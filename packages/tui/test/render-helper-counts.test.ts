@@ -32,13 +32,31 @@ function visible(term: VirtualTerminal): string[] {
 	return term.getViewport().map(line => line.trimEnd());
 }
 
+const RENDER_ENV_KEYS = [
+	"PI_DEBUG_REDRAW",
+	"TMUX",
+	"TMUX_PANE",
+	"STY",
+	"ZELLIJ",
+	"GJC_TMUX_LAUNCHED",
+	"PI_TUI_LEGACY_MULTIPLEXER_FULL_RENDER",
+	"TERM",
+	"TERM_PROGRAM",
+	"WT_SESSION",
+] as const;
+
 describe("TUI render helper counters", () => {
-	let previousDebugRedraw: string | undefined;
+	const previousEnv = new Map<string, string | undefined>();
 	let monotonicNow = 0;
 
 	beforeEach(() => {
-		previousDebugRedraw = Bun.env.PI_DEBUG_REDRAW;
-		delete Bun.env.PI_DEBUG_REDRAW;
+		// VirtualTerminal's process-terminal flag does not override host detection.
+		// Start each case on a plain host even when the test runner is inside tmux.
+		for (const key of RENDER_ENV_KEYS) {
+			previousEnv.set(key, Bun.env[key]);
+			delete Bun.env[key];
+		}
+		Bun.env.TERM = "xterm-256color";
 		monotonicNow = 0;
 		TUI.resetRenderCountersForTest();
 		vi.spyOn(performance, "now").mockImplementation(() => {
@@ -50,11 +68,11 @@ describe("TUI render helper counters", () => {
 	afterEach(() => {
 		vi.restoreAllMocks();
 		TUI.resetRenderCountersForTest();
-		if (previousDebugRedraw === undefined) {
-			delete Bun.env.PI_DEBUG_REDRAW;
-		} else {
-			Bun.env.PI_DEBUG_REDRAW = previousDebugRedraw;
+		for (const [key, value] of previousEnv) {
+			if (value === undefined) delete Bun.env[key];
+			else Bun.env[key] = value;
 		}
+		previousEnv.clear();
 	});
 
 	it("caches PI_DEBUG_REDRAW and does not append debug logs when disabled", async () => {
@@ -166,18 +184,25 @@ describe("TUI render helper counters", () => {
 	});
 
 	it.each(
-		[false, true].flatMap(isProcessTerminal =>
+		[
+			{ host: "plain terminal", isProcessTerminal: false, repaint: "full", tmux: undefined },
+			{ host: "process terminal", isProcessTerminal: true, repaint: "viewport", tmux: undefined },
+			{ host: "tmux", isProcessTerminal: false, repaint: "viewport", tmux: "/tmp/gjc-render-helper-tmux" },
+		].flatMap(host =>
 			[
 				{ columns: 44, text: "漢".repeat(8), visibleText: "漢".repeat(8) },
 				{ columns: 12, text: "漢".repeat(20), visibleText: "漢".repeat(6) },
-			].map(scenario => ({ ...scenario, isProcessTerminal, repaint: isProcessTerminal ? "viewport" : "full" })),
+			].map(scenario => ({ ...scenario, ...host })),
 		),
-	)("preserves $repaint resize output at $columns columns", async ({
+	)("preserves $repaint resize output on $host at $columns columns", async ({
 		columns,
 		text,
 		visibleText,
 		isProcessTerminal,
+		repaint,
+		tmux,
 	}) => {
+		if (tmux !== undefined) Bun.env.TMUX = tmux;
 		const term = new VirtualTerminal(48, 12, { isProcessTerminal });
 		const component = new MutableLinesComponent(Array.from({ length: 80 }, () => `\x1b[36m${text}\x1b[0m`));
 		const tui = new TUI(term, undefined, { widthSettleMs: 0 });
@@ -191,7 +216,7 @@ describe("TUI render helper counters", () => {
 			await settle(term);
 
 			const measurements = TUI.getRenderCountersForTest().widthReflowVisibleWidthCalls;
-			if (isProcessTerminal) expect(measurements).toBe(0);
+			if (repaint === "viewport") expect(measurements).toBe(0);
 			else expect(measurements).toBeGreaterThan(0);
 			expect(visible(term).filter(Boolean)).toContain(visibleText);
 			expect(term.getViewportAnsi()).toContain("\x1b[36m");
