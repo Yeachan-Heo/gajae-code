@@ -123,10 +123,12 @@ describe("G5 gjc state receipts", () => {
 			);
 			expect(handoffEntries).toHaveLength(3);
 			for (const entry of handoffEntries) expectAuditEntry(entry, "handoff");
-			const aggregate = handoffEntries.find(entry => entry.paths.length === 3);
+			const aggregate = handoffEntries.find(entry => Array.isArray(entry.paths) && entry.paths.length === 3);
 			expect(aggregate).toMatchObject({ skill: "deep-interview", forced: false });
-			expect(aggregate?.paths).toContain(modeStatePath(cwd, TEST_SESSION_ID, "deep-interview"));
-			expect(aggregate?.paths).toContain(statePath);
+			const aggregatePaths = aggregate?.paths;
+			expect(Array.isArray(aggregatePaths)).toBe(true);
+			expect(aggregatePaths).toContain(modeStatePath(cwd, TEST_SESSION_ID, "deep-interview"));
+			expect(aggregatePaths).toContain(statePath);
 		});
 	});
 });
