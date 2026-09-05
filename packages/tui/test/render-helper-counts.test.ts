@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import { type Component, TUI } from "@gajae-code/tui";
+import { Loader } from "@gajae-code/tui/components/loader";
 import { visibleWidth } from "@gajae-code/tui/utils";
 import { VirtualTerminal } from "./virtual-terminal";
 
@@ -122,6 +123,73 @@ describe("TUI render helper counters", () => {
 			await settle(term);
 
 			expect(TUI.getRenderCountersForTest().differentialGuardVisibleWidthCalls).toBe(0);
+		} finally {
+			tui.stop();
+		}
+	});
+
+	it("updates the loader over a long transcript without measuring same-width reflow", async () => {
+		const term = new VirtualTerminal(48, 12);
+		const lines = Array.from({ length: 2_000 }, (_, i) => `\x1b[36m履歴 ${i} 漢字\x1b[0m`);
+		const component = new MutableLinesComponent(lines);
+		const tui = new TUI(term, undefined, { widthSettleMs: 0 });
+		const loader = new Loader(
+			tui,
+			text => text,
+			text => text,
+			"Working",
+			["⠋"],
+			{ renderScope: "layout" },
+		);
+		loader.stop();
+		tui.addChild(component);
+		tui.addChild(loader);
+		tui.setBottomPinnedComponent(loader);
+
+		try {
+			tui.start();
+			await settle(term);
+			TUI.resetRenderCountersForTest();
+
+			for (let frame = 0; frame < 8; frame++) {
+				loader.setMessage(`Working ${frame}`);
+				await settle(term);
+				expect(visible(term).join("\n")).toContain(`⠋ Working ${frame}`);
+				expect(visible(term).join("\n")).toContain("履歴 1999 漢字");
+			}
+
+			expect(TUI.getRenderCountersForTest().widthReflowVisibleWidthCalls).toBe(0);
+		} finally {
+			loader.stop();
+			tui.stop();
+		}
+	});
+
+	it.each([
+		{ columns: 44, text: "漢".repeat(8), expectedMeasurements: 80, visibleText: "漢".repeat(8) },
+		{ columns: 12, text: "漢".repeat(20), expectedMeasurements: 1, visibleText: "漢".repeat(6) },
+	])("preserves width-change reflow at $columns columns", async ({
+		columns,
+		text,
+		expectedMeasurements,
+		visibleText,
+	}) => {
+		const term = new VirtualTerminal(48, 12);
+		const component = new MutableLinesComponent(Array.from({ length: 80 }, () => `\x1b[36m${text}\x1b[0m`));
+		const tui = new TUI(term, undefined, { widthSettleMs: 0 });
+		tui.addChild(component);
+
+		try {
+			tui.start();
+			await settle(term);
+			TUI.resetRenderCountersForTest();
+			term.resize(columns, 12);
+			await settle(term);
+
+			expect(TUI.getRenderCountersForTest().widthReflowVisibleWidthCalls).toBe(expectedMeasurements);
+			expect(visible(term).filter(Boolean)).toContain(visibleText);
+			expect(term.getViewportAnsi()).toContain("\x1b[36m");
+			for (const line of visible(term)) expect(visibleWidth(line)).toBeLessThanOrEqual(columns);
 		} finally {
 			tui.stop();
 		}
