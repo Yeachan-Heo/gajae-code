@@ -265,4 +265,45 @@ describe("EventController #handleMessageEnd abort labeling", () => {
 		expect(arg).toBe(message);
 		expect(arg.errorMessage).toBe(formatted);
 	});
+
+	it("orphan agent_end commits the latest partial assistant before terminal cleanup", async () => {
+		const initial = makeAssistantMessage({ stopReason: "stop", content: [] });
+		const f = createFixture({ streamingMessage: initial });
+		f.ctx.setWorkingMessage = vi.fn();
+		const gate = Promise.withResolvers<void>();
+		const entered = Promise.withResolvers<void>();
+		f.ctx.planModeController = {
+			flushPendingModelSwitch: () => {
+				entered.resolve();
+				return gate.promise;
+			},
+		} as never;
+		let stopped = false;
+		f.ctx.isStopped = () => stopped;
+
+		await f.controller.handleEvent({ type: "message_start", message: initial });
+		const component = f.ctx.streamingComponent!;
+		const partial = makeAssistantMessage({
+			stopReason: "aborted",
+			errorMessage: undefined,
+			content: [{ type: "text", text: "partial" }],
+		});
+		await f.controller.handleEvent({
+			type: "message_update",
+			message: partial,
+			assistantMessageEvent: { type: "text_delta", contentIndex: 0 },
+		} as never);
+
+		const pending = f.controller.handleEvent({ type: "agent_end", messages: [partial] } as never);
+		await entered.promise;
+		expect(f.ctx.chatContainer.hasLiveChild(component)).toBe(true);
+		expect(Bun.stripANSI(component.render(80).join("\n"))).toContain("partial");
+		expect(partial.errorMessage).toBe("Operation aborted");
+		expect(f.ctx.streamingComponent).toBeUndefined();
+		expect(f.ctx.streamingMessage).toBeUndefined();
+		f.captured[0]!();
+		stopped = true;
+		gate.resolve();
+		await pending;
+	});
 });
