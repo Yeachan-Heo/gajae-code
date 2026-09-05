@@ -4,7 +4,7 @@
 
 ### Fixed
 
-- Loader and other same-width frames skip the unused transcript-wide reflow measurement, reducing repeated text-width work in long sessions while preserving width-change rendering.
+- Loader and other same-width frames, viewport-only resize repaints, and coalesced resize appends skip unused transcript-wide reflow measurements, reducing repeated text-width work in long sessions while preserving rendering.
 
 ## [0.16.3] - 2026-09-04
 

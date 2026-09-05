@@ -165,16 +165,20 @@ describe("TUI render helper counters", () => {
 		}
 	});
 
-	it.each([
-		{ columns: 44, text: "漢".repeat(8), expectedMeasurements: 80, visibleText: "漢".repeat(8) },
-		{ columns: 12, text: "漢".repeat(20), expectedMeasurements: 1, visibleText: "漢".repeat(6) },
-	])("preserves width-change reflow at $columns columns", async ({
+	it.each(
+		[false, true].flatMap(isProcessTerminal =>
+			[
+				{ columns: 44, text: "漢".repeat(8), visibleText: "漢".repeat(8) },
+				{ columns: 12, text: "漢".repeat(20), visibleText: "漢".repeat(6) },
+			].map(scenario => ({ ...scenario, isProcessTerminal, repaint: isProcessTerminal ? "viewport" : "full" })),
+		),
+	)("preserves $repaint resize output at $columns columns", async ({
 		columns,
 		text,
-		expectedMeasurements,
 		visibleText,
+		isProcessTerminal,
 	}) => {
-		const term = new VirtualTerminal(48, 12);
+		const term = new VirtualTerminal(48, 12, { isProcessTerminal });
 		const component = new MutableLinesComponent(Array.from({ length: 80 }, () => `\x1b[36m${text}\x1b[0m`));
 		const tui = new TUI(term, undefined, { widthSettleMs: 0 });
 		tui.addChild(component);
@@ -186,7 +190,9 @@ describe("TUI render helper counters", () => {
 			term.resize(columns, 12);
 			await settle(term);
 
-			expect(TUI.getRenderCountersForTest().widthReflowVisibleWidthCalls).toBe(expectedMeasurements);
+			const measurements = TUI.getRenderCountersForTest().widthReflowVisibleWidthCalls;
+			if (isProcessTerminal) expect(measurements).toBe(0);
+			else expect(measurements).toBeGreaterThan(0);
 			expect(visible(term).filter(Boolean)).toContain(visibleText);
 			expect(term.getViewportAnsi()).toContain("\x1b[36m");
 			for (const line of visible(term)) expect(visibleWidth(line)).toBeLessThanOrEqual(columns);
