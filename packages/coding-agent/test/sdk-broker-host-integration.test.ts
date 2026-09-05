@@ -74,8 +74,7 @@ test("broker rejects stale get_endpoint authority after a preserved-mtime endpoi
 	const displacedPath = `${endpointPath}.displaced`;
 	const broker = new Broker({ agentDir });
 	try {
-		await fs.mkdir(path.dirname(endpointPath), { recursive: true });
-		await fs.writeFile(endpointPath, JSON.stringify({ sessionId: "replacement", pid: process.pid, token: "old" }));
+		await Bun.write(endpointPath, JSON.stringify({ sessionId: "replacement", pid: process.pid, token: "old" }));
 		const fixedMtimeSeconds = 1_700_000_000;
 		await fs.utimes(endpointPath, fixedMtimeSeconds, fixedMtimeSeconds);
 		const predecessor = await fs.stat(endpointPath, { bigint: true });
@@ -97,7 +96,7 @@ test("broker rejects stale get_endpoint authority after a preserved-mtime endpoi
 			)
 			.digest("hex");
 		await fs.rename(endpointPath, displacedPath);
-		await fs.writeFile(endpointPath, JSON.stringify({ sessionId: "replacement", pid: process.pid, token: "new" }));
+		await Bun.write(endpointPath, JSON.stringify({ sessionId: "replacement", pid: process.pid, token: "new" }));
 		await fs.utimes(endpointPath, fixedMtimeSeconds, fixedMtimeSeconds);
 		const successor = await fs.stat(endpointPath, { bigint: true });
 		expect(`${successor.dev}:${successor.ino}`).not.toBe(predecessorFileId);
@@ -129,8 +128,7 @@ test("broker rejects stale close authority after a preserved-mtime endpoint repl
 		stdio: ["ignore", "ignore", "ignore"],
 	});
 	try {
-		await fs.mkdir(path.dirname(endpointPath), { recursive: true });
-		await fs.writeFile(
+		await Bun.write(
 			endpointPath,
 			JSON.stringify({ sessionId, pid: host.pid, url: "ws://127.0.0.1:1", token: "old" }),
 		);
@@ -155,7 +153,7 @@ test("broker rejects stale close authority after a preserved-mtime endpoint repl
 			)
 			.digest("hex");
 		await fs.rename(endpointPath, displacedPath);
-		await fs.writeFile(
+		await Bun.write(
 			endpointPath,
 			JSON.stringify({ sessionId, pid: host.pid, url: "ws://127.0.0.1:1", token: "new" }),
 		);
