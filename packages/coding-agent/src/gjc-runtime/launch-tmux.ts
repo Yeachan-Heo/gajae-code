@@ -19,6 +19,7 @@ import {
 	MANAGED_OWNER_RUN_ID_ENV,
 	MANAGED_OWNER_SUPERVISED_ENV,
 	MANAGED_OWNER_SUPERVISOR_ARG,
+	publishManagedOwnerSupervisorAuthoritySync,
 } from "./managed-owner-supervisor";
 import { tmuxRuntimeSessionPath } from "./session-layout";
 import {
@@ -1244,6 +1245,7 @@ function rebuildManagedOwnerChildCommand(
 				[GJC_TMUX_OWNER_GENERATION_ENV]: generation,
 				[GJC_TMUX_OWNER_STATE_DIR_ENV]: stateDir,
 				[GJC_TMUX_OWNER_SERVER_KEY_ENV]: plan.tmuxCommand,
+				[GJC_TMUX_COMMAND_ENV]: plan.tmuxCommand,
 				[MANAGED_OWNER_RUN_ID_ENV]: runId,
 				[MANAGED_OWNER_INCARNATION_ENV]: incarnation,
 				...(replacement
@@ -1998,6 +2000,35 @@ export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
 	try {
 		const stateDir = path.dirname(plan.sessionStateFile!);
 		resolveManagedOwnerPredecessorSync(stateDir, plan.sessionId!, plan.ownerGenerationBaseline!);
+		if (plan.platform === "linux" && !context.ownerIsolationProbe) {
+			const pane = spawnSync(
+				plan.tmuxCommand,
+				["display-message", "-p", "-t", plan.createdSessionId!, "-F", "#{pane_pid}"],
+				controlOptions,
+			);
+			const supervisorPid = Number(pane.stdout?.trim());
+			const supervisorStartTime = readLinuxProcStartTimeSync(supervisorPid);
+			if (
+				pane.exitCode !== 0 ||
+				!Number.isSafeInteger(supervisorPid) ||
+				supervisorPid <= 0 ||
+				!supervisorStartTime ||
+				!plan.createdServerIdentity
+			)
+				throw new Error("managed_owner_supervisor_authority_unavailable");
+			publishManagedOwnerSupervisorAuthoritySync({
+				schema_version: 1,
+				kind: "managed_owner_supervisor_authority",
+				state_dir: stateDir,
+				session_id: plan.sessionId!,
+				generation: plan.ownerGeneration!,
+				supervisor_pid: supervisorPid,
+				supervisor_start_time: supervisorStartTime,
+				server_pid: plan.createdServerIdentity.pid,
+				server_start_time: plan.createdServerIdentity.startTime,
+				native_session_id: plan.createdSessionId!,
+			});
+		}
 		replaceOwnerGenerationSync(stateDir, plan.sessionId!, plan.ownerGeneration!, plan.ownerGenerationBaseline!);
 		providerAuthorityPublished = true;
 	} catch (error) {

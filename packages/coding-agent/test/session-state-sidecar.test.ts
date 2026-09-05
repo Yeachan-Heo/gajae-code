@@ -33,6 +33,7 @@ import {
 	persistCoordinatorLaunchFailureState,
 	persistCoordinatorRuntimeInputReady,
 	persistCoordinatorRuntimeStateFromEvent,
+	persistCoordinatorRuntimeStateFromOwnerVerdict,
 	persistCoordinatorRuntimeStateFromPostmortem,
 	persistCoordinatorWorkerIntegrationOutcome,
 	prepareCoordinatorRuntimeStateRescope,
@@ -631,6 +632,34 @@ describe("coordinator runtime state sidecar", () => {
 		await persistCoordinatorRuntimeStateFromPostmortem(postmortem.Reason.SIGTERM, context);
 
 		expect(await Bun.file(stateFile).text()).toBe(beforeReplacement);
+	});
+
+	it("lets the authenticated replacement generation adopt predecessor runtime state", async () => {
+		const root = await tempRoot();
+		const stateFile = path.join(root, "replacement-adoption.json");
+		const sessionId = "replacement-adoption-session";
+		const firstGeneration = "11111111-1111-4111-8111-111111111111";
+		const replacementGeneration = "22222222-2222-4222-8222-222222222222";
+		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
+		process.env[GJC_COORDINATOR_SESSION_ID_ENV] = sessionId;
+
+		await replaceOwnerGeneration(root, sessionId, firstGeneration);
+		await persistCoordinatorRuntimeStateFromEvent(
+			{ type: "agent_start" },
+			{ sessionId, cwd: root, ownerTerminal: { generation: firstGeneration, stateDir: root, socketKey: "tmux" } },
+		);
+		await replaceOwnerGeneration(root, sessionId, replacementGeneration);
+		await persistCoordinatorRuntimeStateFromEvent(assistantEnd("replacement completed"), {
+			sessionId,
+			cwd: root,
+			ownerTerminal: { generation: replacementGeneration, stateDir: root, socketKey: "tmux" },
+		});
+
+		expect(await readPayload(stateFile)).toMatchObject({
+			state: "completed",
+			owner_generation: replacementGeneration,
+			final_response: { text: "replacement completed" },
+		});
 	});
 
 	it("invalidates the async previous-payload cache after an external state file write", async () => {
@@ -1286,6 +1315,83 @@ describe("coordinator runtime state sidecar", () => {
 				cwd: root,
 				sessionFile: path.join(root, "session.jsonl"),
 			}),
+		).resolves.toEqual({ terminal: true, state: "completed" });
+	});
+
+	it("keeps bounded terminal markers larger than lifecycle records readable to GC", async () => {
+		const root = await tempRoot();
+		const stateFile = path.join(root, "large-terminal-marker.json");
+		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
+		process.env[GJC_COORDINATOR_SESSION_ID_ENV] = "large-terminal-marker";
+		await persistCoordinatorRuntimeStateFromEvent(assistantEnd("x".repeat(300 * 1024)), {
+			sessionId: "fallback",
+			cwd: root,
+			sessionFile: null,
+		});
+
+		const file = Bun.file(stateFile);
+		expect(file.size).toBeGreaterThan(16 * 1024);
+		expect(file.size).toBeLessThanOrEqual(256 * 1024);
+		expect(await readPayload(stateFile)).toMatchObject({ final_response: { truncated: true } });
+		await expect(
+			readTerminalRuntimeStateMarker({ stateFile, sessionId: "large-terminal-marker", cwd: root }),
+		).resolves.toEqual({ terminal: true, state: "completed" });
+	});
+
+	it("keeps pre-budget terminal markers readable within the legacy compatibility bound", async () => {
+		const root = await tempRoot();
+		const stateFile = path.join(root, "legacy-large-terminal-marker.json");
+		await Bun.write(
+			stateFile,
+			JSON.stringify({
+				schema_version: 1,
+				session_id: "legacy-large-terminal-marker",
+				state: "completed",
+				cwd: root,
+				workdir: root,
+				session_file: null,
+				final_response: { text: "x".repeat(300 * 1024), source: "agent_end" },
+			}),
+		);
+		expect(Bun.file(stateFile).size).toBeGreaterThan(256 * 1024);
+		await expect(
+			readTerminalRuntimeStateMarker({
+				stateFile,
+				sessionId: "legacy-large-terminal-marker",
+				cwd: root,
+			}),
+		).resolves.toEqual({ terminal: true, state: "completed" });
+	});
+
+	it("rejects legacy terminal markers beyond the finite compatibility bound", async () => {
+		const root = await tempRoot();
+		const stateFile = path.join(root, "oversized-legacy-terminal-marker.json");
+		await Bun.write(
+			stateFile,
+			`{"schema_version":1,"session_id":"oversized","state":"completed","cwd":${JSON.stringify(root)},"workdir":${JSON.stringify(root)},"session_file":null,"final_response":{"text":"${"x".repeat(16 * 1024 * 1024)}"}}`,
+		);
+		await expect(readTerminalRuntimeStateMarker({ stateFile, sessionId: "oversized", cwd: root })).resolves.toEqual({
+			terminal: false,
+			reason: "invalid_json",
+		});
+	});
+
+	it("budgets terminal markers after JSON escaping", async () => {
+		const root = await tempRoot();
+		const stateFile = path.join(root, "escaped-terminal-marker.json");
+		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
+		process.env[GJC_COORDINATOR_SESSION_ID_ENV] = "escaped-terminal-marker";
+		await persistCoordinatorRuntimeStateFromEvent(assistantEnd('"\\'.repeat(100 * 1024)), {
+			sessionId: "fallback",
+			cwd: root,
+			sessionFile: null,
+		});
+
+		const file = Bun.file(stateFile);
+		expect(file.size).toBeLessThanOrEqual(256 * 1024);
+		expect(await readPayload(stateFile)).toMatchObject({ final_response: { truncated: true } });
+		await expect(
+			readTerminalRuntimeStateMarker({ stateFile, sessionId: "escaped-terminal-marker", cwd: root }),
 		).resolves.toEqual({ terminal: true, state: "completed" });
 	});
 
@@ -2332,6 +2438,49 @@ describe("coordinator runtime state sidecar", () => {
 		expect((await readPayload(stateFile)).state).toBe("errored");
 	});
 
+	it("lets the authenticated replacement generation adopt predecessor state for launch failure", async () => {
+		const root = await tempRoot();
+		const stateFile = path.join(root, "replacement-launch-failure.json");
+		const sessionId = "replacement-launch-failure";
+		const predecessor = "11111111-1111-4111-8111-111111111111";
+		const replacement = "22222222-2222-4222-8222-222222222222";
+		await replaceOwnerGeneration(root, sessionId, predecessor);
+		await Bun.write(
+			stateFile,
+			JSON.stringify({
+				schema_version: 1,
+				session_id: sessionId,
+				state: "running",
+				cwd: root,
+				workdir: root,
+				session_file: null,
+				owner_generation: predecessor,
+			}),
+		);
+		await replaceOwnerGeneration(root, sessionId, replacement);
+		await persistCoordinatorLaunchFailureState({
+			stateFile,
+			cwd: root,
+			sessionId,
+			ownerGeneration: replacement,
+			ownerStateDir: root,
+			ownerServerKey: "tmux",
+			managedLaunch: true,
+			payload: {
+				schema_version: 1,
+				session_id: sessionId,
+				state: "errored",
+				cwd: root,
+				workdir: root,
+				session_file: null,
+			},
+			signingRequired: false,
+			keyId: null,
+		});
+
+		expect(await readPayload(stateFile)).toMatchObject({ state: "errored", owner_generation: replacement });
+	});
+
 	it("persists the immutable owner-terminal verdict with public-safe metadata", async () => {
 		const root = await tempRoot();
 		const stateFile = path.join(root, "state.json");
@@ -2416,6 +2565,37 @@ describe("coordinator runtime state sidecar", () => {
 		expect(serialized).not.toContain("raw_terminal");
 		expect(serialized).not.toContain("operator-dispatch");
 		await expect(fs.access(lifecyclePaths(root, sessionId, generation).verdictFile)).resolves.toBeNull();
+	});
+
+	it("uses the tagged session project when an early force-close seed has no cwd", async () => {
+		const root = await tempRoot();
+		const workspace = path.join(root, "workspace");
+		const stateFile = path.join(root, "state.json");
+		const sessionId = "early-force-close";
+		const generation = await replaceOwnerGeneration(root, sessionId, "generation-one");
+		await fs.mkdir(workspace);
+		await Bun.write(stateFile, JSON.stringify({ schema_version: 1, session_id: sessionId, state: "booting" }));
+		const verdict = await observeOwnerTerminal({
+			schema_version: 1,
+			op: "observe_terminal",
+			session_id: sessionId,
+			owner_generation: generation,
+			state_dir: root,
+			socket_key: "opaque-server-key",
+			observer: "raw_monitor",
+			observed_at: new Date().toISOString(),
+			signal: "SIGTERM",
+			exit_code: null,
+			exit_kind: "sigterm",
+			reason: "early_force_close",
+		});
+		await persistCoordinatorRuntimeStateFromOwnerVerdict(
+			stateFile,
+			{ generation, stateDir: root, socketKey: "opaque-server-key" },
+			verdict,
+			workspace,
+		);
+		expect(await readPayload(stateFile)).toMatchObject({ cwd: workspace, workdir: workspace });
 	});
 	it("fails closed with public-safe recovery for invalid metadata and unavailable owner ownership", async () => {
 		const root = await tempRoot();

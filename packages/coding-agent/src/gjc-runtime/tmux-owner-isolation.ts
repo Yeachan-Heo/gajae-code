@@ -12,19 +12,7 @@ import * as fs from "node:fs/promises";
 
 import * as path from "node:path";
 
-import type { RecoveryFsRoot } from "@gajae-code/natives";
-
-let nativeRecoveryFsRoot: typeof import("@gajae-code/natives")["openRecoveryFsRoot"] | undefined;
-
-function openRecoveryFsRootNative(): typeof import("@gajae-code/natives")["openRecoveryFsRoot"] {
-	nativeRecoveryFsRoot ??= (
-		require("@gajae-code/natives") as {
-			openRecoveryFsRoot: typeof import("@gajae-code/natives")["openRecoveryFsRoot"];
-		}
-	).openRecoveryFsRoot;
-	return nativeRecoveryFsRoot;
-}
-
+import { openPortableRecoveryFsRoot, type PortableRecoveryFsRoot } from "@gajae-code/natives";
 import { isCompiledBinary } from "@gajae-code/utils/env";
 import { parseLinuxProcStartTime } from "./linux-proc";
 import { resolveGjcTmuxBinary } from "./psmux-detect";
@@ -154,10 +142,16 @@ export interface PlanRequest {
 export interface PublishGenerationRequest {
 	schema_version: 1;
 	op: "publish_generation";
-	auth_token?: string;
 	session_id: string;
 	owner_generation: string;
 	state_dir: string;
+	socket_key: string;
+	owner_native_session_id?: string;
+	owner_pane_id?: string;
+	owner_pid?: number;
+	owner_start_time?: string;
+	owner_server_pid?: number;
+	owner_server_start_time?: string;
 	baseline: OwnerGenerationBaseline;
 }
 
@@ -1276,11 +1270,20 @@ export interface OwnerIncident {
 export interface ObserveTerminalRequest {
 	schema_version: 1;
 	op: "observe_terminal";
-	auth_token?: string;
 	session_id: string;
 	owner_generation: string;
 	state_dir: string;
 	socket_key: string;
+	owner_native_session_id?: string;
+	owner_pane_id?: string;
+	owner_pid?: number;
+	owner_start_time?: string;
+	owner_server_pid?: number;
+	owner_server_start_time?: string;
+	monitor_native_session_id?: string;
+	monitor_pane_id?: string;
+	monitor_pid?: number;
+	monitor_start_time?: string;
 	observer: TerminalObserver;
 	observed_at: string;
 	signal: TerminalSignal;
@@ -1296,7 +1299,6 @@ export interface LifecyclePaths {
 	generation: string;
 	generationFile: string;
 	generationMarkerFile: string;
-	protocolTokenFile: string;
 	intentFile: string;
 	verdictFile: string;
 	verdictAliasFile: string;
@@ -1319,7 +1321,6 @@ export function lifecyclePaths(stateDir: string, sessionId: string, generation: 
 		generation,
 		generationFile: path.join(root, "generation.json"),
 		generationMarkerFile: path.join(root, `generation-${encodeURIComponent(generation)}.published.json`),
-		protocolTokenFile: path.join(root, `protocol-token-${encodeURIComponent(generation)}.json`),
 		intentFile: path.join(root, `intent-${generation}.json`),
 		verdictFile: path.join(root, `verdict-${generation}.json`),
 		verdictAliasFile: path.join(root, "verdict.json"),
@@ -1422,7 +1423,8 @@ export async function withOwnerGenerationLifecycleLock<T>(
 }
 
 /** Refuses to publish a generation whose staged supervisor already recorded a terminal exit. */
-function assertNoStagedOwnerTerminal(paths: LifecyclePaths): void {
+
+export function assertNoStagedOwnerTerminal(paths: LifecyclePaths): void {
 	const journal = readNoFollowJsonSync(paths.stagedTerminalFile);
 	if (journal === null) return;
 	if (!isValidStagedOwnerTerminalJournal(journal, { generation: paths.generation }))
@@ -1438,17 +1440,29 @@ export type OwnerGenerationBaseline =
 			generation: string;
 			session_id: string;
 			published_at: string;
+			root_dev: string;
+			root_ino: string;
 	  };
 
 function isOwnerGenerationBaseline(value: unknown): value is OwnerGenerationBaseline {
 	return (
 		isRecord(value) &&
 		((Object.keys(value).length === 1 && value.state === "absent") ||
-			(hasOnlyKeys(value, ["state", "schema_version", "generation", "session_id", "published_at"]) &&
+			(hasOnlyKeys(value, [
+				"state",
+				"schema_version",
+				"generation",
+				"session_id",
+				"published_at",
+				"root_dev",
+				"root_ino",
+			]) &&
 				value.state === "current" &&
 				value.schema_version === 1 &&
 				nonEmpty(value.generation) &&
 				nonEmpty(value.session_id) &&
+				nonEmpty(value.root_dev) &&
+				nonEmpty(value.root_ino) &&
 				isSafePathComponent(value.generation, "owner generation") &&
 				isSafePathComponent(value.session_id, "owner session id") &&
 				isCanonicalUtcTimestamp(value.published_at)))
@@ -1477,7 +1491,9 @@ function sameOwnerGenerationBaseline(left: OwnerGenerationBaseline, right: Owner
 				left.schema_version === right.schema_version &&
 				left.generation === right.generation &&
 				left.session_id === right.session_id &&
-				left.published_at === right.published_at))
+				left.published_at === right.published_at &&
+				left.root_dev === right.root_dev &&
+				left.root_ino === right.root_ino))
 	);
 }
 
@@ -1489,15 +1505,30 @@ export interface ManagedOwnerPredecessorEvidence {
 	predecessorToken: string;
 }
 
-function exactManagedOwnerJson(authority: RecoveryFsRoot, name: string): unknown {
+let managedOwnerEvidenceAfterFirstReadForTests: (() => void) | undefined;
+let managedOwnerEvidenceAfterRootPinnedForTests: (() => void) | undefined;
+type ManagedOwnerEvidenceAuthority = Pick<PortableRecoveryFsRoot, "identity" | "list" | "read" | "close">;
+
+/** @internal */
+export function __setManagedOwnerEvidenceAfterFirstReadForTests(hook: (() => void) | undefined): void {
+	managedOwnerEvidenceAfterFirstReadForTests = hook;
+}
+
+/** @internal */
+export function __setManagedOwnerEvidenceAfterRootPinnedForTests(hook: (() => void) | undefined): void {
+	managedOwnerEvidenceAfterRootPinnedForTests = hook;
+}
+
+function exactManagedOwnerJsonFromAuthority(authority: ManagedOwnerEvidenceAuthority, name: string): unknown {
 	const first = authority.read(name, 64 * 1024);
-	if (!first.ok || !first.data) throw new Error("managed_owner_replacement_evidence_unavailable");
+	managedOwnerEvidenceAfterFirstReadForTests?.();
 	const second = authority.read(name, 64 * 1024);
+	if (!first.ok || !first.data || !first.identity || !second.ok || !second.data || !second.identity)
+		throw new Error("managed_owner_replacement_evidence_unavailable");
 	if (
-		!second.ok ||
-		!second.data ||
-		Buffer.compare(Buffer.from(first.data), Buffer.from(second.data)) !== 0 ||
-		JSON.stringify(first.identity) !== JSON.stringify(second.identity)
+		first.identity.dev !== second.identity.dev ||
+		first.identity.ino !== second.identity.ino ||
+		Buffer.compare(Buffer.from(first.data), Buffer.from(second.data)) !== 0
 	)
 		throw new Error("managed_owner_replacement_evidence_changed");
 	const content = Buffer.from(first.data).toString("utf8");
@@ -1528,9 +1559,39 @@ export function resolveManagedOwnerPredecessorSync(
 ): ManagedOwnerPredecessorEvidence | undefined {
 	if (baseline.state === "absent") return undefined;
 	const root = lifecyclePaths(stateDir, sessionId, baseline.generation).root;
+	const authority = openPortableRecoveryFsRoot(root);
+	try {
+		managedOwnerEvidenceAfterRootPinnedForTests?.();
+		const rootIdentity = authority.identity();
+		if (
+			!rootIdentity.ok ||
+			!rootIdentity.identity ||
+			rootIdentity.identity.dev !== baseline.root_dev ||
+			rootIdentity.identity.ino !== baseline.root_ino
+		)
+			throw new Error("managed_owner_replacement_evidence_changed");
+		const generation = exactManagedOwnerJsonFromAuthority(authority, "generation.json");
+		if (
+			!isRecord(generation) ||
+			!isValidGenerationRecord(generation, sessionId, baseline.generation) ||
+			generation.published_at !== baseline.published_at
+		)
+			throw new Error("managed_owner_replacement_evidence_changed");
+		return resolveManagedOwnerPredecessorFromAuthority(authority, stateDir, sessionId, baseline);
+	} finally {
+		authority.close();
+	}
+}
+
+function resolveManagedOwnerPredecessorFromAuthority(
+	authority: ManagedOwnerEvidenceAuthority,
+	stateDir: string,
+	sessionId: string,
+	baseline: Extract<OwnerGenerationBaseline, { state: "current" }>,
+): ManagedOwnerPredecessorEvidence | undefined {
 	let entries: string[];
 	try {
-		entries = fsSync.readdirSync(root);
+		entries = authority.list(4096);
 	} catch {
 		throw new Error("managed_owner_replacement_evidence_unavailable");
 	}
@@ -1549,25 +1610,15 @@ export function resolveManagedOwnerPredecessorSync(
 		lifecyclePaths(stateDir, sessionId, baseline.generation).stagedTerminalFile,
 	);
 	if (entries.includes(stagedTerminalFile)) {
-		const authority = openRecoveryFsRootNative()(root);
-		try {
-			const journal = exactManagedOwnerJson(authority, stagedTerminalFile);
-			if (!isValidStagedOwnerTerminalJournal(journal, { generation: baseline.generation, sessionId }))
-				throw new Error("managed_owner_replacement_evidence_untrusted");
-		} finally {
-			authority.close();
-		}
+		const journal = exactManagedOwnerJsonFromAuthority(authority, stagedTerminalFile);
+		if (!isValidStagedOwnerTerminalJournal(journal, { generation: baseline.generation, sessionId }))
+			throw new Error("managed_owner_replacement_evidence_untrusted");
 		throw new Error("managed_owner_replacement_evidence_ambiguous");
 	}
 	if (entries.includes(completionFile)) {
-		const authority = openRecoveryFsRootNative()(root);
-		try {
-			const completion = exactManagedOwnerJson(authority, completionFile);
-			if (!isCleanManagedOwnerCompletion(completion, { generation: baseline.generation, sessionId }))
-				throw new Error("managed_owner_replacement_evidence_untrusted");
-		} finally {
-			authority.close();
-		}
+		const completion = exactManagedOwnerJsonFromAuthority(authority, completionFile);
+		if (!isCleanManagedOwnerCompletion(completion, { generation: baseline.generation, sessionId }))
+			throw new Error("managed_owner_replacement_evidence_untrusted");
 		if (receipts.size > 0) throw new Error("managed_owner_replacement_evidence_ambiguous");
 		return undefined;
 	}
@@ -1576,104 +1627,115 @@ export function resolveManagedOwnerPredecessorSync(
 	if (tokens.length !== 1 || receipts.size !== 1) throw new Error("managed_owner_replacement_evidence_ambiguous");
 	const predecessorToken = tokens[0]!;
 	if (!/^[A-Za-z0-9._-]+$/.test(predecessorToken)) throw new Error("managed_owner_replacement_evidence_untrusted");
-	const authority = openRecoveryFsRootNative()(root);
-	try {
-		const binding = exactManagedOwnerJson(authority, `child-${predecessorToken}.binding.json`) as Record<
-			string,
-			unknown
-		>;
-		const receipt = exactManagedOwnerJson(authority, `sigabrt-${predecessorToken}.receipt.json`) as Record<
-			string,
-			unknown
-		>;
-		const command = binding.command;
-		const runId = binding.run_id;
-		const incarnation = binding.endpoint_incarnation;
-		const commandDigest =
-			Array.isArray(command) && command.length > 0 && command.every(value => typeof value === "string" && value)
-				? crypto.createHash("sha256").update(JSON.stringify(command)).digest("hex")
-				: "";
-		const valid =
-			binding.schema_version === 2 &&
-			binding.generation === baseline.generation &&
-			binding.session_id === sessionId &&
-			typeof runId === "string" &&
-			runId.length > 0 &&
-			typeof incarnation === "string" &&
-			incarnation.length > 0 &&
-			binding.child_token === predecessorToken &&
-			binding.command_sha256 === commandDigest &&
-			typeof binding.supervisor_pid === "number" &&
-			Number.isSafeInteger(binding.supervisor_pid) &&
-			binding.supervisor_pid > 0 &&
-			typeof binding.supervisor_start_time === "string" &&
-			typeof binding.created_at === "string" &&
-			receipt.schema_version === 2 &&
-			receipt.generation === binding.generation &&
-			receipt.session_id === binding.session_id &&
-			receipt.run_id === runId &&
-			receipt.endpoint_incarnation === incarnation &&
-			receipt.child_token === binding.child_token &&
-			receipt.command_sha256 === binding.command_sha256 &&
-			receipt.supervisor_pid === binding.supervisor_pid &&
-			receipt.supervisor_start_time === binding.supervisor_start_time &&
-			typeof receipt.child_pid === "number" &&
-			Number.isSafeInteger(receipt.child_pid) &&
-			receipt.child_pid > 0 &&
-			typeof receipt.child_start_time === "string" &&
-			typeof receipt.received_at === "string" &&
-			(receipt.exit_code === null || Number.isSafeInteger(receipt.exit_code)) &&
-			receipt.signal === "SIGABRT" &&
-			receipt.signal_number === 6;
-		if (!valid) throw new Error("managed_owner_replacement_evidence_untrusted");
-		return {
-			generation: baseline.generation,
-			sessionId,
-			runId,
-			incarnation,
-			predecessorToken,
-		};
-	} finally {
-		authority.close();
-	}
+	const binding = exactManagedOwnerJsonFromAuthority(authority, `child-${predecessorToken}.binding.json`) as Record<
+		string,
+		unknown
+	>;
+	const receipt = exactManagedOwnerJsonFromAuthority(authority, `sigabrt-${predecessorToken}.receipt.json`) as Record<
+		string,
+		unknown
+	>;
+	const command = binding.command;
+	const runId = binding.run_id;
+	const incarnation = binding.endpoint_incarnation;
+	const commandDigest =
+		Array.isArray(command) && command.length > 0 && command.every(value => typeof value === "string" && value)
+			? crypto.createHash("sha256").update(JSON.stringify(command)).digest("hex")
+			: "";
+	const valid =
+		binding.schema_version === 2 &&
+		binding.generation === baseline.generation &&
+		binding.session_id === sessionId &&
+		typeof runId === "string" &&
+		runId.length > 0 &&
+		typeof incarnation === "string" &&
+		incarnation.length > 0 &&
+		binding.child_token === predecessorToken &&
+		binding.command_sha256 === commandDigest &&
+		typeof binding.supervisor_pid === "number" &&
+		Number.isSafeInteger(binding.supervisor_pid) &&
+		binding.supervisor_pid > 0 &&
+		typeof binding.supervisor_start_time === "string" &&
+		typeof binding.created_at === "string" &&
+		receipt.schema_version === 2 &&
+		receipt.generation === binding.generation &&
+		receipt.session_id === binding.session_id &&
+		receipt.run_id === runId &&
+		receipt.endpoint_incarnation === incarnation &&
+		receipt.child_token === binding.child_token &&
+		receipt.command_sha256 === binding.command_sha256 &&
+		receipt.supervisor_pid === binding.supervisor_pid &&
+		receipt.supervisor_start_time === binding.supervisor_start_time &&
+		typeof receipt.child_pid === "number" &&
+		Number.isSafeInteger(receipt.child_pid) &&
+		receipt.child_pid > 0 &&
+		typeof receipt.child_start_time === "string" &&
+		typeof receipt.received_at === "string" &&
+		(receipt.exit_code === null || Number.isSafeInteger(receipt.exit_code)) &&
+		receipt.signal === "SIGABRT" &&
+		receipt.signal_number === 6;
+	if (!valid) throw new Error("managed_owner_replacement_evidence_untrusted");
+	return {
+		generation: baseline.generation,
+		sessionId,
+		runId,
+		incarnation,
+		predecessorToken,
+	};
 }
 
 export async function captureOwnerGenerationBaseline(
 	stateDir: string,
 	sessionId: string,
 ): Promise<OwnerGenerationBaseline> {
-	const file = lifecyclePaths(stateDir, sessionId, "baseline").generationFile;
-	try {
-		await fs.lstat(file);
-	} catch (error) {
-		if (isCode(error, "ENOENT")) return { state: "absent" };
-		throw error;
-	}
-	const record = await readJson<unknown>(file);
-	if (
-		!isRecord(record) ||
-		!hasExactKeys(record, ["schema_version", "generation", "session_id", "published_at"]) ||
-		record.schema_version !== 1 ||
-		record.session_id !== sessionId ||
-		!nonEmpty(record.generation) ||
-		!isSafePathComponent(record.generation, "owner generation") ||
-		!isCanonicalUtcTimestamp(record.published_at)
-	)
+	return captureOwnerGenerationBaselineSync(stateDir, sessionId);
+}
+
+function ownerGenerationBaselineFromAuthority(
+	authority: PortableRecoveryFsRoot,
+	sessionId: string,
+): OwnerGenerationBaseline {
+	const identity = authority.identity();
+	const generation = authority.read("generation.json", TMUX_OWNER_ISOLATION_MAX_LINE_BYTES);
+	if (generation.code === "not_found") return { state: "absent" };
+	if (!identity.ok || !identity.identity || !generation.ok || !generation.data)
 		throw new Error("baseline_generation_corrupt");
-	return {
-		state: "current",
-		schema_version: record.schema_version,
-		generation: record.generation,
-		session_id: record.session_id,
-		published_at: record.published_at,
-	};
+	let record: unknown;
+	try {
+		record = JSON.parse(Buffer.from(generation.data).toString("utf8"));
+	} catch {
+		throw new Error("baseline_generation_corrupt");
+	}
+	return ownerGenerationBaselineFromRecord(record, sessionId, identity.identity.dev, identity.identity.ino);
 }
 
 /** Captures the full immutable generation record for a planned owner launch. */
 export function captureOwnerGenerationBaselineSync(stateDir: string, sessionId: string): OwnerGenerationBaseline {
 	const paths = lifecyclePaths(stateDir, sessionId, "baseline");
-	const record = readNoFollowJsonSync(paths.generationFile);
-	if (record === null) return { state: "absent" };
+	let authority: PortableRecoveryFsRoot;
+	try {
+		authority = openPortableRecoveryFsRoot(paths.root);
+	} catch (error) {
+		try {
+			fsSync.lstatSync(paths.root);
+		} catch (statError) {
+			if (isCode(statError, "ENOENT")) return { state: "absent" };
+		}
+		throw new Error("baseline_generation_corrupt", { cause: error });
+	}
+	try {
+		return ownerGenerationBaselineFromAuthority(authority, sessionId);
+	} finally {
+		authority.close();
+	}
+}
+
+function ownerGenerationBaselineFromRecord(
+	record: unknown,
+	sessionId: string,
+	rootDev: string,
+	rootIno: string,
+): Extract<OwnerGenerationBaseline, { state: "current" }> {
 	if (
 		!isRecord(record) ||
 		!hasExactKeys(record, ["schema_version", "generation", "session_id", "published_at"]) ||
@@ -1690,6 +1752,8 @@ export function captureOwnerGenerationBaselineSync(stateDir: string, sessionId: 
 		generation: record.generation,
 		session_id: record.session_id,
 		published_at: record.published_at,
+		root_dev: rootDev,
+		root_ino: rootIno,
 	};
 }
 
@@ -1704,7 +1768,10 @@ function readDescriptorBoundedSync(fd: number): Buffer {
 	return buffer.subarray(0, offset);
 }
 
-export function readNoFollowJsonSync(file: string): unknown | null {
+export function readNoFollowJsonSync(
+	file: string,
+	options: { requireSingleLine?: boolean; includeIdentity?: boolean } = {},
+): unknown | null | { value: unknown; identity: { dev: number; ino: number } } {
 	let before: fsSync.Stats;
 	try {
 		before = fsSync.lstatSync(file);
@@ -1741,7 +1808,13 @@ export function readNoFollowJsonSync(file: string): unknown | null {
 		)
 			throw new Error("baseline_generation_corrupt");
 		if (content.byteLength > TMUX_OWNER_ISOLATION_MAX_LINE_BYTES) throw new Error("baseline_generation_corrupt");
-		return JSON.parse(content.toString("utf8")) as unknown;
+		if (
+			options.requireSingleLine === true &&
+			(!content.toString("utf8").endsWith("\n") || content.indexOf(0x0a) !== content.byteLength - 1)
+		)
+			throw new Error("baseline_generation_corrupt");
+		const value = JSON.parse(content.toString("utf8")) as unknown;
+		return options.includeIdentity ? { value, identity: { dev: after.dev, ino: after.ino } } : value;
 	} catch {
 		throw new Error("baseline_generation_corrupt");
 	} finally {
@@ -1756,16 +1829,47 @@ export function isOwnerGenerationBaselineCurrentSync(
 ): boolean {
 	try {
 		const current = captureOwnerGenerationBaselineSync(stateDir, sessionId);
-		if (baseline.state === "absent") return current.state === "absent";
-		return (
-			current.state === "current" &&
-			baseline.schema_version === current.schema_version &&
-			baseline.generation === current.generation &&
-			baseline.session_id === current.session_id &&
-			baseline.published_at === current.published_at
-		);
+		return sameOwnerGenerationBaseline(current, baseline);
 	} catch {
 		return false;
+	}
+}
+
+let ownerGenerationAfterMarkerForTests: (() => void) | undefined;
+
+/** @internal */
+export function __setOwnerGenerationAfterMarkerForTests(hook: (() => void) | undefined): void {
+	ownerGenerationAfterMarkerForTests = hook;
+}
+
+function publishImmutableGenerationMarkerWithAuthority(
+	authority: PortableRecoveryFsRoot,
+	name: string,
+	generation: { schema_version: 1; generation: string; session_id: string; published_at: string },
+): void {
+	const result = authority.writeExclusive(name, Buffer.from(`${JSON.stringify(generation)}\n`));
+	if (result.ok) return;
+	if (result.code === "already_exists") throw new Error("generation_replay");
+	throw new Error("generation_marker_publication_failed");
+}
+
+function ensureGenerationMarkerWithAuthority(
+	authority: PortableRecoveryFsRoot,
+	name: string,
+	generation: { schema_version: 1; generation: string; session_id: string; published_at: string },
+): void {
+	try {
+		publishImmutableGenerationMarkerWithAuthority(authority, name, generation);
+	} catch (error) {
+		if ((error as Error).message !== "generation_replay") throw error;
+		const existing = authority.read(name, TMUX_OWNER_ISOLATION_MAX_LINE_BYTES);
+		if (!existing.ok || !existing.data) throw error;
+		try {
+			if (JSON.stringify(JSON.parse(Buffer.from(existing.data).toString("utf8"))) !== JSON.stringify(generation))
+				throw error;
+		} catch {
+			throw error;
+		}
 	}
 }
 
@@ -1780,32 +1884,57 @@ export function replaceOwnerGenerationSync(
 	const db = acquireSqliteLockSync(paths, 7_000);
 	if (!db) throw new Error("generation_lock_contended");
 	const temporaryGeneration = `${paths.generationFile}.${crypto.randomUUID()}.tmp`;
+	let authority: PortableRecoveryFsRoot | undefined;
 	try {
+		authority = openPortableRecoveryFsRoot(paths.root);
 		assertNoStagedOwnerTerminal(paths);
-		if (!isOwnerGenerationBaselineCurrentSync(stateDir, sessionId, expectedBaseline))
-			throw new Error("baseline_generation_changed");
-		const previous = captureOwnerGenerationBaselineSync(stateDir, sessionId);
+		const previous = authority
+			? ownerGenerationBaselineFromAuthority(authority, sessionId)
+			: captureOwnerGenerationBaselineSync(stateDir, sessionId);
+		if (!sameOwnerGenerationBaseline(previous, expectedBaseline)) throw new Error("baseline_generation_changed");
 		const published = {
 			schema_version: 1 as const,
 			generation,
 			session_id: sessionId,
 			published_at: new Date().toISOString(),
 		};
-		publishImmutableGenerationMarkerSync(paths.generationMarkerFile, published);
-		if (previous.state === "current" && previous.generation !== generation)
-			ensureGenerationMarkerSync(
-				lifecyclePaths(stateDir, sessionId, previous.generation).generationMarkerFile,
-				generationPublicationRecord(previous),
-			);
-		fsSync.writeFileSync(temporaryGeneration, `${JSON.stringify(published)}\n`, { mode: 0o600, flag: "wx" });
-		const generationFd = fsSync.openSync(temporaryGeneration, "r");
-		try {
-			fsSync.fsyncSync(generationFd);
-		} finally {
-			fsSync.closeSync(generationFd);
+		if (authority) {
+			publishImmutableGenerationMarkerWithAuthority(authority, path.basename(paths.generationMarkerFile), published);
+			if (previous.state === "current" && previous.generation !== generation)
+				ensureGenerationMarkerWithAuthority(
+					authority,
+					path.basename(lifecyclePaths(stateDir, sessionId, previous.generation).generationMarkerFile),
+					generationPublicationRecord(previous),
+				);
+			ownerGenerationAfterMarkerForTests?.();
+			const installed = authority.replace("generation.json", Buffer.from(`${JSON.stringify(published)}\n`));
+			if (!installed.ok) throw new Error("generation_publication_failed");
+			const retainedIdentity = authority.identity();
+			const visibleIdentity = fsSync.statSync(paths.root);
+			if (
+				!retainedIdentity.ok ||
+				!retainedIdentity.identity ||
+				retainedIdentity.identity.dev !== visibleIdentity.dev.toString() ||
+				retainedIdentity.identity.ino !== visibleIdentity.ino.toString()
+			)
+				throw new Error("baseline_generation_changed");
+		} else {
+			publishImmutableGenerationMarkerSync(paths.generationMarkerFile, published);
+			if (previous.state === "current" && previous.generation !== generation)
+				ensureGenerationMarkerSync(
+					lifecyclePaths(stateDir, sessionId, previous.generation).generationMarkerFile,
+					generationPublicationRecord(previous),
+				);
+			fsSync.writeFileSync(temporaryGeneration, `${JSON.stringify(published)}\n`, { mode: 0o600, flag: "wx" });
+			const generationFd = fsSync.openSync(temporaryGeneration, "r");
+			try {
+				fsSync.fsyncSync(generationFd);
+			} finally {
+				fsSync.closeSync(generationFd);
+			}
+			fsSync.renameSync(temporaryGeneration, paths.generationFile);
+			fsyncDirectorySync(paths.root);
 		}
-		fsSync.renameSync(temporaryGeneration, paths.generationFile);
-		fsyncDirectorySync(paths.root);
 		if (previous.state === "current" && previous.generation !== generation) {
 			const priorIntent = lifecyclePaths(stateDir, sessionId, previous.generation).intentFile;
 			try {
@@ -1822,6 +1951,7 @@ export function replaceOwnerGenerationSync(
 
 		throw error;
 	} finally {
+		authority?.close();
 		try {
 			fsSync.unlinkSync(temporaryGeneration);
 		} catch {}
@@ -1873,8 +2003,11 @@ export function __setIntentEvidenceReadHooksForTests(hooks: IntentEvidenceReadTe
 	intentEvidenceReadTestHooks = hooks;
 }
 
-async function readDescriptorBounded(handle: fs.FileHandle): Promise<Buffer> {
-	const buffer = Buffer.alloc(TMUX_OWNER_ISOLATION_MAX_LINE_BYTES + 1);
+async function readDescriptorBounded(
+	handle: fs.FileHandle,
+	maxBytes = TMUX_OWNER_ISOLATION_MAX_LINE_BYTES,
+): Promise<Buffer> {
+	const buffer = Buffer.alloc(maxBytes + 1);
 	let offset = 0;
 	while (offset < buffer.byteLength) {
 		const { bytesRead } = await handle.read(buffer, offset, buffer.byteLength - offset, offset);
@@ -1894,7 +2027,10 @@ async function intentMarkerExists(file: string): Promise<boolean> {
 	}
 }
 
-export async function readNoFollowJson(file: string): Promise<unknown | null> {
+export async function readNoFollowJson(
+	file: string,
+	maxBytes = TMUX_OWNER_ISOLATION_MAX_LINE_BYTES,
+): Promise<unknown | null> {
 	const platform = intentEvidenceReadTestHooks?.platform ?? process.platform;
 	const noFollow = platform === "win32" ? 0 : fsSync.constants.O_NOFOLLOW | fsSync.constants.O_NONBLOCK;
 	let pathBefore: fsSync.BigIntStats;
@@ -1905,7 +2041,7 @@ export async function readNoFollowJson(file: string): Promise<unknown | null> {
 		throw error;
 	}
 	if (!pathBefore.isFile()) throw new Error("not_regular_file");
-	if (pathBefore.size > BigInt(TMUX_OWNER_ISOLATION_MAX_LINE_BYTES)) throw new Error("lifecycle_record_too_large");
+	if (pathBefore.size > BigInt(maxBytes)) throw new Error("lifecycle_record_too_large");
 	await intentEvidenceReadTestHooks?.afterPathStat?.(file);
 	let handle: fs.FileHandle;
 	try {
@@ -1918,7 +2054,7 @@ export async function readNoFollowJson(file: string): Promise<unknown | null> {
 		const before = await handle.stat({ bigint: true });
 		if (!before.isFile() || before.dev !== pathBefore.dev || before.ino !== pathBefore.ino)
 			throw new Error("changed_file");
-		const content = await readDescriptorBounded(handle);
+		const content = await readDescriptorBounded(handle, maxBytes);
 		const after = await handle.stat({ bigint: true });
 		let pathAfter: fsSync.BigIntStats;
 		try {
@@ -1939,7 +2075,7 @@ export async function readNoFollowJson(file: string): Promise<unknown | null> {
 			before.ctimeNs !== after.ctimeNs
 		)
 			throw new Error("changed_file");
-		if (content.byteLength > TMUX_OWNER_ISOLATION_MAX_LINE_BYTES) throw new Error("lifecycle_record_too_large");
+		if (content.byteLength > maxBytes) throw new Error("lifecycle_record_too_large");
 		return JSON.parse(content.toString("utf8"));
 	} finally {
 		await handle.close();
@@ -2943,10 +3079,16 @@ function isPublishGenerationRequest(request: unknown): request is PublishGenerat
 		hasOnlyKeys(request, [
 			"schema_version",
 			"op",
-			"auth_token",
 			"session_id",
 			"owner_generation",
 			"state_dir",
+			"socket_key",
+			"owner_native_session_id",
+			"owner_pane_id",
+			"owner_pid",
+			"owner_start_time",
+			"owner_server_pid",
+			"owner_server_start_time",
 			"baseline",
 		]) &&
 		request.schema_version === 1 &&
@@ -2957,6 +3099,20 @@ function isPublishGenerationRequest(request: unknown): request is PublishGenerat
 		isSafePathComponent(request.owner_generation, "owner generation") &&
 		nonEmpty(request.state_dir) &&
 		path.isAbsolute(request.state_dir) &&
+		nonEmpty(request.socket_key) &&
+		(request.owner_native_session_id === undefined || nonEmpty(request.owner_native_session_id)) &&
+		(request.owner_pane_id === undefined || nonEmpty(request.owner_pane_id)) &&
+		(request.owner_native_session_id === undefined) === (request.owner_pane_id === undefined) &&
+		(request.owner_pid === undefined ||
+			(typeof request.owner_pid === "number" && Number.isSafeInteger(request.owner_pid) && request.owner_pid > 0)) &&
+		(request.owner_start_time === undefined || nonEmpty(request.owner_start_time)) &&
+		(request.owner_pid === undefined) === (request.owner_start_time === undefined) &&
+		(request.owner_server_pid === undefined ||
+			(typeof request.owner_server_pid === "number" &&
+				Number.isSafeInteger(request.owner_server_pid) &&
+				request.owner_server_pid > 0)) &&
+		(request.owner_server_start_time === undefined || nonEmpty(request.owner_server_start_time)) &&
+		(request.owner_server_pid === undefined) === (request.owner_server_start_time === undefined) &&
 		isOwnerGenerationBaseline(request.baseline)
 	);
 }
@@ -2967,11 +3123,20 @@ function isObserveTerminalRequest(request: unknown): request is ObserveTerminalR
 		hasOnlyKeys(request, [
 			"schema_version",
 			"op",
-			"auth_token",
 			"session_id",
 			"owner_generation",
 			"state_dir",
 			"socket_key",
+			"owner_native_session_id",
+			"owner_pane_id",
+			"owner_pid",
+			"owner_start_time",
+			"owner_server_pid",
+			"owner_server_start_time",
+			"monitor_native_session_id",
+			"monitor_pane_id",
+			"monitor_pid",
+			"monitor_start_time",
 			"observer",
 			"observed_at",
 			"signal",
@@ -2990,6 +3155,28 @@ function isObserveTerminalRequest(request: unknown): request is ObserveTerminalR
 		nonEmpty(request.state_dir) &&
 		path.isAbsolute(request.state_dir) &&
 		nonEmpty(request.socket_key) &&
+		(request.owner_native_session_id === undefined || nonEmpty(request.owner_native_session_id)) &&
+		(request.owner_pane_id === undefined || nonEmpty(request.owner_pane_id)) &&
+		(request.owner_native_session_id === undefined) === (request.owner_pane_id === undefined) &&
+		(request.owner_pid === undefined ||
+			(typeof request.owner_pid === "number" && Number.isSafeInteger(request.owner_pid) && request.owner_pid > 0)) &&
+		(request.owner_start_time === undefined || nonEmpty(request.owner_start_time)) &&
+		(request.owner_pid === undefined) === (request.owner_start_time === undefined) &&
+		(request.owner_server_pid === undefined ||
+			(typeof request.owner_server_pid === "number" &&
+				Number.isSafeInteger(request.owner_server_pid) &&
+				request.owner_server_pid > 0)) &&
+		(request.owner_server_start_time === undefined || nonEmpty(request.owner_server_start_time)) &&
+		(request.owner_server_pid === undefined) === (request.owner_server_start_time === undefined) &&
+		(request.monitor_native_session_id === undefined || nonEmpty(request.monitor_native_session_id)) &&
+		(request.monitor_pane_id === undefined || nonEmpty(request.monitor_pane_id)) &&
+		(request.monitor_native_session_id === undefined) === (request.monitor_pane_id === undefined) &&
+		(request.monitor_pid === undefined ||
+			(typeof request.monitor_pid === "number" &&
+				Number.isSafeInteger(request.monitor_pid) &&
+				request.monitor_pid > 0)) &&
+		(request.monitor_start_time === undefined || nonEmpty(request.monitor_start_time)) &&
+		(request.monitor_pid === undefined) === (request.monitor_start_time === undefined) &&
 		isTerminalObserver(request.observer) &&
 		isCanonicalUtcTimestamp(request.observed_at) &&
 		isTerminalSignal(request.signal) &&
@@ -3089,22 +3276,7 @@ export function isTrustedOwnerIsolationProtocolRequest(
 			return false;
 		return controlArgv.length > 0 && isTrustedTmuxOwnerIsolationArgv(request.tmux_argv);
 	}
-	if (!nonEmpty(request.auth_token) || !/^[a-f0-9]{64}$/.test(request.auth_token)) return false;
-	try {
-		const capability = readNoFollowJsonSync(
-			lifecyclePaths(request.state_dir, request.session_id, request.owner_generation).protocolTokenFile,
-		);
-		return (
-			isRecord(capability) &&
-			Object.keys(capability).length === 4 &&
-			capability.schema_version === 1 &&
-			capability.session_id === request.session_id &&
-			capability.generation === request.owner_generation &&
-			capability.token_sha256 === crypto.createHash("sha256").update(request.auth_token).digest("hex")
-		);
-	} catch {
-		return false;
-	}
+	return true;
 }
 function isTerminalSignal(value: unknown): value is TerminalSignal {
 	return (

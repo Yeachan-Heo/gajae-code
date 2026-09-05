@@ -185,11 +185,13 @@ export interface NativePublishDiagnostic {
 
 const requiredGeneratedBindingSymbols = [
 	"RecoveryFsRoot",
+	"PortableRecoveryFsRoot",
 	"RecoveryFsIdentity",
 	"RecoveryFsResult",
 	"NativePublishDiagnostic",
 	"NativePublishSyncFailure",
 	"openRecoveryFsRoot",
+	"openPortableRecoveryFsRoot",
 	"repairOwnerOnlyPathSecurityExpected",
 	"verifyOwnerOnlyPathSecurityExpected",
 	"probeWindowsJobMemory",

@@ -769,6 +769,22 @@ describe("launch guard classification", () => {
 		expect(guard?.message).toContain("[launch diagnostic truncated]");
 	});
 
+	it("neutralizes terminal control bytes in launch guard diagnostics", async () => {
+		const repo = await createRepo("gjc-guard-controls-");
+		let caught: unknown;
+		try {
+			prepareLaunchWorktree(repo, ["--worktree", "bad\u001b]52;c;forged\u0007\rreset\u007f"]);
+		} catch (error) {
+			caught = error;
+		}
+		const message = asLaunchWorktreeGuardError(caught)?.message ?? "";
+		expect(message).not.toMatch(/[\u0000-\u0008\u000B-\u001F\u007F]/u);
+		expect(message).toContain("\\u001b");
+		expect(message).toContain("\\u0007");
+		expect(message).toContain("\\u000d");
+		expect(message).toContain("\\u007f");
+	});
+
 	it("leaves a genuine defect unclassified so it keeps full crash diagnostics", () => {
 		expect(asLaunchWorktreeGuardError(new TypeError("cannot read properties of undefined"))).toBeNull();
 		// A plain Error is never promoted by message shape, even if it looks like a guard.

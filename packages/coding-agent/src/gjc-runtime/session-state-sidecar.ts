@@ -18,6 +18,7 @@ import {
 	writeCoordinatorAtomic,
 } from "../coordinator-mcp/durability";
 import { reduceTerminalReceiptState } from "../sdk/receipt-state";
+import { truncateUtf8 } from "../session/btw-contract";
 import { TOOL_CATALOG } from "../tools/tool-catalog.generated";
 import { sessionRoot, sessionRuntimeDir } from "./session-layout";
 import { SessionStateLockUnavailableError, withSessionStateFileLock } from "./session-state-lock";
@@ -141,6 +142,9 @@ export type RuntimeState = "ready_for_input" | "running" | "needs_user_input" | 
 
 type FinalResponseSource = "agent_end" | "launch_error";
 const MAX_PUBLIC_ERROR_MESSAGE_LENGTH = 2000;
+const RUNTIME_STATE_MARKER_MAX_BYTES = 256 * 1024;
+const LEGACY_RUNTIME_STATE_MARKER_MAX_BYTES = 16 * 1024 * 1024;
+const RUNTIME_STATE_FINAL_RESPONSE_MAX_BYTES = 128 * 1024;
 const HEARTBEAT_MS = 1000;
 
 /**
@@ -932,7 +936,15 @@ export async function readTerminalRuntimeStateMarker(input: {
 	let value: unknown;
 	try {
 		await fs.lstat(stateFile);
-		value = await readNoFollowJson(stateFile);
+		try {
+			value = await readNoFollowJson(stateFile, RUNTIME_STATE_MARKER_MAX_BYTES);
+		} catch (error) {
+			if ((error as Error).message !== "lifecycle_record_too_large") throw error;
+			// Builds before terminal-marker budgeting could persist an unbounded
+			// final response. Preserve a finite compatibility window for detached
+			// session collection without weakening descriptor/no-follow validation.
+			value = await readNoFollowJson(stateFile, LEGACY_RUNTIME_STATE_MARKER_MAX_BYTES);
+		}
 	} catch (error) {
 		const code = (error as { code?: unknown }).code;
 		return {
@@ -988,16 +1000,47 @@ function finalResponseForEvent(event: RuntimeStateEvent): {
 	format: "markdown";
 	source: FinalResponseSource;
 	artifact_path: null;
-	truncated: false;
+	truncated: boolean;
 } | null {
 	if (event.type !== "agent_end") return null;
+	const fullText = assistantText(lastAssistant(event.messages));
+	const text = fullText === null ? null : truncateUtf8(fullText, RUNTIME_STATE_FINAL_RESPONSE_MAX_BYTES);
 	return {
-		text: assistantText(lastAssistant(event.messages)),
+		text,
 		format: "markdown",
 		source: "agent_end",
 		artifact_path: null,
-		truncated: false,
+		truncated: text !== fullText,
 	};
+}
+
+function boundTerminalMarkerPayload(payload: Record<string, unknown>, keyId: string | null): Record<string, unknown> {
+	const serializedBytes = (candidate: Record<string, unknown>): number =>
+		Buffer.byteLength(JSON.stringify(finalizeSidecarPayload(candidate, keyId)), "utf8") + 1;
+	if (serializedBytes(payload) <= RUNTIME_STATE_MARKER_MAX_BYTES) return payload;
+	const finalResponse = payload.final_response;
+	if (!finalResponse || typeof finalResponse !== "object") throw new PreviousRuntimeStateReadError();
+	const response = finalResponse as Record<string, unknown>;
+	if (typeof response.text !== "string") throw new PreviousRuntimeStateReadError();
+	const fullText = response.text;
+	let low = 0;
+	let high = Buffer.byteLength(fullText, "utf8");
+	let fitted: Record<string, unknown> | null = null;
+	while (low <= high) {
+		const midpoint = Math.floor((low + high) / 2);
+		const candidate = {
+			...payload,
+			final_response: { ...response, text: truncateUtf8(fullText, midpoint), truncated: true },
+		};
+		if (serializedBytes(candidate) <= RUNTIME_STATE_MARKER_MAX_BYTES) {
+			fitted = candidate;
+			low = midpoint + 1;
+		} else {
+			high = midpoint - 1;
+		}
+	}
+	if (!fitted) throw new PreviousRuntimeStateReadError();
+	return fitted;
 }
 
 export function stateForEvent(event: RuntimeStateEvent): RuntimeState | null {
@@ -1751,7 +1794,7 @@ export async function persistCoordinatorLaunchFailureState(input: {
 							!ownerMetadataValid ||
 							activeGeneration !== ownerGeneration ||
 							previous.session_id !== sessionId ||
-							(previousOwner !== null && previousOwner !== ownerGeneration)
+							previousOwner === null
 						)
 							return;
 					} else if (input.managedLaunch && previousManagedEvidence) {
@@ -1954,8 +1997,9 @@ async function withRuntimeStateWriterLocks<T>(
 
 /**
  * Validate the ownership fence carried by a previous runtime marker while the writer's
- * locks are held. An unowned predecessor remains valid for the explicit legacy paths;
- * once ownership is present, only the authenticated current generation may write.
+ * locks are held. An unowned predecessor remains valid for explicit legacy paths. Once
+ * ownership is present, the authenticated current generation may adopt a predecessor's
+ * marker for the same stable session identity and stamps its own generation on the write.
  */
 async function runtimeStateOwnerGenerationFence(
 	previous: Record<string, unknown>,
@@ -1985,7 +2029,7 @@ async function runtimeStateOwnerGenerationFence(
 		current.generation !== owner.generation
 	)
 		return false;
-	return previousGeneration === null || previousGeneration === owner.generation;
+	return true;
 }
 
 function stampRuntimeStateOwnerGeneration(
@@ -2170,8 +2214,9 @@ export async function persistCoordinatorRuntimeStateFromEvent(
 										}
 									: {}),
 						};
-						if (shouldSkipRuntimeStateWrite(previous, payload, nowMs)) return;
-						await writeStateFileSync(stateFile, payload, identity.sidecarKeyId);
+						const boundedPayload = boundTerminalMarkerPayload(payload, identity.sidecarKeyId);
+						if (shouldSkipRuntimeStateWrite(previous, boundedPayload, nowMs)) return;
+						await writeStateFileSync(stateFile, boundedPayload, identity.sidecarKeyId);
 					}),
 			),
 	);
@@ -3258,9 +3303,15 @@ export async function persistCoordinatorRuntimeStateFromOwnerVerdict(
 	stateFile: string,
 	ownerTerminal: OwnerTerminalContext,
 	verdict: OwnerVerdict,
+	fallbackCwd?: string,
 ): Promise<void> {
 	const previous = readPreviousPayload(stateFile);
-	const cwd = typeof previous.cwd === "string" && previous.cwd.trim() ? previous.cwd : ownerTerminal.stateDir;
+	const cwd =
+		typeof previous.cwd === "string" && previous.cwd.trim()
+			? previous.cwd
+			: typeof fallbackCwd === "string" && fallbackCwd.trim()
+				? fallbackCwd
+				: ownerTerminal.stateDir;
 	const sessionFile = typeof previous.session_file === "string" ? previous.session_file : null;
 	await persistCoordinatorRuntimeStateFromPostmortem(
 		postmortem.Reason.SIGTERM,

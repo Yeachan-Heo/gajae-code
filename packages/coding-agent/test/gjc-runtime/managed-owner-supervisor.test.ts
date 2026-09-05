@@ -1,13 +1,23 @@
 import { describe, expect, it } from "bun:test";
+import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import {
+	assertManagedOwnerGenerationPublished,
+	managedOwnerSupervisorIdentityMatches,
+	publishManagedOwnerSupervisorAuthoritySync,
+} from "@gajae-code/coding-agent/gjc-runtime/managed-owner-supervisor";
 import { sessionUltragoalDir } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
 import {
+	__setManagedOwnerEvidenceAfterFirstReadForTests,
+	__setManagedOwnerEvidenceAfterRootPinnedForTests,
 	captureOwnerGenerationBaseline,
 	createOwnerIntent,
+	isOwnerGenerationBaselineCurrentSync,
 	lifecyclePaths,
 	replaceOwnerGeneration,
+	replaceOwnerGenerationSync,
 	resolveManagedOwnerPredecessorSync,
 } from "@gajae-code/coding-agent/gjc-runtime/tmux-owner-isolation";
 
@@ -37,6 +47,7 @@ function startSupervisor(
 		forceMissingChildStartMarker?: string;
 		forceMissingNativeReferenceMarker?: string;
 		generation?: string;
+		internalEntry?: boolean;
 	} = {},
 ) {
 	const forcedMissingPidRead = options.forceMissingChildStartMarker
@@ -45,10 +56,10 @@ function startSupervisor(
 			? `if (pidReads === 2) { appendFileSync(${JSON.stringify(options.forceMissingNativeReferenceMarker)}, "forced-missing-native-reference:" + actualPid + "\\n"); return 2_000_000_000; }`
 			: "";
 	const script = forcedMissingPidRead
-		? `const { appendFileSync } = await import("node:fs"); const originalSpawn = Bun.spawn; Bun.spawn = options => { const child = originalSpawn(options); const actualPid = child.pid; let pidReads = 0; Object.defineProperty(child, "pid", { configurable: true, get() { pidReads += 1; ${forcedMissingPidRead} return actualPid; } }); return child; }; try { const { runManagedOwnerSupervisor } = await import(${JSON.stringify(supervisorModule)}); await runManagedOwnerSupervisor(); } finally { Bun.spawn = originalSpawn; }`
-		: `import { runManagedOwnerSupervisor } from ${JSON.stringify(supervisorModule)}; await runManagedOwnerSupervisor();`;
+		? `const { appendFileSync } = await import("node:fs"); const originalSpawn = Bun.spawn; Bun.spawn = options => { const child = originalSpawn(options); const actualPid = child.pid; let pidReads = 0; Object.defineProperty(child, "pid", { configurable: true, get() { pidReads += 1; ${forcedMissingPidRead} return actualPid; } }); return child; }; try { const { runManagedOwnerSupervisor } = await import(${JSON.stringify(supervisorModule)}); await runManagedOwnerSupervisor(${options.internalEntry ? "{ requireAuthority: true }" : ""}); } finally { Bun.spawn = originalSpawn; }`
+		: `import { runManagedOwnerSupervisor } from ${JSON.stringify(supervisorModule)}; await runManagedOwnerSupervisor(${options.internalEntry ? "{ requireAuthority: true }" : ""});`;
 	return Bun.spawn({
-		cmd: [process.execPath, "-e", script],
+		cmd: [process.execPath, "-e", script, ...(options.internalEntry ? ["--internal-managed-owner-supervisor"] : [])],
 		cwd: repoRoot,
 		stdout: "pipe",
 		stderr: "pipe",
@@ -100,6 +111,105 @@ function fastSigabrtCommand(): string[] {
 }
 
 describe("managed owner supervisor", () => {
+	it("accepts the exact Windows pane parent without weakening direct-supervisor platforms", () => {
+		expect(
+			managedOwnerSupervisorIdentityMatches({
+				platform: "win32",
+				record: {
+					supervisor_pid: 42,
+					supervisor_start_time: "wrapper-start",
+					supervisor_is_parent: true,
+				},
+				processPid: 43,
+				processStartTime: "supervisor-start",
+				parentPid: 42,
+				publishedProcessStartTime: "wrapper-start",
+			}),
+		).toBe(true);
+		expect(
+			managedOwnerSupervisorIdentityMatches({
+				platform: "linux",
+				record: {
+					supervisor_pid: 42,
+					supervisor_start_time: "wrapper-start",
+					supervisor_is_parent: true,
+				},
+				processPid: 43,
+				processStartTime: "supervisor-start",
+				parentPid: 42,
+				publishedProcessStartTime: "wrapper-start",
+			}),
+		).toBe(false);
+	});
+	it("refuses child release until the exact owner generation is current", async () => {
+		const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-owner-generation-"));
+		try {
+			await expect(
+				assertManagedOwnerGenerationPublished(stateDir, "session-2681", "generation-2681", { timeoutMs: 0 }),
+			).rejects.toThrow("managed_owner_supervisor_generation_unpublished");
+			const baseline = await captureOwnerGenerationBaseline(stateDir, "session-2681");
+			await replaceOwnerGeneration(stateDir, "session-2681", "generation-2681", baseline);
+			await expect(
+				assertManagedOwnerGenerationPublished(stateDir, "session-2681", "generation-2681"),
+			).resolves.toBeUndefined();
+			await expect(
+				assertManagedOwnerGenerationPublished(stateDir, "session-2681", "replacement-generation", { timeoutMs: 0 }),
+			).rejects.toThrow("managed_owner_supervisor_generation_unpublished");
+		} finally {
+			await fs.rm(stateDir, { recursive: true, force: true });
+		}
+	});
+
+	it("waits through the authority-before-generation interleave without releasing early", async () => {
+		const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-owner-handoff-"));
+		try {
+			let settled = false;
+			const handoff = assertManagedOwnerGenerationPublished(stateDir, "session-2681", "generation-2681", {
+				timeoutMs: 2_000,
+				pollMs: 5,
+			}).then(() => {
+				settled = true;
+			});
+			await Bun.sleep(25);
+			expect(settled).toBe(false);
+			const baseline = await captureOwnerGenerationBaseline(stateDir, "session-2681");
+			await replaceOwnerGeneration(stateDir, "session-2681", "generation-2681", baseline);
+			await handoff;
+			expect(settled).toBe(true);
+		} finally {
+			await fs.rm(stateDir, { recursive: true, force: true });
+		}
+	});
+	it("rejects a nested supervised entry that does not match parent-published authority", async () => {
+		if (process.platform !== "linux") return;
+		const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-owner-authority-"));
+		const marker = path.join(stateDir, "nested-child-ran");
+		try {
+			const supervisor = startSupervisor(
+				stateDir,
+				[process.execPath, "-e", `await Bun.write(${JSON.stringify(marker)}, "ran")`],
+				{ GJC_MANAGED_OWNER_SUPERVISED: "1", GJC_TMUX_OWNER_SERVER_KEY: "tmux" },
+				{ internalEntry: true },
+			);
+			publishManagedOwnerSupervisorAuthoritySync({
+				schema_version: 1,
+				kind: "managed_owner_supervisor_authority",
+				state_dir: stateDir,
+				session_id: "session-2681",
+				generation: "generation-2681",
+				supervisor_pid: supervisor.pid + 1,
+				supervisor_start_time: "forged",
+				server_pid: process.pid,
+				server_start_time: "forged",
+				native_session_id: "$forged",
+			});
+			expect(await supervisor.exited).not.toBe(0);
+			expect(await Bun.file(marker).exists()).toBe(false);
+		} finally {
+			await fs.rm(stateDir, { recursive: true, force: true });
+		}
+	});
+
 	it("records one exact durable SIGABRT receipt and exits with the abort status", async () => {
 		const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-owner-"));
 		try {
@@ -254,7 +364,7 @@ describe("managed owner supervisor", () => {
 		} finally {
 			await fs.rm(stateDir, { recursive: true, force: true });
 		}
-	});
+	}, 15_000);
 
 	it("records SIGABRT through the missing native child reference path", async () => {
 		if (process.platform !== "linux") return;
@@ -363,6 +473,151 @@ describe("managed owner supervisor", () => {
 			});
 			expect(resolveManagedOwnerPredecessorSync(stateDir, sessionId, baseline)).toBeUndefined();
 		} finally {
+			await fs.rm(stateDir, { recursive: true, force: true });
+		}
+	});
+	it("rejects identical-content predecessor evidence replaced between validation reads", async () => {
+		const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-owner-swap-"));
+		const sessionId = "session-2681";
+		const generation = "generation-2681";
+		try {
+			await replaceOwnerGeneration(stateDir, sessionId, generation);
+			const baseline = await captureOwnerGenerationBaseline(stateDir, sessionId);
+			const result = await runSupervisor(
+				stateDir,
+				[process.execPath, "-e", "setTimeout(() => process.exit(0), 100)"],
+				{
+					GJC_TMUX_OWNER_SERVER_KEY: "server-key",
+				},
+			);
+			expect(result.exitCode).toBe(0);
+			const verdictFile = lifecyclePaths(stateDir, sessionId, generation).verdictFile;
+			__setManagedOwnerEvidenceAfterFirstReadForTests(() => {
+				const replacement = `${verdictFile}.replacement`;
+				fsSync.writeFileSync(replacement, fsSync.readFileSync(verdictFile));
+				fsSync.renameSync(replacement, verdictFile);
+			});
+			expect(() => resolveManagedOwnerPredecessorSync(stateDir, sessionId, baseline)).toThrow(
+				"managed_owner_replacement_evidence_changed",
+			);
+		} finally {
+			__setManagedOwnerEvidenceAfterFirstReadForTests(undefined);
+			await fs.rm(stateDir, { recursive: true, force: true });
+		}
+	});
+	it("keeps predecessor reads pinned to the original lifecycle root across an ABA swap", async () => {
+		if (process.platform !== "linux") return;
+		const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-owner-root-swap-"));
+		const sessionId = "session-2681";
+		const generation = "generation-2681";
+		let displacedRoot = "";
+		try {
+			await replaceOwnerGeneration(stateDir, sessionId, generation);
+			const baseline = await captureOwnerGenerationBaseline(stateDir, sessionId);
+			const result = await runSupervisor(
+				stateDir,
+				[process.execPath, "-e", "setTimeout(() => process.exit(0), 100)"],
+				{ GJC_TMUX_OWNER_SERVER_KEY: "server-key" },
+			);
+			expect(result.exitCode).toBe(0);
+			const paths = lifecyclePaths(stateDir, sessionId, generation);
+			const original = await Bun.file(paths.verdictFile).text();
+			displacedRoot = `${paths.root}.original`;
+			__setManagedOwnerEvidenceAfterRootPinnedForTests(() => {
+				fsSync.renameSync(paths.root, displacedRoot);
+				fsSync.mkdirSync(paths.root);
+				fsSync.writeFileSync(paths.verdictFile, original);
+			});
+			__setManagedOwnerEvidenceAfterFirstReadForTests(() => {
+				if (!displacedRoot) return;
+				fsSync.rmSync(paths.root, { recursive: true });
+				fsSync.renameSync(displacedRoot, paths.root);
+				displacedRoot = "";
+			});
+			expect(resolveManagedOwnerPredecessorSync(stateDir, sessionId, baseline)).toBeUndefined();
+		} finally {
+			__setManagedOwnerEvidenceAfterRootPinnedForTests(undefined);
+			__setManagedOwnerEvidenceAfterFirstReadForTests(undefined);
+			if (displacedRoot) fsSync.renameSync(displacedRoot, lifecyclePaths(stateDir, sessionId, generation).root);
+			await fs.rm(stateDir, { recursive: true, force: true });
+		}
+	});
+	it("keeps the binding and SIGABRT receipt pinned to one lifecycle root", async () => {
+		if (process.platform === "win32") return;
+		const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-owner-pair-root-swap-"));
+		const sessionId = "session-2681";
+		const generation = "generation-2681";
+		let displacedRoot = "";
+		try {
+			await replaceOwnerGeneration(stateDir, sessionId, generation);
+			const baseline = await captureOwnerGenerationBaseline(stateDir, sessionId);
+			const result = await runSupervisor(stateDir, fastSigabrtCommand());
+			expect(result.exitCode).toBe(134);
+			const paths = lifecyclePaths(stateDir, sessionId, generation);
+			const files = fsSync.readdirSync(paths.root);
+			const receiptFile = files.find(file => file.startsWith("sigabrt-") && file.endsWith(".receipt.json"));
+			expect(receiptFile).toBeDefined();
+			displacedRoot = `${paths.root}.original`;
+			let swapped = false;
+			__setManagedOwnerEvidenceAfterRootPinnedForTests(() => {
+				if (swapped) return;
+				swapped = true;
+				fsSync.renameSync(paths.root, displacedRoot);
+				fsSync.mkdirSync(paths.root);
+				for (const file of files) fsSync.copyFileSync(path.join(displacedRoot, file), path.join(paths.root, file));
+				const forgedReceiptPath = path.join(paths.root, receiptFile!);
+				const forgedReceipt = JSON.parse(fsSync.readFileSync(forgedReceiptPath, "utf8"));
+				forgedReceipt.session_id = "forged-session";
+				fsSync.writeFileSync(forgedReceiptPath, `${JSON.stringify(forgedReceipt)}\n`);
+			});
+			expect(resolveManagedOwnerPredecessorSync(stateDir, sessionId, baseline)).toMatchObject({
+				generation,
+				sessionId,
+				runId: "run-2681",
+				incarnation: "incarnation-2681",
+			});
+		} finally {
+			__setManagedOwnerEvidenceAfterRootPinnedForTests(undefined);
+			if (displacedRoot && fsSync.existsSync(displacedRoot)) {
+				fsSync.rmSync(lifecyclePaths(stateDir, sessionId, generation).root, { recursive: true, force: true });
+				fsSync.renameSync(displacedRoot, lifecyclePaths(stateDir, sessionId, generation).root);
+			}
+			await fs.rm(stateDir, { recursive: true, force: true });
+		}
+	});
+	it("rejects a copied baseline from a replaced lifecycle root", async () => {
+		if (process.platform === "win32") return;
+		const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-owner-baseline-root-swap-"));
+		const sessionId = "session-2681";
+		const generation = "generation-2681";
+		let displacedRoot = "";
+		try {
+			await replaceOwnerGeneration(stateDir, sessionId, generation);
+			const baseline = await captureOwnerGenerationBaseline(stateDir, sessionId);
+			const result = await runSupervisor(
+				stateDir,
+				[process.execPath, "-e", "setTimeout(() => process.exit(0), 100)"],
+				{ GJC_TMUX_OWNER_SERVER_KEY: "server-key" },
+			);
+			expect(result.exitCode).toBe(0);
+			const paths = lifecyclePaths(stateDir, sessionId, generation);
+			displacedRoot = `${paths.root}.original`;
+			fsSync.renameSync(paths.root, displacedRoot);
+			fsSync.mkdirSync(paths.root);
+			for (const file of fsSync.readdirSync(displacedRoot))
+				fsSync.copyFileSync(path.join(displacedRoot, file), path.join(paths.root, file));
+			expect(isOwnerGenerationBaselineCurrentSync(stateDir, sessionId, baseline)).toBe(false);
+			expect(() => replaceOwnerGenerationSync(stateDir, sessionId, "successor-generation", baseline)).toThrow(
+				"baseline_generation_changed",
+			);
+			expect(() => resolveManagedOwnerPredecessorSync(stateDir, sessionId, baseline)).toThrow(
+				"managed_owner_replacement_evidence_changed",
+			);
+		} finally {
+			if (displacedRoot && fsSync.existsSync(displacedRoot)) {
+				fsSync.rmSync(lifecyclePaths(stateDir, sessionId, generation).root, { recursive: true, force: true });
+				fsSync.renameSync(displacedRoot, lifecyclePaths(stateDir, sessionId, generation).root);
+			}
 			await fs.rm(stateDir, { recursive: true, force: true });
 		}
 	});

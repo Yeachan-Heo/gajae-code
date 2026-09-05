@@ -48,12 +48,14 @@ import sys
 request = json.loads(sys.argv[1])
 mode = sys.argv[2]
 bin_path = sys.argv[3]
+def generation_baseline(generation_path):
+    if not os.path.exists(generation_path): return {"state": "absent"}
+    with open(generation_path, encoding="utf-8") as handle: record = json.load(handle)
+    root_identity = os.stat(os.path.dirname(generation_path))
+    return {"state": "current", **record, "root_dev": str(root_identity.st_dev), "root_ino": str(root_identity.st_ino)}
 if request["op"] == "publish_generation":
     generation_path = os.path.join(request["state_dir"], request["session_id"], "owner-lifecycle", "generation.json")
-    if os.path.exists(generation_path):
-        with open(generation_path, encoding="utf-8") as handle: current = {"state": "current", **json.load(handle)}
-    else:
-        current = {"state": "absent"}
+    current = generation_baseline(generation_path)
     if current != request["baseline"]:
         raise SystemExit(6)
     published = {"schema_version":1,"generation":request["owner_generation"],"session_id":request["session_id"],"published_at":datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")}
@@ -70,10 +72,7 @@ elif request["op"] == "plan":
         token = "123e4567-e89b-12d3-a456-426614174099"
         expected_scope = f"gjc-owner-{token}.scope"
         generation_path = os.path.join(request["state_dir"], request["session_id"], "owner-lifecycle", "generation.json")
-        if os.path.exists(generation_path):
-            with open(generation_path, encoding="utf-8") as handle: baseline = {"state": "current", **json.load(handle)}
-        else:
-            baseline = {"state": "absent"}
+        baseline = generation_baseline(generation_path)
         attempt = {"token":token,"session_name":request["session_id"],"socket_key":request["socket_key"],"server_absent_before":True,"baseline":baseline,"expires_at":"2099-01-01T00:00:00.000Z","tmux_argv_sha256":hashlib.sha256(json.dumps(request["tmux_argv"],ensure_ascii=False,separators=(",", ":")).encode("utf-8")).hexdigest()}
         with open(os.path.join(request["state_dir"], ".fixture-attempt.json"), "x", encoding="utf-8") as handle:
             json.dump(attempt, handle, separators=(",", ":"))
@@ -107,17 +106,11 @@ elif request["op"] == "bootstrap":
     if persisted != request["attempt"]:
         raise SystemExit(3)
     generation_path = os.path.join(request["state_dir"], request["session_id"], "owner-lifecycle", "generation.json")
-    if os.path.exists(generation_path):
-        with open(generation_path, encoding="utf-8") as handle: current = {"state": "current", **json.load(handle)}
-    else:
-        current = {"state": "absent"}
+    current = generation_baseline(generation_path)
     if current != request["attempt"]["baseline"]:
         raise SystemExit(4)
     os.unlink(attempt_path)
-    if os.path.exists(generation_path):
-        with open(generation_path, encoding="utf-8") as handle: current_after = {"state": "current", **json.load(handle)}
-    else:
-        current_after = {"state": "absent"}
+    current_after = generation_baseline(generation_path)
     if current_after != request["attempt"]["baseline"]:
         raise SystemExit(5)
     launched = subprocess.run(request["tmux_argv"], text=True, capture_output=True, check=False)
@@ -239,6 +232,23 @@ describe("gjc-session create public owner lifecycle", () => {
 		expect(await Bun.file(path.join(state, "creation-state.json")).json()).toMatchObject({ kind: "creation_started", session_id: name });
 	});
 
+	test("normalizes a relative state-directory override before owner isolation", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-create-relative-state-")); roots.push(root);
+		const dir = await worktree(root); const bin = await fixture(root);
+		const name = `relative-state-${Date.now()}`; sessions.push({ name, socket: `gjc-${name}` });
+		const result = Bun.spawnSync(["bash", createScript, name, "."], {
+			cwd: dir,
+			env: env({ GJC_BIN: bin, GJC_SESSION_STATE_DIR: ".state" }),
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		expect(result.exitCode, result.stderr.toString()).toBe(0);
+		expect(await Bun.file(path.join(dir, ".state", "metadata.json")).json()).toMatchObject({
+			session_id: name,
+			workdir: dir,
+		});
+	});
+
 	test("records an initially dirty worktree without claiming it as new recovery work", async () => {
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-create-dirty-")); roots.push(root);
 		const dir = await worktree(root); await Bun.write(path.join(dir, "README.md"), "dirty\n"); const state = path.join(root, "state"); const bin = await fixture(root);
@@ -314,10 +324,192 @@ describe("gjc-session create public owner lifecycle", () => {
 		const create = await Bun.file(createScript).text();
 		const launchLine = create.split("\n").find(line => line.startsWith("LAUNCH=("));
 		expect(launchLine).toBeDefined();
-		expect(launchLine).toContain("GJC_TMUX_OWNER_PROTOCOL_TOKEN");
+		expect(launchLine).not.toContain("GJC_TMUX_OWNER_PROTOCOL_TOKEN");
 		expect(launchLine).toContain('python3 "$STATE_DIR/supervisor.py"');
-		expect(create).toContain("child_environment.pop(\"GJC_TMUX_OWNER_PROTOCOL_TOKEN\", None)");
+		const paneStartCommand = Bun.spawnSync(
+			["tmux", "-L", `gjc-${name}`, "list-panes", "-t", `=${name}:`, "-F", "#{pane_start_command}"],
+			{ stdout: "pipe", stderr: "pipe" },
+		).stdout.toString();
+		expect(paneStartCommand).not.toContain("GJC_TMUX_OWNER_PROTOCOL_TOKEN");
+		expect(create).not.toContain("protocol-token-");
 	});
+
+	test("preserves a slash-containing relative tmux override across the supervisor cwd", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-create-relative-tmux-"));
+		roots.push(root);
+		const dir = await worktree(root);
+		const state = path.join(root, "state");
+		const tools = path.join(root, "tools");
+		const wrapper = path.join(tools, "tmux-wrapper");
+		await executable(wrapper, '#!/usr/bin/env bash\nexec tmux "$@"\n');
+		const bin = await fixture(root);
+		const name = `relative-tmux-${Date.now()}`;
+		const socket = `gjc-${name}`;
+		sessions.push({ name, socket });
+		const result = Bun.spawnSync(["bash", createScript, name, dir], {
+			cwd: root,
+			env: env({ GJC_BIN: bin, GJC_SESSION_STATE_DIR: state, GJC_SESSION_TMUX_BIN: "./tools/tmux-wrapper" }),
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		expect(result.exitCode, result.stderr.toString()).toBe(0);
+		expect(await Bun.file(path.join(state, name, "owner-lifecycle", "generation.json")).exists()).toBe(true);
+	});
+
+	test("rejects an exec-preserving child lifecycle forgery without a supervisor capability", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-create-authority-"));
+		roots.push(root);
+		const dir = await worktree(root);
+		const state = path.join(root, "state");
+		const attempted = path.join(root, "forgery-attempted");
+		const requestFile = path.join(root, "forgery-request.json");
+		const bin = path.join(root, "gjc");
+		await executable(
+			bin,
+			`#!/usr/bin/env bash
+set -euo pipefail
+if [[ "\${1:-}" == --internal-tmux-owner-isolation ]]; then
+	exec bun ${JSON.stringify(path.join(path.resolve(import.meta.dir, "..", "..", "packages", "coding-agent", "src", "cli.ts")))} "$@"
+fi
+forged_generation=forged-child-generation
+: > ${JSON.stringify(attempted)}
+tmux -L "$GJC_TMUX_OWNER_SERVER_KEY" set-option -t "=$GJC_COORDINATOR_SESSION_ID:" @gjc-owner-generation "$forged_generation"
+python3 - "$GJC_SESSION_STATE_DIR" "$GJC_COORDINATOR_SESSION_ID" "$forged_generation" "$GJC_TMUX_OWNER_SERVER_KEY" ${JSON.stringify(requestFile)} <<'PY'
+import json, os, sys
+state, session, generation, socket, target = sys.argv[1:]
+lifecycle = os.path.join(state, session, "owner-lifecycle")
+with open(os.path.join(lifecycle, "generation.json"), encoding="utf-8") as handle:
+    baseline = {"state": "current", **json.load(handle)}
+root_identity = os.stat(lifecycle)
+baseline.update({"root_dev": str(root_identity.st_dev), "root_ino": str(root_identity.st_ino)})
+with open(target, "w", encoding="utf-8") as handle:
+    json.dump({"schema_version":1,"op":"publish_generation","session_id":session,"owner_generation":generation,"state_dir":state,"socket_key":socket,"baseline":baseline}, handle, separators=(",", ":"))
+PY
+exec "$0" --internal-tmux-owner-isolation < ${JSON.stringify(requestFile)}
+`,
+		);
+		const name = `authority-${Date.now()}`;
+		const socket = `gjc-${name}`;
+		sessions.push({ name, socket });
+		const result = Bun.spawnSync(["bash", createScript, name, dir], {
+			env: env({ GJC_BIN: bin, GJC_SESSION_STATE_DIR: state }),
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		expect(result.exitCode, result.stderr.toString()).toBe(0);
+		await waitFor(attempted);
+		await Bun.sleep(500);
+		const lifecycle = path.join(state, name, "owner-lifecycle");
+		expect((await fs.readdir(lifecycle)).some(file => file.startsWith("protocol-token-"))).toBe(false);
+		const generation = ((await Bun.file(path.join(lifecycle, "generation.json")).json()) as { generation: string })
+			.generation;
+		expect(generation).not.toBe("forged-child-generation");
+		expect(await Bun.file(path.join(lifecycle, `started-${generation}.json`)).json()).toMatchObject({
+			kind: "started",
+			session_id: name,
+			owner_generation: generation,
+		});
+	}, 20_000);
+
+	test("terminates a childless supervisor before publication", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-create-prepublish-signal-"));
+		roots.push(root);
+		const dir = await worktree(root);
+		const state = path.join(root, "state");
+		const paused = path.join(root, "prepublication-paused");
+		const childStarted = path.join(root, "child-started");
+		const bin = await fixture(root, "direct", `: > "$GJC_FIXTURE_CHILD_STARTED"; sleep 30`);
+		const name = `prepublish-signal-${Date.now()}`;
+		const socket = `gjc-${name}`;
+		sessions.push({ name, socket });
+		const creator = Bun.spawn(["bash", createScript, name, dir], {
+			env: env({
+				GJC_BIN: bin,
+				GJC_SESSION_STATE_DIR: state,
+				GJC_SESSION_TEST_PAUSE_BEFORE_PUBLICATION_GO: paused,
+				GJC_FIXTURE_CHILD_STARTED: childStarted,
+			}),
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		await waitFor(paused);
+		const panePid = Bun.spawnSync(
+			["tmux", "-L", socket, "display-message", "-p", "-t", `=${name}:`, "#{pane_pid}"],
+			{ stdout: "pipe", stderr: "pipe" },
+		).stdout.toString().trim();
+		expect(panePid).toMatch(/^[1-9]\d*$/);
+		expect(Bun.spawnSync(["kill", "-TERM", panePid]).exitCode).toBe(0);
+		expect(Bun.spawnSync(["kill", "-TERM", String(creator.pid)]).exitCode).toBe(0);
+		expect(await creator.exited).not.toBe(0);
+		const lifecycle = path.join(state, name, "owner-lifecycle");
+		expect(await Bun.file(path.join(lifecycle, "generation.json")).exists()).toBe(false);
+		expect(
+			(await fs.readdir(lifecycle).catch(() => [] as string[])).some(file => file.startsWith("started-")),
+		).toBe(false);
+		expect(await Bun.file(childStarted).exists()).toBe(false);
+	}, 20_000);
+
+	test("persists started evidence before creator death can strand a running generation", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-create-creator-death-"));
+		roots.push(root);
+		const dir = await worktree(root);
+		const state = path.join(root, "state");
+		const paused = path.join(root, "postpublication-paused");
+		const childStarted = path.join(root, "child-started");
+		const bin = await fixture(root, "direct", `: > "$GJC_FIXTURE_CHILD_STARTED"; sleep 30`);
+		const name = `creator-death-${Date.now()}`;
+		const socket = `gjc-${name}`;
+		sessions.push({ name, socket });
+		const creator = Bun.spawn(["bash", createScript, name, dir], {
+			env: env({
+				GJC_BIN: bin,
+				GJC_SESSION_STATE_DIR: state,
+				GJC_SESSION_TEST_PAUSE_AFTER_PUBLICATION_READY: paused,
+				GJC_FIXTURE_CHILD_STARTED: childStarted,
+			}),
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		await waitFor(paused);
+		const lifecycle = path.join(state, name, "owner-lifecycle");
+		const generation = ((await Bun.file(path.join(lifecycle, "generation.json")).json()) as { generation: string })
+			.generation;
+		expect(await Bun.file(path.join(lifecycle, `started-${generation}.json`)).json()).toEqual({
+			schema_version: 1,
+			kind: "started",
+			session_id: name,
+			owner_generation: generation,
+		});
+		await waitFor(childStarted);
+		expect(Bun.spawnSync(["kill", "-TERM", String(creator.pid)]).exitCode).toBe(0);
+		expect(await creator.exited).not.toBe(0);
+	}, 20_000);
+
+	test("does not launch the workload when started receipt persistence fails", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-create-started-failure-"));
+		roots.push(root);
+		const dir = await worktree(root);
+		const state = path.join(root, "state");
+		const childStarted = path.join(root, "child-started");
+		const bin = await fixture(root, "direct", `: > "$GJC_FIXTURE_CHILD_STARTED"; sleep 30`);
+		const name = `started-failure-${Date.now()}`;
+		const socket = `gjc-${name}`;
+		sessions.push({ name, socket });
+		const result = Bun.spawnSync(["bash", createScript, name, dir], {
+			env: env({
+				GJC_BIN: bin,
+				GJC_SESSION_STATE_DIR: state,
+				GJC_SESSION_TEST_FAIL_RECEIPT_WRITE: "started_canonical",
+				GJC_FIXTURE_CHILD_STARTED: childStarted,
+			}),
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		expect(result.exitCode).not.toBe(0);
+		expect(await Bun.file(childStarted).exists()).toBe(false);
+		const lifecycle = path.join(state, name, "owner-lifecycle");
+		expect((await fs.readdir(lifecycle)).some(file => file.startsWith("started-"))).toBe(false);
+	}, 20_000);
 
 test("fails closed for malformed plans before creating an owner", async () => {
 	const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-create-invalid-plan-")); roots.push(root);
@@ -537,7 +729,7 @@ test("does not recover an incident again in a third generation when a canonical 
 		const create = await Bun.file(createScript).text();
 		expect(create).toContain('last_seen_ms="$(date +%s%3N)"');
 		expect(create).toContain('deadline_at_ms=$((last_seen_ms + 7000))');
-		expect(create).toContain('timeout "${remaining_seconds}s" "$GJC_SESSION_GJC_BIN"');
+		expect(create).toContain('authorized_owner_call "$remaining_seconds"');
 		expect(create).toContain('within_recovery_deadline || exit 1');
 		expect(create).not.toContain('deadline=$((SECONDS + 7))');
 	});
@@ -619,8 +811,15 @@ gjc_session_write_vanished_json() { : >"$1"; }
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-create-monitor-")); roots.push(root);
 		const dir = await worktree(root); const state = path.join(root, "state"); const bin = await fixture(root);
 		const name = `monitor-${Date.now()}`; const socket = `gjc-${name}`; sessions.push({ name, socket });
-		expect(Bun.spawnSync(["bash", createScript, name, dir], { env: { ...env({ GJC_BIN: bin, GJC_SESSION_STATE_DIR: state }), GJC_SESSION_MONITOR_DISABLE: "0", GJC_SESSION_MONITOR_INTERVAL: "1" } }).exitCode).toBe(0);
+		const created = Bun.spawnSync(["bash", createScript, name, dir], { env: { ...env({ GJC_BIN: bin, GJC_SESSION_STATE_DIR: state }), GJC_SESSION_MONITOR_DISABLE: "0", GJC_SESSION_MONITOR_INTERVAL: "1" }, stderr: "pipe" });
+		expect(created.exitCode, created.stderr.toString()).toBe(0);
 		Bun.spawnSync(["tmux", "-L", socket, "kill-session", "-t", name], { stdout: "pipe", stderr: "pipe" });
+		expect(
+			Bun.spawnSync(["tmux", "-L", socket, "new-session", "-d", "-s", name, "sleep 30"], {
+				stdout: "pipe",
+				stderr: "pipe",
+			}).exitCode,
+		).toBe(0);
 		await waitFor(path.join(state, "incident.json"), 8_000);
 		expect(await Bun.file(path.join(state, "verdict.json")).json()).toMatchObject({ classification: "unexpected_owner_loss" });
 		const incidentAlias = (await Bun.file(path.join(state, "incident.json")).json()) as { owner_generation: string; incident_dedupe: string };
@@ -632,6 +831,7 @@ gjc_session_write_vanished_json() { : >"$1"; }
 			dedupe_key: `owner-loss:${name}:${generation.generation}`,
 		});
 		expect(await Bun.file(path.join(state, "recovery.json")).exists()).toBe(false);
+		Bun.spawnSync(["tmux", "-L", socket, "kill-session", "-t", name], { stdout: "pipe", stderr: "pipe" });
 		const recovered = Bun.spawnSync(["bash", createScript, name, dir], {
 			env: env({ GJC_BIN: bin, GJC_SESSION_STATE_DIR: state }),
 			stdout: "pipe",

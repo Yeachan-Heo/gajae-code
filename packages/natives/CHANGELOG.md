@@ -5,6 +5,7 @@
 ### Fixed
 
 - Recheck full computer-use supervisor state between keys, and report keyboard-event creation failures while retaining pressed keys for cleanup before cursor restoration.
+- Portable Unix reads reopen the retained-root entry after reading and require it to name the original descriptor identity; Windows exclusive-write identity failures remove the newly created entry or report cleanup failure.
 
 ## [0.16.6] - 2026-09-07
 
@@ -13,6 +14,10 @@
 ### Fixed
 
 - The addon loader now honors `GJC_NATIVE_VARIANT`, the x64 variant override named in `docs/natives-architecture.md`, `docs/natives-addon-loader-runtime.md`, and `docs/natives-build-release-debugging.md`. Only the pre-rebrand `PI_NATIVE_VARIANT` was read, so the documented remedy for a machine that loads the wrong variant — including the troubleshooting row that prescribes `GJC_NATIVE_VARIANT=baseline` — silently kept the auto-detected variant. The legacy name still works, the canonical name wins when both are set, an empty canonical value falls through to the alias, and invalid values are still ignored.
+- Added a narrow `PortableRecoveryFsRoot` authority for root-identity inspection, bounded directory enumeration, single-component no-follow reads, and durable exclusive/atomic-replacement writes. Unix uses a retained directory descriptor; Windows retains no-delete-share handles for the root and its full ancestor chain so neither the lifecycle root nor a containing directory can be renamed or replaced during evidence recovery or publication.
+- Portable retained-root reads report `not_found` only for an absent directory entry; symlinks, permission failures, and other `openat` errors remain untrusted evidence.
+- Portable atomic replacement retains the staged file handle through rename, then requires the installed device/inode and bytes to match that exact staged object before reporting publication success.
+- Native addon validation now rejects same-version retained artifacts that lack `openPortableRecoveryFsRoot` or any retained-root identity, enumeration, read, close, or publication method, allowing normal fallback/reinstall diagnostics instead of a runtime undefined-function failure.
 
 ## [0.16.4] - 2026-09-05
 

@@ -121,6 +121,19 @@ export function buildGjcTmuxExactSessionTarget(
 	return `=${safeSessionName}`;
 }
 
+/** Preserve immutable native tmux `$N` handles while normalizing named targets. */
+export function normalizeExactTmuxTarget(
+	sessionTarget: string,
+	env: NodeJS.ProcessEnv,
+	kind: "session" | "option",
+	binary?: ResolvedTmuxBinary,
+): string {
+	if (/^\$[0-9]+$/.test(sessionTarget)) return sessionTarget;
+	return kind === "option"
+		? buildGjcTmuxExactOptionTarget(sessionTarget, { env, binary })
+		: buildGjcTmuxExactSessionTarget(sessionTarget, { env, binary });
+}
+
 export const GJC_TMUX_UNTAGGED_REASON = "gjc_tmux_session_untagged";
 
 export function buildGjcTmuxUntaggedSessionHint(tmuxCommand: string): string {
