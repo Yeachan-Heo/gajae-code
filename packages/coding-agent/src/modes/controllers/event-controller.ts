@@ -246,8 +246,37 @@ export class EventController {
 
 	/** Session/transcript replacement invalidates callbacks before removing old children. */
 	resetAssistantTextPresentation(): void {
+		const detachedComponent = this.ctx.streamingComponent;
+		const detachedMessage = this.ctx.streamingMessage;
 		this.#sessionPresentationEpoch += 1;
 		this.#cancelAssistantTextPresentation();
+		// Some rebuild callers detach the live component before invoking this reset and
+		// reattach it immediately afterward. Advance its ownership epoch here so that
+		// reattachment remains eligible without requiring a second controller hook.
+		if (
+			detachedComponent &&
+			detachedMessage?.role === "assistant" &&
+			!this.ctx.chatContainer.hasLiveChild(detachedComponent)
+		) {
+			this.#assistantLifetimes.set(detachedComponent, {
+				sessionIdentity: this.ctx.session,
+				sessionEpoch: this.#sessionPresentationEpoch,
+			});
+		}
+	}
+
+	/** Rebind a detached live assistant after an in-place transcript rebuild. */
+	rebindAssistantTextPresentation(): void {
+		const component = this.ctx.streamingComponent;
+		if (!component) return;
+		this.#assistantLifetimes.set(component, {
+			sessionIdentity: this.ctx.session,
+			sessionEpoch: this.#sessionPresentationEpoch,
+		});
+		const message = this.ctx.streamingMessage;
+		if (message?.role === "assistant" && !this.#assistantTextSuspended) {
+			this.#queueAssistantText(component, message);
+		}
 	}
 
 	#isLiveAssistant(component: AssistantMessageComponent): boolean {
@@ -1057,15 +1086,55 @@ export class EventController {
 	}
 
 	async #handleAgentEnd(event: Extract<AgentSessionEvent, { type: "agent_end" }>): Promise<void> {
-		this.#flushAssistantText();
-		this.#cancelAssistantTextPresentation();
-		this.ctx.setWorkingMessage(undefined);
-		stopInteractiveActivityIndicator(this.ctx, { foregroundSettled: true });
-		if (this.ctx.streamingComponent) {
-			this.ctx.chatContainer.removeChild(this.ctx.streamingComponent);
+		const orphanComponent = this.ctx.streamingComponent;
+		const orphanMessage = this.ctx.streamingMessage?.role === "assistant" ? this.ctx.streamingMessage : undefined;
+		if (orphanComponent && orphanMessage) {
+			// An agent_end without message_end still owns the in-flight assistant.  Commit
+			// its latest partial text as a historical component instead of removing it
+			// before a frame can paint it.  A terminal payload, when present, is more
+			// authoritative than the last delta but remains on the same live component.
+			const authoritativeMessage = [...event.messages]
+				.reverse()
+				.find((message): message is AssistantMessage => message.role === "assistant");
+			const finalMessage = authoritativeMessage ?? orphanMessage;
+			if (finalMessage !== orphanMessage) {
+				transferSessionMessageIdentity([orphanMessage], [finalMessage]);
+				this.ctx.streamingMessage = finalMessage;
+			}
+			this.#cancelAssistantTextPresentation();
+			const aborted = finalMessage.stopReason === "aborted";
+			const silentlyAborted = aborted && isSilentAbort(finalMessage.errorMessage);
+			const ttsrSilenced = aborted && this.ctx.session.isTtsrAbortPending;
+			if (aborted && !silentlyAborted && !ttsrSilenced) {
+				finalMessage.errorMessage = buildAbortDisplayMessage({
+					errorMessage: finalMessage.errorMessage,
+					retryAttempt: this.ctx.session.retryAttempt,
+				});
+			}
+			const displayMessage =
+				silentlyAborted || ttsrSilenced ? { ...finalMessage, stopReason: "stop" as const } : finalMessage;
+			orphanComponent.updateContent(displayMessage, { streaming: false });
+			if (finalMessage.stopReason !== "aborted" && finalMessage.stopReason !== "error") {
+				for (const [toolCallId, component] of this.ctx.pendingTools.entries()) {
+					component.setArgsComplete(toolCallId);
+					this.#consumeToolVisibleChange(component);
+				}
+			}
+			this.#lastAssistantComponent = orphanComponent;
+			orphanComponent.setUsageInfo(finalMessage.usage);
 			this.ctx.streamingComponent = undefined;
 			this.ctx.streamingMessage = undefined;
+		} else {
+			this.#flushAssistantText();
+			this.#cancelAssistantTextPresentation();
+			if (orphanComponent) {
+				this.ctx.chatContainer.removeChild(orphanComponent);
+				this.ctx.streamingComponent = undefined;
+				this.ctx.streamingMessage = undefined;
+			}
 		}
+		this.ctx.setWorkingMessage(undefined);
+		stopInteractiveActivityIndicator(this.ctx, { foregroundSettled: true });
 		await this.ctx.planModeController.flushPendingModelSwitch();
 		if (this.ctx.isStopped?.()) return;
 		for (const toolCallId of Array.from(this.ctx.pendingTools.keys())) {

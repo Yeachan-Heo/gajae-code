@@ -444,7 +444,7 @@ describe("assistant text frame preparation", () => {
 		expect(f.queued.size).toBe(0);
 	});
 
-	it("flushes valid orphan text before agent_end removes the live component", async () => {
+	it("commits valid orphan text before agent_end retains the live component", async () => {
 		const f = fixture();
 		await f.controller.handleEvent({ type: "message_start", message: message("") });
 		const component = f.ctx.streamingComponent!;
@@ -474,11 +474,13 @@ describe("assistant text frame preparation", () => {
 		await f.update(message("orphan latest"));
 		const pending = f.controller.handleEvent({ type: "agent_end", messages: [] } as never);
 		await entered.promise;
-		expect(order).toEqual(["project", "remove"]);
+		expect(order).toEqual(["project", "project"]);
+		expect(f.ctx.chatContainer.hasLiveChild(component)).toBe(true);
 		expect(f.ctx.streamingMessage).toBeUndefined();
 		expect(f.ctx.streamingComponent).toBeUndefined();
 		f.captured[0]!();
-		expect(order).toEqual(["project", "remove"]);
+		expect(order).toEqual(["project", "project"]);
+		expect(Bun.stripANSI(component.render(80).join("\n"))).toContain("orphan latest");
 		stopped = true;
 		gate.resolve();
 		await pending;
@@ -536,6 +538,34 @@ describe("assistant text frame preparation", () => {
 		expect(projection).toHaveBeenLastCalledWith(latest, { streaming: true });
 	});
 
+	it("rebinds the live assistant across a reconcile rebuild while text is pending", async () => {
+		const f = fixture();
+		await f.controller.handleEvent({ type: "message_start", message: message("") });
+		const component = f.ctx.streamingComponent!;
+		const projection = vi.spyOn(component, "updateContent");
+		await f.update(message("before reconcile"));
+		const stale = f.captured[0]!;
+
+		// InteractiveMode.rebuildChatFromMessages("reconcile-same-transcript")
+		// detaches this live owner before clearing the historical children, then
+		// reattaches it and rebinds the controller epoch.
+		f.ctx.chatContainer.detachChild(component);
+		f.controller.resetAssistantTextPresentation();
+		f.ctx.chatContainer.clear();
+		f.ctx.chatContainer.addChild(component);
+		f.controller.rebindAssistantTextPresentation();
+		const latest = message("after reconcile");
+		await f.update(latest);
+		stale();
+
+		expect(f.ctx.chatContainer.hasLiveChild(component)).toBe(true);
+		expect(f.queued.size).toBe(1);
+		f.drain();
+		expect(projection).toHaveBeenCalledTimes(1);
+		expect(projection).toHaveBeenLastCalledWith(latest, { streaming: true });
+		expect(f.ctx.streamingComponent).toBe(component);
+	});
+
 	for (const invalidation of ["reset", "dispose", "session", "remove"] as const) {
 		it(`rejects stale captured work after ${invalidation}`, async () => {
 			const f = fixture();
@@ -561,9 +591,26 @@ describe("assistant text frame preparation", () => {
 		});
 	}
 
-	for (const duringStop of ["none", "delta", "final", "reset", "dispose"] as const) {
+	for (const duringStop of ["none", "delta", "final", "orphan-end", "reset", "dispose"] as const) {
 		it(`real TUI restart reconstructs current text: ${duringStop}`, async () => {
 			const f = fixture(true);
+			if (duringStop === "orphan-end") {
+				f.ctx.setWorkingMessage = vi.fn();
+				f.ctx.updateEditorBorderColor = vi.fn();
+				f.ctx.editor = { getText: () => "" } as never;
+				f.ctx.session = {
+					isCompacting: false,
+					isStreaming: false,
+					getLastAssistantMessage: vi.fn(() => undefined),
+					agent: { state: { messages: [] } },
+				} as never;
+				f.ctx.sessionManager = {
+					getSessionName: vi.fn(() => ""),
+					getCwd: vi.fn(() => process.cwd()),
+				} as never;
+				f.ctx.planModeController = { flushPendingModelSwitch: vi.fn(async () => {}) } as never;
+				vi.spyOn(f.controller, "sendCompletionNotification").mockImplementation(() => {});
+			}
 			try {
 				f.tui.start();
 				await f.terminal.waitForRender();
@@ -575,6 +622,12 @@ describe("assistant text frame preparation", () => {
 				if (duringStop === "delta") await f.update(message("latest during stop"));
 				if (duringStop === "final")
 					await f.controller.handleEvent({ type: "message_end", message: message("authoritative final") });
+				if (duringStop === "orphan-end") {
+					const revision = vi.spyOn(f.ctx, "recordVisibleTranscriptMutation");
+					revision.mockClear();
+					await f.controller.handleEvent({ type: "agent_end", messages: [] } as never);
+					expect(revision).toHaveBeenCalledTimes(1);
+				}
 				if (duringStop === "reset") f.controller.resetAssistantTextPresentation();
 				if (duringStop === "dispose") f.controller.dispose();
 				projection.mockClear();
@@ -585,6 +638,9 @@ describe("assistant text frame preparation", () => {
 					expect(f.terminal.getWriteLog().join("")).toContain(
 						duringStop === "none" ? "queued before stop" : "latest during stop",
 					);
+				} else if (duringStop === "orphan-end") {
+					expect(projection).not.toHaveBeenCalled();
+					expect(f.terminal.getWriteLog().join("")).toContain("queued before stop");
 				} else expect(projection).not.toHaveBeenCalled();
 			} finally {
 				f.tui.setRenderPreparationLifecycleCallbacks(undefined);
