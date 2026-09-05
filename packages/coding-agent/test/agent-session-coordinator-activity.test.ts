@@ -676,6 +676,7 @@ describe("AgentSession coordinator activity labels", () => {
 		release.resolve();
 		await syntheticPaired.promise;
 		await run;
+		await session.awaitSessionSettlement();
 		const settled = await settledActivity(stateFile);
 		sampling = false;
 		await sampler;
