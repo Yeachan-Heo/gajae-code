@@ -251,7 +251,10 @@ async function waitForCursorSetup<T>(
 	const aborted = Promise.withResolvers<never>();
 	aborted.promise.catch(() => {});
 	const onAbort = () => aborted.reject(cursorAbortError(signal!));
-	if (signal) signal.addEventListener("abort", onAbort, { once: true });
+	if (signal) {
+		signal.addEventListener("abort", onAbort, { once: true });
+		if (signal.aborted) onAbort();
+	}
 	try {
 		const racers: Promise<T | never>[] = [setup];
 		if (deadlineTimer) racers.push(deadline.promise);

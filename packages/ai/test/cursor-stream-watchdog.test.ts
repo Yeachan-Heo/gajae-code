@@ -144,6 +144,23 @@ describe("Cursor raw transport watchdog", () => {
 		expect(events.filter(isTerminalEvent)).toHaveLength(1);
 	});
 
+	it("aborts a synchronously cancelled payload hook when the first-event watchdog is disabled", async () => {
+		const controller = new AbortController();
+		const never = Promise.withResolvers<unknown>();
+		const { events, result } = await collectTerminal("http://127.0.0.1:1", {
+			signal: controller.signal,
+			streamFirstEventTimeoutMs: 0,
+			onPayload: () => {
+				controller.abort(new Error("payload hook cancelled"));
+				return never.promise;
+			},
+		});
+
+		expect(result.stopReason).toBe("aborted");
+		expect(result.errorMessage).toBe("payload hook cancelled");
+		expect(events.filter(isTerminalEvent)).toHaveLength(1);
+	});
+
 	it("keeps the normal exec budget when transport idle watching is disabled", () => {
 		expect(cursorExecDeadlineMsForTest(undefined)).toBe(480_000);
 		expect(cursorExecDeadlineMsForTest(0)).toBe(480_000);
