@@ -729,6 +729,45 @@ describe("capability-scoped function hooks", () => {
 		expect(result).toBeUndefined();
 	});
 
+	test("preserves original errors through no-op Function Hook and legacy continuations", async () => {
+		const extension = makeExtension([
+			registration(
+				"tool_result",
+				async (_invocation, _capabilities, next) => await next(),
+				{ capabilities: ["tool.inspect"] },
+				0,
+				"read",
+			),
+		]);
+		extension.handlers.get("tool_result")?.push(async () => undefined);
+		const runner = new ExtensionRunner(
+			[extension],
+			new ExtensionRuntime(),
+			process.cwd(),
+			SessionManager.inMemory(),
+			{} as never,
+		);
+		const original = new TypeError("typed failure");
+		const wrapped = new ExtensionToolWrapper(
+			{
+				name: "read",
+				label: "Read",
+				description: "Read a file",
+				parameters: Type.Object({ path: Type.String() }),
+				execute: async () => {
+					throw original;
+				},
+			},
+			runner,
+		);
+		try {
+			await wrapped.execute("call-1", { path: "safe.txt" });
+			throw new Error("expected tool failure");
+		} catch (error) {
+			expect(error).toBe(original);
+		}
+	});
+
 	test("snapshots a returned transformation before downstream dispatch", async () => {
 		const runner = makeRunner([
 			registration(

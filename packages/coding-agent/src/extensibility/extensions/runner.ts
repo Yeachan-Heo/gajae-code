@@ -189,7 +189,7 @@ type IndexedHandler = { ext: Extension; handler: Handler; registrationOrder: num
 type IndexedFunctionHook = IndexedHandler & { registration: FunctionHookRegistration };
 
 export type FunctionHookDispatchResult<TEvent extends ExtensionEvent> =
-	| { action: "continue"; event: TEvent }
+	| { action: "continue"; event: TEvent; transformed?: boolean }
 	| { action: "deny"; reason: string }
 	| { action: "return"; value: unknown };
 
@@ -990,14 +990,14 @@ export class ExtensionRunner {
 				allowedGrant: FunctionHookGrant | undefined,
 				chainSignal: AbortSignal,
 			): Promise<FunctionHookDispatchResult<TEvent>> => {
-				if (index >= handlers.length) return { action: "continue", event: currentEvent };
+				if (index >= handlers.length) return { action: "continue", event: currentEvent, transformed: false };
 				if (chainSignal.aborted)
 					return this.#functionHookErrorResult(
 						currentEvent,
 						"Function hook chain aborted",
 					) as FunctionHookDispatchResult<TEvent>;
 				const indexed = handlers[index];
-				if (!indexed) return { action: "continue", event: currentEvent };
+				if (!indexed) return { action: "continue", event: currentEvent, transformed: false };
 				const registration = indexed.registration;
 				const effectiveGrant = intersectFunctionHookGrants(registration.grant, allowedGrant);
 				const downstreamGrant =
@@ -1089,10 +1089,19 @@ export class ExtensionRunner {
 							throw new Error(nextFailureReason);
 						}
 					}
-					nextPromise = invoke(index + 1, candidateSnapshot, downstreamGrant, controller.signal);
-					const downstreamResult = await nextPromise;
+					nextPromise = invoke(index + 1, candidateSnapshot, downstreamGrant, controller.signal).then(
+						downstreamResult =>
+							nextEvent !== undefined && downstreamResult.action === "continue"
+								? { ...downstreamResult, transformed: true }
+								: downstreamResult,
+					);
+					const continuedResult = await nextPromise;
 					try {
-						return cloneFunctionHookDataStrict(downstreamResult) as FunctionHookResult;
+						const publicResult =
+							continuedResult.action === "continue"
+								? { action: "continue" as const, event: continuedResult.event }
+								: continuedResult;
+						return cloneFunctionHookDataStrict(publicResult) as FunctionHookResult;
 					} catch {
 						nextFailureReason = "Function hook continuation result could not be snapshotted";
 						throw new Error(nextFailureReason);
@@ -1200,7 +1209,10 @@ export class ExtensionRunner {
 						}
 					}
 					this.#appendFunctionHookAudit(registration, invocation, "continue");
-					return await invoke(index + 1, nextEvent, downstreamGrant, chainSignal);
+					const downstreamResult = await invoke(index + 1, nextEvent, downstreamGrant, chainSignal);
+					return candidate !== undefined && downstreamResult.action === "continue"
+						? { ...downstreamResult, transformed: true }
+						: downstreamResult;
 				}
 				if (action === "deny") {
 					const reason = sanitizeFunctionHookReason(
@@ -1380,7 +1392,7 @@ export class ExtensionRunner {
 		}
 		if (functionDispatch.action === "return") return functionDispatch.value as ToolResultEventResult;
 		const functionEvent = functionDispatch.event;
-		const functionModified = functionEvent !== event;
+		const functionModified = functionDispatch.transformed === true;
 		event.content = functionEvent.content;
 		event.details = functionEvent.details;
 		event.isError = functionEvent.isError;

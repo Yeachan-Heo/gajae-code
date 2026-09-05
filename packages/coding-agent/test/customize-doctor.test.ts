@@ -343,7 +343,7 @@ describe("customize doctor (#4288)", () => {
 		expect(await Bun.file(markerPath).exists()).toBe(false);
 	});
 
-	it("quarantines tampered Function Hook metadata and redacts unsafe destinations", async () => {
+	it("quarantines injected legacy hook grants and redacts unsafe destinations", async () => {
 		const cwd = await makeTempProject();
 		const pluginRoot = path.join(cwd, ".gjc", "gjc-plugins", "tampered-function-hook");
 		const hookPath = path.join(pluginRoot, "hooks", "before-read.ts");
@@ -362,8 +362,6 @@ describe("customize doctor (#4288)", () => {
 					target: "read",
 					phase: "before",
 					path: "hooks/before-read.ts",
-					capabilities: ["network.fetch"],
-					networkDestinations: ["https://safe.example"],
 				},
 			],
 		});
@@ -403,7 +401,7 @@ describe("customize doctor (#4288)", () => {
 								capabilityHash: functionHookGrantHash(
 									normalizeFunctionHookGrant({ capabilities: ["tool.inspect"] }),
 								),
-								functionHook: true,
+								functionHook: false,
 							},
 						],
 						mcps: [],

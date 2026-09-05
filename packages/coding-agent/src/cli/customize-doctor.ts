@@ -1189,7 +1189,15 @@ async function collectPluginBundles(cwd: string): Promise<CustomizeDoctorSurface
 		const functionHooks: CustomizeFunctionHookSummary[] = entry.surfaces.hooks.map(hook => {
 			const observed = surfaces.find(surface => surface.extensionId === hook.extensionId);
 			const compiled = compiledHooks.get(hook.extensionId);
-			let metadataValid = compiled !== undefined;
+			const hasGrantMetadata =
+				hook.capabilities !== undefined ||
+				hook.networkDestinations !== undefined ||
+				hook.filesystemRoots !== undefined ||
+				hook.capabilityHash !== undefined;
+			let metadataValid =
+				compiled !== undefined &&
+				((hook.functionHook === true && hasGrantMetadata) ||
+					(hook.functionHook !== true && !hasGrantMetadata && compiled.functionHook !== true));
 			try {
 				const grant = normalizeFunctionHookGrant({
 					capabilities: hook.capabilities,
