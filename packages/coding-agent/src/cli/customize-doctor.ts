@@ -1204,7 +1204,13 @@ async function collectPluginBundles(cwd: string): Promise<CustomizeDoctorSurface
 					hook.phase === compiled?.phase &&
 					hook.relativePath === compiled?.relativePath &&
 					hook.implementationHash === compiled?.implementationHash &&
-					(hook.functionHook !== true || hook.capabilityHash === functionHookGrantHash(grant));
+					(hook.functionHook !== true ||
+						(hook.capabilityHash === functionHookGrantHash(grant) &&
+							hook.capabilityHash === compiled?.capabilityHash &&
+							JSON.stringify(grant.capabilities) === JSON.stringify(compiled?.capabilities ?? []) &&
+							JSON.stringify(grant.networkDestinations) ===
+								JSON.stringify(compiled?.networkDestinations ?? []) &&
+							JSON.stringify(grant.filesystemRoots) === JSON.stringify(compiled?.filesystemRoots ?? [])));
 			} catch {
 				metadataValid = false;
 			}
@@ -1227,7 +1233,7 @@ async function collectPluginBundles(cwd: string): Promise<CustomizeDoctorSurface
 				relativePath: hook.relativePath,
 				status,
 				requestedCapabilities: [...(hook.capabilities ?? [])],
-				effectiveCapabilities: [...(hook.capabilities ?? [])],
+				effectiveCapabilities: status === "legacy-active" ? [...(hook.capabilities ?? [])] : [],
 				attenuateDownstream: [],
 				networkDestinations: (hook.networkDestinations ?? []).map(destination => {
 					try {

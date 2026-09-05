@@ -333,13 +333,13 @@ describe("customize doctor (#4288)", () => {
 				target: "read",
 				status: "blocked-isolate",
 				requestedCapabilities: ["tool.inspect"],
-				effectiveCapabilities: ["tool.inspect"],
+				effectiveCapabilities: [],
 				attenuateDownstream: [],
 			}),
 		]);
 		const text = renderCustomizeDoctorText(report);
 		expect(text).toContain("status=blocked-isolate");
-		expect(text).toContain("grants: requested=tool.inspect effective=tool.inspect attenuate=none");
+		expect(text).toContain("grants: requested=tool.inspect effective=none attenuate=none");
 		expect(await Bun.file(markerPath).exists()).toBe(false);
 	});
 
@@ -368,10 +368,6 @@ describe("customize doctor (#4288)", () => {
 			],
 		});
 		const sha256 = createHash("sha256").update(hookSource).digest("hex");
-		const grant = normalizeFunctionHookGrant({
-			capabilities: ["network.fetch"],
-			networkDestinations: ["https://safe.example"],
-		});
 		await writeJson(path.join(cwd, ".gjc", "gjc-plugins", "registry.json"), {
 			version: 1,
 			scope: "project",
@@ -401,11 +397,13 @@ describe("customize doctor (#4288)", () => {
 								relativePath: "hooks/before-read.ts",
 								sha256,
 								implementationHash: sha256,
-								capabilities: [...grant.capabilities],
+								capabilities: ["tool.inspect"],
 								networkDestinations: ["https://user:secret@example.com/token?q=secret"],
 								filesystemRoots: [],
-								capabilityHash: functionHookGrantHash(grant),
-								functionHook: false,
+								capabilityHash: functionHookGrantHash(
+									normalizeFunctionHookGrant({ capabilities: ["tool.inspect"] }),
+								),
+								functionHook: true,
 							},
 						],
 						mcps: [],

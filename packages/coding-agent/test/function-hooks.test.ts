@@ -705,6 +705,30 @@ describe("capability-scoped function hooks", () => {
 		}
 	});
 
+	test("preserves legacy-only no-op results with non-JSON details", async () => {
+		const extension = makeExtension([]);
+		extension.handlers.set("tool_result", [async () => undefined]);
+		const runner = new ExtensionRunner(
+			[extension],
+			new ExtensionRuntime(),
+			process.cwd(),
+			SessionManager.inMemory(),
+			{} as never,
+		);
+		const details: { value: bigint; self?: unknown } = { value: 1n };
+		details.self = details;
+		const result = await runner.emitToolResult({
+			type: "tool_result",
+			toolName: "read",
+			toolCallId: "call-1",
+			input: { path: "safe.txt" },
+			content: [{ type: "text", text: "ok" }],
+			details,
+			isError: false,
+		});
+		expect(result).toBeUndefined();
+	});
+
 	test("snapshots a returned transformation before downstream dispatch", async () => {
 		const runner = makeRunner([
 			registration(

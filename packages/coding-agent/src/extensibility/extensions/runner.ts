@@ -1370,9 +1370,6 @@ export class ExtensionRunner {
 		scope?: AttemptScopeRef,
 		options: { signal?: AbortSignal; correlationId?: string } = {},
 	): Promise<ToolResultEventResult | undefined> {
-		const originalContent = event.content;
-		const originalDetails = event.details;
-		const originalIsError = event.isError;
 		const functionDispatch = await this.emitFunctionHooks(event, options);
 		if (functionDispatch.action === "deny") {
 			return {
@@ -1383,10 +1380,7 @@ export class ExtensionRunner {
 		}
 		if (functionDispatch.action === "return") return functionDispatch.value as ToolResultEventResult;
 		const functionEvent = functionDispatch.event;
-		const functionModified =
-			JSON.stringify(functionEvent.content) !== JSON.stringify(originalContent) ||
-			JSON.stringify(functionEvent.details) !== JSON.stringify(originalDetails) ||
-			functionEvent.isError !== originalIsError;
+		const functionModified = functionEvent !== event;
 		event.content = functionEvent.content;
 		event.details = functionEvent.details;
 		event.isError = functionEvent.isError;
