@@ -548,7 +548,7 @@
     "slack:packages/coding-agent/src/sdk/bus/chat-daemon-cli.ts:loadConfig": "aff409ff6d08bfe19f5c39aac900ec6c8e898d988971bac029edb50459a84f5e",
     "slack:packages/coding-agent/src/sdk/bus/chat-daemon-cli.ts:ownerPid": "31110dcdd6e0f5dbc8b4dce27383646b9c339739758623ab67dc40ddc36661e0",
     "slack:packages/coding-agent/src/sdk/bus/chat-daemon-cli.ts:runChatDaemonInternal": "3865dd37ea7a6b92ef0e692a63fb9c084f06fa88b823d293b1e1e55d082dac86",
-    "slack:packages/coding-agent/src/sdk/bus/chat-daemon-control.ts:CHAT_DAEMON_GENERATIONS.slack": "856b88091fbfb542f4f97fd7ed7fbb6d1d6a9ff3cb55382e48b81a0c4fead09d",
+    "slack:packages/coding-agent/src/sdk/bus/chat-daemon-control.ts:CHAT_DAEMON_GENERATIONS.slack": "6786850d49fbec475120cd0138702452123f4a8e9511e78e272ba4a3686f3328",
     "slack:packages/coding-agent/src/sdk/bus/chat-daemon-control.ts:ChatDaemonAction": "d8acaf90439e410595b5cd56fd187001393ea943517a5563a4a2ea3c88d155ef",
     "slack:packages/coding-agent/src/sdk/bus/chat-daemon-control.ts:ChatDaemonController": "bb722a6a83eb383fce45e756cba356592b33ff0f505b4263409ce9138ea651f1",
     "slack:packages/coding-agent/src/sdk/bus/chat-daemon-control.ts:ChatDaemonKind": "b1c2906c4eb04e120c9ce42f8b549a68cfc834d29d4d745335712a7f61bf09f2",
