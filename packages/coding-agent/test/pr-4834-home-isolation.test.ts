@@ -17,7 +17,7 @@ import { type SlashCommand, slashCommandCapability } from "@gajae-code/coding-ag
 import { type SSHHost, sshCapability } from "@gajae-code/coding-agent/capability/ssh";
 import { type SystemPrompt, systemPromptCapability } from "@gajae-code/coding-agent/capability/system-prompt";
 import { toolCapability } from "@gajae-code/coding-agent/capability/tool";
-import { getAgentDir, resetAgentDirFromEnvironment, setAgentDir } from "@gajae-code/utils";
+import { getAgentDir, getTrustedHomeDir, resetAgentDirFromEnvironment, setAgentDir } from "@gajae-code/utils";
 import { type MCPServer, mcpCapability } from "../src/capability/mcp";
 import { Settings } from "../src/config/settings";
 // Register all discovery providers as a side effect.
@@ -352,6 +352,23 @@ describe("PR #4834: loadCapabilityForHome never falls back to the process profil
 		} finally {
 			if (originalGjcConfigDir === undefined) delete process.env.GJC_CONFIG_DIR;
 			else process.env.GJC_CONFIG_DIR = originalGjcConfigDir;
+		}
+	});
+
+	test("current-profile explicit-home loads authorize the exact XDG plugin root", async () => {
+		const originalXdgDataHome = process.env.XDG_DATA_HOME;
+		try {
+			process.env.XDG_DATA_HOME = path.join(tempDir, "xdg-data");
+			await fs.mkdir(path.join(process.env.XDG_DATA_HOME, "gjc", "plugins"), { recursive: true });
+
+			const result = await loadCapabilityForHome<Skill>(skillCapability.id, getTrustedHomeDir(), {
+				cwd: process.cwd(),
+				providers: ["claude-plugins"],
+			});
+			expect(result.warnings).toEqual([]);
+		} finally {
+			if (originalXdgDataHome === undefined) delete process.env.XDG_DATA_HOME;
+			else process.env.XDG_DATA_HOME = originalXdgDataHome;
 		}
 	});
 

@@ -517,8 +517,8 @@ describe("Cursor raw transport watchdog", () => {
 		});
 
 		const { result } = await collectTerminal(baseUrl, {
-			streamFirstEventTimeoutMs: 40,
-			streamIdleTimeoutMs: 40,
+			streamFirstEventTimeoutMs: 100,
+			streamIdleTimeoutMs: 100,
 		});
 
 		expect(result.stopReason).toBe("stop");

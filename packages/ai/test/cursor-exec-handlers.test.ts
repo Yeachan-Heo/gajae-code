@@ -50,6 +50,19 @@ const cursorModel: Model<"cursor-agent"> = {
 	maxTokens: 1,
 };
 
+async function listenServer(server: http2.Http2Server): Promise<void> {
+	const listening = Promise.withResolvers<void>();
+	server.once("error", listening.reject);
+	server.listen(0, "127.0.0.1", listening.resolve);
+	await listening.promise;
+}
+
+async function closeServer(server: http2.Http2Server): Promise<void> {
+	const closed = Promise.withResolvers<void>();
+	server.close(error => (error ? closed.reject(error) : closed.resolve()));
+	await closed.promise;
+}
+
 async function captureCursorPayload(context: Context): Promise<AgentRunRequest> {
 	const server = http2.createServer();
 	let captured: AgentRunRequest | undefined;
@@ -151,6 +164,32 @@ function createTurnEndedMessage(): AgentServerMessage {
 			}),
 		},
 	});
+}
+
+function frameTokenDelta(tokens: number): Buffer {
+	return frameServerMessage(
+		create(AgentServerMessageSchema, {
+			message: {
+				case: "interactionUpdate",
+				value: create(InteractionUpdateSchema, {
+					message: { case: "tokenDelta", value: create(TokenDeltaUpdateSchema, { tokens }) },
+				}),
+			},
+		}),
+	);
+}
+
+function frameConversationCheckpoint(usedTokens: number): Buffer {
+	return frameServerMessage(
+		create(AgentServerMessageSchema, {
+			message: {
+				case: "conversationCheckpointUpdate",
+				value: create(ConversationStateStructureSchema, {
+					tokenDetails: create(ConversationTokenDetailsSchema, { usedTokens }),
+				}),
+			},
+		}),
+	);
 }
 
 function createConversationCheckpointMessage(usedTokens?: number): AgentServerMessage {
@@ -256,13 +295,10 @@ describe("Cursor server message ordering", () => {
 	it("waits for a slow handler before turn completion", async () => {
 		const queue = createCursorMessageQueueForTest();
 		const events: string[] = [];
-		let releaseSlow!: () => void;
-		const slow = new Promise<void>(resolve => {
-			releaseSlow = resolve;
-		});
+		const slow = Promise.withResolvers<void>();
 
 		queue.enqueue(async () => {
-			await slow;
+			await slow.promise;
 			events.push("exec-response");
 		});
 		const turnDone = queue.enqueue(() => {
@@ -275,7 +311,7 @@ describe("Cursor server message ordering", () => {
 
 		await Promise.resolve();
 		expect(finalized).toBe(false);
-		releaseSlow();
+		slow.resolve();
 		await turnDone;
 		await finalizedPromise;
 		expect(events).toEqual(["exec-response", "turn-ended"]);
@@ -590,6 +626,81 @@ describe("Cursor hostile server storage bounds", () => {
 	});
 });
 
+describe("Cursor live checkpoint usage ordering", () => {
+	it("applies a post-turnEnded checkpoint behind earlier token deltas", async () => {
+		const server = http2.createServer();
+		server.on("stream", (stream: http2.ServerHttp2Stream) => {
+			stream.respond({ ":status": 200, "content-type": "application/connect+proto" });
+			stream.once("data", () => {
+				stream.end(
+					Buffer.concat([
+						frameTokenDelta(30),
+						frameServerMessage(createTurnEndedMessage()),
+						frameConversationCheckpoint(100),
+					]),
+				);
+			});
+		});
+		await listenServer(server);
+		try {
+			const address = server.address();
+			if (!address || typeof address === "string") throw new Error("Expected TCP server address");
+			let done: AssistantMessageEvent | undefined;
+			for await (const event of streamCursor(
+				{ ...cursorModel, baseUrl: `http://127.0.0.1:${address.port}` },
+				{ messages: [{ role: "user", content: "usage", timestamp: 0 }] },
+				{ apiKey: "test-token" },
+			)) {
+				if (event.type === "done") done = event;
+			}
+			expect(done?.type === "done" ? done.message.usage : undefined).toMatchObject({
+				input: 70,
+				output: 30,
+				totalTokens: 100,
+			});
+		} finally {
+			await closeServer(server);
+		}
+	});
+
+	it("resets checkpoint output inclusion when a live checkpoint total decreases", async () => {
+		const server = http2.createServer();
+		server.on("stream", (stream: http2.ServerHttp2Stream) => {
+			stream.respond({ ":status": 200, "content-type": "application/connect+proto" });
+			stream.once("data", () => {
+				stream.end(
+					Buffer.concat([
+						frameConversationCheckpoint(500),
+						frameTokenDelta(30),
+						frameConversationCheckpoint(80),
+						frameServerMessage(createTurnEndedMessage()),
+					]),
+				);
+			});
+		});
+		await listenServer(server);
+		try {
+			const address = server.address();
+			if (!address || typeof address === "string") throw new Error("Expected TCP server address");
+			let done: AssistantMessageEvent | undefined;
+			for await (const event of streamCursor(
+				{ ...cursorModel, baseUrl: `http://127.0.0.1:${address.port}` },
+				{ messages: [{ role: "user", content: "compaction", timestamp: 0 }] },
+				{ apiKey: "test-token" },
+			)) {
+				if (event.type === "done") done = event;
+			}
+			expect(done?.type === "done" ? done.message.usage : undefined).toMatchObject({
+				input: 80,
+				output: 30,
+				totalTokens: 110,
+			});
+		} finally {
+			await closeServer(server);
+		}
+	});
+});
+
 describe("Cursor request lifecycle", () => {
 	it("applies a checkpoint delivered after turnEnded before finalizing usage", async () => {
 		const server = http2.createServer();
@@ -602,10 +713,7 @@ describe("Cursor request lifecycle", () => {
 				}, 5);
 			});
 		});
-		await new Promise<void>((resolve, reject) => {
-			server.once("error", reject);
-			server.listen(0, "127.0.0.1", resolve);
-		});
+		await listenServer(server);
 
 		const conversationId = `checkpoint-late-${crypto.randomUUID()}`;
 		try {
@@ -626,7 +734,7 @@ describe("Cursor request lifecycle", () => {
 			expect(events.filter(event => event.type === "error")).toHaveLength(0);
 		} finally {
 			disposeCursorConversation(conversationId);
-			await new Promise<void>(resolve => server.close(() => resolve()));
+			await closeServer(server);
 		}
 	});
 
@@ -652,10 +760,7 @@ describe("Cursor request lifecycle", () => {
 				stream.end(frameServerMessage(createTurnEndedMessage()));
 			});
 		});
-		await new Promise<void>((resolve, reject) => {
-			server.once("error", reject);
-			server.listen(0, "127.0.0.1", resolve);
-		});
+		await listenServer(server);
 
 		const conversationId = `checkpoint-rollback-${crypto.randomUUID()}`;
 		try {
@@ -687,7 +792,7 @@ describe("Cursor request lifecycle", () => {
 			expect(retryPayload?.conversationState?.tokenDetails?.usedTokens ?? 0).toBe(0);
 		} finally {
 			disposeCursorConversation(conversationId);
-			await new Promise<void>(resolve => server.close(() => resolve()));
+			await closeServer(server);
 		}
 	});
 
@@ -714,10 +819,7 @@ describe("Cursor request lifecycle", () => {
 				);
 			});
 		});
-		await new Promise<void>((resolve, reject) => {
-			server.once("error", reject);
-			server.listen(0, "127.0.0.1", resolve);
-		});
+		await listenServer(server);
 
 		const conversationId = `credential-isolation-${crypto.randomUUID()}`;
 		try {
@@ -744,7 +846,7 @@ describe("Cursor request lifecycle", () => {
 			expect(secondPayload?.conversationState?.tokenDetails?.usedTokens ?? 0).toBe(0);
 		} finally {
 			disposeCursorConversation(conversationId);
-			await new Promise<void>(resolve => server.close(() => resolve()));
+			await closeServer(server);
 		}
 	});
 
@@ -757,10 +859,7 @@ describe("Cursor request lifecycle", () => {
 				setTimeout(() => stream.end(), 25);
 			});
 		});
-		await new Promise<void>((resolve, reject) => {
-			server.once("error", reject);
-			server.listen(0, "127.0.0.1", resolve);
-		});
+		await listenServer(server);
 
 		const conversationId = `checkpoint-watchdog-${crypto.randomUUID()}`;
 		try {
@@ -778,7 +877,7 @@ describe("Cursor request lifecycle", () => {
 			expect(events.filter(event => event.type === "error")).toHaveLength(0);
 		} finally {
 			disposeCursorConversation(conversationId);
-			await new Promise<void>(resolve => server.close(() => resolve()));
+			await closeServer(server);
 		}
 	});
 
@@ -794,10 +893,7 @@ describe("Cursor request lifecycle", () => {
 			stream.respond({ ":status": 200, "content-type": "application/connect+proto" });
 			stream.once("data", () => stream.end(frameServerMessage(createTurnEndedMessage())));
 		});
-		await new Promise<void>((resolve, reject) => {
-			server.once("error", reject);
-			server.listen(0, "127.0.0.1", resolve);
-		});
+		await listenServer(server);
 
 		try {
 			const address = server.address();
@@ -812,7 +908,7 @@ describe("Cursor request lifecycle", () => {
 			await requestEnded.promise;
 			expect(requestAborted).toBe(false);
 		} finally {
-			await new Promise<void>(resolve => server.close(() => resolve()));
+			await closeServer(server);
 		}
 	});
 
@@ -870,10 +966,7 @@ describe("Cursor request lifecycle", () => {
 			});
 		});
 
-		await new Promise<void>((resolve, reject) => {
-			server.once("error", reject);
-			server.listen(0, "127.0.0.1", resolve);
-		});
+		await listenServer(server);
 
 		try {
 			const address = server.address();
@@ -923,7 +1016,7 @@ describe("Cursor request lifecycle", () => {
 			);
 			expect(clientMessageCases).toContain("readResult");
 		} finally {
-			await new Promise<void>(resolve => server.close(() => resolve()));
+			await closeServer(server);
 		}
 	});
 
@@ -958,10 +1051,7 @@ describe("Cursor request lifecycle", () => {
 					markResponseReceived();
 			});
 		});
-		await new Promise<void>((resolve, reject) => {
-			server.once("error", reject);
-			server.listen(0, "127.0.0.1", resolve);
-		});
+		await listenServer(server);
 
 		try {
 			const address = server.address();
@@ -994,7 +1084,7 @@ describe("Cursor request lifecycle", () => {
 			expect(events.filter(type => type === "done")).toHaveLength(1);
 			expect(events).not.toContain("error");
 		} finally {
-			await new Promise<void>(resolve => server.close(() => resolve()));
+			await closeServer(server);
 		}
 	});
 
@@ -1023,10 +1113,7 @@ describe("Cursor request lifecycle", () => {
 				);
 			});
 		});
-		await new Promise<void>((resolve, reject) => {
-			server.once("error", reject);
-			server.listen(0, "127.0.0.1", resolve);
-		});
+		await listenServer(server);
 
 		try {
 			const address = server.address();
@@ -1061,7 +1148,7 @@ describe("Cursor request lifecycle", () => {
 			expect(events.filter(event => event.type === "error")).toHaveLength(0);
 		} finally {
 			releaseHandler();
-			await new Promise<void>(resolve => server.close(() => resolve()));
+			await closeServer(server);
 		}
 	});
 
@@ -1088,10 +1175,7 @@ describe("Cursor request lifecycle", () => {
 				);
 			});
 		});
-		await new Promise<void>((resolve, reject) => {
-			server.once("error", reject);
-			server.listen(0, "127.0.0.1", resolve);
-		});
+		await listenServer(server);
 		try {
 			const address = server.address();
 			if (!address || typeof address === "string") throw new Error("Expected TCP server address");
@@ -1123,7 +1207,7 @@ describe("Cursor request lifecycle", () => {
 			await consume;
 			expect(calls).toEqual([1, 2]);
 		} finally {
-			await new Promise<void>(resolve => server.close(() => resolve()));
+			await closeServer(server);
 		}
 	});
 
@@ -1141,10 +1225,7 @@ describe("Cursor request lifecycle", () => {
 				),
 			);
 		});
-		await new Promise<void>((resolve, reject) => {
-			server.once("error", reject);
-			server.listen(0, "127.0.0.1", resolve);
-		});
+		await listenServer(server);
 		try {
 			const address = server.address();
 			if (!address || typeof address === "string") throw new Error("Expected TCP server address");
@@ -1159,7 +1240,7 @@ describe("Cursor request lifecycle", () => {
 					execHandlers: {
 						async read(args) {
 							calls.push(args.path);
-							await new Promise<void>(() => {});
+							await Promise.withResolvers<void>().promise;
 							return createReadSuccessResult("");
 						},
 					},
@@ -1169,7 +1250,7 @@ describe("Cursor request lifecycle", () => {
 			expect(events).toContain("error");
 			expect(calls).toEqual(["/tmp/example"]);
 		} finally {
-			await new Promise<void>(resolve => server.close(() => resolve()));
+			await closeServer(server);
 		}
 	});
 
@@ -1198,10 +1279,7 @@ describe("Cursor request lifecycle", () => {
 				);
 			});
 		});
-		await new Promise<void>((resolve, reject) => {
-			server.once("error", reject);
-			server.listen(0, "127.0.0.1", resolve);
-		});
+		await listenServer(server);
 
 		try {
 			const address = server.address();
@@ -1252,7 +1330,7 @@ describe("Cursor request lifecycle", () => {
 			expect(events.filter(type => type === "error")).toHaveLength(1);
 		} finally {
 			releaseHandler();
-			await new Promise<void>(resolve => server.close(() => resolve()));
+			await closeServer(server);
 		}
 	});
 
@@ -1295,10 +1373,7 @@ describe("Cursor request lifecycle", () => {
 				);
 			});
 		});
-		await new Promise<void>((resolve, reject) => {
-			server.once("error", reject);
-			server.listen(0, "127.0.0.1", resolve);
-		});
+		await listenServer(server);
 
 		let retainedCallbacks: CursorShellStreamCallbacks | undefined;
 		try {
@@ -1356,7 +1431,7 @@ describe("Cursor request lifecycle", () => {
 			expect(events).not.toContain("done");
 		} finally {
 			releaseHandler();
-			await new Promise<void>(resolve => server.close(() => resolve()));
+			await closeServer(server);
 		}
 	});
 
@@ -1420,10 +1495,7 @@ describe("Cursor request lifecycle", () => {
 				stream.write(frameServerMessage(createReadExecMessage()));
 			});
 		});
-		await new Promise<void>((resolve, reject) => {
-			server.once("error", reject);
-			server.listen(0, "127.0.0.1", resolve);
-		});
+		await listenServer(server);
 
 		try {
 			const address = server.address();
@@ -1465,7 +1537,7 @@ describe("Cursor request lifecycle", () => {
 			expect(clientChunks).toHaveLength(framesAtTerminal);
 		} finally {
 			releaseHandler();
-			await new Promise<void>(resolve => server.close(() => resolve()));
+			await closeServer(server);
 		}
 	});
 
@@ -1491,10 +1563,7 @@ describe("Cursor request lifecycle", () => {
 				);
 			});
 		});
-		await new Promise<void>((resolve, reject) => {
-			server.once("error", reject);
-			server.listen(0, "127.0.0.1", resolve);
-		});
+		await listenServer(server);
 
 		try {
 			const address = server.address();
@@ -1530,7 +1599,7 @@ describe("Cursor request lifecycle", () => {
 			await handlerFinished;
 		} finally {
 			releaseHandler();
-			await new Promise<void>(resolve => server.close(() => resolve()));
+			await closeServer(server);
 		}
 	});
 
@@ -1578,10 +1647,7 @@ describe("Cursor request lifecycle", () => {
 				);
 			});
 		});
-		await new Promise<void>((resolve, reject) => {
-			server.once("error", reject);
-			server.listen(0, "127.0.0.1", resolve);
-		});
+		await listenServer(server);
 
 		try {
 			const address = server.address();
@@ -1618,7 +1684,7 @@ describe("Cursor request lifecycle", () => {
 			releaseHandler();
 		} finally {
 			releaseHandler();
-			await new Promise<void>(resolve => server.close(() => resolve()));
+			await closeServer(server);
 		}
 	});
 
@@ -1669,10 +1735,7 @@ describe("Cursor request lifecycle", () => {
 				}
 			});
 		});
-		await new Promise<void>((resolve, reject) => {
-			server.once("error", reject);
-			server.listen(0, "127.0.0.1", resolve);
-		});
+		await listenServer(server);
 
 		let retainedCallbacks: CursorShellStreamCallbacks | undefined;
 		try {
@@ -1731,7 +1794,7 @@ describe("Cursor request lifecycle", () => {
 			retainedCallbacks?.onStderr("late error\n");
 			expect(clientChunks).toHaveLength(framesAfterCompletion);
 		} finally {
-			await new Promise<void>(resolve => server.close(() => resolve()));
+			await closeServer(server);
 		}
 	});
 
@@ -1741,10 +1804,7 @@ describe("Cursor request lifecycle", () => {
 			stream.respond({ ":status": 200, "content-type": "application/connect+proto" });
 			stream.once("data", () => stream.end());
 		});
-		await new Promise<void>((resolve, reject) => {
-			server.once("error", reject);
-			server.listen(0, "127.0.0.1", resolve);
-		});
+		await listenServer(server);
 
 		try {
 			const address = server.address();
@@ -1763,7 +1823,7 @@ describe("Cursor request lifecycle", () => {
 			if (terminal?.type !== "error") throw new Error("Expected terminal Cursor error");
 			expect(terminal.error.errorMessage).toContain("Cursor stream ended before turnEnded");
 		} finally {
-			await new Promise<void>(resolve => server.close(() => resolve()));
+			await closeServer(server);
 		}
 	});
 });

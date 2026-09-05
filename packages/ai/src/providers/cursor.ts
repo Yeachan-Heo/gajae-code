@@ -353,17 +353,17 @@ interface CursorPendingChunk {
  * single Buffer with Buffer.concat.
  */
 class CursorPendingBuffer {
-	private head: CursorPendingChunk | null = null;
-	private tail: CursorPendingChunk | null = null;
-	private byteLength = 0;
-	private lookup: {
+	#head: CursorPendingChunk | null = null;
+	#tail: CursorPendingChunk | null = null;
+	#byteLength = 0;
+	#lookup: {
 		logicalOffset: number;
 		chunk: CursorPendingChunk;
 		chunkOffset: number;
 	} | null = null;
 
 	get length(): number {
-		return this.byteLength;
+		return this.#byteLength;
 	}
 
 	append(bytes: Uint8Array): void {
@@ -373,55 +373,55 @@ class CursorPendingBuffer {
 			offset: 0,
 			next: null,
 		};
-		if (this.tail) this.tail.next = chunk;
-		else this.head = chunk;
-		this.tail = chunk;
-		this.byteLength += chunk.bytes.length;
+		if (this.#tail) this.#tail.next = chunk;
+		else this.#head = chunk;
+		this.#tail = chunk;
+		this.#byteLength += chunk.bytes.length;
 	}
 
 	clear(): void {
-		this.head = null;
-		this.tail = null;
-		this.byteLength = 0;
-		this.lookup = null;
+		this.#head = null;
+		this.#tail = null;
+		this.#byteLength = 0;
+		this.#lookup = null;
 	}
 
 	consume(length: number): void {
-		if (!Number.isInteger(length) || length < 0 || length > this.byteLength) {
-			throw new RangeError(`Cannot consume ${length} bytes from a ${this.byteLength}-byte buffer`);
+		if (!Number.isInteger(length) || length < 0 || length > this.#byteLength) {
+			throw new RangeError(`Cannot consume ${length} bytes from a ${this.#byteLength}-byte buffer`);
 		}
 		let remaining = length;
 		while (remaining > 0) {
-			const chunk = this.head;
+			const chunk = this.#head;
 			if (!chunk) throw new RangeError("Pending buffer ended while consuming bytes");
 			const available = chunk.bytes.length - chunk.offset;
 			const consumed = Math.min(remaining, available);
 			chunk.offset += consumed;
 			remaining -= consumed;
 			if (chunk.offset === chunk.bytes.length) {
-				this.head = chunk.next;
+				this.#head = chunk.next;
 				chunk.next = null;
-				if (!this.head) this.tail = null;
+				if (!this.#head) this.#tail = null;
 			}
 		}
-		this.byteLength -= length;
-		this.lookup = null;
+		this.#byteLength -= length;
+		this.#lookup = null;
 	}
 
-	private locate(offset: number): { chunk: CursorPendingChunk; chunkOffset: number } {
-		if (!Number.isInteger(offset) || offset < 0 || offset >= this.byteLength) {
-			throw new RangeError(`Pending buffer offset ${offset} is outside ${this.byteLength} bytes`);
+	#locate(offset: number): { chunk: CursorPendingChunk; chunkOffset: number } {
+		if (!Number.isInteger(offset) || offset < 0 || offset >= this.#byteLength) {
+			throw new RangeError(`Pending buffer offset ${offset} is outside ${this.#byteLength} bytes`);
 		}
 
 		let chunk: CursorPendingChunk | null;
 		let chunkOffset: number;
 		let logicalOffset: number;
-		if (this.lookup && offset >= this.lookup.logicalOffset) {
-			chunk = this.lookup.chunk;
-			chunkOffset = this.lookup.chunkOffset;
-			logicalOffset = this.lookup.logicalOffset;
+		if (this.#lookup && offset >= this.#lookup.logicalOffset) {
+			chunk = this.#lookup.chunk;
+			chunkOffset = this.#lookup.chunkOffset;
+			logicalOffset = this.#lookup.logicalOffset;
 		} else {
-			chunk = this.head;
+			chunk = this.#head;
 			chunkOffset = chunk?.offset ?? 0;
 			logicalOffset = 0;
 		}
@@ -429,7 +429,7 @@ class CursorPendingBuffer {
 		while (chunk) {
 			const available = chunk.bytes.length - chunkOffset;
 			if (offset < logicalOffset + available) {
-				this.lookup = { logicalOffset: offset, chunk, chunkOffset: chunkOffset + (offset - logicalOffset) };
+				this.#lookup = { logicalOffset: offset, chunk, chunkOffset: chunkOffset + (offset - logicalOffset) };
 				return { chunk, chunkOffset: chunkOffset + (offset - logicalOffset) };
 			}
 			logicalOffset += available;
@@ -437,16 +437,16 @@ class CursorPendingBuffer {
 			chunkOffset = chunk?.offset ?? 0;
 		}
 
-		throw new RangeError(`Pending buffer offset ${offset} is outside ${this.byteLength} bytes`);
+		throw new RangeError(`Pending buffer offset ${offset} is outside ${this.#byteLength} bytes`);
 	}
 
 	byteAt(offset: number): number {
-		const location = this.locate(offset);
+		const location = this.#locate(offset);
 		return location.chunk.bytes[location.chunkOffset];
 	}
 
 	readUInt32BE(offset: number): number {
-		if (!Number.isInteger(offset) || offset < 0 || offset + 4 > this.byteLength) {
+		if (!Number.isInteger(offset) || offset < 0 || offset + 4 > this.#byteLength) {
 			throw new RangeError(`Cannot read a 32-bit value at offset ${offset}`);
 		}
 		return (
@@ -459,11 +459,11 @@ class CursorPendingBuffer {
 	}
 
 	subarray(offset: number, length: number): Buffer {
-		if (!Number.isInteger(length) || length < 0 || offset < 0 || offset + length > this.byteLength) {
+		if (!Number.isInteger(length) || length < 0 || offset < 0 || offset + length > this.#byteLength) {
 			throw new RangeError(`Cannot slice ${length} bytes at offset ${offset}`);
 		}
 		if (length === 0) return Buffer.alloc(0);
-		const first = this.locate(offset);
+		const first = this.#locate(offset);
 		const contiguous = first.chunk.bytes.length - first.chunkOffset;
 		if (length <= contiguous) return first.chunk.bytes.subarray(first.chunkOffset, first.chunkOffset + length);
 
@@ -1779,7 +1779,17 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 						try {
 							const serverMessage = fromBinary(AgentServerMessageSchema, messageBytes);
 							if (serverMessage.message.case === "conversationCheckpointUpdate") {
-								applyBufferedNonExecMessage(serverMessage);
+								if (messageQueue.pendingBytes() + 5 + msgLen > CURSOR_MAX_QUEUED_SERVER_BYTES) {
+									terminalize(new Error("Cursor server-message queue exceeded its bounded byte capacity"));
+									break;
+								}
+								queueDrained = false;
+								const queuedCheckpoint = messageQueue.enqueue(
+									() => applyBufferedNonExecMessage(serverMessage),
+									5 + msgLen,
+								);
+								void queuedCheckpoint.catch(() => {});
+								drainMessageQueue();
 							}
 						} catch {
 							// A validated terminal boundary makes all non-checkpoint bytes tail.
@@ -4382,8 +4392,9 @@ function handleConversationCheckpointUpdate(
 	if (!checkpoint.tokenDetails) {
 		return;
 	}
+	const previousUsedTokens = usageState.conversationUsedTokens;
 	usageState.conversationUsedTokens = usedTokens;
-	usageState.checkpointOutputTokens = output.usage.output;
+	usageState.checkpointOutputTokens = usedTokens < previousUsedTokens ? 0 : output.usage.output;
 	usageState.hasConversationCheckpoint = true;
 }
 

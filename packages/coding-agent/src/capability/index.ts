@@ -169,8 +169,15 @@ async function assertExplicitHomeRoots(
 		addUserRoot(getPluginsDir(canonicalHome), "plugin registry root");
 	}
 
+	const trustedHome = await canonicalizeThroughExistingAncestor(getTrustedHomeDir());
+	const currentProfilePluginRoot =
+		canonicalHome === trustedHome ? await canonicalizeThroughExistingAncestor(getPluginsDir(canonicalHome)) : null;
 	await Promise.all(
-		[...userRoots.entries()].map(([root, label]) => canonicalizeContainedPath(canonicalHome, root, label)),
+		[...userRoots.entries()].map(async ([root, label]) => {
+			const canonicalRoot = await canonicalizeThroughExistingAncestor(root);
+			if (label === "plugin registry root" && canonicalRoot === currentProfilePluginRoot) return;
+			await canonicalizeContainedPath(canonicalHome, root, label);
+		}),
 	);
 
 	// Validate only the roots at the boundaries their providers actually inspect.
