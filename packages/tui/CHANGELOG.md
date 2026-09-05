@@ -11,13 +11,13 @@
 - Markdown cache ownership now finalizes after styling callbacks, so reentrant text replacement cannot inherit stale rejection hints and streaming completion releases local parse tokens. Cache diagnostics measure insertion-time payload sizes; returned render arrays are borrowed and must not be mutated.
 - Streaming Markdown retains only its current parse locally instead of publishing partial documents to the shared render/parse caches. Completed documents remain reusable, with 8 MiB render, 8 MiB parse and 4 MiB highlight accounted-payload budgets and per-entry limits. The render-cache diagnostic now includes UTF-16 keys, full token graphs, styled lines and anchors; it is not a live heap/RSS measurement.
 - Markdown reflow avoids redundant parse-cache admissions and repeated accounting of already rejected normalized content, without retaining completed parse tokens. Render payload accounting uses its owned layout schema, and oversized highlighting inputs are rejected earlier while preserving byte/line limits and guard ordering.
+- `fuzzyFilter` / `fuzzyMatch` now handle Hangul the same way path autocomplete does, so the command palette, model selector, OAuth selector, and session selector stop silently hiding entries. That matcher had no Hangul or normalization handling at all: a chosung query returned nothing (`ㅎㄱ` against `한글경로 설정` matched 0 items), and a composed query matched only composed entries (1 of 2 when both NFC and NFD spellings were present) — which on macOS means filesystem-derived text was routinely invisible. Both sides are now NFC-folded before comparison and a bare consonant matches a syllable's initial. The initial-jamo table, the character comparison, and the folding step moved into a single shared `hangul` module that both matchers import instead of keeping a second copy; scoring, word-boundary rewards, whitespace token semantics, and the alphanumeric-swap fallback are unchanged, and a decomposed target now scores identically to its composed form.
 
 ## [0.16.4] - 2026-09-05
 
 ### Added
 
 - Added cancellable, one-shot `enqueueBeforeRender` preparation on the existing frame scheduler and a single-owner `setRenderPreparationLifecycleCallbacks` seam for invalidation and restart preparation. Stop, terminal loss, and disposal cancel stale work; restart preparation runs before the first forced frame without adding another streaming timer.
-- `fuzzyFilter` / `fuzzyMatch` now handle Hangul the same way path autocomplete does, so the command palette, model selector, OAuth selector, and session selector stop silently hiding entries. That matcher had no Hangul or normalization handling at all: a chosung query returned nothing (`ㅎㄱ` against `한글경로 설정` matched 0 items), and a composed query matched only composed entries (1 of 2 when both NFC and NFD spellings were present) — which on macOS means filesystem-derived text was routinely invisible. Both sides are now NFC-folded before comparison and a bare consonant matches a syllable's initial. The initial-jamo table, the character comparison, and the folding step moved into a single shared `hangul` module that both matchers import instead of keeping a second copy; scoring, word-boundary rewards, whitespace token semantics, and the alphanumeric-swap fallback are unchanged, and a decomposed target now scores identically to its composed form.
 
 ## [0.16.3] - 2026-09-04
 
@@ -30,6 +30,7 @@
 ## [0.16.0] - 2026-09-02
 
 ## [0.15.6] - 2026-08-30
+
 ### Fixed
 
 - Composer file autocomplete now keeps the `@` fuzzy/chosung path reachable from explicit Tab and while Korean query characters are typed, without changing ordinary path-prefix completion.

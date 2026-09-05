@@ -29,6 +29,7 @@ export const MANAGED_OWNER_SUPERVISED_ENV = "GJC_MANAGED_OWNER_SUPERVISED";
 /** Suppresses command-derived durable artifacts for Broker-owned opaque spawn children. */
 export const MANAGED_OWNER_REDACT_COMMAND_ENV = "GJC_MANAGED_OWNER_REDACT_COMMAND";
 const GJC_TMUX_OWNER_SERVER_KEY_ENV = "GJC_TMUX_OWNER_SERVER_KEY";
+const GJC_TMUX_COMMAND_ENV = "GJC_TMUX_COMMAND";
 const GJC_TMUX_OWNER_GENERATION_STAGED_ENV = "GJC_TMUX_OWNER_GENERATION_STAGED";
 const MANAGED_OWNER_TERMINAL_PUBLICATION_UNCERTAIN_EXIT_CODE = 75;
 
@@ -67,6 +68,111 @@ export interface ManagedOwnerSigabrtReceipt {
 	signal_number: 6;
 	exit_code: number | null;
 	received_at: string;
+}
+
+interface ManagedOwnerSupervisorAuthority {
+	schema_version: 1;
+	kind: "managed_owner_supervisor_authority";
+	session_id: string;
+	generation: string;
+	supervisor_pid: number;
+	supervisor_start_time: string;
+	supervisor_is_parent?: true;
+	server_pid: number;
+	server_start_time: string;
+	native_session_id: string;
+}
+
+/** @internal */
+export function managedOwnerSupervisorIdentityMatches(input: {
+	platform: NodeJS.Platform;
+	record: Pick<ManagedOwnerSupervisorAuthority, "supervisor_pid" | "supervisor_start_time" | "supervisor_is_parent">;
+	processPid: number;
+	processStartTime: string;
+	parentPid: number | null;
+	publishedProcessStartTime: string | null;
+}): boolean {
+	const { record } = input;
+	return record.supervisor_is_parent === true
+		? input.platform === "win32" &&
+				input.parentPid === record.supervisor_pid &&
+				input.publishedProcessStartTime === record.supervisor_start_time
+		: record.supervisor_is_parent === undefined &&
+				record.supervisor_pid === input.processPid &&
+				record.supervisor_start_time === input.processStartTime;
+}
+
+function supervisorAuthorityPath(stateDir: string, sessionId: string, generation: string): string {
+	return path.join(lifecyclePaths(stateDir, sessionId, generation).root, `supervisor-authority-${generation}.json`);
+}
+
+export function publishManagedOwnerSupervisorAuthoritySync(
+	input: ManagedOwnerSupervisorAuthority & { state_dir: string },
+): void {
+	const { state_dir, ...record } = input;
+	const file = supervisorAuthorityPath(state_dir, record.session_id, record.generation);
+	fsSync.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+	fsSync.writeFileSync(file, `${JSON.stringify(record)}\n`, { flag: "wx", mode: 0o600 });
+	const fd = fsSync.openSync(file, "r");
+	try {
+		fsSync.fsyncSync(fd);
+	} finally {
+		fsSync.closeSync(fd);
+	}
+}
+
+async function requireManagedOwnerSupervisorAuthority(
+	stateDir: string,
+	sessionId: string,
+	generation: string,
+	supervisorStartTime: string,
+): Promise<void> {
+	const deadline = Date.now() + 7_000;
+	let authority: unknown = null;
+	while (Date.now() < deadline) {
+		try {
+			authority = readNoFollowJsonSync(supervisorAuthorityPath(stateDir, sessionId, generation));
+			if (authority) break;
+		} catch {}
+		await Bun.sleep(20);
+	}
+	if (!authority || typeof authority !== "object" || Array.isArray(authority))
+		throw new Error("managed_owner_supervisor_authority_unavailable");
+	const record = authority as Partial<ManagedOwnerSupervisorAuthority>;
+	const publishedProcessStartTime =
+		typeof record.supervisor_pid === "number" && record.supervisor_is_parent === true
+			? await managedOwnerProcessProvenance(record.supervisor_pid)
+			: null;
+	const supervisorIdentityMatches =
+		typeof record.supervisor_pid === "number" &&
+		typeof record.supervisor_start_time === "string" &&
+		(record.supervisor_is_parent === undefined || record.supervisor_is_parent === true) &&
+		managedOwnerSupervisorIdentityMatches({
+			platform: process.platform,
+			record: {
+				supervisor_pid: record.supervisor_pid,
+				supervisor_start_time: record.supervisor_start_time,
+				...(record.supervisor_is_parent === true ? { supervisor_is_parent: true } : {}),
+			},
+			processPid: process.pid,
+			processStartTime: supervisorStartTime,
+			parentPid: nativeProcessBindings().Process.fromPid(process.pid)?.ppid ?? null,
+			publishedProcessStartTime,
+		});
+	if (
+		record.schema_version !== 1 ||
+		record.kind !== "managed_owner_supervisor_authority" ||
+		record.session_id !== sessionId ||
+		record.generation !== generation ||
+		!supervisorIdentityMatches ||
+		typeof record.server_pid !== "number" ||
+		typeof record.server_start_time !== "string" ||
+		typeof record.native_session_id !== "string"
+	)
+		throw new Error("managed_owner_supervisor_authority_mismatch");
+	if (!process.env[GJC_TMUX_COMMAND_ENV]?.trim()) throw new Error("managed_owner_supervisor_server_unavailable");
+	const serverStartTime = await managedOwnerProcessProvenance(record.server_pid);
+	if (serverStartTime !== record.server_start_time) throw new Error("managed_owner_supervisor_server_mismatch");
 }
 
 function requiredEnvironment(name: string): string {
@@ -175,13 +281,31 @@ export function isManagedOwnerSupervisorArgv(args: readonly string[]): boolean {
 	return args.length === 1 && args[0] === MANAGED_OWNER_SUPERVISOR_ARG;
 }
 
+/** @internal */
+export async function assertManagedOwnerGenerationPublished(
+	stateDir: string,
+	sessionId: string,
+	generation: string,
+	options: { timeoutMs?: number; pollMs?: number } = {},
+): Promise<void> {
+	const timeoutMs = options.timeoutMs ?? 5_000;
+	const pollMs = options.pollMs ?? 20;
+	const deadline = performance.now() + timeoutMs;
+	while (true) {
+		const currentGeneration = await captureOwnerGenerationBaseline(stateDir, sessionId);
+		if (currentGeneration.state === "current" && currentGeneration.generation === generation) return;
+		if (performance.now() >= deadline) throw new Error("managed_owner_supervisor_generation_unpublished");
+		await Bun.sleep(Math.min(pollMs, Math.max(0, deadline - performance.now())));
+	}
+}
+
 if (isManagedOwnerSupervisorArgv(process.argv.slice(2))) {
 	process.removeAllListeners("SIGTERM");
 	process.on("SIGTERM", captureBootstrapSigterm);
 }
 
 /** Runs one exact child and publishes authority for its directly observed terminal state. */
-export async function runManagedOwnerSupervisor(): Promise<void> {
+export async function runManagedOwnerSupervisor(options: { requireAuthority?: boolean } = {}): Promise<void> {
 	const { root, stateDir, generation, sessionId, runId, incarnation } = lifecycleRoot();
 	const command = childCommand();
 	let sigtermPending = bootstrapSigtermPending;
@@ -192,6 +316,10 @@ export async function runManagedOwnerSupervisor(): Promise<void> {
 	process.on("SIGTERM", captureEarlySigterm);
 	const supervisorStartTime = await managedOwnerProcessProvenance(process.pid);
 	if (!supervisorStartTime) throw new Error("managed_owner_supervisor_start_time_unavailable");
+	if (options.requireAuthority) {
+		await requireManagedOwnerSupervisorAuthority(stateDir, sessionId, generation, supervisorStartTime);
+		await assertManagedOwnerGenerationPublished(stateDir, sessionId, generation);
+	}
 	await fs.mkdir(root, { recursive: true, mode: 0o700 });
 	const childToken = crypto.randomUUID();
 	const redactCommand = process.env[MANAGED_OWNER_REDACT_COMMAND_ENV] === "1";
@@ -273,7 +401,11 @@ export async function runManagedOwnerSupervisor(): Promise<void> {
 		process.exitCode = MANAGED_OWNER_TERMINAL_PUBLICATION_UNCERTAIN_EXIT_CODE;
 		return;
 	}
-	const childProcess = nativeProcessBindings().Process.fromPid(child.pid);
+	const nativeReferencePid = child.pid;
+	const nativeReferenceStartTime =
+		process.platform === "linux" ? await readLinuxProcStartTime(nativeReferencePid) : childStartTime;
+	const childProcess =
+		nativeReferenceStartTime === childStartTime ? nativeProcessBindings().Process.fromPid(nativeReferencePid) : null;
 	if (!childProcess) {
 		const exitCode = await child.exited;
 		const stagedJournal = await recordStagedTerminal(

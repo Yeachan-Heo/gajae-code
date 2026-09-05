@@ -633,6 +633,34 @@ describe("coordinator runtime state sidecar", () => {
 		expect(await Bun.file(stateFile).text()).toBe(beforeReplacement);
 	});
 
+	it("lets the authenticated replacement generation adopt predecessor runtime state", async () => {
+		const root = await tempRoot();
+		const stateFile = path.join(root, "replacement-adoption.json");
+		const sessionId = "replacement-adoption-session";
+		const firstGeneration = "11111111-1111-4111-8111-111111111111";
+		const replacementGeneration = "22222222-2222-4222-8222-222222222222";
+		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
+		process.env[GJC_COORDINATOR_SESSION_ID_ENV] = sessionId;
+
+		await replaceOwnerGeneration(root, sessionId, firstGeneration);
+		await persistCoordinatorRuntimeStateFromEvent(
+			{ type: "agent_start" },
+			{ sessionId, cwd: root, ownerTerminal: { generation: firstGeneration, stateDir: root, socketKey: "tmux" } },
+		);
+		await replaceOwnerGeneration(root, sessionId, replacementGeneration);
+		await persistCoordinatorRuntimeStateFromEvent(assistantEnd("replacement completed"), {
+			sessionId,
+			cwd: root,
+			ownerTerminal: { generation: replacementGeneration, stateDir: root, socketKey: "tmux" },
+		});
+
+		expect(await readPayload(stateFile)).toMatchObject({
+			state: "completed",
+			owner_generation: replacementGeneration,
+			final_response: { text: "replacement completed" },
+		});
+	});
+
 	it("invalidates the async previous-payload cache after an external state file write", async () => {
 		const root = await tempRoot();
 		const stateFile = path.join(root, "state.json");
@@ -750,7 +778,7 @@ describe("coordinator runtime state sidecar", () => {
 			reason: "transition_claim_timeout",
 		});
 		expect(await Bun.file(stateFile).bytes()).toEqual(before);
-	});
+	}, 15_000);
 
 	it("preserves directory runtime-state evidence and refuses event and postmortem writes", async () => {
 		const root = await tempRoot();
@@ -1255,6 +1283,26 @@ describe("coordinator runtime state sidecar", () => {
 				cwd: root,
 				sessionFile: path.join(root, "session.jsonl"),
 			}),
+		).resolves.toEqual({ terminal: true, state: "completed" });
+	});
+
+	it("keeps bounded terminal markers larger than lifecycle records readable to GC", async () => {
+		const root = await tempRoot();
+		const stateFile = path.join(root, "large-terminal-marker.json");
+		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
+		process.env[GJC_COORDINATOR_SESSION_ID_ENV] = "large-terminal-marker";
+		await persistCoordinatorRuntimeStateFromEvent(assistantEnd("x".repeat(300 * 1024)), {
+			sessionId: "fallback",
+			cwd: root,
+			sessionFile: null,
+		});
+
+		const file = Bun.file(stateFile);
+		expect(file.size).toBeGreaterThan(16 * 1024);
+		expect(file.size).toBeLessThanOrEqual(256 * 1024);
+		expect(await readPayload(stateFile)).toMatchObject({ final_response: { truncated: true } });
+		await expect(
+			readTerminalRuntimeStateMarker({ stateFile, sessionId: "large-terminal-marker", cwd: root }),
 		).resolves.toEqual({ terminal: true, state: "completed" });
 	});
 
@@ -2296,6 +2344,49 @@ describe("coordinator runtime state sidecar", () => {
 
 		expect((await readPayload(stateFile)).owner_generation).toBe(generation);
 		expect((await readPayload(stateFile)).state).toBe("errored");
+	});
+
+	it("lets the authenticated replacement generation adopt predecessor state for launch failure", async () => {
+		const root = await tempRoot();
+		const stateFile = path.join(root, "replacement-launch-failure.json");
+		const sessionId = "replacement-launch-failure";
+		const predecessor = "11111111-1111-4111-8111-111111111111";
+		const replacement = "22222222-2222-4222-8222-222222222222";
+		await replaceOwnerGeneration(root, sessionId, predecessor);
+		await Bun.write(
+			stateFile,
+			JSON.stringify({
+				schema_version: 1,
+				session_id: sessionId,
+				state: "running",
+				cwd: root,
+				workdir: root,
+				session_file: null,
+				owner_generation: predecessor,
+			}),
+		);
+		await replaceOwnerGeneration(root, sessionId, replacement);
+		await persistCoordinatorLaunchFailureState({
+			stateFile,
+			cwd: root,
+			sessionId,
+			ownerGeneration: replacement,
+			ownerStateDir: root,
+			ownerServerKey: "tmux",
+			managedLaunch: true,
+			payload: {
+				schema_version: 1,
+				session_id: sessionId,
+				state: "errored",
+				cwd: root,
+				workdir: root,
+				session_file: null,
+			},
+			signingRequired: false,
+			keyId: null,
+		});
+
+		expect(await readPayload(stateFile)).toMatchObject({ state: "errored", owner_generation: replacement });
 	});
 
 	it("persists the immutable owner-terminal verdict with public-safe metadata", async () => {

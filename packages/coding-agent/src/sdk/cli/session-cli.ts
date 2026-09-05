@@ -689,8 +689,7 @@ export async function filterSessionRowsByScope(
 	const sessions: SdkSessionRowV1[] = [];
 	for (const row of rows) {
 		if (row.locator.cwd === "unknown") {
-			if (scope !== "cwd")
-				warnings.push(`Session ${row.sessionId} workspace is unavailable; excluded by scope ${scope}.`);
+			warnings.push(`Session ${row.sessionId} workspace is unavailable; excluded by scope ${scope}.`);
 			continue;
 		}
 		const identity = await workspaceIdentity(row.locator.cwd);

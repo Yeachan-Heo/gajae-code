@@ -18,6 +18,7 @@ import {
 	writeCoordinatorAtomic,
 } from "../coordinator-mcp/durability";
 import { reduceTerminalReceiptState } from "../sdk/receipt-state";
+import { truncateUtf8 } from "../session/btw-contract";
 import { TOOL_CATALOG } from "../tools/tool-catalog.generated";
 import { sessionRoot, sessionRuntimeDir } from "./session-layout";
 import { SessionStateLockUnavailableError, withSessionStateFileLock } from "./session-state-lock";
@@ -141,6 +142,8 @@ export type RuntimeState = "ready_for_input" | "running" | "needs_user_input" | 
 
 type FinalResponseSource = "agent_end" | "launch_error";
 const MAX_PUBLIC_ERROR_MESSAGE_LENGTH = 2000;
+const RUNTIME_STATE_MARKER_MAX_BYTES = 256 * 1024;
+const RUNTIME_STATE_FINAL_RESPONSE_MAX_BYTES = 128 * 1024;
 const HEARTBEAT_MS = 1000;
 
 /**
@@ -932,7 +935,7 @@ export async function readTerminalRuntimeStateMarker(input: {
 	let value: unknown;
 	try {
 		await fs.lstat(stateFile);
-		value = await readNoFollowJson(stateFile);
+		value = await readNoFollowJson(stateFile, RUNTIME_STATE_MARKER_MAX_BYTES);
 	} catch (error) {
 		const code = (error as { code?: unknown }).code;
 		return {
@@ -988,15 +991,17 @@ function finalResponseForEvent(event: RuntimeStateEvent): {
 	format: "markdown";
 	source: FinalResponseSource;
 	artifact_path: null;
-	truncated: false;
+	truncated: boolean;
 } | null {
 	if (event.type !== "agent_end") return null;
+	const fullText = assistantText(lastAssistant(event.messages));
+	const text = fullText === null ? null : truncateUtf8(fullText, RUNTIME_STATE_FINAL_RESPONSE_MAX_BYTES);
 	return {
-		text: assistantText(lastAssistant(event.messages)),
+		text,
 		format: "markdown",
 		source: "agent_end",
 		artifact_path: null,
-		truncated: false,
+		truncated: text !== fullText,
 	};
 }
 
@@ -1735,7 +1740,7 @@ export async function persistCoordinatorLaunchFailureState(input: {
 							!ownerMetadataValid ||
 							activeGeneration !== ownerGeneration ||
 							previous.session_id !== sessionId ||
-							(previousOwner !== null && previousOwner !== ownerGeneration)
+							previousOwner === null
 						)
 							return;
 					} else if (input.managedLaunch && previousManagedEvidence) {
@@ -1938,8 +1943,9 @@ async function withRuntimeStateWriterLocks<T>(
 
 /**
  * Validate the ownership fence carried by a previous runtime marker while the writer's
- * locks are held. An unowned predecessor remains valid for the explicit legacy paths;
- * once ownership is present, only the authenticated current generation may write.
+ * locks are held. An unowned predecessor remains valid for explicit legacy paths. Once
+ * ownership is present, the authenticated current generation may adopt a predecessor's
+ * marker for the same stable session identity and stamps its own generation on the write.
  */
 async function runtimeStateOwnerGenerationFence(
 	previous: Record<string, unknown>,
@@ -1969,7 +1975,7 @@ async function runtimeStateOwnerGenerationFence(
 		current.generation !== owner.generation
 	)
 		return false;
-	return previousGeneration === null || previousGeneration === owner.generation;
+	return true;
 }
 
 function stampRuntimeStateOwnerGeneration(

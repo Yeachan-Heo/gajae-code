@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Added a narrow Unix `PortableRecoveryFsRoot` authority for bounded, single-component, no-follow reads relative to one retained directory descriptor, including macOS lifecycle recovery paths.
+
 ## [0.16.4] - 2026-09-05
 
 ### Fixed

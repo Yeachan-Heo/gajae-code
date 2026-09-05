@@ -14,11 +14,11 @@ SESSION="$1"
 WORKDIR="$(cd "$2" && pwd -P)"
 GJC_BIN="${GJC_BIN-$(command -v gjc || true)}"
 TMUX_BIN="${GJC_SESSION_TMUX_BIN:-tmux}"
+if [[ "$TMUX_BIN" == */* && "$TMUX_BIN" != /* ]]; then TMUX_BIN="$(pwd -P)/$TMUX_BIN"; fi
 export GJC_TMUX_COMMAND="$TMUX_BIN"
 STATE_DIR="${GJC_SESSION_STATE_DIR:-$WORKDIR/.gjc-session-state/$SESSION}"
 RUNTIME_STATE_JSON="$STATE_DIR/runtime-state.json"
 SOCKET_KEY="gjc-${SESSION//[^A-Za-z0-9_.-]/_}"
-PROTOCOL_TOKEN="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
 MONITOR_SESSION="${SESSION}-owner-monitor"
 
 
@@ -230,11 +230,6 @@ WORKTREE_BASELINE_DIRTY="$(gjc_session_git_dirty_boolean "$WORKDIR")"
 CREATED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 LIFECYCLE_DIR="$STATE_DIR/$SESSION/owner-lifecycle"
 GENERATION_JSON="$LIFECYCLE_DIR/generation.json"
-PROTOCOL_TOKEN_FILE="$LIFECYCLE_DIR/protocol-token-$OWNER_GENERATION.json"
-PROTOCOL_TOKEN_DIGEST="$(printf '%s' "$PROTOCOL_TOKEN" | sha256sum)"
-PROTOCOL_TOKEN_DIGEST="${PROTOCOL_TOKEN_DIGEST%% *}"
-printf '{"schema_version":1,"session_id":"%s","generation":"%s","token_sha256":"%s"}\n' "$SESSION" "$OWNER_GENERATION" "$PROTOCOL_TOKEN_DIGEST" > "$PROTOCOL_TOKEN_FILE"
-chmod 600 "$PROTOCOL_TOKEN_FILE"
 # Arm immutable failure recording before this generation becomes current.
 ROLLBACK_ARMED=0
 ROLLBACK_MONITOR_CREATED=0
@@ -509,10 +504,37 @@ def now():
 
 
 child = None
+generation_published = False
 SIGNAL_NAMES = {signal.SIGTERM: "SIGTERM", signal.SIGINT: "SIGINT", signal.SIGHUP: "SIGHUP"}
+OWNER_PANE_ID = os.environ.get("TMUX_PANE", "")
+OWNER_PID = os.getpid()
+OWNER_START_TIME = ""
+OWNER_NATIVE_SESSION_ID = ""
+OWNER_SERVER_PID = None
+OWNER_SERVER_START_TIME = ""
+if OWNER_PANE_ID and os.environ.get("GJC_TMUX_COMMAND"):
+    try:
+        with open(f"/proc/{OWNER_PID}/stat", encoding="utf-8") as handle:
+            OWNER_START_TIME = handle.read().rsplit(")", 1)[1].strip().split()[19]
+    except (OSError, IndexError, ValueError):
+        OWNER_START_TIME = ""
+    identity = subprocess.run(
+        [os.environ["GJC_TMUX_COMMAND"], "-L", os.environ["GJC_TMUX_OWNER_SERVER_KEY"], "display-message", "-p", "-t", OWNER_PANE_ID, "-F", "#{session_id}\t#{pid}"],
+        text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=3, check=True,
+    ).stdout.strip()
+    OWNER_NATIVE_SESSION_ID, raw_server_pid = identity.split("\t", 1)
+    OWNER_SERVER_PID = int(raw_server_pid)
+    try:
+        with open(f"/proc/{OWNER_SERVER_PID}/stat", encoding="utf-8") as handle:
+            OWNER_SERVER_START_TIME = handle.read().rsplit(")", 1)[1].strip().split()[19]
+    except (OSError, IndexError, ValueError):
+        OWNER_SERVER_START_TIME = ""
+    if not OWNER_NATIVE_SESSION_ID or not OWNER_START_TIME or not OWNER_SERVER_START_TIME:
+        raise SystemExit(125)
 
 def write_immutable(path, record, inject=None):
-    if inject and os.environ.get("GJC_SESSION_TEST_FAIL_RECEIPT_WRITE") in {inject, inject.removesuffix("_canonical")}:
+    base_inject = inject[:-10] if inject and inject.endswith("_canonical") else inject
+    if inject and os.environ.get("GJC_SESSION_TEST_FAIL_RECEIPT_WRITE") in {inject, base_inject}:
         raise OSError("injected receipt write failure")
     temporary = f"{path}.{os.getpid()}.tmp"
     try:
@@ -553,6 +575,43 @@ def publish_current_alias(canonical_path, alias_path, kind, inject=None):
         raise OSError("failure alias publication failed")
 
 
+def run_authorized(request, timeout=3):
+    read_fd, write_fd = os.pipe()
+    proof_fd = os.dup(read_fd)
+    environment = os.environ.copy()
+    environment["GJC_TMUX_OWNER_AUTHORITY_FD"] = str(read_fd)
+    try:
+        process = subprocess.Popen(
+            [os.environ["GJC_SESSION_GJC_BIN"], "--internal-tmux-owner-isolation"],
+            env=environment,
+            pass_fds=(read_fd,),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+        with open(f"/proc/{process.pid}/stat", encoding="utf-8") as handle:
+            child_start_time = handle.read().rsplit(")", 1)[1].strip().split()[19]
+        os.write(write_fd, f"{process.pid} {child_start_time}\n".encode())
+        os.close(write_fd)
+        write_fd = -1
+        os.close(read_fd)
+        read_fd = -1
+        try:
+            stdout, _ = process.communicate(input=f"{json.dumps(request, separators=(',', ':'))}\n", timeout=timeout)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+            raise
+        return process.returncode, stdout
+    finally:
+        if read_fd >= 0:
+            os.close(read_fd)
+        if write_fd >= 0:
+            os.close(write_fd)
+        os.close(proof_fd)
+
+
 
 
 def observe(signum):
@@ -560,11 +619,16 @@ def observe(signum):
     request = {
         "schema_version": 1,
         "op": "observe_terminal",
-        "auth_token": os.environ["GJC_TMUX_OWNER_PROTOCOL_TOKEN"],
         "session_id": os.environ["GJC_SESSION_NAME"],
         "owner_generation": os.environ["GJC_SESSION_OWNER_GENERATION"],
         "state_dir": os.environ["GJC_SESSION_STATE_DIR"],
         "socket_key": os.environ["GJC_TMUX_OWNER_SERVER_KEY"],
+        "owner_native_session_id": OWNER_NATIVE_SESSION_ID,
+        "owner_pane_id": OWNER_PANE_ID,
+        "owner_pid": OWNER_PID,
+        "owner_start_time": OWNER_START_TIME,
+        "owner_server_pid": OWNER_SERVER_PID,
+        "owner_server_start_time": OWNER_SERVER_START_TIME,
         "observer": "raw_monitor",
         "observed_at": now(),
         "signal": signal_name,
@@ -604,18 +668,10 @@ def observe(signum):
         except (KeyError, OSError, TypeError, ValueError):
             pass
     try:
-        completed = subprocess.run(
-            [os.environ["GJC_SESSION_GJC_BIN"], "--internal-tmux-owner-isolation"],
-            input=f"{json.dumps(request, separators=(',', ':'))}\n",
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            timeout=3,
-            check=False,
-        )
-        if completed.returncode != 0:
+        returncode, stdout = run_authorized(request)
+        if returncode != 0:
             raise ValueError("terminal observer adapter failed")
-        verdict = json.loads(completed.stdout)
+        verdict = json.loads(stdout)
         state_dir = os.environ["GJC_SESSION_STATE_DIR"]
         session = os.environ["GJC_SESSION_NAME"]
         generation = os.environ["GJC_SESSION_OWNER_GENERATION"]
@@ -677,9 +733,11 @@ def observe(signum):
 
 
 def forward(signum, _frame):
-    observe(signum)
     if child is None:
-        return
+        if generation_published:
+            observe(signum)
+        raise SystemExit(128 + signum)
+    observe(signum)
     try:
         child.send_signal(signum)
     except ProcessLookupError:
@@ -689,14 +747,55 @@ def forward(signum, _frame):
 for handled_signal in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
     signal.signal(handled_signal, forward)
 
+publication_go = os.environ.get("GJC_SESSION_PUBLICATION_GO")
+publication_ready = os.environ.get("GJC_SESSION_PUBLICATION_READY")
+if publication_go and publication_ready:
+    deadline = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=15)
+    while not os.path.exists(publication_go):
+        if datetime.datetime.now(datetime.timezone.utc) >= deadline:
+            raise SystemExit(125)
+        import time
+        time.sleep(0.02)
+    publication_request = {
+        "schema_version": 1,
+        "op": "publish_generation",
+        "session_id": os.environ["GJC_SESSION_NAME"],
+        "owner_generation": os.environ["GJC_SESSION_OWNER_GENERATION"],
+        "state_dir": os.environ["GJC_SESSION_STATE_DIR"],
+        "socket_key": os.environ["GJC_TMUX_OWNER_SERVER_KEY"],
+        "owner_native_session_id": OWNER_NATIVE_SESSION_ID,
+        "owner_pane_id": OWNER_PANE_ID,
+        "owner_pid": OWNER_PID,
+        "owner_start_time": OWNER_START_TIME,
+        "owner_server_pid": OWNER_SERVER_PID,
+        "owner_server_start_time": OWNER_SERVER_START_TIME,
+        "baseline": json.loads(os.environ["GJC_SESSION_GENERATION_BASELINE_JSON"]),
+    }
+    signal.pthread_sigmask(signal.SIG_BLOCK, SIGNAL_NAMES)
+    published_returncode, published_stdout = run_authorized(publication_request, timeout=5)
+    try:
+        publication_response = json.loads(published_stdout)
+    except (TypeError, ValueError):
+        publication_response = None
+    if published_returncode != 0 or publication_response != {"schema_version": 1, "ok": True, "code": "generation_published", "generation": os.environ["GJC_SESSION_OWNER_GENERATION"]}:
+        raise SystemExit(125)
+    generation_published = True
+    started_path = os.path.join(os.environ["GJC_SESSION_STATE_DIR"], os.environ["GJC_SESSION_NAME"], "owner-lifecycle", f'started-{os.environ["GJC_SESSION_OWNER_GENERATION"]}.json')
+    write_immutable(started_path, {"schema_version": 1, "kind": "started", "session_id": os.environ["GJC_SESSION_NAME"], "owner_generation": os.environ["GJC_SESSION_OWNER_GENERATION"]}, "started_canonical")
+    write_immutable(publication_ready, publication_response)
+
 started_at = now()
 command = [os.environ["GJC_SESSION_GJC_BIN"]]
 child_environment = os.environ.copy()
-child_environment.pop("GJC_TMUX_OWNER_PROTOCOL_TOKEN", None)
+for private_name in ("GJC_SESSION_GENERATION_BASELINE_JSON", "GJC_SESSION_PUBLICATION_GO", "GJC_SESSION_PUBLICATION_READY"):
+    child_environment.pop(private_name, None)
+child_environment.pop("GJC_TMUX_OWNER_AUTHORITY_FD", None)
 try:
     child = subprocess.Popen(command, cwd=os.environ["GJC_SESSION_WORKDIR"], env=child_environment)
+    signal.pthread_sigmask(signal.SIG_UNBLOCK, SIGNAL_NAMES)
     status = child.wait()
 except OSError:
+    signal.pthread_sigmask(signal.SIG_UNBLOCK, SIGNAL_NAMES)
     status = 127
 exit_code = status if status >= 0 else 128 - status
 finalized = subprocess.run(
@@ -719,7 +818,9 @@ raise SystemExit(exit_code)
 SUPERVISOR
 chmod 700 "$STATE_DIR/supervisor.py"
 
-LAUNCH=(env "GJC_SESSION_NAME=$SESSION" "GJC_SESSION_WORKDIR=$WORKDIR" "GJC_SESSION_BRANCH=$BRANCH" "GJC_SESSION_STATE_DIR=$STATE_DIR" "GJC_SESSION_OWNER_GENERATION=$OWNER_GENERATION" "GJC_SESSION_RUNTIME_FRESH_AFTER=$CREATED_AT" "GJC_SESSION_STARTED_JSON=$STATE_DIR/started.json" "GJC_SESSION_TERMINAL_JSON=$STATE_DIR/terminal.json" "GJC_SESSION_TERMINAL_CANONICAL_JSON=$LIFECYCLE_DIR/terminal-$OWNER_GENERATION.json" "GJC_SESSION_FINAL_JSON=$STATE_DIR/final.json" "GJC_SESSION_FINAL_CANONICAL_JSON=$LIFECYCLE_DIR/final-$OWNER_GENERATION.json" "GJC_SESSION_GENERATION_JSON=$GENERATION_JSON" "GJC_COORDINATOR_SESSION_ID=$SESSION" "GJC_COORDINATOR_SESSION_BRANCH=$BRANCH" "GJC_COORDINATOR_SESSION_STATE_FILE=$RUNTIME_STATE_JSON" "GJC_TMUX_OWNER_GENERATION=$OWNER_GENERATION" "GJC_TMUX_OWNER_STATE_DIR=$STATE_DIR" "GJC_TMUX_OWNER_SERVER_KEY=$SOCKET_KEY" "GJC_TMUX_OWNER_PROTOCOL_TOKEN=$PROTOCOL_TOKEN" "GJC_SESSION_PROMPT_ACCEPTED_JSON=$STATE_DIR/prompt-accepted.json" "GJC_SESSION_WORKTREE_BASELINE_DIRTY=$WORKTREE_BASELINE_DIRTY" "GJC_SESSION_GJC_BIN=$GJC_BIN" "GJC_SESSION_POSTMORTEM_SH=$SCRIPT_DIR/postmortem.sh" "GJC_SESSION_RUNNER_SH=$STATE_DIR/runner.sh" python3 "$STATE_DIR/supervisor.py")
+PUBLICATION_GO="$LIFECYCLE_DIR/publication-go-$OWNER_GENERATION"
+PUBLICATION_READY="$LIFECYCLE_DIR/publication-ready-$OWNER_GENERATION.json"
+LAUNCH=(env "GJC_SESSION_NAME=$SESSION" "GJC_SESSION_WORKDIR=$WORKDIR" "GJC_SESSION_BRANCH=$BRANCH" "GJC_SESSION_STATE_DIR=$STATE_DIR" "GJC_SESSION_OWNER_GENERATION=$OWNER_GENERATION" "GJC_TMUX_COMMAND=$TMUX_BIN" "GJC_SESSION_RUNTIME_FRESH_AFTER=$CREATED_AT" "GJC_SESSION_STARTED_JSON=$STATE_DIR/started.json" "GJC_SESSION_TERMINAL_JSON=$STATE_DIR/terminal.json" "GJC_SESSION_TERMINAL_CANONICAL_JSON=$LIFECYCLE_DIR/terminal-$OWNER_GENERATION.json" "GJC_SESSION_FINAL_JSON=$STATE_DIR/final.json" "GJC_SESSION_FINAL_CANONICAL_JSON=$LIFECYCLE_DIR/final-$OWNER_GENERATION.json" "GJC_SESSION_GENERATION_JSON=$GENERATION_JSON" "GJC_SESSION_GENERATION_BASELINE_JSON=$GENERATION_BASELINE_JSON" "GJC_SESSION_PUBLICATION_GO=$PUBLICATION_GO" "GJC_SESSION_PUBLICATION_READY=$PUBLICATION_READY" "GJC_COORDINATOR_SESSION_ID=$SESSION" "GJC_COORDINATOR_SESSION_BRANCH=$BRANCH" "GJC_COORDINATOR_SESSION_STATE_FILE=$RUNTIME_STATE_JSON" "GJC_TMUX_OWNER_GENERATION=$OWNER_GENERATION" "GJC_TMUX_OWNER_STATE_DIR=$STATE_DIR" "GJC_TMUX_OWNER_SERVER_KEY=$SOCKET_KEY" "GJC_SESSION_PROMPT_ACCEPTED_JSON=$STATE_DIR/prompt-accepted.json" "GJC_SESSION_WORKTREE_BASELINE_DIRTY=$WORKTREE_BASELINE_DIRTY" "GJC_SESSION_GJC_BIN=$GJC_BIN" "GJC_SESSION_POSTMORTEM_SH=$SCRIPT_DIR/postmortem.sh" "GJC_SESSION_RUNNER_SH=$STATE_DIR/runner.sh" python3 "$STATE_DIR/supervisor.py")
 LAUNCH_SHELL="$(shell_join "${LAUNCH[@]}")"
 TMUX_ARGV=("$TMUX_BIN" -L "$SOCKET_KEY" new-session -d -P -F '#{session_id}' -s "$SESSION" -c "$WORKDIR" -n gjc "$LAUNCH_SHELL")
 PLAN_LINE="$(python3 - "$SESSION" "$OWNER_GENERATION" "$WORKDIR" "$STATE_DIR" "$SOCKET_KEY" "$GENERATION_BASELINE_JSON" "${TMUX_ARGV[@]}" <<'PY'
@@ -728,7 +829,7 @@ session, generation, cwd, state_dir, socket_key, baseline, *argv = sys.argv[1:]
 print(json.dumps({"schema_version": 1, "op": "plan", "platform": "linux", "session_id": session, "owner_generation": generation, "cwd": cwd, "state_dir": state_dir, "socket_key": socket_key, "tmux_argv": argv, "baseline": json.loads(baseline)}, separators=(",", ":")))
 PY
 )"
-PLAN_RESPONSE="$(printf '%s\n' "$PLAN_LINE" | env "GJC_TMUX_OWNER_PROTOCOL_TOKEN=$PROTOCOL_TOKEN" "$GJC_BIN" --internal-tmux-owner-isolation)" || { echo "owner-isolation plan protocol failed" >&2; exit 1; }
+PLAN_RESPONSE="$(printf '%s\n' "$PLAN_LINE" | "$GJC_BIN" --internal-tmux-owner-isolation)" || { echo "owner-isolation plan protocol failed" >&2; exit 1; }
 PLAN_MODE="$(python3 - "$PLAN_RESPONSE" "$SESSION" "$OWNER_GENERATION" "$STATE_DIR" "$SOCKET_KEY" "$GENERATION_BASELINE_JSON" "${TMUX_ARGV[@]}" <<'PY'
 import datetime, hashlib, json, sys
 try:
@@ -791,7 +892,7 @@ record_rollback_identity owner_session "$SESSION" ROLLBACK_OWNER_NATIVE_ID ROLLB
 
 CREATION_BOUNDARY=postspawn
 
-POST_SPAWN_RESPONSE="$(printf '%s\n' "$PLAN_LINE" | env "GJC_TMUX_OWNER_PROTOCOL_TOKEN=$PROTOCOL_TOKEN" "$GJC_BIN" --internal-tmux-owner-isolation)" || { echo "owner-isolation post-spawn proof failed" >&2; show_recovery_hint; exit 1; }
+POST_SPAWN_RESPONSE="$(printf '%s\n' "$PLAN_LINE" | "$GJC_BIN" --internal-tmux-owner-isolation)" || { echo "owner-isolation post-spawn proof failed" >&2; show_recovery_hint; exit 1; }
 python3 - "$POST_SPAWN_RESPONSE" "$SESSION" "$SOCKET_KEY" "$ROLLBACK_OWNER_SERVER_PID" "$ROLLBACK_OWNER_SERVER_START_TIME" <<'PY' || { echo "owner-isolation post-spawn server proof rejected" >&2; show_recovery_hint; exit 1; }
 import json
 import sys
@@ -854,26 +955,38 @@ PY
   fi
 done
 CREATION_BOUNDARY=generation
-GENERATION_PUBLISH_REQUEST="$(GJC_TMUX_OWNER_PROTOCOL_TOKEN="$PROTOCOL_TOKEN" python3 - "$SESSION" "$OWNER_GENERATION" "$STATE_DIR" "$GENERATION_BASELINE_JSON" <<'PY'
-import json, os, sys
-session, generation, state_dir, baseline = sys.argv[1:]
-print(json.dumps({"schema_version":1,"op":"publish_generation","auth_token":os.environ["GJC_TMUX_OWNER_PROTOCOL_TOKEN"],"session_id":session,"owner_generation":generation,"state_dir":state_dir,"baseline":json.loads(baseline)}, separators=(",", ":")))
+OWNER_PID="$("$TMUX_BIN" -L "$SOCKET_KEY" display-message -p -t "$ROLLBACK_OWNER_NATIVE_ID:" -F '#{pane_pid}')" || { echo "owner process identity unavailable" >&2; exit 1; }
+OWNER_START_TIME="$(python3 - "$OWNER_PID" <<'PY'
+import sys
+text = open(f"/proc/{sys.argv[1]}/stat", encoding="utf-8").read().strip()
+value = text[text.rfind(")") + 2:].split()[19]
+if not value.isdigit() or int(value) <= 0: raise SystemExit(1)
+print(value)
 PY
-)"
-GENERATION_PUBLISH_RESPONSE="$(printf '%s\n' "$GENERATION_PUBLISH_REQUEST" | env "GJC_TMUX_OWNER_PROTOCOL_TOKEN=$PROTOCOL_TOKEN" "$GJC_BIN" --internal-tmux-owner-isolation)" || { echo "generation publication protocol failed" >&2; exit 1; }
-python3 - "$GENERATION_PUBLISH_RESPONSE" "$OWNER_GENERATION" <<'PY' || { echo "generation publication rejected" >&2; exit 1; }
+)" || { echo "owner process identity unavailable" >&2; exit 1; }
+if [[ -n "${GJC_SESSION_TEST_PAUSE_BEFORE_PUBLICATION_GO:-}" ]]; then
+  : > "$GJC_SESSION_TEST_PAUSE_BEFORE_PUBLICATION_GO"
+  sleep 30
+fi
+printf '' > "$PUBLICATION_GO"
+publication_deadline=$((SECONDS + 15))
+while [[ ! -f "$PUBLICATION_READY" && "$SECONDS" -lt "$publication_deadline" ]]; do sleep 0.02; done
+if [[ -n "${GJC_SESSION_TEST_PAUSE_AFTER_PUBLICATION_READY:-}" ]]; then
+  : > "$GJC_SESSION_TEST_PAUSE_AFTER_PUBLICATION_READY"
+  sleep 30
+fi
+python3 - "$PUBLICATION_READY" "$OWNER_GENERATION" <<'PY' || { echo "generation publication rejected" >&2; exit 1; }
 import json, sys
 try:
-    response = json.loads(sys.argv[1])
+    with open(sys.argv[1], encoding="utf-8") as handle: response = json.load(handle)
     valid = response == {"schema_version":1,"ok":True,"code":"generation_published","generation":sys.argv[2]}
-except (TypeError, ValueError):
+except (OSError, TypeError, ValueError):
     valid = False
 raise SystemExit(0 if valid else 1)
 PY
 gjc_session_publish_current_alias "$METADATA_CANONICAL" "$STATE_DIR/metadata.json" "$GENERATION_JSON" "$SESSION" "$OWNER_GENERATION"
 gjc_session_publish_current_alias "$CREATION_CANONICAL" "$STATE_DIR/creation-state.json" "$GENERATION_JSON" "$SESSION" "$OWNER_GENERATION" creation_started
 STARTED_CANONICAL="$LIFECYCLE_DIR/started-$OWNER_GENERATION.json"
-gjc_session_write_public_marker "$STARTED_CANONICAL" started "$SESSION" "$OWNER_GENERATION"
 gjc_session_publish_current_alias "$STARTED_CANONICAL" "$STATE_DIR/started.json" "$GENERATION_JSON" "$SESSION" "$OWNER_GENERATION" started
 LIFECYCLE_DIR="$STATE_DIR/$SESSION/owner-lifecycle"
 GENERATION_JSON="$LIFECYCLE_DIR/generation.json"
@@ -937,7 +1050,8 @@ case "$interval" in ''|*[!0-9]*) interval=5 ;; esac
 last_seen_ms="$(date +%s%3N)"
 while true; do
   probe_started_ms="$(date +%s%3N)"
-  if timeout 1s "$GJC_SESSION_TMUX_BIN" -L "$GJC_SESSION_SOCKET_KEY" has-session -t "=$GJC_SESSION_NAME" >/dev/null 2>&1; then
+  owner_target="${GJC_SESSION_OWNER_NATIVE_SESSION_ID:-=$GJC_SESSION_NAME}"
+  if timeout 1s "$GJC_SESSION_TMUX_BIN" -L "$GJC_SESSION_SOCKET_KEY" has-session -t "$owner_target" >/dev/null 2>&1; then
     last_seen_ms="$probe_started_ms"
     sleep "$interval"
     continue
@@ -948,12 +1062,61 @@ while true; do
   sleep 1
 done
 observed_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-request="$(python3 - "$GJC_SESSION_NAME" "$GJC_SESSION_OWNER_GENERATION" "$GJC_SESSION_STATE_DIR" "$GJC_SESSION_SOCKET_KEY" "$observed_at" <<'PY'
+monitor_identity_file="${GJC_SESSION_MONITOR_IDENTITY_FILE:-}"
+monitor_pid=""
+monitor_start_time=""
+if [[ -n "$monitor_identity_file" ]]; then
+  for _ in {1..350}; do [[ -s "$monitor_identity_file" ]] && break; sleep 0.02; done
+  [[ -s "$monitor_identity_file" ]] || exit 1
+  read -r monitor_pid monitor_start_time < <(python3 - "$monitor_identity_file" <<'PY'
+import json, sys
+record = json.load(open(sys.argv[1], encoding="utf-8"))
+print(record["pid"], record["start_time"])
+PY
+)
+fi
+monitor_pane_id=""
+monitor_native_session_id=""
+if [[ -n "${GJC_SESSION_OWNER_NATIVE_SESSION_ID:-}" && -n "${GJC_SESSION_OWNER_PANE_ID:-}" ]]; then
+  monitor_pane_id="${GJC_SESSION_MONITOR_PANE_ID:?monitor pane identity unavailable}"
+  monitor_native_session_id="${GJC_SESSION_MONITOR_NATIVE_SESSION_ID:?monitor session identity unavailable}"
+fi
+request="$(python3 - "$GJC_SESSION_NAME" "$GJC_SESSION_OWNER_GENERATION" "$GJC_SESSION_STATE_DIR" "$GJC_SESSION_SOCKET_KEY" "$observed_at" "${GJC_SESSION_OWNER_NATIVE_SESSION_ID:-}" "${GJC_SESSION_OWNER_PANE_ID:-}" "${GJC_SESSION_OWNER_PID:-}" "${GJC_SESSION_OWNER_START_TIME:-}" "${GJC_SESSION_OWNER_SERVER_PID:-}" "${GJC_SESSION_OWNER_SERVER_START_TIME:-}" "$monitor_native_session_id" "$monitor_pane_id" "$monitor_pid" "$monitor_start_time" <<'PY'
 import json, os, sys
-session, generation, state_dir, socket_key, observed_at = sys.argv[1:]
-print(json.dumps({"schema_version":1,"op":"observe_terminal","auth_token":os.environ["GJC_TMUX_OWNER_PROTOCOL_TOKEN"],"session_id":session,"owner_generation":generation,"state_dir":state_dir,"socket_key":socket_key,"observer":"raw_monitor","observed_at":observed_at,"signal":"UNKNOWN","exit_code":None,"exit_kind":"owner_lost","reason":"tmux_session_missing"}, separators=(",", ":")))
+session, generation, state_dir, socket_key, observed_at, owner_native_session_id, owner_pane_id, owner_pid, owner_start_time, owner_server_pid, owner_server_start_time, monitor_native_session_id, monitor_pane_id, monitor_pid, monitor_start_time = sys.argv[1:]
+request = {"schema_version":1,"op":"observe_terminal","session_id":session,"owner_generation":generation,"state_dir":state_dir,"socket_key":socket_key,"observer":"raw_monitor","observed_at":observed_at,"signal":"UNKNOWN","exit_code":None,"exit_kind":"owner_lost","reason":"tmux_session_missing"}
+if owner_native_session_id and owner_pane_id and owner_pid and owner_start_time and owner_server_pid and owner_server_start_time: request.update({"owner_native_session_id":owner_native_session_id,"owner_pane_id":owner_pane_id,"owner_pid":int(owner_pid),"owner_start_time":owner_start_time,"owner_server_pid":int(owner_server_pid),"owner_server_start_time":owner_server_start_time})
+if monitor_native_session_id and monitor_pane_id and monitor_pid and monitor_start_time: request.update({"monitor_native_session_id":monitor_native_session_id,"monitor_pane_id":monitor_pane_id,"monitor_pid":int(monitor_pid),"monitor_start_time":monitor_start_time})
+print(json.dumps(request, separators=(",", ":")))
 PY
 )"
+authorized_owner_call() {
+  python3 - "$GJC_SESSION_GJC_BIN" "$request" "$1" <<'PY'
+import os, subprocess, sys
+binary, request, timeout = sys.argv[1:]
+read_fd, write_fd = os.pipe()
+proof_fd = os.dup(read_fd)
+environment = os.environ.copy()
+environment["GJC_TMUX_OWNER_AUTHORITY_FD"] = str(read_fd)
+try:
+    process = subprocess.Popen([binary, "--internal-tmux-owner-isolation"], env=environment, pass_fds=(read_fd,), stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+    with open(f"/proc/{process.pid}/stat", encoding="utf-8") as handle:
+        child_start_time = handle.read().rsplit(")", 1)[1].strip().split()[19]
+    os.write(write_fd, f"{process.pid} {child_start_time}\n".encode())
+    os.close(write_fd); write_fd = -1
+    os.close(read_fd); read_fd = -1
+    try:
+        stdout, _ = process.communicate(input=f"{request}\n", timeout=float(timeout))
+    except subprocess.TimeoutExpired:
+        process.kill(); process.wait(); raise SystemExit(124)
+    sys.stdout.write(stdout)
+    raise SystemExit(process.returncode)
+finally:
+    if read_fd >= 0: os.close(read_fd)
+    if write_fd >= 0: os.close(write_fd)
+    os.close(proof_fd)
+PY
+}
 deadline_at_ms=$((last_seen_ms + 7000))
 verdict=""
 while true; do
@@ -961,7 +1124,7 @@ while true; do
   remaining_ms=$((deadline_at_ms - now_ms))
   (( remaining_ms > 0 )) || break
   remaining_seconds="$(printf '%d.%03d' "$((remaining_ms / 1000))" "$((remaining_ms % 1000))")"
-  if verdict="$(printf '%s\n' "$request" | timeout "${remaining_seconds}s" "$GJC_SESSION_GJC_BIN" --internal-tmux-owner-isolation)"; then break; fi
+  if verdict="$(authorized_owner_call "$remaining_seconds")"; then break; fi
   verdict=""; sleep 1
 done
 now_ms="$(date +%s%3N)"
@@ -1013,10 +1176,39 @@ chmod +x "$STATE_DIR/monitor.sh"
 CREATION_BOUNDARY=monitor
 
 if [[ "${GJC_SESSION_MONITOR_DISABLE:-0}" != 1 ]]; then
-  MONITOR_LAUNCH=(env "GJC_SESSION_NAME=$SESSION" "GJC_SESSION_WORKDIR=$WORKDIR" "GJC_SESSION_OWNER_GENERATION=$OWNER_GENERATION" "GJC_SESSION_STATE_DIR=$STATE_DIR" "GJC_SESSION_SOCKET_KEY=$SOCKET_KEY" "GJC_TMUX_OWNER_PROTOCOL_TOKEN=$PROTOCOL_TOKEN" "GJC_SESSION_TMUX_BIN=$TMUX_BIN" "GJC_SESSION_GJC_BIN=$GJC_BIN" "GJC_SESSION_POSTMORTEM_SH=$SCRIPT_DIR/postmortem.sh" "GJC_SESSION_GENERATION_JSON=$GENERATION_JSON" "GJC_SESSION_VERDICT_JSON=$STATE_DIR/verdict.json" "GJC_SESSION_VERDICT_CANONICAL_JSON=$LIFECYCLE_DIR/verdict-$OWNER_GENERATION.json" "GJC_SESSION_VANISHED_JSON=$STATE_DIR/vanished.json" "GJC_SESSION_VANISHED_CANONICAL_JSON=$LIFECYCLE_DIR/vanished-$OWNER_GENERATION.json" "GJC_SESSION_INCIDENT_JSON=$STATE_DIR/incident.json" "GJC_SESSION_INCIDENT_CANONICAL_JSON=$LIFECYCLE_DIR/incident-$OWNER_GENERATION.json" "GJC_SESSION_MONITOR_INTERVAL=${GJC_SESSION_MONITOR_INTERVAL:-5}" bash "$STATE_DIR/monitor.sh")
-  "$TMUX_BIN" -L "$SOCKET_KEY" new-session -d -s "$MONITOR_SESSION" -c "$WORKDIR" -n owner-monitor "$(shell_join "${MONITOR_LAUNCH[@]}")" || { echo "owner monitor creation failed" >&2; exit 1; }
+  OWNER_PANE_ID="$("$TMUX_BIN" -L "$SOCKET_KEY" display-message -p -t "$ROLLBACK_OWNER_NATIVE_ID:" -F '#{pane_id}')" || { echo "owner pane identity unavailable" >&2; exit 1; }
+  "$TMUX_BIN" -L "$SOCKET_KEY" new-session -d -s "$MONITOR_SESSION" -c "$WORKDIR" -n owner-monitor "sleep 30" || { echo "owner monitor creation failed" >&2; exit 1; }
   ROLLBACK_MONITOR_CREATED=1
   record_rollback_identity monitor_session "$MONITOR_SESSION" ROLLBACK_MONITOR_NATIVE_ID ROLLBACK_MONITOR_SERVER_PID ROLLBACK_MONITOR_SERVER_START_TIME ROLLBACK_MONITOR_SESSION_NAME || { echo "owner monitor rollback identity receipt failed" >&2; exit 1; }
+  MONITOR_PANE_ID="$("$TMUX_BIN" -L "$SOCKET_KEY" display-message -p -t "$ROLLBACK_MONITOR_NATIVE_ID:" -F '#{pane_id}')" || { echo "monitor pane identity unavailable" >&2; exit 1; }
+  [[ -n "$MONITOR_PANE_ID" ]] || { echo "monitor pane identity unavailable" >&2; exit 1; }
+  MONITOR_IDENTITY_FILE="$LIFECYCLE_DIR/monitor-identity-$OWNER_GENERATION.json"
+  rm -f "$MONITOR_IDENTITY_FILE"
+  MONITOR_LAUNCH=(env "GJC_TMUX_COMMAND=$TMUX_BIN" "GJC_SESSION_MONITOR_IDENTITY_FILE=$MONITOR_IDENTITY_FILE" "GJC_SESSION_OWNER_PID=$OWNER_PID" "GJC_SESSION_OWNER_START_TIME=$OWNER_START_TIME" "GJC_TMUX_COMMAND=$TMUX_BIN" "GJC_SESSION_OWNER_PID=$OWNER_PID" "GJC_SESSION_OWNER_START_TIME=$OWNER_START_TIME" "GJC_SESSION_NAME=$SESSION" "GJC_SESSION_WORKDIR=$WORKDIR" "GJC_SESSION_OWNER_GENERATION=$OWNER_GENERATION" "GJC_SESSION_OWNER_NATIVE_SESSION_ID=$ROLLBACK_OWNER_NATIVE_ID" "GJC_SESSION_OWNER_PANE_ID=$OWNER_PANE_ID" "GJC_SESSION_OWNER_SERVER_PID=$ROLLBACK_OWNER_SERVER_PID" "GJC_SESSION_OWNER_SERVER_START_TIME=$ROLLBACK_OWNER_SERVER_START_TIME" "GJC_SESSION_MONITOR_NATIVE_SESSION_ID=$ROLLBACK_MONITOR_NATIVE_ID" "GJC_SESSION_MONITOR_PANE_ID=$MONITOR_PANE_ID" "GJC_SESSION_STATE_DIR=$STATE_DIR" "GJC_SESSION_SOCKET_KEY=$SOCKET_KEY" "GJC_SESSION_TMUX_BIN=$TMUX_BIN" "GJC_SESSION_GJC_BIN=$GJC_BIN" "GJC_SESSION_POSTMORTEM_SH=$SCRIPT_DIR/postmortem.sh" "GJC_SESSION_GENERATION_JSON=$GENERATION_JSON" "GJC_SESSION_VERDICT_JSON=$STATE_DIR/verdict.json" "GJC_SESSION_VERDICT_CANONICAL_JSON=$LIFECYCLE_DIR/verdict-$OWNER_GENERATION.json" "GJC_SESSION_VANISHED_JSON=$STATE_DIR/vanished.json" "GJC_SESSION_VANISHED_CANONICAL_JSON=$LIFECYCLE_DIR/vanished-$OWNER_GENERATION.json" "GJC_SESSION_INCIDENT_JSON=$STATE_DIR/incident.json" "GJC_SESSION_INCIDENT_CANONICAL_JSON=$LIFECYCLE_DIR/incident-$OWNER_GENERATION.json" "GJC_SESSION_MONITOR_INTERVAL=${GJC_SESSION_MONITOR_INTERVAL:-5}" bash "$STATE_DIR/monitor.sh")  MONITOR_TAG_CONDITION="#{&&:#{==:#{pid},${ROLLBACK_MONITOR_SERVER_PID}},#{&&:#{==:#{session_id},${ROLLBACK_MONITOR_NATIVE_ID}},#{==:#{session_name},${ROLLBACK_MONITOR_SESSION_NAME}}}}"
+  for option_value in \
+    "@gjc-session-id=$SESSION" \
+    "@gjc-session-state-file=$RUNTIME_STATE_JSON" \
+    "@gjc-owner-generation=$OWNER_GENERATION" \
+    "@gjc-owner-server-key=$SOCKET_KEY"; do
+    option="${option_value%%=*}"
+    value="${option_value#*=}"
+    tag_command="$(shell_join set-option -t "$ROLLBACK_MONITOR_NATIVE_ID" "$option" "$value")"
+    tag_response="$("$TMUX_BIN" -L "$SOCKET_KEY" if-shell -t "$ROLLBACK_MONITOR_NATIVE_ID" -F "$MONITOR_TAG_CONDITION" "$tag_command" "display-message -p __gjc_monitor_tag_refused__" 2>/dev/null)" || { echo "failed to tag isolated tmux monitor session: $option" >&2; exit 1; }
+    [[ -z "$tag_response" ]] || { echo "refusing to tag replacement tmux monitor session: $option" >&2; exit 1; }
+  done
+  "$TMUX_BIN" -L "$SOCKET_KEY" respawn-pane -k -t "$MONITOR_PANE_ID" "$(shell_join "${MONITOR_LAUNCH[@]}")" || { echo "owner monitor launch failed" >&2; exit 1; }
+  MONITOR_PID="$("$TMUX_BIN" -L "$SOCKET_KEY" display-message -p -t "$MONITOR_PANE_ID" -F '#{pane_pid}')" || { echo "monitor process identity unavailable" >&2; exit 1; }
+  python3 - "$MONITOR_IDENTITY_FILE" "$MONITOR_PID" <<'PY' || { echo "monitor process identity unavailable" >&2; exit 1; }
+import json, os, sys
+path, raw_pid = sys.argv[1:]
+pid = int(raw_pid)
+text = open(f"/proc/{pid}/stat", encoding="utf-8").read().strip()
+start_time = text[text.rfind(")") + 2:].split()[19]
+temporary = f"{path}.{os.getpid()}.tmp"
+with open(temporary, "x", encoding="utf-8") as handle:
+    json.dump({"pid": pid, "start_time": start_time}, handle, separators=(",", ":")); handle.write("\n"); handle.flush(); os.fsync(handle.fileno())
+os.replace(temporary, path)
+PY
 fi
 CREATION_COMPLETE=1
 ROLLBACK_ARMED=0

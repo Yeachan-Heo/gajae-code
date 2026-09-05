@@ -12,19 +12,7 @@ import * as fs from "node:fs/promises";
 
 import * as path from "node:path";
 
-import type { RecoveryFsRoot } from "@gajae-code/natives";
-
-let nativeRecoveryFsRoot: typeof import("@gajae-code/natives")["openRecoveryFsRoot"] | undefined;
-
-function openRecoveryFsRootNative(): typeof import("@gajae-code/natives")["openRecoveryFsRoot"] {
-	nativeRecoveryFsRoot ??= (
-		require("@gajae-code/natives") as {
-			openRecoveryFsRoot: typeof import("@gajae-code/natives")["openRecoveryFsRoot"];
-		}
-	).openRecoveryFsRoot;
-	return nativeRecoveryFsRoot;
-}
-
+import { openPortableRecoveryFsRoot, type RecoveryFsResult } from "@gajae-code/natives";
 import { isCompiledBinary } from "@gajae-code/utils/env";
 import { parseLinuxProcStartTime } from "./linux-proc";
 import { resolveGjcTmuxBinary } from "./psmux-detect";
@@ -154,10 +142,16 @@ export interface PlanRequest {
 export interface PublishGenerationRequest {
 	schema_version: 1;
 	op: "publish_generation";
-	auth_token?: string;
 	session_id: string;
 	owner_generation: string;
 	state_dir: string;
+	socket_key: string;
+	owner_native_session_id?: string;
+	owner_pane_id?: string;
+	owner_pid?: number;
+	owner_start_time?: string;
+	owner_server_pid?: number;
+	owner_server_start_time?: string;
 	baseline: OwnerGenerationBaseline;
 }
 
@@ -1276,11 +1270,20 @@ export interface OwnerIncident {
 export interface ObserveTerminalRequest {
 	schema_version: 1;
 	op: "observe_terminal";
-	auth_token?: string;
 	session_id: string;
 	owner_generation: string;
 	state_dir: string;
 	socket_key: string;
+	owner_native_session_id?: string;
+	owner_pane_id?: string;
+	owner_pid?: number;
+	owner_start_time?: string;
+	owner_server_pid?: number;
+	owner_server_start_time?: string;
+	monitor_native_session_id?: string;
+	monitor_pane_id?: string;
+	monitor_pid?: number;
+	monitor_start_time?: string;
 	observer: TerminalObserver;
 	observed_at: string;
 	signal: TerminalSignal;
@@ -1296,7 +1299,6 @@ export interface LifecyclePaths {
 	generation: string;
 	generationFile: string;
 	generationMarkerFile: string;
-	protocolTokenFile: string;
 	intentFile: string;
 	verdictFile: string;
 	verdictAliasFile: string;
@@ -1319,7 +1321,6 @@ export function lifecyclePaths(stateDir: string, sessionId: string, generation: 
 		generation,
 		generationFile: path.join(root, "generation.json"),
 		generationMarkerFile: path.join(root, `generation-${encodeURIComponent(generation)}.published.json`),
-		protocolTokenFile: path.join(root, `protocol-token-${encodeURIComponent(generation)}.json`),
 		intentFile: path.join(root, `intent-${generation}.json`),
 		verdictFile: path.join(root, `verdict-${generation}.json`),
 		verdictAliasFile: path.join(root, "verdict.json"),
@@ -1422,7 +1423,8 @@ export async function withOwnerGenerationLifecycleLock<T>(
 }
 
 /** Refuses to publish a generation whose staged supervisor already recorded a terminal exit. */
-function assertNoStagedOwnerTerminal(paths: LifecyclePaths): void {
+
+export function assertNoStagedOwnerTerminal(paths: LifecyclePaths): void {
 	const journal = readNoFollowJsonSync(paths.stagedTerminalFile);
 	if (journal === null) return;
 	if (!isValidStagedOwnerTerminalJournal(journal, { generation: paths.generation }))
@@ -1489,15 +1491,37 @@ export interface ManagedOwnerPredecessorEvidence {
 	predecessorToken: string;
 }
 
-function exactManagedOwnerJson(authority: RecoveryFsRoot, name: string): unknown {
-	const first = authority.read(name, 64 * 1024);
-	if (!first.ok || !first.data) throw new Error("managed_owner_replacement_evidence_unavailable");
-	const second = authority.read(name, 64 * 1024);
+let managedOwnerEvidenceAfterFirstReadForTests: (() => void) | undefined;
+let managedOwnerEvidenceAfterRootPinnedForTests: (() => void) | undefined;
+
+/** @internal */
+export function __setManagedOwnerEvidenceAfterFirstReadForTests(hook: (() => void) | undefined): void {
+	managedOwnerEvidenceAfterFirstReadForTests = hook;
+}
+
+/** @internal */
+export function __setManagedOwnerEvidenceAfterRootPinnedForTests(hook: (() => void) | undefined): void {
+	managedOwnerEvidenceAfterRootPinnedForTests = hook;
+}
+
+function exactManagedOwnerJson(root: string, name: string): unknown {
+	const authority = openPortableRecoveryFsRoot(root);
+	let first: RecoveryFsResult;
+	let second: RecoveryFsResult;
+	try {
+		managedOwnerEvidenceAfterRootPinnedForTests?.();
+		first = authority.read(name, 64 * 1024);
+		managedOwnerEvidenceAfterFirstReadForTests?.();
+		second = authority.read(name, 64 * 1024);
+	} finally {
+		authority.close();
+	}
+	if (!first.ok || !first.data || !first.identity || !second.ok || !second.data || !second.identity)
+		throw new Error("managed_owner_replacement_evidence_unavailable");
 	if (
-		!second.ok ||
-		!second.data ||
-		Buffer.compare(Buffer.from(first.data), Buffer.from(second.data)) !== 0 ||
-		JSON.stringify(first.identity) !== JSON.stringify(second.identity)
+		first.identity.dev !== second.identity.dev ||
+		first.identity.ino !== second.identity.ino ||
+		Buffer.compare(Buffer.from(first.data), Buffer.from(second.data)) !== 0
 	)
 		throw new Error("managed_owner_replacement_evidence_changed");
 	const content = Buffer.from(first.data).toString("utf8");
@@ -1549,25 +1573,15 @@ export function resolveManagedOwnerPredecessorSync(
 		lifecyclePaths(stateDir, sessionId, baseline.generation).stagedTerminalFile,
 	);
 	if (entries.includes(stagedTerminalFile)) {
-		const authority = openRecoveryFsRootNative()(root);
-		try {
-			const journal = exactManagedOwnerJson(authority, stagedTerminalFile);
-			if (!isValidStagedOwnerTerminalJournal(journal, { generation: baseline.generation, sessionId }))
-				throw new Error("managed_owner_replacement_evidence_untrusted");
-		} finally {
-			authority.close();
-		}
+		const journal = exactManagedOwnerJson(root, stagedTerminalFile);
+		if (!isValidStagedOwnerTerminalJournal(journal, { generation: baseline.generation, sessionId }))
+			throw new Error("managed_owner_replacement_evidence_untrusted");
 		throw new Error("managed_owner_replacement_evidence_ambiguous");
 	}
 	if (entries.includes(completionFile)) {
-		const authority = openRecoveryFsRootNative()(root);
-		try {
-			const completion = exactManagedOwnerJson(authority, completionFile);
-			if (!isCleanManagedOwnerCompletion(completion, { generation: baseline.generation, sessionId }))
-				throw new Error("managed_owner_replacement_evidence_untrusted");
-		} finally {
-			authority.close();
-		}
+		const completion = exactManagedOwnerJson(root, completionFile);
+		if (!isCleanManagedOwnerCompletion(completion, { generation: baseline.generation, sessionId }))
+			throw new Error("managed_owner_replacement_evidence_untrusted");
 		if (receipts.size > 0) throw new Error("managed_owner_replacement_evidence_ambiguous");
 		return undefined;
 	}
@@ -1576,66 +1590,55 @@ export function resolveManagedOwnerPredecessorSync(
 	if (tokens.length !== 1 || receipts.size !== 1) throw new Error("managed_owner_replacement_evidence_ambiguous");
 	const predecessorToken = tokens[0]!;
 	if (!/^[A-Za-z0-9._-]+$/.test(predecessorToken)) throw new Error("managed_owner_replacement_evidence_untrusted");
-	const authority = openRecoveryFsRootNative()(root);
-	try {
-		const binding = exactManagedOwnerJson(authority, `child-${predecessorToken}.binding.json`) as Record<
-			string,
-			unknown
-		>;
-		const receipt = exactManagedOwnerJson(authority, `sigabrt-${predecessorToken}.receipt.json`) as Record<
-			string,
-			unknown
-		>;
-		const command = binding.command;
-		const runId = binding.run_id;
-		const incarnation = binding.endpoint_incarnation;
-		const commandDigest =
-			Array.isArray(command) && command.length > 0 && command.every(value => typeof value === "string" && value)
-				? crypto.createHash("sha256").update(JSON.stringify(command)).digest("hex")
-				: "";
-		const valid =
-			binding.schema_version === 2 &&
-			binding.generation === baseline.generation &&
-			binding.session_id === sessionId &&
-			typeof runId === "string" &&
-			runId.length > 0 &&
-			typeof incarnation === "string" &&
-			incarnation.length > 0 &&
-			binding.child_token === predecessorToken &&
-			binding.command_sha256 === commandDigest &&
-			typeof binding.supervisor_pid === "number" &&
-			Number.isSafeInteger(binding.supervisor_pid) &&
-			binding.supervisor_pid > 0 &&
-			typeof binding.supervisor_start_time === "string" &&
-			typeof binding.created_at === "string" &&
-			receipt.schema_version === 2 &&
-			receipt.generation === binding.generation &&
-			receipt.session_id === binding.session_id &&
-			receipt.run_id === runId &&
-			receipt.endpoint_incarnation === incarnation &&
-			receipt.child_token === binding.child_token &&
-			receipt.command_sha256 === binding.command_sha256 &&
-			receipt.supervisor_pid === binding.supervisor_pid &&
-			receipt.supervisor_start_time === binding.supervisor_start_time &&
-			typeof receipt.child_pid === "number" &&
-			Number.isSafeInteger(receipt.child_pid) &&
-			receipt.child_pid > 0 &&
-			typeof receipt.child_start_time === "string" &&
-			typeof receipt.received_at === "string" &&
-			(receipt.exit_code === null || Number.isSafeInteger(receipt.exit_code)) &&
-			receipt.signal === "SIGABRT" &&
-			receipt.signal_number === 6;
-		if (!valid) throw new Error("managed_owner_replacement_evidence_untrusted");
-		return {
-			generation: baseline.generation,
-			sessionId,
-			runId,
-			incarnation,
-			predecessorToken,
-		};
-	} finally {
-		authority.close();
-	}
+	const binding = exactManagedOwnerJson(root, `child-${predecessorToken}.binding.json`) as Record<string, unknown>;
+	const receipt = exactManagedOwnerJson(root, `sigabrt-${predecessorToken}.receipt.json`) as Record<string, unknown>;
+	const command = binding.command;
+	const runId = binding.run_id;
+	const incarnation = binding.endpoint_incarnation;
+	const commandDigest =
+		Array.isArray(command) && command.length > 0 && command.every(value => typeof value === "string" && value)
+			? crypto.createHash("sha256").update(JSON.stringify(command)).digest("hex")
+			: "";
+	const valid =
+		binding.schema_version === 2 &&
+		binding.generation === baseline.generation &&
+		binding.session_id === sessionId &&
+		typeof runId === "string" &&
+		runId.length > 0 &&
+		typeof incarnation === "string" &&
+		incarnation.length > 0 &&
+		binding.child_token === predecessorToken &&
+		binding.command_sha256 === commandDigest &&
+		typeof binding.supervisor_pid === "number" &&
+		Number.isSafeInteger(binding.supervisor_pid) &&
+		binding.supervisor_pid > 0 &&
+		typeof binding.supervisor_start_time === "string" &&
+		typeof binding.created_at === "string" &&
+		receipt.schema_version === 2 &&
+		receipt.generation === binding.generation &&
+		receipt.session_id === binding.session_id &&
+		receipt.run_id === runId &&
+		receipt.endpoint_incarnation === incarnation &&
+		receipt.child_token === binding.child_token &&
+		receipt.command_sha256 === binding.command_sha256 &&
+		receipt.supervisor_pid === binding.supervisor_pid &&
+		receipt.supervisor_start_time === binding.supervisor_start_time &&
+		typeof receipt.child_pid === "number" &&
+		Number.isSafeInteger(receipt.child_pid) &&
+		receipt.child_pid > 0 &&
+		typeof receipt.child_start_time === "string" &&
+		typeof receipt.received_at === "string" &&
+		(receipt.exit_code === null || Number.isSafeInteger(receipt.exit_code)) &&
+		receipt.signal === "SIGABRT" &&
+		receipt.signal_number === 6;
+	if (!valid) throw new Error("managed_owner_replacement_evidence_untrusted");
+	return {
+		generation: baseline.generation,
+		sessionId,
+		runId,
+		incarnation,
+		predecessorToken,
+	};
 }
 
 export async function captureOwnerGenerationBaseline(
@@ -1704,7 +1707,10 @@ function readDescriptorBoundedSync(fd: number): Buffer {
 	return buffer.subarray(0, offset);
 }
 
-export function readNoFollowJsonSync(file: string): unknown | null {
+export function readNoFollowJsonSync(
+	file: string,
+	options: { requireSingleLine?: boolean; includeIdentity?: boolean } = {},
+): unknown | null | { value: unknown; identity: { dev: number; ino: number } } {
 	let before: fsSync.Stats;
 	try {
 		before = fsSync.lstatSync(file);
@@ -1741,7 +1747,13 @@ export function readNoFollowJsonSync(file: string): unknown | null {
 		)
 			throw new Error("baseline_generation_corrupt");
 		if (content.byteLength > TMUX_OWNER_ISOLATION_MAX_LINE_BYTES) throw new Error("baseline_generation_corrupt");
-		return JSON.parse(content.toString("utf8")) as unknown;
+		if (
+			options.requireSingleLine === true &&
+			(!content.toString("utf8").endsWith("\n") || content.indexOf(0x0a) !== content.byteLength - 1)
+		)
+			throw new Error("baseline_generation_corrupt");
+		const value = JSON.parse(content.toString("utf8")) as unknown;
+		return options.includeIdentity ? { value, identity: { dev: after.dev, ino: after.ino } } : value;
 	} catch {
 		throw new Error("baseline_generation_corrupt");
 	} finally {
@@ -1873,8 +1885,11 @@ export function __setIntentEvidenceReadHooksForTests(hooks: IntentEvidenceReadTe
 	intentEvidenceReadTestHooks = hooks;
 }
 
-async function readDescriptorBounded(handle: fs.FileHandle): Promise<Buffer> {
-	const buffer = Buffer.alloc(TMUX_OWNER_ISOLATION_MAX_LINE_BYTES + 1);
+async function readDescriptorBounded(
+	handle: fs.FileHandle,
+	maxBytes = TMUX_OWNER_ISOLATION_MAX_LINE_BYTES,
+): Promise<Buffer> {
+	const buffer = Buffer.alloc(maxBytes + 1);
 	let offset = 0;
 	while (offset < buffer.byteLength) {
 		const { bytesRead } = await handle.read(buffer, offset, buffer.byteLength - offset, offset);
@@ -1894,7 +1909,10 @@ async function intentMarkerExists(file: string): Promise<boolean> {
 	}
 }
 
-export async function readNoFollowJson(file: string): Promise<unknown | null> {
+export async function readNoFollowJson(
+	file: string,
+	maxBytes = TMUX_OWNER_ISOLATION_MAX_LINE_BYTES,
+): Promise<unknown | null> {
 	const platform = intentEvidenceReadTestHooks?.platform ?? process.platform;
 	const noFollow = platform === "win32" ? 0 : fsSync.constants.O_NOFOLLOW | fsSync.constants.O_NONBLOCK;
 	let pathBefore: fsSync.BigIntStats;
@@ -1905,7 +1923,7 @@ export async function readNoFollowJson(file: string): Promise<unknown | null> {
 		throw error;
 	}
 	if (!pathBefore.isFile()) throw new Error("not_regular_file");
-	if (pathBefore.size > BigInt(TMUX_OWNER_ISOLATION_MAX_LINE_BYTES)) throw new Error("lifecycle_record_too_large");
+	if (pathBefore.size > BigInt(maxBytes)) throw new Error("lifecycle_record_too_large");
 	await intentEvidenceReadTestHooks?.afterPathStat?.(file);
 	let handle: fs.FileHandle;
 	try {
@@ -1918,7 +1936,7 @@ export async function readNoFollowJson(file: string): Promise<unknown | null> {
 		const before = await handle.stat({ bigint: true });
 		if (!before.isFile() || before.dev !== pathBefore.dev || before.ino !== pathBefore.ino)
 			throw new Error("changed_file");
-		const content = await readDescriptorBounded(handle);
+		const content = await readDescriptorBounded(handle, maxBytes);
 		const after = await handle.stat({ bigint: true });
 		let pathAfter: fsSync.BigIntStats;
 		try {
@@ -1939,7 +1957,7 @@ export async function readNoFollowJson(file: string): Promise<unknown | null> {
 			before.ctimeNs !== after.ctimeNs
 		)
 			throw new Error("changed_file");
-		if (content.byteLength > TMUX_OWNER_ISOLATION_MAX_LINE_BYTES) throw new Error("lifecycle_record_too_large");
+		if (content.byteLength > maxBytes) throw new Error("lifecycle_record_too_large");
 		return JSON.parse(content.toString("utf8"));
 	} finally {
 		await handle.close();
@@ -2943,10 +2961,16 @@ function isPublishGenerationRequest(request: unknown): request is PublishGenerat
 		hasOnlyKeys(request, [
 			"schema_version",
 			"op",
-			"auth_token",
 			"session_id",
 			"owner_generation",
 			"state_dir",
+			"socket_key",
+			"owner_native_session_id",
+			"owner_pane_id",
+			"owner_pid",
+			"owner_start_time",
+			"owner_server_pid",
+			"owner_server_start_time",
 			"baseline",
 		]) &&
 		request.schema_version === 1 &&
@@ -2957,6 +2981,20 @@ function isPublishGenerationRequest(request: unknown): request is PublishGenerat
 		isSafePathComponent(request.owner_generation, "owner generation") &&
 		nonEmpty(request.state_dir) &&
 		path.isAbsolute(request.state_dir) &&
+		nonEmpty(request.socket_key) &&
+		(request.owner_native_session_id === undefined || nonEmpty(request.owner_native_session_id)) &&
+		(request.owner_pane_id === undefined || nonEmpty(request.owner_pane_id)) &&
+		(request.owner_native_session_id === undefined) === (request.owner_pane_id === undefined) &&
+		(request.owner_pid === undefined ||
+			(typeof request.owner_pid === "number" && Number.isSafeInteger(request.owner_pid) && request.owner_pid > 0)) &&
+		(request.owner_start_time === undefined || nonEmpty(request.owner_start_time)) &&
+		(request.owner_pid === undefined) === (request.owner_start_time === undefined) &&
+		(request.owner_server_pid === undefined ||
+			(typeof request.owner_server_pid === "number" &&
+				Number.isSafeInteger(request.owner_server_pid) &&
+				request.owner_server_pid > 0)) &&
+		(request.owner_server_start_time === undefined || nonEmpty(request.owner_server_start_time)) &&
+		(request.owner_server_pid === undefined) === (request.owner_server_start_time === undefined) &&
 		isOwnerGenerationBaseline(request.baseline)
 	);
 }
@@ -2967,11 +3005,20 @@ function isObserveTerminalRequest(request: unknown): request is ObserveTerminalR
 		hasOnlyKeys(request, [
 			"schema_version",
 			"op",
-			"auth_token",
 			"session_id",
 			"owner_generation",
 			"state_dir",
 			"socket_key",
+			"owner_native_session_id",
+			"owner_pane_id",
+			"owner_pid",
+			"owner_start_time",
+			"owner_server_pid",
+			"owner_server_start_time",
+			"monitor_native_session_id",
+			"monitor_pane_id",
+			"monitor_pid",
+			"monitor_start_time",
 			"observer",
 			"observed_at",
 			"signal",
@@ -2990,6 +3037,28 @@ function isObserveTerminalRequest(request: unknown): request is ObserveTerminalR
 		nonEmpty(request.state_dir) &&
 		path.isAbsolute(request.state_dir) &&
 		nonEmpty(request.socket_key) &&
+		(request.owner_native_session_id === undefined || nonEmpty(request.owner_native_session_id)) &&
+		(request.owner_pane_id === undefined || nonEmpty(request.owner_pane_id)) &&
+		(request.owner_native_session_id === undefined) === (request.owner_pane_id === undefined) &&
+		(request.owner_pid === undefined ||
+			(typeof request.owner_pid === "number" && Number.isSafeInteger(request.owner_pid) && request.owner_pid > 0)) &&
+		(request.owner_start_time === undefined || nonEmpty(request.owner_start_time)) &&
+		(request.owner_pid === undefined) === (request.owner_start_time === undefined) &&
+		(request.owner_server_pid === undefined ||
+			(typeof request.owner_server_pid === "number" &&
+				Number.isSafeInteger(request.owner_server_pid) &&
+				request.owner_server_pid > 0)) &&
+		(request.owner_server_start_time === undefined || nonEmpty(request.owner_server_start_time)) &&
+		(request.owner_server_pid === undefined) === (request.owner_server_start_time === undefined) &&
+		(request.monitor_native_session_id === undefined || nonEmpty(request.monitor_native_session_id)) &&
+		(request.monitor_pane_id === undefined || nonEmpty(request.monitor_pane_id)) &&
+		(request.monitor_native_session_id === undefined) === (request.monitor_pane_id === undefined) &&
+		(request.monitor_pid === undefined ||
+			(typeof request.monitor_pid === "number" &&
+				Number.isSafeInteger(request.monitor_pid) &&
+				request.monitor_pid > 0)) &&
+		(request.monitor_start_time === undefined || nonEmpty(request.monitor_start_time)) &&
+		(request.monitor_pid === undefined) === (request.monitor_start_time === undefined) &&
 		isTerminalObserver(request.observer) &&
 		isCanonicalUtcTimestamp(request.observed_at) &&
 		isTerminalSignal(request.signal) &&
@@ -3089,22 +3158,7 @@ export function isTrustedOwnerIsolationProtocolRequest(
 			return false;
 		return controlArgv.length > 0 && isTrustedTmuxOwnerIsolationArgv(request.tmux_argv);
 	}
-	if (!nonEmpty(request.auth_token) || !/^[a-f0-9]{64}$/.test(request.auth_token)) return false;
-	try {
-		const capability = readNoFollowJsonSync(
-			lifecyclePaths(request.state_dir, request.session_id, request.owner_generation).protocolTokenFile,
-		);
-		return (
-			isRecord(capability) &&
-			Object.keys(capability).length === 4 &&
-			capability.schema_version === 1 &&
-			capability.session_id === request.session_id &&
-			capability.generation === request.owner_generation &&
-			capability.token_sha256 === crypto.createHash("sha256").update(request.auth_token).digest("hex")
-		);
-	} catch {
-		return false;
-	}
+	return true;
 }
 function isTerminalSignal(value: unknown): value is TerminalSignal {
 	return (

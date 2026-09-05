@@ -1,6 +1,5 @@
 import { Database } from "bun:sqlite";
 import { describe, expect, it, spyOn } from "bun:test";
-import * as crypto from "node:crypto";
 import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
@@ -36,7 +35,10 @@ import {
 	tmuxOwnerIsolationBootstrapArgv,
 } from "@gajae-code/coding-agent/gjc-runtime/tmux-owner-isolation";
 import {
+	classifyOwnerSessionProbe,
+	isLifecycleAdapterRegistrationValid,
 	isTmuxOwnerIsolationCliArgv,
+	isTrustedLifecycleMutationCaller,
 	runTmuxOwnerIsolationCli,
 	tmuxServerProof,
 } from "@gajae-code/coding-agent/gjc-runtime/tmux-owner-isolation-cli";
@@ -133,6 +135,55 @@ function holdSqliteWriteLock(databaseFile: string): Database {
 }
 
 describe("tmux owner isolation", () => {
+	it("distinguishes an absent owner session from provider probe failure", () => {
+		expect(classifyOwnerSessionProbe({ exitCode: 0, stderr: "" })).toBe(true);
+		expect(classifyOwnerSessionProbe({ exitCode: 1, stderr: "can't find session: owner" })).toBe(false);
+		expect(classifyOwnerSessionProbe({ exitCode: 1, stderr: "psmux target syntax rejected" })).toBeNull();
+		expect(classifyOwnerSessionProbe({ exitCode: 2, stderr: "transport failed" })).toBeNull();
+	});
+	it("binds a lifecycle adapter registration to its exact PID incarnation", () => {
+		expect(isLifecycleAdapterRegistrationValid("42 100\n", 42, "100")).toBe(true);
+		expect(isLifecycleAdapterRegistrationValid("42 100\n", 42, "100", false)).toBe(false);
+		expect(isLifecycleAdapterRegistrationValid("42 100\n", 43, "100")).toBe(false);
+		expect(isLifecycleAdapterRegistrationValid("42 100\n", 42, "101")).toBe(false);
+		expect(isLifecycleAdapterRegistrationValid("42 100 extra\n", 42, "100")).toBe(false);
+	});
+
+	it("rejects a self-created FIFO inherited by a CLONE_PARENT adapter", async () => {
+		if (process.platform !== "linux" || !Bun.which("cc")) return;
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-owner-clone-parent-"));
+		try {
+			const output = path.join(root, "result.txt");
+			const source = path.join(root, "clone-parent.c");
+			await Bun.write(
+				source,
+				`#define _GNU_SOURCE
+#include <dirent.h>
+#include <fcntl.h>
+#include <limits.h>
+#include <sched.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
+#include <unistd.h>
+struct child_args { int fd; const char *result; };
+static int run(void *raw) { struct child_args *args = raw; char self[64], parent[64], candidate[PATH_MAX]; struct stat expected, observed; int owned = 0; snprintf(self, sizeof(self), "/proc/self/fd/%d", args->fd); if (stat(self, &expected) != 0) _exit(5); snprintf(parent, sizeof(parent), "/proc/%d/fd", getppid()); DIR *directory = opendir(parent); if (!directory) _exit(6); struct dirent *entry; while ((entry = readdir(directory))) { snprintf(candidate, sizeof(candidate), "%s/%s", parent, entry->d_name); if (stat(candidate, &observed) == 0 && observed.st_dev == expected.st_dev && observed.st_ino == expected.st_ino) { owned = 1; break; } } closedir(directory); int out = open(args->result, O_WRONLY | O_CREAT | O_TRUNC, 0600); if (out < 0) _exit(7); write(out, owned ? "true" : "false", owned ? 4 : 5); close(out); _exit(0); }
+int main(int argc, char **argv) { int capability[2]; if (argc != 2 || pipe(capability) != 0) return 2; char *stack = malloc(1 << 20); if (!stack) return 3; struct child_args args = { capability[0], argv[1] }; pid_t pid = clone(run, stack + (1 << 20), CLONE_PARENT | SIGCHLD, &args); if (pid < 0) return 4; close(capability[0]); write(capability[1], "1 1\\n", 4); sleep(2); close(capability[1]); return 0; }
+`,
+			);
+			const helper = path.join(root, "clone-parent");
+			expect(Bun.spawnSync(["cc", "-O2", "-o", helper, source]).exitCode).toBe(0);
+			const result = Bun.spawnSync([helper, output], { stdout: "ignore", stderr: "ignore" });
+			expect(result.exitCode).toBe(0);
+			for (let attempt = 0; attempt < 100 && !(await Bun.file(output).exists()); attempt += 1) await Bun.sleep(20);
+			expect(await Bun.file(output).text()).toBe("false");
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	}, 15_000);
+
 	it("recognizes only the exact owner-isolation argv", () => {
 		expect(isTmuxOwnerIsolationCliArgv([ownerIsolationFlag])).toBe(true);
 		for (const argv of [[], [ownerIsolationFlag, "extra"], ["extra", ownerIsolationFlag], ["--other"]]) {
@@ -383,6 +434,7 @@ describe("tmux owner isolation", () => {
 					session_id: sessionId,
 					owner_generation: generation,
 					state_dir: state,
+					socket_key: `socket-${sessionId}`,
 					baseline: { state: "absent" },
 				};
 				const result = await runOwnerIsolationEntry(command, `${JSON.stringify(request)}\n`);
@@ -431,23 +483,11 @@ describe("tmux owner isolation", () => {
 		20_000,
 	);
 
-	it("authenticates lifecycle mutations against the durable capability record", async () => {
+	it("parses lifecycle mutations without trusting a replaceable capability file", async () => {
 		const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-owner-capability-"));
 		const sessionId = "capability-session";
 		const generation = "capability-generation";
-		const token = "a".repeat(64);
-		const paths = lifecyclePaths(state, sessionId, generation);
 		try {
-			await fs.mkdir(paths.root, { recursive: true });
-			await Bun.write(
-				paths.protocolTokenFile,
-				JSON.stringify({
-					schema_version: 1,
-					session_id: sessionId,
-					generation,
-					token_sha256: crypto.createHash("sha256").update(token).digest("hex"),
-				}),
-			);
 			const request = {
 				schema_version: 1,
 				op: "observe_terminal",
@@ -461,13 +501,214 @@ describe("tmux owner isolation", () => {
 				exit_code: 0,
 				exit_kind: "cleanup",
 				reason: "test",
-				auth_token: token,
 			} as const;
 			expect(isTrustedOwnerIsolationProtocolRequest(request)).toBe(true);
-			expect(isTrustedOwnerIsolationProtocolRequest({ ...request, auth_token: `${"b".repeat(63)}b` })).toBe(false);
+			expect(parseOwnerIsolationRequest(JSON.stringify({ ...request, auth_token: "a".repeat(64) }))).toBeNull();
 		} finally {
 			await fs.rm(state, { recursive: true, force: true });
 		}
+	});
+
+	it("admits generation publication only from the exact owner pane process", async () => {
+		const request = {
+			schema_version: 1,
+			op: "publish_generation",
+			session_id: "session",
+			owner_generation: "generation",
+			state_dir: "/state",
+			socket_key: "socket",
+			owner_native_session_id: "$1",
+			owner_pane_id: "%1",
+			owner_pid: 41,
+			owner_start_time: "15",
+			owner_server_pid: 50,
+			owner_server_start_time: "20",
+			baseline: { state: "absent" },
+		} as const;
+		const owner = {
+			pid: 41,
+			serverPid: 50,
+			nativeSessionId: "$1",
+			paneId: "%1",
+			generation: "generation",
+			serverKey: "socket",
+			sessionId: "session",
+			stateFile: "/state/runtime-state.json",
+		};
+		const probe = {
+			callerPid: 42,
+			parentPid: 41,
+			readParentPid: async () => null,
+			readChildren: async () => [42],
+			readStartTime: async (pid: number) => (pid === 41 ? "15" : "20"),
+			authorityPipeOwnedByParent: async () => true,
+			readPane: () => owner,
+			ownerSessionExists: () => true,
+		};
+		expect(await isTrustedLifecycleMutationCaller(request, probe)).toBe(true);
+		expect(
+			await isTrustedLifecycleMutationCaller(request, { ...probe, authorityPipeOwnedByParent: async () => false }),
+		).toBe(false);
+		expect(await isTrustedLifecycleMutationCaller(request, { ...probe, parentPid: 43 })).toBe(false);
+		expect(await isTrustedLifecycleMutationCaller(request, { ...probe, readChildren: async () => [40, 42] })).toBe(
+			process.platform !== "linux",
+		);
+		expect(
+			await isTrustedLifecycleMutationCaller(request, {
+				...probe,
+				readPane: () => ({ ...owner, generation: "forged" }),
+			}),
+		).toBe(false);
+		expect(
+			await isTrustedLifecycleMutationCaller(request, {
+				...probe,
+				readPane: () => ({ ...owner, nativeSessionId: "$replacement", paneId: "%replacement" }),
+			}),
+		).toBe(false);
+		expect(
+			await isTrustedLifecycleMutationCaller(request, {
+				...probe,
+				parentPid: 99,
+				readPane: () => ({ ...owner, pid: 99 }),
+				readStartTime: async pid => (pid === 99 ? "replacement" : "20"),
+			}),
+		).toBe(false);
+	});
+
+	it("rejects a child while admitting the supervisor and detached monitor", async () => {
+		const request = {
+			schema_version: 1,
+			op: "observe_terminal",
+			session_id: "session",
+			owner_generation: "generation",
+			state_dir: "/state",
+			socket_key: "socket",
+			owner_native_session_id: "$1",
+			owner_pane_id: "%1",
+			owner_pid: 41,
+			owner_start_time: "15",
+			owner_server_pid: 50,
+			owner_server_start_time: "30",
+			observer: "raw_monitor",
+			observed_at: "2026-01-01T00:00:00.000Z",
+			signal: "EXIT",
+			exit_code: 0,
+			exit_kind: "cleanup",
+			reason: "test",
+		} as const;
+		const owner = {
+			pid: 41,
+			serverPid: 50,
+			nativeSessionId: "$1",
+			paneId: "%1",
+			generation: "generation",
+			serverKey: "socket",
+			sessionId: "session",
+			stateFile: "/state/runtime-state.json",
+		};
+		const base = {
+			callerPid: 42,
+			parentPid: 41,
+			readParentPid: async () => null,
+			readChildren: async () => [40, 42],
+			readStartTime: async (pid: number) =>
+				({ 40: "10", 41: "15", 42: "20", 50: "30", 60: "25" })[pid as 40 | 41 | 42 | 50 | 60] ?? null,
+			authorityPipeOwnedByParent: async () => true,
+			readPane: (_socket: string, target: string) => (target.includes("owner-monitor") ? null : owner),
+			ownerSessionExists: () => true,
+		};
+		expect(await isTrustedLifecycleMutationCaller(request, base)).toBe(true);
+		expect(
+			await isTrustedLifecycleMutationCaller(
+				{ ...request, reason: "owner_supervisor_signal" },
+				{ ...base, readChildren: async () => [42] },
+			),
+		).toBe(process.platform !== "linux");
+		expect(
+			await isTrustedLifecycleMutationCaller(request, {
+				...base,
+				callerPid: 40,
+				readChildren: async () => [40, 42],
+				readStartTime: async (pid: number) =>
+					({ 40: "10", 41: "15", 42: "20", 50: "30", 60: "25" })[pid as 40 | 41 | 42 | 50 | 60] ?? null,
+			}),
+		).toBe(process.platform !== "linux");
+		const monitor = { ...owner, pid: 60, nativeSessionId: "$2", paneId: "%2" };
+		const monitorRequest = {
+			...request,
+			monitor_native_session_id: "$2",
+			monitor_pane_id: "%2",
+			monitor_pid: 60,
+			monitor_start_time: "25",
+		};
+		let ownerExistenceTarget = "";
+		expect(
+			await isTrustedLifecycleMutationCaller(monitorRequest, {
+				...base,
+				callerPid: 62,
+				parentPid: 61,
+				readParentPid: async pid => (({ 61: 60, 60: 1 }) as Record<number, number>)[pid] ?? null,
+				readPane: (_socket, target) => (target === "%2" ? monitor : null),
+				ownerSessionExists: (_socket, target) => {
+					ownerExistenceTarget = target;
+					return false;
+				},
+			}),
+		).toBe(true);
+		expect(ownerExistenceTarget).toBe("$1");
+		expect(
+			await isTrustedLifecycleMutationCaller(monitorRequest, {
+				...base,
+				callerPid: 62,
+				parentPid: 61,
+				readParentPid: async pid => (({ 61: 60, 60: 1 }) as Record<number, number>)[pid] ?? null,
+				readPane: (_socket, target) => (target === "%2" ? monitor : null),
+				ownerSessionExists: () => null,
+			}),
+		).toBe(false);
+		expect(
+			await isTrustedLifecycleMutationCaller(monitorRequest, {
+				...base,
+				callerPid: 62,
+				parentPid: 61,
+				readParentPid: async pid => (({ 61: 60, 60: 1 }) as Record<number, number>)[pid] ?? null,
+				readPane: (_socket, target) => (target === "%2" ? { ...monitor, generation: "forged" } : null),
+				ownerSessionExists: () => false,
+			}),
+		).toBe(false);
+		expect(
+			await isTrustedLifecycleMutationCaller(monitorRequest, {
+				...base,
+				callerPid: 62,
+				parentPid: 61,
+				readParentPid: async pid => (({ 61: 60, 60: 1 }) as Record<number, number>)[pid] ?? null,
+				readPane: (_socket, target) =>
+					target === "%2" ? { ...monitor, nativeSessionId: "$replacement", paneId: "%replacement" } : null,
+				ownerSessionExists: () => false,
+			}),
+		).toBe(false);
+		expect(
+			await isTrustedLifecycleMutationCaller(monitorRequest, {
+				...base,
+				callerPid: 62,
+				parentPid: 61,
+				readParentPid: async pid => (({ 61: 60, 60: 1 }) as Record<number, number>)[pid] ?? null,
+				readPane: (_socket, target) => (target === "%2" ? { ...monitor, serverPid: 51 } : null),
+				readStartTime: async pid => (pid === 51 ? "replacement" : pid === 60 ? "25" : "30"),
+				ownerSessionExists: () => false,
+			}),
+		).toBe(false);
+		expect(
+			await isTrustedLifecycleMutationCaller(monitorRequest, {
+				...base,
+				callerPid: 100,
+				parentPid: 99,
+				readParentPid: async pid => (({ 99: 1 }) as Record<number, number>)[pid] ?? null,
+				readPane: (_socket, target) => (target === "%2" ? { ...monitor, pid: 99 } : null),
+				readStartTime: async pid => (pid === 99 ? "replacement" : "30"),
+				ownerSessionExists: () => false,
+			}),
+		).toBe(false);
 	});
 
 	it("rejects a multi-line owner-isolation request without entering an interactive path", async () => {

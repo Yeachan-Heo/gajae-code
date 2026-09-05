@@ -403,5 +403,7 @@ describe("scope exclusion warnings are bounded", () => {
 			descriptor: selection.descriptor,
 		});
 		expect(filtered.sessions).toEqual([]);
+		expect(filtered.warnings).toEqual(["Session unknown-row workspace is unavailable; excluded by scope cwd."]);
+		expect(filtered.warningEntries).toEqual(["Session unknown-row workspace is unavailable; excluded by scope cwd."]);
 	});
 });

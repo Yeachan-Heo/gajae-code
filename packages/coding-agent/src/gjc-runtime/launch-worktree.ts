@@ -342,7 +342,10 @@ function launchGuardLines(code: string, ...lines: string[]): LaunchWorktreeGuard
 }
 
 function safeLaunchDiagnostic(message: string): string {
-	const redacted = redactCrashSecrets(message);
+	const redacted = redactCrashSecrets(message).replace(
+		/[\u0000-\u0008\u000B-\u001F\u007F]/gu,
+		character => `\\u${character.codePointAt(0)!.toString(16).padStart(4, "0")}`,
+	);
 	if (Buffer.byteLength(redacted, "utf8") <= LAUNCH_GUARD_MAX_BYTES) return redacted;
 	const budget = LAUNCH_GUARD_MAX_BYTES - Buffer.byteLength(LAUNCH_GUARD_TRUNCATION_MARKER, "utf8");
 	const bytes = Buffer.from(redacted, "utf8");
