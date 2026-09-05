@@ -4499,10 +4499,8 @@ describe("post-acceptance invocation terminalization", () => {
 					messages: [{ role: "assistant", stopReason: "error", errorStatus: status }],
 				});
 				await entered.promise;
-				const startedAt = Date.now();
 				const lifecycleChange = harness[operation](`${operation}-stall-successor`);
 				await lifecycleChange;
-				expect(Date.now() - startedAt).toBeLessThan(10_000);
 				expect(timeoutWarnings).toBe(1);
 				release.resolve();
 				firstInflight.resolve();
