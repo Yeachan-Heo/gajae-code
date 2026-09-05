@@ -6361,6 +6361,18 @@ export class AgentSession {
 	): Promise<void> => {
 		const attemptScope = (event as AgentEvent & { scope?: AttemptScope }).scope;
 
+		// These lifecycle boundaries can be delivered without awaiting this listener.
+		// Revoke streaming-edit cache generations before any admission, spill, or
+		// extension work so a completed read cannot publish across the boundary.
+		if (event.type === "turn_start") this.#resetStreamingEditState();
+		if (event.type === "message_end" && event.message.role === "toolResult") {
+			const details = event.message.details;
+			if (event.message.toolName === "edit" && details && typeof details === "object" && "path" in details) {
+				const editPath = (details as { path?: unknown }).path;
+				if (typeof editPath === "string") this.#invalidateFileCacheForPath(editPath);
+			}
+		}
+
 		if (
 			event.type === "tool_execution_start" ||
 			event.type === "tool_execution_update" ||
@@ -6715,7 +6727,6 @@ export class AgentSession {
 		}
 
 		if (event.type === "turn_start") {
-			this.#resetStreamingEditState();
 			// TTSR: Reset buffer on turn start
 			this.#ttsrManager?.resetBuffer();
 		}
@@ -6956,10 +6967,6 @@ export class AgentSession {
 					isError?: boolean;
 					content?: Array<TextContent | ImageContent>;
 				};
-				// Invalidate streaming edit cache when edit tool completes to prevent stale data
-				if (toolName === "edit" && details?.path) {
-					this.#invalidateFileCacheForPath(details.path);
-				}
 				if (toolName === "todo_write" && !isError && Array.isArray(details?.phases)) {
 					this.setTodoPhases(details.phases);
 				}
