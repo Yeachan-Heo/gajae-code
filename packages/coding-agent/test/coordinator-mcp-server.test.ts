@@ -168,7 +168,7 @@ type SdkControlServerOptions = {
 	afterDelegateAdmission?: (sessionId: string) => void | Promise<void>;
 	beforeDelegateResponseCommit?: () => void | Promise<void>;
 	afterDelegateResponseCommit?: () => void | Promise<void>;
-	beforeDelegatePinRecovery?: () => void | Promise<void>;
+	readCoordinatorSessionEntries?: (directory: string) => Promise<string[]>;
 	/** Every raw session frame the server sent, in order (activation frames included). */
 	sessionFrames?: Array<Record<string, unknown>>;
 	sessionFrameResult?: (frame: Record<string, unknown>) => unknown;
@@ -418,7 +418,7 @@ async function createSdkControlServer(
 			afterDelegateAdmission: serverOptions.afterDelegateAdmission,
 			beforeDelegateResponseCommit: serverOptions.beforeDelegateResponseCommit,
 			afterDelegateResponseCommit: serverOptions.afterDelegateResponseCommit,
-			beforeDelegatePinRecovery: serverOptions.beforeDelegatePinRecovery,
+			readCoordinatorSessionEntries: serverOptions.readCoordinatorSessionEntries,
 			connectBroker: async () =>
 				({
 					global: async (
@@ -5491,8 +5491,13 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 			let failRecovery = false;
 			let transactionSource = "";
 			const f = await fixture(true, {
-				beforeDelegatePinRecovery: () => {
-					if (failRecovery) throw new Error("injected pin recovery failure");
+				readCoordinatorSessionEntries: async directory => {
+					if (failRecovery) {
+						const error = new Error("injected session enumeration failure") as NodeJS.ErrnoException;
+						error.code = "EACCES";
+						throw error;
+					}
+					return await fs.readdir(directory);
 				},
 				afterDelegateResponseCommit: async () => {
 					failRecovery = true;

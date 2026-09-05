@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it } from "bun:test";
+import { spawn as nodeSpawn, type SpawnOptions } from "node:child_process";
 import { EventEmitter } from "node:events";
 import {
 	type EngineRawOutput,
@@ -214,6 +215,9 @@ describe("tryInsaneFetch concurrency cap", () => {
 class FakeChild extends EventEmitter {
 	stdout = new EventEmitter();
 	stderr = new EventEmitter();
+	pid?: number;
+	exitCode: number | null = null;
+	signalCode: NodeJS.Signals | null = null;
 	killed: string[] = [];
 	kill(signal?: string): boolean {
 		this.killed.push(signal ?? "SIGTERM");
@@ -248,6 +252,54 @@ describe("runEngineSubprocess hardening", () => {
 		child.emit("close", null);
 		const out = await promise;
 		expect(out.aborted).toBe(true);
+	});
+
+	it("coalesces overlapping abort and timeout teardown", async () => {
+		const child = new FakeChild();
+		const fakeSpawn = (() => child) as unknown as typeof import("node:child_process").spawn;
+		const controller = new AbortController();
+		const promise = runEngineSubprocess(
+			{ url: "https://example.com", timeoutMs: 1, signal: controller.signal },
+			{ spawnImpl: fakeSpawn },
+		);
+		controller.abort();
+		await Bun.sleep(20);
+		expect(child.killed).toEqual(["SIGTERM"]);
+		child.emit("close", null);
+		const out = await promise;
+		expect(out.aborted).toBe(true);
+		expect(out.timedOut).toBe(false);
+	});
+
+	it.skipIf(process.platform !== "linux")("reaps TERM-ignoring descendants after the group leader exits", async () => {
+		const childScript = `
+			const { spawn } = require("node:child_process");
+			const descendant = spawn(process.execPath, ["-e", "process.on('SIGTERM', () => {}); setTimeout(() => process.exit(0), 6000); setInterval(() => {}, 1000);"], {
+				stdio: "ignore",
+			});
+			console.log(descendant.pid);
+			setInterval(() => {}, 1000);
+		`;
+		const sacrificialSpawn = ((_command: string, _args: readonly string[], options: SpawnOptions) => {
+			return nodeSpawn(process.execPath, ["-e", childScript], options);
+		}) as unknown as typeof import("node:child_process").spawn;
+		const running = async (pid: number): Promise<boolean> => {
+			try {
+				const stat = await Bun.file(`/proc/${pid}/stat`).text();
+				const state = stat.slice(stat.lastIndexOf(")") + 2).split(" ")[0];
+				return state !== "Z" && state !== "X";
+			} catch {
+				return false;
+			}
+		};
+		const out = await runEngineSubprocess(
+			{ url: "https://example.com", timeoutMs: 200 },
+			{ spawnImpl: sacrificialSpawn },
+		);
+		expect(out.timedOut).toBe(true);
+		const descendantPid = Number.parseInt(out.stdout.trim(), 10);
+		expect(descendantPid).toBeGreaterThan(0);
+		expect(await running(descendantPid)).toBe(false);
 	});
 
 	it("parses stdout from a completed child", async () => {

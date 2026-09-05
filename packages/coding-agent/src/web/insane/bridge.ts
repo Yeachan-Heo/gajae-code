@@ -15,6 +15,8 @@ import { type ChildProcess, spawn as nodeSpawn } from "node:child_process";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { $which } from "@gajae-code/utils";
+import { probeLinuxProcPidSync } from "../../gjc-runtime/linux-proc";
+import { groupLeaderIdentityMatches } from "../../runtime/process-lifecycle";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 /** packages/coding-agent/vendor/insane-search */
@@ -119,22 +121,85 @@ function appendCapped(buffer: string, chunk: string, cap: number): string {
 	return buffer + (chunk.length > remaining ? chunk.slice(0, remaining) : chunk);
 }
 
-/** Kill a child and its group, escalating to SIGKILL after a grace period. */
-function killChild(child: ChildProcess): void {
+/**
+ * Signal the child's whole process group on POSIX (the engine is spawned as a
+ * group leader, so its node/playwright grandchildren — including headless
+ * Chromium — are covered), with an exact-child fallback on Windows.
+ */
+type TeardownStatus = "terminated" | "still_running" | "identity_unverified";
+
+function processGroupAlive(pgid: number): boolean {
 	try {
-		child.kill("SIGTERM");
-	} catch {
-		// already gone
+		process.kill(-pgid, 0);
+		return true;
+	} catch (error) {
+		return (error as NodeJS.ErrnoException).code === "EPERM";
 	}
-	const timer = setTimeout(() => {
+}
+
+async function pollUntil(predicate: () => boolean, timeoutMs: number): Promise<boolean> {
+	if (predicate()) return true;
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() < deadline) {
+		await Bun.sleep(Math.min(20, deadline - Date.now()));
+		if (predicate()) return true;
+	}
+	return predicate();
+}
+
+/** Idempotently terminate the exact child/process group and await bounded reaping. */
+function createChildTeardown(child: ChildProcess, childExited: Promise<void>): () => Promise<TeardownStatus> {
+	const pgid = process.platform !== "win32" ? child.pid : undefined;
+	const leader = pgid && process.platform === "linux" ? probeLinuxProcPidSync(pgid) : undefined;
+	const leaderStartTime = leader?.kind === "live" ? leader.startTime : undefined;
+	let teardownPromise: Promise<TeardownStatus> | undefined;
+
+	const identityMatches = (): boolean => {
+		if (!pgid || process.platform !== "linux") return true;
+		return groupLeaderIdentityMatches(leaderStartTime, probeLinuxProcPidSync(pgid));
+	};
+	const signalGroup = (signal: "SIGTERM" | "SIGKILL"): boolean => {
+		if (!pgid || !identityMatches()) return false;
 		try {
-			child.kill("SIGKILL");
+			process.kill(-pgid, signal);
+			return true;
 		} catch {
-			// already gone
+			return !processGroupAlive(pgid);
 		}
-	}, KILL_GRACE_MS);
-	timer.unref?.();
-	child.once("exit", () => clearTimeout(timer));
+	};
+	const signalChild = (signal: "SIGTERM" | "SIGKILL"): void => {
+		try {
+			child.kill(signal);
+		} catch {
+			// Exact child is already gone.
+		}
+	};
+
+	return () => {
+		if (teardownPromise) return teardownPromise;
+		teardownPromise = (async (): Promise<TeardownStatus> => {
+			if (pgid) {
+				if (!processGroupAlive(pgid)) return "terminated";
+				if (!identityMatches()) return "identity_unverified";
+				signalGroup("SIGTERM");
+				if (await pollUntil(() => !processGroupAlive(pgid), KILL_GRACE_MS)) return "terminated";
+				if (!identityMatches()) return "identity_unverified";
+				signalGroup("SIGKILL");
+				return (await pollUntil(() => !processGroupAlive(pgid), KILL_GRACE_MS)) ? "terminated" : "still_running";
+			}
+
+			if (child.exitCode !== null || child.signalCode !== null) return "terminated";
+			signalChild("SIGTERM");
+			if ((await Promise.race([childExited.then(() => true), Bun.sleep(KILL_GRACE_MS).then(() => false)])) === true)
+				return "terminated";
+			signalChild("SIGKILL");
+			return (await Promise.race([childExited.then(() => true), Bun.sleep(KILL_GRACE_MS).then(() => false)])) ===
+				true
+				? "terminated"
+				: "still_running";
+		})();
+		return teardownPromise;
+	};
 }
 
 /** Real engine runner: `python3 -m engine "<url>" --json`. */
@@ -149,31 +214,45 @@ export function runEngineSubprocess(
 		let settled = false;
 		let timedOut = false;
 		let aborted = false;
+		let closeObserved = false;
+		let closeCode: number | null = null;
+		let teardownDone = false;
+		let teardownPromise: Promise<TeardownStatus> | undefined;
+		const { promise: childExited, resolve: resolveChildExited } = Promise.withResolvers<void>();
 
 		const child = spawnImpl("python3", ["-m", "engine", inv.url, "--json"], {
 			cwd: INSANE_VENDOR_DIR,
 			env: { ...process.env, PYTHONPATH: INSANE_VENDOR_DIR },
 			stdio: ["ignore", "pipe", "pipe"],
+			// Own process group on POSIX so killChild can signal the engine's
+			// whole tree (python3 -> node -> headless Chromium) in one shot.
+			detached: process.platform !== "win32",
 		});
+		const teardown = createChildTeardown(child, childExited);
 
-		const finish = (code: number | null): void => {
+		const finish = (): void => {
 			if (settled) return;
+			if (teardownPromise ? !teardownDone : !closeObserved) return;
 			settled = true;
 			clearTimeout(timer);
 			inv.signal?.removeEventListener("abort", onAbort);
-			resolve({ code, stdout, stderr, timedOut, aborted });
+			resolve({ code: closeObserved ? closeCode : null, stdout, stderr, timedOut, aborted });
+		};
+		const requestStop = (reason: "timeout" | "abort"): void => {
+			if (teardownPromise) return;
+			if (reason === "timeout") timedOut = true;
+			else aborted = true;
+			teardownPromise = teardown();
+			void teardownPromise.finally(() => {
+				teardownDone = true;
+				finish();
+			});
 		};
 
-		const timer = setTimeout(() => {
-			timedOut = true;
-			killChild(child);
-		}, inv.timeoutMs);
+		const timer = setTimeout(() => requestStop("timeout"), inv.timeoutMs);
 		timer.unref?.();
 
-		const onAbort = (): void => {
-			aborted = true;
-			killChild(child);
-		};
+		const onAbort = (): void => requestStop("abort");
 		if (inv.signal) {
 			if (inv.signal.aborted) onAbort();
 			else inv.signal.addEventListener("abort", onAbort, { once: true });
@@ -185,8 +264,19 @@ export function runEngineSubprocess(
 		child.stderr?.on("data", (chunk: Buffer) => {
 			stderr = appendCapped(stderr, chunk.toString("utf8"), MAX_STDERR_BYTES);
 		});
-		child.on("error", () => finish(null));
-		child.on("close", code => finish(code));
+		child.once("exit", () => resolveChildExited());
+		child.on("error", () => {
+			resolveChildExited();
+			closeObserved = true;
+			closeCode = null;
+			finish();
+		});
+		child.on("close", code => {
+			resolveChildExited();
+			closeObserved = true;
+			closeCode = code;
+			finish();
+		});
 	});
 }
 
