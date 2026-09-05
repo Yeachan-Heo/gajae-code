@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.16.4] - 2026-09-05
+
 ### Added
 
 - Bundled `openai-codex/gpt-6-astra` from the authenticated Codex catalog so eligible ChatGPT accounts can select Astra before a live discovery refresh. The reviewed snapshot records Codex's 272K prompt budget, 128K output cap, text-and-image input, websocket preference, low-through-max reasoning efforts, freeform `apply_patch`, and published tiered OpenAI pricing.

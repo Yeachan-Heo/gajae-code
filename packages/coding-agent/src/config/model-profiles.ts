@@ -100,6 +100,27 @@ export const BUILTIN_MODEL_PROFILES: readonly ModelProfileDefinition[] = [
 		critic: "openai-codex/gpt-5.6-luna:max",
 		architect: "openai-codex/gpt-5.6-luna:max",
 	}),
+	profile("astra-lite", ["openai-codex"], {
+		default: "openai-codex/gpt-6-astra:medium",
+		executor: "openai-codex/gpt-5.6-luna:xhigh",
+		planner: "openai-codex/gpt-6-astra:xhigh",
+		critic: "openai-codex/gpt-5.6-sol:high",
+		architect: "openai-codex/gpt-5.6-terra:xhigh",
+	}),
+	profile("astra-default", ["openai-codex"], {
+		default: "openai-codex/gpt-6-astra:medium",
+		executor: "openai-codex/gpt-5.6-luna:max",
+		planner: "openai-codex/gpt-6-astra:xhigh",
+		critic: "openai-codex/gpt-5.6-sol:xhigh",
+		architect: "openai-codex/gpt-5.6-terra:xhigh",
+	}),
+	profile("astra-heavy", ["openai-codex"], {
+		default: "openai-codex/gpt-6-astra:medium",
+		executor: "openai-codex/gpt-5.6-sol:max",
+		planner: "openai-codex/gpt-5.6-sol:max",
+		critic: "openai-codex/gpt-6-astra:max",
+		architect: "openai-codex/gpt-6-astra:max",
+	}),
 	profile("macos-omlx-fast", ["omlx"], {
 		default: "omlx/Qwen3.6-35B-A3B-4bit:low",
 		executor: "omlx/Qwen3.6-35B-A3B-4bit:low",
@@ -488,6 +509,20 @@ export const BUILTIN_MODEL_PROFILES: readonly ModelProfileDefinition[] = [
 		critic: "anthropic/claude-opus-5:high",
 		architect: "openai-codex/gpt-5.6-sol:xhigh",
 	}),
+	profile("astra-fable", ["openai-codex", "anthropic"], {
+		default: "openai-codex/gpt-6-astra:medium",
+		executor: "openai-codex/gpt-5.6-luna:max",
+		planner: "openai-codex/gpt-6-astra:xhigh",
+		critic: "anthropic/claude-fable-5-1:xhigh",
+		architect: "anthropic/claude-fable-5-1:xhigh",
+	}),
+	profile("astra-fable-opus", ["openai-codex", "anthropic"], {
+		default: "openai-codex/gpt-6-astra:medium",
+		executor: "openai-codex/gpt-5.6-luna:max",
+		planner: "anthropic/claude-opus-5:medium",
+		critic: "anthropic/claude-fable-5-1:xhigh",
+		architect: "anthropic/claude-fable-5-1:xhigh",
+	}),
 ];
 
 /**
@@ -521,6 +556,9 @@ const PROFILE_PRESENTATION: Record<string, ModelProfilePresentation> = {
 	"codex-medium": { displayName: "Codex Medium", providerGroup: "CODEX" },
 	"codex-pro": { displayName: "Codex Pro", providerGroup: "CODEX" },
 	lunamaxxing: { displayName: "LunaMaxxing", providerGroup: "CODEX" },
+	"astra-lite": { displayName: "ASTRA-Lite", providerGroup: "CODEX" },
+	"astra-default": { displayName: "ASTRA-Default", providerGroup: "CODEX" },
+	"astra-heavy": { displayName: "ASTRA-Heavy", providerGroup: "CODEX" },
 	opencodego: { displayName: "OpenCodeGo", providerGroup: "OPENCODEGO" },
 	"commandcode-goat": { displayName: "Command Code GOAT", providerGroup: "COMMAND CODE GOAT" },
 	"open-weights-glm": { displayName: "GLM", providerGroup: "OPEN WEIGHT MODELS (PROVIDER AGNOSTIC)" },
@@ -594,6 +632,8 @@ const PROFILE_PRESENTATION: Record<string, ModelProfilePresentation> = {
 	"opus-codex": { displayName: "Opus + Codex", providerGroup: "COMBOS" },
 	"codex-opencodego": { displayName: "Codex + OpenCodeGo", providerGroup: "COMBOS" },
 	"fable-opus-codex": { displayName: "Fable + Opus + Codex", providerGroup: "COMBOS" },
+	"astra-fable": { displayName: "ASTRA + Fable (5.1)", providerGroup: "COMBOS" },
+	"astra-fable-opus": { displayName: "ASTRA + Fable (5.1) + Opus", providerGroup: "COMBOS" },
 	"macos-omlx-fast": { displayName: "4-bit Fast (MoE measured 93.5 tok/s)", providerGroup: "macOS Local (oMLX)" },
 	"macos-omlx-balanced": {
 		displayName: "8-bit Balanced (MoE measured 71.1 tok/s)",

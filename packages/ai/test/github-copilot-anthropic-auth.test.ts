@@ -31,15 +31,12 @@ const testContext: Context = {
 	messages: [{ role: "user", content: "hello", timestamp: Date.now() }],
 };
 
-function getRequestHeader(
-	input: string | URL | Request,
-	init: RequestInit | undefined,
-	headerName: string,
-): string | null {
-	if (input instanceof Request) {
-		return input.headers.get(headerName);
-	}
-	return new Headers(init?.headers).get(headerName);
+function getRequestHeaders(input: string | URL | Request, init: RequestInit | undefined): Headers {
+	const headers = new Headers(input instanceof Request ? input.headers : undefined);
+	new Headers(init?.headers).forEach((value, key) => {
+		headers.set(key, value);
+	});
+	return headers;
 }
 
 describe("Anthropic Copilot auth config", () => {
@@ -58,7 +55,7 @@ describe("Anthropic Copilot auth config", () => {
 		});
 
 		expect(options.apiKey).toBeNull();
-		expect(options.defaultHeaders.Authorization).toBe(`Bearer ${token}`);
+		expect(new Headers(options.defaultHeaders).get("authorization")).toBe(`Bearer ${token}`);
 	});
 
 	it("unwraps structured Copilot credentials before setting Authorization", () => {
@@ -72,7 +69,7 @@ describe("Anthropic Copilot auth config", () => {
 		});
 
 		expect(options.apiKey).toBeNull();
-		expect(options.defaultHeaders.Authorization).toBe("Bearer ghu_test_token_12345");
+		expect(new Headers(options.defaultHeaders).get("authorization")).toBe("Bearer ghu_test_token_12345");
 	});
 
 	it("uses model baseUrl directly (no proxy-ep extraction)", () => {
@@ -111,7 +108,7 @@ describe("Anthropic Copilot auth config", () => {
 			dynamicHeaders: {},
 		});
 
-		expect(options.defaultHeaders["User-Agent"]).toContain("opencode");
+		expect(new Headers(options.defaultHeaders).get("user-agent")).toContain("opencode");
 	});
 
 	it("includes interleaved-thinking beta header when enabled", () => {
@@ -124,8 +121,8 @@ describe("Anthropic Copilot auth config", () => {
 			dynamicHeaders: {},
 		});
 
-		const beta = options.defaultHeaders["anthropic-beta"];
-		expect(beta).toBeDefined();
+		const beta = new Headers(options.defaultHeaders).get("anthropic-beta");
+		expect(beta).not.toBeNull();
 		expect(beta).toContain("interleaved-thinking-2025-05-14");
 	});
 
@@ -139,10 +136,9 @@ describe("Anthropic Copilot auth config", () => {
 			dynamicHeaders: {},
 		});
 
-		const beta = options.defaultHeaders["anthropic-beta"];
-		if (beta) {
-			expect(beta).not.toContain("fine-grained-tool-streaming");
-		}
+		const beta = new Headers(options.defaultHeaders).get("anthropic-beta");
+		expect(beta).not.toBeNull();
+		expect(beta).not.toContain("fine-grained-tool-streaming");
 	});
 
 	it("does not set isOAuthToken for Copilot models", () => {
@@ -185,10 +181,10 @@ describe("Anthropic Copilot auth config", () => {
 		expect(url).toBe("http://127.0.0.1:8317/v1/messages?beta=true");
 	});
 
-	it("forwards initiatorOverride to Copilot message requests", async () => {
-		const requestedInitiators: Array<string | null> = [];
+	it("forwards auth, static, beta, and initiator headers to Copilot message requests", async () => {
+		const requests: Headers[] = [];
 		global.fetch = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
-			requestedInitiators.push(getRequestHeader(input, init, "X-Initiator"));
+			requests.push(getRequestHeaders(input, init));
 			return new Response(JSON.stringify({ error: { type: "authentication_error", message: "Unauthorized" } }), {
 				status: 401,
 				headers: { "Content-Type": "application/json" },
@@ -198,10 +194,16 @@ describe("Anthropic Copilot auth config", () => {
 		const model = makeCopilotClaudeModel();
 		const result = await streamAnthropic(model, testContext, {
 			apiKey: "ghu_test_copilot_token",
+			betas: ["interleaved-thinking-2025-05-14"],
 			initiatorOverride: "agent",
 		}).result();
 
+		const headers = requests[0];
 		expect(result.stopReason).toBe("error");
-		expect(requestedInitiators[0]).toBe("agent");
+		expect(headers?.get("authorization")).toBe("Bearer ghu_test_copilot_token");
+		expect(headers?.get("user-agent")).toContain("opencode");
+		expect(headers?.get("anthropic-beta")).toContain("interleaved-thinking-2025-05-14");
+		expect(headers?.get("x-initiator")).toBe("agent");
+		expect(headers?.has("x-api-key")).toBe(false);
 	});
 });

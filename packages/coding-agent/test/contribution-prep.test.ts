@@ -221,6 +221,33 @@ describe("contribution prep", () => {
 		expect(redacted).toContain("?X-Amz-Security-Token=[REDACTED_SECRET]&X-Amz-Expires=900");
 	});
 
+	it("redacts quoted and mixed-quote X-Amz-Security-Token logs without changing near-misses", () => {
+		const positives = [
+			`"X-Amz-Security-Token"="${SYNTHETIC_AWS_SESSION_TOKEN}"`,
+			`'X-Amz-Security-Token'='${SYNTHETIC_AWS_SESSION_TOKEN}'`,
+			`"X-Amz-Security-Token": '${SYNTHETIC_AWS_SESSION_TOKEN}'`,
+			`'X-Amz-Security-Token': "${SYNTHETIC_AWS_SESSION_TOKEN}"`,
+			`header 'X-Amz-Security-Token: ${SYNTHETIC_AWS_SESSION_TOKEN}'`,
+		];
+		const nearMisses = [
+			`"X-Amz-Security-Token-Id"="${SYNTHETIC_AWS_SESSION_TOKEN}"`,
+			`"X-Amz-Security-Tokens"="${SYNTHETIC_AWS_SESSION_TOKEN}"`,
+			`prefixX-Amz-Security-Token=${SYNTHETIC_AWS_SESSION_TOKEN}`,
+			'"X-Amz-Security-Token"="short"',
+		];
+
+		expect(redactContributionPrepText([...positives, ...nearMisses].join("\n"), process.cwd())).toBe(
+			[
+				'"X-Amz-Security-Token"="[REDACTED_SECRET]"',
+				"'X-Amz-Security-Token'='[REDACTED_SECRET]'",
+				`"X-Amz-Security-Token": '[REDACTED_SECRET]'`,
+				`'X-Amz-Security-Token': "[REDACTED_SECRET]"`,
+				"header 'X-Amz-Security-Token: [REDACTED_SECRET]'",
+				...nearMisses,
+			].join("\n"),
+		);
+	});
+
 	it("redacts canonical AWS XML fields without changing the document structure", () => {
 		const text = `<Credentials><AccessKeyId>${SYNTHETIC_AWS_TEMPORARY_KEY_ID}</AccessKeyId><SecretAccessKey>${SYNTHETIC_AWS_SECRET_ACCESS_KEY}</SecretAccessKey><sts:SessionToken>${SYNTHETIC_AWS_SESSION_TOKEN}</sts:SessionToken></Credentials>`;
 
@@ -336,6 +363,80 @@ describe("contribution prep", () => {
 		expect(redacted).not.toContain(githubToken);
 		expect(redacted).not.toContain(slackToken);
 		for (const benignAssignment of benignAssignments) expect(redacted).toContain(benignAssignment);
+	});
+
+	it("redacts a complete git diff before applying the presentation cutoff", async () => {
+		const tempDir = TempDir.createSync("@gjc-contribution-prep-cutoff-");
+		try {
+			const trackedPath = path.join(tempDir.path(), "tracked.txt");
+			await Bun.write(trackedPath, "baseline\n");
+			await $`git init`.cwd(tempDir.path()).quiet();
+			await $`git add tracked.txt`.cwd(tempDir.path()).quiet();
+			await $`git -c user.email=test@example.com -c user.name=Test commit -m initial`.cwd(tempDir.path()).quiet();
+
+			const cutoffSecret = `SYNTHETIC_CUTOFF_SESSION_TOKEN_${"6".repeat(4096)}`;
+			await Bun.write(
+				trackedPath,
+				`${"x".repeat(59_000)}<SessionToken>${cutoffSecret}</SessionToken>${"y".repeat(5_000)}\n`,
+			);
+			const result = await prepareContributionPrep(
+				{ sessionId: "source-session", cwd: tempDir.path(), messages: [] },
+				{
+					artifactRoot: path.join(tempDir.path(), "artifacts"),
+					now: new Date("2026-05-31T00:00:00.000Z"),
+				},
+			);
+			const manifest = JSON.parse(await Bun.file(result.manifestPath).text()) as {
+				artifacts: Array<{ path: string }>;
+				redactions: string[];
+			};
+			const diffPath = manifest.artifacts.find(artifact => artifact.path === "git-diff.patch")?.path;
+			expect(diffPath).toBeTruthy();
+			const gitDiff = await Bun.file(path.join(result.artifactDir, diffPath ?? "")).text();
+
+			expect(gitDiff).toContain("<SessionToken>[REDACTED_SECRET]</SessionToken>");
+			expect(gitDiff).toContain("[truncated ");
+			expect(gitDiff).not.toContain(cutoffSecret.slice(0, 256));
+			expect(manifest.redactions).toContain("aws_keys");
+		} finally {
+			tempDir.remove();
+		}
+	});
+
+	it("fails closed when a git diff exceeds the raw capture budget", async () => {
+		const tempDir = TempDir.createSync("@gjc-contribution-prep-oversized-diff-");
+		try {
+			const trackedPath = path.join(tempDir.path(), "tracked.txt");
+			await Bun.write(trackedPath, "baseline\n");
+			await $`git init`.cwd(tempDir.path()).quiet();
+			await $`git add tracked.txt`.cwd(tempDir.path()).quiet();
+			await $`git -c user.email=test@example.com -c user.name=Test commit -m initial`.cwd(tempDir.path()).quiet();
+
+			await Bun.write(
+				trackedPath,
+				`<SessionToken>${SYNTHETIC_AWS_SESSION_TOKEN}</SessionToken>${"z".repeat(1_010_000)}\n`,
+			);
+			const result = await prepareContributionPrep(
+				{ sessionId: "source-session", cwd: tempDir.path(), messages: [] },
+				{
+					artifactRoot: path.join(tempDir.path(), "artifacts"),
+					now: new Date("2026-05-31T00:00:00.000Z"),
+				},
+			);
+			const manifest = JSON.parse(await Bun.file(result.manifestPath).text()) as {
+				artifacts: Array<{ path: string }>;
+				redactions: string[];
+			};
+			const diffPath = manifest.artifacts.find(artifact => artifact.path === "git-diff.patch")?.path;
+			expect(diffPath).toBeTruthy();
+			const gitDiff = await Bun.file(path.join(result.artifactDir, diffPath ?? "")).text();
+
+			expect(gitDiff).toBe("[REDACTED_OVERSIZED_CONTENT]\n");
+			expect(gitDiff).not.toContain(SYNTHETIC_AWS_SESSION_TOKEN);
+			expect(manifest.redactions).toContain("oversized_content");
+		} finally {
+			tempDir.remove();
+		}
 	});
 
 	it("writes a manifest with redacted file-pointer artifacts", async () => {

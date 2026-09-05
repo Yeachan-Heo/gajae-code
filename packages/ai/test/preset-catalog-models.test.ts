@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { isRetiredModelKey } from "../src/model-retirements";
-import { Effort } from "../src/model-thinking";
+import { Effort, getSupportedEfforts } from "../src/model-thinking";
 import type { GeneratedProvider } from "../src/models";
 import { getBundledModel, getBundledModels, getBundledProviders } from "../src/models";
 
@@ -9,6 +9,42 @@ function gemini37SiblingId(modelId: string): string {
 }
 
 describe("preset catalog model entries", () => {
+	test("bundles Astra and Fable 5.1 with the thinking ladders used by model profiles", () => {
+		const astra = getBundledModel("openai-codex", "gpt-6-astra");
+		expect(astra).toMatchObject({
+			id: "gpt-6-astra",
+			name: "GPT-6-Astra",
+			api: "openai-codex-responses",
+			provider: "openai-codex",
+			baseUrl: "https://chatgpt.com/backend-api",
+			reasoning: true,
+		});
+		expect(astra.thinking).toEqual({ mode: "effort", minLevel: Effort.Low, maxLevel: Effort.Max });
+		expect(getSupportedEfforts(astra)).toEqual([Effort.Low, Effort.Medium, Effort.High, Effort.XHigh, Effort.Max]);
+
+		const fable = getBundledModel("anthropic", "claude-fable-5-1");
+		expect(fable).toMatchObject({
+			id: "claude-fable-5-1",
+			name: "Anthropic Fable 5.1",
+			api: "anthropic-messages",
+			provider: "anthropic",
+			baseUrl: "https://api.anthropic.com",
+			reasoning: true,
+		});
+		expect(fable.thinking).toEqual({
+			mode: "anthropic-adaptive",
+			minLevel: Effort.Minimal,
+			maxLevel: Effort.XHigh,
+		});
+		expect(getSupportedEfforts(fable)).toEqual([
+			Effort.Minimal,
+			Effort.Low,
+			Effort.Medium,
+			Effort.High,
+			Effort.XHigh,
+		]);
+	});
+
 	test("bundles Kilo Ox Alpha with its reviewed capability contract", () => {
 		const model = getBundledModel("kilo", "stealth/ox-alpha");
 

@@ -595,6 +595,15 @@ describe("SDK serve CLI and discovery", () => {
 			},
 			close: async () => {},
 		} as never;
+		const exactInputs: Record<string, unknown>[] = [];
+		const exactBroker = {
+			global: async (_operation: string, input: Record<string, unknown>) => {
+				exactInputs.push(input);
+				return { ok: true, result: { sessions: [sessions[149]], warnings: [] } };
+			},
+		} as never;
+		expect(await listBrokerSessions(exactBroker, "sess-150")).toEqual([sessions[149]]);
+		expect(exactInputs).toEqual([{ resolveSessionId: "sess-150" }]);
 		const rows = await listBrokerSessions(broker);
 		expect(rows).toHaveLength(150);
 		// Explicit targeting resolves the row only the second page carries.

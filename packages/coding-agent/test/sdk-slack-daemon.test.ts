@@ -1,7 +1,8 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { logger } from "@gajae-code/utils";
 import { ChatDeliveryError } from "../src/sdk/bus/chat-daemon-runtime";
 import { ChatEffectJournal } from "../src/sdk/bus/chat-effect-journal";
 import { ConversationStore } from "../src/sdk/bus/conversation-store";
@@ -40,6 +41,12 @@ class FakeSlack {
 	stops = 0;
 	onFind?: (clientMsgId: string) => Promise<void>;
 	onPost?: (input: { channel: string; text: string; threadTs?: string; clientMsgId: string }) => void | Promise<void>;
+	onReaction?: (input: {
+		channel: string;
+		timestamp: string;
+		name: string;
+		signal?: AbortSignal;
+	}) => void | Promise<void>;
 	onStart?: (handler: (envelope: SlackSocketEnvelope) => void | Promise<void>) => Promise<void>;
 
 	async start(handler: (envelope: SlackSocketEnvelope) => void | Promise<void>): Promise<void> {
@@ -64,8 +71,10 @@ class FakeSlack {
 		await this.onAck?.(envelopeId);
 	}
 
-	async addReaction(input: { channel: string; timestamp: string; name: string }): Promise<void> {
-		this.reactions.push(input);
+	async addReaction(input: { channel: string; timestamp: string; name: string; signal?: AbortSignal }): Promise<void> {
+		const { signal: _signal, ...reaction } = input;
+		this.reactions.push(reaction);
+		await this.onReaction?.(input);
 	}
 
 	waitForPostStartCount(count: number): Promise<void> {
@@ -151,6 +160,18 @@ function endpoint(sessionId: string, generation = 1): SessionAttachment {
 		send: () => undefined,
 		sendMaintenance: () => {},
 	};
+}
+
+async function waitForAbort(signal: AbortSignal): Promise<void> {
+	if (signal.aborted) return;
+	const aborted = Promise.withResolvers<void>();
+	const onAbort = (): void => aborted.resolve();
+	signal.addEventListener("abort", onAbort, { once: true });
+	try {
+		await aborted.promise;
+	} finally {
+		signal.removeEventListener("abort", onAbort);
+	}
 }
 
 type LoadBarrier = {
@@ -320,6 +341,151 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 			expect(fake.reactions).toEqual([{ channel: "C1", timestamp: "2.event-1", name: "eyes" }]);
 			expect(injected).toHaveLength(1);
 		});
+	});
+
+	it("does not reject an accepted turn or leak provider details when its reaction fails", async () => {
+		const secret = "xoxb-reaction-secret";
+		const unhandled: unknown[] = [];
+		const onUnhandled = (reason: unknown): void => void unhandled.push(reason);
+		const warning = vi.spyOn(logger, "warn").mockImplementation(() => {});
+		process.on("unhandledRejection", onUnhandled);
+		try {
+			await withDaemon(async (daemon, fake, injected) => {
+				const root = await daemon.postRoot("session", "root");
+				fake.onReaction = async () => {
+					throw new Error(secret);
+				};
+
+				await expect(
+					daemon.handleEnvelope(messageEnvelope("reaction-rejected", "reaction-rejected-event", root.rootTs!)),
+				).resolves.toBe(true);
+				for (let index = 0; index < 6; index++) await Promise.resolve();
+				await Bun.sleep(0);
+
+				expect(injected).toHaveLength(1);
+				expect(warning.mock.calls).toEqual([["Slack inbound acknowledgement reaction failed."]]);
+				expect(JSON.stringify(warning.mock.calls)).not.toContain(secret);
+				expect(unhandled).toEqual([]);
+			});
+		} finally {
+			process.off("unhandledRejection", onUnhandled);
+			warning.mockRestore();
+		}
+	});
+
+	it("does not couple accepted turn dispatch to a stalled reaction and aborts it at the deadline", async () => {
+		const warning = vi.spyOn(logger, "warn").mockImplementation(() => {});
+		try {
+			await withDaemon(async (daemon, fake, injected) => {
+				const root = await daemon.postRoot("session", "root");
+				const reactionStarted = Promise.withResolvers<AbortSignal>();
+				const reactionAborted = Promise.withResolvers<void>();
+				fake.onReaction = async input => {
+					if (!input.signal) throw new Error("Reaction signal missing");
+					reactionStarted.resolve(input.signal);
+					await waitForAbort(input.signal);
+					reactionAborted.resolve();
+					input.signal.throwIfAborted();
+				};
+				vi.useFakeTimers();
+				try {
+					const handled = daemon.handleEnvelope(
+						messageEnvelope("reaction-stalled", "reaction-stalled-event", root.rootTs!),
+					);
+					const signal = await reactionStarted.promise;
+					await expect(handled).resolves.toBe(true);
+					expect(injected).toHaveLength(1);
+					expect(signal.aborted).toBe(false);
+
+					vi.advanceTimersByTime(4_999);
+					expect(signal.aborted).toBe(false);
+					vi.advanceTimersByTime(1);
+					await reactionAborted.promise;
+					for (let index = 0; index < 6; index++) await Promise.resolve();
+
+					expect(signal.aborted).toBe(true);
+					expect(warning.mock.calls).toEqual([
+						["Slack inbound acknowledgement reaction exceeded the 5000ms deadline and was aborted."],
+					]);
+				} finally {
+					vi.useRealTimers();
+				}
+			});
+		} finally {
+			warning.mockRestore();
+		}
+	});
+
+	it("aborts and drains a stalled reaction during shutdown without an unhandled rejection", async () => {
+		const unhandled: unknown[] = [];
+		const onUnhandled = (reason: unknown): void => void unhandled.push(reason);
+		const warning = vi.spyOn(logger, "warn").mockImplementation(() => {});
+		process.on("unhandledRejection", onUnhandled);
+		try {
+			await withDaemon(async (daemon, fake) => {
+				const root = await daemon.postRoot("session", "root");
+				const reactionStarted = Promise.withResolvers<AbortSignal>();
+				let reactionFinished = false;
+				fake.onReaction = async input => {
+					if (!input.signal) throw new Error("Reaction signal missing");
+					reactionStarted.resolve(input.signal);
+					try {
+						await waitForAbort(input.signal);
+						input.signal.throwIfAborted();
+					} finally {
+						reactionFinished = true;
+					}
+				};
+
+				await expect(
+					daemon.handleEnvelope(messageEnvelope("reaction-shutdown", "reaction-shutdown-event", root.rootTs!)),
+				).resolves.toBe(true);
+				const signal = await reactionStarted.promise;
+				await daemon.stop();
+				expect(reactionFinished).toBe(true);
+				await Bun.sleep(0);
+
+				expect(signal.aborted).toBe(true);
+				expect(warning).not.toHaveBeenCalled();
+				expect(unhandled).toEqual([]);
+			});
+		} finally {
+			process.off("unhandledRejection", onUnhandled);
+			warning.mockRestore();
+		}
+	});
+
+	it("aborts and drains a stalled reaction when attachment ownership is retired", async () => {
+		const warning = vi.spyOn(logger, "warn").mockImplementation(() => {});
+		try {
+			await withDaemon(async (daemon, fake) => {
+				const root = await daemon.postRoot("session", "root");
+				const reactionStarted = Promise.withResolvers<AbortSignal>();
+				let reactionFinished = false;
+				fake.onReaction = async input => {
+					if (!input.signal) throw new Error("Reaction signal missing");
+					reactionStarted.resolve(input.signal);
+					try {
+						await waitForAbort(input.signal);
+						input.signal.throwIfAborted();
+					} finally {
+						reactionFinished = true;
+					}
+				};
+
+				await expect(
+					daemon.handleEnvelope(messageEnvelope("reaction-retired", "reaction-retired-event", root.rootTs!)),
+				).resolves.toBe(true);
+				const signal = await reactionStarted.promise;
+				await daemon.retireAttachment("session", 1);
+				expect(reactionFinished).toBe(true);
+
+				expect(signal.aborted).toBe(true);
+				expect(warning).not.toHaveBeenCalled();
+			});
+		} finally {
+			warning.mockRestore();
+		}
 	});
 
 	it("rejects unpaired actors before inbound journaling or SDK dispatch", async () => {

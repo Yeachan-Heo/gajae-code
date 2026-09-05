@@ -1,9 +1,10 @@
 import { createHash } from "node:crypto";
+import * as nodeFs from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { parseFrontmatter, pathIsWithin } from "@gajae-code/utils";
 import { classifyStdioInvocation } from "./mcp-policy";
-import { readSchemaDeclaration, schemaHash } from "./metadata";
+import { canonicalizeJsonSchema, extractDeclaredToolSchema, schemaHash } from "./metadata";
 import { resolveWithinRoot } from "./paths";
 import { parseManifest, parseSubskillFrontmatter } from "./schema";
 import {
@@ -11,6 +12,7 @@ import {
 	type GjcPluginAppendixManifestEntry,
 	GjcPluginLoadError,
 	type GjcPluginMcpManifestEntry,
+	type JsonSchema202012,
 	type NormalizedAgentAppendixSurface,
 	type NormalizedAppendixSurface,
 	type NormalizedGjcPluginBundle,
@@ -24,34 +26,92 @@ import {
 import { validateBinding } from "./validation";
 
 const PLUGIN_FILE_MAX_BYTES = 16 * 1024 * 1024;
+const PLUGIN_MANIFEST_MAX_BYTES = PLUGIN_FILE_MAX_BYTES;
+const PLUGIN_FILE_OPEN_FLAGS =
+	nodeFs.constants.O_RDONLY | (process.platform === "win32" ? 0 : (nodeFs.constants.O_NOFOLLOW ?? 0));
 
-async function readBoundedFile(absPath: string, rel: string): Promise<Buffer> {
-	const handle = await fs.open(absPath, "r");
+interface FileIdentity {
+	dev: bigint;
+	ino: bigint;
+}
+
+interface FileAuthority {
+	path: string;
+	realPath: string;
+	identity: FileIdentity;
+}
+
+interface ManifestSnapshot {
+	bytes: Buffer;
+	json: unknown;
+}
+
+function sameIdentity(left: FileIdentity, right: FileIdentity): boolean {
+	return left.dev === right.dev && left.ino === right.ino;
+}
+
+function errorCode(error: unknown): string | undefined {
+	return typeof error === "object" && error !== null && "code" in error && typeof error.code === "string"
+		? error.code
+		: undefined;
+}
+
+function tooLarge(rel: string, maxBytes: number): GjcPluginLoadError {
+	return new GjcPluginLoadError("security_policy", `GJC plugin file exceeds ${maxBytes} bytes: ${rel}`);
+}
+
+async function readBoundedFile(file: FileAuthority, rel: string, maxBytes: number): Promise<Buffer> {
+	let handle: fs.FileHandle;
 	try {
-		const before = await handle.stat();
-		if (!before.isFile() || before.size > PLUGIN_FILE_MAX_BYTES) {
-			throw new GjcPluginLoadError(
-				"security_policy",
-				`GJC plugin file exceeds ${PLUGIN_FILE_MAX_BYTES} bytes: ${rel}`,
-			);
+		handle = await fs.open(file.path, PLUGIN_FILE_OPEN_FLAGS);
+	} catch (error) {
+		if (errorCode(error) === "ELOOP") {
+			throw new GjcPluginLoadError("security_policy", `GJC plugin path became a symlink before opening: ${rel}`, {
+				cause: error instanceof Error ? error : undefined,
+			});
 		}
+		throw error;
+	}
+	try {
+		const before = await handle.stat({ bigint: true });
+		if (!before.isFile()) {
+			throw new GjcPluginLoadError("security_policy", `GJC plugin path is not a regular file: ${rel}`);
+		}
+		if (!sameIdentity(file.identity, before)) {
+			throw new GjcPluginLoadError("security_policy", `GJC plugin file changed before opening: ${rel}`);
+		}
+		const [settledRealPath, settledPath] = await Promise.all([
+			fs.realpath(file.path),
+			fs.lstat(file.path, { bigint: true }),
+		]);
+		if (
+			settledRealPath !== file.realPath ||
+			settledPath.isSymbolicLink() ||
+			!settledPath.isFile() ||
+			!sameIdentity(settledPath, before)
+		) {
+			throw new GjcPluginLoadError("security_policy", `GJC plugin file changed before reading: ${rel}`);
+		}
+		if (before.size > BigInt(maxBytes)) throw tooLarge(rel, maxBytes);
 		const chunks: Buffer[] = [];
 		let offset = 0;
 		for (;;) {
-			const remaining = PLUGIN_FILE_MAX_BYTES + 1 - offset;
-			if (remaining <= 0)
-				throw new GjcPluginLoadError(
-					"security_policy",
-					`GJC plugin file exceeds ${PLUGIN_FILE_MAX_BYTES} bytes: ${rel}`,
-				);
+			const remaining = maxBytes + 1 - offset;
+			if (remaining <= 0) throw tooLarge(rel, maxBytes);
 			const chunk = Buffer.allocUnsafe(Math.min(1024 * 1024, remaining));
 			const { bytesRead } = await handle.read(chunk, 0, chunk.byteLength, offset);
 			if (bytesRead === 0) break;
 			chunks.push(chunk.subarray(0, bytesRead));
 			offset += bytesRead;
 		}
-		const after = await handle.stat();
-		if (before.size !== after.size || before.mtimeMs !== after.mtimeMs || before.ctimeMs !== after.ctimeMs) {
+		const after = await handle.stat({ bigint: true });
+		if (
+			!sameIdentity(before, after) ||
+			before.size !== after.size ||
+			before.mtimeNs !== after.mtimeNs ||
+			before.ctimeNs !== after.ctimeNs ||
+			BigInt(offset) !== after.size
+		) {
 			throw new GjcPluginLoadError("security_policy", `GJC plugin file changed while reading: ${rel}`);
 		}
 		return Buffer.concat(chunks, offset);
@@ -81,17 +141,19 @@ export const surfaceIds = {
 		`subskill-tool:${parent}:${phase}:${activationArg}:${relativePath}`,
 } as const;
 
-async function readManifestJson(filePath: string): Promise<unknown> {
-	let text: string;
+async function readManifestSnapshot(pluginRoot: string, filePath: string): Promise<ManifestSnapshot> {
+	let bytes: Buffer;
 	try {
-		text = await fs.readFile(filePath, "utf8");
+		const file = await resolveDeclaredFile(pluginRoot, GJC_PLUGIN_MANIFEST_FILENAME);
+		bytes = await readBoundedFile(file, GJC_PLUGIN_MANIFEST_FILENAME, PLUGIN_MANIFEST_MAX_BYTES);
 	} catch (error) {
+		if (error instanceof GjcPluginLoadError && error.code !== "missing_file") throw error;
 		throw new GjcPluginLoadError("missing_file", `Missing GJC plugin manifest at ${filePath}`, {
 			cause: error instanceof Error ? error : undefined,
 		});
 	}
 	try {
-		return JSON.parse(text) as unknown;
+		return { bytes, json: JSON.parse(bytes.toString("utf8")) as unknown };
 	} catch (error) {
 		throw new GjcPluginLoadError("invalid_manifest", `Invalid GJC plugin manifest JSON at ${filePath}`, {
 			cause: error instanceof Error ? error : undefined,
@@ -123,32 +185,40 @@ async function resolveDeclaredDirectory(pluginRoot: string, rel: string): Promis
  * Resolve a declared relative path, rejecting lexical escapes AND symlink
  * escapes out of the plugin root. Never imports the file.
  */
-async function resolveDeclaredFile(pluginRoot: string, rel: string): Promise<string> {
+async function resolveDeclaredFile(pluginRoot: string, rel: string): Promise<FileAuthority> {
 	const resolved = resolveWithinRoot(pluginRoot, rel);
-	let real: string;
+	let realRoot: string;
+	let realPath: string;
+	let stat: nodeFs.BigIntStats;
 	try {
-		real = await fs.realpath(resolved);
+		realRoot = await fs.realpath(pluginRoot);
+		realPath = await fs.realpath(resolved);
+		stat = await fs.lstat(resolved, { bigint: true });
 	} catch (error) {
 		throw new GjcPluginLoadError("missing_file", `Missing GJC plugin file at ${resolved}`, {
 			cause: error instanceof Error ? error : undefined,
 		});
 	}
-	const realRoot = await fs.realpath(pluginRoot);
-	if (!pathIsWithin(realRoot, real)) {
+	if (!pathIsWithin(realRoot, realPath)) {
 		throw new GjcPluginLoadError("security_policy", `GJC plugin file escapes root via symlink: ${rel}`);
 	}
-	return resolved;
+	if (stat.isSymbolicLink() || !stat.isFile()) {
+		throw new GjcPluginLoadError("security_policy", `GJC plugin path must be a real file: ${rel}`);
+	}
+	return { path: resolved, realPath, identity: stat };
 }
+
 async function hashFile(
-	absPath: string,
+	file: FileAuthority,
 	rel: string,
 	declaredSha?: string,
-): Promise<{ sha256: string; bytes: number }> {
+): Promise<{ sha256: string; bytes: number; content: Buffer }> {
 	let buf: Buffer;
 	try {
-		buf = await readBoundedFile(absPath, rel);
+		buf = await readBoundedFile(file, rel, PLUGIN_FILE_MAX_BYTES);
 	} catch (error) {
-		throw new GjcPluginLoadError("missing_file", `Missing GJC plugin file at ${absPath}`, {
+		if (error instanceof GjcPluginLoadError) throw error;
+		throw new GjcPluginLoadError("missing_file", `Missing GJC plugin file at ${file.path}`, {
 			cause: error instanceof Error ? error : undefined,
 		});
 	}
@@ -156,7 +226,38 @@ async function hashFile(
 	if (declaredSha !== undefined && declaredSha.toLowerCase() !== digest) {
 		throw new GjcPluginLoadError("hash_mismatch", `GJC plugin file hash mismatch for ${rel}`);
 	}
-	return { sha256: digest, bytes: buf.byteLength };
+	return { sha256: digest, bytes: buf.byteLength, content: buf };
+}
+
+function schemaFromSnapshots(
+	declaration: unknown,
+	sourceBytes: Buffer,
+	schemaFile?: { relativePath: string; bytes: Buffer },
+): JsonSchema202012 {
+	if (schemaFile !== undefined) {
+		try {
+			return canonicalizeJsonSchema(JSON.parse(schemaFile.bytes.toString("utf8")) as unknown);
+		} catch (error) {
+			if (error instanceof GjcPluginLoadError) throw error;
+			throw new GjcPluginLoadError(
+				"invalid_schema",
+				`Invalid JSON Schema declaration at ${schemaFile.relativePath}`,
+				{
+					cause: error instanceof Error ? error : undefined,
+				},
+			);
+		}
+	}
+	if (declaration !== undefined) return canonicalizeJsonSchema(declaration);
+	try {
+		return extractDeclaredToolSchema(sourceBytes.toString("utf8"));
+	} catch (error) {
+		if (error instanceof GjcPluginLoadError) throw error;
+		throw new GjcPluginLoadError(
+			"invalid_schema",
+			`Tool parameters schema is not statically readable: ${error instanceof Error ? error.message : String(error)}`,
+		);
+	}
 }
 
 function mcpConfigHash(entry: GjcPluginMcpManifestEntry): string {
@@ -198,8 +299,8 @@ async function compileAppendix(
 		return { contentHash: digest, bytes: Buffer.byteLength(content), content };
 	}
 	const rel = entry.path as string;
-	const abs = await resolveDeclaredFile(pluginRoot, rel);
-	const { sha256: digest, bytes } = await hashFile(abs, rel, entry.sha256);
+	const file = await resolveDeclaredFile(pluginRoot, rel);
+	const { sha256: digest, bytes } = await hashFile(file, rel, entry.sha256);
 	if (bytes === 0) {
 		throw new GjcPluginLoadError("invalid_appendix", `Invalid GJC plugin ${field}: file is empty`);
 	}
@@ -215,40 +316,34 @@ async function compileAppendix(
 export async function compileGjcPluginBundle(root: string): Promise<NormalizedGjcPluginBundle> {
 	const pluginRoot = path.resolve(root);
 	const manifestPath = path.join(pluginRoot, GJC_PLUGIN_MANIFEST_FILENAME);
-	const manifest = parseManifest(await readManifestJson(manifestPath), manifestPath);
+	const manifestSnapshot = await readManifestSnapshot(pluginRoot, manifestPath);
+	const manifest = parseManifest(manifestSnapshot.json, manifestPath);
 
 	const files = new Map<string, { sha256: string; bytes: number }>();
 	const manifestSubskillTools = manifest.tools.filter(tool => tool.surface === "subskill");
 	const manifestSubskillFiles = new Map<string, { name: string; sha256: string }>();
 	for (const tool of manifestSubskillTools) {
-		const abs = await resolveDeclaredFile(pluginRoot, tool.path);
-		const { sha256: digest, bytes } = await hashFile(abs, tool.path, tool.sha256);
+		const file = await resolveDeclaredFile(pluginRoot, tool.path);
+		const { sha256: digest, bytes } = await hashFile(file, tool.path, tool.sha256);
 		files.set(tool.path, { sha256: digest, bytes });
 		manifestSubskillFiles.set(tool.path, { name: tool.name, sha256: digest });
 	}
 
 	const subskills: NormalizedSubskillSurface[] = [];
 	for (const rel of manifest.subskills) {
-		const abs = await resolveDeclaredFile(pluginRoot, rel);
-		const { sha256: digest, bytes } = await hashFile(abs, rel);
+		const file = await resolveDeclaredFile(pluginRoot, rel);
+		const { sha256: digest, bytes, content: contentBytes } = await hashFile(file, rel);
 		files.set(rel, { sha256: digest, bytes });
-		let content: string;
-		try {
-			content = await fs.readFile(abs, "utf8");
-		} catch (error) {
-			throw new GjcPluginLoadError("missing_file", `Missing GJC sub-skill file at ${abs}`, {
-				cause: error instanceof Error ? error : undefined,
-			});
-		}
+		const content = contentBytes.toString("utf8");
 		let parsed: { frontmatter: Record<string, unknown>; body: string };
 		try {
-			parsed = parseFrontmatter(content, { source: abs, level: "fatal" });
+			parsed = parseFrontmatter(content, { source: file.path, level: "fatal" });
 		} catch (error) {
-			throw new GjcPluginLoadError("invalid_frontmatter", `Invalid GJC sub-skill frontmatter at ${abs}`, {
+			throw new GjcPluginLoadError("invalid_frontmatter", `Invalid GJC sub-skill frontmatter at ${file.path}`, {
 				cause: error instanceof Error ? error : undefined,
 			});
 		}
-		const fm = parseSubskillFrontmatter(parsed.frontmatter, abs);
+		const fm = parseSubskillFrontmatter(parsed.frontmatter, file.path);
 		validateBinding(fm);
 		// Subskill-scoped frontmatter tools are hashed for copy-ownership and
 		// escape checks (the loader resolves these at runtime).
@@ -269,8 +364,8 @@ export async function compileGjcPluginBundle(root: string): Promise<NormalizedGj
 		}
 		for (const toolRel of fmToolPaths) {
 			if (toolRel.trim().length === 0) continue;
-			const toolAbs = await resolveDeclaredFile(pluginRoot, toolRel);
-			const { sha256: toolDigest, bytes: toolBytes } = await hashFile(toolAbs, toolRel);
+			const toolFile = await resolveDeclaredFile(pluginRoot, toolRel);
+			const { sha256: toolDigest, bytes: toolBytes } = await hashFile(toolFile, toolRel);
 			files.set(toolRel, { sha256: toolDigest, bytes: toolBytes });
 			const extensionId = surfaceIds.subskillTool(fm.binds_to, fm.phase, fm.activation_arg, toolRel);
 			if (seenToolRefs.has(extensionId)) continue;
@@ -295,18 +390,18 @@ export async function compileGjcPluginBundle(root: string): Promise<NormalizedGj
 	// surface; legacy string shorthand stays subskill-scoped (loader-handled).
 	const tools: NormalizedToolSurface[] = [];
 	for (const tool of manifest.tools) {
-		const abs = await resolveDeclaredFile(pluginRoot, tool.path);
-		const { sha256: digest, bytes } = await hashFile(abs, tool.path, tool.sha256);
+		const file = await resolveDeclaredFile(pluginRoot, tool.path);
+		const { sha256: digest, bytes, content: sourceBytes } = await hashFile(file, tool.path, tool.sha256);
 		files.set(tool.path, { sha256: digest, bytes });
 		if (tool.surface !== "always-on") continue;
-		let schemaPath: string | undefined;
+		let schemaFileSnapshot: { relativePath: string; bytes: Buffer } | undefined;
 		if (tool.schemaPath !== undefined) {
-			const schemaAbs = await resolveDeclaredFile(pluginRoot, tool.schemaPath);
-			const schemaFile = await hashFile(schemaAbs, tool.schemaPath);
-			files.set(tool.schemaPath, schemaFile);
-			schemaPath = tool.schemaPath;
+			const schemaFile = await resolveDeclaredFile(pluginRoot, tool.schemaPath);
+			const { sha256: schemaDigest, bytes: schemaBytes, content } = await hashFile(schemaFile, tool.schemaPath);
+			files.set(tool.schemaPath, { sha256: schemaDigest, bytes: schemaBytes });
+			schemaFileSnapshot = { relativePath: tool.schemaPath, bytes: content };
 		}
-		const schema = await readSchemaDeclaration(pluginRoot, abs, tool.schema, schemaPath);
+		const schema = schemaFromSnapshots(tool.schema, sourceBytes, schemaFileSnapshot);
 		tools.push({
 			extensionId: surfaceIds.tool(tool.name),
 			name: tool.name,
@@ -324,8 +419,8 @@ export async function compileGjcPluginBundle(root: string): Promise<NormalizedGj
 	for (const hook of manifest.hooks) {
 		// Path safety first: resolve/hash before semantic checks so traversal and
 		// missing-file failures take precedence over contract validation.
-		const abs = await resolveDeclaredFile(pluginRoot, hook.path);
-		const { sha256: digest, bytes } = await hashFile(abs, hook.path, hook.sha256);
+		const file = await resolveDeclaredFile(pluginRoot, hook.path);
+		const { sha256: digest, bytes } = await hashFile(file, hook.path, hook.sha256);
 		files.set(hook.path, { sha256: digest, bytes });
 		// Minimal compile-time hook contract: tool_call hooks must name a target
 		// and a before/after phase so the constrained runner (M3/M4) can bind them.
@@ -382,8 +477,8 @@ export async function compileGjcPluginBundle(root: string): Promise<NormalizedGj
 			const invocation = classifyStdioInvocation(entry, { pluginRoot });
 			await resolveDeclaredDirectory(pluginRoot, path.relative(pluginRoot, invocation.cwd));
 			for (const relativePath of new Set(invocation.ownedRelativePaths)) {
-				const abs = await resolveDeclaredFile(pluginRoot, relativePath);
-				const { sha256: digest, bytes } = await hashFile(abs, relativePath, undefined);
+				const file = await resolveDeclaredFile(pluginRoot, relativePath);
+				const { sha256: digest, bytes } = await hashFile(file, relativePath, undefined);
 				files.set(relativePath, { sha256: digest, bytes });
 			}
 		}
@@ -432,7 +527,7 @@ export async function compileGjcPluginBundle(root: string): Promise<NormalizedGj
 		agentAppendices,
 	};
 
-	const manifestBytes = await fs.readFile(manifestPath);
+	const manifestBytes = manifestSnapshot.bytes;
 	const manifestHash = sha256(manifestBytes);
 
 	const copiedFiles = [...files.entries()]

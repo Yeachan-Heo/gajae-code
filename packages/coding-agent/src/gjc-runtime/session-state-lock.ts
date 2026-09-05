@@ -146,7 +146,43 @@ interface PendingTransitionRelease {
 	recovery?: Promise<boolean>;
 }
 
+interface LocalTransitionQueue {
+	waiters: Array<() => void>;
+}
+
 const pendingTransitionReleases = new Map<string, PendingTransitionRelease>();
+const localTransitionQueues = new Map<string, LocalTransitionQueue>();
+
+async function joinLocalTransitionQueue(
+	key: string,
+	transitionDir: string,
+	retryBudget?: LockRetryBudget,
+): Promise<LocalTransitionQueue | undefined> {
+	const queue = localTransitionQueues.get(key);
+	if (!queue) return undefined;
+	const ready = Promise.withResolvers<void>();
+	const queuedAt = performance.now();
+	SessionStateLockTestHooks.afterLocalTransitionQueued?.(transitionDir);
+	queue.waiters.push(ready.resolve);
+	await ready.promise;
+	if (retryBudget) retryBudget.startedAt += Math.max(0, performance.now() - queuedAt);
+	return queue;
+}
+
+function claimLocalTransitionQueue(key: string): LocalTransitionQueue {
+	const queue: LocalTransitionQueue = { waiters: [] };
+	localTransitionQueues.set(key, queue);
+	return queue;
+}
+
+function releaseLocalTransitionQueue(key: string, queue: LocalTransitionQueue): void {
+	const next = queue.waiters.shift();
+	if (next) {
+		next();
+		return;
+	}
+	if (localTransitionQueues.get(key) === queue) localTransitionQueues.delete(key);
+}
 
 function clearPendingTransitionRelease(key: string, pending?: PendingTransitionRelease): void {
 	const current = pendingTransitionReleases.get(key);
@@ -413,6 +449,8 @@ export const SessionStateLockTestHooks: {
 	forcedQuarantineName?: string;
 	/** @internal Observes bounded acquisition retries without changing their timing. */
 	afterAcquireContention?: (lockFile: string, attempt: number, elapsedMs: number) => void;
+	/** @internal Observes process-local admission without altering on-disk ownership. */
+	afterLocalTransitionQueued?: (transitionDir: string) => void;
 	/** @internal Runs after transition mkdir contention and before stale-claim inspection. */
 	afterTransitionClaimContention?: (transitionDir: string) => void | Promise<void>;
 } = {};
@@ -1993,7 +2031,14 @@ async function recoverPendingTransitionRelease(
 	}
 }
 
-/** Run one pathname transition under an atomic `mkdir`/`rmdir` claim. */
+/**
+ * Run one pathname transition under an atomic `mkdir`/`rmdir` claim.
+ *
+ * Same-process contenders join the current claim owner's lifetime before consuming their
+ * bounded filesystem-contention budget. The on-disk protocol remains authoritative across
+ * processes; this queue only prevents a descheduled local owner from timing out its own
+ * successor while it still legitimately holds the claim.
+ */
 async function withLockPathTransition<T>(
 	lockFile: string,
 	transition: () => Promise<T>,
@@ -2003,10 +2048,52 @@ async function withLockPathTransition<T>(
 	if (ownerAccessStrategy() === "unsupported")
 		throw new SessionStateLockUnavailableError(new Error("Safe transition ownership is unsupported."));
 	const transitionDir = `${lockFile}${LOCK_TRANSITION_RESOURCE_SUFFIX}`;
-	const ownerFile = `${transitionDir}.owner`;
 	const recoveryKey = await transitionRecoveryKey(transitionDir);
+	const localKey = recoveryKey;
 	const owner = await newLockOwner();
 	const budget = retryBudget ?? lockRetryBudget();
+	let localTurn = await joinLocalTransitionQueue(localKey, transitionDir, budget);
+	const claimLocalTurn = (): void => {
+		localTurn ??= claimLocalTransitionQueue(localKey);
+	};
+	const joinLocalTurn = async (): Promise<boolean> => {
+		if (localTurn) return false;
+		const joined = await joinLocalTransitionQueue(localKey, transitionDir, budget);
+		if (!joined) return false;
+		localTurn = joined;
+		return true;
+	};
+	try {
+		return await runLockPathTransition(
+			lockFile,
+			recoveryKey,
+			owner,
+			budget,
+			claimLocalTurn,
+			joinLocalTurn,
+			transition,
+			quarantineName,
+		);
+	} finally {
+		if (localTurn) releaseLocalTransitionQueue(localKey, localTurn);
+	}
+}
+
+async function runLockPathTransition<T>(
+	lockFile: string,
+	recoveryKey: string,
+	owner: SessionStateLockOwner,
+	budget: LockRetryBudget,
+	claimLocalTurn: () => void,
+	joinLocalTurn: () => Promise<boolean>,
+	transition: () => Promise<T>,
+	quarantineName = lockQuarantineName(),
+): Promise<T> {
+	if (ownerAccessStrategy() === "unsupported")
+		throw new SessionStateLockUnavailableError(new Error("Safe transition ownership is unsupported."));
+	const transitionDir = `${lockFile}${LOCK_TRANSITION_RESOURCE_SUFFIX}`;
+	const ownerFile = `${transitionDir}.owner`;
+
 	for (;;) {
 		if (ownerAccessStrategy() === "unsupported" && fsSync.existsSync(transitionDir))
 			throw new SessionStateLockUnavailableError(new Error("Safe transition ownership is unsupported."));
@@ -2014,12 +2101,15 @@ async function withLockPathTransition<T>(
 			// The claim this process stranded in an earlier failed release is gone;
 			// fall through and retry the mkdir immediately.
 		}
+		if (await joinLocalTurn()) continue;
 		try {
 			await fs.mkdir(transitionDir, { mode: 0o700 });
+			claimLocalTurn();
 			await fs.chmod(transitionDir, 0o700);
 		} catch (error) {
 			const code = (error as NodeJS.ErrnoException).code;
 			if (code !== "EEXIST" && !isTransientLockError(error)) throw new SessionStateLockUnavailableError(error);
+			if (await joinLocalTurn()) continue;
 			await SessionStateLockTestHooks.afterTransitionClaimContention?.(transitionDir);
 			if (await reclaimStaleTransitionClaim(transitionDir, quarantineName)) {
 				if (lockRetryExhausted(budget))

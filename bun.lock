@@ -14,7 +14,7 @@
     },
     "packages/agent": {
       "name": "@gajae-code/agent-core",
-      "version": "0.16.3",
+      "version": "0.16.4",
       "dependencies": {
         "@gajae-code/ai": "catalog:",
         "@gajae-code/natives": "catalog:",
@@ -29,7 +29,7 @@
     },
     "packages/ai": {
       "name": "@gajae-code/ai",
-      "version": "0.16.3",
+      "version": "0.16.4",
       "bin": {
         "pi-ai": "./src/cli.ts",
       },
@@ -48,7 +48,7 @@
     },
     "packages/coding-agent": {
       "name": "@gajae-code/coding-agent",
-      "version": "0.16.3",
+      "version": "0.16.4",
       "bin": {
         "gjc": "bin/gjc.js",
         "가재씨": "bin/gajaessi.js",
@@ -89,7 +89,7 @@
     },
     "packages/gajae-code": {
       "name": "gajae-code",
-      "version": "0.16.3",
+      "version": "0.16.4",
       "bin": {
         "gjc": "bin/gjc.js",
         "가재씨": "bin/gajaessi.js",
@@ -100,7 +100,7 @@
     },
     "packages/natives": {
       "name": "@gajae-code/natives",
-      "version": "0.16.3",
+      "version": "0.16.4",
       "devDependencies": {
         "@napi-rs/cli": "catalog:",
         "@types/bun": "catalog:",
@@ -116,23 +116,23 @@
     },
     "packages/natives-darwin-arm64": {
       "name": "@gajae-code/natives-darwin-arm64",
-      "version": "0.16.3",
+      "version": "0.16.4",
     },
     "packages/natives-darwin-x64": {
       "name": "@gajae-code/natives-darwin-x64",
-      "version": "0.16.3",
+      "version": "0.16.4",
     },
     "packages/natives-linux-arm64": {
       "name": "@gajae-code/natives-linux-arm64",
-      "version": "0.16.3",
+      "version": "0.16.4",
     },
     "packages/natives-linux-x64": {
       "name": "@gajae-code/natives-linux-x64",
-      "version": "0.16.3",
+      "version": "0.16.4",
     },
     "packages/natives-win32-x64": {
       "name": "@gajae-code/natives-win32-x64",
-      "version": "0.16.3",
+      "version": "0.16.4",
     },
     "packages/orchestration-token-benchmark": {
       "name": "@gajae-code/orchestration-token-benchmark",
@@ -143,7 +143,7 @@
     },
     "packages/stats": {
       "name": "@gajae-code/stats",
-      "version": "0.16.3",
+      "version": "0.16.4",
       "bin": {
         "gjc-stats": "./src/index.ts",
       },
@@ -168,7 +168,7 @@
     },
     "packages/tui": {
       "name": "@gajae-code/tui",
-      "version": "0.16.3",
+      "version": "0.16.4",
       "dependencies": {
         "@gajae-code/natives": "catalog:",
         "@gajae-code/utils": "catalog:",
@@ -209,7 +209,7 @@
     },
     "packages/utils": {
       "name": "@gajae-code/utils",
-      "version": "0.16.3",
+      "version": "0.16.4",
       "dependencies": {
         "@gajae-code/natives": "catalog:",
         "beautiful-mermaid": "catalog:",
@@ -232,18 +232,18 @@
     "@biomejs/biome": "2.5.2",
     "@bufbuild/protobuf": "^2.12.0",
     "@bufbuild/protoc-gen-es": "^2.12.0",
-    "@gajae-code/agent-core": "0.16.3",
-    "@gajae-code/ai": "0.16.3",
-    "@gajae-code/coding-agent": "0.16.3",
-    "@gajae-code/natives": "0.16.3",
-    "@gajae-code/natives-darwin-arm64": "0.16.3",
-    "@gajae-code/natives-darwin-x64": "0.16.3",
-    "@gajae-code/natives-linux-arm64": "0.16.3",
-    "@gajae-code/natives-linux-x64": "0.16.3",
-    "@gajae-code/natives-win32-x64": "0.16.3",
-    "@gajae-code/stats": "0.16.3",
-    "@gajae-code/tui": "0.16.3",
-    "@gajae-code/utils": "0.16.3",
+    "@gajae-code/agent-core": "0.16.4",
+    "@gajae-code/ai": "0.16.4",
+    "@gajae-code/coding-agent": "0.16.4",
+    "@gajae-code/natives": "0.16.4",
+    "@gajae-code/natives-darwin-arm64": "0.16.4",
+    "@gajae-code/natives-darwin-x64": "0.16.4",
+    "@gajae-code/natives-linux-arm64": "0.16.4",
+    "@gajae-code/natives-linux-x64": "0.16.4",
+    "@gajae-code/natives-win32-x64": "0.16.4",
+    "@gajae-code/stats": "0.16.4",
+    "@gajae-code/tui": "0.16.4",
+    "@gajae-code/utils": "0.16.4",
     "@mozilla/readability": "^0.6.0",
     "@napi-rs/cli": "3.6.2",
     "@opentelemetry/api": "^1.9.0",

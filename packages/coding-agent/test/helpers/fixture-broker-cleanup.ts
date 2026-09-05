@@ -262,25 +262,6 @@ export function cleanupFixtureRoot(root: FixtureRootCleanup, options: FixtureRoo
 	cleanupAttempts.set(root, attempt);
 	return attempt;
 }
-
-/**
- * Production-host fixtures can receive one already-owned late write while the
- * broker and session teardown settle. Remove that recreation once, then require
- * the normal bounded absence proof again; a persistent writer still fails.
- */
-export async function cleanupFixtureRootAfterLateWrite(
-	root: FixtureRootCleanup,
-	options: FixtureRootCleanupOptions = {},
-): Promise<void> {
-	const priorRecreation = root.recreation;
-	try {
-		await cleanupFixtureRoot(root, options);
-	} catch (error) {
-		if (root.recreation === priorRecreation) throw error;
-		await cleanupFixtureRoot(root, options);
-	}
-}
-
 /** Clears fixture-local broker opt-out state for an async setup and restores it exactly. */
 export async function withFixtureBrokerEnvironment<T>(run: () => Promise<T>): Promise<T> {
 	const prior = process.env.GJC_SDK_DISABLE;

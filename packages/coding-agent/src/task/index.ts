@@ -375,6 +375,14 @@ function createTaskModeError(text: string): AgentToolResult<TaskToolDetails> {
 	};
 }
 
+/** Remove only strict-provider blank placeholders for the optional caller-authored schema. */
+function normalizeTaskAdmissionParams(params: TaskParams): TaskParams {
+	if (typeof params.schema !== "string" || params.schema.trim() !== "") return params;
+	const normalized = { ...params };
+	delete normalized.schema;
+	return normalized;
+}
+
 function validateTaskModeParams(simpleMode: TaskSimpleMode, params: TaskParams): string | undefined {
 	const { contextEnabled, customSchemaEnabled } = getTaskSimpleModeCapabilities(simpleMode);
 	const disallowedFields: string[] = [];
@@ -900,7 +908,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		signal?: AbortSignal,
 		onUpdate?: AgentToolUpdateCallback<TaskToolDetails>,
 	): Promise<AgentToolResult<TaskToolDetails>> {
-		const params = rawParams as TaskParams;
+		const params = normalizeTaskAdmissionParams(rawParams as TaskParams);
 		const simpleMode = this.#getTaskSimpleMode();
 		const validationError = validateTaskModeParams(simpleMode, params);
 		if (validationError) {

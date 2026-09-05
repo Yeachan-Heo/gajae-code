@@ -3095,11 +3095,12 @@ export class Broker {
 		}
 		const limit = stored?.limit ?? requestedLimit ?? SESSION_LIST_DEFAULT_LIMIT;
 		const observedAt = stored?.observedAt ?? (scope === undefined ? undefined : new Date().toISOString());
+		const resolveSessionId = typeof input.resolveSessionId === "string" ? input.resolveSessionId : undefined;
 		const snapshot = stored ?? {
-			sessions:
-				scope === undefined
-					? [...result.sessions]
-					: result.sessions.filter(session => scopeMatchesLocator(scope, session.locator)),
+			sessions: (scope === undefined
+				? [...result.sessions]
+				: result.sessions.filter(session => scopeMatchesLocator(scope, session.locator))
+			).filter(session => resolveSessionId === undefined || session.sessionId === resolveSessionId),
 			indexSeq: result.indexSeq,
 			warnings: [...result.warnings],
 			limit,

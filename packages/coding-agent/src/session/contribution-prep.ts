@@ -3,7 +3,6 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { AgentMessage } from "@gajae-code/agent-core";
 import type { AssistantMessage, ToolResultMessage, UserMessage } from "@gajae-code/ai/core";
-import { $ } from "bun";
 import { resolveGjcCommand } from "../task/gjc-command";
 import { shortenPath } from "../tools/render-utils";
 
@@ -13,6 +12,9 @@ const MAX_TRANSCRIPT_MESSAGES = 20;
 const MAX_TEXT_CHARS = 12000;
 const MAX_GIT_OUTPUT_CHARS = 60000;
 const MAX_REDACTION_INPUT_CHARS = 1_000_000;
+// Keep whole Git captures within the redactor's input budget; discard an overrun
+// instead of emitting a prefix.
+const MAX_GIT_RAW_OUTPUT_BYTES = MAX_REDACTION_INPUT_CHARS;
 const MAX_JSON_TOKENS = 20_000;
 const MAX_JSON_REPLACEMENTS = 10_000;
 
@@ -111,22 +113,15 @@ function redactAwsLabeledValues(text: string, state: RedactionState): string {
 	);
 	redacted = replaceRegex(
 		redacted,
-		/(^|[^A-Za-z0-9_-])(["']?(?:(?:aws[_-]?)?secret[_-]?access[_-]?key|(?:aws[_-]?)?session[_-]?token)["']?\s*[=:]\s*)(\$?)(["'`])([^"'`\r\n]{8,})\4/gi,
+		/(^|[^A-Za-z0-9_-])(["']?(?:(?:aws[_-]?)?secret[_-]?access[_-]?key|(?:aws[_-]?)?session[_-]?token|x[_-]?amz[_-]?security[_-]?token)["']?\s*[=:]\s*)(\$?)(["'`])([^"'`\r\n]{8,})\4/gi,
 		"$1$2$3$4[REDACTED_SECRET]$4",
-		state,
-		"aws_keys",
-	);
-	redacted = replaceRegex(
-		redacted,
-		/(^|[^A-Za-z0-9_-])(["']?(?:(?:aws[_-]?)?secret[_-]?access[_-]?key|(?:aws[_-]?)?session[_-]?token)["']?\s*[=:]\s*)[^\s"'`,;{}[\]()&<>#]{8,}/gi,
-		"$1$2[REDACTED_SECRET]",
 		state,
 		"aws_keys",
 	);
 	return replaceRegex(
 		redacted,
-		/(^|[?&;\s])(X-Amz-Security-Token)(\s*[=:]\s*)[^\s"'`,;&<>#]{8,}/gi,
-		"$1$2$3[REDACTED_SECRET]",
+		/(^|[^A-Za-z0-9_-])(["']?(?:(?:aws[_-]?)?secret[_-]?access[_-]?key|(?:aws[_-]?)?session[_-]?token|x[_-]?amz[_-]?security[_-]?token)["']?\s*[=:]\s*)[^\s"'`,;{}[\]()&<>#]{8,}/gi,
+		"$1$2[REDACTED_SECRET]",
 		state,
 		"aws_keys",
 	);
@@ -281,17 +276,73 @@ function formatMessage(message: AgentMessage): string {
 	return `## ${message.role}\n\n${JSON.stringify(message)}\n`;
 }
 
-async function gitOutput(cwd: string, args: string[], maxChars = MAX_GIT_OUTPUT_CHARS): Promise<string> {
+interface BoundedGitOutput {
+	text: string;
+	oversized: boolean;
+}
+
+async function readBoundedGitOutput(stream: ReadableStream<Uint8Array>, maxBytes: number): Promise<BoundedGitOutput> {
+	const reader = stream.getReader();
+	const chunks: Uint8Array[] = [];
+	let totalBytes = 0;
 	try {
-		const output = await $`git ${args}`.cwd(cwd).quiet().text();
-		return limitText(output.trim(), maxChars);
+		for (;;) {
+			const { done, value } = await reader.read();
+			if (done) break;
+			totalBytes += value.byteLength;
+			if (totalBytes > maxBytes) return { text: "", oversized: true };
+			chunks.push(value);
+		}
+	} finally {
+		reader.releaseLock();
+	}
+
+	const bytes = new Uint8Array(totalBytes);
+	let offset = 0;
+	for (const chunk of chunks) {
+		bytes.set(chunk, offset);
+		offset += chunk.byteLength;
+	}
+	return { text: new TextDecoder().decode(bytes), oversized: false };
+}
+
+async function gitOutput(
+	cwd: string,
+	args: string[],
+	state: RedactionState,
+	maxChars = MAX_GIT_OUTPUT_CHARS,
+): Promise<string> {
+	try {
+		const proc = Bun.spawn(["git", ...args], { cwd, stdin: "ignore", stdout: "pipe", stderr: "ignore" });
+		const stop = (): void => {
+			try {
+				proc.kill();
+			} catch {
+				// The process already exited.
+			}
+		};
+		try {
+			const output = await readBoundedGitOutput(proc.stdout, MAX_GIT_RAW_OUTPUT_BYTES);
+			if (output.oversized) {
+				stop();
+				await proc.exited;
+				state.labels.add("oversized_content");
+				return "[REDACTED_OVERSIZED_CONTENT]";
+			}
+			if ((await proc.exited) !== 0) return "";
+			return limitText(redactContributionPrepText(output.text.trim(), cwd, state), maxChars);
+		} catch {
+			stop();
+			await proc.exited;
+			return "";
+		}
 	} catch {
 		return "";
 	}
 }
 
-async function changedFiles(cwd: string): Promise<string[]> {
-	const output = await gitOutput(cwd, ["status", "--short"]);
+async function changedFiles(cwd: string, state: RedactionState): Promise<string[]> {
+	const output = await gitOutput(cwd, ["status", "--short"], state);
 	return output
 		.split("\n")
 		.map(line => line.trim())
@@ -374,8 +425,8 @@ export async function prepareContributionPrep(
 		),
 	);
 
-	const gitHead = (await gitOutput(context.cwd, ["rev-parse", "HEAD"])) || null;
-	const files = await changedFiles(context.cwd);
+	const gitHead = (await gitOutput(context.cwd, ["rev-parse", "HEAD"], redactions)) || null;
+	const files = await changedFiles(context.cwd, redactions);
 	artifacts.push(
 		await writeArtifact(artifactDir, "changed-files.txt", "Changed files from git status", redact(files.join("\n"))),
 	);
@@ -384,7 +435,7 @@ export async function prepareContributionPrep(
 			artifactDir,
 			"git-diff.patch",
 			"Bounded redacted git diff",
-			redact(await gitOutput(context.cwd, ["diff", "--no-ext-diff"])),
+			await gitOutput(context.cwd, ["diff", "--no-ext-diff"], redactions),
 		),
 	);
 	artifacts.push(

@@ -748,10 +748,8 @@ describe("issue #4287 acceptance 4: install lifecycle remains covered for alias 
 			kind: "gajae-code-plugin",
 			name: "prototype-runtime",
 			version: "1.0.0",
-			mcpServers: { constructor: { command: "bun", args: ["mcp/server.ts"] } },
+			mcpServers: { constructor: { url: "https://example.com/constructor" } },
 		});
-		await fs.mkdir(path.join(root, "mcp"), { recursive: true });
-		await fs.writeFile(path.join(root, "mcp", "server.ts"), "export default {};\n");
 		const installed = await installGjcBundle({ cwd }, "project", root);
 		expect(installed.ok).toBe(true);
 
@@ -759,8 +757,8 @@ describe("issue #4287 acceptance 4: install lifecycle remains covered for alias 
 		expect(Object.getPrototypeOf(runtime.configs)).toBeNull();
 		expect(Object.hasOwn(runtime.configs, "constructor")).toBe(true);
 		expect(runtime.configs.constructor).toMatchObject({
-			type: "stdio",
-			command: process.platform === "linux" ? "/proc/self/exe" : process.execPath,
+			type: "http",
+			url: "https://example.com/constructor",
 		});
 	});
 });

@@ -171,6 +171,12 @@ describe("ImportWizard", () => {
 		await fs.mkdir(path.join(projectDir, ".claude", "skills", "wiz-skill"), { recursive: true });
 		await fs.writeFile(path.join(projectDir, ".claude", "skills", "wiz-skill", "SKILL.md"), SKILL_MD);
 		const wizard = new ImportWizard(projectDir, "project", homeDir);
+		const previewReady = Promise.withResolvers<void>();
+		const applyFinished = Promise.withResolvers<void>();
+		wizard.onRequestRender = () => {
+			if (wizard.step === "preview") previewReady.resolve();
+			if (wizard.step === "result") applyFinished.resolve();
+		};
 		wizard.handleInput("\r"); // product: claude-code (first)
 		expect(wizard.step).toBe("sourceScope");
 		wizard.handleInput("\r"); // source scope: project (first)
@@ -178,40 +184,43 @@ describe("ImportWizard", () => {
 		wizard.handleInput("\r"); // surfaces: all
 		expect(wizard.step).toBe("collision");
 		wizard.handleInput("\r"); // policy: skip (first) → builds preview async
-		await Bun.sleep(80);
+		await previewReady.promise;
 		expect(wizard.step).toBe("preview");
 		expect(wizard.hasVisibleSelector).toBe(false);
 		expect(wizard.preview?.entries.some(e => e.surface === "skills" && e.destinationName === "wiz-skill")).toBe(true);
 		wizard.handleInput("\r"); // confirm apply
-		await Bun.sleep(80);
+		await applyFinished.promise;
 		expect(wizard.step).toBe("result");
 		expect(wizard.result?.ok).toBe(true);
 		await fs.stat(path.join(projectDir, ".gjc", "skills", "wiz-skill", "SKILL.md"));
 	});
 
 	test("a failed apply closes with applied=false, never a false success", async () => {
-		// Malformed destination mcp.json + a source MCP server makes the apply fail.
+		// Replace the destination's directory parent after preview to force an apply failure.
 		await fs.mkdir(path.join(projectDir, ".claude", "skills", "wiz-skill"), { recursive: true });
 		await fs.writeFile(path.join(projectDir, ".claude", "skills", "wiz-skill", "SKILL.md"), SKILL_MD);
 		const wizard = new ImportWizard(projectDir, "project", homeDir);
+		const previewReady = Promise.withResolvers<void>();
+		const applyFinished = Promise.withResolvers<void>();
+		wizard.onRequestRender = () => {
+			if (wizard.step === "preview") previewReady.resolve();
+			if (wizard.step === "result") applyFinished.resolve();
+		};
 		const closed: boolean[] = [];
 		wizard.onClose = applied => {
 			closed.push(applied);
 		};
 		for (let i = 0; i < 4; i++) wizard.handleInput("\r");
-		await Bun.sleep(80);
+		await previewReady.promise;
 		expect(wizard.step).toBe("preview");
+		await fs.mkdir(path.join(projectDir, ".gjc"), { recursive: true });
+		await fs.writeFile(path.join(projectDir, ".gjc", "skills"), "not-a-directory");
 		wizard.handleInput("\r"); // apply
-		await Bun.sleep(80);
+		await applyFinished.promise;
 		expect(wizard.step).toBe("result");
-		if (wizard.result?.ok === false) {
-			wizard.handleInput("\r"); // close
-			expect(closed).toEqual([false]);
-		} else {
-			// Apply succeeded: closing reports applied=true honestly.
-			wizard.handleInput("\r");
-			expect(closed).toEqual([true]);
-		}
+		expect(wizard.result?.ok).toBe(false);
+		wizard.handleInput("\r"); // close
+		expect(closed).toEqual([false]);
 	});
 
 	test("preview paging reaches every entry before confirmation", async () => {
@@ -221,8 +230,12 @@ describe("ImportWizard", () => {
 			await fs.writeFile(path.join(projectDir, ".claude", "skills", `skill-${i}`, "SKILL.md"), SKILL_MD);
 		}
 		const wizard = new ImportWizard(projectDir, "project", homeDir);
+		const previewReady = Promise.withResolvers<void>();
+		wizard.onRequestRender = () => {
+			if (wizard.step === "preview") previewReady.resolve();
+		};
 		for (let i = 0; i < 4; i++) wizard.handleInput("\r");
-		await Bun.sleep(80);
+		await previewReady.promise;
 		expect(wizard.step).toBe("preview");
 		const pageOne = wizard.render(80).join("\n");
 		expect(pageOne).toContain("page 1/");
