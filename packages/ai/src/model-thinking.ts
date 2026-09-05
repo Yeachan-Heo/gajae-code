@@ -666,7 +666,7 @@ function inferGeneratedApplyPatchToolType(
 	model: ApiModel<Api>,
 	parsedModel: ParsedModel,
 ): ApiModel<Api>["applyPatchToolType"] {
-	if (parsedModel.family !== "openai" || parsedModel.version.major !== 5) {
+	if (parsedModel.family !== "openai" || (parsedModel.version.major !== 5 && parsedModel.variant !== "astra")) {
 		return undefined;
 	}
 	if (model.provider === "openai" && model.api === "openai-responses") {
@@ -711,6 +711,9 @@ function applyGpt56ContextWindow(model: ApiModel<Api>): boolean {
 }
 
 function applyOpenAICatalogPolicy(model: ApiModel<Api>, parsedModel: OpenAIModel): void {
+	if (parsedModel.variant === "astra") {
+		model.name = "GPT-6 Astra";
+	}
 	if (applyGpt55ContextWindow(model, parsedModel)) {
 		return;
 	}

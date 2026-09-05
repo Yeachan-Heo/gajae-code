@@ -359,6 +359,7 @@ export const TIER_MAP_SKIP_LIST = {
 	"nvidia/poolside/laguna-xs-2.1": { rationale: "post-rebase catalog addition from dev; not yet curated" },
 	"nvidia/thinkingmachines/inkling": { rationale: "post-rebase catalog addition from dev; not yet curated" },
 	"nvidia/upstage/solar-10.7b-instruct": { rationale: "post-rebase catalog addition from dev; not yet curated" },
+	"openai-codex/gpt-6-astra": { rationale: "new frontier model; awaiting measured autorouting calibration" },
 	"openai-codex/gpt-daybreak-blue-latest": { rationale: "post-rebase catalog addition from dev; not yet curated" },
 	"opencode-go/deepseek-v4-flash-vision-exp": {
 		rationale: "post-rebase catalog addition from dev; not yet curated",

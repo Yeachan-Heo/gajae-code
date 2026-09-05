@@ -762,9 +762,14 @@ describe("generated model policies", () => {
 	});
 
 	it("parses the GPT-6 Astra variant as a post-5.6 OpenAI model", () => {
-		const model = createModel({ id: "gpt-6-astra", api: "openai-codex-responses", provider: "openai-codex" });
+		const models: Model<Api>[] = [
+			createModel({ id: "gpt-6-astra", api: "openai-codex-responses", provider: "openai-codex" }),
+		];
+		applyGeneratedModelPolicies(models);
+		const model = models[0]!;
 
 		expect(model.thinking).toEqual({ mode: "effort", minLevel: Effort.Low, maxLevel: Effort.Max });
+		expect(model.applyPatchToolType).toBe("freeform");
 		expect(requireSupportedEffort(model, Effort.Max)).toBe(Effort.Max);
 		expect(() => requireSupportedEffort(model, Effort.Minimal)).toThrow(
 			/Supported efforts: low, medium, high, xhigh, max/,

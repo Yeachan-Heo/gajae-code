@@ -4,7 +4,7 @@
 
 ### Added
 
-- Bundled `openai-codex/gpt-6-astra` (GPT-6-Astra) from `/codex/models` discovery so ChatGPT accounts with Astra access can select it from the static `/model` fallback without a live discovery pass. The entry carries the discovered 272K prompt budget, 128K output cap, text+image input, websocket preference, and low–max reasoning efforts; cost stays zero because no first-party pricing is published. The OpenAI model-id parser now recognizes the `astra` variant, so `gpt-6-astra` receives the post-5.6 effort ladder instead of falling through as an unknown model.
+- Bundled `openai-codex/gpt-6-astra` (GPT-6 Astra) from `/codex/models` discovery so ChatGPT accounts with Astra access can select it from the static `/model` fallback without a live discovery pass. The entry carries the discovered 272K Codex prompt budget, 128K output cap, text+image input, websocket preference, low–max reasoning efforts, freeform `apply_patch` support, and first-party Standard API pricing with the published long-context multiplier. The OpenAI model-id parser now recognizes the `astra` variant, so generated and dynamically discovered entries receive the same policy.
 
 ### Fixed
 
