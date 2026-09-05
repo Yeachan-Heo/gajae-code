@@ -140,7 +140,7 @@ import {
 	removeSessionTransaction,
 	repairProjections,
 	replaceCreationRetirementIntent,
-	rewriteSessionEndpointAuthority,
+	rewriteSessionEndpointAuthorityAndDeletions,
 	rotateClaimedCreationVerifier,
 	startCreationRemote,
 	upgradeCreationRetirementEndpointFileId,
@@ -3782,13 +3782,15 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		};
 	}
 
-	async function assertPersistedSessionAuthority(session: CanonicalSessionSnapshotV1): Promise<void> {
+	async function assertPersistedSessionAuthority(
+		session: CanonicalSessionSnapshotV1,
+	): Promise<CanonicalSessionSnapshotV1> {
 		if (!session.broker.workspace) throw new Error("coordinator_workspace_required");
 		await assertCoordinatorSessionLocations(config, session.cwd, session.broker.workspace, {
 			canonicalizePath: services.canonicalizePath,
 			platform,
 		});
-		await migrateLegacySessionEndpointAuthority(session);
+		return await migrateLegacySessionEndpointAuthority(session);
 	}
 
 	/** Every Codex handoff is scoped by the canonical WAL, never a retained projection. */
@@ -3889,14 +3891,14 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		);
 	}
 
-	async function ensureQuestionTransaction(sessionId: string): Promise<void> {
+	async function ensureQuestionTransaction(sessionId: string): Promise<CanonicalSessionSnapshotV1> {
 		await ensureQuestionStateReady();
 		try {
 			const transaction = await readSessionTransaction(questionPaths, sessionId);
 			if (!transaction) throw new Error("resource_gone");
-			await assertPersistedSessionAuthority(transaction.canonical.session);
+			const currentSession = await assertPersistedSessionAuthority(transaction.canonical.session);
 			await ensureSchedulerRoster(questionPaths, sessionId);
-			return;
+			return currentSession;
 		} catch (error) {
 			if (!(error instanceof Error) || error.message !== "resource_gone") throw error;
 		}
@@ -3919,7 +3921,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		const verifierKeyId = optionalString(projectedVerifier?.key_id);
 		const verifierPublicKey = optionalString(projectedVerifier?.public_key);
 		if (!verifierKeyId || !verifierPublicKey) throw new Error("legacy_projection_quarantined");
-		await createSessionTransaction(
+		const transaction = await createSessionTransaction(
 			questionPaths,
 			{
 				kind: "register",
@@ -3955,6 +3957,23 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			},
 			legacyProjection,
 		);
+		return await assertPersistedSessionAuthority(transaction.canonical.session);
+	}
+
+	/**
+	 * Acquire the session authority only after legacy state has been admitted and
+	 * any endpoint identity migration has committed. Callers must use this
+	 * returned snapshot rather than reading the projection before admission: the
+	 * migration rewrites both the WAL and its projection, and the canonical
+	 * post-image is the only safe attachment input during that transition.
+	 */
+	async function ensureCurrentSession(sessionId: string): Promise<Record<string, unknown> | null> {
+		try {
+			return sessionFromCreationSnapshot(await ensureQuestionTransaction(sessionId));
+		} catch (error) {
+			if (error instanceof Error && error.message === "resource_gone") return null;
+			throw error;
+		}
 	}
 
 	type RuntimeAdmissionToken = {
@@ -5652,7 +5671,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		}
 		if (authority.legacyEndpointIncarnation !== session.broker.endpoint_incarnation)
 			throw new SdkClientError("endpoint_stale", "Coordinator session endpoint authority changed.");
-		const rewritten = await rewriteSessionEndpointAuthority(
+		const rewritten = await rewriteSessionEndpointAuthorityAndDeletions(
 			questionPaths,
 			session.session_id,
 			session.broker.endpoint_incarnation,
@@ -7742,7 +7761,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				const sessionId = args.session_id;
 				if (sessionId) {
 					const canonicalSessionId = safeExternalId("session", sessionId);
-					const session = asRecord(await readJsonFile(sessionFile(canonicalSessionId)));
+					const session = await ensureCurrentSession(canonicalSessionId);
 					const cwd = optionalString(session?.cwd);
 					if (!session || !cwd)
 						return {
@@ -7794,7 +7813,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			}
 			if (name === "gjc_coordinator_read_tail") {
 				const sessionId = safeExternalId("session", args.session_id);
-				const session = asRecord(await readJsonFile(sessionFile(sessionId)));
+				const session = await ensureCurrentSession(sessionId);
 				if (!session)
 					return {
 						ok: false,
@@ -8285,7 +8304,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 							let creationKey: string | null = null;
 							if (reusedSessionId) {
 								sessionId = reusedSessionId;
-								const existing = asRecord(await readJsonFile(sessionFile(sessionId)));
+								const existing = await ensureCurrentSession(sessionId);
 								if (!existing)
 									return {
 										ok: false,
@@ -9181,7 +9200,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					{ session_id: sessionId, allow_mutation: true },
 					async () =>
 						await withSessionTransition(sessionId, async () => {
-							const currentSession = asRecord(await readJsonFile(sessionFile(sessionId)));
+							const currentSession = await ensureCurrentSession(sessionId);
 							if (!currentSession)
 								return {
 									ok: false,
@@ -9295,7 +9314,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					},
 					async () =>
 						await withSessionTransition(sessionId, async () => {
-							const currentSession = asRecord(await readJsonFile(sessionFile(sessionId)));
+							const currentSession = await ensureCurrentSession(sessionId);
 							if (!currentSession) {
 								return {
 									ok: false,
