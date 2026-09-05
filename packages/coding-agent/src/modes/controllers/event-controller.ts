@@ -25,7 +25,7 @@ import type { PlanApprovalDetails } from "../../plan-mode/approved-plan";
 import { completionNotifyDisabledByEnv } from "../../sdk/bus/config";
 import { summaryFromMessage } from "../../sdk/bus/helpers";
 import type { AgentSessionEvent } from "../../session/agent-session";
-import { type CustomMessage, isSilentAbort, readPendingDisplayTag } from "../../session/messages";
+import { type CustomMessage, isSilentAbort, readPendingDisplayTag, SILENT_ABORT_MARKER } from "../../session/messages";
 import { transferSessionMessageIdentity } from "../../session/session-manager";
 import type { ResolveToolDetails } from "../../tools/resolve";
 import { computeIrcSplitWidths, getIrcSidebarSemanticToken } from "../components/irc-sidebar";
@@ -1105,6 +1105,11 @@ export class EventController {
 			}
 			this.#cancelAssistantTextPresentation();
 			const aborted = finalMessage.stopReason === "aborted";
+			const silentAbortPending =
+				aborted && (this.ctx.session.isSilentAbortPending || this.ctx.session.isPlanCompactAbortPending);
+			if (silentAbortPending && !isSilentAbort(finalMessage.errorMessage)) {
+				finalMessage.errorMessage = SILENT_ABORT_MARKER;
+			}
 			const silentlyAborted = aborted && isSilentAbort(finalMessage.errorMessage);
 			const ttsrSilenced = aborted && this.ctx.session.isTtsrAbortPending;
 			if (aborted && !silentlyAborted && !ttsrSilenced) {
