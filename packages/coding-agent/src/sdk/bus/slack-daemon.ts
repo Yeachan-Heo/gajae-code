@@ -58,6 +58,7 @@ function slackPublicationClientMsgId(publicationId: string): string {
 
 // Durable filesystem publication leases must outlast one event-loop and persistence turn.
 const MIN_PUBLICATION_LEASE_MS = 100;
+const INBOUND_REACTION_DEADLINE_MS = 5_000;
 const RETIREMENT_DRAIN_MS = 5_000;
 const INBOUND_REACTION = "eyes";
 
@@ -71,6 +72,8 @@ type SlackProviderWork = {
 	scopeKey: string;
 	invalidate(): Promise<void>;
 	abort(): void;
+	/** Best-effort work is aborted before the graceful shutdown drain. */
+	abortOnStop?: boolean;
 	terminalize(): Promise<void>;
 	settled: Promise<void>;
 };
@@ -363,6 +366,7 @@ export class SlackNotificationDaemon {
 		this.#startedGeneration = undefined;
 		if (this.#providerRunningGeneration === lifecycleGeneration) this.#providerRunningGeneration = undefined;
 		this.#clearLeaseRecoveryTimer();
+		for (const work of this.#workInvalidators) if (work.abortOnStop) work.abort();
 		if (stopProvider) this.#providerStopRequestedGenerations.add(lifecycleGeneration);
 		const providerStop = stopProvider ? Promise.resolve().then(() => this.options.provider.stop()) : undefined;
 		const providerStopResult = providerStop?.then(
@@ -450,6 +454,7 @@ export class SlackNotificationDaemon {
 
 	/** Accepted inbound effects are durably claimed before their Socket Mode ACK. */
 	async handleEnvelope(envelope: SlackSocketEnvelope): Promise<boolean> {
+		const lifecycleGeneration = this.#lifecycleGeneration;
 		if (!text(envelope.envelope_id)) return false;
 		const inbound = messageFromEnvelope(envelope.payload);
 		if (!inbound || inbound.teamId !== this.options.teamId || inbound.channelId !== this.options.channelId) {
@@ -481,11 +486,14 @@ export class SlackNotificationDaemon {
 		try {
 			await this.options.provider.ack(envelope.envelope_id);
 			const messageTs = text(inbound.event.ts);
-			if (messageTs) {
-				void this.options.provider
-					.addReaction({ channel: inbound.channelId, timestamp: messageTs, name: INBOUND_REACTION })
-					.catch(() => undefined);
-			}
+			if (messageTs)
+				this.#scheduleInboundReaction(
+					claim.sessionId,
+					claim.endpoint,
+					inbound.channelId,
+					messageTs,
+					lifecycleGeneration,
+				);
 			return await this.#dispatchInbound(claim);
 		} finally {
 			this.#inflightInbound.delete(inflightKey);
@@ -496,6 +504,76 @@ export class SlackNotificationDaemon {
 	#track<T>(work: Promise<T>): Promise<T> {
 		this.#activeWork.add(work);
 		return work.finally(() => this.#activeWork.delete(work));
+	}
+
+	/** Track the best-effort acknowledgement in the owning attachment's provider-work scope. */
+	#scheduleInboundReaction(
+		sessionId: string,
+		endpoint: SessionAttachment,
+		channel: string,
+		timestamp: string,
+		lifecycleGeneration: number,
+	): void {
+		const scope: SlackProviderWorkScope = {
+			sessionId,
+			endpointGeneration: endpoint.generation,
+			...(endpoint.authorityId === undefined ? {} : { attachmentAuthorityId: endpoint.authorityId }),
+		};
+		const scopeKey = slackProviderWorkScopeKey(scope);
+		const workGeneration = this.#workGeneration;
+		const controller = new AbortController();
+		const settled = Promise.withResolvers<void>();
+		let abortKind: "deadline" | "lifecycle" | undefined;
+		const abort = (kind: "deadline" | "lifecycle"): void => {
+			abortKind ??= kind;
+			controller.abort();
+		};
+		const work: SlackProviderWork = {
+			scopeKey,
+			invalidate: async () => abort("lifecycle"),
+			abort: () => abort("lifecycle"),
+			abortOnStop: true,
+			terminalize: async () => abort("lifecycle"),
+			settled: settled.promise,
+		};
+		this.#workInvalidators.add(work);
+		const reaction = (async () => {
+			const deadline = setTimeout(() => abort("deadline"), INBOUND_REACTION_DEADLINE_MS);
+			try {
+				if (
+					workGeneration !== this.#workGeneration ||
+					lifecycleGeneration !== this.#lifecycleGeneration ||
+					this.#retiredProviderWorkScopes.has(scopeKey) ||
+					!endpoint.isCurrent()
+				) {
+					abort("lifecycle");
+					return;
+				}
+				await this.options.provider.addReaction({
+					channel,
+					timestamp,
+					name: INBOUND_REACTION,
+					signal: controller.signal,
+				});
+				if (abortKind === "deadline")
+					logger.warn(
+						`Slack inbound acknowledgement reaction exceeded the ${INBOUND_REACTION_DEADLINE_MS}ms deadline and was aborted.`,
+					);
+			} catch {
+				if (abortKind !== "lifecycle")
+					logger.warn(
+						abortKind === "deadline"
+							? `Slack inbound acknowledgement reaction exceeded the ${INBOUND_REACTION_DEADLINE_MS}ms deadline and was aborted.`
+							: "Slack inbound acknowledgement reaction failed.",
+					);
+			} finally {
+				clearTimeout(deadline);
+				this.#workInvalidators.delete(work);
+				settled.resolve();
+				this.#tryReleaseRetiredProviderWorkScope(scopeKey);
+			}
+		})();
+		void this.#track(reaction);
 	}
 
 	async #invalidateActiveWork(): Promise<void> {

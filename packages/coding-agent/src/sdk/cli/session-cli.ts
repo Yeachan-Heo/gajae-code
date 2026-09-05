@@ -334,13 +334,14 @@ function throwResponseFailure(response: unknown): void {
 async function paginatedSessionList(
 	router: SessionRouter,
 	input: JsonRecord = {},
-	requestKey = `${SDK_SESSION_CLI_LIFECYCLE_ACTOR.namespace}:session.list`,
+	requestKey = `${SDK_SESSION_CLI_LIFECYCLE_ACTOR.namespace}:session.list:${randomBytes(12).toString("hex")}`,
 ): Promise<unknown> {
 	try {
 		const pages = await traverseSessionList(
 			input,
 			async pageInput => {
-				const response = object(await router.listBrokerSessions(pageInput, requestKey));
+				const cursor = typeof pageInput.cursor === "string" ? pageInput.cursor : "initial";
+				const response = object(await router.listBrokerSessions(pageInput, `${requestKey}:${cursor}`));
 				if (response?.ok === false) {
 					const failure = object(response.error);
 					throw new SdkClientError(
@@ -375,10 +376,10 @@ type SessionRows = {
 	sessions: SdkSessionRowV1[];
 };
 
-async function sessionRows(agentDir: string): Promise<SessionRows> {
+async function sessionRows(agentDir: string, input: JsonRecord = {}): Promise<SessionRows> {
 	await ensureBroker({ agentDir });
 	return await withRouter(agentDir, async router => {
-		const response = await paginatedSessionList(router);
+		const response = await paginatedSessionList(router, input);
 		const result = resultObject(response) ?? {};
 		let sessions: SdkSessionRowV1[];
 		try {
@@ -689,7 +690,7 @@ async function runList(agentDir: string, args: SdkSessionCliArgs): Promise<unkno
 }
 
 async function runInspect(agentDir: string, sessionId: string): Promise<unknown> {
-	const listing = await sessionRows(agentDir);
+	const listing = await sessionRows(agentDir, { resolveSessionId: sessionId });
 	const session = listing.sessions.find(candidate => candidate.sessionId === sessionId);
 	if (!session)
 		throw new SdkSessionCliError("session_unavailable", `Session ${sessionId} is not indexed by the broker.`, 1);
@@ -1671,7 +1672,9 @@ export async function runTail(
 	sessionId: string,
 	args: SdkSessionCliArgs,
 ): Promise<unknown> {
-	const row = (await sessionRows(agentDir)).sessions.find(candidate => candidate.sessionId === sessionId);
+	const row = (await sessionRows(agentDir, { resolveSessionId: sessionId })).sessions.find(
+		candidate => candidate.sessionId === sessionId,
+	);
 	if (!row)
 		throw new SdkSessionCliError("session_unavailable", `Session ${sessionId} is not indexed by the broker.`, 1);
 	if (row.deleted)

@@ -5,7 +5,8 @@ import { AsyncJobManager, type AsyncJobRegisterOptions } from "../../src/async";
 import { Settings } from "../../src/config/settings";
 import { TaskTool } from "../../src/task";
 import * as discoveryModule from "../../src/task/discovery";
-import type { TaskParams } from "../../src/task/types";
+import type { runSubprocess } from "../../src/task/executor";
+import type { SingleResult, TaskParams } from "../../src/task/types";
 import type { ToolSession } from "../../src/tools";
 
 const TEST_AGENTS = [
@@ -96,6 +97,64 @@ describe("task.simple", () => {
 		expect(tool.description).toContain("each `assignment`");
 		expect(tool.description).not.toContain("- `context`:");
 		expect(tool.description).not.toContain("- `schema`:");
+	});
+
+	it("treats only blank caller schemas as absent before effective schema selection", async () => {
+		vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({
+			agents: TEST_AGENTS,
+			projectAgentsDir: null,
+		});
+		const inheritedSchema = {
+			type: "object",
+			properties: { ok: { type: "boolean" } },
+			required: ["ok"],
+		};
+		const observedSchemas: unknown[] = [];
+		const manager = new AsyncJobManager({ maxRunningJobs: 1, onJobComplete: async () => {} });
+		AsyncJobManager.setInstance(manager);
+		const runStub = async (options: Parameters<typeof runSubprocess>[0]) => {
+			observedSchemas.push(options.outputSchema);
+			return {
+				index: options.index,
+				id: options.id,
+				agent: options.agent.name,
+				agentSource: options.agent.source,
+				task: options.task,
+				assignment: options.assignment,
+				description: options.description,
+				exitCode: 0,
+				output: "done",
+				stderr: "",
+				truncated: false,
+				durationMs: 1,
+				tokens: 1,
+			} as SingleResult;
+		};
+		const tool = await TaskTool.create(createSession({}, { outputSchema: inheritedSchema }), {
+			runSubprocess: runStub,
+		});
+
+		for (const [id, schema] of [
+			["Blank", ""],
+			["Whitespace", " \t\n"],
+			["Malformed", "{"],
+		] as const) {
+			const toolCallId = `tool-${id}`;
+			const validatedParams = validateToolArguments(tool, {
+				type: "toolCall",
+				id: toolCallId,
+				name: tool.name,
+				arguments: {
+					agent: "task",
+					schema,
+					tasks: [{ id, description: "label", assignment: id }],
+				},
+			});
+			await tool.execute(toolCallId, validatedParams);
+			await manager.waitForAll();
+		}
+
+		expect(observedSchemas).toEqual([inheritedSchema, inheritedSchema, "{"]);
 	});
 
 	it("keeps spawnPlan available in every simple mode", async () => {

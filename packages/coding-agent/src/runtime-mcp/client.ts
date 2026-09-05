@@ -24,8 +24,8 @@ import {
 	normalizeMcpCacheHints,
 	resolveMCPProtocolPreference,
 } from "./protocol";
-import { createHttpTransport, HttpTransport } from "./transports/http";
-import { createStdioTransport } from "./transports/stdio";
+import { HttpTransport } from "./transports/http";
+import { StdioTransport } from "./transports/stdio";
 import type {
 	MCPDiscoverResultLite,
 	MCPGetPromptParams,
@@ -188,18 +188,18 @@ async function defaultRequestHandler(method: string, _params: unknown): Promise<
 /**
  * Create a transport for the given server config.
  */
-async function createTransport(config: MCPServerConfig): Promise<MCPTransport> {
+function createTransport(config: MCPServerConfig): StdioTransport | HttpTransport {
 	const serverType = config.type ?? "stdio";
 
 	switch (serverType) {
 		case "stdio":
-			return createStdioTransport(config as MCPStdioServerConfig);
+			return new StdioTransport(config as MCPStdioServerConfig);
 		case "http":
-			return createHttpTransport(config as MCPHttpServerConfig);
+			return new HttpTransport(config as MCPHttpServerConfig);
 		case "sse":
 			// Compatibility: `sse` configs use Streamable HTTP, not the legacy MCP SSE
 			// protocol. The configured URL receives JSON-RPC POST requests directly.
-			return createHttpTransport(config as MCPSseServerConfig);
+			return new HttpTransport(config as MCPSseServerConfig);
 		default:
 			throw new Error(`Unknown server type: ${serverType}`);
 	}
@@ -293,6 +293,42 @@ function decodeDiscoverResult(value: unknown): MCPDiscoverResultLite {
 /** Unwrap the original transport failure preserved as MCPExpectedFailure.cause. */
 function unwrapTransportFailure(error: unknown): unknown {
 	return error instanceof MCPExpectedFailure && error.cause !== undefined ? error.cause : error;
+}
+
+function transportFailureCauses(error: unknown): unknown[] {
+	const failure = unwrapTransportFailure(error);
+	return failure instanceof AggregateError ? failure.errors : [failure];
+}
+
+function connectionAndCleanupCause(connectionError: unknown, cleanupError: unknown): AggregateError {
+	return new AggregateError(
+		[...transportFailureCauses(connectionError), ...transportFailureCauses(cleanupError)],
+		"MCP connection failed and transport cleanup also failed",
+	);
+}
+
+function combinedConnectionAndCleanupFailure(connectionError: unknown, cleanupError: unknown): MCPExpectedFailure {
+	return new MCPExpectedFailure(connectionAndCleanupCause(connectionError, cleanupError));
+}
+
+/** Failed connection whose still-owned transport cleanup can be retried explicitly. */
+export class MCPConnectionCleanupFailure extends MCPExpectedFailure {
+	#transport: MCPTransport;
+
+	constructor(cause: unknown, transport: MCPTransport) {
+		super(cause);
+		this.name = "MCPConnectionCleanupFailure";
+		this.#transport = transport;
+	}
+
+	/** Retry the same retained transport cleanup; failures preserve all prior causes. */
+	async close(): Promise<void> {
+		try {
+			await this.#transport.close();
+		} catch (cleanupError) {
+			throw new MCPConnectionCleanupFailure(connectionAndCleanupCause(this, cleanupError), this.#transport);
+		}
+	}
 }
 
 type ModernNegotiation =
@@ -505,14 +541,14 @@ export async function connectToServer(
 	},
 ): Promise<MCPServerConnection> {
 	const timeoutMs = config.timeout ?? CONNECTION_TIMEOUT_MS;
-	let transport: MCPTransport | undefined;
+	let transport: StdioTransport | HttpTransport | undefined;
 	const connectAbort = new AbortController();
 	const connectSignal = options?.signal ? AbortSignal.any([options.signal, connectAbort.signal]) : connectAbort.signal;
 
 	const preference = resolveMCPProtocolPreference(config.protocol);
 
 	const connect = async (): Promise<MCPServerConnection> => {
-		transport = await createTransport(config);
+		transport = createTransport(config);
 		if (options?.onNotification) {
 			transport.onNotification = options.onNotification;
 		}
@@ -561,6 +597,7 @@ export async function connectToServer(
 		};
 
 		try {
+			await transport.connect();
 			// stdio has no per-request HTTP era signals; it stays on the legacy handshake.
 			if ((config.type ?? "stdio") === "stdio") {
 				return await connectLegacy("legacy-forced", "stdio-transport");
@@ -609,8 +646,8 @@ export async function connectToServer(
 		} catch (error) {
 			try {
 				await transport.close();
-			} catch {
-				// Preserve the initialization failure when cleanup also fails.
+			} catch (cleanupError) {
+				throw combinedConnectionAndCleanupFailure(error, cleanupError);
 			}
 			throw error;
 		}
@@ -625,20 +662,26 @@ export async function connectToServer(
 		// abort initialization and wait for transport cleanup before returning.
 		const aborted = options?.signal?.aborted === true;
 		connectAbort.abort(error);
+		let failure = error;
+		let cleanupIncomplete = false;
 		if (transport) {
 			try {
 				await transport.close();
-			} catch {
-				// Preserve the primary connection failure when cleanup also fails.
+			} catch (cleanupError) {
+				failure = combinedConnectionAndCleanupFailure(failure, cleanupError);
+				cleanupIncomplete = true;
 			}
 		}
-		if (error instanceof MCPExpectedFailure) {
-			throw error;
+		if (cleanupIncomplete && transport) {
+			throw new MCPConnectionCleanupFailure(unwrapTransportFailure(failure), transport);
 		}
-		if (aborted || (error instanceof Error && error.message === connectionTimeoutMessage)) {
-			throw new MCPExpectedFailure(error);
+		if (failure instanceof MCPExpectedFailure) {
+			throw failure;
 		}
-		throw error;
+		if (aborted || (failure instanceof Error && failure.message === connectionTimeoutMessage)) {
+			throw new MCPExpectedFailure(failure);
+		}
+		throw failure;
 	}
 }
 

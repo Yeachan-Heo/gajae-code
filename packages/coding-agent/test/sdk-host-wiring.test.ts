@@ -8525,10 +8525,10 @@ for (const attached of [false, true]) {
 		const warned: Array<Record<string, unknown> | undefined> = [];
 		const debugged: Array<Record<string, unknown> | undefined> = [];
 		const warnSpy = spyOn(logger, "warn").mockImplementation((message, context) => {
-			if (message.includes("session_closed")) warned.push(context);
+			if (message.includes("session_closed") && context?.sessionId === sessionId) warned.push(context);
 		});
 		const debugSpy = spyOn(logger, "debug").mockImplementation((message, context) => {
-			if (message.includes("session_closed")) debugged.push(context);
+			if (message.includes("session_closed") && context?.sessionId === sessionId) debugged.push(context);
 		});
 		const pushFrameAndWait = spyOn(NotificationServer.prototype, "pushFrameAndWait").mockResolvedValue(false);
 		process.env.GJC_NOTIFICATIONS = "1";

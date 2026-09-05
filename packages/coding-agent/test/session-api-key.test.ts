@@ -140,22 +140,28 @@ describe("lookupSessionApiKey (#5081)", () => {
 		expect(calls).toEqual(["provider:anthropic:parent-sid:default", "provider:anthropic:none:default"]);
 	});
 
-	it("preserves model baseUrl and completes the full unscoped fallback order", async () => {
+	it("preserves model baseUrl and signal through the full unscoped fallback order", async () => {
+		const controller = new AbortController();
 		const calls: string[] = [];
+		const signals: Array<AbortSignal | undefined> = [];
 		const key = await lookupSessionApiKey(
 			{
-				async getApiKey(model, sessionId) {
+				async getApiKey(model, sessionId, options) {
 					calls.push(`model:${sessionId ?? "none"}:${model.baseUrl}`);
+					signals.push(options?.signal);
 					return undefined;
 				},
-				async getApiKeyForProvider(provider, sessionId, baseUrl) {
+				async getApiKeyForProvider(provider, sessionId, baseUrl, options) {
 					calls.push(`provider:${provider}:${sessionId ?? "none"}:${baseUrl}`);
+					signals.push(options?.signal);
 					return sessionId ? undefined : "provider-token";
 				},
 			},
 			"anthropic",
 			"parent-sid",
 			{ provider: "anthropic", baseUrl: "https://gateway.example" },
+			true,
+			controller.signal,
 		);
 		expect(key.apiKey).toBe("provider-token");
 		expect(calls).toEqual([
@@ -164,6 +170,61 @@ describe("lookupSessionApiKey (#5081)", () => {
 			"model:none:https://gateway.example",
 			"provider:anthropic:none:https://gateway.example",
 		]);
+		expect(signals).toEqual([controller.signal, controller.signal, controller.signal, controller.signal]);
+	});
+
+	it("settles a blocked replacement lookup on cancellation without starting a later lookup", async () => {
+		const controller = new AbortController();
+		const lookupStarted = Promise.withResolvers<AbortSignal>();
+		const abortObserved = Promise.withResolvers<void>();
+		const lookupStopped = Promise.withResolvers<void>();
+		const abortReason = new DOMException("replacement lookup cancelled", "AbortError");
+		const calls: string[] = [];
+		const lookup = lookupSessionApiKey(
+			{
+				async getApiKey(_model, sessionId, options) {
+					calls.push(`model:${sessionId ?? "none"}`);
+					const signal = options?.signal;
+					if (!signal) throw new Error("expected replacement lookup signal");
+					lookupStarted.resolve(signal);
+					const onAbort = (): void => abortObserved.resolve();
+					signal.addEventListener("abort", onAbort, { once: true });
+					try {
+						if (!signal.aborted) await abortObserved.promise;
+					} finally {
+						signal.removeEventListener("abort", onAbort);
+					}
+					try {
+						signal.throwIfAborted();
+						return undefined;
+					} finally {
+						lookupStopped.resolve();
+					}
+				},
+				async getApiKeyForProvider(_provider, sessionId, _baseUrl, options) {
+					calls.push(`provider:${sessionId ?? "none"}`);
+					expect(options?.signal).toBe(controller.signal);
+					return undefined;
+				},
+			},
+			"anthropic",
+			"parent-sid",
+			{ provider: "anthropic" },
+			true,
+			controller.signal,
+		);
+		const settlement = lookup.then(
+			() => "resolved" as const,
+			error => error,
+		);
+
+		const forwardedSignal = await lookupStarted.promise;
+		controller.abort(abortReason);
+		await lookupStopped.promise;
+
+		expect(forwardedSignal).toBe(controller.signal);
+		expect(await settlement).toBe(abortReason);
+		expect(calls).toEqual(["model:parent-sid"]);
 	});
 
 	it("does not widen credential authority after a scoped lookup error", async () => {

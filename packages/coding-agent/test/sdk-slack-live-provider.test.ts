@@ -196,13 +196,64 @@ describe("SlackLiveProvider fake Socket Mode protocol", () => {
 
 	it("adds a reaction through the Slack Web API", async () => {
 		const fixture = setup([response({ ok: true })]);
-		await fixture.provider.addReaction({ channel: "C1", timestamp: "2.0", name: "eyes" });
+		const controller = new AbortController();
+		await fixture.provider.addReaction({
+			channel: "C1",
+			timestamp: "2.0",
+			name: "eyes",
+			signal: controller.signal,
+		});
 		expect(fixture.requests[0]?.url).toBe("https://slack.com/api/reactions.add");
+		expect(fixture.requests[0]?.init?.signal).toBe(controller.signal);
 		expect([...new URLSearchParams(String(fixture.requests[0]?.init?.body))]).toEqual([
 			["channel", "C1"],
 			["timestamp", "2.0"],
 			["name", "eyes"],
 		]);
+	});
+
+	it("aborts an in-flight reaction request through the caller signal", async () => {
+		const requestStarted = Promise.withResolvers<{ url: string; signal: AbortSignal }>();
+		const requestAborted = Promise.withResolvers<void>();
+		const provider = new SlackLiveProvider({
+			appToken: "xapp-secret",
+			botToken: "xoxb-secret",
+			fetch: async (url, init) => {
+				const signal = init?.signal;
+				if (!(signal instanceof AbortSignal)) throw new Error("Reaction request signal missing");
+				requestStarted.resolve({ url, signal });
+				if (!signal.aborted) {
+					const aborted = Promise.withResolvers<void>();
+					const onAbort = (): void => aborted.resolve();
+					signal.addEventListener("abort", onAbort, { once: true });
+					try {
+						await aborted.promise;
+					} finally {
+						signal.removeEventListener("abort", onAbort);
+					}
+				}
+				requestAborted.resolve();
+				signal.throwIfAborted();
+				throw new Error("Reaction request remained live after abort");
+			},
+		});
+		const controller = new AbortController();
+		const reaction = provider.addReaction({
+			channel: "C1",
+			timestamp: "2.0",
+			name: "eyes",
+			signal: controller.signal,
+		});
+		const request = await requestStarted.promise;
+		expect(request.url).toBe("https://slack.com/api/reactions.add");
+		expect(request.signal).toBe(controller.signal);
+
+		controller.abort();
+		await requestAborted.promise;
+		const error = await reaction.catch(caught => caught);
+		expect(error).toBeInstanceOf(SlackProviderError);
+		expect(error).toMatchObject({ code: "connection", operation: "reactions.add" });
+		expect(request.signal.aborted).toBe(true);
 	});
 
 	it("bounds rate-limit retry and exposes no credential in typed errors", async () => {

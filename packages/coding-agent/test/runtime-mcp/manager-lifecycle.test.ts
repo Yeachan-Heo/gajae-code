@@ -868,52 +868,23 @@ setInterval(() => {}, 1000);
 			await rm(cwd, { recursive: true, force: true });
 		}
 	});
-	test("awaits task-owned transport termination when onConnecting throws before publication", async () => {
+	test("does not open a transport when onConnecting throws before authentication resolves", async () => {
 		const manager = new MCPManager(process.cwd());
 		const primaryFailure = new Error("onConnecting failure");
-		const closeRelease = Promise.withResolvers<void>();
-		const closeStarted = Promise.withResolvers<void>();
-		let closeFinished = false;
-		let closeCalls = 0;
-		const connection = makeConnection("late", async () => {
-			closeCalls++;
-			closeStarted.resolve();
-			await closeRelease.promise;
-			closeFinished = true;
-		});
-		const connectSpy = vi.spyOn(mcpClient, "connectToServer").mockResolvedValue(connection);
+		const connectSpy = vi.spyOn(mcpClient, "connectToServer");
 		const listToolsSpy = vi.spyOn(mcpClient, "listTools");
-		let load: Promise<unknown> | undefined;
-
 		try {
-			const activeLoad = manager.connectServers({ late: { type: "http", url: "http://127.0.0.1:1" } }, {}, () => {
-				throw primaryFailure;
-			});
-			load = activeLoad;
-			await closeStarted.promise;
-			expect(manager.getConnectedServers()).toEqual([]);
+			await expect(
+				manager.connectServers({ late: { type: "http", url: "http://127.0.0.1:1" } }, {}, () => {
+					throw primaryFailure;
+				}),
+			).rejects.toBe(primaryFailure);
+			expect(connectSpy).not.toHaveBeenCalled();
 			expect(listToolsSpy).not.toHaveBeenCalled();
-
-			const rejectedAfterCleanup = activeLoad.then(
-				() => {
-					throw new Error("Expected connection startup to reject");
-				},
-				error => {
-					expect(closeFinished).toBe(true);
-					throw error;
-				},
-			);
-			closeRelease.resolve();
-
-			await expect(rejectedAfterCleanup).rejects.toBe(primaryFailure);
-			expect(closeCalls).toBe(1);
 			expect(manager.getConnectedServers()).toEqual([]);
 			expect(manager.getAllServerNames()).toEqual([]);
 			expect(manager.getTools()).toEqual([]);
-			expect(connectSpy).toHaveBeenCalledTimes(1);
 		} finally {
-			closeRelease.resolve();
-			if (load) await load.catch(() => undefined);
 			await manager.disconnectAll();
 			vi.restoreAllMocks();
 		}

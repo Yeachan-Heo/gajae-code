@@ -195,12 +195,15 @@ import { createHash } from "node:crypto";
 import { constants } from "node:fs";
 import { open, realpath, readdir } from "node:fs/promises";
 import { register } from "node:module";
-import { dirname, isAbsolute, relative, resolve } from "node:path";
+import { isAbsolute, relative, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const [entrypointPath, snapshotRoot, authorityPath, expectedAuthorityHash, ...serverArgs] = process.argv.slice(1);
 if (!entrypointPath || !snapshotRoot || !authorityPath || !/^[a-f0-9]{64}$/u.test(expectedAuthorityHash ?? "")) {
 	throw new Error("invalid verified plugin MCP launch metadata");
+}
+if (process.versions.bun || process.release?.name !== "node") {
+	throw new Error("Authenticated plugin MCP wrapper requires Node");
 }
 const flags = constants.O_RDONLY | (typeof constants.O_NOFOLLOW === "number" ? constants.O_NOFOLLOW : 0);
 const sha256 = bytes => createHash("sha256").update(bytes).digest("hex");
@@ -254,6 +257,7 @@ if (sha256(authorityBytes) !== expectedAuthorityHash) throw new Error("plugin MC
 const authority = JSON.parse(authorityBytes.toString("utf8"));
 if (!Array.isArray(authority.files) || authority.files.length === 0) throw new Error("plugin MCP snapshot files are missing");
 const expectedPaths = new Set();
+const authenticatedSources = new Map();
 for (const file of authority.files) {
 	if (!file || typeof file.relativePath !== "string" || !/^[a-f0-9]{64}$/u.test(file.sha256)) throw new Error("plugin MCP snapshot record is malformed");
 	const target = resolveInside(snapshotRoot, file.relativePath, "plugin MCP snapshot file");
@@ -261,6 +265,7 @@ for (const file of authority.files) {
 	expectedPaths.add(target);
 	const bytes = await readStableFile(target, "plugin MCP snapshot file", file.bytes);
 	if (bytes.byteLength !== file.bytes || sha256(bytes) !== file.sha256) throw new Error("plugin MCP snapshot file hash mismatch");
+	authenticatedSources.set(pathToFileURL(target).href, bytes);
 }
 async function verifyTree(directory) {
 	for (const child of await readdir(directory, { withFileTypes: true })) {
@@ -271,78 +276,67 @@ async function verifyTree(directory) {
 }
 await verifyTree(snapshotRoot);
 if (expectedPaths.size !== 0) throw new Error("plugin MCP snapshot is incomplete");
+const entrypointUrl = pathToFileURL(entrypointPath).href;
+if (!authenticatedSources.has(entrypointUrl)) throw new Error("plugin MCP entrypoint is not authenticated");
 
-if (process.versions.bun) {
-	try {
-		Object.defineProperty(globalThis, "require", { value: undefined, configurable: false, writable: false });
-	} catch {
-		throw new Error("plugin MCP CommonJS loader could not be disabled");
-	}
-	if (typeof process.getBuiltinModule === "function") {
-		const getBuiltinModule = process.getBuiltinModule.bind(process);
-		process.getBuiltinModule = name => {
-			if (name === "module" || name === "node:module") throw new Error("plugin MCP module loader access is not allowed");
-			return getBuiltinModule(name);
-		};
-	}
-	let resolving = false;
-	Bun.plugin({
-		name: "gjc:verified-plugin-mcp",
-		setup(build) {
-			for (const namespace of ["node", "file"]) {
-				build.onResolve({ filter: /^(?:node:)?module$/u, namespace }, () => {
-					throw new Error("plugin MCP module loader access is not allowed");
-				});
-			}
-			build.onResolve({ filter: /.*/ }, args => {
-				if (resolving) return undefined;
-				if (args.path === "module" || args.path === "node:module") throw new Error("plugin MCP module loader access is not allowed");
-				if (args.path.startsWith("node:") || args.path.startsWith("bun:")) return undefined;
-				try {
-					resolving = true;
-					const importerDir = args.importer ? dirname(args.importer) : process.cwd();
-					const resolvedPath = Bun.resolveSync(args.path, importerDir);
-					if (resolvedPath.startsWith("node:") || resolvedPath.startsWith("bun:")) return undefined;
-					if (!isAbsolute(resolvedPath) || !isWithin(snapshotRoot, resolvedPath)) throw new Error("plugin MCP import escapes its authenticated snapshot: " + args.path);
-					return { path: resolvedPath };
-				} finally {
-					resolving = false;
-				}
-			});
-		},
-	});
-} else {
-	if (typeof process.getBuiltinModule === "function") {
-		const getBuiltinModule = process.getBuiltinModule.bind(process);
-		process.getBuiltinModule = name => {
-			if (name === "module" || name === "node:module") throw new Error("plugin MCP module loader access is not allowed");
-			return getBuiltinModule(name);
-		};
-	}
-	const loader = [
-		'import { isAbsolute, relative } from "node:path";',
-		'import { fileURLToPath } from "node:url";',
-		'let root;',
-		'export function initialize(data) { root = data.snapshotRoot; }',
-		'const within = target => { const rel = relative(root, target); return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel)); };',
-		'export async function resolve(specifier, context, nextResolve) {',
-		'  if (specifier === "module" || specifier === "node:module") throw new Error("plugin MCP module loader access is not allowed");',
-		'  const result = await nextResolve(specifier, context);',
-		'  if (result.url.startsWith("node:")) return result;',
-		'  if (!result.url.startsWith("file:") || !within(fileURLToPath(result.url))) throw new Error("plugin MCP import escapes its authenticated snapshot: " + specifier);',
-		'  return result;',
-		'}',
-		'export async function load(url, context, nextLoad) {',
-		'  const result = await nextLoad(url, context);',
-		'  if (result.format === "commonjs" || result.format === "addon") throw new Error("plugin MCP CommonJS/native modules are not supported");',
-		'  return result;',
-		'}',
-	].join("\\n");
-	register("data:text/javascript," + encodeURIComponent(loader), { parentURL: import.meta.url, data: { snapshotRoot } });
+if (typeof process.getBuiltinModule === "function") {
+	const getBuiltinModule = process.getBuiltinModule.bind(process);
+	process.getBuiltinModule = name => {
+		if (name === "module" || name === "node:module") throw new Error("plugin MCP module loader access is not allowed");
+		return getBuiltinModule(name);
+	};
 }
+const loader = [
+	'import { isAbsolute, relative } from "node:path";',
+	'import { fileURLToPath } from "node:url";',
+	'let root;',
+	'let sources;',
+	'export function initialize(data) {',
+	'  root = data.snapshotRoot;',
+	'  sources = new Map(data.authenticatedSources);',
+	'  if (sources.size === 0) throw new Error("plugin MCP authenticated module bytes are missing");',
+	'}',
+	'const within = target => { const rel = relative(root, target); return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel)); };',
+	'const directFileUrl = (specifier, parentURL) => {',
+	'  if (specifier.startsWith("file:")) return new URL(specifier).href;',
+	'  if (!specifier.startsWith("./") && !specifier.startsWith("../") && !specifier.startsWith("/")) return undefined;',
+	'  if (!parentURL?.startsWith("file:")) throw new Error("plugin MCP file import has no authenticated parent: " + specifier);',
+	'  return new URL(specifier, parentURL).href;',
+	'};',
+	'const authenticatedFormat = format => {',
+	'  if (format === "commonjs" || format === "commonjs-typescript" || format === "addon") throw new Error("plugin MCP CommonJS/native modules are not supported");',
+	'  if (format !== "module" && format !== "module-typescript" && format !== "json" && format !== "wasm") throw new Error("plugin MCP module format is not supported: " + String(format));',
+	'  return format;',
+	'};',
+	'export async function resolve(specifier, context, nextResolve) {',
+	'  if (specifier === "module" || specifier === "node:module") throw new Error("plugin MCP module loader access is not allowed");',
+	'  const expectedUrl = directFileUrl(specifier, context.parentURL);',
+	'  const result = await nextResolve(specifier, context);',
+	'  if (result.url === "node:module") throw new Error("plugin MCP module loader access is not allowed");',
+	'  if (result.url.startsWith("node:")) return result;',
+	'  if (!result.url.startsWith("file:") || !within(fileURLToPath(result.url))) throw new Error("plugin MCP import escapes its authenticated snapshot: " + specifier);',
+	'  if (expectedUrl !== undefined && result.url !== expectedUrl) throw new Error("plugin MCP module identity drifted during resolution: " + specifier);',
+	'  if (!sources.has(result.url)) throw new Error("plugin MCP import is not an authenticated snapshot module: " + specifier);',
+	'  authenticatedFormat(result.format);',
+	'  return result;',
+	'}',
+	'export async function load(url, context, nextLoad) {',
+	'  if (url === "node:module") throw new Error("plugin MCP module loader access is not allowed");',
+	'  if (url.startsWith("node:")) return nextLoad(url, context);',
+	'  if (!url.startsWith("file:") || !within(fileURLToPath(url))) throw new Error("plugin MCP module load escapes its authenticated snapshot: " + url);',
+	'  const source = sources.get(url);',
+	'  if (source === undefined) throw new Error("plugin MCP module load is not authenticated: " + url);',
+	'  return { format: authenticatedFormat(context.format), source: Uint8Array.from(source).buffer, shortCircuit: true };',
+	'}',
+].join("\\n");
+register("data:text/javascript," + encodeURIComponent(loader), {
+	parentURL: import.meta.url,
+	data: { snapshotRoot, authenticatedSources: [...authenticatedSources] },
+});
+authenticatedSources.clear();
 
 process.argv = [process.execPath, entrypointPath, ...serverArgs];
-await import(pathToFileURL(entrypointPath).href);
+await import(entrypointUrl);
 `;
 
 async function readStableFile(
@@ -557,12 +551,17 @@ async function prepareVerifiedStdioLaunch(input: {
 	snapshotBaseReal: string;
 	files: readonly GjcPluginRegistryEntry["copiedFiles"][number][];
 	serverArgs: readonly string[];
+	registerCleanup?: (cleanup: () => Promise<void>) => void;
 }): Promise<MCPStdioPreparedLaunch> {
-	if (process.platform === "win32") {
-		throw new Error("Authenticated plugin MCP stdio launch capsules are unavailable on Windows");
+	if (process.platform !== "linux") {
+		throw new Error("Authenticated plugin MCP stdio launch capsules are available only on Linux");
 	}
 	if (input.launcher === "bun") {
 		throw new Error("Authenticated plugin MCP Bun launch capsules are unavailable");
+	}
+	const registerCleanup = input.registerCleanup;
+	if (!registerCleanup) {
+		throw new Error("Authenticated plugin MCP capsule cleanup ownership is unavailable");
 	}
 	if (input.files.length === 0 || input.files.length > MCP_SNAPSHOT_MAX_FILES) {
 		throw new Error(`Plugin MCP snapshot file count exceeds ${MCP_SNAPSHOT_MAX_FILES}`);
@@ -581,71 +580,70 @@ async function prepareVerifiedStdioLaunch(input: {
 		input.snapshotBaseReal,
 		`gjc-plugin-mcp-${process.pid}-${randomBytes(16).toString("hex")}`,
 	);
+	let cleanupComplete = false;
+	let capsuleCreated = false;
+	const cleanup = async () => {
+		if (cleanupComplete || !capsuleCreated) return;
+		await fs.rm(capsuleRoot, { recursive: true, force: true });
+		cleanupComplete = true;
+	};
+	registerCleanup(cleanup);
+
 	const snapshotRoot = path.join(capsuleRoot, "bundle");
 	const authorityPath = path.join(capsuleRoot, "authority.json");
 	const launcherPath = path.join(capsuleRoot, input.launcher);
-	try {
-		await fs.mkdir(capsuleRoot, { mode: 0o700 });
-		await fs.mkdir(snapshotRoot, { mode: 0o700 });
-		if ((await fs.realpath(capsuleRoot)) !== capsuleRoot) throw new Error("Plugin MCP launch capsule path drifted");
+	await fs.mkdir(capsuleRoot, { mode: 0o700 });
+	capsuleCreated = true;
+	await fs.mkdir(snapshotRoot, { mode: 0o700 });
+	if ((await fs.realpath(capsuleRoot)) !== capsuleRoot) throw new Error("Plugin MCP launch capsule path drifted");
 
-		const launcherBytes = await readStableFile(
-			input.launcherPath,
-			"Plugin MCP interpreter",
-			MCP_LAUNCHER_MAX_BYTES,
-			true,
-		);
-		const launcherReal = await fs.realpath(input.launcherPath);
-		const expectedLauncherHash = (await initialNodeAuthorities).get(launcherReal);
-		if (!expectedLauncherHash || sha256(launcherBytes) !== expectedLauncherHash) {
-			throw new Error("Plugin MCP Node interpreter drifted from startup authority");
-		}
-		await fs.writeFile(launcherPath, launcherBytes, { flag: "wx", mode: 0o500 });
-		await assertCapturedNodeRuntime(launcherPath);
-
-		for (const file of input.files) {
-			const sourcePath = resolveWithinRoot(input.pluginRoot, file.relativePath);
-			const sourceReal = await fs.realpath(sourcePath);
-			const pluginRootReal = await fs.realpath(input.pluginRoot);
-			if (!isWithin(pluginRootReal, sourceReal))
-				throw new Error(`Plugin MCP source escapes installed root: ${file.relativePath}`);
-			const bytes = await readStableFile(
-				sourceReal,
-				`Plugin MCP source ${file.relativePath}`,
-				MCP_SNAPSHOT_MAX_BYTES,
-			);
-			if (bytes.byteLength !== file.bytes || sha256(bytes) !== file.sha256) {
-				throw new Error(`Plugin MCP source hash drift: ${file.relativePath}`);
-			}
-			const destination = resolveWithinRoot(snapshotRoot, file.relativePath);
-			await fs.mkdir(path.dirname(destination), { recursive: true, mode: 0o700 });
-			await fs.writeFile(destination, bytes, { flag: "wx", mode: 0o400 });
-		}
-
-		const authorityBytes = Buffer.from(canonicalPersistedJson({ files: input.files }));
-		await fs.writeFile(authorityPath, authorityBytes, { flag: "wx", mode: 0o400 });
-		const cwd = input.cwdRelative === "" ? snapshotRoot : resolveWithinRoot(snapshotRoot, input.cwdRelative);
-		await fs.mkdir(cwd, { recursive: true, mode: 0o500 });
-		const entrypointPath = resolveWithinRoot(snapshotRoot, input.entrypointRelative);
-		return {
-			command: launcherPath,
-			args: verifiedStdioArgs({
-				launcher: input.launcher,
-				entrypointPath,
-				snapshotRoot,
-				authorityPath,
-				authorityHash: sha256(authorityBytes),
-				serverArgs: input.serverArgs,
-			}),
-			cwd,
-			afterProcessExit: async () => {
-				await fs.rm(capsuleRoot, { recursive: true, force: true });
-			},
-		};
-	} catch (error) {
-		await fs.rm(capsuleRoot, { recursive: true, force: true }).catch(() => {});
-		throw error;
+	const launcherBytes = await readStableFile(
+		input.launcherPath,
+		"Plugin MCP interpreter",
+		MCP_LAUNCHER_MAX_BYTES,
+		true,
+	);
+	const launcherReal = await fs.realpath(input.launcherPath);
+	const expectedLauncherHash = (await initialNodeAuthorities).get(launcherReal);
+	if (!expectedLauncherHash || sha256(launcherBytes) !== expectedLauncherHash) {
+		throw new Error("Plugin MCP Node interpreter drifted from startup authority");
 	}
+	await fs.writeFile(launcherPath, launcherBytes, { flag: "wx", mode: 0o500 });
+	await assertCapturedNodeRuntime(launcherPath);
+
+	for (const file of input.files) {
+		const sourcePath = resolveWithinRoot(input.pluginRoot, file.relativePath);
+		const sourceReal = await fs.realpath(sourcePath);
+		const pluginRootReal = await fs.realpath(input.pluginRoot);
+		if (!isWithin(pluginRootReal, sourceReal))
+			throw new Error(`Plugin MCP source escapes installed root: ${file.relativePath}`);
+		const bytes = await readStableFile(sourceReal, `Plugin MCP source ${file.relativePath}`, MCP_SNAPSHOT_MAX_BYTES);
+		if (bytes.byteLength !== file.bytes || sha256(bytes) !== file.sha256) {
+			throw new Error(`Plugin MCP source hash drift: ${file.relativePath}`);
+		}
+		const destination = resolveWithinRoot(snapshotRoot, file.relativePath);
+		await fs.mkdir(path.dirname(destination), { recursive: true, mode: 0o700 });
+		await fs.writeFile(destination, bytes, { flag: "wx", mode: 0o400 });
+	}
+
+	const authorityBytes = Buffer.from(canonicalPersistedJson({ files: input.files }));
+	await fs.writeFile(authorityPath, authorityBytes, { flag: "wx", mode: 0o400 });
+	const cwd = input.cwdRelative === "" ? snapshotRoot : resolveWithinRoot(snapshotRoot, input.cwdRelative);
+	await fs.mkdir(cwd, { recursive: true, mode: 0o500 });
+	const entrypointPath = resolveWithinRoot(snapshotRoot, input.entrypointRelative);
+	return {
+		command: launcherPath,
+		args: verifiedStdioArgs({
+			launcher: input.launcher,
+			entrypointPath,
+			snapshotRoot,
+			authorityPath,
+			authorityHash: sha256(authorityBytes),
+			serverArgs: input.serverArgs,
+		}),
+		cwd,
+		afterProcessExit: cleanup,
+	};
 }
 
 async function assertCapturedNodeRuntime(launcherPath: string): Promise<void> {
@@ -1096,6 +1094,9 @@ export async function buildPluginMcpConfigs(input: { cwd: string }): Promise<{
 				}
 				assertMcpInstallPolicy(cfg, { pluginRoot: entry.pluginRoot });
 				if (cfg.transport === "stdio") {
+					if (process.platform !== "linux") {
+						throw new Error("Authenticated plugin MCP stdio launch capsules are available only on Linux");
+					}
 					const invocation = classifyStdioInvocation(cfg, { pluginRoot: entry.pluginRoot });
 					for (const relativePath of invocation.ownedRelativePaths) {
 						const ownedFile = entry.copiedFiles.find(
@@ -1121,8 +1122,6 @@ export async function buildPluginMcpConfigs(input: { cwd: string }): Promise<{
 						timeout: 5_000,
 						// Third-party plugin MCP processes must not inherit host secrets;
 						// only a minimal OS allowlist (PATH/HOME/temp/locale) is provided.
-						// Bun additionally receives an immutable empty config plus flags
-						// that disable ambient dotenv and package auto-install behavior.
 						noInheritEnv: true,
 						prepareSpawn: async (launch: MCPStdioSpawnLaunch) => {
 							const [launchCwdReal, expectedInitialCwdReal] = await Promise.all([
@@ -1197,6 +1196,7 @@ export async function buildPluginMcpConfigs(input: { cwd: string }): Promise<{
 								snapshotBaseReal,
 								files: entry.copiedFiles,
 								serverArgs: (freshSurface.config.args ?? []).slice(1),
+								registerCleanup: launch.registerCleanup,
 							});
 						},
 					};

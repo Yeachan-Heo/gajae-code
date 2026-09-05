@@ -10,8 +10,17 @@ export type SessionApiKeyModel = {
 };
 
 export type SessionApiKeyRegistry = {
-	getApiKey(model: SessionApiKeyModel, sessionId?: string): Promise<string | undefined>;
-	getApiKeyForProvider(provider: string, sessionId?: string, baseUrl?: string): Promise<string | undefined>;
+	getApiKey(
+		model: SessionApiKeyModel,
+		sessionId?: string,
+		options?: { signal?: AbortSignal },
+	): Promise<string | undefined>;
+	getApiKeyForProvider(
+		provider: string,
+		sessionId?: string,
+		baseUrl?: string,
+		options?: { signal?: AbortSignal },
+	): Promise<string | undefined>;
 };
 
 export type SessionApiKeyResolution = {
@@ -43,11 +52,20 @@ async function lookupOnce(
 	provider: string,
 	sessionId: string | undefined,
 	model: SessionApiKeyModel | undefined,
+	signal: AbortSignal | undefined,
 ): Promise<string | undefined> {
+	signal?.throwIfAborted();
 	const matchingModel = model?.provider === provider ? model : undefined;
+	const options = signal ? { signal } : undefined;
 	let key: string | undefined;
-	if (matchingModel) key = await registry.getApiKey(matchingModel, sessionId);
-	if (!key) key = await registry.getApiKeyForProvider(provider, sessionId, matchingModel?.baseUrl);
+	if (matchingModel) {
+		key = await registry.getApiKey(matchingModel, sessionId, options);
+		signal?.throwIfAborted();
+	}
+	if (!key) {
+		key = await registry.getApiKeyForProvider(provider, sessionId, matchingModel?.baseUrl, options);
+		signal?.throwIfAborted();
+	}
 	return key;
 }
 
@@ -57,13 +75,14 @@ export async function lookupSessionApiKey(
 	sessionId: string | undefined,
 	model: SessionApiKeyModel | undefined,
 	allowUnscopedRetry = true,
+	signal?: AbortSignal,
 ): Promise<SessionApiKeyResolution> {
-	let key = await lookupOnce(registry, provider, sessionId, model);
+	let key = await lookupOnce(registry, provider, sessionId, model, signal);
 	// Architect children inherit the parent SID. Direct `-p --no-session` does
 	// not. Scoped miss then global/broker hit is the remaining 0-token death
 	// after #5105 (jsonl: Agent run failed / output 0).
 	if (!key && sessionId && allowUnscopedRetry) {
-		key = await lookupOnce(registry, provider, undefined, model);
+		key = await lookupOnce(registry, provider, undefined, model, signal);
 		if (key) return { apiKey: key, credentialSessionId: undefined };
 	}
 	if (!key) {

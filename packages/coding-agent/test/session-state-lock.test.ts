@@ -47,6 +47,7 @@ afterEach(async () => {
 	SessionStateLockTestHooks.afterLockTypeDecision = undefined;
 	SessionStateLockTestHooks.afterTransitionStaleInspection = undefined;
 	SessionStateLockTestHooks.beforeTransitionStaleRemoval = undefined;
+	SessionStateLockTestHooks.afterTransitionClaimContention = undefined;
 	SessionStateLockTestHooks.beforeLegacyDirectoryRemoval = undefined;
 	SessionStateLockTestHooks.afterLegacyDirectoryStaleVerdict = undefined;
 	SessionStateLockTestHooks.ownerAccessStrategy = undefined;
@@ -57,6 +58,7 @@ afterEach(async () => {
 	SessionStateLockTestHooks.legacyOwnerHostId = undefined;
 	SessionStateLockTestHooks.unqualifiedOwnerIsLocal = undefined;
 	SessionStateLockTestHooks.beforeCurrentOwnerRelease = undefined;
+	SessionStateLockTestHooks.afterLocalTransitionQueued = undefined;
 	SessionStateLockTestHooks.afterCurrentOwnerValidation = undefined;
 	SessionStateLockTestHooks.beforeOwnerRecordRewrite = undefined;
 	SessionStateLockTestHooks.beforeTransitionReleaseLstat = undefined;
@@ -1236,6 +1238,99 @@ describe("coordinator session state lock", () => {
 		releaseFirst.resolve();
 		await Promise.all([first, second]);
 		expect(order).toEqual(["first-entered", "first-released", "second-entered"]);
+	});
+
+	it("does not charge same-process transition waits against reused-tombstone release", async () => {
+		const { stateFile } = await seededRunningSession("lock-released-tombstone-local-transition");
+		await withSessionStateFileLock(stateFile, async () => undefined);
+		const lockFile = `${stateFile}.lock`;
+		const transitionDir = `${lockFile}.transition`;
+		const firstEntered = Promise.withResolvers<void>();
+		const releaseFirst = Promise.withResolvers<void>();
+		const blockerClaimed = Promise.withResolvers<void>();
+		const releaseWaiting = Promise.withResolvers<void>();
+		const finishBlocker = Promise.withResolvers<void>();
+		const allowDiskContention = Promise.withResolvers<void>();
+		const order: string[] = [];
+		const first = withSessionStateFileLock(stateFile, async () => {
+			order.push("first-entered");
+			firstEntered.resolve();
+			await releaseFirst.promise;
+			order.push("first-released");
+		});
+		await firstEntered.promise;
+		let monotonicNow = 0;
+		const now = vi.spyOn(performance, "now").mockImplementation(() => monotonicNow);
+		let blocker: Promise<void> | undefined;
+
+		try {
+			SessionStateLockTestHooks.beforeCurrentOwnerRelease = async target => {
+				if (target !== `${transitionDir}.owner`) return;
+				SessionStateLockTestHooks.beforeCurrentOwnerRelease = undefined;
+				blockerClaimed.resolve();
+				await finishBlocker.promise;
+			};
+			SessionStateLockTestHooks.afterLocalTransitionQueued = target => {
+				if (target === transitionDir) releaseWaiting.resolve();
+			};
+			SessionStateLockTestHooks.afterTransitionClaimContention = async target => {
+				if (target !== transitionDir) return;
+				releaseWaiting.resolve();
+				await allowDiskContention.promise;
+			};
+			blocker = reclaimStaleSessionStateLock(lockFile);
+
+			await blockerClaimed.promise;
+			releaseFirst.resolve();
+			await releaseWaiting.promise;
+			monotonicNow = 2_100;
+			finishBlocker.resolve();
+			allowDiskContention.resolve();
+			await Promise.all([blocker, first]);
+			await withSessionStateFileLock(stateFile, async () => {
+				order.push("second-entered");
+			});
+			expect(order).toEqual(["first-entered", "first-released", "second-entered"]);
+			expect((await readJson(lockFile)).released).toBe(true);
+		} finally {
+			releaseFirst.resolve();
+			finishBlocker.resolve();
+			allowDiskContention.resolve();
+			now.mockRestore();
+			await Promise.allSettled(blocker ? [blocker, first] : [first]);
+		}
+	});
+
+	it("keeps the transition timeout fail-closed for an unregistered live claim", async () => {
+		const { stateFile } = await seededRunningSession("lock-unregistered-live-transition-timeout");
+		const transitionDir = `${stateFile}.lock.transition`;
+		await fs.mkdir(transitionDir);
+		await fs.writeFile(
+			`${transitionDir}.owner`,
+			JSON.stringify({
+				pid: process.pid,
+				start_time: processStartTime(process.pid) ?? "unknown",
+				token: "unregistered-live-transition",
+				owner_host_id: "local-host",
+			}),
+		);
+		let monotonicNow = 0;
+		SessionStateLockTestHooks.afterTransitionClaimContention = target => {
+			if (target === transitionDir) monotonicNow = 2_100;
+		};
+		const now = vi.spyOn(performance, "now").mockImplementation(() => monotonicNow);
+		try {
+			await expect(withSessionStateFileLock(stateFile, async () => "unreachable")).rejects.toMatchObject({
+				lockPath: transitionDir,
+				reason: "transition_claim_timeout",
+			});
+			expect(fsSync.existsSync(transitionDir)).toBe(true);
+			expect(fsSync.existsSync(`${transitionDir}.owner`)).toBe(true);
+		} finally {
+			now.mockRestore();
+			await fs.rm(`${transitionDir}.owner`, { force: true });
+			await fs.rmdir(transitionDir).catch(() => undefined);
+		}
 	});
 
 	it("serializes cross-process writers that reuse a released state tombstone", async () => {

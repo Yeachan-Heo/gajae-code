@@ -92,10 +92,10 @@ function brokerSessionRows(sessions: readonly unknown[]): BrokerSessionRow[] {
 }
 
 /** Exhausts strict broker `session.list` pages into one full session snapshot. */
-export async function listBrokerSessions(broker: SdkClient): Promise<BrokerSessionRow[]> {
+export async function listBrokerSessions(broker: SdkClient, explicitSessionId?: string): Promise<BrokerSessionRow[]> {
 	try {
 		const pages = await traverseSessionList(
-			{},
+			{ ...(explicitSessionId ? { resolveSessionId: explicitSessionId } : {}) },
 			async input => await broker.global("session.list", input),
 			response => {
 				brokerResult(response);
@@ -147,7 +147,7 @@ export async function runSdkServe(argv: string[]): Promise<void> {
 		throw new Error("broker_unavailable: SDK broker is not reachable");
 	}
 	try {
-		const sessionId = selectBrokerSession(await listBrokerSessions(broker), parsed.sessionId);
+		const sessionId = selectBrokerSession(await listBrokerSessions(broker, parsed.sessionId), parsed.sessionId);
 		const endpoint = brokerResult(await broker.global("session.get_endpoint", { sessionId }));
 		const url = typeof endpoint.url === "string" && endpoint.url ? endpoint.url : undefined;
 		const token = typeof endpoint.token === "string" ? endpoint.token : "";
