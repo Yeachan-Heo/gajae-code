@@ -118,7 +118,7 @@ function sanitizeAgentFailure(error: unknown, runtimeClassifiedCode?: string): {
 }
 
 /** Only runtime-authenticated built-in constructors may contribute a name. */
-const TRUSTED_ERROR_CONSTRUCTORS = new Map<Function, string>([
+const TRUSTED_ERROR_CONSTRUCTORS = new Map<object, string>([
 	[Error, "Error"],
 	[TypeError, "TypeError"],
 	[RangeError, "RangeError"],

@@ -544,8 +544,9 @@ describe("GLM ZCode OAuth login provider", () => {
 			typeof buildAnthropicClientOptions
 		>[0]["model"];
 		const resolved = buildAnthropicClientOptions({ model, apiKey: MINTED_KEY });
-		expect(resolved.defaultHeaders?.["User-Agent"]).toBe("ZCode/3.1.2");
-		expect(resolved.defaultHeaders?.["X-ZCode-Agent"]).toBe("glm");
+		const defaultHeaders = new Headers(resolved.defaultHeaders);
+		expect(defaultHeaders.get("user-agent")).toBe("ZCode/3.1.2");
+		expect(defaultHeaders.get("x-zcode-agent")).toBe("glm");
 	});
 
 	it("does NOT attach ZCode source headers when the flag is off (e.g. legacy zai)", () => {

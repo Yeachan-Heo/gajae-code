@@ -105,21 +105,22 @@ describe("JetBrains Junie provider", () => {
 		expect(resolved.authToken).toBeNull();
 		expect(resolved.isOAuthToken).toBe(false);
 		expect(resolved.baseURL).toBe(JUNIE_BASE_URL);
-		expect(resolved.defaultHeaders?.Authorization).toBe(`Bearer ${API_KEY}`);
-		expect(resolved.defaultHeaders?.["X-LLM-Model"]).toBe("anthropic");
+		const defaultHeaders = new Headers(resolved.defaultHeaders);
+		expect(defaultHeaders.get("authorization")).toBe(`Bearer ${API_KEY}`);
+		expect(defaultHeaders.get("x-llm-model")).toBe("anthropic");
 	});
 
 	it("drives the request from JUNIE_API_KEY alone, with no explicit apiKey argument", async () => {
 		const realFetch = globalThis.fetch;
 		let requestUrl = "";
-		let authorization = "";
-		let hasApiKeyHeader = true;
+		let requestHeaders = new Headers();
 
 		globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
 			requestUrl = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
-			const headers = new Headers(init?.headers);
-			authorization = headers.get("authorization") ?? "";
-			hasApiKeyHeader = headers.has("x-api-key");
+			requestHeaders = new Headers(input instanceof Request ? input.headers : undefined);
+			new Headers(init?.headers).forEach((value, key) => {
+				requestHeaders.set(key, value);
+			});
 			// Short-circuit: the assertion target is the outbound request, not the reply.
 			return new Response(JSON.stringify({ type: "error", error: { type: "halted" } }), { status: 418 });
 		}) as typeof globalThis.fetch;
@@ -138,8 +139,9 @@ describe("JetBrains Junie provider", () => {
 		}
 
 		expect(requestUrl).toBe(`${JUNIE_BASE_URL}/v1/messages`);
-		expect(authorization).toBe(`Bearer ${API_KEY}`);
-		expect(hasApiKeyHeader).toBe(false);
+		expect(requestHeaders.get("authorization")).toBe(`Bearer ${API_KEY}`);
+		expect(requestHeaders.has("x-api-key")).toBe(false);
+		expect(requestHeaders.get("x-llm-model")).toBe("anthropic");
 	});
 
 	it("tells the user where to get a key, and does not offer a login flow", () => {

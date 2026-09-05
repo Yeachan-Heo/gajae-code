@@ -3,7 +3,6 @@ import * as fs from "node:fs/promises";
 import path from "node:path";
 import {
 	cleanupFixtureRoot,
-	cleanupFixtureRootAfterLateWrite,
 	cleanupFixtureRoots,
 	createFixtureBrokerEnvironment,
 	createFixtureRootCleanup,
@@ -99,27 +98,47 @@ describe("fixture broker root cleanup", () => {
 		expect(events).toEqual(["shutdown", "dispose", "lease", "lease"]);
 	});
 
-	it("removes one late recreation but still rejects a persistent fixture writer", async () => {
-		const recoveredRoot = await temp();
-		const recovered = createFixtureRootCleanup(recoveredRoot, path.join(recoveredRoot, "agent"), lease([]));
-		let recoveredProbes = 0;
-		await cleanupFixtureRootAfterLateWrite(recovered, {
-			absenceObservationMs: 0,
-			rootExists: async () => recoveredProbes++ === 0,
+	it("rejects one post-disposal root recreation before any second removal", async () => {
+		const root = await temp();
+		const events: string[] = [];
+		const cleanup = createFixtureRootCleanup(root, path.join(root, "agent"), lease(events));
+		registerFixtureRuntime(cleanup, {
+			key: "runtime",
+			requiredOwner: "runtime-and-broker",
+			shutdown: async () => void events.push("shutdown"),
+			dispose: async () => void events.push("dispose"),
 		});
-		expect(recovered.recreation?.detail).toBe("fixture root reappeared");
-		expect(fixtureRootForTest(recoveredRoot)).toBeUndefined();
-
-		const persistentRoot = await temp();
-		const persistent = createFixtureRootCleanup(persistentRoot, path.join(persistentRoot, "agent"), lease([]));
+		let absenceProbes = 0;
+		let removeAttempts = 0;
 		await expect(
-			cleanupFixtureRootAfterLateWrite(persistent, {
+			cleanupFixtureRoot(cleanup, {
 				absenceObservationMs: 0,
-				rootExists: async () => true,
+				removeRoot: async () => {
+					removeAttempts++;
+					events.push("remove");
+				},
+				rootExists: async () => {
+					events.push("absent");
+					return absenceProbes++ === 0;
+				},
 			}),
 		).rejects.toThrow("recreated");
-		expect(persistent.phases.rootRemove).toBe("pending");
-		await cleanupFixtureRoot(persistent, { absenceObservationMs: 0, rootExists: async () => false });
+		expect(events).toEqual(["shutdown", "dispose", "lease", "remove", "absent"]);
+		expect(absenceProbes).toBe(1);
+		expect(removeAttempts).toBe(1);
+		expect(cleanup.recreation?.detail).toBe("fixture root reappeared");
+		expect(cleanup.phases).toEqual({ leaseClose: "verified", rootRemove: "pending", rootAbsent: "pending" });
+		expect(fixtureRootForTest(root)).toBe(cleanup);
+
+		// Test teardown is an explicit retry only after the simulated writer has settled.
+		await cleanupFixtureRoot(cleanup, {
+			absenceObservationMs: 0,
+			removeRoot: async () => {
+				removeAttempts++;
+			},
+			rootExists: async () => false,
+		});
+		expect(removeAttempts).toBe(2);
 	});
 
 	it("sanitizes and restores the production SDK opt-out without contacting operator state", async () => {

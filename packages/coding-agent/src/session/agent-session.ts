@@ -439,6 +439,7 @@ import {
 	type ConfiguredFallbackChain,
 	cappedExponentialWithFullJitter,
 	compactionRetryDelay,
+	describeCompactionCandidateFailures,
 	effectiveFallbackDelay,
 	FallbackChainController,
 	type FallbackChainRuntimeState,
@@ -20160,6 +20161,10 @@ export class AgentSession {
 				const telemetry = resolveTelemetry(this.agent.telemetry, this.sessionId);
 				let compactResult: CompactionResult | undefined;
 				let lastError: unknown;
+				// Every candidate that was tried and failed, in order. Only the last failure
+				// used to reach the user, which named whichever same-provider fallback the
+				// chain ended on and hid that the session model itself had already failed.
+				const candidateFailures: Array<{ model: string; message: string }> = [];
 
 				for (const candidate of candidates) {
 					const apiKey = await this.#modelRegistry.getApiKey(candidate, this.credentialSessionId);
@@ -20193,6 +20198,7 @@ export class AgentSession {
 							const message = error instanceof Error ? error.message : String(error);
 							if (this.#isCompactionAuthFailure(error)) {
 								lastError = this.#buildCompactionAuthError();
+								candidateFailures.push({ model: `${candidate.provider}/${candidate.id}`, message });
 								break;
 							}
 							const retryAfterMs = this.#parseRetryAfterMsFromError(message);
@@ -20205,6 +20211,7 @@ export class AgentSession {
 									isUsageLimitError(message));
 							if (!shouldRetry) {
 								lastError = error;
+								candidateFailures.push({ model: `${candidate.provider}/${candidate.id}`, message });
 								break;
 							}
 
@@ -20229,6 +20236,7 @@ export class AgentSession {
 										model: `${candidate.provider}/${candidate.id}`,
 									});
 									lastError = error;
+									candidateFailures.push({ model: `${candidate.provider}/${candidate.id}`, message });
 									break; // Exit retry loop, continue to next candidate
 								}
 								// No more candidates - we have to wait
@@ -20254,7 +20262,9 @@ export class AgentSession {
 
 				if (!compactResult) {
 					if (lastError) {
-						throw lastError;
+						throw candidateFailures.length > 1
+							? describeCompactionCandidateFailures(candidateFailures, lastError)
+							: lastError;
 					}
 					throw new Error("Compaction failed: no available model");
 				}
