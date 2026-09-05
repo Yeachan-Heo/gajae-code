@@ -306,4 +306,47 @@ describe("EventController #handleMessageEnd abort labeling", () => {
 		gate.resolve();
 		await pending;
 	});
+
+	it("force-cancelled agent_end marks an orphan provisional partial as aborted", async () => {
+		const initial = makeAssistantMessage({ stopReason: "stop", content: [] });
+		const f = createFixture({ streamingMessage: initial });
+		f.ctx.setWorkingMessage = vi.fn();
+		const gate = Promise.withResolvers<void>();
+		const entered = Promise.withResolvers<void>();
+		f.ctx.planModeController = {
+			flushPendingModelSwitch: () => {
+				entered.resolve();
+				return gate.promise;
+			},
+		} as never;
+		let stopped = false;
+		f.ctx.isStopped = () => stopped;
+
+		await f.controller.handleEvent({ type: "message_start", message: initial });
+		const component = f.ctx.streamingComponent!;
+		const partial = makeAssistantMessage({
+			stopReason: "stop",
+			content: [{ type: "text", text: "partial before forced cancellation" }],
+		});
+		await f.controller.handleEvent({
+			type: "message_update",
+			message: partial,
+			assistantMessageEvent: { type: "text_delta", contentIndex: 0 },
+		} as never);
+
+		const pending = f.controller.handleEvent({ type: "agent_end", messages: [], stopReason: "cancelled" } as never);
+		await entered.promise;
+
+		expect(f.ctx.chatContainer.hasLiveChild(component)).toBe(true);
+		const rendered = Bun.stripANSI(component.render(80).join("\n"));
+		expect(rendered).toContain("partial before forced cancellation");
+		expect(rendered).toContain("Operation aborted");
+		expect(partial.stopReason).toBe("stop");
+		expect(partial.errorMessage).toBeUndefined();
+		expect(f.ctx.streamingComponent).toBeUndefined();
+		expect(f.ctx.streamingMessage).toBeUndefined();
+		stopped = true;
+		gate.resolve();
+		await pending;
+	});
 });

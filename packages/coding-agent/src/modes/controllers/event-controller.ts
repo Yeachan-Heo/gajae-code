@@ -1096,7 +1096,9 @@ export class EventController {
 			const authoritativeMessage = [...event.messages]
 				.reverse()
 				.find((message): message is AssistantMessage => message.role === "assistant");
-			const finalMessage = authoritativeMessage ?? orphanMessage;
+			const finalMessage =
+				authoritativeMessage ??
+				(event.stopReason === "cancelled" ? { ...orphanMessage, stopReason: "aborted" as const } : orphanMessage);
 			if (finalMessage !== orphanMessage) {
 				transferSessionMessageIdentity([orphanMessage], [finalMessage]);
 				this.ctx.streamingMessage = finalMessage;
