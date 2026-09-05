@@ -2949,6 +2949,34 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 		}
 	});
 
+	it("fails closed without reacquiring the gate when attachment authority changes during root binding", async () => {
+		const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-slack-bind-transition-"));
+		try {
+			const fake = new FakeSlack();
+			const rootTs = "9.125";
+			fake.knownTimestamps.add(rootTs);
+			let resolutions = 0;
+			const daemon = new SlackNotificationDaemon({
+				agentDir,
+				repo: agentDir,
+				teamId: "T1",
+				channelId: "C1",
+				provider: new SlackProvider(fake),
+				resolveAttachment: async sessionId => ({
+					...endpoint(sessionId),
+					authorityId: resolutions++ === 0 ? "legacy-authority" : "current-authority",
+					legacyAuthorityId: resolutions > 1 ? "legacy-authority" : undefined,
+				}),
+			});
+
+			await expect(daemon.bindExistingRoot("session", rootTs)).rejects.toThrow(
+				"Slack session authority changed before the binding could commit.",
+			);
+		} finally {
+			await fs.rm(agentDir, { recursive: true, force: true });
+		}
+	});
+
 	it("terminalizes retired inbound effects before a same-generation mapping can replay them", async () => {
 		let commands = 0;
 		await withDaemon(

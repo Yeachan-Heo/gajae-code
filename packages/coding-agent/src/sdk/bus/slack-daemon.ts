@@ -231,6 +231,7 @@ export class SlackNotificationDaemon {
 	readonly #now: () => number;
 	readonly #randomId: () => string;
 	readonly #resolveAttachment: (sessionId: string) => Promise<SessionAttachment | null>;
+	readonly #resolveAttachmentRaw: (sessionId: string) => Promise<SessionAttachment | null>;
 
 	readonly #publicationOwnerId: string;
 	readonly #publicationLeaseMs: number;
@@ -271,8 +272,9 @@ export class SlackNotificationDaemon {
 		this.#publicationOwnerId = options.publicationOwnerId ?? randomUUID();
 		this.#publicationLeaseMs = Math.max(options.publicationLeaseMs ?? 30_000, MIN_PUBLICATION_LEASE_MS);
 		this.#journal = new ChatEffectJournal({ agentDir: options.agentDir, transport: "slack", now: this.#now });
+		this.#resolveAttachmentRaw = options.resolveAttachment;
 		this.#resolveAttachment = async sessionId => {
-			const attachment = await options.resolveAttachment(sessionId);
+			const attachment = await this.#resolveAttachmentRaw(sessionId);
 			const migrationKey = attachment
 				? `${attachment.sessionId}:${attachment.generation}:${attachment.legacyAuthorityId ?? ""}:${attachment.authorityId ?? ""}`
 				: undefined;
@@ -767,7 +769,7 @@ export class SlackNotificationDaemon {
 					endpointGeneration: authority.endpointGeneration,
 					...(attachmentAuthorityId === undefined ? {} : { attachmentAuthorityId }),
 					revalidate: async () => {
-						const current = await this.#bindingAuthority(sessionId);
+						const current = await this.#bindingAuthority(sessionId, false);
 						if (
 							!current ||
 							current.endpointGeneration !== authority.endpointGeneration ||
@@ -786,12 +788,12 @@ export class SlackNotificationDaemon {
 	 * attachment authority; the fallback accepts only a resolvable endpoint with a
 	 * usable generation, which is all a directly constructed daemon can prove.
 	 */
-	async #bindingAuthority(sessionId: string): Promise<SlackBindingAuthority | undefined> {
+	async #bindingAuthority(sessionId: string, migrate = true): Promise<SlackBindingAuthority | undefined> {
 		const resolved = this.options.resolveBindingAuthority
 			? await this.options.resolveBindingAuthority(sessionId)
 			: undefined;
 		if (this.options.resolveBindingAuthority && !resolved) return undefined;
-		const endpoint = await this.#resolveAttachment(sessionId);
+		const endpoint = await (migrate ? this.#resolveAttachment(sessionId) : this.#resolveAttachmentRaw(sessionId));
 		if (
 			!endpoint?.isCurrent() ||
 			endpoint.sessionId !== sessionId ||
