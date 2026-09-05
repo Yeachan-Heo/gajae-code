@@ -181,6 +181,7 @@ describe("session runtime cache hot paths", () => {
 			startEdit(session, filePath, "second");
 			await secondStarted.promise;
 			invalidate();
+			await settleEvents();
 			startEdit(session, filePath, "third");
 			await settleEvents();
 			expect(readSpy).toHaveBeenCalledTimes(2);
