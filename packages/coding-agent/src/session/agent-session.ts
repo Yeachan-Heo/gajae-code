@@ -8203,7 +8203,9 @@ export class AgentSession {
 		this.#streamingEditPrecheckedToolCallIds.clear();
 		this.#streamingEditParsedToolCallCache.clear();
 		this.#streamingEditFileCache.clear();
-		this.#streamingEditPrecachePending.clear();
+		for (const resolvedPath of this.#streamingEditPrecachePending.keys()) {
+			this.#invalidateStreamingEditPrecachePath(resolvedPath);
+		}
 	}
 
 	#getStreamingEditToolCall(event: AgentEvent): StreamingEditParsedToolCall | undefined {
@@ -8285,15 +8287,21 @@ export class AgentSession {
 	}
 
 	#streamingEditPrecachePending = new Map<string, symbol>();
+	#streamingEditPrecacheStale = new Map<string, Set<symbol>>();
 	async #preCacheFileAsync(resolvedPath: string): Promise<void> {
 		if (this.#streamingEditFileCache.has(resolvedPath)) return;
 		if (this.#streamingEditPrecachePending.has(resolvedPath)) return;
+		// Keep at most one invalidated read alongside the current generation. Once
+		// two reads are already in flight, further invalidations wait for one to
+		// settle instead of accumulating another whole-file read.
+		if ((this.#streamingEditPrecacheStale.get(resolvedPath)?.size ?? 0) >= 2) return;
 		const token = Symbol();
 		this.#streamingEditPrecachePending.set(resolvedPath, token);
 		try {
 			const stat = await fs.promises.stat(resolvedPath);
 			if (stat.size > MAX_EDIT_FILE_BYTES) return;
 
+			if (this.#streamingEditPrecachePending.get(resolvedPath) !== token) return;
 			const rawText = await fs.promises.readFile(resolvedPath, "utf-8");
 			if (this.#streamingEditPrecachePending.get(resolvedPath) !== token) return;
 			if (this.#streamingEditFileCache.has(resolvedPath)) return;
@@ -8305,7 +8313,21 @@ export class AgentSession {
 			if (this.#streamingEditPrecachePending.get(resolvedPath) === token) {
 				this.#streamingEditPrecachePending.delete(resolvedPath);
 			}
+			const stale = this.#streamingEditPrecacheStale.get(resolvedPath);
+			if (stale?.delete(token) && stale.size === 0) this.#streamingEditPrecacheStale.delete(resolvedPath);
 		}
+	}
+
+	#invalidateStreamingEditPrecachePath(resolvedPath: string): void {
+		const token = this.#streamingEditPrecachePending.get(resolvedPath);
+		if (token === undefined) return;
+		this.#streamingEditPrecachePending.delete(resolvedPath);
+		let stale = this.#streamingEditPrecacheStale.get(resolvedPath);
+		if (!stale) {
+			stale = new Set();
+			this.#streamingEditPrecacheStale.set(resolvedPath, stale);
+		}
+		stale.add(token);
 	}
 
 	#ensureFileCache(resolvedPath: string): void {
@@ -8328,7 +8350,7 @@ export class AgentSession {
 		const resolvedPath = this.#resolveSessionFsPath(filePath);
 		if (resolvedPath === undefined) return;
 		this.#streamingEditFileCache.delete(resolvedPath);
-		this.#streamingEditPrecachePending.delete(resolvedPath);
+		this.#invalidateStreamingEditPrecachePath(resolvedPath);
 	}
 
 	/**
