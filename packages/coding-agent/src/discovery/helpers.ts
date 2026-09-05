@@ -1003,9 +1003,21 @@ const pluginRootsCache = new Map<string, { roots: ClaudePluginRoot[]; warnings: 
 /** Invalidate the exact user/project registry pair and their resolved-root cache entry. */
 export async function invalidateClaudePluginRoots(home: string, cwd?: string, isolatedHome = false): Promise<void> {
 	const resolvedProjectPath = cwd ? await resolveActiveProjectRegistryPath(cwd, home, isolatedHome) : null;
-	invalidateFsCache(path.join(getPluginsDir(home), "installed_plugins.json"));
-	if (resolvedProjectPath) invalidateFsCache(resolvedProjectPath);
-	pluginRootsCache.delete(`${home}:${resolvedProjectPath ?? ""}`);
+	const canonicalHome = await canonicalizeThroughExistingAncestor(home);
+	const rawGjcRegistryPath = path.join(getPluginsDir(home), "installed_plugins.json");
+	const gjcRegistryPath = await canonicalizePluginRegistryPath(canonicalHome, rawGjcRegistryPath, isolatedHome);
+	const projectRegistryPath = resolvedProjectPath
+		? await canonicalizePluginRegistryPath(canonicalHome, resolvedProjectPath, isolatedHome)
+		: undefined;
+	for (const registryPath of new Set([
+		rawGjcRegistryPath,
+		gjcRegistryPath,
+		resolvedProjectPath,
+		projectRegistryPath,
+	])) {
+		if (registryPath) invalidateFsCache(registryPath);
+	}
+	pluginRootsCache.delete(`${canonicalHome}:${gjcRegistryPath ?? ""}:${projectRegistryPath ?? ""}`);
 }
 
 async function canonicalizeThroughExistingAncestor(target: string): Promise<string> {

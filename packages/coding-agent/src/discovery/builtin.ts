@@ -384,11 +384,14 @@ async function loadSkills(ctx: LoadContext): Promise<LoadResult<Skill>> {
 	);
 
 	// User-level scan from the active agent-directory profile.
+	const userAgentDir = resolveUserAgentDir(ctx);
+	const defaultAgentDir = path.join(ctx.home, PATHS.userAgent);
 	const userSkillDirs = [
 		...new Set([
-			path.join(resolveUserAgentDir(ctx), "skills"),
-			path.join(ctx.home, PATHS.userBase, "skills"),
-			path.join(ctx.home, ".gjc", "skills"),
+			path.join(userAgentDir, "skills"),
+			...(path.resolve(userAgentDir) === path.resolve(defaultAgentDir)
+				? [path.join(ctx.home, PATHS.userBase, "skills"), path.join(ctx.home, ".gjc", "skills")]
+				: []),
 		]),
 	];
 	const userScans = userSkillDirs.map(dir =>

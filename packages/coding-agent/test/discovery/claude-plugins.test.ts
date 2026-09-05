@@ -6,6 +6,7 @@ import { loadCapability, loadCapabilityForHome } from "@gajae-code/coding-agent/
 import { clearCache as clearFsCache, readFile as readDiscoveryFile } from "@gajae-code/coding-agent/capability/fs";
 import {
 	clearClaudePluginRootsCache,
+	invalidateClaudePluginRoots,
 	listClaudePluginRoots,
 	parseClaudePluginsRegistry,
 } from "@gajae-code/coding-agent/discovery/helpers";
@@ -304,9 +305,9 @@ describe("listClaudePluginRoots", () => {
 		const result2 = await listClaudePluginRoots(tempDir);
 		expect(result2.roots).toHaveLength(1);
 
-		// After clearing cache, should see new plugin
-		clearClaudePluginRootsCache();
-		clearFsCache(); // Also clear fs cache so the file is re-read
+		// Exact registry invalidation must evict both the parsed file and the
+		// canonical plugin-root cache entry.
+		await invalidateClaudePluginRoots(tempDir);
 		const result3 = await listClaudePluginRoots(tempDir);
 		expect(result3.roots).toHaveLength(2);
 	});

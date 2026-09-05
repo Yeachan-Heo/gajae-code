@@ -790,6 +790,7 @@ describe("PR #4834: loadCapabilityForHome never falls back to the process profil
 		const homeAgentDir = path.join(home, ".gjc", "agent");
 		await seedProfile(explicitAgentDir, "explicit");
 		await seedProfile(homeAgentDir, "home");
+		await makeSkill(path.join(home, ".gjc", "skills"), "legacy-home-skill");
 		clearCache();
 
 		const options = { cwd: project, agentDir: explicitAgentDir, providers: ["native"] as string[] };
