@@ -145,8 +145,10 @@ import {
 	removeSessionTransaction,
 	repairProjections,
 	replaceCreationRetirementIntent,
+	rewriteSessionEndpointAuthority,
 	rotateClaimedCreationVerifier,
 	startCreationRemote,
+	upgradeCreationRetirementEndpointFileId,
 	withAdmittedSessionTransaction,
 	withNamespaceRegistry,
 	withSessionTransaction,
@@ -3831,6 +3833,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			canonicalizePath: services.canonicalizePath,
 			platform,
 		});
+		await migrateLegacySessionEndpointAuthority(session);
 	}
 
 	/** Every Codex handoff is scoped by the canonical WAL, never a retained projection. */
@@ -3855,7 +3858,9 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			}
 			try {
 				await assertPersistedSessionAuthority(transaction.canonical.session);
-				authorized.set(sessionId, transaction.canonical.session.broker.endpoint_incarnation);
+				const current = await readSessionTransaction(questionPaths, sessionId);
+				if (!current) throw new Error("resource_gone");
+				authorized.set(sessionId, current.canonical.session.broker.endpoint_incarnation);
 			} catch (error) {
 				if (scopedSessionId === sessionId) throw error;
 			}
@@ -5632,11 +5637,15 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				: null;
 	}
 
-	function brokerEndpointIncarnation(session: Record<string, unknown>, sessionId: string): string | null {
+	function brokerEndpointIncarnation(
+		session: Record<string, unknown>,
+		sessionId: string,
+		options: { includeEndpointFileId?: boolean } = {},
+	): string | null {
 		const endpointGeneration = brokerEndpointGeneration(session);
 		const pid = session.pid;
 		const endpointMtimeMs = session.endpointMtimeMs;
-		const endpointFileId = brokerEndpointFileId(session);
+		const endpointFileId = options.includeEndpointFileId === false ? undefined : brokerEndpointFileId(session);
 		if (
 			endpointGeneration === null ||
 			typeof pid !== "number" ||
@@ -5672,6 +5681,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		endpointGeneration: number;
 		endpointIncarnation: string;
 		endpointFileId?: string;
+		legacyEndpointIncarnation?: string;
 	};
 
 	async function exactBrokerSessionAuthority(sessionId: string, workspace: string): Promise<BrokerSessionAuthority> {
@@ -5702,16 +5712,48 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		if (endpointGeneration === null || endpointIncarnation === null)
 			throw new SdkClientError("endpoint_stale", "Broker session has no usable endpoint incarnation.");
 		const endpointFileId = brokerEndpointFileId(match.session);
+		const legacyEndpointIncarnation =
+			endpointFileId === undefined
+				? undefined
+				: (brokerEndpointIncarnation(match.session, sessionId, { includeEndpointFileId: false }) ?? undefined);
 		return {
 			workspace: match.workspace,
 			endpointGeneration,
 			endpointIncarnation,
 			...(endpointFileId === undefined ? {} : { endpointFileId }),
+			...(legacyEndpointIncarnation === undefined ? {} : { legacyEndpointIncarnation }),
 		};
 	}
 
 	async function exactBrokerSessionBinding(sessionId: string, workspace: string): Promise<BrokerSessionAuthority> {
 		return await exactBrokerSessionAuthority(sessionId, workspace);
+	}
+
+	async function migrateLegacySessionEndpointAuthority(
+		session: CanonicalSessionSnapshotV1,
+	): Promise<CanonicalSessionSnapshotV1> {
+		if (session.broker.endpoint_file_id !== undefined) return session;
+		if (!session.broker.workspace) throw new Error("coordinator_workspace_required");
+		const persistedWorkspace = await canonicalBrokerWorkspace(session.broker.workspace);
+		const authority = await exactBrokerSessionAuthority(session.session_id, persistedWorkspace);
+		if (authority.endpointGeneration !== session.broker.endpoint_generation)
+			throw new SdkClientError("endpoint_stale", "Coordinator session endpoint authority changed.");
+		if (authority.endpointFileId === undefined) {
+			if (authority.endpointIncarnation !== session.broker.endpoint_incarnation)
+				throw new SdkClientError("endpoint_stale", "Coordinator session endpoint authority changed.");
+			return session;
+		}
+		if (authority.legacyEndpointIncarnation !== session.broker.endpoint_incarnation)
+			throw new SdkClientError("endpoint_stale", "Coordinator session endpoint authority changed.");
+		const rewritten = await rewriteSessionEndpointAuthority(
+			questionPaths,
+			session.session_id,
+			session.broker.endpoint_incarnation,
+			authority.endpointIncarnation,
+			authority.endpointFileId,
+		);
+		await writeJsonFile(sessionFile(session.session_id), sessionFromCreationSnapshot(rewritten));
+		return rewritten;
 	}
 
 	/**
@@ -9263,7 +9305,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					request_digest: requestDigest,
 					allow_mutation: true,
 				};
-				const proof: CreationRetirementProofV1 = {
+				let proof: CreationRetirementProofV1 = {
 					session_id: sessionId,
 					cwd,
 					state_root: stateRoot,
@@ -9342,6 +9384,24 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 											message: "The coordinator start intent is not stranded in progress.",
 										},
 									};
+								if (proof.endpoint_file_id === undefined) {
+									const authority = await exactBrokerSessionAuthority(sessionId, cwd);
+									if (
+										authority.endpointGeneration !== proof.endpoint_generation ||
+										authority.endpointFileId === undefined
+									)
+										throw new SdkClientError(
+											"retirement_proof_stale",
+											"Current endpoint file identity is unavailable.",
+										);
+									await upgradeCreationRetirementEndpointFileId(
+										questionPaths,
+										creationKeyDigest,
+										proof,
+										authority.endpointFileId,
+									);
+									proof = { ...proof, endpoint_file_id: authority.endpointFileId };
+								}
 								const creation = await assertCreationRetirementIdentity(
 									questionPaths,
 									creationKeyDigest,

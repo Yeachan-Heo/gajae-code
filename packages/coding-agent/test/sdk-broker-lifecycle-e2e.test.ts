@@ -4047,18 +4047,24 @@ test("reconcile_uncertain retires one dead create identity and refuses live host
 		const marker = { pid: child.pid!, effectMarker: "reconcile-effect", incarnation: processIdentity };
 		await fs.writeFile(path.join(stateRoot, "sdk", `${sessionId}.lifecycle.json`), canonicalJson(marker));
 		await fs.writeFile(path.join(stateRoot, "sdk", `${sessionId}.lifecycle.ready.json`), canonicalJson(marker));
+		const endpointPath = path.join(stateRoot, "sdk", `${sessionId}.json`);
+		await fs.writeFile(endpointPath, canonicalJson({ sessionId, pid: child.pid! }));
+		const endpointStat = await fs.stat(endpointPath);
+		const endpointFileId = `${endpointStat.dev}:${endpointStat.ino}`;
 		await broker.index.append({
 			type: "lifecycle_terminal",
 			sessionId,
 			locator: { cwd: agentDir, worktreeRoot: null, stateRoot },
 			endpointGeneration: 4,
 			pid: child.pid!,
-			endpointMtimeMs: 1,
+			endpointMtimeMs: endpointStat.mtimeMs,
+			endpointFileId,
 			lifecycleRequestId: "reconcile-effect",
 			processIncarnation: processIdentity,
 			hostIncarnation: processIdentity,
 			terminalUncertain: true,
 		});
+		await fs.rm(endpointPath);
 		const createIdentity = "reconcile-create-identity";
 		await broker.ledger.begin(createIdentity, "reconcile-create-request");
 		await broker.ledger.transition(createIdentity, "terminal_uncertain", {
@@ -4076,7 +4082,7 @@ test("reconcile_uncertain retires one dead create identity and refuses live host
 					cwd: agentDir,
 					stateRoot,
 					endpointGeneration: 4,
-					endpointMtimeMs: 1,
+					endpointMtimeMs: endpointStat.mtimeMs,
 					processIncarnation: processIdentity,
 					hostIncarnation: processIdentity,
 					lifecycleRequestId: "reconcile-effect",
@@ -4092,7 +4098,7 @@ test("reconcile_uncertain retires one dead create identity and refuses live host
 					cwd: agentDir,
 					stateRoot,
 					endpointGeneration: 4,
-					endpointMtimeMs: 1,
+					endpointMtimeMs: endpointStat.mtimeMs,
 					processIncarnation: processIdentity,
 					hostIncarnation: processIdentity,
 					lifecycleRequestId: "reconcile-effect",
@@ -4112,7 +4118,7 @@ test("reconcile_uncertain retires one dead create identity and refuses live host
 					cwd: agentDir,
 					stateRoot,
 					endpointGeneration: 4,
-					endpointMtimeMs: 1,
+					endpointMtimeMs: endpointStat.mtimeMs,
 					processIncarnation: processIdentity,
 					hostIncarnation: processIdentity,
 					lifecycleRequestId: "stale-marker",
@@ -4123,6 +4129,24 @@ test("reconcile_uncertain retires one dead create identity and refuses live host
 		).resolves.toMatchObject({ ok: false, error: { code: "retirement_proof_stale" } });
 		child.kill("SIGKILL");
 		await child.exited;
+		await expect(
+			broker.handleRequest(
+				"session.reconcile_uncertain",
+				{
+					sessionId,
+					cwd: agentDir,
+					stateRoot,
+					endpointGeneration: 4,
+					endpointMtimeMs: endpointStat.mtimeMs,
+					processIncarnation: processIdentity,
+					hostIncarnation: processIdentity,
+					lifecycleRequestId: "reconcile-effect",
+					remoteCreateKey: "reconcile-create-key",
+					endpointFileId: "arbitrary-file-id",
+				},
+				"reconcile-mismatched-file-id",
+			),
+		).resolves.toMatchObject({ ok: false, error: { code: "retirement_proof_stale" } });
 		const deadResponse = await broker.handleRequest(
 			"session.reconcile_uncertain",
 			{
@@ -4130,7 +4154,7 @@ test("reconcile_uncertain retires one dead create identity and refuses live host
 				cwd: agentDir,
 				stateRoot,
 				endpointGeneration: 4,
-				endpointMtimeMs: 1,
+				endpointMtimeMs: endpointStat.mtimeMs,
 				processIncarnation: processIdentity,
 				hostIncarnation: processIdentity,
 				lifecycleRequestId: "reconcile-effect",
@@ -4148,7 +4172,7 @@ test("reconcile_uncertain retires one dead create identity and refuses live host
 					cwd: agentDir,
 					stateRoot,
 					endpointGeneration: 4,
-					endpointMtimeMs: 1,
+					endpointMtimeMs: endpointStat.mtimeMs,
 					processIncarnation: processIdentity,
 					hostIncarnation: processIdentity,
 					lifecycleRequestId: "reconcile-effect",
@@ -4159,7 +4183,7 @@ test("reconcile_uncertain retires one dead create identity and refuses live host
 		}
 		expect(retiredResponse).toMatchObject({
 			ok: true,
-			result: { sessionId, retired: true, indexType: "session_closed" },
+			result: { sessionId, retired: true, indexType: "session_closed", endpointFileId },
 		});
 		expect(broker.ledger.get(createIdentity)).toMatchObject({
 			state: "terminal_error",
