@@ -5552,6 +5552,11 @@ export class AgentSession {
 		return this.#ttsrAbortPending;
 	}
 
+	/** Whether an interactive abort is waiting to suppress its terminal abort label. */
+	get isSilentAbortPending(): boolean {
+		return this.#silentAbortPending;
+	}
+
 	/** Whether the plan-mode → compaction transition's expected internal abort is
 	 *  pending. Consumed by `#handleAgentEvent` to stamp `SILENT_ABORT_MARKER`
 	 *  on the next aborted assistant message_end; cleared unconditionally by
