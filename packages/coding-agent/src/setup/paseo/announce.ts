@@ -195,7 +195,7 @@ async function resolveDaemonSelection(
 	if (typeof configured !== "string") return { target: DEFAULT_DAEMON_TARGET, host: "localhost:6767" };
 	const configuredTarget = parseDaemonListen(configured);
 	if (!configuredTarget) return { target: DEFAULT_DAEMON_TARGET, host: "localhost:6767" };
-	if (configuredTarget.kind === "tcp" && configuredTarget.host === "127.0.0.1" && configuredTarget.port === 6767) {
+	if (configured.trim() === "127.0.0.1:6767") {
 		return { target: DEFAULT_DAEMON_TARGET, host: "localhost:6767" };
 	}
 	return { target: configuredTarget, host: configured };
