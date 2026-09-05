@@ -56,6 +56,17 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 	return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
+function assertNoFutureDeepInterviewEnvelope(value: Record<string, unknown>, surface: string): void {
+	if (
+		value.version !== undefined &&
+		(!Number.isSafeInteger(value.version) || (value.version as number) > WORKFLOW_STATE_VERSION)
+	)
+		throw new DeepInterviewCommandError(
+			2,
+			`${surface} has unsupported future deep-interview state version ${String(value.version)}; refusing downgrade`,
+		);
+}
+
 export * from "./deep-interview-recorder";
 
 /**
@@ -992,6 +1003,7 @@ async function handleCrystallizeUnlocked(
 			2,
 			`existing deep-interview state is corrupt or tampered (${existingRead.error})`,
 		);
+	if (existingRead.kind === "valid") assertNoFutureDeepInterviewEnvelope(existingRead.value, "crystallize state");
 	const existing =
 		existingRead.kind === "valid"
 			? normalizeDeepInterviewEnvelope(existingRead.value)
@@ -1768,6 +1780,7 @@ async function persistDeepInterviewSpecUnlocked(
 			`existing deep-interview state is corrupt or tampered (${existingRead.error}); use --force to overwrite ${statePath}`,
 		);
 	}
+	if (existingRead.kind === "valid") assertNoFutureDeepInterviewEnvelope(existingRead.value, "spec publication state");
 	const existing = existingRead.kind === "valid" ? existingRead.value : {};
 	const existingInner =
 		existing.state && typeof existing.state === "object" && !Array.isArray(existing.state)
@@ -1875,6 +1888,7 @@ async function seedDeepInterviewStateUnlocked(cwd: string, resolved: ResolvedDee
 	assertDeepInterviewInputWithinLimit(resolved.idea, MAX_INITIAL_CONTEXT_LENGTH, "initial_idea");
 	const existingRead = await readExistingStateForMutation(statePath);
 	if (existingRead.kind === "valid") {
+		assertNoFutureDeepInterviewEnvelope(existingRead.value, "seed state");
 		const existingInner = isRecord(existingRead.value.state) ? existingRead.value.state : undefined;
 		if (existingInner?.crystal !== undefined)
 			throw new DeepInterviewCommandError(2, "deep-interview seed cannot replace canonical Crystal state");
