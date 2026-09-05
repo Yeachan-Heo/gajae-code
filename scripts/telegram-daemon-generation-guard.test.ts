@@ -123,6 +123,17 @@ const chatEndpointHelpers = {
 		"SessionRouter.#attach",
 		"SessionRouter.#createAttachedClient",
 		"SessionRouter.#publishAttachment",
+		"SessionRouter.#attachUnserialized",
+		"SessionRouter.#endpointAuthorityUnchanged",
+		"SessionRouter.#readProvenEndpoint",
+		"createSessionAttachmentAuthorityId",
+		"sessionAttachmentAuthorityId",
+		"sessionAttachmentLegacyAuthorityId",
+		"lstatEndpoint",
+		"sameEndpointIdentity",
+		"matchesIndexedEndpointIdentity",
+		"sameIndexedAuthority",
+		"matchesAdoptedSessionAuthority",
 	],
 	[sdkDiscovery]: ["readSdkSessionEndpoint"],
 } as const;
@@ -348,7 +359,37 @@ test("requires mapped generation bumps for Telegram lease, chat CLI, and configu
 	}
 });
 
-test("requires a Telegram bump for tool-activity defaults and delivery admission policy", () => {
+test("requires both chat generation bumps for every shared Router authority proof declaration", () => {
+	for (const name of chatEndpointHelpers[sessionRouter]) {
+		const [className, privateName] = name.split(".#");
+		const before = name.includes(".#")
+			? `export class ${className} { #${privateName}() { return "before"; } }`
+			: `export function ${name}() { return "before"; }`;
+		const after = before.replace('return "before"', 'return "after"');
+		const endpointInventory = {
+			telegram: {},
+			discord: { [sessionRouter]: [name] },
+			slack: { [sessionRouter]: [name] },
+		} as const;
+		const base = files({ discordGeneration: 4, slackGeneration: 4 });
+		base.set(sessionRouter, before);
+		const unbumpedHead = files({ discordGeneration: 4, slackGeneration: 4 });
+		unbumpedHead.set(sessionRouter, after);
+		const missing = evaluate(base, unbumpedHead, endpointInventory);
+		expect(missing.protectedChanges).toEqual([
+			`discord:${sessionRouter}:${name}`,
+			`slack:${sessionRouter}:${name}`,
+		]);
+		expect(missing.chatGenerationBumped).toEqual({ discord: false, slack: false });
+
+		const bumpedHead = files({ discordGeneration: 5, slackGeneration: 5 });
+		bumpedHead.set(sessionRouter, after);
+		const bumped = evaluate(base, bumpedHead, endpointInventory);
+		expect(bumped.chatGenerationBumped).toEqual({ discord: true, slack: true });
+	}
+});
+
+test("requires a Telegram bump for tool-activity defaults and delivery admission", () => {
 	for (const [file, declarations] of Object.entries(telegramToolActivityDeclarations)) {
 		for (const name of declarations) {
 			const missing = mappedHelperMutation({ family: "telegram", file, name, generationBumped: false });

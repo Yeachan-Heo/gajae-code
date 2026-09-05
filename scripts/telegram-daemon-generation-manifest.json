@@ -1,5 +1,5 @@
 {
-  "contractVersion": 51,
+  "contractVersion": 52,
   "inventory": {
     "telegram": {
       "packages/coding-agent/src/sdk/bus/telegram-daemon-contract.ts": [
@@ -235,7 +235,18 @@
       "packages/coding-agent/src/sdk/router/session-router.ts": [
         "SessionRouter.#attach",
         "SessionRouter.#createAttachedClient",
-        "SessionRouter.#publishAttachment"
+        "SessionRouter.#publishAttachment",
+        "SessionRouter.#attachUnserialized",
+        "SessionRouter.#endpointAuthorityUnchanged",
+        "SessionRouter.#readProvenEndpoint",
+        "createSessionAttachmentAuthorityId",
+        "sessionAttachmentAuthorityId",
+        "sessionAttachmentLegacyAuthorityId",
+        "lstatEndpoint",
+        "sameEndpointIdentity",
+        "matchesIndexedEndpointIdentity",
+        "sameIndexedAuthority",
+        "matchesAdoptedSessionAuthority"
       ],
       "packages/coding-agent/src/sdk/client/discovery.ts": [
         "readSdkSessionEndpoint"
@@ -333,7 +344,18 @@
       "packages/coding-agent/src/sdk/router/session-router.ts": [
         "SessionRouter.#attach",
         "SessionRouter.#createAttachedClient",
-        "SessionRouter.#publishAttachment"
+        "SessionRouter.#publishAttachment",
+        "SessionRouter.#attachUnserialized",
+        "SessionRouter.#endpointAuthorityUnchanged",
+        "SessionRouter.#readProvenEndpoint",
+        "createSessionAttachmentAuthorityId",
+        "sessionAttachmentAuthorityId",
+        "sessionAttachmentLegacyAuthorityId",
+        "lstatEndpoint",
+        "sameEndpointIdentity",
+        "matchesIndexedEndpointIdentity",
+        "sameIndexedAuthority",
+        "matchesAdoptedSessionAuthority"
       ],
       "packages/coding-agent/src/sdk/client/discovery.ts": [
         "readSdkSessionEndpoint"
@@ -424,7 +446,7 @@
     "discord:packages/coding-agent/src/sdk/bus/config.ts:notificationConfigFromFile": "ed9446063305a13e9c6e8a9ffcac46985b44d79b778e0c96dbc1612b01f1f7d2",
     "discord:packages/coding-agent/src/sdk/bus/config.ts:resolveNotificationProvider": "09402fa9db279332fc392ef13a059b90f82c8721f4ed33cbc060222663558efd",
     "discord:packages/coding-agent/src/sdk/bus/config.ts:tokenFingerprint": "dd57445254e5ca152c4a2030f8959367a6800759f3f82fc5da09cc7b9a5aa758",
-    "discord:packages/coding-agent/src/sdk/bus/discord-daemon.ts:DiscordNotificationDaemon": "f9e9313ddb286e7d2951b5df7108601820b68e26c9b298e43b0b5e7367fa8898",
+    "discord:packages/coding-agent/src/sdk/bus/discord-daemon.ts:DiscordNotificationDaemon": "76162bd89e04365380e4d22e38770a34abe6990f0aebe5742f2e3e963ca3f12a",
     "discord:packages/coding-agent/src/sdk/bus/discord-daemon.ts:close": "b40d69078cc2e85b6c5dc4e5b912682c79dd569642f7c1d9e48b834a1a7cf01e",
     "discord:packages/coding-agent/src/sdk/bus/discord-daemon.ts:handleInbound": "1573d03ae11233beffe1516d5457b20f3d0069ae64e325f9b3accbd7deffce5b",
     "discord:packages/coding-agent/src/sdk/bus/discord-daemon.ts:notify": "4674a55ba3e2f3b7e4743e0a1aca5f9608139f6f3edfe07721ea110dc87cfee3",
@@ -433,8 +455,19 @@
     "discord:packages/coding-agent/src/sdk/bus/discord-daemon.ts:stop": "c8bcd881cc0331fb0565a82d997805f939701b12a80e03177192dbd5935824ff",
     "discord:packages/coding-agent/src/sdk/client/discovery.ts:readSdkSessionEndpoint": "bd8efa5f581993b3dc6c5549f62732211181b460b6e38d97220bb77b1875075e",
     "discord:packages/coding-agent/src/sdk/router/session-router.ts:SessionRouter.#attach": "a08b206ed46659b003ff331708cfccdf81c5c3037263bacca71d675fd09321e3",
+    "discord:packages/coding-agent/src/sdk/router/session-router.ts:SessionRouter.#attachUnserialized": "2ffc33cb649eadb260587d0c2305c573b73d8706df866073e34f21ed80a0c4b3",
     "discord:packages/coding-agent/src/sdk/router/session-router.ts:SessionRouter.#createAttachedClient": "dc2c780c9decb94e23481bc57d5d0fbfd3a45320197e03f33079a91a3334e43e",
+    "discord:packages/coding-agent/src/sdk/router/session-router.ts:SessionRouter.#endpointAuthorityUnchanged": "a5a65a6981a8338c833f6005f04213b4221bbae3a292f2b87f1e7bac31cb2d0b",
     "discord:packages/coding-agent/src/sdk/router/session-router.ts:SessionRouter.#publishAttachment": "d46fff88a22ebd42e3e439a5cc20059a2ed002945972849e841a2e7d644a3079",
+    "discord:packages/coding-agent/src/sdk/router/session-router.ts:SessionRouter.#readProvenEndpoint": "681cc76e77fa0e6693ab74e52e29185b8c6809c31051ed08420a98b06b8713cd",
+    "discord:packages/coding-agent/src/sdk/router/session-router.ts:createSessionAttachmentAuthorityId": "ca807db2d75a04f3d70f8fb8ba233b2582989e2b05a338f07c625d46b45085c9",
+    "discord:packages/coding-agent/src/sdk/router/session-router.ts:lstatEndpoint": "65de2df60704f69936d0d06db5052dae8be9cddfd9c547f2e129614ac370c99f",
+    "discord:packages/coding-agent/src/sdk/router/session-router.ts:matchesAdoptedSessionAuthority": "4f0cb6fe93fca59a6fdabfe79ac11084b9e6f0920194a299f59422b779a8fb3d",
+    "discord:packages/coding-agent/src/sdk/router/session-router.ts:matchesIndexedEndpointIdentity": "6e24fd3e7551316d83141b839c5f63806b17cd828b15d4de12ad93fae8386781",
+    "discord:packages/coding-agent/src/sdk/router/session-router.ts:sameEndpointIdentity": "5db640677b4cd345e475eb3c6edeec673b9729505a2d4a13c67a22911e948b2f",
+    "discord:packages/coding-agent/src/sdk/router/session-router.ts:sameIndexedAuthority": "be9f2ae4c001af1e9c1ba27ca27b7c1e3205b6b0a38960c9c6c68586229f0318",
+    "discord:packages/coding-agent/src/sdk/router/session-router.ts:sessionAttachmentAuthorityId": "ed8b306e8730808e1808cfab5d62bd14a5858ba8b9efb5b7c592e54528b0dd2c",
+    "discord:packages/coding-agent/src/sdk/router/session-router.ts:sessionAttachmentLegacyAuthorityId": "07852ebb745c8c8eaca3167200fe7b22adb68bc6e3cf19790eac4a2efb98cea3",
     "slack:packages/coding-agent/src/sdk/bus/chat-daemon-cli.ts:defaultPidAlive": "437658a2f14ac5daa2a3e84dcd637078566e71a88841cd750efab6d48fc94c3f",
     "slack:packages/coding-agent/src/sdk/bus/chat-daemon-cli.ts:loadConfig": "aff409ff6d08bfe19f5c39aac900ec6c8e898d988971bac029edb50459a84f5e",
     "slack:packages/coding-agent/src/sdk/bus/chat-daemon-cli.ts:ownerPid": "31110dcdd6e0f5dbc8b4dce27383646b9c339739758623ab67dc40ddc36661e0",
@@ -518,8 +551,19 @@
     "slack:packages/coding-agent/src/sdk/bus/slack-daemon.ts:stop": "4ec3502bc5b1fc192a44a9f53f5d19d56190be51b5b285c171bc97441487dbf5",
     "slack:packages/coding-agent/src/sdk/client/discovery.ts:readSdkSessionEndpoint": "bd8efa5f581993b3dc6c5549f62732211181b460b6e38d97220bb77b1875075e",
     "slack:packages/coding-agent/src/sdk/router/session-router.ts:SessionRouter.#attach": "a08b206ed46659b003ff331708cfccdf81c5c3037263bacca71d675fd09321e3",
+    "slack:packages/coding-agent/src/sdk/router/session-router.ts:SessionRouter.#attachUnserialized": "2ffc33cb649eadb260587d0c2305c573b73d8706df866073e34f21ed80a0c4b3",
     "slack:packages/coding-agent/src/sdk/router/session-router.ts:SessionRouter.#createAttachedClient": "dc2c780c9decb94e23481bc57d5d0fbfd3a45320197e03f33079a91a3334e43e",
+    "slack:packages/coding-agent/src/sdk/router/session-router.ts:SessionRouter.#endpointAuthorityUnchanged": "a5a65a6981a8338c833f6005f04213b4221bbae3a292f2b87f1e7bac31cb2d0b",
     "slack:packages/coding-agent/src/sdk/router/session-router.ts:SessionRouter.#publishAttachment": "d46fff88a22ebd42e3e439a5cc20059a2ed002945972849e841a2e7d644a3079",
+    "slack:packages/coding-agent/src/sdk/router/session-router.ts:SessionRouter.#readProvenEndpoint": "681cc76e77fa0e6693ab74e52e29185b8c6809c31051ed08420a98b06b8713cd",
+    "slack:packages/coding-agent/src/sdk/router/session-router.ts:createSessionAttachmentAuthorityId": "ca807db2d75a04f3d70f8fb8ba233b2582989e2b05a338f07c625d46b45085c9",
+    "slack:packages/coding-agent/src/sdk/router/session-router.ts:lstatEndpoint": "65de2df60704f69936d0d06db5052dae8be9cddfd9c547f2e129614ac370c99f",
+    "slack:packages/coding-agent/src/sdk/router/session-router.ts:matchesAdoptedSessionAuthority": "4f0cb6fe93fca59a6fdabfe79ac11084b9e6f0920194a299f59422b779a8fb3d",
+    "slack:packages/coding-agent/src/sdk/router/session-router.ts:matchesIndexedEndpointIdentity": "6e24fd3e7551316d83141b839c5f63806b17cd828b15d4de12ad93fae8386781",
+    "slack:packages/coding-agent/src/sdk/router/session-router.ts:sameEndpointIdentity": "5db640677b4cd345e475eb3c6edeec673b9729505a2d4a13c67a22911e948b2f",
+    "slack:packages/coding-agent/src/sdk/router/session-router.ts:sameIndexedAuthority": "be9f2ae4c001af1e9c1ba27ca27b7c1e3205b6b0a38960c9c6c68586229f0318",
+    "slack:packages/coding-agent/src/sdk/router/session-router.ts:sessionAttachmentAuthorityId": "ed8b306e8730808e1808cfab5d62bd14a5858ba8b9efb5b7c592e54528b0dd2c",
+    "slack:packages/coding-agent/src/sdk/router/session-router.ts:sessionAttachmentLegacyAuthorityId": "07852ebb745c8c8eaca3167200fe7b22adb68bc6e3cf19790eac4a2efb98cea3",
     "telegram:packages/coding-agent/src/sdk/bus/config.ts:isTelegramSessionEligible": "6e2bf01ec7f58e07658172a2911741891f4eb05e2050e536bc170d6770746c37",
     "telegram:packages/coding-agent/src/sdk/bus/config.ts:parseNotificationSettingsSnapshot": "a694158726a9a4f4df58d1b1a4cee54884ef2e4bab506b3c6cac981b3f41072e",
     "telegram:packages/coding-agent/src/sdk/bus/daemon-paths.ts:DaemonPaths": "2a22d60aed8c778a8f4b7e2b2017b192977e3767b04572ca13d534980fa2f560",
