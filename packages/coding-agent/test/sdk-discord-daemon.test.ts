@@ -10,7 +10,6 @@ import {
 	ChatEffectJournal,
 	type ChatEffectLease,
 	type ChatEffectReceipt,
-	type EnqueueChatEffect,
 } from "../src/sdk/bus/chat-effect-journal";
 
 import { ConversationStore } from "../src/sdk/bus/conversation-store";
@@ -811,26 +810,8 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 		const frames: Record<string, unknown>[] = [];
 		const journaled = Promise.withResolvers<void>();
 		const release = Promise.withResolvers<void>();
-		const originalEnqueueAndClaim = ChatEffectJournal.prototype.enqueueAndClaim;
 		let recovery: DiscordNotificationDaemon | undefined;
 		let deferred = 0;
-		vi.spyOn(ChatEffectJournal.prototype, "enqueueAndClaim").mockImplementation(async function <TPayload>(
-			this: ChatEffectJournal,
-			input: EnqueueChatEffect<TPayload>,
-			owner: string,
-			leaseMs: number,
-		): Promise<ChatEffect<TPayload> | undefined> {
-			const claimed = (await originalEnqueueAndClaim.call(this, input, owner, leaseMs)) as
-				| ChatEffect<TPayload>
-				| undefined;
-			// Barrier only the inbound action claim under test; outbound provider
-			// effects also use enqueueAndClaim now and must not trip this fence.
-			if (input.kind === "discord.inbound.action") {
-				journaled.resolve();
-				await release.promise;
-			}
-			return claimed;
-		});
 		try {
 			await withDaemon(
 				async (daemon, provider, agentDir) => {
@@ -843,6 +824,8 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 					});
 					provider.deferInteraction = async () => {
 						deferred++;
+						journaled.resolve();
+						await release.promise;
 					};
 					const effectId = `discord:app:guild:parent:${conversation.threadId}:live-recovery-barrier`;
 					const live = daemon.handleInbound(inbound(conversation.threadId!, "live-recovery-barrier", 1));
@@ -876,8 +859,8 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 						owner: beforeRecovery?.owner,
 						epoch: beforeRecovery?.epoch,
 					});
-					expect(afterRecovery?.receipt).toBeUndefined();
-					expect(deferred).toBe(0);
+					expect(afterRecovery?.receipt).toEqual({ status: "defer_intent" });
+					expect(deferred).toBe(1);
 					expect(frames).toEqual([]);
 
 					release.resolve();

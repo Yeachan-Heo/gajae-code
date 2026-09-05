@@ -1951,6 +1951,7 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 					threadTs: original.rootTs!,
 					text: "must not post",
 					clientMsgId: "stale-generation-one",
+					attachmentAuthorityId: "session:1",
 				},
 			});
 			await daemon.close("session");
@@ -2773,6 +2774,7 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 						teamId: "T1",
 						channelId: "C1",
 						rootTs: original.rootTs!,
+						attachmentAuthorityId: "session:1",
 						actorId: "U1",
 						eventId: "event-1",
 						interactionId: "interaction-1",
