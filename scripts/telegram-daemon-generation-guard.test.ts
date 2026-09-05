@@ -152,6 +152,16 @@ const chatEffectJournalHelpers = [
 	"enqueueWhileHoldingSessionMutationGate",
 	"enqueueAndClaim",
 	"enqueueAndClaimWhileHoldingSessionMutationGate",
+	"claim",
+	"claimWhileHoldingSessionMutationGate",
+	"renew",
+	"renewWhileHoldingSessionMutationGate",
+	"recordReceipt",
+	"recordReceiptWhileHoldingSessionMutationGate",
+	"record",
+	"recordWhileHoldingSessionMutationGate",
+	"terminalize",
+	"terminalizeWhileHoldingSessionMutationGate",
 	"ChatEffectJournal.#prepareEnqueue",
 ] as const;
 const telegramToolActivityDeclarations = {
