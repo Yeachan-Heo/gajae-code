@@ -12,6 +12,8 @@ import { createMockModel, type MockModelOptions } from "@gajae-code/ai/providers
 import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { EditTool } from "@gajae-code/coding-agent/edit";
+import { ExtensionRuntime, loadExtensionFromFactory } from "@gajae-code/coding-agent/extensibility/extensions/loader";
+import { ExtensionRunner } from "@gajae-code/coding-agent/extensibility/extensions/runner";
 import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import type {
 	ClientBridge,
@@ -24,6 +26,7 @@ import type { ToolSession } from "@gajae-code/coding-agent/tools";
 import { TempDir } from "@gajae-code/utils";
 import * as z from "zod/v4";
 import { callSessionTool } from "../src/eval/js/tool-bridge";
+import { EventBus } from "../src/utils/event-bus";
 
 // ---------------------------------------------------------------------------
 // Shared setup
@@ -84,6 +87,7 @@ async function createSession(
 	tools: AgentTool[],
 	bridge?: ClientBridge,
 	permissionMode: "allow" | "prompt" = "prompt",
+	extensionRunner?: ExtensionRunner,
 ): Promise<AgentSession> {
 	const model = getBundledModel("anthropic", "claude-sonnet-4-5");
 	if (!model) throw new Error("Expected claude-sonnet-4-5 model to exist");
@@ -109,6 +113,7 @@ async function createSession(
 		settings,
 		modelRegistry: {} as never,
 		toolRegistry: new Map(tools.map(t => [t.name, t])),
+		extensionRunner,
 	});
 
 	// Session default is `allow`; ACP registers a prompt bridge alongside prompt mode (see acp-agent).
@@ -178,6 +183,58 @@ it("allow_once: calls bridge once and executes the underlying tool", async () =>
 
 	expect(permissionSpy).toHaveBeenCalledTimes(1);
 	expect(bashTool.executeCalls).toBe(1);
+});
+
+it("Function Hook transforms reach ACP permission and execution consistently", async () => {
+	let executedArgs: unknown;
+	const bashTool = makeFakeTool("bash");
+	bashTool.execute = async (_id, args) => {
+		executedArgs = args;
+		bashTool.executeCalls++;
+		return { content: [{ type: "text" as const, text: "ok" }] };
+	};
+	const requests: ClientBridgePermissionToolCall[] = [];
+	const bridge: ClientBridge = {
+		capabilities: { requestPermission: true },
+		async requestPermission(toolCall) {
+			requests.push(toolCall);
+			return { outcome: "selected", optionId: "allow_once", kind: "allow_once" };
+		},
+	};
+	const runtime = new ExtensionRuntime();
+	const manager = SessionManager.inMemory(tempDir.path());
+	const extension = await loadExtensionFromFactory(
+		api => {
+			api.registerFunctionHook(
+				"tool_call",
+				async invocation => ({
+					action: "continue",
+					event: { ...invocation.payload, input: { command: "echo transformed" } },
+				}),
+				{ capabilities: ["tool.inspect", "tool.transform"], target: "bash" },
+			);
+		},
+		tempDir.path(),
+		new EventBus(),
+		runtime,
+		"acp-transform",
+	);
+	const runner = new ExtensionRunner([extension], runtime, tempDir.path(), manager, {} as never);
+	session = await createSession([bashTool], bridge, "prompt", runner);
+	await session.setActiveToolsByName(["bash"]);
+	const wrappedBash = session.agent.state.tools.find(t => t.name === "bash");
+
+	await wrappedBash!.execute(
+		"call-transform",
+		{ command: "echo original" },
+		undefined,
+		undefined as never,
+		undefined as never,
+	);
+
+	expect(requests[0]?.rawInput).toEqual({ command: "echo transformed" });
+	expect(requests[0]?.content).toEqual([{ type: "content", content: { type: "text", text: "$ echo transformed" } }]);
+	expect(executedArgs).toEqual({ command: "echo transformed" });
 });
 
 it("delete and move tools request ACP permission before executing", async () => {

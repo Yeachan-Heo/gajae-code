@@ -357,6 +357,12 @@ export async function compileGjcPluginBundle(root: string): Promise<NormalizedGj
 					: [];
 		const toolRefs: NormalizedSubskillToolSurface[] = [];
 		const seenToolRefs = new Set<string>();
+		for (const [toolRel, info] of manifestSubskillFiles) {
+			const extensionId = surfaceIds.subskillTool(fm.binds_to, fm.phase, fm.activation_arg, toolRel);
+			if (seenToolRefs.has(extensionId)) continue;
+			seenToolRefs.add(extensionId);
+			toolRefs.push({ extensionId, relativePath: toolRel, implementationHash: info.sha256 });
+		}
 		for (const toolRel of fmToolPaths) {
 			if (toolRel.trim().length === 0) continue;
 			const toolFile = await resolveDeclaredFile(pluginRoot, toolRel);
