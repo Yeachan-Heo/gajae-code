@@ -233,7 +233,7 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 					sendMaintenance: () => {},
 				}),
 			});
-			const conversation = await legacy.notify({
+			await legacy.notify({
 				sessionId: "session",
 				endpointGeneration: 1,
 				attachmentAuthorityId: "legacy-authority",
