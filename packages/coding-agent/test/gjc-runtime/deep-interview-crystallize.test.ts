@@ -394,6 +394,7 @@ describe("deep-interview crystallize contract", () => {
 		const first = crystallizeDeepInterview(input({ open_gaps: [gap] }));
 		for (const answer of [
 			"The budget is 1GB.",
+			"The maximum memory budget is different from 1GB.",
 			"The maximum memory budget is 1GB or 2GB.",
 			"The maximum memory budget is probably 1GB.",
 			"The maximum memory budget is 1GB, but perhaps 2GB.",
@@ -775,6 +776,23 @@ describe("deep-interview crystallize contract", () => {
 		});
 		expect(next.lifecycle).toBe("needs-questions");
 		expect(next.items).toEqual(first.items);
+		const nextSnapshot: CrystalSnapshot = {
+			revision: 3,
+			start: 2,
+			end: 2,
+			messages: [{ index: 2, role: "user", content: "The ambiguity remains open." }],
+			digest: "",
+		};
+		nextSnapshot.digest = crystalSnapshotDigest(nextSnapshot);
+		const third = crystallizeDeepInterview({
+			...input(),
+			prior: next,
+			items: [],
+			snapshot: nextSnapshot,
+			current_revision: 3,
+		});
+		expect(third.items).toEqual(first.items);
+		expect(third.lifecycle).toBe("needs-questions");
 	});
 
 	it("rejects accumulated ambiguity above the bounded shortcut ceiling", () => {
@@ -843,6 +861,38 @@ describe("deep-interview crystallize contract", () => {
 			),
 		);
 		expect(carried.removed_item_anchors).toEqual(second.removed_item_anchors);
+		const rolledSnapshot: CrystalSnapshot = {
+			revision: 4,
+			start: 3,
+			end: 3,
+			messages: [{ index: 3, role: "user", content: "Continue with the remaining goal." }],
+			digest: "",
+		};
+		rolledSnapshot.digest = crystalSnapshotDigest(rolledSnapshot);
+		const rolled = crystallizeDeepInterview({
+			...input(),
+			prior: carried,
+			items: [],
+			snapshot: rolledSnapshot,
+			current_revision: 4,
+		});
+		expect(rolled.removed_item_anchors).toEqual(second.removed_item_anchors);
+		const secondRolledSnapshot: CrystalSnapshot = {
+			revision: 5,
+			start: 4,
+			end: 4,
+			messages: [{ index: 4, role: "user", content: "Continue again." }],
+			digest: "",
+		};
+		secondRolledSnapshot.digest = crystalSnapshotDigest(secondRolledSnapshot);
+		const secondRolled = crystallizeDeepInterview({
+			...input(),
+			prior: rolled,
+			items: [],
+			snapshot: secondRolledSnapshot,
+			current_revision: 5,
+		});
+		expect(secondRolled.removed_item_anchors).toEqual(second.removed_item_anchors);
 	});
 
 	it("persists an unauthenticated removal intent instead of becoming ready later", () => {
