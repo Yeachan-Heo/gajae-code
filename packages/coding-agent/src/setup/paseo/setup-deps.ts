@@ -76,8 +76,20 @@ export interface PaseoSetupDependencies {
 	now(): Date;
 }
 
-export function createDefaultPaseoPaths(agentDir: string = getAgentDir(), home: string = os.homedir()): PaseoPaths {
-	const paseoHome = path.join(home, ".paseo");
+export function resolvePaseoHome(env: NodeJS.ProcessEnv = process.env, home: string = os.homedir()): string {
+	const configured = env.PASEO_HOME?.trim();
+	if (!configured) return path.join(home, ".paseo");
+	const expanded =
+		configured === "~" ? home : configured.startsWith("~/") ? path.join(home, configured.slice(2)) : configured;
+	return path.resolve(expanded);
+}
+
+export function createDefaultPaseoPaths(
+	agentDir: string = getAgentDir(),
+	home: string = os.homedir(),
+	env: NodeJS.ProcessEnv = {},
+): PaseoPaths {
+	const paseoHome = resolvePaseoHome(env, home);
 	return {
 		configJson: path.join(paseoHome, "config.json"),
 		orchestrationPreferences: path.join(paseoHome, "orchestration-preferences.json"),
@@ -168,7 +180,7 @@ export function parseProviderLs(stdout: string): PaseoLsOutcome {
 
 export function createDefaultPaseoSetupDependencies(): PaseoSetupDependencies {
 	return {
-		paths: createDefaultPaseoPaths(),
+		paths: createDefaultPaseoPaths(getAgentDir(), os.homedir(), process.env),
 		runProviderLs,
 		now: () => new Date(),
 	};

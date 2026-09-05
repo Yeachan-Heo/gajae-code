@@ -132,6 +132,7 @@ describe("SDK session CLI", () => {
 	// only, live frames pushed the moment that request arrives, and a delay on
 	// the reply so the live frames provably land first.
 	let explicitReplayEvents: Record<string, unknown>[] | undefined;
+	let explicitReplayGap: Record<string, unknown> | undefined;
 	let earlyLiveEvents: Record<string, unknown>[] = [];
 	let preCheckpointLiveEvents: Record<string, unknown>[] = [];
 	let wireLog: string[] = [];
@@ -156,6 +157,7 @@ describe("SDK session CLI", () => {
 		deferredLiveDispatched = false;
 		openSockets = new Set();
 		explicitReplayEvents = undefined;
+		explicitReplayGap = undefined;
 		earlyLiveEvents = [];
 		preCheckpointLiveEvents = [];
 		wireLog = [];
@@ -237,11 +239,14 @@ describe("SDK session CLI", () => {
 											0,
 										),
 										events,
+										...(explicitReplayGap === undefined ? {} : { gap: explicitReplayGap }),
 									});
 									socket.send(lastReplayPayload);
 									wireLog.push("explicit_replay_result");
-									for (const event of deferredLiveEvents)
+									for (const event of deferredLiveEvents) {
 										socket.send(JSON.stringify(withCheckpointRevision(event, checkpointRecord)));
+										wireLog.push(`deferred_live_sent:${event.kind}:${event.seq}`);
+									}
 								} catch {
 									// connection already closed
 								}
@@ -626,11 +631,13 @@ describe("SDK session CLI", () => {
 			const evicted = stream.replay(0, 1);
 			replayEvents = evicted.events;
 			replayGap = evicted.gap;
+			explicitReplayEvents = evicted.events;
+			explicitReplayGap = evicted.gap;
 			checkpointRecord = { revision: 0, generation: 1, seq: 0, idle: false };
 			deferredLiveEvents = [
 				{ type: "event", generation: 1, seq: 4, kind: "turn_end", payload: { type: "turn_end" } },
 			];
-			const args = ["tail", "live", "--until-idle", "--timeout-ms", "40000"];
+			const args = ["tail", "live", "--until-idle", "--timeout-ms", "5000"];
 			if (strict) args.push("--strict");
 			const tail = await runCli(root, agentDir, args);
 			if (strict) {
@@ -638,6 +645,12 @@ describe("SDK session CLI", () => {
 				expect(JSON.parse(tail.stdout)).toMatchObject({ ok: false, error: { code: "retention_gap" } });
 			} else {
 				expect(tail.exitCode, tail.stderr).toBe(0);
+				const explicitRequest = wireLog.indexOf("explicit_replay_request");
+				const explicitResult = wireLog.indexOf("explicit_replay_result");
+				const deferredTerminal = wireLog.indexOf("deferred_live_sent:turn_end:4");
+				expect(explicitRequest).toBeGreaterThanOrEqual(0);
+				expect(explicitResult).toBeGreaterThan(explicitRequest);
+				expect(deferredTerminal).toBeGreaterThan(explicitResult);
 				const result = JSON.parse(tail.stdout).result;
 				expect(result.gap).toMatchObject({ code: "retention_gap", missing: { from: 1, to: 1 } });
 				expect(result.items.map((item: Record<string, unknown>) => item.seq)).toEqual([2, 3, 4]);
