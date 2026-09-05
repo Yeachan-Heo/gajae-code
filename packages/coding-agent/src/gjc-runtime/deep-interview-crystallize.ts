@@ -30,6 +30,7 @@ export interface CrystalInput {
 	current_revision: number;
 	items: CrystalItem[];
 	removed_ids?: string[];
+	removed_item_anchors?: CrystalResolutionAnchor[];
 	open_gaps?: string[];
 	conflicts?: string[];
 	resolved_open_gaps?: string[];
@@ -61,6 +62,7 @@ export interface DeepInterviewCrystal {
 	source: { revision: number; start: number; end: number; digest: string; messages: CrystalMessage[] };
 	items: CrystalItem[];
 	removed_ids?: string[];
+	pending_removals?: string[];
 	open_gaps: string[];
 	conflicts: string[];
 	delta: CrystalDelta;
@@ -72,7 +74,220 @@ const MAX_ITEMS = 128;
 const MAX_TEXT = 10_000;
 const ITEM_KINDS: readonly CrystalItemKind[] = ["goal", "constraint", "decision", "acceptance_criterion", "non_goal"];
 const CLASSIFICATIONS: readonly CrystalClassification[] = ["confirmed", "inferred", "disputed"];
-const EVIDENCE_SEGMENTER = new Intl.Segmenter(undefined, { granularity: "word" });
+const EVIDENCE_SEGMENTER = new Intl.Segmenter("en", { granularity: "word" });
+const CJK_NEGATOR_TERMS = new Set(["不", "無", "无", "没", "沒", "未", "否", "勿", "毋", "别", "別", "莫"]);
+const SEMANTIC_EVIDENCE_TERMS = new Set([
+	"no",
+	"not",
+	"never",
+	"neither",
+	"without",
+	"cannot",
+	"can't",
+	"won't",
+	"don't",
+	"doesn't",
+	"isn't",
+	"aren't",
+	"wasn't",
+	"weren't",
+	"shouldn't",
+	"mustn't",
+	"needn't",
+	"must",
+	"should",
+	"need",
+	"needs",
+	"required",
+	"require",
+	"shall",
+	"ought",
+	"may",
+	"might",
+	"could",
+	"would",
+	"if",
+	"unless",
+	"provided",
+	"assuming",
+	"maybe",
+	"perhaps",
+	"possibly",
+	"probably",
+	"likely",
+	"unlikely",
+	"seems",
+	"seem",
+	"apparently",
+	"or",
+	"either",
+	"alternatively",
+	"instead",
+	"rather",
+	"but",
+	"however",
+	"although",
+	"though",
+	"except",
+	"refuse",
+	"refused",
+	"reject",
+	"rejected",
+	"defer",
+	"deferred",
+	"pending",
+	"uncertain",
+	"unknown",
+	"undecided",
+	"unresolved",
+	"unclear",
+]);
+const RESOLUTION_GENERIC_TERMS = new Set([
+	"ok",
+	"yes",
+	"done",
+	"resolved",
+	"confirmed",
+	"accepted",
+	"fine",
+	"selected",
+	"select",
+	"chosen",
+	"choose",
+	"set",
+	"sets",
+	"follow",
+	"follows",
+	"remain",
+	"remains",
+	"stays",
+	"stay",
+	"unchanged",
+	"same",
+	"different",
+	"fixed",
+	"defined",
+	"available",
+	"possible",
+	"valid",
+	"invalid",
+	"answer",
+	"answers",
+	"decision",
+	"decisions",
+	"choice",
+	"choices",
+	"selection",
+	"selections",
+	"resolution",
+	"resolutions",
+	"determined",
+	"specified",
+]);
+const RESOLUTION_META_TERMS = new Set([
+	"answer",
+	"answers",
+	"decision",
+	"decisions",
+	"choice",
+	"choices",
+	"selection",
+	"selections",
+	"resolution",
+	"resolutions",
+	"determination",
+	"determinations",
+]);
+const RESOLUTION_QUESTION_TERMS = new Set([
+	"what",
+	"which",
+	"when",
+	"where",
+	"why",
+	"how",
+	"whether",
+	"is",
+	"are",
+	"does",
+	"do",
+	"can",
+	"could",
+	"should",
+	"would",
+	"will",
+	"얼마",
+	"몇",
+	"무엇",
+	"무엇을",
+	"어떤",
+	"언제",
+	"어디",
+	"왜",
+	"어떻게",
+	"인지",
+	"인가",
+	"多少",
+	"幾",
+	"什么",
+	"什麼",
+	"哪个",
+	"哪個",
+	"为何",
+	"為何",
+	"怎么",
+	"怎麼",
+	"如何",
+	"何时",
+	"何時",
+	"哪里",
+	"哪裡",
+	"是否",
+	"いくら",
+	"何",
+	"なに",
+	"どの",
+	"いつ",
+	"どこ",
+	"なぜ",
+	"どう",
+	"ですか",
+]);
+const CONFLICT_STATUS_TERMS = new Set([
+	"dispute",
+	"disputed",
+	"disputes",
+	"conflict",
+	"conflicts",
+	"contradiction",
+	"contradictory",
+	"uncertain",
+	"unknown",
+	"unresolved",
+	"unclear",
+	"undecided",
+	"pending",
+	"contested",
+	"disagreement",
+	"争议",
+	"爭議",
+	"冲突",
+	"衝突",
+	"분쟁",
+	"충돌",
+	"모순",
+]);
+
+type CrystalSemanticProfile = {
+	negative: boolean;
+	interrogative: boolean;
+	conditional: boolean;
+	hedged: boolean;
+	alternative: boolean;
+	contradictory: boolean;
+	refusal: boolean;
+	unresolved: boolean;
+	obligation: string;
+};
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return Boolean(value) && typeof value === "object" && !Array.isArray(value);
@@ -89,6 +304,121 @@ function integer(value: unknown, name: string): number {
 	if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0)
 		throw new Error(`${name} must be a non-negative integer`);
 	return value;
+}
+
+function containsNonTextMarker(value: string): boolean {
+	return (
+		/(?:\[(?:image|audio|video|file|content|toolCall|thinking|sticker|attachment|document)\]?|(?:image|audio|video|file|content|toolCall|thinking|sticker|attachment|document)\])/i.test(
+			value,
+		) ||
+		/^(?:\[?(?:image|audio|video|file|content|toolCall|thinking|sticker|attachment|document)\]?)+$/i.test(
+			value.trim(),
+		) ||
+		/^(?:\[[^\]]+\])+$/.test(value.trim())
+	);
+}
+
+function semanticProfile(value: string): CrystalSemanticProfile {
+	const normalized = value.normalize("NFC").toLowerCase();
+	const obligationTerms = new Set<string>();
+	if (
+		/\b(?:must|have\s+to|required|required\s+to|require|shall)\b/i.test(normalized) ||
+		/(?:반드시|필수|해야|필요|必須|必要|なければなら|必须|必須|需要|应当|應當)/u.test(normalized)
+	)
+		obligationTerms.add("required");
+	if (
+		/\b(?:should|ought\s+to|recommended|recommend)\b/i.test(normalized) ||
+		/(?:권장|하는\s+것이\s+좋|べき|推荐|推薦|应该|應該)/u.test(normalized)
+	)
+		obligationTerms.add("recommended");
+	if (/\bneed(?:s|ed)?\b/i.test(normalized) || /(?:필요하다|필요한|必要だ|需要)/u.test(normalized))
+		obligationTerms.add("need");
+	if (
+		/\b(?:can|may|might|could|would)\b/i.test(normalized) ||
+		/(?:할\s+수|가능|てもよい|かもしれ|可以|可能)/u.test(normalized)
+	)
+		obligationTerms.add("permissive");
+	const negative =
+		/\b(?:no|not|never|neither|without|cannot|can't|won't|don't|doesn't|isn't|aren't|wasn't|weren't|shouldn't|mustn't|needn't|avoid|prohibit(?:s|ed)?|forbid(?:s|den)?|ban(?:s|ned)?)\b/i.test(
+			normalized,
+		) ||
+		/(?:안|않|못|없|아니|하지\s*마|마세요|말자|금지|禁止|ない|ません|ぬ|ず|たくない|不|無|无|没|沒|未|否|勿|毋|别|別|莫)/u.test(
+			normalized,
+		);
+	const interrogative =
+		/[?？]/u.test(normalized) ||
+		/\b(?:whether|wonder(?:s|ing)?|question(?:s|ed|ing)?)\b/i.test(normalized) ||
+		/\b(?:what|which|when|where|why|how|whether|do|does|did|is|are|can|could|should|would|will)\b[^.!。！？]*[?？]/iu.test(
+			normalized,
+		) ||
+		/(?:吗|嗎|呢|か|かな|나요|습니까|습니까|인가요|인가|ㄹ까요|을까요|까요|궁금|어떻게|무엇|무엇을|왜|언제|어디|얼마|몇|多少|什么|什麼|哪个|哪個|为何|為何|怎么|怎麼|如何|何时|何時|哪里|哪裡|是否|疑問|かどうか)/u.test(
+			normalized,
+		);
+	const conditional =
+		/\b(?:if|unless|provided(?:\s+that)?|assuming|in\s+case|contingent|when|depending\s+on)\b/i.test(normalized) ||
+		/(?:만약|하면|라면|다면|으면|이면|경우|조건|경우에\s+따라|もし|なら|れば|たら|場合|条件|次第|如果|若|假如|倘若|除非|只要|情况下|取决于|取決於)/u.test(
+			normalized,
+		);
+	const hedged =
+		/\b(?:maybe|perhaps|possibly|probably|might|may|could|would|likely|unlikely|seems?|apparently|approximately|around|roughly|tentative(?:ly)?|prefer(?:ably)?|i\s+think|i\s+guess|i\s+believe|believe(?:s|d)?)\b/i.test(
+			normalized,
+		) ||
+		/(?:아마|어쩌면|가능성|수도|것\s+같|같습니다|추정|대략|たぶん|おそらく|かもしれ|可能性|と思|思われ|だろう|でしょう|也许|也許|可能|或许|大概|似乎|大約|估计|估計|据说|據說)/u.test(
+			normalized,
+		);
+	const alternative =
+		/\b(?:or|either|alternatively|one\s+of|option(?:s)?|versus|vs)\b/i.test(normalized) ||
+		/\s\/\s/.test(normalized) ||
+		/[\p{L}\p{N}]\/[\p{L}\p{N}]/u.test(normalized) ||
+		/(?:또는|혹은|아니면|대안|または|もしくは|いずれか|或者|或是|或|还是|替代)/u.test(normalized);
+	const contradictory =
+		/\b(?:but|however|instead|rather\s+than|although|though|except|contradict(?:s|ed|ion)?|disagree(?:s|d)?|versus|vs)\b/i.test(
+			normalized,
+		) || /(?:하지만|그러나|반면|대신|모순|矛盾|但是|不过|不過|然而|しかし|だが|ところが|代わりに)/u.test(normalized);
+	const refusal =
+		/\b(?:refus(?:e|ed|es|ing)|declin(?:e|ed|es|ing)|won't|can't|cannot|unable\s+to|not\s+able\s+to)\b/i.test(
+			normalized,
+		) ||
+		/(?:답변할\s+수\s+없|대답할\s+수\s+없|말할\s+수\s+없|하지\s+않|않겠|거부|回答できない|答えられない|答えない|したくない|拒否|无法回答|不能回答|不愿回答|不願回答|不愿|不願|拒绝|拒絕|无法决定|不能决定)/u.test(
+			normalized,
+		);
+	return {
+		negative,
+		interrogative,
+		conditional,
+		hedged,
+		alternative,
+		contradictory,
+		refusal,
+		unresolved: isExplicitlyUnresolved(normalized),
+		obligation: [...obligationTerms].sort().join(","),
+	};
+}
+
+function sameSemanticIntent(left: CrystalSemanticProfile, right: CrystalSemanticProfile): boolean {
+	return (
+		left.negative === right.negative &&
+		left.interrogative === right.interrogative &&
+		left.conditional === right.conditional &&
+		left.hedged === right.hedged &&
+		left.alternative === right.alternative &&
+		left.contradictory === right.contradictory &&
+		left.refusal === right.refusal &&
+		left.unresolved === right.unresolved &&
+		left.obligation === right.obligation
+	);
+}
+
+function isUnsafeConfirmedStatement(profile: CrystalSemanticProfile): boolean {
+	return (
+		profile.interrogative ||
+		profile.conditional ||
+		profile.hedged ||
+		profile.alternative ||
+		profile.contradictory ||
+		profile.refusal ||
+		profile.unresolved
+	);
 }
 
 export function crystalSnapshotDigest(
@@ -173,26 +503,24 @@ function validateItems(value: unknown, snapshot?: CrystalSnapshot): CrystalItem[
 				);
 				if (!anchorMessage)
 					throw new Error(`confirmed item ${id} anchor message ${item.anchor!.message_index} is missing`);
-				const normalizedStatement = item.statement
-					.normalize("NFC")
-					.toLocaleLowerCase()
-					.replace(/[^\p{L}\p{N}]+/gu, " ")
-					.trim();
-				const normalizedQuote = item.anchor.quote
-					.normalize("NFC")
-					.toLocaleLowerCase()
-					.replace(/[^\p{L}\p{N}]+/gu, " ")
-					.trim();
+				const statementTerms = evidenceTerms(item.statement);
+				const quoteTerms = evidenceTerms(item.anchor.quote);
+				const statementSemantics = semanticProfile(item.statement);
+				const quoteSemantics = semanticProfile(item.anchor.quote);
 				if (
 					anchorMessage.role !== "user" ||
-					/\[(?:image|audio|video|file|content|toolCall|thinking)\]/i.test(item.anchor.quote) ||
-					/^(?:\[?(?:image|audio|video|file|content|toolCall|thinking)\]?)+$/i.test(item.anchor.quote.trim()) ||
-					/^(?:\[[^\]]+\])+$/.test(anchorMessage.content) ||
+					containsNonTextMarker(item.anchor.quote) ||
+					containsNonTextMarker(anchorMessage.content) ||
 					!anchorMessage.content.includes(item.anchor.quote) ||
-					normalizedQuote.length === 0 ||
-					(!normalizedStatement.includes(normalizedQuote) && !normalizedQuote.includes(normalizedStatement))
+					quoteTerms.size === 0 ||
+					statementTerms.size === 0 ||
+					[...statementTerms].some(term => !quoteTerms.has(term)) ||
+					isUnsafeConfirmedStatement(statementSemantics) ||
+					!sameSemanticIntent(statementSemantics, quoteSemantics)
 				)
-					throw new Error(`confirmed item ${id} has no statement-bound verbatim user anchor`);
+					throw new Error(
+						`confirmed item ${id} has no statement-bound verbatim user anchor (conservative derivation failed)`,
+					);
 			}
 		}
 		return item;
@@ -209,7 +537,9 @@ function isMeaningfulEvidenceWord(value: string): boolean {
 	const codePointLength = [...value].length;
 	return (
 		codePointLength >= 3 ||
-		(codePointLength >= 2 && /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}]/u.test(value))
+		(codePointLength >= 2 && /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}]/u.test(value)) ||
+		SEMANTIC_EVIDENCE_TERMS.has(value.toLowerCase()) ||
+		[...value].some(codePoint => CJK_NEGATOR_TERMS.has(codePoint))
 	);
 }
 
@@ -222,12 +552,9 @@ function evidenceTerms(value: string): Set<string> {
 		"for",
 		"how",
 		"make",
-		"must",
-		"need",
 		"needs",
 		"requirement",
 		"requirements",
-		"should",
 		"support",
 		"that",
 		"the",
@@ -245,11 +572,73 @@ function evidenceTerms(value: string): Set<string> {
 		"use",
 		"using",
 	]);
-	return new Set(
-		[...EVIDENCE_SEGMENTER.segment(value.toLocaleLowerCase())]
+	const normalized = value.normalize("NFC").toLowerCase();
+	const terms = new Set(
+		[...EVIDENCE_SEGMENTER.segment(normalized)]
 			.filter(part => part.isWordLike)
 			.map(part => part.segment)
-			.filter(term => isMeaningfulEvidenceWord(term) && !ignored.has(term)),
+			.filter(term => isMeaningfulEvidenceWord(term) && (!ignored.has(term) || SEMANTIC_EVIDENCE_TERMS.has(term))),
+	);
+	for (const negator of CJK_NEGATOR_TERMS) if (normalized.includes(negator)) terms.add(negator);
+	return terms;
+}
+
+function topicTerms(value: string, conflict: boolean): Set<string> {
+	const terms = evidenceTerms(value);
+	for (const term of [...terms]) {
+		if (
+			SEMANTIC_EVIDENCE_TERMS.has(term) ||
+			CJK_NEGATOR_TERMS.has(term) ||
+			RESOLUTION_QUESTION_TERMS.has(term) ||
+			RESOLUTION_META_TERMS.has(term) ||
+			(conflict && CONFLICT_STATUS_TERMS.has(term))
+		)
+			terms.delete(term);
+	}
+	return terms;
+}
+
+function hasConcreteResolutionValue(value: string, item: string, conflict: boolean): boolean {
+	const itemTerms = evidenceTerms(item);
+	const resolutionTerms = evidenceTerms(value);
+	const newTerms = [...resolutionTerms].filter(
+		term =>
+			!itemTerms.has(term) &&
+			!SEMANTIC_EVIDENCE_TERMS.has(term) &&
+			!RESOLUTION_GENERIC_TERMS.has(term) &&
+			!(conflict && CONFLICT_STATUS_TERMS.has(term)),
+	);
+	return (
+		newTerms.length > 0 ||
+		/\b(?:yes|no|true|false|enabled|disabled)\b/i.test(value) ||
+		/(?:예|네|아니요|아니|是|否|はい|いいえ)/u.test(value) ||
+		/\d/.test(value)
+	);
+}
+
+function hasCjkTopicOverlap(item: string, resolution: string): boolean {
+	const cjk = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u;
+	const itemChars = [...item.normalize("NFC").toLowerCase()].filter(character => cjk.test(character));
+	const resolutionText = [...resolution.normalize("NFC").toLowerCase()]
+		.filter(character => cjk.test(character))
+		.join("");
+	if (itemChars.length < 4 || resolutionText.length < 4) return false;
+	for (let length = itemChars.length; length >= 4; length--)
+		for (let start = 0; start + length <= itemChars.length; start++)
+			if (resolutionText.includes(itemChars.slice(start, start + length).join(""))) return true;
+	return false;
+}
+
+function isUnsafeResolution(value: string): boolean {
+	const profile = semanticProfile(value);
+	return (
+		profile.interrogative ||
+		profile.conditional ||
+		profile.hedged ||
+		profile.alternative ||
+		profile.contradictory ||
+		profile.refusal ||
+		profile.unresolved
 	);
 }
 
@@ -271,37 +660,125 @@ function validateResolutionAnchors(
 		const quote = text(raw.quote, `${field}[${index}].quote`, 500);
 		const resolution = text(raw.resolution, `${field}[${index}].resolution`, 500);
 		const message = snapshot.messages.find(candidate => candidate.index === messageIndex);
-		const itemWords = new Set(
-			[...EVIDENCE_SEGMENTER.segment(item.toLocaleLowerCase())]
-				.filter(part => part.isWordLike)
-				.map(part => part.segment),
-		);
-		const resolutionWords = [...EVIDENCE_SEGMENTER.segment(resolution.toLocaleLowerCase())]
-			.filter(part => part.isWordLike)
-			.map(part => part.segment);
-		const genericResolutionWords = new Set(["ok", "yes", "done", "resolved", "confirmed", "accepted", "fine"]);
-		const introducesNewTerm = resolutionWords.some(
-			word => isMeaningfulEvidenceWord(word) && !itemWords.has(word) && !genericResolutionWords.has(word),
-		);
-		const itemTerms = evidenceTerms(item);
+		const conflict = field === "resolved_conflict_anchors";
+		const itemTerms = topicTerms(item, conflict);
 		const resolutionTerms = evidenceTerms(resolution);
-		const addressesItem = [...resolutionTerms].some(term => itemTerms.has(term));
+		const addressesItem =
+			(itemTerms.size > 0 && [...itemTerms].every(term => resolutionTerms.has(term))) ||
+			hasCjkTopicOverlap(item, resolution);
+		const concreteAnswer = hasConcreteResolutionValue(resolution, item, conflict);
+		const unsafeResolution = isUnsafeResolution(resolution) || isUnsafeResolution(quote);
 		if (
 			!resolutions.includes(item) ||
 			seen.has(item) ||
 			messageIndex <= afterIndex ||
 			!message ||
 			message.role !== "user" ||
+			containsNonTextMarker(quote) ||
+			containsNonTextMarker(resolution) ||
+			containsNonTextMarker(message.content) ||
 			!message.content.includes(quote) ||
 			!message.content.includes(resolution) ||
-			resolution === item ||
-			resolutionWords.length < 2 ||
-			!introducesNewTerm
+			unsafeResolution ||
+			resolution === item
 		)
 			throw new Error(`${field}[${index}] has no fresh verbatim user anchor`);
 		if (!addressesItem) throw new Error(`${field}[${index}] has no relevant verbatim user anchor`);
+		if (!concreteAnswer) throw new Error(`${field}[${index}] has no fresh verbatim user anchor`);
 		seen.add(item);
 	}
+}
+
+function isExplicitlyUnresolved(value: string): boolean {
+	const normalized = value.normalize("NFC").toLowerCase();
+	return (
+		/\b(?:undecided|undetermined|unresolved|unclear|unknown|tbd|pending|defer(?:red|ring)?|uncertain|disputed|contested|conflict(?:s|ing)?|disagreement(?:s)?)\b/i.test(
+			normalized,
+		) ||
+		/\b(?:still\s+(?:deciding|undecided|unresolved|unknown)|not\s+(?:yet\s+)?(?:decided|determined|settled|made|chosen|selected|specified|known)|to\s+be\s+decided)\b/i.test(
+			normalized,
+		) ||
+		/\b(?:will\s+be\s+decided|decide\s+(?:later|eventually)|to\s+decide\s+later|follow[- ]?up|not\s+sure|unsure|later|eventually|afterwards|in\s+the\s+future|next\s+(?:week|month|time))\b/i.test(
+			normalized,
+		) ||
+		/\b(?:no|not|never)\s+(?:\w+\s+){0,3}(?:decision|choice|answer|selection|determination|resolution|agreement)\b/i.test(
+			normalized,
+		) ||
+		/(?:미정|미결정|미해결|보류|불확실|아직\s*(?:결정|정해|선택)|결정되지|결정\s*안\s*(?:됨|됐|되었습니다|안됨)|정해지지|나중에\s*결정|답(?:변)?이\s*없|모르겠|알\s*수\s*없|미합의|분쟁|충돌|모순|未定|未決定|未解決|保留|不明|不確定|まだ\s*(?:決ま|決め)|決まっていない|決まっていません|決定していない|決定していません|答えがない|回答がない|後で\s*決め|わからない|分からない|争議|矛盾|尚未决定|尚未确定|还没决定|還沒決定|没有答案|沒有答案|没有决定|沒有決定|以后决定|以後決定|未解决|未解決|不明确|不明確|不清楚|不知道|待定|暂缓|暫緩|争议|爭議|冲突|衝突|矛盾)/u.test(
+			normalized,
+		)
+	);
+}
+
+function validateRemovalAnchors(
+	value: unknown,
+	requestedIds: readonly string[],
+	priorPendingIds: readonly string[],
+	priorItems: ReadonlyMap<string, CrystalItem>,
+	snapshot: CrystalSnapshot,
+	afterIndex: number,
+): string[] {
+	const removalIds = [...new Set([...requestedIds, ...priorPendingIds])].sort();
+	if (value === undefined) return [];
+	if (!Array.isArray(value) || value.length > removalIds.length)
+		throw new Error("removed_item_anchors must contain one anchor per resolved removal");
+	const seen = new Set<string>();
+	for (const [index, raw] of value.entries()) {
+		if (!isRecord(raw)) throw new Error(`removed_item_anchors[${index}] must be an object`);
+		const itemId = text(raw.item, `removed_item_anchors[${index}].item`, 128);
+		if (!removalIds.includes(itemId) || seen.has(itemId))
+			throw new Error(`removed_item_anchors[${index}] does not identify a pending removal`);
+		const previous = priorItems.get(itemId);
+		if (!previous) throw new Error(`removed_item_anchors[${index}] references unknown prior material`);
+		const messageIndex = integer(raw.message_index, `removed_item_anchors[${index}].message_index`);
+		const quote = text(raw.quote, `removed_item_anchors[${index}].quote`, 500);
+		const resolution = text(raw.resolution, `removed_item_anchors[${index}].resolution`, 500);
+		const message = snapshot.messages.find(candidate => candidate.index === messageIndex);
+		const statementTerms = topicTerms(previous.statement, false);
+		const resolutionTerms = evidenceTerms(resolution);
+		const referencesStatement =
+			statementTerms.size > 0 && [...statementTerms].every(term => resolutionTerms.has(term));
+		const removalLanguage =
+			/\b(?:remove|drop|delete|discard|omit|exclude|retire|cancel|stop|no\s+longer|do\s+not\s+need|don't\s+need|not\s+needed)\b/i.test(
+				resolution,
+			) ||
+			/(?:삭제|제거|버리|제외|취소|중단|더\s+이상\s+필요\s+없|없애|削除|取り除|除外|破棄|取り消|停止|不要|删除|移除|去掉|丢弃|丟棄|排除|取消|停止|不再需要)/u.test(
+				resolution,
+			);
+		const removalSemantics = semanticProfile(resolution);
+		const quotedRemovalSemantics = semanticProfile(quote);
+		if (
+			message?.role !== "user" ||
+			messageIndex <= afterIndex ||
+			containsNonTextMarker(quote) ||
+			containsNonTextMarker(resolution) ||
+			containsNonTextMarker(message.content) ||
+			!message.content.includes(quote) ||
+			!message.content.includes(resolution) ||
+			resolution === previous.statement ||
+			!removalLanguage ||
+			!referencesStatement ||
+			removalSemantics.negative ||
+			removalSemantics.interrogative ||
+			removalSemantics.conditional ||
+			removalSemantics.hedged ||
+			removalSemantics.refusal ||
+			removalSemantics.alternative ||
+			removalSemantics.contradictory ||
+			removalSemantics.unresolved ||
+			quotedRemovalSemantics.negative ||
+			quotedRemovalSemantics.interrogative ||
+			quotedRemovalSemantics.conditional ||
+			quotedRemovalSemantics.hedged ||
+			quotedRemovalSemantics.refusal ||
+			quotedRemovalSemantics.alternative ||
+			quotedRemovalSemantics.contradictory ||
+			quotedRemovalSemantics.unresolved
+		)
+			throw new Error(`removed_item_anchors[${index}] has no fresh statement-bound user removal evidence`);
+		seen.add(itemId);
+	}
+	return [...seen].sort();
 }
 
 function validateRemovedIds(value: unknown): string[] {
@@ -322,8 +799,8 @@ export function crystallizeDeepInterview(value: unknown): DeepInterviewCrystal {
 		throw new Error("crystallize requires material conversation evidence");
 	if (!items.some(item => item.classification === "confirmed" && item.kind !== "non_goal"))
 		throw new Error("crystallize requires a confirmed user requirement");
-	const removedIds = value.removed_ids === undefined ? [] : validateRemovedIds(value.removed_ids);
-	if (removedIds.some(id => items.some(item => item.id === id)))
+	const requestedRemovedIds = value.removed_ids === undefined ? [] : validateRemovedIds(value.removed_ids);
+	if (requestedRemovedIds.some(id => items.some(item => item.id === id)))
 		throw new Error("removed_ids must be disjoint from submitted items");
 	const gaps = normalizedGaps(value.open_gaps);
 	if (gaps.length > 2) throw new Error("broad ambiguity requires the full deep-interview flow");
@@ -341,10 +818,12 @@ export function crystallizeDeepInterview(value: unknown): DeepInterviewCrystal {
 			priorCrystal.spec_version < 1
 		)
 			throw new Error("prior crystal is invalid");
+		if (priorCrystal.spec_version >= Number.MAX_SAFE_INTEGER)
+			throw new Error("prior crystal spec_version cannot be safely incremented");
 		if (!isRecord(priorCrystal.source) || snapshot.revision <= priorCrystal.source.revision)
 			throw new Error("conversation snapshot is stale");
 		if (!Array.isArray(priorCrystal.source.messages)) throw new Error("prior crystal source evidence is missing");
-		validateSnapshot({ ...priorCrystal.source, messages: priorCrystal.source.messages });
+		const priorSnapshot = validateSnapshot({ ...priorCrystal.source, messages: priorCrystal.source.messages });
 		if (!Array.isArray(priorCrystal.items)) throw new Error("prior crystal is invalid");
 		if (
 			!Number.isSafeInteger(priorCrystal.source.revision) ||
@@ -356,7 +835,7 @@ export function crystallizeDeepInterview(value: unknown): DeepInterviewCrystal {
 			priorCrystal.execution_approval !== "not-approved"
 		)
 			throw new Error("prior crystal is invalid");
-		canonicalPriorItems = validateItems(priorCrystal.items);
+		canonicalPriorItems = validateItems(priorCrystal.items, priorSnapshot);
 	}
 	const priorEnd =
 		priorCrystal && isRecord(priorCrystal.source) && typeof priorCrystal.source.end === "number"
@@ -383,6 +862,35 @@ export function crystallizeDeepInterview(value: unknown): DeepInterviewCrystal {
 		priorEnd,
 	);
 	const priorItems = new Map(canonicalPriorItems.map(item => [item.id, item]));
+	const priorRemovedIds = priorCrystal?.removed_ids === undefined ? [] : validateRemovedIds(priorCrystal.removed_ids);
+	const priorPendingRemovals =
+		priorCrystal?.pending_removals === undefined ? [] : validateRemovedIds(priorCrystal.pending_removals);
+	if (priorPendingRemovals.some(id => !priorItems.has(id)))
+		throw new Error("prior crystal contains an unresolved removal for unknown material");
+	if (priorRemovedIds.some(id => priorItems.has(id)))
+		throw new Error("prior crystal contains removed material in its active items");
+	if (priorRemovedIds.some(id => priorPendingRemovals.includes(id)))
+		throw new Error("prior crystal contains both resolved and pending removal tombstones");
+	if (items.some(item => priorRemovedIds.includes(item.id)))
+		throw new Error("submitted items must not resurrect a permanently removed item");
+	if (requestedRemovedIds.some(id => priorRemovedIds.includes(id)))
+		throw new Error("removed crystallize item is permanently removed");
+	if (requestedRemovedIds.some(id => !priorItems.has(id)))
+		throw new Error("removed crystallize item is not present in prior crystal");
+	const resolvedRemovedIds = validateRemovalAnchors(
+		value.removed_item_anchors,
+		requestedRemovedIds,
+		priorPendingRemovals,
+		priorItems,
+		snapshot,
+		priorEnd,
+	);
+	const unresolvedRemovalIds = [
+		...new Set([...priorPendingRemovals, ...requestedRemovedIds].filter(id => !resolvedRemovedIds.includes(id))),
+	].sort();
+	if (items.some(item => unresolvedRemovalIds.includes(item.id) || resolvedRemovedIds.includes(item.id)))
+		throw new Error("submitted items must not silently resurrect unresolved removals");
+	const allRemovedIds = [...new Set([...priorRemovedIds, ...resolvedRemovedIds])].sort();
 	const sameIntent = (left: CrystalItem, right: CrystalItem): boolean =>
 		left.id === right.id &&
 		left.kind === right.kind &&
@@ -397,11 +905,9 @@ export function crystallizeDeepInterview(value: unknown): DeepInterviewCrystal {
 		)
 			throw new Error(`changed confirmed item ${item.id} requires fresh user evidence`);
 	}
-	if (removedIds.some(id => !priorItems.has(id)))
-		throw new Error("removed crystallize item is not present in prior crystal");
 	const mergedItems = [...items];
 	for (const item of canonicalPriorItems)
-		if (!removedIds.includes(item.id) && !mergedItems.some(candidate => candidate.id === item.id))
+		if (!allRemovedIds.includes(item.id) && !mergedItems.some(candidate => candidate.id === item.id))
 			mergedItems.push(item);
 	const currentItems = mergedItems;
 	if (currentItems.length > MAX_ITEMS) throw new Error("merged crystallize items exceed the bounded limit");
@@ -425,8 +931,8 @@ export function crystallizeDeepInterview(value: unknown): DeepInterviewCrystal {
 		const previous = priorItems.get(id);
 		return current?.kind === "goal" || previous?.kind === "goal";
 	});
-	const removedGoal = removedIds.some(id => priorItems.get(id)?.kind === "goal");
-	const removedIntent = removedIds.length > 0;
+	const removedGoal = resolvedRemovedIds.some(id => priorItems.get(id)?.kind === "goal");
+	const removedIntent = resolvedRemovedIds.length > 0 || unresolvedRemovalIds.length > 0;
 	const allGaps = [
 		...new Set([...(priorCrystal?.open_gaps ?? []), ...gaps].filter(gap => !resolvedGaps.includes(gap))),
 	];
@@ -436,6 +942,7 @@ export function crystallizeDeepInterview(value: unknown): DeepInterviewCrystal {
 		),
 	];
 	const hasDisputed = currentItems.some(item => item.classification === "disputed");
+	const hasInferred = currentItems.some(item => item.classification === "inferred");
 	const intentChanged =
 		goalChanged ||
 		changed.some(id =>
@@ -449,7 +956,7 @@ export function crystallizeDeepInterview(value: unknown): DeepInterviewCrystal {
 				? "stale"
 				: goalChanged || removedGoal
 					? "goal-replaced"
-					: intentChanged || removedIntent
+					: intentChanged || removedIntent || hasInferred
 						? "intent-changed"
 						: added.length > 0
 							? "additive"
@@ -457,14 +964,14 @@ export function crystallizeDeepInterview(value: unknown): DeepInterviewCrystal {
 		changed_ids: changed,
 		added_ids: added,
 		preserved_ids: preserved,
-		approval_invalidated: intentChanged || removedIntent || allConflicts.length > 0 || hasDisputed,
+		approval_invalidated: intentChanged || removedIntent || hasInferred || allConflicts.length > 0 || hasDisputed,
 	};
 	const lifecycle =
 		allConflicts.length > 0 || hasDisputed
 			? "stale"
 			: goalChanged || removedGoal
 				? "superseded"
-				: intentChanged || removedIntent || allGaps.length > 0
+				: intentChanged || removedIntent || hasInferred || allGaps.length > 0
 					? "needs-questions"
 					: "ready";
 	return {
@@ -479,7 +986,8 @@ export function crystallizeDeepInterview(value: unknown): DeepInterviewCrystal {
 			messages: snapshot.messages,
 		},
 		items: currentItems,
-		...(removedIds.length > 0 ? { removed_ids: removedIds } : {}),
+		...(allRemovedIds.length > 0 ? { removed_ids: allRemovedIds } : {}),
+		...(unresolvedRemovalIds.length > 0 ? { pending_removals: unresolvedRemovalIds } : {}),
 		open_gaps: allGaps,
 		conflicts: allConflicts,
 		delta,
@@ -501,6 +1009,7 @@ export function crystalMarkdown(crystal: DeepInterviewCrystal): string {
 		`- Added IDs: ${crystal.delta.added_ids.join(", ") || "none"}`,
 		`- Preserved IDs: ${crystal.delta.preserved_ids.join(", ") || "none"}`,
 		`- Removed IDs: ${crystal.removed_ids?.join(", ") || "none"}`,
+		`- Pending removals: ${crystal.pending_removals?.join(", ") || "none"}`,
 		`- Approval invalidated: ${crystal.delta.approval_invalidated}`,
 		"",
 		"## Classified material",

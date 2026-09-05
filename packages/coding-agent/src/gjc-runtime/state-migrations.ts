@@ -1,4 +1,5 @@
 import * as fs from "node:fs/promises";
+import * as path from "node:path";
 import type { CanonicalGjcWorkflowSkill } from "../skill-state/active-state";
 import { initialPhaseForSkill } from "../skill-state/initial-phase";
 import {
@@ -6,7 +7,7 @@ import {
 	WORKFLOW_STATE_RECEIPT_VERSION,
 	WORKFLOW_STATE_VERSION,
 } from "../skill-state/workflow-state-contract";
-import { writeWorkflowEnvelopeAtomic } from "./state-writer";
+import { withWorkflowStateLock, writeGuardedWorkflowEnvelopeAtomic } from "./state-writer";
 import { getSkillManifest } from "./workflow-manifest";
 
 export interface NormalizeLegacyStateResult {
@@ -54,6 +55,26 @@ function canonicalSkillOrThrow(skill: string): CanonicalGjcWorkflowSkill {
 	const canonical = canonicalWorkflowSkill(skill);
 	if (!canonical) throw new Error(`Unsupported GJC workflow skill: ${skill}`);
 	return canonical;
+}
+
+/**
+ * A newer workflow envelope is not a legacy shape.  Treating it as one would
+ * silently downgrade state written by a newer runtime when any sanctioned
+ * read/modify/write path persists the result.  Callers that can surface a
+ * command error should use this guard before doing any merge; the migration
+ * primitive also enforces it so internal writers cannot bypass that boundary.
+ */
+export function assertNotFutureWorkflowState(
+	state: Record<string, unknown>,
+	skill: string,
+	surface = "workflow state",
+): void {
+	const version = state.version;
+	if (typeof version === "number" && Number.isFinite(version) && version > WORKFLOW_STATE_VERSION) {
+		throw new Error(
+			`${surface} for ${canonicalSkillOrThrow(skill)} has unsupported future version ${version}; refusing downgrade`,
+		);
+	}
 }
 
 function safeString(value: unknown): string {
@@ -124,6 +145,7 @@ const MIGRATIONS: Record<number, WorkflowStateMigration> = {
 
 export function migrateWorkflowState(raw: Record<string, unknown>, skill: string): MigrateWorkflowStateResult {
 	const canonicalSkill = canonicalSkillOrThrow(skill);
+	assertNotFutureWorkflowState(raw, canonicalSkill, "workflow state");
 	const fromVersion = typeof raw.version === "number" ? raw.version : 1;
 	if (fromVersion >= WORKFLOW_STATE_VERSION) {
 		return { state: raw, fromVersion, toVersion: fromVersion, changed: false };
@@ -156,6 +178,7 @@ export function migrateWorkflowState(raw: Record<string, unknown>, skill: string
  */
 export function normalizeLegacyState(raw: Record<string, unknown>, skill: string): NormalizeLegacyStateResult {
 	const canonicalSkill = canonicalSkillOrThrow(skill);
+	assertNotFutureWorkflowState(raw, canonicalSkill, "workflow state");
 	const state = cloneRecord(raw);
 	state.skill = canonicalSkill;
 	if (typeof state.version !== "number") state.version = 1;
@@ -174,31 +197,46 @@ export function normalizeLegacyState(raw: Record<string, unknown>, skill: string
 export async function migrateAndPersistLegacyState(
 	args: MigrateAndPersistLegacyStateArgs,
 ): Promise<MigrateAndPersistLegacyStateResult> {
-	const canonicalSkill = canonicalSkillOrThrow(args.skill);
-	const raw = JSON.parse(await fs.readFile(args.statePath, "utf-8")) as unknown;
-	if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
-		throw new Error(`Workflow state file must contain a JSON object: ${args.statePath}`);
-	}
-	const { state, changed } = normalizeLegacyState(raw as Record<string, unknown>, canonicalSkill);
-	if (!changed) return { migrated: false, path: args.statePath };
+	const statePath = path.resolve(args.cwd, args.statePath);
+	return withWorkflowStateLock(
+		statePath,
+		async () => {
+			const canonicalSkill = canonicalSkillOrThrow(args.skill);
+			const raw = JSON.parse(await fs.readFile(statePath, "utf-8")) as unknown;
+			if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+				throw new Error(`Workflow state file must contain a JSON object: ${statePath}`);
+			}
+			const rawState = raw as Record<string, unknown>;
+			const { state, changed } = normalizeLegacyState(rawState, canonicalSkill);
+			if (!changed) return { migrated: false, path: statePath };
 
-	const persistedPath = await writeWorkflowEnvelopeAtomic(args.statePath, state, {
-		cwd: args.cwd,
-		receipt: {
-			cwd: args.cwd,
-			skill: canonicalSkill,
-			owner: "gjc-state-cli",
-			command: `gjc state ${canonicalSkill} migrate`,
-			sessionId: args.sessionId,
+			const currentRevision =
+				typeof rawState.state_revision === "number" && Number.isFinite(rawState.state_revision)
+					? rawState.state_revision
+					: 0;
+			const result = await writeGuardedWorkflowEnvelopeAtomic(statePath, state, {
+				cwd: args.cwd,
+				policy: "source",
+				expectedRevision: currentRevision,
+				lockHeld: true,
+				receipt: {
+					cwd: args.cwd,
+					skill: canonicalSkill,
+					owner: "gjc-state-cli",
+					command: `gjc state ${canonicalSkill} migrate`,
+					sessionId: args.sessionId,
+				},
+				audit: {
+					cwd: args.cwd,
+					skill: canonicalSkill,
+					verb: "migrate",
+					owner: "gjc-state-cli",
+					category: "state",
+					sessionId: args.sessionId,
+				},
+			});
+			return { migrated: true, path: result.path };
 		},
-		audit: {
-			cwd: args.cwd,
-			skill: canonicalSkill,
-			verb: "migrate",
-			owner: "gjc-state-cli",
-			category: "state",
-			sessionId: args.sessionId,
-		},
-	});
-	return { migrated: true, path: persistedPath };
+		{ cwd: args.cwd },
+	);
 }

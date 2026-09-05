@@ -1,7 +1,7 @@
 ---
 name: deep-interview
 description: Socratic deep interview with mathematical ambiguity gating before explicit execution approval
-argument-hint: "[--crystallize] [--trace] [--quick|--standard|--deep] <idea or vague description>"
+argument-hint: "[--crystallize --input <json-or-@file> --slug <slug>] [--trace] [--json] [--quick|--standard|--deep] <idea or vague description>"
 pipeline: [deep-interview, ralplan]
 handoff-policy: approval-required
 handoff: .gjc/_session-{sessionid}/specs/deep-interview-{slug}.md
@@ -75,13 +75,49 @@ source: "forked from upstream deep-interview skill and rebranded for GJC"
 - Run an independent closure audit and a one-sentence goal restatement, each requiring explicit user confirmation, before crystallizing the spec
 - When `--trace` is active, use the bounded trace evidence summary as pre-question context; never dump raw logs, raw files, or unbounded search output into questions, scoring, specs, or handoffs
 
+**Native kickoff contract.** Seed the interviewing phase with `gjc deep-interview [--trace] [--json] [--quick|--standard|--deep] <idea or vague description>`. `--trace` enables the bounded evidence pre-step and `--json` selects machine-readable output; neither flag changes the approval gate. The generic workflow API retains `api --input <json-or-@file>` for bounded payloads and does not authorize execution.
+
+**Native spec-write contract.** Persist a final specification with `gjc deep-interview --write --stage final --slug <slug> --spec <markdown-or-path> [--force] [--json]`. The `--force` option is limited to overwriting corrupt deep-interview state and never grants execution approval; use the separate approval transition before any execution handoff.
+
 ### Crystallize sub-mode
 
-`--crystallize` is a bounded shortcut on this skill, not a new workflow or an execution path. Use it only when the current conversation already contains material requirements and decisions. Before any state write, capture a deterministic conversation snapshot with an explicit message range, source revision, and digest. Extract each item into exactly one of `confirmed`, `inferred`, or `disputed`; every confirmed goal, constraint, decision, and acceptance criterion MUST retain a verbatim source anchor. Do not treat inferred or disputed text as confirmed.
+`--crystallize` is a bounded shortcut on this skill, not a new workflow or an execution path. It is the sanctioned `interviewing` → `handoff` transition for a ready Crystal and must remain non-authorizing. Use it only when the current conversation already contains material requirements and decisions. Before any state write, capture a deterministic conversation snapshot with an explicit message range, source revision, and digest. Extract each item into exactly one of `confirmed`, `inferred`, or `disputed`; every confirmed goal, constraint, decision, and acceptance criterion MUST retain a verbatim source anchor. Do not treat inferred or disputed text as confirmed.
 
 Submit the bounded snapshot and extraction through the native crystallize writer. The writer is the sole promoter into the existing deep-interview state/spec shape; exploration remains non-canonical. A sufficient snapshot creates a versioned Crystal/spec without replaying interview rounds. One or two blocking gaps may be asked through `ask`; unresolved consequential choices use the existing lateral/adversarial review hook. Broad ambiguity MUST fall back to the ordinary full interview flow. Never create a Crystal when the snapshot revision or digest is stale or mismatched.
 
 When a prior Crystal exists, compare only evidence after its bound revision. Preserve unchanged confirmed material and record a versioned delta: additive requirements create the next version, changed constraints or decisions reopen affected fields and invalidate execution approval, changed goals supersede the prior Crystal, and conflicting later evidence marks it stale rather than overwriting it. Every promoted Crystal records `spec_version`, source range/revision/digest, classifications, anchors, open gaps, and `execution_approval: not-approved` unless a separate existing approval gate later records approval. Crystallization MUST NOT invoke implementation, `run`, `ralplan`, or any automatic handoff.
+
+**Native CLI contract.** Invoke this sub-mode as `gjc deep-interview --crystallize --input <json-or-@file> --slug <slug> [--session-id <id>] [--json]`; both `--input` and `--slug` are required. The `--input` value is either inline JSON or an `@file` and is bounded to 1 MiB. It must have this required object shape (the listed arrays are optional when empty):
+
+```json
+{
+  "snapshot": {
+    "revision": 1,
+    "start": 0,
+    "end": 0,
+    "digest": "<64 lowercase hex SHA-256>",
+    "messages": [
+      { "index": 0, "role": "user", "content": "Build audit reports" }
+    ]
+  },
+  "current_revision": 1,
+  "items": [
+    {
+      "id": "goal:reports",
+      "kind": "goal",
+      "classification": "confirmed",
+      "statement": "Build audit reports",
+      "anchor": { "message_index": 0, "quote": "Build audit reports" }
+    }
+  ],
+  "open_gaps": [],
+  "conflicts": []
+}
+```
+
+`snapshot.messages` MUST be ordered, unique, contiguous, and cover every index from `start` through `end`; the range and message list are capped at 200 messages, `items` at 128 entries, and each text field at 10,000 characters. `snapshot.end` MUST be the live transcript tail, `current_revision` MUST equal `snapshot.revision`, and `digest` MUST be the SHA-256 digest of the normalized snapshot. For a prior Crystal, include every message after its stored boundary; never skip a range or reuse stale evidence. Items use exactly one of `goal`, `constraint`, `decision`, `acceptance_criterion`, or `non_goal` and exactly one of `confirmed`, `inferred`, or `disputed`; confirmed items require a verbatim user `anchor` and inferred/disputed items never count as confirmed requirements.
+
+The ordinary state writer has a separate required shape: `gjc deep-interview write --input '{"state":{...}}'` and `stage --for <transition> --input '{"state":{...}}'`; stage transitions are incremental deltas, not whole-transcript replacements. A Crystal is ready only when ambiguity/readiness evidence has no unresolved gaps, conflicts, or disputed requirements; `needs-questions`, `stale`, and `superseded` results do not publish a spec and return to the ordinary interview/resolution path. A ready result persists the versioned artifact `.gjc/_session-{sessionid}/specs/deep-interview-{slug}-v{spec_version}.md`. Every Crystal starts with `execution_approval: not-approved`; only the separate `gjc deep-interview approve-execution --json` action records explicit user execution approval for a ready canonical Crystal, and handoff never grants that approval.
 </Execution_Policy>
 
 <Internal_Auto_Mode_Protocol>
@@ -677,7 +713,7 @@ When ambiguity ≤ threshold (or hard cap / early exit):
    - Apply the self-proofread once (DIPP-5) to newly generated spec prose before persistence, including generated natural-language table cells such as coverage notes, while preserving transcript answers, quoted/source text, code identifiers, file paths, commands, JSON/settings keys, table structure/fixed labels, and `.gjc/_session-{sessionid}/specs/deep-interview-{slug}.md` unchanged.
 2. **Write the final spec through the workflow CLI**: persist the artifact at `.gjc/_session-{sessionid}/specs/deep-interview-{slug}.md`
    - Always use this exact final spec path. Prefer passing the spec markdown **inline** as the `--spec` value; only when it is too large to pass inline, stage it as a file in a system temp directory (`os.tmpdir()`/`$TMPDIR`, `/tmp`, `/var/tmp`) outside the project tree and pass that path — never write scratch specs to the repo root, the project tree, or `.gjc/`.
-   - Use the native deep-interview write command with `--write --stage final --slug {slug} --spec <markdown-or-path> [--json]` for artifact and state persistence; direct `.gjc/` file edits are forbidden unless an explicit force override is active.
+   - Use the native deep-interview write command with `--write --stage final --slug {slug} --spec <markdown-or-path> [--force] [--json]` for artifact and state persistence; `--force` only permits recovery from corrupt deep-interview state and direct `.gjc/` file edits remain forbidden.
    - Persist the final `spec_path` in state when available so downstream skills and resumed sessions can pass the artifact path explicitly.
    - If the user preselected the deliberate ralplan path, use the native deep-interview write command with `--write --stage final --slug {slug} --spec <markdown-or-path> --deliberate [--json]` so the final spec is persisted before deep-interview hands off to ralplan.
 
@@ -879,6 +915,31 @@ Skipping any stage is possible but reduces quality assurance:
 
 <Examples>
 <Good>
+Kickoff with bounded trace evidence and machine-readable output:
+```
+gjc deep-interview --trace --standard "<idea>" --json
+```
+</Good>
+
+<Good>
+Final spec persistence with explicit corrupt-state recovery override:
+```
+gjc deep-interview --write --stage final --slug my-feature --spec ./final-spec.md --force --json
+```
+</Good>
+
+<Good>
+Bounded crystallization with an explicit slug and authenticated snapshot:
+```
+gjc deep-interview --crystallize --input '{"snapshot":{"revision":1,"start":0,"end":0,"digest":"<64 lowercase hex SHA-256>","messages":[{"index":0,"role":"user","content":"Build audit reports"}]},"current_revision":1,"items":[{"id":"goal:reports","kind":"goal","classification":"confirmed","statement":"Build audit reports","anchor":{"message_index":0,"quote":"Build audit reports"}}],"open_gaps":[],"conflicts":[]}' --slug audit-reports --json
+```
+The input is bounded and must cover the declared snapshot range exactly. A successful `ready`
+result writes `deep-interview-audit-reports-v1.md` (or the next `spec_version`), while unresolved
+gaps/conflicts remain non-ready and do not publish a spec. Execution still requires the separate
+`gjc deep-interview approve-execution --json` action after the user chooses an execution path.
+</Good>
+
+<Good>
 Targeting weakest dimension:
 ```
 Scores: Goal=0.9, Constraints=0.4, Criteria=0.7
@@ -981,8 +1042,12 @@ Why bad: 45% ambiguity means nearly half the requirements are unclear. The mathe
 - [ ] Free-text answers passed the Refine gate; dialectic rhythm guard forced a user question after 3 agent-resolved answers; any auto-answer threshold crossing explicitly confirmed
 - [ ] Closure / Acceptance Guard and the one-sentence Restate gate both passed before crystallization
 - [ ] Interview reached ambiguity ≤ threshold OR an explicit early exit with warning
+- [ ] Kickoff flags matched the native contract: `--trace` and `--json` remained optional, bounded, and non-authorizing
 - [ ] Ordinary answered rounds auto-continued to the next weakest-dimension question with no generic continue/cancel/clear ask; any stop matched a legitimate terminal condition (threshold + closure gates, explicit user exit, invocation/resume suitability, or bounded safety recovery)
-- [ ] Spec persisted to `.gjc/_session-{sessionid}/specs/deep-interview-{slug}.md` exactly via the GJC CLI (no direct `.gjc/` edits without force override), covering every active topology component plus goal/constraints/acceptance criteria/clarity/ontology/transcript
+- [ ] Spec persisted to `.gjc/_session-{sessionid}/specs/deep-interview-{slug}.md` exactly via the GJC CLI (use `--force` only for corrupt-state recovery; no direct `.gjc/` edits), covering every active topology component plus goal/constraints/acceptance criteria/clarity/ontology/transcript
+- [ ] `--crystallize` received required `--input <json-or-@file>` and `--slug <slug>`; its snapshot is bounded, contiguous, digest-bound, and matched to the live transcript revision
+- [ ] A ready Crystal persisted the versioned `.gjc/_session-{sessionid}/specs/deep-interview-{slug}-v{spec_version}.md` artifact; `needs-questions`, `stale`, and `superseded` results did not publish a spec
+- [ ] Every Crystal recorded `execution_approval: not-approved`; only a separate explicit `gjc deep-interview approve-execution --json` transition can authorize execution, never crystallization or handoff
 - [ ] Spec metadata includes the auto/lateral counters (`auto_answered_rounds`, `lateral_reviews`, `refined_rounds`, `architect_failures`, `lateral_panel_failures`)
 - [ ] Execution bridge presented via `ask`; execution invoked only after explicit approval through a public workflow entrypoint (never direct implementation); state cleaned up after handoff
 </Final_Checklist>

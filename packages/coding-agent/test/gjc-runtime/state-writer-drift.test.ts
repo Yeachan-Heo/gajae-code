@@ -61,8 +61,10 @@ describe("workflow state writer drift guard", () => {
 	it("persists required-on-write envelopes for state write, clear, and handoff", async () => {
 		const root = await tempDir();
 		const sessionId = "drift-session";
+		const handoffSessionId = "drift-handoff-session";
 		const deepPath = modeStatePath(root, sessionId, "deep-interview");
-		const ralplanPath = modeStatePath(root, sessionId, "ralplan");
+		const handoffDeepPath = modeStatePath(root, handoffSessionId, "deep-interview");
+		const ralplanPath = modeStatePath(root, handoffSessionId, "ralplan");
 
 		const write = await runNativeStateCommand(
 			[
@@ -90,7 +92,7 @@ describe("workflow state writer drift guard", () => {
 				"--mode",
 				"deep-interview",
 				"--session-id",
-				sessionId,
+				handoffSessionId,
 				"--input",
 				JSON.stringify({ current_phase: "handoff" }),
 				"--force",
@@ -99,11 +101,11 @@ describe("workflow state writer drift guard", () => {
 		);
 		expect(seed.status).toBe(0);
 		const handoff = await runNativeStateCommand(
-			["handoff", "--mode", "deep-interview", "--session-id", sessionId, "--to", "ralplan"],
+			["handoff", "--mode", "deep-interview", "--session-id", handoffSessionId, "--to", "ralplan"],
 			root,
 		);
 		expect(handoff.status).toBe(0);
-		await expectPersistedEnvelope(deepPath);
+		await expectPersistedEnvelope(handoffDeepPath);
 		await expectPersistedEnvelope(ralplanPath);
 	});
 
