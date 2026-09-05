@@ -4,7 +4,13 @@
  * Uses brush-core via native bindings for shell execution.
  */
 import * as fs from "node:fs/promises";
-import type { MinimizerOptions, Shell as NativeShell, ShellOptions, ShellRunOptions } from "@gajae-code/natives";
+import type {
+	MinimizerOptions,
+	Shell as NativeShell,
+	ShellOptions,
+	ShellRunOptions,
+	ShellRunResult,
+} from "@gajae-code/natives";
 import { postmortem } from "@gajae-code/utils";
 import { Settings, type ShellMinimizerSettings } from "../config/settings";
 import { formatCrashDiagnosticNotice, writeCrashReport } from "../debug/crash-diagnostics";
@@ -20,7 +26,8 @@ import { getOrCreateSnapshot } from "../utils/shell-snapshot";
 import { IsolatedShell } from "./isolated-shell";
 import { NON_INTERACTIVE_ENV } from "./non-interactive-env";
 
-type NativeShellBindings = Pick<typeof import("@gajae-code/natives"), "Shell">;
+type NativeShellConstructor = new (options?: ShellOptions | null) => NativeShell;
+type NativeShellBindings = { Shell: NativeShellConstructor };
 let nativeShellBindingsLoad: Promise<NativeShellBindings> | undefined;
 
 async function shellNatives(): Promise<NativeShellBindings> {
@@ -28,12 +35,57 @@ async function shellNatives(): Promise<NativeShellBindings> {
 	return await nativeShellBindingsLoad;
 }
 
-type ShellRunResult = Awaited<ReturnType<NativeShell["run"]>> & { signal?: string };
+type BashShellRunResult = ShellRunResult & { signal?: string };
 type Shell = {
-	run(options: ShellRunOptions, onChunk?: (error: Error | null, chunk: string) => void): Promise<ShellRunResult>;
+	run(options: ShellRunOptions, onChunk?: (error: Error | null, chunk: string) => void): Promise<BashShellRunResult>;
 	abort(): Promise<void>;
 	close(): Promise<void>;
+	isTerminal?(): boolean;
+	ready?(): Promise<void>;
+	isRunSignalActive?(signal: AbortSignal): boolean;
 };
+
+class AdmissionAwareShell implements Shell {
+	readonly #inner: Shell;
+	#runTail: Promise<void> = Promise.resolve();
+	#activeSignals = new WeakSet<AbortSignal>();
+
+	constructor(inner: Shell) {
+		this.#inner = inner;
+	}
+
+	async run(
+		options: ShellRunOptions,
+		onChunk?: (error: Error | null, chunk: string) => void,
+	): Promise<BashShellRunResult> {
+		const predecessor = this.#runTail;
+		const admission = Promise.withResolvers<void>();
+		this.#runTail = admission.promise;
+		try {
+			await predecessor;
+			if (options.signal instanceof AbortSignal && options.signal.aborted) {
+				return { exitCode: undefined, cancelled: true, timedOut: false };
+			}
+			if (options.signal instanceof AbortSignal) this.#activeSignals.add(options.signal);
+			return await this.#inner.run(options, onChunk);
+		} finally {
+			if (options.signal instanceof AbortSignal) this.#activeSignals.delete(options.signal);
+			admission.resolve();
+		}
+	}
+
+	abort(): Promise<void> {
+		return this.#inner.abort();
+	}
+
+	close(): Promise<void> {
+		return this.#inner.close();
+	}
+
+	isRunSignalActive(signal: AbortSignal): boolean {
+		return this.#activeSignals.has(signal);
+	}
+}
 type ShellFactory = (options?: ShellOptions) => Shell | Promise<Shell>;
 let shellFactoryForTests: ShellFactory | undefined;
 
@@ -41,13 +93,105 @@ export function setShellFactoryForTests(factory: ShellFactory | undefined): void
 	shellFactoryForTests = factory;
 }
 
-async function createShell(options?: ShellOptions): Promise<Shell> {
-	if (shellFactoryForTests) return await shellFactoryForTests(options);
-	// Windows brush exposes only its stub signal set, so the POSIX self-signal
-	// hazard and session/process-group containment contract do not apply there.
-	if (process.platform !== "win32") return new IsolatedShell(options);
-	const { Shell } = await shellNatives();
-	return new Shell(options);
+async function createShell(
+	options?: ShellOptions,
+	onTerminal?: (shell: Shell) => void,
+	signal?: AbortSignal,
+	onCreated?: (shell: Shell) => void,
+): Promise<Shell> {
+	let shell: Shell;
+	if (shellFactoryForTests) {
+		shell = await shellFactoryForTests(options);
+		const { Shell } = await shellNatives();
+		if (shell instanceof Shell && !shell.isRunSignalActive) shell = new AdmissionAwareShell(shell);
+	} else if (process.platform !== "win32") {
+		// Windows brush exposes only its stub signal set, so the POSIX self-signal
+		// hazard and session/process-group containment contract do not apply there.
+		shell = new IsolatedShell(options, { onTerminal });
+	} else {
+		const { Shell } = await shellNatives();
+		shell = new AdmissionAwareShell(new Shell(options));
+	}
+	onCreated?.(shell);
+	const readyPromise = shell.ready?.();
+	if (readyPromise) {
+		const startupAbort = Promise.withResolvers<"abort">();
+		const startupTimeout = Promise.withResolvers<"timeout">();
+		const startupTimeoutTimer = setTimeout(() => startupTimeout.resolve("timeout"), SHELL_STARTUP_TIMEOUT_MS);
+		const onAbort = () => startupAbort.resolve("abort");
+		if (signal?.aborted) startupAbort.resolve("abort");
+		else signal?.addEventListener("abort", onAbort, { once: true });
+		let winner: "ready" | "abort" | "timeout";
+		try {
+			winner = await Promise.race([
+				readyPromise.then(() => "ready" as const),
+				startupAbort.promise,
+				startupTimeout.promise,
+			]);
+		} finally {
+			clearTimeout(startupTimeoutTimer);
+			signal?.removeEventListener("abort", onAbort);
+		}
+		if (winner !== "ready") {
+			if (winner === "timeout") {
+				await shell.close().catch(() => undefined);
+				throw new Error(`Isolated shell worker did not become ready within ${SHELL_STARTUP_TIMEOUT_MS}ms.`);
+			}
+		}
+	}
+	return shell;
+}
+
+async function getOrCreatePersistentShell(
+	sessionKey: string,
+	options: ShellOptions,
+	signal: AbortSignal | undefined,
+	disposalGeneration: number,
+): Promise<Shell> {
+	let shellSession = shellSessions.get(sessionKey);
+	while (!shellSession && shellStartupLocks.has(sessionKey)) {
+		const startupLock = shellStartupLocks.get(sessionKey);
+		if (!startupLock) break;
+		const aborted = Promise.withResolvers<boolean>();
+		const onAbort = () => aborted.resolve(true);
+		signal?.addEventListener("abort", onAbort, { once: true });
+		const wasAborted = await Promise.race([startupLock.promise.then(() => false), aborted.promise]);
+		signal?.removeEventListener("abort", onAbort);
+		if (wasAborted) throw new DOMException("Command cancelled", "AbortError");
+		shellSession = shellSessions.get(sessionKey);
+	}
+	if (disposalGeneration !== shellDisposalGeneration) {
+		throw new Error("Shell session was disposed during startup.");
+	}
+	if (shellSession) return shellSession;
+
+	const startupLock = Promise.withResolvers<void>();
+	shellStartupLocks.set(sessionKey, startupLock);
+	let startingShell: Shell | undefined;
+	try {
+		shellSession = await createShell(
+			options,
+			terminalShell => {
+				startingShellSessions.delete(terminalShell);
+				if (shellSessions.get(sessionKey) === terminalShell) shellSessions.delete(sessionKey);
+			},
+			signal,
+			createdShell => {
+				startingShell = createdShell;
+				startingShellSessions.add(createdShell);
+			},
+		);
+	} finally {
+		if (startingShell) startingShellSessions.delete(startingShell);
+		if (shellStartupLocks.get(sessionKey) === startupLock) shellStartupLocks.delete(sessionKey);
+		startupLock.resolve();
+	}
+	if (disposalGeneration !== shellDisposalGeneration) {
+		await shellSession.close().catch(() => undefined);
+		throw new Error("Shell session was disposed during startup.");
+	}
+	if (!shellSession.isTerminal?.()) shellSessions.set(sessionKey, shellSession);
+	return shellSession;
 }
 
 export interface BashArtifactSaveSummary {
@@ -209,14 +353,22 @@ export interface BashResult {
 }
 
 const shellSessions = new Map<string, Shell>();
+const startingShellSessions = new Set<Shell>();
+interface ShellStartupLock {
+	promise: Promise<void>;
+	resolve: () => void;
+}
+const shellStartupLocks = new Map<string, ShellStartupLock>();
 const retiringShellSessions = new Set<Shell>();
+let shellDisposalGeneration = 0;
 // Cover pi-shell's normal cancellation kill waves without turning a stalled
 // native cleanup into a multi-second JavaScript tool stall.
-const CANCEL_CLEANUP_WAIT_MS = 400;
+const CANCEL_CLEANUP_WAIT_MS = 250;
+const SHELL_STARTUP_TIMEOUT_MS = 10_000;
 
 /** Number of persistent shell sessions currently retained (owner gauge). */
 export function getShellSessionCount(): number {
-	return shellSessions.size;
+	return shellSessions.size + startingShellSessions.size;
 }
 
 /**
@@ -236,9 +388,13 @@ export async function disposeAllShellSessions(): Promise<void> {
 	// `close` rather than `abort`: aborting only cancels in-flight commands and
 	// leaves a completed session retained for reuse, which keeps the native shell
 	// alive for the rest of the process lifetime.
-	const sessions = new Set([...shellSessions.values(), ...retiringShellSessions]);
+	shellDisposalGeneration++;
+	const sessions = new Set([...shellSessions.values(), ...startingShellSessions, ...retiringShellSessions]);
 	shellSessions.clear();
+	startingShellSessions.clear();
 	retiringShellSessions.clear();
+	for (const lock of shellStartupLocks.values()) lock.resolve();
+	shellStartupLocks.clear();
 	await Promise.allSettled([...sessions].map(session => session.close()));
 }
 
@@ -259,12 +415,13 @@ async function resolveShellCwd(cwd: string | undefined): Promise<string | undefi
 /** Translate `ShellMinimizerSettings` into native `MinimizerOptions`, or `undefined` when disabled. */
 export function buildMinimizerOptions(group: ShellMinimizerSettings): MinimizerOptions | undefined {
 	if (!group.enabled) return undefined;
+	const maxCaptureBytes = Math.min(4 * 1024 * 1024, Math.max(1024, Math.trunc(group.maxCaptureBytes)));
 	return {
 		enabled: true,
 		settingsPath: group.settingsPath || undefined,
 		only: group.only.length > 0 ? group.only : undefined,
 		except: group.except.length > 0 ? group.except : undefined,
-		maxCaptureBytes: group.maxCaptureBytes,
+		maxCaptureBytes,
 	};
 }
 
@@ -316,34 +473,65 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 	}
 	const usePersistentShell = options?.oneShot !== true;
 	const sessionKey = buildSessionKey(shell, configuredPrefix, snapshotPath, shellEnv, options?.sessionKey, minimizer);
+	const invocationDisposalGeneration = shellDisposalGeneration;
 
-	let shellSession = usePersistentShell ? shellSessions.get(sessionKey) : undefined;
-	if (!shellSession && usePersistentShell) {
-		shellSession = await createShell({
-			sessionEnv: shellEnv,
-			snapshotPath: snapshotPath ?? undefined,
-			minimizer,
-		});
-		shellSessions.set(sessionKey, shellSession);
+	let shellSession: Shell | undefined;
+	try {
+		shellSession = usePersistentShell
+			? await getOrCreatePersistentShell(
+					sessionKey,
+					{ sessionEnv: shellEnv, snapshotPath: snapshotPath ?? undefined, minimizer },
+					options?.signal,
+					invocationDisposalGeneration,
+				)
+			: undefined;
+	} catch (error) {
+		if (error instanceof DOMException && error.name === "AbortError") {
+			return {
+				exitCode: undefined,
+				cancelled: true,
+				...(await sink.dump("Command cancelled")),
+			};
+		}
+		throw error;
 	}
 	// Non-persistent invocations still need an owned native Shell so its lifetime
 	// can be ended explicitly. executeShell creates a native shell outside the
 	// persistent registry, leaving its cleanup untrackable by the host process.
 	const oneShotShell = !usePersistentShell
-		? await createShell({
-				sessionEnv: shellEnv,
-				snapshotPath: snapshotPath ?? undefined,
-				minimizer,
-			})
+		? await createShell(
+				{
+					sessionEnv: shellEnv,
+					snapshotPath: snapshotPath ?? undefined,
+					minimizer,
+				},
+				undefined,
+				options?.signal,
+			)
 		: undefined;
-	const activeShell = shellSession ?? oneShotShell;
+	let activeShell = shellSession ?? oneShotShell;
+	if (options?.signal?.aborted) {
+		if (shellSession && shellSessions.get(sessionKey) === shellSession) shellSessions.delete(sessionKey);
+		await activeShell?.close().catch(() => undefined);
+		return {
+			exitCode: undefined,
+			cancelled: true,
+			...(await sink.dump("Command cancelled")),
+		};
+	}
 	const userSignal = options?.signal;
 	const runAbortController = new AbortController();
 	const abortCurrentExecution = () => {
 		if (!runAbortController.signal.aborted) {
 			runAbortController.abort();
 		}
-		if (activeShell && !abortPromise) {
+		// IsolatedShell owns run admission and observes this exact run signal. Calling
+		// its shared abort method here would let a queued request cancel the active run.
+		if (
+			activeShell &&
+			(!activeShell.isRunSignalActive || activeShell.isRunSignalActive(runAbortController.signal)) &&
+			!abortPromise
+		) {
 			abortPromise = activeShell.abort();
 		}
 	};
@@ -385,20 +573,37 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 	let runSettled = false;
 
 	try {
-		const runPromise = activeShell!.run(
-			{
-				command: finalCommand,
-				cwd: commandCwd,
-				env: commandEnv,
-				timeoutMs: executionTimeoutMs,
-				signal: runAbortController.signal,
-			},
-			(err, chunk) => {
-				if (!err) {
-					enqueueChunk(chunk);
-				}
-			},
-		);
+		const runOptions: ShellRunOptions = {
+			command: finalCommand,
+			cwd: commandCwd,
+			env: commandEnv,
+			timeoutMs: executionTimeoutMs,
+			signal: runAbortController.signal,
+		};
+		const onRunChunk = (err: Error | null, chunk: string) => {
+			if (!err) enqueueChunk(chunk);
+		};
+		const admittedShell = activeShell!;
+		const runPromise = admittedShell.run(runOptions, onRunChunk).catch(async error => {
+			if (
+				usePersistentShell &&
+				admittedShell instanceof IsolatedShell &&
+				!admittedShell.wasRunSignalDispatched(runAbortController.signal) &&
+				admittedShell.isTerminal() &&
+				!runAbortController.signal.aborted &&
+				shellSessions.get(sessionKey) !== admittedShell
+			) {
+				shellSession = await getOrCreatePersistentShell(
+					sessionKey,
+					{ sessionEnv: shellEnv, snapshotPath: snapshotPath ?? undefined, minimizer },
+					runAbortController.signal,
+					invocationDisposalGeneration,
+				);
+				activeShell = shellSession;
+				return await shellSession.run(runOptions, onRunChunk);
+			}
+			throw error;
+		});
 
 		const winner = await Promise.race([
 			runPromise.then(result => ({ kind: "result" as const, result })),
@@ -408,32 +613,60 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 
 		if (winner.kind === "timeout" || winner.kind === "abort") {
 			acceptingChunks = false;
+			if (activeShell?.isRunSignalActive && !activeShell.isRunSignalActive(runAbortController.signal)) {
+				// The queued run observes the aborted signal when it later reaches
+				// admission, so it cannot execute. Do not make this caller wait for an
+				// unrelated active predecessor to finish.
+				void runPromise.catch(() => undefined);
+				return {
+					exitCode: undefined,
+					cancelled: true,
+					...(await sink.dump(
+						winner.kind === "timeout" && baseTimeoutMs !== undefined
+							? `Command timed out after ${Math.round(baseTimeoutMs / 1000)} seconds`
+							: "Command cancelled",
+					)),
+				};
+			}
 			if (shellSession) {
+				const retiringShell = shellSession;
 				resetSession = true;
-				retiringShellSessions.add(shellSession);
-				if (shellSessions.get(sessionKey) === shellSession) {
+				retiringShellSessions.add(retiringShell);
+				if (shellSessions.get(sessionKey) === retiringShell) {
 					shellSessions.delete(sessionKey);
 				}
 				runSettled = await awaitAbortCleanup(runPromise);
 				// A retired session is never reused, so release the native shell instead
 				// of leaving it retained for the rest of the process lifetime.
 				if (runSettled) {
-					retiringShellSessions.delete(shellSession);
-					void shellSession.close().catch(() => undefined);
+					retiringShellSessions.delete(retiringShell);
+					void retiringShell.close().catch(() => undefined);
+				} else if (retiringShell instanceof IsolatedShell) {
+					// A stopped or otherwise wedged isolated worker cannot settle its protocol
+					// run. Close the supervisor-owned boundary now so it force-reaps the group.
+					await retiringShell.close().catch(() => undefined);
+					retiringShellSessions.delete(retiringShell);
+					void runPromise.catch(() => undefined);
 				} else {
+					// NativeShell.close() waits on the run's session mutex and can remain
+					// unresolved on Windows. Keep the shell quarantined until its run settles
+					// instead of blocking cancellation on that close.
 					void runPromise
 						.finally(() => {
-							retiringShellSessions.delete(shellSession);
-							if (shellSessions.get(sessionKey) === shellSession) {
-								shellSessions.delete(sessionKey);
-							}
-							void shellSession.close().catch(() => undefined);
+							retiringShellSessions.delete(retiringShell);
+							if (shellSessions.get(sessionKey) === retiringShell) shellSessions.delete(sessionKey);
+							void retiringShell.close().catch(() => undefined);
 						})
 						.catch(() => undefined);
 				}
 			} else {
 				runSettled = await awaitAbortCleanup(runPromise);
-				if (!runSettled) void runPromise.catch(() => undefined);
+				if (!runSettled) {
+					if (oneShotShell instanceof IsolatedShell) {
+						await oneShotShell.close().catch(() => undefined);
+					}
+					void runPromise.catch(() => undefined);
+				}
 			}
 			return {
 				exitCode: undefined,
@@ -456,6 +689,11 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 				? `Command timed out after ${Math.round(options.timeout / 1000)} seconds`
 				: "Command timed out";
 			resetSession = true;
+			runSettled = true;
+			if (shellSession && shellSessions.get(sessionKey) === shellSession) {
+				shellSessions.delete(sessionKey);
+			}
+			void activeShell?.close().catch(() => undefined);
 			return {
 				exitCode: undefined,
 				cancelled: true,
@@ -466,6 +704,11 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 		// Handle cancellation
 		if (winner.result.cancelled) {
 			resetSession = true;
+			runSettled = true;
+			if (shellSession && shellSessions.get(sessionKey) === shellSession) {
+				shellSessions.delete(sessionKey);
+			}
+			void activeShell?.close().catch(() => undefined);
 			return {
 				exitCode: undefined,
 				cancelled: true,
@@ -534,6 +777,8 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 		};
 	} catch (err) {
 		resetSession = true;
+		if (shellSession && shellSessions.get(sessionKey) === shellSession) shellSessions.delete(sessionKey);
+		void activeShell?.close().catch(() => undefined);
 		throw err;
 	} finally {
 		if (timeoutTimer) {
@@ -547,8 +792,9 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 		}
 		if (oneShotShell) {
 			// Always close: a successful run keeps its session retained, so aborting
-			// alone would leak the native shell and hold the event loop open.
-			const disposePromise = (abortPromise ?? Promise.resolve()).then(() => oneShotShell.close());
+			// alone would leak the native shell and hold the event loop open. Closing
+			// must not wait behind an abort acknowledgement from a stopped runtime.
+			const disposePromise = oneShotShell.close();
 			await Promise.race([disposePromise.catch(() => undefined), Bun.sleep(CANCEL_CLEANUP_WAIT_MS)]);
 		}
 	}

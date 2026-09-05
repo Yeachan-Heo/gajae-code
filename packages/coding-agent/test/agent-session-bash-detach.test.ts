@@ -17,20 +17,21 @@
  *           → executeBash
  *             → pi-natives `Shell.run` (real native binding)
  *               → brush-core::execute_external_command (the patched code)
- *                 → spawned child reports getsid()/getpid()
+ *                 → spawned child reports getsid()/getpid()/getpgrp()
  *
  * The assistant's first turn is a scripted `bash` tool call asking Python to
- * print `getsid(0) getpid()`. The second scripted turn is a stop. After the
+ * print the worker PID plus `getsid(0) getpid() getpgrp()`. The second scripted turn is a stop. After the
  * loop settles, we extract the child's session ID from the persisted
  * `toolResult` message and compare it against the test runner's session ID.
  *
  * Pre-fix (`new_pg=false` skipped `detach_session()`), the spawned child
  * inherits the test runner's session, so `child_sid === host_sid`.
  *
- * Post-fix, the embedded-host branch of `child_session_action` returns
- * `DetachSession`, brush calls `setsid()` before exec, and the child becomes
- * its own session leader: `child_sid === child_pid` and
- * `child_sid !== host_sid`.
+ * The bash executor now places brush in a dedicated worker session/process
+ * group. External children stay inside that worker-owned boundary, so the
+ * supervisor can be killed together with every descendant: `child_sid ===
+ * child_pgid`, while that session remains distinct from both the brush runtime
+ * PID and the GJC/test host.
  *
  * If this test ever starts failing on macOS/Linux, the embedded-host bug is
  * back and `BashTool` invocations that touch `/dev/tty` or `tcsetpgrp` can
@@ -88,7 +89,7 @@ function getToolResultText(messages: AgentMessage[], callId: string): string | u
 	return undefined;
 }
 
-const PYTHON_PROBE = `python3 -c "import os; print(os.getsid(0), os.getpid())"`;
+const PYTHON_PROBE = `printf "%s " "$$"; python3 -c "import os; print(os.getsid(0), os.getpid(), os.getpgrp())"`;
 
 /**
  * Snapshot the current process's session id by spawning a probe directly.
@@ -112,7 +113,7 @@ function pythonAvailable(): boolean {
 	return probe.status === 0;
 }
 
-describe("BashTool through AgentSession runs children in their own session (e2e)", () => {
+describe("BashTool through AgentSession contains children in its worker session (e2e)", () => {
 	const skip = !pythonAvailable();
 
 	let session: AgentSession;
@@ -208,7 +209,7 @@ describe("BashTool through AgentSession runs children in their own session (e2e)
 		resetSettingsForTest();
 	});
 
-	it.skipIf(skip)("spawned child runs as its own session leader, not in the host's session", async () => {
+	it.skipIf(skip)("spawned child stays in the isolated worker session, not the host session", async () => {
 		const callId = "call_bash_probe";
 		scriptedResponses = [bashCall(PYTHON_PROBE, callId), stopReply("ok")];
 
@@ -219,15 +220,21 @@ describe("BashTool through AgentSession runs children in their own session (e2e)
 		expect(resultText, "expected a toolResult for the bash call").toBeDefined();
 
 		// `executeBash` wraps its own metadata around the raw output. We only
-		// care about the `<sid> <pid>` line the Python probe emitted. Pull the
-		// first whitespace-separated pair of positive integers.
-		const match = resultText!.match(/(\d+)\s+(\d+)/);
-		expect(match, `expected '<sid> <pid>' in tool result, saw: ${JSON.stringify(resultText)}`).not.toBeNull();
-		const childSid = Number.parseInt(match![1]!, 10);
-		const childPid = Number.parseInt(match![2]!, 10);
+		// care about the `<worker-pid> <sid> <pid> <pgid>` probe line.
+		const match = resultText!.match(/(\d+)\s+(\d+)\s+(\d+)\s+(\d+)/);
+		expect(
+			match,
+			`expected '<worker-pid> <sid> <pid> <pgid>' in tool result, saw: ${JSON.stringify(resultText)}`,
+		).not.toBeNull();
+		const workerPid = Number.parseInt(match![1]!, 10);
+		const childSid = Number.parseInt(match![2]!, 10);
+		const childPid = Number.parseInt(match![3]!, 10);
+		const childPgid = Number.parseInt(match![4]!, 10);
 
+		expect(workerPid).toBeGreaterThan(0);
 		expect(childSid).toBeGreaterThan(0);
 		expect(childPid).toBeGreaterThan(0);
+		expect(childPgid).toBeGreaterThan(0);
 
 		// Pre-fix behavior: child inherits host's session.
 		expect(
@@ -235,26 +242,14 @@ describe("BashTool through AgentSession runs children in their own session (e2e)
 			`child sid (${childSid}) equals host sid (${hostSid}) — embedded-host detach regressed`,
 		).not.toBe(hostSid);
 
-		// Post-fix: brush ran setsid() so the child is its own session leader.
-		expect(childSid, `child sid (${childSid}) !== child pid (${childPid}) — child is not session leader`).toBe(
-			childPid,
-		);
+		expect(childSid, `child sid (${childSid}) !== child pgid (${childPgid})`).toBe(childPgid);
+		expect(childSid).not.toBe(workerPid);
+		expect(childPid).not.toBe(workerPid);
 	});
 
 	it.skipIf(skip)("pipelines through BashTool still produce both stages' output (no setsid breakage)", async () => {
-		// Sanity check that the embedded-host detach (which calls `setsid` on solo
-		// children) does not break multi-process commands. The brush-core fix carves
-		// out the `in_pipeline_group` case in `child_session_action`; this test asserts
-		// that pipelines run end-to-end through the agent and produce both stages'
-		// output with exit code 0.
-		//
-		// Note: the `in_pipeline_group=true` branch is unreachable from a non-
-		// interactive embedded brush (every stage spawns with `process_group_id=None`
-		// and falls into the embedded-host `DetachSession` rule). The fact that the
-		// pipeline still works is the load-bearing assertion: `setsid` is benign for
-		// stages that are already kernel-default pgroup leaders. The pgroup carve-out
-		// matters only for the interactive shell path, which is unit-tested in the
-		// rust truth-table.
+		// Keeping all stages inside the worker process group must preserve ordinary
+		// pipeline semantics while retaining one supervisor-owned kill boundary.
 		const callId = "call_bash_pipeline";
 		const command =
 			"python3 -c \"print('stage_a')\" | " +

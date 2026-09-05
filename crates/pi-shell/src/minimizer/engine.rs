@@ -92,7 +92,12 @@ pub fn apply(
 		record_unknown_command(command);
 		return MinimizerOutput::passthrough(captured).labeled("unknown");
 	};
-	apply_identity(&identity, command, captured, exit_code, config)
+	let output = apply_identity(&identity, command, captured, exit_code, config);
+	if output.text.len() > config.max_capture_bytes as usize {
+		MinimizerOutput::passthrough(captured).labeled("output-too-large")
+	} else {
+		output
+	}
 }
 
 fn identity_has_filter(identity: &detect::CommandIdentity, config: &MinimizerConfig) -> bool {
@@ -472,6 +477,38 @@ mod pipeline_integration_tests {
 		let out = apply("git status", &big, 0, &cfg);
 		assert!(!out.changed);
 		assert_eq!(out.filter, "too-large");
+	}
+
+	#[test]
+	fn expanded_pipeline_output_is_passthrough() {
+		let path = std::env::temp_dir().join(format!(
+			"pi-shell-minimizer-expansion-{}-{}.toml",
+			std::process::id(),
+			std::time::SystemTime::now()
+				.duration_since(std::time::UNIX_EPOCH)
+				.expect("system time after epoch")
+				.as_nanos()
+		));
+		let replacement = "x".repeat(2048);
+		std::fs::write(
+			&path,
+			format!(
+				"[filters.echo]\nmatch_command = \"^echo$\"\nreplace = [{{ pattern = \"a\", \
+				 replacement = \"{replacement}\" }}]\n"
+			),
+		)
+		.expect("write expansion pipeline");
+		let cfg = MinimizerConfig::from_options(&MinimizerOptions {
+			enabled: Some(true),
+			settings_path: Some(path.to_string_lossy().into_owned()),
+			max_capture_bytes: Some(1024),
+			..Default::default()
+		});
+		let out = apply("echo a", "a\n", 0, &cfg);
+		std::fs::remove_file(path).expect("remove expansion pipeline");
+		assert!(!out.changed);
+		assert_eq!(out.text, "a\n");
+		assert_eq!(out.filter, "output-too-large");
 	}
 
 	#[test]

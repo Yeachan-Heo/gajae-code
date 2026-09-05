@@ -1,11 +1,28 @@
 import * as readline from "node:readline";
-import type { Shell as NativeShell } from "@gajae-code/natives";
-import type { BashShellWorkerRequest, BashShellWorkerResponse } from "./bash-shell-worker-protocol";
+import type { Shell as NativeShell, ShellOptions } from "@gajae-code/natives";
+import { fatalCatchableSignals, signalExitCode } from "./bash-shell-signals";
+import type { BashShellWorkerRequest, IsolatedShellRunResult } from "./bash-shell-worker-protocol";
 
-type NativeShellBindings = Pick<typeof import("@gajae-code/natives"), "Shell">;
+type NativeShellConstructor = new (options?: ShellOptions | null) => NativeShell;
+type NativeShellBindings = { Shell: NativeShellConstructor };
+type BashShellWorkerResponsePayload =
+	| { type: "ready" }
+	| { type: "chunk"; id: number; chunk: string }
+	| { type: "result"; id: number; result: IsolatedShellRunResult }
+	| { type: "void"; id: number }
+	| { type: "error"; id?: number; message: string };
 
-function writeResponse(response: BashShellWorkerResponse, callback?: () => void): void {
-	process.stdout.write(`${JSON.stringify(response)}\n`, callback);
+function restoreFatalSignalSemantics(): void {
+	for (const signal of fatalCatchableSignals()) {
+		const exitCode = signalExitCode(signal);
+		if (exitCode === undefined) continue;
+		try {
+			process.removeAllListeners(signal);
+			process.on(signal, () => process.exit(exitCode));
+		} catch {
+			// Unsupported signal handlers retain the platform's default disposition.
+		}
+	}
 }
 
 function errorMessage(error: unknown): string {
@@ -13,8 +30,14 @@ function errorMessage(error: unknown): string {
 }
 
 export async function runBashShellWorker(): Promise<void> {
+	restoreFatalSignalSemantics();
 	let shell: NativeShell | undefined;
 	let initialized = false;
+	let protocolToken: string | undefined;
+	const writeResponse = (response: BashShellWorkerResponsePayload, callback?: () => void): void => {
+		if (!protocolToken) return;
+		process.stdout.write(`${JSON.stringify({ ...response, token: protocolToken })}\n`, callback);
+	};
 	const input = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
 
 	input.on("line", line => {
@@ -27,18 +50,33 @@ export async function runBashShellWorker(): Promise<void> {
 		}
 
 		if (request.type === "init") {
+			protocolToken = request.token;
 			if (initialized) {
 				writeResponse({ type: "error", message: "Shell worker was initialized more than once." });
 				return;
 			}
 			try {
 				const { Shell } = require("@gajae-code/natives") as NativeShellBindings;
-				shell = new Shell(request.options);
+				const shellOptions = {
+					...request.options,
+					containedProcessGroup: process.platform !== "win32",
+					ownershipLedgerPath: request.ownershipLedger?.path,
+					ownershipLedgerToken: request.ownershipLedger?.token,
+				} as ShellOptions;
+				shell = new Shell(shellOptions);
 				initialized = true;
 				writeResponse({ type: "ready" });
 			} catch (error) {
 				writeResponse({ type: "error", message: errorMessage(error) }, () => process.exit(1));
 			}
+			return;
+		}
+		if (!protocolToken || request.token !== protocolToken) {
+			writeResponse({
+				type: "error",
+				id: "id" in request ? request.id : undefined,
+				message: "Invalid protocol token.",
+			});
 			return;
 		}
 

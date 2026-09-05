@@ -19476,10 +19476,10 @@ export class AgentSession {
 					isError: message.isError,
 					content: this.#normalizeProviderReplayValue(message.content),
 				};
-			case "bashExecution":
+			case "pythonExecution":
 				return {
 					role: message.role,
-					command: message.command,
+					code: message.code,
 					output: message.output,
 					exitCode: message.exitCode,
 					cancelled: message.cancelled,
@@ -19497,12 +19497,13 @@ export class AgentSession {
 						: undefined,
 					excludeFromContext: message.excludeFromContext,
 				};
-			case "pythonExecution":
+			case "bashExecution":
 				return {
 					role: message.role,
-					code: message.code,
+					command: message.command,
 					output: message.output,
 					exitCode: message.exitCode,
+					signal: message.signal,
 					cancelled: message.cancelled,
 					meta: message.meta
 						? {
@@ -22379,6 +22380,7 @@ export class AgentSession {
 			command,
 			output: result.output,
 			exitCode: result.exitCode,
+			signal: result.signal,
 			cancelled: result.cancelled,
 			truncated: result.truncated,
 			meta,

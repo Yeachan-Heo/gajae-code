@@ -188,6 +188,29 @@ describe("bash resource lifecycle", () => {
 		await sibling.exited.catch(() => undefined);
 	}, 30_000);
 
+	it("reaps background descendants when a persistent shell is disposed", async () => {
+		if (process.platform === "win32") return;
+
+		const grandchildPidFile = path.join(tempDir, "orphan-grandchild.pid");
+		await executeBash(
+			`python3 -c 'import os,signal,time; pid=os.fork(); (open(${JSON.stringify(grandchildPidFile)}, "w").write(str(os.getpid())), signal.signal(signal.SIGTERM, signal.SIG_IGN), time.sleep(30)) if pid == 0 else os._exit(0)'`,
+			{
+				cwd: tempDir,
+				timeout: 5_000,
+				sessionKey: "dispose-background-descendant",
+			},
+		);
+		const deadline = Date.now() + 2_000;
+		while (!fs.existsSync(grandchildPidFile) && Date.now() < deadline) await Bun.sleep(25);
+		expect(fs.existsSync(grandchildPidFile)).toBe(true);
+		const grandchildPid = Number.parseInt(await Bun.file(grandchildPidFile).text(), 10);
+		expect(grandchildPid).toBeGreaterThan(0);
+		expect(processExists(grandchildPid)).toBe(true);
+
+		await disposeAllShellSessions();
+		expect(await waitForGone(grandchildPid)).toBe(true);
+	}, 30_000);
+
 	it("caps bash artifact output and annotates truncation metadata", async () => {
 		const artifactPath = path.join(tempDir, "capped.log");
 		const sink = new OutputSink({

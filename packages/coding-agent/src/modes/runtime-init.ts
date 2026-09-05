@@ -326,6 +326,7 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 						const result = await session.executeBash(input.cmd, undefined, { excludeFromContext: true });
 						return {
 							exitCode: result.exitCode,
+							signal: result.signal,
 							cancelled: result.cancelled,
 							output: result.output,
 							truncated: result.truncated,

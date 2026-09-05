@@ -22,6 +22,12 @@ describe("BashExecutionComponent #clampDisplayLine", () => {
 		return component;
 	}
 
+	it("renders the terminating signal in the status footer", () => {
+		const component = new BashExecutionComponent("kill -TERM $$", ui, false);
+		component.setComplete(143, false, { signal: "SIGTERM" });
+		expect(component.render(120).join("\n")).toContain("SIGTERM, exit 143");
+	});
+
 	describe("wide glyphs (CJK characters)", () => {
 		it("counts CJK characters as 2 columns each", () => {
 			const cjkString = "日本語";

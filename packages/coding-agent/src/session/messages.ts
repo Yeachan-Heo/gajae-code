@@ -212,6 +212,7 @@ export interface BashExecutionMessage {
 	command: string;
 	output: string;
 	exitCode: number | undefined;
+	signal?: string;
 	cancelled: boolean;
 	truncated: boolean;
 	meta?: OutputMeta;
@@ -313,6 +314,10 @@ export function bashExecutionToText(msg: BashExecutionMessage): string {
 	}
 	if (msg.cancelled) {
 		text += "\n\n(command cancelled)";
+	} else if (msg.signal) {
+		text += `\n\nCommand terminated by ${msg.signal}${
+			msg.exitCode !== null && msg.exitCode !== undefined ? ` (exit code ${msg.exitCode})` : ""
+		}`;
 	} else if (msg.exitCode !== null && msg.exitCode !== undefined && msg.exitCode !== 0) {
 		text += `\n\nCommand exited with code ${msg.exitCode}`;
 	}

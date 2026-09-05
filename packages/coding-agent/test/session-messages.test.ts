@@ -2,7 +2,7 @@ import { describe, expect, it } from "bun:test";
 import type { AgentMessage } from "@gajae-code/agent-core";
 import type { Message } from "@gajae-code/ai";
 import { inferCopilotInitiator } from "@gajae-code/ai/providers/github-copilot-headers";
-import { convertToLlm } from "@gajae-code/coding-agent/session/messages";
+import { bashExecutionToText, convertToLlm } from "@gajae-code/coding-agent/session/messages";
 
 function expectAttribution(message: Message | undefined, expected: "user" | "agent" | undefined): void {
 	expect(message).toBeDefined();
@@ -14,6 +14,20 @@ function expectAttribution(message: Message | undefined, expected: "user" | "age
 }
 
 describe("convertToLlm custom message mapping", () => {
+	it("renders restored bash signal metadata", () => {
+		const text = bashExecutionToText({
+			role: "bashExecution",
+			command: "kill -TERM $$",
+			output: "",
+			exitCode: 143,
+			signal: "SIGTERM",
+			cancelled: false,
+			truncated: false,
+			timestamp: Date.now(),
+		});
+		expect(text).toContain("Command terminated by SIGTERM (exit code 143)");
+	});
+
 	it("uses async-result attribution without special role mapping", () => {
 		const messages: AgentMessage[] = [
 			{

@@ -188,6 +188,9 @@ pub struct CreateOptions<SE: extensions::ShellExtensions = extensions::DefaultSh
 	/// Whether to launch external commands as session leaders.
 	#[builder(default)]
 	pub external_cmd_leads_session: bool,
+	/// Whether an embedding supervisor owns one containing process group.
+	#[builder(default)]
+	pub contained_process_group: bool,
 	/// Initial working dir for the shell. If left unspecified, will be populated
 	/// from the host environment.
 	pub working_dir: Option<PathBuf>,

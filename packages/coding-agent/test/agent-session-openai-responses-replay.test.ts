@@ -12,6 +12,7 @@ import type { CreateAgentSessionResult } from "@gajae-code/coding-agent/sdk";
 import * as sdkModule from "@gajae-code/coding-agent/sdk";
 import type { AgentSession, ForkContextSeed } from "@gajae-code/coding-agent/session/agent-session";
 import type { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
+import { convertToLlm } from "@gajae-code/coding-agent/session/messages";
 import {
 	type SessionEntry,
 	SessionManager,
@@ -1126,6 +1127,71 @@ describe("AgentSession OpenAI Responses replay boundaries", () => {
 				message => message.role === "user" && getTextContent(message) === "Externally appended follow-up",
 			),
 		).toBe(true);
+	});
+
+	it("preserves bash signal metadata across persisted reload and provider replay normalization", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-issue-5291-bash-signal-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+
+		const { sessionFile } = await createPersistedSession(tempDir, sessionManager => {
+			sessionManager.appendModelChange("openai-codex/gpt-5.2-codex");
+			sessionManager.appendMessage({ role: "user", content: "before signalled command", timestamp: Date.now() });
+			sessionManager.appendMessage({
+				role: "bashExecution",
+				command: "kill -TERM $$",
+				output: "",
+				exitCode: 143,
+				signal: "SIGTERM",
+				cancelled: false,
+				truncated: false,
+				timestamp: Date.now(),
+			});
+			sessionManager.appendMessage(createStaleAssistantMessage("after signalled command"));
+		});
+
+		const reloadedSessionManager = await SessionManager.open(sessionFile, tempDir);
+		const { session, authStorage } = await createSessionHarness(tempDir, reloadedSessionManager, {
+			provider: "openai-codex",
+			modelId: "gpt-5.2-codex",
+		});
+		sessions.push(session);
+		authStorages.push(authStorage);
+		await session.reload();
+
+		const initialBashMessage = session.messages.find(message => message.role === "bashExecution");
+		if (initialBashMessage?.role !== "bashExecution") {
+			throw new Error("Expected restored bash execution message");
+		}
+		expect(initialBashMessage.signal).toBe("SIGTERM");
+
+		const closeSpy = vi.fn();
+		session.providerSessionState.set("openai-codex-responses", { close: closeSpy } satisfies ProviderSessionState);
+
+		const rewrittenLines = fs
+			.readFileSync(sessionFile, "utf8")
+			.trimEnd()
+			.split("\n")
+			.map(line => {
+				const entry = JSON.parse(line) as SessionEntry;
+				if (entry.type === "message" && entry.message.role === "bashExecution") {
+					entry.message = { ...entry.message, signal: "SIGKILL" };
+				}
+				return JSON.stringify(entry);
+			});
+		fs.writeFileSync(sessionFile, `${rewrittenLines.join("\n")}\n`, "utf8");
+
+		await session.reload();
+
+		expect(closeSpy).toHaveBeenCalledTimes(1);
+		const restoredBashMessage = session.messages.find(message => message.role === "bashExecution");
+		if (restoredBashMessage?.role !== "bashExecution") throw new Error("Expected reloaded bash execution message");
+		expect(restoredBashMessage.signal).toBe("SIGKILL");
+
+		const rendered = convertToLlm([restoredBashMessage])[0];
+		const renderedText = rendered && typeof rendered.content !== "string" ? rendered.content[0] : undefined;
+		expect(renderedText?.type).toBe("text");
+		if (renderedText?.type !== "text") throw new Error("Expected rendered bash text");
+		expect(renderedText.text).toContain("Command terminated by SIGKILL (exit code 143)");
 	});
 
 	it("resets provider session state when same-file reload restores a different saved model", async () => {

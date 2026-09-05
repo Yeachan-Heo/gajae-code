@@ -66,6 +66,7 @@ function normalizeBaseline(message: AgentMessage): unknown {
 				...(message.role === "bashExecution" ? { command: message.command } : { code: message.code }),
 				output: message.output,
 				exitCode: message.exitCode,
+				...(message.role === "bashExecution" ? { signal: message.signal } : {}),
 				cancelled: message.cancelled,
 				meta: message.meta
 					? {

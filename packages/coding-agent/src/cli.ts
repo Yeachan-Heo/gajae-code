@@ -10,8 +10,15 @@ import { APP_NAME, formatBunRuntimeError, MIN_BUN_VERSION, VERSION } from "@gaja
 import { runFixtureReport } from "./cli/fixture-report";
 import { ROOT_LAUNCH_FLAGS } from "./cli/root-flags";
 import QuickLane from "./commands/quick-lane";
+import { runBashShellGuardian } from "./exec/bash-shell-guardian";
+import { runBashShellSupervisor } from "./exec/bash-shell-supervisor";
 import { runBashShellWorker } from "./exec/bash-shell-worker";
-import { BASH_SHELL_WORKER_ARG } from "./exec/bash-shell-worker-protocol";
+import {
+	BASH_SHELL_RUNTIME_ARG,
+	BASH_SHELL_SUPERVISOR_ARG,
+	BASH_SHELL_WORKER_ARG,
+} from "./exec/bash-shell-worker-protocol";
+import { smokeTestIsolatedShell } from "./exec/isolated-shell";
 import { smokeTestTabWorker } from "./tools/browser/tab-worker-smoke";
 
 if (Bun.semver.order(Bun.version, MIN_BUN_VERSION) < 0) {
@@ -342,6 +349,7 @@ async function runSmokeTest(): Promise<void> {
 	const { runNativeSmokeTest } = await import("./cli/native-smoke");
 	await runNativeSmokeTest();
 	await smokeTestTabWorker();
+	await smokeTestIsolatedShell();
 	process.stdout.write("smoke-test: ok\n");
 }
 
@@ -395,6 +403,14 @@ export function routeRootArgv(argv: readonly string[]): string[] {
 /** Run the CLI with the given argv (no `process.argv` prefix). */
 export async function runCli(argv: string[]): Promise<void> {
 	if (argv.length === 1 && argv[0] === BASH_SHELL_WORKER_ARG) {
+		await runBashShellGuardian();
+		return;
+	}
+	if (argv.length === 1 && argv[0] === BASH_SHELL_SUPERVISOR_ARG) {
+		await runBashShellSupervisor();
+		return;
+	}
+	if (argv.length === 1 && argv[0] === BASH_SHELL_RUNTIME_ARG) {
 		await runBashShellWorker();
 		return;
 	}

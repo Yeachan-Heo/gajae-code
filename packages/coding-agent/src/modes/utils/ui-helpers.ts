@@ -530,6 +530,7 @@ export class UiHelpers {
 					component.appendOutput(message.output);
 				}
 				component.setComplete(message.exitCode, message.cancelled, {
+					signal: message.signal,
 					truncation: message.meta?.truncation,
 				});
 				addChatChild(this.ctx, component);

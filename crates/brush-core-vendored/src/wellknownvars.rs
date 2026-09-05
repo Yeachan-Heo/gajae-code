@@ -419,7 +419,12 @@ pub(crate) fn init_well_known_vars(
 	)?;
 
 	// PPID
-	if let Some(ppid) = sys::terminal::get_parent_process_id() {
+	let ppid = if std::env::var_os("GJC_ISOLATED_SHELL_RUNTIME").is_some() {
+		i32::try_from(std::process::id()).ok()
+	} else {
+		sys::terminal::get_parent_process_id()
+	};
+	if let Some(ppid) = ppid {
 		let mut ppid_var = ShellVariable::new(ppid.to_string());
 		ppid_var.treat_as_integer().set_readonly();
 		shell.env_mut().set_global("PPID", ppid_var)?;

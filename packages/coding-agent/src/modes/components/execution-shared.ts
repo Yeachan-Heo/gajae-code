@@ -68,6 +68,7 @@ export function createCollapsedPreview(previewText: string, previewLines: number
 export function buildStatusFooter(opts: {
 	status: ExecutionStatus;
 	exitCode: number | undefined;
+	signal?: string;
 	truncation: TruncationMeta | undefined;
 	hiddenLineCount: number;
 	/** Suppress the "… N more lines" hint (used when sixel passthrough renders the full output). */
@@ -81,7 +82,9 @@ export function buildStatusFooter(opts: {
 	if (opts.status === "cancelled") {
 		parts.push(theme.fg("warning", "(cancelled)"));
 	} else if (opts.status === "error") {
-		parts.push(theme.fg("error", `(exit ${opts.exitCode})`));
+		parts.push(
+			theme.fg("error", opts.signal ? `(${opts.signal}, exit ${opts.exitCode})` : `(exit ${opts.exitCode})`),
+		);
 	}
 	if (opts.truncation) {
 		parts.push(theme.fg("warning", formatTruncationMetaNotice(opts.truncation)));

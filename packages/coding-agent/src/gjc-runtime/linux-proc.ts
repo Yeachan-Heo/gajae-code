@@ -66,6 +66,20 @@ export function parseLinuxProcState(stat: string | null | undefined): string | n
 	return parseLinuxProcIdentity(stat)?.state ?? null;
 }
 
+/** Parse field 4 (`ppid`) from a `/proc/<pid>/stat` record. */
+export function parseLinuxProcParentPid(stat: string | null | undefined): number | null {
+	if (!stat || stat.includes("\0") || stat.includes("\r")) return null;
+	const record = stat.endsWith("\n") ? stat.slice(0, -1) : stat;
+	const close = record.lastIndexOf(")");
+	if (close < 0) return null;
+	const fields = record
+		.slice(close + 1)
+		.trim()
+		.split(/[ \t]+/);
+	const parentPid = Number.parseInt(fields[1] ?? "", 10);
+	return Number.isSafeInteger(parentPid) && parentPid >= 0 ? parentPid : null;
+}
+
 export function probeLinuxProcPidSync(pid: number): LinuxProcPidProbeResult {
 	if (!Number.isSafeInteger(pid) || pid <= 0) return { kind: "unverifiable", reason: "invalid_pid" };
 	if (process.platform !== "linux") return { kind: "unverifiable", reason: "unsupported_platform" };

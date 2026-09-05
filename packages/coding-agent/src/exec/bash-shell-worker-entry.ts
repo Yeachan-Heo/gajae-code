@@ -1,5 +1,5 @@
 #!/usr/bin/env bun
 
-import { runBashShellWorker } from "./bash-shell-worker";
+import { runBashShellGuardian } from "./bash-shell-guardian";
 
-await runBashShellWorker();
+await runBashShellGuardian();

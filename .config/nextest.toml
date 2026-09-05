@@ -8,12 +8,10 @@
 #   (PROCESS_TEST_LOCK / PTY_TEST_LOCK) do not serialize nextest's
 #   process-per-test execution, so serialization must happen here.
 #
-# MAINTENANCE CONTRACT: the overrides below name tests exactly. If one of the
-# listed tests is renamed or moved, its override silently stops matching (no
-# nextest warning) and the test loses serialization + its extended timeout.
-# After renaming any listed test, re-run:
-#   cargo nextest show-config test-groups --profile ci
-# and confirm all eight tests still resolve into process-lifecycle.
+# Every pi-shell test shares process/session state and must be isolated from
+# other pi-shell test processes. The native override names its five PTY tests
+# exactly; after renaming one, re-run `cargo nextest show-config test-groups
+# --profile ci` and confirm the native members still resolve into this group.
 nextest-version = { required = "0.9.137" }
 
 [test-groups.process-lifecycle]
@@ -32,7 +30,7 @@ leak-timeout = "500ms"
 path = "junit.xml"
 
 [[profile.ci.overrides]]
-filter = 'package(pi-shell) & (test(=shell::tests::timeout_builtin_reaps_reparented_same_group_grandchild_and_preserves_sibling) | test(=shell::tests::cancelled_command_reaps_reparented_same_group_grandchild) | test(=process::tests::descendants_includes_freshly_spawned_child))'
+filter = 'package(pi-shell)'
 test-group = "process-lifecycle"
 slow-timeout = { period = "120s", terminate-after = 2 }
 

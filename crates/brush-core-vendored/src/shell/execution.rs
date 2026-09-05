@@ -13,7 +13,9 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
 	pub fn default_exec_params(&self) -> ExecutionParameters {
 		let mut params = ExecutionParameters::default();
 
-		params.process_group_policy = if self.options.enable_job_control {
+		params.process_group_policy = if self.options.contained_process_group {
+			ProcessGroupPolicy::ContainedProcessGroup
+		} else if self.options.enable_job_control {
 			ProcessGroupPolicy::NewProcessGroup
 		} else {
 			ProcessGroupPolicy::SameProcessGroup
