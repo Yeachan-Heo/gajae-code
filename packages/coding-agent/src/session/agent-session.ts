@@ -8354,7 +8354,24 @@ export class AgentSession {
 
 	/** Invalidate cache for a file after an edit completes to prevent stale data */
 	#invalidateFileCacheForPath(filePath: string): void {
-		const resolvedPath = this.#resolveSessionFsPath(filePath);
+		let resolvedPath: string | undefined;
+		try {
+			resolvedPath = this.#resolveSessionFsPath(filePath);
+		} catch (error) {
+			// Tool-result admission must survive malformed paths and unavailable local roots.
+			// Without a resolved key, revoke every generation before any lifecycle await.
+			this.#streamingEditFileCache.clear();
+			this.#streamingEditPrecachePending.delete(filePath);
+			this.#streamingEditPrecacheStale.delete(filePath);
+			for (const pendingPath of this.#streamingEditPrecachePending.keys()) {
+				this.#invalidateStreamingEditPrecachePath(pendingPath);
+			}
+			logger.debug("Failed to resolve streaming-edit cache invalidation path", {
+				path: filePath,
+				error: String(error),
+			});
+			return;
+		}
 		if (resolvedPath === undefined) return;
 		this.#streamingEditFileCache.delete(resolvedPath);
 		this.#invalidateStreamingEditPrecachePath(resolvedPath);
