@@ -1,6 +1,9 @@
 # Changelog
 
 ## [Unreleased]
+### Fixed
+
+- When every auto-compaction candidate fails, the reported error now leads with the first candidate's failure and lists each candidate that was tried with its own error. The chain starts at the session model and ends on a same-provider largest-context fallback, so surfacing only the final error named a model the user never chose (e.g. `openai-codex/gpt-5.4` on an `astra` preset session) and hid that their own model had already failed the same way.
 
 ## [0.16.4] - 2026-09-05
 ### Added
