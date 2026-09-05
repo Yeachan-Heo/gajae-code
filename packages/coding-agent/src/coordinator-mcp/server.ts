@@ -315,6 +315,7 @@ interface CoordinatorServices {
 	afterDelegateAdmission?: (sessionId: string) => void | Promise<void>;
 	beforeDelegateResponseCommit?: () => void | Promise<void>;
 	afterDelegateResponseCommit?: () => void | Promise<void>;
+	beforeDelegatePinRecovery?: () => void | Promise<void>;
 }
 
 type CoordinatorModelResolution =
@@ -1282,6 +1283,14 @@ interface DelegateAdmissionCheckpoint {
 	response: Record<string, unknown>;
 }
 
+interface DelegateResponsePinV1 {
+	session_id: string;
+	coordinator_turn_id: string;
+	prompt_key_digest: string;
+	runtime_command_id: string;
+	runtime_turn_id: string;
+}
+
 interface CoordinatorToolIdempotencyRecord {
 	schema_version: 1;
 	tool: string;
@@ -1290,6 +1299,7 @@ interface CoordinatorToolIdempotencyRecord {
 	state: "in_progress" | "completed";
 	response?: Record<string, unknown>;
 	admission?: DelegateAdmissionCheckpoint;
+	delegate_response_pin?: DelegateResponsePinV1;
 	created_at: string;
 	completed_at?: string;
 }
@@ -3356,10 +3366,27 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 	// gate canonical question-state initialization.
 	void startupCodexWakeReplay.catch(() => undefined);
 	let questionStateReady: Promise<void> | null = null;
+	let delegatePinRecovery: Promise<void> | null = null;
+	let delegatePinRecoveryComplete = false;
 
-	function ensureQuestionStateReady(): Promise<void> {
+	async function ensureQuestionStateReady(): Promise<void> {
 		questionStateReady ??= initializeCoordinatorNamespace(questionPaths);
-		return questionStateReady;
+		await questionStateReady;
+		if (delegatePinRecoveryComplete) return;
+		delegatePinRecovery ??= reconcileCompletedDelegateResponsePins()
+			.then(() => {
+				delegatePinRecoveryComplete = true;
+			})
+			.finally(() => {
+				delegatePinRecovery = null;
+			});
+		try {
+			await delegatePinRecovery;
+		} catch (error) {
+			// Pin cleanup is maintenance after a durable response commit. Keep the
+			// server available, but leave recovery incomplete so the next call retries.
+			logger.warn("Coordinator delegate response pin recovery failed", { error: String(error) });
+		}
 	}
 
 	let retainedDeliveryRecovery: Promise<void> | null = null;
@@ -5166,24 +5193,49 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			.digest("hex");
 		const file = idempotencyFile(idempotencyKey);
 		const lockFile = idempotencyLockFile(idempotencyKey);
-		const releaseResponsePin = async (response: Record<string, unknown> | undefined): Promise<void> => {
-			if (!workflowForDelegateTool(tool)) return;
+		const releaseResponsePin = async (record: Partial<CoordinatorToolIdempotencyRecord>): Promise<void> => {
+			if (!workflowForDelegateTool(tool) || record.delegate_response_pin === undefined) return;
 			try {
-				await releaseDelegateResponsePin(idempotencyKey, response);
+				if (!(await releaseDelegateResponsePin(record.delegate_response_pin)))
+					throw new Error("delegate_response_pin_mismatch");
 			} catch (error) {
+				delegatePinRecoveryComplete = false;
 				// Cleanup cannot invalidate an already committed snapshot. Keep the
-				// pin on failure and retry cleanup on the next exact-key replay.
+				// pin on failure and retry cleanup during startup recovery or replay.
 				logger.warn("Coordinator delegate response pin cleanup failed", {
-					sessionId: response?.session_id,
+					sessionId: record.delegate_response_pin?.session_id,
 					error: String(error),
 				});
 			}
 		};
 		const commitResponse = async (record: CoordinatorToolIdempotencyRecord): Promise<void> => {
 			if (workflowForDelegateTool(tool)) await services.beforeDelegateResponseCommit?.();
-			await writeCoordinatorIdempotencyFile(file, record);
+			let durableRecord = record;
+			if (workflowForDelegateTool(tool)) {
+				const latestFile = await readCoordinatorIdempotencyFile(file);
+				if (latestFile.kind !== "record") throw new Error("terminal_uncertain");
+				const latest = latestFile.value;
+				const pin = delegateResponsePin(latest.delegate_response_pin);
+				if (
+					latest.schema_version !== 1 ||
+					latest.tool !== tool ||
+					latest.key_digest !== keyDigest ||
+					latest.request_digest !== requestDigest ||
+					latest.state !== "in_progress"
+				)
+					throw new Error("terminal_uncertain");
+				if (record.response?.ok === true && !pin) throw new Error("terminal_uncertain");
+				durableRecord = pin
+					? {
+							...record,
+							...(latest.admission ? { admission: latest.admission as DelegateAdmissionCheckpoint } : {}),
+							delegate_response_pin: pin,
+						}
+					: record;
+			}
+			await writeCoordinatorIdempotencyFile(file, durableRecord);
 			if (workflowForDelegateTool(tool)) await services.afterDelegateResponseCommit?.();
-			await releaseResponsePin(record.response);
+			await releaseResponsePin(durableRecord);
 		};
 		const execute = async (): Promise<Record<string, unknown>> => {
 			const existingFile = await readCoordinatorIdempotencyFile(file);
@@ -5211,7 +5263,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				if (existing.state === "completed") {
 					const replay = asRecord(existing.response);
 					if (replay) {
-						await releaseResponsePin(replay);
+						await releaseResponsePin(existing);
 						return boundedToolResponse(tool, replay);
 					}
 					return {
@@ -6374,30 +6426,102 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		return payload;
 	}
 
+	function delegateResponsePin(value: unknown): DelegateResponsePinV1 | null {
+		const pin = asRecord(value);
+		if (
+			!pin ||
+			typeof pin.session_id !== "string" ||
+			!SAFE_EXTERNAL_ID_PATTERN.test(pin.session_id) ||
+			typeof pin.coordinator_turn_id !== "string" ||
+			!TURN_ID_PATTERN.test(pin.coordinator_turn_id) ||
+			typeof pin.prompt_key_digest !== "string" ||
+			!/^[a-f0-9]{64}$/.test(pin.prompt_key_digest) ||
+			typeof pin.runtime_command_id !== "string" ||
+			!SAFE_EXTERNAL_ID_PATTERN.test(pin.runtime_command_id) ||
+			typeof pin.runtime_turn_id !== "string" ||
+			!SAFE_EXTERNAL_ID_PATTERN.test(pin.runtime_turn_id)
+		)
+			return null;
+		return pin as unknown as DelegateResponsePinV1;
+	}
+
 	/** A persisted final response, never admission alone, permits source compaction. */
-	async function releaseDelegateResponsePin(
-		idempotencyKey: string,
-		response: Record<string, unknown> | undefined,
-	): Promise<void> {
-		if (response?.ok !== true || typeof response.session_id !== "string" || typeof response.turn_id !== "string")
-			return;
-		const receipt = asRecord(response.result);
-		if (!receipt || !(await readSessionTransaction(questionPaths, response.session_id))) return;
-		await withSessionTransaction(questionPaths, response.session_id, async transaction => {
-			for (const request of Object.values(transaction.requests.prompts)) {
-				if (
-					request.delegate_response_pending === true &&
-					request.sdk_idempotency_key === idempotencyKey &&
-					request.coordinator_turn_id === response.turn_id &&
-					request.runtime_receipt?.accepted === true &&
-					request.runtime_receipt.command_id === receipt.command_id &&
-					request.runtime_receipt.turn_id === receipt.turn_id
-				)
-					delete request.delegate_response_pending;
+	async function releaseDelegateResponsePin(rawPin: unknown): Promise<boolean> {
+		const pin = delegateResponsePin(rawPin);
+		if (!pin) return false;
+		if (!(await readSessionTransaction(questionPaths, pin.session_id))) return true;
+		let released = false;
+		await withSessionTransaction(questionPaths, pin.session_id, async transaction => {
+			const request = transaction.requests.prompts[pin.prompt_key_digest];
+			if (request?.delegate_response_pending !== true) {
+				released = true;
+				return;
+			}
+			if (
+				request.coordinator_turn_id === pin.coordinator_turn_id &&
+				request.runtime_receipt?.accepted === true &&
+				request.runtime_receipt.command_id === pin.runtime_command_id &&
+				request.runtime_receipt.turn_id === pin.runtime_turn_id
+			) {
+				delete request.delegate_response_pending;
+				released = true;
 			}
 		}).catch(error => {
 			if (!(error instanceof Error) || error.message !== "resource_gone") throw error;
+			released = true;
 		});
+		return released;
+	}
+
+	async function reconcileCompletedDelegateResponsePins(): Promise<void> {
+		await services.beforeDelegatePinRecovery?.();
+		const roster = await readSchedulerRoster(questionPaths);
+		let persisted: string[];
+		try {
+			persisted = await fs.readdir(questionPaths.sessions);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+			persisted = [];
+		}
+		const sessionIds = [
+			...new Set([
+				...roster.roster.map(entry => entry.session_id),
+				...persisted.filter(entry => COORDINATOR_SESSION_ID_PATTERN.test(entry)),
+			]),
+		];
+		const failures: unknown[] = [];
+		for (const sessionId of sessionIds) {
+			let transaction: CoordinatorSessionTransactionV1 | null;
+			try {
+				transaction = await readSessionTransaction(questionPaths, sessionId);
+			} catch (error) {
+				failures.push(error);
+				continue;
+			}
+			if (!transaction) continue;
+			for (const request of Object.values(transaction.requests.prompts)) {
+				if (request.delegate_response_pending !== true) continue;
+				const keyDigest = createHash("sha256").update(request.sdk_idempotency_key).digest("hex");
+				try {
+					await withSessionStateLock(
+						path.join(namespaceDir, "idempotency-locks", `${keyDigest}.json`),
+						async () => {
+							const current = await readCoordinatorIdempotencyFile(
+								path.join(namespaceDir, "idempotency", `${keyDigest}.json`),
+							);
+							if (current.kind === "missing") return;
+							if (current.kind === "corrupt") throw new Error("delegate_response_receipt_corrupt");
+							if (current.value.state !== "completed") return;
+							if (!(await releaseDelegateResponsePin(current.value.delegate_response_pin)))
+								throw new Error("delegate_response_pin_mismatch");
+						},
+					);
+				} catch (error) {
+					failures.push(error);
+				}
+			}
+		}
+		if (failures.length > 0) throw new AggregateError(failures, "delegate_response_pin_recovery_incomplete");
 	}
 
 	async function claimCanonicalPrompt(
@@ -7470,6 +7594,9 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 
 	async function callTool(name: string, args: Record<string, unknown> = {}): Promise<Record<string, unknown>> {
 		try {
+			// Run startup maintenance before any tool-specific idempotency/session
+			// lock is acquired. Nested state initialization must never invert those locks.
+			await ensureQuestionStateReady();
 			if (name === "gjc_coordinator_list_sessions") {
 				// listSessions() enumerates the broker across allowed roots, but every other
 				// coordinator tool resolves a session through its durable projection. Without
@@ -8607,9 +8734,17 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 									turn_id: turn.turn_id,
 									response: boundedToolResponse(name, response),
 								};
+								const delegateResponsePin: DelegateResponsePinV1 = {
+									session_id: sessionId,
+									coordinator_turn_id: turn.turn_id,
+									prompt_key_digest: promptKey,
+									runtime_command_id: acknowledgement.command_id,
+									runtime_turn_id: acknowledgement.turn_id,
+								};
 								await writeCoordinatorIdempotencyFile(idempotencyFile(idempotencyKey), {
 									...(outer.value as unknown as CoordinatorToolIdempotencyRecord),
 									admission,
+									delegate_response_pin: delegateResponsePin,
 								});
 								await services.afterDelegateAdmission?.(sessionId);
 								return admission.response;
