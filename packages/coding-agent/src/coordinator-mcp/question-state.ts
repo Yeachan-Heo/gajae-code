@@ -1654,13 +1654,24 @@ export async function rewriteSessionEndpointAuthorityAndDeletions(
 					const transaction = await readTransactionJson<CoordinatorSessionTransactionV1>(file);
 					if (!transaction) throw new Error("resource_gone");
 					assertTransaction(transaction, path.basename(paths.root), sessionId);
-					const broker = transaction.canonical.session.broker;
-					if (broker.endpoint_file_id !== undefined) {
-						if (
-							broker.endpoint_file_id !== endpointFileId ||
-							broker.endpoint_incarnation !== currentEndpointIncarnation
-						)
-							throw new Error("endpoint_stale");
+					await applySessionTransactionMutation(paths, sessionId, transaction, async current => {
+						const broker = current.canonical.session.broker;
+						if (broker.endpoint_file_id !== undefined) {
+							if (
+								broker.endpoint_file_id !== endpointFileId ||
+								broker.endpoint_incarnation !== currentEndpointIncarnation
+							)
+								throw new Error("endpoint_stale");
+						} else {
+							if (broker.endpoint_incarnation !== expectedLegacyEndpointIncarnation)
+								throw new Error("endpoint_stale");
+							rewriteSessionEndpointReferences(
+								current,
+								expectedLegacyEndpointIncarnation,
+								currentEndpointIncarnation,
+							);
+							broker.endpoint_file_id = endpointFileId;
+						}
 						rewritePendingDeletionEndpointAuthorities(
 							registry,
 							sessionId,
@@ -1669,35 +1680,31 @@ export async function rewriteSessionEndpointAuthorityAndDeletions(
 						);
 						for (const entry of Object.values(registry.deletions)) {
 							if (entry.session_id !== sessionId || entry.phase === "completed") continue;
-							const operation = transaction.requests.operations[entry.operation_id];
+							const operation = current.requests.operations[entry.operation_id];
 							if (operation?.intent.endpoint_incarnation === expectedLegacyEndpointIncarnation)
 								operation.intent.endpoint_incarnation = currentEndpointIncarnation;
 						}
-						rewritten = transaction.canonical.session;
-						await applySessionTransactionMutation(paths, sessionId, transaction, async () => undefined);
-						return;
+						rewritten = current.canonical.session;
+					});
+					for (const creation of Object.values(registry.creations)) {
+						if (creation.session_id !== sessionId) continue;
+						if (creation.endpoint_incarnation === expectedLegacyEndpointIncarnation)
+							creation.endpoint_incarnation = currentEndpointIncarnation;
+						else if (
+							creation.endpoint_incarnation !== null &&
+							creation.endpoint_incarnation !== currentEndpointIncarnation
+						)
+							throw new Error("endpoint_stale");
+						const intent = creation.canonical_create_intent;
+						if (intent?.session.session_id === sessionId) {
+							if (intent.session.broker.endpoint_incarnation === expectedLegacyEndpointIncarnation)
+								intent.session.broker.endpoint_incarnation = currentEndpointIncarnation;
+							else if (intent.session.broker.endpoint_incarnation !== currentEndpointIncarnation)
+								throw new Error("endpoint_stale");
+							intent.session.broker.endpoint_file_id = endpointFileId;
+						}
+						creation.updated_at = new Date().toISOString();
 					}
-					if (broker.endpoint_incarnation !== expectedLegacyEndpointIncarnation) throw new Error("endpoint_stale");
-					rewriteSessionEndpointReferences(
-						transaction,
-						expectedLegacyEndpointIncarnation,
-						currentEndpointIncarnation,
-					);
-					rewritePendingDeletionEndpointAuthorities(
-						registry,
-						sessionId,
-						expectedLegacyEndpointIncarnation,
-						currentEndpointIncarnation,
-					);
-					for (const entry of Object.values(registry.deletions)) {
-						if (entry.session_id !== sessionId || entry.phase === "completed") continue;
-						const operation = transaction.requests.operations[entry.operation_id];
-						if (operation?.intent.endpoint_incarnation === expectedLegacyEndpointIncarnation)
-							operation.intent.endpoint_incarnation = currentEndpointIncarnation;
-					}
-					broker.endpoint_file_id = endpointFileId;
-					rewritten = transaction.canonical.session;
-					await applySessionTransactionMutation(paths, sessionId, transaction, async () => undefined);
 				},
 				lockOptions(options.signal),
 			);

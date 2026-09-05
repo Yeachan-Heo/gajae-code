@@ -3797,7 +3797,13 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 	async function assertCanonicalHandoffAuthority(sessionId: string): Promise<void> {
 		const transaction = await readSessionTransaction(questionPaths, sessionId);
 		if (!transaction) throw new Error("resource_gone");
-		await assertPersistedSessionAuthority(transaction.canonical.session);
+		const session = transaction.canonical.session;
+		if (!session.broker.workspace) throw new Error("coordinator_workspace_required");
+		await assertCoordinatorSessionLocations(config, session.cwd, session.broker.workspace, {
+			canonicalizePath: services.canonicalizePath,
+			platform,
+		});
+		if (session.broker.endpoint_file_id !== undefined) await migrateLegacySessionEndpointAuthority(session);
 	}
 
 	async function authorizedCanonicalSessionIds(
