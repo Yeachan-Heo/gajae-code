@@ -13,11 +13,11 @@ import {
 	type PaseoDaemonTarget,
 	parseDaemonListen,
 	resolveDaemonTarget,
-	resolvePaseoHome,
 	selectProviderKey,
-	sessionListContainsLiveSessionForTests,
+	sessionListContainsLiveSession,
 	startPaseoAnnouncement,
 } from "../src/setup/paseo/announce";
+import { resolvePaseoHome } from "../src/setup/paseo/setup-deps";
 
 const SESSION_ID = "01a045e7-3d51-7387-a868-a8ba3eecd2d1";
 const CWD = "/Users/probe/git/example";
@@ -39,7 +39,13 @@ function config(providers: Record<string, unknown>, daemonListen = "127.0.0.1:67
 }
 
 interface Recorder {
-	readonly imports: Array<{ providerKey: string; cwd: string; sessionId: string }>;
+	readonly imports: Array<{
+		providerKey: string;
+		cwd: string;
+		sessionId: string;
+		daemonTarget: PaseoDaemonTarget;
+		daemonHost: string;
+	}>;
 	readonly probes: PaseoDaemonTarget[];
 }
 
@@ -60,7 +66,13 @@ function deps(
 		},
 		isSessionLive: async () => true,
 		runImport: async input => {
-			recorder.imports.push({ providerKey: input.providerKey, cwd: input.cwd, sessionId: input.sessionId });
+			recorder.imports.push({
+				providerKey: input.providerKey,
+				cwd: input.cwd,
+				sessionId: input.sessionId,
+				daemonTarget: input.daemonTarget,
+				daemonHost: input.daemonHost,
+			});
 			return { kind: "imported", providerKey: input.providerKey };
 		},
 	};
@@ -141,6 +153,16 @@ describe("resolveDaemonTarget", () => {
 		).toEqual({ kind: "tcp", host: "10.1.1.1", port: 9999 });
 	});
 
+	test("prefers PASEO_LISTEN over the running daemon pid file", async () => {
+		expect(
+			await resolveDaemonTarget(config({}, "127.0.0.1:6767"), {
+				...base,
+				env: { PASEO_LISTEN: "127.0.0.1:7777" },
+				readJson: async () => ({ listen: "/tmp/from-pid.sock" }),
+			}),
+		).toEqual({ kind: "tcp", host: "127.0.0.1", port: 7777 });
+	});
+
 	test("prefers the running daemon's pid file over the configured listener", async () => {
 		expect(
 			await resolveDaemonTarget(config({}, "127.0.0.1:6767"), {
@@ -155,6 +177,11 @@ describe("resolveDaemonTarget", () => {
 			kind: "tcp",
 			host: "127.0.0.1",
 			port: 7777,
+		});
+		expect(await resolveDaemonTarget(config({}, "127.0.0.1:6767"), base)).toEqual({
+			kind: "tcp",
+			host: "localhost",
+			port: 6767,
 		});
 		expect(await resolveDaemonTarget({ version: 1 }, base)).toEqual({ kind: "tcp", host: "localhost", port: 6767 });
 	});
@@ -205,7 +232,7 @@ describe("resolvePaseoHome", () => {
 describe("broker live-session matching", () => {
 	test("uses the current locator.cwd shape", () => {
 		expect(
-			sessionListContainsLiveSessionForTests(
+			sessionListContainsLiveSession(
 				[{ sessionId: SESSION_ID, live: true, locator: { cwd: CWD, worktreeRoot: null, stateRoot: "/tmp/state" } }],
 				SESSION_ID,
 				CWD,
@@ -221,7 +248,7 @@ describe("broker live-session matching", () => {
 		await fs.symlink(real, linked);
 		try {
 			expect(
-				sessionListContainsLiveSessionForTests(
+				sessionListContainsLiveSession(
 					[
 						{
 							sessionId: SESSION_ID,
@@ -244,7 +271,15 @@ describe("announceSessionToPaseo", () => {
 		const dependencies = deps();
 		const outcome = await announceSessionToPaseo({ sessionId: SESSION_ID, cwd: CWD }, dependencies);
 		expect(outcome).toEqual({ kind: "imported", providerKey: "gjc" });
-		expect(dependencies.recorder.imports).toEqual([{ providerKey: "gjc", cwd: CWD, sessionId: SESSION_ID }]);
+		expect(dependencies.recorder.imports).toEqual([
+			{
+				providerKey: "gjc",
+				cwd: CWD,
+				sessionId: SESSION_ID,
+				daemonTarget: { kind: "tcp", host: "localhost", port: 6767 },
+				daemonHost: "localhost:6767",
+			},
+		]);
 	});
 
 	test("skips when Paseo is not installed at all", async () => {
@@ -292,6 +327,63 @@ describe("announceSessionToPaseo", () => {
 			reason: "unsupported-daemon-target",
 		});
 		expect(dependencies.recorder.probes).toHaveLength(0);
+		expect(dependencies.recorder.imports).toHaveLength(0);
+	});
+
+	test("does not fall through from an invalid explicit PASEO_LISTEN", async () => {
+		const dependencies = deps({ env: { PASEO_LISTEN: "not-an-endpoint" } });
+		expect(await announceSessionToPaseo({ sessionId: SESSION_ID, cwd: CWD }, dependencies)).toEqual({
+			kind: "skipped",
+			reason: "unsupported-daemon-target",
+		});
+		expect(dependencies.recorder.probes).toHaveLength(0);
+		expect(dependencies.recorder.imports).toHaveLength(0);
+	});
+
+	test("binds probe and import to PASEO_LISTEN when pid IPC also exists", async () => {
+		const dependencies = deps({
+			env: { PASEO_LISTEN: "127.0.0.1:7777" },
+			readJson: async file =>
+				file.endsWith("config.json") ? config({ gjc: providerEntry() }) : { listen: "/tmp/pid.sock" },
+		});
+		expect(await announceSessionToPaseo({ sessionId: SESSION_ID, cwd: CWD }, dependencies)).toEqual({
+			kind: "imported",
+			providerKey: "gjc",
+		});
+		expect(dependencies.recorder.probes).toEqual([{ kind: "tcp", host: "127.0.0.1", port: 7777 }]);
+		expect(dependencies.recorder.imports[0]?.daemonTarget).toEqual({
+			kind: "tcp",
+			host: "127.0.0.1",
+			port: 7777,
+		});
+	});
+
+	test("preserves TLS and authentication options on the configured default address", async () => {
+		const daemonHost = "tcp://127.0.0.1:6767?ssl=true&password=secret";
+		const dependencies = deps({ configValue: config({ gjc: providerEntry() }, daemonHost) });
+		expect(await announceSessionToPaseo({ sessionId: SESSION_ID, cwd: CWD }, dependencies)).toEqual({
+			kind: "imported",
+			providerKey: "gjc",
+		});
+		expect(dependencies.recorder.probes).toEqual([{ kind: "tcp", host: "127.0.0.1", port: 6767 }]);
+		expect(dependencies.recorder.imports[0]).toMatchObject({ daemonHost });
+	});
+
+	test("does not import through live pid IPC when explicit PASEO_LISTEN is unreachable", async () => {
+		const dependencies = deps({
+			env: { PASEO_LISTEN: "127.0.0.1:7777" },
+			readJson: async file =>
+				file.endsWith("config.json") ? config({ gjc: providerEntry() }) : { listen: "/tmp/pid.sock" },
+			probeDaemon: async target => {
+				dependencies.recorder.probes.push(target);
+				return target.kind === "ipc";
+			},
+		});
+		expect(await announceSessionToPaseo({ sessionId: SESSION_ID, cwd: CWD }, dependencies)).toEqual({
+			kind: "skipped",
+			reason: "daemon-unreachable",
+		});
+		expect(dependencies.recorder.probes).toEqual([{ kind: "tcp", host: "127.0.0.1", port: 7777 }]);
 		expect(dependencies.recorder.imports).toHaveLength(0);
 	});
 
@@ -401,7 +493,14 @@ describe("default dependencies", () => {
 		return cli;
 	}
 
-	const importInput = (cli: string) => ({ cli, providerKey: "gjc", cwd: "/tmp/repo", sessionId: SESSION_ID });
+	const importInput = (cli: string) => ({
+		cli,
+		providerKey: "gjc",
+		cwd: "/tmp/repo",
+		sessionId: SESSION_ID,
+		daemonTarget: { kind: "tcp", host: "127.0.0.1", port: 7777 } as const,
+		daemonHost: "127.0.0.1:7777",
+	});
 
 	test("a socket probe answers false without blocking when nothing listens", async () => {
 		const dependencies = createDefaultPaseoAnnounceDependencies("/tmp/agent-dir", {});
@@ -441,11 +540,42 @@ describe("default dependencies", () => {
 
 	test("a successful import reports the provider it imported under", async () => {
 		const dependencies = createDefaultPaseoAnnounceDependencies("/tmp/agent-dir", {});
-		const cli = await fakeCli('printf "%s\\n" "$*" > "$(dirname "$0")/argv"; exit 0');
+		const cli = await fakeCli(
+			'printf "%s\\n" "$*" > "$(dirname "$0")/argv"; printf "%s" "$PASEO_HOST" > "$(dirname "$0")/host"; exit 0',
+		);
 		expect(await dependencies.runImport(importInput(cli))).toEqual({ kind: "imported", providerKey: "gjc" });
 		expect((await Bun.file(path.join(path.dirname(cli), "argv")).text()).trim()).toBe(
 			`import --provider gjc --cwd /tmp/repo ${SESSION_ID}`,
 		);
+		expect(await Bun.file(path.join(path.dirname(cli), "host")).text()).toBe("127.0.0.1:7777");
+	});
+
+	test("forces an IPC import to the exact probed daemon", async () => {
+		const dependencies = createDefaultPaseoAnnounceDependencies("/tmp/agent-dir", {});
+		const cli = await fakeCli('printf "%s" "$PASEO_HOST" > "$(dirname "$0")/host"; exit 0');
+		expect(
+			await dependencies.runImport({
+				...importInput(cli),
+				daemonTarget: { kind: "ipc", socketPath: "/tmp/paseo.sock" },
+				daemonHost: "unix:///tmp/paseo.sock",
+			}),
+		).toEqual({ kind: "imported", providerKey: "gjc" });
+		expect(await Bun.file(path.join(path.dirname(cli), "host")).text()).toBe("unix:///tmp/paseo.sock");
+	});
+
+	test("preserves pipe and authenticated TLS listener spellings for the import child", async () => {
+		const dependencies = createDefaultPaseoAnnounceDependencies("/tmp/agent-dir", {});
+		for (const [daemonHost, daemonTarget] of [
+			["pipe://gjc-paseo", { kind: "ipc", socketPath: "gjc-paseo" }],
+			["tcp://paseo.example:7443?ssl=true&password=secret", { kind: "tcp", host: "paseo.example", port: 7443 }],
+		] as const) {
+			const cli = await fakeCli('printf "%s" "$PASEO_HOST" > "$(dirname "$0")/host"; exit 0');
+			expect(await dependencies.runImport({ ...importInput(cli), daemonTarget, daemonHost })).toEqual({
+				kind: "imported",
+				providerKey: "gjc",
+			});
+			expect(await Bun.file(path.join(path.dirname(cli), "host")).text()).toBe(daemonHost);
+		}
 	});
 
 	test("Paseo's duplicate-import refusal on stderr is read as success", async () => {

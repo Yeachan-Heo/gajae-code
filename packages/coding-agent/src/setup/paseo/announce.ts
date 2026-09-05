@@ -33,8 +33,6 @@ import { AgentDirSessionLifecycleClient } from "../../sdk/lifecycle/broker-clien
 import { sessionListPageFromResponse, traverseSessionList } from "../../sdk/session-list";
 import { PROVIDER_EXTENDS, PROVIDER_KEY, resolvePaseoHome } from "./setup-deps";
 
-export { resolvePaseoHome } from "./setup-deps";
-
 /** Cheap liveness probe of the daemon socket. Only gates the expensive CLI spawn. */
 const DAEMON_PROBE_TIMEOUT_MS = 750;
 /** Bound on the broker `session.list` traversal that proves our own liveness. */
@@ -87,8 +85,15 @@ export interface PaseoAnnounceDependencies {
 		readonly providerKey: string;
 		readonly cwd: string;
 		readonly sessionId: string;
+		readonly daemonTarget: PaseoDaemonTarget;
+		readonly daemonHost: string;
 		readonly signal?: AbortSignal;
 	}): Promise<PaseoAnnounceOutcome>;
+}
+
+interface ResolvedDaemonSelection {
+	readonly target: PaseoDaemonTarget;
+	readonly host: string;
 }
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
@@ -161,43 +166,39 @@ export function parseDaemonListen(raw: string): PaseoDaemonTarget | undefined {
 export async function resolveDaemonTarget(
 	config: unknown,
 	deps: Pick<PaseoAnnounceDependencies, "env" | "paseoHome" | "readJson">,
-): Promise<PaseoDaemonTarget> {
-	return (await resolveDaemonTargets(config, deps))[0] ?? DEFAULT_DAEMON_TARGET;
+): Promise<PaseoDaemonTarget | undefined> {
+	return (await resolveDaemonSelection(config, deps))?.target;
 }
 
-async function resolveDaemonTargets(
+async function resolveDaemonSelection(
 	config: unknown,
 	deps: Pick<PaseoAnnounceDependencies, "env" | "paseoHome" | "readJson">,
-): Promise<PaseoDaemonTarget[]> {
+): Promise<ResolvedDaemonSelection | undefined> {
 	const explicitHost = deps.env.PASEO_HOST?.trim();
 	if (explicitHost) {
-		const explicitTarget = parseDaemonListen(explicitHost);
-		return explicitTarget ? [explicitTarget] : [];
+		const target = parseDaemonListen(explicitHost);
+		return target ? { target, host: explicitHost } : undefined;
+	}
+	const explicitListen = deps.env.PASEO_LISTEN?.trim();
+	if (explicitListen) {
+		const target = parseDaemonListen(explicitListen);
+		return target ? { target, host: explicitListen } : undefined;
 	}
 
 	const pidFile = asRecord(await deps.readJson(path.join(deps.paseoHome, "paseo.pid")));
 	const pidListen = typeof pidFile?.listen === "string" ? pidFile.listen : pidFile?.sockPath;
 	const pidTarget = typeof pidListen === "string" ? parseDaemonListen(pidListen) : undefined;
+	if (pidTarget?.kind === "ipc") return { target: pidTarget, host: pidListen as string };
 
 	const parsed = asRecord(config);
 	const configured = asRecord(parsed?.daemon)?.listen ?? parsed?.listen;
-	const configuredRaw = deps.env.PASEO_LISTEN?.trim() || (typeof configured === "string" ? configured : undefined);
-	const configuredTarget = configuredRaw ? parseDaemonListen(configuredRaw) : undefined;
-	const configuredIpc = configuredTarget?.kind === "ipc" ? configuredTarget : undefined;
-	const pidIpc = pidTarget?.kind === "ipc" ? pidTarget : undefined;
-	const configuredTcp =
-		configuredTarget?.kind === "tcp" && !(configuredTarget.host === "127.0.0.1" && configuredTarget.port === 6767)
-			? configuredTarget
-			: undefined;
-	const directIpc = deps.env.PASEO_LISTEN?.trim();
-	const directIpcTarget = directIpc ? parseDaemonListen(directIpc) : undefined;
-	const targets = [
-		directIpcTarget?.kind === "ipc" ? directIpcTarget : undefined,
-		pidIpc,
-		configuredIpc,
-		configuredTcp,
-	].filter((target): target is PaseoDaemonTarget => target !== undefined);
-	return targets.length > 0 ? [targets[0]!] : [DEFAULT_DAEMON_TARGET];
+	if (typeof configured !== "string") return { target: DEFAULT_DAEMON_TARGET, host: "localhost:6767" };
+	const configuredTarget = parseDaemonListen(configured);
+	if (!configuredTarget) return { target: DEFAULT_DAEMON_TARGET, host: "localhost:6767" };
+	if (configured.trim() === "127.0.0.1:6767") {
+		return { target: DEFAULT_DAEMON_TARGET, host: "localhost:6767" };
+	}
+	return { target: configuredTarget, host: configured };
 }
 
 /**
@@ -243,24 +244,26 @@ export async function announceSessionToPaseo(
 	const cli = deps.resolveCli();
 	if (!cli) return { kind: "skipped", reason: "cli-missing" };
 
-	const targets = await resolveDaemonTargets(config, deps);
-	if (deps.env.PASEO_HOST?.trim() && targets.length === 0)
+	const selection = await resolveDaemonSelection(config, deps);
+	if ((deps.env.PASEO_HOST?.trim() || deps.env.PASEO_LISTEN?.trim()) && selection === undefined)
 		return { kind: "skipped", reason: "unsupported-daemon-target" };
-	let reachable = false;
-	for (const target of targets) {
-		if (await deps.probeDaemon(target)) {
-			reachable = true;
-			break;
-		}
-	}
-	if (!reachable) return { kind: "skipped", reason: "daemon-unreachable" };
+	if (!selection || !(await deps.probeDaemon(selection.target)))
+		return { kind: "skipped", reason: "daemon-unreachable" };
 	if (signal?.aborted) return { kind: "failed", detail: "Paseo announcement cancelled" };
 
 	// Importing a session the broker does not yet report as live would make ACP
 	// `session/load` resume a copy instead of attaching to the running host.
 	if (!(await deps.isSessionLive(input.sessionId, input.cwd))) return { kind: "skipped", reason: "session-not-live" };
 
-	return await deps.runImport({ cli, providerKey, cwd: input.cwd, sessionId: input.sessionId, signal });
+	return await deps.runImport({
+		cli,
+		providerKey,
+		cwd: input.cwd,
+		sessionId: input.sessionId,
+		daemonTarget: selection.target,
+		daemonHost: selection.host,
+		signal,
+	});
 }
 
 /** Only a daemon that is not up yet, or a registration that has not landed yet, is worth retrying. */
@@ -369,17 +372,13 @@ function isSessionLive(agentDir: string): (sessionId: string, cwd: string) => Pr
 			response => sessionListPageFromResponse(response),
 		);
 		for (const { sessions } of pages) {
-			if (sessionListContainsLiveSessionForTests(sessions, sessionId, canonicalCwd)) return true;
+			if (sessionListContainsLiveSession(sessions, sessionId, canonicalCwd)) return true;
 		}
 		return false;
 	};
 }
 
-export function sessionListContainsLiveSessionForTests(
-	sessions: readonly unknown[],
-	sessionId: string,
-	cwd: string,
-): boolean {
+export function sessionListContainsLiveSession(sessions: readonly unknown[], sessionId: string, cwd: string): boolean {
 	for (const value of sessions) {
 		const session = asRecord(value);
 		if (session?.sessionId !== sessionId || session.live !== true) continue;
@@ -403,6 +402,8 @@ function runImport(env: NodeJS.ProcessEnv) {
 		readonly providerKey: string;
 		readonly cwd: string;
 		readonly sessionId: string;
+		readonly daemonTarget: PaseoDaemonTarget;
+		readonly daemonHost: string;
 		readonly signal?: AbortSignal;
 	}): Promise<PaseoAnnounceOutcome> => {
 		const timeoutController = new AbortController();
@@ -413,7 +414,12 @@ function runImport(env: NodeJS.ProcessEnv) {
 		try {
 			const child = Bun.spawn(
 				[input.cli, "import", "--provider", input.providerKey, "--cwd", input.cwd, input.sessionId],
-				{ stdout: "pipe", stderr: "pipe", signal, env },
+				{
+					stdout: "pipe",
+					stderr: "pipe",
+					signal,
+					env: { ...env, PASEO_HOST: input.daemonHost },
+				},
 			);
 			const [exitCode, stderr] = await Promise.all([child.exited, new Response(child.stderr).text()]);
 			if (input.signal?.aborted) return { kind: "failed", detail: "Paseo announcement cancelled" };

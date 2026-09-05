@@ -427,14 +427,12 @@ export class SessionSdkSessionRuntime {
 	 * asked for. Delivery failure is ignored: a disconnected consumer must never
 	 * disturb the turn producing the content.
 	 */
-	sendFrameTo(connectionIds: Iterable<string>, frame: SdkFrame): void {
-		for (const connectionId of connectionIds) {
-			try {
-				const result = this.transport.sendFrame(connectionId, frame);
-				if (result instanceof Promise) result.catch(() => undefined);
-			} catch {
-				// A dead connection is reaped by the transport's own close handling.
-			}
+	sendFrameTo(connectionId: string, frame: SdkFrame): void {
+		try {
+			const result = this.transport.sendFrame(connectionId, frame);
+			if (result instanceof Promise) result.catch(() => undefined);
+		} catch {
+			// A dead connection is reaped by the transport's own close handling.
 		}
 	}
 
@@ -4880,7 +4878,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		"tool_execution_update",
 		"tool_execution_end",
 	]);
-	const streamTurnEvent = (event: { type?: unknown } | null | undefined, ctx: ExtensionContext): void => {
+	const streamTurnEvent = (event: AgentSessionEvent | null | undefined, ctx: ExtensionContext): void => {
 		const current = lifecycleStateForContext(ctx, "agent_start");
 		const activeInvocation = current?.activeInvocation;
 		if (!current) return;
@@ -4902,21 +4900,17 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		// The handlers below also renew prompt deadlines, so streaming must never
 		// throw out of them: a frame the wire producer does not recognize is dropped.
 		if (!event || typeof event.type !== "string" || !STREAMED_TURN_EVENT_TYPES.has(event.type)) return;
-		try {
-			const payload = toAgentWireEventPayload(event as AgentSessionEvent);
-			// One frame per owning invocation, each carrying its own correlation, so a
-			// shared run lets every submitter attribute the content to its own prompt.
-			for (const invocation of invocations) {
-				if (invocation.connectionId === undefined) continue;
-				current.runtime.sendFrameTo([invocation.connectionId], {
-					type: "event",
-					kind: event.type,
-					payload,
-					...invocation.correlation,
-				});
-			}
-		} catch {
-			// Streamed content is best-effort; the turn producing it is authoritative.
+		const payload = toAgentWireEventPayload(event);
+		// One frame per owning invocation, each carrying its own correlation, so a
+		// shared run lets every submitter attribute the content to its own prompt.
+		for (const invocation of invocations) {
+			if (invocation.connectionId === undefined) continue;
+			current.runtime.sendFrameTo(invocation.connectionId, {
+				type: "event",
+				kind: event.type,
+				payload,
+				...invocation.correlation,
+			});
 		}
 	};
 	api.on("tool_execution_start", async (event, ctx) => {
