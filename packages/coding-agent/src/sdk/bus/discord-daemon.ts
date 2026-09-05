@@ -161,7 +161,11 @@ function attachmentAcceptsAuthority(attachment: SessionAttachment, authorityId: 
 }
 
 function recordAcceptsAuthority(record: DiscordConversation, authorityId: string | undefined): boolean {
-	return record.attachmentAuthorityId === authorityId || record.attachmentAuthorityMigrationFromId === authorityId;
+	return (
+		record.attachmentAuthorityId === authorityId ||
+		(record.attachmentAuthorityMigrationFromId !== undefined &&
+			record.attachmentAuthorityMigrationFromId === authorityId)
+	);
 }
 
 /** SDK-only Discord threaded notification daemon. It owns no AgentSession and never retains endpoint credentials. */
@@ -490,59 +494,61 @@ export class DiscordNotificationDaemon {
 		currentAuthorityId: string,
 	): Promise<void> {
 		if (!previousAuthorityId || !currentAuthorityId || previousAuthorityId === currentAuthorityId) return;
-		const document = await this.#store.load();
-		for (const key of Object.keys(document.conversations)) {
-			await this.#store.transact(key, current => {
-				if (!current || current.sessionId !== sessionId || current.endpointGeneration !== endpointGeneration)
-					return current;
-				if (
-					current.attachmentAuthorityId !== previousAuthorityId &&
-					!recordAcceptsAuthority(current, previousAuthorityId)
-				)
-					return current;
-				if (
-					current.attachmentAuthorityId === currentAuthorityId &&
-					current.attachmentAuthorityMigrationFromId === previousAuthorityId
-				)
-					return current;
-				return normalizeDiscordConversation({
-					...current,
-					generation: current.generation + 1,
-					attachmentAuthorityId: currentAuthorityId,
-					attachmentAuthorityMigrationFromId: previousAuthorityId,
-					updatedAt: this.#now(),
+		await this.#effects.withSessionMutationGate(sessionId, async () => {
+			const document = await this.#store.load();
+			for (const key of Object.keys(document.conversations)) {
+				await this.#store.transact(key, current => {
+					if (!current || current.sessionId !== sessionId || current.endpointGeneration !== endpointGeneration)
+						return current;
+					if (
+						current.attachmentAuthorityId !== previousAuthorityId &&
+						!recordAcceptsAuthority(current, previousAuthorityId)
+					)
+						return current;
+					if (
+						current.attachmentAuthorityId === currentAuthorityId &&
+						current.attachmentAuthorityMigrationFromId === previousAuthorityId
+					)
+						return current;
+					return normalizeDiscordConversation({
+						...current,
+						generation: current.generation + 1,
+						attachmentAuthorityId: currentAuthorityId,
+						attachmentAuthorityMigrationFromId: previousAuthorityId,
+						updatedAt: this.#now(),
+					});
 				});
-			});
-		}
-		await this.#effects.migrateAttachmentAuthorityId(
-			sessionId,
-			endpointGeneration,
-			previousAuthorityId,
-			currentAuthorityId,
-		);
-		for (const key of Object.keys(document.conversations)) {
-			await this.#store.transact(key, current => {
-				if (
-					!current ||
-					current.sessionId !== sessionId ||
-					current.endpointGeneration !== endpointGeneration ||
-					current.attachmentAuthorityId !== currentAuthorityId ||
-					current.attachmentAuthorityMigrationFromId !== previousAuthorityId
-				)
-					return current;
-				const inboundDispatches = current.inboundDispatches?.map(receipt => {
-					if (receipt.attachmentAuthorityId !== previousAuthorityId) return receipt;
-					return { ...receipt, attachmentAuthorityId: currentAuthorityId };
+			}
+			await this.#effects.migrateAttachmentAuthorityIdWhileHoldingGate(
+				sessionId,
+				endpointGeneration,
+				previousAuthorityId,
+				currentAuthorityId,
+			);
+			for (const key of Object.keys(document.conversations)) {
+				await this.#store.transact(key, current => {
+					if (
+						!current ||
+						current.sessionId !== sessionId ||
+						current.endpointGeneration !== endpointGeneration ||
+						current.attachmentAuthorityId !== currentAuthorityId ||
+						current.attachmentAuthorityMigrationFromId !== previousAuthorityId
+					)
+						return current;
+					const inboundDispatches = current.inboundDispatches?.map(receipt => {
+						if (receipt.attachmentAuthorityId !== previousAuthorityId) return receipt;
+						return { ...receipt, attachmentAuthorityId: currentAuthorityId };
+					});
+					return normalizeDiscordConversation({
+						...current,
+						generation: current.generation + 1,
+						attachmentAuthorityMigrationFromId: undefined,
+						...(inboundDispatches === undefined ? {} : { inboundDispatches }),
+						updatedAt: this.#now(),
+					});
 				});
-				return normalizeDiscordConversation({
-					...current,
-					generation: current.generation + 1,
-					attachmentAuthorityMigrationFromId: undefined,
-					...(inboundDispatches === undefined ? {} : { inboundDispatches }),
-					updatedAt: this.#now(),
-				});
-			});
-		}
+			}
+		});
 	}
 
 	/** Posts a safe command outcome to the active mapped conversation. */
@@ -848,7 +854,12 @@ export class DiscordNotificationDaemon {
 		}
 
 		await this.#store.transact(key, current => {
-			if (current?.state !== "active" || current.endpointGeneration !== record.endpointGeneration) return current;
+			if (
+				current?.state !== "active" ||
+				current.endpointGeneration !== record.endpointGeneration ||
+				!recordAcceptsAuthority(current, routing.attachmentAuthorityId)
+			)
+				return current;
 			const interactionId = event.interaction?.id;
 			const existing = (current.inboundDispatches ?? []).find(
 				item => item.eventId === event.id || (interactionId !== undefined && item.interactionId === interactionId),
@@ -1662,25 +1673,29 @@ export class DiscordNotificationDaemon {
 			}
 			const now = this.#now();
 			await this.#requireLiveBinding(sessionId, endpointGeneration, attachmentAuthorityId);
-			intent = await this.#store.transact(intentKey, old => {
-				if (old?.state === "creating" && old.createOwner && (old.createLeaseExpiresAt ?? 0) > now) return old;
-				return {
-					generation: (old?.generation ?? 0) + 1,
-					state: "creating",
-					appId: this.options.provider.applicationId,
-					guildId: this.options.guildId,
-					parentChannelId: this.options.parentChannelId,
-					sessionId,
-					endpointGeneration,
-					attachmentAuthorityId,
-					createNonce: old?.createNonce ?? nonce,
-					createOwner: owner,
-					createLeaseExpiresAt: now + 60_000,
-					updatedAt: now,
-					seenEventIds: [],
-					seenInteractionIds: [],
-				};
-			});
+			intent = await this.#effects.withSessionMutationGate(
+				sessionId,
+				async () =>
+					await this.#store.transact(intentKey, old => {
+						if (old?.state === "creating" && old.createOwner && (old.createLeaseExpiresAt ?? 0) > now) return old;
+						return {
+							generation: (old?.generation ?? 0) + 1,
+							state: "creating",
+							appId: this.options.provider.applicationId,
+							guildId: this.options.guildId,
+							parentChannelId: this.options.parentChannelId,
+							sessionId,
+							endpointGeneration,
+							attachmentAuthorityId,
+							createNonce: old?.createNonce ?? nonce,
+							createOwner: owner,
+							createLeaseExpiresAt: now + 60_000,
+							updatedAt: now,
+							seenEventIds: [],
+							seenInteractionIds: [],
+						};
+					}),
+			);
 			if (!intent) throw new Error("Unable to persist Discord create intent");
 			if (intent.createOwner === owner) break;
 			await Bun.sleep(Math.min(25, Math.max(1, (intent.createLeaseExpiresAt ?? now) - now)));
@@ -1717,39 +1732,49 @@ export class DiscordNotificationDaemon {
 			threadId: thread.id,
 		});
 		let committed = false;
-		const record = await this.#store.transactWithSnapshot(key, (old, conversations) => {
-			const current = conversations[intentKey];
-			if (
-				current?.state !== "creating" ||
-				current.createOwner !== intent.createOwner ||
-				current.generation !== intent.generation ||
-				current.attachmentAuthorityId !== intent.attachmentAuthorityId ||
-				(current.createLeaseExpiresAt ?? 0) <= this.#now()
-			)
-				return old;
-			committed = true;
-			return normalizeDiscordConversation({
-				generation: (old?.generation ?? 0) + 1,
-				state: "active",
-				appId: intent.appId,
-				guildId: intent.guildId,
-				parentChannelId: intent.parentChannelId,
-				threadId: thread.id,
-				sessionId,
-				endpointGeneration,
-				attachmentAuthorityId: intent.attachmentAuthorityId,
-				createNonce: intent.createNonce,
-				effectIncarnationId: old?.effectIncarnationId ?? intent.effectIncarnationId ?? randomUUID(),
-				updatedAt: this.#now(),
-				seenEventIds: old?.attachmentAuthorityId === intent.attachmentAuthorityId ? (old?.seenEventIds ?? []) : [],
-				seenInteractionIds:
-					old?.attachmentAuthorityId === intent.attachmentAuthorityId ? (old?.seenInteractionIds ?? []) : [],
-				inboundDispatches:
-					old?.attachmentAuthorityId === intent.attachmentAuthorityId ? old?.inboundDispatches : undefined,
-			});
-		});
+		const record = await this.#effects.withSessionMutationGate(
+			sessionId,
+			async () =>
+				await this.#store.transactWithSnapshot(key, (old, conversations) => {
+					const current = conversations[intentKey];
+					if (
+						current?.state !== "creating" ||
+						current.createOwner !== intent.createOwner ||
+						current.generation !== intent.generation ||
+						current.attachmentAuthorityId !== intent.attachmentAuthorityId ||
+						(current.createLeaseExpiresAt ?? 0) <= this.#now()
+					)
+						return old;
+					committed = true;
+					return normalizeDiscordConversation({
+						generation: (old?.generation ?? 0) + 1,
+						state: "active",
+						appId: intent.appId,
+						guildId: intent.guildId,
+						parentChannelId: intent.parentChannelId,
+						threadId: thread.id,
+						sessionId,
+						endpointGeneration,
+						attachmentAuthorityId: intent.attachmentAuthorityId,
+						...(current.attachmentAuthorityMigrationFromId === undefined
+							? {}
+							: { attachmentAuthorityMigrationFromId: current.attachmentAuthorityMigrationFromId }),
+						createNonce: intent.createNonce,
+						effectIncarnationId: old?.effectIncarnationId ?? intent.effectIncarnationId ?? randomUUID(),
+						updatedAt: this.#now(),
+						seenEventIds:
+							old?.attachmentAuthorityId === intent.attachmentAuthorityId ? (old?.seenEventIds ?? []) : [],
+						seenInteractionIds:
+							old?.attachmentAuthorityId === intent.attachmentAuthorityId ? (old?.seenInteractionIds ?? []) : [],
+						inboundDispatches:
+							old?.attachmentAuthorityId === intent.attachmentAuthorityId ? old?.inboundDispatches : undefined,
+					});
+				}),
+		);
 		if (!committed || !record) throw new Error("Discord create intent lost its fence before mapping commit");
-		await this.#store.delete(intentKey, intent.generation);
+		await this.#effects.withSessionMutationGate(sessionId, async () => {
+			await this.#store.delete(intentKey, intent.generation);
+		});
 		return record;
 	}
 
@@ -1873,11 +1898,15 @@ export class DiscordNotificationDaemon {
 					threadId: current.threadId,
 				})
 			: this.#intentKey(current.sessionId!);
-		const result = await this.#store.write(key, current.generation, {
-			...next,
-			generation: current.generation + 1,
-			updatedAt: this.#now(),
-		});
+		const result = await this.#effects.withSessionMutationGate(
+			current.sessionId!,
+			async () =>
+				await this.#store.write(key, current.generation, {
+					...next,
+					generation: current.generation + 1,
+					updatedAt: this.#now(),
+				}),
+		);
 		if (!result) {
 			const stored = await this.#store.read(key);
 			throw new Error(

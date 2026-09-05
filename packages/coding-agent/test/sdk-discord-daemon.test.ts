@@ -272,6 +272,106 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 		);
 	});
 
+	test("rejects a provider effect that omits attachment authority", async () => {
+		await withDaemon(
+			async (daemon, _provider, agentDir) => {
+				await daemon.notify({
+					sessionId: "session",
+					endpointGeneration: 1,
+					attachmentAuthorityId: "current-authority",
+					content: "root",
+				});
+				const journal = new ChatEffectJournal({ agentDir, transport: "discord" });
+				await expect(
+					journal.enqueue({
+						id: "missing-authority",
+						kind: "post-message",
+						transport: "discord",
+						sessionId: "session",
+						endpointGeneration: 1,
+						payload: {
+							threadId: "thread-1",
+							content: "forged",
+							nonce: "missing-authority",
+							attachmentAuthorityId: undefined,
+						},
+					}),
+				).rejects.toThrow("attachment authority");
+			},
+			{
+				resolveAttachment: async sessionId => ({
+					sessionId,
+					generation: 1,
+					authorityId: "current-authority",
+					isCurrent: () => true,
+					send: () => {},
+					sendMaintenance: () => {},
+				}),
+			},
+		);
+	});
+
+	test("fences an effect enqueued after the migration journal snapshot", async () => {
+		let authorityId = "legacy-authority";
+		await withDaemon(
+			async (daemon, _provider, agentDir) => {
+				await daemon.notify({
+					sessionId: "session",
+					endpointGeneration: 1,
+					attachmentAuthorityId: authorityId,
+					content: "root",
+				});
+				authorityId = "current-authority";
+				const entered = Promise.withResolvers<void>();
+				const release = Promise.withResolvers<void>();
+				let paused = true;
+				__chatEffectJournalTestHooks.beforeAuthorityMigrationEffect = async () => {
+					if (!paused) return;
+					paused = false;
+					entered.resolve();
+					await release.promise;
+				};
+
+				const journal = new ChatEffectJournal({ agentDir, transport: "discord" });
+				const migration = daemon.migrateAttachmentAuthority("session", 1, "legacy-authority", "current-authority");
+				await entered.promise;
+				const late = journal.enqueue({
+					id: "late-discord-effect",
+					kind: "post-message",
+					transport: "discord",
+					sessionId: "session",
+					endpointGeneration: 1,
+					payload: {
+						threadId: "thread-1",
+						content: "late",
+						nonce: "late-discord-effect",
+						attachmentAuthorityId: "legacy-authority",
+					},
+				});
+				release.resolve();
+				await migration;
+				await expect(late).rejects.toThrow("attachment authority");
+				expect(await journal.read("late-discord-effect")).toBeUndefined();
+				const store = new ConversationStore<DiscordConversation>({ agentDir, kind: "discord" });
+				const migrated = Object.values((await store.load()).conversations).find(
+					record => record.sessionId === "session",
+				);
+				expect(migrated?.attachmentAuthorityId).toBe("current-authority");
+				expect(migrated?.attachmentAuthorityMigrationFromId).toBeUndefined();
+			},
+			{
+				resolveAttachment: async sessionId => ({
+					sessionId,
+					generation: 1,
+					authorityId,
+					isCurrent: () => true,
+					send: () => {},
+					sendMaintenance: () => {},
+				}),
+			},
+		);
+	});
+
 	test("reconciles an uncertain create by nonce instead of creating a second thread", async () => {
 		await withDaemon(async (daemon, provider) => {
 			provider.failCreateAfterPersist = true;
