@@ -429,29 +429,111 @@ describe("AuthStorage codex oauth ranking", () => {
 		);
 	});
 
-	test.each(["plus", " Plus ", "PLUS"])(
-		"allows GPT-5.6 Sol for the provider-decided %s ChatGPT plan",
-		async planType => {
-			if (!authStorage) throw new Error("test setup failed");
+	test("rejects GPT-5.6 Sol when a credential selector pins a Free ChatGPT account", async () => {
+		if (!authStorage) throw new Error("test setup failed");
 
-			await authStorage.set("openai-codex", [
-				{ type: "oauth", ...createCredential("acct-plus", "plus@example.com") },
-			]);
-			const plusReport = createCodexUsageReport({
-				accountId: "acct-plus",
+		await authStorage.set("openai-codex", [
+			{ type: "oauth", ...createCredential("acct-free", "free@example.com") },
+			{ type: "oauth", ...createCredential("acct-plus", "plus@example.com") },
+		]);
+		for (const [accountId, planType] of [
+			["acct-free", "free"],
+			["acct-plus", "plus"],
+		] as const) {
+			const report = createCodexUsageReport({
+				accountId,
 				primary: { usedFraction: 0.05, resetInMs: 30 * 60 * 1000 },
 				secondary: { usedFraction: 0.05, resetInMs: 6 * 24 * 60 * 60 * 1000 },
 			});
-			plusReport.metadata = { ...plusReport.metadata, planType };
-			usageByAccount.set("acct-plus", plusReport);
+			report.metadata = { ...report.metadata, planType };
+			usageByAccount.set(accountId, report);
+		}
 
-			await expect(
-				authStorage.getApiKey("openai-codex", `session-sol-${planType.trim().toLowerCase()}`, {
-					modelId: "gpt-5.6-sol",
-				}),
-			).resolves.toBe("api-acct-plus");
-		},
-	);
+		await expect(
+			authStorage.getApiKey("openai-codex", "session-sol-pinned-free", {
+				modelId: "gpt-5.6-sol",
+				credentialSelector: { kind: "email", value: "free@example.com" },
+			}),
+		).rejects.toThrow('This ChatGPT Codex account cannot use model "gpt-5.6-sol"');
+	});
+
+	test("aborts GPT-5.6 Sol preflight while fetching a pinned Free account plan", async () => {
+		if (!authStorage) throw new Error("test setup failed");
+
+		await authStorage.set("openai-codex", [{ type: "oauth", ...createCredential("acct-free", "free@example.com") }]);
+		const freeReport = createCodexUsageReport({
+			accountId: "acct-free",
+			primary: { usedFraction: 0.05, resetInMs: 30 * 60 * 1000 },
+			secondary: { usedFraction: 0.05, resetInMs: 6 * 24 * 60 * 60 * 1000 },
+		});
+		freeReport.metadata = { ...freeReport.metadata, planType: "free" };
+		let usageStarted = false;
+		vi.spyOn(usageProvider, "fetchUsage").mockImplementation(async params => {
+			usageStarted = true;
+			if (!params.signal) {
+				await Bun.sleep(200);
+				return freeReport;
+			}
+			const aborted = Promise.withResolvers<void>();
+			params.signal.addEventListener("abort", () => aborted.reject(params.signal?.reason), { once: true });
+			await aborted.promise;
+			return freeReport;
+		});
+		const controller = new AbortController();
+		const request = authStorage.getApiKey("openai-codex", "session-sol-pinned-free-abort", {
+			modelId: "gpt-5.6-sol",
+			credentialSelector: { kind: "email", value: "free@example.com" },
+			signal: controller.signal,
+		});
+		await waitFor(() => usageStarted);
+		controller.abort(new Error("cancelled Sol preflight"));
+
+		await expect(request).rejects.toThrow("usage fetch aborted");
+	});
+
+	test("rejects GPT-5.6 Sol when the only Free ChatGPT credential is temporarily blocked", async () => {
+		if (!authStorage) throw new Error("test setup failed");
+
+		await authStorage.set("openai-codex", [{ type: "oauth", ...createCredential("acct-free", "free@example.com") }]);
+		const freeReport = createCodexUsageReport({
+			accountId: "acct-free",
+			primary: { usedFraction: 0.05, resetInMs: 30 * 60 * 1000 },
+			secondary: { usedFraction: 0.05, resetInMs: 6 * 24 * 60 * 60 * 1000 },
+		});
+		freeReport.metadata = { ...freeReport.metadata, planType: "free" };
+		usageByAccount.set("acct-free", freeReport);
+
+		await expect(authStorage.getApiKey("openai-codex", "session-blocked-free")).resolves.toBe("api-acct-free");
+		await expect(
+			authStorage.markUsageLimitReached("openai-codex", "session-blocked-free", { retryAfterMs: 60_000 }),
+		).resolves.toBe(false);
+		await expect(
+			authStorage.getApiKey("openai-codex", "session-sol-blocked-free", { modelId: "gpt-5.6-sol" }),
+		).rejects.toThrow('This ChatGPT Codex account cannot use model "gpt-5.6-sol"');
+	});
+
+	test.each([
+		"plus",
+		" Plus ",
+		"PLUS",
+	])("allows GPT-5.6 Sol for the provider-decided %s ChatGPT plan", async planType => {
+		if (!authStorage) throw new Error("test setup failed");
+
+		await authStorage.set("openai-codex", [{ type: "oauth", ...createCredential("acct-plus", "plus@example.com") }]);
+		const plusReport = createCodexUsageReport({
+			accountId: "acct-plus",
+			primary: { usedFraction: 0.05, resetInMs: 30 * 60 * 1000 },
+			secondary: { usedFraction: 0.05, resetInMs: 6 * 24 * 60 * 60 * 1000 },
+		});
+		plusReport.metadata = { ...plusReport.metadata, planType };
+		usageByAccount.set("acct-plus", plusReport);
+
+		await expect(
+			authStorage.getApiKey("openai-codex", `session-sol-${planType.trim().toLowerCase()}`, {
+				modelId: "gpt-5.6-sol",
+			}),
+		).resolves.toBe("api-acct-plus");
+	});
 
 	test.each([
 		"pro",
@@ -520,6 +602,174 @@ describe("AuthStorage codex oauth ranking", () => {
 		).resolves.toBe("api-acct-plus");
 	});
 
+	test.each([
+		["pro", "free"],
+		["plus", "free"],
+	] as const)("does not dispatch a Free Sol fallback after a failed %s credential", async (firstPlan, fallbackPlan) => {
+		if (!authStorage) throw new Error("test setup failed");
+
+		const firstAccountId = `acct-${firstPlan}`;
+		const fallbackAccountId = `acct-${fallbackPlan}`;
+		await authStorage.set("openai-codex", [
+			{ type: "oauth", ...createCredential(fallbackAccountId, `${fallbackPlan}@example.com`) },
+			{ type: "oauth", ...createCredential(firstAccountId, `${firstPlan}@example.com`) },
+		]);
+		for (const [accountId, planType] of [
+			[fallbackAccountId, fallbackPlan],
+			[firstAccountId, firstPlan],
+		] as const) {
+			const report = createCodexUsageReport({
+				accountId,
+				primary: { usedFraction: 0.05, resetInMs: 30 * 60 * 1000 },
+				secondary: { usedFraction: 0.05, resetInMs: 6 * 24 * 60 * 60 * 1000 },
+			});
+			report.metadata = { ...report.metadata, planType };
+			usageByAccount.set(accountId, report);
+		}
+		const attemptedAccounts: string[] = [];
+		vi.spyOn(oauthUtils, "getOAuthApiKey").mockImplementation(async (_provider, credentials) => {
+			const credential = credentials["openai-codex"] as OAuthCredentials | undefined;
+			if (!credential?.accountId) return null;
+			attemptedAccounts.push(credential.accountId);
+			return null;
+		});
+
+		await expect(
+			authStorage.getApiKey("openai-codex", `session-sol-${firstPlan}-free-fallback`, {
+				modelId: "gpt-5.6-sol",
+			}),
+		).resolves.toBeUndefined();
+		expect(attemptedAccounts).toEqual([firstAccountId]);
+	});
+
+	test("skips a soft-preferred Free Sol account and dispatches the entitled Pro account", async () => {
+		if (!authStorage) throw new Error("test setup failed");
+
+		await authStorage.set("openai-codex", [
+			{ type: "oauth", ...createCredential("acct-pro", "pro@example.com") },
+			{ type: "oauth", ...createCredential("acct-free", "free@example.com") },
+		]);
+		for (const [accountId, planType] of [
+			["acct-pro", "pro"],
+			["acct-free", "free"],
+		] as const) {
+			const report = createCodexUsageReport({
+				accountId,
+				primary: { usedFraction: 0.05, resetInMs: 30 * 60 * 1000 },
+				secondary: { usedFraction: 0.05, resetInMs: 6 * 24 * 60 * 60 * 1000 },
+			});
+			report.metadata = { ...report.metadata, planType };
+			usageByAccount.set(accountId, report);
+		}
+		const attemptedAccounts: string[] = [];
+		vi.spyOn(oauthUtils, "getOAuthApiKey").mockImplementation(async (_provider, credentials) => {
+			const credential = credentials["openai-codex"] as OAuthCredentials | undefined;
+			if (!credential?.accountId) return null;
+			attemptedAccounts.push(credential.accountId);
+			return { apiKey: `api-${credential.accountId}`, newCredentials: credential };
+		});
+
+		await expect(
+			authStorage.getApiKey("openai-codex", "session-sol-preferred-free", {
+				modelId: "gpt-5.6-sol",
+				preferredCredentialSelector: { kind: "email", value: "free@example.com" },
+			}),
+		).resolves.toBe("api-acct-pro");
+		expect(attemptedAccounts).toEqual(["acct-pro"]);
+	});
+
+	test("refetches Sol entitlement when request preparation replaces a Plus row with a Free account", async () => {
+		if (!authStorage || !store) throw new Error("test setup failed");
+
+		await authStorage.set("openai-codex", [{ type: "oauth", ...createCredential("acct-plus", "plus@example.com") }]);
+		for (const [accountId, planType] of [
+			["acct-plus", "plus"],
+			["acct-free", "free"],
+		] as const) {
+			const report = createCodexUsageReport({
+				accountId,
+				primary: { usedFraction: 0.05, resetInMs: 30 * 60 * 1000 },
+				secondary: { usedFraction: 0.05, resetInMs: 6 * 24 * 60 * 60 * 1000 },
+			});
+			report.metadata = { ...report.metadata, planType };
+			usageByAccount.set(accountId, report);
+		}
+		store.prepareForRequest = async credentialId => {
+			store?.updateAuthCredential(credentialId, {
+				type: "oauth",
+				...createCredential("acct-free", "free@example.com"),
+			});
+			return true;
+		};
+		const attemptedAccounts: string[] = [];
+		vi.spyOn(oauthUtils, "getOAuthApiKey").mockImplementation(async (_provider, credentials) => {
+			const credential = credentials["openai-codex"] as OAuthCredentials | undefined;
+			if (credential?.accountId) attemptedAccounts.push(credential.accountId);
+			return null;
+		});
+
+		await expect(
+			authStorage.getApiKey("openai-codex", "session-sol-prepared-free", { modelId: "gpt-5.6-sol" }),
+		).rejects.toThrow('This ChatGPT Codex account cannot use model "gpt-5.6-sol"');
+		expect(attemptedAccounts).toEqual([]);
+	});
+
+	test("revalidates Sol entitlement when a snapshot changes the same account from Plus to Free", async () => {
+		const snapshotStore: AuthCredentialStore = await SqliteAuthCredentialStore.open(
+			path.join(tempDir, "snapshot-replacement.db"),
+		);
+		let notifySnapshotChanged = () => {};
+		snapshotStore.onSnapshotChanged = listener => {
+			notifySnapshotChanged = listener;
+			return () => {};
+		};
+		const snapshotAuth = new AuthStorage(snapshotStore, {
+			usageProviderResolver: provider => (provider === "openai-codex" ? usageProvider : undefined),
+		});
+		try {
+			await snapshotAuth.set("openai-codex", [
+				{ type: "oauth", ...createCredential("acct-plus", "plus@example.com") },
+			]);
+			const plusReport = createCodexUsageReport({
+				accountId: "acct-plus",
+				primary: { usedFraction: 0.05, resetInMs: 30 * 60 * 1000 },
+				secondary: { usedFraction: 0.05, resetInMs: 6 * 24 * 60 * 60 * 1000 },
+			});
+			plusReport.metadata = { ...plusReport.metadata, planType: "plus" };
+			usageByAccount.set("acct-plus", plusReport);
+			snapshotStore.prepareForRequest = async credentialId => {
+				queueMicrotask(() => {
+					const freeReport = createCodexUsageReport({
+						accountId: "acct-plus",
+						primary: { usedFraction: 0.05, resetInMs: 30 * 60 * 1000 },
+						secondary: { usedFraction: 0.05, resetInMs: 6 * 24 * 60 * 60 * 1000 },
+					});
+					freeReport.metadata = { ...freeReport.metadata, planType: "free" };
+					usageByAccount.set("acct-plus", freeReport);
+					snapshotStore.updateAuthCredential(credentialId, {
+						type: "oauth",
+						...createCredential("acct-plus", "plus@example.com"),
+					});
+					notifySnapshotChanged();
+				});
+				return undefined;
+			};
+			const attemptedAccounts: string[] = [];
+			vi.spyOn(oauthUtils, "getOAuthApiKey").mockImplementation(async (_provider, credentials) => {
+				const credential = credentials["openai-codex"] as OAuthCredentials | undefined;
+				if (credential?.accountId) attemptedAccounts.push(credential.accountId);
+				return null;
+			});
+
+			await expect(
+				snapshotAuth.getApiKey("openai-codex", "session-sol-snapshot-free", { modelId: "gpt-5.6-sol" }),
+			).rejects.toThrow('This ChatGPT Codex account cannot use model "gpt-5.6-sol"');
+			expect(attemptedAccounts).toEqual([]);
+		} finally {
+			snapshotAuth.close();
+		}
+	});
+
 	test("does not reject GPT-5.6 Sol when the ChatGPT plan is unavailable", async () => {
 		if (!authStorage) throw new Error("test setup failed");
 
@@ -566,7 +816,7 @@ describe("AuthStorage codex oauth ranking", () => {
 		).resolves.toBe("api-acct-unfamiliar");
 	});
 
-	test("prefers an unfamiliar plan over a known denied plan so the provider can decide", async () => {
+	test("prefers an unfamiliar plan over a limited Plus plan so the provider can decide", async () => {
 		if (!authStorage) throw new Error("test setup failed");
 
 		await authStorage.set("openai-codex", [
