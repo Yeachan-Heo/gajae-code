@@ -286,6 +286,8 @@ class ConcreteExtensionAPI implements ExtensionAPI {
 		if (event === "*") {
 			if (options.target !== undefined) throw new Error("Wildcard function hooks cannot declare a target");
 		} else if (options.target !== undefined) {
+			if (event !== "tool_call" && event !== "tool_result")
+				throw new Error("Function hook targets are only valid for tool_call and tool_result events");
 			validateFunctionHookTarget(options.target);
 		}
 		const grant = intersectFunctionHookGrants(
@@ -701,6 +703,7 @@ async function discoverExtensionsInDir(dir: string): Promise<string[]> {
 		logger.warn("Failed to discover extensions in directory", { path: dir, error: String(err) });
 		return [];
 	}
+	entries.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
 
 	for (const entry of entries) {
 		const entryPath = path.join(dir, entry.name);

@@ -42,13 +42,12 @@ import {
 	functionHookTransformAllowed,
 	intersectFunctionHookGrants,
 	isPlainFunctionHookData,
-	isSafeFunctionHookValue,
 	isValidFunctionHookEventValue,
-	readConstrainedFunctionHookFile,
+	isValidFunctionHookReturnValue,
 	redactFunctionHookValue,
 	sanitizeFunctionHookReason,
 } from "./function-hooks";
-import { getFunctionHookRegistration } from "./function-hooks-internal";
+import { getFunctionHookRegistration, readConstrainedFunctionHookFile } from "./function-hooks-internal";
 import type {
 	AfterProviderResponseEvent,
 	BeforeAgentStartEvent,
@@ -641,7 +640,7 @@ export class ExtensionRunner {
 	}
 
 	getFunctionHookAudit(): readonly FunctionHookAuditRecord[] {
-		return this.#functionHookAudit.map(record => ({ ...record, provenance: { ...record.provenance } }));
+		return this.#functionHookAudit.map(record => cloneFunctionHookDataStrict(record));
 	}
 
 	setAttemptRecordStore(store: AttemptRecordStore): void {
@@ -884,7 +883,7 @@ export class ExtensionRunner {
 		this.#functionHookAuditSequence += 1;
 		const frozenEvidence =
 			record.evidence !== null && typeof record.evidence === "object"
-				? Object.freeze(record.evidence)
+				? Object.freeze(cloneFunctionHookDataStrict(record.evidence))
 				: record.evidence;
 		const frozenRecord = Object.freeze({
 			...record,
@@ -956,7 +955,10 @@ export class ExtensionRunner {
 				error instanceof Error ? error.message : String(error),
 				"Function hook failed",
 			);
-			const stack = error instanceof Error ? error.stack : undefined;
+			const stack =
+				error instanceof Error && error.stack
+					? sanitizeFunctionHookReason(error.stack, "Function hook stack unavailable")
+					: undefined;
 			this.emitError({ extensionPath: ext.path, event: invocation.eventType, error: message, stack });
 			return { status: "error", error: message, stack };
 		} finally {
@@ -1008,9 +1010,16 @@ export class ExtensionRunner {
 					if (wildcard) return { action: "continue", event: currentEvent };
 					return this.#functionHookErrorResult(currentEvent, reason) as FunctionHookDispatchResult<TEvent>;
 				};
-				const payload = Object.freeze(
-					compatibilityPayloadForFunctionHook(currentEvent, effectiveGrant, wildcard),
-				) as Readonly<TEvent>;
+				let payload: Readonly<TEvent>;
+				try {
+					payload = Object.freeze(
+						compatibilityPayloadForFunctionHook(currentEvent, effectiveGrant, wildcard),
+					) as Readonly<TEvent>;
+				} catch {
+					const reason = "Function hook payload could not be snapshotted";
+					this.emitError({ extensionPath: indexed.ext.path, event: currentEvent.type, error: reason });
+					return failureResult(reason);
+				}
 				const controller = new AbortController();
 				const abortFromChain = () => controller.abort(chainSignal.reason);
 				if (chainSignal.aborted) abortFromChain();
@@ -1124,6 +1133,7 @@ export class ExtensionRunner {
 					controller.abort(new Error("Function hook invocation completed"));
 					active = false;
 					chainSignal.removeEventListener("abort", abortFromChain);
+					this.#appendFunctionHookAudit(registration, invocation, "continue", undefined, effectiveGrant);
 					return nextResult;
 				}
 				controller.abort(new Error("Function hook invocation completed"));
@@ -1214,14 +1224,23 @@ export class ExtensionRunner {
 						return failureResult(reason);
 					}
 					const value = (rawResult as { value: unknown }).value;
-					if (value === undefined || !isSafeFunctionHookValue(value)) {
-						const reason = "Function hook returned a non-plain terminal value";
+					if (value === undefined || !isValidFunctionHookReturnValue(currentEvent, value)) {
+						const reason = "Function hook returned an invalid terminal value";
+						this.emitError({ extensionPath: indexed.ext.path, event: currentEvent.type, error: reason });
+						this.#appendFunctionHookAudit(registration, invocation, "error", reason);
+						return failureResult(reason);
+					}
+					let valueSnapshot: unknown;
+					try {
+						valueSnapshot = cloneFunctionHookDataStrict(value);
+					} catch {
+						const reason = "Function hook terminal value could not be snapshotted";
 						this.emitError({ extensionPath: indexed.ext.path, event: currentEvent.type, error: reason });
 						this.#appendFunctionHookAudit(registration, invocation, "error", reason);
 						return failureResult(reason);
 					}
 					this.#appendFunctionHookAudit(registration, invocation, "return");
-					return { action: "return", value } as FunctionHookDispatchResult<TEvent>;
+					return { action: "return", value: valueSnapshot } as FunctionHookDispatchResult<TEvent>;
 				}
 				const reason = "Function hook returned an invalid action";
 				this.emitError({ extensionPath: indexed.ext.path, event: currentEvent.type, error: reason });
@@ -1365,7 +1384,13 @@ export class ExtensionRunner {
 		event.details = functionEvent.details;
 		event.isError = functionEvent.isError;
 		const handlers = this.#legacyHandlers("tool_result");
-		if (handlers.length === 0) return undefined;
+		if (handlers.length === 0) {
+			return {
+				content: event.content,
+				details: event.details,
+				isError: event.isError,
+			};
+		}
 		this.#requireScopeOrFailClosed(scope, "tool_result");
 
 		const ctx = this.createContext();

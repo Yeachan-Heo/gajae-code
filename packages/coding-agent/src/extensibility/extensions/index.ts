@@ -21,7 +21,6 @@ export {
 	isSafeFunctionHookValue,
 	isValidFunctionHookEventValue,
 	normalizeFunctionHookGrant,
-	readConstrainedFunctionHookFile,
 	redactFunctionHookValue,
 	sanitizeFunctionHookReason,
 	validateFunctionHookTarget,

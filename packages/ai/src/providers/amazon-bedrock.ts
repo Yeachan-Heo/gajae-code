@@ -220,7 +220,7 @@ export const streamBedrock: StreamFunction<"bedrock-converse-stream"> = (
 				if (tc.any || tc.tool) additionalModelRequestFields = undefined;
 			}
 
-			const commandInput: ConverseStreamRequest = {
+			let commandInput: ConverseStreamRequest = {
 				messages: convertMessages(context, model, cacheRetention),
 				system: buildSystemPrompt(context.systemPrompt, model, cacheRetention),
 				inferenceConfig: {
@@ -231,7 +231,15 @@ export const streamBedrock: StreamFunction<"bedrock-converse-stream"> = (
 				toolConfig,
 				additionalModelRequestFields,
 			};
-			options?.onPayload?.(commandInput, model, options?.attemptScope, options?.signal);
+			const replacementPayload = await options?.onPayload?.(
+				commandInput,
+				model,
+				options?.attemptScope,
+				options?.signal,
+			);
+			if (replacementPayload !== undefined) {
+				commandInput = replacementPayload as typeof commandInput;
+			}
 
 			const host = `bedrock-runtime.${region}.amazonaws.com`;
 			const url = `https://${host}/model/${encodeURIComponent(model.id)}/converse-stream`;

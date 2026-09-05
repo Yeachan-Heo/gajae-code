@@ -187,6 +187,15 @@ function assertCompiledHookMetadata(
 		);
 	}
 	const expectedFunctionHook = expected.functionHook === true;
+	if (
+		declared.extensionId !== expected.extensionId ||
+		declared.event !== expected.event ||
+		declared.target !== expected.target ||
+		declared.phase !== expected.phase ||
+		declared.relativePath !== expected.relativePath ||
+		declared.implementationHash !== expected.implementationHash
+	)
+		invalidHookMetadata(declared.plugin, "identity or implementation metadata does not match the installed manifest");
 	if (persisted.functionHook !== expectedFunctionHook)
 		invalidHookMetadata(declared.plugin, "functionHook does not match the installed manifest");
 	if (!expectedFunctionHook) return persisted;

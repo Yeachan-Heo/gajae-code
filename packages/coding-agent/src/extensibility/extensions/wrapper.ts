@@ -151,9 +151,10 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 		// Execute the actual tool
 		let result: { content: any; details?: TDetails };
 		let executionError: Error | undefined;
+		const effectiveOnUpdate = this.runner.hasHandlers("tool_result") ? undefined : onUpdate;
 
 		try {
-			result = await this.tool.execute(toolCallId, params, signal, onUpdate, context);
+			result = await this.tool.execute(toolCallId, params, signal, effectiveOnUpdate, context);
 		} catch (err) {
 			executionError = err instanceof Error ? err : new Error(String(err));
 			result = {
@@ -196,7 +197,8 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 
 				// Error status unchanged, but content/details may be modified
 				if (executionError) {
-					throw executionError;
+					const textBlocks = modifiedContent.filter((content): content is TextContent => content.type === "text");
+					throw new Error(textBlocks.map(content => content.text).join("\n") || "Tool execution failed");
 				}
 				return { content: modifiedContent, details: modifiedDetails };
 			}

@@ -1421,6 +1421,7 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 		];
 		const changedSources = [
 			"packages/coding-agent/src/extensibility/extensions/function-hooks.ts",
+			"packages/coding-agent/src/extensibility/extensions/function-hooks-internal.ts",
 			"packages/coding-agent/src/extensibility/extensions/runner.ts",
 			"packages/coding-agent/src/extensibility/extensions/loader.ts",
 			"packages/coding-agent/src/extensibility/extensions/wrapper.ts",

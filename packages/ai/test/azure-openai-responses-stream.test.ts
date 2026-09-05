@@ -121,6 +121,35 @@ describe("azure openai first-class provider auth", () => {
 });
 
 describe("azure openai responses streaming", () => {
+	it("awaits and sends the onPayload replacement", async () => {
+		let sentBody: Record<string, unknown> | undefined;
+		global.fetch = vi.fn(async (_input, init) => {
+			sentBody = JSON.parse(String(init?.body)) as Record<string, unknown>;
+			return createSseResponse([
+				{
+					type: "response.completed",
+					response: { status: "completed", output: [], usage: { input_tokens: 0, output_tokens: 0 } },
+				},
+			]);
+		}) as unknown as typeof fetch;
+
+		await streamAzureOpenAIResponses(
+			azureModel,
+			{ messages: [{ role: "user", content: "Say hello", timestamp: Date.now() }] },
+			{
+				apiKey: "test-key",
+				azureBaseUrl: azureModel.baseUrl,
+				azureApiVersion: "v1",
+				onPayload: async payload => {
+					await Bun.sleep(1);
+					return { ...(payload as Record<string, unknown>), middlewareMarker: "applied" };
+				},
+			},
+		).result();
+
+		expect(sentBody?.middlewareMarker).toBe("applied");
+	});
+
 	it("serializes each system prompt as an Azure Responses system input item for non-reasoning models", async () => {
 		const payload = await captureAzurePayload({
 			systemPrompt: ["First instruction", "", "Second instruction"],

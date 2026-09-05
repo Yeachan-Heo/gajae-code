@@ -3897,7 +3897,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		} else if (!toolRegistry.has("resolve")) {
 			const resolveTool = await logger.time("createTools:resolve:session", HIDDEN_TOOLS.resolve, toolSession);
 			if (resolveTool) {
-				const wrappedResolveTool = wrapToolWithMetaNotice(resolveTool);
+				const resolveWithNotice = wrapToolWithMetaNotice(resolveTool);
+				const wrappedResolveTool = extensionRunner
+					? (new ExtensionToolWrapper(resolveWithNotice, extensionRunner) as AgentTool)
+					: resolveWithNotice;
 				builtinCandidateTools.push(wrappedResolveTool);
 				toolRegistry.set(wrappedResolveTool.name, wrappedResolveTool);
 				builtinToolIdentities.add(wrappedResolveTool);

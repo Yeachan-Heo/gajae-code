@@ -214,4 +214,23 @@ describe("constrained plugin hooks", () => {
 			hook.capabilityHash = "0".repeat(64);
 		});
 	});
+
+	test("quarantines a function hook when persisted identity or implementation metadata is tampered", async () => {
+		for (const mutate of [
+			(hook: Record<string, unknown>) => {
+				hook.extensionId = "hook:tool_call:before:write:h";
+			},
+			(hook: Record<string, unknown>) => {
+				hook.target = "write";
+			},
+			(hook: Record<string, unknown>) => {
+				hook.relativePath = "hooks/other.ts";
+			},
+			(hook: Record<string, unknown>) => {
+				hook.implementationHash = "0".repeat(64);
+			},
+		]) {
+			await expectTamperedFunctionHookQuarantined({ capabilities: ["tool.inspect"] }, mutate);
+		}
+	});
 });

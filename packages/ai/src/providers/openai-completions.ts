@@ -624,15 +624,24 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 			const createCompletionsStream = async (toolStrictModeOverride?: ToolStrictModeOverride) => {
 				clearCapturedErrorResponse();
 				const effectiveToolStrictModeOverride = disableStrictTools ? "none" : toolStrictModeOverride;
-				const { params, toolStrictMode } = buildParams(
+				const { params: builtParams, toolStrictMode } = buildParams(
 					model,
 					context,
 					options,
 					baseUrl,
 					effectiveToolStrictModeOverride,
 				);
+				let params = builtParams;
 				appliedToolStrictMode = toolStrictMode;
-				options?.onPayload?.(params, undefined, options?.attemptScope, options?.signal);
+				const replacementPayload = await options?.onPayload?.(
+					params,
+					undefined,
+					options?.attemptScope,
+					options?.signal,
+				);
+				if (replacementPayload !== undefined) {
+					params = replacementPayload as typeof params;
+				}
 				rawRequestDump = {
 					provider: model.provider,
 					api: output.api,

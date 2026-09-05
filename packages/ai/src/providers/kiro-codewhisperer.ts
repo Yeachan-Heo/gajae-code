@@ -193,11 +193,19 @@ export const streamKiroCodeWhisperer: StreamFunction<"kiro-codewhisperer-stream"
 
 			// Build request
 			const conversationState = buildConversationState(context, model, options);
-			const requestBody: GenerateAssistantResponseRequest = {
+			let requestBody: GenerateAssistantResponseRequest = {
 				conversationState,
 			};
 
-			options?.onPayload?.(requestBody, model, options?.attemptScope, options?.signal);
+			const replacementPayload = await options?.onPayload?.(
+				requestBody,
+				model,
+				options?.attemptScope,
+				options?.signal,
+			);
+			if (replacementPayload !== undefined) {
+				requestBody = replacementPayload as typeof requestBody;
+			}
 
 			const host = `${STREAMING_SERVICE_NAME}.${region}.amazonaws.com`;
 			const url = `https://${host}/`;

@@ -4,6 +4,7 @@ import {
 	type FunctionHookEventType,
 	type FunctionHookRegistration,
 	type FunctionHookRegistrationOptions,
+	functionHookGrantHash,
 	normalizeFunctionHookGrant,
 } from "../src/extensibility/extensions/function-hooks";
 import { tagFunctionHookHandler } from "../src/extensibility/extensions/function-hooks-internal";
@@ -13,7 +14,12 @@ import {
 	ExtensionRunner,
 	testSetExtensionHandlerTimeoutMs,
 } from "../src/extensibility/extensions/runner";
-import type { Extension, ExtensionSessionMetadata, ToolCallEvent } from "../src/extensibility/extensions/types";
+import type {
+	Extension,
+	ExtensionSessionMetadata,
+	ToolCallEvent,
+	ToolResultEvent,
+} from "../src/extensibility/extensions/types";
 import { ExtensionToolWrapper } from "../src/extensibility/extensions/wrapper";
 import { Type } from "../src/extensibility/typebox";
 import { SessionManager } from "../src/session/session-manager";
@@ -103,9 +109,11 @@ describe("capability-scoped function hooks", () => {
 		let networkCapability: unknown = "unset";
 		let provenance: unknown;
 		let exposesHostTag = true;
+		let exposesHostRead = true;
 		const extension = await loadExtensionFromFactory(
 			api => {
 				exposesHostTag = "tagFunctionHookHandler" in api.pi;
+				exposesHostRead = "readConstrainedFunctionHookFile" in api.pi;
 				api.registerFunctionHook(
 					"tool_call",
 					async (invocation, capabilities, next) => {
@@ -132,11 +140,37 @@ describe("capability-scoped function hooks", () => {
 		expect(await runner.emitToolCall(toolCall())).toBeUndefined();
 		expect(networkCapability).toBeUndefined();
 		expect(exposesHostTag).toBe(false);
+		expect(exposesHostRead).toBe(false);
 		expect(provenance).toEqual({
 			source: "extension",
 			extensionId: "project-extension",
 			path: "project-extension",
 		});
+	});
+
+	test("binds downstream attenuation into the capability hash", () => {
+		const base = normalizeFunctionHookGrant({ capabilities: ["tool"] });
+		const attenuated = normalizeFunctionHookGrant({
+			capabilities: ["tool"],
+			attenuateDownstream: ["tool.deny"],
+		});
+		expect(functionHookGrantHash(base)).not.toBe(functionHookGrantHash(attenuated));
+	});
+
+	test("rejects targets on non-tool events", async () => {
+		await expect(
+			loadExtensionFromFactory(
+				api => {
+					api.registerFunctionHook("context", async () => undefined, {
+						target: "read",
+						capabilities: ["ui.transform"],
+					});
+				},
+				process.cwd(),
+				new EventBus(),
+				new ExtensionRuntime(),
+			),
+		).rejects.toThrow("only valid for tool_call and tool_result");
 	});
 
 	test("composes wildcard observation before exact transformation without exposing wildcard payload", async () => {
@@ -199,6 +233,9 @@ describe("capability-scoped function hooks", () => {
 
 		expect(await runner.emitToolCall(toolCall())).toBeUndefined();
 		expect(downstreamCanDeny).toBe(false);
+		const audit = runner.getFunctionHookAudit();
+		expect(audit).toHaveLength(2);
+		expect(audit.map(record => record.action)).toEqual(["continue", "continue"]);
 	});
 
 	test("blocks a tool when a granted hook denies it and leaves legacy handlers single-dispatched", async () => {
@@ -254,6 +291,56 @@ describe("capability-scoped function hooks", () => {
 		expect(audit.at(-1)?.provenance.extensionId).toBe("test-extension");
 		expect(audit.at(-1)?.requestedCapabilities).toEqual(["tool.inspect"]);
 		expect(audit.at(-1)?.effectiveCapabilities).toEqual(["tool.inspect"]);
+		const detached = audit.at(-1);
+		if (!detached) throw new Error("expected audit record");
+		(detached.provenance as { extensionId?: string }).extensionId = "mutated";
+		expect(runner.getFunctionHookAudit().at(-1)?.provenance.extensionId).toBe("test-extension");
+	});
+
+	test("rejects malformed terminal return values", async () => {
+		const runner = makeRunner([
+			registration(
+				"tool_call",
+				async () => ({ action: "return", value: { block: "yes" } }),
+				{ capabilities: ["tool.deny"] },
+				0,
+				"read",
+			),
+		]);
+		expect((await runner.emitToolCall(toolCall()))?.block).toBe(true);
+		expect(runner.getFunctionHookAudit().at(-1)?.reason).toBe("Function hook returned an invalid terminal value");
+	});
+
+	test("fails closed when the original payload cannot be snapshotted", async () => {
+		const runner = makeRunner([
+			registration(
+				"tool_call",
+				async (_invocation, _capabilities, next) => await next(),
+				{ capabilities: ["tool.inspect", "tool.deny"] },
+				0,
+				"read",
+			),
+		]);
+		const event = toolCall(new Proxy({ path: "secret.txt" }, {}));
+		expect((await runner.emitToolCall(event))?.block).toBe(true);
+	});
+
+	test("redacts exception messages from published Function Hook stacks", async () => {
+		const runner = makeRunner([
+			registration(
+				"tool_call",
+				async () => {
+					throw new Error("authorization: Bearer top-secret-token");
+				},
+				{ capabilities: ["tool.deny"] },
+				0,
+				"read",
+			),
+		]);
+		const errors: Array<{ stack?: string }> = [];
+		runner.onError(error => errors.push(error));
+		await runner.emitToolCall(toolCall());
+		expect(errors.at(-1)?.stack).not.toContain("top-secret-token");
 	});
 
 	test("aborts timed-out hooks and prevents their late transformation from committing", async () => {
@@ -509,6 +596,46 @@ describe("capability-scoped function hooks", () => {
 		);
 		await expect(wrapped.execute("call-1", { path: "safe.txt" })).rejects.toThrow();
 		expect(executed).toBe(false);
+	});
+
+	test("does not expose raw updates or original errors before tool-result mediation", async () => {
+		let updateCalls = 0;
+		const runner = makeRunner([
+			registration(
+				"tool_result",
+				async invocation => ({
+					action: "continue",
+					event: {
+						...(invocation.payload as ToolResultEvent),
+						content: [{ type: "text", text: "redacted failure" }],
+						isError: true,
+					},
+				}),
+				{ capabilities: ["tool.inspect", "tool.transform"] },
+				0,
+				"read",
+			),
+		]);
+		const wrapped = new ExtensionToolWrapper(
+			{
+				name: "read",
+				label: "Read",
+				description: "Read a file",
+				parameters: Type.Object({ path: Type.String() }),
+				execute: async (_id, _params, _signal, onUpdate) => {
+					onUpdate?.({ content: [{ type: "text", text: "raw secret update" }] });
+					throw new Error("raw secret error");
+				},
+			},
+			runner,
+		);
+
+		await expect(
+			wrapped.execute("call-1", { path: "safe.txt" }, undefined, () => {
+				updateCalls += 1;
+			}),
+		).rejects.toThrow("redacted failure");
+		expect(updateCalls).toBe(0);
 	});
 
 	test("snapshots a returned transformation before downstream dispatch", async () => {

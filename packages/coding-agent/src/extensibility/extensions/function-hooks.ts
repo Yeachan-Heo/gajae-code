@@ -1,6 +1,4 @@
 import { createHash } from "node:crypto";
-import * as fs from "node:fs/promises";
-import * as path from "node:path";
 import type { ImageContent, TextContent } from "@gajae-code/ai/core";
 import { redactCrashSecrets } from "@gajae-code/utils";
 import type { CustomMessage } from "../../session/messages";
@@ -334,6 +332,7 @@ export function functionHookGrantHash(grant: FunctionHookGrant): string {
 		capabilities: [...expandedOperations(grant.capabilities)].sort(),
 		networkDestinations: [...grant.networkDestinations].sort(),
 		filesystemRoots: [...grant.filesystemRoots].sort(),
+		attenuateDownstream: [...(grant.attenuateDownstream ?? [])].sort(),
 	});
 	return createHash("sha256").update(canonical).digest("hex");
 }
@@ -505,6 +504,19 @@ function isFunctionHookMessage(value: unknown): boolean {
 	return isSafeFunctionHookValue(message);
 }
 
+function isFunctionHookCustomMessage(value: unknown): boolean {
+	if (!isPlainFunctionHookData(value) || value === null || typeof value !== "object") return false;
+	const message = value as Record<string, unknown>;
+	return (
+		typeof message.customType === "string" &&
+		(typeof message.content === "string" ||
+			(Array.isArray(message.content) && message.content.every(isFunctionHookContent))) &&
+		typeof message.display === "boolean" &&
+		(message.details === undefined || isSafeFunctionHookValue(message.details)) &&
+		(message.attribution === undefined || message.attribution === "user" || message.attribution === "agent")
+	);
+}
+
 export function isValidFunctionHookEventValue(event: ExtensionEvent): boolean {
 	try {
 		if (!isPlainFunctionHookData(event) || typeof event.type !== "string") return false;
@@ -572,11 +584,7 @@ export function functionHookEventIdentityMatches(original: ExtensionEvent, candi
 }
 
 export function cloneFunctionHookData<T>(value: T): T {
-	try {
-		return structuredClone(value);
-	} catch {
-		return value;
-	}
+	return cloneFunctionHookDataStrict(value);
 }
 
 /** Security-boundary clone for transformed events; never aliases caller-owned data. */
@@ -765,8 +773,8 @@ function deepFreezeFunctionHookData<T>(value: T, seen = new WeakSet<object>()): 
 			if (descriptor && "value" in descriptor) deepFreezeFunctionHookData(descriptor.value, seen);
 		}
 		return Object.freeze(value);
-	} catch {
-		return value;
+	} catch (error) {
+		throw new Error("Function hook snapshot could not be frozen", { cause: error });
 	} finally {
 		seen.delete(value);
 	}
@@ -802,25 +810,74 @@ export function sanitizeFunctionHookReason(reason: unknown, fallback: string): s
 	return typeof reason === "string" && reason.trim() ? boundedText(reason, 512) : fallback;
 }
 
-/** Root-confined, realpath-checked read used only by the filesystem capability. */
-export async function readConstrainedFunctionHookFile(
-	filePath: string,
-	cwd: string,
-	roots: readonly string[],
-): Promise<string> {
-	if (roots.length === 0) throw new Error("Function hook filesystem.read has no declared root");
-	const candidateReal = await fs.realpath(path.resolve(cwd, filePath));
-	for (const root of roots) {
-		const rootReal = await fs.realpath(path.resolve(cwd, root));
-		const relative = path.relative(rootReal, candidateReal);
-		if (relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative))) {
-			const handle = await fs.open(candidateReal, "r");
-			try {
-				return (await handle.readFile("utf8")).slice(0, 1_000_000);
-			} finally {
-				await handle.close();
-			}
+function hasOnlyKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
+	const allowed = new Set(keys);
+	return Object.keys(value).every(key => allowed.has(key));
+}
+
+/** Validate terminal short-circuit values before they enter event-specific host control flow. */
+export function isValidFunctionHookReturnValue(event: ExtensionEvent, value: unknown): boolean {
+	if (!isPlainFunctionHookData(value)) return false;
+	if (event.type === "context") return Array.isArray(value) && value.every(isFunctionHookMessage);
+	if (event.type === "before_provider_request") return value !== undefined;
+	if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+	const result = value as Record<string, unknown>;
+	switch (event.type) {
+		case "tool_call":
+			return (
+				hasOnlyKeys(result, ["block", "reason"]) &&
+				(result.block === undefined || typeof result.block === "boolean") &&
+				(result.reason === undefined || typeof result.reason === "string")
+			);
+		case "tool_result":
+			return (
+				hasOnlyKeys(result, ["content", "details", "isError"]) &&
+				(result.content === undefined ||
+					(Array.isArray(result.content) && result.content.every(isFunctionHookContent))) &&
+				(result.details === undefined || isSafeFunctionHookValue(result.details)) &&
+				(result.isError === undefined || typeof result.isError === "boolean")
+			);
+		case "input":
+			return (
+				hasOnlyKeys(result, ["handled", "text", "images"]) &&
+				(result.handled === undefined || typeof result.handled === "boolean") &&
+				(result.text === undefined || typeof result.text === "string") &&
+				(result.images === undefined || (Array.isArray(result.images) && result.images.every(isFunctionHookImage)))
+			);
+		case "before_agent_start":
+			return (
+				hasOnlyKeys(result, ["messages", "systemPrompt", "prompt", "images"]) &&
+				(result.messages === undefined ||
+					(Array.isArray(result.messages) && result.messages.every(isFunctionHookCustomMessage))) &&
+				(result.systemPrompt === undefined ||
+					(Array.isArray(result.systemPrompt) && result.systemPrompt.every(item => typeof item === "string"))) &&
+				(result.prompt === undefined || typeof result.prompt === "string") &&
+				(result.images === undefined || (Array.isArray(result.images) && result.images.every(isFunctionHookImage)))
+			);
+		case "session_before_switch":
+			return hasOnlyKeys(result, ["cancel"]) && (result.cancel === undefined || typeof result.cancel === "boolean");
+		case "session_before_branch":
+			return (
+				hasOnlyKeys(result, ["cancel", "skipConversationRestore"]) &&
+				(result.cancel === undefined || typeof result.cancel === "boolean") &&
+				(result.skipConversationRestore === undefined || typeof result.skipConversationRestore === "boolean")
+			);
+		case "session_before_compact":
+			return hasOnlyKeys(result, ["cancel"]) && (result.cancel === undefined || typeof result.cancel === "boolean");
+		case "session_before_tree": {
+			if (!hasOnlyKeys(result, ["cancel", "summary"])) return false;
+			if (result.cancel !== undefined && typeof result.cancel !== "boolean") return false;
+			if (result.summary === undefined) return true;
+			if (result.summary === null || typeof result.summary !== "object" || Array.isArray(result.summary))
+				return false;
+			const summary = result.summary as Record<string, unknown>;
+			return (
+				hasOnlyKeys(summary, ["summary", "details"]) &&
+				typeof summary.summary === "string" &&
+				(summary.details === undefined || isSafeFunctionHookValue(summary.details))
+			);
 		}
+		default:
+			return false;
 	}
-	throw new Error("Function hook filesystem path is outside its declared grant");
 }

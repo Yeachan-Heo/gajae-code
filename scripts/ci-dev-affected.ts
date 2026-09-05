@@ -137,6 +137,7 @@ const BEHAVIORAL_OWNER_TESTS: Readonly<Record<string, readonly string[]>> = {
 	// shard: changing any layer can alter registration, dispatch, or payload
 	// authority, and basename matching misses the prefixed plugin contracts.
 	"packages/coding-agent/src/extensibility/extensions/function-hooks.ts": EXTENSIBILITY_BEHAVIORAL_OWNER_TESTS,
+	"packages/coding-agent/src/extensibility/extensions/function-hooks-internal.ts": EXTENSIBILITY_BEHAVIORAL_OWNER_TESTS,
 	"packages/coding-agent/src/extensibility/extensions/index.ts": EXTENSIBILITY_BEHAVIORAL_OWNER_TESTS,
 	"packages/coding-agent/src/extensibility/extensions/loader.ts": EXTENSIBILITY_BEHAVIORAL_OWNER_TESTS,
 	"packages/coding-agent/src/extensibility/extensions/runner.ts": EXTENSIBILITY_BEHAVIORAL_OWNER_TESTS,

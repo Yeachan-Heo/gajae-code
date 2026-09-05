@@ -175,7 +175,12 @@ async function createHookAPI(
 			handler: FunctionHook<FunctionHookPayloadFor<T>>,
 			options: FunctionHookRegistrationOptions = {},
 		): void {
-			if (options.target !== undefined && options.target !== "*") validateFunctionHookTarget(options.target);
+			if (options.target !== undefined) {
+				if (event === "*") throw new Error("Wildcard function hooks cannot declare a target");
+				if (event !== "tool_call" && event !== "tool_result")
+					throw new Error("Function hook targets are only valid for tool_call and tool_result events");
+				if (options.target !== "*") validateFunctionHookTarget(options.target);
+			}
 			const registration: FunctionHookRegistration = {
 				event,
 				...(options.target === undefined ? {} : { target: options.target }),

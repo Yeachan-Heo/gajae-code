@@ -1,3 +1,5 @@
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
 import { type FunctionHookRegistration, validateFunctionHookTarget } from "./function-hooks";
 
 export type TaggedFunctionHookHandler = (...args: unknown[]) => Promise<unknown>;
@@ -23,4 +25,27 @@ export function tagFunctionHookHandler(registration: FunctionHookRegistration): 
 
 export function getFunctionHookRegistration(value: unknown): FunctionHookRegistration | undefined {
 	return typeof value === "function" ? registrations.get(value as TaggedFunctionHookHandler) : undefined;
+}
+
+/** Host-only root-confined read used by the mediated filesystem capability. */
+export async function readConstrainedFunctionHookFile(
+	filePath: string,
+	cwd: string,
+	roots: readonly string[],
+): Promise<string> {
+	if (roots.length === 0) throw new Error("Function hook filesystem.read has no declared root");
+	const candidateReal = await fs.realpath(path.resolve(cwd, filePath));
+	for (const root of roots) {
+		const rootReal = await fs.realpath(path.resolve(cwd, root));
+		const relative = path.relative(rootReal, candidateReal);
+		if (relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative))) {
+			const handle = await fs.open(candidateReal, "r");
+			try {
+				return (await handle.readFile("utf8")).slice(0, 1_000_000);
+			} finally {
+				await handle.close();
+			}
+		}
+	}
+	throw new Error("Function hook filesystem path is outside its declared grant");
 }
