@@ -1714,7 +1714,7 @@ export class ExtensionRunner {
 				requestId: response.requestId,
 				metadata: response.metadata,
 			},
-			{ signal },
+			{ signal, scope },
 		);
 		if (functionDispatch.action !== "continue") return;
 		const functionEvent = functionDispatch.event;

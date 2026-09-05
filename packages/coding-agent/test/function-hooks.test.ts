@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { createAttemptScopeAuthority } from "@gajae-code/agent-core/attempt-scope";
 import {
 	type FunctionHook,
 	type FunctionHookEventType,
@@ -22,6 +23,7 @@ import type {
 } from "../src/extensibility/extensions/types";
 import { ExtensionToolWrapper } from "../src/extensibility/extensions/wrapper";
 import { Type } from "../src/extensibility/typebox";
+import { AttemptRecordStore } from "../src/session/attempt-record-store";
 import { SessionManager } from "../src/session/session-manager";
 import { EventBus } from "../src/utils/event-bus";
 
@@ -1012,5 +1014,21 @@ describe("capability-scoped function hooks", () => {
 		await expect(pending).rejects.toThrow("Function hook timed out");
 		expect(invocationAborted).toBe(true);
 		expect(() => notify?.()).toThrow("no longer active");
+	});
+
+	test("marks attempts executed for after-provider-response Function Hooks", async () => {
+		const runner = makeRunner([
+			registration("after_provider_response", async () => undefined, { capabilities: ["ui"] }, 0),
+		]);
+		const authority = createAttemptScopeAuthority();
+		const store = new AttemptRecordStore(authority);
+		const scope = authority.mintMain();
+		store.register(scope);
+		store.establishClean(scope);
+		runner.setAttemptRecordStore(store);
+
+		await runner.emitAfterProviderResponse({ status: 200, headers: {} }, undefined, scope);
+
+		expect(store.isClean(scope)).toBe(false);
 	});
 });
