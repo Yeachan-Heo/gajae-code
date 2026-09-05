@@ -953,6 +953,43 @@ describe("gjc state handoff", () => {
 		});
 	});
 
+	it("records recovered approved D-to-R provenance for a later R-to-U handoff", async () => {
+		await withTempCwd(async cwd => {
+			await writePublishedReadyCrystal(cwd);
+			expect((await runNativeDeepInterviewCommand(["approve-execution", "--json"], cwd)).status).toBe(0);
+			const handoffAt = "2026-09-04T00:00:00.000Z";
+			const mutationId = `deep-interview:handoff:ralplan:${handoffAt}`;
+			const priorFailpoint = process.env.GJC_STATE_HANDOFF_FAIL_AFTER_CALLER;
+			const originalToISOString = Date.prototype.toISOString;
+			Date.prototype.toISOString = () => handoffAt;
+			process.env.GJC_STATE_HANDOFF_FAIL_AFTER_CALLER = mutationId;
+			try {
+				expect(
+					(await runNativeStateCommand(["handoff", "--mode", "deep-interview", "--to", "ralplan", "--json"], cwd))
+						.status,
+				).toBe(1);
+			} finally {
+				Date.prototype.toISOString = originalToISOString;
+				restoreEnvironmentValue("GJC_STATE_HANDOFF_FAIL_AFTER_CALLER", priorFailpoint);
+			}
+			expect(
+				(await runNativeStateCommand(["handoff", "--mode", "deep-interview", "--to", "ralplan", "--json"], cwd))
+					.status,
+			).toBe(0);
+			expect(
+				(
+					await runNativeStateCommand(
+						["write", "--mode", "ralplan", "--input", JSON.stringify({ current_phase: "handoff" }), "--json"],
+						cwd,
+					)
+				).status,
+			).toBe(0);
+			expect(
+				(await runNativeStateCommand(["handoff", "--mode", "ralplan", "--to", "ultragoal", "--json"], cwd)).status,
+			).toBe(0);
+		});
+	});
+
 	it("rejects missing --to", async () => {
 		await withTempCwd(async cwd => {
 			await writeJson(modeStatePath(cwd, TEST_SESSION_ID, "deep-interview"), {
@@ -1404,6 +1441,43 @@ describe("gjc state handoff", () => {
 			expect(result.status).toBe(2);
 			expect(result.stderr).toContain("unsupported future version");
 			await expect(fs.access(modeStatePath(cwd, TEST_SESSION_ID, "ultragoal"))).rejects.toThrow();
+		});
+	});
+
+	it("rejects clearing a future workflow envelope without downgrading it", async () => {
+		await withTempCwd(async cwd => {
+			const statePath = modeStatePath(cwd, TEST_SESSION_ID, "ralplan");
+			await writeJson(statePath, {
+				skill: "ralplan",
+				version: WORKFLOW_STATE_VERSION + 1,
+				active: true,
+				current_phase: "planner",
+				future_field: "preserve",
+			});
+			const before = await fs.readFile(statePath, "utf8");
+			const result = await runNativeStateCommand(["clear", "--mode", "ralplan", "--force", "--json"], cwd);
+			expect(result.status).toBe(2);
+			expect(result.stderr).toContain("unsupported future version");
+			expect(await fs.readFile(statePath, "utf8")).toBe(before);
+		});
+	});
+
+	it("repairs a missing specialized approval audit on exact retry", async () => {
+		await withTempCwd(async cwd => {
+			const { callerPath } = await writePublishedReadyCrystal(cwd);
+			const approvalAuditPath = auditPath(cwd, TEST_SESSION_ID);
+			await fs.mkdir(approvalAuditPath, { recursive: true });
+			const first = await runNativeDeepInterviewCommand(["approve-execution", "--json"], cwd);
+			expect(first.status).not.toBe(0);
+			expect(((await readJson(callerPath))?.state as Record<string, unknown>)?.execution_approval).toBe("approved");
+			await fs.rm(approvalAuditPath, { recursive: true, force: true });
+			const retried = await runNativeDeepInterviewCommand(["approve-execution", "--json"], cwd);
+			expect(retried.status).toBe(0);
+			expect(await fs.readFile(approvalAuditPath, "utf8")).toContain('"verb":"approve-execution"');
+			expect(
+				(await runNativeStateCommand(["handoff", "--mode", "deep-interview", "--to", "ultragoal", "--json"], cwd))
+					.status,
+			).toBe(0);
 		});
 	});
 
