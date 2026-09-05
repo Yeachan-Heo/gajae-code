@@ -1,6 +1,7 @@
 import { expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
+import * as os from "node:os";
 import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "../src/extensibility/extensions";
 import { Broker } from "../src/sdk/broker/broker";
@@ -67,7 +68,7 @@ test("broker preserves host registration endpoint metadata across heartbeats", a
 });
 
 test("broker rejects stale get_endpoint authority after a preserved-mtime endpoint replacement", async () => {
-	const agentDir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-endpoint-incarnation-"));
+	const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-broker-endpoint-incarnation-"));
 	const stateRoot = path.join(agentDir, "state");
 	const endpointPath = path.join(stateRoot, "sdk", "replacement.json");
 	const displacedPath = `${endpointPath}.displaced`;
@@ -118,7 +119,7 @@ test("broker rejects stale get_endpoint authority after a preserved-mtime endpoi
 });
 
 test("broker rejects stale close authority after a preserved-mtime endpoint replacement", async () => {
-	const agentDir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-close-incarnation-"));
+	const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-broker-close-incarnation-"));
 	const stateRoot = path.join(agentDir, "state");
 	const endpointPath = path.join(stateRoot, "sdk", "replacement-close.json");
 	const displacedPath = `${endpointPath}.displaced`;
