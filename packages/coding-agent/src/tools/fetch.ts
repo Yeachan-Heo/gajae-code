@@ -1167,12 +1167,35 @@ interface ReadUrlCacheEntry {
 	wrappedPreambleChars?: number;
 }
 
+// Entries hold whole-page outputs and image payloads, so this map must stay
+// bounded in long-lived hosts (TUI, SDK broker). Each fetch caches one entry
+// under up to two keys (requested + final URL). FIFO eviction is sufficient:
+// a miss simply refetches, so correctness never depends on a hit.
+export const READ_URL_CACHE_MAX_KEYS = 64;
+
 const readUrlCache = new Map<string, ReadUrlCacheEntry>();
 
 function getReadUrlCacheKey(session: ToolSession, requestedUrl: string, raw: boolean): string {
-	const scope = session.getSessionFile() ?? session.cwd;
+	const sessionFile = session.getSessionFile();
+	const sessionId = session.getSessionId?.();
+	const scope = sessionFile ? `file:${sessionFile}` : sessionId ? `session:${sessionId}` : `cwd:${session.cwd}`;
 	return `${scope}::${raw ? "raw" : "rendered"}::${normalizeUrl(requestedUrl)}`;
 }
+
+/** Test-only seam for deterministic module-global cache assertions. */
+export const readUrlCacheTestHooks = {
+	get size(): number {
+		return readUrlCache.size;
+	},
+	get retainedOutputChars(): number {
+		let total = 0;
+		for (const entry of new Set(readUrlCache.values())) total += entry.output.length;
+		return total;
+	},
+	reset(): void {
+		readUrlCache.clear();
+	},
+};
 
 async function readArtifactOutput(session: ToolSession, artifactId: string): Promise<string | null> {
 	const artifactsDir = session.getArtifactsDir?.();
@@ -1224,6 +1247,11 @@ async function ensureReadUrlCacheArtifact(session: ToolSession, entry: ReadUrlCa
 function cacheReadUrlEntry(session: ToolSession, requestedUrl: string, raw: boolean, entry: ReadUrlCacheEntry): void {
 	readUrlCache.set(getReadUrlCacheKey(session, requestedUrl, raw), entry);
 	readUrlCache.set(getReadUrlCacheKey(session, entry.details.finalUrl, raw), entry);
+	while (readUrlCache.size > READ_URL_CACHE_MAX_KEYS) {
+		const oldest = readUrlCache.keys().next().value;
+		if (oldest === undefined) break;
+		readUrlCache.delete(oldest);
+	}
 }
 
 async function buildReadUrlCacheEntry(

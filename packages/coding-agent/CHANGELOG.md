@@ -7,6 +7,7 @@
 
 ### Fixed
 
+- The read-URL cache is now bounded (FIFO, 64 keys), so long-lived TUI and SDK-host processes no longer retain every fetched page's full output and image payload for the process lifetime; an evicted entry simply refetches on the next read, and unpersisted sessions sharing a working directory remain isolated by session identity.
 - Contribution-prep outbound artifacts now redact complete AWS credentials, including AKIA/ASIA access-key IDs and SecretAccessKey/SessionToken values in shell-style and escaped JSON forms, while preserving structured output and existing GitHub, Slack, authorization-header, and cookie redaction.
 - Model preset registry URL and disable overrides now resolve only from explicitly inherited or user-owned environment sources, so a checkout `.env` cannot suppress updates or redirect signed-registry polling while dependency injection, HTTPS validation, signatures, ETags, cache, and offline behavior remain unchanged (#5300).
 - OpenCode Go's provider conversation identity now remains distinct from generic cache affinity across normal turns and maintenance calls, so the required session header reuses the session manager's opaque lifecycle without accepting auth-gateway prompt-derived cache keys (#5295).
