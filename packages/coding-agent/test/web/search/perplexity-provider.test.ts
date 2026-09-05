@@ -168,6 +168,23 @@ describe("Perplexity web search provider", () => {
 		}
 	});
 
+	it("does not expose unclassified non-2xx response bodies", async () => {
+		process.env.PERPLEXITY_API_KEY = "test-key";
+		delete process.env.PERPLEXITY_COOKIES;
+		const secret = "provider-secret-payload";
+		using _hook = hookFetch(async () => new Response(secret, { status: 500 }));
+
+		try {
+			await searchPerplexity(params());
+			throw new Error("Expected provider failure");
+		} catch (error) {
+			expect(error).toBeInstanceOf(SearchProviderError);
+			expect(error).toMatchObject({ provider: "perplexity", status: 500 });
+			expect((error as Error).message).toBe("Perplexity API error (500)");
+			expect((error as Error).message).not.toContain(secret);
+		}
+	});
+
 	it("preserves a valid answer when citation and result structures are empty", async () => {
 		process.env.PERPLEXITY_API_KEY = "test-key";
 		delete process.env.PERPLEXITY_COOKIES;

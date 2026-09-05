@@ -120,6 +120,43 @@ describe("executeSearch fallback", () => {
 		expect(result.details.warning).toContain("Perplexity web search returned no answer");
 	});
 
+	it("preserves a caller abort while Perplexity consumes the response body", async () => {
+		process.env.PERPLEXITY_API_KEY = "test-key";
+		const controller = new AbortController();
+		const fallback = vi.fn(async () => ({
+			provider: "exa" as const,
+			sources: [{ title: "Exa", url: "https://exa.example" }],
+		}));
+		using _hook = hookFetch(async () => {
+			controller.abort();
+			return new Response(
+				new ReadableStream({
+					start(streamController) {
+						streamController.error(new DOMException("aborted", "AbortError"));
+					},
+				}),
+				{ status: 200, headers: { "Content-Type": "application/json" } },
+			);
+		});
+		vi.spyOn(provider, "resolveProviderChain").mockResolvedValue([
+			new PerplexityProvider(),
+			fakeProvider("exa", fallback),
+		]);
+
+		await expect(
+			runSearchQuery(
+				{ query: "anything" },
+				{
+					authStorage: {
+						getOAuthAccess: async () => undefined,
+					} as unknown as AuthStorage,
+					signal: controller.signal,
+				},
+			),
+		).rejects.toBeInstanceOf(ToolAbortError);
+		expect(fallback).not.toHaveBeenCalled();
+	});
+
 	it("rethrows caller abort instead of falling through", async () => {
 		const second = vi.fn();
 		vi.spyOn(provider, "resolveProviderChain").mockResolvedValue([

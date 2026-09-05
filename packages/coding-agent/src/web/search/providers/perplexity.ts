@@ -249,16 +249,13 @@ async function callPerplexityApi(apiKey: string, request: PerplexityRequest, sig
 		const errorText = await response.text();
 		const classified = classifyProviderHttpError("perplexity", response.status, errorText);
 		if (classified) throw classified;
-		throw new SearchProviderError(
-			"perplexity",
-			`Perplexity API error (${response.status}): ${errorText}`,
-			response.status,
-		);
+		throw new SearchProviderError("perplexity", `Perplexity API error (${response.status})`, response.status);
 	}
 
 	try {
 		return await response.json();
-	} catch {
+	} catch (error) {
+		if (error instanceof Error && error.name === "AbortError") throw error;
 		throw new SearchProviderError("perplexity", "Perplexity API returned invalid JSON", 502);
 	}
 }
@@ -372,11 +369,7 @@ async function callPerplexityOAuth(
 		const errorText = await response.text();
 		const classified = classifyProviderHttpError("perplexity", response.status, errorText);
 		if (classified) throw classified;
-		throw new SearchProviderError(
-			"perplexity",
-			`Perplexity OAuth API error (${response.status}): ${errorText}`,
-			response.status,
-		);
+		throw new SearchProviderError("perplexity", `Perplexity OAuth API error (${response.status})`, response.status);
 	}
 
 	if (!response.body) {
