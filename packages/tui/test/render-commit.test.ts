@@ -415,14 +415,8 @@ describe("generation-scoped render commits", () => {
 			erase: { type: "raster-erase", bytes: new TextEncoder().encode("DISPOSE_ERASE") },
 		});
 		if (lease.status !== "acquired") throw new Error("lease not acquired");
-		let releaseIngress: () => void = () => {};
-		const ingressGate = new Promise<void>(resolve => {
-			releaseIngress = resolve;
-		});
-		let signalIngressStarted: () => void = () => {};
-		const ingressStarted = new Promise<void>(resolve => {
-			signalIngressStarted = resolve;
-		});
+		const ingressGate = Promise.withResolvers<void>();
+		const ingressStarted = Promise.withResolvers<void>();
 		let disposed = false;
 		const held = tui.submitTerminalOutput({
 			token: lease.token,
@@ -430,8 +424,8 @@ describe("generation-scoped render commits", () => {
 				type: "raster-multipart-batch",
 				prefix: new TextEncoder().encode("DISPOSE_PREFIX"),
 				afterPrefix: async () => {
-					signalIngressStarted();
-					await ingressGate;
+					ingressStarted.resolve();
+					await ingressGate.promise;
 					return true;
 				},
 				records: [new TextEncoder().encode("DISPOSE_RASTER")],
@@ -439,17 +433,19 @@ describe("generation-scoped render commits", () => {
 			},
 		});
 		try {
-			await ingressStarted;
+			await ingressStarted.promise;
 			terminal.clearWriteLog();
 			text.setText("DISPOSE_STALE_RENDER");
 			const generation = tui.requestRenderWithGeneration(true, "test.dispose-held-raster");
 			const committed = tui.waitForRenderCommit(generation);
 			// Let the forced frame capture its write closure behind the held ingress.
-			await new Promise<void>(resolve => process.nextTick(resolve));
+			const renderQueued = Promise.withResolvers<void>();
+			process.nextTick(renderQueued.resolve);
+			await renderQueued.promise;
 			tui.dispose();
 			disposed = true;
 			expect(await committed).toBe(false);
-			releaseIngress();
+			ingressGate.resolve();
 			expect((await held).status).toBe("failed");
 			await terminal.waitForRender();
 			const output = terminal.getWriteLog().join("");
@@ -457,7 +453,7 @@ describe("generation-scoped render commits", () => {
 			expect(output).not.toContain("DISPOSE_STALE_ABORT");
 			expect(output).not.toContain("DISPOSE_RASTER");
 		} finally {
-			releaseIngress();
+			ingressGate.resolve();
 			await held;
 			if (!disposed) tui.stop();
 		}
@@ -482,22 +478,16 @@ describe("generation-scoped render commits", () => {
 			erase: { type: "raster-erase", bytes: new TextEncoder().encode("LOSS_ERASE") },
 		});
 		if (lease.status !== "acquired") throw new Error("lease not acquired");
-		let releaseIngress: () => void = () => {};
-		const ingressGate = new Promise<void>(resolve => {
-			releaseIngress = resolve;
-		});
-		let signalIngressStarted: () => void = () => {};
-		const ingressStarted = new Promise<void>(resolve => {
-			signalIngressStarted = resolve;
-		});
+		const ingressGate = Promise.withResolvers<void>();
+		const ingressStarted = Promise.withResolvers<void>();
 		const held = tui.submitTerminalOutput({
 			token: lease.token,
 			operation: {
 				type: "raster-multipart-batch",
 				prefix: new TextEncoder().encode("LOSS_PREFIX"),
 				afterPrefix: async () => {
-					signalIngressStarted();
-					await ingressGate;
+					ingressStarted.resolve();
+					await ingressGate.promise;
 					return true;
 				},
 				records: [new TextEncoder().encode("LOSS_RASTER")],
@@ -505,13 +495,15 @@ describe("generation-scoped render commits", () => {
 			},
 		});
 		try {
-			await ingressStarted;
+			await ingressStarted.promise;
 			terminal.clearWriteLog();
 			text.setText("LOSS_STALE_RENDER");
 			const generation = tui.requestRenderWithGeneration(true, "test.loss-held-raster");
 			const committed = tui.waitForRenderCommit(generation);
 			// Let the forced frame capture its write closure behind the held ingress.
-			await new Promise<void>(resolve => process.nextTick(resolve));
+			const renderQueued = Promise.withResolvers<void>();
+			process.nextTick(renderQueued.resolve);
+			await renderQueued.promise;
 			terminal.live = false;
 			const invalidatedGeneration = tui.requestRenderWithGeneration(true, "test.loss-held-raster.invalidate");
 			expect(await committed).toBe(false);
@@ -520,7 +512,7 @@ describe("generation-scoped render commits", () => {
 			terminal.live = true;
 			tui.start();
 			terminal.clearWriteLog();
-			releaseIngress();
+			ingressGate.resolve();
 			expect((await held).status).toBe("failed");
 			await terminal.waitForRender();
 			const output = terminal.getWriteLog().join("");
@@ -529,7 +521,7 @@ describe("generation-scoped render commits", () => {
 			expect(output).not.toContain("LOSS_RASTER");
 			expect(output).toContain("LOSS_FRESH_RENDER");
 		} finally {
-			releaseIngress();
+			ingressGate.resolve();
 			await held;
 			tui.stop();
 		}
