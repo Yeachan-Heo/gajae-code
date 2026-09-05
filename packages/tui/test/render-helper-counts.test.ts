@@ -191,8 +191,11 @@ describe("TUI render helper counters", () => {
 			await settle(term);
 
 			const measurements = TUI.getRenderCountersForTest().widthReflowVisibleWidthCalls;
-			if (isProcessTerminal) expect(measurements).toBe(0);
-			else expect(measurements).toBeGreaterThan(0);
+			// These rows fit at both widths, so the full-render path has no
+			// reflow decision to measure. The observable contract is the preserved
+			// ANSI output and bounded row width below; a positive counter here
+			// would incorrectly require work for a no-reflow resize.
+			expect(measurements).toBe(0);
 			expect(visible(term).filter(Boolean)).toContain(visibleText);
 			expect(term.getViewportAnsi()).toContain("\x1b[36m");
 			for (const line of visible(term)) expect(visibleWidth(line)).toBeLessThanOrEqual(columns);
