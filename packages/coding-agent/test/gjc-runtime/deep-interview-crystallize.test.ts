@@ -139,6 +139,31 @@ describe("deep-interview crystallize contract", () => {
 		}
 	});
 
+	it("rejects an anchor substring that strips full-turn negation", () => {
+		const snapshot: CrystalSnapshot = {
+			revision: 1,
+			start: 0,
+			end: 0,
+			messages: [{ index: 0, role: "user", content: "Do not build a fast report." }],
+			digest: "",
+		};
+		snapshot.digest = crystalSnapshotDigest(snapshot);
+		expect(() =>
+			crystallizeDeepInterview(
+				input({
+					snapshot,
+					items: [
+						{
+							...input().items[0]!,
+							statement: "Build a fast report",
+							anchor: { message_index: 0, quote: "build a fast report" },
+						},
+					],
+				}),
+			),
+		).toThrow("conservative derivation failed");
+	});
+
 	it("preserves semantic qualifiers and single-codepoint CJK negation", () => {
 		for (const quote of [
 			"Do not build a fast report.",
@@ -395,6 +420,7 @@ describe("deep-interview crystallize contract", () => {
 		for (const answer of [
 			"The budget is 1GB.",
 			"The maximum memory budget is different from 1GB.",
+			"The maximum memory budget is less than 1GB.",
 			"The maximum memory budget is 1GB or 2GB.",
 			"The maximum memory budget is probably 1GB.",
 			"The maximum memory budget is 1GB, but perhaps 2GB.",
@@ -411,6 +437,46 @@ describe("deep-interview crystallize contract", () => {
 				}),
 			).toThrow(/has no (?:fresh|relevant) verbatim user anchor/);
 		}
+	});
+
+	it("rejects resolution and removal substrings that strip conditional context", () => {
+		const gap = "Which database choice should be used?";
+		const first = crystallizeDeepInterview(input({ open_gaps: [gap] }));
+		const conditionalAnswer = "If approved, the database choice is PostgreSQL.";
+		const next = withFreshUserEvidence(input({ prior: first }), conditionalAnswer);
+		expect(() =>
+			crystallizeDeepInterview({
+				...next,
+				prior: first,
+				resolved_open_gaps: [gap],
+				resolved_open_gap_anchors: [
+					{
+						item: gap,
+						message_index: 1,
+						quote: "the database choice is PostgreSQL.",
+						resolution: "the database choice is PostgreSQL.",
+					},
+				],
+			}),
+		).toThrow("has no fresh verbatim user anchor");
+
+		const removalBase = crystallizeDeepInterview(input());
+		const conditionalRemoval = "If the manager agrees, remove the fast constraint.";
+		const removalInput = withFreshUserEvidence(
+			input({ prior: removalBase, items: [removalBase.items[0]!], removed_ids: ["constraint:latency"] }),
+			conditionalRemoval,
+		);
+		removalInput.removed_item_anchors = [
+			{
+				item: "constraint:latency",
+				message_index: 1,
+				quote: "remove the fast constraint.",
+				resolution: "remove the fast constraint.",
+			},
+		];
+		expect(() => crystallizeDeepInterview(removalInput)).toThrow(
+			"has no fresh statement-bound user removal evidence",
+		);
 	});
 
 	it("rejects a negated numeric non-answer as a gap resolution", () => {
@@ -641,8 +707,8 @@ describe("deep-interview crystallize contract", () => {
 							id: "acceptance_criterion:fast",
 							kind: "acceptance_criterion",
 							classification: "confirmed",
-							statement: "Respond quickly",
-							anchor: { message_index: 1, quote: "respond quickly" },
+							statement: "The report must respond quickly",
+							anchor: { message_index: 1, quote: "The report must respond quickly." },
 						},
 					],
 				}),
@@ -663,8 +729,8 @@ describe("deep-interview crystallize contract", () => {
 					items: [
 						{
 							...first.items[0]!,
-							statement: "Build a dashboard",
-							anchor: { message_index: 1, quote: "Build a dashboard" },
+							statement: "Build a dashboard instead",
+							anchor: { message_index: 1, quote: "Build a dashboard instead." },
 						},
 						first.items[1]!,
 					],
@@ -686,8 +752,8 @@ describe("deep-interview crystallize contract", () => {
 						first.items[0]!,
 						{
 							...first.items[1]!,
-							statement: "Respond within 50 ms",
-							anchor: { message_index: 1, quote: "respond within 50 ms" },
+							statement: "The report must respond within 50 ms",
+							anchor: { message_index: 1, quote: "The report must respond within 50 ms." },
 						},
 					],
 				}),
