@@ -216,6 +216,8 @@ describe("TUI render helper counters", () => {
 			await settle(term);
 
 			const measurements = TUI.getRenderCountersForTest().widthReflowVisibleWidthCalls;
+			// Plain hosts scan raw rows to decide whether reflow is needed, even
+			// when they fit. Viewport hosts return before consuming that decision.
 			if (repaint === "viewport") expect(measurements).toBe(0);
 			else expect(measurements).toBeGreaterThan(0);
 			expect(visible(term).filter(Boolean)).toContain(visibleText);
