@@ -319,6 +319,25 @@ function containsNonTextMarker(value: string): boolean {
 	);
 }
 
+function anchoredClause(content: string, quote: string): string {
+	const quoteIndex = content.indexOf(quote);
+	if (quoteIndex < 0) return content;
+	const before = content.slice(0, quoteIndex);
+	const boundary = Math.max(
+		before.lastIndexOf("."),
+		before.lastIndexOf("!"),
+		before.lastIndexOf("?"),
+		before.lastIndexOf("\n"),
+	);
+	const afterStart = quoteIndex + quote.length;
+	const after = content.slice(afterStart);
+	const endOffsets = [after.indexOf("."), after.indexOf("!"), after.indexOf("?"), after.indexOf("\n")].filter(
+		offset => offset >= 0,
+	);
+	const end = endOffsets.length > 0 ? afterStart + Math.min(...endOffsets) + 1 : content.length;
+	return content.slice(boundary + 1, end).trim();
+}
+
 function semanticProfile(value: string): CrystalSemanticProfile {
 	const normalized = value.normalize("NFC").toLowerCase();
 	const obligationTerms = new Set<string>();
@@ -416,7 +435,6 @@ function isUnsafeConfirmedStatement(profile: CrystalSemanticProfile): boolean {
 		profile.conditional ||
 		profile.hedged ||
 		profile.alternative ||
-		profile.contradictory ||
 		profile.refusal ||
 		profile.unresolved
 	);
@@ -507,7 +525,7 @@ function validateItems(value: unknown, snapshot?: CrystalSnapshot): CrystalItem[
 				const statementTerms = evidenceTerms(item.statement);
 				const quoteTerms = evidenceTerms(item.anchor.quote);
 				const statementSemantics = semanticProfile(item.statement);
-				const quoteSemantics = semanticProfile(item.anchor.quote);
+				const quoteSemantics = semanticProfile(anchoredClause(anchorMessage.content, item.anchor.quote));
 				if (
 					anchorMessage.role !== "user" ||
 					containsNonTextMarker(item.anchor.quote) ||
@@ -656,7 +674,10 @@ function isUnsafeResolution(value: string): boolean {
 		/^(?:yes|no|true|false|enabled|disabled|예|네|아니요|아니|是|否|はい|いいえ)[.!。！？]?$/iu.test(value.trim());
 	return (
 		(profile.negative && !standaloneBinary) ||
-		/\b(?:different\s+from|other\s+than|not\s+equal\s+to|anything\s+but|except\s+for)\b/i.test(value) ||
+		/\b(?:different\s+from|other\s+than|not\s+equal\s+to|anything\s+but|except\s+for|less\s+than|greater\s+than|at\s+most|at\s+least|no\s+more\s+than|no\s+less\s+than|under|over|below|above)\b/i.test(
+			value,
+		) ||
+		/(?:<=|>=|<|>)/.test(value) ||
 		profile.interrogative ||
 		profile.conditional ||
 		profile.hedged ||
@@ -692,7 +713,10 @@ function validateResolutionAnchors(
 			(itemTerms.size > 0 && [...itemTerms].every(term => resolutionTerms.has(term))) ||
 			hasCjkTopicOverlap(item, resolution);
 		const concreteAnswer = hasConcreteResolutionValue(resolution, item, conflict);
-		const unsafeResolution = isUnsafeResolution(resolution) || isUnsafeResolution(quote);
+		const unsafeResolution =
+			isUnsafeResolution(resolution) ||
+			isUnsafeResolution(quote) ||
+			(message ? isUnsafeResolution(anchoredClause(message.content, quote)) : true);
 		if (
 			!resolutions.includes(item) ||
 			seen.has(item) ||
@@ -773,6 +797,7 @@ function validateRemovalAnchors(
 			);
 		const removalSemantics = semanticProfile(resolution);
 		const quotedRemovalSemantics = semanticProfile(quote);
+		const messageRemovalSemantics = message ? semanticProfile(anchoredClause(message.content, quote)) : undefined;
 		if (
 			message?.role !== "user" ||
 			messageIndex <= afterIndex ||
@@ -799,7 +824,16 @@ function validateRemovalAnchors(
 			quotedRemovalSemantics.refusal ||
 			quotedRemovalSemantics.alternative ||
 			quotedRemovalSemantics.contradictory ||
-			quotedRemovalSemantics.unresolved
+			quotedRemovalSemantics.unresolved ||
+			!messageRemovalSemantics ||
+			messageRemovalSemantics.negative ||
+			messageRemovalSemantics.interrogative ||
+			messageRemovalSemantics.conditional ||
+			messageRemovalSemantics.hedged ||
+			messageRemovalSemantics.refusal ||
+			messageRemovalSemantics.alternative ||
+			messageRemovalSemantics.contradictory ||
+			messageRemovalSemantics.unresolved
 		)
 			throw new Error(`removed_item_anchors[${index}] has no fresh statement-bound user removal evidence`);
 		seen.add(itemId);
