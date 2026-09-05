@@ -4,7 +4,7 @@
  * Uses brush-core via native bindings for shell execution.
  */
 import * as fs from "node:fs/promises";
-import type { MinimizerOptions, Shell as NativeShell } from "@gajae-code/natives";
+import type { MinimizerOptions, Shell as NativeShell, ShellOptions, ShellRunOptions } from "@gajae-code/natives";
 import { postmortem } from "@gajae-code/utils";
 import { Settings, type ShellMinimizerSettings } from "../config/settings";
 import { formatCrashDiagnosticNotice, writeCrashReport } from "../debug/crash-diagnostics";
@@ -17,6 +17,7 @@ import {
 } from "../session/streaming-output";
 import { formatArtifactReference, resolveOutputMaxColumns, resolveOutputSinkHeadBytes } from "../tools/output-meta";
 import { getOrCreateSnapshot } from "../utils/shell-snapshot";
+import { IsolatedShell } from "./isolated-shell";
 import { NON_INTERACTIVE_ENV } from "./non-interactive-env";
 
 type NativeShellBindings = Pick<typeof import("@gajae-code/natives"), "Shell">;
@@ -27,7 +28,27 @@ async function shellNatives(): Promise<NativeShellBindings> {
 	return await nativeShellBindingsLoad;
 }
 
-type Shell = NativeShell;
+type ShellRunResult = Awaited<ReturnType<NativeShell["run"]>> & { signal?: string };
+type Shell = {
+	run(options: ShellRunOptions, onChunk?: (error: Error | null, chunk: string) => void): Promise<ShellRunResult>;
+	abort(): Promise<void>;
+	close(): Promise<void>;
+};
+type ShellFactory = (options?: ShellOptions) => Shell | Promise<Shell>;
+let shellFactoryForTests: ShellFactory | undefined;
+
+export function setShellFactoryForTests(factory: ShellFactory | undefined): void {
+	shellFactoryForTests = factory;
+}
+
+async function createShell(options?: ShellOptions): Promise<Shell> {
+	if (shellFactoryForTests) return await shellFactoryForTests(options);
+	// Windows brush exposes only its stub signal set, so the POSIX self-signal
+	// hazard and session/process-group containment contract do not apply there.
+	if (process.platform !== "win32") return new IsolatedShell(options);
+	const { Shell } = await shellNatives();
+	return new Shell(options);
+}
 
 export interface BashArtifactSaveSummary {
 	artifactId: string;
@@ -174,6 +195,8 @@ export interface BashExecutorOptions {
 export interface BashResult {
 	output: string;
 	exitCode: number | undefined;
+	/** POSIX signal that terminated the isolated shell execution boundary. */
+	signal?: string;
 	cancelled: boolean;
 	truncated: boolean;
 	totalLines: number;
@@ -291,14 +314,12 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 			...(await sink.dump("Command cancelled")),
 		};
 	}
-	const { Shell } = await shellNatives();
-
 	const usePersistentShell = options?.oneShot !== true;
 	const sessionKey = buildSessionKey(shell, configuredPrefix, snapshotPath, shellEnv, options?.sessionKey, minimizer);
 
 	let shellSession = usePersistentShell ? shellSessions.get(sessionKey) : undefined;
 	if (!shellSession && usePersistentShell) {
-		shellSession = new Shell({
+		shellSession = await createShell({
 			sessionEnv: shellEnv,
 			snapshotPath: snapshotPath ?? undefined,
 			minimizer,
@@ -309,7 +330,7 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 	// can be ended explicitly. executeShell creates a native shell outside the
 	// persistent registry, leaving its cleanup untrackable by the host process.
 	const oneShotShell = !usePersistentShell
-		? new Shell({
+		? await createShell({
 				sessionEnv: shellEnv,
 				snapshotPath: snapshotPath ?? undefined,
 				minimizer,
@@ -452,6 +473,18 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 			};
 		}
 
+		// A self-signal terminates the isolated worker rather than the GJC host.
+		// Retire that worker-backed shell immediately; the next command with the
+		// same session key creates a fresh persistent shell.
+		if (winner.result.signal) {
+			resetSession = true;
+			runSettled = true;
+			if (shellSession && shellSessions.get(sessionKey) === shellSession) {
+				shellSessions.delete(sessionKey);
+			}
+			void activeShell?.close().catch(() => undefined);
+		}
+
 		// When the native minimizer rewrote the output, swap the sink's accumulated
 		// raw stream for the minimized text, persist the original as a session
 		// artifact, and splice an artifact footer into the visible text so the agent
@@ -494,6 +527,7 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 		const saveNotice = minimizedSaveResult ? minimizedSaveNotice(minimizedSaveResult, summary) : undefined;
 		return {
 			exitCode: winner.result.exitCode,
+			...(winner.result.signal ? { signal: winner.result.signal } : {}),
 			cancelled: false,
 			...summary,
 			...(saveNotice ? { output: appendModelNotice(summary.output, saveNotice) } : {}),

@@ -245,8 +245,15 @@ function failureStatusCause(
 	if (result.cancelled) return leadingStatus ?? lastStatus ?? "Command cancelled";
 	if (isInteractiveResult(result) && result.timedOut) return lastStatus ?? "Command timed out";
 	if (result.exitCode === undefined) return "Command failed: missing exit status";
-	if (result.exitCode !== 0) return `Command exited with code ${result.exitCode}`;
+	if (result.exitCode !== 0) return nonZeroExitCause(result);
 	return undefined;
+}
+
+function nonZeroExitCause(result: BashResult | BashInteractiveResult): string {
+	if ("signal" in result && result.signal) {
+		return `Command terminated by ${result.signal} (exit code ${result.exitCode})`;
+	}
+	return `Command exited with code ${result.exitCode}`;
 }
 
 function removeTrailingFailureCause(text: string, cause: string | undefined): string {
@@ -897,9 +904,8 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			throw new ToolError(formatBashFailureMessage(result, `${outputText}\n\nCommand failed: missing exit status`));
 		}
 		if (result.exitCode !== 0) {
-			throw new ToolError(
-				formatBashFailureMessage(result, `${outputText}\n\nCommand exited with code ${result.exitCode}`),
-			);
+			const cause = nonZeroExitCause(result);
+			throw new ToolError(formatBashFailureMessage(result, `${outputText}\n\n${cause}`));
 		}
 		return outputText;
 	}

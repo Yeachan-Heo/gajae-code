@@ -5,10 +5,12 @@ import * as path from "node:path";
 import { resetSettingsForTest, Settings } from "@gajae-code/coding-agent/config/settings";
 import { getRuntimeResourceCounts } from "@gajae-code/coding-agent/debug/runtime-gauges";
 import {
+	type BashResult,
 	disposeAllShellSessions,
 	executeBash,
 	getShellSessionCount,
 	normalizeMinimizedSaveResultForTests,
+	setShellFactoryForTests,
 } from "@gajae-code/coding-agent/exec/bash-executor";
 import { DEFAULT_MAX_BYTES } from "@gajae-code/coding-agent/session/streaming-output";
 import * as shellSnapshot from "@gajae-code/coding-agent/utils/shell-snapshot";
@@ -36,6 +38,7 @@ describe("executeBash", () => {
 	});
 
 	afterEach(() => {
+		setShellFactoryForTests(undefined);
 		resetSettingsForTest();
 		vi.restoreAllMocks();
 		if (fs.existsSync(tempDir)) {
@@ -62,6 +65,64 @@ describe("executeBash", () => {
 		expect(result.exitCode).toBe(7);
 		expect(result.cancelled).toBe(false);
 	});
+
+	it("contains shell self-signals in a sacrificial child and restores the persistent session", async () => {
+		if (process.platform === "win32") return;
+
+		const fixture = path.join(import.meta.dir, "fixtures", "bash-self-signal-repro.ts");
+		const child = Bun.spawn([process.execPath, fixture], {
+			cwd: path.resolve(import.meta.dir, "../../.."),
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const stdout = new Response(child.stdout).text();
+		const stderr = new Response(child.stderr).text();
+		const completion = await Promise.race([
+			child.exited.then(exitCode => ({ kind: "exit" as const, exitCode })),
+			Bun.sleep(20_000).then(() => ({ kind: "timeout" as const })),
+		]);
+		if (completion.kind === "timeout") child.kill("SIGKILL");
+		expect(completion.kind).toBe("exit");
+		if (completion.kind !== "exit") return;
+		const diagnostic = await stderr;
+		expect(completion.exitCode, diagnostic).toBe(0);
+
+		const report = JSON.parse(await stdout) as {
+			hostPid: number;
+			identity: BashResult;
+			persistent: BashResult;
+			builtinTrap: BashResult;
+			builtinTrapFinalized: boolean;
+			builtinTrapRecovery: BashResult;
+			externalTrap: BashResult;
+			externalTrapFinalized: boolean;
+			externalTrapRecovery: BashResult;
+			processGroupTerm: BashResult;
+			processGroupTermFinalized: boolean;
+			processGroupTermRecovery: BashResult;
+			uncatchableKill: BashResult;
+			uncatchableKillFinalized: boolean;
+			uncatchableKillRecovery: BashResult;
+			parentAlive: boolean;
+		};
+		const [shellPid, bashPid] = report.identity.output.split("|").map(Number);
+		expect(shellPid).toBeGreaterThan(0);
+		expect(bashPid).toBe(shellPid);
+		expect(shellPid).not.toBe(report.hostPid);
+		expect(report.persistent?.output).toBe("preserved");
+		for (const name of ["builtinTrap", "externalTrap"] as const) {
+			expect(report[name]).toMatchObject({ exitCode: 133, signal: "SIGTRAP", cancelled: false });
+			expect(report[`${name}Finalized`]).toBe(true);
+			expect(report[`${name}Recovery`]?.output).toBe("recovered");
+		}
+		expect(report.processGroupTerm).toMatchObject({ exitCode: 143, signal: "SIGTERM", cancelled: false });
+		expect(report.processGroupTermFinalized).toBe(true);
+		expect(report.processGroupTermRecovery?.output).toBe("recovered");
+		expect(report.uncatchableKill).toMatchObject({ exitCode: 137, signal: "SIGKILL", cancelled: false });
+		expect(report.uncatchableKillFinalized).toBe(true);
+		expect(report.uncatchableKillRecovery?.output).toBe("recovered");
+		expect(report.parentAlive).toBe(true);
+	}, 30_000);
 
 	it("scrubs inherited managed transcript paths from shell sessions", async () => {
 		const previousSessionFile = process.env.GJC_SESSION_FILE;
@@ -103,15 +164,19 @@ describe("executeBash", () => {
 
 	it("owns and disposes one-shot native shells", async () => {
 		await disposeAllShellSessions();
+		setShellFactoryForTests(options => new piNatives.Shell(options));
 		const closeSpy = vi.spyOn(piNatives.Shell.prototype, "close");
 		const abortSpy = vi.spyOn(piNatives.Shell.prototype, "abort");
+		try {
+			const result = await executeBash("echo one-shot", { cwd: tempDir, timeout: 5000, oneShot: true });
 
-		const result = await executeBash("echo one-shot", { cwd: tempDir, timeout: 5000, oneShot: true });
-
-		expect(result.output.trim()).toBe("one-shot");
-		expect(getShellSessionCount()).toBe(0);
-		expect(closeSpy).toHaveBeenCalledTimes(1);
-		expect(abortSpy).not.toHaveBeenCalled();
+			expect(result.output.trim()).toBe("one-shot");
+			expect(getShellSessionCount()).toBe(0);
+			expect(closeSpy).toHaveBeenCalledTimes(1);
+			expect(abortSpy).not.toHaveBeenCalled();
+		} finally {
+			setShellFactoryForTests(undefined);
+		}
 	});
 
 	it("reports the bash shell-session owner count via runtime resource gauges", async () => {
@@ -273,6 +338,8 @@ describe("executeBash", () => {
 			return;
 		}
 
+		await disposeAllShellSessions();
+		setShellFactoryForTests(options => new piNatives.Shell(options));
 		const originalRun = piNatives.Shell.prototype.run;
 		let runCalls = 0;
 		vi.spyOn(piNatives.Shell.prototype, "run").mockImplementation(function (this: Shell, options, onChunk) {
@@ -314,6 +381,7 @@ describe("executeBash", () => {
 		});
 		expect(next.output.trim()).toBe("next");
 		expect(runCalls).toBe(2);
+		setShellFactoryForTests(undefined);
 	});
 
 	it("restores persistent sessions after native abort cleanup settles", async () => {
@@ -361,6 +429,8 @@ describe("executeBash", () => {
 			return;
 		}
 
+		await disposeAllShellSessions();
+		setShellFactoryForTests(options => new piNatives.Shell(options));
 		vi.spyOn(piNatives.Shell.prototype, "run").mockImplementation((_options, onChunk) => {
 			onChunk?.(null, "started\n");
 			return new Promise(() => {});
@@ -383,6 +453,7 @@ describe("executeBash", () => {
 			expect(raced.result.output).toContain("Command timed out after 1 seconds");
 		}
 		expect(abortSpy).toHaveBeenCalled();
+		setShellFactoryForTests(undefined);
 	});
 
 	it("aborts before follow-up output", async () => {

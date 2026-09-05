@@ -10,6 +10,8 @@ import { APP_NAME, formatBunRuntimeError, MIN_BUN_VERSION, VERSION } from "@gaja
 import { runFixtureReport } from "./cli/fixture-report";
 import { ROOT_LAUNCH_FLAGS } from "./cli/root-flags";
 import QuickLane from "./commands/quick-lane";
+import { runBashShellWorker } from "./exec/bash-shell-worker";
+import { BASH_SHELL_WORKER_ARG } from "./exec/bash-shell-worker-protocol";
 import { smokeTestTabWorker } from "./tools/browser/tab-worker-smoke";
 
 if (Bun.semver.order(Bun.version, MIN_BUN_VERSION) < 0) {
@@ -392,6 +394,10 @@ export function routeRootArgv(argv: readonly string[]): string[] {
 
 /** Run the CLI with the given argv (no `process.argv` prefix). */
 export async function runCli(argv: string[]): Promise<void> {
+	if (argv.length === 1 && argv[0] === BASH_SHELL_WORKER_ARG) {
+		await runBashShellWorker();
+		return;
+	}
 	// macOS malloc-env launch boundary. Re-exec once with a scrubbed environment
 	// BEFORE any fast path or subprocess spawn, so the startup env snapshot Bun hands
 	// to every child lane (Bun.spawn defaults, node:child_process, native PTY, tmux

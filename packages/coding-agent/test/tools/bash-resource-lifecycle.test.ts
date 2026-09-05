@@ -8,6 +8,7 @@ import {
 	disposeAllShellSessions,
 	executeBash,
 	getShellSessionCount,
+	setShellFactoryForTests,
 } from "@gajae-code/coding-agent/exec/bash-executor";
 import { ArtifactManager } from "@gajae-code/coding-agent/session/artifacts";
 import { DEFAULT_ARTIFACT_MAX_BYTES, OutputSink } from "@gajae-code/coding-agent/session/streaming-output";
@@ -73,6 +74,7 @@ describe("bash resource lifecycle", () => {
 		await manager.dispose({ timeoutMs: 1_000 });
 		AsyncJobManager.resetForTests();
 		await disposeAllShellSessions();
+		setShellFactoryForTests(undefined);
 		resetSettingsForTest();
 		if (fs.existsSync(tempDir)) fs.rmSync(tempDir, { recursive: true });
 	});
@@ -216,6 +218,8 @@ describe("bash resource lifecycle", () => {
 		expect(saved.length).toBeLessThan(96);
 	});
 	it("does not let a late-retired shell replace its same-key successor", async () => {
+		await disposeAllShellSessions();
+		setShellFactoryForTests(options => new piNatives.Shell(options));
 		const originalRun = piNatives.Shell.prototype.run;
 		let runCalls = 0;
 		let firstRunSettled: (() => void) | undefined;
