@@ -335,6 +335,7 @@ const CURSOR_MAX_GRPC_MESSAGE_LENGTH = 16 * 1024 * 1024;
 const CURSOR_MAX_PENDING_SERVER_BYTES = CURSOR_MAX_GRPC_MESSAGE_LENGTH + 5;
 const CURSOR_MAX_BLOB_STORE_ENTRIES = 256;
 const CURSOR_MAX_BLOB_STORE_BYTES = 64 * 1024 * 1024;
+const CURSOR_BLOB_ID_BYTES = 32;
 const CURSOR_MAX_GRPC_ERROR_MESSAGE_LENGTH = 4096;
 const CURSOR_EXEC_DEADLINE_MULTIPLIER = 4;
 const CURSOR_MIN_EXEC_DEADLINE_MS = 100;
@@ -1169,7 +1170,16 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 				// message a bounded grace window before publishing the terminal.
 				postTurnEndedCheckpointTimer = setTimeout(() => {
 					postTurnEndedCheckpointTimer = undefined;
-					settleBehindFence(() => settleH2());
+					const request = h2Request;
+					if (!request || isClosedCursorRequest(request)) {
+						settleBehindFence(() => settleH2());
+						return;
+					}
+					settleBehindFence(() => {
+						localTransportCloseRequested = true;
+						closeStalledCursorRequest(request);
+						settleH2();
+					});
 				}, 25);
 			} else if (responseEnded) {
 				settleBehindFence(() => settleH2(new Error("Cursor HTTP/2 stream ended before turnEnded")));
@@ -2377,7 +2387,8 @@ function handleKvServerMessage(
 	} else if (kvCase === "setBlobArgs") {
 		const { blobId, blobData } = kvMsg.message.value;
 		const blobIdKey = Buffer.from(blobId).toString("hex");
-		const stored = storeCursorServerBlob(blobStore, blobIdKey, blobData);
+		const stored =
+			blobId.byteLength === CURSOR_BLOB_ID_BYTES && storeCursorServerBlob(blobStore, blobIdKey, blobData);
 
 		const response = create(KvClientMessageSchema, {
 			id: kvMsg.id,
@@ -2420,11 +2431,14 @@ function storeCursorServerBlob(
 
 export function storeCursorBlobForTest(
 	blobStore: Map<string, Uint8Array>,
-	blobId: string,
+	blobId: Uint8Array,
 	blobData: Uint8Array,
 	limits: { maxEntries: number; maxBytes: number },
 ): boolean {
-	return storeCursorServerBlob(blobStore, blobId, blobData, limits);
+	return (
+		blobId.byteLength === CURSOR_BLOB_ID_BYTES &&
+		storeCursorServerBlob(blobStore, Buffer.from(blobId).toString("hex"), blobData, limits)
+	);
 }
 
 function sendShellStreamEvent(

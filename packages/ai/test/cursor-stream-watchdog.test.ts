@@ -1609,6 +1609,33 @@ describe("Cursor raw transport watchdog", () => {
 		expect(events.filter(isTerminalEvent)).toHaveLength(1);
 	});
 
+	it("closes an unfinished response before publishing grace-window success", async () => {
+		const baseUrl = await createCursorServer(stream => {
+			stream.respond({ ":status": 200, "content-type": "application/connect+proto" }, { waitForTrailers: true });
+			stream.on("wantTrailers", () => {
+				setTimeout(() => {
+					if (!stream.destroyed) {
+						stream.sendTrailers({ "grpc-status": "13", "grpc-message": "delayed%20failure" });
+					}
+				}, 40);
+			});
+			setTimeout(() => {
+				sendInteractionUpdate(stream, {
+					case: "turnEnded",
+					value: create(TurnEndedUpdateSchema, {}),
+				});
+				stream.end();
+			}, 10);
+		});
+
+		const { events, result } = await collectTerminal(baseUrl, {
+			streamIdleTimeoutMs: 100,
+			streamFirstEventTimeoutMs: 500,
+		});
+		expect(result.stopReason).toBe("stop");
+		expect(events.filter(isTerminalEvent)).toHaveLength(1);
+	});
+
 	it("drops buffered execs when a gRPC trailer failure closes admission", async () => {
 		const baseUrl = await createCursorServer(stream => {
 			stream.respond({ ":status": 200, "content-type": "application/connect+proto" }, { waitForTrailers: true });
