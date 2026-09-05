@@ -1556,11 +1556,28 @@ export class InteractiveMode implements InteractiveModeContext {
 	}
 
 	rebuildChatFromMessages(policy: TranscriptRebuildPolicy): void {
+		const preservedStreamingComponent =
+			policy === "reconcile-same-transcript" &&
+			this.streamingComponent &&
+			this.streamingMessage &&
+			this.chatContainer.hasLiveChild(this.streamingComponent)
+				? this.streamingComponent
+				: undefined;
+		const preservedStreamingMessage = preservedStreamingComponent ? this.streamingMessage : undefined;
 		prepareTranscriptRebuild(this.ui, policy);
+		// A live provider response is not persisted until message_end. Detach it before
+		// clear() so reconcile rebuilds do not dispose the owner of pending text frames.
+		if (preservedStreamingComponent) this.chatContainer.detachChild(preservedStreamingComponent);
 		this.resetAssistantTextPresentation();
 		this.chatContainer.clear();
 		const context = this.session.buildDisplaySessionContext();
 		this.renderSessionContext(context);
+		if (preservedStreamingComponent && preservedStreamingMessage) {
+			this.streamingComponent = preservedStreamingComponent;
+			this.streamingMessage = preservedStreamingMessage;
+			addChatChild(this, preservedStreamingComponent);
+			this.#eventController.rebindAssistantTextPresentation();
+		}
 	}
 
 	#sanitizeTodoText(text: string): string {

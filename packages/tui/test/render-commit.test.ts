@@ -402,6 +402,139 @@ describe("generation-scoped render commits", () => {
 		tui.stop();
 	});
 
+	it("fences a render queued behind held raster ingress when disposed", async () => {
+		const terminal = new VirtualTerminal(40, 8);
+		const tui = new TUI(terminal);
+		const text = new Text("initial", 0, 0);
+		tui.addChild(text);
+		tui.start();
+		await terminal.waitForRender();
+		const lease = await tui.acquireRasterLease({
+			ownerId: "dispose-held-raster",
+			rect: { column: 0, row: 0, width: 2, height: 1 },
+			erase: { type: "raster-erase", bytes: new TextEncoder().encode("DISPOSE_ERASE") },
+		});
+		if (lease.status !== "acquired") throw new Error("lease not acquired");
+		let releaseIngress: () => void = () => {};
+		const ingressGate = new Promise<void>(resolve => {
+			releaseIngress = resolve;
+		});
+		let signalIngressStarted: () => void = () => {};
+		const ingressStarted = new Promise<void>(resolve => {
+			signalIngressStarted = resolve;
+		});
+		let disposed = false;
+		const held = tui.submitTerminalOutput({
+			token: lease.token,
+			operation: {
+				type: "raster-multipart-batch",
+				prefix: new TextEncoder().encode("DISPOSE_PREFIX"),
+				afterPrefix: async () => {
+					signalIngressStarted();
+					await ingressGate;
+					return true;
+				},
+				records: [new TextEncoder().encode("DISPOSE_RASTER")],
+				abortSuffix: new TextEncoder().encode("DISPOSE_STALE_ABORT"),
+			},
+		});
+		try {
+			await ingressStarted;
+			terminal.clearWriteLog();
+			text.setText("DISPOSE_STALE_RENDER");
+			const generation = tui.requestRenderWithGeneration(true, "test.dispose-held-raster");
+			const committed = tui.waitForRenderCommit(generation);
+			// Let the forced frame capture its write closure behind the held ingress.
+			await new Promise<void>(resolve => process.nextTick(resolve));
+			tui.dispose();
+			disposed = true;
+			expect(await committed).toBe(false);
+			releaseIngress();
+			expect((await held).status).toBe("failed");
+			await terminal.waitForRender();
+			const output = terminal.getWriteLog().join("");
+			expect(output).not.toContain("DISPOSE_STALE_RENDER");
+			expect(output).not.toContain("DISPOSE_STALE_ABORT");
+			expect(output).not.toContain("DISPOSE_RASTER");
+		} finally {
+			releaseIngress();
+			await held;
+			if (!disposed) tui.stop();
+		}
+	});
+
+	it("fences a render queued behind held raster ingress across terminal loss and restart", async () => {
+		class AvailabilityTerminal extends VirtualTerminal {
+			live = true;
+			override get available(): boolean {
+				return this.live;
+			}
+		}
+		const terminal = new AvailabilityTerminal(40, 8);
+		const tui = new TUI(terminal);
+		const text = new Text("initial", 0, 0);
+		tui.addChild(text);
+		tui.start();
+		await terminal.waitForRender();
+		const lease = await tui.acquireRasterLease({
+			ownerId: "loss-held-raster",
+			rect: { column: 0, row: 0, width: 2, height: 1 },
+			erase: { type: "raster-erase", bytes: new TextEncoder().encode("LOSS_ERASE") },
+		});
+		if (lease.status !== "acquired") throw new Error("lease not acquired");
+		let releaseIngress: () => void = () => {};
+		const ingressGate = new Promise<void>(resolve => {
+			releaseIngress = resolve;
+		});
+		let signalIngressStarted: () => void = () => {};
+		const ingressStarted = new Promise<void>(resolve => {
+			signalIngressStarted = resolve;
+		});
+		const held = tui.submitTerminalOutput({
+			token: lease.token,
+			operation: {
+				type: "raster-multipart-batch",
+				prefix: new TextEncoder().encode("LOSS_PREFIX"),
+				afterPrefix: async () => {
+					signalIngressStarted();
+					await ingressGate;
+					return true;
+				},
+				records: [new TextEncoder().encode("LOSS_RASTER")],
+				abortSuffix: new TextEncoder().encode("LOSS_STALE_ABORT"),
+			},
+		});
+		try {
+			await ingressStarted;
+			terminal.clearWriteLog();
+			text.setText("LOSS_STALE_RENDER");
+			const generation = tui.requestRenderWithGeneration(true, "test.loss-held-raster");
+			const committed = tui.waitForRenderCommit(generation);
+			// Let the forced frame capture its write closure behind the held ingress.
+			await new Promise<void>(resolve => process.nextTick(resolve));
+			terminal.live = false;
+			const invalidatedGeneration = tui.requestRenderWithGeneration(true, "test.loss-held-raster.invalidate");
+			expect(await committed).toBe(false);
+			expect(await tui.waitForRenderCommit(invalidatedGeneration)).toBe(false);
+			text.setText("LOSS_FRESH_RENDER");
+			terminal.live = true;
+			tui.start();
+			terminal.clearWriteLog();
+			releaseIngress();
+			expect((await held).status).toBe("failed");
+			await terminal.waitForRender();
+			const output = terminal.getWriteLog().join("");
+			expect(output).not.toContain("LOSS_STALE_RENDER");
+			expect(output).not.toContain("LOSS_STALE_ABORT");
+			expect(output).not.toContain("LOSS_RASTER");
+			expect(output).toContain("LOSS_FRESH_RENDER");
+		} finally {
+			releaseIngress();
+			await held;
+			tui.stop();
+		}
+	});
+
 	it("does not call beforeStart when terminal setup fails", () => {
 		class FailedStartTerminal extends VirtualTerminal {
 			override start(): void {
