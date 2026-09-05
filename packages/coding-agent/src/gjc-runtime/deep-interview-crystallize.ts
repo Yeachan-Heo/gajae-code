@@ -62,6 +62,7 @@ export interface DeepInterviewCrystal {
 	source: { revision: number; start: number; end: number; digest: string; messages: CrystalMessage[] };
 	items: CrystalItem[];
 	removed_ids?: string[];
+	removed_item_anchors?: CrystalResolutionAnchor[];
 	pending_removals?: string[];
 	open_gaps: string[];
 	conflicts: string[];
@@ -515,6 +516,7 @@ function validateItems(value: unknown, snapshot?: CrystalSnapshot): CrystalItem[
 					quoteTerms.size === 0 ||
 					statementTerms.size === 0 ||
 					[...statementTerms].some(term => !quoteTerms.has(term)) ||
+					!preservesEvidenceOrder(item.statement, item.anchor.quote) ||
 					isUnsafeConfirmedStatement(statementSemantics) ||
 					!sameSemanticIntent(statementSemantics, quoteSemantics)
 				)
@@ -583,6 +585,25 @@ function evidenceTerms(value: string): Set<string> {
 	return terms;
 }
 
+function evidenceTermSequence(value: string): string[] {
+	const terms = evidenceTerms(value);
+	return [...EVIDENCE_SEGMENTER.segment(value.normalize("NFC").toLowerCase())]
+		.filter(part => part.isWordLike && terms.has(part.segment))
+		.map(part => part.segment);
+}
+
+function preservesEvidenceOrder(statement: string, quote: string): boolean {
+	const statementTerms = evidenceTermSequence(statement);
+	const quoteTerms = evidenceTermSequence(quote);
+	let quoteIndex = 0;
+	for (const statementTerm of statementTerms) {
+		while (quoteIndex < quoteTerms.length && quoteTerms[quoteIndex] !== statementTerm) quoteIndex++;
+		if (quoteIndex >= quoteTerms.length) return false;
+		quoteIndex++;
+	}
+	return true;
+}
+
 function topicTerms(value: string, conflict: boolean): Set<string> {
 	const terms = evidenceTerms(value);
 	for (const term of [...terms]) {
@@ -631,7 +652,10 @@ function hasCjkTopicOverlap(item: string, resolution: string): boolean {
 
 function isUnsafeResolution(value: string): boolean {
 	const profile = semanticProfile(value);
+	const standaloneBinary =
+		/^(?:yes|no|true|false|enabled|disabled|예|네|아니요|아니|是|否|はい|いいえ)[.!。！？]?$/iu.test(value.trim());
 	return (
+		(profile.negative && !standaloneBinary) ||
 		profile.interrogative ||
 		profile.conditional ||
 		profile.hedged ||
@@ -717,12 +741,13 @@ function validateRemovalAnchors(
 	priorItems: ReadonlyMap<string, CrystalItem>,
 	snapshot: CrystalSnapshot,
 	afterIndex: number,
-): string[] {
+): CrystalResolutionAnchor[] {
 	const removalIds = [...new Set([...requestedIds, ...priorPendingIds])].sort();
 	if (value === undefined) return [];
 	if (!Array.isArray(value) || value.length > removalIds.length)
 		throw new Error("removed_item_anchors must contain one anchor per resolved removal");
 	const seen = new Set<string>();
+	const anchors: CrystalResolutionAnchor[] = [];
 	for (const [index, raw] of value.entries()) {
 		if (!isRecord(raw)) throw new Error(`removed_item_anchors[${index}] must be an object`);
 		const itemId = text(raw.item, `removed_item_anchors[${index}].item`, 128);
@@ -777,8 +802,33 @@ function validateRemovalAnchors(
 		)
 			throw new Error(`removed_item_anchors[${index}] has no fresh statement-bound user removal evidence`);
 		seen.add(itemId);
+		anchors.push({ item: itemId, message_index: messageIndex, quote, resolution });
 	}
-	return [...seen].sort();
+	return anchors.sort((left, right) => left.item.localeCompare(right.item));
+}
+
+function validateStoredRemovalAnchors(
+	value: unknown,
+	removedIds: readonly string[],
+	priorSnapshot: CrystalSnapshot,
+): CrystalResolutionAnchor[] {
+	if (removedIds.length === 0 && value === undefined) return [];
+	if (!Array.isArray(value) || value.length !== removedIds.length)
+		throw new Error("prior crystal removal evidence is invalid");
+	const anchors = value.map((raw, index) => {
+		if (!isRecord(raw)) throw new Error("prior crystal removal evidence is invalid");
+		const item = text(raw.item, `prior.removed_item_anchors[${index}].item`, 128);
+		const messageIndex = integer(raw.message_index, `prior.removed_item_anchors[${index}].message_index`);
+		const quote = text(raw.quote, `prior.removed_item_anchors[${index}].quote`, 500);
+		const resolution = text(raw.resolution, `prior.removed_item_anchors[${index}].resolution`, 500);
+		const message = priorSnapshot.messages.find(candidate => candidate.index === messageIndex);
+		if (!removedIds.includes(item) || message?.role !== "user" || !message.content.includes(quote))
+			throw new Error("prior crystal removal evidence is invalid");
+		return { item, message_index: messageIndex, quote, resolution };
+	});
+	if (new Set(anchors.map(anchor => anchor.item)).size !== anchors.length)
+		throw new Error("prior crystal removal evidence is invalid");
+	return anchors.sort((left, right) => left.item.localeCompare(right.item));
 }
 
 function validateRemovedIds(value: unknown): string[] {
@@ -795,10 +845,7 @@ export function crystallizeDeepInterview(value: unknown): DeepInterviewCrystal {
 	if (integer(value.current_revision, "current_revision") !== snapshot.revision)
 		throw new Error("conversation snapshot is stale");
 	const items = validateItems(value.items, snapshot);
-	if (snapshot.messages.length === 0 || items.length === 0)
-		throw new Error("crystallize requires material conversation evidence");
-	if (!items.some(item => item.classification === "confirmed" && item.kind !== "non_goal"))
-		throw new Error("crystallize requires a confirmed user requirement");
+	if (snapshot.messages.length === 0) throw new Error("crystallize requires material conversation evidence");
 	const requestedRemovedIds = value.removed_ids === undefined ? [] : validateRemovedIds(value.removed_ids);
 	if (requestedRemovedIds.some(id => items.some(item => item.id === id)))
 		throw new Error("removed_ids must be disjoint from submitted items");
@@ -811,6 +858,7 @@ export function crystallizeDeepInterview(value: unknown): DeepInterviewCrystal {
 	if (prior !== undefined && !isRecord(prior)) throw new Error("prior crystal is invalid");
 	const priorCrystal = prior as DeepInterviewCrystal | undefined;
 	let canonicalPriorItems: CrystalItem[] = [];
+	let priorSnapshot: CrystalSnapshot | undefined;
 	if (priorCrystal) {
 		if (
 			priorCrystal.schema_version !== 1 ||
@@ -823,7 +871,7 @@ export function crystallizeDeepInterview(value: unknown): DeepInterviewCrystal {
 		if (!isRecord(priorCrystal.source) || snapshot.revision <= priorCrystal.source.revision)
 			throw new Error("conversation snapshot is stale");
 		if (!Array.isArray(priorCrystal.source.messages)) throw new Error("prior crystal source evidence is missing");
-		const priorSnapshot = validateSnapshot({ ...priorCrystal.source, messages: priorCrystal.source.messages });
+		priorSnapshot = validateSnapshot({ ...priorCrystal.source, messages: priorCrystal.source.messages });
 		if (!Array.isArray(priorCrystal.items)) throw new Error("prior crystal is invalid");
 		if (
 			!Number.isSafeInteger(priorCrystal.source.revision) ||
@@ -863,6 +911,9 @@ export function crystallizeDeepInterview(value: unknown): DeepInterviewCrystal {
 	);
 	const priorItems = new Map(canonicalPriorItems.map(item => [item.id, item]));
 	const priorRemovedIds = priorCrystal?.removed_ids === undefined ? [] : validateRemovedIds(priorCrystal.removed_ids);
+	const priorRemovedAnchors = priorCrystal
+		? validateStoredRemovalAnchors(priorCrystal.removed_item_anchors, priorRemovedIds, priorSnapshot!)
+		: [];
 	const priorPendingRemovals =
 		priorCrystal?.pending_removals === undefined ? [] : validateRemovedIds(priorCrystal.pending_removals);
 	if (priorPendingRemovals.some(id => !priorItems.has(id)))
@@ -877,7 +928,7 @@ export function crystallizeDeepInterview(value: unknown): DeepInterviewCrystal {
 		throw new Error("removed crystallize item is permanently removed");
 	if (requestedRemovedIds.some(id => !priorItems.has(id)))
 		throw new Error("removed crystallize item is not present in prior crystal");
-	const resolvedRemovedIds = validateRemovalAnchors(
+	const resolvedRemovalAnchors = validateRemovalAnchors(
 		value.removed_item_anchors,
 		requestedRemovedIds,
 		priorPendingRemovals,
@@ -885,6 +936,7 @@ export function crystallizeDeepInterview(value: unknown): DeepInterviewCrystal {
 		snapshot,
 		priorEnd,
 	);
+	const resolvedRemovedIds = resolvedRemovalAnchors.map(anchor => anchor.item);
 	const unresolvedRemovalIds = [
 		...new Set([...priorPendingRemovals, ...requestedRemovedIds].filter(id => !resolvedRemovedIds.includes(id))),
 	].sort();
@@ -911,6 +963,9 @@ export function crystallizeDeepInterview(value: unknown): DeepInterviewCrystal {
 			mergedItems.push(item);
 	const currentItems = mergedItems;
 	if (currentItems.length > MAX_ITEMS) throw new Error("merged crystallize items exceed the bounded limit");
+	if (currentItems.length === 0) throw new Error("crystallize requires material conversation evidence");
+	if (!currentItems.some(item => item.classification === "confirmed" && item.kind !== "non_goal"))
+		throw new Error("crystallize requires a confirmed user requirement");
 	const changed = currentItems
 		.filter(item => {
 			const previous = priorItems.get(item.id);
@@ -936,6 +991,7 @@ export function crystallizeDeepInterview(value: unknown): DeepInterviewCrystal {
 	const allGaps = [
 		...new Set([...(priorCrystal?.open_gaps ?? []), ...gaps].filter(gap => !resolvedGaps.includes(gap))),
 	];
+	if (allGaps.length > 2) throw new Error("broad ambiguity requires the full deep-interview flow");
 	const allConflicts = [
 		...new Set(
 			[...(priorCrystal?.conflicts ?? []), ...conflicts].filter(conflict => !resolvedConflicts.includes(conflict)),
@@ -964,8 +1020,18 @@ export function crystallizeDeepInterview(value: unknown): DeepInterviewCrystal {
 		changed_ids: changed,
 		added_ids: added,
 		preserved_ids: preserved,
-		approval_invalidated: intentChanged || removedIntent || hasInferred || allConflicts.length > 0 || hasDisputed,
+		approval_invalidated:
+			Boolean(priorCrystal && added.length > 0) ||
+			intentChanged ||
+			removedIntent ||
+			hasInferred ||
+			allConflicts.length > 0 ||
+			hasDisputed,
 	};
+	const allRemovedAnchors = [...priorRemovedAnchors];
+	for (const anchor of resolvedRemovalAnchors)
+		if (!allRemovedAnchors.some(existing => existing.item === anchor.item)) allRemovedAnchors.push(anchor);
+	allRemovedAnchors.sort((left, right) => left.item.localeCompare(right.item));
 	const lifecycle =
 		allConflicts.length > 0 || hasDisputed
 			? "stale"
@@ -987,6 +1053,7 @@ export function crystallizeDeepInterview(value: unknown): DeepInterviewCrystal {
 		},
 		items: currentItems,
 		...(allRemovedIds.length > 0 ? { removed_ids: allRemovedIds } : {}),
+		...(allRemovedAnchors.length > 0 ? { removed_item_anchors: allRemovedAnchors } : {}),
 		...(unresolvedRemovalIds.length > 0 ? { pending_removals: unresolvedRemovalIds } : {}),
 		open_gaps: allGaps,
 		conflicts: allConflicts,
@@ -1009,6 +1076,7 @@ export function crystalMarkdown(crystal: DeepInterviewCrystal): string {
 		`- Added IDs: ${crystal.delta.added_ids.join(", ") || "none"}`,
 		`- Preserved IDs: ${crystal.delta.preserved_ids.join(", ") || "none"}`,
 		`- Removed IDs: ${crystal.removed_ids?.join(", ") || "none"}`,
+		`- Removal evidence: ${crystal.removed_item_anchors?.map(anchor => `${anchor.item}@${anchor.message_index}: ${anchor.quote}`).join("; ") || "none"}`,
 		`- Pending removals: ${crystal.pending_removals?.join(", ") || "none"}`,
 		`- Approval invalidated: ${crystal.delta.approval_invalidated}`,
 		"",
