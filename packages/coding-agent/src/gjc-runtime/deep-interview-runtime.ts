@@ -1,8 +1,8 @@
 import { createHash, randomBytes } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { getSessionsDir } from "@gajae-code/utils";
 import { isSettingsInitialized, Settings } from "../config/settings";
+import { listManagedSessionCandidates, resolveManagedSessionScope } from "../sdk/session-directory";
 import {
 	type FileEntry,
 	listProjectSessionTranscriptFiles,
@@ -17,6 +17,7 @@ import {
 	crystallizeDeepInterview,
 	crystalMarkdown,
 	crystalSnapshotDigest,
+	type DeepInterviewCrystal,
 } from "./deep-interview-crystallize";
 import { isDeepInterviewStageVerb, runDeepInterviewStageCommand } from "./deep-interview-stage";
 import {
@@ -33,27 +34,27 @@ import {
 	reviewDeepInterviewIntent,
 } from "./deep-interview-state";
 import { runNativeRalplanCommand } from "./ralplan-runtime";
-import { modeStatePath, sessionSpecsDir } from "./session-layout";
+import { modeStatePath, sessionSpecsDir, transactionJournalPath } from "./session-layout";
 import { resolveGjcSessionForWrite, writeSessionActivityMarker } from "./session-resolution";
 import { runNativeStateCommand } from "./state-runtime";
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return value !== null && typeof value === "object" && !Array.isArray(value);
-}
-
 import {
 	appendJsonl,
 	beginWorkflowTransactionJournal,
 	completeWorkflowTransactionJournal,
+	detectWorkflowEnvelopeIntegrityMismatch,
 	readExistingStateForMutation,
-	readWorkflowTransactionJournal,
 	updateWorkflowTransactionJournal,
+	type WorkflowTransactionJournal,
 	withWorkflowStateLock,
 	writeArtifact,
 	writeWorkflowEnvelopeAtomic,
 } from "./state-writer";
 import { assertSafePathComponent, CommandError, flagValue, hasFlag } from "./workflow-cli-common";
 import { resolveWorkflowSetting } from "./workflow-settings";
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return value !== null && typeof value === "object" && !Array.isArray(value);
+}
 
 export * from "./deep-interview-recorder";
 
@@ -172,6 +173,202 @@ const VALUE_FLAGS = new Set([
 	"--handoff",
 ]);
 
+// Keep the runtime's transcript and publication bounds aligned with the pure
+// Crystal validator.  These are byte bounds for recovery reads; normal input
+// validation remains code-point bounded by deep-interview-state.ts.
+const CRYSTAL_MAX_MESSAGES = 200;
+const CRYSTAL_MAX_JOURNAL_BYTES = 64 * 1024;
+const CRYSTAL_MAX_INDEX_BYTES = 1_000_000;
+const CRYSTAL_MAX_ARTIFACT_BYTES = MAX_DEEP_INTERVIEW_STRUCTURED_RESPONSE_LENGTH * 4 + 4096;
+const READ_NOFOLLOW_FLAGS =
+	fs.constants.O_RDONLY | (typeof fs.constants.O_NOFOLLOW === "number" ? fs.constants.O_NOFOLLOW : 0);
+
+interface CrystalIndexRow {
+	slug: string;
+	stage: "final";
+	path: string;
+	created_at: string;
+	sha256: string;
+	canonicalPath: string;
+}
+
+interface CrystalIndexCatalog {
+	rows: CrystalIndexRow[];
+}
+
+interface CrystalJournalRecord extends WorkflowTransactionJournal {
+	artifact_sha256?: unknown;
+}
+
+function isErrnoCode(error: unknown, code: string): boolean {
+	return typeof error === "object" && error !== null && "code" in error && (error as { code?: unknown }).code === code;
+}
+
+function isPathWithin(root: string, target: string): boolean {
+	const relative = path.relative(path.resolve(root), path.resolve(target));
+	return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+}
+
+async function readBoundedFileBytes(
+	filePath: string,
+	maxBytes: number,
+	label: string,
+	options: { allowMissing?: boolean; rejectSymlink?: boolean } = {},
+): Promise<Buffer | undefined> {
+	let lexicalStat: Awaited<ReturnType<typeof fs.lstat>>;
+	try {
+		lexicalStat = await fs.lstat(filePath);
+	} catch (error) {
+		if (options.allowMissing && isErrnoCode(error, "ENOENT")) return undefined;
+		if (isErrnoCode(error, "ENOENT")) throw new DeepInterviewCommandError(2, `${label} is missing`);
+		throw new DeepInterviewCommandError(2, `failed to read ${label}`);
+	}
+	if (options.rejectSymlink !== false && lexicalStat.isSymbolicLink())
+		throw new DeepInterviewCommandError(2, `${label} must not be a symlink`);
+	if (!lexicalStat.isFile()) throw new DeepInterviewCommandError(2, `${label} is not a regular file`);
+	let handle: Awaited<ReturnType<typeof fs.open>> | undefined;
+	try {
+		handle = await fs.open(filePath, READ_NOFOLLOW_FLAGS);
+		const initial = await handle.stat();
+		if (!initial.isFile()) throw new DeepInterviewCommandError(2, `${label} is not a regular file`);
+		if (initial.size > maxBytes) throw new DeepInterviewCommandError(2, `${label} exceeds the bounded read limit`);
+		const output = Buffer.alloc(Number(initial.size));
+		let offset = 0;
+		while (offset < output.length) {
+			const { bytesRead } = await handle.read(output, offset, output.length - offset, offset);
+			if (bytesRead <= 0) throw new DeepInterviewCommandError(2, `${label} changed during recovery read`);
+			offset += bytesRead;
+		}
+		const final = await handle.stat();
+		if (final.size !== initial.size) throw new DeepInterviewCommandError(2, `${label} changed during recovery read`);
+		return output;
+	} catch (error) {
+		if (error instanceof DeepInterviewCommandError) throw error;
+		throw new DeepInterviewCommandError(2, `failed to read ${label}`);
+	} finally {
+		await handle?.close().catch(() => undefined);
+	}
+}
+
+function boundedUtf8(bytes: Buffer, label: string): string {
+	try {
+		return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+	} catch {
+		throw new DeepInterviewCommandError(2, `${label} is not valid UTF-8`);
+	}
+}
+
+function crystalSpecsRoot(cwd: string, sessionId: string): string {
+	return path.resolve(sessionSpecsDir(cwd, sessionId));
+}
+
+function canonicalPublicationPath(cwd: string, sessionId: string, value: string): string {
+	const canonical = path.resolve(value);
+	if (!isPathWithin(crystalSpecsRoot(cwd, sessionId), canonical))
+		throw new DeepInterviewCommandError(2, "Crystal publication path escapes the session specs directory");
+	return canonical;
+}
+
+async function readCrystalIndexCatalog(
+	cwd: string,
+	sessionId: string,
+	indexPath: string,
+): Promise<CrystalIndexCatalog> {
+	const bytes = await readBoundedFileBytes(indexPath, CRYSTAL_MAX_INDEX_BYTES, "Crystal index", {
+		allowMissing: true,
+	});
+	if (!bytes) return { rows: [] };
+	const text = boundedUtf8(bytes, "Crystal index");
+	const rows: CrystalIndexRow[] = [];
+	const pathHashes = new Map<string, string>();
+	for (const line of text.split(/\r?\n/)) {
+		if (!line.trim()) continue;
+		let parsed: unknown;
+		try {
+			parsed = JSON.parse(line);
+		} catch {
+			throw new DeepInterviewCommandError(2, "Crystal index contains malformed JSON");
+		}
+		if (!isRecord(parsed)) throw new DeepInterviewCommandError(2, "Crystal index contains a malformed row");
+		const slug = parsed.slug;
+		const stage = parsed.stage;
+		const rowPath = parsed.path;
+		const createdAt = parsed.created_at;
+		const sha256 = parsed.sha256;
+		if (
+			typeof slug !== "string" ||
+			slug.trim() === "" ||
+			typeof stage !== "string" ||
+			stage !== "final" ||
+			typeof rowPath !== "string" ||
+			typeof createdAt !== "string" ||
+			createdAt.trim() === "" ||
+			typeof sha256 !== "string" ||
+			!/^[a-f0-9]{64}$/.test(sha256)
+		)
+			throw new DeepInterviewCommandError(2, "Crystal index contains a malformed row");
+		try {
+			assertSafePathComponent(slug, "Crystal index slug");
+		} catch {
+			throw new DeepInterviewCommandError(2, "Crystal index contains an unsafe slug");
+		}
+		const canonicalPath = canonicalPublicationPath(cwd, sessionId, rowPath);
+		const previousHash = pathHashes.get(canonicalPath);
+		// Versioned Crystal artifacts are immutable.  A differing hash for one
+		// path therefore proves a conflicting ledger row.  Direct spec writes are
+		// intentionally mutable and retain their append-only history.
+		if (previousHash && previousHash !== sha256 && /-v[0-9]+\.md$/.test(path.basename(canonicalPath)))
+			throw new DeepInterviewCommandError(2, "Crystal index contains conflicting rows");
+		pathHashes.set(canonicalPath, sha256);
+		rows.push({
+			slug: slug.trim(),
+			stage: "final",
+			path: rowPath,
+			created_at: createdAt,
+			sha256,
+			canonicalPath,
+		});
+	}
+	return { rows };
+}
+
+function indexRowsForPath(catalog: CrystalIndexCatalog, targetPath: string): CrystalIndexRow[] {
+	const canonical = path.resolve(targetPath);
+	return catalog.rows.filter(row => row.canonicalPath === canonical);
+}
+
+async function verifyPublishedArtifactIndex(options: {
+	cwd: string;
+	sessionId: string;
+	indexPath: string;
+	specPath: string;
+	specHash: string;
+	crystal?: DeepInterviewCrystal;
+}): Promise<CrystalIndexCatalog> {
+	if (!/^[a-f0-9]{64}$/.test(options.specHash))
+		throw new DeepInterviewCommandError(2, "published Crystal hash is invalid");
+	const canonicalSpecPath = canonicalPublicationPath(options.cwd, options.sessionId, options.specPath);
+	const catalog = await readCrystalIndexCatalog(options.cwd, options.sessionId, options.indexPath);
+	const matchingRows = indexRowsForPath(catalog, canonicalSpecPath);
+	if (!matchingRows.some(row => row.sha256 === options.specHash))
+		throw new DeepInterviewCommandError(2, "published Crystal index verification failed");
+	const artifact = await readBoundedFileBytes(
+		canonicalSpecPath,
+		CRYSTAL_MAX_ARTIFACT_BYTES,
+		"published Crystal artifact",
+	);
+	if (!artifact) throw new DeepInterviewCommandError(2, "published Crystal artifact is missing");
+	const actualHash = createHash("sha256").update(artifact).digest("hex");
+	if (actualHash !== options.specHash)
+		throw new DeepInterviewCommandError(2, "published Crystal artifact verification failed");
+	if (options.crystal) {
+		const expectedHash = createHash("sha256").update(crystalMarkdown(options.crystal)).digest("hex");
+		if (expectedHash !== options.specHash)
+			throw new DeepInterviewCommandError(2, "published Crystal artifact does not match stored Crystal");
+	}
+	return catalog;
+}
+
 async function readCrystallizeInput(rawInput: string | undefined, cwd: string): Promise<Record<string, unknown>> {
 	if (!rawInput?.trim())
 		throw new DeepInterviewCommandError(2, "--input is required for deep-interview --crystallize");
@@ -207,12 +404,28 @@ async function readCrystallizeInput(rawInput: string | undefined, cwd: string): 
 
 function activeSessionEntries(entries: FileEntry[]): FileEntry[] {
 	const body = entries.slice(1);
-	if (
-		body.length === 0 ||
-		body.some(entry => typeof (entry as { id?: unknown }).id !== "string" || !("parentId" in entry))
-	)
-		return body;
-	const byId = new Map(body.map(entry => [(entry as { id: string }).id, entry]));
+	if (body.length === 0) return body;
+	const hasBranchMetadata = body.some(entry => "id" in entry || "parentId" in entry);
+	if (!hasBranchMetadata) return body;
+	const byId = new Map<string, FileEntry>();
+	for (const entry of body) {
+		const id = (entry as { id?: unknown }).id;
+		const parentId = (entry as { parentId?: unknown }).parentId;
+		if (
+			typeof id !== "string" ||
+			id.trim() === "" ||
+			!("parentId" in entry) ||
+			(parentId !== null && typeof parentId !== "string")
+		)
+			throw new DeepInterviewCommandError(2, "live session transcript branch metadata is malformed");
+		if (byId.has(id)) throw new DeepInterviewCommandError(2, "live session transcript branch contains duplicate IDs");
+		byId.set(id, entry);
+	}
+	for (const entry of body) {
+		const parentId = (entry as { parentId: string | null }).parentId;
+		if (parentId !== null && !byId.has(parentId))
+			throw new DeepInterviewCommandError(2, "live session transcript branch has a missing parent");
+	}
 	const branch: typeof body = [];
 	const visited = new Set<string>();
 	let current = body.at(-1);
@@ -230,6 +443,62 @@ function activeSessionEntries(entries: FileEntry[]): FileEntry[] {
 	return branch;
 }
 
+function validateTranscriptRecords(records: unknown[]): void {
+	if (records.length === 0 || !isRecord(records[0]) || records[0].type !== "session")
+		throw new DeepInterviewCommandError(2, "live session transcript must begin with one session header");
+	const headers = records.filter(record => isRecord(record) && record.type === "session");
+	if (headers.length !== 1)
+		throw new DeepInterviewCommandError(2, "live session transcript has multiple session headers");
+	const header = records[0] as Record<string, unknown>;
+	if (typeof header.id !== "string" || header.id.trim() === "" || typeof header.cwd !== "string")
+		throw new DeepInterviewCommandError(2, "live session transcript header is malformed");
+	const version = header.version === undefined ? 1 : header.version;
+	if (typeof version !== "number" || !Number.isSafeInteger(version) || version < 1)
+		throw new DeepInterviewCommandError(2, "live session transcript header is malformed");
+	const body = records.slice(1).filter((record): record is Record<string, unknown> => isRecord(record));
+	if (body.length !== records.length - 1)
+		throw new DeepInterviewCommandError(2, "live session transcript contains a malformed entry");
+	const entries = body.filter(record => record.type !== "header_patch" && record.type !== "entry_patch");
+	const hasBranchMetadata = entries.some(entry => "id" in entry || "parentId" in entry);
+	if (version >= 2 || hasBranchMetadata) {
+		const ids = new Set<string>();
+		for (const entry of entries) {
+			const id = entry.id;
+			const parentId = entry.parentId;
+			if (
+				typeof entry.type !== "string" ||
+				typeof id !== "string" ||
+				id.trim() === "" ||
+				!("parentId" in entry) ||
+				(parentId !== null && typeof parentId !== "string")
+			)
+				throw new DeepInterviewCommandError(2, "live session transcript branch metadata is malformed");
+			if (ids.has(id))
+				throw new DeepInterviewCommandError(2, "live session transcript branch contains duplicate IDs");
+			ids.add(id);
+		}
+		for (const entry of entries) {
+			const parentId = entry.parentId;
+			if (parentId !== null && !ids.has(parentId as string))
+				throw new DeepInterviewCommandError(2, "live session transcript branch has a missing parent");
+		}
+	}
+	for (const record of body) {
+		if (record.type === "header_patch") {
+			if (!isRecord(record.patch) || !Object.keys(record).every(key => key === "type" || key === "patch"))
+				throw new DeepInterviewCommandError(2, "live session transcript contains malformed branch metadata");
+		}
+		if (record.type === "entry_patch") {
+			if (
+				typeof record.entryId !== "string" ||
+				!isRecord(record.patch) ||
+				!Object.keys(record).every(key => key === "type" || key === "entryId" || key === "patch")
+			)
+				throw new DeepInterviewCommandError(2, "live session transcript contains malformed branch metadata");
+		}
+	}
+}
+
 async function authoritativeConversationSnapshot(
 	cwd: string,
 	sessionId: string,
@@ -237,43 +506,55 @@ async function authoritativeConversationSnapshot(
 	revision: number;
 	messages: Array<{ index: number; role: string; content: string }>;
 }> {
+	const canonicalCandidates = new Set<string>();
+	const lexicalCandidates = new Set(listProjectSessionTranscriptFiles(cwd).map(candidate => path.resolve(candidate)));
+	const managedScope = await resolveManagedSessionScope({ cwd });
+	if (managedScope.kind === "error")
+		throw new DeepInterviewCommandError(2, "managed session transcript scope is unavailable");
+	if (managedScope.kind === "resolved") {
+		const managedListing = await listManagedSessionCandidates({ scope: managedScope.scope });
+		if (managedListing.kind === "error")
+			throw new DeepInterviewCommandError(2, "managed session transcript listing is unavailable");
+		for (const candidate of managedListing.owned) lexicalCandidates.add(path.resolve(candidate.path));
+	}
+	if (lexicalCandidates.size > 1000)
+		throw new DeepInterviewCommandError(2, "session transcript discovery exceeded the bounded candidate limit");
+	for (const candidate of [...lexicalCandidates].sort()) {
+		try {
+			const stat = await fs.lstat(candidate);
+			if (!stat.isFile() || stat.isSymbolicLink()) continue;
+			const realPath = await fs.realpath(candidate);
+			if (realPath !== candidate) continue;
+			canonicalCandidates.add(realPath);
+		} catch {}
+	}
 	let sessionFile = process.env.GJC_SESSION_FILE?.trim();
 	// The native command accepts an explicit workspace cwd, which may differ from
 	// process.cwd(). Resolve relative managed transcript paths against that same
 	// workspace so transcript identity and content cannot drift with process launch location.
-	if (sessionFile) sessionFile = path.resolve(cwd, sessionFile);
-	if (!sessionFile) {
-		const candidates = [...listProjectSessionTranscriptFiles(cwd)];
-		const pending = [getSessionsDir()];
-		const visitedDirectories = new Set<string>();
-		const maxDirectories = 4096;
-		let visitedEntries = 0;
-		const maxEntries = 100_000;
-		while (pending.length > 0 && candidates.length < 1000) {
-			const directory = pending.pop()!;
-			if (visitedDirectories.has(directory)) continue;
-			visitedDirectories.add(directory);
-			if (visitedDirectories.size > maxDirectories)
-				throw new DeepInterviewCommandError(2, "session transcript discovery exceeded the bounded directory limit");
-			let entries: Array<{ isDirectory(): boolean; isFile(): boolean; name: string }> = [];
-			try {
-				entries = await fs.readdir(directory, { withFileTypes: true });
-			} catch {
-				continue;
-			}
-			visitedEntries += entries.length;
-			if (visitedEntries > maxEntries)
-				throw new DeepInterviewCommandError(2, "session transcript discovery exceeded the bounded entry limit");
-			for (const entry of entries) {
-				const candidate = path.join(directory, entry.name);
-				if (entry.isDirectory()) pending.push(candidate);
-				else if (entry.isFile() && entry.name.endsWith(".jsonl")) candidates.push(candidate);
-				if (candidates.length >= 1000) break;
-			}
+	if (sessionFile) {
+		sessionFile = path.resolve(cwd, sessionFile);
+		let explicitRealPath: string;
+		try {
+			const explicitStat = await fs.lstat(sessionFile);
+			if (!explicitStat.isFile() || explicitStat.isSymbolicLink())
+				throw new Error("symlink or non-regular transcript");
+			explicitRealPath = await fs.realpath(sessionFile);
+			if (explicitRealPath !== sessionFile) throw new Error("symlink transcript");
+		} catch {
+			throw new DeepInterviewCommandError(2, "GJC_SESSION_FILE is not a managed canonical session transcript");
 		}
-		for (const candidate of candidates) {
+		if (!canonicalCandidates.has(explicitRealPath))
+			throw new DeepInterviewCommandError(2, "GJC_SESSION_FILE is not a managed canonical session transcript");
+		sessionFile = explicitRealPath;
+	} else {
+		for (const candidate of [...canonicalCandidates].sort()) {
 			try {
-				const header = JSON.parse((await fs.readFile(candidate, "utf-8")).split(/\r?\n/, 1)[0]) as Record<
+				const bytes = await readBoundedFileBytes(candidate, RESUME_TRANSCRIPT_MAX_BYTES, "session transcript", {
+					allowMissing: true,
+				});
+				if (!bytes) continue;
+				const header = JSON.parse(boundedUtf8(bytes, "session transcript").split(/\r?\n/, 1)[0]) as Record<
 					string,
 					unknown
 				>;
@@ -291,16 +572,23 @@ async function authoritativeConversationSnapshot(
 	if (!sessionFile)
 		throw new DeepInterviewCommandError(2, "an authenticated session transcript is required for crystallization");
 	try {
-		const transcriptStat = await fs.stat(sessionFile);
-		if (!transcriptStat.isFile() || transcriptStat.size > RESUME_TRANSCRIPT_MAX_BYTES)
-			throw new DeepInterviewCommandError(2, "live session transcript exceeds the bounded resume limit");
-		const text = await fs.readFile(sessionFile, "utf-8");
+		const bytes = await readBoundedFileBytes(sessionFile, RESUME_TRANSCRIPT_MAX_BYTES, "live session transcript");
+		if (!bytes) throw new DeepInterviewCommandError(2, "live session transcript is unavailable");
+		const text = boundedUtf8(bytes, "live session transcript");
+		const records: unknown[] = [];
 		for (const line of text.split(/\r?\n/)) {
 			if (!line.trim()) continue;
-			const parsed = JSON.parse(line);
+			let parsed: unknown;
+			try {
+				parsed = JSON.parse(line);
+			} catch {
+				throw new DeepInterviewCommandError(2, "live session transcript is malformed");
+			}
 			if (!parsed || typeof parsed !== "object" || Array.isArray(parsed))
 				throw new DeepInterviewCommandError(2, "live session transcript is malformed");
+			records.push(parsed);
 		}
+		validateTranscriptRecords(records);
 		const entries = parseSessionEntries(text);
 		const header = entries[0];
 		if (
@@ -355,6 +643,305 @@ async function authoritativeConversationSnapshot(
 	}
 }
 
+function parseCrystalMutationId(mutationId: string, sessionId: string): { specVersion: number } {
+	const prefix = `crystal:${sessionId}:`;
+	if (!mutationId.startsWith(prefix))
+		throw new DeepInterviewCommandError(2, "Crystal transaction journal identity mismatch");
+	const suffix = mutationId.slice(prefix.length);
+	const separator = suffix.indexOf(":");
+	if (
+		separator <= 0 ||
+		!/^\d+$/.test(suffix.slice(0, separator)) ||
+		!/^[a-f0-9]{64}$/.test(suffix.slice(separator + 1))
+	)
+		throw new DeepInterviewCommandError(2, "pending Crystal transaction journal is invalid");
+	const specVersion = Number(suffix.slice(0, separator));
+	if (!Number.isSafeInteger(specVersion) || specVersion < 1)
+		throw new DeepInterviewCommandError(2, "pending Crystal transaction journal is invalid");
+	return { specVersion };
+}
+
+function validateCrystalJournalRecord(
+	value: unknown,
+	cwd: string,
+	sessionId: string,
+	indexPath: string,
+	statePath: string,
+): CrystalJournalRecord {
+	if (!isRecord(value)) throw new DeepInterviewCommandError(2, "pending Crystal transaction journal is invalid");
+	if (value.version !== 1 || typeof value.mutation_id !== "string")
+		throw new DeepInterviewCommandError(2, "pending Crystal transaction journal is invalid");
+	parseCrystalMutationId(value.mutation_id, sessionId);
+	if (value.status !== "pending" && value.status !== "committed")
+		throw new DeepInterviewCommandError(2, "pending Crystal transaction journal is invalid");
+	if (
+		typeof value.created_at !== "string" ||
+		typeof value.updated_at !== "string" ||
+		!Array.isArray(value.paths) ||
+		value.paths.length !== 3 ||
+		!Array.isArray(value.steps) ||
+		value.steps.some(step => typeof step !== "string")
+	)
+		throw new DeepInterviewCommandError(2, "pending Crystal transaction journal is invalid");
+	const [specPath, journalIndexPath, journalStatePath] = value.paths;
+	if (
+		typeof specPath !== "string" ||
+		typeof journalIndexPath !== "string" ||
+		typeof journalStatePath !== "string" ||
+		path.resolve(journalIndexPath) !== path.resolve(indexPath) ||
+		path.resolve(journalStatePath) !== path.resolve(statePath)
+	)
+		throw new DeepInterviewCommandError(2, "pending Crystal transaction journal identity mismatch");
+	canonicalPublicationPath(cwd, sessionId, specPath);
+	const allowedSteps = new Set(["artifact", "index", "state"]);
+	const steps = value.steps as unknown[];
+	if (
+		new Set(steps).size !== steps.length ||
+		steps.some(step => !allowedSteps.has(step as string)) ||
+		(steps.includes("index") && !steps.includes("artifact")) ||
+		(steps.includes("state") && (!steps.includes("artifact") || !steps.includes("index")))
+	)
+		throw new DeepInterviewCommandError(2, "pending Crystal transaction journal steps are invalid");
+	if (
+		value.artifact_sha256 !== undefined &&
+		(typeof value.artifact_sha256 !== "string" || !/^[a-f0-9]{64}$/.test(value.artifact_sha256))
+	)
+		throw new DeepInterviewCommandError(2, "pending Crystal transaction journal hash is invalid");
+	return value as unknown as CrystalJournalRecord;
+}
+
+async function readCrystalJournal(
+	cwd: string,
+	sessionId: string,
+	mutationId: string,
+	indexPath: string,
+	statePath: string,
+): Promise<CrystalJournalRecord | undefined> {
+	const journalPath = transactionJournalPath(cwd, sessionId, mutationId);
+	const bytes = await readBoundedFileBytes(journalPath, CRYSTAL_MAX_JOURNAL_BYTES, "Crystal transaction journal", {
+		allowMissing: true,
+	});
+	if (!bytes) return undefined;
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(boundedUtf8(bytes, "Crystal transaction journal"));
+	} catch {
+		throw new DeepInterviewCommandError(2, "pending Crystal transaction journal is corrupt");
+	}
+	return validateCrystalJournalRecord(parsed, cwd, sessionId, indexPath, statePath);
+}
+
+async function verifyPriorPendingCrystalJournals(options: {
+	cwd: string;
+	sessionId: string;
+	indexPath: string;
+	statePath: string;
+	existing: Record<string, unknown>;
+	currentMutationId?: string;
+}): Promise<CrystalJournalRecord | undefined> {
+	const transactionsDir = path.dirname(transactionJournalPath(options.cwd, options.sessionId, "scan"));
+	let names: string[];
+	try {
+		names = (await fs.readdir(transactionsDir)).filter(name => name.endsWith(".json")).sort();
+	} catch (error) {
+		if (isErrnoCode(error, "ENOENT")) return undefined;
+		throw new DeepInterviewCommandError(2, "Crystal transaction journal discovery failed");
+	}
+	if (names.length > 128)
+		throw new DeepInterviewCommandError(2, "Crystal transaction journal discovery exceeded the bounded limit");
+	const catalog = await readCrystalIndexCatalog(options.cwd, options.sessionId, options.indexPath);
+	let current: CrystalJournalRecord | undefined;
+	for (const name of names) {
+		const journalPath = path.join(transactionsDir, name);
+		const bytes = await readBoundedFileBytes(journalPath, CRYSTAL_MAX_JOURNAL_BYTES, "Crystal transaction journal");
+		if (!bytes) continue;
+		let parsed: unknown;
+		try {
+			parsed = JSON.parse(boundedUtf8(bytes, "Crystal transaction journal"));
+		} catch {
+			throw new DeepInterviewCommandError(2, "pending Crystal transaction journal is corrupt");
+		}
+		if (!isRecord(parsed) || typeof parsed.mutation_id !== "string")
+			throw new DeepInterviewCommandError(2, "pending Crystal transaction journal is invalid");
+		if (!parsed.mutation_id.startsWith(`crystal:${options.sessionId}:`)) continue;
+		const journal = validateCrystalJournalRecord(
+			parsed,
+			options.cwd,
+			options.sessionId,
+			options.indexPath,
+			options.statePath,
+		);
+		if (journal.status !== "pending") continue;
+		if (journal.mutation_id === options.currentMutationId) {
+			current = journal;
+			continue;
+		}
+		const specPath = journal.paths[0]!;
+		const canonicalSpecPath = canonicalPublicationPath(options.cwd, options.sessionId, specPath);
+		const rows = indexRowsForPath(catalog, canonicalSpecPath);
+		let expectedHash = typeof journal.artifact_sha256 === "string" ? journal.artifact_sha256 : undefined;
+		for (const row of rows) {
+			if (expectedHash && expectedHash !== row.sha256)
+				throw new DeepInterviewCommandError(2, "pending Crystal transaction hash mismatch");
+			expectedHash = row.sha256;
+		}
+		const existingSpecPath = typeof options.existing.spec_path === "string" ? options.existing.spec_path : undefined;
+		const existingSpecHash =
+			typeof options.existing.spec_sha256 === "string" ? options.existing.spec_sha256 : undefined;
+		if (existingSpecPath && path.resolve(existingSpecPath) === canonicalSpecPath) {
+			if (expectedHash && existingSpecHash && expectedHash !== existingSpecHash)
+				throw new DeepInterviewCommandError(2, "pending Crystal transaction hash mismatch");
+			expectedHash = existingSpecHash ?? expectedHash;
+		}
+		if (!expectedHash) throw new DeepInterviewCommandError(2, "pending Crystal transaction cannot be authenticated");
+		const artifact = await readBoundedFileBytes(
+			canonicalSpecPath,
+			CRYSTAL_MAX_ARTIFACT_BYTES,
+			"pending Crystal artifact",
+		);
+		if (!artifact || createHash("sha256").update(artifact).digest("hex") !== expectedHash)
+			throw new DeepInterviewCommandError(2, "pending Crystal artifact verification failed");
+		if (!rows.some(row => row.sha256 === expectedHash))
+			throw new DeepInterviewCommandError(2, "pending Crystal index verification failed");
+		if (
+			!existingSpecPath ||
+			!existingSpecHash ||
+			path.resolve(existingSpecPath) !== canonicalSpecPath ||
+			existingSpecHash !== expectedHash
+		)
+			throw new DeepInterviewCommandError(2, "pending Crystal state verification failed");
+		await completeWorkflowTransactionJournal(options.cwd, options.sessionId, journal.mutation_id);
+	}
+	return current;
+}
+
+const CRYSTAL_ROLES = new Set(["user", "assistant", "system", "tool", "toolResult", "developer"]);
+const CRYSTAL_LIFECYCLES = new Set(["ready", "needs-questions", "stale", "superseded"]);
+const CRYSTAL_DELTA_KINDS = new Set(["none", "additive", "intent-changed", "goal-replaced", "stale"]);
+const CRYSTAL_ITEM_KINDS = new Set(["goal", "constraint", "decision", "acceptance_criterion", "non_goal"]);
+const CRYSTAL_CLASSIFICATIONS = new Set(["confirmed", "inferred", "disputed"]);
+
+function parseCrystalSnapshot(value: unknown, label: string): CrystalSnapshot {
+	if (!isRecord(value)) throw new DeepInterviewCommandError(2, `${label} is malformed`);
+	const revision = value.revision;
+	const start = value.start;
+	const end = value.end;
+	if (
+		typeof revision !== "number" ||
+		!Number.isSafeInteger(revision) ||
+		typeof start !== "number" ||
+		!Number.isSafeInteger(start) ||
+		typeof end !== "number" ||
+		!Number.isSafeInteger(end) ||
+		start < 0 ||
+		end < start ||
+		!Array.isArray(value.messages) ||
+		value.messages.length !== end - start + 1 ||
+		value.messages.length > CRYSTAL_MAX_MESSAGES
+	)
+		throw new DeepInterviewCommandError(2, `${label} is malformed`);
+	const messages = value.messages.map((entry, index) => {
+		if (!isRecord(entry)) throw new DeepInterviewCommandError(2, `${label} contains a malformed message`);
+		const messageIndex = entry.index;
+		const role = entry.role;
+		const content = entry.content;
+		if (
+			typeof messageIndex !== "number" ||
+			!Number.isSafeInteger(messageIndex) ||
+			messageIndex !== start + index ||
+			typeof role !== "string" ||
+			!CRYSTAL_ROLES.has(role) ||
+			typeof content !== "string"
+		)
+			throw new DeepInterviewCommandError(2, `${label} contains a malformed message`);
+		return { index: messageIndex, role: role as CrystalSnapshot["messages"][number]["role"], content };
+	});
+	if (typeof value.digest !== "string" || !/^[a-f0-9]{64}$/.test(value.digest))
+		throw new DeepInterviewCommandError(2, `${label} digest is invalid`);
+	const snapshot = { revision, start, end, digest: value.digest, messages } as CrystalSnapshot;
+	if (crystalSnapshotDigest(snapshot) !== snapshot.digest)
+		throw new DeepInterviewCommandError(2, `${label} digest mismatch`);
+	return snapshot;
+}
+
+function parseStoredCrystal(value: unknown): DeepInterviewCrystal {
+	if (!isRecord(value) || value.schema_version !== 1 || !Number.isSafeInteger(value.spec_version))
+		throw new DeepInterviewCommandError(2, "stored Crystal is invalid");
+	if (
+		(value.spec_version as number) < 1 ||
+		typeof value.lifecycle !== "string" ||
+		!CRYSTAL_LIFECYCLES.has(value.lifecycle)
+	)
+		throw new DeepInterviewCommandError(2, "stored Crystal is invalid");
+	if (value.execution_approval !== "not-approved")
+		throw new DeepInterviewCommandError(2, "stored Crystal execution approval is invalid");
+	parseCrystalSnapshot(value.source, "stored Crystal source");
+	if (!Array.isArray(value.items) || value.items.length === 0 || value.items.length > 128)
+		throw new DeepInterviewCommandError(2, "stored Crystal items are invalid");
+	const ids = new Set<string>();
+	for (const item of value.items) {
+		if (
+			!isRecord(item) ||
+			typeof item.id !== "string" ||
+			item.id.trim() === "" ||
+			ids.has(item.id) ||
+			typeof item.kind !== "string" ||
+			!CRYSTAL_ITEM_KINDS.has(item.kind) ||
+			typeof item.classification !== "string" ||
+			!CRYSTAL_CLASSIFICATIONS.has(item.classification) ||
+			typeof item.statement !== "string" ||
+			item.statement.trim() === ""
+		)
+			throw new DeepInterviewCommandError(2, "stored Crystal items are invalid");
+		if (item.classification === "confirmed") {
+			if (
+				!isRecord(item.anchor) ||
+				!Number.isSafeInteger(item.anchor.message_index) ||
+				typeof item.anchor.quote !== "string"
+			)
+				throw new DeepInterviewCommandError(2, "stored Crystal confirmed item anchor is invalid");
+		}
+		ids.add(item.id);
+	}
+	if (!isRecord(value.delta) || typeof value.delta.kind !== "string" || !CRYSTAL_DELTA_KINDS.has(value.delta.kind))
+		throw new DeepInterviewCommandError(2, "stored Crystal delta is invalid");
+	if (
+		!Array.isArray(value.delta.changed_ids) ||
+		!Array.isArray(value.delta.added_ids) ||
+		!Array.isArray(value.delta.preserved_ids) ||
+		typeof value.delta.approval_invalidated !== "boolean" ||
+		[...value.delta.changed_ids, ...value.delta.added_ids, ...value.delta.preserved_ids].some(
+			id => typeof id !== "string",
+		)
+	)
+		throw new DeepInterviewCommandError(2, "stored Crystal delta is invalid");
+	for (const field of ["open_gaps", "conflicts"] as const) {
+		if (!Array.isArray(value[field]) || value[field].some(item => typeof item !== "string"))
+			throw new DeepInterviewCommandError(2, "stored Crystal resolution fields are invalid");
+	}
+	for (const field of ["removed_ids", "pending_removals"] as const) {
+		if (
+			value[field] !== undefined &&
+			(!Array.isArray(value[field]) || value[field].some(item => typeof item !== "string"))
+		)
+			throw new DeepInterviewCommandError(2, "stored Crystal removal fields are invalid");
+	}
+	return value as unknown as DeepInterviewCrystal;
+}
+
+function verifyCrystalSourceAgainstLive(
+	crystal: DeepInterviewCrystal,
+	liveSnapshot: { revision: number; messages: Array<{ index: number; role: string; content: string }> },
+): CrystalSnapshot {
+	const source = parseCrystalSnapshot(crystal.source, "stored Crystal source");
+	if (source.end >= liveSnapshot.messages.length)
+		throw new DeepInterviewCommandError(2, "stored Crystal source is outside the live transcript");
+	const expected = liveSnapshot.messages.slice(source.start, source.end + 1);
+	if (JSON.stringify(expected) !== JSON.stringify(source.messages))
+		throw new DeepInterviewCommandError(2, "stored Crystal source evidence does not match the live transcript");
+	return source;
+}
+
 async function handleCrystallize(args: readonly string[], cwd: string): Promise<DeepInterviewCommandResult> {
 	assertCrystallizeArgs(args);
 	const input = await readCrystallizeInput(flagValue(args, "--input"), cwd);
@@ -388,6 +975,8 @@ function assertCrystallizeArgs(args: readonly string[]): void {
 		throw new DeepInterviewCommandError(2, `unsupported crystallize argument: ${arg}`);
 	}
 	if (valueExpected) throw new DeepInterviewCommandError(2, "crystallize option requires a value");
+	const slug = flagValue(args, "--slug")?.trim();
+	if (!slug) throw new DeepInterviewCommandError(2, "--slug is required for deep-interview --crystallize");
 }
 
 async function handleCrystallizeUnlocked(
@@ -409,7 +998,18 @@ async function handleCrystallizeUnlocked(
 			: normalizeDeepInterviewEnvelope({});
 	if (existingRead.kind === "valid" && existing.active === false)
 		throw new DeepInterviewCommandError(2, "cannot crystallize an inactive deep-interview state");
-	const storedPrior = (existing.state as Record<string, unknown> | undefined)?.crystal;
+	const existingInner = isRecord(existing.state) ? existing.state : {};
+	const storedPrior = existingInner.crystal;
+	const priorCrystal = storedPrior === undefined ? undefined : parseStoredCrystal(storedPrior);
+	if (existingRead.kind === "valid" && priorCrystal) {
+		try {
+			const integrity = await detectWorkflowEnvelopeIntegrityMismatch(statePath);
+			if (integrity) throw new DeepInterviewCommandError(2, "stored Crystal state integrity verification failed");
+		} catch (error) {
+			if (error instanceof DeepInterviewCommandError) throw error;
+			throw new DeepInterviewCommandError(2, "stored Crystal state integrity verification failed");
+		}
+	}
 	if (input.prior !== undefined && storedPrior === undefined)
 		throw new DeepInterviewCommandError(2, "supplied prior crystal requires canonical stored crystal provenance");
 	if (
@@ -421,105 +1021,70 @@ async function handleCrystallizeUnlocked(
 	const liveSnapshot = await authoritativeConversationSnapshot(cwd, sessionId);
 	if (liveSnapshot.revision !== input.current_revision)
 		throw new DeepInterviewCommandError(2, "conversation snapshot is stale against the live session transcript");
-	const rawSnapshot = input.snapshot;
-	if (
-		!rawSnapshot ||
-		typeof rawSnapshot !== "object" ||
-		Array.isArray(rawSnapshot) ||
-		!Array.isArray((rawSnapshot as Record<string, unknown>).messages)
-	)
-		throw new DeepInterviewCommandError(2, "crystallize snapshot is required");
-	const snapshot = rawSnapshot as CrystalSnapshot;
+	const snapshot = parseCrystalSnapshot(input.snapshot, "crystallize snapshot");
+	if (snapshot.revision !== input.current_revision)
+		throw new DeepInterviewCommandError(2, "conversation snapshot is stale");
 	if (snapshot.end !== liveSnapshot.messages.length - 1)
 		throw new DeepInterviewCommandError(2, "crystallize snapshot must cover the live transcript tail");
 	const expectedMessages = liveSnapshot.messages.slice(snapshot.start, snapshot.end + 1);
-	const suppliedMessages = snapshot.messages.map((message, index) => ({
-		index: snapshot.start + index,
-		role: message.role,
-		content: message.content.normalize("NFC").trim(),
-	}));
-	if (JSON.stringify(expectedMessages) !== JSON.stringify(suppliedMessages))
+	if (JSON.stringify(expectedMessages) !== JSON.stringify(snapshot.messages))
 		throw new DeepInterviewCommandError(2, "conversation snapshot does not match the live session transcript");
 	const existingSpecPath = typeof existing.spec_path === "string" ? existing.spec_path : undefined;
 	const existingSpecHash = typeof existing.spec_sha256 === "string" ? existing.spec_sha256 : undefined;
 	const indexPath = path.join(sessionSpecsDir(cwd, sessionId), "deep-interview-index.jsonl");
-	const priorRecord = isRecord(storedPrior) ? storedPrior : undefined;
-	const priorSource = priorRecord && isRecord(priorRecord.source) ? priorRecord.source : undefined;
-	const priorStart = priorSource && typeof priorSource.start === "number" ? priorSource.start : undefined;
-	const priorEnd = priorSource && typeof priorSource.end === "number" ? priorSource.end : undefined;
-	const priorRevision = priorSource && typeof priorSource.revision === "number" ? priorSource.revision : undefined;
-	const priorDigest = priorSource && typeof priorSource.digest === "string" ? priorSource.digest : undefined;
-	const priorSpecVersion =
-		priorRecord && typeof priorRecord.spec_version === "number" ? priorRecord.spec_version : undefined;
+	const priorSource = priorCrystal ? verifyCrystalSourceAgainstLive(priorCrystal, liveSnapshot) : undefined;
+	if ((existingSpecPath && !existingSpecHash) || (!existingSpecPath && existingSpecHash))
+		throw new DeepInterviewCommandError(2, "existing Crystal publication identity is incomplete");
+	if (existingSpecPath && existingSpecHash)
+		await verifyPublishedArtifactIndex({
+			cwd,
+			sessionId,
+			indexPath,
+			specPath: existingSpecPath,
+			specHash: existingSpecHash,
+			crystal: priorCrystal?.lifecycle === "ready" ? priorCrystal : undefined,
+		});
 	if (
+		priorCrystal &&
 		priorSource &&
-		priorStart !== undefined &&
-		priorEnd !== undefined &&
-		priorRevision !== undefined &&
-		priorDigest &&
-		Array.isArray(priorSource.messages)
+		priorSource.revision === snapshot.revision &&
+		priorSource.digest === snapshot.digest
 	) {
-		const priorMessages = priorSource.messages as CrystalSnapshot["messages"];
-		const livePriorMessages = liveSnapshot.messages.slice(priorStart, priorEnd + 1);
 		if (
-			priorStart < 0 ||
-			priorEnd < priorStart ||
-			priorEnd >= liveSnapshot.messages.length ||
-			JSON.stringify(priorMessages) !== JSON.stringify(livePriorMessages) ||
-			crystalSnapshotDigest({
-				revision: priorRevision,
-				start: priorStart,
-				end: priorEnd,
-				messages: priorMessages,
-			}) !== priorDigest
+			priorSource.start !== snapshot.start ||
+			priorSource.end !== snapshot.end ||
+			JSON.stringify(priorSource.messages) !== JSON.stringify(snapshot.messages)
 		)
-			throw new DeepInterviewCommandError(2, "prior Crystal source evidence does not match the live transcript");
-	}
-	if (
-		priorSource &&
-		priorRevision === snapshot.revision &&
-		priorDigest === snapshot.digest &&
-		priorRecord &&
-		priorSpecVersion !== undefined &&
-		existingSpecPath &&
-		existingSpecHash
-	) {
-		const specName = path.basename(existingSpecPath);
-		const specMatch = /^deep-interview-(.+)-v[0-9]+\.md$/.exec(specName);
-		const recoverySlug = specMatch?.[1];
-		if (!recoverySlug) throw new DeepInterviewCommandError(2, "canonical Crystal publication identity is invalid");
-		const recoveryMutationId = `crystal:${sessionId}:${priorSpecVersion}:${createHash("sha256").update(`${recoverySlug}\0${existingSpecPath}`).digest("hex")}`;
-		const pending = await readWorkflowTransactionJournal(cwd, sessionId, recoveryMutationId);
-		if (
-			pending &&
-			pending.status === "pending" &&
-			JSON.stringify(pending.paths) === JSON.stringify([existingSpecPath, indexPath, statePath]) &&
-			pending.steps.includes("artifact") &&
-			pending.steps.includes("index")
-		) {
-			let artifactValid = false;
-			try {
-				const artifact = await fs.readFile(existingSpecPath, "utf8");
-				artifactValid = createHash("sha256").update(artifact).digest("hex") === existingSpecHash;
-			} catch {
-				artifactValid = false;
+			throw new DeepInterviewCommandError(2, "stored Crystal source evidence does not match the replay snapshot");
+		if (priorCrystal.lifecycle === "ready") {
+			if (!existingSpecPath || !existingSpecHash)
+				throw new DeepInterviewCommandError(2, "stored Crystal publication identity is incomplete");
+			const requestedSlug = flagValue(args, "--slug")!.trim();
+			const expectedName = path.basename(existingSpecPath);
+			const match = /^deep-interview-(.+)-v[0-9]+\.md$/.exec(expectedName);
+			if (!match || match[1] !== requestedSlug)
+				throw new DeepInterviewCommandError(2, "conversation snapshot was already crystallized under another slug");
+			const mutationId = `crystal:${sessionId}:${priorCrystal.spec_version}:${createHash("sha256")
+				.update(`${requestedSlug}\0${path.resolve(existingSpecPath)}`)
+				.digest("hex")}`;
+			const pending = await verifyPriorPendingCrystalJournals({
+				cwd,
+				sessionId,
+				indexPath,
+				statePath,
+				existing,
+				currentMutationId: mutationId,
+			});
+			if (pending) {
+				if (
+					pending.paths.some(
+						(value, index) =>
+							path.resolve(value) !== path.resolve([existingSpecPath, indexPath, statePath][index]!),
+					)
+				)
+					throw new DeepInterviewCommandError(2, "Crystal promotion journal identity mismatch");
+				await completeWorkflowTransactionJournal(cwd, sessionId, mutationId);
 			}
-			if (!artifactValid) throw new DeepInterviewCommandError(2, "pending Crystal artifact verification failed");
-			let indexValid = false;
-			try {
-				const index = await fs.readFile(indexPath, "utf8");
-				indexValid = index.split(/\r?\n/).some(line => {
-					try {
-						const entry = JSON.parse(line) as Record<string, unknown>;
-						return entry.path === existingSpecPath && entry.sha256 === existingSpecHash;
-					} catch {
-						return false;
-					}
-				});
-			} catch {
-				indexValid = false;
-			}
-			if (!indexValid) throw new DeepInterviewCommandError(2, "pending Crystal index verification failed");
 			await syncDeepInterviewHud({
 				cwd,
 				sessionId,
@@ -528,16 +1093,32 @@ async function handleCrystallizeUnlocked(
 				specStatus: "persisted",
 			});
 			await writeSessionActivityMarker(cwd, sessionId, { writer: "deep-interview-runtime", path: statePath });
-			await completeWorkflowTransactionJournal(cwd, sessionId, recoveryMutationId);
+			const summary = {
+				skill: "deep-interview",
+				mode: "crystallize",
+				crystal: priorCrystal,
+				spec_path: existingSpecPath,
+				state_path: statePath,
+			};
 			return {
 				status: 0,
-				stdout: `${JSON.stringify({ skill: "deep-interview", mode: "crystallize", crystal: priorRecord, spec_path: existingSpecPath, state_path: statePath })}\n`,
+				stdout: hasFlag(args, "--json")
+					? `${JSON.stringify(summary)}\n`
+					: `Crystal v${priorCrystal.spec_version} created\nReadiness: ${priorCrystal.lifecycle}\nExecution approval: none\nspec_path=${existingSpecPath}\n`,
 			};
 		}
+		throw new DeepInterviewCommandError(2, "conversation snapshot was already crystallized");
+	}
+	if (priorSource && snapshot.revision <= priorSource.revision)
+		throw new DeepInterviewCommandError(2, "conversation snapshot is stale against the stored Crystal");
+	if (!priorCrystal) {
+		const canonicalStart = Math.max(0, liveSnapshot.messages.length - CRYSTAL_MAX_MESSAGES);
+		if (snapshot.start !== canonicalStart)
+			throw new DeepInterviewCommandError(2, "first Crystal must cover the canonical bounded transcript window");
 	}
 	const payload = { ...input, prior: storedPrior };
 	const crystal = crystallizeDeepInterview(payload);
-	const slug = flagValue(args, "--slug")?.trim() || `crystal-v${crystal.spec_version}`;
+	const slug = flagValue(args, "--slug")!.trim();
 	assertSafePathComponent(slug, "slug");
 	const specPath =
 		crystal.lifecycle === "ready"
@@ -552,40 +1133,53 @@ async function handleCrystallizeUnlocked(
 		specPath && specHash
 			? `crystal:${sessionId}:${crystal.spec_version}:${createHash("sha256").update(`${slug}\0${specPath}`).digest("hex")}`
 			: undefined;
-	if (mutationId) {
-		const existingJournal = await readWorkflowTransactionJournal(cwd, sessionId, mutationId);
-		if (existingJournal && JSON.stringify(existingJournal.paths) !== JSON.stringify([specPath, indexPath, statePath]))
-			throw new DeepInterviewCommandError(2, "Crystal promotion journal identity mismatch");
-	}
-	if (specPath && specContent)
+	const currentJournal = await verifyPriorPendingCrystalJournals({
+		cwd,
+		sessionId,
+		indexPath,
+		statePath,
+		existing,
+		currentMutationId: mutationId,
+	});
+	const indexCatalog = await readCrystalIndexCatalog(cwd, sessionId, indexPath);
+	if (specPath && specContent && mutationId) {
 		await beginWorkflowTransactionJournal({
 			cwd,
 			sessionId,
 			mutationId: mutationId!,
 			paths: [specPath, indexPath, statePath],
 		});
-	if (specPath && specContent)
-		await writeArtifact(specPath, specContent, {
-			cwd,
-			audit: { category: "artifact", verb: "write", owner: "gjc-runtime", skill: "deep-interview", sessionId },
+		const journal = currentJournal ?? (await readCrystalJournal(cwd, sessionId, mutationId, indexPath, statePath));
+		if (journal && journal.status !== "pending")
+			throw new DeepInterviewCommandError(2, "Crystal promotion journal is already committed");
+		if (journal && path.resolve(journal.paths[0]!) !== path.resolve(specPath))
+			throw new DeepInterviewCommandError(2, "Crystal promotion journal identity mismatch");
+		if (journal?.artifact_sha256 !== undefined && journal.artifact_sha256 !== specHash)
+			throw new DeepInterviewCommandError(2, "Crystal promotion journal hash mismatch");
+		let artifactReady = false;
+		const existingArtifact = await readBoundedFileBytes(specPath, CRYSTAL_MAX_ARTIFACT_BYTES, "Crystal artifact", {
+			allowMissing: true,
 		});
-	if (specPath && specContent)
-		await updateWorkflowTransactionJournal(cwd, sessionId, mutationId!, { steps: ["artifact"] });
-	let indexAlreadyContains = false;
-	if (specPath && specContent) {
-		try {
-			const index = await fs.readFile(indexPath, "utf8");
-			indexAlreadyContains = index.split(/\r?\n/).some(line => {
-				try {
-					const entry = JSON.parse(line) as Record<string, unknown>;
-					return entry.path === specPath && entry.sha256 === specHash;
-				} catch {
-					return false;
-				}
-			});
-		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+		if (existingArtifact) {
+			if (createHash("sha256").update(existingArtifact).digest("hex") !== specHash)
+				throw new DeepInterviewCommandError(2, "existing Crystal artifact conflicts with the requested promotion");
+			artifactReady = true;
+		} else if (journal?.steps.includes("artifact")) {
+			throw new DeepInterviewCommandError(2, "pending Crystal artifact verification failed");
 		}
+		if (!artifactReady)
+			await writeArtifact(specPath, specContent, {
+				cwd,
+				audit: { category: "artifact", verb: "write", owner: "gjc-runtime", skill: "deep-interview", sessionId },
+			});
+		if (journal || mutationId)
+			await updateWorkflowTransactionJournal(cwd, sessionId, mutationId, {
+				steps: ["artifact"],
+				artifact_sha256: specHash,
+			} as Partial<WorkflowTransactionJournal>);
+		const indexAlreadyContains = indexRowsForPath(indexCatalog, specPath).some(row => row.sha256 === specHash);
+		if (journal?.steps.includes("index") && !indexAlreadyContains)
+			throw new DeepInterviewCommandError(2, "pending Crystal index verification failed");
 		if (!indexAlreadyContains)
 			await appendJsonl(
 				indexPath,
@@ -595,10 +1189,12 @@ async function handleCrystallizeUnlocked(
 					audit: { category: "ledger", verb: "append", owner: "gjc-runtime", skill: "deep-interview", sessionId },
 				},
 			);
+		await updateWorkflowTransactionJournal(cwd, sessionId, mutationId, {
+			steps: ["artifact", "index"],
+			artifact_sha256: specHash,
+		} as Partial<WorkflowTransactionJournal>);
 	}
-	if (specPath && specContent)
-		await updateWorkflowTransactionJournal(cwd, sessionId, mutationId!, { steps: ["artifact", "index"] });
-	const state: Record<string, unknown> = { ...(existing.state ?? {}), crystal, execution_approval: "not-approved" };
+	const state: Record<string, unknown> = { ...existingInner, crystal, execution_approval: "not-approved" };
 	delete state.execution_approval_receipt;
 	const envelope = {
 		...existing,
@@ -639,8 +1235,11 @@ async function handleCrystallizeUnlocked(
 		},
 		audit: { category: "state", verb: "write", owner: "gjc-runtime", skill: "deep-interview", sessionId },
 	});
-	if (specPath && specContent)
-		await updateWorkflowTransactionJournal(cwd, sessionId, mutationId!, { steps: ["artifact", "index", "state"] });
+	if (specPath && specContent && mutationId)
+		await updateWorkflowTransactionJournal(cwd, sessionId, mutationId, {
+			steps: ["artifact", "index", "state"],
+			artifact_sha256: specHash,
+		} as Partial<WorkflowTransactionJournal>);
 	await writeSessionActivityMarker(cwd, sessionId, { writer: "deep-interview-runtime", path: statePath });
 	await syncDeepInterviewHud({
 		cwd,
@@ -649,7 +1248,7 @@ async function handleCrystallizeUnlocked(
 		phase: envelope.current_phase,
 		specStatus: specPath ? "persisted" : "not_persisted",
 	});
-	if (specPath && specContent) await completeWorkflowTransactionJournal(cwd, sessionId, mutationId!);
+	if (specPath && specContent && mutationId) await completeWorkflowTransactionJournal(cwd, sessionId, mutationId);
 	const summary = {
 		skill: "deep-interview",
 		mode: "crystallize",

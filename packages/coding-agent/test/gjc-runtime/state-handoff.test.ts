@@ -15,10 +15,12 @@ import {
 } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-state";
 import {
 	activeSnapshotPath,
+	auditPath,
 	modeStatePath,
 	sessionSpecsDir,
 	sessionStateDir,
 } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
+import { migrateAndPersistLegacyState } from "../../src/gjc-runtime/state-migrations";
 import {
 	reconcileWorkflowSkillState,
 	runNativeStateCommand,
@@ -1209,7 +1211,7 @@ describe("gjc state handoff", () => {
 		});
 	});
 
-	it("preserves D->R->U lineage while stripping owner_generation from successor and active-state records", async () => {
+	it("rejects unapproved D->R->U execution laundering while preserving lineage", async () => {
 		await withTempCwd(async cwd => {
 			const stateDir = sessionStateDir(cwd, TEST_SESSION_ID);
 			await writeJson(path.join(stateDir, "deep-interview-state.json"), {
@@ -1248,31 +1250,28 @@ describe("gjc state handoff", () => {
 				["handoff", "--mode", "ralplan", "--to", "ultragoal", "--json", "--force"],
 				cwd,
 			);
-			expect(step2.status).toBe(0);
+			expect(step2.status).toBe(2);
+			expect(step2.stderr).toContain("cannot authenticate Deep Interview approval lineage");
+			await expect(fs.access(modeStatePath(cwd, TEST_SESSION_ID, "ultragoal"))).rejects.toThrow();
 
-			// Assert all three lineage records are present in active_skills.
+			// The failed execution attempt must leave the already-persisted D -> R
+			// lineage untouched and must not promote a new Ultragoal state.
 			const activeState = (await readJson(path.join(stateDir, "skill-active-state.json"))) as {
 				active_skills?: Array<Record<string, unknown>>;
 			};
 			const skills = activeState?.active_skills ?? [];
 			const di = skills.find(e => e.skill === "deep-interview");
 			const rp = skills.find(e => e.skill === "ralplan");
-			const ug = skills.find(e => e.skill === "ultragoal");
 			expect(di?.active).toBe(false);
 			expect(di?.handoff_to).toBe("ralplan");
-			expect(rp?.active).toBe(false);
-			expect(rp?.handoff_to).toBe("ultragoal");
+			expect(rp?.active).toBe(true);
 			expect(rp?.handoff_from).toBe("deep-interview");
-			expect(ug?.active).toBe(true);
-			expect(ug?.handoff_from).toBe("ralplan");
-			for (const entry of [di, rp, ug]) expect(entry?.owner_generation).toBeUndefined();
+			for (const entry of [di, rp]) expect(entry?.owner_generation).toBeUndefined();
 			const demotedDeepInterview = await readJson(path.join(stateDir, "deep-interview-state.json"));
 			const successorRalplan = await readJson(path.join(stateDir, "ralplan-state.json"));
-			const finalUltragoal = await readJson(path.join(stateDir, "ultragoal-state.json"));
 			expect(demotedDeepInterview?.owner_generation).toBe("deep-interview-generation");
 			expect(successorRalplan?.owner_generation).toBeUndefined();
-			expect(finalUltragoal?.owner_generation).toBeUndefined();
-			expect(finalUltragoal?.handoff_from).toBe("ralplan");
+			expect(successorRalplan?.active).toBe(true);
 		});
 	});
 	it("defaults session-id from GJC_SESSION_ID env var when no --session-id flag is passed", async () => {
@@ -1357,6 +1356,197 @@ describe("gjc state handoff", () => {
 			} finally {
 				restoreSessionId(prior);
 			}
+		});
+	});
+
+	it("rejects a restamped approved Crystal without the sanctioned approval audit record", async () => {
+		await withTempCwd(async cwd => {
+			const { callerPath } = await writePublishedReadyCrystal(cwd);
+			const forged = (await readJson(callerPath)) as Record<string, unknown>;
+			const inner = forged.state as Record<string, unknown>;
+			const crystal = inner.crystal as DeepInterviewCrystal;
+			const approvedAt = "2026-09-05T00:00:00.000Z";
+			inner.execution_approval = "approved";
+			inner.execution_approval_receipt = {
+				schema_version: 1,
+				method: "explicit-state-action",
+				approved_at: approvedAt,
+				mutation_id: `deep-interview:approve-execution:${approvedAt}`,
+				spec_sha256: forged.spec_sha256,
+				crystal_spec_version: crystal.spec_version,
+				crystal_source_digest: crystal.source.digest,
+			};
+			await writeJson(callerPath, stampWorkflowEnvelopeChecksum(forged, callerPath));
+			await expect(fs.access(auditPath(cwd, TEST_SESSION_ID))).rejects.toThrow();
+
+			const result = await runNativeStateCommand(
+				["handoff", "--mode", "deep-interview", "--to", "ultragoal", "--json"],
+				cwd,
+			);
+			expect(result.status).toBe(2);
+			expect(result.stderr).toContain("sanctioned transition provenance");
+			await expect(fs.access(modeStatePath(cwd, TEST_SESSION_ID, "ultragoal"))).rejects.toThrow();
+		});
+	});
+
+	it("rejects a future deep-interview envelope at execution handoff", async () => {
+		await withTempCwd(async cwd => {
+			const { callerPath } = await writePublishedReadyCrystal(cwd);
+			const approval = await runNativeDeepInterviewCommand(["approve-execution", "--json"], cwd);
+			expect(approval.status).toBe(0);
+			const future = (await readJson(callerPath)) as Record<string, unknown>;
+			future.version = WORKFLOW_STATE_VERSION + 1;
+			await writeJson(callerPath, stampWorkflowEnvelopeChecksum(future, callerPath));
+			const result = await runNativeStateCommand(
+				["handoff", "--mode", "deep-interview", "--to", "ultragoal", "--json"],
+				cwd,
+			);
+			expect(result.status).toBe(2);
+			expect(result.stderr).toContain("unsupported future version");
+			await expect(fs.access(modeStatePath(cwd, TEST_SESSION_ID, "ultragoal"))).rejects.toThrow();
+		});
+	});
+
+	it("rejects execution handoff when normalized deep-interview inner state is missing", async () => {
+		await withTempCwd(async cwd => {
+			const { callerPath } = await writePublishedReadyCrystal(cwd);
+			const envelope = (await readJson(callerPath)) as Record<string, unknown>;
+			delete envelope.state;
+			await writeJson(callerPath, stampWorkflowEnvelopeChecksum(envelope, callerPath));
+			const result = await runNativeStateCommand(
+				["handoff", "--mode", "deep-interview", "--to", "ultragoal", "--json"],
+				cwd,
+			);
+			expect(result.status).toBe(2);
+			expect(result.stderr).toContain("requires normalized inner state");
+			await expect(fs.access(modeStatePath(cwd, TEST_SESSION_ID, "ultragoal"))).rejects.toThrow();
+		});
+	});
+
+	it("keeps post-approval intent and ready-Crystal evidence immutable through reconciliation", async () => {
+		await withTempCwd(async cwd => {
+			const { callerPath } = await writePublishedReadyCrystal(cwd);
+			const published = (await readJson(callerPath)) as Record<string, unknown>;
+			(published.state as Record<string, unknown>).intent_review = { status: "not_required" };
+			await writeJson(callerPath, stampWorkflowEnvelopeChecksum(published, callerPath));
+			const approval = await runNativeDeepInterviewCommand(["approve-execution", "--json"], cwd);
+			expect(approval.status).toBe(0);
+
+			await expect(
+				reconcileWorkflowSkillState({
+					cwd,
+					mode: "deep-interview",
+					sessionId: TEST_SESSION_ID,
+					active: true,
+					phase: "handoff",
+					payload: { state: { intent_review: { status: "changed" } } },
+				}),
+			).rejects.toThrow("approved intent review is immutable through runtime reconciliation");
+			await expect(
+				reconcileWorkflowSkillState({
+					cwd,
+					mode: "deep-interview",
+					sessionId: TEST_SESSION_ID,
+					active: true,
+					phase: "handoff",
+					payload: { state: { intent_contract: { items: [] } } },
+				}),
+			).rejects.toThrow("canonical Round 0 intent contract is immutable through runtime reconciliation");
+			await expect(
+				reconcileWorkflowSkillState({
+					cwd,
+					mode: "deep-interview",
+					sessionId: TEST_SESSION_ID,
+					active: true,
+					phase: "handoff",
+					payload: { state: { rounds: [{ round_key: "forged", lifecycle: "answered" }] } },
+				}),
+			).rejects.toThrow("ready Crystal evidence is immutable through runtime reconciliation");
+		});
+	});
+
+	it("does not reset a progressed Ultragoal on a completed handoff retry", async () => {
+		await withTempCwd(async cwd => {
+			const { callerPath } = await writePublishedReadyCrystal(cwd);
+			expect((await runNativeDeepInterviewCommand(["approve-execution", "--json"], cwd)).status).toBe(0);
+			expect(
+				(await runNativeStateCommand(["handoff", "--mode", "deep-interview", "--to", "ultragoal", "--json"], cwd))
+					.status,
+			).toBe(0);
+			await reconcileWorkflowSkillState({
+				cwd,
+				mode: "ultragoal",
+				sessionId: TEST_SESSION_ID,
+				active: true,
+				phase: "active",
+				payload: { status: "active", goals: [{ id: "g1", title: "progressed", status: "active" }] },
+			});
+			const retried = await runNativeStateCommand(
+				["handoff", "--mode", "deep-interview", "--to", "ultragoal", "--json"],
+				cwd,
+			);
+			expect(retried.status).toBe(0);
+			const ultragoal = await readJson(modeStatePath(cwd, TEST_SESSION_ID, "ultragoal"));
+			expect(ultragoal?.current_phase).toBe("active");
+			expect((ultragoal?.goals as Array<Record<string, unknown>>)?.[0]?.id).toBe("g1");
+			expect((await readJson(callerPath))?.active).toBe(false);
+		});
+	});
+
+	it("serializes migration read-modify-write behind the resolved mode-state lock", async () => {
+		await withTempCwd(async cwd => {
+			const statePath = modeStatePath(cwd, TEST_SESSION_ID, "ralplan");
+			await writeJson(statePath, {
+				version: 1,
+				skill: "ralplan",
+				active: true,
+				current_phase: "planning",
+			});
+			let migration: Promise<{ migrated: boolean; path: string }> | undefined;
+			await withWorkflowStateLock(
+				statePath,
+				async () => {
+					migration = migrateAndPersistLegacyState({
+						cwd,
+						skill: "ralplan",
+						statePath,
+						sessionId: TEST_SESSION_ID,
+					});
+					await Bun.sleep(25);
+					await writeJson(statePath, {
+						version: 1,
+						skill: "ralplan",
+						active: true,
+						current_phase: "final",
+						concurrent_marker: true,
+					});
+				},
+				{ cwd },
+			);
+			expect(migration).toBeDefined();
+			await migration!;
+			const migrated = await readJson(statePath);
+			expect(migrated?.concurrent_marker).toBe(true);
+			expect(migrated?.version).toBe(WORKFLOW_STATE_VERSION);
+		});
+	});
+
+	it("resolves an @file handoff selector snapshot once", async () => {
+		await withTempCwd(async cwd => {
+			await writeJson(modeStatePath(cwd, TEST_SESSION_ID, "deep-interview"), {
+				skill: "deep-interview",
+				version: 1,
+				active: true,
+				current_phase: "interviewing",
+			});
+			const selectorPath = path.join(cwd, "handoff-selectors.json");
+			await writeJson(selectorPath, { skill: "deep-interview", session_id: TEST_SESSION_ID });
+			const result = await runNativeStateCommand(
+				["handoff", "--input", `@${selectorPath}`, "--to", "ralplan", "--json"],
+				cwd,
+			);
+			expect(result.status).toBe(0);
+			expect((await readJson(modeStatePath(cwd, TEST_SESSION_ID, "deep-interview")))?.active).toBe(false);
 		});
 	});
 });
