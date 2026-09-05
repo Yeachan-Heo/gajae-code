@@ -5964,19 +5964,20 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				return { ok: false, reason: "unknown_session", closed: false };
 			}
 
-			await ensureQuestionTransaction(id);
+			const currentSession = await ensureQuestionTransaction(id);
 			// Rebuild legacy projections before reaper eligibility checks. A crash after
 			// canonical terminal commit must not leave a stale active-turn file blocking reap.
 			await recoverCanonicalSessionProjection(id);
-			const cwd = optionalString(session.cwd);
-			const persistedWorkspace = optionalString(session.broker_workspace);
+			const migratedSession = sessionFromCreationSnapshot(currentSession);
+			const cwd = optionalString(migratedSession.cwd);
+			const persistedWorkspace = optionalString(migratedSession.broker_workspace);
 			const persistedGeneration =
-				typeof session.endpoint_generation === "number" &&
-				Number.isSafeInteger(session.endpoint_generation) &&
-				session.endpoint_generation > 0
-					? session.endpoint_generation
+				typeof migratedSession.endpoint_generation === "number" &&
+				Number.isSafeInteger(migratedSession.endpoint_generation) &&
+				migratedSession.endpoint_generation > 0
+					? migratedSession.endpoint_generation
 					: null;
-			const persistedIncarnation = optionalString(session.endpoint_incarnation);
+			const persistedIncarnation = optionalString(migratedSession.endpoint_incarnation);
 			if (!cwd || !persistedWorkspace || persistedGeneration === null || !persistedIncarnation)
 				return { ok: false, reason: "endpoint_stale", closed: false };
 			// Endpoint identity is the authority for any lifecycle mutation. Check it
@@ -5997,7 +5998,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					return { ok: false, reason: "endpoint_stale", closed: false };
 				throw error;
 			}
-			if (session.ephemeral !== true && opts.force !== true)
+			if (migratedSession.ephemeral !== true && opts.force !== true)
 				return { ok: false, reason: "not_ephemeral", closed: false };
 			let canonicalTransaction = await readSessionTransaction(questionPaths, id);
 			const canonicalActiveTurn = (canonicalTransaction

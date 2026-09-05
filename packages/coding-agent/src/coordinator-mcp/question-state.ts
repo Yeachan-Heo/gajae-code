@@ -1654,6 +1654,25 @@ export async function rewriteSessionEndpointAuthorityAndDeletions(
 					const transaction = await readTransactionJson<CoordinatorSessionTransactionV1>(file);
 					if (!transaction) throw new Error("resource_gone");
 					assertTransaction(transaction, path.basename(paths.root), sessionId);
+					let correlatedCreation: CreationRequestV1 | undefined;
+					let migratedCreationIntent: CanonicalCreateIntentV1 | undefined;
+					for (const creation of Object.values(registry.creations)) {
+						const intent = creation.canonical_create_intent;
+						if (creation.session_id !== sessionId || intent?.session.session_id !== sessionId) continue;
+						const migrated = structuredClone(intent);
+						if (migrated.session.broker.endpoint_incarnation === expectedLegacyEndpointIncarnation)
+							migrated.session.broker.endpoint_incarnation = currentEndpointIncarnation;
+						else if (migrated.session.broker.endpoint_incarnation !== currentEndpointIncarnation) continue;
+						migrated.session.broker.endpoint_file_id = endpointFileId;
+						if (
+							transaction.creation_intent_digest !== creationIntentDigest(intent) &&
+							transaction.creation_intent_digest !== creationIntentDigest(migrated)
+						)
+							continue;
+						if (correlatedCreation) throw new Error("state_corrupt");
+						correlatedCreation = creation;
+						migratedCreationIntent = migrated;
+					}
 					await applySessionTransactionMutation(paths, sessionId, transaction, async current => {
 						const broker = current.canonical.session.broker;
 						if (broker.endpoint_file_id !== undefined) {
@@ -1684,26 +1703,16 @@ export async function rewriteSessionEndpointAuthorityAndDeletions(
 							if (operation?.intent.endpoint_incarnation === expectedLegacyEndpointIncarnation)
 								operation.intent.endpoint_incarnation = currentEndpointIncarnation;
 						}
+						if (migratedCreationIntent)
+							current.creation_intent_digest = creationIntentDigest(migratedCreationIntent);
 						rewritten = current.canonical.session;
 					});
-					for (const creation of Object.values(registry.creations)) {
-						if (creation.session_id !== sessionId) continue;
-						if (creation.endpoint_incarnation === expectedLegacyEndpointIncarnation)
-							creation.endpoint_incarnation = currentEndpointIncarnation;
-						else if (
-							creation.endpoint_incarnation !== null &&
-							creation.endpoint_incarnation !== currentEndpointIncarnation
-						)
-							throw new Error("endpoint_stale");
-						const intent = creation.canonical_create_intent;
-						if (intent?.session.session_id === sessionId) {
-							if (intent.session.broker.endpoint_incarnation === expectedLegacyEndpointIncarnation)
-								intent.session.broker.endpoint_incarnation = currentEndpointIncarnation;
-							else if (intent.session.broker.endpoint_incarnation !== currentEndpointIncarnation)
-								throw new Error("endpoint_stale");
-							intent.session.broker.endpoint_file_id = endpointFileId;
-						}
-						creation.updated_at = new Date().toISOString();
+					if (correlatedCreation && migratedCreationIntent) {
+						correlatedCreation.endpoint_incarnation = currentEndpointIncarnation;
+						correlatedCreation.canonical_create_intent = migratedCreationIntent;
+						correlatedCreation.wal_revision = transaction.revision;
+						correlatedCreation.wal_digest = digest(JSON.stringify(transaction));
+						correlatedCreation.updated_at = new Date().toISOString();
 					}
 				},
 				lockOptions(options.signal),
