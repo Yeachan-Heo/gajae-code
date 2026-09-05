@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Performance
+
+- Drain completion-only stream events instead of retaining them, close idle-iterator sources once on early exit, and avoid repeated suffix scans in escape-dense JSON.
+
 ### Fixed
 
 - ChatGPT Codex Sol credential selection no longer denies `gpt-5.6-sol` from the account's plan label. A Plus-labelled OAuth account was rejected locally before any request, but the provider accepts that account and returns a normal `200`; trial, grandfathered and experiment-enabled accounts all carry an ordinary plan label. Plan tier now only ranks Sol candidates, so a Pro account is still preferred and a Plus account is used when it is the only one connected or the preferred one is exhausted. Spark keeps its existing confirmed-Pro filtering when a Pro account is present. The provider remains the entitlement authority for Sol, and its refusal is still surfaced through the same actionable message (#5270).
