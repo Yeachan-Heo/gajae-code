@@ -261,9 +261,13 @@ export async function* iterateWithIdleTimeout<T>(
 	const closeIterator = (): void => {
 		if (iteratorClosed) return;
 		iteratorClosed = true;
-		const returnPromise = iterator.return?.();
-		if (returnPromise) {
-			void returnPromise.catch(() => {});
+		try {
+			const returnPromise = iterator.return?.();
+			if (returnPromise) {
+				void returnPromise.catch(() => {});
+			}
+		} catch {
+			// Cleanup must not replace the source error or timeout that triggered it.
 		}
 	};
 
