@@ -262,7 +262,7 @@ function schemaFromSnapshots(
 }
 
 function mcpConfigHash(entry: GjcPluginMcpManifestEntry): string {
-	const canonical = canonicalJson({
+	const canonical = JSON.stringify({
 		name: entry.name,
 		transport: entry.transport,
 		command: entry.command ?? null,

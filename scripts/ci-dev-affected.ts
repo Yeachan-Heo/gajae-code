@@ -76,6 +76,7 @@ const EXTENSIBILITY_BEHAVIORAL_OWNER_TESTS = [
 	"packages/coding-agent/test/extensions-wrapper.test.ts",
 	"packages/coding-agent/test/hook-event-normalization.test.ts",
 	"packages/coding-agent/test/gjc-plugin-schema.test.ts",
+	"packages/coding-agent/test/gjc-plugin-aliases.test.ts",
 	"packages/coding-agent/test/gjc-plugin-compiler.test.ts",
 	"packages/coding-agent/test/gjc-plugin-registry.test.ts",
 	"packages/coding-agent/test/gjc-plugin-registry-v2.test.ts",
