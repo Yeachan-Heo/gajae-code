@@ -1395,7 +1395,6 @@ export class ExtensionRunner {
 
 		const ctx = this.createContext();
 		const currentEvent: ToolResultEvent = { ...event };
-		let modified = false;
 		let marked = false;
 
 		for (const { ext, handler } of handlers) {
@@ -1414,19 +1413,14 @@ export class ExtensionRunner {
 
 			if (handlerResult.content !== undefined) {
 				currentEvent.content = handlerResult.content;
-				modified = true;
 			}
 			if (handlerResult.details !== undefined) {
 				currentEvent.details = handlerResult.details;
-				modified = true;
 			}
 			if (handlerResult.isError !== undefined) {
 				currentEvent.isError = handlerResult.isError;
-				modified = true;
 			}
 		}
-
-		if (!modified) return undefined;
 
 		return {
 			content: currentEvent.content,

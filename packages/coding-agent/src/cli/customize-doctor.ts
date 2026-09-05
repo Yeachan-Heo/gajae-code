@@ -156,6 +156,27 @@ export interface CustomizeDoctorItem {
 	mcp?: McpSafeSummary;
 	/** Present only for quarantined plugin-bundle surfaces. */
 	quarantineCode?: string;
+	/** Metadata-only Function Hook policy projection; hook code is never executed. */
+	functionHooks?: CustomizeFunctionHookSummary[];
+}
+
+export interface CustomizeFunctionHookSummary {
+	extensionId: string;
+	order: number;
+	event: string;
+	target?: string;
+	phase?: "before" | "after";
+	scope: "user" | "project";
+	plugin: string;
+	relativePath: string;
+	status: "disabled" | "quarantined" | "blocked-isolate" | "legacy-active";
+	requestedCapabilities: string[];
+	effectiveCapabilities: string[];
+	attenuateDownstream: string[];
+	networkDestinations: string[];
+	filesystemRoots: string[];
+	capabilityHash?: string;
+	remediation: string;
 }
 
 export interface CustomizeDoctorSurface {
@@ -1145,6 +1166,43 @@ async function collectPluginBundles(cwd: string): Promise<CustomizeDoctorSurface
 	const observability = await summarizeGjcPluginObservability(cwd, { migrate: false });
 	const items: CustomizeDoctorItem[] = [...npmItems];
 	for (const entry of bundleEntries) {
+		const surfaces = observability.surfaces.filter(s => s.plugin === entry.name && s.scope === entry.scope);
+		const functionHooks: CustomizeFunctionHookSummary[] = entry.surfaces.hooks.map((hook, order) => {
+			const observed = surfaces.find(surface => surface.extensionId === hook.extensionId);
+			const status: CustomizeFunctionHookSummary["status"] =
+				observed?.status === "quarantined"
+					? "quarantined"
+					: !entry.enabled || entry.disabledSurfaceIds.includes(hook.extensionId)
+						? "disabled"
+						: hook.functionHook === true
+							? "blocked-isolate"
+							: "legacy-active";
+			return {
+				extensionId: hook.extensionId,
+				order,
+				event: hook.event,
+				...(hook.target === undefined ? {} : { target: hook.target }),
+				...(hook.phase === undefined ? {} : { phase: hook.phase }),
+				scope: entry.scope,
+				plugin: entry.name,
+				relativePath: hook.relativePath,
+				status,
+				requestedCapabilities: [...(hook.capabilities ?? [])],
+				effectiveCapabilities: [...(hook.capabilities ?? [])],
+				attenuateDownstream: [],
+				networkDestinations: [...(hook.networkDestinations ?? [])],
+				filesystemRoots: [...(hook.filesystemRoots ?? [])],
+				...(hook.capabilityHash === undefined ? {} : { capabilityHash: hook.capabilityHash }),
+				remediation:
+					status === "blocked-isolate"
+						? "Function Hook remains disabled until a capability-enforcing plugin isolate is available."
+						: status === "quarantined"
+							? "Reinstall the bundle and verify installed metadata and file hashes."
+							: status === "disabled"
+								? `Enable surface ${hook.extensionId} only after reviewing its declared policy.`
+								: "Legacy constrained hook executes under the existing trusted compatibility policy.",
+			};
+		});
 		const base: Omit<CustomizeDoctorItem, "status" | "reason" | "detail" | "remediation"> = {
 			name: entry.name,
 			kind: "plugin-bundle",
@@ -1157,6 +1215,7 @@ async function collectPluginBundles(cwd: string): Promise<CustomizeDoctorSurface
 			trust: TRUST_BY_KIND["plugin-bundle"],
 			restartRequired: true,
 			precedence: { priority: 0 },
+			functionHooks,
 		};
 		if (!entry.enabled) {
 			items.push(
@@ -1170,7 +1229,6 @@ async function collectPluginBundles(cwd: string): Promise<CustomizeDoctorSurface
 			);
 			continue;
 		}
-		const surfaces = observability.surfaces.filter(s => s.plugin === entry.name && s.scope === entry.scope);
 		const quarantined = surfaces.filter(s => s.status === "quarantined");
 		if (quarantined.length > 0) {
 			const codes = Array.from(new Set(quarantined.map(s => s.quarantineCode ?? "unknown"))).join(", ");
@@ -1578,6 +1636,21 @@ export function renderCustomizeDoctorText(report: CustomizeDoctorReport): string
 			lines.push(`    reason: ${item.reason} — ${item.detail}`);
 			lines.push(`    source: ${item.path}`);
 			if (item.quarantineCode) lines.push(`    quarantine code: ${item.quarantineCode}`);
+			for (const hook of item.functionHooks ?? []) {
+				lines.push(
+					`    function hook[${hook.order}]: ${hook.extensionId} event=${hook.event}${hook.target ? ` target=${hook.target}` : ""} status=${hook.status}`,
+				);
+				lines.push(`      provenance: scope=${hook.scope} plugin=${hook.plugin} path=${hook.relativePath}`);
+				lines.push(
+					`      grants: requested=${hook.requestedCapabilities.join(",") || "none"} effective=${hook.effectiveCapabilities.join(",") || "none"} attenuate=${hook.attenuateDownstream.join(",") || "none"}`,
+				);
+				if (hook.networkDestinations.length > 0)
+					lines.push(`      network destinations: ${hook.networkDestinations.join(",")}`);
+				if (hook.filesystemRoots.length > 0)
+					lines.push(`      filesystem roots: ${hook.filesystemRoots.join(",")}`);
+				if (hook.capabilityHash) lines.push(`      capability hash: ${hook.capabilityHash}`);
+				lines.push(`      remediation: ${hook.remediation}`);
+			}
 			for (const fix of item.remediation) lines.push(`    fix: ${fix}`);
 			lines.push(`    trust: ${item.trust}`);
 			lines.push(`    restart required: ${item.restartRequired ? "yes (new session)" : "no"}`);

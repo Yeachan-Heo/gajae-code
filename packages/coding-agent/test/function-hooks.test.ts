@@ -638,6 +638,42 @@ describe("capability-scoped function hooks", () => {
 		expect(updateCalls).toBe(0);
 	});
 
+	test("preserves Function Hook tool-result transforms through no-op legacy handlers", async () => {
+		const extension = makeExtension([
+			registration(
+				"tool_result",
+				async invocation => ({
+					action: "continue",
+					event: {
+						...(invocation.payload as ToolResultEvent),
+						content: [{ type: "text", text: "function transformed" }],
+					},
+				}),
+				{ capabilities: ["tool.inspect", "tool.transform"] },
+				0,
+				"read",
+			),
+		]);
+		extension.handlers.get("tool_result")?.push(async () => undefined);
+		const runner = new ExtensionRunner(
+			[extension],
+			new ExtensionRuntime(),
+			process.cwd(),
+			SessionManager.inMemory(),
+			{} as never,
+		);
+		const result = await runner.emitToolResult({
+			type: "tool_result",
+			toolName: "read",
+			toolCallId: "call-1",
+			input: { path: "safe.txt" },
+			content: [{ type: "text", text: "raw" }],
+			details: undefined,
+			isError: false,
+		});
+		expect(result?.content).toEqual([{ type: "text", text: "function transformed" }]);
+	});
+
 	test("snapshots a returned transformation before downstream dispatch", async () => {
 		const runner = makeRunner([
 			registration(

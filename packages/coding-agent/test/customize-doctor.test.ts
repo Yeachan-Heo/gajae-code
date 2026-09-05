@@ -13,6 +13,7 @@
  *     skills always win over same-name filesystem copies).
  */
 import { afterEach, describe, expect, it } from "bun:test";
+import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -24,6 +25,7 @@ import {
 	runCustomizeDoctor,
 } from "../src/cli/customize-doctor";
 import { Settings } from "../src/config/settings";
+import { functionHookGrantHash, normalizeFunctionHookGrant } from "../src/extensibility/extensions/function-hooks";
 import { loadSkills } from "../src/extensibility/skills";
 import { loadAllMCPConfigs } from "../src/runtime-mcp/config";
 
@@ -250,6 +252,80 @@ describe("customize doctor (#4288)", () => {
 			bundles.get("fixture-bundle")?.reason,
 		]);
 		expect(reasons.size).toBe(5);
+	});
+
+	it("reports Function Hook policy metadata without executing hook code", async () => {
+		const cwd = await makeTempProject();
+		const pluginRoot = path.join(cwd, ".gjc", "gjc-plugins", "function-hook-doctor");
+		const hookPath = path.join(pluginRoot, "hooks", "before-read.ts");
+		const markerPath = path.join(cwd, "doctor-imported");
+		const hookSource = `await Bun.write(${JSON.stringify(markerPath)}, "imported"); export default function() {}`;
+		await fs.mkdir(path.dirname(hookPath), { recursive: true });
+		await fs.writeFile(hookPath, hookSource);
+		const sha256 = createHash("sha256").update(hookSource).digest("hex");
+		const grant = normalizeFunctionHookGrant({ capabilities: ["tool.inspect"] });
+		await writeJson(path.join(cwd, ".gjc", "gjc-plugins", "registry.json"), {
+			version: 1,
+			scope: "project",
+			plugins: [
+				{
+					name: "function-hook-doctor",
+					version: "1.0.0",
+					scope: "project",
+					enabled: true,
+					pluginRoot,
+					manifestPath: path.join(pluginRoot, "gajae-plugin.json"),
+					manifestHash: "",
+					source: { kind: "path", uri: pluginRoot, resolvedAt: "2026-01-01T00:00:00.000Z" },
+					installedAt: "2026-01-01T00:00:00.000Z",
+					updatedAt: "2026-01-01T00:00:00.000Z",
+					copiedFiles: [{ relativePath: "hooks/before-read.ts", sha256, bytes: Buffer.byteLength(hookSource) }],
+					surfaces: {
+						subskills: [],
+						tools: [],
+						hooks: [
+							{
+								extensionId: "hook:tool_call:before:read:before-read",
+								name: "before-read",
+								event: "tool_call",
+								target: "read",
+								phase: "before",
+								relativePath: "hooks/before-read.ts",
+								sha256,
+								implementationHash: sha256,
+								capabilities: [...grant.capabilities],
+								networkDestinations: [],
+								filesystemRoots: [],
+								capabilityHash: functionHookGrantHash(grant),
+								functionHook: true,
+							},
+						],
+						mcps: [],
+						systemAppendices: [],
+						agentAppendices: [],
+					},
+					disabledSurfaceIds: [],
+				},
+			],
+		});
+
+		const report = await runCustomizeDoctor(cwd, Settings.isolated({}));
+		const bundle = itemsByName(report, "plugin-bundle").get("function-hook-doctor");
+		expect(bundle?.functionHooks).toEqual([
+			expect.objectContaining({
+				order: 0,
+				event: "tool_call",
+				target: "read",
+				status: "blocked-isolate",
+				requestedCapabilities: ["tool.inspect"],
+				effectiveCapabilities: ["tool.inspect"],
+				attenuateDownstream: [],
+			}),
+		]);
+		const text = renderCustomizeDoctorText(report);
+		expect(text).toContain("status=blocked-isolate");
+		expect(text).toContain("grants: requested=tool.inspect effective=tool.inspect attenuate=none");
+		expect(await Bun.file(markerPath).exists()).toBe(false);
 	});
 
 	it("agrees with session-startup consumers (loadSkills, loadAllMCPConfigs)", async () => {
