@@ -53,6 +53,32 @@ async function hotRender(h: Harness): Promise<void> {
 }
 
 describe("keyboard input render latency under streaming load", () => {
+	it("prepares pending stream presentation before the input-priority frame reads components", async () => {
+		const h = setup();
+		await h.term.waitForRender();
+		const stream = new Text("old stream", 0, 0);
+		h.tui.addChild(stream);
+		let prepared = 0;
+		let revision = 0;
+		try {
+			h.tui.enqueueBeforeRender(() => {
+				prepared++;
+				stream.setText("latest stream");
+				revision = h.tui.requestRenderWithGeneration(false, "stream.prepared");
+			});
+			h.term.sendInput("ZQX");
+			await nextTick();
+			await h.term.flush();
+			expect(prepared).toBe(1);
+			expect(await h.tui.waitForRenderCommit(revision)).toBe(true);
+			const viewport = h.term.getViewport().join("\n");
+			expect(viewport).toContain("latest stream");
+			expect(viewport).toContain("ZQX");
+		} finally {
+			h.tui.stop();
+		}
+	});
+
 	it("never drops keystrokes during fast typing interleaved with streaming (hard gate)", async () => {
 		const h = setup();
 		await h.term.waitForRender();

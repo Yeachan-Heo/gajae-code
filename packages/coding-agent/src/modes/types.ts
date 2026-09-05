@@ -355,6 +355,7 @@ export interface InteractiveModeContext {
 	extractAssistantText(message: AssistantMessage): string;
 	/** Records one semantic visible-transcript mutation for the sticky viewport. */
 	recordVisibleTranscriptMutation?(): void;
+	resetAssistantTextPresentation(): void;
 	updateEditorTopBorder(): void;
 	updateEditorBorderColor(): void;
 	rebuildChatFromMessages(policy: TranscriptRebuildPolicy): void;

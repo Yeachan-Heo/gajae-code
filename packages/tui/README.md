@@ -44,6 +44,60 @@ tui.start();
 
 Main container that manages components and rendering.
 
+#### Frame preparation
+
+`tui.enqueueBeforeRender(callback: () => void): () => void` registers one synchronous,
+one-shot preparation and returns an idempotent cancellation function. It requests a
+normal full-mutation render on the existing 16 ms frame clock; it adds no timer and
+does not force or expedite a frame. Normal, forced, and input-priority frames drain
+the same snapshot before capturing render generations or reading layout, components,
+viewport sources, or caches. Ordinary render requests made by preparation join that
+frame without a request-only follow-up paint. Registrations made while draining run
+in a later frame; their generations cannot commit before that preparation executes,
+even when a newer ordinary request commits first or terminal output is queued.
+
+Cancellation removes callback references, including entries already captured but
+not yet invoked. Retained cancellation handles release their reference to the TUI
+and callback on cancellation, invocation (including failure), or lifecycle
+invalidation. Later cancellation calls are no-ops; an executing callback remains
+live until its synchronous invocation returns. Preparation exceptions are logged, unrelated callbacks continue,
+and the failed preparation's generation is not reported as successfully committed.
+Throwing or lifecycle-invalidated preparations immediately resolve their existing
+commit waiters `false`; late waiters for those generations also resolve `false`,
+even after a newer successful frame. Retired generations are stored as merged,
+sorted failure ranges, separate from live pending-frame exclusions. Contiguous
+failures compact into one range; separated failures retain distinct ranges to
+preserve exact outcomes. Historical failure ranges are not copied or scanned on
+each frame (waiter lookup uses binary search).
+History has no arbitrary expiry: its numeric storage is O(disjoint failed ranges),
+not bounded over an indefinitely alternating failure/success session. Empty active
+pending and hole sets do not imply bounded historical storage or prove leak freedom.
+Callbacks must be synchronous (do not pass async functions).
+
+The cancellation lifetime regression inspects Bun's heap snapshot for outgoing
+local closure/entry paths to the owner, callback and payload, while all targets
+remain deliberately rooted. Pending handles and an intentionally retaining arrow
+are positive controls; retired handles must lose those paths. This checks reference
+release without assuming when GC collects an object. It does not prove global leak
+freedom or exclude unrelated module, runtime or test-runner roots.
+
+`tui.setRenderPreparationLifecycleCallbacks(callbacks: { invalidate: () => void;
+beforeStart: () => void } | undefined): void` installs a **single** preparation owner.
+Replacing or clearing the owner invalidates its old queued and captured work and
+calls its `invalidate` synchronously. Stop, terminal loss, and disposal do the same;
+exceptions are logged without preventing cancellation. Disposal also clears the
+owner. Enqueue while stopped, unavailable, invalidating, or disposed retains no work.
+Disposal cancels pending render/width-settle timers and render requests; later normal,
+forced, input-priority, and resize requests cannot rearm the disposed renderer.
+
+After successful terminal setup, each `start()` calls `beforeStart` synchronously
+before its first forced render request. The owner can enqueue fresh preparation
+from its current authoritative state there, so restarting does not require another
+provider event. Failed setup does not rearm work; a throwing `beforeStart` is logged
+and its queued work is invalidated. Stop/start during a drain cannot revive that
+drain's old snapshot. This API is only a presentation-preparation lifecycle seam,
+not a general lifecycle event bus.
+
 ```typescript
 const tui = new TUI(terminal);
 tui.addChild(component);

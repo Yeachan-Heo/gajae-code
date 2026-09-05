@@ -11,6 +11,10 @@
 
 - Status-line settings now include a draft-local spatial custom editor with exact-slot keyboard reordering, hidden-segment palette management, command text configuration, persisted Confirm/Exit semantics, live multi-row preview compatibility, narrow/Unicode rendering, and deterministic visual evidence.
 
+### Changed
+
+- Interactive assistant `text_delta` presentation now coalesces eligible updates into the latest message projection before the existing TUI frame while preserving ordered event processing, immediate non-text updates, and authoritative final output. Session/transcript replacement and disposal cancel stale presentation; temporary TUI stop/start rearms current live text before the first restarted frame without invalidating live historical image callbacks.
+
 ### Fixed
 
 - The read-URL cache is now bounded (FIFO, 64 keys), so long-lived TUI and SDK-host processes no longer retain every fetched page's full output and image payload for the process lifetime; an evicted entry simply refetches on the next read, and unpersisted sessions sharing a working directory remain isolated by session identity.

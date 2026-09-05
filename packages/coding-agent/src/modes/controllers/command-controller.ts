@@ -1043,6 +1043,7 @@ export class CommandController {
 		this.ctx.ui.requestRender();
 
 		prepareTranscriptRebuild(this.ctx.ui, "replace-identity");
+		this.ctx.resetAssistantTextPresentation();
 		this.ctx.chatContainer.clear();
 		this.ctx.pendingMessagesContainer.clear();
 		this.ctx.compactionQueuedMessages = [];
@@ -1083,6 +1084,7 @@ export class CommandController {
 		this.ctx.ui.requestRender();
 
 		prepareTranscriptRebuild(this.ctx.ui, "replace-identity");
+		this.ctx.resetAssistantTextPresentation();
 		this.ctx.chatContainer.clear();
 		this.ctx.pendingMessagesContainer.clear();
 		this.ctx.compactionQueuedMessages = [];

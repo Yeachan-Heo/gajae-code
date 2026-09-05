@@ -6,6 +6,10 @@
 
 - Loader and other same-width frames, viewport-only resize repaints, and coalesced resize appends skip unused transcript-wide reflow measurements, reducing repeated text-width work in long sessions while preserving rendering.
 
+### Added
+
+- Added cancellable, one-shot `enqueueBeforeRender` preparation on the existing frame scheduler and a single-owner `setRenderPreparationLifecycleCallbacks` seam for invalidation and restart preparation. Stop, terminal loss, and disposal cancel stale work; restart preparation runs before the first forced frame without adding another streaming timer.
+
 ## [0.16.3] - 2026-09-04
 
 ## [0.16.2] - 2026-09-04

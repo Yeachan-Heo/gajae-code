@@ -3265,6 +3265,7 @@ export class SelectorController {
 	}
 
 	#clearTransientSessionUi(options?: { restoreBackground?: boolean; clearSpecializedLoaders?: boolean }): void {
+		this.ctx.resetAssistantTextPresentation();
 		if (options?.clearSpecializedLoaders) clearInteractiveActivityLoaders(this.ctx);
 		stopInteractiveActivityIndicator(this.ctx, {
 			restoreBackground: options?.restoreBackground,

@@ -781,6 +781,10 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#btwController = new BtwController(this);
 		this.#extensionUiController = new ExtensionUiController(this);
 		this.#eventController = new EventController(this);
+		this.ui.setRenderPreparationLifecycleCallbacks({
+			invalidate: () => this.#eventController.suspendAssistantTextPresentation(),
+			beforeStart: () => this.#eventController.resumeAssistantTextPresentation(),
+		});
 		this.#commandController = new CommandController(this);
 		this.#todoCommandController = new TodoCommandController(this);
 		this.#selectorController = new SelectorController(this);
@@ -1553,6 +1557,7 @@ export class InteractiveMode implements InteractiveModeContext {
 
 	rebuildChatFromMessages(policy: TranscriptRebuildPolicy): void {
 		prepareTranscriptRebuild(this.ui, policy);
+		this.resetAssistantTextPresentation();
 		this.chatContainer.clear();
 		const context = this.session.buildDisplaySessionContext();
 		this.renderSessionContext(context);
@@ -1685,6 +1690,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	stop(): void {
 		const wasInitialized = this.isInitialized;
 		this.#stopped = true;
+		this.ui.setRenderPreparationLifecycleCallbacks(undefined);
 		this.#inputController.discardDeferredSubmission();
 		for (const listener of this.#stopListeners) {
 			try {
@@ -2111,6 +2117,10 @@ export class InteractiveMode implements InteractiveModeContext {
 
 	isKnownSlashCommand(text: string): boolean {
 		return this.#uiHelpers.isKnownSlashCommand(text);
+	}
+
+	resetAssistantTextPresentation(): void {
+		this.#eventController.resetAssistantTextPresentation();
 	}
 
 	/** Advances the sticky-viewport source only for semantic transcript output. */

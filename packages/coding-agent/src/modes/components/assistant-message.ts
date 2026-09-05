@@ -106,16 +106,24 @@ export class AssistantMessageComponent extends Container {
 	#toolImagesRevision = 0;
 	#convertedToolImagesRevision = 0;
 	#disposed = false;
+	// Cached Markdown children can outlive their attachment to this assistant.
+	// Session/live-parent validity belongs to the owner, not the paint lifetime.
+	readonly #requestRepaint?: () => void;
 	constructor(
 		message?: AssistantMessage,
 		private hideThinkingBlock = false,
-		private readonly onImageUpdate?: () => void,
+		onImageUpdate?: () => void,
 		viewportAnchorId?: string,
 		private readonly onVisibleMutation?: () => void,
 		private readonly hintSession?: ProviderSafetyStopHintSession,
 	) {
 		super();
 		this.#viewportAnchorId = viewportAnchorId;
+		if (onImageUpdate) {
+			this.#requestRepaint = () => {
+				if (!this.#disposed) onImageUpdate();
+			};
+		}
 
 		this.#contentContainer = new Container();
 		this.addChild(this.#contentContainer);
@@ -172,6 +180,7 @@ export class AssistantMessageComponent extends Container {
 	}
 
 	#notifyVisibleMutation(): void {
+		if (this.#disposed) return;
 		const after = this.#visibleContentSignature();
 		if (after === this.#visibleSignature) return;
 		this.#visibleSignature = after;
@@ -186,6 +195,7 @@ export class AssistantMessageComponent extends Container {
 	}
 
 	override invalidate(): void {
+		if (this.#disposed) return;
 		super.invalidate();
 		if (this.#lastMessage) {
 			this.updateContent(this.#lastMessage, { streaming: this.#lastStreaming });
@@ -193,13 +203,14 @@ export class AssistantMessageComponent extends Container {
 	}
 
 	setHideThinkingBlock(hide: boolean): void {
+		if (this.#disposed) return;
 		if (this.hideThinkingBlock === hide) return;
 		this.hideThinkingBlock = hide;
 		this.#notifyVisibleMutation();
 	}
 
 	setToolResultImages(toolCallId: string, images: ImageContent[]): void {
-		if (!toolCallId) return;
+		if (this.#disposed || !toolCallId) return;
 		const validImages = images.filter(img => img.type === "image" && img.data && img.mimeType);
 		const previousImages = this.#toolImagesByCallId.get(toolCallId);
 		if (
@@ -268,7 +279,7 @@ export class AssistantMessageComponent extends Container {
 					this.#convertedKittyImages.set(key, { type: "image", data, mimeType: "image/png", source });
 					this.#convertedToolImagesRevision += 1;
 					if (this.#lastMessage) this.updateContent(this.#lastMessage, { streaming: this.#lastStreaming });
-					this.onImageUpdate?.();
+					this.#requestRepaint?.();
 				})
 				.catch(() => {
 					if (
@@ -283,6 +294,7 @@ export class AssistantMessageComponent extends Container {
 	}
 
 	setUsageInfo(usage: Usage): void {
+		if (this.#disposed) return;
 		this.#usageInfo = usage;
 		if (this.#lastMessage) {
 			this.updateContent(this.#lastMessage, { streaming: this.#lastStreaming });
@@ -311,7 +323,7 @@ export class AssistantMessageComponent extends Container {
 		const cached = this.#contentBlocksCache.get(content);
 		if (cached?.source === content.text) {
 			if (cached.component instanceof Markdown) {
-				cached.component.setOnStaleThrottle(this.onImageUpdate);
+				cached.component.setOnStaleThrottle(this.#requestRepaint);
 				cached.component.setStreaming(streaming);
 			}
 			return cached.component;
@@ -322,14 +334,14 @@ export class AssistantMessageComponent extends Container {
 		// instead of constructing a new one each chunk; combined with the markdown
 		// per-code-block highlight cache, appends no longer re-highlight the whole prefix.
 		if (!deepInterview && cached && cached.component instanceof Markdown) {
-			cached.component.setOnStaleThrottle(this.onImageUpdate);
+			cached.component.setOnStaleThrottle(this.#requestRepaint);
 			cached.component.setText(trimmed, { streaming });
 			cached.source = content.text;
 			return cached.component;
 		}
 		const component = deepInterview ?? new Markdown(trimmed, 1, 0, getMarkdownTheme());
 		if (component instanceof Markdown) {
-			component.setOnStaleThrottle(this.onImageUpdate);
+			component.setOnStaleThrottle(this.#requestRepaint);
 			component.setStreaming(streaming);
 		}
 		this.#contentBlocksCache.set(content, { source: content.text, component });
@@ -341,14 +353,14 @@ export class AssistantMessageComponent extends Container {
 		const cached = this.#contentBlocksCache.get(content);
 		if (cached?.source === content.thinking) {
 			if (cached.component instanceof Markdown) {
-				cached.component.setOnStaleThrottle(this.onImageUpdate);
+				cached.component.setOnStaleThrottle(this.#requestRepaint);
 				cached.component.setStreaming(streaming);
 			}
 			return cached.component as Markdown;
 		}
 		const trimmed = elideRunawayThinkingRepetition(content.thinking.trim());
 		if (cached?.component instanceof Markdown) {
-			cached.component.setOnStaleThrottle(this.onImageUpdate);
+			cached.component.setOnStaleThrottle(this.#requestRepaint);
 			cached.component.setText(trimmed, { streaming });
 			cached.source = content.thinking;
 			return cached.component;
@@ -357,7 +369,7 @@ export class AssistantMessageComponent extends Container {
 			color: (text: string) => theme.fg("thinkingText", text),
 			italic: true,
 		});
-		component.setOnStaleThrottle(this.onImageUpdate);
+		component.setOnStaleThrottle(this.#requestRepaint);
 		component.setStreaming(streaming);
 		this.#contentBlocksCache.set(content, { source: content.thinking, component });
 		this.#reusableChildren.add(component);
@@ -437,6 +449,7 @@ export class AssistantMessageComponent extends Container {
 	}
 
 	updateContent(message: AssistantMessage, options?: AssistantMessageUpdateOptions): void {
+		if (this.#disposed) return;
 		this.#lastMessage = message;
 		this.#lastStreaming = options?.streaming ?? false;
 
