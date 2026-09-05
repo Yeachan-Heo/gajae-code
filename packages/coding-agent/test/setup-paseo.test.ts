@@ -37,15 +37,29 @@ import {
 import { removePaseoSetup } from "../src/setup/paseo/remove";
 import { checkExitCode, type SetupCheckStatus } from "../src/setup/paseo/result-types";
 import {
+	createDefaultPaseoPaths,
 	type PaseoLsOutcome,
 	type PaseoPaths,
 	type PaseoSetupDependencies,
 	parseProviderLs,
+	resolvePaseoHome,
 } from "../src/setup/paseo/setup-deps";
 import { installSkillsBridge, preflightSkillsBridge, SkillsBridgeError } from "../src/setup/paseo/skills-bridge";
 
 const FIXTURE_PASSWORD = "$2b$10$FIXTUREFIXTUREFIXTUREFIXTUREFIXTUREFIXTUREFIXTUREFIXTUR";
 const SKILL_NAMES = ["paseo", "paseo-advisor", "paseo-committee", "paseo-handoff", "paseo-loop"];
+
+describe("Paseo home resolution", () => {
+	test("shares custom and tilde-expanded PASEO_HOME paths with setup", () => {
+		const home = "/home/tester";
+		const agentDir = "/home/tester/.gjc/agent";
+		expect(resolvePaseoHome({ PASEO_HOME: "/srv/paseo" }, home)).toBe("/srv/paseo");
+		expect(resolvePaseoHome({ PASEO_HOME: "~/custom-paseo" }, home)).toBe("/home/tester/custom-paseo");
+		expect(createDefaultPaseoPaths(agentDir, home, { PASEO_HOME: "/srv/paseo" }).configJson).toBe(
+			"/srv/paseo/config.json",
+		);
+	});
+});
 /** Built from codepoints so this test file stays pure ASCII on disk. */
 const NON_ASCII_VALUE = String.fromCodePoint(0xd55c, 0xad6d, 0xc5b4);
 

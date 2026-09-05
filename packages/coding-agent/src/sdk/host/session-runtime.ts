@@ -27,7 +27,10 @@ import { resolveModelChainWithAuth, splitSelectorThinkingSuffix } from "../../co
 import { type ModelSelectorValue, normalizeModelSelectorValue } from "../../config/model-selector-value";
 import { type Settings, validateSettingPatch } from "../../config/settings";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "../../extensibility/extensions";
+import type { AgentEndEvent } from "../../extensibility/shared-events";
 import { normalizeGoal } from "../../goals/state";
+import { toAgentWireEventPayload } from "../../modes/shared/agent-wire/event-envelope";
+import type { AgentSessionEvent } from "../../session/agent-session";
 import type { SdkRunCapability } from "../../session/sdk-run-capability";
 import {
 	boundTerminalRetentionState,
@@ -190,6 +193,24 @@ class DiffQueryError extends Error {
 	) {
 		super(message);
 	}
+}
+
+/**
+ * Normalize an agent-loop stop reason into the published terminal outcome.
+ *
+ * Only reached for a boundary that actually terminalizes an owned invocation,
+ * so every result is a `stopped` disposition: a failed run publishes its own
+ * correlated `agent_failed` frame with the sanitized cause instead.
+ */
+export function terminalStoppedOutcome(
+	stopReason: AgentEndEvent["stopReason"],
+	maintenanceOutcome: string | undefined,
+): Extract<SdkPromptTerminalOutcome, { kind: "stopped" }> {
+	// An aborted maintenance checkpoint is the one maintenance path that really
+	// ends the run, and it ends it the same way an explicit stop does.
+	return stopReason === "cancelled" || maintenanceOutcome === "aborted"
+		? { kind: "stopped", reason: "cancelled", provenance: "client_cancel" }
+		: { kind: "stopped", reason: "end_turn", provenance: "agent" };
 }
 
 /** Transport-neutral endpoint contract consumed by the SDK session runtime. */
@@ -395,6 +416,28 @@ export class SessionSdkSessionRuntime {
 		this.transport.broadcastFrame?.(event);
 	}
 
+	/**
+	 * Deliver a frame to specific connections without recording it.
+	 *
+	 * Deliberately not `emitEvent`: that assigns a ring position and broadcasts to
+	 * every authenticated socket. Streamed turn content is high-frequency and
+	 * unbounded in size, so a count-bounded ring would evict the lifecycle events
+	 * clients depend on -- including the `agent_end` that settles their prompt --
+	 * and broadcasting would hand every subscriber a stream only the submitter
+	 * asked for. Delivery failure is ignored: a disconnected consumer must never
+	 * disturb the turn producing the content.
+	 */
+	sendFrameTo(connectionIds: Iterable<string>, frame: SdkFrame): void {
+		for (const connectionId of connectionIds) {
+			try {
+				const result = this.transport.sendFrame(connectionId, frame);
+				if (result instanceof Promise) result.catch(() => undefined);
+			} catch {
+				// A dead connection is reaped by the transport's own close handling.
+			}
+		}
+	}
+
 	publish(frame: SdkFrame): void {
 		this.emitEvent(frame);
 	}
@@ -577,6 +620,8 @@ function canonicalTerminalOutcome(
 		if (candidate.kind === "stopped") {
 			if (candidate.reason === "cancelled" && candidate.provenance === "client_cancel")
 				return { kind: "stopped", reason: "cancelled", provenance: "client_cancel" };
+			if (candidate.reason === "end_turn" && candidate.provenance === "agent")
+				return { kind: "stopped", reason: "end_turn", provenance: "agent" };
 			return undefined;
 		}
 		if (candidate.kind === "failed")
@@ -2239,6 +2284,7 @@ function createControlSurface(
 	canResolveGate: () => boolean = () => true,
 	trackGateResolution: <T>(resolution: Promise<T>) => Promise<T> = async resolution => await resolution,
 	onInvocationCompletionReconciledForTests?: (kind: InvocationKind, correlation: InvocationCorrelation) => void,
+	publishLifecycleFrame?: (frame: SdkFrame) => void,
 ): ControlSurface {
 	const normalizePromptImages = (value: unknown): ImageContent[] => {
 		if (!Array.isArray(value)) return [];
@@ -2376,6 +2422,24 @@ function createControlSurface(
 		const correlation = newCorrelation();
 		const sdkRunToken = `${correlation.commandId}:${correlation.turnId}`;
 		const sdkRunCapability = createSdkRunCapability(sdkRunToken);
+		const publishTerminal = (outcome: InvocationOutcome): void => {
+			publishLifecycleFrame?.({
+				type: "agent_end",
+				sessionId: ctx.sessionManager.getSessionId(),
+				...correlation,
+				outcome,
+			});
+		};
+		const publishFailure = (error: unknown): void => {
+			const failure = sanitizePromptFailure(error);
+			publishLifecycleFrame?.({
+				type: "agent_failed",
+				sessionId: ctx.sessionManager.getSessionId(),
+				...correlation,
+				error: failure,
+			});
+			publishTerminal(canonicalFailedOutcome(failure));
+		};
 		const preflight = Promise.withResolvers<void>();
 		let accepted = false;
 		let settled = false;
@@ -2484,11 +2548,25 @@ function createControlSurface(
 							retirePendingOwner?.(kind, correlation);
 							const attemptTerminalization = async (remaining: number): Promise<void> => {
 								try {
+									const before = reconciliation.lookup(kind, correlation) as {
+										status?: string;
+									};
+									const alreadyTerminal = before.status === "terminal_ok" || before.status === "failed";
 									await reconciliation.noteTransition(kind, correlation, {
 										type: "agent_end",
 										...(typeof result === "string" ? { content: sanitizeTurnResultContent(result) } : {}),
 									});
 									onInvocationCompletionReconciledForTests?.(kind, correlation);
+									if (!alreadyTerminal) {
+										const settledRecord = reconciliation.lookup(kind, correlation) as {
+											status?: string;
+											outcome?: unknown;
+											error?: { code?: unknown; message?: unknown };
+										};
+										const outcome = canonicalTerminalOutcome(settledRecord.outcome, settledRecord.error);
+										if (outcome?.kind === "failed") publishFailure(settledRecord.error ?? outcome);
+										else if (outcome) publishTerminal(outcome);
+									}
 									retirePendingOwner?.(kind, correlation, "always");
 								} catch (transitionError) {
 									if (kind === "prompt" || kind === "skill") {
@@ -2585,6 +2663,7 @@ function createControlSurface(
 								}
 								try {
 									await reconciliation.noteTransition(kind, correlation, { type: "agent_end" });
+									publishFailure(error);
 								} catch (transitionError) {
 									if (kind === "prompt" || kind === "skill") {
 										retirePendingOwner?.(
@@ -3940,7 +4019,11 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				waitForGateResolutionQuiescence: () => Promise<void>;
 				activeInvocation?: { kind: InvocationKind; correlation: InvocationCorrelation };
 				drainedInvocations?: Array<{ kind: InvocationKind; correlation: InvocationCorrelation }>;
-				attachedInvocations?: Array<{ kind: InvocationKind; correlation: InvocationCorrelation }>;
+				attachedInvocations?: Array<{
+					kind: InvocationKind;
+					correlation: InvocationCorrelation;
+					connectionId: string | undefined;
+				}>;
 				openLifecycleBatches: Array<{
 					epoch: number;
 					invocations: Array<{
@@ -3949,7 +4032,11 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 						connectionId: string | undefined;
 						sdkRunToken: string;
 					}>;
-					attachedInvocations: Array<{ kind: InvocationKind; correlation: InvocationCorrelation }>;
+					attachedInvocations: Array<{
+						kind: InvocationKind;
+						correlation: InvocationCorrelation;
+						connectionId: string | undefined;
+					}>;
 				}>;
 				disposeGate?: () => void;
 				lifecycleActive: boolean;
@@ -4142,6 +4229,8 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		terminalContent?: TurnResultContent,
 		terminalHasActivity = false,
 		terminalOutcome?: InvocationOutcome,
+		stopReason?: AgentEndEvent["stopReason"],
+		startToken?: string,
 	): Promise<void> => {
 		const current = lifecycleOwner?.state ?? active;
 		if (!current) return;
@@ -4216,19 +4305,44 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			// turn (queued-while-streaming submissions never push), so a mid-prompt
 			// continuation agent_start with an empty queue leaves the current owner
 			// untouched (review thread P1).
-			const drained = current.pending
-				.splice(0)
+			const matchingPending =
+				typeof startToken === "string" && startToken.length > 0
+					? current.pending.filter(entry => entry.sdkRunToken === startToken)
+					: current.pending.slice();
+			const matchingKeys = new Set(matchingPending.map(entry => entry.sdkRunToken));
+			const pendingSnapshot = current.pending.splice(0);
+			const drained = pendingSnapshot
+				.filter(entry => matchingKeys.has(entry.sdkRunToken))
 				.filter(entry => entry.kind !== "prompt" || !current.deadlineManager.isExpiring(entry.correlation));
+			current.pending.push(...pendingSnapshot.filter(entry => !matchingKeys.has(entry.sdkRunToken)));
+			const existingTokenBatch =
+				typeof startToken === "string" && startToken.length > 0
+					? lifecycleRunOwners.get(startToken)?.batch
+					: undefined;
 			if (drained.length > 0) {
-				current.openLifecycleBatches.push({
+				const batch: LifecycleBatch = {
 					epoch: current.lifecycleEpoch,
 					invocations: drained,
 					attachedInvocations: [],
-				});
+				};
+				current.openLifecycleBatches.push(batch);
+				if (typeof startToken === "string" && startToken.length > 0) {
+					const entry = drained.find(item => item.sdkRunToken === startToken);
+					lifecycleRunOwners.set(startToken, {
+						state: current,
+						batch,
+						...(entry ? { correlationKey: lifecycleCorrelationKey(entry.correlation) } : {}),
+					});
+				}
 				adoptLifecycleBatch(drained);
 				if (current.activeInvocation?.kind === "prompt") {
 					current.deadlineManager.onAccepted(current.activeInvocation.correlation);
 				}
+			} else if (existingTokenBatch && current.openLifecycleBatches.includes(existingTokenBatch)) {
+				// A continuation within the same SDK-owned run carries the same token
+				// but has no newly pending invocation. Preserve the established owner so
+				// later chunks and the final terminal remain directed to its submitters.
+				adoptLifecycleBatch(existingTokenBatch.invocations);
 			} else {
 				// An empty drain is an agent-initiated successor run. Clear the
 				// predecessor's SDK owner and active invocation so abort ownership and
@@ -4240,7 +4354,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			// Pair this agent_end with the oldest unmatched start. A delayed
 			// aborted-turn end that lands after a successor agent_start must
 			// terminalize the aborted invocation, never the successor.
-			const ended = current.openLifecycleBatches[0];
+			const ended = failureBatch ?? current.openLifecycleBatches[0];
 			const baseTransitions = ended
 				? ended.invocations.map(({ kind, correlation }) => ({ kind, correlation }))
 				: current.activeInvocation
@@ -4485,7 +4599,31 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 						observed = false;
 					}
 				}
+			} else if (type === "agent_end" && transitions.length > 0) {
+				// An invocation-owned terminal must carry the identity it was accepted
+				// under and the normalized outcome. A client that submitted this turn
+				// matches the terminal against its own acknowledged correlation and
+				// refuses an unowned one, so the bare `{ type, sessionId }` boundary left
+				// every externally submitted prompt reporting `working` forever even
+				// though the turn had finished -- ACP dropped it as
+				// `incomplete_correlation`, and the notifications runtime has always
+				// stamped both fields for exactly this reason. One frame per invocation,
+				// matching the agent_failed shape above, also lets a shared run attribute
+				// the boundary to each owner instead of one signal nobody can claim. A
+				// continuing maintenance checkpoint never reaches this branch: it returned
+				// above with the one uncorrelated frame, so it cannot settle a live prompt.
+				const outcome = terminalOutcome ?? terminalStoppedOutcome(stopReason, maintenanceOutcome);
+				for (const invocation of transitions) {
+					try {
+						current.runtime.emitEvent({ type, sessionId, ...invocation.correlation, outcome });
+					} catch {
+						observed = false;
+					}
+				}
 			} else {
+				// Everything that does not terminalize an owned invocation keeps the one
+				// uncorrelated frame: `agent_start` and a host-originated run (autonomous
+				// continuation, cron, monitor) that owns no invocation.
 				try {
 					current.runtime.emitEvent({ type, sessionId });
 				} catch {
@@ -4553,29 +4691,22 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 	};
 	api.on("agent_start", (event, ctx) => {
 		const owner = lifecycleStateForEvent(ctx, "agent_start", event.sdkRunToken);
-		return trackLifecycle(async () => {
-			await emitLifecycle(
-				"agent_start",
-				ctx,
-				undefined,
-				undefined,
-				owner ? { state: owner, sessionId: owner.sessionId } : undefined,
-			);
-			if (owner && typeof event.sdkRunToken === "string" && event.sdkRunToken.length > 0) {
-				const batch = owner.openLifecycleBatches.at(-1);
-				const entry = batch?.invocations.find(item => item.sdkRunToken === event.sdkRunToken);
-				const previous = lifecycleRunOwners.get(event.sdkRunToken);
-				lifecycleRunOwners.set(event.sdkRunToken, {
-					state: owner,
-					batch,
-					...(previous?.correlationKey !== undefined
-						? { correlationKey: previous.correlationKey }
-						: entry
-							? { correlationKey: lifecycleCorrelationKey(entry.correlation) }
-							: {}),
-				});
-			}
-		}, owner);
+		return trackLifecycle(
+			async () =>
+				emitLifecycle(
+					"agent_start",
+					ctx,
+					undefined,
+					undefined,
+					owner ? { state: owner, sessionId: owner.sessionId } : undefined,
+					undefined,
+					false,
+					undefined,
+					undefined,
+					typeof event.sdkRunToken === "string" ? event.sdkRunToken : undefined,
+				),
+			owner,
+		);
 	});
 	api.on("agent_end", (event, ctx) => {
 		const tokenBinding =
@@ -4608,11 +4739,20 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		const failureAlreadyPublished = failure === undefined || (hasExistingFailure && genericFailureKeys.length === 0);
 		const terminalEvidence = promptTerminalEvidenceFromAgentEnd(event);
 		const terminalOutcome =
-			event.stopReason === "cancelled"
-				? ({ kind: "stopped", reason: "cancelled", provenance: "client_cancel" } as const)
-				: failure === undefined
-					? undefined
-					: canonicalFailedOutcome(failure);
+			event.stopReason === "cancelled" ||
+			(event.stopReason === "maintenance" && event.maintenanceOutcome === "aborted")
+				? terminalStoppedOutcome(
+						event.stopReason,
+						event.stopReason === "maintenance" ? event.maintenanceOutcome : undefined,
+					)
+				: failure !== undefined
+					? canonicalFailedOutcome(failure)
+					: terminalEvidence.content?.text.trim() || terminalEvidence.hasActivity
+						? terminalStoppedOutcome(
+								event.stopReason,
+								event.stopReason === "maintenance" ? event.maintenanceOutcome : undefined,
+							)
+						: canonicalFailedOutcome(EMPTY_PROMPT_FAILURE);
 		return trackLifecycle(async () => {
 			if (failure && !failureAlreadyPublished) {
 				for (const key of genericFailureKeys) owner?.failureDiagnosticKeys.delete(key);
@@ -4627,6 +4767,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				terminalEvidence.content,
 				terminalEvidence.hasActivity,
 				terminalOutcome,
+				event.stopReason,
 			);
 		}, owner).finally(() => {
 			if (typeof event.sdkRunToken === "string" && lifecycleRunOwners.get(event.sdkRunToken)?.state === owner)
@@ -4716,11 +4857,84 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				current.deadlineManager.onAttributableEvent(invocation.correlation, eventType);
 		}
 	};
-	api.on("tool_execution_start", async (_event, ctx) => {
+	/**
+	 * Stream one turn event to the connections that submitted the running turn.
+	 *
+	 * This is the same frame the notifications runtime sends for an ACP-launched
+	 * session (`{ type: "event", kind, payload: { event_type, event }, ...correlation }`),
+	 * built from the same shared producer, so an ACP client attached to a live
+	 * interactive session renders assistant text and tool calls exactly as it does
+	 * for a session it started itself. Without it an attached client could drive
+	 * the session and see the turn settle but never receive a single word of the
+	 * answer.
+	 *
+	 * Scoped to the owning invocations of the batch that is actually running: a
+	 * turn nobody submitted over the SDK (an ordinary terminal prompt, an
+	 * autonomous continuation, cron, monitor) has no owner connection and streams
+	 * nothing at all, so a session with no attached client pays one map lookup.
+	 */
+	const STREAMED_TURN_EVENT_TYPES: ReadonlySet<string> = new Set([
+		"message_update",
+		"message_end",
+		"tool_execution_start",
+		"tool_execution_update",
+		"tool_execution_end",
+	]);
+	const streamTurnEvent = (event: { type?: unknown } | null | undefined, ctx: ExtensionContext): void => {
+		const current = lifecycleStateForContext(ctx, "agent_start");
+		const activeInvocation = current?.activeInvocation;
+		if (!current) return;
+		const batch = activeInvocation
+			? current.openLifecycleBatches.find(candidate =>
+					candidate.invocations.some(
+						entry =>
+							entry.correlation.commandId === activeInvocation.correlation.commandId &&
+							entry.correlation.turnId === activeInvocation.correlation.turnId,
+					),
+				)
+			: undefined;
+		const invocations = batch
+			? [...batch.invocations, ...batch.attachedInvocations]
+			: current.lifecycleActive
+				? (current.attachedInvocations ?? [])
+				: [];
+		if (invocations.length === 0) return;
+		// The handlers below also renew prompt deadlines, so streaming must never
+		// throw out of them: a frame the wire producer does not recognize is dropped.
+		if (!event || typeof event.type !== "string" || !STREAMED_TURN_EVENT_TYPES.has(event.type)) return;
+		try {
+			const payload = toAgentWireEventPayload(event as AgentSessionEvent);
+			// One frame per owning invocation, each carrying its own correlation, so a
+			// shared run lets every submitter attribute the content to its own prompt.
+			for (const invocation of invocations) {
+				if (invocation.connectionId === undefined) continue;
+				current.runtime.sendFrameTo([invocation.connectionId], {
+					type: "event",
+					kind: event.type,
+					payload,
+					...invocation.correlation,
+				});
+			}
+		} catch {
+			// Streamed content is best-effort; the turn producing it is authoritative.
+		}
+	};
+	api.on("tool_execution_start", async (event, ctx) => {
 		renewAttributableProgress("tool_execution_start", ctx);
+		streamTurnEvent(event, ctx);
 	});
-	api.on("tool_execution_end", async (_event, ctx) => {
+	api.on("tool_execution_update", async (event, ctx) => {
+		streamTurnEvent(event, ctx);
+	});
+	api.on("tool_execution_end", async (event, ctx) => {
 		renewAttributableProgress("tool_execution_end", ctx);
+		streamTurnEvent(event, ctx);
+	});
+	api.on("message_update", async (event, ctx) => {
+		streamTurnEvent(event, ctx);
+	});
+	api.on("message_end", async (event, ctx) => {
+		streamTurnEvent(event, ctx);
 	});
 	const errorCode = (error: unknown): string | undefined =>
 		typeof error === "object" &&
@@ -4784,7 +4998,11 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				connectionId: string | undefined;
 				sdkRunToken: string;
 			}>;
-			attachedInvocations: Array<{ kind: InvocationKind; correlation: InvocationCorrelation }>;
+			attachedInvocations: Array<{
+				kind: InvocationKind;
+				correlation: InvocationCorrelation;
+				connectionId: string | undefined;
+			}>;
 		}> = [];
 		const configRevision = { current: 0 };
 		let acceptingGateResolutions = true;
@@ -4913,6 +5131,19 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					// 2. Terminal boundary. The durable error from step 1 makes this
 					// classify as failed, never terminal_ok.
 					await reconciliation.noteTransition(kind, correlation, { type: "agent_end" });
+					const failure = sanitizePromptFailure(Object.assign(new Error(error.message), { code: error.code }));
+					runtime.emitEvent({
+						type: "agent_failed",
+						sessionId,
+						...correlation,
+						error: failure,
+					});
+					runtime.emitEvent({
+						type: "agent_end",
+						sessionId,
+						...correlation,
+						outcome: canonicalFailedOutcome(failure),
+					});
 					// 3. Release recovery ownership ONLY after durable terminalization.
 					deadlineManager.clear(correlation);
 				} catch (transitionError) {
@@ -5065,7 +5296,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 								entry.correlation.turnId === correlation.turnId,
 						)
 					)
-						current.attachedInvocations.push({ kind, correlation });
+						current.attachedInvocations.push({ kind, correlation, connectionId });
 					if (
 						activeBatch &&
 						!activeBatch.attachedInvocations.some(
@@ -5074,7 +5305,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 								entry.correlation.turnId === correlation.turnId,
 						)
 					)
-						activeBatch.attachedInvocations.push({ kind, correlation });
+						activeBatch.attachedInvocations.push({ kind, correlation, connectionId });
 					bindPromotedToken(activeBatch);
 					return;
 				}
@@ -5157,6 +5388,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			() => acceptingGateResolutions,
 			trackGateResolution,
 			options.onInvocationCompletionReconciledForTests,
+			frame => runtime.emitEvent(frame),
 		);
 		const installProviderDefinitions = (capability: string, definitions: unknown): void => {
 			if (capability === "permission") {

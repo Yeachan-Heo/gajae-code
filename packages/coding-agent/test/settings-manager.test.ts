@@ -138,6 +138,34 @@ describe("Settings", () => {
 		}
 	});
 
+	it("keeps Paseo announcement operator-owned instead of workspace-controlled", async () => {
+		await writeSettings({ paseo: { autoImport: true } });
+		await Bun.write(
+			path.join(getProjectAgentDir(projectDir), "config.yml"),
+			YAML.stringify({ paseo: { autoImport: false } }, null, 2),
+		);
+		const globalWins = await Settings.loadForScope({ cwd: projectDir, agentDir });
+		try {
+			expect(globalWins.get("paseo.autoImport")).toBe(true);
+			expect(globalWins.getGlobal("paseo.autoImport")).toBe(true);
+		} finally {
+			await globalWins.close();
+		}
+
+		await Bun.write(getConfigPath(), "{}\n");
+		await Bun.write(
+			path.join(getProjectAgentDir(projectDir), "config.yml"),
+			YAML.stringify({ paseo: { autoImport: true } }, null, 2),
+		);
+		const projectIgnored = await Settings.loadForScope({ cwd: projectDir, agentDir });
+		try {
+			expect(projectIgnored.get("paseo.autoImport")).toBe(false);
+			expect(projectIgnored.getGlobal("paseo.autoImport")).toBeUndefined();
+		} finally {
+			await projectIgnored.close();
+		}
+	});
+
 	it("does not close the global storage when an SDK scope is disposed", async () => {
 		const global = await Settings.init({ cwd: projectDir, agentDir });
 		const scoped = await Settings.loadForScope({ cwd: projectDir, agentDir });

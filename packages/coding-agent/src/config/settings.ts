@@ -333,6 +333,7 @@ const PATH_SCOPED_ARRAY_SETTINGS = new Set<SettingPath>(["enabledModels", "disab
 const GLOBAL_ONLY_SETTINGS = new Set<SettingPath>([
 	"crashReport.upstream",
 	"crashReport.upstreamDsn",
+	"paseo.autoImport",
 	"ui.language",
 	"telemetry.enabled",
 ]);
