@@ -85,8 +85,15 @@ export interface PaseoAnnounceDependencies {
 		readonly providerKey: string;
 		readonly cwd: string;
 		readonly sessionId: string;
+		readonly daemonTarget: PaseoDaemonTarget;
 		readonly signal?: AbortSignal;
 	}): Promise<PaseoAnnounceOutcome>;
+}
+
+function formatDaemonTarget(target: PaseoDaemonTarget): string {
+	if (target.kind === "ipc") return `unix://${target.socketPath}`;
+	const host = target.host.includes(":") ? `[${target.host}]` : target.host;
+	return `${host}:${target.port}`;
 }
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
@@ -236,7 +243,14 @@ export async function announceSessionToPaseo(
 	// `session/load` resume a copy instead of attaching to the running host.
 	if (!(await deps.isSessionLive(input.sessionId, input.cwd))) return { kind: "skipped", reason: "session-not-live" };
 
-	return await deps.runImport({ cli, providerKey, cwd: input.cwd, sessionId: input.sessionId, signal });
+	return await deps.runImport({
+		cli,
+		providerKey,
+		cwd: input.cwd,
+		sessionId: input.sessionId,
+		daemonTarget: target,
+		signal,
+	});
 }
 
 /** Only a daemon that is not up yet, or a registration that has not landed yet, is worth retrying. */
@@ -375,6 +389,7 @@ function runImport(env: NodeJS.ProcessEnv) {
 		readonly providerKey: string;
 		readonly cwd: string;
 		readonly sessionId: string;
+		readonly daemonTarget: PaseoDaemonTarget;
 		readonly signal?: AbortSignal;
 	}): Promise<PaseoAnnounceOutcome> => {
 		const timeoutController = new AbortController();
@@ -385,7 +400,12 @@ function runImport(env: NodeJS.ProcessEnv) {
 		try {
 			const child = Bun.spawn(
 				[input.cli, "import", "--provider", input.providerKey, "--cwd", input.cwd, input.sessionId],
-				{ stdout: "pipe", stderr: "pipe", signal, env },
+				{
+					stdout: "pipe",
+					stderr: "pipe",
+					signal,
+					env: { ...env, PASEO_HOST: formatDaemonTarget(input.daemonTarget) },
+				},
 			);
 			const [exitCode, stderr] = await Promise.all([child.exited, new Response(child.stderr).text()]);
 			if (input.signal?.aborted) return { kind: "failed", detail: "Paseo announcement cancelled" };
