@@ -1458,6 +1458,72 @@ export async function withSessionTransaction<T>(
 	);
 }
 
+/**
+ * Rebinds a pre-file-identity session WAL after the broker has proved the exact
+ * current endpoint row. The caller supplies both digests so this helper cannot
+ * silently adopt an unrelated successor; the WAL lock makes the rewrite durable
+ * before any projection is refreshed.
+ */
+export async function rewriteSessionEndpointAuthority(
+	paths: CoordinatorStatePaths,
+	sessionId: string,
+	expectedLegacyEndpointIncarnation: string,
+	currentEndpointIncarnation: string,
+	endpointFileId: string,
+	options: { signal?: AbortSignal } = {},
+): Promise<CanonicalSessionSnapshotV1> {
+	if (
+		!/^[a-f0-9]{64}$/.test(expectedLegacyEndpointIncarnation) ||
+		!/^[a-f0-9]{64}$/.test(currentEndpointIncarnation) ||
+		endpointFileId.length === 0 ||
+		endpointFileId.length > 256 ||
+		/[\u0000-\u001f\u007f]/u.test(endpointFileId)
+	)
+		throw new Error("state_corrupt");
+	let rewritten: CanonicalSessionSnapshotV1 | null = null;
+	await withSessionTransaction(
+		paths,
+		sessionId,
+		async transaction => {
+			const broker = transaction.canonical.session.broker;
+			if (broker.endpoint_file_id !== undefined) {
+				if (
+					broker.endpoint_file_id !== endpointFileId ||
+					broker.endpoint_incarnation !== currentEndpointIncarnation
+				)
+					throw new Error("endpoint_stale");
+				rewritten = transaction.canonical.session;
+				return;
+			}
+			if (broker.endpoint_incarnation !== expectedLegacyEndpointIncarnation) throw new Error("endpoint_stale");
+			broker.endpoint_incarnation = currentEndpointIncarnation;
+			broker.endpoint_file_id = endpointFileId;
+			if (transaction.endpoint === null) {
+				transaction.endpoint = { incarnation: currentEndpointIncarnation, observed_at: new Date().toISOString() };
+			} else {
+				transaction.endpoint.incarnation = currentEndpointIncarnation;
+			}
+			for (const turn of Object.values(transaction.canonical.turns))
+				if (turn.runtime_provenance) turn.runtime_provenance.endpoint_incarnation = currentEndpointIncarnation;
+			for (const authority of Object.values(transaction.canonical.gate_authorities)) {
+				authority.authority.endpoint_incarnation = currentEndpointIncarnation;
+				if (authority.observation.kind === "valid")
+					authority.observation.first_provenance.endpoint_incarnation = currentEndpointIncarnation;
+			}
+			for (const question of Object.values(transaction.canonical.questions))
+				question.endpoint_incarnation = currentEndpointIncarnation;
+			for (const request of Object.values(transaction.requests.answers)) {
+				request.endpoint_incarnation = currentEndpointIncarnation;
+				if (request.safe_receipt) request.safe_receipt.endpoint_incarnation = currentEndpointIncarnation;
+			}
+			rewritten = transaction.canonical.session;
+		},
+		options,
+	);
+	if (!rewritten) throw new Error("state_corrupt");
+	return rewritten;
+}
+
 /** Remove a retained-session hint once its WAL has no unacknowledged deliveries. */
 async function pruneRetainedSessionIfEmpty(
 	paths: CoordinatorStatePaths,
@@ -2476,6 +2542,31 @@ function assertCreationRetirementProofMatches(
 	}
 	const staged = includeStaged ? request.retirement_intent : undefined;
 	if (staged && !sameCreationRetirementProof(staged.proof, proof)) throw new Error("idempotency_conflict");
+}
+
+/** Upgrades only a legacy missing endpoint file identity after external exact-row proof. */
+export async function upgradeCreationRetirementEndpointFileId(
+	paths: CoordinatorStatePaths,
+	keyDigest: string,
+	legacyProof: CreationRetirementProofV1,
+	endpointFileId: string,
+): Promise<CreationRequestV1> {
+	return await withNamespaceRegistry(paths, async registry => {
+		const request = registry.creations[keyDigest];
+		if (!request) throw new Error("state_corrupt");
+		if (legacyProof.endpoint_file_id !== undefined || !endpointFileId) throw new Error("invalid_input");
+		const intent = request.canonical_create_intent;
+		if (!intent || intent.session.broker.endpoint_file_id !== undefined) throw new Error("idempotency_conflict");
+		assertCreationRetirementProofMatches(request, legacyProof);
+		intent.session.broker.endpoint_file_id = endpointFileId;
+		if (request.retirement_intent) {
+			if (request.retirement_intent.proof.endpoint_file_id !== undefined) throw new Error("idempotency_conflict");
+			request.retirement_intent.proof.endpoint_file_id = endpointFileId;
+			request.retirement_intent.updated_at = new Date().toISOString();
+		}
+		request.updated_at = new Date().toISOString();
+		return request;
+	});
 }
 
 /** Claims retirement under the creation receipt before any broker effect. */

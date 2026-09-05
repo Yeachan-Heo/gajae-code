@@ -2103,7 +2103,7 @@ function retirementIdentityFromInput(
 	const processIdentity = text(input.processIncarnation);
 	const hostIdentity = text(input.hostIncarnation);
 	const remoteCreateKey = text(input.remoteCreateKey);
-	const endpointFileId = text(input.endpointFileId);
+	const suppliedEndpointFileId = text(input.endpointFileId);
 	const endpointGeneration = input.endpointGeneration;
 	const endpointMtimeMs = input.endpointMtimeMs;
 	if (
@@ -2113,7 +2113,7 @@ function retirementIdentityFromInput(
 		!processIdentity ||
 		!hostIdentity ||
 		!remoteCreateKey ||
-		(input.endpointFileId !== undefined && endpointFileId === undefined) ||
+		(input.endpointFileId !== undefined && suppliedEndpointFileId === undefined) ||
 		typeof endpointGeneration !== "number" ||
 		!Number.isSafeInteger(endpointGeneration) ||
 		endpointGeneration <= 0 ||
@@ -2126,6 +2126,13 @@ function retirementIdentityFromInput(
 		!boundedRetirementString(hostIdentity, MAX_PROCESS_INCARNATION_LENGTH)
 	)
 		return fail("invalid_input", "Retirement requires the complete indexed identity proof.");
+	// Pre-file-identity callers may omit endpoint_file_id. In that one legacy
+	// shape, upgrade from the exact current indexed row. A caller-supplied ID
+	// must already equal the indexed row; this rejects arbitrary IDs for both
+	// identity-bearing and identity-less rows.
+	if (suppliedEndpointFileId !== undefined && suppliedEndpointFileId !== record.endpointFileId)
+		return fail("retirement_proof_stale", "Retirement endpoint file identity does not match the indexed session.");
+	const endpointFileId = record.endpointFileId;
 	const identity: LifecycleRetirementIdentity = {
 		sessionId: record.sessionId,
 		stateRoot,
