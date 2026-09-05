@@ -1,5 +1,5 @@
 {
-  "contractVersion": 52,
+  "contractVersion": 53,
   "inventory": {
     "telegram": {
       "packages/coding-agent/src/sdk/bus/telegram-daemon-contract.ts": [
@@ -248,6 +248,22 @@
         "sameIndexedAuthority",
         "matchesAdoptedSessionAuthority"
       ],
+      "packages/coding-agent/src/sdk/bus/chat-effect-journal.ts": [
+        "sessionMutationGateFileName",
+        "mappingAcceptsAuthority",
+        "collectAttachmentAuthorityIds",
+        "rewriteAttachmentAuthorityIds",
+        "ChatEffectJournal.#sessionGateStores",
+        "ChatEffectJournal.#createSessionGateStore",
+        "withSessionMutationGate",
+        "migrateAttachmentAuthorityId",
+        "migrateAttachmentAuthorityIdWhileHoldingGate",
+        "enqueue",
+        "enqueueWhileHoldingSessionMutationGate",
+        "enqueueAndClaim",
+        "enqueueAndClaimWhileHoldingSessionMutationGate",
+        "ChatEffectJournal.#prepareEnqueue"
+      ],
       "packages/coding-agent/src/sdk/client/discovery.ts": [
         "readSdkSessionEndpoint"
       ],
@@ -357,6 +373,22 @@
         "sameIndexedAuthority",
         "matchesAdoptedSessionAuthority"
       ],
+      "packages/coding-agent/src/sdk/bus/chat-effect-journal.ts": [
+        "sessionMutationGateFileName",
+        "mappingAcceptsAuthority",
+        "collectAttachmentAuthorityIds",
+        "rewriteAttachmentAuthorityIds",
+        "ChatEffectJournal.#sessionGateStores",
+        "ChatEffectJournal.#createSessionGateStore",
+        "withSessionMutationGate",
+        "migrateAttachmentAuthorityId",
+        "migrateAttachmentAuthorityIdWhileHoldingGate",
+        "enqueue",
+        "enqueueWhileHoldingSessionMutationGate",
+        "enqueueAndClaim",
+        "enqueueAndClaimWhileHoldingSessionMutationGate",
+        "ChatEffectJournal.#prepareEnqueue"
+      ],
       "packages/coding-agent/src/sdk/client/discovery.ts": [
         "readSdkSessionEndpoint"
       ],
@@ -440,6 +472,20 @@
     "discord:packages/coding-agent/src/sdk/bus/chat-daemon-control.ts:withStateWriteLock": "37f9c3d754c08b87c3ac0761d79e060b75926dea2817d23ca801898119b0d202",
     "discord:packages/coding-agent/src/sdk/bus/chat-daemon-control.ts:writeChatDaemonControlRequest": "96a21ae816b1c4c8209c6f629f6f17920a72cf4476e35d13ed5bbeaa35c4ff6a",
     "discord:packages/coding-agent/src/sdk/bus/chat-daemon-control.ts:writeJson": "5d55b301451dae6d354b0a1f0bb2e9f401012791d3d0f61f0f9ce886d49e64a8",
+    "discord:packages/coding-agent/src/sdk/bus/chat-effect-journal.ts:ChatEffectJournal.#createSessionGateStore": "33c73ac0cee7ab1137b8f5b38d644b99ed6d0e4cadbbd3eab9a5d505ba03b5a3",
+    "discord:packages/coding-agent/src/sdk/bus/chat-effect-journal.ts:ChatEffectJournal.#prepareEnqueue": "69a885943423540e074079cfc2530a0e035b3ec6fb28174ea16f672c0cd95302",
+    "discord:packages/coding-agent/src/sdk/bus/chat-effect-journal.ts:ChatEffectJournal.#sessionGateStores": "3384822c729d365876962d9c0cec5add617aa35a6f26b1871c45e28b5667d47c",
+    "discord:packages/coding-agent/src/sdk/bus/chat-effect-journal.ts:collectAttachmentAuthorityIds": "429ecb0b786bdd089c0b9823d4007fbbc7cc8af1939079ce2b5a6e6ba673d89b",
+    "discord:packages/coding-agent/src/sdk/bus/chat-effect-journal.ts:enqueue": "6a24ff656deeaabfd98775a081a9506c3e13fd3ab0e7c09d91a4c0fa4e6784ca",
+    "discord:packages/coding-agent/src/sdk/bus/chat-effect-journal.ts:enqueueAndClaim": "1dbf21bea776b4c16b7897bc40718a24e18e328c5419c78cfbc997158f2923db",
+    "discord:packages/coding-agent/src/sdk/bus/chat-effect-journal.ts:enqueueAndClaimWhileHoldingSessionMutationGate": "710b39337eddbdcaad5884826d28085e5e8afffd1c127bd6faf807f97524871e",
+    "discord:packages/coding-agent/src/sdk/bus/chat-effect-journal.ts:enqueueWhileHoldingSessionMutationGate": "317b21ff49110ceeab97183d91b9a6e0a66f876cefe928079262a3ad1e3f10e7",
+    "discord:packages/coding-agent/src/sdk/bus/chat-effect-journal.ts:mappingAcceptsAuthority": "21c0b23b7b5a4dae8d90e19b7e79e2c1945d514468b47da773a81cde345402bf",
+    "discord:packages/coding-agent/src/sdk/bus/chat-effect-journal.ts:migrateAttachmentAuthorityId": "cd22ed90af3d43224343184e36a0e90c26470499324aeaa1532e42bb3bca1c3a",
+    "discord:packages/coding-agent/src/sdk/bus/chat-effect-journal.ts:migrateAttachmentAuthorityIdWhileHoldingGate": "6fd8e61d5cd19a39b40286bde51cac1d9f7c721e27cc3e22b0cd20ec8c670027",
+    "discord:packages/coding-agent/src/sdk/bus/chat-effect-journal.ts:rewriteAttachmentAuthorityIds": "1a044dc04bbff53adce309af03a337af71fe1cc538bec457ee6629d0c795a885",
+    "discord:packages/coding-agent/src/sdk/bus/chat-effect-journal.ts:sessionMutationGateFileName": "ab9a3f97e93bcb3873c1829c95de89556dc7d21ef5a10dc2149dc4c6d63a6372",
+    "discord:packages/coding-agent/src/sdk/bus/chat-effect-journal.ts:withSessionMutationGate": "d65feb015a9c7aace27664cc6667ed874890b28cd39e87759c5318709acee0d1",
     "discord:packages/coding-agent/src/sdk/bus/config.ts:getNotificationConfig": "ba6398ca150353a58e85eadaf18f4cf6d0ca2cc6a999c0994c9ea08268a07c4e",
     "discord:packages/coding-agent/src/sdk/bus/config.ts:isDiscordComplete": "321c4247e1811ca1b30ed58ac93c1d121c7dc8b78dcb58be3f1a5e6db60c9d1a",
     "discord:packages/coding-agent/src/sdk/bus/config.ts:isProviderEffectivelyEnabled": "06df2d8ae990fd234498d48d00e45c0cedf7dd068d5e2cc54c13f44e079a45d5",
@@ -535,6 +581,20 @@
     "slack:packages/coding-agent/src/sdk/bus/chat-daemon-control.ts:withStateWriteLock": "37f9c3d754c08b87c3ac0761d79e060b75926dea2817d23ca801898119b0d202",
     "slack:packages/coding-agent/src/sdk/bus/chat-daemon-control.ts:writeChatDaemonControlRequest": "96a21ae816b1c4c8209c6f629f6f17920a72cf4476e35d13ed5bbeaa35c4ff6a",
     "slack:packages/coding-agent/src/sdk/bus/chat-daemon-control.ts:writeJson": "5d55b301451dae6d354b0a1f0bb2e9f401012791d3d0f61f0f9ce886d49e64a8",
+    "slack:packages/coding-agent/src/sdk/bus/chat-effect-journal.ts:ChatEffectJournal.#createSessionGateStore": "33c73ac0cee7ab1137b8f5b38d644b99ed6d0e4cadbbd3eab9a5d505ba03b5a3",
+    "slack:packages/coding-agent/src/sdk/bus/chat-effect-journal.ts:ChatEffectJournal.#prepareEnqueue": "69a885943423540e074079cfc2530a0e035b3ec6fb28174ea16f672c0cd95302",
+    "slack:packages/coding-agent/src/sdk/bus/chat-effect-journal.ts:ChatEffectJournal.#sessionGateStores": "3384822c729d365876962d9c0cec5add617aa35a6f26b1871c45e28b5667d47c",
+    "slack:packages/coding-agent/src/sdk/bus/chat-effect-journal.ts:collectAttachmentAuthorityIds": "429ecb0b786bdd089c0b9823d4007fbbc7cc8af1939079ce2b5a6e6ba673d89b",
+    "slack:packages/coding-agent/src/sdk/bus/chat-effect-journal.ts:enqueue": "6a24ff656deeaabfd98775a081a9506c3e13fd3ab0e7c09d91a4c0fa4e6784ca",
+    "slack:packages/coding-agent/src/sdk/bus/chat-effect-journal.ts:enqueueAndClaim": "1dbf21bea776b4c16b7897bc40718a24e18e328c5419c78cfbc997158f2923db",
+    "slack:packages/coding-agent/src/sdk/bus/chat-effect-journal.ts:enqueueAndClaimWhileHoldingSessionMutationGate": "710b39337eddbdcaad5884826d28085e5e8afffd1c127bd6faf807f97524871e",
+    "slack:packages/coding-agent/src/sdk/bus/chat-effect-journal.ts:enqueueWhileHoldingSessionMutationGate": "317b21ff49110ceeab97183d91b9a6e0a66f876cefe928079262a3ad1e3f10e7",
+    "slack:packages/coding-agent/src/sdk/bus/chat-effect-journal.ts:mappingAcceptsAuthority": "21c0b23b7b5a4dae8d90e19b7e79e2c1945d514468b47da773a81cde345402bf",
+    "slack:packages/coding-agent/src/sdk/bus/chat-effect-journal.ts:migrateAttachmentAuthorityId": "cd22ed90af3d43224343184e36a0e90c26470499324aeaa1532e42bb3bca1c3a",
+    "slack:packages/coding-agent/src/sdk/bus/chat-effect-journal.ts:migrateAttachmentAuthorityIdWhileHoldingGate": "6fd8e61d5cd19a39b40286bde51cac1d9f7c721e27cc3e22b0cd20ec8c670027",
+    "slack:packages/coding-agent/src/sdk/bus/chat-effect-journal.ts:rewriteAttachmentAuthorityIds": "1a044dc04bbff53adce309af03a337af71fe1cc538bec457ee6629d0c795a885",
+    "slack:packages/coding-agent/src/sdk/bus/chat-effect-journal.ts:sessionMutationGateFileName": "ab9a3f97e93bcb3873c1829c95de89556dc7d21ef5a10dc2149dc4c6d63a6372",
+    "slack:packages/coding-agent/src/sdk/bus/chat-effect-journal.ts:withSessionMutationGate": "d65feb015a9c7aace27664cc6667ed874890b28cd39e87759c5318709acee0d1",
     "slack:packages/coding-agent/src/sdk/bus/config.ts:getNotificationConfig": "ba6398ca150353a58e85eadaf18f4cf6d0ca2cc6a999c0994c9ea08268a07c4e",
     "slack:packages/coding-agent/src/sdk/bus/config.ts:isProviderEffectivelyEnabled": "06df2d8ae990fd234498d48d00e45c0cedf7dd068d5e2cc54c13f44e079a45d5",
     "slack:packages/coding-agent/src/sdk/bus/config.ts:isSlackComplete": "c077a130d4f4398594ec679ac6c2b20e2c055ba0ea9ed77a1e94e1b6bf1c4192",
