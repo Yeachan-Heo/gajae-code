@@ -516,24 +516,20 @@ export class ChatDaemonRuntime {
 				attachment.legacyAuthorityId === attachment.authorityId
 			)
 				return;
-			try {
-				if (this.#discord)
-					await this.#discord.migrateAttachmentAuthority(
-						attachment.sessionId,
-						attachment.generation,
-						attachment.legacyAuthorityId,
-						attachment.authorityId,
-					);
-				if (this.#slack)
-					await this.#slack.migrateAttachmentAuthority(
-						attachment.sessionId,
-						attachment.generation,
-						attachment.legacyAuthorityId,
-						attachment.authorityId,
-					);
-			} catch (error) {
-				logger.warn(`SDK attachment authority migration remains durably fenced for retry: ${String(error)}`);
-			}
+			if (this.#discord)
+				await this.#discord.migrateAttachmentAuthority(
+					attachment.sessionId,
+					attachment.generation,
+					attachment.legacyAuthorityId,
+					attachment.authorityId,
+				);
+			if (this.#slack)
+				await this.#slack.migrateAttachmentAuthority(
+					attachment.sessionId,
+					attachment.generation,
+					attachment.legacyAuthorityId,
+					attachment.authorityId,
+				);
 		};
 		if (revivedTransport) {
 			const barrier = migrateAttachmentAuthority();
