@@ -38,6 +38,8 @@ import { initializeWithSettings, loadCapability } from "../discovery";
 import { inspectClaudeConvention } from "../discovery/claude";
 import { inspectCodexConvention } from "../discovery/codex";
 import { scanSkillsFromDir } from "../discovery/helpers";
+import { functionHookGrantHash, normalizeFunctionHookGrant } from "../extensibility/extensions/function-hooks";
+import { compileGjcPluginBundle } from "../extensibility/gjc-plugins/compiler";
 import { summarizeGjcPluginObservability } from "../extensibility/gjc-plugins/observability";
 import { loadEffectiveGjcPluginRegistry } from "../extensibility/gjc-plugins/registry";
 import { getEnabledPlugins } from "../extensibility/plugins/loader";
@@ -176,6 +178,8 @@ export interface CustomizeFunctionHookSummary {
 	networkDestinations: string[];
 	filesystemRoots: string[];
 	capabilityHash?: string;
+	implementationHash?: string;
+	quarantineCode?: string;
 	remediation: string;
 }
 
@@ -935,8 +939,11 @@ async function collectHooks(cwd: string, activeSettings: SettingsInstance): Prom
 		nameOf: hook => hook.name,
 		pathOf: hook => hook.path,
 		notExecutedDetail:
-			"Discovered and shown in the extension dashboard, but standalone sessions do not execute hook files. Runtime hooks come from validated GJC plugin bundles.",
-		notExecutedRemediation: ["See `gjc plugin list` for plugin bundles that contribute runtime hooks"],
+			"Trusted filesystem hook module discovered for session-start activation. Doctor does not execute the module, so dynamic Function Hook registrations and effective runtime order remain opaque until a session loads it.",
+		notExecutedRemediation: [
+			"Review the trusted hook source before session startup",
+			"Use plugin-bundle Function Hooks for declarative grants, hashes, quarantine, and metadata-only policy inspection",
+		],
 	});
 }
 
@@ -1165,12 +1172,44 @@ async function collectPluginBundles(cwd: string): Promise<CustomizeDoctorSurface
 	const bundleEntries = await loadEffectiveGjcPluginRegistry(cwd, { migrate: false });
 	const observability = await summarizeGjcPluginObservability(cwd, { migrate: false });
 	const items: CustomizeDoctorItem[] = [...npmItems];
+	let globalFunctionHookOrder = 0;
 	for (const entry of bundleEntries) {
 		const surfaces = observability.surfaces.filter(s => s.plugin === entry.name && s.scope === entry.scope);
-		const functionHooks: CustomizeFunctionHookSummary[] = entry.surfaces.hooks.map((hook, order) => {
+		let compiledHooks = new Map<
+			string,
+			Awaited<ReturnType<typeof compileGjcPluginBundle>>["surfaces"]["hooks"][number]
+		>();
+		try {
+			const compiled = await compileGjcPluginBundle(entry.pluginRoot);
+			compiledHooks = new Map(compiled.surfaces.hooks.map(hook => [hook.extensionId, hook]));
+		} catch {
+			// Existing observability reports unreadable/hash-drift bundles. Keep
+			// declarative rows visible and mark unmatched metadata quarantined.
+		}
+		const functionHooks: CustomizeFunctionHookSummary[] = entry.surfaces.hooks.map(hook => {
 			const observed = surfaces.find(surface => surface.extensionId === hook.extensionId);
+			const compiled = compiledHooks.get(hook.extensionId);
+			let metadataValid = compiled !== undefined;
+			try {
+				const grant = normalizeFunctionHookGrant({
+					capabilities: hook.capabilities,
+					networkDestinations: hook.networkDestinations,
+					filesystemRoots: hook.filesystemRoots,
+				});
+				metadataValid =
+					metadataValid &&
+					hook.functionHook === compiled?.functionHook &&
+					hook.event === compiled?.event &&
+					hook.target === compiled?.target &&
+					hook.phase === compiled?.phase &&
+					hook.relativePath === compiled?.relativePath &&
+					hook.implementationHash === compiled?.implementationHash &&
+					(hook.functionHook !== true || hook.capabilityHash === functionHookGrantHash(grant));
+			} catch {
+				metadataValid = false;
+			}
 			const status: CustomizeFunctionHookSummary["status"] =
-				observed?.status === "quarantined"
+				!metadataValid || observed?.status === "quarantined"
 					? "quarantined"
 					: !entry.enabled || entry.disabledSurfaceIds.includes(hook.extensionId)
 						? "disabled"
@@ -1179,7 +1218,7 @@ async function collectPluginBundles(cwd: string): Promise<CustomizeDoctorSurface
 							: "legacy-active";
 			return {
 				extensionId: hook.extensionId,
-				order,
+				order: globalFunctionHookOrder++,
 				event: hook.event,
 				...(hook.target === undefined ? {} : { target: hook.target }),
 				...(hook.phase === undefined ? {} : { phase: hook.phase }),
@@ -1190,9 +1229,20 @@ async function collectPluginBundles(cwd: string): Promise<CustomizeDoctorSurface
 				requestedCapabilities: [...(hook.capabilities ?? [])],
 				effectiveCapabilities: [...(hook.capabilities ?? [])],
 				attenuateDownstream: [],
-				networkDestinations: [...(hook.networkDestinations ?? [])],
+				networkDestinations: (hook.networkDestinations ?? []).map(destination => {
+					try {
+						const url = new URL(destination);
+						return url.protocol === "https:" && !url.username && !url.password ? url.origin : "[redacted]";
+					} catch {
+						return "[redacted]";
+					}
+				}),
 				filesystemRoots: [...(hook.filesystemRoots ?? [])],
 				...(hook.capabilityHash === undefined ? {} : { capabilityHash: hook.capabilityHash }),
+				...(hook.implementationHash === undefined ? {} : { implementationHash: hook.implementationHash }),
+				...(observed?.quarantineCode === undefined && metadataValid
+					? {}
+					: { quarantineCode: observed?.quarantineCode ?? "security_policy" }),
 				remediation:
 					status === "blocked-isolate"
 						? "Function Hook remains disabled until a capability-enforcing plugin isolate is available."
@@ -1649,6 +1699,8 @@ export function renderCustomizeDoctorText(report: CustomizeDoctorReport): string
 				if (hook.filesystemRoots.length > 0)
 					lines.push(`      filesystem roots: ${hook.filesystemRoots.join(",")}`);
 				if (hook.capabilityHash) lines.push(`      capability hash: ${hook.capabilityHash}`);
+				if (hook.implementationHash) lines.push(`      implementation hash: ${hook.implementationHash}`);
+				if (hook.quarantineCode) lines.push(`      quarantine code: ${hook.quarantineCode}`);
 				lines.push(`      remediation: ${hook.remediation}`);
 			}
 			for (const fix of item.remediation) lines.push(`    fix: ${fix}`);

@@ -674,6 +674,37 @@ describe("capability-scoped function hooks", () => {
 		expect(result?.content).toEqual([{ type: "text", text: "function transformed" }]);
 	});
 
+	test("preserves original tool errors for legacy-only no-op handlers", async () => {
+		const extension = makeExtension([]);
+		extension.handlers.set("tool_result", [async () => undefined]);
+		const runner = new ExtensionRunner(
+			[extension],
+			new ExtensionRuntime(),
+			process.cwd(),
+			SessionManager.inMemory(),
+			{} as never,
+		);
+		const original = new TypeError("typed failure");
+		const wrapped = new ExtensionToolWrapper(
+			{
+				name: "read",
+				label: "Read",
+				description: "Read a file",
+				parameters: Type.Object({ path: Type.String() }),
+				execute: async () => {
+					throw original;
+				},
+			},
+			runner,
+		);
+		try {
+			await wrapped.execute("call-1", { path: "safe.txt" });
+			throw new Error("expected tool failure");
+		} catch (error) {
+			expect(error).toBe(original);
+		}
+	});
+
 	test("snapshots a returned transformation before downstream dispatch", async () => {
 		const runner = makeRunner([
 			registration(

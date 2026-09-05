@@ -1370,6 +1370,9 @@ export class ExtensionRunner {
 		scope?: AttemptScopeRef,
 		options: { signal?: AbortSignal; correlationId?: string } = {},
 	): Promise<ToolResultEventResult | undefined> {
+		const originalContent = event.content;
+		const originalDetails = event.details;
+		const originalIsError = event.isError;
 		const functionDispatch = await this.emitFunctionHooks(event, options);
 		if (functionDispatch.action === "deny") {
 			return {
@@ -1380,6 +1383,10 @@ export class ExtensionRunner {
 		}
 		if (functionDispatch.action === "return") return functionDispatch.value as ToolResultEventResult;
 		const functionEvent = functionDispatch.event;
+		const functionModified =
+			JSON.stringify(functionEvent.content) !== JSON.stringify(originalContent) ||
+			JSON.stringify(functionEvent.details) !== JSON.stringify(originalDetails) ||
+			functionEvent.isError !== originalIsError;
 		event.content = functionEvent.content;
 		event.details = functionEvent.details;
 		event.isError = functionEvent.isError;
@@ -1395,6 +1402,7 @@ export class ExtensionRunner {
 
 		const ctx = this.createContext();
 		const currentEvent: ToolResultEvent = { ...event };
+		let legacyModified = false;
 		let marked = false;
 
 		for (const { ext, handler } of handlers) {
@@ -1413,14 +1421,18 @@ export class ExtensionRunner {
 
 			if (handlerResult.content !== undefined) {
 				currentEvent.content = handlerResult.content;
+				legacyModified = true;
 			}
 			if (handlerResult.details !== undefined) {
 				currentEvent.details = handlerResult.details;
+				legacyModified = true;
 			}
 			if (handlerResult.isError !== undefined) {
 				currentEvent.isError = handlerResult.isError;
+				legacyModified = true;
 			}
 		}
+		if (!functionModified && !legacyModified) return undefined;
 
 		return {
 			content: currentEvent.content,

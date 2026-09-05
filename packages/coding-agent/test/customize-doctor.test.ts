@@ -262,6 +262,21 @@ describe("customize doctor (#4288)", () => {
 		const hookSource = `await Bun.write(${JSON.stringify(markerPath)}, "imported"); export default function() {}`;
 		await fs.mkdir(path.dirname(hookPath), { recursive: true });
 		await fs.writeFile(hookPath, hookSource);
+		await writeJson(path.join(pluginRoot, "gajae-plugin.json"), {
+			kind: "gajae-code-plugin",
+			name: "function-hook-doctor",
+			version: "1.0.0",
+			hooks: [
+				{
+					name: "before-read",
+					event: "tool_call",
+					target: "read",
+					phase: "before",
+					path: "hooks/before-read.ts",
+					capabilities: ["tool.inspect"],
+				},
+			],
+		});
 		const sha256 = createHash("sha256").update(hookSource).digest("hex");
 		const grant = normalizeFunctionHookGrant({ capabilities: ["tool.inspect"] });
 		await writeJson(path.join(cwd, ".gjc", "gjc-plugins", "registry.json"), {
@@ -326,6 +341,86 @@ describe("customize doctor (#4288)", () => {
 		expect(text).toContain("status=blocked-isolate");
 		expect(text).toContain("grants: requested=tool.inspect effective=tool.inspect attenuate=none");
 		expect(await Bun.file(markerPath).exists()).toBe(false);
+	});
+
+	it("quarantines tampered Function Hook metadata and redacts unsafe destinations", async () => {
+		const cwd = await makeTempProject();
+		const pluginRoot = path.join(cwd, ".gjc", "gjc-plugins", "tampered-function-hook");
+		const hookPath = path.join(pluginRoot, "hooks", "before-read.ts");
+		const manifestPath = path.join(pluginRoot, "gajae-plugin.json");
+		const hookSource = "export default function() {}";
+		await fs.mkdir(path.dirname(hookPath), { recursive: true });
+		await fs.writeFile(hookPath, hookSource);
+		await writeJson(manifestPath, {
+			kind: "gajae-code-plugin",
+			name: "tampered-function-hook",
+			version: "1.0.0",
+			hooks: [
+				{
+					name: "before-read",
+					event: "tool_call",
+					target: "read",
+					phase: "before",
+					path: "hooks/before-read.ts",
+					capabilities: ["network.fetch"],
+					networkDestinations: ["https://safe.example"],
+				},
+			],
+		});
+		const sha256 = createHash("sha256").update(hookSource).digest("hex");
+		const grant = normalizeFunctionHookGrant({
+			capabilities: ["network.fetch"],
+			networkDestinations: ["https://safe.example"],
+		});
+		await writeJson(path.join(cwd, ".gjc", "gjc-plugins", "registry.json"), {
+			version: 1,
+			scope: "project",
+			plugins: [
+				{
+					name: "tampered-function-hook",
+					version: "1.0.0",
+					scope: "project",
+					enabled: true,
+					pluginRoot,
+					manifestPath,
+					manifestHash: "",
+					source: { kind: "path", uri: pluginRoot, resolvedAt: "2026-01-01T00:00:00.000Z" },
+					installedAt: "2026-01-01T00:00:00.000Z",
+					updatedAt: "2026-01-01T00:00:00.000Z",
+					copiedFiles: [{ relativePath: "hooks/before-read.ts", sha256, bytes: Buffer.byteLength(hookSource) }],
+					surfaces: {
+						subskills: [],
+						tools: [],
+						hooks: [
+							{
+								extensionId: "hook:tool_call:before:read:before-read",
+								name: "before-read",
+								event: "tool_call",
+								target: "write",
+								phase: "before",
+								relativePath: "hooks/before-read.ts",
+								sha256,
+								implementationHash: sha256,
+								capabilities: [...grant.capabilities],
+								networkDestinations: ["https://user:secret@example.com/token?q=secret"],
+								filesystemRoots: [],
+								capabilityHash: functionHookGrantHash(grant),
+								functionHook: false,
+							},
+						],
+						mcps: [],
+						systemAppendices: [],
+						agentAppendices: [],
+					},
+					disabledSurfaceIds: [],
+				},
+			],
+		});
+
+		const report = await runCustomizeDoctor(cwd, Settings.isolated({}));
+		const hook = itemsByName(report, "plugin-bundle").get("tampered-function-hook")?.functionHooks?.[0];
+		expect(hook).toMatchObject({ status: "quarantined", networkDestinations: ["[redacted]"] });
+		expect(JSON.stringify(report)).not.toContain("secret");
 	});
 
 	it("agrees with session-startup consumers (loadSkills, loadAllMCPConfigs)", async () => {
