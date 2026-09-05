@@ -77,6 +77,7 @@
   refreshes, bounded timeout/output, ANSI sanitization, placeholder degradation,
   disposal cancellation, and custom-editor configuration while preserving
   synchronous TUI rendering; project-scoped settings cannot trigger execution.
+- Coordinator MCP delegation now releases the session transition lock after durable admission so force/queue prompts can dispatch during bounded completion observation. New and reused delegates persist and replay the complete bounded response, including timeout and waiting snapshots, while receipt-first crash recovery preserves accepted prompt identity and successor terminal fences without redispatch. Pending delegate responses pin their source prompt/turn through age and size compaction until final response commit; resumed keys with missing live authority remain unsealed and fail closed instead of redispatching or sealing a busy error.
 
 - Business/Enterprise/Team ChatGPT accounts can bind GPT-5.6 Sol again. The Codex entitlement preflight treated only `plan_type` values containing `"pro"` as eligible, so an `openai-codex` OAuth account on a Business/Enterprise/Team plan was rejected at model-binding/subagent setup time with a spurious entitlement error even though the backend accepts the request. Exact Pro/Business/Enterprise/Team tiers are now recognized as entitled, Plus/Free remain rejected, and unfamiliar plan names are deferred to the provider rather than guessed locally.
 
