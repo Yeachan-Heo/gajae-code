@@ -99,6 +99,11 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 		applyToolProxy(tool, this);
 	}
 
+	/** Host composition hook: guards must run inside Function Hook preflight. */
+	getInnerTool(): AgentTool<TParameters, TDetails> {
+		return this.tool;
+	}
+
 	/**
 	 * Forward browser mode changes when available.
 	 */
@@ -180,8 +185,12 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 			);
 
 			if (resultResult) {
-				const modifiedContent: (TextContent | ImageContent)[] = resultResult.content ?? result.content;
-				const modifiedDetails = (resultResult.details ?? result.details) as TDetails;
+				const modifiedContent: (TextContent | ImageContent)[] = Object.hasOwn(resultResult, "content")
+					? (resultResult.content ?? [])
+					: result.content;
+				const modifiedDetails = (
+					Object.hasOwn(resultResult, "details") ? resultResult.details : result.details
+				) as TDetails;
 
 				// Extension can override error status
 				if (resultResult.isError === true && !executionError) {

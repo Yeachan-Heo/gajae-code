@@ -970,10 +970,11 @@ export class ExtensionRunner {
 	/** Execute capability-scoped middleware stored in Extension.handlers. */
 	async emitFunctionHooks<TEvent extends ExtensionEvent>(
 		event: TEvent,
-		options: { signal?: AbortSignal; correlationId?: string } = {},
+		options: { signal?: AbortSignal; correlationId?: string; scope?: AttemptScopeRef } = {},
 	): Promise<FunctionHookDispatchResult<TEvent>> {
 		const handlers = this.#matchingFunctionHooks(event);
 		if (handlers.length === 0) return { action: "continue", event };
+		this.#markAttemptExecuted(options.scope);
 		const functionHookDepth = this.#functionHookDepth.getStore() ?? 0;
 		if (functionHookDepth >= 16) {
 			const reason = "Function hook re-entry depth exceeded";
@@ -1066,6 +1067,7 @@ export class ExtensionRunner {
 				let nextCalled = false;
 				let nextFailureReason: string | undefined;
 				let nextPromise: Promise<FunctionHookDispatchResult<TEvent>> | undefined;
+				let nextReturnValue: FunctionHookResult | undefined;
 				const next: FunctionHookNext = async nextEvent => {
 					if (nextCalled) throw new Error("Function hook next() may only be called once");
 					nextCalled = true;
@@ -1101,7 +1103,8 @@ export class ExtensionRunner {
 							continuedResult.action === "continue"
 								? { action: "continue" as const, event: continuedResult.event }
 								: continuedResult;
-						return cloneFunctionHookDataStrict(publicResult) as FunctionHookResult;
+						nextReturnValue = cloneFunctionHookDataStrict(publicResult) as FunctionHookResult;
+						return nextReturnValue;
 					} catch {
 						nextFailureReason = "Function hook continuation result could not be snapshotted";
 						throw new Error(nextFailureReason);
@@ -1138,6 +1141,14 @@ export class ExtensionRunner {
 					return failureResult(nextFailureReason);
 				}
 				if (nextCalled) {
+					if (outcome.value !== undefined && outcome.value !== nextReturnValue) {
+						const reason = "Function hook returned a conflicting decision after next()";
+						controller.abort(new Error(reason));
+						active = false;
+						chainSignal.removeEventListener("abort", abortFromChain);
+						this.#appendFunctionHookAudit(registration, invocation, "error", reason);
+						return failureResult(reason);
+					}
 					const nextResult = (await nextPromise) as FunctionHookDispatchResult<TEvent>;
 					controller.abort(new Error("Function hook invocation completed"));
 					active = false;
@@ -1332,7 +1343,7 @@ export class ExtensionRunner {
 		scope?: AttemptScopeRef,
 	): Promise<RunnerEmitResult<TEvent>> {
 		const eventSignal = "signal" in event && event.signal instanceof AbortSignal ? event.signal : undefined;
-		const functionDispatch = await this.emitFunctionHooks(event, { signal: eventSignal });
+		const functionDispatch = await this.emitFunctionHooks(event, { signal: eventSignal, scope });
 		if (functionDispatch.action === "deny") {
 			if (this.#isSessionBeforeEvent(event)) return { cancel: true } as RunnerEmitResult<TEvent>;
 			return undefined as RunnerEmitResult<TEvent>;
@@ -1382,7 +1393,7 @@ export class ExtensionRunner {
 		scope?: AttemptScopeRef,
 		options: { signal?: AbortSignal; correlationId?: string } = {},
 	): Promise<ToolResultEventResult | undefined> {
-		const functionDispatch = await this.emitFunctionHooks(event, options);
+		const functionDispatch = await this.emitFunctionHooks(event, { ...options, scope });
 		if (functionDispatch.action === "deny") {
 			return {
 				content: [{ type: "text", text: functionDispatch.reason }],
@@ -1452,7 +1463,7 @@ export class ExtensionRunner {
 		scope?: AttemptScopeRef,
 		options: { signal?: AbortSignal; correlationId?: string } = {},
 	): Promise<ToolCallEventResult | undefined> {
-		const functionDispatch = await this.emitFunctionHooks(event, options);
+		const functionDispatch = await this.emitFunctionHooks(event, { ...options, scope });
 		if (functionDispatch.action === "deny") return { block: true, reason: functionDispatch.reason };
 		if (functionDispatch.action === "return") return functionDispatch.value as ToolCallEventResult;
 		event.input = functionDispatch.event.input;
@@ -1616,7 +1627,7 @@ export class ExtensionRunner {
 	}
 
 	async emitContext(messages: AgentMessage[], scope?: AttemptScopeRef, signal?: AbortSignal): Promise<AgentMessage[]> {
-		const functionDispatch = await this.emitFunctionHooks({ type: "context", messages }, { signal });
+		const functionDispatch = await this.emitFunctionHooks({ type: "context", messages }, { signal, scope });
 		if (functionDispatch.action === "deny") throw new Error(functionDispatch.reason);
 		if (functionDispatch.action === "return") return functionDispatch.value as AgentMessage[];
 		const transformedMessages = functionDispatch.event.messages;
@@ -1657,7 +1668,10 @@ export class ExtensionRunner {
 		scope?: AttemptScopeRef,
 		signal?: AbortSignal,
 	): Promise<BeforeProviderRequestEventResult> {
-		const functionDispatch = await this.emitFunctionHooks({ type: "before_provider_request", payload }, { signal });
+		const functionDispatch = await this.emitFunctionHooks(
+			{ type: "before_provider_request", payload },
+			{ signal, scope },
+		);
 		if (functionDispatch.action === "deny") throw new Error(functionDispatch.reason);
 		if (functionDispatch.action === "return") return functionDispatch.value;
 		const handlers = this.#legacyHandlers("before_provider_request");

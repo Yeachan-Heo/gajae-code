@@ -638,6 +638,51 @@ describe("capability-scoped function hooks", () => {
 		expect(updateCalls).toBe(0);
 	});
 
+	test("preserves explicit tool-result detail removal", async () => {
+		const runner = makeRunner([
+			registration(
+				"tool_result",
+				async invocation => ({
+					action: "continue",
+					event: { ...(invocation.payload as ToolResultEvent), details: undefined },
+				}),
+				{ capabilities: ["tool.inspect", "tool.transform"] },
+				0,
+				"read",
+			),
+		]);
+		const wrapped = new ExtensionToolWrapper(
+			{
+				name: "read",
+				label: "Read",
+				description: "Read a file",
+				parameters: Type.Object({ path: Type.String() }),
+				execute: async () => ({ content: [{ type: "text" as const, text: "ok" }], details: { secret: true } }),
+			},
+			runner,
+		);
+		expect((await wrapped.execute("call-1", { path: "safe.txt" })).details).toBeUndefined();
+	});
+
+	test("fails closed on a conflicting decision after next", async () => {
+		const runner = makeRunner([
+			registration(
+				"tool_call",
+				async (_invocation, _capabilities, next) => {
+					await next();
+					return { action: "deny", reason: "late denial" };
+				},
+				{ capabilities: ["tool.inspect", "tool.deny"] },
+				0,
+				"read",
+			),
+		]);
+		expect((await runner.emitToolCall(toolCall()))?.block).toBe(true);
+		expect(runner.getFunctionHookAudit().at(-1)?.reason).toBe(
+			"Function hook returned a conflicting decision after next()",
+		);
+	});
+
 	test("preserves Function Hook tool-result transforms through no-op legacy handlers", async () => {
 		const extension = makeExtension([
 			registration(

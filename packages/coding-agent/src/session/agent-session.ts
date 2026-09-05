@@ -10289,11 +10289,12 @@ export class AgentSession {
 		let wrappersByVersion = this.#guardedToolWrapperCache.get(tool);
 		const cached = wrappersByVersion?.get(cacheKey);
 		if (cached) return cached as T;
-		const wrapped = this.#wrapToolForCwdTransitionFence(
+		const innerTool = tool instanceof ExtensionToolWrapper ? tool.getInnerTool() : tool;
+		const guarded = this.#wrapToolForCwdTransitionFence(
 			this.#wrapToolForWorkflowMutationGuard(
 				this.#wrapToolForAcpPermission(
 					guardToolForUltragoalAsk(
-						tool,
+						innerTool,
 						() => this.sessionManager.getCwd(),
 						() => ({
 							activeSkillState: this.getActiveSkillState(),
@@ -10304,6 +10305,7 @@ export class AgentSession {
 				),
 			),
 		);
+		const wrapped = (this.#extensionRunner ? new ExtensionToolWrapper(guarded, this.#extensionRunner) : guarded) as T;
 		// The object published into `agent.state.tools` — and therefore the object the
 		// agent loop actually dispatches to — is this guard wrapper, not the registry
 		// entry. A wrapper built from a proven built-in inherits that proof; one built
