@@ -39,7 +39,13 @@ function config(providers: Record<string, unknown>, daemonListen = "127.0.0.1:67
 }
 
 interface Recorder {
-	readonly imports: Array<{ providerKey: string; cwd: string; sessionId: string; daemonTarget: PaseoDaemonTarget }>;
+	readonly imports: Array<{
+		providerKey: string;
+		cwd: string;
+		sessionId: string;
+		daemonTarget: PaseoDaemonTarget;
+		daemonHost: string;
+	}>;
 	readonly probes: PaseoDaemonTarget[];
 }
 
@@ -65,6 +71,7 @@ function deps(
 				cwd: input.cwd,
 				sessionId: input.sessionId,
 				daemonTarget: input.daemonTarget,
+				daemonHost: input.daemonHost,
 			});
 			return { kind: "imported", providerKey: input.providerKey };
 		},
@@ -270,6 +277,7 @@ describe("announceSessionToPaseo", () => {
 				cwd: CWD,
 				sessionId: SESSION_ID,
 				daemonTarget: { kind: "tcp", host: "localhost", port: 6767 },
+				daemonHost: "localhost:6767",
 			},
 		]);
 	});
@@ -480,6 +488,7 @@ describe("default dependencies", () => {
 		cwd: "/tmp/repo",
 		sessionId: SESSION_ID,
 		daemonTarget: { kind: "tcp", host: "127.0.0.1", port: 7777 } as const,
+		daemonHost: "127.0.0.1:7777",
 	});
 
 	test("a socket probe answers false without blocking when nothing listens", async () => {
@@ -537,9 +546,25 @@ describe("default dependencies", () => {
 			await dependencies.runImport({
 				...importInput(cli),
 				daemonTarget: { kind: "ipc", socketPath: "/tmp/paseo.sock" },
+				daemonHost: "unix:///tmp/paseo.sock",
 			}),
 		).toEqual({ kind: "imported", providerKey: "gjc" });
 		expect(await Bun.file(path.join(path.dirname(cli), "host")).text()).toBe("unix:///tmp/paseo.sock");
+	});
+
+	test("preserves pipe and authenticated TLS listener spellings for the import child", async () => {
+		const dependencies = createDefaultPaseoAnnounceDependencies("/tmp/agent-dir", {});
+		for (const [daemonHost, daemonTarget] of [
+			["pipe://gjc-paseo", { kind: "ipc", socketPath: "gjc-paseo" }],
+			["tcp://paseo.example:7443?ssl=true&password=secret", { kind: "tcp", host: "paseo.example", port: 7443 }],
+		] as const) {
+			const cli = await fakeCli('printf "%s" "$PASEO_HOST" > "$(dirname "$0")/host"; exit 0');
+			expect(await dependencies.runImport({ ...importInput(cli), daemonTarget, daemonHost })).toEqual({
+				kind: "imported",
+				providerKey: "gjc",
+			});
+			expect(await Bun.file(path.join(path.dirname(cli), "host")).text()).toBe(daemonHost);
+		}
 	});
 
 	test("Paseo's duplicate-import refusal on stderr is read as success", async () => {

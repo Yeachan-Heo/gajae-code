@@ -86,14 +86,14 @@ export interface PaseoAnnounceDependencies {
 		readonly cwd: string;
 		readonly sessionId: string;
 		readonly daemonTarget: PaseoDaemonTarget;
+		readonly daemonHost: string;
 		readonly signal?: AbortSignal;
 	}): Promise<PaseoAnnounceOutcome>;
 }
 
-function formatDaemonTarget(target: PaseoDaemonTarget): string {
-	if (target.kind === "ipc") return `unix://${target.socketPath}`;
-	const host = target.host.includes(":") ? `[${target.host}]` : target.host;
-	return `${host}:${target.port}`;
+interface ResolvedDaemonSelection {
+	readonly target: PaseoDaemonTarget;
+	readonly host: string;
 }
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
@@ -167,27 +167,38 @@ export async function resolveDaemonTarget(
 	config: unknown,
 	deps: Pick<PaseoAnnounceDependencies, "env" | "paseoHome" | "readJson">,
 ): Promise<PaseoDaemonTarget | undefined> {
+	return (await resolveDaemonSelection(config, deps))?.target;
+}
+
+async function resolveDaemonSelection(
+	config: unknown,
+	deps: Pick<PaseoAnnounceDependencies, "env" | "paseoHome" | "readJson">,
+): Promise<ResolvedDaemonSelection | undefined> {
 	const explicitHost = deps.env.PASEO_HOST?.trim();
 	if (explicitHost) {
-		return parseDaemonListen(explicitHost);
+		const target = parseDaemonListen(explicitHost);
+		return target ? { target, host: explicitHost } : undefined;
 	}
 	const explicitListen = deps.env.PASEO_LISTEN?.trim();
-	if (explicitListen) return parseDaemonListen(explicitListen);
+	if (explicitListen) {
+		const target = parseDaemonListen(explicitListen);
+		return target ? { target, host: explicitListen } : undefined;
+	}
 
 	const pidFile = asRecord(await deps.readJson(path.join(deps.paseoHome, "paseo.pid")));
 	const pidListen = typeof pidFile?.listen === "string" ? pidFile.listen : pidFile?.sockPath;
 	const pidTarget = typeof pidListen === "string" ? parseDaemonListen(pidListen) : undefined;
-	if (pidTarget?.kind === "ipc") return pidTarget;
+	if (pidTarget?.kind === "ipc") return { target: pidTarget, host: pidListen as string };
 
 	const parsed = asRecord(config);
 	const configured = asRecord(parsed?.daemon)?.listen ?? parsed?.listen;
-	if (typeof configured !== "string") return DEFAULT_DAEMON_TARGET;
+	if (typeof configured !== "string") return { target: DEFAULT_DAEMON_TARGET, host: "localhost:6767" };
 	const configuredTarget = parseDaemonListen(configured);
-	if (!configuredTarget) return DEFAULT_DAEMON_TARGET;
+	if (!configuredTarget) return { target: DEFAULT_DAEMON_TARGET, host: "localhost:6767" };
 	if (configuredTarget.kind === "tcp" && configuredTarget.host === "127.0.0.1" && configuredTarget.port === 6767) {
-		return DEFAULT_DAEMON_TARGET;
+		return { target: DEFAULT_DAEMON_TARGET, host: "localhost:6767" };
 	}
-	return configuredTarget;
+	return { target: configuredTarget, host: configured };
 }
 
 /**
@@ -233,10 +244,11 @@ export async function announceSessionToPaseo(
 	const cli = deps.resolveCli();
 	if (!cli) return { kind: "skipped", reason: "cli-missing" };
 
-	const target = await resolveDaemonTarget(config, deps);
-	if ((deps.env.PASEO_HOST?.trim() || deps.env.PASEO_LISTEN?.trim()) && target === undefined)
+	const selection = await resolveDaemonSelection(config, deps);
+	if ((deps.env.PASEO_HOST?.trim() || deps.env.PASEO_LISTEN?.trim()) && selection === undefined)
 		return { kind: "skipped", reason: "unsupported-daemon-target" };
-	if (!target || !(await deps.probeDaemon(target))) return { kind: "skipped", reason: "daemon-unreachable" };
+	if (!selection || !(await deps.probeDaemon(selection.target)))
+		return { kind: "skipped", reason: "daemon-unreachable" };
 	if (signal?.aborted) return { kind: "failed", detail: "Paseo announcement cancelled" };
 
 	// Importing a session the broker does not yet report as live would make ACP
@@ -248,7 +260,8 @@ export async function announceSessionToPaseo(
 		providerKey,
 		cwd: input.cwd,
 		sessionId: input.sessionId,
-		daemonTarget: target,
+		daemonTarget: selection.target,
+		daemonHost: selection.host,
 		signal,
 	});
 }
@@ -390,6 +403,7 @@ function runImport(env: NodeJS.ProcessEnv) {
 		readonly cwd: string;
 		readonly sessionId: string;
 		readonly daemonTarget: PaseoDaemonTarget;
+		readonly daemonHost: string;
 		readonly signal?: AbortSignal;
 	}): Promise<PaseoAnnounceOutcome> => {
 		const timeoutController = new AbortController();
@@ -404,7 +418,7 @@ function runImport(env: NodeJS.ProcessEnv) {
 					stdout: "pipe",
 					stderr: "pipe",
 					signal,
-					env: { ...env, PASEO_HOST: formatDaemonTarget(input.daemonTarget) },
+					env: { ...env, PASEO_HOST: input.daemonHost },
 				},
 			);
 			const [exitCode, stderr] = await Promise.all([child.exited, new Response(child.stderr).text()]);
