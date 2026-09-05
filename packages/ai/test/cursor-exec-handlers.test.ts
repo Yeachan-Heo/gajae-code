@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import * as http2 from "node:http2";
-import { create, fromBinary, fromJson, type JsonValue, toBinary } from "@bufbuild/protobuf";
+import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
 import {
 	buildCursorHistoryForTest,
 	buildCursorRequestContextRules,
@@ -14,7 +14,6 @@ import type { AgentRunRequest, AgentServerMessage } from "../src/providers/curso
 import {
 	type AgentClientMessage,
 	AgentClientMessageSchema,
-	AgentRunRequestSchema,
 	AgentServerMessageSchema,
 	ConversationStateStructureSchema,
 	ConversationTokenDetailsSchema,
@@ -26,6 +25,7 @@ import {
 	ShellArgsSchema,
 	ShellResultSchema,
 	ShellSuccessSchema,
+	StepTimingSchema,
 	TurnEndedUpdateSchema,
 } from "../src/providers/cursor/gen/agent_pb";
 import type { AssistantMessageEvent, Context, CursorShellStreamCallbacks, Model } from "../src/types";
@@ -43,22 +43,46 @@ const cursorModel: Model<"cursor-agent"> = {
 	maxTokens: 1,
 };
 
-function captureCursorPayload(context: Context): Promise<AgentRunRequest> {
-	const { promise, resolve, reject } = Promise.withResolvers<AgentRunRequest>();
-	streamCursor(cursorModel, context, {
-		apiKey: "test-token",
-		onPayload: async payload => {
-			await Bun.sleep(1);
-			try {
-				JSON.stringify(payload);
-				resolve(fromJson(AgentRunRequestSchema, payload as JsonValue));
-			} catch (error) {
-				reject(error);
-			}
-			throw new Error("stop after capturing Cursor payload");
-		},
+async function captureCursorPayload(context: Context): Promise<AgentRunRequest> {
+	const server = http2.createServer();
+	let captured: AgentRunRequest | undefined;
+	server.on("stream", (stream: http2.ServerHttp2Stream) => {
+		stream.respond({ ":status": 200, "content-type": "application/connect+proto" });
+		const chunks: Buffer[] = [];
+		stream.on("data", (chunk: Buffer) => {
+			chunks.push(chunk);
+			const request = decodeRunRequest(chunks);
+			if (!request || captured) return;
+			captured = request;
+			stream.end(frameServerMessage(createTurnEndedMessage()));
+		});
 	});
-	return promise;
+	const serverListening = Promise.withResolvers<void>();
+	server.once("error", serverListening.reject);
+	server.listen(0, "127.0.0.1", serverListening.resolve);
+	await serverListening.promise;
+
+	const conversationId = `payload-capture-${crypto.randomUUID()}`;
+	try {
+		const address = server.address();
+		if (!address || typeof address === "string") throw new Error("Expected TCP server address");
+		const events: AssistantMessageEvent[] = [];
+		for await (const event of streamCursor({ ...cursorModel, baseUrl: `http://127.0.0.1:${address.port}` }, context, {
+			apiKey: "test-token",
+			conversationId,
+		})) {
+			events.push(event);
+		}
+		const terminalError = events.find(event => event.type === "error");
+		if (terminalError?.type === "error") throw new Error(terminalError.error.errorMessage);
+		if (!captured) throw new Error("Expected encoded Cursor run request");
+		return captured;
+	} finally {
+		disposeCursorConversation(conversationId);
+		const serverClosed = Promise.withResolvers<void>();
+		server.close(error => (error ? serverClosed.reject(error) : serverClosed.resolve()));
+		await serverClosed.promise;
+	}
 }
 
 function frameServerMessage(message: AgentServerMessage): Buffer {
@@ -84,6 +108,13 @@ function decodeClientMessages(chunks: Buffer[]): AgentClientMessage[] {
 		pending = pending.subarray(5 + length);
 	}
 	return messages;
+}
+
+function decodeRunRequest(chunks: Buffer[]): AgentRunRequest | undefined {
+	for (const message of decodeClientMessages(chunks)) {
+		if (message.message.case === "runRequest") return message.message.value;
+	}
+	return undefined;
 }
 
 function createReadExecMessage(id = 1): AgentServerMessage {
@@ -257,6 +288,155 @@ describe("Cursor server message ordering", () => {
 		await expect(rejected).rejects.toThrow("handler failed");
 		await next;
 		expect(events).toEqual(["first", "second"]);
+	});
+});
+
+describe("Cursor payload transport boundary", () => {
+	it("awaits an async replacement, keeps nonzero 64-bit fields JSON-safe, and encodes it on the wire", async () => {
+		const durationMs = 9_007_199_254_740_993n;
+		const timestampMs = 9_007_199_254_740_995n;
+		const server = http2.createServer();
+		let dispatchCount = 0;
+		let encodedReplacement: AgentRunRequest | undefined;
+		server.on("stream", (stream: http2.ServerHttp2Stream) => {
+			const dispatch = ++dispatchCount;
+			stream.respond({ ":status": 200, "content-type": "application/connect+proto" });
+			const chunks: Buffer[] = [];
+			let handled = false;
+			stream.on("data", (chunk: Buffer) => {
+				chunks.push(chunk);
+				const request = decodeRunRequest(chunks);
+				if (!request || handled) return;
+				handled = true;
+				if (dispatch === 1) {
+					const conversationState = create(ConversationStateStructureSchema, request.conversationState);
+					conversationState.turnTimings = [create(StepTimingSchema, { durationMs, timestampMs })];
+					const checkpoint = create(AgentServerMessageSchema, {
+						message: {
+							case: "conversationCheckpointUpdate",
+							value: conversationState,
+						},
+					});
+					stream.end(
+						Buffer.concat([frameServerMessage(checkpoint), frameServerMessage(createTurnEndedMessage())]),
+					);
+					return;
+				}
+				encodedReplacement = request;
+				stream.end(frameServerMessage(createTurnEndedMessage()));
+			});
+		});
+		const serverListening = Promise.withResolvers<void>();
+		server.once("error", serverListening.reject);
+		server.listen(0, "127.0.0.1", serverListening.resolve);
+		await serverListening.promise;
+
+		const conversationId = `payload-replacement-${crypto.randomUUID()}`;
+		try {
+			const address = server.address();
+			if (!address || typeof address === "string") throw new Error("Expected TCP server address");
+			const model = { ...cursorModel, baseUrl: `http://127.0.0.1:${address.port}` };
+			const firstContext: Context = {
+				messages: [{ role: "user", content: "seed cached state", timestamp: 0 }],
+			};
+			let firstDone: Extract<AssistantMessageEvent, { type: "done" }> | undefined;
+			for await (const event of streamCursor(model, firstContext, { apiKey: "test-token", conversationId })) {
+				if (event.type === "error") throw new Error(event.error.errorMessage);
+				if (event.type === "done") firstDone = event;
+			}
+			if (!firstDone) throw new Error("Expected first Cursor turn to complete");
+
+			let hookSettled = false;
+			let hookTiming: { durationMs?: unknown; timestampMs?: unknown } | undefined;
+			const secondContext: Context = {
+				messages: [
+					...firstContext.messages,
+					firstDone.message,
+					{ role: "user", content: "send replacement", timestamp: 1 },
+				],
+			};
+			for await (const event of streamCursor(model, secondContext, {
+				apiKey: "test-token",
+				conversationId,
+				onPayload: async payload => {
+					await Bun.sleep(1);
+					const jsonPayload = JSON.parse(JSON.stringify(payload)) as Record<string, unknown> & {
+						conversationState?: {
+							turnTimings?: Array<{ durationMs?: unknown; timestampMs?: unknown }>;
+						};
+					};
+					hookTiming = jsonPayload.conversationState?.turnTimings?.[0];
+					hookSettled = true;
+					return { ...jsonPayload, customSystemPrompt: "async hook replacement" };
+				},
+			})) {
+				if (event.type === "error") throw new Error(event.error.errorMessage);
+			}
+
+			expect(hookSettled).toBe(true);
+			expect(hookTiming).toEqual({
+				durationMs: durationMs.toString(),
+				timestampMs: timestampMs.toString(),
+			});
+			expect(dispatchCount).toBe(2);
+			expect(encodedReplacement?.customSystemPrompt).toBe("async hook replacement");
+			expect(encodedReplacement?.conversationState?.turnTimings[0]).toMatchObject({ durationMs, timestampMs });
+		} finally {
+			disposeCursorConversation(conversationId);
+			const serverClosed = Promise.withResolvers<void>();
+			server.close(error => (error ? serverClosed.reject(error) : serverClosed.resolve()));
+			await serverClosed.promise;
+		}
+	});
+
+	it("rejects a malformed replacement before opening a transport stream", async () => {
+		const server = http2.createServer();
+		let dispatchCount = 0;
+		server.on("stream", (stream: http2.ServerHttp2Stream) => {
+			dispatchCount++;
+			stream.respond({ ":status": 200, "content-type": "application/connect+proto" });
+			stream.once("data", () => stream.end(frameServerMessage(createTurnEndedMessage())));
+		});
+		const serverListening = Promise.withResolvers<void>();
+		server.once("error", serverListening.reject);
+		server.listen(0, "127.0.0.1", serverListening.resolve);
+		await serverListening.promise;
+
+		const conversationId = `payload-rejection-${crypto.randomUUID()}`;
+		try {
+			const address = server.address();
+			if (!address || typeof address === "string") throw new Error("Expected TCP server address");
+			let hookSettled = false;
+			const events: AssistantMessageEvent[] = [];
+			for await (const event of streamCursor(
+				{ ...cursorModel, baseUrl: `http://127.0.0.1:${address.port}` },
+				{ messages: [{ role: "user", content: "reject replacement", timestamp: 0 }] },
+				{
+					apiKey: "test-token",
+					conversationId,
+					onPayload: async () => {
+						await Bun.sleep(1);
+						hookSettled = true;
+						return { conversationState: { turnTimings: [{ durationMs: {} }] } };
+					},
+				},
+			)) {
+				events.push(event);
+			}
+
+			expect(hookSettled).toBe(true);
+			expect(dispatchCount).toBe(0);
+			const errors = events.filter(
+				(event): event is Extract<AssistantMessageEvent, { type: "error" }> => event.type === "error",
+			);
+			expect(errors).toHaveLength(1);
+			expect(errors[0].error.errorMessage).toContain("duration");
+		} finally {
+			disposeCursorConversation(conversationId);
+			const serverClosed = Promise.withResolvers<void>();
+			server.close(error => (error ? serverClosed.reject(error) : serverClosed.resolve()));
+			await serverClosed.promise;
+		}
 	});
 });
 

@@ -1,8 +1,16 @@
 import { describe, expect, it } from "bun:test";
-import { fromJson, type JsonValue } from "@bufbuild/protobuf";
-import { resolveCursorWireModelForTest, streamCursor } from "../src/providers/cursor";
-import { type AgentRunRequest, AgentRunRequestSchema } from "../src/providers/cursor/gen/agent_pb";
-import type { Context, Model } from "../src/types";
+import * as http2 from "node:http2";
+import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
+import { disposeCursorConversation, resolveCursorWireModelForTest, streamCursor } from "../src/providers/cursor";
+import {
+	type AgentClientMessage,
+	AgentClientMessageSchema,
+	type AgentRunRequest,
+	AgentServerMessageSchema,
+	InteractionUpdateSchema,
+	TurnEndedUpdateSchema,
+} from "../src/providers/cursor/gen/agent_pb";
+import type { AssistantMessageEvent, Context, Model } from "../src/types";
 
 const baseCursorModel: Model<"cursor-agent"> = {
 	id: "cursor-composer-2.5",
@@ -21,29 +29,77 @@ function cursorModel(id: string): Model<"cursor-agent"> {
 	return { ...baseCursorModel, id, name: id };
 }
 
-function captureCursorRequest(model: Model<"cursor-agent">): Promise<AgentRunRequest> {
-	const { promise, resolve, reject } = Promise.withResolvers<AgentRunRequest>();
-	streamCursor(
-		model,
-		{
-			messages: [{ role: "user", content: "capture this request", timestamp: 0 }],
-		} satisfies Context,
-		{
-			apiKey: "test-token",
-			onPayload: payload => {
-				try {
-					JSON.stringify(payload);
-					resolve(fromJson(AgentRunRequestSchema, payload as JsonValue));
-				} catch (error) {
-					reject(error);
-				}
-				// The payload callback runs before any transport is opened, so the
-				// request contract can be captured without a network connection.
-				throw new Error("stop after capturing Cursor payload");
-			},
+function frameServerTurnEnded(): Buffer {
+	const message = create(AgentServerMessageSchema, {
+		message: {
+			case: "interactionUpdate",
+			value: create(InteractionUpdateSchema, {
+				message: { case: "turnEnded", value: create(TurnEndedUpdateSchema, {}) },
+			}),
 		},
-	);
-	return promise;
+	});
+	const bytes = toBinary(AgentServerMessageSchema, message);
+	const frame = Buffer.alloc(5 + bytes.length);
+	frame.writeUInt32BE(bytes.length, 1);
+	frame.set(bytes, 5);
+	return frame;
+}
+
+function decodeRunRequest(chunks: Buffer[]): AgentRunRequest | undefined {
+	const frame = Buffer.concat(chunks);
+	if (frame.length < 5) return undefined;
+	const length = frame.readUInt32BE(1);
+	if (frame.length < 5 + length) return undefined;
+	const message: AgentClientMessage = fromBinary(AgentClientMessageSchema, frame.subarray(5, 5 + length));
+	return message.message.case === "runRequest" ? message.message.value : undefined;
+}
+
+async function captureCursorRequest(model: Model<"cursor-agent">): Promise<AgentRunRequest> {
+	const server = http2.createServer();
+	let dispatchCount = 0;
+	let captured: AgentRunRequest | undefined;
+	server.on("stream", (stream: http2.ServerHttp2Stream) => {
+		dispatchCount++;
+		stream.respond({ ":status": 200, "content-type": "application/connect+proto" });
+		const chunks: Buffer[] = [];
+		stream.on("data", (chunk: Buffer) => {
+			chunks.push(chunk);
+			const request = decodeRunRequest(chunks);
+			if (!request || captured) return;
+			captured = request;
+			stream.end(frameServerTurnEnded());
+		});
+	});
+	const serverListening = Promise.withResolvers<void>();
+	server.once("error", serverListening.reject);
+	server.listen(0, "127.0.0.1", serverListening.resolve);
+	await serverListening.promise;
+
+	const conversationId = `requested-model-${crypto.randomUUID()}`;
+	try {
+		const address = server.address();
+		if (!address || typeof address === "string") throw new Error("Expected TCP server address");
+		const events: AssistantMessageEvent[] = [];
+		for await (const event of streamCursor(
+			{ ...model, baseUrl: `http://127.0.0.1:${address.port}` },
+			{
+				messages: [{ role: "user", content: "capture this request", timestamp: 0 }],
+			} satisfies Context,
+			{ apiKey: "test-token", conversationId },
+		)) {
+			events.push(event);
+		}
+		const terminalError = events.find(event => event.type === "error");
+		if (terminalError?.type === "error") throw new Error(terminalError.error.errorMessage);
+		expect(dispatchCount).toBe(1);
+		if (!captured) throw new Error("Expected encoded Cursor run request");
+		return captured;
+	} finally {
+		disposeCursorConversation(conversationId);
+		const serverClosed = Promise.withResolvers<void>();
+		server.close(error => (error ? serverClosed.reject(error) : serverClosed.resolve()));
+		await serverClosed.promise;
+	}
 }
 
 describe("Cursor requested model wire translation", () => {

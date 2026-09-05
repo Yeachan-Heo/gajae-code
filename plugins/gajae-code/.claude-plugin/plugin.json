@@ -1,7 +1,7 @@
 {
   "name": "gajae-code",
   "description": "Delegate planning and execution workflows to GJC through the coordinator MCP server, plus advisory SDK session CLI and guide skills.",
-  "version": "0.16.3",
+  "version": "0.16.4",
   "commands": "./commands",
   "skills": "./skills",
   "mcpServers": "./.mcp.json"

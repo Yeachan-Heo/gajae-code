@@ -99,10 +99,15 @@ export interface MCPStdioSpawnLaunch {
 	command: string;
 	args: readonly string[];
 	cwd: string;
+	/** Transport-supplied registrar for retryable cleanup before preparation allocates resources. */
+	registerCleanup?: (cleanup: () => Promise<void>) => void;
 }
 
 export interface MCPStdioPreparedLaunch extends MCPStdioSpawnLaunch {
-	/** Per-attempt cleanup, run after confirmed child exit or failed spawn. */
+	/**
+	 * Per-attempt cleanup run after confirmed child exit or failed spawn. The same
+	 * callback may already have been registered during preparation.
+	 */
 	afterProcessExit?: () => Promise<void>;
 }
 

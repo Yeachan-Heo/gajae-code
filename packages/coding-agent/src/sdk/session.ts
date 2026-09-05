@@ -4257,7 +4257,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		}
 
 		const resolvedCredentialScopes = new Map<string, string | undefined>();
-		const resolveAgentApiKey = async (provider: string): Promise<string> => {
+		const resolveAgentApiKey = async (provider: string, signal?: AbortSignal): Promise<string> => {
 			const liveModel = resolveLiveSessionApiKeyModel(sessionAgent?.state.model, model, provider);
 			const hasExplicitScopePolicy =
 				modelRegistry.authStorage.hasSessionCredentialSelector(provider, credentialSessionId) ||
@@ -4268,6 +4268,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				credentialSessionId,
 				liveModel,
 				!hasExplicitScopePolicy,
+				signal,
 			);
 			resolvedCredentialScopes.set(provider, resolution.credentialSessionId);
 			return resolution.apiKey;
@@ -4345,7 +4346,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 								provider,
 								error: error instanceof Error ? error.message : String(error),
 							});
-							const replacementApiKey = await resolveAgentApiKey(provider);
+							const replacementApiKey = await resolveAgentApiKey(provider, streamOptions?.signal);
 							if (
 								!isStableSessionApiKeyCredentialType(
 									streamOptions?.authCredentialType,

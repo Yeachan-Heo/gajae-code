@@ -156,9 +156,88 @@ describe("status line command segment", () => {
 				rightSegments: [],
 				segmentOptions: {},
 			});
-			await Bun.sleep(300);
+			const deadline = Date.now() + 3_000;
+			while (!(await Bun.file(marker).exists()) && Date.now() < deadline) await Bun.sleep(10);
 
 			expect(await Bun.file(marker).text()).toBe("preview-safe");
+		} finally {
+			component.dispose();
+			await fs.rm(marker, { force: true });
+		}
+	});
+
+	it("cancels an active command when its committed segment is removed", async () => {
+		const marker = path.join(os.tmpdir(), `gjc-status-line-remove-${Date.now()}.txt`);
+		const quotedMarker = marker.replaceAll("'", "'\\''");
+		const staleOutput = "removed-command-stale-output";
+		const command = `sleep 0.3; printf removed > '${quotedMarker}'; printf '${staleOutput}'`;
+		const settings = Settings.isolated({
+			"statusLine.leftSegments": ["command"],
+			"statusLine.segmentOptions": {
+				command: { command, timeoutMs: 1_000, refreshMs: 250, maxLength: 40 },
+			},
+		});
+		const component = makeComponent(command, { timeoutMs: 1_000 }, settings);
+		try {
+			component.render(120);
+			await Bun.sleep(50);
+
+			settings.set("statusLine.leftSegments", []);
+			component.updateSettings({ preset: "custom", leftSegments: [], rightSegments: [] });
+			component.render(120);
+			await Bun.sleep(400);
+
+			expect(
+				await Bun.file(marker)
+					.text()
+					.catch(() => ""),
+			).toBe("");
+			const stalePreview = Bun.stripANSI(
+				component.getPreviewContentForSettings(120, {
+					preset: "custom",
+					leftSegments: ["command" as StatusLineSegmentId],
+					rightSegments: [],
+					segmentOptions: { command: { command } },
+				}),
+			);
+			expect(stalePreview).not.toContain(staleOutput);
+		} finally {
+			component.dispose();
+			await fs.rm(marker, { force: true });
+		}
+	});
+
+	it("cancels an active command when its committed command is cleared", async () => {
+		const marker = path.join(os.tmpdir(), `gjc-status-line-clear-${Date.now()}.txt`);
+		const quotedMarker = marker.replaceAll("'", "'\\''");
+		const staleOutput = "cleared-command-stale-output";
+		const command = `sleep 0.3; printf cleared > '${quotedMarker}'; printf '${staleOutput}'`;
+		const settings = Settings.isolated({
+			"statusLine.leftSegments": ["command"],
+			"statusLine.segmentOptions": {
+				command: { command, timeoutMs: 1_000, refreshMs: 250, maxLength: 40 },
+			},
+		});
+		const component = makeComponent(command, { timeoutMs: 1_000 }, settings);
+		try {
+			component.render(120);
+			await Bun.sleep(50);
+
+			const clearedSegmentOptions = {
+				command: { command: "", timeoutMs: 1_000, refreshMs: 250, maxLength: 40 },
+			};
+			settings.set("statusLine.segmentOptions", clearedSegmentOptions);
+			component.updateSettings({ segmentOptions: clearedSegmentOptions });
+			component.render(120);
+			await Bun.sleep(400);
+
+			expect(
+				await Bun.file(marker)
+					.text()
+					.catch(() => ""),
+			).toBe("");
+			const afterClear = Bun.stripANSI(component.render(120).join("\n"));
+			expect(afterClear).not.toContain(staleOutput);
 		} finally {
 			component.dispose();
 			await fs.rm(marker, { force: true });

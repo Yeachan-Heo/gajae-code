@@ -1,22 +1,28 @@
 import { describe, expect, test } from "bun:test";
+import { type GeneratedProvider, getBundledModel, getSupportedEfforts } from "@gajae-code/ai";
 import {
 	BUILTIN_MODEL_PROFILES,
+	deriveModelProfileMappedProviders,
 	formatAvailableProfileNames,
 	getModelProfilePresentation,
 	groupModelProfilesForPresetLanding,
 	type ModelProfileDefinition,
 	mergeModelProfiles,
+	PROXY_ROUTABLE_PROVIDER_IDS,
 	recommendModelProfileForProvider,
 	resolveProfileBindings,
 } from "@gajae-code/coding-agent/config/model-profiles";
 import { parseModelString, splitSelectorThinkingSuffix } from "@gajae-code/coding-agent/config/model-resolver";
 import { ProfileModelSelectorSchema } from "@gajae-code/coding-agent/config/models-config-schema";
 import modelsJson from "../../ai/src/models.json";
+import { isModelProfileProviderAvailable } from "../src/config/model-profile-contract";
 import { type ModelSelectorValue, normalizeModelSelectorValue, selectorHead } from "../src/config/model-selector-value";
 
 type Role = "default" | "executor" | "planner" | "critic" | "architect";
 
 const roles: Role[] = ["default", "executor", "planner", "critic", "architect"];
+const astraProfileNames = ["astra-lite", "astra-default", "astra-heavy", "astra-fable", "astra-fable-opus"] as const;
+const astraProfileNameSet = new Set<string>(astraProfileNames);
 
 const expectedProfiles: Array<{
 	name: string;
@@ -65,6 +71,39 @@ const expectedProfiles: Array<{
 			planner: "openai-codex/gpt-5.6-luna:max",
 			critic: "openai-codex/gpt-5.6-luna:max",
 			architect: "openai-codex/gpt-5.6-luna:max",
+		},
+	},
+	{
+		name: "astra-lite",
+		requiredProviders: ["openai-codex"],
+		mapping: {
+			default: "openai-codex/gpt-6-astra:medium",
+			executor: "openai-codex/gpt-5.6-luna:xhigh",
+			planner: "openai-codex/gpt-6-astra:xhigh",
+			critic: "openai-codex/gpt-5.6-sol:high",
+			architect: "openai-codex/gpt-5.6-terra:xhigh",
+		},
+	},
+	{
+		name: "astra-default",
+		requiredProviders: ["openai-codex"],
+		mapping: {
+			default: "openai-codex/gpt-6-astra:medium",
+			executor: "openai-codex/gpt-5.6-luna:max",
+			planner: "openai-codex/gpt-6-astra:xhigh",
+			critic: "openai-codex/gpt-5.6-sol:xhigh",
+			architect: "openai-codex/gpt-5.6-terra:xhigh",
+		},
+	},
+	{
+		name: "astra-heavy",
+		requiredProviders: ["openai-codex"],
+		mapping: {
+			default: "openai-codex/gpt-6-astra:medium",
+			executor: "openai-codex/gpt-5.6-sol:max",
+			planner: "openai-codex/gpt-5.6-sol:max",
+			critic: "openai-codex/gpt-6-astra:max",
+			architect: "openai-codex/gpt-6-astra:max",
 		},
 	},
 	{
@@ -661,6 +700,28 @@ const expectedProfiles: Array<{
 			architect: "openai-codex/gpt-5.6-sol:xhigh",
 		},
 	},
+	{
+		name: "astra-fable",
+		requiredProviders: ["openai-codex", "anthropic"],
+		mapping: {
+			default: "openai-codex/gpt-6-astra:medium",
+			executor: "openai-codex/gpt-5.6-luna:max",
+			planner: "openai-codex/gpt-6-astra:xhigh",
+			critic: "anthropic/claude-fable-5-1:xhigh",
+			architect: "anthropic/claude-fable-5-1:xhigh",
+		},
+	},
+	{
+		name: "astra-fable-opus",
+		requiredProviders: ["openai-codex", "anthropic"],
+		mapping: {
+			default: "openai-codex/gpt-6-astra:medium",
+			executor: "openai-codex/gpt-5.6-luna:max",
+			planner: "anthropic/claude-opus-5:medium",
+			critic: "anthropic/claude-fable-5-1:xhigh",
+			architect: "anthropic/claude-fable-5-1:xhigh",
+		},
+	},
 ];
 
 const oldNames = [
@@ -738,17 +799,98 @@ const fixedNonCodexComboMappings: Record<string, Partial<Record<Role, string>>> 
 		planner: "anthropic/claude-opus-5:medium",
 		critic: "anthropic/claude-opus-5:high",
 	},
+	"astra-fable": {
+		critic: "anthropic/claude-fable-5-1:xhigh",
+		architect: "anthropic/claude-fable-5-1:xhigh",
+	},
+	"astra-fable-opus": {
+		planner: "anthropic/claude-opus-5:medium",
+		critic: "anthropic/claude-fable-5-1:xhigh",
+		architect: "anthropic/claude-fable-5-1:xhigh",
+	},
 };
 
 describe("built-in model profile catalog", () => {
-	test("contains exact 50-profile matrix cell-for-cell", () => {
+	test("contains exact 63-profile matrix cell-for-cell without replacing prior presets", () => {
+		expect(expectedProfiles).toHaveLength(63);
 		expect(BUILTIN_MODEL_PROFILES.map(profile => profile.name)).toEqual(
 			expectedProfiles.map(profile => profile.name),
 		);
+		const priorExpectedProfiles = expectedProfiles.filter(profile => !astraProfileNameSet.has(profile.name));
+		expect(priorExpectedProfiles).toHaveLength(58);
+		expect(
+			BUILTIN_MODEL_PROFILES.filter(profile => !astraProfileNameSet.has(profile.name)).map(profile => ({
+				name: profile.name,
+				requiredProviders: profile.requiredProviders,
+				mapping: profile.modelMapping,
+			})),
+		).toEqual(priorExpectedProfiles);
 		for (const expected of expectedProfiles) {
 			const profile = BUILTIN_MODEL_PROFILES.find(candidate => candidate.name === expected.name);
 			expect(profile?.requiredProviders).toEqual(expected.requiredProviders);
 			expect(profile?.modelMapping).toEqual(expected.mapping);
+		}
+	});
+
+	test("Astra tiers and combinations resolve their exact role bindings", () => {
+		const profiles = mergeModelProfiles();
+		for (const name of astraProfileNames) {
+			const expected = expectedProfiles.find(profile => profile.name === name);
+			if (!expected) throw new Error(`Missing expected profile: ${name}`);
+			const definition = profiles.get(name);
+			if (!definition) throw new Error(`Missing resolved profile: ${name}`);
+			const resolved = resolveProfileBindings(definition);
+			expect(resolved.defaultSelector).toBe(expected.mapping.default);
+			expect(resolved.agentModelOverrides).toEqual({
+				executor: expected.mapping.executor,
+				architect: expected.mapping.architect,
+				planner: expected.mapping.planner,
+				critic: expected.mapping.critic,
+			});
+		}
+	});
+
+	test("Astra profiles enforce provider availability and keep mapped providers proxy-routable", () => {
+		const profiles = mergeModelProfiles();
+		for (const name of ["astra-lite", "astra-default", "astra-heavy"] as const) {
+			const profile = profiles.get(name);
+			if (!profile) throw new Error(`Missing Astra profile: ${name}`);
+			expect(profile.requiredProviders).toEqual(["openai-codex"]);
+			expect(deriveModelProfileMappedProviders(profile)).toEqual(["openai-codex"]);
+			expect(isModelProfileProviderAvailable(profile, new Set<string>())).toBe(false);
+			expect(isModelProfileProviderAvailable(profile, new Set(["openai-codex"]))).toBe(true);
+		}
+		for (const name of ["astra-fable", "astra-fable-opus"] as const) {
+			const profile = profiles.get(name);
+			if (!profile) throw new Error(`Missing Astra combination: ${name}`);
+			expect(profile.requiredProviders).toEqual(["openai-codex", "anthropic"]);
+			expect(deriveModelProfileMappedProviders(profile)).toEqual(["anthropic", "openai-codex"]);
+			expect(isModelProfileProviderAvailable(profile, new Set(["openai-codex"]))).toBe(false);
+			expect(isModelProfileProviderAvailable(profile, new Set(["anthropic"]))).toBe(false);
+			expect(isModelProfileProviderAvailable(profile, new Set(["openai-codex", "anthropic"]))).toBe(true);
+		}
+		for (const provider of ["openai-codex", "anthropic"]) {
+			expect(PROXY_ROUTABLE_PROVIDER_IDS.has(provider)).toBe(true);
+		}
+	});
+
+	test("Astra mappings use only thinking efforts declared by their bundled models", () => {
+		for (const name of astraProfileNames) {
+			const profile = BUILTIN_MODEL_PROFILES.find(candidate => candidate.name === name);
+			if (!profile) throw new Error(`Missing Astra profile: ${name}`);
+			for (const selectorValue of Object.values(profile.modelMapping)) {
+				for (const selector of normalizeModelSelectorValue(selectorValue)) {
+					const suffix = splitSelectorThinkingSuffix(selector);
+					expect(suffix.invalidSuffix).toBeUndefined();
+					if (suffix.thinkingLevel === undefined) throw new Error(`Missing Astra effort: ${selector}`);
+					const parsed = parseModelString(suffix.selector);
+					if (!parsed) throw new Error(`Invalid Astra selector: ${selector}`);
+					const model = getBundledModel(parsed.provider as GeneratedProvider, parsed.id);
+					expect(model).toBeDefined();
+					const supportedEfforts: readonly string[] = getSupportedEfforts(model);
+					expect(supportedEfforts).toContain(suffix.thinkingLevel);
+				}
+			}
 		}
 	});
 
@@ -840,9 +982,12 @@ describe("built-in model profile catalog", () => {
 	test("combo Codex roles project their source preset at the same role", () => {
 		const medium = builtinMapping("codex-medium");
 		const pro = builtinMapping("codex-pro");
+		const astraDefault = builtinMapping("astra-default");
 		const opusCodex = builtinMapping("opus-codex");
 		const codexOpencodego = builtinMapping("codex-opencodego");
 		const fableOpusCodex = builtinMapping("fable-opus-codex");
+		const astraFable = builtinMapping("astra-fable");
+		const astraFableOpus = builtinMapping("astra-fable-opus");
 
 		for (const role of ["executor", "critic", "architect"] as const) {
 			expect(opusCodex[role]).toBe(medium[role]);
@@ -852,6 +997,12 @@ describe("built-in model profile catalog", () => {
 		}
 		for (const role of ["executor", "architect"] as const) {
 			expect(fableOpusCodex[role]).toBe(pro[role]);
+		}
+		for (const role of ["default", "executor", "planner"] as const) {
+			expect(astraFable[role]).toBe(astraDefault[role]);
+		}
+		for (const role of ["default", "executor"] as const) {
+			expect(astraFableOpus[role]).toBe(astraDefault[role]);
 		}
 	});
 
@@ -936,6 +1087,19 @@ describe("built-in model profile catalog", () => {
 		})) {
 			expect(getModelProfilePresentation(name)).toEqual({ displayName, providerGroup: "GROK" });
 		}
+		for (const [name, displayName] of Object.entries({
+			"astra-lite": "ASTRA-Lite",
+			"astra-default": "ASTRA-Default",
+			"astra-heavy": "ASTRA-Heavy",
+		})) {
+			expect(getModelProfilePresentation(name)).toEqual({ displayName, providerGroup: "CODEX" });
+		}
+		for (const [name, displayName] of Object.entries({
+			"astra-fable": "ASTRA + Fable (5.1)",
+			"astra-fable-opus": "ASTRA + Fable (5.1) + Opus",
+		})) {
+			expect(getModelProfilePresentation(name)).toEqual({ displayName, providerGroup: "COMBOS" });
+		}
 		expect([...groupModelProfilesForPresetLanding(profiles).keys()]).toEqual([
 			"CODEX",
 			"OPENCODEGO",
@@ -952,6 +1116,24 @@ describe("built-in model profile catalog", () => {
 			"ALIBABA TOKEN PLAN",
 			"COMBOS",
 		]);
+		expect(
+			groupModelProfilesForPresetLanding(profiles)
+				.get("CODEX")
+				?.map(profile => profile.name),
+		).toEqual([
+			"astra-default",
+			"astra-heavy",
+			"astra-lite",
+			"codex-eco",
+			"codex-medium",
+			"codex-pro",
+			"lunamaxxing",
+		]);
+		expect(
+			groupModelProfilesForPresetLanding(profiles)
+				.get("COMBOS")
+				?.map(profile => profile.name),
+		).toEqual(["astra-fable", "astra-fable-opus", "codex-opencodego", "fable-opus-codex", "opus-codex"]);
 		expect(
 			groupModelProfilesForPresetLanding(profiles)
 				.get("macOS Local (oMLX)")

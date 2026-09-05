@@ -143,6 +143,15 @@ test("broker session.list rejects a new cursor stream at capacity without evicti
 			cursors.push(page.continuationCursor as string);
 		}
 
+		// Exact inspection is not a paginated list. Even with all 32 cursor slots
+		// occupied it returns the one requested row without allocating a cursor.
+		expect(await broker.handleRequest("session.list", { resolveSessionId: "session-2" })).toMatchObject({
+			ok: true,
+			result: { sessions: [{ sessionId: "session-2" }] },
+		});
+		const exact = await broker.handleRequest("session.list", { resolveSessionId: "session-2" });
+		expect(exact.ok && (exact.result as { continuationCursor?: string }).continuationCursor).toBeUndefined();
+
 		expect(await broker.handleRequest("session.list", { limit: 1 })).toEqual({
 			ok: false,
 			error: { code: "invalid_input", message: "session.list cursor capacity is exhausted" },

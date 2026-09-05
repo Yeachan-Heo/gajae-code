@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.16.4] - 2026-09-05
+
 - Provider calls now carry the agent-owned opaque provider conversation identity separately from generic session/cache affinity, including compaction, handoff, turn-prefix summary, and branch-summary maintenance calls. This lets provider-specific conversation headers remain stable without treating prompt-derived gateway cache keys as conversation authority (#5295).
 
 - Failed cooperative context maintenance now terminalizes the active run with its concrete maintenance error instead of advertising a continuation over unchanged context. Only committed prune, compaction, or promotion outcomes remain resumable.

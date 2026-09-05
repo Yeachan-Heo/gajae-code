@@ -189,6 +189,27 @@ describe("subagent warning injection", () => {
 		});
 	});
 
+	it("rejects yield data missing required structured fields", () => {
+		const result = finalizeSubprocessOutput({
+			rawOutput: "ignored",
+			exitCode: 0,
+			stderr: "",
+			doneAborted: false,
+			signalAborted: false,
+			yieldItems: [{ status: "success", data: {} }],
+			outputSchema: {
+				type: "object",
+				properties: { ok: { type: "boolean" } },
+				required: ["ok"],
+			},
+		});
+
+		expect(result.exitCode).toBe(1);
+		expect(result.stderr).toContain("schema_violation");
+		expect(result.stderr).toContain("ok");
+		expect(result.rawOutput).toContain('"error": "schema_violation"');
+	});
+
 	it("rejects placeholder yield data that points at omitted message body", () => {
 		const result = finalizeSubprocessOutput({
 			rawOutput: "should be replaced",
@@ -376,7 +397,7 @@ describe("subagent warning injection", () => {
 			expect(fallback.rawOutput).not.toContain("LONG-FINDINGS-TAIL-SENTINEL");
 		});
 
-		it("preserves rejected data when the output schema itself is invalid", () => {
+		it("preserves rejected data when a nonempty output schema itself is malformed", () => {
 			const data = { tail: "INVALID-SCHEMA-TAIL-SENTINEL", details: "x".repeat(600) };
 			const result = finalizeSubprocessOutput({
 				rawOutput: "ignored",

@@ -857,9 +857,15 @@ export class StatusLineComponent implements Component {
 		const commandSegmentActive =
 			effectiveSettings.leftSegments.includes("command") || effectiveSettings.rightSegments.includes("command");
 		const commandOptions = commandSegmentActive ? this.#trustedCommandOptions() : undefined;
-		const commandKey =
-			!previewOnly && commandOptions ? this.#refreshCommandInBackground(commandOptions) : this.#commandConfigKey;
-		if (!previewOnly && !commandKey) this.#disableCommandSegment();
+		let commandKey: string | undefined = this.#commandConfigKey;
+		if (!previewOnly) {
+			if (commandOptions) {
+				commandKey = this.#refreshCommandInBackground(commandOptions);
+			} else {
+				this.#disableCommandSegment();
+				commandKey = undefined;
+			}
+		}
 
 		return {
 			session: this.session,
@@ -881,15 +887,16 @@ export class StatusLineComponent implements Component {
 				pr: prSegmentActive ? (previewOnly ? (this.#cachedPr ?? null) : this.#lookupPr()) : null,
 			},
 			usage: this.#cachedUsage,
-			command: commandSegmentActive
-				? {
-						output: this.#commandOutput,
-						failed: this.#commandFailed,
-						pending: previewOnly
-							? this.#commandOutput === null && !this.#commandFailed
-							: this.#commandInFlightKey === commandKey,
-					}
-				: undefined,
+			command:
+				commandSegmentActive && (previewOnly || commandKey !== undefined)
+					? {
+							output: this.#commandOutput,
+							failed: this.#commandFailed,
+							pending: previewOnly
+								? this.#commandOutput === null && !this.#commandFailed
+								: this.#commandInFlightKey === commandKey,
+						}
+					: undefined,
 		};
 	}
 

@@ -5,7 +5,7 @@
  * multiple leases and roots/resource subscriptions are connection-global unions.
  */
 import { logger } from "@gajae-code/utils";
-import { connectToServer, subscribeToResources, unsubscribeFromResources } from "./client";
+import { connectToServer, MCPConnectionCleanupFailure, subscribeToResources, unsubscribeFromResources } from "./client";
 import {
 	buildMCPPoolKeyIdentity,
 	computeMCPPoolKey,
@@ -60,9 +60,16 @@ export class MCPPoolAcquireAbortError extends Error {
 	readonly code = "MCP_POOL_ACQUIRE_ABORTED" as const;
 	readonly serverName: string;
 	readonly poolKey: string;
-	cleanup?: Promise<unknown>;
+	readonly cleanup?: Promise<void>;
+	readonly cleanupGeneration?: number;
 
-	constructor(serverName: string, poolKey: string, cause: unknown, cleanup?: Promise<unknown>) {
+	constructor(
+		serverName: string,
+		poolKey: string,
+		cause: unknown,
+		cleanup?: Promise<void>,
+		cleanupGeneration?: number,
+	) {
 		super(
 			`MCP connection acquisition aborted for ${serverName} (${poolKey}): ${
 				cause instanceof Error ? cause.message : String(cause)
@@ -73,6 +80,7 @@ export class MCPPoolAcquireAbortError extends Error {
 		this.serverName = serverName;
 		this.poolKey = poolKey;
 		this.cleanup = cleanup;
+		this.cleanupGeneration = cleanupGeneration;
 	}
 }
 
@@ -121,6 +129,8 @@ export interface MCPPoolAcquireOptions extends MCPPoolKeyOptions {
 	advertiseRoots?: boolean;
 	onNotification?: (method: string, params: unknown) => void;
 	onRequest?: (method: string, params: unknown) => Promise<unknown>;
+	/** @internal Synchronous handoff for a pool-owned abandoned-acquire cleanup flight. */
+	onCleanupPending?: (error: MCPPoolAcquireAbortError) => void;
 }
 
 export interface MCPConnectionPoolOptions {
@@ -172,6 +182,7 @@ type PendingWaiter = {
 	settled: boolean;
 	claimed: boolean;
 	removeAbortListener?: () => void;
+	onCleanupPending?: (error: MCPPoolAcquireAbortError) => void;
 };
 
 type PendingEntry = {
@@ -186,7 +197,17 @@ type PendingEntry = {
 	cancellationReason?: unknown;
 	openAbortController: AbortController;
 	openSignal?: AbortSignal;
-	settlement?: Promise<unknown>;
+	settlement?: Promise<void>;
+};
+
+type RetiredAcquisitionCleanup = {
+	key: string;
+	serverName: string;
+	generation: number;
+	completion: Promise<void>;
+	error: MCPPoolAcquireAbortError;
+	failure?: MCPConnectionCleanupFailure;
+	retry?: Promise<void>;
 };
 
 function errorMessage(error: unknown): string {
@@ -386,6 +407,7 @@ export class MCPConnectionPool {
 	readonly #pending = new Map<string, PendingEntry>();
 	readonly #allLeases = new Set<MCPPoolLeaseImpl>();
 	readonly #retiredEntries = new Set<PoolEntry>();
+	readonly #retiredAcquisitionCleanups = new Map<string, RetiredAcquisitionCleanup>();
 	readonly #restartOwners = new Set<string>();
 	readonly #restartWaiters = new Map<string, { promise: Promise<boolean>; resolve: (value: boolean) => void }>();
 	readonly #healthListeners = new Set<HealthListener>();
@@ -458,22 +480,160 @@ export class MCPConnectionPool {
 		this.#restartWaiters.delete(key);
 	}
 
+	private retainCancelledAcquireCleanup(
+		key: string,
+		name: string,
+		pending: PendingEntry,
+		cause: unknown,
+	): RetiredAcquisitionCleanup {
+		const current = this.#retiredAcquisitionCleanups.get(key);
+		if (current) return current;
+		const completion = pending.settlement;
+		const generation = pending.entry?.generation;
+		if (!completion || generation === undefined) {
+			throw new Error(`MCP cancelled acquisition cleanup is missing its flight identity: ${key}`);
+		}
+		const error = new MCPPoolAcquireAbortError(name, key, cause, completion, generation);
+		const owner: RetiredAcquisitionCleanup = { key, serverName: name, generation, completion, error };
+		this.#retiredAcquisitionCleanups.set(key, owner);
+		void completion.then(
+			() => {
+				if (this.#retiredAcquisitionCleanups.get(key) === owner && !owner.retry) {
+					this.#retiredAcquisitionCleanups.delete(key);
+				}
+			},
+			error => {
+				if (error instanceof MCPConnectionCleanupFailure) {
+					owner.failure = error;
+					return;
+				}
+				if (this.#retiredAcquisitionCleanups.get(key) === owner && !owner.retry) {
+					this.#retiredAcquisitionCleanups.delete(key);
+				}
+			},
+		);
+		return owner;
+	}
+
+	private notifyPendingAcquireCleanup(
+		listener: MCPPoolAcquireOptions["onCleanupPending"],
+		owner: RetiredAcquisitionCleanup,
+	): void {
+		try {
+			listener?.(owner.error);
+		} catch (error) {
+			logger.debug("MCP cancelled acquire cleanup handoff failed", {
+				path: `mcp:${owner.serverName}`,
+				poolKey: owner.key,
+				error,
+			});
+		}
+	}
+
+	/** @internal Whether this pool still owns the notified abandoned-acquire flight. */
+	hasPendingAcquireCleanup(error: MCPPoolAcquireAbortError): boolean {
+		const owner = this.#retiredAcquisitionCleanups.get(error.poolKey);
+		return owner?.generation === error.cleanupGeneration;
+	}
+
+	/** @internal Current retained failure for one notified abandoned-acquire generation. */
+	getPendingAcquireCleanupFailure(error: MCPPoolAcquireAbortError): MCPConnectionCleanupFailure | undefined {
+		const owner = this.#retiredAcquisitionCleanups.get(error.poolKey);
+		return owner && owner.generation === error.cleanupGeneration ? owner.failure : undefined;
+	}
+
+	/** @internal Prevent manager-level duplication of the pool's retained cleanup owner. */
+	ownsPendingAcquireCleanupFailure(error: unknown): boolean {
+		if (!(error instanceof MCPConnectionCleanupFailure)) return false;
+		for (const owner of this.#retiredAcquisitionCleanups.values()) {
+			if (owner.failure === error) return true;
+		}
+		return false;
+	}
+
+	/** Read-only test seam for abandoned-acquire cleanup owners. */
+	get pendingAcquireCleanupCountForTests(): number {
+		return this.#retiredAcquisitionCleanups.size;
+	}
+
+	/** Read-only test seam for the current retained abandoned-acquire cleanup failure. */
+	getPendingAcquireCleanupFailureForTests(name: string): MCPConnectionCleanupFailure | undefined {
+		for (const owner of this.#retiredAcquisitionCleanups.values()) {
+			if (owner.serverName === name && owner.failure) return owner.failure;
+		}
+		return undefined;
+	}
+
+	/** @internal Join and retry one generation of abandoned acquisition cleanup. */
+	async closePendingAcquireCleanup(key: string, generation: number): Promise<void> {
+		const owner = this.#retiredAcquisitionCleanups.get(key);
+		if (!owner || owner.generation !== generation) return;
+		if (owner.retry) return owner.retry;
+		let tracked!: Promise<void>;
+		tracked = (async () => {
+			let failure = owner.failure;
+			if (!failure) {
+				try {
+					await owner.completion;
+				} catch (error) {
+					if (!(error instanceof MCPConnectionCleanupFailure)) throw error;
+					failure = owner.failure ?? error;
+				}
+			}
+			if (failure) {
+				try {
+					await failure.close();
+				} catch (error) {
+					if (this.#retiredAcquisitionCleanups.get(key) === owner) {
+						owner.failure = error instanceof MCPConnectionCleanupFailure ? error : failure;
+					}
+					throw error;
+				}
+			}
+			if (this.#retiredAcquisitionCleanups.get(key) === owner) this.#retiredAcquisitionCleanups.delete(key);
+		})().finally(() => {
+			if (this.#retiredAcquisitionCleanups.get(key) === owner && owner.retry === tracked) owner.retry = undefined;
+		});
+		owner.retry = tracked;
+		return tracked;
+	}
+
 	async acquire(name: string, config: MCPServerConfig, options: MCPPoolAcquireOptions = {}): Promise<MCPPoolLease> {
 		if (this.#shuttingDown) throw new Error("MCP connection pool is shut down");
 		const keyOptions: MCPPoolKeyOptions = options;
 		const key = computeMCPPoolKey(name, config, keyOptions);
+		if (options.signal?.aborted) {
+			throw new MCPPoolAcquireAbortError(
+				name,
+				key,
+				options.signal.reason ?? new Error(`MCP connection acquisition aborted: ${name}`),
+			);
+		}
+		for (;;) {
+			const cleanup = this.#retiredAcquisitionCleanups.get(key);
+			if (!cleanup) break;
+			this.notifyPendingAcquireCleanup(options.onCleanupPending, cleanup);
+			await this.closePendingAcquireCleanup(cleanup.key, cleanup.generation);
+		}
+		if (options.signal?.aborted) {
+			throw new MCPPoolAcquireAbortError(
+				name,
+				key,
+				options.signal.reason ?? new Error(`MCP connection acquisition aborted: ${name}`),
+			);
+		}
 
 		let entry = this.#entries.get(key);
 		let claim: () => void = () => {};
 		if (entry?.pending) {
-			const acquisition = await this.waitForPendingEntry(key, name, entry.pending, options.signal);
+			const acquisition = await this.waitForPendingEntry(key, name, entry.pending, options);
 			entry = acquisition.entry;
 			claim = acquisition.claim;
 		}
 		if (!entry) {
 			let pending = this.#pending.get(key);
 			if (!pending) pending = this.startPendingEntry(key, name, config, options);
-			const acquisition = await this.waitForPendingEntry(key, name, pending, options.signal);
+			const acquisition = await this.waitForPendingEntry(key, name, pending, options);
 			entry = acquisition.entry;
 			claim = acquisition.claim;
 		}
@@ -502,10 +662,17 @@ export class MCPConnectionPool {
 		key: string,
 		name: string,
 		pending: PendingEntry,
-		signal?: AbortSignal,
+		options: Pick<MCPPoolAcquireOptions, "signal" | "onCleanupPending">,
 	): Promise<PendingAcquisition> {
 		const { promise, resolve, reject } = Promise.withResolvers<PendingAcquisition>();
-		const waiter: PendingWaiter = { resolve, reject, settled: false, claimed: false };
+		const signal = options.signal;
+		const waiter: PendingWaiter = {
+			resolve,
+			reject,
+			settled: false,
+			claimed: false,
+			onCleanupPending: options.onCleanupPending,
+		};
 		pending.waiters.add(waiter);
 		const settle = (fn: () => void): void => {
 			if (waiter.settled) return;
@@ -515,14 +682,21 @@ export class MCPConnectionPool {
 			fn();
 		};
 		const abortWaiter = (): void => {
-			const reason = new MCPPoolAcquireAbortError(
-				name,
-				key,
-				signal?.reason ?? new Error(`MCP connection acquisition aborted: ${name}`),
-				pending.settlement,
-			);
-			settle(() => reject(reason));
-			if (pending.waiters.size === 0 && !pending.settled) this.cancelPendingEntry(key, pending, reason);
+			if (waiter.settled) return;
+			waiter.settled = true;
+			pending.waiters.delete(waiter);
+			waiter.removeAbortListener?.();
+			const cause = signal?.reason ?? new Error(`MCP connection acquisition aborted: ${name}`);
+			let reason: MCPPoolAcquireAbortError;
+			if (pending.waiters.size === 0 && !pending.settled) {
+				const cleanup = this.retainCancelledAcquireCleanup(key, name, pending, cause);
+				reason = cleanup.error;
+				this.cancelPendingEntry(key, pending, reason);
+				this.notifyPendingAcquireCleanup(waiter.onCleanupPending, cleanup);
+			} else {
+				reason = new MCPPoolAcquireAbortError(name, key, cause);
+			}
+			reject(reason);
 		};
 		if (signal) {
 			if (signal.aborted) abortWaiter();
@@ -618,12 +792,22 @@ export class MCPConnectionPool {
 					try {
 						await this.closeEntry(entry);
 					} catch (error) {
-						logger.error("MCP cancelled acquire cleanup failed", { path: `mcp:${name}`, poolKey: key, error });
+						throw new MCPConnectionCleanupFailure(
+							new AggregateError(
+								[
+									pending.cancellationReason ?? new Error(`MCP connection acquisition abandoned: ${name}`),
+									error,
+								],
+								`MCP cancelled acquisition cleanup failed: ${name}`,
+							),
+							entry.connection.transport,
+						);
 					}
 				},
 				error => {
 					pending.settled = true;
 					pending.reject(error);
+					if (pending.cancelled && error instanceof MCPConnectionCleanupFailure) throw error;
 				},
 			)
 			.finally(() => {
@@ -678,11 +862,16 @@ export class MCPConnectionPool {
 				try {
 					await connection.transport.close();
 				} catch (closeError) {
-					logger.error("MCP late transport close failed", {
-						path: `mcp:${name}`,
-						poolKey: key,
-						error: closeError,
-					});
+					throw new MCPConnectionCleanupFailure(
+						new AggregateError(
+							[
+								pending.cancellationReason ?? new Error(`MCP connection acquisition abandoned: ${name}`),
+								closeError,
+							],
+							`MCP cancelled acquisition cleanup failed: ${name}`,
+						),
+						connection.transport,
+					);
 				}
 				throw pending.cancellationReason ?? new Error(`MCP connection acquisition abandoned: ${name}`);
 			}
@@ -938,6 +1127,7 @@ export class MCPConnectionPool {
 		this.#shutdownController.abort(reason);
 		for (const [key, pending] of this.#pending) {
 			if (!pending.cancelled) {
+				this.retainCancelledAcquireCleanup(key, pending.entry?.name ?? "unknown", pending, reason);
 				pending.cancelled = true;
 				pending.cancellationReason = reason;
 				pending.openAbortController.abort(reason);
@@ -950,6 +1140,17 @@ export class MCPConnectionPool {
 			}
 			pending.waiters.clear();
 			if (this.#pending.get(key) === pending) this.#pending.delete(key);
+		}
+		for (const cleanup of this.#retiredAcquisitionCleanups.values()) {
+			const failure = this.getPendingAcquireCleanupFailure(cleanup.error);
+			if (!failure) continue;
+			void this.closePendingAcquireCleanup(cleanup.key, cleanup.generation).catch(error =>
+				logger.error("MCP pool shutdown pending acquire cleanup failed", {
+					serverName: cleanup.serverName,
+					poolKey: cleanup.key,
+					error,
+				}),
+			);
 		}
 		for (const lease of this.#allLeases) lease.invalidate(reason);
 		this.#allLeases.clear();
