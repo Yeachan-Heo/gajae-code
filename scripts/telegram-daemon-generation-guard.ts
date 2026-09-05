@@ -8,7 +8,7 @@ import * as path from "node:path";
 
 const root = path.join(import.meta.dir, "..");
 const SHA = /^[0-9a-f]{40}$/i;
-export const GUARD_CONTRACT_VERSION = 53;
+export const GUARD_CONTRACT_VERSION = 54;
 const telegramContract = "packages/coding-agent/src/sdk/bus/telegram-daemon-contract.ts";
 const telegramDaemon = "packages/coding-agent/src/sdk/bus/telegram-daemon.ts";
 const telegramControl = "packages/coding-agent/src/sdk/bus/telegram-daemon-control.ts";
@@ -79,7 +79,7 @@ type GuardManifest = {
  * protected because old owners must be replaced when that admission path changes.
  */
 export const protectedInventory = manifest.inventory as Inventory;
-const PROTECTED_INVENTORY_SHA256 = "df5c87ffe4d762392ca8f35d66d41aed9130bde53b25600206a09a6f8a595587";
+const PROTECTED_INVENTORY_SHA256 = "0679e491e53bd0db96e37151dfda97a95d6d3265b771631865d8ef1f97c00edb";
 
 /** Transition-marker generations fence every daemon lifecycle mutation. */
 export const TRANSITION_TOKEN_PROTECTED_DECLARATIONS = [
@@ -213,6 +213,16 @@ export const CHAT_EFFECT_JOURNAL_PROTECTED_DECLARATIONS = {
 		"enqueueWhileHoldingSessionMutationGate",
 		"enqueueAndClaim",
 		"enqueueAndClaimWhileHoldingSessionMutationGate",
+		"claim",
+		"claimWhileHoldingSessionMutationGate",
+		"renew",
+		"renewWhileHoldingSessionMutationGate",
+		"recordReceipt",
+		"recordReceiptWhileHoldingSessionMutationGate",
+		"record",
+		"recordWhileHoldingSessionMutationGate",
+		"terminalize",
+		"terminalizeWhileHoldingSessionMutationGate",
 		"ChatEffectJournal.#prepareEnqueue",
 	],
 } as const;

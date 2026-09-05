@@ -2185,7 +2185,8 @@ export class SessionRouter {
 						current?.live &&
 						(current.endpointGeneration !== attached.generation ||
 							current.pid !== attached.pid ||
-							current.endpointMtimeMs !== attached.endpointMtimeMs)
+							current.endpointMtimeMs !== attached.endpointMtimeMs ||
+							current.endpointFileId !== attached.indexed.endpointFileId)
 					)
 						reason = current.endpointGeneration === attached.generation ? "replaced_same_generation" : "replaced";
 				} catch {

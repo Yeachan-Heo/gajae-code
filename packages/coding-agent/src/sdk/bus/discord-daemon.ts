@@ -592,25 +592,27 @@ export class DiscordNotificationDaemon {
 		await this.#invalidateSessionWork(sessionId);
 		const intentKey = this.#intentKey(sessionId);
 		const now = this.#now();
-		await this.#store.transact(intentKey, current => {
-			if (
-				current?.state !== "creating" ||
-				current.sessionId !== sessionId ||
-				current.endpointGeneration !== endpointGeneration
-			)
-				return current;
-			return normalizeDiscordConversation({
-				...current,
-				generation: current.generation + 1,
-				state: "closed",
-				createNonce: undefined,
-				createOwner: undefined,
-				createLeaseExpiresAt: undefined,
-				closedAt: now,
-				updatedAt: now,
+		const record = await this.#effects.withSessionMutationGate(sessionId, async () => {
+			await this.#store.transact(intentKey, current => {
+				if (
+					current?.state !== "creating" ||
+					current.sessionId !== sessionId ||
+					current.endpointGeneration !== endpointGeneration
+				)
+					return current;
+				return normalizeDiscordConversation({
+					...current,
+					generation: current.generation + 1,
+					state: "closed",
+					createNonce: undefined,
+					createOwner: undefined,
+					createLeaseExpiresAt: undefined,
+					closedAt: now,
+					updatedAt: now,
+				});
 			});
+			return await this.#bySession(sessionId);
 		});
-		const record = await this.#bySession(sessionId);
 		if (!record?.threadId || record.endpointGeneration !== endpointGeneration) return;
 		await this.#drainSessionWork(sessionId, this.#now() + 5_000);
 		for (const receipt of record.inboundDispatches ?? [])
@@ -621,11 +623,13 @@ export class DiscordNotificationDaemon {
 			parentChannelId: record.parentChannelId,
 			threadId: record.threadId,
 		});
-		await this.#store.transact(key, current =>
-			current?.sessionId === sessionId && current.endpointGeneration === endpointGeneration
-				? withoutClosingIntent(current, now)
-				: current,
-		);
+		await this.#effects.withSessionMutationGate(sessionId, async () => {
+			await this.#store.transact(key, current =>
+				current?.sessionId === sessionId && current.endpointGeneration === endpointGeneration
+					? withoutClosingIntent(current, now)
+					: current,
+			);
+		});
 	}
 
 	async archive(sessionId: string): Promise<void> {
