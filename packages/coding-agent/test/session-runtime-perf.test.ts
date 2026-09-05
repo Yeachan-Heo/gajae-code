@@ -143,14 +143,16 @@ describe("session runtime cache hot paths", () => {
 		}
 	});
 
-	it("bounds unresolved pre-cache generations across repeated invalidation", async () => {
+	it.each(["edit", "turn reset", "rejection"])("bounds and re-admits pre-cache generations after %s", async mode => {
 		using dir = TempDir.createSync("precache-generation-bound-");
 		const filePath = path.resolve(dir.path(), "file.txt");
 		await Bun.write(filePath, "old");
 		const session = createSession(dir.path());
-		const reads: Array<ReturnType<typeof Promise.withResolvers<string>>> = [];
+		const reads: PromiseWithResolvers<string>[] = [];
 		const firstStarted = Promise.withResolvers<void>();
 		const secondStarted = Promise.withResolvers<void>();
+		const replacementStarted = Promise.withResolvers<void>();
+		const nextTurnStarted = Promise.withResolvers<void>();
 		const originalRead = fs.promises.readFile;
 		const readSpy = spyOn(fs.promises, "readFile").mockImplementation(((...args: Parameters<typeof originalRead>) => {
 			if (String(args[0]) !== filePath) return originalRead(...args);
@@ -158,8 +160,11 @@ describe("session runtime cache hot paths", () => {
 			reads.push(pending);
 			if (reads.length === 1) firstStarted.resolve();
 			if (reads.length === 2) secondStarted.resolve();
+			if (reads.length === 3) replacementStarted.resolve();
+			if (reads.length === 4) nextTurnStarted.resolve();
 			return pending.promise;
 		}) as typeof originalRead);
+		const publishSpy = spyOn(StreamingEditFileCache.prototype, "set");
 		try {
 			const invalidate = () =>
 				session.agent.emitExternalEvent({
@@ -180,16 +185,87 @@ describe("session runtime cache hot paths", () => {
 			await settleEvents();
 			startEdit(session, filePath, "second");
 			await secondStarted.promise;
-			invalidate();
+			if (mode === "turn reset") session.agent.emitExternalEvent({ type: "turn_start" });
+			else invalidate();
 			await settleEvents();
 			startEdit(session, filePath, "third");
 			await settleEvents();
-			expect(readSpy).toHaveBeenCalledTimes(2);
-			for (const pending of reads) pending.resolve("stale");
+			expect(reads).toHaveLength(2);
+			if (mode === "rejection") reads[0]!.reject(new Error("stale read failed"));
+			else reads[0]!.resolve("stale first");
 			await settleEvents();
+			expect(publishSpy.mock.calls.filter(([key]) => key === filePath)).toHaveLength(0);
+			startEdit(session, filePath, "replacement");
+			await replacementStarted.promise;
+			expect(reads).toHaveLength(3);
+			reads[2]!.resolve("fresh replacement");
+			await settleEvents();
+			expect(publishSpy.mock.calls.filter(([key]) => key === filePath)).toEqual([[filePath, "fresh replacement"]]);
+			if (mode === "rejection") reads[1]!.reject(new Error("second stale read failed"));
+			else reads[1]!.resolve("stale second");
+			await settleEvents();
+			expect(publishSpy.mock.calls.filter(([key]) => key === filePath)).toEqual([[filePath, "fresh replacement"]]);
+			// Reset also evicts the published text; settled stale generations must not block another read.
+			session.agent.emitExternalEvent({ type: "turn_start" });
+			await settleEvents();
+			startEdit(session, filePath, "after-reset");
+			await nextTurnStarted.promise;
+			expect(reads).toHaveLength(4);
+			reads[3]!.resolve("next turn");
+			await settleEvents();
+			expect(publishSpy.mock.calls.filter(([key]) => key === filePath)).toEqual([
+				[filePath, "fresh replacement"],
+				[filePath, "next turn"],
+			]);
 		} finally {
 			for (const pending of reads) pending.resolve("stale");
 			readSpy.mockRestore();
+			publishSpy.mockRestore();
+			await session.dispose();
+			sessions.splice(sessions.indexOf(session), 1);
+		}
+	});
+
+	it.each(["reject", "throw"])("re-admits pre-cache reads after a current read fails via %s", async failure => {
+		using dir = TempDir.createSync("precache-failure-");
+		const filePath = path.resolve(dir.path(), "file.txt");
+		await Bun.write(filePath, "old");
+		const session = createSession(dir.path());
+		const failed = Promise.withResolvers<string>();
+		const firstStarted = Promise.withResolvers<void>();
+		const replacementStarted = Promise.withResolvers<void>();
+		const replacement = Promise.withResolvers<string>();
+		const originalRead = fs.promises.readFile;
+		let reads = 0;
+		const readSpy = spyOn(fs.promises, "readFile").mockImplementation(((...args: Parameters<typeof originalRead>) => {
+			if (String(args[0]) !== filePath) return originalRead(...args);
+			reads++;
+			if (reads === 1) {
+				firstStarted.resolve();
+				if (failure === "throw") throw new Error("synchronous read failure");
+				return failed.promise;
+			}
+			replacementStarted.resolve();
+			return replacement.promise;
+		}) as typeof originalRead);
+		const publishSpy = spyOn(StreamingEditFileCache.prototype, "set");
+		try {
+			startEdit(session, filePath, "failed");
+			await firstStarted.promise;
+			if (failure === "reject") failed.reject(new Error("asynchronous read failure"));
+			await settleEvents();
+			expect(publishSpy.mock.calls.filter(([key]) => key === filePath)).toHaveLength(0);
+			startEdit(session, filePath, "retry");
+			await replacementStarted.promise;
+			expect(reads).toBe(2);
+			replacement.resolve("recovered");
+			await settleEvents();
+			expect(publishSpy.mock.calls.filter(([key]) => key === filePath)).toEqual([[filePath, "recovered"]]);
+		} finally {
+			failed.resolve("unused");
+			replacement.resolve("recovered");
+			readSpy.mockRestore();
+			publishSpy.mockRestore();
 		}
 	});
 
