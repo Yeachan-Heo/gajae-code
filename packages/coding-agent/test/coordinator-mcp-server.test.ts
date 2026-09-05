@@ -151,6 +151,7 @@ type SdkControlServerOptions = {
 	) => unknown;
 
 	promptAckTimeoutMs?: number;
+	mutations?: string;
 	controlOptions?: Array<{ idempotencyKey?: string; timeoutMs?: number }>;
 	/** Per-query transport options, in dispatch order, parallel to the recorded query names. */
 	queryOptions?: Array<{ timeoutMs?: number } | undefined>;
@@ -167,6 +168,7 @@ type SdkControlServerOptions = {
 	afterDelegateAdmission?: (sessionId: string) => void | Promise<void>;
 	beforeDelegateResponseCommit?: () => void | Promise<void>;
 	afterDelegateResponseCommit?: () => void | Promise<void>;
+	beforeDelegatePinRecovery?: () => void | Promise<void>;
 	/** Every raw session frame the server sent, in order (activation frames included). */
 	sessionFrames?: Array<Record<string, unknown>>;
 	sessionFrameResult?: (frame: Record<string, unknown>) => unknown;
@@ -390,7 +392,7 @@ async function createSdkControlServer(
 		env: {
 			GJC_COORDINATOR_MCP_WORKDIR_ROOTS: root,
 			GJC_COORDINATOR_MCP_STATE_ROOT: stateRoot,
-			GJC_COORDINATOR_MCP_MUTATIONS: "sessions,questions,reports",
+			GJC_COORDINATOR_MCP_MUTATIONS: serverOptions.mutations ?? "sessions,questions,reports",
 			GJC_COORDINATOR_MCP_PROFILE: "local",
 			GJC_COORDINATOR_MCP_REPO: "repo",
 			...(sessionCommand ? { GJC_COORDINATOR_MCP_SESSION_COMMAND: sessionCommand } : {}),
@@ -416,6 +418,7 @@ async function createSdkControlServer(
 			afterDelegateAdmission: serverOptions.afterDelegateAdmission,
 			beforeDelegateResponseCommit: serverOptions.beforeDelegateResponseCommit,
 			afterDelegateResponseCommit: serverOptions.afterDelegateResponseCommit,
+			beforeDelegatePinRecovery: serverOptions.beforeDelegatePinRecovery,
 			connectBroker: async () =>
 				({
 					global: async (
@@ -4843,15 +4846,17 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 							expect(outer).toMatchObject({ state: "in_progress", admission: { kind: "delegate_admission" } });
 							expect(outer.response).toBeUndefined();
 						}
-						sent = f.server.callTool("gjc_coordinator_send_prompt", {
+						sent = f.server.callTool("gjc_delegate_execute", {
+							cwd: f.root,
 							session_id: "visible-session",
-							prompt: "interrupt delegated observation",
+							task: "interrupt delegated observation",
 							[mode]: true,
 							idempotency_key: `interrupt-${mode}`,
 							allow_mutation: true,
+							await_completion: false,
 						});
 						// Await the actual dispatch response with the observation barrier still held.
-						expect(await sent).toMatchObject({ ok: true });
+						expect(await sent).toMatchObject({ ok: true, workflow: "execute" });
 						const operation = mode === "force" ? "turn.abort_and_prompt" : "turn.follow_up";
 						expect(f.controls.filter(control => control.operation === operation)).toHaveLength(1);
 						expect(f.controls.filter(control => control.operation === "turn.prompt")).toHaveLength(1);
@@ -5361,6 +5366,161 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 				expect(f.controls.filter(control => control.operation === "turn.prompt")).toHaveLength(1);
 			}, 15000);
 		}
+
+		it("releases a committed delegate pin after restart even when mutation authorization is revoked", async () => {
+			let interrupt = true;
+			const f = await fixture(true, {
+				afterDelegateResponseCommit: () => {
+					if (interrupt) throw new Error("injected post-commit crash");
+				},
+			});
+			const first = await f.server.callTool("gjc_delegate_execute", f.request);
+			expect(first).toMatchObject({ ok: false });
+			const outer = await Bun.file(receiptPath(f.root, f.request.idempotency_key)).json();
+			const promptKey = String(outer.delegate_response_pin.prompt_key_digest);
+			expect(outer).toMatchObject({
+				state: "completed",
+				delegate_response_pin: {
+					session_id: "visible-session",
+					coordinator_turn_id: expect.any(String),
+					prompt_key_digest: expect.any(String),
+					runtime_command_id: expect.any(String),
+					runtime_turn_id: expect.any(String),
+				},
+			});
+			const paths = coordinatorStatePaths(f.server.config.stateRoot, f.server.config.namespace.identity);
+			const interruptedTransaction = await readSessionTransaction(paths, "visible-session");
+			expect(Object.keys(interruptedTransaction?.requests.prompts ?? {})).toContain(promptKey);
+			expect(interruptedTransaction?.requests.prompts[promptKey]).toMatchObject({
+				delegate_response_pending: true,
+			});
+			interrupt = false;
+			const restarted = await f.open({ mutations: "questions,reports" });
+			expect(restarted.config.mutationClasses.has("sessions")).toBe(false);
+			expect(await restarted.callTool("gjc_coordinator_read_coordination_status")).toMatchObject({ ok: true });
+			expect(
+				(await readSessionTransaction(paths, "visible-session"))?.requests.prompts[promptKey]
+					?.delegate_response_pending,
+			).not.toBe(true);
+			expect(await restarted.callTool("gjc_delegate_execute", f.request)).toMatchObject({
+				ok: false,
+				error: { code: "unavailable" },
+			});
+		}, 15000);
+
+		it("releases a delegate pin from internal identity when the public response is truncated", async () => {
+			const f = await fixture(true);
+			const first = await f.server.callTool("gjc_delegate_execute", f.request);
+			expect(first).toMatchObject({ ok: true });
+			const file = receiptPath(f.root, f.request.idempotency_key);
+			const outer = await Bun.file(file).json();
+			const pin = outer.delegate_response_pin as Record<string, unknown>;
+			const promptKey = String(pin.prompt_key_digest);
+			const paths = coordinatorStatePaths(f.server.config.stateRoot, f.server.config.namespace.identity);
+			await withSessionTransaction(paths, "visible-session", async transaction => {
+				transaction.requests.prompts[promptKey]!.delegate_response_pending = true;
+			});
+			outer.response.result = "[truncated]";
+			await Bun.write(file, `${JSON.stringify(outer)}\n`);
+			const restarted = await f.open();
+			expect(await restarted.callTool("gjc_coordinator_read_coordination_status")).toMatchObject({ ok: true });
+			expect(
+				(await readSessionTransaction(paths, "visible-session"))?.requests.prompts[promptKey]
+					?.delegate_response_pending,
+			).not.toBe(true);
+		}, 15000);
+
+		it("leaves the delegate response unsealed when its admission pin disappears before commit", async () => {
+			let tamper = true;
+			const f = await fixture(true, {
+				beforeDelegateResponseCommit: async () => {
+					if (!tamper) return;
+					const file = receiptPath(f.root, f.request.idempotency_key);
+					const outer = await Bun.file(file).json();
+					delete outer.delegate_response_pin;
+					await Bun.write(file, `${JSON.stringify(outer)}\n`);
+				},
+			});
+			expect(await f.server.callTool("gjc_delegate_execute", f.request)).toMatchObject({ ok: false });
+			const outer = await Bun.file(receiptPath(f.root, f.request.idempotency_key)).json();
+			expect(outer).toMatchObject({ state: "in_progress", admission: { kind: "delegate_admission" } });
+			expect(outer.response).toBeUndefined();
+			expect(outer.completed_at).toBeUndefined();
+			tamper = false;
+		}, 15000);
+
+		it("continues past one corrupt pin receipt and retries it on the next call", async () => {
+			const f = await fixture(true);
+			const first = await f.server.callTool("gjc_delegate_execute", f.request);
+			expect(first).toMatchObject({ ok: true });
+			const secondRequest = {
+				...f.request,
+				task: "second durable delegated task",
+				idempotency_key: "delegate-recovery-second",
+				force: true,
+				await_completion: false,
+			};
+			const second = await f.server.callTool("gjc_delegate_execute", secondRequest);
+			expect(second).toMatchObject({ ok: true });
+			const firstFile = receiptPath(f.root, f.request.idempotency_key);
+			const secondFile = receiptPath(f.root, secondRequest.idempotency_key);
+			const firstOuter = await Bun.file(firstFile).json();
+			const secondOuter = await Bun.file(secondFile).json();
+			const firstPromptKey = String(firstOuter.delegate_response_pin.prompt_key_digest);
+			const secondPromptKey = String(secondOuter.delegate_response_pin.prompt_key_digest);
+			const paths = coordinatorStatePaths(f.server.config.stateRoot, f.server.config.namespace.identity);
+			await withSessionTransaction(paths, "visible-session", async transaction => {
+				transaction.requests.prompts[firstPromptKey]!.delegate_response_pending = true;
+				transaction.requests.prompts[secondPromptKey]!.delegate_response_pending = true;
+			});
+			await Bun.write(firstFile, "{");
+			const restarted = await f.open();
+			expect(await restarted.callTool("gjc_coordinator_read_coordination_status")).toMatchObject({ ok: true });
+			const afterPartialRecovery = await readSessionTransaction(paths, "visible-session");
+			expect(afterPartialRecovery?.requests.prompts[firstPromptKey]?.delegate_response_pending).toBe(true);
+			expect(afterPartialRecovery?.requests.prompts[secondPromptKey]?.delegate_response_pending).not.toBe(true);
+			await Bun.write(firstFile, `${JSON.stringify(firstOuter)}\n`);
+			expect(await restarted.callTool("gjc_coordinator_read_coordination_status")).toMatchObject({ ok: true });
+			expect(
+				(await readSessionTransaction(paths, "visible-session"))?.requests.prompts[firstPromptKey]
+					?.delegate_response_pending,
+			).not.toBe(true);
+		}, 15000);
+
+		it("retries a same-process pin cleanup failure on the next unrelated read", async () => {
+			let failRecovery = false;
+			let transactionSource = "";
+			const f = await fixture(true, {
+				beforeDelegatePinRecovery: () => {
+					if (failRecovery) throw new Error("injected pin recovery failure");
+				},
+				afterDelegateResponseCommit: async () => {
+					failRecovery = true;
+					const paths = coordinatorStatePaths(f.server.config.stateRoot, f.server.config.namespace.identity);
+					transactionSource = await Bun.file(transactionPath(paths, "visible-session")).text();
+					await Bun.write(transactionPath(paths, "visible-session"), "{");
+				},
+			});
+			const first = await f.server.callTool("gjc_delegate_execute", f.request);
+			expect(first).toMatchObject({ ok: true });
+			const paths = coordinatorStatePaths(f.server.config.stateRoot, f.server.config.namespace.identity);
+			const outer = await Bun.file(receiptPath(f.root, f.request.idempotency_key)).json();
+			const promptKey = String(outer.delegate_response_pin.prompt_key_digest);
+			const corrupted = await Bun.file(transactionPath(paths, "visible-session")).text();
+			expect(corrupted).toBe("{");
+			await Bun.write(transactionPath(paths, "visible-session"), transactionSource);
+			expect(await f.server.callTool("gjc_coordinator_read_coordination_status")).toMatchObject({ ok: true });
+			expect(
+				(await readSessionTransaction(paths, "visible-session"))?.requests.prompts[promptKey]
+					?.delegate_response_pending,
+			).toBe(true);
+			failRecovery = false;
+			expect(await f.server.callTool("gjc_coordinator_read_coordination_status")).toMatchObject({ ok: true });
+			expect(
+				(await readSessionTransaction(paths, "visible-session"))?.requests.prompts[promptKey]
+					?.delegate_response_pending,
+			).not.toBe(true);
+		}, 15000);
 
 		for (const reused of [false, true]) {
 			it(`singleflights ${reused ? "reused" : "new"} observation and rejects conflicting requests`, async () => {
