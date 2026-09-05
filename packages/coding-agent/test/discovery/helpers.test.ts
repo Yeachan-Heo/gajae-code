@@ -1,7 +1,15 @@
 import { describe, expect, test } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
 import * as path from "node:path";
 import { parseFrontmatter } from "@gajae-code/utils";
-import { getUserSkillScanDirs, resolveUserAgentDir, SOURCE_PATHS } from "../../src/discovery/helpers";
+import {
+	getAncestorDirs,
+	getUserSkillScanDirs,
+	resolveUserAgentDir,
+	SOURCE_PATHS,
+	scanSkillsFromDir,
+} from "../../src/discovery/helpers";
 
 describe("parseFrontmatter", () => {
 	const parse = (content: string) => parseFrontmatter(content, { source: "tests:frontmatter", level: "off" });
@@ -276,6 +284,84 @@ Body content`;
 		const result = parseFrontmatter(content, { source: "tests:frontmatter", level: "off", normalize: false });
 		expect(result.frontmatter).toEqual({});
 		expect(result.body).toBe(content);
+	});
+});
+
+describe("safe discovery boundaries", () => {
+	test("excludes normalized home from an ancestor walk even when home is the repo root", () => {
+		const home = path.resolve(path.join(os.tmpdir(), "gjc-home-repo"));
+		const cwd = path.join(home, "workspace");
+		expect(getAncestorDirs(cwd, home, home)).toEqual([{ dir: cwd, depth: 0 }]);
+	});
+
+	test("loads in-root skill symlinks but rejects directory and file symlinks outside the scan root", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-safe-skill-scan-"));
+		try {
+			const skillsDir = path.join(root, "skills");
+			const outsideDir = path.join(root, "outside");
+			const insideDir = path.join(skillsDir, "inside-target");
+			await fs.mkdir(insideDir, { recursive: true });
+			await fs.mkdir(outsideDir);
+			const content = "---\nname: safe\ndescription: safe skill\n---\n\n# safe\n";
+			await fs.writeFile(path.join(insideDir, "SKILL.md"), content);
+			await fs.writeFile(path.join(outsideDir, "SKILL.md"), content.replaceAll("safe", "outside"));
+			await fs.symlink(insideDir, path.join(skillsDir, "inside-alias"), "dir");
+			await fs.symlink(outsideDir, path.join(skillsDir, "outside-dir"), "dir");
+			const outsideFileDir = path.join(skillsDir, "outside-file");
+			await fs.mkdir(outsideFileDir);
+			await fs.symlink(path.join(outsideDir, "SKILL.md"), path.join(outsideFileDir, "SKILL.md"), "file");
+			const hardLinkDir = path.join(skillsDir, "outside-hard-link");
+			await fs.mkdir(hardLinkDir);
+			await fs.link(path.join(outsideDir, "SKILL.md"), path.join(hardLinkDir, "SKILL.md"));
+
+			const result = await scanSkillsFromDir(
+				{ cwd: root, home: root, repoRoot: root },
+				{ dir: skillsDir, providerId: "test", level: "user", requireDescription: true },
+			);
+
+			expect(result.items.map(skill => skill.name)).toEqual(["safe", "safe"]);
+			expect(result.warnings).toEqual(
+				expect.arrayContaining([expect.stringContaining("Refusing skill path outside scan root")]),
+			);
+
+			const directSkill = result.items.find(skill => skill.path === path.join(insideDir, "SKILL.md"));
+			expect(directSkill).toBeDefined();
+			const loadContent = directSkill?.loadContent;
+			expect(loadContent).toBeDefined();
+			await fs.rm(path.join(insideDir, "SKILL.md"));
+			await fs.symlink(path.join(outsideDir, "SKILL.md"), path.join(insideDir, "SKILL.md"), "file");
+			await expect(loadContent!()).rejects.toThrow();
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
+	test("rejects a selected agent-directory authority root that is itself a symlink", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-agent-root-symlink-"));
+		try {
+			const outside = path.join(root, "outside");
+			const agentDir = path.join(root, "agent");
+			const skillDir = path.join(outside, "skills", "leak");
+			await fs.mkdir(skillDir, { recursive: true });
+			await fs.writeFile(path.join(skillDir, "SKILL.md"), "---\nname: leak\ndescription: outside\n---\n");
+			await fs.symlink(outside, agentDir, "dir");
+
+			const result = await scanSkillsFromDir(
+				{ cwd: root, home: root, repoRoot: root },
+				{
+					dir: path.join(agentDir, "skills"),
+					authorityRoot: agentDir,
+					providerId: "test",
+					level: "user",
+					requireDescription: true,
+				},
+			);
+
+			expect(result.items).toEqual([]);
+			expect(result.warnings).toEqual([expect.stringContaining("Refusing unsafe skill authority root")]);
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
 	});
 });
 

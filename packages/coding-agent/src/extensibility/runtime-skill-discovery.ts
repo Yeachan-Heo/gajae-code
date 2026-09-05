@@ -13,7 +13,13 @@ import { resolveSkillScopeTrust } from "../config/skill-settings-defaults";
 import { scanClaudeProjectSkills, scanClaudeUserSkills } from "../discovery/claude";
 import { loadMarketplaceSkills } from "../discovery/claude-plugins";
 import { scanCodexProjectSkills, scanCodexUserSkills } from "../discovery/codex";
-import { compareSkillOrder, getUserSkillScanDirs, SOURCE_PATHS, scanSkillsFromDir } from "../discovery/helpers";
+import {
+	compareSkillOrder,
+	getAncestorDirs,
+	getUserSkillScanDirs,
+	SOURCE_PATHS,
+	scanSkillsFromDir,
+} from "../discovery/helpers";
 import { CANONICAL_GJC_WORKFLOW_SKILLS } from "../skill-state/canonical-skills";
 import { expandTilde } from "../tools/path-utils";
 import { loadSkills, type Skill } from "./skills";
@@ -90,29 +96,11 @@ async function getProjectSkillDirs(
 ): Promise<{ scans: ProjectScanDir[]; repoRoot: string | null }> {
 	const scans: ProjectScanDir[] = [];
 	const repoRoot = await findRepoRoot(cwd);
-	const walkDirs = ancestorDirs(cwd, path.resolve(repoRoot ?? cwd), home);
-	for (const dir of walkDirs) {
+	const walkDirs = getAncestorDirs(cwd, path.resolve(repoRoot ?? cwd), home);
+	for (const { dir } of walkDirs) {
 		scans.push({ dir: path.join(dir, ".gjc", "skills"), label: "project .gjc/skills" });
 	}
 	return { scans, repoRoot };
-}
-
-/** Ancestor directories from `cwd` (inclusive) up to `stop` (inclusive), excluding `home`. */
-function ancestorDirs(cwd: string, stop: string, home: string): string[] {
-	const dirs: string[] = [];
-	let current = path.resolve(cwd);
-	const resolvedStop = path.resolve(stop);
-	const resolvedHome = path.resolve(home);
-	while (true) {
-		if (current !== resolvedHome) {
-			dirs.push(current);
-		}
-		if (current === resolvedStop) break;
-		const parent = path.dirname(current);
-		if (parent === current) break;
-		current = parent;
-	}
-	return dirs;
 }
 
 function getUserSkillDirs(home: string, agentDir = getAgentDir(), profileAuthority?: "default" | "custom"): string[] {
@@ -274,9 +262,11 @@ async function scanProjectOrUserDir(
 	label: string,
 	source: RuntimeSkillDiscoverySource,
 	providerPriority: number,
+	authorityRoot?: string,
 ): Promise<ScanJobResult> {
 	const result = await scanSkillsFromDir(ctx, {
 		dir,
+		authorityRoot,
 		providerId: "runtime",
 		level,
 		requireDescription: true,
@@ -409,7 +399,15 @@ export async function discoverRuntimeSkills(
 	if ((source === "all" || source === "user") && sourceEnabled("user", policy)) {
 		for (const dir of getUserSkillDirs(home, agentDir, profileAuthority)) {
 			scanJobs.push(
-				scanProjectOrUserDir({ cwd: options.cwd, home, repoRoot: home }, dir, "user", `user ${dir}`, "user", 100),
+				scanProjectOrUserDir(
+					{ cwd: options.cwd, home, repoRoot: home },
+					dir,
+					"user",
+					`user ${dir}`,
+					"user",
+					100,
+					agentDir,
+				),
 			);
 		}
 	}

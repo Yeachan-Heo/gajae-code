@@ -91,6 +91,8 @@ export interface LoadOptions {
 	 * process-wide one (`createAgentSession({ agentDir })`).
 	 */
 	agentDir?: string;
+	/** Resolver-owned classification for `agentDir`; preserve it across HOME/config refreshes. */
+	profileAuthority?: "default" | "custom";
 	/** Include items even if they fail validation. Default: false */
 	includeInvalid?: boolean;
 	/** Include items disabled via settings. Default: false */

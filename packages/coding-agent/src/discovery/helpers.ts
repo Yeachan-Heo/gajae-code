@@ -1,4 +1,5 @@
 import * as fs from "node:fs";
+import type { FileHandle } from "node:fs/promises";
 import * as path from "node:path";
 import type { ThinkingLevel } from "@gajae-code/agent-core";
 import type { FileType as FileTypeEnum, glob as globFn } from "@gajae-code/natives";
@@ -99,6 +100,30 @@ export const SOURCE_PATHS = {
 		projectDir: ".vscode",
 	},
 } as const;
+
+/** Ancestors from `cwd` through `stopAt`, excluding one normalized authority boundary. */
+export function getAncestorDirs(
+	cwd: string,
+	stopAt?: string | null,
+	excludeDir?: string,
+): Array<{ dir: string; depth: number }> {
+	const ancestors: Array<{ dir: string; depth: number }> = [];
+	let current = path.resolve(cwd);
+	let depth = 0;
+	let normalizedCurrent = normalizePathForComparison(current);
+	const normalizedStop = stopAt ? normalizePathForComparison(path.resolve(stopAt)) : undefined;
+	const normalizedExclude = excludeDir ? normalizePathForComparison(path.resolve(excludeDir)) : undefined;
+	while (true) {
+		if (normalizedCurrent !== normalizedExclude) ancestors.push({ dir: current, depth });
+		if (normalizedStop && normalizedCurrent === normalizedStop) break;
+		const parent = path.dirname(current);
+		if (parent === current) break;
+		current = parent;
+		normalizedCurrent = normalizePathForComparison(current);
+		depth++;
+	}
+	return ancestors;
+}
 
 export type SourceId = keyof typeof SOURCE_PATHS;
 export type ProfileAuthority = "default" | "custom";
@@ -390,6 +415,8 @@ async function globIf(
 
 export interface ScanSkillsFromDirOptions {
 	dir: string;
+	/** Selected authority root whose own identity must not be a symlink. */
+	authorityRoot?: string;
 	providerId: string;
 	level: "user" | "project";
 	requireDescription?: boolean;
@@ -445,7 +472,25 @@ export async function scanSkillsFromDir(
 	const { dir, level, providerId, requireDescription = false } = options;
 
 	let entries: fs.Dirent[];
+	let realRoot: string;
 	try {
+		if (options.authorityRoot) {
+			try {
+				const authorityStat = await fs.promises.lstat(options.authorityRoot);
+				if (authorityStat.isSymbolicLink() || !authorityStat.isDirectory()) {
+					warnings.push(`Refusing unsafe skill authority root: ${options.authorityRoot}`);
+					return { items, warnings };
+				}
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+			}
+		}
+		const rootStat = await fs.promises.lstat(dir);
+		if (rootStat.isSymbolicLink() || !rootStat.isDirectory()) {
+			warnings.push(`Refusing unsafe skills directory: ${dir}`);
+			return { items, warnings };
+		}
+		realRoot = await fs.promises.realpath(dir);
 		entries = await fs.promises.readdir(dir, { withFileTypes: true });
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
@@ -453,8 +498,49 @@ export async function scanSkillsFromDir(
 		}
 		return { items, warnings };
 	}
-	const loadSkill = async (skillPath: string) => {
+	const isWithinRoot = (candidate: string): boolean => {
+		const relative = path.relative(realRoot, candidate);
+		return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+	};
+	const readSkillContentSafely = async (skillPath: string): Promise<string> => {
+		const flags =
+			fs.constants.O_RDONLY |
+			(process.platform === "win32" ? 0 : (fs.constants.O_NOFOLLOW ?? 0) | (fs.constants.O_NONBLOCK ?? 0));
+		const handle = await fs.promises.open(skillPath, flags);
 		try {
+			const [opened, observed, currentPath] = await Promise.all([
+				handle.stat({ bigint: true }),
+				fs.promises.lstat(skillPath, { bigint: true }),
+				fs.promises.realpath(skillPath),
+			]);
+			if (
+				!opened.isFile() ||
+				opened.nlink !== 1n ||
+				observed.isSymbolicLink() ||
+				!observed.isFile() ||
+				opened.dev !== observed.dev ||
+				opened.ino !== observed.ino ||
+				!isWithinRoot(currentPath)
+			) {
+				throw new Error(`Unsafe skill file: ${skillPath}`);
+			}
+			return await handle.readFile({ encoding: "utf8" });
+		} finally {
+			await handle.close();
+		}
+	};
+	const loadSkill = async (candidatePath: string) => {
+		try {
+			const skillPath = await fs.promises.realpath(candidatePath);
+			if (!isWithinRoot(skillPath)) {
+				warnings.push(`Refusing skill path outside scan root: ${candidatePath}`);
+				return;
+			}
+			const stat = await fs.promises.stat(skillPath);
+			if (!stat.isFile() || stat.nlink !== 1) {
+				warnings.push(`Skill path is not a regular file: ${candidatePath}`);
+				return;
+			}
 			const frontmatter = await readSkillFrontmatter(skillPath);
 			if (!frontmatter) {
 				if (fs.statSync(skillPath).size > SKILL_FRONTMATTER_SCAN_TOTAL_BYTES) {
@@ -480,15 +566,16 @@ export async function scanSkillsFromDir(
 				name,
 				path: skillPath,
 				loadContent: async () => {
-					const content = await Bun.file(skillPath).text();
+					const content = await readSkillContentSafely(skillPath);
 					return parseFrontmatter(content, { source: skillPath }).body;
 				},
 				frontmatter: frontmatter as SkillFrontmatter,
 				level,
 				_source: createSourceMeta(providerId, skillPath, level),
 			});
-		} catch {
-			warnings.push(`Failed to read skill file: ${skillPath}`);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+			warnings.push(`Failed to read skill file: ${candidatePath}`);
 		}
 	};
 
@@ -497,9 +584,7 @@ export async function scanSkillsFromDir(
 		if (entry.name.startsWith(".")) continue;
 		if (!entry.isDirectory() && !entry.isSymbolicLink()) continue;
 		const skillPath = path.join(dir, entry.name, "SKILL.md");
-		if (fs.existsSync(skillPath)) {
-			work.push(loadSkill(skillPath));
-		}
+		work.push(loadSkill(skillPath));
 	}
 	await Promise.all(work);
 
@@ -507,6 +592,54 @@ export async function scanSkillsFromDir(
 	items.sort((a, b) => compareSkillOrder(a.name, a.path, b.name, b.path));
 
 	return { items, warnings };
+}
+
+/** Read a regular single-link file that remains contained by its configured root. */
+export async function readContainedFile(root: string, filePath: string): Promise<string | null> {
+	let realRoot: string;
+	try {
+		const rootStat = await fs.promises.lstat(root);
+		if (rootStat.isSymbolicLink() || !rootStat.isDirectory()) return null;
+		realRoot = await fs.promises.realpath(root);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+		throw error;
+	}
+	const relative = path.relative(root, filePath);
+	if (relative.startsWith("..") || path.isAbsolute(relative)) return null;
+	const flags =
+		fs.constants.O_RDONLY |
+		(process.platform === "win32" ? 0 : (fs.constants.O_NOFOLLOW ?? 0) | (fs.constants.O_NONBLOCK ?? 0));
+	let handle: FileHandle;
+	try {
+		handle = await fs.promises.open(filePath, flags);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+		return null;
+	}
+	try {
+		const [opened, observed, currentPath] = await Promise.all([
+			handle.stat({ bigint: true }),
+			fs.promises.lstat(filePath, { bigint: true }),
+			fs.promises.realpath(filePath),
+		]);
+		const currentRelative = path.relative(realRoot, currentPath);
+		if (
+			!opened.isFile() ||
+			opened.nlink !== 1n ||
+			observed.isSymbolicLink() ||
+			!observed.isFile() ||
+			opened.dev !== observed.dev ||
+			opened.ino !== observed.ino ||
+			currentRelative.startsWith("..") ||
+			path.isAbsolute(currentRelative)
+		) {
+			return null;
+		}
+		return await handle.readFile({ encoding: "utf8" });
+	} finally {
+		await handle.close();
+	}
 }
 
 /**

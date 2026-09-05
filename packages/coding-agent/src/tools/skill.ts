@@ -176,6 +176,7 @@ export class SkillTool implements AgentTool<typeof skillSchema, SkillToolDetails
 					this.#getRuntimeSkillPolicy(),
 					this.#session.home,
 					agentDir,
+					this.#session.profileAuthority,
 				));
 			if (!skill) {
 				const available = formatAvailableSkills(skills);

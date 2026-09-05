@@ -32,6 +32,25 @@ describe("native prompt discovery agent directory", () => {
 		expect(resolvedContext.contextFiles).toEqual([{ path: path.join(agentDir, "AGENTS.md"), content: context }]);
 	});
 
+	test("rejects symlinked user prompt leaves outside the selected agent directory", async () => {
+		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-prompt-symlink-cwd-"));
+		const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-prompt-symlink-profile-"));
+		const outside = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-prompt-symlink-outside-"));
+		tempRoots.push(cwd, agentDir, outside);
+		await fs.writeFile(path.join(outside, "SYSTEM.md"), "outside system");
+		await fs.writeFile(path.join(outside, "AGENTS.md"), "outside context");
+		await fs.symlink(path.join(outside, "SYSTEM.md"), path.join(agentDir, "SYSTEM.md"), "file");
+		await fs.symlink(path.join(outside, "AGENTS.md"), path.join(agentDir, "AGENTS.md"), "file");
+
+		const [resolvedSystemPrompt, resolvedContext] = await Promise.all([
+			loadSystemPromptFiles({ cwd, agentDir }),
+			loadProjectContextFilesResult({ cwd, agentDir }),
+		]);
+
+		expect(resolvedSystemPrompt).toBeNull();
+		expect(resolvedContext.contextFiles).toEqual([]);
+	});
+
 	test("keeps default-profile legacy skill roots with an XDG agent directory", async () => {
 		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-skill-agent-cwd-"));
 		const home = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-skill-agent-home-"));
@@ -60,5 +79,36 @@ describe("native prompt discovery agent directory", () => {
 		});
 
 		expect(result.skills.map(skill => skill.name)).toEqual(["legacy-skill", "xdg-skill"]);
+	});
+
+	test("does not promote home legacy skills to project scope when home is the repository root", async () => {
+		const home = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-home-repo-skill-"));
+		const cwd = path.join(home, "workspace");
+		const agentDir = path.join(home, "profiles", "review");
+		tempRoots.push(home);
+		await fs.mkdir(path.join(home, ".git"));
+		await fs.mkdir(cwd);
+		const writeSkill = async (root: string, name: string): Promise<void> => {
+			const skillDir = path.join(root, name);
+			await fs.mkdir(skillDir, { recursive: true });
+			await fs.writeFile(
+				path.join(skillDir, "SKILL.md"),
+				`---\nname: ${name}\ndescription: ${name} description\n---\n\n# ${name}\n`,
+			);
+		};
+		await writeSkill(path.join(home, ".gjc", "skills"), "legacy-home");
+		await writeSkill(path.join(agentDir, "skills"), "profile-only");
+
+		const result = await loadSkills({
+			cwd,
+			home,
+			agentDir,
+			profileAuthority: "custom",
+			enabled: true,
+			trustProjectSkills: true,
+			trustUserSkills: true,
+		});
+
+		expect(result.skills.map(skill => skill.name)).toEqual(["profile-only"]);
 	});
 });

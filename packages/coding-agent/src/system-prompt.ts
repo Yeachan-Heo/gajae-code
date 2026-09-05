@@ -237,6 +237,8 @@ export interface LoadContextFilesOptions {
 	cwd?: string;
 	/** Agent directory backing native user-scope context and system prompt files. */
 	agentDir?: string;
+	/** Resolver-owned classification for `agentDir`; preserve it across HOME/config refreshes. */
+	profileAuthority?: "default" | "custom";
 }
 
 function dedupeExactContextFiles(
@@ -267,7 +269,11 @@ export async function loadProjectContextFilesResult(
 	options: LoadContextFilesOptions = {},
 ): Promise<ProjectContextFilesResult> {
 	const resolvedCwd = options.cwd ?? getProjectDir();
-	const result = await loadCapability(contextFileCapability.id, { cwd: resolvedCwd, agentDir: options.agentDir });
+	const result = await loadCapability(contextFileCapability.id, {
+		cwd: resolvedCwd,
+		agentDir: options.agentDir,
+		profileAuthority: options.profileAuthority,
+	});
 	const items = result.items as ContextFile[];
 
 	// Native user-global context applies everywhere and is least specific, so it
@@ -316,6 +322,7 @@ export async function loadSystemPromptFiles(options: LoadContextFilesOptions = {
 	const result = await loadCapability<SystemPromptFile>(systemPromptCapability.id, {
 		cwd: resolvedCwd,
 		agentDir: options.agentDir,
+		profileAuthority: options.profileAuthority,
 	});
 
 	if (result.items.length === 0) return null;
@@ -381,6 +388,8 @@ export interface BuildSystemPromptOptions {
 	cwd?: string;
 	/** Agent directory backing native user-scope prompt discovery. */
 	agentDir?: string;
+	/** Resolver-owned classification for `agentDir`; preserve it across HOME/config refreshes. */
+	profileAuthority?: "default" | "custom";
 	/** Pre-loaded context files (skips discovery if provided). */
 	contextFiles?: Array<{ path: string; content: string; depth?: number }>;
 	/** Skills provided directly to system prompt construction. */
@@ -611,12 +620,14 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 	const systemPromptCustomizationPromise = logger.time("loadSystemPromptFiles", loadSystemPromptFiles, {
 		cwd: resolvedCwd,
 		agentDir: options.agentDir,
+		profileAuthority: options.profileAuthority,
 	});
 	const contextFilesPromise = providedContextFiles
 		? Promise.resolve({ contextFiles: providedContextFiles, warnings: [] })
 		: logger.time("loadProjectContextFiles", loadProjectContextFilesResult, {
 				cwd: resolvedCwd,
 				agentDir: options.agentDir,
+				profileAuthority: options.profileAuthority,
 			});
 	const workspaceTreePromise =
 		providedWorkspaceTree !== undefined

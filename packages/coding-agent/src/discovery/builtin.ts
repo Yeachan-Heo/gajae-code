@@ -4,7 +4,7 @@
  * Primary provider for GJC native configs. Supports all capabilities.
  */
 import * as path from "node:path";
-import { logger, normalizePathForComparison, parseFrontmatter, tryParseJson } from "@gajae-code/utils";
+import { logger, parseFrontmatter, tryParseJson } from "@gajae-code/utils";
 import { YAML } from "bun";
 import { registerProvider } from "../capability";
 import { type ContextFile, contextFileCapability } from "../capability/context-file";
@@ -28,9 +28,11 @@ import {
 	createSourceMeta,
 	discoverExtensionModulePaths,
 	expandEnvVarsDeep,
+	getAncestorDirs,
 	getExtensionNameFromPath,
 	getUserSkillScanDirs,
 	loadFilesFromDir,
+	readContainedFile,
 	SOURCE_PATHS,
 	scanSkillsFromDir,
 } from "./helpers";
@@ -89,37 +91,12 @@ async function getConfigDirs(ctx: LoadContext): Promise<Array<{ dir: string; lev
 	return result;
 }
 
-function getAncestorDirs(
-	cwd: string,
-	stopAt?: string | null,
-	excludeDir?: string,
-): Array<{ dir: string; depth: number }> {
-	const ancestors: Array<{ dir: string; depth: number }> = [];
-	let current = path.resolve(cwd);
-	let depth = 0;
-	let normalizedCurrent = normalizePathForComparison(current);
-	const resolvedStop = stopAt ? path.resolve(stopAt) : undefined;
-	const normalizedStop = resolvedStop ? normalizePathForComparison(resolvedStop) : undefined;
-	const resolvedExclude = excludeDir ? path.resolve(excludeDir) : undefined;
-	const normalizedExclude = resolvedExclude ? normalizePathForComparison(resolvedExclude) : undefined;
-	while (true) {
-		if (normalizedCurrent !== normalizedExclude) ancestors.push({ dir: current, depth });
-		if (normalizedStop && normalizedCurrent === normalizedStop) break;
-		const parent = path.dirname(current);
-		if (parent === current) break;
-		current = parent;
-		normalizedCurrent = normalizePathForComparison(current);
-		depth++;
-	}
-	return ancestors;
-}
-
 async function findNearestProjectConfigDir(
 	cwd: string,
 	repoRoot?: string | null,
 	home?: string,
 ): Promise<{ dir: string; depth: number } | null> {
-	for (const ancestor of getAncestorDirs(cwd, repoRoot ?? home, repoRoot ? undefined : home)) {
+	for (const ancestor of getAncestorDirs(cwd, repoRoot ?? home, home)) {
 		for (const projectConfigDir of getProjectConfigDirs()) {
 			const configDir = await ifNonEmptyDir(ancestor.dir, projectConfigDir);
 			if (configDir) return { dir: configDir, depth: ancestor.depth };
@@ -292,7 +269,7 @@ async function loadSystemPrompt(ctx: LoadContext): Promise<LoadResult<SystemProm
 	// and the only user-scope seam. A profile is a separate scope; the default
 	// profile's home-relative SYSTEM.md is not read under one.
 	const userPath = path.join(resolveUserAgentDir(ctx), "SYSTEM.md");
-	const userContent = await readFile(userPath);
+	const userContent = await readContainedFile(resolveUserAgentDir(ctx), userPath);
 	if (userContent) {
 		items.push({
 			path: userPath,
@@ -330,7 +307,7 @@ registerProvider<SystemPrompt>(systemPromptCapability.id, {
 // Skills
 async function loadSkills(ctx: LoadContext): Promise<LoadResult<Skill>> {
 	// Walk up from cwd finding .gjc/skills/ in ancestors (closest first)
-	const ancestors = getAncestorDirs(ctx.cwd, ctx.repoRoot ?? ctx.home, ctx.repoRoot ? undefined : ctx.home);
+	const ancestors = getAncestorDirs(ctx.cwd, ctx.repoRoot ?? ctx.home, ctx.home);
 	const projectScans = ancestors.flatMap(({ dir }) =>
 		getProjectConfigDirs().map(projectConfigDir =>
 			scanSkillsFromDir(ctx, {
@@ -344,9 +321,11 @@ async function loadSkills(ctx: LoadContext): Promise<LoadResult<Skill>> {
 
 	// User-level scan from the selected agent-directory profile plus documented
 	// default-profile legacy scan roots.
-	const userScans = getUserSkillScanDirs(ctx.home, resolveUserAgentDir(ctx), ctx.profileAuthority).map(dir =>
+	const userAgentDir = resolveUserAgentDir(ctx);
+	const userScans = getUserSkillScanDirs(ctx.home, userAgentDir, ctx.profileAuthority).map(dir =>
 		scanSkillsFromDir(ctx, {
 			dir,
+			authorityRoot: userAgentDir,
 			providerId: PROVIDER_ID,
 			level: "user",
 			requireDescription: true,
@@ -428,18 +407,18 @@ async function loadRules(ctx: LoadContext): Promise<LoadResult<Rule>> {
 	// User scope:    <agentDir>/RULES.md (a profile is a separate user scope;
 	//                the default profile's home-relative copy is not read)
 	// Project scope: nearest .gjc/RULES.md walking up from cwd to repoRoot
+	await loadRulesFromDirs([...projectConfigDirs, ...userConfigDirs]);
+
+	const userRulesFile = path.join(resolveUserAgentDir(ctx), "RULES.md");
+	const userRule = await loadStickyRulesFile(userRulesFile, "user");
+	if (userRule) items.push(userRule);
+
 	const nearestProjectConfigDir = await findNearestProjectConfigDir(ctx.cwd, ctx.repoRoot, ctx.home);
 	if (nearestProjectConfigDir) {
 		const projectRulesFile = path.join(nearestProjectConfigDir.dir, "RULES.md");
 		const projectRule = await loadStickyRulesFile(projectRulesFile, "project");
 		if (projectRule) items.push(projectRule);
 	}
-	await loadRulesFromDirs(projectConfigDirs);
-
-	const userRulesFile = path.join(resolveUserAgentDir(ctx), "RULES.md");
-	const userRule = await loadStickyRulesFile(userRulesFile, "user");
-	if (userRule) items.push(userRule);
-	await loadRulesFromDirs(userConfigDirs);
 
 	return { items, warnings };
 }
@@ -449,7 +428,7 @@ async function loadRules(ctx: LoadContext): Promise<LoadResult<Rule>> {
  * Returns null when the file is absent or empty so callers can short-circuit.
  */
 async function loadStickyRulesFile(filePath: string, level: "user" | "project"): Promise<Rule | null> {
-	const content = await readFile(filePath);
+	const content = await readContainedFile(path.dirname(filePath), filePath);
 	if (!content) return null;
 	const source = createSourceMeta(PROVIDER_ID, filePath, level);
 	const rule = buildRuleFromMarkdown("RULES.md", content, filePath, source, { ruleName: "RULES" });
@@ -948,7 +927,7 @@ async function loadContextFiles(ctx: LoadContext): Promise<LoadResult<ContextFil
 	const warnings: string[] = [];
 
 	const userPath = path.join(resolveUserAgentDir(ctx), "AGENTS.md");
-	const userContent = await readFile(userPath);
+	const userContent = await readContainedFile(resolveUserAgentDir(ctx), userPath);
 	if (userContent) {
 		items.push({
 			path: userPath,

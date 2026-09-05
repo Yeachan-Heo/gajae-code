@@ -251,9 +251,10 @@ export async function loadCapability<T>(capabilityId: string, options: LoadOptio
 	const home = getTrustedHomeDir();
 	const userAgentDir = options.agentDir ? path.resolve(options.agentDir) : getAgentDir();
 	const profileAuthority =
-		options.agentDir && normalizePathForComparison(userAgentDir) !== normalizePathForComparison(getAgentDir())
+		options.profileAuthority ??
+		(options.agentDir && normalizePathForComparison(userAgentDir) !== normalizePathForComparison(getAgentDir())
 			? "custom"
-			: getAgentProfileAuthority();
+			: getAgentProfileAuthority());
 	const repoRoot = await findRepoRoot(cwd);
 	const ctx: LoadContext = { cwd, home, userAgentDir, profileAuthority, repoRoot, settings: options.settings };
 	const providers = filterProviders(capability, options);

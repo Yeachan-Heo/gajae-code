@@ -192,7 +192,7 @@ Loaded via symbolic link.
 		}
 	});
 
-	it("should discover skills when skill directory is a symlink", async () => {
+	it("does not discover a skill symlinked outside its configured scan root", async () => {
 		const { session } = await createAgentSession({
 			cwd: tempDir,
 			agentDir: tempDir,
@@ -200,7 +200,7 @@ Loaded via symbolic link.
 			settings: createIsolatedSkillsSettings(),
 		});
 
-		expect(session.skills.some((s: Skill) => s.name === "symlinked-skill")).toBe(true);
+		expect(session.skills.some((s: Skill) => s.name === "symlinked-skill")).toBe(false);
 	});
 
 	it("should still discover project skills when user skills directory is missing", async () => {
@@ -246,6 +246,31 @@ description: Skill installed into an explicit agent-directory profile.
 			expect(session.skills.some(skill => skill.name === "profile-skill")).toBe(true);
 		} finally {
 			await session.dispose();
+		}
+	});
+
+	it("uses an injected Settings agent directory when options.agentDir is omitted", async () => {
+		const profileDir = path.join(tempDir, "settings-profile-agent");
+		const profileSkillDir = path.join(profileDir, "skills", "settings-profile-skill");
+		fs.mkdirSync(profileSkillDir, { recursive: true });
+		fs.writeFileSync(
+			path.join(profileSkillDir, "SKILL.md"),
+			"---\nname: settings-profile-skill\ndescription: Skill from injected Settings authority.\n---\n\n# Settings Profile\n",
+		);
+		const settings = await Settings.loadForScope({ cwd: tempDir, agentDir: profileDir });
+		settings.set("skills.enabled", true);
+		settings.set("skills.trustUserSkills", true);
+		const { session } = await createAgentSession({
+			cwd: tempDir,
+			sessionManager: SessionManager.inMemory(),
+			settings,
+		});
+
+		try {
+			expect(session.skills.some(skill => skill.name === "settings-profile-skill")).toBe(true);
+		} finally {
+			await session.dispose();
+			await settings.close();
 		}
 	});
 

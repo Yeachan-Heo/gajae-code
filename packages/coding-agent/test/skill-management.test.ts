@@ -121,6 +121,28 @@ describe("skill-management", () => {
 			});
 		});
 
+		it("does not target the excluded home root for project skill writes", async () => {
+			const home = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-skill-home-repo-"));
+			try {
+				const cwd = path.join(home, "workspace");
+				await fs.mkdir(path.join(home, ".git"));
+				await fs.mkdir(cwd);
+				const receipt = await writeNativeSkill({
+					cwd,
+					home,
+					scope: "project",
+					name: "my-skill",
+					content: validContent,
+				});
+				expect(receipt.path).toBe(path.join(cwd, ".gjc", "skills", "my-skill", "SKILL.md"));
+				await expect(
+					writeNativeSkill({ cwd: home, home, scope: "project", name: "my-skill", content: validContent }),
+				).rejects.toBeInstanceOf(SkillFrontmatterError);
+			} finally {
+				await fs.rm(home, { recursive: true, force: true });
+			}
+		});
+
 		it("writes user skills into the canonical agent skills root", async () => {
 			await withTempDirs(async (cwd, home) => {
 				const receipt = await writeNativeSkill({
@@ -187,6 +209,80 @@ describe("skill-management", () => {
 					writeNativeSkill({ cwd, home, scope: "user", name: "my-skill", content: validContent }),
 				).rejects.toBeInstanceOf(SkillFrontmatterError);
 				await expect(fs.stat(path.join(outsideDir, "SKILL.md"))).rejects.toMatchObject({ code: "ENOENT" });
+
+				await fs.rm(path.join(skillsDir, "my-skill"));
+				await fs.mkdir(path.join(skillsDir, "my-skill"));
+				const outsideFile = path.join(outsideDir, "outside.md");
+				await fs.writeFile(outsideFile, "unchanged");
+				await fs.symlink(outsideFile, path.join(skillsDir, "my-skill", "SKILL.md"), "file");
+				await expect(
+					writeNativeSkill({ cwd, home, scope: "user", name: "my-skill", content: validContent }),
+				).rejects.toBeInstanceOf(SkillFrontmatterError);
+				expect(await fs.readFile(outsideFile, "utf8")).toBe("unchanged");
+			});
+
+			await withTempDirs(async (cwd, home) => {
+				const agentDir = path.join(home, ".gjc", "agent");
+				const outsideSkills = path.join(home, "outside-skills");
+				await fs.mkdir(agentDir, { recursive: true });
+				await fs.mkdir(outsideSkills);
+				await fs.symlink(outsideSkills, path.join(agentDir, "skills"), "dir");
+				await expect(
+					writeNativeSkill({ cwd, home, scope: "user", name: "my-skill", content: validContent }),
+				).rejects.toBeInstanceOf(SkillFrontmatterError);
+				await expect(fs.stat(path.join(outsideSkills, "my-skill", "SKILL.md"))).rejects.toMatchObject({
+					code: "ENOENT",
+				});
+			});
+		});
+
+		it("rejects a selected agent directory that is itself a symlink", async () => {
+			await withTempDirs(async (cwd, home) => {
+				const outsideAgentDir = path.join(home, "outside-agent");
+				const selectedAgentDir = path.join(home, "selected-agent");
+				await fs.mkdir(outsideAgentDir);
+				await fs.symlink(outsideAgentDir, selectedAgentDir, "dir");
+
+				await expect(
+					writeNativeSkill({
+						cwd,
+						home,
+						agentDir: selectedAgentDir,
+						scope: "user",
+						name: "my-skill",
+						content: validContent,
+					}),
+				).rejects.toBeInstanceOf(SkillFrontmatterError);
+				await expect(fs.stat(path.join(outsideAgentDir, "skills", "my-skill", "SKILL.md"))).rejects.toMatchObject({
+					code: "ENOENT",
+				});
+			});
+		});
+
+		it.skipIf(process.platform === "win32")("rejects a FIFO skill file without blocking", async () => {
+			await withTempDirs(async (cwd, home) => {
+				const skillDir = path.join(home, ".gjc", "agent", "skills", "my-skill");
+				await fs.mkdir(skillDir, { recursive: true });
+				const fifoPath = path.join(skillDir, "SKILL.md");
+				const proc = Bun.spawn(["mkfifo", fifoPath]);
+				expect(await proc.exited).toBe(0);
+				await expect(
+					writeNativeSkill({ cwd, home, scope: "user", name: "my-skill", content: validContent }),
+				).rejects.toBeInstanceOf(SkillFrontmatterError);
+			});
+		});
+
+		it("rejects a hard-linked skill file without modifying its peer", async () => {
+			await withTempDirs(async (cwd, home) => {
+				const skillDir = path.join(home, ".gjc", "agent", "skills", "my-skill");
+				const outsideFile = path.join(home, "outside.md");
+				await fs.mkdir(skillDir, { recursive: true });
+				await fs.writeFile(outsideFile, "unchanged");
+				await fs.link(outsideFile, path.join(skillDir, "SKILL.md"));
+				await expect(
+					writeNativeSkill({ cwd, home, scope: "user", name: "my-skill", content: validContent }),
+				).rejects.toBeInstanceOf(SkillFrontmatterError);
+				expect(await fs.readFile(outsideFile, "utf8")).toBe("unchanged");
 			});
 		});
 

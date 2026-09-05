@@ -76,6 +76,18 @@ test("project .gjc/RULES.md becomes an alwaysApply rule", async () => {
 	expect(projectRule?.content).toContain("Always say hi.");
 });
 
+test("orders user RULES.md before project RULES.md so project authority wins", async () => {
+	writeFile(path.join(home, ".gjc", "agent", "RULES.md"), "User rule.\n");
+	writeFile(path.join(project, ".gjc", "RULES.md"), "Project rule.\n");
+
+	const stickyRules = (await loadNativeRules({ cwd: project, home, repoRoot: project })).filter(
+		rule => rule.name === "RULES",
+	);
+
+	expect(stickyRules.map(rule => rule._source.level)).toEqual(["user", "project"]);
+	expect(stickyRules.map(rule => rule.content.trim())).toEqual(["User rule.", "Project rule."]);
+});
+
 test("project RULES.md is found walking up from a sub-package cwd", async () => {
 	const subPkg = path.join(project, "packages", "app");
 	fs.mkdirSync(subPkg, { recursive: true });
@@ -97,6 +109,17 @@ test("alwaysApply is forced even when frontmatter says false", async () => {
 	const userRule = rules.find(r => r._source.level === "user" && r.name === "RULES");
 	expect(userRule?.alwaysApply).toBe(true);
 	expect(userRule?.content).toContain("Stick around anyway.");
+});
+
+test("user RULES.md does not follow a symlink outside the selected agent directory", async () => {
+	const outside = path.join(tempDir, "outside-RULES.md");
+	writeFile(outside, "Outside rule.\n");
+	fs.mkdirSync(path.join(home, ".gjc", "agent"), { recursive: true });
+	fs.symlinkSync(outside, path.join(home, ".gjc", "agent", "RULES.md"), "file");
+
+	const rules = await loadNativeRules({ cwd: project, home, repoRoot: project });
+
+	expect(rules.find(rule => rule._source.level === "user" && rule.name === "RULES")).toBeUndefined();
 });
 
 test("absent RULES.md does not produce a rule", async () => {
