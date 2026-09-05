@@ -1576,6 +1576,58 @@ describe("gjc state handoff", () => {
 		});
 	});
 
+	it("preserves forced D-to-R provenance across callee-write recovery", async () => {
+		await withTempCwd(async cwd => {
+			await writePublishedReadyCrystal(cwd);
+			expect((await runNativeDeepInterviewCommand(["approve-execution", "--json"], cwd)).status).toBe(0);
+			const handoffAt = "2026-09-04T00:00:00.000Z";
+			const mutationId = `deep-interview:handoff:ralplan:${handoffAt}`;
+			const priorFailpoint = process.env.GJC_STATE_HANDOFF_FAIL_AFTER_CALLEE;
+			const originalToISOString = Date.prototype.toISOString;
+			Date.prototype.toISOString = () => handoffAt;
+			process.env.GJC_STATE_HANDOFF_FAIL_AFTER_CALLEE = mutationId;
+			try {
+				expect(
+					(
+						await runNativeStateCommand(
+							["handoff", "--mode", "deep-interview", "--to", "ralplan", "--force", "--json"],
+							cwd,
+						)
+					).status,
+				).toBe(1);
+			} finally {
+				Date.prototype.toISOString = originalToISOString;
+				restoreEnvironmentValue("GJC_STATE_HANDOFF_FAIL_AFTER_CALLEE", priorFailpoint);
+			}
+			expect(
+				(await runNativeStateCommand(["handoff", "--mode", "deep-interview", "--to", "ralplan", "--json"], cwd))
+					.status,
+			).toBe(0);
+			const recoveredAudit = (await fs.readFile(auditPath(cwd, TEST_SESSION_ID), "utf8"))
+				.split(/\r?\n/)
+				.filter(Boolean)
+				.map(line => JSON.parse(line) as Record<string, unknown>)
+				.filter(
+					entry =>
+						entry.verb === "handoff" && entry.mutation_id === mutationId && typeof entry.caller_path === "string",
+				);
+			expect(recoveredAudit.map(entry => entry.forced)).toEqual([true]);
+			expect(
+				(
+					await runNativeStateCommand(
+						["write", "--mode", "ralplan", "--input", JSON.stringify({ current_phase: "handoff" }), "--json"],
+						cwd,
+					)
+				).status,
+			).toBe(0);
+			const blocked = await runNativeStateCommand(
+				["handoff", "--mode", "ralplan", "--to", "ultragoal", "--json"],
+				cwd,
+			);
+			expect(blocked.status, blocked.stderr).toBe(2);
+		});
+	});
+
 	it("rejects execution handoff when normalized deep-interview inner state is missing", async () => {
 		await withTempCwd(async cwd => {
 			const { callerPath } = await writePublishedReadyCrystal(cwd);

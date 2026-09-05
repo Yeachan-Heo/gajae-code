@@ -2635,6 +2635,7 @@ async function handleHandoffUnlocked(
 	}
 	const activePath = activeStateFile(cwd, sessionId);
 	let pendingCalleeRecovery: { journal: Record<string, unknown>; mutationId: string; handoffAt: string } | undefined;
+	let pendingRecoveryForced = forced;
 	if (!exactRecovery && existingCaller.active === true && calleeRead.kind === "valid") {
 		pendingCalleeRecovery = await findPendingHandoffRecovery({
 			cwd,
@@ -2658,6 +2659,9 @@ async function handleHandoffUnlocked(
 				nowIso: handoffAt,
 				mutationId,
 			});
+			const recoveredCalleeReceipt = persistedWorkflowReceipt(calleeRead.value.receipt, workflowCallee);
+			pendingRecoveryForced = recoveredCalleeReceipt?.forced === true;
+			callerReceipt.forced = pendingRecoveryForced;
 		}
 	}
 	if (exactRecovery) {
@@ -2768,7 +2772,7 @@ async function handleHandoffUnlocked(
 			sessionId,
 			skill: caller,
 			mutationId,
-			force: forced,
+			force: pendingRecoveryForced,
 			fromPhase: typeof existingCaller.current_phase === "string" ? existingCaller.current_phase : undefined,
 			toPhase: "handoff",
 			lockHeld: options.callerLockHeld,
@@ -2805,7 +2809,7 @@ async function handleHandoffUnlocked(
 			fromPhase: typeof existingCaller.current_phase === "string" ? existingCaller.current_phase : undefined,
 			callerState: callerWrite.stamped,
 			calleeState: recoveryCalleeState,
-			forced,
+			forced: pendingRecoveryForced,
 		});
 		await completeWorkflowTransactionJournal(cwd, sessionId, mutationId);
 		await touchStateActivityMarker(cwd, sessionId, callerPath);
