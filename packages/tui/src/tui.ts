@@ -5089,17 +5089,6 @@ export class TUI extends Container {
 			return;
 		}
 		const useViewportRepaintPath = this.#viewportRepaintHost();
-		// Only width-change frames consume this result; loader ticks otherwise
-		// measure the entire raw transcript and discard the reflow decision.
-		const widthReflowRequired =
-			widthChanged &&
-			this.#previousWidth > 0 &&
-			rawLines.some(line => {
-				TUI.#renderCounters.widthReflowScanRows += 1;
-				if (TERMINAL.isImageLine(line)) return false;
-				TUI.#renderCounters.widthReflowVisibleWidthCalls += 1;
-				return visibleWidth(line) > Math.min(this.#previousWidth, width);
-			});
 		if (
 			widthChanged &&
 			!this.#legacyMultiplexerFullRender &&
@@ -5183,6 +5172,16 @@ export class TUI extends Container {
 		// Width changes always need a full re-render because wrapping changes, unless
 		// a proven coalesced append is continuing through the durable append path.
 		if (widthChanged && !coalescedWidthAppend) {
+			// Measure only where the reflow decision is consumed. Viewport-only
+			// resize repaints return above; coalesced appends also skip this scan.
+			const widthReflowRequired =
+				this.#previousWidth > 0 &&
+				rawLines.some(line => {
+					TUI.#renderCounters.widthReflowScanRows += 1;
+					if (TERMINAL.isImageLine(line)) return false;
+					TUI.#renderCounters.widthReflowVisibleWidthCalls += 1;
+					return visibleWidth(line) > Math.min(this.#previousWidth, width);
+				});
 			if (!widthReflowRequired) {
 				this.#widthSettleRepairPending = false;
 				logRedraw(`terminal width changed without reflow (${this.#previousWidth} -> ${width})`);
