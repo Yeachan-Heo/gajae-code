@@ -2,28 +2,34 @@
  * Model entitlement facts shared by Codex credential selection and provider
  * error presentation.
  *
- * GPT-5.6 Sol is a Pro-tier ChatGPT Codex model. The usage endpoint is the
- * authority for the account tier; this module only names the model policy and
- * keeps the provider's deterministic rejection wording in one place.
+ * Live provider entitlement is authoritative for GPT-5.6 Sol access on Plus
+ * and unknown plans: those local usage labels only rank candidates. A
+ * confirmed Free-only pool remains locally unsupported. Spark retains its
+ * existing local filter that excludes non-Pro candidates whenever a confirmed
+ * Pro candidate exists. This module names those model policies and keeps the
+ * provider's deterministic rejection wording in one place.
  */
 
 const OPENAI_CODEX_PRO_ENTITLED_PLAN_TYPES = new Set(["pro", "business", "enterprise", "team"]);
-const OPENAI_CODEX_PRO_DENIED_PLAN_TYPES = new Set(["free", "plus"]);
+const OPENAI_CODEX_PRO_DENIED_PLAN_TYPES = new Set(["free"]);
+const OPENAI_CODEX_PRO_LIMITED_PLAN_TYPES = new Set(["plus"]);
 
-export type OpenAICodexProEntitlement = "entitled" | "denied" | "unknown";
+export type OpenAICodexProEntitlement = "entitled" | "limited" | "denied" | "unknown";
 
 /**
  * Classify a ChatGPT `plan_type` for strict Pro-tier Codex models.
  *
  * The usage endpoint remains authoritative: only exact, documented tier names
- * are classified. Known Free/Plus tiers can be rejected locally, while missing
- * or unfamiliar values stay unknown and reach the provider instead of being
- * guessed from a substring.
+ * are classified. Known Free tiers can be rejected locally. Plus remains a
+ * lower-priority provider-decided candidate, while missing or unfamiliar
+ * values stay unknown and reach the provider instead of being guessed from a
+ * substring.
  */
 export function classifyOpenAICodexProEntitlement(planType: string | undefined): OpenAICodexProEntitlement {
 	const normalized = planType?.trim().toLowerCase();
 	if (!normalized) return "unknown";
 	if (OPENAI_CODEX_PRO_ENTITLED_PLAN_TYPES.has(normalized)) return "entitled";
+	if (OPENAI_CODEX_PRO_LIMITED_PLAN_TYPES.has(normalized)) return "limited";
 	if (OPENAI_CODEX_PRO_DENIED_PLAN_TYPES.has(normalized)) return "denied";
 	return "unknown";
 }

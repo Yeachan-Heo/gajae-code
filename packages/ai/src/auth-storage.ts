@@ -583,7 +583,12 @@ export interface AuthCredentialStore {
 	 *
 	 * `signal` propagates the agent's cancel down to the broker fetch.
 	 */
-	getUsageReport?(provider: Provider, credential: OAuthCredential, signal?: AbortSignal): Promise<UsageReport | null>;
+	getUsageReport?(
+		provider: Provider,
+		credential: OAuthCredential,
+		signal?: AbortSignal,
+		options?: { forceFresh?: boolean },
+	): Promise<UsageReport | null>;
 	/**
 	 * Optional store hook to invalidate a specific credential after the upstream
 	 * provider returned 401 on a supposedly-fresh key. Remote stores force the
@@ -1074,6 +1079,7 @@ export interface AuthCredentialSelector {
 }
 
 type OAuthResolutionResult = { apiKey: string; credential: OAuthCredential };
+const OAUTH_CREDENTIAL_ENTITLEMENT_DENIED = Symbol("oauth-credential-entitlement-denied");
 
 /**
  * Refreshed OAuth access plus identity metadata returned by
@@ -1156,7 +1162,8 @@ function getUsagePlanType(report: UsageReport | null): string | undefined {
 function getOpenAICodexPlanPriority(report: UsageReport | null): number {
 	const entitlement = classifyOpenAICodexProEntitlement(getUsagePlanType(report));
 	if (entitlement === "entitled") return 0;
-	if (entitlement === "denied") return 2;
+	if (entitlement === "limited") return 2;
+	if (entitlement === "denied") return 3;
 	return 1;
 }
 
@@ -1251,6 +1258,7 @@ function storedCredentialArraysEqual(left: StoredCredential[], right: StoredCred
 		const rightEntry = right[index];
 		if (!leftEntry || !rightEntry) return false;
 		if (leftEntry.id !== rightEntry.id) return false;
+		if (leftEntry.revision !== rightEntry.revision) return false;
 		if (!authCredentialEquals(leftEntry.credential, rightEntry.credential)) return false;
 	}
 	return true;
@@ -1352,6 +1360,7 @@ export class AuthStorage {
 	#rankingStrategyResolver?: (provider: Provider) => CredentialRankingStrategy | undefined;
 	#usageCache: UsageCache;
 	#usageRequestInFlight: Map<string, Promise<UsageReport | null>> = new Map();
+	#usageInvalidationGenerations: Map<string, number> = new Map();
 	#usageReportsInFlight: Map<string, Promise<UsageReport[] | null>> = new Map();
 	#usageFetch: typeof fetch;
 	#usageRequestTimeoutMs: number;
@@ -2690,8 +2699,9 @@ export class AuthStorage {
 			throw new Error("Credential authority changed during refresh");
 		}
 		if (persist && !this.#store.refreshSnapshot) this.#store.updateAuthCredential(target.id, credential);
+		const persisted = this.#store.listAuthCredentials(provider).find(entry => entry.id === target.id);
 		const updated = [...entries];
-		updated[index] = { id: target.id, credential };
+		updated[index] = persisted ?? { id: target.id, credential, revision: target.revision };
 		this.#setStoredCredentials(provider, updated);
 		if (
 			credential.type === "oauth" &&
@@ -3882,9 +3892,13 @@ export class AuthStorage {
 
 		const inFlight = this.#usageRequestInFlight.get(cacheKey);
 		if (inFlight) return inFlight;
+		const invalidationGeneration = this.#usageInvalidationGenerations.get(cacheKey) ?? 0;
 
 		const promise = (async () => {
 			const report = await this.#fetchUsageUncached(request, timeoutMs, logDetails);
+			if ((this.#usageInvalidationGenerations.get(cacheKey) ?? 0) !== invalidationGeneration) {
+				return report;
+			}
 			const ttlJitter = USAGE_REPORT_TTL_MS * (Math.random() * 0.5 - 0.25);
 			if (report !== null) {
 				// Success: stagger per-credential cache expiry so all accounts don't
@@ -4111,7 +4125,7 @@ export class AuthStorage {
 	async #getUsageReport(
 		provider: Provider,
 		credential: OAuthCredential,
-		options?: { baseUrl?: string; timeoutMs?: number; signal?: AbortSignal },
+		options?: { baseUrl?: string; timeoutMs?: number; signal?: AbortSignal; forceFresh?: boolean },
 	): Promise<UsageReport | null> {
 		// Store-level hook (e.g. `RemoteAuthCredentialStore`) is authoritative
 		// when present: the broker already aggregates usage from a less-throttled
@@ -4119,15 +4133,24 @@ export class AuthStorage {
 		// whole point of routing through it.
 		const storeHook = this.#store.getUsageReport?.bind(this.#store);
 		if (storeHook) {
-			return storeHook(provider, credential, options?.signal);
+			return storeHook(provider, credential, options?.signal, { forceFresh: options?.forceFresh });
 		}
 		return raceUsageWithSignal(
-			this.#fetchUsageCached(
+			(options?.forceFresh ? this.#fetchUsageUncached : this.#fetchUsageCached).call(
+				this,
 				this.#buildUsageRequestForOauth(provider, credential, options?.baseUrl),
 				options?.timeoutMs ?? this.#usageRequestTimeoutMs,
 			),
 			options?.signal,
 		);
+	}
+
+	#invalidateUsageReport(provider: Provider, credential: OAuthCredential, baseUrl?: string): void {
+		const request = this.#buildUsageRequestForOauth(provider, credential, baseUrl);
+		const cacheKey = this.#buildUsageReportCacheKey(request);
+		this.#usageInvalidationGenerations.set(cacheKey, (this.#usageInvalidationGenerations.get(cacheKey) ?? 0) + 1);
+		this.#usageRequestInFlight.delete(cacheKey);
+		this.#usageCache.deletePrefix?.(cacheKey);
 	}
 
 	async fetchUsageReports(options?: {
@@ -4961,24 +4984,29 @@ export class AuthStorage {
 			}),
 		);
 
-		// Skip the Pro-plan filter when no candidate is confirmed Pro, so users with only
-		// non-Pro accounts can still attempt Spark requests (e.g. trial/grandfathered access).
-		const enforceProRequirement =
-			requiresProModel && candidates.some(candidate => hasOpenAICodexProPlan(candidate.usage));
-		// Spark retains its historical Plus fallback for grandfathered accounts.
-		// Sol is different: confirmed Free/Plus plans cannot call it, so reject the
-		// model before returning an OAuth bearer and letting the turn fail remotely.
-		// Unknown plan names still reach the provider because the usage endpoint is
-		// authoritative and future tiers must not be denied by a client-side guess.
+		// Spark keeps its historical Pro filter when a confirmed Pro candidate exists,
+		// but still falls back when no candidate is confirmed Pro. GPT-5.6 Sol treats
+		// Plus and unknown plan labels as ranking hints, so an unusable preferred Pro
+		// row can fall through to provider-authorized access. A confirmed Free-only
+		// pool remains locally unsupported; provider failures retain actionable guidance.
 		const strictProRequirement = requiresStrictOpenAICodexProModel(provider, options?.modelId);
-		if (
-			strictProRequirement &&
-			candidates.length > 0 &&
-			candidates.every(candidate => hasKnownOpenAICodexNonProPlan(candidate.usage))
-		) {
-			throw new Error(formatOpenAICodexChatGPTEntitlementError(options?.modelId));
+		if (strictProRequirement) {
+			await Promise.all(
+				candidates.map(async candidate => {
+					if (candidate.usageChecked) return;
+					candidate.usage = await this.#getUsageReport(provider, candidate.selection.credential, {
+						baseUrl: options?.baseUrl,
+						signal: options?.signal,
+						timeoutMs: this.#usageRequestTimeoutMs,
+					});
+					candidate.usageChecked = true;
+				}),
+			);
 		}
-
+		const enforceProRequirement =
+			requiresProModel &&
+			!strictProRequirement &&
+			candidates.some(candidate => hasOpenAICodexProPlan(candidate.usage));
 		const fallback = candidates[0];
 
 		for (const candidate of candidates) {
@@ -4993,15 +5021,18 @@ export class AuthStorage {
 					allowBlocked: false,
 					prefetchedUsage: candidate.usage,
 					usagePrechecked: candidate.usageChecked,
+					prefetchedUsageAccountId: candidate.selection.credential.accountId,
 					enforceProRequirement,
+					rejectKnownDeniedPlan: strictProRequirement,
 				},
 				reloadsUsed,
 			);
+			if (resolved === OAUTH_CREDENTIAL_ENTITLEMENT_DENIED) continue;
 			if (resolved) return resolved;
 		}
 
 		if (fallback && this.#isCredentialBlocked(providerKey, fallback.selection.index)) {
-			return this.#tryOAuthCredential(
+			const resolved = await this.#tryOAuthCredential(
 				provider,
 				fallback.selection,
 				providerKey,
@@ -5012,12 +5043,33 @@ export class AuthStorage {
 					allowBlocked: true,
 					prefetchedUsage: fallback.usage,
 					usagePrechecked: fallback.usageChecked,
+					prefetchedUsageAccountId: fallback.selection.credential.accountId,
 					enforceProRequirement,
+					rejectKnownDeniedPlan: strictProRequirement,
 				},
 				reloadsUsed,
 			);
+			if (resolved !== OAUTH_CREDENTIAL_ENTITLEMENT_DENIED) {
+				if (resolved) return resolved;
+			}
 		}
-
+		if (strictProRequirement && candidates.length > 0) {
+			const finalEntitlements = await Promise.all(
+				candidates.map(async candidate => {
+					if (!this.#reconcileOAuthCredentialSelection(provider, candidate.selection)) return null;
+					const usage = await this.#getUsageReport(provider, candidate.selection.credential, {
+						baseUrl: options?.baseUrl,
+						forceFresh: true,
+						signal: options?.signal,
+						timeoutMs: this.#usageRequestTimeoutMs,
+					});
+					return hasKnownOpenAICodexNonProPlan(usage);
+				}),
+			);
+			if (finalEntitlements.length > 0 && finalEntitlements.every(entitlement => entitlement === true)) {
+				throw new Error(formatOpenAICodexChatGPTEntitlementError(options?.modelId));
+			}
+		}
 		return undefined;
 	}
 
@@ -5298,17 +5350,22 @@ export class AuthStorage {
 			allowBlocked: boolean;
 			prefetchedUsage?: UsageReport | null;
 			usagePrechecked?: boolean;
+			prefetchedUsageAccountId?: string;
 			enforceProRequirement?: boolean;
+			rejectKnownDeniedPlan?: boolean;
 		},
 		reloadsUsed = 0,
-	): Promise<OAuthResolutionResult | undefined> {
+	): Promise<OAuthResolutionResult | typeof OAUTH_CREDENTIAL_ENTITLEMENT_DENIED | undefined> {
 		const {
 			checkUsage,
 			allowBlocked,
 			prefetchedUsage = null,
 			usagePrechecked = false,
+			prefetchedUsageAccountId,
 			enforceProRequirement,
+			rejectKnownDeniedPlan = false,
 		} = usageOptions;
+		const prefetchedUsageRevision = usagePrechecked ? selection.revision : undefined;
 		if (!this.#reconcileOAuthCredentialSelection(provider, selection)) return undefined;
 		if (!allowBlocked && this.#isCredentialBlocked(providerKey, selection.index)) {
 			return undefined;
@@ -5322,20 +5379,33 @@ export class AuthStorage {
 		const applyProFilter = enforceProRequirement ?? requiresProModel;
 		let usage: UsageReport | null = null;
 		let usageChecked = false;
+		let usageCredentialRevision: number | undefined;
+		let usageAccountId: string | undefined;
 
 		if ((checkUsage && !allowBlocked) || requiresProModel) {
-			if (usagePrechecked) {
+			if (
+				!rejectKnownDeniedPlan &&
+				usagePrechecked &&
+				selection.revision === prefetchedUsageRevision &&
+				selection.credential.accountId === prefetchedUsageAccountId
+			) {
 				usage = prefetchedUsage;
 				usageChecked = true;
 			} else {
 				usage = await this.#getUsageReport(provider, selection.credential, {
 					...options,
+					forceFresh: rejectKnownDeniedPlan,
 					timeoutMs: this.#usageRequestTimeoutMs,
 				});
 				usageChecked = true;
 			}
+			usageCredentialRevision = selection.revision;
+			usageAccountId = selection.credential.accountId;
 			if (applyProFilter && !hasOpenAICodexProPlan(usage)) {
 				return undefined;
+			}
+			if (rejectKnownDeniedPlan && hasKnownOpenAICodexNonProPlan(usage)) {
+				return OAUTH_CREDENTIAL_ENTITLEMENT_DENIED;
 			}
 			if (checkUsage && !allowBlocked && usage && this.#isUsageLimitReached(usage)) {
 				const resetAtMs = this.#getUsageResetAtMs(usage, Date.now());
@@ -5350,6 +5420,24 @@ export class AuthStorage {
 
 		try {
 			if (!this.#reconcileOAuthCredentialSelection(provider, selection)) return undefined;
+			if (
+				requiresProModel &&
+				(selection.revision !== usageCredentialRevision || selection.credential.accountId !== usageAccountId)
+			) {
+				this.#invalidateUsageReport(provider, selection.credential, options?.baseUrl);
+				usage = await this.#getUsageReport(provider, selection.credential, {
+					...options,
+					forceFresh: rejectKnownDeniedPlan,
+					timeoutMs: this.#usageRequestTimeoutMs,
+				});
+				usageChecked = true;
+				usageCredentialRevision = selection.revision;
+				usageAccountId = selection.credential.accountId;
+				if (applyProFilter && !hasOpenAICodexProPlan(usage)) return undefined;
+				if (rejectKnownDeniedPlan && hasKnownOpenAICodexNonProPlan(usage)) {
+					return OAUTH_CREDENTIAL_ENTITLEMENT_DENIED;
+				}
+			}
 			const selectionCredentialId = selection.id;
 			let result: { newCredentials: OAuthCredentials; apiKey: string } | null;
 			// The refresh result carries the effective (possibly guard-adopted)
@@ -5408,16 +5496,21 @@ export class AuthStorage {
 			);
 
 			if ((checkUsage && !allowBlocked) || requiresProModel) {
-				const sameAccount = selection.credential.accountId === updated.accountId;
-				if (!usageChecked || !sameAccount) {
+				const sameAccount = usageAccountId === updated.accountId;
+				if (rejectKnownDeniedPlan || !usageChecked || !sameAccount) {
 					usage = await this.#getUsageReport(provider, updated, {
 						...options,
+						forceFresh: rejectKnownDeniedPlan,
 						timeoutMs: this.#usageRequestTimeoutMs,
 					});
 					usageChecked = true;
+					usageAccountId = updated.accountId;
 				}
 				if (applyProFilter && !hasOpenAICodexProPlan(usage)) {
 					return undefined;
+				}
+				if (rejectKnownDeniedPlan && hasKnownOpenAICodexNonProPlan(usage)) {
+					return OAUTH_CREDENTIAL_ENTITLEMENT_DENIED;
 				}
 				if (checkUsage && !allowBlocked && usage && this.#isUsageLimitReached(usage)) {
 					const resetAtMs = this.#getUsageResetAtMs(usage, Date.now());
