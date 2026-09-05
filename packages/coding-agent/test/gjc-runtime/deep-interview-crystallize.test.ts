@@ -412,6 +412,21 @@ describe("deep-interview crystallize contract", () => {
 		}
 	});
 
+	it("rejects a negated numeric non-answer as a gap resolution", () => {
+		const gap = "What is the maximum memory budget?";
+		const first = crystallizeDeepInterview(input({ open_gaps: [gap] }));
+		const answer = "The maximum memory budget is not 1GB.";
+		const next = withFreshUserEvidence(input({ prior: first }), answer);
+		expect(() =>
+			crystallizeDeepInterview({
+				...next,
+				prior: first,
+				resolved_open_gaps: [gap],
+				resolved_open_gap_anchors: [{ item: gap, message_index: 1, quote: answer, resolution: answer }],
+			}),
+		).toThrow("has no fresh verbatim user anchor");
+	});
+
 	it("rejects unresolved answers in English, Korean, Japanese, and Chinese", () => {
 		const cases = [
 			{ gap: "What is the memory budget?", answer: "The memory budget is still undecided." },
@@ -740,6 +755,69 @@ describe("deep-interview crystallize contract", () => {
 		expect(second.delta.approval_invalidated).toBe(false);
 	});
 
+	it("records a new ambiguity after prior confirmed anchors leave the bounded window", () => {
+		const first = crystallizeDeepInterview(input());
+		const snapshot: CrystalSnapshot = {
+			revision: 2,
+			start: 1,
+			end: 1,
+			messages: [{ index: 1, role: "user", content: "We still need to decide the export format." }],
+			digest: "",
+		};
+		snapshot.digest = crystalSnapshotDigest(snapshot);
+		const next = crystallizeDeepInterview({
+			...input(),
+			prior: first,
+			items: [],
+			snapshot,
+			current_revision: 2,
+			open_gaps: ["Which export format should be used?"],
+		});
+		expect(next.lifecycle).toBe("needs-questions");
+		expect(next.items).toEqual(first.items);
+	});
+
+	it("rejects accumulated ambiguity above the bounded shortcut ceiling", () => {
+		const first = crystallizeDeepInterview(input({ open_gaps: ["Which database?", "Which region?"] }));
+		const snapshot = withFreshUserEvidence(input({ prior: first, items: [] }), "Another question remains.");
+		expect(() =>
+			crystallizeDeepInterview({
+				...snapshot,
+				prior: first,
+				items: [],
+				open_gaps: ["Which cache policy?"],
+			}),
+		).toThrow("broad ambiguity requires the full deep-interview flow");
+	});
+
+	it("rejects confirmed statements that reverse user ordering", () => {
+		expect(() =>
+			crystallizeDeepInterview(
+				singleGoalEvidence("Do not publish the report before review.", "Do not review the report before publish"),
+			),
+		).toThrow("conservative derivation failed");
+	});
+
+	it("invalidates approval when a later version adds confirmed scope", () => {
+		const first = crystallizeDeepInterview(input());
+		const next = withFreshUserEvidence(input({ prior: first }), "Encrypt the report at rest.");
+		const second = crystallizeDeepInterview({
+			...next,
+			prior: first,
+			items: [
+				first.items[0]!,
+				{
+					id: "constraint:encryption",
+					kind: "constraint",
+					classification: "confirmed",
+					statement: "Encrypt the report at rest",
+					anchor: { message_index: 1, quote: "Encrypt the report at rest." },
+				},
+			],
+		});
+		expect(second.delta.approval_invalidated).toBe(true);
+	});
+
 	it("requires explicit removals and invalidates their prior approval", () => {
 		const first = crystallizeDeepInterview(input());
 		const next = withFreshUserEvidence(
@@ -757,6 +835,14 @@ describe("deep-interview crystallize contract", () => {
 		const second = crystallizeDeepInterview(next);
 		expect(second.items.map(item => item.id)).not.toContain("constraint:latency");
 		expect(second.delta.approval_invalidated).toBe(true);
+		expect(second.removed_item_anchors).toEqual(next.removed_item_anchors);
+		const carried = crystallizeDeepInterview(
+			withFreshUserEvidence(
+				input({ prior: second, items: [first.items[0]!], snapshot: second.source, current_revision: 2 }),
+				"No further changes.",
+			),
+		);
+		expect(carried.removed_item_anchors).toEqual(second.removed_item_anchors);
 	});
 
 	it("persists an unauthenticated removal intent instead of becoming ready later", () => {
