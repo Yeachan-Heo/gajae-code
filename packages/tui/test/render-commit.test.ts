@@ -129,6 +129,28 @@ function expectPreparationReferencePaths(count: number, retained: boolean): void
 
 describe("generation-scoped render commits", () => {
 	it("severs retired cancellation paths to callbacks, payloads and owners without relying on collection", async () => {
+		if (Bun.env.GJC_TUI_LIFETIME_PROBE !== "1") {
+			// Inspecting the full suite's accumulated heap causes memory pressure
+			// that stalls later render tests. Run the same graph assertions in a
+			// fresh VM and release all snapshot/profiler state when it exits.
+			const child = Bun.spawn(
+				[process.execPath, "test", import.meta.path, "--test-name-pattern", "severs retired cancellation paths"],
+				{
+					env: { ...process.env, GJC_TUI_LIFETIME_PROBE: "1" },
+					stdout: "pipe",
+					stderr: "pipe",
+					timeout: 5_000,
+				},
+			);
+			const [exitCode, stdout, stderr] = await Promise.all([
+				child.exited,
+				new Response(child.stdout).text(),
+				new Response(child.stderr).text(),
+			]);
+			expect(exitCode, `${stdout}\n${stderr}`).toBe(0);
+			expect(stderr).toContain("1 pass");
+			return;
+		}
 		const fixtures: PreparationLifetimeFixture[] = [];
 		try {
 			for (const mode of ["cancel", "complete", "throw", "stop", "owner", "dispose"] as const) {
