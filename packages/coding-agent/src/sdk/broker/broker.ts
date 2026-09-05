@@ -2857,6 +2857,8 @@ export class Broker {
 		return this.#readEndpoint(record, authority);
 	}
 	async #readLifecycleReplayEndpoint(sessionId: string): Promise<LifecycleReplayEndpoint | BrokerResponse> {
+		if (!isCanonicalSessionId(sessionId))
+			return error("invalid_input", "replayed sessionId must be a canonical safe identifier");
 		await this.index.refresh();
 		const record = this.index.listSessions().sessions.find(session => session.sessionId === sessionId);
 		if (!record) return error("resource_gone", "session endpoint record is gone");
