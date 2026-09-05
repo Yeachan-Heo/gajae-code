@@ -1541,7 +1541,7 @@ describe("Cursor request lifecycle", () => {
 		}
 	});
 
-	it("drops an END_STREAM error tail after a validated turnEnded", async () => {
+	it("keeps an END_STREAM error authoritative after a validated turnEnded", async () => {
 		const { promise: releasePromise, resolve: releaseHandler } = Promise.withResolvers<void>();
 		const { promise: handlerStarted, resolve: markHandlerStarted } = Promise.withResolvers<void>();
 		const { promise: handlerFinished, resolve: markHandlerFinished } = Promise.withResolvers<void>();
@@ -1595,7 +1595,8 @@ describe("Cursor request lifecycle", () => {
 			const terminalEvents = events.filter(event => event.type === "done" || event.type === "error");
 			expect(terminalEvents).toHaveLength(1);
 			const terminal = terminalEvents[0];
-			if (terminal.type !== "done") throw new Error("Expected successful Cursor terminal");
+			if (terminal.type !== "error") throw new Error("Expected failed Cursor terminal");
+			expect(terminal.error.errorMessage).toContain("terminal race");
 			await handlerFinished;
 		} finally {
 			releaseHandler();

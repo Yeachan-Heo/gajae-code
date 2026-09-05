@@ -123,6 +123,7 @@ async function assertExplicitHomeRoots(
 	cwd: string,
 	explicitAgentDir: boolean,
 	providerIds: ReadonlySet<string>,
+	isolatedHome: boolean,
 ): Promise<void> {
 	const userRoots = new Map<string, string>();
 	const projectRoots = new Map<string, { label: string; walksAncestors: boolean }>();
@@ -185,6 +186,7 @@ async function assertExplicitHomeRoots(
 	// symlinked config file; ancestor-scoped providers retain the full walk.
 	await Promise.all(
 		[...projectRoots.entries()].map(async ([relativeRoot, { label, walksAncestors }]) => {
+			if (!isolatedHome) return;
 			let current = cwd;
 			while (true) {
 				await canonicalizeContainedPath(canonicalHome, path.join(current, relativeRoot), label);
@@ -461,6 +463,8 @@ export async function loadCapabilityForHome<T>(
 	// read another profile's SYSTEM/RULES/AGENTS, skills, commands, hooks,
 	// settings, or executable descriptors.
 	const canonicalHome = await canonicalizeThroughExistingAncestor(resolvedHome);
+	const trustedHome = await canonicalizeThroughExistingAncestor(getTrustedHomeDir());
+	const isolatedHome = canonicalHome !== trustedHome;
 	const lexicalCwd = options.cwd === undefined ? canonicalHome : path.resolve(options.cwd);
 	const cwd = await canonicalizeThroughExistingAncestor(lexicalCwd);
 	const homeStats = await fs.stat(canonicalHome);
@@ -468,13 +472,13 @@ export async function loadCapabilityForHome<T>(
 	// Every explicit-home cwd must resolve inside the supplied physical home.
 	// Allowing an outside cwd would let repository and plugin-registry discovery
 	// walk unrelated ancestors before the isolated boundary can take effect.
-	if (!isWithinOrEqual(canonicalHome, cwd)) {
+	if (isolatedHome && !isWithinOrEqual(canonicalHome, cwd)) {
 		throw new Error(
 			`loadCapabilityForHome cwd is outside the supplied home: "${lexicalCwd}" resolves to "${cwd}" outside "${canonicalHome}".`,
 		);
 	}
 
-	const isolatedOptions: LoadOptions = { ...options, isolatedHome: true };
+	const isolatedOptions: LoadOptions = { ...options, isolatedHome };
 	const providers = filterProviders(capability, isolatedOptions);
 	const effectiveProviderIds = new Set(providers.map(provider => provider.id));
 	const usesAgentScope = effectiveProviderIds.has("native") || effectiveProviderIds.has("ssh-json");
@@ -489,16 +493,18 @@ export async function loadCapabilityForHome<T>(
 			: path.join(canonicalHome, getConfigDirName(), "agent");
 	const userAgentStats = await fs.stat(userAgentDir).catch(() => null);
 	const userAgentIdentity = userAgentStats ? { dev: userAgentStats.dev, ino: userAgentStats.ino } : null;
-	await assertExplicitHomeRoots(canonicalHome, cwd, Boolean(options.agentDir), effectiveProviderIds);
+	await assertExplicitHomeRoots(canonicalHome, cwd, Boolean(options.agentDir), effectiveProviderIds, isolatedHome);
 	const repoRootCandidate = await findRepoRoot(cwd, canonicalHome, {
-		isolatedHome: true,
+		isolatedHome,
 		homeIdentity,
 		home: canonicalHome,
 		bypassCache: true,
 	});
 	const canonicalRepoRoot = repoRootCandidate ? await canonicalizeThroughExistingAncestor(repoRootCandidate) : null;
 	const repoRoot =
-		canonicalRepoRoot && canonicalRepoRoot !== canonicalHome && isWithinOrEqual(canonicalHome, canonicalRepoRoot)
+		canonicalRepoRoot &&
+		canonicalRepoRoot !== canonicalHome &&
+		(!isolatedHome || isWithinOrEqual(canonicalHome, canonicalRepoRoot))
 			? canonicalRepoRoot
 			: null;
 	const ctx: LoadContext = {
@@ -507,7 +513,7 @@ export async function loadCapabilityForHome<T>(
 		userAgentDir,
 		userAgentIdentity,
 		repoRoot,
-		isolatedHome: true,
+		isolatedHome,
 		homeIdentity,
 		settings: isolatedOptions.settings,
 	};

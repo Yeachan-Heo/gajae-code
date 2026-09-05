@@ -356,20 +356,70 @@ describe("PR #4834: loadCapabilityForHome never falls back to the process profil
 	});
 
 	test("current-profile explicit-home loads authorize the exact XDG plugin root", async () => {
-		const originalXdgDataHome = process.env.XDG_DATA_HOME;
-		try {
-			process.env.XDG_DATA_HOME = path.join(tempDir, "xdg-data");
-			await fs.mkdir(path.join(process.env.XDG_DATA_HOME, "gjc", "plugins"), { recursive: true });
-
-			const result = await loadCapabilityForHome<Skill>(skillCapability.id, getTrustedHomeDir(), {
-				cwd: process.cwd(),
-				providers: ["claude-plugins"],
+		const processHome = path.join(tempDir, "process-home");
+		const xdgDataHome = path.join(tempDir, "external-xdg-data");
+		const registryRoot = path.join(xdgDataHome, "gjc", "plugins");
+		const pluginRoot = path.join(registryRoot, "installed", "xdg-plugin");
+		await makeSkill(path.join(pluginRoot, "skills"), "xdg-skill");
+		await writeFile(
+			path.join(registryRoot, "installed_plugins.json"),
+			JSON.stringify({
+				version: 2,
+				plugins: {
+					"xdg-plugin@test": [
+						{
+							scope: "user",
+							installPath: pluginRoot,
+							version: "1.0.0",
+							installedAt: "2026-01-01T00:00:00Z",
+							lastUpdated: "2026-01-01T00:00:00Z",
+						},
+					],
+				},
+			}),
+		);
+		await fs.mkdir(processHome, { recursive: true });
+		const script = `
+			import { loadCapabilityForHome } from "@gajae-code/coding-agent/capability";
+			import "@gajae-code/coding-agent/discovery";
+			import { getTrustedHomeDir } from "@gajae-code/utils";
+			const result = await loadCapabilityForHome("skills", getTrustedHomeDir(), {
+				cwd: process.cwd(), providers: ["claude-plugins"]
 			});
-			expect(result.warnings).toEqual([]);
-		} finally {
-			if (originalXdgDataHome === undefined) delete process.env.XDG_DATA_HOME;
-			else process.env.XDG_DATA_HOME = originalXdgDataHome;
-		}
+			process.stdout.write(JSON.stringify({ names: result.items.map(item => item.name), warnings: result.warnings }));
+		`;
+		const childEnv: Record<string, string | undefined> = {
+			...process.env,
+			HOME: processHome,
+			XDG_DATA_HOME: xdgDataHome,
+		};
+		delete childEnv.GJC_CODING_AGENT_DIR;
+		delete childEnv.PI_CODING_AGENT_DIR;
+		const child = Bun.spawn([process.execPath, "-e", script], {
+			cwd: process.cwd(),
+			env: childEnv,
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const [stdout, stderr, exitCode] = await Promise.all([
+			new Response(child.stdout).text(),
+			new Response(child.stderr).text(),
+			child.exited,
+		]);
+		expect(exitCode, stderr).toBe(0);
+		expect(JSON.parse(stdout)).toEqual({ names: ["xdg-plugin:xdg-skill"], warnings: [] });
+	});
+
+	test("current-profile explicit-home loads allow project cwd outside HOME", async () => {
+		const outsideProject = path.join(tempDir, "outside-current-profile-project");
+		await fs.mkdir(path.join(outsideProject, ".git"), { recursive: true });
+		await writeFile(path.join(outsideProject, ".gjc", "SYSTEM.md"), "# outside current profile");
+
+		const result = await loadCapabilityForHome<SystemPrompt>(systemPromptCapability.id, getTrustedHomeDir(), {
+			cwd: outsideProject,
+			providers: ["native"],
+		});
+		expect(result.items.map(item => item.content)).toContain("# outside current profile");
 	});
 
 	test("ordinary Linux directory discovery does not depend on procfs", async () => {

@@ -1773,6 +1773,11 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 						pendingBuffer.consume(5 + msgLen);
 						if (flags & CONNECT_END_STREAM_FLAG) {
 							responseEnded = true;
+							const endError = parseConnectEndStream(messageBytes);
+							if (endError) {
+								endStreamError = endError;
+								terminalize(endError, "drainable");
+							}
 							pendingBuffer.clear();
 							continue;
 						}
