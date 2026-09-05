@@ -1946,6 +1946,7 @@ function sameRetirementIdentityAsRecord(identity: LifecycleRetirementIdentity, r
 		path.resolve(identity.stateRoot) === path.resolve(record.locator.stateRoot) &&
 		identity.endpointGeneration === record.endpointGeneration &&
 		identity.endpointMtimeMs === record.endpointMtimeMs &&
+		identity.endpointFileId === record.endpointFileId &&
 		identity.pid === record.pid &&
 		identity.processIncarnation === record.processIncarnation &&
 		identity.hostIncarnation === record.hostIncarnation &&
@@ -2102,6 +2103,7 @@ function retirementIdentityFromInput(
 	const processIdentity = text(input.processIncarnation);
 	const hostIdentity = text(input.hostIncarnation);
 	const remoteCreateKey = text(input.remoteCreateKey);
+	const endpointFileId = text(input.endpointFileId);
 	const endpointGeneration = input.endpointGeneration;
 	const endpointMtimeMs = input.endpointMtimeMs;
 	if (
@@ -2111,6 +2113,7 @@ function retirementIdentityFromInput(
 		!processIdentity ||
 		!hostIdentity ||
 		!remoteCreateKey ||
+		(input.endpointFileId !== undefined && endpointFileId === undefined) ||
 		typeof endpointGeneration !== "number" ||
 		!Number.isSafeInteger(endpointGeneration) ||
 		endpointGeneration <= 0 ||
@@ -2128,6 +2131,7 @@ function retirementIdentityFromInput(
 		stateRoot,
 		endpointGeneration,
 		endpointMtimeMs,
+		...(endpointFileId === undefined ? {} : { endpointFileId }),
 		pid: record.pid,
 		processIncarnation: processIdentity,
 		hostIncarnation: hostIdentity,
@@ -2141,6 +2145,7 @@ function retirementIdentityFromInput(
 		path.resolve(record.locator.stateRoot) !== path.resolve(stateRoot) ||
 		record.endpointGeneration !== endpointGeneration ||
 		record.endpointMtimeMs !== endpointMtimeMs ||
+		record.endpointFileId !== endpointFileId ||
 		record.lifecycleRequestId !== lifecycleRequestId ||
 		(record.processIncarnation ?? record.hostIncarnation) !== processIdentity ||
 		(record.hostIncarnation ?? record.processIncarnation) !== hostIdentity
@@ -2163,6 +2168,7 @@ function retirementProof(identity: LifecycleRetirementIdentity, indexSeq?: numbe
 			stateRoot: identity.stateRoot,
 			endpointGeneration: identity.endpointGeneration,
 			endpointMtimeMs: identity.endpointMtimeMs,
+			...(identity.endpointFileId === undefined ? {} : { endpointFileId: identity.endpointFileId }),
 			processIncarnation: identity.processIncarnation,
 			hostIncarnation: identity.hostIncarnation,
 			lifecycleRequestId: identity.lifecycleRequestId,
@@ -2384,6 +2390,7 @@ async function executeUncertainRetirement(
 					...(record.processIncarnation === undefined ? {} : { processIncarnation: record.processIncarnation }),
 					...(record.hostIncarnation === undefined ? {} : { hostIncarnation: record.hostIncarnation }),
 					...(record.endpointMtimeMs === undefined ? {} : { endpointMtimeMs: record.endpointMtimeMs }),
+					...(record.endpointFileId === undefined ? {} : { endpointFileId: record.endpointFileId }),
 					...(record.lifecycleRequestId === undefined ? {} : { lifecycleRequestId: record.lifecycleRequestId }),
 				});
 				const verifiedIndexSeq = broker.index.findSessionClosedEvidence(record);
@@ -3176,6 +3183,7 @@ type LifecycleRetirementIdentity = {
 	stateRoot: string;
 	endpointGeneration: number;
 	endpointMtimeMs: number;
+	endpointFileId?: string;
 	pid: number;
 	processIncarnation: string;
 	hostIncarnation: string;
@@ -3213,6 +3221,7 @@ function isLifecycleRetirementIdentity(value: unknown): value is LifecycleRetire
 					"stateRoot",
 					"endpointGeneration",
 					"endpointMtimeMs",
+					"endpointFileId",
 					"pid",
 					"processIncarnation",
 					"hostIncarnation",
@@ -3236,6 +3245,7 @@ function isLifecycleRetirementIdentity(value: unknown): value is LifecycleRetire
 		typeof identity.endpointMtimeMs === "number" &&
 		Number.isFinite(identity.endpointMtimeMs) &&
 		identity.endpointMtimeMs > 0 &&
+		(identity.endpointFileId === undefined || boundedRetirementString(identity.endpointFileId, 256)) &&
 		typeof identity.pid === "number" &&
 		Number.isSafeInteger(identity.pid) &&
 		identity.pid > 0 &&
@@ -3479,6 +3489,7 @@ async function recordTerminalUncertain(
 			...(registered.processIncarnation === undefined ? {} : { processIncarnation: registered.processIncarnation }),
 			...(registered.hostIncarnation === undefined ? {} : { hostIncarnation: registered.hostIncarnation }),
 			...(registered.endpointMtimeMs === undefined ? {} : { endpointMtimeMs: registered.endpointMtimeMs }),
+			...(registered.endpointFileId === undefined ? {} : { endpointFileId: registered.endpointFileId }),
 			...(registered.lifecycleRequestId === undefined
 				? expected?.effectMarker === undefined
 					? {}
@@ -3749,6 +3760,7 @@ async function removeExactDeadSessionEndpoint(
 		current.endpointGeneration !== record.endpointGeneration ||
 		current.pid !== record.pid ||
 		current.endpointMtimeMs !== record.endpointMtimeMs ||
+		current.endpointFileId !== record.endpointFileId ||
 		current.lifecycleRequestId !== record.lifecycleRequestId ||
 		current.processIncarnation !== record.processIncarnation ||
 		path.resolve(current.locator.stateRoot) !== path.resolve(record.locator.stateRoot)
@@ -4799,6 +4811,7 @@ type CloseRecord = {
 	endpointGeneration: number;
 	pid: number;
 	endpointMtimeMs?: number;
+	endpointFileId?: string;
 	lifecycleRequestId?: string;
 	processIncarnation?: string;
 };
@@ -4816,9 +4829,10 @@ function endpointIncarnation(record: CloseRecord, sessionId: string): string | u
 		return undefined;
 	return createHash("sha256")
 		.update(
-			JSON.stringify({
+			canonicalJson({
 				endpointGeneration: record.endpointGeneration,
 				endpointMtimeMs: record.endpointMtimeMs,
+				...(record.endpointFileId === undefined ? {} : { endpointFileId: record.endpointFileId }),
 				pid: record.pid,
 				sessionId,
 			}),
@@ -4853,6 +4867,7 @@ function sameCloseAuthority(authority: CloseAuthority, record: CloseRecord, sess
 function sameCloseStoredProcessIdentity(expected: CloseRecord, current: CloseRecord): boolean {
 	return (
 		current.pid === expected.pid &&
+		current.endpointFileId === expected.endpointFileId &&
 		typeof expected.processIncarnation === "string" &&
 		expected.processIncarnation.length > 0 &&
 		current.processIncarnation === expected.processIncarnation &&
@@ -4876,6 +4891,7 @@ function sameCloseEndpointIdentity(expected: CloseRecord, current: CloseRecord):
 		current.pid === expected.pid &&
 		current.endpointMtimeMs !== undefined &&
 		expected.endpointMtimeMs !== undefined &&
+		current.endpointFileId === expected.endpointFileId &&
 		current.lifecycleRequestId === expected.lifecycleRequestId &&
 		path.resolve(current.locator.cwd) === path.resolve(expected.locator.cwd) &&
 		path.resolve(current.locator.stateRoot) === path.resolve(expected.locator.stateRoot)
@@ -4892,6 +4908,7 @@ function sameCloseGeneration(expected: CloseRecord, current: CloseRecord & { liv
 		current.endpointGeneration === expected.endpointGeneration &&
 		current.pid === expected.pid &&
 		current.endpointMtimeMs === expected.endpointMtimeMs &&
+		current.endpointFileId === expected.endpointFileId &&
 		current.lifecycleRequestId === expected.lifecycleRequestId &&
 		current.processIncarnation === expected.processIncarnation &&
 		path.resolve(current.locator.cwd) === path.resolve(expected.locator.cwd) &&
@@ -6328,6 +6345,7 @@ async function appendSessionDeletedEvidence(broker: Broker, record: IndexedSessi
 		...(record.processIncarnation === undefined ? {} : { processIncarnation: record.processIncarnation }),
 		...(record.hostIncarnation === undefined ? {} : { hostIncarnation: record.hostIncarnation }),
 		...(record.endpointMtimeMs === undefined ? {} : { endpointMtimeMs: record.endpointMtimeMs }),
+		...(record.endpointFileId === undefined ? {} : { endpointFileId: record.endpointFileId }),
 		...(record.lifecycleRequestId === undefined ? {} : { lifecycleRequestId: record.lifecycleRequestId }),
 	});
 }

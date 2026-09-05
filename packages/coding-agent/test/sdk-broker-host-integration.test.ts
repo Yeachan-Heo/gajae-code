@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "../src/extensibility/extensions";
@@ -60,6 +61,121 @@ test("broker preserves host registration endpoint metadata across heartbeats", a
 			result: { indexSeq: 4, sessions: [{ sessionId: "live", live: false, terminal: true }] },
 		});
 	} finally {
+		await broker.stop();
+		await fs.rm(agentDir, { recursive: true, force: true });
+	}
+});
+
+test("broker rejects stale get_endpoint authority after a preserved-mtime endpoint replacement", async () => {
+	const agentDir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-endpoint-incarnation-"));
+	const stateRoot = path.join(agentDir, "state");
+	const endpointPath = path.join(stateRoot, "sdk", "replacement.json");
+	const displacedPath = `${endpointPath}.displaced`;
+	const broker = new Broker({ agentDir });
+	try {
+		await fs.mkdir(path.dirname(endpointPath), { recursive: true });
+		await fs.writeFile(endpointPath, JSON.stringify({ sessionId: "replacement", pid: process.pid, token: "old" }));
+		const fixedMtimeSeconds = 1_700_000_000;
+		await fs.utimes(endpointPath, fixedMtimeSeconds, fixedMtimeSeconds);
+		const predecessor = await fs.stat(endpointPath, { bigint: true });
+		const predecessorFileId = `${predecessor.dev}:${predecessor.ino}`;
+		const endpointMtimeMs = Number(predecessor.mtimeNs) / 1_000_000;
+		await broker.start();
+		const index = await new SessionIndex(agentDir).open();
+		await index.append(event("host_registered", "replacement", stateRoot, endpointMtimeMs, predecessorFileId));
+		await index.append(event("host_heartbeat", "replacement", stateRoot));
+		const predecessorIncarnation = createHash("sha256")
+			.update(
+				JSON.stringify({
+					endpointFileId: predecessorFileId,
+					endpointGeneration: 1,
+					endpointMtimeMs,
+					pid: process.pid,
+					sessionId: "replacement",
+				}),
+			)
+			.digest("hex");
+		await fs.rename(endpointPath, displacedPath);
+		await fs.writeFile(endpointPath, JSON.stringify({ sessionId: "replacement", pid: process.pid, token: "new" }));
+		await fs.utimes(endpointPath, fixedMtimeSeconds, fixedMtimeSeconds);
+		const successor = await fs.stat(endpointPath, { bigint: true });
+		expect(`${successor.dev}:${successor.ino}`).not.toBe(predecessorFileId);
+		expect(Number(successor.mtimeNs) / 1_000_000).toBe(endpointMtimeMs);
+		await index.append(
+			event("host_registered", "replacement", stateRoot, endpointMtimeMs, `${successor.dev}:${successor.ino}`),
+		);
+		expect(
+			await broker.handleRequest("session.get_endpoint", {
+				sessionId: "replacement",
+				endpointGeneration: 1,
+				endpointIncarnation: predecessorIncarnation,
+			}),
+		).toEqual({ ok: false, error: { code: "endpoint_stale", message: "session endpoint is stale" } });
+	} finally {
+		await broker.stop();
+		await fs.rm(agentDir, { recursive: true, force: true });
+	}
+});
+
+test("broker rejects stale close authority after a preserved-mtime endpoint replacement", async () => {
+	const agentDir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-close-incarnation-"));
+	const stateRoot = path.join(agentDir, "state");
+	const endpointPath = path.join(stateRoot, "sdk", "replacement-close.json");
+	const displacedPath = `${endpointPath}.displaced`;
+	const sessionId = "replacement-close";
+	const broker = new Broker({ agentDir });
+	const host = Bun.spawn([process.execPath, "-e", "setInterval(() => {}, 1_000_000)"], {
+		stdio: ["ignore", "ignore", "ignore"],
+	});
+	try {
+		await fs.mkdir(path.dirname(endpointPath), { recursive: true });
+		await fs.writeFile(
+			endpointPath,
+			JSON.stringify({ sessionId, pid: host.pid, url: "ws://127.0.0.1:1", token: "old" }),
+		);
+		const fixedMtimeSeconds = 1_700_000_000;
+		await fs.utimes(endpointPath, fixedMtimeSeconds, fixedMtimeSeconds);
+		const predecessor = await fs.stat(endpointPath, { bigint: true });
+		const predecessorFileId = `${predecessor.dev}:${predecessor.ino}`;
+		const endpointMtimeMs = Number(predecessor.mtimeNs) / 1_000_000;
+		await broker.start();
+		const index = await new SessionIndex(agentDir).open();
+		await index.append(event("host_registered", sessionId, stateRoot, endpointMtimeMs, predecessorFileId));
+		await index.append(event("host_heartbeat", sessionId, stateRoot));
+		const predecessorIncarnation = createHash("sha256")
+			.update(
+				JSON.stringify({
+					endpointFileId: predecessorFileId,
+					endpointGeneration: 1,
+					endpointMtimeMs,
+					pid: host.pid,
+					sessionId,
+				}),
+			)
+			.digest("hex");
+		await fs.rename(endpointPath, displacedPath);
+		await fs.writeFile(
+			endpointPath,
+			JSON.stringify({ sessionId, pid: host.pid, url: "ws://127.0.0.1:1", token: "new" }),
+		);
+		await fs.utimes(endpointPath, fixedMtimeSeconds, fixedMtimeSeconds);
+		const successor = await fs.stat(endpointPath, { bigint: true });
+		expect(`${successor.dev}:${successor.ino}`).not.toBe(predecessorFileId);
+		expect(Number(successor.mtimeNs) / 1_000_000).toBe(endpointMtimeMs);
+		await index.append(
+			event("host_registered", sessionId, stateRoot, endpointMtimeMs, `${successor.dev}:${successor.ino}`),
+		);
+		expect(
+			await broker.handleRequest(
+				"session.close",
+				{ sessionId, endpointGeneration: 1, endpointIncarnation: predecessorIncarnation },
+				"preserved-mtime-stale-close",
+			),
+		).toEqual({ ok: false, error: { code: "endpoint_stale", message: "session endpoint is stale" } });
+		expect(await fs.readFile(endpointPath, "utf8")).toContain('"token":"new"');
+	} finally {
+		if (host.exitCode === null) host.kill("SIGKILL");
+		await host.exited;
 		await broker.stop();
 		await fs.rm(agentDir, { recursive: true, force: true });
 	}

@@ -32,6 +32,7 @@ export interface CanonicalSessionSnapshotV1 {
 		endpoint_url: string;
 		endpoint_generation: number;
 		endpoint_incarnation: string;
+		endpoint_file_id?: string;
 		sidecar_verifier: { key_id: string; public_key: string };
 	};
 	ephemeral: boolean;
@@ -307,6 +308,7 @@ export interface CreationRetirementProofV1 {
 	state_root: string;
 	endpoint_generation: number;
 	endpoint_mtime_ms: number;
+	endpoint_file_id?: string;
 	process_incarnation: string;
 	host_incarnation: string;
 	lifecycle_request_id: string;
@@ -320,6 +322,7 @@ export interface CreationRetirementBrokerProofV1 {
 	state_root: string;
 	endpoint_generation: number;
 	endpoint_mtime_ms: number;
+	endpoint_file_id?: string;
 	process_incarnation: string;
 	host_incarnation: string;
 	lifecycle_request_id: string;
@@ -2444,6 +2447,11 @@ function assertCreationRetirementProofMatches(
 		proof.endpoint_generation <= 0 ||
 		!Number.isFinite(proof.endpoint_mtime_ms) ||
 		proof.endpoint_mtime_ms <= 0 ||
+		(proof.endpoint_file_id !== undefined &&
+			(typeof proof.endpoint_file_id !== "string" ||
+				proof.endpoint_file_id.length === 0 ||
+				proof.endpoint_file_id.length > 256 ||
+				/[\u0000-\u001f\u007f]/u.test(proof.endpoint_file_id))) ||
 		!proof.process_incarnation ||
 		!proof.host_incarnation ||
 		!proof.lifecycle_request_id ||
@@ -2460,6 +2468,7 @@ function assertCreationRetirementProofMatches(
 			path.resolve(session.cwd) !== path.resolve(proof.cwd) ||
 			path.resolve(session.cwd, ".gjc", "state") !== path.resolve(proof.state_root) ||
 			session.broker.endpoint_generation !== proof.endpoint_generation ||
+			session.broker.endpoint_file_id !== proof.endpoint_file_id ||
 			intent.kind === "register" ||
 			intent.remote_create_key !== proof.remote_create_key
 		)
@@ -2553,6 +2562,7 @@ export async function recordCreationRetirementBrokerProof(
 			brokerProof.state_root !== proof.state_root ||
 			brokerProof.endpoint_generation !== proof.endpoint_generation ||
 			brokerProof.endpoint_mtime_ms !== proof.endpoint_mtime_ms ||
+			brokerProof.endpoint_file_id !== proof.endpoint_file_id ||
 			brokerProof.process_incarnation !== proof.process_incarnation ||
 			brokerProof.host_incarnation !== proof.host_incarnation ||
 			brokerProof.lifecycle_request_id !== proof.lifecycle_request_id ||

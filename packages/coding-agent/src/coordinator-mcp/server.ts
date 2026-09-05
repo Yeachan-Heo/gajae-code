@@ -626,6 +626,7 @@ function toolSchema(name: CoordinatorToolName): {
 					state_root: { type: "string", description: "Exact indexed SDK state root." },
 					endpoint_generation: { type: "number" },
 					endpoint_mtime_ms: { type: "number" },
+					endpoint_file_id: { type: "string" },
 					process_incarnation: { type: "string" },
 					host_incarnation: { type: "string" },
 					lifecycle_request_id: { type: "string" },
@@ -1057,6 +1058,8 @@ function normalizeSession(session: Record<string, unknown>): Record<string, unkn
 		session.endpoint_generation > 0
 	)
 		normalized.endpoint_generation = session.endpoint_generation;
+	const endpointFileId = optionalString(session.endpoint_file_id ?? session.endpointFileId);
+	if (endpointFileId !== null) normalized.endpoint_file_id = endpointFileId;
 	const sidecarVerifier = asRecord(session.sidecar_verifier);
 	if (sidecarVerifier && typeof sidecarVerifier.key_id === "string" && typeof sidecarVerifier.public_key === "string")
 		normalized.sidecar_verifier = {
@@ -3475,6 +3478,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		const cwd = optionalString(session.cwd);
 		const brokerWorkspace = optionalString(session.broker_workspace);
 		const incarnation = optionalString(session.endpoint_incarnation);
+		const endpointFileId = optionalString(session.endpoint_file_id);
 		if (!cwd || !brokerWorkspace || !incarnation) throw new Error("state_corrupt");
 		return {
 			schema_version: 1,
@@ -3499,6 +3503,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				endpoint_url: "",
 				endpoint_generation: typeof session.endpoint_generation === "number" ? session.endpoint_generation : 0,
 				endpoint_incarnation: incarnation,
+				...(endpointFileId === null ? {} : { endpoint_file_id: endpointFileId }),
 				sidecar_verifier:
 					session.sidecar_verifier && typeof session.sidecar_verifier === "object"
 						? (session.sidecar_verifier as { key_id: string; public_key: string })
@@ -3526,6 +3531,9 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			broker_workspace: snapshot.broker.workspace,
 			endpoint_generation: snapshot.broker.endpoint_generation,
 			endpoint_incarnation: snapshot.broker.endpoint_incarnation,
+			...(snapshot.broker.endpoint_file_id === undefined
+				? {}
+				: { endpoint_file_id: snapshot.broker.endpoint_file_id }),
 			sidecar_verifier: snapshot.broker.sidecar_verifier,
 		});
 	}
@@ -3890,6 +3898,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		const session = asRecord(await readJsonFile(path.join(legacyNamespaceDir, "sessions", `${sessionId}.json`)));
 		if (!session) throw new Error("resource_gone");
 		const incarnation = optionalString(session.endpoint_incarnation);
+		const endpointFileId = optionalString(session.endpoint_file_id);
 		const cwd = optionalString(session.cwd);
 		const brokerWorkspace = optionalString(session.broker_workspace);
 		if (!incarnation || !cwd || !brokerWorkspace || !legacyScopeOwned(session)) throw new Error("resource_gone");
@@ -3930,6 +3939,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 						endpoint_generation:
 							typeof session.endpoint_generation === "number" ? session.endpoint_generation : 0,
 						endpoint_incarnation: incarnation,
+						...(endpointFileId === null ? {} : { endpoint_file_id: endpointFileId }),
 						sidecar_verifier: { key_id: verifierKeyId, public_key: verifierPublicKey },
 					},
 					ephemeral: session.ephemeral === true,
@@ -5428,6 +5438,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			state_root: typeof result.stateRoot === "string" ? result.stateRoot : "",
 			endpoint_generation: typeof result.endpointGeneration === "number" ? result.endpointGeneration : Number.NaN,
 			endpoint_mtime_ms: typeof result.endpointMtimeMs === "number" ? result.endpointMtimeMs : Number.NaN,
+			...(typeof result.endpointFileId === "string" ? { endpoint_file_id: result.endpointFileId } : {}),
 			process_incarnation: typeof result.processIncarnation === "string" ? result.processIncarnation : "",
 			host_incarnation: typeof result.hostIncarnation === "string" ? result.hostIncarnation : "",
 			lifecycle_request_id: typeof result.lifecycleRequestId === "string" ? result.lifecycleRequestId : "",
@@ -5441,6 +5452,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			broker.state_root !== expected.state_root ||
 			broker.endpoint_generation !== expected.endpoint_generation ||
 			broker.endpoint_mtime_ms !== expected.endpoint_mtime_ms ||
+			broker.endpoint_file_id !== expected.endpoint_file_id ||
 			broker.process_incarnation !== expected.process_incarnation ||
 			broker.host_incarnation !== expected.host_incarnation ||
 			broker.lifecycle_request_id !== expected.lifecycle_request_id ||
@@ -5533,6 +5545,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		const endpointGeneration = brokerEndpointGeneration(session);
 		const pid = session.pid;
 		const endpointMtimeMs = session.endpointMtimeMs;
+		const endpointFileId = brokerEndpointFileId(session);
 		if (
 			endpointGeneration === null ||
 			typeof pid !== "number" ||
@@ -5544,14 +5557,28 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		)
 			return null;
 		return createHash("sha256")
-			.update(canonicalJson({ endpointGeneration, endpointMtimeMs, pid, sessionId }))
+			.update(
+				canonicalJson({
+					endpointGeneration,
+					endpointMtimeMs,
+					...(endpointFileId === undefined ? {} : { endpointFileId }),
+					pid,
+					sessionId,
+				}),
+			)
 			.digest("hex");
+	}
+
+	function brokerEndpointFileId(session: Record<string, unknown>): string | undefined {
+		const value = session.endpointFileId ?? session.endpoint_file_id;
+		return typeof value === "string" && value.length > 0 ? value : undefined;
 	}
 
 	type BrokerSessionAuthority = {
 		workspace: string;
 		endpointGeneration: number;
 		endpointIncarnation: string;
+		endpointFileId?: string;
 	};
 
 	async function exactBrokerSessionAuthority(sessionId: string, workspace: string): Promise<BrokerSessionAuthority> {
@@ -5581,7 +5608,13 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		const endpointIncarnation = brokerEndpointIncarnation(match.session, sessionId);
 		if (endpointGeneration === null || endpointIncarnation === null)
 			throw new SdkClientError("endpoint_stale", "Broker session has no usable endpoint incarnation.");
-		return { workspace: match.workspace, endpointGeneration, endpointIncarnation };
+		const endpointFileId = brokerEndpointFileId(match.session);
+		return {
+			workspace: match.workspace,
+			endpointGeneration,
+			endpointIncarnation,
+			...(endpointFileId === undefined ? {} : { endpointFileId }),
+		};
 	}
 
 	async function exactBrokerSessionBinding(sessionId: string, workspace: string): Promise<BrokerSessionAuthority> {
@@ -7438,7 +7471,8 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					priorSession &&
 					priorSession.broker_workspace === binding.workspace &&
 					priorSession.endpoint_generation === binding.endpointGeneration &&
-					optionalString(priorSession.endpoint_incarnation) === binding.endpointIncarnation
+					optionalString(priorSession.endpoint_incarnation) === binding.endpointIncarnation &&
+					optionalString(priorSession.endpoint_file_id) === (binding.endpointFileId ?? null)
 						? (priorSession.sidecar_verifier as { key_id: string; public_key: string } | undefined)
 						: undefined;
 				// An already-running SDK process cannot receive a newly minted private
@@ -7472,6 +7506,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 							broker_workspace: binding.workspace,
 							endpoint_generation: binding.endpointGeneration,
 							endpoint_incarnation: binding.endpointIncarnation,
+							...(binding.endpointFileId === undefined ? {} : { endpoint_file_id: binding.endpointFileId }),
 							sidecar_verifier: priorAuthority,
 						});
 						const intent: CanonicalCreateIntentV1 = {
@@ -8244,7 +8279,8 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 										platform,
 									) ||
 									existing.endpoint_generation !== binding.endpointGeneration ||
-									optionalString(existing.endpoint_incarnation) !== binding.endpointIncarnation
+									optionalString(existing.endpoint_incarnation) !== binding.endpointIncarnation ||
+									optionalString(existing.endpoint_file_id) !== (binding.endpointFileId ?? null)
 								)
 									return {
 										ok: false,
@@ -8260,6 +8296,9 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 									broker_workspace: binding.workspace,
 									endpoint_generation: binding.endpointGeneration,
 									endpoint_incarnation: binding.endpointIncarnation,
+									...(binding.endpointFileId === undefined
+										? {}
+										: { endpoint_file_id: binding.endpointFileId }),
 									sidecar_verifier: existing.sidecar_verifier as { key_id: string; public_key: string },
 								});
 							} else {
@@ -8329,6 +8368,9 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 										broker_workspace: binding.workspace,
 										endpoint_generation: binding.endpointGeneration,
 										endpoint_incarnation: binding.endpointIncarnation,
+										...(binding.endpointFileId === undefined
+											? {}
+											: { endpoint_file_id: binding.endpointFileId }),
 										sidecar_verifier: reconciled.sidecar_verifier,
 									});
 									const intent: CanonicalCreateIntentV1 = {
@@ -8670,6 +8712,9 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 									broker_workspace: binding.workspace,
 									endpoint_generation: binding.endpointGeneration,
 									endpoint_incarnation: binding.endpointIncarnation,
+									...(binding.endpointFileId === undefined
+										? {}
+										: { endpoint_file_id: binding.endpointFileId }),
 									sidecar_verifier: reconciled.sidecar_verifier,
 								});
 							}
@@ -8808,6 +8853,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				const lifecycleRequestId = proofString(args.lifecycle_request_id, 128);
 				const processIncarnation = proofString(args.process_incarnation, 256);
 				const hostIncarnation = proofString(args.host_incarnation, 256);
+				const endpointFileId = proofString(args.endpoint_file_id, 256);
 				const endpointGeneration = args.endpoint_generation;
 				const endpointMtimeMs = args.endpoint_mtime_ms;
 				if (
@@ -8824,6 +8870,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					typeof endpointMtimeMs !== "number" ||
 					!Number.isFinite(endpointMtimeMs) ||
 					endpointMtimeMs <= 0 ||
+					(args.endpoint_file_id !== undefined && endpointFileId === null) ||
 					path.resolve(stateRoot) !== path.join(cwd, ".gjc", "state")
 				)
 					return {
@@ -8843,6 +8890,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					state_root: stateRoot,
 					endpoint_generation: endpointGeneration,
 					endpoint_mtime_ms: endpointMtimeMs,
+					...(endpointFileId === null ? {} : { endpoint_file_id: endpointFileId }),
 					process_incarnation: processIncarnation,
 					host_incarnation: hostIncarnation,
 					lifecycle_request_id: lifecycleRequestId,
@@ -8961,6 +9009,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 										staged.state_root !== proof.state_root ||
 										staged.endpoint_generation !== proof.endpoint_generation ||
 										staged.endpoint_mtime_ms !== proof.endpoint_mtime_ms ||
+										staged.endpoint_file_id !== proof.endpoint_file_id ||
 										staged.process_incarnation !== proof.process_incarnation ||
 										staged.host_incarnation !== proof.host_incarnation ||
 										staged.lifecycle_request_id !== proof.lifecycle_request_id ||
@@ -8990,6 +9039,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 											stateRoot,
 											endpointGeneration,
 											endpointMtimeMs,
+											...(endpointFileId === null ? {} : { endpointFileId }),
 											processIncarnation,
 											hostIncarnation,
 											lifecycleRequestId,

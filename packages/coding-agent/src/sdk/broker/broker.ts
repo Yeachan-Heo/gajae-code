@@ -742,7 +742,7 @@ function matchesLifecycleReplayEndpointFile(
 
 type EndpointAuthority = { endpointGeneration?: number; endpointIncarnation?: string };
 function endpointIncarnation(
-	record: Pick<IndexedSession, "endpointGeneration" | "endpointMtimeMs" | "pid">,
+	record: Pick<IndexedSession, "endpointGeneration" | "endpointMtimeMs" | "endpointFileId" | "pid">,
 	sessionId: string,
 ): string | undefined {
 	if (
@@ -760,6 +760,7 @@ function endpointIncarnation(
 			canonicalJson({
 				endpointGeneration: record.endpointGeneration,
 				endpointMtimeMs: record.endpointMtimeMs,
+				...(record.endpointFileId === undefined ? {} : { endpointFileId: record.endpointFileId }),
 				pid: record.pid,
 				sessionId,
 			}),
