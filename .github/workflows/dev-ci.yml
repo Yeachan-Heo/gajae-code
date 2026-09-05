@@ -532,6 +532,10 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           bun test ./packages/natives/test/path-identity-windows.test.ts
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          bun test ./packages/coding-agent/test/sdk-session-router-authority.test.ts --test-name-pattern 'inode replacement|endpoint file identity differs'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          bun test ./packages/coding-agent/test/sdk-broker-host-integration.test.ts --test-name-pattern 'preserved-mtime endpoint replacement'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
   # Native addon build runs at most once per run and publishes the built `.node`
   # files as an artifact the runtime-dependent shards download. A content-hash

@@ -270,7 +270,22 @@ export class SlackNotificationDaemon {
 		this.#publicationOwnerId = options.publicationOwnerId ?? randomUUID();
 		this.#publicationLeaseMs = Math.max(options.publicationLeaseMs ?? 30_000, MIN_PUBLICATION_LEASE_MS);
 		this.#journal = new ChatEffectJournal({ agentDir: options.agentDir, transport: "slack", now: this.#now });
-		this.#resolveAttachment = options.resolveAttachment;
+		this.#resolveAttachment = async sessionId => {
+			const attachment = await options.resolveAttachment(sessionId);
+			if (
+				attachment?.isCurrent() &&
+				attachment.legacyAuthorityId &&
+				attachment.authorityId &&
+				attachment.legacyAuthorityId !== attachment.authorityId
+			)
+				await this.migrateAttachmentAuthority(
+					attachment.sessionId,
+					attachment.generation,
+					attachment.legacyAuthorityId,
+					attachment.authorityId,
+				);
+			return attachment;
+		};
 	}
 
 	restartBlocked(): boolean {

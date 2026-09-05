@@ -211,7 +211,22 @@ export class DiscordNotificationDaemon {
 			setTimeout: (callback, delayMs) => setTimeout(() => void callback(), delayMs),
 			clearTimeout: handle => clearTimeout(handle as ReturnType<typeof setTimeout>),
 		};
-		this.#resolveAttachment = options.resolveAttachment;
+		this.#resolveAttachment = async (sessionId, expectedGeneration) => {
+			const attachment = await options.resolveAttachment(sessionId, expectedGeneration);
+			if (
+				attachment?.isCurrent() &&
+				attachment.legacyAuthorityId &&
+				attachment.authorityId &&
+				attachment.legacyAuthorityId !== attachment.authorityId
+			)
+				await this.migrateAttachmentAuthority(
+					attachment.sessionId,
+					attachment.generation,
+					attachment.legacyAuthorityId,
+					attachment.authorityId,
+				);
+			return attachment;
+		};
 	}
 	restartBlocked(): boolean {
 		return this.#providerLifecycleTail !== undefined || this.#providerLifecycleErrorSet;
