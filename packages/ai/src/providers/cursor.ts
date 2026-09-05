@@ -653,6 +653,7 @@ function isClosedCursorRequest(request: http2.ClientHttp2Stream): boolean {
 }
 
 const CURSOR_WRITE_DRAIN_TIMEOUT_MS = 5_000;
+const CURSOR_MAX_PENDING_SHELL_WRITE_BYTES = 1024 * 1024;
 const pendingCursorWrites = new WeakMap<object, Set<Promise<void>>>();
 const cursorWriteErrors = new WeakMap<object, unknown>();
 
@@ -739,6 +740,40 @@ export function waitForCursorWritesForTest(request: http2.ClientHttp2Stream | nu
 	return waitForCursorWrites(request, timeoutMs);
 }
 
+async function waitForCursorWriteDrain(
+	request: http2.ClientHttp2Stream,
+	timeoutMs = CURSOR_WRITE_DRAIN_TIMEOUT_MS,
+): Promise<void> {
+	if (isClosedCursorRequest(request)) throw new Error("Cursor request closed while waiting for write backpressure");
+	const settled = Promise.withResolvers<void>();
+	const onDrain = () => settled.resolve();
+	const onClose = () => settled.reject(new Error("Cursor request closed while waiting for write backpressure"));
+	const onError = (error: unknown) => settled.reject(error);
+	request.once("drain", onDrain);
+	request.once("close", onClose);
+	request.once("error", onError);
+	const timeout = setTimeout(
+		() => {
+			const error = new Error(`Cursor request write backpressure timed out after ${timeoutMs}ms`);
+			settled.reject(error);
+			closeStalledCursorRequest(request);
+		},
+		Math.max(1, timeoutMs),
+	);
+	try {
+		await settled.promise;
+	} finally {
+		clearTimeout(timeout);
+		request.removeListener("drain", onDrain);
+		request.removeListener("close", onClose);
+		request.removeListener("error", onError);
+	}
+}
+
+export function waitForCursorWriteDrainForTest(request: http2.ClientHttp2Stream, timeoutMs?: number): Promise<void> {
+	return waitForCursorWriteDrain(request, timeoutMs);
+}
+
 /**
  * Late exec/stream handlers can finish after the bounded settlement fence has
  * closed the HTTP/2 request. Treat those writes as dropped transport output;
@@ -775,8 +810,7 @@ function writeCursorFrame(request: http2.ClientHttp2Stream, frame: Uint8Array): 
 			request.once("close", onClose);
 			request.once("error", finish);
 		}
-		request.write(frame, finish);
-		return true;
+		return request.write(frame, finish) !== false;
 	} catch (error) {
 		if (isClosedCursorRequest(request)) {
 			finish();
@@ -2418,6 +2452,49 @@ async function handleShellStreamArgs(
 	let stdoutBuffer = "";
 	let stderrBuffer = "";
 	let callbacksOpen = true;
+	let pendingShellWriteBytes = 0;
+	let shellWriteFailure: unknown;
+	let shellWriteChain = Promise.resolve();
+	const queueShellStreamEvent = (event: ShellStream["event"]): void => {
+		if (shellWriteFailure || !callbacksOpen || !h2Request.isActive()) return;
+		const frame = encodeExecClientMessageFrame(execMsg, {
+			case: "shellStream",
+			value: create(ShellStreamSchema, { event }),
+		});
+		if (pendingShellWriteBytes + frame.length > CURSOR_MAX_PENDING_SHELL_WRITE_BYTES) {
+			const error = new Error(
+				`Cursor shell output exceeded ${CURSOR_MAX_PENDING_SHELL_WRITE_BYTES} pending write bytes`,
+			);
+			shellWriteFailure = error;
+			callbacksOpen = false;
+			closeStalledCursorRequest(h2Request);
+			shellWriteChain = shellWriteChain.then(() => {
+				throw error;
+			});
+			shellWriteChain.catch(() => {});
+			return;
+		}
+		pendingShellWriteBytes += frame.length;
+		const queuedWrite = shellWriteChain
+			.then(async () => {
+				if (shellWriteFailure) throw shellWriteFailure;
+				const writable = writeCursorFrame(h2Request, frame);
+				if (writable) return;
+				if (isClosedCursorRequest(h2Request)) {
+					throw new Error("Cursor request closed while forwarding shell output");
+				}
+				await waitForCursorWriteDrain(h2Request);
+			})
+			.finally(() => {
+				pendingShellWriteBytes -= frame.length;
+			});
+		shellWriteChain = queuedWrite;
+		queuedWrite.catch(error => {
+			shellWriteFailure ??= error;
+			callbacksOpen = false;
+			closeStalledCursorRequest(h2Request);
+		});
+	};
 	const unregisterShellGate = h2Request.registerShellGate(() => {
 		callbacksOpen = false;
 		if (stdoutFlushTimer) clearTimeout(stdoutFlushTimer);
@@ -2436,7 +2513,7 @@ async function handleShellStreamArgs(
 			const toSend = stdoutBuffer.slice(0, safeEnd);
 			const remaining = stdoutBuffer.slice(safeEnd);
 			if (toSend) {
-				sendShellStreamEvent(h2Request, execMsg, {
+				queueShellStreamEvent({
 					case: "stdout",
 					value: create(ShellStreamStdoutSchema, { data: sanitizeText(toSend) }),
 				});
@@ -2455,7 +2532,7 @@ async function handleShellStreamArgs(
 			const toSend = stderrBuffer.slice(0, safeEnd);
 			const remaining = stderrBuffer.slice(safeEnd);
 			if (toSend) {
-				sendShellStreamEvent(h2Request, execMsg, {
+				queueShellStreamEvent({
 					case: "stderr",
 					value: create(ShellStreamStderrSchema, { data: sanitizeText(toSend) }),
 				});
@@ -2545,6 +2622,8 @@ async function handleShellStreamArgs(
 	if (stderrFlushTimer) clearTimeout(stderrFlushTimer);
 	flushStdout();
 	flushStderr();
+	await shellWriteChain;
+	if (shellWriteFailure) throw shellWriteFailure;
 
 	sendShellStreamExitFromResult(h2Request, execMsg, sanitizedExecResult, sendBufferedOutput);
 	// Cursor can keep the turn pending when it receives only stream deltas.
@@ -3115,10 +3194,18 @@ function sendExecClientMessage<TCase extends NonNullable<ExecClientMessage["mess
 	messageCase: TCase,
 	value: Extract<ExecClientMessage["message"], { case: TCase }>["value"],
 ): void {
+	writeCursorFrame(
+		h2Request,
+		encodeExecClientMessageFrame(execMsg, { case: messageCase, value } as ExecClientMessage["message"]),
+	);
+	log("execClientMessage", messageCase, value);
+}
+
+function encodeExecClientMessageFrame(execMsg: ExecServerMessage, message: ExecClientMessage["message"]): Buffer {
 	const execClientMessage = create(ExecClientMessageSchema, {
 		id: execMsg.id,
 		execId: execMsg.execId,
-		message: { case: messageCase, value } as ExecClientMessage["message"],
+		message,
 	});
 
 	const clientMessage = create(AgentClientMessageSchema, {
@@ -3126,9 +3213,7 @@ function sendExecClientMessage<TCase extends NonNullable<ExecClientMessage["mess
 	});
 
 	const responseBytes = toBinary(AgentClientMessageSchema, clientMessage);
-	writeCursorFrame(h2Request, frameConnectMessage(responseBytes));
-
-	log("execClientMessage", messageCase, value);
+	return frameConnectMessage(responseBytes);
 }
 
 function sendExecClientThrow(

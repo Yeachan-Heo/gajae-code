@@ -9,6 +9,8 @@ import {
 	invalidateClaudePluginRoots,
 	listClaudePluginRoots,
 	parseClaudePluginsRegistry,
+	resolveActiveProjectRegistryPath,
+	resolveOrDefaultProjectRegistryPath,
 } from "@gajae-code/coding-agent/discovery/helpers";
 import { discoverAgents } from "@gajae-code/coding-agent/task/discovery";
 import { safeRm } from "../../../../scripts/safe-cleanup";
@@ -89,6 +91,28 @@ describe("listClaudePluginRoots", () => {
 		const result = await listClaudePluginRoots(tempDir);
 		expect(result.roots).toEqual([]);
 		expect(result.warnings).toEqual([]);
+	});
+
+	test("keeps project plugin registries under .gjc when the user config directory is overridden", async () => {
+		const originalConfigDir = process.env.GJC_CONFIG_DIR;
+		const project = path.join(tempDir, "project");
+		await fs.mkdir(path.join(project, ".git"), { recursive: true });
+		await fs.mkdir(path.join(project, ".gjc", "plugins"), { recursive: true });
+		await fs.mkdir(path.join(project, ".profile", "plugins"), { recursive: true });
+		process.env.GJC_CONFIG_DIR = ".profile";
+		try {
+			expect(await resolveActiveProjectRegistryPath(project)).toBe(
+				path.join(project, ".gjc", "plugins", "installed_plugins.json"),
+			);
+			const freshProject = path.join(tempDir, "fresh-project");
+			await fs.mkdir(freshProject, { recursive: true });
+			expect(await resolveOrDefaultProjectRegistryPath(freshProject)).toBe(
+				path.join(freshProject, ".gjc", "plugins", "installed_plugins.json"),
+			);
+		} finally {
+			if (originalConfigDir === undefined) delete process.env.GJC_CONFIG_DIR;
+			else process.env.GJC_CONFIG_DIR = originalConfigDir;
+		}
 	});
 
 	test("parses plugin with user scope", async () => {

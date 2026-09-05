@@ -126,6 +126,23 @@ describe("dev-ci Telegram daemon generation guard topology", () => {
 		expect(windowsContract.run).toContain("constructing or restarting provider transport cannot mutate session lifecycle");
 	});
 
+	test("keeps Windows dev-doctor requiredness aligned with its explicit-home eligibility paths", async () => {
+		const d = await workflow();
+		const eligibility = String(requiredJob(d, "windows-dev-doctor").if);
+		const affected = requiredJob(d, "affected");
+		const producer = requiredJob(d, "affected-evidence-producer");
+		const producerRequired = requiredEnvValue(namedStep(producer, "Produce affected evidence"), "CI_DEV_WINDOWS_DOCTOR_REQUIRED");
+		const affectedRequired = requiredEnvValue(affected, "CI_DEV_WINDOWS_DOCTOR_REQUIRED");
+		for (const changedPath of [
+			"packages/coding-agent/src/capability/fs.ts",
+			"packages/coding-agent/test/pr-4834-home-isolation.test.ts",
+		]) {
+			expect(eligibility).toContain(changedPath);
+			expect(producerRequired).toContain(changedPath);
+			expect(affectedRequired).toContain(changedPath);
+		}
+	});
+
 	test("keeps affected validation pinned while reserving an explicit virtual-integration dispatch head", async () => {
 		const d = await workflow();
 		const dispatchInputs = Object.keys(d.on.workflow_dispatch.inputs);

@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import * as events from "node:events";
 import * as http2 from "node:http2";
 import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
 import {
@@ -9,6 +10,7 @@ import {
 	disposeCursorConversation,
 	resolveExecHandler,
 	streamCursor,
+	waitForCursorWriteDrainForTest,
 	waitForCursorWritesForTest,
 	writeCursorFrameForTest,
 } from "../src/providers/cursor";
@@ -442,6 +444,51 @@ describe("Cursor payload transport boundary", () => {
 			await serverClosed.promise;
 		}
 describe("Cursor request writer teardown", () => {
+	it("preserves the HTTP/2 write backpressure signal and resumes on drain", async () => {
+		const request = Object.assign(new events.EventEmitter(), {
+			closed: false,
+			destroyed: false,
+			writableEnded: false,
+			writableFinished: false,
+			write(_frame: Uint8Array, callback: (error?: Error | null) => void) {
+				callback();
+				return false;
+			},
+		}) as unknown as http2.ClientHttp2Stream;
+
+		expect(writeCursorFrameForTest(request, Buffer.from("response"))).toBe(false);
+		const drained = waitForCursorWriteDrainForTest(request, 100);
+		request.emit("drain");
+		await expect(drained).resolves.toBeUndefined();
+	});
+
+	it("bounds a live HTTP/2 backpressure stall", async () => {
+		let closed = false;
+		let destroyed = false;
+		const request = Object.assign(new events.EventEmitter(), {
+			get closed() {
+				return closed;
+			},
+			get destroyed() {
+				return destroyed;
+			},
+			writableEnded: false,
+			writableFinished: false,
+			close() {
+				closed = true;
+			},
+			destroy() {
+				destroyed = true;
+			},
+		}) as unknown as http2.ClientHttp2Stream;
+
+		await expect(waitForCursorWriteDrainForTest(request, 10)).rejects.toThrow(
+			"Cursor request write backpressure timed out after 10ms",
+		);
+		expect(closed).toBe(true);
+		expect(destroyed).toBe(true);
+	});
+
 	it("makes an asynchronous write callback failure observable", async () => {
 		let writeCallback: ((error?: Error | null) => void) | undefined;
 		const request = {

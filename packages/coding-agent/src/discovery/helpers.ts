@@ -3,6 +3,7 @@ import * as path from "node:path";
 import type { ThinkingLevel } from "@gajae-code/agent-core";
 import type { FileType as FileTypeEnum, glob as globFn } from "@gajae-code/natives";
 import {
+	CONFIG_DIR_NAME,
 	getConfigDirName,
 	getPluginsDir,
 	getProjectDir,
@@ -61,7 +62,7 @@ export const SOURCE_PATHS = {
 			return `${getConfigDirName()}/agent`;
 		},
 		get projectDir() {
-			return getConfigDirName();
+			return CONFIG_DIR_NAME;
 		},
 	},
 	claude: {
@@ -941,9 +942,9 @@ export async function resolveActiveProjectRegistryPath(
 	while (true) {
 		if (dir === effectiveStop && effectiveStop === homeDir) break;
 		try {
-			const stat = await fs.promises.stat(path.join(dir, getConfigDirName()));
+			const stat = await fs.promises.stat(path.join(dir, CONFIG_DIR_NAME));
 			if (stat.isDirectory()) {
-				return path.join(dir, getConfigDirName(), "plugins", "installed_plugins.json");
+				return path.join(dir, CONFIG_DIR_NAME, "plugins", "installed_plugins.json");
 			}
 		} catch {
 			// not found at this level — continue up
@@ -960,7 +961,7 @@ export async function resolveActiveProjectRegistryPath(
 		if (dir === effectiveStop && effectiveStop === homeDir) break;
 		try {
 			await fs.promises.stat(path.join(dir, ".git"));
-			return path.join(dir, getConfigDirName(), "plugins", "installed_plugins.json");
+			return path.join(dir, CONFIG_DIR_NAME, "plugins", "installed_plugins.json");
 		} catch {
 			// not found at this level — continue up
 		}
@@ -995,7 +996,7 @@ export async function resolveOrDefaultProjectRegistryPath(cwd: string): Promise<
 		fs.promises.realpath(getTrustedHomeDir()).catch(() => path.resolve(getTrustedHomeDir())),
 	]);
 	if (canonicalCwd === canonicalHome) return undefined;
-	return path.join(cwd, getConfigDirName(), "plugins", "installed_plugins.json");
+	return path.join(cwd, CONFIG_DIR_NAME, "plugins", "installed_plugins.json");
 }
 
 const pluginRootsCache = new Map<string, { roots: ClaudePluginRoot[]; warnings: string[] }>();

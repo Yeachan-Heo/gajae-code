@@ -124,6 +124,45 @@ describe("CursorExecHandlers detached invocation (#484)", () => {
 		);
 		expect(marked).toBe(true);
 	});
+	it("withholds cancellation and delays terminal settlement for a native non-abortable write", async () => {
+		const started = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const observedSignals: Array<AbortSignal | undefined> = [];
+		const writeTool = {
+			...makeTool("write"),
+			nonAbortable: true,
+			execute: async (_toolCallId: string, _args: Record<string, unknown>, signal?: AbortSignal) => {
+				observedSignals.push(signal);
+				started.resolve();
+				await release.promise;
+				return { content: [{ type: "text" as const, text: "written" }], details: {} };
+			},
+		} as AgentTool;
+		const handlers = new CursorExecHandlers({ cwd: process.cwd(), tools: new Map([["write", writeTool]]) } as never);
+		const controller = new AbortController();
+		let terminalSettled = false;
+		const pending = runWithCursorExecDeadlineForTest(
+			(signal, markNonAbortable) =>
+				handlers.write(
+					create(WriteArgsSchema, { path: "native.txt", fileText: "body", toolCallId: "native-held" }),
+					signal,
+					markNonAbortable,
+				),
+			controller.signal,
+			20,
+		).finally(() => {
+			terminalSettled = true;
+		});
+
+		await started.promise;
+		controller.abort(new Error("caller cancelled native write"));
+		await Bun.sleep(25);
+		expect(observedSignals).toEqual([undefined]);
+		expect(terminalSettled).toBe(false);
+		release.resolve();
+		await expect(pending).rejects.toThrow("Cursor local exec exceeded its 20ms deadline");
+		expect(terminalSettled).toBe(true);
+	});
 	it("propagates a closed admission marker instead of returning a tool error", async () => {
 		const writeTool = { ...makeTool("write"), nonAbortable: true };
 		const handlers = new CursorExecHandlers({ cwd: process.cwd(), tools: new Map([["write", writeTool]]) } as never);
