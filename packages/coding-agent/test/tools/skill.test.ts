@@ -481,6 +481,16 @@ describe("SkillTool", () => {
 		expect(captured).toHaveLength(0);
 	});
 
+	it("rejects Windows filesystem aliases for bundled workflow skills", async () => {
+		const cwd = await makeTempCwd();
+		const alias = await makeSkill("ralplan.", "---\nname: ralplan.\n---\nAlias");
+		const captured: CapturedSend[] = [];
+		const tool = SkillTool.createIf(createSession(cwd, [alias], captured))!;
+
+		await expect(tool.execute("call-1", { name: "ralplan." })).rejects.toThrow(/filesystem alias/);
+		expect(captured).toHaveLength(0);
+	});
+
 	it("rejects chaining into the currently active skill (recursive-self guard)", async () => {
 		const cwd = await makeTempCwd();
 		const deepInterview = await makeSkill("deep-interview", "---\nname: deep-interview\n---\nBody");

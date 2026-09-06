@@ -281,6 +281,9 @@ export interface ExecutorOptions {
 	authStorage?: AuthStorage;
 	modelRegistry?: ModelRegistry;
 	settings?: Settings;
+	/** Parent session's selected agent directory and immutable resolver-owned authority. */
+	agentDir?: string;
+	profileAuthority?: "default" | "custom";
 	/** Parent session's registry; shared by child sessions for IRC routing and roster visibility. */
 	agentRegistry?: AgentRegistry;
 	/**
@@ -1952,6 +1955,8 @@ export async function runSubprocessOnce(options: ExecutorOptions): Promise<Singl
 			const { session } = await awaitAbortable(
 				canonicalSdk.createAgentSession({
 					cwd: worktree ?? cwd,
+					agentDir: options.agentDir,
+					profileAuthority: options.profileAuthority,
 					authStorage,
 					modelRegistry,
 					settings: subagentSettings,

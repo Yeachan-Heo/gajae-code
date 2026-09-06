@@ -32,8 +32,10 @@ import {
 	$flag,
 	getAgentDbPath,
 	getAgentDir,
+	getAgentProfileAuthority,
 	getProjectDir,
 	logger,
+	normalizePathForComparison,
 	postmortem,
 	prompt,
 	Snowflake,
@@ -168,6 +170,7 @@ import {
 	unregisterOwnedRegistration,
 } from "../session/terminal-abort";
 import { formatNoModelsAvailableFallback } from "../setup/model-onboarding-guidance";
+import { getSkillFilesystemIdentity } from "../skill-state/canonical-skills";
 import {
 	type BuildSystemPromptResult,
 	buildSystemPrompt as buildSystemPromptInternal,
@@ -438,6 +441,8 @@ export interface CreateAgentSessionOptions {
 	cwd?: string;
 	/** Global config directory. Default: ~/.gjc/agent */
 	agentDir?: string;
+	/** Resolver-owned classification for `agentDir`; required when authority must survive HOME/config refreshes. */
+	profileAuthority?: "default" | "custom";
 	/** Spawns to allow. Default: "*" */
 	spawns?: string;
 
@@ -781,10 +786,11 @@ export async function discoverSkills(
  */
 export async function discoverContextFiles(
 	cwd?: string,
-	_agentDir?: string,
+	agentDir?: string,
 ): Promise<Array<{ path: string; content: string; depth?: number }>> {
 	return await loadContextFilesInternal({
 		cwd: cwd ?? getProjectDir(),
+		agentDir,
 	});
 }
 
@@ -821,6 +827,8 @@ export interface BuildSystemPromptOptions {
 	skills?: Skill[];
 	contextFiles?: Array<{ path: string; content: string }>;
 	cwd?: string;
+	agentDir?: string;
+	profileAuthority?: "default" | "custom";
 	appendPrompt?: string;
 	repeatToolDescriptions?: boolean;
 }
@@ -834,6 +842,8 @@ export interface BuildSystemPromptOptions {
 export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}): Promise<BuildSystemPromptResult> {
 	return await buildSystemPromptInternal({
 		cwd: options.cwd,
+		agentDir: options.agentDir,
+		profileAuthority: options.profileAuthority,
 		skills: options.skills,
 		contextFiles: options.contextFiles,
 		appendSystemPrompt: options.appendPrompt,
@@ -1112,14 +1122,14 @@ function buildMCPPromptCommands(manager: MCPManager): LoadedCustomCommand[] {
 function withEmbeddedDefaultGjcSkills(skills: Skill[]): Skill[] {
 	const byName = new Map<string, Skill>();
 	for (const skill of skills) {
-		const key = skill.name.toLowerCase();
+		const key = getSkillFilesystemIdentity(skill.name);
 		if (!byName.has(key)) byName.set(key, skill);
 	}
 	// The four public GJC workflow skills are a product invariant: even if a
 	// caller-supplied or filesystem skill shares a name, the bundled definition
 	// wins so workflow routing can never be silently hijacked.
 	for (const defaultSkill of getEmbeddedDefaultGjcSkills()) {
-		byName.set(defaultSkill.name.toLowerCase(), defaultSkill);
+		byName.set(getSkillFilesystemIdentity(defaultSkill.name), defaultSkill);
 	}
 	return [...byName.values()];
 }
@@ -1393,7 +1403,14 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	}
 	const cwd = options.cwd ?? getProjectDir();
 	const explicitMcpConfigPath = !isCanonicalSubSession && !options.mcpManager ? options.mcpConfigPath : undefined;
-	const agentDir = options.agentDir ?? getDefaultAgentDir();
+	const agentDir = options.agentDir ?? options.settings?.getAgentDir() ?? getDefaultAgentDir();
+	const profileAuthority =
+		options.profileAuthority ??
+		(options.agentDir !== undefined || options.settings !== undefined
+			? normalizePathForComparison(agentDir) !== normalizePathForComparison(getAgentDir())
+				? "custom"
+				: getAgentProfileAuthority()
+			: getAgentProfileAuthority());
 	const eventBus = options.eventBus ?? new EventBus();
 	const hasInjectedAuth = options.authStorage !== undefined || options.modelRegistry !== undefined;
 
@@ -1581,7 +1598,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		// session-context build, tool creation, MCP discovery, and extension discovery.
 		const contextFilesResultPromise = options.contextFiles
 			? Promise.resolve({ contextFiles: options.contextFiles, warnings: [] })
-			: logger.time("discoverContextFiles", loadContextFilesResultInternal, { cwd });
+			: logger.time("discoverContextFiles", loadContextFilesResultInternal, { cwd, agentDir, profileAuthority });
 		contextFilesResultPromise.catch(() => {});
 		const promptTemplatesPromise = options.promptTemplates
 			? Promise.resolve(options.promptTemplates)
@@ -1982,9 +1999,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			skills = withEmbeddedDefaultGjcSkills(options.skills);
 			skillWarnings = [];
 		} else if (settings.get("skills.enabled")) {
-			const skillsResult = await logger.time("loadSkills", loadSkills, {
+			const skillsResult = await logger.time("discoverSkills", loadSkills, {
 				...settings.getGroup("skills"),
 				agentDir,
+				profileAuthority,
 				cwd,
 				disabledExtensions: settings.get("disabledExtensions"),
 			});
@@ -2006,7 +2024,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			const rulesResult =
 				options.rules !== undefined
 					? { items: options.rules, warnings: undefined }
-					: await loadCapability<Rule>(ruleCapability.id, { cwd, agentDir, settings });
+					: await loadCapability<Rule>(ruleCapability.id, { cwd, agentDir, profileAuthority, settings });
 			const rulebookRules: Rule[] = [];
 			const alwaysApplyRules: Rule[] = [];
 			for (const rule of rulesResult.items) {
@@ -2334,7 +2352,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		 */
 		const applyRescopedReadState = async (to: string): Promise<void> => {
 			try {
-				const rediscovered = await loadContextFilesResultInternal({ cwd: to });
+				const rediscovered = await loadContextFilesResultInternal({ cwd: to, agentDir, profileAuthority });
 				contextFiles = rediscovered.contextFiles;
 			} catch (error) {
 				logger.warn("Failed to re-discover context files after session rescope", {
@@ -2375,6 +2393,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				return sessionManager.getCwd();
 			},
 			hasUI: options.hasUI ?? false,
+			profileAuthority,
 			workflowGateEligible: true,
 			enableLsp,
 			get hasEditTool() {
@@ -2693,6 +2712,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					}
 				: {}),
 			getSessionFile: () => sessionManager.getSessionFile() ?? null,
+			getSessionAgentDir: () => session?.getSessionAgentDir() ?? options.agentDir ?? settings.getAgentDir(),
 			getEvalKernelOwnerId: () => evalKernelOwnerId,
 			assertEvalExecutionAllowed: () => session?.assertEvalExecutionAllowed(),
 			trackEvalExecution: (execution, abortController) =>
@@ -3912,6 +3932,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				// Live cwd: the prompt is rebuilt after a rescope, and describing the
 				// retired launcher root there is what makes the model pick wrong paths.
 				cwd: getLiveCwd(),
+				agentDir,
+				profileAuthority,
 				skills,
 				contextFiles,
 				tools: promptTools,
@@ -4491,6 +4513,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 								const reloaded = await loadSkills({
 									...settings.getGroup("skills"),
 									agentDir,
+									profileAuthority,
 									cwd: reloadCwd,
 									disabledExtensions: settings.get("disabledExtensions"),
 								});

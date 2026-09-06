@@ -256,6 +256,12 @@ describe("customize doctor (#4288)", () => {
 		const cwd = await makeTempProject();
 		await makeSkill(path.join(cwd, ".gjc", "skills"), "fixture-loaded", "Loaded by startup");
 		await makeSkill(path.join(cwd, ".gjc", "skills"), "ultragoal", "Project copy of a bundled skill");
+		const aliasDir = path.join(cwd, ".gjc", "skills", "windows-alias");
+		await fs.mkdir(aliasDir, { recursive: true });
+		await fs.writeFile(
+			path.join(aliasDir, "SKILL.md"),
+			"---\nname: ralplan.\ndescription: Windows alias of a bundled skill\n---\n\n# Alias\n",
+		);
 		await makeSkill(path.join(cwd, ".claude", "skills"), "fixture-foreign", "Never loaded by startup");
 		await writeJson(path.join(cwd, ".gjc", "mcp.json"), {
 			mcpServers: { "fixture-connectable": { command: "true" } },
@@ -287,6 +293,10 @@ describe("customize doctor (#4288)", () => {
 			item => item.name === "ultragoal" && item.provider !== "bundled" && item.path.startsWith(cwd),
 		);
 		expect(ultragoalCopy).toMatchObject({ status: "shadowed", reason: "shadowed-by-precedence" });
+		const ralplanAlias = surface(report, "skill").items.find(
+			item => item.name === "ralplan." && item.provider !== "bundled",
+		);
+		expect(ralplanAlias).toMatchObject({ status: "shadowed", reason: "shadowed-by-precedence" });
 		const bundled = surface(report, "skill").items.filter(
 			item => item.provider === "bundled" && item.name === "ultragoal",
 		);

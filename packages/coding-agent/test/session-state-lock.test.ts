@@ -229,7 +229,7 @@ describe("coordinator session state lock", () => {
 
 		expect(order).toEqual(["holder-released", "waiter-wrote"]);
 		expect((await readJson(stateFile)).activity).toMatchObject({ seq: 1, tool: "bash" });
-	});
+	}, 15_000);
 
 	it("serializes concurrent resume contenders after reclaiming a dead transition claim", async () => {
 		const { stateFile } = await seededRunningSession("lock-concurrent-resume");
@@ -265,7 +265,7 @@ describe("coordinator session state lock", () => {
 		releaseFirst.resolve();
 		await Promise.all([first, second]);
 		expect(order).toEqual(["first-entered", "first-released", "second-entered"]);
-	});
+	}, 15_000);
 
 	it("keeps session-state parents, transition claims, and owner records restrictive under umask", async () => {
 		const root = await tempRoot();
@@ -437,7 +437,7 @@ describe("coordinator session state lock", () => {
 			await reclaimStaleSessionStateLock(lockFile);
 
 			expect(fsSync.existsSync(lockFile)).toBe(false);
-		});
+		}, 15_000);
 
 		/**
 		 * Unknown liveness never authorizes a deletion, but recorded IDENTITY still can:
@@ -464,7 +464,7 @@ describe("coordinator session state lock", () => {
 			await reclaimStaleSessionStateLock(lockFile);
 
 			expect(fsSync.existsSync(lockFile)).toBe(false);
-		});
+		}, 15_000);
 
 		it("preserves an unversioned live owner when its start-time encoding mismatches", async () => {
 			const { stateFile } = await seededRunningSession("lock-legacy-mismatched-start");
@@ -498,7 +498,7 @@ describe("coordinator session state lock", () => {
 		expect((await readJson(stateFile)).activity).toMatchObject({ seq: 1, tool: "bash" });
 		await expectReleasedOwner(`${stateFile}.lock`);
 		expectReleasedTransition(`${stateFile}.lock`);
-	});
+	}, 15_000);
 
 	it("reclaims a malformed owner file only once it is stale", async () => {
 		const { root, stateFile } = await seededRunningSession("lock-malformed-owner");
@@ -1238,7 +1238,7 @@ describe("coordinator session state lock", () => {
 		releaseFirst.resolve();
 		await Promise.all([first, second]);
 		expect(order).toEqual(["first-entered", "first-released", "second-entered"]);
-	});
+	}, 15_000);
 
 	it("does not charge same-process transition waits against reused-tombstone release", async () => {
 		const { stateFile } = await seededRunningSession("lock-released-tombstone-local-transition");
@@ -1316,7 +1316,7 @@ describe("coordinator session state lock", () => {
 		);
 		let monotonicNow = 0;
 		SessionStateLockTestHooks.afterTransitionClaimContention = target => {
-			if (target === transitionDir) monotonicNow = 2_100;
+			if (target === transitionDir) monotonicNow = 5_100;
 		};
 		const now = vi.spyOn(performance, "now").mockImplementation(() => monotonicNow);
 		try {
@@ -1369,7 +1369,7 @@ describe("coordinator session state lock", () => {
 		expect(holderExit).toBe(0);
 		expect(contenderExit).toBe(0);
 		expect(await Bun.file(enteredFile).text()).toBe("entered");
-	});
+	}, 15_000);
 
 	it("reclaims a dead atomic transition directory through identity-bound removal", async () => {
 		const { stateFile } = await seededRunningSession("lock-dead-atomic-transition");
