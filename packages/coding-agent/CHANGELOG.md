@@ -3,6 +3,7 @@
 ## [Unreleased]
 ### Fixed
 
+- Coordinator delegates recover a creation-WAL crash before the initial prompt claim without recreating the session or replaying compacted requests. Startup pin cleanup skips live observations without waiting on their caller-key locks, and revisits skipped pins so a surviving coordinator can clean up after a peer commits its response and crashes.
 - Disconnecting an MCP server during its initial connection now returns after cancelling the acquisition instead of waiting forever when an uncooperative transport ignores abort. The pool still owns and closes any late connection, retains cleanup failures for retry, and releases the manager's pending-cleanup fence after successful settlement (#5329).
 - SDK session routing now uses the Broker's endpoint timestamp comparison, accepting sub-millisecond representation differences while retaining device/inode and exact file-replacement checks. Valid live sessions no longer become unavailable solely because timestamp conversions round differently.
 - When every auto-compaction candidate fails, the reported error now leads with the first candidate's failure and lists each candidate that was tried with its own error. The chain starts at the session model and ends on a same-provider largest-context fallback, so surfacing only the final error named a model the user never chose (e.g. `openai-codex/gpt-5.4` on an `astra` preset session) and hid that their own model had already failed the same way.

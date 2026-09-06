@@ -313,6 +313,7 @@ interface CoordinatorServices {
 	afterCanonicalReportSafeResponse?: (sessionId: string, response: Record<string, unknown>) => void | Promise<void>;
 	/** Test barriers around delegate admission and outer response durability. */
 	afterDelegateAdmission?: (sessionId: string) => void | Promise<void>;
+	afterDelegateCreationWalCommitted?: (sessionId: string) => void | Promise<void>;
 	afterDelegateCreationCompleted?: () => void | Promise<void>;
 	beforeDelegateResponseCommit?: () => void | Promise<void>;
 	afterDelegateResponseCommit?: () => void | Promise<void>;
@@ -3375,8 +3376,8 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		await questionStateReady;
 		if (delegatePinRecoveryComplete) return;
 		delegatePinRecovery ??= reconcileCompletedDelegateResponsePins()
-			.then(() => {
-				delegatePinRecoveryComplete = true;
+			.then(complete => {
+				delegatePinRecoveryComplete = complete;
 			})
 			.finally(() => {
 				delegatePinRecovery = null;
@@ -6474,7 +6475,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		return released;
 	}
 
-	async function reconcileCompletedDelegateResponsePins(): Promise<void> {
+	async function reconcileCompletedDelegateResponsePins(): Promise<boolean> {
 		const roster = await readSchedulerRoster(questionPaths);
 		let persisted: string[];
 		try {
@@ -6490,6 +6491,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			]),
 		];
 		const failures: unknown[] = [];
+		let complete = true;
 		for (const sessionId of sessionIds) {
 			let transaction: CoordinatorSessionTransactionV1 | null;
 			try {
@@ -6502,16 +6504,32 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			for (const request of Object.values(transaction.requests.prompts)) {
 				if (request.delegate_response_pending !== true) continue;
 				const keyDigest = createHash("sha256").update(request.sdk_idempotency_key).digest("hex");
+				const file = path.join(namespaceDir, "idempotency", `${keyDigest}.json`);
 				try {
+					// Receipts are atomically replaced. An in-progress delegate may own
+					// its caller-key lock throughout observation; maintenance must not wait
+					// for it. Completed candidates still need a locked authoritative read.
+					const candidate = await readCoordinatorIdempotencyFile(file);
+					if (candidate.kind === "corrupt") throw new Error("delegate_response_receipt_corrupt");
+					if (candidate.kind !== "record" || candidate.value.state !== "completed") {
+						// A peer can commit and die before releasing this pin. Skip its
+						// live lock, but revisit the receipt on a later readiness call.
+						complete = false;
+						continue;
+					}
 					await withSessionStateLock(
 						path.join(namespaceDir, "idempotency-locks", `${keyDigest}.json`),
 						async () => {
-							const current = await readCoordinatorIdempotencyFile(
-								path.join(namespaceDir, "idempotency", `${keyDigest}.json`),
-							);
-							if (current.kind === "missing") return;
+							const current = await readCoordinatorIdempotencyFile(file);
+							if (current.kind === "missing") {
+								complete = false;
+								return;
+							}
 							if (current.kind === "corrupt") throw new Error("delegate_response_receipt_corrupt");
-							if (current.value.state !== "completed") return;
+							if (current.value.state !== "completed") {
+								complete = false;
+								return;
+							}
 							if (!(await releaseDelegateResponsePin(current.value.delegate_response_pin)))
 								throw new Error("delegate_response_pin_mismatch");
 						},
@@ -6522,6 +6540,20 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			}
 		}
 		if (failures.length > 0) throw new AggregateError(failures, "delegate_response_pin_recovery_incomplete");
+		return complete;
+	}
+
+	function hasInitialDelegatePromptAuthority(
+		transaction: CoordinatorSessionTransactionV1 | null,
+		request: CoordinatorSessionTransactionV1["recovery"]["initial_delegate_request"],
+	): boolean {
+		const pending = transaction?.recovery.initial_delegate_request;
+		return (
+			pending !== undefined &&
+			request !== undefined &&
+			pending.key_digest === request.key_digest &&
+			pending.request_digest === request.request_digest
+		);
 	}
 
 	async function claimCanonicalPrompt(
@@ -6531,6 +6563,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		idempotencyKey: string,
 		retainDelegateResponse = false,
 		requireExisting = false,
+		initialDelegateRequest?: CoordinatorSessionTransactionV1["recovery"]["initial_delegate_request"],
 	): Promise<string> {
 		await ensureQuestionTransaction(sessionId);
 		const keyDigest = createHash("sha256").update(`${idempotencyKey}\0${operation}`).digest("hex");
@@ -6551,7 +6584,8 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			}
 			// Check under the WAL lock as well as at the delegate boundary: an
 			// unpinned historical receipt could compact between those two reads.
-			if (requireExisting) throw new Error("terminal_uncertain");
+			const initialAuthority = hasInitialDelegatePromptAuthority(transaction, initialDelegateRequest);
+			if (requireExisting && !initialAuthority) throw new Error("terminal_uncertain");
 			const activeTurnId = transaction.canonical.queue.active_turn_id;
 			const anotherActiveTurn = Object.values(transaction.canonical.turns).some(turn =>
 				ACTIVE_TURN_STATUSES.has(turn.status as TurnStatus),
@@ -6611,6 +6645,9 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				created_at: now,
 				updated_at: now,
 			};
+			// This transaction replaces pre-dispatch authority with the pinned prompt
+			// reservation. Missing historical requests can never reuse that authority.
+			if (initialAuthority) delete transaction.recovery.initial_delegate_request;
 		});
 		return keyDigest;
 	}
@@ -8436,6 +8473,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 							let sessionId: string;
 							let session: Record<string, unknown>;
 							let creationKey: string | null = null;
+							let initialDelegateRequest: CoordinatorSessionTransactionV1["recovery"]["initial_delegate_request"];
 							if (reusedSessionId) {
 								sessionId = reusedSessionId;
 								const prior = await readSessionTransaction(questionPaths, sessionId);
@@ -8503,6 +8541,12 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 									return creation.request.safe_response;
 								}
 								creationKey = creation.keyDigest;
+								// claimProductionCreation has validated the caller key and all
+								// canonical arguments, including the prompt mode and workflow.
+								initialDelegateRequest = {
+									key_digest: creation.keyDigest,
+									request_digest: creation.request.request_digest,
+								};
 								if (creation.request.canonical_create_intent) {
 									delegateEffectStarted = true;
 									session = sessionFromCreationSnapshot(creation.request.canonical_create_intent.session);
@@ -8590,6 +8634,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 									await bindCreationRequest(questionPaths, creation.keyDigest, intent);
 									await commitCreationWal(questionPaths, creation.keyDigest, intent);
 								}
+								await services.afterDelegateCreationWalCommitted?.(sessionId);
 							}
 							const admit = async (): Promise<Record<string, unknown>> => {
 								await writeJsonFile(sessionFile(sessionId), session);
@@ -8598,7 +8643,12 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 									(await readCanonicalActiveTurn(sessionId));
 								const priorTransaction = await readSessionTransaction(questionPaths, sessionId);
 								const priorPrompt = priorTransaction?.requests.prompts[requestKey];
-								if (recovering && !priorPrompt) throw new Error("terminal_uncertain");
+								if (
+									recovering &&
+									!priorPrompt &&
+									!hasInitialDelegatePromptAuthority(priorTransaction, initialDelegateRequest)
+								)
+									throw new Error("terminal_uncertain");
 								if (priorPrompt && ["remote_started", "accepted", "completed"].includes(priorPrompt.phase))
 									delegateEffectStarted = true;
 								const reserved = priorPrompt?.coordinator_turn_id
@@ -8631,6 +8681,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 									idempotencyKey,
 									true,
 									recovering,
+									initialDelegateRequest,
 								);
 								if (reserved?.terminal_fence && !(await promptReceipt(sessionId, promptKey))) {
 									delegateEffectStarted = true;
