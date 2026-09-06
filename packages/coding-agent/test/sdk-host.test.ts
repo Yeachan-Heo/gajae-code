@@ -147,6 +147,54 @@ describe("SessionSdkHost", () => {
 		expect(unregisterAttempts).toBe(2);
 	});
 
+	test("does not fail shutdown when the session-index lock is held by a live broker", async () => {
+		const host = new SessionSdkHost({
+			sessionId: "contended-stop",
+			stateRoot: "/tmp/contended-stop",
+			token: "t",
+			sendFrame: () => "written",
+			onFrame: () => () => {},
+		});
+		await host.start();
+		await host.registerWithBroker({
+			register: () => {},
+			unregister: () => {
+				throw new Error("Failed to acquire lock for /tmp/index.jsonl after 600 attempts: held by pid 123 (live)");
+			},
+		});
+
+		await expect(host.stop({ allowLockContention: true })).resolves.toBe("stopped");
+		expect(host.started).toBe(false);
+	});
+
+	test("keeps lock contention retryable during session replacement", async () => {
+		let unregisterAttempts = 0;
+		const host = new SessionSdkHost({
+			sessionId: "replacement-stop",
+			stateRoot: "/tmp/replacement-stop",
+			token: "t",
+			sendFrame: () => "written",
+			onFrame: () => () => {},
+		});
+		await host.registerWithBroker({
+			register: () => {},
+			unregister: () => {
+				unregisterAttempts++;
+				if (unregisterAttempts === 1)
+					throw new Error(
+						"Failed to acquire lock for /tmp/index.jsonl after 600 attempts: held by pid 123 (live)",
+					);
+			},
+		});
+		await host.start();
+
+		await expect(host.stop()).rejects.toThrow("Failed to acquire lock");
+		expect(host.started).toBe(true);
+		expect(unregisterAttempts).toBe(1);
+		expect(await host.stop()).toBe("stopped");
+		expect(unregisterAttempts).toBe(2);
+	});
+
 	test("shares one broker unregister across concurrent stop callers", async () => {
 		let unsubscribeAttempts = 0;
 		let unregisterAttempts = 0;

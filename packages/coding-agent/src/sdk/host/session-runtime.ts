@@ -491,13 +491,13 @@ export class SessionSdkSessionRuntime {
 		}
 	}
 
-	async stop(): Promise<void> {
+	async stop(options: { allowLockContention?: boolean } = {}): Promise<void> {
 		this.#connectionDisposer?.();
 		this.#capabilitiesDisposer?.();
 		this.#malformedDisposer?.();
 		let hostError: unknown;
 		try {
-			await this.host.stop();
+			await this.host.stop(options);
 		} catch (error) {
 			hostError = error;
 		} finally {
@@ -5920,7 +5920,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				retiredLifecycleOwnerTimers.set(current, timer);
 			} else current.deadlineManager.clearAll();
 			current.disposeGate?.();
-			await current.runtime.stop();
+			await current.runtime.stop({ allowLockContention: cancelSkillRecovery });
 		} catch (error) {
 			// Keep the immutable owner available for a retry when transport teardown
 			// fails after quiescing. Clearing `active` before stop prevents a second
