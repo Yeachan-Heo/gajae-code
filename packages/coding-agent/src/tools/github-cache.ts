@@ -152,6 +152,26 @@ function evictExpired(db: Database, hardTtlMs: number): void {
  */
 const SWEEP_INTERVAL_MS = 60_000;
 let lastSweepAt = 0;
+const backgroundRefreshes = new Map<string, { generation: number; controller: AbortController }>();
+let backgroundRefreshGeneration = 0;
+const BACKGROUND_REFRESH_TIMEOUT_MS = 30_000;
+
+function cacheIdentityKey(
+	authKey: string,
+	repo: string,
+	kind: CacheKind,
+	number: number,
+	includeComments: boolean,
+): string {
+	return JSON.stringify([authKey, normalizeRepo(repo), kind, number, includeComments]);
+}
+
+function retireBackgroundRefresh(key: string): void {
+	const entry = backgroundRefreshes.get(key);
+	if (!entry) return;
+	entry.controller.abort();
+	backgroundRefreshes.delete(key);
+}
 
 function sweepIfDue(hardTtlMs: number): void {
 	const now = Date.now();
@@ -296,6 +316,12 @@ export function invalidate(
 	includeComments?: boolean,
 	authKey: string = DEFAULT_CACHE_AUTH_KEY,
 ): void {
+	if (includeComments === undefined) {
+		retireBackgroundRefresh(cacheIdentityKey(authKey, repo, kind, number, false));
+		retireBackgroundRefresh(cacheIdentityKey(authKey, repo, kind, number, true));
+	} else {
+		retireBackgroundRefresh(cacheIdentityKey(authKey, repo, kind, number, includeComments));
+	}
 	const db = openDb();
 	if (!db) return;
 	try {
@@ -342,6 +368,9 @@ export function resetForTests(): void {
 	cachedDb = null;
 	openAttempted = false;
 	lastSweepAt = 0;
+	for (const { controller } of backgroundRefreshes.values()) controller.abort();
+	backgroundRefreshes.clear();
+	backgroundRefreshGeneration += 1;
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -365,9 +394,10 @@ export interface CacheLookupOptions<T> {
 	 * must bypass persistent cache reads/writes.
 	 */
 	authKey?: string | null;
-	fetchFresh: () => Promise<FreshResult<T>>;
+	fetchFresh: (signal?: AbortSignal) => Promise<FreshResult<T>>;
 	settings?: Settings | undefined;
 	now?: number;
+	signal?: AbortSignal;
 }
 
 export type CacheStatus = "miss" | "fresh" | "stale" | "disabled";
@@ -448,22 +478,41 @@ function scheduleBackgroundRefresh<T>(
 	kind: CacheKind,
 	number: number,
 	includeComments: boolean,
-	fetchFresh: () => Promise<FreshResult<T>>,
+	fetchFresh: (signal?: AbortSignal) => Promise<FreshResult<T>>,
 ): void {
-	queueMicrotask(() => {
-		const promise = fetchFresh();
-		promise
-			.then(fresh => {
+	const key = cacheIdentityKey(authKey, repo, kind, number, includeComments);
+	if (backgroundRefreshes.has(key)) return;
+	const generation = backgroundRefreshGeneration;
+	const controller = new AbortController();
+	const entry = { generation, controller };
+	backgroundRefreshes.set(key, entry);
+	queueMicrotask(async () => {
+		const timeoutHandle = setTimeout(() => {
+			controller.abort(new Error("GitHub background refresh timed out"));
+			if (backgroundRefreshes.get(key) === entry) backgroundRefreshes.delete(key);
+			logger.debug("github cache: background refresh timed out", { repo, kind, number });
+		}, BACKGROUND_REFRESH_TIMEOUT_MS);
+		try {
+			const fresh = await fetchFresh(controller.signal);
+			if (
+				!controller.signal.aborted &&
+				backgroundRefreshes.get(key) === entry &&
+				backgroundRefreshGeneration === generation
+			) {
 				storeResult(authKey, repo, kind, number, includeComments, fresh, Date.now());
-			})
-			.catch(err => {
-				logger.debug("github cache: background refresh failed", {
-					err: String(err),
-					repo,
-					kind,
-					number,
-				});
+			}
+		} catch (err) {
+			controller.abort();
+			logger.debug("github cache: background refresh failed", {
+				err: String(err),
+				repo,
+				kind,
+				number,
 			});
+		} finally {
+			clearTimeout(timeoutHandle);
+			if (backgroundRefreshes.get(key) === entry) backgroundRefreshes.delete(key);
+		}
 	});
 }
 
@@ -473,9 +522,10 @@ export async function getOrFetchView<T>(options: CacheLookupOptions<T>): Promise
 	const authKey = options.authKey === undefined ? DEFAULT_CACHE_AUTH_KEY : options.authKey;
 
 	if (!ttl.enabled || authKey === null) {
-		const fresh = await options.fetchFresh();
+		const fresh = await options.fetchFresh(options.signal);
 		return { ...fresh, status: "disabled", fetchedAt: now };
 	}
+	const cacheKey = cacheIdentityKey(authKey, options.repo, options.kind, options.number, options.includeComments);
 
 	// Enforce the *configured* hard TTL against on-disk rows. This is what
 	// makes `github.cache.hardTtlSec` a real retention cap rather than a soft
@@ -496,6 +546,7 @@ export async function getOrFetchView<T>(options: CacheLookupOptions<T>): Promise
 			// Past hard TTL: drop the row eagerly so the on-disk exposure window
 			// is bounded even if `fetchFresh()` then fails (network down, gh
 			// auth lapse, etc.) and we never get to overwrite it.
+			retireBackgroundRefresh(cacheKey);
 			invalidate(options.repo, options.kind, options.number, options.includeComments, authKey);
 		} else if (age <= ttl.softMs) {
 			return {
@@ -524,8 +575,9 @@ export async function getOrFetchView<T>(options: CacheLookupOptions<T>): Promise
 		}
 	}
 
-	const fresh = await options.fetchFresh();
+	const fresh = await options.fetchFresh(options.signal);
 	const fetchedAt = Date.now();
+	retireBackgroundRefresh(cacheKey);
 	storeResult(authKey, options.repo, options.kind, options.number, options.includeComments, fresh, fetchedAt);
 	return { ...fresh, status: "miss", fetchedAt };
 }

@@ -308,6 +308,7 @@ export function formatDiagnostics(
 	// Count total diagnostics for "... X more" calculation
 	const totalParsedDiags = files.reduce((sum, [, diags]) => sum + diags.length, 0);
 	const totalDiags = totalParsedDiags + unparsed.length;
+	const willShowAllRemaining = totalDiags <= maxDiags;
 
 	// Helper to check if this is the very last item in the tree
 	const isTreeEnd = (fileIdx: number, diagIdx: number | null, unparsedIdx: number | null): boolean => {
@@ -329,9 +330,6 @@ export function formatDiagnostics(
 	for (let fi = 0; fi < files.length && diagsShown < maxDiags; fi++) {
 		const [filePath, diagnostics] = files[fi];
 		// File is "last" only if no more files AND no unparsed AND we'll show all diags AND no "... X more"
-		const remainingDiagsInFile = diagnostics.length;
-		const remainingDiagsAfter = files.slice(fi + 1).reduce((sum, [, d]) => sum + d.length, 0) + unparsed.length;
-		const willShowAllRemaining = diagsShown + remainingDiagsInFile + remainingDiagsAfter <= maxDiags;
 		const isLastFileNode = fi === files.length - 1 && unparsed.length === 0 && willShowAllRemaining;
 		const fileBranch = isLastFileNode ? theme.tree.last : theme.tree.branch;
 

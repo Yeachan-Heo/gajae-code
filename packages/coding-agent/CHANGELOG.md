@@ -14,6 +14,8 @@
 - SDK live-attach streams preserve producer order across text deltas, final messages, and tool events even when asynchronous extension handlers are slow, without replaying or broadcasting turn content. Content observed while the correlated `agent_start` is still being durably recorded is held and released after the start frame, so no consumer sees turn content before the turn it belongs to; held content is delivered only to the owners that held the run when it was produced, and the hold is bounded (256 events, oldest dropped with one warning) so a wedged start write can neither invert the start/content boundary nor accumulate a whole response in memory.
 - SDK prompts consumed together after queued steering is interrupted now each receive correlated starts, streamed content, and one terminal, without adopting unrelated pending submissions.
 
+- Tool hot paths avoid overlap-table allocations for equal/append-only ACP output, redundant UTF-8 tail previews, repeated diagnostics suffix scans, and duplicate background GitHub-cache refreshes. Job polling now releases watches and timers when a progress callback throws.
+
 ## [0.16.4] - 2026-09-05
 ### Added
 

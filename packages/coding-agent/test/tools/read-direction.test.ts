@@ -6,7 +6,7 @@ import * as path from "node:path";
 import { Settings } from "../../src/config/settings";
 import type { ToolSession } from "../../src/tools";
 import { formatOutputNotice } from "../../src/tools/output-meta";
-import { ReadTool } from "../../src/tools/read";
+import { ReadTool, streamLinesFromFile } from "../../src/tools/read";
 import { pathDefault, type ReadRoute, resolveEffectiveDirection } from "../../src/tools/read-internals";
 
 function textOf(result: { content: Array<{ type: string; text?: string }> }): string {
@@ -59,6 +59,26 @@ beforeEach(async () => {
 
 afterEach(async () => {
 	await fs.rm(tempDir, { recursive: true, force: true });
+});
+
+test("tail streaming preserves ordinary and oversized UTF-8 line suffixes", async () => {
+	for (const oversized of [false, true]) {
+		const file = path.join(tempDir, `utf8-${oversized}.txt`);
+		const lastLine = `${"한".repeat(oversized ? 20_000 : 10)}끝`;
+		await Bun.write(file, `first\n${lastLine}`);
+		const result = await streamLinesFromFile(file, 0, 50, 101, null, undefined, "tail");
+		if (oversized) {
+			expect(result.tailPartial).toEqual({
+				text: `${"한".repeat(32)}끝`,
+				bytes: 99,
+				sourceIndex: 1,
+				sourceLineBytes: 60_003,
+			});
+		} else {
+			expect(result.lines).toEqual(["first", lastLine]);
+			expect(result.tailPartial).toBeUndefined();
+		}
+	}
 });
 
 const routes: ReadRoute[] = [
