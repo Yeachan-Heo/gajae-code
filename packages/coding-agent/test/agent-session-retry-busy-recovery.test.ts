@@ -193,6 +193,65 @@ describe("AgentSession auto-retry busy recovery", () => {
 		});
 	});
 
+	it("does not wedge when auto_retry_end extension delivery rejects", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected bundled Anthropic test model to exist");
+
+		const mock = createMockModel({
+			responses: [
+				{ throw: "503 service unavailable: overloaded_error retry-after-ms=5" },
+				{ content: ["retry recovered"] },
+				{ content: ["same session accepted the next prompt"] },
+			],
+		});
+		const agent = new Agent({
+			getApiKey: provider => `${provider}-test-key`,
+			initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: mock.stream,
+		});
+		let retryEndDeliveries = 0;
+		const extensionRunner = {
+			emitBeforeAgentStart: async () => undefined,
+			hasHandlers: (eventType: string) => eventType === "auto_retry_end",
+			emit: async (event: { type: string }) => {
+				if (event.type !== "auto_retry_end") return;
+				retryEndDeliveries++;
+				throw new Error("auto_retry_end handler failed");
+			},
+		} as never;
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"retry.baseDelayMs": 5,
+			"retry.maxDelayMs": 5_000,
+		});
+		settings.setModelRole("default", `${model.provider}/${model.id}`);
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings,
+			modelRegistry,
+			extensionRunner,
+		});
+
+		await session.prompt("provider failure before successful retry");
+		await session.waitForIdle();
+
+		expect(retryEndDeliveries).toBe(1);
+		expect(session.isRetrying).toBe(false);
+		expect(session.isStreaming).toBe(false);
+
+		await session.prompt("same-session follow-up");
+		await session.waitForIdle();
+
+		expect(mock.calls).toHaveLength(3);
+		expect(session.isStreaming).toBe(false);
+		expect(session.agent.state.messages.at(-1)).toMatchObject({
+			role: "assistant",
+			content: [{ type: "text", text: "same session accepted the next prompt" }],
+			stopReason: "stop",
+		});
+	});
+
 	it("recovers a later retryable error normally after a prior retry was abandoned", async () => {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
 		if (!model) throw new Error("Expected bundled Anthropic test model to exist");
