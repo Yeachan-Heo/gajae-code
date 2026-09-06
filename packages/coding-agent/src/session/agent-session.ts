@@ -790,6 +790,7 @@ type AgentEndSessionEvent = Extract<AgentEvent, { type: "agent_end" }> & {
 	readonly silentAbort?: true;
 	readonly ttsrAbort?: true;
 	readonly terminalPersistenceFailed?: true;
+	readonly terminalProjectionMatched?: boolean;
 };
 
 type MessageEndSessionEvent = Extract<AgentEvent, { type: "message_end" }> & {
@@ -3094,7 +3095,11 @@ export class AgentSession {
 
 	// Background-channel IRC exchanges queued while the recipient was streaming.
 	// Drained into history (via emitExternalEvent) once the recipient becomes idle.
-	#pendingBackgroundExchanges: CustomMessage[][] = [];
+	#pendingBackgroundExchanges: Array<{
+		messages: CustomMessage[];
+		sessionId: string;
+		sessionIdentityEpoch: number;
+	}> = [];
 	#scheduledBackgroundExchangeFlush = false;
 	// Agent identity + registry for IRC relay forwarding to the main session UI.
 	#agentId: string | undefined;
@@ -3717,8 +3722,8 @@ export class AgentSession {
 		// injects via appendCustomMessageEntry), so this fences external entrants —
 		// prompt/sendUserMessage/steer/follow-up/triggerTurn all funnel here — without
 		// blocking the handoff's own work or the exempt auto-maintenance owner.
-		if (kind === "prompt" && this.#handoffTransitionActive) {
-			throw Object.assign(new AgentBusyError("Cannot start a turn while a handoff is in progress."), {
+		if (kind === "prompt" && this.#sessionTransitionKind !== undefined) {
+			throw Object.assign(new AgentBusyError("Cannot start a turn while a session transition is in progress."), {
 				code: "busy",
 			});
 		}
@@ -3760,8 +3765,8 @@ export class AgentSession {
 			}
 			// Re-check the handoff fence after activation: a prompt queued before the
 			// transition began must not start once the fence is up.
-			if (kind === "prompt" && this.#handoffTransitionActive) {
-				throw Object.assign(new AgentBusyError("Cannot start a turn while a handoff is in progress."), {
+			if (kind === "prompt" && this.#sessionTransitionKind !== undefined) {
+				throw Object.assign(new AgentBusyError("Cannot start a turn while a session transition is in progress."), {
 					code: "busy",
 				});
 			}
@@ -6394,11 +6399,11 @@ export class AgentSession {
 	}
 
 	#admitExternalAgentEvent(event: AgentEvent): boolean {
+		if (this.#externalIngressSealed) return false;
 		if (this.#sessionOwnedExternalEvents.delete(event)) {
 			this.#trustedExternalEventsAfterAgentAdmission.add(event);
 			return true;
 		}
-		if (this.#externalIngressSealed) return false;
 		const scope = (event as AgentEvent & { scope?: AttemptScope }).scope;
 		if (!scope) return this.#sessionIdentityEpoch === 0;
 		const key = this.#attemptScopeKey(scope);
@@ -6566,6 +6571,13 @@ export class AgentSession {
 			event.type === "agent_end"
 				? [...event.messages].reverse().find((message): message is AssistantMessage => message.role === "assistant")
 				: undefined;
+		if (event.type === "agent_end" && provisionalAssistant) {
+			Object.defineProperty(event, "terminalProjectionMatched", {
+				value:
+					provisionalAttemptMatches && provisionalAssistant.sessionIdentityEpoch === this.#sessionIdentityEpoch,
+				enumerable: true,
+			});
+		}
 		const orphanAssistant =
 			event.type === "agent_end" &&
 			event.stopReason !== "maintenance" &&
@@ -6866,13 +6878,14 @@ export class AgentSession {
 						!(error instanceof SessionNearLimitAppendError && error.entryRetained)
 					) {
 						Object.defineProperty(event, "terminalPersistenceFailed", { value: true, enumerable: true });
-						this.#terminalPersistenceRecovery = {
+						this.#terminalPersistenceRecovery ??= {
 							message: event.message,
 							entryId: error instanceof SessionAppendPersistenceError ? error.entryId : undefined,
 							sessionId: this.sessionId,
 							sessionIdentityEpoch: this.#sessionIdentityEpoch,
 						};
 						this.agent.discardRejectedAssistantEvent(event.message);
+						this.agent.abort();
 						this.emitNotice(
 							"error",
 							"Assistant output could not be committed to session history. Reconcile session storage before continuing.",
@@ -12293,6 +12306,13 @@ export class AgentSession {
 		} finally {
 			if (this.#terminalPersistenceRecoveryPromise === task) this.#terminalPersistenceRecoveryPromise = undefined;
 		}
+	}
+
+	#assertTerminalPersistenceSettledForHistoryMutation(): void {
+		if (!this.#terminalPersistenceRecovery) return;
+		throw Object.assign(new Error("Reconcile terminal persistence before rewriting session history."), {
+			code: "session_persistence_blocked",
+		});
 	}
 
 	async #promptInternal(
@@ -17814,6 +17834,7 @@ export class AgentSession {
 		overThreshold = false,
 		options?: { commitGate?: (actual: { prunedCount: number; tokensSaved: number }) => boolean },
 	): Promise<ToolOutputPruneResult | undefined> {
+		this.#assertTerminalPersistenceSettledForHistoryMutation();
 		const branchEntries = this.sessionManager.getBranch();
 		const artifactManager = await this.sessionManager.ensureArtifactManager();
 		// Over-threshold callers have already proven tool-output savings before entering
@@ -18189,6 +18210,7 @@ export class AgentSession {
 	 * @param options Optional callbacks for completion/error handling
 	 */
 	async compact(customInstructions?: string, options?: CompactOptions): Promise<CompactionResult> {
+		this.#assertTerminalPersistenceSettledForHistoryMutation();
 		this.#assertSessionAdmissionOpen();
 		// Serialize with every other session-identity transition via the shared lease
 		// (bidirectional mutual exclusion with handoff/new/switch/branch/clear/fork/
@@ -19300,6 +19322,7 @@ export class AgentSession {
 	}
 
 	async #applyRewind(report: string): Promise<void> {
+		this.#assertTerminalPersistenceSettledForHistoryMutation();
 		const checkpointState = this.#checkpointState;
 		if (!checkpointState) {
 			return;
@@ -23698,7 +23721,11 @@ export class AgentSession {
 	}
 
 	#queueBackgroundExchangeInjection(messages: CustomMessage[], options?: { deferFlush?: boolean }): void {
-		this.#pendingBackgroundExchanges.push(messages);
+		this.#pendingBackgroundExchanges.push({
+			messages,
+			sessionId: this.sessionId,
+			sessionIdentityEpoch: this.#sessionIdentityEpoch,
+		});
 		if (!options?.deferFlush) this.#flushOrSchedulePendingBackgroundExchanges();
 	}
 
@@ -23738,7 +23765,8 @@ export class AgentSession {
 		const batches = this.#pendingBackgroundExchanges;
 		this.#pendingBackgroundExchanges = [];
 		for (const batch of batches) {
-			for (const msg of batch) {
+			if (batch.sessionId !== this.sessionId || batch.sessionIdentityEpoch !== this.#sessionIdentityEpoch) continue;
+			for (const msg of batch.messages) {
 				// emitExternalEvent on message_end appends to agent state and dispatches
 				// to all session listeners, which in turn handle TUI rendering and
 				// sessionManager persistence via #handleAgentEvent.

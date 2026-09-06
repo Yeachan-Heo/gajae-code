@@ -1098,6 +1098,7 @@ export class EventController {
 	}
 
 	async #handleAgentEnd(event: Extract<AgentSessionEvent, { type: "agent_end" }>): Promise<void> {
+		if (event.terminalProjectionMatched === false && this.ctx.streamingComponent) return;
 		const orphanComponent = this.ctx.streamingComponent;
 		const orphanMessage = this.ctx.streamingMessage?.role === "assistant" ? this.ctx.streamingMessage : undefined;
 		if (orphanComponent && orphanMessage && event.terminalPersistenceFailed !== true) {
