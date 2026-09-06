@@ -718,7 +718,7 @@ export class DiscordNotificationDaemon {
 		endpointGeneration: number,
 		attachmentAuthorityId?: string,
 	): Promise<DiscordConversation | undefined> {
-		const record = await this.#bySession(sessionId);
+		let record = await this.#bySession(sessionId);
 		if (!record?.threadId || record.state === "closed") return undefined;
 		if (
 			attachmentAuthorityId !== undefined &&
@@ -732,6 +732,16 @@ export class DiscordNotificationDaemon {
 			return undefined;
 		}
 		await this.#requireLiveBinding(sessionId, endpointGeneration, attachmentAuthorityId);
+		const current = await this.#bySession(sessionId);
+		if (
+			!current?.threadId ||
+			current.threadId !== record.threadId ||
+			current.state !== record.state ||
+			current.endpointGeneration !== record.endpointGeneration ||
+			!recordAcceptsAuthority(current, attachmentAuthorityId)
+		)
+			return undefined;
+		record = current;
 		const resumeOccurrenceId = randomUUID();
 		const effectIncarnationId = backfilledEffectIncarnationId(record);
 		const resuming = await this.#replace(record, {
