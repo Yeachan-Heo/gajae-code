@@ -91,7 +91,8 @@ function fixture(real = false) {
 		chatContainer,
 		pendingTools: new Map(),
 		settings: { get: () => true },
-		session: {},
+		session: { agent: { appendMessage: vi.fn() } },
+		sessionManager: { appendMessage: vi.fn() },
 		recordVisibleTranscriptMutation: vi.fn(),
 	} as unknown as InteractiveModeContext;
 	const controller = new EventController(ctx);
@@ -602,9 +603,10 @@ describe("assistant text frame preparation", () => {
 					isCompacting: false,
 					isStreaming: false,
 					getLastAssistantMessage: vi.fn(() => undefined),
-					agent: { state: { messages: [] } },
+					agent: { appendMessage: vi.fn(), state: { messages: [] } },
 				} as never;
 				f.ctx.sessionManager = {
+					appendMessage: vi.fn(),
 					getSessionName: vi.fn(() => ""),
 					getCwd: vi.fn(() => process.cwd()),
 				} as never;

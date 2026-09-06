@@ -1556,28 +1556,40 @@ export class InteractiveMode implements InteractiveModeContext {
 	}
 
 	rebuildChatFromMessages(policy: TranscriptRebuildPolicy): void {
-		const preservedStreamingComponent =
+		const preservedStreamingAssistant = this.#detachStreamingAssistantForRebuild(policy);
+		prepareTranscriptRebuild(this.ui, policy);
+		this.resetAssistantTextPresentation();
+		this.chatContainer.clear();
+		const context = this.session.buildDisplaySessionContext();
+		this.renderSessionContext(context);
+		this.#restoreStreamingAssistantAfterRebuild(preservedStreamingAssistant);
+	}
+
+	#detachStreamingAssistantForRebuild(
+		policy: TranscriptRebuildPolicy,
+	): { component: AssistantMessageComponent; message: AssistantMessage } | undefined {
+		const component =
 			policy === "reconcile-same-transcript" &&
 			this.streamingComponent &&
 			this.streamingMessage &&
 			this.chatContainer.hasLiveChild(this.streamingComponent)
 				? this.streamingComponent
 				: undefined;
-		const preservedStreamingMessage = preservedStreamingComponent ? this.streamingMessage : undefined;
-		prepareTranscriptRebuild(this.ui, policy);
+		if (!component || !this.streamingMessage) return undefined;
 		// A live provider response is not persisted until message_end. Detach it before
-		// clear() so reconcile rebuilds do not dispose the owner of pending text frames.
-		if (preservedStreamingComponent) this.chatContainer.detachChild(preservedStreamingComponent);
-		this.resetAssistantTextPresentation();
-		this.chatContainer.clear();
-		const context = this.session.buildDisplaySessionContext();
-		this.renderSessionContext(context);
-		if (preservedStreamingComponent && preservedStreamingMessage) {
-			this.streamingComponent = preservedStreamingComponent;
-			this.streamingMessage = preservedStreamingMessage;
-			addChatChild(this, preservedStreamingComponent);
-			this.#eventController.rebindAssistantTextPresentation();
-		}
+		// clear() so same-transcript rebuilds cannot dispose pending text-frame ownership.
+		this.chatContainer.detachChild(component);
+		return { component, message: this.streamingMessage };
+	}
+
+	#restoreStreamingAssistantAfterRebuild(
+		preserved: { component: AssistantMessageComponent; message: AssistantMessage } | undefined,
+	): void {
+		if (!preserved) return;
+		this.streamingComponent = preserved.component;
+		this.streamingMessage = preserved.message;
+		addChatChild(this, preserved.component);
+		this.#eventController.rebindAssistantTextPresentation();
 	}
 
 	#sanitizeTodoText(text: string): string {
@@ -2179,11 +2191,13 @@ export class InteractiveMode implements InteractiveModeContext {
 
 	rebuildInitialMessages(
 		policy: TranscriptRebuildPolicy,
-		prebuiltContext?: SessionContext,
+		rebuiltContext?: SessionContext,
 		options?: { preserveExistingChat?: boolean },
 	): void {
+		const preservedStreamingAssistant = this.#detachStreamingAssistantForRebuild(policy);
 		prepareTranscriptRebuild(this.ui, policy);
-		this.#uiHelpers.renderInitialMessages(prebuiltContext, options);
+		this.#uiHelpers.renderInitialMessages(rebuiltContext, options);
+		this.#restoreStreamingAssistantAfterRebuild(preservedStreamingAssistant);
 	}
 	renderInitialMessages(prebuiltContext?: SessionContext, options?: { preserveExistingChat?: boolean }): void {
 		this.#uiHelpers.renderInitialMessages(prebuiltContext, options);
