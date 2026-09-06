@@ -3746,10 +3746,6 @@ export class AgentSession {
 			);
 		}
 		this.#externalIngressSealed = true;
-		this.agent.abort();
-		this.#promptGeneration++;
-		this.#promptPreflightAbortController.abort();
-		this.#promptPreflightAbortController = new AbortController();
 		this.#sessionTransitionKind = kind;
 		this.#coordinatorPersistGeneration += 1;
 	}
@@ -7262,11 +7258,14 @@ export class AgentSession {
 				!unadmittedTerminalAssistant ||
 				getSessionMessageEntryId(unadmittedTerminalAssistant) === undefined
 			) {
-				const recoveredAssistant: AssistantMessage = unadmittedTerminalAssistant ?? {
-					...orphanAssistant!.message,
-					stopReason: event.stopReason === "cancelled" ? "aborted" : orphanAssistant!.message.stopReason,
-					...(silentTerminal || ttsrTerminal ? { errorMessage: SILENT_ABORT_MARKER } : {}),
-				};
+				const recoveredAssistant: AssistantMessage = structuredClone(
+					unadmittedTerminalAssistant ?? {
+						...orphanAssistant!.message,
+						stopReason: event.stopReason === "cancelled" ? "aborted" : orphanAssistant!.message.stopReason,
+						...(silentTerminal || ttsrTerminal ? { errorMessage: SILENT_ABORT_MARKER } : {}),
+					},
+				);
+				recoveredAssistant.content = recoveredAssistant.content.filter(block => block.type !== "toolCall");
 				if (
 					recoveredAssistant.stopReason === "aborted" &&
 					(silentTerminal || ttsrTerminal) &&
@@ -7305,8 +7304,15 @@ export class AgentSession {
 					}
 				}
 				if (!persistenceFailed) {
-					if (!this.agent.state.messages.includes(recoveredAssistant))
-						this.agent.appendMessage(recoveredAssistant);
+					const publishedAssistant = terminalAssistant ?? recoveredAssistant;
+					if (terminalAssistant) {
+						terminalAssistant.content = recoveredAssistant.content;
+						terminalAssistant.stopReason = recoveredAssistant.stopReason;
+						terminalAssistant.errorMessage = recoveredAssistant.errorMessage;
+						transferSessionMessageIdentity([recoveredAssistant], [terminalAssistant]);
+					}
+					if (!this.agent.state.messages.includes(publishedAssistant))
+						this.agent.appendMessage(publishedAssistant);
 					if (!terminalAssistant) event.messages.push(recoveredAssistant);
 					const presentationMessage =
 						orphanAssistant?.presentationMessage ??
@@ -7318,8 +7324,8 @@ export class AgentSession {
 						transferSessionMessageIdentity([recoveredAssistant], [presentationMessage]);
 						this.agent.discardRejectedAssistantEvent(presentationMessage);
 					}
-					this.#lastAssistantMessage = recoveredAssistant;
-					this.#lastAssistantAdmissionByMessage.set(recoveredAssistant, canonicalAdmission);
+					this.#lastAssistantMessage = publishedAssistant;
+					this.#lastAssistantAdmissionByMessage.set(publishedAssistant, canonicalAdmission);
 				}
 				if (silentTerminal) {
 					this.#planCompactAbortPending = false;
@@ -12995,6 +13001,10 @@ export class AgentSession {
 				this.agent.replaceMessages(this.sessionManager.buildSessionContext().messages, {
 					historyRewrite: { reason: "terminal-persistence-recovery", preserveSeededPrefix: true },
 				});
+				if (recovery.attemptScopeKey !== undefined) {
+					this.#currentSessionIdentityAttemptScopeKeys.delete(recovery.attemptScopeKey);
+					this.#retiredSessionIdentityAttemptScopeKeys.add(recovery.attemptScopeKey);
+				}
 				this.#terminalPersistenceRecovery = undefined;
 				this.emitNotice(
 					"info",
@@ -22623,6 +22633,7 @@ export class AgentSession {
 								await restoreOwnedTransition();
 								return;
 							}
+							this.#assertNoSessionTransition();
 							const continuation = this.agent.continue({
 								...this.#managedFallbackPromptOptions(),
 								transientRecoveryMessage: this.#escapedNonAsciiRecoveryMessage(),
