@@ -308,6 +308,13 @@ describe("AgentSession silent-abort marker stamping", () => {
 			messages: [lateFinal],
 			stopReason: "completed",
 			scope: clonedScope,
+			disownedSteering: [
+				{
+					role: "user",
+					content: [{ type: "text", text: "must not rearm in successor" }],
+					timestamp: Date.now(),
+				},
+			],
 		};
 		session.agent.emitExternalEvent(lateTerminal);
 		const unscopedLate = makeStoppedAssistantMessage("late unscoped final");
@@ -324,6 +331,8 @@ describe("AgentSession silent-abort marker stamping", () => {
 		expect(session.agent.state.messages).not.toContain(lateFinal);
 		expect(session.agent.state.messages).not.toContain(unscopedLate);
 		expect(session.agent.state.streamMessage).toBeNull();
+		expect(session.agent.snapshotSteering()).toHaveLength(0);
+		expect(session.agent.snapshotFollowUp()).toHaveLength(0);
 		expect(
 			session
 				.buildDisplaySessionContext()
@@ -364,12 +373,31 @@ describe("AgentSession silent-abort marker stamping", () => {
 		expect((terminal as Extract<AgentSessionEvent, { type: "agent_end" }>).terminalPersistenceFailed).toBe(true);
 		expect(terminal.messages).toHaveLength(0);
 		expect(session.agent.state.messages.some(message => message === partial)).toBe(false);
-		vi.spyOn(session.sessionManager, "recoverPersistenceFailure").mockRejectedValueOnce(
-			new Error("still unreconciled"),
-		);
+		expect(session.agent.state.streamMessage).toBeNull();
+		expect(() => session.newSession()).toThrow(expect.objectContaining({ code: "session_persistence_blocked" }));
+		const recovery = vi
+			.spyOn(session.sessionManager, "recoverPersistenceFailure")
+			.mockRejectedValueOnce(new Error("still unreconciled"));
 		await expect(session.prompt("must remain fenced")).rejects.toMatchObject({
 			code: "session_persistence_blocked",
 		});
+		await Promise.all([
+			session.runWithPromptAdmissionForTests(async () => {}),
+			session.runWithPromptAdmissionForTests(async () => {}),
+		]);
+		expect(recovery).toHaveBeenCalledTimes(2);
+		expect(
+			events.filter(event => event.type === "notice" && event.source === "terminal-persistence-recovered"),
+		).toHaveLength(1);
+		expect(
+			session
+				.buildDisplaySessionContext()
+				.messages.filter(
+					message =>
+						message.role === "assistant" &&
+						message.content.some(content => content.type === "text" && content.text === "unpersisted partial"),
+				),
+		).toHaveLength(1);
 	});
 
 	it("A3: flag set + non-aborted message_end does NOT consume the flag", async () => {
