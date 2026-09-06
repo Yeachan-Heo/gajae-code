@@ -5644,7 +5644,10 @@ export class AuthStorage {
 	 * and get a best-effort token. For GitHub Copilot we preserve enterprise
 	 * routing metadata so discovery can hit the correct host.
 	 */
-	async peekApiKey(provider: string, options?: Pick<AuthApiKeyOptions, "owner">): Promise<string | undefined> {
+	async peekApiKey(
+		provider: string,
+		options?: Pick<AuthApiKeyOptions, "owner"> & { sessionId?: string },
+	): Promise<string | undefined> {
 		provider = resolveOAuthStorageProvider(provider);
 		const runtimeKey = this.#runtimeOverrides.get(provider);
 		if (runtimeKey) return runtimeKey;
@@ -5656,7 +5659,7 @@ export class AuthStorage {
 		const selectedCredential = this.#resolveSelectedStoredCredential(
 			provider,
 			options?.owner ? { owner: options.owner } : undefined,
-			undefined,
+			options?.sessionId,
 		);
 		if (configKey) {
 			// Env-sourced (`apiKeyEnv`) override: same precedence as getApiKey —
@@ -5683,6 +5686,10 @@ export class AuthStorage {
 			}
 			return undefined;
 		}
+		// A hard selector is an identity boundary. If its selected row cannot
+		// provide a current token, discovery must not continue into the shared
+		// credential pool and silently query another account's catalog.
+		if (this.#getCredentialSelector(provider, undefined, options?.sessionId)) return undefined;
 
 		const attemptedApiKeyIndices = new Set<number>();
 		for (;;) {

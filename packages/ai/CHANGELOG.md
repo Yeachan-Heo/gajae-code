@@ -26,6 +26,10 @@
 - Maintenance reasoning now fails closed for Anthropic models routed through an unverified custom endpoint and for raw reasoning-enabled models without thinking metadata. This prevents unsupported thinking controls and avoids a synchronous missing-metadata crash before provider wire transformation.
 - The auth-gateway OpenAI Responses and Chat Completions encoders now emit only the `call_id` half of a Codex/Responses compound tool-call id (`call_…|fc_…`) on the wire. The compound encoding is gjc-internal replay state; a downstream OpenAI-format client that echoed it back truncated it at its own 64-character limit and every chained tool turn was then rejected with `400 No tool output found for function call`. The item id still travels as the Responses item `id`.
 
+### Fixed
+
+- Credential-scoped model discovery now peeks the OAuth account selected for that session instead of falling back to unscoped pool ranking. An expired hard-pinned token returns unavailable rather than querying another account's catalog, while AUTO and callers without a scope retain their existing selection behavior.
+
 ## [0.16.4] - 2026-09-05
 
 ### Added
