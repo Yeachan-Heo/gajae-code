@@ -1840,7 +1840,9 @@ export class Agent {
 		this.#observeMainAttemptScope(scope);
 		const handle: AttemptRunHandle = { logicalRunId, scope };
 		this.#runHandles.set(logicalRunId, handle);
-		this.#runScopes.set(logicalRunId, new Set([scope]));
+		const logicalRunScopes = this.#runScopes.get(logicalRunId) ?? new Set<AttemptScope>();
+		logicalRunScopes.add(scope);
+		this.#runScopes.set(logicalRunId, logicalRunScopes);
 		options?.onRunAccepted?.(handle, {
 			consumedQueuedMessages: options.consumedQueuedMessages ?? [],
 		});
