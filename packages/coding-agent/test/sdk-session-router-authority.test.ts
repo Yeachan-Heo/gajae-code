@@ -2812,7 +2812,7 @@ describe("SessionRouter dispatch authority", () => {
 	});
 
 	for (const delta of [-0.000244140625, 0.000244140625]) {
-		test(`endpoint rounding difference ${delta} permits attachment and maintenance, not replacement`, async () => {
+		test(`identity-less endpoint rounding difference ${delta} fails closed`, async () => {
 			const fixture = await routerFixture({ start: false });
 			const timestamp = new Date(1_700_000_000_000);
 			await fsPromises.utimes(fixture.endpointFile, timestamp, timestamp);
@@ -2820,20 +2820,8 @@ describe("SessionRouter dispatch authority", () => {
 			fixture.authority.endpointMtimeMs = original.mtimeMs + delta;
 			try {
 				await fixture.router.start();
-				const attachment = fixture.router.attachment(fixture.sessionId);
-				expect(attachment?.isCurrent()).toBe(true);
-				await attachment!.sendMaintenance?.("rounding-safe");
-				expect(fixture.clients[0].sent).toHaveLength(1);
-				const staging = `${fixture.endpointFile}.replacement`;
-				await Bun.write(staging, await Bun.file(fixture.endpointFile).text());
-				await fsPromises.rename(staging, fixture.endpointFile);
-				await fsPromises.utimes(fixture.endpointFile, timestamp, timestamp);
-				const replacement = await fsPromises.lstat(fixture.endpointFile);
-				expect(replacement.mtimeMs).toBe(original.mtimeMs);
-				expect(Math.abs(replacement.mtimeMs - fixture.authority.endpointMtimeMs)).toBeLessThanOrEqual(0.001);
-				expect(replacement.ino).not.toBe(original.ino);
-				await expect(attachment!.sendMaintenance?.("replaced")).rejects.toBeInstanceOf(SessionRouterError);
-				expect(fixture.clients[0].sent).toHaveLength(1);
+				expect(fixture.router.attachment(fixture.sessionId)).toBeNull();
+				expect(fixture.clients).toHaveLength(0);
 			} finally {
 				await fixture.router.stop();
 			}
