@@ -381,12 +381,23 @@ export class SessionSdkHost {
 		this.#stopping = true;
 		this.#unsubscribe?.();
 		this.#unsubscribe = undefined;
-		if (this.#registration?.writer.unregister)
-			await this.#registration.writer.unregister({
-				sessionId: this.#options.sessionId,
-				stateRoot: this.#options.stateRoot,
-				endpointGeneration: this.events.generation,
-			});
+		if (this.#registration?.writer.unregister) {
+			try {
+				await this.#registration.writer.unregister({
+					sessionId: this.#options.sessionId,
+					stateRoot: this.#options.stateRoot,
+					endpointGeneration: this.events.generation,
+				});
+			} catch (error) {
+				// A live broker may hold the shared session-index lock beyond the
+				// bounded acquisition budget. Unregistration is best effort: leaving
+				// the durable row in place is fail-closed because peers still fence
+				// authority on process liveness and incarnation, while propagating the
+				// contention error turns ordinary shutdown into an uncaught failure.
+				if (!(error instanceof Error) || !error.message.startsWith("Failed to acquire lock")) throw error;
+				logger.warn("sdk broker unregister deferred because the session index is busy", { error: error.message });
+			}
+		}
 		this.#started = false;
 		this.#stopping = false;
 		return "stopped";
