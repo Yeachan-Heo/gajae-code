@@ -32,6 +32,10 @@ import { getSkillManifest } from "../gjc-runtime/workflow-manifest";
 import skillDescription from "../prompts/tools/skill.md" with { type: "text" };
 import { SKILL_PROMPT_MESSAGE_TYPE } from "../session/messages";
 import { isCanonicalGjcWorkflowSkill } from "../skill-state/active-state";
+import {
+	getSkillFilesystemIdentity,
+	isCanonicalGjcWorkflowSkillFilesystemAlias,
+} from "../skill-state/canonical-skills";
 import type { ToolSession } from ".";
 import { ToolError } from "./tool-errors";
 
@@ -156,6 +160,12 @@ export class SkillTool implements AgentTool<typeof skillSchema, SkillToolDetails
 				throw new ToolError(
 					`skill tool: "${requestedName}" is not a valid skill name. The name must be a single concrete skill (e.g. "ralplan"), not a glob or wildcard pattern. Pass one exact skill name as shown in /skill:<name>.`,
 				);
+			}
+			if (
+				isCanonicalGjcWorkflowSkillFilesystemAlias(requestedName) &&
+				getSkillFilesystemIdentity(requestedName) !== requestedName.toLowerCase()
+			) {
+				throw new ToolError(`skill tool: refusing filesystem alias for bundled workflow skill "${requestedName}"`);
 			}
 			const activeState = this.#session.getActiveSkillState?.();
 			const activeSkill = normalizeSkillName(activeState?.skill);

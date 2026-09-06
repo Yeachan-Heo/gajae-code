@@ -15,7 +15,10 @@ import { type Skill as CapabilitySkill, getCapability } from "../discovery";
 import { loadMarketplaceSkills } from "../discovery/claude-plugins";
 import { compareSkillOrder, resolveUserAgentDir, scanSkillsFromDir } from "../discovery/helpers";
 import type { SkillPromptDetails } from "../session/messages";
-import { CANONICAL_GJC_WORKFLOW_SKILLS } from "../skill-state/canonical-skills";
+import {
+	getSkillFilesystemIdentity,
+	isCanonicalGjcWorkflowSkillFilesystemAlias,
+} from "../skill-state/canonical-skills";
 import { expandTilde } from "../tools/path-utils";
 import type { LoadedSubskillActivation } from "./gjc-plugins";
 import { buildSubskillInjection } from "./gjc-plugins/injection";
@@ -131,8 +134,6 @@ export interface LoadSkillsOptions extends SkillsSettings {
  * sources into `.gjc` (see skill-management.ts) and are never loaded directly.
  */
 const LOADABLE_SKILL_PROVIDERS = new Set(["native", "claude-plugins"]);
-
-const BUILT_IN_SKILL_NAMES = new Set<string>(CANONICAL_GJC_WORKFLOW_SKILLS.map(name => name.toLowerCase()));
 
 /**
  * Load skills from all configured locations.
@@ -277,14 +278,14 @@ export async function loadSkills(options: LoadSkillsOptions = {}): Promise<LoadS
 		// workflow-routing hijack: warn, and let the session merge keep the bundled
 		// definition authoritative (sdk/session.ts). User-scope copies are not
 		// warned about: installed defaults legitimately mirror bundled skills.
-		if (capSkill.level === "project" && BUILT_IN_SKILL_NAMES.has(capSkill.name.toLowerCase())) {
+		if (capSkill.level === "project" && isCanonicalGjcWorkflowSkillFilesystemAlias(capSkill.name)) {
 			collisionWarnings.push({
 				skillPath: capSkill.path,
 				message: `name collision: "${capSkill.name}" is a bundled GJC workflow skill; the bundled definition takes precedence in sessions and this project copy is never used`,
 			});
 		}
 
-		const skillKey = capSkill.name.toLowerCase();
+		const skillKey = getSkillFilesystemIdentity(capSkill.name);
 		const existing = skillMap.get(skillKey);
 		if (existing) {
 			collisionWarnings.push({
@@ -361,7 +362,7 @@ export async function loadSkills(options: LoadSkillsOptions = {}): Promise<LoadS
 		const resolvedPath = customRealPaths[i];
 		if (realPathSet.has(resolvedPath)) continue;
 
-		const skillKey = skill.name.toLowerCase();
+		const skillKey = getSkillFilesystemIdentity(skill.name);
 		const existing = skillMap.get(skillKey);
 		if (existing) {
 			collisionWarnings.push({

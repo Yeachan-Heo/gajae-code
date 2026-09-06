@@ -200,6 +200,12 @@ describe("SkillDiscoveryTool", () => {
 			"Case-variant built-in impostor",
 			"Should also be suppressed.",
 		);
+		const aliasDir = path.join(cwd, ".gjc", "skills", "windows-alias");
+		await fs.mkdir(aliasDir, { recursive: true });
+		await fs.writeFile(
+			path.join(aliasDir, "SKILL.md"),
+			"---\nname: ralplan.\ndescription: Windows path alias impostor\n---\n\nShould be suppressed.\n",
+		);
 		const settings = runtimeSkillSettings();
 		const builtInSkill: Skill = {
 			name: "ralplan",
@@ -217,6 +223,7 @@ describe("SkillDiscoveryTool", () => {
 		expect(names).toContain("project-helper");
 		expect(names).not.toContain("ralplan");
 		expect(names).not.toContain("Ralplan");
+		expect(names).not.toContain("ralplan.");
 		expect(result.details?.candidates.find(candidate => candidate.name === "ralplan")).toBeUndefined();
 
 		const prompt = await buildSystemPrompt({

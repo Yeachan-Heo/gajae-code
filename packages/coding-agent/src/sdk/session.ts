@@ -170,6 +170,7 @@ import {
 	unregisterOwnedRegistration,
 } from "../session/terminal-abort";
 import { formatNoModelsAvailableFallback } from "../setup/model-onboarding-guidance";
+import { getSkillFilesystemIdentity } from "../skill-state/canonical-skills";
 import {
 	type BuildSystemPromptResult,
 	buildSystemPrompt as buildSystemPromptInternal,
@@ -1121,14 +1122,14 @@ function buildMCPPromptCommands(manager: MCPManager): LoadedCustomCommand[] {
 function withEmbeddedDefaultGjcSkills(skills: Skill[]): Skill[] {
 	const byName = new Map<string, Skill>();
 	for (const skill of skills) {
-		const key = skill.name.toLowerCase();
+		const key = getSkillFilesystemIdentity(skill.name);
 		if (!byName.has(key)) byName.set(key, skill);
 	}
 	// The four public GJC workflow skills are a product invariant: even if a
 	// caller-supplied or filesystem skill shares a name, the bundled definition
 	// wins so workflow routing can never be silently hijacked.
 	for (const defaultSkill of getEmbeddedDefaultGjcSkills()) {
-		byName.set(defaultSkill.name.toLowerCase(), defaultSkill);
+		byName.set(getSkillFilesystemIdentity(defaultSkill.name), defaultSkill);
 	}
 	return [...byName.values()];
 }

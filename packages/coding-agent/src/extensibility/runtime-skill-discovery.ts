@@ -20,7 +20,10 @@ import {
 	SOURCE_PATHS,
 	scanSkillsFromDir,
 } from "../discovery/helpers";
-import { CANONICAL_GJC_WORKFLOW_SKILLS } from "../skill-state/canonical-skills";
+import {
+	getSkillFilesystemIdentity,
+	isCanonicalGjcWorkflowSkillFilesystemAlias,
+} from "../skill-state/canonical-skills";
 import { expandTilde } from "../tools/path-utils";
 import { loadSkills, type Skill } from "./skills";
 
@@ -68,8 +71,6 @@ function getRuntimeHome(): string {
 const DEFAULT_LIMIT = 20;
 const MAX_LIMIT = 50;
 const MAX_DIAGNOSTICS = 10;
-const BUILT_IN_SKILL_NAMES = new Set<string>(CANONICAL_GJC_WORKFLOW_SKILLS.map(name => name.toLowerCase()));
-
 function normalizeLimit(limit: number | undefined): number {
 	if (limit === undefined || !Number.isFinite(limit)) return DEFAULT_LIMIT;
 	return Math.max(1, Math.min(MAX_LIMIT, Math.trunc(limit)));
@@ -189,7 +190,7 @@ interface ScanJobResult {
 }
 
 function isAllowedByPolicy(skill: CapabilitySkill, policy: SkillsSettings | undefined, diagnostics: string[]): boolean {
-	if (BUILT_IN_SKILL_NAMES.has(skill.name.toLowerCase())) {
+	if (isCanonicalGjcWorkflowSkillFilesystemAlias(skill.name)) {
 		pushDiagnostic(
 			diagnostics,
 			`skill "${skill.name}" is a bundled GJC workflow skill and always resolves to the bundled definition; the filesystem copy at ${skill.path} is shadowed`,
@@ -332,7 +333,7 @@ function reportConventionImportCandidates(
 ): void {
 	for (const scan of scans.sort((a, b) => a.host.localeCompare(b.host) || a.dir.localeCompare(b.dir))) {
 		for (const skill of scan.skills) {
-			const normalizedName = skill.name.toLowerCase();
+			const normalizedName = getSkillFilesystemIdentity(skill.name);
 			if (seenNames.has(normalizedName)) continue;
 			seenNames.add(normalizedName);
 			pushDiagnostic(
@@ -473,7 +474,7 @@ export async function discoverRuntimeSkills(
 	for (const item of orderedItems) {
 		if (!isAllowedByPolicy(item.skill, policy, diagnostics)) continue;
 		const realPath = await realPathOrSelf(item.skill.path);
-		const normalizedName = item.skill.name.toLowerCase();
+		const normalizedName = getSkillFilesystemIdentity(item.skill.name);
 		if (seenPaths.has(realPath) || seenNames.has(normalizedName)) {
 			pushDiagnostic(
 				diagnostics,
@@ -515,7 +516,7 @@ export async function findRuntimeSkillByName(
 ): Promise<Skill | undefined> {
 	const normalized = name.trim();
 	if (!normalized) return undefined;
-	if (BUILT_IN_SKILL_NAMES.has(normalized.toLowerCase())) return undefined;
+	if (isCanonicalGjcWorkflowSkillFilesystemAlias(normalized)) return undefined;
 	const hasExplicitHome = home !== undefined;
 	const resolvedHome = home ?? getRuntimeHome();
 	const resolvedAgentDir = resolveRuntimeAgentDir(resolvedHome, agentDir, hasExplicitHome);

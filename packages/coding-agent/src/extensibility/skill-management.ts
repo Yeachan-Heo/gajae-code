@@ -34,7 +34,10 @@ import {
 	resolveUserAgentDir,
 	scanSkillsFromDir,
 } from "../discovery/helpers";
-import { CANONICAL_GJC_WORKFLOW_SKILLS } from "../skill-state/canonical-skills";
+import {
+	CANONICAL_GJC_WORKFLOW_SKILLS,
+	isCanonicalGjcWorkflowSkillFilesystemAlias,
+} from "../skill-state/canonical-skills";
 export type SkillScope = "project" | "user";
 export type ConventionSkillHost = "claude" | "codex";
 
@@ -107,16 +110,15 @@ export class SkillFrontmatterError extends Error {
 	}
 }
 
-const BUILT_IN_SKILL_NAMES = new Set<string>(CANONICAL_GJC_WORKFLOW_SKILLS.map(name => name.toLowerCase()));
-
 function isProtectedSkillName(name: string): boolean {
-	return BUILT_IN_SKILL_NAMES.has(name.toLowerCase());
+	return isCanonicalGjcWorkflowSkillFilesystemAlias(name);
 }
 
 function assertSafeSkillName(name: string): void {
 	if (
 		name === "." ||
 		name === ".." ||
+		/[. ]$/u.test(name) ||
 		name.includes("/") ||
 		name.includes("\\") ||
 		name.includes("\0") ||
@@ -410,8 +412,8 @@ export async function writeNativeSkill(input: WriteNativeSkillInput): Promise<Wr
 
 	const effectiveName =
 		typeof frontmatter.name === "string" && frontmatter.name.trim() ? frontmatter.name.trim() : name;
-	assertSafeSkillName(effectiveName);
 	if (isProtectedSkillName(effectiveName)) throw new SkillNameProtectedError(effectiveName);
+	assertSafeSkillName(effectiveName);
 
 	const directory = await resolveNativeSkillScopeDir(input.cwd, input.scope, input.home, input.agentDir);
 	const scopeRoot = input.scope === "user" ? path.dirname(directory) : path.dirname(path.dirname(directory));

@@ -47,7 +47,10 @@ import { loadAllMCPConfigs } from "../runtime-mcp/config";
 import { readDisabledServers } from "../runtime-mcp/config-writer";
 import { canonicalizeMCPEndpoint } from "../runtime-mcp/pool-key";
 import { redactMCPEndpoint } from "../runtime-mcp/redaction";
-import { CANONICAL_GJC_WORKFLOW_SKILLS } from "../skill-state/canonical-skills";
+import {
+	getSkillFilesystemIdentity,
+	isCanonicalGjcWorkflowSkillFilesystemAlias,
+} from "../skill-state/canonical-skills";
 import { expandTilde } from "../tools/path-utils";
 
 // =============================================================================
@@ -199,8 +202,6 @@ export interface CustomizeDoctorCommandOptions {
 // =============================================================================
 
 const REDACTED = "<redacted>";
-
-const BUILT_IN_SKILL_NAMES = new Set<string>(CANONICAL_GJC_WORKFLOW_SKILLS);
 
 const SENSITIVE_KEY_PATTERN =
 	/(?:token|secret|key|credential|password|passwd|pwd|authorization|auth|bearer|cookie|session|apikey)/i;
@@ -655,7 +656,7 @@ async function collectSkills(cwd: string, activeSettings: SettingsInstance): Pro
 			cwd,
 			disabledExtensions: activeSettings.get("disabledExtensions"),
 		});
-		for (const skill of result.skills) loadedNames.add(skill.name);
+		for (const skill of result.skills) loadedNames.add(getSkillFilesystemIdentity(skill.name));
 	}
 
 	const skillScopeNotes: string[] = [];
@@ -730,7 +731,7 @@ async function collectSkills(cwd: string, activeSettings: SettingsInstance): Pro
 				[`Move the skill under .gjc/skills/<name>/SKILL.md to make it loadable`],
 			);
 		}
-		if (BUILT_IN_SKILL_NAMES.has(entry.name)) {
+		if (isCanonicalGjcWorkflowSkillFilesystemAlias(entry.name)) {
 			return finalizeItem(
 				base,
 				"shadowed",
@@ -740,7 +741,7 @@ async function collectSkills(cwd: string, activeSettings: SettingsInstance): Pro
 				{ precedence: { priority: entry.priority, shadowedBy: { provider: "bundled", scope: "native" } } },
 			);
 		}
-		if (loadedNames.has(entry.name)) {
+		if (loadedNames.has(getSkillFilesystemIdentity(entry.name))) {
 			return finalizeItem(base, "loaded", "loaded", "Loaded by session startup.", []);
 		}
 		if (ignoredPatterns.length > 0 || includePatterns.length > 0) {
@@ -809,7 +810,7 @@ async function collectSkills(cwd: string, activeSettings: SettingsInstance): Pro
 				);
 				continue;
 			}
-			if (BUILT_IN_SKILL_NAMES.has(skill.name)) {
+			if (isCanonicalGjcWorkflowSkillFilesystemAlias(skill.name)) {
 				items.push(
 					finalizeItem(
 						base,
@@ -828,7 +829,10 @@ async function collectSkills(cwd: string, activeSettings: SettingsInstance): Pro
 			// in loadedNames even though it loses the name collision to an
 			// earlier-priority source. The collision must report shadowed-by-
 			// precedence, not a second "loaded" item.
-			const collisionWinner = items.find(i => i.name === skill.name && i.status === "loaded");
+			const skillIdentity = getSkillFilesystemIdentity(skill.name);
+			const collisionWinner = items.find(
+				i => getSkillFilesystemIdentity(i.name) === skillIdentity && i.status === "loaded",
+			);
 			if (collisionWinner) {
 				items.push(
 					finalizeItem(
@@ -847,7 +851,7 @@ async function collectSkills(cwd: string, activeSettings: SettingsInstance): Pro
 				);
 				continue;
 			}
-			if (loadedNames.has(skill.name)) {
+			if (loadedNames.has(skillIdentity)) {
 				items.push(
 					finalizeItem(base, "loaded", "loaded", "Loaded by session startup from skills.customDirectories.", []),
 				);

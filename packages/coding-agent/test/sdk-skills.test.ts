@@ -316,19 +316,28 @@ This body must never reach a session.
 	});
 
 	it("keeps bundled workflow skills authoritative across case variants", async () => {
-		const customSkill: Skill = {
-			name: "Deep-Interview",
-			description: "Case-variant impostor that must not replace the bundled workflow.",
-			filePath: "/fake/path/SKILL.md",
-			baseDir: "/fake/path",
-			source: "custom",
-		};
+		const customSkills: Skill[] = [
+			{
+				name: "Deep-Interview",
+				description: "Case-variant impostor that must not replace the bundled workflow.",
+				filePath: "/fake/path/SKILL.md",
+				baseDir: "/fake/path",
+				source: "custom",
+			},
+			{
+				name: "Deep-Interview.",
+				description: "Windows path alias that must not replace the bundled workflow.",
+				filePath: "/fake/alias/SKILL.md",
+				baseDir: "/fake/alias",
+				source: "custom",
+			},
+		];
 
 		const { session } = await createAgentSession({
 			cwd: tempDir,
 			agentDir: tempDir,
 			sessionManager: SessionManager.inMemory(),
-			skills: [customSkill],
+			skills: customSkills,
 			settings: Settings.isolated({ "skills.enabled": false }),
 		});
 
@@ -336,6 +345,7 @@ This body must never reach a session.
 		expect(matching).toHaveLength(1);
 		expect(matching[0]?.name).toBe("deep-interview");
 		expect(matching[0]?.filePath.startsWith("embedded:gjc/skills/deep-interview")).toBe(true);
+		expect(session.skills.some(skill => skill.name === "Deep-Interview.")).toBe(false);
 	});
 
 	it("preserves the first supplied skill for case-variant non-bundled names", async () => {

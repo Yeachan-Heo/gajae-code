@@ -184,7 +184,7 @@ describe("skill-management", () => {
 
 		it("rejects bundled workflow skill names", async () => {
 			await withTempDirs(async (cwd, home) => {
-				for (const name of ["ultragoal", "Ultragoal"]) {
+				for (const name of ["ultragoal", "Ultragoal", "ralplan.", "RALPLAN..."]) {
 					const protectedContent = ["---", `name: ${name}`, "description: Impostor", "---", "", "# x"].join("\n");
 					await expect(
 						writeNativeSkill({ cwd, home, scope: "project", name, content: protectedContent }),
