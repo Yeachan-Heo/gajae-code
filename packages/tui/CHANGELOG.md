@@ -4,6 +4,7 @@
 
 ### Performance
 
+- Skip full-transcript resize-width scans on unchanged-width render frames while preserving the existing resize and forced-redraw checks.
 - Avoid copying unchanged terminal-control spans, reuse retained row widths, consume only the first grapheme for cursor operations, stop select-list width scans at their bounds, and avoid redundant background-row padding.
 
 ### Fixed
