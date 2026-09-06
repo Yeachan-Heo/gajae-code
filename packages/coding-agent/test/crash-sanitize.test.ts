@@ -81,6 +81,49 @@ describe("sanitizeExternalCrashV1 — hostile inputs", () => {
 		expect(Buffer.byteLength(output, "utf8")).toBeLessThan(CRASH_BODY_MAX_BYTES);
 		expect(output.endsWith("…[truncated]")).toBe(true);
 	});
+
+	it("drops the credential shapes the import scrubber already recognizes", () => {
+		// All synthetic. These four survived into outbound text because the shared
+		// credential layer did not name them, while session-import/redact.ts —
+		// which faces strictly less exposure — already listed every one.
+		const googleApiKey = `AIza${"S".repeat(35)}`;
+		const pemBody = "MIIEowIBAAKCAQEAxGZ0000abcdefgHIJKLmnop";
+		const output = sanitized(
+			[
+				`google: ${googleApiKey}`,
+				"principal one: ABIAIOSFODNN7EXAMPLE",
+				"principal two: ACCAIOSFODNN7EXAMPLE",
+				// Control: already covered before this change.
+				"principal three: ASIAIOSFODNN7EXAMPLE",
+				`-----BEGIN RSA PRIVATE KEY-----\n${pemBody}\n-----END RSA PRIVATE KEY-----`,
+			].join("\n"),
+		);
+
+		expect(output).not.toContain(googleApiKey);
+		expect(output).not.toContain("ABIAIOSFODNN7EXAMPLE");
+		expect(output).not.toContain("ACCAIOSFODNN7EXAMPLE");
+		expect(output).not.toContain("ASIAIOSFODNN7EXAMPLE");
+		expect(output).not.toContain(pemBody);
+		// The surrounding diagnostic text still survives.
+		expect(output).toContain("principal one");
+		expect(output).toContain("principal two");
+	});
+
+	it("keeps url userinfo out of outbound text without hiding the host", () => {
+		const output = sanitized("clone failed: https://deploy:s3cr3tvalue@git.example.com/x.git");
+		expect(output).not.toContain("s3cr3tvalue");
+		expect(output).toContain("clone failed");
+	});
+
+	it("scans a large credential-free body in linear time", () => {
+		// The url-credential rule bounds its scheme repetition. An unbounded one
+		// re-tries every prefix of a long alphabetic run before failing on `://`,
+		// which is quadratic: a 200 KB crash body cost ~10s and blew the 5s test
+		// timeout in packages/utils/test/crash-journal.test.ts.
+		const startedAt = performance.now();
+		sanitized("x".repeat(200_000));
+		expect(performance.now() - startedAt).toBeLessThan(1_000);
+	});
 });
 
 describe("fenceCrashText", () => {

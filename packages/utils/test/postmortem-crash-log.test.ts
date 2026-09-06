@@ -218,6 +218,52 @@ describe("recordFatalCrash", () => {
 		expect(contents).toContain("SessionToken");
 	});
 
+	it("redacts the credential shapes the session-import scrubber already lists", () => {
+		const target = tempCrashLog();
+		// All synthetic. Each shape is already catalogued by
+		// packages/coding-agent/src/session-import/redact.ts; the persisted crash
+		// log kept them verbatim because this scrubber never named them.
+		const googleApiKey = `AIza${"S".repeat(35)}`;
+		const pemBody = "MIIEowIBAAKCAQEAxGZ0000abcdefgHIJKLmnop";
+		// ABIA is the bearer access key id and ACCA the context one; both sit
+		// alongside AKIA/ASIA in AWS's own identifier prefix table.
+		const bearerAws = "ABIAIOSFODNN7EXAMPLE";
+		const contextAws = "ACCAIOSFODNN7EXAMPLE";
+		const urlSecret = "s3cr3tvalue";
+		const err = new Error(
+			[
+				`fetch failed: ${googleApiKey}`,
+				`${bearerAws} ${contextAws}`,
+				`clone: https://deploy:${urlSecret}@git.example.com/x.git`,
+				`-----BEGIN RSA PRIVATE KEY-----\n${pemBody}\n-----END RSA PRIVATE KEY-----`,
+			].join(" "),
+		);
+
+		recordFatalCrash("Uncaught Exception", err, { path: target });
+
+		const contents = fs.readFileSync(target, "utf8");
+		expect(contents).toContain("fetch failed");
+		expect(contents).not.toContain(googleApiKey);
+		expect(contents).not.toContain(bearerAws);
+		expect(contents).not.toContain(contextAws);
+		expect(contents).not.toContain(urlSecret);
+		expect(contents).not.toContain(pemBody);
+		expect(contents).toContain("«redacted-google-api-key»");
+		expect(contents).toContain("«redacted-private-key»");
+		// Scheme and host stay readable so the record still says which remote failed.
+		expect(contents).toContain("https://«redacted-url-credential»@git.example.com");
+	});
+
+	it("scans a large credential-free crash body in linear time", () => {
+		// The url-credential rule bounds its scheme repetition. Unbounded, it
+		// re-tries every prefix of a long alphabetic run before failing on `://`,
+		// which is quadratic in body length and cost ~10s on 200 KB.
+		const target = tempCrashLog();
+		const startedAt = performance.now();
+		recordFatalCrash("Uncaught Exception", new Error("x".repeat(200_000)), { path: target });
+		expect(performance.now() - startedAt).toBeLessThan(1_000);
+	});
+
 	it("enforces owner-only permissions on a pre-existing file", () => {
 		if (process.platform === "win32") return;
 		const target = tempCrashLog();

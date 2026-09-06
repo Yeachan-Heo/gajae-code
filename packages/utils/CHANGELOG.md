@@ -1,6 +1,9 @@
 # Changelog
 
 ## [Unreleased]
+### Fixed
+
+- `redactCrashSecrets` now covers the credential shapes the session-import scrubber already listed: Google API keys, PEM private-key blocks, the `ABIA`/`ACCA` AWS access-key prefixes, and basic-auth credentials embedded in a URL. All four previously survived into the persisted crash log and into outbound crash text, because `sanitizeExternalCrashV1` uses this function as its credential layer and its later URL/hex/path passes do not recognize them. The URL rule bounds its scheme repetition so scanning stays linear; an unbounded one re-tried every prefix of a long alphabetic run and cost roughly ten seconds on a 200 KB crash body.
 
 ## [0.16.4] - 2026-09-05
 
