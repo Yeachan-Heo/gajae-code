@@ -27,7 +27,12 @@ import { SelectorController } from "../src/modes/controllers/selector-controller
 import { InteractiveMode } from "../src/modes/interactive-mode";
 import { AgentSession } from "../src/session/agent-session";
 import { AuthStorage } from "../src/session/auth-storage";
-import { associateSessionMessageEntryId, type SessionContext, SessionManager } from "../src/session/session-manager";
+import {
+	associateSessionMessageEntryId,
+	type SessionContext,
+	SessionManager,
+	transferSessionMessageIdentity,
+} from "../src/session/session-manager";
 
 class TestModalEditor extends CustomEditor {}
 function stripRenderControls(line: string): string {
@@ -195,6 +200,44 @@ describe("InteractiveMode.setEditorComponent", () => {
 		const rendered = Bun.stripANSI(mode.chatContainer.render(100).join("\n"));
 		expect(rendered).toContain("orphan survives later reconcile");
 		expect(rendered).toContain("Operation aborted");
+	});
+
+	it("does not restore a live assistant after canonical orphan persistence", () => {
+		const committed: AssistantMessage = {
+			role: "assistant",
+			content: [{ type: "text", text: "canonical orphan exactly once" }],
+			api: "anthropic-messages",
+			provider: "anthropic",
+			model: "claude-sonnet-4-5",
+			stopReason: "aborted",
+			errorMessage: "Operation aborted",
+			timestamp: Date.now(),
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+		};
+		const liveProjection = { ...committed, stopReason: "stop" as const };
+		session.sessionManager.appendMessage(committed);
+		session.agent.appendMessage(committed);
+		transferSessionMessageIdentity([committed], [liveProjection]);
+		const component = new AssistantMessageComponent(liveProjection);
+		const dispose = vi.spyOn(component, "dispose");
+		mode.streamingMessage = liveProjection;
+		mode.streamingComponent = component;
+		mode.chatContainer.addChild(component);
+
+		mode.rebuildChatFromMessages("reconcile-same-transcript");
+
+		const rendered = Bun.stripANSI(mode.chatContainer.render(100).join("\n"));
+		expect(rendered.match(/canonical orphan exactly once/g)).toHaveLength(1);
+		expect(dispose).toHaveBeenCalledTimes(1);
+		expect(mode.streamingComponent).toBeUndefined();
+		expect(mode.streamingMessage).toBeUndefined();
 	});
 
 	it("does not spend the iTerm pet warning deadline during pre-start initialization", async () => {
