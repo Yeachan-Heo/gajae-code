@@ -14,7 +14,7 @@
  */
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
-import { Agent } from "@gajae-code/agent-core";
+import { Agent, type AgentEvent } from "@gajae-code/agent-core";
 import type { AssistantMessage, TextContent } from "@gajae-code/ai";
 import { getBundledModel } from "@gajae-code/ai/models";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
@@ -23,7 +23,7 @@ import { SecretObfuscator } from "@gajae-code/coding-agent/secrets/obfuscator";
 import { AgentSession, type AgentSessionEvent } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SILENT_ABORT_MARKER } from "@gajae-code/coding-agent/session/messages";
-import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
+import { getSessionMessageEntryId, SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { TempDir } from "@gajae-code/utils";
 
 function makeAbortedAssistantMessage(text = "partial draft"): AssistantMessage {
@@ -155,6 +155,262 @@ describe("AgentSession silent-abort marker stamping", () => {
 		await Promise.all([silentAbort, realAbort]);
 	});
 
+	it("canonically commits and classifies an orphan before publishing the same agent_end object", async () => {
+		fixture = await createSessionWithObfuscator();
+		const { session } = fixture;
+		const { scope, dispose: disposeScope } = session.agent.mintSideAttemptScope();
+		const seen: AgentSessionEvent[] = [];
+		session.subscribe(event => seen.push(event));
+
+		const provisional = makeStoppedAssistantMessage("retained orphan partial");
+		session.agent.emitExternalEvent({ type: "message_start", message: provisional, scope });
+		session.agent.emitExternalEvent({
+			type: "message_update",
+			message: provisional,
+			assistantMessageEvent: {
+				type: "text_delta",
+				contentIndex: 0,
+				delta: "retained orphan partial",
+				partial: provisional,
+			},
+			scope,
+		});
+		const provisionalText = provisional.content[0];
+		if (provisionalText?.type === "text") provisionalText.text = "mutated after captured update";
+		session.markPlanCompactAbortPending();
+		expect(session.isPlanCompactAbortPending).toBe(true);
+		const rawAgentEnd: Extract<AgentEvent, { type: "agent_end" }> = {
+			type: "agent_end",
+			messages: [],
+			stopReason: "cancelled",
+			scope,
+		};
+		session.agent.emitExternalEvent(rawAgentEnd);
+		let agentEnd: Extract<AgentSessionEvent, { type: "agent_end" }> | undefined;
+		for (let attempt = 0; attempt < 50 && !agentEnd; attempt++) {
+			await Bun.sleep(1);
+			agentEnd = seen.find(
+				(event): event is Extract<AgentSessionEvent, { type: "agent_end" }> =>
+					event.type === "agent_end" && event.silentAbort === true,
+			);
+		}
+		expect(agentEnd).toBe(rawAgentEnd);
+		expect(agentEnd?.silentAbort).toBe(true);
+		const recovered = agentEnd?.messages.find((message): message is AssistantMessage => message.role === "assistant");
+		expect(recovered?.stopReason).toBe("aborted");
+		expect(recovered?.errorMessage).toBe(SILENT_ABORT_MARKER);
+		expect(recovered && getSessionMessageEntryId(recovered)).toBeDefined();
+		expect(session.agent.state.messages.filter(message => message === recovered)).toHaveLength(1);
+		expect(
+			session
+				.buildDisplaySessionContext()
+				.messages.some(
+					message =>
+						message.role === "assistant" &&
+						message.content.some(
+							content => content.type === "text" && content.text === "retained orphan partial",
+						),
+				),
+		).toBe(true);
+		expect(session.isPlanCompactAbortPending).toBe(false);
+		disposeScope();
+	});
+
+	it("matches forced recovery by attempt scope after abort advances prompt generation", async () => {
+		fixture = await createSessionWithObfuscator();
+		const { session } = fixture;
+		const { scope, dispose: disposeScope } = session.agent.mintSideAttemptScope();
+		const partial = makeStoppedAssistantMessage("forced partial");
+		session.agent.emitExternalEvent({ type: "message_start", message: partial, scope });
+		await session.awaitSessionSettlement();
+		const beforeAbortGeneration = session.transcriptPromptGeneration;
+		await session.abort();
+		expect(session.transcriptPromptGeneration).toBeGreaterThan(beforeAbortGeneration);
+		const terminal: Extract<AgentEvent, { type: "agent_end" }> = {
+			type: "agent_end",
+			messages: [],
+			stopReason: "cancelled",
+			scope,
+		};
+		session.agent.emitExternalEvent(terminal);
+		await session.awaitSessionSettlement();
+
+		const recovered = terminal.messages.find((message): message is AssistantMessage => message.role === "assistant");
+		expect(recovered?.stopReason).toBe("aborted");
+		expect(recovered?.content).toEqual([{ type: "text", text: "forced partial" }]);
+		expect(recovered && getSessionMessageEntryId(recovered)).toBeDefined();
+		disposeScope();
+	});
+
+	it("canonically admits an authoritative external terminal without message_end", async () => {
+		fixture = await createSessionWithObfuscator();
+		const { session } = fixture;
+		const { scope, dispose: disposeScope } = session.agent.mintSideAttemptScope();
+		const presentationMessage = makeStoppedAssistantMessage("external partial");
+		const finalMessage = makeStoppedAssistantMessage("external final");
+		session.agent.emitExternalEvent({ type: "message_start", message: presentationMessage, scope });
+		const terminal: Extract<AgentEvent, { type: "agent_end" }> = {
+			type: "agent_end",
+			messages: [finalMessage],
+			stopReason: "completed",
+			scope,
+		};
+		session.agent.emitExternalEvent(terminal);
+		await session.awaitSessionSettlement();
+
+		expect(getSessionMessageEntryId(finalMessage)).toBeDefined();
+		expect(getSessionMessageEntryId(presentationMessage)).toBe(getSessionMessageEntryId(finalMessage));
+		expect(session.agent.state.messages.filter(message => message === finalMessage)).toHaveLength(1);
+		expect(
+			session
+				.buildDisplaySessionContext()
+				.messages.some(
+					message =>
+						message === finalMessage ||
+						getSessionMessageEntryId(message) === getSessionMessageEntryId(finalMessage),
+				),
+		).toBe(true);
+		disposeScope();
+	});
+
+	it("persists silent classification on a cancelled authoritative external terminal", async () => {
+		fixture = await createSessionWithObfuscator();
+		const { session } = fixture;
+		const finalMessage: AssistantMessage = {
+			...makeStoppedAssistantMessage("silent external final"),
+			stopReason: "aborted",
+		};
+		session.markPlanCompactAbortPending();
+		session.agent.emitExternalEvent({
+			type: "agent_end",
+			messages: [finalMessage],
+			stopReason: "cancelled",
+		});
+		await session.awaitSessionSettlement();
+
+		expect(finalMessage.errorMessage).toBe(SILENT_ABORT_MARKER);
+		expect(getSessionMessageEntryId(finalMessage)).toBeDefined();
+	});
+
+	it("does not recover a predecessor partial after a branch rotates session identity", async () => {
+		fixture = await createSessionWithObfuscator();
+		const { session } = fixture;
+		const userMessage = {
+			role: "user" as const,
+			content: [{ type: "text" as const, text: "branch root" }],
+			timestamp: Date.now(),
+		};
+		const entryId = session.sessionManager.appendMessage(userMessage);
+		session.agent.appendMessage(userMessage);
+		const predecessorScope = { attemptId: "predecessor", generation: 7, lineage: "main" as const };
+		const partial = makeStoppedAssistantMessage("predecessor partial");
+		session.agent.emitExternalEvent({ type: "message_start", message: partial, scope: predecessorScope });
+		await Promise.resolve();
+
+		const result = await session.branch(entryId);
+		expect(result.cancelled).toBe(false);
+		const clonedScope = { ...predecessorScope };
+		const lateFinal = makeStoppedAssistantMessage("late cloned-scope final");
+		const lateTerminal: Extract<AgentEvent, { type: "agent_end" }> = {
+			type: "agent_end",
+			messages: [lateFinal],
+			stopReason: "completed",
+			scope: clonedScope,
+			disownedSteering: [
+				{
+					role: "user",
+					content: [{ type: "text", text: "must not rearm in successor" }],
+					timestamp: Date.now(),
+				},
+			],
+		};
+		session.agent.emitExternalEvent(lateTerminal);
+		const unscopedLate = makeStoppedAssistantMessage("late unscoped final");
+		session.agent.emitExternalEvent({ type: "message_start", message: unscopedLate });
+		session.agent.emitExternalEvent({
+			type: "agent_end",
+			messages: [unscopedLate],
+			stopReason: "completed",
+		});
+		await session.awaitSessionSettlement();
+
+		expect(getSessionMessageEntryId(lateFinal)).toBeUndefined();
+		expect(getSessionMessageEntryId(unscopedLate)).toBeUndefined();
+		expect(session.agent.state.messages).not.toContain(lateFinal);
+		expect(session.agent.state.messages).not.toContain(unscopedLate);
+		expect(session.agent.state.streamMessage).toBeNull();
+		expect(session.agent.snapshotSteering()).toHaveLength(0);
+		expect(session.agent.snapshotFollowUp()).toHaveLength(0);
+		expect(
+			session
+				.buildDisplaySessionContext()
+				.messages.some(
+					message =>
+						message.role === "assistant" &&
+						message.content.some(content => content.type === "text" && content.text === "predecessor partial"),
+				),
+		).toBe(false);
+	});
+
+	it("emits a visible notice when canonical orphan persistence fails", async () => {
+		fixture = await createSessionWithObfuscator();
+		const { session } = fixture;
+		const { scope, dispose: disposeScope } = session.agent.mintSideAttemptScope();
+		const partial = makeStoppedAssistantMessage("unpersisted partial");
+		const events: AgentSessionEvent[] = [];
+		session.subscribe(event => events.push(event));
+		session.agent.emitExternalEvent({ type: "message_start", message: partial, scope });
+		vi.spyOn(session.sessionManager, "appendMessage").mockImplementationOnce(() => {
+			throw new Error("synthetic persistence failure");
+		});
+		const terminal: Extract<AgentEvent, { type: "agent_end" }> = {
+			type: "agent_end",
+			messages: [],
+			stopReason: "cancelled",
+			scope,
+		};
+		session.agent.emitExternalEvent(terminal);
+		await session.awaitSessionSettlement();
+
+		expect(events).toContainEqual(
+			expect.objectContaining({
+				type: "notice",
+				level: "error",
+				source: "session-persistence",
+			}),
+		);
+		expect(events).toContain(terminal);
+		expect((terminal as Extract<AgentSessionEvent, { type: "agent_end" }>).terminalPersistenceFailed).toBe(true);
+		expect(terminal.messages).toHaveLength(0);
+		expect(session.agent.state.messages.some(message => message === partial)).toBe(false);
+		expect(session.agent.state.streamMessage).toBeNull();
+		disposeScope();
+		expect(() => session.newSession()).toThrow(expect.objectContaining({ code: "session_persistence_blocked" }));
+		const recovery = vi
+			.spyOn(session.sessionManager, "recoverPersistenceFailure")
+			.mockRejectedValueOnce(new Error("still unreconciled"));
+		await expect(session.prompt("must remain fenced")).rejects.toMatchObject({
+			code: "session_persistence_blocked",
+		});
+		await Promise.all([
+			session.runWithPromptAdmissionForTests(async () => {}),
+			session.runWithPromptAdmissionForTests(async () => {}),
+		]);
+		expect(recovery).toHaveBeenCalledTimes(2);
+		expect(
+			events.filter(event => event.type === "notice" && event.source === "terminal-persistence-recovered"),
+		).toHaveLength(1);
+		expect(
+			session
+				.buildDisplaySessionContext()
+				.messages.filter(
+					message =>
+						message.role === "assistant" &&
+						message.content.some(content => content.type === "text" && content.text === "unpersisted partial"),
+				),
+		).toHaveLength(1);
+	});
+
 	it("A3: flag set + non-aborted message_end does NOT consume the flag", async () => {
 		fixture = await createSessionWithObfuscator();
 		const { session } = fixture;
@@ -238,6 +494,8 @@ describe("AgentSession silent-abort marker stamping", () => {
 			throw new Error("expected emitted message_end to be an assistant message");
 		}
 		expect(emittedMessage.errorMessage).toBe(SILENT_ABORT_MARKER);
+		expect(emitted.silentAbort).toBe(true);
+		expect(Object.getOwnPropertyDescriptor(emitted, "silentAbort")?.writable).toBe(false);
 
 		// Prove the obfuscator branch actually ran by asserting the emitted message
 		// is a distinct object (post-spread) AND its content was deobfuscated back to

@@ -17870,14 +17870,21 @@ export class SessionManager {
 			timestamp: new Date().toISOString(),
 			message,
 		};
-		associateSessionMessageEntryId(message, entry.id);
 		// Defense-in-depth (#4443): detect directly adjacent thinking/redacted_thinking
 		// blocks in a persisted assistant transcript message and warn once per session.
 		// This is a read-only observation — storage is NEVER mutated. The diagnostic is
 		// bounded to development/test to avoid production noise, and names only the
 		// envelope shape (block count), never raw thinking text, signatures, or payloads.
 		this.#warnAdjacentPrivateThinking(message);
-		this.#appendEntry(entry);
+		try {
+			this.#appendEntry(entry);
+		} catch (error) {
+			if (error instanceof SessionNearLimitAppendError && error.entryRetained) {
+				associateSessionMessageEntryId(message, entry.id);
+			}
+			throw error;
+		}
+		associateSessionMessageEntryId(message, entry.id);
 		const residentEntry = this.#byId.get(entry.id);
 		if (residentEntry?.type === "message") transferSessionMessageIdentity([message], [residentEntry.message]);
 		return entry.id;

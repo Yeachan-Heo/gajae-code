@@ -1169,10 +1169,10 @@ export class TUI extends Container {
 	#pendingDependentGenericBytes: Array<{ bytes: Uint8Array; rect: CellRect; blockedBy: string[] }> = [];
 	#terminalGeneration = 0;
 	/**
-	 * Raster lifecycle epoch. `stop()` increments it before lease cleanup so a
-	 * queue body captured under a prior running epoch can never write to the
-	 * terminal after restoration; `start()` does not reset it, so work enqueued
-	 * in the new lifecycle carries the new epoch.
+	 * Raster lifecycle epoch. Lifecycle-invalidating transitions increment it
+	 * before lease cleanup so a queue body captured under a prior running epoch
+	 * can never write to the terminal after restoration; `start()` does not reset
+	 * it, so work enqueued in the new lifecycle carries the new epoch.
 	 */
 	#rasterLifecycle = 0;
 
@@ -1312,6 +1312,10 @@ export class TUI extends Container {
 			this.#widthSettleTimer = undefined;
 		}
 		this.#invalidatePreparations();
+		// Invalidate every raster-queue body captured before disposal. Disposal does
+		// not stop the terminal itself, so the ingress epoch is the only fence that
+		// prevents a held body or queued render from writing after teardown.
+		this.#rasterLifecycle++;
 		this.#preparationLifecycle = undefined;
 		this.#settleRenderCommitWaiters(false);
 		this.#unsubscribeTabWidthChange?.();
@@ -2539,6 +2543,10 @@ export class TUI extends Container {
 	}
 	#markTerminalUnavailable(settleRenderWaiters = true): void {
 		this.#invalidatePreparations();
+		// A terminal-loss transition invalidates bodies parked behind the raster
+		// ingress just like stop(). Restarted output must never resume that stale
+		// epoch after availability returns.
+		this.#rasterLifecycle++;
 		this.#terminalGeneration++;
 		for (const record of this.#rasterCleanup.values()) record.terminalGeneration = this.#terminalGeneration;
 		this.#revokeRasterLeases("terminal-loss");

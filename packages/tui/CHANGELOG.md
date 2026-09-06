@@ -18,6 +18,10 @@
 
 - Added cancellable, one-shot `enqueueBeforeRender` preparation on the existing frame scheduler and a single-owner `setRenderPreparationLifecycleCallbacks` seam for invalidation and restart preparation. Stop, terminal loss, and disposal cancel stale work; restart preparation runs before the first forced frame without adding another streaming timer.
 
+### Fixed
+
+- Disposal and terminal-loss recovery now fence render and raster work already queued behind raster ingress, preventing stale terminal bytes or a falsely successful render generation after the owning TUI lifecycle ends.
+
 ## [0.16.3] - 2026-09-04
 
 ## [0.16.2] - 2026-09-04

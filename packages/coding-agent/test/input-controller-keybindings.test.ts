@@ -511,6 +511,9 @@ describe("InputController keybinding setup", () => {
 			expect(set).toHaveBeenCalledWith("hideThinkingBlock", true);
 			expect(setThinkingVisibility).toHaveBeenCalledWith("hidden");
 			expect(set.mock.invocationCallOrder[0]).toBeLessThan(setThinkingVisibility.mock.invocationCallOrder[0]);
+			expect(ctx.rebuildChatFromMessages).toHaveBeenCalledWith("reconcile-same-transcript");
+			expect(ctx.chatContainer.detachChild).not.toHaveBeenCalled();
+			expect(ctx.chatContainer.addChild).not.toHaveBeenCalled();
 		} finally {
 			set.mockRestore();
 			resetSettingsForTest();

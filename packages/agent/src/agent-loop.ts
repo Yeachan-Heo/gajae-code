@@ -4203,7 +4203,13 @@ async function runLoopBody(
 				);
 				const toolResults: ToolResultMessage[] = [];
 				for (const toolCall of toolCalls) {
-					const result = createAbortedToolResult(toolCall, stream, message.stopReason, message.errorMessage);
+					const result = createAbortedToolResult(
+						toolCall,
+						stream,
+						message.stopReason,
+						message.errorMessage,
+						attemptScope,
+					);
 					currentContext.messages.push(result);
 					newMessages.push(result);
 					toolResults.push(result);
@@ -4247,6 +4253,7 @@ async function runLoopBody(
 							stream,
 							"error",
 							"Tool calls are disabled during repeated malformed tool-call recovery.",
+							attemptScope,
 						);
 						currentContext.messages.push(result);
 						newMessages.push(result);
@@ -4909,6 +4916,16 @@ async function streamAssistantResponse(
 			const trailing = config.fallbackManaged
 				? managedAssistantShell(finished, config.model, managedDegradedFieldDiagnostics, true)
 				: finished;
+			promoteTypedEmptyResponseStop(trailing);
+			if (!config.fallbackManaged || (trailing.stopReason !== "error" && trailing.stopReason !== "aborted")) {
+				if (addedPartial) {
+					context.messages[context.messages.length - 1] = trailing;
+				} else {
+					context.messages.push(trailing);
+					stream.push({ type: "message_start", message: { ...trailing }, scope });
+				}
+				stream.push({ type: "message_end", message: trailing, scope });
+			}
 			await finishChat(trailing);
 			return trailing;
 		});
@@ -5222,7 +5239,7 @@ async function executeToolCalls(
 	};
 
 	const runTool = async (record: (typeof records)[number], index: number): Promise<void> => {
-		if (record.skipped || interruptState.triggered) {
+		if (record.skipped || interruptState.triggered || signal?.aborted) {
 			// Skip both span emission and the collector orphan record here. The
 			// scheduler-task finalizer emits the skipped result and collector record;
 			// the tail sweep below remains a defensive fallback for unexpected throws.
@@ -5399,6 +5416,10 @@ async function executeToolCalls(
 					effectiveArgs,
 					toolContext,
 				);
+				if (signal?.aborted) {
+					record.skipped = true;
+					return;
+				}
 				// Preparation is complete. A successful publication is the only transition
 				// that marks this record dispatched; intrinsic invocation then consumes locals.
 				publishToolDispatch(record, startEvent);
@@ -5416,7 +5437,7 @@ async function executeToolCalls(
 				isError = true;
 			}
 
-			if (afterToolCall) {
+			if (afterToolCall && record.started) {
 				try {
 					const after = await afterToolCall(
 						{
@@ -5448,7 +5469,7 @@ async function executeToolCalls(
 			}
 		});
 
-		const interrupted = interruptState.triggered;
+		const interrupted = interruptState.triggered || record.skipped;
 		if (interrupted) {
 			record.skipped = true;
 			emitToolResult(record, createSkippedToolResult(), true);
@@ -5585,6 +5606,7 @@ function createAbortedToolResult(
 	stream: EventStream<AgentEvent, AgentMessage[]>,
 	reason: "aborted" | "error",
 	errorMessage?: string,
+	scope?: AttemptScope,
 ): ToolResultMessage {
 	toolCall = stripToolCallEvidence(toolCall);
 	const message = reason === "aborted" ? "Tool execution was aborted" : "Tool execution failed due to an error";
@@ -5605,6 +5627,7 @@ function createAbortedToolResult(
 		toolName: toolCall.name,
 		args: toolCall.arguments,
 		intent: toolCall.intent,
+		scope,
 	};
 	markNonDispatchedToolEvent(startEvent);
 	stream.push(startEvent);
@@ -5614,6 +5637,7 @@ function createAbortedToolResult(
 		toolName: toolCall.name,
 		result,
 		isError: true,
+		scope,
 	};
 	markNonDispatchedToolEvent(endEvent);
 	stream.push(endEvent);
@@ -5628,8 +5652,8 @@ function createAbortedToolResult(
 		timestamp: Date.now(),
 	};
 
-	stream.push({ type: "message_start", message: toolResultMessage });
-	stream.push({ type: "message_end", message: toolResultMessage });
+	stream.push({ type: "message_start", message: toolResultMessage, scope });
+	stream.push({ type: "message_end", message: toolResultMessage, scope });
 
 	return toolResultMessage;
 }

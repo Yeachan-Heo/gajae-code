@@ -21,6 +21,8 @@ export interface YieldQueueOptions {
 	injectIdle(messages: AgentMessage[], signal?: AbortSignal): Promise<void>;
 	scheduleIdleFlush(run: (signal?: AbortSignal) => Promise<void>, onSkip: () => void): void;
 	getIdleFlushSignal?(): AbortSignal | undefined;
+	captureIdentity?(): unknown;
+	isIdentityCurrent?(identity: unknown): boolean;
 }
 
 type YieldFlushMode = "streaming" | "idle";
@@ -31,6 +33,11 @@ interface StoredDispatcher {
 	build: (survivors: unknown[]) => AgentMessage | null;
 }
 
+interface StoredEntry {
+	value: unknown;
+	identity: unknown;
+}
+
 function formatError(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
 }
@@ -38,7 +45,7 @@ function formatError(error: unknown): string {
 export class YieldQueue {
 	readonly #options: YieldQueueOptions;
 	readonly #dispatchers = new Map<string, StoredDispatcher>();
-	readonly #entries = new Map<string, unknown[]>();
+	readonly #entries = new Map<string, StoredEntry[]>();
 	#idleFlushPending = false;
 	#idleFlushPendingOwner: symbol | undefined;
 
@@ -70,7 +77,7 @@ export class YieldQueue {
 			entries = [];
 			this.#entries.set(kind, entries);
 		}
-		entries.push(entry);
+		entries.push({ value: entry, identity: this.#options.captureIdentity?.() });
 		if (!this.#options.isStreaming()) {
 			this.#scheduleIdleFlush();
 		}
@@ -91,7 +98,9 @@ export class YieldQueue {
 		}
 		const idleMessages: AgentMessage[] = [];
 		for (const [kind, dispatcher] of this.#dispatchers) {
-			const entries = this.#drain(kind);
+			const entries = this.#drain(kind)
+				.filter(entry => this.#options.isIdentityCurrent?.(entry.identity) ?? true)
+				.map(entry => entry.value);
 			if (entries.length === 0) continue;
 			const messages = this.#build(kind, dispatcher, entries) ?? [];
 			for (const message of messages) {
@@ -117,7 +126,11 @@ export class YieldQueue {
 
 	clear(onDrop?: (kind: string, entries: readonly unknown[]) => void): void {
 		if (onDrop) {
-			for (const [kind, entries] of this.#entries) onDrop(kind, entries);
+			for (const [kind, entries] of this.#entries)
+				onDrop(
+					kind,
+					entries.map(entry => entry.value),
+				);
 		}
 		this.#entries.clear();
 		this.#idleFlushPending = false;
@@ -166,7 +179,7 @@ export class YieldQueue {
 		}
 	}
 
-	#drain(kind: string): unknown[] {
+	#drain(kind: string): StoredEntry[] {
 		const entries = this.#entries.get(kind);
 		if (!entries || entries.length === 0) return [];
 		this.#entries.delete(kind);

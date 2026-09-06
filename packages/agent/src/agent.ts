@@ -487,8 +487,10 @@ export class Agent {
 	#contextRevision = 0;
 	#attemptAuthority = createAttemptScopeAuthority();
 	#runHandles = new Map<number | ManagedLogicalRunId, AttemptRunHandle>();
+	#runScopes = new Map<number | ManagedLogicalRunId, Set<AttemptScope>>();
 
 	#listeners = new Set<(e: AgentEvent) => void>();
+	#externalEventAdmissionFence?: (event: AgentEvent) => boolean;
 	#abortController?: AbortController;
 	#convertToLlm: (messages: AgentMessage[]) => Message[] | Promise<Message[]>;
 	#transformContext?: (
@@ -552,7 +554,7 @@ export class Agent {
 	#maintainContext?: AgentLoopConfig["maintainContext"];
 	#telemetry?: AgentLoopConfig["telemetry"];
 	#appendOnlyContext?: AppendOnlyContextManager;
-	#mainAttemptScopeObserver?: (scope: AttemptScope) => void;
+	#mainAttemptScopeObserver?: (scope: AttemptScope, active: boolean) => void;
 
 	get intentTracing(): boolean {
 		return this.#intentTracing;
@@ -560,6 +562,7 @@ export class Agent {
 
 	/** Buffered Cursor tool results with text length at time of call (for correct ordering) */
 	#cursorToolResultBuffer: CursorToolResultEntry[] = [];
+	#cursorSplitTerminalMessages = new WeakSet<AssistantMessage>();
 	#terminalizedLogicalRunIds = new Set<ManagedLogicalRunId>();
 	#managedLogicalRunOwner?: ManagedLogicalRunId;
 	readonly resourceLedger: RunResourceLedger = createRunResourceLedger();
@@ -570,7 +573,15 @@ export class Agent {
 
 	/** Mint a side-attempt scope and its authority unregister function. */
 	mintSideAttemptScope(): { scope: AttemptScope; dispose: () => void } {
-		return this.#attemptAuthority.mintSide();
+		const minted = this.#attemptAuthority.mintSide();
+		this.#observeMainAttemptScope(minted.scope);
+		return {
+			scope: minted.scope,
+			dispose: () => {
+				minted.dispose();
+				this.#mainAttemptScopeObserver?.(minted.scope, false);
+			},
+		};
 	}
 
 	/** Return the Agent-owned attempt scope authority for session record injection. */
@@ -581,12 +592,16 @@ export class Agent {
 	 * Observe each main-attempt scope synchronously, before any provider or
 	 * extension-capable lifecycle work can begin.
 	 */
-	setMainAttemptScopeObserver(observer: ((scope: AttemptScope) => void) | undefined): void {
+	setMainAttemptScopeObserver(observer: ((scope: AttemptScope, active: boolean) => void) | undefined): void {
 		this.#mainAttemptScopeObserver = observer;
 	}
 
+	setExternalEventAdmissionFence(fence: ((event: AgentEvent) => boolean) | undefined): void {
+		this.#externalEventAdmissionFence = fence;
+	}
+
 	#observeMainAttemptScope(scope: AttemptScope): void {
-		this.#mainAttemptScopeObserver?.(scope);
+		this.#mainAttemptScopeObserver?.(scope, true);
 	}
 
 	streamFn: StreamFn;
@@ -978,6 +993,7 @@ export class Agent {
 	 * unbound external event stays unbound; unproven provenance is `custom`.
 	 */
 	emitExternalEvent(event: AgentEvent) {
+		if (this.#externalEventAdmissionFence && !this.#externalEventAdmissionFence(event)) return false;
 		switch (event.type) {
 			case "message_start":
 			case "message_update":
@@ -1002,14 +1018,29 @@ export class Agent {
 		}
 
 		this.#emit(event);
+		return true;
+	}
+
+	discardRejectedAssistantEvent(message: AssistantMessage): void {
+		if (this.#state.streamMessage === message) this.#state.streamMessage = null;
+		if (this.#state.messages.at(-1) === message) this.popMessage();
+	}
+
+	restoreStreamMessageForSessionRollback(message: AgentMessage | null): void {
+		this.#state.streamMessage = message;
+	}
+
+	isCursorSplitTerminalMessage(message: AssistantMessage): boolean {
+		return this.#cursorSplitTerminalMessages.has(message);
 	}
 
 	createExternalEventEmitterForCurrentRun(): ((event: AgentEvent) => void) | undefined {
 		const runId = this.#activeRunId;
 		if (runId === undefined) return undefined;
+		const scope = this.#runHandles.get(this.#managedLogicalRunOwner ?? runId)?.scope;
 		return (event: AgentEvent) => {
 			if (this.#activeRunId !== runId) return;
-			this.emitExternalEvent(event);
+			this.emitExternalEvent(scope && !event.scope ? { ...event, scope } : event);
 		};
 	}
 
@@ -1575,9 +1606,9 @@ export class Agent {
 			},
 			() => {
 				for (const message of request.messages ?? []) {
-					this.#emit({ type: "message_start", message });
+					this.#emit({ type: "message_start", message, scope: handle.scope });
 					this.appendMessage(message);
-					this.#emit({ type: "message_end", message });
+					this.#emit({ type: "message_end", message, scope: handle.scope });
 				}
 			},
 		);
@@ -1809,6 +1840,9 @@ export class Agent {
 		this.#observeMainAttemptScope(scope);
 		const handle: AttemptRunHandle = { logicalRunId, scope };
 		this.#runHandles.set(logicalRunId, handle);
+		const logicalRunScopes = this.#runScopes.get(logicalRunId) ?? new Set<AttemptScope>();
+		logicalRunScopes.add(scope);
+		this.#runScopes.set(logicalRunId, logicalRunScopes);
 		options?.onRunAccepted?.(handle, {
 			consumedQueuedMessages: options.consumedQueuedMessages ?? [],
 		});
@@ -1936,6 +1970,7 @@ export class Agent {
 				mint: () => {
 					const scope = this.#attemptAuthority.mintMain();
 					this.#observeMainAttemptScope(scope);
+					this.#runScopes.get(logicalRunId)?.add(scope);
 					return scope;
 				},
 			},
@@ -2114,7 +2149,7 @@ export class Agent {
 						// Check if this is an assistant message with buffered Cursor tool results.
 						// If so, split the message to emit tool results at the correct position.
 						if (event.message.role === "assistant" && this.#cursorToolResultBuffer.length > 0) {
-							this.#emitCursorSplitAssistantMessage(event.message as AssistantMessage);
+							this.#emitCursorSplitAssistantMessage(event.message as AssistantMessage, event.scope);
 							continue; // Skip default emit - split method handles everything
 						}
 						this.#state.streamMessage = null;
@@ -2330,7 +2365,7 @@ export class Agent {
 						// The documented contract emits the sanitized diagnostic
 						// before the error terminal on this path too (exact-head
 						// review P2).
-						this.#emit({ type: "agent_failed", error: sanitizeAgentFailure(err) });
+						this.#emit({ type: "agent_failed", error: sanitizeAgentFailure(err), scope: ownership.handle.scope });
 						this.requestRunTerminal(managedLogicalRunOwner ?? runId, { stopReason: "error" });
 						if (this.#managedLogicalRunOwner === managedLogicalRunOwner) this.#managedLogicalRunOwner = undefined;
 					}
@@ -2378,12 +2413,14 @@ export class Agent {
 		if (this.#terminalizedLogicalRunIds.size > 256) {
 			this.#terminalizedLogicalRunIds.delete(this.#terminalizedLogicalRunIds.values().next().value!);
 		}
+		const runScopes = this.#runScopes.get(logicalRunId);
+		const terminalScope = runScopes ? [...runScopes].at(-1) : handle?.scope;
 		const terminalEvent: Extract<AgentEvent, { type: "agent_end" }> = event ?? {
 			type: "agent_end",
 			messages: [],
-			scope: handle?.scope,
+			scope: terminalScope,
 		};
-		if (handle) terminalEvent.scope = handle.scope;
+		if (terminalScope) terminalEvent.scope = terminalScope;
 		// The run is over: nothing will poll the steering queue again. Disown
 		// whatever it still holds — unconditionally, so no ownership exception can
 		// leave an ended run's steering behind for an unrelated run to consume —
@@ -2409,6 +2446,8 @@ export class Agent {
 				try {
 					this.resourceLedger.seal(resourceRunId);
 				} finally {
+					for (const scope of runScopes ?? []) this.#mainAttemptScopeObserver?.(scope, false);
+					this.#runScopes.delete(logicalRunId);
 					this.#runHandles.delete(logicalRunId);
 				}
 			}
@@ -2434,7 +2473,7 @@ export class Agent {
 	 *
 	 * Output order: Assistant(preamble) -> ToolResults -> Assistant(continuation)
 	 */
-	#emitCursorSplitAssistantMessage(assistantMessage: AssistantMessage): void {
+	#emitCursorSplitAssistantMessage(assistantMessage: AssistantMessage, scope?: AttemptScope): void {
 		const buffer = this.#cursorToolResultBuffer;
 		this.#cursorToolResultBuffer = [];
 
@@ -2442,7 +2481,7 @@ export class Agent {
 			// No tool results, emit normally
 			this.#state.streamMessage = null;
 			this.appendMessage(assistantMessage);
-			this.#emit({ type: "message_end", message: assistantMessage });
+			this.#emit({ type: "message_end", message: assistantMessage, scope });
 			return;
 		}
 
@@ -2463,13 +2502,13 @@ export class Agent {
 			// Emit assistant message first, then tool results (original behavior but with buffered results)
 			this.#state.streamMessage = null;
 			this.appendMessage(assistantMessage);
-			this.#emit({ type: "message_end", message: assistantMessage });
+			this.#emit({ type: "message_end", message: assistantMessage, scope });
 
 			// Emit buffered tool results
 			for (const { toolResult } of buffer) {
-				this.#emit({ type: "message_start", message: toolResult });
+				this.#emit({ type: "message_start", message: toolResult, scope });
 				this.appendMessage(toolResult);
-				this.#emit({ type: "message_end", message: toolResult });
+				this.#emit({ type: "message_end", message: toolResult, scope });
 			}
 			return;
 		}
@@ -2489,17 +2528,18 @@ export class Agent {
 			...assistantMessage,
 			content: preambleContent,
 		};
+		this.#cursorSplitTerminalMessages.add(assistantMessage);
 
 		// Emit preamble
 		this.#state.streamMessage = null;
 		this.appendMessage(preambleMessage);
-		this.#emit({ type: "message_end", message: preambleMessage });
+		this.#emit({ type: "message_end", message: preambleMessage, scope });
 
 		// Emit buffered tool results
 		for (const { toolResult } of buffer) {
-			this.#emit({ type: "message_start", message: toolResult });
+			this.#emit({ type: "message_start", message: toolResult, scope });
 			this.appendMessage(toolResult);
-			this.#emit({ type: "message_end", message: toolResult });
+			this.#emit({ type: "message_end", message: toolResult, scope });
 		}
 
 		// Emit continuation message (text after tools) if non-empty
@@ -2520,9 +2560,9 @@ export class Agent {
 					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 				},
 			};
-			this.#emit({ type: "message_start", message: continuationMessage });
+			this.#emit({ type: "message_start", message: continuationMessage, scope });
 			this.appendMessage(continuationMessage);
-			this.#emit({ type: "message_end", message: continuationMessage });
+			this.#emit({ type: "message_end", message: continuationMessage, scope });
 		}
 	}
 }
