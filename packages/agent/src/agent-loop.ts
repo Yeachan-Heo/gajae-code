@@ -5499,7 +5499,7 @@ async function executeToolCalls(
 				isError = true;
 			}
 
-			if (afterToolCall && !record.skipped) {
+			if (afterToolCall && record.started) {
 				try {
 					const after = await afterToolCall(
 						{
