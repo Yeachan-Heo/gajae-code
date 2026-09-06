@@ -210,6 +210,74 @@ describe("AgentSession silent-abort marker stamping", () => {
 		expect(session.isPlanCompactAbortPending).toBe(false);
 	});
 
+	it("does not recover a predecessor partial after a branch rotates session identity", async () => {
+		fixture = await createSessionWithObfuscator();
+		const { session } = fixture;
+		const userMessage = {
+			role: "user" as const,
+			content: [{ type: "text" as const, text: "branch root" }],
+			timestamp: Date.now(),
+		};
+		const entryId = session.sessionManager.appendMessage(userMessage);
+		session.agent.appendMessage(userMessage);
+		const partial = makeStoppedAssistantMessage("predecessor partial");
+		session.agent.emitExternalEvent({ type: "message_start", message: partial });
+		await Promise.resolve();
+
+		const result = await session.branch(entryId);
+		expect(result.cancelled).toBe(false);
+		const lateTerminal: Extract<AgentEvent, { type: "agent_end" }> = {
+			type: "agent_end",
+			messages: [],
+			stopReason: "cancelled",
+		};
+		session.agent.emitExternalEvent(lateTerminal);
+		await Bun.sleep(10);
+
+		expect(lateTerminal.messages).toHaveLength(0);
+		expect(
+			session
+				.buildDisplaySessionContext()
+				.messages.some(
+					message =>
+						message.role === "assistant" &&
+						message.content.some(content => content.type === "text" && content.text === "predecessor partial"),
+				),
+		).toBe(false);
+	});
+
+	it("emits a visible notice when canonical orphan persistence fails", async () => {
+		fixture = await createSessionWithObfuscator();
+		const { session } = fixture;
+		const partial = makeStoppedAssistantMessage("unpersisted partial");
+		const events: AgentSessionEvent[] = [];
+		session.subscribe(event => events.push(event));
+		session.agent.emitExternalEvent({ type: "message_start", message: partial });
+		vi.spyOn(session.sessionManager, "appendMessage").mockImplementationOnce(() => {
+			throw new Error("synthetic persistence failure");
+		});
+		const terminal: Extract<AgentEvent, { type: "agent_end" }> = {
+			type: "agent_end",
+			messages: [],
+			stopReason: "cancelled",
+		};
+		session.agent.emitExternalEvent(terminal);
+		for (let attempt = 0; attempt < 50; attempt++) {
+			if (events.some(event => event.type === "notice" && event.source === "session-persistence")) break;
+			await Bun.sleep(1);
+		}
+
+		expect(events).toContainEqual(
+			expect.objectContaining({
+				type: "notice",
+				level: "error",
+				source: "session-persistence",
+			}),
+		);
+		expect(terminal.messages).toHaveLength(0);
+		expect(session.agent.state.messages.some(message => message === partial)).toBe(false);
+	});
+
 	it("A3: flag set + non-aborted message_end does NOT consume the flag", async () => {
 		fixture = await createSessionWithObfuscator();
 		const { session } = fixture;
