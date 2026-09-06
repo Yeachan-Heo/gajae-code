@@ -553,7 +553,7 @@ export class Agent {
 	#maintainContext?: AgentLoopConfig["maintainContext"];
 	#telemetry?: AgentLoopConfig["telemetry"];
 	#appendOnlyContext?: AppendOnlyContextManager;
-	#mainAttemptScopeObserver?: (scope: AttemptScope) => void;
+	#mainAttemptScopeObserver?: (scope: AttemptScope, active: boolean) => void;
 
 	get intentTracing(): boolean {
 		return this.#intentTracing;
@@ -574,7 +574,13 @@ export class Agent {
 	mintSideAttemptScope(): { scope: AttemptScope; dispose: () => void } {
 		const minted = this.#attemptAuthority.mintSide();
 		this.#observeMainAttemptScope(minted.scope);
-		return minted;
+		return {
+			scope: minted.scope,
+			dispose: () => {
+				minted.dispose();
+				this.#mainAttemptScopeObserver?.(minted.scope, false);
+			},
+		};
 	}
 
 	/** Return the Agent-owned attempt scope authority for session record injection. */
@@ -585,7 +591,7 @@ export class Agent {
 	 * Observe each main-attempt scope synchronously, before any provider or
 	 * extension-capable lifecycle work can begin.
 	 */
-	setMainAttemptScopeObserver(observer: ((scope: AttemptScope) => void) | undefined): void {
+	setMainAttemptScopeObserver(observer: ((scope: AttemptScope, active: boolean) => void) | undefined): void {
 		this.#mainAttemptScopeObserver = observer;
 	}
 
@@ -594,7 +600,7 @@ export class Agent {
 	}
 
 	#observeMainAttemptScope(scope: AttemptScope): void {
-		this.#mainAttemptScopeObserver?.(scope);
+		this.#mainAttemptScopeObserver?.(scope, true);
 	}
 
 	streamFn: StreamFn;
@@ -1599,9 +1605,9 @@ export class Agent {
 			},
 			() => {
 				for (const message of request.messages ?? []) {
-					this.#emit({ type: "message_start", message });
+					this.#emit({ type: "message_start", message, scope: handle.scope });
 					this.appendMessage(message);
-					this.#emit({ type: "message_end", message });
+					this.#emit({ type: "message_end", message, scope: handle.scope });
 				}
 			},
 		);
@@ -2354,7 +2360,7 @@ export class Agent {
 						// The documented contract emits the sanitized diagnostic
 						// before the error terminal on this path too (exact-head
 						// review P2).
-						this.#emit({ type: "agent_failed", error: sanitizeAgentFailure(err) });
+						this.#emit({ type: "agent_failed", error: sanitizeAgentFailure(err), scope: ownership.handle.scope });
 						this.requestRunTerminal(managedLogicalRunOwner ?? runId, { stopReason: "error" });
 						if (this.#managedLogicalRunOwner === managedLogicalRunOwner) this.#managedLogicalRunOwner = undefined;
 					}
@@ -2433,6 +2439,7 @@ export class Agent {
 				try {
 					this.resourceLedger.seal(resourceRunId);
 				} finally {
+					if (handle) this.#mainAttemptScopeObserver?.(handle.scope, false);
 					this.#runHandles.delete(logicalRunId);
 				}
 			}
