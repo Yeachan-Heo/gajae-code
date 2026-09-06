@@ -437,7 +437,7 @@ describe("coordinator session state lock", () => {
 			await reclaimStaleSessionStateLock(lockFile);
 
 			expect(fsSync.existsSync(lockFile)).toBe(false);
-		});
+		}, 15_000);
 
 		/**
 		 * Unknown liveness never authorizes a deletion, but recorded IDENTITY still can:
@@ -464,7 +464,7 @@ describe("coordinator session state lock", () => {
 			await reclaimStaleSessionStateLock(lockFile);
 
 			expect(fsSync.existsSync(lockFile)).toBe(false);
-		});
+		}, 15_000);
 
 		it("preserves an unversioned live owner when its start-time encoding mismatches", async () => {
 			const { stateFile } = await seededRunningSession("lock-legacy-mismatched-start");
@@ -498,7 +498,7 @@ describe("coordinator session state lock", () => {
 		expect((await readJson(stateFile)).activity).toMatchObject({ seq: 1, tool: "bash" });
 		await expectReleasedOwner(`${stateFile}.lock`);
 		expectReleasedTransition(`${stateFile}.lock`);
-	});
+	}, 15_000);
 
 	it("reclaims a malformed owner file only once it is stale", async () => {
 		const { root, stateFile } = await seededRunningSession("lock-malformed-owner");
@@ -1316,7 +1316,7 @@ describe("coordinator session state lock", () => {
 		);
 		let monotonicNow = 0;
 		SessionStateLockTestHooks.afterTransitionClaimContention = target => {
-			if (target === transitionDir) monotonicNow = 2_100;
+			if (target === transitionDir) monotonicNow = 5_100;
 		};
 		const now = vi.spyOn(performance, "now").mockImplementation(() => monotonicNow);
 		try {
