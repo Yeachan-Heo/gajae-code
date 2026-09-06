@@ -158,11 +158,12 @@ describe("AgentSession silent-abort marker stamping", () => {
 	it("canonically commits and classifies an orphan before publishing the same agent_end object", async () => {
 		fixture = await createSessionWithObfuscator();
 		const { session } = fixture;
+		const { scope, dispose: disposeScope } = session.agent.mintSideAttemptScope();
 		const seen: AgentSessionEvent[] = [];
 		session.subscribe(event => seen.push(event));
 
 		const provisional = makeStoppedAssistantMessage("retained orphan partial");
-		session.agent.emitExternalEvent({ type: "message_start", message: provisional });
+		session.agent.emitExternalEvent({ type: "message_start", message: provisional, scope });
 		session.agent.emitExternalEvent({
 			type: "message_update",
 			message: provisional,
@@ -172,6 +173,7 @@ describe("AgentSession silent-abort marker stamping", () => {
 				delta: "retained orphan partial",
 				partial: provisional,
 			},
+			scope,
 		});
 		const provisionalText = provisional.content[0];
 		if (provisionalText?.type === "text") provisionalText.text = "mutated after captured update";
@@ -181,6 +183,7 @@ describe("AgentSession silent-abort marker stamping", () => {
 			type: "agent_end",
 			messages: [],
 			stopReason: "cancelled",
+			scope,
 		};
 		session.agent.emitExternalEvent(rawAgentEnd);
 		let agentEnd: Extract<AgentSessionEvent, { type: "agent_end" }> | undefined;
@@ -210,6 +213,7 @@ describe("AgentSession silent-abort marker stamping", () => {
 				),
 		).toBe(true);
 		expect(session.isPlanCompactAbortPending).toBe(false);
+		disposeScope();
 	});
 
 	it("matches forced recovery by attempt scope after abort advances prompt generation", async () => {
@@ -240,13 +244,15 @@ describe("AgentSession silent-abort marker stamping", () => {
 	it("canonically admits an authoritative external terminal without message_end", async () => {
 		fixture = await createSessionWithObfuscator();
 		const { session } = fixture;
+		const { scope, dispose: disposeScope } = session.agent.mintSideAttemptScope();
 		const presentationMessage = makeStoppedAssistantMessage("external partial");
 		const finalMessage = makeStoppedAssistantMessage("external final");
-		session.agent.emitExternalEvent({ type: "message_start", message: presentationMessage });
+		session.agent.emitExternalEvent({ type: "message_start", message: presentationMessage, scope });
 		const terminal: Extract<AgentEvent, { type: "agent_end" }> = {
 			type: "agent_end",
 			messages: [finalMessage],
 			stopReason: "completed",
+			scope,
 		};
 		session.agent.emitExternalEvent(terminal);
 		await session.awaitSessionSettlement();
@@ -263,6 +269,7 @@ describe("AgentSession silent-abort marker stamping", () => {
 						getSessionMessageEntryId(message) === getSessionMessageEntryId(finalMessage),
 				),
 		).toBe(true);
+		disposeScope();
 	});
 
 	it("persists silent classification on a cancelled authoritative external terminal", async () => {
@@ -347,10 +354,11 @@ describe("AgentSession silent-abort marker stamping", () => {
 	it("emits a visible notice when canonical orphan persistence fails", async () => {
 		fixture = await createSessionWithObfuscator();
 		const { session } = fixture;
+		const { scope, dispose: disposeScope } = session.agent.mintSideAttemptScope();
 		const partial = makeStoppedAssistantMessage("unpersisted partial");
 		const events: AgentSessionEvent[] = [];
 		session.subscribe(event => events.push(event));
-		session.agent.emitExternalEvent({ type: "message_start", message: partial });
+		session.agent.emitExternalEvent({ type: "message_start", message: partial, scope });
 		vi.spyOn(session.sessionManager, "appendMessage").mockImplementationOnce(() => {
 			throw new Error("synthetic persistence failure");
 		});
@@ -358,6 +366,7 @@ describe("AgentSession silent-abort marker stamping", () => {
 			type: "agent_end",
 			messages: [],
 			stopReason: "cancelled",
+			scope,
 		};
 		session.agent.emitExternalEvent(terminal);
 		await session.awaitSessionSettlement();
@@ -374,6 +383,7 @@ describe("AgentSession silent-abort marker stamping", () => {
 		expect(terminal.messages).toHaveLength(0);
 		expect(session.agent.state.messages.some(message => message === partial)).toBe(false);
 		expect(session.agent.state.streamMessage).toBeNull();
+		disposeScope();
 		expect(() => session.newSession()).toThrow(expect.objectContaining({ code: "session_persistence_blocked" }));
 		const recovery = vi
 			.spyOn(session.sessionManager, "recoverPersistenceFailure")
