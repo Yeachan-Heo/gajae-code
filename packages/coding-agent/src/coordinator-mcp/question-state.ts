@@ -163,6 +163,8 @@ export interface PromptRequestV1 {
 	phase: "claimed" | "remote_started" | "accepted" | "linked" | "terminal" | "completed" | "uncertain";
 	runtime_receipt?: { accepted: true; command_id: string; turn_id: string };
 	coordinator_turn_id?: string;
+	/** Retain prompt and source turn until the delegate's outer response is durable. */
+	delegate_response_pending?: boolean;
 	safe_response?: Record<string, unknown>;
 	error_code?: PublicReason | "idempotency_conflict";
 	created_at: string;
@@ -244,7 +246,12 @@ export interface CoordinatorSessionTransactionV1 {
 		scheduler_applied_revision?: number;
 		scheduler_digest?: string;
 	};
-	recovery: { prompt_watermark_at: string | null; last_repaired_at: string | null };
+	recovery: {
+		prompt_watermark_at: string | null;
+		last_repaired_at: string | null;
+		/** One-shot authority for the initial delegate prompt, consumed atomically with its claim. */
+		initial_delegate_request?: { key_digest: string; request_digest: string };
+	};
 }
 interface CoordinatorSessionHistoryV1 {
 	schema_version: 1;
@@ -815,6 +822,7 @@ function assertTransaction(transaction: CoordinatorSessionTransactionV1, namespa
 		typeof request.canonical_prompt.text !== "string" ||
 		!safeId(request.sdk_idempotency_key) ||
 		!promptPhases.has(String(request.phase)) ||
+		(request.delegate_response_pending !== undefined && typeof request.delegate_response_pending !== "boolean") ||
 		!isTime(request.created_at) ||
 		!isTime(request.updated_at) ||
 		(request.coordinator_turn_id !== undefined &&
@@ -1194,6 +1202,12 @@ function assertTransaction(transaction: CoordinatorSessionTransactionV1, namespa
 			(typeof projection.scheduler_digest !== "string" || projection.scheduler_digest.length === 0)) ||
 		(recovery.prompt_watermark_at !== null && !isTime(recovery.prompt_watermark_at)) ||
 		(recovery.last_repaired_at !== null && !isTime(recovery.last_repaired_at)) ||
+		(recovery.initial_delegate_request !== undefined &&
+			(!isRecord(recovery.initial_delegate_request) ||
+				typeof recovery.initial_delegate_request.key_digest !== "string" ||
+				!/^[a-f0-9]{64}$/.test(recovery.initial_delegate_request.key_digest) ||
+				typeof recovery.initial_delegate_request.request_digest !== "string" ||
+				!/^[a-f0-9]{64}$/.test(recovery.initial_delegate_request.request_digest))) ||
 		(queue.selected_promotion !== null &&
 			(!isRecord(queue.selected_promotion) ||
 				!safeId(queue.selected_promotion.from_turn_id) ||
@@ -1837,7 +1851,15 @@ export async function commitCreationWal(
 					scheduler_applied_revision: 0,
 					scheduler_digest: digest(JSON.stringify({ session_id: session.session_id, revision: 1 })),
 				},
-				recovery: { prompt_watermark_at: null, last_repaired_at: null },
+				recovery: {
+					prompt_watermark_at: null,
+					last_repaired_at: null,
+					// Only a newly created WAL may grant pre-dispatch authority. An
+					// existing WAL above must never replenish a consumed/compacted claim.
+					...(intent.kind === "delegate"
+						? { initial_delegate_request: { key_digest: keyDigest, request_digest: request.request_digest } }
+						: {}),
+				},
 			};
 			assertTransaction(transaction, session.namespace_id, session.session_id);
 			await writeAtomic(transactionPath(paths, session.session_id), transaction);
@@ -2320,6 +2342,13 @@ export async function enumeratePublicDeliveries(
 export function compactTransaction(transaction: CoordinatorSessionTransactionV1, now = Date.now()): void {
 	normalizeOutbox(transaction);
 	const old = (time: string): boolean => Date.parse(time) + RETENTION_MS < now;
+	// Prompt acceptance/canonical finalization precedes the outer delegate receipt.
+	// Neither retention nor pressure compaction may erase that recovery authority.
+	const pinnedPrompts = Object.values(transaction.requests.prompts).filter(
+		request => request.delegate_response_pending === true,
+	);
+	const pinnedRequests = new Set<object>(pinnedPrompts);
+	const pinnedTurns = new Set(pinnedPrompts.map(request => request.coordinator_turn_id));
 	for (const [id, event] of Object.entries(transaction.outbox))
 		if (
 			event.emitted &&
@@ -2332,6 +2361,7 @@ export function compactTransaction(transaction: CoordinatorSessionTransactionV1,
 		for (const [id, request] of Object.entries(group))
 			if (
 				request.phase === "completed" &&
+				!pinnedRequests.has(request) &&
 				old(request.updated_at) &&
 				JSON.stringify(transaction.canonical).includes(id) === false
 			)
@@ -2347,6 +2377,7 @@ export function compactTransaction(transaction: CoordinatorSessionTransactionV1,
 		for (const turnId of terminalTurnIds) {
 			const turn = transaction.canonical.turns[turnId];
 			if (!turn) continue;
+			if (pinnedTurns.has(turnId)) continue;
 			// Both promotion endpoints stay addressable for later projection repair;
 			// deleting either would corrupt the WAL instead of completing at capacity.
 			if (

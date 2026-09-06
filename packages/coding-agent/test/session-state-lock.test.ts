@@ -14,6 +14,7 @@ import {
 	sessionStateLockFailureFields,
 	setSessionStateLockNativeBindings,
 	shouldWarnPersistFailure,
+	tryWithSessionStateFileLock,
 	withSessionStateFileLock,
 } from "../src/gjc-runtime/session-state-lock";
 import {
@@ -230,6 +231,199 @@ describe("coordinator session state lock", () => {
 		expect(order).toEqual(["holder-released", "waiter-wrote"]);
 		expect((await readJson(stateFile)).activity).toMatchObject({ seq: 1, tool: "bash" });
 	}, 15_000);
+
+	it("try-acquire skips live local transitions, owner records, and disk claims without waiting", async () => {
+		const stateFile = path.join(await tempRoot(), "try-busy.json");
+		const lockFile = `${stateFile}.lock`;
+		const transitionDir = `${lockFile}.transition`;
+		const transitionEntered = Promise.withResolvers<void>();
+		const releaseTransition = Promise.withResolvers<void>();
+		const holderEntered = Promise.withResolvers<void>();
+		const releaseHolder = Promise.withResolvers<void>();
+		const attempts: Array<Promise<unknown>> = [];
+		const realSleep = Bun.sleep;
+		const sleep = vi.spyOn(Bun, "sleep");
+		let callbacks = 0;
+		let queued = 0;
+		let externalClaim = false;
+		SessionStateLockTestHooks.unqualifiedOwnerIsLocal = false;
+		SessionStateLockTestHooks.afterLocalTransitionQueued = () => queued++;
+		SessionStateLockTestHooks.beforeTransitionSetupLstat = async target => {
+			if (target !== transitionDir) return;
+			SessionStateLockTestHooks.beforeTransitionSetupLstat = undefined;
+			transitionEntered.resolve();
+			await releaseTransition.promise;
+		};
+		const holder = withSessionStateFileLock(stateFile, async () => {
+			holderEntered.resolve();
+			await releaseHolder.promise;
+		});
+		const tryOnce = async () => {
+			const attempt = tryWithSessionStateFileLock(stateFile, async () => {
+				callbacks++;
+				return "maintenance";
+			});
+			attempts.push(attempt);
+			// Drain every contender in finally even if the deadline detects a regression.
+			return await Promise.race([attempt, realSleep(1_000).then(() => "blocked" as const)]);
+		};
+		try {
+			await transitionEntered.promise;
+			const localClaim = transitionToken(transitionDir);
+			expect(await tryOnce()).toEqual({ acquired: false });
+			expect(transitionToken(transitionDir)).toBe(localClaim);
+			expect(queued).toBe(0);
+			expect(callbacks).toBe(0);
+
+			releaseTransition.resolve();
+			await holderEntered.promise;
+			const ownerBytes = await Bun.file(lockFile).text();
+			const ownerIdentity = transitionToken(lockFile);
+			expect(await tryOnce()).toEqual({ acquired: false });
+			expect(await Bun.file(lockFile).text()).toBe(ownerBytes);
+			expect(transitionToken(lockFile)).toBe(ownerIdentity);
+			expect(callbacks).toBe(0);
+
+			releaseHolder.resolve();
+			await holder;
+			expect(await tryOnce()).toEqual({ acquired: true, value: "maintenance" });
+			expect(callbacks).toBe(1);
+
+			await fs.mkdir(transitionDir);
+			externalClaim = true;
+			const diskOwner = JSON.stringify({
+				pid: process.pid,
+				start_time: "unknown",
+				token: "unregistered-live-try-claim",
+				owner_host_id: "local-host",
+			});
+			await Bun.write(`${transitionDir}.owner`, diskOwner);
+			const diskClaim = transitionToken(transitionDir);
+			expect(await tryOnce()).toEqual({ acquired: false });
+			expect(await Bun.file(`${transitionDir}.owner`).text()).toBe(diskOwner);
+			expect(transitionToken(transitionDir)).toBe(diskClaim);
+			expect(callbacks).toBe(1);
+			await fs.rm(`${transitionDir}.owner`);
+			await fs.rmdir(transitionDir);
+			externalClaim = false;
+			expect(await tryOnce()).toEqual({ acquired: true, value: "maintenance" });
+			expect(callbacks).toBe(2);
+			expect(sleep).not.toHaveBeenCalled();
+			await expectReleasedOwner(lockFile);
+			expectReleasedTransition(lockFile);
+		} finally {
+			releaseTransition.resolve();
+			releaseHolder.resolve();
+			SessionStateLockTestHooks.beforeTransitionSetupLstat = undefined;
+			if (externalClaim) {
+				await fs.rm(`${transitionDir}.owner`, { force: true });
+				await fs.rmdir(transitionDir);
+			}
+			sleep.mockRestore();
+			await Promise.allSettled([holder, ...attempts]);
+		}
+	});
+
+	it("try-acquire safely reclaims stale owners and propagates callback and release failures", async () => {
+		const root = await tempRoot();
+		const sleep = vi.spyOn(Bun, "sleep");
+		SessionStateLockTestHooks.unqualifiedOwnerIsLocal = false;
+		try {
+			for (const shape of ["regular", "transition", "malformed"] as const) {
+				const stateFile = path.join(root, `try-stale-${shape}.json`);
+				const lockFile = `${stateFile}.lock`;
+				const ownerFile = shape === "transition" ? `${lockFile}.transition.owner` : lockFile;
+				if (shape === "transition") await fs.mkdir(`${lockFile}.transition`);
+				await Bun.write(
+					ownerFile,
+					JSON.stringify({
+						pid: DEAD_PID,
+						start_time: "unknown",
+						token: `dead-try-${shape}`,
+						owner_host_id: "local-host",
+						...(shape === "malformed" ? { released: false } : {}),
+					}),
+				);
+				const stale = new Date(Date.now() - 60_000);
+				await fs.utimes(ownerFile, stale, stale);
+				let callbacks = 0;
+				const operation = async () => {
+					callbacks++;
+					expect((await readJson(lockFile)).pid).toBe(process.pid);
+					return "reclaimed";
+				};
+				const first = await tryWithSessionStateFileLock(stateFile, operation);
+				if (shape === "regular") {
+					expect(first).toEqual({ acquired: true, value: "reclaimed" });
+				} else {
+					expect(first).toEqual({ acquired: false });
+					expect(callbacks).toBe(0);
+					expect(await tryWithSessionStateFileLock(stateFile, operation)).toEqual({
+						acquired: true,
+						value: "reclaimed",
+					});
+				}
+				expect(callbacks).toBe(1);
+				await expectReleasedOwner(lockFile);
+				expectReleasedTransition(lockFile);
+			}
+
+			const stateFile = path.join(root, "try-callback-errors.json");
+			for (const primary of [
+				Object.assign(new Error("callback EEXIST is not contention"), { code: "EEXIST" }),
+				new SessionStateLockUnavailableError({
+					lockPath: "callback-owned.lock.transition",
+					reason: "transition_claim_timeout",
+				}),
+			]) {
+				await expect(
+					tryWithSessionStateFileLock(stateFile, () => {
+						throw primary;
+					}),
+				).rejects.toBe(primary);
+				await expect(
+					tryWithSessionStateFileLock(stateFile, async () => {
+						throw primary;
+					}),
+				).rejects.toBe(primary);
+				await expectReleasedOwner(`${stateFile}.lock`);
+				expect(await tryWithSessionStateFileLock(stateFile, async () => "after-error")).toEqual({
+					acquired: true,
+					value: "after-error",
+				});
+			}
+
+			for (const callbackFails of [false, true]) {
+				const stateFile = path.join(root, `try-release-error-${callbackFails}.json`);
+				const primary = new Error("primary callback failure");
+				const release = Object.assign(new Error("owner release failure"), { code: "EACCES" });
+				SessionStateLockTestHooks.beforeCurrentOwnerRelease = target => {
+					if (target === `${stateFile}.lock`) throw release;
+				};
+				let callbacks = 0;
+				const observed = await tryWithSessionStateFileLock(stateFile, async () => {
+					callbacks++;
+					if (callbackFails) throw primary;
+					return "written";
+				}).catch((error: unknown) => error);
+				expect(callbacks).toBe(1);
+				if (callbackFails) {
+					expect(observed).toBeInstanceOf(AggregateError);
+					const failures = (observed as AggregateError).errors;
+					expect(failures[0]).toBe(primary);
+					expect(failures[1]).toBeInstanceOf(SessionStateLockUnavailableError);
+					expect((failures[1] as Error).cause).toBe(release);
+				} else {
+					expect(observed).toBeInstanceOf(SessionStateLockUnavailableError);
+					expect(observed).toMatchObject({ reason: "lock_release_failed", cause: release });
+				}
+			}
+			expect(sleep).not.toHaveBeenCalled();
+		} finally {
+			SessionStateLockTestHooks.beforeCurrentOwnerRelease = undefined;
+			sleep.mockRestore();
+		}
+	});
 
 	it("serializes concurrent resume contenders after reclaiming a dead transition claim", async () => {
 		const { stateFile } = await seededRunningSession("lock-concurrent-resume");
