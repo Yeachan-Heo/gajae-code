@@ -390,4 +390,33 @@ describe("EventController #handleMessageEnd abort labeling", () => {
 		gate.resolve();
 		await pending;
 	});
+
+	it("terminal persistence failure removes the uncommitted live projection", async () => {
+		const initial = makeAssistantMessage({
+			stopReason: "stop",
+			content: [{ type: "text", text: "must not survive failed persistence" }],
+		});
+		const f = createFixture({ streamingMessage: initial });
+		f.ctx.setWorkingMessage = vi.fn();
+		let stopped = false;
+		f.ctx.planModeController = {
+			flushPendingModelSwitch: vi.fn(() => {
+				stopped = true;
+			}),
+		} as never;
+		f.ctx.isStopped = () => stopped;
+		await f.controller.handleEvent({ type: "message_start", message: initial });
+		const component = f.ctx.streamingComponent!;
+
+		await f.controller.handleEvent({
+			type: "agent_end",
+			messages: [],
+			stopReason: "cancelled",
+			terminalPersistenceFailed: true,
+		} as never);
+
+		expect(f.ctx.chatContainer.hasLiveChild(component)).toBe(false);
+		expect(f.ctx.streamingComponent).toBeUndefined();
+		expect(f.ctx.streamingMessage).toBeUndefined();
+	});
 });

@@ -1088,7 +1088,7 @@ export class EventController {
 	async #handleAgentEnd(event: Extract<AgentSessionEvent, { type: "agent_end" }>): Promise<void> {
 		const orphanComponent = this.ctx.streamingComponent;
 		const orphanMessage = this.ctx.streamingMessage?.role === "assistant" ? this.ctx.streamingMessage : undefined;
-		if (orphanComponent && orphanMessage) {
+		if (orphanComponent && orphanMessage && event.terminalPersistenceFailed !== true) {
 			// An agent_end without message_end still owns the in-flight assistant.  Commit
 			// its latest partial text as a historical component instead of removing it
 			// before a frame can paint it.  A terminal payload, when present, is more

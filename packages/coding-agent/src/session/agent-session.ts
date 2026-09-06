@@ -789,6 +789,7 @@ type AgentEndSessionEvent = Extract<AgentEvent, { type: "agent_end" }> & {
 	/** Immutable abort-display classification captured before asynchronous UI dispatch. */
 	readonly silentAbort?: true;
 	readonly ttsrAbort?: true;
+	readonly terminalPersistenceFailed?: true;
 };
 
 type MessageEndSessionEvent = Extract<AgentEvent, { type: "message_end" }> & {
@@ -6306,9 +6307,11 @@ export class AgentSession {
 	// Track last assistant message for auto-compaction check
 	#lastAssistantMessage: AssistantMessage | undefined = undefined;
 	#sessionIdentityEpoch = 0;
+	readonly #retiredSessionIdentityAttemptScopes = new WeakSet<AttemptScope>();
 	#provisionalAssistantMessage:
 		| {
 				message: AssistantMessage;
+				presentationMessage: AssistantMessage;
 				promptGeneration: number;
 				attemptScope: AttemptScope | undefined;
 				sessionIdentityEpoch: number;
@@ -6397,6 +6400,7 @@ export class AgentSession {
 		eventLease?: RunResourceProducerLease,
 	): Promise<void> => {
 		const attemptScope = (event as AgentEvent & { scope?: AttemptScope }).scope;
+		if (attemptScope && this.#retiredSessionIdentityAttemptScopes.has(attemptScope)) return;
 		const terminalSnapshot = event as AgentEvent & { readonly silentAbort?: true; readonly ttsrAbort?: true };
 		const terminalWasAborted =
 			(event.type === "agent_end" && event.stopReason === "cancelled") ||
@@ -6411,7 +6415,8 @@ export class AgentSession {
 		}
 		if (event.type === "message_start" && event.message.role === "assistant") {
 			this.#provisionalAssistantMessage = {
-				message: event.message,
+				message: structuredClone(event.message),
+				presentationMessage: event.message,
 				promptGeneration: this.#promptGeneration,
 				attemptScope,
 				sessionIdentityEpoch: this.#sessionIdentityEpoch,
@@ -6423,16 +6428,33 @@ export class AgentSession {
 			this.#provisionalAssistantMessage.attemptScope === attemptScope &&
 			this.#provisionalAssistantMessage.sessionIdentityEpoch === this.#sessionIdentityEpoch
 		) {
-			this.#provisionalAssistantMessage.message = event.message;
+			this.#provisionalAssistantMessage.message = structuredClone(event.message);
+			this.#provisionalAssistantMessage.presentationMessage = event.message;
 		}
+		const provisionalAssistant = this.#provisionalAssistantMessage;
+		const provisionalAttemptMatches =
+			provisionalAssistant !== undefined &&
+			(provisionalAssistant.attemptScope !== undefined || attemptScope !== undefined
+				? provisionalAssistant.attemptScope === attemptScope
+				: provisionalAssistant.promptGeneration === this.#promptGeneration);
+		const terminalAssistant =
+			event.type === "agent_end"
+				? [...event.messages].reverse().find((message): message is AssistantMessage => message.role === "assistant")
+				: undefined;
 		const orphanAssistant =
 			event.type === "agent_end" &&
-			event.stopReason === "cancelled" &&
-			!event.messages.some(message => message.role === "assistant") &&
-			this.#provisionalAssistantMessage?.promptGeneration === this.#promptGeneration &&
-			this.#provisionalAssistantMessage.attemptScope === attemptScope &&
-			this.#provisionalAssistantMessage.sessionIdentityEpoch === this.#sessionIdentityEpoch
-				? this.#provisionalAssistantMessage.message
+			event.stopReason !== "maintenance" &&
+			terminalAssistant === undefined &&
+			provisionalAttemptMatches &&
+			provisionalAssistant.sessionIdentityEpoch === this.#sessionIdentityEpoch
+				? provisionalAssistant
+				: undefined;
+		const unadmittedTerminalAssistant =
+			event.type === "agent_end" &&
+			event.stopReason !== "maintenance" &&
+			terminalAssistant !== undefined &&
+			getSessionMessageEntryId(terminalAssistant) === undefined
+				? terminalAssistant
 				: undefined;
 		if (event.type === "turn_start" || (event.type === "message_end" && event.message.role === "assistant")) {
 			this.#provisionalAssistantMessage = undefined;
@@ -6585,41 +6607,50 @@ export class AgentSession {
 			}
 		}
 
-		if (event.type === "agent_end" && orphanAssistant) {
+		if (event.type === "agent_end" && (orphanAssistant || unadmittedTerminalAssistant)) {
 			if (canonicalAdmission && !canonicalAdmission.predecessor.released) {
 				await canonicalAdmission.predecessor.promise;
 			}
-			const recoveredAssistant: AssistantMessage = {
-				...orphanAssistant,
-				stopReason: "aborted",
-				...(silentTerminal || ttsrTerminal ? { errorMessage: SILENT_ABORT_MARKER } : {}),
-			};
-			try {
-				this.sessionManager.appendMessage(recoveredAssistant);
-			} catch (error) {
-				if (error instanceof SessionNearLimitAppendError && error.entryRetained) {
-					this.emitNotice(
-						"warning",
-						"Interrupted assistant output is retained in the live session but could not be written durably. Compact or export the session before continuing.",
-						"session-persistence",
-					);
-				} else {
-					this.emitNotice(
-						"error",
-						"Interrupted assistant output could not be committed to session history. Reconcile session storage before continuing.",
-						"session-persistence",
-					);
-					this.agent.abort();
-					throw error;
+			if (!unadmittedTerminalAssistant || getSessionMessageEntryId(unadmittedTerminalAssistant) === undefined) {
+				const recoveredAssistant: AssistantMessage = unadmittedTerminalAssistant ?? {
+					...orphanAssistant!.message,
+					stopReason: event.stopReason === "cancelled" ? "aborted" : orphanAssistant!.message.stopReason,
+					...(silentTerminal || ttsrTerminal ? { errorMessage: SILENT_ABORT_MARKER } : {}),
+				};
+				let persistenceFailed = false;
+				try {
+					this.sessionManager.appendMessage(recoveredAssistant);
+				} catch (error) {
+					if (error instanceof SessionNearLimitAppendError && error.entryRetained) {
+						this.emitNotice(
+							"warning",
+							"Interrupted assistant output is retained in the live session but could not be written durably. Compact or export the session before continuing.",
+							"session-persistence",
+						);
+					} else {
+						this.emitNotice(
+							"error",
+							"Interrupted assistant output could not be committed to session history. Reconcile session storage before continuing.",
+							"session-persistence",
+						);
+						Object.defineProperty(event, "terminalPersistenceFailed", { value: true, enumerable: true });
+						persistenceFailed = true;
+					}
 				}
-			}
-			if (!this.agent.state.messages.includes(recoveredAssistant)) this.agent.appendMessage(recoveredAssistant);
-			event.messages.push(recoveredAssistant);
-			this.#lastAssistantMessage = recoveredAssistant;
-			this.#lastAssistantAdmissionByMessage.set(recoveredAssistant, canonicalAdmission);
-			if (silentTerminal) {
-				this.#planCompactAbortPending = false;
-				this.#silentAbortPending = false;
+				if (!persistenceFailed) {
+					if (!this.agent.state.messages.includes(recoveredAssistant))
+						this.agent.appendMessage(recoveredAssistant);
+					if (!terminalAssistant) event.messages.push(recoveredAssistant);
+					if (orphanAssistant && orphanAssistant.presentationMessage !== recoveredAssistant) {
+						transferSessionMessageIdentity([recoveredAssistant], [orphanAssistant.presentationMessage]);
+					}
+					this.#lastAssistantMessage = recoveredAssistant;
+					this.#lastAssistantAdmissionByMessage.set(recoveredAssistant, canonicalAdmission);
+				}
+				if (silentTerminal) {
+					this.#planCompactAbortPending = false;
+					this.#silentAbortPending = false;
+				}
 			}
 		}
 
@@ -6801,6 +6832,24 @@ export class AgentSession {
 				const displayMessage = { ...message, content: deobfuscatedContent };
 				transferSessionMessageIdentity([message], [displayMessage]);
 				displayEvent = { ...event, message: displayMessage };
+			}
+		}
+		if (displayEvent !== event) {
+			if (terminalSnapshot.silentAbort === true) {
+				Object.defineProperty(displayEvent, "silentAbort", {
+					value: true,
+					enumerable: true,
+					writable: false,
+					configurable: false,
+				});
+			}
+			if (terminalSnapshot.ttsrAbort === true) {
+				Object.defineProperty(displayEvent, "ttsrAbort", {
+					value: true,
+					enumerable: true,
+					writable: false,
+					configurable: false,
+				});
 			}
 		}
 
@@ -15885,6 +15934,10 @@ export class AgentSession {
 					return false;
 				}
 			}
+			const predecessorAttemptScope = this.#activeAttemptScope;
+			if (this.isStreaming) await this.abort();
+			await this.awaitSessionSettlement();
+			if (predecessorAttemptScope) this.#retiredSessionIdentityAttemptScopes.add(predecessorAttemptScope);
 
 			// Flush current session to ensure all entries are written
 			await this.sessionManager.flush();
@@ -23945,6 +23998,10 @@ export class AgentSession {
 				}
 				skipConversationRestore = result?.skipConversationRestore ?? false;
 			}
+			const predecessorAttemptScope = this.#activeAttemptScope;
+			if (this.isStreaming) await this.abort();
+			await this.awaitSessionSettlement();
+			if (predecessorAttemptScope) this.#retiredSessionIdentityAttemptScopes.add(predecessorAttemptScope);
 
 			// Flush pending writes before preparing the successor.
 			await this.sessionManager.flush();
