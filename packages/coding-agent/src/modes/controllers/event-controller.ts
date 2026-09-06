@@ -888,6 +888,14 @@ export class EventController {
 	async #handleMessageEnd(event: Extract<AgentSessionEvent, { type: "message_end" }>): Promise<void> {
 		if (event.message.role === "user") return;
 		if (event.message.role === "assistant") this.#cancelAssistantTextPresentation();
+		if (event.message.role === "assistant" && event.terminalPersistenceFailed === true) {
+			if (this.ctx.streamingComponent) this.ctx.chatContainer.removeChild(this.ctx.streamingComponent);
+			this.ctx.streamingComponent = undefined;
+			this.ctx.streamingMessage = undefined;
+			this.#recordVisibleTranscriptMutation();
+			this.ctx.ui.requestRender();
+			return;
+		}
 		if (this.ctx.streamingComponent && event.message.role === "assistant") {
 			if (this.ctx.streamingMessage?.role === "assistant") {
 				transferSessionMessageIdentity([this.ctx.streamingMessage], [event.message]);

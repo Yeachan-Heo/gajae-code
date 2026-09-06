@@ -1019,9 +1019,10 @@ export class Agent {
 	createExternalEventEmitterForCurrentRun(): ((event: AgentEvent) => void) | undefined {
 		const runId = this.#activeRunId;
 		if (runId === undefined) return undefined;
+		const scope = this.#runHandles.get(this.#managedLogicalRunOwner ?? runId)?.scope;
 		return (event: AgentEvent) => {
 			if (this.#activeRunId !== runId) return;
-			this.emitExternalEvent(event);
+			this.emitExternalEvent(scope && !event.scope ? { ...event, scope } : event);
 		};
 	}
 
@@ -2126,7 +2127,7 @@ export class Agent {
 						// Check if this is an assistant message with buffered Cursor tool results.
 						// If so, split the message to emit tool results at the correct position.
 						if (event.message.role === "assistant" && this.#cursorToolResultBuffer.length > 0) {
-							this.#emitCursorSplitAssistantMessage(event.message as AssistantMessage);
+							this.#emitCursorSplitAssistantMessage(event.message as AssistantMessage, event.scope);
 							continue; // Skip default emit - split method handles everything
 						}
 						this.#state.streamMessage = null;
@@ -2446,7 +2447,7 @@ export class Agent {
 	 *
 	 * Output order: Assistant(preamble) -> ToolResults -> Assistant(continuation)
 	 */
-	#emitCursorSplitAssistantMessage(assistantMessage: AssistantMessage): void {
+	#emitCursorSplitAssistantMessage(assistantMessage: AssistantMessage, scope?: AttemptScope): void {
 		const buffer = this.#cursorToolResultBuffer;
 		this.#cursorToolResultBuffer = [];
 
@@ -2454,7 +2455,7 @@ export class Agent {
 			// No tool results, emit normally
 			this.#state.streamMessage = null;
 			this.appendMessage(assistantMessage);
-			this.#emit({ type: "message_end", message: assistantMessage });
+			this.#emit({ type: "message_end", message: assistantMessage, scope });
 			return;
 		}
 
@@ -2475,13 +2476,13 @@ export class Agent {
 			// Emit assistant message first, then tool results (original behavior but with buffered results)
 			this.#state.streamMessage = null;
 			this.appendMessage(assistantMessage);
-			this.#emit({ type: "message_end", message: assistantMessage });
+			this.#emit({ type: "message_end", message: assistantMessage, scope });
 
 			// Emit buffered tool results
 			for (const { toolResult } of buffer) {
-				this.#emit({ type: "message_start", message: toolResult });
+				this.#emit({ type: "message_start", message: toolResult, scope });
 				this.appendMessage(toolResult);
-				this.#emit({ type: "message_end", message: toolResult });
+				this.#emit({ type: "message_end", message: toolResult, scope });
 			}
 			return;
 		}
@@ -2505,13 +2506,13 @@ export class Agent {
 		// Emit preamble
 		this.#state.streamMessage = null;
 		this.appendMessage(preambleMessage);
-		this.#emit({ type: "message_end", message: preambleMessage });
+		this.#emit({ type: "message_end", message: preambleMessage, scope });
 
 		// Emit buffered tool results
 		for (const { toolResult } of buffer) {
-			this.#emit({ type: "message_start", message: toolResult });
+			this.#emit({ type: "message_start", message: toolResult, scope });
 			this.appendMessage(toolResult);
-			this.#emit({ type: "message_end", message: toolResult });
+			this.#emit({ type: "message_end", message: toolResult, scope });
 		}
 
 		// Emit continuation message (text after tools) if non-empty
@@ -2532,9 +2533,9 @@ export class Agent {
 					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 				},
 			};
-			this.#emit({ type: "message_start", message: continuationMessage });
+			this.#emit({ type: "message_start", message: continuationMessage, scope });
 			this.appendMessage(continuationMessage);
-			this.#emit({ type: "message_end", message: continuationMessage });
+			this.#emit({ type: "message_end", message: continuationMessage, scope });
 		}
 	}
 }
