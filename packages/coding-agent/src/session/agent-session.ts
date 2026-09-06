@@ -6927,12 +6927,13 @@ export class AgentSession {
 					assistantMsg.stopReason !== "aborted" &&
 					this.#retryAttempt > 0
 				) {
+					const attempt = this.#retryAttempt;
+					this.#retryAttempt = 0;
 					await this.#emitSessionEvent({
 						type: "auto_retry_end",
 						success: true,
-						attempt: this.#retryAttempt,
+						attempt,
 					});
-					this.#retryAttempt = 0;
 					// Settle the retry gate here, colocated with the success event, rather
 					// than relying on the generic #resolveRetry() at the end of the
 					// agent_end branch. That tail resolver is bypassed by every early
