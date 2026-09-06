@@ -27,6 +27,7 @@ import {
 	getFunctionHookRegistration,
 	tagExtensionHandlerRegistrationOrder,
 	tagFunctionHookHandler,
+	wrapExtensionHandlerRegistration,
 } from "../extensions/function-hooks-internal";
 import type {
 	ExtensionAPI,
@@ -152,7 +153,7 @@ async function createHookAPI(
 			if (!handlers.has(event)) {
 				handlers.set(event, []);
 			}
-			handlers.get(event)!.push(tagExtensionHandlerRegistrationOrder(handler, handlerRegistrationOrder++));
+			handlers.get(event)!.push(wrapExtensionHandlerRegistration(handler, handlerRegistrationOrder++));
 		},
 		sendMessage<T = unknown>(
 			message: HookMessage<T>,

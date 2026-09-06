@@ -30,7 +30,11 @@ import {
 	normalizeFunctionHookGrant,
 	validateFunctionHookTarget,
 } from "./function-hooks";
-import { tagExtensionHandlerRegistrationOrder, tagFunctionHookHandler } from "./function-hooks-internal";
+import {
+	tagExtensionHandlerRegistrationOrder,
+	tagFunctionHookHandler,
+	wrapExtensionHandlerRegistration,
+} from "./function-hooks-internal";
 import type {
 	Extension,
 	ExtensionAPI,
@@ -274,7 +278,7 @@ class ConcreteExtensionAPI implements ExtensionAPI {
 
 	on<F extends HandlerFn>(event: string, handler: F): void {
 		const list = this.extension.handlers.get(event) ?? [];
-		list.push(tagExtensionHandlerRegistrationOrder(handler, this.#handlerRegistrationOrder++));
+		list.push(wrapExtensionHandlerRegistration(handler, this.#handlerRegistrationOrder++));
 		this.extension.handlers.set(event, list);
 	}
 

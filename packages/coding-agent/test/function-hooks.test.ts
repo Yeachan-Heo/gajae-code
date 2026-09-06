@@ -400,6 +400,89 @@ describe("capability-scoped function hooks", () => {
 		expect(calls).toEqual(["observer", "policy"]);
 	});
 
+	test("projects downstream continuation values through the caller inspection grant", async () => {
+		let observedInput: unknown;
+		const runner = makeRunner([
+			registration(
+				"*",
+				async (_invocation, _capabilities, next) => {
+					const result = await next();
+					if (result.action === "continue") observedInput = (result.event as ToolCallEvent).input;
+					return result;
+				},
+				{ capabilities: ["audit.append"] },
+				0,
+			),
+			registration(
+				"tool_call",
+				async invocation => ({
+					action: "continue",
+					event: {
+						...(invocation.payload as ToolCallEvent),
+						input: { token: "downstream-secret" },
+					},
+				}),
+				{ capabilities: ["tool.inspect", "tool.transform"] },
+				1,
+				"read",
+			),
+		]);
+		const event = toolCall({ path: "original.txt" });
+
+		expect(await runner.emitToolCall(event)).toBeUndefined();
+		expect(observedInput).toBe("<redacted>");
+		expect(event.input).toEqual({ token: "downstream-secret" });
+	});
+
+	test("rejects malformed custom-role messages before context continuation", async () => {
+		const runner = makeRunner([
+			registration(
+				"context",
+				async invocation => ({
+					action: "continue",
+					event: {
+						...invocation.payload,
+						messages: [{ role: "fileMention", timestamp: Date.now() }],
+					} as never,
+				}),
+				{ capabilities: ["ui.transform"] },
+				0,
+			),
+		]);
+
+		await expect(runner.emitContext([])).rejects.toThrow("Function hook returned an invalid transformed event");
+	});
+
+	test("preserves order when one legacy function is registered for multiple events", async () => {
+		const calls: string[] = [];
+		const runtime = new ExtensionRuntime();
+		const extension = await loadExtensionFromFactory(
+			api => {
+				const shared = async () => {
+					calls.push("shared");
+				};
+				api.on("input", shared);
+				api.registerFunctionHook(
+					"*",
+					async (_invocation, _capabilities, next) => {
+						calls.push("wildcard");
+						return await next();
+					},
+					{ capabilities: ["audit.append"] },
+				);
+				api.on("tool_call", shared);
+			},
+			process.cwd(),
+			new EventBus(),
+			runtime,
+			"reused-handler-extension",
+		);
+		const runner = new ExtensionRunner([extension], runtime, process.cwd(), SessionManager.inMemory(), {} as never);
+
+		await runner.emitInput("hello", undefined, "interactive");
+		expect(calls).toEqual(["shared", "wildcard"]);
+	});
+
 	test("preserves transformed tool input alongside nonblocking legacy metadata", async () => {
 		const extension = makeExtension([]);
 		extension.handlers.set("tool_call", [

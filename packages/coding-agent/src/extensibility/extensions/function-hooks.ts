@@ -501,7 +501,71 @@ function isFunctionHookMessage(value: unknown): boolean {
 			Number.isFinite(message.timestamp)
 		);
 	}
-	return isSafeFunctionHookValue(message);
+	if (message.role === "custom" || message.role === "hookMessage") {
+		return (
+			isFunctionHookCustomMessage(message) &&
+			typeof message.timestamp === "number" &&
+			Number.isFinite(message.timestamp)
+		);
+	}
+	if (message.role === "bashExecution" || message.role === "pythonExecution") {
+		const sourceField = message.role === "bashExecution" ? "command" : "code";
+		return (
+			typeof message[sourceField] === "string" &&
+			typeof message.output === "string" &&
+			(message.exitCode === undefined ||
+				(typeof message.exitCode === "number" && Number.isFinite(message.exitCode))) &&
+			typeof message.cancelled === "boolean" &&
+			typeof message.truncated === "boolean" &&
+			(message.meta === undefined || isSafeFunctionHookValue(message.meta)) &&
+			(message.excludeFromContext === undefined || typeof message.excludeFromContext === "boolean") &&
+			typeof message.timestamp === "number" &&
+			Number.isFinite(message.timestamp)
+		);
+	}
+	if (message.role === "fileMention") {
+		return (
+			Array.isArray(message.files) &&
+			message.files.every(file => {
+				if (!isPlainFunctionHookData(file) || file === null || typeof file !== "object") return false;
+				const entry = file as Record<string, unknown>;
+				return (
+					typeof entry.path === "string" &&
+					typeof entry.content === "string" &&
+					(entry.lineCount === undefined ||
+						(typeof entry.lineCount === "number" && Number.isFinite(entry.lineCount))) &&
+					(entry.byteSize === undefined ||
+						(typeof entry.byteSize === "number" && Number.isFinite(entry.byteSize))) &&
+					(entry.skippedReason === undefined || entry.skippedReason === "tooLarge") &&
+					(entry.image === undefined || isFunctionHookImage(entry.image)) &&
+					(entry.duplicate === undefined || typeof entry.duplicate === "boolean") &&
+					(entry.pruned === undefined || typeof entry.pruned === "boolean")
+				);
+			}) &&
+			typeof message.timestamp === "number" &&
+			Number.isFinite(message.timestamp)
+		);
+	}
+	if (message.role === "branchSummary") {
+		return (
+			typeof message.summary === "string" &&
+			typeof message.fromId === "string" &&
+			typeof message.timestamp === "number" &&
+			Number.isFinite(message.timestamp)
+		);
+	}
+	if (message.role === "compactionSummary") {
+		return (
+			typeof message.summary === "string" &&
+			(message.shortSummary === undefined || typeof message.shortSummary === "string") &&
+			typeof message.tokensBefore === "number" &&
+			Number.isFinite(message.tokensBefore) &&
+			(message.providerPayload === undefined || isSafeFunctionHookValue(message.providerPayload)) &&
+			typeof message.timestamp === "number" &&
+			Number.isFinite(message.timestamp)
+		);
+	}
+	return false;
 }
 
 function isFunctionHookCustomMessage(value: unknown): boolean {
@@ -761,6 +825,18 @@ export function compatibilityPayloadForFunctionHook(
 	if ((wildcard || !canInspectNonTool) && event.type !== "tool_call" && event.type !== "tool_result")
 		return Object.freeze({ type: event.type }) as ExtensionEvent;
 	return deepFreezeFunctionHookData(cloneFunctionHookData(event));
+}
+
+export function functionHookInspectAllowed(
+	event: ExtensionEvent,
+	grant: FunctionHookGrant,
+	wildcard: boolean,
+): boolean {
+	const operations = expandedOperations(grant.capabilities);
+	if (event.type === "tool_call" || event.type === "tool_result") return operations.has("tool.inspect");
+	if (wildcard) return false;
+	if (event.type.startsWith("session_")) return operations.has("session.read");
+	return operations.has("ui.transform");
 }
 
 function deepFreezeFunctionHookData<T>(value: T, seen = new WeakSet<object>()): T {

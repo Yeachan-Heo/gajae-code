@@ -15,6 +15,15 @@ export function tagExtensionHandlerRegistrationOrder<T extends (...args: never[]
 	return handler;
 }
 
+export function wrapExtensionHandlerRegistration<T extends (...args: never[]) => unknown>(
+	handler: T,
+	registrationOrder: number,
+): T {
+	const registered = ((...args: never[]) => handler(...args)) as T;
+	registrationOrders.set(registered, registrationOrder);
+	return registered;
+}
+
 export function getExtensionHandlerRegistrationOrder(value: unknown): number | undefined {
 	return typeof value === "function" ? registrationOrders.get(value as (...args: never[]) => unknown) : undefined;
 }

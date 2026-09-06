@@ -39,6 +39,7 @@ import {
 	functionHookDenyAllowed,
 	functionHookEventIdentityMatches,
 	functionHookGrantHash,
+	functionHookInspectAllowed,
 	functionHookPayloadHash,
 	functionHookTransformAllowed,
 	isPlainFunctionHookData,
@@ -1148,8 +1149,18 @@ export class ExtensionRunner {
 					try {
 						const publicResult =
 							continuedResult.action === "continue"
-								? { action: "continue" as const, event: continuedResult.event }
-								: continuedResult;
+								? {
+										action: "continue" as const,
+										event: compatibilityPayloadForFunctionHook(
+											continuedResult.event,
+											effectiveGrant,
+											wildcard,
+										),
+									}
+								: continuedResult.action === "return" &&
+										!functionHookInspectAllowed(currentEvent, effectiveGrant, wildcard)
+									? { action: "return" as const, value: "<redacted>" }
+									: continuedResult;
 						nextReturnValue = cloneFunctionHookDataStrict(publicResult) as FunctionHookResult;
 						return nextReturnValue;
 					} catch {
