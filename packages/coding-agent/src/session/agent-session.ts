@@ -3746,6 +3746,10 @@ export class AgentSession {
 			);
 		}
 		this.#externalIngressSealed = true;
+		this.agent.abort();
+		this.#promptGeneration++;
+		this.#promptPreflightAbortController.abort();
+		this.#promptPreflightAbortController = new AbortController();
 		this.#sessionTransitionKind = kind;
 		this.#coordinatorPersistGeneration += 1;
 	}
@@ -3753,6 +3757,7 @@ export class AgentSession {
 	#endSessionTransition(): void {
 		this.#externalIngressSealed = false;
 		this.#sessionTransitionKind = undefined;
+		this.#flushOrSchedulePendingBackgroundExchanges();
 	}
 
 	#activateNextSessionAdmission(): void {
@@ -5062,6 +5067,7 @@ export class AgentSession {
 							if (survivors.some(message => ownedCompletionResumeAction(message) === "fresh"))
 								this.#resumeFromOwnedCompletion();
 							if (survivors.length === 1) {
+								this.#assertNoSessionTransition();
 								await this.agent.prompt(first, {
 									...this.#managedFallbackPromptOptions(),
 									onRunAccepted: (handle: AttemptRunHandle) => {
@@ -5069,6 +5075,7 @@ export class AgentSession {
 									},
 								});
 							} else {
+								this.#assertNoSessionTransition();
 								await this.agent.prompt(survivors, {
 									...this.#managedFallbackPromptOptions(),
 									onRunAccepted: (handle: AttemptRunHandle) => {
@@ -6327,7 +6334,14 @@ export class AgentSession {
 	#coordinatorToolObservations = new WeakMap<object, CoordinatorToolObservation>();
 	#agentEventAdmission = new WeakMap<
 		object,
-		{ scope?: AttemptScope; sdkRunToken?: string; persistGeneration: number; persistBarrier?: Promise<void> }
+		{
+			scope?: AttemptScope;
+			sdkRunToken?: string;
+			sessionId?: string;
+			sessionIdentityEpoch?: number;
+			persistGeneration: number;
+			persistBarrier?: Promise<void>;
+		}
 	>();
 	/** Extension handlers cannot mutate or replace the Agent-claimed run owner. */
 	#terminalOwnerByExtensionEvent = new WeakMap<object, AgentTerminalOwnerContext>();
@@ -6413,6 +6427,8 @@ export class AgentSession {
 		this.#agentEventAdmission.set(event, {
 			scope: this.#activeAttemptScope,
 			sdkRunToken: this.#activeSdkRunToken,
+			sessionId: this.sessionId,
+			sessionIdentityEpoch: this.#sessionIdentityEpoch,
 			persistGeneration: this.#coordinatorPersistGeneration,
 			persistBarrier: this.#coordinatorRescopeBarrier,
 		});
@@ -6845,7 +6861,16 @@ export class AgentSession {
 			this.#trustedExternalEventsAfterAgentAdmission.add(event);
 			return true;
 		}
-		if (!scope) return this.#sessionIdentityEpoch === 0;
+		if (!scope) {
+			if (
+				(event.type === "message_start" || event.type === "message_update") &&
+				event.message.role === "assistant"
+			) {
+				return false;
+			}
+			if (event.type === "agent_end" && this.#provisionalAssistantMessage) return false;
+			return this.#sessionIdentityEpoch === 0;
+		}
 		const scopedKey = this.#attemptScopeKey(scope);
 		if (this.#retiredSessionIdentityAttemptScopeKeys.has(scopedKey)) return false;
 		if (this.#sessionIdentityEpoch === 0) {
@@ -6938,6 +6963,11 @@ export class AgentSession {
 		eventLease?: RunResourceProducerLease,
 	): Promise<void> => {
 		const attemptScope = (event as AgentEvent & { scope?: AttemptScope }).scope;
+		const eventAdmission = this.#agentEventAdmission.get(event);
+		const eventIdentityIsCurrent = (): boolean =>
+			eventAdmission?.sessionId === undefined ||
+			(eventAdmission.sessionId === this.sessionId &&
+				eventAdmission.sessionIdentityEpoch === this.#sessionIdentityEpoch);
 		const attemptScopeKey = attemptScope ? this.#attemptScopeKey(attemptScope) : undefined;
 		const discardRejectedAssistantEvent = (): void => {
 			if (
@@ -7036,6 +7066,7 @@ export class AgentSession {
 			event.type === "agent_end" &&
 			event.stopReason !== "maintenance" &&
 			terminalAssistant !== undefined &&
+			!this.agent.isCursorSplitTerminalMessage(terminalAssistant) &&
 			getSessionMessageEntryId(terminalAssistant) === undefined
 				? terminalAssistant
 				: undefined;
@@ -7098,6 +7129,10 @@ export class AgentSession {
 			// Register synchronously so Agent.transformContext sees the barrier even
 			// when the event dispatcher does not await this listener.
 			await this.#queuePreAdmissionArtifactSpill(event.message);
+		}
+		if (!eventIdentityIsCurrent()) {
+			discardRejectedAssistantEvent();
+			return;
 		}
 
 		// Agent listeners run synchronously, but this handler yields while emitting
@@ -7212,6 +7247,7 @@ export class AgentSession {
 			if (canonicalAdmission && !canonicalAdmission.predecessor.released) {
 				await canonicalAdmission.predecessor.promise;
 			}
+			if (!eventIdentityIsCurrent()) return;
 			if (this.#terminalPersistenceRecovery) {
 				Object.defineProperty(event, "terminalPersistenceFailed", { value: true, enumerable: true });
 			} else if (
@@ -8326,6 +8362,7 @@ export class AgentSession {
 										skip("handoff_in_progress");
 										return;
 									}
+									this.#assertNoSessionTransition();
 									const predecessorAgentEnd =
 										this.#claimDeferredAgentEndForContinuation(predecessorAgentEndHold);
 									const predecessorScope = (
@@ -10447,7 +10484,7 @@ export class AgentSession {
 
 	/** Whether agent is currently streaming a response */
 	get isStreaming(): boolean {
-		return this.agent.state.isStreaming || this.#livePromptsInFlight() > 0;
+		return this.agent.state.isStreaming || this.agent.state.streamMessage !== null || this.#livePromptsInFlight() > 0;
 	}
 
 	/** Wait until streaming and session settlement work are fully settled. */
@@ -11891,7 +11928,7 @@ export class AgentSession {
 			// Re-check after the awaited preparation: a handoff can engage during the
 			// volatile-context/hindsight awaits above and this would otherwise start a
 			// turn against the session being handed off.
-			this.#assertNoHandoffTransition();
+			this.#assertNoSessionTransition();
 			await this.agent.continue({
 				...this.#managedFallbackPromptOptions(),
 				onRunAccepted: (handle: AttemptRunHandle) => {
@@ -13443,7 +13480,7 @@ export class AgentSession {
 		// Re-check after the publication await: a handoff can engage during that
 		// window, and #beginInFlight below would otherwise start a turn against the
 		// session being handed off.
-		this.#assertNoHandoffTransition();
+		this.#assertNoSessionTransition();
 		const inFlightPrompt = this.#beginInFlight();
 		// Discard hidden next-turn successors queued by a PREVIOUS turn that a
 		// terminal abort closed. This must run BEFORE the admission bump below:
@@ -18937,6 +18974,7 @@ export class AgentSession {
 					entry.type === "message" && committedIds.has(entry.id),
 			);
 			const combined = [...committedToolEntries, ...argumentResult.prunedEntries, ...fileMentionResult.changed];
+			this.#assertTerminalPersistenceSettledForHistoryMutation();
 			this.sessionManager.applyEntryMessageUpdates(combined);
 			this.sessionManager.applyCustomMessageEntryUpdates([
 				...volatileContextResult.changed,
@@ -22621,6 +22659,7 @@ export class AgentSession {
 				type: "retry",
 				continuation: async ownership => {
 					if (attemptCancelled() || !ownership.isCurrent() || ownership.lease.signal.aborted) return;
+					this.#assertNoSessionTransition();
 					const continuationSdkOwnership =
 						sdkOwnership ?? this.#captureSdkContinuationOwnership(ownership.handle.scope);
 					await this.agent.continue({
@@ -23920,6 +23959,7 @@ export class AgentSession {
 						this.#resolveRetry();
 						return;
 					}
+					this.#assertNoSessionTransition();
 					await this.agent.continue({
 						...this.#managedFallbackPromptOptions(),
 						onRunAccepted: (handle: AttemptRunHandle) => {
@@ -24048,6 +24088,7 @@ export class AgentSession {
 						if (seam?.signal?.aborted) throw promptPreflightCancelledError();
 						preflightAccepted = true;
 					}
+					this.#assertNoSessionTransition();
 					await this.agent.prompt(messages, options);
 					this.#releaseDeferredAgentEndLease(predecessorAgentEnd);
 					return;
@@ -25187,7 +25228,7 @@ export class AgentSession {
 	}
 
 	#flushOrSchedulePendingBackgroundExchanges(): void {
-		if (!this.isStreaming) {
+		if (!this.isStreaming && !this.#externalIngressSealed) {
 			this.#flushPendingBackgroundExchanges();
 			return;
 		}
@@ -25203,7 +25244,7 @@ export class AgentSession {
 				this.#scheduledBackgroundExchangeFlush = false;
 				return;
 			}
-			if (this.isStreaming) {
+			if (this.isStreaming || this.#externalIngressSealed) {
 				// Re-poll while streaming, but do not let this housekeeping timer
 				// keep the event loop alive on its own (CPU-7).
 				const pollTimer = setTimeout(attempt, 50);
@@ -25219,6 +25260,10 @@ export class AgentSession {
 
 	#flushPendingBackgroundExchanges(): void {
 		if (this.#pendingBackgroundExchanges.length === 0) return;
+		if (this.#externalIngressSealed) {
+			this.#scheduleBackgroundExchangeFlush();
+			return;
+		}
 		const batches = this.#pendingBackgroundExchanges;
 		this.#pendingBackgroundExchanges = [];
 		for (const batch of batches) {
@@ -25304,6 +25349,8 @@ export class AgentSession {
 				ownerShutdownManager = asyncManager;
 				ownerShutdownLease = lease;
 			}
+			const previousStreamMessage = this.agent.state.streamMessage;
+			const previousProvisionalAssistantMessage = this.#provisionalAssistantMessage;
 			await this.abort();
 			if (this.isCompacting) {
 				this.abortCompaction();
@@ -25586,6 +25633,8 @@ export class AgentSession {
 				for (const key of previousCurrentAttemptScopeKeys) this.#currentSessionIdentityAttemptScopeKeys.add(key);
 				this.#retiredSessionIdentityAttemptScopeKeys.clear();
 				for (const key of previousRetiredAttemptScopeKeys) this.#retiredSessionIdentityAttemptScopeKeys.add(key);
+				this.agent.restoreStreamMessageForSessionRollback(previousStreamMessage);
+				this.#provisionalAssistantMessage = previousProvisionalAssistantMessage;
 				// The switch never committed: rotate the manager's endpoint
 				// registration back to the predecessor before restoring it
 				// (review thread P1 — the map key must track the session id).
