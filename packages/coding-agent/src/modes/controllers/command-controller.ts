@@ -1233,6 +1233,7 @@ export class CommandController {
 				const meta = outputMeta().truncationFromSummary(result, { direction: "tail" }).get();
 				this.ctx.bashComponent.setComplete(result.exitCode, result.cancelled, {
 					output: result.output,
+					signal: result.signal,
 					truncation: meta?.truncation,
 				});
 			}

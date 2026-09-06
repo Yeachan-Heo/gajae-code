@@ -69,7 +69,9 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
 		};
 
 		let mut params = params.clone();
-		params.process_group_policy = ProcessGroupPolicy::SameProcessGroup;
+		params.process_group_policy = params
+			.process_group_policy
+			.preserving_containment(ProcessGroupPolicy::SameProcessGroup);
 
 		// Preserve $? across trap handler execution so the handler doesn't
 		// clobber the status that triggered it.

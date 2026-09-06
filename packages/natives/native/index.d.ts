@@ -2302,6 +2302,8 @@ export interface ShellExecuteOptions {
   minimizer?: MinimizerOptions
   /** Abort signal for cancelling the operation. */
   signal?: unknown
+  /** Keep external commands inside the embedding process group. */
+  containedProcessGroup?: boolean
 }
 
 /** Options for configuring a persistent shell session. */
@@ -2312,6 +2314,15 @@ export interface ShellOptions {
   snapshotPath?: string
   /** Optional per-command output minimizer configuration. */
   minimizer?: MinimizerOptions
+  /**
+   * Keep external commands inside the embedding process group. Used only by
+   * an already-isolated shell worker whose parent supervises that group.
+   */
+  containedProcessGroup?: boolean
+  /** Private append-only ownership ledger used by the external guardian. */
+  ownershipLedgerPath?: string
+  /** Authentication key for ownership ledger records. */
+  ownershipLedgerToken?: string
 }
 
 /** Options for running a shell command. */

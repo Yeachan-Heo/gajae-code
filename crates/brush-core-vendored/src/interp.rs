@@ -66,6 +66,12 @@ pub trait ExternalCommandOutputMarker: Send + Sync {
 	) -> Option<ExternalCommandOutputMarkers>;
 }
 
+/// Observer notified synchronously after an external process is spawned.
+pub trait ExternalProcessObserver: Send + Sync {
+	/// Records a newly spawned process and its process group when known.
+	fn spawned(&self, pid: i32, process_group_id: Option<i32>);
+}
+
 /// Parameters for execution.
 #[derive(Clone, Default)]
 pub struct ExecutionParameters {
@@ -80,6 +86,8 @@ pub struct ExecutionParameters {
 	/// Whether command-output marking was disabled by shell syntax that can
 	/// consume or redirect command output.
 	command_output_disabled:  bool,
+	/// Optional external-process ownership observer.
+	process_observer:         Option<Arc<dyn ExternalProcessObserver>>,
 	/// Whether `errexit` (exit on error) behavior should be
 	/// suppressed in this execution context. Defaults to `false`.
 	pub suppress_errexit:     bool,
@@ -108,6 +116,24 @@ impl ExecutionParameters {
 	pub fn set_command_output_marker(&mut self, marker: Arc<dyn ExternalCommandOutputMarker>) {
 		self.command_output_marker = Some(marker);
 		self.command_output_disabled = false;
+	}
+
+	/// Assigns an external-process ownership observer.
+	pub fn set_process_observer(&mut self, observer: Arc<dyn ExternalProcessObserver>) {
+		self.process_observer = Some(observer);
+	}
+
+	/// Clone the configured process observer so nested execution wrappers can
+	/// preserve ownership publication while adding their own cancellation state.
+	pub fn process_observer(&self) -> Option<Arc<dyn ExternalProcessObserver>> {
+		self.process_observer.clone()
+	}
+
+	/// Notifies the configured observer that an external process was spawned.
+	pub fn notify_process_spawned(&self, pid: i32, process_group_id: Option<i32>) {
+		if let Some(observer) = self.process_observer.as_ref() {
+			observer.spawned(pid, process_group_id);
+		}
 	}
 
 	/// Disables external-command output marking for this execution branch.
@@ -263,7 +289,7 @@ fn ensure_not_cancelled(params: &ExecutionParameters) -> Result<(), error::Error
 }
 
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default)]
 /// Policy for how to manage spawned external processes.
 pub enum ProcessGroupPolicy {
 	/// Place the process in a new process group.
@@ -271,6 +297,19 @@ pub enum ProcessGroupPolicy {
 	NewProcessGroup,
 	/// Place the process in the same process group as its parent.
 	SameProcessGroup,
+	/// Keep every external command in the embedding process group and session.
+	///
+	/// This is for an embedder that already owns a dedicated process boundary;
+	/// it lets that supervisor reap the whole group if the embedded shell dies.
+	ContainedProcessGroup,
+}
+
+impl ProcessGroupPolicy {
+	/// Preserve an embedding worker's containment boundary across nested shell
+	/// execution while retaining the caller's ordinary fallback policy.
+	pub const fn preserving_containment(self, fallback: Self) -> Self {
+		if matches!(self, Self::ContainedProcessGroup) { self } else { fallback }
+	}
 }
 
 #[async_trait::async_trait]
@@ -691,7 +730,9 @@ async fn spawn_pipeline_processes(
 		let pipeline_context = if !run_in_current_shell {
 			// Make sure that all commands in the pipeline are in the same process group.
 			if current_pipeline_index > 0 {
-				cmd_params.process_group_policy = ProcessGroupPolicy::SameProcessGroup;
+				cmd_params.process_group_policy = cmd_params
+					.process_group_policy
+					.preserving_containment(ProcessGroupPolicy::SameProcessGroup);
 			}
 
 			PipelineExecutionContext {
@@ -2111,7 +2152,9 @@ fn setup_process_substitution(
 
 	// Set up execution parameters for the child execution.
 	let mut child_params = params.clone();
-	child_params.process_group_policy = ProcessGroupPolicy::SameProcessGroup;
+	child_params.process_group_policy = child_params
+		.process_group_policy
+		.preserving_containment(ProcessGroupPolicy::SameProcessGroup);
 
 	// Set up pipe so we can connect to the command.
 	let (reader, writer) = std::io::pipe()?;

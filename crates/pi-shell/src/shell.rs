@@ -2,11 +2,12 @@
 
 use std::{
 	collections::{HashMap, HashSet},
+	fmt::Write as _,
 	fs,
 	io::{self, Write},
 	str,
 	sync::{
-		Arc,
+		Arc, Mutex as StdMutex,
 		atomic::{AtomicI32, AtomicUsize, Ordering},
 	},
 	time::Duration,
@@ -15,14 +16,16 @@ use std::{
 use anyhow::{Error, Result};
 use brush_builtins::{BuiltinSet, default_builtins};
 use brush_core::{
-	ExecutionContext, ExecutionControlFlow, ExecutionExitCode, ExecutionResult, ProcessGroupPolicy,
-	ProfileLoadBehavior, RcLoadBehavior, Shell as BrushShell, ShellValue, ShellVariable, SourceInfo,
-	builtins,
+	ExecutionContext, ExecutionControlFlow, ExecutionExitCode, ExecutionResult,
+	ExternalProcessObserver, ProcessGroupPolicy, ProfileLoadBehavior, RcLoadBehavior,
+	Shell as BrushShell, ShellValue, ShellVariable, SourceInfo, builtins,
 	env::EnvironmentScope,
 	openfiles::{self, OpenFile, OpenFiles},
 };
 use bytes::Bytes;
 use clap::Parser;
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
 #[cfg(not(unix))]
 use tokio::io::AsyncReadExt as _;
 use tokio::{
@@ -39,7 +42,105 @@ use crate::{
 };
 
 struct ShellSessionCore {
-	shell: BrushShell,
+	shell:                   BrushShell,
+	contained_process_group: bool,
+	ownership_ledger:        Option<OwnershipLedger>,
+}
+
+struct CommandProcessObserver {
+	process_group_id: Arc<AtomicI32>,
+	targets:          Arc<StdMutex<process::TerminationTargets>>,
+	ownership_ledger: Option<OwnershipLedger>,
+	upstream:         Option<Arc<dyn ExternalProcessObserver>>,
+}
+
+#[derive(Clone)]
+struct OwnershipLedger {
+	file:  Arc<StdMutex<fs::File>>,
+	token: String,
+}
+
+impl ExternalProcessObserver for CommandProcessObserver {
+	fn spawned(&self, pid: i32, process_group_id: Option<i32>) {
+		if let Some(upstream) = &self.upstream {
+			upstream.spawned(pid, process_group_id);
+		}
+		if let Some(ledger) = &self.ownership_ledger {
+			let process = process::Process::from_pid(pid);
+			#[cfg(target_os = "macos")]
+			let Some(process) = process else {
+				std::process::exit(70);
+			};
+			#[cfg(not(target_os = "macos"))]
+			let Some(process) = process else {
+				self
+					.targets
+					.lock()
+					.expect("process target lock poisoned")
+					.add_pid(pid);
+				if let Some(pgid) = process_group_id {
+					self
+						.process_group_id
+						.compare_exchange(0, pgid, Ordering::SeqCst, Ordering::SeqCst)
+						.ok();
+				}
+				return;
+			};
+			let incarnation = process.incarnation();
+			let darwin_unique_id = process.darwin_unique_id().map(|value| value.to_string());
+			#[cfg(target_os = "macos")]
+			if darwin_unique_id.is_none() {
+				process.kill_tree(Some(process::KILL_SIGNAL));
+				std::process::exit(70);
+			}
+			let payload = format!("{pid}:{incarnation}:{}", darwin_unique_id.as_deref().unwrap_or(""));
+			let Ok(mut mac) = Hmac::<Sha256>::new_from_slice(ledger.token.as_bytes()) else {
+				process.kill_tree(Some(process::KILL_SIGNAL));
+				std::process::exit(70);
+			};
+			mac.update(payload.as_bytes());
+			let signature = mac.finalize().into_bytes();
+			let signature = signature.iter().fold(
+				String::with_capacity(signature.len() * 2),
+				|mut output, byte| {
+					let _ = write!(&mut output, "{byte:02x}");
+					output
+				},
+			);
+			let record = serde_json::json!({
+				"pid": pid,
+				"incarnation": incarnation,
+				"darwinUniqueId": darwin_unique_id,
+				"signature": signature,
+			});
+			let published = ledger.file.lock().ok().is_some_and(|mut file| {
+				writeln!(file, "{record}")
+					.and_then(|()| file.flush())
+					.is_ok()
+			});
+			if !published {
+				process.kill_tree(Some(process::KILL_SIGNAL));
+				std::process::exit(70);
+			}
+			self
+				.targets
+				.lock()
+				.expect("process target lock poisoned")
+				.add_process(process);
+		} else {
+			self
+				.targets
+				.lock()
+				.expect("process target lock poisoned")
+				.add_pid(pid);
+		}
+		if let Some(pgid) = process_group_id {
+			self
+				.process_group_id
+				.compare_exchange(0, pgid, Ordering::SeqCst, Ordering::SeqCst)
+				.ok();
+		}
+	}
 }
 
 #[derive(Default)]
@@ -98,16 +199,21 @@ impl ShellAbortState {
 
 #[derive(Clone)]
 struct ShellConfig {
-	session_env:   Option<HashMap<String, String>>,
-	snapshot_path: Option<String>,
-	minimizer:     Option<minimizer::MinimizerConfig>,
+	session_env:             Option<HashMap<String, String>>,
+	snapshot_path:           Option<String>,
+	minimizer:               Option<minimizer::MinimizerConfig>,
+	contained_process_group: bool,
+	ownership_ledger:        Option<OwnershipLedger>,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct ShellOptions {
-	pub session_env:   Option<HashMap<String, String>>,
-	pub snapshot_path: Option<String>,
-	pub minimizer:     Option<minimizer::MinimizerOptions>,
+	pub session_env:             Option<HashMap<String, String>>,
+	pub snapshot_path:           Option<String>,
+	pub minimizer:               Option<minimizer::MinimizerOptions>,
+	pub contained_process_group: bool,
+	pub ownership_ledger_path:   Option<String>,
+	pub ownership_ledger_token:  Option<String>,
 }
 
 struct ShellRunConfig {
@@ -150,13 +256,14 @@ pub struct ShellRunResult {
 
 #[derive(Debug, Clone, Default)]
 pub struct ShellExecuteOptions {
-	pub command:       String,
-	pub cwd:           Option<String>,
-	pub env:           Option<HashMap<String, String>>,
-	pub session_env:   Option<HashMap<String, String>>,
-	pub timeout_ms:    Option<u32>,
-	pub snapshot_path: Option<String>,
-	pub minimizer:     Option<minimizer::MinimizerOptions>,
+	pub command:                 String,
+	pub cwd:                     Option<String>,
+	pub env:                     Option<HashMap<String, String>>,
+	pub session_env:             Option<HashMap<String, String>>,
+	pub timeout_ms:              Option<u32>,
+	pub snapshot_path:           Option<String>,
+	pub minimizer:               Option<minimizer::MinimizerOptions>,
+	pub contained_process_group: bool,
 }
 
 pub type ShellExecuteResult = ShellRunResult;
@@ -171,7 +278,13 @@ impl Shell {
 	#[must_use]
 	pub fn new(options: Option<ShellOptions>) -> Self {
 		let config = match options {
-			None => ShellConfig { session_env: None, snapshot_path: None, minimizer: None },
+			None => ShellConfig {
+				session_env:             None,
+				snapshot_path:           None,
+				minimizer:               None,
+				contained_process_group: false,
+				ownership_ledger:        None,
+			},
 			Some(opt) => {
 				let minimizer = opt
 					.minimizer
@@ -181,6 +294,34 @@ impl Shell {
 					session_env: opt.session_env,
 					snapshot_path: opt.snapshot_path,
 					minimizer,
+					contained_process_group: opt.contained_process_group,
+					ownership_ledger: opt
+						.ownership_ledger_path
+						.zip(opt.ownership_ledger_token)
+						.map(|(path, token)| {
+							let file = fs::OpenOptions::new()
+								.create(true)
+								.append(true)
+								.open(path)
+								.unwrap_or_else(|_| std::process::exit(70));
+							#[cfg(unix)]
+							{
+								use std::os::fd::AsRawFd as _;
+								let fd = file.as_raw_fd();
+								// SAFETY: `fd` is the live ledger descriptor owned by `file`.
+								let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+								if flags < 0 {
+									std::process::exit(70);
+								}
+								// SAFETY: `fd` remains owned by `file`; this changes only its exec flag.
+								let inherited =
+									unsafe { libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) };
+								if inherited < 0 {
+									std::process::exit(70);
+								}
+							}
+							OwnershipLedger { file: Arc::new(StdMutex::new(file)), token }
+						}),
 				}
 			},
 		};
@@ -240,9 +381,11 @@ pub async fn execute_shell(
 		.as_ref()
 		.map(minimizer::MinimizerConfig::from_options);
 	let config = ShellConfig {
-		session_env:   options.session_env,
-		snapshot_path: options.snapshot_path,
-		minimizer:     minimizer.clone(),
+		session_env:             options.session_env,
+		snapshot_path:           options.snapshot_path,
+		minimizer:               minimizer.clone(),
+		contained_process_group: options.contained_process_group,
+		ownership_ledger:        None,
 	};
 	let run_config =
 		ShellRunConfig { command: options.command, cwd: options.cwd, env: options.env, minimizer };
@@ -272,9 +415,11 @@ pub async fn execute_shell_streams(
 	cancel_token: CancelToken,
 ) -> Result<ShellExecuteResult> {
 	let config = ShellConfig {
-		session_env:   options.session_env,
-		snapshot_path: options.snapshot_path,
-		minimizer:     None,
+		session_env:             options.session_env,
+		snapshot_path:           options.snapshot_path,
+		minimizer:               None,
+		contained_process_group: options.contained_process_group,
+		ownership_ledger:        None,
 	};
 	let run_config = ShellRunConfig {
 		command:   options.command,
@@ -390,7 +535,13 @@ async fn run_shell_oneshot(
 		result = &mut task => result,
 		reason = ct.wait() => {
 			tokio_cancel.cancel();
-			terminate_new_descendants(&baseline_descendants, 0).await;
+			terminate_new_descendants(
+				&baseline_descendants,
+				0,
+				&Arc::new(StdMutex::new(process::TerminationTargets::new())),
+				false,
+			)
+			.await;
 			let graceful = time::timeout(Duration::from_secs(2), &mut task).await;
 			if graceful.is_err() {
 				task.abort();
@@ -449,7 +600,13 @@ async fn run_shell_oneshot_streams(
 		result = &mut task => result,
 		reason = ct.wait() => {
 			tokio_cancel.cancel();
-			terminate_new_descendants(&baseline_descendants, 0).await;
+			terminate_new_descendants(
+				&baseline_descendants,
+				0,
+				&Arc::new(StdMutex::new(process::TerminationTargets::new())),
+				false,
+			)
+			.await;
 			let graceful = time::timeout(Duration::from_secs(2), &mut task).await;
 			if graceful.is_err() {
 				task.abort();
@@ -567,6 +724,7 @@ fn merge_path_values(_existing: &str, incoming: &str) -> String {
 async fn create_session(config: &ShellConfig) -> Result<ShellSessionCore> {
 	let mut shell = BrushShell::builder()
 		.do_not_inherit_env(true)
+		.contained_process_group(config.contained_process_group)
 		.profile(ProfileLoadBehavior::Skip)
 		.rc(RcLoadBehavior::Skip)
 		.builtins(default_builtins(BuiltinSet::BashMode))
@@ -640,14 +798,25 @@ async fn create_session(config: &ShellConfig) -> Result<ShellSessionCore> {
 	configure_windows_path(&mut shell)?;
 
 	if let Some(snapshot_path) = config.snapshot_path.as_ref() {
-		source_snapshot(&mut shell, snapshot_path).await?;
+		source_snapshot(&mut shell, snapshot_path, config.contained_process_group).await?;
 	}
 
-	Ok(ShellSessionCore { shell })
+	Ok(ShellSessionCore {
+		shell,
+		contained_process_group: config.contained_process_group,
+		ownership_ledger: config.ownership_ledger.clone(),
+	})
 }
 
-async fn source_snapshot(shell: &mut BrushShell, snapshot_path: &str) -> Result<()> {
+async fn source_snapshot(
+	shell: &mut BrushShell,
+	snapshot_path: &str,
+	contained_process_group: bool,
+) -> Result<()> {
 	let mut params = shell.default_exec_params();
+	if contained_process_group {
+		params.process_group_policy = ProcessGroupPolicy::ContainedProcessGroup;
+	}
 	let source_info = SourceInfo::from("pi-natives:snapshot");
 	params.set_fd(OpenFiles::STDIN_FD, null_file()?);
 	params.set_fd(OpenFiles::STDOUT_FD, null_file()?);
@@ -702,10 +871,21 @@ async fn run_shell_command(
 	params.set_fd(OpenFiles::STDIN_FD, null_file()?);
 	params.set_fd(OpenFiles::STDOUT_FD, stdout_file);
 	params.set_fd(OpenFiles::STDERR_FD, stderr_file);
-	params.process_group_policy = ProcessGroupPolicy::NewProcessGroup;
+	params.process_group_policy = if session.contained_process_group {
+		ProcessGroupPolicy::ContainedProcessGroup
+	} else {
+		ProcessGroupPolicy::NewProcessGroup
+	};
 	params.set_cancel_token(cancel_token.clone());
 	let baseline_descendants = process::DescendantBaseline::capture();
 	let command_pgid = Arc::new(AtomicI32::new(0));
+	let retained_targets = Arc::new(StdMutex::new(process::TerminationTargets::new()));
+	params.set_process_observer(Arc::new(CommandProcessObserver {
+		process_group_id: command_pgid.clone(),
+		targets:          retained_targets.clone(),
+		ownership_ledger: session.ownership_ledger.clone(),
+		upstream:         params.process_observer(),
+	}));
 	let reader_cancel = CancellationToken::new();
 	let (activity_tx, mut activity_rx) = mpsc::channel::<()>(1);
 	// Stream every raw chunk to the caller live, regardless of whether
@@ -751,16 +931,26 @@ async fn run_shell_command(
 			reader_cancel.cancel();
 		}
 	});
-	let pgid_probe =
-		tokio::spawn(capture_new_process_group(baseline_descendants.clone(), command_pgid.clone()));
+	let pgid_probe = tokio::spawn(capture_new_process_group(
+		baseline_descendants.clone(),
+		command_pgid.clone(),
+		retained_targets.clone(),
+	));
 	let process_cancel_bridge = tokio::spawn({
 		let cancel_token = cancel_token.clone();
 		let baseline_descendants = baseline_descendants.clone();
 		let command_pgid = command_pgid.clone();
+		let retained_targets = retained_targets.clone();
+		let scan_session_members = session.contained_process_group;
 		async move {
 			cancel_token.cancelled().await;
-			terminate_new_descendants(&baseline_descendants, command_pgid.load(Ordering::SeqCst))
-				.await;
+			terminate_new_descendants(
+				&baseline_descendants,
+				command_pgid.load(Ordering::SeqCst),
+				&retained_targets,
+				scan_session_members,
+			)
+			.await;
 		}
 	});
 	let source_info = SourceInfo::from("pi-natives:command");
@@ -902,10 +1092,21 @@ async fn run_shell_command_streams(
 	params.set_fd(OpenFiles::STDIN_FD, null_file()?);
 	params.set_fd(OpenFiles::STDOUT_FD, stdout_file);
 	params.set_fd(OpenFiles::STDERR_FD, stderr_file);
-	params.process_group_policy = ProcessGroupPolicy::NewProcessGroup;
+	params.process_group_policy = if session.contained_process_group {
+		ProcessGroupPolicy::ContainedProcessGroup
+	} else {
+		ProcessGroupPolicy::NewProcessGroup
+	};
 	params.set_cancel_token(cancel_token.clone());
 	let baseline_descendants = process::DescendantBaseline::capture();
 	let command_pgid = Arc::new(AtomicI32::new(0));
+	let retained_targets = Arc::new(StdMutex::new(process::TerminationTargets::new()));
+	params.set_process_observer(Arc::new(CommandProcessObserver {
+		process_group_id: command_pgid.clone(),
+		targets:          retained_targets.clone(),
+		ownership_ledger: session.ownership_ledger.clone(),
+		upstream:         params.process_observer(),
+	}));
 	let reader_cancel = CancellationToken::new();
 	let (activity_tx, mut activity_rx) = mpsc::channel::<()>(1);
 
@@ -935,16 +1136,26 @@ async fn run_shell_command_streams(
 			reader_cancel.cancel();
 		}
 	});
-	let pgid_probe =
-		tokio::spawn(capture_new_process_group(baseline_descendants.clone(), command_pgid.clone()));
+	let pgid_probe = tokio::spawn(capture_new_process_group(
+		baseline_descendants.clone(),
+		command_pgid.clone(),
+		retained_targets.clone(),
+	));
 	let process_cancel_bridge = tokio::spawn({
 		let cancel_token = cancel_token.clone();
 		let baseline_descendants = baseline_descendants.clone();
 		let command_pgid = command_pgid.clone();
+		let retained_targets = retained_targets.clone();
+		let scan_session_members = session.contained_process_group;
 		async move {
 			cancel_token.cancelled().await;
-			terminate_new_descendants(&baseline_descendants, command_pgid.load(Ordering::SeqCst))
-				.await;
+			terminate_new_descendants(
+				&baseline_descendants,
+				command_pgid.load(Ordering::SeqCst),
+				&retained_targets,
+				scan_session_members,
+			)
+			.await;
 		}
 	});
 	let source_info = SourceInfo::from("pi-shell:streams");
@@ -1115,6 +1326,7 @@ async fn read_output_bytes(
 async fn capture_new_process_group(
 	baseline: process::DescendantBaseline,
 	command_pgid: Arc<AtomicI32>,
+	retained_targets: Arc<StdMutex<process::TerminationTargets>>,
 ) {
 	if !baseline.observed() {
 		// Without a proven baseline every pre-existing helper looks new, so any
@@ -1122,18 +1334,74 @@ async fn capture_new_process_group(
 		return;
 	}
 	for _ in 0..100 {
-		let mut targets = process::TerminationTargets::new();
-		let _ = process::add_new_descendants(&mut targets, baseline.pids());
-		if let Some(pgid) = targets.first_pgid() {
-			command_pgid.store(pgid, Ordering::SeqCst);
-			return;
+		{
+			let mut targets = retained_targets
+				.lock()
+				.expect("process target lock poisoned");
+			targets.retain_owned_descendants();
+			if let Some(pgid) = targets.first_pgid() {
+				command_pgid.store(pgid, Ordering::SeqCst);
+			}
+			// The live probe retains only incarnation-bound process authorities.
+			// Numeric PGIDs are never carried across asynchronous observation windows.
+			targets.clear_pgids();
 		}
 		time::sleep(Duration::from_millis(5)).await;
 	}
 }
 
-async fn terminate_new_descendants(baseline: &process::DescendantBaseline, command_pgid: i32) {
+async fn terminate_new_descendants(
+	baseline: &process::DescendantBaseline,
+	command_pgid: i32,
+	retained_targets: &Arc<StdMutex<process::TerminationTargets>>,
+	scan_session_members: bool,
+) {
 	const WAVES: u32 = 3;
+	let command_pgid = if command_pgid > 0 {
+		command_pgid
+	} else {
+		retained_targets
+			.lock()
+			.expect("process target lock poisoned")
+			.first_owned_process_group()
+			.unwrap_or(0)
+	};
+	// The contained command runs in a group that excludes this runtime. Freeze
+	// that entire owned boundary before any graceful signal can execute hostile
+	// handlers that fork and `setsid()` out of both the group and session. While
+	// at least one frozen member exists the PGID cannot be reused, so the group
+	// KILL remains bound to this exact command incarnation.
+	if scan_session_members
+		&& command_pgid > 0
+		&& process::kill_process_group(command_pgid, process::STOP_SIGNAL)
+	{
+		time::sleep(Duration::from_millis(5)).await;
+		let mut retained = retained_targets
+			.lock()
+			.expect("process target lock poisoned");
+		let _ = process::add_process_group_members(&mut retained, command_pgid);
+		let _ = process::add_new_session_members(&mut retained, baseline.pids());
+		retained.retain_owned_descendants();
+		let _ = process::kill_process_group(command_pgid, process::KILL_SIGNAL);
+		retained.clear_pgids();
+		retained.signal_processes(process::KILL_SIGNAL);
+		return;
+	}
+	if scan_session_members {
+		// Contained commands normally share the runtime's group, which the runtime
+		// cannot freeze without stopping itself. Never invoke graceful handlers from
+		// this in-boundary fallback: pin the complete observed session/descendant set
+		// and use uncatchable process-only termination. The external supervisor still
+		// owns group-wide cleanup if this runtime dies mid-reap.
+		let mut retained = retained_targets
+			.lock()
+			.expect("process target lock poisoned");
+		let _ = process::add_new_session_members(&mut retained, baseline.pids());
+		retained.retain_owned_descendants();
+		retained.clear_pgids();
+		retained.signal_processes(process::KILL_SIGNAL);
+		return;
+	}
 	// An unproven baseline cannot be differenced safely: pre-existing processes
 	// would look newly spawned, so a pid diff could signal unrelated work. Fall
 	// back to the one target we know is exclusively ours.
@@ -1146,41 +1414,104 @@ async fn terminate_new_descendants(baseline: &process::DescendantBaseline, comma
 	// ownership (a job object or retained child handles), which is a separate
 	// design change and is tracked as follow-up rather than patched here.
 	if !baseline.observed() {
-		if command_pgid > 0 {
-			let _ = process::kill_process_group(command_pgid, process::TERM_SIGNAL);
+		let owns_group = {
+			let mut retained = retained_targets
+				.lock()
+				.expect("process target lock poisoned");
+			if retained.owns_process_group(command_pgid)
+				|| retained.owns_process_group_identity(command_pgid)
+			{
+				let _ = process::add_process_group_members(&mut retained, command_pgid);
+				retained.clear_pgids();
+				retained.signal_processes(process::TERM_SIGNAL);
+				true
+			} else {
+				false
+			}
+		};
+		if owns_group {
 			time::sleep(Duration::from_millis(75)).await;
-			let _ = process::kill_process_group(command_pgid, process::KILL_SIGNAL);
+			retained_targets
+				.lock()
+				.expect("process target lock poisoned")
+				.signal_processes(process::KILL_SIGNAL);
 		}
 		return;
 	}
+	// Retain stable process authorities discovered before each signal wave.
+	// A child can exit and reparent a signal-resistant grandchild between TERM
+	// and KILL, making that grandchild disappear from later descendant walks;
+	// the retained parent authority can still rediscover and kill its tree.
 	for wave in 0..WAVES {
-		let mut targets = process::TerminationTargets::new();
-		let observed = process::add_new_descendants(&mut targets, baseline.pids());
-		// Only an *observed* empty target set proves there is nothing left to kill.
-		// When the process tree could not be read, fall through and keep signalling
-		// the command's process group across every wave instead of reporting a
-		// clean cleanup we cannot substantiate.
-		if observed && targets.is_empty() && command_pgid <= 0 {
-			return;
-		}
 		let signal = if wave == 0 {
 			process::TERM_SIGNAL
 		} else {
 			process::KILL_SIGNAL
 		};
-		if command_pgid > 0 {
-			let _ = process::kill_process_group(command_pgid, signal);
+		let should_return = {
+			let mut retained = retained_targets
+				.lock()
+				.expect("process target lock poisoned");
+			if wave == 0
+				&& (retained.owns_process_group(command_pgid)
+					|| retained.owns_process_group_identity(command_pgid))
+			{
+				// Detached non-TTY commands synchronously publish their exact spawned
+				// PID as session/group leader. The retained process authority pins that
+				// incarnation while group members are converted to stable authorities.
+				let _ = process::add_process_group_members(&mut retained, command_pgid);
+			}
+			if scan_session_members {
+				let _ = process::add_new_session_members(&mut retained, baseline.pids());
+			}
+			retained.retain_owned_descendants();
+			let empty = retained.is_empty() && command_pgid <= 0;
+			retained.clear_pgids();
+			retained.signal_processes(signal);
+			empty
+		};
+		if should_return {
+			return;
 		}
-		targets.signal(signal);
 		if wave + 1 < WAVES {
 			let pause = if wave == 0 {
-				Duration::from_millis(75)
+				if scan_session_members {
+					Duration::from_millis(250)
+				} else {
+					Duration::from_millis(75)
+				}
 			} else {
 				Duration::from_millis(150)
 			};
-			time::sleep(pause).await;
+			let deadline = time::Instant::now() + pause;
+			while time::Instant::now() < deadline {
+				time::sleep(Duration::from_millis(5)).await;
+				// TERM handlers can spawn a descendant after the signal is delivered,
+				// then move it into a fresh session before the original root exits. Poll
+				// throughout the grace window so its stable authority is captured before
+				// reparenting. Numeric PGIDs never cross this boundary.
+				let mut retained = retained_targets
+					.lock()
+					.expect("process target lock poisoned");
+				if scan_session_members {
+					let _ = process::add_new_session_members(&mut retained, baseline.pids());
+				}
+				retained.retain_owned_descendants();
+			}
 		}
 	}
+	// One final identity-bound discovery/reap pass closes the gap for a child
+	// observed during the last escalation window. This intentionally never
+	// resurrects a numeric process-group target.
+	let mut retained = retained_targets
+		.lock()
+		.expect("process target lock poisoned");
+	if scan_session_members {
+		let _ = process::add_new_session_members(&mut retained, baseline.pids());
+	}
+	retained.retain_owned_descendants();
+	retained.clear_pgids();
+	retained.signal_processes(process::KILL_SIGNAL);
 }
 async fn terminate_background_jobs(shell: &BrushShell) {
 	let mut targets = process::TerminationTargets::new();
@@ -1197,8 +1528,9 @@ async fn terminate_background_jobs(shell: &BrushShell) {
 	}
 
 	targets.signal(process::TERM_SIGNAL);
+	targets.clear_pgids();
 	time::sleep(Duration::from_millis(150)).await;
-	targets.signal(process::KILL_SIGNAL);
+	targets.signal_processes(process::KILL_SIGNAL);
 }
 
 /// Apply per-command environment variables onto a freshly pushed
@@ -1804,7 +2136,11 @@ impl builtins::Command for TimeoutCommand {
 
 			let child_cancel = CancellationToken::new();
 			let mut params = context.params.clone();
-			params.process_group_policy = ProcessGroupPolicy::NewProcessGroup;
+			let scan_session_members =
+				matches!(params.process_group_policy, ProcessGroupPolicy::ContainedProcessGroup);
+			params.process_group_policy = params
+				.process_group_policy
+				.preserving_containment(ProcessGroupPolicy::NewProcessGroup);
 			params.set_cancel_token(child_cancel.clone());
 
 			let mut command_line = String::new();
@@ -1818,9 +2154,17 @@ impl builtins::Command for TimeoutCommand {
 			let cancel_token = context.cancel_token();
 			let baseline_descendants = process::DescendantBaseline::capture();
 			let command_pgid = Arc::new(AtomicI32::new(0));
-			let pgid_probe = tokio::spawn(capture_new_process_group(
+			let retained_targets = Arc::new(StdMutex::new(process::TerminationTargets::new()));
+			params.set_process_observer(Arc::new(CommandProcessObserver {
+				process_group_id: command_pgid.clone(),
+				targets:          retained_targets.clone(),
+				ownership_ledger: None,
+				upstream:         params.process_observer(),
+			}));
+			let mut pgid_probe = tokio::spawn(capture_new_process_group(
 				baseline_descendants.clone(),
 				command_pgid.clone(),
+				retained_targets.clone(),
 			));
 			let source_info = SourceInfo::from("pi-natives:timeout");
 			let run_future = context
@@ -1832,17 +2176,33 @@ impl builtins::Command for TimeoutCommand {
 				tokio::select! {
 					result = &mut run_future => result,
 					() = time::sleep(timeout) => {
+						pgid_probe.abort();
+						let _ = (&mut pgid_probe).await;
+						let owned_pgid = command_pgid.swap(0, Ordering::SeqCst);
+						if scan_session_members {
+							terminate_new_descendants(&baseline_descendants, owned_pgid, &retained_targets, true).await;
+						}
 						child_cancel.cancel();
-						terminate_new_descendants(&baseline_descendants, command_pgid.load(Ordering::SeqCst)).await;
+						if !scan_session_members {
+							terminate_new_descendants(&baseline_descendants, owned_pgid, &retained_targets, false).await;
+						}
 						let _ = time::timeout(Duration::from_secs(2), &mut run_future).await;
-						terminate_new_descendants(&baseline_descendants, command_pgid.load(Ordering::SeqCst)).await;
+						terminate_new_descendants(&baseline_descendants, command_pgid.load(Ordering::SeqCst), &retained_targets, scan_session_members).await;
 						Ok(ExecutionResult::new(124))
 					},
 					() = cancel_token.cancelled() => {
+						pgid_probe.abort();
+						let _ = (&mut pgid_probe).await;
+						let owned_pgid = command_pgid.swap(0, Ordering::SeqCst);
+						if scan_session_members {
+							terminate_new_descendants(&baseline_descendants, owned_pgid, &retained_targets, true).await;
+						}
 						child_cancel.cancel();
-						terminate_new_descendants(&baseline_descendants, command_pgid.load(Ordering::SeqCst)).await;
+						if !scan_session_members {
+							terminate_new_descendants(&baseline_descendants, owned_pgid, &retained_targets, false).await;
+						}
 						let _ = time::timeout(Duration::from_secs(2), &mut run_future).await;
-						terminate_new_descendants(&baseline_descendants, command_pgid.load(Ordering::SeqCst)).await;
+						terminate_new_descendants(&baseline_descendants, command_pgid.load(Ordering::SeqCst), &retained_targets, scan_session_members).await;
 						Ok(ExecutionExitCode::Interrupted.into())
 					},
 				}
@@ -1850,16 +2210,26 @@ impl builtins::Command for TimeoutCommand {
 				tokio::select! {
 					result = &mut run_future => result,
 					() = time::sleep(timeout) => {
+						pgid_probe.abort();
+						let _ = (&mut pgid_probe).await;
+						let owned_pgid = command_pgid.swap(0, Ordering::SeqCst);
+						if scan_session_members {
+							terminate_new_descendants(&baseline_descendants, owned_pgid, &retained_targets, true).await;
+						}
 						child_cancel.cancel();
-						terminate_new_descendants(&baseline_descendants, command_pgid.load(Ordering::SeqCst)).await;
+						if !scan_session_members {
+							terminate_new_descendants(&baseline_descendants, owned_pgid, &retained_targets, false).await;
+						}
 						let _ = time::timeout(Duration::from_secs(2), &mut run_future).await;
-						terminate_new_descendants(&baseline_descendants, command_pgid.load(Ordering::SeqCst)).await;
+						terminate_new_descendants(&baseline_descendants, command_pgid.load(Ordering::SeqCst), &retained_targets, scan_session_members).await;
 						Ok(ExecutionResult::new(124))
 					},
 				}
 			};
-			pgid_probe.abort();
-			let _ = pgid_probe.await;
+			if !pgid_probe.is_finished() {
+				pgid_probe.abort();
+				let _ = pgid_probe.await;
+			}
 			result
 		}
 	}
@@ -1938,12 +2308,11 @@ mod tests {
 			assert_eq!(child_session_action(true, true, true), ChildSessionAction::TakeForeground,);
 		}
 
-		/// Brush leading a new pgroup with non-terminal stdin detaches only when
-		/// it is not part of a multi-command pipeline. Pipeline leaders must stay
-		/// in the parent session so later stages can join their process group.
+		/// Brush leading a new pgroup stays in the parent session so stable
+		/// session membership can be used for descendant cleanup.
 		#[test]
-		fn non_terminal_stdin_leading_new_pgroup_detaches_unless_pipeline() {
-			assert_eq!(child_session_action(true, false, false), ChildSessionAction::DetachSession,);
+		fn non_terminal_stdin_leading_new_pgroup_preserves_session() {
+			assert_eq!(child_session_action(true, false, false), ChildSessionAction::None,);
 			assert_eq!(child_session_action(true, false, true), ChildSessionAction::None,);
 		}
 
@@ -1984,7 +2353,8 @@ mod tests {
 
 	/// End-to-end verification that brush, when embedded as a non-interactive
 	/// library (`interactive: false`, exactly what `create_session` produces),
-	/// spawns external commands in a **separate session** from the host.
+	/// spawns external commands in a dedicated process group within the host
+	/// session.
 	///
 	/// The truth-table tests in `child_session_action` cover the decision in
 	/// isolation. This test covers the wiring: it boots a real `BrushShell`,
@@ -1996,7 +2366,7 @@ mod tests {
 	/// (`getsid(child_pid) == child_pid`).
 	#[cfg(unix)]
 	#[tokio::test(flavor = "multi_thread")]
-	async fn embedded_external_command_runs_in_its_own_session() {
+	async fn embedded_external_command_runs_in_its_own_process_group() {
 		use std::io::Read as _;
 		let _process_test_guard = PROCESS_TEST_LOCK.lock().await;
 
@@ -2006,7 +2376,13 @@ mod tests {
 		assert!(host_sid > 0, "getsid(0) failed: {}", std::io::Error::last_os_error());
 
 		// Build the same kind of session pi-natives uses in production.
-		let config = ShellConfig { session_env: None, snapshot_path: None, minimizer: None };
+		let config = ShellConfig {
+			session_env:             None,
+			snapshot_path:           None,
+			minimizer:               None,
+			contained_process_group: false,
+			ownership_ledger:        None,
+		};
 		let mut session = create_session(&config).await.expect("create_session");
 
 		// Output pipe shared between the brush child and a concurrent reader. The
@@ -2016,6 +2392,7 @@ mod tests {
 		let stderr_file = OpenFile::from(writer);
 
 		let mut params = session.shell.default_exec_params();
+		params.process_group_policy = ProcessGroupPolicy::NewProcessGroup;
 		params.set_fd(OpenFiles::STDIN_FD, null_file().expect("null stdin"));
 		params.set_fd(OpenFiles::STDOUT_FD, stdout_file);
 		params.set_fd(OpenFiles::STDERR_FD, stderr_file);
@@ -2077,6 +2454,8 @@ mod tests {
 			"getsid({child_pid}) failed: {} (child may have already exited)",
 			std::io::Error::last_os_error(),
 		);
+		// SAFETY: `child_pid` is live and was reported by the child.
+		let child_pgid = unsafe { libc::getpgid(child_pid) };
 
 		// Drain the brush task and the pipe reader.
 		let (_session, exec) = time::timeout(Duration::from_secs(5), shell_handle)
@@ -2090,15 +2469,8 @@ mod tests {
 		);
 		let _ = time::timeout(Duration::from_secs(2), reader_handle).await;
 
-		assert_ne!(
-			child_sid, host_sid,
-			"child PID {child_pid} inherited host session {host_sid}; setsid() did not run — the \
-			 embedded-host bug is back",
-		);
-		assert_eq!(
-			child_sid, child_pid,
-			"child PID {child_pid} should be its own session leader after setsid",
-		);
+		assert_eq!(child_sid, host_sid, "child must remain visible to session-scoped cleanup");
+		assert_eq!(child_pgid, child_pid, "child must lead its dedicated process group");
 	}
 
 	/// Standard base64 (RFC 4648, with padding) for the Windows e2e probe below:
@@ -2237,7 +2609,13 @@ mod tests {
 		);
 
 		// Build the same kind of session pi-natives uses in production.
-		let config = ShellConfig { session_env: None, snapshot_path: None, minimizer: None };
+		let config = ShellConfig {
+			session_env:             None,
+			snapshot_path:           None,
+			minimizer:               None,
+			contained_process_group: false,
+			ownership_ledger:        None,
+		};
 		let mut session = create_session(&config).await.expect("create_session");
 
 		let (mut reader, writer) = pipe_to_files("win-console").expect("pipe");
@@ -2664,6 +3042,74 @@ mod tests {
 		);
 	}
 
+	/// Freeze the complete contained group before termination so a hostile TERM
+	/// handler cannot fork and `setsid()` an unowned descendant, even when the
+	/// handler would exit its parent immediately.
+	#[cfg(unix)]
+	#[tokio::test(flavor = "multi_thread")]
+	async fn contained_timeout_freezes_group_before_term_handler_can_escape() {
+		let _process_test_guard = PROCESS_TEST_LOCK.lock().await;
+		let sibling = std::process::Command::new("sleep")
+			.arg("30")
+			.spawn()
+			.expect("spawn unrelated sibling");
+		let sibling_pid = i32::try_from(sibling.id()).expect("sibling pid should fit i32");
+		wait_until_descendant_visible(sibling_pid).await;
+
+		let pid_file =
+			std::env::temp_dir().join(format!("pi-shell-late-setsid-{}.pid", std::process::id()));
+		let _ = std::fs::remove_file(&pid_file);
+		let mut env = HashMap::new();
+		env.insert("LATE_PID_FILE".to_string(), pid_file.to_string_lossy().into_owned());
+		let command = concat!(
+			"timeout 0.2 perl -e '",
+			"$SIG{TERM}=sub { ",
+			"my $pid=fork(); die \"fork failed: $!\" unless defined $pid; ",
+			"if ($pid == 0) { ",
+			"require POSIX; POSIX::setsid() == -1 and die \"setsid failed: $!\"; ",
+			"$SIG{TERM}=\"IGNORE\"; $|=1; ",
+			"open(my $fh, \">\", $ENV{LATE_PID_FILE}) or die \"open failed: $!\"; ",
+			"print $fh \"$$\\n\"; close $fh; print \"late=$$\\n\"; ",
+			"sleep 30; exit 0; ",
+			"} ",
+			"exit 0; }; ",
+			"$|=1; sleep 30'",
+		);
+		let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+		let result = execute_shell(
+			ShellExecuteOptions {
+				command: command.to_string(),
+				env: Some(env),
+				contained_process_group: true,
+				..Default::default()
+			},
+			Some(tx),
+			CancelToken::default(),
+		)
+		.await
+		.expect("contained timeout command should execute");
+
+		let mut output = String::new();
+		while let Ok(Some(chunk)) = time::timeout(Duration::from_millis(50), rx.recv()).await {
+			output.push_str(&chunk);
+		}
+		assert_eq!(result.exit_code, Some(124), "output={output:?}");
+		assert!(
+			!pid_file.exists() && parse_marker_pid(&output, "late=").is_none(),
+			"contained freeze allowed the TERM handler to launch an escapee; output={output:?}"
+		);
+		let _ = std::fs::remove_file(&pid_file);
+
+		let sibling_alive = process::Process::from_pid(sibling_pid)
+			.is_some_and(|process| process.status() == process::ProcessStatus::Running);
+		let _ = process::Process::from_pid(sibling_pid)
+			.map(|process| process.kill_tree(Some(process::KILL_SIGNAL)));
+		assert!(
+			sibling_alive,
+			"contained timeout killed unrelated sibling {sibling_pid}; output={output:?}"
+		);
+	}
+
 	#[cfg(unix)]
 	#[tokio::test(flavor = "multi_thread")]
 	async fn cancelled_command_reaps_reparented_same_group_grandchild() {
@@ -2708,7 +3154,16 @@ mod tests {
 		let command_pgid = process::Process::from_pid(grandchild_pid)
 			.and_then(|process| process.group_id())
 			.expect("grandchild pgid should be visible");
-
+		let retained_targets = Arc::new(StdMutex::new(process::TerminationTargets::new()));
+		{
+			let mut targets = retained_targets
+				.lock()
+				.expect("process target lock poisoned");
+			assert!(
+				process::add_process_group_members(&mut targets, command_pgid),
+				"command group membership should be observable"
+			);
+		}
 		for _ in 0..50 {
 			if process::Process::from_pid(grandchild_pid).and_then(|process| process.ppid())
 				!= Some(parent_pid)
@@ -2724,10 +3179,15 @@ mod tests {
 		);
 
 		abort.abort(AbortReason::Signal);
-		terminate_new_descendants(&process::DescendantBaseline::capture(), command_pgid).await;
-		time::sleep(Duration::from_millis(500)).await;
 		run.abort();
 		let _ = run.await;
+		terminate_new_descendants(
+			&process::DescendantBaseline::capture(),
+			command_pgid,
+			&retained_targets,
+			false,
+		)
+		.await;
 
 		// The unrelated sibling shares the test's process group; cancellation
 		// only targets the command's descendants, so the sibling's survival is
@@ -2822,7 +3282,13 @@ mod tests {
 			}
 		});
 
-		let config = ShellConfig { session_env: None, snapshot_path: None, minimizer: None };
+		let config = ShellConfig {
+			session_env:             None,
+			snapshot_path:           None,
+			minimizer:               None,
+			contained_process_group: false,
+			ownership_ledger:        None,
+		};
 		let mut session = create_session(&config).await.expect("create_session");
 		let mut env = HashMap::new();
 		env.insert("U3_POP_ERROR".to_string(), "1".to_string());

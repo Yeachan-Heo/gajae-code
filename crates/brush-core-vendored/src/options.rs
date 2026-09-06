@@ -198,6 +198,8 @@ pub struct RuntimeOptions {
 	pub sh_mode:                    bool,
 	/// Whether to treat external commands as session leaders.
 	pub external_cmd_leads_session: bool,
+	/// Whether an embedding supervisor owns one containing process group.
+	pub contained_process_group:    bool,
 	/// Maximum function call depth.
 	pub max_function_call_depth:    Option<usize>,
 }
@@ -230,6 +232,7 @@ impl RuntimeOptions {
 			treat_unset_variables_as_error: create_options.treat_unset_variables_as_error,
 			exit_on_nonzero_command_exit: create_options.exit_on_nonzero_command_exit,
 			external_cmd_leads_session: create_options.external_cmd_leads_session,
+			contained_process_group: create_options.contained_process_group,
 			login_shell: create_options.login,
 			disable_filename_globbing: create_options.disable_pathname_expansion,
 			remember_command_locations: true,

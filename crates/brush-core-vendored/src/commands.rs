@@ -602,7 +602,15 @@ pub(crate) fn execute_external_command(
 
 	// Figure out if we should be setting up a new process group.
 	let new_pg = matches!(context.params.process_group_policy, ProcessGroupPolicy::NewProcessGroup);
-	let session_action = child_session_action(new_pg, child_stdin_is_terminal, in_pipeline);
+	let contained_pg = matches!(
+		context.params.process_group_policy,
+		ProcessGroupPolicy::ContainedProcessGroup
+	);
+	let session_action = if contained_pg {
+		ChildSessionAction::None
+	} else {
+		child_session_action(new_pg, child_stdin_is_terminal, in_pipeline)
+	};
 
 	// Compose the std::process::Command that encapsulates what we want to launch.
 	// argv[0] defaults to context.command_name (the user-facing name of the
@@ -630,7 +638,11 @@ pub(crate) fn execute_external_command(
 		&& matches!(session_action, ChildSessionAction::TakeForeground)
 		&& context.shell.options().external_cmd_leads_session;
 
-	if new_pg {
+	if contained_pg {
+		// The embedding worker is already a dedicated session/process-group
+		// leader. Preserve that boundary so its supervisor can kill the complete
+		// group even if the worker itself receives an uncatchable signal.
+	} else if new_pg {
 		match session_action {
 			ChildSessionAction::DetachSession => {
 				// `detach_session()` calls `setsid()`, which creates a fresh session
@@ -678,7 +690,14 @@ pub(crate) fn execute_external_command(
 			if let Some(pid) = &pid {
 				if new_pg {
 					actual_pgid = Some(*pid);
+				} else if matches!(session_action, ChildSessionAction::DetachSession) {
+					// `setsid()` made this exact spawned PID the session and process-group
+					// leader before `spawn()` returned.
+					actual_pgid = Some(*pid);
+				} else if contained_pg {
+					actual_pgid = sys::terminal::get_process_group_id();
 				}
+				context.params.notify_process_spawned(*pid, actual_pgid);
 			} else {
 				tracing::warn!("could not retrieve pid for child process");
 			}
@@ -844,7 +863,9 @@ pub(crate) async fn invoke_command_in_subshell_and_get_output(
 
 	// Get our own set of parameters we can customize and use.
 	let mut params = params.clone();
-	params.process_group_policy = ProcessGroupPolicy::SameProcessGroup;
+	params.process_group_policy = params
+		.process_group_policy
+		.preserving_containment(ProcessGroupPolicy::SameProcessGroup);
 	params.disable_command_output_marking();
 
 	// Set up pipe so we can read the output.
@@ -989,7 +1010,9 @@ pub fn child_session_action(
 	if new_pg && child_stdin_is_terminal {
 		return ChildSessionAction::TakeForeground;
 	}
-
+	if new_pg {
+		return ChildSessionAction::None;
+	}
 	if child_stdin_is_terminal {
 		return ChildSessionAction::None;
 	}

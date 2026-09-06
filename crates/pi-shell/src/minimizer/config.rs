@@ -18,6 +18,10 @@ use crate::minimizer::pipeline::{self, PipelineRegistry, SUPPORTED_SCHEMA_VERSIO
 
 const DEFAULT_MAX_CAPTURE_BYTES: u32 = 4 * 1024 * 1024;
 
+fn normalize_max_capture_bytes(value: u32) -> u32 {
+	value.clamp(1024, DEFAULT_MAX_CAPTURE_BYTES)
+}
+
 /// N-API opt-in handle for the minimizer.
 #[derive(Debug, Clone, Default)]
 pub struct MinimizerOptions {
@@ -81,7 +85,7 @@ impl MinimizerConfig {
 			cfg.except = list.iter().map(|s| s.to_lowercase()).collect();
 		}
 		if let Some(n) = opts.max_capture_bytes {
-			cfg.max_capture_bytes = n.max(1024);
+			cfg.max_capture_bytes = normalize_max_capture_bytes(n);
 		}
 		if let Some(path) = opts.settings_path.as_deref()
 			&& !path.is_empty()
@@ -176,7 +180,7 @@ impl SettingsFile {
 			cfg.except = list.into_iter().map(|s| s.to_lowercase()).collect();
 		}
 		if let Some(n) = self.max_capture_bytes {
-			cfg.max_capture_bytes = n.max(1024);
+			cfg.max_capture_bytes = normalize_max_capture_bytes(n);
 		}
 		for (k, v) in self.tables {
 			if v.is_table() && k != "filters" && k != "tests" {
@@ -264,5 +268,20 @@ mod tests {
 			..Default::default()
 		});
 		assert!(cfg.enabled);
+	}
+
+	#[test]
+	fn capture_bytes_are_bounded_for_protocol_framing() {
+		let high = MinimizerConfig::from_options(&MinimizerOptions {
+			max_capture_bytes: Some(u32::MAX),
+			..Default::default()
+		});
+		assert_eq!(high.max_capture_bytes, DEFAULT_MAX_CAPTURE_BYTES);
+
+		let low = MinimizerConfig::from_options(&MinimizerOptions {
+			max_capture_bytes: Some(0),
+			..Default::default()
+		});
+		assert_eq!(low.max_capture_bytes, 1024);
 	}
 }

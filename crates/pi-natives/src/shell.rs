@@ -61,19 +61,29 @@ impl From<MinimizerOptions> for minimizer::MinimizerOptions {
 #[napi(object)]
 pub struct ShellOptions {
 	/// Environment variables to apply once per session.
-	pub session_env:   Option<HashMap<String, String>>,
+	pub session_env:             Option<HashMap<String, String>>,
 	/// Optional snapshot file to source on session creation.
-	pub snapshot_path: Option<String>,
+	pub snapshot_path:           Option<String>,
 	/// Optional per-command output minimizer configuration.
-	pub minimizer:     Option<MinimizerOptions>,
+	pub minimizer:               Option<MinimizerOptions>,
+	/// Keep external commands inside the embedding process group. Used only by
+	/// an already-isolated shell worker whose parent supervises that group.
+	pub contained_process_group: Option<bool>,
+	/// Private append-only ownership ledger used by the external guardian.
+	pub ownership_ledger_path:   Option<String>,
+	/// Authentication key for ownership ledger records.
+	pub ownership_ledger_token:  Option<String>,
 }
 
 impl From<ShellOptions> for CoreShellOptions {
 	fn from(value: ShellOptions) -> Self {
 		Self {
-			session_env:   value.session_env,
-			snapshot_path: value.snapshot_path,
-			minimizer:     value.minimizer.map(Into::into),
+			session_env:             value.session_env,
+			snapshot_path:           value.snapshot_path,
+			minimizer:               value.minimizer.map(Into::into),
+			contained_process_group: value.contained_process_group.unwrap_or(false),
+			ownership_ledger_path:   value.ownership_ledger_path,
+			ownership_ledger_token:  value.ownership_ledger_token,
 		}
 	}
 }
@@ -97,21 +107,23 @@ pub struct ShellRunOptions<'env> {
 #[napi(object)]
 pub struct ShellExecuteOptions<'env> {
 	/// Command string to execute in the shell.
-	pub command:       String,
+	pub command:                 String,
 	/// Working directory for the command.
-	pub cwd:           Option<String>,
+	pub cwd:                     Option<String>,
 	/// Environment variables to apply for this command only.
-	pub env:           Option<HashMap<String, String>>,
+	pub env:                     Option<HashMap<String, String>>,
 	/// Environment variables to apply once per session.
-	pub session_env:   Option<HashMap<String, String>>,
+	pub session_env:             Option<HashMap<String, String>>,
 	/// Timeout in milliseconds before cancelling the command.
-	pub timeout_ms:    Option<u32>,
+	pub timeout_ms:              Option<u32>,
 	/// Optional snapshot file to source on session creation.
-	pub snapshot_path: Option<String>,
+	pub snapshot_path:           Option<String>,
 	/// Optional per-command output minimizer configuration.
-	pub minimizer:     Option<MinimizerOptions>,
+	pub minimizer:               Option<MinimizerOptions>,
 	/// Abort signal for cancelling the operation.
-	pub signal:        Option<Unknown<'env>>,
+	pub signal:                  Option<Unknown<'env>>,
+	/// Keep external commands inside the embedding process group.
+	pub contained_process_group: Option<bool>,
 }
 
 /// Telemetry for a single minimization.
@@ -263,13 +275,14 @@ pub fn execute_shell<'env>(
 ) -> Result<PromiseRaw<'env, ShellRunResult>> {
 	let cancel_token = task::CancelToken::new(options.timeout_ms, options.signal);
 	let exec_options = CoreShellExecuteOptions {
-		command:       options.command,
-		cwd:           options.cwd,
-		env:           options.env,
-		session_env:   options.session_env,
-		timeout_ms:    options.timeout_ms,
-		snapshot_path: options.snapshot_path,
-		minimizer:     options.minimizer.map(Into::into),
+		command:                 options.command,
+		cwd:                     options.cwd,
+		env:                     options.env,
+		session_env:             options.session_env,
+		timeout_ms:              options.timeout_ms,
+		snapshot_path:           options.snapshot_path,
+		minimizer:               options.minimizer.map(Into::into),
+		contained_process_group: options.contained_process_group.unwrap_or(false),
 	};
 	task::future(env, "shell.execute", async move {
 		let (chunk_tx, drain_handle) = bridge_chunks(on_chunk);
@@ -364,8 +377,8 @@ mod tests {
 		}
 
 		#[test]
-		fn non_terminal_stdin_leading_new_pgroup_detaches_unless_pipeline() {
-			assert_eq!(child_session_action(true, false, false), ChildSessionAction::DetachSession);
+		fn non_terminal_stdin_leading_new_pgroup_preserves_session() {
+			assert_eq!(child_session_action(true, false, false), ChildSessionAction::None);
 			assert_eq!(child_session_action(true, false, true), ChildSessionAction::None);
 		}
 
@@ -392,7 +405,7 @@ mod tests {
 
 	#[cfg(unix)]
 	#[tokio::test(flavor = "multi_thread")]
-	async fn embedded_external_command_runs_in_its_own_session() {
+	async fn embedded_external_command_runs_in_its_own_process_group() {
 		let shell = CoreShell::new(None);
 		let (tx, mut rx) = mpsc::unbounded_channel::<String>();
 		let handle = tokio::spawn(async move {
@@ -424,13 +437,15 @@ mod tests {
 		// return value is checked below.
 		let child_sid = unsafe { libc::getsid(child_pid) };
 		assert!(child_sid > 0, "getsid({child_pid}) failed: {}", std::io::Error::last_os_error());
+		// SAFETY: `child_pid` is live and was reported by the child.
+		let child_pgid = unsafe { libc::getpgid(child_pid) };
 		let result = handle
 			.await
 			.expect("shell task panicked")
 			.expect("shell run");
 		assert_eq!(result.exit_code, Some(0));
-		assert_ne!(child_sid, host_sid);
-		assert_eq!(child_sid, child_pid);
+		assert_eq!(child_sid, host_sid);
+		assert_eq!(child_pgid, child_pid);
 	}
 
 	#[tokio::test]
