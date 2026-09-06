@@ -407,7 +407,7 @@ export async function discoverRuntimeSkills(
 					`user ${dir}`,
 					"user",
 					100,
-					agentDir,
+					path.resolve(dir) === path.resolve(agentDir, "skills") ? agentDir : undefined,
 				),
 			);
 		}

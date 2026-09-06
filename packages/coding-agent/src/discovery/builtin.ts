@@ -325,7 +325,7 @@ async function loadSkills(ctx: LoadContext): Promise<LoadResult<Skill>> {
 	const userScans = getUserSkillScanDirs(ctx.home, userAgentDir, ctx.profileAuthority).map(dir =>
 		scanSkillsFromDir(ctx, {
 			dir,
-			authorityRoot: userAgentDir,
+			authorityRoot: path.resolve(dir) === path.resolve(userAgentDir, "skills") ? userAgentDir : undefined,
 			providerId: PROVIDER_ID,
 			level: "user",
 			requireDescription: true,

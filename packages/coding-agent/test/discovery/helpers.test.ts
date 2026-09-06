@@ -6,6 +6,7 @@ import { parseFrontmatter } from "@gajae-code/utils";
 import {
 	getAncestorDirs,
 	getUserSkillScanDirs,
+	readContainedFile,
 	resolveUserAgentDir,
 	SkillDiscoveryTestHooks,
 	SOURCE_PATHS,
@@ -361,6 +362,102 @@ describe("safe discovery boundaries", () => {
 			expect(result.items).toEqual([]);
 			expect(result.warnings).toEqual([expect.stringContaining("Refusing unsafe skill authority root")]);
 		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
+	test("rejects a selected authority root replaced after validation", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-agent-root-swap-"));
+		try {
+			const agentDir = path.join(root, "agent");
+			const movedAgentDir = path.join(root, "moved-agent");
+			const outside = path.join(root, "outside");
+			await fs.mkdir(path.join(agentDir, "skills"), { recursive: true });
+			await fs.mkdir(path.join(outside, "skills", "escaped"), { recursive: true });
+			await fs.writeFile(
+				path.join(outside, "skills", "escaped", "SKILL.md"),
+				"---\nname: escaped\ndescription: outside authority\n---\n",
+			);
+			SkillDiscoveryTestHooks.afterAuthorityRootValidated = async validatedRoot => {
+				if (validatedRoot !== agentDir) return;
+				delete SkillDiscoveryTestHooks.afterAuthorityRootValidated;
+				await fs.rename(agentDir, movedAgentDir);
+				await fs.symlink(outside, agentDir, "dir");
+			};
+
+			const result = await scanSkillsFromDir(
+				{ cwd: root, home: root, repoRoot: root },
+				{
+					dir: path.join(agentDir, "skills"),
+					authorityRoot: agentDir,
+					providerId: "test",
+					level: "user",
+					requireDescription: true,
+				},
+			);
+
+			expect(result.items).toEqual([]);
+			expect(result.warnings).toEqual([expect.stringContaining("changed skill authority root")]);
+		} finally {
+			delete SkillDiscoveryTestHooks.afterAuthorityRootValidated;
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
+	test("does not admit an authority root created after it was observed missing", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-agent-root-missing-"));
+		try {
+			const agentDir = path.join(root, "selected-agent");
+			const outside = path.join(root, "outside");
+			await fs.mkdir(path.join(outside, "skills", "escaped"), { recursive: true });
+			await fs.writeFile(
+				path.join(outside, "skills", "escaped", "SKILL.md"),
+				"---\nname: escaped\ndescription: outside authority\n---\n",
+			);
+			SkillDiscoveryTestHooks.afterAuthorityRootMissing = async missingRoot => {
+				if (missingRoot !== agentDir) return;
+				delete SkillDiscoveryTestHooks.afterAuthorityRootMissing;
+				await fs.symlink(outside, agentDir, "dir");
+			};
+
+			const result = await scanSkillsFromDir(
+				{ cwd: root, home: root, repoRoot: root },
+				{
+					dir: path.join(agentDir, "skills"),
+					authorityRoot: agentDir,
+					providerId: "test",
+					level: "user",
+					requireDescription: true,
+				},
+			);
+
+			expect(result).toEqual({ items: [], warnings: [] });
+		} finally {
+			delete SkillDiscoveryTestHooks.afterAuthorityRootMissing;
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
+	test("rejects a contained-file root replaced after validation", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-contained-root-swap-"));
+		try {
+			const agentDir = path.join(root, "agent");
+			const movedAgentDir = path.join(root, "moved-agent");
+			const outside = path.join(root, "outside");
+			await fs.mkdir(agentDir);
+			await fs.mkdir(outside);
+			await fs.writeFile(path.join(agentDir, "SYSTEM.md"), "inside authority");
+			await fs.writeFile(path.join(outside, "SYSTEM.md"), "outside authority");
+			SkillDiscoveryTestHooks.afterContainedRootValidated = async validatedRoot => {
+				if (validatedRoot !== agentDir) return;
+				delete SkillDiscoveryTestHooks.afterContainedRootValidated;
+				await fs.rename(agentDir, movedAgentDir);
+				await fs.symlink(outside, agentDir, "dir");
+			};
+
+			expect(await readContainedFile(agentDir, path.join(agentDir, "SYSTEM.md"))).toBeNull();
+		} finally {
+			delete SkillDiscoveryTestHooks.afterContainedRootValidated;
 			await fs.rm(root, { recursive: true, force: true });
 		}
 	});

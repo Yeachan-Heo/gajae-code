@@ -339,7 +339,13 @@ export async function listNativeSkillsForManagement(options: {
 			scanJobs.push(
 				scanSkillsFromDir(
 					{ cwd: options.cwd, home, repoRoot: home },
-					{ dir, authorityRoot: agentDir, providerId: "runtime", level: "user", requireDescription: true },
+					{
+						dir,
+						authorityRoot: path.resolve(dir) === path.resolve(agentDir, "skills") ? agentDir : undefined,
+						providerId: "runtime",
+						level: "user",
+						requireDescription: true,
+					},
 				).then(result => ({ dir, scope: "user" as const, items: result.items })),
 			);
 		}
