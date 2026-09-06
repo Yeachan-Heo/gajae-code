@@ -29,6 +29,7 @@ import {
 	createFunctionHookCapabilities,
 	type FunctionHook,
 	type FunctionHookAuditRecord,
+	type FunctionHookCapability,
 	type FunctionHookCapabilityBindings,
 	type FunctionHookGrant,
 	type FunctionHookInvocation,
@@ -40,7 +41,6 @@ import {
 	functionHookGrantHash,
 	functionHookPayloadHash,
 	functionHookTransformAllowed,
-	intersectFunctionHookGrants,
 	isPlainFunctionHookData,
 	isValidFunctionHookEventValue,
 	isValidFunctionHookReturnValue,
@@ -621,6 +621,18 @@ export class ExtensionRunner {
 		);
 	}
 
+	hasToolResultMediation(toolName: string): boolean {
+		for (const indexed of this.#matchingHandlers({ type: "tool_result", toolName } as ToolResultEvent, true)) {
+			const registration = getFunctionHookRegistration(indexed.handler);
+			if (!registration) return true;
+			const capabilities = new Set(registration.grant.capabilities);
+			if (capabilities.has("tool") || capabilities.has("tool.transform") || capabilities.has("tool.deny")) {
+				return true;
+			}
+		}
+		return false;
+	}
+
 	/** Return immutable registration metadata in authoritative registration order. */
 	getFunctionHookRegistrations(): readonly FunctionHookRegistration[] {
 		const registrations: Array<{ order: number; registration: FunctionHookRegistration }> = [];
@@ -818,12 +830,23 @@ export class ExtensionRunner {
 	}
 
 	#matchingFunctionHooks(event: ExtensionEvent): IndexedFunctionHook[] {
+		return this.#matchingHandlers(event, false).map(indexed => ({
+			...indexed,
+			registration: getFunctionHookRegistration(indexed.handler)!,
+		}));
+	}
+
+	#matchingHandlers(event: ExtensionEvent, includeLegacyToolHandlers: boolean): IndexedHandler[] {
 		const exact = this.#handlersByEvent.get(event.type) ?? [];
 		const wildcard = this.#handlersByEvent.get("*") ?? [];
-		const matches: IndexedFunctionHook[] = [];
+		const matches: IndexedHandler[] = [];
 		for (const indexed of [...exact, ...wildcard]) {
 			const registration = getFunctionHookRegistration(indexed.handler);
-			if (!registration) continue;
+			if (!registration) {
+				if (includeLegacyToolHandlers && indexed.registrationOrder >= 0 && exact.includes(indexed))
+					matches.push(indexed);
+				continue;
+			}
 			if (registration.event !== "*" && registration.event !== event.type) continue;
 			if (
 				registration.target !== undefined &&
@@ -832,7 +855,7 @@ export class ExtensionRunner {
 			) {
 				continue;
 			}
-			matches.push({ ...indexed, registration });
+			matches.push(indexed);
 		}
 		matches.sort((a, b) => a.registrationOrder - b.registrationOrder);
 		return matches;
@@ -971,10 +994,19 @@ export class ExtensionRunner {
 	/** Execute capability-scoped middleware stored in Extension.handlers. */
 	async emitFunctionHooks<TEvent extends ExtensionEvent>(
 		event: TEvent,
-		options: { signal?: AbortSignal; correlationId?: string; scope?: AttemptScopeRef } = {},
+		options: {
+			signal?: AbortSignal;
+			correlationId?: string;
+			scope?: AttemptScopeRef;
+			includeLegacyToolHandlers?: boolean;
+		} = {},
 	): Promise<FunctionHookDispatchResult<TEvent>> {
-		const handlers = this.#matchingFunctionHooks(event);
+		const handlers = options.includeLegacyToolHandlers
+			? this.#matchingHandlers(event, true)
+			: this.#matchingFunctionHooks(event);
 		if (handlers.length === 0) return { action: "continue", event };
+		const includesLegacy = handlers.some(indexed => getFunctionHookRegistration(indexed.handler) === undefined);
+		if (includesLegacy) this.#requireScopeOrFailClosed(options.scope, event.type);
 		this.#markAttemptExecuted(options.scope);
 		const functionHookDepth = this.#functionHookDepth.getStore() ?? 0;
 		if (functionHookDepth >= 16) {
@@ -986,13 +1018,19 @@ export class ExtensionRunner {
 		const eventId = randomUUID();
 		const correlationId = options.correlationId ?? eventId;
 		return await this.#functionHookDepth.run(functionHookDepth + 1, async () => {
+			let legacyToolCallResult: ToolCallEventResult | undefined;
 			const invoke = async (
 				index: number,
 				currentEvent: TEvent,
-				allowedGrant: FunctionHookGrant | undefined,
+				removedCapabilities: readonly FunctionHookCapability[],
 				chainSignal: AbortSignal,
 			): Promise<FunctionHookDispatchResult<TEvent>> => {
-				if (index >= handlers.length) return { action: "continue", event: currentEvent, transformed: false };
+				if (index >= handlers.length) {
+					if (legacyToolCallResult) {
+						return { action: "return", value: legacyToolCallResult } as FunctionHookDispatchResult<TEvent>;
+					}
+					return { action: "continue", event: currentEvent, transformed: false };
+				}
 				if (chainSignal.aborted)
 					return this.#functionHookErrorResult(
 						currentEvent,
@@ -1000,12 +1038,57 @@ export class ExtensionRunner {
 					) as FunctionHookDispatchResult<TEvent>;
 				const indexed = handlers[index];
 				if (!indexed) return { action: "continue", event: currentEvent, transformed: false };
-				const registration = indexed.registration;
-				const effectiveGrant = intersectFunctionHookGrants(registration.grant, allowedGrant);
-				const downstreamGrant =
-					registration.grant.attenuateDownstream && registration.grant.attenuateDownstream.length > 0
-						? attenuateFunctionHookGrant(effectiveGrant, registration.grant.attenuateDownstream)
-						: allowedGrant;
+				const registration = getFunctionHookRegistration(indexed.handler);
+				if (!registration) {
+					const ctx = this.createContext();
+					if (currentEvent.type === "tool_call") {
+						try {
+							const result = (await indexed.handler(currentEvent, ctx)) as ToolCallEventResult | undefined;
+							if (result?.block)
+								return { action: "return", value: result } as FunctionHookDispatchResult<TEvent>;
+							if (result) legacyToolCallResult = result;
+						} catch (error) {
+							const message = error instanceof Error ? error.message : String(error);
+							this.emitError({ extensionPath: indexed.ext.path, event: "tool_call", error: message });
+							return {
+								action: "return",
+								value: { block: true, reason: `Extension ${indexed.ext.path} failed: ${message}` },
+							} as FunctionHookDispatchResult<TEvent>;
+						}
+						return await invoke(index + 1, currentEvent, removedCapabilities, chainSignal);
+					}
+					const result = (await this.#runHandlerWithTimeout(
+						indexed.handler,
+						currentEvent,
+						ctx,
+						indexed.ext,
+						extensionHandlerTimeoutMs,
+					)) as ToolResultEventResult | undefined;
+					let legacyChanged = false;
+					if (result) {
+						const toolResult = currentEvent as ToolResultEvent;
+						if (result.content !== undefined) {
+							toolResult.content = result.content;
+							legacyChanged = true;
+						}
+						if (result.details !== undefined) {
+							toolResult.details = result.details;
+							legacyChanged = true;
+						}
+						if (result.isError !== undefined) {
+							toolResult.isError = result.isError;
+							legacyChanged = true;
+						}
+					}
+					const downstream = await invoke(index + 1, currentEvent, removedCapabilities, chainSignal);
+					return legacyChanged && downstream.action === "continue"
+						? { ...downstream, transformed: true }
+						: downstream;
+				}
+				const effectiveGrant = attenuateFunctionHookGrant(registration.grant, removedCapabilities);
+				const downstreamRemoved = [
+					...new Set([...removedCapabilities, ...(registration.grant.attenuateDownstream ?? [])]),
+				];
 				const wildcard = registration.event === "*" || registration.target === "*";
 				const failureResult = (reason: string): FunctionHookDispatchResult<TEvent> => {
 					if (functionHookDenyAllowed(currentEvent, effectiveGrant)) return { action: "deny", reason };
@@ -1092,7 +1175,7 @@ export class ExtensionRunner {
 							throw new Error(nextFailureReason);
 						}
 					}
-					nextPromise = invoke(index + 1, candidateSnapshot, downstreamGrant, controller.signal).then(
+					nextPromise = invoke(index + 1, candidateSnapshot, downstreamRemoved, controller.signal).then(
 						downstreamResult =>
 							nextEvent !== undefined && downstreamResult.action === "continue"
 								? { ...downstreamResult, transformed: true }
@@ -1163,7 +1246,7 @@ export class ExtensionRunner {
 				const rawResult = outcome.value;
 				if (rawResult === undefined) {
 					this.#appendFunctionHookAudit(registration, invocation, "continue");
-					return await invoke(index + 1, currentEvent, downstreamGrant, chainSignal);
+					return await invoke(index + 1, currentEvent, downstreamRemoved, chainSignal);
 				}
 				if (
 					rawResult === null ||
@@ -1221,7 +1304,7 @@ export class ExtensionRunner {
 						}
 					}
 					this.#appendFunctionHookAudit(registration, invocation, "continue");
-					const downstreamResult = await invoke(index + 1, nextEvent, downstreamGrant, chainSignal);
+					const downstreamResult = await invoke(index + 1, nextEvent, downstreamRemoved, chainSignal);
 					return candidate !== undefined && downstreamResult.action === "continue"
 						? { ...downstreamResult, transformed: true }
 						: downstreamResult;
@@ -1271,7 +1354,7 @@ export class ExtensionRunner {
 				this.#appendFunctionHookAudit(registration, invocation, "error", reason);
 				return failureResult(reason);
 			};
-			return await invoke(0, event, undefined, parentSignal);
+			return await invoke(0, event, [], parentSignal);
 		});
 	}
 
@@ -1394,7 +1477,14 @@ export class ExtensionRunner {
 		scope?: AttemptScopeRef,
 		options: { signal?: AbortSignal; correlationId?: string } = {},
 	): Promise<ToolResultEventResult | undefined> {
-		const functionDispatch = await this.emitFunctionHooks(event, { ...options, scope });
+		const functionDispatch = await this.emitFunctionHooks(
+			{ ...event },
+			{
+				...options,
+				scope,
+				includeLegacyToolHandlers: true,
+			},
+		);
 		if (functionDispatch.action === "deny") {
 			return {
 				content: [{ type: "text", text: functionDispatch.reason }],
@@ -1403,56 +1493,8 @@ export class ExtensionRunner {
 			};
 		}
 		if (functionDispatch.action === "return") return functionDispatch.value as ToolResultEventResult;
-		const functionEvent = functionDispatch.event;
-		const functionModified = functionDispatch.transformed === true;
-		event.content = functionEvent.content;
-		event.details = functionEvent.details;
-		event.isError = functionEvent.isError;
-		const handlers = this.#legacyHandlers("tool_result");
-		if (handlers.length === 0) {
-			if (!functionModified) return undefined;
-			return {
-				content: event.content,
-				details: event.details,
-				isError: event.isError,
-			};
-		}
-		this.#requireScopeOrFailClosed(scope, "tool_result");
-
-		const ctx = this.createContext();
-		const currentEvent: ToolResultEvent = { ...event };
-		let legacyModified = false;
-		let marked = false;
-
-		for (const { ext, handler } of handlers) {
-			if (!marked) {
-				this.#markAttemptExecuted(scope);
-				marked = true;
-			}
-			const handlerResult = (await this.#runHandlerWithTimeout(
-				handler,
-				currentEvent,
-				ctx,
-				ext,
-				extensionHandlerTimeoutMs,
-			)) as ToolResultEventResult | undefined;
-			if (!handlerResult) continue;
-
-			if (handlerResult.content !== undefined) {
-				currentEvent.content = handlerResult.content;
-				legacyModified = true;
-			}
-			if (handlerResult.details !== undefined) {
-				currentEvent.details = handlerResult.details;
-				legacyModified = true;
-			}
-			if (handlerResult.isError !== undefined) {
-				currentEvent.isError = handlerResult.isError;
-				legacyModified = true;
-			}
-		}
-		if (!functionModified && !legacyModified) return undefined;
-
+		if (functionDispatch.transformed !== true) return undefined;
+		const currentEvent = functionDispatch.event;
 		return {
 			content: currentEvent.content,
 			details: currentEvent.details,
@@ -1465,46 +1507,15 @@ export class ExtensionRunner {
 		scope?: AttemptScopeRef,
 		options: { signal?: AbortSignal; correlationId?: string } = {},
 	): Promise<ToolCallEventResult | undefined> {
-		const functionDispatch = await this.emitFunctionHooks(event, { ...options, scope });
+		const functionDispatch = await this.emitFunctionHooks(event, {
+			...options,
+			scope,
+			includeLegacyToolHandlers: true,
+		});
 		if (functionDispatch.action === "deny") return { block: true, reason: functionDispatch.reason };
 		if (functionDispatch.action === "return") return functionDispatch.value as ToolCallEventResult;
 		event.input = functionDispatch.event.input;
-		const handlers = this.#legacyHandlers("tool_call");
-		if (handlers.length === 0) return undefined;
-		this.#requireScopeOrFailClosed(scope, "tool_call");
-
-		const ctx = this.createContext();
-		let result: ToolCallEventResult | undefined;
-		let marked = false;
-
-		for (const { ext, handler } of handlers) {
-			if (!marked) {
-				this.#markAttemptExecuted(scope);
-				marked = true;
-			}
-			try {
-				const handlerResult = await handler(event, ctx);
-
-				if (handlerResult) {
-					result = handlerResult as ToolCallEventResult;
-					if (result.block) {
-						return result;
-					}
-				}
-			} catch (err) {
-				const message = err instanceof Error ? err.message : String(err);
-				const stack = err instanceof Error ? err.stack : undefined;
-				this.emitError({
-					extensionPath: ext.path,
-					event: "tool_call",
-					error: message,
-					stack,
-				});
-				return { block: true, reason: `Extension ${ext.path} failed: ${message}` };
-			}
-		}
-
-		return result;
+		return undefined;
 	}
 
 	async emitUserBash(event: UserBashEvent): Promise<UserBashEventResult | undefined> {

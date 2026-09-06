@@ -2,7 +2,7 @@ import { describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { hookCapability } from "../src/capability/hook";
+import { type Hook, hookCapability } from "../src/capability/hook";
 import { Settings } from "../src/config/settings";
 import { getProviderInfo, loadCapability } from "../src/discovery";
 import { EXTENSION_HANDLER_TIMEOUT_MS } from "../src/extensibility/extensions/runner";
@@ -361,6 +361,21 @@ describe("bounded diagnostics, matchers, provenance, duplicates, and ordering", 
 });
 
 describe("production discovery integration", () => {
+	it("discovers native hook files in deterministic byte order", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-native-hook-order-"));
+		const hooksDir = path.join(root, ".gjc", "hooks", "pre");
+		await fs.mkdir(hooksDir, { recursive: true });
+		await Bun.write(path.join(hooksDir, "z-last.ts"), "export default () => undefined;\n");
+		await Bun.write(path.join(hooksDir, "a-first.ts"), "export default () => undefined;\n");
+
+		try {
+			const result = await loadCapability<Hook>(hookCapability.id, { cwd: root, providers: ["native"] });
+			expect(result.items.map(hook => hook.name)).toEqual(["a-first.ts", "z-last.ts"]);
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
 	it("keeps Claude and Codex providers available for import diagnostics", async () => {
 		expect(getProviderInfo("claude")?.capabilities).toEqual(["hooks"]);
 		expect(getProviderInfo("codex")?.capabilities).toEqual(["hooks"]);

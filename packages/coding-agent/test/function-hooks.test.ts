@@ -25,6 +25,7 @@ import { ExtensionToolWrapper } from "../src/extensibility/extensions/wrapper";
 import { Type } from "../src/extensibility/typebox";
 import { AttemptRecordStore } from "../src/session/attempt-record-store";
 import { SessionManager } from "../src/session/session-manager";
+import { ToolAbortError } from "../src/tools/tool-errors";
 import { EventBus } from "../src/utils/event-bus";
 
 type HookRegistration = Omit<FunctionHookRegistration, "grant"> & {
@@ -238,6 +239,69 @@ describe("capability-scoped function hooks", () => {
 		const audit = runner.getFunctionHookAudit();
 		expect(audit).toHaveLength(2);
 		expect(audit.map(record => record.action)).toEqual(["continue", "continue"]);
+	});
+
+	test("attenuates only requested downstream operations across capability families", async () => {
+		let downstreamCapabilities: { inspect?: boolean; transform?: boolean; deny?: boolean } = {};
+		const runner = makeRunner([
+			registration(
+				"tool_call",
+				async (_invocation, _capabilities, next) => await next(),
+				{ capabilities: ["audit.append"], attenuateDownstream: ["tool.deny"] },
+				0,
+				"read",
+			),
+			registration(
+				"tool_call",
+				async (_invocation, capabilities, next) => {
+					downstreamCapabilities = {
+						inspect: capabilities.tool?.canInspect,
+						transform: capabilities.tool?.canTransform,
+						deny: capabilities.tool?.canDeny,
+					};
+					return await next();
+				},
+				{ capabilities: ["tool"] },
+				1,
+				"read",
+			),
+		]);
+
+		expect(await runner.emitToolCall(toolCall())).toBeUndefined();
+		expect(downstreamCapabilities).toEqual({ inspect: true, transform: true, deny: false });
+	});
+
+	test("preserves registration order across legacy and Function Hook tool handlers", async () => {
+		const calls: string[] = [];
+		const extension = makeExtension([]);
+		extension.handlers.set("tool_call", [
+			async () => {
+				calls.push("legacy-first");
+			},
+			tagFunctionHookHandler({
+				...registration(
+					"tool_call",
+					async (_invocation, _capabilities, next) => {
+						calls.push("function-second");
+						return await next();
+					},
+					{ capabilities: ["tool.inspect"] },
+					1,
+					"read",
+				),
+				grant: normalizeFunctionHookGrant({ capabilities: ["tool.inspect"] }),
+			}),
+		]);
+		const runner = new ExtensionRunner(
+			[extension],
+			new ExtensionRuntime(),
+			process.cwd(),
+			SessionManager.inMemory(),
+			{} as never,
+		);
+
+		expect(await runner.emitToolCall(toolCall())).toBeUndefined();
+		expect(calls).toEqual(["legacy-first", "function-second"]);
 	});
 
 	test("blocks a tool when a granted hook denies it and leaves legacy handlers single-dispatched", async () => {
@@ -638,6 +702,93 @@ describe("capability-scoped function hooks", () => {
 			}),
 		).rejects.toThrow("redacted failure");
 		expect(updateCalls).toBe(0);
+	});
+
+	test("preserves progress updates for unrelated observation-only wildcard hooks", async () => {
+		let updateCalls = 0;
+		const runner = makeRunner([
+			registration(
+				"*",
+				async (_invocation, _capabilities, next) => await next(),
+				{ capabilities: ["audit.append"] },
+				0,
+			),
+		]);
+		const wrapped = new ExtensionToolWrapper(
+			{
+				name: "read",
+				label: "Read",
+				description: "Read a file",
+				parameters: Type.Object({ path: Type.String() }),
+				execute: async (_id, _params, _signal, onUpdate) => {
+					onUpdate?.({ content: [{ type: "text", text: "streaming" }] });
+					return { content: [{ type: "text" as const, text: "done" }] };
+				},
+			},
+			runner,
+		);
+
+		await wrapped.execute("call-1", { path: "safe.txt" }, undefined, () => {
+			updateCalls += 1;
+		});
+		expect(updateCalls).toBe(1);
+	});
+
+	test("preserves caller abort identity before tool-call mediation", async () => {
+		const runner = makeRunner([
+			registration(
+				"tool_call",
+				async (_invocation, _capabilities, next) => await next(),
+				{ capabilities: ["tool"] },
+				0,
+			),
+		]);
+		const wrapped = new ExtensionToolWrapper(
+			{
+				name: "read",
+				label: "Read",
+				description: "Read a file",
+				parameters: Type.Object({ path: Type.String() }),
+				execute: async () => ({ content: [{ type: "text" as const, text: "unexpected" }] }),
+			},
+			runner,
+		);
+		const controller = new AbortController();
+		const reason = new ToolAbortError("caller cancelled");
+		controller.abort(reason);
+
+		await expect(wrapped.execute("call-1", { path: "safe.txt" }, controller.signal)).rejects.toBe(reason);
+	});
+
+	test("preserves tool cancellation identity and skips result mediation", async () => {
+		let resultHookCalls = 0;
+		const runner = makeRunner([
+			registration(
+				"tool_result",
+				async (_invocation, _capabilities, next) => {
+					resultHookCalls += 1;
+					return await next();
+				},
+				{ capabilities: ["tool"] },
+				0,
+			),
+		]);
+		const reason = new ToolAbortError("tool cancelled");
+		const wrapped = new ExtensionToolWrapper(
+			{
+				name: "read",
+				label: "Read",
+				description: "Read a file",
+				parameters: Type.Object({ path: Type.String() }),
+				execute: async () => {
+					throw reason;
+				},
+			},
+			runner,
+		);
+
+		await expect(wrapped.execute("call-1", { path: "safe.txt" })).rejects.toBe(reason);
+		expect(resultHookCalls).toBe(0);
 	});
 
 	test("preserves explicit tool-result detail removal", async () => {
