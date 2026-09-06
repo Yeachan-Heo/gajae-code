@@ -47,7 +47,11 @@ import {
 	redactFunctionHookValue,
 	sanitizeFunctionHookReason,
 } from "./function-hooks";
-import { getFunctionHookRegistration, readConstrainedFunctionHookFile } from "./function-hooks-internal";
+import {
+	getExtensionHandlerRegistrationOrder,
+	getFunctionHookRegistration,
+	readConstrainedFunctionHookFile,
+} from "./function-hooks-internal";
 import type {
 	AfterProviderResponseEvent,
 	BeforeAgentStartEvent,
@@ -352,16 +356,24 @@ export class ExtensionRunner {
 		const handlersByEvent = new Map<string, IndexedHandler[]>();
 		let registrationOrder = 0;
 		for (const ext of extensions) {
-			const extensionHandlers: Array<{ eventType: string; handler: Handler; index: number }> = [];
+			const extensionHandlers: Array<{
+				eventType: string;
+				handler: Handler;
+				index: number;
+				explicitOrder?: number;
+			}> = [];
 			let index = 0;
 			for (const [eventType, handlers] of ext.handlers) {
-				for (const handler of handlers) extensionHandlers.push({ eventType, handler, index: index++ });
+				for (const handler of handlers) {
+					const explicitOrder =
+						getExtensionHandlerRegistrationOrder(handler) ??
+						getFunctionHookRegistration(handler)?.registrationOrder;
+					extensionHandlers.push({ eventType, handler, index: index++, explicitOrder });
+				}
 			}
 			extensionHandlers.sort((a, b) => {
-				const aRegistration = getFunctionHookRegistration(a.handler);
-				const bRegistration = getFunctionHookRegistration(b.handler);
-				if (aRegistration?.registrationOrder !== undefined && bRegistration?.registrationOrder !== undefined)
-					return aRegistration.registrationOrder - bRegistration.registrationOrder;
+				if (a.explicitOrder !== undefined && b.explicitOrder !== undefined)
+					return a.explicitOrder - b.explicitOrder;
 				return a.index - b.index;
 			});
 			for (const { eventType, handler } of extensionHandlers) {

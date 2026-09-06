@@ -304,6 +304,37 @@ describe("capability-scoped function hooks", () => {
 		expect(calls).toEqual(["legacy-first", "function-second"]);
 	});
 
+	test("preserves public registration order across exact legacy and wildcard Function Hooks", async () => {
+		const calls: string[] = [];
+		const runtime = new ExtensionRuntime();
+		const extension = await loadExtensionFromFactory(
+			api => {
+				api.on("tool_call", async () => {
+					calls.push("legacy-first");
+				});
+				api.registerFunctionHook(
+					"*",
+					async (_invocation, _capabilities, next) => {
+						calls.push("function-middle");
+						return await next();
+					},
+					{ capabilities: ["tool.inspect"] },
+				);
+				api.on("tool_call", async () => {
+					calls.push("legacy-last");
+				});
+			},
+			process.cwd(),
+			new EventBus(),
+			runtime,
+			"ordered-extension",
+		);
+		const runner = new ExtensionRunner([extension], runtime, process.cwd(), SessionManager.inMemory(), {} as never);
+
+		expect(await runner.emitToolCall(toolCall())).toBeUndefined();
+		expect(calls).toEqual(["legacy-first", "function-middle", "legacy-last"]);
+	});
+
 	test("blocks a tool when a granted hook denies it and leaves legacy handlers single-dispatched", async () => {
 		let legacyCalls = 0;
 		const extension = makeExtension([

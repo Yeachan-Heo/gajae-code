@@ -5,6 +5,19 @@ import { type FunctionHookRegistration, validateFunctionHookTarget } from "./fun
 export type TaggedFunctionHookHandler = (...args: unknown[]) => Promise<unknown>;
 
 const registrations = new WeakMap<TaggedFunctionHookHandler, FunctionHookRegistration>();
+const registrationOrders = new WeakMap<(...args: never[]) => unknown, number>();
+
+export function tagExtensionHandlerRegistrationOrder<T extends (...args: never[]) => unknown>(
+	handler: T,
+	registrationOrder: number,
+): T {
+	registrationOrders.set(handler, registrationOrder);
+	return handler;
+}
+
+export function getExtensionHandlerRegistrationOrder(value: unknown): number | undefined {
+	return typeof value === "function" ? registrationOrders.get(value as (...args: never[]) => unknown) : undefined;
+}
 
 export function tagFunctionHookHandler(registration: FunctionHookRegistration): TaggedFunctionHookHandler {
 	if (registration.event === "*" && registration.target !== undefined)

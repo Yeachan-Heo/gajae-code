@@ -30,7 +30,7 @@ import {
 	normalizeFunctionHookGrant,
 	validateFunctionHookTarget,
 } from "./function-hooks";
-import { tagFunctionHookHandler } from "./function-hooks-internal";
+import { tagExtensionHandlerRegistrationOrder, tagFunctionHookHandler } from "./function-hooks-internal";
 import type {
 	Extension,
 	ExtensionAPI,
@@ -270,11 +270,11 @@ class ConcreteExtensionAPI implements ExtensionAPI {
 		private readonly cwd: string,
 		public readonly events: EventBus,
 	) {}
-	#functionHookRegistrationOrder = 0;
+	#handlerRegistrationOrder = 0;
 
 	on<F extends HandlerFn>(event: string, handler: F): void {
 		const list = this.extension.handlers.get(event) ?? [];
-		list.push(handler);
+		list.push(tagExtensionHandlerRegistrationOrder(handler, this.#handlerRegistrationOrder++));
 		this.extension.handlers.set(event, list);
 	}
 
@@ -294,11 +294,12 @@ class ConcreteExtensionAPI implements ExtensionAPI {
 			normalizeFunctionHookGrant(options),
 			DEFAULT_EXTENSION_FUNCTION_HOOK_GRANT,
 		);
+		const registrationOrder = this.#handlerRegistrationOrder++;
 		const registration = {
 			event,
 			...(options.target === undefined ? {} : { target: options.target }),
 			...(options.registrationId === undefined ? {} : { registrationId: options.registrationId }),
-			registrationOrder: this.#functionHookRegistrationOrder++,
+			registrationOrder,
 			handler: handler as unknown as FunctionHook,
 			grant,
 			provenance: {
@@ -308,7 +309,7 @@ class ConcreteExtensionAPI implements ExtensionAPI {
 			},
 		};
 		const list = this.extension.handlers.get(event) ?? [];
-		list.push(tagFunctionHookHandler(registration));
+		list.push(tagExtensionHandlerRegistrationOrder(tagFunctionHookHandler(registration), registrationOrder));
 		this.extension.handlers.set(event, list);
 	}
 
