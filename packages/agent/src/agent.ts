@@ -572,7 +572,9 @@ export class Agent {
 
 	/** Mint a side-attempt scope and its authority unregister function. */
 	mintSideAttemptScope(): { scope: AttemptScope; dispose: () => void } {
-		return this.#attemptAuthority.mintSide();
+		const minted = this.#attemptAuthority.mintSide();
+		this.#observeMainAttemptScope(minted.scope);
+		return minted;
 	}
 
 	/** Return the Agent-owned attempt scope authority for session record injection. */
