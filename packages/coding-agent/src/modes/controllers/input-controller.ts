@@ -2454,19 +2454,13 @@ export class InputController {
 		this.ctx.hideThinkingBlock = hideThinkingBlock;
 		this.ctx.session.setThinkingVisibility(hideThinkingBlock ? "hidden" : "visible");
 
-		// Rebuild chat from session messages
-		// Detach the live streaming component before the disposing clear() so the
-		// component we re-add below is not torn down (detach != dispose).
-		if (this.ctx.streamingComponent) {
-			this.ctx.chatContainer.detachChild(this.ctx.streamingComponent);
-		}
+		// The shared same-transcript rebuild owns live-assistant detach/rebind.
 		this.ctx.rebuildChatFromMessages("reconcile-same-transcript");
 
-		// If streaming, re-add the streaming component with updated visibility and re-render
+		// If streaming, update the restored component's visibility and current projection.
 		if (this.ctx.streamingComponent && this.ctx.streamingMessage) {
 			this.ctx.streamingComponent.setHideThinkingBlock(this.ctx.hideThinkingBlock);
 			this.ctx.streamingComponent.updateContent(this.ctx.streamingMessage, { streaming: true });
-			this.ctx.chatContainer.addChild(this.ctx.streamingComponent);
 		}
 
 		this.ctx.showStatus(`Thinking blocks: ${this.ctx.hideThinkingBlock ? "hidden" : "visible"}`);
