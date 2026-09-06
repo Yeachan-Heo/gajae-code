@@ -5232,7 +5232,7 @@ async function executeToolCalls(
 	};
 
 	const runTool = async (record: (typeof records)[number], index: number): Promise<void> => {
-		if (record.skipped || interruptState.triggered) {
+		if (record.skipped || interruptState.triggered || signal?.aborted) {
 			// Skip both span emission and the collector orphan record here. The
 			// scheduler-task finalizer emits the skipped result and collector record;
 			// the tail sweep below remains a defensive fallback for unexpected throws.
@@ -5409,6 +5409,10 @@ async function executeToolCalls(
 					effectiveArgs,
 					toolContext,
 				);
+				if (signal?.aborted) {
+					record.skipped = true;
+					return;
+				}
 				// Preparation is complete. A successful publication is the only transition
 				// that marks this record dispatched; intrinsic invocation then consumes locals.
 				publishToolDispatch(record, startEvent);
@@ -5458,7 +5462,7 @@ async function executeToolCalls(
 			}
 		});
 
-		const interrupted = interruptState.triggered;
+		const interrupted = interruptState.triggered || record.skipped;
 		if (interrupted) {
 			record.skipped = true;
 			emitToolResult(record, createSkippedToolResult(), true);

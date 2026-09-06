@@ -3476,6 +3476,13 @@ export class AgentSession {
 		}
 	}
 
+	#assertNoSessionTransition(): void {
+		if (this.#sessionTransitionKind === undefined) return;
+		throw Object.assign(new AgentBusyError("Cannot start a turn while a session transition is in progress."), {
+			code: "busy",
+		});
+	}
+
 	/**
 	 * Single, synchronously-acquired mutex for session-identity transitions
 	 * (handoff, compact, new/switch/branch/clear, fork, tree navigation). Acquired
@@ -3559,11 +3566,13 @@ export class AgentSession {
 				{ code: "busy" },
 			);
 		}
+		this.#externalIngressSealed = true;
 		this.#sessionTransitionKind = kind;
 		this.#coordinatorPersistGeneration += 1;
 	}
 
 	#endSessionTransition(): void {
+		this.#externalIngressSealed = false;
 		this.#sessionTransitionKind = undefined;
 	}
 
@@ -3670,6 +3679,7 @@ export class AgentSession {
 		},
 	): Promise<T> {
 		const owner = this.#sessionAdmissionContext.getStore();
+		if (kind === "prompt" && this.#sessionTransitionKind !== undefined) this.#assertNoSessionTransition();
 		if (owner && !owner.released) {
 			if (
 				continuationAdmission?.entry === owner &&
@@ -5979,11 +5989,15 @@ export class AgentSession {
 	}
 
 	#rejectStaleAgentEvent(event: AgentEvent): boolean {
-		if (this.#trustedExternalEventsAfterAgentAdmission.delete(event)) return false;
+		const trustedAfterAgentAdmission = this.#trustedExternalEventsAfterAgentAdmission.delete(event);
 		const scope = (event as AgentEvent & { scope?: AttemptScope }).scope;
 		const scopeKey = scope ? this.#attemptScopeKey(scope) : undefined;
+		const recoveryRejected =
+			this.#terminalPersistenceRecovery !== undefined &&
+			!(event.type === "agent_end" && scopeKey === this.#terminalPersistenceRecovery.attemptScopeKey);
+		if (trustedAfterAgentAdmission && !recoveryRejected) return false;
 		const rejected =
-			this.#externalIngressSealed ||
+			recoveryRejected ||
 			(scopeKey !== undefined && this.#retiredSessionIdentityAttemptScopeKeys.has(scopeKey)) ||
 			(this.#sessionIdentityEpoch > 0 &&
 				(scopeKey === undefined || !this.#currentSessionIdentityAttemptScopeKeys.has(scopeKey)));
@@ -6362,7 +6376,13 @@ export class AgentSession {
 	readonly #trustedExternalEventsAfterAgentAdmission = new WeakSet<AgentEvent>();
 	#externalIngressSealed = false;
 	#terminalPersistenceRecovery:
-		| { message: AssistantMessage; entryId: string | undefined; sessionId: string; sessionIdentityEpoch: number }
+		| {
+				message: AssistantMessage;
+				entryId: string | undefined;
+				attemptScopeKey: string | undefined;
+				sessionId: string;
+				sessionIdentityEpoch: number;
+		  }
 		| undefined;
 	#terminalPersistenceRecoveryPromise: Promise<void> | undefined;
 	#provisionalAssistantMessage:
@@ -6400,19 +6420,23 @@ export class AgentSession {
 
 	#admitExternalAgentEvent(event: AgentEvent): boolean {
 		if (this.#externalIngressSealed) return false;
+		const scope = (event as AgentEvent & { scope?: AttemptScope }).scope;
+		const key = scope ? this.#attemptScopeKey(scope) : undefined;
+		if (this.#terminalPersistenceRecovery) {
+			return event.type === "agent_end" && key === this.#terminalPersistenceRecovery.attemptScopeKey;
+		}
 		if (this.#sessionOwnedExternalEvents.delete(event)) {
 			this.#trustedExternalEventsAfterAgentAdmission.add(event);
 			return true;
 		}
-		const scope = (event as AgentEvent & { scope?: AttemptScope }).scope;
 		if (!scope) return this.#sessionIdentityEpoch === 0;
-		const key = this.#attemptScopeKey(scope);
-		if (this.#retiredSessionIdentityAttemptScopeKeys.has(key)) return false;
+		const scopedKey = this.#attemptScopeKey(scope);
+		if (this.#retiredSessionIdentityAttemptScopeKeys.has(scopedKey)) return false;
 		if (this.#sessionIdentityEpoch === 0) {
-			this.#currentSessionIdentityAttemptScopeKeys.add(key);
+			this.#currentSessionIdentityAttemptScopeKeys.add(scopedKey);
 			return true;
 		}
-		if (this.#sessionIdentityEpoch > 0 && !this.#currentSessionIdentityAttemptScopeKeys.has(key)) return false;
+		if (this.#sessionIdentityEpoch > 0 && !this.#currentSessionIdentityAttemptScopeKeys.has(scopedKey)) return false;
 		return this.#attemptAuthority.isCurrent(scope);
 	}
 
@@ -6566,7 +6590,7 @@ export class AgentSession {
 			provisionalAssistant !== undefined &&
 			(provisionalAssistant.attemptScopeKey !== undefined || attemptScopeKey !== undefined
 				? provisionalAssistant.attemptScopeKey === attemptScopeKey
-				: provisionalAssistant.promptGeneration === this.#promptGeneration);
+				: event.type !== "agent_end" && provisionalAssistant.promptGeneration === this.#promptGeneration);
 		const terminalAssistant =
 			event.type === "agent_end"
 				? [...event.messages].reverse().find((message): message is AssistantMessage => message.role === "assistant")
@@ -6596,7 +6620,9 @@ export class AgentSession {
 		if (event.type === "turn_start" || (event.type === "message_end" && event.message.role === "assistant")) {
 			this.#provisionalAssistantMessage = undefined;
 		}
-		if (event.type === "agent_end") this.#provisionalAssistantMessage = undefined;
+		if (event.type === "agent_end" && (event as AgentEndSessionEvent).terminalProjectionMatched !== false) {
+			this.#provisionalAssistantMessage = undefined;
+		}
 
 		if (
 			event.type === "tool_execution_start" ||
@@ -6752,7 +6778,12 @@ export class AgentSession {
 			if (canonicalAdmission && !canonicalAdmission.predecessor.released) {
 				await canonicalAdmission.predecessor.promise;
 			}
-			if (!unadmittedTerminalAssistant || getSessionMessageEntryId(unadmittedTerminalAssistant) === undefined) {
+			if (this.#terminalPersistenceRecovery) {
+				Object.defineProperty(event, "terminalPersistenceFailed", { value: true, enumerable: true });
+			} else if (
+				!unadmittedTerminalAssistant ||
+				getSessionMessageEntryId(unadmittedTerminalAssistant) === undefined
+			) {
 				const recoveredAssistant: AssistantMessage = unadmittedTerminalAssistant ?? {
 					...orphanAssistant!.message,
 					stopReason: event.stopReason === "cancelled" ? "aborted" : orphanAssistant!.message.stopReason,
@@ -6780,6 +6811,7 @@ export class AgentSession {
 						this.#terminalPersistenceRecovery = {
 							message: recoveredAssistant,
 							entryId: error instanceof SessionAppendPersistenceError ? error.entryId : undefined,
+							attemptScopeKey,
 							sessionId: this.sessionId,
 							sessionIdentityEpoch: this.#sessionIdentityEpoch,
 						};
@@ -6881,6 +6913,7 @@ export class AgentSession {
 						this.#terminalPersistenceRecovery ??= {
 							message: event.message,
 							entryId: error instanceof SessionAppendPersistenceError ? error.entryId : undefined,
+							attemptScopeKey,
 							sessionId: this.sessionId,
 							sessionIdentityEpoch: this.#sessionIdentityEpoch,
 						};
@@ -12274,19 +12307,14 @@ export class AgentSession {
 					this.sessionManager.appendMessage(recovery.message);
 					canonicalMessage = recovery.message;
 				}
-				const canonicalEntryId = getSessionMessageEntryId(canonicalMessage);
-				if (
-					!this.agent.state.messages.some(
-						message =>
-							message === canonicalMessage ||
-							(canonicalEntryId !== undefined && getSessionMessageEntryId(message) === canonicalEntryId),
-					)
-				) {
-					this.agent.appendMessage(canonicalMessage);
-				}
 				if (canonicalMessage !== recovery.message) {
 					transferSessionMessageIdentity([canonicalMessage], [recovery.message]);
 				}
+				const liveProjection = this.agent.state.streamMessage;
+				if (liveProjection?.role === "assistant") this.agent.discardRejectedAssistantEvent(liveProjection);
+				this.agent.replaceMessages(this.sessionManager.buildSessionContext().messages, {
+					historyRewrite: { reason: "terminal-persistence-recovery", preserveSeededPrefix: true },
+				});
 				this.#terminalPersistenceRecovery = undefined;
 				this.emitNotice(
 					"info",
@@ -12784,7 +12812,7 @@ export class AgentSession {
 			resetRetryReplaySafety?: boolean;
 		},
 	): Promise<void> {
-		this.#assertNoHandoffTransition();
+		this.#assertNoSessionTransition();
 		await this.#reconcileTerminalPersistenceFailure();
 		if (options?.preflightSignal?.aborted) throw promptPreflightCancelledError();
 		await awaitPromptInvocationPreflight(this.#agentEndPublicationPromise, options?.preflightSignal);
@@ -18010,6 +18038,7 @@ export class AgentSession {
 					eviction: handle,
 				});
 			}
+			this.#assertTerminalPersistenceSettledForHistoryMutation();
 			const commitOutcomes = commitToolOutputPrune(branchEntries, committedPlan, {
 				replacements: replacementOverrides,
 			});
@@ -18346,6 +18375,7 @@ export class AgentSession {
 				if (compactionAbortController.signal.aborted) {
 					throw new CompactionCancelledError();
 				}
+				this.#assertTerminalPersistenceSettledForHistoryMutation();
 				const compactionEntryId = this.sessionManager.appendCompaction(
 					summary,
 					shortSummary,
@@ -20332,6 +20362,7 @@ export class AgentSession {
 			resourceRunId?: string;
 		},
 	): Promise<AutoCompactionTerminalStatus> {
+		if (this.#terminalPersistenceRecovery) return Promise.resolve({ kind: "skipped" });
 		if (this.#isDisposed || this.#sessionAdmissionClosing) return Promise.resolve({ kind: "skipped" });
 		const completion = this.#runAutoCompactionImpl(reason, willRetry, deferred, options);
 		this.#autoCompactionCompletions.add(completion);
@@ -20766,6 +20797,7 @@ export class AgentSession {
 				return { kind: "aborted", source: "signal" };
 			}
 
+			this.#assertTerminalPersistenceSettledForHistoryMutation();
 			const compactionEntryId = this.sessionManager.appendCompaction(
 				summary,
 				shortSummary,
