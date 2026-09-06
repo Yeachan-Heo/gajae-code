@@ -489,6 +489,7 @@ export class Agent {
 	#runHandles = new Map<number | ManagedLogicalRunId, AttemptRunHandle>();
 
 	#listeners = new Set<(e: AgentEvent) => void>();
+	#externalEventAdmissionFence?: (event: AgentEvent) => boolean;
 	#abortController?: AbortController;
 	#convertToLlm: (messages: AgentMessage[]) => Message[] | Promise<Message[]>;
 	#transformContext?: (
@@ -583,6 +584,10 @@ export class Agent {
 	 */
 	setMainAttemptScopeObserver(observer: ((scope: AttemptScope) => void) | undefined): void {
 		this.#mainAttemptScopeObserver = observer;
+	}
+
+	setExternalEventAdmissionFence(fence: ((event: AgentEvent) => boolean) | undefined): void {
+		this.#externalEventAdmissionFence = fence;
 	}
 
 	#observeMainAttemptScope(scope: AttemptScope): void {
@@ -978,6 +983,7 @@ export class Agent {
 	 * unbound external event stays unbound; unproven provenance is `custom`.
 	 */
 	emitExternalEvent(event: AgentEvent) {
+		if (this.#externalEventAdmissionFence && !this.#externalEventAdmissionFence(event)) return false;
 		switch (event.type) {
 			case "message_start":
 			case "message_update":
@@ -1002,6 +1008,7 @@ export class Agent {
 		}
 
 		this.#emit(event);
+		return true;
 	}
 
 	discardRejectedAssistantEvent(message: AssistantMessage): void {

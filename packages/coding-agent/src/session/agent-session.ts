@@ -2372,7 +2372,6 @@ export interface DefaultFallbackRuntimeState {
 const AGENT_CONTINUE_BUSY_RESCHEDULE_BASE_DELAY_MS = 100;
 const AGENT_CONTINUE_BUSY_RESCHEDULE_MAX_DELAY_MS = 5_000;
 const AGENT_CONTINUE_BUSY_MAX_RESCHEDULES = 50;
-const MAX_RETIRED_SESSION_IDENTITY_ATTEMPT_SCOPES = 4096;
 /**
  * Maximum un-charged managed-fallback retries for escaped-non-ASCII tool-call
  * turns within one logical run. Each retry is a fresh loop with its own
@@ -2902,6 +2901,7 @@ export class AgentSession {
 	}
 	#bindAttemptScope(scope: AttemptScope | undefined): void {
 		if (!scope) return;
+		this.#currentSessionIdentityAttemptScopeKeys.add(this.#attemptScopeKey(scope));
 		this.#attemptRecordStore.register(scope);
 		this.#attemptRecordStore.establishClean(scope);
 	}
@@ -3542,6 +3542,18 @@ export class AgentSession {
 	}
 
 	#beginSessionTransition(kind: string): void {
+		if (
+			this.#terminalPersistenceRecovery &&
+			(kind === "new-session" ||
+				kind === "fork" ||
+				kind === "handoff" ||
+				kind === "switch-session" ||
+				kind === "branch")
+		) {
+			throw Object.assign(new Error("Reconcile terminal persistence before replacing the session identity."), {
+				code: "session_persistence_blocked",
+			});
+		}
 		if (this.#sessionTransitionKind !== undefined) {
 			throw Object.assign(
 				new Error(`Cannot start ${kind} while a ${this.#sessionTransitionKind} transition is in progress.`),
@@ -3757,6 +3769,7 @@ export class AgentSession {
 					code: "busy",
 				});
 			}
+			if (kind === "prompt") await this.#reconcileTerminalPersistenceFailure();
 
 			const release = () => {
 				releaseEntry();
@@ -4583,6 +4596,7 @@ export class AgentSession {
 			this.#extensionRunner.setAttemptRecordStore(this.#attemptRecordStore);
 		}
 		this.agent.setMainAttemptScopeObserver(scope => this.#bindAttemptScope(scope));
+		this.agent.setExternalEventAdmissionFence(event => this.#admitExternalAgentEvent(event));
 		this.#skills = config.skills ?? [];
 		this.#skillWarnings = config.skillWarnings ?? [];
 		this.#reloadSkills = config.reloadSkills;
@@ -5950,7 +5964,26 @@ export class AgentSession {
 		return { predecessor, release };
 	}
 
+	#rejectStaleAgentEvent(event: AgentEvent): boolean {
+		const scope = (event as AgentEvent & { scope?: AttemptScope }).scope;
+		const scopeKey = scope ? this.#attemptScopeKey(scope) : undefined;
+		const rejected =
+			this.#externalIngressSealed ||
+			(scopeKey !== undefined && this.#retiredSessionIdentityAttemptScopeKeys.has(scopeKey)) ||
+			(this.#sessionIdentityEpoch > 0 &&
+				(scopeKey === undefined || !this.#currentSessionIdentityAttemptScopeKeys.has(scopeKey)));
+		if (!rejected) return false;
+		if (
+			(event.type === "message_start" || event.type === "message_update" || event.type === "message_end") &&
+			event.message.role === "assistant"
+		) {
+			this.agent.discardRejectedAssistantEvent(event.message);
+		}
+		return true;
+	}
+
 	#trackAgentEvent = (event: AgentEvent): Promise<void> => {
+		if (this.#rejectStaleAgentEvent(event)) return Promise.resolve();
 		this.#agentEventAdmission.set(event, {
 			scope: this.#activeAttemptScope,
 			sdkRunToken: this.#activeSdkRunToken,
@@ -6310,7 +6343,12 @@ export class AgentSession {
 	#sessionIdentityEpoch = 0;
 	readonly #currentSessionIdentityAttemptScopeKeys = new Set<string>();
 	readonly #retiredSessionIdentityAttemptScopeKeys = new Set<string>();
-	#terminalPersistenceRecoveryMessage: AssistantMessage | undefined;
+	readonly #sessionOwnedExternalEvents = new WeakSet<AgentEvent>();
+	#externalIngressSealed = false;
+	#terminalPersistenceRecovery:
+		| { message: AssistantMessage; entryId: string | undefined; sessionId: string; sessionIdentityEpoch: number }
+		| undefined;
+	#terminalPersistenceRecoveryPromise: Promise<void> | undefined;
 	#provisionalAssistantMessage:
 		| {
 				message: AssistantMessage;
@@ -6335,11 +6373,34 @@ export class AgentSession {
 			this.#retiredSessionIdentityAttemptScopeKeys.add(key);
 		}
 		this.#currentSessionIdentityAttemptScopeKeys.clear();
-		while (this.#retiredSessionIdentityAttemptScopeKeys.size > MAX_RETIRED_SESSION_IDENTITY_ATTEMPT_SCOPES) {
-			const oldest = this.#retiredSessionIdentityAttemptScopeKeys.values().next().value;
-			if (oldest === undefined) break;
-			this.#retiredSessionIdentityAttemptScopeKeys.delete(oldest);
+	}
+
+	#commitSessionIdentityTransition(): void {
+		const streamingMessage = this.agent.state.streamMessage;
+		if (streamingMessage?.role === "assistant") this.agent.discardRejectedAssistantEvent(streamingMessage);
+		this.#retireCurrentSessionIdentityAttemptScopes();
+		this.#attemptAuthority.advanceMain();
+		this.#advanceSessionIdentityEpoch();
+	}
+
+	#admitExternalAgentEvent(event: AgentEvent): boolean {
+		if (this.#sessionOwnedExternalEvents.delete(event)) return true;
+		if (this.#externalIngressSealed) return false;
+		const scope = (event as AgentEvent & { scope?: AttemptScope }).scope;
+		if (!scope) return this.#sessionIdentityEpoch === 0;
+		const key = this.#attemptScopeKey(scope);
+		if (this.#retiredSessionIdentityAttemptScopeKeys.has(key)) return false;
+		if (this.#sessionIdentityEpoch === 0) {
+			this.#currentSessionIdentityAttemptScopeKeys.add(key);
+			return true;
 		}
+		if (this.#sessionIdentityEpoch > 0 && !this.#currentSessionIdentityAttemptScopeKeys.has(key)) return false;
+		return this.#attemptAuthority.isCurrent(scope);
+	}
+
+	#emitSessionOwnedExternalEvent(event: AgentEvent): void {
+		this.#sessionOwnedExternalEvents.add(event);
+		this.agent.emitExternalEvent(event);
 	}
 	// Admission slot of the last message_end per assistant message, so the
 	// agent_end handler can join the terminal's canonical admission before any
@@ -6451,8 +6512,10 @@ export class AgentSession {
 		const terminalWasAborted =
 			(event.type === "agent_end" && event.stopReason === "cancelled") ||
 			(event.type === "message_end" && event.message.role === "assistant" && event.message.stopReason === "aborted");
-		const silentTerminal = terminalWasAborted && (this.#silentAbortPending || this.#planCompactAbortPending);
-		const ttsrTerminal = terminalWasAborted && this.#ttsrAbortPending;
+		const silentTerminal =
+			terminalWasAborted &&
+			(this.#silentAbortPending || this.#planCompactAbortPending || terminalSnapshot.silentAbort === true);
+		const ttsrTerminal = terminalWasAborted && (this.#ttsrAbortPending || terminalSnapshot.ttsrAbort === true);
 		if (silentTerminal && terminalSnapshot.silentAbort !== true) {
 			Object.defineProperty(event, "silentAbort", { value: true, enumerable: true });
 		}
@@ -6687,7 +6750,15 @@ export class AgentSession {
 							"session-persistence",
 						);
 						Object.defineProperty(event, "terminalPersistenceFailed", { value: true, enumerable: true });
-						this.#terminalPersistenceRecoveryMessage = recoveredAssistant;
+						this.#terminalPersistenceRecovery = {
+							message: recoveredAssistant,
+							entryId: error instanceof SessionAppendPersistenceError ? error.entryId : undefined,
+							sessionId: this.sessionId,
+							sessionIdentityEpoch: this.#sessionIdentityEpoch,
+						};
+						const failedPresentation =
+							orphanAssistant?.presentationMessage ?? provisionalAssistant?.presentationMessage;
+						if (failedPresentation) this.agent.discardRejectedAssistantEvent(failedPresentation);
 						persistenceFailed = true;
 					}
 				}
@@ -6696,7 +6767,11 @@ export class AgentSession {
 						this.agent.appendMessage(recoveredAssistant);
 					if (!terminalAssistant) event.messages.push(recoveredAssistant);
 					const presentationMessage =
-						orphanAssistant?.presentationMessage ?? provisionalAssistant?.presentationMessage;
+						orphanAssistant?.presentationMessage ??
+						(provisionalAttemptMatches &&
+						provisionalAssistant?.sessionIdentityEpoch === this.#sessionIdentityEpoch
+							? provisionalAssistant.presentationMessage
+							: undefined);
 					if (presentationMessage && presentationMessage !== recoveredAssistant) {
 						transferSessionMessageIdentity([recoveredAssistant], [presentationMessage]);
 					}
@@ -9209,7 +9284,6 @@ export class AgentSession {
 		previousSessionFile: string | undefined,
 		options: { retirePredecessorRegistrations?: boolean } = {},
 	): void {
-		this.#advanceSessionIdentityEpoch();
 		const previousEndpointId = this.#asyncJobEndpointId(previousSessionId, previousSessionFile);
 		const currentEndpointId = this.#asyncJobEndpointId(
 			this.sessionManager.getSessionId(),
@@ -9223,7 +9297,10 @@ export class AgentSession {
 		// neither the mapping nor the tuples keyed under it are ours to move
 		// or retire (review thread P1).
 		const ownManager = this.#ownedAsyncJobManager ?? AsyncJobManager.instance();
-		if (predecessorOwner !== undefined && predecessorOwner !== ownManager) return;
+		if (predecessorOwner !== undefined && predecessorOwner !== ownManager) {
+			this.#commitSessionIdentityTransition();
+			return;
+		}
 		if (predecessorOwner !== undefined) {
 			const rekeyed = AsyncJobManager.rekeyForEndpoint(previousEndpointId, currentEndpointId, predecessorOwner);
 			if (!rekeyed) {
@@ -9254,6 +9331,7 @@ export class AgentSession {
 		if (previousEndpointId !== currentEndpointId && options.retirePredecessorRegistrations !== false) {
 			retireOwnedRegistrationsForEndpoint(previousEndpointId);
 		}
+		this.#commitSessionIdentityTransition();
 	}
 
 	#rekeyHindsightMemoryForCurrentSessionId(): void {
@@ -12110,7 +12188,6 @@ export class AgentSession {
 	async prompt(text: string, options?: PromptOptions): Promise<void> {
 		const releaseStartupPromptWaiter = this.#reserveStartupPromptWaiter();
 		try {
-			await this.#reconcileTerminalPersistenceFailure();
 			await this.#promptInternal(text, options, releaseStartupPromptWaiter);
 		} finally {
 			releaseStartupPromptWaiter();
@@ -12118,18 +12195,59 @@ export class AgentSession {
 	}
 
 	async #reconcileTerminalPersistenceFailure(): Promise<void> {
-		const message = this.#terminalPersistenceRecoveryMessage;
-		if (!message) return;
+		await this.#agentEndHandlingPromise;
+		if (this.#terminalPersistenceRecoveryPromise) return this.#terminalPersistenceRecoveryPromise;
+		const recovery = this.#terminalPersistenceRecovery;
+		if (!recovery) return;
+		const task = (async () => {
+			try {
+				if (recovery.sessionId !== this.sessionId || recovery.sessionIdentityEpoch !== this.#sessionIdentityEpoch) {
+					throw new Error("Terminal persistence recovery belongs to a different session identity.");
+				}
+				await this.sessionManager.recoverPersistenceFailure();
+				const previousEntryId = recovery.entryId ?? getSessionMessageEntryId(recovery.message);
+				const recoveredEntry = previousEntryId
+					? this.sessionManager.getEntryForFidelity(previousEntryId)
+					: undefined;
+				let canonicalMessage =
+					recoveredEntry?.type === "message" && recoveredEntry.message.role === "assistant"
+						? recoveredEntry.message
+						: undefined;
+				if (!canonicalMessage) {
+					this.sessionManager.appendMessage(recovery.message);
+					canonicalMessage = recovery.message;
+				}
+				const canonicalEntryId = getSessionMessageEntryId(canonicalMessage);
+				if (
+					!this.agent.state.messages.some(
+						message =>
+							message === canonicalMessage ||
+							(canonicalEntryId !== undefined && getSessionMessageEntryId(message) === canonicalEntryId),
+					)
+				) {
+					this.agent.appendMessage(canonicalMessage);
+				}
+				if (canonicalMessage !== recovery.message) {
+					transferSessionMessageIdentity([canonicalMessage], [recovery.message]);
+				}
+				this.#terminalPersistenceRecovery = undefined;
+				this.emitNotice(
+					"info",
+					"Recovered interrupted assistant output into canonical session history.",
+					"terminal-persistence-recovered",
+				);
+			} catch (error) {
+				throw Object.assign(
+					new Error("Session persistence must be reconciled before another prompt can start.", { cause: error }),
+					{ code: "session_persistence_blocked" },
+				);
+			}
+		})();
+		this.#terminalPersistenceRecoveryPromise = task;
 		try {
-			await this.sessionManager.recoverPersistenceFailure();
-			this.sessionManager.appendMessage(message);
-			if (!this.agent.state.messages.includes(message)) this.agent.appendMessage(message);
-			this.#terminalPersistenceRecoveryMessage = undefined;
-		} catch (error) {
-			throw Object.assign(
-				new Error("Session persistence must be reconciled before another prompt can start.", { cause: error }),
-				{ code: "session_persistence_blocked" },
-			);
+			await task;
+		} finally {
+			if (this.#terminalPersistenceRecoveryPromise === task) this.#terminalPersistenceRecoveryPromise = undefined;
 		}
 	}
 
@@ -16015,7 +16133,7 @@ export class AgentSession {
 			}
 			if (this.isStreaming) await this.abort();
 			await this.awaitSessionSettlement();
-			this.#retireCurrentSessionIdentityAttemptScopes();
+			this.#externalIngressSealed = true;
 
 			// Flush current session to ensure all entries are written
 			await this.sessionManager.flush();
@@ -16115,6 +16233,7 @@ export class AgentSession {
 
 			return true;
 		} finally {
+			this.#externalIngressSealed = false;
 			this.#endSessionTransition();
 		}
 	}
@@ -23575,8 +23694,8 @@ export class AgentSession {
 				// emitExternalEvent on message_end appends to agent state and dispatches
 				// to all session listeners, which in turn handle TUI rendering and
 				// sessionManager persistence via #handleAgentEvent.
-				this.agent.emitExternalEvent({ type: "message_start", message: msg });
-				this.agent.emitExternalEvent({ type: "message_end", message: msg });
+				this.#emitSessionOwnedExternalEvent({ type: "message_start", message: msg });
+				this.#emitSessionOwnedExternalEvent({ type: "message_end", message: msg });
 			}
 		}
 	}
@@ -24078,7 +24197,7 @@ export class AgentSession {
 			}
 			if (this.isStreaming) await this.abort();
 			await this.awaitSessionSettlement();
-			this.#retireCurrentSessionIdentityAttemptScopes();
+			this.#externalIngressSealed = true;
 
 			// Flush pending writes before preparing the successor.
 			await this.sessionManager.flush();
@@ -24143,6 +24262,7 @@ export class AgentSession {
 
 			return { selectedText, cancelled: false };
 		} finally {
+			this.#externalIngressSealed = false;
 			this.#endSessionTransition();
 		}
 	}

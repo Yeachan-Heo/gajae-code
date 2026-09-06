@@ -746,6 +746,10 @@ export class EventController {
 	}
 
 	async #handleNotice(event: Extract<AgentSessionEvent, { type: "notice" }>): Promise<void> {
+		if (event.source === "terminal-persistence-recovered") {
+			this.ctx.rebuildChatFromMessages("reconcile-same-transcript");
+			return;
+		}
 		const message = event.source ? `${event.source}: ${event.message}` : event.message;
 		if (event.level === "error") {
 			this.ctx.showError(message);
