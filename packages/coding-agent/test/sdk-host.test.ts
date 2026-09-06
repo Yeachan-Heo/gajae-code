@@ -147,6 +147,25 @@ describe("SessionSdkHost", () => {
 		expect(unregisterAttempts).toBe(2);
 	});
 
+	test("does not fail shutdown when the session-index lock is held by a live broker", async () => {
+		const host = new SessionSdkHost({
+			sessionId: "contended-stop",
+			stateRoot: "/tmp/contended-stop",
+			sendFrame: async () => {},
+			onFrame: () => () => {},
+		});
+		await host.start();
+		await host.registerWithBroker({
+			register: () => {},
+			unregister: () => {
+				throw new Error("Failed to acquire lock for /tmp/index.jsonl after 600 attempts: held by pid 123 (live)");
+			},
+		});
+
+		await expect(host.stop()).resolves.toBe("stopped");
+		expect(host.started).toBe(false);
+	});
+
 	test("shares one broker unregister across concurrent stop callers", async () => {
 		let unsubscribeAttempts = 0;
 		let unregisterAttempts = 0;
