@@ -398,15 +398,16 @@ describe("EventController #handleMessageEnd abort labeling", () => {
 		});
 		const f = createFixture({ streamingMessage: initial });
 		f.ctx.setWorkingMessage = vi.fn();
-		let stopped = false;
-		f.ctx.planModeController = {
-			flushPendingModelSwitch: vi.fn(() => {
-				stopped = true;
-			}),
-		} as never;
-		f.ctx.isStopped = () => stopped;
+		f.ctx.planModeController = { flushPendingModelSwitch: vi.fn() } as never;
+		f.ctx.isStopped = () => false;
+		f.ctx.updateEditorBorderColor = vi.fn();
+		const recordVisibleTranscriptMutation = vi.fn();
+		f.ctx.recordVisibleTranscriptMutation = recordVisibleTranscriptMutation;
+		(f.ctx.session as unknown as { isCompacting: boolean }).isCompacting = true;
+		f.ctx.session.getLastAssistantMessage = () => makeAssistantMessage({ stopReason: "aborted" });
 		await f.controller.handleEvent({ type: "message_start", message: initial });
 		const component = f.ctx.streamingComponent!;
+		recordVisibleTranscriptMutation.mockClear();
 
 		await f.controller.handleEvent({
 			type: "agent_end",
@@ -418,5 +419,6 @@ describe("EventController #handleMessageEnd abort labeling", () => {
 		expect(f.ctx.chatContainer.hasLiveChild(component)).toBe(false);
 		expect(f.ctx.streamingComponent).toBeUndefined();
 		expect(f.ctx.streamingMessage).toBeUndefined();
+		expect(recordVisibleTranscriptMutation).toHaveBeenCalledTimes(1);
 	});
 });

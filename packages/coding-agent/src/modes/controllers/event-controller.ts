@@ -1136,6 +1136,7 @@ export class EventController {
 				this.ctx.chatContainer.removeChild(orphanComponent);
 				this.ctx.streamingComponent = undefined;
 				this.ctx.streamingMessage = undefined;
+				this.#recordVisibleTranscriptMutation();
 			}
 		}
 		this.ctx.setWorkingMessage(undefined);

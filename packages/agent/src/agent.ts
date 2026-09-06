@@ -1004,6 +1004,11 @@ export class Agent {
 		this.#emit(event);
 	}
 
+	discardRejectedAssistantEvent(message: AssistantMessage): void {
+		if (this.#state.streamMessage === message) this.#state.streamMessage = null;
+		if (this.#state.messages.at(-1) === message) this.popMessage();
+	}
+
 	createExternalEventEmitterForCurrentRun(): ((event: AgentEvent) => void) | undefined {
 		const runId = this.#activeRunId;
 		if (runId === undefined) return undefined;
