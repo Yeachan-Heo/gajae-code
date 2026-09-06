@@ -792,8 +792,14 @@ class ToolOutputPruneRollbackError extends Error {
 /** Session-specific events that extend the core AgentEvent */
 export type AutoCompactionContinuationSkipReason = "auto_continue_disabled_non_resumable_tail";
 
+type AgentEndSessionEvent = Extract<AgentEvent, { type: "agent_end" }> & {
+	/** Immutable abort-display classification captured before asynchronous UI dispatch. */
+	silentAbort?: boolean;
+};
+
 export type AgentSessionEvent =
-	| AgentEvent
+	| Exclude<AgentEvent, { type: "agent_end" }>
+	| AgentEndSessionEvent
 	| { type: "auto_compaction_start"; reason: "threshold" | "overflow" | "idle"; action: "context-full" | "handoff" }
 	| {
 			type: "auto_compaction_end";
@@ -5628,11 +5634,6 @@ export class AgentSession {
 		return this.#ttsrAbortPending;
 	}
 
-	/** Whether an interactive abort is waiting to suppress its terminal abort label. */
-	get isSilentAbortPending(): boolean {
-		return this.#silentAbortPending;
-	}
-
 	/** Whether the plan-mode → compaction transition's expected internal abort is
 	 *  pending. Consumed by `#handleAgentEvent` to stamp `SILENT_ABORT_MARKER`
 	 *  on the next aborted assistant message_end; cleared unconditionally by
@@ -6475,6 +6476,10 @@ export class AgentSession {
 		eventLease?: RunResourceProducerLease,
 	): Promise<void> => {
 		const attemptScope = (event as AgentEvent & { scope?: AttemptScope }).scope;
+		const silentAgentEnd =
+			event.type === "agent_end" &&
+			event.stopReason === "cancelled" &&
+			(this.#silentAbortPending || this.#planCompactAbortPending);
 
 		// These lifecycle boundaries can be delivered without awaiting this listener.
 		// Revoke streaming-edit cache generations before any admission, spill, or
@@ -6801,7 +6806,8 @@ export class AgentSession {
 		// values. The original event.message stays obfuscated so the canonical persistence path above
 		// writes authenticated placeholder tokens to the session file; convertToLlm re-obfuscates outbound
 		// traffic on the next turn. Walks text, thinking, and toolCall arguments/intent.
-		let displayEvent: AgentEvent = event;
+		let displayEvent: AgentSessionEvent =
+			event.type === "agent_end" && silentAgentEnd ? { ...event, silentAbort: true } : event;
 		const obfuscator = this.#obfuscator;
 		if (obfuscator && event.type === "message_end" && event.message.role === "assistant") {
 			const message = event.message;

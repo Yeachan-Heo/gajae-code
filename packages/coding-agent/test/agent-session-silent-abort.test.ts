@@ -155,6 +155,28 @@ describe("AgentSession silent-abort marker stamping", () => {
 		await Promise.all([silentAbort, realAbort]);
 	});
 
+	it("snapshots silent cancellation on agent_end before later flag cleanup", async () => {
+		fixture = await createSessionWithObfuscator();
+		const { session } = fixture;
+		const seen: AgentSessionEvent[] = [];
+		session.subscribe(event => seen.push(event));
+
+		session.markPlanCompactAbortPending();
+		expect(session.isPlanCompactAbortPending).toBe(true);
+		session.agent.emitExternalEvent({ type: "agent_end", messages: [], stopReason: "cancelled" });
+		let agentEnd: Extract<AgentSessionEvent, { type: "agent_end" }> | undefined;
+		for (let attempt = 0; attempt < 50 && !agentEnd; attempt++) {
+			await Bun.sleep(1);
+			agentEnd = seen.find(
+				(event): event is Extract<AgentSessionEvent, { type: "agent_end" }> =>
+					event.type === "agent_end" && event.silentAbort === true,
+			);
+		}
+		expect(agentEnd?.silentAbort).toBe(true);
+		session.clearPlanCompactAbortPending();
+		expect(agentEnd?.silentAbort).toBe(true);
+	});
+
 	it("A3: flag set + non-aborted message_end does NOT consume the flag", async () => {
 		fixture = await createSessionWithObfuscator();
 		const { session } = fixture;

@@ -18,6 +18,7 @@ import type {
 	ExtensionContextActions,
 	ExtensionUIContext,
 } from "../src/extensibility/extensions";
+import { AssistantMessageComponent } from "../src/modes/components/assistant-message";
 import { CustomEditor } from "../src/modes/components/custom-editor";
 import { computeIrcWorkLaneWidths, IrcSplitViewComponent } from "../src/modes/components/irc-sidebar";
 import { resolveWelcomeIntroTickMs, WelcomeComponent } from "../src/modes/components/welcome";
@@ -118,6 +119,82 @@ describe("InteractiveMode.setEditorComponent", () => {
 			mode: "none",
 		});
 		expect(reconcile).toHaveBeenCalledTimes(1);
+	});
+
+	it("preserves a live assistant through the tree-navigation initial rebuild path", () => {
+		const message: AssistantMessage = {
+			role: "assistant",
+			content: [{ type: "text", text: "live before tree navigation" }],
+			api: "anthropic-messages",
+			provider: "anthropic",
+			model: "claude-sonnet-4-5",
+			stopReason: "stop",
+			timestamp: Date.now(),
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+		};
+		const component = new AssistantMessageComponent(message);
+		const dispose = vi.spyOn(component, "dispose");
+		mode.streamingMessage = message;
+		mode.streamingComponent = component;
+		mode.chatContainer.addChild(component);
+
+		mode.rebuildInitialMessages("reconcile-same-transcript", {
+			messages: [],
+			thinkingLevel: "off",
+			serviceTier: undefined,
+			models: {},
+			configuredModelChains: {},
+			injectedTtsrRules: [],
+			selectedMCPToolNames: [],
+			hasPersistedMCPToolSelection: false,
+			mode: "none",
+		});
+
+		expect(dispose).not.toHaveBeenCalled();
+		expect(mode.chatContainer.hasLiveChild(component)).toBe(true);
+		expect(mode.streamingComponent).toBe(component);
+		expect(mode.streamingMessage).toBe(message);
+		component.updateContent(
+			{ ...message, content: [{ type: "text", text: "live after tree navigation" }] },
+			{ streaming: true },
+		);
+		expect(Bun.stripANSI(component.render(80).join("\n"))).toContain("live after tree navigation");
+	});
+
+	it("rebuilds a committed orphan assistant from the session transcript", () => {
+		const message: AssistantMessage = {
+			role: "assistant",
+			content: [{ type: "text", text: "orphan survives later reconcile" }],
+			api: "anthropic-messages",
+			provider: "anthropic",
+			model: "claude-sonnet-4-5",
+			stopReason: "aborted",
+			errorMessage: "Operation aborted",
+			timestamp: Date.now(),
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+		};
+		session.sessionManager.appendMessage(message);
+		session.agent.appendMessage(message);
+
+		mode.rebuildChatFromMessages("reconcile-same-transcript");
+
+		const rendered = Bun.stripANSI(mode.chatContainer.render(100).join("\n"));
+		expect(rendered).toContain("orphan survives later reconcile");
+		expect(rendered).toContain("Operation aborted");
 	});
 
 	it("does not spend the iTerm pet warning deadline during pre-start initialization", async () => {
