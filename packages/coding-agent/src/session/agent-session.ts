@@ -2920,8 +2920,12 @@ export class AgentSession {
 	get #hasCleanRetryReplaySafety(): boolean {
 		return this.#retryReplayEpoch > 0 && this.#retryReplayUnsafeEpoch !== this.#retryReplayEpoch;
 	}
-	#bindAttemptScope(scope: AttemptScope | undefined): void {
+	#bindAttemptScope(scope: AttemptScope | undefined, active = true): void {
 		if (!scope) return;
+		if (!active) {
+			this.#currentSessionIdentityAttemptScopeKeys.delete(this.#attemptScopeKey(scope));
+			return;
+		}
 		this.#currentSessionIdentityAttemptScopeKeys.add(this.#attemptScopeKey(scope));
 		this.#attemptRecordStore.register(scope);
 		this.#attemptRecordStore.establishClean(scope);
@@ -3507,6 +3511,12 @@ export class AgentSession {
 		});
 	}
 
+	async #awaitSessionTransitionDisposition(expectedIdentityEpoch: number): Promise<boolean> {
+		const settlement = this.#sessionTransitionSettlement;
+		if (settlement) await settlement.promise;
+		return this.#sessionIdentityEpoch === expectedIdentityEpoch;
+	}
+
 	/**
 	 * Single, synchronously-acquired mutex for session-identity transitions
 	 * (handoff, compact, new/switch/branch/clear, fork, tree navigation). Acquired
@@ -3517,6 +3527,7 @@ export class AgentSession {
 	 * orchestrator does not hold it), so there is no self-deadlock.
 	 */
 	#sessionTransitionKind: string | undefined;
+	#sessionTransitionSettlement: PromiseWithResolvers<void> | undefined;
 	#coordinatorPersistGeneration = 0;
 	#coordinatorRescopeBarrier: Promise<void> | undefined;
 	#releaseCoordinatorRescopeBarrier: (() => void) | undefined;
@@ -3591,6 +3602,7 @@ export class AgentSession {
 			);
 		}
 		this.#externalIngressSealed = true;
+		this.#sessionTransitionSettlement = Promise.withResolvers<void>();
 		this.#sessionTransitionKind = kind;
 		this.#coordinatorPersistGeneration += 1;
 	}
@@ -3598,6 +3610,8 @@ export class AgentSession {
 	#endSessionTransition(): void {
 		this.#externalIngressSealed = false;
 		this.#sessionTransitionKind = undefined;
+		this.#sessionTransitionSettlement?.resolve();
+		this.#sessionTransitionSettlement = undefined;
 		this.#flushOrSchedulePendingBackgroundExchanges();
 	}
 
@@ -4683,7 +4697,7 @@ export class AgentSession {
 		if (this.#extensionRunner && typeof this.#extensionRunner.setAttemptRecordStore === "function") {
 			this.#extensionRunner.setAttemptRecordStore(this.#attemptRecordStore);
 		}
-		this.agent.setMainAttemptScopeObserver(scope => this.#bindAttemptScope(scope));
+		this.agent.setMainAttemptScopeObserver((scope, active) => this.#bindAttemptScope(scope, active));
 		this.agent.setExternalEventAdmissionFence(event => this.#admitExternalAgentEvent(event));
 		this.#skills = config.skills ?? [];
 		this.#skillWarnings = config.skillWarnings ?? [];
@@ -6536,6 +6550,7 @@ export class AgentSession {
 		if (streamingMessage?.role === "assistant") this.agent.discardRejectedAssistantEvent(streamingMessage);
 		this.#retireCurrentSessionIdentityAttemptScopes();
 		this.#advanceSessionIdentityEpoch();
+		this.#retiredSessionIdentityAttemptScopeKeys.clear();
 	}
 
 	#admitExternalAgentEvent(event: AgentEvent): boolean {
@@ -6669,7 +6684,6 @@ export class AgentSession {
 			discardRejectedAssistantEvent();
 			return;
 		}
-		if (attemptScopeKey) this.#currentSessionIdentityAttemptScopeKeys.add(attemptScopeKey);
 		if (
 			attemptScope === undefined &&
 			this.#sessionIdentityEpoch > 0 &&
@@ -16399,6 +16413,7 @@ export class AgentSession {
 			this.agent.reset();
 			await this.sessionManager.flush();
 			this.sessionManager.appendContextClearEntry({ sessionId });
+			this.#commitSessionIdentityTransition();
 			this.setTodoPhases([]);
 			this.#syncAgentSessionId(sessionId);
 			this.#steeringMessages = [];
@@ -21827,7 +21842,11 @@ export class AgentSession {
 								await restoreOwnedTransition();
 								return;
 							}
-							this.#assertNoSessionTransition();
+							const transitionEpoch = this.#sessionIdentityEpoch;
+							if (!(await this.#awaitSessionTransitionDisposition(transitionEpoch))) {
+								await restoreOwnedTransition();
+								return;
+							}
 							const continuation = this.agent.continue({
 								...this.#managedFallbackPromptOptions(),
 								transientRecoveryMessage: this.#escapedNonAsciiRecoveryMessage(),
@@ -21871,7 +21890,9 @@ export class AgentSession {
 				type: "retry",
 				continuation: async ownership => {
 					if (attemptCancelled() || !ownership.isCurrent() || ownership.lease.signal.aborted) return;
-					this.#assertNoSessionTransition();
+					const transitionEpoch = this.#sessionIdentityEpoch;
+					if (!(await this.#awaitSessionTransitionDisposition(transitionEpoch))) return;
+					if (attemptCancelled() || !ownership.isCurrent() || ownership.lease.signal.aborted) return;
 					await this.agent.continue({
 						...this.#managedFallbackPromptOptions(),
 						transientRecoveryMessage: this.#escapedNonAsciiRecoveryMessage(),
@@ -22896,7 +22917,9 @@ export class AgentSession {
 						this.#resolveRetry();
 						return;
 					}
-					this.#assertNoSessionTransition();
+					const transitionEpoch = this.#sessionIdentityEpoch;
+					if (!(await this.#awaitSessionTransitionDisposition(transitionEpoch))) return;
+					if (retryCancelled() || ownershipCancelled()) return;
 					await this.agent.continue({
 						...this.#managedFallbackPromptOptions(),
 						onRunAccepted: (handle: AttemptRunHandle) => {
@@ -24947,6 +24970,7 @@ export class AgentSession {
 				// No summary, navigating to non-root
 				this.sessionManager.branch(newLeafId);
 			}
+			this.#commitSessionIdentityTransition();
 
 			// The history rewrite is now committed. Drop predecessor-owned queued SDK
 			// work at this boundary; cancelled or failed preparation above preserves it.
