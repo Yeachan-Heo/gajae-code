@@ -152,17 +152,20 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 				throw new Error(`Extension failed, blocking execution: ${String(err)}`);
 			}
 		}
-		params = validateToolArguments(this.tool, {
-			type: "toolCall",
-			id: toolCallId,
-			name: this.tool.name,
-			arguments: toolCallEvent.input,
-		} satisfies ToolCall) as Static<TParameters>;
+		if (toolCallEvent.input !== params || !this.tool.lenientArgValidation) {
+			params = validateToolArguments(this.tool, {
+				type: "toolCall",
+				id: toolCallId,
+				name: this.tool.name,
+				arguments: toolCallEvent.input,
+			} satisfies ToolCall) as Static<TParameters>;
+		}
 
 		// Execute the actual tool
 		let result: { content: any; details?: TDetails };
 		let executionError: Error | undefined;
 		const mediatesToolResult = this.runner.hasToolResultMediation(this.tool.name);
+		const deliversToolResult = this.runner.hasHandlers("tool_result");
 		const effectiveOnUpdate = mediatesToolResult ? undefined : onUpdate;
 
 		try {
@@ -180,7 +183,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 
 		// Emit tool_result event - extensions can modify the result and error status
 		if (signal?.aborted) throw toolAbortReason(signal, "Tool execution aborted");
-		if (mediatesToolResult) {
+		if (deliversToolResult) {
 			const resultResult = await this.runner.emitToolResult(
 				{
 					type: "tool_result",

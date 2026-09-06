@@ -873,12 +873,6 @@ export class ExtensionRunner {
 		return matches;
 	}
 
-	#legacyHandlers(eventType: string): IndexedHandler[] {
-		return (this.#handlersByEvent.get(eventType) ?? []).filter(
-			({ handler }) => getFunctionHookRegistration(handler) === undefined,
-		);
-	}
-
 	#functionHookAuditPath(registration: FunctionHookRegistration): string {
 		return path.basename(registration.provenance.path).slice(0, 256);
 	}
@@ -1010,12 +1004,10 @@ export class ExtensionRunner {
 			signal?: AbortSignal;
 			correlationId?: string;
 			scope?: AttemptScopeRef;
-			includeLegacyToolHandlers?: boolean;
+			legacyHandler?: (handler: IndexedHandler, event: TEvent) => Promise<FunctionHookDispatchResult<TEvent>>;
 		} = {},
 	): Promise<FunctionHookDispatchResult<TEvent>> {
-		const handlers = options.includeLegacyToolHandlers
-			? this.#matchingHandlers(event, true)
-			: this.#matchingFunctionHooks(event);
+		const handlers = options.legacyHandler ? this.#matchingHandlers(event, true) : this.#matchingFunctionHooks(event);
 		if (handlers.length === 0) return { action: "continue", event };
 		const includesLegacy = handlers.some(indexed => getFunctionHookRegistration(indexed.handler) === undefined);
 		if (includesLegacy) this.#requireScopeOrFailClosed(options.scope, event.type);
@@ -1030,19 +1022,13 @@ export class ExtensionRunner {
 		const eventId = randomUUID();
 		const correlationId = options.correlationId ?? eventId;
 		return await this.#functionHookDepth.run(functionHookDepth + 1, async () => {
-			let legacyToolCallResult: ToolCallEventResult | undefined;
 			const invoke = async (
 				index: number,
 				currentEvent: TEvent,
 				removedCapabilities: readonly FunctionHookCapability[],
 				chainSignal: AbortSignal,
 			): Promise<FunctionHookDispatchResult<TEvent>> => {
-				if (index >= handlers.length) {
-					if (legacyToolCallResult) {
-						return { action: "return", value: legacyToolCallResult } as FunctionHookDispatchResult<TEvent>;
-					}
-					return { action: "continue", event: currentEvent, transformed: false };
-				}
+				if (index >= handlers.length) return { action: "continue", event: currentEvent, transformed: false };
 				if (chainSignal.aborted)
 					return this.#functionHookErrorResult(
 						currentEvent,
@@ -1052,48 +1038,10 @@ export class ExtensionRunner {
 				if (!indexed) return { action: "continue", event: currentEvent, transformed: false };
 				const registration = getFunctionHookRegistration(indexed.handler);
 				if (!registration) {
-					const ctx = this.createContext();
-					if (currentEvent.type === "tool_call") {
-						try {
-							const result = (await indexed.handler(currentEvent, ctx)) as ToolCallEventResult | undefined;
-							if (result?.block)
-								return { action: "return", value: result } as FunctionHookDispatchResult<TEvent>;
-							if (result) legacyToolCallResult = result;
-						} catch (error) {
-							const message = error instanceof Error ? error.message : String(error);
-							this.emitError({ extensionPath: indexed.ext.path, event: "tool_call", error: message });
-							return {
-								action: "return",
-								value: { block: true, reason: `Extension ${indexed.ext.path} failed: ${message}` },
-							} as FunctionHookDispatchResult<TEvent>;
-						}
-						return await invoke(index + 1, currentEvent, removedCapabilities, chainSignal);
-					}
-					const result = (await this.#runHandlerWithTimeout(
-						indexed.handler,
-						currentEvent,
-						ctx,
-						indexed.ext,
-						extensionHandlerTimeoutMs,
-					)) as ToolResultEventResult | undefined;
-					let legacyChanged = false;
-					if (result) {
-						const toolResult = currentEvent as ToolResultEvent;
-						if (result.content !== undefined) {
-							toolResult.content = result.content;
-							legacyChanged = true;
-						}
-						if (result.details !== undefined) {
-							toolResult.details = result.details;
-							legacyChanged = true;
-						}
-						if (result.isError !== undefined) {
-							toolResult.isError = result.isError;
-							legacyChanged = true;
-						}
-					}
-					const downstream = await invoke(index + 1, currentEvent, removedCapabilities, chainSignal);
-					return legacyChanged && downstream.action === "continue"
+					const legacyDispatch = await options.legacyHandler!(indexed, currentEvent);
+					if (legacyDispatch.action !== "continue") return legacyDispatch;
+					const downstream = await invoke(index + 1, legacyDispatch.event, removedCapabilities, chainSignal);
+					return legacyDispatch.transformed === true && downstream.action === "continue"
 						? { ...downstream, transformed: true }
 						: downstream;
 				}
@@ -1102,9 +1050,16 @@ export class ExtensionRunner {
 					...new Set([...removedCapabilities, ...(registration.grant.attenuateDownstream ?? [])]),
 				];
 				const wildcard = registration.event === "*" || registration.target === "*";
-				const failureResult = (reason: string): FunctionHookDispatchResult<TEvent> => {
+				let nextCalled = false;
+				let nextFailureReason: string | undefined;
+				let nextPromise: Promise<FunctionHookDispatchResult<TEvent>> | undefined;
+				let nextReturnValue: FunctionHookResult | undefined;
+				const failureResult = async (reason: string): Promise<FunctionHookDispatchResult<TEvent>> => {
 					if (functionHookDenyAllowed(currentEvent, effectiveGrant)) return { action: "deny", reason };
-					if (wildcard) return { action: "continue", event: currentEvent };
+					if (wildcard) {
+						if (nextPromise) return await nextPromise;
+						return await invoke(index + 1, currentEvent, downstreamRemoved, chainSignal);
+					}
 					return this.#functionHookErrorResult(currentEvent, reason) as FunctionHookDispatchResult<TEvent>;
 				};
 				let payload: Readonly<TEvent>;
@@ -1160,10 +1115,6 @@ export class ExtensionRunner {
 					readFile: (filePath, roots) => readConstrainedFunctionHookFile(filePath, this.cwd, roots),
 				};
 				const capabilities = createFunctionHookCapabilities(effectiveGrant, bindings);
-				let nextCalled = false;
-				let nextFailureReason: string | undefined;
-				let nextPromise: Promise<FunctionHookDispatchResult<TEvent>> | undefined;
-				let nextReturnValue: FunctionHookResult | undefined;
 				const next: FunctionHookNext = async nextEvent => {
 					if (nextCalled) throw new Error("Function hook next() may only be called once");
 					nextCalled = true;
@@ -1439,48 +1390,36 @@ export class ExtensionRunner {
 		scope?: AttemptScopeRef,
 	): Promise<RunnerEmitResult<TEvent>> {
 		const eventSignal = "signal" in event && event.signal instanceof AbortSignal ? event.signal : undefined;
-		const functionDispatch = await this.emitFunctionHooks(event, { signal: eventSignal, scope });
+		const ctx = this.createContext();
+		let result: SessionBeforeEventResult | SessionCompactingResult | undefined;
+		const functionDispatch = await this.emitFunctionHooks(event, {
+			signal: eventSignal,
+			scope,
+			legacyHandler: async (indexed, currentEvent) => {
+				if (continueWhile && !continueWhile()) return { action: "return", value: result };
+				const handlerResult = await this.#runHandlerWithTimeout(
+					indexed.handler,
+					currentEvent,
+					ctx,
+					indexed.ext,
+					currentEvent.type === "session_shutdown" ? sessionShutdownHandlerTimeoutMs : extensionHandlerTimeoutMs,
+				);
+				if (continueWhile && !continueWhile()) return { action: "return", value: result };
+				if (this.#isSessionBeforeEvent(currentEvent) && handlerResult) {
+					result = handlerResult as SessionBeforeEventResult;
+					if (result.cancel) return { action: "return", value: result };
+				}
+				if (currentEvent.type === "session.compacting" && handlerResult) {
+					result = handlerResult as SessionCompactingResult;
+				}
+				return { action: "continue", event: currentEvent };
+			},
+		});
 		if (functionDispatch.action === "deny") {
 			if (this.#isSessionBeforeEvent(event)) return { cancel: true } as RunnerEmitResult<TEvent>;
 			return undefined as RunnerEmitResult<TEvent>;
 		}
 		if (functionDispatch.action === "return") return functionDispatch.value as RunnerEmitResult<TEvent>;
-		const functionEvent = functionDispatch.event;
-		const handlers = this.#legacyHandlers(event.type);
-		if (handlers.length === 0) return undefined as RunnerEmitResult<TEvent>;
-		this.#requireScopeOrFailClosed(scope, event.type);
-
-		const ctx = this.createContext();
-		let result: SessionBeforeEventResult | SessionCompactingResult | undefined;
-		let marked = false;
-
-		for (const { ext, handler } of handlers) {
-			if (continueWhile && !continueWhile()) return result as RunnerEmitResult<TEvent>;
-			if (!marked) {
-				this.#markAttemptExecuted(scope);
-				marked = true;
-			}
-			const handlerResult = await this.#runHandlerWithTimeout(
-				handler,
-				functionEvent,
-				ctx,
-				ext,
-				event.type === "session_shutdown" ? sessionShutdownHandlerTimeoutMs : extensionHandlerTimeoutMs,
-			);
-			if (continueWhile && !continueWhile()) return result as RunnerEmitResult<TEvent>;
-
-			if (this.#isSessionBeforeEvent(event) && handlerResult) {
-				result = handlerResult as SessionBeforeEventResult;
-				if (result.cancel) {
-					return result as RunnerEmitResult<TEvent>;
-				}
-			}
-
-			if (event.type === "session.compacting" && handlerResult) {
-				result = handlerResult as SessionCompactingResult;
-			}
-		}
-
 		return result as RunnerEmitResult<TEvent>;
 	}
 
@@ -1489,12 +1428,35 @@ export class ExtensionRunner {
 		scope?: AttemptScopeRef,
 		options: { signal?: AbortSignal; correlationId?: string } = {},
 	): Promise<ToolResultEventResult | undefined> {
+		const ctx = this.createContext();
 		const functionDispatch = await this.emitFunctionHooks(
 			{ ...event },
 			{
 				...options,
 				scope,
-				includeLegacyToolHandlers: true,
+				legacyHandler: async (indexed, currentEvent) => {
+					const result = (await this.#runHandlerWithTimeout(
+						indexed.handler,
+						currentEvent,
+						ctx,
+						indexed.ext,
+						extensionHandlerTimeoutMs,
+					)) as ToolResultEventResult | undefined;
+					let transformed = false;
+					if (result?.content !== undefined) {
+						currentEvent.content = result.content;
+						transformed = true;
+					}
+					if (result?.details !== undefined) {
+						currentEvent.details = result.details;
+						transformed = true;
+					}
+					if (result?.isError !== undefined) {
+						currentEvent.isError = result.isError;
+						transformed = true;
+					}
+					return { action: "continue", event: currentEvent, transformed };
+				},
 			},
 		);
 		if (functionDispatch.action === "deny") {
@@ -1519,15 +1481,31 @@ export class ExtensionRunner {
 		scope?: AttemptScopeRef,
 		options: { signal?: AbortSignal; correlationId?: string } = {},
 	): Promise<ToolCallEventResult | undefined> {
+		const ctx = this.createContext();
+		let legacyResult: ToolCallEventResult | undefined;
 		const functionDispatch = await this.emitFunctionHooks(event, {
 			...options,
 			scope,
-			includeLegacyToolHandlers: true,
+			legacyHandler: async (indexed, currentEvent) => {
+				try {
+					const result = (await indexed.handler(currentEvent, ctx)) as ToolCallEventResult | undefined;
+					if (result?.block) return { action: "return", value: result };
+					if (result) legacyResult = result;
+					return { action: "continue", event: currentEvent };
+				} catch (error) {
+					const message = error instanceof Error ? error.message : String(error);
+					this.emitError({ extensionPath: indexed.ext.path, event: "tool_call", error: message });
+					return {
+						action: "return",
+						value: { block: true, reason: `Extension ${indexed.ext.path} failed: ${message}` },
+					};
+				}
+			},
 		});
 		if (functionDispatch.action === "deny") return { block: true, reason: functionDispatch.reason };
 		if (functionDispatch.action === "return") return functionDispatch.value as ToolCallEventResult;
 		event.input = functionDispatch.event.input;
-		return undefined;
+		return legacyResult;
 	}
 
 	async emitUserBash(event: UserBashEvent): Promise<UserBashEventResult | undefined> {
@@ -1542,29 +1520,25 @@ export class ExtensionRunner {
 		event: UserBashEvent | UserPythonEvent,
 		eventName: "user_bash" | "user_python",
 	): Promise<R | undefined> {
-		const functionDispatch = await this.emitFunctionHooks(event);
+		const ctx = this.createContext();
+		const functionDispatch = await this.emitFunctionHooks(event, {
+			legacyHandler: async (indexed, currentEvent) => {
+				const result = await this.#runHandlerWithTimeout(
+					indexed.handler,
+					currentEvent,
+					ctx,
+					indexed.ext,
+					extensionHandlerTimeoutMs,
+				);
+				return result === undefined
+					? { action: "continue", event: currentEvent }
+					: { action: "return", value: result };
+			},
+		});
 		if (functionDispatch.action === "deny" || functionDispatch.action === "return") {
 			return functionDispatch.action === "return" ? (functionDispatch.value as R) : undefined;
 		}
-		const functionEvent = functionDispatch.event;
-		const handlers = this.#legacyHandlers(eventName);
-		if (handlers.length === 0) return undefined;
-
-		const ctx = this.createContext();
-
-		for (const { ext, handler } of handlers) {
-			const handlerResult = await this.#runHandlerWithTimeout(
-				handler,
-				functionEvent,
-				ctx,
-				ext,
-				extensionHandlerTimeoutMs,
-			);
-			if (handlerResult) {
-				return handlerResult as R;
-			}
-		}
-
+		void eventName;
 		return undefined;
 	}
 
@@ -1576,7 +1550,31 @@ export class ExtensionRunner {
 		promptPaths: Array<{ path: string; extensionPath: string }>;
 		themePaths: Array<{ path: string; extensionPath: string }>;
 	}> {
-		const functionDispatch = await this.emitFunctionHooks({ type: "resources_discover", cwd, reason });
+		const ctx = this.createContext();
+		const skillPaths: Array<{ path: string; extensionPath: string }> = [];
+		const promptPaths: Array<{ path: string; extensionPath: string }> = [];
+		const themePaths: Array<{ path: string; extensionPath: string }> = [];
+		const functionDispatch = await this.emitFunctionHooks(
+			{ type: "resources_discover", cwd, reason },
+			{
+				legacyHandler: async (indexed, currentEvent) => {
+					const result = (await this.#runHandlerWithTimeout(
+						indexed.handler,
+						currentEvent,
+						ctx,
+						indexed.ext,
+						extensionHandlerTimeoutMs,
+					)) as ResourcesDiscoverResult | undefined;
+					if (result?.skillPaths?.length)
+						skillPaths.push(...result.skillPaths.map(path => ({ path, extensionPath: indexed.ext.path })));
+					if (result?.promptPaths?.length)
+						promptPaths.push(...result.promptPaths.map(path => ({ path, extensionPath: indexed.ext.path })));
+					if (result?.themePaths?.length)
+						themePaths.push(...result.themePaths.map(path => ({ path, extensionPath: indexed.ext.path })));
+					return { action: "continue", event: currentEvent };
+				},
+			},
+		);
 		if (functionDispatch.action === "deny") return { skillPaths: [], promptPaths: [], themePaths: [] };
 		if (functionDispatch.action === "return")
 			return functionDispatch.value as {
@@ -1584,35 +1582,6 @@ export class ExtensionRunner {
 				promptPaths: Array<{ path: string; extensionPath: string }>;
 				themePaths: Array<{ path: string; extensionPath: string }>;
 			};
-		const functionEvent = functionDispatch.event;
-		const handlers = this.#legacyHandlers("resources_discover");
-		if (handlers.length === 0) return { skillPaths: [], promptPaths: [], themePaths: [] };
-		const ctx = this.createContext();
-		const skillPaths: Array<{ path: string; extensionPath: string }> = [];
-		const promptPaths: Array<{ path: string; extensionPath: string }> = [];
-		const themePaths: Array<{ path: string; extensionPath: string }> = [];
-
-		for (const { ext, handler } of handlers) {
-			const handlerResult = await this.#runHandlerWithTimeout(
-				handler,
-				functionEvent,
-				ctx,
-				ext,
-				extensionHandlerTimeoutMs,
-			);
-			const result = handlerResult as ResourcesDiscoverResult | undefined;
-
-			if (result?.skillPaths?.length) {
-				skillPaths.push(...result.skillPaths.map(path => ({ path, extensionPath: ext.path })));
-			}
-			if (result?.promptPaths?.length) {
-				promptPaths.push(...result.promptPaths.map(path => ({ path, extensionPath: ext.path })));
-			}
-			if (result?.themePaths?.length) {
-				themePaths.push(...result.themePaths.map(path => ({ path, extensionPath: ext.path })));
-			}
-		}
-
 		return { skillPaths, promptPaths, themePaths };
 	}
 
@@ -1622,70 +1591,61 @@ export class ExtensionRunner {
 		images: ImageContent[] | undefined,
 		source: "interactive" | "sdk" | "extension",
 	): Promise<InputEventResult> {
-		const functionDispatch = await this.emitFunctionHooks({ type: "input", text, images, source });
+		const ctx = this.createContext();
+		const functionDispatch = await this.emitFunctionHooks(
+			{ type: "input", text, images, source },
+			{
+				legacyHandler: async (indexed, currentEvent) => {
+					const result = (await this.#runHandlerWithTimeout(
+						indexed.handler,
+						currentEvent,
+						ctx,
+						indexed.ext,
+						extensionHandlerTimeoutMs,
+					)) as InputEventResult | undefined;
+					if (result?.handled) return { action: "return", value: result };
+					if (result?.text !== undefined) {
+						currentEvent.text = result.text;
+						currentEvent.images = result.images ?? currentEvent.images;
+						return { action: "continue", event: currentEvent, transformed: true };
+					}
+					return { action: "continue", event: currentEvent };
+				},
+			},
+		);
 		if (functionDispatch.action === "deny") return { handled: true };
 		if (functionDispatch.action === "return") return functionDispatch.value as InputEventResult;
 		const transformedInput = functionDispatch.event;
-		const handlers = this.#legacyHandlers("input");
-		if (handlers.length === 0)
-			return transformedInput.text !== text || transformedInput.images !== images
-				? { text: transformedInput.text, images: transformedInput.images }
-				: {};
-
-		const ctx = this.createContext();
-		let currentText = transformedInput.text;
-		let currentImages = transformedInput.images;
-
-		for (const { ext, handler } of handlers) {
-			const event: InputEvent = { type: "input", text: currentText, images: currentImages, source };
-			const result = (await this.#runHandlerWithTimeout(handler, event, ctx, ext, extensionHandlerTimeoutMs)) as
-				| InputEventResult
-				| undefined;
-			if (result?.handled) return result;
-			if (result?.text !== undefined) {
-				currentText = result.text;
-				currentImages = result.images ?? currentImages;
-			}
-		}
-
-		return currentText !== text || currentImages !== images ? { text: currentText, images: currentImages } : {};
+		return transformedInput.text !== text || transformedInput.images !== images
+			? { text: transformedInput.text, images: transformedInput.images }
+			: {};
 	}
 
 	async emitContext(messages: AgentMessage[], scope?: AttemptScopeRef, signal?: AbortSignal): Promise<AgentMessage[]> {
-		const functionDispatch = await this.emitFunctionHooks({ type: "context", messages }, { signal, scope });
+		let ctx: ExtensionContext | undefined;
+		const functionDispatch = await this.emitFunctionHooks(
+			{ type: "context", messages },
+			{
+				signal,
+				scope,
+				legacyHandler: async (indexed, currentEvent) => {
+					ctx ??= this.createContext();
+					const result = (await this.#runHandlerWithTimeout(
+						indexed.handler,
+						currentEvent,
+						ctx,
+						indexed.ext,
+						extensionHandlerTimeoutMs,
+					)) as ContextEventResult | undefined;
+					if (!result?.messages) return { action: "continue", event: currentEvent };
+					currentEvent.messages = result.messages;
+					return { action: "continue", event: currentEvent, transformed: true };
+				},
+			},
+		);
 		if (functionDispatch.action === "deny") throw new Error(functionDispatch.reason);
 		if (functionDispatch.action === "return") return functionDispatch.value as AgentMessage[];
-		const transformedMessages = functionDispatch.event.messages;
-		const handlers = this.#legacyHandlers("context");
-		if (handlers.length === 0) return transformedMessages;
-		this.#requireScopeOrFailClosed(scope, "context");
-
-		const ctx = this.createContext();
-		let currentMessages: AgentMessage[];
-		try {
-			currentMessages = structuredClone(transformedMessages);
-		} catch {
-			// Messages may contain non-cloneable objects (e.g. in ToolResultMessage.details
-			// or ProviderPayload). Fall back to a shallow array clone — extensions should
-			// return new message arrays rather than mutating in place.
-			currentMessages = [...transformedMessages];
-		}
-		let marked = false;
-
-		for (const { ext, handler } of handlers) {
-			if (!marked) {
-				this.#markAttemptExecuted(scope);
-				marked = true;
-			}
-			const event: ContextEvent = { type: "context", messages: currentMessages };
-			const handlerResult = await this.#runHandlerWithTimeout(handler, event, ctx, ext, extensionHandlerTimeoutMs);
-
-			if (handlerResult && (handlerResult as ContextEventResult).messages) {
-				currentMessages = (handlerResult as ContextEventResult).messages!;
-			}
-		}
-
-		return currentMessages;
+		return functionDispatch.event.messages;
 	}
 
 	async emitBeforeProviderRequest(
@@ -1693,36 +1653,29 @@ export class ExtensionRunner {
 		scope?: AttemptScopeRef,
 		signal?: AbortSignal,
 	): Promise<BeforeProviderRequestEventResult> {
+		const ctx = this.createContext();
 		const functionDispatch = await this.emitFunctionHooks(
 			{ type: "before_provider_request", payload },
-			{ signal, scope },
+			{
+				signal,
+				scope,
+				legacyHandler: async (indexed, currentEvent) => {
+					const result = await this.#runHandlerWithTimeout(
+						indexed.handler,
+						currentEvent,
+						ctx,
+						indexed.ext,
+						extensionHandlerTimeoutMs,
+					);
+					if (result === undefined) return { action: "continue", event: currentEvent };
+					currentEvent.payload = result;
+					return { action: "continue", event: currentEvent, transformed: true };
+				},
+			},
 		);
 		if (functionDispatch.action === "deny") throw new Error(functionDispatch.reason);
 		if (functionDispatch.action === "return") return functionDispatch.value;
-		const handlers = this.#legacyHandlers("before_provider_request");
-		if (handlers.length === 0) return functionDispatch.event.payload;
-		this.#requireScopeOrFailClosed(scope, "before_provider_request");
-
-		const ctx = this.createContext();
-		let currentPayload = functionDispatch.event.payload;
-		let marked = false;
-
-		for (const { ext, handler } of handlers) {
-			if (!marked) {
-				this.#markAttemptExecuted(scope);
-				marked = true;
-			}
-			const event: BeforeProviderRequestEvent = {
-				type: "before_provider_request",
-				payload: currentPayload,
-			};
-			const handlerResult = await this.#runHandlerWithTimeout(handler, event, ctx, ext, extensionHandlerTimeoutMs);
-			if (handlerResult !== undefined) {
-				currentPayload = handlerResult;
-			}
-		}
-
-		return currentPayload;
+		return functionDispatch.event.payload;
 	}
 
 	async emitAfterProviderResponse(
@@ -1731,6 +1684,7 @@ export class ExtensionRunner {
 		scope?: AttemptScopeRef,
 		signal?: AbortSignal,
 	): Promise<void> {
+		const ctx = this.createContext();
 		const functionDispatch = await this.emitFunctionHooks(
 			{
 				type: "after_provider_response",
@@ -1739,24 +1693,22 @@ export class ExtensionRunner {
 				requestId: response.requestId,
 				metadata: response.metadata,
 			},
-			{ signal, scope },
+			{
+				signal,
+				scope,
+				legacyHandler: async (indexed, currentEvent) => {
+					await this.#runHandlerWithTimeout(
+						indexed.handler,
+						currentEvent,
+						ctx,
+						indexed.ext,
+						extensionHandlerTimeoutMs,
+					);
+					return { action: "continue", event: currentEvent };
+				},
+			},
 		);
 		if (functionDispatch.action !== "continue") return;
-		const functionEvent = functionDispatch.event;
-		const handlers = this.#legacyHandlers("after_provider_response");
-		if (handlers.length === 0) return;
-		this.#requireScopeOrFailClosed(scope, "after_provider_response");
-
-		const ctx = this.createContext();
-		let marked = false;
-
-		for (const { ext, handler } of handlers) {
-			if (!marked) {
-				this.#markAttemptExecuted(scope);
-				marked = true;
-			}
-			await this.#runHandlerWithTimeout(handler, functionEvent, ctx, ext, extensionHandlerTimeoutMs);
-		}
 	}
 
 	async emitBeforeAgentStart(
@@ -1765,6 +1717,8 @@ export class ExtensionRunner {
 		systemPrompt: string[],
 		signal?: AbortSignal,
 	): Promise<BeforeAgentStartCombinedResult | undefined> {
+		const ctx = this.createContext();
+		const messages: NonNullable<BeforeAgentStartEventResult["message"]>[] = [];
 		const functionDispatch = await this.emitFunctionHooks(
 			{
 				type: "before_agent_start",
@@ -1772,67 +1726,47 @@ export class ExtensionRunner {
 				images,
 				systemPrompt,
 			},
-			{ signal },
+			{
+				signal,
+				legacyHandler: async (indexed, currentEvent) => {
+					const result = await this.#runHandlerWithTimeout(
+						indexed.handler,
+						currentEvent,
+						ctx,
+						indexed.ext,
+						extensionHandlerTimeoutMs,
+					);
+					if (!result) return { action: "continue", event: currentEvent };
+					const unsupportedFields = unsupportedBeforeAgentStartResultFields(result);
+					if (unsupportedFields.length > 0) {
+						this.emitError({
+							extensionPath: indexed.ext.path,
+							event: "before_agent_start",
+							error: `Unsupported before_agent_start result field(s): ${unsupportedFields.join(", ")}. Supported fields: message, systemPrompt.`,
+						});
+					}
+					const legacyResult = result as BeforeAgentStartEventResult;
+					if (legacyResult.message) messages.push(legacyResult.message);
+					if (legacyResult.systemPrompt === undefined) return { action: "continue", event: currentEvent };
+					currentEvent.systemPrompt = legacyResult.systemPrompt;
+					return { action: "continue", event: currentEvent, transformed: true };
+				},
+			},
 		);
 		if (functionDispatch.action === "deny") throw new Error(functionDispatch.reason);
 		if (functionDispatch.action === "return") return functionDispatch.value as BeforeAgentStartCombinedResult;
 		const transformedPrompt = functionDispatch.event.prompt;
 		const transformedImages = functionDispatch.event.images;
+		const transformedSystemPrompt = functionDispatch.event.systemPrompt;
 		const promptModified = transformedPrompt !== prompt;
 		const imagesModified = JSON.stringify(transformedImages) !== JSON.stringify(images);
-		const functionSystemPromptModified =
-			JSON.stringify(functionDispatch.event.systemPrompt) !== JSON.stringify(systemPrompt);
-		const handlers = this.#legacyHandlers("before_agent_start");
-		if (handlers.length === 0) {
-			return promptModified || imagesModified || functionSystemPromptModified
-				? {
-						...(promptModified ? { prompt: transformedPrompt } : {}),
-						...(imagesModified ? { images: transformedImages } : {}),
-						...(functionSystemPromptModified ? { systemPrompt: functionDispatch.event.systemPrompt } : {}),
-					}
-				: undefined;
-		}
-
-		const ctx = this.createContext();
-		const messages: NonNullable<BeforeAgentStartEventResult["message"]>[] = [];
-		let currentSystemPrompt = functionDispatch.event.systemPrompt;
-		let systemPromptModified = functionSystemPromptModified;
-
-		for (const { ext, handler } of handlers) {
-			const event: BeforeAgentStartEvent = {
-				type: "before_agent_start",
-				prompt: transformedPrompt,
-				images: transformedImages,
-				systemPrompt: currentSystemPrompt,
-			};
-			const handlerResult = await this.#runHandlerWithTimeout(handler, event, ctx, ext, extensionHandlerTimeoutMs);
-
-			if (handlerResult) {
-				const unsupportedFields = unsupportedBeforeAgentStartResultFields(handlerResult);
-				if (unsupportedFields.length > 0) {
-					this.emitError({
-						extensionPath: ext.path,
-						event: "before_agent_start",
-						error: `Unsupported before_agent_start result field(s): ${unsupportedFields.join(", ")}. Supported fields: message, systemPrompt.`,
-					});
-				}
-				const result = handlerResult as BeforeAgentStartEventResult;
-				if (result.message) {
-					messages.push(result.message);
-				}
-				if (result.systemPrompt !== undefined) {
-					currentSystemPrompt = result.systemPrompt;
-					systemPromptModified = true;
-				}
-			}
-		}
-
+		const systemPromptModified = JSON.stringify(transformedSystemPrompt) !== JSON.stringify(systemPrompt);
 		if (messages.length > 0 || systemPromptModified || promptModified || imagesModified) {
 			return {
-				messages: messages.length > 0 ? messages : undefined,
-				systemPrompt: systemPromptModified ? currentSystemPrompt : undefined,
-				prompt: promptModified ? transformedPrompt : undefined,
-				images: imagesModified ? transformedImages : undefined,
+				...(messages.length > 0 ? { messages } : {}),
+				...(systemPromptModified ? { systemPrompt: transformedSystemPrompt } : {}),
+				...(promptModified ? { prompt: transformedPrompt } : {}),
+				...(imagesModified ? { images: transformedImages } : {}),
 			};
 		}
 

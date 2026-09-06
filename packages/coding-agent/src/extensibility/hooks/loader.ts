@@ -22,7 +22,12 @@ import {
 	normalizeFunctionHookGrant,
 	validateFunctionHookTarget,
 } from "../extensions/function-hooks";
-import { getFunctionHookRegistration, tagFunctionHookHandler } from "../extensions/function-hooks-internal";
+import {
+	getExtensionHandlerRegistrationOrder,
+	getFunctionHookRegistration,
+	tagExtensionHandlerRegistrationOrder,
+	tagFunctionHookHandler,
+} from "../extensions/function-hooks-internal";
 import type {
 	ExtensionAPI,
 	ExtensionCommandContext,
@@ -138,7 +143,7 @@ async function createHookAPI(
 	let appendEntryHandler: AppendEntryHandler | null = null;
 	const messageRenderers = new Map<string, HookMessageRenderer>();
 	const commands = new Map<string, RegisteredCommand>();
-	let functionHookRegistrationOrder = 0;
+	let handlerRegistrationOrder = 0;
 
 	// Cast to HookAPI - the implementation is more general (string event names)
 	// but the interface has specific overloads for type safety in hooks
@@ -147,7 +152,7 @@ async function createHookAPI(
 			if (!handlers.has(event)) {
 				handlers.set(event, []);
 			}
-			handlers.get(event)!.push(handler);
+			handlers.get(event)!.push(tagExtensionHandlerRegistrationOrder(handler, handlerRegistrationOrder++));
 		},
 		sendMessage<T = unknown>(
 			message: HookMessage<T>,
@@ -181,11 +186,12 @@ async function createHookAPI(
 					throw new Error("Function hook targets are only valid for tool_call and tool_result events");
 				if (options.target !== "*") validateFunctionHookTarget(options.target);
 			}
+			const registrationOrder = handlerRegistrationOrder++;
 			const registration: FunctionHookRegistration = {
 				event,
 				...(options.target === undefined ? {} : { target: options.target }),
 				...(options.registrationId === undefined ? {} : { registrationId: options.registrationId }),
-				registrationOrder: functionHookRegistrationOrder++,
+				registrationOrder,
 				handler: handler as unknown as FunctionHook,
 				grant: intersectFunctionHookGrants(
 					normalizeFunctionHookGrant(options),
@@ -194,7 +200,12 @@ async function createHookAPI(
 				provenance: { source: "extension", path: sourcePath, extensionId: sourcePath },
 			};
 			const list = handlers.get(event) ?? [];
-			list.push(tagFunctionHookHandler(registration) as unknown as HandlerFn);
+			list.push(
+				tagExtensionHandlerRegistrationOrder(
+					tagFunctionHookHandler(registration) as unknown as HandlerFn,
+					registrationOrder,
+				),
+			);
 			handlers.set(event, list);
 		},
 		exec(command: string, args: string[], options?: ExecOptions) {
@@ -420,45 +431,60 @@ function createHookExtensionFactory(hook: LoadedHook): ExtensionFactory {
 		hook.setSendMessageHandler((message, options) => api.sendMessage(message, options));
 		hook.setAppendEntryHandler((customType, data) => api.appendEntry(customType, data));
 
+		const orderedHandlers: Array<{ event: string; handler: HandlerFn; order: number; fallback: number }> = [];
+		let fallback = 0;
 		for (const [event, handlers] of hook.handlers) {
 			for (const handler of handlers) {
-				const functionRegistration = getFunctionHookRegistration(handler);
-				if (functionRegistration) {
-					const normalized = hook.normalization;
-					const normalizedTarget = normalized && normalized.toolName !== "*" ? normalized.toolName : undefined;
-					if (
-						normalized &&
-						(functionRegistration.event !== normalized.runtimeEvent ||
-							(functionRegistration.target !== undefined && functionRegistration.target !== normalizedTarget))
-					) {
-						throw new Error("Function hook registration conflicts with its normalized discovery target");
-					}
-					api.registerFunctionHook(functionRegistration.event, functionRegistration.handler, {
-						...(normalizedTarget === undefined && functionRegistration.target === undefined
-							? {}
-							: { target: normalizedTarget ?? functionRegistration.target }),
-						...(functionRegistration.registrationId === undefined
-							? {}
-							: { registrationId: functionRegistration.registrationId }),
-						...functionRegistration.grant,
-					});
-					continue;
-				}
-				const normalized = hook.normalization;
-				const adapted: HandlerFn = async (...args: unknown[]) => {
-					const payload = args[0] as { toolName?: string };
-					if (
-						normalized &&
-						event === normalized.runtimeEvent &&
-						normalized.toolName !== "*" &&
-						payload.toolName !== normalized.toolName
-					) {
-						return undefined;
-					}
-					return await handler(payload, toHookContext(args[1] as ExtensionContext));
-				};
-				(api.on as (event: string, handler: HandlerFn) => void)(event, adapted);
+				orderedHandlers.push({
+					event,
+					handler,
+					order:
+						getExtensionHandlerRegistrationOrder(handler) ??
+						getFunctionHookRegistration(handler)?.registrationOrder ??
+						Number.MAX_SAFE_INTEGER,
+					fallback: fallback++,
+				});
 			}
+		}
+		orderedHandlers.sort((a, b) => a.order - b.order || a.fallback - b.fallback);
+
+		for (const { event, handler } of orderedHandlers) {
+			const functionRegistration = getFunctionHookRegistration(handler);
+			if (functionRegistration) {
+				const normalized = hook.normalization;
+				const normalizedTarget = normalized && normalized.toolName !== "*" ? normalized.toolName : undefined;
+				if (
+					normalized &&
+					(functionRegistration.event !== normalized.runtimeEvent ||
+						(functionRegistration.target !== undefined && functionRegistration.target !== normalizedTarget))
+				) {
+					throw new Error("Function hook registration conflicts with its normalized discovery target");
+				}
+				api.registerFunctionHook(functionRegistration.event, functionRegistration.handler, {
+					...(normalizedTarget === undefined && functionRegistration.target === undefined
+						? {}
+						: { target: normalizedTarget ?? functionRegistration.target }),
+					...(functionRegistration.registrationId === undefined
+						? {}
+						: { registrationId: functionRegistration.registrationId }),
+					...functionRegistration.grant,
+				});
+				continue;
+			}
+			const normalized = hook.normalization;
+			const adapted: HandlerFn = async (...args: unknown[]) => {
+				const payload = args[0] as { toolName?: string };
+				if (
+					normalized &&
+					event === normalized.runtimeEvent &&
+					normalized.toolName !== "*" &&
+					payload.toolName !== normalized.toolName
+				) {
+					return undefined;
+				}
+				return await handler(payload, toHookContext(args[1] as ExtensionContext));
+			};
+			(api.on as (event: string, handler: HandlerFn) => void)(event, adapted);
 		}
 
 		for (const [customType, renderer] of hook.messageRenderers) {

@@ -1,4 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
 import { createAttemptScopeAuthority } from "@gajae-code/agent-core/attempt-scope";
 import {
 	type FunctionHook,
@@ -22,6 +25,7 @@ import type {
 	ToolResultEvent,
 } from "../src/extensibility/extensions/types";
 import { ExtensionToolWrapper } from "../src/extensibility/extensions/wrapper";
+import { discoverAndLoadHookExtensions } from "../src/extensibility/hooks/loader";
 import { Type } from "../src/extensibility/typebox";
 import { AttemptRecordStore } from "../src/session/attempt-record-store";
 import { SessionManager } from "../src/session/session-manager";
@@ -335,6 +339,131 @@ describe("capability-scoped function hooks", () => {
 		expect(calls).toEqual(["legacy-first", "function-middle", "legacy-last"]);
 	});
 
+	test("preserves HookAPI registration order while adapting cross-event handlers", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-hook-adapter-order-"));
+		const hookPath = path.join(root, "ordered-hook.ts");
+		await Bun.write(
+			hookPath,
+			`export default function(api) {
+				api.on("tool_call", async () => { globalThis.__gjcHookOrder.push("legacy-first"); });
+				api.registerFunctionHook("*", async (_invocation, _capabilities, next) => {
+					globalThis.__gjcHookOrder.push("function-middle");
+					return await next();
+				}, { capabilities: ["audit.append"] });
+				api.on("tool_call", async () => { globalThis.__gjcHookOrder.push("legacy-last"); });
+			}
+			`,
+		);
+		try {
+			const globalOrder = globalThis as typeof globalThis & { __gjcHookOrder?: string[] };
+			globalOrder.__gjcHookOrder = [];
+			const loaded = await discoverAndLoadHookExtensions([hookPath], root);
+			expect(loaded.errors).toHaveLength(0);
+			const factory = loaded.factories[0];
+			if (!factory) throw new Error("Expected adapted hook factory");
+			const runtime = new ExtensionRuntime();
+			const extension = await loadExtensionFromFactory(factory.factory, root, new EventBus(), runtime, factory.name);
+			const runner = new ExtensionRunner([extension], runtime, root, SessionManager.inMemory(), {} as never);
+			await runner.emitToolCall(toolCall());
+			expect(globalOrder.__gjcHookOrder).toEqual(["legacy-first", "function-middle", "legacy-last"]);
+		} finally {
+			delete (globalThis as typeof globalThis & { __gjcHookOrder?: string[] }).__gjcHookOrder;
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
+	test("continues downstream enforcement when a fail-open wildcard observer throws", async () => {
+		const calls: string[] = [];
+		const runner = makeRunner([
+			registration(
+				"*",
+				async () => {
+					calls.push("observer");
+					throw new Error("observer failed");
+				},
+				{ capabilities: ["audit.append"] },
+				0,
+			),
+			registration(
+				"tool_call",
+				async () => {
+					calls.push("policy");
+					return { action: "deny", reason: "blocked" };
+				},
+				{ capabilities: ["tool.deny"] },
+				1,
+				"read",
+			),
+		]);
+
+		expect(await runner.emitToolCall(toolCall())).toEqual({ block: true, reason: "blocked" });
+		expect(calls).toEqual(["observer", "policy"]);
+	});
+
+	test("preserves transformed tool input alongside nonblocking legacy metadata", async () => {
+		const extension = makeExtension([]);
+		extension.handlers.set("tool_call", [
+			async () => ({ block: false }),
+			tagFunctionHookHandler({
+				...registration(
+					"tool_call",
+					async invocation => ({
+						action: "continue",
+						event: { ...(invocation.payload as ToolCallEvent), input: { path: "replacement.txt" } },
+					}),
+					{ capabilities: ["tool.transform"] },
+					1,
+					"read",
+				),
+				grant: normalizeFunctionHookGrant({ capabilities: ["tool.transform"] }),
+			}),
+		]);
+		const runner = new ExtensionRunner(
+			[extension],
+			new ExtensionRuntime(),
+			process.cwd(),
+			SessionManager.inMemory(),
+			{} as never,
+		);
+		const event = toolCall({ path: "original.txt" });
+
+		expect(await runner.emitToolCall(event)).toEqual({ block: false });
+		expect(event.input).toEqual({ path: "replacement.txt" });
+	});
+
+	test("preserves registration order for non-tool input middleware", async () => {
+		const calls: string[] = [];
+		const runtime = new ExtensionRuntime();
+		const extension = await loadExtensionFromFactory(
+			api => {
+				api.on("input", async () => {
+					calls.push("legacy-first");
+					return { text: "legacy" };
+				});
+				api.registerFunctionHook(
+					"input",
+					async (invocation, _capabilities, next) => {
+						calls.push("function-second");
+						expect((invocation.payload as { text: string }).text).toBe("legacy");
+						return await next();
+					},
+					{ capabilities: ["ui.transform"] },
+				);
+			},
+			process.cwd(),
+			new EventBus(),
+			runtime,
+			"input-order-extension",
+		);
+		const runner = new ExtensionRunner([extension], runtime, process.cwd(), SessionManager.inMemory(), {} as never);
+
+		expect(await runner.emitInput("original", undefined, "interactive")).toEqual({
+			text: "legacy",
+			images: undefined,
+		});
+		expect(calls).toEqual(["legacy-first", "function-second"]);
+	});
+
 	test("blocks a tool when a granted hook denies it and leaves legacy handlers single-dispatched", async () => {
 		let legacyCalls = 0;
 		const extension = makeExtension([
@@ -589,6 +718,25 @@ describe("capability-scoped function hooks", () => {
 		).toEqual({ prompt: "redacted", images: undefined, systemPrompt: ["safe system"] });
 	});
 
+	test("omits unchanged images from message-only legacy before-agent results", async () => {
+		const extension = makeExtension([]);
+		extension.handlers.set("before_agent_start", [
+			async () => ({ message: { customType: "notice", content: "observed", display: true } }),
+		]);
+		const runner = new ExtensionRunner(
+			[extension],
+			new ExtensionRuntime(),
+			process.cwd(),
+			SessionManager.inMemory(),
+			{} as never,
+		);
+		const images = [{ type: "image" as const, data: "base64", mimeType: "image/png" }];
+
+		const result = await runner.emitBeforeAgentStart("hello", images, ["system"]);
+		expect(result?.messages).toHaveLength(1);
+		expect(Object.hasOwn(result ?? {}, "images")).toBe(false);
+	});
+
 	test("does not treat concurrent top-level dispatches as recursive re-entry", async () => {
 		const runner = makeRunner([
 			registration(
@@ -763,6 +911,73 @@ describe("capability-scoped function hooks", () => {
 			updateCalls += 1;
 		});
 		expect(updateCalls).toBe(1);
+	});
+
+	test("delivers final results to inspection-only hooks without suppressing progress", async () => {
+		let updateCalls = 0;
+		let resultHookCalls = 0;
+		const runner = makeRunner([
+			registration(
+				"tool_result",
+				async (_invocation, _capabilities, next) => {
+					resultHookCalls += 1;
+					return await next();
+				},
+				{ capabilities: ["tool.inspect"] },
+				0,
+				"read",
+			),
+		]);
+		const wrapped = new ExtensionToolWrapper(
+			{
+				name: "read",
+				label: "Read",
+				description: "Read a file",
+				parameters: Type.Object({ path: Type.String() }),
+				execute: async (_id, _params, _signal, onUpdate) => {
+					onUpdate?.({ content: [{ type: "text", text: "streaming" }] });
+					return { content: [{ type: "text" as const, text: "done" }] };
+				},
+			},
+			runner,
+		);
+
+		await wrapped.execute("call-1", { path: "safe.txt" }, undefined, () => {
+			updateCalls += 1;
+		});
+		expect(updateCalls).toBe(1);
+		expect(resultHookCalls).toBe(1);
+	});
+
+	test("preserves lenient validation when middleware leaves arguments unchanged", async () => {
+		let received: unknown;
+		const runner = makeRunner([
+			registration(
+				"tool_call",
+				async (_invocation, _capabilities, next) => await next(),
+				{ capabilities: ["tool.inspect"] },
+				0,
+				"read",
+			),
+		]);
+		const wrapped = new ExtensionToolWrapper(
+			{
+				name: "read",
+				label: "Read",
+				description: "Read a file",
+				parameters: Type.Object({ path: Type.String() }),
+				lenientArgValidation: true,
+				execute: async (_id, params) => {
+					received = params;
+					return { content: [{ type: "text" as const, text: "done" }] };
+				},
+			},
+			runner,
+		);
+		const invalid = { path: 42 } as never;
+
+		await wrapped.execute("call-1", invalid);
+		expect(received).toBe(invalid);
 	});
 
 	test("preserves caller abort identity before tool-call mediation", async () => {
