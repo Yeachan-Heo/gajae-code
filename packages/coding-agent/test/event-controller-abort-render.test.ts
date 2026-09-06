@@ -10,7 +10,7 @@
  *   C2  errorMessage = undefined + aborted + no TTSR flag
  *       → `streamingMessage.errorMessage` is set to "Operation aborted";
  *         `updateContent` receives the original message ref.
- *   C3  isTtsrAbortPending = true + aborted
+ *   C3  ttsrAbort event snapshot + aborted
  *       → `updateContent` receives a message with `stopReason: "stop"`;
  *         `errorMessage` is NOT set (TTSR existing behavior unchanged).
  */
@@ -55,11 +55,7 @@ function makeAssistantMessage(overrides: Partial<AssistantMessage> = {}): Assist
 	};
 }
 
-function createFixture(opts: {
-	streamingMessage: AssistantMessage;
-	isTtsrAbortPending?: boolean;
-	retryAttempt?: number;
-}) {
+function createFixture(opts: { streamingMessage: AssistantMessage; retryAttempt?: number }) {
 	const updateContent = vi.fn();
 	const setUsageInfo = vi.fn();
 	const streamingComponent = { updateContent, setUsageInfo };
@@ -87,7 +83,6 @@ function createFixture(opts: {
 		streamingMessage: opts.streamingMessage,
 		pendingTools: new Map(),
 		session: {
-			isTtsrAbortPending: opts.isTtsrAbortPending ?? false,
 			agent: { appendMessage: vi.fn() },
 			retryAttempt: opts.retryAttempt ?? 0,
 		},
@@ -102,7 +97,7 @@ describe("EventController #handleMessageEnd abort labeling", () => {
 	for (const ending of ["success", "error", "visible", "silent", "ttsr"] as const) {
 		it(`queued text cannot supersede authoritative ${ending} finalization`, async () => {
 			const initial = makeAssistantMessage({ stopReason: "stop", content: [] });
-			const f = createFixture({ streamingMessage: initial, isTtsrAbortPending: ending === "ttsr" });
+			const f = createFixture({ streamingMessage: initial });
 			await f.controller.handleEvent({ type: "message_start", message: initial });
 			const component = f.ctx.streamingComponent!;
 			const projection = vi.spyOn(component, "updateContent");
@@ -128,7 +123,11 @@ describe("EventController #handleMessageEnd abort labeling", () => {
 				errorMessage:
 					ending === "silent" ? SILENT_ABORT_MARKER : ending === "error" ? "provider failed" : undefined,
 			});
-			await f.controller.handleEvent({ type: "message_end", message: final });
+			await f.controller.handleEvent({
+				type: "message_end",
+				message: final,
+				...(ending === "ttsr" ? { ttsrAbort: true } : {}),
+			});
 			expect(f.preparations.size).toBe(0);
 			expect(usage).toHaveBeenCalledTimes(1);
 			const finalProjectionCount = projection.mock.calls.length;
@@ -190,7 +189,6 @@ describe("EventController #handleMessageEnd abort labeling", () => {
 		const message = makeAssistantMessage({ stopReason: "aborted", errorMessage: undefined });
 		const { controller, streamingComponent } = createFixture({
 			streamingMessage: message,
-			isTtsrAbortPending: false,
 		});
 
 		await controller.handleEvent({ type: "message_end", message });
@@ -206,14 +204,11 @@ describe("EventController #handleMessageEnd abort labeling", () => {
 		expect(arg.errorMessage).toBe("Operation aborted");
 	});
 
-	it("C3: isTtsrAbortPending=true + aborted -> updateContent stopReason='stop', errorMessage NOT set", async () => {
+	it("C3: ttsrAbort event snapshot + aborted -> updateContent stopReason='stop', errorMessage NOT set", async () => {
 		const message = makeAssistantMessage({ stopReason: "aborted", errorMessage: undefined });
-		const { controller, streamingComponent } = createFixture({
-			streamingMessage: message,
-			isTtsrAbortPending: true,
-		});
+		const { controller, streamingComponent } = createFixture({ streamingMessage: message });
 
-		await controller.handleEvent({ type: "message_end", message });
+		await controller.handleEvent({ type: "message_end", message, ttsrAbort: true });
 
 		// TTSR keeps its existing flag-only render path — `errorMessage` stays undefined,
 		// and the display copy gets `stopReason: "stop"`.
@@ -230,7 +225,6 @@ describe("EventController #handleMessageEnd abort labeling", () => {
 		});
 		const { controller, streamingComponent } = createFixture({
 			streamingMessage: message,
-			isTtsrAbortPending: false,
 			retryAttempt: 1,
 		});
 
@@ -255,7 +249,6 @@ describe("EventController #handleMessageEnd abort labeling", () => {
 		});
 		const { controller, streamingComponent } = createFixture({
 			streamingMessage: message,
-			isTtsrAbortPending: false,
 			retryAttempt: 0,
 		});
 
@@ -393,10 +386,6 @@ describe("EventController #handleMessageEnd abort labeling", () => {
 		expect(rendered).not.toContain(SILENT_ABORT_MARKER);
 		expect(partial.stopReason).toBe("stop");
 		expect(partial.errorMessage).toBeUndefined();
-		expect(f.ctx.sessionManager.appendMessage).toHaveBeenCalledWith(
-			expect.objectContaining({ stopReason: "aborted", errorMessage: SILENT_ABORT_MARKER }),
-		);
-		expect(f.ctx.session.agent.appendMessage).toHaveBeenCalledTimes(1);
 		stopped = true;
 		gate.resolve();
 		await pending;

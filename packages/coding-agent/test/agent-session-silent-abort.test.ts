@@ -14,7 +14,7 @@
  */
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
-import { Agent } from "@gajae-code/agent-core";
+import { Agent, type AgentEvent } from "@gajae-code/agent-core";
 import type { AssistantMessage, TextContent } from "@gajae-code/ai";
 import { getBundledModel } from "@gajae-code/ai/models";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
@@ -23,7 +23,7 @@ import { SecretObfuscator } from "@gajae-code/coding-agent/secrets/obfuscator";
 import { AgentSession, type AgentSessionEvent } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SILENT_ABORT_MARKER } from "@gajae-code/coding-agent/session/messages";
-import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
+import { getSessionMessageEntryId, SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { TempDir } from "@gajae-code/utils";
 
 function makeAbortedAssistantMessage(text = "partial draft"): AssistantMessage {
@@ -155,15 +155,32 @@ describe("AgentSession silent-abort marker stamping", () => {
 		await Promise.all([silentAbort, realAbort]);
 	});
 
-	it("snapshots silent cancellation on agent_end before later flag cleanup", async () => {
+	it("canonically commits and classifies an orphan before publishing the same agent_end object", async () => {
 		fixture = await createSessionWithObfuscator();
 		const { session } = fixture;
 		const seen: AgentSessionEvent[] = [];
 		session.subscribe(event => seen.push(event));
 
+		const provisional = makeStoppedAssistantMessage("retained orphan partial");
+		session.agent.emitExternalEvent({ type: "message_start", message: provisional });
+		session.agent.emitExternalEvent({
+			type: "message_update",
+			message: provisional,
+			assistantMessageEvent: {
+				type: "text_delta",
+				contentIndex: 0,
+				delta: "retained orphan partial",
+				partial: provisional,
+			},
+		});
 		session.markPlanCompactAbortPending();
 		expect(session.isPlanCompactAbortPending).toBe(true);
-		session.agent.emitExternalEvent({ type: "agent_end", messages: [], stopReason: "cancelled" });
+		const rawAgentEnd: Extract<AgentEvent, { type: "agent_end" }> = {
+			type: "agent_end",
+			messages: [],
+			stopReason: "cancelled",
+		};
+		session.agent.emitExternalEvent(rawAgentEnd);
 		let agentEnd: Extract<AgentSessionEvent, { type: "agent_end" }> | undefined;
 		for (let attempt = 0; attempt < 50 && !agentEnd; attempt++) {
 			await Bun.sleep(1);
@@ -172,9 +189,25 @@ describe("AgentSession silent-abort marker stamping", () => {
 					event.type === "agent_end" && event.silentAbort === true,
 			);
 		}
+		expect(agentEnd).toBe(rawAgentEnd);
 		expect(agentEnd?.silentAbort).toBe(true);
-		session.clearPlanCompactAbortPending();
-		expect(agentEnd?.silentAbort).toBe(true);
+		const recovered = agentEnd?.messages.find((message): message is AssistantMessage => message.role === "assistant");
+		expect(recovered?.stopReason).toBe("aborted");
+		expect(recovered?.errorMessage).toBe(SILENT_ABORT_MARKER);
+		expect(recovered && getSessionMessageEntryId(recovered)).toBeDefined();
+		expect(session.agent.state.messages.filter(message => message === recovered)).toHaveLength(1);
+		expect(
+			session
+				.buildDisplaySessionContext()
+				.messages.some(
+					message =>
+						message.role === "assistant" &&
+						message.content.some(
+							content => content.type === "text" && content.text === "retained orphan partial",
+						),
+				),
+		).toBe(true);
+		expect(session.isPlanCompactAbortPending).toBe(false);
 	});
 
 	it("A3: flag set + non-aborted message_end does NOT consume the flag", async () => {
