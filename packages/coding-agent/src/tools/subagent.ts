@@ -12,6 +12,7 @@ import { ToolError } from "./tool-errors";
 
 const DEFAULT_AWAIT_TIMEOUT_MS = 30_000;
 const MAX_AWAIT_TIMEOUT_MS = 60 * 60 * 1000;
+const MAX_AWAIT_HEARTBEAT_MS = 60_000;
 /**
  * Bounded cadence for await liveness: even when the rendered-state signature is
  * stable (a running subagent emitting no new progress), the await panel re-emits
@@ -47,9 +48,9 @@ const subagentSchema = z.object({
 		.describe("terminal wait condition; defaults to all_terminal"),
 	heartbeat_ms: z
 		.number()
-		.refine(value => value === 0 || (Number.isInteger(value) && value >= 100 && value <= 5000))
+		.refine(value => value === 0 || (Number.isInteger(value) && value >= 100 && value <= MAX_AWAIT_HEARTBEAT_MS))
 		.optional()
-		.describe("heartbeat interval; 0 disables"),
+		.describe(`heartbeat interval in milliseconds (100-${MAX_AWAIT_HEARTBEAT_MS}); 0 disables`),
 	timeout_ms: z.number().min(0).max(MAX_AWAIT_TIMEOUT_MS).optional().describe("await timeout in milliseconds"),
 	limit: z.number().min(1).max(MAX_LIST_LIMIT).optional().describe("maximum subagents to return"),
 	verbosity: z
