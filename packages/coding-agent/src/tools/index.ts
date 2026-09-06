@@ -203,6 +203,8 @@ export interface ToolSession {
 	 * Runtime discovery only; never threaded into capability loading.
 	 */
 	home?: string;
+	/** Resolver-owned classification for the session's selected agent directory. */
+	profileAuthority?: "default" | "custom";
 	skills?: Skill[];
 	/** Currently executing skill prompt, when this tool session is inside one. */
 	getActiveSkillState?: () => Pick<SkillActiveEntry, "skill" | "session_id"> | undefined;

@@ -38,6 +38,8 @@ import { initializeWithSettings, loadCapability } from "../discovery";
 import { inspectClaudeConvention } from "../discovery/claude";
 import { inspectCodexConvention } from "../discovery/codex";
 import { scanSkillsFromDir } from "../discovery/helpers";
+import { functionHookGrantHash, normalizeFunctionHookGrant } from "../extensibility/extensions/function-hooks";
+import { compileGjcPluginBundle } from "../extensibility/gjc-plugins/compiler";
 import { summarizeGjcPluginObservability } from "../extensibility/gjc-plugins/observability";
 import { loadEffectiveGjcPluginRegistry } from "../extensibility/gjc-plugins/registry";
 import { getEnabledPlugins } from "../extensibility/plugins/loader";
@@ -47,7 +49,10 @@ import { loadAllMCPConfigs } from "../runtime-mcp/config";
 import { readDisabledServers } from "../runtime-mcp/config-writer";
 import { canonicalizeMCPEndpoint } from "../runtime-mcp/pool-key";
 import { redactMCPEndpoint } from "../runtime-mcp/redaction";
-import { CANONICAL_GJC_WORKFLOW_SKILLS } from "../skill-state/canonical-skills";
+import {
+	getSkillFilesystemIdentity,
+	isCanonicalGjcWorkflowSkillFilesystemAlias,
+} from "../skill-state/canonical-skills";
 import { expandTilde } from "../tools/path-utils";
 
 // =============================================================================
@@ -153,6 +158,29 @@ export interface CustomizeDoctorItem {
 	mcp?: McpSafeSummary;
 	/** Present only for quarantined plugin-bundle surfaces. */
 	quarantineCode?: string;
+	/** Metadata-only Function Hook policy projection; hook code is never executed. */
+	functionHooks?: CustomizeFunctionHookSummary[];
+}
+
+export interface CustomizeFunctionHookSummary {
+	extensionId: string;
+	order: number;
+	event: string;
+	target?: string;
+	phase?: "before" | "after";
+	scope: "user" | "project";
+	plugin: string;
+	relativePath: string;
+	status: "disabled" | "quarantined" | "blocked-isolate" | "legacy-active";
+	requestedCapabilities: string[];
+	effectiveCapabilities: string[];
+	attenuateDownstream: string[];
+	networkDestinations: string[];
+	filesystemRoots: string[];
+	capabilityHash?: string;
+	implementationHash?: string;
+	quarantineCode?: string;
+	remediation: string;
 }
 
 export interface CustomizeDoctorSurface {
@@ -199,8 +227,6 @@ export interface CustomizeDoctorCommandOptions {
 // =============================================================================
 
 const REDACTED = "<redacted>";
-
-const BUILT_IN_SKILL_NAMES = new Set<string>(CANONICAL_GJC_WORKFLOW_SKILLS);
 
 const SENSITIVE_KEY_PATTERN =
 	/(?:token|secret|key|credential|password|passwd|pwd|authorization|auth|bearer|cookie|session|apikey)/i;
@@ -655,7 +681,7 @@ async function collectSkills(cwd: string, activeSettings: SettingsInstance): Pro
 			cwd,
 			disabledExtensions: activeSettings.get("disabledExtensions"),
 		});
-		for (const skill of result.skills) loadedNames.add(skill.name);
+		for (const skill of result.skills) loadedNames.add(getSkillFilesystemIdentity(skill.name));
 	}
 
 	const skillScopeNotes: string[] = [];
@@ -730,7 +756,7 @@ async function collectSkills(cwd: string, activeSettings: SettingsInstance): Pro
 				[`Move the skill under .gjc/skills/<name>/SKILL.md to make it loadable`],
 			);
 		}
-		if (BUILT_IN_SKILL_NAMES.has(entry.name)) {
+		if (isCanonicalGjcWorkflowSkillFilesystemAlias(entry.name)) {
 			return finalizeItem(
 				base,
 				"shadowed",
@@ -740,7 +766,7 @@ async function collectSkills(cwd: string, activeSettings: SettingsInstance): Pro
 				{ precedence: { priority: entry.priority, shadowedBy: { provider: "bundled", scope: "native" } } },
 			);
 		}
-		if (loadedNames.has(entry.name)) {
+		if (loadedNames.has(getSkillFilesystemIdentity(entry.name))) {
 			return finalizeItem(base, "loaded", "loaded", "Loaded by session startup.", []);
 		}
 		if (ignoredPatterns.length > 0 || includePatterns.length > 0) {
@@ -809,7 +835,7 @@ async function collectSkills(cwd: string, activeSettings: SettingsInstance): Pro
 				);
 				continue;
 			}
-			if (BUILT_IN_SKILL_NAMES.has(skill.name)) {
+			if (isCanonicalGjcWorkflowSkillFilesystemAlias(skill.name)) {
 				items.push(
 					finalizeItem(
 						base,
@@ -828,7 +854,10 @@ async function collectSkills(cwd: string, activeSettings: SettingsInstance): Pro
 			// in loadedNames even though it loses the name collision to an
 			// earlier-priority source. The collision must report shadowed-by-
 			// precedence, not a second "loaded" item.
-			const collisionWinner = items.find(i => i.name === skill.name && i.status === "loaded");
+			const skillIdentity = getSkillFilesystemIdentity(skill.name);
+			const collisionWinner = items.find(
+				i => getSkillFilesystemIdentity(i.name) === skillIdentity && i.status === "loaded",
+			);
 			if (collisionWinner) {
 				items.push(
 					finalizeItem(
@@ -847,7 +876,7 @@ async function collectSkills(cwd: string, activeSettings: SettingsInstance): Pro
 				);
 				continue;
 			}
-			if (loadedNames.has(skill.name)) {
+			if (loadedNames.has(skillIdentity)) {
 				items.push(
 					finalizeItem(base, "loaded", "loaded", "Loaded by session startup from skills.customDirectories.", []),
 				);
@@ -910,8 +939,11 @@ async function collectHooks(cwd: string, activeSettings: SettingsInstance): Prom
 		nameOf: hook => hook.name,
 		pathOf: hook => hook.path,
 		notExecutedDetail:
-			"Discovered and shown in the extension dashboard, but standalone sessions do not execute hook files. Runtime hooks come from validated GJC plugin bundles.",
-		notExecutedRemediation: ["See `gjc plugin list` for plugin bundles that contribute runtime hooks"],
+			"Trusted filesystem hook module discovered for session-start activation. Doctor does not execute the module, so dynamic Function Hook registrations and effective runtime order remain opaque until a session loads it.",
+		notExecutedRemediation: [
+			"Review the trusted hook source before session startup",
+			"Use plugin-bundle Function Hooks for declarative grants, hashes, quarantine, and metadata-only policy inspection",
+		],
 	});
 }
 
@@ -1140,7 +1172,101 @@ async function collectPluginBundles(cwd: string): Promise<CustomizeDoctorSurface
 	const bundleEntries = await loadEffectiveGjcPluginRegistry(cwd, { migrate: false });
 	const observability = await summarizeGjcPluginObservability(cwd, { migrate: false });
 	const items: CustomizeDoctorItem[] = [...npmItems];
+	let globalFunctionHookOrder = 0;
 	for (const entry of bundleEntries) {
+		const surfaces = observability.surfaces.filter(s => s.plugin === entry.name && s.scope === entry.scope);
+		let compiledHooks = new Map<
+			string,
+			Awaited<ReturnType<typeof compileGjcPluginBundle>>["surfaces"]["hooks"][number]
+		>();
+		try {
+			const compiled = await compileGjcPluginBundle(entry.pluginRoot);
+			compiledHooks = new Map(compiled.surfaces.hooks.map(hook => [hook.extensionId, hook]));
+		} catch {
+			// Existing observability reports unreadable/hash-drift bundles. Keep
+			// declarative rows visible and mark unmatched metadata quarantined.
+		}
+		const functionHooks: CustomizeFunctionHookSummary[] = entry.surfaces.hooks.map(hook => {
+			const observed = surfaces.find(surface => surface.extensionId === hook.extensionId);
+			const compiled = compiledHooks.get(hook.extensionId);
+			const hasGrantMetadata =
+				hook.capabilities !== undefined ||
+				hook.networkDestinations !== undefined ||
+				hook.filesystemRoots !== undefined ||
+				hook.capabilityHash !== undefined;
+			let metadataValid =
+				compiled !== undefined &&
+				((hook.functionHook === true && hasGrantMetadata) ||
+					(hook.functionHook !== true && !hasGrantMetadata && compiled.functionHook !== true));
+			try {
+				const grant = normalizeFunctionHookGrant({
+					capabilities: hook.capabilities,
+					networkDestinations: hook.networkDestinations,
+					filesystemRoots: hook.filesystemRoots,
+				});
+				metadataValid =
+					metadataValid &&
+					hook.functionHook === compiled?.functionHook &&
+					hook.event === compiled?.event &&
+					hook.target === compiled?.target &&
+					hook.phase === compiled?.phase &&
+					hook.relativePath === compiled?.relativePath &&
+					hook.implementationHash === compiled?.implementationHash &&
+					(hook.functionHook !== true ||
+						(hook.capabilityHash?.toLowerCase() === functionHookGrantHash(grant).toLowerCase() &&
+							hook.capabilityHash?.toLowerCase() === compiled?.capabilityHash?.toLowerCase() &&
+							JSON.stringify(grant.capabilities) === JSON.stringify(compiled?.capabilities ?? []) &&
+							JSON.stringify(grant.networkDestinations) ===
+								JSON.stringify(compiled?.networkDestinations ?? []) &&
+							JSON.stringify(grant.filesystemRoots) === JSON.stringify(compiled?.filesystemRoots ?? [])));
+			} catch {
+				metadataValid = false;
+			}
+			const status: CustomizeFunctionHookSummary["status"] =
+				!metadataValid || observed?.status === "quarantined"
+					? "quarantined"
+					: !entry.enabled || entry.disabledSurfaceIds.includes(hook.extensionId)
+						? "disabled"
+						: hook.functionHook === true
+							? "blocked-isolate"
+							: "legacy-active";
+			return {
+				extensionId: hook.extensionId,
+				order: globalFunctionHookOrder++,
+				event: hook.event,
+				...(hook.target === undefined ? {} : { target: hook.target }),
+				...(hook.phase === undefined ? {} : { phase: hook.phase }),
+				scope: entry.scope,
+				plugin: entry.name,
+				relativePath: hook.relativePath,
+				status,
+				requestedCapabilities: [...(hook.capabilities ?? [])],
+				effectiveCapabilities: status === "legacy-active" ? [...(hook.capabilities ?? [])] : [],
+				attenuateDownstream: [],
+				networkDestinations: (hook.networkDestinations ?? []).map(destination => {
+					try {
+						const url = new URL(destination);
+						return url.protocol === "https:" && !url.username && !url.password ? url.origin : "[redacted]";
+					} catch {
+						return "[redacted]";
+					}
+				}),
+				filesystemRoots: [...(hook.filesystemRoots ?? [])],
+				...(hook.capabilityHash === undefined ? {} : { capabilityHash: hook.capabilityHash }),
+				...(hook.implementationHash === undefined ? {} : { implementationHash: hook.implementationHash }),
+				...(observed?.quarantineCode === undefined && metadataValid
+					? {}
+					: { quarantineCode: observed?.quarantineCode ?? "security_policy" }),
+				remediation:
+					status === "blocked-isolate"
+						? "Function Hook remains disabled until a capability-enforcing plugin isolate is available."
+						: status === "quarantined"
+							? "Reinstall the bundle and verify installed metadata and file hashes."
+							: status === "disabled"
+								? `Enable surface ${hook.extensionId} only after reviewing its declared policy.`
+								: "Legacy constrained hook executes under the existing trusted compatibility policy.",
+			};
+		});
 		const base: Omit<CustomizeDoctorItem, "status" | "reason" | "detail" | "remediation"> = {
 			name: entry.name,
 			kind: "plugin-bundle",
@@ -1153,6 +1279,7 @@ async function collectPluginBundles(cwd: string): Promise<CustomizeDoctorSurface
 			trust: TRUST_BY_KIND["plugin-bundle"],
 			restartRequired: true,
 			precedence: { priority: 0 },
+			functionHooks,
 		};
 		if (!entry.enabled) {
 			items.push(
@@ -1166,7 +1293,6 @@ async function collectPluginBundles(cwd: string): Promise<CustomizeDoctorSurface
 			);
 			continue;
 		}
-		const surfaces = observability.surfaces.filter(s => s.plugin === entry.name && s.scope === entry.scope);
 		const quarantined = surfaces.filter(s => s.status === "quarantined");
 		if (quarantined.length > 0) {
 			const codes = Array.from(new Set(quarantined.map(s => s.quarantineCode ?? "unknown"))).join(", ");
@@ -1574,6 +1700,23 @@ export function renderCustomizeDoctorText(report: CustomizeDoctorReport): string
 			lines.push(`    reason: ${item.reason} — ${item.detail}`);
 			lines.push(`    source: ${item.path}`);
 			if (item.quarantineCode) lines.push(`    quarantine code: ${item.quarantineCode}`);
+			for (const hook of item.functionHooks ?? []) {
+				lines.push(
+					`    function hook[${hook.order}]: ${hook.extensionId} event=${hook.event}${hook.target ? ` target=${hook.target}` : ""} status=${hook.status}`,
+				);
+				lines.push(`      provenance: scope=${hook.scope} plugin=${hook.plugin} path=${hook.relativePath}`);
+				lines.push(
+					`      grants: requested=${hook.requestedCapabilities.join(",") || "none"} effective=${hook.effectiveCapabilities.join(",") || "none"} attenuate=${hook.attenuateDownstream.join(",") || "none"}`,
+				);
+				if (hook.networkDestinations.length > 0)
+					lines.push(`      network destinations: ${hook.networkDestinations.join(",")}`);
+				if (hook.filesystemRoots.length > 0)
+					lines.push(`      filesystem roots: ${hook.filesystemRoots.join(",")}`);
+				if (hook.capabilityHash) lines.push(`      capability hash: ${hook.capabilityHash}`);
+				if (hook.implementationHash) lines.push(`      implementation hash: ${hook.implementationHash}`);
+				if (hook.quarantineCode) lines.push(`      quarantine code: ${hook.quarantineCode}`);
+				lines.push(`      remediation: ${hook.remediation}`);
+			}
 			for (const fix of item.remediation) lines.push(`    fix: ${fix}`);
 			lines.push(`    trust: ${item.trust}`);
 			lines.push(`    restart required: ${item.restartRequired ? "yes (new session)" : "no"}`);

@@ -1999,7 +1999,12 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 				if (dropFastMode) {
 					dropAnthropicFastMode(nextParams);
 				}
-				const replacementPayload = await options?.onPayload?.(nextParams, model, options?.attemptScope);
+				const replacementPayload = await options?.onPayload?.(
+					nextParams,
+					model,
+					options?.attemptScope,
+					options?.signal,
+				);
 				if (replacementPayload !== undefined) {
 					nextParams = replacementPayload as typeof nextParams;
 				}

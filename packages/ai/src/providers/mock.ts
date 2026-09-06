@@ -339,6 +339,7 @@ async function runMock(
 				},
 				model,
 				options.attemptScope,
+				options.signal,
 			);
 		} catch (err) {
 			stream.fail(err);

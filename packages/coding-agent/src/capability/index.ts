@@ -7,7 +7,14 @@
  * - Loading items for a capability across all providers
  */
 import * as path from "node:path";
-import { getAgentDir, getProjectDir, getTrustedHomeDir, logger } from "@gajae-code/utils";
+import {
+	getAgentDir,
+	getAgentProfileAuthority,
+	getProjectDir,
+	getTrustedHomeDir,
+	logger,
+	normalizePathForComparison,
+} from "@gajae-code/utils";
 
 import type { Settings } from "../config/settings";
 import { clearCache as clearFsCache, findRepoRoot, cacheStats as fsCacheStats, invalidate as invalidateFs } from "./fs";
@@ -243,8 +250,13 @@ export async function loadCapability<T>(capabilityId: string, options: LoadOptio
 	const cwd = options.cwd ?? getProjectDir();
 	const home = getTrustedHomeDir();
 	const userAgentDir = options.agentDir ? path.resolve(options.agentDir) : getAgentDir();
+	const profileAuthority =
+		options.profileAuthority ??
+		(options.agentDir && normalizePathForComparison(userAgentDir) !== normalizePathForComparison(getAgentDir())
+			? "custom"
+			: getAgentProfileAuthority());
 	const repoRoot = await findRepoRoot(cwd);
-	const ctx: LoadContext = { cwd, home, userAgentDir, repoRoot, settings: options.settings };
+	const ctx: LoadContext = { cwd, home, userAgentDir, profileAuthority, repoRoot, settings: options.settings };
 	const providers = filterProviders(capability, options);
 
 	return await loadImpl(capability, providers, ctx, options);

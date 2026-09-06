@@ -1,4 +1,9 @@
 import {
+	FUNCTION_HOOK_CAPABILITIES,
+	type FunctionHookCapability,
+	normalizeFunctionHookGrant,
+} from "../extensions/function-hooks";
+import {
 	GJC_PLUGIN_KIND,
 	GJC_SUBSKILL_PARENT_AGENTS,
 	type GjcPluginAgentAppendixManifestEntry,
@@ -92,6 +97,23 @@ const MCP_TRANSPORTS: readonly GjcPluginMcpTransport[] = ["stdio", "http", "sse"
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function rejectUnknownKeys(
+	value: Record<string, unknown>,
+	allowed: readonly string[],
+	context: string,
+	manifestPath: string,
+): void {
+	const allowedSet = new Set(allowed);
+	for (const key of Object.keys(value)) {
+		if (!allowedSet.has(key)) {
+			throw new GjcPluginLoadError(
+				"unsupported_surface",
+				`Unsupported GJC plugin field "${key}" at ${context} (${manifestPath}); supported fields are ${[...allowed].sort().join(", ")}`,
+			);
+		}
+	}
 }
 
 function requireNonEmptyString(value: unknown, field: string, filePath: string): string {
@@ -221,6 +243,23 @@ function parseTools(value: unknown, manifestPath: string): GjcPluginToolManifest
 				`Invalid GJC plugin manifest at ${manifestPath}: tools[${index}] must be a string or object`,
 			);
 		}
+		rejectUnknownKeys(
+			entry,
+			[
+				"name",
+				"path",
+				"description",
+				"sha256",
+				"schemaPath",
+				"schema_path",
+				"schema",
+				"inputSchema",
+				"input_schema",
+				"parameters",
+			],
+			`tools[${index}]`,
+			manifestPath,
+		);
 		const name = manifestSafeName(entry.name, `tools[${index}].name`, manifestPath);
 		const path = manifestString(entry.path, `tools[${index}].path`, manifestPath);
 		const description =
@@ -258,6 +297,25 @@ function parseHooks(value: unknown, manifestPath: string): GjcPluginHookManifest
 				`Invalid GJC plugin manifest at ${manifestPath}: hooks[${index}] must be an object`,
 			);
 		}
+		const allowedKeys = new Set([
+			"name",
+			"event",
+			"target",
+			"phase",
+			"path",
+			"sha256",
+			"capabilities",
+			"networkDestinations",
+			"filesystemRoots",
+		]);
+		for (const key of Object.keys(entry)) {
+			if (!allowedKeys.has(key)) {
+				throw new GjcPluginLoadError(
+					"unsupported_surface",
+					`Unsupported GJC plugin hook field "${key}" at ${manifestPath}; supported fields are ${[...allowedKeys].sort().join(", ")}`,
+				);
+			}
+		}
 		const name = manifestSafeName(entry.name, `hooks[${index}].name`, manifestPath);
 		// event/target become part of the hook surface ID
 		// (`hook:<event>:<phase>:<target>:<name>`), which is rendered and printed.
@@ -266,7 +324,9 @@ function parseHooks(value: unknown, manifestPath: string): GjcPluginHookManifest
 		const target =
 			entry.target === undefined
 				? undefined
-				: manifestSafeName(entry.target, `hooks[${index}].target`, manifestPath);
+				: entry.target === "*"
+					? "*"
+					: manifestSafeName(entry.target, `hooks[${index}].target`, manifestPath);
 		let phase: "before" | "after" | undefined;
 		if (entry.phase !== undefined) {
 			if (entry.phase !== "before" && entry.phase !== "after") {
@@ -279,7 +339,41 @@ function parseHooks(value: unknown, manifestPath: string): GjcPluginHookManifest
 		}
 		const sha256 =
 			entry.sha256 === undefined ? undefined : manifestString(entry.sha256, `hooks[${index}].sha256`, manifestPath);
-		return { name, event, target, phase, path, sha256 };
+		let capabilities: FunctionHookCapability[] | undefined;
+		if (entry.capabilities !== undefined) {
+			if (
+				!Array.isArray(entry.capabilities) ||
+				!entry.capabilities.every(
+					capability =>
+						typeof capability === "string" &&
+						FUNCTION_HOOK_CAPABILITIES.includes(capability as FunctionHookCapability),
+				)
+			) {
+				throw new GjcPluginLoadError(
+					"unsupported_surface",
+					`Invalid GJC plugin hook capabilities at ${manifestPath}: use only ${FUNCTION_HOOK_CAPABILITIES.join(", ")}`,
+				);
+			}
+			capabilities = [...(entry.capabilities as FunctionHookCapability[])];
+		}
+		const parseStringArray = (field: "networkDestinations" | "filesystemRoots"): string[] | undefined => {
+			const value = entry[field];
+			if (value === undefined) return undefined;
+			if (!Array.isArray(value) || !value.every(item => typeof item === "string"))
+				throw new GjcPluginLoadError(
+					"invalid_manifest",
+					`Invalid ${field} at ${manifestPath}: expected a string array`,
+				);
+			return [...(value as string[])];
+		};
+		const networkDestinations = parseStringArray("networkDestinations");
+		const filesystemRoots = parseStringArray("filesystemRoots");
+		try {
+			normalizeFunctionHookGrant({ capabilities, networkDestinations, filesystemRoots });
+		} catch (error) {
+			throw new GjcPluginLoadError("invalid_manifest", error instanceof Error ? error.message : String(error));
+		}
+		return { name, event, target, phase, path, sha256, capabilities, networkDestinations, filesystemRoots };
 	});
 }
 
@@ -290,6 +384,12 @@ function parseMcpEntry(entry: unknown, field: string, manifestPath: string): Gjc
 			`Invalid GJC plugin manifest at ${manifestPath}: ${field} must be an object`,
 		);
 	}
+	rejectUnknownKeys(
+		entry,
+		["name", "transport", "command", "args", "cwd", "url", "headers", "sha256"],
+		field,
+		manifestPath,
+	);
 	const name = manifestSafeName(entry.name, `${field}.name`, manifestPath);
 	const transport = entry.transport;
 	if (typeof transport !== "string" || !MCP_TRANSPORTS.includes(transport as GjcPluginMcpTransport)) {
@@ -430,13 +530,24 @@ function pickOptional(entry: Record<string, unknown>, keys: readonly string[]): 
 	return out;
 }
 
-function parseAppendixEntry(entry: unknown, field: string, manifestPath: string): GjcPluginAppendixManifestEntry {
+function parseAppendixEntry(
+	entry: unknown,
+	field: string,
+	manifestPath: string,
+	allowAgent = false,
+): GjcPluginAppendixManifestEntry {
 	if (!isRecord(entry)) {
 		throw new GjcPluginLoadError(
 			"invalid_manifest",
 			`Invalid GJC plugin manifest at ${manifestPath}: ${field} must be an object`,
 		);
 	}
+	rejectUnknownKeys(
+		entry,
+		allowAgent ? ["name", "path", "content", "sha256", "agent"] : ["name", "path", "content", "sha256"],
+		field,
+		manifestPath,
+	);
 	const name = manifestSafeName(entry.name, `${field}.name`, manifestPath);
 	const path = entry.path === undefined ? undefined : manifestString(entry.path, `${field}.path`, manifestPath);
 	// Content may be empty/whitespace here; the compiler enforces non-empty and
@@ -461,7 +572,7 @@ function parseSystemAppendix(value: unknown, manifestPath: string): GjcPluginApp
 function parseAgentAppendix(value: unknown, manifestPath: string): GjcPluginAgentAppendixManifestEntry[] {
 	const raw = optionalArray(value, "agent-appendix", manifestPath);
 	return raw.map((entry, index) => {
-		const base = parseAppendixEntry(entry, `agent-appendix[${index}]`, manifestPath);
+		const base = parseAppendixEntry(entry, `agent-appendix[${index}]`, manifestPath, true);
 		const agent = (entry as Record<string, unknown>).agent;
 		if (typeof agent !== "string" || !GJC_SUBSKILL_PARENT_AGENTS.includes(agent as GjcSubskillParentAgent)) {
 			throw new GjcPluginLoadError(
@@ -553,6 +664,12 @@ export function parseManifest(raw: unknown, manifestPath: string): GjcPluginMani
 }
 
 export function parseSubskillFrontmatter(fm: Record<string, unknown>, filePath: string): SubskillFrontmatter {
+	rejectUnknownKeys(
+		fm,
+		["name", "binds_to", "phase", "activation_arg", "description", "tools"],
+		"frontmatter",
+		filePath,
+	);
 	return {
 		// Name and activation_arg become part of the surface ID
 		// (`subskill:<parent>:<phase>:<arg>`) and are rendered, so they share the

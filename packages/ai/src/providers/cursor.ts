@@ -3575,7 +3575,7 @@ async function buildGrpcRequest(
 
 	if (options?.onPayload) {
 		const payload = toJson(AgentRunRequestSchema, runRequest);
-		const replacement = await options.onPayload(payload, model, options.attemptScope);
+		const replacement = await options.onPayload(payload, model, options.attemptScope, options.signal);
 		if (replacement !== undefined) {
 			runRequest = fromJson(AgentRunRequestSchema, replacement as JsonValue);
 		}

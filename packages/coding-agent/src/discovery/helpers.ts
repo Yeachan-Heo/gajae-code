@@ -1,4 +1,5 @@
 import * as fs from "node:fs";
+import type { FileHandle } from "node:fs/promises";
 import * as path from "node:path";
 import type { ThinkingLevel } from "@gajae-code/agent-core";
 import type { FileType as FileTypeEnum, glob as globFn } from "@gajae-code/natives";
@@ -9,6 +10,7 @@ import {
 	getProjectDir,
 	getTrustedHomeDir,
 	logger,
+	normalizePathForComparison,
 	parseFrontmatter,
 	tryParseJson,
 } from "@gajae-code/utils";
@@ -99,7 +101,32 @@ export const SOURCE_PATHS = {
 	},
 } as const;
 
+/** Ancestors from `cwd` through `stopAt`, excluding one normalized authority boundary. */
+export function getAncestorDirs(
+	cwd: string,
+	stopAt?: string | null,
+	excludeDir?: string,
+): Array<{ dir: string; depth: number }> {
+	const ancestors: Array<{ dir: string; depth: number }> = [];
+	let current = path.resolve(cwd);
+	let depth = 0;
+	let normalizedCurrent = normalizePathForComparison(current);
+	const normalizedStop = stopAt ? normalizePathForComparison(path.resolve(stopAt)) : undefined;
+	const normalizedExclude = excludeDir ? normalizePathForComparison(path.resolve(excludeDir)) : undefined;
+	while (true) {
+		if (normalizedCurrent !== normalizedExclude) ancestors.push({ dir: current, depth });
+		if (normalizedStop && normalizedCurrent === normalizedStop) break;
+		const parent = path.dirname(current);
+		if (parent === current) break;
+		current = parent;
+		normalizedCurrent = normalizePathForComparison(current);
+		depth++;
+	}
+	return ancestors;
+}
+
 export type SourceId = keyof typeof SOURCE_PATHS;
+export type ProfileAuthority = "default" | "custom";
 
 /**
  * Get user-level path for a source.
@@ -108,6 +135,49 @@ export function getUserPath(ctx: LoadContext, source: SourceId, subpath: string)
 	const paths = SOURCE_PATHS[source];
 	if (!paths.userAgent) return null;
 	return path.join(ctx.home, paths.userAgent, subpath);
+}
+
+/**
+ * Deterministic user-scope skill scan directories, highest precedence first.
+ *
+ * The canonical root is the agent directory (`getAgentDir()`, moved by
+ * `--agent-dir` / `GJC_CODING_AGENT_DIR` / `setAgentDir()`) — the target of
+ * every user-scope skill writer (`gjc migrate`, `gjc skill`). An agent-directory
+ * profile is a *separate* user scope, the same contract as MCP user config
+ * (#4768): its legacy home-relative roots are not scanned, so a profile cannot
+ * pick up the default profile's skills (and vice versa). The resolver-owned
+ * `profileAuthority` classification is authoritative when supplied, so a
+ * custom profile remains isolated even if a later HOME/config-root refresh
+ * makes its path look like the current default. In the default profile the
+ * agent directory is `<home>/<configDir>/agent` and the configured legacy roots
+ * below it are still honored, exactly as before.
+ */
+export function resolveUserAgentDir(home: string, userAgentDir?: string): string {
+	return path.resolve(userAgentDir ?? path.join(home, SOURCE_PATHS.native.userAgent));
+}
+
+export function getUserSkillScanDirs(
+	home: string,
+	userAgentDir?: string,
+	profileAuthority?: ProfileAuthority,
+): string[] {
+	const resolvedAgentDir = resolveUserAgentDir(home, userAgentDir);
+	const defaultAgentDir = path.join(home, SOURCE_PATHS.native.userAgent);
+	const authority =
+		profileAuthority ??
+		(normalizePathForComparison(resolvedAgentDir) === normalizePathForComparison(defaultAgentDir)
+			? "default"
+			: "custom");
+	if (authority === "custom") {
+		return [path.join(resolvedAgentDir, "skills")];
+	}
+	return [
+		...new Set([
+			path.join(resolvedAgentDir, "skills"),
+			path.join(home, SOURCE_PATHS.native.userBase, "skills"),
+			path.join(home, ".gjc", "skills"),
+		]),
+	];
 }
 
 /**
@@ -345,6 +415,8 @@ async function globIf(
 
 export interface ScanSkillsFromDirOptions {
 	dir: string;
+	/** Selected authority root whose own identity must not be a symlink. */
+	authorityRoot?: string;
 	providerId: string;
 	level: "user" | "project";
 	requireDescription?: boolean;
@@ -365,30 +437,40 @@ export const SKILL_FRONTMATTER_SCAN_BYTES = 4 * 1024;
 /** Maximum total bytes read while seeking the frontmatter closing delimiter. */
 export const SKILL_FRONTMATTER_SCAN_TOTAL_BYTES = 64 * 1024;
 
-async function readSkillFrontmatter(skillPath: string): Promise<SkillFrontmatter | null> {
-	const file = Bun.file(skillPath);
-	const size = (await fs.promises.stat(skillPath)).size;
-	const scanLimit = Math.min(size, SKILL_FRONTMATTER_SCAN_TOTAL_BYTES);
-	let offset = 0;
-	let prefix = "";
-	const decoder = new TextDecoder();
-	while (offset < scanLimit) {
-		const end = Math.min(offset + SKILL_FRONTMATTER_SCAN_BYTES, scanLimit);
-		const bytes = new Uint8Array(await file.slice(offset, end).arrayBuffer());
-		const chunk = decoder.decode(bytes, { stream: end < scanLimit });
-		if (!chunk) break;
-		prefix += chunk;
-		offset = end;
+export const SkillDiscoveryTestHooks: {
+	afterCandidateValidated?: (candidatePath: string) => void | Promise<void>;
+	afterAuthorityRootValidated?: (root: string) => void | Promise<void>;
+	afterAuthorityRootMissing?: (root: string) => void | Promise<void>;
+	afterContainedRootValidated?: (root: string) => void | Promise<void>;
+} = {};
 
-		const opening = prefix.match(/^---[ \t]*(?:\r?\n|$)/);
-		if (!opening) return null;
-		const afterOpening = prefix.slice(opening[0].length);
-		const closing = afterOpening.match(/\r?\n---[ \t]*(?:\r?\n|$)/);
-		if (!closing || closing.index === undefined) continue;
-		const bounded = prefix.slice(0, opening[0].length + closing.index + closing[0].length);
-		return parseFrontmatter(bounded, { source: skillPath }).frontmatter as SkillFrontmatter;
+interface DirectoryIdentity {
+	dev: bigint;
+	ino: bigint;
+	realPath: string;
+}
+
+async function captureDirectoryIdentity(root: string): Promise<DirectoryIdentity | null> {
+	const observed = await fs.promises.lstat(root, { bigint: true });
+	if (observed.isSymbolicLink() || !observed.isDirectory()) return null;
+	const realPath = await fs.promises.realpath(root);
+	const resolved = await fs.promises.stat(realPath, { bigint: true });
+	if (!resolved.isDirectory() || observed.dev !== resolved.dev || observed.ino !== resolved.ino) return null;
+	return { dev: observed.dev, ino: observed.ino, realPath };
+}
+
+async function directoryIdentityIsCurrent(root: string, expected: DirectoryIdentity): Promise<boolean> {
+	try {
+		const current = await captureDirectoryIdentity(root);
+		return (
+			current !== null &&
+			current.dev === expected.dev &&
+			current.ino === expected.ino &&
+			normalizePathForComparison(current.realPath) === normalizePathForComparison(expected.realPath)
+		);
+	} catch {
+		return false;
 	}
-	return null;
 }
 
 export async function scanSkillsFromDir(
@@ -400,19 +482,150 @@ export async function scanSkillsFromDir(
 	const { dir, level, providerId, requireDescription = false } = options;
 
 	let entries: fs.Dirent[];
+	let realRoot: string;
+	let authorityIdentity: DirectoryIdentity | null = null;
+	let scanRootIdentity: DirectoryIdentity;
 	try {
+		if (options.authorityRoot) {
+			try {
+				authorityIdentity = await captureDirectoryIdentity(options.authorityRoot);
+				if (!authorityIdentity) {
+					warnings.push(`Refusing unsafe skill authority root: ${options.authorityRoot}`);
+					return { items, warnings };
+				}
+				await SkillDiscoveryTestHooks.afterAuthorityRootValidated?.(options.authorityRoot);
+				if (!(await directoryIdentityIsCurrent(options.authorityRoot, authorityIdentity))) {
+					warnings.push(`Refusing changed skill authority root: ${options.authorityRoot}`);
+					return { items, warnings };
+				}
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+				await SkillDiscoveryTestHooks.afterAuthorityRootMissing?.(options.authorityRoot);
+				return { items, warnings };
+			}
+		}
+		const capturedScanRoot = await captureDirectoryIdentity(dir);
+		if (!capturedScanRoot) {
+			warnings.push(`Refusing unsafe skills directory: ${dir}`);
+			return { items, warnings };
+		}
+		scanRootIdentity = capturedScanRoot;
+		realRoot = scanRootIdentity.realPath;
 		entries = await fs.promises.readdir(dir, { withFileTypes: true });
+		if (!(await directoryIdentityIsCurrent(dir, scanRootIdentity))) {
+			warnings.push(`Refusing changed skills directory: ${dir}`);
+			return { items, warnings };
+		}
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
 			warnings.push(`Failed to read skills directory: ${dir} (${String(error)})`);
 		}
 		return { items, warnings };
 	}
-	const loadSkill = async (skillPath: string) => {
+	const isWithinRoot = (candidate: string): boolean => {
+		const relative = path.relative(realRoot, candidate);
+		return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+	};
+	const openSkillFileSafely = async (skillPath: string): Promise<FileHandle> => {
+		if (
+			!(await directoryIdentityIsCurrent(dir, scanRootIdentity)) ||
+			(options.authorityRoot &&
+				authorityIdentity &&
+				!(await directoryIdentityIsCurrent(options.authorityRoot, authorityIdentity)))
+		) {
+			throw new Error(`Unsafe skill authority root for: ${skillPath}`);
+		}
+		const flags =
+			fs.constants.O_RDONLY |
+			(process.platform === "win32" ? 0 : (fs.constants.O_NOFOLLOW ?? 0) | (fs.constants.O_NONBLOCK ?? 0));
+		const handle = await fs.promises.open(skillPath, flags);
 		try {
-			const frontmatter = await readSkillFrontmatter(skillPath);
+			const [opened, observed, currentPath, currentScanRoot, currentAuthorityRoot] = await Promise.all([
+				handle.stat({ bigint: true }),
+				fs.promises.lstat(skillPath, { bigint: true }),
+				fs.promises.realpath(skillPath),
+				directoryIdentityIsCurrent(dir, scanRootIdentity),
+				options.authorityRoot && authorityIdentity
+					? directoryIdentityIsCurrent(options.authorityRoot, authorityIdentity)
+					: true,
+			]);
+			if (
+				!opened.isFile() ||
+				opened.nlink !== 1n ||
+				observed.isSymbolicLink() ||
+				!observed.isFile() ||
+				opened.dev !== observed.dev ||
+				opened.ino !== observed.ino ||
+				!isWithinRoot(currentPath) ||
+				!currentScanRoot ||
+				!currentAuthorityRoot
+			) {
+				throw new Error(`Unsafe skill file: ${skillPath}`);
+			}
+			return handle;
+		} catch (error) {
+			await handle.close();
+			throw error;
+		}
+	};
+	const readSkillContentSafely = async (skillPath: string): Promise<string> => {
+		const handle = await openSkillFileSafely(skillPath);
+		try {
+			return await handle.readFile({ encoding: "utf8" });
+		} finally {
+			await handle.close();
+		}
+	};
+	const readSkillFrontmatterSafely = async (
+		skillPath: string,
+	): Promise<{ frontmatter: SkillFrontmatter | null; size: number }> => {
+		const handle = await openSkillFileSafely(skillPath);
+		try {
+			const size = Number((await handle.stat({ bigint: true })).size);
+			const scanLimit = Math.min(size, SKILL_FRONTMATTER_SCAN_TOTAL_BYTES);
+			let offset = 0;
+			let prefix = "";
+			const decoder = new TextDecoder();
+			while (offset < scanLimit) {
+				const length = Math.min(SKILL_FRONTMATTER_SCAN_BYTES, scanLimit - offset);
+				const bytes = new Uint8Array(length);
+				const { bytesRead } = await handle.read(bytes, 0, length, offset);
+				if (bytesRead === 0) break;
+				offset += bytesRead;
+				prefix += decoder.decode(bytes.subarray(0, bytesRead), { stream: offset < scanLimit });
+
+				const opening = prefix.match(/^---[ \t]*(?:\r?\n|$)/);
+				if (!opening) return { frontmatter: null, size };
+				const afterOpening = prefix.slice(opening[0].length);
+				const closing = afterOpening.match(/\r?\n---[ \t]*(?:\r?\n|$)/);
+				if (!closing || closing.index === undefined) continue;
+				const bounded = prefix.slice(0, opening[0].length + closing.index + closing[0].length);
+				return {
+					frontmatter: parseFrontmatter(bounded, { source: skillPath }).frontmatter as SkillFrontmatter,
+					size,
+				};
+			}
+			return { frontmatter: null, size };
+		} finally {
+			await handle.close();
+		}
+	};
+	const loadSkill = async (candidatePath: string) => {
+		try {
+			const skillPath = await fs.promises.realpath(candidatePath);
+			if (!isWithinRoot(skillPath)) {
+				warnings.push(`Refusing skill path outside scan root: ${candidatePath}`);
+				return;
+			}
+			const stat = await fs.promises.stat(skillPath);
+			if (!stat.isFile() || stat.nlink !== 1) {
+				warnings.push(`Skill path is not a regular file: ${candidatePath}`);
+				return;
+			}
+			await SkillDiscoveryTestHooks.afterCandidateValidated?.(candidatePath);
+			const { frontmatter, size } = await readSkillFrontmatterSafely(skillPath);
 			if (!frontmatter) {
-				if (fs.statSync(skillPath).size > SKILL_FRONTMATTER_SCAN_TOTAL_BYTES) {
+				if (size > SKILL_FRONTMATTER_SCAN_TOTAL_BYTES) {
 					warnings.push(
 						`Skill frontmatter exceeded ${SKILL_FRONTMATTER_SCAN_TOTAL_BYTES} byte scan cap: ${skillPath}`,
 					);
@@ -435,15 +648,16 @@ export async function scanSkillsFromDir(
 				name,
 				path: skillPath,
 				loadContent: async () => {
-					const content = await Bun.file(skillPath).text();
+					const content = await readSkillContentSafely(skillPath);
 					return parseFrontmatter(content, { source: skillPath }).body;
 				},
 				frontmatter: frontmatter as SkillFrontmatter,
 				level,
 				_source: createSourceMeta(providerId, skillPath, level),
 			});
-		} catch {
-			warnings.push(`Failed to read skill file: ${skillPath}`);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+			warnings.push(`Failed to read skill file: ${candidatePath}`);
 		}
 	};
 
@@ -452,9 +666,7 @@ export async function scanSkillsFromDir(
 		if (entry.name.startsWith(".")) continue;
 		if (!entry.isDirectory() && !entry.isSymbolicLink()) continue;
 		const skillPath = path.join(dir, entry.name, "SKILL.md");
-		if (fs.existsSync(skillPath)) {
-			work.push(loadSkill(skillPath));
-		}
+		work.push(loadSkill(skillPath));
 	}
 	await Promise.all(work);
 
@@ -462,6 +674,59 @@ export async function scanSkillsFromDir(
 	items.sort((a, b) => compareSkillOrder(a.name, a.path, b.name, b.path));
 
 	return { items, warnings };
+}
+
+/** Read a regular single-link file that remains contained by its configured root. */
+export async function readContainedFile(root: string, filePath: string): Promise<string | null> {
+	let rootIdentity: DirectoryIdentity;
+	try {
+		const capturedRoot = await captureDirectoryIdentity(root);
+		if (!capturedRoot) return null;
+		rootIdentity = capturedRoot;
+		await SkillDiscoveryTestHooks.afterContainedRootValidated?.(root);
+		if (!(await directoryIdentityIsCurrent(root, rootIdentity))) return null;
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+		throw error;
+	}
+	const relative = path.relative(root, filePath);
+	if (relative.startsWith("..") || path.isAbsolute(relative)) return null;
+	const flags =
+		fs.constants.O_RDONLY |
+		(process.platform === "win32" ? 0 : (fs.constants.O_NOFOLLOW ?? 0) | (fs.constants.O_NONBLOCK ?? 0));
+	let handle: FileHandle;
+	try {
+		handle = await fs.promises.open(filePath, flags);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+		return null;
+	}
+	try {
+		const [opened, observed, currentPath, currentRoot] = await Promise.all([
+			handle.stat({ bigint: true }),
+			fs.promises.lstat(filePath, { bigint: true }),
+			fs.promises.realpath(filePath),
+			directoryIdentityIsCurrent(root, rootIdentity),
+		]);
+		const currentRelative = path.relative(rootIdentity.realPath, currentPath);
+		if (
+			!opened.isFile() ||
+			opened.nlink !== 1n ||
+			observed.isSymbolicLink() ||
+			!observed.isFile() ||
+			opened.dev !== observed.dev ||
+			opened.ino !== observed.ino ||
+			!currentRoot ||
+			currentRelative.startsWith("..") ||
+			path.isAbsolute(currentRelative)
+		) {
+			return null;
+		}
+		const content = await handle.readFile({ encoding: "utf8" });
+		return (await directoryIdentityIsCurrent(root, rootIdentity)) ? content : null;
+	} finally {
+		await handle.close();
+	}
 }
 
 /**

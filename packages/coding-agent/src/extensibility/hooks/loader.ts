@@ -11,6 +11,24 @@ import { HookSourceConvention } from "../../hooks/events";
 import { type NormalizedHook, normalizeDirectoryHook } from "../../hooks/normalize";
 import type { HookMessage } from "../../session/messages";
 import type { SessionManager } from "../../session/session-manager";
+import {
+	DEFAULT_EXTENSION_FUNCTION_HOOK_GRANT,
+	type FunctionHook,
+	type FunctionHookEventType,
+	type FunctionHookPayloadFor,
+	type FunctionHookRegistration,
+	type FunctionHookRegistrationOptions,
+	intersectFunctionHookGrants,
+	normalizeFunctionHookGrant,
+	validateFunctionHookTarget,
+} from "../extensions/function-hooks";
+import {
+	getExtensionHandlerRegistrationOrder,
+	getFunctionHookRegistration,
+	tagExtensionHandlerRegistrationOrder,
+	tagFunctionHookHandler,
+	wrapExtensionHandlerRegistration,
+} from "../extensions/function-hooks-internal";
 import type {
 	ExtensionAPI,
 	ExtensionCommandContext,
@@ -114,6 +132,7 @@ export interface LoadHookExtensionsResult {
 async function createHookAPI(
 	handlers: Map<string, HandlerFn[]>,
 	cwd: string,
+	sourcePath: string,
 ): Promise<{
 	api: HookAPI;
 	messageRenderers: Map<string, HookMessageRenderer>;
@@ -125,6 +144,7 @@ async function createHookAPI(
 	let appendEntryHandler: AppendEntryHandler | null = null;
 	const messageRenderers = new Map<string, HookMessageRenderer>();
 	const commands = new Map<string, RegisteredCommand>();
+	let handlerRegistrationOrder = 0;
 
 	// Cast to HookAPI - the implementation is more general (string event names)
 	// but the interface has specific overloads for type safety in hooks
@@ -133,7 +153,7 @@ async function createHookAPI(
 			if (!handlers.has(event)) {
 				handlers.set(event, []);
 			}
-			handlers.get(event)!.push(handler);
+			handlers.get(event)!.push(wrapExtensionHandlerRegistration(handler, handlerRegistrationOrder++));
 		},
 		sendMessage<T = unknown>(
 			message: HookMessage<T>,
@@ -155,6 +175,39 @@ async function createHookAPI(
 		},
 		registerCommand(name: string, options: { description?: string; handler: RegisteredCommand["handler"] }): void {
 			commands.set(name, { name, ...options });
+		},
+		registerFunctionHook<T extends FunctionHookEventType>(
+			event: T,
+			handler: FunctionHook<FunctionHookPayloadFor<T>>,
+			options: FunctionHookRegistrationOptions = {},
+		): void {
+			if (options.target !== undefined) {
+				if (event === "*") throw new Error("Wildcard function hooks cannot declare a target");
+				if (event !== "tool_call" && event !== "tool_result")
+					throw new Error("Function hook targets are only valid for tool_call and tool_result events");
+				if (options.target !== "*") validateFunctionHookTarget(options.target);
+			}
+			const registrationOrder = handlerRegistrationOrder++;
+			const registration: FunctionHookRegistration = {
+				event,
+				...(options.target === undefined ? {} : { target: options.target }),
+				...(options.registrationId === undefined ? {} : { registrationId: options.registrationId }),
+				registrationOrder,
+				handler: handler as unknown as FunctionHook,
+				grant: intersectFunctionHookGrants(
+					normalizeFunctionHookGrant(options),
+					DEFAULT_EXTENSION_FUNCTION_HOOK_GRANT,
+				),
+				provenance: { source: "extension", path: sourcePath, extensionId: sourcePath },
+			};
+			const list = handlers.get(event) ?? [];
+			list.push(
+				tagExtensionHandlerRegistrationOrder(
+					tagFunctionHookHandler(registration) as unknown as HandlerFn,
+					registrationOrder,
+				),
+			);
+			handlers.set(event, list);
 		},
 		exec(command: string, args: string[], options?: ExecOptions) {
 			return execCommand(command, args, options?.cwd ?? cwd, options);
@@ -198,6 +251,7 @@ async function loadHook(hookPath: string, cwd: string): Promise<{ hook: LoadedHo
 		const { api, messageRenderers, commands, setSendMessageHandler, setAppendEntryHandler } = await createHookAPI(
 			handlers,
 			cwd,
+			resolvedPath,
 		);
 
 		// Call factory to register handlers
@@ -258,6 +312,27 @@ export async function discoverAndLoadHooks(configuredPaths: string[], cwd: strin
 	const seen = new Set<string>();
 	const normalizationErrors: Array<{ path: string; error: string }> = [];
 	const normalizationByPath = new Map<string, NormalizedHook>();
+	const normalizeExplicitPath = (inputPath: string): NormalizedHook | undefined => {
+		const resolved = resolvePath(inputPath, cwd);
+		const phase = path.basename(path.dirname(resolved));
+		if (phase !== "pre" && phase !== "post") return undefined;
+		const fileName = path.basename(resolved);
+		const toolName = fileName.includes(".") ? fileName.slice(0, fileName.lastIndexOf(".")) : fileName;
+		const normalized = normalizeDirectoryHook({
+			convention: HookSourceConvention.NativeGjc,
+			phase,
+			toolName: toolName === "*" ? "*" : toolName,
+			source: resolved,
+			externalName: fileName,
+		});
+		if (!normalized.hook) {
+			normalizationErrors.push({
+				path: resolved,
+				error: normalized.diagnostics.map(diagnostic => `${diagnostic.code}: ${diagnostic.message}`).join("; "),
+			});
+		}
+		return normalized.hook ?? undefined;
+	};
 
 	// Helper to add paths without duplicates
 	const addPaths = (paths: string[]) => {
@@ -297,13 +372,18 @@ export async function discoverAndLoadHooks(configuredPaths: string[], cwd: strin
 				});
 				continue;
 			}
-			normalizationByPath.set(path.resolve(hook.path), normalized.hook);
+			normalizationByPath.set(resolvePath(hook.path, cwd), normalized.hook);
 		}
 		addPaths([hook.path]);
 	}
 
 	// 2. Explicitly configured paths (can override/add)
-	addPaths(configuredPaths.map(p => resolvePath(p, cwd)));
+	for (const configuredPath of configuredPaths) {
+		const resolved = resolvePath(configuredPath, cwd);
+		const normalized = normalizeExplicitPath(resolved);
+		if (normalized) normalizationByPath.set(resolved, normalized);
+		addPaths([resolved]);
+	}
 
 	const loaded = await loadHooks(allPaths, cwd);
 	for (const hook of loaded.hooks) {
@@ -352,23 +432,60 @@ function createHookExtensionFactory(hook: LoadedHook): ExtensionFactory {
 		hook.setSendMessageHandler((message, options) => api.sendMessage(message, options));
 		hook.setAppendEntryHandler((customType, data) => api.appendEntry(customType, data));
 
+		const orderedHandlers: Array<{ event: string; handler: HandlerFn; order: number; fallback: number }> = [];
+		let fallback = 0;
 		for (const [event, handlers] of hook.handlers) {
 			for (const handler of handlers) {
-				const normalized = hook.normalization;
-				const adapted: HandlerFn = async (...args: unknown[]) => {
-					const payload = args[0] as { toolName?: string };
-					if (
-						normalized &&
-						event === normalized.runtimeEvent &&
-						normalized.toolName !== "*" &&
-						payload.toolName !== normalized.toolName
-					) {
-						return undefined;
-					}
-					return await handler(payload, toHookContext(args[1] as ExtensionContext));
-				};
-				(api.on as (event: string, handler: HandlerFn) => void)(event, adapted);
+				orderedHandlers.push({
+					event,
+					handler,
+					order:
+						getExtensionHandlerRegistrationOrder(handler) ??
+						getFunctionHookRegistration(handler)?.registrationOrder ??
+						Number.MAX_SAFE_INTEGER,
+					fallback: fallback++,
+				});
 			}
+		}
+		orderedHandlers.sort((a, b) => a.order - b.order || a.fallback - b.fallback);
+
+		for (const { event, handler } of orderedHandlers) {
+			const functionRegistration = getFunctionHookRegistration(handler);
+			if (functionRegistration) {
+				const normalized = hook.normalization;
+				const normalizedTarget = normalized && normalized.toolName !== "*" ? normalized.toolName : undefined;
+				if (
+					normalized &&
+					(functionRegistration.event !== normalized.runtimeEvent ||
+						(functionRegistration.target !== undefined && functionRegistration.target !== normalizedTarget))
+				) {
+					throw new Error("Function hook registration conflicts with its normalized discovery target");
+				}
+				api.registerFunctionHook(functionRegistration.event, functionRegistration.handler, {
+					...(normalizedTarget === undefined && functionRegistration.target === undefined
+						? {}
+						: { target: normalizedTarget ?? functionRegistration.target }),
+					...(functionRegistration.registrationId === undefined
+						? {}
+						: { registrationId: functionRegistration.registrationId }),
+					...functionRegistration.grant,
+				});
+				continue;
+			}
+			const normalized = hook.normalization;
+			const adapted: HandlerFn = async (...args: unknown[]) => {
+				const payload = args[0] as { toolName?: string };
+				if (
+					normalized &&
+					event === normalized.runtimeEvent &&
+					normalized.toolName !== "*" &&
+					payload.toolName !== normalized.toolName
+				) {
+					return undefined;
+				}
+				return await handler(payload, toHookContext(args[1] as ExtensionContext));
+			};
+			(api.on as (event: string, handler: HandlerFn) => void)(event, adapted);
 		}
 
 		for (const [customType, renderer] of hook.messageRenderers) {

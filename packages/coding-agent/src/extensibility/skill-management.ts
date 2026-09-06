@@ -12,16 +12,32 @@
  * writing a skill file into a scope, and per-skill enable/disable. The import
  * preview/apply transaction and the UI itself are owned by #4291.
  */
+import * as nodeFs from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { getTrustedHomeDir, parseFrontmatter } from "@gajae-code/utils";
+import {
+	getAgentDir,
+	getAgentProfileAuthority,
+	getTrustedHomeDir,
+	normalizePathForComparison,
+	parseFrontmatter,
+} from "@gajae-code/utils";
 import { findRepoRoot } from "../capability/fs";
 import type { Skill as CapabilitySkill } from "../capability/skill";
 import { resolveSkillScopeTrust } from "../config/skill-settings-defaults";
 import { scanClaudeProjectSkills, scanClaudeUserSkills } from "../discovery/claude";
 import { scanCodexProjectSkills, scanCodexUserSkills } from "../discovery/codex";
-import { compareSkillOrder, SOURCE_PATHS, scanSkillsFromDir } from "../discovery/helpers";
-import { CANONICAL_GJC_WORKFLOW_SKILLS } from "../skill-state/canonical-skills";
+import {
+	compareSkillOrder,
+	getAncestorDirs,
+	getUserSkillScanDirs,
+	resolveUserAgentDir,
+	scanSkillsFromDir,
+} from "../discovery/helpers";
+import {
+	CANONICAL_GJC_WORKFLOW_SKILLS,
+	isCanonicalGjcWorkflowSkillFilesystemAlias,
+} from "../skill-state/canonical-skills";
 export type SkillScope = "project" | "user";
 export type ConventionSkillHost = "claude" | "codex";
 
@@ -61,6 +77,7 @@ export interface ConventionSkillImportSource {
 export interface WriteNativeSkillInput {
 	cwd: string;
 	home?: string;
+	agentDir?: string;
 	scope: SkillScope;
 	name: string;
 	content: string;
@@ -93,28 +110,127 @@ export class SkillFrontmatterError extends Error {
 	}
 }
 
-const BUILT_IN_SKILL_NAMES = new Set<string>(CANONICAL_GJC_WORKFLOW_SKILLS);
+function isProtectedSkillName(name: string): boolean {
+	return isCanonicalGjcWorkflowSkillFilesystemAlias(name);
+}
+
+function assertSafeSkillName(name: string): void {
+	if (
+		name === "." ||
+		name === ".." ||
+		/[. ]$/u.test(name) ||
+		name.includes("/") ||
+		name.includes("\\") ||
+		name.includes("\0") ||
+		path.basename(name) !== name
+	) {
+		throw new SkillFrontmatterError(`skill name must be a single path segment: ${name}`);
+	}
+}
+
+function isPathWithin(root: string, candidate: string): boolean {
+	const relative = path.relative(root, candidate);
+	return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+}
+
+async function ensureSafeDescendantDirectory(root: string, segments: readonly string[]): Promise<string> {
+	try {
+		const rootStat = await fs.lstat(root);
+		if (rootStat.isSymbolicLink() || !rootStat.isDirectory()) {
+			throw new SkillFrontmatterError(`skill authority root is not a safe directory: ${root}`);
+		}
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+		await fs.mkdir(root, { recursive: true });
+		const rootStat = await fs.lstat(root);
+		if (rootStat.isSymbolicLink() || !rootStat.isDirectory()) {
+			throw new SkillFrontmatterError(`skill authority root is not a safe directory: ${root}`);
+		}
+	}
+	const realRoot = await fs.realpath(root);
+	let current = root;
+	for (const segment of segments) {
+		current = path.join(current, segment);
+		try {
+			const stat = await fs.lstat(current);
+			if (stat.isSymbolicLink() || !stat.isDirectory()) {
+				throw new SkillFrontmatterError(`skill destination is not a safe directory: ${current}`);
+			}
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+			try {
+				await fs.mkdir(current);
+			} catch (mkdirError) {
+				if ((mkdirError as NodeJS.ErrnoException).code !== "EEXIST") throw mkdirError;
+				const stat = await fs.lstat(current);
+				if (stat.isSymbolicLink() || !stat.isDirectory()) {
+					throw new SkillFrontmatterError(`skill destination is not a safe directory: ${current}`);
+				}
+			}
+		}
+		const realCurrent = await fs.realpath(current);
+		if (!isPathWithin(realRoot, realCurrent)) {
+			throw new SkillFrontmatterError(`skill destination escapes its scope root: ${current}`);
+		}
+	}
+	return current;
+}
+
+async function writeSkillFileSafely(skillDir: string, scopeRoot: string, content: string): Promise<string> {
+	const [canonicalSkillDir, canonicalScopeRoot] = await Promise.all([fs.realpath(skillDir), fs.realpath(scopeRoot)]);
+	if (!isPathWithin(canonicalScopeRoot, canonicalSkillDir)) {
+		throw new SkillFrontmatterError(`skill destination escapes its scope root: ${skillDir}`);
+	}
+	const filePath = path.join(skillDir, "SKILL.md");
+	let destinationExists = false;
+	try {
+		const destination = await fs.lstat(filePath);
+		if (destination.isSymbolicLink() || !destination.isFile()) {
+			throw new SkillFrontmatterError(`skill destination is not a safe file: ${filePath}`);
+		}
+		destinationExists = true;
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+	}
+	const noFollowFlags =
+		process.platform === "win32" ? 0 : (nodeFs.constants.O_NOFOLLOW ?? 0) | (nodeFs.constants.O_NONBLOCK ?? 0);
+	const flags = destinationExists
+		? nodeFs.constants.O_WRONLY | noFollowFlags
+		: nodeFs.constants.O_WRONLY | nodeFs.constants.O_CREAT | nodeFs.constants.O_EXCL | noFollowFlags;
+	let handle: fs.FileHandle;
+	try {
+		handle = await fs.open(filePath, flags, 0o600);
+	} catch (error) {
+		throw new SkillFrontmatterError(`skill destination is not a safe file: ${filePath} (${String(error)})`);
+	}
+	try {
+		const [opened, observed, currentSkillDir] = await Promise.all([
+			handle.stat({ bigint: true }),
+			fs.lstat(filePath, { bigint: true }),
+			fs.realpath(skillDir),
+		]);
+		if (
+			!opened.isFile() ||
+			opened.nlink !== 1n ||
+			observed.isSymbolicLink() ||
+			!observed.isFile() ||
+			opened.dev !== observed.dev ||
+			opened.ino !== observed.ino ||
+			normalizePathForComparison(currentSkillDir) !== normalizePathForComparison(canonicalSkillDir) ||
+			!isPathWithin(canonicalScopeRoot, currentSkillDir)
+		) {
+			throw new SkillFrontmatterError(`skill destination changed during write: ${filePath}`);
+		}
+		await handle.truncate(0);
+		await handle.writeFile(content);
+	} finally {
+		await handle.close();
+	}
+	return filePath;
+}
 
 function getRuntimeHome(): string {
 	return getTrustedHomeDir();
-}
-
-/** Ancestor directories from `cwd` (inclusive) up to `stop` (inclusive), excluding `home`. */
-function ancestorDirs(cwd: string, stop: string, home: string): string[] {
-	const dirs: string[] = [];
-	let current = path.resolve(cwd);
-	const resolvedStop = path.resolve(stop);
-	const resolvedHome = path.resolve(home);
-	while (true) {
-		if (current !== resolvedHome) {
-			dirs.push(current);
-		}
-		if (current === resolvedStop) break;
-		const parent = path.dirname(current);
-		if (parent === current) break;
-		current = parent;
-	}
-	return dirs;
 }
 
 /**
@@ -126,34 +242,42 @@ export async function getProjectSkillDirs(
 	home: string,
 ): Promise<{ dirs: string[]; repoRoot: string | null }> {
 	const repoRoot = await findRepoRoot(cwd);
-	const walkDirs = ancestorDirs(cwd, path.resolve(repoRoot ?? cwd), home);
-	return { dirs: walkDirs.map(dir => path.join(dir, ".gjc", "skills")), repoRoot };
+	const walkDirs = getAncestorDirs(cwd, path.resolve(repoRoot ?? cwd), home);
+	return { dirs: walkDirs.map(({ dir }) => path.join(dir, ".gjc", "skills")), repoRoot };
 }
 
 /** Canonical user skill directories in precedence order (same resolution as runtime discovery). */
-export function getUserSkillDirs(home: string): string[] {
-	return [
-		...new Set([
-			path.join(home, SOURCE_PATHS.native.userAgent, "skills"),
-			path.join(home, SOURCE_PATHS.native.userBase, "skills"),
-			path.join(home, ".gjc", "skills"),
-		]),
-	];
+export function getUserSkillDirs(home: string, agentDir?: string, profileAuthority?: "default" | "custom"): string[] {
+	return getUserSkillScanDirs(home, agentDir, profileAuthority);
 }
 
 /**
  * The canonical directory a write targets for a scope: the repo root (or `cwd`)
- * `.gjc/skills` for project scope, the canonical `<config>/agent/skills` user
- * root for user scope (honoring `GJC_CONFIG_DIR` / `PI_CONFIG_DIR`).
+ * `.gjc/skills` for project scope, the agent directory's `skills` root for user
+ * scope — the same directory every reader scans first (`gjc config path` prints
+ * it; `--agent-dir` / `GJC_CODING_AGENT_DIR` / `setAgentDir()` move it).
  */
 export async function resolveNativeSkillScopeDir(
 	cwd: string,
 	scope: SkillScope,
-	home = getRuntimeHome(),
+	_home?: string,
+	agentDir?: string,
 ): Promise<string> {
-	if (scope === "user") return path.join(home, SOURCE_PATHS.native.userAgent, "skills");
+	const home = _home ?? getRuntimeHome();
+	if (scope === "user") {
+		const resolvedAgentDir = agentDir ?? (_home === undefined ? getAgentDir() : resolveUserAgentDir(home));
+		return path.join(path.resolve(resolvedAgentDir), "skills");
+	}
 	const repoRoot = await findRepoRoot(cwd);
-	return path.join(repoRoot ?? path.resolve(cwd), ".gjc", "skills");
+	const resolvedCwd = path.resolve(cwd);
+	const projectRoot = repoRoot ?? resolvedCwd;
+	if (normalizePathForComparison(projectRoot) === normalizePathForComparison(home)) {
+		if (normalizePathForComparison(resolvedCwd) === normalizePathForComparison(home)) {
+			throw new SkillFrontmatterError("project skill scope is unavailable at the user home boundary");
+		}
+		return path.join(resolvedCwd, ".gjc", "skills");
+	}
+	return path.join(projectRoot, ".gjc", "skills");
 }
 
 function matchesPattern(name: string, patterns: string[] | undefined): boolean {
@@ -174,14 +298,31 @@ function isDisabledByExtension(name: string, disabledExtensions: string[] | unde
 export async function listNativeSkillsForManagement(options: {
 	cwd: string;
 	home?: string;
+	agentDir?: string;
+	/** Resolver-owned profile classification; unlike path comparison, this survives HOME refreshes. */
+	profileAuthority?: "default" | "custom";
 	policy?: SkillManagementPolicy;
 }): Promise<ManagedSkillRecord[]> {
+	const homeWasInjected = options.home !== undefined;
 	const home = options.home ?? getRuntimeHome();
+	const agentDir = options.agentDir ?? (homeWasInjected ? resolveUserAgentDir(home) : getAgentDir());
+	const profileAuthority =
+		options.profileAuthority ??
+		(options.agentDir !== undefined
+			? normalizePathForComparison(options.agentDir) ===
+				normalizePathForComparison(homeWasInjected ? resolveUserAgentDir(home) : getAgentDir())
+				? homeWasInjected
+					? "default"
+					: getAgentProfileAuthority()
+				: "custom"
+			: !homeWasInjected
+				? getAgentProfileAuthority()
+				: undefined);
 	const policy = options.policy;
 	const projectTrusted = resolveSkillScopeTrust(policy ?? {}, "project");
 	const userTrusted = resolveSkillScopeTrust(policy ?? {}, "user");
 
-	const scanJobs: Array<Promise<{ dir: string; items: CapabilitySkill[] }>> = [];
+	const scanJobs: Array<Promise<{ dir: string; scope: SkillScope; items: CapabilitySkill[] }>> = [];
 	const projectDirs = await getProjectSkillDirs(options.cwd, home);
 	if (projectTrusted) {
 		for (const dir of projectDirs.dirs) {
@@ -189,17 +330,23 @@ export async function listNativeSkillsForManagement(options: {
 				scanSkillsFromDir(
 					{ cwd: options.cwd, home, repoRoot: projectDirs.repoRoot },
 					{ dir, providerId: "runtime", level: "project", requireDescription: true },
-				).then(result => ({ dir, items: result.items })),
+				).then(result => ({ dir, scope: "project" as const, items: result.items })),
 			);
 		}
 	}
 	if (userTrusted) {
-		for (const dir of getUserSkillDirs(home)) {
+		for (const dir of getUserSkillScanDirs(home, agentDir, profileAuthority)) {
 			scanJobs.push(
 				scanSkillsFromDir(
 					{ cwd: options.cwd, home, repoRoot: home },
-					{ dir, providerId: "runtime", level: "user", requireDescription: true },
-				).then(result => ({ dir, items: result.items })),
+					{
+						dir,
+						authorityRoot: path.resolve(dir) === path.resolve(agentDir, "skills") ? agentDir : undefined,
+						providerId: "runtime",
+						level: "user",
+						requireDescription: true,
+					},
+				).then(result => ({ dir, scope: "user" as const, items: result.items })),
 			);
 		}
 	}
@@ -208,8 +355,7 @@ export async function listNativeSkillsForManagement(options: {
 	const seenNames = new Set<string>();
 	const seenPaths = new Set<string>();
 
-	for (const { dir, items } of await Promise.all(scanJobs)) {
-		const scope: SkillScope = path.resolve(dir).startsWith(`${path.resolve(home)}${path.sep}`) ? "user" : "project";
+	for (const { dir, scope, items } of await Promise.all(scanJobs)) {
 		const source = scope === "project" ? "project .gjc/skills" : `user ${dir}`;
 		for (const skill of items) {
 			const realPath = await safeRealpath(skill.path);
@@ -217,7 +363,7 @@ export async function listNativeSkillsForManagement(options: {
 
 			let disabledReason: SkillDisabledReason | undefined;
 			let enabled = true;
-			if (BUILT_IN_SKILL_NAMES.has(skill.name)) {
+			if (isProtectedSkillName(skill.name)) {
 				enabled = false;
 				disabledReason = "protected";
 			} else if (!(scope === "project" ? projectTrusted : userTrusted)) {
@@ -272,19 +418,21 @@ export async function writeNativeSkill(input: WriteNativeSkillInput): Promise<Wr
 
 	const effectiveName =
 		typeof frontmatter.name === "string" && frontmatter.name.trim() ? frontmatter.name.trim() : name;
-	if (BUILT_IN_SKILL_NAMES.has(effectiveName)) throw new SkillNameProtectedError(effectiveName);
+	if (isProtectedSkillName(effectiveName)) throw new SkillNameProtectedError(effectiveName);
+	assertSafeSkillName(effectiveName);
 
-	const directory = await resolveNativeSkillScopeDir(input.cwd, input.scope, input.home ?? getRuntimeHome());
-	const skillDir = path.join(directory, effectiveName);
-	await fs.mkdir(skillDir, { recursive: true });
-	const filePath = path.join(skillDir, "SKILL.md");
-	await Bun.write(filePath, `${input.content.trimEnd()}\n`);
+	const directory = await resolveNativeSkillScopeDir(input.cwd, input.scope, input.home, input.agentDir);
+	const scopeRoot = input.scope === "user" ? path.dirname(directory) : path.dirname(path.dirname(directory));
+	const relativeDirectory = path.relative(scopeRoot, directory);
+	const directorySegments = relativeDirectory.split(path.sep).filter(Boolean);
+	const skillDir = await ensureSafeDescendantDirectory(scopeRoot, [...directorySegments, effectiveName]);
+	const filePath = await writeSkillFileSafely(skillDir, scopeRoot, `${input.content.trimEnd()}\n`);
 	return { name: effectiveName, scope: input.scope, directory, path: filePath };
 }
 
 /** Whether a skill is enabled under the current policy (disabledExtensions/ignored/scope trust). */
 export function isNativeSkillEnabled(name: string, policy: SkillManagementPolicy | undefined): boolean {
-	if (BUILT_IN_SKILL_NAMES.has(name)) return true;
+	if (isProtectedSkillName(name)) return true;
 	if (isDisabledByExtension(name, policy?.disabledExtensions)) return false;
 	if (matchesPattern(name, policy?.ignoredSkills)) return false;
 	if (policy?.includeSkills?.length && !matchesPattern(name, policy.includeSkills)) return false;
@@ -299,7 +447,7 @@ export function isNativeSkillEnabled(name: string, policy: SkillManagementPolicy
 export function setNativeSkillEnabled(name: string, enabled: boolean, disabledExtensions: string[]): string[] {
 	const id = `skill:${name}`;
 	const next = new Set(disabledExtensions);
-	if (BUILT_IN_SKILL_NAMES.has(name)) return [...next];
+	if (isProtectedSkillName(name)) return [...next];
 	if (enabled) {
 		next.delete(id);
 	} else {

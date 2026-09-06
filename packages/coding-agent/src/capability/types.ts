@@ -29,6 +29,8 @@ export interface LoadContext {
 	 * produced. This includes MCP registrations and user-installed skills.
 	 */
 	userAgentDir?: string;
+	/** Resolver-owned classification for the selected user agent directory. */
+	profileAuthority?: "default" | "custom";
 	/** Git repository root (directory containing .git), or null if not in a repo */
 	repoRoot: string | null;
 	/** Owning session settings for provider policy decisions. */
@@ -89,6 +91,8 @@ export interface LoadOptions {
 	 * process-wide one (`createAgentSession({ agentDir })`).
 	 */
 	agentDir?: string;
+	/** Resolver-owned classification for `agentDir`; preserve it across HOME/config refreshes. */
+	profileAuthority?: "default" | "custom";
 	/** Include items even if they fail validation. Default: false */
 	includeInvalid?: boolean;
 	/** Include items disabled via settings. Default: false */

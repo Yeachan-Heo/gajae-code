@@ -121,6 +121,28 @@ describe("skill-management", () => {
 			});
 		});
 
+		it("does not target the excluded home root for project skill writes", async () => {
+			const home = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-skill-home-repo-"));
+			try {
+				const cwd = path.join(home, "workspace");
+				await fs.mkdir(path.join(home, ".git"));
+				await fs.mkdir(cwd);
+				const receipt = await writeNativeSkill({
+					cwd,
+					home,
+					scope: "project",
+					name: "my-skill",
+					content: validContent,
+				});
+				expect(receipt.path).toBe(path.join(cwd, ".gjc", "skills", "my-skill", "SKILL.md"));
+				await expect(
+					writeNativeSkill({ cwd: home, home, scope: "project", name: "my-skill", content: validContent }),
+				).rejects.toBeInstanceOf(SkillFrontmatterError);
+			} finally {
+				await fs.rm(home, { recursive: true, force: true });
+			}
+		});
+
 		it("writes user skills into the canonical agent skills root", async () => {
 			await withTempDirs(async (cwd, home) => {
 				const receipt = await writeNativeSkill({
@@ -134,12 +156,141 @@ describe("skill-management", () => {
 			});
 		});
 
+		it("keeps an explicit agent profile isolated for listing and writes", async () => {
+			await withTempDirs(async (cwd, home) => {
+				const profileDir = path.join(home, "profiles", "review");
+				await makeSkill(path.join(home, ".gjc", "agent", "skills"), "default-only", "Default profile skill");
+				await makeSkill(path.join(profileDir, "skills"), "profile-only", "Review profile skill");
+
+				const records = await listNativeSkillsForManagement({
+					cwd,
+					home,
+					agentDir: profileDir,
+					profileAuthority: "custom",
+				});
+				expect(records.map(record => record.name)).toEqual(["profile-only"]);
+
+				const receipt = await writeNativeSkill({
+					cwd,
+					home,
+					agentDir: profileDir,
+					scope: "user",
+					name: "written-profile",
+					content: validContent.replace("name: my-skill", "name: written-profile"),
+				});
+				expect(receipt.path).toBe(path.join(profileDir, "skills", "written-profile", "SKILL.md"));
+			});
+		});
+
 		it("rejects bundled workflow skill names", async () => {
 			await withTempDirs(async (cwd, home) => {
-				const protectedContent = ["---", "name: ultragoal", "description: Impostor", "---", "", "# x"].join("\n");
+				for (const name of ["ultragoal", "Ultragoal", "ralplan.", "RALPLAN..."]) {
+					const protectedContent = ["---", `name: ${name}`, "description: Impostor", "---", "", "# x"].join("\n");
+					await expect(
+						writeNativeSkill({ cwd, home, scope: "project", name, content: protectedContent }),
+					).rejects.toBeInstanceOf(SkillNameProtectedError);
+				}
+			});
+		});
+
+		it("rejects path traversal names and symlinked destinations", async () => {
+			await withTempDirs(async (cwd, home) => {
+				const traversalContent = validContent.replace("name: my-skill", "name: ../outside");
 				await expect(
-					writeNativeSkill({ cwd, home, scope: "project", name: "ultragoal", content: protectedContent }),
-				).rejects.toBeInstanceOf(SkillNameProtectedError);
+					writeNativeSkill({ cwd, home, scope: "user", name: "outside", content: traversalContent }),
+				).rejects.toBeInstanceOf(SkillFrontmatterError);
+
+				const skillsDir = path.join(home, ".gjc", "agent", "skills");
+				const outsideDir = path.join(home, "outside");
+				await fs.mkdir(skillsDir, { recursive: true });
+				await fs.mkdir(outsideDir);
+				await fs.symlink(outsideDir, path.join(skillsDir, "my-skill"), "dir");
+				await expect(
+					writeNativeSkill({ cwd, home, scope: "user", name: "my-skill", content: validContent }),
+				).rejects.toBeInstanceOf(SkillFrontmatterError);
+				await expect(fs.stat(path.join(outsideDir, "SKILL.md"))).rejects.toMatchObject({ code: "ENOENT" });
+
+				await fs.rm(path.join(skillsDir, "my-skill"));
+				await fs.mkdir(path.join(skillsDir, "my-skill"));
+				const outsideFile = path.join(outsideDir, "outside.md");
+				await fs.writeFile(outsideFile, "unchanged");
+				await fs.symlink(outsideFile, path.join(skillsDir, "my-skill", "SKILL.md"), "file");
+				await expect(
+					writeNativeSkill({ cwd, home, scope: "user", name: "my-skill", content: validContent }),
+				).rejects.toBeInstanceOf(SkillFrontmatterError);
+				expect(await fs.readFile(outsideFile, "utf8")).toBe("unchanged");
+
+				await fs.rm(path.join(skillsDir, "my-skill", "SKILL.md"));
+				const danglingTarget = path.join(outsideDir, "created-by-follow.md");
+				await fs.symlink(danglingTarget, path.join(skillsDir, "my-skill", "SKILL.md"), "file");
+				await expect(
+					writeNativeSkill({ cwd, home, scope: "user", name: "my-skill", content: validContent }),
+				).rejects.toBeInstanceOf(SkillFrontmatterError);
+				await expect(fs.stat(danglingTarget)).rejects.toMatchObject({ code: "ENOENT" });
+			});
+
+			await withTempDirs(async (cwd, home) => {
+				const agentDir = path.join(home, ".gjc", "agent");
+				const outsideSkills = path.join(home, "outside-skills");
+				await fs.mkdir(agentDir, { recursive: true });
+				await fs.mkdir(outsideSkills);
+				await fs.symlink(outsideSkills, path.join(agentDir, "skills"), "dir");
+				await expect(
+					writeNativeSkill({ cwd, home, scope: "user", name: "my-skill", content: validContent }),
+				).rejects.toBeInstanceOf(SkillFrontmatterError);
+				await expect(fs.stat(path.join(outsideSkills, "my-skill", "SKILL.md"))).rejects.toMatchObject({
+					code: "ENOENT",
+				});
+			});
+		});
+
+		it("rejects a selected agent directory that is itself a symlink", async () => {
+			await withTempDirs(async (cwd, home) => {
+				const outsideAgentDir = path.join(home, "outside-agent");
+				const selectedAgentDir = path.join(home, "selected-agent");
+				await fs.mkdir(outsideAgentDir);
+				await fs.symlink(outsideAgentDir, selectedAgentDir, "dir");
+
+				await expect(
+					writeNativeSkill({
+						cwd,
+						home,
+						agentDir: selectedAgentDir,
+						scope: "user",
+						name: "my-skill",
+						content: validContent,
+					}),
+				).rejects.toBeInstanceOf(SkillFrontmatterError);
+				await expect(fs.stat(path.join(outsideAgentDir, "skills", "my-skill", "SKILL.md"))).rejects.toMatchObject({
+					code: "ENOENT",
+				});
+			});
+		});
+
+		it.skipIf(process.platform === "win32")("rejects a FIFO skill file without blocking", async () => {
+			await withTempDirs(async (cwd, home) => {
+				const skillDir = path.join(home, ".gjc", "agent", "skills", "my-skill");
+				await fs.mkdir(skillDir, { recursive: true });
+				const fifoPath = path.join(skillDir, "SKILL.md");
+				const proc = Bun.spawn(["mkfifo", fifoPath]);
+				expect(await proc.exited).toBe(0);
+				await expect(
+					writeNativeSkill({ cwd, home, scope: "user", name: "my-skill", content: validContent }),
+				).rejects.toBeInstanceOf(SkillFrontmatterError);
+			});
+		});
+
+		it("rejects a hard-linked skill file without modifying its peer", async () => {
+			await withTempDirs(async (cwd, home) => {
+				const skillDir = path.join(home, ".gjc", "agent", "skills", "my-skill");
+				const outsideFile = path.join(home, "outside.md");
+				await fs.mkdir(skillDir, { recursive: true });
+				await fs.writeFile(outsideFile, "unchanged");
+				await fs.link(outsideFile, path.join(skillDir, "SKILL.md"));
+				await expect(
+					writeNativeSkill({ cwd, home, scope: "user", name: "my-skill", content: validContent }),
+				).rejects.toBeInstanceOf(SkillFrontmatterError);
+				expect(await fs.readFile(outsideFile, "utf8")).toBe("unchanged");
 			});
 		});
 
@@ -169,7 +320,9 @@ describe("skill-management", () => {
 
 		it("never disables bundled workflow skills", () => {
 			expect(setNativeSkillEnabled("ralplan", false, [])).toEqual([]);
+			expect(setNativeSkillEnabled("Ralplan", false, [])).toEqual([]);
 			expect(isNativeSkillEnabled("ralplan", { disabledExtensions: ["skill:ralplan"] })).toBe(true);
+			expect(isNativeSkillEnabled("Ralplan", { disabledExtensions: ["skill:Ralplan"] })).toBe(true);
 		});
 
 		it("reflects ignore/include policy", () => {

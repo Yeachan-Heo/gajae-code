@@ -2,11 +2,23 @@
  * Tool wrappers for extensions.
  */
 import type { AgentTool, AgentToolContext, AgentToolUpdateCallback } from "@gajae-code/agent-core";
-import type { ImageContent, Static, TextContent, TSchema } from "@gajae-code/ai/core";
+import {
+	type ImageContent,
+	type Static,
+	type TextContent,
+	type ToolCall,
+	type TSchema,
+	validateToolArguments,
+} from "@gajae-code/ai/core";
 import type { Theme } from "../../modes/theme/theme";
+import { ToolAbortError } from "../../tools/tool-errors";
 import { applyToolProxy } from "../tool-proxy";
 import type { ExtensionRunner } from "./runner";
 import type { RegisteredTool, ToolCallEventResult } from "./types";
+
+function toolAbortReason(signal: AbortSignal | undefined, fallback: string): Error {
+	return signal?.reason instanceof Error ? signal.reason : new ToolAbortError(fallback);
+}
 
 /**
  * Adapts a RegisteredTool into an AgentTool.
@@ -92,6 +104,11 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 		applyToolProxy(tool, this);
 	}
 
+	/** Host composition hook: guards must run inside Function Hook preflight. */
+	getInnerTool(): AgentTool<TParameters, TDetails> {
+		return this.tool;
+	}
+
 	/**
 	 * Forward browser mode changes when available.
 	 */
@@ -109,19 +126,21 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 		context?: AgentToolContext,
 	) {
 		const scope = context?.attemptScope;
+		const toolCallEvent = {
+			type: "tool_call" as const,
+			toolName: this.tool.name,
+			toolCallId,
+			input: params as Record<string, unknown>,
+		};
 		// Emit tool_call event - extensions can block execution
 		if (this.runner.hasHandlers("tool_call")) {
 			try {
-				const callResult = (await this.runner.emitToolCall(
-					{
-						type: "tool_call",
-						toolName: this.tool.name,
-						toolCallId,
-						input: params as Record<string, unknown>,
-					},
-					scope,
-				)) as ToolCallEventResult | undefined;
+				const callResult = (await this.runner.emitToolCall(toolCallEvent, scope, {
+					signal,
+					correlationId: toolCallId,
+				})) as ToolCallEventResult | undefined;
 
+				if (signal?.aborted) throw toolAbortReason(signal, "Tool call aborted during Function Hook mediation");
 				if (callResult?.block) {
 					const reason = callResult.reason || "Tool execution was blocked by an extension";
 					throw new Error(reason);
@@ -133,14 +152,28 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 				throw new Error(`Extension failed, blocking execution: ${String(err)}`);
 			}
 		}
+		if (toolCallEvent.input !== params || !this.tool.lenientArgValidation) {
+			params = validateToolArguments(this.tool, {
+				type: "toolCall",
+				id: toolCallId,
+				name: this.tool.name,
+				arguments: toolCallEvent.input,
+			} satisfies ToolCall) as Static<TParameters>;
+		}
 
 		// Execute the actual tool
 		let result: { content: any; details?: TDetails };
 		let executionError: Error | undefined;
+		const mediatesToolResult = this.runner.hasToolResultMediation(this.tool.name);
+		const deliversToolResult = this.runner.hasHandlers("tool_result");
+		const effectiveOnUpdate = mediatesToolResult ? undefined : onUpdate;
 
 		try {
-			result = await this.tool.execute(toolCallId, params, signal, onUpdate, context);
+			result = await this.tool.execute(toolCallId, params, signal, effectiveOnUpdate, context);
 		} catch (err) {
+			if (err instanceof ToolAbortError || signal?.aborted) {
+				throw err instanceof ToolAbortError ? err : toolAbortReason(signal, "Tool execution aborted");
+			}
 			executionError = err instanceof Error ? err : new Error(String(err));
 			result = {
 				content: [{ type: "text", text: executionError.message }],
@@ -149,7 +182,8 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 		}
 
 		// Emit tool_result event - extensions can modify the result and error status
-		if (this.runner.hasHandlers("tool_result")) {
+		if (signal?.aborted) throw toolAbortReason(signal, "Tool execution aborted");
+		if (deliversToolResult) {
 			const resultResult = await this.runner.emitToolResult(
 				{
 					type: "tool_result",
@@ -161,11 +195,17 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 					isError: !!executionError,
 				},
 				scope,
+				{ signal, correlationId: toolCallId },
 			);
+			if (signal?.aborted) throw toolAbortReason(signal, "Tool result mediation aborted");
 
 			if (resultResult) {
-				const modifiedContent: (TextContent | ImageContent)[] = resultResult.content ?? result.content;
-				const modifiedDetails = (resultResult.details ?? result.details) as TDetails;
+				const modifiedContent: (TextContent | ImageContent)[] = Object.hasOwn(resultResult, "content")
+					? (resultResult.content ?? [])
+					: result.content;
+				const modifiedDetails = (
+					Object.hasOwn(resultResult, "details") ? resultResult.details : result.details
+				) as TDetails;
 
 				// Extension can override error status
 				if (resultResult.isError === true && !executionError) {
@@ -181,7 +221,8 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 
 				// Error status unchanged, but content/details may be modified
 				if (executionError) {
-					throw executionError;
+					const textBlocks = modifiedContent.filter((content): content is TextContent => content.type === "text");
+					throw new Error(textBlocks.map(content => content.text).join("\n") || "Tool execution failed");
 				}
 				return { content: modifiedContent, details: modifiedDetails };
 			}

@@ -32,8 +32,10 @@ import {
 	$flag,
 	getAgentDbPath,
 	getAgentDir,
+	getAgentProfileAuthority,
 	getProjectDir,
 	logger,
+	normalizePathForComparison,
 	postmortem,
 	prompt,
 	Snowflake,
@@ -91,10 +93,14 @@ import { CustomToolAdapter } from "../extensibility/custom-tools/wrapper";
 import {
 	createCustomToolSettings,
 	type ExtensionContext,
+	type ExtensionEvent,
 	type ExtensionFactory,
 	ExtensionRunner,
 	ExtensionToolWrapper,
 	type ExtensionUIContext,
+	type FunctionHook,
+	type FunctionHookEventType,
+	type FunctionHookResult,
 	type LoadExtensionsResult,
 	loadExtensionFromFactory,
 	type ToolDefinition,
@@ -168,6 +174,7 @@ import {
 	unregisterOwnedRegistration,
 } from "../session/terminal-abort";
 import { formatNoModelsAvailableFallback } from "../setup/model-onboarding-guidance";
+import { getSkillFilesystemIdentity } from "../skill-state/canonical-skills";
 import {
 	type BuildSystemPromptResult,
 	buildSystemPrompt as buildSystemPromptInternal,
@@ -438,6 +445,8 @@ export interface CreateAgentSessionOptions {
 	cwd?: string;
 	/** Global config directory. Default: ~/.gjc/agent */
 	agentDir?: string;
+	/** Resolver-owned classification for `agentDir`; required when authority must survive HOME/config refreshes. */
+	profileAuthority?: "default" | "custom";
 	/** Spawns to allow. Default: "*" */
 	spawns?: string;
 
@@ -781,10 +790,11 @@ export async function discoverSkills(
  */
 export async function discoverContextFiles(
 	cwd?: string,
-	_agentDir?: string,
+	agentDir?: string,
 ): Promise<Array<{ path: string; content: string; depth?: number }>> {
 	return await loadContextFilesInternal({
 		cwd: cwd ?? getProjectDir(),
+		agentDir,
 	});
 }
 
@@ -821,6 +831,8 @@ export interface BuildSystemPromptOptions {
 	skills?: Skill[];
 	contextFiles?: Array<{ path: string; content: string }>;
 	cwd?: string;
+	agentDir?: string;
+	profileAuthority?: "default" | "custom";
 	appendPrompt?: string;
 	repeatToolDescriptions?: boolean;
 }
@@ -834,6 +846,8 @@ export interface BuildSystemPromptOptions {
 export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}): Promise<BuildSystemPromptResult> {
 	return await buildSystemPromptInternal({
 		cwd: options.cwd,
+		agentDir: options.agentDir,
+		profileAuthority: options.profileAuthority,
 		skills: options.skills,
 		contextFiles: options.contextFiles,
 		appendSystemPrompt: options.appendPrompt,
@@ -1015,14 +1029,89 @@ export function createPluginHooksExtension(hooks: ConstrainedPluginHook[]): Exte
 			if (!normalized) throw new Error("Hook normalization invariant violated");
 			const registrationEvent = normalized.runtimeEvent;
 			const target = normalized.toolName === "*" ? undefined : normalized.toolName;
-			const handler = target
-				? (event: { toolName?: string; tool?: { name?: string }; name?: string }, ...rest: unknown[]) => {
-						const toolName = event?.toolName ?? event?.tool?.name ?? event?.name;
-						if (toolName !== target) return undefined;
-						return (hook.handler as (...a: unknown[]) => unknown)(event, ...rest);
+			if (!hook.functionHook) {
+				const legacyHandler: (...args: unknown[]) => unknown = target
+					? (event: unknown, ...rest: unknown[]) => {
+							const record = event as { toolName?: string; tool?: { name?: string }; name?: string } | undefined;
+							const toolName = record?.toolName ?? record?.tool?.name ?? record?.name;
+							if (toolName !== target) return undefined;
+							return (hook.handler as (...args: unknown[]) => unknown)(event, ...rest);
+						}
+					: (hook.handler as (...args: unknown[]) => unknown);
+				(api.on as (event: string, handler: (...args: unknown[]) => void) => void)(
+					registrationEvent,
+					legacyHandler,
+				);
+				continue;
+			}
+			const handler: FunctionHook = async (invocation, _capabilities, next) => {
+				const legacyResult = await (hook.handler as (...args: unknown[]) => unknown)(invocation.payload, undefined);
+				if (legacyResult === undefined) return await next();
+				if (invocation.eventType === "tool_call") {
+					const result = legacyResult as { block?: unknown; reason?: unknown; input?: unknown };
+					if (result.block === true) {
+						return {
+							action: "deny",
+							reason:
+								typeof result.reason === "string" ? result.reason : "Tool execution blocked by plugin hook",
+						};
 					}
-				: hook.handler;
-			(api.on as (event: string, handler: (...args: unknown[]) => unknown) => void)(registrationEvent, handler);
+					if (result.input !== undefined) {
+						return {
+							action: "continue",
+							event: { ...invocation.payload, input: result.input as Record<string, unknown> } as ExtensionEvent,
+						} as FunctionHookResult;
+					}
+				}
+				if (invocation.eventType === "tool_result") {
+					const result = legacyResult as { content?: unknown; details?: unknown; isError?: unknown };
+					if (result.content !== undefined || result.details !== undefined || result.isError !== undefined) {
+						return {
+							action: "continue",
+							event: {
+								...invocation.payload,
+								...(result.content === undefined ? {} : { content: result.content }),
+								...(result.details === undefined ? {} : { details: result.details }),
+								...(result.isError === undefined ? {} : { isError: result.isError }),
+							},
+						} as FunctionHookResult;
+					}
+				}
+				if (invocation.eventType === "context" && (legacyResult as { messages?: unknown }).messages !== undefined) {
+					return {
+						action: "continue",
+						event: {
+							...invocation.payload,
+							messages: (legacyResult as { messages: unknown }).messages,
+						} as ExtensionEvent,
+					} as FunctionHookResult;
+				}
+				if (
+					invocation.eventType.startsWith("session_before_") &&
+					(legacyResult as { cancel?: unknown }).cancel === true
+				) {
+					return { action: "deny", reason: "Session change blocked by plugin hook" };
+				}
+				if (invocation.eventType === "before_agent_start") {
+					const result = legacyResult as { message?: unknown; systemPrompt?: unknown };
+					if (result.message !== undefined || result.systemPrompt !== undefined) {
+						return {
+							action: "return",
+							value: {
+								...(result.message === undefined ? {} : { messages: [result.message] }),
+								...(result.systemPrompt === undefined ? {} : { systemPrompt: result.systemPrompt }),
+							},
+						} as FunctionHookResult;
+					}
+				}
+				return await next();
+			};
+			const options = {
+				...(target === undefined ? {} : { target }),
+				registrationId: hook.extensionId,
+				...(hook.grant ?? {}),
+			};
+			api.registerFunctionHook(registrationEvent as FunctionHookEventType, handler, options);
 		}
 	};
 }
@@ -1112,14 +1201,14 @@ function buildMCPPromptCommands(manager: MCPManager): LoadedCustomCommand[] {
 function withEmbeddedDefaultGjcSkills(skills: Skill[]): Skill[] {
 	const byName = new Map<string, Skill>();
 	for (const skill of skills) {
-		const key = skill.name.toLowerCase();
+		const key = getSkillFilesystemIdentity(skill.name);
 		if (!byName.has(key)) byName.set(key, skill);
 	}
 	// The four public GJC workflow skills are a product invariant: even if a
 	// caller-supplied or filesystem skill shares a name, the bundled definition
 	// wins so workflow routing can never be silently hijacked.
 	for (const defaultSkill of getEmbeddedDefaultGjcSkills()) {
-		byName.set(defaultSkill.name.toLowerCase(), defaultSkill);
+		byName.set(getSkillFilesystemIdentity(defaultSkill.name), defaultSkill);
 	}
 	return [...byName.values()];
 }
@@ -1393,7 +1482,14 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	}
 	const cwd = options.cwd ?? getProjectDir();
 	const explicitMcpConfigPath = !isCanonicalSubSession && !options.mcpManager ? options.mcpConfigPath : undefined;
-	const agentDir = options.agentDir ?? getDefaultAgentDir();
+	const agentDir = options.agentDir ?? options.settings?.getAgentDir() ?? getDefaultAgentDir();
+	const profileAuthority =
+		options.profileAuthority ??
+		(options.agentDir !== undefined || options.settings !== undefined
+			? normalizePathForComparison(agentDir) !== normalizePathForComparison(getAgentDir())
+				? "custom"
+				: getAgentProfileAuthority()
+			: getAgentProfileAuthority());
 	const eventBus = options.eventBus ?? new EventBus();
 	const hasInjectedAuth = options.authStorage !== undefined || options.modelRegistry !== undefined;
 
@@ -1581,7 +1677,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		// session-context build, tool creation, MCP discovery, and extension discovery.
 		const contextFilesResultPromise = options.contextFiles
 			? Promise.resolve({ contextFiles: options.contextFiles, warnings: [] })
-			: logger.time("discoverContextFiles", loadContextFilesResultInternal, { cwd });
+			: logger.time("discoverContextFiles", loadContextFilesResultInternal, { cwd, agentDir, profileAuthority });
 		contextFilesResultPromise.catch(() => {});
 		const promptTemplatesPromise = options.promptTemplates
 			? Promise.resolve(options.promptTemplates)
@@ -1982,9 +2078,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			skills = withEmbeddedDefaultGjcSkills(options.skills);
 			skillWarnings = [];
 		} else if (settings.get("skills.enabled")) {
-			const skillsResult = await logger.time("loadSkills", loadSkills, {
+			const skillsResult = await logger.time("discoverSkills", loadSkills, {
 				...settings.getGroup("skills"),
 				agentDir,
+				profileAuthority,
 				cwd,
 				disabledExtensions: settings.get("disabledExtensions"),
 			});
@@ -2006,7 +2103,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			const rulesResult =
 				options.rules !== undefined
 					? { items: options.rules, warnings: undefined }
-					: await loadCapability<Rule>(ruleCapability.id, { cwd, agentDir, settings });
+					: await loadCapability<Rule>(ruleCapability.id, { cwd, agentDir, profileAuthority, settings });
 			const rulebookRules: Rule[] = [];
 			const alwaysApplyRules: Rule[] = [];
 			for (const rule of rulesResult.items) {
@@ -2334,7 +2431,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		 */
 		const applyRescopedReadState = async (to: string): Promise<void> => {
 			try {
-				const rediscovered = await loadContextFilesResultInternal({ cwd: to });
+				const rediscovered = await loadContextFilesResultInternal({ cwd: to, agentDir, profileAuthority });
 				contextFiles = rediscovered.contextFiles;
 			} catch (error) {
 				logger.warn("Failed to re-discover context files after session rescope", {
@@ -2375,6 +2472,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				return sessionManager.getCwd();
 			},
 			hasUI: options.hasUI ?? false,
+			profileAuthority,
 			workflowGateEligible: true,
 			enableLsp,
 			get hasEditTool() {
@@ -2693,6 +2791,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					}
 				: {}),
 			getSessionFile: () => sessionManager.getSessionFile() ?? null,
+			getSessionAgentDir: () => session?.getSessionAgentDir() ?? options.agentDir ?? settings.getAgentDir(),
 			getEvalKernelOwnerId: () => evalKernelOwnerId,
 			assertEvalExecutionAllowed: () => session?.assertEvalExecutionAllowed(),
 			trackEvalExecution: (execution, abortController) =>
@@ -2974,7 +3073,14 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				cwdCapturingToolNames.push(...pluginToolResult.tools.map(tool => tool.name));
 			}
 			for (const q of pluginToolResult.quarantine) {
-				gjcFindings.add({ identity: q.identity, surfaceId: q.surfaceId, code: q.code, message: q.message });
+				gjcFindings.add({
+					identity: q.identity,
+					surfaceId: q.surfaceId,
+					code: q.code,
+					message: q.message,
+					decision: "quarantined",
+					provenance: { source: "plugin-bundle", plugin: q.plugin },
+				});
 				logger.warn("Quarantined GJC plugin surface", { plugin: q.plugin, surface: q.surfaceId, code: q.code });
 			}
 		} catch (error) {
@@ -3064,7 +3170,14 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			try {
 				const { configs, quarantine } = await buildPluginMcpConfigs({ cwd });
 				for (const q of quarantine) {
-					gjcFindings.add({ identity: q.identity, surfaceId: q.surfaceId, code: q.code, message: q.message });
+					gjcFindings.add({
+						identity: q.identity,
+						surfaceId: q.surfaceId,
+						code: q.code,
+						message: q.message,
+						decision: "quarantined",
+						provenance: { source: "plugin-bundle", plugin: q.plugin },
+					});
 					logger.warn("Quarantined GJC plugin MCP", { plugin: q.plugin, surface: q.surfaceId, code: q.code });
 				}
 				const pluginNames = new Set(Object.keys(configs));
@@ -3209,12 +3322,22 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		// Always-on constrained plugin hooks (validated registry surfaces). Additive
 		// and a no-op without installed plugins; the loader denies all dangerous APIs.
 		try {
-			const pluginHookResult = await loadConstrainedPluginHooks({ cwd });
+			const pluginHookResult = await loadConstrainedPluginHooks({
+				cwd,
+				activationGeneration: gjcActivationGeneration,
+			});
 			if (pluginHookResult.hooks.length > 0) {
 				inlineExtensions.push(createPluginHooksExtension(pluginHookResult.hooks));
 			}
 			for (const q of pluginHookResult.quarantine) {
-				gjcFindings.add({ identity: q.identity, surfaceId: q.surfaceId, code: q.code, message: q.message });
+				gjcFindings.add({
+					identity: q.identity,
+					surfaceId: q.surfaceId,
+					code: q.code,
+					message: q.message,
+					decision: "quarantined",
+					provenance: { source: "plugin-bundle", plugin: q.plugin },
+				});
 				logger.warn("Quarantined GJC plugin hook", { plugin: q.plugin, surface: q.surfaceId, code: q.code });
 			}
 		} catch (error) {
@@ -3774,7 +3897,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		} else if (!toolRegistry.has("resolve")) {
 			const resolveTool = await logger.time("createTools:resolve:session", HIDDEN_TOOLS.resolve, toolSession);
 			if (resolveTool) {
-				const wrappedResolveTool = wrapToolWithMetaNotice(resolveTool);
+				const resolveWithNotice = wrapToolWithMetaNotice(resolveTool);
+				const wrappedResolveTool = extensionRunner
+					? (new ExtensionToolWrapper(resolveWithNotice, extensionRunner) as AgentTool)
+					: resolveWithNotice;
 				builtinCandidateTools.push(wrappedResolveTool);
 				toolRegistry.set(wrappedResolveTool.name, wrappedResolveTool);
 				builtinToolIdentities.add(wrappedResolveTool);
@@ -3912,6 +4038,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				// Live cwd: the prompt is rebuilt after a rescope, and describing the
 				// retired launcher root there is what makes the model pick wrong paths.
 				cwd: getLiveCwd(),
+				agentDir,
+				profileAuthority,
 				skills,
 				contextFiles,
 				tools: promptTools,
@@ -4184,21 +4312,21 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			if (!obfuscator?.hasSecrets() || !obfuscateMessagesFn) return converted;
 			return obfuscateMessagesFn(obfuscator, converted);
 		};
-		const transformContext = async (messages: AgentMessage[], _signal?: AbortSignal, scope?: AttemptScopeRef) => {
+		const transformContext = async (messages: AgentMessage[], signal?: AbortSignal, scope?: AttemptScopeRef) => {
 			// External Agent events dispatch listeners without awaiting them. The
 			// session-owned barrier makes any pre-admission artifact transformation
 			// visible before this provider context is normalized.
 			await session?.awaitPendingContextTransformations();
-			return extensionRunner ? await extensionRunner.emitContext(messages, scope) : messages;
+			return extensionRunner ? await extensionRunner.emitContext(messages, scope, signal) : messages;
 		};
 		const onPayload = extensionRunner
-			? async (payload: unknown, _model?: Model, scope?: AttemptScopeRef) => {
-					return await extensionRunner.emitBeforeProviderRequest(payload, scope);
+			? async (payload: unknown, _model?: Model, scope?: AttemptScopeRef, signal?: AbortSignal) => {
+					return await extensionRunner.emitBeforeProviderRequest(payload, scope, signal);
 				}
 			: undefined;
 		const onResponse: SimpleStreamOptions["onResponse"] | undefined = extensionRunner
-			? async (response, model, scope) => {
-					await extensionRunner.emitAfterProviderResponse(response, model, scope);
+			? async (response, model, scope, signal) => {
+					await extensionRunner.emitAfterProviderResponse(response, model, scope, signal);
 				}
 			: undefined;
 
@@ -4491,6 +4619,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 								const reloaded = await loadSkills({
 									...settings.getGroup("skills"),
 									agentDir,
+									profileAuthority,
 									cwd: reloadCwd,
 									disabledExtensions: settings.get("disabledExtensions"),
 								});

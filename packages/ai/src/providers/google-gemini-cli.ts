@@ -354,7 +354,12 @@ export const streamGoogleGeminiCli: StreamFunction<"google-gemini-cli"> = (
 			const endpoints = baseUrl ? [baseUrl] : isAntigravity ? ANTIGRAVITY_ENDPOINT_FALLBACKS : [DEFAULT_ENDPOINT];
 
 			let requestBody = buildRequest(model, context, projectId, options, isAntigravity);
-			const replacementPayload = await options?.onPayload?.(requestBody, model, options?.attemptScope);
+			const replacementPayload = await options?.onPayload?.(
+				requestBody,
+				model,
+				options?.attemptScope,
+				options?.signal,
+			);
 			if (replacementPayload !== undefined) {
 				requestBody = replacementPayload as typeof requestBody;
 			}

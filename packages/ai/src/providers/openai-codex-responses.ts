@@ -717,8 +717,16 @@ async function buildCodexRequestContext(
 	const baseUrl = model.baseUrl || CODEX_BASE_URL;
 	const url = resolveCodexResponsesUrl(baseUrl);
 	const promptCacheKey = normalizeOpenAIResponsesPromptCacheKey(options?.sessionId);
-	const transformedBody = await buildTransformedCodexRequestBody(model, context, options);
-	options?.onPayload?.(transformedBody, model, options?.attemptScope);
+	let transformedBody = await buildTransformedCodexRequestBody(model, context, options);
+	const replacementPayload = await options?.onPayload?.(
+		transformedBody,
+		model,
+		options?.attemptScope,
+		options?.signal,
+	);
+	if (replacementPayload !== undefined) {
+		transformedBody = replacementPayload as typeof transformedBody;
+	}
 
 	const requestHeaders = { ...(model.headers ?? {}), ...(options?.headers ?? {}) };
 	const rawRequestDump: RawHttpRequestDump = {
