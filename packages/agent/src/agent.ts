@@ -564,6 +564,7 @@ export class Agent {
 
 	/** Buffered Cursor tool results with text length at time of call (for correct ordering) */
 	#cursorToolResultBuffer: CursorToolResultEntry[] = [];
+	#cursorSplitTerminalMessages = new WeakSet<AssistantMessage>();
 	#terminalizedLogicalRunIds = new Set<ManagedLogicalRunId>();
 	#managedLogicalRunOwner?: ManagedLogicalRunId;
 	readonly resourceLedger: RunResourceLedger = createRunResourceLedger();
@@ -1017,6 +1018,14 @@ export class Agent {
 	discardRejectedAssistantEvent(message: AssistantMessage): void {
 		if (this.#state.streamMessage === message) this.#state.streamMessage = null;
 		if (this.#state.messages.at(-1) === message) this.popMessage();
+	}
+
+	restoreStreamMessageForSessionRollback(message: AgentMessage | null): void {
+		this.#state.streamMessage = message;
+	}
+
+	isCursorSplitTerminalMessage(message: AssistantMessage): boolean {
+		return this.#cursorSplitTerminalMessages.has(message);
 	}
 
 	createExternalEventEmitterForCurrentRun(): ((event: AgentEvent) => void) | undefined {
@@ -2569,6 +2578,7 @@ export class Agent {
 			...assistantMessage,
 			content: preambleContent,
 		};
+		this.#cursorSplitTerminalMessages.add(assistantMessage);
 
 		// Emit preamble
 		this.#state.streamMessage = null;
