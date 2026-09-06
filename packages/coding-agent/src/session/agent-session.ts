@@ -6476,12 +6476,13 @@ export class AgentSession {
 		}
 		const scopedKey = this.#attemptScopeKey(scope);
 		if (this.#retiredSessionIdentityAttemptScopeKeys.has(scopedKey)) return false;
+		if (!this.#attemptAuthority.isCurrent(scope)) return false;
 		if (this.#sessionIdentityEpoch === 0) {
 			this.#currentSessionIdentityAttemptScopeKeys.add(scopedKey);
 			return true;
 		}
 		if (this.#sessionIdentityEpoch > 0 && !this.#currentSessionIdentityAttemptScopeKeys.has(scopedKey)) return false;
-		return this.#attemptAuthority.isCurrent(scope);
+		return true;
 	}
 
 	#emitSessionOwnedExternalEvent(event: AgentEvent): void {
@@ -8428,22 +8429,16 @@ export class AgentSession {
 			if (otherId === toolCallId) continue;
 			for (const rule of otherBucket) claimedElsewhere.add(rule.name);
 		}
-		const newlyAdded: string[] = [];
 		for (const rule of rules) {
 			if (seen.has(rule.name) || claimedElsewhere.has(rule.name)) continue;
 			bucket.push(rule);
 			seen.add(rule.name);
-			newlyAdded.push(rule.name);
 		}
 		if (bucket.length === 0) return;
 		this.#perToolTtsrInjections.set(toolCallId, bucket);
-		// Claim the rules in the TTSR manager so subsequent deltas in this same
-		// turn (e.g. a sibling tool call's argument stream) don't re-match them.
-		// Persistence still happens in #ttsrAfterToolCall when the tool actually
-		// produces a result we can fold the reminder into.
-		if (newlyAdded.length > 0) {
-			this.#ttsrManager?.markInjectedByNames(newlyAdded);
-		}
+		// Same-turn sibling dedupe is owned by the per-tool buckets above. Do not
+		// mark the durable repeat gate until a tool actually dispatches and returns;
+		// cancelled or policy-blocked calls must remain eligible on a later turn.
 	}
 
 	/** `afterToolCall` hook: fold any per-tool TTSR reminders into the result. */
@@ -8454,9 +8449,9 @@ export class AgentSession {
 		const reminder = rules
 			.map(r => prompt.render(ttsrToolReminderTemplate, { name: r.name, path: r.path, content: r.content }))
 			.join("\n\n");
-		// The TTSR manager was already claimed at bucket time; only persistence remains.
 		const ruleNames = rules.map(r => r.name.trim()).filter(n => n.length > 0);
 		if (ruleNames.length > 0) {
+			this.#ttsrManager?.markInjectedByNames(ruleNames);
 			const records = this.#ttsrManager?.getInjectedRecords().filter(record => ruleNames.includes(record.name));
 			this.sessionManager.appendTtsrInjection(ruleNames, records, this.#ttsrManager?.getMessageCount());
 		}
@@ -14132,6 +14127,7 @@ export class AgentSession {
 			origin?: "turn" | "external";
 		},
 	): Promise<void> {
+		if (this.#terminalPersistenceRecovery) await this.#reconcileTerminalPersistenceFailure();
 		this.#assertRecoveryHydrationPromoted();
 		const appMessage: CustomMessage<T> = {
 			role: "custom",
@@ -16427,6 +16423,7 @@ export class AgentSession {
 			onMutationStarted?: () => void;
 		},
 	): Promise<void> {
+		await this.#reconcileTerminalPersistenceFailure();
 		const previousEditMode = this.#resolveActiveEditMode();
 		const apiKey = await this.#modelRegistry.getApiKey(model, this.credentialSessionId);
 		if (!apiKey) {
@@ -16969,6 +16966,7 @@ export class AgentSession {
 		model: Model | undefined,
 		thinkingLevel: ThinkingLevel | undefined,
 	): Promise<void> {
+		await this.#reconcileTerminalPersistenceFailure();
 		if (model) {
 			await this.setModelTemporary(model, thinkingLevel, { cause: "rollback", reason: "other" });
 			return;
@@ -21580,10 +21578,14 @@ export class AgentSession {
 								return;
 							}
 							const transitionEpoch = this.#sessionIdentityEpoch;
-							if (!(await this.#awaitSessionTransitionDisposition(transitionEpoch))) {
+							if (
+								this.#sessionTransitionSettlement &&
+								!(await this.#awaitSessionTransitionDisposition(transitionEpoch))
+							) {
 								await restoreOwnedTransition();
 								return;
 							}
+							this.#assertNoSessionTransition();
 							const continuation = this.agent.continue({
 								...this.#managedFallbackPromptOptions(),
 								transientRecoveryMessage: this.#escapedNonAsciiRecoveryMessage(),
@@ -21628,8 +21630,13 @@ export class AgentSession {
 				continuation: async ownership => {
 					if (attemptCancelled() || !ownership.isCurrent() || ownership.lease.signal.aborted) return;
 					const transitionEpoch = this.#sessionIdentityEpoch;
-					if (!(await this.#awaitSessionTransitionDisposition(transitionEpoch))) return;
+					if (
+						this.#sessionTransitionSettlement &&
+						!(await this.#awaitSessionTransitionDisposition(transitionEpoch))
+					)
+						return;
 					if (attemptCancelled() || !ownership.isCurrent() || ownership.lease.signal.aborted) return;
+					this.#assertNoSessionTransition();
 					await this.agent.continue({
 						...this.#managedFallbackPromptOptions(),
 						transientRecoveryMessage: this.#escapedNonAsciiRecoveryMessage(),
@@ -22593,8 +22600,13 @@ export class AgentSession {
 						return;
 					}
 					const transitionEpoch = this.#sessionIdentityEpoch;
-					if (!(await this.#awaitSessionTransitionDisposition(transitionEpoch))) return;
+					if (
+						this.#sessionTransitionSettlement &&
+						!(await this.#awaitSessionTransitionDisposition(transitionEpoch))
+					)
+						return;
 					if (retryCancelled() || ownershipCancelled()) return;
+					this.#assertNoSessionTransition();
 					await this.agent.continue({
 						...this.#managedFallbackPromptOptions(),
 						onRunAccepted: (handle: AttemptRunHandle) => {
@@ -22870,6 +22882,7 @@ export class AgentSession {
 		onChunk?: (chunk: string) => void,
 		options?: { excludeFromContext?: boolean; onPersisted?: () => void },
 	): Promise<BashResult> {
+		await this.#reconcileTerminalPersistenceFailure();
 		const excludeFromContext = options?.excludeFromContext === true;
 		this.#markRetryReplayUnsafe();
 
@@ -23006,6 +23019,7 @@ export class AgentSession {
 		onChunk?: (chunk: string) => void,
 		options?: { excludeFromContext?: boolean; onPersisted?: () => void },
 	): Promise<PythonResult> {
+		await this.#reconcileTerminalPersistenceFailure();
 		const excludeFromContext = options?.excludeFromContext === true;
 		this.#markRetryReplayUnsafe();
 		const cwd = this.sessionManager.getCwd();

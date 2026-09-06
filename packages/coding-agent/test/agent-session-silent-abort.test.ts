@@ -219,7 +219,7 @@ describe("AgentSession silent-abort marker stamping", () => {
 	it("matches forced recovery by attempt scope after abort advances prompt generation", async () => {
 		fixture = await createSessionWithObfuscator();
 		const { session } = fixture;
-		const scope = { attemptId: "forced-orphan", generation: 1, lineage: "main" as const };
+		const { scope, dispose: disposeScope } = session.agent.mintSideAttemptScope();
 		const partial = makeStoppedAssistantMessage("forced partial");
 		session.agent.emitExternalEvent({ type: "message_start", message: partial, scope });
 		await session.awaitSessionSettlement();
@@ -239,6 +239,7 @@ describe("AgentSession silent-abort marker stamping", () => {
 		expect(recovered?.stopReason).toBe("aborted");
 		expect(recovered?.content).toEqual([{ type: "text", text: "forced partial" }]);
 		expect(recovered && getSessionMessageEntryId(recovered)).toBeDefined();
+		disposeScope();
 	});
 
 	it("canonically admits an authoritative external terminal without message_end", async () => {

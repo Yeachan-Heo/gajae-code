@@ -487,6 +487,7 @@ export class Agent {
 	#contextRevision = 0;
 	#attemptAuthority = createAttemptScopeAuthority();
 	#runHandles = new Map<number | ManagedLogicalRunId, AttemptRunHandle>();
+	#runScopes = new Map<number | ManagedLogicalRunId, Set<AttemptScope>>();
 
 	#listeners = new Set<(e: AgentEvent) => void>();
 	#externalEventAdmissionFence?: (event: AgentEvent) => boolean;
@@ -1839,6 +1840,7 @@ export class Agent {
 		this.#observeMainAttemptScope(scope);
 		const handle: AttemptRunHandle = { logicalRunId, scope };
 		this.#runHandles.set(logicalRunId, handle);
+		this.#runScopes.set(logicalRunId, new Set([scope]));
 		options?.onRunAccepted?.(handle, {
 			consumedQueuedMessages: options.consumedQueuedMessages ?? [],
 		});
@@ -1966,6 +1968,7 @@ export class Agent {
 				mint: () => {
 					const scope = this.#attemptAuthority.mintMain();
 					this.#observeMainAttemptScope(scope);
+					this.#runScopes.get(logicalRunId)?.add(scope);
 					return scope;
 				},
 			},
@@ -2408,12 +2411,14 @@ export class Agent {
 		if (this.#terminalizedLogicalRunIds.size > 256) {
 			this.#terminalizedLogicalRunIds.delete(this.#terminalizedLogicalRunIds.values().next().value!);
 		}
+		const runScopes = this.#runScopes.get(logicalRunId);
+		const terminalScope = runScopes ? [...runScopes].at(-1) : handle?.scope;
 		const terminalEvent: Extract<AgentEvent, { type: "agent_end" }> = event ?? {
 			type: "agent_end",
 			messages: [],
-			scope: handle?.scope,
+			scope: terminalScope,
 		};
-		if (handle) terminalEvent.scope = handle.scope;
+		if (terminalScope) terminalEvent.scope = terminalScope;
 		// The run is over: nothing will poll the steering queue again. Disown
 		// whatever it still holds — unconditionally, so no ownership exception can
 		// leave an ended run's steering behind for an unrelated run to consume —
@@ -2439,7 +2444,8 @@ export class Agent {
 				try {
 					this.resourceLedger.seal(resourceRunId);
 				} finally {
-					if (handle) this.#mainAttemptScopeObserver?.(handle.scope, false);
+					for (const scope of runScopes ?? []) this.#mainAttemptScopeObserver?.(scope, false);
+					this.#runScopes.delete(logicalRunId);
 					this.#runHandles.delete(logicalRunId);
 				}
 			}
