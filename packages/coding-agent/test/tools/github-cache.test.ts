@@ -10,7 +10,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
-import { getOrFetchIssue, getOrFetchPr } from "@gajae-code/coding-agent/tools/gh";
+import { getOrFetchIssue, getOrFetchPr, getOrFetchPrDiff } from "@gajae-code/coding-agent/tools/gh";
 import {
 	clearAll,
 	getCached,
@@ -36,6 +36,7 @@ beforeEach(async () => {
 
 afterEach(async () => {
 	resetCacheForTests();
+	vi.useRealTimers();
 	if (originalEnv === undefined) {
 		delete process.env.GJC_GITHUB_CACHE_DB;
 	} else {
@@ -43,6 +44,232 @@ afterEach(async () => {
 	}
 	vi.restoreAllMocks();
 	await fs.rm(tempDir, { recursive: true, force: true });
+});
+
+it("coalesces stale background refreshes per row and releases failed refreshes", async () => {
+	const now = Date.now();
+	const row = { repo: TEST_REPO, kind: "issue" as const, number: 77, includeComments: true };
+	putCached({ ...row, payload: "old", rendered: "old", sourceUrl: "url", fetchedAt: now - 2_000 });
+	const settings = Settings.isolated({ "github.cache.softTtlSec": 1, "github.cache.hardTtlSec": 60 });
+	const gate = Promise.withResolvers<{ payload: string; rendered: string; sourceUrl: string }>();
+	const fetchFresh = vi.fn(() => gate.promise);
+	const hits = await Promise.all(
+		Array.from({ length: 20 }, (_, index) =>
+			getOrFetchView({ ...row, repo: index % 2 ? TEST_REPO.toUpperCase() : TEST_REPO, settings, now, fetchFresh }),
+		),
+	);
+	expect(hits.map(hit => hit.status)).toEqual(Array(20).fill("stale"));
+	expect(hits.every(hit => hit.rendered === "old")).toBe(true);
+	expect(fetchFresh).toHaveBeenCalledTimes(1);
+	gate.reject(new Error("offline"));
+	await Bun.sleep(0);
+	const retry = vi.fn(async () => ({ payload: "new", rendered: "new", sourceUrl: "url" }));
+	await getOrFetchView({ ...row, settings, now, fetchFresh: retry });
+	await Bun.sleep(0);
+	expect(retry).toHaveBeenCalledTimes(1);
+	expect(getCached(row.repo, row.kind, row.number, row.includeComments)?.rendered).toBe("new");
+	putCached({ ...row, payload: "old", rendered: "old", fetchedAt: now - 2_000 });
+	await getOrFetchView({ ...row, settings, now, fetchFresh: retry });
+	await Bun.sleep(0);
+	expect(retry).toHaveBeenCalledTimes(2);
+});
+
+it("refreshes distinct cache identities independently", async () => {
+	const now = Date.now();
+	const settings = Settings.isolated({ "github.cache.softTtlSec": 1, "github.cache.hardTtlSec": 60 });
+	const base = { authKey: "a", repo: TEST_REPO, kind: "issue" as const, number: 78, includeComments: true };
+	const rows = [
+		base,
+		{ ...base, authKey: "b" },
+		{ ...base, repo: "owner/another" },
+		{ ...base, kind: "pr" as const },
+		{ ...base, number: 79 },
+		{ ...base, includeComments: false },
+	];
+	const gate = Promise.withResolvers<void>();
+	const fetchFresh = vi.fn(async () => {
+		await gate.promise;
+		return { payload: "new", rendered: "new", sourceUrl: "url" };
+	});
+	for (const row of rows) {
+		putCached({ ...row, payload: "old", rendered: "old", fetchedAt: now - 2_000 });
+	}
+	try {
+		await Promise.all(
+			rows.flatMap(row => [
+				getOrFetchView({ ...row, settings, now, fetchFresh }),
+				getOrFetchView({ ...row, settings, now, fetchFresh }),
+			]),
+		);
+		expect(fetchFresh).toHaveBeenCalledTimes(rows.length);
+	} finally {
+		gate.resolve();
+		await Bun.sleep(0);
+	}
+});
+
+for (const outcome of ["never", "resolve", "reject", "cooperative abort"] as const) {
+	it(`releases timed-out refreshes (${outcome})`, async () => {
+		vi.useFakeTimers();
+		const now = Date.now();
+		const row = { repo: TEST_REPO, kind: "issue" as const, number: 80, includeComments: true };
+		putCached({ ...row, payload: "old", rendered: "old", fetchedAt: now - 2_000 });
+		const settings = Settings.isolated({ "github.cache.softTtlSec": 1, "github.cache.hardTtlSec": 60 });
+		const gate = Promise.withResolvers<{ payload: string; rendered: string; sourceUrl: string }>();
+		let refreshSignal: AbortSignal | undefined;
+		const fetchFresh = vi.fn((signal?: AbortSignal) => {
+			refreshSignal = signal;
+			if (outcome === "cooperative abort") {
+				signal?.addEventListener("abort", () => gate.reject(signal.reason), { once: true });
+			}
+			return gate.promise;
+		});
+		await getOrFetchView({ ...row, settings, now, fetchFresh });
+		await getOrFetchView({ ...row, settings, now, fetchFresh });
+		expect(fetchFresh).toHaveBeenCalledTimes(1);
+		vi.advanceTimersByTime(30_001);
+		for (let index = 0; index < 6; index += 1) await Promise.resolve();
+		expect(refreshSignal?.aborted).toBe(true);
+		expect(refreshSignal?.reason).toBeInstanceOf(Error);
+		expect(refreshSignal?.reason.message).toBe("GitHub background refresh timed out");
+		expect(getCached(row.repo, row.kind, row.number, row.includeComments)?.rendered).toBe("old");
+		const retry = vi.fn(async () => ({ payload: "retry", rendered: "retry", sourceUrl: "url" }));
+		await getOrFetchView({ ...row, settings, now, fetchFresh: retry });
+		for (let index = 0; index < 6; index += 1) await Promise.resolve();
+		expect(retry).toHaveBeenCalledTimes(1);
+		if (outcome === "resolve") gate.resolve({ payload: "late", rendered: "late", sourceUrl: "url" });
+		if (outcome === "reject") gate.reject(new Error("late failure after timeout"));
+		for (let index = 0; index < 6; index += 1) await Promise.resolve();
+		expect(getCached(row.repo, row.kind, row.number, row.includeComments)?.rendered).toBe("retry");
+		// Bun's test runner also fails this case on any unhandled rejection.
+	});
+}
+
+it("clears the deadline timer after a successful fast refresh", async () => {
+	vi.useFakeTimers();
+	const setTimeoutSpy = vi.spyOn(globalThis, "setTimeout");
+	const clearTimeoutSpy = vi.spyOn(globalThis, "clearTimeout");
+	const now = Date.now();
+	const row = { repo: TEST_REPO, kind: "issue" as const, number: 85, includeComments: true };
+	putCached({ ...row, payload: "old", rendered: "old", fetchedAt: now - 2_000 });
+	const settings = Settings.isolated({ "github.cache.softTtlSec": 1, "github.cache.hardTtlSec": 60 });
+	let refreshSignal: AbortSignal | undefined;
+	await getOrFetchView({
+		...row,
+		settings,
+		now,
+		fetchFresh: async signal => {
+			refreshSignal = signal;
+			return { payload: "new", rendered: "new", sourceUrl: "url" };
+		},
+	});
+	for (let index = 0; index < 6; index += 1) await Promise.resolve();
+	expect(getCached(row.repo, row.kind, row.number, row.includeComments)?.rendered).toBe("new");
+	expect(setTimeoutSpy).toHaveBeenCalledTimes(1);
+	expect(clearTimeoutSpy).toHaveBeenCalledTimes(1);
+	expect(clearTimeoutSpy).toHaveBeenCalledWith(setTimeoutSpy.mock.results[0].value);
+	vi.advanceTimersByTime(30_001);
+	expect(refreshSignal?.aborted).toBe(false);
+});
+
+it("releases the refresh marker after a synchronous fetch throw", async () => {
+	const now = Date.now();
+	const row = { repo: TEST_REPO, kind: "issue" as const, number: 82, includeComments: true };
+	putCached({ ...row, payload: "old", rendered: "old", fetchedAt: now - 2_000 });
+	const settings = Settings.isolated({ "github.cache.softTtlSec": 1, "github.cache.hardTtlSec": 60 });
+	const fetchFresh = vi.fn(() => {
+		throw new Error("synchronous failure");
+	});
+	await getOrFetchView({ ...row, settings, now, fetchFresh });
+	await getOrFetchView({ ...row, settings, now, fetchFresh });
+	expect(fetchFresh).toHaveBeenCalledTimes(2);
+});
+
+it("keeps the new generation's marker when a retired refresh settles", async () => {
+	const now = Date.now();
+	const row = { repo: TEST_REPO, kind: "issue" as const, number: 84, includeComments: true };
+	const settings = Settings.isolated({ "github.cache.softTtlSec": 1, "github.cache.hardTtlSec": 60 });
+	const retired = Promise.withResolvers<{ payload: string; rendered: string; sourceUrl: undefined }>();
+	const current = Promise.withResolvers<{ payload: string; rendered: string; sourceUrl: undefined }>();
+	putCached({ ...row, payload: "old", rendered: "old", fetchedAt: now - 2_000 });
+	await getOrFetchView({ ...row, settings, now, fetchFresh: () => retired.promise });
+	resetCacheForTests();
+	const fetchFresh = vi.fn(() => current.promise);
+	try {
+		await getOrFetchView({ ...row, settings, now, fetchFresh });
+		retired.resolve({ payload: "retired", rendered: "retired", sourceUrl: undefined });
+		for (let index = 0; index < 6; index += 1) await Promise.resolve();
+		expect(getCached(row.repo, row.kind, row.number, row.includeComments)?.rendered).toBe("old");
+		await getOrFetchView({ ...row, settings, now, fetchFresh });
+		expect(fetchFresh).toHaveBeenCalledTimes(1);
+	} finally {
+		current.resolve({ payload: "current", rendered: "current", sourceUrl: undefined });
+		await Bun.sleep(0);
+	}
+	expect(getCached(row.repo, row.kind, row.number, row.includeComments)?.rendered).toBe("current");
+});
+
+for (const kind of ["issue", "pr", "pr-diff"] as const) {
+	it(`preserves caller cancellation in the ${kind} background refresh`, async () => {
+		const controller = new AbortController();
+		const gate = Promise.withResolvers<never>();
+		let refreshSignal: AbortSignal | undefined;
+		const capture = (_cwd: string, _args: string[], signal?: AbortSignal) => {
+			refreshSignal = signal;
+			return gate.promise;
+		};
+		vi.spyOn(git.github, "json").mockImplementation(capture);
+		vi.spyOn(git.github, "text").mockImplementation(capture);
+		putCached({
+			authKey: TEST_AUTH_KEY,
+			repo: TEST_REPO,
+			kind,
+			number: 83,
+			includeComments: false,
+			payload: {},
+			rendered: "old",
+			fetchedAt: Date.now() - 2_000,
+		});
+		const options = {
+			cwd: tempDir,
+			repo: TEST_REPO,
+			number: 83,
+			issue: "83",
+			includeComments: false,
+			cacheAuthKey: TEST_AUTH_KEY,
+			signal: controller.signal,
+			settings: Settings.isolated({ "github.cache.softTtlSec": 1, "github.cache.hardTtlSec": 60 }),
+		};
+		const lookup = kind === "issue" ? getOrFetchIssue : kind === "pr" ? getOrFetchPr : getOrFetchPrDiff;
+		try {
+			expect((await lookup(options)).status).toBe("stale");
+			expect(refreshSignal).toBeDefined();
+			expect(refreshSignal).not.toBe(controller.signal);
+			expect(refreshSignal?.aborted).toBe(false);
+			controller.abort(new Error("caller cancelled"));
+			expect(refreshSignal?.aborted).toBe(true);
+			expect(refreshSignal?.reason).toBe(controller.signal.reason);
+		} finally {
+			gate.reject(new Error("cleanup"));
+			await Bun.sleep(0);
+		}
+	});
+}
+
+it("does not let a late stale refresh overwrite a newer hard-expiry fetch", async () => {
+	const now = Date.now();
+	const row = { repo: TEST_REPO, kind: "issue" as const, number: 81, includeComments: true };
+	putCached({ ...row, payload: "old", rendered: "old", sourceUrl: "url", fetchedAt: now - 2_000 });
+	const settings = Settings.isolated({ "github.cache.softTtlSec": 1, "github.cache.hardTtlSec": 60 });
+	const stale = Promise.withResolvers<{ payload: string; rendered: string; sourceUrl: string }>();
+	await getOrFetchView({ ...row, settings, now, fetchFresh: () => stale.promise });
+	await Promise.resolve();
+	const fresh = vi.fn(async () => ({ payload: "new", rendered: "new", sourceUrl: "url" }));
+	await getOrFetchView({ ...row, settings, now: now + 70_000, fetchFresh: fresh });
+	stale.resolve({ payload: "late", rendered: "late", sourceUrl: "url" });
+	for (let index = 0; index < 6; index += 1) await Promise.resolve();
+	expect(fresh).toHaveBeenCalledTimes(1);
+	expect(getCached(row.repo, row.kind, row.number, row.includeComments)?.rendered).toBe("new");
 });
 
 function issuePayload(number: number, body: string) {
