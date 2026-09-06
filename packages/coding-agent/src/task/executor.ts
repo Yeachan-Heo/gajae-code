@@ -1730,7 +1730,12 @@ export async function runSubprocessOnce(options: ExecutorOptions): Promise<Singl
 			}
 			checkAbort();
 			if (!registryFromParent) {
-				await awaitAbortable(modelRegistry.refresh());
+				await awaitAbortable(
+					modelRegistry.refresh(
+						"online-if-uncached",
+						options.parentCredentialSessionId ?? options.parentSessionId,
+					),
+				);
 			} else {
 				logger.debug("runSubagent: reusing parent modelRegistry; skipping refresh");
 			}

@@ -17,6 +17,10 @@
 
 - Tool hot paths avoid overlap-table allocations for equal/append-only ACP output, redundant UTF-8 tail previews, repeated diagnostics suffix scans, and duplicate background GitHub-cache refreshes. Job polling now releases watches and timers when a progress callback throws.
 
+### Fixed
+
+- CLI startup now preserves saved account pins when handing authentication to the SDK. Catalog refreshes with a session use its effective credential pin, preventing a cached free OpenAI Codex account catalog from hiding Astra or Sol during paid-account profile startup. Generic injected SDK authentication keeps its existing isolation, and persisted session selections retain precedence over global pins.
+
 ## [0.16.4] - 2026-09-05
 ### Added
 

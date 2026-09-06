@@ -4,6 +4,10 @@
 
 - Maintenance reasoning now fails closed for Anthropic models routed through an unverified custom endpoint and for raw reasoning-enabled models without thinking metadata. This prevents unsupported thinking controls and avoids a synchronous missing-metadata crash before provider wire transformation.
 
+### Fixed
+
+- Credential-scoped model discovery now peeks the OAuth account selected for that session instead of falling back to unscoped pool ranking. An expired hard-pinned token returns unavailable rather than querying another account's catalog, while AUTO and callers without a scope retain their existing selection behavior.
+
 ## [0.16.4] - 2026-09-05
 
 ### Added
