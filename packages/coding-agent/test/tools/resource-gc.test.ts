@@ -457,6 +457,47 @@ describe("resource GC controller", () => {
 		});
 	}
 
+	it("does not fence an in-flight sample for a redundant enabled write", async () => {
+		const settings = Settings.isolated({
+			"memoryGuard.enabled": true,
+			"memoryGuard.checkIntervalMs": 30_000,
+			"memoryGuard.policyLimitMb": 100,
+			"browser.gc.enabled": false,
+			"computer.screenshotGc.enabled": false,
+		});
+		const snapshot = {
+			hardCapBytes: 200 * MB,
+			totalUsageBytes: 90 * MB,
+			parentBytes: 90 * MB,
+			source: "host" as const,
+		};
+		const pendingSample = Promise.withResolvers<typeof snapshot>();
+		let samples = 0;
+		const runGc = vi.fn();
+		const logWarn = vi.fn();
+		const deps = baseDeps({
+			memorySnapshot: () => (++samples === 1 ? pendingSample.promise : Promise.resolve(snapshot)),
+			runGc,
+			logWarn,
+		});
+		const unregister = registerResourceGcSession({ sessionId: "redundant-enabled", settings });
+		const pending = sweepOnce(deps);
+		try {
+			settings.set("memoryGuard.enabled", true);
+			pendingSample.resolve(snapshot);
+			await pending;
+			expect(runGc).toHaveBeenCalledTimes(1);
+			expect(logWarn.mock.calls.map(call => call[0])).toEqual(["Memory guard: GC threshold reached"]);
+
+			await sweepOnce(deps);
+			expect(samples).toBe(1);
+		} finally {
+			pendingSample.resolve(snapshot);
+			await pending;
+			unregister();
+		}
+	});
+
 	it("keeps other registered sessions eligible when one guard is disabled during sampling", async () => {
 		const settings = () =>
 			Settings.isolated({

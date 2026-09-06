@@ -106,7 +106,10 @@ const defaultDeps: ResourceGcDeps = {
 };
 
 // ── Controller state (process-global; tabs/browsers are module-global too) ──────────────────
-const activeSessions = new Map<string, { settings: Settings; cwd: () => string; memoryGuardGeneration: symbol }>();
+const activeSessions = new Map<
+	string,
+	{ settings: Settings; cwd: () => string; memoryGuardGeneration: symbol; memoryGuardEnabled: boolean }
+>();
 const scheduler = new MemoryGuardHost({
 	run: async () => {
 		await sweepOnce(deps);
@@ -141,7 +144,12 @@ function resolveSessionSweepIntervalMs(settings: Settings): number {
 export function registerResourceGcSession(reg: ResourceGcRegistration): () => void {
 	const registeredCwd = reg.cwd;
 	const cwd = typeof registeredCwd === "function" ? registeredCwd : () => registeredCwd ?? process.cwd();
-	const registration = { settings: reg.settings, cwd, memoryGuardGeneration: Symbol() };
+	const registration = {
+		settings: reg.settings,
+		cwd,
+		memoryGuardGeneration: Symbol(),
+		memoryGuardEnabled: resolveMemoryGuardPolicy(reg.settings).enabled,
+	};
 	activeSessions.set(reg.sessionId, registration);
 	const unregisterSchedule = scheduler.register({
 		ownerId: reg.sessionId,
@@ -149,8 +157,12 @@ export function registerResourceGcSession(reg: ResourceGcRegistration): () => vo
 	});
 	const unregisterSettings = reg.settings.onChanged(path => {
 		if (path === "memoryGuard.enabled") {
-			// Fence samples already in flight, even if the guard is re-enabled before they settle.
-			registration.memoryGuardGeneration = Symbol();
+			const enabled = resolveMemoryGuardPolicy(reg.settings).enabled;
+			if (enabled !== registration.memoryGuardEnabled) {
+				// Fence samples already in flight, even if the guard is re-enabled before they settle.
+				registration.memoryGuardGeneration = Symbol();
+				registration.memoryGuardEnabled = enabled;
+			}
 		}
 		if (
 			path === "memoryGuard.enabled" ||
