@@ -1054,6 +1054,21 @@ function sameSessionIdentity(
 	);
 }
 
+function sameSessionLegacyIdentity(
+	event: SessionIndexEvent,
+	expected: SessionIdentityExpectation,
+	expectedRoot: string,
+): boolean {
+	return (
+		sameSessionTuple(event, expected, expectedRoot) &&
+		event.pid === expected.pid &&
+		event.processIncarnation === expected.processIncarnation &&
+		event.hostIncarnation === expected.hostIncarnation &&
+		event.endpointMtimeMs === expected.endpointMtimeMs &&
+		event.lifecycleRequestId === expected.lifecycleRequestId
+	);
+}
+
 function supersededAtForIdentity(
 	events: readonly SessionIndexEvent[],
 	expected: SessionIdentityExpectation,
@@ -2007,6 +2022,29 @@ export class SessionIndex {
 				identity: identityKey(latest),
 				latest,
 				heartbeat: matching.findLast(event => event.type === "host_heartbeat"),
+			},
+			false,
+			this.#policy.clock(),
+		);
+	}
+
+	/** Resolves one retained file-bound identity for a legacy receipt that predates endpointFileId. */
+	findUniqueHistoricalFileBoundSessionIdentity(expected: SessionIdentityExpectation): IndexedSession | undefined {
+		const expectedRoot = resolveEquivalentPath(expected.stateRoot);
+		const matching = admitEvents(this.#events).admitted.filter(
+			event => event.endpointFileId !== undefined && sameSessionLegacyIdentity(event, expected, expectedRoot),
+		);
+		const fileIds = new Set(matching.map(event => event.endpointFileId!));
+		if (fileIds.size !== 1) return undefined;
+		const endpointFileId = [...fileIds][0]!;
+		const exact = matching.filter(event => event.endpointFileId === endpointFileId);
+		const latest = exact.findLast(event => event.type !== "host_heartbeat");
+		if (!latest) return undefined;
+		return projectIdentity(
+			{
+				identity: `${identityKey(latest)}\u0000${endpointFileId}`,
+				latest,
+				heartbeat: exact.findLast(event => event.type === "host_heartbeat"),
 			},
 			false,
 			this.#policy.clock(),
