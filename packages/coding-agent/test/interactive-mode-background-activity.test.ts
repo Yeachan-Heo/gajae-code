@@ -1,10 +1,14 @@
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
 import { stripVTControlCharacters } from "node:util";
-import { Agent } from "@gajae-code/agent-core";
+import { Agent, type AgentTool } from "@gajae-code/agent-core";
+import type { AssistantMessage, Model } from "@gajae-code/ai";
+import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
 import { AsyncJobManager } from "@gajae-code/coding-agent/async/job-manager";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { resetSettingsForTest, Settings } from "@gajae-code/coding-agent/config/settings";
+import { ExtensionRuntime, loadExtensionFromFactory } from "@gajae-code/coding-agent/extensibility/extensions/loader";
+import { ExtensionRunner } from "@gajae-code/coding-agent/extensibility/extensions/runner";
 import { EventController } from "@gajae-code/coding-agent/modes/controllers/event-controller";
 import {
 	InteractiveMode,
@@ -12,11 +16,18 @@ import {
 	tallyBackgroundActivity,
 } from "@gajae-code/coding-agent/modes/interactive-mode";
 import { initTheme } from "@gajae-code/coding-agent/modes/theme/theme";
-import { AgentSession, type AsyncJobSnapshotItem } from "@gajae-code/coding-agent/session/agent-session";
+import {
+	AgentSession,
+	type AgentSessionEvent,
+	type AsyncJobSnapshotItem,
+} from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
+import { EventBus } from "@gajae-code/coding-agent/utils/event-bus";
 import { Container, Loader } from "@gajae-code/tui";
 import { logger, postmortem, TempDir } from "@gajae-code/utils";
+import * as z from "zod/v4";
+import { VirtualTerminal } from "../../tui/test/virtual-terminal";
 import { FileLockTestHooks } from "../src/config/file-lock";
 import { ExtensionUiController } from "../src/modes/controllers/extension-ui-controller";
 import { SelectorController } from "../src/modes/controllers/selector-controller";
@@ -39,7 +50,7 @@ describe("interactive background activity indicator", () => {
 	let session: AgentSession;
 	let manager: AsyncJobManager;
 	let mode: InteractiveMode;
-	const pendingJobs: Array<ReturnType<typeof Promise.withResolvers<string>>> = [];
+	const pendingJobs: Array<{ resolve: (value: string) => void }> = [];
 
 	beforeAll(() => {
 		initTheme();
@@ -78,6 +89,233 @@ describe("interactive background activity indicator", () => {
 		authStorage?.close();
 		tempDir?.removeSync();
 		resetSettingsForTest();
+	});
+
+	async function startContinuingRun(recovery: "compaction" | "hook-veto" | "retry") {
+		mode.stop();
+		await session.dispose();
+		const modelRegistry = new ModelRegistry(authStorage);
+		const primary = modelRegistry.find("anthropic", "claude-sonnet-4-5");
+		const fallback = modelRegistry.find("openai", "gpt-4o-mini");
+		if (!primary || !fallback) throw new Error("Expected bundled continuation models");
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		authStorage.setRuntimeApiKey("openai", "test-key");
+		const sessionManager = SessionManager.create(tempDir.path(), tempDir.path());
+		const runtime = new ExtensionRuntime();
+		const extension = await loadExtensionFromFactory(
+			api => {
+				api.on("session_before_compact", async event =>
+					recovery === "hook-veto"
+						? { cancel: true }
+						: {
+								compaction: {
+									summary: "Earlier conversation compacted",
+									firstKeptEntryId: event.preparation.firstKeptEntryId,
+									tokensBefore: event.preparation.tokensBefore,
+								},
+							},
+				);
+			},
+			tempDir.path(),
+			new EventBus(),
+			runtime,
+		);
+		const firstTool = Promise.withResolvers<string>();
+		const continuedTool = Promise.withResolvers<string>();
+		pendingJobs.push(firstTool, continuedTool);
+		const toolParameters = z.object({ stage: z.enum(["initial", "continued"]) });
+		const tool: AgentTool<typeof toolParameters> = {
+			name: "activity_probe",
+			label: "Activity probe",
+			description: "Hold a deterministic tool execution for activity assertions",
+			parameters: toolParameters,
+			intent: args =>
+				args.stage === "initial" ? "Preparing continuation" : "Reviewing remaining responsibility boundaries",
+			execute: async (_id, args) => ({
+				content: [
+					{ type: "text", text: await (args.stage === "initial" ? firstTool.promise : continuedTool.promise) },
+				],
+			}),
+		};
+		let calls = 0;
+		const response = (model: Model, content: AssistantMessage["content"], totalTokens: number): AssistantMessage => ({
+			role: "assistant",
+			content,
+			api: model.api,
+			provider: model.provider,
+			model: model.id,
+			usage: {
+				input: totalTokens,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: content.some(part => part.type === "toolCall") ? "toolUse" : "stop",
+			timestamp: Date.now() + calls,
+		});
+		const agent = new Agent({
+			intentTracing: true,
+			getApiKey: () => "test-key",
+			initialState: { model: primary, systemPrompt: ["Test"], tools: [tool], messages: [] },
+			streamFn: model => {
+				const call = ++calls;
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(() => {
+					if (recovery === "retry" && call === 2) {
+						const message = {
+							...response(model, [], 0),
+							stopReason: "error" as const,
+							errorMessage: "rate limit exceeded",
+							errorStatus: 429,
+							transportFailure: { kind: "transport" as const, status: 429 },
+						};
+						stream.push({ type: "start", partial: message });
+						stream.push({ type: "error", reason: "error", error: message });
+						return;
+					}
+					const done = call === (recovery === "retry" ? 4 : 3);
+					const message = response(
+						model,
+						done
+							? [{ type: "text", text: "Finished continuation" }]
+							: [
+									{
+										type: "toolCall",
+										id: `probe-${call}`,
+										name: tool.name,
+										arguments: { stage: call === 1 ? "initial" : "continued" },
+									},
+								],
+						recovery !== "retry" && call === 1 ? 180_000 : 1_000,
+					);
+					stream.push({ type: "start", partial: message });
+					stream.push({ type: "done", reason: message.stopReason === "toolUse" ? "toolUse" : "stop", message });
+				});
+				return stream;
+			},
+		});
+		const settings = Settings.isolated({
+			"compaction.enabled": recovery !== "retry",
+			"compaction.strategy": "context-full",
+			"compaction.thresholdTokens": 100_000,
+			"compaction.keepRecentTokens": 10,
+			"contextPromotion.enabled": false,
+			"retry.baseDelayMs": 1,
+			"fallback.maxAttempts": 3,
+		});
+		settings.setModelRole("default", "anthropic/claude-sonnet-4-5");
+		session = new AgentSession({
+			agent,
+			sessionManager,
+			settings,
+			modelRegistry,
+			agentId: "0-Main",
+			extensionRunner: new ExtensionRunner([extension], runtime, tempDir.path(), sessionManager, modelRegistry),
+		});
+		if (recovery === "retry")
+			session.setConfiguredModelChain("default", ["anthropic/claude-sonnet-4-5", "openai/gpt-4o-mini"], "test");
+		session.setResourceSampler(() => ({ heapUsedBytes: 0, providerBytes: 0, messageCount: 0, imageBytes: 0 }));
+		for (let index = 0; index < 3; index++) {
+			agent.emitExternalEvent({
+				type: "message_end",
+				message: { role: "user", content: `Earlier request ${index}`, timestamp: Date.now() },
+			});
+			agent.emitExternalEvent({
+				type: "message_end",
+				message: response(primary, [{ type: "text", text: `Earlier response ${index}` }], 1_000),
+			});
+		}
+		await session.awaitSessionSettlement();
+		mode = new InteractiveMode(session, "test");
+		const terminal = new VirtualTerminal(100, 30);
+		mode.ui.terminal = terminal;
+		await mode.init();
+		const events: AgentSessionEvent[] = [];
+		session.subscribe(event => events.push(event));
+		const run = session.prompt("Continue working through recovery");
+		await waitFor(() => renderStatus(mode).includes("Preparing continuation"));
+		return { events, run, firstTool, continuedTool, terminal };
+	}
+
+	it.each([
+		"compaction",
+		"hook-veto",
+		"retry",
+	] as const)("keeps the working intent visible through a real %s continuation without agent_start", async recovery => {
+		const { events, run, firstTool, continuedTool, terminal } = await startContinuingRun(recovery);
+		try {
+			expect(renderStatus(mode)).toContain("Preparing continuation");
+			firstTool.resolve("first tool complete");
+			const recoveredToolId = recovery === "retry" ? "probe-3" : "probe-2";
+			await waitFor(() => mode.pendingTools.has(recoveredToolId) && !mode.autoCompactionLoader && !mode.retryLoader);
+			expect(events.filter(event => event.type === "agent_start")).toHaveLength(1);
+			expect(events.filter(event => event.type === "agent_end")).toHaveLength(0);
+			expect(
+				events.some(event => event.type === (recovery === "retry" ? "auto_retry_end" : "auto_compaction_end")),
+			).toBe(true);
+			expect(session.isStreaming).toBe(true);
+			expect(renderStatus(mode)).toContain("Reviewing remaining responsibility boundaries");
+			for (const width of [60, 100, 160]) {
+				terminal.resize(width, 30);
+				await terminal.waitForRender();
+				expect(terminal.getViewport().join("\n")).toContain("Reviewing remaining responsibility boundaries");
+			}
+			continuedTool.resolve("continued tool complete");
+			await run;
+			await session.waitForIdle();
+			await waitFor(() => mode.loadingAnimation === undefined);
+			expect(events.filter(event => event.type === "agent_end")).toHaveLength(1);
+			expect(renderStatus(mode)).toBe("");
+			await terminal.waitForRender();
+			expect(terminal.getViewport().join("\n")).not.toContain("Reviewing remaining responsibility boundaries");
+		} finally {
+			firstTool.resolve("cleanup");
+			continuedTool.resolve("cleanup");
+			await run;
+		}
+	});
+
+	it("retains foreground intent and background ownership across compaction and terminal cleanup", async () => {
+		const { run, firstTool, continuedTool } = await startContinuingRun("compaction");
+		const ownerId = session.getAgentId();
+		if (!ownerId) throw new Error("Expected owner");
+		const background = Promise.withResolvers<string>();
+		pendingJobs.push(background);
+		const jobId = manager.register("task", "continuation companion", () => background.promise, {
+			ownerId,
+			metadata: { subagent: { id: "compaction-companion", agent: "executor", agentSource: "bundled" } },
+		});
+		manager.registerSubagentRecord({
+			subagentId: "compaction-companion",
+			ownerId,
+			currentJobId: jobId,
+			historicalJobIds: [],
+			status: "running",
+			sessionFile: null,
+			resumable: false,
+		});
+		try {
+			await waitFor(() => renderStatus(mode).includes("1 subagent"));
+			firstTool.resolve("initial complete");
+			await waitFor(() => mode.pendingTools.has("probe-2") && !mode.autoCompactionLoader);
+			expect(renderStatus(mode)).toContain("Reviewing remaining responsibility boundaries");
+			expect(renderStatus(mode)).toContain("1 subagent");
+			expect(renderStatus(mode)).not.toContain("Background:");
+			continuedTool.resolve("continued complete");
+			await run;
+			await session.waitForIdle();
+			await waitFor(() => renderStatus(mode).includes("Background: 1 subagent"));
+			background.resolve("background complete");
+			await waitFor(() => mode.loadingAnimation === undefined);
+			expect(renderStatus(mode)).toBe("");
+		} finally {
+			firstTool.resolve("cleanup");
+			continuedTool.resolve("cleanup");
+			background.resolve("cleanup");
+			await run;
+		}
 	});
 
 	it("tallies and distinguishes foreground and background activity messages", () => {
@@ -200,19 +438,96 @@ describe("interactive background activity indicator", () => {
 		expect(quit).toHaveBeenCalledWith(0);
 	});
 
-	it("retires stale foreground activity across maintenance stop boundaries", async () => {
+	it.each([
+		"compaction",
+		"retry",
+	] as const)("does not resurrect terminal foreground activity after %s cleanup with stale streaming state", async recovery => {
 		mode.ensureLoadingAnimation();
 		Object.defineProperty(session, "isStreaming", { configurable: true, get: () => true });
 		const controller = new EventController(mode);
+		try {
+			await controller.handleEvent(
+				recovery === "compaction"
+					? { type: "auto_compaction_start", reason: "threshold", action: "context-full" }
+					: { type: "auto_retry_start", attempt: 1, maxAttempts: 3, delayMs: 1000, errorMessage: "rate limited" },
+			);
+			await controller.handleEvent({ type: "agent_end", messages: [], stopReason: "cancelled" });
+			await controller.handleEvent(
+				recovery === "compaction"
+					? {
+							type: "auto_compaction_end",
+							action: "context-full",
+							result: undefined,
+							aborted: true,
+							willRetry: false,
+						}
+					: { type: "auto_retry_end", success: false, attempt: 1, finalError: "cancelled" },
+			);
+			mode.syncActivityIndicator();
+			expect(mode.loadingAnimation).toBeUndefined();
+			expect(renderStatus(mode)).toBe("");
+		} finally {
+			controller.dispose();
+		}
+	});
 
-		await controller.handleEvent({ type: "auto_compaction_start", reason: "threshold", action: "context-full" });
-		mode.autoCompactionLoader?.stop();
-		mode.autoCompactionLoader = undefined;
-		mode.statusContainer.clear();
-		mode.syncActivityIndicator();
+	it("preserves foreground ownership across repeated retries and nested display suspension", async () => {
+		const controller = new EventController(mode);
+		mode.ensureLoadingAnimation();
+		mode.setWorkingMessage("Reviewing remaining responsibility boundaries");
+		const originalEscape = mode.editor.onEscape;
+		try {
+			for (const attempt of [1, 2]) {
+				await controller.handleEvent({
+					type: "auto_retry_start",
+					attempt,
+					maxAttempts: 3,
+					delayMs: 1000,
+					errorMessage: "rate limited",
+				});
+				expect(renderStatus(mode)).toContain(`Retrying (${attempt}/3)`);
+				expect(mode.statusContainer.children).toHaveLength(1);
+			}
+			const releaseOuter = mode.suspendActivityIndicator();
+			const releaseInner = mode.suspendActivityIndicator();
+			try {
+				await controller.handleEvent({ type: "auto_retry_end", success: true, attempt: 2 });
+				expect(renderStatus(mode)).toBe("");
+				releaseInner();
+				expect(renderStatus(mode)).toBe("");
+			} finally {
+				releaseInner();
+				releaseOuter();
+			}
+			expect(mode.editor.onEscape).toBe(originalEscape);
+			expect(mode.retryCountdownTimer).toBeUndefined();
+			expect(renderStatus(mode)).toContain("Reviewing remaining responsibility boundaries");
+			await controller.handleEvent({ type: "agent_end", messages: [] });
+			expect(renderStatus(mode)).toBe("");
+		} finally {
+			controller.dispose();
+		}
+	});
 
-		expect(mode.loadingAnimation).toBeUndefined();
-		expect(renderStatus(mode)).toBe("");
+	it.each([false, true])("keeps idle maintenance idle after completion (aborted=%s)", async aborted => {
+		const controller = new EventController(mode);
+		try {
+			await controller.handleEvent({ type: "auto_compaction_start", reason: "idle", action: "context-full" });
+			expect(renderStatus(mode)).toContain("Idle Auto context-full maintenance");
+			await controller.handleEvent({
+				type: "auto_compaction_end",
+				action: "context-full",
+				result: undefined,
+				aborted,
+				skipped: !aborted,
+				willRetry: false,
+			});
+			expect(session.isStreaming).toBe(false);
+			expect(mode.loadingAnimation).toBeUndefined();
+			expect(renderStatus(mode)).toBe("");
+		} finally {
+			controller.dispose();
+		}
 	});
 
 	it("preserves background activity and re-arms after settled terminal cleanup", async () => {

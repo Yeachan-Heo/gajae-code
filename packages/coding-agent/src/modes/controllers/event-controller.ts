@@ -16,6 +16,7 @@ import { ToolExecutionComponent, type ToolExecutionHandle } from "../../modes/co
 import { TtsrNotificationComponent } from "../../modes/components/ttsr-notification";
 import { getSymbolTheme, theme } from "../../modes/theme/theme";
 import {
+	clearInteractiveActivityIndicator,
 	type InteractiveModeContext,
 	stopInteractiveActivityIndicator,
 	syncInteractiveActivityIndicator,
@@ -1104,7 +1105,7 @@ export class EventController {
 		this.ctx.editor.onEscape = () => {
 			this.ctx.session.abortCompaction();
 		};
-		stopInteractiveActivityIndicator(this.ctx, { restoreBackground: false, foregroundSettled: true });
+		clearInteractiveActivityIndicator(this.ctx);
 		const reasonText =
 			event.reason === "overflow" ? "Context overflow detected, " : event.reason === "idle" ? "Idle " : "";
 		const actionLabel = event.action === "handoff" ? "Auto-handoff" : "Auto context-full maintenance";
@@ -1205,7 +1206,7 @@ export class EventController {
 				this.ctx.session.abortRetry();
 			}
 		};
-		stopInteractiveActivityIndicator(this.ctx, { restoreBackground: false, foregroundSettled: true });
+		clearInteractiveActivityIndicator(this.ctx);
 		// Stop any prior retry loader/timer before installing a new one.
 		this.ctx.retryLoader?.stop();
 		this.#clearRetryCountdown();
