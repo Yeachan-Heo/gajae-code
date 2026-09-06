@@ -7450,13 +7450,12 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				break;
 			let turn: TurnRecord | null = null;
 			try {
-				const transaction = await readSessionTransaction(questionPaths, entry.session_id);
-				if (!transaction) {
-					processedCursor = entry.session_id;
-					continue;
-				}
-				await assertPersistedSessionAuthority(transaction.canonical.session);
-				turn = await readActiveTurn(namespaceDir, entry.session_id);
+				// Endpoint identity admission may rewrite the canonical WAL and every
+				// endpoint-bearing turn reference. Do not discard that post-image and
+				// then consult the stale active-turn projection: acknowledgement and
+				// timeout decisions must use the canonical turn that survived admission.
+				await ensureQuestionTransaction(entry.session_id);
+				turn = await readCanonicalActiveTurn(entry.session_id);
 			} catch (error) {
 				if (
 					!(error instanceof Error) ||

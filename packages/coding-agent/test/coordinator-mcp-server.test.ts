@@ -3469,6 +3469,86 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 			mismatchServer.callTool("gjc_coordinator_read_coordination_status", { session_id: "visible-session" }),
 		).resolves.toMatchObject({ ok: false, error: { code: "endpoint_stale" } });
 	});
+	it("uses the canonical turn for zero-time watch acknowledgement decisions after endpoint-file migration", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const sessions = [
+			{
+				sessionId: "visible-session",
+				locator: { cwd: root, worktreeRoot: null, stateRoot: path.join(root, ".gjc", "state") },
+				live: true,
+				endpointGeneration: 1,
+				pid: 101,
+				endpointMtimeMs: 1,
+			},
+		];
+		const server = await createSdkControlServer(
+			root,
+			controls,
+			undefined,
+			undefined,
+			sessions,
+			undefined,
+			undefined,
+			{
+				promptAckTimeoutMs: 1,
+			},
+		);
+		await registerSdkSession(server, root);
+		const sent = await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "visible-session",
+			prompt: "preserve acknowledged turn",
+			idempotency_key: "canonical-zero-time-ack",
+			allow_mutation: true,
+		});
+		const turnId = String(sent.turn_id);
+		const projectionTurnPath = path.join(coordinatorNamespace(root), "turns", `${turnId}.json`);
+		const projectionTurn = JSON.parse(await fs.readFile(projectionTurnPath, "utf8")) as Record<string, unknown>;
+		const projectedDelivery = projectionTurn.delivery as Record<string, unknown>;
+		await fs.writeFile(
+			projectionTurnPath,
+			JSON.stringify({
+				...projectionTurn,
+				delivery: {
+					...projectedDelivery,
+					tmux_keys_sent: true,
+					prompt_acknowledged: false,
+					state: "tmux_keys_sent",
+					attempts: [
+						...(projectedDelivery.attempts as unknown[]),
+						{
+							delivered: true,
+							created_at: new Date(Date.now() - 1000).toISOString(),
+							reason: null,
+							channel: "tmux_keys",
+							tmux_keys_sent: true,
+						},
+					],
+				},
+			}),
+		);
+		const endpointPath = path.join(root, ".gjc", "state", "sdk", "visible-session.json");
+		const endpointStat = await fs.stat(endpointPath);
+		const endpointFileId = `${endpointStat.dev}:${endpointStat.ino}`;
+		(sessions[0] as Record<string, unknown>).endpointFileId = endpointFileId;
+		const cursor = await currentEventCursor(root);
+
+		const watched = await server.callTool("gjc_coordinator_watch_events", { after_seq: cursor, timeout_ms: 0 });
+		expect(watched).toMatchObject({ ok: true, events: [] });
+		const paths = coordinatorStatePaths(server.config.stateRoot, server.config.namespace.identity);
+		const migrated = await withSessionTransaction(paths, "visible-session", async transaction => transaction);
+		expect(migrated.canonical.session.broker.endpoint_file_id).toBe(endpointFileId);
+		await expect(
+			server.callTool("gjc_coordinator_read_turn", { session_id: "visible-session", turn_id: turnId }),
+		).resolves.toMatchObject({
+			ok: true,
+			turn: {
+				turn_id: turnId,
+				status: "active",
+				delivery: { prompt_acknowledged: true, state: "acknowledged" },
+			},
+		});
+	});
 	it("fails closed when a same-generation successor moves to a different broker workspace", async () => {
 		const root = await tempRoot();
 		const otherWorkspace = path.join(root, "successor-workspace");
