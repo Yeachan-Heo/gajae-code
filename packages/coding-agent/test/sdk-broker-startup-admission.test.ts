@@ -719,7 +719,7 @@ test("a default startup admitted late by the production broker stays inside the 
 				return Promise.withResolvers<void>().promise;
 			},
 		});
-		// No `readinessTimeoutMs`: the default request every ACP caller sends.
+		// No `readinessTimeoutMs`: the request shape of a caller that sizes nothing itself.
 		const queued = broker.handleRequest(
 			"session.create",
 			{ cwd: root, stateRoot: path.join(root, ".gjc", "state") },

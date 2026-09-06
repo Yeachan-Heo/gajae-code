@@ -256,10 +256,21 @@ export class JobTool implements AgentTool<typeof jobSchema, JobToolDetails> {
 				},
 			});
 		};
-		const progressTimer = onUpdate ? setInterval(emitProgress, PROGRESS_INTERVAL_MS) : undefined;
-		emitProgress();
+		const { promise: progressError, reject: rejectProgress } = Promise.withResolvers<never>();
+		racePromises.push(progressError);
+		let progressTimer: Timer | undefined;
 
 		try {
+			progressTimer = onUpdate
+				? setInterval(() => {
+						try {
+							emitProgress();
+						} catch (error) {
+							rejectProgress(error);
+						}
+					}, PROGRESS_INTERVAL_MS)
+				: undefined;
+			emitProgress();
 			if (signal) {
 				const { promise: abortPromise, resolve: abortResolve } = Promise.withResolvers<void>();
 				const onAbort = () => abortResolve();

@@ -101,6 +101,16 @@ const MAX_PROMPT_FRAME_BYTES = 256 * 1024;
  * envelope. A canonical-length UUID keeps the measurement equal to the real frame.
  */
 const PROMPT_FRAME_ID_PLACEHOLDER = "00000000-0000-4000-8000-000000000000";
+/**
+ * Readiness budget every ACP session launch requests, independent of MCP.
+ *
+ * Host cold start costs the same whether or not the client declared MCP servers,
+ * so leaving the MCP-less path on the broker's 10s default made it the only ACP
+ * launch that fails under ordinary concurrency: a second host starting beside the
+ * first measurably crosses that deadline, and the broker then reports the launch
+ * as `terminal_uncertain`, which an external client surfaces as a dead provider.
+ */
+const ACP_SESSION_READINESS_TIMEOUT_MS = ACP_MCP_LIFECYCLE_TIMEOUT_MS;
 
 type JsonObject = Record<string, unknown>;
 interface PromptWaiter {
@@ -1362,7 +1372,8 @@ export class AcpAgent implements Agent {
 				cwd: params.cwd,
 				target: { path: params.cwd },
 				...(this.#startupOptions?.modelPreset ? { modelPreset: this.#startupOptions.modelPreset } : {}),
-				...(mcpServers.length > 0 ? { mcpServers, readinessTimeoutMs: ACP_MCP_LIFECYCLE_TIMEOUT_MS } : {}),
+				readinessTimeoutMs: ACP_SESSION_READINESS_TIMEOUT_MS,
+				...(mcpServers.length > 0 ? { mcpServers } : {}),
 			},
 			randomUUID(),
 			mcpServers,
@@ -1418,7 +1429,8 @@ export class AcpAgent implements Agent {
 				sourceSessionId: params.sessionId,
 				sourceSessionPath: source,
 				target: { path: params.cwd },
-				...(mcpServers.length > 0 ? { mcpServers, readinessTimeoutMs: ACP_MCP_LIFECYCLE_TIMEOUT_MS } : {}),
+				readinessTimeoutMs: ACP_SESSION_READINESS_TIMEOUT_MS,
+				...(mcpServers.length > 0 ? { mcpServers } : {}),
 			},
 			randomUUID(),
 			mcpServers,
@@ -2268,7 +2280,8 @@ export class AcpAgent implements Agent {
 				sessionId: id,
 				sessionPath: saved,
 				target: { path: cwd },
-				...(mcpServers.length > 0 ? { mcpServers, readinessTimeoutMs: ACP_MCP_LIFECYCLE_TIMEOUT_MS } : {}),
+				readinessTimeoutMs: ACP_SESSION_READINESS_TIMEOUT_MS,
+				...(mcpServers.length > 0 ? { mcpServers } : {}),
 			},
 			randomUUID(),
 			mcpServers,

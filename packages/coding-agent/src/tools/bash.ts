@@ -186,8 +186,9 @@ function artifactReferenceIsReachable(text: string, result: BashResult | BashInt
 	);
 }
 
-function suffixPrefixOverlap(source: string, target: string): number {
+export function suffixPrefixOverlap(source: string, target: string): number {
 	if (source.length === 0 || target.length === 0) return 0;
+	if (target.startsWith(source)) return source.length;
 	const prefix = new Uint32Array(target.length);
 	for (let index = 1; index < target.length; index += 1) {
 		let length = prefix[index - 1] ?? 0;
