@@ -2213,19 +2213,60 @@ function promptTerminalEvidenceFromAgentEnd(event: unknown): PromptTerminalEvide
 			);
 		if (!assistant || typeof assistant !== "object") return { hasActivity: false };
 		const content = (assistant as { content?: unknown }).content;
+		// Missing usage is not evidence of a zero-token turn: some compatible
+		// providers omit usage entirely or report null. Malformed non-null usage
+		// must not inherit that compatibility path and independently prove success.
+		const hasUsage = Object.hasOwn(assistant, "usage");
+		const usage = hasUsage ? (assistant as { usage?: unknown }).usage : undefined;
+		const hasTokenActivity =
+			!hasUsage ||
+			usage === null ||
+			(typeof usage === "object" &&
+				!Array.isArray(usage) &&
+				typeof (usage as { totalTokens?: unknown }).totalTokens === "number" &&
+				Number.isFinite((usage as { totalTokens: number }).totalTokens) &&
+				(usage as { totalTokens: number }).totalTokens > 0);
 		if (typeof content === "string") {
 			const bounded = sanitizeTurnResultContent(content);
-			return { content: bounded, hasActivity: content.trim().length > 0 };
+			return { content: bounded, hasActivity: content.trim().length > 0 || hasTokenActivity };
 		}
 		if (Array.isArray(content)) {
-			const hasActivity = content.some(block => {
+			const hasContentActivity = content.some(block => {
 				if (block === null || typeof block !== "object") return false;
 				const type = (block as { type?: unknown }).type;
 				if (type === "text") {
 					const text = (block as { text?: unknown }).text;
 					return typeof text === "string" && text.trim().length > 0;
 				}
-				return typeof type === "string" && type.length > 0;
+				if (type === "thinking") {
+					const thinking = (block as { thinking?: unknown }).thinking;
+					return typeof thinking === "string" && thinking.trim().length > 0;
+				}
+				if (type === "redactedThinking") {
+					const data = (block as { data?: unknown }).data;
+					return typeof data === "string" && data.trim().length > 0;
+				}
+				if (type === "toolCall") {
+					const toolCall = block as {
+						id?: unknown;
+						name?: unknown;
+						arguments?: unknown;
+						incompleteArguments?: unknown;
+						incompleteArgumentsReason?: unknown;
+					};
+					return (
+						typeof toolCall.id === "string" &&
+						toolCall.id.trim().length > 0 &&
+						typeof toolCall.name === "string" &&
+						toolCall.name.trim().length > 0 &&
+						toolCall.arguments !== null &&
+						typeof toolCall.arguments === "object" &&
+						!Array.isArray(toolCall.arguments) &&
+						(toolCall.incompleteArguments === undefined || toolCall.incompleteArguments === false) &&
+						toolCall.incompleteArgumentsReason === undefined
+					);
+				}
+				return false;
 			});
 			const text = content
 				.filter(
@@ -2237,7 +2278,7 @@ function promptTerminalEvidenceFromAgentEnd(event: unknown): PromptTerminalEvide
 				)
 				.map(block => block.text)
 				.join("");
-			return { content: sanitizeTurnResultContent(text), hasActivity };
+			return { content: sanitizeTurnResultContent(text), hasActivity: hasContentActivity || hasTokenActivity };
 		}
 		return { content: sanitizeTurnResultContent(""), hasActivity: false };
 	} catch {
