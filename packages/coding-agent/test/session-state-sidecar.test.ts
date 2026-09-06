@@ -3939,7 +3939,9 @@ describe("coordinator runtime tool activity", () => {
 
 		// Far more concurrent calls than the public list holds. The private set is
 		// current state, not history, so none of them may be silently dropped.
-		const LIVE_CALLS = 65;
+		// Two full public windows plus one proves overflow without turning this
+		// correctness test into a benchmark of synced atomic state-file writes.
+		const LIVE_CALLS = 17;
 		for (let index = 0; index < LIVE_CALLS; index++) {
 			await toolEvent(stateFile, "start", {
 				at: new Date(Date.UTC(2026, 2, 1, 0, 0, index + 1)).toISOString(),
@@ -3954,22 +3956,33 @@ describe("coordinator runtime tool activity", () => {
 
 		// A duplicate start for a live call is idempotent; it never double-counts.
 		await toolEvent(stateFile, "start", { at: "2026-03-01T00:02:00.000Z", callId: "call-0", label: "bash" });
-		expect(await activityOf(stateFile)).toMatchObject({ seq: 66, active_tool_count: LIVE_CALLS });
+		expect(await activityOf(stateFile)).toMatchObject({ seq: LIVE_CALLS + 1, active_tool_count: LIVE_CALLS });
 
 		// call-0 is far outside the public top 8, but ending it still removes exactly
 		// one entry from the exact total.
 		await toolEvent(stateFile, "end", { at: "2026-03-01T00:02:01.000Z", callId: "call-0", label: "bash" });
-		expect(await activityOf(stateFile)).toMatchObject({ seq: 67, active_tool_count: 64, elapsed_ms: 120_000 });
+		expect(await activityOf(stateFile)).toMatchObject({
+			seq: LIVE_CALLS + 2,
+			active_tool_count: LIVE_CALLS - 1,
+			elapsed_ms: 120_000,
+		});
 
 		// A duplicate end and an unmatched end change nothing but the snapshot header.
 		await toolEvent(stateFile, "end", { at: "2026-03-01T00:02:02.000Z", callId: "call-0", label: "bash" });
 		await toolEvent(stateFile, "end", { at: "2026-03-01T00:02:03.000Z", callId: "never-started", label: "bash" });
-		expect(await activityOf(stateFile)).toMatchObject({ seq: 69, active_tool_count: 64, elapsed_ms: null });
+		expect(await activityOf(stateFile)).toMatchObject({
+			seq: LIVE_CALLS + 4,
+			active_tool_count: LIVE_CALLS - 1,
+			elapsed_ms: null,
+		});
 
 		// A missing call id cannot correlate, so it must not corrupt accounting.
 		await toolEvent(stateFile, "start", { at: "2026-03-01T00:02:04.000Z", label: "bash" });
 		await toolEvent(stateFile, "end", { at: "2026-03-01T00:02:05.000Z", callId: "   ", label: "bash" });
-		expect(await activityOf(stateFile)).toMatchObject({ seq: 71, active_tool_count: 64 });
+		expect(await activityOf(stateFile)).toMatchObject({
+			seq: LIVE_CALLS + 6,
+			active_tool_count: LIVE_CALLS - 1,
+		});
 
 		// Ending every remaining live call drains the set to exactly zero.
 		for (let index = 1; index < LIVE_CALLS; index++) {

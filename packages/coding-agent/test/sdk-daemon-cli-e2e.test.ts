@@ -455,7 +455,18 @@ describe("SDK session CLI", () => {
 		let selections = 0;
 		broker.handleRequest = async (operation, input, idempotencyKey) => {
 			const response = await originalHandleRequest(operation, input, idempotencyKey);
-			if (operation === "session.list" && input.resolveSessionId === session.id && selections === 0) {
+			const selectedTranscript = response.ok
+				? (response.result as { savedSession?: { id?: unknown; path?: unknown } } | undefined)?.savedSession
+				: undefined;
+			// Exact tail preflight also resolves this session id. Mutate only after the
+			// Broker has returned the identity-bound retained transcript selection.
+			if (
+				operation === "session.list" &&
+				input.resolveSessionId === session.id &&
+				selectedTranscript?.id === session.id &&
+				selectedTranscript?.path === session.path &&
+				selections === 0
+			) {
 				selections++;
 				await mutate(session);
 			}

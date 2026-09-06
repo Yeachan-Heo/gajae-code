@@ -147,15 +147,17 @@ function csiEnd(bytes: string, start: number): number | undefined {
  */
 function stripTerminalEraseControls(bytes: string): string {
 	let sanitized = "";
+	let spanStart = 0;
 	for (let index = 0; index < bytes.length; index += 1) {
 		const value = bytes.charCodeAt(index);
 		const isEscapeCsi = value === 0x1b && bytes.charCodeAt(index + 1) === 0x5b;
 		const isEightBitCsi = value === 0x9b;
-		if (value === 0x1b && index === bytes.length - 1) break;
-		if (!isEscapeCsi && !isEightBitCsi) {
-			sanitized += bytes[index];
-			continue;
+		if (value === 0x1b && index === bytes.length - 1) {
+			sanitized += bytes.slice(spanStart, index);
+			spanStart = bytes.length;
+			break;
 		}
+		if (!isEscapeCsi && !isEightBitCsi) continue;
 
 		const start = isEightBitCsi ? index + 1 : index + 2;
 		const end = csiEnd(bytes, start);
@@ -168,16 +170,19 @@ function stripTerminalEraseControls(bytes: string): string {
 				if (!CSI_PARAMETER(nextValue) && !CSI_INTERMEDIATE(nextValue)) break;
 				next += 1;
 			}
+			sanitized += bytes.slice(spanStart, index);
+			spanStart = next;
 			index = next - 1;
 			continue;
 		}
 		const final = bytes.charCodeAt(end);
-		if (final !== 0x4a && final !== 0x4b) {
-			sanitized += bytes.slice(index, end + 1);
+		if (final === 0x4a || final === 0x4b) {
+			sanitized += bytes.slice(spanStart, index);
+			spanStart = end + 1;
 		}
 		index = end;
 	}
-	return sanitized;
+	return spanStart === 0 ? bytes : sanitized + bytes.slice(spanStart);
 }
 type InputListenerResult = { consume?: boolean; data?: string } | undefined;
 type InputListener = (data: string) => InputListenerResult;
@@ -960,6 +965,20 @@ function hasDistinctPostContractionRows(
 	return false;
 }
 
+interface RenderPreparation {
+	callback?: () => void;
+	generation: number;
+	cancel?: () => void;
+}
+
+// Keep the public handle outside the enqueue scope: it must capture only the entry,
+// not the TUI or the original callback after the entry has been released.
+function createPreparationCancellation(entry: RenderPreparation): () => void {
+	return () => entry.cancel?.();
+}
+
+function cancelNoPreparation(): void {}
+
 /**
  * TUI - Main class for managing terminal UI with differential rendering
  */
@@ -1009,6 +1028,21 @@ export class TUI extends Container {
 	#nextRenderGeneration = 0;
 	#renderRequestedGeneration = 0;
 	#committedRenderGeneration = 0;
+	#preparations = new Set<RenderPreparation>();
+	#preparationSnapshot: Set<RenderPreparation> | undefined;
+	#preparationEpoch = 0;
+	#preparationDrainEpoch = -1;
+	#preparationDisposed = false;
+	#preparationInvalidating = false;
+	#preparationLifecycle: { invalidate: () => void; beforeStart: () => void } | undefined;
+	// A newer ordinary request may commit while an older nested preparation is still pending.
+	// Keep holes in the high-water mark, including for waiters registered after that commit.
+	#preparationBlocked = new Set<number>();
+	#commitHoles = new Set<number>();
+	// Terminal failures are sorted, disjoint inclusive ranges, not per-frame exclusions.
+	#failedPreparationRanges: Array<[number, number]> = [];
+	// Captured by queued terminal writes; never consult the mutable queue at write settlement.
+	#frameCommitExclusions = new Set<number>();
 	#renderCommitWaiters = new Map<number, Set<RenderCommitWaiter>>();
 	#lastRenderWriteSucceeded = false;
 	/** Generation whose render path is currently capturing terminal output. */
@@ -1161,6 +1195,14 @@ export class TUI extends Container {
 		return { ...TUI.#renderCounters };
 	}
 
+	getRenderPreparationStateForTest(): { pending: number; holes: number; failedRanges: number } {
+		return {
+			pending: this.#preparationBlocked.size,
+			holes: this.#commitHoles.size,
+			failedRanges: this.#failedPreparationRanges.length,
+		};
+	}
+
 	static #readDebugRedrawFlag(): boolean {
 		TUI.#renderCounters.debugRedrawEnvReads += 1;
 		return $pickflag("GJC_DEBUG_REDRAW", "PI_DEBUG_REDRAW");
@@ -1249,6 +1291,29 @@ export class TUI extends Container {
 	}
 
 	override dispose(): void {
+		if (this.#preparationDisposed) return;
+		this.#preparationDisposed = true;
+		this.#renderRequested = false;
+		this.#renderRequestedGeneration = 0;
+		this.#inputRenderPending = false;
+		this.#resizeRenderQueued = false;
+		this.#resizeRenderMutationQueued = false;
+		this.#renderMutationQueued = false;
+		this.#widthSettleRenderQueued = false;
+		this.#forcedRenderQueued = false;
+		this.#clearSixelProbeState();
+		if (this.#renderTimer) {
+			clearTimeout(this.#renderTimer);
+			this.#renderTimer = undefined;
+			if (renderMetrics.enabled) renderMetrics.setTimerGauge("tui.renderTimer", 0);
+		}
+		if (this.#widthSettleTimer) {
+			clearTimeout(this.#widthSettleTimer);
+			this.#widthSettleTimer = undefined;
+		}
+		this.#invalidatePreparations();
+		this.#preparationLifecycle = undefined;
+		this.#settleRenderCommitWaiters(false);
 		this.#unsubscribeTabWidthChange?.();
 		this.#unsubscribeTabWidthChange = undefined;
 		this.#finalizeRasterLeases("terminal-loss");
@@ -2314,6 +2379,7 @@ export class TUI extends Container {
 		return true;
 	}
 	start(): void {
+		if (this.#preparationDisposed) return;
 		this.#stopped = false;
 		this.#terminalUnavailable = false;
 		this.#clearMouseSelection();
@@ -2321,31 +2387,36 @@ export class TUI extends Container {
 		// Seed the observed width so a spurious post-start resize event (iTerm2 tab
 		// activation, the self-sent SIGWINCH after resume) is not read as a reflow.
 		this.#lastObservedWidth = this.terminal.columns;
-		this.terminal.setMouseEnabled?.(this.options.enableMouse === true);
-		this.terminal.start(
-			data => this.#handleInput(data),
-			() => {
-				const hadRasterLease = this.#rasterLeases.size > 0;
-				this.#revokeRasterLeases("resize");
-				// Only a pet raster lease needs refreshed cell metrics on resize; a
-				// plain resize keeps the historical byte stream (no cell query).
-				if (hadRasterLease) this.#queryCellSize(true);
-				this.invalidate();
-				if (this.#pendingTerminalCleanup.length > 0 || this.#rasterCleanup.size > 0) {
-					// Retained pet/cleanup output must be flushed before the resize
-					// repaint so it cannot interleave behind the new frame.
-					this.notifyTerminalLifecycle({
-						kind: "explicit-cleanup",
-						source: "tui",
-						terminalGeneration: this.#terminalGeneration,
-					}).then(result => {
-						if (result.stillPending === 0) this.requestResizeRender();
-					});
-				} else {
-					this.requestResizeRender();
-				}
-			},
-		);
+		try {
+			this.terminal.setMouseEnabled?.(this.options.enableMouse === true);
+			this.terminal.start(
+				data => this.#handleInput(data),
+				() => {
+					const hadRasterLease = this.#rasterLeases.size > 0;
+					this.#revokeRasterLeases("resize");
+					// Only a pet raster lease needs refreshed cell metrics on resize; a
+					// plain resize keeps the historical byte stream (no cell query).
+					if (hadRasterLease) this.#queryCellSize(true);
+					this.invalidate();
+					if (this.#pendingTerminalCleanup.length > 0 || this.#rasterCleanup.size > 0) {
+						// Retained pet/cleanup output must be flushed before the resize
+						// repaint so it cannot interleave behind the new frame.
+						this.notifyTerminalLifecycle({
+							kind: "explicit-cleanup",
+							source: "tui",
+							terminalGeneration: this.#terminalGeneration,
+						}).then(result => {
+							if (result.stillPending === 0) this.requestResizeRender();
+						});
+					} else {
+						this.requestResizeRender();
+					}
+				},
+			);
+		} catch (error) {
+			this.#markTerminalUnavailable();
+			throw error;
+		}
 		if (this.#pendingTerminalCleanup.length > 0 || this.#rasterCleanup.size > 0) {
 			void this.notifyTerminalLifecycle({
 				kind: "availability-restored",
@@ -2356,6 +2427,14 @@ export class TUI extends Container {
 		this.#hideCursor();
 		this.#querySixelSupport();
 		this.#queryCellSize();
+		if (this.#stopped || !this.terminalAvailable) return;
+		const epoch = this.#preparationEpoch;
+		if (!this.#callPreparation(this.#preparationLifecycle?.beforeStart, "beforeStart")) {
+			this.#invalidatePreparations();
+			if (!this.#stopped && this.terminalAvailable && !this.#preparationDisposed) this.requestRender(true);
+			return;
+		}
+		if (epoch !== this.#preparationEpoch || this.#stopped || !this.terminalAvailable) return;
 		this.requestRender(true);
 	}
 
@@ -2368,8 +2447,10 @@ export class TUI extends Container {
 	 * holding a session operation behind a dead renderer.
 	 */
 	waitForRenderCommit(generation: number, timeoutMs = 250): Promise<boolean> {
-		if (generation <= 0 || generation <= this.#committedRenderGeneration) return Promise.resolve(true);
-		if (this.#stopped || !this.terminalAvailable) return Promise.resolve(false);
+		if (this.#isFailedPreparation(generation)) return Promise.resolve(false);
+		if (generation <= 0 || (generation <= this.#committedRenderGeneration && !this.#commitHoles.has(generation)))
+			return Promise.resolve(true);
+		if (this.#stopped || !this.terminalAvailable || this.#preparationDisposed) return Promise.resolve(false);
 		return new Promise<boolean>(resolve => {
 			const waiter: RenderCommitWaiter = {
 				resolve,
@@ -2392,14 +2473,31 @@ export class TUI extends Container {
 		});
 	}
 
-	#settleRenderCommitWaiters(committed: boolean, generation = Number.POSITIVE_INFINITY): void {
-		if (committed) this.#committedRenderGeneration = Math.max(this.#committedRenderGeneration, generation);
+	#settleRenderCommitWaiters(
+		committed: boolean,
+		generation = Number.POSITIVE_INFINITY,
+		exclusions = this.#frameCommitExclusions,
+	): void {
+		if (committed) {
+			for (const blocked of exclusions) {
+				if (
+					blocked <= generation &&
+					blocked > this.#committedRenderGeneration &&
+					!this.#isFailedPreparation(blocked)
+				)
+					this.#commitHoles.add(blocked);
+			}
+			for (const hole of this.#commitHoles) {
+				if (hole <= generation && !exclusions.has(hole)) this.#commitHoles.delete(hole);
+			}
+			this.#committedRenderGeneration = Math.max(this.#committedRenderGeneration, generation);
+		}
 		for (const [waiterGeneration, waiters] of this.#renderCommitWaiters) {
-			if (committed && waiterGeneration > generation) continue;
+			if (committed && (waiterGeneration > generation || exclusions.has(waiterGeneration))) continue;
 			this.#renderCommitWaiters.delete(waiterGeneration);
 			for (const waiter of waiters) {
 				clearTimeout(waiter.timer);
-				waiter.resolve(committed);
+				waiter.resolve(committed && !this.#isFailedPreparation(waiterGeneration));
 			}
 		}
 	}
@@ -2440,6 +2538,7 @@ export class TUI extends Container {
 		this.#rasterLeases.clear();
 	}
 	#markTerminalUnavailable(settleRenderWaiters = true): void {
+		this.#invalidatePreparations();
 		this.#terminalGeneration++;
 		for (const record of this.#rasterCleanup.values()) record.terminalGeneration = this.#terminalGeneration;
 		this.#revokeRasterLeases("terminal-loss");
@@ -2676,6 +2775,7 @@ export class TUI extends Container {
 	}
 
 	stop(): void {
+		this.#invalidatePreparations();
 		// Invalidate every raster-queue body captured under the running epoch
 		// before any teardown: nothing queued before stop may write after
 		// restoration. Synchronous stop cleanup below writes directly.
@@ -2785,6 +2885,7 @@ export class TUI extends Container {
 	 * the last committed frame.
 	 */
 	requestResizeRender(): void {
+		if (this.#preparationDisposed) return;
 		// Width is tracked against the last OBSERVED terminal width, not against
 		// #previousWidth (the last committed frame). Those diverge whenever resize
 		// events coalesce inside one frame budget: a 100->90->100 burst would leave
@@ -2844,8 +2945,180 @@ export class TUI extends Container {
 		this.requestRenderWithGeneration(force, source);
 	}
 
+	/** Queue one synchronous preparation on the existing frame clock. Cancellation is idempotent. */
+	enqueueBeforeRender(callback: () => void): () => void {
+		if (this.#preparationDisposed || this.#preparationInvalidating || this.#stopped || !this.terminalAvailable)
+			return cancelNoPreparation;
+		const entry: RenderPreparation = { callback, generation: this.#nextRenderGeneration + 1 };
+		entry.cancel = () => {
+			entry.callback = undefined;
+			entry.cancel = undefined;
+			this.#preparations.delete(entry);
+			this.#preparationSnapshot?.delete(entry);
+			this.#preparationBlocked.delete(entry.generation);
+		};
+		this.#preparations.add(entry);
+		this.#preparationBlocked.add(entry.generation);
+		this.requestRenderWithGeneration(false, "preparation");
+		return createPreparationCancellation(entry);
+	}
+
+	/** One owner only: replacing or clearing it invalidates all old preparation work. */
+	setRenderPreparationLifecycleCallbacks(
+		callbacks: { invalidate: () => void; beforeStart: () => void } | undefined,
+	): void {
+		if (this.#preparationLifecycle === callbacks) return;
+		this.#invalidatePreparations();
+		this.#preparationLifecycle = this.#preparationDisposed ? undefined : callbacks;
+	}
+
+	#callPreparation(callback: (() => void) | undefined, where: string): boolean {
+		try {
+			callback?.();
+			return true;
+		} catch (error) {
+			logger.error("Render preparation failed", {
+				where,
+				error: error instanceof Error ? error.message : String(error),
+				stack: error instanceof Error ? error.stack : undefined,
+			});
+			return false;
+		}
+	}
+
+	#invalidatePreparations(): void {
+		this.#preparationEpoch++;
+		for (const generation of this.#preparationBlocked) this.#retirePreparation(generation);
+		for (const entry of this.#preparations) {
+			entry.callback = undefined;
+			entry.cancel = undefined;
+		}
+		for (const entry of this.#preparationSnapshot ?? []) {
+			entry.callback = undefined;
+			entry.cancel = undefined;
+		}
+		this.#preparations.clear();
+		this.#preparationSnapshot?.clear();
+		if (this.#preparationInvalidating) return;
+		this.#preparationInvalidating = true;
+		try {
+			this.#callPreparation(this.#preparationLifecycle?.invalidate, "invalidate");
+		} finally {
+			this.#preparationInvalidating = false;
+		}
+	}
+
+	#isFailedPreparation(generation: number): boolean {
+		let low = 0;
+		let high = this.#failedPreparationRanges.length;
+		while (low < high) {
+			const middle = (low + high) >>> 1;
+			const [start, end] = this.#failedPreparationRanges[middle];
+			if (generation < start) high = middle;
+			else if (generation > end) low = middle + 1;
+			else return true;
+		}
+		return false;
+	}
+
+	#retirePreparation(generation: number): void {
+		this.#preparationBlocked.delete(generation);
+		this.#commitHoles.delete(generation);
+		const ranges = this.#failedPreparationRanges;
+		let low = 0;
+		let high = ranges.length;
+		while (low < high) {
+			const middle = (low + high) >>> 1;
+			if (ranges[middle][1] < generation - 1) low = middle + 1;
+			else high = middle;
+		}
+		let start = generation;
+		let end = generation;
+		let next = low;
+		while (next < ranges.length && ranges[next][0] <= end + 1) {
+			start = Math.min(start, ranges[next][0]);
+			end = Math.max(end, ranges[next][1]);
+			next++;
+		}
+		ranges.splice(low, next - low, [start, end]);
+		const waiters = this.#renderCommitWaiters.get(generation);
+		this.#renderCommitWaiters.delete(generation);
+		for (const waiter of waiters ?? []) {
+			clearTimeout(waiter.timer);
+			waiter.resolve(false);
+		}
+	}
+
+	/** The only preparation boundary, before generation capture and all renderer reads. */
+	#renderPreparedFrame(): void {
+		if (this.#stopped || this.#preparationDisposed) return;
+		if (!this.terminalAvailable) {
+			this.#markTerminalUnavailable();
+			return;
+		}
+		const epoch = this.#preparationEpoch;
+		const snapshot = this.#preparations;
+		this.#preparations = new Set();
+		this.#preparationSnapshot = snapshot;
+		this.#preparationDrainEpoch = epoch;
+		try {
+			for (const entry of snapshot) {
+				if (epoch !== this.#preparationEpoch || this.#stopped || !this.terminalAvailable) break;
+				const callback = entry.callback;
+				entry.callback = undefined;
+				entry.cancel = undefined;
+				if (
+					callback &&
+					this.#callPreparation(callback, "beforeRender") &&
+					epoch === this.#preparationEpoch &&
+					!this.#stopped &&
+					this.terminalAvailable
+				) {
+					this.#preparationBlocked.delete(entry.generation);
+				} else if (callback) {
+					this.#retirePreparation(entry.generation);
+				}
+			}
+		} finally {
+			for (const entry of snapshot) {
+				entry.callback = undefined;
+				entry.cancel = undefined;
+			}
+			snapshot.clear();
+			this.#preparationSnapshot = undefined;
+		}
+		if (!this.terminalAvailable && !this.#stopped) this.#markTerminalUnavailable();
+		if (epoch !== this.#preparationEpoch || this.#stopped || !this.terminalAvailable || this.#preparationDisposed) {
+			if (!this.#stopped && this.terminalAvailable && !this.#preparationDisposed) this.#scheduleRender();
+			return;
+		}
+		const requestedGeneration = this.#renderRequestedGeneration;
+		this.#renderRequestedGeneration = 0;
+		this.#renderRequested = false;
+		this.#lastRenderAt = performance.now();
+		this.#lastRenderWriteSucceeded = false;
+		this.#frameCommitExclusions = new Set(this.#preparationBlocked);
+		const t0 = renderMetrics.now();
+		try {
+			this.#renderGenerationInProgress = requestedGeneration;
+			this.#doRender();
+			this.#commitRenderGeneration(requestedGeneration);
+		} finally {
+			this.#renderGenerationInProgress = 0;
+			this.#frameCommitExclusions = new Set();
+			if (renderMetrics.enabled) renderMetrics.recordRender(renderMetrics.now() - t0);
+			if (this.#preparations.size > 0 && epoch === this.#preparationEpoch) {
+				for (const entry of this.#preparations)
+					this.#renderRequestedGeneration = Math.max(this.#renderRequestedGeneration, entry.generation);
+				this.#renderRequested = true;
+				this.#scheduleRender();
+			}
+		}
+	}
+
 	#requestRenderWithScope(force: boolean, source: string, scope: "full" | "layout"): number {
 		const generation = ++this.#nextRenderGeneration;
+		if (this.#preparationDisposed) return generation;
 		this.#renderRequestedGeneration = Math.max(this.#renderRequestedGeneration, generation);
 		if (scope === "full") this.#renderScope = "full";
 		this.#requestRenderCore(force, source, generation);
@@ -2863,6 +3136,7 @@ export class TUI extends Container {
 	}
 
 	#requestRenderCore(force: boolean, source: string, generation: number): void {
+		if (this.#preparationDisposed) return;
 		if (!this.terminalAvailable) {
 			this.#markTerminalUnavailable();
 			return;
@@ -2905,6 +3179,7 @@ export class TUI extends Container {
 				this.#viewportTopRow = 0;
 				this.#maxLinesRendered = 0;
 			}
+			if (this.#preparationSnapshot && this.#preparationDrainEpoch === this.#preparationEpoch) return;
 			if (this.#renderTimer) {
 				clearTimeout(this.#renderTimer);
 				this.#renderTimer = undefined;
@@ -2916,20 +3191,12 @@ export class TUI extends Container {
 					this.#settleRenderCommitWaiters(false, generation);
 					return;
 				}
-				const requestedGeneration = this.#renderRequestedGeneration;
-				this.#renderRequestedGeneration = 0;
-				this.#renderRequested = false;
-				this.#lastRenderAt = performance.now();
-				this.#lastRenderWriteSucceeded = false;
-				const t0 = renderMetrics.now();
-				this.#renderGenerationInProgress = requestedGeneration;
-				this.#doRender();
-				this.#renderGenerationInProgress = 0;
-				this.#commitRenderGeneration(requestedGeneration);
-				if (renderMetrics.enabled) renderMetrics.recordRender(renderMetrics.now() - t0);
+				this.#renderPreparedFrame();
 			});
 			return;
 		}
+		// Preparation mutations join this frame; nested registrations get the next normal frame.
+		if (this.#preparationSnapshot && this.#preparationDrainEpoch === this.#preparationEpoch) return;
 		// Input-priority path: expedite so the keystroke echoes within the next tick
 		// instead of waiting for (or behind) the frame-budget timer. Re-entrant input
 		// requests in the same turn coalesce via #inputRenderPending, so at most one
@@ -2950,7 +3217,7 @@ export class TUI extends Container {
 	}
 
 	#scheduleRender(): void {
-		if (this.#stopped || this.#renderTimer || !this.#renderRequested) {
+		if (this.#preparationDisposed || this.#stopped || this.#renderTimer || !this.#renderRequested) {
 			return;
 		}
 		const elapsed = performance.now() - this.#lastRenderAt;
@@ -2961,17 +3228,7 @@ export class TUI extends Container {
 			if (this.#stopped || !this.#renderRequested) {
 				return;
 			}
-			const requestedGeneration = this.#renderRequestedGeneration;
-			this.#renderRequestedGeneration = 0;
-			this.#renderRequested = false;
-			this.#lastRenderAt = performance.now();
-			this.#lastRenderWriteSucceeded = false;
-			const t0 = renderMetrics.now();
-			this.#renderGenerationInProgress = requestedGeneration;
-			this.#doRender();
-			this.#renderGenerationInProgress = 0;
-			this.#commitRenderGeneration(requestedGeneration);
-			if (renderMetrics.enabled) renderMetrics.recordRender(renderMetrics.now() - t0);
+			this.#renderPreparedFrame();
 			if (this.#renderRequested) {
 				this.#scheduleRender();
 			}
@@ -2993,17 +3250,7 @@ export class TUI extends Container {
 			this.#renderTimer = undefined;
 			if (renderMetrics.enabled) renderMetrics.setTimerGauge("tui.renderTimer", 0);
 		}
-		const requestedGeneration = this.#renderRequestedGeneration;
-		this.#renderRequestedGeneration = 0;
-		this.#renderRequested = false;
-		this.#lastRenderAt = performance.now();
-		this.#lastRenderWriteSucceeded = false;
-		const t0 = renderMetrics.now();
-		this.#renderGenerationInProgress = requestedGeneration;
-		this.#doRender();
-		this.#renderGenerationInProgress = 0;
-		this.#commitRenderGeneration(requestedGeneration);
-		if (renderMetrics.enabled) renderMetrics.recordRender(renderMetrics.now() - t0);
+		this.#renderPreparedFrame();
 	}
 
 	#handleInput(data: string): void {
@@ -3798,6 +4045,7 @@ export class TUI extends Container {
 	#normalizeLinesForEmit(lines: string[], width: number, start = 0): string[] {
 		const widthCheckIndexes: number[] = [];
 		const widthCheckLines: string[] = [];
+		const retainedWidths: (number | undefined)[] = [];
 		for (let i = start; i < lines.length; i++) {
 			const line = lines[i];
 			if (TERMINAL.isImageLine(line)) continue;
@@ -3810,19 +4058,21 @@ export class TUI extends Container {
 				continue;
 			}
 			widthCheckIndexes.push(i);
-			widthCheckLines.push(normalized);
+			retainedWidths.push(entry.width);
+			if (entry.width === undefined) widthCheckLines.push(normalized);
 		}
 
 		const widths = widthCheckLines.length === 0 ? [] : visibleWidths(widthCheckLines);
 		const truncateIndexes: number[] = [];
 		const truncateLines: string[] = [];
+		let measuredIndex = 0;
 		for (let i = 0; i < widthCheckIndexes.length; i++) {
 			const lineIndex = widthCheckIndexes[i];
-			const normalized = widthCheckLines[i];
-			const measuredWidth = widths[i] ?? 0;
+			const entry = this.#normalizeLineForRender(lines[lineIndex]);
+			const { normalized } = entry;
+			const measuredWidth = retainedWidths[i] ?? widths[measuredIndex++] ?? 0;
+			entry.width = measuredWidth;
 			if (measuredWidth <= width) {
-				const entry = this.#normalizeLineForRender(lines[lineIndex]);
-				entry.width = measuredWidth;
 				this.#lineEmitWidthCache.set(entry.terminated, measuredWidth);
 				lines[lineIndex] = entry.terminated;
 				continue;
@@ -3831,7 +4081,9 @@ export class TUI extends Container {
 			const key = `${width}\0${normalized}`;
 			const cached = this.#lineTruncationCache.get(key);
 			if (cached !== undefined) {
-				this.#lineEmitWidthCache.set(cached, visibleWidth(cached));
+				if (!this.#lineEmitWidthCache.has(cached)) {
+					this.#lineEmitWidthCache.set(cached, visibleWidth(cached));
+				}
 				lines[lineIndex] = cached;
 				continue;
 			}
@@ -5607,11 +5859,12 @@ export class TUI extends Container {
 			? (bytes: string) => this.#writeRasterPreservingRenderIngress(bytes)
 			: (bytes: string) => this.#writeProtectedRenderIngress(bytes);
 		const renderGeneration = this.#renderGenerationInProgress;
+		const commitExclusions = this.#frameCommitExclusions;
 		const write = () => {
 			if (!writeIngress(buffer)) return false;
 			onBufferWritten?.();
 			this.#lastRenderWriteSucceeded = true;
-			if (renderGeneration > 0) this.#settleRenderCommitWaiters(true, renderGeneration);
+			if (renderGeneration > 0) this.#settleRenderCommitWaiters(true, renderGeneration, commitExclusions);
 			const emission = this.#postRenderEmitter?.();
 			if (emission) {
 				const overlay = typeof emission === "string" ? emission : emission.payload;

@@ -1,6 +1,6 @@
 import { afterAll, beforeEach, describe, expect, it, vi } from "bun:test";
 import type { AssistantMessage } from "@gajae-code/ai";
-import { Container, Spacer, Text } from "@gajae-code/tui";
+import { Container, Image, ImageProtocol, Spacer, setTerminalImageProtocol, TERMINAL, Text } from "@gajae-code/tui";
 import {
 	__markdownPerfCounters,
 	__setMarkdownNowForTest,
@@ -54,6 +54,31 @@ function countChildren(
 	return contentChildren(component).filter(child => child instanceof type).length;
 }
 
+async function withDeferredImages(run: (conversions: PromiseWithResolvers<string>[]) => Promise<void>): Promise<void> {
+	const originalImage = Bun.Image;
+	const originalProtocol = TERMINAL.imageProtocol;
+	const conversions: PromiseWithResolvers<string>[] = [];
+	class DeferredImage {
+		png(): { toBase64(): Promise<string> } {
+			return {
+				toBase64: () => {
+					const conversion = Promise.withResolvers<string>();
+					conversions.push(conversion);
+					return conversion.promise;
+				},
+			};
+		}
+	}
+	(Bun as unknown as { Image: typeof Bun.Image }).Image = DeferredImage as never;
+	setTerminalImageProtocol(ImageProtocol.Kitty);
+	try {
+		await run(conversions);
+	} finally {
+		(Bun as unknown as { Image: typeof Bun.Image }).Image = originalImage;
+		setTerminalImageProtocol(originalProtocol);
+	}
+}
+
 describe("AssistantMessageComponent streaming markdown", () => {
 	beforeEach(async () => {
 		clearRenderCache();
@@ -66,6 +91,143 @@ describe("AssistantMessageComponent streaming markdown", () => {
 	});
 	afterAll(() => {
 		__setMarkdownNowForTest(undefined);
+	});
+
+	it("does not enable stale-throttle repaint scheduling without an owner callback", () => {
+		const staleThrottle = vi.spyOn(Markdown.prototype, "setOnStaleThrottle");
+		let component: AssistantMessageComponent | undefined;
+		try {
+			const content = [
+				{ type: "text" as const, text: "text" },
+				{ type: "thinking" as const, thinking: "thinking" },
+			];
+			component = new AssistantMessageComponent(message(content));
+			component.updateContent(message(content), { streaming: true });
+			expect(staleThrottle.mock.calls.length).toBeGreaterThanOrEqual(4);
+			expect(staleThrottle.mock.calls.every(([callback]) => callback === undefined)).toBe(true);
+		} finally {
+			component?.dispose();
+			staleThrottle.mockRestore();
+		}
+	});
+
+	it.each([
+		"text",
+		"thinking",
+	] as const)("guards captured %s repaint callbacks without expiring finalized assistants", kind => {
+		const repaint = vi.fn();
+		const visibleMutation = vi.fn();
+		const staleThrottle = vi.spyOn(Markdown.prototype, "setOnStaleThrottle");
+		const block =
+			kind === "text"
+				? { type: "text" as const, text: "initial" }
+				: { type: "thinking" as const, thinking: "initial" };
+		let component: AssistantMessageComponent | undefined;
+		try {
+			component = new AssistantMessageComponent(message([block]), false, repaint, undefined, visibleMutation);
+			const markdown = contentChildren(component).find(child => child instanceof Markdown);
+			expect(markdown).toBeDefined();
+			if (!markdown) return;
+			component.updateContent(message([block]), { streaming: true });
+			if (block.type === "text") block.text = "updated";
+			else block.thinking = "updated";
+			component.updateContent(message([block]), { streaming: true });
+			component.updateContent(message([block]), { streaming: false });
+			expect(contentChildren(component)).toContain(markdown);
+			const callbacks = staleThrottle.mock.calls.map(([callback]) => callback);
+			expect(callbacks.length).toBeGreaterThanOrEqual(4);
+			expect(callbacks[0]).toBeTypeOf("function");
+			expect(new Set(callbacks).size).toBe(1);
+			repaint.mockClear();
+			callbacks[0]?.();
+			expect(repaint).toHaveBeenCalledTimes(1);
+			// Detach the cached child before disposal: its captured callback still belongs to the assistant.
+			component.updateContent(message([{ type: "text", text: "replacement" }]), { streaming: false });
+			component.dispose();
+			const disposedChildren = [...component.children];
+			repaint.mockClear();
+			visibleMutation.mockClear();
+			for (const callback of callbacks) callback?.();
+			component.setHideThinkingBlock(true);
+			component.setUsageInfo(message([]).usage);
+			component.setToolResultImages("read-1", [{ type: "image", data: "source", mimeType: "image/png" }]);
+			component.updateContent(message([{ type: "text", text: "must not resurrect" }]));
+			component.invalidate();
+			expect(component.children).toEqual(disposedChildren);
+			expect(repaint).not.toHaveBeenCalled();
+			expect(visibleMutation).not.toHaveBeenCalled();
+		} finally {
+			component?.dispose();
+			staleThrottle.mockRestore();
+		}
+	});
+
+	it.each(["success", "failure"] as const)("ignores late image %s after disposal", async outcome => {
+		await withDeferredImages(async conversions => {
+			const repaint = vi.fn();
+			const visibleMutation = vi.fn();
+			const component = new AssistantMessageComponent(
+				message([{ type: "text", text: "final" }]),
+				false,
+				repaint,
+				undefined,
+				visibleMutation,
+			);
+			component.setToolResultImages("read-1", [{ type: "image", data: "source", mimeType: "image/webp" }]);
+			expect(conversions).toHaveLength(1);
+			component.dispose();
+			repaint.mockClear();
+			visibleMutation.mockClear();
+			if (outcome === "success") conversions[0].resolve("converted");
+			else conversions[0].reject(new Error("conversion failed"));
+			await Promise.resolve();
+			await Promise.resolve();
+			expect(repaint).not.toHaveBeenCalled();
+			expect(visibleMutation).not.toHaveBeenCalled();
+		});
+	});
+
+	it.each([
+		"success",
+		"failure",
+	] as const)("ignores stale generation %s while completing a live finalized image", async outcome => {
+		await withDeferredImages(async conversions => {
+			const repaint = vi.fn();
+			const visibleMutation = vi.fn();
+			const block = { type: "text" as const, text: "streaming" };
+			const component = new AssistantMessageComponent(message([block]), false, repaint, undefined, visibleMutation);
+			try {
+				component.updateContent(message([block]), { streaming: true });
+				const images = [{ type: "image" as const, data: "source", mimeType: "image/webp" }];
+				component.setToolResultImages("read-1", images);
+				component.setToolResultImages("read-1", []);
+				component.setToolResultImages("read-1", images);
+				expect(conversions).toHaveLength(2);
+				block.text = "authoritative final";
+				component.updateContent(message([block]), { streaming: false });
+				const finalChildren = [...contentChildren(component)];
+				repaint.mockClear();
+				visibleMutation.mockClear();
+				if (outcome === "success") conversions[0].resolve("obsolete");
+				else conversions[0].reject(new Error("obsolete conversion"));
+				await Promise.resolve();
+				await Promise.resolve();
+				expect(contentChildren(component)).toEqual(finalChildren);
+				expect(repaint).not.toHaveBeenCalled();
+				expect(visibleMutation).not.toHaveBeenCalled();
+				conversions[1].resolve("fresh");
+				await Promise.resolve();
+				await Promise.resolve();
+				expect(contentChildren(component).some(child => child instanceof Image)).toBe(true);
+				expect(repaint).toHaveBeenCalledTimes(1);
+				expect(visibleMutation).toHaveBeenCalledTimes(1);
+				visibleMutation.mockClear();
+				component.updateContent(message([block]), { streaming: false });
+				expect(visibleMutation).not.toHaveBeenCalled();
+			} finally {
+				component.dispose();
+			}
+		});
 	});
 
 	it("only re-lexes the active block while earlier blocks are unchanged", () => {

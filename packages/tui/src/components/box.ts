@@ -161,13 +161,13 @@ export class Box implements Component {
 	}
 
 	#applyBg(line: string, width: number): string {
+		if (this.#bgFn) {
+			return applyBackgroundToLine(line, width, this.#bgFn);
+		}
 		const visLen = visibleWidth(line);
 		const padNeeded = Math.max(0, width - visLen);
 		const padded = line + padding(padNeeded);
 
-		if (this.#bgFn) {
-			return applyBackgroundToLine(padded, width, this.#bgFn);
-		}
 		return padded;
 	}
 }

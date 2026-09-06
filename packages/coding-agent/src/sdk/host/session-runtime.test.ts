@@ -5261,7 +5261,7 @@ describe("post-acceptance invocation terminalization", () => {
 		}
 	});
 
-	test("a later provider error enriches but never re-opens an already terminal prompt", async () => {
+	test("a later provider error never changes or re-opens an already terminal prompt", async () => {
 		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-terminalize-once-"));
 		try {
 			const inflight = Promise.withResolvers<void>();
@@ -5282,13 +5282,8 @@ describe("post-acceptance invocation terminalization", () => {
 			// A lifecycle frame arriving after the terminal must not resurrect the record either.
 			await harness.emit("agent_start");
 			const settled = await harness.query("turn.prompt_status", { commandId, turnId });
-			// The late reason attaches to the settled record, so `error` is the only field that may
-			// appear; status, terminalAt, and identity stay exactly as claimed.
-			const { error: _claimedReason, ...claimedTerminal } = claimed;
-			const { error: _lateReason, ...settledTerminal } = settled.result ?? {};
-			expect(settledTerminal).toEqual(claimedTerminal);
-			// The recorded reason is the sanitized late failure: never fabricated, never raw.
-			expect(settled.result?.error).toEqual({ code: "upstream_error", message: "Prompt submission failed." });
+			// A rejected submission after terminal publication is only a cleanup diagnostic.
+			expect(settled.result).toEqual(claimed);
 			await harness.stop();
 		} finally {
 			await Bun.sleep(50);
@@ -7144,4 +7139,51 @@ test("SDK-only host rebinds the steering snapshot when the requester's turn wins
 		await handlers.get("session_shutdown")?.({}, ctx);
 		await rm(cwd, { recursive: true, force: true });
 	}
+});
+
+describe("rejection terminalization idempotency", () => {
+	test("cleanup rejection after success preserves the sole correlated wire terminal and durable result", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-cleanup-rejection-"));
+		const cleanup = Promise.withResolvers<void>();
+		const harness = await invocationHarness("cleanup-rejection", cwd, {
+			sendUserMessage: async (_content, options) => {
+				await options?.onPreflightAcceptCommit?.();
+				await cleanup.promise;
+			},
+		});
+		const warning = spyOn(logger, "warn").mockImplementation(() => {});
+		try {
+			const accepted = await harness.control("turn.prompt", { text: "complete before cleanup" });
+			expect(accepted.ok).toBe(true);
+			const ids = { commandId: accepted.result?.commandId, turnId: accepted.result?.turnId };
+			await harness.emit("agent_start");
+			await harness.emit("agent_end", {
+				messages: [{ role: "assistant", content: [{ type: "text", text: "Completed." }], stopReason: "stop" }],
+			});
+			const before = await settledStatus(harness, "turn.result", { kind: "prompt", ...ids });
+			expect(before.status).toBe("terminal_ok");
+			cleanup.reject(new Error("post-turn cleanup failed"));
+			await Bun.sleep(50);
+			const after = await harness.query("turn.result", { kind: "prompt", ...ids });
+			expect(after.result).toEqual(before);
+			expect(warning).toHaveBeenCalledWith("SDK submission cleanup failed after terminal publication", {
+				kind: "prompt",
+				...ids,
+				error: { code: "internal", message: "Prompt submission failed." },
+			});
+			const correlated = harness.broadcasts.filter(
+				frame => (frame.payload as { commandId?: string } | undefined)?.commandId === ids.commandId,
+			);
+			expect(correlated.filter(frame => frame.kind === "agent_failed")).toHaveLength(0);
+			const terminals = correlated.filter(frame => frame.kind === "agent_end");
+			expect(terminals).toHaveLength(1);
+			expect(terminals[0]).toMatchObject({
+				payload: { ...ids, outcome: (before as { outcome?: unknown }).outcome },
+			});
+		} finally {
+			warning.mockRestore();
+			await harness.stop();
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
 });

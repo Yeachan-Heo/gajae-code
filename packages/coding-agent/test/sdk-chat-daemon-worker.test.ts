@@ -275,6 +275,9 @@ describe("chat daemon worker", () => {
 		expect(shouldPublishChatFrame({ type: "identity_header" }, "lean")).toBe(false);
 		expect(shouldPublishChatFrame({ type: "agent_start" }, "lean")).toBe(false);
 		expect(shouldPublishChatFrame({ type: "activity" }, "lean")).toBe(false);
+		expect(shouldPublishChatFrame({ type: "turn_stream", finalAnswer: true, text: "missing phase" }, "lean")).toBe(
+			false,
+		);
 		expect(
 			shouldPublishChatFrame(
 				{ type: "turn_stream", phase: "finalized", finalAnswer: true, text: "final answer" },
@@ -283,6 +286,7 @@ describe("chat daemon worker", () => {
 		).toBe(true);
 		expect(shouldPublishChatFrame({ type: "turn_stream", phase: "finalized", text: "lead-in" }, "lean")).toBe(false);
 		expect(shouldPublishChatFrame({ type: "identity_header" }, "verbose")).toBe(true);
+		expect(shouldPublishChatFrame({ type: "turn_stream", text: "protocol frame" }, "verbose")).toBe(true);
 	});
 
 	it("uses one publication identity for duplicate finalized answer frames", () => {
@@ -1118,6 +1122,7 @@ describe("chat daemon worker", () => {
 							authorizedUserId: "human",
 						},
 					},
+					presentation: { redact: false, verbosity: "lean" },
 				},
 			},
 			{
@@ -1586,6 +1591,7 @@ describe("chat daemon worker", () => {
 						url: host.endpoint.url,
 						token: host.endpoint.token,
 						endpointIdentity: {
+							dev: endpointIdentity.dev,
 							mtimeMs: host.endpointMtimeMs,
 							mtimeNs: endpointIdentity.mtimeNs,
 							ctimeNs: endpointIdentity.ctimeNs,

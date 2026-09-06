@@ -80,15 +80,39 @@ describe("repository binding (#2901)", () => {
 		);
 	});
 
-	it("rejects relativeSubdir that escapes with ..", () => {
-		expect(() =>
-			parseRepositoryBinding({
-				schema: REPOSITORY_BINDING_SCHEMA,
-				worktreeRoot: "/tmp/repo",
-				commonDir: "/tmp/repo/.git",
-				relativeSubdir: "../sibling",
-			}),
-		).toThrow(/relativeSubdir/);
+	it("rejects empty, absolute, and traversing relativeSubdir values", () => {
+		const binding = {
+			schema: REPOSITORY_BINDING_SCHEMA,
+			worktreeRoot: "/tmp/repo",
+			commonDir: "/tmp/repo/.git",
+		};
+		for (const relativeSubdir of ["", path.resolve(os.tmpdir(), "sibling"), "../sibling"]) {
+			expect(() => parseRepositoryBinding({ ...binding, relativeSubdir })).toThrow(/relativeSubdir/);
+		}
+	});
+
+	it("resolves canonical root binding without widening repository ownership", async () => {
+		const parent = await fsp.mkdtemp(path.join(os.tmpdir(), "gjc-repo-root-bind-"));
+		tempRoots.push(parent);
+		const root = path.join(parent, "repo");
+		const sibling = path.join(parent, "sibling");
+		await fsp.mkdir(root);
+		await fsp.mkdir(sibling);
+		await initGitRepo(root);
+		await fsp.writeFile(path.join(sibling, "secret.txt"), "outside\n");
+		await fsp.symlink(sibling, path.join(root, "sibling-link"), process.platform === "win32" ? "junction" : "dir");
+
+		const captured = await captureRepositoryBinding(root);
+		const resolved = await resolveTaskRepositoryBinding(root, { ...captured, relativeSubdir: "." });
+
+		expect(resolved.relativeSubdir).toBe(".");
+		expect(assertPathUnderRepositoryBinding(resolved, ".")).toBe(await fsp.realpath(root));
+		expect(() => assertPathUnderRepositoryBinding(resolved, "../sibling/secret.txt")).toThrow(
+			/escapes bound repository root/,
+		);
+		expect(() => assertPathUnderRepositoryBinding(resolved, "sibling-link/secret.txt")).toThrow(
+			/escapes bound repository root/,
+		);
 	});
 
 	it("stamps omitted task bindings from session cwd (no implicit unbound lane)", async () => {
@@ -102,7 +126,7 @@ describe("repository binding (#2901)", () => {
 		await assertExecutionRootMatchesRepositoryBinding(root, stamped);
 	});
 
-	it("rejects declared task binding that points at a sibling repo", async () => {
+	it("rejects declared root binding that points at a sibling repo", async () => {
 		const parent = await fsp.mkdtemp(path.join(os.tmpdir(), "gjc-repo-task-sib-"));
 		tempRoots.push(parent);
 		const left = path.join(parent, "left");
@@ -112,7 +136,7 @@ describe("repository binding (#2901)", () => {
 		await initGitRepo(left);
 		await initGitRepo(right);
 
-		const rightBinding = await captureRepositoryBinding(right);
+		const rightBinding = await captureRepositoryBinding(right, { relativeSubdir: "." });
 		await expect(resolveTaskRepositoryBinding(left, rightBinding)).rejects.toMatchObject({
 			code: "identity_mismatch",
 		});

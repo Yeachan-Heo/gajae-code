@@ -49,6 +49,7 @@ import type { ExecOptions, ExecResult } from "../../exec/exec";
 import type { CustomEditor } from "../../modes/components/custom-editor";
 import type { WorkflowGateEmitter } from "../../modes/shared/agent-wire/workflow-gate-broker";
 import type { Theme } from "../../modes/theme/theme";
+import type { AgentSessionEventListener } from "../../session/agent-session";
 import type {
 	ClientBridge,
 	ClientBridgePermissionOption,
@@ -530,6 +531,8 @@ export interface ExtensionContext {
 	getJobs(): unknown;
 	/** Subscribe to foreground-wait folds (`bash_folded`). Returns an unsubscribe function. */
 	onJobFold?(listener: (event: JobFoldEvent) => void): () => void;
+	/** Observe session events synchronously in producer order. Returns an unsubscribe function. */
+	onSessionEvent?(listener: AgentSessionEventListener): () => void;
 	/** Typed skill and mode controls exposed to the SDK host. */
 	invokeSkill?(
 		name: string,
@@ -750,6 +753,8 @@ export type { AgentEndEvent, TurnEndEvent, TurnStartEvent } from "../shared-even
 /** Fired when an agent loop starts. `sdkRunToken` is an internal SDK queue-owner binding. */
 export interface AgentStartEvent extends SharedAgentStartEvent {
 	sdkRunToken?: string;
+	/** Complete set of SDK queue owners consumed together by this run. */
+	sdkRunTokens?: string[];
 }
 
 /** Fired when an agent run fails before emitting agent_end. The error is the
@@ -1692,6 +1697,8 @@ export interface ExtensionContextActions {
 	getJobs?: () => unknown;
 	/** Subscribe to foreground-wait folds so the SDK host can publish `bash_folded`. Returns an unsubscribe. */
 	onJobFold?: (listener: (event: JobFoldEvent) => void) => () => void;
+	/** Ordered, synchronous AgentSession subscription, independent of async extension hooks. */
+	onSessionEvent?: (listener: AgentSessionEventListener) => () => void;
 	setSdkPermissionProvider?: (
 		provider:
 			| ((

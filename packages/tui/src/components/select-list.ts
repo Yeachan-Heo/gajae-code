@@ -241,9 +241,12 @@ export class SelectList implements Component {
 
 	#getPrimaryColumnWidth(): number {
 		const { min, max } = this.#getPrimaryColumnBounds();
-		const widestPrimary = this.#filteredItems.reduce((widest, item) => {
-			return Math.max(widest, visibleWidth(this.#getDisplayValue(item)) + PRIMARY_COLUMN_GAP);
-		}, 0);
+		if (min === max) return min;
+		let widestPrimary = 0;
+		for (const item of this.#filteredItems) {
+			widestPrimary = Math.max(widestPrimary, visibleWidth(this.#getDisplayValue(item)) + PRIMARY_COLUMN_GAP);
+			if (widestPrimary >= max) return max;
+		}
 
 		return clamp(widestPrimary, min, max);
 	}

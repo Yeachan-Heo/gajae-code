@@ -128,6 +128,15 @@ type AgentSessionEventHandlers = {
 	[E in AgentSessionEventKind]: (event: Extract<AgentSessionEvent, { type: E }>) => Promise<void>;
 };
 
+interface AssistantTextPresentation {
+	component: AssistantMessageComponent;
+	latestMessage: AssistantMessage;
+	sessionIdentity: InteractiveModeContext["session"];
+	sessionEpoch: number;
+	paintEpoch: number;
+	cancel: () => void;
+}
+
 export class EventController {
 	#lastReadGroup: ReadToolGroupComponent | undefined = undefined;
 	#lastThinkingCount = 0;
@@ -146,6 +155,16 @@ export class EventController {
 	#visibleTranscriptChanged = false;
 	#handlingEvent = false;
 	#eventQueue: Promise<void> = Promise.resolve();
+	#disposed = false;
+	#assistantTextSuspended = false;
+	#sessionPresentationEpoch = 0;
+	#paintEpoch = 0;
+	#pendingAssistantText: AssistantTextPresentation | undefined;
+	#assistantTextMutationScope: AssistantTextPresentation | undefined;
+	#assistantLifetimes = new WeakMap<
+		AssistantMessageComponent,
+		{ sessionIdentity: InteractiveModeContext["session"]; sessionEpoch: number }
+	>();
 
 	constructor(private ctx: InteractiveModeContext) {
 		this.#handlers = {
@@ -177,6 +196,8 @@ export class EventController {
 	}
 
 	dispose(): void {
+		this.#disposed = true;
+		this.resetAssistantTextPresentation();
 		this.#cancelIdleCompaction();
 		this.#clearRetryCountdown();
 		if (this.ctx.retryEscapeHandler) {
@@ -197,6 +218,104 @@ export class EventController {
 			this.ctx.retryLoader = undefined;
 		}
 		this.clearIrcExpiryTimers();
+	}
+
+	#cancelAssistantTextPresentation(): void {
+		const pending = this.#pendingAssistantText;
+		this.#pendingAssistantText = undefined;
+		pending?.cancel();
+	}
+
+	/** Temporary TUI stop discards scheduling, not historical assistant callback lifetimes. */
+	suspendAssistantTextPresentation(): void {
+		this.#assistantTextSuspended = true;
+		this.#paintEpoch += 1;
+		this.#cancelAssistantTextPresentation();
+	}
+
+	/** Rearm before the first restarted frame, even without a new provider event. */
+	resumeAssistantTextPresentation(): void {
+		this.#cancelAssistantTextPresentation();
+		this.#assistantTextSuspended = false;
+		const component = this.ctx.streamingComponent;
+		const message = this.ctx.streamingMessage;
+		if (component && message && this.#isLiveAssistant(component)) {
+			this.#queueAssistantText(component, message);
+		}
+	}
+
+	/** Session/transcript replacement invalidates callbacks before removing old children. */
+	resetAssistantTextPresentation(): void {
+		this.#sessionPresentationEpoch += 1;
+		this.#cancelAssistantTextPresentation();
+	}
+
+	#isLiveAssistant(component: AssistantMessageComponent): boolean {
+		const lifetime = this.#assistantLifetimes.get(component);
+		return (
+			!this.#disposed &&
+			!this.ctx.isStopped?.() &&
+			lifetime !== undefined &&
+			lifetime.sessionIdentity === this.ctx.session &&
+			lifetime.sessionEpoch === this.#sessionPresentationEpoch &&
+			this.ctx.chatContainer.hasLiveChild(component)
+		);
+	}
+
+	#isValidAssistantText(record: AssistantTextPresentation): boolean {
+		return (
+			!this.#assistantTextSuspended &&
+			this.#isLiveAssistant(record.component) &&
+			record.sessionIdentity === this.ctx.session &&
+			record.sessionEpoch === this.#sessionPresentationEpoch &&
+			record.paintEpoch === this.#paintEpoch &&
+			record.component === this.ctx.streamingComponent
+		);
+	}
+
+	#queueAssistantText(component: AssistantMessageComponent, latestMessage: AssistantMessage): void {
+		if (this.#assistantTextSuspended || !this.#isLiveAssistant(component)) return;
+		const pending = this.#pendingAssistantText;
+		if (pending && this.#isValidAssistantText(pending)) {
+			pending.latestMessage = latestMessage;
+			return;
+		}
+		this.#cancelAssistantTextPresentation();
+		const record: AssistantTextPresentation = {
+			component,
+			latestMessage,
+			sessionIdentity: this.ctx.session,
+			sessionEpoch: this.#sessionPresentationEpoch,
+			paintEpoch: this.#paintEpoch,
+			cancel: () => {},
+		};
+		this.#pendingAssistantText = record;
+		record.cancel = this.ctx.ui.enqueueBeforeRender(() => this.#flushAssistantText(record));
+	}
+
+	#flushAssistantText(record = this.#pendingAssistantText): void {
+		if (!record || this.#pendingAssistantText !== record) return;
+		this.#cancelAssistantTextPresentation();
+		if (!this.#isValidAssistantText(record)) return;
+		const previousScope = this.#assistantTextMutationScope;
+		this.#assistantTextMutationScope = record;
+		try {
+			record.component.updateContent(record.latestMessage, { streaming: true });
+		} finally {
+			this.#assistantTextMutationScope = previousScope;
+		}
+	}
+
+	#observeAssistantMutation(component: AssistantMessageComponent): void {
+		if (!this.#isLiveAssistant(component)) return;
+		const scope = this.#assistantTextMutationScope;
+		if (scope?.component === component && this.#isValidAssistantText(scope)) {
+			// Only this synchronous projection publishes before frame source selection.
+			// An unrelated awaited event retains its own dirty flag and settlement semantics.
+			this.ctx.recordVisibleTranscriptMutation?.();
+			return;
+		}
+		this.#observeVisibleTranscriptMutation();
 	}
 
 	#recordVisibleTranscriptMutation(): void {
@@ -292,9 +411,10 @@ export class EventController {
 	}
 
 	async #dispatchEvent(event: AgentSessionEvent): Promise<void> {
+		if (this.#disposed) return;
 		if (this.ctx.isStopped?.()) return;
 		if (!this.ctx.isInitialized) await this.ctx.init();
-		if (this.ctx.isStopped?.()) return;
+		if (this.#disposed || this.ctx.isStopped?.()) return;
 		this.#visibleTranscriptChanged = false;
 		this.#handlingEvent = true;
 		try {
@@ -462,18 +582,26 @@ export class EventController {
 			this.ctx.ui.requestRender();
 			this.#recordVisibleTranscriptMutation();
 		} else if (event.message.role === "assistant") {
+			this.#cancelAssistantTextPresentation();
 			this.#lastThinkingCount = 0;
 			this.#resetReadGroup();
 			this.#toolIntentCache.clear();
 			this.#thinkingContentIndices.clear();
-			this.ctx.streamingComponent = new AssistantMessageComponent(
+			const component: AssistantMessageComponent = new AssistantMessageComponent(
 				undefined,
 				this.ctx.hideThinkingBlock,
-				() => this.ctx.ui.requestRender(),
+				() => {
+					if (this.#isLiveAssistant(component)) this.ctx.ui.requestRender();
+				},
 				this.ctx.getAssistantViewportAnchorId?.(event.message),
-				() => this.#observeVisibleTranscriptMutation(),
+				() => this.#observeAssistantMutation(component),
 				this.ctx.session,
 			);
+			this.#assistantLifetimes.set(component, {
+				sessionIdentity: this.ctx.session,
+				sessionEpoch: this.#sessionPresentationEpoch,
+			});
+			this.ctx.streamingComponent = component;
 			this.ctx.streamingMessage = event.message;
 			addChatChild(this.ctx, this.ctx.streamingComponent);
 			this.ctx.streamingComponent.updateContent(this.ctx.streamingMessage, { streaming: true });
@@ -605,8 +733,20 @@ export class EventController {
 				transferSessionMessageIdentity([this.ctx.streamingMessage], [event.message]);
 			}
 			this.ctx.streamingMessage = event.message;
-			this.ctx.streamingComponent.updateContent(this.ctx.streamingMessage, { streaming: true });
 			const contentIndex = event.assistantMessageEvent?.contentIndex;
+			if (
+				event.assistantMessageEvent?.type === "text_delta" &&
+				typeof contentIndex === "number" &&
+				Number.isInteger(contentIndex) &&
+				contentIndex >= 0 &&
+				contentIndex < event.message.content.length &&
+				event.message.content[contentIndex]?.type === "text"
+			) {
+				this.#queueAssistantText(this.ctx.streamingComponent, event.message);
+			} else {
+				this.#cancelAssistantTextPresentation();
+				this.ctx.streamingComponent.updateContent(this.ctx.streamingMessage, { streaming: true });
+			}
 			const changedContent =
 				typeof contentIndex === "number" && contentIndex >= 0
 					? this.ctx.streamingMessage.content[contentIndex]
@@ -714,6 +854,7 @@ export class EventController {
 
 	async #handleMessageEnd(event: Extract<AgentSessionEvent, { type: "message_end" }>): Promise<void> {
 		if (event.message.role === "user") return;
+		if (event.message.role === "assistant") this.#cancelAssistantTextPresentation();
 		if (this.ctx.streamingComponent && event.message.role === "assistant") {
 			if (this.ctx.streamingMessage?.role === "assistant") {
 				transferSessionMessageIdentity([this.ctx.streamingMessage], [event.message]);
@@ -916,6 +1057,8 @@ export class EventController {
 	}
 
 	async #handleAgentEnd(event: Extract<AgentSessionEvent, { type: "agent_end" }>): Promise<void> {
+		this.#flushAssistantText();
+		this.#cancelAssistantTextPresentation();
 		this.ctx.setWorkingMessage(undefined);
 		stopInteractiveActivityIndicator(this.ctx, { foregroundSettled: true });
 		if (this.ctx.streamingComponent) {

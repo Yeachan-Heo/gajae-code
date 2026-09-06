@@ -944,6 +944,7 @@ export class UiHelpers {
 		this.ctx.pendingPythonComponents = this.ctx.pendingPythonComponents.filter(component =>
 			runningExecutionComponents.includes(component),
 		);
+		this.ctx.resetAssistantTextPresentation();
 		this.ctx.chatContainer.clear();
 
 		// Reuse a pre-built context when available (e.g. from navigateTree) to avoid a second O(N) walk.

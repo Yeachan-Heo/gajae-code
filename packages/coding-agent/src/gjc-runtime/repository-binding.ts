@@ -106,7 +106,7 @@ function normalizeRelativeSubdir(relative: string): string {
 		.replaceAll("\\", "/")
 		.replace(/^\.\/+/u, "")
 		.replace(/\/+$/u, "");
-	if (normalized === "" || normalized === ".") {
+	if (normalized === "") {
 		throw new RepositoryBindingError("invalid_binding", "relativeSubdir must be a non-empty relative path");
 	}
 	if (path.isAbsolute(normalized) || normalized.split("/").includes("..")) {

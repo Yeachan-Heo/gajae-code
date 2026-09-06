@@ -14,12 +14,25 @@
  *       → `updateContent` receives a message with `stopReason: "stop"`;
  *         `errorMessage` is NOT set (TTSR existing behavior unchanged).
  */
-import { describe, expect, it, vi } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import type { AssistantMessage } from "@gajae-code/ai";
+import { resetSettingsForTest, Settings } from "@gajae-code/coding-agent/config/settings";
 import { EventController } from "@gajae-code/coding-agent/modes/controllers/event-controller";
+import { initTheme } from "@gajae-code/coding-agent/modes/theme/theme";
 import type { InteractiveModeContext } from "@gajae-code/coding-agent/modes/types";
 import type { AgentSessionEvent } from "@gajae-code/coding-agent/session/agent-session";
 import { SILENT_ABORT_MARKER } from "@gajae-code/coding-agent/session/messages";
+import { Container } from "@gajae-code/tui";
+
+beforeEach(async () => {
+	resetSettingsForTest();
+	await Settings.init({ inMemory: true });
+	await initTheme(false);
+});
+afterEach(() => {
+	vi.restoreAllMocks();
+	resetSettingsForTest();
+});
 
 function makeAssistantMessage(overrides: Partial<AssistantMessage> = {}): AssistantMessage {
 	return {
@@ -51,11 +64,23 @@ function createFixture(opts: {
 	const setUsageInfo = vi.fn();
 	const streamingComponent = { updateContent, setUsageInfo };
 	const requestRender = vi.fn();
+	const preparations = new Set<() => void>();
+	const captured: Array<() => void> = [];
 
 	const ctx = {
 		isInitialized: true,
 		init: vi.fn(async () => {}),
-		ui: { requestRender },
+		ui: {
+			requestRender,
+			enqueueBeforeRender: (callback: () => void) => {
+				preparations.add(callback);
+				captured.push(callback);
+				return () => {
+					preparations.delete(callback);
+				};
+			},
+		},
+		chatContainer: new Container(),
 		statusLine: { invalidate: vi.fn() },
 		updateEditorTopBorder: vi.fn(),
 		streamingComponent,
@@ -68,10 +93,68 @@ function createFixture(opts: {
 	} as unknown as InteractiveModeContext;
 
 	const controller = new EventController(ctx);
-	return { controller, ctx, streamingComponent, requestRender };
+	return { controller, ctx, streamingComponent, requestRender, preparations, captured };
 }
 
 describe("EventController #handleMessageEnd abort labeling", () => {
+	for (const ending of ["success", "error", "visible", "silent", "ttsr"] as const) {
+		it(`queued text cannot supersede authoritative ${ending} finalization`, async () => {
+			const initial = makeAssistantMessage({ stopReason: "stop", content: [] });
+			const f = createFixture({ streamingMessage: initial, isTtsrAbortPending: ending === "ttsr" });
+			await f.controller.handleEvent({ type: "message_start", message: initial });
+			const component = f.ctx.streamingComponent!;
+			const projection = vi.spyOn(component, "updateContent");
+			const setUsageInfo = component.setUsageInfo.bind(component);
+			const usage = vi.spyOn(component, "setUsageInfo").mockImplementation(value => {
+				// The controller's authoritative final projection precedes usage.
+				expect(projection).toHaveBeenCalledTimes(1);
+				setUsageInfo(value);
+				// Real usage presentation reprojects the saved final message, not a queued delta.
+				expect(projection).toHaveBeenCalledTimes(2);
+			});
+			const draft = makeAssistantMessage({ stopReason: "stop" });
+			await f.controller.handleEvent({
+				type: "message_update",
+				message: draft,
+				assistantMessageEvent: { type: "text_delta", contentIndex: 0 },
+			} as never);
+			expect(projection).not.toHaveBeenCalled();
+			expect(f.preparations.size).toBe(1);
+			const final = makeAssistantMessage({
+				content: [{ type: "text", text: "authoritative final differs from draft" }],
+				stopReason: ending === "success" ? "stop" : ending === "error" ? "error" : "aborted",
+				errorMessage:
+					ending === "silent" ? SILENT_ABORT_MARKER : ending === "error" ? "provider failed" : undefined,
+			});
+			await f.controller.handleEvent({ type: "message_end", message: final });
+			expect(f.preparations.size).toBe(0);
+			expect(usage).toHaveBeenCalledTimes(1);
+			const finalProjectionCount = projection.mock.calls.length;
+			const finalRendered = component.render(80);
+			f.captured[0]!();
+			expect(projection).toHaveBeenCalledTimes(finalProjectionCount);
+			expect(component.render(80)).toEqual(finalRendered);
+			const [display, options] = projection.mock.calls[0]!;
+			for (const [projectedMessage, projectedOptions] of projection.mock.calls) {
+				expect(projectedMessage).toBe(display);
+				expect(projectedOptions).toEqual({ streaming: false });
+			}
+			expect(options).toEqual({ streaming: false });
+			expect(display.content).toEqual(final.content);
+			expect(display.stopReason).toBe(ending === "silent" || ending === "ttsr" ? "stop" : final.stopReason);
+			if (ending === "visible") expect(display.errorMessage).toBe("Operation aborted");
+			if (ending === "silent") expect(final.errorMessage).toBe(SILENT_ABORT_MARKER);
+			if (ending === "ttsr") expect(final.errorMessage).toBeUndefined();
+			if (ending === "error") expect(display.errorMessage).toBe("provider failed");
+			expect(usage).toHaveBeenCalledWith(final.usage);
+			expect(f.ctx.streamingComponent).toBeUndefined();
+			expect(f.ctx.streamingMessage).toBeUndefined();
+			f.controller.resumeAssistantTextPresentation();
+			expect(f.preparations.size).toBe(0);
+			expect(projection).toHaveBeenCalledTimes(finalProjectionCount);
+		});
+	}
+
 	it("C1: SILENT_ABORT_MARKER + aborted -> updateContent stopReason='stop', errorMessage NOT overwritten", async () => {
 		const message = makeAssistantMessage({
 			stopReason: "aborted",

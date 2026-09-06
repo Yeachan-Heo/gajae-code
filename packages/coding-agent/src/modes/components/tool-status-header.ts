@@ -854,12 +854,20 @@ export class StatusLineComponent implements Component {
 		// treats a null value as hidden, so gating here is behavior-identical.
 		const prSegmentActive =
 			effectiveSettings.leftSegments.includes("pr") || effectiveSettings.rightSegments.includes("pr");
+		const gitSegmentActive =
+			effectiveSettings.leftSegments.includes("git") || effectiveSettings.rightSegments.includes("git");
 		const commandSegmentActive =
 			effectiveSettings.leftSegments.includes("command") || effectiveSettings.rightSegments.includes("command");
 		const commandOptions = commandSegmentActive ? this.#trustedCommandOptions() : undefined;
-		const commandKey =
-			!previewOnly && commandOptions ? this.#refreshCommandInBackground(commandOptions) : this.#commandConfigKey;
-		if (!previewOnly && !commandKey) this.#disableCommandSegment();
+		let commandKey: string | undefined = this.#commandConfigKey;
+		if (!previewOnly) {
+			if (commandOptions) {
+				commandKey = this.#refreshCommandInBackground(commandOptions);
+			} else {
+				this.#disableCommandSegment();
+				commandKey = undefined;
+			}
+		}
 
 		return {
 			session: this.session,
@@ -877,19 +885,20 @@ export class StatusLineComponent implements Component {
 			sessionStartTime: this.#sessionStartTime,
 			git: {
 				branch: this.#getCurrentBranch(),
-				status: this.#getGitStatus(),
+				status: gitSegmentActive ? this.#getGitStatus() : null,
 				pr: prSegmentActive ? (previewOnly ? (this.#cachedPr ?? null) : this.#lookupPr()) : null,
 			},
 			usage: this.#cachedUsage,
-			command: commandSegmentActive
-				? {
-						output: this.#commandOutput,
-						failed: this.#commandFailed,
-						pending: previewOnly
-							? this.#commandOutput === null && !this.#commandFailed
-							: this.#commandInFlightKey === commandKey,
-					}
-				: undefined,
+			command:
+				commandSegmentActive && (previewOnly || commandKey !== undefined)
+					? {
+							output: this.#commandOutput,
+							failed: this.#commandFailed,
+							pending: previewOnly
+								? this.#commandOutput === null && !this.#commandFailed
+								: this.#commandInFlightKey === commandKey,
+						}
+					: undefined,
 		};
 	}
 

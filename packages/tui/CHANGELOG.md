@@ -2,6 +2,22 @@
 
 ## [Unreleased]
 
+### Performance
+
+- Avoid copying unchanged terminal-control spans, reuse retained row widths, consume only the first grapheme for cursor operations, stop select-list width scans at their bounds, and avoid redundant background-row padding.
+
+### Fixed
+
+- Markdown cache ownership now finalizes after styling callbacks, so reentrant text replacement cannot inherit stale rejection hints and streaming completion releases local parse tokens. Cache diagnostics measure insertion-time payload sizes; returned render arrays are borrowed and must not be mutated.
+- Streaming Markdown retains only its current parse locally instead of publishing partial documents to the shared render/parse caches. Completed documents remain reusable, with 8 MiB render, 8 MiB parse and 4 MiB highlight accounted-payload budgets and per-entry limits. The render-cache diagnostic now includes UTF-16 keys, full token graphs, styled lines and anchors; it is not a live heap/RSS measurement.
+- Markdown reflow avoids redundant parse-cache admissions and repeated accounting of already rejected normalized content, without retaining completed parse tokens. Render payload accounting uses its owned layout schema, and oversized highlighting inputs are rejected earlier while preserving byte/line limits and guard ordering.
+
+## [0.16.4] - 2026-09-05
+
+### Added
+
+- Added cancellable, one-shot `enqueueBeforeRender` preparation on the existing frame scheduler and a single-owner `setRenderPreparationLifecycleCallbacks` seam for invalidation and restart preparation. Stop, terminal loss, and disposal cancel stale work; restart preparation runs before the first forced frame without adding another streaming timer.
+
 ## [0.16.3] - 2026-09-04
 
 ## [0.16.2] - 2026-09-04

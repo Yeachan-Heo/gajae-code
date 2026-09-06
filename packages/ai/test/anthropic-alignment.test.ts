@@ -3,7 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as tls from "node:tls";
-import { Effort } from "@gajae-code/ai";
+import { clampThinkingLevelForModel, Effort } from "@gajae-code/ai";
 import {
 	applyClaudeToolPrefix,
 	buildAnthropicClientOptions,
@@ -860,13 +860,18 @@ describe("Anthropic request fingerprint alignment", () => {
 			hasTools: true,
 		});
 
-		expect(withoutTools.defaultHeaders["Anthropic-Beta"]).not.toContain("fine-grained-tool-streaming-2025-05-14");
-		expect(withCompatibleTools.defaultHeaders["Anthropic-Beta"]).not.toContain(
-			"fine-grained-tool-streaming-2025-05-14",
-		);
-		expect(withIncompatibleTools.defaultHeaders["Anthropic-Beta"]).toContain(
-			"fine-grained-tool-streaming-2025-05-14",
-		);
+		const withoutToolsHeaders = new Headers(withoutTools.defaultHeaders);
+		const withCompatibleToolsHeaders = new Headers(withCompatibleTools.defaultHeaders);
+		const withIncompatibleToolsHeaders = new Headers(withIncompatibleTools.defaultHeaders);
+		const withoutToolsBeta = withoutToolsHeaders.get("anthropic-beta");
+		const withCompatibleToolsBeta = withCompatibleToolsHeaders.get("anthropic-beta");
+		const withIncompatibleToolsBeta = withIncompatibleToolsHeaders.get("anthropic-beta");
+
+		expect(withoutToolsBeta).not.toBeNull();
+		expect(withoutToolsBeta).not.toContain("fine-grained-tool-streaming-2025-05-14");
+		expect(withCompatibleToolsBeta).not.toBeNull();
+		expect(withCompatibleToolsBeta).not.toContain("fine-grained-tool-streaming-2025-05-14");
+		expect(withIncompatibleToolsBeta).toContain("fine-grained-tool-streaming-2025-05-14");
 	});
 
 	it("uses Cloudflare AI Gateway authorization without Anthropic credential headers", () => {
@@ -882,9 +887,10 @@ describe("Anthropic request fingerprint alignment", () => {
 		expect(options.baseURL).toBe("https://gateway.ai.cloudflare.com/v1/account/gateway/anthropic");
 		expect(options.apiKey).toBeNull();
 		expect(options.authToken).toBeNull();
-		expect(options.defaultHeaders["cf-aig-authorization"]).toBe("Bearer cf-gateway-token");
-		expect(options.defaultHeaders.Authorization).toBeUndefined();
-		expect(options.defaultHeaders["X-Api-Key"]).toBeUndefined();
+		const defaultHeaders = new Headers(options.defaultHeaders);
+		expect(defaultHeaders.get("cf-aig-authorization")).toBe("Bearer cf-gateway-token");
+		expect(defaultHeaders.has("authorization")).toBe(false);
+		expect(defaultHeaders.has("x-api-key")).toBe(false);
 	});
 
 	it("keeps Cloudflare gateway auth authoritative over caller-supplied auth headers", () => {
@@ -904,9 +910,10 @@ describe("Anthropic request fingerprint alignment", () => {
 			dynamicHeaders: {},
 		});
 
-		expect(options.defaultHeaders["cf-aig-authorization"]).toBe("Bearer cf-gateway-token");
-		expect(options.defaultHeaders.Authorization).toBeUndefined();
-		expect(options.defaultHeaders["X-Api-Key"]).toBeUndefined();
+		const defaultHeaders = new Headers(options.defaultHeaders);
+		expect(defaultHeaders.get("cf-aig-authorization")).toBe("Bearer cf-gateway-token");
+		expect(defaultHeaders.has("authorization")).toBe(false);
+		expect(defaultHeaders.has("x-api-key")).toBe(false);
 	});
 
 	it("applies Claude Code TLS profile for direct Anthropic transport", () => {
@@ -954,10 +961,11 @@ describe("Anthropic request fingerprint alignment", () => {
 				});
 
 				expect(options.baseURL).toBe("https://foundry.example.com/anthropic");
-				expect(options.defaultHeaders.Authorization).toBe("Bearer foundry-token");
-				expect(options.defaultHeaders["X-Api-Key"]).toBeUndefined();
-				expect(options.defaultHeaders["user-id"]).toBe("alice");
-				expect(options.defaultHeaders["x-route"]).toBe("engineering");
+				const defaultHeaders = new Headers(options.defaultHeaders);
+				expect(defaultHeaders.get("authorization")).toBe("Bearer foundry-token");
+				expect(defaultHeaders.has("x-api-key")).toBe(false);
+				expect(defaultHeaders.get("user-id")).toBe("alice");
+				expect(defaultHeaders.get("x-route")).toBe("engineering");
 			},
 		);
 	});
@@ -1079,6 +1087,26 @@ describe("Anthropic request fingerprint alignment", () => {
 			{ thinkingEnabled: false },
 		)) as { thinking?: { type?: string } };
 
+		expect(payload.thinking).toBeUndefined();
+	});
+
+	it("omits wire thinking for unverified Anthropic reasoning transports", async () => {
+		const model: Model<"anthropic-messages"> = {
+			...ANTHROPIC_MODEL,
+			provider: "anthropic",
+			baseUrl: "http://proxy.invalid/v1",
+		};
+		const reasoning = clampThinkingLevelForModel(model, Effort.High);
+		const payload = (await captureAnthropicPayload(
+			model,
+			{
+				systemPrompt: ["Stay concise."],
+				messages: [{ role: "user", content: "Hi", timestamp: Date.now() }],
+			},
+			{ thinkingEnabled: reasoning !== undefined, reasoning },
+		)) as { thinking?: unknown };
+
+		expect(reasoning).toBeUndefined();
 		expect(payload.thinking).toBeUndefined();
 	});
 

@@ -10,20 +10,33 @@ import type {
 import { EventController } from "@gajae-code/coding-agent/modes/controllers/event-controller";
 import { initTheme } from "@gajae-code/coding-agent/modes/theme/theme";
 import type { InteractiveModeContext } from "@gajae-code/coding-agent/modes/types";
-import { type Component, Container, Text } from "@gajae-code/tui";
+import { type Component, Container, Editor, Text, TUI } from "@gajae-code/tui";
+import { renderMetrics } from "../../../../tui/src/metrics";
+import { defaultEditorTheme } from "../../../../tui/test/test-themes";
+import { VirtualTerminal } from "../../../../tui/test/virtual-terminal";
 
 function createContext(handle: ToolExecutionHandle): {
 	ctx: InteractiveModeContext;
 	addMessageToChat: Mock<() => Component[]>;
 	recordVisibleTranscriptMutation: Mock<() => void>;
+	drain: () => void;
 } {
 	const addMessageToChat = vi.fn<() => Component[]>(() => []);
 	const recordVisibleTranscriptMutation = vi.fn();
+	const preparations = new Set<() => void>();
 	const ctx = {
 		isInitialized: true,
 		statusLine: { invalidate: vi.fn() },
 		updateEditorTopBorder: vi.fn(),
-		ui: { requestRender: vi.fn() },
+		ui: {
+			requestRender: vi.fn(),
+			enqueueBeforeRender: (callback: () => void) => {
+				preparations.add(callback);
+				return () => {
+					preparations.delete(callback);
+				};
+			},
+		},
 		pendingTools: new Map([["tool-1", handle]]),
 		addMessageToChat,
 		recordVisibleTranscriptMutation,
@@ -33,7 +46,17 @@ function createContext(handle: ToolExecutionHandle): {
 		session: { getToolByName: vi.fn() },
 		sessionManager: { getCwd: vi.fn(() => process.cwd()) },
 	} as unknown as InteractiveModeContext;
-	return { ctx, addMessageToChat, recordVisibleTranscriptMutation };
+	return {
+		ctx,
+		addMessageToChat,
+		recordVisibleTranscriptMutation,
+		drain: () => {
+			for (const callback of [...preparations]) {
+				preparations.delete(callback);
+				callback();
+			}
+		},
+	};
 }
 
 async function waitFor(condition: () => boolean): Promise<void> {
@@ -64,7 +87,251 @@ describe("EventController viewport output revision", () => {
 	});
 
 	afterEach(() => {
+		vi.restoreAllMocks();
 		resetSettingsForTest();
+	});
+
+	for (const mode of ["normal", "forced", "input"] as const) {
+		for (const reject of [false, true]) {
+			for (const independentDirty of [false, true]) {
+				it(`publishes text before ${mode} frame during ${reject ? "rejected" : "resolved"} reload, independent dirty=${independentDirty}`, async () => {
+					await Settings.init({ inMemory: true });
+					const handle: ToolExecutionHandle = {
+						updateArgs: vi.fn(),
+						updateResult: vi.fn(),
+						setArgsComplete: vi.fn(),
+						setExpanded: vi.fn(),
+					};
+					const { ctx, recordVisibleTranscriptMutation } = createContext(handle);
+					const terminal = new VirtualTerminal(80, 20);
+					const tui = new TUI(terminal);
+					const metricsEnabled = renderMetrics.enabled;
+					renderMetrics.enable();
+					const commits = vi.spyOn(renderMetrics, "recordRender");
+					ctx.ui = tui;
+					let revision = 0n;
+					tui.setViewportOutputSource({ identity: "test-session", revision });
+					recordVisibleTranscriptMutation.mockImplementation(() => {
+						tui.setViewportOutputSource({ identity: "test-session", revision: ++revision });
+					});
+					tui.addChild(ctx.chatContainer);
+					const editor = new Editor(defaultEditorTheme);
+					tui.addChild(editor);
+					tui.setFocus(editor);
+					const controller = new EventController(ctx);
+					tui.setRenderPreparationLifecycleCallbacks({
+						invalidate: () => controller.suspendAssistantTextPresentation(),
+						beforeStart: () => controller.resumeAssistantTextPresentation(),
+					});
+					const gate = Promise.withResolvers<void>();
+					const entered = Promise.withResolvers<void>();
+					ctx.reloadTodos = vi.fn(() => {
+						entered.resolve();
+						return gate.promise;
+					});
+					try {
+						tui.start();
+						await terminal.waitForRender();
+						await controller.handleEvent({ type: "message_start", message: assistantMessage("historical") });
+						const historical = ctx.streamingComponent!;
+						await controller.handleEvent({ type: "message_end", message: assistantMessage("historical") });
+						await controller.handleEvent({ type: "message_start", message: assistantMessage("") });
+						await tui.waitForRenderCommit(tui.requestRenderWithGeneration(true));
+						const drainScheduler = async () => {
+							// Probe for forbidden follow-up work only after a real commit barrier.
+							// Do not use this fake-clock probe to establish a required commit.
+							for (let turn = 0; turn < 3; turn++) {
+								await Promise.resolve();
+								await new Promise<void>(resolve => process.nextTick(resolve));
+								vi.advanceTimersByTime(100);
+								await Promise.resolve();
+							}
+						};
+						recordVisibleTranscriptMutation.mockClear();
+						const component = ctx.streamingComponent!;
+						const projection = vi.spyOn(component, "updateContent");
+						const latest = assistantMessage("prepared while reload waits");
+						const commitsBeforeQueue = commits.mock.calls.length;
+						await controller.handleEvent({
+							type: "message_update",
+							message: latest,
+							assistantMessageEvent: { type: "text_delta", contentIndex: 0 },
+						} as never);
+						const pending = controller.handleEvent({ type: "todo_auto_clear" } as never);
+						// Attach the rejection observer before rejecting, without changing dispatch semantics.
+						const settled = pending.then(
+							() => undefined,
+							error => error,
+						);
+						await entered.promise;
+						if (independentDirty)
+							historical.updateContent(assistantMessage("independent historical image equivalent"), {
+								streaming: false,
+							});
+						expect(recordVisibleTranscriptMutation).not.toHaveBeenCalled();
+						const seen: number[] = [];
+						const originalRender = component.render.bind(component);
+						vi.spyOn(component, "render").mockImplementation(width => {
+							seen.push(recordVisibleTranscriptMutation.mock.calls.length);
+							return originalRender(width);
+						});
+						const generation = tui.requestRenderWithGeneration(mode === "forced");
+						if (mode === "input") terminal.sendInput("x");
+						expect(await tui.waitForRenderCommit(generation)).toBe(true);
+						expect(commits).toHaveBeenCalledTimes(commitsBeforeQueue + 1);
+						expect(projection).toHaveBeenCalledTimes(1);
+						expect(seen.length).toBeGreaterThan(0);
+						expect(seen.every(count => count === 1)).toBe(true);
+						expect(terminal.getWriteLog().join("")).toContain("prepared while reload waits");
+						const renderedBeforeSettlement = seen.length;
+						const commitsBeforeSettlement = commits.mock.calls.length;
+						const writesBeforeSettlement = [...terminal.getWriteLog()];
+						// No-dirty settlements must not request any frame. Install the controlled
+						// clock before settlement to detect such work without creating a barrier.
+						if (!independentDirty || reject) vi.useFakeTimers();
+						if (reject) gate.reject(new Error("reload failed"));
+						else gate.resolve();
+						const result = await settled;
+						if (reject) expect(result).toBeInstanceOf(Error);
+						else expect(result).toBeUndefined();
+						expect(recordVisibleTranscriptMutation).toHaveBeenCalledTimes(independentDirty && !reject ? 2 : 1);
+						expect(projection).toHaveBeenCalledTimes(1);
+						if (!independentDirty || reject) {
+							await drainScheduler();
+							expect(seen).toHaveLength(renderedBeforeSettlement);
+							expect(commits).toHaveBeenCalledTimes(commitsBeforeSettlement);
+							expect(terminal.getWriteLog()).toEqual(writesBeforeSettlement);
+						} else {
+							// Publication is asserted above. Drain its legitimate render request via
+							// a real generation barrier, not fake elapsed time: TUI's frame budget
+							// uses performance.now(), which need not share the fake timer clock.
+							const settledGeneration = tui.requestRenderWithGeneration(true);
+							expect(await tui.waitForRenderCommit(settledGeneration)).toBe(true);
+							expect(projection).toHaveBeenCalledTimes(1);
+							vi.useFakeTimers();
+						}
+						const quiescentReads = seen.length;
+						const quiescentCommits = commits.mock.calls.length;
+						const quiescentWrites = [...terminal.getWriteLog()];
+						await drainScheduler();
+						expect(seen).toHaveLength(quiescentReads);
+						expect(commits).toHaveBeenCalledTimes(quiescentCommits);
+						expect(terminal.getWriteLog()).toEqual(quiescentWrites);
+						expect(projection).toHaveBeenCalledTimes(1);
+					} finally {
+						gate.resolve();
+						tui.setRenderPreparationLifecycleCallbacks(undefined);
+						controller.dispose();
+						tui.stop();
+						vi.useRealTimers();
+						commits.mockRestore();
+						if (!metricsEnabled) renderMetrics.disable();
+					}
+				});
+			}
+		}
+	}
+
+	it("restores the exact-component publication scope after a throwing projection", async () => {
+		await Settings.init({ inMemory: true });
+		const handle: ToolExecutionHandle = {
+			updateArgs: vi.fn(),
+			updateResult: vi.fn(),
+			setArgsComplete: vi.fn(),
+			setExpanded: vi.fn(),
+		};
+		const { ctx, drain, recordVisibleTranscriptMutation } = createContext(handle);
+		const controller = new EventController(ctx);
+		await controller.handleEvent({ type: "message_start", message: assistantMessage("") });
+		const component = ctx.streamingComponent!;
+		const originalUpdate = component.updateContent.bind(component);
+		const projection = vi.spyOn(component, "updateContent").mockImplementationOnce(() => {
+			throw new Error("projection failed");
+		});
+		await controller.handleEvent({
+			type: "message_update",
+			message: assistantMessage("queued"),
+			assistantMessageEvent: { type: "text_delta", contentIndex: 0 },
+		} as never);
+		const gate = Promise.withResolvers<void>();
+		const entered = Promise.withResolvers<void>();
+		ctx.reloadTodos = vi.fn(() => {
+			entered.resolve();
+			return gate.promise;
+		});
+		const pending = controller.handleEvent({ type: "todo_auto_clear" } as never);
+		await entered.promise;
+		expect(() => drain()).toThrow("projection failed");
+		projection.mockRestore();
+		originalUpdate(assistantMessage("event owned after exception"), { streaming: true });
+		expect(recordVisibleTranscriptMutation).not.toHaveBeenCalled();
+		gate.resolve();
+		await pending;
+		expect(recordVisibleTranscriptMutation).toHaveBeenCalledTimes(1);
+	});
+
+	it("does not classify another component's synchronous callback as prepared text", async () => {
+		await Settings.init({ inMemory: true });
+		const handle: ToolExecutionHandle = {
+			updateArgs: vi.fn(),
+			updateResult: vi.fn(),
+			setArgsComplete: vi.fn(),
+			setExpanded: vi.fn(),
+		};
+		const { ctx, drain, recordVisibleTranscriptMutation } = createContext(handle);
+		ctx.pendingTools.clear();
+		const controller = new EventController(ctx);
+		await controller.handleEvent({ type: "message_start", message: assistantMessage("history") });
+		const historical = ctx.streamingComponent!;
+		await controller.handleEvent({ type: "message_end", message: assistantMessage("history") });
+		await controller.handleEvent({ type: "message_start", message: assistantMessage("") });
+		const current = ctx.streamingComponent!;
+		const update = current.updateContent.bind(current);
+		vi.spyOn(current, "updateContent").mockImplementation((message, options) => {
+			historical.updateContent(assistantMessage("unrelated synchronous output"), { streaming: false });
+			update(message, options);
+		});
+		recordVisibleTranscriptMutation.mockClear();
+		await controller.handleEvent({
+			type: "message_update",
+			message: assistantMessage("latest"),
+			assistantMessageEvent: { type: "text_delta", contentIndex: 0 },
+		} as never);
+		const gate = Promise.withResolvers<void>();
+		const entered = Promise.withResolvers<void>();
+		ctx.reloadTodos = vi.fn(() => {
+			entered.resolve();
+			return gate.promise;
+		});
+		const pending = controller.handleEvent({ type: "todo_auto_clear" } as never);
+		await entered.promise;
+		drain();
+		expect(recordVisibleTranscriptMutation).toHaveBeenCalledTimes(1);
+		gate.resolve();
+		await pending;
+		expect(recordVisibleTranscriptMutation).toHaveBeenCalledTimes(2);
+	});
+
+	it("does not publish a revision for an unchanged deferred text signature", async () => {
+		await Settings.init({ inMemory: true });
+		const handle: ToolExecutionHandle = {
+			updateArgs: vi.fn(),
+			updateResult: vi.fn(),
+			setArgsComplete: vi.fn(),
+			setExpanded: vi.fn(),
+		};
+		const { ctx, drain, recordVisibleTranscriptMutation } = createContext(handle);
+		const controller = new EventController(ctx);
+		const message = assistantMessage("same source");
+		await controller.handleEvent({ type: "message_start", message });
+		recordVisibleTranscriptMutation.mockClear();
+		await controller.handleEvent({
+			type: "message_update",
+			message,
+			assistantMessageEvent: { type: "text_delta", contentIndex: 0 },
+		} as never);
+		drain();
+		expect(recordVisibleTranscriptMutation).not.toHaveBeenCalled();
 	});
 
 	it("does not record a controller revision when an observed apply_patch preview resolves absent", async () => {

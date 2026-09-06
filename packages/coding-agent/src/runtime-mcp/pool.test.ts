@@ -1,4 +1,6 @@
 import { describe, expect, test } from "bun:test";
+import { MCPConnectionCleanupFailure } from "./client";
+import { MCPManager } from "./manager";
 import { MCPConnectionPool, MCPPoolAcquireAbortError, MCPPoolLeaseInvalidatedError } from "./pool";
 import { MCPPoolConfigError } from "./pool-key";
 import { legacyEraObservation } from "./protocol";
@@ -45,6 +47,17 @@ class FakeTransport implements MCPTransport {
 	async close(): Promise<void> {
 		this.closeCount += 1;
 		this.connected = false;
+	}
+}
+
+class ToolListTransport extends FakeTransport {
+	override async request<T = unknown>(
+		method: string,
+		params?: Record<string, unknown>,
+		options?: MCPRequestOptions,
+	): Promise<T> {
+		if (method === "tools/list") return { tools: [] } as T;
+		return super.request<T>(method, params, options);
 	}
 }
 
@@ -371,6 +384,211 @@ describe("MCPConnectionPool", () => {
 		await Bun.sleep(0);
 		expect(transport.closeCount).toBe(1);
 		await pool.shutdown();
+	});
+
+	test("retains cancelled cleanup before late failure and fences each cleanup generation", async () => {
+		const flights = [Promise.withResolvers<MCPServerConnection>(), Promise.withResolvers<MCPServerConnection>()];
+		const starts = [Promise.withResolvers<void>(), Promise.withResolvers<void>()];
+		const recoveryTransports: FakeTransport[] = [];
+		let opens = 0;
+		const pool = new MCPConnectionPool({
+			connect: async (name, cfg) => {
+				opens += 1;
+				if (opens === 1) {
+					starts[0]?.resolve();
+					return flights[0]!.promise;
+				}
+				if (opens === 3) {
+					starts[1]?.resolve();
+					return flights[1]!.promise;
+				}
+				const transport = new FakeTransport();
+				recoveryTransports.push(transport);
+				return connection(name, cfg, transport);
+			},
+		});
+		const acquireCancelledFlight = async (index: number): Promise<MCPPoolAcquireAbortError> => {
+			const controller = new AbortController();
+			const acquire = pool.acquire("server", config(), {
+				sessionId: "retained-cleanup",
+				signal: controller.signal,
+			});
+			await starts[index]!.promise;
+			controller.abort(new Error(`caller abort ${index}`));
+			const error = await acquire.catch(error => error);
+			expect(error).toBeInstanceOf(MCPPoolAcquireAbortError);
+			if (!(error instanceof MCPPoolAcquireAbortError)) throw new Error("Expected aborted pool acquisition");
+			return error;
+		};
+
+		const firstAbort = await acquireCancelledFlight(0);
+		expect(pool.pendingAcquireCleanupCountForTests).toBe(1);
+		expect(opens).toBe(1);
+		const firstCleanupTransport = new FakeTransport();
+		let fencedSettled = false;
+		const fenced = pool.acquire("server", config(), { sessionId: "retained-cleanup" });
+		void fenced.then(
+			() => {
+				fencedSettled = true;
+			},
+			() => {
+				fencedSettled = true;
+			},
+		);
+		await Promise.resolve();
+		expect(fencedSettled).toBe(false);
+		expect(opens).toBe(1);
+		flights[0]!.reject(new MCPConnectionCleanupFailure(new Error("late cleanup failure 1"), firstCleanupTransport));
+		await expect(fenced).resolves.toBeDefined();
+		expect(firstCleanupTransport.closeCount).toBe(1);
+		expect(opens).toBe(2);
+
+		const secondLease = await fenced;
+		await secondLease.release();
+		const secondAbort = await acquireCancelledFlight(1);
+		expect(secondAbort.cleanupGeneration).toBeGreaterThan(firstAbort.cleanupGeneration ?? 0);
+		const secondCleanupTransport = new FakeTransport();
+		flights[1]!.reject(new MCPConnectionCleanupFailure(new Error("late cleanup failure 2"), secondCleanupTransport));
+		await expect(secondAbort.cleanup).rejects.toBeInstanceOf(MCPConnectionCleanupFailure);
+		await pool.closePendingAcquireCleanup(firstAbort.poolKey, firstAbort.cleanupGeneration!);
+		expect(secondCleanupTransport.closeCount).toBe(0);
+		expect(pool.pendingAcquireCleanupCountForTests).toBe(1);
+		await pool.closePendingAcquireCleanup(secondAbort.poolKey, secondAbort.cleanupGeneration!);
+		expect(secondCleanupTransport.closeCount).toBe(1);
+		expect(pool.pendingAcquireCleanupCountForTests).toBe(0);
+		const recovered = await pool.acquire("server", config(), { sessionId: "retained-cleanup" });
+		expect(opens).toBe(4);
+		await recovered.release();
+		expect(recoveryTransports).toHaveLength(2);
+	});
+
+	test("manager disconnect preserves late cleanup failure until pool retry clears every manager fence", async () => {
+		const firstFlight = Promise.withResolvers<MCPServerConnection>();
+		const firstStarted = Promise.withResolvers<void>();
+		const cleanupTransport = new FakeTransport();
+		const retryFailure = new Error("deferred cleanup retry failed");
+		let cleanupAttempts = 0;
+		cleanupTransport.close = async () => {
+			cleanupAttempts += 1;
+			if (cleanupAttempts === 1) throw retryFailure;
+			cleanupTransport.connected = false;
+		};
+		let opens = 0;
+		const pool = new MCPConnectionPool({
+			connect: async (name, cfg) => {
+				opens += 1;
+				if (opens === 1) {
+					firstStarted.resolve();
+					return firstFlight.promise;
+				}
+				return connection(name, cfg, new ToolListTransport());
+			},
+		});
+		const manager = new MCPManager(".", null, { pool, sessionId: "disconnect-cleanup" });
+		const serverConfig = config();
+		const controller = new AbortController();
+		const operation = manager.withPreparedLease("server", serverConfig, async () => undefined, {
+			signal: controller.signal,
+		});
+		await firstStarted.promise;
+		controller.abort(new Error("abort before deferred cleanup failure"));
+		const abortedAcquire = await operation.catch(error => error);
+		expect(abortedAcquire).toBeInstanceOf(MCPPoolAcquireAbortError);
+		if (!(abortedAcquire instanceof MCPPoolAcquireAbortError)) throw new Error("Expected aborted acquisition");
+		expect(manager.pendingConnectionCleanupCountForTests).toBe(1);
+
+		await manager.disconnectServer("server");
+		const fenced = await manager.connectServers({ server: serverConfig }, {});
+		expect(fenced.errors.has("server")).toBe(true);
+		expect(opens).toBe(1);
+		const primaryFailure = new Error("late connection cleanup failed");
+		firstFlight.reject(new MCPConnectionCleanupFailure(primaryFailure, cleanupTransport));
+		await expect(abortedAcquire.cleanup).rejects.toBeInstanceOf(MCPConnectionCleanupFailure);
+		const disconnectError = await manager.disconnectServer("server").catch(error => error);
+		expect(disconnectError).toBeInstanceOf(MCPConnectionCleanupFailure);
+		if (!(disconnectError instanceof MCPConnectionCleanupFailure)) {
+			throw new Error("Expected retained disconnect cleanup failure");
+		}
+		expect(disconnectError.cause).toBeInstanceOf(AggregateError);
+		if (!(disconnectError.cause instanceof AggregateError)) throw new Error("Expected combined cleanup causes");
+		expect(disconnectError.cause.errors).toEqual([primaryFailure, retryFailure]);
+		expect(cleanupAttempts).toBe(1);
+		expect(manager.pendingConnectionCleanupCountForTests).toBe(1);
+		expect(pool.pendingAcquireCleanupCountForTests).toBe(1);
+
+		const recoveryManager = new MCPManager(".", null, { pool, sessionId: "disconnect-cleanup" });
+		await recoveryManager.withPreparedLease("server", serverConfig, async lease => {
+			expect(lease.serverName).toBe("server");
+		});
+		expect(cleanupAttempts).toBe(2);
+		expect(pool.pendingAcquireCleanupCountForTests).toBe(0);
+		expect(manager.pendingConnectionCleanupCountForTests).toBe(1);
+
+		const recovered = await manager.connectServers({ server: serverConfig }, {});
+		expect(recovered.errors.size).toBe(0);
+		expect(recovered.connectedServers).toEqual(["server"]);
+		expect(manager.pendingConnectionCleanupCountForTests).toBe(0);
+		expect(opens).toBe(3);
+		await recoveryManager.disconnectAll();
+		await manager.disconnectAll();
+	});
+
+	test("manager reconnect retries pool-owned cleanup before replacing the live connection", async () => {
+		const transientFlight = Promise.withResolvers<MCPServerConnection>();
+		const transientStarted = Promise.withResolvers<void>();
+		const cleanupTransport = new FakeTransport();
+		const cleanupRetryFailure = new Error("reconnect cleanup retry failed");
+		let cleanupAttempts = 0;
+		cleanupTransport.close = async () => {
+			cleanupAttempts += 1;
+			if (cleanupAttempts === 1) throw cleanupRetryFailure;
+			cleanupTransport.connected = false;
+		};
+		let opens = 0;
+		const transports: ToolListTransport[] = [];
+		const pool = new MCPConnectionPool({
+			connect: async (name, cfg) => {
+				opens += 1;
+				if (opens === 2) {
+					transientStarted.resolve();
+					return transientFlight.promise;
+				}
+				const transport = new ToolListTransport();
+				transports.push(transport);
+				return connection(name, cfg, transport);
+			},
+		});
+		const manager = new MCPManager(".", null, { pool, sessionId: "reconnect-cleanup", sleep: async () => {} });
+		const serverConfig = config();
+		await manager.connectServers({ server: serverConfig }, {});
+		const original = manager.getConnection("server");
+		const controller = new AbortController();
+		const transient = manager.withPreparedLease(
+			"server",
+			{ type: "stdio", command: "fake-mcp", args: ["--transient"] },
+			async () => undefined,
+			{ signal: controller.signal },
+		);
+		await transientStarted.promise;
+		controller.abort(new Error("abort transient before reconnect"));
+		await expect(transient).rejects.toBeInstanceOf(MCPPoolAcquireAbortError);
+
+		const firstReconnect = manager.reconnectServer("server");
+		transientFlight.reject(
+			new MCPConnectionCleanupFailure(new Error("late reconnect cleanup failed"), cleanupTransport),
+		);
+		await expect(firstReconnect).rejects.toBeInstanceOf(MCPConnectionCleanupFailure);
+		expect(cleanupAttempts).toBe(1);
+		expect(opens).toBe(2);
+		expect(manager.getConnection("server")).toBe(original);
+		const replacement = await manager.reconnectServer("server");
+		expect(cleanupAttempts).toBe(2);
+		expect(opens).toBe(3);
+		expect(replacement).toBeDefined();
+		expect(replacement).not.toBe(original);
+		expect(manager.pendingConnectionCleanupCountForTests).toBe(0);
+		await manager.disconnectAll();
+		expect(transports.every(transport => transport.closeCount === 1)).toBe(true);
 	});
 
 	test("shutdown aborts hanging opens, settles waiters, and closes late transports", async () => {

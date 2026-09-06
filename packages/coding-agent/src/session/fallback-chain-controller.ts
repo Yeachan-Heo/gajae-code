@@ -1,3 +1,4 @@
+import { cleanReason } from "@gajae-code/ai/auth-broker/redact";
 import type { FallbackTriggerClass } from "@gajae-code/ai/utils/fallback-transport";
 
 /** Immutable configured fallback intent. Transient attempt state never belongs here. */
@@ -263,6 +264,43 @@ export function compactionRetryDelay(
 	const hinted = Math.max(exponential, hint);
 	const bounded = maxDelayMs > 0 ? Math.min(hinted, maxDelayMs) : hinted;
 	return Math.max(0, bounded);
+}
+
+export interface CompactionCandidateFailure {
+	readonly model: string;
+	readonly message: string;
+}
+
+function sanitizeCompactionCandidateFailureMessage(message: string): string {
+	const cleaned = cleanReason(message) ?? "Compaction candidate failed.";
+	return cleaned.replace(/\b[a-z][a-z0-9+.-]*:\/\/[^\s<>'"]+/gi, "[redacted URL]");
+}
+
+/**
+ * Error for an auto-compaction run whose every candidate failed.
+ *
+ * The candidate chain starts at the session model and ends on a same-provider
+ * largest-context fallback, so surfacing only the final error named a model
+ * the user never chose and hid that their own model had already failed the
+ * same way. The message leads with the first failure (the one the user can act
+ * on), then lists every candidate that was tried with its own error. `cause`
+ * is the final error so callers that classify by type keep the same object.
+ */
+export function describeCompactionCandidateFailures(
+	failures: readonly CompactionCandidateFailure[],
+	lastError: unknown,
+): Error {
+	if (failures.length === 0)
+		return new Error("Compaction failed: no candidate failure details available.", { cause: lastError });
+	const first = failures[0]!;
+	const firstMessage = sanitizeCompactionCandidateFailureMessage(first.message);
+	const lines = failures.map(
+		failure => `  ${failure.model}: ${sanitizeCompactionCandidateFailureMessage(failure.message)}`,
+	);
+	return new Error(
+		`${firstMessage} (${first.model}); ${failures.length} compaction candidates failed:\n${lines.join("\n")}`,
+		{ cause: lastError },
+	);
 }
 
 /** Retry-After is intentionally uncapped. */
