@@ -4863,7 +4863,7 @@ test("close preserves terminal uncertainty when conditional endpoint unregister 
 	}
 });
 
-test("close removes an unchanged dead endpoint with a fractional nanosecond mtime", async () => {
+test("close retains a legacy endpoint whose indexed mtime lost fractional precision", async () => {
 	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-dead-mtime-"));
 	const agentDir = path.join(root, "agent");
 	const stateRoot = path.join(root, ".gjc", "state");
@@ -4902,14 +4902,14 @@ test("close removes an unchanged dead endpoint with a fractional nanosecond mtim
 		});
 		try {
 			expect(await broker.handleRequest("session.close", { sessionId }, "fractional-mtime-close")).toMatchObject({
-				ok: true,
-				result: { sessionId },
+				ok: false,
+				error: { code: "terminal_uncertain" },
 			});
 		} finally {
 			unlinkSpy.mockRestore();
 		}
-		expect(unlinked).toBe(true);
-		await expect(fs.access(endpointPath)).rejects.toThrow();
+		expect(unlinked).toBe(false);
+		await expect(fs.access(endpointPath)).resolves.toBeNull();
 	} finally {
 		await broker.stop();
 		await fs.rm(root, { recursive: true, force: true });
