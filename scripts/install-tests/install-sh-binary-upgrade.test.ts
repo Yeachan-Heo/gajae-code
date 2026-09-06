@@ -488,6 +488,86 @@ describe("install.sh binary-first contract", () => {
 		expect(installer).toContain('ARCH="arm64"');
 	});
 
+	test("forwards installer termination and waits for optional runtime cleanup", async () => {
+		const installer = await Bun.file(installScript).text();
+		expect(installer).toContain("OFFER_RUNTIME_PID=$!");
+		expect(installer).toContain('[ -z "$OFFER_RUNTIME_SIGNAL" ] || return 0');
+		expect(installer).toContain('kill -s "$1" "$OFFER_RUNTIME_PID"');
+		expect(installer).toContain('wait "$OFFER_RUNTIME_PID"');
+		expect(installer).toContain(
+			'while [ -n "$OFFER_RUNTIME_SIGNAL" ] && kill -0 "$OFFER_RUNTIME_PID" 2>/dev/null; do',
+		);
+		expect(installer).not.toContain('kill -KILL "$OFFER_RUNTIME_PID"');
+		expect(installer).toContain('community_app_offer_suppressed');
+		expect(installer).toContain('"$OFFER_RUNTIME" --internal-macos-community-app-offer < /dev/tty');
+		expect(installer).toContain('"$OFFER_RUNTIME" --supports-macos-community-app');
+	});
+
+	test("reaps the optional runtime before deleting its snapshot after repeated signals", async () => {
+		const markerPath = path.join(sandbox.root, "offer-marker");
+		const signalPath = path.join(sandbox.root, "offer-signal");
+		const unamePath = path.join(sandbox.shimDir, "uname");
+		fs.writeFileSync(
+			unamePath,
+			'#!/bin/sh\nif [ "$1" = "-s" ]; then echo Darwin; else echo x86_64; fi\n',
+		);
+		fs.chmodSync(unamePath, 0o755);
+		const payload = `#!/bin/sh
+if [ "$1" = "--version" ]; then echo "gjc/${VERSION}"; exit 0; fi
+if [ "$1" = "--smoke-test" ]; then exit 0; fi
+if [ "$1" = "--supports-macos-community-app" ]; then exit 0; fi
+if [ "$1" = "--internal-macos-community-app-offer" ]; then
+  printf '%s|%s\n' "$$" "$0" > "$GJC_TEST_OFFER_MARKER"
+  trap 'printf "TERM\\n" >> "$GJC_TEST_OFFER_SIGNAL"; sleep 1; exit 0' TERM
+  while :; do sleep 1; done
+fi
+exit 0
+`;
+		const binaryName = "gjc-darwin-x64";
+		writeCurlShim(sandbox.shimDir, {
+			assets: {
+				[binaryName]: payload,
+				"gajae-release-binaries.sha256": `${sha256(payload)}  ${binaryName}\n`,
+			},
+		});
+		const installer = Bun.spawn(["sh", installScript], {
+			env: {
+				...process.env,
+				PATH: `${sandbox.shimDir}:/usr/bin:/bin`,
+				GJC_INSTALL_DIR: sandbox.installDir,
+				HOME: sandbox.root,
+				GITHUB_TOKEN: "",
+				GH_TOKEN: "",
+				CI: "false",
+				GITHUB_ACTIONS: "false",
+				GJC_NONINTERACTIVE: "false",
+				GJC_TEST_OFFER_MARKER: markerPath,
+				GJC_TEST_OFFER_SIGNAL: signalPath,
+			},
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		let marker: string | undefined;
+		for (let attempt = 0; attempt < 100; attempt++) {
+			marker = fs.existsSync(markerPath) ? fs.readFileSync(markerPath, "utf8").trim() : undefined;
+			if (marker) break;
+			await Bun.sleep(50);
+		}
+		if (!marker) throw new Error(`optional runtime did not start: ${await new Response(installer.stderr).text()}`);
+		const [pidText, runtimePath] = marker.split("|");
+		const runtimePid = Number(pidText);
+		expect(fs.existsSync(runtimePath)).toBe(true);
+		process.kill(installer.pid, "SIGTERM");
+		await Bun.sleep(50);
+		process.kill(installer.pid, "SIGINT");
+		await Bun.sleep(100);
+		expect(fs.existsSync(runtimePath)).toBe(true);
+		expect(await installer.exited).toBe(143);
+		expect(() => process.kill(runtimePid, 0)).toThrow();
+		expect(fs.existsSync(runtimePath)).toBe(false);
+		expect(fs.readFileSync(signalPath, "utf8").trim()).toBe("TERM");
+	}, 15_000);
+
 	test("follows redirects and fail-closes checksum fetch except HTTP 404", async () => {
 		const installer = await Bun.file(installScript).text();
 		expect(installer).toContain("curl -sSL");

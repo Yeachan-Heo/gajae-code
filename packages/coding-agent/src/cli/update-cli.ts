@@ -5,11 +5,13 @@
  * binaries. Package-manager installs are migrated to a user binary path
  * rather than overwritten. Source checkouts and dev-links are never replaced.
  */
+
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { pipeline } from "node:stream/promises";
-import { $which, APP_NAME, isCompiledBinary, isEnoent, redactCrashSecrets, VERSION } from "@gajae-code/utils";
+import { $which, APP_NAME, isCompiledBinary, isEnoent, logger, redactCrashSecrets, VERSION } from "@gajae-code/utils";
+import * as postmortem from "@gajae-code/utils/postmortem";
 import { $ } from "bun";
 import chalk from "chalk";
 import { Settings } from "../config/settings";
@@ -29,6 +31,7 @@ import {
 	verifyDownloadedBinaryChecksum,
 	versionFromTag,
 } from "./github-release";
+import { type CommunityAppOfferResult, offerMacosCommunityApp } from "./macos-community-app";
 import { runNotifyCommand } from "./notify-cli";
 
 const PACKAGE = "@gajae-code/coding-agent";
@@ -1247,6 +1250,7 @@ async function updateViaBinaryAt(
  * Run the update command.
  */
 export interface UpdateCommandDependencies {
+	platform?: NodeJS.Platform;
 	getLatestRelease?: (options?: LatestReleaseLookupOptions) => Promise<ReleaseInfo>;
 	resolveUpdateTarget?: () => Promise<UpdateTarget>;
 	verifyMigrationTarget?: (release: ReleaseInfo, runtimePath: string) => Promise<InstalledVersionVerification>;
@@ -1261,6 +1265,7 @@ export interface UpdateCommandDependencies {
 	restartDaemon?: (settings: Settings) => Promise<void>;
 	recoverNotifications?: (settings: Settings) => Promise<void>;
 	runPostUpdateRecovery?: (runtimePath: string) => Promise<void>;
+	offerCommunityApp?: (runtimePath: string) => Promise<void>;
 	recordTelemetryEvent?: (event: TelemetryEventName, details: TelemetryDetails) => unknown;
 	exit?: (code: number) => never;
 }
@@ -1320,9 +1325,120 @@ async function recoverManagedNotifications(settings: Settings): Promise<void> {
 	await runNotifyCommand({ action: "recovery", rawArgs: [], forceDaemonLock: false }, { settings });
 }
 
-async function spawnPostUpdateRecovery(argv: string[]): Promise<number> {
-	const child = Bun.spawn(argv, { stdin: "inherit", stdout: "inherit", stderr: "inherit" });
-	return await child.exited;
+async function spawnPostUpdateRecovery(argv: string[], onSpawn?: (pid: number) => void): Promise<number> {
+	const child = Bun.spawn(argv, {
+		stdin: "inherit",
+		stdout: "inherit",
+		stderr: "inherit",
+	});
+	const childPid = child.pid;
+	onSpawn?.(childPid);
+	const signalTarget = childPid;
+	const livenessHold = setInterval(() => {}, 1_000);
+	const childIsAlive = (): boolean => {
+		try {
+			process.kill(signalTarget, 0);
+			return true;
+		} catch {
+			return false;
+		}
+	};
+	const awaitChildDeath = async (timeoutMs: number): Promise<boolean> => {
+		const deadline = Date.now() + timeoutMs;
+		while (childIsAlive() && Date.now() < deadline) await Bun.sleep(25);
+		return !childIsAlive();
+	};
+	let termination: Promise<void> | undefined;
+	const terminate = (signal: "SIGINT" | "SIGTERM" | "SIGHUP"): Promise<void> => {
+		if (termination) return termination;
+		termination = (async () => {
+			const exitCode = signal === "SIGINT" ? 130 : signal === "SIGHUP" ? 129 : 143;
+			process.exitCode = exitCode;
+			process.once("exit", () => {
+				process.exitCode = exitCode;
+			});
+			const exitHold = setInterval(() => {}, 1_000);
+			setTimeout(() => process.exit(exitCode), 4_500);
+			try {
+				process.kill(signalTarget, signal);
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+			}
+			// Signal cleanup must complete graceful-to-forceful escalation before its
+			// first async yield; otherwise the parent signal handler can finish while
+			// Bun has already resolved child.exited for a still-running signal handler.
+			Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 500);
+			try {
+				process.kill(signalTarget, "SIGKILL");
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+			}
+			try {
+				child.kill("SIGKILL");
+			} catch {
+				// The native child handle may already be closed after exact-PID escalation.
+			}
+			if (!(await awaitChildDeath(2_000))) throw new Error("verified recovery child remained alive after SIGKILL");
+			await child.exited;
+			await postmortem.quit(exitCode);
+			// postmortem.quit owns process termination; retain the liveness hold until
+			// that exact signal exit occurs.
+			void exitHold;
+		})();
+		return termination;
+	};
+	const unregister = postmortem.register("update:verified-runtime-recovery", reason => {
+		const signal =
+			reason === postmortem.Reason.SIGINT ? "SIGINT" : reason === postmortem.Reason.SIGHUP ? "SIGHUP" : "SIGTERM";
+		return terminate(signal);
+	});
+	const signalHandlers = new Map<NodeJS.Signals, () => void>();
+	for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
+		const handler = (): void => {
+			void terminate(signal);
+		};
+		signalHandlers.set(signal, handler);
+		process.prependListener(signal, handler);
+	}
+	try {
+		const exitCode = child.exited;
+		await Bun.sleep(25);
+		while (childIsAlive()) await Bun.sleep(25);
+		const settledExitCode = await exitCode;
+		await Bun.sleep(100);
+		return settledExitCode;
+	} finally {
+		clearInterval(livenessHold);
+		unregister();
+		for (const [signal, handler] of signalHandlers) process.off(signal, handler);
+	}
+}
+
+export const spawnPostUpdateRecoveryForTest = spawnPostUpdateRecovery;
+
+async function runCommunityAppOfferFromRuntime(
+	runtimePath: string,
+	deps: Pick<UpdateCommandDependencies, "offerCommunityApp">,
+): Promise<void> {
+	if (deps.offerCommunityApp) {
+		await deps.offerCommunityApp(runtimePath);
+		return;
+	}
+	const result = await offerMacosCommunityApp();
+	if (result.status === "failed") throw new Error(result.reason);
+}
+
+export async function runVerifiedRuntimeRecovery(
+	options: {
+		platform?: NodeJS.Platform;
+		recover?: () => Promise<void>;
+		offer?: () => Promise<CommunityAppOfferResult>;
+	} = {},
+): Promise<void> {
+	await (options.recover ?? (() => runManagedNotifyRecovery({})))();
+	if ((options.platform ?? process.platform) !== "darwin") return;
+	const result = await (options.offer ?? offerMacosCommunityApp)();
+	if (result.status === "failed") logger.warn(`Warning: optional macOS community app offer failed: ${result.reason}`);
 }
 
 async function supportsUpdateRecovery(runtimePath: string): Promise<boolean> {
@@ -1552,7 +1668,18 @@ export async function runUpdateCommand(
 		migrate: target?.method === "migrate",
 	});
 
-	if (target.method === "migrate" && decision.install && !opts.force) {
+	if (target.method === "migrate" && decision.install && !opts.force && opts.check) {
+		const verification = await verifyTarget(release, target.path);
+		if (verification.ok) {
+			record("update_check_completed", { channel, result: "available" });
+			printVerifiedMigrationTarget(target, release.version);
+			record("update_install_completed", { channel, result: "skipped" });
+			return;
+		}
+	}
+
+	if (target.method === "migrate" && decision.install && !opts.force && !opts.check) {
+		let migrationVerified = false;
 		const releaseLock = await acquireBinaryUpdateLock(target.path);
 		try {
 			const verification = await verifyTarget(release, target.path);
@@ -1560,11 +1687,21 @@ export async function runUpdateCommand(
 				record("update_check_completed", { channel, result: "available" });
 				record("update_install_started", { channel, installMethod: target.method });
 				printVerifiedMigrationTarget(target, release.version);
-				record("update_install_completed", { channel, result: "installed", installMethod: target.method });
-				return;
+				migrationVerified = true;
 			}
 		} finally {
 			await releaseLock();
+		}
+		if (migrationVerified) {
+			if ((deps.platform ?? process.platform) === "darwin") {
+				try {
+					await runCommunityAppOfferFromRuntime(target.path, deps);
+				} catch (error) {
+					logger.warn(`Warning: optional macOS community app offer failed: ${error}`);
+				}
+			}
+			record("update_install_completed", { channel, result: "installed", installMethod: target.method });
+			return;
 		}
 	}
 
@@ -1591,12 +1728,14 @@ export async function runUpdateCommand(
 	}
 
 	let installedVersion: string | undefined;
+	let installedRuntimePath: string | undefined;
 	record("update_install_started", { channel, installMethod: target.method });
 	try {
 		const resolved = target ?? (await resolveTarget());
 		const verification = await update(resolved, release.version, release.registry);
 		if (verification?.path) {
 			installedVersion = release.version;
+			installedRuntimePath = verification.path;
 			await (deps.runPostUpdateRecovery ?? runPostUpdateRecovery)(verification.path);
 		} else if (!deps.performUpdate) throw new Error("verified installed runtime path is unavailable");
 	} catch (err) {
@@ -1611,6 +1750,18 @@ export async function runUpdateCommand(
 	// The installed runtime completes recovery before this old updater process
 	// refreshes opt-in local definitions, avoiding stale-module daemon control.
 	await refreshDefaults();
+	if (
+		deps.offerCommunityApp &&
+		installedVersion &&
+		installedRuntimePath &&
+		(deps.platform ?? process.platform) === "darwin"
+	) {
+		try {
+			await runCommunityAppOfferFromRuntime(installedRuntimePath, deps);
+		} catch (error) {
+			logger.warn(`Warning: optional macOS community app offer failed: ${error}`);
+		}
+	}
 	record("update_install_completed", { channel, result: "installed", installMethod: target.method });
 }
 

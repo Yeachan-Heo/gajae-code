@@ -29,6 +29,7 @@ import {
 	runPackageManagerUpdateForTest,
 	runPostUpdateRecoveryForTest,
 	runUpdateCommand,
+	runVerifiedRuntimeRecovery,
 	sanitizeVerificationOutputForTest,
 	verifyInstalledVersionForTest,
 	verifyMigrationTargetAdapterForTest,
@@ -62,6 +63,70 @@ describe("update-cli recovery command surface", () => {
 		expect(result.exitCode).toBe(0);
 		expect(result.stdout.toString()).toContain("update-recovery");
 	});
+
+	it("runs the optional app offer inside the verified runtime recovery action", async () => {
+		const calls: string[] = [];
+		await runVerifiedRuntimeRecovery({
+			platform: "darwin",
+			recover: async () => {
+				calls.push("recover");
+			},
+			offer: async () => {
+				calls.push("offer");
+				return { status: "skipped", reason: "cancelled" };
+			},
+		});
+		expect(calls).toEqual(["recover", "offer"]);
+	});
+
+	it.skipIf(process.platform === "win32" || Bun.which("python3") === null)(
+		"reaps a non-cooperative verified recovery child before updater signal exit",
+		async () => {
+			const root = await makeTempDir();
+			const childScript = path.join(root, "recovery-child.py");
+			const parentScript = path.join(root, "recovery-parent.ts");
+			const childPidFile = path.join(root, "child.pid");
+			const childSignalFile = path.join(root, "child.signal");
+			const parentReadyFile = path.join(root, "parent.ready");
+			const parentChildPidFile = path.join(root, "parent-child.pid");
+			const parentStatusFile = path.join(root, "parent.status");
+			await Bun.write(
+				childScript,
+				`import os, signal, sys, time\npid_file, signal_file = sys.argv[1:]\ndef received(signum, _frame):\n    with open(signal_file, "w") as file:\n        file.write(signal.Signals(signum).name)\nfor name in ("SIGINT", "SIGTERM", "SIGHUP"):\n    signal.signal(getattr(signal, name), received)\nwith open(pid_file, "w") as file:\n    file.write(str(os.getpid()))\nwhile True:\n    time.sleep(1)\n`,
+			);
+			await Bun.write(
+				parentScript,
+				`import { spawnPostUpdateRecoveryForTest } from ${JSON.stringify(new URL("../src/cli/update-cli.ts", import.meta.url).href)};\nconst recovery = spawnPostUpdateRecoveryForTest([${JSON.stringify(Bun.which("python3"))}, ${JSON.stringify(childScript)}, ${JSON.stringify(childPidFile)}, ${JSON.stringify(childSignalFile)}], pid => { void Bun.write(${JSON.stringify(parentChildPidFile)}, String(pid)); });\nawait Bun.write(${JSON.stringify(parentReadyFile)}, String(process.pid));\nawait recovery;\n`,
+			);
+			const wrapper = Bun.spawn(["/bin/sh", "-c", '"$BUN" "$SCRIPT"; code=$?; printf "%s" "$code" > "$STATUS"'], {
+				env: { ...process.env, BUN: process.execPath, SCRIPT: parentScript, STATUS: parentStatusFile },
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			for (let attempt = 0; attempt < 100 && !(await Bun.file(childPidFile).exists()); attempt++)
+				await Bun.sleep(25);
+			expect(await Bun.file(childPidFile).exists()).toBe(true);
+			const childPid = Number.parseInt(await Bun.file(childPidFile).text(), 10);
+			expect(await Bun.file(parentChildPidFile).text()).toBe(String(childPid));
+			const parentPid = Number.parseInt(await Bun.file(parentReadyFile).text(), 10);
+			expect(await Bun.file(parentStatusFile).exists()).toBe(false);
+			expect(() => process.kill(parentPid, 0)).not.toThrow();
+			expect(Bun.spawnSync(["/bin/kill", "-SIGTERM", String(parentPid)]).exitCode).toBe(0);
+			expect(await wrapper.exited).toBe(0);
+			expect(await Bun.file(childSignalFile).text()).toBe("SIGTERM");
+			for (let attempt = 0; attempt < 100; attempt++) {
+				try {
+					process.kill(childPid, 0);
+					await Bun.sleep(25);
+				} catch {
+					break;
+				}
+			}
+			expect(() => process.kill(childPid, 0)).toThrow();
+			expect(await Bun.file(parentStatusFile).text()).toBe("143");
+		},
+		15_000,
+	);
 });
 
 describe("update-cli release lookup", () => {
@@ -870,6 +935,50 @@ describe("update-cli managed notification recovery", () => {
 				},
 			);
 			expect(calls).toEqual(["update", "recovery", "refresh"]);
+		});
+
+		it("keeps a successful update successful when the optional app offer rejects", async () => {
+			const calls: string[] = [];
+			await runUpdateCommand(
+				{ force: false, check: false },
+				{
+					platform: "darwin",
+					getLatestRelease: async () => release,
+					resolveUpdateTarget: async () => ({ method: "binary", path: "/standalone/gjc" }),
+					performUpdate: async () => ({ ok: true, path: "/standalone/gjc" }),
+					runPostUpdateRecovery: async () => {
+						calls.push("recovery");
+					},
+					refreshInstalledDefaultSkills: async () => {
+						calls.push("refresh");
+					},
+					offerCommunityApp: async runtimePath => {
+						calls.push(`offer:${runtimePath}`);
+						throw new Error("detach failed");
+					},
+				},
+			);
+			expect(calls).toEqual(["recovery", "refresh", "offer:/standalone/gjc"]);
+		});
+
+		it("runs the optional app offer from a verified migration runtime", async () => {
+			const calls: string[] = [];
+			const events: string[] = [];
+			await runUpdateCommand(
+				{ force: false, check: false },
+				{
+					platform: "darwin",
+					getLatestRelease: async () => release,
+					resolveUpdateTarget: async () => target,
+					verifyMigrationTarget: async () => ({ ok: true, actual: release.version, path: target.path }),
+					offerCommunityApp: async runtimePath => {
+						calls.push(`offer:${runtimePath}`);
+					},
+					recordTelemetryEvent: event => events.push(event),
+				},
+			);
+			expect(calls).toEqual(["offer:/standalone/gjc"]);
+			expect(events).toContain("update_install_completed");
 		});
 
 		it("does not preflight a migration target when the release decision is already up to date", async () => {

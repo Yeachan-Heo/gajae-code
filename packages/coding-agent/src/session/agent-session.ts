@@ -2401,7 +2401,7 @@ interface CanonicalMessageAdmission {
 type CoordinatorRuntimeStatePersistContext = {
 	sessionId: string;
 	cwd: string;
-	sessionFile: string | undefined;
+	sessionFile: string | null;
 	stateFile: string | null;
 };
 export class AgentSession {
@@ -6087,6 +6087,7 @@ export class AgentSession {
 		const generation = this.#coordinatorPersistGeneration;
 		const barrier = this.#coordinatorRescopeBarrier;
 		const persist = async () => {
+			if (context.stateFile === null) return;
 			if (barrier) {
 				await barrier;
 				return await persistCoordinatorWorkerIntegrationOutcome(context, {
@@ -6124,12 +6125,12 @@ export class AgentSession {
 		const context = {
 			sessionId: this.sessionId,
 			cwd: this.sessionManager.getCwd(),
-			sessionFile: this.sessionManager.getSessionFile(),
+			sessionFile: this.sessionManager.getSessionFile() ?? null,
 		};
 		const explicitStateFile = process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]?.trim();
 		const stateFile =
 			explicitStateFile ||
-			(context.sessionId.trim()
+			(context.sessionFile && context.sessionId.trim()
 				? path.join(sessionRuntimeDir(context.cwd, context.sessionId), "runtime-state.json")
 				: null);
 		return { ...context, stateFile };
@@ -6179,6 +6180,7 @@ export class AgentSession {
 		observation: CoordinatorToolObservation | undefined,
 		propagateFailure: boolean,
 	): Promise<void> {
+		if (context.stateFile === null) return;
 		try {
 			await persistCoordinatorRuntimeStateFromEvent(event, context, observation);
 		} catch (error) {

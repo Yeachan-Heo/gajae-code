@@ -5,9 +5,11 @@
  * lightweight CLI runner from pi-utils.
  */
 import "@gajae-code/utils/postmortem";
+import { logger } from "@gajae-code/utils";
 import { Args, type CliConfig, Command, type CommandEntry, run } from "@gajae-code/utils/cli";
 import { APP_NAME, formatBunRuntimeError, MIN_BUN_VERSION, VERSION } from "@gajae-code/utils/dirs";
 import { runFixtureReport } from "./cli/fixture-report";
+import { offerMacosCommunityApp } from "./cli/macos-community-app";
 import { ROOT_LAUNCH_FLAGS } from "./cli/root-flags";
 import QuickLane from "./commands/quick-lane";
 import { smokeTestTabWorker } from "./tools/browser/tab-worker-smoke";
@@ -26,6 +28,8 @@ if (Bun.semver.order(Bun.version, MIN_BUN_VERSION) < 0) {
 process.title = APP_NAME;
 const rootHelpFlags = ["--help", "-h", "help"];
 const versionFlags = ["--version", "-v"];
+const MACOS_COMMUNITY_APP_CAPABILITY_ARG = "--supports-macos-community-app";
+const MACOS_COMMUNITY_APP_INTERNAL_ARG = "--internal-macos-community-app-offer";
 const MANAGED_OWNER_SUPERVISOR_ARG = "--internal-managed-owner-supervisor";
 const MANAGED_OWNER_CHILD_TOKEN_ENV = "GJC_MANAGED_OWNER_CHILD_TOKEN";
 const TMUX_OWNER_ISOLATION_ARG = "--internal-tmux-owner-isolation";
@@ -448,6 +452,14 @@ export async function runCli(argv: string[]): Promise<void> {
 	}
 	if (argv[0] === "--smoke-test") {
 		await runSmokeTest();
+		return;
+	}
+	if (argv.length === 1 && argv[0] === MACOS_COMMUNITY_APP_CAPABILITY_ARG) {
+		process.stdout.write("macos-community-app-offer\n");
+		return;
+	}
+	if (argv.length === 1 && argv[0] === MACOS_COMMUNITY_APP_INTERNAL_ARG) {
+		await offerMacosCommunityApp({ log: message => logger.warn(message) });
 		return;
 	}
 	const fixtureArg = rootFixtureArg(argv);

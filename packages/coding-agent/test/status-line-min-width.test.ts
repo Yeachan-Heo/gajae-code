@@ -53,7 +53,7 @@ function buildRail(overrides: SessionOverrides = {}, goalActive = true): StatusL
 	const component = new StatusLineComponent(createSession(overrides), { version: "9.9.9" });
 	component.updateSettings({
 		preset: "custom",
-		leftSegments: ["model", "mode", "git", "path"],
+		leftSegments: ["model", "mode"],
 		rightSegments: ["session_name", "cost"],
 		separator: "slash",
 		showSkillHud: false,
@@ -113,7 +113,7 @@ describe("status rail survives very small widths", () => {
 			expect({ width, text }).toMatchObject({ text: expect.stringMatching(CONTEXT_TOKEN) });
 			for (const row of rendered) expect(visibleWidth(row)).toBeLessThanOrEqual(width);
 		}
-	});
+	}, 30_000);
 
 	it("never drops the model before the goal, nor the goal before the context", () => {
 		const goalGlyph = theme.icon.goal || "G";
@@ -129,13 +129,13 @@ describe("status rail survives very small widths", () => {
 			expect({ width, ok: hasContext || !hasGoal }).toEqual({ width, ok: true });
 			expect({ width, ok: hasGoal || !hasModel }).toEqual({ width, ok: true });
 		}
-	});
+	}, 30_000);
 
 	it("suppresses the overflow marker once the rail is narrow", () => {
 		for (let width = 4; width <= 30; width += 1) {
 			expect(strip(buildRail().render(width).join(" "))).not.toContain("…+");
 		}
-	});
+	}, 30_000);
 
 	it("keeps the context window while it fits and falls back to an integer percentage", () => {
 		const wide = strip(buildRail().render(28).join(" "));

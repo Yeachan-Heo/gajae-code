@@ -43,6 +43,10 @@ DEV_REPO_ROOT=""
 DEV_REQUESTED=0
 SOURCE_REQUESTED=0
 BINARY_REQUESTED=0
+OFFER_RUNTIME_DIR=""
+OFFER_RUNTIME_ACTIVE=""
+OFFER_RUNTIME_SIGNAL=""
+OFFER_RUNTIME_PID=""
 
 usage() {
     cat <<'EOF'
@@ -92,13 +96,27 @@ cleanup() {
     if [ -n "$SOURCE_CLONE_DIR" ] && [ -d "$SOURCE_CLONE_DIR" ]; then
         rm -rf "$SOURCE_CLONE_DIR"
     fi
+    if [ -z "$OFFER_RUNTIME_ACTIVE" ] && [ -n "$OFFER_RUNTIME_DIR" ] && [ -d "$OFFER_RUNTIME_DIR" ]; then
+        chmod 700 "$OFFER_RUNTIME_DIR" 2>/dev/null || true
+        rm -rf "$OFFER_RUNTIME_DIR" || true
+    fi
     return 0
 }
 
 trap cleanup EXIT
-trap 'cleanup; exit 130' INT
-trap 'cleanup; exit 143' TERM
-trap 'cleanup; exit 129' HUP
+forward_offer_signal() {
+    [ -z "$OFFER_RUNTIME_SIGNAL" ] || return 0
+    OFFER_RUNTIME_SIGNAL="$1"
+    if [ -n "$OFFER_RUNTIME_PID" ]; then
+        kill -s "$1" "$OFFER_RUNTIME_PID" 2>/dev/null || true
+    fi
+}
+handle_int() { if [ -n "$OFFER_RUNTIME_ACTIVE" ]; then forward_offer_signal INT; else cleanup; exit 130; fi; }
+handle_term() { if [ -n "$OFFER_RUNTIME_ACTIVE" ]; then forward_offer_signal TERM; else cleanup; exit 143; fi; }
+handle_hup() { if [ -n "$OFFER_RUNTIME_ACTIVE" ]; then forward_offer_signal HUP; else cleanup; exit 129; fi; }
+trap handle_int INT
+trap handle_term TERM
+trap handle_hup HUP
 
 remember_tmp() {
     TMP_FILES="${TMP_FILES}$1
@@ -367,6 +385,21 @@ This installer never downloads Bun."
     fi
 }
 
+community_app_offer_suppressed() {
+    no_offer=$(printf '%s' "${GJC_NO_COMMUNITY_APP:-}" | tr '[:upper:]' '[:lower:]')
+    case "$no_offer" in
+        1|true|yes|on) return 0 ;;
+    esac
+    for marker in "${CI:-}" "${GITHUB_ACTIONS:-}" "${GJC_NONINTERACTIVE:-}"; do
+        normalized_marker=$(printf '%s' "$marker" | tr '[:upper:]' '[:lower:]')
+        case "$normalized_marker" in
+            ""|0|false|no|off) ;;
+            *) return 0 ;;
+        esac
+    done
+    return 1
+}
+
 detect_platform() {
     OS="$(uname -s)"
     ARCH="$(uname -m)"
@@ -455,30 +488,40 @@ For branch/commit source installs, re-run with --source --ref <git-ref> and an e
 verify_checksum() {
     asset_name="$1"
     downloaded="$2"
+    VERIFY_CHECKSUM_OPTIONAL="${3:-}"
     exclusive_tmp "gjc.sha256"
     sums_tmp="$LAST_EXCLUSIVE_TMP"
     exclusive_tmp "gjc.manifest"
     manifest_tmp="$LAST_EXCLUSIVE_TMP"
     sums_url="${GITHUB_RELEASES}/${LATEST}/${BINARY_SHA256_ASSET}"
-    http_code=$(curl_github_optional "$sums_url" "$sums_tmp") || die "Failed to fetch integrity asset $sums_url. Existing install was not changed."
+    http_code=$(curl_github_optional "$sums_url" "$sums_tmp") || {
+        if [ "$VERIFY_CHECKSUM_OPTIONAL" = "optional" ]; then return 1; fi
+        die "Failed to fetch integrity asset $sums_url. Existing install was not changed."
+    }
     if [ "$http_code" = "200" ]; then
         expected=$(lookup_checksum "$sums_tmp" "$asset_name")
         if [ ${#expected} -ne 64 ]; then
+            if [ "$VERIFY_CHECKSUM_OPTIONAL" = "optional" ]; then return 1; fi
             die "Release checksum file ${BINARY_SHA256_ASSET} did not list ${asset_name}"
         fi
         actual=$(file_sha256 "$downloaded")
         if [ "$actual" != "$expected" ]; then
+            if [ "$VERIFY_CHECKSUM_OPTIONAL" = "optional" ]; then return 1; fi
             die "Checksum mismatch for ${asset_name}: expected ${expected}, got ${actual}. Existing install was not changed."
         fi
         echo "Verified SHA-256 for ${asset_name}"
         return 0
     fi
     if [ "$http_code" != "404" ]; then
+        if [ "$VERIFY_CHECKSUM_OPTIONAL" = "optional" ]; then return 1; fi
         die "Integrity asset ${BINARY_SHA256_ASSET} returned HTTP ${http_code}. Existing install was not changed."
     fi
 
     manifest_url="${GITHUB_RELEASES}/${LATEST}/${BINARY_MANIFEST_ASSET}"
-    http_code=$(curl_github_optional "$manifest_url" "$manifest_tmp") || die "Failed to fetch integrity asset $manifest_url. Existing install was not changed."
+    http_code=$(curl_github_optional "$manifest_url" "$manifest_tmp") || {
+        if [ "$VERIFY_CHECKSUM_OPTIONAL" = "optional" ]; then return 1; fi
+        die "Failed to fetch integrity asset $manifest_url. Existing install was not changed."
+    }
     if [ "$http_code" = "200" ]; then
         expected=$(awk -v name="$asset_name" '
             $0 ~ "\"name\"" && $0 ~ name { saw=1 }
@@ -493,19 +536,23 @@ verify_checksum() {
             }
         ' "$manifest_tmp")
         if [ ${#expected} -ne 64 ]; then
+            if [ "$VERIFY_CHECKSUM_OPTIONAL" = "optional" ]; then return 1; fi
             die "Release manifest ${BINARY_MANIFEST_ASSET} did not list a SHA-256 for ${asset_name}"
         fi
         actual=$(file_sha256 "$downloaded")
         if [ "$actual" != "$expected" ]; then
+            if [ "$VERIFY_CHECKSUM_OPTIONAL" = "optional" ]; then return 1; fi
             die "Checksum mismatch for ${asset_name}: expected ${expected}, got ${actual}. Existing install was not changed."
         fi
         echo "Verified SHA-256 for ${asset_name} from ${BINARY_MANIFEST_ASSET}"
         return 0
     fi
     if [ "$http_code" != "404" ]; then
+        if [ "$VERIFY_CHECKSUM_OPTIONAL" = "optional" ]; then return 1; fi
         die "Integrity asset ${BINARY_MANIFEST_ASSET} returned HTTP ${http_code}. Existing install was not changed."
     fi
 
+    if [ "$VERIFY_CHECKSUM_OPTIONAL" = "optional" ]; then return 1; fi
     die "Release ${LATEST} has no checksum assets. Existing install was not changed."
 }
 
@@ -646,6 +693,52 @@ install_binary() {
 
     echo ""
     echo "Installed gjc ${EXPECTED_VERSION} to ${DEST_PATH}"
+
+    # The verified runtime owns the optional macOS community-app flow so fresh
+    # installs and `gjc update` share the same supply-chain checks. The offer is
+    # strictly best-effort and must never change a successful GJC install.
+    if [ "$PLATFORM" = "darwin" ] && ! community_app_offer_suppressed; then
+        OFFER_RUNTIME_ACTIVE=1
+        OFFER_RUNTIME_DIR=$(mktemp -d "${INSTALL_DIR}/.gjc-community-app.XXXXXX" 2>/dev/null || true)
+        OFFER_RUNTIME="${OFFER_RUNTIME_DIR}/gjc"
+        if [ -n "$OFFER_RUNTIME_DIR" ] && [ ! -L "$DEST_PATH" ] && [ -f "$DEST_PATH" ] && cp -p "$DEST_PATH" "$OFFER_RUNTIME" 2>/dev/null; then
+            if chmod 500 "$OFFER_RUNTIME" 2>/dev/null && chmod 500 "$OFFER_RUNTIME_DIR" 2>/dev/null && [ -f "$OFFER_RUNTIME" ] && verify_checksum "$BINARY" "$OFFER_RUNTIME" optional; then
+                if "$OFFER_RUNTIME" --supports-macos-community-app </dev/null >/dev/null 2>&1; then
+                    if [ -t 1 ] && [ -r /dev/tty ]; then
+                        "$OFFER_RUNTIME" --internal-macos-community-app-offer < /dev/tty &
+                    else
+                        "$OFFER_RUNTIME" --internal-macos-community-app-offer &
+                    fi
+                    OFFER_RUNTIME_PID=$!
+                    if [ -n "$OFFER_RUNTIME_SIGNAL" ]; then
+                        kill -s "$OFFER_RUNTIME_SIGNAL" "$OFFER_RUNTIME_PID" 2>/dev/null || true
+                    fi
+                    wait "$OFFER_RUNTIME_PID" 2>/dev/null || true
+                    while [ -n "$OFFER_RUNTIME_SIGNAL" ] && kill -0 "$OFFER_RUNTIME_PID" 2>/dev/null; do
+                        wait "$OFFER_RUNTIME_PID" 2>/dev/null || true
+                    done
+                    OFFER_RUNTIME_PID=""
+                fi
+            fi
+            chmod 700 "$OFFER_RUNTIME_DIR" 2>/dev/null || true
+            rm -rf "$OFFER_RUNTIME_DIR" || true
+            OFFER_RUNTIME_DIR=""
+        elif [ -n "$OFFER_RUNTIME_DIR" ]; then
+            rm -rf "$OFFER_RUNTIME_DIR" || true
+            OFFER_RUNTIME_DIR=""
+        fi
+        OFFER_RUNTIME_ACTIVE=""
+        OFFER_SIGNAL_EXIT=0
+        case "$OFFER_RUNTIME_SIGNAL" in
+            INT) OFFER_SIGNAL_EXIT=130 ;;
+            TERM) OFFER_SIGNAL_EXIT=143 ;;
+            HUP) OFFER_SIGNAL_EXIT=129 ;;
+        esac
+        OFFER_RUNTIME_SIGNAL=""
+        if [ "$OFFER_SIGNAL_EXIT" -ne 0 ]; then
+            exit "$OFFER_SIGNAL_EXIT"
+        fi
+    fi
 
     case ":$PATH:" in
         *":$INSTALL_DIR:"*) echo "Run 'gjc' to get started!" ;;

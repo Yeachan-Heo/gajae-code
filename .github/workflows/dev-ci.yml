@@ -666,6 +666,11 @@ jobs:
           printf 'CI_DEV_DARWIN_SMOKE_XDG_CONFIG_HOME=%s\n' "$runtime_dir/xdg/config" >> "$GITHUB_ENV"
           printf 'CI_DEV_DARWIN_SMOKE_XDG_DATA_HOME=%s\n' "$runtime_dir/xdg/data" >> "$GITHUB_ENV"
           printf 'CI_DEV_DARWIN_SMOKE_XDG_CACHE_HOME=%s\n' "$runtime_dir/xdg/cache" >> "$GITHUB_ENV"
+      - name: Smoke compiled community-app offer boundary
+        shell: bash
+        run: |
+          test "$(HOME="$CI_DEV_DARWIN_SMOKE_HOME" XDG_CONFIG_HOME="$CI_DEV_DARWIN_SMOKE_XDG_CONFIG_HOME" XDG_DATA_HOME="$CI_DEV_DARWIN_SMOKE_XDG_DATA_HOME" XDG_CACHE_HOME="$CI_DEV_DARWIN_SMOKE_XDG_CACHE_HOME" CI=true packages/coding-agent/dist/gjc --supports-macos-community-app)" = "macos-community-app-offer"
+          HOME="$CI_DEV_DARWIN_SMOKE_HOME" XDG_CONFIG_HOME="$CI_DEV_DARWIN_SMOKE_XDG_CONFIG_HOME" XDG_DATA_HOME="$CI_DEV_DARWIN_SMOKE_XDG_DATA_HOME" XDG_CACHE_HOME="$CI_DEV_DARWIN_SMOKE_XDG_CACHE_HOME" CI=true packages/coding-agent/dist/gjc --internal-macos-community-app-offer
       - name: Write immutable Darwin smoke receipt
         env:
           CI_DEV_DARWIN_BINARY: packages/coding-agent/dist/gjc
