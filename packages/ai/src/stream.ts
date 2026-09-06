@@ -494,6 +494,9 @@ export async function complete<TApi extends Api>(
 	options?: OptionsForApi<TApi>,
 ): Promise<AssistantMessage> {
 	const s = stream(model, context, options);
+	for await (const _event of s) {
+		// Completion callers only need the terminal message, not buffered events.
+	}
 	return s.result();
 }
 
@@ -818,6 +821,9 @@ export async function completeSimple<TApi extends Api>(
 	options?: SimpleStreamOptions,
 ): Promise<AssistantMessage> {
 	const s = streamSimple(model, context, options);
+	for await (const _event of s) {
+		// Completion callers only need the terminal message, not buffered events.
+	}
 	return s.result();
 }
 

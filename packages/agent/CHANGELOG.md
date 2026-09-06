@@ -4,6 +4,10 @@
 
 - Compaction summary, turn-prefix summary, and handoff generation now clamp their reasoning effort to the model they are about to call instead of hard-coding `high`. A reasoning-capable model on a transport without reasoning control (the registry strips `thinking` when `openai-codex` or `anthropic` is routed through a non-audited proxy `baseUrl`) rejected the raw effort inside the provider mapper with "Model <provider>/<id> does not support thinking"; since the compaction fallback chain then reaches for the same-provider largest-context model, every candidate died on that throw and auto-compaction reported only the last one. The agent turn already clamps through `clampThinkingLevelForModel`; the maintenance calls were the one path still sending an unclamped effort.
 
+### Performance
+
+- Bound stream abort-race retention to the current read and reuse history hashes when checking append-only context rewrites.
+
 ## [0.16.4] - 2026-09-05
 
 - Provider calls now carry the agent-owned opaque provider conversation identity separately from generic session/cache affinity, including compaction, handoff, turn-prefix summary, and branch-summary maintenance calls. This lets provider-specific conversation headers remain stable without treating prompt-derived gateway cache keys as conversation authority (#5295).
