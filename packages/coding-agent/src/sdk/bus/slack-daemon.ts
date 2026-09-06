@@ -1784,7 +1784,8 @@ export class SlackNotificationDaemon {
 					right.candidate.updatedAt - left.candidate.updatedAt,
 			)[0];
 		if (!matched) return undefined;
-		const { mappingKey: key, candidate: record } = matched;
+		const { mappingKey: key } = matched;
+		let record = matched.candidate;
 		if (
 			!record.sessionId ||
 			!record.endpointGeneration ||
@@ -1798,6 +1799,23 @@ export class SlackNotificationDaemon {
 			!attachmentAcceptsAuthority(endpoint, record.attachmentAuthorityId)
 		)
 			return undefined;
+		// Attachment resolution may migrate the mapping, effects, and inbound
+		// receipts. The candidate selected before resolution is therefore only a
+		// lookup hint; all routing decisions must use the post-migration image.
+		const resolvedRecord = await this.store.read(key);
+		if (
+			!resolvedRecord?.sessionId ||
+			resolvedRecord.teamId !== inbound.teamId ||
+			resolvedRecord.channelId !== inbound.channelId ||
+			resolvedRecord.rootTs !== inbound.rootTs ||
+			resolvedRecord.sessionId !== record.sessionId ||
+			resolvedRecord.endpointGeneration !== endpoint.generation ||
+			!acceptsSlackInbound(resolvedRecord, inbound.rootTs, endpoint.generation) ||
+			!attachmentAcceptsAuthority(endpoint, resolvedRecord.attachmentAuthorityId)
+		)
+			return undefined;
+		record = resolvedRecord;
+		const resolvedSessionId = resolvedRecord.sessionId;
 		const interactionId = text(inbound.event.client_msg_id) ?? inbound.eventId;
 		const retryKey = `${inbound.eventId}:${interactionId}`;
 		const inboundText = text(inbound.event.text);
@@ -1825,11 +1843,11 @@ export class SlackNotificationDaemon {
 			? { type: "command", content: inboundText, idempotencyKey, routing }
 			: actionId
 				? { type: "reply", id: actionId, answer: inboundText, idempotencyKey, routing }
-				: { type: "user_message", sessionId: record.sessionId, text: inboundText, idempotencyKey, routing };
+				: { type: "user_message", sessionId: resolvedSessionId, text: inboundText, idempotencyKey, routing };
 		let sessionId: string | undefined;
 		let receipt: SlackInboundDispatchReceipt | undefined;
 		let payload: SlackInboundEffectPayload = initialPayload;
-		await this.#journal.withSessionMutationGate(record.sessionId, async () => {
+		await this.#journal.withSessionMutationGate(resolvedSessionId, async () => {
 			const existingEffect = await this.#journal.read<SlackInboundEffectPayload>(effectId);
 			payload = existingEffect?.payload ?? initialPayload;
 			const dispatchKind = payload.routing.kind;
@@ -1843,7 +1861,7 @@ export class SlackNotificationDaemon {
 								? "sdk.inbound.reply"
 								: "sdk.inbound.user_message",
 					transport: "slack",
-					sessionId: record.sessionId,
+					sessionId: resolvedSessionId,
 					endpointGeneration: endpoint.generation,
 					payload,
 				}),
@@ -2313,8 +2331,10 @@ export class SlackNotificationDaemon {
 		await this.#reconcileTerminalInboundReceipts();
 		const document = await this.store.load();
 		const dispatchableEffectIds = new Set<string>();
-		for (const [key, record] of Object.entries(document.conversations)) {
-			for (const receipt of record.inboundDispatches ?? []) {
+		for (const [key, listedRecord] of Object.entries(document.conversations)) {
+			for (const listedReceipt of listedRecord.inboundDispatches ?? []) {
+				let record = listedRecord;
+				let receipt = listedReceipt;
 				let effect = await this.#journal.read<SlackInboundEffectPayload>(receipt.effectId);
 				if (effect?.state === "dispatching") {
 					const inflightKey = `${key}\u0000${receipt.key}`;
@@ -2332,11 +2352,22 @@ export class SlackNotificationDaemon {
 				// into a definite stale refusal: doing so would erase the ambiguity and
 				// make a duplicate provider envelope eligible for a new dispatch.
 				if (effect?.state === "uncertain") continue;
+				const endpoint = await this.#resolveAttachment(record.sessionId!);
+				// Resolving an attachment can migrate the durable mapping, effect
+				// payload, and receipt authority. Reload all three by their immutable
+				// identities before deciding whether recovery is still dispatchable.
+				const postMigration = await this.#reloadInboundDispatch(key, receipt);
+				if (!postMigration) {
+					await this.#terminalizeStaleInboundDispatch(key, receipt, "stale_mapping");
+					continue;
+				}
+				record = postMigration.record;
+				receipt = postMigration.receipt;
+				effect = postMigration.effect;
 				if (!this.#mappedInboundDispatchable(record, receipt, effect)) {
 					await this.#terminalizeStaleInboundDispatch(key, receipt, "stale_mapping");
 					continue;
 				}
-				const endpoint = await this.#resolveAttachment(record.sessionId!);
 				if (
 					!endpoint ||
 					endpoint.generation !== receipt.endpointGeneration ||
@@ -2357,7 +2388,8 @@ export class SlackNotificationDaemon {
 				}
 			}
 		}
-		for (const effect of await this.#journal.list()) {
+		for (const listedEffect of await this.#journal.list()) {
+			let effect = listedEffect;
 			if (effect.state === "dispatching") {
 				if ((effect.leaseExpiresAt ?? 0) > this.#now()) continue;
 				await this.#journal.recoverDispatchingAsUncertain(effect.id, { onlyIfExpired: true });
@@ -2377,15 +2409,22 @@ export class SlackNotificationDaemon {
 			const adopted = await this.#adoptOrphanInbound(effect as ChatEffect<SlackInboundEffectPayload>);
 			if (!adopted) continue;
 			const endpoint = await this.#resolveAttachment(adopted.sessionId);
+			const postMigration = await this.#reloadInboundDispatch(adopted.key, adopted.receipt);
+			if (!postMigration) {
+				await this.#terminalizeStaleInboundDispatch(adopted.key, adopted.receipt, "stale_mapping");
+				continue;
+			}
+			effect = postMigration.effect;
+			const receipt = postMigration.receipt;
 			if (
 				!endpoint ||
-				endpoint.generation !== adopted.receipt.endpointGeneration ||
+				endpoint.generation !== receipt.endpointGeneration ||
 				!(await this.#inboundEffectCurrent(
-					{ key: adopted.key, endpoint, sessionId: adopted.sessionId, receipt: adopted.receipt },
+					{ key: adopted.key, endpoint, sessionId: adopted.sessionId, receipt },
 					effect.id,
 				))
 			) {
-				await this.#terminalizeStaleInboundDispatch(adopted.key, adopted.receipt, "stale_binding");
+				await this.#terminalizeStaleInboundDispatch(adopted.key, receipt, "stale_binding");
 				continue;
 			}
 			if (effect.state === "leased" && (effect.leaseExpiresAt ?? 0) > this.#now()) continue;
@@ -2393,7 +2432,7 @@ export class SlackNotificationDaemon {
 				key: adopted.key,
 				endpoint,
 				sessionId: adopted.sessionId,
-				receipt: adopted.receipt,
+				receipt,
 			});
 		}
 	}
@@ -2465,6 +2504,48 @@ export class SlackNotificationDaemon {
 					routing.kind === "message" &&
 					effect.kind === "sdk.inbound.user_message" &&
 					payload.sessionId === effect.sessionId))
+		);
+	}
+	async #reloadInboundDispatch(
+		key: string,
+		reference: SlackInboundDispatchReceipt,
+	): Promise<
+		| {
+				record: SlackConversation;
+				receipt: SlackInboundDispatchReceipt;
+				effect: ChatEffect<SlackInboundEffectPayload>;
+		  }
+		| undefined
+	> {
+		const [record, effect] = await Promise.all([
+			this.store.read(key),
+			this.#journal.read<SlackInboundEffectPayload>(reference.effectId),
+		]);
+		if (!record || !effect) return undefined;
+		if (
+			!record.sessionId ||
+			effect.sessionId !== record.sessionId ||
+			effect.endpointGeneration !== reference.endpointGeneration ||
+			effect.endpointGeneration !== record.endpointGeneration
+		)
+			return undefined;
+		const receipt = (record.inboundDispatches ?? []).find(candidate =>
+			this.#sameInboundIdentity(candidate, reference),
+		);
+		return receipt ? { record, receipt, effect } : undefined;
+	}
+	#sameInboundIdentity(left: SlackInboundDispatchReceipt, right: SlackInboundDispatchReceipt): boolean {
+		return (
+			left.key === right.key &&
+			left.eventId === right.eventId &&
+			left.interactionId === right.interactionId &&
+			left.retryKey === right.retryKey &&
+			left.eventContext === right.eventContext &&
+			left.kind === right.kind &&
+			left.actionId === right.actionId &&
+			left.endpointGeneration === right.endpointGeneration &&
+			left.effectId === right.effectId &&
+			left.idempotencyKey === right.idempotencyKey
 		);
 	}
 	#sameInboundReceipt(left: SlackInboundDispatchReceipt, right: SlackInboundDispatchReceipt): boolean {
