@@ -173,6 +173,8 @@ describe("AgentSession silent-abort marker stamping", () => {
 				partial: provisional,
 			},
 		});
+		const provisionalText = provisional.content[0];
+		if (provisionalText?.type === "text") provisionalText.text = "mutated after captured update";
 		session.markPlanCompactAbortPending();
 		expect(session.isPlanCompactAbortPending).toBe(true);
 		const rawAgentEnd: Extract<AgentEvent, { type: "agent_end" }> = {
@@ -208,6 +210,56 @@ describe("AgentSession silent-abort marker stamping", () => {
 				),
 		).toBe(true);
 		expect(session.isPlanCompactAbortPending).toBe(false);
+	});
+
+	it("matches forced recovery by attempt scope after abort advances prompt generation", async () => {
+		fixture = await createSessionWithObfuscator();
+		const { session } = fixture;
+		const scope = { attemptId: "forced-orphan", generation: 1, lineage: "main" as const };
+		const partial = makeStoppedAssistantMessage("forced partial");
+		session.agent.emitExternalEvent({ type: "message_start", message: partial, scope });
+		await session.awaitSessionSettlement();
+		const beforeAbortGeneration = session.transcriptPromptGeneration;
+		await session.abort();
+		expect(session.transcriptPromptGeneration).toBeGreaterThan(beforeAbortGeneration);
+		const terminal: Extract<AgentEvent, { type: "agent_end" }> = {
+			type: "agent_end",
+			messages: [],
+			stopReason: "cancelled",
+			scope,
+		};
+		session.agent.emitExternalEvent(terminal);
+		await session.awaitSessionSettlement();
+
+		const recovered = terminal.messages.find((message): message is AssistantMessage => message.role === "assistant");
+		expect(recovered?.stopReason).toBe("aborted");
+		expect(recovered?.content).toEqual([{ type: "text", text: "forced partial" }]);
+		expect(recovered && getSessionMessageEntryId(recovered)).toBeDefined();
+	});
+
+	it("canonically admits an authoritative external terminal without message_end", async () => {
+		fixture = await createSessionWithObfuscator();
+		const { session } = fixture;
+		const finalMessage = makeStoppedAssistantMessage("external final");
+		const terminal: Extract<AgentEvent, { type: "agent_end" }> = {
+			type: "agent_end",
+			messages: [finalMessage],
+			stopReason: "completed",
+		};
+		session.agent.emitExternalEvent(terminal);
+		await session.awaitSessionSettlement();
+
+		expect(getSessionMessageEntryId(finalMessage)).toBeDefined();
+		expect(session.agent.state.messages.filter(message => message === finalMessage)).toHaveLength(1);
+		expect(
+			session
+				.buildDisplaySessionContext()
+				.messages.some(
+					message =>
+						message === finalMessage ||
+						getSessionMessageEntryId(message) === getSessionMessageEntryId(finalMessage),
+				),
+		).toBe(true);
 	});
 
 	it("does not recover a predecessor partial after a branch rotates session identity", async () => {
@@ -262,10 +314,7 @@ describe("AgentSession silent-abort marker stamping", () => {
 			stopReason: "cancelled",
 		};
 		session.agent.emitExternalEvent(terminal);
-		for (let attempt = 0; attempt < 50; attempt++) {
-			if (events.some(event => event.type === "notice" && event.source === "session-persistence")) break;
-			await Bun.sleep(1);
-		}
+		await session.awaitSessionSettlement();
 
 		expect(events).toContainEqual(
 			expect.objectContaining({
@@ -274,6 +323,8 @@ describe("AgentSession silent-abort marker stamping", () => {
 				source: "session-persistence",
 			}),
 		);
+		expect(events).toContain(terminal);
+		expect((terminal as Extract<AgentSessionEvent, { type: "agent_end" }>).terminalPersistenceFailed).toBe(true);
 		expect(terminal.messages).toHaveLength(0);
 		expect(session.agent.state.messages.some(message => message === partial)).toBe(false);
 	});
@@ -361,6 +412,8 @@ describe("AgentSession silent-abort marker stamping", () => {
 			throw new Error("expected emitted message_end to be an assistant message");
 		}
 		expect(emittedMessage.errorMessage).toBe(SILENT_ABORT_MARKER);
+		expect(emitted.silentAbort).toBe(true);
+		expect(Object.getOwnPropertyDescriptor(emitted, "silentAbort")?.writable).toBe(false);
 
 		// Prove the obfuscator branch actually ran by asserting the emitted message
 		// is a distinct object (post-spread) AND its content was deobfuscated back to
