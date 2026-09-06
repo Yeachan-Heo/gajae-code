@@ -5634,7 +5634,7 @@ async function executeToolCalls(
 				isError = true;
 			}
 
-			if (afterToolCall) {
+			if (afterToolCall && !record.skipped) {
 				try {
 					const after = await afterToolCall(
 						{
