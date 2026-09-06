@@ -1,15 +1,16 @@
 // Advisory perf baselines: recording only; hard gating deferred to perf-gates.test.ts.
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { __animationSchedulerTestHooks } from "@gajae-code/tui";
+import { __animationSchedulerTestHooks, type Component, CURSOR_MARKER, TUI } from "@gajae-code/tui";
 import { __editorPerfCounters, Editor } from "@gajae-code/tui/components/editor";
 import { __loaderPerfCounters, Loader } from "@gajae-code/tui/components/loader";
 import * as markdownCache from "@gajae-code/tui/components/markdown";
 import { __markdownPerfCounters, clearRenderCache, Markdown } from "@gajae-code/tui/components/markdown";
-import { renderMetrics } from "@gajae-code/tui/metrics";
-import { __textHelperPerfCounters } from "@gajae-code/tui/utils";
+import { type RenderMetricsSnapshot, renderMetrics } from "@gajae-code/tui/metrics";
+import { __textHelperPerfCounters, visibleWidth } from "@gajae-code/tui/utils";
 import { $flag } from "@gajae-code/utils";
 import { makeRecordedSession, type ReplayFixture, runReplay } from "./replay-harness";
 import { defaultEditorTheme, defaultMarkdownTheme } from "./test-themes";
+import { VirtualTerminal } from "./virtual-terminal";
 
 function expectFiniteNonNegative(value: number): void {
 	expect(Number.isFinite(value)).toBe(true);
@@ -262,8 +263,212 @@ describe("advisory performance baselines", () => {
 		it("records line normalization/diff baselines for a 100k-line transcript append", async () => {
 			await runTranscriptAppendBaseline(100_000, "100k");
 		}, 120000);
+
+		it("records width-scan CPU, fresh input, and actual-resize evidence", async () => {
+			// A comparison checkout must not accidentally import the candidate through workspace links.
+			expect(import.meta.resolve("@gajae-code/tui")).toBe(new URL("../src/index.ts", import.meta.url).href);
+			const reports = [];
+			for (const metrics of [false, true]) {
+				for (const count of [64, 8_000, 40_000]) {
+					for (const phase of ["normal", "input"] as const)
+						reports.push(await runWidthScanWorkload(count, phase, metrics));
+				}
+				reports.push(await runWidthScanWorkload(40_000, "resize", metrics));
+			}
+			const report = {
+				schemaVersion: 1,
+				bun: Bun.version,
+				platform: process.platform,
+				arch: process.arch,
+				runtime: process.execPath,
+				tuiEntry: import.meta.resolve("@gajae-code/tui"),
+				sourceSha256: sha256(await Bun.file(new URL("../src/tui.ts", import.meta.url)).arrayBuffer()),
+				fixtureSourceSha256: sha256(await Bun.file(new URL(import.meta.url)).arrayBuffer()),
+				nativeSha256: process.env.GJC_WIDTH_SCAN_NATIVE_SHA ?? null,
+				flags: {
+					virtualViewport: process.env.PI_TUI_VIRTUAL_VIEWPORT ?? null,
+					tmux: process.env.TMUX ?? null,
+					screen: process.env.STY ?? null,
+				},
+				reports,
+			};
+			if (process.env.GJC_WIDTH_SCAN_REPORT)
+				await Bun.write(process.env.GJC_WIDTH_SCAN_REPORT, JSON.stringify(report, null, 2));
+			console.log(
+				`[width-scan] ${reports.length} workloads; 5 warmups + 20 samples; CPU/frame/input scopes separate`,
+			);
+		}, 120000);
 	}
 });
+
+type WidthScanPhase = "normal" | "input" | "resize";
+
+class WidthScanTranscript implements Component {
+	tail = "tail-setup";
+
+	constructor(readonly lines: string[]) {}
+
+	invalidate(): void {}
+
+	render(): string[] {
+		return [...this.lines, this.tail];
+	}
+}
+
+function sha256(value: string | ArrayBuffer): string {
+	return new Bun.CryptoHasher("sha256").update(value).digest("hex");
+}
+
+function widthScanDigest(value: unknown): string {
+	return sha256(JSON.stringify(value, (_key, item) => (typeof item === "bigint" ? item.toString() : item)));
+}
+
+async function runWidthScanWorkload(count: number, phase: WidthScanPhase, metrics: boolean) {
+	const lines = Array.from({ length: count }, (_value, index) => {
+		const text = `${index.toString().padStart(6, "0")} :: stable transcript 한글 wide 界 payload`;
+		return index % 3 === 0 ? `\x1b[36m${text}\x1b[0m` : text;
+	});
+	const fixtureHash = widthScanDigest(lines);
+	const terminal = new VirtualTerminal(100, 30, { isProcessTerminal: true });
+	const tui = new TUI(terminal, false, { widthSettleMs: 0 });
+	const transcript = new WidthScanTranscript(lines);
+	let editor: Editor | undefined;
+	let initialRawRows: string[];
+	const samples: Array<{
+		observedMs: number;
+		cpuUserMicros: number;
+		cpuSystemMicros: number;
+		bytes: number;
+		writes: number;
+		stateHash: string;
+	}> = [];
+	let warmMemory: NodeJS.MemoryUsage | undefined;
+	let liveMemory: NodeJS.MemoryUsage | undefined;
+	let frameMetrics: RenderMetricsSnapshot;
+	let measuredFrames = 0;
+	let startupBytes = 0;
+	let teardownBytes = 0;
+	try {
+		tui.addChild(transcript);
+		// The resize control has no width-padded editor/suffix: every raw row fits
+		// both 99 and 100 columns, so it must visit the full history.
+		if (phase !== "resize") {
+			editor = new Editor(defaultEditorTheme);
+			tui.addChild(editor);
+			editor.setBorderVisible(false);
+			editor.setText("input");
+			tui.setBottomPinnedComponent(editor);
+			tui.setFocus(editor);
+		}
+		initialRawRows = tui.render(100);
+		// TUI extracts this marker before forming the rows scanned for reflow.
+		expect(
+			initialRawRows.every(line => visibleWidth(line.replace(CURSOR_MARKER, "")) <= (phase === "resize" ? 99 : 100)),
+		).toBe(true);
+		tui.start();
+		const setup = tui.requestRenderWithGeneration(false, "width-scan.setup");
+		expect(await tui.waitForRenderCommit(setup, 5_000)).toBe(true);
+		await terminal.flush();
+		startupBytes = terminal.getWriteLog().reduce((sum, text) => sum + Buffer.byteLength(text), 0);
+		if (metrics) renderMetrics.enable();
+		else renderMetrics.disable();
+		for (let sample = 0; sample < 25; sample++) {
+			terminal.clearWriteLog();
+			if (sample === 5) {
+				Bun.gc(true);
+				warmMemory = process.memoryUsage();
+				renderMetrics.reset();
+			}
+			const cpuStart = process.cpuUsage();
+			let started = performance.now();
+			let generation: number;
+			if (phase === "resize") {
+				terminal.resize(terminal.columns === 100 ? 99 : 100, 30);
+				// Obtain a waiter without turning this real resize into a semantic mutation.
+				generation = tui.requestRenderWithGeneration(false, "resize");
+			} else {
+				transcript.tail = `tail-${sample.toString().padStart(2, "0")}`;
+				generation = tui.requestRenderWithGeneration(false, "width-scan.normal");
+				if (phase === "input") {
+					started = performance.now();
+					terminal.sendInput(String.fromCharCode(65 + sample));
+				}
+			}
+			expect(await tui.waitForRenderCommit(generation, 5_000)).toBe(true);
+			await terminal.flush();
+			const viewport = terminal.getViewport();
+			expect(viewport.some(line => line.trim() === transcript.tail)).toBe(true);
+			if (editor) {
+				const expected = phase === "input" ? `input${"ABCDEFGHIJKLMNOPQRSTUVWXY".slice(0, sample + 1)}` : "input";
+				expect(editor.getText()).toBe(expected);
+				expect(viewport.map(line => line.trim())).toContain(`${expected}${defaultEditorTheme.symbols.inputCursor}`);
+			}
+			const observedMs = performance.now() - started;
+			const cpu = process.cpuUsage(cpuStart);
+			if (sample >= 5) {
+				measuredFrames++;
+				const writes = terminal.getWriteLog();
+				samples.push({
+					observedMs,
+					cpuUserMicros: cpu.user,
+					cpuSystemMicros: cpu.system,
+					bytes: writes.reduce((sum, text) => sum + Buffer.byteLength(text), 0),
+					writes: writes.length,
+					stateHash: widthScanDigest({
+						writes,
+						viewport,
+						scrollback: terminal.getScrollBuffer(),
+						observation: tui.getViewportObservation(),
+						anchors: tui.getViewportAnchorSnapshot(),
+					}),
+				});
+			}
+		}
+		frameMetrics = renderMetrics.snapshot();
+		expect(measuredFrames).toBe(20);
+		if (metrics) expect(frameMetrics.renderCount).toBe(20);
+		Bun.gc(true);
+		liveMemory = process.memoryUsage();
+	} finally {
+		terminal.clearWriteLog();
+		tui.stop();
+		tui.dispose();
+		await terminal.flush();
+		teardownBytes = terminal.getWriteLog().reduce((sum, text) => sum + Buffer.byteLength(text), 0);
+		terminal.reset();
+		terminal.clearWriteLog();
+		renderMetrics.disable();
+		renderMetrics.reset();
+	}
+	Bun.gc(true);
+	return {
+		count,
+		phase,
+		metrics,
+		fixtureHash,
+		actualRawRows: initialRawRows.length,
+		fixtureUtf8Bytes: lines.reduce((sum, line) => sum + Buffer.byteLength(line), 0),
+		widths: phase === "resize" ? [100, 99] : [100],
+		rows: 30,
+		warmups: 5,
+		measuredFrames,
+		startupBytes,
+		teardownBytes,
+		frame: metrics ? frameMetrics.renderDurations : null,
+		lineCounts: metrics ? frameMetrics.lineCounts : null,
+		memory: { warm: warmMemory, live: liveMemory, afterDispose: process.memoryUsage() },
+		memoryScope: "Forced-GC samples; fixture and disposed harness remain referenced; not a leak/reclaim proof",
+		latencyScope:
+			phase === "input"
+				? "Dispatch through verified fresh emulator content"
+				: "Request through verified emulator content; includes scheduling",
+		frameScope:
+			"Synchronous render/immediate commit after preparations; excludes deferred terminal/emulator completion",
+		cpuScope:
+			"Process CPU for mutation/resize/input through fresh observation, including queued normal work; excludes state hashing and memory samples",
+		samples,
+	};
+}
 
 async function runTranscriptAppendBaseline(lineCount: number, label: string): Promise<void> {
 	const fixture: ReplayFixture = {
