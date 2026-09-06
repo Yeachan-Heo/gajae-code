@@ -10,7 +10,10 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { pipeline } from "node:stream/promises";
+import type { Process as NativeProcess } from "@gajae-code/natives";
 import { $which, APP_NAME, isCompiledBinary, isEnoent, logger, redactCrashSecrets, VERSION } from "@gajae-code/utils";
+import { nativeProcessBindings } from "@gajae-code/utils/native-process";
+import * as postmortem from "@gajae-code/utils/postmortem";
 import { $ } from "bun";
 import chalk from "chalk";
 import { Settings } from "../config/settings";
@@ -30,7 +33,7 @@ import {
 	verifyDownloadedBinaryChecksum,
 	versionFromTag,
 } from "./github-release";
-import { offerMacosCommunityApp } from "./macos-community-app";
+import { type CommunityAppOfferResult, offerMacosCommunityApp } from "./macos-community-app";
 import { runNotifyCommand } from "./notify-cli";
 
 const PACKAGE = "@gajae-code/coding-agent";
@@ -1324,10 +1327,84 @@ async function recoverManagedNotifications(settings: Settings): Promise<void> {
 	await runNotifyCommand({ action: "recovery", rawArgs: [], forceDaemonLock: false }, { settings });
 }
 
-async function spawnPostUpdateRecovery(argv: string[]): Promise<number> {
-	const child = Bun.spawn(argv, { stdin: "inherit", stdout: "inherit", stderr: "inherit" });
-	return await child.exited;
+async function spawnPostUpdateRecovery(argv: string[], onSpawn?: (pid: number) => void): Promise<number> {
+	const child = Bun.spawn(argv, {
+		stdin: "inherit",
+		stdout: "inherit",
+		stderr: "inherit",
+	});
+	const childPid = child.pid;
+	onSpawn?.(childPid);
+	const processRef: NativeProcess | null = nativeProcessBindings().Process.fromPid(childPid);
+	if (!processRef) {
+		child.kill("SIGKILL");
+		await Promise.race([child.exited.catch(() => undefined), Bun.sleep(500)]);
+		return 125;
+	}
+	const livenessHold = setInterval(() => {}, 1_000);
+	let termination: Promise<void> | undefined;
+	const terminate = (signal: "SIGINT" | "SIGTERM" | "SIGHUP"): Promise<void> => {
+		if (termination) return termination;
+		termination = (async () => {
+			const exitCode = signal === "SIGINT" ? 130 : signal === "SIGHUP" ? 129 : 143;
+			process.exitCode = exitCode;
+			process.once("exit", () => {
+				process.exitCode = exitCode;
+			});
+			const exitHold = setInterval(() => {}, 1_000);
+			setTimeout(() => process.exit(exitCode), 4_500);
+			const signalNumber = signal === "SIGINT" ? 2 : signal === "SIGHUP" ? 1 : 15;
+			processRef.killTree(signalNumber);
+			if (!(await processRef.waitForExit({ timeoutMs: 3_000 }))) {
+				processRef.killTree(9);
+				processRef.signalRoot(9);
+				if (!(await processRef.waitForExit({ timeoutMs: 1_000 })))
+					throw new Error("verified recovery child remained alive after forceful termination");
+			}
+			await child.exited;
+			await postmortem.quit(exitCode);
+			// postmortem.quit owns process termination; retain the liveness hold until
+			// that exact signal exit occurs.
+			void exitHold;
+		})();
+		return termination;
+	};
+	const unregister = postmortem.register("update:verified-runtime-recovery", reason => {
+		const signal =
+			reason === postmortem.Reason.SIGINT ? "SIGINT" : reason === postmortem.Reason.SIGHUP ? "SIGHUP" : "SIGTERM";
+		return terminate(signal);
+	});
+	const signalHandlers = new Map<NodeJS.Signals, () => void>();
+	for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
+		const handler = (): void => {
+			const exitCode = signal === "SIGINT" ? 130 : signal === "SIGHUP" ? 129 : 143;
+			process.exitCode = exitCode;
+			process.once("exit", () => {
+				process.exitCode = exitCode;
+			});
+			const signalNumber = signal === "SIGINT" ? 2 : signal === "SIGHUP" ? 1 : 15;
+			processRef.killTree(signalNumber);
+			// Signal dispatch itself is not awaitable. Reserve most of the shared
+			// five-second postmortem budget for the child offer's bounded cleanup,
+			// then force the pinned process tree down before other exit handlers run.
+			Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 3_000);
+			processRef.killTree(9);
+			processRef.signalRoot(9);
+			void terminate(signal);
+		};
+		signalHandlers.set(signal, handler);
+		process.prependListener(signal, handler);
+	}
+	try {
+		return await child.exited;
+	} finally {
+		clearInterval(livenessHold);
+		unregister();
+		for (const [signal, handler] of signalHandlers) process.off(signal, handler);
+	}
 }
+
+export const spawnPostUpdateRecoveryForTest = spawnPostUpdateRecovery;
 
 async function runCommunityAppOfferFromRuntime(
 	runtimePath: string,
@@ -1339,6 +1416,19 @@ async function runCommunityAppOfferFromRuntime(
 	}
 	const result = await offerMacosCommunityApp();
 	if (result.status === "failed") throw new Error(result.reason);
+}
+
+export async function runVerifiedRuntimeRecovery(
+	options: {
+		platform?: NodeJS.Platform;
+		recover?: () => Promise<void>;
+		offer?: () => Promise<CommunityAppOfferResult>;
+	} = {},
+): Promise<void> {
+	await (options.recover ?? (() => runManagedNotifyRecovery({})))();
+	if ((options.platform ?? process.platform) !== "darwin") return;
+	const result = await (options.offer ?? offerMacosCommunityApp)();
+	if (result.status === "failed") logger.warn(`Warning: optional macOS community app offer failed: ${result.reason}`);
 }
 
 async function supportsUpdateRecovery(runtimePath: string): Promise<boolean> {
@@ -1650,7 +1740,12 @@ export async function runUpdateCommand(
 	// The installed runtime completes recovery before this old updater process
 	// refreshes opt-in local definitions, avoiding stale-module daemon control.
 	await refreshDefaults();
-	if (installedVersion && installedRuntimePath && (deps.platform ?? process.platform) === "darwin") {
+	if (
+		deps.offerCommunityApp &&
+		installedVersion &&
+		installedRuntimePath &&
+		(deps.platform ?? process.platform) === "darwin"
+	) {
 		try {
 			await runCommunityAppOfferFromRuntime(installedRuntimePath, deps);
 		} catch (error) {

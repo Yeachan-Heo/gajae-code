@@ -10,6 +10,7 @@ import {
 	COMMUNITY_APP_SUPPRESS_ENV,
 	COMMUNITY_APP_TEAM_ID,
 	communityAppAssetMatchesArchitectureForTest,
+	hasExpectedCommunityAppSignatureForTest,
 	offerMacosCommunityApp,
 	parseCommunityAppChecksumForTest,
 	resolveCommunityAppExecutableForTest,
@@ -29,6 +30,52 @@ afterEach(async () => {
 });
 
 describe("macOS community app offer guards", () => {
+	test("fails before prompting when installed-app discovery cannot be reaped", async () => {
+		let prompted = false;
+		let fetched = false;
+		const result = await offerMacosCommunityApp({
+			platform: "darwin",
+			arch: "arm64",
+			env: {},
+			stdinIsTTY: true,
+			stdoutIsTTY: true,
+			prompt: async () => {
+				prompted = true;
+				return true;
+			},
+			fetchImpl: async () => {
+				fetched = true;
+				return new Response("unexpected");
+			},
+			command: async argv => ({
+				exitCode: argv[0] === "/usr/bin/mdfind" ? 1 : 0,
+				stdout: "",
+				stderr: "",
+				reaped: argv[0] !== "/usr/bin/mdfind",
+			}),
+		});
+		expect(result.status).toBe("failed");
+		expect(result.reason).toContain("discovery helper did not terminate safely");
+		expect(prompted).toBe(false);
+		expect(fetched).toBe(false);
+	});
+	test("parses pinned signer fields as complete codesign records", async () => {
+		const maliciousPath = `/tmp/Executable=Authority=${COMMUNITY_APP_SIGNING_AUTHORITY} TeamIdentifier=${COMMUNITY_APP_TEAM_ID}.app`;
+		expect(
+			await hasExpectedCommunityAppSignatureForTest(maliciousPath, async () => ({
+				exitCode: 0,
+				stdout: "",
+				stderr: `Executable=${maliciousPath}\nAuthority=Developer ID Application: Mallory (BADTEAM123)\nTeamIdentifier=BADTEAM123\n`,
+			})),
+		).toBe(false);
+		expect(
+			await hasExpectedCommunityAppSignatureForTest("/tmp/app", async () => ({
+				exitCode: 0,
+				stdout: "",
+				stderr: `Authority=${COMMUNITY_APP_SIGNING_AUTHORITY} (${COMMUNITY_APP_TEAM_ID})\nTeamIdentifier=${COMMUNITY_APP_TEAM_ID}\n`,
+			})),
+		).toBe(true);
+	});
 	test("is disabled outside macOS, in automation, and when explicitly suppressed", async () => {
 		expect((await offerMacosCommunityApp({ platform: "linux", stdinIsTTY: true, stdoutIsTTY: true })).status).toBe(
 			"skipped",
@@ -275,6 +322,95 @@ process.exit(0);
 			},
 		});
 		expect(badChecksum.reason).toContain("checksum");
+
+		let cancelled = false;
+		const neverEndingDmg = new ReadableStream<Uint8Array>({
+			start(controller) {
+				controller.enqueue(new Uint8Array([1]));
+			},
+			cancel() {
+				cancelled = true;
+			},
+		});
+		const malformedChecksum = await offerMacosCommunityApp({
+			platform: "darwin",
+			arch: "arm64",
+			env: {},
+			stdinIsTTY: true,
+			stdoutIsTTY: true,
+			prompt: async () => true,
+			command,
+			cleanupCommand: command,
+			fetchImpl: async url => {
+				if (url.includes("/releases?"))
+					return Response.json({
+						tag_name: "v1.0.0",
+						assets: [
+							{
+								name: "gajae-app-desktop-1.0.0-macos-arm64.dmg",
+								browser_download_url:
+									"https://github.com/devswha/gajae-code-app/releases/download/v1.0.0/gajae-app-desktop-1.0.0-macos-arm64.dmg",
+							},
+							{
+								name: "gajae-app-desktop-1.0.0-macos-arm64.dmg.sha256",
+								browser_download_url:
+									"https://github.com/devswha/gajae-code-app/releases/download/v1.0.0/gajae-app-desktop-1.0.0-macos-arm64.dmg.sha256",
+							},
+						],
+					});
+				return url.endsWith(".dmg") ? new Response(neverEndingDmg) : new Response("malformed\n");
+			},
+		});
+		expect(malformedChecksum.reason).toContain("does not name the DMG");
+		expect(cancelled).toBe(true);
+
+		let rejectedFetchAborted = false;
+		let rejectedStreamCancelled = false;
+		const rejectedChecksum = await offerMacosCommunityApp({
+			platform: "darwin",
+			arch: "arm64",
+			env: {},
+			stdinIsTTY: true,
+			stdoutIsTTY: true,
+			prompt: async () => true,
+			command,
+			cleanupCommand: command,
+			fetchImpl: async (url, init) => {
+				if (url.includes("/releases?"))
+					return Response.json({
+						tag_name: "v1.0.0",
+						assets: [
+							{
+								name: "gajae-app-desktop-1.0.0-macos-arm64.dmg",
+								browser_download_url:
+									"https://github.com/devswha/gajae-code-app/releases/download/v1.0.0/gajae-app-desktop-1.0.0-macos-arm64.dmg",
+							},
+							{
+								name: "gajae-app-desktop-1.0.0-macos-arm64.dmg.sha256",
+								browser_download_url:
+									"https://github.com/devswha/gajae-code-app/releases/download/v1.0.0/gajae-app-desktop-1.0.0-macos-arm64.dmg.sha256",
+							},
+						],
+					});
+				if (url.endsWith(".sha256")) throw new Error("checksum fetch failed");
+				init?.signal?.addEventListener("abort", () => {
+					rejectedFetchAborted = true;
+				});
+				return new Response(
+					new ReadableStream<Uint8Array>({
+						start(controller) {
+							controller.enqueue(new Uint8Array([1]));
+						},
+						cancel() {
+							rejectedStreamCancelled = true;
+						},
+					}),
+				);
+			},
+		});
+		expect(rejectedChecksum.reason).toContain("checksum fetch failed");
+		expect(rejectedFetchAborted).toBe(true);
+		expect(rejectedStreamCancelled).toBe(true);
 	});
 });
 
@@ -314,7 +450,7 @@ describe("macOS community app verified installation", () => {
 				return {
 					exitCode: 0,
 					stdout: "",
-					stderr: `Authority=${COMMUNITY_APP_SIGNING_AUTHORITY}\nTeamIdentifier=${signingTeam}\n`,
+					stderr: `Authority=${COMMUNITY_APP_SIGNING_AUTHORITY} (${signingTeam})\nTeamIdentifier=${signingTeam}\n`,
 				};
 			return { exitCode: 0, stdout: argv[0] === "/usr/bin/lipo" ? "arm64" : "", stderr: "" };
 		};

@@ -3,7 +3,7 @@
  */
 import { getProjectDir } from "@gajae-code/utils";
 import { Args, Command, Flags } from "@gajae-code/utils/cli";
-import { runManagedNotifyRecovery, runUpdateCommand } from "../cli/update-cli";
+import { runUpdateCommand, runVerifiedRuntimeRecovery } from "../cli/update-cli";
 import { Settings } from "../config/settings";
 import {
 	isUpdateChannel,
@@ -35,7 +35,7 @@ export default class Update extends Command {
 	async run(): Promise<void> {
 		const { args, flags } = await this.parse(Update);
 		if (args.action === "update-recovery") {
-			await runManagedNotifyRecovery({});
+			await runVerifiedRuntimeRecovery();
 			return;
 		}
 		let channel: UpdateChannel | undefined;
