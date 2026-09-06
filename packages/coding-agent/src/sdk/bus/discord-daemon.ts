@@ -2550,7 +2550,6 @@ export class DiscordNotificationDaemon {
 						current.endpointGeneration === record.endpointGeneration
 					: !!current &&
 						current.state === (operation === "archive" ? "active" : "resuming") &&
-						current.generation === record.generation &&
 						current.endpointGeneration === record.endpointGeneration &&
 						!!migratedEffect &&
 						recordAcceptsAuthority(current, migratedEffect.payload.attachmentAuthorityId) &&
