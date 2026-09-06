@@ -54,6 +54,7 @@ describe("resume progress lease", () => {
 				getCwd: () => "/tmp",
 			},
 			resetIrcSidebarSession: vi.fn(),
+			resetAssistantTextPresentation: vi.fn(),
 			updateEditorBorderColor: vi.fn(),
 			rebuildInitialMessages: vi.fn(),
 			reloadTodos: vi.fn(async () => undefined),
@@ -71,6 +72,7 @@ describe("resume progress lease", () => {
 		await resume;
 		expect(statusContainer.children).toHaveLength(0);
 		expect(context.showStatus).toHaveBeenCalledWith("Resumed session");
+		expect(context.resetAssistantTextPresentation).toHaveBeenCalledTimes(1);
 		expect(session.switchSession).toHaveBeenCalledWith("/tmp/target.jsonl", expect.any(Object));
 
 		ui.stop();
@@ -115,6 +117,7 @@ describe("resume progress lease", () => {
 				getCwd: () => "/tmp",
 			},
 			resetIrcSidebarSession: vi.fn(),
+			resetAssistantTextPresentation: vi.fn(),
 			updateEditorBorderColor: vi.fn(),
 			rebuildInitialMessages: vi.fn(),
 			reloadTodos: vi.fn(async () => undefined),

@@ -382,6 +382,11 @@ export class MCPManager {
 		pending?.delete(error);
 		if (pending?.size === 0) this.#pendingAcquireCleanups.delete(name);
 	}
+	#pruneSettledPendingAcquireCleanups(name: string): void {
+		for (const error of this.#pendingAcquireCleanups.get(name) ?? []) {
+			if (!this.#pool.hasPendingAcquireCleanup(error)) this.#removePendingAcquireCleanup(name, error);
+		}
+	}
 
 	#retainPendingAcquireCleanup(name: string, error: MCPPoolAcquireAbortError): void {
 		if (error.cleanupGeneration === undefined || !error.cleanup || !this.#pool.hasPendingAcquireCleanup(error))
@@ -393,7 +398,11 @@ export class MCPManager {
 		}
 		if (pending.has(error)) return;
 		pending.add(error);
-		void error.cleanup.catch(() => {});
+		void error.cleanup
+			.finally(() => {
+				if (!this.#pool.hasPendingAcquireCleanup(error)) this.#removePendingAcquireCleanup(name, error);
+			})
+			.catch(() => {});
 	}
 
 	#retainConnectionCleanupFailure(name: string, error: unknown): MCPConnectionCleanupFailure | undefined {
@@ -518,6 +527,7 @@ export class MCPManager {
 			onRequest: (method, params) => this.#handleServerRequest(method, params),
 			onCleanupPending: error => this.#retainPendingAcquireCleanup(name, error),
 		});
+		this.#pruneSettledPendingAcquireCleanups(name);
 		if (trackManagerLease) this.#leaseByConnection.set(lease.connection, lease);
 		if (!this.#toolsOnly) lease.updateRoots(this.#getRoots().roots);
 		return lease;
@@ -1040,6 +1050,10 @@ export class MCPManager {
 		const connectionTasks: ConnectionTask[] = [];
 
 		for (const [name, config] of Object.entries(configs)) {
+			// Another manager sharing the pool may have retried and completed an
+			// abandoned-acquire cleanup. Retire this manager's observation before
+			// applying its reconnect fence; pool ownership remains authoritative.
+			this.#pruneSettledPendingAcquireCleanups(name);
 			const pendingAcquire = this.#pendingAcquireCleanups.get(name);
 			const pendingCleanup = this.#pendingConnectionCleanups.get(name);
 			if (pendingCleanup || pendingAcquire) {
@@ -1781,7 +1795,11 @@ export class MCPManager {
 
 		let closeError: unknown;
 		try {
-			await this.#closePendingConnectionCleanup(name);
+			// A transport may ignore its abort signal while the initial connection
+			// is still opening. The pool owns that abandoned flight and closes any
+			// late connection, so disconnect must not wait for the uncooperative
+			// opener. Already-materialized cleanup failures are still retried here.
+			await this.#closePendingConnectionCleanup(name, false);
 		} catch (error) {
 			closeError = error;
 		}

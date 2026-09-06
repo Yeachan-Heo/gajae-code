@@ -46,6 +46,7 @@ function createInitialRenderHarness(): { ctx: InteractiveModeContext; helpers: U
 		},
 		toolOutputExpanded: false,
 		hideThinkingBlock: false,
+		resetAssistantTextPresentation: vi.fn(),
 	} as unknown as InteractiveModeContext;
 	helpers = new UiHelpers(ctx);
 	return { ctx, helpers };
@@ -108,6 +109,7 @@ describe("InteractiveMode.showStatus", () => {
 		helpers.renderInitialMessages(undefined, { preserveExistingChat: true });
 
 		expect(renderContainer(ctx.chatContainer)).toContain("startup notification probe");
+		expect(ctx.resetAssistantTextPresentation).toHaveBeenCalledTimes(1);
 	});
 
 	test("preserves optimistic user signatures when rebuilding transcript state", () => {

@@ -1,7 +1,18 @@
-import { afterAll, beforeAll, describe, expect, it } from "bun:test";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
+import { getDefaultTabWidth, setDefaultTabWidth } from "@gajae-code/utils";
 import type { Terminal as XtermTerminalType } from "@xterm/headless";
 import { Chalk } from "chalk";
-import { clearRenderCache, Markdown, renderInlineMarkdown } from "../src/components/markdown.js";
+import { LRUCache } from "lru-cache/raw";
+import { marked } from "marked";
+import {
+	__markdownPerfCounters,
+	clearRenderCache,
+	getMarkdownCacheEntryAccountedSize,
+	getMarkdownCacheStats,
+	getRenderCacheRetainedBytes,
+	Markdown,
+	renderInlineMarkdown,
+} from "../src/components/markdown.js";
 import { TERMINAL } from "../src/terminal-capabilities.js";
 import { type Component, TUI } from "../src/tui.js";
 import { defaultMarkdownTheme } from "./test-themes.js";
@@ -9,6 +20,565 @@ import { VirtualTerminal } from "./virtual-terminal.js";
 
 // Force full color in CI so ANSI assertions are deterministic
 const chalk = new Chalk({ level: 3 });
+
+// Independent full-walk oracle used only on bounded test payloads.
+function accountedPayload(value: unknown, seen = new Set<object>()): number {
+	if (typeof value === "string") return value.length * 2;
+	if (typeof value === "number") return 8;
+	if (typeof value === "boolean") return 4;
+	if (!value || typeof value !== "object" || seen.has(value)) return 0;
+	seen.add(value);
+	const array = Array.isArray(value);
+	let size = array ? 24 + value.length * 8 : 32;
+	for (const [key, item] of Object.entries(value)) {
+		const index = Number(key);
+		const slot = array && Number.isInteger(index) && index >= 0 && index < 0xffffffff && String(index) === key;
+		if (!slot) size += 16 + key.length * 2;
+		size += accountedPayload(item, seen);
+	}
+	return size;
+}
+
+// Theme identity is metadata on the supplied object, not a cache entry or size.
+// Build the complete production key independently so omitted key charges fail.
+function themeIdentity(theme: object): number {
+	const symbol = Object.getOwnPropertySymbols(theme).find(key => key.description === "markdown.objectId");
+	expect(symbol).toBeDefined();
+	return Object.getOwnPropertyDescriptor(theme, symbol!)!.value as number;
+}
+
+function singleTextRenderSize(width: number): number {
+	const key = `1:1\x00${width}\x000\x000\x002\x00${themeIdentity(defaultMarkdownTheme)}\x00-1\x00${TERMINAL.imageProtocol ?? ""}\x00${TERMINAL.hyperlinks ? 1 : 0}\x00\x00${defaultMarkdownTheme.heading("")}`;
+	return 64 + key.length * 2 + accountedPayload({ source: "x", lines: ["x".padEnd(width)] });
+}
+
+describe("Markdown accounted cache limits", () => {
+	beforeEach(() => {
+		clearRenderCache();
+		__markdownPerfCounters.reset();
+	});
+	afterEach(() => {
+		vi.restoreAllMocks();
+		clearRenderCache();
+	});
+
+	it("does not reinsert verified parse hits but republishes after eviction", () => {
+		const sets = vi.spyOn(LRUCache.prototype, "set");
+		const parseWrites = () =>
+			sets.mock.calls.filter(([, value]) => {
+				return value !== null && typeof value === "object" && "tokens" in value;
+			}).length;
+		const md = new Markdown("- **one**\n- [two](https://example.com)\n", 0, 0, defaultMarkdownTheme);
+		md.render(80);
+		expect(parseWrites()).toBe(1);
+		md.render(40);
+		md.renderWithViewportAnchorSource(30, { id: "same-source" });
+		expect(parseWrites()).toBe(1);
+		expect(__markdownPerfCounters.lexerInvocations).toBe(1);
+		clearRenderCache();
+		md.render(20);
+		expect(parseWrites()).toBe(2);
+		expect(__markdownPerfCounters.lexerInvocations).toBe(2);
+	});
+
+	it("reuses verified prior content after a failed new-source render", () => {
+		let fail = false;
+		const theme = {
+			...defaultMarkdownTheme,
+			heading: (text: string) => {
+				if (fail) throw new Error("test heading failure");
+				return defaultMarkdownTheme.heading(text);
+			},
+		};
+		const md = new Markdown("original source", 0, 0, theme);
+		md.render(80);
+		expect(__markdownPerfCounters.lexerInvocations).toBe(1);
+		fail = true;
+		md.setText("uncommitted source", { streaming: true });
+		expect(() => md.render(79)).toThrow("test heading failure");
+		fail = false;
+		md.setText("original source", { streaming: true });
+		expect(md.render(78).join("\n")).toContain("original source");
+		expect(__markdownPerfCounters.lexerInvocations).toBe(1);
+		md.dispose();
+	});
+
+	it("does not recount repeated oversized admissions or retain completed tokens", () => {
+		const sets = vi.spyOn(LRUCache.prototype, "set");
+		const parseWrites = () =>
+			sets.mock.calls.filter(([, value]) => value !== null && typeof value === "object" && "tokens" in value).length;
+		const oversized = "x".repeat(120_000);
+		const md = new Markdown(oversized, 0, 0, defaultMarkdownTheme);
+		md.render(80);
+		expect(parseWrites()).toBe(1);
+		expect(getMarkdownCacheStats().parse.count).toBe(0);
+		md.render(79);
+		md.render(78);
+		expect(parseWrites()).toBe(1);
+		expect(__markdownPerfCounters.lexerInvocations).toBe(3);
+		md.setText("small eligible text");
+		md.render(80);
+		expect(parseWrites()).toBe(2);
+		expect(getMarkdownCacheStats().parse.count).toBe(1);
+		md.setText(oversized);
+		md.render(77);
+		expect(parseWrites()).toBe(3);
+		md.dispose();
+		clearRenderCache();
+		md.invalidate();
+		md.render(76);
+		expect(parseWrites()).toBe(4);
+	});
+
+	it("retries rejected admission when tab normalization changes without changing raw text", () => {
+		const tabWidth = getDefaultTabWidth();
+		const md = new Markdown("x\t".repeat(20_000), 0, 0, defaultMarkdownTheme);
+		try {
+			setDefaultTabWidth(8);
+			md.render(80);
+			expect(getMarkdownCacheStats().parse.count).toBe(0);
+			setDefaultTabWidth(1);
+			md.render(79);
+			expect(getMarkdownCacheStats().parse.count).toBe(1);
+			const calls = __markdownPerfCounters.lexerInvocations;
+			md.render(78);
+			expect(__markdownPerfCounters.lexerInvocations).toBe(calls);
+			setDefaultTabWidth(8);
+			md.render(77);
+			expect(__markdownPerfCounters.lexerInvocations).toBe(calls + 1);
+			setDefaultTabWidth(1);
+			md.render(76);
+			expect(__markdownPerfCounters.lexerInvocations).toBe(calls + 1);
+		} finally {
+			md.dispose();
+			setDefaultTabWidth(tabWidth);
+		}
+	});
+
+	it("clears a rejected key when new raw text collides but is eligible", () => {
+		vi.spyOn(Bun, "hash").mockReturnValue(1n);
+		const md = new Markdown("x".repeat(120_000), 0, 0, defaultMarkdownTheme);
+		md.render(80);
+		expect(getMarkdownCacheStats().parse.count).toBe(0);
+		md.setText(`<!--${"y".repeat(119_993)}-->`);
+		md.render(79);
+		expect(getMarkdownCacheStats().parse.count).toBe(1);
+		md.dispose();
+	});
+
+	it("preserves oversized same-key replacement after another component inserts a collision", () => {
+		vi.spyOn(Bun, "hash").mockReturnValue(1n);
+		const md = new Markdown("x".repeat(120_000), 0, 0, defaultMarkdownTheme);
+		md.render(80);
+		md.render(79);
+		expect(getMarkdownCacheStats().parse.count).toBe(0);
+		const colliding = `<!--${"y".repeat(119_993)}-->`;
+		new Markdown(colliding, 0, 0, defaultMarkdownTheme).render(80);
+		expect(getMarkdownCacheStats().parse.count).toBe(1);
+		md.render(78);
+		expect(getMarkdownCacheStats().parse.count).toBe(0);
+		md.dispose();
+	});
+
+	it("matches independent graph totals for every constructed render payload", () => {
+		const sets = vi.spyOn(LRUCache.prototype, "set");
+		for (const source of [
+			"# Heading\n\nparagraph **bold**",
+			"- one\n- two",
+			"| A | B |\n|---|---|\n| 漢字 | 😀 |",
+			"```ts\nconst a = 1;\n```",
+			"---\n\n> quote",
+		]) {
+			for (const width of [1, 20, 80]) {
+				const md = new Markdown(source, 1, 1, defaultMarkdownTheme, { bgColor: text => `\x1b[44m${text}\x1b[0m` });
+				md.render(width);
+				md.renderWithViewportAnchorSource(width, { id: "schema" });
+				md.dispose();
+			}
+		}
+		let renderWrites = 0;
+		for (const [index, [key, value]] of sets.mock.calls.entries()) {
+			if (typeof value !== "object" || value === null || !("source" in value) || !("lines" in value)) continue;
+			const cache = sets.mock.contexts[index] as LRUCache<string, object>;
+			const exact = 64 + String(key).length * 2 + accountedPayload(value);
+			expect(cache.sizeCalculation!(value, String(key))).toBe(Math.min(exact, cache.maxEntrySize + 1));
+			renderWrites++;
+		}
+		expect(renderWrites).toBe(30);
+	});
+
+	it("preserves graph accounting for seeded shared cyclic and sparse payloads", () => {
+		let seed = 0x51a7;
+		const random = () => {
+			seed ^= seed << 13;
+			seed ^= seed >>> 17;
+			seed ^= seed << 5;
+			return seed >>> 0;
+		};
+		for (let sample = 0; sample < 100; sample++) {
+			const graph: object[] = [];
+			for (let i = 0; i < 20; i++) graph.push(i % 3 === 0 ? new Array(3) : {});
+			for (const node of graph) {
+				for (const key of ["0", "2", "01", "links", "text", "missing"]) {
+					const pick = random() % 6;
+					const value =
+						pick === 0
+							? graph[random() % graph.length]
+							: pick === 1
+								? "漢😀\x1b[31m".repeat(random() % 9)
+								: pick === 2
+									? random()
+									: pick === 3
+										? true
+										: pick === 4
+											? null
+											: undefined;
+					Object.defineProperty(node, key, { value, enumerable: key !== "missing", configurable: true });
+				}
+			}
+			const key = `fixture-${sample}`;
+			const exact = 64 + key.length * 2 + accountedPayload(graph);
+			for (const cap of [exact - 2, exact, exact + 2, 128]) {
+				expect(getMarkdownCacheEntryAccountedSize(key, graph, cap)).toBe(exact > cap ? cap + 1 : exact);
+			}
+		}
+	});
+
+	it("accounts Unicode, ANSI, sparse/custom arrays, nested tokens and repeated references", () => {
+		const shared = { text: "漢😀\x1b[31mx\x1b[0m", flag: true, n: 7, absent: undefined };
+		const array = Object.assign([shared, null, shared], { links: { ref: shared }, "01": "custom" });
+		const value = {
+			source: "漢😀",
+			array,
+			tokens: marked.lexer('[a][r]\n\n[r]: https://example.com "title"'),
+			anchors: [null, { cellStart: 0, cellEnd: 3 }],
+		};
+		const key = "key\x00😀";
+		const exact = 64 + key.length * 2 + accountedPayload(value);
+		expect(getMarkdownCacheEntryAccountedSize(key, value, exact)).toBe(exact);
+		expect(getMarkdownCacheEntryAccountedSize(key, value, exact - 2)).toBe(exact - 1);
+		expect(getMarkdownCacheEntryAccountedSize("", [null, undefined], 1000)).toBe(64 + 24 + 16);
+		const cycle: { self?: object; text: string } = { text: "a" };
+		cycle.self = cycle;
+		expect(getMarkdownCacheEntryAccountedSize("", cycle, 1000)).toBe(64 + accountedPayload(cycle));
+	});
+
+	it("cuts off deep and enormous payloads without recursive traversal or serialization", () => {
+		let deep: object = { text: "leaf" };
+		for (let i = 0; i < 20_000; i++) deep = { child: deep };
+		expect(getMarkdownCacheEntryAccountedSize("", deep, 1024)).toBe(1025);
+		expect(getMarkdownCacheEntryAccountedSize("", new Array(1_000_000), 1024)).toBe(1025);
+		expect(getMarkdownCacheEntryAccountedSize("x".repeat(1000), null, 1024)).toBe(1025);
+	});
+
+	it("accounts admitted deep and widely shared graphs with bounded traversal", () => {
+		let deep: unknown = null;
+		for (let i = 0; i < 10_000; i++) deep = { child: deep };
+		const deepSize = 64 + 10_000 * (32 + 16 + "child".length * 2);
+		expect(getMarkdownCacheEntryAccountedSize("", deep, deepSize)).toBe(deepSize);
+		const shared = { value: true };
+		const wide = Object.assign(new Array(100_000).fill(shared), { links: shared });
+		const wideSize = 64 + 24 + 100_000 * 8 + 16 + "links".length * 2 + 32 + 16 + "value".length * 2 + 4;
+		expect(getMarkdownCacheEntryAccountedSize("", wide, wideSize)).toBe(wideSize);
+		expect(getMarkdownCacheEntryAccountedSize("", wide, wideSize - 2)).toBe(wideSize - 1);
+	});
+
+	it("rejects oversized array slots before enumerating their properties", () => {
+		const oversized = new Proxy(new Array(200_000), {
+			ownKeys: () => {
+				throw new Error("oversized array must not be enumerated");
+			},
+		});
+		expect(getMarkdownCacheEntryAccountedSize("", oversized, 1024)).toBe(1025);
+	});
+
+	it("charges noncanonical and uint32-limit array properties as named properties", () => {
+		const array: unknown[] = [];
+		for (const key of ["0", "00", "-0", "-1", "1.0", "1e0", "NaN", "Infinity", "4294967295", "4294967296"]) {
+			Object.defineProperty(array, key, { value: "漢", enumerable: true });
+		}
+		const exact = 64 + accountedPayload(array);
+		expect(getMarkdownCacheEntryAccountedSize("", array, exact)).toBe(exact);
+		expect(getMarkdownCacheEntryAccountedSize("", array, exact - 2)).toBe(exact - 1);
+	});
+
+	it("admits exact parse cap boundaries with independently calculated token graphs", () => {
+		vi.spyOn(Bun, "hash").mockReturnValue(1n);
+		const cap = getMarkdownCacheStats().parse.maxEntrySize;
+		for (const target of [cap - 2, cap, cap + 2]) {
+			let fixture: string | undefined;
+			// A paragraph adds ten accounted bytes per ASCII unit; newline suffixes
+			// change source/raw independently, yielding the attainable even boundaries.
+			for (const suffix of ["", "\n", "\n\n", "\n\n\n", "\n\n\n\n", "\n\n\n\n\n"]) {
+				const sample = "x".repeat(100_000) + suffix;
+				const sampleSize =
+					64 +
+					`${sample.length}:1`.length * 2 +
+					accountedPayload({ source: sample, tokens: marked.lexer(sample) });
+				const growth = (target - sampleSize) / 10;
+				if (!Number.isInteger(growth)) continue;
+				fixture = "x".repeat(100_000 + growth) + suffix;
+				expect(
+					64 +
+						`${fixture.length}:1`.length * 2 +
+						accountedPayload({ source: fixture, tokens: marked.lexer(fixture) }),
+				).toBe(target);
+				break;
+			}
+			expect(fixture, `fixture for ${target}`).toBeDefined();
+			clearRenderCache();
+			const md = new Markdown(fixture!, 0, 0, defaultMarkdownTheme);
+			const lines = md.render(100);
+			expect(getMarkdownCacheStats().parse.accountedSize).toBe(target <= cap ? target : 0);
+			expect(getMarkdownCacheStats().parse.count).toBe(target <= cap ? 1 : 0);
+			const before = __markdownPerfCounters.lexerInvocations;
+			md.render(99);
+			expect(__markdownPerfCounters.lexerInvocations).toBe(before + (target > cap ? 1 : 0));
+			clearRenderCache();
+			expect(new Markdown(fixture!, 0, 0, defaultMarkdownTheme).render(100)).toEqual(lines);
+		}
+	}, 15_000);
+
+	it("enforces render entry boundaries and recounts anchor enrichment", () => {
+		vi.spyOn(Bun, "hash").mockReturnValue(1n);
+		const md = new Markdown("x", 0, 0, defaultMarkdownTheme);
+		md.render(500_000);
+		const cap = getMarkdownCacheStats().render.maxEntrySize;
+		expect(getMarkdownCacheStats().render.accountedSize).toBe(singleTextRenderSize(500_000));
+		const overhead = singleTextRenderSize(500_000) - 1_000_000;
+		for (const target of [cap - 2, cap, cap + 2]) {
+			clearRenderCache();
+			const width = (target - overhead) / 2;
+			expect(singleTextRenderSize(width)).toBe(target);
+			const output = new Markdown("x", 0, 0, defaultMarkdownTheme).render(width);
+			expect(output[0].length).toBe(width);
+			expect(getMarkdownCacheStats().render.accountedSize).toBe(target <= cap ? target : 0);
+		}
+		clearRenderCache();
+		md.invalidate();
+		md.render(80);
+		const before = getMarkdownCacheStats().render.accountedSize;
+		md.renderWithViewportAnchorSource(80, { id: "x" });
+		const after = getMarkdownCacheStats().render.accountedSize;
+		expect(before).toBe(singleTextRenderSize(80));
+		const anchorPayload = [{ graphemeStart: 0, graphemeEnd: 65536, cellStart: 0, cellEnd: 65536 }];
+		expect(after - before).toBe(16 + "anchorSpans".length * 2 + accountedPayload(anchorPayload));
+		expect(getMarkdownCacheStats().render.count).toBe(1);
+		md.invalidate();
+		md.renderWithViewportAnchorSource(80, { id: "x" });
+		expect(getMarkdownCacheStats().render.accountedSize).toBe(after);
+	});
+
+	it("rejects oversized same-key anchor replacements without evicting unrelated entries", () => {
+		vi.spyOn(Bun, "hash").mockReturnValue(1n);
+		const md = new Markdown("x", 0, 0, defaultMarkdownTheme);
+		md.render(500_000);
+		const stats = getMarkdownCacheStats().render;
+		const width = (stats.maxEntrySize - (singleTextRenderSize(500_000) - 1_000_000)) / 2;
+		clearRenderCache();
+		md.render(width);
+		new Markdown("survivor", 0, 0, defaultMarkdownTheme).render(80);
+		expect(getMarkdownCacheStats().render.count).toBe(2);
+		md.renderWithViewportAnchorSource(width, { id: "x" });
+		// Installed lru-cache deletes the old same-key entry on oversized replacement.
+		expect(getMarkdownCacheStats().render.count).toBe(1);
+		const calls = __markdownPerfCounters.lexerInvocations;
+		new Markdown("survivor", 0, 0, defaultMarkdownTheme).render(80);
+		expect(__markdownPerfCounters.lexerInvocations).toBe(calls);
+	});
+
+	it("bounds source-bearing highlight keys/output at the exact entry limit", () => {
+		let outputLength = 1;
+		const theme = { ...defaultMarkdownTheme, highlightCode: vi.fn(() => ["h".repeat(outputLength)]) };
+		const source = "```txt\nx\n```";
+		new Markdown(source, 0, 0, theme).render(80);
+		const key = `${themeIdentity(theme)}\x00txt\x00x`;
+		const overhead = 64 + key.length * 2 + accountedPayload({ lang: "txt", code: "x", lines: [""] });
+		expect(getMarkdownCacheStats().highlight.accountedSize).toBe(overhead + 2);
+		const cap = getMarkdownCacheStats().highlight.maxEntrySize;
+		for (const target of [cap - 2, cap, cap + 2]) {
+			clearRenderCache();
+			outputLength = (target - overhead) / 2;
+			expect(
+				64 + key.length * 2 + accountedPayload({ lang: "txt", code: "x", lines: ["h".repeat(outputLength)] }),
+			).toBe(target);
+			const md = new Markdown(source, 0, 0, theme);
+			md.setStreaming(true);
+			const lines = md.render(100);
+			expect(getMarkdownCacheStats().highlight.accountedSize).toBe(target <= cap ? target : 0);
+			const calls = theme.highlightCode.mock.calls.length;
+			md.render(99);
+			expect(theme.highlightCode.mock.calls.length).toBe(calls + (target > cap ? 1 : 0));
+			clearRenderCache();
+			expect(new Markdown(source, 0, 0, theme).render(100)).toEqual(lines);
+			md.dispose();
+		}
+	});
+
+	it("enforces UTF8 caps before a language/code key alias can reuse a cached block", () => {
+		const unicode = "漢".repeat(70_000);
+		const theme = { ...defaultMarkdownTheme, highlightCode: vi.fn(() => ["CACHED BLOCK SENTINEL"]) };
+		new Markdown(`\`\`\`ts\x00${unicode}\nsmall\n\`\`\``, 0, 0, theme).render(80);
+		expect(theme.highlightCode).toHaveBeenCalledTimes(1);
+		const output = new Markdown(`\`\`\`ts\n${unicode}\x00small\n\`\`\``, 0, 0, theme).render(80).join("\n");
+		expect(output).toContain("syntax highlighting skipped");
+		expect(output).not.toContain("CACHED BLOCK SENTINEL");
+		expect(theme.highlightCode).toHaveBeenCalledTimes(1);
+	});
+
+	it("verifies language and code on delimiter-colliding highlight keys", () => {
+		const calls: Array<{ code: string; lang?: string }> = [];
+		const theme = {
+			...defaultMarkdownTheme,
+			highlightCode: (code: string, lang?: string): string[] => {
+				calls.push({ code, lang });
+				return [`${lang ?? "none"}:${code}`];
+			},
+		};
+		const first = new Markdown(`\`\`\`a\nb\x00c\n\`\`\``, 0, 0, theme).render(80).join("\n");
+		const second = new Markdown(`\`\`\`a\x00b\nc\n\`\`\``, 0, 0, theme).render(80).join("\n");
+
+		expect(calls).toEqual([
+			{ code: "b\x00c", lang: "a" },
+			{ code: "c", lang: "a\x00b" },
+		]);
+		expect(first).toContain("a:b\x00c");
+		expect(second).toContain("a\x00b:c");
+	});
+
+	it("evicts by aggregate size before count, retains recent entries and reports the full sum", () => {
+		const sources = Array.from({ length: 24 }, (_, i) => `message ${i} ${"x".repeat(70_000)}`);
+		for (const source of sources) {
+			new Markdown(source, 0, 0, defaultMarkdownTheme).render(100);
+			const stats = getMarkdownCacheStats();
+			for (const cache of Object.values(stats)) {
+				expect(cache.accountedSize).toBeLessThanOrEqual(cache.maxSize);
+				expect(cache.count).toBeLessThanOrEqual(cache.max);
+			}
+			expect(getRenderCacheRetainedBytes()).toBe(
+				Object.values(stats).reduce((sum, cache) => sum + cache.accountedSize, 0),
+			);
+		}
+		expect(getMarkdownCacheStats().parse.count).toBeLessThan(sources.length);
+		let calls = __markdownPerfCounters.lexerInvocations;
+		new Markdown(sources.at(-1)!, 0, 0, defaultMarkdownTheme).render(99);
+		expect(__markdownPerfCounters.lexerInvocations).toBe(calls);
+		new Markdown(sources[0], 0, 0, defaultMarkdownTheme).render(99);
+		expect(__markdownPerfCounters.lexerInvocations).toBe(calls + 1);
+		calls = __markdownPerfCounters.lexerInvocations;
+		new Markdown(sources.at(-1)!, 0, 0, defaultMarkdownTheme).render(98);
+		expect(__markdownPerfCounters.lexerInvocations).toBe(calls);
+		clearRenderCache();
+		expect(getRenderCacheRetainedBytes()).toBe(0);
+	});
+
+	it("evicts render payloads by size with LRU touch before reaching the count cap", () => {
+		const sources = Array.from({ length: 20 }, (_, i) => `row-${String(i).padStart(2, "0")}`);
+		const lines = sources.map(source => new Markdown(source, 0, 0, defaultMarkdownTheme).render(200_000));
+		expect(getMarkdownCacheStats().render.count).toBe(20);
+		expect(new Markdown(sources[0], 0, 0, defaultMarkdownTheme).render(200_000)).toBe(lines[0]);
+		new Markdown("row-20", 0, 0, defaultMarkdownTheme).render(200_000);
+		expect(getMarkdownCacheStats().render.count).toBe(20);
+		expect(getMarkdownCacheStats().render.accountedSize).toBeLessThanOrEqual(8 * 1024 * 1024);
+		expect(new Markdown(sources[0], 0, 0, defaultMarkdownTheme).render(200_000)).toBe(lines[0]);
+		expect(new Markdown(sources[1], 0, 0, defaultMarkdownTheme).render(200_000)).not.toBe(lines[1]);
+	});
+
+	it("evicts highlight payloads by size while keeping the touched block reusable", () => {
+		const theme = { ...defaultMarkdownTheme, highlightCode: vi.fn(() => ["h".repeat(220_000)]) };
+		const render = (n: number) => {
+			const md = new Markdown(`\`\`\`txt\ncode-${n}\n\`\`\``, 0, 0, theme);
+			md.setStreaming(true);
+			md.render(100);
+			md.dispose();
+		};
+		for (let i = 0; i < 9; i++) render(i);
+		expect(getMarkdownCacheStats().highlight.count).toBe(9);
+		render(0);
+		expect(theme.highlightCode).toHaveBeenCalledTimes(9);
+		render(9);
+		expect(getMarkdownCacheStats().highlight.count).toBe(9);
+		expect(getMarkdownCacheStats().highlight.accountedSize).toBeLessThanOrEqual(4 * 1024 * 1024);
+		render(0);
+		expect(theme.highlightCode).toHaveBeenCalledTimes(10);
+		render(1);
+		expect(theme.highlightCode).toHaveBeenCalledTimes(11);
+	});
+
+	it("keeps count caps alongside byte budgets for small documents and blocks", () => {
+		const theme = { ...defaultMarkdownTheme, highlightCode: (code: string) => [code] };
+		for (let i = 0; i < 520; i++) new Markdown(`\`\`\`txt\n${i}\n\`\`\``, 0, 0, theme).render(40);
+		const stats = getMarkdownCacheStats();
+		expect(stats.render.count).toBe(256);
+		expect(stats.parse.count).toBe(128);
+		expect(stats.highlight.count).toBe(512);
+		for (const cache of Object.values(stats)) expect(cache.accountedSize).toBeLessThan(cache.maxSize);
+	});
+
+	it("renders streaming completion and resize through the terminal pipeline", async () => {
+		const terminal = new VirtualTerminal(60, 12);
+		const ui = new TUI(terminal);
+		const md = new Markdown("# Streaming preview\n\npartial body", 0, 0, defaultMarkdownTheme);
+		const actions: Array<{ type: string; selector: string; timestamp: string; description: string }> = [];
+		const record = (description: string) =>
+			actions.push({ type: "custom", selector: "tui.markdown", timestamp: new Date().toISOString(), description });
+		md.setStreaming(true);
+		ui.addChild(md);
+		try {
+			ui.start();
+			await terminal.waitForRender();
+			expect(terminal.getViewport().join("\n")).toContain("Streaming preview");
+			expect(getMarkdownCacheStats().parse.count).toBe(0);
+			record(
+				"Started real TUI renderer on xterm headless; streaming text visible with zero shared document admissions",
+			);
+			md.setText("# Final document\n\n**Completed** 漢字 😀\n\n- final item", { streaming: false });
+			ui.requestRender(true);
+			await terminal.waitForRender();
+			const finalViewport = terminal.getViewport().join("\n");
+			expect(finalViewport).toContain("Final document");
+			expect(finalViewport).toContain("Completed");
+			expect(finalViewport).not.toContain("partial body");
+			expect(getMarkdownCacheStats().parse.count).toBe(1);
+			record("Completed with authoritative replacement text; old prefix absent and final parse admitted");
+			const calls = __markdownPerfCounters.lexerInvocations;
+			terminal.resize(40, 12);
+			await terminal.waitForRender();
+			expect(terminal.getViewport().join("\n")).toContain("Completed");
+			expect(__markdownPerfCounters.lexerInvocations).toBe(calls);
+			record("Resized terminal to 40 columns; completed content visible without relexing");
+			if (process.env.GJC_MARKDOWN_TUI_REPORT) {
+				await Bun.write(
+					process.env.GJC_MARKDOWN_TUI_REPORT,
+					JSON.stringify(
+						{
+							schemaVersion: 1,
+							surface: "tui",
+							tool: "bun:test + TUI + @xterm/headless VirtualTerminal",
+							actions,
+							assertions: [
+								{
+									selector: "tui.markdown",
+									status: "passed",
+									timestamp: new Date().toISOString(),
+									description:
+										"Streaming admission, authoritative completion, stale-prefix removal and resize reuse assertions passed",
+								},
+							],
+							viewport: terminal.getViewport(),
+							terminalWrites: terminal.getWriteLog(),
+						},
+						null,
+						2,
+					),
+				);
+			}
+		} finally {
+			md.dispose();
+			ui.stop();
+		}
+	});
+});
 
 function getCellItalic(terminal: VirtualTerminal, row: number, col: number): number {
 	const xterm = (terminal as unknown as { xterm: XtermTerminalType }).xterm;

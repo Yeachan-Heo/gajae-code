@@ -448,6 +448,12 @@ describe("default dependencies", () => {
 		);
 	});
 
+	test("import discards stdout instead of exposing an unread pipe", async () => {
+		const dependencies = createDefaultPaseoAnnounceDependencies("/tmp/agent-dir", {});
+		const cli = await fakeCli('[ -c /dev/fd/1 ] || exit 1\nprintf "unused output"\nexit 0');
+		expect(await dependencies.runImport(importInput(cli))).toEqual({ kind: "imported", providerKey: "gjc" });
+	});
+
 	test("Paseo's duplicate-import refusal on stderr is read as success", async () => {
 		const dependencies = createDefaultPaseoAnnounceDependencies("/tmp/agent-dir", {});
 		const cli = await fakeCli(

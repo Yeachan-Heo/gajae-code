@@ -4,8 +4,16 @@
 ### Fixed
 
 - Session runtime caches avoid redundant sentinel scans, obsolete permission wrappers, and unnecessary blob-buffer copies; streaming-edit pre-cache reads can no longer publish after invalidation, and oversized IRC replies use bounded UTF-8 truncation.
-
+- Disconnecting an MCP server during its initial connection now returns after cancelling the acquisition instead of waiting forever when an uncooperative transport ignores abort. The pool still owns and closes any late connection, retains cleanup failures for retry, and releases the manager's pending-cleanup fence after successful settlement (#5329).
+- SDK session routing now uses the Broker's endpoint timestamp comparison, accepting sub-millisecond representation differences while retaining device/inode and exact file-replacement checks. Valid live sessions no longer become unavailable solely because timestamp conversions round differently.
 - When every auto-compaction candidate fails, the reported error now leads with the first candidate's failure and lists each candidate that was tried with its own error. The chain starts at the session model and ends on a same-provider largest-context fallback, so surfacing only the final error named a model the user never chose (e.g. `openai-codex/gpt-5.4` on an `astra` preset session) and hid that their own model had already failed the same way.
+
+### Fixed
+
+- SDK submissions that reject during post-turn cleanup no longer publish a contradictory second terminal after their correlation has already settled.
+- Paseo session imports discard unused CLI stdout instead of leaving an unread pipe.
+- SDK live-attach streams preserve producer order across text deltas, final messages, and tool events even when asynchronous extension handlers are slow, without replaying or broadcasting turn content. Content observed while the correlated `agent_start` is still being durably recorded is held and released after the start frame, so no consumer sees turn content before the turn it belongs to; held content is delivered only to the owners that held the run when it was produced, and the hold is bounded (256 events, oldest dropped with one warning) so a wedged start write can neither invert the start/content boundary nor accumulate a whole response in memory.
+- SDK prompts consumed together after queued steering is interrupted now each receive correlated starts, streamed content, and one terminal, without adopting unrelated pending submissions.
 
 ## [0.16.4] - 2026-09-05
 ### Added

@@ -147,15 +147,17 @@ function csiEnd(bytes: string, start: number): number | undefined {
  */
 function stripTerminalEraseControls(bytes: string): string {
 	let sanitized = "";
+	let spanStart = 0;
 	for (let index = 0; index < bytes.length; index += 1) {
 		const value = bytes.charCodeAt(index);
 		const isEscapeCsi = value === 0x1b && bytes.charCodeAt(index + 1) === 0x5b;
 		const isEightBitCsi = value === 0x9b;
-		if (value === 0x1b && index === bytes.length - 1) break;
-		if (!isEscapeCsi && !isEightBitCsi) {
-			sanitized += bytes[index];
-			continue;
+		if (value === 0x1b && index === bytes.length - 1) {
+			sanitized += bytes.slice(spanStart, index);
+			spanStart = bytes.length;
+			break;
 		}
+		if (!isEscapeCsi && !isEightBitCsi) continue;
 
 		const start = isEightBitCsi ? index + 1 : index + 2;
 		const end = csiEnd(bytes, start);
@@ -168,16 +170,19 @@ function stripTerminalEraseControls(bytes: string): string {
 				if (!CSI_PARAMETER(nextValue) && !CSI_INTERMEDIATE(nextValue)) break;
 				next += 1;
 			}
+			sanitized += bytes.slice(spanStart, index);
+			spanStart = next;
 			index = next - 1;
 			continue;
 		}
 		const final = bytes.charCodeAt(end);
-		if (final !== 0x4a && final !== 0x4b) {
-			sanitized += bytes.slice(index, end + 1);
+		if (final === 0x4a || final === 0x4b) {
+			sanitized += bytes.slice(spanStart, index);
+			spanStart = end + 1;
 		}
 		index = end;
 	}
-	return sanitized;
+	return spanStart === 0 ? bytes : sanitized + bytes.slice(spanStart);
 }
 type InputListenerResult = { consume?: boolean; data?: string } | undefined;
 type InputListener = (data: string) => InputListenerResult;
@@ -4040,6 +4045,7 @@ export class TUI extends Container {
 	#normalizeLinesForEmit(lines: string[], width: number, start = 0): string[] {
 		const widthCheckIndexes: number[] = [];
 		const widthCheckLines: string[] = [];
+		const retainedWidths: (number | undefined)[] = [];
 		for (let i = start; i < lines.length; i++) {
 			const line = lines[i];
 			if (TERMINAL.isImageLine(line)) continue;
@@ -4052,19 +4058,21 @@ export class TUI extends Container {
 				continue;
 			}
 			widthCheckIndexes.push(i);
-			widthCheckLines.push(normalized);
+			retainedWidths.push(entry.width);
+			if (entry.width === undefined) widthCheckLines.push(normalized);
 		}
 
 		const widths = widthCheckLines.length === 0 ? [] : visibleWidths(widthCheckLines);
 		const truncateIndexes: number[] = [];
 		const truncateLines: string[] = [];
+		let measuredIndex = 0;
 		for (let i = 0; i < widthCheckIndexes.length; i++) {
 			const lineIndex = widthCheckIndexes[i];
-			const normalized = widthCheckLines[i];
-			const measuredWidth = widths[i] ?? 0;
+			const entry = this.#normalizeLineForRender(lines[lineIndex]);
+			const { normalized } = entry;
+			const measuredWidth = retainedWidths[i] ?? widths[measuredIndex++] ?? 0;
+			entry.width = measuredWidth;
 			if (measuredWidth <= width) {
-				const entry = this.#normalizeLineForRender(lines[lineIndex]);
-				entry.width = measuredWidth;
 				this.#lineEmitWidthCache.set(entry.terminated, measuredWidth);
 				lines[lineIndex] = entry.terminated;
 				continue;
@@ -4073,7 +4081,9 @@ export class TUI extends Container {
 			const key = `${width}\0${normalized}`;
 			const cached = this.#lineTruncationCache.get(key);
 			if (cached !== undefined) {
-				this.#lineEmitWidthCache.set(cached, visibleWidth(cached));
+				if (!this.#lineEmitWidthCache.has(cached)) {
+					this.#lineEmitWidthCache.set(cached, visibleWidth(cached));
+				}
 				lines[lineIndex] = cached;
 				continue;
 			}

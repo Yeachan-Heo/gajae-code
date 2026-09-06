@@ -48,9 +48,11 @@ function makeCtx(sessionManager?: Pick<SessionManager, "buildSessionContext" | "
 	ctx: InteractiveModeContext;
 	buildSessionContextSpy: Mock<() => SessionContext>;
 	renderSessionContextSpy: Mock<(...args: unknown[]) => void>;
+	resetAssistantTextPresentationSpy: Mock<() => void>;
 } {
 	const buildSessionContextSpy = vi.fn(() => makeEmptyContext());
 	const renderSessionContextSpy = vi.fn();
+	const resetAssistantTextPresentationSpy = vi.fn();
 
 	const sm = sessionManager ?? {
 		buildSessionContext: buildSessionContextSpy,
@@ -65,20 +67,22 @@ function makeCtx(sessionManager?: Pick<SessionManager, "buildSessionContext" | "
 		pendingPythonComponents: [],
 		sessionManager: sm,
 		renderSessionContext: renderSessionContextSpy,
+		resetAssistantTextPresentation: resetAssistantTextPresentationSpy,
 		showStatus: vi.fn(),
 		ui: { requestRender: vi.fn() },
 	} as unknown as InteractiveModeContext;
 
-	return { ctx, buildSessionContextSpy, renderSessionContextSpy };
+	return { ctx, buildSessionContextSpy, renderSessionContextSpy, resetAssistantTextPresentationSpy };
 }
 
 // ─── Part 1: Isolated renderInitialMessages behaviour ─────────────────────────
 
 describe("UiHelpers.renderInitialMessages — isolated", () => {
 	it("calls sessionManager.buildSessionContext when no prebuilt context is given", () => {
-		const { ctx, buildSessionContextSpy } = makeCtx();
+		const { ctx, buildSessionContextSpy, resetAssistantTextPresentationSpy } = makeCtx();
 		new UiHelpers(ctx).renderInitialMessages();
 		expect(buildSessionContextSpy).toHaveBeenCalledTimes(1);
+		expect(resetAssistantTextPresentationSpy).toHaveBeenCalledTimes(1);
 	});
 
 	it("does NOT call sessionManager.buildSessionContext when a prebuilt context is provided", () => {

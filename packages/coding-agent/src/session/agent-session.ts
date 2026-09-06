@@ -2789,7 +2789,7 @@ export class AgentSession {
 		this.#activeAttemptScope = undefined;
 		this.#activeLogicalRunId = undefined;
 	}
-	#acceptSdkAttemptRun(handle: AttemptRunHandle, sdkRunToken?: string): void {
+	#acceptSdkAttemptRun(handle: AttemptRunHandle, sdkRunToken?: string, sdkRunTokens?: string[]): void {
 		const predecessorScope = this.#activeAttemptScope;
 		const predecessorSdkRunToken =
 			predecessorScope === undefined ? undefined : this.#sdkRunTokensByAttemptScope.get(predecessorScope);
@@ -2802,6 +2802,11 @@ export class AgentSession {
 		if (sdkRunToken !== undefined) {
 			this.#activeSdkRunToken = sdkRunToken;
 			this.#sdkRunTokensByAttemptScope.set(handle.scope, sdkRunToken);
+			const inheritedCohort =
+				predecessorScope !== undefined && predecessorSdkRunToken === sdkRunToken
+					? this.#sdkRunCohortsByAttemptScope.get(predecessorScope)
+					: undefined;
+			this.#sdkRunCohortsByAttemptScope.set(handle.scope, sdkRunTokens ?? inheritedCohort ?? [sdkRunToken]);
 		}
 		if (carryRecoverySkip) this.#skipPostPromptRecoveryWaitByAttemptScope.add(handle.scope);
 	}
@@ -3106,6 +3111,7 @@ export class AgentSession {
 	#sdkRunTokensByQueuedMessage = new WeakMap<AgentMessage, string>();
 	#skipPostPromptRecoveryWaitByAttemptScope = new WeakSet<AttemptScope>();
 	#sdkRunTokensByAttemptScope = new WeakMap<AttemptScope, string>();
+	#sdkRunCohortsByAttemptScope = new WeakMap<AttemptScope, string[]>();
 	#activeSdkRunToken: string | undefined;
 	#activeAttemptScope: AttemptScope | undefined;
 	#attemptAuthority!: AttemptScopeAuthority;
@@ -7535,15 +7541,19 @@ export class AgentSession {
 												const inheritedSdkRunToken = options?.continueQueuedOnly
 													? undefined
 													: (options?.sdkRunToken ?? scheduledSdkRunToken);
-												const consumedSdkRunToken = acceptance.consumedQueuedMessages
+												const consumedSdkRunTokens = acceptance.consumedQueuedMessages
 													.map(message => this.#sdkRunTokensByQueuedMessage.get(message))
-													.find((token): token is string => token !== undefined);
-												const sdkRunToken = consumedSdkRunToken ?? inheritedSdkRunToken;
+													.filter((token): token is string => token !== undefined);
+												const sdkRunToken = consumedSdkRunTokens[0] ?? inheritedSdkRunToken;
 												this.#fireQueuedPromotionHooks(acceptance.consumedQueuedMessages, {
 													startsOwnRun: startsOwn,
 												});
 												if (startsOwn) this.#activeSdkRunToken = sdkRunToken;
-												this.#acceptSdkAttemptRun(handle, sdkRunToken);
+												this.#acceptSdkAttemptRun(
+													handle,
+													sdkRunToken,
+													consumedSdkRunTokens.length > 0 ? consumedSdkRunTokens : undefined,
+												);
 												options?.onRunAccepted?.(handle);
 												// Keep the queued token available through the acceptance callback;
 												// SDK follow-up owners bind it to the new attempt scope there.
@@ -8724,6 +8734,9 @@ export class AgentSession {
 					{
 						type: "agent_start",
 						...(sdkRunToken ? { sdkRunToken } : {}),
+						...(deliveryScope
+							? { sdkRunTokens: this.#sdkRunCohortsByAttemptScope.get(deliveryScope as AttemptScope) }
+							: {}),
 					},
 					undefined,
 					deliveryScope,
