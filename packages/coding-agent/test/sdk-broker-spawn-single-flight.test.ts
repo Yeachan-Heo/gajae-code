@@ -1,4 +1,5 @@
 import { expect, it, spyOn } from "bun:test";
+import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import path from "node:path";
@@ -35,7 +36,14 @@ async function waitForFile(file: string): Promise<void> {
 	throw new Error(`Timed out waiting for ${file}`);
 }
 
-function spawnLockWorker(dir: string, ready: string, journal: string, label: string, holdMs: number): LockWorker {
+function spawnLockWorker(
+	dir: string,
+	ready: string,
+	journal: string,
+	label: string,
+	holdMs: number,
+	env: NodeJS.ProcessEnv = process.env,
+): LockWorker {
 	const source = `
 		import * as fs from "node:fs/promises";
 		import { acquireSpawnLockForTest } from ${JSON.stringify(ensureModule)};
@@ -46,15 +54,15 @@ function spawnLockWorker(dir: string, ready: string, journal: string, label: str
 		await fs.appendFile(${JSON.stringify(journal)}, ${JSON.stringify(`${label}:end\n`)});
 		await release();
 	`;
-	return Bun.spawn([process.execPath, "-e", source], { stdin: "ignore", stdout: "pipe", stderr: "pipe" });
+	return Bun.spawn([process.execPath, "-e", source], { stdin: "ignore", stdout: "pipe", stderr: "pipe", env });
 }
 
-function spawnEnsureWorker(dir: string): LockWorker {
+function spawnEnsureWorker(dir: string, env: NodeJS.ProcessEnv = process.env): LockWorker {
 	const source = `
 		import { ensureBroker } from ${JSON.stringify(ensureModule)};
 		await ensureBroker({ agentDir: ${JSON.stringify(dir)} });
 	`;
-	return Bun.spawn([process.execPath, "-e", source], { stdin: "ignore", stdout: "pipe", stderr: "pipe" });
+	return Bun.spawn([process.execPath, "-e", source], { stdin: "ignore", stdout: "pipe", stderr: "pipe", env });
 }
 
 function spawnStaleBrokerWorker(dir: string, ready: string): LockWorker {
@@ -546,6 +554,81 @@ it("two OS processes reclaim a dead holder without overlapping critical sections
 		await fs.rm(dir, { recursive: true, force: true });
 	}
 }, 30_000);
+
+it("shared agent roots recover dead locks across config profiles despite a retained broker quarantine", async () => {
+	const root = await temp();
+	const dir = path.join(root, "shared-agent");
+	const configA = path.join(root, "profile-a");
+	const configB = path.join(root, "profile-b");
+	const ready = path.join(root, "dead.ready");
+	const journal = path.join(root, "journal");
+	const envA = { ...process.env, GJC_CONFIG_DIR: configA };
+	const envB = { ...process.env, GJC_CONFIG_DIR: configB };
+	const dead = spawnLockWorker(dir, ready, journal, "dead", 60_000, envA);
+	let brokerPid: number | undefined;
+	try {
+		await waitForFile(ready);
+		const deadPid = dead.pid;
+		dead.kill("SIGKILL");
+		await dead.exited;
+
+		const sdk = path.join(dir, "sdk");
+		const brokerLock = path.join(sdk, "broker.lock");
+		await fs.mkdir(brokerLock, { recursive: true, mode: 0o700 });
+		await fs.writeFile(
+			path.join(brokerLock, "owner.json"),
+			JSON.stringify({ version: 1, ownerId: "dead-broker", pid: deadPid, acquiredAt: Date.now() - 60_000 }),
+			{ mode: 0o600 },
+		);
+		const lockStat = await fs.lstat(brokerLock, { bigint: true });
+		const legacyTombstone = path.join(
+			sdk,
+			`.broker.lock.stale-${createHash("sha256").update(`${lockStat.dev}:${lockStat.ino}`).digest("hex")}`,
+		);
+		await fs.mkdir(legacyTombstone, { mode: 0o700 });
+		await fs.writeFile(
+			path.join(legacyTombstone, "owner.json"),
+			JSON.stringify({ version: 1, ownerId: "older-dead-broker", pid: deadPid, acquiredAt: Date.now() - 120_000 }),
+			{ mode: 0o600 },
+		);
+		await brokerDiscovery.writeBrokerDiscovery(dir, {
+			version: 1,
+			protocolVersion: 3,
+			packageGeneration: packageJson.version,
+			ownerId: "dead-broker",
+			pid: deadPid,
+			incarnation: `dead:${deadPid}`,
+			host: "127.0.0.1",
+			port: 1,
+			url: "ws://127.0.0.1:1",
+			token: "dead-broker-token",
+			startedAt: Date.now() - 120_000,
+			heartbeatAt: Date.now() - 120_000,
+		});
+
+		const contenders = Array.from({ length: 4 }, () => spawnEnsureWorker(dir, envB));
+		const results = await Promise.all(
+			contenders.map(async child => ({ code: await child.exited, error: await new Response(child.stderr).text() })),
+		);
+		expect(results).toEqual(results.map(() => ({ code: 0, error: "" })));
+		const discovery = await brokerDiscovery.readBrokerDiscovery(dir);
+		expect(discovery).not.toBeNull();
+		brokerPid = discovery!.pid;
+		expect(discovery!.pid).not.toBe(deadPid);
+		expect(await fs.readdir(sdk)).not.toContain("broker.spawn.lock");
+		expect(await fs.readFile(path.join(legacyTombstone, "owner.json"), "utf8")).toContain("older-dead-broker");
+	} finally {
+		dead.kill("SIGKILL");
+		if (brokerPid !== undefined)
+			try {
+				process.kill(brokerPid, "SIGTERM");
+			} catch {
+				// gone
+			}
+		await Bun.sleep(300);
+		await fs.rm(root, { recursive: true, force: true });
+	}
+}, 60_000);
 
 it("a transient exact stale-removal refusal stays fail-closed and retries acquisition", async () => {
 	const dir = await temp();

@@ -49,20 +49,28 @@ interface BrokerLockHostIdentity {
 	previousOwnerHostIds: readonly string[];
 }
 
-let brokerLockHostIdentityPromise: Promise<BrokerLockHostIdentity> | undefined;
+const brokerLockHostIdentityPromises = new Map<string, Promise<BrokerLockHostIdentity>>();
 
-async function brokerLockHostIdentity(): Promise<BrokerLockHostIdentity> {
+async function brokerLockHostIdentity(agentDir: string): Promise<BrokerLockHostIdentity> {
+	const coordinationRoot = path.resolve(agentDir, "sdk");
 	const pending =
-		brokerLockHostIdentityPromise ??
-		Promise.all([loadInstallationHostId(), loadLegacyInstallationHostId()]).then(([ownerHostId, legacyHostId]) => ({
+		brokerLockHostIdentityPromises.get(coordinationRoot) ??
+		Promise.all([
+			loadInstallationHostId({ configRootDir: coordinationRoot }),
+			loadInstallationHostId(),
+			loadLegacyInstallationHostId(),
+		]).then(([ownerHostId, installationHostId, legacyHostId]) => ({
 			ownerHostId,
-			previousOwnerHostIds: legacyHostId === ownerHostId ? [] : [legacyHostId],
+			previousOwnerHostIds: [...new Set([installationHostId, legacyHostId])].filter(
+				hostId => hostId !== ownerHostId,
+			),
 		}));
-	brokerLockHostIdentityPromise = pending;
+	brokerLockHostIdentityPromises.set(coordinationRoot, pending);
 	try {
 		return await pending;
 	} catch (error) {
-		if (brokerLockHostIdentityPromise === pending) brokerLockHostIdentityPromise = undefined;
+		if (brokerLockHostIdentityPromises.get(coordinationRoot) === pending)
+			brokerLockHostIdentityPromises.delete(coordinationRoot);
 		throw error;
 	}
 }
@@ -102,7 +110,7 @@ async function readBrokerDiscoveryBeforeDeadline(
  * the exact directory generation, and ownership includes the OS incarnation.
  */
 async function acquireSpawnLock(agentDir: string, options: SpawnLockOptions = {}): Promise<() => Promise<void>> {
-	const hostIdentity = await brokerLockHostIdentity();
+	const hostIdentity = await brokerLockHostIdentity(agentDir);
 	return acquireFileLock(path.join(agentDir, "sdk", SPAWN_LOCK_TARGET_NAME), {
 		retries: Math.ceil(SPAWN_LOCK_WAIT_MS / SPAWN_LOCK_RETRY_DELAY_MS),
 		retryDelayMs: SPAWN_LOCK_RETRY_DELAY_MS,
@@ -120,7 +128,7 @@ export async function withBrokerStartupLock<T>(
 	agentDir: string,
 	operation: (deadline: number) => Promise<T>,
 ): Promise<T> {
-	const hostIdentity = await brokerLockHostIdentity();
+	const hostIdentity = await brokerLockHostIdentity(agentDir);
 	return withFileLock(
 		path.join(agentDir, "sdk", STARTUP_LOCK_TARGET_NAME),
 		() => operation(Date.now() + STALE_BROKER_RETIREMENT_TIMEOUT_MS + BROKER_PUBLICATION_TIMEOUT_MS),
