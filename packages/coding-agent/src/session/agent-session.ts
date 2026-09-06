@@ -3848,8 +3848,10 @@ export class AgentSession {
 			if (
 				continuationAdmission?.entry === owner &&
 				continuationAdmission.capability === owner.continuationCapability
-			)
+			) {
+				if (kind === "prompt") await this.#reconcileTerminalPersistenceFailure();
 				return await body({ release: () => {} });
+			}
 			if (options?.allowPromptContinuationReentry === true && owner.kind === "prompt") {
 				return await body({ release: () => {} });
 			}
@@ -6051,6 +6053,19 @@ export class AgentSession {
 		if (failures.length > 0) throw new AggregateError(failures, "Tool session transition cleanup failed.");
 	}
 
+	async #runCommittedSessionTransitionCleanups(): Promise<void> {
+		try {
+			await this.#runToolSessionTransitionCleanups();
+		} catch (error) {
+			logger.warn("Committed session transition cleanup failed", { error: String(error) });
+			this.emitNotice(
+				"warning",
+				"The successor session is active, but a predecessor tool cleanup did not finish. Remaining cleanup will retry during disposal.",
+				"session-transition-cleanup",
+			);
+		}
+	}
+
 	async #runToolSessionCleanups(): Promise<void> {
 		const cleanups = Array.from(this.#toolSessionCleanups);
 		const results = await Promise.allSettled(cleanups.map(async cleanup => await cleanup()));
@@ -6191,7 +6206,7 @@ export class AgentSession {
 					}
 					retireOwnedRegistrationsForEndpoint(predecessorEndpointId);
 					this.sessionManager.retireEphemeralArtifactsAfterTransition();
-					await this.#runToolSessionTransitionCleanups();
+					await this.#runCommittedSessionTransitionCleanups();
 					manager.finishOwnerSubagentShutdown(lease, "commit");
 					return;
 				} catch (error) {
@@ -7151,7 +7166,11 @@ export class AgentSession {
 			}
 		}
 
-		if (event.type === "agent_end" && (orphanAssistant || unadmittedTerminalAssistant)) {
+		if (
+			event.type === "agent_end" &&
+			(orphanAssistant || unadmittedTerminalAssistant) &&
+			!this.#terminalPersistenceRecovery
+		) {
 			if (canonicalAdmission && !canonicalAdmission.predecessor.released) {
 				await canonicalAdmission.predecessor.promise;
 			}
@@ -7179,11 +7198,6 @@ export class AgentSession {
 							"session-persistence",
 						);
 					} else {
-						this.emitNotice(
-							"error",
-							"Interrupted assistant output could not be committed to session history. Reconcile session storage before continuing.",
-							"session-persistence",
-						);
 						Object.defineProperty(event, "terminalPersistenceFailed", { value: true, enumerable: true });
 						this.#terminalPersistenceRecovery = {
 							message: recoveredAssistant,
@@ -7194,6 +7208,11 @@ export class AgentSession {
 						const failedPresentation =
 							orphanAssistant?.presentationMessage ?? provisionalAssistant?.presentationMessage;
 						if (failedPresentation) this.agent.discardRejectedAssistantEvent(failedPresentation);
+						this.emitNotice(
+							"error",
+							"Interrupted assistant output could not be committed to session history. Reconcile session storage before continuing.",
+							"session-persistence",
+						);
 						persistenceFailed = true;
 					}
 				}
@@ -16539,6 +16558,7 @@ export class AgentSession {
 		void transition
 			.finally(() => {
 				if (this.#newSessionTransition === transition) this.#newSessionTransition = undefined;
+				this.#externalIngressSealed = false;
 				this.#endSessionTransition();
 			})
 			.catch(() => {});
@@ -16589,6 +16609,7 @@ export class AgentSession {
 		if (!lease) {
 			this.#disconnectFromAgent();
 			await this.abort();
+			this.#externalIngressSealed = true;
 			if (this.isCompacting) {
 				this.abortCompaction();
 				while (this.isCompacting) {
@@ -16614,7 +16635,7 @@ export class AgentSession {
 				// manager so post-transition lineage bindings resolve and owned
 				// aborts classify in the successor session (review thread P1).
 				this.#rekeyJobManagerForSessionIdentity(noLeasePreviousSessionIdentity, noLeasePreviousSessionFile);
-				await this.#runToolSessionTransitionCleanups();
+				await this.#runCommittedSessionTransitionCleanups();
 			} catch (error) {
 				throw await discardPreparedNewSessionAfterFailure(this.sessionManager, prepared, error);
 			}
@@ -16646,6 +16667,7 @@ export class AgentSession {
 			try {
 				manager.runOwnerProducerCleanupsStrict({ ownerId });
 				await this.abort();
+				this.#externalIngressSealed = true;
 				if (this.isCompacting) {
 					this.abortCompaction();
 					while (this.isCompacting) {
@@ -16690,7 +16712,7 @@ export class AgentSession {
 				// manager so post-transition lineage bindings resolve and owned
 				// aborts classify in the successor session (review thread P1).
 				this.#rekeyJobManagerForSessionIdentity(previousSessionIdentity, previousSessionIdentityFile);
-				await this.#runToolSessionTransitionCleanups();
+				await this.#runCommittedSessionTransitionCleanups();
 			} catch (error) {
 				throw await discardPreparedNewSessionAfterFailure(this.sessionManager, prepared, error);
 			}
@@ -16947,7 +16969,7 @@ export class AgentSession {
 						error: error instanceof Error ? error.message : String(error),
 					});
 				}
-				await this.#runToolSessionTransitionCleanups();
+				await this.#runCommittedSessionTransitionCleanups();
 			} else {
 				// Prepare the copied successor and complete local:// readiness while all
 				// public manager getters remain bound to the predecessor.
@@ -16961,7 +16983,7 @@ export class AgentSession {
 					// Fork commits a successor endpoint identity; re-register the
 					// manager under it (review thread P1).
 					this.#rekeyJobManagerForSessionIdentity(previousSessionIdentity, previousSessionFile);
-					await this.#runToolSessionTransitionCleanups();
+					await this.#runCommittedSessionTransitionCleanups();
 				} catch (error) {
 					throw await discardPreparedNewSessionAfterFailure(this.sessionManager, prepared, error);
 				}
@@ -19451,7 +19473,7 @@ export class AgentSession {
 				// manager under it (review thread P1).
 				this.#rekeyJobManagerForSessionIdentity(rollbackSessionState.sessionId, rollbackSessionState.sessionFile);
 				committed = true;
-				await this.#runToolSessionTransitionCleanups();
+				await this.#runCommittedSessionTransitionCleanups();
 				this.#terminalizeQueuedSdkWorkForSessionTransition([
 					...rollbackAgentSteeringQueue,
 					...rollbackAgentFollowUpQueue,
@@ -25469,7 +25491,7 @@ export class AgentSession {
 						// made rollback restore live jobs without their owned tuples.
 						retireOwnedRegistrationsForEndpoint(predecessorEndpointId);
 						this.sessionManager.retireEphemeralArtifactsAfterTransition();
-						await this.#runToolSessionTransitionCleanups();
+						await this.#runCommittedSessionTransitionCleanups();
 					}
 				}
 				this.#reconnectToAgent();
@@ -25671,7 +25693,7 @@ export class AgentSession {
 				// Branch commits a successor endpoint identity; re-register the
 				// manager under it (review thread P1).
 				this.#rekeyJobManagerForSessionIdentity(previousSessionIdentity, previousSessionFile);
-				await this.#runToolSessionTransitionCleanups();
+				await this.#runCommittedSessionTransitionCleanups();
 			} catch (error) {
 				throw await discardPreparedNewSessionAfterFailure(this.sessionManager, prepared, error);
 			}
