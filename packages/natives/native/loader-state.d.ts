@@ -30,6 +30,8 @@ export function detectWin32Avx2Support(
 	report?: (diagnostic: Win32Avx2ProbeDiagnostic) => void,
 ): boolean;
 
+export function getVariantOverride(env?: Record<string, string | undefined>): "modern" | "baseline" | null;
+
 export interface GetAddonFilenamesInput {
 	tag: string;
 	arch: string;

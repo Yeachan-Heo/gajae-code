@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- The addon loader now honors `GJC_NATIVE_VARIANT`, the x64 variant override named in `docs/natives-architecture.md`, `docs/natives-addon-loader-runtime.md`, and `docs/natives-build-release-debugging.md`. Only the pre-rebrand `PI_NATIVE_VARIANT` was read, so the documented remedy for a machine that loads the wrong variant — including the troubleshooting row that prescribes `GJC_NATIVE_VARIANT=baseline` — silently kept the auto-detected variant. The legacy name still works, the canonical name wins when both are set, an empty canonical value falls through to the alias, and invalid values are still ignored.
+
 ## [0.16.4] - 2026-09-05
 
 ### Fixed
