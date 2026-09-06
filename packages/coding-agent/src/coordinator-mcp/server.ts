@@ -5930,6 +5930,14 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			);
 			if (pendingDeletion?.phase === "intent") {
 				try {
+					await ensureQuestionTransaction(id);
+					const pendingDeletionId = pendingDeletion.deletion_id;
+					pendingDeletion = await withNamespaceRegistry(
+						questionPaths,
+						async registry => registry.deletions[pendingDeletionId] ?? null,
+					);
+					if (pendingDeletion?.phase !== "intent")
+						throw new SdkClientError("state_corrupt", "Pending deletion migration lost its intent.");
 					await recoverIntentDeletion(pendingDeletion);
 				} catch (error) {
 					return {
