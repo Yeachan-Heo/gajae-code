@@ -3,7 +3,7 @@
  * streaming must render its header/output/exit status continuously and land in
  * the chat transcript on completion, exactly like the idle path.
  */
-import { beforeAll, describe, expect, it } from "bun:test";
+import { beforeAll, describe, expect, it, vi } from "bun:test";
 import { BashExecutionComponent } from "@gajae-code/coding-agent/modes/components/bash-execution";
 import type { EvalExecutionComponent } from "@gajae-code/coding-agent/modes/components/eval-execution";
 import { CommandController } from "@gajae-code/coding-agent/modes/controllers/command-controller";
@@ -115,6 +115,7 @@ function createHarness(options: { isStreaming: boolean }): Harness {
 		statusLine: { invalidate: () => {}, setSessionStartTime: () => {} },
 		updateEditorTopBorder: () => {},
 		updateEditorBorderColor: () => {},
+		resetAssistantTextPresentation: vi.fn(),
 		resetIrcSidebarSession: () => {},
 		resetObserverRegistry: () => {},
 		reloadTodos: async () => {},
@@ -258,6 +259,7 @@ describe("deferred shell command display", () => {
 		harness.rebuiltTranscriptRows.push("earlier command");
 		new UiHelpers(harness.ctx).renderInitialMessages();
 
+		expect(harness.ctx.resetAssistantTextPresentation).toHaveBeenCalledTimes(1);
 		expect(harness.ctx.pendingBashComponents).toEqual([liveComponent]);
 		expect(harness.pendingMessagesContainer.children).toEqual([liveComponent]);
 		expect(harness.pendingMessagesContainer.render(80).join("\n")).toContain("$ printf parked");
@@ -336,6 +338,7 @@ describe("deferred shell command parentage after the transcript is cleared", () 
 		expect(harness.pendingMessagesContainer.children).toContain(parked);
 
 		expect(await controller.handleClearCommand()).toBe(true);
+		expect(harness.ctx.resetAssistantTextPresentation).toHaveBeenCalledTimes(1);
 		expect(harness.pendingMessagesContainer.hasLiveChild(parked)).toBe(false);
 		const chatChildrenAfterClear = harness.chatContainer.children.length;
 
@@ -356,6 +359,7 @@ describe("deferred shell command parentage after the transcript is cleared", () 
 
 		const parked = harness.ctx.pendingBashComponents[0];
 		await controller.handleContextClearCommand();
+		expect(harness.ctx.resetAssistantTextPresentation).toHaveBeenCalledTimes(1);
 		expect(harness.pendingMessagesContainer.hasLiveChild(parked)).toBe(false);
 		const chatChildrenAfterClear = harness.chatContainer.children.length;
 

@@ -1061,8 +1061,7 @@ export class Editor implements Component, Focusable {
 				if (after.length > 0) {
 					// Cursor is on a character (grapheme) - replace it with highlighted version
 					// Get the first grapheme from 'after'
-					const afterGraphemes = [...segmenter.segment(after)];
-					const firstGrapheme = afterGraphemes[0]?.segment || "";
+					const firstGrapheme = segmenter.segment(after)[Symbol.iterator]().next().value?.segment || "";
 					const restAfter = after.slice(firstGrapheme.length);
 					const cursor = `\x1b[7m${firstGrapheme}\x1b[0m`;
 					displayText = before + marker + cursor + restAfter;
@@ -2643,8 +2642,7 @@ export class Editor implements Component, Focusable {
 			const afterCursor = currentLine.slice(this.#state.cursorCol);
 
 			// Find the first grapheme at cursor
-			const graphemes = [...segmenter.segment(afterCursor)];
-			const firstGrapheme = graphemes[0];
+			const firstGrapheme = segmenter.segment(afterCursor)[Symbol.iterator]().next().value;
 			const graphemeLength = firstGrapheme ? firstGrapheme.segment.length : 1;
 
 			const before = currentLine.slice(0, this.#state.cursorCol);
@@ -2762,8 +2760,7 @@ export class Editor implements Component, Focusable {
 						this.#setCursorCol(this.#state.cursorCol + 1);
 					} else {
 						const afterCursor = currentLine.slice(this.#state.cursorCol);
-						const graphemes = [...segmenter.segment(afterCursor)];
-						const firstGrapheme = graphemes[0];
+						const firstGrapheme = segmenter.segment(afterCursor)[Symbol.iterator]().next().value;
 						this.#setCursorCol(this.#state.cursorCol + (firstGrapheme ? firstGrapheme.segment.length : 1));
 					}
 				} else if (this.#state.cursorLine < this.#state.lines.length - 1) {

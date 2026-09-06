@@ -59,6 +59,7 @@ function createContext(session: { switchSession: (path: string, options?: unknow
 		rebuildInitialMessages: vi.fn(),
 		reloadTodos: vi.fn(async () => undefined),
 		showStatus: vi.fn(),
+		resetAssistantTextPresentation: vi.fn(),
 	} as unknown as InteractiveModeContext;
 
 	return { context, statusContainer, pendingMessagesContainer, ui };
@@ -183,6 +184,7 @@ describe("resume session re-entrancy", () => {
 		expect(context.pendingTools.size).toBe(1);
 		expect(pendingMessagesContainer.children).toHaveLength(1);
 		expect(loadingAnimation.stop).not.toHaveBeenCalled();
+		expect(context.resetAssistantTextPresentation).not.toHaveBeenCalled();
 
 		ui.stop();
 	});
@@ -205,6 +207,9 @@ describe("resume session re-entrancy", () => {
 		expect(pendingMessagesContainer.children).toHaveLength(0);
 		expect(loadingAnimation.stop).toHaveBeenCalled();
 		expect(context.loadingAnimation).toBeUndefined();
+		// The committed switch drops the coalesced assistant-text projection so the
+		// resumed transcript is not painted over the previous session's frame state.
+		expect(context.resetAssistantTextPresentation).toHaveBeenCalledTimes(1);
 		expect(context.showStatus).toHaveBeenCalledWith("Resumed session");
 
 		ui.stop();

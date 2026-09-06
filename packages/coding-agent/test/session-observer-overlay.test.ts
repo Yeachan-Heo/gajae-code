@@ -1,5 +1,7 @@
 import { beforeAll, describe, expect, spyOn, test } from "bun:test";
+import * as crypto from "node:crypto";
 import * as fs from "node:fs";
+import * as fsAsync from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
@@ -110,6 +112,35 @@ function parsedMessages(records: string): Parameters<typeof entriesFromMessages>
 }
 
 describe("SessionObserverOverlayComponent source snapshots", () => {
+	test("incremental digest matches SHA-256 of the complete concatenated prefix", async () => {
+		const dir = await fsAsync.mkdtemp(path.join(os.tmpdir(), "observer-digest-"));
+		try {
+			const file = path.join(dir, "session.jsonl");
+			const prefix = Buffer.from(source("observed", `${record("one", "one €")}\n`));
+			await Bun.write(file, prefix);
+			const overlay = observer(file);
+			const suffix = Buffer.from(`${record("two", "two 한글")}\n`);
+			const expected = crypto
+				.createHash("sha256")
+				.update(Buffer.concat([prefix, suffix]))
+				.digest("hex");
+			await fsAsync.appendFile(file, suffix);
+			const digestSpy = spyOn(crypto.Hash.prototype, "digest");
+			try {
+				overlay.refreshFromRegistry();
+				expect(rendered(overlay)).toContain("two 한글");
+				expect(digestSpy.mock.results.map(result => result.value)).toContain(expected);
+			} finally {
+				digestSpy.mockRestore();
+			}
+			await fsAsync.appendFile(file, `${record("three", "three")}\n`);
+			overlay.refreshFromRegistry();
+			expect(occurrences(rendered(overlay), "two 한글")).toBe(1);
+			expect(rendered(overlay)).toContain("three");
+		} finally {
+			await fsAsync.rm(dir, { recursive: true, force: true });
+		}
+	});
 	test("publishes a direct-tail record once when its € bytes are split between writes", () => {
 		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "observer-utf8-tail-"));
 		try {

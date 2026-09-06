@@ -60,6 +60,22 @@ describe("SelectList", () => {
 		setKeybindings(new KeybindingsManager(TUI_KEYBINDINGS));
 	});
 
+	it("preserves fixed-column bytes and capped adaptive-column parity", () => {
+		const items = [
+			{ value: "wide", label: "界".repeat(100), description: "first" },
+			{ value: "short", label: "hi", description: "second" },
+		];
+		const fixed = new SelectList(items, 5, testTheme, {
+			minPrimaryColumnWidth: 12,
+			maxPrimaryColumnWidth: 12,
+		});
+		const adaptive = new SelectList(items, 5, testTheme, {
+			minPrimaryColumnWidth: 4,
+			maxPrimaryColumnWidth: 12,
+		});
+		expect(fixed.render(80)).toEqual([`→ ${"界".repeat(5)}  first`, "  hi          second"]);
+		expect(adaptive.render(80)).toEqual(fixed.render(80));
+	});
 	it("normalizes multiline descriptions to single line", () => {
 		const items = [
 			{

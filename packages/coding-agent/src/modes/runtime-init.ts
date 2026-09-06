@@ -201,6 +201,7 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 			},
 			getJobs: () => session.getAsyncJobSnapshot(),
 			onJobFold: listener => session.onJobFold(listener),
+			onSessionEvent: listener => session.subscribe(listener),
 			setSdkPermissionProvider: provider => session.setSdkPermissionProvider(provider),
 			setSdkClientBridge: bridge => session.setClientBridge(bridge),
 			sdkControl: async (operation, input) => {

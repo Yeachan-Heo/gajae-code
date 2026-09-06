@@ -263,6 +263,7 @@ export class ExtensionRunner {
 
 	#getJobsFn: ExtensionContextActions["getJobs"] = undefined;
 	#onJobFoldFn: ExtensionContextActions["onJobFold"] = undefined;
+	#onSessionEventFn: ExtensionContextActions["onSessionEvent"] = undefined;
 	#sdkControlFn: ExtensionContextActions["sdkControl"] = undefined;
 	#setSdkPermissionProviderFn: ExtensionContextActions["setSdkPermissionProvider"] = undefined;
 	#setSdkClientBridgeFn: ExtensionContextActions["setSdkClientBridge"] = undefined;
@@ -395,6 +396,7 @@ export class ExtensionRunner {
 
 		this.#getJobsFn = contextActions.getJobs;
 		this.#onJobFoldFn = contextActions.onJobFold;
+		this.#onSessionEventFn = contextActions.onSessionEvent;
 		this.#sdkControlFn = contextActions.sdkControl;
 		this.#setSdkPermissionProviderFn = contextActions.setSdkPermissionProvider;
 		this.#setSdkClientBridgeFn = contextActions.setSdkClientBridge;
@@ -680,6 +682,7 @@ export class ExtensionRunner {
 
 			getJobs: () => this.#getJobsFn?.(),
 			onJobFold: listener => this.#onJobFoldFn?.(listener) ?? (() => {}),
+			onSessionEvent: listener => this.#onSessionEventFn?.(listener) ?? (() => {}),
 			sdkControl: (operation, input) => this.#sdkControlFn?.(operation, input),
 			setSdkPermissionProvider: provider => this.#setSdkPermissionProviderFn?.(provider),
 			setSdkClientBridge: bridge => this.#setSdkClientBridgeFn?.(bridge),

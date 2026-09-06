@@ -1,5 +1,6 @@
 import * as crypto from "node:crypto";
 import * as fsSync from "node:fs";
+import type { FileHandle } from "node:fs/promises";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { Api, Model } from "@gajae-code/ai/core";
@@ -939,16 +940,80 @@ function validateGeneration(
 	return generation;
 }
 
-function readJsonSync(file: string): unknown | undefined {
+type RegistryFileStat = {
+	dev: number | bigint;
+	ino: number | bigint;
+	size: number | bigint;
+	isFile(): boolean;
+	isSymbolicLink(): boolean;
+};
+
+function registryFileOpenFlags(): number {
+	return (
+		fsSync.constants.O_RDONLY |
+		(process.platform === "win32" ? 0 : (fsSync.constants.O_NOFOLLOW ?? 0) | (fsSync.constants.O_NONBLOCK ?? 0))
+	);
+}
+
+function sameRegistryFileIdentity(left: RegistryFileStat, right: RegistryFileStat): boolean {
+	return (
+		left.isFile() &&
+		!left.isSymbolicLink() &&
+		right.isFile() &&
+		!right.isSymbolicLink() &&
+		left.dev === right.dev &&
+		left.ino === right.ino
+	);
+}
+
+function readBoundedRegistryFdSync(fd: number): Buffer {
+	const chunks: Buffer[] = [];
+	const buffer = Buffer.allocUnsafe(64 * 1024);
+	let total = 0;
+	for (;;) {
+		const length = Math.min(buffer.length, MODEL_PRESET_REGISTRY_MAX_STATE_BYTES + 1 - total);
+		const bytesRead = fsSync.readSync(fd, buffer, 0, length, null);
+		if (bytesRead === 0) return Buffer.concat(chunks, total);
+		total += bytesRead;
+		chunks.push(Buffer.from(buffer.subarray(0, bytesRead)));
+		if (total > MODEL_PRESET_REGISTRY_MAX_STATE_BYTES) throw new Error("Registry cache is oversized.");
+	}
+}
+
+function readRegistryBytesSync(file: string): Buffer | undefined {
+	let before: fsSync.Stats;
 	try {
-		const stat = fsSync.lstatSync(file);
-		if (!stat.isFile() || stat.isSymbolicLink()) throw new Error("Registry cache path is not a regular file.");
-		if (stat.size > MODEL_PRESET_REGISTRY_MAX_STATE_BYTES) throw new Error("Registry cache is oversized.");
-		return JSON.parse(fsSync.readFileSync(file, "utf8"));
+		before = fsSync.lstatSync(file);
 	} catch (error) {
 		if (isEnoent(error)) return undefined;
 		throw error;
 	}
+	if (!before.isFile() || before.isSymbolicLink()) throw new Error("Registry cache path is not a regular file.");
+	if (before.size > MODEL_PRESET_REGISTRY_MAX_STATE_BYTES) throw new Error("Registry cache is oversized.");
+	let fd: number | undefined;
+	try {
+		fd = fsSync.openSync(file, registryFileOpenFlags());
+		const opened = fsSync.fstatSync(fd);
+		if (!sameRegistryFileIdentity(before, opened)) throw new Error("Registry cache path changed while opening.");
+		const bytes = readBoundedRegistryFdSync(fd);
+		const finalOpened = fsSync.fstatSync(fd);
+		let after: fsSync.Stats;
+		try {
+			after = fsSync.lstatSync(file);
+		} catch (error) {
+			throw new Error("Registry cache path changed while reading.", { cause: error });
+		}
+		if (!sameRegistryFileIdentity(opened, finalOpened) || !sameRegistryFileIdentity(opened, after))
+			throw new Error("Registry cache path changed while reading.");
+		return bytes;
+	} finally {
+		if (fd !== undefined) fsSync.closeSync(fd);
+	}
+}
+
+function readJsonSync(file: string): unknown | undefined {
+	const bytes = readRegistryBytesSync(file);
+	return bytes === undefined ? undefined : JSON.parse(bytes.toString("utf8"));
 }
 
 /**
@@ -956,16 +1021,44 @@ function readJsonSync(file: string): unknown | undefined {
  * Keep the synchronous reader above for legacy startup paths until their
  * constructor-wide migration can be completed without changing public APIs.
  */
-async function readJsonBun(file: string): Promise<unknown | undefined> {
+async function readRegistryBytesBun(file: string): Promise<Buffer | undefined> {
+	let before: fsSync.BigIntStats;
 	try {
-		const stat = await fs.lstat(file, { bigint: true });
-		if (!stat.isFile() || stat.isSymbolicLink()) throw new Error("Registry cache path is not a regular file.");
-		if (stat.size > BigInt(MODEL_PRESET_REGISTRY_MAX_STATE_BYTES)) throw new Error("Registry cache is oversized.");
-		return JSON.parse(await Bun.file(file).text());
+		before = await fs.lstat(file, { bigint: true });
 	} catch (error) {
 		if (isEnoent(error)) return undefined;
 		throw error;
 	}
+	if (!before.isFile() || before.isSymbolicLink()) throw new Error("Registry cache path is not a regular file.");
+	if (before.size > BigInt(MODEL_PRESET_REGISTRY_MAX_STATE_BYTES)) throw new Error("Registry cache is oversized.");
+	let handle: FileHandle | undefined;
+	try {
+		handle = await fs.open(file, registryFileOpenFlags());
+		const opened = await handle.stat({ bigint: true });
+		if (!sameRegistryFileIdentity(before, opened)) throw new Error("Registry cache path changed while opening.");
+		const bunFileFromDescriptor = (Bun.file as unknown as (descriptor: number) => Bun.BunFile)(handle.fd);
+		const bytes = Buffer.from(
+			await bunFileFromDescriptor.slice(0, MODEL_PRESET_REGISTRY_MAX_STATE_BYTES + 1).arrayBuffer(),
+		);
+		if (bytes.length > MODEL_PRESET_REGISTRY_MAX_STATE_BYTES) throw new Error("Registry cache is oversized.");
+		const finalOpened = await handle.stat({ bigint: true });
+		let after: fsSync.BigIntStats;
+		try {
+			after = await fs.lstat(file, { bigint: true });
+		} catch (error) {
+			throw new Error("Registry cache path changed while reading.", { cause: error });
+		}
+		if (!sameRegistryFileIdentity(opened, finalOpened) || !sameRegistryFileIdentity(opened, after))
+			throw new Error("Registry cache path changed while reading.");
+		return bytes;
+	} finally {
+		await handle?.close();
+	}
+}
+
+async function readJsonBun(file: string): Promise<unknown | undefined> {
+	const bytes = await readRegistryBytesBun(file);
+	return bytes === undefined ? undefined : JSON.parse(bytes.toString("utf8"));
 }
 
 function parseState(value: unknown): RegistryState {
@@ -1576,9 +1669,10 @@ function cloneAcceptedModelPresetRegistry(value: AcceptedModelPresetRegistry): A
 
 function registryFileFingerprint(file: string): string {
 	try {
-		return sha256(fsSync.readFileSync(file));
-	} catch {
-		return "absent";
+		const bytes = readRegistryBytesSync(file);
+		return bytes === undefined ? "absent" : sha256(bytes);
+	} catch (error) {
+		return isEnoent(error) ? "absent" : "rejected";
 	}
 }
 
@@ -1595,9 +1689,10 @@ function acceptedRegistryFingerprint(
 
 async function registryFileFingerprintAsync(file: string): Promise<string> {
 	try {
-		return sha256(new Uint8Array(await Bun.file(file).arrayBuffer()));
-	} catch {
-		return "absent";
+		const bytes = await readRegistryBytesBun(file);
+		return bytes === undefined ? "absent" : sha256(bytes);
+	} catch (error) {
+		return isEnoent(error) ? "absent" : "rejected";
 	}
 }
 
@@ -1624,6 +1719,8 @@ export function loadAcceptedModelPresetRegistry(
 	if (!acceptedRegistryReadIsCacheable(dependencies) || environmentDisabled())
 		return loadAcceptedModelPresetRegistryUncached(agentDir, dependencies);
 	const fingerprint = acceptedRegistryFingerprint(agentDir, dependencies);
+	if (fingerprint.split("|").includes("rejected"))
+		return loadAcceptedModelPresetRegistryUncached(agentDir, dependencies);
 	const cached = acceptedRegistryReadCache.get(agentDir);
 	if (cached && cached.fingerprint === fingerprint) return cloneAcceptedModelPresetRegistry(cached.value);
 	const value = loadAcceptedModelPresetRegistryUncached(agentDir, dependencies);
@@ -1700,6 +1797,8 @@ export async function loadAcceptedModelPresetRegistryAsync(
 	if (!acceptedRegistryReadIsCacheable(dependencies) || environmentDisabled())
 		return loadAcceptedModelPresetRegistryAsyncUncached(agentDir, dependencies);
 	const fingerprint = await acceptedRegistryFingerprintAsync(agentDir, dependencies);
+	if (fingerprint.split("|").includes("rejected"))
+		return loadAcceptedModelPresetRegistryAsyncUncached(agentDir, dependencies);
 	const cached = acceptedRegistryReadCache.get(agentDir);
 	if (cached && cached.fingerprint === fingerprint) return cloneAcceptedModelPresetRegistry(cached.value);
 	const value = await loadAcceptedModelPresetRegistryAsyncUncached(agentDir, dependencies);

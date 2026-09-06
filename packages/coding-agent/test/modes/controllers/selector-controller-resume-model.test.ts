@@ -62,6 +62,7 @@ function createContext(options: {
 		streamingComponent: undefined,
 		streamingMessage: undefined,
 		pendingTools: { clear: vi.fn() },
+		resetAssistantTextPresentation: vi.fn(),
 		loadingAnimation: undefined,
 		stopLoadingAnimation: vi.fn(),
 		syncActivityIndicator: vi.fn(),
@@ -110,6 +111,7 @@ describe("SelectorController resume model choice", () => {
 			restoreBackground: false,
 		});
 		expect(ctx.syncActivityIndicator).toHaveBeenCalledTimes(1);
+		expect(ctx.resetAssistantTextPresentation).toHaveBeenCalledTimes(1);
 	});
 
 	it("prompts and switches when resumeModelBehavior is ask and models differ", async () => {
@@ -166,6 +168,7 @@ describe("SelectorController resume model choice", () => {
 		expect(ctx.retryLoader).toBe(typedRetryLoader);
 		expect(ctx.retryCountdownTimer).toBe(retryTimer);
 		expect(retryLoader.stop).not.toHaveBeenCalled();
+		expect(ctx.resetAssistantTextPresentation).not.toHaveBeenCalled();
 		clearInterval(retryTimer);
 	});
 
