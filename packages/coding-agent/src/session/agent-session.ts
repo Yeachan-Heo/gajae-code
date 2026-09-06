@@ -6931,11 +6931,11 @@ export class AgentSession {
 					// the success event is awaiting its subscribers.
 					const attempt = this.#retryAttempt;
 					this.#retryAttempt = 0;
-					await this.#emitSessionEvent({
-						type: "auto_retry_end",
-						success: true,
-						attempt,
-					});
+					try {
+						await this.#emitSessionEvent({ type: "auto_retry_end", success: true, attempt });
+					} finally {
+						this.#resolveRetry();
+					}
 					// Settle the retry gate here, colocated with the success event, rather
 					// than relying on the generic #resolveRetry() at the end of the
 					// agent_end branch. That tail resolver is bypassed by every early
@@ -7156,12 +7156,16 @@ export class AgentSession {
 				// the terminal retry-end and reset so observers clear retry state.
 				const attempt = this.#retryAttempt;
 				this.#retryAttempt = 0;
-				await this.#emitSessionEvent({
-					type: "auto_retry_end",
-					success: false,
-					attempt,
-					finalError: msg.errorMessage,
-				});
+				try {
+					await this.#emitSessionEvent({
+						type: "auto_retry_end",
+						success: false,
+						attempt,
+						finalError: msg.errorMessage,
+					});
+				} finally {
+					this.#resolveRetry();
+				}
 			}
 			this.#resolveRetry();
 			if (this.#isDisposed || this.#sessionAdmissionClosing) return;
@@ -22008,13 +22012,16 @@ export class AgentSession {
 				} else {
 					const attempt = this.#retryAttempt;
 					this.#retryAttempt = 0;
-					await this.#emitSessionEvent({
-						type: "auto_retry_end",
-						success: false,
-						attempt,
-						finalError: "Retry cancelled",
-					});
-					this.#resolveRetry();
+					try {
+						await this.#emitSessionEvent({
+							type: "auto_retry_end",
+							success: false,
+							attempt,
+							finalError: "Retry cancelled",
+						});
+					} finally {
+						this.#resolveRetry();
+					}
 					return;
 				}
 			}
@@ -22026,13 +22033,16 @@ export class AgentSession {
 				this.#retryAbortController = undefined;
 				const attempt = this.#retryAttempt;
 				this.#retryAttempt = 0;
-				await this.#emitSessionEvent({
-					type: "auto_retry_end",
-					success: false,
-					attempt,
-					finalError: "Retry cancelled",
-				});
-				this.#resolveRetry();
+				try {
+					await this.#emitSessionEvent({
+						type: "auto_retry_end",
+						success: false,
+						attempt,
+						finalError: "Retry cancelled",
+					});
+				} finally {
+					this.#resolveRetry();
+				}
 				return;
 			}
 			if (this.#retryAbortController === retryAbortController) this.#retryAbortController = undefined;
@@ -22045,13 +22055,16 @@ export class AgentSession {
 					if (retryCancelled() || ownershipCancelled()) {
 						const attempt = this.#retryAttempt;
 						this.#retryAttempt = 0;
-						await this.#emitSessionEvent({
-							type: "auto_retry_end",
-							success: false,
-							attempt,
-							finalError: "Retry continuation was superseded",
-						});
-						this.#resolveRetry();
+						try {
+							await this.#emitSessionEvent({
+								type: "auto_retry_end",
+								success: false,
+								attempt,
+								finalError: "Retry continuation was superseded",
+							});
+						} finally {
+							this.#resolveRetry();
+						}
 						return;
 					}
 					await this.agent.continue({
@@ -22133,7 +22146,7 @@ export class AgentSession {
 			success: false,
 			attempt,
 			finalError: reason,
-		});
+		}).catch(error => logger.warn("Failed to emit retry terminal event", { error: String(error) }));
 		this.#resolveRetry();
 	}
 
