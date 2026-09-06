@@ -1654,6 +1654,7 @@ setInterval(() => {}, 1000);
 			const reconnect = manager.reconnectServer("stale");
 			await waitFor(() => initializeCount === 2);
 			await manager.disconnectServer("stale");
+			await waitFor(() => manager.pendingConnectionCleanupCountForTests === 0);
 			const result = await manager.connectServers({ stale: config }, {});
 			expect(result.errors.size).toBe(0);
 			expect(result.connectedServers).toEqual(["stale"]);

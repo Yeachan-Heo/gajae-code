@@ -17,6 +17,7 @@ import {
 	type SessionRouterClient,
 	SessionRouterError,
 	type SessionRouterFrame,
+	sessionAttachmentAuthorityId,
 } from "../src/sdk/router";
 import { SESSION_REQUEST_TIMEOUT_MS } from "../src/sdk/session-reconnect";
 
@@ -2662,6 +2663,57 @@ describe("SessionRouter dispatch authority", () => {
 			await router.stop();
 		}
 	});
+	test("attachment authority distinguishes otherwise identical endpoint devices", () => {
+		const input = {
+			sessionId: "device-identity",
+			generation: 1,
+			pid: 42,
+			endpointMtimeMs: 1_700_000_000_000,
+			url: "ws://router.test",
+			token: "fixture-token",
+			endpointIdentity: {
+				dev: 1n,
+				ino: 17n,
+				mtimeMs: 1_700_000_000_000,
+				mtimeNs: 1_700_000_000_000_000_000n,
+				ctimeNs: 1_700_000_000_000_000_000n,
+				size: 100n,
+			},
+		};
+		expect(sessionAttachmentAuthorityId(input)).not.toBe(
+			sessionAttachmentAuthorityId({ ...input, endpointIdentity: { ...input.endpointIdentity, dev: 2n } }),
+		);
+	});
+
+	for (const delta of [-0.000244140625, 0.000244140625]) {
+		test(`endpoint rounding difference ${delta} permits attachment and maintenance, not replacement`, async () => {
+			const fixture = await routerFixture({ start: false });
+			const timestamp = new Date(1_700_000_000_000);
+			await fsPromises.utimes(fixture.endpointFile, timestamp, timestamp);
+			const original = await fsPromises.lstat(fixture.endpointFile);
+			fixture.authority.endpointMtimeMs = original.mtimeMs + delta;
+			try {
+				await fixture.router.start();
+				const attachment = fixture.router.attachment(fixture.sessionId);
+				expect(attachment?.isCurrent()).toBe(true);
+				await attachment!.sendMaintenance?.("rounding-safe");
+				expect(fixture.clients[0].sent).toHaveLength(1);
+				const staging = `${fixture.endpointFile}.replacement`;
+				await Bun.write(staging, await Bun.file(fixture.endpointFile).text());
+				await fsPromises.rename(staging, fixture.endpointFile);
+				await fsPromises.utimes(fixture.endpointFile, timestamp, timestamp);
+				const replacement = await fsPromises.lstat(fixture.endpointFile);
+				expect(replacement.mtimeMs).toBe(original.mtimeMs);
+				expect(Math.abs(replacement.mtimeMs - fixture.authority.endpointMtimeMs)).toBeLessThanOrEqual(0.001);
+				expect(replacement.ino).not.toBe(original.ino);
+				await expect(attachment!.sendMaintenance?.("replaced")).rejects.toBeInstanceOf(SessionRouterError);
+				expect(fixture.clients[0].sent).toHaveLength(1);
+			} finally {
+				await fixture.router.stop();
+			}
+		});
+	}
+
 	test("sendMaintenance fails closed when the endpoint file is replaced under it (#4730 review)", async () => {
 		// A replacement that preserves sessionId/pid/url/token and even mtime must
 		// not keep the old attachment authorized: mtime is not a replacement-safe

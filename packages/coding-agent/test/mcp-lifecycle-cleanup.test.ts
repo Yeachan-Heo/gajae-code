@@ -67,6 +67,8 @@ describe("MCP lifecycle cleanup", () => {
 
 		await manager.disconnectServer("slow");
 		expect(capturedSignal?.aborted).toBe(true);
+		expect(manager.getConnectionStatus("slow")).toBe("disconnected");
+		expect(manager.pendingConnectionCleanupCountForTests).toBe(1);
 
 		release.resolve(
 			makeConnection("slow", async () => {
@@ -78,6 +80,7 @@ describe("MCP lifecycle cleanup", () => {
 
 		expect(manager.getConnection("slow")).toBeUndefined();
 		expect(closedLateConnection).toBe(true);
+		expect(manager.pendingConnectionCleanupCountForTests).toBe(0);
 	});
 
 	it("disconnectAll aborts pending initial connection work", async () => {

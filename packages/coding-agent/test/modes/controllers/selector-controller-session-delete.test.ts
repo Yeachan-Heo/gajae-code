@@ -159,6 +159,9 @@ function createContext(currentSessionFile: string): {
 			calls.push(`showStatus:${message}`);
 		}),
 		showError: vi.fn(),
+		resetAssistantTextPresentation: vi.fn(() => {
+			calls.push("resetAssistantTextPresentation");
+		}),
 		resetIrcSidebarSession: vi.fn(() => {
 			calls.push("resetIrcSidebarSession");
 		}),
@@ -425,6 +428,7 @@ describe("SelectorController session deletion", () => {
 			"ui.requestRender",
 			"session.newSession",
 			"resetIrcSidebarSession",
+			"resetAssistantTextPresentation",
 			"loadingAnimation.stop",
 			"statusContainer.clear",
 			"pendingMessagesContainer.clear",
@@ -501,6 +505,7 @@ describe("SelectorController session deletion", () => {
 		expect(calls).toEqual([
 			"session.newSession",
 			"resetIrcSidebarSession",
+			"resetAssistantTextPresentation",
 			"loadingAnimation.stop",
 			"statusContainer.clear",
 			"pendingMessagesContainer.clear",

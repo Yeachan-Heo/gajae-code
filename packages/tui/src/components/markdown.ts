@@ -46,14 +46,95 @@ markdownParser.setOptions({
 // (Rust FFI) work for content/layout combinations already seen this session.
 
 const RENDER_CACHE_MAX = 256; // sane cap: ~256 distinct message × width combos
-const renderCache = new LRUCache<
-	string,
-	{ source: string; lines: string[]; anchorSpans?: Array<ViewportAnchorSpan | null> }
->({
+const DOCUMENT_CACHE_SIZE = 8 * 1024 * 1024;
+const DOCUMENT_ENTRY_SIZE = 1024 * 1024;
+
+/** Account retained payload, not live heap. Stop once admission is impossible. */
+export function getMarkdownCacheEntryAccountedSize(key: string, value: unknown, cap: number): number {
+	let size = 64 + key.length * 2;
+	const visited = new Set<object>();
+	const pending: Iterator<unknown>[] = [[value][Symbol.iterator]()];
+	function* objects(object: object, array: boolean): Generator<object> {
+		for (const name in object) {
+			if (!Object.hasOwn(object, name)) continue;
+			// Array indices are canonical uint32 strings, excluding 2^32 - 1.
+			const index = array ? Number(name) >>> 0 : 0;
+			if (!array || index === 0xffffffff || String(index) !== name) {
+				size += 16 + name.length * 2;
+				if (size > cap) return;
+			}
+			const child = (object as Record<string, unknown>)[name];
+			if (typeof child === "string") size += child.length * 2;
+			else if (typeof child === "number") size += 8;
+			else if (typeof child === "boolean") size += 4;
+			else if (child !== null && typeof child === "object") yield child;
+			if (size > cap) return;
+		}
+	}
+	while (pending.length && size <= cap) {
+		const next = pending[pending.length - 1].next();
+		if (next.done) {
+			pending.pop();
+			continue;
+		}
+		const item = next.value;
+		if (typeof item === "string") size += item.length * 2;
+		else if (typeof item === "number") size += 8;
+		else if (typeof item === "boolean") size += 4;
+		else if (item !== null && typeof item === "object" && !visited.has(item)) {
+			visited.add(item);
+			const array = Array.isArray(item);
+			size += array ? 24 + item.length * 8 : 32;
+			if (size <= cap) pending.push(objects(item, array));
+		}
+	}
+	return size > cap ? cap + 1 : size;
+}
+
+interface MarkdownRenderCacheEntry {
+	source: string;
+	lines: string[];
+	anchorSpans?: Array<ViewportAnchorSpan | null>;
+}
+
+const RENDER_ENTRY_BASE_SIZE = 64 + 32 + 16 + "source".length * 2 + 16 + "lines".length * 2 + 24;
+const ANCHOR_SPAN_SIZE =
+	32 + 4 * 16 + 4 * 8 + 2 * ("graphemeStart".length + "graphemeEnd".length + "cellStart".length + "cellEnd".length);
+
+function renderCacheEntrySize(entry: MarkdownRenderCacheEntry, key: string): number {
+	// These arrays and distinct span records are constructed exclusively by #render,
+	// with no custom properties, sharing or cycles. Account that owned schema without
+	// allocating the generic token-graph traversal machinery.
+	let size = RENDER_ENTRY_BASE_SIZE + key.length * 2 + entry.source.length * 2 + entry.lines.length * 8;
+	if (size > DOCUMENT_ENTRY_SIZE) return DOCUMENT_ENTRY_SIZE + 1;
+	for (const line of entry.lines) {
+		size += line.length * 2;
+		if (size > DOCUMENT_ENTRY_SIZE) return DOCUMENT_ENTRY_SIZE + 1;
+	}
+	if (entry.anchorSpans) {
+		size += 16 + "anchorSpans".length * 2 + 24 + entry.anchorSpans.length * 8;
+		if (size > DOCUMENT_ENTRY_SIZE) return DOCUMENT_ENTRY_SIZE + 1;
+		for (const span of entry.anchorSpans) {
+			if (span) size += ANCHOR_SPAN_SIZE;
+			if (size > DOCUMENT_ENTRY_SIZE) return DOCUMENT_ENTRY_SIZE + 1;
+		}
+	}
+	return size;
+}
+
+const renderCache = new LRUCache<string, MarkdownRenderCacheEntry>({
 	max: RENDER_CACHE_MAX,
+	maxSize: DOCUMENT_CACHE_SIZE,
+	maxEntrySize: DOCUMENT_ENTRY_SIZE,
+	sizeCalculation: renderCacheEntrySize,
 });
 const PARSE_CACHE_MAX = 128;
-const parseCache = new LRUCache<string, { source: string; tokens: Token[] }>({ max: PARSE_CACHE_MAX });
+const parseCache = new LRUCache<string, { source: string; tokens: Token[] }>({
+	max: PARSE_CACHE_MAX,
+	maxSize: DOCUMENT_CACHE_SIZE,
+	maxEntrySize: DOCUMENT_ENTRY_SIZE,
+	sizeCalculation: (value, key) => getMarkdownCacheEntryAccountedSize(key, value, DOCUMENT_ENTRY_SIZE),
+});
 const MARKDOWN_STREAM_THROTTLE_MS = 64;
 let markdownNow = (): number => performance.now();
 
@@ -76,20 +157,44 @@ export function __setMarkdownNowForTest(now: (() => number) | undefined): void {
 // appends only highlight new/changed blocks instead of re-highlighting the whole
 // prefix on every chunk. Bounded LRU; cleared on theme change via clearRenderCache().
 const HIGHLIGHT_CACHE_MAX = 512;
-const highlightCache = new LRUCache<string, string[]>({ max: HIGHLIGHT_CACHE_MAX });
-
-function renderedLinesBytes(lines: readonly string[]): number {
-	let bytes = 0;
-	for (const line of lines) bytes += Buffer.byteLength(line, "utf8");
-	return bytes;
+const HIGHLIGHT_ENTRY_SIZE = 512 * 1024;
+interface MarkdownHighlightCacheEntry {
+	lang: string;
+	code: string;
+	lines: string[];
 }
 
-function anchorSpansBytes(spans: readonly (ViewportAnchorSpan | null)[]): number {
-	let bytes = spans.length * 8; // Array element references
-	for (const span of spans) {
-		if (span) bytes += 4 * 8; // Four numeric offsets
-	}
-	return bytes;
+const highlightCache = new LRUCache<string, MarkdownHighlightCacheEntry>({
+	max: HIGHLIGHT_CACHE_MAX,
+	maxSize: 4 * 1024 * 1024,
+	maxEntrySize: HIGHLIGHT_ENTRY_SIZE,
+	sizeCalculation: (value, key) => getMarkdownCacheEntryAccountedSize(key, value, HIGHLIGHT_ENTRY_SIZE),
+});
+
+export interface MarkdownCacheStats {
+	count: number;
+	accountedSize: number;
+	max: number;
+	maxSize: number;
+	maxEntrySize: number;
+}
+
+/** Detached diagnostics; exposes neither entries nor mutable budgets. */
+export function getMarkdownCacheStats(): Record<"render" | "parse" | "highlight", MarkdownCacheStats> {
+	const snapshot = (cache: {
+		size: number;
+		calculatedSize: number;
+		max: number;
+		maxSize: number;
+		maxEntrySize: number;
+	}): MarkdownCacheStats => ({
+		count: cache.size,
+		accountedSize: cache.calculatedSize,
+		max: cache.max,
+		maxSize: cache.maxSize,
+		maxEntrySize: cache.maxEntrySize,
+	});
+	return { render: snapshot(renderCache), parse: snapshot(parseCache), highlight: snapshot(highlightCache) };
 }
 
 // F18: cap synchronous (Rust FFI) syntax highlighting so a single huge fenced block
@@ -133,16 +238,12 @@ export function clearRenderCache(): void {
 	highlightCache.clear();
 }
 
+/**
+ * Insertion-time UTF-16 accounting of global keys/tokens/lines/anchors, not heap or RSS.
+ * Rendered arrays are borrowed cache payloads: callers must not mutate them.
+ */
 export function getRenderCacheRetainedBytes(): number {
-	let bytes = 0;
-	for (const entry of renderCache.values()) {
-		bytes += Buffer.byteLength(entry.source, "utf8");
-		bytes += renderedLinesBytes(entry.lines);
-		if (entry.anchorSpans) bytes += anchorSpansBytes(entry.anchorSpans);
-	}
-	for (const entry of parseCache.values()) bytes += Buffer.byteLength(entry.source, "utf8");
-	for (const lines of highlightCache.values()) bytes += renderedLinesBytes(lines);
-	return bytes;
+	return renderCache.calculatedSize + parseCache.calculatedSize + highlightCache.calculatedSize;
 }
 
 // Stable numeric IDs for structural theme/style objects (no ID field on type).
@@ -267,6 +368,8 @@ export class Markdown implements Component {
 	#cachedWidth?: number;
 	#cachedLines?: string[];
 	#cachedAnchorSpans?: Array<ViewportAnchorSpan | null>;
+	#currentParse?: { source: string; tokens: Token[] };
+	#rejectedParseKey?: string;
 
 	#streaming = false;
 	#lastFullParseAt = 0;
@@ -297,6 +400,7 @@ export class Markdown implements Component {
 		if (options?.streaming !== undefined) {
 			this.setStreaming(options.streaming);
 		}
+		if (this.#text !== text) this.#rejectedParseKey = undefined;
 		this.#text = text;
 		if (this.#streaming) {
 			return;
@@ -336,6 +440,8 @@ export class Markdown implements Component {
 
 	dispose(): void {
 		this.#clearStaleThrottleTimer();
+		this.#currentParse = undefined;
+		this.#rejectedParseKey = undefined;
 	}
 
 	invalidate(): void {
@@ -346,14 +452,17 @@ export class Markdown implements Component {
 	}
 
 	#exceedsHighlightCap(code: string): boolean {
+		// UTF-8 requires at least one byte per UTF-16 code unit, including lone
+		// surrogates. Reject obviously oversized input without scanning or hashing it.
+		if (code.length > MAX_HIGHLIGHT_BYTES) return true;
+		// Check UTF-8 bytes before the JavaScript line scan so oversized Unicode
+		// blocks do not pay for a scan whose result cannot change rejection.
+		if (Buffer.byteLength(code, "utf8") > MAX_HIGHLIGHT_BYTES) return true;
 		let newlines = 0;
 		for (let i = 0; i < code.length; i++) {
-			if (code.charCodeAt(i) === 10) newlines += 1;
+			if (code.charCodeAt(i) === 10 && ++newlines >= MAX_HIGHLIGHT_LINES) return true;
 		}
-		if (newlines + 1 > MAX_HIGHLIGHT_LINES) return true;
-		// UTF-8 byte length (not UTF-16 code-unit count) so a non-ASCII block cannot
-		// exceed the advertised byte cap and still reach the synchronous highlighter.
-		return Buffer.byteLength(code, "utf8") > MAX_HIGHLIGHT_BYTES;
+		return false;
 	}
 
 	#highlightCodeBlock(code: string, lang: string): string[] | null {
@@ -361,10 +470,10 @@ export class Markdown implements Component {
 		if (this.#exceedsHighlightCap(code)) return null;
 		const key = `${objectId(this.#theme)}\x00${lang}\x00${code}`;
 		const cached = highlightCache.get(key);
-		if (cached) return cached;
+		if (cached?.lang === lang && cached.code === code) return cached.lines;
 		highlightCallCount += 1;
 		const result = this.#theme.highlightCode(code, lang || undefined);
-		highlightCache.set(key, result);
+		highlightCache.set(key, { lang, code, lines: result });
 		return result;
 	}
 
@@ -421,6 +530,7 @@ export class Markdown implements Component {
 
 		// Don't render anything if there's no actual text
 		if (!this.#text || this.#text.trim() === "") {
+			this.#currentParse = undefined;
 			const result: string[] = [];
 			// Update per-instance cache
 			this.#cachedText = this.#text;
@@ -430,8 +540,9 @@ export class Markdown implements Component {
 			return { lines: result, spans: this.#cachedAnchorSpans };
 		}
 
-		// Replace tabs with 3 spaces for consistent rendering
-		const normalizedText = replaceTabs(this.#text);
+		// Normalize tabs using the current configured indentation width.
+		const renderedText = this.#text;
+		const normalizedText = replaceTabs(renderedText);
 		this.#clearStaleThrottleTimer();
 		const contentKey = markdownContentKey(normalizedText);
 
@@ -450,10 +561,11 @@ export class Markdown implements Component {
 			(!includeAnchors || cached.anchorSpans !== undefined)
 		) {
 			// Populate L1 so subsequent calls from this instance are O(1) map lookup.
-			this.#cachedText = this.#text;
+			this.#cachedText = renderedText;
 			this.#cachedWidth = width;
 			this.#cachedLines = cached.lines;
 			this.#cachedAnchorSpans = cached.anchorSpans;
+			if (!this.#streaming || this.#currentParse?.source !== normalizedText) this.#currentParse = undefined;
 			return { lines: cached.lines, spans: cached.anchorSpans };
 		}
 
@@ -462,13 +574,17 @@ export class Markdown implements Component {
 		// final wrapped output must differ by width.
 		const cachedParse = parseCache.get(contentKey);
 		let tokens: Token[];
-		if (cachedParse !== undefined && cachedParse.source === normalizedText) {
+		if (this.#currentParse?.source === normalizedText) {
+			tokens = this.#currentParse.tokens;
+		} else if (cachedParse !== undefined && cachedParse.source === normalizedText) {
 			tokens = cachedParse.tokens;
 		} else {
 			__markdownPerfCounters.lexerInvocations += 1;
 			__markdownPerfCounters.lexedBytes += normalizedText.length;
 			tokens = markdownParser.lexer(normalizedText);
-			parseCache.set(contentKey, { source: normalizedText, tokens });
+		}
+		if (this.#streaming && this.#text === renderedText) {
+			this.#currentParse = { source: normalizedText, tokens };
 		}
 
 		// Convert tokens to styled terminal output. When anchoring, record each
@@ -615,8 +731,24 @@ export class Markdown implements Component {
 		const result = rawResult.length > 0 ? rawResult : [""];
 		const anchorSpans = rawResult.length > 0 ? rawAnchorSpans : wrappedSpans ? [null] : undefined;
 
+		// Styling callbacks may replace text or end streaming. Publish ownership
+		// only after they finish, and never attach an old rejection to new text.
+		if (!this.#streaming && this.#text === renderedText) {
+			const completedParse = parseCache.get(contentKey);
+			// Reparse rejected documents on reflow without retaining their tokens.
+			// Occupied collisions still retry admission to preserve replacement rules.
+			if (
+				completedParse?.source !== normalizedText &&
+				(this.#rejectedParseKey !== contentKey || completedParse !== undefined)
+			) {
+				parseCache.set(contentKey, { source: normalizedText, tokens });
+				this.#rejectedParseKey = parseCache.has(contentKey) ? undefined : contentKey;
+			}
+		}
+		if (!this.#streaming || this.#text !== renderedText) this.#currentParse = undefined;
+
 		// Update L1 per-instance cache
-		this.#cachedText = this.#text;
+		this.#cachedText = renderedText;
 		this.#cachedWidth = width;
 		this.#cachedLines = result;
 		this.#cachedAnchorSpans = anchorSpans;
@@ -624,7 +756,9 @@ export class Markdown implements Component {
 
 		// Update L2 module-level LRU so future instances with the same key skip
 		// the marked.lexer + highlightCode (Rust FFI) work entirely.
-		renderCache.set(cacheKey, { source: normalizedText, lines: result, ...(anchorSpans ? { anchorSpans } : {}) });
+		if (!this.#streaming) {
+			renderCache.set(cacheKey, { source: normalizedText, lines: result, ...(anchorSpans ? { anchorSpans } : {}) });
+		}
 
 		return { lines: result, spans: anchorSpans };
 	}

@@ -149,9 +149,9 @@ export default pi => ({ name: "late_tool", label: "Late", description: "late", p
 		const r = await installGjcBundle({ cwd }, "project", sixSurface);
 		expect(r.ok).toBe(true);
 		const installedRoot = path.join(cwd, ".gjc", "gjc-plugins", "valid-six-surface-bundle");
-		const readFileSpy = spyOn(fs, "readFile");
+		const openSpy = spyOn(fs, "open");
 		const pluginReadCount = () =>
-			readFileSpy.mock.calls.filter(args => typeof args[0] === "string" && args[0].startsWith(installedRoot)).length;
+			openSpy.mock.calls.filter(args => typeof args[0] === "string" && args[0].startsWith(installedRoot)).length;
 
 		try {
 			const first = await renderSkillAdvertisement({ cwd, skillName: "ralplan", phase: "planner" });
@@ -163,7 +163,7 @@ export default pi => ({ name: "late_tool", label: "Late", description: "late", p
 			expect(second).toContain('activation_arg="design"');
 			expect(pluginReadCount()).toBe(afterFirst);
 		} finally {
-			readFileSpy.mockRestore();
+			openSpy.mockRestore();
 		}
 	});
 
@@ -173,9 +173,9 @@ export default pi => ({ name: "late_tool", label: "Late", description: "late", p
 		expect(r.ok).toBe(true);
 		const installed = path.join(cwd, ".gjc", "gjc-plugins", "valid-six-surface-bundle", "tools", "domain-note.ts");
 		const installedRoot = path.join(cwd, ".gjc", "gjc-plugins", "valid-six-surface-bundle");
-		const readFileSpy = spyOn(fs, "readFile");
+		const openSpy = spyOn(fs, "open");
 		const pluginReadCount = () =>
-			readFileSpy.mock.calls.filter(args => typeof args[0] === "string" && args[0].startsWith(installedRoot)).length;
+			openSpy.mock.calls.filter(args => typeof args[0] === "string" && args[0].startsWith(installedRoot)).length;
 
 		try {
 			await renderSkillAdvertisement({ cwd, skillName: "ralplan", phase: "planner" });
@@ -187,7 +187,7 @@ export default pi => ({ name: "late_tool", label: "Late", description: "late", p
 			expect(res.tools.map(t => t.name)).not.toContain("domain_note");
 			expect(res.quarantine.some(q => q.code === "runtime_mismatch")).toBe(true);
 		} finally {
-			readFileSpy.mockRestore();
+			openSpy.mockRestore();
 		}
 	});
 
