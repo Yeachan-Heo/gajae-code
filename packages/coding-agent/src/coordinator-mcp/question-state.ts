@@ -1708,11 +1708,20 @@ export async function rewriteSessionEndpointAuthorityAndDeletions(
 						rewritten = current.canonical.session;
 					});
 					if (correlatedCreation && migratedCreationIntent) {
-						correlatedCreation.endpoint_incarnation = currentEndpointIncarnation;
-						correlatedCreation.canonical_create_intent = migratedCreationIntent;
-						correlatedCreation.wal_revision = transaction.revision;
-						correlatedCreation.wal_digest = digest(JSON.stringify(transaction));
-						correlatedCreation.updated_at = new Date().toISOString();
+						const walDigest = digest(JSON.stringify(transaction));
+						if (
+							correlatedCreation.endpoint_incarnation !== currentEndpointIncarnation ||
+							canonicalJson(correlatedCreation.canonical_create_intent) !==
+								canonicalJson(migratedCreationIntent) ||
+							correlatedCreation.wal_revision !== transaction.revision ||
+							correlatedCreation.wal_digest !== walDigest
+						) {
+							correlatedCreation.endpoint_incarnation = currentEndpointIncarnation;
+							correlatedCreation.canonical_create_intent = migratedCreationIntent;
+							correlatedCreation.wal_revision = transaction.revision;
+							correlatedCreation.wal_digest = walDigest;
+							correlatedCreation.updated_at = new Date().toISOString();
+						}
 					}
 				},
 				lockOptions(options.signal),

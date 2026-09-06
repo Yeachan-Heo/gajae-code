@@ -8981,9 +8981,6 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					remote_create_key: remoteCreateKey,
 				};
 				const creationKeyDigest = creationDigests("gjc_coordinator_start_session", creationKey, {}).keyDigest;
-				const brokerRequestKey = `coordinator-retire:${creationKeyDigest}:${createHash("sha256")
-					.update(JSON.stringify(proof))
-					.digest("hex")}`;
 				const retirementKeyDigest = createHash("sha256").update(retirementKey).digest("hex");
 				const isRetirementRetryable = (response: Record<string, unknown>): boolean => {
 					const code = asRecord(response.error)?.code;
@@ -9128,6 +9125,9 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 										);
 									lifecycle = publicRetirementProof(staged);
 								} else {
+									const brokerRequestKey = `coordinator-retire:${creationKeyDigest}:${createHash("sha256")
+										.update(JSON.stringify(proof))
+										.digest("hex")}`;
 									await recordCreationRetirementIntent(
 										questionPaths,
 										creationKeyDigest,
@@ -9138,16 +9138,18 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 										cwd,
 										"session.reconcile_uncertain",
 										{
-											sessionId,
-											cwd,
-											stateRoot,
-											endpointGeneration,
-											endpointMtimeMs,
-											...(endpointFileId === null ? {} : { endpointFileId }),
-											processIncarnation,
-											hostIncarnation,
-											lifecycleRequestId,
-											remoteCreateKey,
+											sessionId: proof.session_id,
+											cwd: proof.cwd,
+											stateRoot: proof.state_root,
+											endpointGeneration: proof.endpoint_generation,
+											endpointMtimeMs: proof.endpoint_mtime_ms,
+											...(proof.endpoint_file_id === undefined
+												? {}
+												: { endpointFileId: proof.endpoint_file_id }),
+											processIncarnation: proof.process_incarnation,
+											hostIncarnation: proof.host_incarnation,
+											lifecycleRequestId: proof.lifecycle_request_id,
+											remoteCreateKey: proof.remote_create_key,
 										},
 										brokerRequestKey,
 									);
