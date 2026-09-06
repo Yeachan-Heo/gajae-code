@@ -2678,10 +2678,18 @@ export class SlackNotificationDaemon {
 
 	async #drainProviderEffects(): Promise<boolean> {
 		let failed = false;
-		for (const effect of await this.#journal.list()) {
+		for (const listedEffect of await this.#journal.list()) {
+			let effect = listedEffect;
 			try {
 				if (effect.kind !== "provider-post" || effect.state === "terminal") continue;
-				const current = !!effect.sessionId && (await this.#providerEffectCurrent(effect));
+				let current = !!effect.sessionId && (await this.#providerEffectCurrent(effect));
+				if (!current && effect.sessionId) {
+					const migrated = await this.#journal.read(effect.id);
+					if (migrated && migrated.state !== "terminal") {
+						effect = migrated;
+						current = await this.#providerEffectCurrent(effect);
+					}
+				}
 				if (!current && effect.state !== "uncertain" && effect.state !== "leased") {
 					await this.#journal.terminalize(effect.id, { provider: "slack", status: "stale_noop" });
 					continue;
