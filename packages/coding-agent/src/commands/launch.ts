@@ -6,9 +6,9 @@ import { APP_NAME, getAgentDir, setProjectDir } from "@gajae-code/utils";
 import { Args, Command } from "@gajae-code/utils/cli";
 import { assertLocalLaunchArgs, parseArgs } from "../cli/args";
 import { ROOT_LAUNCH_FLAGS } from "../cli/root-flags";
-import { writeCoordinatorAtomic } from "../coordinator-mcp/durability";
 import { launchDefaultTmuxIfNeeded } from "../gjc-runtime/launch-tmux";
 import {
+	asLaunchWorktreeGuardError,
 	type GjcLaunchWorktreePlan,
 	type PreparedLaunchWorktree,
 	parseLaunchWorktreeMode,
@@ -19,7 +19,13 @@ import { type LaunchWorktreeReservation, reserveLaunchWorktree } from "../gjc-ru
 import {
 	GJC_COORDINATOR_SESSION_ID_ENV,
 	GJC_COORDINATOR_SESSION_STATE_FILE_ENV,
+	GJC_COORDINATOR_SIDECAR_KEY_ID_ENV,
+	GJC_COORDINATOR_SIDECAR_SIGNATURE_REQUIRED_ENV,
 	GJC_TMUX_OWNER_GENERATION_ENV,
+	GJC_TMUX_OWNER_GENERATION_STAGED_ENV,
+	GJC_TMUX_OWNER_SERVER_KEY_ENV,
+	GJC_TMUX_OWNER_STATE_DIR_ENV,
+	persistCoordinatorLaunchFailureState,
 } from "../gjc-runtime/session-state-sidecar";
 import { runRootCommand } from "../main";
 import { assertMasterLaunchArgs } from "../master-mode/context";
@@ -34,12 +40,15 @@ export async function persistCoordinatorLaunchFailure(
 ): Promise<void> {
 	const stateFile = env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]?.trim();
 	if (!stateFile) return;
+	const sessionId = env[GJC_COORDINATOR_SESSION_ID_ENV]?.trim() || null;
+	const ownerGenerationPublished = env[GJC_TMUX_OWNER_GENERATION_STAGED_ENV] !== "1";
+	const ownerGeneration = env[GJC_TMUX_OWNER_GENERATION_ENV] ?? null;
 	const message = error instanceof Error ? error.message : String(error);
 	const code = message.split(":", 1)[0] || "launch_failed";
 	const now = new Date().toISOString();
 	const payload = {
 		schema_version: 1,
-		session_id: env[GJC_COORDINATOR_SESSION_ID_ENV]?.trim() || null,
+		session_id: sessionId,
 		state: "errored",
 		ready_for_input: false,
 		updated_at: now,
@@ -59,11 +68,20 @@ export async function persistCoordinatorLaunchFailure(
 			truncated: false,
 		},
 		error: { code, message, recoverable: true },
-		...(env[GJC_COORDINATOR_SESSION_ID_ENV]?.trim()
-			? { owner_generation: env[GJC_TMUX_OWNER_GENERATION_ENV] ?? null }
-			: {}),
+		...(sessionId && ownerGenerationPublished ? { owner_generation: ownerGeneration } : {}),
 	};
-	await writeCoordinatorAtomic(stateFile, `${JSON.stringify(payload, null, 2)}\n`);
+	await persistCoordinatorLaunchFailureState({
+		stateFile,
+		cwd,
+		sessionId,
+		ownerGeneration,
+		ownerStateDir: env[GJC_TMUX_OWNER_STATE_DIR_ENV] ?? null,
+		ownerServerKey: env[GJC_TMUX_OWNER_SERVER_KEY_ENV] ?? null,
+		managedLaunch: env.GJC_TMUX_LAUNCHED === "1",
+		payload,
+		signingRequired: env[GJC_COORDINATOR_SIDECAR_SIGNATURE_REQUIRED_ENV]?.trim() === "true",
+		keyId: env[GJC_COORDINATOR_SIDECAR_KEY_ID_ENV] ?? null,
+	});
 }
 
 function worktreeInUseError(worktreePath: string, occupant?: string): Error {
@@ -134,7 +152,7 @@ export default class Index extends Command {
 		`# Include files in initial message\n  ${APP_NAME} @prompt.md @image.png "What color is the sky?"`,
 		`# Non-interactive mode (process and exit)\n  ${APP_NAME} -p "List all .ts files in src/"`,
 		`# Continue previous session\n  ${APP_NAME} --continue "What did we discuss?"`,
-		`# Launch in a sibling git worktree\n  ${APP_NAME} --worktree`,
+		`# Launch in a repo-local git worktree (git-ignored {repo}/.worktrees)\n  ${APP_NAME} --worktree`,
 		`# Use different model (fuzzy matching)\n  ${APP_NAME} --model opus "Help me refactor this code"`,
 		`# Limit model cycling to specific models\n  ${APP_NAME} --models claude-sonnet,claude-haiku,gpt-4o`,
 		`# Pin a stored credential for this session\n  ${APP_NAME} --credential email:me@example.com`,
@@ -165,6 +183,19 @@ export default class Index extends Command {
 			launch = prepareLaunchWorktree(process.cwd(), args);
 		} catch (error) {
 			await reservation?.release();
+			const guard = asLaunchWorktreeGuardError(error);
+			// A user-fixable launch refusal exits with only its actionable message: no stack
+			// trace, and no durable crash record for a configuration state the user can fix.
+			if (guard) {
+				try {
+					await persistCoordinatorLaunchFailure(error, process.cwd());
+				} catch {
+					// Persistence is diagnostic only; never replace the actionable refusal.
+				}
+				process.stderr.write(`${guard.message}\n`);
+				process.exitCode = 1;
+				return;
+			}
 			await persistCoordinatorLaunchFailure(error, process.cwd());
 			throw error;
 		}

@@ -34,6 +34,7 @@ import {
 	lifecyclePaths,
 	replaceOwnerGenerationSync,
 } from "@gajae-code/coding-agent/gjc-runtime/tmux-owner-isolation";
+import { __setTmuxProviderAuthorityPlatformForTests } from "@gajae-code/coding-agent/gjc-runtime/tmux-provider-context";
 import {
 	__setCreateOwnerIsolationForTests,
 	__setMutationServerProofForTests,
@@ -224,6 +225,7 @@ const originalStderrWrite = process.stderr.write.bind(process.stderr);
 
 afterEach(() => {
 	process.exitCode = undefined;
+	__setTmuxProviderAuthorityPlatformForTests(null);
 });
 
 function stderrError(code: string): Error {
@@ -2899,6 +2901,73 @@ it("launches psmux through its managed provider namespace", () => {
 	expect(calls.filter(call => call.command === "new-session")).toHaveLength(1);
 	expect(calls.some(call => call.command === "attach-session")).toBe(true);
 	expect(diagnostics).toEqual([]);
+});
+it("rebuilds the managed owner command with the canonical psmux authority executable", () => {
+	__setTmuxProviderAuthorityPlatformForTests("win32");
+	const calls: Array<{ command: string; args: string[] }> = [];
+	const metadata = new Map<string, string>();
+	const namespace = "gjc-test-000000000000000000000000000000000000";
+	const canonicalCommand = "C:\\canonical\\psmux.exe";
+	let createdSessionName: string | undefined;
+	let authorityInputCommand: string | undefined;
+	const handled = launchDefaultTmuxIfNeededRaw(
+		launchContext({
+			parsed: args({ messages: ["hello world"], tmux: true }),
+			rawArgs: ["--tmux", "hello world"],
+			cwd: "/repo",
+			env: { GJC_TMUX_COMMAND: "psmux", GJC_PSMUX_COMMAND: "psmux", GJC_PSMUX_DETECTION: "on" },
+			argv: ["bun", "cli.ts"],
+			execPath: "/bin/bun",
+			platform: "win32",
+			tty: interactiveTty,
+			tmuxAvailable: true,
+			currentBranch: "",
+			existingBranchSessionName: null,
+			providerAuthorityPersist: () => {},
+			providerAuthorityStagedAssert: () => {},
+			providerAuthorityAssert: () => {},
+			providerAuthorityResolver: input => {
+				authorityInputCommand = input.command;
+				return {
+					kind: "windows-psmux",
+					command: canonicalCommand,
+					commandPrefix: ["-L", namespace],
+					namespace,
+					executableIdentity: "canonical-psmux",
+					binary: { command: input.command, isPsmux: true, viaExplicitOverride: true },
+					platform: "win32",
+					stateDir: input.stateDir,
+					sessionId: input.sessionId,
+					generation: input.generation,
+				};
+			},
+			spawnSync: (_command, spawnArgs) => {
+				const command = spawnArgs[0] === "-L" && spawnArgs[1] === namespace ? spawnArgs.slice(2) : spawnArgs;
+				calls.push({ command: _command, args: command });
+				if (command[0] === "new-session") createdSessionName = command[command.indexOf("-s") + 1];
+				if (command[0] === "set-option") metadata.set(command.at(-2)!, command.at(-1)!);
+				if (command[0] === "display-message") {
+					if (command.at(-1) === "#{session_name}") return { exitCode: 0, stdout: createdSessionName };
+					const option = command.at(-1)?.match(/^#\{(.+)\}$/)?.[1];
+					return { exitCode: 0, stdout: option ? (metadata.get(option) ?? "") : "" };
+				}
+				return { exitCode: 0, stdout: "" };
+			},
+		}),
+	);
+
+	expect(handled).toBe(true);
+	expect(authorityInputCommand).toBe("psmux");
+	const newSession = calls.find(call => call.args[0] === "new-session");
+	expect(newSession?.command).toBe(canonicalCommand);
+	const innerCommand = newSession?.args.at(-1);
+	expect(innerCommand).toBeDefined();
+	const encodedMarker = "-EncodedCommand ";
+	const encodedIndex = innerCommand?.indexOf(encodedMarker) ?? -1;
+	expect(encodedIndex).toBeGreaterThanOrEqual(0);
+	const script = Buffer.from(innerCommand!.slice(encodedIndex + encodedMarker.length), "base64").toString("utf16le");
+	expect(script).toContain(`$env:GJC_TMUX_OWNER_SERVER_KEY = '${canonicalCommand}'`);
+	expect(metadata.get("@gjc-owner-server-key")).toBe(canonicalCommand);
 });
 it("provisions psmux authority before generation publication and verifies later namespaced commands", () => {
 	const events: string[] = [];

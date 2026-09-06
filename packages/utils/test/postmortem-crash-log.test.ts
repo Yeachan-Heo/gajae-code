@@ -306,3 +306,98 @@ describe("fatal handler process fixtures", () => {
 		expect(contents).toContain("spawned rejection boom");
 	});
 });
+
+describe("multi-line fatal messages", () => {
+	// V8's `stack` header spans as many lines as the message does. Dropping a single line left
+	// lines 2..N inside the "stack" while the message had already been rendered in full, so a
+	// multi-line guard printed its whole body twice on stderr and in the durable record.
+	const MULTI_LINE = [
+		"worktree_bucket_not_ignored",
+		"The GJC launch worktree bucket is inside the repository but is not ignored by Git.",
+		'Path: "/tmp/example/.worktrees"',
+		"Safe remediation: add /.worktrees to /tmp/example/.gitignore, then relaunch.",
+	].join("\n");
+
+	function occurrences(haystack: string, needle: string): number {
+		return haystack.split(needle).length - 1;
+	}
+
+	it("records each line of a multi-line message exactly once", () => {
+		const target = tempCrashLog();
+
+		recordFatalCrash("Uncaught Exception", new Error(MULTI_LINE), { path: target });
+
+		const contents = fs.readFileSync(target, "utf8");
+		for (const line of MULTI_LINE.split("\n").slice(1)) {
+			expect(occurrences(contents, line)).toBe(1);
+		}
+		// The real frames must survive the header strip.
+		expect(contents).toContain("    at ");
+	});
+
+	it("preserves a headerless frame-shaped stack", () => {
+		const target = tempCrashLog();
+		recordFatalCrash(
+			"Uncaught Exception",
+			{
+				name: "Error",
+				message: "boom",
+				stack: "    at firstFrame (fixture.ts:1:1)\n    at secondFrame (fixture.ts:2:1)",
+			},
+			{ path: target },
+		);
+
+		const contents = fs.readFileSync(target, "utf8");
+		expect(contents).toContain("    at firstFrame (fixture.ts:1:1)");
+		expect(contents).toContain("    at secondFrame (fixture.ts:2:1)");
+	});
+
+	it("preserves a lone headerless frame", () => {
+		const target = tempCrashLog();
+		recordFatalCrash(
+			"Uncaught Exception",
+			{ name: "Error", message: "boom", stack: "    at onlyFrame (fixture.ts:1:1)" },
+			{ path: target },
+		);
+
+		expect(fs.readFileSync(target, "utf8")).toContain("    at onlyFrame (fixture.ts:1:1)");
+	});
+
+	it("strips coded V8 stack headers without duplicating the message", () => {
+		const target = tempCrashLog();
+		recordFatalCrash(
+			"Uncaught Exception",
+			{
+				name: "AssertionError",
+				message: "boom",
+				stack: "AssertionError [ERR_ASSERTION]: boom\n    at onlyFrame (fixture.ts:1:1)",
+			},
+			{ path: target },
+		);
+
+		const contents = fs.readFileSync(target, "utf8");
+		expect(contents).toContain("AssertionError: boom");
+		expect(contents).toContain("    at onlyFrame (fixture.ts:1:1)");
+		expect(contents).not.toContain("AssertionError [ERR_ASSERTION]: boom");
+	});
+
+	it("prints each line of a multi-line message exactly once on stderr", () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-crash-multiline-"));
+		const script = path.join(dir, "throw-multiline.ts");
+		fs.writeFileSync(
+			script,
+			`import ${JSON.stringify(POSTMORTEM_SOURCE)};\nthrow new Error(${JSON.stringify(MULTI_LINE)});\n`,
+		);
+
+		const { exitCode, stderr } = spawnBun(script, {
+			env: { GJC_CODING_AGENT_DIR: path.join(dir, "agent") },
+		});
+
+		expect(exitCode).toBe(1);
+		const remediation = "Safe remediation: add /.worktrees to /tmp/example/.gitignore, then relaunch.";
+		expect(stderr).toContain(remediation);
+		expect(occurrences(stderr, remediation)).toBe(1);
+		const contents = fs.readFileSync(path.join(dir, "agent", "gjc-crash.log"), "utf8");
+		expect(occurrences(contents, remediation)).toBe(1);
+	});
+});

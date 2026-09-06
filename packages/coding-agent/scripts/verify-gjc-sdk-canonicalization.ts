@@ -1185,12 +1185,11 @@ function tmuxCreateStartupViolations(file: string, contents: string): string[] {
 		);
 	}
 	const canonicalInteractivePopenAssignment =
-		/^\s*child\s*=\s*subprocess\.Popen\(\s*command\s*(?:,\s*cwd\s*=\s*os\.environ\[\s*["']GJC_SESSION_WORKDIR["']\s*\])?\s*\)\s*$/;
+		/^\s*child\s*=\s*subprocess\.Popen\(\s*command(?:\s*,\s*cwd\s*=\s*os\.environ\[\s*["']GJC_SESSION_WORKDIR["']\s*\]\s*,\s*env\s*=\s*child_environment)?\s*\)\s*$/;
 	const expectedLifecycleCallsites = [
 		{
 			operation: "terminal observer",
-			pattern:
-				/\bcompleted\s*=\s*subprocess\.run\(\s*\[\s*os\.environ\[\s*["']GJC_SESSION_GJC_BIN["']\s*\]\s*,\s*["']--internal-tmux-owner-isolation["']\s*\]\s*,/g,
+			pattern: /\breturncode\s*,\s*stdout\s*=\s*run_authorized\(\s*request\s*\)/g,
 		},
 		{
 			operation: "owner-isolation plan",
@@ -1205,12 +1204,11 @@ function tmuxCreateStartupViolations(file: string, contents: string): string[] {
 		{
 			operation: "generation publication",
 			pattern:
-				/\bGENERATION_PUBLISH_RESPONSE\s*=\s*"\$\(\s*printf\s+["'][^"']*["']\s+"\$GENERATION_PUBLISH_REQUEST"\s*\|\s*"\$GJC_BIN"\s+--internal-tmux-owner-isolation\s*\)"/g,
+				/\bpublished_returncode\s*,\s*published_stdout\s*=\s*run_authorized\(\s*publication_request\s*,\s*timeout\s*=\s*5\s*\)/g,
 		},
 		{
 			operation: "terminal monitor",
-			pattern:
-				/\bif\s+verdict\s*=\s*"\$\(\s*printf\s+["'][^"']*["']\s+"\$request"\s*\|\s*timeout\s+"[^"]+"\s+"\$GJC_SESSION_GJC_BIN"\s+--internal-tmux-owner-isolation\s*\)"\s*;\s*then/g,
+			pattern: /\bif\s+verdict\s*=\s*"\$\(\s*authorized_owner_call\s+"\$remaining_seconds"\s*\)"\s*;\s*then/g,
 		},
 	];
 	const expectedLifecycleRanges: ShellRange[] = [];
@@ -1260,7 +1258,9 @@ function tmuxCreateStartupViolations(file: string, contents: string): string[] {
 		}
 		if (isLifecycleCall) {
 			const lifecycleStart = match.index ?? 0;
-			if (!expectedLifecycleRanges.some(range => lifecycleStart >= range.start && lifecycleStart < range.end)) {
+			const runAuthorized = contents.lastIndexOf("def run_authorized", lifecycleStart);
+			const nextFunction = contents.indexOf("\ndef ", runAuthorized + 1);
+			if (runAuthorized < 0 || (nextFunction >= 0 && lifecycleStart >= nextFunction)) {
 				violation(
 					lifecycleStart,
 					"human-only tmux owner must bind owner-isolation to its expected lifecycle callsite",
@@ -2740,12 +2740,16 @@ async function selfTest(): Promise<void> {
 	const canonicalCreateFixture = `#!/usr/bin/env bash
 [[ $# -eq 2 ]] || { echo "Usage: $0 <session-name> <worktree-path>" >&2; exit 2; }
 command = [os.environ["GJC_SESSION_GJC_BIN"]]
+child_environment = os.environ.copy()
 child = subprocess.Popen(command)
-completed = subprocess.run([os.environ["GJC_SESSION_GJC_BIN"], "--internal-tmux-owner-isolation"], input="{}")
+def run_authorized(request, timeout=3):
+ process = subprocess.Popen([os.environ["GJC_SESSION_GJC_BIN"], "--internal-tmux-owner-isolation"])
+ return process.returncode, ""
+returncode, stdout = run_authorized(request)
 PLAN_RESPONSE="$(printf '%s\\n' "$PLAN_LINE" | "$GJC_BIN" --internal-tmux-owner-isolation)"
 POST_SPAWN_RESPONSE="$(printf '%s\\n' "$PLAN_LINE" | "$GJC_BIN" --internal-tmux-owner-isolation)"
-GENERATION_PUBLISH_RESPONSE="$(printf '%s\\n' "$GENERATION_PUBLISH_REQUEST" | "$GJC_BIN" --internal-tmux-owner-isolation)"
-if verdict="$(printf '%s\\n' "$request" | timeout "1s" "$GJC_SESSION_GJC_BIN" --internal-tmux-owner-isolation)"; then
+published_returncode, published_stdout = run_authorized(publication_request, timeout=5)
+if verdict="$(authorized_owner_call "$remaining_seconds")"; then
   true
 fi
 `;

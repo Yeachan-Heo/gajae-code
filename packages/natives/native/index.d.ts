@@ -321,6 +321,11 @@ export declare class NotificationServer {
   stopAndWait(): Promise<void>
 }
 
+export declare class PortableRecoveryFsRoot {
+  read(relativeName: string, maxBytes: number): RecoveryFsResult
+  close(): RecoveryFsResult
+}
+
 /** Stable process reference. */
 export declare class Process {
   /** Open a stable process reference from a PID. */
@@ -1976,6 +1981,8 @@ export interface NotificationEndpoint {
   /** The session id this endpoint serves. */
   sessionId: string
 }
+
+export declare function openPortableRecoveryFsRoot(rootPath: string): PortableRecoveryFsRoot
 
 /**
  * Acquire an immutable trusted-root descriptor. Linux is required; every

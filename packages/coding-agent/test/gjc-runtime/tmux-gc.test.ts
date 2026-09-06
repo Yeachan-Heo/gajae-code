@@ -133,6 +133,28 @@ describe("tmux GC safety", () => {
 		expect(calls).not.toContainEqual(["tmux-test", "kill-session", "-t", "=unrelated_orphan"]);
 	});
 
+	it("keeps foreign session names opaque while collecting GJC inventory", async () => {
+		const spawnSyncSpy = spyOn(Bun, "spawnSync") as unknown as SpawnSyncSpy;
+		spawnSyncSpy.mockImplementation((cmd: string[]) => {
+			if (!cmd.includes("list-sessions")) return spawnResult(0, "");
+			const format = cmd[cmd.indexOf("-F") + 1] ?? "";
+			if (format === "#{session_name}") return spawnResult(0, "foreign session:glyph\n");
+			return spawnResult(0, sessionLine({ name: "foreign session:glyph", profile: "" }));
+		});
+
+		const result = await tmuxSessionsGcAdapter.collect(ctx());
+
+		expect(result.errors).toEqual([]);
+		expect(result.records).toContainEqual(
+			expect.objectContaining({
+				id: "foreign session:glyph",
+				status: "unclassified",
+				removable: false,
+				reason: "untagged_tmux_session",
+			}),
+		);
+	});
+
 	it("classifies terminal detached sessions but refuses prune without exact server proof", async () => {
 		spyOn(Date, "now").mockReturnValue(1_800_000_000_000);
 		const stateFile = "/tmp/gjc-terminal-marker.json";

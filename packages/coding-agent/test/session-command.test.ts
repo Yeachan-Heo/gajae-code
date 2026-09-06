@@ -11,7 +11,7 @@ type SpawnSyncMock = {
 };
 
 const ORIGINAL_STDOUT_WRITE = process.stdout.write.bind(process.stdout);
-const REAL_TMUX_SESSIONS = { ...tmuxSessions };
+const REAL_REMOVE_GJC_TMUX_SESSION = tmuxSessions.removeGjcTmuxSession;
 
 function spawnResult(exitCode: number, stdout = "", stderr = "") {
 	return {
@@ -107,25 +107,37 @@ function injectSafeAbsentToSafeOwnerProof(plannedExecutions: string[][]): string
 	return probedSockets;
 }
 
-async function runSessionCommand(argv: string[]): Promise<string> {
+/**
+ * Runs the command and reports the process exit status it published.
+ *
+ * `process.exitCode` is always restored, so a command that now marks failure on the JSON path
+ * cannot leak a non-zero status into the surrounding test process.
+ */
+async function runSessionCommandWithStatus(argv: string[]): Promise<{ output: string; exitCode: number }> {
 	let output = "";
 	const writeSpy = spyOn(process.stdout, "write").mockImplementation((chunk: string | Uint8Array) => {
 		output += chunk.toString();
 		return true;
 	});
+	const previous = process.exitCode;
+	process.exitCode = 0;
 	try {
 		const command = new SessionCommand(argv, { bin: "gjc", version: "0.0.0-test", commands: new Map() });
 		await command.run();
-		return output;
+		return { output, exitCode: Number(process.exitCode ?? 0) };
 	} finally {
+		process.exitCode = previous;
 		writeSpy.mockRestore();
 	}
+}
+
+async function runSessionCommand(argv: string[]): Promise<string> {
+	return (await runSessionCommandWithStatus(argv)).output;
 }
 
 afterEach(() => {
 	process.stdout.write = ORIGINAL_STDOUT_WRITE;
 	(Bun.spawnSync as unknown as SpawnSyncMock).mockRestore?.();
-	mock.module("../src/gjc-runtime/tmux-sessions", () => REAL_TMUX_SESSIONS);
 	mock.restore();
 	tmuxSessions.__setCreateOwnerIsolationForTests(null);
 	tmuxSessions.__setMutationServerProofForTests(null);
@@ -155,13 +167,38 @@ describe("gjc session command", () => {
 		});
 	});
 
-	it("emits JSON failure wrappers", async () => {
+	it("emits JSON failure wrappers and exits non-zero", async () => {
 		mockSpawnSync(() => spawnResult(0, ""));
 
-		const output = await runSessionCommand(["status", "missing", "--json"]);
-		const payload = JSON.parse(output);
+		const { output, exitCode } = await runSessionCommandWithStatus(["status", "missing", "--json"]);
 
-		expect(payload).toEqual({ ok: false, reason: "gjc_tmux_session_not_found" });
+		expect(JSON.parse(output)).toEqual({ ok: false, reason: "gjc_tmux_session_not_found" });
+		// A refusal that reports success through the exit status is invisible to `cmd && ...`.
+		expect(exitCode).toBe(1);
+	});
+
+	it("keeps a successful JSON read at exit status zero", async () => {
+		mockSpawnSync(() => spawnResult(0, sessionLine("gajae_code_test", "feature/demo")));
+
+		const { output, exitCode } = await runSessionCommandWithStatus(["--json", "list"]);
+
+		expect(JSON.parse(output).ok).toBe(true);
+		expect(exitCode).toBe(0);
+	});
+
+	it("exits non-zero when a mutation is refused on fallback authority", async () => {
+		spyOn(tmuxSessions, "removeGjcTmuxSession").mockImplementation(() => {
+			throw new Error("gjc_tmux_fallback_authority_unconfirmed");
+		});
+
+		const { output, exitCode } = await runSessionCommandWithStatus(["remove", "managed", "--json"]);
+
+		expect(JSON.parse(output)).toEqual({ ok: false, reason: "gjc_tmux_fallback_authority_unconfirmed" });
+		expect(exitCode).toBe(1);
+	});
+
+	it("observes the real mutation export after a scoped refusal spy is restored", () => {
+		expect(tmuxSessions.removeGjcTmuxSession).toBe(REAL_REMOVE_GJC_TMUX_SESSION);
 	});
 
 	it("creates and reports a detached managed session as exact JSON DTO", async () => {
@@ -295,17 +332,15 @@ describe("gjc session command", () => {
 			attached: boolean;
 			windows: number;
 			panes: number;
+			panePids: number[];
 			bindings: string;
 			createdAt: string;
 		}>();
 		const received = { args: null as unknown[] | null };
-		mock.module("../src/gjc-runtime/tmux-sessions", () => ({
-			...REAL_TMUX_SESSIONS,
-			forceCloseGjcTmuxSession: (...args: unknown[]) => {
-				received.args = args;
-				return closed.promise;
-			},
-		}));
+		spyOn(tmuxSessions, "forceCloseGjcTmuxSession").mockImplementation((...args) => {
+			received.args = args;
+			return closed.promise;
+		});
 
 		const result = runSessionCommand([
 			"force-close",
@@ -322,6 +357,7 @@ describe("gjc session command", () => {
 			attached: false,
 			windows: 1,
 			panes: 1,
+			panePids: [],
 			bindings: "root",
 			createdAt: "2026-02-02T02:40:00.000Z",
 		});
@@ -341,12 +377,9 @@ describe("gjc session command", () => {
 	});
 
 	it("preserves an asynchronous force-close error instead of reporting success", async () => {
-		mock.module("../src/gjc-runtime/tmux-sessions", () => ({
-			...REAL_TMUX_SESSIONS,
-			forceCloseGjcTmuxSession: async () => {
-				throw new Error("owner_term_verdict_timeout");
-			},
-		}));
+		spyOn(tmuxSessions, "forceCloseGjcTmuxSession").mockImplementation(async () => {
+			throw new Error("owner_term_verdict_timeout");
+		});
 
 		const output = await runSessionCommand(["force-close", "managed", "--json"]);
 
@@ -354,12 +387,9 @@ describe("gjc session command", () => {
 	});
 	it("returns exact JSON failures for owner identity and generation mismatches", async () => {
 		for (const reason of ["owner_pid_identity_mismatch", "owner_generation_mismatch"]) {
-			mock.module("../src/gjc-runtime/tmux-sessions", () => ({
-				...REAL_TMUX_SESSIONS,
-				forceCloseGjcTmuxSession: async () => {
-					throw new Error(reason);
-				},
-			}));
+			spyOn(tmuxSessions, "forceCloseGjcTmuxSession").mockImplementation(async () => {
+				throw new Error(reason);
+			});
 			const output = await runSessionCommand([
 				"force-close",
 				"gjc_lc_private",
@@ -370,7 +400,7 @@ describe("gjc session command", () => {
 				"--json",
 			]);
 			expect(JSON.parse(output)).toEqual({ ok: false, reason });
-			mock.restore();
+			(tmuxSessions.forceCloseGjcTmuxSession as unknown as { mockRestore?: () => void }).mockRestore?.();
 		}
 	});
 });

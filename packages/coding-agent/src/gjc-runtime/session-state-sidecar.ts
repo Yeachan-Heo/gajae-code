@@ -18,21 +18,28 @@ import {
 	writeCoordinatorAtomic,
 } from "../coordinator-mcp/durability";
 import { reduceTerminalReceiptState } from "../sdk/receipt-state";
+import { truncateUtf8 } from "../session/btw-contract";
 import { TOOL_CATALOG } from "../tools/tool-catalog.generated";
 import { sessionRoot, sessionRuntimeDir } from "./session-layout";
 import { SessionStateLockUnavailableError, withSessionStateFileLock } from "./session-state-lock";
 import {
+	captureOwnerGenerationBaseline,
 	isValidOwnerIntent,
+	isValidOwnerVerdict,
 	lifecyclePaths,
 	type ObserveTerminalRequest,
+	type OwnerGenerationBaseline,
 	type OwnerIntent,
 	type OwnerVerdict,
 	observeOwnerTerminal,
+	readNoFollowJson,
 	type TerminalSignal,
+	withOwnerGenerationLock,
 } from "./tmux-owner-isolation";
 
 /** Managed tmux owner provenance propagated only to the launched child process. */
 export const GJC_TMUX_OWNER_GENERATION_ENV = "GJC_TMUX_OWNER_GENERATION";
+export const GJC_TMUX_OWNER_GENERATION_STAGED_ENV = "GJC_TMUX_OWNER_GENERATION_STAGED";
 export const GJC_TMUX_OWNER_STATE_DIR_ENV = "GJC_TMUX_OWNER_STATE_DIR";
 export const GJC_TMUX_OWNER_SERVER_KEY_ENV = "GJC_TMUX_OWNER_SERVER_KEY";
 export const GJC_COORDINATOR_SESSION_STATE_FILE_ENV = "GJC_COORDINATOR_SESSION_STATE_FILE";
@@ -135,6 +142,8 @@ export type RuntimeState = "ready_for_input" | "running" | "needs_user_input" | 
 
 type FinalResponseSource = "agent_end" | "launch_error";
 const MAX_PUBLIC_ERROR_MESSAGE_LENGTH = 2000;
+const RUNTIME_STATE_MARKER_MAX_BYTES = 256 * 1024;
+const RUNTIME_STATE_FINAL_RESPONSE_MAX_BYTES = 128 * 1024;
 const HEARTBEAT_MS = 1000;
 
 /**
@@ -174,6 +183,7 @@ export const __sessionStateSidecarPerfCounters = {
 /** Test-only barriers for deterministic rescope transaction race coverage. */
 export const __sessionStateSidecarTestHooks: {
 	afterRescopeLocksAcquired?: () => void | Promise<void>;
+	afterOwnerGenerationLockAcquired?: () => void | Promise<void>;
 	beforeRescopeJournalWrite?: (cwd: string) => void | Promise<void>;
 	beforePersistFromEvent?: (eventType: string, cwd: string) => void | Promise<void>;
 	beforeRescopePublish?: () => void | Promise<void>;
@@ -633,10 +643,12 @@ export interface OwnerTerminalContext {
 	generation: string;
 	stateDir: string;
 	socketKey: string;
+	generationPublished?: boolean;
 	scope?: string | null;
 	ownerPid?: number | null;
 	ownerName?: string | null;
 	operatorDispatchId?: string | null;
+	operatorIntentId?: string | null;
 }
 
 export interface RuntimeStateContext {
@@ -648,6 +660,8 @@ export interface RuntimeStateContext {
 	branch?: string | null;
 	/** Public-safe owner metadata used to persist the canonical terminal verdict. */
 	ownerTerminal?: OwnerTerminalContext | null;
+	/** Internal marker: staged owners may terminalize without stamping an unpublished generation. */
+	ownerGenerationPublished?: boolean;
 	/** Internal fail-closed marker set only when managed owner metadata is malformed or missing. */
 	ownerTerminalMetadataInvalid?: boolean;
 	/**
@@ -920,7 +934,8 @@ export async function readTerminalRuntimeStateMarker(input: {
 		return { terminal: false, reason: "missing_state_file" };
 	let value: unknown;
 	try {
-		value = JSON.parse(await Bun.file(stateFile).text());
+		await fs.lstat(stateFile);
+		value = await readNoFollowJson(stateFile, RUNTIME_STATE_MARKER_MAX_BYTES);
 	} catch (error) {
 		const code = (error as { code?: unknown }).code;
 		return {
@@ -976,15 +991,17 @@ function finalResponseForEvent(event: RuntimeStateEvent): {
 	format: "markdown";
 	source: FinalResponseSource;
 	artifact_path: null;
-	truncated: false;
+	truncated: boolean;
 } | null {
 	if (event.type !== "agent_end") return null;
+	const fullText = assistantText(lastAssistant(event.messages));
+	const text = fullText === null ? null : truncateUtf8(fullText, RUNTIME_STATE_FINAL_RESPONSE_MAX_BYTES);
 	return {
-		text: assistantText(lastAssistant(event.messages)),
+		text,
 		format: "markdown",
 		source: "agent_end",
 		artifact_path: null,
-		truncated: false,
+		truncated: text !== fullText,
 	};
 }
 
@@ -1071,6 +1088,13 @@ function pathIsInside(candidate: string, root: string, platform: NodeJS.Platform
 	return normalizedCandidate.startsWith(prefix);
 }
 
+class OwnerTerminalPublicationError extends Error {
+	constructor(cause: unknown) {
+		super("Owner terminal verdict is durable, but its public runtime state could not be constructed.");
+		this.name = "OwnerTerminalPublicationError";
+		Object.assign(this, { code: "owner_terminal_publication_failed", cause });
+	}
+}
 class RuntimeToolActivityRefusedError extends Error {
 	constructor(reason: string) {
 		super(`Refusing to overwrite the coordinator tool-activity snapshot: ${reason}.`);
@@ -1415,7 +1439,11 @@ function basePayload(input: {
 		branch: branchForContext(input.context),
 		session_file: identity.sessionFile,
 		...(activity === undefined ? {} : { activity }),
-		...(input.context.ownerTerminal ? { owner_generation: input.context.ownerTerminal.generation } : {}),
+		...(input.context.ownerTerminal &&
+		input.context.ownerGenerationPublished !== false &&
+		input.context.ownerTerminal.generationPublished !== false
+			? { owner_generation: input.context.ownerTerminal.generation }
+			: {}),
 	};
 	return payload;
 }
@@ -1623,6 +1651,132 @@ async function writeStateFileSyncConditional(
 }
 
 /**
+ * Publish a launch failure through the same transaction and signing path as runtime events.
+ *
+ * A launch can be attempting to replace a managed owner while the predecessor is still
+ * live. In that case the state file is a compare-and-swap target: only a caller carrying
+ * the currently published owner generation may replace it. Missing, malformed, or stale
+ * owner provenance is deliberately a no-op. A state file with no active owner generation
+ * retains the standalone launch-error behavior.
+ */
+export async function persistCoordinatorLaunchFailureState(input: {
+	stateFile: string;
+	cwd: string;
+	sessionId: string | null;
+	ownerGeneration: string | null;
+	ownerStateDir: string | null;
+	ownerServerKey: string | null;
+	managedLaunch: boolean;
+	payload: Record<string, unknown>;
+	signingRequired: boolean;
+	keyId: string | null;
+}): Promise<void> {
+	const stateFile = input.stateFile.trim();
+	if (!stateFile) return;
+	const sessionId = input.sessionId?.trim() || null;
+	const ownerGeneration = input.ownerGeneration?.trim() || null;
+	const ownerStateDir = input.ownerStateDir?.trim() || null;
+	const ownerServerKey = input.ownerServerKey?.trim() || null;
+	const stateDirectory = path.dirname(path.resolve(stateFile));
+	const ownerMetadataComplete = Boolean(ownerGeneration && ownerStateDir && ownerServerKey);
+	const ownerMetadataValid =
+		ownerMetadataComplete &&
+		path.isAbsolute(ownerStateDir!) &&
+		!ownerStateDir!.split("").some(character => character.charCodeAt(0) < 0x20 || character.charCodeAt(0) === 0x7f) &&
+		!ownerServerKey!
+			.split("")
+			.some(character => character.charCodeAt(0) < 0x20 || character.charCodeAt(0) === 0x7f) &&
+		path.resolve(ownerStateDir!) === stateDirectory;
+	const keyId = input.signingRequired ? input.keyId?.trim() || null : null;
+	if (input.signingRequired && (!keyId || !/^[a-f0-9]{64}$/.test(keyId))) return;
+
+	const writeTransaction = async () =>
+		await withCoordinatorTransactionLock(
+			stateFile,
+			async () =>
+				await withStateFileLock(stateFile, async () => {
+					let previous: Record<string, unknown>;
+					try {
+						previous = await readPreviousPayloadForEvent(stateFile);
+					} catch (error) {
+						// A launch diagnostic must never turn an unreadable shared state
+						// marker into a replacement payload.
+						if (error instanceof PreviousRuntimeStateReadError) return;
+						throw error;
+					}
+					if (Object.hasOwn(previous, "owner_generation")) {
+						const rawOwnerGeneration = previous.owner_generation;
+						if (
+							rawOwnerGeneration !== null &&
+							(typeof rawOwnerGeneration !== "string" || rawOwnerGeneration.trim().length === 0)
+						)
+							return;
+					}
+					if (!sessionId && typeof previous.session_id === "string" && previous.session_id.trim().length > 0)
+						return;
+					const previousOwner =
+						typeof previous.owner_generation === "string" && previous.owner_generation.trim().length > 0
+							? previous.owner_generation.trim()
+							: null;
+					if (previousOwner !== null && !sessionId) return;
+					const baseline = sessionId
+						? await captureOwnerGenerationBaseline(stateDirectory, sessionId).catch(() => undefined)
+						: null;
+					const activeGeneration = baseline?.state === "current" ? baseline.generation : null;
+					const previousManagedEvidence = previousOwner !== null;
+					if (ownerMetadataComplete && baseline === undefined) return;
+					// Any owner generation already represented by the state file requires an
+					// authenticated, still-current caller. Do not turn an unavailable
+					// lifecycle record into an unowned overwrite.
+					if (
+						input.managedLaunch &&
+						previousManagedEvidence &&
+						(activeGeneration === null || baseline === undefined)
+					)
+						return;
+					if (activeGeneration !== null) {
+						if (
+							!sessionId ||
+							!ownerMetadataValid ||
+							activeGeneration !== ownerGeneration ||
+							previous.session_id !== sessionId ||
+							previousOwner === null
+						)
+							return;
+					} else if (input.managedLaunch && previousManagedEvidence) {
+						return;
+					}
+					if (sessionId) {
+						try {
+							assertPreviousRuntimeStateIdentity(previous, {
+								sessionId,
+								cwd: path.resolve(input.cwd),
+								workdir: path.resolve(input.cwd),
+								sessionFile: null,
+								platform: process.platform,
+								sidecarKeyId: keyId,
+							});
+						} catch (error) {
+							if (error instanceof PreviousRuntimeStateReadError) return;
+							throw error;
+						}
+					}
+					const payload =
+						activeGeneration !== null && ownerMetadataValid && sessionId && ownerGeneration === activeGeneration
+							? { ...input.payload, owner_generation: ownerGeneration }
+							: input.payload;
+					await writeStateFileSync(stateFile, payload, keyId);
+				}),
+		);
+	await serializeStateFileWrite(
+		stateFile,
+		ownerMetadataValid && sessionId && ownerStateDir
+			? () => withOwnerGenerationLock(ownerStateDir, sessionId, writeTransaction)
+			: writeTransaction,
+	);
+}
+
+/**
  * The state-file critical section, shared byte-for-byte with the Coordinator MCP writer.
  *
  * The shared implementation writes the base Coordinator's regular-file `<file>.lock`
@@ -1751,11 +1905,95 @@ async function withStateFileLocks<T>(stateFiles: readonly string[], operation: (
 	return await withStateFileLock(stateFile, async () => await withStateFileLocks(remaining, operation));
 }
 
+/**
+ * Owner-bound state writers take the lifecycle lock before either state lock. Owner
+ * replacement uses that same lifecycle lock, so the generation read and the eventual
+ * state write cannot straddle a replacement publication.
+ */
+async function withRuntimeStateWriterLocks<T>(
+	stateFile: string,
+	context: RuntimeStateContext,
+	sessionId: string,
+	operation: (lockedContext: RuntimeStateContext) => Promise<T>,
+): Promise<T> {
+	const owner = context.ownerTerminal;
+	const transaction = (lockedContext: RuntimeStateContext) =>
+		withCoordinatorTransactionLock(stateFile, async () => await operation(lockedContext));
+	if (!owner) return await transaction(context);
+	return await withOwnerGenerationLock(owner.stateDir, sessionId, async () => {
+		await __sessionStateSidecarTestHooks.afterOwnerGenerationLockAcquired?.();
+		let lockedContext = context;
+		if (owner.generationPublished === false) {
+			const generation = await captureOwnerGenerationBaseline(owner.stateDir, sessionId).catch(() => ({
+				state: "absent" as const,
+			}));
+			if (
+				generation.state === "current" &&
+				generation.session_id === sessionId &&
+				generation.generation === owner.generation
+			)
+				lockedContext = {
+					...context,
+					ownerTerminal: { ...owner, generationPublished: true },
+				};
+		}
+		return await transaction(lockedContext);
+	});
+}
+
+/**
+ * Validate the ownership fence carried by a previous runtime marker while the writer's
+ * locks are held. An unowned predecessor remains valid for explicit legacy paths. Once
+ * ownership is present, the authenticated current generation may adopt a predecessor's
+ * marker for the same stable session identity and stamps its own generation on the write.
+ */
+async function runtimeStateOwnerGenerationFence(
+	previous: Record<string, unknown>,
+	context: RuntimeStateContext,
+	identity: RuntimeStateIdentity,
+): Promise<boolean> {
+	const rawPreviousGeneration = previous.owner_generation;
+	if (
+		rawPreviousGeneration !== undefined &&
+		rawPreviousGeneration !== null &&
+		(typeof rawPreviousGeneration !== "string" || rawPreviousGeneration.trim().length === 0)
+	)
+		return false;
+	const previousGeneration = typeof rawPreviousGeneration === "string" ? rawPreviousGeneration.trim() : null;
+	const owner = context.ownerTerminal;
+	if (!owner) return previousGeneration === null;
+	let current: OwnerGenerationBaseline;
+	try {
+		current = await captureOwnerGenerationBaseline(owner.stateDir, identity.sessionId);
+	} catch {
+		return false;
+	}
+	if (current.state === "absent") return previousGeneration === null;
+	if (
+		current.state !== "current" ||
+		current.session_id !== identity.sessionId ||
+		current.generation !== owner.generation
+	)
+		return false;
+	return true;
+}
+
+function stampRuntimeStateOwnerGeneration(
+	previous: Record<string, unknown>,
+	context: RuntimeStateContext,
+): Record<string, unknown> {
+	return context.ownerTerminal &&
+		context.ownerGenerationPublished !== false &&
+		context.ownerTerminal.generationPublished !== false
+		? { ...previous, owner_generation: context.ownerTerminal.generation }
+		: previous;
+}
+
 async function writeStateFile(stateFile: string, payload: Record<string, unknown>): Promise<void> {
 	await writeCoordinatorAtomic(stateFile, `${JSON.stringify(payload)}\n`);
 }
 
-function contextWithManagedOwnerGeneration(context: RuntimeStateContext): RuntimeStateContext {
+async function contextWithManagedOwnerGeneration(context: RuntimeStateContext): Promise<RuntimeStateContext> {
 	if (context.ownerTerminal) return context;
 	const ownerTerminal = ownerTerminalContextFromEnvironment();
 	if (ownerTerminal === "invalid") throw new PreviousRuntimeStateReadError();
@@ -1781,14 +2019,17 @@ async function persistCoordinatorRuntimeToolActivity(
 	await serializeStateFileWrite(
 		stateFile,
 		async () =>
-			await withCoordinatorTransactionLock(
+			await withRuntimeStateWriterLocks(
 				stateFile,
-				async () =>
+				context,
+				identity.sessionId,
+				async lockedContext =>
 					await withStateFileLock(stateFile, async () => {
-						assertNoRuntimeStateRescopeJournal(context, identity);
+						assertNoRuntimeStateRescopeJournal(lockedContext, identity);
 						const previous = await readPreviousPayloadForEvent(stateFile);
 						if (Object.keys(previous).length === 0) return;
 						assertPreviousRuntimeStateIdentity(previous, identity, stateFile);
+						if (!(await runtimeStateOwnerGenerationFence(previous, lockedContext, identity))) return;
 						// A tool event that lands after the session settled must never
 						// resurrect it into a live-looking state.
 						if (previous.state === "completed" || previous.state === "errored") return;
@@ -1803,7 +2044,7 @@ async function persistCoordinatorRuntimeToolActivity(
 						await writeStateFileSync(
 							stateFile,
 							{
-								...previous,
+								...stampRuntimeStateOwnerGeneration(previous, lockedContext),
 								activity: nextRuntimeToolActivity(priorActivity, {
 									phase,
 									label,
@@ -1846,9 +2087,10 @@ export async function persistCoordinatorRuntimeStateFromEvent(
 	if (!state) {
 		const activityPhase = toolActivityPhaseForEvent(event);
 		if (!activityPhase) return;
+		const activityContext = await contextWithManagedOwnerGeneration(context);
 		await persistCoordinatorRuntimeToolActivity(
 			event,
-			context,
+			activityContext,
 			stateFile,
 			activityPhase,
 			observation?.label,
@@ -1856,20 +2098,23 @@ export async function persistCoordinatorRuntimeStateFromEvent(
 		);
 		return;
 	}
-	context = contextWithManagedOwnerGeneration(context);
+	context = await contextWithManagedOwnerGeneration(context);
 	const identity = normalizedIdentity(context);
 	await serializeStateFileWrite(
 		stateFile,
 		async () =>
-			await withCoordinatorTransactionLock(
+			await withRuntimeStateWriterLocks(
 				stateFile,
-				async () =>
+				context,
+				identity.sessionId,
+				async lockedContext =>
 					await withStateFileLock(stateFile, async () => {
-						assertNoRuntimeStateRescopeJournal(context, identity);
+						assertNoRuntimeStateRescopeJournal(lockedContext, identity);
 						const nowMs = Date.now();
 						const now = new Date(nowMs).toISOString();
 						const previous = await readPreviousPayloadForEvent(stateFile);
 						assertPreviousRuntimeStateIdentity(previous, identity, stateFile);
+						if (!(await runtimeStateOwnerGenerationFence(previous, lockedContext, identity))) return;
 						const finalResponse = finalResponseForEvent(event);
 						const terminalReceipt =
 							state === "completed" || state === "errored"
@@ -1880,7 +2125,7 @@ export async function persistCoordinatorRuntimeStateFromEvent(
 								: null;
 						const payload = {
 							...basePayload({
-								context,
+								context: lockedContext,
 								previous,
 								state,
 								now,
@@ -1933,18 +2178,22 @@ export async function persistCoordinatorWorkerIntegrationOutcome(
 ): Promise<void> {
 	const stateFile = runtimeStateFileForContext(context);
 	if (!stateFile) return;
+	context = await contextWithManagedOwnerGeneration(context);
 	const identity = normalizedIdentity(context);
 	await serializeStateFileWrite(
 		stateFile,
 		async () =>
-			await withCoordinatorTransactionLock(
+			await withRuntimeStateWriterLocks(
 				stateFile,
-				async () =>
+				context,
+				identity.sessionId,
+				async lockedContext =>
 					await withStateFileLock(stateFile, async () => {
-						assertNoRuntimeStateRescopeJournal(context, identity);
+						assertNoRuntimeStateRescopeJournal(lockedContext, identity);
 						const previous = await readPreviousPayloadForEvent(stateFile);
 						if (Object.keys(previous).length === 0) return;
 						assertPreviousRuntimeStateIdentity(previous, identity, stateFile);
+						if (!(await runtimeStateOwnerGenerationFence(previous, lockedContext, identity))) return;
 						const now = new Date().toISOString();
 						const terminalPersistenceFailed =
 							outcome.kind === "terminal_persistence" && outcome.status !== "completed";
@@ -1961,7 +2210,7 @@ export async function persistCoordinatorWorkerIntegrationOutcome(
 									: "Worker integration failed after terminal publication."),
 						);
 						const payload = {
-							...previous,
+							...stampRuntimeStateOwnerGeneration(previous, lockedContext),
 							...(terminalPersistenceFailed
 								? {
 										state: "errored",
@@ -2617,7 +2866,12 @@ export function ownerTerminalContextFromEnvironment(): OwnerTerminalContext | "i
 	) {
 		return "invalid";
 	}
-	return { generation: normalizedGeneration, stateDir: normalizedStateDir, socketKey: normalizedSocketKey };
+	return {
+		generation: normalizedGeneration,
+		stateDir: normalizedStateDir,
+		socketKey: normalizedSocketKey,
+		...(process.env[GJC_TMUX_OWNER_GENERATION_STAGED_ENV] === "1" ? { generationPublished: false } : {}),
+	};
 }
 
 async function persistInvalidOwnerTerminalMetadata(
@@ -2657,17 +2911,29 @@ async function persistInvalidOwnerTerminalMetadata(
 
 async function operatorDispatchIdForOwner(
 	owner: OwnerTerminalContext,
-	request: Omit<ObserveTerminalRequest, "operator_dispatch_id">,
-): Promise<string | undefined> {
+	request: Omit<ObserveTerminalRequest, "operator_dispatch_id" | "operator_intent_id">,
+): Promise<Pick<ObserveTerminalRequest, "operator_dispatch_id" | "operator_intent_id"> | undefined> {
+	const dispatchId = owner.operatorDispatchId;
+	if (!dispatchId) return undefined;
+	const intentId = owner.operatorIntentId;
+	if (!intentId) return undefined;
 	try {
-		const intent = JSON.parse(
-			await Bun.file(lifecyclePaths(owner.stateDir, request.session_id, owner.generation).intentFile).text(),
-		) as unknown;
+		const intent = await readNoFollowJson(
+			lifecyclePaths(owner.stateDir, request.session_id, owner.generation).intentFile,
+		);
 		if (!isValidOwnerIntent(intent)) return undefined;
-		const dispatchId = owner.operatorDispatchId ?? intent.dispatch_id;
-		return isValidOwnerIntent(intent as OwnerIntent, { ...request, operator_dispatch_id: dispatchId })
-			? dispatchId
-			: undefined;
+		if (
+			!isValidOwnerIntent(intent as OwnerIntent, {
+				...request,
+				operator_dispatch_id: dispatchId,
+				...(intentId !== undefined && intentId !== null ? { operator_intent_id: intentId } : {}),
+			})
+		)
+			return undefined;
+		return {
+			operator_dispatch_id: dispatchId,
+			...(intentId !== undefined && intentId !== null ? { operator_intent_id: intentId } : {}),
+		};
 	} catch {
 		return undefined;
 	}
@@ -2679,8 +2945,23 @@ async function observeOwnerTerminalPostmortem(
 	sessionId: string,
 ): Promise<OwnerVerdict | null> {
 	try {
+		const intentStatus =
+			reason === postmortem.Reason.SIGTERM ? await pendingOwnerIntentStatus(owner, sessionId) : "none";
+		// A present but unparseable, future-dated, expired, or otherwise unavailable intent
+		// is evidence that cannot authorize an unbound sidecar observation. Only a proven
+		// ENOENT (`none`) permits the ordinary unbound path below. A durable verdict is
+		// the exception: observeOwnerTerminal must still be allowed to replay it exactly,
+		// even when a stale intent marker remains beside it.
+		if (intentStatus === "unavailable" && !(await hasMatchingDurableOwnerVerdict(owner, sessionId))) return null;
+		if (
+			(process.env.GJC_MANAGED_OWNER_SUPERVISED === "1" ||
+				(process.env.GJC_TMUX_LAUNCHED === "1" && process.platform === "win32")) &&
+			reason === postmortem.Reason.SIGTERM &&
+			(!owner.operatorDispatchId || !owner.operatorIntentId)
+		)
+			return null;
 		const now = new Date().toISOString();
-		const observation: Omit<ObserveTerminalRequest, "operator_dispatch_id"> = {
+		const observation: Omit<ObserveTerminalRequest, "operator_dispatch_id" | "operator_intent_id"> = {
 			schema_version: 1,
 			op: "observe_terminal",
 			session_id: sessionId,
@@ -2694,17 +2975,63 @@ async function observeOwnerTerminalPostmortem(
 			exit_kind: String(reason),
 			reason: "process_postmortem",
 		};
-		const operatorDispatchId = await operatorDispatchIdForOwner(owner, observation);
+		const operatorIdentity = await operatorDispatchIdForOwner(owner, observation);
 		return await observeOwnerTerminal({
 			...observation,
-			...(operatorDispatchId ? { operator_dispatch_id: operatorDispatchId } : {}),
+			...(operatorIdentity ?? {}),
 		});
-	} catch {
+	} catch (error) {
+		if (await hasMatchingDurableOwnerVerdict(owner, sessionId)) throw new OwnerTerminalPublicationError(error);
 		return null;
 	}
 }
 
+type PendingOwnerIntentStatus = "none" | "matching" | "foreign" | "unavailable";
+
+async function hasMatchingDurableOwnerVerdict(owner: OwnerTerminalContext, sessionId: string): Promise<boolean> {
+	try {
+		const verdict = await readNoFollowJson(lifecyclePaths(owner.stateDir, sessionId, owner.generation).verdictFile);
+		return (
+			isValidOwnerVerdict(verdict) &&
+			verdict.generation === owner.generation &&
+			verdict.session_id === sessionId &&
+			verdict.server_key === owner.socketKey
+		);
+	} catch {
+		return false;
+	}
+}
+
+async function pendingOwnerIntentStatus(
+	owner: OwnerTerminalContext,
+	sessionId: string,
+): Promise<PendingOwnerIntentStatus> {
+	const intentFile = lifecyclePaths(owner.stateDir, sessionId, owner.generation).intentFile;
+	try {
+		try {
+			await fs.lstat(intentFile);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") return "none";
+			return "unavailable";
+		}
+		const intent = await readNoFollowJson(intentFile);
+		if (intent === null) return "unavailable";
+		if (
+			!isValidOwnerIntent(intent) ||
+			intent.session_id !== sessionId ||
+			intent.generation !== owner.generation ||
+			Date.parse(intent.created_at) > Date.now() ||
+			Date.parse(intent.expires_at) <= Date.now()
+		)
+			return "unavailable";
+		return intent.server_key === owner.socketKey ? "matching" : "foreign";
+	} catch {
+		return "unavailable";
+	}
+}
+
 async function persistCoordinatorRuntimeStateFromOwnerTerminalPostmortem(
+	reason: postmortem.Reason,
 	context: RuntimeStateContext,
 	stateFile: string,
 	sessionId: string,
@@ -2713,12 +3040,22 @@ async function persistCoordinatorRuntimeStateFromOwnerTerminalPostmortem(
 ): Promise<void> {
 	const owner = context.ownerTerminal;
 	if (!owner) return;
+	let payload: Record<string, unknown> | null = null;
 	try {
-		if (!verdict) throw new Error("owner terminal verdict unavailable");
+		if (!verdict) {
+			if (
+				(process.env.GJC_MANAGED_OWNER_SUPERVISED === "1" ||
+					(process.env.GJC_TMUX_LAUNCHED === "1" && process.platform === "win32")) &&
+				reason === postmortem.Reason.SIGTERM &&
+				(await pendingOwnerIntentStatus(owner, sessionId)) === "matching"
+			)
+				return;
+			throw new Error("owner terminal verdict unavailable");
+		}
 		const now = new Date().toISOString();
 		const expected = verdict.classification === "expected_operator_shutdown";
 		const state: RuntimeState = expected ? "completed" : "errored";
-		const payload = {
+		payload = {
 			...basePayload({
 				context,
 				previous,
@@ -2747,8 +3084,8 @@ async function persistCoordinatorRuntimeStateFromOwnerTerminalPostmortem(
 					}),
 			previous_runtime_state: typeof previous.state === "string" ? previous.state : null,
 		};
-		await writeStateFileSync(stateFile, payload);
-	} catch {
+	} catch (error) {
+		if (verdict) throw new OwnerTerminalPublicationError(error);
 		const now = new Date().toISOString();
 		await writeStateFileSync(stateFile, {
 			...basePayload({
@@ -2775,45 +3112,83 @@ async function persistCoordinatorRuntimeStateFromOwnerTerminalPostmortem(
 			previous_runtime_state: typeof previous.state === "string" ? previous.state : null,
 		});
 	}
+	if (payload) await writeStateFileSync(stateFile, payload);
+}
+export interface PersistCoordinatorRuntimeStateFromPostmortemOptions {
+	stateFile?: string;
+	ownerTerminalVerdict?: OwnerVerdict | null;
 }
 
 export async function persistCoordinatorRuntimeStateFromPostmortem(
 	reason: postmortem.Reason,
 	context: RuntimeStateContext,
+	options: PersistCoordinatorRuntimeStateFromPostmortemOptions = {},
 ): Promise<void> {
-	const stateFile = runtimeStateFileForContext(context);
+	const stateFile = options.stateFile ?? runtimeStateFileForContext(context);
 	if (!stateFile) return;
-	const identity = normalizedIdentity(context);
-	const ownerSessionRoot = sessionRoot(context.cwd, identity.sessionId);
-	const ownerTerminalVerdict = context.ownerTerminal
-		? await observeOwnerTerminalPostmortem(reason, context.ownerTerminal, identity.sessionId)
-		: null;
+	if (!context.ownerTerminal && !context.ownerTerminalMetadataInvalid)
+		context = await contextWithManagedOwnerGeneration(context);
+	const ownerTerminalVerdict =
+		options.ownerTerminalVerdict !== undefined
+			? options.ownerTerminalVerdict
+			: context.ownerTerminal
+				? await observeOwnerTerminalPostmortem(reason, context.ownerTerminal, context.sessionId)
+				: null;
+	let identity: RuntimeStateIdentity;
+	try {
+		identity = normalizedIdentity(context);
+	} catch (error) {
+		if (context.ownerTerminal) throw new OwnerTerminalPublicationError(error);
+		throw error;
+	}
+	if (ownerTerminalVerdict && context.ownerTerminal && context.ownerTerminal.generationPublished !== undefined) {
+		const generation = await captureOwnerGenerationBaseline(context.ownerTerminal.stateDir, identity.sessionId).catch(
+			() => ({ state: "absent" as const }),
+		);
+		context = {
+			...context,
+			ownerGenerationPublished:
+				generation.state === "current" && generation.generation === context.ownerTerminal.generation,
+		};
+	}
+	let ownerSessionRoot: string;
+	try {
+		const ownerCwd = context.cwd;
+		ownerSessionRoot = sessionRoot(ownerCwd, identity.sessionId);
+	} catch (error) {
+		if (context.ownerTerminal) throw new OwnerTerminalPublicationError(error);
+		throw error;
+	}
 	await serializeStateFileWrite(
 		stateFile,
 		async () =>
-			await withCoordinatorTransactionLock(
+			await withRuntimeStateWriterLocks(
 				stateFile,
-				async () =>
+				context,
+				identity.sessionId,
+				async lockedContext =>
 					await withStateFileLock(stateFile, async () => {
-						assertNoRuntimeStateRescopeJournal(context, identity);
+						assertNoRuntimeStateRescopeJournal(lockedContext, identity);
 						const previous = readPreviousPayload(stateFile);
 						assertPreviousRuntimeStateIdentity(previous, identity, stateFile);
+						if (!(await runtimeStateOwnerGenerationFence(previous, lockedContext, identity))) return;
 						if (shouldPreserveTerminalPayload(previous as RuntimeStateSidecarPayload, identity)) return;
 						// The immutable owner verdict remains in its lifecycle artifact; never replace a
 						// complete agent terminal payload merely to mirror that verdict here.
-						if (context.ownerTerminalMetadataInvalid) {
+						if (lockedContext.ownerTerminalMetadataInvalid) {
 							await persistInvalidOwnerTerminalMetadata(
 								reason,
-								context,
+								lockedContext,
 								stateFile,
 								identity.sessionId,
 								previous,
 							);
 							return;
 						}
-						if (context.ownerTerminal) {
+						if (lockedContext.ownerTerminal) {
 							await persistCoordinatorRuntimeStateFromOwnerTerminalPostmortem(
-								context,
+								reason,
+								lockedContext,
 								stateFile,
 								identity.sessionId,
 								previous,
@@ -2830,7 +3205,7 @@ export async function persistCoordinatorRuntimeStateFromPostmortem(
 						const details = postmortemExitDetails(reason, previousForDetails, identity.cwd);
 						const payload = {
 							...basePayload({
-								context,
+								context: lockedContext,
 								previous,
 								state: details.state,
 								now,
@@ -2856,6 +3231,7 @@ export async function persistCoordinatorRuntimeStateFromPostmortem(
 					}),
 			),
 	).catch(error => {
+		if (ownerTerminalVerdict) throw new OwnerTerminalPublicationError(error);
 		if ((error as NodeJS.ErrnoException).code === "ENOENT") {
 			try {
 				fsSync.lstatSync(ownerSessionRoot);
@@ -2865,6 +3241,27 @@ export async function persistCoordinatorRuntimeStateFromPostmortem(
 		}
 		throw error;
 	});
+}
+
+/** Finalizes an externally observed managed-owner shutdown in its tagged runtime-state file. */
+export async function persistCoordinatorRuntimeStateFromOwnerVerdict(
+	stateFile: string,
+	ownerTerminal: OwnerTerminalContext,
+	verdict: OwnerVerdict,
+): Promise<void> {
+	const previous = readPreviousPayload(stateFile);
+	const cwd = typeof previous.cwd === "string" && previous.cwd.trim() ? previous.cwd : ownerTerminal.stateDir;
+	const sessionFile = typeof previous.session_file === "string" ? previous.session_file : null;
+	await persistCoordinatorRuntimeStateFromPostmortem(
+		postmortem.Reason.SIGTERM,
+		{
+			sessionId: verdict.session_id,
+			cwd,
+			sessionFile,
+			ownerTerminal: { ...ownerTerminal, generationPublished: true },
+		},
+		{ stateFile, ownerTerminalVerdict: verdict },
+	);
 }
 
 export function registerCoordinatorRuntimeStateFinalizer(

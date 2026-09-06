@@ -634,6 +634,167 @@ impl RecoveryFsResult {
 	}
 }
 
+#[napi]
+pub struct PortableRecoveryFsRoot {
+	#[cfg(unix)]
+	root: std::sync::Mutex<Option<std::fs::File>>,
+}
+
+#[napi]
+impl PortableRecoveryFsRoot {
+	#[napi]
+	pub fn read(&self, relative_name: String, max_bytes: u32) -> RecoveryFsResult {
+		#[cfg(unix)]
+		{
+			use std::{
+				ffi::CString,
+				io::Read,
+				os::{
+					fd::{AsRawFd, FromRawFd},
+					unix::{ffi::OsStrExt, fs::MetadataExt},
+				},
+				path::Path,
+			};
+			if max_bytes == 0
+				|| relative_name.is_empty()
+				|| relative_name == "."
+				|| relative_name == ".."
+			{
+				return RecoveryFsResult::failure("invalid_path");
+			}
+			let relative = Path::new(&relative_name);
+			if relative.components().count() != 1 || relative.is_absolute() {
+				return RecoveryFsResult::failure("invalid_path");
+			}
+			let Ok(name) = CString::new(relative.as_os_str().as_bytes()) else {
+				return RecoveryFsResult::failure("invalid_path");
+			};
+			let Ok(guard) = self.root.lock() else {
+				return RecoveryFsResult::failure("closed");
+			};
+			let Some(root) = guard.as_ref() else {
+				return RecoveryFsResult::failure("closed");
+			};
+			// SAFETY: root owns a valid directory fd and name is live and NUL-terminated.
+			let file_fd = unsafe {
+				libc::openat(
+					root.as_raw_fd(),
+					name.as_ptr(),
+					libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+				)
+			};
+			if file_fd < 0 {
+				return RecoveryFsResult::failure("not_found");
+			}
+			// SAFETY: file_fd is newly owned after successful openat.
+			let mut file = unsafe { std::fs::File::from_raw_fd(file_fd) };
+			let metadata = match file.metadata() {
+				Ok(value) if value.is_file() && value.nlink() == 1 => value,
+				_ => return RecoveryFsResult::failure("identity_mismatch"),
+			};
+			if metadata.size() > u64::from(max_bytes) {
+				return RecoveryFsResult::failure("content_too_large");
+			}
+			let mut data = Vec::with_capacity(metadata.size() as usize + 1);
+			if Read::by_ref(&mut file)
+				.take(u64::from(max_bytes) + 1)
+				.read_to_end(&mut data)
+				.is_err()
+				|| data.len() > max_bytes as usize
+			{
+				return RecoveryFsResult::failure("content_too_large");
+			}
+			let Ok(after) = file.metadata() else {
+				return RecoveryFsResult::failure("changed_file");
+			};
+			if metadata.dev() != after.dev()
+				|| metadata.ino() != after.ino()
+				|| metadata.size() != after.size()
+				|| metadata.mtime() != after.mtime()
+				|| metadata.mtime_nsec() != after.mtime_nsec()
+				|| metadata.ctime() != after.ctime()
+				|| metadata.ctime_nsec() != after.ctime_nsec()
+			{
+				return RecoveryFsResult::failure("changed_file");
+			}
+			RecoveryFsResult {
+				ok:       true,
+				code:     None,
+				identity: Some(RecoveryFsIdentity {
+					dev:      metadata.dev().to_string(),
+					ino:      metadata.ino().to_string(),
+					nlink:    metadata.nlink().to_string(),
+					size:     metadata.size().to_string(),
+					mtime_ns: (i128::from(metadata.mtime()) * 1_000_000_000
+						+ i128::from(metadata.mtime_nsec()))
+					.to_string(),
+					ctime_ns: (i128::from(metadata.ctime()) * 1_000_000_000
+						+ i128::from(metadata.ctime_nsec()))
+					.to_string(),
+					sha256:   None,
+				}),
+				data:     Some(Uint8Array::from(data)),
+			}
+		}
+		#[cfg(not(unix))]
+		{
+			let _ = (relative_name, max_bytes);
+			RecoveryFsResult::failure("unsupported_platform")
+		}
+	}
+
+	#[napi]
+	pub fn close(&self) -> RecoveryFsResult {
+		#[cfg(unix)]
+		{
+			let Ok(mut guard) = self.root.lock() else {
+				return RecoveryFsResult::failure("closed");
+			};
+			if guard.take().is_none() {
+				return RecoveryFsResult::failure("closed");
+			}
+			RecoveryFsResult { ok: true, code: None, identity: None, data: None }
+		}
+		#[cfg(not(unix))]
+		{
+			RecoveryFsResult::failure("unsupported_platform")
+		}
+	}
+}
+
+#[napi]
+pub fn open_portable_recovery_fs_root(root_path: String) -> napi::Result<PortableRecoveryFsRoot> {
+	#[cfg(unix)]
+	{
+		use std::{
+			ffi::CString,
+			os::{fd::FromRawFd, unix::ffi::OsStrExt},
+			path::Path,
+		};
+		let root_c = CString::new(Path::new(&root_path).as_os_str().as_bytes())
+			.map_err(|_| napi::Error::from_reason("invalid_path"))?;
+		// SAFETY: root_c is live and NUL-terminated; successful ownership transfers to
+		// File.
+		let fd = unsafe {
+			libc::open(
+				root_c.as_ptr(),
+				libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+			)
+		};
+		if fd < 0 {
+			return Err(napi::Error::from_reason("untrusted_root"));
+		}
+		// SAFETY: fd is newly owned after successful open.
+		let root = unsafe { std::fs::File::from_raw_fd(fd) };
+		Ok(PortableRecoveryFsRoot { root: std::sync::Mutex::new(Some(root)) })
+	}
+	#[cfg(not(unix))]
+	{
+		let _ = root_path;
+		Err(napi::Error::from_reason("unsupported_platform"))
+	}
+}
+
 /// Bounded, path-free diagnostic evidence for one retained publication.
 #[napi(object)]
 #[derive(Clone)]

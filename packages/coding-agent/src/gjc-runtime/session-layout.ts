@@ -58,7 +58,7 @@ export function assertNonEmptyGjcSessionId(value: string | undefined, source: st
 export function assertSafePathComponent(value: string, label: string): void {
 	const trimmed = value.trim();
 	if (trimmed === "") throw new Error(`${label} is required`);
-	if (trimmed === "." || trimmed === ".." || /[/\\]/.test(trimmed)) {
+	if (trimmed === "." || trimmed === ".." || /[/\\\u0000-\u001F\u007F]/u.test(value)) {
 		throw new Error(`${label} must be a safe path component (no separators or traversal): ${value}`);
 	}
 }

@@ -4,7 +4,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 
-import { openRecoveryFsRoot } from "../native/index.js";
+import { openPortableRecoveryFsRoot, openRecoveryFsRoot } from "../native/index.js";
 
 const temporaryDirectories: string[] = [];
 
@@ -18,6 +18,26 @@ afterEach(async () => {
 	await Promise.all(
 		temporaryDirectories.splice(0).map(directory => fs.rm(directory, { recursive: true, force: true })),
 	);
+});
+
+describe.skipIf(process.platform === "win32")("portable retained recovery filesystem root", () => {
+	it("keeps reads bound to the opened directory across a pathname ABA swap", async () => {
+		const root = await temporaryDirectory();
+		const retained = `${root}-retained`;
+		await fs.writeFile(path.join(root, "receipt"), "original\n");
+		const authority = openPortableRecoveryFsRoot(root);
+		await fs.rename(root, retained);
+		await fs.mkdir(root);
+		await fs.writeFile(path.join(root, "receipt"), "forged\n");
+
+		const result = authority.read("receipt", 1024);
+		expect(result.ok).toBe(true);
+		expect(Buffer.from(result.data ?? []).toString()).toBe("original\n");
+		expect(authority.close().ok).toBe(true);
+
+		await fs.rm(root, { recursive: true, force: true });
+		await fs.rename(retained, root);
+	});
 });
 
 describe.skipIf(process.platform !== "linux")("native recovery filesystem authority", () => {

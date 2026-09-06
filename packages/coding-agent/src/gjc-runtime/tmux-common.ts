@@ -93,14 +93,15 @@ export function buildGjcTmuxExactOptionTarget(
 	sessionName: string,
 	opts: { env?: NodeJS.ProcessEnv; platform?: NodeJS.Platform; binary?: ResolvedTmuxBinary } = {},
 ): string {
+	const safeSessionName = assertSafeGjcTmuxSessionName(sessionName);
 	const binary = opts.binary ?? resolveGjcTmuxBinary({ env: opts.env, platform: opts.platform });
 	// psmux 3.3.0 rejects the tmux `=NAME` exact-session prefix for option
 	// commands ("no server running on session '=NAME'"); bare `NAME` and
 	// window-qualified `NAME:` both work. tmux 3.6a needs the
 	// window-qualified `=NAME:` to resolve the session for option
 	// commands (gajae-code#580).
-	if (binary.isPsmux) return sessionName;
-	return `=${sessionName}:`;
+	if (binary.isPsmux) return safeSessionName;
+	return `=${safeSessionName}:`;
 }
 
 /**
@@ -114,9 +115,10 @@ export function buildGjcTmuxExactSessionTarget(
 	sessionName: string,
 	opts: { env?: NodeJS.ProcessEnv; platform?: NodeJS.Platform; binary?: ResolvedTmuxBinary } = {},
 ): string {
+	const safeSessionName = assertSafeGjcTmuxSessionName(sessionName);
 	const binary = opts.binary ?? resolveGjcTmuxBinary({ env: opts.env, platform: opts.platform });
-	if (binary.isPsmux) return sessionName;
-	return `=${sessionName}`;
+	if (binary.isPsmux) return safeSessionName;
+	return `=${safeSessionName}`;
 }
 
 export const GJC_TMUX_UNTAGGED_REASON = "gjc_tmux_session_untagged";
@@ -145,6 +147,19 @@ export function sanitizeTmuxToken(value: string): string {
 	);
 }
 
+/**
+ * Validate a session name before it is embedded in a tmux target or format
+ * predicate. Keep this grammar aligned with the coordinator's safe tmux
+ * session-name boundary: names start with an alphanumeric character, contain
+ * only conservative single-component characters, and are bounded in length.
+ */
+export function assertSafeGjcTmuxSessionName(value: string): string {
+	const normalized = value.trim();
+	if (normalized !== value || !/^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/.test(value))
+		throw new Error(`gjc_tmux_session_name_unsafe:${value}`);
+	return value;
+}
+
 export function buildGjcTmuxSessionSlug(value: string): string {
 	return sanitizeTmuxToken(value);
 }
@@ -157,12 +172,14 @@ export function buildGjcTmuxSessionName(
 	env: NodeJS.ProcessEnv = process.env,
 	context: { branch?: string | null; now?: number; id?: string } = {},
 ): string {
-	const explicit = env.GJC_TMUX_SESSION?.trim();
-	if (explicit) return explicit;
+	const explicit = env.GJC_TMUX_SESSION;
+	if (explicit?.trim()) return assertSafeGjcTmuxSessionName(explicit);
 	const timestamp = (context.now ?? Date.now()).toString(36);
 	const id = context.id ?? randomTmuxSessionSuffix();
-	const branchSlug = context.branch ? `${buildGjcTmuxSessionSlug(context.branch)}_` : "";
-	return `${GJC_TMUX_SESSION_PREFIX}${branchSlug}${timestamp}_${id}`;
+	const fixed = `${GJC_TMUX_SESSION_PREFIX}${timestamp}_${id}`;
+	const branchBudget = Math.max(0, 128 - fixed.length - 1);
+	const branchSlug = context.branch ? `${buildGjcTmuxSessionSlug(context.branch).slice(0, branchBudget)}_` : "";
+	return assertSafeGjcTmuxSessionName(`${GJC_TMUX_SESSION_PREFIX}${branchSlug}${timestamp}_${id}`);
 }
 
 export function buildGjcTmuxRequiredProfileCommands(

@@ -26,7 +26,7 @@ Use GJC first for coding, review, planning, and follow-up sessions. Treat OMX as
 
 - Installed CLI: run `command -v gjc` and then launch with `gjc --tmux`.
 - Repository checkout: from the gajae-code repo, prefer `bun packages/coding-agent/src/cli.ts --tmux` when testing source changes before install.
-- Worktree isolation: for branch-specific work, either let GJC create a managed sibling worktree with `gjc --tmux --worktree <branch-like-name>` or `cd <existing-worktree-path>` and run `gjc --tmux` there. Do not pass filesystem paths to `--worktree`.
+- Worktree isolation: for branch-specific work, either let GJC create a managed repo-local worktree with `gjc --tmux --worktree <branch-like-name>` or `cd <existing-worktree-path>` and run `gjc --tmux` there. Do not pass filesystem paths to `--worktree`.
 - Name sessions explicitly with the project and issue, for example `gajae-code-93-dogfood-skill`, so tmux panes, logs, and exports remain traceable.
 
 ## Start the session

@@ -31,7 +31,6 @@ import {
 	ensureReusableNodeModulesCancellable,
 	type GjcLaunchWorktreePlan,
 	planLaunchWorktree,
-	removeOwnedLaunchWorktree,
 	WorktreePreparationTimeoutError,
 } from "../../gjc-runtime/launch-worktree";
 import { probeLinuxProcPidSync } from "../../gjc-runtime/linux-proc";
@@ -5219,9 +5218,6 @@ async function executeLifecycleResponse(
 			}
 			await reapDeadLifecycleMarkers(launch.root);
 		} catch (error) {
-			if (launch.worktreePlan && worktreeReceipt?.created && !worktreeReceipt.reused) {
-				removeOwnedLaunchWorktree(launch.worktreePlan, worktreeReceipt);
-			}
 			return mapPreparationFailure(error);
 		}
 		if (!launch.worktreePlan && timing.now() >= readinessDeadline)

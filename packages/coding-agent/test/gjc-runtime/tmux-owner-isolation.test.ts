@@ -1,10 +1,11 @@
 import { Database } from "bun:sqlite";
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, spyOn } from "bun:test";
 import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
+	__setIntentEvidenceReadHooksForTests,
 	type AttemptCapability,
 	type BootstrapRequest,
 	bootstrapTmuxOwnerIsolation,
@@ -15,6 +16,8 @@ import {
 	executeTmuxOwnerIsolationPlanSync,
 	isExactScopedBootstrapSuccessReceipt,
 	isOwnerGenerationBaselineCurrentSync,
+	isTrustedOwnerIsolationProtocolRequest,
+	isTrustedTmuxOwnerIsolationArgv,
 	isValidOwnerVerdict,
 	lifecyclePaths,
 	observeOwnerTerminal,
@@ -23,13 +26,20 @@ import {
 	parseOwnerIsolationRequest,
 	planTmuxOwnerIsolation,
 	planTmuxOwnerIsolationSync,
+	readNoFollowJson,
+	readNoFollowJsonSync,
 	replaceOwnerGeneration,
 	replaceOwnerGenerationSync,
 	TMUX_OWNER_ISOLATION_MAX_LINE_BYTES,
+	tmuxOwnerIsolationArgvSha256,
 	tmuxOwnerIsolationBootstrapArgv,
 } from "@gajae-code/coding-agent/gjc-runtime/tmux-owner-isolation";
 import {
+	classifyOwnerSessionProbe,
+	isLifecycleAdapterRegistrationValid,
 	isTmuxOwnerIsolationCliArgv,
+	isTrustedLifecycleMutationCaller,
+	runTmuxOwnerIsolationCli,
 	tmuxServerProof,
 } from "@gajae-code/coding-agent/gjc-runtime/tmux-owner-isolation-cli";
 
@@ -125,10 +135,140 @@ function holdSqliteWriteLock(databaseFile: string): Database {
 }
 
 describe("tmux owner isolation", () => {
+	it("distinguishes an absent owner session from provider probe failure", () => {
+		expect(classifyOwnerSessionProbe({ exitCode: 0, stderr: "" })).toBe(true);
+		expect(classifyOwnerSessionProbe({ exitCode: 1, stderr: "can't find session: owner" })).toBe(false);
+		expect(classifyOwnerSessionProbe({ exitCode: 1, stderr: "psmux target syntax rejected" })).toBeNull();
+		expect(classifyOwnerSessionProbe({ exitCode: 2, stderr: "transport failed" })).toBeNull();
+	});
+	it("binds a lifecycle adapter registration to its exact PID incarnation", () => {
+		expect(isLifecycleAdapterRegistrationValid("42 100\n", 42, "100")).toBe(true);
+		expect(isLifecycleAdapterRegistrationValid("42 100\n", 42, "100", false)).toBe(false);
+		expect(isLifecycleAdapterRegistrationValid("42 100\n", 43, "100")).toBe(false);
+		expect(isLifecycleAdapterRegistrationValid("42 100\n", 42, "101")).toBe(false);
+		expect(isLifecycleAdapterRegistrationValid("42 100 extra\n", 42, "100")).toBe(false);
+	});
+
+	it("rejects a self-created FIFO inherited by a CLONE_PARENT adapter", async () => {
+		if (process.platform !== "linux" || !Bun.which("cc")) return;
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-owner-clone-parent-"));
+		try {
+			const output = path.join(root, "result.txt");
+			const source = path.join(root, "clone-parent.c");
+			await Bun.write(
+				source,
+				`#define _GNU_SOURCE
+#include <dirent.h>
+#include <fcntl.h>
+#include <limits.h>
+#include <sched.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
+#include <unistd.h>
+struct child_args { int fd; const char *result; };
+static int run(void *raw) { struct child_args *args = raw; char self[64], parent[64], candidate[PATH_MAX]; struct stat expected, observed; int owned = 0; snprintf(self, sizeof(self), "/proc/self/fd/%d", args->fd); if (stat(self, &expected) != 0) _exit(5); snprintf(parent, sizeof(parent), "/proc/%d/fd", getppid()); DIR *directory = opendir(parent); if (!directory) _exit(6); struct dirent *entry; while ((entry = readdir(directory))) { snprintf(candidate, sizeof(candidate), "%s/%s", parent, entry->d_name); if (stat(candidate, &observed) == 0 && observed.st_dev == expected.st_dev && observed.st_ino == expected.st_ino) { owned = 1; break; } } closedir(directory); int out = open(args->result, O_WRONLY | O_CREAT | O_TRUNC, 0600); if (out < 0) _exit(7); write(out, owned ? "true" : "false", owned ? 4 : 5); close(out); _exit(0); }
+int main(int argc, char **argv) { int capability[2]; if (argc != 2 || pipe(capability) != 0) return 2; char *stack = malloc(1 << 20); if (!stack) return 3; struct child_args args = { capability[0], argv[1] }; pid_t pid = clone(run, stack + (1 << 20), CLONE_PARENT | SIGCHLD, &args); if (pid < 0) return 4; close(capability[0]); write(capability[1], "1 1\\n", 4); sleep(2); close(capability[1]); return 0; }
+`,
+			);
+			const helper = path.join(root, "clone-parent");
+			expect(Bun.spawnSync(["cc", "-O2", "-o", helper, source]).exitCode).toBe(0);
+			const result = Bun.spawnSync([helper, output], { stdout: "ignore", stderr: "ignore" });
+			expect(result.exitCode).toBe(0);
+			for (let attempt = 0; attempt < 100 && !(await Bun.file(output).exists()); attempt += 1) await Bun.sleep(20);
+			expect(await Bun.file(output).text()).toBe("false");
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	}, 15_000);
+
 	it("recognizes only the exact owner-isolation argv", () => {
 		expect(isTmuxOwnerIsolationCliArgv([ownerIsolationFlag])).toBe(true);
 		for (const argv of [[], [ownerIsolationFlag, "extra"], ["extra", ownerIsolationFlag], ["--other"]]) {
 			expect(isTmuxOwnerIsolationCliArgv(argv)).toBe(false);
+		}
+	});
+
+	it("rejects a spoofed protocol platform before planning", async () => {
+		const spoofedPlatform = process.platform === "linux" ? "darwin" : "linux";
+		const spoofedRequest = { ...request, platform: spoofedPlatform };
+		expect(isTrustedOwnerIsolationProtocolRequest(spoofedRequest as never)).toBe(false);
+		expect(JSON.parse(await runTmuxOwnerIsolationCli(JSON.stringify(spoofedRequest)))).toMatchObject({
+			ok: false,
+			code: "scope_unavailable",
+			diagnostic: "invalid_json_line",
+		});
+	});
+
+	it("rejects arbitrary control argv and socket selectors before probing", async () => {
+		let runnerCalls = 0;
+		const proof = await tmuxServerProof("socket", ["tmux", "-L", "other"], {
+			platform: process.platform,
+			runListSessions: () => {
+				runnerCalls += 1;
+				return { exitCode: 0, stdout: "42\towned\n", stderr: "" };
+			},
+		});
+		expect(proof).toEqual({ state: "unverifiable" });
+		expect(runnerCalls).toBe(0);
+		const arbitraryArgv = { ...request, tmux_argv: ["sh", "-c", "new-session", "-s", "owned"] };
+		expect(isTrustedOwnerIsolationProtocolRequest(arbitraryArgv as never)).toBe(false);
+		expect(JSON.parse(await runTmuxOwnerIsolationCli(JSON.stringify(arbitraryArgv)))).toMatchObject({
+			ok: false,
+			code: "scope_unavailable",
+			diagnostic: "invalid_json_line",
+		});
+	});
+
+	it("admits only the complete owner-isolation new-session grammar", () => {
+		const provider = process.env.GJC_TMUX_COMMAND?.trim() || "tmux";
+		const launchCwd = process.platform === "win32" ? "C:\\work" : "/work";
+		const validLaunchArgv = [
+			provider,
+			"-L",
+			"socket",
+			"new-session",
+			"-d",
+			"-P",
+			"-F",
+			"#{session_id}",
+			"-s",
+			"owned-session",
+			"-c",
+			launchCwd,
+			"-n",
+			"gjc",
+			"exec env GJC_SESSION_NAME='owned-session'; exec gjc",
+		] as const;
+		expect(isTrustedTmuxOwnerIsolationArgv(validLaunchArgv)).toBe(true);
+		expect(
+			isTrustedOwnerIsolationProtocolRequest({
+				...request,
+				platform: process.platform,
+				cwd: launchCwd,
+				tmux_argv: [...validLaunchArgv],
+			}),
+		).toBe(true);
+		for (const argv of [
+			[...validLaunchArgv.slice(0, 5), ...validLaunchArgv.slice(8)],
+			[...validLaunchArgv.slice(0, -1), "run-shell", "echo escaped"],
+			[...validLaunchArgv.slice(0, -1), "run-shell -b echo escaped"],
+			[...validLaunchArgv.slice(0, -1), ";", "echo escaped"],
+			[...validLaunchArgv.slice(0, 4), "-A", ...validLaunchArgv.slice(4)],
+			[...validLaunchArgv.slice(0, 4), "-f", "/tmp/tmux.conf", ...validLaunchArgv.slice(4)],
+			[...validLaunchArgv.slice(0, 8), "../unsafe", ...validLaunchArgv.slice(9)],
+		]) {
+			expect(isTrustedTmuxOwnerIsolationArgv(argv)).toBe(false);
+			expect(
+				isTrustedOwnerIsolationProtocolRequest({
+					...request,
+					platform: process.platform,
+					cwd: launchCwd,
+					tmux_argv: argv,
+				}),
+			).toBe(false);
 		}
 	});
 
@@ -207,6 +347,64 @@ describe("tmux owner isolation", () => {
 		expect(ownerProcessStartTime("linux", "malformed")).toBeNull();
 	});
 
+	it("distinguishes a lifecycle file that grows after async preflight from ENOENT", async () => {
+		const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-owner-bounded-read-"));
+		const file = path.join(state, "record.json");
+		try {
+			await fs.writeFile(file, "{}\n");
+			let grew = false;
+			__setIntentEvidenceReadHooksForTests({
+				platform: process.platform,
+				afterPathStat: async target => {
+					if (target !== file || grew) return;
+					grew = true;
+					await fs.appendFile(file, "x".repeat(TMUX_OWNER_ISOLATION_MAX_LINE_BYTES));
+				},
+			});
+			await expect(readNoFollowJson(file)).rejects.toThrow("lifecycle_record_too_large");
+			expect(grew).toBe(true);
+			await expect(readNoFollowJson(path.join(state, "missing.json"))).resolves.toBeNull();
+		} finally {
+			__setIntentEvidenceReadHooksForTests(null);
+			await fs.rm(state, { recursive: true, force: true });
+		}
+	});
+
+	it("bounds synchronous descriptor reads when a lifecycle file grows after preflight", () => {
+		const state = fsSync.mkdtempSync(path.join(os.tmpdir(), "gjc-owner-bounded-read-sync-"));
+		const file = path.join(state, "record.json");
+		try {
+			fsSync.writeFileSync(file, "{}\n");
+			const originalReadSync = fsSync.readSync;
+			let grew = false;
+			let requestedLength: number | undefined;
+			const readSpy = spyOn(fsSync, "readSync").mockImplementation(((
+				descriptor: number,
+				buffer: NodeJS.ArrayBufferView,
+				offset: number,
+				length: number,
+				position: number | null,
+			) => {
+				requestedLength = length;
+				if (!grew) {
+					grew = true;
+					fsSync.appendFileSync(file, "x".repeat(TMUX_OWNER_ISOLATION_MAX_LINE_BYTES));
+				}
+				return originalReadSync(descriptor, buffer, offset, length, position);
+			}) as never);
+			try {
+				expect(() => readNoFollowJsonSync(file)).toThrow("baseline_generation_corrupt");
+			} finally {
+				readSpy.mockRestore();
+			}
+			expect(grew).toBe(true);
+			expect(requestedLength).toBe(TMUX_OWNER_ISOLATION_MAX_LINE_BYTES + 1);
+			expect(() => readNoFollowJsonSync(path.join(state, "missing.json"))).not.toThrow();
+		} finally {
+			fsSync.rmSync(state, { recursive: true, force: true });
+		}
+	});
+
 	it.each(ownerIsolationEntries)(
 		"routes exact argv through %s as one bounded JSON line",
 		async (_entry, command) => {
@@ -224,7 +422,7 @@ describe("tmux owner isolation", () => {
 	);
 
 	it.each(ownerIsolationEntries)(
-		"publishes a generation through the canonical CAS path via %s",
+		"rejects unauthenticated generation publication via %s",
 		async (entry, command) => {
 			const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-owner-cli-generation-"));
 			const sessionId = `session-${entry.replace(/\W+/g, "-")}`;
@@ -236,30 +434,14 @@ describe("tmux owner isolation", () => {
 					session_id: sessionId,
 					owner_generation: generation,
 					state_dir: state,
+					socket_key: `socket-${sessionId}`,
 					baseline: { state: "absent" },
 				};
 				const result = await runOwnerIsolationEntry(command, `${JSON.stringify(request)}\n`);
-				expect(result.exitCode).toBe(0);
+				expect(result.exitCode).toBe(1);
 				expect(result.stderr).toBe("");
-				expect(JSON.parse(result.stdout)).toEqual({
-					schema_version: 1,
-					ok: true,
-					code: "generation_published",
-					generation,
-				});
-				expect(captureOwnerGenerationBaselineSync(state, sessionId)).toMatchObject({
-					state: "current",
-					generation,
-					session_id: sessionId,
-				});
-				const stale = await runOwnerIsolationEntry(command, `${JSON.stringify(request)}\n`);
-				expect(JSON.parse(stale.stdout)).toEqual({
-					schema_version: 1,
-					ok: false,
-					code: "scope_unavailable",
-					diagnostic: "generation_publication_failed",
-				});
-				expect(captureOwnerGenerationBaselineSync(state, sessionId)).toMatchObject({ generation });
+				expect(JSON.parse(result.stdout)).toMatchObject({ ok: false, code: "scope_unavailable" });
+				expect(captureOwnerGenerationBaselineSync(state, sessionId)).toMatchObject({ state: "absent" });
 			} finally {
 				await fs.rm(state, { recursive: true, force: true });
 			}
@@ -268,7 +450,7 @@ describe("tmux owner isolation", () => {
 	);
 
 	it.each(ownerIsolationEntries)(
-		"routes a valid bounded terminal observation through %s",
+		"rejects unauthenticated terminal observation through %s",
 		async (entry, command) => {
 			const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-owner-cli-observe-"));
 			const sessionId = `session-${entry.replace(/\W+/g, "-")}`;
@@ -290,19 +472,9 @@ describe("tmux owner isolation", () => {
 					reason: "test",
 				};
 				const result = await runOwnerIsolationEntry(command, `${JSON.stringify(request)}\n`);
-				const response = JSON.parse(result.stdout) as Record<string, unknown>;
-				expect(result.exitCode).toBe(0);
+				expect(result.exitCode).toBe(1);
 				expect(result.stderr).toBe("");
-				expect(response).toMatchObject({
-					schema_version: 1,
-					generation,
-					session_id: sessionId,
-					server_key: request.socket_key,
-					observer: "sidecar",
-					signal: "EXIT",
-					result: "cleanup",
-					classification: "non_operator_cleanup",
-				});
+				expect(JSON.parse(result.stdout)).toMatchObject({ ok: false, code: "scope_unavailable" });
 				expect(result.stdout).not.toContain(state);
 			} finally {
 				await fs.rm(state, { recursive: true, force: true });
@@ -310,6 +482,234 @@ describe("tmux owner isolation", () => {
 		},
 		20_000,
 	);
+
+	it("parses lifecycle mutations without trusting a replaceable capability file", async () => {
+		const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-owner-capability-"));
+		const sessionId = "capability-session";
+		const generation = "capability-generation";
+		try {
+			const request = {
+				schema_version: 1,
+				op: "observe_terminal",
+				session_id: sessionId,
+				owner_generation: generation,
+				state_dir: state,
+				socket_key: "socket",
+				observer: "sidecar",
+				observed_at: "2026-01-01T00:00:00.000Z",
+				signal: "EXIT",
+				exit_code: 0,
+				exit_kind: "cleanup",
+				reason: "test",
+			} as const;
+			expect(isTrustedOwnerIsolationProtocolRequest(request)).toBe(true);
+			expect(parseOwnerIsolationRequest(JSON.stringify({ ...request, auth_token: "a".repeat(64) }))).toBeNull();
+		} finally {
+			await fs.rm(state, { recursive: true, force: true });
+		}
+	});
+
+	it("admits generation publication only from the exact owner pane process", async () => {
+		const request = {
+			schema_version: 1,
+			op: "publish_generation",
+			session_id: "session",
+			owner_generation: "generation",
+			state_dir: "/state",
+			socket_key: "socket",
+			owner_native_session_id: "$1",
+			owner_pane_id: "%1",
+			owner_pid: 41,
+			owner_start_time: "15",
+			owner_server_pid: 50,
+			owner_server_start_time: "20",
+			baseline: { state: "absent" },
+		} as const;
+		const owner = {
+			pid: 41,
+			serverPid: 50,
+			nativeSessionId: "$1",
+			paneId: "%1",
+			generation: "generation",
+			serverKey: "socket",
+			sessionId: "session",
+			stateFile: "/state/runtime-state.json",
+		};
+		const probe = {
+			callerPid: 42,
+			parentPid: 41,
+			readParentPid: async () => null,
+			readChildren: async () => [42],
+			readStartTime: async (pid: number) => (pid === 41 ? "15" : "20"),
+			authorityPipeOwnedByParent: async () => true,
+			readPane: () => owner,
+			ownerSessionExists: () => true,
+		};
+		expect(await isTrustedLifecycleMutationCaller(request, probe)).toBe(true);
+		expect(
+			await isTrustedLifecycleMutationCaller(request, { ...probe, authorityPipeOwnedByParent: async () => false }),
+		).toBe(false);
+		expect(await isTrustedLifecycleMutationCaller(request, { ...probe, parentPid: 43 })).toBe(false);
+		expect(await isTrustedLifecycleMutationCaller(request, { ...probe, readChildren: async () => [40, 42] })).toBe(
+			process.platform !== "linux",
+		);
+		expect(
+			await isTrustedLifecycleMutationCaller(request, {
+				...probe,
+				readPane: () => ({ ...owner, generation: "forged" }),
+			}),
+		).toBe(false);
+		expect(
+			await isTrustedLifecycleMutationCaller(request, {
+				...probe,
+				readPane: () => ({ ...owner, nativeSessionId: "$replacement", paneId: "%replacement" }),
+			}),
+		).toBe(false);
+		expect(
+			await isTrustedLifecycleMutationCaller(request, {
+				...probe,
+				parentPid: 99,
+				readPane: () => ({ ...owner, pid: 99 }),
+				readStartTime: async pid => (pid === 99 ? "replacement" : "20"),
+			}),
+		).toBe(false);
+	});
+
+	it("rejects a child while admitting the supervisor and detached monitor", async () => {
+		const request = {
+			schema_version: 1,
+			op: "observe_terminal",
+			session_id: "session",
+			owner_generation: "generation",
+			state_dir: "/state",
+			socket_key: "socket",
+			owner_native_session_id: "$1",
+			owner_pane_id: "%1",
+			owner_pid: 41,
+			owner_start_time: "15",
+			owner_server_pid: 50,
+			owner_server_start_time: "30",
+			observer: "raw_monitor",
+			observed_at: "2026-01-01T00:00:00.000Z",
+			signal: "EXIT",
+			exit_code: 0,
+			exit_kind: "cleanup",
+			reason: "test",
+		} as const;
+		const owner = {
+			pid: 41,
+			serverPid: 50,
+			nativeSessionId: "$1",
+			paneId: "%1",
+			generation: "generation",
+			serverKey: "socket",
+			sessionId: "session",
+			stateFile: "/state/runtime-state.json",
+		};
+		const base = {
+			callerPid: 42,
+			parentPid: 41,
+			readParentPid: async () => null,
+			readChildren: async () => [40, 42],
+			readStartTime: async (pid: number) =>
+				({ 40: "10", 41: "15", 42: "20", 50: "30", 60: "25" })[pid as 40 | 41 | 42 | 50 | 60] ?? null,
+			authorityPipeOwnedByParent: async () => true,
+			readPane: (_socket: string, target: string) => (target.includes("owner-monitor") ? null : owner),
+			ownerSessionExists: () => true,
+		};
+		expect(await isTrustedLifecycleMutationCaller(request, base)).toBe(true);
+		expect(
+			await isTrustedLifecycleMutationCaller(
+				{ ...request, reason: "owner_supervisor_signal" },
+				{ ...base, readChildren: async () => [42] },
+			),
+		).toBe(process.platform !== "linux");
+		expect(
+			await isTrustedLifecycleMutationCaller(request, {
+				...base,
+				callerPid: 40,
+				readChildren: async () => [40, 42],
+				readStartTime: async (pid: number) =>
+					({ 40: "10", 41: "15", 42: "20", 50: "30", 60: "25" })[pid as 40 | 41 | 42 | 50 | 60] ?? null,
+			}),
+		).toBe(process.platform !== "linux");
+		const monitor = { ...owner, pid: 60, nativeSessionId: "$2", paneId: "%2" };
+		const monitorRequest = {
+			...request,
+			monitor_native_session_id: "$2",
+			monitor_pane_id: "%2",
+			monitor_pid: 60,
+			monitor_start_time: "25",
+		};
+		let ownerExistenceTarget = "";
+		expect(
+			await isTrustedLifecycleMutationCaller(monitorRequest, {
+				...base,
+				callerPid: 62,
+				parentPid: 61,
+				readParentPid: async pid => (({ 61: 60, 60: 1 }) as Record<number, number>)[pid] ?? null,
+				readPane: (_socket, target) => (target === "%2" ? monitor : null),
+				ownerSessionExists: (_socket, target) => {
+					ownerExistenceTarget = target;
+					return false;
+				},
+			}),
+		).toBe(true);
+		expect(ownerExistenceTarget).toBe("$1");
+		expect(
+			await isTrustedLifecycleMutationCaller(monitorRequest, {
+				...base,
+				callerPid: 62,
+				parentPid: 61,
+				readParentPid: async pid => (({ 61: 60, 60: 1 }) as Record<number, number>)[pid] ?? null,
+				readPane: (_socket, target) => (target === "%2" ? monitor : null),
+				ownerSessionExists: () => null,
+			}),
+		).toBe(false);
+		expect(
+			await isTrustedLifecycleMutationCaller(monitorRequest, {
+				...base,
+				callerPid: 62,
+				parentPid: 61,
+				readParentPid: async pid => (({ 61: 60, 60: 1 }) as Record<number, number>)[pid] ?? null,
+				readPane: (_socket, target) => (target === "%2" ? { ...monitor, generation: "forged" } : null),
+				ownerSessionExists: () => false,
+			}),
+		).toBe(false);
+		expect(
+			await isTrustedLifecycleMutationCaller(monitorRequest, {
+				...base,
+				callerPid: 62,
+				parentPid: 61,
+				readParentPid: async pid => (({ 61: 60, 60: 1 }) as Record<number, number>)[pid] ?? null,
+				readPane: (_socket, target) =>
+					target === "%2" ? { ...monitor, nativeSessionId: "$replacement", paneId: "%replacement" } : null,
+				ownerSessionExists: () => false,
+			}),
+		).toBe(false);
+		expect(
+			await isTrustedLifecycleMutationCaller(monitorRequest, {
+				...base,
+				callerPid: 62,
+				parentPid: 61,
+				readParentPid: async pid => (({ 61: 60, 60: 1 }) as Record<number, number>)[pid] ?? null,
+				readPane: (_socket, target) => (target === "%2" ? { ...monitor, serverPid: 51 } : null),
+				readStartTime: async pid => (pid === 51 ? "replacement" : pid === 60 ? "25" : "30"),
+				ownerSessionExists: () => false,
+			}),
+		).toBe(false);
+		expect(
+			await isTrustedLifecycleMutationCaller(monitorRequest, {
+				...base,
+				callerPid: 100,
+				parentPid: 99,
+				readParentPid: async pid => (({ 99: 1 }) as Record<number, number>)[pid] ?? null,
+				readPane: (_socket, target) => (target === "%2" ? { ...monitor, pid: 99 } : null),
+				readStartTime: async pid => (pid === 99 ? "replacement" : "30"),
+				ownerSessionExists: () => false,
+			}),
+		).toBe(false);
+	});
 
 	it("rejects a multi-line owner-isolation request without entering an interactive path", async () => {
 		const result = await runOwnerIsolationEntry(
@@ -460,6 +860,10 @@ describe("tmux owner isolation", () => {
 		expect(parseOwnerIsolationRequest(JSON.stringify({ ...request, tmux_argv: ["tmux", ""] }))?.op).toBe("plan");
 		expect(parseOwnerIsolationRequest(`${JSON.stringify(request)}\nextra`)).toBeNull();
 		expect(parseOwnerIsolationRequest(JSON.stringify({ ...request, extra: true }))).toBeNull();
+		expect(parseOwnerIsolationRequest(JSON.stringify({ ...request, session_id: "../escape" }))).toBeNull();
+		expect(parseOwnerIsolationRequest(JSON.stringify({ ...request, owner_generation: "..\\escape" }))).toBeNull();
+		expect(parseOwnerIsolationRequest(JSON.stringify({ ...request, state_dir: "relative/state" }))).toBeNull();
+		expect(parseOwnerIsolationRequest(JSON.stringify({ ...request, session_id: "bad\u0000id" }))).toBeNull();
 		expect(parseOwnerIsolationRequest("x".repeat(16 * 1024 + 1))).toBeNull();
 		expect(
 			await planTmuxOwnerIsolation(request, {
@@ -480,6 +884,9 @@ describe("tmux owner isolation", () => {
 		});
 		expect(scoped.ok && scoped.execution.mode).toBe("scoped");
 		expect(scoped.ok && scoped.execution.attempt_session).toBe("owned-session");
+		expect(
+			scoped.ok && scoped.execution.mode === "scoped" ? scoped.execution.attempt.tmux_argv_sha256 : undefined,
+		).toBe(tmuxOwnerIsolationArgvSha256(request.tmux_argv));
 		expect(attempts).toHaveLength(1);
 		const calls: Array<{ argv: string[]; stdin?: string }> = [];
 		const executed = executeTmuxOwnerIsolationPlanSync(scoped, {
@@ -522,6 +929,21 @@ describe("tmux owner isolation", () => {
 		expect(calls[0]?.argv).not.toContain("sh");
 		expect(calls[0]?.argv).not.toContain("-c");
 		expect(calls[0]?.argv).not.toContain(calls[0]?.stdin ?? "");
+	});
+
+	it("rejects a scoped bootstrap envelope before recording its attempt", () => {
+		const attempts: string[] = [];
+		const oversizedRequest = {
+			...request,
+			tmux_argv: [...request.tmux_argv.slice(0, -1), "x".repeat(TMUX_OWNER_ISOLATION_MAX_LINE_BYTES)],
+		};
+		const result = planTmuxOwnerIsolationSync(oversizedRequest, {
+			readCallerCgroup: () => "0::/caller.service",
+			probeServer: () => ({ state: "absent" }),
+			recordAttempt: input => attempts.push(input.attempt.token),
+		});
+		expect(result).toMatchObject({ ok: false, code: "scope_unavailable", diagnostic: "bootstrap_request_too_large" });
+		expect(attempts).toEqual([]);
 	});
 
 	it("rejects a scoped receipt when its creating server was replaced", () => {
@@ -779,6 +1201,7 @@ describe("tmux owner isolation", () => {
 			token: "token",
 			session_name: "owned",
 			socket_key: "socket",
+			tmux_argv_sha256: tmuxOwnerIsolationArgvSha256(["tmux", "new-session", "-s", "owned", "a b"]),
 			server_absent_before: true,
 			baseline: { state: "absent" as const },
 			expires_at: new Date(Date.now() + 5_000).toISOString(),
@@ -839,6 +1262,15 @@ describe("tmux owner isolation", () => {
 			token: "explicit-token",
 			session_name: "owned-explicit",
 			socket_key: "opaque socket",
+			tmux_argv_sha256: tmuxOwnerIsolationArgvSha256([
+				"tmux",
+				"-L",
+				"explicit",
+				"new-session",
+				"-s",
+				"owned-explicit",
+				"a b",
+			]),
 			server_absent_before: true,
 			baseline: { state: "absent" as const },
 			expires_at: new Date(Date.now() + 5_000).toISOString(),
@@ -931,6 +1363,131 @@ describe("tmux owner isolation", () => {
 		await fs.rm(state, { recursive: true, force: true });
 	});
 
+	it("rejects bootstrap replay when the pane command, cwd, or argv changes", async () => {
+		const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-owner-bootstrap-argv-"));
+		const sessionId = "session";
+		const generation = "generation";
+		const token = "argv-token";
+		const originalArgv = [
+			"tmux",
+			"new-session",
+			"-d",
+			"-P",
+			"-F",
+			"#{session_id}",
+			"-s",
+			"owned",
+			"-c",
+			state,
+			"-n",
+			"gjc",
+			"exec env GJC_SESSION_NAME='owned'; exec gjc",
+		];
+		try {
+			await replaceOwnerGeneration(state, sessionId, generation);
+			const root = lifecyclePaths(state, sessionId, generation).root;
+			const attempt: AttemptCapability = {
+				token,
+				session_name: "owned",
+				socket_key: "socket",
+				tmux_argv_sha256: tmuxOwnerIsolationArgvSha256(originalArgv),
+				server_absent_before: true,
+				baseline: captureOwnerGenerationBaselineSync(state, sessionId),
+				expires_at: new Date(Date.now() + 5_000).toISOString(),
+			};
+			const attemptFile = path.join(root, `attempt-${token}.json`);
+			await fs.writeFile(
+				attemptFile,
+				JSON.stringify({
+					schema_version: 1,
+					generation,
+					session_id: sessionId,
+					created_at: "2026-01-01T00:00:00.000Z",
+					...attempt,
+				}),
+			);
+
+			const alteredCwd = [...originalArgv];
+			alteredCwd[9] = path.join(state, "different-cwd");
+			const alteredArgv = [...originalArgv];
+			alteredArgv.splice(8, 0, "-x", "100");
+			const alteredRequests: Array<[string, string[]]> = [
+				["pane command", [...originalArgv.slice(0, -1), "exec env GJC_SESSION_NAME='changed'; exec gjc"]],
+				["cwd", alteredCwd],
+				["argv", alteredArgv],
+			];
+			let spawnCount = 0;
+			for (const [_label, tmux_argv] of alteredRequests) {
+				const result = await bootstrapTmuxOwnerIsolation(
+					{
+						schema_version: 1,
+						op: "bootstrap",
+						session_id: sessionId,
+						owner_generation: generation,
+						state_dir: state,
+						socket_key: "socket",
+						expected_scope: `gjc-owner-${token}.scope`,
+						tmux_argv,
+						attempt,
+					},
+					{
+						readSelfCgroup: async () => `0::/gjc-owner-${token}.scope`,
+						spawn: () => {
+							spawnCount += 1;
+							return { exitCode: 0, stdout: "$0\n" };
+						},
+						probeServer: async () => ({
+							state: "safe",
+							pid: 1,
+							startTime: "1",
+							cgroup: { classification: "safe" },
+						}),
+					},
+				);
+				expect(result).toMatchObject({
+					ok: false,
+					code: "scope_bootstrap_failed",
+				});
+				expect(await Bun.file(attemptFile).exists()).toBe(true);
+			}
+			expect(spawnCount).toBe(0);
+
+			const accepted = await bootstrapTmuxOwnerIsolation(
+				{
+					schema_version: 1,
+					op: "bootstrap",
+					session_id: sessionId,
+					owner_generation: generation,
+					state_dir: state,
+					socket_key: "socket",
+					expected_scope: `gjc-owner-${token}.scope`,
+					tmux_argv: originalArgv,
+					attempt,
+				},
+				{
+					readSelfCgroup: async () => `0::/gjc-owner-${token}.scope`,
+					spawn: argv => {
+						spawnCount += 1;
+						expect(argv).toEqual(originalArgv);
+						return { exitCode: 0, stdout: "$0\n" };
+					},
+					probeServer: async () => ({
+						state: "safe",
+						pid: 1,
+						startTime: "1",
+						cgroup: { classification: "safe" },
+					}),
+				},
+			);
+			expect(accepted).toMatchObject({ ok: true, code: "bootstrapped" });
+			expect(spawnCount).toBe(1);
+			expect(await Bun.file(attemptFile).exists()).toBe(false);
+			expect(await Bun.file(`${attemptFile}.consumed`).exists()).toBe(true);
+		} finally {
+			await fs.rm(state, { recursive: true, force: true });
+		}
+	});
+
 	it("never cleans after an unsafe or unrelated post-spawn server proof", async () => {
 		const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-owner-bootstrap-cleanup-"));
 		const sessionId = "session";
@@ -941,6 +1498,15 @@ describe("tmux owner isolation", () => {
 			token: "qualifying-token",
 			session_name: "qualifying-session",
 			socket_key: "qualifying-socket",
+			tmux_argv_sha256: tmuxOwnerIsolationArgvSha256([
+				"tmux",
+				"-L",
+				"qualifying-token",
+				"new-session",
+				"-s",
+				"qualifying-session",
+				"a b",
+			]),
 			server_absent_before: true,
 			baseline: { state: "absent" as const },
 			expires_at,
@@ -949,6 +1515,15 @@ describe("tmux owner isolation", () => {
 			token: "non-qualifying-token",
 			session_name: "non-qualifying-session",
 			socket_key: "non-qualifying-socket",
+			tmux_argv_sha256: tmuxOwnerIsolationArgvSha256([
+				"tmux",
+				"-L",
+				"non-qualifying-token",
+				"new-session",
+				"-s",
+				"non-qualifying-session",
+				"a b",
+			]),
 			server_absent_before: true,
 			baseline: { state: "absent" as const },
 			expires_at,
@@ -1026,6 +1601,7 @@ describe("tmux owner isolation", () => {
 			token: "stale-token",
 			session_name: "owned",
 			socket_key: "socket",
+			tmux_argv_sha256: tmuxOwnerIsolationArgvSha256(["tmux", "new-session", "-s", "owned"]),
 			server_absent_before: true,
 			baseline: { state: "absent" as const },
 			expires_at: new Date(Date.now() + 5_000).toISOString(),
@@ -1170,6 +1746,88 @@ describe("tmux owner isolation", () => {
 			owner_generation: generation,
 		});
 		await fs.rm(state, { recursive: true, force: true });
+	});
+
+	it("blocks retries beside a valid verdict and ignores a journal from an older dispatch", async () => {
+		const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-owner-verdict-retry-"));
+		try {
+			const generation = await replaceOwnerGeneration(state, "session", "generation");
+			const first = await createOwnerIntent(state, {
+				generation,
+				session_id: "session",
+				server_key: "socket",
+				expected_terminal: { signal: "SIGTERM", result: "owner_term_then_session_cleanup" },
+				dispatch_id: "dispatch-one",
+				created_at: "2026-01-01T00:00:00.000Z",
+				expires_at: "2099-01-01T00:00:00.000Z",
+			});
+			const paths = lifecyclePaths(state, "session", generation);
+			await fs.writeFile(
+				paths.journalFile,
+				JSON.stringify({
+					schema_version: 1,
+					intent_id: first.intent_id,
+					observation: {
+						schema_version: 1,
+						op: "observe_terminal",
+						session_id: "session",
+						owner_generation: generation,
+						state_dir: state,
+						socket_key: "socket",
+						observer: "sidecar",
+						observed_at: "2026-01-01T00:00:01.000Z",
+						signal: "SIGTERM",
+						exit_code: 0,
+						exit_kind: "exit",
+						reason: "test",
+						operator_dispatch_id: "dispatch-one",
+					},
+				}),
+			);
+			await fs.rename(paths.intentFile, `${paths.intentFile}.expired`);
+			const second = await createOwnerIntent(state, {
+				generation,
+				session_id: "session",
+				server_key: "socket",
+				expected_terminal: { signal: "SIGTERM", result: "owner_term_then_session_cleanup" },
+				dispatch_id: "dispatch-one",
+				created_at: "2026-01-01T00:00:02.000Z",
+				expires_at: "2099-01-01T00:00:00.000Z",
+			});
+			const verdict = await observeOwnerTerminal({
+				schema_version: 1,
+				op: "observe_terminal",
+				session_id: "session",
+				owner_generation: generation,
+				state_dir: state,
+				socket_key: "socket",
+				observer: "sidecar",
+				observed_at: "2026-01-01T00:00:03.000Z",
+				signal: "SIGTERM",
+				exit_code: 0,
+				exit_kind: "exit",
+				reason: "test",
+				operator_dispatch_id: "dispatch-one",
+				operator_intent_id: second.intent_id,
+			});
+			expect(verdict.classification).toBe("expected_operator_shutdown");
+			expect(verdict.intent_id).toBe(second.intent_id);
+			await expect(fs.access(`${paths.intentFile}.consumed`)).resolves.toBeNull();
+
+			await expect(
+				createOwnerIntent(state, {
+					generation,
+					session_id: "session",
+					server_key: "socket",
+					expected_terminal: { signal: "SIGTERM", result: "owner_term_then_session_cleanup" },
+					dispatch_id: "dispatch-three",
+					created_at: "2026-01-01T00:00:04.000Z",
+					expires_at: "2099-01-01T00:00:00.000Z",
+				}),
+			).rejects.toThrow("owner_intent_replay");
+		} finally {
+			await fs.rm(state, { recursive: true, force: true });
+		}
 	});
 
 	it("rejects a foreign generation while using the shared SQLite lock database", async () => {
@@ -1372,7 +2030,7 @@ describe("tmux owner isolation", () => {
 		}
 	});
 
-	it("cancels failed and expires nonauthorizing current-generation SIGTERM intents without cleanup", async () => {
+	it("retains uncertain dispatches and expires nonauthorizing current-generation intents without cleanup", async () => {
 		const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-owner-"));
 		let signals = 0;
 		let cleanups = 0;
@@ -1403,8 +2061,19 @@ describe("tmux owner isolation", () => {
 			closeExactTmuxOwner(requestFor("dispatch-failure", "2099-01-01T00:00:00.000Z"), dependencies),
 		).rejects.toThrow("dispatch_failed");
 		await expect(
-			fs.access(`${lifecyclePaths(state, "session", "dispatch-failure").intentFile}.cancelled`),
+			fs.access(`${lifecyclePaths(state, "session", "dispatch-failure").intentFile}.dispatching`),
 		).resolves.toBeNull();
+		await expect(
+			createOwnerIntent(state, {
+				generation: "dispatch-failure",
+				session_id: "session",
+				server_key: "socket",
+				expected_terminal: { signal: "SIGTERM", result: "owner_term_then_session_cleanup" },
+				dispatch_id: "retry",
+				created_at: "2026-01-01T00:00:00.000Z",
+				expires_at: "2099-01-01T00:00:00.000Z",
+			}),
+		).rejects.toThrow("owner_intent_replay");
 		await replaceOwnerGeneration(state, "session", "expired");
 		await expect(
 			closeExactTmuxOwner(requestFor("expired", "2020-01-01T00:00:00.000Z"), dependencies),
@@ -1444,7 +2113,7 @@ describe("tmux owner isolation", () => {
 				}),
 			).rejects.toThrow("owner_term_verdict_timeout");
 			await expect(
-				fs.access(`${lifecyclePaths(state, "session", generation).intentFile}.expired`),
+				fs.access(`${lifecyclePaths(state, "session", generation).intentFile}.dispatched`),
 			).resolves.toBeNull();
 		}
 		await replaceOwnerGeneration(state, "session", "replayed");
@@ -1626,6 +2295,416 @@ describe("tmux owner isolation", () => {
 			).rejects.toThrow("owner_intent_invalid");
 		} finally {
 			await fs.rm(state, { recursive: true, force: true });
+		}
+	});
+	describe("owner intent replay after a non-consuming attempt", () => {
+		const intentInput = (expiresAt: string) => ({
+			generation: "generation",
+			session_id: "session",
+			server_key: "socket",
+			expected_terminal: { signal: "SIGTERM" as const, result: "owner_term_then_session_cleanup" as const },
+			dispatch_id: "dispatch",
+			created_at: "2026-01-01T00:00:00.000Z",
+			expires_at: expiresAt,
+		});
+
+		const intentFile = (state: string) => path.join(state, "session", "owner-lifecycle", "intent-generation.json");
+
+		const futureDeadline = () => new Date(Date.now() + 600_000).toISOString();
+
+		async function seedMarker(state: string, suffix: string, expiresAt: string): Promise<string> {
+			const target = `${intentFile(state)}${suffix}`;
+			await fs.mkdir(path.dirname(target), { recursive: true });
+			await fs.writeFile(
+				target,
+				`${JSON.stringify({ schema_version: 1, intent_id: "prior", state: "pending", ...intentInput(expiresAt) })}\n`,
+			);
+			return target;
+		}
+
+		// A `.cancelled` or `.expired` marker records an attempt that never consumed the session.
+		// The intent path is keyed on the owner generation, which does not rotate while the tmux
+		// session lives, so refusing these wedged force-close forever (observed in dogfooding).
+		for (const suffix of [".cancelled", ".expired"]) {
+			it(`allows a fresh intent after a prior ${suffix} attempt and retains the record`, async () => {
+				const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-owner-intent-retry-"));
+				try {
+					const marker = await seedMarker(state, suffix, futureDeadline());
+
+					const intent = await createOwnerIntent(state, intentInput(futureDeadline()));
+
+					expect(intent.state).toBe("pending");
+					expect(intent.intent_id).not.toBe("prior");
+					expect(await Bun.file(intentFile(state)).exists()).toBe(true);
+					// The prior record is superseded, never deleted.
+					expect(await Bun.file(marker).exists()).toBe(false);
+					const retained = (await fs.readdir(path.dirname(marker))).filter(name =>
+						name.includes(`${suffix}.superseded-`),
+					);
+					expect(retained).toHaveLength(1);
+				} finally {
+					await fs.rm(state, { recursive: true, force: true });
+				}
+			});
+		}
+
+		it("does not retry after dispatch until the original observer reconciles it", async () => {
+			const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-owner-intent-dispatched-"));
+			try {
+				await replaceOwnerGeneration(state, "session", "generation");
+				const input = intentInput(new Date(Date.now() + 600_000).toISOString());
+				await expect(
+					closeExactTmuxOwner(
+						{
+							stateDir: state,
+							sessionId: "session",
+							generation: "generation",
+							serverKey: "socket",
+							pid: process.pid,
+							startTime: "start",
+							dispatchId: input.dispatch_id,
+							createdAt: input.created_at,
+							expiresAt: input.expires_at,
+						},
+						{
+							readStartTime: async () => "start",
+							sendSigterm: async () => undefined,
+							waitForVerdict: async () => null,
+							cleanupSession: async () => undefined,
+						},
+					),
+				).rejects.toThrow("owner_term_verdict_timeout");
+				const paths = lifecyclePaths(state, "session", "generation");
+				const dispatched = JSON.parse(await Bun.file(`${paths.intentFile}.dispatched`).text()) as {
+					intent_id: string;
+					dispatch_id: string;
+				};
+				const dispatchedIntentId = dispatched.intent_id;
+				expect(dispatched).toMatchObject({ intent_id: expect.any(String), dispatch_id: input.dispatch_id });
+				await expect(createOwnerIntent(state, input)).rejects.toThrow("owner_intent_replay");
+				const observation = {
+					schema_version: 1,
+					op: "observe_terminal",
+					session_id: "session",
+					owner_generation: "generation",
+					state_dir: state,
+					socket_key: "socket",
+					observer: "sidecar",
+					observed_at: new Date().toISOString(),
+					signal: "SIGTERM",
+					exit_code: 0,
+					exit_kind: "exit",
+					reason: "test",
+					operator_dispatch_id: input.dispatch_id,
+					operator_intent_id: dispatchedIntentId,
+				} as const;
+				const observed = await observeOwnerTerminal(observation);
+				expect(observed.classification).toBe("expected_operator_shutdown");
+				expect(await Bun.file(paths.intentFile).exists()).toBe(false);
+				expect(await Bun.file(`${paths.intentFile}.consumed`).exists()).toBe(true);
+			} finally {
+				await fs.rm(state, { recursive: true, force: true });
+			}
+		});
+
+		it("reconciles an intent retained across an uncertain dispatch", async () => {
+			const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-owner-intent-dispatching-"));
+			try {
+				await replaceOwnerGeneration(state, "session", "generation");
+				const intent = await createOwnerIntent(state, intentInput(futureDeadline()));
+				const paths = lifecyclePaths(state, "session", "generation");
+				await fs.writeFile(`${paths.intentFile}.dispatching`, `${JSON.stringify(intent)}\n`);
+				const observed = await observeOwnerTerminal({
+					schema_version: 1,
+					op: "observe_terminal",
+					session_id: "session",
+					owner_generation: "generation",
+					state_dir: state,
+					socket_key: "socket",
+					observer: "sidecar",
+					observed_at: new Date().toISOString(),
+					signal: "SIGTERM",
+					exit_code: 0,
+					exit_kind: "exit",
+					reason: "test",
+					operator_dispatch_id: intent.dispatch_id,
+					operator_intent_id: intent.intent_id,
+				});
+				expect(observed.classification).toBe("expected_operator_shutdown");
+				await expect(fs.access(paths.intentFile)).rejects.toThrow();
+				await expect(fs.access(`${paths.intentFile}.dispatching`)).rejects.toThrow();
+				await expect(fs.access(`${paths.intentFile}.consumed`)).resolves.toBeNull();
+			} finally {
+				await fs.rm(state, { recursive: true, force: true });
+			}
+		});
+
+		it("does not let a late observer use a retryable marker to publish owner loss", async () => {
+			const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-owner-intent-stale-observer-"));
+			try {
+				await replaceOwnerGeneration(state, "session", "generation");
+				await seedMarker(state, ".expired", futureDeadline());
+				await expect(
+					observeOwnerTerminal({
+						schema_version: 1,
+						op: "observe_terminal",
+						session_id: "session",
+						owner_generation: "generation",
+						state_dir: state,
+						socket_key: "socket",
+						observer: "sidecar",
+						observed_at: new Date().toISOString(),
+						signal: "SIGTERM",
+						exit_code: 0,
+						exit_kind: "exit",
+						reason: "test",
+						operator_dispatch_id: "dispatch",
+					}),
+				).rejects.toThrow("stale_terminal_observation");
+				await expect(fs.access(lifecyclePaths(state, "session", "generation").verdictFile)).rejects.toThrow();
+			} finally {
+				await fs.rm(state, { recursive: true, force: true });
+			}
+		});
+
+		it("rejects a malformed live intent instead of treating it as absent", async () => {
+			const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-owner-intent-malformed-"));
+			try {
+				const file = intentFile(state);
+				await fs.mkdir(path.dirname(file), { recursive: true });
+				await fs.writeFile(file, "{}\n");
+				await expect(createOwnerIntent(state, intentInput(futureDeadline()))).rejects.toThrow(
+					"owner_intent_replay",
+				);
+			} finally {
+				await fs.rm(state, { recursive: true, force: true });
+			}
+		});
+
+		it("refuses to archive a malformed retry marker", async () => {
+			const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-owner-intent-malformed-retry-"));
+			try {
+				const marker = `${intentFile(state)}.expired`;
+				await fs.mkdir(path.dirname(marker), { recursive: true });
+				await fs.writeFile(marker, "{}\n");
+				await expect(createOwnerIntent(state, intentInput(futureDeadline()))).rejects.toThrow(
+					"owner_intent_replay",
+				);
+				expect(await Bun.file(marker).exists()).toBe(true);
+				expect(await Bun.file(intentFile(state)).exists()).toBe(false);
+			} finally {
+				await fs.rm(state, { recursive: true, force: true });
+			}
+		});
+
+		it("refuses to archive a retry marker from another server", async () => {
+			const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-owner-intent-cross-server-"));
+			try {
+				const marker = `${intentFile(state)}.expired`;
+				await fs.mkdir(path.dirname(marker), { recursive: true });
+				await fs.writeFile(
+					marker,
+					`${JSON.stringify({ schema_version: 1, intent_id: "prior", state: "pending", ...intentInput(futureDeadline()), server_key: "other" })}\n`,
+				);
+				await expect(createOwnerIntent(state, intentInput(futureDeadline()))).rejects.toThrow(
+					"owner_intent_replay",
+				);
+				expect(await Bun.file(marker).exists()).toBe(true);
+				expect(await Bun.file(intentFile(state)).exists()).toBe(false);
+			} finally {
+				await fs.rm(state, { recursive: true, force: true });
+			}
+		});
+
+		it("treats a dangling blocking-marker symlink as present", async () => {
+			const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-owner-intent-symlink-"));
+			try {
+				const marker = `${intentFile(state)}.consumed`;
+				await fs.mkdir(path.dirname(marker), { recursive: true });
+				await fs.symlink("missing-intent", marker);
+				await expect(createOwnerIntent(state, intentInput(futureDeadline()))).rejects.toThrow(
+					"owner_intent_replay",
+				);
+			} finally {
+				await fs.rm(state, { recursive: true, force: true });
+			}
+		});
+
+		it("rejects a special archived marker before reading it", async () => {
+			if (process.platform === "win32") return;
+			const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-owner-intent-special-"));
+			try {
+				await replaceOwnerGeneration(state, "session", "generation");
+				const marker = `${intentFile(state)}.expired`;
+				await fs.mkdir(path.dirname(marker), { recursive: true });
+				const result = Bun.spawnSync(["mkfifo", marker]);
+				if (result.exitCode !== 0) throw new Error("mkfifo unavailable");
+				await expect(
+					observeOwnerTerminal({
+						schema_version: 1,
+						op: "observe_terminal",
+						session_id: "session",
+						owner_generation: "generation",
+						state_dir: state,
+						socket_key: "socket",
+						observer: "sidecar",
+						observed_at: new Date().toISOString(),
+						signal: "SIGTERM",
+						exit_code: 0,
+						exit_kind: "exit",
+						reason: "test",
+						operator_dispatch_id: "dispatch",
+					}),
+				).rejects.toThrow("stale_terminal_evidence_unavailable");
+			} finally {
+				await fs.rm(state, { recursive: true, force: true });
+			}
+		});
+
+		it("fails closed when a marker is replaced between inspection and open", async () => {
+			const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-owner-intent-race-"));
+			try {
+				const file = intentFile(state);
+				await fs.mkdir(path.dirname(file), { recursive: true });
+				await fs.writeFile(
+					file,
+					`${JSON.stringify({ schema_version: 1, intent_id: "prior", state: "pending", ...intentInput(futureDeadline()) })}\n`,
+				);
+				let replaced = false;
+				__setIntentEvidenceReadHooksForTests({
+					platform: "win32",
+					afterPathStat: async target => {
+						if (replaced || target !== file) return;
+						replaced = true;
+						await fs.rename(file, `${file}.target`);
+						await fs.symlink(`${file}.target`, file);
+					},
+				});
+				await expect(createOwnerIntent(state, intentInput(futureDeadline()))).rejects.toThrow(
+					"owner_intent_replay",
+				);
+				expect(replaced).toBe(true);
+			} finally {
+				__setIntentEvidenceReadHooksForTests(null);
+				await fs.rm(state, { recursive: true, force: true });
+			}
+		});
+
+		it("still refuses replay after the close was consumed", async () => {
+			const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-owner-intent-consumed-"));
+			try {
+				await seedMarker(state, ".consumed", futureDeadline());
+				await expect(createOwnerIntent(state, intentInput(futureDeadline()))).rejects.toThrow(
+					"owner_intent_replay",
+				);
+			} finally {
+				await fs.rm(state, { recursive: true, force: true });
+			}
+		});
+
+		it("still refuses replay after the generation was invalidated", async () => {
+			const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-owner-intent-invalidated-"));
+			try {
+				await seedMarker(state, ".invalidated", futureDeadline());
+				await expect(createOwnerIntent(state, intentInput(futureDeadline()))).rejects.toThrow(
+					"owner_intent_replay",
+				);
+			} finally {
+				await fs.rm(state, { recursive: true, force: true });
+			}
+		});
+
+		it("refuses replay while an unexpired dispatch is still in flight", async () => {
+			const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-owner-intent-inflight-"));
+			try {
+				await seedMarker(state, "", futureDeadline());
+				await expect(createOwnerIntent(state, intentInput(futureDeadline()))).rejects.toThrow(
+					"owner_intent_replay",
+				);
+			} finally {
+				await fs.rm(state, { recursive: true, force: true });
+			}
+		});
+
+		it("does not archive an expired pending intent from another server", async () => {
+			const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-owner-intent-pending-authority-"));
+			try {
+				const marker = await seedMarker(state, "", new Date(Date.now() - 600_000).toISOString());
+				const prior = JSON.parse(await fs.readFile(marker, "utf8")) as Record<string, unknown>;
+				prior.server_key = "other";
+				await fs.writeFile(marker, `${JSON.stringify(prior)}\n`);
+				await expect(createOwnerIntent(state, intentInput(futureDeadline()))).rejects.toThrow(
+					"owner_intent_replay",
+				);
+				expect(await Bun.file(marker).exists()).toBe(true);
+				expect(await Bun.file(intentFile(state)).exists()).toBe(true);
+			} finally {
+				await fs.rm(state, { recursive: true, force: true });
+			}
+		});
+
+		// An owner that died between publishing the intent and renaming it leaves a `pending`
+		// record that can never reach a verdict; honoring it forever is the same wedge.
+		it("supersedes an abandoned pending intent whose deadline has elapsed", async () => {
+			const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-owner-intent-abandoned-"));
+			try {
+				await seedMarker(state, "", new Date(Date.now() - 600_000).toISOString());
+
+				const intent = await createOwnerIntent(state, intentInput(futureDeadline()));
+
+				expect(intent.intent_id).not.toBe("prior");
+				const retained = (await fs.readdir(path.join(state, "session", "owner-lifecycle"))).filter(name =>
+					name.includes(".superseded-"),
+				);
+				expect(retained).toHaveLength(1);
+			} finally {
+				await fs.rm(state, { recursive: true, force: true });
+			}
+		});
+
+		// The archive rename is best-effort; if it fails and the record is still present, the
+		// guard must refuse rather than publish a second live intent for the same generation.
+		it("fails closed when a superseded record cannot be archived", async () => {
+			const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-owner-intent-readonly-"));
+			try {
+				await seedMarker(state, "", new Date(Date.now() - 600_000).toISOString());
+				const lifecycleRoot = path.join(state, "session", "owner-lifecycle");
+				await fs.chmod(lifecycleRoot, 0o500);
+				try {
+					await expect(createOwnerIntent(state, intentInput(futureDeadline()))).rejects.toThrow(
+						"owner_intent_replay",
+					);
+				} finally {
+					await fs.chmod(lifecycleRoot, 0o700);
+				}
+			} finally {
+				await fs.rm(state, { recursive: true, force: true });
+			}
+		});
+
+		// Review finding A4 (@snowykr): a retryable marker whose archive rename fails must not
+		// leave an un-superseded audit record behind while a fresh intent goes live.
+		for (const suffix of [".cancelled", ".expired"]) {
+			it(`fails closed when a ${suffix} record cannot be archived`, async () => {
+				const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-owner-intent-archive-fail-"));
+				try {
+					const marker = await seedMarker(state, suffix, futureDeadline());
+					const lifecycleRoot = path.join(state, "session", "owner-lifecycle");
+					await fs.chmod(lifecycleRoot, 0o500);
+					try {
+						await expect(createOwnerIntent(state, intentInput(futureDeadline()))).rejects.toThrow(
+							"owner_intent_replay",
+						);
+						// The original record is intact and no live intent was published.
+						expect(await Bun.file(marker).exists()).toBe(true);
+						expect(await Bun.file(intentFile(state)).exists()).toBe(false);
+					} finally {
+						await fs.chmod(lifecycleRoot, 0o700);
+					}
+				} finally {
+					await fs.rm(state, { recursive: true, force: true });
+				}
+			});
 		}
 	});
 });
