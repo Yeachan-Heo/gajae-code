@@ -322,6 +322,7 @@ export const WORKFLOW_MANIFEST: Record<CanonicalGjcWorkflowSkill, SkillManifest>
 				"record-critic-verdict",
 				"record-critic-gate-override",
 				"quality-gate",
+				"succession",
 			]),
 			...plannedVerbs(PLANNED_ADMIN_VERBS),
 		],
@@ -376,6 +377,20 @@ export const WORKFLOW_MANIFEST: Record<CanonicalGjcWorkflowSkill, SkillManifest>
 			{ name: "blockers-json", type: "string", appliesToVerbs: ["record-critic-verdict"] },
 			{ name: "goal-id", type: "string", appliesToVerbs: ["record-critic-verdict"] },
 			{ name: "classification-event-id", type: "string", appliesToVerbs: ["record-critic-verdict"] },
+			// Cross-repository succession (#5353). Requiredness varies by subcommand
+			// (`offer` needs the target/selection/authorization, `adopt` needs the
+			// offer), so these are declared optional here — matching `quality-gate`.
+			{ name: "target-repo", type: "string", appliesToVerbs: ["succession"] },
+			{ name: "goal-id", type: "string", appliesToVerbs: ["succession"] },
+			{ name: "authorize", type: "string", appliesToVerbs: ["succession"] },
+			{ name: "authorized-by", type: "string", appliesToVerbs: ["succession"] },
+			{ name: "offer", type: "string", appliesToVerbs: ["succession"] },
+			{
+				name: "gjc-goal-mode",
+				type: "enum",
+				enumValues: ["aggregate", "per-story"],
+				appliesToVerbs: ["succession"],
+			},
 			{ name: "quality-gate-json", type: "string", appliesToVerbs: ["checkpoint", "quality-gate"] },
 			{ name: "goal-id", type: "string", appliesToVerbs: ["quality-gate"] },
 			{ name: "goal-id", type: "string", appliesToVerbs: ["steer"] },
@@ -429,6 +444,7 @@ export const WORKFLOW_MANIFEST: Record<CanonicalGjcWorkflowSkill, SkillManifest>
 					"classify-blocker",
 					"record-critic-verdict",
 					"record-critic-gate-override",
+					"succession",
 				],
 			},
 			{ name: "directive-json", type: "string", appliesToVerbs: ["steer"], planned: true },

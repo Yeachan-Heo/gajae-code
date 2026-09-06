@@ -1613,6 +1613,52 @@
       },
       {
         "appliesToVerbs": [
+          "succession"
+        ],
+        "name": "target-repo",
+        "type": "string"
+      },
+      {
+        "appliesToVerbs": [
+          "succession"
+        ],
+        "name": "goal-id",
+        "type": "string"
+      },
+      {
+        "appliesToVerbs": [
+          "succession"
+        ],
+        "name": "authorize",
+        "type": "string"
+      },
+      {
+        "appliesToVerbs": [
+          "succession"
+        ],
+        "name": "authorized-by",
+        "type": "string"
+      },
+      {
+        "appliesToVerbs": [
+          "succession"
+        ],
+        "name": "offer",
+        "type": "string"
+      },
+      {
+        "appliesToVerbs": [
+          "succession"
+        ],
+        "enumValues": [
+          "aggregate",
+          "per-story"
+        ],
+        "name": "gjc-goal-mode",
+        "type": "enum"
+      },
+      {
+        "appliesToVerbs": [
           "checkpoint",
           "quality-gate"
         ],
@@ -1754,7 +1800,8 @@
           "steer",
           "classify-blocker",
           "record-critic-verdict",
-          "record-critic-gate-override"
+          "record-critic-gate-override",
+          "succession"
         ],
         "name": "json",
         "type": "boolean"
@@ -1849,6 +1896,10 @@
       },
       {
         "name": "quality-gate",
+        "surface": "command-positional"
+      },
+      {
+        "name": "succession",
         "surface": "command-positional"
       },
       {
