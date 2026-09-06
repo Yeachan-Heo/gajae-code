@@ -478,10 +478,13 @@ async function resolveVerifiedExecutable(bundlePath: string, executable: string)
 async function hasExpectedDeveloperIdSignature(bundlePath: string, command: CommandRunner): Promise<boolean> {
 	const result = await command(["/usr/bin/codesign", "--display", "--verbose=4", bundlePath]);
 	if (result.exitCode !== 0 || result.reaped === false) return false;
-	const details = `${result.stdout}\n${result.stderr}`;
+	const records = `${result.stdout}\n${result.stderr}`
+		.split(/\r?\n/)
+		.map(line => line.trim())
+		.filter(Boolean);
 	return (
-		details.includes(`Authority=${COMMUNITY_APP_SIGNING_AUTHORITY}`) &&
-		details.includes(`TeamIdentifier=${COMMUNITY_APP_TEAM_ID}`)
+		records.includes(`Authority=${COMMUNITY_APP_SIGNING_AUTHORITY} (${COMMUNITY_APP_TEAM_ID})`) &&
+		records.includes(`TeamIdentifier=${COMMUNITY_APP_TEAM_ID}`)
 	);
 }
 
@@ -521,6 +524,7 @@ async function findInstalledApp(
 		if (await isVerifiedCommunityApp(candidate, arch, command)) return candidate;
 	}
 	const result = await command(["/usr/bin/mdfind", `kMDItemCFBundleIdentifier == '${COMMUNITY_APP_BUNDLE_ID}'`]);
+	if (result.reaped === false) throw new Error("installed app discovery helper did not terminate safely");
 	if (result.exitCode !== 0) return undefined;
 	for (const candidate of result.stdout
 		.split(/\r?\n/)
@@ -581,14 +585,13 @@ export async function offerMacosCommunityApp(
 	const env = deps.env ?? process.env;
 	const log = deps.log ?? (() => undefined);
 	if (platform !== "darwin") return { status: "skipped", reason: "unsupported platform" };
-	if (env[COMMUNITY_APP_SUPPRESS_ENV] === "1" || env[COMMUNITY_APP_SUPPRESS_ENV]?.toLowerCase() === "true") {
+	if (environmentFlagEnabled(env[COMMUNITY_APP_SUPPRESS_ENV])) {
 		return { status: "skipped", reason: "suppressed by environment" };
 	}
 	if (
 		environmentFlagEnabled(env.CI) ||
 		environmentFlagEnabled(env.GITHUB_ACTIONS) ||
-		env.GJC_NONINTERACTIVE === "1" ||
-		env.GJC_NONINTERACTIVE?.toLowerCase() === "true"
+		environmentFlagEnabled(env.GJC_NONINTERACTIVE)
 	) {
 		return { status: "skipped", reason: "automation environment" };
 	}
@@ -671,6 +674,7 @@ export async function offerMacosCommunityApp(
 	let mountAttempted = false;
 	let mountState: "none" | "unknown" | "attached" = "none";
 	let installedDestination: { path: string; identity: FileIdentity } | undefined;
+	let priorDestination: { originalPath: string; backupPath: string; identity: FileIdentity } | undefined;
 	let destinationRoot: string | undefined;
 	let destinationRootIdentity: FileIdentity | undefined;
 	const throwIfInterrupted = () => {
@@ -717,15 +721,54 @@ export async function offerMacosCommunityApp(
 			!trustedReleaseAssetUrl(checksumAsset.browser_download_url, checksumAsset.name, release.tag_name!)
 		)
 			return failure("the release has no trusted DMG checksum", log);
-		const [dmgResponse, checksumResponse] = await Promise.all([
-			fetchImpl(dmg.browser_download_url, fetchOptions(ASSET_FETCH_TIMEOUT_MS)),
-			fetchImpl(checksumAsset.browser_download_url, fetchOptions(METADATA_FETCH_TIMEOUT_MS)),
-		]);
-		if (!dmgResponse.ok || !checksumResponse.ok)
+		const assetAbortController = new AbortController();
+		const assetFetchOptions = (timeoutMs: number): RequestInit => ({
+			signal: AbortSignal.any([fetchAbortSignal, assetAbortController.signal, AbortSignal.timeout(timeoutMs)]),
+		});
+		let dmgResponse: Response | undefined;
+		let checksumResponse: Response | undefined;
+		try {
+			await Promise.all([
+				fetchImpl(dmg.browser_download_url, assetFetchOptions(ASSET_FETCH_TIMEOUT_MS)).then(response => {
+					dmgResponse = response;
+				}),
+				fetchImpl(checksumAsset.browser_download_url, assetFetchOptions(METADATA_FETCH_TIMEOUT_MS)).then(
+					response => {
+						checksumResponse = response;
+					},
+				),
+			]);
+		} catch (error) {
+			assetAbortController.abort();
+			await Promise.all([
+				dmgResponse?.body?.cancel().catch(() => undefined),
+				checksumResponse?.body?.cancel().catch(() => undefined),
+			]);
+			throw error;
+		}
+		if (!dmgResponse || !checksumResponse) throw new Error("release asset fetches did not settle conclusively");
+		if (!dmgResponse.ok || !checksumResponse.ok) {
+			assetAbortController.abort();
+			await Promise.all([
+				dmgResponse.body?.cancel().catch(() => undefined),
+				checksumResponse.body?.cancel().catch(() => undefined),
+			]);
 			return failure("the canonical release assets could not be downloaded", log);
-		const expected = parseChecksum(await readResponseText(checksumResponse, MAX_CHECKSUM_BYTES), dmg.name);
+		}
+		let expected: string | undefined;
+		try {
+			expected = parseChecksum(await readResponseText(checksumResponse, MAX_CHECKSUM_BYTES), dmg.name);
+		} catch (error) {
+			assetAbortController.abort();
+			await dmgResponse.body?.cancel().catch(() => undefined);
+			throw error;
+		}
 		throwIfInterrupted();
-		if (!expected) return failure("the published checksum does not name the DMG", log);
+		if (!expected) {
+			assetAbortController.abort();
+			await dmgResponse.body?.cancel().catch(() => undefined);
+			return failure("the published checksum does not name the DMG", log);
+		}
 
 		tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-community-app-"));
 		tempRootIdentity = await fileIdentity(tempRoot);
@@ -975,14 +1018,14 @@ export async function offerMacosCommunityApp(
 				installedDestination = undefined;
 				return { status: "skipped", reason: "already installed" };
 			}
-			const removed = await removeClaimedDirectory(
-				destination,
-				currentExistingDestinationIdentity,
-				currentDestinationRoot,
-				destinationRootIdentity,
-				log,
-			);
-			if (!removed) throw new Error("the existing app bundle could not be replaced safely");
+			const backupPath = path.join(currentDestinationRoot, `.${appEntry.name}.${randomUUID()}.previous`);
+			await fs.rename(destination, backupPath);
+			if (
+				!(await sameDirectoryIdentity(currentDestinationRoot, destinationRootIdentity)) ||
+				!(await sameDirectoryIdentity(backupPath, currentExistingDestinationIdentity))
+			)
+				throw new Error("the prior app bundle identity changed during replacement staging");
+			priorDestination = { originalPath: destination, backupPath, identity: currentExistingDestinationIdentity };
 		}
 		await fs.rename(stagingDestination, destination);
 		const destinationIdentity = await fileIdentity(destination);
@@ -1003,28 +1046,17 @@ export async function offerMacosCommunityApp(
 				log,
 			);
 		}
-		if (launch.exitCode !== 0) {
-			let removed = false;
-			if (
-				tempRoot &&
-				destinationRootIdentity &&
-				(await sameDirectoryIdentity(destinationRoot, destinationRootIdentity)) &&
-				(await sameDirectoryIdentity(destination, destinationIdentity))
-			)
-				removed = await removeClaimedDirectory(
-					destination,
-					destinationIdentity,
-					destinationRoot,
-					destinationRootIdentity,
-					log,
-				);
-			installedDestination = undefined;
-			return failure(
-				removed
-					? "the verified app could not be launched; the partial app state was removed"
-					: "the verified app could not be launched; partial app state was retained for safety",
+		if (launch.exitCode !== 0) throw new Error("the verified app could not be launched");
+		if (priorDestination) {
+			const removed = await removeClaimedDirectory(
+				priorDestination.backupPath,
+				priorDestination.identity,
+				currentDestinationRoot,
+				destinationRootIdentity,
 				log,
 			);
+			if (!removed) throw new Error("the prior app bundle backup could not be removed safely");
+			priorDestination = undefined;
 		}
 		return { status: "installed", reason: destination };
 	} catch (error) {
@@ -1050,6 +1082,24 @@ export async function offerMacosCommunityApp(
 				}
 			} catch (cleanupError) {
 				log(`Optional community app cleanup warning: failed to remove partial app state: ${String(cleanupError)}`);
+			}
+		}
+		if (priorDestination && destinationRoot && destinationRootIdentity) {
+			try {
+				const destinationExists = await fs.lstat(priorDestination.originalPath).catch(() => undefined);
+				if (
+					!destinationExists &&
+					(await sameDirectoryIdentity(destinationRoot, destinationRootIdentity)) &&
+					(await sameDirectoryIdentity(priorDestination.backupPath, priorDestination.identity))
+				) {
+					await fs.rename(priorDestination.backupPath, priorDestination.originalPath);
+					if (await sameDirectoryIdentity(priorDestination.originalPath, priorDestination.identity)) {
+						partialState = "removed and prior app restored";
+						priorDestination = undefined;
+					}
+				}
+			} catch (restoreError) {
+				log(`Optional community app cleanup warning: failed to restore prior app: ${String(restoreError)}`);
 			}
 		}
 		return failure(
@@ -1124,6 +1174,13 @@ export async function resolveCommunityAppExecutableForTest(
 	executable: string,
 ): Promise<string | undefined> {
 	return resolveVerifiedExecutable(bundlePath, executable);
+}
+
+export async function hasExpectedCommunityAppSignatureForTest(
+	bundlePath: string,
+	command: CommandRunner,
+): Promise<boolean> {
+	return hasExpectedDeveloperIdSignature(bundlePath, command);
 }
 
 export async function runCommunityAppCommandForTest(
