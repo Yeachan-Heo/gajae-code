@@ -246,7 +246,12 @@ export interface CoordinatorSessionTransactionV1 {
 		scheduler_applied_revision?: number;
 		scheduler_digest?: string;
 	};
-	recovery: { prompt_watermark_at: string | null; last_repaired_at: string | null };
+	recovery: {
+		prompt_watermark_at: string | null;
+		last_repaired_at: string | null;
+		/** One-shot authority for the initial delegate prompt, consumed atomically with its claim. */
+		initial_delegate_request?: { key_digest: string; request_digest: string };
+	};
 }
 interface CoordinatorSessionHistoryV1 {
 	schema_version: 1;
@@ -1197,6 +1202,12 @@ function assertTransaction(transaction: CoordinatorSessionTransactionV1, namespa
 			(typeof projection.scheduler_digest !== "string" || projection.scheduler_digest.length === 0)) ||
 		(recovery.prompt_watermark_at !== null && !isTime(recovery.prompt_watermark_at)) ||
 		(recovery.last_repaired_at !== null && !isTime(recovery.last_repaired_at)) ||
+		(recovery.initial_delegate_request !== undefined &&
+			(!isRecord(recovery.initial_delegate_request) ||
+				typeof recovery.initial_delegate_request.key_digest !== "string" ||
+				!/^[a-f0-9]{64}$/.test(recovery.initial_delegate_request.key_digest) ||
+				typeof recovery.initial_delegate_request.request_digest !== "string" ||
+				!/^[a-f0-9]{64}$/.test(recovery.initial_delegate_request.request_digest))) ||
 		(queue.selected_promotion !== null &&
 			(!isRecord(queue.selected_promotion) ||
 				!safeId(queue.selected_promotion.from_turn_id) ||
@@ -1840,7 +1851,15 @@ export async function commitCreationWal(
 					scheduler_applied_revision: 0,
 					scheduler_digest: digest(JSON.stringify({ session_id: session.session_id, revision: 1 })),
 				},
-				recovery: { prompt_watermark_at: null, last_repaired_at: null },
+				recovery: {
+					prompt_watermark_at: null,
+					last_repaired_at: null,
+					// Only a newly created WAL may grant pre-dispatch authority. An
+					// existing WAL above must never replenish a consumed/compacted claim.
+					...(intent.kind === "delegate"
+						? { initial_delegate_request: { key_digest: keyDigest, request_digest: request.request_digest } }
+						: {}),
+				},
 			};
 			assertTransaction(transaction, session.namespace_id, session.session_id);
 			await writeAtomic(transactionPath(paths, session.session_id), transaction);
