@@ -43,8 +43,8 @@ function createContext(handle: ToolExecutionHandle): {
 		settings: { get: () => true },
 		toolOutputExpanded: false,
 		chatContainer: new Container(),
-		session: { getToolByName: vi.fn() },
-		sessionManager: { getCwd: vi.fn(() => process.cwd()) },
+		session: { getToolByName: vi.fn(), agent: { appendMessage: vi.fn() } },
+		sessionManager: { getCwd: vi.fn(() => process.cwd()), appendMessage: vi.fn() },
 	} as unknown as InteractiveModeContext;
 	return {
 		ctx,
@@ -418,9 +418,10 @@ describe("EventController viewport output revision", () => {
 			isCompacting: false,
 			isStreaming: false,
 			getLastAssistantMessage: vi.fn(() => undefined),
-			agent: { state: { messages: [] } },
+			agent: { appendMessage: vi.fn(), state: { messages: [] } },
 		} as never;
 		ctx.sessionManager = {
+			appendMessage: vi.fn(),
 			getSessionName: vi.fn(() => ""),
 			getCwd: vi.fn(() => process.cwd()),
 		} as never;

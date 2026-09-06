@@ -58,7 +58,6 @@ function makeAssistantMessage(overrides: Partial<AssistantMessage> = {}): Assist
 function createFixture(opts: {
 	streamingMessage: AssistantMessage;
 	isTtsrAbortPending?: boolean;
-	isSilentAbortPending?: boolean;
 	retryAttempt?: number;
 }) {
 	const updateContent = vi.fn();
@@ -89,10 +88,10 @@ function createFixture(opts: {
 		pendingTools: new Map(),
 		session: {
 			isTtsrAbortPending: opts.isTtsrAbortPending ?? false,
-			isSilentAbortPending: opts.isSilentAbortPending ?? false,
-			isPlanCompactAbortPending: false,
+			agent: { appendMessage: vi.fn() },
 			retryAttempt: opts.retryAttempt ?? 0,
 		},
+		sessionManager: { appendMessage: vi.fn() },
 	} as unknown as InteractiveModeContext;
 
 	const controller = new EventController(ctx);
@@ -355,7 +354,7 @@ describe("EventController #handleMessageEnd abort labeling", () => {
 
 	it("force-cancelled agent_end preserves pending silent-abort suppression", async () => {
 		const initial = makeAssistantMessage({ stopReason: "stop", content: [] });
-		const f = createFixture({ streamingMessage: initial, isSilentAbortPending: true });
+		const f = createFixture({ streamingMessage: initial });
 		f.ctx.setWorkingMessage = vi.fn();
 		const gate = Promise.withResolvers<void>();
 		const entered = Promise.withResolvers<void>();
@@ -380,7 +379,12 @@ describe("EventController #handleMessageEnd abort labeling", () => {
 			assistantMessageEvent: { type: "text_delta", contentIndex: 0 },
 		} as never);
 
-		const pending = f.controller.handleEvent({ type: "agent_end", messages: [], stopReason: "cancelled" } as never);
+		const pending = f.controller.handleEvent({
+			type: "agent_end",
+			messages: [],
+			stopReason: "cancelled",
+			silentAbort: true,
+		} as never);
 		await entered.promise;
 
 		const rendered = Bun.stripANSI(component.render(80).join("\n"));
@@ -389,6 +393,10 @@ describe("EventController #handleMessageEnd abort labeling", () => {
 		expect(rendered).not.toContain(SILENT_ABORT_MARKER);
 		expect(partial.stopReason).toBe("stop");
 		expect(partial.errorMessage).toBeUndefined();
+		expect(f.ctx.sessionManager.appendMessage).toHaveBeenCalledWith(
+			expect.objectContaining({ stopReason: "aborted", errorMessage: SILENT_ABORT_MARKER }),
+		);
+		expect(f.ctx.session.agent.appendMessage).toHaveBeenCalledTimes(1);
 		stopped = true;
 		gate.resolve();
 		await pending;

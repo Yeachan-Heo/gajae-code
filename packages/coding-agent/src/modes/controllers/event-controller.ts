@@ -27,7 +27,7 @@ import { completionNotifyDisabledByEnv } from "../../sdk/bus/config";
 import { summaryFromMessage } from "../../sdk/bus/helpers";
 import type { AgentSessionEvent } from "../../session/agent-session";
 import { type CustomMessage, isSilentAbort, readPendingDisplayTag, SILENT_ABORT_MARKER } from "../../session/messages";
-import { transferSessionMessageIdentity } from "../../session/session-manager";
+import { getSessionMessageEntryId, transferSessionMessageIdentity } from "../../session/session-manager";
 import type { ResolveToolDetails } from "../../tools/resolve";
 import { computeIrcSplitWidths, getIrcSidebarSemanticToken } from "../components/irc-sidebar";
 import type { IrcObservationRecord } from "../irc-observation-ledger";
@@ -1106,9 +1106,7 @@ export class EventController {
 			}
 			this.#cancelAssistantTextPresentation();
 			const aborted = finalMessage.stopReason === "aborted";
-			const silentAbortPending =
-				aborted && (this.ctx.session.isSilentAbortPending || this.ctx.session.isPlanCompactAbortPending);
-			if (silentAbortPending && !isSilentAbort(finalMessage.errorMessage)) {
+			if (aborted && event.silentAbort && !isSilentAbort(finalMessage.errorMessage)) {
 				finalMessage.errorMessage = SILENT_ABORT_MARKER;
 			}
 			const silentlyAborted = aborted && isSilentAbort(finalMessage.errorMessage);
@@ -1121,6 +1119,10 @@ export class EventController {
 			}
 			const displayMessage =
 				silentlyAborted || ttsrSilenced ? { ...finalMessage, stopReason: "stop" as const } : finalMessage;
+			if (!getSessionMessageEntryId(finalMessage)) {
+				this.ctx.sessionManager.appendMessage(finalMessage);
+				this.ctx.session.agent.appendMessage(finalMessage);
+			}
 			orphanComponent.updateContent(displayMessage, { streaming: false });
 			if (finalMessage.stopReason !== "aborted" && finalMessage.stopReason !== "error") {
 				for (const [toolCallId, component] of this.ctx.pendingTools.entries()) {
