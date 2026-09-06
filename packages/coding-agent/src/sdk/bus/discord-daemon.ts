@@ -2549,29 +2549,32 @@ export class DiscordNotificationDaemon {
 				return { provider: "discord", messageId: posted.id, threadId: record.threadId, status: "posted" };
 			},
 			async () => {
+				if (
+					!closing &&
+					!allowInactive &&
+					(!record.sessionId ||
+						!(await this.#bindingCurrent(
+							record.sessionId,
+							record.endpointGeneration!,
+							record.attachmentAuthorityId,
+						)))
+				)
+					return false;
 				const current = await this.#byThread(record.guildId, record.parentChannelId, record.threadId!);
-				const intent = closingIntent(record);
+				const migratedEffect = await this.#effects.read<typeof payload>(id);
+				const intent = current ? closingIntent(current) : undefined;
 				const mappingCurrent = closing
 					? !!current &&
-						intent?.nonce === closingIntent(current)?.nonce &&
+						closingIntent(record)?.nonce === intent?.nonce &&
 						current.sessionId === record.sessionId &&
 						current.endpointGeneration === record.endpointGeneration
 					: !!current &&
 						(allowInactive || current.state === "active") &&
-						current.generation === record.generation &&
 						current.endpointGeneration === record.endpointGeneration &&
-						recordAcceptsAuthority(current, payload.attachmentAuthorityId) &&
+						!!migratedEffect &&
+						recordAcceptsAuthority(current, migratedEffect.payload.attachmentAuthorityId) &&
 						(!actionPublication || current.pendingActionEffectId === id);
-				return (
-					mappingCurrent &&
-					(closing ||
-						allowInactive ||
-						(await this.#bindingCurrent(
-							record.sessionId!,
-							record.endpointGeneration!,
-							record.attachmentAuthorityId,
-						)))
-				);
+				return mappingCurrent;
 			},
 		);
 	}
