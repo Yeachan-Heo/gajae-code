@@ -26,7 +26,7 @@ import { completionNotifyDisabledByEnv } from "../../sdk/bus/config";
 import { summaryFromMessage } from "../../sdk/bus/helpers";
 import type { AgentSessionEvent } from "../../session/agent-session";
 import { type CustomMessage, isSilentAbort, readPendingDisplayTag, SILENT_ABORT_MARKER } from "../../session/messages";
-import { getSessionMessageEntryId, transferSessionMessageIdentity } from "../../session/session-manager";
+import { transferSessionMessageIdentity } from "../../session/session-manager";
 import type { ResolveToolDetails } from "../../tools/resolve";
 import { computeIrcSplitWidths, getIrcSidebarSemanticToken } from "../components/irc-sidebar";
 import type { IrcObservationRecord } from "../irc-observation-ledger";
@@ -892,7 +892,7 @@ export class EventController {
 			let errorMessage: string | undefined;
 			const aborted = this.ctx.streamingMessage.stopReason === "aborted";
 			const silentlyAborted = aborted && isSilentAbort(this.ctx.streamingMessage.errorMessage);
-			const ttsrSilenced = aborted && this.ctx.session.isTtsrAbortPending;
+			const ttsrSilenced = aborted && event.ttsrAbort === true;
 			if (aborted && !silentlyAborted && !ttsrSilenced) {
 				// Real user-cancel / network / provider abort: surface the standard
 				// operator-facing label. AgentSession.#handleAgentEvent already stamped
@@ -1109,7 +1109,7 @@ export class EventController {
 				finalMessage.errorMessage = SILENT_ABORT_MARKER;
 			}
 			const silentlyAborted = aborted && isSilentAbort(finalMessage.errorMessage);
-			const ttsrSilenced = aborted && this.ctx.session.isTtsrAbortPending;
+			const ttsrSilenced = aborted && event.ttsrAbort === true;
 			if (aborted && !silentlyAborted && !ttsrSilenced) {
 				finalMessage.errorMessage = buildAbortDisplayMessage({
 					errorMessage: finalMessage.errorMessage,
@@ -1118,10 +1118,6 @@ export class EventController {
 			}
 			const displayMessage =
 				silentlyAborted || ttsrSilenced ? { ...finalMessage, stopReason: "stop" as const } : finalMessage;
-			if (!getSessionMessageEntryId(finalMessage)) {
-				this.ctx.sessionManager.appendMessage(finalMessage);
-				this.ctx.session.agent.appendMessage(finalMessage);
-			}
 			orphanComponent.updateContent(displayMessage, { streaming: false });
 			if (finalMessage.stopReason !== "aborted" && finalMessage.stopReason !== "error") {
 				for (const [toolCallId, component] of this.ctx.pendingTools.entries()) {
