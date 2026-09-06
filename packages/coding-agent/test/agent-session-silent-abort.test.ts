@@ -240,7 +240,9 @@ describe("AgentSession silent-abort marker stamping", () => {
 	it("canonically admits an authoritative external terminal without message_end", async () => {
 		fixture = await createSessionWithObfuscator();
 		const { session } = fixture;
+		const presentationMessage = makeStoppedAssistantMessage("external partial");
 		const finalMessage = makeStoppedAssistantMessage("external final");
+		session.agent.emitExternalEvent({ type: "message_start", message: presentationMessage });
 		const terminal: Extract<AgentEvent, { type: "agent_end" }> = {
 			type: "agent_end",
 			messages: [finalMessage],
@@ -250,6 +252,7 @@ describe("AgentSession silent-abort marker stamping", () => {
 		await session.awaitSessionSettlement();
 
 		expect(getSessionMessageEntryId(finalMessage)).toBeDefined();
+		expect(getSessionMessageEntryId(presentationMessage)).toBe(getSessionMessageEntryId(finalMessage));
 		expect(session.agent.state.messages.filter(message => message === finalMessage)).toHaveLength(1);
 		expect(
 			session
@@ -262,6 +265,25 @@ describe("AgentSession silent-abort marker stamping", () => {
 		).toBe(true);
 	});
 
+	it("persists silent classification on a cancelled authoritative external terminal", async () => {
+		fixture = await createSessionWithObfuscator();
+		const { session } = fixture;
+		const finalMessage: AssistantMessage = {
+			...makeStoppedAssistantMessage("silent external final"),
+			stopReason: "aborted",
+		};
+		session.markPlanCompactAbortPending();
+		session.agent.emitExternalEvent({
+			type: "agent_end",
+			messages: [finalMessage],
+			stopReason: "cancelled",
+		});
+		await session.awaitSessionSettlement();
+
+		expect(finalMessage.errorMessage).toBe(SILENT_ABORT_MARKER);
+		expect(getSessionMessageEntryId(finalMessage)).toBeDefined();
+	});
+
 	it("does not recover a predecessor partial after a branch rotates session identity", async () => {
 		fixture = await createSessionWithObfuscator();
 		const { session } = fixture;
@@ -272,21 +294,36 @@ describe("AgentSession silent-abort marker stamping", () => {
 		};
 		const entryId = session.sessionManager.appendMessage(userMessage);
 		session.agent.appendMessage(userMessage);
+		const predecessorScope = { attemptId: "predecessor", generation: 7, lineage: "main" as const };
 		const partial = makeStoppedAssistantMessage("predecessor partial");
-		session.agent.emitExternalEvent({ type: "message_start", message: partial });
+		session.agent.emitExternalEvent({ type: "message_start", message: partial, scope: predecessorScope });
 		await Promise.resolve();
 
 		const result = await session.branch(entryId);
 		expect(result.cancelled).toBe(false);
+		const clonedScope = { ...predecessorScope };
+		const lateFinal = makeStoppedAssistantMessage("late cloned-scope final");
 		const lateTerminal: Extract<AgentEvent, { type: "agent_end" }> = {
 			type: "agent_end",
-			messages: [],
-			stopReason: "cancelled",
+			messages: [lateFinal],
+			stopReason: "completed",
+			scope: clonedScope,
 		};
 		session.agent.emitExternalEvent(lateTerminal);
-		await Bun.sleep(10);
+		const unscopedLate = makeStoppedAssistantMessage("late unscoped final");
+		session.agent.emitExternalEvent({ type: "message_start", message: unscopedLate });
+		session.agent.emitExternalEvent({
+			type: "agent_end",
+			messages: [unscopedLate],
+			stopReason: "completed",
+		});
+		await session.awaitSessionSettlement();
 
-		expect(lateTerminal.messages).toHaveLength(0);
+		expect(getSessionMessageEntryId(lateFinal)).toBeUndefined();
+		expect(getSessionMessageEntryId(unscopedLate)).toBeUndefined();
+		expect(session.agent.state.messages).not.toContain(lateFinal);
+		expect(session.agent.state.messages).not.toContain(unscopedLate);
+		expect(session.agent.state.streamMessage).toBeNull();
 		expect(
 			session
 				.buildDisplaySessionContext()
@@ -327,6 +364,12 @@ describe("AgentSession silent-abort marker stamping", () => {
 		expect((terminal as Extract<AgentSessionEvent, { type: "agent_end" }>).terminalPersistenceFailed).toBe(true);
 		expect(terminal.messages).toHaveLength(0);
 		expect(session.agent.state.messages.some(message => message === partial)).toBe(false);
+		vi.spyOn(session.sessionManager, "recoverPersistenceFailure").mockRejectedValueOnce(
+			new Error("still unreconciled"),
+		);
+		await expect(session.prompt("must remain fenced")).rejects.toMatchObject({
+			code: "session_persistence_blocked",
+		});
 	});
 
 	it("A3: flag set + non-aborted message_end does NOT consume the flag", async () => {

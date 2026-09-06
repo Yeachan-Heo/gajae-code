@@ -2707,6 +2707,7 @@ export interface DefaultFallbackRuntimeState {
 const AGENT_CONTINUE_BUSY_RESCHEDULE_BASE_DELAY_MS = 100;
 const AGENT_CONTINUE_BUSY_RESCHEDULE_MAX_DELAY_MS = 5_000;
 const AGENT_CONTINUE_BUSY_MAX_RESCHEDULES = 50;
+const MAX_RETIRED_SESSION_IDENTITY_ATTEMPT_SCOPES = 4096;
 /**
  * Maximum un-charged managed-fallback retries for escaped-non-ASCII tool-call
  * turns within one logical run. Each retry is a fresh loop with its own
@@ -7484,13 +7485,15 @@ export class AgentSession {
 	// Track last assistant message for auto-compaction check
 	#lastAssistantMessage: AssistantMessage | undefined = undefined;
 	#sessionIdentityEpoch = 0;
-	readonly #retiredSessionIdentityAttemptScopes = new WeakSet<AttemptScope>();
+	readonly #currentSessionIdentityAttemptScopeKeys = new Set<string>();
+	readonly #retiredSessionIdentityAttemptScopeKeys = new Set<string>();
+	#terminalPersistenceRecoveryMessage: AssistantMessage | undefined;
 	#provisionalAssistantMessage:
 		| {
 				message: AssistantMessage;
 				presentationMessage: AssistantMessage;
 				promptGeneration: number;
-				attemptScope: AttemptScope | undefined;
+				attemptScopeKey: string | undefined;
 				sessionIdentityEpoch: number;
 		  }
 		| undefined;
@@ -7498,6 +7501,22 @@ export class AgentSession {
 	#advanceSessionIdentityEpoch(): void {
 		this.#sessionIdentityEpoch++;
 		this.#provisionalAssistantMessage = undefined;
+	}
+
+	#attemptScopeKey(scope: AttemptScope): string {
+		return JSON.stringify([scope.lineage, scope.generation, scope.attemptId]);
+	}
+
+	#retireCurrentSessionIdentityAttemptScopes(): void {
+		for (const key of this.#currentSessionIdentityAttemptScopeKeys) {
+			this.#retiredSessionIdentityAttemptScopeKeys.add(key);
+		}
+		this.#currentSessionIdentityAttemptScopeKeys.clear();
+		while (this.#retiredSessionIdentityAttemptScopeKeys.size > MAX_RETIRED_SESSION_IDENTITY_ATTEMPT_SCOPES) {
+			const oldest = this.#retiredSessionIdentityAttemptScopeKeys.values().next().value;
+			if (oldest === undefined) break;
+			this.#retiredSessionIdentityAttemptScopeKeys.delete(oldest);
+		}
 	}
 	// Admission slot of the last message_end per assistant message, so the
 	// agent_end handler can join the terminal's canonical admission before any
@@ -7577,9 +7596,40 @@ export class AgentSession {
 		eventLease?: RunResourceProducerLease,
 	): Promise<void> => {
 		const attemptScope = (event as AgentEvent & { scope?: AttemptScope }).scope;
-		if (attemptScope && this.#retiredSessionIdentityAttemptScopes.has(attemptScope)) return;
+		const attemptScopeKey = attemptScope ? this.#attemptScopeKey(attemptScope) : undefined;
+		const discardRejectedAssistantEvent = (): void => {
+			if (
+				(event.type === "message_start" || event.type === "message_update" || event.type === "message_end") &&
+				event.message.role === "assistant"
+			) {
+				this.agent.discardRejectedAssistantEvent(event.message);
+			}
+		};
+		if (attemptScope && this.#retiredSessionIdentityAttemptScopes.has(attemptScope)) {
+			discardRejectedAssistantEvent();
+			return;
+		}
+		if (attemptScopeKey && this.#retiredSessionIdentityAttemptScopeKeys.has(attemptScopeKey)) {
+			discardRejectedAssistantEvent();
+			return;
+		}
 		const terminalSdkOwnership =
 			event.type === "agent_end" ? this.#captureSdkContinuationOwnership(attemptScope) : undefined;
+		if (attemptScopeKey) this.#currentSessionIdentityAttemptScopeKeys.add(attemptScopeKey);
+		if (
+			attemptScope === undefined &&
+			this.#sessionIdentityEpoch > 0 &&
+			((event.type === "message_start" && event.message.role === "assistant") ||
+				(event.type === "message_update" && event.message.role === "assistant") ||
+				(event.type === "message_end" && event.message.role === "assistant") ||
+				(event.type === "agent_end" &&
+					event.messages.some(
+						message => message.role === "assistant" && getSessionMessageEntryId(message) === undefined,
+					)))
+		) {
+			discardRejectedAssistantEvent();
+			return;
+		}
 		const terminalSnapshot = event as AgentEvent & { readonly silentAbort?: true; readonly ttsrAbort?: true };
 		const terminalWasAborted =
 			(event.type === "agent_end" && event.stopReason === "cancelled") ||
@@ -7597,14 +7647,14 @@ export class AgentSession {
 				message: structuredClone(event.message),
 				presentationMessage: event.message,
 				promptGeneration: this.#promptGeneration,
-				attemptScope,
+				attemptScopeKey,
 				sessionIdentityEpoch: this.#sessionIdentityEpoch,
 			};
 		} else if (
 			event.type === "message_update" &&
 			event.message.role === "assistant" &&
 			this.#provisionalAssistantMessage?.promptGeneration === this.#promptGeneration &&
-			this.#provisionalAssistantMessage.attemptScope === attemptScope &&
+			this.#provisionalAssistantMessage.attemptScopeKey === attemptScopeKey &&
 			this.#provisionalAssistantMessage.sessionIdentityEpoch === this.#sessionIdentityEpoch
 		) {
 			this.#provisionalAssistantMessage.message = structuredClone(event.message);
@@ -7613,8 +7663,8 @@ export class AgentSession {
 		const provisionalAssistant = this.#provisionalAssistantMessage;
 		const provisionalAttemptMatches =
 			provisionalAssistant !== undefined &&
-			(provisionalAssistant.attemptScope !== undefined || attemptScope !== undefined
-				? provisionalAssistant.attemptScope === attemptScope
+			(provisionalAssistant.attemptScopeKey !== undefined || attemptScopeKey !== undefined
+				? provisionalAssistant.attemptScopeKey === attemptScopeKey
 				: provisionalAssistant.promptGeneration === this.#promptGeneration);
 		const terminalAssistant =
 			event.type === "agent_end"
@@ -7815,6 +7865,13 @@ export class AgentSession {
 					stopReason: event.stopReason === "cancelled" ? "aborted" : orphanAssistant!.message.stopReason,
 					...(silentTerminal || ttsrTerminal ? { errorMessage: SILENT_ABORT_MARKER } : {}),
 				};
+				if (
+					recoveredAssistant.stopReason === "aborted" &&
+					(silentTerminal || ttsrTerminal) &&
+					recoveredAssistant.errorMessage !== SILENT_ABORT_MARKER
+				) {
+					recoveredAssistant.errorMessage = SILENT_ABORT_MARKER;
+				}
 				let persistenceFailed = false;
 				try {
 					this.sessionManager.appendMessage(recoveredAssistant);
@@ -7832,6 +7889,7 @@ export class AgentSession {
 							"session-persistence",
 						);
 						Object.defineProperty(event, "terminalPersistenceFailed", { value: true, enumerable: true });
+						this.#terminalPersistenceRecoveryMessage = recoveredAssistant;
 						persistenceFailed = true;
 					}
 				}
@@ -7839,8 +7897,10 @@ export class AgentSession {
 					if (!this.agent.state.messages.includes(recoveredAssistant))
 						this.agent.appendMessage(recoveredAssistant);
 					if (!terminalAssistant) event.messages.push(recoveredAssistant);
-					if (orphanAssistant && orphanAssistant.presentationMessage !== recoveredAssistant) {
-						transferSessionMessageIdentity([recoveredAssistant], [orphanAssistant.presentationMessage]);
+					const presentationMessage =
+						orphanAssistant?.presentationMessage ?? provisionalAssistant?.presentationMessage;
+					if (presentationMessage && presentationMessage !== recoveredAssistant) {
+						transferSessionMessageIdentity([recoveredAssistant], [presentationMessage]);
 					}
 					this.#lastAssistantMessage = recoveredAssistant;
 					this.#lastAssistantAdmissionByMessage.set(recoveredAssistant, canonicalAdmission);
@@ -8391,6 +8451,12 @@ export class AgentSession {
 
 		// Check auto-retry and auto-compaction after agent completes
 		if (event.type === "agent_end") {
+			if ((event as AgentEndSessionEvent).terminalPersistenceFailed === true) {
+				this.#lastAssistantMessage = undefined;
+				this.#lastSuccessfulYieldToolCallId = undefined;
+				this.#resolveRetry();
+				return;
+			}
 			// Cooperative mid-run maintenance interruption (issue #2035). The loop
 			// ended the run losslessly after #runMidRunMaintenance did prune/
 			// compact/promote; this handler is the SINGLE continuation owner. Resume
@@ -13820,6 +13886,7 @@ export class AgentSession {
 	async prompt(text: string, options?: PromptOptions): Promise<void> {
 		const releaseStartupPromptWaiter = this.#reserveStartupPromptWaiter();
 		try {
+			await this.#reconcileTerminalPersistenceFailure();
 			await this.#promptInternal(text, options, releaseStartupPromptWaiter);
 			// Agent-core converts listener failures into an aborted response. Keep a
 			// rejected persistence fence typed at the public prompt boundary instead
@@ -13859,6 +13926,22 @@ export class AgentSession {
 			this.#customCommands.some(c => c.command.name === commandName) ||
 			this.#mcpPromptCommands.some(c => c.command.name === commandName)
 		);
+	}
+
+	async #reconcileTerminalPersistenceFailure(): Promise<void> {
+		const message = this.#terminalPersistenceRecoveryMessage;
+		if (!message) return;
+		try {
+			await this.sessionManager.recoverPersistenceFailure();
+			this.sessionManager.appendMessage(message);
+			if (!this.agent.state.messages.includes(message)) this.agent.appendMessage(message);
+			this.#terminalPersistenceRecoveryMessage = undefined;
+		} catch (error) {
+			throw Object.assign(
+				new Error("Session persistence must be reconciled before another prompt can start.", { cause: error }),
+				{ code: "session_persistence_blocked" },
+			);
+		}
 	}
 
 	async #promptInternal(
@@ -18246,10 +18329,9 @@ export class AgentSession {
 					return false;
 				}
 			}
-			const predecessorAttemptScope = this.#activeAttemptScope;
 			if (this.isStreaming) await this.abort();
 			await this.awaitSessionSettlement();
-			if (predecessorAttemptScope) this.#retiredSessionIdentityAttemptScopes.add(predecessorAttemptScope);
+			this.#retireCurrentSessionIdentityAttemptScopes();
 
 			this.#settleTrackedQueuedInputsBeforeAgentDisconnect();
 			this.#disconnectFromAgent();
@@ -27490,10 +27572,9 @@ export class AgentSession {
 				}
 				skipConversationRestore = result?.skipConversationRestore ?? false;
 			}
-			const predecessorAttemptScope = this.#activeAttemptScope;
 			if (this.isStreaming) await this.abort();
 			await this.awaitSessionSettlement();
-			if (predecessorAttemptScope) this.#retiredSessionIdentityAttemptScopes.add(predecessorAttemptScope);
+			this.#retireCurrentSessionIdentityAttemptScopes();
 
 			this.#settleTrackedQueuedInputsBeforeAgentDisconnect();
 			this.#disconnectFromAgent();
