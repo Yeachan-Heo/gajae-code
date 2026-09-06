@@ -1576,6 +1576,11 @@ export class InteractiveMode implements InteractiveModeContext {
 				? this.streamingComponent
 				: undefined;
 		if (!component || !this.streamingMessage) return undefined;
+		if (getSessionMessageEntryId(this.streamingMessage)) {
+			this.streamingComponent = undefined;
+			this.streamingMessage = undefined;
+			return undefined;
+		}
 		// A live provider response is not persisted until message_end. Detach it before
 		// clear() so same-transcript rebuilds cannot dispose pending text-frame ownership.
 		this.chatContainer.detachChild(component);
