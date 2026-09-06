@@ -19,8 +19,22 @@ import { EventBus } from "../../utils/event-bus";
 import { installLegacyPiSpecifierShim, loadLegacyPiModule } from "../plugins/legacy-pi-compat";
 import { getAllPluginExtensionPaths } from "../plugins/loader";
 import * as TypeBox from "../typebox";
-
 import { resolvePath } from "../utils";
+import {
+	DEFAULT_EXTENSION_FUNCTION_HOOK_GRANT,
+	type FunctionHook,
+	type FunctionHookEventType,
+	type FunctionHookPayloadFor,
+	type FunctionHookRegistrationOptions,
+	intersectFunctionHookGrants,
+	normalizeFunctionHookGrant,
+	validateFunctionHookTarget,
+} from "./function-hooks";
+import {
+	tagExtensionHandlerRegistrationOrder,
+	tagFunctionHookHandler,
+	wrapExtensionHandlerRegistration,
+} from "./function-hooks-internal";
 import type {
 	Extension,
 	ExtensionAPI,
@@ -260,10 +274,46 @@ class ConcreteExtensionAPI implements ExtensionAPI {
 		private readonly cwd: string,
 		public readonly events: EventBus,
 	) {}
+	#handlerRegistrationOrder = 0;
 
 	on<F extends HandlerFn>(event: string, handler: F): void {
 		const list = this.extension.handlers.get(event) ?? [];
-		list.push(handler);
+		list.push(wrapExtensionHandlerRegistration(handler, this.#handlerRegistrationOrder++));
+		this.extension.handlers.set(event, list);
+	}
+
+	registerFunctionHook<T extends FunctionHookEventType>(
+		event: T,
+		handler: FunctionHook<FunctionHookPayloadFor<T>>,
+		options: FunctionHookRegistrationOptions = {},
+	): void {
+		if (event === "*") {
+			if (options.target !== undefined) throw new Error("Wildcard function hooks cannot declare a target");
+		} else if (options.target !== undefined) {
+			if (event !== "tool_call" && event !== "tool_result")
+				throw new Error("Function hook targets are only valid for tool_call and tool_result events");
+			validateFunctionHookTarget(options.target);
+		}
+		const grant = intersectFunctionHookGrants(
+			normalizeFunctionHookGrant(options),
+			DEFAULT_EXTENSION_FUNCTION_HOOK_GRANT,
+		);
+		const registrationOrder = this.#handlerRegistrationOrder++;
+		const registration = {
+			event,
+			...(options.target === undefined ? {} : { target: options.target }),
+			...(options.registrationId === undefined ? {} : { registrationId: options.registrationId }),
+			registrationOrder,
+			handler: handler as unknown as FunctionHook,
+			grant,
+			provenance: {
+				source: "extension" as const,
+				extensionId: this.extension.path,
+				path: this.extension.path,
+			},
+		};
+		const list = this.extension.handlers.get(event) ?? [];
+		list.push(tagExtensionHandlerRegistrationOrder(tagFunctionHookHandler(registration), registrationOrder));
 		this.extension.handlers.set(event, list);
 	}
 
@@ -658,6 +708,7 @@ async function discoverExtensionsInDir(dir: string): Promise<string[]> {
 		logger.warn("Failed to discover extensions in directory", { path: dir, error: String(err) });
 		return [];
 	}
+	entries.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
 
 	for (const entry of entries) {
 		const entryPath = path.join(dir, entry.name);

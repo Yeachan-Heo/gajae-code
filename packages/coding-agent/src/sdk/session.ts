@@ -93,10 +93,14 @@ import { CustomToolAdapter } from "../extensibility/custom-tools/wrapper";
 import {
 	createCustomToolSettings,
 	type ExtensionContext,
+	type ExtensionEvent,
 	type ExtensionFactory,
 	ExtensionRunner,
 	ExtensionToolWrapper,
 	type ExtensionUIContext,
+	type FunctionHook,
+	type FunctionHookEventType,
+	type FunctionHookResult,
 	type LoadExtensionsResult,
 	loadExtensionFromFactory,
 	type ToolDefinition,
@@ -1025,14 +1029,89 @@ export function createPluginHooksExtension(hooks: ConstrainedPluginHook[]): Exte
 			if (!normalized) throw new Error("Hook normalization invariant violated");
 			const registrationEvent = normalized.runtimeEvent;
 			const target = normalized.toolName === "*" ? undefined : normalized.toolName;
-			const handler = target
-				? (event: { toolName?: string; tool?: { name?: string }; name?: string }, ...rest: unknown[]) => {
-						const toolName = event?.toolName ?? event?.tool?.name ?? event?.name;
-						if (toolName !== target) return undefined;
-						return (hook.handler as (...a: unknown[]) => unknown)(event, ...rest);
+			if (!hook.functionHook) {
+				const legacyHandler: (...args: unknown[]) => unknown = target
+					? (event: unknown, ...rest: unknown[]) => {
+							const record = event as { toolName?: string; tool?: { name?: string }; name?: string } | undefined;
+							const toolName = record?.toolName ?? record?.tool?.name ?? record?.name;
+							if (toolName !== target) return undefined;
+							return (hook.handler as (...args: unknown[]) => unknown)(event, ...rest);
+						}
+					: (hook.handler as (...args: unknown[]) => unknown);
+				(api.on as (event: string, handler: (...args: unknown[]) => void) => void)(
+					registrationEvent,
+					legacyHandler,
+				);
+				continue;
+			}
+			const handler: FunctionHook = async (invocation, _capabilities, next) => {
+				const legacyResult = await (hook.handler as (...args: unknown[]) => unknown)(invocation.payload, undefined);
+				if (legacyResult === undefined) return await next();
+				if (invocation.eventType === "tool_call") {
+					const result = legacyResult as { block?: unknown; reason?: unknown; input?: unknown };
+					if (result.block === true) {
+						return {
+							action: "deny",
+							reason:
+								typeof result.reason === "string" ? result.reason : "Tool execution blocked by plugin hook",
+						};
 					}
-				: hook.handler;
-			(api.on as (event: string, handler: (...args: unknown[]) => unknown) => void)(registrationEvent, handler);
+					if (result.input !== undefined) {
+						return {
+							action: "continue",
+							event: { ...invocation.payload, input: result.input as Record<string, unknown> } as ExtensionEvent,
+						} as FunctionHookResult;
+					}
+				}
+				if (invocation.eventType === "tool_result") {
+					const result = legacyResult as { content?: unknown; details?: unknown; isError?: unknown };
+					if (result.content !== undefined || result.details !== undefined || result.isError !== undefined) {
+						return {
+							action: "continue",
+							event: {
+								...invocation.payload,
+								...(result.content === undefined ? {} : { content: result.content }),
+								...(result.details === undefined ? {} : { details: result.details }),
+								...(result.isError === undefined ? {} : { isError: result.isError }),
+							},
+						} as FunctionHookResult;
+					}
+				}
+				if (invocation.eventType === "context" && (legacyResult as { messages?: unknown }).messages !== undefined) {
+					return {
+						action: "continue",
+						event: {
+							...invocation.payload,
+							messages: (legacyResult as { messages: unknown }).messages,
+						} as ExtensionEvent,
+					} as FunctionHookResult;
+				}
+				if (
+					invocation.eventType.startsWith("session_before_") &&
+					(legacyResult as { cancel?: unknown }).cancel === true
+				) {
+					return { action: "deny", reason: "Session change blocked by plugin hook" };
+				}
+				if (invocation.eventType === "before_agent_start") {
+					const result = legacyResult as { message?: unknown; systemPrompt?: unknown };
+					if (result.message !== undefined || result.systemPrompt !== undefined) {
+						return {
+							action: "return",
+							value: {
+								...(result.message === undefined ? {} : { messages: [result.message] }),
+								...(result.systemPrompt === undefined ? {} : { systemPrompt: result.systemPrompt }),
+							},
+						} as FunctionHookResult;
+					}
+				}
+				return await next();
+			};
+			const options = {
+				...(target === undefined ? {} : { target }),
+				registrationId: hook.extensionId,
+				...(hook.grant ?? {}),
+			};
+			api.registerFunctionHook(registrationEvent as FunctionHookEventType, handler, options);
 		}
 	};
 }
@@ -2994,7 +3073,14 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				cwdCapturingToolNames.push(...pluginToolResult.tools.map(tool => tool.name));
 			}
 			for (const q of pluginToolResult.quarantine) {
-				gjcFindings.add({ identity: q.identity, surfaceId: q.surfaceId, code: q.code, message: q.message });
+				gjcFindings.add({
+					identity: q.identity,
+					surfaceId: q.surfaceId,
+					code: q.code,
+					message: q.message,
+					decision: "quarantined",
+					provenance: { source: "plugin-bundle", plugin: q.plugin },
+				});
 				logger.warn("Quarantined GJC plugin surface", { plugin: q.plugin, surface: q.surfaceId, code: q.code });
 			}
 		} catch (error) {
@@ -3084,7 +3170,14 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			try {
 				const { configs, quarantine } = await buildPluginMcpConfigs({ cwd });
 				for (const q of quarantine) {
-					gjcFindings.add({ identity: q.identity, surfaceId: q.surfaceId, code: q.code, message: q.message });
+					gjcFindings.add({
+						identity: q.identity,
+						surfaceId: q.surfaceId,
+						code: q.code,
+						message: q.message,
+						decision: "quarantined",
+						provenance: { source: "plugin-bundle", plugin: q.plugin },
+					});
 					logger.warn("Quarantined GJC plugin MCP", { plugin: q.plugin, surface: q.surfaceId, code: q.code });
 				}
 				const pluginNames = new Set(Object.keys(configs));
@@ -3229,12 +3322,22 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		// Always-on constrained plugin hooks (validated registry surfaces). Additive
 		// and a no-op without installed plugins; the loader denies all dangerous APIs.
 		try {
-			const pluginHookResult = await loadConstrainedPluginHooks({ cwd });
+			const pluginHookResult = await loadConstrainedPluginHooks({
+				cwd,
+				activationGeneration: gjcActivationGeneration,
+			});
 			if (pluginHookResult.hooks.length > 0) {
 				inlineExtensions.push(createPluginHooksExtension(pluginHookResult.hooks));
 			}
 			for (const q of pluginHookResult.quarantine) {
-				gjcFindings.add({ identity: q.identity, surfaceId: q.surfaceId, code: q.code, message: q.message });
+				gjcFindings.add({
+					identity: q.identity,
+					surfaceId: q.surfaceId,
+					code: q.code,
+					message: q.message,
+					decision: "quarantined",
+					provenance: { source: "plugin-bundle", plugin: q.plugin },
+				});
 				logger.warn("Quarantined GJC plugin hook", { plugin: q.plugin, surface: q.surfaceId, code: q.code });
 			}
 		} catch (error) {
@@ -3794,7 +3897,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		} else if (!toolRegistry.has("resolve")) {
 			const resolveTool = await logger.time("createTools:resolve:session", HIDDEN_TOOLS.resolve, toolSession);
 			if (resolveTool) {
-				const wrappedResolveTool = wrapToolWithMetaNotice(resolveTool);
+				const resolveWithNotice = wrapToolWithMetaNotice(resolveTool);
+				const wrappedResolveTool = extensionRunner
+					? (new ExtensionToolWrapper(resolveWithNotice, extensionRunner) as AgentTool)
+					: resolveWithNotice;
 				builtinCandidateTools.push(wrappedResolveTool);
 				toolRegistry.set(wrappedResolveTool.name, wrappedResolveTool);
 				builtinToolIdentities.add(wrappedResolveTool);
@@ -4206,21 +4312,21 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			if (!obfuscator?.hasSecrets() || !obfuscateMessagesFn) return converted;
 			return obfuscateMessagesFn(obfuscator, converted);
 		};
-		const transformContext = async (messages: AgentMessage[], _signal?: AbortSignal, scope?: AttemptScopeRef) => {
+		const transformContext = async (messages: AgentMessage[], signal?: AbortSignal, scope?: AttemptScopeRef) => {
 			// External Agent events dispatch listeners without awaiting them. The
 			// session-owned barrier makes any pre-admission artifact transformation
 			// visible before this provider context is normalized.
 			await session?.awaitPendingContextTransformations();
-			return extensionRunner ? await extensionRunner.emitContext(messages, scope) : messages;
+			return extensionRunner ? await extensionRunner.emitContext(messages, scope, signal) : messages;
 		};
 		const onPayload = extensionRunner
-			? async (payload: unknown, _model?: Model, scope?: AttemptScopeRef) => {
-					return await extensionRunner.emitBeforeProviderRequest(payload, scope);
+			? async (payload: unknown, _model?: Model, scope?: AttemptScopeRef, signal?: AbortSignal) => {
+					return await extensionRunner.emitBeforeProviderRequest(payload, scope, signal);
 				}
 			: undefined;
 		const onResponse: SimpleStreamOptions["onResponse"] | undefined = extensionRunner
-			? async (response, model, scope) => {
-					await extensionRunner.emitAfterProviderResponse(response, model, scope);
+			? async (response, model, scope, signal) => {
+					await extensionRunner.emitAfterProviderResponse(response, model, scope, signal);
 				}
 			: undefined;
 

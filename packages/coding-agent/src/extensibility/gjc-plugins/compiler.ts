@@ -3,6 +3,7 @@ import * as nodeFs from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { parseFrontmatter, pathIsWithin } from "@gajae-code/utils";
+import { functionHookGrantHash, normalizeFunctionHookGrant } from "../extensions/function-hooks";
 import { classifyStdioInvocation } from "./mcp-policy";
 import { canonicalizeJsonSchema, extractDeclaredToolSchema, schemaHash } from "./metadata";
 import { resolveWithinRoot } from "./paths";
@@ -447,7 +448,16 @@ export async function compileGjcPluginBundle(root: string): Promise<NormalizedGj
 				`GJC plugin hook "${hook.name}": tool_result requires the after phase`,
 			);
 		}
-		hooks.push({
+		const grant = normalizeFunctionHookGrant({
+			capabilities: hook.capabilities,
+			networkDestinations: hook.networkDestinations,
+			filesystemRoots: hook.filesystemRoots,
+		});
+		const functionHook =
+			hook.capabilities !== undefined ||
+			hook.networkDestinations !== undefined ||
+			hook.filesystemRoots !== undefined;
+		const normalizedHook: NormalizedHookSurface = {
 			extensionId: surfaceIds.hook(hook.event, hook.phase, hook.target, hook.name),
 			name: hook.name,
 			event: hook.event,
@@ -456,7 +466,15 @@ export async function compileGjcPluginBundle(root: string): Promise<NormalizedGj
 			relativePath: hook.path,
 			sha256: digest,
 			implementationHash: digest,
-		});
+		};
+		if (functionHook) {
+			normalizedHook.capabilities = [...grant.capabilities];
+			normalizedHook.networkDestinations = [...grant.networkDestinations];
+			normalizedHook.filesystemRoots = [...grant.filesystemRoots];
+			normalizedHook.capabilityHash = functionHookGrantHash(grant);
+			normalizedHook.functionHook = true;
+		}
+		hooks.push(normalizedHook);
 	}
 
 	const mcps: NormalizedMcpSurface[] = [];

@@ -1,3 +1,4 @@
+import { redactCrashSecrets } from "@gajae-code/utils";
 import { identityEquals, identityKey } from "./lifecycle-reconciliation";
 import type { GjcBundleIdentity, GjcRuntimeFinding, GjcRuntimeSnapshot, GjcRuntimeSnapshotState } from "./types";
 
@@ -28,7 +29,11 @@ export class GjcRuntimeFindingAccumulator {
 	constructor(readonly generation: number) {}
 
 	add(finding: GjcRuntimeFinding): void {
-		this.findings.push(finding);
+		this.findings.push({
+			...finding,
+			message: redactCrashSecrets(finding.message.replace(/[\u0000-\u001f\u007f-\u009f]/gu, "?")).slice(0, 2048),
+			generation: this.generation,
+		});
 	}
 
 	addAll(findings: readonly GjcRuntimeFinding[]): void {
@@ -40,7 +45,20 @@ export class GjcRuntimeFindingAccumulator {
 		const seen = new Set<string>();
 		const unique: GjcRuntimeFinding[] = [];
 		for (const finding of this.findings) {
-			const key = [identityKey(finding.identity), finding.surfaceId, finding.code, finding.message].join("\u0000");
+			const key = [
+				identityKey(finding.identity),
+				finding.surfaceId,
+				finding.code,
+				finding.message,
+				finding.decision ?? "",
+				finding.event ?? "",
+				finding.phase ?? "",
+				JSON.stringify(finding.requestedCapabilities ?? []),
+				JSON.stringify(finding.effectiveCapabilities ?? []),
+				finding.capabilityHash ?? "",
+				JSON.stringify(finding.provenance ?? {}),
+				JSON.stringify(finding.audit ?? {}),
+			].join("\u0000");
 			if (seen.has(key)) continue;
 			seen.add(key);
 			unique.push(finding);

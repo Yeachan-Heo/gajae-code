@@ -1,17 +1,19 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
 import { Agent, type AgentMessage } from "@gajae-code/agent-core";
-import { getBundledModel, type Message } from "@gajae-code/ai";
+import { type Context, getBundledModel, type Message } from "@gajae-code/ai";
 import { inferCopilotInitiator } from "@gajae-code/ai/providers/github-copilot-headers";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
-import type { ExtensionRunner } from "@gajae-code/coding-agent/extensibility/extensions";
 import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { convertToLlm } from "@gajae-code/coding-agent/session/messages";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { TempDir } from "@gajae-code/utils";
+import { ExtensionRuntime, loadExtensionFromFactory } from "../src/extensibility/extensions/loader";
+import { ExtensionRunner } from "../src/extensibility/extensions/runner";
+import { EventBus } from "../src/utils/event-bus";
 
 describe("AgentSession before_agent_start attribution fallback", () => {
 	let tempDir: TempDir;
@@ -38,8 +40,8 @@ describe("AgentSession before_agent_start attribution fallback", () => {
 		tempDir.removeSync();
 	});
 
-	function createSession() {
-		const emitBeforeAgentStart = vi.fn().mockResolvedValue({
+	function createSession(
+		beforeAgentStartResult: Record<string, unknown> = {
 			messages: [
 				{
 					customType: "before-start",
@@ -47,7 +49,10 @@ describe("AgentSession before_agent_start attribution fallback", () => {
 					display: false,
 				},
 			],
-		});
+		},
+		capturedContexts?: Context[],
+	) {
+		const emitBeforeAgentStart = vi.fn().mockResolvedValue(beforeAgentStartResult);
 		const extensionRunner = {
 			emitBeforeAgentStart,
 			emit: vi.fn().mockResolvedValue(undefined),
@@ -57,15 +62,20 @@ describe("AgentSession before_agent_start attribution fallback", () => {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
 		if (!model) throw new Error("Expected claude-sonnet-4-5 model to exist");
 
+		const mockModel = createMockModel({ responses: [{ content: ["Done"] }] });
 		const agent = new Agent({
 			getApiKey: () => "test-key",
+			convertToLlm,
 			initialState: {
 				model,
 				systemPrompt: ["Test"],
 				tools: [],
 				messages: [],
 			},
-			streamFn: createMockModel({ responses: [{ content: ["Done"] }] }).stream,
+			streamFn: (streamModel, context, streamOptions) => {
+				capturedContexts?.push(structuredClone(context));
+				return mockModel.stream(streamModel, context, streamOptions);
+			},
 		});
 
 		session = new AgentSession({
@@ -91,13 +101,16 @@ describe("AgentSession before_agent_start attribution fallback", () => {
 		});
 	}
 
-	function findPromptMessage(messages: AgentMessage[], text: string): AgentMessage | undefined {
+	function findPromptMessage(
+		messages: AgentMessage[],
+		text: string,
+	): Extract<AgentMessage, { role: "user" | "developer" }> | undefined {
 		return messages.find(message => {
 			if ((message.role !== "user" && message.role !== "developer") || typeof message.content === "string") {
 				return false;
 			}
 			return message.content.some(block => block.type === "text" && block.text === text);
-		});
+		}) as Extract<AgentMessage, { role: "user" | "developer" }> | undefined;
 	}
 	it("defaults before_agent_start message attribution to user for user prompts", async () => {
 		const { emitBeforeAgentStart } = createSession();
@@ -119,6 +132,124 @@ describe("AgentSession before_agent_start attribution fallback", () => {
 		}
 		expect(llmInjected.attribution).toBe("user");
 		expect(inferCopilotInitiator(llmMessages)).toBe("user");
+	});
+
+	it("submits Function Hook prompt and image transformations to the model", async () => {
+		const contexts: Context[] = [];
+		createSession({ prompt: "redacted prompt", images: [], systemPrompt: ["redacted system"] }, contexts);
+
+		await session.prompt("secret prompt", {
+			images: [{ type: "image", data: "secret-image", mimeType: "image/png" }],
+		});
+
+		const submitted = contexts[0];
+		expect(submitted?.systemPrompt).toEqual(["redacted system"]);
+		const user = submitted ? findPromptMessage(submitted.messages, "redacted prompt") : undefined;
+		expect(user?.content).toEqual([{ type: "text", text: "redacted prompt" }]);
+	});
+
+	it("submits public Function Hook transformations with and without a legacy handler", async () => {
+		for (const withLegacy of [false, true]) {
+			const contexts: Context[] = [];
+			const runtime = new ExtensionRuntime();
+			const eventBus = new EventBus();
+			const sessionManager = SessionManager.inMemory(tempDir.path());
+			const extension = await loadExtensionFromFactory(
+				api => {
+					api.registerFunctionHook(
+						"before_agent_start",
+						async invocation => ({
+							action: "continue",
+							event: {
+								...invocation.payload,
+								prompt: "public redacted prompt",
+								images: undefined,
+								systemPrompt: ["function system"],
+							},
+						}),
+						{ capabilities: ["ui.transform"] },
+					);
+					if (withLegacy) {
+						api.on("before_agent_start", event => ({
+							systemPrompt: [...event.systemPrompt, "legacy system"],
+						}));
+					}
+				},
+				tempDir.path(),
+				eventBus,
+				runtime,
+				"public-function-hook",
+			);
+			const extensionRunner = new ExtensionRunner(
+				[extension],
+				runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+			if (!model) throw new Error("Expected claude-sonnet-4-5 model to exist");
+			const mockModel = createMockModel({ responses: [{ content: ["Done"] }] });
+			const agent = new Agent({
+				getApiKey: () => "test-key",
+				convertToLlm,
+				initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+				streamFn: (streamModel, context, streamOptions) => {
+					contexts.push(structuredClone(context));
+					return mockModel.stream(streamModel, context, streamOptions);
+				},
+			});
+			session = new AgentSession({
+				agent,
+				sessionManager,
+				settings: Settings.isolated({ "compaction.enabled": false }),
+				modelRegistry,
+				extensionRunner,
+			});
+
+			await session.prompt("public secret", {
+				images: [{ type: "image", data: "secret-image", mimeType: "image/png" }],
+			});
+
+			expect(contexts[0]?.systemPrompt).toEqual(
+				withLegacy ? ["function system", "legacy system"] : ["function system"],
+			);
+			const user = contexts[0] ? findPromptMessage(contexts[0].messages, "public redacted prompt") : undefined;
+			expect(user?.content).toEqual([{ type: "text", text: "public redacted prompt" }]);
+		}
+	});
+
+	it("submits transformed custom prompt content", async () => {
+		const contexts: Context[] = [];
+		createSession({ prompt: "transformed custom" }, contexts);
+
+		await session.promptCustomMessage({
+			customType: "function-hook-test",
+			content: [
+				{ type: "text", text: "custom secret" },
+				{ type: "image", data: "custom-image", mimeType: "image/png" },
+			],
+			display: false,
+			attribution: "user",
+		});
+
+		const submitted = JSON.stringify(contexts);
+		expect(submitted).toContain("transformed custom");
+		expect(submitted).toContain("custom-image");
+		expect(submitted).not.toContain("custom secret");
+	});
+
+	it("does not expand file mentions removed by a prompt transformation", async () => {
+		const contexts: Context[] = [];
+		const mentionedPath = tempDir.join("function-hook-secret.txt");
+		await Bun.write(mentionedPath, "FUNCTION_HOOK_FILE_SECRET");
+		createSession({ prompt: "safe prompt", images: [] }, contexts);
+
+		await session.prompt(`inspect @${mentionedPath}`);
+
+		const submitted = JSON.stringify(contexts[0]);
+		expect(submitted).not.toContain("FUNCTION_HOOK_FILE_SECRET");
+		expect(submitted).not.toContain(mentionedPath);
 	});
 
 	it("defaults before_agent_start message attribution to agent for synthetic prompts", async () => {

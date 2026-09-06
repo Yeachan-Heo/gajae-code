@@ -1,5 +1,6 @@
 import type { CanonicalGjcWorkflowSkill } from "../../skill-state/active-state";
 import { CANONICAL_GJC_WORKFLOW_SKILLS } from "../../skill-state/active-state";
+import type { FunctionHookCapability } from "../extensions/function-hooks";
 
 export const GJC_PLUGIN_MANIFEST_FILENAME = "gajae-plugin.json";
 export const GJC_PLUGIN_KIND = "gajae-code-plugin";
@@ -48,6 +49,10 @@ export interface GjcPluginHookManifestEntry {
 	phase?: "before" | "after";
 	path: string;
 	sha256?: string;
+	/** Requested capability families; the runtime never grants more than declared. */
+	capabilities?: FunctionHookCapability[];
+	networkDestinations?: string[];
+	filesystemRoots?: string[];
 }
 
 export type GjcPluginMcpTransport = "stdio" | "http" | "sse";
@@ -290,6 +295,11 @@ export interface NormalizedHookSurface {
 	relativePath: string;
 	sha256: string;
 	implementationHash?: string;
+	capabilities?: FunctionHookCapability[];
+	networkDestinations?: string[];
+	filesystemRoots?: string[];
+	capabilityHash?: string;
+	functionHook?: boolean;
 }
 
 export interface NormalizedMcpSurface {
@@ -522,6 +532,21 @@ export interface GjcRuntimeFinding {
 	surfaceId: string;
 	code: GjcPluginLoadErrorCode;
 	message: string;
+	decision?: "loaded" | "quarantined" | "blocked" | "error";
+	event?: string;
+	phase?: "before" | "after";
+	requestedCapabilities?: readonly FunctionHookCapability[];
+	effectiveCapabilities?: readonly FunctionHookCapability[];
+	capabilityHash?: string;
+	provenance?: {
+		source: "builtin" | "user" | "project" | "extension" | "plugin-bundle";
+		scope?: "user" | "project" | "native";
+		plugin?: string;
+		path?: string;
+		extensionId?: string;
+	};
+	audit?: Record<string, unknown>;
+	generation?: number;
 }
 
 export interface GjcRuntimeSnapshot {

@@ -5,6 +5,7 @@ import * as path from "node:path";
 import { getAgentDir, setAgentDir } from "@gajae-code/utils";
 import {
 	type GjcPluginRegistryEntry,
+	GjcRuntimeFindingAccumulator,
 	installGjcBundle,
 	type NormalizedGjcPluginSurfaces,
 	summarizeGjcPluginObservability,
@@ -110,5 +111,36 @@ describe("observability quarantine keying", () => {
 		expect(a?.status).toBe("enabled");
 		expect(b?.status).toBe("quarantined");
 		expect(b?.quarantineCode).toBe("session_collision");
+	});
+});
+
+describe("runtime finding generation", () => {
+	const identity = { kind: "gjc-bundle" as const, scope: "project" as const, name: "hooks" };
+
+	test("overwrites producer-supplied generations with the accumulator generation", () => {
+		const accumulator = new GjcRuntimeFindingAccumulator(7);
+		accumulator.add({
+			identity,
+			surfaceId: "hook:read",
+			code: "security_policy",
+			message: "blocked",
+			generation: 3,
+		});
+		expect(accumulator.snapshot().findings[0]?.generation).toBe(7);
+	});
+
+	test("preserves findings with distinct provenance and audit evidence", () => {
+		const accumulator = new GjcRuntimeFindingAccumulator(7);
+		for (const plugin of ["one", "two"]) {
+			accumulator.add({
+				identity,
+				surfaceId: "hook:read",
+				code: "security_policy",
+				message: "blocked",
+				provenance: { source: "plugin-bundle", plugin },
+				audit: { plugin },
+			});
+		}
+		expect(accumulator.snapshot().findings).toHaveLength(2);
 	});
 });

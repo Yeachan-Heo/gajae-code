@@ -65,6 +65,38 @@ describe("GJC plugin compiler", () => {
 		await expect(fs.access(sentinel)).rejects.toThrow();
 	});
 
+	test("preserves legacy manifest string tools as subskill tool refs", async () => {
+		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-legacy-subskill-tool-"));
+		tempDirs.push(dir);
+		await fs.mkdir(path.join(dir, "subskills", "design"), { recursive: true });
+		await fs.mkdir(path.join(dir, "tools"), { recursive: true });
+		await fs.writeFile(
+			path.join(dir, "subskills", "design", "SKILL.md"),
+			"---\nname: design\nbinds_to: ralplan\nphase: planner\nactivation_arg: design\ndescription: Design.\n---\nBody.\n",
+		);
+		await fs.writeFile(path.join(dir, "tools", "domain-note.ts"), "export default {}\n");
+		await fs.writeFile(
+			path.join(dir, "gajae-plugin.json"),
+			JSON.stringify({
+				kind: "gajae-code-plugin",
+				name: "legacy-subskill-tool",
+				version: "1.0.0",
+				subskills: ["subskills/design/SKILL.md"],
+				tools: ["tools/domain-note.ts"],
+			}),
+		);
+
+		const bundle = await compileGjcPluginBundle(dir);
+
+		expect(bundle.surfaces.subskills[0]?.toolRefs).toEqual([
+			expect.objectContaining({
+				extensionId: "subskill-tool:ralplan:planner:design:tools/domain-note.ts",
+				relativePath: "tools/domain-note.ts",
+				implementationHash: expect.stringMatching(/^[0-9a-f]{64}$/),
+			}),
+		]);
+	});
+
 	test("rejects a path that escapes the plugin root", async () => {
 		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-escape-"));
 		tempDirs.push(dir);

@@ -104,6 +104,12 @@ import type {
 	TurnStartEvent,
 } from "../shared-events";
 import type { SlashCommandInfo } from "../slash-commands";
+import type {
+	FunctionHook,
+	FunctionHookEventType,
+	FunctionHookPayloadFor,
+	FunctionHookRegistrationOptions,
+} from "./function-hooks";
 
 export type { AppKeybinding, KeybindingsManager } from "../../config/keybindings";
 export type { ExecOptions, ExecResult } from "../../exec/exec";
@@ -1239,6 +1245,18 @@ export interface ExtensionAPI {
 	on(event: "user_bash", handler: ExtensionHandler<UserBashEvent, UserBashEventResult>): void;
 	on(event: "user_python", handler: ExtensionHandler<UserPythonEvent, UserPythonEventResult>): void;
 
+	/**
+	 * Register capability-scoped middleware on the authoritative ExtensionRunner.
+	 * The host supplies grants; an extension cannot self-grant capabilities.
+	 * Wildcard registrations receive a redacted payload unless the host explicitly
+	 * grants a tool inspection/transform capability.
+	 */
+	registerFunctionHook<T extends FunctionHookEventType>(
+		event: T,
+		handler: FunctionHook<FunctionHookPayloadFor<T>>,
+		options?: FunctionHookRegistrationOptions,
+	): void;
+
 	// =========================================================================
 	// Tool Registration
 	// =========================================================================
@@ -1758,6 +1776,23 @@ export interface Extension {
 	flags: Map<string, ExtensionFlag>;
 	shortcuts: Map<KeyId, ExtensionShortcut>;
 }
+
+export type {
+	FunctionHook,
+	FunctionHookAuditRecord,
+	FunctionHookCapabilities,
+	FunctionHookCapability,
+	FunctionHookEventType,
+	FunctionHookGrant,
+	FunctionHookGrantInput,
+	FunctionHookNext,
+	FunctionHookOperation,
+	FunctionHookPayloadFor,
+	FunctionHookProvenance,
+	FunctionHookRegistration,
+	FunctionHookRegistrationOptions,
+	FunctionHookResult,
+} from "./function-hooks";
 
 /** Result of loading extensions. */
 export interface LoadExtensionsResult {

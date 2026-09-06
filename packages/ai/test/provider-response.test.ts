@@ -52,6 +52,21 @@ describe("provider response metadata", () => {
 			},
 		]);
 	});
+
+	it("passes the request cancellation signal to the response callback", async () => {
+		const controller = new AbortController();
+		let seenSignal: AbortSignal | undefined;
+		await notifyProviderResponse(
+			{
+				signal: controller.signal,
+				onResponse: (_response, _model, _scope, signal) => {
+					seenSignal = signal;
+				},
+			},
+			new Response(null, { status: 200 }),
+		);
+		expect(seenSignal).toBe(controller.signal);
+	});
 });
 
 const originalFetch = global.fetch;

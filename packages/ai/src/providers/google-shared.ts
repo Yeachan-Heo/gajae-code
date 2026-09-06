@@ -899,7 +899,7 @@ export function streamGoogleGenAI<T extends "google-generative-ai" | "google-ver
 		try {
 			const plan = await prepare();
 			let params = plan.params;
-			const replacement = await options?.onPayload?.(params, model, options?.attemptScope);
+			const replacement = await options?.onPayload?.(params, model, options?.attemptScope, options?.signal);
 			if (replacement !== undefined) {
 				params = replacement as GenerateContentParameters;
 			}

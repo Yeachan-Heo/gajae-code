@@ -33,7 +33,7 @@ async function mkCwd(): Promise<string> {
 	return cwd;
 }
 
-async function bundleWithHook(hookBody: string): Promise<string> {
+async function bundleWithHook(hookBody: string, hookOptions: Record<string, unknown> = {}): Promise<string> {
 	const src = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-hooksrc-"));
 	tempDirs.push(src);
 	await fs.mkdir(path.join(src, "hooks"), { recursive: true });
@@ -44,10 +44,45 @@ async function bundleWithHook(hookBody: string): Promise<string> {
 			kind: "gajae-code-plugin",
 			name: "hook-bundle",
 			version: "1.0.0",
-			hooks: [{ name: "h", event: "tool_call", target: "read", phase: "before", path: "hooks/h.ts" }],
+			hooks: [
+				{
+					name: "h",
+					event: "tool_call",
+					target: "read",
+					phase: "before",
+					path: "hooks/h.ts",
+					...hookOptions,
+				},
+			],
 		}),
 	);
 	return src;
+}
+
+async function expectTamperedFunctionHookQuarantined(
+	hookOptions: Record<string, unknown>,
+	mutate: (hook: Record<string, unknown>) => void,
+): Promise<void> {
+	const cwd = await mkCwd();
+	const markerPath = path.join(cwd, "imported");
+	const src = await bundleWithHook(
+		`await Bun.write(${JSON.stringify(markerPath)}, "imported"); export default function(api){ api.on("tool_call", ()=>({})); }\n`,
+		hookOptions,
+	);
+	await installGjcBundle({ cwd }, "project", src);
+	const registryPath = registryPathForScope("project", cwd);
+	const registry = JSON.parse(await fs.readFile(registryPath, "utf8")) as {
+		plugins: Array<{ surfaces: { hooks: Array<Record<string, unknown>> } }>;
+	};
+	const hook = registry.plugins[0]?.surfaces.hooks[0];
+	if (!hook) throw new Error("expected installed hook metadata");
+	mutate(hook);
+	await fs.writeFile(registryPath, JSON.stringify(registry));
+
+	const res = await loadConstrainedPluginHooks({ cwd });
+	expect(res.hooks).toHaveLength(0);
+	expect(res.quarantine.some(q => q.code === "security_policy")).toBe(true);
+	expect(await Bun.file(markerPath).exists()).toBe(false);
 }
 
 describe("constrained plugin hooks", () => {
@@ -137,5 +172,65 @@ describe("constrained plugin hooks", () => {
 		expect(res.hooks).toHaveLength(0);
 		expect(res.quarantine.some(q => q.code === "invalid_hook")).toBe(true);
 		expect(await Bun.file(markerPath).exists()).toBe(false);
+	});
+
+	test("quarantines plugin function hooks before importing them into the host realm", async () => {
+		const cwd = await mkCwd();
+		const markerPath = path.join(cwd, "imported");
+		const src = await bundleWithHook(
+			`await Bun.write(${JSON.stringify(markerPath)}, "imported"); export default function(api){ api.on("tool_call", ()=>({})); }\n`,
+			{ capabilities: ["tool.inspect"] },
+		);
+		await installGjcBundle({ cwd }, "project", src);
+		const res = await loadConstrainedPluginHooks({ cwd });
+		expect(res.hooks).toHaveLength(0);
+		expect(res.quarantine.some(q => q.code === "security_policy")).toBe(true);
+		expect(await Bun.file(markerPath).exists()).toBe(false);
+	});
+
+	test("quarantines a function hook when persisted functionHook metadata is flipped off", async () => {
+		await expectTamperedFunctionHookQuarantined({ capabilities: ["tool.inspect"] }, hook => {
+			hook.functionHook = false;
+		});
+	});
+
+	test("quarantines a function hook when persisted grant metadata or its hash is tampered", async () => {
+		await expectTamperedFunctionHookQuarantined({ capabilities: ["tool.inspect"] }, hook => {
+			hook.capabilities = ["tool.transform"];
+		});
+		await expectTamperedFunctionHookQuarantined(
+			{ capabilities: ["network.fetch"], networkDestinations: ["https://example.com"] },
+			hook => {
+				hook.networkDestinations = ["https://evil.example"];
+			},
+		);
+		await expectTamperedFunctionHookQuarantined(
+			{ capabilities: ["filesystem.read"], filesystemRoots: ["/tmp"] },
+			hook => {
+				hook.filesystemRoots = ["/etc"];
+			},
+		);
+		await expectTamperedFunctionHookQuarantined({ capabilities: ["tool.inspect"] }, hook => {
+			hook.capabilityHash = "0".repeat(64);
+		});
+	});
+
+	test("quarantines a function hook when persisted identity or implementation metadata is tampered", async () => {
+		for (const mutate of [
+			(hook: Record<string, unknown>) => {
+				hook.extensionId = "hook:tool_call:before:write:h";
+			},
+			(hook: Record<string, unknown>) => {
+				hook.target = "write";
+			},
+			(hook: Record<string, unknown>) => {
+				hook.relativePath = "hooks/other.ts";
+			},
+			(hook: Record<string, unknown>) => {
+				hook.implementationHash = "0".repeat(64);
+			},
+		]) {
+			await expectTamperedFunctionHookQuarantined({ capabilities: ["tool.inspect"] }, mutate);
+		}
 	});
 });

@@ -129,6 +129,8 @@
 		"./session/session-manager-internal.js": null,
 		"./session/sdk-run-capability": null,
 		"./session/sdk-run-capability.js": null,
+		"./extensibility/extensions/function-hooks-internal": null,
+		"./extensibility/extensions/function-hooks-internal.js": null,
 		"./sdk": {
 			"types": "./src/sdk/index.ts",
 			"import": "./src/sdk/index.ts"
