@@ -818,10 +818,22 @@ export async function streamLinesFromFile(
 					fitBytes += separatorBytes + currentLineLength;
 				} else {
 					transitionToSplit();
-					pushSplit(lineIndex, lineText, currentLineLength, currentLineDropped, capturePartialPreview());
+					pushSplit(
+						lineIndex,
+						lineText,
+						currentLineLength,
+						currentLineDropped,
+						currentLineDropped || currentLineLength > ringBudgetBytes ? capturePartialPreview() : undefined,
+					);
 				}
 			} else {
-				pushSplit(lineIndex, lineText, currentLineLength, currentLineDropped, capturePartialPreview());
+				pushSplit(
+					lineIndex,
+					lineText,
+					currentLineLength,
+					currentLineDropped,
+					currentLineDropped || currentLineLength > ringBudgetBytes ? capturePartialPreview() : undefined,
+				);
 			}
 		}
 
