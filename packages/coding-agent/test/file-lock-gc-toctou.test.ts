@@ -830,6 +830,28 @@ describe("file lock cleanup failure handling (#2478)", () => {
 		},
 		10_000,
 	);
+	test("waits boundedly for a competing exact-removal quarantine to clear", async () => {
+		const base = await makeTemp();
+		const lockedFile = path.join(base, "state.json");
+		const lockDir = `${lockedFile}.lock`;
+		let collisions = 6;
+		FileLockTestHooks.nativeQuarantineBindings = () => ({
+			snapshotDirectoryTree,
+			exactRemoveDirectoryTree: target => {
+				if (collisions > 0) {
+					collisions--;
+					return { ok: false, code: "quarantine_collision" };
+				}
+				rmSync(target, { recursive: true, force: true });
+				return { ok: true };
+			},
+		});
+
+		await withFileLock(lockedFile, async () => {});
+
+		expect(collisions).toBe(0);
+		expect(await fs.exists(lockDir)).toBe(false);
+	});
 
 	test("quarantines a self-owned lock when transient release denial persists", async () => {
 		const base = await makeTemp();

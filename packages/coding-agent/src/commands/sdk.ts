@@ -13,6 +13,7 @@ import { initTheme } from "../modes/theme/theme";
 import { ACP_MCP_REQUEST_TIMEOUT_MS, ACP_MCP_STARTUP_HEADROOM_MS } from "../sdk/acp/mcp";
 import { Broker } from "../sdk/broker/broker";
 import { readBrokerDiscovery } from "../sdk/broker/discovery";
+import { reconcileBrokerGenerationForStartup, withBrokerStartupLock } from "../sdk/broker/ensure";
 import { completeBrokerProcess } from "../sdk/broker/internal";
 import {
 	type LifecycleTranscriptEvidence,
@@ -1086,59 +1087,101 @@ export default class Sdk extends Command {
 			await runSessionHost();
 			return;
 		}
-		const agentDir = internal.agentDir;
-		const broker = new Broker({
-			agentDir,
-			masterOrphanGraceMs: (await Settings.loadForScope({ cwd: process.cwd(), agentDir })).get(
-				"sdk.masterOrphanGraceMs",
-			),
-			resolveDirectoryMigration: async cwd => {
-				const settings = await Settings.loadForScope({ cwd, agentDir });
-				try {
-					const policy = settings.get("session.directoryMigration");
-					return policy === "disabled" ? "disabled" : "copy-retain";
-				} finally {
-					await settings.close();
-				}
-			},
-		});
+		const agentDir = path.resolve(internal.agentDir);
+		let broker: Broker | undefined;
 		try {
-			await broker.start();
+			broker = await withBrokerStartupLock(agentDir, async deadline => {
+				const remainingMs = Math.max(1, deadline - Date.now());
+				const testWatchdogMs = Number(process.env.GJC_SDK_TEST_BROKER_STARTUP_WATCHDOG_MS ?? 0);
+				const watchdogMs =
+					Number.isSafeInteger(testWatchdogMs) && testWatchdogMs > 0 && testWatchdogMs <= remainingMs
+						? testWatchdogMs
+						: remainingMs;
+				const startupWatchdog = setTimeout(() => {
+					process.stderr.write(`SDK broker startup exceeded its ${watchdogMs}ms fence deadline.\n`);
+					process.exit(1);
+				}, watchdogMs);
+				try {
+					if (await reconcileBrokerGenerationForStartup({ agentDir }, deadline)) return undefined;
+					if (process.env.GJC_SDK_TEST_BROKER_STARTUP_STALL === "1") {
+						const stalled = Promise.withResolvers<void>();
+						await stalled.promise;
+					}
+					const startupDelayMs = Number(process.env.GJC_SDK_TEST_BROKER_STARTUP_DELAY_MS ?? 0);
+					if (Number.isSafeInteger(startupDelayMs) && startupDelayMs > 0 && startupDelayMs <= 10_000)
+						await Bun.sleep(startupDelayMs);
+					const candidate = new Broker({
+						agentDir,
+						masterOrphanGraceMs: (await Settings.loadForScope({ cwd: process.cwd(), agentDir })).get(
+							"sdk.masterOrphanGraceMs",
+						),
+						resolveDirectoryMigration: async cwd => {
+							const settings = await Settings.loadForScope({ cwd, agentDir });
+							try {
+								const policy = settings.get("session.directoryMigration");
+								return policy === "disabled" ? "disabled" : "copy-retain";
+							} finally {
+								await settings.close();
+							}
+						},
+					});
+					broker = candidate;
+					await candidate.start();
+					return candidate;
+				} finally {
+					clearTimeout(startupWatchdog);
+				}
+			});
 		} catch (error) {
+			if (broker) {
+				try {
+					await broker.stop();
+				} catch {
+					// Preserve the startup/fence failure that made this bootstrap unusable.
+				}
+			}
 			// This process spawns detached with stdio ignored (see ensure.ts), so the
 			// durable marker is the only channel the caller has to see why start()
 			// failed instead of a bare exit code (#3963).
-			await writeBrokerStartupFailureMarker(agentDir, {
-				reason: error instanceof Error ? error.message : String(error),
-				exitCode: 1,
-				signal: null,
-				pid: process.pid,
-			});
+			const incarnation = processIncarnation(process.pid);
+			if (incarnation)
+				await writeBrokerStartupFailureMarker(agentDir, {
+					reason: error instanceof Error ? error.message : String(error),
+					exitCode: 1,
+					signal: null,
+					pid: process.pid,
+					incarnation,
+				});
 			throw error;
 		}
-		if (!broker.ownsDiscovery) {
+		if (!broker) return;
+		const runningBroker = broker;
+		if (!runningBroker.ownsDiscovery) {
 			// Another broker owns discovery; this process exits cleanly (code 0) as
 			// the race loser. Record why so a caller polling for a winner that never
 			// appears can diagnose the loss instead of seeing only a bare exit 0.
-			await writeBrokerStartupFailureMarker(agentDir, {
-				reason: "Another broker owns the lock/discovery; this broker exited as the race loser.",
-				exitCode: 0,
-				signal: null,
-				pid: process.pid,
-			});
+			const incarnation = processIncarnation(process.pid);
+			if (incarnation)
+				await writeBrokerStartupFailureMarker(agentDir, {
+					reason: "Another broker owns the lock/discovery; this broker exited as the race loser.",
+					exitCode: 0,
+					signal: null,
+					pid: process.pid,
+					incarnation,
+				});
 			return;
 		}
 		// A live broker must not keep advertising sessions whose host process is
 		// gone; the sweep is the broker-side half of the host reaping bound.
-		const stopSweep = startBrokerDeadRegistrationSweep(broker);
+		const stopSweep = startBrokerDeadRegistrationSweep(runningBroker);
 		const stop = () => {
 			stopSweep();
-			void broker.stop();
+			void runningBroker.stop();
 		};
 		process.once("SIGTERM", stop);
 		process.once("SIGINT", stop);
 		try {
-			await completeBrokerProcess(broker);
+			await completeBrokerProcess(runningBroker);
 		} finally {
 			stopSweep();
 		}

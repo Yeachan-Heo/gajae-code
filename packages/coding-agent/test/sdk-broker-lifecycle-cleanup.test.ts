@@ -30,11 +30,12 @@ test("write creates the marker at the expected path and read round-trips it", as
 
 		const marker = await readBrokerStartupFailureMarker(agentDir);
 		expect(marker).toBeDefined();
-		expect(marker?.version).toBe(1);
+		expect(marker?.version).toBe(2);
 		expect(marker?.reason).toBe("no discovery within deadline");
 		expect(marker?.exitCode).toBe(3);
 		expect(marker?.signal).toBe("SIGTERM");
 		expect(marker?.pid).toBe(process.pid);
+		expect(typeof marker?.incarnation).toBe("string");
 		expect(typeof marker?.writtenAt).toBe("number");
 		expect(Number.isFinite(marker?.writtenAt)).toBe(true);
 	} finally {
@@ -214,6 +215,12 @@ test("read returns undefined for an empty reason, a non-string signal, or a miss
 		await Bun.write(
 			markerPath,
 			JSON.stringify({ version: 1, reason: "r", exitCode: 1, signal: null, writtenAt: 1, pid: 0 }),
+		);
+		await expect(readBrokerStartupFailureMarker(agentDir)).resolves.toBeUndefined();
+
+		await Bun.write(
+			markerPath,
+			JSON.stringify({ version: 2, reason: "r", exitCode: 1, signal: null, writtenAt: 1, pid: 1 }),
 		);
 		await expect(readBrokerStartupFailureMarker(agentDir)).resolves.toBeUndefined();
 	} finally {
