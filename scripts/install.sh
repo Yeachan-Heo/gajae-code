@@ -400,6 +400,14 @@ try_publish_lock_file() {
     ( set -C; umask 077; printf '%s %s\n' "$$" "$LOCK_NONCE" > "$lock" )
 }
 
+lock_owner_is_alive() {
+    owner="$1"
+    case "$owner" in
+        ''|0|*[!0-9]*) return 1 ;;
+    esac
+    kill -0 "$owner" 2>/dev/null
+}
+
 acquire_lock() {
     lock="${INSTALL_DIR}/.gjc-install.lock"
     mkdir -p "$INSTALL_DIR"
@@ -409,6 +417,32 @@ acquire_lock() {
         LOCK_FILE="$lock"
         return 0
     fi
+
+    owner=""
+    nonce=""
+    if [ -f "$lock" ]; then
+        read owner nonce < "$lock" || true
+    fi
+    case "$owner" in
+        ''|0|*[!0-9]*) ;;
+        *)
+            if [ -n "$nonce" ] && ! lock_owner_is_alive "$owner"; then
+                lock_contents="$owner $nonce"
+                current_contents=$(cat "$lock" 2>/dev/null || true)
+                if [ "$current_contents" = "$lock_contents" ]; then
+                    stale_lock="${lock}.stale.$$"
+                    if mv "$lock" "$stale_lock" 2>/dev/null; then
+                        rm -f "$stale_lock"
+                        if try_publish_lock_file "$lock" 2>/dev/null; then
+                            LOCK_FILE="$lock"
+                            return 0
+                        fi
+                    fi
+                fi
+            fi
+            ;;
+    esac
+
     die "Another GJC installer is already running in ${INSTALL_DIR} (lock: ${lock}). Remove a leftover lock file only after confirming no installer is running."
 }
 
