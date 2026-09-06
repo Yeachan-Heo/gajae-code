@@ -94,6 +94,20 @@ function createFixture(opts: { streamingMessage: AssistantMessage; retryAttempt?
 }
 
 describe("EventController #handleMessageEnd abort labeling", () => {
+	it("rebuilds the transcript after terminal persistence recovery", async () => {
+		const f = createFixture({ streamingMessage: makeAssistantMessage() });
+		f.ctx.rebuildChatFromMessages = vi.fn();
+
+		await f.controller.handleEvent({
+			type: "notice",
+			level: "info",
+			message: "Recovered interrupted assistant output into canonical session history.",
+			source: "terminal-persistence-recovered",
+		});
+
+		expect(f.ctx.rebuildChatFromMessages).toHaveBeenCalledWith("reconcile-same-transcript");
+	});
+
 	for (const ending of ["success", "error", "visible", "silent", "ttsr"] as const) {
 		it(`queued text cannot supersede authoritative ${ending} finalization`, async () => {
 			const initial = makeAssistantMessage({ stopReason: "stop", content: [] });
