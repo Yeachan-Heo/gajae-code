@@ -15,6 +15,7 @@ Inspect selected subagents by `ids`; omit `ids` to inspect current running subag
 ## `action: "await"`
 Wait for selected subagents by `ids`; omit `ids` to wait for current running subagents.
 - Always set `timeout_ms` when the result is not immediately required forever.
+- `heartbeat_ms` accepts integer intervals from 100 to 60,000 milliseconds (for example, 10,000 for ten seconds); `0` disables heartbeat updates and omission retains the 500 ms default. Terminal completion is event-driven, not delayed until the next heartbeat.
 - Await timeout only bounds this tool call's wait; it does not stop the subagent and is not a failure reason.
 - On timeout, inspect progress and keep doing independent work. Never cancel just because an await timed out; cancel only if the subagent has actually failed, gone off-track, or become unrecoverably wrong.
 - Completed results are receipt-first by default: bounded preview plus `agent://<id>` output ref when available, not full retained output.
