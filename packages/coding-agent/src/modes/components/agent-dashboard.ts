@@ -83,6 +83,7 @@ interface AgentDashboardModelContext {
 	modelRegistry?: ModelRegistry;
 	activeModelPattern?: string;
 	defaultModelPattern?: string;
+	credentialSessionId?: string;
 }
 
 export function resolveAgentCreationModel(
@@ -602,7 +603,7 @@ export class AgentDashboard extends Container {
 		if (!modelRegistry) {
 			throw new Error("Model registry unavailable in current session.");
 		}
-		await modelRegistry.refresh();
+		await modelRegistry.refresh("online-if-uncached", this.modelContext.credentialSessionId);
 
 		const settings = this.#settingsManager ?? undefined;
 		const modelPatterns = resolveConfiguredModelPatterns(
@@ -622,6 +623,7 @@ export class AgentDashboard extends Container {
 			modelRegistry,
 			settings,
 			model: selectedModel,
+			credentialSessionId: this.modelContext.credentialSessionId,
 			systemPrompt: [systemPrompt],
 			hasUI: false,
 			notificationHostModeSupported: false,

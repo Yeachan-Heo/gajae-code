@@ -32,7 +32,9 @@ function fakeRegistry(
 	let refreshed = false;
 	const registry = {
 		refreshCalls: [] as string[],
+		refreshCredentialSessions: [] as Array<string | undefined>,
 		refreshInBackgroundCalls: [] as string[],
+		refreshInBackgroundCredentialSessions: [] as Array<string | undefined>,
 		getModelProfile: (name: string) => new Map(activeProfiles.map(profile => [profile.name, profile])).get(name),
 		getModelProfiles: () => new Map(activeProfiles.map(profile => [profile.name, profile])),
 		getAvailableModelProfileNames: () => activeProfiles.map(profile => profile.name).sort(),
@@ -40,14 +42,16 @@ function fakeRegistry(
 		getAll: () => activeModels,
 		getAvailableForProfileActivation: () =>
 			options.excludeModelsFromProfileActivationUntilRefresh && !refreshed ? [] : activeModels,
-		async refresh(strategy = "online-if-uncached") {
+		async refresh(strategy = "online-if-uncached", credentialSessionId?: string) {
 			registry.refreshCalls.push(strategy);
+			registry.refreshCredentialSessions.push(credentialSessionId);
 			refreshed = true;
 			activeProfiles = options.profilesAfterRefresh ?? activeProfiles;
 			activeModels = options.modelsAfterRefresh ?? activeModels;
 		},
-		refreshInBackground(strategy = "online-if-uncached") {
+		refreshInBackground(strategy = "online-if-uncached", credentialSessionId?: string) {
 			registry.refreshInBackgroundCalls.push(strategy);
+			registry.refreshInBackgroundCredentialSessions.push(credentialSessionId);
 		},
 	};
 	return registry;
@@ -58,6 +62,7 @@ function fakeSession(initial = model("initial-provider", "initial")) {
 		model: initial as Model | undefined,
 		thinkingLevel: undefined as ThinkingLevel | undefined,
 		sessionId: "session-1",
+		credentialSessionId: "credential-session-1",
 		setModelTemporaryCalls: [] as Array<{
 			model: Model;
 			thinkingLevel?: ThinkingLevel;
@@ -372,6 +377,7 @@ test("interactive continuation activates --mpreset from cached models without bl
 
 	expect(registry.refreshCalls).toEqual([]);
 	expect(registry.refreshInBackgroundCalls).toEqual(["online-if-uncached"]);
+	expect(registry.refreshInBackgroundCredentialSessions).toEqual(["credential-session-1"]);
 	expect(session.model?.provider).toBe("profile-provider");
 	expect(session.model?.id).toBe("default");
 });
@@ -463,6 +469,7 @@ test("lifecycle startup refreshes online when cached default profile resolution 
 	});
 
 	expect(registry.refreshCalls).toEqual(["online-if-uncached"]);
+	expect(registry.refreshCredentialSessions).toEqual(["credential-session-1"]);
 	expect(registry.refreshInBackgroundCalls).toEqual([]);
 	expect(session.model?.provider).toBe("refreshed-provider");
 	expect(session.model?.id).toBe("new");

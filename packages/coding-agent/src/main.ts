@@ -81,6 +81,7 @@ import {
 	SessionTranscriptOversizedError,
 	type StrictSessionOpenResult,
 } from "./session/session-manager";
+import { resolveStartupAuthConfig } from "./session/startup-auth-config";
 import { runStartupCredentialAutoImportIfNeeded } from "./setup/credential-auto-import";
 import {
 	readOnboardingState,
@@ -519,14 +520,15 @@ async function applyStartupModelProfilesWithPolicy(
 			applied = await applyConfiguredProfiles();
 		} catch (error) {
 			if (error instanceof ModelProfileCredentialError) throw error;
-			await args.modelRegistry.refresh("online-if-uncached");
+			await args.modelRegistry.refresh("online-if-uncached", args.session.credentialSessionId);
 			refreshedOnline = true;
 			applied = await applyConfiguredProfiles();
 		}
-		if (applied && !refreshedOnline) args.modelRegistry.refreshInBackground();
+		if (applied && !refreshedOnline)
+			args.modelRegistry.refreshInBackground("online-if-uncached", args.session.credentialSessionId);
 	} else {
 		if (defaultProfile || args.parsedArgs.mpreset) {
-			await args.modelRegistry.refresh("online-if-uncached");
+			await args.modelRegistry.refresh("online-if-uncached", args.session.credentialSessionId);
 		}
 		await applyConfiguredProfiles();
 	}
@@ -1306,6 +1308,7 @@ export interface RunRootCommandDependencies {
 	createAgentSession?: typeof createAgentSession;
 	createSessionManager?: typeof createSessionManager;
 	discoverAuthStorage?: typeof discoverAuthStorage;
+	resolveStartupAuthConfig?: typeof resolveStartupAuthConfig;
 	runAcpMode?: (options?: { agentDir?: string }) => Promise<void>;
 	settings?: Settings;
 	suppressProcessExit?: boolean;
@@ -1491,8 +1494,15 @@ export async function runRootCommand(
 
 	const notifs: (InteractiveModeNotify | null)[] = [];
 
-	// Create AuthStorage and ModelRegistry upfront
-	const authStorage = await logger.time("discoverModels", deps.discoverAuthStorage ?? discoverAuthStorage);
+	// Keep store authority and persistent pin intent in the same startup snapshot.
+	// Injected discoverers own their auth unless they also supply a config resolver.
+	const agentDir = deps.settings?.getAgentDir() ?? getAgentDir();
+	const resolveAuthConfig =
+		deps.resolveStartupAuthConfig ?? (deps.discoverAuthStorage ? undefined : resolveStartupAuthConfig);
+	const startupAuthConfig = await resolveAuthConfig?.(agentDir);
+	const authStorage = await logger.time("discoverModels", () =>
+		(deps.discoverAuthStorage ?? discoverAuthStorage)(agentDir, startupAuthConfig),
+	);
 	const modelRegistry = new ModelRegistry(authStorage);
 
 	if (parsedArgs.version) {
@@ -1833,6 +1843,7 @@ export async function runRootCommand(
 	let rootStartupCacheAdmissionAttempted = false;
 	sessionOptions.authStorage = authStorage;
 	sessionOptions.modelRegistry = modelRegistry;
+	sessionOptions.startupAuthConfig = startupAuthConfig;
 	sessionOptions.modelRegistryStartupMutation = {
 		owner: "cli-root",
 		onAttempt: () => {
@@ -1953,7 +1964,7 @@ export async function runRootCommand(
 		// every parallel arm by ~30ms. Startup model profiles do their own foreground refresh
 		// before activation so project-scoped defaults can resolve freshly discovered models.
 		if (!context?.skipPostCreateModelRefresh && !rootStartupCacheAdmissionAttempted) {
-			modelRegistry.refreshInBackground();
+			modelRegistry.refreshInBackground("online-if-uncached", result.session.credentialSessionId);
 		}
 		return result;
 	};

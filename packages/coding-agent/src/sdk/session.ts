@@ -1496,10 +1496,12 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	// Pin authStorage to modelRegistry.authStorage: ModelRegistry.getApiKey() routes refresh
 	// failures through that instance, so any divergent storage handed to the bridge / mcpManager
 	// / session would silently miss credential_disabled events.
-	// Injected auth is already the caller's authority; do not discover global
-	// startup auth or apply persistent pins while constructing this session.
+	// Injected auth is the caller's authority. Only the CLI root can hand off its
+	// explicit startup snapshot; never discover global config for injected SDK auth.
 	const startupAuthConfig = hasInjectedAuth
-		? undefined
+		? options.modelRegistryStartupMutation?.owner === "cli-root"
+			? options.startupAuthConfig
+			: undefined
 		: (options.startupAuthConfig ?? (await resolveStartupAuthConfig(agentDir)));
 	const ownsModelRegistry = options.modelRegistry === undefined;
 	const ownsAuthStorage = options.modelRegistry === undefined && options.authStorage === undefined;
@@ -1647,9 +1649,6 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				);
 			}
 		}
-		if (!options.modelRegistry && !attemptedStartupCacheAdmission) {
-			modelRegistry.refreshInBackground();
-		}
 		// Resolve the workspace tree through its runtime service. The compatibility
 		// default starts the native scan at the legacy startup trigger; lazy mode
 		// leaves the service idle until the first-turn prompt barrier. The native scan
@@ -1731,7 +1730,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		const scopeAlreadyLeased = authStorage.hasCredentialScopeLease(credentialSessionId);
 		authStorage.acquireCredentialScope(credentialSessionId);
 		credentialScopeLeased = true;
-		const configuredPins = hasInjectedAuth ? {} : (startupAuthConfig?.credentialPins ?? {});
+		const configuredPins = startupAuthConfig?.credentialPins ?? {};
 		const persistedPinStoreMatches =
 			startupAuthConfig?.credentialPinStoreIdentity === startupAuthConfig?.credentialStoreIdentity;
 		// AuthStorage has no scope-level "pinned but unavailable" marker. Keep the
@@ -1906,6 +1905,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				options.credentialSelector.provider,
 				options.credentialSelector.selector,
 			);
+		}
+		if (!options.modelRegistry && !attemptedStartupCacheAdmission) {
+			modelRegistry.refreshInBackground("online-if-uncached", credentialSessionId);
 		}
 
 		const hasExplicitModel = options.model !== undefined || options.modelPattern !== undefined;

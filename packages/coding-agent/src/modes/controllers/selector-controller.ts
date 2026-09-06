@@ -1655,7 +1655,7 @@ export class SelectorController {
 			authStorage: this.ctx.session.modelRegistry.authStorage,
 			trigger: "bare-login",
 		});
-		await this.ctx.session.modelRegistry.refresh();
+		await this.ctx.session.modelRegistry.refresh("online-if-uncached", this.ctx.session.credentialSessionId);
 
 		this.ctx.chatContainer.addChild(new Spacer(1));
 		for (const credential of summary.imported) {
@@ -1690,7 +1690,7 @@ export class SelectorController {
 			const submit = async (input: CustomModelPresetWizardSubmit): Promise<void> => {
 				try {
 					const profile = await this.ctx.session.modelRegistry.saveCustomModelProfile(input.name, input.profile);
-					await this.ctx.session.modelRegistry.refresh("offline");
+					await this.ctx.session.modelRegistry.refresh("offline", this.ctx.session.credentialSessionId);
 					await this.ctx.notifyConfigChanged?.();
 					this.ctx.showStatus(`Custom model preset created: ${formatModelProfileDisplayLabel(profile)}`);
 					done();
@@ -1728,7 +1728,7 @@ export class SelectorController {
 		}
 		try {
 			const renamed = await this.ctx.session.modelRegistry.renameCustomModelProfile(profileName, input);
-			await this.ctx.session.modelRegistry.refresh("offline");
+			await this.ctx.session.modelRegistry.refresh("offline", this.ctx.session.credentialSessionId);
 			await this.ctx.notifyConfigChanged?.();
 			modelSelector.refreshPresetProfiles(renamed.name);
 			this.ctx.showStatus(`Custom model preset renamed: ${formatModelProfileDisplayLabel(renamed)}`);
@@ -1774,7 +1774,7 @@ export class SelectorController {
 				});
 			}
 			deletedProfile = await this.ctx.session.modelRegistry.deleteCustomModelProfile(profileName);
-			await this.ctx.session.modelRegistry.refresh("offline");
+			await this.ctx.session.modelRegistry.refresh("offline", this.ctx.session.credentialSessionId);
 			await this.ctx.notifyConfigChanged?.();
 			refreshSelectorState();
 			this.ctx.showStatus(`Custom model preset deleted: ${profileLabel}`);
@@ -1784,7 +1784,7 @@ export class SelectorController {
 			if (deletedProfile) {
 				try {
 					await this.ctx.session.modelRegistry.saveCustomModelProfile(profileName, deletedProfile);
-					await this.ctx.session.modelRegistry.refresh("offline");
+					await this.ctx.session.modelRegistry.refresh("offline", this.ctx.session.credentialSessionId);
 				} catch (restoreErr) {
 					presetRestoreError = restoreErr;
 				}
@@ -1821,7 +1821,7 @@ export class SelectorController {
 			const submit = async (input: CustomProviderWizardSubmit): Promise<void> => {
 				try {
 					const result = await addApiCompatibleProvider(input);
-					await this.ctx.session.modelRegistry.refresh("offline");
+					await this.ctx.session.modelRegistry.refresh("offline", this.ctx.session.credentialSessionId);
 					await this.ctx.notifyConfigChanged?.();
 					this.ctx.showStatus(formatProviderSetupResult(result));
 					wizard.complete();
@@ -2218,6 +2218,7 @@ export class SelectorController {
 			modelRegistry: this.ctx.session.modelRegistry,
 			activeModelPattern,
 			defaultModelPattern: selectorHead(defaultModelPattern),
+			credentialSessionId: this.ctx.session.credentialSessionId,
 		});
 		this.showSelector(done => {
 			dashboard.onClose = () => {
@@ -3626,7 +3627,7 @@ export class SelectorController {
 				},
 				{ manualCode },
 			);
-			await this.ctx.session.modelRegistry.refresh();
+			await this.ctx.session.modelRegistry.refresh("online-if-uncached", this.ctx.session.credentialSessionId);
 			this.ctx.chatContainer.addChild(new Spacer(1));
 			const successMessage =
 				providerId === "opencodex"
@@ -3679,7 +3680,7 @@ export class SelectorController {
 				return;
 			}
 			await clearPersistentPinForRemovedRows(this.ctx.settings, providerId, inventory, result.ids);
-			await this.ctx.session.modelRegistry.refresh();
+			await this.ctx.session.modelRegistry.refresh("online-if-uncached", this.ctx.session.credentialSessionId);
 			this.ctx.showStatus(
 				`Successfully removed ${result.ids.length} stored credential${result.ids.length === 1 ? "" : "s"} from ${providerId}.`,
 			);
@@ -3890,7 +3891,10 @@ export class SelectorController {
 									}
 									if (summary.imported.length > 0) {
 										try {
-											await this.ctx.session.modelRegistry.refresh("offline");
+											await this.ctx.session.modelRegistry.refresh(
+												"offline",
+												this.ctx.session.credentialSessionId,
+											);
 										} catch {
 											logger.warn("Credential auto-import refresh failed", {
 												classification: "refresh-failed",
