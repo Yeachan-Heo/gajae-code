@@ -1700,7 +1700,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			}
 		}
 		this.#stopListeners.clear();
-		this.#stopLoadingAnimation();
+		this.clearLoadingAnimation();
 		this.#suspendedActivityIndicator = undefined;
 		this.#petProtocolUnsubscribe?.();
 		this.#petProtocolUnsubscribe = undefined;
@@ -1996,7 +1996,8 @@ export class InteractiveMode implements InteractiveModeContext {
 		return tallyBackgroundActivity(this.session.getAsyncJobSnapshot()?.running ?? []);
 	}
 
-	#stopLoadingAnimation(): void {
+	/** Clear the status display without settling the foreground run during maintenance/retry. */
+	clearLoadingAnimation(): void {
 		this.loadingAnimation?.stop();
 		this.loadingAnimation = undefined;
 		this.statusContainer.clear();
@@ -2007,7 +2008,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			return;
 		const foregroundActive = this.#foregroundActivity || (!this.#foregroundTurnSettled && this.session.isStreaming);
 		if (!this.isInitialized && !foregroundActive) {
-			this.#stopLoadingAnimation();
+			this.clearLoadingAnimation();
 			return;
 		}
 		const message = resolveActivityIndicatorMessage(
@@ -2016,7 +2017,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			this.#pendingWorkingMessage ?? this.#defaultWorkingMessage,
 		);
 		if (!message) {
-			this.#stopLoadingAnimation();
+			this.clearLoadingAnimation();
 			return;
 		}
 		if (!this.loadingAnimation) {
@@ -2047,7 +2048,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#foregroundActivity = false;
 		if (options?.foregroundSettled) this.#foregroundTurnSettled = true;
 		if (options?.restoreBackground === false) {
-			this.#stopLoadingAnimation();
+			this.clearLoadingAnimation();
 			return;
 		}
 		this.syncActivityIndicator();
