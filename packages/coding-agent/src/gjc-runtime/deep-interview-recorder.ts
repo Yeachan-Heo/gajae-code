@@ -382,7 +382,7 @@ async function syncRecorderHud(
 	await syncSkillActiveState({
 		cwd,
 		skill: "deep-interview",
-		active: phase !== "complete",
+		active: envelope.active !== false && phase !== "complete",
 		phase,
 		sessionId,
 		source: "gjc-runtime-deep-interview-recorder",
@@ -437,6 +437,13 @@ export async function appendOrMergeDeepInterviewRound(
 	if (input.customInput !== undefined)
 		assertDeepInterviewInputWithinLimit(input.customInput, MAX_USER_RESPONSE_LENGTH, "user_response");
 	const envelope = await readEnvelope(statePath);
+	if (envelope.active === false) throw new Error("cannot record a deep-interview turn after handoff or completion");
+	const envelopeState = envelope.state as Record<string, unknown>;
+	const crystal = envelopeState.crystal;
+	if (crystal && typeof crystal === "object" && !Array.isArray(crystal)) {
+		if ((crystal as Record<string, unknown>).lifecycle === "ready")
+			throw new Error("cannot record a deep-interview turn after Crystal promotion");
+	}
 	const interviewId = input.interviewId ?? interviewIdOf(envelope);
 	const shell = buildAnswerShell({
 		...input,
@@ -446,7 +453,7 @@ export async function appendOrMergeDeepInterviewRound(
 	const rounds = readRounds(envelope);
 	const priorRecord = rounds.find(r => r.round_key === shell.round_key);
 	const result = appendOrMergeRound(rounds, shell);
-	const inner = envelope.state as Record<string, unknown>;
+	const inner = envelopeState;
 	let intentStateChanged = false;
 	if (input.intent_contract) {
 		if (input.round !== 0 || input.component !== "review-topology" || input.dimension !== "topology")
@@ -559,6 +566,16 @@ export async function enrichDeepInterviewRoundScoring(
 ): Promise<{ record: DeepInterviewRoundRecord }> {
 	assertDeepInterviewStructuredResponseWithinLimit(input);
 	const envelope = await readEnvelope(statePath);
+	if (envelope.active === false) throw new Error("cannot score a deep-interview turn after handoff or completion");
+	const scoringState = envelope.state as Record<string, unknown>;
+	const scoringCrystal = scoringState.crystal;
+	if (
+		scoringCrystal &&
+		typeof scoringCrystal === "object" &&
+		!Array.isArray(scoringCrystal) &&
+		(scoringCrystal as Record<string, unknown>).lifecycle === "ready"
+	)
+		throw new Error("cannot score a deep-interview turn after Crystal promotion");
 	const interviewId = input.interviewId ?? interviewIdOf(envelope);
 	const rounds = readRounds(envelope);
 	const { rounds: enrichedRounds, record: reportedRecord } = enrichRoundWithScoring(rounds, {

@@ -728,6 +728,92 @@ describe("deep-interview staged transitions", () => {
 		expect(afterState.note_b).toBeUndefined();
 	});
 
+	it("reset preserves canonical Crystal and spec ownership metadata", async () => {
+		const root = await tempDir();
+		await seed(root);
+		const statePath = modeStatePath(root, TEST_SESSION_ID, "deep-interview");
+		const state = await readState(root);
+		state.spec_path = "/tmp/crystal.md";
+		state.spec_sha256 = "a".repeat(64);
+		state.spec_slug = "crystal";
+		state.spec_stage = "final";
+		state.state = { crystal: { lifecycle: "ready", schema_version: 1 }, execution_approval: "not-approved" };
+		await fs.writeFile(statePath, `${JSON.stringify(state)}\n`, "utf8");
+		const reset = parse(
+			(await run(root, ["write", "--reset", "--input", JSON.stringify({ state: { fresh: true } }), "--json"]))
+				.stderr,
+		);
+		expect(reset.ok).toBe(false);
+		expect(reset.code).toBe("DI_STAGE_MERGE_REJECTED");
+		const after = await readState(root);
+		expect((after.state as Record<string, unknown>).crystal).toEqual({ lifecycle: "ready", schema_version: 1 });
+		expect(after.spec_path).toBe("/tmp/crystal.md");
+		expect((after.state as Record<string, unknown>).execution_approval).toBe("not-approved");
+	});
+
+	it("rejects reset without deleting approved Crystal provenance", async () => {
+		const root = await tempDir();
+		await seed(root);
+		const statePath = modeStatePath(root, TEST_SESSION_ID, "deep-interview");
+		const state = await readState(root);
+		state.state = {
+			crystal: { lifecycle: "ready", schema_version: 1 },
+			execution_approval: "approved",
+			execution_approval_receipt: { method: "explicit-state-action", mutation_id: "approval-1" },
+		};
+		await fs.writeFile(statePath, `${JSON.stringify(state)}\n`, "utf8");
+		const before = await fs.readFile(statePath, "utf8");
+		const reset = await run(root, ["write", "--reset", "--input", JSON.stringify({ state: {} }), "--json"]);
+		expect(reset.status).toBe(2);
+		expect(await fs.readFile(statePath, "utf8")).toBe(before);
+		const after = await readState(root);
+		expect((after.state as Record<string, unknown>).execution_approval_receipt).toEqual({
+			method: "explicit-state-action",
+			mutation_id: "approval-1",
+		});
+	});
+
+	it("revokes pre-v2 Crystal authority before staged apply", async () => {
+		const root = await tempDir();
+		const statePath = modeStatePath(root, TEST_SESSION_ID, "deep-interview");
+		await fs.mkdir(path.dirname(statePath), { recursive: true });
+		await fs.writeFile(
+			statePath,
+			`${JSON.stringify({
+				version: 1,
+				skill: "deep-interview",
+				active: true,
+				current_phase: "handoff",
+				spec_path: "/tmp/forged.md",
+				spec_sha256: "a".repeat(64),
+				state: {
+					crystal: { lifecycle: "ready" },
+					execution_approval: "approved",
+					execution_approval_receipt: { method: "explicit-state-action" },
+				},
+			})}\n`,
+			"utf8",
+		);
+		const staged = await run(root, [
+			"stage",
+			"--for",
+			"merge-state",
+			"--input",
+			JSON.stringify({ state: { note: "safe repair" } }),
+			"--json",
+		]);
+		expect(staged.status).toBe(0);
+		const applied = await run(root, ["apply", "--json"]);
+		expect(applied.status).toBe(0);
+		const after = await readState(root);
+		expect(after.current_phase).toBe("interviewing");
+		expect(after.spec_path).toBeUndefined();
+		const inner = after.state as Record<string, unknown>;
+		expect(inner.crystal).toBeUndefined();
+		expect(inner.execution_approval).toBe("not-approved");
+		expect(inner.execution_approval_receipt).toBeUndefined();
+	});
+
 	it("write refuses while a staged draft is pending and strips runtime-owned keys", async () => {
 		const root = await tempDir();
 		await seed(root);
@@ -761,9 +847,12 @@ describe("deep-interview staged transitions", () => {
 		if (read.exists) {
 			expect((read.envelope as Record<string, unknown>).active).toBe(false);
 		}
+		const staged = await run(root, ["write", "--input", JSON.stringify({ state: { revived: true } }), "--json"]);
+		expect(staged.status).not.toBe(0);
+		expect(staged.stderr).toContain("cannot stage after deep-interview handoff or completion");
 	});
 
-	it("strips recorder-owned intent keys from staged payloads", async () => {
+	it("strips runtime-owned intent and execution approval keys from staged payloads", async () => {
 		const root = await tempDir();
 		await seed(root);
 		const staged = parse(
@@ -775,6 +864,8 @@ describe("deep-interview staged transitions", () => {
 						state: {
 							intent_contract: { version: 1, status: "confirmed", items: [] },
 							intent_review: { version: 1, status: "approved" },
+							execution_approval: "approved",
+							execution_approval_receipt: { method: "forged" },
 							note: "payload with fabricated contract",
 						},
 					}),
@@ -784,12 +875,19 @@ describe("deep-interview staged transitions", () => {
 		);
 		expect(staged.ok).toBe(true);
 		expect(staged.ignored_runtime_owned_keys).toEqual(
-			expect.arrayContaining(["state.intent_contract", "state.intent_review"]),
+			expect.arrayContaining([
+				"state.intent_contract",
+				"state.intent_review",
+				"state.execution_approval",
+				"state.execution_approval_receipt",
+			]),
 		);
 		const after = await readState(root);
 		const state = after.state as Record<string, unknown>;
 		expect(state.intent_contract).toBeUndefined();
 		expect(state.intent_review).toBeUndefined();
+		expect(state.execution_approval).toBeUndefined();
+		expect(state.execution_approval_receipt).toBeUndefined();
 		expect(state.note).toBe("payload with fabricated contract");
 	});
 

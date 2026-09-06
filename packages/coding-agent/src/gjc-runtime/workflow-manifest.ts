@@ -70,22 +70,16 @@ const PLANNED_ADMIN_VERBS = ["graph", "prune", "migrate", "force-overwrite"] as 
 
 const COMMON_TYPED_ARGS: TypedArgSpec[] = [
 	{ name: "input", type: "string", appliesToVerbs: ["write", "api"] },
-	{ name: "mode", type: "enum", enumValues: [...CANONICAL_GJC_WORKFLOW_SKILLS], appliesToVerbs: [...STATE_VERBS] },
+	{
+		name: "mode",
+		type: "enum",
+		enumValues: [...CANONICAL_GJC_WORKFLOW_SKILLS],
+		appliesToVerbs: [...STATE_VERBS],
+	},
 	{
 		name: "session-id",
 		type: "string",
-		appliesToVerbs: [
-			...STATE_VERBS,
-			"kickoff",
-			"write-spec",
-			"write-artifact",
-			"stage",
-			"check",
-			"apply",
-			"discard",
-			"read",
-			"write",
-		],
+		appliesToVerbs: [...STATE_VERBS, "kickoff", "write-spec", "write-artifact", "stage", "check", "apply", "discard"],
 	},
 	{ name: "thread-id", type: "string", appliesToVerbs: ["write", "clear", "handoff"] },
 	{ name: "turn-id", type: "string", appliesToVerbs: ["write", "clear", "handoff"] },
@@ -137,9 +131,18 @@ function manifest(input: {
 	phaseLock?: readonly string[];
 	canonicalOverrides?: readonly string[];
 	initialState?: string;
+	commonTypedArgs?: TypedArgSpec[];
 }): SkillManifest {
 	const staleInitialState = initialPhaseForSkill(input.skill);
 	const initialState = input.initialState ?? staleInitialState;
+	const supportedVerbs = new Set([...input.verbs.map(item => item.name), "api"]);
+	const typedArgs = [...(input.commonTypedArgs ?? COMMON_TYPED_ARGS), ...(input.typedArgs ?? [])]
+		.map(argument =>
+			argument.appliesToVerbs === undefined
+				? argument
+				: { ...argument, appliesToVerbs: argument.appliesToVerbs.filter(verb => supportedVerbs.has(verb)) },
+		)
+		.filter(argument => argument.appliesToVerbs === undefined || argument.appliesToVerbs.length > 0);
 	return {
 		skill: input.skill,
 		states: input.states.map(item => state(item, initialState, input.terminalStates)),
@@ -147,7 +150,7 @@ function manifest(input: {
 		terminalStates: input.terminalStates,
 		transitions: input.transitions,
 		verbs: input.verbs,
-		typedArgs: [...COMMON_TYPED_ARGS, ...(input.typedArgs ?? [])],
+		typedArgs,
 		retention: input.retention,
 		hudFields: input.hudFields,
 		graphLabel: input.graphLabel,
@@ -171,32 +174,63 @@ export const WORKFLOW_MANIFEST: Record<CanonicalGjcWorkflowSkill, SkillManifest>
 		terminalStates: ["handoff", "complete"],
 		transitions: [
 			{ from: "interviewing", to: "handoff", verb: "write-spec" },
+			{ from: "interviewing", to: "handoff", verb: "crystallize" },
 			{ from: "handoff", to: "complete", verb: "clear" },
 			{ from: "interviewing", to: "complete", verb: "clear" },
 		],
 		verbs: [
 			...stateVerbs(),
-			...flagVerbs(["kickoff", "write-spec"]),
-			...positionalVerbs(["stage", "check", "apply", "discard", "read", "write", "clear", "handoff"]),
+			...flagVerbs(["kickoff", "write-spec", "crystallize"]),
+			...positionalVerbs([
+				"stage",
+				"check",
+				"apply",
+				"discard",
+				"read",
+				"write",
+				"clear",
+				"handoff",
+				"approve-execution",
+			]),
 			...plannedVerbs(PLANNED_ADMIN_VERBS),
 		],
+		commonTypedArgs: COMMON_TYPED_ARGS.filter(argument => argument.name !== "input"),
 		typedArgs: [
 			{ name: "quick", type: "boolean", appliesToVerbs: ["kickoff"] },
 			{ name: "standard", type: "boolean", appliesToVerbs: ["kickoff"] },
 			{ name: "deep", type: "boolean", appliesToVerbs: ["kickoff"] },
+			{ name: "trace", type: "boolean", appliesToVerbs: ["kickoff"] },
 			{ name: "threshold", type: "number", appliesToVerbs: ["kickoff"] },
 			{ name: "threshold-source", type: "string", appliesToVerbs: ["kickoff"] },
 			{ name: "stage", type: "enum", enumValues: ["final"], appliesToVerbs: ["write-spec"] },
 			{ name: "slug", type: "string", appliesToVerbs: ["write-spec"] },
+			{ name: "slug", type: "string", required: true, appliesToVerbs: ["crystallize"] },
 			{ name: "spec", type: "string", required: true, appliesToVerbs: ["write-spec"] },
 			{ name: "handoff", type: "enum", enumValues: ["ralplan"], appliesToVerbs: ["write-spec"] },
 			{ name: "deliberate", type: "boolean", appliesToVerbs: ["write-spec"] },
+			{ name: "force", type: "boolean", appliesToVerbs: ["write-spec"] },
 			{
 				name: "json",
 				type: "boolean",
-				appliesToVerbs: ["write-spec", "stage", "check", "apply", "discard", "read", "write", "clear", "handoff"],
+				appliesToVerbs: [
+					"kickoff",
+					"write-spec",
+					"crystallize",
+					"stage",
+					"check",
+					"apply",
+					"discard",
+					"read",
+					"write",
+					"clear",
+					"handoff",
+					"approve-execution",
+				],
 			},
-			{ name: "input", type: "string", required: true, appliesToVerbs: ["stage", "write"] },
+			{ name: "input", type: "string", appliesToVerbs: ["api"] },
+			{ name: "input", type: "string", required: true, appliesToVerbs: ["write", "stage", "crystallize"] },
+			{ name: "mode", type: "enum", enumValues: ["deep-interview"], appliesToVerbs: ["approve-execution"] },
+			{ name: "session-id", type: "string", appliesToVerbs: ["crystallize", "approve-execution"] },
 			{ name: "reset", type: "boolean", appliesToVerbs: ["write"] },
 			{
 				name: "for",
@@ -507,9 +541,8 @@ export function listVerbs(skill: CanonicalGjcWorkflowSkill): string[] {
 }
 
 export function typedArgsFor(skill: CanonicalGjcWorkflowSkill, verb: string): TypedArgSpec[] {
-	return WORKFLOW_MANIFEST[skill].typedArgs.filter(
-		arg => arg.appliesToVerbs === undefined || arg.appliesToVerbs.includes(verb),
-	);
+	const manifest = WORKFLOW_MANIFEST[skill];
+	return manifest.typedArgs.filter(arg => arg.appliesToVerbs === undefined || arg.appliesToVerbs.includes(verb));
 }
 
 function stableSort(value: unknown): unknown {

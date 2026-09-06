@@ -19,6 +19,7 @@ import {
 import { getConfigRootDir, setAgentDir } from "@gajae-code/utils";
 import { YAML } from "bun";
 import { resetSettingsForTest } from "../../src/config/settings";
+import { WORKFLOW_STATE_VERSION } from "../../src/skill-state/workflow-state-contract";
 
 const tempRoots: string[] = [];
 const codingAgentRoot = path.resolve(path.dirname(url.fileURLToPath(import.meta.url)), "../..");
@@ -59,6 +60,12 @@ afterAll(() => {
 });
 
 describe("native gjc deep-interview runtime", () => {
+	it("rejects unsupported crystallize arguments before reading input", async () => {
+		const root = await tempDir();
+		const result = await runNativeDeepInterviewCommand(["--crystallize", "--write", "--json"], root);
+		expect(result.status).toBe(2);
+		expect(result.stderr).toContain("unsupported crystallize argument: --write");
+	});
 	it("advertises the deep-interview spec persistence and handoff surface in command help", async () => {
 		const source = await fs.readFile(path.join(codingAgentRoot, "src/commands/deep-interview.ts"), "utf-8");
 		// The lightweight CLI help renderer advertises exactly the static flags/examples declared by the command.
@@ -99,6 +106,34 @@ describe("native gjc deep-interview runtime", () => {
 		const validState = JSON.parse(await fs.readFile(validStatePath, "utf-8"));
 		expect(validState.transcript).toEqual([{ question: "q", answer: "a" }]);
 		expect(validState.spec_slug).toBe("valid-state");
+	});
+
+	it("rejects future deep-interview state through every native writer", async () => {
+		for (const action of ["seed", "spec", "crystallize"] as const) {
+			const root = await tempDir();
+			const statePath = modeStatePath(root, TEST_SESSION_ID, "deep-interview");
+			await fs.mkdir(path.dirname(statePath), { recursive: true });
+			await fs.writeFile(
+				statePath,
+				`${JSON.stringify({ skill: "deep-interview", version: WORKFLOW_STATE_VERSION + 1, active: true, current_phase: "interviewing", future_field: "preserve" })}\n`,
+			);
+			const before = await fs.readFile(statePath, "utf8");
+			const result =
+				action === "seed"
+					? await runNativeDeepInterviewCommand(["future state"], root)
+					: action === "spec"
+						? await runNativeDeepInterviewCommand(
+								["--write", "--stage", "final", "--slug", "future", "--spec", "# Future", "--json"],
+								root,
+							)
+						: await runNativeDeepInterviewCommand(
+								["--crystallize", "--input", "{}", "--slug", "future", "--json"],
+								root,
+							);
+			expect(result.status, action).toBe(2);
+			expect(result.stderr, action).toContain("unsupported future deep-interview state version");
+			expect(await fs.readFile(statePath, "utf8"), action).toBe(before);
+		}
 	});
 
 	it("enforces locked-intent review before creating a spec while preserving legacy handoff", async () => {

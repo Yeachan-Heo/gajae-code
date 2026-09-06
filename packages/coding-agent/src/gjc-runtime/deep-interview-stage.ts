@@ -14,6 +14,7 @@ import {
 } from "./deep-interview-state";
 import { sessionStateDir } from "./session-layout";
 import { resolveGjcSessionForWrite, SessionResolutionError, writeSessionActivityMarker } from "./session-resolution";
+import { migrateWorkflowState } from "./state-migrations";
 import { runNativeStateCommand } from "./state-runtime";
 import {
 	persistedStateRevision,
@@ -184,7 +185,12 @@ const RUNTIME_OWNED_ENVELOPE_KEYS = [
  * `invalid intent contract`, bricking the interview until a destructive
  * `clear --force`. The recorder is the only writer that can lock intent.
  */
-const RECORDER_OWNED_STATE_KEYS = ["intent_contract", "intent_review"] as const;
+const RUNTIME_OWNED_STATE_KEYS = [
+	"intent_contract",
+	"intent_review",
+	"execution_approval",
+	"execution_approval_receipt",
+] as const;
 
 /**
  * Remove sanitizer-owned keys from a staged payload and classify the
@@ -213,7 +219,7 @@ function sanitizeStagedPayload(payload: Record<string, unknown>): {
 	}
 	if (isPlainObject(next.state)) {
 		const state = { ...(next.state as Record<string, unknown>) };
-		for (const key of RECORDER_OWNED_STATE_KEYS) {
+		for (const key of RUNTIME_OWNED_STATE_KEYS) {
 			if (key in state) {
 				delete state[key];
 				ignoredKeys.push(`state.${key}`);
@@ -371,7 +377,7 @@ async function readCurrentState(cwd: string, sessionId: string): Promise<Current
 	if (read.kind === "absent")
 		return { value: {}, revision: 0, sha256: workflowEnvelopeContentSha256({}), exists: false };
 	return {
-		value: read.value,
+		value: migrateWorkflowState(read.value, "deep-interview").state,
 		revision: persistedStateRevision(read.value),
 		sha256: workflowEnvelopeContentSha256(read.value),
 		exists: true,
@@ -430,6 +436,11 @@ function computeMergedEnvelope(
 	draft: DeepInterviewStageDraft,
 	nowIso: string,
 ): Record<string, unknown> {
+	if (current.active === false)
+		throw new DeepInterviewStageError(
+			"DI_STAGE_MERGE_REJECTED",
+			"cannot stage after deep-interview handoff or completion",
+		);
 	// A poisoned (unverifiable) intent contract in the persisted base would make
 	// every merge throw forever; heal it instead of bricking the interview.
 	const { base: healedCurrent, healed } = healPoisonedIntentContract(current);
@@ -454,6 +465,39 @@ function computeMergedEnvelope(
 	// one-fact patch cannot erase confirmed/disputed history (#3387 finding 2).
 	const mergedState = isPlainObject(merged.state) ? (merged.state as Record<string, unknown>) : undefined;
 	const priorState = isPlainObject(current.state) ? (current.state as Record<string, unknown>) : undefined;
+	if (priorState?.crystal === undefined && mergedState?.crystal !== undefined)
+		throw new DeepInterviewStageError(
+			"DI_STAGE_MERGE_REJECTED",
+			"staged apply cannot introduce canonical Crystal state",
+		);
+	if (priorState?.crystal !== undefined) {
+		if (!mergedState || JSON.stringify(mergedState.crystal) !== JSON.stringify(priorState.crystal))
+			throw new DeepInterviewStageError(
+				"DI_STAGE_MERGE_REJECTED",
+				"canonical crystallized state cannot be replaced or deleted through staged apply",
+			);
+		if (mergedState.execution_approval !== priorState.execution_approval)
+			throw new DeepInterviewStageError(
+				"DI_STAGE_MERGE_REJECTED",
+				"crystallized execution approval is immutable through staged apply",
+			);
+		if (
+			JSON.stringify(mergedState.execution_approval_receipt) !==
+			JSON.stringify(priorState.execution_approval_receipt)
+		)
+			throw new DeepInterviewStageError(
+				"DI_STAGE_MERGE_REJECTED",
+				"crystallized execution approval provenance is immutable through staged apply",
+			);
+		for (const field of ["spec_path", "spec_sha256", "spec_slug", "spec_stage"] as const)
+			if (merged[field] !== current[field])
+				throw new DeepInterviewStageError(
+					"DI_STAGE_MERGE_REJECTED",
+					`crystallized ${field} is immutable through staged apply`,
+				);
+	}
+	if (mergedState?.crystal && isPlainObject(mergedState.crystal) && mergedState.crystal.lifecycle !== "ready")
+		merged.current_phase = "interviewing";
 	if (mergedState && priorState && Array.isArray(priorState.established_facts)) {
 		mergedState.established_facts = mergeEstablishedFacts(
 			priorState.established_facts,
@@ -461,6 +505,24 @@ function computeMergedEnvelope(
 		);
 	}
 	merged = deriveRuntimeAmbiguity(merged, current);
+	if (isPlainObject(priorState?.crystal) && priorState.crystal.lifecycle === "ready") {
+		for (const field of [
+			"rounds",
+			"established_facts",
+			"intent_review",
+			"current_ambiguity",
+			"topology",
+			"auto_answered_rounds",
+		] as const)
+			if (
+				JSON.stringify((merged.state as Record<string, unknown> | undefined)?.[field]) !==
+				JSON.stringify(priorState[field])
+			)
+				throw new DeepInterviewStageError(
+					"DI_STAGE_MERGE_REJECTED",
+					"ready Crystal evidence is immutable through staged apply",
+				);
+	}
 	try {
 		assertDeepInterviewEnvelopeInputLimits(merged);
 	} catch (error) {
@@ -851,6 +913,14 @@ async function handleWrite(args: readonly string[], cwd: string): Promise<Record
 				);
 			}
 			const current = await readCurrentState(cwd, sessionId);
+			const currentInner = isPlainObject(current.value.state) ? current.value.state : {};
+			if (reset && currentInner.crystal !== undefined) {
+				throw new DeepInterviewStageError(
+					"DI_STAGE_MERGE_REJECTED",
+					"reset cannot rewrite canonical Crystal state",
+					"clear the workflow explicitly or continue through the approval and handoff lifecycle",
+				);
+			}
 			const nowIso = new Date().toISOString();
 			const syntheticDraft: DeepInterviewStageDraft = {
 				version: DRAFT_VERSION,
@@ -862,16 +932,39 @@ async function handleWrite(args: readonly string[], cwd: string): Promise<Record
 				payload,
 				created_at: nowIso,
 			};
-			// --reset replaces: merge against an empty base but re-lock the intent
-			// contract from prior state through the merge's own immutability guard.
+			// --reset replaces free-form interview state but retains every runtime-owned
+			// Crystal/approval/spec field so computeMergedEnvelope can enforce its
+			// immutability guard against the real canonical base.
 			const base = reset
 				? (() => {
+						const baseEnvelope: Record<string, unknown> = {};
+						for (const field of [
+							"skill",
+							"version",
+							"active",
+							"current_phase",
+							"session_id",
+							"spec_slug",
+							"spec_path",
+							"spec_stage",
+							"spec_sha256",
+							"spec_persisted_at",
+						] as const)
+							if (current.value[field] !== undefined) baseEnvelope[field] = current.value[field];
 						const priorState = isPlainObject(current.value.state)
 							? (current.value.state as Record<string, unknown>)
 							: {};
-						return priorState.intent_contract !== undefined
-							? { state: { intent_contract: priorState.intent_contract, intent_contract_required: true } }
-							: {};
+						const retainedState: Record<string, unknown> = {};
+						for (const field of [
+							"crystal",
+							"execution_approval",
+							"execution_approval_receipt",
+							"intent_contract",
+							"intent_contract_required",
+						] as const)
+							if (priorState[field] !== undefined) retainedState[field] = priorState[field];
+						if (Object.keys(retainedState).length > 0) baseEnvelope.state = retainedState;
+						return baseEnvelope;
 					})()
 				: current.value;
 			const merged = computeMergedEnvelope(base as Record<string, unknown>, syntheticDraft, nowIso);
@@ -930,7 +1023,7 @@ async function syncStageHud(cwd: string, sessionId: string, envelope: Record<str
 		await syncSkillActiveState({
 			cwd,
 			skill: "deep-interview",
-			active: phase !== "complete",
+			active: envelope.active !== false && phase !== "complete",
 			phase,
 			sessionId,
 			source: "gjc-deep-interview-native",
