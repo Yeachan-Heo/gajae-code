@@ -4250,6 +4250,7 @@ test("reconcile_uncertain replays a ledger-stage receipt after deletion and same
 	const lifecycleRequestId = "reconcile-delete-effect";
 	const remoteCreateKey = "reconcile-delete-create";
 	const retirementKey = "reconcile-delete-retirement";
+	const endpointFileId = "41:1";
 	const child = spawnDisposableHost();
 	const broker = new Broker({ agentDir });
 	const createIdentity = "reconcile-delete-create-identity";
@@ -4262,6 +4263,7 @@ test("reconcile_uncertain replays a ledger-stage receipt after deletion and same
 			stateRoot,
 			endpointGeneration: 4,
 			endpointMtimeMs: 1,
+			endpointFileId,
 			lifecycleRequestId,
 			processIncarnation: processIdentity,
 			hostIncarnation: processIdentity,
@@ -4279,6 +4281,7 @@ test("reconcile_uncertain replays a ledger-stage receipt after deletion and same
 			endpointGeneration: input.endpointGeneration,
 			pid: process.pid,
 			endpointMtimeMs: input.endpointMtimeMs,
+			endpointFileId,
 			lifecycleRequestId: "older-incarnation",
 			processIncarnation: "older-process",
 			hostIncarnation: "older-host",
@@ -4290,6 +4293,7 @@ test("reconcile_uncertain replays a ledger-stage receipt after deletion and same
 			endpointGeneration: input.endpointGeneration,
 			pid: child.pid,
 			endpointMtimeMs: input.endpointMtimeMs,
+			endpointFileId,
 			lifecycleRequestId,
 			processIncarnation: processIdentity,
 			hostIncarnation: processIdentity,
@@ -4301,6 +4305,7 @@ test("reconcile_uncertain replays a ledger-stage receipt after deletion and same
 			endpointGeneration: input.endpointGeneration,
 			pid: child.pid,
 			endpointMtimeMs: input.endpointMtimeMs,
+			endpointFileId,
 			lifecycleRequestId,
 			processIncarnation: processIdentity,
 			hostIncarnation: processIdentity,
@@ -4354,6 +4359,7 @@ test("reconcile_uncertain replays a ledger-stage receipt after deletion and same
 			processIncarnation: indexed.processIncarnation,
 			hostIncarnation: indexed.hostIncarnation,
 			endpointMtimeMs: indexed.endpointMtimeMs,
+			endpointFileId: indexed.endpointFileId,
 			lifecycleRequestId: indexed.lifecycleRequestId,
 		});
 		await expect(
@@ -4366,6 +4372,7 @@ test("reconcile_uncertain replays a ledger-stage receipt after deletion and same
 			endpointGeneration: indexed.endpointGeneration,
 			pid: indexed.pid,
 			endpointMtimeMs: input.endpointMtimeMs + 1,
+			endpointFileId: "41:2",
 			lifecycleRequestId: "same-id-successor",
 			processIncarnation: input.processIncarnation,
 			hostIncarnation: input.hostIncarnation,
@@ -4412,6 +4419,7 @@ test("reconcile_uncertain fails closed when deletion wins the closure append rac
 	const lifecycleRequestId = "reconcile-index-delete-effect";
 	const remoteCreateKey = "reconcile-index-delete-create";
 	const retirementKey = "reconcile-index-delete-retirement";
+	const endpointFileId = "42:1";
 	const child = spawnDisposableHost();
 	const broker = new Broker({ agentDir });
 	const createIdentity = "reconcile-index-delete-create-identity";
@@ -4424,6 +4432,7 @@ test("reconcile_uncertain fails closed when deletion wins the closure append rac
 			stateRoot,
 			endpointGeneration: 4,
 			endpointMtimeMs: 1,
+			endpointFileId,
 			lifecycleRequestId,
 			processIncarnation: processIdentity,
 			hostIncarnation: processIdentity,
@@ -4441,6 +4450,7 @@ test("reconcile_uncertain fails closed when deletion wins the closure append rac
 			endpointGeneration: input.endpointGeneration,
 			pid: child.pid,
 			endpointMtimeMs: input.endpointMtimeMs,
+			endpointFileId,
 			lifecycleRequestId,
 			processIncarnation: processIdentity,
 			hostIncarnation: processIdentity,
