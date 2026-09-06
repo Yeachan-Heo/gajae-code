@@ -2997,6 +2997,33 @@ test("session index proves ordinary host unregistration using a newer matching r
 	}
 });
 
+test("session index accepts a legacy unregister that predates endpoint file identity", async () => {
+	const agentDir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-session-index-legacy-unregister-"));
+	const index = await new SessionIndex(agentDir).open();
+	try {
+		const shared = {
+			sessionId: "legacy-unregister",
+			locator: { cwd: "fixture", worktreeRoot: null, stateRoot: path.join(agentDir, "state") },
+			endpointGeneration: 7,
+			pid: process.pid,
+			lifecycleRequestId: "legacy-close",
+		};
+		const registration = await index.append({
+			type: "host_registered",
+			...shared,
+			endpointMtimeMs: 1234,
+			endpointFileId: "11:22",
+		});
+		await index.append({ type: "host_unregistered", ...shared });
+		expect(index.hostUnregisteredAfter(registration)).toEqual({
+			indexSeq: registration.indexSeq + 1,
+			lifecycleRequestId: "legacy-close",
+		});
+	} finally {
+		await fs.rm(agentDir, { recursive: true, force: true });
+	}
+});
+
 test("broker records the resolved worktree state root and preserves pre-child preparation failures", async () => {
 	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-lifecycle-worktree-prechild-"));
 	const repo = path.join(root, "repo");

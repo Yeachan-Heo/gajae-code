@@ -294,9 +294,6 @@ export class ChatEffectJournal {
 					...current,
 					generation: current.generation + 1,
 					payload,
-					...(current.state === "leased"
-						? { owner: undefined, leaseExpiresAt: undefined, epoch: current.epoch + 1 }
-						: {}),
 					updatedAt: this.#now(),
 				};
 			});

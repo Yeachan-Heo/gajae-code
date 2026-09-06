@@ -5664,12 +5664,28 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 	async function migrateLegacySessionEndpointAuthority(
 		session: CanonicalSessionSnapshotV1,
 	): Promise<CanonicalSessionSnapshotV1> {
-		if (session.broker.endpoint_file_id !== undefined) return session;
 		if (!session.broker.workspace) throw new Error("coordinator_workspace_required");
 		const persistedWorkspace = await canonicalBrokerWorkspace(session.broker.workspace);
 		const authority = await exactBrokerSessionAuthority(session.session_id, persistedWorkspace);
 		if (authority.endpointGeneration !== session.broker.endpoint_generation)
 			throw new SdkClientError("endpoint_stale", "Coordinator session endpoint authority changed.");
+		if (session.broker.endpoint_file_id !== undefined) {
+			if (
+				authority.endpointFileId !== session.broker.endpoint_file_id ||
+				authority.endpointIncarnation !== session.broker.endpoint_incarnation ||
+				authority.legacyEndpointIncarnation === undefined
+			)
+				throw new SdkClientError("endpoint_stale", "Coordinator session endpoint authority changed.");
+			const reconciled = await rewriteSessionEndpointAuthorityAndDeletions(
+				questionPaths,
+				session.session_id,
+				authority.legacyEndpointIncarnation,
+				authority.endpointIncarnation,
+				authority.endpointFileId,
+			);
+			await writeJsonFile(sessionFile(session.session_id), sessionFromCreationSnapshot(reconciled));
+			return reconciled;
+		}
 		if (authority.endpointFileId === undefined) {
 			if (authority.endpointIncarnation !== session.broker.endpoint_incarnation)
 				throw new SdkClientError("endpoint_stale", "Coordinator session endpoint authority changed.");
@@ -9035,7 +9051,8 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 									const authority = await exactBrokerSessionAuthority(sessionId, cwd);
 									if (
 										authority.endpointGeneration !== proof.endpoint_generation ||
-										authority.endpointFileId === undefined
+										authority.endpointFileId === undefined ||
+										authority.legacyEndpointIncarnation === undefined
 									)
 										throw new SdkClientError(
 											"retirement_proof_stale",
@@ -9045,6 +9062,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 										questionPaths,
 										creationKeyDigest,
 										proof,
+										authority.legacyEndpointIncarnation,
 										authority.endpointFileId,
 									);
 									proof = { ...proof, endpoint_file_id: authority.endpointFileId };

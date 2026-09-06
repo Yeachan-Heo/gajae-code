@@ -848,6 +848,38 @@ describe("SessionLifecycleService", () => {
 		expect(client.calls[0]?.input).toEqual({ ...target });
 	});
 
+	it("accepts broker-proven endpoint file identity for a legacy retirement target", async () => {
+		const target: SessionReconcileUncertainTarget = {
+			sessionId: "legacy-retired-session",
+			cwd: "/tmp/workspace",
+			stateRoot: "/tmp/workspace/.gjc/state",
+			endpointGeneration: 2,
+			endpointMtimeMs: 1,
+			processIncarnation: "linux:123",
+			hostIncarnation: "host:123",
+			lifecycleRequestId: "retire-effect",
+			remoteCreateKey: "remote-create-key",
+		};
+		const client = new FakeLifecycleClient();
+		client.response = {
+			ok: true,
+			result: {
+				...target,
+				endpointFileId: "dev:456",
+				retired: true,
+				ledgerState: "terminal_error",
+				indexType: "session_closed",
+			},
+		};
+		const result = await new SessionLifecycleService(client).reconcileUncertain({
+			actor,
+			capability: "session.reconcile_uncertain",
+			requestKey: "legacy-retire-request",
+			target,
+		});
+		expect(result).toMatchObject({ ok: true, result: { endpointFileId: "dev:456" } });
+	});
+
 	it("rejects a proofless successful broker envelope", async () => {
 		const client = new FakeLifecycleClient();
 		client.response = { ok: true, result: { sessionId: "retired-session" } };

@@ -2279,8 +2279,9 @@ export class SessionIndex {
 				item.sessionId === registration.sessionId &&
 				item.endpointGeneration === registration.endpointGeneration &&
 				item.pid === registration.pid &&
-				item.endpointMtimeMs === registration.endpointMtimeMs &&
-				item.endpointFileId === registration.endpointFileId &&
+				((item.endpointMtimeMs === undefined && item.endpointFileId === undefined) ||
+					(item.endpointMtimeMs === registration.endpointMtimeMs &&
+						item.endpointFileId === registration.endpointFileId)) &&
 				resolveEquivalentPath(item.locator.cwd) === resolveEquivalentPath(registration.locator.cwd) &&
 				path.resolve(item.locator.stateRoot) === path.resolve(registration.locator.stateRoot) &&
 				(lifecycleRequestId === undefined || item.lifecycleRequestId === lifecycleRequestId) &&

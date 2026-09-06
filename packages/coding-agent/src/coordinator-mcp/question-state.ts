@@ -2749,6 +2749,7 @@ export async function upgradeCreationRetirementEndpointFileId(
 	paths: CoordinatorStatePaths,
 	keyDigest: string,
 	legacyProof: CreationRetirementProofV1,
+	expectedLegacyEndpointIncarnation: string,
 	endpointFileId: string,
 ): Promise<CreationRequestV1> {
 	return await withNamespaceRegistry(paths, async registry => {
@@ -2756,7 +2757,13 @@ export async function upgradeCreationRetirementEndpointFileId(
 		if (!request) throw new Error("state_corrupt");
 		if (legacyProof.endpoint_file_id !== undefined || !endpointFileId) throw new Error("invalid_input");
 		const intent = request.canonical_create_intent;
-		if (!intent || intent.session.broker.endpoint_file_id !== undefined) throw new Error("idempotency_conflict");
+		if (!intent || intent.session.broker.endpoint_incarnation !== expectedLegacyEndpointIncarnation)
+			throw new Error("idempotency_conflict");
+		if (intent.session.broker.endpoint_file_id !== undefined) {
+			if (intent.session.broker.endpoint_file_id !== endpointFileId) throw new Error("idempotency_conflict");
+			assertCreationRetirementProofMatches(request, { ...legacyProof, endpoint_file_id: endpointFileId });
+			return request;
+		}
 		assertCreationRetirementProofMatches(request, legacyProof);
 		intent.session.broker.endpoint_file_id = endpointFileId;
 		if (request.retirement_intent) {
