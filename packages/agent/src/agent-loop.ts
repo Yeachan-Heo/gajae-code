@@ -4267,7 +4267,13 @@ async function runLoopBody(
 				);
 				const toolResults: ToolResultMessage[] = [];
 				for (const toolCall of toolCalls) {
-					const result = createAbortedToolResult(toolCall, stream, message.stopReason, message.errorMessage);
+					const result = createAbortedToolResult(
+						toolCall,
+						stream,
+						message.stopReason,
+						message.errorMessage,
+						attemptScope,
+					);
 					currentContext.messages.push(result);
 					newMessages.push(result);
 					toolResults.push(result);
@@ -4311,6 +4317,7 @@ async function runLoopBody(
 							stream,
 							"error",
 							"Tool calls are disabled during repeated malformed tool-call recovery.",
+							attemptScope,
 						);
 						currentContext.messages.push(result);
 						newMessages.push(result);
@@ -5668,6 +5675,7 @@ function createAbortedToolResult(
 	stream: EventStream<AgentEvent, AgentMessage[]>,
 	reason: "aborted" | "error",
 	errorMessage?: string,
+	scope?: AttemptScope,
 ): ToolResultMessage {
 	toolCall = stripToolCallEvidence(toolCall);
 	const message = reason === "aborted" ? "Tool execution was aborted" : "Tool execution failed due to an error";
@@ -5688,6 +5696,7 @@ function createAbortedToolResult(
 		toolName: toolCall.name,
 		args: toolCall.arguments,
 		intent: toolCall.intent,
+		scope,
 	};
 	markNonDispatchedToolEvent(startEvent);
 	stream.push(startEvent);
@@ -5697,6 +5706,7 @@ function createAbortedToolResult(
 		toolName: toolCall.name,
 		result,
 		isError: true,
+		scope,
 	};
 	markNonDispatchedToolEvent(endEvent);
 	stream.push(endEvent);
@@ -5711,8 +5721,8 @@ function createAbortedToolResult(
 		timestamp: Date.now(),
 	};
 
-	stream.push({ type: "message_start", message: toolResultMessage });
-	stream.push({ type: "message_end", message: toolResultMessage });
+	stream.push({ type: "message_start", message: toolResultMessage, scope });
+	stream.push({ type: "message_end", message: toolResultMessage, scope });
 
 	return toolResultMessage;
 }
