@@ -141,6 +141,42 @@ describe("agentLoop with AgentMessage", () => {
 		expect(eventTypes).toContain("agent_end");
 	});
 
+	it("emits message_end when the provider iterator returns a trailing assistant without done", async () => {
+		const context: AgentContext = { systemPrompt: ["You are helpful."], messages: [], tools: [] };
+		const mock = createMockModel();
+		const trailing = createAssistantMessage([{ type: "text", text: "trailing final" }]);
+		const streamFn = () => {
+			const response = new AssistantMessageEventStream();
+			queueMicrotask(() => {
+				response.push({ type: "start", partial: trailing });
+				response.end(trailing);
+			});
+			return response;
+		};
+		const events: AgentEvent[] = [];
+		const stream = agentLoop(
+			[createUserMessage("Hello")],
+			context,
+			{ model: mock.model, convertToLlm: identityConverter },
+			undefined,
+			streamFn,
+		);
+
+		for await (const event of stream) events.push(event);
+		const messages = await stream.result();
+		const assistantEnds = events.filter(
+			(event): event is Extract<AgentEvent, { type: "message_end" }> =>
+				event.type === "message_end" && event.message.role === "assistant",
+		);
+
+		expect(assistantEnds).toHaveLength(1);
+		const terminal = assistantEnds[0]?.message;
+		if (terminal?.role !== "assistant") throw new Error("Expected trailing assistant message_end");
+		expect(terminal.content).toEqual([{ type: "text", text: "trailing final" }]);
+		expect(events.slice(-3).map(event => event.type)).toEqual(["message_end", "turn_end", "agent_end"]);
+		expect(messages.filter(message => message.role === "assistant")).toHaveLength(1);
+	});
+
 	it("emits an aborted assistant message when cancellation happens before provider events", async () => {
 		const context: AgentContext = {
 			systemPrompt: ["You are helpful."],

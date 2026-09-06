@@ -6305,9 +6305,20 @@ export class AgentSession {
 
 	// Track last assistant message for auto-compaction check
 	#lastAssistantMessage: AssistantMessage | undefined = undefined;
+	#sessionIdentityEpoch = 0;
 	#provisionalAssistantMessage:
-		| { message: AssistantMessage; promptGeneration: number; attemptScope: AttemptScope | undefined }
+		| {
+				message: AssistantMessage;
+				promptGeneration: number;
+				attemptScope: AttemptScope | undefined;
+				sessionIdentityEpoch: number;
+		  }
 		| undefined;
+
+	#advanceSessionIdentityEpoch(): void {
+		this.#sessionIdentityEpoch++;
+		this.#provisionalAssistantMessage = undefined;
+	}
 	// Admission slot of the last message_end per assistant message, so the
 	// agent_end handler can join the terminal's canonical admission before any
 	// post-turn write reaches the branch.
@@ -6398,25 +6409,29 @@ export class AgentSession {
 		if (ttsrTerminal && terminalSnapshot.ttsrAbort !== true) {
 			Object.defineProperty(event, "ttsrAbort", { value: true, enumerable: true });
 		}
-		const assistantSnapshot =
-			event.type === "message_start" && event.message.role === "assistant"
-				? event.message
-				: event.type === "message_update" && event.message.role === "assistant"
-					? event.message
-					: undefined;
-		if (assistantSnapshot) {
+		if (event.type === "message_start" && event.message.role === "assistant") {
 			this.#provisionalAssistantMessage = {
-				message: assistantSnapshot,
+				message: event.message,
 				promptGeneration: this.#promptGeneration,
 				attemptScope,
+				sessionIdentityEpoch: this.#sessionIdentityEpoch,
 			};
+		} else if (
+			event.type === "message_update" &&
+			event.message.role === "assistant" &&
+			this.#provisionalAssistantMessage?.promptGeneration === this.#promptGeneration &&
+			this.#provisionalAssistantMessage.attemptScope === attemptScope &&
+			this.#provisionalAssistantMessage.sessionIdentityEpoch === this.#sessionIdentityEpoch
+		) {
+			this.#provisionalAssistantMessage.message = event.message;
 		}
 		const orphanAssistant =
 			event.type === "agent_end" &&
 			event.stopReason === "cancelled" &&
 			!event.messages.some(message => message.role === "assistant") &&
 			this.#provisionalAssistantMessage?.promptGeneration === this.#promptGeneration &&
-			this.#provisionalAssistantMessage.attemptScope === attemptScope
+			this.#provisionalAssistantMessage.attemptScope === attemptScope &&
+			this.#provisionalAssistantMessage.sessionIdentityEpoch === this.#sessionIdentityEpoch
 				? this.#provisionalAssistantMessage.message
 				: undefined;
 		if (event.type === "turn_start" || (event.type === "message_end" && event.message.role === "assistant")) {
@@ -6582,8 +6597,21 @@ export class AgentSession {
 			try {
 				this.sessionManager.appendMessage(recoveredAssistant);
 			} catch (error) {
-				this.agent.abort();
-				throw error;
+				if (error instanceof SessionNearLimitAppendError && error.entryRetained) {
+					this.emitNotice(
+						"warning",
+						"Interrupted assistant output is retained in the live session but could not be written durably. Compact or export the session before continuing.",
+						"session-persistence",
+					);
+				} else {
+					this.emitNotice(
+						"error",
+						"Interrupted assistant output could not be committed to session history. Reconcile session storage before continuing.",
+						"session-persistence",
+					);
+					this.agent.abort();
+					throw error;
+				}
 			}
 			if (!this.agent.state.messages.includes(recoveredAssistant)) this.agent.appendMessage(recoveredAssistant);
 			event.messages.push(recoveredAssistant);
@@ -9070,6 +9098,7 @@ export class AgentSession {
 		previousSessionFile: string | undefined,
 		options: { retirePredecessorRegistrations?: boolean } = {},
 	): void {
+		this.#advanceSessionIdentityEpoch();
 		const previousEndpointId = this.#asyncJobEndpointId(previousSessionId, previousSessionFile);
 		const currentEndpointId = this.#asyncJobEndpointId(
 			this.sessionManager.getSessionId(),

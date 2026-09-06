@@ -4909,6 +4909,16 @@ async function streamAssistantResponse(
 			const trailing = config.fallbackManaged
 				? managedAssistantShell(finished, config.model, managedDegradedFieldDiagnostics, true)
 				: finished;
+			promoteTypedEmptyResponseStop(trailing);
+			if (!config.fallbackManaged || (trailing.stopReason !== "error" && trailing.stopReason !== "aborted")) {
+				if (addedPartial) {
+					context.messages[context.messages.length - 1] = trailing;
+				} else {
+					context.messages.push(trailing);
+					stream.push({ type: "message_start", message: { ...trailing }, scope });
+				}
+				stream.push({ type: "message_end", message: trailing, scope });
+			}
 			await finishChat(trailing);
 			return trailing;
 		});

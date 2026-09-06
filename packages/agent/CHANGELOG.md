@@ -2,7 +2,8 @@
 
 ## [Unreleased]
 
-- Compaction summary, turn-prefix summary, and handoff generation now clamp their reasoning effort to the model they are about to call instead of hard-coding `high`. A reasoning-capable model on a transport without reasoning control (the registry strips `thinking` when `openai-codex` or `anthropic` is routed through a non-audited proxy `baseUrl`) rejected the raw effort inside the provider mapper with "Model <provider>/<id> does not support thinking"; since the compaction fallback chain then reaches for the same-provider largest-context model, every candidate died on that throw and auto-compaction reported only the last one. The agent turn already clamps through `clampThinkingLevelForModel`; the maintenance calls were the one path still sending an unclamped effort.
+- Provider iterators that close with a trailing assistant but no explicit `done`/`error` event now publish the canonical `message_end` before `turn_end` and `agent_end`, preventing session persistence from missing the authoritative final response.
+- Compaction summary, turn-prefix summary, and handoff generation now clamp their reasoning effort to the model they are about to call instead of hard-coding `high`. A reasoning-capable model on a transport without reasoning control (the registry strips `thinking` when `openai-codex` or `anthropic` is routed through a non-audited proxy `baseUrl`) rejected the raw effort inside the provider mapper with "Model <provider>/<id> does not support thinking"; since the compaction fallback chain then reaches for the same-provider largest-context model, every candidate died on that throw and auto-compaction reported only the last one. The agent turn already clamps through `clampThinkingLevelForModel`; the maintenance calls were the one path still sending an unclamped …
 
 ## [0.16.4] - 2026-09-05
 
