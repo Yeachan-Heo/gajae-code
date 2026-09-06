@@ -149,8 +149,15 @@ function backfilledEffectIncarnationId(record: DiscordConversation): string {
 }
 
 type DiscordInboundClaim = {
+	record: DiscordConversation;
 	receipt: DiscordInboundDispatchReceipt;
 	liveCallbackEffect?: ChatEffect<DiscordInboundEffectPayload>;
+};
+
+type DiscordInboundSnapshot = {
+	record: DiscordConversation;
+	receipt: DiscordInboundDispatchReceipt;
+	effect: ChatEffect<DiscordInboundEffectPayload>;
 };
 
 function attachmentAcceptsAuthority(attachment: SessionAttachment, authorityId: string | undefined): boolean {
@@ -779,7 +786,7 @@ export class DiscordNotificationDaemon {
 	async handleInbound(event: DiscordInboundEvent): Promise<void> {
 		if (event.bot || event.authorId === this.options.provider.botUserId) return;
 		await this.#reconcileTerminalInboundReceipts();
-		const record = await this.#byThread(event.guildId, event.parentId, event.threadId);
+		let record = await this.#byThread(event.guildId, event.parentId, event.threadId);
 		if (!record?.sessionId) {
 			await this.#fail(event.threadId);
 			return;
@@ -792,16 +799,27 @@ export class DiscordNotificationDaemon {
 		if (!claim || this.#inflightInbound.has(claim.receipt.effectId)) return;
 		this.#inflightInbound.add(claim.receipt.effectId);
 		try {
+			record = claim.record;
+			let receipt = claim.receipt;
 			// Interaction callbacks have a short provider deadline. The mapping and
 			// journal claim are sufficient to acknowledge; attachment discovery waits.
 			const attachment = event.interaction
 				? null
-				: await this.#resolveAttachment(record.sessionId, record.endpointGeneration);
-			if (!event.interaction && !this.#matches(record, attachment)) {
+				: await this.#resolveAttachment(record.sessionId!, record.endpointGeneration);
+			if (!event.interaction) {
+				const postImage = await this.#reloadInboundSnapshot(record, receipt);
+				if (!postImage || !this.#matches(postImage.record, attachment)) {
+					await this.#fail(event.threadId);
+					return;
+				}
+				record = postImage.record;
+				receipt = postImage.receipt;
+			}
+			if (!event.interaction && !attachment) {
 				await this.#fail(event.threadId);
 				return;
 			}
-			await this.#dispatchInbound(record, attachment, claim.receipt, event.interaction, claim.liveCallbackEffect);
+			await this.#dispatchInbound(record, attachment, receipt, event.interaction, claim.liveCallbackEffect);
 		} finally {
 			this.#inflightInbound.delete(claim.receipt.effectId);
 			await this.#scheduleLeaseRecovery();
@@ -820,8 +838,7 @@ export class DiscordNotificationDaemon {
 		if (record.state !== "active" || closingIntent(record)) return "invalid";
 		const route = event.interaction ? decodeCustomId(event.interaction.customId) : undefined;
 		const command = !event.interaction && event.content?.startsWith("/sdk ");
-		if (!command && (!route || !event.interaction || route.generation !== record.endpointGeneration))
-			return "invalid";
+		if (!command && (!route || !event.interaction)) return "invalid";
 		const key = discordConversationKey({
 			appId: record.appId,
 			guildId: record.guildId,
@@ -830,29 +847,45 @@ export class DiscordNotificationDaemon {
 		});
 		let receipt: DiscordInboundDispatchReceipt | undefined;
 		let valid = false;
+		let claimedRecord: DiscordConversation | undefined;
 		const effectId = `discord:${record.appId}:${record.guildId}:${record.parentChannelId}:${record.threadId}:${event.id}`;
 		const idempotencyKey = effectId;
-		const routing: DiscordInboundRouting = {
-			guildId: event.guildId,
-			parentId: event.parentId,
-			threadId: event.threadId,
-			eventId: event.id,
-			...(record.attachmentAuthorityId === undefined ? {} : { attachmentAuthorityId: record.attachmentAuthorityId }),
-			...(event.interaction ? { interactionId: event.interaction.id } : {}),
-			kind: command ? "command" : "action",
-			...(!command ? { actionId: route!.actionId, actionNonce: route!.actionNonce } : {}),
-		};
-		const payload: DiscordInboundEffectPayload = command
-			? { type: "command", content: event.content!, idempotencyKey, routing }
-			: {
-					type: "reply",
-					id: route!.actionId,
-					answer: componentAnswer(event.interaction!.value ?? ""),
-					idempotencyKey,
-					routing,
-				};
 		let liveCallbackEffect: ChatEffect<DiscordInboundEffectPayload> | undefined;
 		await this.#effects.withSessionMutationGate(record.sessionId!, async () => {
+			const current = await this.#store.read(key);
+			if (
+				current?.state !== "active" ||
+				closingIntent(current) ||
+				current.sessionId !== record.sessionId ||
+				current.endpointGeneration !== record.endpointGeneration
+			)
+				return;
+			if (!command && (!route || route.generation !== current.endpointGeneration)) return;
+			const desiredRouting: DiscordInboundRouting = {
+				guildId: event.guildId,
+				parentId: event.parentId,
+				threadId: event.threadId,
+				eventId: event.id,
+				...(current.attachmentAuthorityId === undefined
+					? {}
+					: { attachmentAuthorityId: current.attachmentAuthorityId }),
+				...(event.interaction ? { interactionId: event.interaction.id } : {}),
+				kind: command ? "command" : "action",
+				...(!command ? { actionId: route!.actionId, actionNonce: route!.actionNonce } : {}),
+			};
+			const desiredPayload: DiscordInboundEffectPayload = command
+				? { type: "command", content: event.content!, idempotencyKey, routing: desiredRouting }
+				: {
+						type: "reply",
+						id: route!.actionId,
+						answer: componentAnswer(event.interaction!.value ?? ""),
+						idempotencyKey,
+						routing: desiredRouting,
+					};
+			const existingEffect = await this.#effects.read<DiscordInboundEffectPayload>(effectId);
+			const payload = existingEffect?.payload ?? desiredPayload;
+			const routing = payload.routing;
+			claimedRecord = current;
 			if (event.interaction) {
 				liveCallbackEffect = await this.#rescheduleAfterEffectTransition(
 					this.#effects.enqueueAndClaimWhileHoldingSessionMutationGate(
@@ -860,8 +893,8 @@ export class DiscordNotificationDaemon {
 							id: effectId,
 							kind: "discord.inbound.action",
 							transport: "discord",
-							sessionId: record.sessionId,
-							endpointGeneration: record.endpointGeneration!,
+							sessionId: current.sessionId,
+							endpointGeneration: current.endpointGeneration!,
 							payload,
 						},
 						this.#dispatchOwner,
@@ -874,8 +907,8 @@ export class DiscordNotificationDaemon {
 						id: effectId,
 						kind: "discord.inbound.command",
 						transport: "discord",
-						sessionId: record.sessionId,
-						endpointGeneration: record.endpointGeneration!,
+						sessionId: current.sessionId,
+						endpointGeneration: current.endpointGeneration!,
 						payload,
 					}),
 				);
@@ -896,6 +929,7 @@ export class DiscordNotificationDaemon {
 				if (existing) {
 					valid = true;
 					receipt = existing;
+					claimedRecord = current;
 					return current;
 				}
 				if (
@@ -920,9 +954,9 @@ export class DiscordNotificationDaemon {
 							eventId: event.id,
 							kind: "command",
 							endpointGeneration: record.endpointGeneration!,
-							...(record.attachmentAuthorityId === undefined
+							...(routing.attachmentAuthorityId === undefined
 								? {}
-								: { attachmentAuthorityId: record.attachmentAuthorityId }),
+								: { attachmentAuthorityId: routing.attachmentAuthorityId }),
 							effectId,
 							idempotencyKey,
 						}
@@ -934,12 +968,13 @@ export class DiscordNotificationDaemon {
 							actionId: route!.actionId,
 							actionNonce: route!.actionNonce,
 							endpointGeneration: record.endpointGeneration!,
-							...(record.attachmentAuthorityId === undefined
+							...(routing.attachmentAuthorityId === undefined
 								? {}
-								: { attachmentAuthorityId: record.attachmentAuthorityId }),
+								: { attachmentAuthorityId: routing.attachmentAuthorityId }),
 							effectId,
 							idempotencyKey,
 						};
+				claimedRecord = current;
 				return normalizeDiscordConversation({
 					...current,
 					generation: current.generation + 1,
@@ -962,7 +997,7 @@ export class DiscordNotificationDaemon {
 			});
 			liveCallbackEffect = undefined;
 		}
-		return { receipt, liveCallbackEffect };
+		return { record: claimedRecord ?? record, receipt, liveCallbackEffect };
 	}
 	async #dispatchInbound(
 		record: DiscordConversation,
@@ -984,13 +1019,16 @@ export class DiscordNotificationDaemon {
 		let effect: ChatEffect<DiscordInboundEffectPayload> = claimedEffect;
 		let lease = { owner: this.#dispatchOwner, epoch: effect.epoch };
 
-		const current = await this.#currentInboundRecord(record, receipt);
-		if (!current) {
+		let postImage = await this.#reloadInboundSnapshot(record, receipt);
+		if (!postImage) {
 			await this.#terminalizeInbound(record, receipt, "rejected", lease);
 
 			return;
 		}
-		record = current;
+		record = postImage.record;
+		receipt = postImage.receipt;
+		effect = postImage.effect;
+		if (effect.state !== "leased" || effect.owner !== lease.owner || effect.epoch !== lease.epoch) return;
 		if (receipt.kind === "action" && !this.#hasDurableDeferIntent(effect)) {
 			// Callback tokens cannot survive a restart. Persist the intent before remote
 			// I/O so recovery can safely resume SDK delivery whether defer reached Discord
@@ -1061,15 +1099,29 @@ export class DiscordNotificationDaemon {
 			}
 		}
 
-		const dispatchable = await this.#currentInboundRecord(record, receipt);
-		if (!dispatchable) {
+		postImage = await this.#reloadInboundSnapshot(record, receipt);
+		if (postImage === undefined || postImage.effect.state !== "leased") {
 			await this.#terminalizeInbound(record, receipt, "stale_binding", lease);
 
 			return;
 		}
-		record = dispatchable;
+		record = postImage.record;
+		receipt = postImage.receipt;
+		effect = postImage.effect;
 		const attachment =
 			initialAttachment ?? (await this.#resolveAttachment(record.sessionId!, receipt.endpointGeneration));
+		postImage = await this.#reloadInboundSnapshot(record, receipt);
+		if (!postImage) {
+			await this.#rescheduleAfterEffectTransition(
+				this.#effects.record(effect.id, lease, "accepted", {
+					status: this.#inboundAcceptedStatus(effect, "pre_send_binding_changed"),
+				}),
+			);
+			return;
+		}
+		record = postImage.record;
+		receipt = postImage.receipt;
+		effect = postImage.effect;
 		if (!this.#matches(record, attachment) || receipt.endpointGeneration !== attachment.generation) {
 			await this.#rescheduleAfterEffectTransition(
 				this.#effects.record(effect.id, lease, "accepted", {
@@ -1118,13 +1170,15 @@ export class DiscordNotificationDaemon {
 			}
 
 			if (!(await renew())) return;
-			const beforeSend = await this.#currentInboundRecord(record, receipt);
+			const beforeSend = await this.#reloadInboundSnapshot(record, receipt);
 			if (!beforeSend) {
 				await this.#terminalizeInbound(record, receipt, "stale_binding", lease);
 
 				return;
 			}
-			record = beforeSend;
+			record = beforeSend.record;
+			receipt = beforeSend.receipt;
+			effect = beforeSend.effect;
 			if (!this.#matches(record, attachment) || receipt.endpointGeneration !== attachment.generation) {
 				await this.#rescheduleAfterEffectTransition(
 					this.#effects.record(effect.id, lease, "accepted", {
@@ -1180,11 +1234,13 @@ export class DiscordNotificationDaemon {
 		await this.#reconcileTerminalInboundReceipts();
 		let recoveryFailed = false;
 		const dispatched = new Set<string>();
-		for (const record of Object.values((await this.#store.load()).conversations)) {
-			if (!record.threadId || !record.sessionId || record.state !== "active") continue;
+		for (const initialRecord of Object.values((await this.#store.load()).conversations)) {
+			if (!initialRecord.threadId || !initialRecord.sessionId || initialRecord.state !== "active") continue;
+			let record = initialRecord;
 			let attachment: SessionAttachment | null = null;
 			let attachmentResolved = false;
-			for (const [index, receipt] of (record.inboundDispatches ?? []).entries()) {
+			for (const [index, initialReceipt] of (record.inboundDispatches ?? []).entries()) {
+				let receipt = initialReceipt;
 				// Never race a foreground handleInbound() dispatch: while an effect is
 				// in-flight it briefly unowns itself (record "accepted"/"deferred" before
 				// reclaiming), a window in which recovery could otherwise claim it and
@@ -1223,10 +1279,17 @@ export class DiscordNotificationDaemon {
 					continue;
 				}
 				if (!attachmentResolved) {
-					attachment = await this.#resolveAttachment(record.sessionId, receipt.endpointGeneration);
+					attachment = await this.#resolveAttachment(record.sessionId!, receipt.endpointGeneration);
 					attachmentResolved = true;
 				}
-				if (!this.#matches(record, attachment) || attachment.generation !== receipt.endpointGeneration) {
+				const postImage = await this.#reloadInboundSnapshot(record, receipt);
+				if (!postImage) {
+					await this.#terminalizeInbound(record, receipt, "stale_binding");
+					continue;
+				}
+				record = postImage.record;
+				receipt = postImage.receipt;
+				if (!this.#matches(record, attachment) || receipt.endpointGeneration !== attachment.generation) {
 					await this.#terminalizeInbound(record, receipt, "stale_binding");
 					continue;
 				}
@@ -1260,11 +1323,16 @@ export class DiscordNotificationDaemon {
 			);
 			if (!adopted) continue;
 			const attachment = await this.#resolveAttachment(adopted.record.sessionId!, effect.endpointGeneration);
-			if (!this.#matches(adopted.record, attachment) || attachment.generation !== effect.endpointGeneration) {
+			const postImage = await this.#reloadInboundSnapshot(adopted.record, adopted.receipt);
+			if (
+				!postImage ||
+				!this.#matches(postImage.record, attachment) ||
+				attachment.generation !== postImage.receipt.endpointGeneration
+			) {
 				await this.#terminalizeInbound(adopted.record, adopted.receipt, "stale_binding");
 				continue;
 			}
-			await this.#dispatchInbound(adopted.record, attachment, adopted.receipt);
+			await this.#dispatchInbound(postImage.record, attachment, postImage.receipt);
 		}
 		return recoveryFailed;
 	}
@@ -1281,20 +1349,27 @@ export class DiscordNotificationDaemon {
 			parentChannelId: routing.parentId,
 			threadId: routing.threadId,
 		});
-		const expectedId = `discord:${this.options.provider.applicationId}:${routing.guildId}:${routing.parentId}:${routing.threadId}:${routing.eventId}`;
 		let record: DiscordConversation | undefined;
 		let receipt: DiscordInboundDispatchReceipt | undefined;
-		const structurallyValid =
-			effectId === expectedId &&
+		const structurallyValid = (): boolean =>
+			effectId ===
+				`discord:${this.options.provider.applicationId}:${routing.guildId}:${routing.parentId}:${routing.threadId}:${routing.eventId}` &&
 			payload.idempotencyKey === effectId &&
 			(payload.type === "command"
 				? routing.kind === "command"
 				: routing.kind === "action" && payload.id === routing.actionId && typeof routing.actionNonce === "string");
 		if (sessionId !== undefined)
 			await this.#effects.withSessionMutationGate(sessionId, async () => {
+				const currentEffect = await this.#effects.read<DiscordInboundEffectPayload>(effectId);
+				if (!currentEffect || currentEffect.id !== effectId) return;
+				if (!currentEffect.sessionId) return;
+				sessionId = currentEffect.sessionId;
+				endpointGeneration = currentEffect.endpointGeneration;
+				payload = currentEffect.payload;
+				routing = payload.routing;
 				await this.#store.transact(key, current => {
 					if (
-						!structurallyValid ||
+						!structurallyValid() ||
 						!current ||
 						current.state !== "active" ||
 						current.sessionId !== sessionId ||
@@ -1357,7 +1432,7 @@ export class DiscordNotificationDaemon {
 		await this.#terminalizeRejectedInbound(effectId);
 		return undefined;
 	}
-	#sameInboundReceipt(left: DiscordInboundDispatchReceipt, right: DiscordInboundDispatchReceipt): boolean {
+	#sameInboundIdentity(left: DiscordInboundDispatchReceipt, right: DiscordInboundDispatchReceipt): boolean {
 		return (
 			left.key === right.key &&
 			left.eventId === right.eventId &&
@@ -1366,10 +1441,39 @@ export class DiscordNotificationDaemon {
 			left.actionId === right.actionId &&
 			left.actionNonce === right.actionNonce &&
 			left.endpointGeneration === right.endpointGeneration &&
-			left.attachmentAuthorityId === right.attachmentAuthorityId &&
 			left.effectId === right.effectId &&
 			left.idempotencyKey === right.idempotencyKey
 		);
+	}
+	async #reloadInboundSnapshot(
+		record: DiscordConversation,
+		receipt: DiscordInboundDispatchReceipt,
+	): Promise<DiscordInboundSnapshot | undefined> {
+		const current = await this.#byThread(record.guildId, record.parentChannelId, record.threadId!);
+		const currentReceipt = current?.inboundDispatches?.find(candidate =>
+			this.#sameInboundIdentity(candidate, receipt),
+		);
+		const effect = await this.#effects.read<DiscordInboundEffectPayload>(receipt.effectId);
+		if (
+			!current ||
+			!currentReceipt ||
+			!effect ||
+			current.state !== "active" ||
+			current.sessionId !== record.sessionId ||
+			current.endpointGeneration !== receipt.endpointGeneration ||
+			!recordAcceptsAuthority(current, currentReceipt.attachmentAuthorityId) ||
+			!recordAcceptsAuthority(current, effect.payload.routing.attachmentAuthorityId) ||
+			effect.sessionId !== current.sessionId ||
+			effect.endpointGeneration !== receipt.endpointGeneration
+		)
+			return undefined;
+		if (
+			currentReceipt.kind === "action" &&
+			(current.pendingActionId !== currentReceipt.actionId ||
+				current.pendingActionNonce !== currentReceipt.actionNonce)
+		)
+			return undefined;
+		return { record: current, receipt: currentReceipt, effect };
 	}
 	#completeInbound(record: DiscordConversation, receipt: DiscordInboundDispatchReceipt): DiscordConversation {
 		const clearsAction =
@@ -1389,7 +1493,7 @@ export class DiscordNotificationDaemon {
 					? record.seenInteractionIds
 					: [...record.seenInteractionIds, receipt.interactionId],
 			inboundDispatches: (record.inboundDispatches ?? []).filter(
-				candidate => !this.#sameInboundReceipt(candidate, receipt),
+				candidate => !this.#sameInboundIdentity(candidate, receipt),
 			),
 		});
 	}
@@ -1455,36 +1559,17 @@ export class DiscordNotificationDaemon {
 			threadId: record.threadId!,
 		});
 		await this.#effects.withSessionMutationGate(record.sessionId!, async () => {
-			if (!(await this.#terminalizeEffect(receipt.effectId, status, lease, true))) return;
+			const current = await this.#store.read(key);
+			const matching = current?.inboundDispatches?.find(candidate => this.#sameInboundIdentity(candidate, receipt));
+			const effectiveReceipt = matching ?? receipt;
+			if (!(await this.#terminalizeEffect(effectiveReceipt.effectId, status, lease, true))) return;
 			await this.#store.transact(key, current => {
 				const matching = current?.inboundDispatches?.find(candidate =>
-					this.#sameInboundReceipt(candidate, receipt),
+					this.#sameInboundIdentity(candidate, effectiveReceipt),
 				);
 				return !current || !matching ? current : this.#completeInbound(current, matching);
 			});
 		});
-	}
-	async #currentInboundRecord(
-		record: DiscordConversation,
-		receipt: DiscordInboundDispatchReceipt,
-	): Promise<DiscordConversation | undefined> {
-		const current = await this.#byThread(record.guildId, record.parentChannelId, record.threadId!);
-		const claimed = current?.inboundDispatches?.find(candidate => this.#sameInboundReceipt(candidate, receipt));
-		if (
-			current?.state !== "active" ||
-			current.sessionId !== record.sessionId ||
-			current.endpointGeneration !== receipt.endpointGeneration ||
-			!recordAcceptsAuthority(current, receipt.attachmentAuthorityId) ||
-			!claimed
-		)
-			return undefined;
-		if (
-			receipt.kind === "action" &&
-			(current.pendingActionId !== receipt.actionId || current.pendingActionNonce !== receipt.actionNonce)
-		)
-			return undefined;
-
-		return current;
 	}
 	#receiptFromRouting(
 		effectId: string,
@@ -1530,7 +1615,7 @@ export class DiscordNotificationDaemon {
 		await this.#effects.withSessionMutationGate(record.sessionId!, async () => {
 			await this.#store.transact(key, current => {
 				const matching = current?.inboundDispatches?.find(candidate =>
-					this.#sameInboundReceipt(candidate, receipt),
+					this.#sameInboundIdentity(candidate, receipt),
 				);
 				return !current || !matching ? current : this.#completeInbound(current, matching);
 			});
@@ -1573,7 +1658,7 @@ export class DiscordNotificationDaemon {
 				routing,
 			);
 			const record = await this.#byThread(routing.guildId, routing.parentId, routing.threadId);
-			if (record?.inboundDispatches?.some(candidate => this.#sameInboundReceipt(candidate, receipt)))
+			if (record?.inboundDispatches?.some(candidate => this.#sameInboundIdentity(candidate, receipt)))
 				await this.#finishInbound(record, receipt);
 		}
 	}
@@ -1774,7 +1859,9 @@ export class DiscordNotificationDaemon {
 		}
 		let thread: DiscordThread | null;
 		try {
-			thread = await this.#withCreateIntentLease(intent, () => this.#createThreadEffect(intent, name));
+			thread = await this.#withCreateIntentLease(intent, () =>
+				this.#createThreadEffect(intent, name, attachmentAuthorityId),
+			);
 			await this.#requireLiveBinding(sessionId, endpointGeneration, intent.attachmentAuthorityId);
 		} catch (error) {
 			await this.#abandonCreator(intentKey, intent);
@@ -2562,7 +2649,11 @@ export class DiscordNotificationDaemon {
 			!closing,
 		);
 	}
-	async #createThreadEffect(intent: DiscordConversation, name: string): Promise<DiscordThread> {
+	async #createThreadEffect(
+		intent: DiscordConversation,
+		name: string,
+		attachmentAuthorityId = intent.attachmentAuthorityId,
+	): Promise<DiscordThread> {
 		const effectId = `create:${intent.sessionId}:${intent.createNonce}`;
 		const nonce = discordEffectNonce(effectId);
 		const expectedPayload = {
@@ -2570,7 +2661,7 @@ export class DiscordNotificationDaemon {
 			parentId: intent.parentChannelId,
 			name,
 			nonce,
-			...(intent.attachmentAuthorityId === undefined ? {} : { attachmentAuthorityId: intent.attachmentAuthorityId }),
+			...(attachmentAuthorityId === undefined ? {} : { attachmentAuthorityId }),
 		};
 		const existingEffect = await this.#effects.read<typeof expectedPayload>(effectId);
 		const payload = existingEffect?.payload ?? expectedPayload;
@@ -2618,8 +2709,8 @@ export class DiscordNotificationDaemon {
 					current.createOwner === intent.createOwner &&
 					current.generation === intent.generation &&
 					(current.createLeaseExpiresAt ?? 0) > this.#now() &&
-					current.attachmentAuthorityId === intent.attachmentAuthorityId &&
-					(await this.#bindingCurrent(intent.sessionId!, intent.endpointGeneration!, intent.attachmentAuthorityId))
+					current.attachmentAuthorityId === attachmentAuthorityId &&
+					(await this.#bindingCurrent(intent.sessionId!, intent.endpointGeneration!, attachmentAuthorityId))
 				);
 			},
 		);
@@ -2638,41 +2729,89 @@ export class DiscordNotificationDaemon {
 	): Promise<void> {
 		if (!effect.sessionId || !payload.nonce) return;
 		const intentKey = this.#intentKey(effect.sessionId);
+		const effectId = effect.id;
+		type CreateThreadPayload = {
+			guildId?: string;
+			parentId?: string;
+			name?: string;
+			nonce?: string;
+			attachmentAuthorityId?: string;
+		};
+		const matchesCreateOperation = (
+			candidate: DiscordConversation | undefined,
+			candidateEffect: ChatEffect<CreateThreadPayload> | undefined,
+		): candidate is DiscordConversation => {
+			const candidatePayload = candidateEffect?.payload;
+			return (
+				!!candidate &&
+				!!candidateEffect &&
+				candidateEffect.id === effectId &&
+				candidateEffect.kind === "create-thread" &&
+				candidateEffect.transport === "discord" &&
+				candidateEffect.sessionId === effect.sessionId &&
+				candidateEffect.endpointGeneration === effect.endpointGeneration &&
+				candidatePayload?.guildId === payload.guildId &&
+				candidatePayload?.parentId === payload.parentId &&
+				candidatePayload?.name === payload.name &&
+				candidatePayload?.nonce === payload.nonce &&
+				candidate.sessionId === effect.sessionId &&
+				candidate.endpointGeneration === effect.endpointGeneration &&
+				candidate.state === "creating" &&
+				candidate.guildId === payload.guildId &&
+				candidate.parentChannelId === payload.parentId &&
+				candidate.createNonce !== undefined &&
+				candidateEffect.id === `create:${candidate.sessionId}:${candidate.createNonce}` &&
+				discordEffectNonce(candidateEffect.id) === candidatePayload?.nonce &&
+				recordAcceptsAuthority(candidate, candidatePayload?.attachmentAuthorityId)
+			);
+		};
 		let intent: DiscordConversation | undefined;
-		let matchesIntent = false;
+		let currentEffect: ChatEffect<CreateThreadPayload> | undefined;
 		await this.#effects.withSessionMutationGate(effect.sessionId, async () => {
 			intent = await this.#store.read(intentKey);
-			matchesIntent =
-				intent?.state === "creating" &&
-				intent.sessionId === effect.sessionId &&
-				intent.guildId === payload.guildId &&
-				intent.parentChannelId === payload.parentId &&
-				recordAcceptsAuthority(intent, payload.attachmentAuthorityId) &&
-				discordEffectNonce(`create:${intent.sessionId}:${intent.createNonce}`) === payload.nonce;
+			currentEffect = await this.#effects.read<CreateThreadPayload>(effectId);
 		});
-		if (!matchesIntent || !intent) {
+		if (!matchesCreateOperation(intent, currentEffect)) {
 			if (effect.state !== "terminal") await this.#terminalizeEffect(effect.id, "rejected");
 
 			return;
 		}
-		if (!(await this.#bindingCurrent(effect.sessionId, effect.endpointGeneration, payload.attachmentAuthorityId))) {
+		const bindingCurrent = await this.#bindingCurrent(
+			effect.sessionId,
+			effect.endpointGeneration,
+			payload.attachmentAuthorityId,
+		);
+		await this.#effects.withSessionMutationGate(effect.sessionId, async () => {
+			intent = await this.#store.read(intentKey);
+			currentEffect = await this.#effects.read<CreateThreadPayload>(effectId);
+		});
+		if (!bindingCurrent) {
 			await this.#effects.withSessionMutationGate(effect.sessionId, async () => {
 				const current = await this.#store.read(intentKey);
-				if (current?.generation === intent!.generation) await this.#store.delete(intentKey, current.generation);
+				const latestEffect = await this.#effects.read<CreateThreadPayload>(effectId);
+				if (matchesCreateOperation(current, latestEffect)) await this.#store.delete(intentKey, current.generation);
 			});
 			return;
 		}
-		if (effect.state !== "terminal") {
+		if (!matchesCreateOperation(intent, currentEffect)) {
+			if (currentEffect?.state !== "terminal") await this.#terminalizeEffect(effectId, "rejected");
+
+			return;
+		}
+		if (!intent || !currentEffect) return;
+		const recoveredIntent = intent;
+		const recoveredEffect = currentEffect;
+		if (recoveredEffect.state !== "terminal") {
 			await this.#create(
-				effect.sessionId,
-				effect.endpointGeneration,
-				intent.createNonce!,
-				payload.name,
-				intent.attachmentAuthorityId,
+				recoveredIntent.sessionId!,
+				recoveredIntent.endpointGeneration!,
+				recoveredIntent.createNonce!,
+				recoveredEffect.payload.name,
+				recoveredIntent.attachmentAuthorityId,
 			);
 			return;
 		}
-		const threadId = effect.receipt?.threadId;
+		const threadId = recoveredEffect.receipt?.threadId;
 		if (!threadId) return;
 		// Any durable mapping for this session is already session-level authority.
 		// Do not let a terminal receipt reactivate an older remote thread merely
@@ -2683,47 +2822,59 @@ export class DiscordNotificationDaemon {
 			hasSessionMappings = (await this.#sessionMappings(effect.sessionId!)).length > 0;
 			if (!hasSessionMappings) return;
 			const current = await this.#store.read(intentKey);
-			if (current?.generation === intent!.generation) await this.#store.delete(intentKey, current.generation);
+			const latestEffect = await this.#effects.read<CreateThreadPayload>(effectId);
+			if (matchesCreateOperation(current, latestEffect)) await this.#store.delete(intentKey, current.generation);
 		});
 		if (hasSessionMappings) {
 			return;
 		}
-		await this.#requireLiveBinding(effect.sessionId, effect.endpointGeneration, payload.attachmentAuthorityId);
+		await this.#requireLiveBinding(
+			recoveredIntent.sessionId!,
+			recoveredIntent.endpointGeneration!,
+			recoveredIntent.attachmentAuthorityId,
+		);
 		const key = discordConversationKey({
-			appId: intent.appId,
-			guildId: intent.guildId,
-			parentChannelId: intent.parentChannelId,
+			appId: recoveredIntent.appId,
+			guildId: recoveredIntent.guildId,
+			parentChannelId: recoveredIntent.parentChannelId,
 			threadId,
 		});
-		const committed = await this.#effects.withSessionMutationGate(
-			effect.sessionId,
-			async () =>
-				await this.#store.transact(
-					key,
-					old =>
-						old ??
-						normalizeDiscordConversation({
-							generation: 1,
-							state: "active",
-							appId: intent!.appId,
-							guildId: intent!.guildId,
-							parentChannelId: intent!.parentChannelId,
-							threadId,
-							sessionId: intent!.sessionId,
-							endpointGeneration: intent!.endpointGeneration,
-							attachmentAuthorityId: intent!.attachmentAuthorityId,
-							createNonce: intent!.createNonce,
-							effectIncarnationId: intent!.createNonce,
-							updatedAt: this.#now(),
-							seenEventIds: [],
-							seenInteractionIds: [],
-						}),
-				),
-		);
+		let committed = false;
+		await this.#effects.withSessionMutationGate(effect.sessionId, async () => {
+			const latestEffect = await this.#effects.read<CreateThreadPayload>(effectId);
+			await this.#store.transactWithSnapshot(key, (old, conversations) => {
+				const current = conversations[intentKey];
+				if (
+					old ||
+					latestEffect?.state !== "terminal" ||
+					latestEffect.receipt?.threadId !== threadId ||
+					!matchesCreateOperation(current, latestEffect)
+				)
+					return old;
+				committed = true;
+				return normalizeDiscordConversation({
+					generation: 1,
+					state: "active",
+					appId: current.appId,
+					guildId: current.guildId,
+					parentChannelId: current.parentChannelId,
+					threadId,
+					sessionId: current.sessionId,
+					endpointGeneration: current.endpointGeneration,
+					attachmentAuthorityId: current.attachmentAuthorityId,
+					createNonce: current.createNonce,
+					effectIncarnationId: current.createNonce,
+					updatedAt: this.#now(),
+					seenEventIds: [],
+					seenInteractionIds: [],
+				});
+			});
+		});
 		if (committed)
 			await this.#effects.withSessionMutationGate(effect.sessionId, async () => {
 				const current = await this.#store.read(intentKey);
-				if (current?.generation === intent!.generation) await this.#store.delete(intentKey, current.generation);
+				const latestEffect = await this.#effects.read<CreateThreadPayload>(effectId);
+				if (matchesCreateOperation(current, latestEffect)) await this.#store.delete(intentKey, current.generation);
 			});
 	}
 	async #drainProviderEffects(): Promise<boolean> {

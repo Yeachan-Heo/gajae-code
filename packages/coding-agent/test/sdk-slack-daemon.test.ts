@@ -2513,6 +2513,64 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 		}
 	});
 
+	it("replays a pending inbound exactly once after startup migrates legacy authority", async () => {
+		const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-slack-startup-migration-replay-"));
+		try {
+			const firstFake = new FakeSlack();
+			const first = new SlackNotificationDaemon({
+				agentDir,
+				repo: agentDir,
+				teamId: "T1",
+				channelId: "C1",
+				provider: new SlackProvider(firstFake),
+				resolveAttachment: async sessionId => ({
+					...endpoint(sessionId),
+					authorityId: "legacy-authority",
+				}),
+				authorizeActor: actorId => actorId === "U1",
+			});
+			const root = await first.postRoot("session", "root");
+			await first.notify("session", "question", "action-1");
+			firstFake.onAck = async () => {
+				throw new Error("crash after ACK");
+			};
+			const inbound = messageEnvelope("first", "event-1", root.rootTs!, { clientMsgId: "interaction-1" });
+			await expect(first.handleEnvelope(inbound)).rejects.toThrow("crash after ACK");
+			await first.stop();
+
+			const replayed: Array<Record<string, unknown>> = [];
+			const restarted = new SlackNotificationDaemon({
+				agentDir,
+				repo: agentDir,
+				teamId: "T1",
+				channelId: "C1",
+				provider: new SlackProvider(new FakeSlack()),
+				resolveAttachment: async sessionId => ({
+					...endpoint(sessionId),
+					authorityId: "current-authority",
+					legacyAuthorityId: "legacy-authority",
+					send: (frame: Record<string, unknown>) => replayed.push(frame),
+					sendMaintenance: () => {},
+				}),
+				authorizeActor: actorId => actorId === "U1",
+			});
+			await restarted.start();
+
+			const effectId = `inbound:T1:C1:${root.rootTs}:U1:event-1:interaction-1`;
+			const journal = new ChatEffectJournal({ agentDir, transport: "slack" });
+			expect(replayed).toEqual([expect.objectContaining({ type: "reply", id: "action-1", answer: "reply" })]);
+			expect(await journal.read(effectId)).toMatchObject({ state: "terminal", receipt: { status: "sent" } });
+			expect((await journal.list()).some(effect => effect.receipt?.status === "stale_mapping")).toBe(false);
+			const recovered = await restarted.store.read("T1:C1:intent:session");
+			expect(recovered?.attachmentAuthorityId).toBe("current-authority");
+			expect(recovered?.attachmentAuthorityMigrationFromId).toBeUndefined();
+			expect(recovered?.inboundDispatches).toEqual([]);
+			await restarted.stop();
+		} finally {
+			await fs.rm(agentDir, { recursive: true, force: true });
+		}
+	});
+
 	it("releases a generation-swapped pre-send receipt for redelivery", async () => {
 		let swapped = false;
 		let sent = false;
