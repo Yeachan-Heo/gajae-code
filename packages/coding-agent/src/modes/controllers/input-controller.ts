@@ -273,16 +273,19 @@ export class InputController {
 
 	#syncTranscriptTurnPosition(): readonly string[] {
 		const anchorIds = getUserMessageViewportAnchorIds(this.ctx.session.messages);
+		const previousAnchorIds = new Set(this.#transcriptTurnAnchorIds);
 		if (
 			anchorIds.length !== this.#transcriptTurnAnchorIds.length ||
-			anchorIds.some(id => !this.#transcriptTurnAnchorIds.includes(id))
+			anchorIds.some(id => !previousAnchorIds.has(id))
 		) {
 			const hadAnchors = this.#transcriptTurnAnchorIds.length > 0;
 			const currentAnchorId = this.#transcriptTurnAnchorIds[this.#transcriptTurnPosition];
-			const retainedAnchorIds = this.#transcriptTurnAnchorIds.filter(id => anchorIds.includes(id));
+			const incomingAnchorIds = new Set(anchorIds);
+			const retainedAnchorIds = this.#transcriptTurnAnchorIds.filter(id => incomingAnchorIds.has(id));
+			const retainedAnchorIdSet = new Set(retainedAnchorIds);
 			this.#transcriptTurnAnchorIds = [
 				...retainedAnchorIds,
-				...anchorIds.filter(id => !retainedAnchorIds.includes(id)),
+				...anchorIds.filter(id => !retainedAnchorIdSet.has(id)),
 			];
 			const currentPosition = currentAnchorId ? this.#transcriptTurnAnchorIds.indexOf(currentAnchorId) : -1;
 			this.#transcriptTurnPosition =

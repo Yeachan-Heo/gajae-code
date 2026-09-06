@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Maintenance reasoning now fails closed for Anthropic models routed through an unverified custom endpoint and for raw reasoning-enabled models without thinking metadata. This prevents unsupported thinking controls and avoids a synchronous missing-metadata crash before provider wire transformation.
+
 ## [0.16.4] - 2026-09-05
 
 ### Added

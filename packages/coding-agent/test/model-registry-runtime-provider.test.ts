@@ -282,6 +282,39 @@ describe("ModelRegistry runtime provider registration", () => {
 		});
 	});
 
+	test("runtime thinking wins over custom thinking across catalog finalization", async () => {
+		const customThinking = { mode: "anthropic-adaptive" as const, minLevel: Effort.Minimal, maxLevel: Effort.Medium };
+		const runtimeThinking = { mode: "anthropic-adaptive" as const, minLevel: Effort.Low, maxLevel: Effort.High };
+		await Bun.write(
+			modelsJsonPath,
+			JSON.stringify({
+				providers: {
+					"runtime-provider": {
+						baseUrl: "https://custom.example.com/v1",
+						api: "anthropic-messages",
+						apiKey: "custom-key",
+						models: [{ ...baseModel, reasoning: true, thinking: customThinking }],
+					},
+				},
+			}),
+		);
+		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+		expect(registry.find("runtime-provider", baseModel.id)?.thinking).toEqual(customThinking);
+		registry.registerProvider(
+			"runtime-provider",
+			{
+				baseUrl: "https://runtime.example.com/v1",
+				api: "anthropic-messages",
+				apiKey: "runtime-key",
+				models: [{ ...baseModel, reasoning: true, thinking: runtimeThinking }],
+			},
+			"ext://runtime",
+		);
+		expect(registry.find("runtime-provider", baseModel.id)?.thinking).toEqual(runtimeThinking);
+		await registry.refresh("offline");
+		expect(registry.find("runtime-provider", baseModel.id)?.thinking).toEqual(runtimeThinking);
+	});
+
 	test("extension-registered models survive refresh('offline') cycle", async () => {
 		const registry = new ModelRegistry(authStorage, modelsJsonPath);
 		const config: ProviderConfigInput = {

@@ -413,7 +413,7 @@ function runImport(env: NodeJS.ProcessEnv) {
 		try {
 			const child = Bun.spawn(
 				[input.cli, "import", "--provider", input.providerKey, "--cwd", input.cwd, input.sessionId],
-				{ stdout: "pipe", stderr: "pipe", signal, env },
+				{ stdout: "ignore", stderr: "pipe", signal, env },
 			);
 			const [exitCode, stderr] = await Promise.all([child.exited, new Response(child.stderr).text()]);
 			if (input.signal?.aborted) return { kind: "failed", detail: "Paseo announcement cancelled" };

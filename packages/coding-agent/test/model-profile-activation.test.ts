@@ -303,6 +303,14 @@ describe("model profile activation", () => {
 					.filter(candidate => candidate.provider === "anthropic")
 					.map(candidate => candidate.id),
 			).not.toContain("claude-opus-5");
+			const expectedIds = new Set(["claude-opus-4-6", "claude-sonnet-5"]);
+			expect(
+				registry.getAvailableForProfileActivation().filter(candidate => candidate.provider === "anthropic"),
+			).toEqual(
+				registry
+					.getAvailable()
+					.filter(candidate => candidate.provider === "anthropic" && expectedIds.has(candidate.id)),
+			);
 			const session = fakeSession();
 			session.model = undefined;
 			session.thinkingLevel = undefined;

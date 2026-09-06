@@ -156,8 +156,7 @@ export class Input implements Component, Focusable {
 			this.#lastAction = null;
 			if (this.#cursor < this.#value.length) {
 				const afterCursor = this.#value.slice(this.#cursor);
-				const graphemes = [...segmenter.segment(afterCursor)];
-				const firstGrapheme = graphemes[0];
+				const firstGrapheme = segmenter.segment(afterCursor)[Symbol.iterator]().next().value;
 				this.#cursor += firstGrapheme ? firstGrapheme.segment.length : 1;
 			}
 			return;
@@ -231,8 +230,7 @@ export class Input implements Component, Focusable {
 		this.#pushUndo();
 
 		const afterCursor = this.#value.slice(this.#cursor);
-		const graphemes = [...segmenter.segment(afterCursor)];
-		const firstGrapheme = graphemes[0];
+		const firstGrapheme = segmenter.segment(afterCursor)[Symbol.iterator]().next().value;
 		const graphemeLength = firstGrapheme ? firstGrapheme.segment.length : 1;
 
 		this.#value = this.#value.slice(0, this.#cursor) + this.#value.slice(this.#cursor + graphemeLength);
@@ -442,8 +440,7 @@ export class Input implements Component, Focusable {
 
 		// Build line with fake cursor
 		// Insert cursor character at cursor position
-		const graphemes = [...segmenter.segment(visibleText.slice(cursorDisplay))];
-		const cursorGrapheme = graphemes[0];
+		const cursorGrapheme = segmenter.segment(visibleText.slice(cursorDisplay))[Symbol.iterator]().next().value;
 
 		const beforeCursor = visibleText.slice(0, cursorDisplay);
 		const atCursor = cursorGrapheme?.segment ?? " ";

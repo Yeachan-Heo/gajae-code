@@ -854,6 +854,8 @@ export class StatusLineComponent implements Component {
 		// treats a null value as hidden, so gating here is behavior-identical.
 		const prSegmentActive =
 			effectiveSettings.leftSegments.includes("pr") || effectiveSettings.rightSegments.includes("pr");
+		const gitSegmentActive =
+			effectiveSettings.leftSegments.includes("git") || effectiveSettings.rightSegments.includes("git");
 		const commandSegmentActive =
 			effectiveSettings.leftSegments.includes("command") || effectiveSettings.rightSegments.includes("command");
 		const commandOptions = commandSegmentActive ? this.#trustedCommandOptions() : undefined;
@@ -883,7 +885,7 @@ export class StatusLineComponent implements Component {
 			sessionStartTime: this.#sessionStartTime,
 			git: {
 				branch: this.#getCurrentBranch(),
-				status: this.#getGitStatus(),
+				status: gitSegmentActive ? this.#getGitStatus() : null,
 				pr: prSegmentActive ? (previewOnly ? (this.#cachedPr ?? null) : this.#lookupPr()) : null,
 			},
 			usage: this.#cachedUsage,
