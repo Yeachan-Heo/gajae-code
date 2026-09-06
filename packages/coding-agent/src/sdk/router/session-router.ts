@@ -501,7 +501,7 @@ function sameEndpointIdentity(expected: SessionEndpointIdentity, current: Sessio
 
 function matchesIndexedEndpointIdentity(identity: SessionEndpointIdentity, indexed: IndexedSession): boolean {
 	if (indexed.endpointMtimeMs === undefined || !Number.isFinite(indexed.endpointMtimeMs)) return false;
-	if (indexed.endpointFileId === undefined) return identity.mtimeMs === indexed.endpointMtimeMs;
+	if (indexed.endpointFileId === undefined) return Math.abs(identity.mtimeMs - indexed.endpointMtimeMs) <= 0.001;
 	return (
 		indexed.endpointFileId === `${identity.dev}:${identity.ino}` &&
 		Math.abs(identity.mtimeMs - indexed.endpointMtimeMs) <= 0.001
