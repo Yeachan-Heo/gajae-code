@@ -4173,6 +4173,11 @@ test("reconcile_uncertain retires one dead create identity and refuses live host
 				"reconcile-mismatched-file-id",
 			),
 		).resolves.toMatchObject({ ok: false, error: { code: "retirement_proof_stale" } });
+		const originalAppend = broker.index.append.bind(broker.index);
+		const appendFailureSpy = vi.spyOn(broker.index, "append").mockImplementation(async event => {
+			if (event.type === "session_closed") throw new Error("stage legacy retirement receipt");
+			return originalAppend(event);
+		});
 		const deadResponse = await broker.handleRequest(
 			"session.reconcile_uncertain",
 			{
@@ -4188,7 +4193,19 @@ test("reconcile_uncertain retires one dead create identity and refuses live host
 			},
 			"reconcile-dead",
 		);
-		let retiredResponse = deadResponse;
+		appendFailureSpy.mockRestore();
+		const stagedRetirement = broker.ledger.findByOperationKey("session.reconcile_uncertain\u0000reconcile-dead");
+		if (!stagedRetirement || deadResponse.ok) throw new Error("Expected staged uncertain retirement receipt");
+		const legacyResponse = structuredClone(deadResponse) as {
+			error?: { cleanup?: { uncertainRetirement?: { identity?: { endpointFileId?: string } } } };
+		};
+		const legacyIdentity = legacyResponse.error?.cleanup?.uncertainRetirement?.identity;
+		if (!legacyIdentity) throw new Error("Expected staged uncertain retirement identity");
+		delete legacyIdentity.endpointFileId;
+		await broker.ledger.transition(stagedRetirement.identity, "effect_started", {
+			response: legacyResponse as Extract<BrokerResponse, { ok: false }>,
+		});
+		let retiredResponse: BrokerResponse = deadResponse;
 		for (let attempt = 0; attempt < 4 && !retiredResponse.ok; attempt++) {
 			if (retiredResponse.error.code !== "cleanup_pending") break;
 			retiredResponse = await broker.handleRequest(

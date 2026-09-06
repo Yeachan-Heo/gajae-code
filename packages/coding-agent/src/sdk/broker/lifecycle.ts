@@ -1940,17 +1940,25 @@ function exactLifecycleEndpointAbsent(root: string, id: string): boolean {
 	}
 }
 
-function sameRetirementIdentityAsRecord(identity: LifecycleRetirementIdentity, record: IndexedSession): boolean {
+function sameRetirementIdentityLegacyFieldsAsRecord(
+	identity: LifecycleRetirementIdentity,
+	record: IndexedSession,
+): boolean {
 	return (
 		identity.sessionId === record.sessionId &&
 		path.resolve(identity.stateRoot) === path.resolve(record.locator.stateRoot) &&
 		identity.endpointGeneration === record.endpointGeneration &&
 		identity.endpointMtimeMs === record.endpointMtimeMs &&
-		identity.endpointFileId === record.endpointFileId &&
 		identity.pid === record.pid &&
 		identity.processIncarnation === record.processIncarnation &&
 		identity.hostIncarnation === record.hostIncarnation &&
 		identity.lifecycleRequestId === record.lifecycleRequestId
+	);
+}
+
+function sameRetirementIdentityAsRecord(identity: LifecycleRetirementIdentity, record: IndexedSession): boolean {
+	return (
+		sameRetirementIdentityLegacyFieldsAsRecord(identity, record) && identity.endpointFileId === record.endpointFileId
 	);
 }
 
@@ -1969,6 +1977,17 @@ function findRetirementRecord(
 			.listSessionIdentities()
 			.find(session => session.sessionId === id && sameRetirementIdentityAsRecord(receipt.identity, session));
 		if (staged) return staged;
+		if (receipt.identity.endpointFileId === undefined) {
+			const legacyMatches = broker.index
+				.listSessionIdentities()
+				.filter(
+					session =>
+						session.sessionId === id &&
+						session.endpointFileId !== undefined &&
+						sameRetirementIdentityLegacyFieldsAsRecord(receipt.identity, session),
+				);
+			if (legacyMatches.length === 1) return legacyMatches[0];
+		}
 	}
 	const current = broker.index.listSessions().sessions.find(session => session.sessionId === id);
 	return current;
@@ -2210,6 +2229,22 @@ async function executeUncertainRetirement(
 	let retirementIdentity: LifecycleRetirementIdentity;
 	let create = receipt ? broker.ledger.get(receipt.identity.createIdentity) : undefined;
 	if (receipt) {
+		if (
+			receipt.identity.endpointFileId === undefined &&
+			record.endpointFileId !== undefined &&
+			sameRetirementIdentityLegacyFieldsAsRecord(receipt.identity, record)
+		) {
+			const upgradedReceipt: LifecycleRetirementReceipt = {
+				...receipt,
+				identity: { ...receipt.identity, endpointFileId: record.endpointFileId },
+			};
+			cleanup = { ...cleanup!, uncertainRetirement: upgradedReceipt };
+			await broker.ledger.transition(identity, "effect_started", {
+				intendedSessionId: id,
+				response: fail("cleanup_pending", "Uncertain session retirement receipt was upgraded.", cleanup),
+			});
+			receipt = upgradedReceipt;
+		}
 		const suppliedIdentity = retirementIdentityFromInput(input, record, receipt.identity.createIdentity);
 		if (isLifecycleBrokerResponse(suppliedIdentity)) return suppliedIdentity;
 		if (
