@@ -1673,13 +1673,10 @@ function dedupeIrcReply(text: string): string {
 	}
 	let result = out.join("\n");
 	if (Buffer.byteLength(result, "utf8") > IRC_REPLY_MAX_BYTES) {
-		// Trim by characters until we're under the byte budget — handles multi-byte
-		// glyphs at the boundary without splitting them.
+		// Bound the UTF-8 prefix without repeatedly measuring the shrinking reply.
 		const suffix = "\n[…truncated]";
 		const budget = IRC_REPLY_MAX_BYTES - Buffer.byteLength(suffix, "utf8");
-		while (Buffer.byteLength(result, "utf8") > budget) {
-			result = result.slice(0, -1);
-		}
+		result = truncateHeadBytes(result, budget).text;
 		result += suffix;
 	}
 	return result;
@@ -6371,6 +6368,18 @@ export class AgentSession {
 	): Promise<void> => {
 		const attemptScope = (event as AgentEvent & { scope?: AttemptScope }).scope;
 
+		// These lifecycle boundaries can be delivered without awaiting this listener.
+		// Revoke streaming-edit cache generations before any admission, spill, or
+		// extension work so a completed read cannot publish across the boundary.
+		if (event.type === "turn_start") this.#resetStreamingEditState();
+		if (event.type === "message_end" && event.message.role === "toolResult") {
+			const details = event.message.details;
+			if (event.message.toolName === "edit" && details && typeof details === "object" && "path" in details) {
+				const editPath = (details as { path?: unknown }).path;
+				if (typeof editPath === "string") this.#invalidateFileCacheForPath(editPath);
+			}
+		}
+
 		if (
 			event.type === "tool_execution_start" ||
 			event.type === "tool_execution_update" ||
@@ -6725,7 +6734,6 @@ export class AgentSession {
 		}
 
 		if (event.type === "turn_start") {
-			this.#resetStreamingEditState();
 			// TTSR: Reset buffer on turn start
 			this.#ttsrManager?.resetBuffer();
 		}
@@ -6966,10 +6974,6 @@ export class AgentSession {
 					isError?: boolean;
 					content?: Array<TextContent | ImageContent>;
 				};
-				// Invalidate streaming edit cache when edit tool completes to prevent stale data
-				if (toolName === "edit" && details?.path) {
-					this.#invalidateFileCacheForPath(details.path);
-				}
 				if (toolName === "todo_write" && !isError && Array.isArray(details?.phases)) {
 					this.setTodoPhases(details.phases);
 				}
@@ -8217,6 +8221,9 @@ export class AgentSession {
 		this.#streamingEditPrecheckedToolCallIds.clear();
 		this.#streamingEditParsedToolCallCache.clear();
 		this.#streamingEditFileCache.clear();
+		for (const resolvedPath of this.#streamingEditPrecachePending.keys()) {
+			this.#invalidateStreamingEditPrecachePath(resolvedPath);
+		}
 	}
 
 	#getStreamingEditToolCall(event: AgentEvent): StreamingEditParsedToolCall | undefined {
@@ -8297,24 +8304,48 @@ export class AgentSession {
 		return block?.type === "toolCall" && this.#provisionalStreamingToolCallIds.has(block.id);
 	}
 
-	#streamingEditPrecachePending = new Set<string>();
+	#streamingEditPrecachePending = new Map<string, symbol>();
+	#streamingEditPrecacheStale = new Map<string, Set<symbol>>();
 	async #preCacheFileAsync(resolvedPath: string): Promise<void> {
 		if (this.#streamingEditFileCache.has(resolvedPath)) return;
 		if (this.#streamingEditPrecachePending.has(resolvedPath)) return;
-		this.#streamingEditPrecachePending.add(resolvedPath);
+		// Keep at most one invalidated read alongside the current generation. Once
+		// two reads are already in flight, further invalidations wait for one to
+		// settle instead of accumulating another whole-file read.
+		if ((this.#streamingEditPrecacheStale.get(resolvedPath)?.size ?? 0) >= 2) return;
+		const token = Symbol();
+		this.#streamingEditPrecachePending.set(resolvedPath, token);
 		try {
 			const stat = await fs.promises.stat(resolvedPath);
 			if (stat.size > MAX_EDIT_FILE_BYTES) return;
 
+			if (this.#streamingEditPrecachePending.get(resolvedPath) !== token) return;
 			const rawText = await fs.promises.readFile(resolvedPath, "utf-8");
+			if (this.#streamingEditPrecachePending.get(resolvedPath) !== token) return;
 			if (this.#streamingEditFileCache.has(resolvedPath)) return;
 			const { text } = stripBom(rawText);
 			this.#streamingEditFileCache.set(resolvedPath, normalizeToLF(text));
 		} catch {
 			// Don't cache on read errors (including ENOENT) - let the edit tool handle them
 		} finally {
-			this.#streamingEditPrecachePending.delete(resolvedPath);
+			if (this.#streamingEditPrecachePending.get(resolvedPath) === token) {
+				this.#streamingEditPrecachePending.delete(resolvedPath);
+			}
+			const stale = this.#streamingEditPrecacheStale.get(resolvedPath);
+			if (stale?.delete(token) && stale.size === 0) this.#streamingEditPrecacheStale.delete(resolvedPath);
 		}
+	}
+
+	#invalidateStreamingEditPrecachePath(resolvedPath: string): void {
+		const token = this.#streamingEditPrecachePending.get(resolvedPath);
+		if (token === undefined) return;
+		this.#streamingEditPrecachePending.delete(resolvedPath);
+		let stale = this.#streamingEditPrecacheStale.get(resolvedPath);
+		if (!stale) {
+			stale = new Set();
+			this.#streamingEditPrecacheStale.set(resolvedPath, stale);
+		}
+		stale.add(token);
 	}
 
 	#ensureFileCache(resolvedPath: string): void {
@@ -8334,9 +8365,27 @@ export class AgentSession {
 
 	/** Invalidate cache for a file after an edit completes to prevent stale data */
 	#invalidateFileCacheForPath(filePath: string): void {
-		const resolvedPath = this.#resolveSessionFsPath(filePath);
+		let resolvedPath: string | undefined;
+		try {
+			resolvedPath = this.#resolveSessionFsPath(filePath);
+		} catch (error) {
+			// Tool-result admission must survive malformed paths and unavailable local roots.
+			// Without a resolved key, revoke every generation before any lifecycle await.
+			this.#streamingEditFileCache.clear();
+			this.#streamingEditPrecachePending.delete(filePath);
+			this.#streamingEditPrecacheStale.delete(filePath);
+			for (const pendingPath of this.#streamingEditPrecachePending.keys()) {
+				this.#invalidateStreamingEditPrecachePath(pendingPath);
+			}
+			logger.debug("Failed to resolve streaming-edit cache invalidation path", {
+				path: filePath,
+				error: String(error),
+			});
+			return;
+		}
 		if (resolvedPath === undefined) return;
 		this.#streamingEditFileCache.delete(resolvedPath);
+		this.#invalidateStreamingEditPrecachePath(resolvedPath);
 	}
 
 	/**
@@ -10289,6 +10338,7 @@ export class AgentSession {
 		let wrappersByVersion = this.#guardedToolWrapperCache.get(tool);
 		const cached = wrappersByVersion?.get(cacheKey);
 		if (cached) return cached as T;
+		wrappersByVersion?.clear();
 		const wrapped = this.#wrapToolForCwdTransitionFence(
 			this.#wrapToolForWorkflowMutationGuard(
 				this.#wrapToolForAcpPermission(
