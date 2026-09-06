@@ -1990,6 +1990,8 @@ function findRetirementRecord(
 	receipt: LifecycleRetirementReceipt | undefined,
 ): IndexedSession | undefined {
 	if (receipt !== undefined) {
+		if (receipt.identity.endpointFileId === undefined)
+			return broker.index.findUniqueHistoricalFileBoundSessionIdentity(receipt.identity);
 		const historical = broker.index.findHistoricalSessionIdentity(receipt.identity);
 		if (historical) return historical;
 		// A later registration may make a same-ID successor the public authority.
@@ -1998,18 +2000,7 @@ function findRetirementRecord(
 		const staged = broker.index
 			.listSessionIdentities()
 			.find(session => session.sessionId === id && sameRetirementIdentityAsRecord(receipt.identity, session));
-		if (staged) return staged;
-		if (receipt.identity.endpointFileId === undefined) {
-			const legacyMatches = broker.index
-				.listSessionIdentities()
-				.filter(
-					session =>
-						session.sessionId === id &&
-						session.endpointFileId !== undefined &&
-						sameRetirementIdentityLegacyFieldsAsRecord(receipt.identity, session),
-				);
-			if (legacyMatches.length === 1) return legacyMatches[0];
-		}
+		return staged;
 	}
 	const current = broker.index.listSessions().sessions.find(session => session.sessionId === id);
 	return current;

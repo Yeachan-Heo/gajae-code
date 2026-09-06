@@ -1483,6 +1483,50 @@ describe("SDK session index", () => {
 			await fs.rm(dir, { recursive: true, force: true });
 		}
 	});
+	it("resolves legacy retirement authority only from one retained file-bound identity", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-legacy-file-bound-"));
+		const index = await new SessionIndex(dir).open();
+		const expected = {
+			sessionId: "legacy-file-bound",
+			stateRoot: dir,
+			endpointGeneration: 1,
+			pid: process.pid,
+			processIncarnation: "legacy-process",
+			hostIncarnation: "legacy-host",
+			endpointMtimeMs: 11,
+			lifecycleRequestId: "legacy-request",
+		};
+		try {
+			await index.append({
+				type: "host_registered",
+				locator: { cwd: dir, worktreeRoot: null, stateRoot: dir },
+				...expected,
+			});
+			expect(index.findUniqueHistoricalFileBoundSessionIdentity(expected)).toBeUndefined();
+
+			await index.append({
+				type: "lifecycle_terminal",
+				locator: { cwd: dir, worktreeRoot: null, stateRoot: dir },
+				...expected,
+				endpointFileId: "1:1",
+				terminalUncertain: true,
+			});
+			expect(index.findUniqueHistoricalFileBoundSessionIdentity(expected)).toMatchObject({
+				endpointFileId: "1:1",
+			});
+
+			await index.append({
+				type: "lifecycle_terminal",
+				locator: { cwd: dir, worktreeRoot: null, stateRoot: dir },
+				...expected,
+				endpointFileId: "2:2",
+				terminalUncertain: true,
+			});
+			expect(index.findUniqueHistoricalFileBoundSessionIdentity(expected)).toBeUndefined();
+		} finally {
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	});
 	it("refreshIfChanged skips the locked rescan while the index is unchanged (#4689)", async () => {
 		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-poll-"));
 		await new SessionIndex(dir).append(event("polled"));
