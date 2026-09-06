@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 
+- Documented `GJC_OPENAI_CODE_WEBSOCKET_V2` as a switch that enables a websocket v2 path. No code read it under that name, under the legacy `PI_CODEX_WEBSOCKET_V2`, or under the `PI_OPENAI_CODE_WEBSOCKET_V2` the historical entry records; the v2 beta header has been unconditional for websocket transport. The documentation row is removed rather than reintroducing a knob, and the test that claimed to gate on it no longer writes an environment variable nothing reads.
 - Maintenance reasoning now fails closed for Anthropic models routed through an unverified custom endpoint and for raw reasoning-enabled models without thinking metadata. This prevents unsupported thinking controls and avoids a synchronous missing-metadata crash before provider wire transformation.
 
 ## [0.16.4] - 2026-09-05
