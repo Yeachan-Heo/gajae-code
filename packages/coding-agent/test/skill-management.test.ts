@@ -219,6 +219,14 @@ describe("skill-management", () => {
 					writeNativeSkill({ cwd, home, scope: "user", name: "my-skill", content: validContent }),
 				).rejects.toBeInstanceOf(SkillFrontmatterError);
 				expect(await fs.readFile(outsideFile, "utf8")).toBe("unchanged");
+
+				await fs.rm(path.join(skillsDir, "my-skill", "SKILL.md"));
+				const danglingTarget = path.join(outsideDir, "created-by-follow.md");
+				await fs.symlink(danglingTarget, path.join(skillsDir, "my-skill", "SKILL.md"), "file");
+				await expect(
+					writeNativeSkill({ cwd, home, scope: "user", name: "my-skill", content: validContent }),
+				).rejects.toBeInstanceOf(SkillFrontmatterError);
+				await expect(fs.stat(danglingTarget)).rejects.toMatchObject({ code: "ENOENT" });
 			});
 
 			await withTempDirs(async (cwd, home) => {

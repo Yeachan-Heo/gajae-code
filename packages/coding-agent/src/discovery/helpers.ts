@@ -437,31 +437,9 @@ export const SKILL_FRONTMATTER_SCAN_BYTES = 4 * 1024;
 /** Maximum total bytes read while seeking the frontmatter closing delimiter. */
 export const SKILL_FRONTMATTER_SCAN_TOTAL_BYTES = 64 * 1024;
 
-async function readSkillFrontmatter(skillPath: string): Promise<SkillFrontmatter | null> {
-	const file = Bun.file(skillPath);
-	const size = (await fs.promises.stat(skillPath)).size;
-	const scanLimit = Math.min(size, SKILL_FRONTMATTER_SCAN_TOTAL_BYTES);
-	let offset = 0;
-	let prefix = "";
-	const decoder = new TextDecoder();
-	while (offset < scanLimit) {
-		const end = Math.min(offset + SKILL_FRONTMATTER_SCAN_BYTES, scanLimit);
-		const bytes = new Uint8Array(await file.slice(offset, end).arrayBuffer());
-		const chunk = decoder.decode(bytes, { stream: end < scanLimit });
-		if (!chunk) break;
-		prefix += chunk;
-		offset = end;
-
-		const opening = prefix.match(/^---[ \t]*(?:\r?\n|$)/);
-		if (!opening) return null;
-		const afterOpening = prefix.slice(opening[0].length);
-		const closing = afterOpening.match(/\r?\n---[ \t]*(?:\r?\n|$)/);
-		if (!closing || closing.index === undefined) continue;
-		const bounded = prefix.slice(0, opening[0].length + closing.index + closing[0].length);
-		return parseFrontmatter(bounded, { source: skillPath }).frontmatter as SkillFrontmatter;
-	}
-	return null;
-}
+export const SkillDiscoveryTestHooks: {
+	afterCandidateValidated?: (candidatePath: string) => void | Promise<void>;
+} = {};
 
 export async function scanSkillsFromDir(
 	_ctx: LoadContext,
@@ -502,7 +480,7 @@ export async function scanSkillsFromDir(
 		const relative = path.relative(realRoot, candidate);
 		return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
 	};
-	const readSkillContentSafely = async (skillPath: string): Promise<string> => {
+	const openSkillFileSafely = async (skillPath: string): Promise<FileHandle> => {
 		const flags =
 			fs.constants.O_RDONLY |
 			(process.platform === "win32" ? 0 : (fs.constants.O_NOFOLLOW ?? 0) | (fs.constants.O_NONBLOCK ?? 0));
@@ -524,7 +502,50 @@ export async function scanSkillsFromDir(
 			) {
 				throw new Error(`Unsafe skill file: ${skillPath}`);
 			}
+			return handle;
+		} catch (error) {
+			await handle.close();
+			throw error;
+		}
+	};
+	const readSkillContentSafely = async (skillPath: string): Promise<string> => {
+		const handle = await openSkillFileSafely(skillPath);
+		try {
 			return await handle.readFile({ encoding: "utf8" });
+		} finally {
+			await handle.close();
+		}
+	};
+	const readSkillFrontmatterSafely = async (
+		skillPath: string,
+	): Promise<{ frontmatter: SkillFrontmatter | null; size: number }> => {
+		const handle = await openSkillFileSafely(skillPath);
+		try {
+			const size = Number((await handle.stat({ bigint: true })).size);
+			const scanLimit = Math.min(size, SKILL_FRONTMATTER_SCAN_TOTAL_BYTES);
+			let offset = 0;
+			let prefix = "";
+			const decoder = new TextDecoder();
+			while (offset < scanLimit) {
+				const length = Math.min(SKILL_FRONTMATTER_SCAN_BYTES, scanLimit - offset);
+				const bytes = new Uint8Array(length);
+				const { bytesRead } = await handle.read(bytes, 0, length, offset);
+				if (bytesRead === 0) break;
+				offset += bytesRead;
+				prefix += decoder.decode(bytes.subarray(0, bytesRead), { stream: offset < scanLimit });
+
+				const opening = prefix.match(/^---[ \t]*(?:\r?\n|$)/);
+				if (!opening) return { frontmatter: null, size };
+				const afterOpening = prefix.slice(opening[0].length);
+				const closing = afterOpening.match(/\r?\n---[ \t]*(?:\r?\n|$)/);
+				if (!closing || closing.index === undefined) continue;
+				const bounded = prefix.slice(0, opening[0].length + closing.index + closing[0].length);
+				return {
+					frontmatter: parseFrontmatter(bounded, { source: skillPath }).frontmatter as SkillFrontmatter,
+					size,
+				};
+			}
+			return { frontmatter: null, size };
 		} finally {
 			await handle.close();
 		}
@@ -541,9 +562,10 @@ export async function scanSkillsFromDir(
 				warnings.push(`Skill path is not a regular file: ${candidatePath}`);
 				return;
 			}
-			const frontmatter = await readSkillFrontmatter(skillPath);
+			await SkillDiscoveryTestHooks.afterCandidateValidated?.(candidatePath);
+			const { frontmatter, size } = await readSkillFrontmatterSafely(skillPath);
 			if (!frontmatter) {
-				if (fs.statSync(skillPath).size > SKILL_FRONTMATTER_SCAN_TOTAL_BYTES) {
+				if (size > SKILL_FRONTMATTER_SCAN_TOTAL_BYTES) {
 					warnings.push(
 						`Skill frontmatter exceeded ${SKILL_FRONTMATTER_SCAN_TOTAL_BYTES} byte scan cap: ${skillPath}`,
 					);

@@ -7,6 +7,7 @@ import {
 	getAncestorDirs,
 	getUserSkillScanDirs,
 	resolveUserAgentDir,
+	SkillDiscoveryTestHooks,
 	SOURCE_PATHS,
 	scanSkillsFromDir,
 } from "../../src/discovery/helpers";
@@ -360,6 +361,43 @@ describe("safe discovery boundaries", () => {
 			expect(result.items).toEqual([]);
 			expect(result.warnings).toEqual([expect.stringContaining("Refusing unsafe skill authority root")]);
 		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
+	test("rejects a parent swap before frontmatter bytes are read", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-frontmatter-swap-"));
+		try {
+			const skillsDir = path.join(root, "skills");
+			const originalDir = path.join(skillsDir, "victim");
+			const movedDir = path.join(root, "moved-victim");
+			const outsideDir = path.join(root, "outside-victim");
+			await fs.mkdir(originalDir, { recursive: true });
+			await fs.mkdir(outsideDir);
+			await fs.writeFile(
+				path.join(originalDir, "SKILL.md"),
+				"---\nname: inside\ndescription: inside authority\n---\n",
+			);
+			await fs.writeFile(
+				path.join(outsideDir, "SKILL.md"),
+				"---\nname: escaped\ndescription: outside authority\n---\n",
+			);
+			SkillDiscoveryTestHooks.afterCandidateValidated = async candidatePath => {
+				if (candidatePath !== path.join(originalDir, "SKILL.md")) return;
+				delete SkillDiscoveryTestHooks.afterCandidateValidated;
+				await fs.rename(originalDir, movedDir);
+				await fs.symlink(outsideDir, originalDir, "dir");
+			};
+
+			const result = await scanSkillsFromDir(
+				{ cwd: root, home: root, repoRoot: root },
+				{ dir: skillsDir, providerId: "test", level: "user", requireDescription: true },
+			);
+
+			expect(result.items).toEqual([]);
+			expect(result.warnings).toEqual([expect.stringContaining("Failed to read skill file")]);
+		} finally {
+			delete SkillDiscoveryTestHooks.afterCandidateValidated;
 			await fs.rm(root, { recursive: true, force: true });
 		}
 	});

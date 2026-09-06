@@ -180,10 +180,21 @@ async function writeSkillFileSafely(skillDir: string, scopeRoot: string, content
 		throw new SkillFrontmatterError(`skill destination escapes its scope root: ${skillDir}`);
 	}
 	const filePath = path.join(skillDir, "SKILL.md");
-	const flags =
-		nodeFs.constants.O_WRONLY |
-		nodeFs.constants.O_CREAT |
-		(process.platform === "win32" ? 0 : (nodeFs.constants.O_NOFOLLOW ?? 0) | (nodeFs.constants.O_NONBLOCK ?? 0));
+	let destinationExists = false;
+	try {
+		const destination = await fs.lstat(filePath);
+		if (destination.isSymbolicLink() || !destination.isFile()) {
+			throw new SkillFrontmatterError(`skill destination is not a safe file: ${filePath}`);
+		}
+		destinationExists = true;
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+	}
+	const noFollowFlags =
+		process.platform === "win32" ? 0 : (nodeFs.constants.O_NOFOLLOW ?? 0) | (nodeFs.constants.O_NONBLOCK ?? 0);
+	const flags = destinationExists
+		? nodeFs.constants.O_WRONLY | noFollowFlags
+		: nodeFs.constants.O_WRONLY | nodeFs.constants.O_CREAT | nodeFs.constants.O_EXCL | noFollowFlags;
 	let handle: fs.FileHandle;
 	try {
 		handle = await fs.open(filePath, flags, 0o600);
