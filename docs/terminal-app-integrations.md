@@ -78,6 +78,10 @@ turn back: assistant text, thinking, and tool calls arrive as they happen, and t
 `idle`. Content is delivered only to the connections that submitted the turn, so an ordinary terminal
 prompt with nobody attached streams nothing, and a session with no attached client costs nothing.
 
+Displaying externally initiated work as running requires client support. Paseo 0.7.2 reads the
+standard `title` and `updatedAt` fields of `session_info_update`, but ignores GJC's running/idle
+metadata, so its displayed status can remain `idle` during terminal work.
+
 GJC can perform the one remaining step for you. This is **opt-in and off by default** — nothing
 contacts Paseo until you turn it on:
 
@@ -117,13 +121,14 @@ remove an agent you still wanted — and the cleanup is yours to run.
 
 What that means in practice:
 
-- **One entry per launch.** Every interactive start gets a fresh session id, including `gjc -c`, so
-  resuming your work in the same directory adds another entry rather than reusing the previous one.
+- **One entry per session.** A new session gets a new entry. Continuing an existing session with
+  `gjc -c` preserves its session id and reuses its imported Paseo entry; the duplicate-import
+  response is not a registration failure. The ACP router follows the replacement live host.
 - **Ending the session does not remove its entry.** Paseo keeps listing it, and keeps showing it as
   `idle`, because nothing told the daemon otherwise. Sending to it fails with
   `SDK session attachment is stale`, and Paseo then marks it `error`.
 
-So the list grows one row per launch until you prune it:
+So the list grows one row per new session until you prune it:
 
 ```sh
 paseo ls                  # find the stale ids
