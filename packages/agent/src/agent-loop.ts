@@ -43,7 +43,6 @@ import {
 	verifyUnicodeEscapeEvidence,
 } from "@gajae-code/ai/utils/json-parse";
 import { $credentialEnv, sanitizeText } from "@gajae-code/utils";
-import { markDesignedError } from "@gajae-code/utils/error-classification";
 import * as logger from "@gajae-code/utils/logger";
 import { revokeProviderSafetyStop } from "../../ai/src/adapter-internals/provider-safety-stop";
 import type { AttemptScope } from "./attempt-scope";
@@ -2089,8 +2088,6 @@ function losslessDetachedClone<T>(value: T): T {
 						"kind",
 						"status",
 						"code",
-						"http2RstCode",
-						"nativeErrorCode",
 						"providerCode",
 						"openaiErrorCode",
 						"anthropicErrorType",
@@ -4831,12 +4828,6 @@ async function streamAssistantResponse(
 				await finishChat(aborted);
 				return aborted;
 			}
-			// Fingerprint the exact provider-visible request only once it is really sent.
-			const promptPrefix = config.promptPrefixTracker?.observe(config.model, llmContext, {
-				toolChoice: effectiveToolChoice,
-				reasoning: effectiveReasoning,
-				serviceTier: config.serviceTier,
-			});
 			let responsePromise: Promise<Awaited<ReturnType<StreamFn>>>;
 			try {
 				responsePromise = Promise.resolve(
@@ -4943,9 +4934,10 @@ async function streamAssistantResponse(
 				return getResponseResult();
 			};
 
-			// Keep one listener, but race a fresh promise per read so pending abort
-			// reactions do not retain every event until the request ends.
-			let settleReadAbort: (() => void) | undefined;
+			// Set up a single abort race: register the abort listener once for the whole
+			// stream and reuse the same race promise for every iterator.next() instead of
+			// allocating Promise.withResolvers and add/removeEventListener per event.
+			let abortRacePromise: Promise<typeof ABORTED> | undefined;
 			let detachAbortListener: (() => void) | undefined;
 			if (requestSignal) {
 				if (requestSignal.aborted) {
@@ -4961,32 +4953,18 @@ async function streamAssistantResponse(
 					await finishChat(aborted);
 					return aborted;
 				}
-				const onAbort = () => settleReadAbort?.();
+				const { promise, resolve } = Promise.withResolvers<typeof ABORTED>();
+				const onAbort = () => resolve(ABORTED);
 				requestSignal.addEventListener("abort", onAbort, { once: true });
+				abortRacePromise = promise;
 				detachAbortListener = () => requestSignal.removeEventListener("abort", onAbort);
 			}
 
 			try {
 				while (true) {
 					let next: IteratorResult<AssistantMessageEvent>;
-					if (requestSignal) {
-						const { promise, resolve } = Promise.withResolvers<typeof ABORTED>();
-						let settled = false;
-						const settleAbort = (): void => {
-							if (settled) return;
-							settled = true;
-							resolve(ABORTED);
-							config.onAbortRaceReactionChange?.(-1);
-						};
-						config.onAbortRaceReactionChange?.(1);
-						settleReadAbort = settleAbort;
-						let result: IteratorResult<AssistantMessageEvent> | typeof ABORTED;
-						try {
-							result = requestSignal.aborted ? ABORTED : await Promise.race([responseIterator.next(), promise]);
-						} finally {
-							settleAbort();
-							settleReadAbort = undefined;
-						}
+					if (abortRacePromise) {
+						const result = await Promise.race([responseIterator.next(), abortRacePromise]);
 						if (result === ABORTED) {
 							closeIterator();
 							const aborted = emitAbortedAssistantMessage(
@@ -5136,6 +5114,15 @@ async function streamAssistantResponse(
 				: finished;
 			promoteEmptyResponseStop(trailing, finished, managedAttemptTransaction);
 			if (promptPrefix) trailing.promptPrefix = promptPrefix;
+			if (!config.fallbackManaged || (trailing.stopReason !== "error" && trailing.stopReason !== "aborted")) {
+				if (addedPartial) {
+					context.messages[context.messages.length - 1] = trailing;
+				} else {
+					context.messages.push(trailing);
+					stream.push({ type: "message_start", message: { ...trailing }, scope });
+				}
+				stream.push({ type: "message_end", message: trailing, scope });
+			}
 			await finishChat(trailing);
 			return trailing;
 		});
@@ -5514,7 +5501,7 @@ async function executeToolCalls(
 								: reason === "ambiguous"
 									? `The identity of tool call "${toolCall.name}" was ambiguous on the wire (duplicate call id or id/call_id collision), so its arguments cannot be safely attributed. Re-issue the call.`
 									: `Tool call "${toolCall.name}" was cut off before its arguments finished streaming (the response hit its output token limit). The partial arguments cannot be executed. Re-issue the call with complete arguments, splitting the work into smaller steps if needed.`;
-					throw markDesignedError(new Error(detail));
+					throw new Error(detail);
 				}
 				const displaySafeEscapedArguments =
 					escapedArgumentsGuarded &&
@@ -5542,12 +5529,10 @@ async function executeToolCalls(
 						toolRegistered: tool !== undefined,
 						displaySafeFieldsDeclared: isDisplaySafeEscapedTool(tool),
 					});
-					throw markDesignedError(
-						new Error(
-							`Tool call "${toolCall.name}" spelled printable text as \\uXXXX escapes instead of literal UTF-8 characters. ` +
-								`Escaped text cannot be verified — a single wrong hex digit silently becomes a different character — ` +
-								`so the call was not executed. Re-issue it writing every printable character literally.`,
-						),
+					throw new Error(
+						`Tool call "${toolCall.name}" spelled printable text as \\uXXXX escapes instead of literal UTF-8 characters. ` +
+							`Escaped text cannot be verified — a single wrong hex digit silently becomes a different character — ` +
+							`so the call was not executed. Re-issue it writing every printable character literally.`,
 					);
 				}
 				if (!tool) {
@@ -5566,12 +5551,10 @@ async function executeToolCalls(
 					// naming that guess hits a tool the model never asked for, which is
 					// worse than the dead end it would replace.
 					const base = `Tool ${toolCall.name} not found`;
-					throw markDesignedError(
-						new Error(
-							isToolDiscoveryCallable(tools)
-								? `${base}. If you are unsure whether this tool exists or how to use it, call \`${TOOL_DISCOVERY_NAME}\` to discover and activate the matching tool, then retry.`
-								: base,
-						),
+					throw new Error(
+						isToolDiscoveryCallable(tools)
+							? `${base}. If you are unsure whether this tool exists or how to use it, call \`${TOOL_DISCOVERY_NAME}\` to discover and activate the matching tool, then retry.`
+							: base,
 					);
 				}
 
