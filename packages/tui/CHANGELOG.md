@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Loader and other same-width frames, viewport-only resize repaints, and coalesced resize appends skip unused transcript-wide reflow measurements, reducing repeated text-width work in long sessions while preserving rendering.
+
 ### Performance
 
 - Avoid copying unchanged terminal-control spans, reuse retained row widths, consume only the first grapheme for cursor operations, stop select-list width scans at their bounds, and avoid redundant background-row padding.

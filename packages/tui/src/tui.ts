@@ -818,6 +818,7 @@ type TuiRenderCounterSnapshot = {
 	debugRedrawEnvReads: number;
 	debugRedrawAppendWrites: number;
 	differentialGuardVisibleWidthCalls: number;
+	widthReflowVisibleWidthCalls: number;
 };
 type RenderCommitWaiter = {
 	resolve: (committed: boolean) => void;
@@ -1181,6 +1182,7 @@ export class TUI extends Container {
 		debugRedrawEnvReads: 0,
 		debugRedrawAppendWrites: 0,
 		differentialGuardVisibleWidthCalls: 0,
+		widthReflowVisibleWidthCalls: 0,
 	};
 
 	static resetRenderCountersForTest(): void {
@@ -1188,6 +1190,7 @@ export class TUI extends Container {
 			debugRedrawEnvReads: 0,
 			debugRedrawAppendWrites: 0,
 			differentialGuardVisibleWidthCalls: 0,
+			widthReflowVisibleWidthCalls: 0,
 		};
 	}
 
@@ -5083,11 +5086,6 @@ export class TUI extends Container {
 			return;
 		}
 		const useViewportRepaintPath = this.#viewportRepaintHost();
-		const widthReflowRequired =
-			this.#previousWidth > 0 &&
-			rawLines.some(
-				line => !TERMINAL.isImageLine(line) && visibleWidth(line) > Math.min(this.#previousWidth, width),
-			);
 		if (
 			widthChanged &&
 			!this.#legacyMultiplexerFullRender &&
@@ -5171,6 +5169,15 @@ export class TUI extends Container {
 		// Width changes always need a full re-render because wrapping changes, unless
 		// a proven coalesced append is continuing through the durable append path.
 		if (widthChanged && !coalescedWidthAppend) {
+			// Measure only where the reflow decision is consumed. Viewport-only
+			// resize repaints return above; coalesced appends also skip this scan.
+			const widthReflowRequired =
+				this.#previousWidth > 0 &&
+				rawLines.some(line => {
+					if (TERMINAL.isImageLine(line)) return false;
+					TUI.#renderCounters.widthReflowVisibleWidthCalls += 1;
+					return visibleWidth(line) > Math.min(this.#previousWidth, width);
+				});
 			if (!widthReflowRequired) {
 				this.#widthSettleRepairPending = false;
 				logRedraw(`terminal width changed without reflow (${this.#previousWidth} -> ${width})`);
