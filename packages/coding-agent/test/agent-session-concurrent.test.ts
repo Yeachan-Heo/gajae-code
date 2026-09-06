@@ -1432,7 +1432,7 @@ describe("AgentSession TTSR resume gate", () => {
 			},
 		});
 
-		const sessionManager = SessionManager.inMemory();
+		const sessionManager = SessionManager.inMemory(tempDir);
 		const settings = Settings.isolated();
 		const authStorage = await AuthStorage.create(path.join(tempDir, "testauth-int.db"));
 		authStorages.push(authStorage);
@@ -1507,7 +1507,7 @@ describe("AgentSession TTSR resume gate", () => {
 			},
 		});
 
-		const sessionManager = SessionManager.inMemory();
+		const sessionManager = SessionManager.inMemory(tempDir);
 		const settings = Settings.isolated();
 		const authStorage = await AuthStorage.create(path.join(tempDir, "testauth-def.db"));
 		authStorages.push(authStorage);
@@ -1578,7 +1578,7 @@ describe("AgentSession TTSR resume gate", () => {
 			},
 		});
 
-		const sessionManager = SessionManager.inMemory();
+		const sessionManager = SessionManager.inMemory(tempDir);
 		const settings = Settings.isolated();
 		const authStorage = await AuthStorage.create(path.join(tempDir, "testauth-abt.db"));
 		authStorages.push(authStorage);
@@ -1689,7 +1689,7 @@ describe("AgentSession TTSR resume gate", () => {
 			},
 		});
 
-		const sessionManager = SessionManager.inMemory();
+		const sessionManager = SessionManager.inMemory(tempDir);
 		const settings = Settings.isolated();
 		const authStorage = await AuthStorage.create(path.join(tempDir, "testauth-tool.db"));
 		authStorages.push(authStorage);
@@ -1798,7 +1798,7 @@ describe("AgentSession TTSR resume gate", () => {
 			},
 		});
 
-		const sessionManager = SessionManager.inMemory();
+		const sessionManager = SessionManager.inMemory(tempDir);
 		const settings = Settings.isolated();
 		const authStorage = await AuthStorage.create(path.join(tempDir, "testauth-never-tool.db"));
 		authStorages.push(authStorage);
@@ -1934,7 +1934,7 @@ describe("AgentSession TTSR resume gate", () => {
 			},
 		});
 
-		const sessionManager = SessionManager.inMemory();
+		const sessionManager = SessionManager.inMemory(tempDir);
 		const settings = Settings.isolated();
 		const authStorage = await AuthStorage.create(path.join(tempDir, "testauth-dup.db"));
 		authStorages.push(authStorage);
@@ -2042,7 +2042,7 @@ describe("AgentSession TTSR resume gate", () => {
 
 		session = new AgentSession({
 			agent,
-			sessionManager: SessionManager.inMemory(),
+			sessionManager: SessionManager.inMemory(tempDir),
 			settings: Settings.isolated({ "compaction.enabled": false, "contextPromotion.enabled": true }),
 			modelRegistry,
 		});

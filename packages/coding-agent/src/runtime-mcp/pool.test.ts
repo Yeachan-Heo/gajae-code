@@ -462,7 +462,7 @@ describe("MCPConnectionPool", () => {
 		expect(recoveryTransports).toHaveLength(2);
 	});
 
-	test("manager disconnect joins and retries pool-owned late cleanup without spawning", async () => {
+	test("manager disconnect preserves late cleanup failure until pool retry clears every manager fence", async () => {
 		const firstFlight = Promise.withResolvers<MCPServerConnection>();
 		const firstStarted = Promise.withResolvers<void>();
 		const cleanupTransport = new FakeTransport();
@@ -481,7 +481,7 @@ describe("MCPConnectionPool", () => {
 					firstStarted.resolve();
 					return firstFlight.promise;
 				}
-				return connection(name, cfg, new FakeTransport());
+				return connection(name, cfg, new ToolListTransport());
 			},
 		});
 		const manager = new MCPManager(".", null, { pool, sessionId: "disconnect-cleanup" });
@@ -492,16 +492,19 @@ describe("MCPConnectionPool", () => {
 		});
 		await firstStarted.promise;
 		controller.abort(new Error("abort before deferred cleanup failure"));
-		await expect(operation).rejects.toBeInstanceOf(MCPPoolAcquireAbortError);
+		const abortedAcquire = await operation.catch(error => error);
+		expect(abortedAcquire).toBeInstanceOf(MCPPoolAcquireAbortError);
+		if (!(abortedAcquire instanceof MCPPoolAcquireAbortError)) throw new Error("Expected aborted acquisition");
 		expect(manager.pendingConnectionCleanupCountForTests).toBe(1);
 
-		const disconnect = manager.disconnectServer("server");
+		await manager.disconnectServer("server");
 		const fenced = await manager.connectServers({ server: serverConfig }, {});
 		expect(fenced.errors.has("server")).toBe(true);
 		expect(opens).toBe(1);
 		const primaryFailure = new Error("late connection cleanup failed");
 		firstFlight.reject(new MCPConnectionCleanupFailure(primaryFailure, cleanupTransport));
-		const disconnectError = await disconnect.catch(error => error);
+		await expect(abortedAcquire.cleanup).rejects.toBeInstanceOf(MCPConnectionCleanupFailure);
+		const disconnectError = await manager.disconnectServer("server").catch(error => error);
 		expect(disconnectError).toBeInstanceOf(MCPConnectionCleanupFailure);
 		if (!(disconnectError instanceof MCPConnectionCleanupFailure)) {
 			throw new Error("Expected retained disconnect cleanup failure");
@@ -513,14 +516,20 @@ describe("MCPConnectionPool", () => {
 		expect(manager.pendingConnectionCleanupCountForTests).toBe(1);
 		expect(pool.pendingAcquireCleanupCountForTests).toBe(1);
 
-		await manager.disconnectServer("server");
-		expect(cleanupAttempts).toBe(2);
-		expect(manager.pendingConnectionCleanupCountForTests).toBe(0);
-		expect(pool.pendingAcquireCleanupCountForTests).toBe(0);
-		await manager.withPreparedLease("server", serverConfig, async lease => {
+		const recoveryManager = new MCPManager(".", null, { pool, sessionId: "disconnect-cleanup" });
+		await recoveryManager.withPreparedLease("server", serverConfig, async lease => {
 			expect(lease.serverName).toBe("server");
 		});
-		expect(opens).toBe(2);
+		expect(cleanupAttempts).toBe(2);
+		expect(pool.pendingAcquireCleanupCountForTests).toBe(0);
+		expect(manager.pendingConnectionCleanupCountForTests).toBe(1);
+
+		const recovered = await manager.connectServers({ server: serverConfig }, {});
+		expect(recovered.errors.size).toBe(0);
+		expect(recovered.connectedServers).toEqual(["server"]);
+		expect(manager.pendingConnectionCleanupCountForTests).toBe(0);
+		expect(opens).toBe(3);
+		await recoveryManager.disconnectAll();
 		await manager.disconnectAll();
 	});
 

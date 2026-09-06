@@ -18,6 +18,7 @@ function createContext(success: boolean): InteractiveModeContext {
 		statusLine: { invalidate: vi.fn(), setSessionStartTime: vi.fn() },
 		updateEditorTopBorder: vi.fn(),
 		updateEditorBorderColor: vi.fn(),
+		resetAssistantTextPresentation: vi.fn(),
 		ui: { requestRender: vi.fn(), resetViewportAnchorIntent: vi.fn() },
 		chatContainer: { clear: vi.fn(), addChild: vi.fn() },
 		pendingMessagesContainer: { clear: vi.fn() },
@@ -45,6 +46,7 @@ describe("Issue #2261 CommandController fail-closed session replacement", () => 
 			expect(context.loadingAnimation?.stop).not.toHaveBeenCalled();
 			expect(context.statusContainer.clear).not.toHaveBeenCalled();
 			expect(context.resetIrcSidebarSession).not.toHaveBeenCalled();
+			expect(context.resetAssistantTextPresentation).not.toHaveBeenCalled();
 			expect(context.chatContainer.clear).not.toHaveBeenCalled();
 			expect(context.pendingMessagesContainer.clear).not.toHaveBeenCalled();
 			expect(context.compactionQueuedMessages).toEqual([{ text: "old", mode: "followUp" }]);
@@ -63,6 +65,7 @@ describe("Issue #2261 CommandController fail-closed session replacement", () => 
 			expect(stopLoading).toHaveBeenCalledTimes(1);
 			expect(context.statusContainer.clear).toHaveBeenCalledTimes(1);
 			expect(context.resetIrcSidebarSession).toHaveBeenCalledTimes(1);
+			expect(context.resetAssistantTextPresentation).toHaveBeenCalledTimes(1);
 			expect(context.chatContainer.clear).toHaveBeenCalledTimes(1);
 			expect(context.pendingMessagesContainer.clear).toHaveBeenCalledTimes(1);
 			expect(context.compactionQueuedMessages).toEqual([]);
