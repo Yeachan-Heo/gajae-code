@@ -80,6 +80,11 @@ import {
 	type UltragoalChangeStatus,
 } from "./ultragoal-change-set";
 import {
+	assertUltragoalAdoptionPublished,
+	assertUltragoalGoalNotFenced,
+	runUltragoalSuccessionCommand,
+} from "./ultragoal-succession";
+import {
 	resolveUltragoalValidationApplicability,
 	type UltragoalValidationApplicability,
 	type UltragoalValidationLane,
@@ -560,7 +565,13 @@ export async function recordUltragoalNudgeIfBudgetRemaining(input: {
 	);
 }
 
-export async function writePlan(cwd: string, plan: UltragoalPlan, sessionId?: string | null): Promise<void> {
+export async function writePlan(
+	cwd: string,
+	plan: UltragoalPlan,
+	sessionId?: string | null,
+	/** Set by callers already inside {@link withUltragoalPlanOwnership} for this plan. */
+	options: { lockHeld?: boolean } = {},
+): Promise<void> {
 	const resolvedSessionId =
 		sessionId?.trim() || resolveGjcSessionForWrite(cwd, { envSessionId: process.env.GJC_SESSION_ID }).gjcSessionId;
 	const paths = getUltragoalPaths(cwd, resolvedSessionId);
@@ -571,10 +582,45 @@ export async function writePlan(cwd: string, plan: UltragoalPlan, sessionId?: st
 	await writeGuardedJsonAtomic(paths.goalsPath, plan, {
 		cwd,
 		policy: "source",
+		lockHeld: options.lockHeld === true,
 		expectedRevision: typeof plan.state_revision === "number" ? persistedStateRevision(plan) : undefined,
 		audit: { category: "state", verb: "write", owner: "gjc-runtime", sessionId: resolvedSessionId },
 	});
 	await writeSessionActivityMarker(cwd, resolvedSessionId, { writer: "ultragoal-runtime", path: paths.goalsPath });
+}
+
+/**
+ * The single exclusion that decides who owns an Ultragoal run (#5353).
+ *
+ * Establishing ownership is a read-decide-write sequence, not a write: a start
+ * reads the plan, checks the outgoing succession fence, then commits `active`.
+ * Checking quiescence at a point in time and writing afterwards is not enough —
+ * an offer can observe `pending` in the window between an in-flight start's
+ * check and its commit, and both runs then believe they own the goal.
+ *
+ * Every caller that decides ownership — source admission (`start`/`checkpoint`),
+ * succession offer/fence issuance, and successor publication — runs its whole
+ * decision inside this lock, keyed on the plan it is deciding about, and
+ * re-reads the plan under it. Writers inside pass `lockHeld` because
+ * `withFileLock` intentionally serializes same-process callers as well.
+ *
+ * Lock ordering: this lock is always taken BEFORE any ledger lock. The existing
+ * ledger-scoped critical sections (nudge budget, critic verdict, critic gate
+ * override) never write the plan, so no cycle exists.
+ */
+export async function withUltragoalPlanOwnership<T>(cwd: string, sessionId: string, fn: () => Promise<T>): Promise<T> {
+	return withWorkflowStateLock(getUltragoalPaths(cwd, sessionId).goalsPath, fn, { cwd });
+}
+
+/**
+ * Resolve the session whose plan ownership is being decided, without changing
+ * the resolution behaviour callers already depend on.
+ */
+export async function resolveUltragoalOwnershipSession(cwd: string, sessionId?: string | null): Promise<string> {
+	return (
+		sessionId?.trim() ||
+		(await resolveGjcSessionForRead(cwd, { envSessionId: process.env.GJC_SESSION_ID })).gjcSessionId
+	);
 }
 
 function chooseReceiptKind(
@@ -1315,40 +1361,53 @@ export async function startNextUltragoalGoal(input: {
 	allComplete: boolean;
 	nextAction: UltragoalCompleteNextAction;
 }> {
-	const plan = await readUltragoalPlan(input.cwd, input.sessionId);
-	if (!plan) throw new Error("No ultragoal plan found. Run `gjc ultragoal create-goals --brief ...` first.");
-	// Fail closed: delegated execution requires stamped repository authority (#2901).
-	if (!plan.repositoryBinding) {
-		throw new Error(
-			"Ultragoal plan is missing repositoryBinding; recreate goals so the plan is bound to an authoritative repository identity.",
-		);
-	}
-	await assertCwdMatchesRepositoryBinding(input.cwd, plan.repositoryBinding);
-	const retryFailed = input.retryFailed === true;
-	const goal = chooseNextGoal(plan, retryFailed);
-	if (!goal) {
-		const state = getUltragoalRunCompletionState(plan, { retryFailed });
+	const sessionId = await resolveUltragoalOwnershipSession(input.cwd, input.sessionId);
+	// Claiming a goal is a read-decide-write sequence. It runs entirely inside the
+	// plan-ownership exclusion so a succession offer cannot observe this run as
+	// idle between the fence check and the commit of `active` (#5353).
+	return withUltragoalPlanOwnership(input.cwd, sessionId, async () => {
+		const plan = await readUltragoalPlan(input.cwd, sessionId);
+		if (!plan) throw new Error("No ultragoal plan found. Run `gjc ultragoal create-goals --brief ...` first.");
+		// Fail closed: delegated execution requires stamped repository authority (#2901).
+		if (!plan.repositoryBinding) {
+			throw new Error(
+				"Ultragoal plan is missing repositoryBinding; recreate goals so the plan is bound to an authoritative repository identity.",
+			);
+		}
+		await assertCwdMatchesRepositoryBinding(input.cwd, plan.repositoryBinding);
+		// Fail closed before any mutation: a run whose cross-repository adoption never
+		// finished publishing does not own its goals yet, however visible goals.json is
+		// (#5353).
+		await assertUltragoalAdoptionPublished(input.cwd, sessionId);
+		const retryFailed = input.retryFailed === true;
+		const goal = chooseNextGoal(plan, retryFailed);
+		// Re-checked under the exclusion, not before it: an offer that won the lock
+		// first has already published its fence by the time we get here.
+		if (goal) await assertUltragoalGoalNotFenced(input.cwd, sessionId, goal.id);
+		if (!goal) {
+			const state = getUltragoalRunCompletionState(plan, { retryFailed });
+			return {
+				plan,
+				allComplete: state.allComplete,
+				nextAction: resolveUltragoalCompleteNextAction(plan, { retryFailed }),
+			};
+		}
+		if (goal.status !== "active") {
+			const now = new Date().toISOString();
+			goal.status = "active";
+			goal.startedAt = goal.startedAt ?? now;
+			goal.updatedAt = now;
+			plan.updatedAt = now;
+			await writePlan(input.cwd, plan, sessionId, { lockHeld: true });
+			await appendLedger(input.cwd, { event: "goal_started", goalId: goal.id }, sessionId);
+		}
 		return {
 			plan,
-			allComplete: state.allComplete,
-			nextAction: resolveUltragoalCompleteNextAction(plan, { retryFailed }),
+			goal,
+			allComplete: false,
+			nextAction: { kind: "execute-goal", goal },
 		};
-	}
-	if (goal.status !== "active") {
-		const now = new Date().toISOString();
-		goal.status = "active";
-		goal.startedAt = goal.startedAt ?? now;
-		goal.updatedAt = now;
-		plan.updatedAt = now;
-		await writePlan(input.cwd, plan, input.sessionId);
-		await appendLedger(input.cwd, { event: "goal_started", goalId: goal.id }, input.sessionId);
-	}
-	return {
-		plan,
-		goal,
-		allComplete: false,
-		nextAction: { kind: "execute-goal", goal },
-	};
+	});
 }
 
 async function readStructuredValue(cwd: string, value: string): Promise<unknown> {
@@ -3496,17 +3555,41 @@ function validateCompleteCheckpointTargetGoal(goal: UltragoalGoal): void {
 	);
 }
 
-export async function checkpointUltragoalGoal(input: {
+export interface UltragoalCheckpointInput {
 	cwd: string;
 	goalId: string;
 	status: UltragoalGoalStatus;
 	evidence: string;
 	qualityGateJson?: string;
-}): Promise<UltragoalPlan> {
-	const plan = await readUltragoalPlan(input.cwd);
+}
+
+/**
+ * Checkpointing shares its plan with a succession offer, but only its *commit*
+ * is fenced against one (#5353). Completion validation must observe the same
+ * repository basis `quality-gate source-hash` did, and the ownership lock's own
+ * on-disk artifact lives under `.gjc/` — a path repositories are not required to
+ * ignore — so capturing the basis while holding it would make the runtime digest
+ * disagree with the gate the caller was told to produce.
+ */
+export async function checkpointUltragoalGoal(input: UltragoalCheckpointInput): Promise<UltragoalPlan> {
+	const sessionId = await resolveUltragoalOwnershipSession(input.cwd, null);
+	return checkpointUltragoalGoalForSession(input, sessionId);
+}
+
+async function checkpointUltragoalGoalForSession(
+	input: UltragoalCheckpointInput,
+	sessionId: string,
+): Promise<UltragoalPlan> {
+	const plan = await readUltragoalPlan(input.cwd, sessionId);
 	if (!plan) throw new Error("No ultragoal plan found. Run `gjc ultragoal create-goals --brief ...` first.");
 	const goal = plan.goals.find(item => item.id === input.goalId);
 	if (!goal) throw new Error(`No ultragoal goal found for ${input.goalId}.`);
+	// A handed-off goal is owned by the successor run; the source must not record
+	// further checkpoints against it (#5353). A run whose own adoption is still
+	// unpublished may not record checkpoints at all — a completion receipt must
+	// never rest on a transaction that never committed.
+	await assertUltragoalAdoptionPublished(input.cwd, sessionId);
+	await assertUltragoalGoalNotFenced(input.cwd, sessionId, goal.id);
 	const evidence = input.evidence.trim();
 	if (!evidence) throw new Error("checkpoint evidence is required");
 	const ledgerBefore = await readUltragoalLedger(input.cwd);
@@ -3683,17 +3766,27 @@ export async function checkpointUltragoalGoal(input: {
 	goal.updatedAt = now;
 	if (input.status === "complete") goal.completedAt = now;
 	plan.updatedAt = now;
-	await writePlan(input.cwd, plan);
-	const persistedPlan = await readUltragoalPlan(input.cwd);
-	if (persistedPlan?.state_revision !== undefined) plan.state_revision = persistedPlan.state_revision;
-	await appendLedger(input.cwd, {
-		eventId: pendingCheckpointEventId,
-		event: "goal_checkpointed",
-		goalId: goal.id,
-		status: input.status,
-		evidence,
-		qualityGateJson,
-		completionVerification: goal.completionVerification,
+	// Commit inside the exclusion an offer holds while it decides quiescence and
+	// installs its fence. The earlier assertions ran before validation, which is
+	// slow, and an offer may fence a non-active goal in that window; because an
+	// offer writes no source bytes, the plan's compare-and-swap cannot observe it.
+	// Re-asserting here is what makes "not handed off" true at the instant of the
+	// write rather than merely true earlier.
+	await withUltragoalPlanOwnership(input.cwd, sessionId, async () => {
+		await assertUltragoalAdoptionPublished(input.cwd, sessionId);
+		await assertUltragoalGoalNotFenced(input.cwd, sessionId, goal.id);
+		await writePlan(input.cwd, plan, sessionId, { lockHeld: true });
+		const persistedPlan = await readUltragoalPlan(input.cwd, sessionId);
+		if (persistedPlan?.state_revision !== undefined) plan.state_revision = persistedPlan.state_revision;
+		await appendLedger(input.cwd, {
+			eventId: pendingCheckpointEventId,
+			event: "goal_checkpointed",
+			goalId: goal.id,
+			status: input.status,
+			evidence,
+			qualityGateJson,
+			completionVerification: goal.completionVerification,
+		});
 	});
 	return plan;
 }
@@ -4732,6 +4825,10 @@ const FLAGS_WITH_VALUES = new Set([
 	"--validation-batch-json",
 	"--out",
 	"--surface",
+	"--target-repo",
+	"--authorize",
+	"--authorized-by",
+	"--offer",
 ]);
 
 function isHelpArg(arg: string): boolean {
@@ -4861,6 +4958,46 @@ function renderUltragoalHelp(args: readonly string[]): string | null {
 		].join("\n");
 	}
 
+	if (subject === "succession") {
+		return [
+			"Run native GJC Ultragoal workflow commands",
+			"",
+			"USAGE",
+			"  $ gjc ultragoal succession offer --target-repo <path> --goal-id <id> [--goal-id <id> ...] --authorize <statement> --authorized-by <identity> [--json]",
+			"  $ gjc ultragoal succession adopt --offer <path> [--gjc-goal-mode aggregate|per-story] [--json]",
+			"  $ gjc ultragoal succession status [--json]",
+			"",
+			"FLAGS",
+			"      --target-repo=<value>        Destination repository for the successor run; never the source repository",
+			"      --goal-id=<value>            Unfinished source goal to hand off (repeatable; no implicit or wildcard selection)",
+			"      --authorize=<value>          Required. Explicit bounded authorization statement for this source/target/selection",
+			"      --authorized-by=<value>      Required. Identity that authorized the handoff",
+			"      --offer=<value>              Offer document recorded by `succession offer`, read from inside the source worktree",
+			"      --gjc-goal-mode=<value>      Successor validation mode (default aggregate); the source mode is provenance only",
+			"      --json                       Output a machine-readable receipt",
+			"",
+			"OWNERSHIP",
+			"  `offer` records a durable outgoing ownership fence, so the source run stops scheduling and checkpointing the",
+			"  selected goals immediately — not when the target happens to adopt. Between offer and adoption no run owns them.",
+			"  The source brief, goals and ledger are never written. Goals the offer did not select stay schedulable, so",
+			"  admission compares a snapshot of the offered work rather than whole-file digests.",
+			"  There is deliberately no `revoke` verb: any read-then-delete of the fence races a concurrent adoption and could",
+			"  revive the source while the target is starting, so an unadopted offer keeps its goals fenced.",
+			"",
+			"AUTHORITY",
+			"  Adoption starts a fresh run bound to the target repository, pinned to the exact worktree the offer named. Source",
+			"  statuses, completion receipts, quality gates, reviews and approvals are carried as provenance only and never",
+			"  authorize anything in the target. Adoption fails closed on changed offered work, an altered or unfenced offer, an",
+			"  unnamed or occupied target, and any duplicate or divergent adoption in the target repository; a retry reconciles",
+			"  the exact recorded operation or fails closed. Until publication completes, the target refuses to execute.",
+			"",
+			"EXAMPLES",
+			'  $ gjc ultragoal succession offer --target-repo ../payments-api --goal-id G002 --goal-id G003 --authorize "leader approved moving the refund stories" --authorized-by human:release-lead --json',
+			"  $ gjc ultragoal succession adopt --offer ../plan-repo/.gjc/_session-abc/ultragoal/succession/offer-<id>.json --json",
+			"",
+		].join("\n");
+	}
+
 	if (subject === "quality-gate") {
 		return [
 			"Run native GJC Ultragoal workflow commands",
@@ -4906,9 +5043,12 @@ function renderUltragoalHelp(args: readonly string[]): string | null {
 		"  quality-gate source-hash",
 		"  quality-gate lane-selection",
 		"  quality-gate validate",
+		"  succession offer",
+		"  succession adopt",
+		"  succession status",
 
 		"",
-		"Run `gjc ultragoal checkpoint --help`, `gjc ultragoal review --help`, `gjc ultragoal classify-blocker --help`, `gjc ultragoal record-critic-verdict --help`, or `gjc ultragoal record-critic-gate-override --help`, or `gjc ultragoal quality-gate --help` for command-specific requirements.",
+		"Run `gjc ultragoal checkpoint --help`, `gjc ultragoal review --help`, `gjc ultragoal classify-blocker --help`, `gjc ultragoal record-critic-verdict --help`, or `gjc ultragoal record-critic-gate-override --help`, or `gjc ultragoal quality-gate --help`, or `gjc ultragoal succession --help` for command-specific requirements.",
 		"",
 	].join("\n");
 }
@@ -5390,6 +5530,8 @@ async function dispatchUltragoalCommand(
 						.join("\n")}\n`,
 				};
 			}
+			case "succession":
+				return await runUltragoalSuccessionCommand(args, cwd);
 			case "review": {
 				const result = await runUltragoalReview(cwd, args);
 				return {

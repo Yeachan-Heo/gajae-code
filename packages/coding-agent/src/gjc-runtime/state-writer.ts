@@ -533,40 +533,41 @@ async function writeGuardedResolvedJsonAtomic(
 	value: unknown,
 	options: GuardedStateWriterOptions,
 ): Promise<GuardedWriteResult> {
-	return lockResolvedWorkflowTarget(
-		filePath,
-		async () => {
-			const current = await readJsonIfPresentTolerant(filePath);
-			const currentRevision = persistedStateRevision(current);
+	const write = async (): Promise<GuardedWriteResult> => {
+		const current = await readJsonIfPresentTolerant(filePath);
+		const currentRevision = persistedStateRevision(current);
 
-			if (options.policy === "source") {
-				if (options.expectedRevision !== undefined && options.expectedRevision !== currentRevision) {
-					throw new StateWriteConflictError(filePath, options.expectedRevision, currentRevision);
-				}
-				const next = stampStateRevision(withWorkflowReceipt(value, buildReceipt(options)), currentRevision + 1);
-				await atomicWrite(filePath, jsonText(next));
-				await maybeAudit(filePath, options);
-				return { path: filePath, written: true, revision: currentRevision + 1, stamped: next };
+		if (options.policy === "source") {
+			if (options.expectedRevision !== undefined && options.expectedRevision !== currentRevision) {
+				throw new StateWriteConflictError(filePath, options.expectedRevision, currentRevision);
 			}
-
-			const valueSourceRevision = isPlainObject(value) ? persistedSourceRevision(value) : 0;
-			const incomingSourceRevision =
-				options.sourceRevision ??
-				(valueSourceRevision || (options.advanceSourceRevision ? persistedSourceRevision(current) + 1 : 0));
-			if (current !== undefined && incomingSourceRevision <= persistedSourceRevision(current)) {
-				return { path: filePath, written: false, reason: "stale-skip", revision: currentRevision };
-			}
-			const next = stampStateRevision(
-				withWorkflowReceipt(value, buildReceipt(options)),
-				currentRevision + 1,
-				incomingSourceRevision,
-			);
+			const next = stampStateRevision(withWorkflowReceipt(value, buildReceipt(options)), currentRevision + 1);
 			await atomicWrite(filePath, jsonText(next));
 			await maybeAudit(filePath, options);
 			return { path: filePath, written: true, revision: currentRevision + 1, stamped: next };
-		},
-		options.lock,
-	);
+		}
+
+		const valueSourceRevision = isPlainObject(value) ? persistedSourceRevision(value) : 0;
+		const incomingSourceRevision =
+			options.sourceRevision ??
+			(valueSourceRevision || (options.advanceSourceRevision ? persistedSourceRevision(current) + 1 : 0));
+		if (current !== undefined && incomingSourceRevision <= persistedSourceRevision(current)) {
+			return { path: filePath, written: false, reason: "stale-skip", revision: currentRevision };
+		}
+		const next = stampStateRevision(
+			withWorkflowReceipt(value, buildReceipt(options)),
+			currentRevision + 1,
+			incomingSourceRevision,
+		);
+		await atomicWrite(filePath, jsonText(next));
+		await maybeAudit(filePath, options);
+		return { path: filePath, written: true, revision: currentRevision + 1, stamped: next };
+	};
+	// `withFileLock` deliberately serializes same-process callers too, so a caller
+	// that already holds this target's lock (via `withWorkflowStateLock`) must say
+	// so rather than deadlocking against itself — the same `lockHeld` contract the
+	// envelope writers already use.
+	return options.lockHeld ? write() : lockResolvedWorkflowTarget(filePath, write, options.lock);
 }
 
 export async function writeGuardedJsonAtomic(
