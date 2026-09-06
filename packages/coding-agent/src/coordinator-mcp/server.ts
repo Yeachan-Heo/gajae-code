@@ -11,7 +11,11 @@ import {
 	COORDINATOR_MCP_TOOL_NAMES,
 	type CoordinatorToolName,
 } from "../coordinator/contract";
-import { SessionStateLockUnavailableError, withSessionStateFileLock } from "../gjc-runtime/session-state-lock";
+import {
+	SessionStateLockUnavailableError,
+	tryWithSessionStateFileLock,
+	withSessionStateFileLock,
+} from "../gjc-runtime/session-state-lock";
 import {
 	canonicalCoordinatorSidecarPayload,
 	classifyRuntimeToolActivity,
@@ -3369,19 +3373,14 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 	void startupCodexWakeReplay.catch(() => undefined);
 	let questionStateReady: Promise<void> | null = null;
 	let delegatePinRecovery: Promise<void> | null = null;
-	let delegatePinRecoveryComplete = false;
+	let delegatePinCursor: { sessionId: string; promptKey: string | null } | null = null;
 
 	async function ensureQuestionStateReady(): Promise<void> {
 		questionStateReady ??= initializeCoordinatorNamespace(questionPaths);
 		await questionStateReady;
-		if (delegatePinRecoveryComplete) return;
-		delegatePinRecovery ??= reconcileCompletedDelegateResponsePins()
-			.then(complete => {
-				delegatePinRecoveryComplete = complete;
-			})
-			.finally(() => {
-				delegatePinRecovery = null;
-			});
+		delegatePinRecovery ??= reconcileCompletedDelegateResponsePins().finally(() => {
+			delegatePinRecovery = null;
+		});
 		try {
 			await delegatePinRecovery;
 		} catch (error) {
@@ -5198,12 +5197,11 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		const releaseResponsePin = async (record: Partial<CoordinatorToolIdempotencyRecord>): Promise<void> => {
 			if (!workflowForDelegateTool(tool) || record.delegate_response_pin === undefined) return;
 			try {
-				if (!(await releaseDelegateResponsePin(record.delegate_response_pin)))
+				if (!(await releaseDelegateResponsePin(record.delegate_response_pin, idempotencyKey)))
 					throw new Error("delegate_response_pin_mismatch");
 			} catch (error) {
-				delegatePinRecoveryComplete = false;
 				// Cleanup cannot invalidate an already committed snapshot. Keep the
-				// pin on failure and retry cleanup during startup recovery or replay.
+				// pin on failure and retry cleanup during readiness or replay.
 				logger.warn("Coordinator delegate response pin cleanup failed", {
 					sessionId: record.delegate_response_pin?.session_id,
 					error: String(error),
@@ -6448,7 +6446,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 	}
 
 	/** A persisted final response, never admission alone, permits source compaction. */
-	async function releaseDelegateResponsePin(rawPin: unknown): Promise<boolean> {
+	async function releaseDelegateResponsePin(rawPin: unknown, idempotencyKey: string): Promise<boolean> {
 		const pin = delegateResponsePin(rawPin);
 		if (!pin) return false;
 		if (!(await readSessionTransaction(questionPaths, pin.session_id))) return true;
@@ -6460,6 +6458,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				return;
 			}
 			if (
+				request.sdk_idempotency_key === idempotencyKey &&
 				request.coordinator_turn_id === pin.coordinator_turn_id &&
 				request.runtime_receipt?.accepted === true &&
 				request.runtime_receipt.command_id === pin.runtime_command_id &&
@@ -6475,7 +6474,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		return released;
 	}
 
-	async function reconcileCompletedDelegateResponsePins(): Promise<boolean> {
+	async function reconcileCompletedDelegateResponsePins(): Promise<void> {
 		const roster = await readSchedulerRoster(questionPaths);
 		let persisted: string[];
 		try {
@@ -6489,10 +6488,21 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				...roster.roster.map(entry => entry.session_id),
 				...persisted.filter(entry => COORDINATOR_SESSION_ID_PATTERN.test(entry)),
 			]),
-		];
+		].sort();
+		// Readiness recurs even after a clean scan: another coordinator may create
+		// a pin later. Bound WAL reads and receipt inspections per pass, and resume
+		// within a session when its pins exhaust the shared budget.
+		const cursor = delegatePinCursor;
+		const nextIndex = sessionIds.findIndex(
+			id => cursor === null || (cursor.promptKey !== null ? id >= cursor.sessionId : id > cursor.sessionId),
+		);
+		const start = nextIndex < 0 ? 0 : nextIndex;
+		let remainingPins = 32;
 		const failures: unknown[] = [];
-		let complete = true;
-		for (const sessionId of sessionIds) {
+		for (let offset = 0; offset < Math.min(sessionIds.length, 32) && remainingPins > 0; offset++) {
+			const sessionId = sessionIds[(start + offset) % sessionIds.length]!;
+			const afterPrompt = offset === 0 && sessionId === cursor?.sessionId ? cursor.promptKey : null;
+			delegatePinCursor = { sessionId, promptKey: null };
 			let transaction: CoordinatorSessionTransactionV1 | null;
 			try {
 				transaction = await readSessionTransaction(questionPaths, sessionId);
@@ -6501,8 +6511,13 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				continue;
 			}
 			if (!transaction) continue;
-			for (const request of Object.values(transaction.requests.prompts)) {
+			for (const promptKey of Object.keys(transaction.requests.prompts).sort()) {
+				if (afterPrompt !== null && promptKey <= afterPrompt) continue;
+				const request = transaction.requests.prompts[promptKey]!;
 				if (request.delegate_response_pending !== true) continue;
+				if (remainingPins === 0) break;
+				remainingPins--;
+				delegatePinCursor = { sessionId, promptKey };
 				const keyDigest = createHash("sha256").update(request.sdk_idempotency_key).digest("hex");
 				const file = path.join(namespaceDir, "idempotency", `${keyDigest}.json`);
 				try {
@@ -6511,26 +6526,26 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					// for it. Completed candidates still need a locked authoritative read.
 					const candidate = await readCoordinatorIdempotencyFile(file);
 					if (candidate.kind === "corrupt") throw new Error("delegate_response_receipt_corrupt");
-					if (candidate.kind !== "record" || candidate.value.state !== "completed") {
-						// A peer can commit and die before releasing this pin. Skip its
-						// live lock, but revisit the receipt on a later readiness call.
-						complete = false;
-						continue;
-					}
-					await withSessionStateLock(
+					if (candidate.kind !== "record" || candidate.value.state !== "completed") continue;
+					// A completed receipt can still have a live writer finishing cleanup.
+					// Busy candidates remain pinned until a later round-robin pass.
+					await tryWithSessionStateFileLock(
 						path.join(namespaceDir, "idempotency-locks", `${keyDigest}.json`),
 						async () => {
 							const current = await readCoordinatorIdempotencyFile(file);
-							if (current.kind === "missing") {
-								complete = false;
-								return;
-							}
+							if (current.kind === "missing") return;
 							if (current.kind === "corrupt") throw new Error("delegate_response_receipt_corrupt");
-							if (current.value.state !== "completed") {
-								complete = false;
-								return;
-							}
-							if (!(await releaseDelegateResponsePin(current.value.delegate_response_pin)))
+							if (current.value.state !== "completed") return;
+							// Match replay's response requirement before relinquishing canonical
+							// recovery evidence. Public response subfields may be truncated.
+							if (!asRecord(current.value.response)) throw new Error("delegate_response_receipt_corrupt");
+							const pin = delegateResponsePin(current.value.delegate_response_pin);
+							if (
+								current.value.key_digest !== keyDigest ||
+								pin?.session_id !== sessionId ||
+								pin.prompt_key_digest !== promptKey ||
+								!(await releaseDelegateResponsePin(pin, request.sdk_idempotency_key))
+							)
 								throw new Error("delegate_response_pin_mismatch");
 						},
 					);
@@ -6538,9 +6553,9 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					failures.push(error);
 				}
 			}
+			if (remainingPins > 0) delegatePinCursor = { sessionId, promptKey: null };
 		}
 		if (failures.length > 0) throw new AggregateError(failures, "delegate_response_pin_recovery_incomplete");
-		return complete;
 	}
 
 	function hasInitialDelegatePromptAuthority(

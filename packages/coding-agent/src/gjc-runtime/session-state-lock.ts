@@ -40,15 +40,17 @@ const LOCK_ACQUIRE_MAX_RETRY_MS = 100;
 const LOCK_ACQUIRE_TIMEOUT_MS = 5_000;
 const LOCK_STALE_MS = 30_000;
 const RELEASED_TRANSITION_GRACE_MS = 1_000;
+const SESSION_STATE_LOCK_BUSY = Symbol("session-state-lock-busy");
 
 interface LockRetryBudget {
 	startedAt: number;
 	nextDelayMs: number;
 	attempts: number;
+	nonBlocking: boolean;
 }
 
-function lockRetryBudget(): LockRetryBudget {
-	return { startedAt: performance.now(), nextDelayMs: LOCK_ACQUIRE_RETRY_MS, attempts: 0 };
+function lockRetryBudget(nonBlocking = false): LockRetryBudget {
+	return { startedAt: performance.now(), nextDelayMs: LOCK_ACQUIRE_RETRY_MS, attempts: 0, nonBlocking };
 }
 
 function lockRetryElapsedMs(budget: LockRetryBudget): number {
@@ -160,6 +162,7 @@ async function joinLocalTransitionQueue(
 ): Promise<LocalTransitionQueue | undefined> {
 	const queue = localTransitionQueues.get(key);
 	if (!queue) return undefined;
+	if (retryBudget?.nonBlocking) throw SESSION_STATE_LOCK_BUSY;
 	const ready = Promise.withResolvers<void>();
 	const queuedAt = performance.now();
 	SessionStateLockTestHooks.afterLocalTransitionQueued?.(transitionDir);
@@ -1819,6 +1822,7 @@ async function recoverPendingTransitionRelease(
 	transitionDir: string,
 	recoveryKey: string,
 	quarantineName: string,
+	nonBlocking = false,
 ): Promise<boolean> {
 	let pendingKey = recoveryKey;
 	let pending = pendingTransitionReleases.get(pendingKey);
@@ -1851,7 +1855,10 @@ async function recoverPendingTransitionRelease(
 	// for a contender while that release is still in progress. The owner that armed
 	// it flips this bit only when a phase actually throws.
 	if (!pending.recoverable) return false;
-	if (pending.recovery) return await pending.recovery;
+	if (pending.recovery) {
+		if (nonBlocking) throw SESSION_STATE_LOCK_BUSY;
+		return await pending.recovery;
+	}
 	const recovery = (async (): Promise<boolean> => {
 		const ownerFile = `${transitionDir}.owner`;
 		if (!pending.generation) {
@@ -2097,7 +2104,7 @@ async function runLockPathTransition<T>(
 	for (;;) {
 		if (ownerAccessStrategy() === "unsupported" && fsSync.existsSync(transitionDir))
 			throw new SessionStateLockUnavailableError(new Error("Safe transition ownership is unsupported."));
-		if (await recoverPendingTransitionRelease(transitionDir, recoveryKey, quarantineName)) {
+		if (await recoverPendingTransitionRelease(transitionDir, recoveryKey, quarantineName, budget.nonBlocking)) {
 			// The claim this process stranded in an earlier failed release is gone;
 			// fall through and retry the mkdir immediately.
 		}
@@ -2108,10 +2115,15 @@ async function runLockPathTransition<T>(
 			await fs.chmod(transitionDir, 0o700);
 		} catch (error) {
 			const code = (error as NodeJS.ErrnoException).code;
-			if (code !== "EEXIST" && !isTransientLockError(error)) throw new SessionStateLockUnavailableError(error);
+			if (code !== "EEXIST" && (budget.nonBlocking || !isTransientLockError(error)))
+				throw new SessionStateLockUnavailableError(error);
 			if (await joinLocalTurn()) continue;
 			await SessionStateLockTestHooks.afterTransitionClaimContention?.(transitionDir);
-			if (await reclaimStaleTransitionClaim(transitionDir, quarantineName)) {
+			const reclaimed = await reclaimStaleTransitionClaim(transitionDir, quarantineName);
+			// One safe reclaim may make progress, but a try-acquire never follows a
+			// succession of contenders. A later maintenance pass can take the freed claim.
+			if (budget.nonBlocking) throw SESSION_STATE_LOCK_BUSY;
+			if (reclaimed) {
 				if (lockRetryExhausted(budget))
 					throw lockUnavailable(transitionDir, "transition_claim_timeout", budget, error);
 				continue;
@@ -2551,8 +2563,33 @@ export async function reclaimStaleSessionStateLock(lockFile: string, quarantineN
  * lock file itself and may run for as long as it needs.
  */
 export async function withSessionStateFileLock<T>(stateFile: string, operation: () => Promise<T>): Promise<T> {
+	return await runWithSessionStateFileLock(stateFile, operation, lockRetryBudget());
+}
+
+/**
+ * Try one admission without joining a live owner's queue or backing off on contention.
+ * A stale reclaim may return `acquired: false` after making the next attempt possible.
+ * Once admitted, the operation and identity-safe release use the normal lock protocol;
+ * their failures propagate rather than being reported as contention.
+ */
+export async function tryWithSessionStateFileLock<T>(
+	stateFile: string,
+	operation: () => Promise<T>,
+): Promise<{ acquired: true; value: T } | { acquired: false }> {
+	try {
+		return { acquired: true, value: await runWithSessionStateFileLock(stateFile, operation, lockRetryBudget(true)) };
+	} catch (error) {
+		if (error === SESSION_STATE_LOCK_BUSY) return { acquired: false };
+		throw error;
+	}
+}
+
+async function runWithSessionStateFileLock<T>(
+	stateFile: string,
+	operation: () => Promise<T>,
+	budget: LockRetryBudget,
+): Promise<T> {
 	const lockFile = `${stateFile}.lock`;
-	const budget = lockRetryBudget();
 	let owner: SessionStateLockOwner;
 	try {
 		owner = await newLockOwner();
@@ -2608,6 +2645,11 @@ export async function withSessionStateFileLock<T>(stateFile: string, operation: 
 			if (callbackFailure && error === callbackError) throw error;
 			// A fault after the lock was taken belongs to the operation, not to acquisition.
 			if (held) throw lockDiagnostic(error, lockFile, "lock_release_failed");
+			if (error === SESSION_STATE_LOCK_BUSY) throw error;
+			// Typed protocol failures include transition setup/release faults. A
+			// try-acquire must not downgrade those into a successful busy response.
+			if (budget.nonBlocking && error instanceof SessionStateLockUnavailableError)
+				throw lockDiagnostic(error, lockFile, "lock_inspection_failed", budget);
 			// Without a safe owner-record access strategy, retrying cannot make the
 			// transition claim removable. Preserve it as a fail-closed fence instead
 			// of spinning until the acquisition budget expires.
@@ -2630,6 +2672,7 @@ export async function withSessionStateFileLock<T>(stateFile: string, operation: 
 			);
 			if (reclaim === "owner_unprovenanced")
 				throw lockUnavailable(lockFile, "lock_owner_record_unprovenanced", budget);
+			if (budget.nonBlocking) throw SESSION_STATE_LOCK_BUSY;
 			if (reclaim === "legacy_directory_unprovenanced") lastReason = "legacy_directory_owner_unprovenanced";
 			else if (reclaim === "owner_live_or_unverifiable") lastReason = "lock_owner_live_or_unverifiable";
 			else if (reclaim === "owner_record_fresh") lastReason = "lock_owner_record_fresh";
