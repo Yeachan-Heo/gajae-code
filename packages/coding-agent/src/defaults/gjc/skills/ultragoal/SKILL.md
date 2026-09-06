@@ -442,6 +442,28 @@ Receipts are freshness-scoped:
 - Appending required goals or changing final required-goal state stales final aggregate receipts. Final aggregate completion requires a fresh final aggregate receipt proving no incomplete, blocked, or `review_blocked` required goals remain.
 - Deferred per-goal receipts (validation-batch members) are incomplete until a matching fresh batch-close receipt exists on the batch's `finalGoalId`; a story-scope query for a deferred member stays blocked until that close, and mutating a member after close stales the batch-close and final aggregate receipts.
 
+## Cross-repository succession
+
+When an approved run was planned in one repository but the implementation belongs in another, the repository-binding guard correctly refuses to execute the plan from the second repository. Never edit `repositoryBinding` and never copy the runtime directory: both defeat the boundary and launder verification provenance. Use the explicit successor path instead.
+
+```
+gjc ultragoal succession offer --target-repo <path> --goal-id G002 --goal-id G003 --authorize "<who approved what, for which source, target and goals>" --authorized-by <identity> --json
+gjc ultragoal succession adopt --offer <offer path inside the source worktree> --json
+gjc ultragoal succession status --json
+```
+
+`offer` runs in the source repository. It records an offer document plus a durable outgoing ownership fence, and writes nothing to `brief.md`, `goals.json` or `ledger.jsonl`. From that moment the source run refuses to schedule or checkpoint the fenced goals; goals outside the selection stay fully schedulable. Ownership therefore leaves the source at the offer, not when the target happens to adopt, so no interval exists in which both runs may resume the same goal. There is deliberately no `revoke` verb: any read-then-delete of the fence races a concurrent adoption and could revive the source while the target is starting, so an unadopted offer keeps its goals fenced.
+
+Because unselected goals stay schedulable, ordinary source progress moves whole-file digests. Adoption therefore compares a **snapshot of the offered work** — the brief plus each selected goal's record and unresolved obligations — instead of whole-file equality, so unrelated progress cannot permanently strand the handed-off work. Whole-file digests are still recorded as provenance and any drift is written into the adoption record.
+
+`adopt` runs in the target repository and starts a genuinely fresh run: new pending goals, fresh timestamps, the target repository's own binding, and no inherited receipts, quality gates, validation batches, steering or activated objective. The source brief and every selected objective are carried verbatim, together with the unresolved obligations recorded against those goals — requirements are carried forward in full, never summarized down. Dependency groups travel as explicit obligations with source-to-target id mapping: the source's batch metadata and receipts are not inherited, but the requirement to validate those goals together is.
+
+Selection and authorization must be explicit. Only unfinished goals (`pending`, `failed`, `blocked`, `review_blocked`) may be handed off; the source run must be quiescent with no `active` goal; there is no implicit or wildcard selection; and a selection that takes only part of a validation batch, or splits a review blocker from the goal it still blocks, is rejected rather than silently dropping that obligation. Adoption fails closed on changed offered work, an altered or unfenced offer, an offer path that escapes the source worktree, a target the offer does not name, a linked worktree that is not the exact named target, an occupied target session, and any duplicate or simultaneous adoption anywhere in the target repository. A retry reconciles the exact recorded operation or fails closed — a matching operation id is never authority to overwrite target work it did not write, and a published plan that has disappeared is never reconstructed.
+
+Until publication completes, the target refuses to execute: a visible `goals.json` is not admission evidence, the adoption record is. `start`/`complete-goals` and `checkpoint` reject while an adoption remains pending.
+
+Integrity digests are evidence, not authorization: a matching digest set with no fence, no bounded authorization, or the wrong target is still rejected. Historical source statuses, receipts, reviews and approvals travel as provenance only and never satisfy a target gate.
+
 ## Handoff back to planning
 
 When the aggregate ultragoal is complete OR the user requests return to planning/clarification, mark ultragoal ready for handoff so the skill tool's chain guard permits the backward transition:
