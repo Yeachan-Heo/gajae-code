@@ -3137,6 +3137,8 @@ export class AgentSession {
 		message: BashExecutionMessage;
 		onPersisted?: () => void;
 		appendedToAgent: boolean;
+		sessionId: string;
+		sessionIdentityEpoch: number;
 	}> = [];
 	/**
 	 * Set by a fold and consumed once by the pause checkpoint, so a fold ends its
@@ -3265,6 +3267,8 @@ export class AgentSession {
 		message: PythonExecutionMessage;
 		onPersisted?: () => void;
 		appendedToAgent: boolean;
+		sessionId: string;
+		sessionIdentityEpoch: number;
 	}> = [];
 	#activeEvalExecutions = new Set<Promise<unknown>>();
 	#evalExecutionDisposing = false;
@@ -3666,6 +3670,12 @@ export class AgentSession {
 		});
 	}
 
+	#assertTransitionIngressAllowed(): void {
+		if (this.#sessionTransitionKind === undefined) return;
+		if (this.#postCommitTransitionIngress.getStore() === this.#sessionIdentityEpoch) return;
+		this.#assertNoSessionTransition();
+	}
+
 	async #awaitSessionTransitionDisposition(expectedIdentityEpoch: number): Promise<boolean> {
 		const settlement = this.#sessionTransitionSettlement;
 		if (settlement) await settlement.promise;
@@ -3683,6 +3693,7 @@ export class AgentSession {
 	 */
 	#sessionTransitionKind: string | undefined;
 	#sessionTransitionSettlement: PromiseWithResolvers<void> | undefined;
+	#postCommitTransitionIngress = new AsyncLocalStorage<number>();
 	#coordinatorPersistGeneration = 0;
 	#coordinatorRescopeBarrier: Promise<void> | undefined;
 	#releaseCoordinatorRescopeBarrier: (() => void) | undefined;
@@ -5001,6 +5012,12 @@ export class AgentSession {
 		this.#bindWorkflowGateEmitter();
 		this.yieldQueue = new YieldQueue({
 			isStreaming: () => this.isStreaming || this.#handoffTransitionActive,
+			captureIdentity: () => ({ sessionId: this.sessionId, sessionIdentityEpoch: this.#sessionIdentityEpoch }),
+			isIdentityCurrent: identity => {
+				if (!identity || typeof identity !== "object") return false;
+				const token = identity as { sessionId?: unknown; sessionIdentityEpoch?: unknown };
+				return token.sessionId === this.sessionId && token.sessionIdentityEpoch === this.#sessionIdentityEpoch;
+			},
 			injectStreaming: message => {
 				// Mandated boundary comment (corrected turn semantics): turn-scope
 				// abort blocks only deliveries whose origin is a continuation of the
@@ -6893,11 +6910,7 @@ export class AgentSession {
 		const scopedKey = this.#attemptScopeKey(scope);
 		if (this.#retiredSessionIdentityAttemptScopeKeys.has(scopedKey)) return false;
 		if (!this.#attemptAuthority.isCurrent(scope)) return false;
-		if (this.#sessionIdentityEpoch === 0) {
-			this.#currentSessionIdentityAttemptScopeKeys.add(scopedKey);
-			return true;
-		}
-		if (this.#sessionIdentityEpoch > 0 && !this.#currentSessionIdentityAttemptScopeKeys.has(scopedKey)) return false;
+		if (!this.#currentSessionIdentityAttemptScopeKeys.has(scopedKey)) return false;
 		return true;
 	}
 
@@ -7679,6 +7692,15 @@ export class AgentSession {
 								event.message.role === "assistant" ? event.message.timestamp : undefined;
 							this.#schedulePostPromptTask(
 								async () => {
+									try {
+										await this.#reconcileTerminalPersistenceFailure();
+									} catch {
+										this.#ttsrAbortPending = false;
+										this.#pendingTtsrInjections = [];
+										this.#perToolTtsrInjections.clear();
+										this.#resolveTtsrResume();
+										return;
+									}
 									if (this.#ttsrRetryToken !== retryToken) {
 										this.#resolveTtsrResume();
 										return;
@@ -7704,6 +7726,13 @@ export class AgentSession {
 									const injection = this.#getTtsrInjectionContent();
 									if (injection) {
 										const details = { rules: injection.rules.map(rule => rule.name) };
+										this.sessionManager.appendCustomMessageEntry(
+											"ttsr-injection",
+											injection.content,
+											false,
+											details,
+											"agent",
+										);
 										this.agent.appendMessage({
 											role: "custom",
 											customType: "ttsr-injection",
@@ -7713,13 +7742,6 @@ export class AgentSession {
 											attribution: "agent",
 											timestamp: Date.now(),
 										});
-										this.sessionManager.appendCustomMessageEntry(
-											"ttsr-injection",
-											injection.content,
-											false,
-											details,
-											"agent",
-										);
 										this.#markTtsrInjected(details.rules);
 									}
 									await this.#scheduleAgentContinue({
@@ -8929,9 +8951,8 @@ export class AgentSession {
 			.join("\n\n");
 		const ruleNames = rules.map(r => r.name.trim()).filter(n => n.length > 0);
 		if (ruleNames.length > 0) {
+			this.sessionManager.appendTtsrInjection(ruleNames, undefined, this.#ttsrManager?.getMessageCount());
 			this.#ttsrManager?.markInjectedByNames(ruleNames);
-			const records = this.#ttsrManager?.getInjectedRecords().filter(record => ruleNames.includes(record.name));
-			this.sessionManager.appendTtsrInjection(ruleNames, records, this.#ttsrManager?.getMessageCount());
 		}
 
 		return {
@@ -8957,9 +8978,8 @@ export class AgentSession {
 		if (uniqueRuleNames.length === 0) {
 			return;
 		}
+		this.sessionManager.appendTtsrInjection(uniqueRuleNames, undefined, this.#ttsrManager?.getMessageCount());
 		this.#ttsrManager?.markInjectedByNames(uniqueRuleNames);
-		const records = this.#ttsrManager?.getInjectedRecords().filter(record => uniqueRuleNames.includes(record.name));
-		this.sessionManager.appendTtsrInjection(uniqueRuleNames, records, this.#ttsrManager?.getMessageCount());
 	}
 
 	#findTtsrAssistantIndex(targetTimestamp: number | undefined): number {
@@ -13016,6 +13036,7 @@ export class AgentSession {
 					this.#retiredSessionIdentityAttemptScopeKeys.add(recovery.attemptScopeKey);
 				}
 				this.#terminalPersistenceRecovery = undefined;
+				this.#flushOrSchedulePendingBackgroundExchanges();
 				this.emitNotice(
 					"info",
 					"Recovered interrupted assistant output into canonical session history.",
@@ -14175,6 +14196,7 @@ export class AgentSession {
 	 * Queue a steering message to interrupt the agent mid-run.
 	 */
 	async steer(text: string, images?: ImageContent[]): Promise<void> {
+		this.#assertTransitionIngressAllowed();
 		const hasUsableImage =
 			images?.some(image => typeof image?.data === "string" && image.data.trim().length > 0) === true;
 		if (typeof text !== "string" || (text.trim().length === 0 && !hasUsableImage))
@@ -14199,6 +14221,7 @@ export class AgentSession {
 		images?: ImageContent[],
 		options?: Pick<PromptOptions, "followUpQueuePolicy">,
 	): Promise<void> {
+		this.#assertTransitionIngressAllowed();
 		const hasUsableImage =
 			images?.some(image => typeof image?.data === "string" && image.data.trim().length > 0) === true;
 		if (typeof text !== "string" || (text.trim().length === 0 && !hasUsableImage))
@@ -14824,6 +14847,7 @@ export class AgentSession {
 			origin?: "turn" | "external";
 		},
 	): Promise<void> {
+		this.#assertTransitionIngressAllowed();
 		if (this.#terminalPersistenceRecovery) await this.#reconcileTerminalPersistenceFailure();
 		this.#assertRecoveryHydrationPromoted();
 		const appMessage: CustomMessage<T> = {
@@ -16937,10 +16961,8 @@ export class AgentSession {
 		this.#reconnectToAgent();
 		this.#resetIrcRosterDeliveryState();
 		if (this.#extensionRunner) {
-			await this.#extensionRunner.emit({
-				type: "session_switch",
-				reason: "new",
-				previousSessionFile,
+			await this.#postCommitTransitionIngress.run(this.#sessionIdentityEpoch, async () => {
+				await this.#extensionRunner?.emit({ type: "session_switch", reason: "new", previousSessionFile });
 			});
 		} else {
 		}
@@ -17115,10 +17137,8 @@ export class AgentSession {
 
 			// Emit session_switch event with reason "fork" to hooks
 			if (this.#extensionRunner) {
-				await this.#extensionRunner.emit({
-					type: "session_switch",
-					reason: "fork",
-					previousSessionFile,
+				await this.#postCommitTransitionIngress.run(this.#sessionIdentityEpoch, async () => {
+					await this.#extensionRunner?.emit({ type: "session_switch", reason: "fork", previousSessionFile });
 				});
 			}
 
@@ -18295,6 +18315,7 @@ export class AgentSession {
 	}
 
 	setThinkingLevel(level: ThinkingLevel | undefined, persist: boolean = false): void {
+		if (persist) this.#assertTerminalPersistenceSettledForHistoryMutation();
 		this.#applyThinkingLevel(level, persist, false);
 	}
 
@@ -18681,6 +18702,7 @@ export class AgentSession {
 	}
 
 	setServiceTier(serviceTier: ServiceTier | undefined): void {
+		this.#assertTerminalPersistenceSettledForHistoryMutation();
 		// Re-arming a priority-granting tier always clears the per-session
 		// auto-fallback sticky disable AND the auto-disable markers so the next
 		// request carries `speed: "fast"` again — even when the tier is unchanged
@@ -19654,10 +19676,8 @@ export class AgentSession {
 				// errors are isolated by ExtensionRunner and must not roll back the
 				// already-committed switch.
 				if (this.#extensionRunner) {
-					await this.#extensionRunner.emit({
-						type: "session_switch",
-						reason: "new",
-						previousSessionFile,
+					await this.#postCommitTransitionIngress.run(this.#sessionIdentityEpoch, async () => {
+						await this.#extensionRunner?.emit({ type: "session_switch", reason: "new", previousSessionFile });
 					});
 				}
 
@@ -24298,6 +24318,7 @@ export class AgentSession {
 	): Promise<BashResult> {
 		await this.#reconcileTerminalPersistenceFailure();
 		const publishArtifact = this.sessionManager.captureArtifactPublication();
+		const executionIdentity = { sessionId: this.sessionId, sessionIdentityEpoch: this.#sessionIdentityEpoch };
 		const excludeFromContext = options?.excludeFromContext === true;
 		this.#markRetryReplayUnsafe();
 
@@ -24311,7 +24332,7 @@ export class AgentSession {
 				cwd,
 			});
 			if (hookResult?.result) {
-				this.recordBashResult(command, hookResult.result, options);
+				this.recordBashResult(command, hookResult.result, options, executionIdentity);
 				if (hookResult.result.exitCode === 0 && !hookResult.result.cancelled) {
 					await this.#activatePendingGjcGoalModeRequest();
 				}
@@ -24338,7 +24359,7 @@ export class AgentSession {
 				onMinimizedSave: originalText => saveAgentBashOriginalArtifact(publishArtifact, originalText),
 			});
 
-			this.recordBashResult(command, result, options);
+			this.recordBashResult(command, result, options, executionIdentity);
 			if (result.exitCode === 0 && !result.cancelled) {
 				await this.#activatePendingGjcGoalModeRequest();
 			}
@@ -24357,7 +24378,13 @@ export class AgentSession {
 		command: string,
 		result: BashResult,
 		options?: { excludeFromContext?: boolean; onPersisted?: () => void },
+		executionIdentity = { sessionId: this.sessionId, sessionIdentityEpoch: this.#sessionIdentityEpoch },
 	): void {
+		if (
+			executionIdentity.sessionId !== this.sessionId ||
+			executionIdentity.sessionIdentityEpoch !== this.#sessionIdentityEpoch
+		)
+			return;
 		const meta = outputMeta().truncationFromSummary(result, { direction: "tail" }).get();
 		const bashMessage: BashExecutionMessage = {
 			role: "bashExecution",
@@ -24379,6 +24406,8 @@ export class AgentSession {
 				message: bashMessage,
 				onPersisted: options?.onPersisted,
 				appendedToAgent: false,
+				sessionId: executionIdentity.sessionId,
+				sessionIdentityEpoch: executionIdentity.sessionIdentityEpoch,
 			});
 		} else {
 			// Add to agent state immediately
@@ -24436,6 +24465,7 @@ export class AgentSession {
 		options?: { excludeFromContext?: boolean; onPersisted?: () => void },
 	): Promise<PythonResult> {
 		await this.#reconcileTerminalPersistenceFailure();
+		const executionIdentity = { sessionId: this.sessionId, sessionIdentityEpoch: this.#sessionIdentityEpoch };
 		const excludeFromContext = options?.excludeFromContext === true;
 		this.#markRetryReplayUnsafe();
 		const cwd = this.sessionManager.getCwd();
@@ -24464,7 +24494,7 @@ export class AgentSession {
 				}
 				this.assertEvalExecutionAllowed();
 				if (hookResult?.result) {
-					this.recordPythonResult(code, hookResult.result, options);
+					this.recordPythonResult(code, hookResult.result, options, executionIdentity);
 					return hookResult.result;
 				}
 			}
@@ -24481,7 +24511,7 @@ export class AgentSession {
 			// A retained kernel can finish after strict session close has fenced
 			// persistence. The caller still receives its completed result, but it
 			// must not reopen a closing session to append history.
-			if (!this.#evalExecutionDisposing) this.recordPythonResult(code, result, options);
+			if (!this.#evalExecutionDisposing) this.recordPythonResult(code, result, options, executionIdentity);
 			return result;
 		});
 		return await this.trackEvalExecution(execution, abortController);
@@ -24521,7 +24551,13 @@ export class AgentSession {
 		code: string,
 		result: PythonResult,
 		options?: { excludeFromContext?: boolean; onPersisted?: () => void },
+		executionIdentity = { sessionId: this.sessionId, sessionIdentityEpoch: this.#sessionIdentityEpoch },
 	): void {
+		if (
+			executionIdentity.sessionId !== this.sessionId ||
+			executionIdentity.sessionIdentityEpoch !== this.#sessionIdentityEpoch
+		)
+			return;
 		const meta = outputMeta().truncationFromSummary(result, { direction: "tail" }).get();
 		const pythonMessage: PythonExecutionMessage = {
 			role: "pythonExecution",
@@ -24541,6 +24577,8 @@ export class AgentSession {
 				message: pythonMessage,
 				onPersisted: options?.onPersisted,
 				appendedToAgent: false,
+				sessionId: executionIdentity.sessionId,
+				sessionIdentityEpoch: executionIdentity.sessionIdentityEpoch,
 			});
 		} else {
 			this.agent.appendMessage(pythonMessage);
@@ -24615,7 +24653,13 @@ export class AgentSession {
 	}
 
 	#flushPendingExecutionMessages<T extends BashExecutionMessage | PythonExecutionMessage>(
-		pendingMessages: Array<{ message: T; onPersisted?: () => void; appendedToAgent: boolean }>,
+		pendingMessages: Array<{
+			message: T;
+			onPersisted?: () => void;
+			appendedToAgent: boolean;
+			sessionId: string;
+			sessionIdentityEpoch: number;
+		}>,
 		kind: "bash" | "python",
 	): void {
 		if (pendingMessages.length === 0) return;
@@ -24628,6 +24672,8 @@ export class AgentSession {
 		let persistenceBlocked = false;
 		let agentAppendBlocked = false;
 		for (const pending of pendingMessages) {
+			if (pending.sessionId !== this.sessionId || pending.sessionIdentityEpoch !== this.#sessionIdentityEpoch)
+				continue;
 			if (!pending.appendedToAgent) {
 				if (agentAppendBlocked) {
 					remaining.push(pending);
@@ -25289,7 +25335,7 @@ export class AgentSession {
 	}
 
 	#flushOrSchedulePendingBackgroundExchanges(): void {
-		if (!this.isStreaming && !this.#externalIngressSealed) {
+		if (!this.isStreaming && !this.#externalIngressSealed && !this.#terminalPersistenceRecovery) {
 			this.#flushPendingBackgroundExchanges();
 			return;
 		}
@@ -25305,7 +25351,7 @@ export class AgentSession {
 				this.#scheduledBackgroundExchangeFlush = false;
 				return;
 			}
-			if (this.isStreaming || this.#externalIngressSealed) {
+			if (this.isStreaming || this.#externalIngressSealed || this.#terminalPersistenceRecovery) {
 				// Re-poll while streaming, but do not let this housekeeping timer
 				// keep the event loop alive on its own (CPU-7).
 				const pollTimer = setTimeout(attempt, 50);
@@ -25321,7 +25367,7 @@ export class AgentSession {
 
 	#flushPendingBackgroundExchanges(): void {
 		if (this.#pendingBackgroundExchanges.length === 0) return;
-		if (this.#externalIngressSealed) {
+		if (this.#externalIngressSealed || this.#terminalPersistenceRecovery) {
 			this.#scheduleBackgroundExchangeFlush();
 			return;
 		}
@@ -25673,11 +25719,13 @@ export class AgentSession {
 				// messages, model state, MCP selections, the agent subscription, and
 				// session-scoped tool cleanup are complete.
 				if (this.#extensionRunner) {
-					await this.#extensionRunner.emit({
-						type: "session_switch",
-						reason: "resume",
-						previousSessionFile,
-						...(options?.transition ? { transition: options.transition } : {}),
+					await this.#postCommitTransitionIngress.run(this.#sessionIdentityEpoch, async () => {
+						await this.#extensionRunner?.emit({
+							type: "session_switch",
+							reason: "resume",
+							previousSessionFile,
+							...(options?.transition ? { transition: options.transition } : {}),
+						});
 					});
 				}
 				this.#terminalizeQueuedSdkWorkForSessionTransition([
