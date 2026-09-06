@@ -4882,7 +4882,15 @@ export class AgentSession {
 		// intentionally survive the tool call: resumed registrations re-use the
 		// original tool call id and must retain the same owned-completion origin.
 		// They are superseded by a rebind on the same id or by bounded eviction.
-		this.agent.beforeToolCall = ctx => {
+		this.agent.beforeToolCall = async ctx => {
+			const canonicalAdmission = this.#canonicalMessageAdmissionTail;
+			if (!canonicalAdmission.released) await canonicalAdmission.promise;
+			if (this.#terminalPersistenceRecovery) {
+				return { block: true, reason: "Assistant output was not committed to session history." };
+			}
+			if (this.#sessionTransitionKind !== undefined) {
+				return { block: true, reason: "Session transition is in progress." };
+			}
 			const lineageIdHash = this.#turnLineageIdHash;
 			if (lineageIdHash) {
 				bindToolLineage(ctx.toolCall.id, {
@@ -6910,6 +6918,10 @@ export class AgentSession {
 		if (event.type === "message_end") {
 			if (canonicalAdmission && !canonicalAdmission.predecessor.released) {
 				await canonicalAdmission.predecessor.promise;
+			}
+			if (!eventIdentityIsCurrent() || this.#terminalPersistenceRecovery) {
+				discardRejectedAssistantEvent();
+				return;
 			}
 			if (
 				(event.message.role === "hookMessage" || event.message.role === "custom") &&
