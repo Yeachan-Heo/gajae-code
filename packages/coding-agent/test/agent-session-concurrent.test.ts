@@ -19,9 +19,9 @@ import { TtsrManager } from "@gajae-code/coding-agent/export/ttsr";
 import type { ExtensionRunner } from "@gajae-code/coding-agent/extensibility/extensions/runner";
 import { submitInteractiveInput } from "@gajae-code/coding-agent/main";
 import type { SubmittedUserInput } from "@gajae-code/coding-agent/modes/types";
-import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
+import { AgentSession, type AgentSessionEvent } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
-import { convertToLlm } from "@gajae-code/coding-agent/session/messages";
+import { convertToLlm, SILENT_ABORT_MARKER } from "@gajae-code/coding-agent/session/messages";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { Snowflake } from "@gajae-code/utils";
 import * as z from "zod/v4";
@@ -1446,7 +1446,8 @@ describe("AgentSession TTSR resume gate", () => {
 			modelRegistry,
 			ttsrManager,
 		});
-
+		const terminalEvents: AgentSessionEvent[] = [];
+		session.subscribe(event => terminalEvents.push(event));
 		// prompt() must block until the TTSR continuation completes
 		await session.prompt("Write some Rust code");
 
@@ -1454,6 +1455,15 @@ describe("AgentSession TTSR resume gate", () => {
 		expect(continuationCompleted).toBe(true);
 		expect(streamCallCount).toBeGreaterThanOrEqual(2);
 		expect(session.isStreaming).toBe(false);
+		expect(
+			terminalEvents.some(
+				event =>
+					event.type === "message_end" &&
+					event.message.role === "assistant" &&
+					event.ttsrAbort === true &&
+					event.message.errorMessage === SILENT_ABORT_MARKER,
+			),
+		).toBe(true);
 	});
 
 	it("prompt() blocks until TTSR deferred continuation completes", async () => {
@@ -1521,7 +1531,6 @@ describe("AgentSession TTSR resume gate", () => {
 			modelRegistry,
 			ttsrManager,
 		});
-
 		// prompt() must block until the deferred TTSR continuation completes
 		await session.prompt("Write some Rust code");
 
@@ -1592,7 +1601,6 @@ describe("AgentSession TTSR resume gate", () => {
 			modelRegistry,
 			ttsrManager,
 		});
-
 		// Start prompt (will trigger TTSR and create resume gate)
 		const promptPromise = session.prompt("Write some Rust code");
 		await waitFor(() => session.agent.state.isStreaming);
@@ -1602,6 +1610,7 @@ describe("AgentSession TTSR resume gate", () => {
 		await promptPromise;
 
 		expect(session.isStreaming).toBe(false);
+		expect(session.isTtsrAbortPending).toBe(false);
 	});
 
 	it("prompt() waits for TTSR continuation with tool calls to finish", async () => {

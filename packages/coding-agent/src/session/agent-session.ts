@@ -794,12 +794,19 @@ export type AutoCompactionContinuationSkipReason = "auto_continue_disabled_non_r
 
 type AgentEndSessionEvent = Extract<AgentEvent, { type: "agent_end" }> & {
 	/** Immutable abort-display classification captured before asynchronous UI dispatch. */
-	silentAbort?: boolean;
+	readonly silentAbort?: true;
+	readonly ttsrAbort?: true;
+};
+
+type MessageEndSessionEvent = Extract<AgentEvent, { type: "message_end" }> & {
+	readonly silentAbort?: true;
+	readonly ttsrAbort?: true;
 };
 
 export type AgentSessionEvent =
-	| Exclude<AgentEvent, { type: "agent_end" }>
+	| Exclude<AgentEvent, { type: "agent_end" | "message_end" }>
 	| AgentEndSessionEvent
+	| MessageEndSessionEvent
 	| { type: "auto_compaction_start"; reason: "threshold" | "overflow" | "idle"; action: "context-full" | "handoff" }
 	| {
 			type: "auto_compaction_end";
@@ -5998,7 +6005,7 @@ export class AgentSession {
 	#canonicalMessageAdmissionTail: CanonicalMessageAdmissionSlot = { promise: Promise.resolve(), released: true };
 
 	#reserveCanonicalMessageAdmission(event: AgentEvent): CanonicalMessageAdmission | undefined {
-		if (event.type !== "message_end") return undefined;
+		if (event.type !== "message_end" && event.type !== "agent_end") return undefined;
 		const predecessor = this.#canonicalMessageAdmissionTail;
 		const settled = Promise.withResolvers<void>();
 		const slot: CanonicalMessageAdmissionSlot = { promise: settled.promise, released: false };
@@ -6398,6 +6405,9 @@ export class AgentSession {
 
 	// Track last assistant message for auto-compaction check
 	#lastAssistantMessage: AssistantMessage | undefined = undefined;
+	#provisionalAssistantMessage:
+		| { message: AssistantMessage; promptGeneration: number; attemptScope: AttemptScope | undefined }
+		| undefined;
 	// Admission slot of the last message_end per assistant message, so the
 	// agent_end handler can join the terminal's canonical admission before any
 	// post-turn write reaches the branch.
@@ -6476,10 +6486,43 @@ export class AgentSession {
 		eventLease?: RunResourceProducerLease,
 	): Promise<void> => {
 		const attemptScope = (event as AgentEvent & { scope?: AttemptScope }).scope;
-		const silentAgentEnd =
+		const terminalSnapshot = event as AgentEvent & { readonly silentAbort?: true; readonly ttsrAbort?: true };
+		const terminalWasAborted =
+			(event.type === "agent_end" && event.stopReason === "cancelled") ||
+			(event.type === "message_end" && event.message.role === "assistant" && event.message.stopReason === "aborted");
+		const silentTerminal = terminalWasAborted && (this.#silentAbortPending || this.#planCompactAbortPending);
+		const ttsrTerminal = terminalWasAborted && this.#ttsrAbortPending;
+		if (silentTerminal && terminalSnapshot.silentAbort !== true) {
+			Object.defineProperty(event, "silentAbort", { value: true, enumerable: true });
+		}
+		if (ttsrTerminal && terminalSnapshot.ttsrAbort !== true) {
+			Object.defineProperty(event, "ttsrAbort", { value: true, enumerable: true });
+		}
+		const assistantSnapshot =
+			event.type === "message_start" && event.message.role === "assistant"
+				? event.message
+				: event.type === "message_update" && event.message.role === "assistant"
+					? event.message
+					: undefined;
+		if (assistantSnapshot) {
+			this.#provisionalAssistantMessage = {
+				message: assistantSnapshot,
+				promptGeneration: this.#promptGeneration,
+				attemptScope,
+			};
+		}
+		const orphanAssistant =
 			event.type === "agent_end" &&
 			event.stopReason === "cancelled" &&
-			(this.#silentAbortPending || this.#planCompactAbortPending);
+			!event.messages.some(message => message.role === "assistant") &&
+			this.#provisionalAssistantMessage?.promptGeneration === this.#promptGeneration &&
+			this.#provisionalAssistantMessage.attemptScope === attemptScope
+				? this.#provisionalAssistantMessage.message
+				: undefined;
+		if (event.type === "turn_start" || (event.type === "message_end" && event.message.role === "assistant")) {
+			this.#provisionalAssistantMessage = undefined;
+		}
+		if (event.type === "agent_end") this.#provisionalAssistantMessage = undefined;
 
 		// These lifecycle boundaries can be delivered without awaiting this listener.
 		// Revoke streaming-edit cache generations before any admission, spill, or
@@ -6629,12 +6672,39 @@ export class AgentSession {
 			event.type === "message_end" &&
 			event.message.role === "assistant" &&
 			event.message.stopReason === "aborted" &&
-			(this.#planCompactAbortPending || this.#silentAbortPending)
+			(silentTerminal || ttsrTerminal)
 		) {
 			(event.message as AssistantMessage).errorMessage = SILENT_ABORT_MARKER;
 			this.agent.touchContext();
-			this.#planCompactAbortPending = false;
-			this.#silentAbortPending = false;
+			if (silentTerminal) {
+				this.#planCompactAbortPending = false;
+				this.#silentAbortPending = false;
+			}
+		}
+
+		if (event.type === "agent_end" && orphanAssistant) {
+			if (canonicalAdmission && !canonicalAdmission.predecessor.released) {
+				await canonicalAdmission.predecessor.promise;
+			}
+			const recoveredAssistant: AssistantMessage = {
+				...orphanAssistant,
+				stopReason: "aborted",
+				...(silentTerminal || ttsrTerminal ? { errorMessage: SILENT_ABORT_MARKER } : {}),
+			};
+			try {
+				this.sessionManager.appendMessage(recoveredAssistant);
+			} catch (error) {
+				this.agent.abort();
+				throw error;
+			}
+			if (!this.agent.state.messages.includes(recoveredAssistant)) this.agent.appendMessage(recoveredAssistant);
+			event.messages.push(recoveredAssistant);
+			this.#lastAssistantMessage = recoveredAssistant;
+			this.#lastAssistantAdmissionByMessage.set(recoveredAssistant, canonicalAdmission);
+			if (silentTerminal) {
+				this.#planCompactAbortPending = false;
+				this.#silentAbortPending = false;
+			}
 		}
 
 		// Canonical persistence follows synchronous message_end reservation order.
@@ -6806,8 +6876,7 @@ export class AgentSession {
 		// values. The original event.message stays obfuscated so the canonical persistence path above
 		// writes authenticated placeholder tokens to the session file; convertToLlm re-obfuscates outbound
 		// traffic on the next turn. Walks text, thinking, and toolCall arguments/intent.
-		let displayEvent: AgentSessionEvent =
-			event.type === "agent_end" && silentAgentEnd ? { ...event, silentAbort: true } : event;
+		let displayEvent: AgentSessionEvent = event;
 		const obfuscator = this.#obfuscator;
 		if (obfuscator && event.type === "message_end" && event.message.role === "assistant") {
 			const message = event.message;
@@ -7977,7 +8046,7 @@ export class AgentSession {
 	async #cancelPostPromptTasks(): Promise<void> {
 		this.#postPromptTasksAbortController.abort();
 		this.#postPromptTasksAbortController = new AbortController();
-		this.#resolveTtsrResume();
+		this.#clearCancelledTtsrState();
 
 		const pendingTasks = Array.from(this.#postPromptTasks);
 		if (pendingTasks.length === 0) {
@@ -8000,8 +8069,16 @@ export class AgentSession {
 		this.#postPromptTaskSelectionFenceGenerations.clear();
 		this.#postPromptTaskRecoveryExcluded.clear();
 		this.#releaseDeferredAgentEndContinuations();
-		this.#resolveTtsrResume();
+		this.#clearCancelledTtsrState();
 		this.#resolvePostPromptTasks();
+	}
+
+	#clearCancelledTtsrState(): void {
+		this.#ttsrRetryToken++;
+		this.#ttsrAbortPending = false;
+		this.#pendingTtsrInjections = [];
+		this.#perToolTtsrInjections.clear();
+		this.#resolveTtsrResume();
 	}
 
 	/**
