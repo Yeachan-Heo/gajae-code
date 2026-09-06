@@ -488,6 +488,7 @@ test("ACP reconcile_uncertain validates proof and projects an opaque result", as
 			stateRoot: "/workspace/.gjc/state",
 			endpointGeneration: 2,
 			endpointMtimeMs: 1,
+			endpointFileId: "dev:123",
 			processIncarnation: "linux:123",
 			hostIncarnation: "host:123",
 			lifecycleRequestId: "retire-effect",
@@ -504,6 +505,7 @@ test("ACP reconcile_uncertain validates proof and projects an opaque result", as
 			stateRoot: "/workspace/.gjc/state",
 			endpointGeneration: 2,
 			endpointMtimeMs: 1,
+			endpointFileId: "dev:123",
 			processIncarnation: "linux:123",
 			hostIncarnation: "host:123",
 			lifecycleRequestId: "retire-effect",
@@ -511,7 +513,10 @@ test("ACP reconcile_uncertain validates proof and projects an opaque result", as
 		},
 		"acp-retire-key",
 	);
-	expect(result).toEqual({ ok: true, result: { sessionId: "retired-session", endpointGeneration: 2 } });
+	expect(result).toEqual({
+		ok: true,
+		result: { sessionId: "retired-session", endpointGeneration: 2, endpointFileId: "dev:123" },
+	});
 	expect(JSON.stringify(result)).not.toContain("stateRoot");
 	expect(JSON.stringify(result)).not.toContain("processIncarnation");
 	expect(sdk.frames).toContainEqual({
@@ -896,7 +901,6 @@ test("the production ACP MCP launch path preserves broker admission timeout fail
 			message: "SDK host startup was not admitted before the queue wait cutoff.",
 		});
 	} finally {
-		controller.abort();
 		server?.stop(true);
 		await fs.rm(root, { recursive: true, force: true });
 	}

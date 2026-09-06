@@ -1,17 +1,22 @@
 import { expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
+import * as os from "node:os";
 import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "../src/extensibility/extensions";
 import { Broker } from "../src/sdk/broker/broker";
+import { processIncarnation } from "../src/sdk/broker/process-incarnation";
 import { SessionIndex } from "../src/sdk/broker/session-index";
 import { createSdkSessionRuntimeExtension } from "../src/sdk/host/session-runtime";
 import { createSdkWebSocketTransport } from "../src/sdk/host/websocket-transport";
+import { SessionRouter } from "../src/sdk/router/session-router";
 
 const event = (
 	type: "host_registered" | "host_heartbeat" | "host_unregistered",
 	sessionId: string,
 	stateRoot: string,
 	endpointMtimeMs?: number,
+	endpointFileId?: string,
 ) => ({
 	type,
 	sessionId,
@@ -19,6 +24,7 @@ const event = (
 	endpointGeneration: 1,
 	pid: process.pid,
 	...(endpointMtimeMs === undefined ? {} : { endpointMtimeMs }),
+	...(endpointFileId === undefined ? {} : { endpointFileId }),
 });
 
 test("broker preserves host registration endpoint metadata across heartbeats", async () => {
@@ -27,12 +33,14 @@ test("broker preserves host registration endpoint metadata across heartbeats", a
 	const endpointPath = path.join(stateRoot, "sdk", "live.json");
 	await fs.mkdir(path.dirname(endpointPath), { recursive: true });
 	await fs.writeFile(endpointPath, JSON.stringify({ sessionId: "live", pid: process.pid, token: "session-secret" }));
-	const endpointMtimeMs = (await fs.stat(endpointPath)).mtimeMs;
+	const endpointIdentity = await fs.stat(endpointPath, { bigint: true });
+	const endpointMtimeMs = Number(endpointIdentity.mtimeNs) / 1_000_000;
+	const endpointFileId = `${endpointIdentity.dev}:${endpointIdentity.ino}`;
 	const broker = new Broker({ agentDir });
 	await broker.start();
 	try {
 		const busIndex = await new SessionIndex(agentDir).open();
-		await busIndex.append(event("host_registered", "live", stateRoot, endpointMtimeMs));
+		await busIndex.append(event("host_registered", "live", stateRoot, endpointMtimeMs, endpointFileId));
 		await busIndex.append(event("host_heartbeat", "live", stateRoot));
 		await busIndex.append(event("host_heartbeat", "live", stateRoot));
 		expect(await broker.handleRequest("session.get_endpoint", { sessionId: "live", endpointGeneration: 1 })).toEqual({
@@ -54,6 +62,119 @@ test("broker preserves host registration endpoint metadata across heartbeats", a
 			result: { indexSeq: 4, sessions: [{ sessionId: "live", live: false, terminal: true }] },
 		});
 	} finally {
+		await broker.stop();
+		await fs.rm(agentDir, { recursive: true, force: true });
+	}
+});
+
+test("broker rejects stale get_endpoint authority after a preserved-mtime endpoint replacement", async () => {
+	const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-broker-endpoint-incarnation-"));
+	const stateRoot = path.join(agentDir, "state");
+	const endpointPath = path.join(stateRoot, "sdk", "replacement.json");
+	const displacedPath = `${endpointPath}.displaced`;
+	const broker = new Broker({ agentDir });
+	try {
+		await Bun.write(endpointPath, JSON.stringify({ sessionId: "replacement", pid: process.pid, token: "old" }));
+		const fixedMtimeSeconds = 1_700_000_000;
+		await fs.utimes(endpointPath, fixedMtimeSeconds, fixedMtimeSeconds);
+		const predecessor = await fs.stat(endpointPath, { bigint: true });
+		const predecessorFileId = `${predecessor.dev}:${predecessor.ino}`;
+		const endpointMtimeMs = Number(predecessor.mtimeNs) / 1_000_000;
+		await broker.start();
+		const index = await new SessionIndex(agentDir).open();
+		await index.append(event("host_registered", "replacement", stateRoot, endpointMtimeMs, predecessorFileId));
+		await index.append(event("host_heartbeat", "replacement", stateRoot));
+		const predecessorIncarnation = createHash("sha256")
+			.update(
+				JSON.stringify({
+					endpointFileId: predecessorFileId,
+					endpointGeneration: 1,
+					endpointMtimeMs,
+					pid: process.pid,
+					sessionId: "replacement",
+				}),
+			)
+			.digest("hex");
+		await fs.rename(endpointPath, displacedPath);
+		await Bun.write(endpointPath, JSON.stringify({ sessionId: "replacement", pid: process.pid, token: "new" }));
+		await fs.utimes(endpointPath, fixedMtimeSeconds, fixedMtimeSeconds);
+		const successor = await fs.stat(endpointPath, { bigint: true });
+		expect(`${successor.dev}:${successor.ino}`).not.toBe(predecessorFileId);
+		expect(Number(successor.mtimeNs) / 1_000_000).toBe(endpointMtimeMs);
+		await index.append(
+			event("host_registered", "replacement", stateRoot, endpointMtimeMs, `${successor.dev}:${successor.ino}`),
+		);
+		expect(
+			await broker.handleRequest("session.get_endpoint", {
+				sessionId: "replacement",
+				endpointGeneration: 1,
+				endpointIncarnation: predecessorIncarnation,
+			}),
+		).toEqual({ ok: false, error: { code: "endpoint_stale", message: "session endpoint is stale" } });
+	} finally {
+		await broker.stop();
+		await fs.rm(agentDir, { recursive: true, force: true });
+	}
+});
+
+test("broker rejects stale close authority after a preserved-mtime endpoint replacement", async () => {
+	const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-broker-close-incarnation-"));
+	const stateRoot = path.join(agentDir, "state");
+	const endpointPath = path.join(stateRoot, "sdk", "replacement-close.json");
+	const displacedPath = `${endpointPath}.displaced`;
+	const sessionId = "replacement-close";
+	const broker = new Broker({ agentDir });
+	const host = Bun.spawn([process.execPath, "-e", "setInterval(() => {}, 1_000_000)"], {
+		stdio: ["ignore", "ignore", "ignore"],
+	});
+	try {
+		await Bun.write(
+			endpointPath,
+			JSON.stringify({ sessionId, pid: host.pid, url: "ws://127.0.0.1:1", token: "old" }),
+		);
+		const fixedMtimeSeconds = 1_700_000_000;
+		await fs.utimes(endpointPath, fixedMtimeSeconds, fixedMtimeSeconds);
+		const predecessor = await fs.stat(endpointPath, { bigint: true });
+		const predecessorFileId = `${predecessor.dev}:${predecessor.ino}`;
+		const endpointMtimeMs = Number(predecessor.mtimeNs) / 1_000_000;
+		await broker.start();
+		const index = await new SessionIndex(agentDir).open();
+		await index.append(event("host_registered", sessionId, stateRoot, endpointMtimeMs, predecessorFileId));
+		await index.append(event("host_heartbeat", sessionId, stateRoot));
+		const predecessorIncarnation = createHash("sha256")
+			.update(
+				JSON.stringify({
+					endpointFileId: predecessorFileId,
+					endpointGeneration: 1,
+					endpointMtimeMs,
+					pid: host.pid,
+					sessionId,
+				}),
+			)
+			.digest("hex");
+		await fs.rename(endpointPath, displacedPath);
+		await Bun.write(
+			endpointPath,
+			JSON.stringify({ sessionId, pid: host.pid, url: "ws://127.0.0.1:1", token: "new" }),
+		);
+		await fs.utimes(endpointPath, fixedMtimeSeconds, fixedMtimeSeconds);
+		const successor = await fs.stat(endpointPath, { bigint: true });
+		expect(`${successor.dev}:${successor.ino}`).not.toBe(predecessorFileId);
+		expect(Number(successor.mtimeNs) / 1_000_000).toBe(endpointMtimeMs);
+		await index.append(
+			event("host_registered", sessionId, stateRoot, endpointMtimeMs, `${successor.dev}:${successor.ino}`),
+		);
+		expect(
+			await broker.handleRequest(
+				"session.close",
+				{ sessionId, endpointGeneration: 1, endpointIncarnation: predecessorIncarnation },
+				"preserved-mtime-stale-close",
+			),
+		).toEqual({ ok: false, error: { code: "endpoint_stale", message: "session endpoint is stale" } });
+		expect(await fs.readFile(endpointPath, "utf8")).toContain('"token":"new"');
+	} finally {
+		if (host.exitCode === null) host.kill("SIGKILL");
+		await host.exited;
 		await broker.stop();
 		await fs.rm(agentDir, { recursive: true, force: true });
 	}
@@ -309,6 +430,135 @@ test("SDK-only runtime registers its broker endpoint and retracts it on shutdown
 			error: { code: "resource_gone", message: "session endpoint record is gone" },
 		});
 	} finally {
+		const shutdown = handlers.get("session_shutdown");
+		if (shutdown) await Promise.resolve(shutdown({}, context)).catch(() => undefined);
+		await broker.stop();
+		await fs.rm(agentDir, { recursive: true, force: true });
+	}
+});
+
+test("resumed direct SDK-only session replaces generation zero and is usable through the Router", async () => {
+	const agentDir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-sdk-direct-resume-"));
+	const cwd = path.join(agentDir, "workspace");
+	const stateRoot = path.join(cwd, ".gjc", "state");
+	const sessionId = "sdk-direct-resume";
+	await fs.mkdir(cwd, { recursive: true });
+	let broker = new Broker({ agentDir });
+	await broker.start();
+	const index = await new SessionIndex(agentDir).open();
+	const incarnation = processIncarnation(process.pid);
+	await index.append({
+		type: "host_registered",
+		sessionId,
+		locator: { cwd, worktreeRoot: null, stateRoot: agentDir },
+		endpointGeneration: 0,
+		pid: process.pid,
+		...(incarnation ? { processIncarnation: incarnation } : {}),
+	});
+	const handlers = new Map<string, (event: unknown, ctx: ExtensionContext) => void | Promise<void>>();
+	const api = {
+		on(event: string, handler: (event: unknown, ctx: ExtensionContext) => void | Promise<void>) {
+			handlers.set(event, handler);
+		},
+	} as unknown as ExtensionAPI;
+	createSdkSessionRuntimeExtension(api, {
+		agentDir,
+		createTransport: input => createSdkWebSocketTransport(input),
+	});
+	const pendingGateIds = new Set(["resume-gate"]);
+	const context = {
+		cwd,
+		sdkBindings: () => [],
+		sessionManager: { getSessionId: () => sessionId, getSessionName: () => "Resumed direct session" },
+		workflowGate: {
+			listWorkflowGateQueryRecords: () =>
+				[...pendingGateIds].map(gateId => ({ id: `pending:${gateId}`, gate_id: gateId, tag: "pending" })),
+			listPendingGates: () => [...pendingGateIds].map(gate_id => ({ gate_id })),
+			resolveGate: async (response: { gate_id: string }) => {
+				pendingGateIds.delete(response.gate_id);
+				return { gate_id: response.gate_id, status: "accepted" };
+			},
+			recoverAcceptedGates: async () => [],
+			lookupCompletedResolution: () => ({ kind: "none" }),
+			prepareTerminalization: () => true,
+			clearPreparedTerminalization: () => {},
+			registerGateTerminalController: () => () => {},
+			quarantineGate: () => {},
+		},
+	} as unknown as ExtensionContext;
+	const router = new SessionRouter({ agentDir, sessionIds: [sessionId] });
+	try {
+		const start = handlers.get("session_start");
+		if (!start) throw new Error("SDK-only session_start handler was not registered.");
+		await start({}, context);
+		await index.refresh();
+		let resumed = index.listSessions().sessions.find(session => session.sessionId === sessionId);
+		expect(resumed).toMatchObject({
+			endpointGeneration: 1,
+			live: true,
+			terminal: false,
+			ambiguous: false,
+			locator: { cwd, stateRoot },
+		});
+		expect(resumed?.endpointMtimeMs).toEqual(expect.any(Number));
+		const endpointPath = path.join(stateRoot, "sdk", `${sessionId}.json`);
+		const endpointIdentity = await fs.lstat(endpointPath, { bigint: true });
+		const endpointMtimeMs = Number(endpointIdentity.mtimeNs) / 1_000_000;
+		await index.append({
+			type: "host_registered",
+			sessionId,
+			locator: { cwd, worktreeRoot: null, stateRoot },
+			endpointGeneration: 1,
+			pid: process.pid,
+			endpointMtimeMs: endpointMtimeMs + 0.0005,
+			endpointFileId: `${endpointIdentity.dev}:${endpointIdentity.ino}`,
+			...(incarnation ? { processIncarnation: incarnation } : {}),
+		});
+		await index.refresh();
+		resumed = index.listSessions().sessions.find(session => session.sessionId === sessionId);
+		expect(Math.abs(endpointMtimeMs - resumed!.endpointMtimeMs!)).toBeGreaterThan(0);
+		expect(Math.abs(endpointMtimeMs - resumed!.endpointMtimeMs!)).toBeLessThanOrEqual(0.001);
+		expect(resumed?.endpointFileId).toBe(`${endpointIdentity.dev}:${endpointIdentity.ino}`);
+
+		await broker.stop();
+		broker = new Broker({ agentDir });
+		await broker.start();
+		expect(await broker.handleRequest("session.get_endpoint", { sessionId, endpointGeneration: 1 })).toMatchObject({
+			ok: true,
+			result: { sessionId, pid: process.pid, url: expect.stringMatching(/^ws:\/\/127\.0\.0\.1:/) },
+		});
+
+		await router.start();
+		const attachment = router.attachment(sessionId);
+		expect(attachment).not.toBeNull();
+		expect(attachment?.generation).toBe(1);
+		expect(
+			await router.request(
+				sessionId,
+				{ type: "query_request", id: "resume-query", query: "Q12", input: {} },
+				1,
+				attachment ?? undefined,
+			),
+		).toMatchObject({
+			type: "query_response",
+			ok: true,
+			page: { items: [{ gate_id: "resume-gate" }] },
+		});
+		expect(
+			await router.request(
+				sessionId,
+				{
+					type: "control_request",
+					id: "resume-control",
+					operation: "workflow.gate_answer",
+					input: { id: "resume-gate", response: "approve", expectedSessionId: sessionId },
+				},
+				1,
+				attachment ?? undefined,
+			),
+		).toMatchObject({ type: "control_response", ok: true, result: { status: "accepted" } });
+	} finally {
+		await router.stop().catch(() => undefined);
 		const shutdown = handlers.get("session_shutdown");
 		if (shutdown) await Promise.resolve(shutdown({}, context)).catch(() => undefined);
 		await broker.stop();

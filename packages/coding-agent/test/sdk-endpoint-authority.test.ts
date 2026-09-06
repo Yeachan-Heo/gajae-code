@@ -21,4 +21,11 @@ describe("SDK endpoint index authority", () => {
 			false,
 		);
 	});
+
+	test("requires exact timestamp authority when the index has no file identity", () => {
+		const file = { dev: 7n, ino: 11n, mtimeMs: 1_000.123_456 };
+
+		expect(matchesIndexedEndpointFile(file, { endpointMtimeMs: file.mtimeMs })).toBe(true);
+		expect(matchesIndexedEndpointFile(file, { endpointMtimeMs: file.mtimeMs + 0.0005 })).toBe(false);
+	});
 });

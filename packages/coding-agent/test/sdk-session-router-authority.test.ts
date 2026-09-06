@@ -41,6 +41,7 @@ interface RouterFixtureAuthority {
 	generation: number;
 	pid: number;
 	endpointMtimeMs: number;
+	endpointFileId?: string;
 	indexed: boolean;
 	terminalUncertain: boolean;
 	warnings: string[];
@@ -103,7 +104,7 @@ async function routerFixture(
 	fs.writeFileSync(endpointFile, JSON.stringify({ sessionId, url: "ws://router.test", token: "secret", pid: 42 }));
 	const endpointMtimeMs = fs.statSync(endpointFile).mtimeMs;
 
-	const authority = {
+	const authority: RouterFixtureAuthority = {
 		generation: 1,
 		pid: 42,
 		endpointMtimeMs,
@@ -130,6 +131,7 @@ async function routerFixture(
 							endpointGeneration: authority.generation,
 							pid: authority.pid,
 							endpointMtimeMs: authority.endpointMtimeMs,
+							...(authority.endpointFileId === undefined ? {} : { endpointFileId: authority.endpointFileId }),
 							live: true,
 							indexSeq: authority.generation,
 							terminalUncertain: authority.terminalUncertain || undefined,
@@ -1501,6 +1503,130 @@ describe("SessionRouter dispatch authority", () => {
 		}
 	});
 
+	test("adopts rounded lifecycle authority only with the exact endpoint file identity", async () => {
+		const removed: Array<string | undefined> = [];
+		const fixture = await routerFixture({
+			initiallyIndexed: false,
+			onSessionRemoved: (_attachment, reason) => {
+				removed.push(reason);
+			},
+		});
+		const endpoint = (await Bun.file(fixture.endpointFile).json()) as Record<string, unknown>;
+		const identity = fs.statSync(fixture.endpointFile, { bigint: true });
+		const descriptorMtimeMs = Number(identity.mtimeNs) / 1_000_000;
+		fixture.authority.endpointMtimeMs = descriptorMtimeMs + 0.0005;
+		fixture.authority.endpointFileId = `${identity.dev}:${identity.ino}`;
+		const adopted = await fixture.router.adoptLifecycleResult(
+			{
+				ok: true,
+				result: {
+					sessionId: fixture.sessionId,
+					endpointGeneration: fixture.authority.generation,
+					pid: fixture.authority.pid,
+					endpointMtimeMs: fixture.authority.endpointMtimeMs,
+					endpointFileId: fixture.authority.endpointFileId,
+					endpoint,
+				},
+			},
+			{ sessionId: fixture.sessionId, cwd: fixture.repo },
+		);
+		try {
+			expect(adopted.isCurrent()).toBe(false);
+			fixture.authority.indexed = true;
+			await fixture.router.reconcile();
+			expect(removed).toEqual([]);
+			expect(adopted.isCurrent()).toBe(true);
+			expect(fixture.router.attachment(fixture.sessionId)).toBe(adopted);
+		} finally {
+			await fixture.router.stop();
+		}
+	});
+
+	test("revokes rounded lifecycle adoption when the endpoint file identity differs", async () => {
+		const removed: Array<string | undefined> = [];
+		const fixture = await routerFixture({
+			initiallyIndexed: false,
+			onSessionRemoved: (_attachment, reason) => {
+				removed.push(reason);
+			},
+		});
+		const endpoint = (await Bun.file(fixture.endpointFile).json()) as Record<string, unknown>;
+		const identity = fs.statSync(fixture.endpointFile, { bigint: true });
+		const descriptorMtimeMs = Number(identity.mtimeNs) / 1_000_000;
+		const lifecycleFileId = `${identity.dev}:${identity.ino}`;
+		const successorFileId = `${identity.dev}:${identity.ino + 1n}`;
+		const adopted = await fixture.router.adoptLifecycleResult(
+			{
+				ok: true,
+				result: {
+					sessionId: fixture.sessionId,
+					endpointGeneration: fixture.authority.generation,
+					pid: fixture.authority.pid,
+					endpointMtimeMs: descriptorMtimeMs + 0.0005,
+					endpointFileId: lifecycleFileId,
+					endpoint,
+				},
+			},
+			{ sessionId: fixture.sessionId, cwd: fixture.repo },
+		);
+		try {
+			expect(adopted.isCurrent()).toBe(false);
+			fixture.authority.endpointMtimeMs = descriptorMtimeMs + 0.0005;
+			fixture.authority.endpointFileId = successorFileId;
+			fixture.authority.indexed = true;
+			await fixture.router.reconcile();
+			expect(adopted.isCurrent()).toBe(false);
+			expect(fixture.router.attachment(fixture.sessionId)).toBeNull();
+			expect(removed).toEqual(["replaced_same_generation"]);
+		} finally {
+			await fixture.router.stop();
+		}
+	});
+
+	test("binds durable attachment authority IDs to the endpoint device", () => {
+		const endpointIdentity = {
+			dev: 7n,
+			mtimeMs: 1_000.123,
+			mtimeNs: 1_000_123_456n,
+			ctimeNs: 1_000_123_457n,
+			size: 64n,
+			ino: 11n,
+		};
+		const input = {
+			sessionId: "router-session",
+			generation: 1,
+			pid: 42,
+			endpointMtimeMs: endpointIdentity.mtimeMs,
+			url: "ws://router.test",
+			token: "secret",
+			endpointIdentity,
+		};
+
+		expect(sessionAttachmentAuthorityId(input)).not.toBe(
+			sessionAttachmentAuthorityId({ ...input, endpointIdentity: { ...endpointIdentity, dev: 8n } }),
+		);
+	});
+
+	test("keeps device identity optional for public attachment authority callers", () => {
+		const authorityId = sessionAttachmentAuthorityId({
+			sessionId: "router-session",
+			generation: 1,
+			pid: 42,
+			endpointMtimeMs: 1_000.123,
+			url: "ws://router.test",
+			token: "secret",
+			endpointIdentity: {
+				mtimeMs: 1_000.123,
+				mtimeNs: 1_000_123_456n,
+				ctimeNs: 1_000_123_457n,
+				size: 64n,
+				ino: 11n,
+			},
+		});
+
+		expect(authorityId).toMatch(/^[0-9a-f]{64}$/);
+	});
+
 	test("revokes lifecycle adoption when the index remains missing or terminal", async () => {
 		const fixture = await routerFixture({ initiallyIndexed: false });
 		const endpoint = JSON.parse(fs.readFileSync(fixture.endpointFile, "utf8")) as Record<string, unknown>;
@@ -2686,7 +2812,7 @@ describe("SessionRouter dispatch authority", () => {
 	});
 
 	for (const delta of [-0.000244140625, 0.000244140625]) {
-		test(`endpoint rounding difference ${delta} permits attachment and maintenance, not replacement`, async () => {
+		test(`identity-less endpoint rounding difference ${delta} fails closed`, async () => {
 			const fixture = await routerFixture({ start: false });
 			const timestamp = new Date(1_700_000_000_000);
 			await fsPromises.utimes(fixture.endpointFile, timestamp, timestamp);
@@ -2694,20 +2820,8 @@ describe("SessionRouter dispatch authority", () => {
 			fixture.authority.endpointMtimeMs = original.mtimeMs + delta;
 			try {
 				await fixture.router.start();
-				const attachment = fixture.router.attachment(fixture.sessionId);
-				expect(attachment?.isCurrent()).toBe(true);
-				await attachment!.sendMaintenance?.("rounding-safe");
-				expect(fixture.clients[0].sent).toHaveLength(1);
-				const staging = `${fixture.endpointFile}.replacement`;
-				await Bun.write(staging, await Bun.file(fixture.endpointFile).text());
-				await fsPromises.rename(staging, fixture.endpointFile);
-				await fsPromises.utimes(fixture.endpointFile, timestamp, timestamp);
-				const replacement = await fsPromises.lstat(fixture.endpointFile);
-				expect(replacement.mtimeMs).toBe(original.mtimeMs);
-				expect(Math.abs(replacement.mtimeMs - fixture.authority.endpointMtimeMs)).toBeLessThanOrEqual(0.001);
-				expect(replacement.ino).not.toBe(original.ino);
-				await expect(attachment!.sendMaintenance?.("replaced")).rejects.toBeInstanceOf(SessionRouterError);
-				expect(fixture.clients[0].sent).toHaveLength(1);
+				expect(fixture.router.attachment(fixture.sessionId)).toBeNull();
+				expect(fixture.clients).toHaveLength(0);
 			} finally {
 				await fixture.router.stop();
 			}

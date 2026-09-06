@@ -807,6 +807,7 @@ describe("SessionLifecycleService", () => {
 			stateRoot: "/tmp/workspace/.gjc/state",
 			endpointGeneration: 2,
 			endpointMtimeMs: 1,
+			endpointFileId: "dev:123",
 			processIncarnation: "linux:123",
 			hostIncarnation: "host:123",
 			lifecycleRequestId: "retire-effect",
@@ -823,6 +824,7 @@ describe("SessionLifecycleService", () => {
 				stateRoot: target.stateRoot,
 				endpointGeneration: target.endpointGeneration,
 				endpointMtimeMs: target.endpointMtimeMs,
+				endpointFileId: target.endpointFileId,
 				processIncarnation: target.processIncarnation,
 				hostIncarnation: target.hostIncarnation,
 				lifecycleRequestId: target.lifecycleRequestId,
@@ -840,9 +842,42 @@ describe("SessionLifecycleService", () => {
 			operation: "session.reconcile_uncertain",
 			result: { sessionId: target.sessionId },
 		});
+		expect(result.ok && result.result).toMatchObject({ endpointFileId: target.endpointFileId });
 		expect(result.ok && result.result).not.toHaveProperty("stateRoot");
 		expect(result.ok && result.result).not.toHaveProperty("processIncarnation");
 		expect(client.calls[0]?.input).toEqual({ ...target });
+	});
+
+	it("accepts broker-proven endpoint file identity for a legacy retirement target", async () => {
+		const target: SessionReconcileUncertainTarget = {
+			sessionId: "legacy-retired-session",
+			cwd: "/tmp/workspace",
+			stateRoot: "/tmp/workspace/.gjc/state",
+			endpointGeneration: 2,
+			endpointMtimeMs: 1,
+			processIncarnation: "linux:123",
+			hostIncarnation: "host:123",
+			lifecycleRequestId: "retire-effect",
+			remoteCreateKey: "remote-create-key",
+		};
+		const client = new FakeLifecycleClient();
+		client.response = {
+			ok: true,
+			result: {
+				...target,
+				endpointFileId: "dev:456",
+				retired: true,
+				ledgerState: "terminal_error",
+				indexType: "session_closed",
+			},
+		};
+		const result = await new SessionLifecycleService(client).reconcileUncertain({
+			actor,
+			capability: "session.reconcile_uncertain",
+			requestKey: "legacy-retire-request",
+			target,
+		});
+		expect(result).toMatchObject({ ok: true, result: { endpointFileId: "dev:456" } });
 	});
 
 	it("rejects a proofless successful broker envelope", async () => {
@@ -858,6 +893,7 @@ describe("SessionLifecycleService", () => {
 				stateRoot: "/tmp/workspace/.gjc/state",
 				endpointGeneration: 2,
 				endpointMtimeMs: 1,
+				endpointFileId: "dev:123",
 				processIncarnation: "linux:123",
 				hostIncarnation: "host:123",
 				lifecycleRequestId: "retire-effect",
@@ -879,6 +915,7 @@ describe("SessionLifecycleService", () => {
 				stateRoot: "/tmp/workspace/.gjc/state",
 				endpointGeneration: 2,
 				endpointMtimeMs: 1,
+				endpointFileId: "dev:123",
 				processIncarnation: "linux:123",
 				hostIncarnation: "host:123",
 				lifecycleRequestId: "retire-effect",
@@ -895,6 +932,7 @@ describe("SessionLifecycleService", () => {
 				stateRoot: "/tmp/workspace/../workspace/.gjc/state",
 				endpointGeneration: 2,
 				endpointMtimeMs: 1,
+				endpointFileId: "dev:123",
 				processIncarnation: "linux:123",
 				hostIncarnation: "host:123",
 				lifecycleRequestId: "retire-effect",

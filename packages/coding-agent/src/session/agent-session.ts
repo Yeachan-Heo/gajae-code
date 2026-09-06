@@ -4471,22 +4471,19 @@ export class AgentSession {
 		});
 		this.#unregisterMoveAbortListener = this.sessionManager.registerMoveAbortListener(async move => {
 			const moveId = this.#coordinatorRescopeMoveId;
-			try {
-				if (moveId && !move.preserveRecoveryJournal) {
-					await clearCoordinatorRuntimeStateRescope(
-						{
-							sessionId: this.sessionId,
-							cwd: move.newCwd,
-							sessionFile: move.newSessionFile ?? null,
-						},
-						moveId,
-						move.previousCwd,
-					);
-				}
-			} finally {
-				this.#coordinatorRescopeMoveId = undefined;
-				this.#endCoordinatorRescopeBarrier();
-			}
+			if (!moveId) return;
+			if (move.preserveRecoveryJournal) return;
+			await clearCoordinatorRuntimeStateRescope(
+				{
+					sessionId: this.sessionId,
+					cwd: move.newCwd,
+					sessionFile: move.newSessionFile ?? null,
+				},
+				moveId,
+				move.previousCwd,
+			);
+			this.#coordinatorRescopeMoveId = undefined;
+			this.#endCoordinatorRescopeBarrier();
 		});
 		this.#unregisterMovePublicationListener = this.sessionManager.registerMovePublicationListener(async move => {
 			const moveId = this.#coordinatorRescopeMoveId;
@@ -4507,7 +4504,8 @@ export class AgentSession {
 		// fence refuses every later persist) and rebinds the postmortem finalizer, which
 		// otherwise keeps writing terminal state to the launch root's cwd/session file.
 		this.#unregisterAfterMoveListener = this.sessionManager.registerAfterMoveListener(async move => {
-			let completed = false;
+			const moveId = this.#coordinatorRescopeMoveId;
+			if (!moveId) throw new Error("Coordinator rescope completion has no prepared move identity.");
 			try {
 				const relocated = await relocateCoordinatorRuntimeStateForRescope(
 					{
@@ -4525,16 +4523,13 @@ export class AgentSession {
 						cwd: move.newCwd,
 						sessionFile: this.sessionManager.getSessionFile() ?? null,
 					},
-					this.#coordinatorRescopeMoveId,
+					moveId,
 					move.previousCwd,
 				);
-				completed = true;
+				this.#coordinatorRescopeMoveId = undefined;
+				this.#endCoordinatorRescopeBarrier();
 			} finally {
 				this.#registerRuntimeStateFinalizer();
-				if (completed) {
-					this.#coordinatorRescopeMoveId = undefined;
-					this.#endCoordinatorRescopeBarrier();
-				}
 			}
 		});
 		// Power assertions are taken per turn (see #beginInFlight); nothing acquired here.
@@ -6932,12 +6927,13 @@ export class AgentSession {
 					assistantMsg.stopReason !== "aborted" &&
 					this.#retryAttempt > 0
 				) {
-					await this.#emitSessionEvent({
-						type: "auto_retry_end",
-						success: true,
-						attempt: this.#retryAttempt,
-					});
+					const attempt = this.#retryAttempt;
 					this.#retryAttempt = 0;
+					try {
+						await this.#emitSessionEvent({ type: "auto_retry_end", success: true, attempt });
+					} finally {
+						this.#resolveRetry();
+					}
 					// Settle the retry gate here, colocated with the success event, rather
 					// than relying on the generic #resolveRetry() at the end of the
 					// agent_end branch. That tail resolver is bypassed by every early
@@ -7158,12 +7154,16 @@ export class AgentSession {
 				// the terminal retry-end and reset so observers clear retry state.
 				const attempt = this.#retryAttempt;
 				this.#retryAttempt = 0;
-				await this.#emitSessionEvent({
-					type: "auto_retry_end",
-					success: false,
-					attempt,
-					finalError: msg.errorMessage,
-				});
+				try {
+					await this.#emitSessionEvent({
+						type: "auto_retry_end",
+						success: false,
+						attempt,
+						finalError: msg.errorMessage,
+					});
+				} finally {
+					this.#resolveRetry();
+				}
 			}
 			this.#resolveRetry();
 			if (this.#isDisposed || this.#sessionAdmissionClosing) return;
@@ -21993,13 +21993,16 @@ export class AgentSession {
 				} else {
 					const attempt = this.#retryAttempt;
 					this.#retryAttempt = 0;
-					await this.#emitSessionEvent({
-						type: "auto_retry_end",
-						success: false,
-						attempt,
-						finalError: "Retry cancelled",
-					});
-					this.#resolveRetry();
+					try {
+						await this.#emitSessionEvent({
+							type: "auto_retry_end",
+							success: false,
+							attempt,
+							finalError: "Retry cancelled",
+						});
+					} finally {
+						this.#resolveRetry();
+					}
 					return;
 				}
 			}
@@ -22011,13 +22014,16 @@ export class AgentSession {
 				this.#retryAbortController = undefined;
 				const attempt = this.#retryAttempt;
 				this.#retryAttempt = 0;
-				await this.#emitSessionEvent({
-					type: "auto_retry_end",
-					success: false,
-					attempt,
-					finalError: "Retry cancelled",
-				});
-				this.#resolveRetry();
+				try {
+					await this.#emitSessionEvent({
+						type: "auto_retry_end",
+						success: false,
+						attempt,
+						finalError: "Retry cancelled",
+					});
+				} finally {
+					this.#resolveRetry();
+				}
 				return;
 			}
 			if (this.#retryAbortController === retryAbortController) this.#retryAbortController = undefined;
@@ -22030,13 +22036,16 @@ export class AgentSession {
 					if (retryCancelled() || ownershipCancelled()) {
 						const attempt = this.#retryAttempt;
 						this.#retryAttempt = 0;
-						await this.#emitSessionEvent({
-							type: "auto_retry_end",
-							success: false,
-							attempt,
-							finalError: "Retry continuation was superseded",
-						});
-						this.#resolveRetry();
+						try {
+							await this.#emitSessionEvent({
+								type: "auto_retry_end",
+								success: false,
+								attempt,
+								finalError: "Retry continuation was superseded",
+							});
+						} finally {
+							this.#resolveRetry();
+						}
 						return;
 					}
 					await this.agent.continue({
@@ -22118,7 +22127,7 @@ export class AgentSession {
 			success: false,
 			attempt,
 			finalError: reason,
-		});
+		}).catch(error => logger.warn("Failed to emit retry terminal event", { error: String(error) }));
 		this.#resolveRetry();
 	}
 

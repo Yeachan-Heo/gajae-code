@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 
 import {
@@ -9,6 +10,11 @@ import {
 
 export const CHAT_EFFECT_JOURNAL_VERSION = 1;
 export const MAX_TERMINAL_CHAT_EFFECTS = 128;
+
+/** Test-only failure seam for durable authority migration regressions. */
+export const __chatEffectJournalTestHooks: {
+	beforeAuthorityMigrationEffect?: (effectId: string) => void | Promise<void>;
+} = {};
 
 export function chatEffectJournalPath(agentDir: string, transport: "discord" | "slack"): string {
 	return conversationStorePath(agentDir, transport, "effects.json");
@@ -63,6 +69,37 @@ export interface ChatEffectLease {
 
 type EffectReferenceMapping = ConversationRecord & Record<string, unknown>;
 
+function sessionMutationGateFileName(sessionId: string): string {
+	return `.authority-gate-${createHash("sha256").update(sessionId).digest("hex")}.json`;
+}
+
+function mappingAcceptsAuthority(mapping: EffectReferenceMapping, authorityId: string | undefined): boolean {
+	return (
+		mapping.attachmentAuthorityId === authorityId ||
+		(mapping.attachmentAuthorityMigrationFromId !== undefined &&
+			mapping.attachmentAuthorityMigrationFromId === authorityId)
+	);
+}
+
+function collectAttachmentAuthorityIds(value: unknown, authorities: Set<string | undefined>): boolean {
+	if (Array.isArray(value)) {
+		let found = false;
+		for (const entry of value) found ||= collectAttachmentAuthorityIds(entry, authorities);
+		return found;
+	}
+	if (!value || typeof value !== "object") return false;
+	let found = false;
+	for (const [key, candidate] of Object.entries(value)) {
+		if (key === "attachmentAuthorityId") {
+			authorities.add(typeof candidate === "string" ? candidate : undefined);
+			found = true;
+			continue;
+		}
+		found ||= collectAttachmentAuthorityIds(candidate, authorities);
+	}
+	return found;
+}
+
 function hasImmutableEnqueueIdentity<TPayload>(
 	effect: ChatEffect<TPayload>,
 	input: EnqueueChatEffect<TPayload>,
@@ -96,6 +133,31 @@ function collectEffectReferences(value: unknown, references: Set<string>): void 
 	}
 }
 
+function rewriteAttachmentAuthorityIds(value: unknown, previous: string, current: string): unknown {
+	if (Array.isArray(value)) {
+		let changed = false;
+		const rewritten = value.map(entry => {
+			const next = rewriteAttachmentAuthorityIds(entry, previous, current);
+			changed ||= next !== entry;
+			return next;
+		});
+		return changed ? rewritten : value;
+	}
+	if (!value || typeof value !== "object") return value;
+	let changed = false;
+	const rewritten = Object.fromEntries(
+		Object.entries(value).map(([key, entry]) => {
+			const next =
+				key === "attachmentAuthorityId" && entry === previous
+					? current
+					: rewriteAttachmentAuthorityIds(entry, previous, current);
+			changed ||= next !== entry;
+			return [key, next];
+		}),
+	);
+	return changed ? rewritten : value;
+}
+
 function nonEmpty(value: string, name: string): void {
 	if (!value) throw new Error(`Chat effect ${name} is required`);
 }
@@ -118,6 +180,8 @@ function canClaim(effect: ChatEffect, now: number): boolean {
 export class ChatEffectJournal {
 	readonly #store: ConversationStore<ChatEffect>;
 	readonly #mappings: ConversationStore<EffectReferenceMapping>;
+	readonly #sessionGateStores = new Map<string, ConversationStore<ConversationRecord>>();
+	readonly #createSessionGateStore: (sessionId: string) => ConversationStore<ConversationRecord>;
 	readonly #maxTerminalEffects: number;
 
 	readonly #now: () => number;
@@ -136,6 +200,19 @@ export class ChatEffectJournal {
 	}) {
 		this.#store = new ConversationStore<ChatEffect>({ ...input, kind: input.transport, fileName: "effects.json" });
 		this.#mappings = new ConversationStore<EffectReferenceMapping>({ ...input, kind: input.transport });
+		this.#createSessionGateStore = sessionId =>
+			new ConversationStore<ConversationRecord>({
+				agentDir: input.agentDir,
+				kind: input.transport,
+				fileName: sessionMutationGateFileName(sessionId),
+				fs: input.fs,
+				now: input.now,
+				pid: input.pid,
+				pidAlive: input.pidAlive,
+				pidIncarnation: input.pidIncarnation,
+				sleep: input.sleep,
+				lockTimeoutMs: input.lockTimeoutMs,
+			});
 
 		if (
 			input.maxTerminalEffects !== undefined &&
@@ -150,12 +227,77 @@ export class ChatEffectJournal {
 		return this.#store.filePath;
 	}
 
+	/**
+	 * Serialize every durable mutation that can publish an effect for one
+	 * session. The gate is a separate ConversationStore file so its lock is
+	 * shared by mapping and journal writers without widening either store's
+	 * existing document lock. Callers must keep provider/network work outside
+	 * the gate and use the gate-held variants for nested journal mutations.
+	 */
+	async withSessionMutationGate<T>(sessionId: string, operation: () => Promise<T>): Promise<T> {
+		nonEmpty(sessionId, "sessionId");
+		let gateStore = this.#sessionGateStores.get(sessionId);
+		if (!gateStore) {
+			gateStore = this.#createSessionGateStore(sessionId);
+			this.#sessionGateStores.set(sessionId, gateStore);
+		}
+		let result!: T;
+		await gateStore.transactWithSnapshot("gate", async current => {
+			result = await operation();
+			return { generation: (current?.generation ?? 0) + 1 };
+		});
+		return result;
+	}
+
 	async read<TPayload = unknown>(id: string): Promise<ChatEffect<TPayload> | undefined> {
 		return (await this.#store.read(id)) as ChatEffect<TPayload> | undefined;
 	}
 
 	async list(): Promise<ChatEffect[]> {
 		return Object.values((await this.#store.load()).conversations);
+	}
+
+	/** Rewrite pre-device-binding effect payloads after Router proves the current endpoint. */
+	async migrateAttachmentAuthorityId(
+		sessionId: string,
+		endpointGeneration: number,
+		previousAuthorityId: string,
+		currentAuthorityId: string,
+	): Promise<void> {
+		await this.withSessionMutationGate(sessionId, async () => {
+			await this.migrateAttachmentAuthorityIdWhileHoldingGate(
+				sessionId,
+				endpointGeneration,
+				previousAuthorityId,
+				currentAuthorityId,
+			);
+		});
+	}
+
+	/** Performs effect migration for a caller that already holds the session gate. */
+	async migrateAttachmentAuthorityIdWhileHoldingGate(
+		sessionId: string,
+		endpointGeneration: number,
+		previousAuthorityId: string,
+		currentAuthorityId: string,
+	): Promise<void> {
+		if (!previousAuthorityId || !currentAuthorityId || previousAuthorityId === currentAuthorityId) return;
+		for (const effect of await this.list()) {
+			if (effect.sessionId !== sessionId || effect.endpointGeneration !== endpointGeneration) continue;
+			await __chatEffectJournalTestHooks.beforeAuthorityMigrationEffect?.(effect.id);
+			await this.#store.transact(effect.id, current => {
+				if (!current || current.sessionId !== sessionId || current.endpointGeneration !== endpointGeneration)
+					return current;
+				const payload = rewriteAttachmentAuthorityIds(current.payload, previousAuthorityId, currentAuthorityId);
+				if (payload === current.payload && current.state !== "leased") return current;
+				return {
+					...current,
+					generation: current.generation + 1,
+					payload,
+					updatedAt: this.#now(),
+				};
+			});
+		}
 	}
 
 	async replayable(transport: "discord" | "slack", endpointGeneration: number): Promise<ChatEffect[]> {
@@ -167,27 +309,38 @@ export class ChatEffectJournal {
 	}
 
 	async enqueue<TPayload>(input: EnqueueChatEffect<TPayload>): Promise<ChatEffect<TPayload>> {
+		if (input.sessionId === undefined) return await this.enqueueWhileHoldingSessionMutationGate(input);
+		return await this.withSessionMutationGate(input.sessionId, async () => {
+			return await this.enqueueWhileHoldingSessionMutationGate(input);
+		});
+	}
+
+	/** Enqueue variant for a caller that already holds the session mutation gate. */
+	async enqueueWhileHoldingSessionMutationGate<TPayload>(
+		input: EnqueueChatEffect<TPayload>,
+	): Promise<ChatEffect<TPayload>> {
 		nonEmpty(input.id, "id");
 		nonEmpty(input.kind, "kind");
-		const existing = await this.read<TPayload>(input.id);
+		const prepared = await this.#prepareEnqueue(input);
+		const existing = await this.read<TPayload>(prepared.id);
 		if (existing) {
-			requireImmutableEnqueueIdentity(existing, input);
+			requireImmutableEnqueueIdentity(existing, prepared);
 			return existing;
 		}
 
 		const now = this.#now();
 		const effect: ChatEffect<TPayload> = {
-			...input,
+			...prepared,
 			generation: 1,
 			state: "pending",
 			epoch: 0,
 			createdAt: now,
 			updatedAt: now,
 		};
-		if (await this.#store.write(input.id, undefined, effect)) return effect;
-		const raced = await this.read<TPayload>(input.id);
+		if (await this.#store.write(prepared.id, undefined, effect)) return effect;
+		const raced = await this.read<TPayload>(prepared.id);
 		if (!raced) throw new Error(`Unable to enqueue chat effect ${input.id}`);
-		requireImmutableEnqueueIdentity(raced, input);
+		requireImmutableEnqueueIdentity(raced, prepared);
 		return raced;
 	}
 
@@ -201,20 +354,34 @@ export class ChatEffectJournal {
 		owner: string,
 		leaseMs: number,
 	): Promise<ChatEffect<TPayload> | undefined> {
+		if (input.sessionId === undefined)
+			return await this.enqueueAndClaimWhileHoldingSessionMutationGate(input, owner, leaseMs);
+		return await this.withSessionMutationGate(input.sessionId, async () => {
+			return await this.enqueueAndClaimWhileHoldingSessionMutationGate(input, owner, leaseMs);
+		});
+	}
+
+	/** Enqueue-and-claim variant for a caller that already holds the session gate. */
+	async enqueueAndClaimWhileHoldingSessionMutationGate<TPayload>(
+		input: EnqueueChatEffect<TPayload>,
+		owner: string,
+		leaseMs: number,
+	): Promise<ChatEffect<TPayload> | undefined> {
 		nonEmpty(input.id, "id");
 		nonEmpty(input.kind, "kind");
 		nonEmpty(owner, "owner");
 		if (!Number.isFinite(leaseMs) || leaseMs <= 0) throw new Error("Chat effect lease duration must be positive");
+		const prepared = await this.#prepareEnqueue(input);
 		let claimed: ChatEffect<TPayload> | undefined;
 		const now = this.#now();
-		await this.#store.transact(input.id, current => {
+		await this.#store.transact(prepared.id, current => {
 			if (current) {
-				requireImmutableEnqueueIdentity(current as ChatEffect<TPayload>, input);
+				requireImmutableEnqueueIdentity(current as ChatEffect<TPayload>, prepared);
 				return current;
 			}
 
 			claimed = {
-				...input,
+				...prepared,
 				generation: 1,
 				state: "leased",
 				owner,
@@ -229,6 +396,19 @@ export class ChatEffectJournal {
 	}
 
 	async claim<TPayload = unknown>(
+		id: string,
+		owner: string,
+		leaseMs: number,
+	): Promise<ChatEffect<TPayload> | undefined> {
+		const existing = await this.read(id);
+		if (!existing?.sessionId) return await this.claimWhileHoldingSessionMutationGate(id, owner, leaseMs);
+		return await this.withSessionMutationGate(
+			existing.sessionId,
+			async () => await this.claimWhileHoldingSessionMutationGate(id, owner, leaseMs),
+		);
+	}
+
+	async claimWhileHoldingSessionMutationGate<TPayload = unknown>(
 		id: string,
 		owner: string,
 		leaseMs: number,
@@ -258,6 +438,19 @@ export class ChatEffectJournal {
 		lease: ChatEffectLease,
 		leaseMs: number,
 	): Promise<ChatEffect<TPayload> | undefined> {
+		const existing = await this.read(id);
+		if (!existing?.sessionId) return await this.renewWhileHoldingSessionMutationGate(id, lease, leaseMs);
+		return await this.withSessionMutationGate(
+			existing.sessionId,
+			async () => await this.renewWhileHoldingSessionMutationGate(id, lease, leaseMs),
+		);
+	}
+
+	async renewWhileHoldingSessionMutationGate<TPayload = unknown>(
+		id: string,
+		lease: ChatEffectLease,
+		leaseMs: number,
+	): Promise<ChatEffect<TPayload> | undefined> {
 		if (!Number.isFinite(leaseMs) || leaseMs <= 0) throw new Error("Chat effect lease duration must be positive");
 		let renewed: ChatEffect<TPayload> | undefined;
 		const now = this.#now();
@@ -281,6 +474,19 @@ export class ChatEffectJournal {
 		lease: ChatEffectLease,
 		receipt: ChatEffectReceipt,
 	): Promise<ChatEffect<TPayload> | undefined> {
+		const existing = await this.read(id);
+		if (!existing?.sessionId) return await this.recordReceiptWhileHoldingSessionMutationGate(id, lease, receipt);
+		return await this.withSessionMutationGate(
+			existing.sessionId,
+			async () => await this.recordReceiptWhileHoldingSessionMutationGate(id, lease, receipt),
+		);
+	}
+
+	async recordReceiptWhileHoldingSessionMutationGate<TPayload = unknown>(
+		id: string,
+		lease: ChatEffectLease,
+		receipt: ChatEffectReceipt,
+	): Promise<ChatEffect<TPayload> | undefined> {
 		let recorded: ChatEffect<TPayload> | undefined;
 		const now = this.#now();
 		await this.#store.transact(id, current => {
@@ -298,6 +504,20 @@ export class ChatEffectJournal {
 	}
 
 	async record<TPayload = unknown>(
+		id: string,
+		lease: ChatEffectLease,
+		state: Exclude<ChatEffectState, "pending" | "leased">,
+		receipt?: ChatEffectReceipt,
+	): Promise<ChatEffect<TPayload> | undefined> {
+		const existing = await this.read(id);
+		if (!existing?.sessionId) return await this.recordWhileHoldingSessionMutationGate(id, lease, state, receipt);
+		return await this.withSessionMutationGate(
+			existing.sessionId,
+			async () => await this.recordWhileHoldingSessionMutationGate(id, lease, state, receipt),
+		);
+	}
+
+	async recordWhileHoldingSessionMutationGate<TPayload = unknown>(
 		id: string,
 		lease: ChatEffectLease,
 		state: Exclude<ChatEffectState, "pending" | "leased">,
@@ -325,6 +545,19 @@ export class ChatEffectJournal {
 
 	/** Irreversibly rejects an effect whose mapping never accepted its authority. */
 	async terminalize(id: string, receipt: ChatEffectReceipt, lease?: ChatEffectLease): Promise<ChatEffect | undefined> {
+		const existing = await this.read(id);
+		if (!existing?.sessionId) return await this.terminalizeWhileHoldingSessionMutationGate(id, receipt, lease);
+		return await this.withSessionMutationGate(
+			existing.sessionId,
+			async () => await this.terminalizeWhileHoldingSessionMutationGate(id, receipt, lease),
+		);
+	}
+
+	async terminalizeWhileHoldingSessionMutationGate(
+		id: string,
+		receipt: ChatEffectReceipt,
+		lease?: ChatEffectLease,
+	): Promise<ChatEffect | undefined> {
 		let terminalized: ChatEffect | undefined;
 		const now = this.#now();
 		await this.#store.transact(id, current => {
@@ -345,6 +578,21 @@ export class ChatEffectJournal {
 		});
 		if (terminalized) await this.#pruneTerminal();
 		return terminalized;
+	}
+
+	async #prepareEnqueue<TPayload>(input: EnqueueChatEffect<TPayload>): Promise<EnqueueChatEffect<TPayload>> {
+		if (input.sessionId === undefined) return input;
+		const mappings = Object.values((await this.#mappings.load()).conversations).filter(
+			mapping => mapping.sessionId === input.sessionId && mapping.endpointGeneration === input.endpointGeneration,
+		);
+		if (mappings.length === 0) return input;
+		const authorities = new Set<string | undefined>();
+		if (!collectAttachmentAuthorityIds(input.payload, authorities)) authorities.add(undefined);
+		for (const authorityId of authorities) {
+			if (!mappings.some(mapping => mappingAcceptsAuthority(mapping, authorityId)))
+				throw new Error(`Chat effect ${input.id} attachment authority is no longer accepted`);
+		}
+		return input;
 	}
 
 	async #pruneTerminal(): Promise<void> {

@@ -30,9 +30,11 @@ import {
 	initializeCoordinatorNamespace,
 	readSessionTransaction,
 	reconcileCreationRemoteVerifier,
+	rewriteSessionEndpointAuthority,
 	rotateClaimedCreationVerifier,
 	startCreationRemote,
 	transactionPath,
+	upgradeCreationRetirementEndpointFileId,
 	withNamespaceRegistry,
 	withSessionTransaction,
 } from "../src/coordinator-mcp/question-state";
@@ -376,6 +378,72 @@ describe("mcp serve check command compatibility", () => {
 });
 
 describe("coordinator question-state direct contracts", () => {
+	it("does not bind a legacy retirement intent to a same-generation successor", async () => {
+		await withTempRoot(async root => {
+			const paths = coordinatorStatePaths(path.join(root, "state"), "namespace-retire-fence");
+			await initializeCoordinatorNamespace(paths);
+			const session = {
+				schema_version: 1 as const,
+				namespace_id: "namespace-retire-fence",
+				session_id: "session-retire-fence",
+				cwd: root,
+				created_at: "2026-09-05T00:00:00.000Z",
+				updated_at: "2026-09-05T00:00:00.000Z",
+				mpreset: null,
+				source: "coordinator" as const,
+				model: null,
+				tmux: { session: null, window: null, pane: null },
+				broker: {
+					workspace: root,
+					endpoint_url: "ws://private.example.test",
+					endpoint_generation: 1,
+					endpoint_incarnation: "legacy-predecessor",
+					sidecar_verifier: { key_id: "a".repeat(64), public_key: "public-key" },
+				},
+				ephemeral: false,
+				visible: true,
+			};
+			const proof = {
+				session_id: session.session_id,
+				cwd: root,
+				state_root: path.join(root, ".gjc", "state"),
+				endpoint_generation: 1,
+				endpoint_mtime_ms: 1,
+				process_incarnation: "process",
+				host_incarnation: "host",
+				lifecycle_request_id: "lifecycle",
+				remote_create_key: "remote",
+			};
+			await withNamespaceRegistry(paths, async registry => {
+				registry.creations.creation = {
+					key_digest: "creation",
+					request_digest: "request",
+					tool: "gjc_coordinator_start_session",
+					phase: "uncertain",
+					canonical_create_intent: {
+						kind: "start",
+						session,
+						remote_create_key: "remote",
+						initial_state: "ready_for_input",
+						initial_prompt: null,
+						initial_events: [],
+					},
+					remote_create_key: "remote",
+					session_id: session.session_id,
+					endpoint_incarnation: "legacy-predecessor",
+					sidecar_verifier: session.broker.sidecar_verifier,
+					created_at: session.created_at,
+					updated_at: session.updated_at,
+				};
+			});
+			await expect(
+				upgradeCreationRetirementEndpointFileId(paths, "creation", proof, "legacy-successor", "2:3"),
+			).rejects.toThrow("idempotency_conflict");
+			const creation = await withNamespaceRegistry(paths, async registry => registry.creations.creation);
+			expect(creation?.canonical_create_intent?.session.broker).not.toHaveProperty("endpoint_file_id");
+		});
+	});
+
 	it("rotates only an unspawned claimed creation verifier", async () => {
 		await withTempRoot(async root => {
 			const paths = coordinatorStatePaths(path.join(root, "state"), "namespace-rotate");
@@ -480,6 +548,273 @@ describe("coordinator question-state direct contracts", () => {
 				registry.deletions["close-2550"].phase = "completed";
 				expect(() => assertCloseAdmission(registry, transaction)).toThrow("session_closing");
 			});
+		});
+	});
+
+	const migrationAt = "2026-08-20T02:00:00.000Z";
+	const legacyEndpointIncarnation = "a".repeat(64);
+	const currentEndpointIncarnation = "b".repeat(64);
+	const migrationAuthorityId = (namespaceId: string, sessionId: string, endpointIncarnation: string): string =>
+		createHash("sha256").update(`${namespaceId}\0${sessionId}\0${endpointIncarnation}\0gate-migration`).digest("hex");
+
+	async function seedGateMigrationState(root: string, answered: boolean) {
+		const namespaceId = answered ? "namespace-gate-answered" : "namespace-gate-pending";
+		const sessionId = answered ? "session-gate-answered" : "session-gate-pending";
+		const paths = coordinatorStatePaths(path.join(root, "state"), namespaceId);
+		const authorityId = migrationAuthorityId(namespaceId, sessionId, legacyEndpointIncarnation);
+		const session: CanonicalSessionSnapshotV1 = {
+			schema_version: 1,
+			namespace_id: namespaceId,
+			session_id: sessionId,
+			cwd: root,
+			created_at: migrationAt,
+			updated_at: migrationAt,
+			mpreset: null,
+			source: "coordinator",
+			model: null,
+			tmux: { session: null, window: null, pane: null },
+			broker: {
+				workspace: root,
+				endpoint_url: "ws://private.example.test",
+				endpoint_generation: 1,
+				endpoint_incarnation: legacyEndpointIncarnation,
+				sidecar_verifier: { key_id: createHash("sha256").update("sidecar").digest("hex"), public_key: "test-key" },
+			},
+			ephemeral: false,
+			visible: true,
+		};
+		await initializeCoordinatorNamespace(paths);
+		await createSessionTransaction(paths, {
+			kind: "register",
+			session,
+			initial_state: answered ? "completed" : "needs_user_input",
+			initial_events: [
+				{
+					kind: "question.opened",
+					entity: "question",
+					entity_id: "question-migration",
+					turn_id: "turn-migration",
+					question_id: "question-migration",
+					authority_id: authorityId,
+					created_at: migrationAt,
+				},
+			],
+		});
+		await withSessionTransaction(paths, sessionId, async transaction => {
+			const runtimeProvenance = {
+				namespace_id: namespaceId,
+				session_id: sessionId,
+				endpoint_incarnation: legacyEndpointIncarnation,
+				coordinator_turn_id: "turn-migration",
+				runtime_turn_id: "runtime-migration",
+				gate_created_at: migrationAt,
+				schema_hash: "schema-migration",
+				stage: "deep-interview",
+				kind: "question",
+			};
+			transaction.canonical.turns["turn-migration"] = {
+				schema_version: 1,
+				turn_id: "turn-migration",
+				session_id: sessionId,
+				namespace_id: namespaceId,
+				status: answered ? "completed" : "waiting_for_answer",
+				prompt: { text: "Answer the migration question", created_at: migrationAt, source: "coordinator" },
+				delivery: { delivered: false, queued: false, target: null, attempts: [] },
+				runtime_provenance: runtimeProvenance,
+				question_ids: ["question-migration"],
+				final_response: { text: null, format: "markdown", source: null, artifact_path: null, truncated: false },
+				evidence: [],
+				error: null,
+				liveness: {},
+				created_at: migrationAt,
+				updated_at: migrationAt,
+				started_at: migrationAt,
+				completed_at: answered ? migrationAt : null,
+				terminal_fence: answered ? { epoch: 2, status: "completed", reason: null, at: migrationAt } : null,
+			};
+			const binding = answered ? "answered-migration-binding" : "pending-migration-binding";
+			transaction.canonical.questions["question-migration"] = {
+				question_id: "question-migration",
+				authority_id: authorityId,
+				session_id: sessionId,
+				turn_id: "turn-migration",
+				endpoint_incarnation: legacyEndpointIncarnation,
+				stage: "deep-interview",
+				kind: "question",
+				prompt: "Answer the migration question",
+				status: answered ? "answered" : "pending",
+				binding_plaintext: binding,
+				binding_sha256: createHash("sha256").update(binding).digest("hex"),
+				codec: {
+					schema_version: 1,
+					labels: ["Continue"],
+					recommended_index: null,
+					multi: false,
+					allow_empty: false,
+					other_allowed: true,
+					clarification_allowed: true,
+				},
+				claim_fence_epoch: answered ? 1 : null,
+				answer_request_id: answered ? "answer-migration" : null,
+				created_at: migrationAt,
+				updated_at: migrationAt,
+				answered_at: answered ? migrationAt : null,
+				history: answered
+					? [
+							{ at: migrationAt, status: "pending", reason: null },
+							{ at: migrationAt, status: "answered", reason: null },
+						]
+					: [{ at: migrationAt, status: "pending", reason: null }],
+			};
+			transaction.canonical.gate_authorities[authorityId] = {
+				authority: {
+					namespace_id: namespaceId,
+					session_id: sessionId,
+					endpoint_incarnation: legacyEndpointIncarnation,
+					gate_id: "gate-migration",
+				},
+				observation: { kind: "valid", first_provenance: runtimeProvenance },
+				outcome: answered
+					? { state: "answered", turn_id: "turn-migration", question_id: "question-migration" }
+					: { state: "pending", turn_id: "turn-migration", question_id: "question-migration" },
+				first_seen_at: migrationAt,
+				updated_at: migrationAt,
+			};
+			if (answered) {
+				const answerHash = createHash("sha256").update("answer").digest("hex");
+				const bindingHash = createHash("sha256").update(binding).digest("hex");
+				transaction.requests.answers["answer-key"] = {
+					request_id: "answer-migration",
+					key_digest: "answer-key",
+					request_digest: "answer-request-digest",
+					answer_hash: answerHash,
+					answer_binding_sha256: bindingHash,
+					authority_id: authorityId,
+					question_id: "question-migration",
+					turn_id: "turn-migration",
+					endpoint_incarnation: legacyEndpointIncarnation,
+					sdk_idempotency_key: "answer-migration",
+					claim_fence_epoch: 1,
+					phase: "completed",
+					safe_receipt: {
+						status: "accepted",
+						answer_hash: answerHash,
+						answer_binding_sha256: bindingHash,
+						authority_id: authorityId,
+						turn_id: "turn-migration",
+						endpoint_incarnation: legacyEndpointIncarnation,
+						claim_fence_epoch: 1,
+						resolved_at: migrationAt,
+					},
+					created_at: migrationAt,
+					updated_at: migrationAt,
+				};
+			}
+			transaction.canonical.queue.active_turn_id = answered ? null : "turn-migration";
+			transaction.canonical.desired_session_state = answered ? "completed" : "needs_user_input";
+		});
+		return { paths, namespaceId, sessionId, authorityId };
+	}
+
+	it("rekeys a pending gate authority and preserves one question.opened event", async () => {
+		await withTempRoot(async root => {
+			const {
+				paths,
+				namespaceId,
+				sessionId,
+				authorityId: legacyAuthorityId,
+			} = await seedGateMigrationState(root, false);
+			const before = await readSessionTransaction(paths, sessionId);
+			expect(before).not.toBeNull();
+			expect(Object.values(before!.outbox).filter(event => event.kind === "question.opened")).toHaveLength(1);
+
+			const currentAuthorityId = migrationAuthorityId(namespaceId, sessionId, currentEndpointIncarnation);
+			const rewritten = await rewriteSessionEndpointAuthority(
+				paths,
+				sessionId,
+				legacyEndpointIncarnation,
+				currentEndpointIncarnation,
+				"endpoint-file-pending",
+			);
+			expect(rewritten.broker).toMatchObject({
+				endpoint_incarnation: currentEndpointIncarnation,
+				endpoint_file_id: "endpoint-file-pending",
+			});
+			const migrated = await readSessionTransaction(paths, sessionId);
+			expect(migrated).not.toBeNull();
+			expect(Object.keys(migrated!.canonical.gate_authorities)).toEqual([currentAuthorityId]);
+			expect(migrated!.canonical.gate_authorities[legacyAuthorityId]).toBeUndefined();
+			expect(migrated!.canonical.gate_authorities[currentAuthorityId]).toMatchObject({
+				authority: { endpoint_incarnation: currentEndpointIncarnation, gate_id: "gate-migration" },
+				observation: { first_provenance: { endpoint_incarnation: currentEndpointIncarnation } },
+			});
+			expect(migrated!.canonical.questions["question-migration"]).toMatchObject({
+				authority_id: currentAuthorityId,
+				endpoint_incarnation: currentEndpointIncarnation,
+				status: "pending",
+			});
+			expect(Object.values(migrated!.outbox).filter(event => event.kind === "question.opened")).toHaveLength(1);
+			expect(
+				Object.values(migrated!.outbox).find(event => event.kind === "question.opened")?.payload.authority_id,
+			).toBe(currentAuthorityId);
+
+			await rewriteSessionEndpointAuthority(
+				paths,
+				sessionId,
+				legacyEndpointIncarnation,
+				currentEndpointIncarnation,
+				"endpoint-file-pending",
+			);
+			const replayed = await readSessionTransaction(paths, sessionId);
+			expect(Object.keys(replayed!.canonical.gate_authorities)).toEqual([currentAuthorityId]);
+			expect(Object.values(replayed!.outbox).filter(event => event.kind === "question.opened")).toHaveLength(1);
+		});
+	});
+
+	it("rekeys an answered gate authority without breaking its durable answer receipt", async () => {
+		await withTempRoot(async root => {
+			const {
+				paths,
+				namespaceId,
+				sessionId,
+				authorityId: legacyAuthorityId,
+			} = await seedGateMigrationState(root, true);
+			const currentAuthorityId = migrationAuthorityId(namespaceId, sessionId, currentEndpointIncarnation);
+			await rewriteSessionEndpointAuthority(
+				paths,
+				sessionId,
+				legacyEndpointIncarnation,
+				currentEndpointIncarnation,
+				"endpoint-file-answered",
+			);
+			const migrated = await readSessionTransaction(paths, sessionId);
+			expect(migrated).not.toBeNull();
+			expect(Object.keys(migrated!.canonical.gate_authorities)).toEqual([currentAuthorityId]);
+			expect(migrated!.canonical.gate_authorities[legacyAuthorityId]).toBeUndefined();
+			expect(migrated!.canonical.gate_authorities[currentAuthorityId]?.outcome).toEqual({
+				state: "answered",
+				turn_id: "turn-migration",
+				question_id: "question-migration",
+			});
+			expect(migrated!.canonical.questions["question-migration"]).toMatchObject({
+				authority_id: currentAuthorityId,
+				endpoint_incarnation: currentEndpointIncarnation,
+				status: "answered",
+				answer_request_id: "answer-migration",
+			});
+			expect(migrated!.requests.answers["answer-key"]).toMatchObject({
+				authority_id: currentAuthorityId,
+				endpoint_incarnation: currentEndpointIncarnation,
+				phase: "completed",
+				safe_receipt: {
+					authority_id: currentAuthorityId,
+					endpoint_incarnation: currentEndpointIncarnation,
+					status: "accepted",
+				},
+			});
+			expect(
+				Object.values(migrated!.outbox).find(event => event.kind === "question.opened")?.payload.authority_id,
+			).toBe(currentAuthorityId);
 		});
 	});
 });

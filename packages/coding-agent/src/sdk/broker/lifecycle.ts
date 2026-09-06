@@ -777,6 +777,7 @@ type LiveResumeRecord = {
 	endpointGeneration: number;
 	pid: number;
 	endpointMtimeMs?: number;
+	endpointFileId?: string;
 	processIncarnation?: string;
 	hostIncarnation?: string;
 	live: boolean;
@@ -819,6 +820,7 @@ function sameLiveResumeRecord(expected: LiveResumeRecord, current: LiveResumeRec
 		current.endpointGeneration === expected.endpointGeneration &&
 		current.pid === expected.pid &&
 		current.endpointMtimeMs === expected.endpointMtimeMs &&
+		current.endpointFileId === expected.endpointFileId &&
 		(current.hostIncarnation ?? current.processIncarnation) ===
 			(expected.hostIncarnation ?? expected.processIncarnation) &&
 		sameResumeLocator(current, expected.locator.cwd, expected.locator.stateRoot)
@@ -1938,7 +1940,10 @@ function exactLifecycleEndpointAbsent(root: string, id: string): boolean {
 	}
 }
 
-function sameRetirementIdentityAsRecord(identity: LifecycleRetirementIdentity, record: IndexedSession): boolean {
+function sameRetirementIdentityLegacyFieldsAsRecord(
+	identity: LifecycleRetirementIdentity,
+	record: IndexedSession,
+): boolean {
 	return (
 		identity.sessionId === record.sessionId &&
 		path.resolve(identity.stateRoot) === path.resolve(record.locator.stateRoot) &&
@@ -1951,12 +1956,20 @@ function sameRetirementIdentityAsRecord(identity: LifecycleRetirementIdentity, r
 	);
 }
 
+function sameRetirementIdentityAsRecord(identity: LifecycleRetirementIdentity, record: IndexedSession): boolean {
+	return (
+		sameRetirementIdentityLegacyFieldsAsRecord(identity, record) && identity.endpointFileId === record.endpointFileId
+	);
+}
+
 function findRetirementRecord(
 	broker: Broker,
 	id: string,
 	receipt: LifecycleRetirementReceipt | undefined,
 ): IndexedSession | undefined {
 	if (receipt !== undefined) {
+		if (receipt.identity.endpointFileId === undefined)
+			return broker.index.findUniqueHistoricalFileBoundSessionIdentity(receipt.identity);
 		const historical = broker.index.findHistoricalSessionIdentity(receipt.identity);
 		if (historical) return historical;
 		// A later registration may make a same-ID successor the public authority.
@@ -1965,7 +1978,7 @@ function findRetirementRecord(
 		const staged = broker.index
 			.listSessionIdentities()
 			.find(session => session.sessionId === id && sameRetirementIdentityAsRecord(receipt.identity, session));
-		if (staged) return staged;
+		return staged;
 	}
 	const current = broker.index.listSessions().sessions.find(session => session.sessionId === id);
 	return current;
@@ -2100,6 +2113,7 @@ function retirementIdentityFromInput(
 	const processIdentity = text(input.processIncarnation);
 	const hostIdentity = text(input.hostIncarnation);
 	const remoteCreateKey = text(input.remoteCreateKey);
+	const suppliedEndpointFileId = text(input.endpointFileId);
 	const endpointGeneration = input.endpointGeneration;
 	const endpointMtimeMs = input.endpointMtimeMs;
 	if (
@@ -2109,6 +2123,7 @@ function retirementIdentityFromInput(
 		!processIdentity ||
 		!hostIdentity ||
 		!remoteCreateKey ||
+		(input.endpointFileId !== undefined && suppliedEndpointFileId === undefined) ||
 		typeof endpointGeneration !== "number" ||
 		!Number.isSafeInteger(endpointGeneration) ||
 		endpointGeneration <= 0 ||
@@ -2121,11 +2136,19 @@ function retirementIdentityFromInput(
 		!boundedRetirementString(hostIdentity, MAX_PROCESS_INCARNATION_LENGTH)
 	)
 		return fail("invalid_input", "Retirement requires the complete indexed identity proof.");
+	// Pre-file-identity callers may omit endpoint_file_id. In that one legacy
+	// shape, upgrade from the exact current indexed row. A caller-supplied ID
+	// must already equal the indexed row; this rejects arbitrary IDs for both
+	// identity-bearing and identity-less rows.
+	if (suppliedEndpointFileId !== undefined && suppliedEndpointFileId !== record.endpointFileId)
+		return fail("retirement_proof_stale", "Retirement endpoint file identity does not match the indexed session.");
+	const endpointFileId = record.endpointFileId;
 	const identity: LifecycleRetirementIdentity = {
 		sessionId: record.sessionId,
 		stateRoot,
 		endpointGeneration,
 		endpointMtimeMs,
+		...(endpointFileId === undefined ? {} : { endpointFileId }),
 		pid: record.pid,
 		processIncarnation: processIdentity,
 		hostIncarnation: hostIdentity,
@@ -2139,6 +2162,7 @@ function retirementIdentityFromInput(
 		path.resolve(record.locator.stateRoot) !== path.resolve(stateRoot) ||
 		record.endpointGeneration !== endpointGeneration ||
 		record.endpointMtimeMs !== endpointMtimeMs ||
+		record.endpointFileId !== endpointFileId ||
 		record.lifecycleRequestId !== lifecycleRequestId ||
 		(record.processIncarnation ?? record.hostIncarnation) !== processIdentity ||
 		(record.hostIncarnation ?? record.processIncarnation) !== hostIdentity
@@ -2161,6 +2185,7 @@ function retirementProof(identity: LifecycleRetirementIdentity, indexSeq?: numbe
 			stateRoot: identity.stateRoot,
 			endpointGeneration: identity.endpointGeneration,
 			endpointMtimeMs: identity.endpointMtimeMs,
+			...(identity.endpointFileId === undefined ? {} : { endpointFileId: identity.endpointFileId }),
 			processIncarnation: identity.processIncarnation,
 			hostIncarnation: identity.hostIncarnation,
 			lifecycleRequestId: identity.lifecycleRequestId,
@@ -2195,6 +2220,22 @@ async function executeUncertainRetirement(
 	let retirementIdentity: LifecycleRetirementIdentity;
 	let create = receipt ? broker.ledger.get(receipt.identity.createIdentity) : undefined;
 	if (receipt) {
+		if (
+			receipt.identity.endpointFileId === undefined &&
+			record.endpointFileId !== undefined &&
+			sameRetirementIdentityLegacyFieldsAsRecord(receipt.identity, record)
+		) {
+			const upgradedReceipt: LifecycleRetirementReceipt = {
+				...receipt,
+				identity: { ...receipt.identity, endpointFileId: record.endpointFileId },
+			};
+			cleanup = { ...cleanup!, uncertainRetirement: upgradedReceipt };
+			await broker.ledger.transition(identity, "effect_started", {
+				intendedSessionId: id,
+				response: fail("cleanup_pending", "Uncertain session retirement receipt was upgraded.", cleanup),
+			});
+			receipt = upgradedReceipt;
+		}
 		const suppliedIdentity = retirementIdentityFromInput(input, record, receipt.identity.createIdentity);
 		if (isLifecycleBrokerResponse(suppliedIdentity)) return suppliedIdentity;
 		if (
@@ -2382,6 +2423,7 @@ async function executeUncertainRetirement(
 					...(record.processIncarnation === undefined ? {} : { processIncarnation: record.processIncarnation }),
 					...(record.hostIncarnation === undefined ? {} : { hostIncarnation: record.hostIncarnation }),
 					...(record.endpointMtimeMs === undefined ? {} : { endpointMtimeMs: record.endpointMtimeMs }),
+					...(record.endpointFileId === undefined ? {} : { endpointFileId: record.endpointFileId }),
 					...(record.lifecycleRequestId === undefined ? {} : { lifecycleRequestId: record.lifecycleRequestId }),
 				});
 				const verifiedIndexSeq = broker.index.findSessionClosedEvidence(record);
@@ -3174,6 +3216,7 @@ type LifecycleRetirementIdentity = {
 	stateRoot: string;
 	endpointGeneration: number;
 	endpointMtimeMs: number;
+	endpointFileId?: string;
 	pid: number;
 	processIncarnation: string;
 	hostIncarnation: string;
@@ -3211,6 +3254,7 @@ function isLifecycleRetirementIdentity(value: unknown): value is LifecycleRetire
 					"stateRoot",
 					"endpointGeneration",
 					"endpointMtimeMs",
+					"endpointFileId",
 					"pid",
 					"processIncarnation",
 					"hostIncarnation",
@@ -3234,6 +3278,7 @@ function isLifecycleRetirementIdentity(value: unknown): value is LifecycleRetire
 		typeof identity.endpointMtimeMs === "number" &&
 		Number.isFinite(identity.endpointMtimeMs) &&
 		identity.endpointMtimeMs > 0 &&
+		(identity.endpointFileId === undefined || boundedRetirementString(identity.endpointFileId, 256)) &&
 		typeof identity.pid === "number" &&
 		Number.isSafeInteger(identity.pid) &&
 		identity.pid > 0 &&
@@ -3477,6 +3522,7 @@ async function recordTerminalUncertain(
 			...(registered.processIncarnation === undefined ? {} : { processIncarnation: registered.processIncarnation }),
 			...(registered.hostIncarnation === undefined ? {} : { hostIncarnation: registered.hostIncarnation }),
 			...(registered.endpointMtimeMs === undefined ? {} : { endpointMtimeMs: registered.endpointMtimeMs }),
+			...(registered.endpointFileId === undefined ? {} : { endpointFileId: registered.endpointFileId }),
 			...(registered.lifecycleRequestId === undefined
 				? expected?.effectMarker === undefined
 					? {}
@@ -3747,6 +3793,7 @@ async function removeExactDeadSessionEndpoint(
 		current.endpointGeneration !== record.endpointGeneration ||
 		current.pid !== record.pid ||
 		current.endpointMtimeMs !== record.endpointMtimeMs ||
+		current.endpointFileId !== record.endpointFileId ||
 		current.lifecycleRequestId !== record.lifecycleRequestId ||
 		current.processIncarnation !== record.processIncarnation ||
 		path.resolve(current.locator.stateRoot) !== path.resolve(record.locator.stateRoot)
@@ -3815,13 +3862,14 @@ async function removeExactDeadSessionEndpoint(
 		if (bytesRead !== Number(metadata.size)) return false;
 		const source = bytes.subarray(0, bytesRead);
 		const endpoint = JSON.parse(source.toString("utf8")) as { sessionId?: unknown; pid?: unknown; stale?: unknown };
-		const indexedEndpointMtimeMs = Math.trunc(record.endpointMtimeMs);
 		if (
 			endpoint.sessionId !== id ||
 			endpoint.pid !== record.pid ||
 			endpoint.stale === true ||
-			!Number.isSafeInteger(indexedEndpointMtimeMs) ||
-			metadata.mtimeNs / 1_000_000n !== BigInt(indexedEndpointMtimeMs)
+			!matchesIndexedEndpointFile(
+				{ dev: metadata.dev, ino: metadata.ino, mtimeMs: Number(metadata.mtimeNs) / 1_000_000 },
+				record,
+			)
 		)
 			return false;
 		await handle.close();
@@ -4034,7 +4082,11 @@ async function currentReadyAuthority(
 		return {
 			endpoint: endpoint as Record<string, unknown>,
 			endpointSource,
-			endpointMtimeMs: endpointFile.mtimeMs,
+			// Lifecycle responses are Router adoption inputs. Publish the index's
+			// canonical millisecond representation so the provisional attachment
+			// mints the same persisted authority ID as ordinary reattachment. The
+			// descriptor itself was already matched to this row above.
+			endpointMtimeMs: record.endpointMtimeMs!,
 			...(record.endpointFileId === undefined ? {} : { endpointFileId: record.endpointFileId }),
 			endpointGeneration: record.endpointGeneration,
 		};
@@ -4793,6 +4845,7 @@ type CloseRecord = {
 	endpointGeneration: number;
 	pid: number;
 	endpointMtimeMs?: number;
+	endpointFileId?: string;
 	lifecycleRequestId?: string;
 	processIncarnation?: string;
 };
@@ -4810,9 +4863,10 @@ function endpointIncarnation(record: CloseRecord, sessionId: string): string | u
 		return undefined;
 	return createHash("sha256")
 		.update(
-			JSON.stringify({
+			canonicalJson({
 				endpointGeneration: record.endpointGeneration,
 				endpointMtimeMs: record.endpointMtimeMs,
+				...(record.endpointFileId === undefined ? {} : { endpointFileId: record.endpointFileId }),
 				pid: record.pid,
 				sessionId,
 			}),
@@ -4847,6 +4901,7 @@ function sameCloseAuthority(authority: CloseAuthority, record: CloseRecord, sess
 function sameCloseStoredProcessIdentity(expected: CloseRecord, current: CloseRecord): boolean {
 	return (
 		current.pid === expected.pid &&
+		current.endpointFileId === expected.endpointFileId &&
 		typeof expected.processIncarnation === "string" &&
 		expected.processIncarnation.length > 0 &&
 		current.processIncarnation === expected.processIncarnation &&
@@ -4870,6 +4925,7 @@ function sameCloseEndpointIdentity(expected: CloseRecord, current: CloseRecord):
 		current.pid === expected.pid &&
 		current.endpointMtimeMs !== undefined &&
 		expected.endpointMtimeMs !== undefined &&
+		current.endpointFileId === expected.endpointFileId &&
 		current.lifecycleRequestId === expected.lifecycleRequestId &&
 		path.resolve(current.locator.cwd) === path.resolve(expected.locator.cwd) &&
 		path.resolve(current.locator.stateRoot) === path.resolve(expected.locator.stateRoot)
@@ -4886,6 +4942,7 @@ function sameCloseGeneration(expected: CloseRecord, current: CloseRecord & { liv
 		current.endpointGeneration === expected.endpointGeneration &&
 		current.pid === expected.pid &&
 		current.endpointMtimeMs === expected.endpointMtimeMs &&
+		current.endpointFileId === expected.endpointFileId &&
 		current.lifecycleRequestId === expected.lifecycleRequestId &&
 		current.processIncarnation === expected.processIncarnation &&
 		path.resolve(current.locator.cwd) === path.resolve(expected.locator.cwd) &&
@@ -4998,6 +5055,7 @@ async function executeLifecycleResponse(
 						endpointGeneration: current.endpointGeneration,
 						pid: current.pid,
 						endpointMtimeMs: current.endpointMtimeMs,
+						...(current.endpointFileId === undefined ? {} : { endpointFileId: current.endpointFileId }),
 						endpoint: endpoint.result,
 						reused: true,
 					},
@@ -5478,6 +5536,7 @@ async function executeLifecycleResponse(
 				endpointGeneration: verified.endpointGeneration,
 				pid: verified.endpoint.pid,
 				endpointMtimeMs: verified.endpointMtimeMs,
+				...(verified.endpointFileId === undefined ? {} : { endpointFileId: verified.endpointFileId }),
 				endpoint: verified.endpoint,
 				// Public, ledger-replayable evidence of the bootstrap authority that
 				// reached this runtime. The private key never enters the response.
@@ -6320,6 +6379,7 @@ async function appendSessionDeletedEvidence(broker: Broker, record: IndexedSessi
 		...(record.processIncarnation === undefined ? {} : { processIncarnation: record.processIncarnation }),
 		...(record.hostIncarnation === undefined ? {} : { hostIncarnation: record.hostIncarnation }),
 		...(record.endpointMtimeMs === undefined ? {} : { endpointMtimeMs: record.endpointMtimeMs }),
+		...(record.endpointFileId === undefined ? {} : { endpointFileId: record.endpointFileId }),
 		...(record.lifecycleRequestId === undefined ? {} : { lifecycleRequestId: record.lifecycleRequestId }),
 	});
 }

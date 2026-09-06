@@ -135,8 +135,8 @@ export type ChatDaemonAction = "stop" | "reload";
  * pre-upgrade owner cannot retain the queue race fixed by #5120.
  */
 export const CHAT_DAEMON_GENERATIONS: Readonly<Record<ChatDaemonKind, number>> = {
-	discord: 73,
-	slack: 79,
+	discord: 74,
+	slack: 80,
 };
 
 export function chatDaemonGeneration(kind: ChatDaemonKind): number {

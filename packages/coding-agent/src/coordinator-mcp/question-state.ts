@@ -32,6 +32,7 @@ export interface CanonicalSessionSnapshotV1 {
 		endpoint_url: string;
 		endpoint_generation: number;
 		endpoint_incarnation: string;
+		endpoint_file_id?: string;
 		sidecar_verifier: { key_id: string; public_key: string };
 	};
 	ephemeral: boolean;
@@ -307,6 +308,7 @@ export interface CreationRetirementProofV1 {
 	state_root: string;
 	endpoint_generation: number;
 	endpoint_mtime_ms: number;
+	endpoint_file_id?: string;
 	process_incarnation: string;
 	host_incarnation: string;
 	lifecycle_request_id: string;
@@ -320,6 +322,7 @@ export interface CreationRetirementBrokerProofV1 {
 	state_root: string;
 	endpoint_generation: number;
 	endpoint_mtime_ms: number;
+	endpoint_file_id?: string;
 	process_incarnation: string;
 	host_incarnation: string;
 	lifecycle_request_id: string;
@@ -386,6 +389,8 @@ const PUBLIC_CLAIM_LEASE_MS = 30_000;
 export const COORDINATOR_SESSION_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 export const COORDINATOR_REPORT_ID_PATTERN = /^report-[a-f0-9]{64}$/;
 const digest = (value: string): string => createHash("sha256").update(value).digest("hex");
+const gateAuthorityId = (namespaceId: string, sessionId: string, endpointIncarnation: string, gateId: string): string =>
+	digest(`${namespaceId}\0${sessionId}\0${endpointIncarnation}\0${gateId}`);
 const canonicalJson = (value: unknown): string => {
 	if (value === null || typeof value !== "object") return JSON.stringify(value);
 	if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
@@ -1426,33 +1431,306 @@ export async function withSessionTransaction<T>(
 			const transaction = await readTransactionJson<CoordinatorSessionTransactionV1>(file);
 			if (!transaction) throw new Error("resource_gone");
 			assertTransaction(transaction, path.basename(paths.root), sessionId);
-			const beforeDigest = digest(JSON.stringify(transaction));
-			normalizeOutbox(transaction);
-			const result = await operation(transaction);
-			normalizeOutbox(transaction);
-			const beforeCompaction = JSON.parse(JSON.stringify(transaction)) as CoordinatorSessionTransactionV1;
-			compactTransaction(transaction);
-			await archiveCompactedHistory(paths, beforeCompaction, transaction);
-			if (digest(JSON.stringify(transaction)) === beforeDigest) return result;
-			transaction.projection.scheduler_pending_revision = transaction.revision + 1;
-			transaction.projection.scheduler_digest = digest(
-				JSON.stringify({
-					session_id: transaction.session_id,
-					revision: transaction.revision + 1,
-					active: transaction.canonical.queue.active_turn_id !== null,
-					state: transaction.canonical.desired_session_state,
-				}),
-			);
-			transaction.revision++;
-			// Callers mutate this authoritative object in place. Validate the complete
-			// post-image after compaction and revision/projection updates so malformed
-			// ingress can never poison the WAL.
-			assertTransaction(transaction, path.basename(paths.root), sessionId);
-			await writeAtomic(file, transaction);
-			return result;
+			return await applySessionTransactionMutation(paths, sessionId, transaction, operation);
 		},
 		lockOptions(options.signal),
 	);
+}
+
+/** Applies one canonical WAL mutation while its session lock is held. */
+async function applySessionTransactionMutation<T>(
+	paths: CoordinatorStatePaths,
+	sessionId: string,
+	transaction: CoordinatorSessionTransactionV1,
+	operation: (transaction: CoordinatorSessionTransactionV1) => Promise<T>,
+): Promise<T> {
+	const beforeDigest = digest(JSON.stringify(transaction));
+	normalizeOutbox(transaction);
+	const result = await operation(transaction);
+	normalizeOutbox(transaction);
+	const beforeCompaction = JSON.parse(JSON.stringify(transaction)) as CoordinatorSessionTransactionV1;
+	compactTransaction(transaction);
+	await archiveCompactedHistory(paths, beforeCompaction, transaction);
+	if (digest(JSON.stringify(transaction)) === beforeDigest) return result;
+	transaction.projection.scheduler_pending_revision = transaction.revision + 1;
+	transaction.projection.scheduler_digest = digest(
+		JSON.stringify({
+			session_id: transaction.session_id,
+			revision: transaction.revision + 1,
+			active: transaction.canonical.queue.active_turn_id !== null,
+			state: transaction.canonical.desired_session_state,
+		}),
+	);
+	transaction.revision++;
+	// Callers mutate this authoritative object in place. Validate the complete
+	// post-image after compaction and revision/projection updates so malformed
+	// ingress can never poison the WAL.
+	assertTransaction(transaction, path.basename(paths.root), sessionId);
+	await writeAtomic(transactionPath(paths, sessionId), transaction);
+	return result;
+}
+
+/** Rewrites every endpoint-bearing reference in one canonical WAL image. */
+function rewriteSessionEndpointReferences(
+	transaction: CoordinatorSessionTransactionV1,
+	expectedLegacyEndpointIncarnation: string,
+	currentEndpointIncarnation: string,
+): void {
+	const broker = transaction.canonical.session.broker;
+	const legacyAuthorities = transaction.canonical.gate_authorities;
+	const authorityIds = new Map<string, string>();
+	const authorities: Record<string, GateAuthorityEntryV1> = {};
+	for (const [legacyAuthorityId, authority] of Object.entries(legacyAuthorities)) {
+		const authorityId = gateAuthorityId(
+			transaction.namespace_id,
+			transaction.session_id,
+			currentEndpointIncarnation,
+			authority.authority.gate_id,
+		);
+		if (authorities[authorityId] !== undefined) throw new Error("state_corrupt");
+		authorityIds.set(legacyAuthorityId, authorityId);
+		const observation =
+			authority.observation.kind === "valid"
+				? {
+						...authority.observation,
+						first_provenance: {
+							...authority.observation.first_provenance,
+							endpoint_incarnation: currentEndpointIncarnation,
+						},
+					}
+				: authority.observation;
+		authorities[authorityId] = {
+			...authority,
+			authority: {
+				...authority.authority,
+				endpoint_incarnation: currentEndpointIncarnation,
+			},
+			observation,
+		};
+	}
+	const remapAuthorityId = (legacyAuthorityId: unknown): string => {
+		if (typeof legacyAuthorityId !== "string") throw new Error("state_corrupt");
+		const authorityId = authorityIds.get(legacyAuthorityId);
+		if (!authorityId) throw new Error("state_corrupt");
+		return authorityId;
+	};
+	for (const question of Object.values(transaction.canonical.questions))
+		question.authority_id = remapAuthorityId(question.authority_id);
+	for (const request of Object.values(transaction.requests.answers)) {
+		request.authority_id = remapAuthorityId(request.authority_id);
+		if (request.safe_receipt) request.safe_receipt.authority_id = remapAuthorityId(request.safe_receipt.authority_id);
+	}
+	for (const event of Object.values(transaction.outbox))
+		if (Object.hasOwn(event.payload, "authority_id"))
+			event.payload.authority_id = remapAuthorityId(event.payload.authority_id);
+	rewriteOperationEndpointReferences(transaction, expectedLegacyEndpointIncarnation, currentEndpointIncarnation);
+	broker.endpoint_incarnation = currentEndpointIncarnation;
+	if (transaction.endpoint === null) {
+		transaction.endpoint = { incarnation: currentEndpointIncarnation, observed_at: new Date().toISOString() };
+	} else {
+		transaction.endpoint.incarnation = currentEndpointIncarnation;
+	}
+	for (const turn of Object.values(transaction.canonical.turns))
+		if (turn.runtime_provenance) turn.runtime_provenance.endpoint_incarnation = currentEndpointIncarnation;
+	transaction.canonical.gate_authorities = authorities;
+	for (const question of Object.values(transaction.canonical.questions))
+		question.endpoint_incarnation = currentEndpointIncarnation;
+	for (const request of Object.values(transaction.requests.answers)) {
+		request.endpoint_incarnation = currentEndpointIncarnation;
+		if (request.safe_receipt) request.safe_receipt.endpoint_incarnation = currentEndpointIncarnation;
+	}
+}
+
+function rewriteOperationEndpointReferences(
+	transaction: CoordinatorSessionTransactionV1,
+	expectedLegacyEndpointIncarnation: string,
+	currentEndpointIncarnation: string,
+): void {
+	for (const request of Object.values(transaction.requests.operations)) {
+		const intentEndpoint = request.intent.endpoint_incarnation;
+		if (intentEndpoint === undefined) continue;
+		if (intentEndpoint !== expectedLegacyEndpointIncarnation && intentEndpoint !== currentEndpointIncarnation)
+			throw new Error("endpoint_stale");
+		if (intentEndpoint === expectedLegacyEndpointIncarnation)
+			request.intent.endpoint_incarnation = currentEndpointIncarnation;
+	}
+}
+
+function assertEndpointAuthorityMigrationInput(
+	expectedLegacyEndpointIncarnation: string,
+	currentEndpointIncarnation: string,
+	endpointFileId: string,
+): void {
+	if (
+		!/^[a-f0-9]{64}$/.test(expectedLegacyEndpointIncarnation) ||
+		!/^[a-f0-9]{64}$/.test(currentEndpointIncarnation) ||
+		endpointFileId.length === 0 ||
+		endpointFileId.length > 256 ||
+		/[\u0000-\u001f\u007f]/u.test(endpointFileId)
+	)
+		throw new Error("state_corrupt");
+}
+
+/**
+ * Rebinds a pre-file-identity session WAL after the broker has proved the exact
+ * current endpoint row. The caller supplies both digests so this helper cannot
+ * silently adopt an unrelated successor; the WAL lock makes the rewrite durable
+ * before any projection is refreshed.
+ */
+export async function rewriteSessionEndpointAuthority(
+	paths: CoordinatorStatePaths,
+	sessionId: string,
+	expectedLegacyEndpointIncarnation: string,
+	currentEndpointIncarnation: string,
+	endpointFileId: string,
+	options: { signal?: AbortSignal } = {},
+): Promise<CanonicalSessionSnapshotV1> {
+	assertEndpointAuthorityMigrationInput(expectedLegacyEndpointIncarnation, currentEndpointIncarnation, endpointFileId);
+	let rewritten: CanonicalSessionSnapshotV1 | null = null;
+	await withSessionTransaction(
+		paths,
+		sessionId,
+		async transaction => {
+			const broker = transaction.canonical.session.broker;
+			if (broker.endpoint_file_id !== undefined) {
+				if (
+					broker.endpoint_file_id !== endpointFileId ||
+					broker.endpoint_incarnation !== currentEndpointIncarnation
+				)
+					throw new Error("endpoint_stale");
+				rewritten = transaction.canonical.session;
+				return;
+			}
+			if (broker.endpoint_incarnation !== expectedLegacyEndpointIncarnation) throw new Error("endpoint_stale");
+			rewriteSessionEndpointReferences(transaction, expectedLegacyEndpointIncarnation, currentEndpointIncarnation);
+			broker.endpoint_file_id = endpointFileId;
+			rewritten = transaction.canonical.session;
+		},
+		options,
+	);
+	if (!rewritten) throw new Error("state_corrupt");
+	return rewritten;
+}
+
+function rewritePendingDeletionEndpointAuthorities(
+	registry: NamespaceRegistryV1,
+	sessionId: string,
+	expectedLegacyEndpointIncarnation: string,
+	currentEndpointIncarnation: string,
+): void {
+	for (const entry of Object.values(registry.deletions)) {
+		if (entry.session_id !== sessionId || entry.phase === "completed") continue;
+		if (entry.endpoint_incarnation === expectedLegacyEndpointIncarnation) {
+			entry.endpoint_incarnation = currentEndpointIncarnation;
+			entry.updated_at = new Date().toISOString();
+			continue;
+		}
+		if (entry.endpoint_incarnation !== currentEndpointIncarnation) throw new Error("endpoint_stale");
+	}
+}
+
+/**
+ * Migrates a legacy endpoint while holding the namespace registry lock before
+ * the session WAL lock. Pending deletion manifests and their operation intents
+ * remain the same idempotent operation, but now target the post-image authority.
+ */
+export async function rewriteSessionEndpointAuthorityAndDeletions(
+	paths: CoordinatorStatePaths,
+	sessionId: string,
+	expectedLegacyEndpointIncarnation: string,
+	currentEndpointIncarnation: string,
+	endpointFileId: string,
+	options: { signal?: AbortSignal } = {},
+): Promise<CanonicalSessionSnapshotV1> {
+	assertEndpointAuthorityMigrationInput(expectedLegacyEndpointIncarnation, currentEndpointIncarnation, endpointFileId);
+	let rewritten: CanonicalSessionSnapshotV1 | null = null;
+	await withNamespaceRegistry(
+		paths,
+		async registry => {
+			await withFileLock(
+				transactionLockPath(paths, sessionId),
+				async () => {
+					const file = transactionPath(paths, sessionId);
+					const transaction = await readTransactionJson<CoordinatorSessionTransactionV1>(file);
+					if (!transaction) throw new Error("resource_gone");
+					assertTransaction(transaction, path.basename(paths.root), sessionId);
+					let correlatedCreation: CreationRequestV1 | undefined;
+					let migratedCreationIntent: CanonicalCreateIntentV1 | undefined;
+					for (const creation of Object.values(registry.creations)) {
+						const intent = creation.canonical_create_intent;
+						if (creation.session_id !== sessionId || intent?.session.session_id !== sessionId) continue;
+						const migrated = structuredClone(intent);
+						if (migrated.session.broker.endpoint_incarnation === expectedLegacyEndpointIncarnation)
+							migrated.session.broker.endpoint_incarnation = currentEndpointIncarnation;
+						else if (migrated.session.broker.endpoint_incarnation !== currentEndpointIncarnation) continue;
+						migrated.session.broker.endpoint_file_id = endpointFileId;
+						if (
+							transaction.creation_intent_digest !== creationIntentDigest(intent) &&
+							transaction.creation_intent_digest !== creationIntentDigest(migrated)
+						)
+							continue;
+						if (correlatedCreation) throw new Error("state_corrupt");
+						correlatedCreation = creation;
+						migratedCreationIntent = migrated;
+					}
+					await applySessionTransactionMutation(paths, sessionId, transaction, async current => {
+						const broker = current.canonical.session.broker;
+						if (broker.endpoint_file_id !== undefined) {
+							if (
+								broker.endpoint_file_id !== endpointFileId ||
+								broker.endpoint_incarnation !== currentEndpointIncarnation
+							)
+								throw new Error("endpoint_stale");
+						} else {
+							if (broker.endpoint_incarnation !== expectedLegacyEndpointIncarnation)
+								throw new Error("endpoint_stale");
+							rewriteSessionEndpointReferences(
+								current,
+								expectedLegacyEndpointIncarnation,
+								currentEndpointIncarnation,
+							);
+							broker.endpoint_file_id = endpointFileId;
+						}
+						rewritePendingDeletionEndpointAuthorities(
+							registry,
+							sessionId,
+							expectedLegacyEndpointIncarnation,
+							currentEndpointIncarnation,
+						);
+						for (const entry of Object.values(registry.deletions)) {
+							if (entry.session_id !== sessionId || entry.phase === "completed") continue;
+							const operation = current.requests.operations[entry.operation_id];
+							if (operation?.intent.endpoint_incarnation === expectedLegacyEndpointIncarnation)
+								operation.intent.endpoint_incarnation = currentEndpointIncarnation;
+						}
+						if (migratedCreationIntent)
+							current.creation_intent_digest = creationIntentDigest(migratedCreationIntent);
+						rewritten = current.canonical.session;
+					});
+					if (correlatedCreation && migratedCreationIntent) {
+						const walDigest = digest(JSON.stringify(transaction));
+						if (
+							correlatedCreation.endpoint_incarnation !== currentEndpointIncarnation ||
+							canonicalJson(correlatedCreation.canonical_create_intent) !==
+								canonicalJson(migratedCreationIntent) ||
+							correlatedCreation.wal_revision !== transaction.revision ||
+							correlatedCreation.wal_digest !== walDigest
+						) {
+							correlatedCreation.endpoint_incarnation = currentEndpointIncarnation;
+							correlatedCreation.canonical_create_intent = migratedCreationIntent;
+							correlatedCreation.wal_revision = transaction.revision;
+							correlatedCreation.wal_digest = walDigest;
+							correlatedCreation.updated_at = new Date().toISOString();
+						}
+					}
+				},
+				lockOptions(options.signal),
+			);
+		},
+		options,
+	);
+	if (!rewritten) throw new Error("state_corrupt");
+	return rewritten;
 }
 
 /** Remove a retained-session hint once its WAL has no unacknowledged deliveries. */
@@ -2444,6 +2722,11 @@ function assertCreationRetirementProofMatches(
 		proof.endpoint_generation <= 0 ||
 		!Number.isFinite(proof.endpoint_mtime_ms) ||
 		proof.endpoint_mtime_ms <= 0 ||
+		(proof.endpoint_file_id !== undefined &&
+			(typeof proof.endpoint_file_id !== "string" ||
+				proof.endpoint_file_id.length === 0 ||
+				proof.endpoint_file_id.length > 256 ||
+				/[\u0000-\u001f\u007f]/u.test(proof.endpoint_file_id))) ||
 		!proof.process_incarnation ||
 		!proof.host_incarnation ||
 		!proof.lifecycle_request_id ||
@@ -2460,6 +2743,7 @@ function assertCreationRetirementProofMatches(
 			path.resolve(session.cwd) !== path.resolve(proof.cwd) ||
 			path.resolve(session.cwd, ".gjc", "state") !== path.resolve(proof.state_root) ||
 			session.broker.endpoint_generation !== proof.endpoint_generation ||
+			session.broker.endpoint_file_id !== proof.endpoint_file_id ||
 			intent.kind === "register" ||
 			intent.remote_create_key !== proof.remote_create_key
 		)
@@ -2467,6 +2751,38 @@ function assertCreationRetirementProofMatches(
 	}
 	const staged = includeStaged ? request.retirement_intent : undefined;
 	if (staged && !sameCreationRetirementProof(staged.proof, proof)) throw new Error("idempotency_conflict");
+}
+
+/** Upgrades only a legacy missing endpoint file identity after external exact-row proof. */
+export async function upgradeCreationRetirementEndpointFileId(
+	paths: CoordinatorStatePaths,
+	keyDigest: string,
+	legacyProof: CreationRetirementProofV1,
+	expectedLegacyEndpointIncarnation: string,
+	endpointFileId: string,
+): Promise<CreationRequestV1> {
+	return await withNamespaceRegistry(paths, async registry => {
+		const request = registry.creations[keyDigest];
+		if (!request) throw new Error("state_corrupt");
+		if (legacyProof.endpoint_file_id !== undefined || !endpointFileId) throw new Error("invalid_input");
+		const intent = request.canonical_create_intent;
+		if (!intent || intent.session.broker.endpoint_incarnation !== expectedLegacyEndpointIncarnation)
+			throw new Error("idempotency_conflict");
+		if (intent.session.broker.endpoint_file_id !== undefined) {
+			if (intent.session.broker.endpoint_file_id !== endpointFileId) throw new Error("idempotency_conflict");
+			assertCreationRetirementProofMatches(request, { ...legacyProof, endpoint_file_id: endpointFileId });
+			return request;
+		}
+		assertCreationRetirementProofMatches(request, legacyProof);
+		intent.session.broker.endpoint_file_id = endpointFileId;
+		if (request.retirement_intent) {
+			if (request.retirement_intent.proof.endpoint_file_id !== undefined) throw new Error("idempotency_conflict");
+			request.retirement_intent.proof.endpoint_file_id = endpointFileId;
+			request.retirement_intent.updated_at = new Date().toISOString();
+		}
+		request.updated_at = new Date().toISOString();
+		return request;
+	});
 }
 
 /** Claims retirement under the creation receipt before any broker effect. */
@@ -2553,6 +2869,7 @@ export async function recordCreationRetirementBrokerProof(
 			brokerProof.state_root !== proof.state_root ||
 			brokerProof.endpoint_generation !== proof.endpoint_generation ||
 			brokerProof.endpoint_mtime_ms !== proof.endpoint_mtime_ms ||
+			brokerProof.endpoint_file_id !== proof.endpoint_file_id ||
 			brokerProof.process_incarnation !== proof.process_incarnation ||
 			brokerProof.host_incarnation !== proof.host_incarnation ||
 			brokerProof.lifecycle_request_id !== proof.lifecycle_request_id ||

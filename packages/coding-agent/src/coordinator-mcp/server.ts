@@ -140,8 +140,10 @@ import {
 	removeSessionTransaction,
 	repairProjections,
 	replaceCreationRetirementIntent,
+	rewriteSessionEndpointAuthorityAndDeletions,
 	rotateClaimedCreationVerifier,
 	startCreationRemote,
+	upgradeCreationRetirementEndpointFileId,
 	withAdmittedSessionTransaction,
 	withNamespaceRegistry,
 	withSessionTransaction,
@@ -626,6 +628,7 @@ function toolSchema(name: CoordinatorToolName): {
 					state_root: { type: "string", description: "Exact indexed SDK state root." },
 					endpoint_generation: { type: "number" },
 					endpoint_mtime_ms: { type: "number" },
+					endpoint_file_id: { type: "string" },
 					process_incarnation: { type: "string" },
 					host_incarnation: { type: "string" },
 					lifecycle_request_id: { type: "string" },
@@ -1057,6 +1060,8 @@ function normalizeSession(session: Record<string, unknown>): Record<string, unkn
 		session.endpoint_generation > 0
 	)
 		normalized.endpoint_generation = session.endpoint_generation;
+	const endpointFileId = optionalString(session.endpoint_file_id ?? session.endpointFileId);
+	if (endpointFileId !== null) normalized.endpoint_file_id = endpointFileId;
 	const sidecarVerifier = asRecord(session.sidecar_verifier);
 	if (sidecarVerifier && typeof sidecarVerifier.key_id === "string" && typeof sidecarVerifier.public_key === "string")
 		normalized.sidecar_verifier = {
@@ -3475,6 +3480,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		const cwd = optionalString(session.cwd);
 		const brokerWorkspace = optionalString(session.broker_workspace);
 		const incarnation = optionalString(session.endpoint_incarnation);
+		const endpointFileId = optionalString(session.endpoint_file_id);
 		if (!cwd || !brokerWorkspace || !incarnation) throw new Error("state_corrupt");
 		return {
 			schema_version: 1,
@@ -3499,6 +3505,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				endpoint_url: "",
 				endpoint_generation: typeof session.endpoint_generation === "number" ? session.endpoint_generation : 0,
 				endpoint_incarnation: incarnation,
+				...(endpointFileId === null ? {} : { endpoint_file_id: endpointFileId }),
 				sidecar_verifier:
 					session.sidecar_verifier && typeof session.sidecar_verifier === "object"
 						? (session.sidecar_verifier as { key_id: string; public_key: string })
@@ -3526,6 +3533,9 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			broker_workspace: snapshot.broker.workspace,
 			endpoint_generation: snapshot.broker.endpoint_generation,
 			endpoint_incarnation: snapshot.broker.endpoint_incarnation,
+			...(snapshot.broker.endpoint_file_id === undefined
+				? {}
+				: { endpoint_file_id: snapshot.broker.endpoint_file_id }),
 			sidecar_verifier: snapshot.broker.sidecar_verifier,
 		});
 	}
@@ -3772,19 +3782,28 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		};
 	}
 
-	async function assertPersistedSessionAuthority(session: CanonicalSessionSnapshotV1): Promise<void> {
+	async function assertPersistedSessionAuthority(
+		session: CanonicalSessionSnapshotV1,
+	): Promise<CanonicalSessionSnapshotV1> {
 		if (!session.broker.workspace) throw new Error("coordinator_workspace_required");
 		await assertCoordinatorSessionLocations(config, session.cwd, session.broker.workspace, {
 			canonicalizePath: services.canonicalizePath,
 			platform,
 		});
+		return await migrateLegacySessionEndpointAuthority(session);
 	}
 
 	/** Every Codex handoff is scoped by the canonical WAL, never a retained projection. */
 	async function assertCanonicalHandoffAuthority(sessionId: string): Promise<void> {
 		const transaction = await readSessionTransaction(questionPaths, sessionId);
 		if (!transaction) throw new Error("resource_gone");
-		await assertPersistedSessionAuthority(transaction.canonical.session);
+		const session = transaction.canonical.session;
+		if (!session.broker.workspace) throw new Error("coordinator_workspace_required");
+		await assertCoordinatorSessionLocations(config, session.cwd, session.broker.workspace, {
+			canonicalizePath: services.canonicalizePath,
+			platform,
+		});
+		if (session.broker.endpoint_file_id !== undefined) await migrateLegacySessionEndpointAuthority(session);
 	}
 
 	async function authorizedCanonicalSessionIds(
@@ -3802,7 +3821,9 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			}
 			try {
 				await assertPersistedSessionAuthority(transaction.canonical.session);
-				authorized.set(sessionId, transaction.canonical.session.broker.endpoint_incarnation);
+				const current = await readSessionTransaction(questionPaths, sessionId);
+				if (!current) throw new Error("resource_gone");
+				authorized.set(sessionId, current.canonical.session.broker.endpoint_incarnation);
 			} catch (error) {
 				if (scopedSessionId === sessionId) throw error;
 			}
@@ -3876,20 +3897,21 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		);
 	}
 
-	async function ensureQuestionTransaction(sessionId: string): Promise<void> {
+	async function ensureQuestionTransaction(sessionId: string): Promise<CanonicalSessionSnapshotV1> {
 		await ensureQuestionStateReady();
 		try {
 			const transaction = await readSessionTransaction(questionPaths, sessionId);
 			if (!transaction) throw new Error("resource_gone");
-			await assertPersistedSessionAuthority(transaction.canonical.session);
+			const currentSession = await assertPersistedSessionAuthority(transaction.canonical.session);
 			await ensureSchedulerRoster(questionPaths, sessionId);
-			return;
+			return currentSession;
 		} catch (error) {
 			if (!(error instanceof Error) || error.message !== "resource_gone") throw error;
 		}
 		const session = asRecord(await readJsonFile(path.join(legacyNamespaceDir, "sessions", `${sessionId}.json`)));
 		if (!session) throw new Error("resource_gone");
 		const incarnation = optionalString(session.endpoint_incarnation);
+		const endpointFileId = optionalString(session.endpoint_file_id);
 		const cwd = optionalString(session.cwd);
 		const brokerWorkspace = optionalString(session.broker_workspace);
 		if (!incarnation || !cwd || !brokerWorkspace || !legacyScopeOwned(session)) throw new Error("resource_gone");
@@ -3905,7 +3927,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		const verifierKeyId = optionalString(projectedVerifier?.key_id);
 		const verifierPublicKey = optionalString(projectedVerifier?.public_key);
 		if (!verifierKeyId || !verifierPublicKey) throw new Error("legacy_projection_quarantined");
-		await createSessionTransaction(
+		const transaction = await createSessionTransaction(
 			questionPaths,
 			{
 				kind: "register",
@@ -3930,6 +3952,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 						endpoint_generation:
 							typeof session.endpoint_generation === "number" ? session.endpoint_generation : 0,
 						endpoint_incarnation: incarnation,
+						...(endpointFileId === null ? {} : { endpoint_file_id: endpointFileId }),
 						sidecar_verifier: { key_id: verifierKeyId, public_key: verifierPublicKey },
 					},
 					ephemeral: session.ephemeral === true,
@@ -3940,6 +3963,23 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			},
 			legacyProjection,
 		);
+		return await assertPersistedSessionAuthority(transaction.canonical.session);
+	}
+
+	/**
+	 * Acquire the session authority only after legacy state has been admitted and
+	 * any endpoint identity migration has committed. Callers must use this
+	 * returned snapshot rather than reading the projection before admission: the
+	 * migration rewrites both the WAL and its projection, and the canonical
+	 * post-image is the only safe attachment input during that transition.
+	 */
+	async function ensureCurrentSession(sessionId: string): Promise<Record<string, unknown> | null> {
+		try {
+			return sessionFromCreationSnapshot(await ensureQuestionTransaction(sessionId));
+		} catch (error) {
+			if (error instanceof Error && error.message === "resource_gone") return null;
+			throw error;
+		}
 	}
 
 	type RuntimeAdmissionToken = {
@@ -5428,6 +5468,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			state_root: typeof result.stateRoot === "string" ? result.stateRoot : "",
 			endpoint_generation: typeof result.endpointGeneration === "number" ? result.endpointGeneration : Number.NaN,
 			endpoint_mtime_ms: typeof result.endpointMtimeMs === "number" ? result.endpointMtimeMs : Number.NaN,
+			...(typeof result.endpointFileId === "string" ? { endpoint_file_id: result.endpointFileId } : {}),
 			process_incarnation: typeof result.processIncarnation === "string" ? result.processIncarnation : "",
 			host_incarnation: typeof result.hostIncarnation === "string" ? result.hostIncarnation : "",
 			lifecycle_request_id: typeof result.lifecycleRequestId === "string" ? result.lifecycleRequestId : "",
@@ -5441,6 +5482,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			broker.state_root !== expected.state_root ||
 			broker.endpoint_generation !== expected.endpoint_generation ||
 			broker.endpoint_mtime_ms !== expected.endpoint_mtime_ms ||
+			broker.endpoint_file_id !== expected.endpoint_file_id ||
 			broker.process_incarnation !== expected.process_incarnation ||
 			broker.host_incarnation !== expected.host_incarnation ||
 			broker.lifecycle_request_id !== expected.lifecycle_request_id ||
@@ -5529,10 +5571,15 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				: null;
 	}
 
-	function brokerEndpointIncarnation(session: Record<string, unknown>, sessionId: string): string | null {
+	function brokerEndpointIncarnation(
+		session: Record<string, unknown>,
+		sessionId: string,
+		options: { includeEndpointFileId?: boolean } = {},
+	): string | null {
 		const endpointGeneration = brokerEndpointGeneration(session);
 		const pid = session.pid;
 		const endpointMtimeMs = session.endpointMtimeMs;
+		const endpointFileId = options.includeEndpointFileId === false ? undefined : brokerEndpointFileId(session);
 		if (
 			endpointGeneration === null ||
 			typeof pid !== "number" ||
@@ -5544,14 +5591,29 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		)
 			return null;
 		return createHash("sha256")
-			.update(canonicalJson({ endpointGeneration, endpointMtimeMs, pid, sessionId }))
+			.update(
+				canonicalJson({
+					endpointGeneration,
+					endpointMtimeMs,
+					...(endpointFileId === undefined ? {} : { endpointFileId }),
+					pid,
+					sessionId,
+				}),
+			)
 			.digest("hex");
+	}
+
+	function brokerEndpointFileId(session: Record<string, unknown>): string | undefined {
+		const value = session.endpointFileId ?? session.endpoint_file_id;
+		return typeof value === "string" && value.length > 0 ? value : undefined;
 	}
 
 	type BrokerSessionAuthority = {
 		workspace: string;
 		endpointGeneration: number;
 		endpointIncarnation: string;
+		endpointFileId?: string;
+		legacyEndpointIncarnation?: string;
 	};
 
 	async function exactBrokerSessionAuthority(sessionId: string, workspace: string): Promise<BrokerSessionAuthority> {
@@ -5581,11 +5643,65 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		const endpointIncarnation = brokerEndpointIncarnation(match.session, sessionId);
 		if (endpointGeneration === null || endpointIncarnation === null)
 			throw new SdkClientError("endpoint_stale", "Broker session has no usable endpoint incarnation.");
-		return { workspace: match.workspace, endpointGeneration, endpointIncarnation };
+		const endpointFileId = brokerEndpointFileId(match.session);
+		const legacyEndpointIncarnation =
+			endpointFileId === undefined
+				? undefined
+				: (brokerEndpointIncarnation(match.session, sessionId, { includeEndpointFileId: false }) ?? undefined);
+		return {
+			workspace: match.workspace,
+			endpointGeneration,
+			endpointIncarnation,
+			...(endpointFileId === undefined ? {} : { endpointFileId }),
+			...(legacyEndpointIncarnation === undefined ? {} : { legacyEndpointIncarnation }),
+		};
 	}
 
 	async function exactBrokerSessionBinding(sessionId: string, workspace: string): Promise<BrokerSessionAuthority> {
 		return await exactBrokerSessionAuthority(sessionId, workspace);
+	}
+
+	async function migrateLegacySessionEndpointAuthority(
+		session: CanonicalSessionSnapshotV1,
+	): Promise<CanonicalSessionSnapshotV1> {
+		if (!session.broker.workspace) throw new Error("coordinator_workspace_required");
+		const persistedWorkspace = await canonicalBrokerWorkspace(session.broker.workspace);
+		const authority = await exactBrokerSessionAuthority(session.session_id, persistedWorkspace);
+		if (authority.endpointGeneration !== session.broker.endpoint_generation)
+			throw new SdkClientError("endpoint_stale", "Coordinator session endpoint authority changed.");
+		if (session.broker.endpoint_file_id !== undefined) {
+			if (
+				authority.endpointFileId !== session.broker.endpoint_file_id ||
+				authority.endpointIncarnation !== session.broker.endpoint_incarnation ||
+				authority.legacyEndpointIncarnation === undefined
+			)
+				throw new SdkClientError("endpoint_stale", "Coordinator session endpoint authority changed.");
+			const reconciled = await rewriteSessionEndpointAuthorityAndDeletions(
+				questionPaths,
+				session.session_id,
+				authority.legacyEndpointIncarnation,
+				authority.endpointIncarnation,
+				authority.endpointFileId,
+			);
+			await writeJsonFile(sessionFile(session.session_id), sessionFromCreationSnapshot(reconciled));
+			return reconciled;
+		}
+		if (authority.endpointFileId === undefined) {
+			if (authority.endpointIncarnation !== session.broker.endpoint_incarnation)
+				throw new SdkClientError("endpoint_stale", "Coordinator session endpoint authority changed.");
+			return session;
+		}
+		if (authority.legacyEndpointIncarnation !== session.broker.endpoint_incarnation)
+			throw new SdkClientError("endpoint_stale", "Coordinator session endpoint authority changed.");
+		const rewritten = await rewriteSessionEndpointAuthorityAndDeletions(
+			questionPaths,
+			session.session_id,
+			session.broker.endpoint_incarnation,
+			authority.endpointIncarnation,
+			authority.endpointFileId,
+		);
+		await writeJsonFile(sessionFile(session.session_id), sessionFromCreationSnapshot(rewritten));
+		return rewritten;
 	}
 
 	/**
@@ -5814,6 +5930,14 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			);
 			if (pendingDeletion?.phase === "intent") {
 				try {
+					await ensureQuestionTransaction(id);
+					const pendingDeletionId = pendingDeletion.deletion_id;
+					pendingDeletion = await withNamespaceRegistry(
+						questionPaths,
+						async registry => registry.deletions[pendingDeletionId] ?? null,
+					);
+					if (pendingDeletion?.phase !== "intent")
+						throw new SdkClientError("state_corrupt", "Pending deletion migration lost its intent.");
 					await recoverIntentDeletion(pendingDeletion);
 				} catch (error) {
 					return {
@@ -5864,19 +5988,20 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				return { ok: false, reason: "unknown_session", closed: false };
 			}
 
-			await ensureQuestionTransaction(id);
+			const currentSession = await ensureQuestionTransaction(id);
 			// Rebuild legacy projections before reaper eligibility checks. A crash after
 			// canonical terminal commit must not leave a stale active-turn file blocking reap.
 			await recoverCanonicalSessionProjection(id);
-			const cwd = optionalString(session.cwd);
-			const persistedWorkspace = optionalString(session.broker_workspace);
+			const migratedSession = sessionFromCreationSnapshot(currentSession);
+			const cwd = optionalString(migratedSession.cwd);
+			const persistedWorkspace = optionalString(migratedSession.broker_workspace);
 			const persistedGeneration =
-				typeof session.endpoint_generation === "number" &&
-				Number.isSafeInteger(session.endpoint_generation) &&
-				session.endpoint_generation > 0
-					? session.endpoint_generation
+				typeof migratedSession.endpoint_generation === "number" &&
+				Number.isSafeInteger(migratedSession.endpoint_generation) &&
+				migratedSession.endpoint_generation > 0
+					? migratedSession.endpoint_generation
 					: null;
-			const persistedIncarnation = optionalString(session.endpoint_incarnation);
+			const persistedIncarnation = optionalString(migratedSession.endpoint_incarnation);
 			if (!cwd || !persistedWorkspace || persistedGeneration === null || !persistedIncarnation)
 				return { ok: false, reason: "endpoint_stale", closed: false };
 			// Endpoint identity is the authority for any lifecycle mutation. Check it
@@ -5897,7 +6022,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					return { ok: false, reason: "endpoint_stale", closed: false };
 				throw error;
 			}
-			if (session.ephemeral !== true && opts.force !== true)
+			if (migratedSession.ephemeral !== true && opts.force !== true)
 				return { ok: false, reason: "not_ephemeral", closed: false };
 			let canonicalTransaction = await readSessionTransaction(questionPaths, id);
 			const canonicalActiveTurn = (canonicalTransaction
@@ -7333,13 +7458,12 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				break;
 			let turn: TurnRecord | null = null;
 			try {
-				const transaction = await readSessionTransaction(questionPaths, entry.session_id);
-				if (!transaction) {
-					processedCursor = entry.session_id;
-					continue;
-				}
-				await assertPersistedSessionAuthority(transaction.canonical.session);
-				turn = await readActiveTurn(namespaceDir, entry.session_id);
+				// Endpoint identity admission may rewrite the canonical WAL and every
+				// endpoint-bearing turn reference. Do not discard that post-image and
+				// then consult the stale active-turn projection: acknowledgement and
+				// timeout decisions must use the canonical turn that survived admission.
+				await ensureQuestionTransaction(entry.session_id);
+				turn = await readCanonicalActiveTurn(entry.session_id);
 			} catch (error) {
 				if (
 					!(error instanceof Error) ||
@@ -7438,7 +7562,8 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					priorSession &&
 					priorSession.broker_workspace === binding.workspace &&
 					priorSession.endpoint_generation === binding.endpointGeneration &&
-					optionalString(priorSession.endpoint_incarnation) === binding.endpointIncarnation
+					optionalString(priorSession.endpoint_incarnation) === binding.endpointIncarnation &&
+					optionalString(priorSession.endpoint_file_id) === (binding.endpointFileId ?? null)
 						? (priorSession.sidecar_verifier as { key_id: string; public_key: string } | undefined)
 						: undefined;
 				// An already-running SDK process cannot receive a newly minted private
@@ -7472,6 +7597,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 							broker_workspace: binding.workspace,
 							endpoint_generation: binding.endpointGeneration,
 							endpoint_incarnation: binding.endpointIncarnation,
+							...(binding.endpointFileId === undefined ? {} : { endpoint_file_id: binding.endpointFileId }),
 							sidecar_verifier: priorAuthority,
 						});
 						const intent: CanonicalCreateIntentV1 = {
@@ -7665,7 +7791,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				const sessionId = args.session_id;
 				if (sessionId) {
 					const canonicalSessionId = safeExternalId("session", sessionId);
-					const session = asRecord(await readJsonFile(sessionFile(canonicalSessionId)));
+					const session = await ensureCurrentSession(canonicalSessionId);
 					const cwd = optionalString(session?.cwd);
 					if (!session || !cwd)
 						return {
@@ -7717,7 +7843,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			}
 			if (name === "gjc_coordinator_read_tail") {
 				const sessionId = safeExternalId("session", args.session_id);
-				const session = asRecord(await readJsonFile(sessionFile(sessionId)));
+				const session = await ensureCurrentSession(sessionId);
 				if (!session)
 					return {
 						ok: false,
@@ -8208,7 +8334,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 							let creationKey: string | null = null;
 							if (reusedSessionId) {
 								sessionId = reusedSessionId;
-								const existing = asRecord(await readJsonFile(sessionFile(sessionId)));
+								const existing = await ensureCurrentSession(sessionId);
 								if (!existing)
 									return {
 										ok: false,
@@ -8244,7 +8370,8 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 										platform,
 									) ||
 									existing.endpoint_generation !== binding.endpointGeneration ||
-									optionalString(existing.endpoint_incarnation) !== binding.endpointIncarnation
+									optionalString(existing.endpoint_incarnation) !== binding.endpointIncarnation ||
+									optionalString(existing.endpoint_file_id) !== (binding.endpointFileId ?? null)
 								)
 									return {
 										ok: false,
@@ -8260,6 +8387,9 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 									broker_workspace: binding.workspace,
 									endpoint_generation: binding.endpointGeneration,
 									endpoint_incarnation: binding.endpointIncarnation,
+									...(binding.endpointFileId === undefined
+										? {}
+										: { endpoint_file_id: binding.endpointFileId }),
 									sidecar_verifier: existing.sidecar_verifier as { key_id: string; public_key: string },
 								});
 							} else {
@@ -8329,6 +8459,9 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 										broker_workspace: binding.workspace,
 										endpoint_generation: binding.endpointGeneration,
 										endpoint_incarnation: binding.endpointIncarnation,
+										...(binding.endpointFileId === undefined
+											? {}
+											: { endpoint_file_id: binding.endpointFileId }),
 										sidecar_verifier: reconciled.sidecar_verifier,
 									});
 									const intent: CanonicalCreateIntentV1 = {
@@ -8670,6 +8803,9 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 									broker_workspace: binding.workspace,
 									endpoint_generation: binding.endpointGeneration,
 									endpoint_incarnation: binding.endpointIncarnation,
+									...(binding.endpointFileId === undefined
+										? {}
+										: { endpoint_file_id: binding.endpointFileId }),
 									sidecar_verifier: reconciled.sidecar_verifier,
 								});
 							}
@@ -8808,6 +8944,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				const lifecycleRequestId = proofString(args.lifecycle_request_id, 128);
 				const processIncarnation = proofString(args.process_incarnation, 256);
 				const hostIncarnation = proofString(args.host_incarnation, 256);
+				const endpointFileId = proofString(args.endpoint_file_id, 256);
 				const endpointGeneration = args.endpoint_generation;
 				const endpointMtimeMs = args.endpoint_mtime_ms;
 				if (
@@ -8824,6 +8961,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					typeof endpointMtimeMs !== "number" ||
 					!Number.isFinite(endpointMtimeMs) ||
 					endpointMtimeMs <= 0 ||
+					(args.endpoint_file_id !== undefined && endpointFileId === null) ||
 					path.resolve(stateRoot) !== path.join(cwd, ".gjc", "state")
 				)
 					return {
@@ -8837,21 +8975,19 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					request_digest: requestDigest,
 					allow_mutation: true,
 				};
-				const proof: CreationRetirementProofV1 = {
+				let proof: CreationRetirementProofV1 = {
 					session_id: sessionId,
 					cwd,
 					state_root: stateRoot,
 					endpoint_generation: endpointGeneration,
 					endpoint_mtime_ms: endpointMtimeMs,
+					...(endpointFileId === null ? {} : { endpoint_file_id: endpointFileId }),
 					process_incarnation: processIncarnation,
 					host_incarnation: hostIncarnation,
 					lifecycle_request_id: lifecycleRequestId,
 					remote_create_key: remoteCreateKey,
 				};
 				const creationKeyDigest = creationDigests("gjc_coordinator_start_session", creationKey, {}).keyDigest;
-				const brokerRequestKey = `coordinator-retire:${creationKeyDigest}:${createHash("sha256")
-					.update(JSON.stringify(proof))
-					.digest("hex")}`;
 				const retirementKeyDigest = createHash("sha256").update(retirementKey).digest("hex");
 				const isRetirementRetryable = (response: Record<string, unknown>): boolean => {
 					const code = asRecord(response.error)?.code;
@@ -8915,6 +9051,26 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 											message: "The coordinator start intent is not stranded in progress.",
 										},
 									};
+								if (proof.endpoint_file_id === undefined) {
+									const authority = await exactBrokerSessionAuthority(sessionId, cwd);
+									if (
+										authority.endpointGeneration !== proof.endpoint_generation ||
+										authority.endpointFileId === undefined ||
+										authority.legacyEndpointIncarnation === undefined
+									)
+										throw new SdkClientError(
+											"retirement_proof_stale",
+											"Current endpoint file identity is unavailable.",
+										);
+									await upgradeCreationRetirementEndpointFileId(
+										questionPaths,
+										creationKeyDigest,
+										proof,
+										authority.legacyEndpointIncarnation,
+										authority.endpointFileId,
+									);
+									proof = { ...proof, endpoint_file_id: authority.endpointFileId };
+								}
 								const creation = await assertCreationRetirementIdentity(
 									questionPaths,
 									creationKeyDigest,
@@ -8961,6 +9117,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 										staged.state_root !== proof.state_root ||
 										staged.endpoint_generation !== proof.endpoint_generation ||
 										staged.endpoint_mtime_ms !== proof.endpoint_mtime_ms ||
+										staged.endpoint_file_id !== proof.endpoint_file_id ||
 										staged.process_incarnation !== proof.process_incarnation ||
 										staged.host_incarnation !== proof.host_incarnation ||
 										staged.lifecycle_request_id !== proof.lifecycle_request_id ||
@@ -8975,6 +9132,9 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 										);
 									lifecycle = publicRetirementProof(staged);
 								} else {
+									const brokerRequestKey = `coordinator-retire:${creationKeyDigest}:${createHash("sha256")
+										.update(JSON.stringify(proof))
+										.digest("hex")}`;
 									await recordCreationRetirementIntent(
 										questionPaths,
 										creationKeyDigest,
@@ -8985,15 +9145,18 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 										cwd,
 										"session.reconcile_uncertain",
 										{
-											sessionId,
-											cwd,
-											stateRoot,
-											endpointGeneration,
-											endpointMtimeMs,
-											processIncarnation,
-											hostIncarnation,
-											lifecycleRequestId,
-											remoteCreateKey,
+											sessionId: proof.session_id,
+											cwd: proof.cwd,
+											stateRoot: proof.state_root,
+											endpointGeneration: proof.endpoint_generation,
+											endpointMtimeMs: proof.endpoint_mtime_ms,
+											...(proof.endpoint_file_id === undefined
+												? {}
+												: { endpointFileId: proof.endpoint_file_id }),
+											processIncarnation: proof.process_incarnation,
+											hostIncarnation: proof.host_incarnation,
+											lifecycleRequestId: proof.lifecycle_request_id,
+											remoteCreateKey: proof.remote_create_key,
 										},
 										brokerRequestKey,
 									);
@@ -9071,7 +9234,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					{ session_id: sessionId, allow_mutation: true },
 					async () =>
 						await withSessionTransition(sessionId, async () => {
-							const currentSession = asRecord(await readJsonFile(sessionFile(sessionId)));
+							const currentSession = await ensureCurrentSession(sessionId);
 							if (!currentSession)
 								return {
 									ok: false,
@@ -9185,7 +9348,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					},
 					async () =>
 						await withSessionTransition(sessionId, async () => {
-							const currentSession = asRecord(await readJsonFile(sessionFile(sessionId)));
+							const currentSession = await ensureCurrentSession(sessionId);
 							if (!currentSession) {
 								return {
 									ok: false,

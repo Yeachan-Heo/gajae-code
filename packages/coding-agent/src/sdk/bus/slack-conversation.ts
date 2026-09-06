@@ -27,6 +27,8 @@ export interface SlackConversation extends ConversationRecord {
 	sessionId?: string;
 	endpointGeneration?: number;
 	attachmentAuthorityId?: string;
+	/** Durable dual-authority fence while mapping and effect migration is incomplete. */
+	attachmentAuthorityMigrationFromId?: string;
 	clientMsgId?: string;
 	/** Exact pending Router-removal cleanup; cleared only after the mapping close CAS commits. */
 	cleanupEffectId?: string;

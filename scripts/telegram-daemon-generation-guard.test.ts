@@ -39,6 +39,7 @@ const telegramDaemon = "packages/coding-agent/src/sdk/bus/telegram-daemon.ts";
 const telegramControl = "packages/coding-agent/src/sdk/bus/telegram-daemon-control.ts";
 
 const chatControl = "packages/coding-agent/src/sdk/bus/chat-daemon-control.ts";
+const chatEffectJournal = "packages/coding-agent/src/sdk/bus/chat-effect-journal.ts";
 const chatCli = "packages/coding-agent/src/sdk/bus/chat-daemon-cli.ts";
 const sdkDiscovery = "packages/coding-agent/src/sdk/client/discovery.ts";
 const config = "packages/coding-agent/src/sdk/bus/config.ts";
@@ -123,9 +124,46 @@ const chatEndpointHelpers = {
 		"SessionRouter.#attach",
 		"SessionRouter.#createAttachedClient",
 		"SessionRouter.#publishAttachment",
+		"SessionRouter.#attachUnserialized",
+		"SessionRouter.#endpointAuthorityUnchanged",
+		"SessionRouter.#readProvenEndpoint",
+		"createSessionAttachmentAuthorityId",
+		"sessionAttachmentAuthorityId",
+		"sessionAttachmentLegacyAuthorityId",
+		"lstatEndpoint",
+		"sameEndpointIdentity",
+		"matchesIndexedEndpointIdentity",
+		"sameIndexedAuthority",
+		"matchesAdoptedSessionAuthority",
 	],
 	[sdkDiscovery]: ["readSdkSessionEndpoint"],
 } as const;
+const chatEffectJournalHelpers = [
+	"sessionMutationGateFileName",
+	"mappingAcceptsAuthority",
+	"collectAttachmentAuthorityIds",
+	"rewriteAttachmentAuthorityIds",
+	"ChatEffectJournal.#sessionGateStores",
+	"ChatEffectJournal.#createSessionGateStore",
+	"withSessionMutationGate",
+	"migrateAttachmentAuthorityId",
+	"migrateAttachmentAuthorityIdWhileHoldingGate",
+	"enqueue",
+	"enqueueWhileHoldingSessionMutationGate",
+	"enqueueAndClaim",
+	"enqueueAndClaimWhileHoldingSessionMutationGate",
+	"claim",
+	"claimWhileHoldingSessionMutationGate",
+	"renew",
+	"renewWhileHoldingSessionMutationGate",
+	"recordReceipt",
+	"recordReceiptWhileHoldingSessionMutationGate",
+	"record",
+	"recordWhileHoldingSessionMutationGate",
+	"terminalize",
+	"terminalizeWhileHoldingSessionMutationGate",
+	"ChatEffectJournal.#prepareEnqueue",
+] as const;
 const telegramToolActivityDeclarations = {
 	[config]: ["parseNotificationSettingsSnapshot"],
 	[telegramDaemon]: [
@@ -348,7 +386,67 @@ test("requires mapped generation bumps for Telegram lease, chat CLI, and configu
 	}
 });
 
-test("requires a Telegram bump for tool-activity defaults and delivery admission policy", () => {
+test("requires both chat generation bumps for every shared Router authority proof declaration", () => {
+	for (const name of chatEndpointHelpers[sessionRouter]) {
+		const [className, privateName] = name.split(".#");
+		const before = name.includes(".#")
+			? `export class ${className} { #${privateName}() { return "before"; } }`
+			: `export function ${name}() { return "before"; }`;
+		const after = before.replace('return "before"', 'return "after"');
+		const endpointInventory = {
+			telegram: {},
+			discord: { [sessionRouter]: [name] },
+			slack: { [sessionRouter]: [name] },
+		} as const;
+		const base = files({ discordGeneration: 4, slackGeneration: 4 });
+		base.set(sessionRouter, before);
+		const unbumpedHead = files({ discordGeneration: 4, slackGeneration: 4 });
+		unbumpedHead.set(sessionRouter, after);
+		const missing = evaluate(base, unbumpedHead, endpointInventory);
+		expect(missing.protectedChanges).toEqual([
+			`discord:${sessionRouter}:${name}`,
+			`slack:${sessionRouter}:${name}`,
+		]);
+		expect(missing.chatGenerationBumped).toEqual({ discord: false, slack: false });
+
+		const bumpedHead = files({ discordGeneration: 5, slackGeneration: 5 });
+		bumpedHead.set(sessionRouter, after);
+		const bumped = evaluate(base, bumpedHead, endpointInventory);
+		expect(bumped.chatGenerationBumped).toEqual({ discord: true, slack: true });
+	}
+});
+
+test("requires both chat generation bumps for every ChatEffectJournal session mutation and authority declaration", () => {
+	for (const name of chatEffectJournalHelpers) {
+		const [className, privateName] = name.split(".#");
+		const before = name.includes(".#")
+			? `export class ${className} { #${privateName}() { return "before"; } }`
+			: `export function ${name}() { return "before"; }`;
+		const after = before.replace('return "before"', 'return "after"');
+		const journalInventory = {
+			telegram: {},
+			discord: { [chatEffectJournal]: [name] },
+			slack: { [chatEffectJournal]: [name] },
+		} as const;
+		const base = files({ discordGeneration: 4, slackGeneration: 4 });
+		base.set(chatEffectJournal, before);
+		const unbumpedHead = files({ discordGeneration: 4, slackGeneration: 4 });
+		unbumpedHead.set(chatEffectJournal, after);
+		const missing = evaluate(base, unbumpedHead, journalInventory);
+		expect(missing.protectedChanges).toEqual([
+			`discord:${chatEffectJournal}:${name}`,
+			`slack:${chatEffectJournal}:${name}`,
+		]);
+		expect(missing.chatGenerationBumped).toEqual({ discord: false, slack: false });
+
+		const bumpedHead = files({ discordGeneration: 5, slackGeneration: 5 });
+		bumpedHead.set(chatEffectJournal, after);
+		const bumped = evaluate(base, bumpedHead, journalInventory);
+		expect(bumped.chatGenerationBumped).toEqual({ discord: true, slack: true });
+	}
+});
+
+test("requires a Telegram bump for tool-activity defaults and delivery admission", () => {
 	for (const [file, declarations] of Object.entries(telegramToolActivityDeclarations)) {
 		for (const name of declarations) {
 			const missing = mappedHelperMutation({ family: "telegram", file, name, generationBumped: false });
@@ -784,7 +882,7 @@ test("fails closed when a protected native authority declaration is missing or m
 		expect(() => validateManifest({ contractVersion: GUARD_CONTRACT_VERSION, inventory: narrowed })).toThrow("Telegram owner-lock handoff primitives");
 	});
 
-	test("rejects inventories missing required Telegram lifecycle, lease, tool-activity, topic-admission, chat CLI, endpoint discovery, or provider configuration authorities", () => {
+	test("rejects inventories missing required Telegram lifecycle, lease, tool-activity, topic-admission, chat CLI, endpoint discovery, chat-effect-journal, or provider configuration authorities", () => {
 		for (const symbol of TELEGRAM_LIFECYCLE_PROTECTED_DECLARATIONS) {
 			const telegram = mutableInventory();
 			telegram.telegram[telegramDaemon] = telegram.telegram[telegramDaemon]!.filter(name => name !== symbol);
@@ -832,6 +930,13 @@ test("fails closed when a protected native authority declaration is missing or m
 					expect(() => validateInventory(endpointDiscovery)).toThrow("isolated chat endpoint discovery");
 				}
 			}
+		}
+		for (const symbol of chatEffectJournalHelpers) {
+			const effectJournal = mutableInventory();
+			const remaining = effectJournal.discord[chatEffectJournal]!.filter(name => name !== symbol);
+			if (remaining.length === 0) delete effectJournal.discord[chatEffectJournal];
+			else effectJournal.discord[chatEffectJournal] = remaining;
+			expect(() => validateInventory(effectJournal)).toThrow("chat effect journal session mutation and authority primitives");
 		}
 	});
 	test("protects Telegram shutdown admission and durable drain authorities", () => {

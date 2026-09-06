@@ -2,7 +2,6 @@ import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { logger, resolveEquivalentPath } from "@gajae-code/utils";
-import { matchesIndexedEndpointFile } from "../broker/endpoint-authority";
 import {
 	canonicalSessionCwd,
 	SessionIndex as DefaultSessionIndex,
@@ -28,7 +27,8 @@ import {
 import { ACP_SESSION_RECONNECT, SESSION_REQUEST_TIMEOUT_MS } from "../session-reconnect";
 
 export interface SessionEndpointIdentity {
-	readonly dev: bigint;
+	/** Device identity is Router-internal proof and optional for public digest callers. */
+	readonly dev?: bigint;
 	readonly mtimeMs: number;
 	readonly mtimeNs: bigint;
 	readonly ctimeNs: bigint;
@@ -36,13 +36,7 @@ export interface SessionEndpointIdentity {
 	readonly ino: bigint;
 }
 
-/**
- * Exact identity of one attached SDK session endpoint. Providers persist it next to
- * their conversation state and re-prove it before every resume, so it must be derived
- * in exactly one place: a caller that recomputes the digest by hand silently stops
- * matching the moment the bound fields change.
- */
-export function sessionAttachmentAuthorityId(input: {
+export interface SessionAttachmentAuthorityInput {
 	sessionId: string;
 	generation: number;
 	pid: number;
@@ -51,14 +45,24 @@ export function sessionAttachmentAuthorityId(input: {
 	token: string;
 	/** Proven no-follow endpoint identity, when the caller has one. */
 	endpointIdentity?: SessionEndpointIdentity;
-}): string {
+}
+
+/**
+ * Exact identity of one attached SDK session endpoint. Providers persist it next to
+ * their conversation state and re-prove it before every resume, so it must be derived
+ * in exactly one place: a caller that recomputes the digest by hand silently stops
+ * matching the moment the bound fields change.
+ */
+function createSessionAttachmentAuthorityId(input: SessionAttachmentAuthorityInput, includeDevice: boolean): string {
 	const endpointAuthorityDigest = crypto
 		.createHash("sha256")
 		.update(JSON.stringify({ url: input.url, token: input.token }))
 		.digest("hex");
 	const endpointIdentity = input.endpointIdentity
 		? {
-				dev: input.endpointIdentity.dev.toString(),
+				...(includeDevice && input.endpointIdentity.dev !== undefined
+					? { dev: input.endpointIdentity.dev.toString() }
+					: {}),
 				mtimeMs: input.endpointIdentity.mtimeMs,
 				mtimeNs: input.endpointIdentity.mtimeNs.toString(),
 				ctimeNs: input.endpointIdentity.ctimeNs.toString(),
@@ -81,10 +85,21 @@ export function sessionAttachmentAuthorityId(input: {
 		.digest("hex");
 }
 
+export function sessionAttachmentAuthorityId(input: SessionAttachmentAuthorityInput): string {
+	return createSessionAttachmentAuthorityId(input, true);
+}
+
+/** Digest used by pre-device-binding provider records during one-time migration. */
+function sessionAttachmentLegacyAuthorityId(input: SessionAttachmentAuthorityInput): string {
+	return createSessionAttachmentAuthorityId(input, false);
+}
+
 /** The only capability a provider may retain for an attached SDK session. */
 export interface SessionAttachment {
 	readonly sessionId: string;
 	readonly authorityId?: string;
+	/** Pre-device-binding authority ID; valid only for one-time migration after current proof. */
+	readonly legacyAuthorityId?: string;
 	/** Current Router-owned transport identity for this exact attachment's reverse leases. */
 	readonly connectionId?: string;
 	readonly generation: number;
@@ -479,7 +494,17 @@ function sameEndpointIdentity(expected: SessionEndpointIdentity, current: Sessio
 		expected.mtimeNs === current.mtimeNs &&
 		expected.ctimeNs === current.ctimeNs &&
 		expected.size === current.size &&
+		expected.dev === current.dev &&
 		expected.ino === current.ino
+	);
+}
+
+function matchesIndexedEndpointIdentity(identity: SessionEndpointIdentity, indexed: IndexedSession): boolean {
+	if (indexed.endpointMtimeMs === undefined || !Number.isFinite(indexed.endpointMtimeMs)) return false;
+	if (indexed.endpointFileId === undefined) return identity.mtimeMs === indexed.endpointMtimeMs;
+	return (
+		indexed.endpointFileId === `${identity.dev}:${identity.ino}` &&
+		Math.abs(identity.mtimeMs - indexed.endpointMtimeMs) <= 0.001
 	);
 }
 
@@ -570,6 +595,13 @@ function readReplayGap(
 }
 
 function sameIndexedAuthority(expected: IndexedSession, current: IndexedSession): boolean {
+	const sameEndpointAuthority =
+		expected.endpointMtimeMs !== undefined &&
+		current.endpointMtimeMs !== undefined &&
+		(expected.endpointFileId === undefined
+			? current.endpointMtimeMs === expected.endpointMtimeMs
+			: current.endpointFileId === expected.endpointFileId &&
+				Math.abs(current.endpointMtimeMs - expected.endpointMtimeMs) <= 0.001);
 	return (
 		current.sessionId === expected.sessionId &&
 		current.live &&
@@ -577,7 +609,12 @@ function sameIndexedAuthority(expected: IndexedSession, current: IndexedSession)
 		!current.terminalUncertain &&
 		current.endpointGeneration === expected.endpointGeneration &&
 		current.pid === expected.pid &&
-		current.endpointMtimeMs === expected.endpointMtimeMs
+		sameEndpointAuthority &&
+		current.locator.cwd === expected.locator.cwd &&
+		resolveEquivalentPath(current.locator.stateRoot) === resolveEquivalentPath(expected.locator.stateRoot) &&
+		(expected.processIncarnation === undefined || current.processIncarnation === expected.processIncarnation) &&
+		(expected.hostIncarnation === undefined || current.hostIncarnation === expected.hostIncarnation) &&
+		(expected.lifecycleRequestId === undefined || current.lifecycleRequestId === expected.lifecycleRequestId)
 	);
 }
 
@@ -585,8 +622,23 @@ type AdoptedSession = {
 	readonly generation: number;
 	readonly pid: number;
 	readonly endpointMtimeMs: number;
+	readonly endpointFileId?: string;
 	readonly attachment: SessionAttachment;
 };
+
+function matchesAdoptedSessionAuthority(adopted: AdoptedSession, indexed: IndexedSession): boolean {
+	if (
+		indexed.endpointGeneration !== adopted.generation ||
+		indexed.pid !== adopted.pid ||
+		indexed.endpointMtimeMs === undefined
+	)
+		return false;
+	if (adopted.endpointFileId === undefined) return indexed.endpointMtimeMs === adopted.endpointMtimeMs;
+	return (
+		indexed.endpointFileId === adopted.endpointFileId &&
+		Math.abs(indexed.endpointMtimeMs - adopted.endpointMtimeMs) <= 0.001
+	);
+}
 
 /**
  * Broker-index-backed SDK attachment authority. Providers receive only opaque
@@ -770,6 +822,7 @@ export class SessionRouter {
 		const endpointGeneration = readPositiveInteger(result.endpointGeneration);
 		const pid = readPositiveInteger(result.pid);
 		const endpointMtimeMs = readEndpointMtime(result.endpointMtimeMs);
+		const endpointFileId = typeof result.endpointFileId === "string" ? result.endpointFileId : undefined;
 		if (
 			sessionId !== fallback.sessionId ||
 			(this.#sessionIds !== undefined && !this.#sessionIds.has(sessionId ?? "")) ||
@@ -793,6 +846,7 @@ export class SessionRouter {
 			endpointGeneration,
 			pid,
 			endpointMtimeMs,
+			...(endpointFileId === undefined ? {} : { endpointFileId }),
 			live: true,
 			indexSeq: 0,
 			identityProvenance: "legacy",
@@ -1267,9 +1321,7 @@ export class SessionRouter {
 				indexedSession?.live === true &&
 				isSessionAuthorityEligible(indexedSession) &&
 				!indexedSession.terminalUncertain &&
-				indexedSession.endpointGeneration === adopted.generation &&
-				indexedSession.pid === adopted.pid &&
-				indexedSession.endpointMtimeMs === adopted.endpointMtimeMs;
+				matchesAdoptedSessionAuthority(adopted, indexedSession);
 			const endpoint = exactIndex ? await this.#readEndpoint(indexedSession).catch(() => null) : null;
 			if (
 				!exactIndex ||
@@ -1365,7 +1417,7 @@ export class SessionRouter {
 		// cannot keep the old attachment authorized.
 		const identityBefore = await lstatEndpoint(attached.endpoint.path);
 		if (!identityBefore || !sameEndpointIdentity(attached.endpointIdentity, identityBefore)) return false;
-		if (!matchesIndexedEndpointFile(identityBefore, indexed)) return false;
+		if (!matchesIndexedEndpointIdentity(identityBefore, indexed)) return false;
 		let raw: Record<string, unknown>;
 		try {
 			const parsed = JSON.parse(await Bun.file(attached.endpoint.path).text());
@@ -1389,7 +1441,7 @@ export class SessionRouter {
 		const identityAfter = await lstatEndpoint(attached.endpoint.path);
 		return (
 			identityAfter !== undefined &&
-			matchesIndexedEndpointFile(identityAfter, indexed) &&
+			matchesIndexedEndpointIdentity(identityAfter, indexed) &&
 			sameEndpointIdentity(attached.endpointIdentity, identityAfter)
 		);
 	}
@@ -1421,7 +1473,7 @@ export class SessionRouter {
 		const endpointIdentity = await lstatEndpoint(endpointPath);
 		const endpoint = await readSdkSessionEndpoint(cwd, indexed.sessionId, scope);
 		if (!endpoint || endpoint.stale || endpoint.pid !== indexed.pid) return null;
-		if (!endpointIdentity || !matchesIndexedEndpointFile(endpointIdentity, indexed)) return null;
+		if (!endpointIdentity || !matchesIndexedEndpointIdentity(endpointIdentity, indexed)) return null;
 		// Identity is proven INSIDE this authority read (#4730 review): sampling it
 		// afterwards would let an identical rename between the read and the sample
 		// install the replacement's inode as the trusted baseline.
@@ -1446,7 +1498,7 @@ export class SessionRouter {
 		const endpointIdentityAfterRead = await lstatEndpoint(endpoint.path);
 		if (
 			!endpointIdentityAfterRead ||
-			!matchesIndexedEndpointFile(endpointIdentityAfterRead, indexed) ||
+			!matchesIndexedEndpointIdentity(endpointIdentityAfterRead, indexed) ||
 			!sameEndpointIdentity(endpointIdentity, endpointIdentityAfterRead)
 		)
 			return null;
@@ -1563,9 +1615,7 @@ export class SessionRouter {
 			existing !== undefined &&
 			existing.endpoint.url === endpoint.url &&
 			existing.endpoint.token === endpoint.token &&
-			existing.generation === indexed.endpointGeneration &&
-			existing.pid === indexed.pid &&
-			existing.endpointMtimeMs === indexed.endpointMtimeMs &&
+			sameIndexedAuthority(existing.indexed, indexed) &&
 			endpointIdentity !== undefined &&
 			sameEndpointIdentity(existing.endpointIdentity, endpointIdentity);
 		if (
@@ -1600,8 +1650,7 @@ export class SessionRouter {
 					existing.generation === indexed.endpointGeneration &&
 						(existing.endpoint.url !== endpoint.url ||
 							existing.endpoint.token !== endpoint.token ||
-							existing.pid !== indexed.pid ||
-							existing.endpointMtimeMs !== indexed.endpointMtimeMs ||
+							!sameIndexedAuthority(existing.indexed, indexed) ||
 							endpointIdentity === undefined ||
 							!sameEndpointIdentity(existing.endpointIdentity, endpointIdentity))
 						? "replaced_same_generation"
@@ -1632,6 +1681,15 @@ export class SessionRouter {
 		void publication.promise.catch(() => undefined);
 		const capability: SessionAttachment = Object.freeze({
 			authorityId: sessionAttachmentAuthorityId({
+				sessionId: indexed.sessionId,
+				generation: indexed.endpointGeneration,
+				pid: indexed.pid,
+				endpointMtimeMs: indexed.endpointMtimeMs,
+				url: endpoint.url,
+				token: endpoint.token,
+				endpointIdentity,
+			}),
+			legacyAuthorityId: sessionAttachmentLegacyAuthorityId({
 				sessionId: indexed.sessionId,
 				generation: indexed.endpointGeneration,
 				pid: indexed.pid,
@@ -1786,6 +1844,7 @@ export class SessionRouter {
 				generation: indexed.endpointGeneration,
 				pid: indexed.pid,
 				endpointMtimeMs: indexed.endpointMtimeMs,
+				...(indexed.endpointFileId === undefined ? {} : { endpointFileId: indexed.endpointFileId }),
 				attachment: capability,
 			});
 		try {
@@ -2125,7 +2184,8 @@ export class SessionRouter {
 						current?.live &&
 						(current.endpointGeneration !== attached.generation ||
 							current.pid !== attached.pid ||
-							current.endpointMtimeMs !== attached.endpointMtimeMs)
+							current.endpointMtimeMs !== attached.endpointMtimeMs ||
+							current.endpointFileId !== attached.indexed.endpointFileId)
 					)
 						reason = current.endpointGeneration === attached.generation ? "replaced_same_generation" : "replaced";
 				} catch {

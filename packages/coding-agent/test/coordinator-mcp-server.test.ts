@@ -25,6 +25,7 @@ import {
 	deterministicOutboxId,
 	enumeratePublicDeliveries,
 	readDeliveryDiscoveryCursor,
+	readSessionTransaction,
 	transactionPath,
 	withNamespaceRegistry,
 	withSessionTransaction,
@@ -3373,6 +3374,180 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		expect(
 			controls.filter(control => control.operation === "turn.prompt" || control.operation === "session.close"),
 		).toEqual([]);
+	});
+	it("migrates a legacy endpoint digest only from the exact current broker row", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const sessions = [
+			{
+				sessionId: "visible-session",
+				locator: { cwd: root, worktreeRoot: null, stateRoot: path.join(root, ".gjc", "state") },
+				live: true,
+				endpointGeneration: 1,
+				pid: 101,
+				endpointMtimeMs: 1,
+			},
+		];
+		const server = await createSdkControlServer(root, controls, undefined, undefined, sessions);
+		await registerSdkSession(server, root);
+		const recordPath = path.join(coordinatorNamespace(root), "sessions", "visible-session.json");
+		const recordBefore = JSON.parse(await fs.readFile(recordPath, "utf8")) as Record<string, unknown>;
+		const legacyDigest = String(recordBefore.endpoint_incarnation);
+		const endpointPath = path.join(root, ".gjc", "state", "sdk", "visible-session.json");
+		const endpointStat = await fs.stat(endpointPath);
+		const endpointFileId = `${endpointStat.dev}:${endpointStat.ino}`;
+		(sessions[0] as Record<string, unknown>).endpointFileId = endpointFileId;
+		const currentDigest = createHash("sha256")
+			.update(
+				JSON.stringify({
+					endpointFileId,
+					endpointGeneration: sessions[0]!.endpointGeneration,
+					endpointMtimeMs: sessions[0]!.endpointMtimeMs,
+					pid: sessions[0]!.pid,
+					sessionId: "visible-session",
+				}),
+			)
+			.digest("hex");
+		const paths = coordinatorStatePaths(server.config.stateRoot, server.config.namespace.identity);
+
+		const recovered = await server.callTool("gjc_coordinator_read_coordination_status", {
+			session_id: "visible-session",
+		});
+		expect(recovered).toMatchObject({ ok: true });
+		const migratedRecord = JSON.parse(await fs.readFile(recordPath, "utf8")) as Record<string, unknown>;
+		const migratedTransaction = await readSessionTransaction(paths, "visible-session");
+		expect(legacyDigest).not.toBe(currentDigest);
+		expect(migratedRecord).toMatchObject({ endpoint_incarnation: currentDigest, endpoint_file_id: endpointFileId });
+		expect(migratedTransaction?.canonical.session.broker).toMatchObject({
+			endpoint_incarnation: currentDigest,
+			endpoint_file_id: endpointFileId,
+		});
+		const migratedRevision = migratedTransaction?.revision;
+		await expect(
+			server.callTool("gjc_coordinator_read_coordination_status", { session_id: "visible-session" }),
+		).resolves.toMatchObject({ ok: true });
+		expect((await readSessionTransaction(paths, "visible-session"))?.revision).toBe(migratedRevision);
+
+		const mismatchRoot = await tempRoot();
+		const mismatchControls: SdkControl[] = [];
+		const mismatchSessions = [
+			{
+				sessionId: "visible-session",
+				locator: { cwd: mismatchRoot, worktreeRoot: null, stateRoot: path.join(mismatchRoot, ".gjc", "state") },
+				live: true,
+				endpointGeneration: 1,
+				pid: 101,
+				endpointMtimeMs: 1,
+			},
+		];
+		const mismatchServer = await createSdkControlServer(
+			mismatchRoot,
+			mismatchControls,
+			undefined,
+			undefined,
+			mismatchSessions,
+		);
+		await registerSdkSession(mismatchServer, mismatchRoot);
+		const mismatchEndpointPath = path.join(mismatchRoot, ".gjc", "state", "sdk", "visible-session.json");
+		const mismatchEndpointStat = await fs.stat(mismatchEndpointPath);
+		(mismatchSessions[0] as Record<string, unknown>).endpointFileId =
+			`${mismatchEndpointStat.dev}:${mismatchEndpointStat.ino}`;
+		const mismatchPaths = coordinatorStatePaths(
+			mismatchServer.config.stateRoot,
+			mismatchServer.config.namespace.identity,
+		);
+		await withSessionTransaction(mismatchPaths, "visible-session", async transaction => {
+			transaction.canonical.session.broker.endpoint_incarnation = "f".repeat(64);
+			delete transaction.canonical.session.broker.endpoint_file_id;
+		});
+		const mismatchRecordPath = path.join(coordinatorNamespace(mismatchRoot), "sessions", "visible-session.json");
+		const mismatchRecord = JSON.parse(await fs.readFile(mismatchRecordPath, "utf8")) as Record<string, unknown>;
+		delete mismatchRecord.endpoint_file_id;
+		mismatchRecord.endpoint_incarnation = "f".repeat(64);
+		await Bun.write(mismatchRecordPath, `${JSON.stringify(mismatchRecord)}\n`);
+		await expect(
+			mismatchServer.callTool("gjc_coordinator_read_coordination_status", { session_id: "visible-session" }),
+		).resolves.toMatchObject({ ok: false, error: { code: "endpoint_stale" } });
+	});
+	it("uses the canonical turn for zero-time watch acknowledgement decisions after endpoint-file migration", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const sessions = [
+			{
+				sessionId: "visible-session",
+				locator: { cwd: root, worktreeRoot: null, stateRoot: path.join(root, ".gjc", "state") },
+				live: true,
+				endpointGeneration: 1,
+				pid: 101,
+				endpointMtimeMs: 1,
+			},
+		];
+		const server = await createSdkControlServer(
+			root,
+			controls,
+			undefined,
+			undefined,
+			sessions,
+			undefined,
+			undefined,
+			{
+				promptAckTimeoutMs: 1,
+			},
+		);
+		await registerSdkSession(server, root);
+		const sent = await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "visible-session",
+			prompt: "preserve acknowledged turn",
+			idempotency_key: "canonical-zero-time-ack",
+			allow_mutation: true,
+		});
+		const turnId = String(sent.turn_id);
+		const projectionTurnPath = path.join(coordinatorNamespace(root), "turns", `${turnId}.json`);
+		const projectionTurn = JSON.parse(await fs.readFile(projectionTurnPath, "utf8")) as Record<string, unknown>;
+		const projectedDelivery = projectionTurn.delivery as Record<string, unknown>;
+		await fs.writeFile(
+			projectionTurnPath,
+			JSON.stringify({
+				...projectionTurn,
+				delivery: {
+					...projectedDelivery,
+					tmux_keys_sent: true,
+					prompt_acknowledged: false,
+					state: "tmux_keys_sent",
+					attempts: [
+						...(projectedDelivery.attempts as unknown[]),
+						{
+							delivered: true,
+							created_at: new Date(Date.now() - 1000).toISOString(),
+							reason: null,
+							channel: "tmux_keys",
+							tmux_keys_sent: true,
+						},
+					],
+				},
+			}),
+		);
+		const endpointPath = path.join(root, ".gjc", "state", "sdk", "visible-session.json");
+		const endpointStat = await fs.stat(endpointPath);
+		const endpointFileId = `${endpointStat.dev}:${endpointStat.ino}`;
+		(sessions[0] as Record<string, unknown>).endpointFileId = endpointFileId;
+		const cursor = await currentEventCursor(root);
+
+		const watched = await server.callTool("gjc_coordinator_watch_events", { after_seq: cursor, timeout_ms: 0 });
+		expect(watched).toMatchObject({ ok: true, events: [] });
+		const paths = coordinatorStatePaths(server.config.stateRoot, server.config.namespace.identity);
+		const migrated = await withSessionTransaction(paths, "visible-session", async transaction => transaction);
+		expect(migrated.canonical.session.broker.endpoint_file_id).toBe(endpointFileId);
+		await expect(
+			server.callTool("gjc_coordinator_read_turn", { session_id: "visible-session", turn_id: turnId }),
+		).resolves.toMatchObject({
+			ok: true,
+			turn: {
+				turn_id: turnId,
+				status: "active",
+				delivery: { prompt_acknowledged: true, state: "acknowledged" },
+			},
+		});
 	});
 	it("fails closed when a same-generation successor moves to a different broker workspace", async () => {
 		const root = await tempRoot();

@@ -8,7 +8,7 @@ import * as path from "node:path";
 
 const root = path.join(import.meta.dir, "..");
 const SHA = /^[0-9a-f]{40}$/i;
-export const GUARD_CONTRACT_VERSION = 51;
+export const GUARD_CONTRACT_VERSION = 54;
 const telegramContract = "packages/coding-agent/src/sdk/bus/telegram-daemon-contract.ts";
 const telegramDaemon = "packages/coding-agent/src/sdk/bus/telegram-daemon.ts";
 const telegramControl = "packages/coding-agent/src/sdk/bus/telegram-daemon-control.ts";
@@ -17,6 +17,7 @@ const richRender = "packages/coding-agent/src/sdk/bus/rich-render.ts";
 const sdkHost = "packages/coding-agent/src/sdk/host/host.ts";
 
 const chatControl = "packages/coding-agent/src/sdk/bus/chat-daemon-control.ts";
+const chatEffectJournal = "packages/coding-agent/src/sdk/bus/chat-effect-journal.ts";
 const chatCli = "packages/coding-agent/src/sdk/bus/chat-daemon-cli.ts";
 const sdkDiscovery = "packages/coding-agent/src/sdk/client/discovery.ts";
 const sessionRouter = "packages/coding-agent/src/sdk/router/session-router.ts";
@@ -78,7 +79,7 @@ type GuardManifest = {
  * protected because old owners must be replaced when that admission path changes.
  */
 export const protectedInventory = manifest.inventory as Inventory;
-const PROTECTED_INVENTORY_SHA256 = "2e76706a9ebe0362f8a48c191677f0ca682ea6d4a39b29fafedabce8e677c118";
+const PROTECTED_INVENTORY_SHA256 = "0679e491e53bd0db96e37151dfda97a95d6d3265b771631865d8ef1f97c00edb";
 
 /** Transition-marker generations fence every daemon lifecycle mutation. */
 export const TRANSITION_TOKEN_PROTECTED_DECLARATIONS = [
@@ -181,8 +182,49 @@ export const CHAT_ENDPOINT_DISCOVERY_PROTECTED_DECLARATIONS = {
 		"SessionRouter.#attach",
 		"SessionRouter.#createAttachedClient",
 		"SessionRouter.#publishAttachment",
+		"SessionRouter.#attachUnserialized",
+		"SessionRouter.#endpointAuthorityUnchanged",
+		"SessionRouter.#readProvenEndpoint",
+		"createSessionAttachmentAuthorityId",
+		"sessionAttachmentAuthorityId",
+		"sessionAttachmentLegacyAuthorityId",
+		"lstatEndpoint",
+		"sameEndpointIdentity",
+		"matchesIndexedEndpointIdentity",
+		"sameIndexedAuthority",
+		"matchesAdoptedSessionAuthority",
 	],
 	[sdkDiscovery]: ["readSdkSessionEndpoint"],
+} as const;
+
+/** Chat effect session mutation, migration, and attachment-authority validation must stay generation-fenced. */
+export const CHAT_EFFECT_JOURNAL_PROTECTED_DECLARATIONS = {
+	[chatEffectJournal]: [
+		"sessionMutationGateFileName",
+		"mappingAcceptsAuthority",
+		"collectAttachmentAuthorityIds",
+		"rewriteAttachmentAuthorityIds",
+		"ChatEffectJournal.#sessionGateStores",
+		"ChatEffectJournal.#createSessionGateStore",
+		"withSessionMutationGate",
+		"migrateAttachmentAuthorityId",
+		"migrateAttachmentAuthorityIdWhileHoldingGate",
+		"enqueue",
+		"enqueueWhileHoldingSessionMutationGate",
+		"enqueueAndClaim",
+		"enqueueAndClaimWhileHoldingSessionMutationGate",
+		"claim",
+		"claimWhileHoldingSessionMutationGate",
+		"renew",
+		"renewWhileHoldingSessionMutationGate",
+		"recordReceipt",
+		"recordReceiptWhileHoldingSessionMutationGate",
+		"record",
+		"recordWhileHoldingSessionMutationGate",
+		"terminalize",
+		"terminalizeWhileHoldingSessionMutationGate",
+		"ChatEffectJournal.#prepareEnqueue",
+	],
 } as const;
 
 /** Telegram tool-activity defaults and delivery admission must stay generation-fenced. */
@@ -297,6 +339,16 @@ function validateChatEndpointDiscoveryInventory(inventory: Inventory): void {
 	}
 }
 
+function validateChatEffectJournalInventory(inventory: Inventory): void {
+	for (const family of ["discord", "slack"] as const) {
+		const symbols = inventory[family][chatEffectJournal];
+		if (!symbols || CHAT_EFFECT_JOURNAL_PROTECTED_DECLARATIONS[chatEffectJournal].some(symbol => !symbols.includes(symbol)))
+			throw new Error(
+				`telegram-daemon-generation-guard: chat effect journal session mutation and authority primitives must be protected by the ${family} generation contract`,
+			);
+	}
+}
+
 function validateTelegramToolActivityInventory(inventory: Inventory): void {
 	for (const [file, required] of Object.entries(TELEGRAM_TOOL_ACTIVITY_PROTECTED_DECLARATIONS)) {
 		const symbols = inventory.telegram[file];
@@ -375,6 +427,7 @@ export function validateInventory(inventory: Inventory = protectedInventory): vo
 	validateChatCliInventory(inventory);
 	validateChatConfigInventory(inventory);
 	validateChatEndpointDiscoveryInventory(inventory);
+	validateChatEffectJournalInventory(inventory);
 	validateTelegramToolActivityInventory(inventory);
 	validateTelegramTopicAdmissionInventory(inventory);
 	validateTelegramCallbackRecoveryInventory(inventory);

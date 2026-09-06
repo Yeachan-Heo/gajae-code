@@ -1022,6 +1022,7 @@ type SessionIdentityExpectation = {
 	processIncarnation?: string;
 	hostIncarnation?: string;
 	endpointMtimeMs?: number;
+	endpointFileId?: string;
 	lifecycleRequestId?: string;
 };
 
@@ -1038,6 +1039,22 @@ function sameSessionTuple(
 }
 
 function sameSessionIdentity(
+	event: SessionIndexEvent,
+	expected: SessionIdentityExpectation,
+	expectedRoot: string,
+): boolean {
+	return (
+		sameSessionTuple(event, expected, expectedRoot) &&
+		event.pid === expected.pid &&
+		event.processIncarnation === expected.processIncarnation &&
+		event.hostIncarnation === expected.hostIncarnation &&
+		event.endpointMtimeMs === expected.endpointMtimeMs &&
+		event.endpointFileId === expected.endpointFileId &&
+		event.lifecycleRequestId === expected.lifecycleRequestId
+	);
+}
+
+function sameSessionLegacyIdentity(
 	event: SessionIndexEvent,
 	expected: SessionIdentityExpectation,
 	expectedRoot: string,
@@ -1590,6 +1607,23 @@ export class SessionIndex {
 					indexSeq: this.indexSeq + 1,
 					ts: input.ts ?? Date.now(),
 				};
+				if (unsigned.type === "host_unregistered") {
+					const registration = this.#events.findLast(
+						event =>
+							event.type === "host_registered" &&
+							event.sessionId === unsigned.sessionId &&
+							event.endpointGeneration === unsigned.endpointGeneration &&
+							event.pid === unsigned.pid &&
+							resolveEquivalentPath(event.locator.stateRoot) ===
+								resolveEquivalentPath(unsigned.locator.stateRoot) &&
+							(unsigned.lifecycleRequestId === undefined ||
+								event.lifecycleRequestId === unsigned.lifecycleRequestId),
+					);
+					if (registration) {
+						if (unsigned.endpointMtimeMs === undefined) unsigned.endpointMtimeMs = registration.endpointMtimeMs;
+						if (unsigned.endpointFileId === undefined) unsigned.endpointFileId = registration.endpointFileId;
+					}
+				}
 				// The host's own OS identity was derived before the lock above;
 				// broker-authored events for another process carry the registration's
 				// persisted binding instead.
@@ -1632,6 +1666,7 @@ export class SessionIndex {
 						session.endpointGeneration === expected.endpointGeneration &&
 						session.pid === expected.pid &&
 						session.endpointMtimeMs === expected.endpointMtimeMs &&
+						session.endpointFileId === expected.endpointFileId &&
 						session.lifecycleRequestId === expected.lifecycleRequestId &&
 						session.processIncarnation === expected.processIncarnation &&
 						(session.hostIncarnation ?? session.processIncarnation) ===
@@ -1673,6 +1708,7 @@ export class SessionIndex {
 					locator: expected.locator,
 					endpointGeneration: expected.endpointGeneration,
 					pid: expected.pid,
+					...(expected.endpointFileId === undefined ? {} : { endpointFileId: expected.endpointFileId }),
 					...(expected.processIncarnation === undefined
 						? {}
 						: { processIncarnation: expected.processIncarnation }),
@@ -1969,6 +2005,7 @@ export class SessionIndex {
 		processIncarnation?: string;
 		hostIncarnation?: string;
 		endpointMtimeMs?: number;
+		endpointFileId?: string;
 		lifecycleRequestId?: string;
 	}): IndexedSession | undefined {
 		const expectedRoot = resolveEquivalentPath(expected.stateRoot);
@@ -1991,6 +2028,29 @@ export class SessionIndex {
 		);
 	}
 
+	/** Resolves one retained file-bound identity for a legacy receipt that predates endpointFileId. */
+	findUniqueHistoricalFileBoundSessionIdentity(expected: SessionIdentityExpectation): IndexedSession | undefined {
+		const expectedRoot = resolveEquivalentPath(expected.stateRoot);
+		const matching = admitEvents(this.#events).admitted.filter(
+			event => event.endpointFileId !== undefined && sameSessionLegacyIdentity(event, expected, expectedRoot),
+		);
+		const fileIds = new Set(matching.map(event => event.endpointFileId!));
+		if (fileIds.size !== 1) return undefined;
+		const endpointFileId = [...fileIds][0]!;
+		const exact = matching.filter(event => event.endpointFileId === endpointFileId);
+		const latest = exact.findLast(event => event.type !== "host_heartbeat");
+		if (!latest) return undefined;
+		return projectIdentity(
+			{
+				identity: `${identityKey(latest)}\u0000${endpointFileId}`,
+				latest,
+				heartbeat: exact.findLast(event => event.type === "host_heartbeat"),
+			},
+			false,
+			this.#policy.clock(),
+		);
+	}
+
 	/** Returns the latest identity-bound terminal event, if retained. */
 	findSessionTerminalEvidence(
 		expected: Pick<
@@ -2002,6 +2062,7 @@ export class SessionIndex {
 			| "processIncarnation"
 			| "hostIncarnation"
 			| "endpointMtimeMs"
+			| "endpointFileId"
 			| "lifecycleRequestId"
 		>,
 	): { type: "host_unregistered" | "session_closed" | "session_deleted"; indexSeq: number } | undefined {
@@ -2015,6 +2076,7 @@ export class SessionIndex {
 			processIncarnation: expected.processIncarnation,
 			hostIncarnation: expected.hostIncarnation,
 			endpointMtimeMs: expected.endpointMtimeMs,
+			endpointFileId: expected.endpointFileId,
 			lifecycleRequestId: expected.lifecycleRequestId,
 		});
 		const event = this.#events.findLast(
@@ -2035,6 +2097,7 @@ export class SessionIndex {
 						processIncarnation: expected.processIncarnation,
 						hostIncarnation: expected.hostIncarnation,
 						endpointMtimeMs: expected.endpointMtimeMs,
+						endpointFileId: expected.endpointFileId,
 						lifecycleRequestId: expected.lifecycleRequestId,
 					},
 					expectedRoot,
@@ -2049,6 +2112,7 @@ export class SessionIndex {
 						processIncarnation: expected.processIncarnation,
 						hostIncarnation: expected.hostIncarnation,
 						endpointMtimeMs: expected.endpointMtimeMs,
+						endpointFileId: expected.endpointFileId,
 						lifecycleRequestId: expected.lifecycleRequestId,
 					},
 					expectedRoot,
@@ -2071,6 +2135,7 @@ export class SessionIndex {
 			| "processIncarnation"
 			| "hostIncarnation"
 			| "endpointMtimeMs"
+			| "endpointFileId"
 			| "lifecycleRequestId"
 		>,
 	): number | undefined {
@@ -2083,6 +2148,7 @@ export class SessionIndex {
 			processIncarnation: expected.processIncarnation,
 			hostIncarnation: expected.hostIncarnation,
 			endpointMtimeMs: expected.endpointMtimeMs,
+			endpointFileId: expected.endpointFileId,
 			lifecycleRequestId: expected.lifecycleRequestId,
 		});
 		return this.#events.findLast(
@@ -2100,6 +2166,7 @@ export class SessionIndex {
 						processIncarnation: expected.processIncarnation,
 						hostIncarnation: expected.hostIncarnation,
 						endpointMtimeMs: expected.endpointMtimeMs,
+						endpointFileId: expected.endpointFileId,
 						lifecycleRequestId: expected.lifecycleRequestId,
 					},
 					expectedRoot,
@@ -2114,6 +2181,7 @@ export class SessionIndex {
 						processIncarnation: expected.processIncarnation,
 						hostIncarnation: expected.hostIncarnation,
 						endpointMtimeMs: expected.endpointMtimeMs,
+						endpointFileId: expected.endpointFileId,
 						lifecycleRequestId: expected.lifecycleRequestId,
 					},
 					expectedRoot,
@@ -2232,6 +2300,8 @@ export class SessionIndex {
 			| "locator"
 			| "endpointGeneration"
 			| "pid"
+			| "endpointMtimeMs"
+			| "endpointFileId"
 			| "indexSeq"
 			| "lifecycleRequestId"
 			| "hostIncarnation"
@@ -2247,6 +2317,9 @@ export class SessionIndex {
 				item.sessionId === registration.sessionId &&
 				item.endpointGeneration === registration.endpointGeneration &&
 				item.pid === registration.pid &&
+				((item.endpointMtimeMs === undefined && item.endpointFileId === undefined) ||
+					(item.endpointMtimeMs === registration.endpointMtimeMs &&
+						item.endpointFileId === registration.endpointFileId)) &&
 				resolveEquivalentPath(item.locator.cwd) === resolveEquivalentPath(registration.locator.cwd) &&
 				path.resolve(item.locator.stateRoot) === path.resolve(registration.locator.stateRoot) &&
 				(lifecycleRequestId === undefined || item.lifecycleRequestId === lifecycleRequestId) &&

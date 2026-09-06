@@ -1,15 +1,15 @@
-import { describe, expect, test, vi } from "bun:test";
+import { afterEach, describe, expect, test, vi } from "bun:test";
 import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { ChatDeliveryError } from "../src/sdk/bus/chat-daemon-runtime";
 import {
+	__chatEffectJournalTestHooks,
 	type ChatEffect,
 	ChatEffectJournal,
 	type ChatEffectLease,
 	type ChatEffectReceipt,
-	type EnqueueChatEffect,
 } from "../src/sdk/bus/chat-effect-journal";
 
 import { ConversationStore } from "../src/sdk/bus/conversation-store";
@@ -28,6 +28,10 @@ import type {
 } from "../src/sdk/bus/discord-provider";
 import { SdkClientError } from "../src/sdk/client/client";
 import type { SessionAttachment } from "../src/sdk/router";
+
+afterEach(() => {
+	__chatEffectJournalTestHooks.beforeAuthorityMigrationEffect = undefined;
+});
 
 const actionCustomIds = new Map<string, string>();
 
@@ -211,6 +215,217 @@ function inbound(threadId: string, id: string, generation = 1, customId?: string
 }
 
 describe("DiscordNotificationDaemon fake-provider acceptance", () => {
+	test("migrates legacy authority when a standalone daemon resolves an attachment", async () => {
+		const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-discord-standalone-migration-"));
+		try {
+			const provider = new FakeDiscordProvider();
+			const legacy = new DiscordNotificationDaemon({
+				agentDir,
+				guildId: "guild",
+				parentChannelId: "parent",
+				provider,
+				resolveAttachment: async sessionId => ({
+					sessionId,
+					generation: 1,
+					authorityId: "legacy-authority",
+					isCurrent: () => true,
+					send: () => {},
+					sendMaintenance: () => {},
+				}),
+			});
+			await legacy.notify({
+				sessionId: "session",
+				endpointGeneration: 1,
+				attachmentAuthorityId: "legacy-authority",
+				content: "root",
+			});
+			const current = new DiscordNotificationDaemon({
+				agentDir,
+				guildId: "guild",
+				parentChannelId: "parent",
+				provider,
+				resolveAttachment: async sessionId => ({
+					sessionId,
+					generation: 1,
+					authorityId: "current-authority",
+					legacyAuthorityId: "legacy-authority",
+					isCurrent: () => true,
+					send: () => {},
+					sendMaintenance: () => {},
+				}),
+			});
+			await current.notify({
+				sessionId: "session",
+				endpointGeneration: 1,
+				attachmentAuthorityId: "current-authority",
+				content: "after migration",
+			});
+			const record = Object.values(
+				(await new ConversationStore<DiscordConversation>({ agentDir, kind: "discord" }).load()).conversations,
+			).find(item => item.sessionId === "session");
+			expect(record?.attachmentAuthorityId).toBe("current-authority");
+			expect(record?.attachmentAuthorityMigrationFromId).toBeUndefined();
+		} finally {
+			await fs.rm(agentDir, { recursive: true, force: true });
+		}
+	});
+
+	test("migrates persisted attachment and effect authority after device binding", async () => {
+		let authorityId = "legacy-authority";
+		await withDaemon(
+			async (daemon, _provider, agentDir) => {
+				const conversation = await daemon.notify({
+					sessionId: "session",
+					endpointGeneration: 1,
+					attachmentAuthorityId: authorityId,
+					content: "root",
+				});
+				authorityId = "device-bound-authority";
+				__chatEffectJournalTestHooks.beforeAuthorityMigrationEffect = () => {
+					throw new Error("effect migration exploded");
+				};
+				await expect(
+					daemon.migrateAttachmentAuthority("session", 1, "legacy-authority", authorityId),
+				).rejects.toThrow("effect migration exploded");
+
+				const store = new ConversationStore<DiscordConversation>({ agentDir, kind: "discord" });
+				const fenced = Object.values((await store.load()).conversations).find(
+					record => record.sessionId === "session" && record.threadId === conversation.threadId,
+				);
+				expect(fenced?.attachmentAuthorityId).toBe("device-bound-authority");
+				expect(fenced?.attachmentAuthorityMigrationFromId).toBe("legacy-authority");
+
+				const journal = new ChatEffectJournal({ agentDir, transport: "discord" });
+				let effect = (await journal.list()).find(record => record.kind === "post-message");
+				expect((effect?.payload as { attachmentAuthorityId?: string }).attachmentAuthorityId).toBe(
+					"legacy-authority",
+				);
+
+				__chatEffectJournalTestHooks.beforeAuthorityMigrationEffect = undefined;
+				await daemon.migrateAttachmentAuthority("session", 1, "legacy-authority", authorityId);
+				const migrated = Object.values((await store.load()).conversations).find(
+					record => record.sessionId === "session" && record.threadId === conversation.threadId,
+				);
+				expect(migrated?.attachmentAuthorityMigrationFromId).toBeUndefined();
+				effect = (await journal.list()).find(record => record.kind === "post-message");
+				expect((effect?.payload as { attachmentAuthorityId?: string }).attachmentAuthorityId).toBe(
+					"device-bound-authority",
+				);
+				__chatEffectJournalTestHooks.beforeAuthorityMigrationEffect = undefined;
+			},
+			{
+				resolveAttachment: async sessionId => ({
+					sessionId,
+					generation: 1,
+					authorityId,
+					isCurrent: () => true,
+					send: () => {},
+					sendMaintenance: () => {},
+				}),
+			},
+		);
+	});
+
+	test("rejects a provider effect that omits attachment authority", async () => {
+		await withDaemon(
+			async (daemon, _provider, agentDir) => {
+				await daemon.notify({
+					sessionId: "session",
+					endpointGeneration: 1,
+					attachmentAuthorityId: "current-authority",
+					content: "root",
+				});
+				const journal = new ChatEffectJournal({ agentDir, transport: "discord" });
+				await expect(
+					journal.enqueue({
+						id: "missing-authority",
+						kind: "post-message",
+						transport: "discord",
+						sessionId: "session",
+						endpointGeneration: 1,
+						payload: {
+							threadId: "thread-1",
+							content: "forged",
+							nonce: "missing-authority",
+							attachmentAuthorityId: undefined,
+						},
+					}),
+				).rejects.toThrow("attachment authority");
+			},
+			{
+				resolveAttachment: async sessionId => ({
+					sessionId,
+					generation: 1,
+					authorityId: "current-authority",
+					isCurrent: () => true,
+					send: () => {},
+					sendMaintenance: () => {},
+				}),
+			},
+		);
+	});
+
+	test("fences an effect enqueued after the migration journal snapshot", async () => {
+		let authorityId = "legacy-authority";
+		await withDaemon(
+			async (daemon, _provider, agentDir) => {
+				await daemon.notify({
+					sessionId: "session",
+					endpointGeneration: 1,
+					attachmentAuthorityId: authorityId,
+					content: "root",
+				});
+				authorityId = "current-authority";
+				const entered = Promise.withResolvers<void>();
+				const release = Promise.withResolvers<void>();
+				let paused = true;
+				__chatEffectJournalTestHooks.beforeAuthorityMigrationEffect = async () => {
+					if (!paused) return;
+					paused = false;
+					entered.resolve();
+					await release.promise;
+				};
+
+				const journal = new ChatEffectJournal({ agentDir, transport: "discord" });
+				const migration = daemon.migrateAttachmentAuthority("session", 1, "legacy-authority", "current-authority");
+				await entered.promise;
+				const late = journal.enqueue({
+					id: "late-discord-effect",
+					kind: "post-message",
+					transport: "discord",
+					sessionId: "session",
+					endpointGeneration: 1,
+					payload: {
+						threadId: "thread-1",
+						content: "late",
+						nonce: "late-discord-effect",
+						attachmentAuthorityId: "legacy-authority",
+					},
+				});
+				release.resolve();
+				await migration;
+				await expect(late).rejects.toThrow("attachment authority");
+				expect(await journal.read("late-discord-effect")).toBeUndefined();
+				const store = new ConversationStore<DiscordConversation>({ agentDir, kind: "discord" });
+				const migrated = Object.values((await store.load()).conversations).find(
+					record => record.sessionId === "session",
+				);
+				expect(migrated?.attachmentAuthorityId).toBe("current-authority");
+				expect(migrated?.attachmentAuthorityMigrationFromId).toBeUndefined();
+			},
+			{
+				resolveAttachment: async sessionId => ({
+					sessionId,
+					generation: 1,
+					authorityId,
+					isCurrent: () => true,
+					send: () => {},
+					sendMaintenance: () => {},
+				}),
+			},
+		);
+	});
+
 	test("reconciles an uncertain create by nonce instead of creating a second thread", async () => {
 		await withDaemon(async (daemon, provider) => {
 			provider.failCreateAfterPersist = true;
@@ -650,26 +865,8 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 		const frames: Record<string, unknown>[] = [];
 		const journaled = Promise.withResolvers<void>();
 		const release = Promise.withResolvers<void>();
-		const originalEnqueueAndClaim = ChatEffectJournal.prototype.enqueueAndClaim;
 		let recovery: DiscordNotificationDaemon | undefined;
 		let deferred = 0;
-		vi.spyOn(ChatEffectJournal.prototype, "enqueueAndClaim").mockImplementation(async function <TPayload>(
-			this: ChatEffectJournal,
-			input: EnqueueChatEffect<TPayload>,
-			owner: string,
-			leaseMs: number,
-		): Promise<ChatEffect<TPayload> | undefined> {
-			const claimed = (await originalEnqueueAndClaim.call(this, input, owner, leaseMs)) as
-				| ChatEffect<TPayload>
-				| undefined;
-			// Barrier only the inbound action claim under test; outbound provider
-			// effects also use enqueueAndClaim now and must not trip this fence.
-			if (input.kind === "discord.inbound.action") {
-				journaled.resolve();
-				await release.promise;
-			}
-			return claimed;
-		});
 		try {
 			await withDaemon(
 				async (daemon, provider, agentDir) => {
@@ -682,6 +879,8 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 					});
 					provider.deferInteraction = async () => {
 						deferred++;
+						journaled.resolve();
+						await release.promise;
 					};
 					const effectId = `discord:app:guild:parent:${conversation.threadId}:live-recovery-barrier`;
 					const live = daemon.handleInbound(inbound(conversation.threadId!, "live-recovery-barrier", 1));
@@ -715,8 +914,8 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 						owner: beforeRecovery?.owner,
 						epoch: beforeRecovery?.epoch,
 					});
-					expect(afterRecovery?.receipt).toBeUndefined();
-					expect(deferred).toBe(0);
+					expect(afterRecovery?.receipt).toEqual({ status: "defer_intent" });
+					expect(deferred).toBe(1);
 					expect(frames).toEqual([]);
 
 					release.resolve();
@@ -2547,11 +2746,22 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 			);
 
 			const leased = await journal.enqueueAndClaim(
-				{ ...input, id: "live-effect", payload: { threadId: "thread", content: "live" } },
+				{
+					...input,
+					id: "live-effect",
+					payload: { threadId: "thread", content: "live", attachmentAuthorityId: "legacy-authority" },
+				},
 				"owner",
 				60_000,
 			);
 			expect(leased).toBeDefined();
+			await journal.migrateAttachmentAuthorityId("session", 1, "legacy-authority", "current-authority");
+			expect(await journal.read("live-effect")).toMatchObject({
+				state: "leased",
+				owner: "owner",
+				epoch: leased!.epoch,
+				payload: { attachmentAuthorityId: "current-authority" },
+			});
 			await journal.terminalize("live-effect", { status: "stale_noop" });
 			expect(await journal.read("live-effect")).toMatchObject({ state: "leased", owner: "owner" });
 			await journal.record("live-effect", { owner: "owner", epoch: leased!.epoch }, "terminal");
@@ -2793,5 +3003,230 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 			);
 			expect(new Set(archiveEffects.map(effect => effect.id)).size).toBe(2);
 		});
+	});
+
+	test("reloads an inbound command after resolver-triggered authority migration", async () => {
+		let authorityId = "legacy-authority";
+		const commands: string[] = [];
+		await withDaemon(
+			async (daemon, _provider, agentDir) => {
+				const conversation = await daemon.notify({
+					sessionId: "session",
+					endpointGeneration: 1,
+					attachmentAuthorityId: "legacy-authority",
+					content: "open",
+				});
+				authorityId = "current-authority";
+				await daemon.handleInbound({
+					...inbound(conversation.threadId!, "migrated-command"),
+					interaction: undefined,
+					content: "/sdk migrate",
+				});
+				expect(commands).toEqual(["/sdk migrate"]);
+				const store = new ConversationStore<DiscordConversation>({ agentDir, kind: "discord" });
+				const mapping = await store.read(`app:guild:parent:${conversation.threadId}`);
+				expect(mapping).toMatchObject({ attachmentAuthorityId: "current-authority" });
+				expect(mapping?.attachmentAuthorityMigrationFromId).toBeUndefined();
+				const effect = await new ChatEffectJournal({ agentDir, transport: "discord" }).read(
+					`discord:app:guild:parent:${conversation.threadId}:migrated-command`,
+				);
+				expect(effect).toMatchObject({ state: "terminal" });
+				expect(
+					(effect?.payload as { routing: { attachmentAuthorityId?: string } }).routing.attachmentAuthorityId,
+				).toBe("current-authority");
+			},
+			{
+				resolveAttachment: async (sessionId, expectedGeneration = 1) => ({
+					sessionId,
+					generation: expectedGeneration,
+					authorityId,
+					...(authorityId === "current-authority" ? { legacyAuthorityId: "legacy-authority" } : {}),
+					isCurrent: () => true,
+					send: () => {},
+					sendMaintenance: () => {},
+				}),
+				onCommand: async (_sessionId, content) => {
+					commands.push(content);
+					return true;
+				},
+			},
+		);
+	});
+
+	test("reloads orphaned inbound authority after startup migration", async () => {
+		let authorityId = "legacy-authority";
+		const commands: string[] = [];
+		await withDaemon(
+			async (daemon, provider, agentDir) => {
+				const conversation = await daemon.notify({
+					sessionId: "session",
+					endpointGeneration: 1,
+					attachmentAuthorityId: "legacy-authority",
+					content: "open",
+				});
+				const journal = new ChatEffectJournal({ agentDir, transport: "discord" });
+				const effectId = `discord:app:guild:parent:${conversation.threadId}:migrated-orphan`;
+				await journal.enqueue({
+					id: effectId,
+					kind: "discord.inbound.command",
+					transport: "discord",
+					sessionId: "session",
+					endpointGeneration: 1,
+					payload: {
+						type: "command",
+						content: "/sdk orphan-migrate",
+						idempotencyKey: effectId,
+						routing: {
+							guildId: "guild",
+							parentId: "parent",
+							threadId: conversation.threadId!,
+							eventId: "migrated-orphan",
+							attachmentAuthorityId: "legacy-authority",
+							kind: "command",
+						},
+					},
+				});
+				authorityId = "current-authority";
+				const restarted = new DiscordNotificationDaemon({
+					agentDir,
+					guildId: "guild",
+					parentChannelId: "parent",
+					provider,
+					resolveAttachment: async sessionId => ({
+						sessionId,
+						generation: 1,
+						authorityId,
+						legacyAuthorityId: "legacy-authority",
+						isCurrent: () => true,
+						send: () => {},
+						sendMaintenance: () => {},
+					}),
+					onCommand: async (_sessionId, content) => {
+						commands.push(content);
+						return true;
+					},
+				});
+				await restarted.start();
+				expect(commands).toEqual(["/sdk orphan-migrate"]);
+				expect(await journal.read(effectId)).toMatchObject({ state: "terminal" });
+				await restarted.stop();
+			},
+			{
+				resolveAttachment: async (sessionId, expectedGeneration = 1) => ({
+					sessionId,
+					generation: expectedGeneration,
+					authorityId,
+					...(authorityId === "current-authority" ? { legacyAuthorityId: "legacy-authority" } : {}),
+					isCurrent: () => true,
+					send: () => {},
+					sendMaintenance: () => {},
+				}),
+				onCommand: async () => true,
+			},
+		);
+	});
+
+	test("reloads a receipt-backed inbound recovery after startup migration", async () => {
+		let authorityId = "legacy-authority";
+		const commands: string[] = [];
+		await withDaemon(
+			async (daemon, provider, agentDir) => {
+				const conversation = await daemon.notify({
+					sessionId: "session",
+					endpointGeneration: 1,
+					attachmentAuthorityId: "legacy-authority",
+					content: "open",
+				});
+				await daemon.handleInbound({
+					...inbound(conversation.threadId!, "migrated-recovery"),
+					interaction: undefined,
+					content: "/sdk recover-migrate",
+				});
+				const effectId = `discord:app:guild:parent:${conversation.threadId}:migrated-recovery`;
+				expect(await new ChatEffectJournal({ agentDir, transport: "discord" }).read(effectId)).toMatchObject({
+					state: "accepted",
+				});
+				authorityId = "current-authority";
+				const restarted = new DiscordNotificationDaemon({
+					agentDir,
+					guildId: "guild",
+					parentChannelId: "parent",
+					provider,
+					resolveAttachment: async sessionId => ({
+						sessionId,
+						generation: 1,
+						authorityId,
+						legacyAuthorityId: "legacy-authority",
+						isCurrent: () => true,
+						send: () => {},
+						sendMaintenance: () => {},
+					}),
+					onCommand: async (_sessionId, content) => {
+						commands.push(content);
+						return true;
+					},
+				});
+				await restarted.start();
+				expect(commands).toEqual(["/sdk recover-migrate"]);
+				expect(await new ChatEffectJournal({ agentDir, transport: "discord" }).read(effectId)).toMatchObject({
+					state: "terminal",
+				});
+				await restarted.stop();
+			},
+			{
+				resolveAttachment: async (sessionId, expectedGeneration = 1) => ({
+					sessionId,
+					generation: expectedGeneration,
+					authorityId,
+					...(authorityId === "current-authority" ? { legacyAuthorityId: "legacy-authority" } : {}),
+					isCurrent: () => true,
+					send: () => {},
+					sendMaintenance: () => {},
+				}),
+				onCommand: async () => {
+					throw new ChatDeliveryError("pre_send");
+				},
+			},
+		);
+	});
+
+	test("reloads an inbound interaction after callback-time authority migration", async () => {
+		let authorityId = "legacy-authority";
+		const frames: Record<string, unknown>[] = [];
+		await withDaemon(
+			async (daemon, _provider, agentDir) => {
+				const conversation = await daemon.notify({
+					sessionId: "session",
+					endpointGeneration: 1,
+					attachmentAuthorityId: "legacy-authority",
+					content: "Choose",
+					actionId: "ask",
+					options: ["Yes"],
+				});
+				authorityId = "current-authority";
+				await daemon.handleInbound(inbound(conversation.threadId!, "migrated-interaction", 1));
+				expect(frames).toMatchObject([
+					{ type: "reply", id: "ask", answer: "yes", idempotencyKey: expect.any(String) },
+				]);
+				const effect = await new ChatEffectJournal({ agentDir, transport: "discord" }).read(
+					`discord:app:guild:parent:${conversation.threadId}:migrated-interaction`,
+				);
+				expect(effect).toMatchObject({ state: "terminal" });
+				expect(
+					(effect?.payload as { routing: { attachmentAuthorityId?: string } }).routing.attachmentAuthorityId,
+				).toBe("current-authority");
+			},
+			{
+				resolveAttachment: async (sessionId, expectedGeneration = 1) => ({
+					sessionId,
+					generation: expectedGeneration,
+					authorityId,
+					...(authorityId === "current-authority" ? { legacyAuthorityId: "legacy-authority" } : {}),
+					isCurrent: () => true,
+					send: frame => frames.push(frame),
+					sendMaintenance: () => {},
+				}),
+			},
+		);
 	});
 });

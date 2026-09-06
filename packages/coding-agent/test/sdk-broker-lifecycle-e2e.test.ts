@@ -1,4 +1,4 @@
-import { afterEach, expect, test, vi } from "bun:test";
+import { afterEach, expect, type Mock, test, vi } from "bun:test";
 import { createHash } from "node:crypto";
 import * as syncFs from "node:fs";
 import { renameSync, writeFileSync } from "node:fs";
@@ -2997,6 +2997,33 @@ test("session index proves ordinary host unregistration using a newer matching r
 	}
 });
 
+test("session index accepts a legacy unregister that predates endpoint file identity", async () => {
+	const agentDir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-session-index-legacy-unregister-"));
+	const index = await new SessionIndex(agentDir).open();
+	try {
+		const shared = {
+			sessionId: "legacy-unregister",
+			locator: { cwd: "fixture", worktreeRoot: null, stateRoot: path.join(agentDir, "state") },
+			endpointGeneration: 7,
+			pid: process.pid,
+			lifecycleRequestId: "legacy-close",
+		};
+		const registration = await index.append({
+			type: "host_registered",
+			...shared,
+			endpointMtimeMs: 1234,
+			endpointFileId: "11:22",
+		});
+		await index.append({ type: "host_unregistered", ...shared });
+		expect(index.hostUnregisteredAfter(registration)).toEqual({
+			indexSeq: registration.indexSeq + 1,
+			lifecycleRequestId: "legacy-close",
+		});
+	} finally {
+		await fs.rm(agentDir, { recursive: true, force: true });
+	}
+});
+
 test("broker records the resolved worktree state root and preserves pre-child preparation failures", async () => {
 	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-lifecycle-worktree-prechild-"));
 	const repo = path.join(root, "repo");
@@ -3184,7 +3211,9 @@ test("broker fences ambiguous state roots from checkpoint, endpoint, and resume 
 			endpointPath,
 			JSON.stringify({ sessionId, pid: process.pid, url: "ws://127.0.0.1:1", token: "current-token" }),
 		);
-		const endpointMtimeMs = (await fs.stat(endpointPath)).mtimeMs;
+		const endpointIdentity = await fs.stat(endpointPath, { bigint: true });
+		const endpointMtimeMs = Number(endpointIdentity.mtimeNs) / 1_000_000;
+		const endpointFileId = `${endpointIdentity.dev}:${endpointIdentity.ino}`;
 		await broker.start();
 		setLifecycleCommandResolverForTest(broker, () => {
 			launchAttempts += 1;
@@ -3205,6 +3234,7 @@ test("broker fences ambiguous state roots from checkpoint, endpoint, and resume 
 			endpointGeneration: 2,
 			pid: process.pid,
 			endpointMtimeMs,
+			endpointFileId,
 		});
 		expect(broker.index.listSessions().sessions).toEqual([
 			expect.objectContaining({
@@ -3260,6 +3290,7 @@ test("broker fences ambiguous state roots from checkpoint, endpoint, and resume 
 			result: {
 				sessionId,
 				endpointGeneration: current.endpointGeneration,
+				endpointFileId,
 				reused: true,
 				endpoint: { token: "current-token" },
 			},
@@ -3354,11 +3385,13 @@ test("broker promotes the lower-generation root after the higher-generation root
 	const endpointPath = path.join(alternateStateRoot, "sdk", `${sessionId}.json`);
 	try {
 		await fs.mkdir(path.dirname(endpointPath), { recursive: true });
-		await fs.writeFile(
+		await Bun.write(
 			endpointPath,
 			JSON.stringify({ sessionId, pid: process.pid, url: "ws://127.0.0.1:1", token: "alternate-token" }),
 		);
-		const alternateEndpointMtimeMs = (await fs.stat(endpointPath)).mtimeMs;
+		const alternateEndpointIdentity = await fs.stat(endpointPath, { bigint: true });
+		const alternateEndpointMtimeMs = Number(alternateEndpointIdentity.mtimeNs) / 1_000_000;
+		const alternateEndpointFileId = `${alternateEndpointIdentity.dev}:${alternateEndpointIdentity.ino}`;
 		await broker.start();
 		const alternate = await broker.index.append({
 			type: "host_registered",
@@ -3367,6 +3400,7 @@ test("broker promotes the lower-generation root after the higher-generation root
 			endpointGeneration: 1,
 			pid: process.pid,
 			endpointMtimeMs: alternateEndpointMtimeMs,
+			endpointFileId: alternateEndpointFileId,
 		});
 		const current = await broker.index.append({
 			type: "host_registered",
@@ -3729,10 +3763,11 @@ test("broker atomically reuses the indexed live owner for distinct resume keys",
 	try {
 		await broker.start();
 		await fs.mkdir(path.dirname(endpointPath), { recursive: true });
-		await fs.writeFile(
+		await Bun.write(
 			endpointPath,
 			JSON.stringify({ sessionId, pid: host.pid, url: "ws://127.0.0.1:1", token: "live-owner-token" }),
 		);
+		const endpointIdentity = await fs.stat(endpointPath, { bigint: true });
 		const hostIncarnation = await incarnation(host.pid);
 		await broker.index.append({
 			type: "host_registered",
@@ -3740,7 +3775,8 @@ test("broker atomically reuses the indexed live owner for distinct resume keys",
 			locator: { cwd: root, worktreeRoot: null, stateRoot },
 			endpointGeneration: 17,
 			pid: host.pid,
-			endpointMtimeMs: (await fs.stat(endpointPath)).mtimeMs,
+			endpointMtimeMs: Number(endpointIdentity.mtimeNs) / 1_000_000,
+			endpointFileId: `${endpointIdentity.dev}:${endpointIdentity.ino}`,
 			processIncarnation: hostIncarnation,
 			hostIncarnation,
 		});
@@ -4037,18 +4073,24 @@ test("reconcile_uncertain retires one dead create identity and refuses live host
 		const marker = { pid: child.pid!, effectMarker: "reconcile-effect", incarnation: processIdentity };
 		await fs.writeFile(path.join(stateRoot, "sdk", `${sessionId}.lifecycle.json`), canonicalJson(marker));
 		await fs.writeFile(path.join(stateRoot, "sdk", `${sessionId}.lifecycle.ready.json`), canonicalJson(marker));
+		const endpointPath = path.join(stateRoot, "sdk", `${sessionId}.json`);
+		await fs.writeFile(endpointPath, canonicalJson({ sessionId, pid: child.pid! }));
+		const endpointStat = await fs.stat(endpointPath);
+		const endpointFileId = `${endpointStat.dev}:${endpointStat.ino}`;
 		await broker.index.append({
 			type: "lifecycle_terminal",
 			sessionId,
 			locator: { cwd: agentDir, worktreeRoot: null, stateRoot },
 			endpointGeneration: 4,
 			pid: child.pid!,
-			endpointMtimeMs: 1,
+			endpointMtimeMs: endpointStat.mtimeMs,
+			endpointFileId,
 			lifecycleRequestId: "reconcile-effect",
 			processIncarnation: processIdentity,
 			hostIncarnation: processIdentity,
 			terminalUncertain: true,
 		});
+		await fs.rm(endpointPath);
 		const createIdentity = "reconcile-create-identity";
 		await broker.ledger.begin(createIdentity, "reconcile-create-request");
 		await broker.ledger.transition(createIdentity, "terminal_uncertain", {
@@ -4066,7 +4108,7 @@ test("reconcile_uncertain retires one dead create identity and refuses live host
 					cwd: agentDir,
 					stateRoot,
 					endpointGeneration: 4,
-					endpointMtimeMs: 1,
+					endpointMtimeMs: endpointStat.mtimeMs,
 					processIncarnation: processIdentity,
 					hostIncarnation: processIdentity,
 					lifecycleRequestId: "reconcile-effect",
@@ -4082,7 +4124,7 @@ test("reconcile_uncertain retires one dead create identity and refuses live host
 					cwd: agentDir,
 					stateRoot,
 					endpointGeneration: 4,
-					endpointMtimeMs: 1,
+					endpointMtimeMs: endpointStat.mtimeMs,
 					processIncarnation: processIdentity,
 					hostIncarnation: processIdentity,
 					lifecycleRequestId: "reconcile-effect",
@@ -4102,7 +4144,7 @@ test("reconcile_uncertain retires one dead create identity and refuses live host
 					cwd: agentDir,
 					stateRoot,
 					endpointGeneration: 4,
-					endpointMtimeMs: 1,
+					endpointMtimeMs: endpointStat.mtimeMs,
 					processIncarnation: processIdentity,
 					hostIncarnation: processIdentity,
 					lifecycleRequestId: "stale-marker",
@@ -4113,6 +4155,29 @@ test("reconcile_uncertain retires one dead create identity and refuses live host
 		).resolves.toMatchObject({ ok: false, error: { code: "retirement_proof_stale" } });
 		child.kill("SIGKILL");
 		await child.exited;
+		await expect(
+			broker.handleRequest(
+				"session.reconcile_uncertain",
+				{
+					sessionId,
+					cwd: agentDir,
+					stateRoot,
+					endpointGeneration: 4,
+					endpointMtimeMs: endpointStat.mtimeMs,
+					processIncarnation: processIdentity,
+					hostIncarnation: processIdentity,
+					lifecycleRequestId: "reconcile-effect",
+					remoteCreateKey: "reconcile-create-key",
+					endpointFileId: "arbitrary-file-id",
+				},
+				"reconcile-mismatched-file-id",
+			),
+		).resolves.toMatchObject({ ok: false, error: { code: "retirement_proof_stale" } });
+		const originalAppend = broker.index.append.bind(broker.index);
+		const appendFailureSpy = vi.spyOn(broker.index, "append").mockImplementation(async event => {
+			if (event.type === "session_closed") throw new Error("stage legacy retirement receipt");
+			return originalAppend(event);
+		});
 		const deadResponse = await broker.handleRequest(
 			"session.reconcile_uncertain",
 			{
@@ -4120,7 +4185,7 @@ test("reconcile_uncertain retires one dead create identity and refuses live host
 				cwd: agentDir,
 				stateRoot,
 				endpointGeneration: 4,
-				endpointMtimeMs: 1,
+				endpointMtimeMs: endpointStat.mtimeMs,
 				processIncarnation: processIdentity,
 				hostIncarnation: processIdentity,
 				lifecycleRequestId: "reconcile-effect",
@@ -4128,7 +4193,19 @@ test("reconcile_uncertain retires one dead create identity and refuses live host
 			},
 			"reconcile-dead",
 		);
-		let retiredResponse = deadResponse;
+		appendFailureSpy.mockRestore();
+		const stagedRetirement = broker.ledger.findByOperationKey("session.reconcile_uncertain\u0000reconcile-dead");
+		if (!stagedRetirement || deadResponse.ok) throw new Error("Expected staged uncertain retirement receipt");
+		const legacyResponse = structuredClone(deadResponse) as {
+			error?: { cleanup?: { uncertainRetirement?: { identity?: { endpointFileId?: string } } } };
+		};
+		const legacyIdentity = legacyResponse.error?.cleanup?.uncertainRetirement?.identity;
+		if (!legacyIdentity) throw new Error("Expected staged uncertain retirement identity");
+		delete legacyIdentity.endpointFileId;
+		await broker.ledger.transition(stagedRetirement.identity, "effect_started", {
+			response: legacyResponse as Extract<BrokerResponse, { ok: false }>,
+		});
+		let retiredResponse: BrokerResponse = deadResponse;
 		for (let attempt = 0; attempt < 4 && !retiredResponse.ok; attempt++) {
 			if (retiredResponse.error.code !== "cleanup_pending") break;
 			retiredResponse = await broker.handleRequest(
@@ -4138,7 +4215,7 @@ test("reconcile_uncertain retires one dead create identity and refuses live host
 					cwd: agentDir,
 					stateRoot,
 					endpointGeneration: 4,
-					endpointMtimeMs: 1,
+					endpointMtimeMs: endpointStat.mtimeMs,
 					processIncarnation: processIdentity,
 					hostIncarnation: processIdentity,
 					lifecycleRequestId: "reconcile-effect",
@@ -4149,7 +4226,7 @@ test("reconcile_uncertain retires one dead create identity and refuses live host
 		}
 		expect(retiredResponse).toMatchObject({
 			ok: true,
-			result: { sessionId, retired: true, indexType: "session_closed" },
+			result: { sessionId, retired: true, indexType: "session_closed", endpointFileId },
 		});
 		expect(broker.ledger.get(createIdentity)).toMatchObject({
 			state: "terminal_error",
@@ -4173,6 +4250,7 @@ test("reconcile_uncertain replays a ledger-stage receipt after deletion and same
 	const lifecycleRequestId = "reconcile-delete-effect";
 	const remoteCreateKey = "reconcile-delete-create";
 	const retirementKey = "reconcile-delete-retirement";
+	const endpointFileId = "41:1";
 	const child = spawnDisposableHost();
 	const broker = new Broker({ agentDir });
 	const createIdentity = "reconcile-delete-create-identity";
@@ -4185,6 +4263,7 @@ test("reconcile_uncertain replays a ledger-stage receipt after deletion and same
 			stateRoot,
 			endpointGeneration: 4,
 			endpointMtimeMs: 1,
+			endpointFileId,
 			lifecycleRequestId,
 			processIncarnation: processIdentity,
 			hostIncarnation: processIdentity,
@@ -4202,6 +4281,7 @@ test("reconcile_uncertain replays a ledger-stage receipt after deletion and same
 			endpointGeneration: input.endpointGeneration,
 			pid: process.pid,
 			endpointMtimeMs: input.endpointMtimeMs,
+			endpointFileId,
 			lifecycleRequestId: "older-incarnation",
 			processIncarnation: "older-process",
 			hostIncarnation: "older-host",
@@ -4213,6 +4293,7 @@ test("reconcile_uncertain replays a ledger-stage receipt after deletion and same
 			endpointGeneration: input.endpointGeneration,
 			pid: child.pid,
 			endpointMtimeMs: input.endpointMtimeMs,
+			endpointFileId,
 			lifecycleRequestId,
 			processIncarnation: processIdentity,
 			hostIncarnation: processIdentity,
@@ -4224,6 +4305,7 @@ test("reconcile_uncertain replays a ledger-stage receipt after deletion and same
 			endpointGeneration: input.endpointGeneration,
 			pid: child.pid,
 			endpointMtimeMs: input.endpointMtimeMs,
+			endpointFileId,
 			lifecycleRequestId,
 			processIncarnation: processIdentity,
 			hostIncarnation: processIdentity,
@@ -4277,6 +4359,7 @@ test("reconcile_uncertain replays a ledger-stage receipt after deletion and same
 			processIncarnation: indexed.processIncarnation,
 			hostIncarnation: indexed.hostIncarnation,
 			endpointMtimeMs: indexed.endpointMtimeMs,
+			endpointFileId: indexed.endpointFileId,
 			lifecycleRequestId: indexed.lifecycleRequestId,
 		});
 		await expect(
@@ -4289,6 +4372,7 @@ test("reconcile_uncertain replays a ledger-stage receipt after deletion and same
 			endpointGeneration: indexed.endpointGeneration,
 			pid: indexed.pid,
 			endpointMtimeMs: input.endpointMtimeMs + 1,
+			endpointFileId: "41:2",
 			lifecycleRequestId: "same-id-successor",
 			processIncarnation: input.processIncarnation,
 			hostIncarnation: input.hostIncarnation,
@@ -4335,6 +4419,7 @@ test("reconcile_uncertain fails closed when deletion wins the closure append rac
 	const lifecycleRequestId = "reconcile-index-delete-effect";
 	const remoteCreateKey = "reconcile-index-delete-create";
 	const retirementKey = "reconcile-index-delete-retirement";
+	const endpointFileId = "42:1";
 	const child = spawnDisposableHost();
 	const broker = new Broker({ agentDir });
 	const createIdentity = "reconcile-index-delete-create-identity";
@@ -4347,6 +4432,7 @@ test("reconcile_uncertain fails closed when deletion wins the closure append rac
 			stateRoot,
 			endpointGeneration: 4,
 			endpointMtimeMs: 1,
+			endpointFileId,
 			lifecycleRequestId,
 			processIncarnation: processIdentity,
 			hostIncarnation: processIdentity,
@@ -4364,6 +4450,7 @@ test("reconcile_uncertain fails closed when deletion wins the closure append rac
 			endpointGeneration: input.endpointGeneration,
 			pid: child.pid,
 			endpointMtimeMs: input.endpointMtimeMs,
+			endpointFileId,
 			lifecycleRequestId,
 			processIncarnation: processIdentity,
 			hostIncarnation: processIdentity,
@@ -4803,7 +4890,7 @@ test("close preserves terminal uncertainty when conditional endpoint unregister 
 	}
 });
 
-test("close removes an unchanged dead endpoint with a fractional nanosecond mtime", async () => {
+test("close retains a legacy endpoint whose indexed mtime lost fractional precision", async () => {
 	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-dead-mtime-"));
 	const agentDir = path.join(root, "agent");
 	const stateRoot = path.join(root, ".gjc", "state");
@@ -4842,14 +4929,77 @@ test("close removes an unchanged dead endpoint with a fractional nanosecond mtim
 		});
 		try {
 			expect(await broker.handleRequest("session.close", { sessionId }, "fractional-mtime-close")).toMatchObject({
-				ok: true,
-				result: { sessionId },
+				ok: false,
+				error: { code: "terminal_uncertain" },
 			});
 		} finally {
 			unlinkSpy.mockRestore();
 		}
-		expect(unlinked).toBe(true);
-		await expect(fs.access(endpointPath)).rejects.toThrow();
+		expect(unlinked).toBe(false);
+		await expect(fs.access(endpointPath)).resolves.toBeNull();
+	} finally {
+		await broker.stop();
+		await fs.rm(root, { recursive: true, force: true });
+	}
+});
+
+test("close fails closed when a dead endpoint is replaced before its descriptor is opened", async () => {
+	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-dead-endpoint-replacement-"));
+	const agentDir = path.join(root, "agent");
+	const stateRoot = path.join(root, ".gjc", "state");
+	const sessionId = "dead-endpoint-replacement";
+	const endpointPath = path.join(stateRoot, "sdk", `${sessionId}.json`);
+	const displacedPath = `${endpointPath}.displaced`;
+	const deadPid = 4_194_304;
+	const broker = new Broker({ agentDir });
+	const predecessorSource = JSON.stringify({ sessionId, pid: deadPid, url: "ws://127.0.0.1:1", token: "predecessor" });
+	const successorSource = JSON.stringify({ sessionId, pid: deadPid, url: "ws://127.0.0.1:1", token: "successor" });
+	let replacedBeforeOpen = false;
+	try {
+		expect(() => process.kill(deadPid, 0)).toThrow();
+		await fs.mkdir(path.dirname(endpointPath), { recursive: true });
+		await fs.writeFile(endpointPath, predecessorSource);
+		const fixedMtimeSeconds = 1_700_000_000;
+		await fs.utimes(endpointPath, fixedMtimeSeconds, fixedMtimeSeconds);
+		const predecessor = await fs.stat(endpointPath, { bigint: true });
+		const predecessorFileId = `${predecessor.dev}:${predecessor.ino}`;
+		const endpointMtimeMs = Number(predecessor.mtimeNs / 1_000_000n);
+		await broker.start();
+		await broker.index.append({
+			type: "host_registered",
+			sessionId,
+			locator: { cwd: root, worktreeRoot: null, stateRoot },
+			endpointGeneration: 1,
+			pid: deadPid,
+			processIncarnation: "dead-incarnation",
+			endpointMtimeMs,
+			endpointFileId: predecessorFileId,
+		});
+		const realOpen = fs.open.bind(fs);
+		const openSpy = vi.spyOn(fs, "open").mockImplementation((async (file: string, ...rest: unknown[]) => {
+			if (!replacedBeforeOpen && path.resolve(file) === path.resolve(endpointPath)) {
+				replacedBeforeOpen = true;
+				await fs.rename(endpointPath, displacedPath);
+				await fs.writeFile(endpointPath, successorSource);
+				await fs.utimes(endpointPath, fixedMtimeSeconds, fixedMtimeSeconds);
+			}
+			return await (realOpen as (file: string, ...args: unknown[]) => Promise<fs.FileHandle>)(file, ...rest);
+		}) as typeof fs.open);
+		try {
+			await expect(
+				broker.handleRequest("session.close", { sessionId }, "dead-endpoint-replacement-close"),
+			).resolves.toMatchObject({
+				ok: false,
+				error: { code: "terminal_uncertain" },
+			});
+		} finally {
+			openSpy.mockRestore();
+		}
+		expect(replacedBeforeOpen).toBe(true);
+		const successor = await fs.stat(endpointPath, { bigint: true });
+		expect(`${successor.dev}:${successor.ino}`).not.toBe(predecessorFileId);
+		expect(Number(successor.mtimeNs / 1_000_000n)).toBe(endpointMtimeMs);
+		expect(await fs.readFile(endpointPath, "utf8")).toBe(successorSource);
 	} finally {
 		await broker.stop();
 		await fs.rm(root, { recursive: true, force: true });
@@ -4972,7 +5122,9 @@ test("idempotent lifecycle replay refreshes authority after a broker restart", a
 			endpointPath,
 			JSON.stringify({ sessionId, pid: host.pid, url: "ws://127.0.0.1:1", token: "successor-token" }),
 		);
-		const endpointMtimeMs = (await fs.stat(endpointPath)).mtimeMs;
+		const endpointIdentity = await fs.stat(endpointPath, { bigint: true });
+		const endpointMtimeMs = Number(endpointIdentity.mtimeNs) / 1_000_000;
+		const endpointFileId = `${endpointIdentity.dev}:${endpointIdentity.ino}`;
 		const hostIncarnation = await incarnation(host.pid);
 		initial = new Broker({ agentDir });
 		await initial.start();
@@ -4983,6 +5135,7 @@ test("idempotent lifecycle replay refreshes authority after a broker restart", a
 			endpointGeneration: 2,
 			pid: host.pid,
 			endpointMtimeMs,
+			endpointFileId,
 			processIncarnation: hostIncarnation,
 			hostIncarnation,
 		});
@@ -5012,6 +5165,7 @@ test("idempotent lifecycle replay refreshes authority after a broker restart", a
 					endpointGeneration: 1,
 					pid: host.pid + 1,
 					endpointMtimeMs: 1,
+					endpointFileId: "stale:identity",
 					reused: true,
 				},
 			},
@@ -5028,6 +5182,7 @@ test("idempotent lifecycle replay refreshes authority after a broker restart", a
 				endpointGeneration: 2,
 				pid: host.pid,
 				endpointMtimeMs,
+				endpointFileId,
 				reused: true,
 				endpoint: {
 					sessionId,
@@ -5037,10 +5192,172 @@ test("idempotent lifecycle replay refreshes authority after a broker restart", a
 				},
 			},
 		});
+
+		const exactMtimeMs = Number((await fs.stat(endpointPath, { bigint: true })).mtimeNs) / 1_000_000;
+		await restarted.index.append({
+			type: "host_registered",
+			sessionId,
+			locator: { cwd: root, worktreeRoot: null, stateRoot },
+			endpointGeneration: 2,
+			pid: host.pid,
+			endpointMtimeMs: exactMtimeMs,
+			processIncarnation: hostIncarnation,
+			hostIncarnation,
+		});
+		const identityLessKey = "replay-authority-identity-less";
+		const identityLess = await deriveIdempotencyIdentity(agentDir, "session.resume", identityLessKey, targetHash);
+		expect(await restarted.ledger.begin(identityLess, requestHash)).toMatchObject({ kind: "new" });
+		await restarted.ledger.transition(identityLess, "terminal_ok", {
+			response: {
+				ok: true,
+				result: {
+					sessionId,
+					cwd: root,
+					endpointGeneration: 1,
+					pid: host.pid + 1,
+					endpointMtimeMs: 1,
+					endpointFileId: "stale:identity",
+					reused: true,
+				},
+			},
+		});
+		expect(await restarted.handleRequest("session.resume", { cwd: root, sessionId }, identityLessKey)).toEqual({
+			ok: true,
+			result: {
+				sessionId,
+				cwd: root,
+				endpointGeneration: 2,
+				pid: host.pid,
+				endpointMtimeMs: exactMtimeMs,
+				reused: true,
+				endpoint: {
+					sessionId,
+					pid: host.pid,
+					url: "ws://127.0.0.1:1",
+					token: "successor-token",
+				},
+			},
+		});
+		const malformedReplayKey = "replay-authority-malformed-session";
+		const malformedReplayIdentity = await deriveIdempotencyIdentity(
+			agentDir,
+			"session.resume",
+			malformedReplayKey,
+			targetHash,
+		);
+		expect(await restarted.ledger.begin(malformedReplayIdentity, requestHash)).toMatchObject({ kind: "new" });
+		await restarted.ledger.transition(malformedReplayIdentity, "terminal_ok", {
+			response: {
+				ok: true,
+				result: {
+					sessionId: "../../outside",
+					cwd: root,
+					endpointGeneration: 2,
+					pid: host.pid,
+					endpointMtimeMs,
+					reused: true,
+				},
+			},
+		});
+		expect(await restarted.handleRequest("session.resume", { cwd: root, sessionId }, malformedReplayKey)).toEqual({
+			ok: false,
+			error: { code: "invalid_input", message: "replayed sessionId must be a canonical safe identifier" },
+		});
 	} finally {
 		await initial?.stop();
 		await restarted?.stop();
 		await fs.rm(root, { recursive: true, force: true });
+	}
+});
+
+test("idempotent lifecycle replay rejects preserved-mtime endpoint identity transitions", async () => {
+	for (const transition of ["identity-less-to-identityful", "identityful-to-identity-less"] as const) {
+		const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", `gjc-replay-race-${transition}-`));
+		const agentDir = path.join(root, "agent");
+		const stateRoot = path.join(root, ".gjc", "state");
+		const sessionId = `replay-race-${transition}`;
+		const endpointPath = path.join(stateRoot, "sdk", `${sessionId}.json`);
+		const displacedPath = `${endpointPath}.displaced`;
+		const host = spawnDisposableHost();
+		const broker = new Broker({ agentDir });
+		let refreshSpy: Mock<() => Promise<void>> | undefined;
+		try {
+			await fs.mkdir(path.dirname(endpointPath), { recursive: true });
+			await Bun.write(
+				endpointPath,
+				JSON.stringify({ sessionId, pid: host.pid, url: "ws://127.0.0.1:1", token: "predecessor-token" }),
+			);
+			const fixedMtimeSeconds = 1_700_000_000;
+			await fs.utimes(endpointPath, fixedMtimeSeconds, fixedMtimeSeconds);
+			const initialFile = await fs.stat(endpointPath, { bigint: true });
+			const initialMtimeMs = Number(initialFile.mtimeNs) / 1_000_000;
+			const initialFileId = `${initialFile.dev}:${initialFile.ino}`;
+			const hostIncarnation = await incarnation(host.pid);
+			await broker.start();
+			await broker.index.append({
+				type: "host_registered",
+				sessionId,
+				locator: { cwd: root, worktreeRoot: null, stateRoot },
+				endpointGeneration: 2,
+				pid: host.pid,
+				endpointMtimeMs: initialMtimeMs,
+				...(transition === "identityful-to-identity-less" ? { endpointFileId: initialFileId } : {}),
+				processIncarnation: hostIncarnation,
+				hostIncarnation,
+			});
+			const key = `replay-race-${transition}`;
+			const targetHash = createHash("sha256").update(canonicalJson({ sessionId })).digest("hex");
+			const identity = await deriveIdempotencyIdentity(agentDir, "session.resume", key, targetHash);
+			const input = { cwd: root, stateRoot, sessionId };
+			const requestHash = createHash("sha256")
+				.update(canonicalJson({ operation: "session.resume", input }))
+				.digest("hex");
+			expect(await broker.ledger.begin(identity, requestHash)).toMatchObject({ kind: "new" });
+			await broker.ledger.transition(identity, "terminal_ok", {
+				response: {
+					ok: true,
+					result: { sessionId, cwd: root, endpointGeneration: 1, pid: host.pid + 1, endpointMtimeMs: 1 },
+				},
+			});
+			const replacementIndex = await new SessionIndex(agentDir).open();
+			const realRefresh = broker.index.refresh.bind(broker.index);
+			let refreshes = 0;
+			refreshSpy = vi.spyOn(broker.index, "refresh").mockImplementation(async () => {
+				refreshes += 1;
+				if (refreshes === 2) {
+					await fs.rename(endpointPath, displacedPath);
+					await Bun.write(
+						endpointPath,
+						JSON.stringify({ sessionId, pid: host.pid, url: "ws://127.0.0.1:2", token: "successor-token" }),
+					);
+					await fs.utimes(endpointPath, fixedMtimeSeconds, fixedMtimeSeconds);
+					const replacementFile = await fs.stat(endpointPath, { bigint: true });
+					await replacementIndex.append({
+						type: "host_registered",
+						sessionId,
+						locator: { cwd: root, worktreeRoot: null, stateRoot },
+						endpointGeneration: 2,
+						pid: host.pid,
+						endpointMtimeMs: Number(replacementFile.mtimeNs) / 1_000_000,
+						...(transition === "identity-less-to-identityful"
+							? { endpointFileId: `${replacementFile.dev}:${replacementFile.ino}` }
+							: {}),
+						processIncarnation: hostIncarnation,
+						hostIncarnation,
+					});
+				}
+				await realRefresh();
+			});
+			expect(await broker.handleRequest("session.resume", { cwd: root, sessionId }, key)).toMatchObject({
+				ok: false,
+				error: { code: "endpoint_stale" },
+			});
+		} finally {
+			refreshSpy?.mockRestore();
+			await broker.stop();
+			host.kill();
+			await fs.rm(root, { recursive: true, force: true });
+		}
 	}
 });
 
