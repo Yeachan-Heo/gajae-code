@@ -2530,32 +2530,35 @@ export class DiscordNotificationDaemon {
 				return { provider: "discord", threadId: record.threadId, status: operation };
 			},
 			async () => {
+				if (
+					!closing &&
+					(!record.sessionId ||
+						!(await this.#bindingCurrent(
+							record.sessionId,
+							record.endpointGeneration!,
+							record.attachmentAuthorityId,
+						)))
+				)
+					return false;
 				const current = await this.#byThread(record.guildId, record.parentChannelId, record.threadId!);
-				const intent = closingIntent(record);
+				const migratedEffect = await this.#effects.read<typeof expectedPayload>(id);
+				const intent = current ? closingIntent(current) : undefined;
 				const mappingCurrent = closing
 					? !!current &&
-						intent?.nonce === closingIntent(current)?.nonce &&
+						closingIntent(record)?.nonce === intent?.nonce &&
 						current.sessionId === record.sessionId &&
 						current.endpointGeneration === record.endpointGeneration
 					: !!current &&
 						current.state === (operation === "archive" ? "active" : "resuming") &&
 						current.generation === record.generation &&
 						current.endpointGeneration === record.endpointGeneration &&
-						current.attachmentAuthorityId === record.attachmentAuthorityId &&
+						!!migratedEffect &&
+						recordAcceptsAuthority(current, migratedEffect.payload.attachmentAuthorityId) &&
 						(occurrenceId === undefined ||
 							(operation === "archive"
 								? current.archiveEffectId === id && current.archiveOccurrenceId === occurrenceId
 								: current.resumeEffectId === id && current.resumeOccurrenceId === occurrenceId));
-				return (
-					mappingCurrent &&
-					(closing ||
-						(!!record.sessionId &&
-							(await this.#bindingCurrent(
-								record.sessionId,
-								record.endpointGeneration!,
-								record.attachmentAuthorityId,
-							))))
-				);
+				return mappingCurrent;
 			},
 			!closing,
 		);
