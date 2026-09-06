@@ -417,6 +417,39 @@ describe("import redaction", () => {
 		expect(benign.value).toBe("The callback handler drops query parameters.");
 	});
 
+	it("scans a large credential-free body in linear time", () => {
+		// The url-credential rule used to accept an unbounded scheme before the
+		// literal `://`, so a long alphabetic run re-tried every prefix: cost grew
+		// quadratically (50k/100k/200k = 0.7s/2.7s/10.6s) on text holding no
+		// credential at all. Every imported string crosses this function, so a
+		// single large transcript message stalled the whole import.
+		const body = "x".repeat(200_000);
+		const startedAt = performance.now();
+		const result = redactImportedText(body);
+		const elapsedMs = performance.now() - startedAt;
+
+		expect(result.redacted).toBe(0);
+		expect(result.value).toBe(body);
+		// Linear scanning lands near 1ms; the pre-fix pattern needed ~10_600ms.
+		// The budget is deliberately loose so it fails only on quadratic scanning.
+		expect(elapsedMs).toBeLessThan(1_000);
+	});
+
+	it("still redacts url credentials across real scheme shapes", () => {
+		const cases = [
+			["https://alice:hunter2hunter2@example.com/repo.git", "hunter2hunter2"],
+			["postgres://svc:s3cr3tvalue@db.internal:5432/app", "s3cr3tvalue"],
+			["git+ssh://deploy:tokenvalue123@git.example.com/x.git", "tokenvalue123"],
+		] as const;
+		for (const [input, secret] of cases) {
+			const result = redactImportedText(input);
+			expect(result.value).not.toContain(secret);
+			expect(result.kinds).toContain("url-credential");
+			// The scheme and host stay readable; only the userinfo is dropped.
+			expect(result.value).toContain(input.slice(0, input.indexOf("://") + 3));
+		}
+	});
+
 	it("applies redaction to imported context and reports the count", async () => {
 		const dir = makeTempDir();
 		const withSecret = `${CODEX_ROLLOUT}\n${JSON.stringify({

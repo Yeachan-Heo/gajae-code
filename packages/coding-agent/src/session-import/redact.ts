@@ -59,7 +59,11 @@ const REDACTION_RULES: readonly RedactionRule[] = [
 	// Long hex secrets (64+ hex chars: webhook secrets, signing keys).
 	{ id: "hex-secret", pattern: new RegExp(`\\b${HEX}{64,}\\b`, "g") },
 	// Basic-auth credentials embedded in URLs (https://user:pass@host).
-	{ id: "url-credential", pattern: /([a-z][a-z0-9+.-]*:\/\/)[^/\s:@]{1,256}:[^/\s@]{1,256}@/gi },
+	// The scheme repetition is bounded. Unbounded `[a-z0-9+.-]*` in front of the
+	// literal `://` re-tries every prefix of a long alphabetic run before failing,
+	// which is quadratic in the input length: 200 KB of ordinary prose costs ~10s.
+	// IANA's longest registered scheme is well under 16 characters.
+	{ id: "url-credential", pattern: /\b([a-z][a-z0-9+.-]{0,15}:\/\/)[^/\s:@]{1,256}:[^/\s@]{1,256}@/gi },
 	// Sensitive env/KEY assignments: OPENAI_API_KEY=..., token: ..., password = ...
 	// The name prefix is optional so a bare sensitive name (`password: …`) also matches.
 	{
