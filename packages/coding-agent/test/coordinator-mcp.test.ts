@@ -34,6 +34,7 @@ import {
 	rotateClaimedCreationVerifier,
 	startCreationRemote,
 	transactionPath,
+	upgradeCreationRetirementEndpointFileId,
 	withNamespaceRegistry,
 	withSessionTransaction,
 } from "../src/coordinator-mcp/question-state";
@@ -377,6 +378,72 @@ describe("mcp serve check command compatibility", () => {
 });
 
 describe("coordinator question-state direct contracts", () => {
+	it("does not bind a legacy retirement intent to a same-generation successor", async () => {
+		await withTempRoot(async root => {
+			const paths = coordinatorStatePaths(path.join(root, "state"), "namespace-retire-fence");
+			await initializeCoordinatorNamespace(paths);
+			const session = {
+				schema_version: 1 as const,
+				namespace_id: "namespace-retire-fence",
+				session_id: "session-retire-fence",
+				cwd: root,
+				created_at: "2026-09-05T00:00:00.000Z",
+				updated_at: "2026-09-05T00:00:00.000Z",
+				mpreset: null,
+				source: "coordinator" as const,
+				model: null,
+				tmux: { session: null, window: null, pane: null },
+				broker: {
+					workspace: root,
+					endpoint_url: "ws://private.example.test",
+					endpoint_generation: 1,
+					endpoint_incarnation: "legacy-predecessor",
+					sidecar_verifier: { key_id: "a".repeat(64), public_key: "public-key" },
+				},
+				ephemeral: false,
+				visible: true,
+			};
+			const proof = {
+				session_id: session.session_id,
+				cwd: root,
+				state_root: path.join(root, ".gjc", "state"),
+				endpoint_generation: 1,
+				endpoint_mtime_ms: 1,
+				process_incarnation: "process",
+				host_incarnation: "host",
+				lifecycle_request_id: "lifecycle",
+				remote_create_key: "remote",
+			};
+			await withNamespaceRegistry(paths, async registry => {
+				registry.creations.creation = {
+					key_digest: "creation",
+					request_digest: "request",
+					tool: "gjc_coordinator_start_session",
+					phase: "uncertain",
+					canonical_create_intent: {
+						kind: "start",
+						session,
+						remote_create_key: "remote",
+						initial_state: "ready_for_input",
+						initial_prompt: null,
+						initial_events: [],
+					},
+					remote_create_key: "remote",
+					session_id: session.session_id,
+					endpoint_incarnation: "legacy-predecessor",
+					sidecar_verifier: session.broker.sidecar_verifier,
+					created_at: session.created_at,
+					updated_at: session.updated_at,
+				};
+			});
+			await expect(
+				upgradeCreationRetirementEndpointFileId(paths, "creation", proof, "legacy-successor", "2:3"),
+			).rejects.toThrow("idempotency_conflict");
+			const creation = await withNamespaceRegistry(paths, async registry => registry.creations.creation);
+			expect(creation?.canonical_create_intent?.session.broker).not.toHaveProperty("endpoint_file_id");
+		});
+	});
+
 	it("rotates only an unspawned claimed creation verifier", async () => {
 		await withTempRoot(async root => {
 			const paths = coordinatorStatePaths(path.join(root, "state"), "namespace-rotate");

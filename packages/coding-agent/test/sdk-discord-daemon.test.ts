@@ -2746,11 +2746,22 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 			);
 
 			const leased = await journal.enqueueAndClaim(
-				{ ...input, id: "live-effect", payload: { threadId: "thread", content: "live" } },
+				{
+					...input,
+					id: "live-effect",
+					payload: { threadId: "thread", content: "live", attachmentAuthorityId: "legacy-authority" },
+				},
 				"owner",
 				60_000,
 			);
 			expect(leased).toBeDefined();
+			await journal.migrateAttachmentAuthorityId("session", 1, "legacy-authority", "current-authority");
+			expect(await journal.read("live-effect")).toMatchObject({
+				state: "leased",
+				owner: "owner",
+				epoch: leased!.epoch,
+				payload: { attachmentAuthorityId: "current-authority" },
+			});
 			await journal.terminalize("live-effect", { status: "stale_noop" });
 			expect(await journal.read("live-effect")).toMatchObject({ state: "leased", owner: "owner" });
 			await journal.record("live-effect", { owner: "owner", epoch: leased!.epoch }, "terminal");

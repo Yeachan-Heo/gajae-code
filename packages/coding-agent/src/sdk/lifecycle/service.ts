@@ -575,6 +575,8 @@ function reconcileUncertainResult(
 	target: SessionReconcileUncertainTarget,
 ): SessionLifecycleSessionResult | undefined {
 	if (!isRecord(value)) return undefined;
+	const endpointFileId =
+		typeof value.endpointFileId === "string" && value.endpointFileId.length > 0 ? value.endpointFileId : undefined;
 	if (
 		value.sessionId !== target.sessionId ||
 		value.retired !== true ||
@@ -583,7 +585,7 @@ function reconcileUncertainResult(
 		value.stateRoot !== target.stateRoot ||
 		value.endpointGeneration !== target.endpointGeneration ||
 		value.endpointMtimeMs !== target.endpointMtimeMs ||
-		value.endpointFileId !== target.endpointFileId ||
+		(target.endpointFileId !== undefined && endpointFileId !== target.endpointFileId) ||
 		value.processIncarnation !== target.processIncarnation ||
 		value.hostIncarnation !== target.hostIncarnation ||
 		value.lifecycleRequestId !== target.lifecycleRequestId ||
@@ -593,7 +595,7 @@ function reconcileUncertainResult(
 	return {
 		sessionId: target.sessionId,
 		endpointGeneration: target.endpointGeneration,
-		...(target.endpointFileId === undefined ? {} : { endpointFileId: target.endpointFileId }),
+		...(endpointFileId === undefined ? {} : { endpointFileId }),
 	};
 }
 
