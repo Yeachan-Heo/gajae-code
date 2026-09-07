@@ -343,7 +343,10 @@ function resolveTrustedLspCommand(command: string, cwd: string): string | null {
 	if (!discovered) return null;
 	if (isProjectControlledPath(discovered, cwd)) return null;
 	const canonical = canonicalExistingPath(discovered);
-	return canonical;
+	// Canonicalization validates the target and trust boundary, but launching the
+	// discovered path preserves argv[0]-based proxy behavior such as rust-analyzer
+	// selecting rustup's rust-analyzer mode.
+	return canonical ? discovered : null;
 }
 
 interface ConfigSource {

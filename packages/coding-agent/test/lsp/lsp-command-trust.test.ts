@@ -287,7 +287,7 @@ describe("LSP repository command trust", () => {
 		}
 	});
 
-	it("rejects a repository-owned executable symlink while preserving an external symlink", async () => {
+	it("rejects a repository-owned executable symlink while preserving an external symlink invocation path", async () => {
 		if (process.platform === "win32") return;
 
 		using tempDir = TempDir.createSync("@gjc-lsp-server-symlink-trust-");
@@ -311,9 +311,7 @@ describe("LSP repository command trust", () => {
 		expect(loadConfig(repositoryRoot).servers["typescript-language-server"]).toBeUndefined();
 
 		which.mockImplementation(command => (command === "typescript-language-server" ? externalSymlink : null));
-		expect(loadConfig(repositoryRoot).servers["typescript-language-server"]?.resolvedCommand).toBe(
-			fs.realpathSync(externalServer),
-		);
+		expect(loadConfig(repositoryRoot).servers["typescript-language-server"]?.resolvedCommand).toBe(externalSymlink);
 	});
 
 	it("finds repository-root executables through a symlinked nested session cwd", async () => {
@@ -421,7 +419,7 @@ describe("LSP repository command trust", () => {
 			.mockImplementation(command => (command === "typescript-language-server" ? userServer : null));
 
 		expect(isProjectControlledPath(userServer, cwd)).toBe(false);
-		expect(loadConfig(cwd).servers["typescript-language-server"]?.resolvedCommand).toBe(fs.realpathSync(userServer));
+		expect(loadConfig(cwd).servers["typescript-language-server"]?.resolvedCommand).toBe(userServer);
 		resetLspmuxStateForTesting();
 		which.mockImplementation(command => (command === "lspmux" ? userLspmux : null));
 		expect((await detectLspmux(cwd)).available).toBe(true);
@@ -449,7 +447,7 @@ describe("LSP repository command trust", () => {
 		for (const cwd of [lexicalHome, canonicalHome]) {
 			expect(isProjectControlledPath(userServer, cwd)).toBe(false);
 			const server = loadConfig(cwd).servers["typescript-language-server"];
-			expect(server?.resolvedCommand).toBe(fs.realpathSync(userServer));
+			expect(server?.resolvedCommand).toBe(userServer);
 
 			resetLspmuxStateForTesting();
 			which.mockImplementation(command => (command === "lspmux" ? userLspmux : null));

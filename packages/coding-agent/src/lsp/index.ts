@@ -1160,7 +1160,7 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 
 			const serverStatus =
 				servers.length > 0
-					? `Active language servers: ${servers.join(", ")}`
+					? `Configured language servers: ${servers.join(", ")}`
 					: "No language servers configured for this project";
 
 			const output = lspmuxStatus ? `${serverStatus}\n${lspmuxStatus}` : serverStatus;
