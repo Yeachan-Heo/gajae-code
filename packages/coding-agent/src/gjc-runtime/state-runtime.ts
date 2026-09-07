@@ -2711,10 +2711,15 @@ async function writeHandoffAuditIndex(
 	);
 }
 
-async function appendHandoffAudit(options: HandoffAuditOptions): Promise<void> {
+async function appendHandoffAudit(
+	options: HandoffAuditOptions,
+	hooks: { afterAudit?: () => Promise<unknown>; afterIndex?: () => Promise<unknown> } = {},
+): Promise<void> {
 	const entry = buildHandoffAuditEntry(options);
 	await appendAuditEntry(options.cwd, options.sessionId, entry);
+	await hooks.afterAudit?.();
 	await writeHandoffAuditIndex(options, entry);
+	await hooks.afterIndex?.();
 }
 
 /**
@@ -3053,18 +3058,41 @@ async function handleHandoffUnlocked(
 					calleeState: retryCalleeState,
 					forced: callerReceiptForRetry?.forced === true,
 				};
-				const audited = await hasAuditedDeepInterviewHandoff(cwd, sessionId, workflowCallee, {
+				const indexPresent = await hasAuditedDeepInterviewHandoff(cwd, sessionId, workflowCallee, {
 					handoffAt: retryAt,
+					indexOnly: true,
 				});
-				if (!audited) {
-					await appendHandoffAudit(auditOptions);
+				const persistSteps = () =>
+					updateWorkflowTransactionJournal(cwd, sessionId, retryMutationId, { steps: [...steps] });
+				if (steps.has("handoff-audit")) {
+					if (!indexPresent) {
+						await writeHandoffAuditIndex(auditOptions, buildHandoffAuditEntry(auditOptions));
+						steps.add("handoff-index");
+						await persistSteps();
+					}
 				} else if (
-					!(await hasAuditedDeepInterviewHandoff(cwd, sessionId, workflowCallee, {
+					await hasAuditedDeepInterviewHandoff(cwd, sessionId, workflowCallee, {
 						handoffAt: retryAt,
-						indexOnly: true,
-					}))
+					})
 				) {
-					await writeHandoffAuditIndex(auditOptions, buildHandoffAuditEntry(auditOptions));
+					steps.add("handoff-audit");
+					await persistSteps();
+					if (!indexPresent) {
+						await writeHandoffAuditIndex(auditOptions, buildHandoffAuditEntry(auditOptions));
+						steps.add("handoff-index");
+						await persistSteps();
+					}
+				} else {
+					await appendHandoffAudit(auditOptions, {
+						afterAudit: async () => {
+							steps.add("handoff-audit");
+							await persistSteps();
+						},
+						afterIndex: async () => {
+							steps.add("handoff-index");
+							await persistSteps();
+						},
+					});
 				}
 			}
 			await completeWorkflowTransactionJournal(cwd, sessionId, retryMutationId);
@@ -3140,7 +3168,7 @@ async function handleHandoffUnlocked(
 		await updateWorkflowTransactionJournal(cwd, sessionId, mutationId, {
 			steps: ["callee-mode-state", "caller-mode-state", "active-state"],
 		});
-		await appendHandoffAudit({
+		const recoveryAuditOptions: HandoffAuditOptions = {
 			cwd,
 			sessionId,
 			caller,
@@ -3154,6 +3182,16 @@ async function handleHandoffUnlocked(
 			callerState: callerWrite.stamped,
 			calleeState: recoveryCalleeState,
 			forced: pendingRecoveryForced,
+		};
+		await appendHandoffAudit(recoveryAuditOptions, {
+			afterAudit: () =>
+				updateWorkflowTransactionJournal(cwd, sessionId, mutationId, {
+					steps: ["callee-mode-state", "caller-mode-state", "active-state", "handoff-audit"],
+				}),
+			afterIndex: () =>
+				updateWorkflowTransactionJournal(cwd, sessionId, mutationId, {
+					steps: ["callee-mode-state", "caller-mode-state", "active-state", "handoff-audit", "handoff-index"],
+				}),
 		});
 		await completeWorkflowTransactionJournal(cwd, sessionId, mutationId);
 		await touchStateActivityMarker(cwd, sessionId, callerPath);
@@ -3307,7 +3345,7 @@ async function handleHandoffUnlocked(
 	await updateWorkflowTransactionJournal(cwd, sessionId, mutationId, {
 		steps: ["callee-mode-state", "caller-mode-state", "active-state"],
 	});
-	await appendHandoffAudit({
+	const handoffAuditOptions: HandoffAuditOptions = {
 		cwd,
 		sessionId,
 		caller,
@@ -3321,6 +3359,16 @@ async function handleHandoffUnlocked(
 		callerState: callerWrite.stamped,
 		calleeState: calleeWrite.stamped,
 		forced,
+	};
+	await appendHandoffAudit(handoffAuditOptions, {
+		afterAudit: () =>
+			updateWorkflowTransactionJournal(cwd, sessionId, mutationId, {
+				steps: ["callee-mode-state", "caller-mode-state", "active-state", "handoff-audit"],
+			}),
+		afterIndex: () =>
+			updateWorkflowTransactionJournal(cwd, sessionId, mutationId, {
+				steps: ["callee-mode-state", "caller-mode-state", "active-state", "handoff-audit", "handoff-index"],
+			}),
 	});
 	await completeWorkflowTransactionJournal(cwd, sessionId, mutationId);
 	await touchStateActivityMarker(cwd, sessionId, callerPath);
