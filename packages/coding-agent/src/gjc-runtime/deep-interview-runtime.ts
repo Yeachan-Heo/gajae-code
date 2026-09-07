@@ -631,11 +631,14 @@ async function authoritativeConversationSnapshot(
 			const message = entry.message as unknown;
 			if (!isRecord(message) || typeof message.role !== "string")
 				throw new DeepInterviewCommandError(2, "live session transcript contains a malformed message");
-			const role = ["custom", "hookMessage"].includes(message.role)
-				? "system"
-				: ["bashExecution", "pythonExecution", "fileMention"].includes(message.role)
-					? "tool"
-					: message.role;
+			const role =
+				message.role === "user" && message.attribution === "agent"
+					? "developer"
+					: ["custom", "hookMessage"].includes(message.role)
+						? "system"
+						: ["bashExecution", "pythonExecution", "fileMention"].includes(message.role)
+							? "tool"
+							: message.role;
 			let projectedContent: string;
 			if (["bashExecution", "pythonExecution", "fileMention"].includes(message.role)) {
 				projectedContent = `[${message.role} sha256:${createHash("sha256").update(JSON.stringify(message)).digest("hex")}]`;
