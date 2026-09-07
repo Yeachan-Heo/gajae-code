@@ -910,13 +910,14 @@ describe("gjc state handoff", () => {
 			}
 			const tamperedCallee = (await readJson(calleePath)) as Record<string, unknown>;
 			tamperedCallee.current_phase = "final";
+			delete (tamperedCallee.receipt as Record<string, unknown>).content_sha256;
 			await writeJson(calleePath, tamperedCallee);
 			const retried = await runNativeStateCommand(
 				["handoff", "--mode", "deep-interview", "--to", "ralplan", "--json"],
 				cwd,
 			);
 			expect(retried.status).toBe(2);
-			expect(retried.stderr).toContain("handoff recovery refuses tampered callee state");
+			expect(retried.stderr).toContain("requires checksummed canonical callee state");
 			expect((await readJson(calleePath))?.current_phase).toBe("final");
 		});
 	});
@@ -940,13 +941,15 @@ describe("gjc state handoff", () => {
 			}
 			const tamperedCaller = (await readJson(callerPath)) as Record<string, unknown>;
 			(tamperedCaller.state as Record<string, unknown>).rounds = [{ round: 99 }];
+			((tamperedCaller.receipt as Record<string, unknown>).content_sha256 as Record<string, unknown>).algorithm =
+				"sha1";
 			await writeJson(callerPath, tamperedCaller);
 			const retried = await runNativeStateCommand(
 				["handoff", "--mode", "deep-interview", "--to", "ralplan", "--json"],
 				cwd,
 			);
 			expect(retried.status).toBe(2);
-			expect(retried.stderr).toContain("handoff recovery refuses tampered caller state");
+			expect(retried.stderr).toContain("requires checksummed canonical caller state");
 			expect(((await readJson(callerPath))?.state as Record<string, unknown>).rounds).toEqual([{ round: 99 }]);
 		});
 	});
