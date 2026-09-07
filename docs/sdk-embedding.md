@@ -253,11 +253,18 @@ one accepted submission with one model call or one `agent_end` event.
 
 For generic embedders, prefer an application-owned queue of bounded full turns
 submitted through `session.prompt()`, and use `steer`/`followUp` only for live
-conversational controls. Use the supported delivery modes and session events to
-correlate admission, consumption, completion, and cancellation; do not build a
-generic embedder contract around internal dispatch or promotion-correlation
-hooks. The `sendUserMessage` promise reports admission into the selected
-delivery path, not model completion.
+conversational controls. The `sendUserMessage` promise has delivery-mode
+dependent completion semantics:
+
+- An ordinary idle submission with no `deliverAs` queues nothing and awaits the
+  prompt turn, including its terminal completion.
+- An explicit queued `steer`/`followUp`, or a submission diverted into a queue
+  because a live turn is active, resolves when the submission is admitted to
+  that delivery path. Use supported session events to correlate its later
+  consumption, completion, and cancellation.
+
+Neither promise is a generic queue-drained receipt. Do not build a generic
+embedder contract around internal dispatch or promotion-correlation hooks.
 
 Related APIs:
 
