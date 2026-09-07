@@ -5,6 +5,7 @@ import { isSettingsInitialized, Settings } from "../config/settings";
 import { listManagedSessionCandidates, resolveManagedSessionScope } from "../sdk/session-directory";
 import {
 	type FileEntry,
+	isProjectSessionTranscriptPath,
 	listProjectSessionTranscriptFiles,
 	parseSessionEntries,
 	RESUME_TRANSCRIPT_MAX_BYTES,
@@ -519,7 +520,6 @@ async function authoritativeConversationSnapshot(
 	messages: Array<{ index: number; role: string; content: string }>;
 }> {
 	let sessionFile = process.env.GJC_SESSION_FILE?.trim();
-	const projectSessionsRoot = path.resolve(cwd, ".gjc", "sessions");
 	let explicitProjectTranscript = false;
 	if (sessionFile) {
 		sessionFile = path.resolve(cwd, sessionFile);
@@ -530,7 +530,7 @@ async function authoritativeConversationSnapshot(
 			const explicitRealPath = await fs.realpath(sessionFile);
 			if (explicitRealPath !== sessionFile) throw new Error("symlink transcript");
 			sessionFile = explicitRealPath;
-			explicitProjectTranscript = isPathWithin(projectSessionsRoot, explicitRealPath);
+			explicitProjectTranscript = isProjectSessionTranscriptPath(path.resolve(cwd, ".gjc"), explicitRealPath);
 		} catch {
 			throw new DeepInterviewCommandError(2, "GJC_SESSION_FILE is not a managed canonical session transcript");
 		}
