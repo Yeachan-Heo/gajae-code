@@ -1850,7 +1850,7 @@ describe("gjc state handoff", () => {
 		});
 	});
 
-	it("repairs a missing approval index from a pending post-audit journal", async () => {
+	it("replaces a stale approval index from a pending post-audit journal", async () => {
 		await withTempCwd(async cwd => {
 			const { callerPath } = await writePublishedReadyCrystal(cwd);
 			expect((await runNativeDeepInterviewCommand(["approve-execution", "--json"], cwd)).status).toBe(0);
@@ -1861,7 +1861,9 @@ describe("gjc state handoff", () => {
 			>;
 			const mutationId = approval.mutation_id as string;
 			const indexPath = path.join(sessionStateDir(cwd, TEST_SESSION_ID), "deep-interview-approval-audit.json");
-			await fs.rm(indexPath);
+			const staleIndex = JSON.parse(await fs.readFile(indexPath, "utf8")) as Record<string, unknown>;
+			staleIndex.mutation_id = "deep-interview:approve-execution:2026-01-01T00:00:00.000Z";
+			await fs.writeFile(indexPath, `${JSON.stringify(staleIndex)}\n`);
 			await beginWorkflowTransactionJournal({
 				cwd,
 				sessionId: TEST_SESSION_ID,
