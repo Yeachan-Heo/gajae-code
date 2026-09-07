@@ -370,7 +370,9 @@ function hasLaterSupersedingCorrection(content: string, quote: string, statement
 		/^\s*[.!?。！？]*\s*(?:no|not)\s*[,;:.!?。！？]?\s*(?:use|make|choose|select|switch|change|replace)\b/i.test(
 			later,
 		);
-	const followingClauses = following.split(/[.!?。！？;\n]+/u).filter(clause => clause.trim() !== "");
+	const followingClauses = following
+		.split(/(?:[!?。！？;]|\.(?=\s|$)|\n)+\s*/u)
+		.filter(clause => clause.trim() !== "");
 	const negativeCorrection =
 		/\b(?:no|not|never|cannot|can['’]t|won['’]t|don['’]t|doesn['’]t|isn['’]t|aren['’]t|wasn['’]t|weren['’]t|shouldn['’]t|mustn['’]t|needn['’]t|do\s+not)\b/i;
 	const explicitNegativeReplacement =
