@@ -519,41 +519,49 @@ async function authoritativeConversationSnapshot(
 	messages: Array<{ index: number; role: string; content: string }>;
 }> {
 	let sessionFile = process.env.GJC_SESSION_FILE?.trim();
+	const projectSessionsRoot = path.resolve(cwd, ".gjc", "sessions");
+	let explicitProjectTranscript = false;
+	if (sessionFile) {
+		sessionFile = path.resolve(cwd, sessionFile);
+		try {
+			const explicitStat = await fs.lstat(sessionFile);
+			if (!explicitStat.isFile() || explicitStat.isSymbolicLink())
+				throw new Error("symlink or non-regular transcript");
+			const explicitRealPath = await fs.realpath(sessionFile);
+			if (explicitRealPath !== sessionFile) throw new Error("symlink transcript");
+			sessionFile = explicitRealPath;
+			explicitProjectTranscript = isPathWithin(projectSessionsRoot, explicitRealPath);
+		} catch {
+			throw new DeepInterviewCommandError(2, "GJC_SESSION_FILE is not a managed canonical session transcript");
+		}
+	}
 	const canonicalCandidates = new Set<string>();
 	const managedCandidates = new Set<string>();
-	const lexicalCandidates = new Set(listProjectSessionTranscriptFiles(cwd).map(candidate => path.resolve(candidate)));
-	const managedScope = await resolveManagedSessionScope({ cwd });
-	if (managedScope.kind === "error")
-		throw new DeepInterviewCommandError(2, "managed session transcript scope is unavailable");
-	if (managedScope.kind === "resolved") {
-		const managedListing = await listManagedSessionCandidates({ scope: managedScope.scope });
-		if (managedListing.kind === "error")
-			throw new DeepInterviewCommandError(2, "managed session transcript listing is unavailable");
-		for (const candidate of managedListing.owned) {
-			const resolved = path.resolve(candidate.path);
-			managedCandidates.add(resolved);
-			lexicalCandidates.add(resolved);
+	const lexicalCandidates = new Set<string>();
+	if (!sessionFile) {
+		for (const candidate of listProjectSessionTranscriptFiles(cwd)) lexicalCandidates.add(path.resolve(candidate));
+	}
+	if (!explicitProjectTranscript) {
+		const managedScope = await resolveManagedSessionScope({ cwd });
+		if (managedScope.kind === "error")
+			throw new DeepInterviewCommandError(2, "managed session transcript scope is unavailable");
+		if (managedScope.kind === "resolved") {
+			const managedListing = await listManagedSessionCandidates({ scope: managedScope.scope });
+			if (managedListing.kind === "error")
+				throw new DeepInterviewCommandError(2, "managed session transcript listing is unavailable");
+			for (const candidate of managedListing.owned) {
+				const resolved = path.resolve(candidate.path);
+				managedCandidates.add(resolved);
+				lexicalCandidates.add(resolved);
+			}
 		}
 	}
 	// The native command accepts an explicit workspace cwd, which may differ from
 	// process.cwd(). Resolve relative managed transcript paths against that same
 	// workspace so transcript identity and content cannot drift with process launch location.
 	if (sessionFile) {
-		sessionFile = path.resolve(cwd, sessionFile);
-		let explicitRealPath: string;
-		try {
-			const explicitStat = await fs.lstat(sessionFile);
-			if (!explicitStat.isFile() || explicitStat.isSymbolicLink())
-				throw new Error("symlink or non-regular transcript");
-			explicitRealPath = await fs.realpath(sessionFile);
-			if (explicitRealPath !== sessionFile) throw new Error("symlink transcript");
-		} catch {
+		if (!explicitProjectTranscript && !managedCandidates.has(sessionFile))
 			throw new DeepInterviewCommandError(2, "GJC_SESSION_FILE is not a managed canonical session transcript");
-		}
-		const projectSessionsRoot = path.resolve(cwd, ".gjc", "sessions");
-		if (!isPathWithin(projectSessionsRoot, explicitRealPath) && !managedCandidates.has(explicitRealPath))
-			throw new DeepInterviewCommandError(2, "GJC_SESSION_FILE is not a managed canonical session transcript");
-		sessionFile = explicitRealPath;
 	} else {
 		if (lexicalCandidates.size > 1000)
 			throw new DeepInterviewCommandError(2, "session transcript discovery exceeded the bounded candidate limit");
