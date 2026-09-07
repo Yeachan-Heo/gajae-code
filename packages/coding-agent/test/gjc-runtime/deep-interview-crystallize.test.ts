@@ -1030,6 +1030,24 @@ describe("deep-interview crystallize contract", () => {
 		expect(secondRolled.removed_item_anchors).toEqual(second.removed_item_anchors);
 	});
 
+	it("accepts explicit no-longer-needed removal evidence", () => {
+		const first = crystallizeDeepInterview(input());
+		const resolution = "We do not need fast performance any longer.";
+		const next = withFreshUserEvidence(
+			input({ prior: first, items: [first.items[0]!], removed_ids: ["constraint:latency"] }),
+			resolution,
+		);
+		next.removed_item_anchors = [
+			{
+				item: "constraint:latency",
+				message_index: 1,
+				quote: resolution,
+				resolution,
+			},
+		];
+		expect(crystallizeDeepInterview(next).removed_ids).toContain("constraint:latency");
+	});
+
 	it("persists an unauthenticated removal intent instead of becoming ready later", () => {
 		const first = crystallizeDeepInterview(input());
 		const pending = crystallizeDeepInterview(
