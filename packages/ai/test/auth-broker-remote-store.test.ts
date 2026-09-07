@@ -12,6 +12,7 @@ import {
 	SqliteAuthCredentialStore,
 	startAuthBroker,
 } from "../src";
+import type { UsageProvider } from "../src/usage";
 import * as oauthUtils from "../src/utils/oauth";
 
 const ANTHROPIC_ENV = ["ANTHROPIC_API_KEY", "ANTHROPIC_OAUTH_TOKEN"] as const;
@@ -74,6 +75,44 @@ describe("RemoteAuthCredentialStore SSE integration", () => {
 			if (savedEnv[key] === undefined) delete process.env[key];
 			else process.env[key] = savedEnv[key];
 		}
+	});
+
+	test("strict Sol bypasses broker-cached Plus usage after an upstream downgrade to Free", async () => {
+		await handle!.close();
+		let planType = "plus";
+		const usageProvider: UsageProvider = {
+			id: "openai-codex",
+			fetchUsage: vi.fn(async params => ({
+				provider: "openai-codex",
+				fetchedAt: Date.now(),
+				limits: [],
+				metadata: { accountId: params.credential.accountId!, planType },
+			})),
+		};
+		storage = new AuthStorage(store!, {
+			usageProviderResolver: provider => (provider === "openai-codex" ? usageProvider : undefined),
+		});
+		await storage.set("openai-codex", mintOAuthCredential("codex", Date.now() + 3_600_000));
+		handle = startAuthBroker({ storage, bind: "127.0.0.1:0", bearerTokens: [token], disableRefresher: true });
+		const client = new AuthBrokerClient({ url: handle.url, token });
+		remote = new RemoteAuthCredentialStore({ client, streamSnapshots: false });
+		await remote.refreshSnapshot();
+		const clientStorage = new AuthStorage(remote);
+		await clientStorage.reload();
+		const resolveKey = vi.spyOn(oauthUtils, "getOAuthApiKey").mockImplementation(async (_provider, credentials) => {
+			const credential = credentials["openai-codex"]!;
+			return { newCredentials: credential, apiKey: credential.access };
+		});
+		await remote.fetchUsageReportsForProvider("openai-codex");
+		expect(usageProvider.fetchUsage).toHaveBeenCalledTimes(1);
+		planType = "free";
+		await expect(
+			clientStorage.getApiKey("openai-codex", "downgraded-sol", {
+				modelId: "gpt-5.6-sol",
+			}),
+		).rejects.toThrow('This ChatGPT Codex account cannot use model "gpt-5.6-sol"');
+		expect(resolveKey).not.toHaveBeenCalled();
+		expect(usageProvider.fetchUsage).toHaveBeenCalledTimes(3);
 	});
 
 	test("consumes initial snapshot, upsert, and removal over SSE without manual refresh", async () => {

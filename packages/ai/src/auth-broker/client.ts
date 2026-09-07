@@ -274,12 +274,15 @@ export class AuthBrokerClient {
 		}
 	}
 
-	fetchUsage(signal?: AbortSignal, provider?: Provider): Promise<UsageResponse> {
+	fetchUsage(signal?: AbortSignal, provider?: Provider, options?: { forceFresh?: boolean }): Promise<UsageResponse> {
 		// Validates the envelope (`generatedAt`, `reports[].provider`, `limits`,
 		// `metadata`) but leaves provider-specific extension fields permissive so
 		// the broker can ship new shapes ahead of the client. `raw` is accepted
 		// but normally stripped by the broker before send.
-		const path = provider ? `/v1/usage/scoped?provider=${encodeURIComponent(provider)}` : "/v1/usage";
+		const query = new URLSearchParams();
+		if (provider) query.set("provider", provider);
+		if (options?.forceFresh) query.set("forceFresh", "1");
+		const path = `${provider ? "/v1/usage/scoped" : "/v1/usage"}${query.size ? `?${query}` : ""}`;
 		return this.#request("GET", path, { schema: usageResponseSchema, signal }) as Promise<UsageResponse>;
 	}
 

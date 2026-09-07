@@ -1153,12 +1153,16 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 	 * rate-limited by Anthropic's per-IP `/usage` cap the way a heavy
 	 * residential laptop is, so all credentials surface every cycle.
 	 */
-	async fetchUsageReports(signal?: AbortSignal): Promise<UsageReport[] | null> {
-		return this.#raceWithSignal(this.#loadUsageReports(), signal);
+	async fetchUsageReports(signal?: AbortSignal, options?: { forceFresh?: boolean }): Promise<UsageReport[] | null> {
+		return this.#raceWithSignal(this.#loadUsageReports(undefined, options), signal);
 	}
 
-	async fetchUsageReportsForProvider(provider: Provider, signal?: AbortSignal): Promise<UsageReport[] | null> {
-		return this.#raceWithSignal(this.#loadUsageReports(provider), signal);
+	async fetchUsageReportsForProvider(
+		provider: Provider,
+		signal?: AbortSignal,
+		options?: { forceFresh?: boolean },
+	): Promise<UsageReport[] | null> {
+		return this.#raceWithSignal(this.#loadUsageReports(provider, options), signal);
 	}
 
 	/** Synchronous, zero-network usage presentation read. */
@@ -1295,8 +1299,7 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 	): Promise<UsageReport | null> {
 		let reports: UsageReport[] | null;
 		try {
-			if (options?.forceFresh) this.#invalidateUsageCache();
-			reports = await this.#raceWithSignal(this.#loadUsageReports(provider), signal);
+			reports = await this.#raceWithSignal(this.#loadUsageReports(provider, options), signal);
 		} catch (error) {
 			// A caller cancellation is control flow, not a missing usage report.
 			// Preserve it so selection/dispatch can stop promptly; only ordinary
@@ -1388,7 +1391,8 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 		}
 	}
 
-	#loadUsageReports(provider?: Provider): Promise<UsageReport[] | null> {
+	#loadUsageReports(provider?: Provider, options?: { forceFresh?: boolean }): Promise<UsageReport[] | null> {
+		if (options?.forceFresh) this.#invalidateUsageCache();
 		if (provider) {
 			const cached = this.#scopedUsageCache.get(provider);
 			if (cached && Date.now() - cached.fetchedAt < USAGE_CACHE_TTL_MS) return Promise.resolve(cached.reports);
@@ -1398,7 +1402,7 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 			if (existing) return existing;
 			const epoch = this.#usageCacheEpoch;
 			const inflight = this.#client
-				.fetchUsage(undefined, provider)
+				.fetchUsage(undefined, provider, options)
 				.then(body => {
 					if (this.#usageCacheEpoch === epoch) {
 						this.#scopedUsageCache.set(provider, { reports: body.reports, fetchedAt: Date.now() });
@@ -1430,7 +1434,7 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 		if (this.#usageInflight) return this.#usageInflight;
 		const epoch = this.#usageCacheEpoch;
 		const inflight = this.#client
-			.fetchUsage()
+			.fetchUsage(undefined, undefined, options)
 			.then(body => {
 				if (this.#usageCacheEpoch === epoch) {
 					this.#usageCache = { reports: body.reports, fetchedAt: Date.now() };

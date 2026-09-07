@@ -641,6 +641,7 @@ export function startAuthBroker(opts: AuthBrokerServerOptions): AuthBrokerServer
 							(await opts.storage.fetchUsageReports?.({
 								provider: scopedProvider ?? undefined,
 								signal: req.signal,
+								forceFresh: url.searchParams.get("forceFresh") === "1",
 							})) ?? [];
 						// Drop the `raw` field — it's the provider-specific upstream body,
 						// large and unstable. Everything UI-relevant lives in `limits` and
