@@ -1,4 +1,4 @@
-import { describe, expect, it, spyOn } from "bun:test";
+import { describe, expect, it } from "bun:test";
 import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
@@ -1854,18 +1854,13 @@ describe("gjc state handoff", () => {
 		await withTempCwd(async cwd => {
 			const { callerPath } = await writePublishedReadyCrystal(cwd);
 			const approvalAuditPath = auditPath(cwd, TEST_SESSION_ID);
-			const appendFile = fs.appendFile.bind(fs);
-			let auditAppendCount = 0;
-			const appendSpy = spyOn(fs, "appendFile").mockImplementation(async (...args) => {
-				auditAppendCount++;
-				if (auditAppendCount === 2) throw new Error("injected specialized approval audit failure");
-				return appendFile(...args);
-			});
+			const priorFailpoint = process.env.GJC_STATE_APPROVAL_FAIL_BEFORE_AUDIT;
+			process.env.GJC_STATE_APPROVAL_FAIL_BEFORE_AUDIT = "1";
 			let first: StateCommandResult;
 			try {
 				first = await runNativeDeepInterviewCommand(["approve-execution", "--json"], cwd);
 			} finally {
-				appendSpy.mockRestore();
+				restoreEnvironmentValue("GJC_STATE_APPROVAL_FAIL_BEFORE_AUDIT", priorFailpoint);
 			}
 			expect(first.status).not.toBe(0);
 			const persisted = await readJson(callerPath);
@@ -1876,7 +1871,11 @@ describe("gjc state handoff", () => {
 			expect((persisted?.receipt as Record<string, unknown>)?.mutation_id).toBe(approvalReceipt.mutation_id);
 			expect(
 				await readWorkflowTransactionJournal(cwd, TEST_SESSION_ID, approvalReceipt.mutation_id as string),
-			).toMatchObject({ status: "pending", steps: ["approval-state"] });
+			).toMatchObject({
+				status: "pending",
+				steps: ["approval-state", "approval-index"],
+				approval_audit_offset: expect.any(Number),
+			});
 			const filler = `${JSON.stringify({ event: "filler", payload: "x".repeat(1024) })}\n`.repeat(9_000);
 			await fs.appendFile(approvalAuditPath, filler);
 			expect((await fs.stat(approvalAuditPath)).size).toBeGreaterThan(8 * 1024 * 1024);
@@ -1976,6 +1975,39 @@ describe("gjc state handoff", () => {
 				.map(line => JSON.parse(line) as Record<string, unknown>)
 				.filter(entry => entry.mutation_id === mutationId && entry.approved_at !== undefined);
 			expect(specialized).toHaveLength(1);
+		});
+	});
+
+	it("fails closed when pending approval recovery sees a symlinked audit", async () => {
+		if (process.platform === "win32") return;
+		await withTempCwd(async cwd => {
+			const { callerPath } = await writePublishedReadyCrystal(cwd);
+			expect((await runNativeDeepInterviewCommand(["approve-execution", "--json"], cwd)).status).toBe(0);
+			const approved = (await readJson(callerPath)) as Record<string, unknown>;
+			const approval = (approved.state as Record<string, unknown>).execution_approval_receipt as Record<
+				string,
+				unknown
+			>;
+			const mutationId = approval.mutation_id as string;
+			const approvalAuditPath = auditPath(cwd, TEST_SESSION_ID);
+			await beginWorkflowTransactionJournal({
+				cwd,
+				sessionId: TEST_SESSION_ID,
+				mutationId,
+				caller: "deep-interview",
+				paths: [callerPath, approvalAuditPath],
+			});
+			await updateWorkflowTransactionJournal(cwd, TEST_SESSION_ID, mutationId, {
+				steps: ["approval-state", "approval-index"],
+				approval_audit_offset: 0,
+			});
+			const external = path.join(cwd, "external-audit.jsonl");
+			await fs.writeFile(external, "external\n");
+			await fs.rm(approvalAuditPath);
+			await fs.symlink(external, approvalAuditPath);
+			const retried = await runNativeDeepInterviewCommand(["approve-execution", "--json"], cwd);
+			expect(retried.status).toBe(2);
+			expect(await fs.readFile(external, "utf8")).toBe("external\n");
 		});
 	});
 
