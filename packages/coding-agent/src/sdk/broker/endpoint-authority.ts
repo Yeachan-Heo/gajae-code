@@ -40,7 +40,12 @@ export function endpointIncarnation(
 		.update(
 			JSON.stringify({
 				endpointGeneration: record.endpointGeneration,
-				endpointMtimeMs: record.endpointMtimeMs,
+				// Filesystem mtime is only millisecond-precise, and the two stat
+				// spellings used across this path (bigint mtimeNs/1e6 vs libuv
+				// double mtimeMs) can disagree by 1 float ulp (~0.00024ms) for the
+				// same file (#5376). Quantize so equivalent reads hash identically;
+				// a genuine replacement still differs by >=1ms or pid/generation.
+				endpointMtimeMs: Math.round(record.endpointMtimeMs),
 				pid: record.pid,
 				sessionId,
 			}),

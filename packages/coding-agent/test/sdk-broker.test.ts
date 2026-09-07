@@ -19,6 +19,7 @@ import {
 	redactBrokerDiscovery,
 	writeBrokerDiscovery,
 } from "../src/sdk/broker/discovery";
+import { endpointIncarnation } from "../src/sdk/broker/endpoint-authority";
 import {
 	brokerOwnerForTest,
 	brokerSpawnEnvironmentForTest,
@@ -49,6 +50,14 @@ import {
 } from "../src/session/session-storage";
 
 const temp = () => fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-"));
+const nextFloat = (value: number): number => {
+	const buf = new ArrayBuffer(8);
+	const f64 = new Float64Array(buf);
+	const u64 = new BigUint64Array(buf);
+	f64[0] = value;
+	u64[0] = u64[0]! + 1n;
+	return f64[0]!;
+};
 
 it("does not disclose launch paths when cleanup remains uncertain", () => {
 	const executable = "/private/runtime/gjc-secret";
@@ -2081,14 +2090,13 @@ describe("SDK broker identity and discovery", () => {
 			endpointGeneration: 3,
 			pid: process.pid,
 		});
-		const endpointIncarnation = createHash("sha256")
-			.update(JSON.stringify({ endpointGeneration: 3, endpointMtimeMs, pid: process.pid, sessionId: "s" }))
-			.digest("hex");
+		const boundIncarnation = endpointIncarnation({ endpointGeneration: 3, endpointMtimeMs, pid: process.pid }, "s");
+		expect(boundIncarnation).toBeString();
 		expect(
 			await broker.handleRequest("session.get_endpoint", {
 				sessionId: "s",
 				endpointGeneration: 3,
-				endpointIncarnation,
+				endpointIncarnation: boundIncarnation,
 			}),
 		).toEqual({
 			ok: true,
@@ -2347,6 +2355,84 @@ describe("SDK broker identity and discovery", () => {
 				ok: false,
 				error: { code: "endpoint_stale", message: "lifecycle replay target was replaced" },
 			});
+		} finally {
+			await broker.stop();
+			await saved?.close();
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	});
+	it("replays a lifecycle success when endpoint mtime differs by one float ulp (#5376)", async () => {
+		const dir = await temp();
+		const cwd = path.join(dir, "repo");
+		const stateRoot = path.join(cwd, ".gjc", "state");
+		const broker = new Broker({ agentDir: dir });
+		let saved: SessionManager | undefined;
+		try {
+			await fs.mkdir(cwd, { recursive: true });
+			saved = SessionManager.create(cwd, SessionManager.managedDestination(cwd, dir));
+			await saved.ensureOnDisk();
+			const sessionId = saved.getSessionId();
+			const sessionPath = saved.getSessionFile();
+			if (!sessionPath) throw new Error("Expected a saved session path.");
+			const captured = SessionManager.captureTranscriptStrict(sessionPath);
+			if (captured.kind !== "captured") throw new Error("Expected a captured saved session.");
+			const identity = captured.snapshot.identity;
+			const endpointPath = path.join(stateRoot, "sdk", `${sessionId}.json`);
+			await fs.mkdir(path.dirname(endpointPath), { recursive: true });
+			await fs.writeFile(
+				endpointPath,
+				JSON.stringify({ sessionId, pid: process.pid, url: "ws://127.0.0.1:1", token: "original-token" }),
+			);
+			await broker.start();
+			const firstEndpointMtimeMs = (await fs.stat(endpointPath)).mtimeMs;
+			const locator = { cwd, worktreeRoot: null, stateRoot };
+			await broker.index.append({
+				type: "host_registered",
+				sessionId,
+				locator,
+				endpointGeneration: 1,
+				pid: process.pid,
+				endpointMtimeMs: firstEndpointMtimeMs,
+			});
+			await broker.index.append({
+				type: "host_heartbeat",
+				sessionId,
+				locator,
+				endpointGeneration: 1,
+				pid: process.pid,
+			});
+			const input = {
+				cwd,
+				stateRoot,
+				sessionId,
+				sessionPath,
+				sessionIdentity: {
+					dev: identity.dev.toString(),
+					ino: identity.ino.toString(),
+					size: identity.size,
+					mtimeMs: identity.mtimeMs,
+					mtimeNs: identity.mtimeNs.toString(),
+					sha256: identity.sha256,
+				},
+			};
+			const first = await broker.handleRequest("session.resume", input, "ulp-replay");
+			expect(first).toMatchObject({
+				ok: true,
+				result: { endpointGeneration: 1, endpoint: { token: "original-token" } },
+			});
+			const skewedMtimeMs = nextFloat(firstEndpointMtimeMs);
+			expect(Math.abs(skewedMtimeMs - firstEndpointMtimeMs)).toBeLessThan(0.001);
+			expect(skewedMtimeMs).not.toBe(firstEndpointMtimeMs);
+			await broker.index.append({
+				type: "host_registered",
+				sessionId,
+				locator,
+				endpointGeneration: 1,
+				pid: process.pid,
+				endpointMtimeMs: skewedMtimeMs,
+			});
+			const replayed = await broker.handleRequest("session.resume", input, "ulp-replay");
+			expect(replayed).toMatchObject({ ok: true });
 		} finally {
 			await broker.stop();
 			await saved?.close();
