@@ -1818,6 +1818,80 @@ function requireReadyCanonicalCrystal(value: unknown): Record<string, unknown> {
 	return value;
 }
 
+function sameBoundedFileIdentity(left: nodeFs.BigIntStats, right: nodeFs.BigIntStats): boolean {
+	return (
+		left.dev === right.dev &&
+		left.ino === right.ino &&
+		left.mode === right.mode &&
+		left.size === right.size &&
+		left.mtimeNs === right.mtimeNs &&
+		left.ctimeNs === right.ctimeNs &&
+		left.nlink === right.nlink
+	);
+}
+
+async function readBoundedIdentityText(
+	filePath: string,
+	maxBytes: number,
+	label: string,
+	options: { tail?: boolean } = {},
+): Promise<string | undefined> {
+	let initialStat: nodeFs.BigIntStats;
+	try {
+		initialStat = await fs.lstat(filePath, { bigint: true });
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+		throw new StateCommandError(2, `failed to read ${label}: ${(error as Error).message}`);
+	}
+	if (initialStat.isSymbolicLink() || !initialStat.isFile()) throw new StateCommandError(2, `${label} is invalid`);
+	const openFlags =
+		nodeFs.constants.O_RDONLY | (process.platform === "win32" ? 0 : (nodeFs.constants.O_NOFOLLOW ?? 0));
+	let handle: fs.FileHandle | undefined;
+	try {
+		handle = await fs.open(filePath, openFlags);
+		const openedStat = await handle.stat({ bigint: true });
+		const beforeReadStat = await fs.lstat(filePath, { bigint: true });
+		if (
+			openedStat.isSymbolicLink() ||
+			!openedStat.isFile() ||
+			beforeReadStat.isSymbolicLink() ||
+			!sameBoundedFileIdentity(initialStat, openedStat) ||
+			!sameBoundedFileIdentity(initialStat, beforeReadStat)
+		)
+			throw new StateCommandError(2, `${label} is invalid`);
+		const start = options.tail ? (openedStat.size > BigInt(maxBytes) ? openedStat.size - BigInt(maxBytes) : 0n) : 0n;
+		const readSize = openedStat.size - start;
+		if (!options.tail && readSize > BigInt(maxBytes)) throw new StateCommandError(2, `${label} is invalid`);
+		const buffer = Buffer.alloc(Number(readSize));
+		let offset = 0;
+		while (offset < buffer.length) {
+			const { bytesRead } = await handle.read(buffer, offset, buffer.length - offset, Number(start) + offset);
+			if (bytesRead === 0) throw new StateCommandError(2, `${label} is invalid`);
+			offset += bytesRead;
+		}
+		const afterReadStat = await handle.stat({ bigint: true });
+		const afterPathStat = await fs.lstat(filePath, { bigint: true });
+		if (
+			afterPathStat.isSymbolicLink() ||
+			!afterPathStat.isFile() ||
+			!sameBoundedFileIdentity(initialStat, afterReadStat) ||
+			!sameBoundedFileIdentity(initialStat, afterPathStat)
+		)
+			throw new StateCommandError(2, `${label} is invalid`);
+		let text = buffer.subarray(0, offset).toString("utf-8");
+		if (options.tail && start > 0n) {
+			const firstNewline = text.indexOf("\n");
+			text = firstNewline >= 0 ? text.slice(firstNewline + 1) : "";
+		}
+		return text;
+	} catch (error) {
+		if (error instanceof StateCommandError) throw error;
+		throw new StateCommandError(2, `failed to read ${label}: ${(error as Error).message}`);
+	} finally {
+		await handle?.close().catch(() => undefined);
+	}
+}
+
 async function assertSanctionedExecutionApprovalAudit(
 	cwd: string,
 	sessionId: string,
@@ -2024,13 +2098,19 @@ async function hasAuditedDeepInterviewHandoff(
 	callee: CanonicalGjcWorkflowSkill,
 	options: { handoffAt?: string } = {},
 ): Promise<boolean> {
-	let raw: string;
-	try {
-		raw = await fs.readFile(auditPath(cwd, sessionId), "utf-8");
-	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
-		throw error;
-	}
+	const indexedRaw = await readBoundedIdentityText(
+		path.join(sessionStateDir(cwd, sessionId), `deep-interview-handoff-${callee}-audit.json`),
+		64 * 1024,
+		"deep-interview handoff index",
+	);
+	const auditRaw = await readBoundedIdentityText(
+		auditPath(cwd, sessionId),
+		1024 * 1024,
+		"deep-interview handoff audit",
+		{ tail: true },
+	);
+	const raw = `${indexedRaw ?? ""}${auditRaw ?? ""}`;
+	if (!raw) return false;
 	const sourcePath = path.resolve(modeStateFile(cwd, "deep-interview", sessionId));
 	const calleePath = path.resolve(modeStateFile(cwd, callee, sessionId));
 	const activePath = path.resolve(activeStateFile(cwd, sessionId));
@@ -2586,7 +2666,7 @@ async function appendHandoffAudit(options: {
 		calleeReceipt.mutated_at !== options.handoffAt
 	)
 		throw new StateCommandError(1, "handoff writer did not return matching caller/callee receipts");
-	await appendAuditEntry(options.cwd, options.sessionId, {
+	const entry = {
 		ts: options.handoffAt,
 		skill: options.caller,
 		category: "state",
@@ -2605,7 +2685,28 @@ async function appendHandoffAudit(options: {
 		callee_state_revision: calleeRevision,
 		caller_receipt: callerReceipt,
 		callee_receipt: calleeReceipt,
-	} as AuditEntry & Record<string, unknown>);
+	} as AuditEntry & Record<string, unknown>;
+	await appendAuditEntry(options.cwd, options.sessionId, entry);
+	if (options.caller === "deep-interview") {
+		await writeArtifact(
+			path.join(
+				sessionStateDir(options.cwd, options.sessionId),
+				`deep-interview-handoff-${options.callee}-audit.json`,
+			),
+			`${JSON.stringify(entry)}\n`,
+			{
+				cwd: options.cwd,
+				audit: {
+					category: "artifact",
+					verb: "write",
+					owner: "gjc-state-cli",
+					skill: "deep-interview",
+					sessionId: options.sessionId,
+					mutationId: options.mutationId,
+				},
+			},
+		);
+	}
 }
 
 /**

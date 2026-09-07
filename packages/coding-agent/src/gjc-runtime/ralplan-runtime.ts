@@ -2385,57 +2385,68 @@ async function seedRalplanState(
 	explicitTarget = false,
 ): Promise<{ statePath: string; runId: string; repositoryBinding: RepositoryBinding }> {
 	const statePath = ralplanStatePath(cwd, resolved.sessionId);
-	// Reuse an existing run id when present so a re-invocation of `gjc ralplan "task"` doesn't
-	// orphan in-progress artifacts under a fresh run id.
-	const existingRunId = await readActiveRunId(cwd, resolved.sessionId);
-	const runId = existingRunId ?? resolved.sessionId ?? defaultRunId();
-	assertSafePathComponent(runId, "run-id");
-	const now = new Date().toISOString();
-	// When an active seed already carries authority, re-entry must match it (fail closed).
-	// Otherwise stamp the current cwd as the durable binding for this run.
-	const repositoryBinding = existingRunId
-		? await enforceRalplanRepositoryBinding(cwd, resolved.sessionId, { exactWorktreeRoot: explicitTarget })
-		: publicRepositoryBinding(await captureRepositoryBinding(cwd, { displayPath: cwd }));
-	const existingStateRead = await readExistingStateForMutation(statePath);
-	const payload: Record<string, unknown> = {
-		active: true,
-		current_phase: "planner",
-		skill: "ralplan",
-		version: WORKFLOW_STATE_VERSION,
-		mode: resolved.deliberate ? "deliberate" : "short",
-		interactive: resolved.interactive,
-		task: resolved.task,
-		run_id: runId,
-		updated_at: now,
-		repository_binding: repositoryBinding,
-	};
-	if (existingStateRead.kind === "valid") {
-		for (const field of ["handoff_from", "handoff_at"] as const) {
-			if (typeof existingStateRead.value[field] === "string") payload[field] = existingStateRead.value[field];
-		}
-	}
-	if (resolved.architectKind) payload.architect_kind = resolved.architectKind;
-	if (resolved.criticKind) payload.critic_kind = resolved.criticKind;
-	if (resolved.sessionId) payload.session_id = resolved.sessionId;
-	await writeWorkflowEnvelopeAtomic(statePath, payload, {
-		cwd,
-		receipt: {
-			cwd,
-			skill: "ralplan",
-			owner: "gjc-runtime",
-			command: "gjc ralplan seed",
-			sessionId: resolved.sessionId,
+	return withWorkflowStateLock(
+		statePath,
+		async () => {
+			const existingStateRead = await readExistingStateForMutation(statePath);
+			if (existingStateRead.kind === "corrupt")
+				throw new RalplanCommandError(
+					2,
+					`existing ralplan state is corrupt or tampered (${existingStateRead.error}); refusing to overwrite ${statePath}`,
+				);
+			const existingRunId =
+				existingStateRead.kind === "valid" && typeof existingStateRead.value.run_id === "string"
+					? existingStateRead.value.run_id.trim() || undefined
+					: undefined;
+			const runId = existingRunId ?? resolved.sessionId ?? defaultRunId();
+			assertSafePathComponent(runId, "run-id");
+			const now = new Date().toISOString();
+			const repositoryBinding = existingRunId
+				? await enforceRalplanRepositoryBinding(cwd, resolved.sessionId, { exactWorktreeRoot: explicitTarget })
+				: publicRepositoryBinding(await captureRepositoryBinding(cwd, { displayPath: cwd }));
+			const payload: Record<string, unknown> = {
+				active: true,
+				current_phase: "planner",
+				skill: "ralplan",
+				version: WORKFLOW_STATE_VERSION,
+				mode: resolved.deliberate ? "deliberate" : "short",
+				interactive: resolved.interactive,
+				task: resolved.task,
+				run_id: runId,
+				updated_at: now,
+				repository_binding: repositoryBinding,
+			};
+			if (existingStateRead.kind === "valid") {
+				for (const field of ["handoff_from", "handoff_at"] as const) {
+					if (typeof existingStateRead.value[field] === "string") payload[field] = existingStateRead.value[field];
+				}
+			}
+			if (resolved.architectKind) payload.architect_kind = resolved.architectKind;
+			if (resolved.criticKind) payload.critic_kind = resolved.criticKind;
+			if (resolved.sessionId) payload.session_id = resolved.sessionId;
+			await writeWorkflowEnvelopeAtomic(statePath, payload, {
+				cwd,
+				lockHeld: true,
+				receipt: {
+					cwd,
+					skill: "ralplan",
+					owner: "gjc-runtime",
+					command: "gjc ralplan seed",
+					sessionId: resolved.sessionId,
+				},
+				audit: {
+					category: "state",
+					verb: "write",
+					owner: "gjc-runtime",
+					skill: "ralplan",
+					sessionId: resolved.sessionId,
+				},
+			});
+			await writeSessionActivityMarker(cwd, resolved.sessionId, { writer: "ralplan-runtime", path: statePath });
+			return { statePath, runId, repositoryBinding };
 		},
-		audit: {
-			category: "state",
-			verb: "write",
-			owner: "gjc-runtime",
-			skill: "ralplan",
-			sessionId: resolved.sessionId,
-		},
-	});
-	await writeSessionActivityMarker(cwd, resolved.sessionId, { writer: "ralplan-runtime", path: statePath });
-	return { statePath, runId, repositoryBinding };
+		{ cwd },
+	);
 }
 
 async function handleConsensusHandoff(args: readonly string[], cwd: string): Promise<RalplanCommandResult> {
