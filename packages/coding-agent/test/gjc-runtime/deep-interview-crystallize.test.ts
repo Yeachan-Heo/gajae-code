@@ -461,9 +461,7 @@ describe("deep-interview crystallize contract", () => {
 			revision: 1,
 			start: 0,
 			end: 0,
-			messages: [
-				{ index: 0, role: "user", content: "Use PostgreSQL for storage. Do not expose the database port." },
-			],
+			messages: [{ index: 0, role: "user", content: "Use PostgreSQL for storage. Do not use a public endpoint." }],
 			digest: "",
 		};
 		independentNegativeSnapshot.digest = crystalSnapshotDigest(independentNegativeSnapshot);
@@ -480,6 +478,28 @@ describe("deep-interview crystallize contract", () => {
 			}),
 		);
 		expect(independent.lifecycle).toBe("ready");
+		const contractedSnapshot: CrystalSnapshot = {
+			revision: 1,
+			start: 0,
+			end: 0,
+			messages: [{ index: 0, role: "user", content: "Use Go. Don't use Go; use JS." }],
+			digest: "",
+		};
+		contractedSnapshot.digest = crystalSnapshotDigest(contractedSnapshot);
+		expect(() =>
+			crystallizeDeepInterview(
+				input({
+					snapshot: contractedSnapshot,
+					items: [
+						{
+							...input().items[0]!,
+							statement: "Use Go",
+							anchor: { message_index: 0, quote: "Use Go." },
+						},
+					],
+				}),
+			),
+		).toThrow("verbatim user anchor");
 	});
 	it("requires fresh evidence when inferred material becomes confirmed", () => {
 		const first = crystallizeDeepInterview(
@@ -568,6 +588,12 @@ describe("deep-interview crystallize contract", () => {
 		);
 		next.resolved_open_gap_anchors = [{ item: gap, message_index: 1, quote: answer, resolution: answer }];
 		expect(crystallizeDeepInterview(next).lifecycle).toBe("ready");
+		const conditionalAnswer = "Telemetry should not be enabled until security signs off.";
+		const conditional = withFreshUserEvidence(input({ prior: first, resolved_open_gaps: [gap] }), conditionalAnswer);
+		conditional.resolved_open_gap_anchors = [
+			{ item: gap, message_index: 1, quote: conditionalAnswer, resolution: conditionalAnswer },
+		];
+		expect(() => crystallizeDeepInterview(conditional)).toThrow("fresh verbatim user anchor");
 	});
 	it("rejects unrelated unspaced CJK resolution evidence", () => {
 		const gap = "内存预算是多少？";

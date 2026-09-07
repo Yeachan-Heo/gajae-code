@@ -1834,7 +1834,7 @@ async function readBoundedIdentityText(
 	filePath: string,
 	maxBytes: number,
 	label: string,
-	options: { tail?: boolean } = {},
+	options: { tail?: boolean; offset?: number } = {},
 ): Promise<string | undefined> {
 	let initialStat: nodeFs.BigIntStats;
 	try {
@@ -1859,9 +1859,17 @@ async function readBoundedIdentityText(
 			!sameBoundedFileIdentity(initialStat, beforeReadStat)
 		)
 			throw new StateCommandError(2, `${label} is invalid`);
-		const start = options.tail ? (openedStat.size > BigInt(maxBytes) ? openedStat.size - BigInt(maxBytes) : 0n) : 0n;
-		const readSize = openedStat.size - start;
-		if (!options.tail && readSize > BigInt(maxBytes)) throw new StateCommandError(2, `${label} is invalid`);
+		const requestedOffset = options.offset === undefined ? undefined : BigInt(options.offset);
+		if (requestedOffset !== undefined && (requestedOffset < 0n || requestedOffset > openedStat.size))
+			throw new StateCommandError(2, `${label} offset is invalid`);
+		const start =
+			requestedOffset ??
+			(options.tail ? (openedStat.size > BigInt(maxBytes) ? openedStat.size - BigInt(maxBytes) : 0n) : 0n);
+		const available = openedStat.size - start;
+		const readSize =
+			requestedOffset === undefined ? available : available > BigInt(maxBytes) ? BigInt(maxBytes) : available;
+		if (!options.tail && requestedOffset === undefined && readSize > BigInt(maxBytes))
+			throw new StateCommandError(2, `${label} is invalid`);
 		const buffer = Buffer.alloc(Number(readSize));
 		let offset = 0;
 		while (offset < buffer.length) {
@@ -3544,38 +3552,70 @@ function buildExecutionApprovalAuditEntry(
 	} as AuditEntry & Record<string, unknown>;
 }
 
+function isSpecializedApprovalAuditLine(line: string, mutationId: string): boolean {
+	if (!line.includes(mutationId) || !line.includes('"approve-execution"')) return false;
+	try {
+		const parsed: unknown = JSON.parse(line);
+		return (
+			isPlainObject(parsed) &&
+			parsed.skill === "deep-interview" &&
+			parsed.category === "state" &&
+			parsed.verb === "approve-execution" &&
+			parsed.mutation_id === mutationId &&
+			typeof parsed.approved_at === "string" &&
+			Number.isSafeInteger(parsed.receipt_state_revision)
+		);
+	} catch {
+		return false;
+	}
+}
+
 async function approvalAuditContainsMutation(filePath: string, mutationId: string): Promise<boolean> {
-	const raw = await readBoundedIdentityTail(filePath, 8 * 1024 * 1024, "execution approval recovery audit");
-	if (!raw) return false;
-	return raw.split(/\r?\n/).some(line => {
-		if (!line.includes(mutationId) || !line.includes('"approve-execution"')) return false;
-		try {
-			const parsed: unknown = JSON.parse(line);
-			return (
-				isPlainObject(parsed) &&
-				parsed.skill === "deep-interview" &&
-				parsed.category === "state" &&
-				parsed.verb === "approve-execution" &&
-				parsed.mutation_id === mutationId &&
-				typeof parsed.approved_at === "string" &&
-				Number.isSafeInteger(parsed.receipt_state_revision)
-			);
-		} catch {
-			return false;
-		}
+	const raw = await readBoundedIdentityText(filePath, 8 * 1024 * 1024, "execution approval recovery audit", {
+		tail: true,
 	});
+	if (!raw) return false;
+	return raw.split(/\r?\n/).some(line => isSpecializedApprovalAuditLine(line, mutationId));
+}
+
+async function approvalAuditContainsMutationAtOffset(
+	filePath: string,
+	mutationId: string,
+	offset: number,
+): Promise<boolean> {
+	const raw = await readBoundedIdentityText(filePath, 128 * 1024, "execution approval recovery audit offset", {
+		offset,
+	});
+	if (raw === undefined) return false;
+	return isSpecializedApprovalAuditLine(raw.split(/\r?\n/, 1)[0] ?? "", mutationId);
 }
 
 async function appendExecutionApprovalAuditIdempotent(
 	options: ExecutionApprovalAuditOptions,
 	entry: AuditEntry & Record<string, unknown>,
-): Promise<void> {
+	knownOffset?: number,
+): Promise<number | undefined> {
 	const filePath = auditPath(options.cwd, options.sessionId);
-	await withWorkflowStateLock(
+	return withWorkflowStateLock(
 		filePath,
 		async () => {
-			if (await approvalAuditContainsMutation(filePath, options.mutationId)) return;
-			await appendAuditEntry(options.cwd, options.sessionId, entry);
+			if (
+				knownOffset !== undefined &&
+				Number.isSafeInteger(knownOffset) &&
+				knownOffset >= 0 &&
+				(await approvalAuditContainsMutationAtOffset(filePath, options.mutationId, knownOffset))
+			)
+				return knownOffset;
+			if (knownOffset === undefined && (await approvalAuditContainsMutation(filePath, options.mutationId))) return;
+			const offset = await fs
+				.stat(filePath)
+				.then(stat => stat.size)
+				.catch(error => {
+					if ((error as NodeJS.ErrnoException).code === "ENOENT") return 0;
+					throw error;
+				});
+			await appendAuditEntry(options.cwd, options.sessionId, entry, { lockHeld: true });
+			return offset;
 		},
 		{ cwd: options.cwd },
 	);
@@ -3604,12 +3644,31 @@ async function writeExecutionApprovalIndex(
 
 async function appendExecutionApprovalAudit(
 	options: ExecutionApprovalAuditOptions,
-	hooks: { afterIndex?: () => Promise<unknown>; afterAudit?: () => Promise<unknown> } = {},
+	hooks: {
+		afterIndex?: () => Promise<unknown>;
+		beforeAudit?: (offset: number) => Promise<unknown>;
+		afterAudit?: () => Promise<unknown>;
+	} = {},
 ): Promise<void> {
 	const entry = buildExecutionApprovalAuditEntry(options);
 	await writeExecutionApprovalIndex(options, entry);
 	await hooks.afterIndex?.();
-	await appendAuditEntry(options.cwd, options.sessionId, entry);
+	const filePath = auditPath(options.cwd, options.sessionId);
+	await withWorkflowStateLock(
+		filePath,
+		async () => {
+			const offset = await fs
+				.stat(filePath)
+				.then(stat => stat.size)
+				.catch(error => {
+					if ((error as NodeJS.ErrnoException).code === "ENOENT") return 0;
+					throw error;
+				});
+			await hooks.beforeAudit?.(offset);
+			await appendAuditEntry(options.cwd, options.sessionId, entry, { lockHeld: true });
+		},
+		{ cwd: options.cwd },
+	);
 	await hooks.afterAudit?.();
 }
 
@@ -3716,6 +3775,11 @@ async function handleApproveExecutionUnlocked(cwd: string, selectors: ResolvedSe
 					updateWorkflowTransactionJournal(cwd, selectors.gjcSessionId, existingReceipt.mutation_id as string, {
 						steps: ["approval-state", "approval-index"],
 					}),
+				beforeAudit: offset =>
+					updateWorkflowTransactionJournal(cwd, selectors.gjcSessionId, existingReceipt.mutation_id as string, {
+						steps: ["approval-state", "approval-index"],
+						approval_audit_offset: offset,
+					}),
 				afterAudit: () =>
 					updateWorkflowTransactionJournal(cwd, selectors.gjcSessionId, existingReceipt.mutation_id as string, {
 						steps: ["approval-state", "approval-index", "approval-audit"],
@@ -3776,12 +3840,18 @@ async function handleApproveExecutionUnlocked(cwd: string, selectors: ResolvedSe
 				}
 				if (!indexedMatches) await writeExecutionApprovalIndex(approvalOptions, expectedApprovalEntry);
 				const recoverySteps = new Set([...pendingJournal.steps, "approval-index"]);
+				let approvalAuditOffset = pendingJournal.approval_audit_offset;
 				if (!recoverySteps.has("approval-audit")) {
-					await appendExecutionApprovalAuditIdempotent(approvalOptions, expectedApprovalEntry);
+					approvalAuditOffset = await appendExecutionApprovalAuditIdempotent(
+						approvalOptions,
+						expectedApprovalEntry,
+						approvalAuditOffset,
+					);
 					recoverySteps.add("approval-audit");
 				}
 				await updateWorkflowTransactionJournal(cwd, selectors.gjcSessionId, existingReceipt.mutation_id, {
 					steps: [...recoverySteps],
+					approval_audit_offset: approvalAuditOffset,
 				});
 				await completeWorkflowTransactionJournal(cwd, selectors.gjcSessionId, existingReceipt.mutation_id);
 			}
@@ -3862,6 +3932,11 @@ async function handleApproveExecutionUnlocked(cwd: string, selectors: ResolvedSe
 		afterIndex: () =>
 			updateWorkflowTransactionJournal(cwd, selectors.gjcSessionId, mutationId, {
 				steps: ["approval-state", "approval-index"],
+			}),
+		beforeAudit: offset =>
+			updateWorkflowTransactionJournal(cwd, selectors.gjcSessionId, mutationId, {
+				steps: ["approval-state", "approval-index"],
+				approval_audit_offset: offset,
 			}),
 		afterAudit: () =>
 			updateWorkflowTransactionJournal(cwd, selectors.gjcSessionId, mutationId, {
