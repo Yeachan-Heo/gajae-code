@@ -300,6 +300,28 @@ describe("deep-interview crystallize contract", () => {
 				}),
 			),
 		).toThrow("verbatim user anchor");
+		const negatedCorrectionSnapshot: CrystalSnapshot = {
+			revision: 1,
+			start: 0,
+			end: 0,
+			messages: [{ index: 0, role: "user", content: "Build the API in Go. No, use JS." }],
+			digest: "",
+		};
+		negatedCorrectionSnapshot.digest = crystalSnapshotDigest(negatedCorrectionSnapshot);
+		expect(() =>
+			crystallizeDeepInterview(
+				input({
+					snapshot: negatedCorrectionSnapshot,
+					items: [
+						{
+							...input().items[0]!,
+							statement: "Build the API in Go",
+							anchor: { message_index: 0, quote: "Build the API in Go." },
+						},
+					],
+				}),
+			),
+		).toThrow("verbatim user anchor");
 	});
 	it("rejects marker substrings in mixed text anchors", () => {
 		const snapshot: CrystalSnapshot = {

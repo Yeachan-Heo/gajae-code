@@ -345,7 +345,7 @@ function hasLaterSupersedingCorrection(content: string, quote: string): boolean 
 	if (quoteIndex < 0) return false;
 	const later = content.slice(quoteIndex + quote.length);
 	return (
-		/\b(?:actually|instead|rather|correction|on\s+second\s+thought|make\s+that)\b/i.test(later) ||
+		/\b(?:actually|instead|rather|correction|on\s+second\s+thought|make\s+that|no|not)\b/i.test(later) ||
 		/(?:사실|대신|정정|다시\s+생각|実際|代わり|訂正|やはり|实际上|實際上|改为|改為|更正)/u.test(later)
 	);
 }
