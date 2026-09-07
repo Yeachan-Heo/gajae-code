@@ -950,6 +950,22 @@ describe("coordinator session state lock", () => {
 		expect((await readJson(stateFile)).activity).toBeUndefined();
 	});
 
+	it("fails closed on an aged stable malformed legacy directory with a live-shaped sibling", async () => {
+		// An aged, byte-stable, unparseable info record proves nothing about the
+		// process generation that owns the directory: clocks are neither
+		// monotonic nor cross-host trustworthy, so the legacy reclaimer must
+		// leave it for manual inspection even when the generic verdict is stale.
+		const { stateFile } = await seededRunningSession("lock-malformed-directory-aged-live");
+		const lockFile = `${stateFile}.lock`;
+		await fs.mkdir(lockFile, { recursive: true });
+		await Bun.write(path.join(lockFile, "info"), "");
+		const stale = new Date(Date.now() - 60_000);
+		await fs.utimes(path.join(lockFile, "info"), stale, stale);
+		await reclaimStaleSessionStateLock(lockFile);
+		expect(fsSync.statSync(lockFile).isDirectory()).toBe(true);
+		expect((await readJson(stateFile)).activity).toBeUndefined();
+	});
+
 	it("refuses to delete a legacy directory whose owner token changed", async () => {
 		const root = await tempRoot();
 		const lockDir = path.join(root, "state.json.lock");
