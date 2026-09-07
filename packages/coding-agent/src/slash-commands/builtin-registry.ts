@@ -42,6 +42,7 @@ import {
 	formatProviderPresetList,
 	formatProviderSetupResult,
 	parseProviderCompatibility,
+	reloadAndRefreshDiscoveryCatalog,
 } from "../setup/provider-onboarding";
 import { parseThinkingLevel } from "../thinking";
 import { getDisplayChangelogEntries } from "../utils/changelog";
@@ -171,6 +172,7 @@ function parseProviderSetupSlashArgs(args: string): {
 	apiKeyEnv?: string;
 	rejectedRawApiKey: boolean;
 	force: boolean;
+	discover: boolean;
 	models: string[];
 } {
 	const tokens = args.split(/\s+/).filter(Boolean);
@@ -182,9 +184,11 @@ function parseProviderSetupSlashArgs(args: string): {
 		apiKeyEnv?: string;
 		rejectedRawApiKey: boolean;
 		force: boolean;
+		discover: boolean;
 		models: string[];
 	} = {
 		force: false,
+		discover: false,
 		models: [],
 		rejectedRawApiKey: false,
 	};
@@ -192,6 +196,10 @@ function parseProviderSetupSlashArgs(args: string): {
 		const token = tokens[i];
 		if (token === "--force" || token === "-f") {
 			result.force = true;
+			continue;
+		}
+		if (token === "--discover") {
+			result.discover = true;
 			continue;
 		}
 		if (!token.startsWith("-") && !result.preset) {
@@ -231,7 +239,7 @@ function providerSetupUsage(): string {
 		"Provider onboarding",
 		"Presets: /provider add --preset <id> [--force]",
 		"Aliases include minimax, zai, alibaba, cline, command-code, and goat.",
-		"API providers: /provider add --compat <openai|anthropic> --provider <id> --base-url <url> --api-key-env <ENV> --model <model> [--force]",
+		"API providers: /provider add --compat <openai|anthropic> --provider <id> --base-url <url> --api-key-env <ENV> (--model <model> | --discover) [--force]",
 		`Available presets:\n${formatProviderPresetList()}`,
 		"OAuth/subscription providers: /provider login [provider-id] or /login [provider-id]",
 		"Headless OAuth callbacks can be pasted with /login <redirect URL or code>.",
@@ -1681,7 +1689,7 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 			}
 			if (!parsed.preset) {
 				if (!parsed.apiKeyEnv) missing.push("--api-key-env");
-				if (parsed.models.length === 0) missing.push("--model");
+				if (parsed.models.length === 0 && !parsed.discover) missing.push("--model or --discover");
 			}
 			if (missing.length > 0) {
 				return usage(
@@ -1697,10 +1705,20 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 					baseUrl: parsed.baseUrl,
 					apiKeyEnv: parsed.apiKeyEnv,
 					models: parsed.models,
+					discover: parsed.discover,
 					force: parsed.force,
 				});
-				await runtime.session.modelRegistry.refresh("offline");
-				await runtime.output(formatProviderSetupResult(result));
+				let recoveryHint: string | null = null;
+				if (result.discoveryEnabled && !result.preset) {
+					recoveryHint = await reloadAndRefreshDiscoveryCatalog(runtime.session.modelRegistry, result.providerId);
+				} else {
+					await runtime.session.modelRegistry.refresh("offline");
+				}
+				await runtime.output(
+					recoveryHint
+						? `${formatProviderSetupResult(result)}\n${recoveryHint}`
+						: formatProviderSetupResult(result),
+				);
 				await runtime.notifyConfigChanged?.();
 				return commandConsumed();
 			} catch (err) {
@@ -1738,10 +1756,24 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 						baseUrl: parsed.baseUrl,
 						apiKeyEnv: parsed.apiKeyEnv,
 						models: parsed.models,
+						discover: parsed.discover,
 						force: parsed.force,
+						authStorage: runtime.ctx.session.modelRegistry.authStorage,
 					});
-					await runtime.ctx.session.modelRegistry.refresh("offline");
-					runtime.ctx.showStatus(formatProviderSetupResult(result));
+					let recoveryHint: string | null = null;
+					if (result.discoveryEnabled && !result.preset) {
+						recoveryHint = await reloadAndRefreshDiscoveryCatalog(
+							runtime.ctx.session.modelRegistry,
+							result.providerId,
+						);
+					} else {
+						await runtime.ctx.session.modelRegistry.refresh("offline");
+					}
+					runtime.ctx.showStatus(
+						recoveryHint
+							? `${formatProviderSetupResult(result)}\n${recoveryHint}`
+							: formatProviderSetupResult(result),
+					);
 				} catch (err) {
 					runtime.ctx.showError(`Provider setup failed: ${errorMessage(err)}`);
 				}

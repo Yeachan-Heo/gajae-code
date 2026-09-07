@@ -3460,7 +3460,14 @@ describe("ModelRegistry", () => {
 			await addApiCompatibleProvider({ preset: "minimax", modelsPath: presetModelsPath });
 			await addApiCompatibleProvider({ preset: "zai", modelsPath: presetModelsPath });
 			await addApiCompatibleProvider({ preset: "cline-pass", modelsPath: presetModelsPath });
-			await addApiCompatibleProvider({ preset: "commandcode-goat", modelsPath: presetModelsPath });
+			await addApiCompatibleProvider({
+				preset: "commandcode-goat",
+				modelsPath: presetModelsPath,
+				probeDiscovery: async () => ({
+					models: ["goat-model"],
+					endpoint: "https://api.commandcode.ai/provider/v1/models",
+				}),
+			});
 			authStorage.setRuntimeApiKey("commandcode-goat", "test-key");
 
 			using _hook = hookFetch(input => {

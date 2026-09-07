@@ -42,7 +42,7 @@ function typeText(component: { handleInput(input: string): void }, text: string)
 
 function driveEnvWizard(
 	component: CustomProviderWizardComponent,
-	options?: { providerId?: string; model?: string },
+	options?: { providerId?: string; model?: string; discover?: boolean },
 ): void {
 	component.handleInput("\n");
 	typeText(component, options?.providerId ?? "custom-openai");
@@ -52,6 +52,16 @@ function driveEnvWizard(
 	component.handleInput("\n");
 	typeText(component, "CUSTOM_PROVIDER_KEY");
 	component.handleInput("\n");
+	if (options?.discover === true) {
+		// Discover step: "Discover models now" with no injected deps is a
+		// no-op, so take the manual path explicitly.
+		component.handleInput("\x1b[B");
+		component.handleInput("\n");
+	} else {
+		// Discover step defaults to "Discover models now"; move to manual entry.
+		component.handleInput("\x1b[B");
+		component.handleInput("\n");
+	}
 	typeText(component, options?.model ?? "custom-model");
 	component.handleInput("\n");
 }
@@ -90,6 +100,8 @@ describe("provider onboarding wizard", () => {
 				apiKeyEnv: "CUSTOM_PROVIDER_KEY",
 				apiKey: undefined,
 				models: ["custom-model"],
+				discover: false,
+				discoverySignal: expect.any(AbortSignal),
 				force: false,
 			},
 		]);
@@ -133,6 +145,9 @@ describe("provider onboarding wizard", () => {
 		wizard.handleInput("\n");
 		typeText(wizard, "literal-secret");
 		expect(visibleText(wizard)).not.toContain("literal-secret");
+		wizard.handleInput("\n");
+		// Discover step: move to manual model entry.
+		wizard.handleInput("\x1b[B");
 		wizard.handleInput("\n");
 		typeText(wizard, "literal-model");
 		wizard.handleInput("\n");
@@ -215,6 +230,41 @@ describe("provider onboarding wizard", () => {
 			expect(configChanged).toBe(true);
 			expect(registry.find("live-provider", "live-model")).toBeDefined();
 			expect(ctx.statuses).toEqual([successStatus]);
+		} finally {
+			store.close();
+		}
+	});
+
+	it("skips completion UI when the wizard is cancelled before submit settles", async () => {
+		tempAgentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-provider-wizard-"));
+		setAgentDir(tempAgentDir);
+		const store = await SqliteAuthCredentialStore.open(path.join(tempAgentDir, "agent.db"));
+		try {
+			const authStorage = new AuthStorage(store);
+			const registry = new ModelRegistry(authStorage, path.join(tempAgentDir, "models.yml"));
+			const ctx = createControllerContext(registry);
+			const controller = new SelectorController(ctx);
+			// Slow the registry reload so the submit stays pending while we cancel.
+			const originalRefresh = registry.refresh.bind(registry);
+			const { promise: refreshGate, resolve: releaseRefresh } = Promise.withResolvers<void>();
+			registry.refresh = async mode => {
+				await refreshGate;
+				await originalRefresh(mode);
+			};
+			controller.showCustomProviderWizard();
+			const wizard = ctx.ui.focused as CustomProviderWizardComponent;
+			driveEnvWizard(wizard, { providerId: "late-provider", model: "late-model" });
+			wizard.handleInput("\n");
+			await Bun.sleep(20);
+			// Esc back to compatibility (confirm -> models -> discover ->
+			// credential -> source -> base -> id -> compatibility), then cancel.
+			for (let i = 0; i < 7; i++) wizard.handleInput("\u001b");
+			wizard.handleInput("\u001b");
+			releaseRefresh();
+			await Bun.sleep(50);
+			// No completion UI may surface after dismissal: neither success
+			// status nor error may be reported for the settled submit.
+			expect(ctx.statuses).toEqual([]);
 		} finally {
 			store.close();
 		}

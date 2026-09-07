@@ -5,6 +5,15 @@ import type { Api, FetchImpl, Model, Provider } from "../../types";
 import { toNumber } from "../../utils";
 
 const MODELS_PATH = "/models";
+
+/**
+ * Shared `/models` request deadline for setup-time probing and runtime
+ * discovery. One policy so an endpoint that passes setup validation cannot
+ * be unreachable under the runtime deadline (previously 10s vs 5s: a 6s
+ * endpoint passed setup, saved discovery-only config, then stayed
+ * unavailable at runtime with no recovery hint).
+ */
+export const MODELS_LIST_REQUEST_TIMEOUT_MS = 10_000;
 const MAX_MODELS_RESPONSE_BYTES = 1_000_000;
 const MAX_CATALOG_MODEL_ID_LENGTH = 200;
 
@@ -306,6 +315,13 @@ export async function fetchOpenAICompatibleModels<TApi extends Api>(
 	}
 
 	return Array.from(deduped.values()).sort((left, right) => left.id.localeCompare(right.id));
+}
+
+export const MAX_MODELS_RESPONSE_BYTES_PUBLIC = MAX_MODELS_RESPONSE_BYTES;
+
+/** Bounded JSON body reader for `/models` responses (shared by runtime and setup probe). */
+export async function readBoundedModelsJson(response: Response): Promise<unknown> {
+	return JSON.parse(await readModelsResponse(response));
 }
 
 async function readModelsResponse(response: Response): Promise<string> {

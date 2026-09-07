@@ -43,6 +43,9 @@ import { fetchModelsDevPayload } from "@gajae-code/ai/provider-models/openai-com
 import { isDirectXaiReasoningEffortModel } from "@gajae-code/ai/providers/openai-completions-compat";
 import {
 	detectDiscoveredApiFamily,
+	isSafeCatalogModelId,
+	MODELS_LIST_REQUEST_TIMEOUT_MS,
+	readBoundedModelsJson,
 	resolveLoopbackOpenAIBaseUrl,
 } from "@gajae-code/ai/utils/discovery/openai-compatible";
 
@@ -141,6 +144,28 @@ function redactDiscoveryUrl(value: string | URL): string {
 	} catch {
 		return "(invalid URL)";
 	}
+}
+
+/**
+ * Scrub resolved credential material from a discovery failure before it is
+ * published to discovery state, cache provenance, or the logger. Mutates
+ * Error messages in place to preserve class/stack; wraps non-Errors.
+ */
+export function scrubDiscoveryError(error: unknown, secrets: ReadonlyArray<string | undefined>): unknown {
+	const redact = (text: string): string => {
+		let scrubbed = text;
+		for (const secret of secrets) {
+			if (secret) scrubbed = scrubbed.split(secret).join("[redacted]");
+		}
+		return scrubbed;
+	};
+	if (error instanceof Error) {
+		error.message = redact(error.message);
+		if (typeof error.cause === "string") error.cause = redact(error.cause);
+		return error;
+	}
+	if (typeof error === "string") return redact(error);
+	return error;
 }
 
 /** Whether a structured transport code proves that no listener accepted the connection. */
@@ -3468,8 +3493,13 @@ export class ModelRegistry {
 						await this.#discoverModelsByProviderType(provider, apiKey),
 					);
 				} catch (error) {
+					// ONE credential-safe discovery error boundary: transport
+					// layers may echo request details (including the bearer)
+					// in failure text. Scrub resolved credential material
+					// before the error reaches discovery state, cache
+					// provenance, or the logger below.
 					discoveryFailureEvidence = error;
-					throw error;
+					throw scrubDiscoveryError(error, [apiKey, preflightApiKey]);
 				}
 			},
 			getEvidenceGeneration: provider => this.#getProviderEvidenceGeneration(provider.provider, preflightApiKey),
@@ -4190,7 +4220,7 @@ export class ModelRegistry {
 			...(providerConfig.discovery.type === "vllm" || providerConfig.discovery.type === "sglang"
 				? { redirect: "error" as const }
 				: {}),
-			signal: AbortSignal.timeout(hardenedLocalDiscovery ? 500 : 5_000),
+			signal: AbortSignal.timeout(hardenedLocalDiscovery ? 500 : MODELS_LIST_REQUEST_TIMEOUT_MS),
 		});
 		if (!response.ok) {
 			if (response.status === 401 || response.status === 403) {
@@ -4202,16 +4232,31 @@ export class ModelRegistry {
 			}
 			throw new Error(`HTTP ${response.status} from ${redactDiscoveryUrl(modelsUrl)}`);
 		}
-		const payload: unknown = await response.json();
+		// Shared 1MB bounded reader (same as the setup probe): a timeout
+		// bounds wall clock, not bytes buffered.
+		let payload: unknown;
+		try {
+			payload = await readBoundedModelsJson(response);
+		} catch {
+			throw new Error(`Malformed OpenAI models-list response from ${redactDiscoveryUrl(modelsUrl)}`);
+		}
 		if (!isRecord(payload) || !Array.isArray(payload.data)) {
 			throw new Error(`Malformed OpenAI models-list response from ${redactDiscoveryUrl(modelsUrl)}`);
 		}
 		const models = payload.data;
 		const discovered: Model<Api>[] = [];
 		for (const item of models) {
-			if (!isRecord(item) || typeof item.id !== "string" || !item.id.trim()) continue;
-			const id = item.id;
+			// Shared catalog admission: the setup probe applies the same
+			// check, so IDs that appear only between requests cannot enter
+			// the live catalog or cache unsanitized.
+			if (!isRecord(item) || !isSafeCatalogModelId(item.id)) continue;
+			const id = item.id.trim();
 			const referenceModel = resolveCustomModelReference(id);
+			// Names render directly in the model selector: apply the same
+			// text-safety admission, falling back to the reference name or
+			// the safe ID.
+			const rawName = typeof item.name === "string" ? item.name.trim() : "";
+			const name = rawName && isSafeCatalogModelId(rawName) ? rawName : (referenceModel?.name ?? id);
 			const discoveredMaxTokens = firstPositiveDiscoveryNumber(
 				item.max_completion_tokens,
 				item.max_tokens,
@@ -4221,7 +4266,7 @@ export class ModelRegistry {
 			discovered.push(
 				enrichModelThinking({
 					id,
-					name: typeof item.name === "string" ? item.name : (referenceModel?.name ?? id),
+					name,
 					api,
 					provider: providerConfig.provider,
 					baseUrl: requestBaseUrl,
