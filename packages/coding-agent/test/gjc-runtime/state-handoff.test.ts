@@ -1113,6 +1113,31 @@ describe("gjc state handoff", () => {
 		});
 	});
 
+	it("accepts explicit Ralplan execution from an ordinary off receipt with a large final artifact", async () => {
+		await withTempCwd(async cwd => {
+			await writePublishedReadyCrystal(cwd);
+			expect(
+				(await runNativeStateCommand(["handoff", "--mode", "deep-interview", "--to", "ralplan", "--json"], cwd))
+					.status,
+			).toBe(0);
+			const seed = await runNativeRalplanCommand(["--json", "refine before explicit execution approval"], cwd);
+			expect(seed.status, seed.stderr).toBe(0);
+			const runId = parseRequiredJson(seed.stdout, "ralplan seed stdout").run_id as string;
+			const artifactPath = path.join(cwd, "large-final.md");
+			await fs.writeFile(artifactPath, `# Final\n${"계획".repeat(60_000)}`);
+			const final = await runNativeRalplanCommand(
+				["--write", "--stage", "final", "--stage_n", "1", "--artifact", artifactPath, "--run-id", runId, "--json"],
+				cwd,
+			);
+			expect(final.status, final.stderr).toBe(0);
+			const result = await runNativeStateCommand(
+				["handoff", "--mode", "ralplan", "--to", "ultragoal", "--json"],
+				cwd,
+			);
+			expect(result.status, result.stderr).toBe(0);
+		});
+	});
+
 	it("reads Ralplan handoff lineage only after acquiring the seed lock", async () => {
 		await withTempCwd(async cwd => {
 			const ralplanPath = modeStatePath(cwd, TEST_SESSION_ID, "ralplan");
@@ -1822,6 +1847,35 @@ describe("gjc state handoff", () => {
 				(await runNativeStateCommand(["handoff", "--mode", "deep-interview", "--to", "ultragoal", "--json"], cwd))
 					.status,
 			).toBe(0);
+		});
+	});
+
+	it("repairs a missing approval index from a pending post-audit journal", async () => {
+		await withTempCwd(async cwd => {
+			const { callerPath } = await writePublishedReadyCrystal(cwd);
+			expect((await runNativeDeepInterviewCommand(["approve-execution", "--json"], cwd)).status).toBe(0);
+			const approved = (await readJson(callerPath)) as Record<string, unknown>;
+			const approval = (approved.state as Record<string, unknown>).execution_approval_receipt as Record<
+				string,
+				unknown
+			>;
+			const mutationId = approval.mutation_id as string;
+			const indexPath = path.join(sessionStateDir(cwd, TEST_SESSION_ID), "deep-interview-approval-audit.json");
+			await fs.rm(indexPath);
+			await beginWorkflowTransactionJournal({
+				cwd,
+				sessionId: TEST_SESSION_ID,
+				mutationId,
+				caller: "deep-interview",
+				paths: [callerPath, auditPath(cwd, TEST_SESSION_ID)],
+			});
+			await updateWorkflowTransactionJournal(cwd, TEST_SESSION_ID, mutationId, {
+				steps: ["approval-state", "approval-audit"],
+			});
+			const retried = await runNativeDeepInterviewCommand(["approve-execution", "--json"], cwd);
+			expect(retried.status, retried.stderr).toBe(0);
+			expect(JSON.parse(await fs.readFile(indexPath, "utf8")).mutation_id).toBe(mutationId);
+			expect(await readWorkflowTransactionJournal(cwd, TEST_SESSION_ID, mutationId)).toBeUndefined();
 		});
 	});
 
