@@ -700,6 +700,7 @@ describe("deep-interview crystallize contract", () => {
 			],
 			["Use Go. Can’t use Go; use JS.", "Use Go.", "Use Go"],
 			["Use Go. Go is deprecated; don’t use it.", "Use Go.", "Use Go"],
+			["Use API v1.2. API v1.2 is deprecated; don’t use it.", "Use API v1.2.", "Use API v1.2"],
 			["Use اّdatabase for storage", "database for storage", "Use database for storage"],
 			["Use Java‍Script", "Script", "Use Script"],
 		] as const) {
