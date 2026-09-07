@@ -6945,7 +6945,7 @@ export class AgentSession {
 						provisionalAssistant?.sessionIdentityEpoch === this.#sessionIdentityEpoch
 							? provisionalAssistant.presentationMessage
 							: undefined);
-					if (presentationMessage && presentationMessage !== recoveredAssistant) {
+					if (presentationMessage && presentationMessage !== publishedAssistant) {
 						transferSessionMessageIdentity([recoveredAssistant], [presentationMessage]);
 						this.agent.discardRejectedAssistantEvent(presentationMessage);
 					}
@@ -7741,6 +7741,8 @@ export class AgentSession {
 			this.#sessionAdmissionContext.getStore()?.selectionFenceGeneration ??
 			this.#selectionFenceGeneration;
 		const delayMs = options?.delayMs ?? 0;
+		const scheduledSessionId = this.sessionId;
+		const scheduledSessionIdentityEpoch = this.#sessionIdentityEpoch;
 		const resourceRunId = options?.resourceRunId;
 		const contextualLease = this.#runResourceLeaseContext.getStore();
 		const parentLease =
@@ -7779,6 +7781,10 @@ export class AgentSession {
 			}
 			if (options?.generation !== undefined && this.#promptGeneration !== options.generation) {
 				options.onSkip?.();
+				return;
+			}
+			if (this.sessionId !== scheduledSessionId || this.#sessionIdentityEpoch !== scheduledSessionIdentityEpoch) {
+				options?.onSkip?.();
 				return;
 			}
 			await this.#selectionFenceGenerationContext.run(selectionFenceGeneration, () => task(signal));
@@ -24848,12 +24854,14 @@ export class AgentSession {
 			// the emit and the context rebuild when no handlers are registered (mirrors
 			// the session_before_tree guard above).
 			if (this.#extensionRunner?.hasHandlers("session_tree")) {
-				await this.#extensionRunner.emit({
-					type: "session_tree",
-					newLeafId: this.sessionManager.getLeafId(),
-					oldLeafId,
-					summaryEntry,
-					fromExtension: summaryText ? fromExtension : undefined,
+				await this.#withPostCommitTransitionIngress(async () => {
+					await this.#extensionRunner?.emit({
+						type: "session_tree",
+						newLeafId: this.sessionManager.getLeafId(),
+						oldLeafId,
+						summaryEntry,
+						fromExtension: summaryText ? fromExtension : undefined,
+					});
 				});
 				const refreshedContext = this.buildDisplaySessionContext();
 				return { editorText, cancelled: false, summaryEntry, sessionContext: refreshedContext };
