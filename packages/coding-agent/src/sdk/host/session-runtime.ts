@@ -4262,7 +4262,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			const payload = toAgentWireEventPayload(event);
 			for (const invocation of invocations) {
 				if (invocation.connectionId === undefined) continue;
-				current.runtime.sendFrameTo([invocation.connectionId], {
+				current.runtime.sendFrameTo(invocation.connectionId, {
 					type: "event",
 					kind: event.type,
 					payload,
