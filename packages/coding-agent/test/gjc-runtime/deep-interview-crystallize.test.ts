@@ -1096,6 +1096,7 @@ describe("deep-interview crystallize contract", () => {
 		const first = crystallizeDeepInterview(input());
 		for (const resolution of [
 			"Do not remove the fast constraint.",
+			"Do not remove the fast constraint; it is no longer needed.",
 			"Should we remove the fast constraint?",
 			"If needed, remove the fast constraint.",
 			"I refuse to remove the fast constraint.",
