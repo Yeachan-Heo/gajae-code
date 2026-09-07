@@ -2094,6 +2094,169 @@ describe("SDK broker identity and discovery", () => {
 			await fs.rm(dir, { recursive: true, force: true });
 		}
 	});
+	it("enforces a supplied saved-session identity before live resume", async () => {
+		const dir = await temp();
+		const cwd = path.join(dir, "repo");
+		const stateRoot = path.join(cwd, ".gjc", "state");
+		const broker = new Broker({ agentDir: dir });
+		let saved: SessionManager | undefined;
+		try {
+			await fs.mkdir(cwd, { recursive: true });
+			saved = SessionManager.create(cwd, SessionManager.managedDestination(cwd, dir));
+			await saved.ensureOnDisk();
+			const sessionId = saved.getSessionId();
+			const sessionPath = saved.getSessionFile();
+			if (!sessionPath) throw new Error("Expected a saved session path.");
+			const captured = SessionManager.captureTranscriptStrict(sessionPath);
+			if (captured.kind !== "captured") throw new Error("Expected a captured saved session.");
+			const identity = captured.snapshot.identity;
+			const resumeInput = {
+				cwd,
+				stateRoot,
+				sessionId,
+				sessionPath,
+				sessionIdentity: {
+					dev: identity.dev.toString(),
+					ino: identity.ino.toString(),
+					size: identity.size,
+					mtimeMs: identity.mtimeMs,
+					mtimeNs: identity.mtimeNs.toString(),
+					sha256: "0".repeat(64),
+				},
+			};
+			await broker.start();
+			const coldResult = await broker.handleRequest("session.resume", resumeInput, "saved-identity-mismatch-cold");
+			expect(coldResult).toMatchObject({
+				ok: false,
+				error: { code: "invalid_input", message: expect.stringContaining("transcript identity") },
+			});
+			const endpointPath = path.join(stateRoot, "sdk", `${sessionId}.json`);
+			await fs.mkdir(path.dirname(endpointPath), { recursive: true });
+			await fs.writeFile(
+				endpointPath,
+				JSON.stringify({ sessionId, pid: process.pid, url: "ws://127.0.0.1:1", token: "live-token" }),
+			);
+			const endpointMtimeMs = (await fs.stat(endpointPath)).mtimeMs;
+			await broker.index.append({
+				type: "host_registered",
+				sessionId,
+				locator: { cwd, worktreeRoot: null, stateRoot },
+				endpointGeneration: 1,
+				pid: process.pid,
+				endpointMtimeMs,
+			});
+			await broker.index.append({
+				type: "host_heartbeat",
+				sessionId,
+				locator: { cwd, worktreeRoot: null, stateRoot },
+				endpointGeneration: 1,
+				pid: process.pid,
+			});
+
+			const result = await broker.handleRequest("session.resume", resumeInput, "saved-identity-mismatch");
+			expect(result).toMatchObject({
+				ok: false,
+				error: { code: "invalid_input", message: expect.stringContaining("transcript identity") },
+			});
+		} finally {
+			await broker.stop();
+			await saved?.close();
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	});
+	it("does not replay a lifecycle success onto a replacement endpoint incarnation", async () => {
+		const dir = await temp();
+		const cwd = path.join(dir, "repo");
+		const stateRoot = path.join(cwd, ".gjc", "state");
+		const broker = new Broker({ agentDir: dir });
+		let saved: SessionManager | undefined;
+		try {
+			await fs.mkdir(cwd, { recursive: true });
+			saved = SessionManager.create(cwd, SessionManager.managedDestination(cwd, dir));
+			await saved.ensureOnDisk();
+			const sessionId = saved.getSessionId();
+			const sessionPath = saved.getSessionFile();
+			if (!sessionPath) throw new Error("Expected a saved session path.");
+			const captured = SessionManager.captureTranscriptStrict(sessionPath);
+			if (captured.kind !== "captured") throw new Error("Expected a captured saved session.");
+			const identity = captured.snapshot.identity;
+			const endpointPath = path.join(stateRoot, "sdk", `${sessionId}.json`);
+			await fs.mkdir(path.dirname(endpointPath), { recursive: true });
+			await fs.writeFile(
+				endpointPath,
+				JSON.stringify({ sessionId, pid: process.pid, url: "ws://127.0.0.1:1", token: "original-token" }),
+			);
+			await broker.start();
+			const firstEndpointMtimeMs = (await fs.stat(endpointPath)).mtimeMs;
+			const locator = { cwd, worktreeRoot: null, stateRoot };
+			await broker.index.append({
+				type: "host_registered",
+				sessionId,
+				locator,
+				endpointGeneration: 1,
+				pid: process.pid,
+				endpointMtimeMs: firstEndpointMtimeMs,
+			});
+			await broker.index.append({
+				type: "host_heartbeat",
+				sessionId,
+				locator,
+				endpointGeneration: 1,
+				pid: process.pid,
+			});
+			const input = {
+				cwd,
+				stateRoot,
+				sessionId,
+				sessionPath,
+				sessionIdentity: {
+					dev: identity.dev.toString(),
+					ino: identity.ino.toString(),
+					size: identity.size,
+					mtimeMs: identity.mtimeMs,
+					mtimeNs: identity.mtimeNs.toString(),
+					sha256: identity.sha256,
+				},
+			};
+			const first = await broker.handleRequest("session.resume", input, "replacement-replay");
+			expect(first).toMatchObject({
+				ok: true,
+				result: { endpointGeneration: 1, endpoint: { token: "original-token" } },
+			});
+
+			await broker.index.append({
+				type: "host_unregistered",
+				sessionId,
+				locator,
+				endpointGeneration: 1,
+				pid: process.pid,
+			});
+			await fs.rm(endpointPath);
+			await fs.writeFile(
+				endpointPath,
+				JSON.stringify({ sessionId, pid: process.pid, url: "ws://127.0.0.1:1", token: "replacement-token" }),
+			);
+			const replacementEndpointMtimeMs = (await fs.stat(endpointPath)).mtimeMs;
+			await broker.index.append({
+				type: "host_registered",
+				sessionId,
+				locator,
+				endpointGeneration: 1,
+				pid: process.pid,
+				endpointMtimeMs: replacementEndpointMtimeMs,
+			});
+
+			const replayed = await broker.handleRequest("session.resume", input, "replacement-replay");
+			expect(replayed).toEqual({
+				ok: false,
+				error: { code: "endpoint_stale", message: "lifecycle replay target was replaced" },
+			});
+		} finally {
+			await broker.stop();
+			await saved?.close();
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	});
 	it("replays only the same lifecycle body and conflicts when a caller reuses its key for the same target", async () => {
 		const dir = await temp();
 		const broker = new Broker({ agentDir: dir });

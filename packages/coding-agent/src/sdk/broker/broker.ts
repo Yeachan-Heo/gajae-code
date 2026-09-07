@@ -724,6 +724,7 @@ function credentialFreeLifecycleResponse(value: unknown): unknown {
 type LifecycleReplayEndpoint = {
 	endpoint: Record<string, unknown>;
 	endpointGeneration: number;
+	endpointIncarnation: string;
 	pid: number;
 	endpointMtimeMs: number;
 };
@@ -2862,6 +2863,8 @@ export class Broker {
 			endpointMtimeMs <= 0
 		)
 			return error("endpoint_stale", "session endpoint authority is incomplete");
+		const currentIncarnation = endpointIncarnation(record, sessionId);
+		if (!currentIncarnation) return error("endpoint_stale", "session endpoint incarnation is unavailable");
 		const endpoint = await this.#readEndpoint(record, {});
 		if (!endpoint.ok) return endpoint;
 		if (endpoint.result === null || typeof endpoint.result !== "object" || Array.isArray(endpoint.result))
@@ -2869,6 +2872,7 @@ export class Broker {
 		return {
 			endpoint: endpoint.result as Record<string, unknown>,
 			endpointGeneration: record.endpointGeneration,
+			endpointIncarnation: currentIncarnation,
 			pid: record.pid,
 			endpointMtimeMs,
 		};
@@ -3326,15 +3330,32 @@ export class Broker {
 						(operation === "session.create" || operation === "session.fork" || operation === "session.resume") &&
 						typeof (replay.result as { sessionId?: unknown } | undefined)?.sessionId === "string"
 					) {
-						const refreshed = await this.#readLifecycleReplayEndpoint(
-							(replay.result as { sessionId: string }).sessionId,
-						);
+						const replayResult = objectRecord(replay.result);
+						const replaySessionId = (replay.result as { sessionId: string }).sessionId;
+						const replayIncarnation =
+							typeof replayResult?.endpointIncarnation === "string" &&
+							/^[a-f0-9]{64}$/.test(replayResult.endpointIncarnation)
+								? replayResult.endpointIncarnation
+								: endpointIncarnation(
+										{
+											endpointGeneration: replayResult?.endpointGeneration as number,
+											endpointMtimeMs: replayResult?.endpointMtimeMs as number,
+											pid: replayResult?.pid as number,
+										},
+										replaySessionId,
+									);
+						if (!replayIncarnation)
+							return error("endpoint_stale", "lifecycle replay lacks original endpoint authority");
+						const refreshed = await this.#readLifecycleReplayEndpoint(replaySessionId);
 						if (isBrokerResponse(refreshed)) return refreshed;
+						if (refreshed.endpointIncarnation !== replayIncarnation)
+							return error("endpoint_stale", "lifecycle replay target was replaced");
 						return {
 							ok: true,
 							result: {
 								...(replay.result as Record<string, unknown>),
 								endpointGeneration: refreshed.endpointGeneration,
+								endpointIncarnation: refreshed.endpointIncarnation,
 								pid: refreshed.pid,
 								endpointMtimeMs: refreshed.endpointMtimeMs,
 								endpoint: refreshed.endpoint,

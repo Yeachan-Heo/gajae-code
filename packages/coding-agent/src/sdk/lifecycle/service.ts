@@ -200,6 +200,7 @@ export interface SessionLifecycleSessionResult {
 	readonly sessionId: string;
 	readonly cwd?: string;
 	readonly endpointGeneration?: number;
+	readonly endpointIncarnation?: string;
 	readonly reused?: boolean;
 	readonly note?: string;
 }
@@ -511,6 +512,7 @@ function sessionResult(value: unknown, expectedSessionId?: string): SessionLifec
 		sessionId: string;
 		cwd?: string;
 		endpointGeneration?: number;
+		endpointIncarnation?: string;
 		reused?: boolean;
 		note?: string;
 	} = { sessionId };
@@ -518,6 +520,8 @@ function sessionResult(value: unknown, expectedSessionId?: string): SessionLifec
 	const endpointGeneration = record.endpointGeneration;
 	if (typeof endpointGeneration === "number" && Number.isSafeInteger(endpointGeneration) && endpointGeneration > 0)
 		result.endpointGeneration = endpointGeneration;
+	if (typeof record.endpointIncarnation === "string" && /^[a-f0-9]{64}$/.test(record.endpointIncarnation))
+		result.endpointIncarnation = record.endpointIncarnation;
 	if (typeof record.reused === "boolean") result.reused = record.reused;
 	if (typeof record.note === "string") result.note = record.note;
 	return result;

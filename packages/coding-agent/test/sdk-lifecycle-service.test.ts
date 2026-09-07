@@ -366,6 +366,8 @@ describe("SessionLifecycleService", () => {
 				pid: 1234,
 				processIncarnation: "linux:1234",
 				hostIncarnation: "linux:1234",
+				endpointGeneration: 3,
+				endpointIncarnation: "a".repeat(64),
 				endpointMtimeMs: 1234,
 				lifecycleRequestId: "internal-request-id",
 			},
@@ -374,7 +376,12 @@ describe("SessionLifecycleService", () => {
 		expect(created).toEqual({
 			ok: true,
 			operation: "session.create",
-			result: { sessionId: "created", cwd: "/repo" },
+			result: {
+				sessionId: "created",
+				cwd: "/repo",
+				endpointGeneration: 3,
+				endpointIncarnation: "a".repeat(64),
+			},
 		});
 		client.response = {
 			ok: true,
@@ -386,6 +393,8 @@ describe("SessionLifecycleService", () => {
 				pid: 1234,
 				processIncarnation: "linux:1234",
 				hostIncarnation: "linux:1234",
+				endpointGeneration: 4,
+				endpointIncarnation: "b".repeat(64),
 				endpointMtimeMs: 1234,
 				lifecycleRequestId: "internal-request-id",
 			},
@@ -399,7 +408,12 @@ describe("SessionLifecycleService", () => {
 		expect(resumed).toEqual({
 			ok: true,
 			operation: "session.resume",
-			result: { sessionId: "resumed", cwd: "/repo" },
+			result: {
+				sessionId: "resumed",
+				cwd: "/repo",
+				endpointGeneration: 4,
+				endpointIncarnation: "b".repeat(64),
+			},
 		});
 	});
 

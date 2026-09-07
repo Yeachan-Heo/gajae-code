@@ -813,7 +813,12 @@ SDK core exposes two related provider-neutral capabilities:
    operation capability, a stable caller request key, and a typed target. It
    derives one Broker idempotency key and invokes the canonical Broker lifecycle
    operation. Results never expose endpoint URLs, tokens, process identities,
-   cleanup paths, or raw Broker receipts.
+   cleanup paths, or raw Broker receipts. Successful create, fork, and resume
+   results may include the credential-free `endpointGeneration` plus opaque
+   `endpointIncarnation`; pass both back for an exact close authority rather
+   than deriving a replacement identity from the numeric generation. A supplied
+   saved-session `sessionIdentity` is enforced as the transcript snapshot
+   precondition for resume and fork.
 2. **`SessionRouter`** owns live attachment discovery and transport. It validates
    the exact indexed endpoint generation, keeps credentials and `SdkClient`
    instances private, replays from the attachment cursor, reconnects after
