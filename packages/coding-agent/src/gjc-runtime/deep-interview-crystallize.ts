@@ -616,9 +616,22 @@ function evidenceTerms(value: string): Set<string> {
 
 function evidenceTermSequence(value: string): string[] {
 	const terms = evidenceTerms(value);
-	return [...EVIDENCE_SEGMENTER.segment(value.normalize("NFC").toLowerCase())]
-		.filter(part => part.isWordLike && terms.has(part.segment))
-		.map(part => part.segment);
+	const canonical = value.normalize("NFC");
+	const technical = [...canonical.matchAll(/(?:\b[A-Za-z][A-Za-z0-9]*\.[A-Za-z0-9.]+\b|\b[A-Za-z][+#]{1,2})/g)].map(
+		match => ({ index: match.index, end: match.index + match[0].length, term: match[0].toLowerCase() }),
+	);
+	const segmented = [...EVIDENCE_SEGMENTER.segment(canonical)]
+		.filter(
+			part =>
+				part.isWordLike &&
+				!technical.some(match => part.index >= match.index && part.index < match.end) &&
+				terms.has(part.segment.toLowerCase()),
+		)
+		.map(part => ({ index: part.index, term: part.segment.toLowerCase() }));
+	return [...segmented, ...technical]
+		.filter(part => terms.has(part.term))
+		.sort((left, right) => left.index - right.index)
+		.map(part => part.term);
 }
 
 function preservesEvidenceOrder(statement: string, quote: string): boolean {
