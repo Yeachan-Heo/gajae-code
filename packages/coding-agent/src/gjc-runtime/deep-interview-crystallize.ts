@@ -340,6 +340,16 @@ function anchoredClause(content: string, quote: string): string {
 	return content.slice(boundary + 1, end).trim();
 }
 
+function hasLaterSupersedingCorrection(content: string, quote: string): boolean {
+	const quoteIndex = content.indexOf(quote);
+	if (quoteIndex < 0) return false;
+	const later = content.slice(quoteIndex + quote.length);
+	return (
+		/\b(?:actually|instead|rather|correction|on\s+second\s+thought|make\s+that)\b/i.test(later) ||
+		/(?:사실|대신|정정|다시\s+생각|実際|代わり|訂正|やはり|实际上|實際上|改为|改為|更正)/u.test(later)
+	);
+}
+
 function semanticProfile(value: string): CrystalSemanticProfile {
 	const normalized = value.normalize("NFC").toLowerCase();
 	const obligationTerms = new Set<string>();
@@ -533,6 +543,7 @@ function validateItems(value: unknown, snapshot?: CrystalSnapshot): CrystalItem[
 					containsNonTextMarker(item.anchor.quote) ||
 					containsNonTextMarker(anchorMessage.content) ||
 					!anchorMessage.content.includes(item.anchor.quote) ||
+					hasLaterSupersedingCorrection(anchorMessage.content, item.anchor.quote) ||
 					quoteTerms.size === 0 ||
 					statementTerms.size === 0 ||
 					[...statementTerms].some(term => !quoteTerms.has(term)) ||
@@ -824,7 +835,8 @@ function validateRemovalAnchors(
 			/(?:더\s+이상\s+필요\s+없|不要|不再需要)/u.test(resolution);
 		const containsCompetingKeepDirective = (value: string): boolean =>
 			/\b(?:do\s+not|don't|never)\s+(?:remove|drop|delete|discard|omit|exclude|retire|cancel|stop)\b/i.test(value) ||
-			/(?:삭제|제거|제외|취소|중단)(?:하지\s*마|하지\s*않)/u.test(value);
+			/\b(?:keep|retain|restore|preserve|maintain)\b/i.test(value) ||
+			/(?:삭제|제거|제외|취소|중단)(?:하지\s*마|하지\s*않)|(?:유지|보존|복원|保持|保留|恢复|恢復|復元)/u.test(value);
 		const competingKeepDirective = [resolution, quote, message?.content ?? ""].some(containsCompetingKeepDirective);
 		const removalSemantics = semanticProfile(resolution);
 		const quotedRemovalSemantics = semanticProfile(quote);
