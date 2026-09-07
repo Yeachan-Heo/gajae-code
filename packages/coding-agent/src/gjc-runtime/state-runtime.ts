@@ -44,7 +44,14 @@ import {
 	mergeDeepInterviewEnvelope,
 	normalizeDeepInterviewEnvelope,
 } from "./deep-interview-state";
-import { activeSnapshotPath, auditPath, modeStatePath, sessionSpecsDir, sessionStateDir } from "./session-layout";
+import {
+	activeSnapshotPath,
+	auditPath,
+	modeStatePath,
+	sessionPlansDir,
+	sessionSpecsDir,
+	sessionStateDir,
+} from "./session-layout";
 import {
 	resolveGjcSessionForRead,
 	resolveGjcSessionForWrite,
@@ -1844,8 +1851,13 @@ async function assertSanctionedExecutionApprovalAudit(
 		const handle = await fs.open(filePath, "r");
 		try {
 			const buffer = Buffer.alloc(stat.size - start);
-			await handle.read(buffer, 0, buffer.length, start);
-			raw = buffer.toString("utf-8");
+			let offset = 0;
+			while (offset < buffer.length) {
+				const { bytesRead } = await handle.read(buffer, offset, buffer.length - offset, start + offset);
+				if (bytesRead === 0) throw new Error("execution approval audit ended before the bounded tail was read");
+				offset += bytesRead;
+			}
+			raw = buffer.subarray(0, offset).toString("utf-8");
 			if (start > 0) {
 				const firstNewline = raw.indexOf("\n");
 				raw = firstNewline >= 0 ? raw.slice(firstNewline + 1) : "";
@@ -2148,6 +2160,92 @@ async function assertDeepInterviewHandoffReady(
 	assertLockedIntentContract();
 }
 
+async function hasSanctionedRalplanFinalAdmission(
+	cwd: string,
+	sessionId: string,
+	state: Record<string, unknown>,
+): Promise<boolean> {
+	const runId = typeof state.run_id === "string" ? state.run_id.trim() : "";
+	if (!runId) return false;
+	try {
+		assertSafePathComponent(runId, "ralplan run-id");
+	} catch {
+		return false;
+	}
+	const admission = isPlainObject(state.auto_handoff) ? state.auto_handoff : undefined;
+	if (!admission) return false;
+	if (
+		admission.effectiveTarget !== "ultragoal" ||
+		admission.degradationReason !== null ||
+		typeof admission.source !== "string" ||
+		!admission.source.trim()
+	)
+		return false;
+	const ralplanPath = modeStateFile(cwd, "ralplan", sessionId);
+	const receipt = persistedWorkflowReceipt(state.receipt, "ralplan");
+	const checksum = receipt?.content_sha256;
+	if (
+		receipt?.owner !== "gjc-runtime" ||
+		receipt.command !== "gjc ralplan final-admission" ||
+		checksum?.algorithm !== "sha256" ||
+		typeof checksum.value !== "string" ||
+		!/^[0-9a-f]{64}$/.test(checksum.value) ||
+		checksum.covered_path !== path.resolve(ralplanPath) ||
+		typeof checksum.computed_at !== "string" ||
+		!checksum.computed_at.trim()
+	)
+		return false;
+	const integrityWarning = await warnAndAuditOutOfBandIfNeeded(cwd, sessionId, ralplanPath, "ralplan");
+	if (integrityWarning) return false;
+
+	const runDir = path.join(sessionPlansDir(cwd, sessionId), "ralplan", runId);
+	const indexPath = path.join(runDir, "index.jsonl");
+	let indexText: string;
+	try {
+		const stat = await fs.stat(indexPath);
+		if (!stat.isFile() || stat.size > 1024 * 1024) return false;
+		indexText = await fs.readFile(indexPath, "utf-8");
+	} catch {
+		return false;
+	}
+	let finalRow: Record<string, unknown> | undefined;
+	for (const line of indexText.split(/\r?\n/)) {
+		if (!line.trim()) continue;
+		let parsed: unknown;
+		try {
+			parsed = JSON.parse(line);
+		} catch {
+			return false;
+		}
+		if (!isPlainObject(parsed)) return false;
+		if (parsed.stage === "final") finalRow = parsed;
+	}
+	const indexedAdmission = isPlainObject(finalRow?.auto_handoff) ? finalRow.auto_handoff : undefined;
+	if (
+		!finalRow ||
+		!indexedAdmission ||
+		indexedAdmission.configuredTarget !== admission.configuredTarget ||
+		indexedAdmission.effectiveTarget !== admission.effectiveTarget ||
+		indexedAdmission.degradationReason !== admission.degradationReason ||
+		indexedAdmission.source !== admission.source ||
+		typeof finalRow.path !== "string" ||
+		typeof finalRow.sha256 !== "string" ||
+		!/^[0-9a-f]{64}$/.test(finalRow.sha256)
+	)
+		return false;
+	const artifactPath = path.resolve(finalRow.path);
+	if (!artifactPath.startsWith(`${path.resolve(runDir)}${path.sep}`)) return false;
+	try {
+		const stat = await fs.lstat(artifactPath);
+		if (!stat.isFile() || stat.isSymbolicLink() || stat.size > MAX_DEEP_INTERVIEW_STRUCTURED_RESPONSE_LENGTH)
+			return false;
+		const artifact = await fs.readFile(artifactPath);
+		return createHash("sha256").update(artifact).digest("hex") === finalRow.sha256;
+	} catch {
+		return false;
+	}
+}
+
 async function assertDeepInterviewExecutionLineage(
 	cwd: string,
 	sessionId: string,
@@ -2234,34 +2332,8 @@ async function assertDeepInterviewExecutionLineage(
 			const integrityWarning = await warnAndAuditOutOfBandIfNeeded(cwd, sessionId, upstreamPath, "deep-interview");
 			if (integrityWarning)
 				throw new StateCommandError(2, `${integrityWarning}; execution handoff refuses tampered mode-state`);
-			let ralplanAdmission =
-				currentSkill === "ralplan" &&
-				isPlainObject(currentState.auto_handoff) &&
-				currentState.auto_handoff.effectiveTarget === "ultragoal" &&
-				currentState.auto_handoff.degradationReason === null &&
-				typeof currentState.auto_handoff.source === "string" &&
-				currentState.auto_handoff.source.trim() !== "" &&
-				isPlainObject(currentState.receipt) &&
-				currentState.receipt.skill === "ralplan" &&
-				currentState.receipt.owner === "gjc-runtime" &&
-				currentState.receipt.command === "gjc ralplan final-admission";
-			if (ralplanAdmission) {
-				const ralplanPath = modeStateFile(cwd, "ralplan", sessionId);
-				const receipt = persistedWorkflowReceipt(currentState.receipt, "ralplan");
-				const checksum = receipt?.content_sha256;
-				ralplanAdmission =
-					checksum?.algorithm === "sha256" &&
-					typeof checksum.value === "string" &&
-					/^[0-9a-f]{64}$/.test(checksum.value) &&
-					checksum.covered_path === path.resolve(ralplanPath) &&
-					typeof checksum.computed_at === "string" &&
-					checksum.computed_at.trim() !== "";
-				if (ralplanAdmission) {
-					const integrityWarning = await warnAndAuditOutOfBandIfNeeded(cwd, sessionId, ralplanPath, "ralplan");
-					if (integrityWarning)
-						throw new StateCommandError(2, "execution handoff cannot authenticate ralplan final admission");
-				}
-			}
+			const ralplanAdmission =
+				currentSkill === "ralplan" && (await hasSanctionedRalplanFinalAdmission(cwd, sessionId, currentState));
 			try {
 				await assertDeepInterviewHandoffReady(upstreamState, {
 					cwd,
@@ -2269,8 +2341,11 @@ async function assertDeepInterviewExecutionLineage(
 					statePath: upstreamPath,
 					requireExecutionApproval: !ralplanAdmission,
 				});
-			} catch {
-				throw new StateCommandError(2, "execution handoff cannot authenticate Deep Interview approval lineage");
+			} catch (error) {
+				throw new StateCommandError(
+					2,
+					`execution handoff cannot authenticate Deep Interview approval lineage: ${error instanceof Error ? error.message : String(error)}`,
+				);
 			}
 			return;
 		}

@@ -2396,6 +2396,7 @@ async function seedRalplanState(
 	const repositoryBinding = existingRunId
 		? await enforceRalplanRepositoryBinding(cwd, resolved.sessionId, { exactWorktreeRoot: explicitTarget })
 		: publicRepositoryBinding(await captureRepositoryBinding(cwd, { displayPath: cwd }));
+	const existingStateRead = await readExistingStateForMutation(statePath);
 	const payload: Record<string, unknown> = {
 		active: true,
 		current_phase: "planner",
@@ -2408,6 +2409,11 @@ async function seedRalplanState(
 		updated_at: now,
 		repository_binding: repositoryBinding,
 	};
+	if (existingStateRead.kind === "valid") {
+		for (const field of ["handoff_from", "handoff_at"] as const) {
+			if (typeof existingStateRead.value[field] === "string") payload[field] = existingStateRead.value[field];
+		}
+	}
 	if (resolved.architectKind) payload.architect_kind = resolved.architectKind;
 	if (resolved.criticKind) payload.critic_kind = resolved.criticKind;
 	if (resolved.sessionId) payload.session_id = resolved.sessionId;

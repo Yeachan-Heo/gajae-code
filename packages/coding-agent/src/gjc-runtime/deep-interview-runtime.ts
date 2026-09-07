@@ -519,6 +519,7 @@ async function authoritativeConversationSnapshot(
 }> {
 	let sessionFile = process.env.GJC_SESSION_FILE?.trim();
 	const canonicalCandidates = new Set<string>();
+	const managedCandidates = new Set<string>();
 	const lexicalCandidates = new Set(listProjectSessionTranscriptFiles(cwd).map(candidate => path.resolve(candidate)));
 	const managedScope = await resolveManagedSessionScope({ cwd });
 	if (managedScope.kind === "error")
@@ -527,18 +528,11 @@ async function authoritativeConversationSnapshot(
 		const managedListing = await listManagedSessionCandidates({ scope: managedScope.scope });
 		if (managedListing.kind === "error")
 			throw new DeepInterviewCommandError(2, "managed session transcript listing is unavailable");
-		for (const candidate of managedListing.owned) lexicalCandidates.add(path.resolve(candidate.path));
-	}
-	if (!sessionFile && lexicalCandidates.size > 1000)
-		throw new DeepInterviewCommandError(2, "session transcript discovery exceeded the bounded candidate limit");
-	for (const candidate of [...lexicalCandidates].sort()) {
-		try {
-			const stat = await fs.lstat(candidate);
-			if (!stat.isFile() || stat.isSymbolicLink()) continue;
-			const realPath = await fs.realpath(candidate);
-			if (realPath !== candidate) continue;
-			canonicalCandidates.add(realPath);
-		} catch {}
+		for (const candidate of managedListing.owned) {
+			const resolved = path.resolve(candidate.path);
+			managedCandidates.add(resolved);
+			lexicalCandidates.add(resolved);
+		}
 	}
 	// The native command accepts an explicit workspace cwd, which may differ from
 	// process.cwd(). Resolve relative managed transcript paths against that same
@@ -555,10 +549,22 @@ async function authoritativeConversationSnapshot(
 		} catch {
 			throw new DeepInterviewCommandError(2, "GJC_SESSION_FILE is not a managed canonical session transcript");
 		}
-		if (!canonicalCandidates.has(explicitRealPath))
+		const projectSessionsRoot = path.resolve(cwd, ".gjc", "sessions");
+		if (!isPathWithin(projectSessionsRoot, explicitRealPath) && !managedCandidates.has(explicitRealPath))
 			throw new DeepInterviewCommandError(2, "GJC_SESSION_FILE is not a managed canonical session transcript");
 		sessionFile = explicitRealPath;
 	} else {
+		if (lexicalCandidates.size > 1000)
+			throw new DeepInterviewCommandError(2, "session transcript discovery exceeded the bounded candidate limit");
+		for (const candidate of [...lexicalCandidates].sort()) {
+			try {
+				const stat = await fs.lstat(candidate);
+				if (!stat.isFile() || stat.isSymbolicLink()) continue;
+				const realPath = await fs.realpath(candidate);
+				if (realPath !== candidate) continue;
+				canonicalCandidates.add(realPath);
+			} catch {}
+		}
 		for (const candidate of [...canonicalCandidates].sort()) {
 			try {
 				const bytes = await readBoundedFileBytes(candidate, RESUME_TRANSCRIPT_MAX_BYTES, "session transcript", {
