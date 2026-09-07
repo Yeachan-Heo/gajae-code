@@ -133,10 +133,12 @@ export type ChatDaemonAction = "stop" | "reload";
  * Discord generation 72 / Slack generation 75 serialize same-generation
  * successor attachment admission behind predecessor provider retirement, so a
  * pre-upgrade owner cannot retain the queue race fixed by #5120.
+ * Slack generation 80 persists and fences the inbound SDK dispatch boundary so
+ * crashes, recovery, and attachment retirement cannot replay ambiguous work.
  */
 export const CHAT_DAEMON_GENERATIONS: Readonly<Record<ChatDaemonKind, number>> = {
 	discord: 73,
-	slack: 79,
+	slack: 80,
 };
 
 export function chatDaemonGeneration(kind: ChatDaemonKind): number {

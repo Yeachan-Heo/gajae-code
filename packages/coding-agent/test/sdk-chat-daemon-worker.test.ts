@@ -1281,6 +1281,7 @@ describe("chat daemon worker", () => {
 		};
 		const firstProvider = new FakeSlackProvider();
 		const firstClient = new FakeSdkClient();
+		const controlDispatched = Promise.withResolvers<void>();
 		firstClient.request = async frame => {
 			firstClient.requests.push(frame);
 			if (frame.type === "event_replay")
@@ -1290,6 +1291,7 @@ describe("chat daemon worker", () => {
 					lastSeq: 1,
 					events: [{ type: "event", name: "session_ready", sessionId: "session", generation: 1, seq: 1 }],
 				};
+			controlDispatched.resolve();
 			throw new SdkClientError("uncertain_after_send", "SDK connection closed after accepting the control request");
 		};
 		const firstRuntime = new ChatDaemonRuntime(runtimeInput, {
@@ -1298,12 +1300,37 @@ describe("chat daemon worker", () => {
 		});
 
 		const firstReadyPost = firstProvider.waitForPostCount(1, post => post.threadTs === undefined);
-		await firstRuntime.start();
-		await firstReadyPost;
-		await firstRuntime.reconcile({ waitForReplay: true });
-		const rootTs = "1.1";
+		await withStageTimeout("lost-response first runtime start", firstRuntime.start(), 5_000);
+		await withStageTimeout("lost-response first ready post", firstReadyPost, 5_000);
+		await withStageTimeout(
+			"lost-response first replay reconciliation",
+			firstRuntime.reconcile({ waitForReplay: true }),
+			5_000,
+		);
+		// The provider reports the Slack post before the daemon commits the root
+		// mapping that authorizes inbound commands. A cold/detached filesystem can
+		// expose that interval, so synchronize on durable authority rather than the
+		// provider callback; otherwise the prompt is correctly rejected pre-send and
+		// the request waiter owns an unbounded promise until the test-level timeout.
+		const firstStore = new ConversationStore<SlackConversation>({ agentDir, kind: "slack" });
+		const activeConversation = await withStageTimeout(
+			"lost-response durable Slack root",
+			(async () => {
+				const deadline = Date.now() + 4_000;
+				while (Date.now() < deadline) {
+					const conversation = Object.values((await firstStore.load()).conversations).find(
+						record => record.sessionId === "session" && record.state === "active" && record.rootTs !== undefined,
+					);
+					if (conversation) return conversation;
+					await Bun.sleep(1);
+				}
+				throw new Error("Durable Slack root did not become active.");
+			})(),
+			5_000,
+		);
+		const rootTs = activeConversation.rootTs!;
 		expect(firstProvider.posts).toHaveLength(1);
-		await firstProvider.handler?.({
+		const promptEnvelope: SlackSocketEnvelope = {
 			envelope_id: "prompt-envelope",
 			payload: {
 				type: "events_api",
@@ -1319,22 +1346,45 @@ describe("chat daemon worker", () => {
 					client_msg_id: "prompt-id",
 				},
 			},
-		});
-		await firstClient.waitForRequest(frame => frame.type === "control_request");
-		expect(firstClient.requests).toContainEqual({
-			type: "control_request",
-			operation: "turn.prompt",
-			input: { text: "accepted prompt" },
-			confirm: true,
-			idempotencyKey: "slack:team:channel:1.1:human:prompt-event:prompt-id",
-		});
-		const effectId = "inbound:team:channel:1.1:human:prompt-event:prompt-id";
-		expect(await new ChatEffectJournal({ agentDir, transport: "slack" }).read(effectId)).toMatchObject({
+		};
+		const promptDispatch = firstProvider.handler?.(promptEnvelope);
+		if (!promptDispatch) throw new Error("Slack provider did not publish its inbound handler.");
+		await withStageTimeout("lost-response SDK dispatch boundary", controlDispatched.promise, 5_000);
+		await withStageTimeout("lost-response prompt settlement", promptDispatch, 5_000);
+		const controlRequests = firstClient.requests.filter(frame => frame.type === "control_request");
+		const idempotencyKey = `slack:team:channel:${rootTs}:human:prompt-event:prompt-id`;
+		expect(controlRequests).toEqual([
+			{
+				type: "control_request",
+				operation: "turn.prompt",
+				input: { text: "accepted prompt" },
+				confirm: true,
+				idempotencyKey,
+			},
+		]);
+		const effectId = `inbound:team:channel:${rootTs}:human:prompt-event:prompt-id`;
+		const journal = new ChatEffectJournal({ agentDir, transport: "slack" });
+		const uncertainEffect = await withStageTimeout(
+			"lost-response durable ambiguity receipt",
+			(async () => {
+				const deadline = Date.now() + 4_000;
+				while (Date.now() < deadline) {
+					const effect = await journal.read(effectId);
+					if (effect?.state === "uncertain") return effect;
+					await Bun.sleep(1);
+				}
+				throw new Error("Lost-response effect did not become durably uncertain.");
+			})(),
+			5_000,
+		);
+		expect(uncertainEffect).toMatchObject({
 			kind: "sdk.inbound.command",
 			state: "uncertain",
 			receipt: { status: "uncertain" },
 		});
-		await firstRuntime.stop();
+		await withStageTimeout("lost-response first runtime stop", firstRuntime.stop(), 5_000);
+		expect(firstClient.closed).toBe(true);
+		expect(firstProvider.stopped).toBe(true);
 
 		const restartedProvider = new FakeSlackProvider();
 		const restartedClient = new FakeSdkClient();
@@ -1342,14 +1392,32 @@ describe("chat daemon worker", () => {
 			routerDeps: { ...routerDeps, createClient: async () => restartedClient },
 			createSlackProvider: () => restartedProvider,
 		});
-		await restartedRuntime.start();
-		await restartedClient.waitForRequest(frame => frame.type === "event_replay");
-		await restartedRuntime.reconcile({ waitForReplay: true });
+		await withStageTimeout("lost-response restarted runtime start", restartedRuntime.start(), 5_000);
+		await withStageTimeout(
+			"lost-response restarted replay observation",
+			restartedClient.waitForRequest(frame => frame.type === "event_replay"),
+			5_000,
+		);
+		await withStageTimeout(
+			"lost-response restarted reconciliation",
+			restartedRuntime.reconcile({ waitForReplay: true }),
+			5_000,
+		);
+		expect(await journal.read(effectId)).toMatchObject({
+			kind: "sdk.inbound.command",
+			state: "uncertain",
+			receipt: { status: "uncertain" },
+		});
+		const duplicateDispatch = restartedProvider.handler?.(promptEnvelope);
+		if (!duplicateDispatch) throw new Error("Restarted Slack provider did not publish its inbound handler.");
+		await withStageTimeout("lost-response duplicate envelope settlement", duplicateDispatch, 5_000);
 		expect(restartedClient.requests).toEqual([expect.objectContaining({ type: "event_replay" })]);
 		expect(restartedClient.requests).not.toContainEqual(
 			expect.objectContaining({ type: "control_request", operation: "turn.prompt" }),
 		);
-		await restartedRuntime.stop();
+		await withStageTimeout("lost-response restarted runtime stop", restartedRuntime.stop(), 5_000);
+		expect(restartedClient.closed).toBe(true);
+		expect(restartedProvider.stopped).toBe(true);
 	}, 20_000);
 	it("uses the production SdkClient loopback boundary while Discord remains fake", async () => {
 		root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-chat-worker-wire-"));

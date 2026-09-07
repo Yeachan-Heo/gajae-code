@@ -12,7 +12,13 @@ import {
 	type SessionIndex,
 } from "../broker/session-index";
 import { cancellableSleep, lifecycleRequestTimeoutMs } from "../broker/startup-budget";
-import { SdkClient, SdkClientError, type SdkDispatchContext, type SdkDispatchHandler } from "../client/client";
+import {
+	SdkClient,
+	SdkClientError,
+	type SdkDispatchContext,
+	type SdkDispatchHandler,
+	SdkPreparedDispatchError,
+} from "../client/client";
 import {
 	endpointDirectory,
 	readSdkBrokerDiscovery,
@@ -89,7 +95,13 @@ export interface SessionAttachment {
 	readonly connectionId?: string;
 	readonly generation: number;
 	isCurrent(): boolean;
-	send(frame: Record<string, unknown>): unknown;
+	send(
+		frame: Record<string, unknown>,
+		options?: {
+			beforeDispatch?: () => void;
+			dispatchFence?: (dispatch: () => Promise<void>) => Promise<void>;
+		},
+	): unknown;
 	/**
 	 * Idempotent provider-lease heartbeat send that skips the pre-send authority
 	 * reconcile (#4689).
@@ -182,6 +194,7 @@ export interface SessionRouterClient {
 		frame: Record<string, unknown>,
 		options?: {
 			timeoutMs?: number;
+			connectedOnly?: boolean;
 			/** Synchronous pre-send observer; a throw aborts the dispatch before the wire. */
 			beforeDispatch?: (context: SdkDispatchContext) => void;
 			/** Synchronous post-send boundary observer for transport-close-aware consumers. */
@@ -914,6 +927,7 @@ export class SessionRouter {
 			timeoutMs?: number;
 			beforeDispatch?: (context: SdkDispatchContext) => void;
 			onDispatch?: SdkDispatchHandler;
+			dispatchFence?: (dispatch: () => Promise<Record<string, unknown>>) => Promise<Record<string, unknown>>;
 		},
 	): Promise<Record<string, unknown>> {
 		const matchesExpectedAuthority = (attachment: SessionAttachment): boolean =>
@@ -951,31 +965,34 @@ export class SessionRouter {
 		// token: the wire frame alone carries credentials, and the observer
 		// context is a deep-frozen, token-redacted copy (#4640 review).
 		const wireFrame = this.#prepareFrame(attached, frame);
-		const { beforeDispatch, onDispatch, ...requestOptions } = options ?? {};
-		const response = await attached.client.request(wireFrame, {
-			...requestOptions,
-			timeoutMs: requestOptions.timeoutMs ?? SESSION_REQUEST_TIMEOUT_MS,
-			...(beforeDispatch
-				? {
-						beforeDispatch: (context: SdkDispatchContext) => {
-							return beforeDispatch({
-								...context,
-								frame: redactDispatchFrame(context.frame),
-							});
-						},
-					}
-				: {}),
-			...(onDispatch
-				? {
-						onDispatch: (context: SdkDispatchContext) => {
-							return onDispatch({
-								...context,
-								frame: redactDispatchFrame(context.frame),
-							});
-						},
-					}
-				: {}),
-		});
+		const { beforeDispatch, onDispatch, dispatchFence, ...requestOptions } = options ?? {};
+		try {
+			await attached.client.connect?.();
+		} catch (error) {
+			if (error instanceof SdkClientError) throw new SdkPreparedDispatchError(error);
+			throw error;
+		}
+		if (!this.#attachmentPublished(attached))
+			throw new SessionRouterError("pre_send", "SDK session attachment changed during transport preparation.");
+		const dispatch = () =>
+			attached.client.request(wireFrame, {
+				...requestOptions,
+				connectedOnly: true,
+				timeoutMs: requestOptions.timeoutMs ?? SESSION_REQUEST_TIMEOUT_MS,
+				...(beforeDispatch
+					? {
+							beforeDispatch: (context: SdkDispatchContext) =>
+								beforeDispatch({ ...context, frame: redactDispatchFrame(context.frame) }),
+						}
+					: {}),
+				...(onDispatch
+					? {
+							onDispatch: (context: SdkDispatchContext) =>
+								onDispatch({ ...context, frame: redactDispatchFrame(context.frame) }),
+						}
+					: {}),
+			});
+		const response = await (dispatchFence ? dispatchFence(dispatch) : dispatch());
 		const settled = this.#sessions.get(sessionId);
 		if (
 			!settled ||
@@ -1146,7 +1163,12 @@ export class SessionRouter {
 	}
 
 	/** Lists saved sessions through Router-owned Broker discovery without exposing credentials or mutation authority. */
-	async listBrokerSessions(input: Record<string, unknown>, idempotencyKey: string): Promise<Record<string, unknown>> {
+	async listBrokerSessions(
+		input: Record<string, unknown>,
+		idempotencyKey: string,
+		options?: { beforeDispatch?: (context: SdkDispatchContext) => void },
+		dispatchFence?: (dispatch: () => Promise<Record<string, unknown>>) => Promise<Record<string, unknown>>,
+	): Promise<Record<string, unknown>> {
 		const operation = "session.list";
 		const discovery = await readSdkBrokerDiscovery(this.#agentDir);
 		if (!discovery) throw new SessionRouterError("pre_send", "SDK broker discovery is unavailable.");
@@ -1160,10 +1182,18 @@ export class SessionRouter {
 		}
 		try {
 			const timeoutMs = lifecycleRequestTimeoutMs(operation, input);
-			return await client.request(
-				{ type: "broker_request", operation, input, idempotencyKey },
-				timeoutMs === undefined ? undefined : { timeoutMs },
-			);
+			try {
+				await client.connect?.();
+			} catch (error) {
+				if (error instanceof SdkClientError) throw new SdkPreparedDispatchError(error);
+				throw error;
+			}
+			const dispatch = () =>
+				client.request(
+					{ type: "broker_request", operation, input, idempotencyKey },
+					{ ...(timeoutMs === undefined ? {} : { timeoutMs }), ...options, connectedOnly: true },
+				);
+			return await (dispatchFence ? dispatchFence(dispatch) : dispatch());
 		} finally {
 			await client.close().catch(error => {
 				logger.warn(`SDK Broker session.list transport cleanup failed (${String(error)}).`);
@@ -1646,7 +1676,13 @@ export class SessionRouter {
 				return attached?.client.connectionId;
 			},
 			isCurrent: () => attached !== undefined && this.#attachmentPublished(attached),
-			send: async (frame: Record<string, unknown>) => {
+			send: async (
+				frame: Record<string, unknown>,
+				options?: {
+					beforeDispatch?: () => void;
+					dispatchFence?: (dispatch: () => Promise<void>) => Promise<void>;
+				},
+			) => {
 				if (!attached || !this.#attachmentPublished(attached))
 					throw new SessionRouterError("pre_send", "SDK session attachment is stale.");
 				if (attached.initializingPublication) {
@@ -1664,7 +1700,17 @@ export class SessionRouter {
 				} else await this.#serialReconcile(runEpoch, true, true);
 				if (!attached || !this.#attachmentPublished(attached))
 					throw new SessionRouterError("pre_send", "SDK session attachment is stale.");
-				attached.client.send(this.#prepareFrame(attached, frame));
+				const dispatchAttachment = attached;
+				const dispatch = async () => {
+					options?.beforeDispatch?.();
+					try {
+						dispatchAttachment.client.send(this.#prepareFrame(dispatchAttachment, frame));
+					} catch (error) {
+						if (error instanceof SdkClientError) throw new SdkPreparedDispatchError(error);
+						throw error;
+					}
+				};
+				await (options?.dispatchFence ? options.dispatchFence(dispatch) : dispatch());
 			},
 			/**
 			 * Provider-lease heartbeats skip the pre-send authority reconcile

@@ -208,6 +208,35 @@ export class ConversationStore<T extends ConversationRecord> {
 		});
 	}
 
+	/**
+	 * Hold the cross-process mapping lock until a prepared dispatch either reaches
+	 * its synchronous wire boundary or fails before sending. The result may remain
+	 * pending after the lock is released while the remote response is awaited.
+	 */
+	async dispatchWithSnapshotFence<R>(
+		key: string,
+		prepare: (
+			current: T | undefined,
+			conversations: Readonly<Record<string, T>>,
+		) => { result: Promise<R>; dispatched: Promise<void> } | undefined,
+	): Promise<{ value: R } | undefined> {
+		let result: Promise<R> | undefined;
+		await this.#withLock(async () => {
+			const document = await this.#readDocument();
+			const prepared = prepare(document.conversations[key], Object.freeze({ ...document.conversations }));
+			if (!prepared) return;
+			result = prepared.result;
+			await Promise.race([
+				prepared.dispatched,
+				prepared.result.then(
+					() => undefined,
+					() => undefined,
+				),
+			]);
+		});
+		return result ? { value: await result } : undefined;
+	}
+
 	async #withLock<R>(operation: () => Promise<R>): Promise<R> {
 		const previous = this.#locks.get(this.#file) ?? Promise.resolve();
 		const gate = Promise.withResolvers<void>();

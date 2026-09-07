@@ -1,16 +1,16 @@
-import { describe, expect, it, vi } from "bun:test";
+import { describe, expect, it, spyOn, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { logger } from "@gajae-code/utils";
 import { ChatDeliveryError } from "../src/sdk/bus/chat-daemon-runtime";
-import { ChatEffectJournal } from "../src/sdk/bus/chat-effect-journal";
-import { ConversationStore } from "../src/sdk/bus/conversation-store";
+import { type ChatEffect, ChatEffectJournal, type ChatEffectLease } from "../src/sdk/bus/chat-effect-journal";
+import { ConversationLockTimeoutError, ConversationStore } from "../src/sdk/bus/conversation-store";
 import type { SlackConversation } from "../src/sdk/bus/slack-conversation";
 import { SlackEndpointBindingError, SlackNotificationDaemon } from "../src/sdk/bus/slack-daemon";
 import { SlackLiveProvider, SlackProviderError } from "../src/sdk/bus/slack-live-provider";
 import { SlackProvider, type SlackSocketEnvelope } from "../src/sdk/bus/slack-provider";
-import { SdkClientError } from "../src/sdk/client/client";
+import { SdkClientError, SdkPreparedDispatchError } from "../src/sdk/client/client";
 import { type SessionAttachment, SessionRouterError } from "../src/sdk/router";
 
 class FakeSlack {
@@ -208,8 +208,23 @@ async function withDaemon(
 		agentDir: string,
 	) => Promise<void>,
 	options: {
-		onCommand?: (sessionId: string, content: string) => Promise<boolean>;
-		attachmentSend?: (injected: Array<Record<string, unknown>>) => { send(frame: Record<string, unknown>): unknown };
+		onCommand?: (
+			sessionId: string,
+			content: string,
+			attachment: SessionAttachment,
+			idempotencyKey: string,
+			beforeDispatch: () => void,
+			dispatchFence: <T>(dispatch: () => Promise<T>) => Promise<T>,
+		) => Promise<boolean>;
+		attachmentSend?: (injected: Array<Record<string, unknown>>) => {
+			send(
+				frame: Record<string, unknown>,
+				options?: {
+					beforeDispatch?: () => void;
+					dispatchFence?: (dispatch: () => Promise<void>) => Promise<void>;
+				},
+			): unknown;
+		};
 		authorizeActor?: ((actorId: string) => boolean | Promise<boolean>) | false;
 		now?: () => number;
 	} = {},
@@ -233,15 +248,37 @@ async function withDaemon(
 				if (endpointGeneration === undefined) return null;
 				return {
 					...endpoint(sessionId, endpointGeneration),
-					send: (frame: Record<string, unknown>) => {
-						if (attachment) return attachment.send(frame);
-						injected.push(frame);
+					send: (
+						frame: Record<string, unknown>,
+						sendOptions?: {
+							beforeDispatch?: () => void;
+							dispatchFence?: (dispatch: () => Promise<void>) => Promise<void>;
+						},
+					) => {
+						if (attachment) return attachment.send(frame, sendOptions);
+						const dispatch = async () => {
+							sendOptions?.beforeDispatch?.();
+							injected.push(frame);
+						};
+						return sendOptions?.dispatchFence ? sendOptions.dispatchFence(dispatch) : dispatch();
 					},
 					sendMaintenance: () => {},
 				};
 			},
 			now: options.now,
-			onCommand: options.onCommand,
+			onCommand: options.onCommand
+				? async (sessionId, content, resolvedAttachment, idempotencyKey, beforeDispatch, dispatchFence) => {
+						if (options.onCommand!.length < 5) beforeDispatch();
+						return await options.onCommand!(
+							sessionId,
+							content,
+							resolvedAttachment,
+							idempotencyKey,
+							beforeDispatch,
+							dispatchFence,
+						);
+					}
+				: undefined,
 			...(options.authorizeActor === false
 				? {}
 				: { authorizeActor: options.authorizeActor ?? (async actorId => actorId === "U1") }),
@@ -2144,7 +2181,9 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 					send(frame) {
 						if (fail) {
 							fail = false;
-							throw new SdkClientError("connection_closed", "SDK unavailable before send");
+							throw new SdkPreparedDispatchError(
+								new SdkClientError("connection_closed", "SDK unavailable before send"),
+							);
 						}
 						injected.push(frame);
 					},
@@ -2206,7 +2245,7 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 				resolveAttachment: async sessionId => ({
 					...endpoint(sessionId),
 					send: () => {
-						throw new SdkClientError("connection_closed", "before send");
+						throw new SdkPreparedDispatchError(new SdkClientError("connection_closed", "before send"));
 					},
 					sendMaintenance: () => {},
 				}),
@@ -2330,6 +2369,33 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 						injected.push(frame);
 					},
 				}),
+			},
+		);
+	});
+
+	it("releases a mapping-lock pre-send failure for redelivery", async () => {
+		let commands = 0;
+		await withDaemon(
+			async (daemon, _fake) => {
+				const root = await daemon.postRoot("session", "root");
+				const dispatchFence = spyOn(daemon.store, "dispatchWithSnapshotFence").mockRejectedValueOnce(
+					new ConversationLockTimeoutError("effects.lock", 1_000),
+				);
+				const inbound = messageEnvelope("lock-first", "lock-event", root.rootTs!, {
+					clientMsgId: "lock-interaction",
+					text: "/sdk control turn.prompt {}",
+				});
+				expect(await daemon.handleEnvelope(inbound)).toBe(false);
+				dispatchFence.mockRestore();
+				expect(await daemon.handleEnvelope({ ...inbound, envelope_id: "lock-redelivery" })).toBe(true);
+				expect(commands).toBe(1);
+			},
+			{
+				onCommand: async (_sessionId, _content, _attachment, _idempotencyKey, beforeDispatch, dispatchFence) =>
+					await dispatchFence(async () => {
+						beforeDispatch();
+						return ++commands > 0;
+					}),
 			},
 		);
 	});
@@ -2795,6 +2861,875 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 				},
 			},
 		);
+	});
+
+	it("retains an ambiguous sent command across retirement and redelivery without redispatch", async () => {
+		let commands = 0;
+		await withDaemon(
+			async (daemon, fake, _injected, setEndpointGeneration, agentDir) => {
+				const root = await daemon.postRoot("session", "root");
+				await daemon.handleEnvelope(
+					messageEnvelope("ambiguous-envelope", "ambiguous-command", root.rootTs!, {
+						clientMsgId: "ambiguous-command-id",
+						text: "/sdk control turn.prompt {}",
+					}),
+				);
+
+				const journal = new ChatEffectJournal({ agentDir, transport: "slack" });
+				const effect = (await journal.list()).find(candidate => candidate.id.startsWith("inbound:"));
+				if (!effect) throw new Error("Ambiguous inbound command effect was not journaled");
+				expect(effect).toMatchObject({ state: "uncertain", receipt: { status: "uncertain" } });
+				expect(commands).toBe(1);
+
+				await daemon.retireAttachment("session", 1);
+				setEndpointGeneration(2);
+				expect(await journal.read(effect.id)).toMatchObject({
+					state: "uncertain",
+					receipt: { status: "uncertain" },
+				});
+
+				await daemon.handleEnvelope(
+					messageEnvelope("ambiguous-envelope-redelivery", "ambiguous-command", root.rootTs!, {
+						clientMsgId: "ambiguous-command-id",
+						text: "/sdk control turn.prompt {}",
+					}),
+				);
+				expect(commands).toBe(1);
+				expect(await journal.read(effect.id)).toMatchObject({
+					state: "uncertain",
+					receipt: { status: "uncertain" },
+				});
+				expect(fake.acks).toContain("ambiguous-envelope-redelivery");
+			},
+			{
+				onCommand: async () => {
+					commands++;
+					throw new ChatDeliveryError("ambiguous");
+				},
+			},
+		);
+	});
+
+	it("claims and terminalizes an expired stale inbound lease once", async () => {
+		let now = 0;
+		await withDaemon(
+			async (daemon, fake, _injected, setEndpointGeneration, agentDir) => {
+				const root = await daemon.postRoot("session", "root");
+				fake.onAck = async () => {
+					throw new Error("crash after acknowledgement");
+				};
+				await expect(
+					daemon.handleEnvelope(
+						messageEnvelope("leased-envelope", "leased-command", root.rootTs!, {
+							clientMsgId: "leased-command-id",
+							text: "/sdk control turn.prompt {}",
+						}),
+					),
+				).rejects.toThrow("crash after acknowledgement");
+
+				const journal = new ChatEffectJournal({ agentDir, transport: "slack", now: () => now });
+				const effect = (await journal.list()).find(candidate => candidate.id.startsWith("inbound:"));
+				if (!effect) throw new Error("Leased inbound command effect was not journaled");
+				expect(await journal.claim(effect.id, "foreign-owner", 10)).toMatchObject({ state: "leased" });
+				now = 11;
+				setEndpointGeneration(2);
+				fake.onAck = undefined;
+				await daemon.start();
+
+				expect(await journal.read(effect.id)).toMatchObject({
+					state: "terminal",
+					receipt: { status: "stale_binding" },
+				});
+				const conversation = await daemon.store.read("T1:C1:intent:session");
+				expect(conversation?.inboundDispatches).toEqual([]);
+			},
+			{ now: () => now },
+		);
+	});
+
+	it("keeps an in-flight command ambiguous when attachment retirement wins", async () => {
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		await withDaemon(
+			async (daemon, _fake, _injected, _setEndpointGeneration, agentDir) => {
+				const root = await daemon.postRoot("session", "root");
+				const dispatch = daemon.handleEnvelope(
+					messageEnvelope("retiring-envelope", "retiring-command", root.rootTs!, {
+						clientMsgId: "retiring-command-id",
+						text: "/sdk control turn.prompt {}",
+					}),
+				);
+				await entered.promise;
+				const retirement = daemon.retireAttachment("session", 1);
+				release.resolve();
+				await Promise.all([dispatch, retirement]);
+
+				const journal = new ChatEffectJournal({ agentDir, transport: "slack" });
+				const effect = (await journal.list()).find(candidate => candidate.id.startsWith("inbound:"));
+				if (!effect) throw new Error("Retiring inbound command effect was not journaled");
+				expect(effect).toMatchObject({ state: "uncertain" });
+			},
+			{
+				onCommand: async () => {
+					entered.resolve();
+					await release.promise;
+					throw new ChatDeliveryError("ambiguous");
+				},
+			},
+		);
+	});
+
+	it("recovers a crash at the persisted SDK dispatch boundary as uncertain", async () => {
+		let now = 0;
+		let commands = 0;
+		await withDaemon(
+			async (daemon, fake, _injected, _setEndpointGeneration, agentDir) => {
+				const root = await daemon.postRoot("session", "root");
+				fake.onAck = async () => {
+					throw new Error("crash before local dispatch resumes");
+				};
+				await expect(
+					daemon.handleEnvelope(
+						messageEnvelope("crash-envelope", "crash-command", root.rootTs!, {
+							clientMsgId: "crash-command-id",
+							text: "/sdk control turn.prompt {}",
+						}),
+					),
+				).rejects.toThrow("crash before local dispatch resumes");
+
+				const journal = new ChatEffectJournal({ agentDir, transport: "slack", now: () => now });
+				const effect = (await journal.list()).find(candidate => candidate.id.startsWith("inbound:"));
+				if (!effect) throw new Error("Crashed inbound command effect was not journaled");
+				const claimed = await journal.claim(effect.id, "crashed-worker", 10);
+				if (!claimed) throw new Error("Crashed inbound command effect was not claimable");
+				await journal.markDispatching(effect.id, { owner: "crashed-worker", epoch: claimed.epoch });
+				now = 11;
+				fake.onAck = undefined;
+
+				await daemon.start();
+				expect(commands).toBe(0);
+				expect(await journal.read(effect.id)).toMatchObject({
+					state: "uncertain",
+					receipt: { status: "uncertain" },
+				});
+			},
+			{
+				now: () => now,
+				onCommand: async () => {
+					commands++;
+					return true;
+				},
+			},
+		);
+	});
+
+	it("does not recover an actively renewed dispatching command as uncertain", async () => {
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		let commands = 0;
+		await withDaemon(
+			async (daemon, _fake, _injected, _setEndpointGeneration, agentDir) => {
+				const root = await daemon.postRoot("session", "root");
+				const dispatch = daemon.handleEnvelope(
+					messageEnvelope("live-envelope", "live-command", root.rootTs!, {
+						clientMsgId: "live-command-id",
+						text: "/sdk control turn.prompt {}",
+					}),
+				);
+				await entered.promise;
+				await daemon.start();
+
+				const journal = new ChatEffectJournal({ agentDir, transport: "slack" });
+				const effect = (await journal.list()).find(candidate => candidate.id.startsWith("inbound:"));
+				if (!effect) throw new Error("Live dispatching command effect was not journaled");
+				expect(effect.state).toBe("dispatching");
+				expect(commands).toBe(1);
+
+				release.resolve();
+				await dispatch;
+				expect(await journal.read(effect.id)).toMatchObject({
+					state: "terminal",
+					receipt: { status: "accepted" },
+				});
+			},
+			{
+				onCommand: async () => {
+					commands++;
+					entered.resolve();
+					await release.promise;
+					return true;
+				},
+			},
+		);
+	});
+
+	it("schedules an early-restart dispatching lease for uncertainty recovery at expiry", async () => {
+		await withDaemon(async (daemon, fake, _injected, _setEndpointGeneration, agentDir) => {
+			const root = await daemon.postRoot("session", "root");
+			fake.onAck = async () => {
+				throw new Error("crash before local dispatch resumes");
+			};
+			await expect(
+				daemon.handleEnvelope(
+					messageEnvelope("scheduled-envelope", "scheduled-command", root.rootTs!, {
+						clientMsgId: "scheduled-command-id",
+						text: "/sdk control turn.prompt {}",
+					}),
+				),
+			).rejects.toThrow("crash before local dispatch resumes");
+
+			const journal = new ChatEffectJournal({ agentDir, transport: "slack" });
+			const effect = (await journal.list()).find(candidate => candidate.id.startsWith("inbound:"));
+			if (!effect) throw new Error("Scheduled dispatching command effect was not journaled");
+			const claimed = await journal.claim(effect.id, "crashed-worker", 100);
+			if (!claimed) throw new Error("Scheduled dispatching command effect was not claimable");
+			await journal.markDispatching(effect.id, { owner: "crashed-worker", epoch: claimed.epoch });
+			fake.onAck = undefined;
+
+			await daemon.start();
+			const deadline = Date.now() + 2_000;
+			for (;;) {
+				const recovered = await journal.read(effect.id);
+				if (recovered?.state === "uncertain") {
+					expect(recovered.receipt).toMatchObject({ status: "uncertain" });
+					break;
+				}
+				if (Date.now() >= deadline) throw new Error("Dispatching lease was not recovered at expiry");
+				await Bun.sleep(10);
+			}
+		});
+	});
+
+	it("does not dispatch a command retired while its durable boundary is persisted", async () => {
+		const original = ChatEffectJournal.prototype.markDispatching;
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		let commands = 0;
+		const dispatching = spyOn(ChatEffectJournal.prototype, "markDispatching").mockImplementation(async function <
+			TPayload = unknown,
+		>(this: ChatEffectJournal, id: string, lease: ChatEffectLease) {
+			const marked = await original.call(this, id, lease);
+			entered.resolve();
+			await release.promise;
+			return marked as ChatEffect<TPayload> | undefined;
+		});
+		try {
+			await withDaemon(
+				async (daemon, _fake, _injected) => {
+					const root = await daemon.postRoot("session", "root");
+					const dispatch = daemon.handleEnvelope(
+						messageEnvelope("boundary-retire-command", "boundary-retire-command-event", root.rootTs!, {
+							clientMsgId: "boundary-retire-command-id",
+							text: "/sdk control turn.prompt {}",
+						}),
+					);
+					await entered.promise;
+					const retirement = daemon.retireAttachment("session", 1);
+					while ((await daemon.store.read("T1:C1:intent:session"))?.state !== "closed_marker") await Bun.sleep(1);
+					release.resolve();
+					await Promise.all([dispatch, retirement]);
+					expect(commands).toBe(0);
+				},
+				{ onCommand: async () => ++commands > 0 },
+			);
+		} finally {
+			dispatching.mockRestore();
+		}
+	});
+
+	it("does not send a reply retired while its durable boundary is persisted", async () => {
+		const original = ChatEffectJournal.prototype.markDispatching;
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const sent: Array<Record<string, unknown>> = [];
+		const dispatching = spyOn(ChatEffectJournal.prototype, "markDispatching").mockImplementation(async function <
+			TPayload = unknown,
+		>(this: ChatEffectJournal, id: string, lease: ChatEffectLease) {
+			const marked = await original.call(this, id, lease);
+			entered.resolve();
+			await release.promise;
+			return marked as ChatEffect<TPayload> | undefined;
+		});
+		try {
+			await withDaemon(
+				async (daemon, _fake) => {
+					const root = await daemon.postRoot("session", "root");
+					await daemon.notify("session", "question", "action-1");
+					const dispatch = daemon.handleEnvelope(
+						messageEnvelope("boundary-retire-reply", "boundary-retire-reply-event", root.rootTs!, {
+							clientMsgId: "boundary-retire-reply-id",
+							text: "answer",
+						}),
+					);
+					await entered.promise;
+					const retirement = daemon.retireAttachment("session", 1);
+					while ((await daemon.store.read("T1:C1:intent:session"))?.state !== "closed_marker") await Bun.sleep(1);
+					release.resolve();
+					await Promise.all([dispatch, retirement]);
+					expect(sent).toEqual([]);
+				},
+				{ attachmentSend: () => ({ send: frame => sent.push(frame) }) },
+			);
+		} finally {
+			dispatching.mockRestore();
+		}
+	});
+
+	it("does not dispatch after retirement wins the post-boundary authorization wait", async () => {
+		for (const kind of ["command", "reply"] as const) {
+			const authorizing = Promise.withResolvers<void>();
+			const release = Promise.withResolvers<void>();
+			let authorizationCalls = 0;
+			let commands = 0;
+			const sent: Array<Record<string, unknown>> = [];
+			await withDaemon(
+				async (daemon, _fake) => {
+					const root = await daemon.postRoot("session", "root");
+					if (kind === "reply") await daemon.notify("session", "question", "action-1");
+					const dispatch = daemon.handleEnvelope(
+						messageEnvelope(`auth-retire-${kind}`, `auth-retire-${kind}-event`, root.rootTs!, {
+							clientMsgId: `auth-retire-${kind}-id`,
+							text: kind === "command" ? "/sdk control turn.prompt {}" : "answer",
+						}),
+					);
+					await authorizing.promise;
+					const retirement = daemon.retireAttachment("session", 1);
+					while ((await daemon.store.read("T1:C1:intent:session"))?.state !== "closed_marker") await Bun.sleep(1);
+					release.resolve();
+					await Promise.all([dispatch, retirement]);
+					expect(commands).toBe(0);
+					expect(sent).toEqual([]);
+				},
+				{
+					authorizeActor: async () => {
+						authorizationCalls++;
+						if (authorizationCalls === 3) {
+							authorizing.resolve();
+							await release.promise;
+						}
+						return true;
+					},
+					onCommand: async () => ++commands > 0,
+					attachmentSend: () => ({ send: frame => sent.push(frame) }),
+				},
+			);
+		}
+	});
+
+	it("does not dispatch after recovery wins the post-boundary authorization wait", async () => {
+		let now = 0;
+		for (const kind of ["command", "reply"] as const) {
+			const authorizing = Promise.withResolvers<void>();
+			const release = Promise.withResolvers<void>();
+			let authorizationCalls = 0;
+			let commands = 0;
+			const sent: Array<Record<string, unknown>> = [];
+			await withDaemon(
+				async (daemon, _fake, _injected, _setEndpointGeneration, agentDir) => {
+					const root = await daemon.postRoot("session", "root");
+					if (kind === "reply") await daemon.notify("session", "question", "action-1");
+					const dispatch = daemon.handleEnvelope(
+						messageEnvelope(`auth-recover-${kind}`, `auth-recover-${kind}-event`, root.rootTs!, {
+							clientMsgId: `auth-recover-${kind}-id`,
+							text: kind === "command" ? "/sdk control turn.prompt {}" : "answer",
+						}),
+					);
+					await authorizing.promise;
+					const journal = new ChatEffectJournal({ agentDir, transport: "slack", now: () => now });
+					const effect = (await journal.list()).find(candidate => candidate.state === "dispatching");
+					if (!effect) throw new Error("Dispatching effect was not journaled");
+					now = (effect.leaseExpiresAt ?? 0) + 1;
+					await journal.recoverDispatchingAsUncertain(effect.id, { onlyIfExpired: true });
+					release.resolve();
+					await dispatch;
+					expect(commands).toBe(0);
+					expect(sent).toEqual([]);
+					expect(await journal.read(effect.id)).toMatchObject({ state: "uncertain" });
+				},
+				{
+					now: () => now,
+					authorizeActor: async () => {
+						authorizationCalls++;
+						if (authorizationCalls === 3) {
+							authorizing.resolve();
+							await release.promise;
+						}
+						return true;
+					},
+					onCommand: async () => ++commands > 0,
+					attachmentSend: () => ({ send: frame => sent.push(frame) }),
+				},
+			);
+		}
+	});
+
+	it("fences dispatch synchronously while retirement waits for its session lookup", async () => {
+		const original = SlackNotificationDaemon.prototype.findSession;
+		const lookupEntered = Promise.withResolvers<void>();
+		const releaseLookup = Promise.withResolvers<void>();
+		const authorizationEntered = Promise.withResolvers<void>();
+		const releaseAuthorization = Promise.withResolvers<void>();
+		let holdLookup = false;
+		let authorizationCalls = 0;
+		let commands = 0;
+		const lookup = spyOn(SlackNotificationDaemon.prototype, "findSession").mockImplementation(async function (
+			this: SlackNotificationDaemon,
+			...args: Parameters<SlackNotificationDaemon["findSession"]>
+		) {
+			if (holdLookup) {
+				lookupEntered.resolve();
+				await releaseLookup.promise;
+			}
+			return await original.apply(this, args);
+		});
+		try {
+			await withDaemon(
+				async (daemon, _fake) => {
+					const root = await daemon.postRoot("session", "root");
+					const dispatch = daemon.handleEnvelope(
+						messageEnvelope("lookup-retire", "lookup-retire-event", root.rootTs!, {
+							clientMsgId: "lookup-retire-id",
+							text: "/sdk control turn.prompt {}",
+						}),
+					);
+					await authorizationEntered.promise;
+					holdLookup = true;
+					const retirement = daemon.retireAttachment("session", 1);
+					await lookupEntered.promise;
+					releaseAuthorization.resolve();
+					await dispatch;
+					expect(commands).toBe(0);
+					releaseLookup.resolve();
+					await retirement;
+				},
+				{
+					authorizeActor: async () => {
+						authorizationCalls++;
+						if (authorizationCalls === 3) {
+							authorizationEntered.resolve();
+							await releaseAuthorization.promise;
+						}
+						return true;
+					},
+					onCommand: async () => ++commands > 0,
+				},
+			);
+		} finally {
+			lookup.mockRestore();
+		}
+	});
+
+	it("releases the synchronous retirement fence when its session lookup fails", async () => {
+		let commands = 0;
+		await withDaemon(
+			async (daemon, _fake) => {
+				const root = await daemon.postRoot("session", "root");
+				const lookup = spyOn(daemon, "findSession").mockRejectedValueOnce(new Error("lookup failed"));
+				await expect(daemon.retireAttachment("session", 1)).rejects.toThrow("lookup failed");
+				lookup.mockRestore();
+				await daemon.handleEnvelope(
+					messageEnvelope("lookup-recovered", "lookup-recovered-event", root.rootTs!, {
+						clientMsgId: "lookup-recovered-id",
+						text: "/sdk control turn.prompt {}",
+					}),
+				);
+				expect(commands).toBe(1);
+			},
+			{ onCommand: async () => ++commands > 0 },
+		);
+	});
+
+	it("releases the provider-work retirement fence when its mapping write fails", async () => {
+		let commands = 0;
+		await withDaemon(
+			async (daemon, _fake) => {
+				const root = await daemon.postRoot("session", "root");
+				const transact = spyOn(daemon.store, "transact").mockRejectedValueOnce(new Error("mapping write failed"));
+				await expect(daemon.retireAttachment("session", 1)).rejects.toThrow("mapping write failed");
+				transact.mockRestore();
+				await daemon.handleEnvelope(
+					messageEnvelope("write-recovered", "write-recovered-event", root.rootTs!, {
+						clientMsgId: "write-recovered-id",
+						text: "/sdk control turn.prompt {}",
+					}),
+				);
+				expect(commands).toBe(1);
+			},
+			{ onCommand: async () => ++commands > 0 },
+		);
+	});
+
+	it("does not dispatch while a durable close wins the final ownership read", async () => {
+		const original = ChatEffectJournal.prototype.ownsDispatching;
+		const ownershipEntered = Promise.withResolvers<void>();
+		const releaseOwnership = Promise.withResolvers<void>();
+		let commands = 0;
+		const ownership = spyOn(ChatEffectJournal.prototype, "ownsDispatching").mockImplementation(async function (
+			this: ChatEffectJournal,
+			...args: Parameters<ChatEffectJournal["ownsDispatching"]>
+		) {
+			const owned = await original.apply(this, args);
+			ownershipEntered.resolve();
+			await releaseOwnership.promise;
+			return owned;
+		});
+		try {
+			await withDaemon(
+				async (daemon, _fake) => {
+					const root = await daemon.postRoot("session", "root");
+					const dispatch = daemon.handleEnvelope(
+						messageEnvelope("close-ownership", "close-ownership-event", root.rootTs!, {
+							clientMsgId: "close-ownership-id",
+							text: "/sdk control turn.prompt {}",
+						}),
+					);
+					await ownershipEntered.promise;
+					const closing = daemon.close("session");
+					while ((await daemon.store.read("T1:C1:intent:session"))?.state !== "closed_marker") await Bun.sleep(1);
+					releaseOwnership.resolve();
+					await Promise.all([dispatch, closing]);
+					expect(commands).toBe(0);
+				},
+				{ onCommand: async () => ++commands > 0 },
+			);
+		} finally {
+			ownership.mockRestore();
+		}
+	});
+
+	it("does not resurrect pre-close inbound work after reopening the session", async () => {
+		const original = ChatEffectJournal.prototype.ownsDispatching;
+		const ownershipEntered = Promise.withResolvers<void>();
+		const releaseOwnership = Promise.withResolvers<void>();
+		let commands = 0;
+		const ownership = spyOn(ChatEffectJournal.prototype, "ownsDispatching").mockImplementation(async function (
+			this: ChatEffectJournal,
+			...args: Parameters<ChatEffectJournal["ownsDispatching"]>
+		) {
+			const owned = await original.apply(this, args);
+			ownershipEntered.resolve();
+			await releaseOwnership.promise;
+			return owned;
+		});
+		try {
+			await withDaemon(
+				async (daemon, _fake) => {
+					const root = await daemon.postRoot("session", "root");
+					const dispatch = daemon.handleEnvelope(
+						messageEnvelope("close-reopen", "close-reopen-event", root.rootTs!, {
+							clientMsgId: "close-reopen-id",
+							text: "/sdk control turn.prompt {}",
+						}),
+					);
+					await ownershipEntered.promise;
+					await daemon.close("session");
+					await daemon.postRoot("session", "reopened");
+					releaseOwnership.resolve();
+					await dispatch;
+					expect(commands).toBe(0);
+				},
+				{ onCommand: async () => ++commands > 0 },
+			);
+		} finally {
+			ownership.mockRestore();
+		}
+	});
+
+	it("admits new inbound work on a notify-created root after close", async () => {
+		let commands = 0;
+		await withDaemon(
+			async (daemon, _fake) => {
+				await daemon.postRoot("session", "root");
+				await daemon.close("session");
+				await daemon.notify("session", "replacement notification");
+				const replacement = await daemon.findSession("session", true);
+				if (!replacement?.record.rootTs) throw new Error("Replacement root was not created");
+				await daemon.handleEnvelope(
+					messageEnvelope("notify-reopen", "notify-reopen-event", replacement.record.rootTs, {
+						clientMsgId: "notify-reopen-id",
+						text: "/sdk control turn.prompt {}",
+					}),
+				);
+				expect(commands).toBe(1);
+			},
+			{ onCommand: async () => ++commands > 0 },
+		);
+	});
+
+	it("admits new inbound work after reconciling an uncertain replacement root", async () => {
+		let commands = 0;
+		await withDaemon(
+			async (daemon, fake) => {
+				await daemon.postRoot("session", "root");
+				await daemon.close("session");
+				fake.failPostAfterAccept = true;
+				const replacement = await daemon.notify("session", "uncertain replacement");
+				fake.failPostAfterAccept = false;
+				if (!replacement.rootTs) throw new Error("Uncertain replacement root was not reconciled");
+				await daemon.handleEnvelope(
+					messageEnvelope("reconciled-reopen", "reconciled-reopen-event", replacement.rootTs, {
+						clientMsgId: "reconciled-reopen-id",
+						text: "/sdk control turn.prompt {}",
+					}),
+				);
+				expect(commands).toBe(1);
+			},
+			{ onCommand: async () => ++commands > 0 },
+		);
+	});
+
+	it("does not re-close a notify replacement opened during old-root terminalization", async () => {
+		let commands = 0;
+		await withDaemon(
+			async (daemon, _fake) => {
+				const closeCommitted = Promise.withResolvers<void>();
+				const releaseClose = Promise.withResolvers<void>();
+				const originalTransact = daemon.store.transact.bind(daemon.store);
+				let holdClosedResult = true;
+				const transact = spyOn(daemon.store, "transact").mockImplementation(async (key, update) => {
+					const result = await originalTransact(key, update);
+					if (holdClosedResult && result?.state === "closed_marker") {
+						holdClosedResult = false;
+						closeCommitted.resolve();
+						await releaseClose.promise;
+					}
+					return result;
+				});
+				try {
+					await daemon.postRoot("session", "root");
+					const closing = daemon.close("session");
+					await closeCommitted.promise;
+					await daemon.notify("session", "replacement notification");
+					const replacement = await daemon.findSession("session", true);
+					if (!replacement?.record.rootTs) throw new Error("Replacement root was not created");
+					await daemon.handleEnvelope(
+						messageEnvelope("overlap-live", "overlap-live-event", replacement.record.rootTs, {
+							clientMsgId: "overlap-live-id",
+							text: "/sdk control turn.prompt {}",
+						}),
+					);
+					expect(commands).toBe(1);
+					const replacementCloseLookup = Promise.withResolvers<void>();
+					const releaseReplacementClose = Promise.withResolvers<void>();
+					const originalFindSession = daemon.findSession.bind(daemon);
+					let holdReplacementClose = true;
+					const findSession = spyOn(daemon, "findSession").mockImplementation(async (...args) => {
+						if (holdReplacementClose) {
+							holdReplacementClose = false;
+							replacementCloseLookup.resolve();
+							await releaseReplacementClose.promise;
+						}
+						return await originalFindSession(...args);
+					});
+					const replacementClosing = daemon.close("session");
+					await replacementCloseLookup.promise;
+					releaseClose.resolve();
+					await closing;
+					await daemon.handleEnvelope(
+						messageEnvelope("overlap-new", "overlap-new-event", replacement.record.rootTs, {
+							clientMsgId: "overlap-new-id",
+							text: "/sdk control turn.prompt {}",
+						}),
+					);
+					expect(commands).toBe(1);
+					releaseReplacementClose.resolve();
+					await replacementClosing;
+					findSession.mockRestore();
+				} finally {
+					transact.mockRestore();
+				}
+			},
+			{ onCommand: async () => ++commands > 0 },
+		);
+	});
+
+	it("fences old-root inbound work while a forced resume posts its close marker", async () => {
+		let commands = 0;
+		const releasePost = Promise.withResolvers<void>();
+		await withDaemon(
+			async (daemon, fake) => {
+				const root = await daemon.postRoot("session", "root");
+				fake.postGate = releasePost.promise;
+				const resuming = daemon.resume("session", "replacement");
+				await fake.waitForPostStartCount(2);
+				await daemon.handleEnvelope(
+					messageEnvelope("rollover-old", "rollover-old-event", root.rootTs!, {
+						clientMsgId: "rollover-old-id",
+						text: "/sdk control turn.prompt {}",
+					}),
+				);
+				expect(commands).toBe(0);
+				releasePost.resolve();
+				await resuming;
+			},
+			{ onCommand: async () => ++commands > 0 },
+		);
+	});
+
+	it("recovers a posted rollover close intent after crashing before mapping closure", async () => {
+		await withDaemon(async (daemon, _fake, _injected, setEndpointGeneration) => {
+			await daemon.postRoot("session", "root");
+			const originalTransact = daemon.store.transact.bind(daemon.store);
+			const transact = spyOn(daemon.store, "transact").mockImplementation(
+				async (key, update) =>
+					await originalTransact(key, current => {
+						const next = update(current);
+						if (next?.state === "closed_marker") throw new Error("crash before mapping closure");
+						return next;
+					}),
+			);
+			await expect(daemon.resume("session", "replacement")).rejects.toThrow("crash before mapping closure");
+			transact.mockRestore();
+			expect(await daemon.store.read("T1:C1:intent:session")).toMatchObject({
+				state: "active",
+				cleanupEffectId: expect.stringContaining("close-marker:session:"),
+			});
+			setEndpointGeneration(2);
+			expect(await daemon.recoverCleanup("session", 2, "session:2")).toBe(true);
+			expect(await daemon.store.read("T1:C1:intent:session")).toMatchObject({ state: "closed_marker" });
+		});
+	});
+
+	it("reconstructs a durable close intent whose journal enqueue was lost", async () => {
+		await withDaemon(async (daemon, fake, _injected, _setEndpointGeneration, agentDir) => {
+			const root = await daemon.postRoot("session", "root");
+			const effectId = `close-marker-cleanup:session:${root.clientMsgId}`;
+			await daemon.store.transact("T1:C1:intent:session", current =>
+				current ? { ...current, generation: current.generation + 1, cleanupEffectId: effectId } : current,
+			);
+			expect(await new ChatEffectJournal({ agentDir, transport: "slack" }).read(effectId)).toBeUndefined();
+			expect(await daemon.recoverCleanup("session", 1, "session:1")).toBe(true);
+			expect(await daemon.store.read("T1:C1:intent:session")).toMatchObject({ state: "closed_marker" });
+			expect(fake.posts.map(post => post.text)).toContain("Session closed.");
+		});
+	});
+
+	it("linearizes an in-flight command wire boundary before a peer close intent", async () => {
+		const dispatchReady = Promise.withResolvers<void>();
+		const releaseDispatch = Promise.withResolvers<void>();
+		let commands = 0;
+		await withDaemon(
+			async (daemon, fake, _injected, _setEndpointGeneration, agentDir) => {
+				const root = await daemon.postRoot("session", "root");
+				const peer = new SlackNotificationDaemon({
+					agentDir,
+					repo: agentDir,
+					teamId: "T1",
+					channelId: "C1",
+					provider: new SlackProvider(fake),
+					publicationOwnerId: "closing-peer",
+					resolveAttachment: async sessionId => endpoint(sessionId),
+				});
+				const dispatch = daemon.handleEnvelope(
+					messageEnvelope("command-boundary-close", "command-boundary-close-event", root.rootTs!, {
+						clientMsgId: "command-boundary-close-id",
+						text: "/sdk control turn.prompt {}",
+					}),
+				);
+				await dispatchReady.promise;
+				let closed = false;
+				const closing = peer.close("session").then(result => {
+					closed = result;
+				});
+				await Bun.sleep(20);
+				expect(closed).toBe(false);
+				releaseDispatch.resolve();
+				await Promise.all([dispatch, closing]);
+				expect(commands).toBe(1);
+				expect(closed).toBe(true);
+			},
+			{
+				onCommand: async (_sessionId, _content, _attachment, _idempotencyKey, beforeDispatch, dispatchFence) =>
+					await dispatchFence(async () => {
+						dispatchReady.resolve();
+						await releaseDispatch.promise;
+						beforeDispatch();
+						commands++;
+						return true;
+					}),
+			},
+		);
+	});
+
+	it("linearizes an in-flight reply wire boundary before a peer close intent", async () => {
+		const dispatchReady = Promise.withResolvers<void>();
+		const releaseDispatch = Promise.withResolvers<void>();
+		await withDaemon(
+			async (daemon, fake, injected, _setEndpointGeneration, agentDir) => {
+				const root = await daemon.postRoot("session", "root");
+				await daemon.notify("session", "question", "action-1");
+				const peer = new SlackNotificationDaemon({
+					agentDir,
+					repo: agentDir,
+					teamId: "T1",
+					channelId: "C1",
+					provider: new SlackProvider(fake),
+					publicationOwnerId: "reply-closing-peer",
+					resolveAttachment: async sessionId => endpoint(sessionId),
+				});
+				const dispatch = daemon.handleEnvelope(
+					messageEnvelope("reply-boundary-close", "reply-boundary-close-event", root.rootTs!, {
+						clientMsgId: "reply-boundary-close-id",
+						text: "answer",
+					}),
+				);
+				await dispatchReady.promise;
+				let closed = false;
+				const closing = peer.close("session").then(result => {
+					closed = result;
+				});
+				await Bun.sleep(20);
+				expect(closed).toBe(false);
+				releaseDispatch.resolve();
+				await Promise.all([dispatch, closing]);
+				expect(injected).toEqual([expect.objectContaining({ type: "reply", answer: "answer" })]);
+				expect(closed).toBe(true);
+			},
+			{
+				attachmentSend: injected => ({
+					send: async (frame, options) =>
+						await (options?.dispatchFence
+							? options.dispatchFence(async () => {
+									dispatchReady.resolve();
+									await releaseDispatch.promise;
+									options.beforeDispatch?.();
+									injected.push(frame);
+								})
+							: Promise.resolve()),
+				}),
+			},
+		);
+	});
+
+	it("rejects old-root inbound work across daemons while a durable close marker posts", async () => {
+		const releasePost = Promise.withResolvers<void>();
+		let commands = 0;
+		await withDaemon(async (daemon, fake, _injected, _setEndpointGeneration, agentDir) => {
+			const root = await daemon.postRoot("session", "root");
+			const peer = new SlackNotificationDaemon({
+				agentDir,
+				repo: agentDir,
+				teamId: "T1",
+				channelId: "C1",
+				provider: new SlackProvider(fake),
+				publicationOwnerId: "peer",
+				resolveAttachment: async sessionId => endpoint(sessionId),
+				authorizeActor: actorId => actorId === "U1",
+				onCommand: async () => ++commands > 0,
+			});
+			fake.postGate = releasePost.promise;
+			const closing = daemon.close("session");
+			await fake.waitForPostStartCount(2);
+			await peer.handleEnvelope(
+				messageEnvelope("peer-close", "peer-close-event", root.rootTs!, {
+					clientMsgId: "peer-close-id",
+					text: "/sdk control turn.prompt {}",
+				}),
+			);
+			expect(commands).toBe(0);
+			releasePost.resolve();
+			await closing;
+		});
 	});
 
 	it("returns after the retirement deadline while slow journal terminalization keeps the old scope fenced", async () => {

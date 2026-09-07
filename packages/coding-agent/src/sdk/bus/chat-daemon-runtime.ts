@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { logger } from "@gajae-code/utils";
-import { SdkClientError } from "../client/client";
+import { SdkClientError, SdkPreparedDispatchError } from "../client/client";
 import { SESSION_PREPARED_EVENT } from "../host/host";
 
 import type { SessionRouterDeps } from "../router";
@@ -50,6 +50,7 @@ function chatDeliveryPhase(error: unknown): ChatDeliveryPhase | undefined {
 	if (error instanceof SessionRouterError) return error.phase;
 
 	if (error instanceof ChatDeliveryError) return error.phase;
+	if (error instanceof SdkPreparedDispatchError) return "pre_send";
 	if (!(error instanceof SdkClientError)) return undefined;
 	// `uncertain_after_send` is the one code that states outright that the frame
 	// reached the host: reporting it as a definite failure would tell the operator a
@@ -414,8 +415,16 @@ export class ChatDaemonRuntime {
 				authorizeActor: async actorId => config.authorizedUserId === actorId,
 				resolveAttachment: async sessionId => this.#router.attachment(sessionId),
 				resolveBindingAuthority: async sessionId => await this.#router.bindingAuthority(sessionId),
-				onCommand: async (sessionId, content, attachment, idempotencyKey) =>
-					await this.#runChatCommand("slack", sessionId, content, attachment, idempotencyKey),
+				onCommand: async (sessionId, content, attachment, idempotencyKey, beforeDispatch, dispatchFence) =>
+					await this.#runChatCommand(
+						"slack",
+						sessionId,
+						content,
+						attachment,
+						idempotencyKey,
+						beforeDispatch,
+						dispatchFence,
+					),
 			});
 		}
 		try {
@@ -730,6 +739,8 @@ export class ChatDaemonRuntime {
 		content: string,
 		expectedAttachment: SessionAttachment,
 		idempotencyKey: string = randomUUID(),
+		beforeDispatch?: () => void,
+		dispatchFence?: <T>(dispatch: () => Promise<T>) => Promise<T>,
 	): Promise<boolean> {
 		const match = /^\/sdk\s+(control|query|global)\s+([^\s]+)(?:\s+(.+))?\s*$/.exec(content);
 		if (!match) return false;
@@ -748,7 +759,13 @@ export class ChatDaemonRuntime {
 		try {
 			outcome = await sendAuthorizedChatOperation(transport, { kind, operation, input }, async () => {
 				if (kind === "global")
-					return await this.#runGlobalCommand(operation, input as Record<string, unknown>, idempotencyKey);
+					return await this.#runGlobalCommand(
+						operation,
+						input as Record<string, unknown>,
+						idempotencyKey,
+						beforeDispatch,
+						dispatchFence,
+					);
 				if (!expectedAttachment.isCurrent()) throw new ChatDeliveryError("pre_send");
 				return await this.#router.request(
 					sessionId,
@@ -757,6 +774,12 @@ export class ChatDaemonRuntime {
 						: { type: "query_request", query: operation, input, idempotencyKey },
 					expectedAttachment.generation,
 					expectedAttachment,
+					beforeDispatch || dispatchFence
+						? {
+								beforeDispatch,
+								dispatchFence: dispatchFence ? dispatch => dispatchFence(dispatch) : undefined,
+							}
+						: undefined,
 				);
 			});
 		} catch (error) {
@@ -776,10 +799,17 @@ export class ChatDaemonRuntime {
 		operation: string,
 		input: Record<string, unknown>,
 		idempotencyKey: string,
+		beforeDispatch?: () => void,
+		dispatchFence?: <T>(dispatch: () => Promise<T>) => Promise<T>,
 	): Promise<Record<string, unknown>> {
 		if (operation !== "session.list") throw new ChatDeliveryError("pre_send");
 		try {
-			return await this.#router.listBrokerSessions(input, idempotencyKey);
+			return await this.#router.listBrokerSessions(
+				input,
+				idempotencyKey,
+				{ beforeDispatch },
+				dispatchFence ? dispatch => dispatchFence(dispatch) : undefined,
+			);
 		} catch (error) {
 			if (error instanceof SessionRouterError) throw new ChatDeliveryError(error.phase);
 			throw error;

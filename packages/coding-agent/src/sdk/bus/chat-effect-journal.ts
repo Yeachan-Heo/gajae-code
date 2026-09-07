@@ -14,7 +14,7 @@ export function chatEffectJournalPath(agentDir: string, transport: "discord" | "
 	return conversationStorePath(agentDir, transport, "effects.json");
 }
 
-export type ChatEffectState = "pending" | "leased" | "accepted" | "uncertain" | "terminal";
+export type ChatEffectState = "pending" | "leased" | "dispatching" | "accepted" | "uncertain" | "terminal";
 
 /** Provider receipts are identifiers/status only. Never put request or response bodies here. */
 export interface ChatEffectReceipt {
@@ -262,7 +262,11 @@ export class ChatEffectJournal {
 		let renewed: ChatEffect<TPayload> | undefined;
 		const now = this.#now();
 		await this.#store.transact(id, current => {
-			if (current?.state !== "leased" || current.owner !== lease.owner || current.epoch !== lease.epoch)
+			if (
+				(current?.state !== "leased" && current?.state !== "dispatching") ||
+				current.owner !== lease.owner ||
+				current.epoch !== lease.epoch
+			)
 				return current;
 			renewed = {
 				...current,
@@ -275,6 +279,78 @@ export class ChatEffectJournal {
 		return renewed;
 	}
 
+	async markDispatching<TPayload = unknown>(
+		id: string,
+		lease: ChatEffectLease,
+	): Promise<ChatEffect<TPayload> | undefined> {
+		let marked: ChatEffect<TPayload> | undefined;
+		const now = this.#now();
+		await this.#store.transact(id, current => {
+			if (current?.state !== "leased" || current.owner !== lease.owner || current.epoch !== lease.epoch)
+				return current;
+			marked = {
+				...current,
+				generation: current.generation + 1,
+				state: "dispatching",
+				updatedAt: now,
+			} as ChatEffect<TPayload>;
+			return marked;
+		});
+		return marked;
+	}
+
+	async ownsDispatching(id: string, lease: ChatEffectLease): Promise<boolean> {
+		const current = await this.#store.read(id);
+		return (
+			current?.state === "dispatching" &&
+			current.owner === lease.owner &&
+			current.epoch === lease.epoch &&
+			(current.leaseExpiresAt ?? 0) > this.#now()
+		);
+	}
+
+	/** Hold the durable dispatching lease until the synchronous SDK prewire boundary. */
+	async dispatchWithLeaseFence<R>(
+		id: string,
+		lease: ChatEffectLease,
+		dispatch: () => Promise<R>,
+		dispatched: Promise<void>,
+	): Promise<{ value: R } | undefined> {
+		return await this.#store.dispatchWithSnapshotFence(id, current => {
+			if (
+				current?.state !== "dispatching" ||
+				current.owner !== lease.owner ||
+				current.epoch !== lease.epoch ||
+				(current.leaseExpiresAt ?? 0) <= this.#now()
+			)
+				return undefined;
+			return { result: dispatch(), dispatched };
+		});
+	}
+
+	async recoverDispatchingAsUncertain<TPayload = unknown>(
+		id: string,
+		options: { onlyIfExpired?: boolean } = {},
+	): Promise<ChatEffect<TPayload> | undefined> {
+		let recovered: ChatEffect<TPayload> | undefined;
+		const now = this.#now();
+		await this.#store.transact(id, current => {
+			if (current?.state !== "dispatching") return current;
+			if (options.onlyIfExpired && (current.leaseExpiresAt ?? 0) > now) return current;
+			recovered = {
+				...current,
+				generation: current.generation + 1,
+				state: "uncertain",
+				owner: undefined,
+				leaseExpiresAt: undefined,
+				receipt: { status: "uncertain" },
+				updatedAt: now,
+			} as ChatEffect<TPayload>;
+			return recovered;
+		});
+		return recovered;
+	}
+
 	/** Persists provider progress without releasing the owner/epoch fence. */
 	async recordReceipt<TPayload = unknown>(
 		id: string,
@@ -284,7 +360,11 @@ export class ChatEffectJournal {
 		let recorded: ChatEffect<TPayload> | undefined;
 		const now = this.#now();
 		await this.#store.transact(id, current => {
-			if (current?.state !== "leased" || current.owner !== lease.owner || current.epoch !== lease.epoch)
+			if (
+				(current?.state !== "leased" && current?.state !== "dispatching") ||
+				current.owner !== lease.owner ||
+				current.epoch !== lease.epoch
+			)
 				return current;
 			recorded = {
 				...current,
@@ -300,13 +380,17 @@ export class ChatEffectJournal {
 	async record<TPayload = unknown>(
 		id: string,
 		lease: ChatEffectLease,
-		state: Exclude<ChatEffectState, "pending" | "leased">,
-		receipt?: ChatEffectReceipt,
+		state: "accepted" | "uncertain" | "terminal",
+		receipt: ChatEffectReceipt = {},
 	): Promise<ChatEffect<TPayload> | undefined> {
 		let recorded: ChatEffect<TPayload> | undefined;
 		const now = this.#now();
 		await this.#store.transact(id, current => {
-			if (current?.state !== "leased" || current.owner !== lease.owner || current.epoch !== lease.epoch)
+			if (
+				(current?.state !== "leased" && current?.state !== "dispatching") ||
+				current.owner !== lease.owner ||
+				current.epoch !== lease.epoch
+			)
 				return current;
 			recorded = {
 				...current,
@@ -329,7 +413,10 @@ export class ChatEffectJournal {
 		const now = this.#now();
 		await this.#store.transact(id, current => {
 			if (!current || current.state === "terminal") return current;
-			if (current.state === "leased" && (!lease || current.owner !== lease.owner || current.epoch !== lease.epoch))
+			if (
+				(current.state === "leased" || current.state === "dispatching") &&
+				(!lease || current.owner !== lease.owner || current.epoch !== lease.epoch)
+			)
 				return current;
 
 			terminalized = {
@@ -344,6 +431,44 @@ export class ChatEffectJournal {
 			return terminalized;
 		});
 		if (terminalized) await this.#pruneTerminal();
+		return terminalized;
+	}
+
+	/**
+	 * Terminalize only a decided effect. The uncertainty check and state change
+	 * share one store transaction so a concurrent sender cannot publish an
+	 * ambiguity tombstone between a caller's read and stale cleanup.
+	 */
+	async terminalizeDecided(
+		id: string,
+		receipt: ChatEffectReceipt,
+		lease?: ChatEffectLease,
+	): Promise<ChatEffect | undefined> {
+		let terminalized: ChatEffect | undefined;
+		const now = this.#now();
+		await this.#store.transact(id, current => {
+			if (!current || current.state === "uncertain") return current;
+			if (current.state === "terminal") {
+				terminalized = current;
+				return current;
+			}
+			if (
+				(current.state === "leased" || current.state === "dispatching") &&
+				(!lease || current.owner !== lease.owner || current.epoch !== lease.epoch)
+			)
+				return current;
+			terminalized = {
+				...current,
+				generation: current.generation + 1,
+				state: "terminal",
+				owner: undefined,
+				leaseExpiresAt: undefined,
+				receipt,
+				updatedAt: now,
+			};
+			return terminalized;
+		});
+		if (terminalized?.state === "terminal") await this.#pruneTerminal();
 		return terminalized;
 	}
 
