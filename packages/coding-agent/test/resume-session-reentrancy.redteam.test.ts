@@ -84,6 +84,7 @@ function createResumeHarness(options: ResumeHarnessOptions = {}): {
 	ui: TUI;
 	switchSession: SwitchSession;
 	showStatus: Mock<(message: string) => void>;
+	resetAssistantTextPresentation: Mock<() => void>;
 	dispose(): void;
 } {
 	const terminal = new VirtualTerminal(80, 12);
@@ -94,6 +95,7 @@ function createResumeHarness(options: ResumeHarnessOptions = {}): {
 
 	const switchSession = options.switchSession ?? vi.fn(async () => true);
 	const showStatus = vi.fn<(message: string) => void>();
+	const resetAssistantTextPresentation = vi.fn<() => void>();
 	const context = {
 		ui,
 		statusContainer,
@@ -118,6 +120,7 @@ function createResumeHarness(options: ResumeHarnessOptions = {}): {
 		rebuildInitialMessages: options.rebuildInitialMessages ?? vi.fn(),
 		reloadTodos: options.reloadTodos ?? vi.fn(async () => undefined),
 		showStatus,
+		resetAssistantTextPresentation,
 	} as unknown as InteractiveModeContext;
 
 	return {
@@ -126,6 +129,7 @@ function createResumeHarness(options: ResumeHarnessOptions = {}): {
 		ui,
 		switchSession,
 		showStatus,
+		resetAssistantTextPresentation,
 		dispose() {
 			ui.stop();
 		},
@@ -420,6 +424,7 @@ describe("handleResumeSession adversarial re-entrancy", () => {
 			expect(harness.context.streamingMessage).toBeUndefined();
 			expect(harness.context.loadingAnimation).toBeUndefined();
 			expect(state.loadingAnimation.stop).toHaveBeenCalledTimes(1);
+			expect(harness.resetAssistantTextPresentation).toHaveBeenCalledTimes(1);
 			expect(harness.statusContainer.children).toHaveLength(0);
 		} finally {
 			harness.dispose();
@@ -482,6 +487,7 @@ describe("handleResumeSession adversarial re-entrancy", () => {
 			await expect(controller.handleResumeSession("/tmp/rejected-before-switch.jsonl")).rejects.toBe(hookFailure);
 
 			expectTransientSessionUiPreserved(harness.context, state);
+			expect(harness.resetAssistantTextPresentation).not.toHaveBeenCalled();
 			expect(harness.showStatus).not.toHaveBeenCalledWith("Another session operation is already in progress");
 			expect(harness.statusContainer.children).toHaveLength(0);
 
