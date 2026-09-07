@@ -253,18 +253,11 @@ one accepted submission with one model call or one `agent_end` event.
 
 For generic embedders, prefer an application-owned queue of bounded full turns
 submitted through `session.prompt()`, and use `steer`/`followUp` only for live
-conversational controls. The lower-level `sendUserMessage` options
-`queuedAtDispatch: true` and `onQueuedPromoted` are available for hosts that
-must preserve dispatch-time ownership and correlate actual queue consumption:
-
-- `queuedAtDispatch` preserves the fact that the caller observed a busy/queued
-  dispatch across asynchronous admission fences. It does not promise a new run.
-- `onQueuedPromoted` fires at the actual dequeue/promotion boundary with
-  `startsOwnRun: false` for in-run consumption and `startsOwnRun: true` when a
-  queued-only continuation starts a new run.
-- The `sendUserMessage` promise reports admission into the selected delivery
-  path, not model completion. Use session events and the promotion callback to
-  correlate completion and cancellation.
+conversational controls. Use the supported delivery modes and session events to
+correlate admission, consumption, completion, and cancellation; do not build a
+generic embedder contract around internal dispatch or promotion-correlation
+hooks. The `sendUserMessage` promise reports admission into the selected
+delivery path, not model completion.
 
 Related APIs:
 
