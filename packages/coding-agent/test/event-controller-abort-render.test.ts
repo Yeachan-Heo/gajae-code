@@ -82,6 +82,7 @@ function createFixture(opts: { streamingMessage: AssistantMessage; retryAttempt?
 		streamingComponent,
 		streamingMessage: opts.streamingMessage,
 		pendingTools: new Map(),
+		setTodos: vi.fn(),
 		session: {
 			agent: { appendMessage: vi.fn() },
 			retryAttempt: opts.retryAttempt ?? 0,
@@ -94,6 +95,35 @@ function createFixture(opts: { streamingMessage: AssistantMessage; retryAttempt?
 }
 
 describe("EventController #handleMessageEnd abort labeling", () => {
+	it("reconciles optimistic todo state from a corrected persistence receipt", async () => {
+		const f = createFixture({ streamingMessage: makeAssistantMessage() });
+		const optimistic = [{ name: "Work", tasks: [{ content: "New task", status: "in_progress" as const }] }];
+		const durable = [{ name: "Prior", tasks: [{ content: "Durable task", status: "in_progress" as const }] }];
+
+		await f.controller.handleEvent({
+			type: "tool_execution_end",
+			toolCallId: "call_todo_write",
+			toolName: "todo_write",
+			result: { content: [], details: { phases: optimistic } },
+			isError: false,
+		} as never);
+		await f.controller.handleEvent({
+			type: "message_end",
+			message: {
+				role: "toolResult",
+				toolCallId: "call_todo_write",
+				toolName: "todo_write",
+				content: [{ type: "text", text: "Todo state persistence failed" }],
+				details: { phases: durable, failureKind: "persistence" },
+				isError: true,
+				timestamp: Date.now(),
+			},
+		});
+
+		expect(f.ctx.setTodos).toHaveBeenNthCalledWith(1, optimistic);
+		expect(f.ctx.setTodos).toHaveBeenNthCalledWith(2, durable);
+	});
+
 	it("rebuilds the transcript after terminal persistence recovery", async () => {
 		const f = createFixture({ streamingMessage: makeAssistantMessage() });
 		f.ctx.rebuildChatFromMessages = vi.fn();
