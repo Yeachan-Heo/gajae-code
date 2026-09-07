@@ -1,6 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { constants as fsConstants, type Stats } from "node:fs";
-import type { FileHandle } from "node:fs/promises";
+import * as nodeFs from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { type FileLockOptions, withFileLock } from "../config/file-lock";
@@ -194,7 +193,7 @@ export interface GenericHardPruneTarget {
 export interface GenericHardPruneSelectorContext {
 	path: string;
 	category: WriterCategory | string;
-	stat: Stats;
+	stat: nodeFs.Stats;
 	readJson: () => Promise<unknown>;
 }
 
@@ -553,7 +552,7 @@ function currentUid(): number {
 }
 
 interface PrivatePublicationDirectory {
-	handle: FileHandle;
+	handle: fs.FileHandle;
 	parent?: PrivatePublicationDirectory;
 	name?: string;
 	dev: number;
@@ -568,7 +567,7 @@ interface PrivatePublicationContext {
 	anchoredTarget: string;
 }
 
-function assertSafePublicationDirectory(stat: Stats, directory: string, privateSubtree: boolean): void {
+function assertSafePublicationDirectory(stat: nodeFs.Stats, directory: string, privateSubtree: boolean): void {
 	if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("unsafe publication directory");
 	if ((stat.mode & 0o022) !== 0 || stat.uid !== currentUid()) {
 		const mode = (stat.mode & 0o777).toString(8);
@@ -580,7 +579,7 @@ function assertSafePublicationDirectory(stat: Stats, directory: string, privateS
 		throw new Error("private publication directory is not owned mode 0700");
 }
 
-function procPath(handle: FileHandle): string {
+function procPath(handle: fs.FileHandle): string {
 	return `/proc/self/fd/${handle.fd}`;
 }
 
@@ -591,9 +590,9 @@ function directoryPath(directory: PrivatePublicationDirectory): string {
 const LINUX_O_PATH = 0o10000000;
 
 async function readPrivateExistingStateForMutation(filePath: string): Promise<StrictMutationReadResult> {
-	let handle: FileHandle | undefined;
+	let handle: fs.FileHandle | undefined;
 	try {
-		handle = await fs.open(filePath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK);
+		handle = await fs.open(filePath, nodeFs.constants.O_RDONLY | nodeFs.constants.O_NOFOLLOW | nodeFs.constants.O_NONBLOCK);
 		const stat = await handle.stat();
 		if (!stat.isFile() || stat.nlink !== 1 || (stat.mode & 0o777) !== 0o600 || stat.uid !== currentUid())
 			throw new Error("unsafe private publication file");
@@ -658,10 +657,10 @@ async function preparePrivateDirectory(
 	const root = cwdForOptions(options);
 	if ((await fs.realpath(root)) !== root) throw new Error("private publication requires canonical cwd");
 	const directories: PrivatePublicationDirectory[] = [];
-	const openFlags = fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW;
+	const openFlags = nodeFs.constants.O_RDONLY | nodeFs.constants.O_DIRECTORY | nodeFs.constants.O_NOFOLLOW;
 	try {
 		const rootHandle = await fs.open(root, openFlags);
-		let rootStat: Stats;
+		let rootStat: nodeFs.Stats;
 		try {
 			rootStat = await rootHandle.stat();
 		} catch (error) {
@@ -696,7 +695,7 @@ async function preparePrivateDirectory(
 			if (created) {
 				const pathHandle = await fs.open(
 					childPath,
-					LINUX_O_PATH | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW,
+					LINUX_O_PATH | nodeFs.constants.O_DIRECTORY | nodeFs.constants.O_NOFOLLOW,
 				);
 				try {
 					const beforeChmod = await pathHandle.stat();
@@ -712,7 +711,7 @@ async function preparePrivateDirectory(
 				}
 			}
 			const childHandle = await fs.open(childPath, openFlags);
-			let childStat: Stats;
+			let childStat: nodeFs.Stats;
 			try {
 				childStat = await childHandle.stat();
 			} catch (error) {
@@ -1495,7 +1494,7 @@ export async function hardPrune(
 	const removed: string[] = [];
 	for (const target of targets) {
 		const filePath = resolveGjcTarget(target.path, cwd);
-		let stat: Stats;
+		let stat: nodeFs.Stats;
 		try {
 			stat = await fs.stat(filePath);
 		} catch (error) {
@@ -1572,7 +1571,42 @@ export async function appendAuditEntry(
 	const filePath = resolveGjcTarget(layoutAuditPath(cwd, sessionId), cwd);
 	const append = async () => {
 		await fs.mkdir(path.dirname(filePath), { recursive: true });
-		await fs.appendFile(filePath, `${JSON.stringify(entry)}\n`, "utf-8");
+		let initialStat: nodeFs.BigIntStats | undefined;
+		try {
+			initialStat = await fs.lstat(filePath, { bigint: true });
+			if (initialStat.isSymbolicLink() || !initialStat.isFile()) throw new Error("audit path is not a regular file");
+		} catch (error) {
+			if (!isErrno(error, "ENOENT")) throw error;
+		}
+		const flags = initialStat
+			? nodeFs.constants.O_WRONLY |
+				nodeFs.constants.O_APPEND |
+				(process.platform === "win32" ? 0 : (nodeFs.constants.O_NOFOLLOW ?? 0))
+			: nodeFs.constants.O_WRONLY | nodeFs.constants.O_APPEND | nodeFs.constants.O_CREAT | nodeFs.constants.O_EXCL;
+		let handle: fs.FileHandle | undefined;
+		try {
+			handle = await fs.open(filePath, flags, 0o600);
+			const openedStat = await handle.stat({ bigint: true });
+			const pathStat = await fs.lstat(filePath, { bigint: true });
+			const sameObject = (left: nodeFs.BigIntStats, right: nodeFs.BigIntStats) =>
+				left.dev === right.dev && left.ino === right.ino && left.mode === right.mode && left.nlink === right.nlink;
+			if (
+				openedStat.isSymbolicLink() ||
+				!openedStat.isFile() ||
+				pathStat.isSymbolicLink() ||
+				!pathStat.isFile() ||
+				(initialStat !== undefined && !sameObject(initialStat, openedStat)) ||
+				!sameObject(openedStat, pathStat)
+			)
+				throw new Error("audit path identity changed before append");
+			await handle.writeFile(`${JSON.stringify(entry)}\n`, "utf-8");
+			await handle.sync();
+			const afterPathStat = await fs.lstat(filePath, { bigint: true });
+			if (afterPathStat.isSymbolicLink() || !sameObject(openedStat, afterPathStat))
+				throw new Error("audit path identity changed during append");
+		} finally {
+			await handle?.close();
+		}
 	};
 	if (options.lockHeld) await append();
 	else await withWorkflowStateLock(filePath, append, { cwd });
