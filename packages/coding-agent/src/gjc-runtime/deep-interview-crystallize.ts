@@ -351,9 +351,13 @@ function hasLaterSupersedingCorrection(content: string, quote: string, statement
 		/^\s*[.!?。！？]*\s*(?:no|not)\s*[,;:]?\s*(?:use|make|choose|select|switch|change|replace)\b/i.test(later);
 	const explicitNegativeReplacement =
 		/\b(?:no|not|don't|do\s+not)\b/i.test(later) && (topicOverlap || directNegativeReplacement);
+	const standaloneConditionalQualifier =
+		/^\s*[.!?。！？]*\s*(?:only\s+)?(?:if|unless|until|before|after|once|provided(?:\s+that)?)\b[^,;.!?。！？]*[.!?。！？]?\s*$/i.test(
+			later,
+		);
 	return (
 		/\b(?:actually|instead|rather|correction|on\s+second\s+thought|make\s+that)\b/i.test(later) ||
-		/\b(?:only\s+if|unless|until|before|after|once|provided(?:\s+that)?|depending\s+on)\b/i.test(later) ||
+		standaloneConditionalQualifier ||
 		explicitNegativeReplacement ||
 		/(?:사실|대신|정정|다시\s+생각|実際|代わり|訂正|やはり|实际上|實際上|改为|改為|更正)/u.test(later)
 	);
