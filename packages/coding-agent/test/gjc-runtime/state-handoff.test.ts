@@ -941,8 +941,8 @@ describe("gjc state handoff", () => {
 			}
 			const tamperedCaller = (await readJson(callerPath)) as Record<string, unknown>;
 			(tamperedCaller.state as Record<string, unknown>).rounds = [{ round: 99 }];
-			((tamperedCaller.receipt as Record<string, unknown>).content_sha256 as Record<string, unknown>).algorithm =
-				"sha1";
+			delete ((tamperedCaller.receipt as Record<string, unknown>).content_sha256 as Record<string, unknown>)
+				.computed_at;
 			await writeJson(callerPath, tamperedCaller);
 			const retried = await runNativeStateCommand(
 				["handoff", "--mode", "deep-interview", "--to", "ralplan", "--json"],
