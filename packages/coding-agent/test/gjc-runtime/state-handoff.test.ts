@@ -1618,8 +1618,15 @@ describe("gjc state handoff", () => {
 			await writePublishedReadyCrystal(cwd);
 			expect((await runNativeDeepInterviewCommand(["approve-execution", "--json"], cwd)).status).toBe(0);
 			const ledgerPath = auditPath(cwd, TEST_SESSION_ID);
-			const approvalLedger = await fs.readFile(ledgerPath, "utf8");
-			await fs.writeFile(ledgerPath, `${"x".repeat(2 * 1024 * 1024)}\n${approvalLedger}`);
+			await fs.appendFile(ledgerPath, `${"x".repeat(2 * 1024 * 1024)}\n`);
+			expect(
+				JSON.parse(
+					await fs.readFile(
+						path.join(sessionStateDir(cwd, TEST_SESSION_ID), "deep-interview-approval-audit.json"),
+						"utf8",
+					),
+				).mutation_id,
+			).toMatch(/^deep-interview:approve-execution:/);
 			const result = await runNativeStateCommand(
 				["handoff", "--mode", "deep-interview", "--to", "ultragoal", "--json"],
 				cwd,
@@ -1706,6 +1713,9 @@ describe("gjc state handoff", () => {
 			await writePublishedReadyCrystal(cwd);
 			expect((await runNativeDeepInterviewCommand(["approve-execution", "--json"], cwd)).status).toBe(0);
 			await fs.rm(auditPath(cwd, TEST_SESSION_ID), { force: true });
+			await fs.rm(path.join(sessionStateDir(cwd, TEST_SESSION_ID), "deep-interview-approval-audit.json"), {
+				force: true,
+			});
 			const retried = await runNativeDeepInterviewCommand(["approve-execution", "--json"], cwd);
 			expect(retried.status).toBe(2);
 			expect(retried.stderr).toContain("sanctioned approval audit record");
