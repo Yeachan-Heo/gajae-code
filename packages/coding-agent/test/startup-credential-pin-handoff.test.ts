@@ -323,6 +323,46 @@ describe("startup credential pin handoff", () => {
 		}
 	});
 
+	test("a stale durable pin remains unavailable instead of using an alternate account", async () => {
+		using tempDir = TempDir.createSync("@gjc-startup-pin-stale-");
+		const fixture = await createCredentialFixture(tempDir.path());
+		const sessionManager = SessionManager.inMemory(fixture.root);
+		sessionManager.appendCustomEntry("auth-credential-pin", {
+			v: 1,
+			scopeId: "credential-scope",
+			provider: fixture.provider,
+			pin: { kind: "id", value: String(fixture.paidRowId) },
+			credentialStoreIdentity: "fixture-store",
+		});
+		expect(fixture.authStorage.disableCredentialById(fixture.paidRowId, "revoked by test")).toBe(true);
+		let session: AgentSession | undefined;
+		const requests: string[] = [];
+		using _fetch = hookFetch((_input, init) => {
+			const bearer = new Headers(init?.headers).get("Authorization");
+			if (bearer) requests.push(bearer);
+			return Response.json({ data: [] });
+		});
+		try {
+			const result = await createAgentSession({
+				...sessionOptions(fixture),
+				sessionManager,
+				startupAuthConfig: snapshot(fixture.provider, `id:${fixture.paidRowId}`),
+				modelRegistryStartupMutation: { owner: "cli-root", onAttempt: () => {} },
+			});
+			session = result.session;
+			expect(
+				await fixture.authStorage.peekApiKey(fixture.provider, {
+					sessionId: session.credentialSessionId,
+					owner: fixture.modelRegistry.getAuthStorageOwner(),
+				}),
+			).toBeUndefined();
+			expect(requests).not.toContain(`Bearer ${fixture.wrongKey}`);
+			expect(fixture.authStorage.hasSessionCredentialUnavailable(fixture.provider, "credential-scope")).toBe(true);
+		} finally {
+			await disposeFixture(fixture, session);
+		}
+	});
+
 	test("an explicit credential selector overrides the global paid pin", async () => {
 		using tempDir = TempDir.createSync("@gjc-startup-pin-explicit-");
 		const fixture = await createCredentialFixture(tempDir.path());

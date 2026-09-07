@@ -1872,8 +1872,17 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					staleDurableCredentialPins.delete(resolveOAuthStorageProvider(record.provider));
 				}
 			} catch {
+				const unavailableSelector: AuthCredentialSelector | undefined =
+					pin &&
+					(pin.kind === "id" || pin.kind === "email" || pin.kind === "account" || pin.kind === "project") &&
+					typeof pin.value === "string"
+						? { kind: pin.kind, value: pin.value }
+						: undefined;
 				// A newer stale pin must not leave an earlier replayed selector active.
 				authStorage.clearSessionCredentialSelector(record.provider, credentialSessionId);
+				if (unavailableSelector) {
+					authStorage.markSessionCredentialUnavailable(credentialSessionId, record.provider, unavailableSelector);
+				}
 				staleDurableCredentialPins.add(resolveOAuthStorageProvider(record.provider));
 			}
 		}

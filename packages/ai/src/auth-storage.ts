@@ -1335,6 +1335,8 @@ export class AuthStorage {
 	#sessionCredentialSelectors: Map<string, Map<string, AuthCredentialSelector>> = new Map();
 	/** Explicit AUTO masks suppress both scoped and process-global selectors for a scope/provider. */
 	#sessionCredentialAutoMasks: Map<string, Set<string>> = new Map();
+	/** Hard-pin failures that must remain unavailable until an explicit user choice. */
+	#sessionCredentialUnavailable: Map<string, Map<string, AuthCredentialSelector>> = new Map();
 	/** Reference counts for sessions sharing one credential scope (top-level + subagents). */
 	#credentialScopeLeases: Map<string, number> = new Map();
 	/** Tracks next credential index per provider:type key for round-robin distribution (non-session use). */
@@ -1441,6 +1443,7 @@ export class AuthStorage {
 		this.#credentialScopeLeases.clear();
 		this.#sessionCredentialSelectors.clear();
 		this.#sessionCredentialAutoMasks.clear();
+		this.#sessionCredentialUnavailable.clear();
 		this.#sessionLastCredential.clear();
 		this.#store.close();
 	}
@@ -1667,6 +1670,7 @@ export class AuthStorage {
 		this.#credentialScopeLeases.delete(scope);
 		this.#sessionCredentialSelectors.delete(scope);
 		this.#sessionCredentialAutoMasks.delete(scope);
+		this.#sessionCredentialUnavailable.delete(scope);
 		for (const [provider, sessions] of this.#sessionLastCredential) {
 			if (!sessions.delete(scope)) continue;
 			if (sessions.size === 0) this.#sessionLastCredential.delete(provider);
@@ -1688,6 +1692,7 @@ export class AuthStorage {
 		if (!scope) throw new Error("Credential scope id must not be empty");
 		const storageProvider = resolveOAuthStorageProvider(provider);
 		this.#assertCredentialSelectorUsable(storageProvider, selector, owner);
+		this.#sessionCredentialUnavailable.get(scope)?.delete(storageProvider);
 		const selectors = this.#sessionCredentialSelectors.get(scope) ?? new Map<string, AuthCredentialSelector>();
 		selectors.set(storageProvider, selector);
 		this.#sessionCredentialSelectors.set(scope, selectors);
@@ -1701,6 +1706,7 @@ export class AuthStorage {
 		if (!scope) throw new Error("Credential scope id must not be empty");
 		const storageProvider = resolveOAuthStorageProvider(provider);
 		this.#sessionCredentialSelectors.get(scope)?.delete(storageProvider);
+		this.#sessionCredentialUnavailable.get(scope)?.delete(storageProvider);
 		const masks = this.#sessionCredentialAutoMasks.get(scope) ?? new Set<string>();
 		masks.add(storageProvider);
 		this.#sessionCredentialAutoMasks.set(scope, masks);
@@ -1718,6 +1724,28 @@ export class AuthStorage {
 		if (selectors?.size === 0) this.#sessionCredentialSelectors.delete(scope);
 		if (masks?.size === 0) this.#sessionCredentialAutoMasks.delete(scope);
 		if (changed) this.#bumpGeneration("clear-session-credential-selector", storageProvider);
+	}
+
+	/** Preserve a failed hard pin as unavailable instead of allowing AUTO fallback. */
+	markSessionCredentialUnavailable(scopeId: string, provider: string, selector: AuthCredentialSelector): void {
+		const scope = scopeId.trim();
+		if (!scope) throw new Error("Credential scope id must not be empty");
+		const storageProvider = resolveOAuthStorageProvider(provider);
+		const unavailable = this.#sessionCredentialUnavailable.get(scope) ?? new Map<string, AuthCredentialSelector>();
+		unavailable.set(storageProvider, selector);
+		this.#sessionCredentialUnavailable.set(scope, unavailable);
+		this.#sessionCredentialSelectors.get(scope)?.delete(storageProvider);
+		this.#sessionCredentialAutoMasks.get(scope)?.delete(storageProvider);
+		this.#bumpGeneration("mark-session-credential-unavailable", storageProvider);
+	}
+
+	/** Return a failed hard pin retained for this scope, if any. */
+	hasSessionCredentialUnavailable(provider: string, scopeId?: string): boolean {
+		const scope = scopeId?.trim();
+		return (
+			scope !== undefined &&
+			this.#sessionCredentialUnavailable.get(scope)?.has(resolveOAuthStorageProvider(provider)) === true
+		);
 	}
 
 	/** Whether the effective selection for a scope is explicitly pinned (AUTO masks are not pins). */
@@ -4822,6 +4850,15 @@ export class AuthStorage {
 		options?: AuthApiKeyOptions,
 		reloadsUsed = 0,
 	): Promise<OAuthResolutionResult | undefined> {
+		const unavailableSelector =
+			sessionId && !options?.credentialSelector
+				? this.#sessionCredentialUnavailable.get(sessionId)?.get(resolveOAuthStorageProvider(provider))
+				: undefined;
+		if (unavailableSelector) {
+			throw new Error(
+				`Selected credential for ${provider} (${this.#formatCredentialSelector(unavailableSelector)}) is unavailable`,
+			);
+		}
 		if (reloadsUsed > MAX_OAUTH_RESOLUTION_RELOADS) {
 			logger.warn("OAuth credential resolution exhausted its reload budget", {
 				provider,
@@ -4830,6 +4867,10 @@ export class AuthStorage {
 			return undefined;
 		}
 		const selectedCredential = this.#resolveSelectedStoredCredential(provider, options, sessionId);
+		const sessionSelector =
+			sessionId && !options?.credentialSelector && selectedCredential?.credential.type === "oauth"
+				? { kind: "id" as const, value: String(selectedCredential.id) }
+				: undefined;
 		const selectedOAuthCredential: OAuthCredentialSelection | undefined =
 			selectedCredential?.credential.type === "oauth"
 				? {
@@ -4952,6 +4993,17 @@ export class AuthStorage {
 					);
 				} catch (error) {
 					if (isSqliteError(error)) throw error;
+					if (
+						sessionSelector &&
+						/invalid_grant|grant is invalid|invalid_token|revoked|unauthorized|expired.*refresh|refresh.*expired/i.test(
+							String(error),
+						)
+					) {
+						this.markSessionCredentialUnavailable(sessionId!, provider, sessionSelector);
+						throw new Error(
+							`Selected credential for ${provider} (${this.#formatCredentialSelector(sessionSelector)}) is unavailable`,
+						);
+					}
 				}
 			}),
 		);
@@ -4982,6 +5034,7 @@ export class AuthStorage {
 					enforceSparkProRequirement,
 				},
 				reloadsUsed,
+				sessionSelector,
 			);
 			if (resolved) return resolved;
 		}
@@ -5001,6 +5054,7 @@ export class AuthStorage {
 					enforceSparkProRequirement,
 				},
 				reloadsUsed,
+				sessionSelector,
 			);
 		}
 
@@ -5287,6 +5341,7 @@ export class AuthStorage {
 			enforceSparkProRequirement?: boolean;
 		},
 		reloadsUsed = 0,
+		sessionSelector?: AuthCredentialSelector,
 	): Promise<OAuthResolutionResult | undefined> {
 		const {
 			checkUsage,
@@ -5498,6 +5553,9 @@ export class AuthStorage {
 					`oauth refresh failed: ${errorMsg}`,
 					attemptedCredentialId,
 				);
+				if (sessionSelector && sessionId) {
+					this.markSessionCredentialUnavailable(sessionId, provider, sessionSelector);
+				}
 				if (!disabled) {
 					// The CAS predicate compares the row's serialized `data`, so it also
 					// misses when nothing was rotated: the row may have been replaced by
@@ -5510,7 +5568,12 @@ export class AuthStorage {
 					// peer rotation to clobber — so apply it directly instead of looping.
 					const stillHoldsAttemptedToken =
 						attemptedCredentialId !== undefined &&
-						this.#credentialRowHoldsRefreshToken(provider, attemptedCredentialId, attemptedRefreshToken);
+						(this.#credentialRowHoldsRefreshToken(provider, attemptedCredentialId, attemptedRefreshToken) ||
+							this.#credentialRowHoldsRefreshToken(
+								provider,
+								attemptedCredentialId,
+								selection.credential.refresh,
+							));
 					if (stillHoldsAttemptedToken && attemptedCredentialId !== undefined) {
 						logger.warn("OAuth refresh disable CAS mismatched an unrotated row; disabling by id", {
 							provider,
@@ -5568,6 +5631,9 @@ export class AuthStorage {
 		}
 		if (this.#getCredentialSelector(provider, options, sessionId)) {
 			const selector = this.#getCredentialSelector(provider, options, sessionId);
+			if (selector && sessionId && !options?.credentialSelector) {
+				this.markSessionCredentialUnavailable(sessionId, provider, selector);
+			}
 			throw new Error(
 				`Selected credential for ${provider} (${selector ? this.#formatCredentialSelector(selector) : "unknown"}) is unavailable`,
 			);
@@ -5655,6 +5721,7 @@ export class AuthStorage {
 		const configOverride = this.#configOverrideRegistration(provider, options?.owner);
 		const configKey = configOverride?.apiKey;
 		if (configKey && !configOverride?.envSourced) return configKey;
+		if (options?.sessionId && this.hasSessionCredentialUnavailable(provider, options.sessionId)) return undefined;
 
 		const selectedCredential = this.#resolveSelectedStoredCredential(
 			provider,
