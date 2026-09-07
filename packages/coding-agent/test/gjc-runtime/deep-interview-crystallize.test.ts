@@ -342,6 +342,28 @@ describe("deep-interview crystallize contract", () => {
 				}),
 			),
 		).toThrow("verbatim user anchor");
+		const punctuatedSnapshot: CrystalSnapshot = {
+			revision: 1,
+			start: 0,
+			end: 0,
+			messages: [{ index: 0, role: "user", content: "Build the API in C++." }],
+			digest: "",
+		};
+		punctuatedSnapshot.digest = crystalSnapshotDigest(punctuatedSnapshot);
+		expect(() =>
+			crystallizeDeepInterview(
+				input({
+					snapshot: punctuatedSnapshot,
+					items: [
+						{
+							...input().items[0]!,
+							statement: "Build the API in C#",
+							anchor: { message_index: 0, quote: "Build the API in C++." },
+						},
+					],
+				}),
+			),
+		).toThrow("verbatim user anchor");
 	});
 	it("requires fresh evidence when inferred material becomes confirmed", () => {
 		const first = crystallizeDeepInterview(
