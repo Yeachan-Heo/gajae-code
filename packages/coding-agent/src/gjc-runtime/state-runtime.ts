@@ -2716,10 +2716,10 @@ async function appendHandoffAudit(
 	hooks: { afterAudit?: () => Promise<unknown>; afterIndex?: () => Promise<unknown> } = {},
 ): Promise<void> {
 	const entry = buildHandoffAuditEntry(options);
-	await appendAuditEntry(options.cwd, options.sessionId, entry);
-	await hooks.afterAudit?.();
 	await writeHandoffAuditIndex(options, entry);
 	await hooks.afterIndex?.();
+	await appendAuditEntry(options.cwd, options.sessionId, entry);
+	await hooks.afterAudit?.();
 }
 
 /**
@@ -3064,35 +3064,19 @@ async function handleHandoffUnlocked(
 				});
 				const persistSteps = () =>
 					updateWorkflowTransactionJournal(cwd, sessionId, retryMutationId, { steps: [...steps] });
-				if (steps.has("handoff-audit")) {
-					if (!indexPresent) {
-						await writeHandoffAuditIndex(auditOptions, buildHandoffAuditEntry(auditOptions));
-						steps.add("handoff-index");
-						await persistSteps();
-					}
-				} else if (
-					await hasAuditedDeepInterviewHandoff(cwd, sessionId, workflowCallee, {
-						handoffAt: retryAt,
-					})
-				) {
-					steps.add("handoff-audit");
+				if (!indexPresent) {
+					const entry = buildHandoffAuditEntry(auditOptions);
+					await writeHandoffAuditIndex(auditOptions, entry);
+					steps.add("handoff-index");
 					await persistSteps();
-					if (!indexPresent) {
-						await writeHandoffAuditIndex(auditOptions, buildHandoffAuditEntry(auditOptions));
-						steps.add("handoff-index");
+					if (!steps.has("handoff-audit")) {
+						await appendAuditEntry(cwd, sessionId, entry);
+						steps.add("handoff-audit");
 						await persistSteps();
 					}
-				} else {
-					await appendHandoffAudit(auditOptions, {
-						afterAudit: async () => {
-							steps.add("handoff-audit");
-							await persistSteps();
-						},
-						afterIndex: async () => {
-							steps.add("handoff-index");
-							await persistSteps();
-						},
-					});
+				} else if (!steps.has("handoff-index")) {
+					steps.add("handoff-index");
+					await persistSteps();
 				}
 			}
 			await completeWorkflowTransactionJournal(cwd, sessionId, retryMutationId);
@@ -3184,13 +3168,13 @@ async function handleHandoffUnlocked(
 			forced: pendingRecoveryForced,
 		};
 		await appendHandoffAudit(recoveryAuditOptions, {
-			afterAudit: () =>
-				updateWorkflowTransactionJournal(cwd, sessionId, mutationId, {
-					steps: ["callee-mode-state", "caller-mode-state", "active-state", "handoff-audit"],
-				}),
 			afterIndex: () =>
 				updateWorkflowTransactionJournal(cwd, sessionId, mutationId, {
-					steps: ["callee-mode-state", "caller-mode-state", "active-state", "handoff-audit", "handoff-index"],
+					steps: ["callee-mode-state", "caller-mode-state", "active-state", "handoff-index"],
+				}),
+			afterAudit: () =>
+				updateWorkflowTransactionJournal(cwd, sessionId, mutationId, {
+					steps: ["callee-mode-state", "caller-mode-state", "active-state", "handoff-index", "handoff-audit"],
 				}),
 		});
 		await completeWorkflowTransactionJournal(cwd, sessionId, mutationId);
@@ -3361,13 +3345,13 @@ async function handleHandoffUnlocked(
 		forced,
 	};
 	await appendHandoffAudit(handoffAuditOptions, {
-		afterAudit: () =>
-			updateWorkflowTransactionJournal(cwd, sessionId, mutationId, {
-				steps: ["callee-mode-state", "caller-mode-state", "active-state", "handoff-audit"],
-			}),
 		afterIndex: () =>
 			updateWorkflowTransactionJournal(cwd, sessionId, mutationId, {
-				steps: ["callee-mode-state", "caller-mode-state", "active-state", "handoff-audit", "handoff-index"],
+				steps: ["callee-mode-state", "caller-mode-state", "active-state", "handoff-index"],
+			}),
+		afterAudit: () =>
+			updateWorkflowTransactionJournal(cwd, sessionId, mutationId, {
+				steps: ["callee-mode-state", "caller-mode-state", "active-state", "handoff-index", "handoff-audit"],
 			}),
 	});
 	await completeWorkflowTransactionJournal(cwd, sessionId, mutationId);

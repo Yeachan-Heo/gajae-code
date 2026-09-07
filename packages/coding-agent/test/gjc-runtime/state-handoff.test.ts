@@ -1191,6 +1191,21 @@ describe("gjc state handoff", () => {
 			);
 			expect(retried.status, retried.stderr).toBe(0);
 			expect(JSON.parse(await fs.readFile(indexPath, "utf8")).mutation_id).toBe(mutationId);
+			const handoffEvents = (await fs.readFile(auditPath(cwd, TEST_SESSION_ID), "utf8"))
+				.split(/\r?\n/)
+				.filter(Boolean)
+				.map(line => {
+					try {
+						return JSON.parse(line) as Record<string, unknown>;
+					} catch {
+						return undefined;
+					}
+				})
+				.filter(
+					entry =>
+						entry?.verb === "handoff" && entry.mutation_id === mutationId && entry.caller_receipt !== undefined,
+				);
+			expect(handoffEvents).toHaveLength(1);
 		});
 	});
 
