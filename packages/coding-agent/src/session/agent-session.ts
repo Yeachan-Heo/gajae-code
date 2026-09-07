@@ -3536,6 +3536,7 @@ export class AgentSession {
 	#sessionTransitionSettlement: PromiseWithResolvers<void> | undefined;
 	#postCommitTransitionIngress = new AsyncLocalStorage<{ epoch: number; token: symbol }>();
 	#activePostCommitTransitionIngressTokens = new Set<symbol>();
+	#compactionHookContext = new AsyncLocalStorage<boolean>();
 	#coordinatorPersistGeneration = 0;
 	#coordinatorRescopeBarrier: Promise<void> | undefined;
 	#releaseCoordinatorRescopeBarrier: (() => void) | undefined;
@@ -15091,10 +15092,12 @@ export class AgentSession {
 
 		if (this.#extensionRunner && savedCompactionEntry) {
 			if (identityIsCurrent?.() === false) return undefined;
-			await this.#extensionRunner.emit({
-				type: "session_compact",
-				compactionEntry: savedCompactionEntry,
-				fromExtension: fromExtension ?? false,
+			await this.#compactionHookContext.run(true, async () => {
+				await this.#extensionRunner?.emit({
+					type: "session_compact",
+					compactionEntry: savedCompactionEntry,
+					fromExtension: fromExtension ?? false,
+				});
 			});
 		}
 
@@ -16258,7 +16261,7 @@ export class AgentSession {
 			const sessionId = this.sessionId;
 			this.#disconnectFromAgent();
 			await this.abort();
-			await Promise.allSettled([...this.#autoCompactionCompletions]);
+			if (!this.#compactionHookContext.getStore()) await Promise.allSettled([...this.#autoCompactionCompletions]);
 			this.#cancelOwnAsyncJobs();
 			this.#suppressOwnAsyncJobDeliveries();
 			this.yieldQueue.clear();
