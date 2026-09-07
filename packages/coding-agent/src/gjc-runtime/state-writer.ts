@@ -89,6 +89,7 @@ export interface WorkflowTransactionJournal {
 	callee?: CanonicalGjcWorkflowSkill;
 	paths: string[];
 	steps: string[];
+	approval_audit_offset?: number;
 }
 
 export type StateWritePolicy = "source" | "cache";
@@ -1559,6 +1560,7 @@ export async function appendAuditEntry(
 	cwd: string,
 	sessionIdOrEntry: string | AuditEntry,
 	maybeEntry?: AuditEntry,
+	options: { lockHeld?: boolean } = {},
 ): Promise<string> {
 	const sessionId =
 		typeof sessionIdOrEntry === "string"
@@ -1568,8 +1570,12 @@ export async function appendAuditEntry(
 	const entry = typeof sessionIdOrEntry === "string" ? maybeEntry : sessionIdOrEntry;
 	if (!entry) throw new Error("audit entry is required");
 	const filePath = resolveGjcTarget(layoutAuditPath(cwd, sessionId), cwd);
-	await fs.mkdir(path.dirname(filePath), { recursive: true });
-	await fs.appendFile(filePath, `${JSON.stringify(entry)}\n`, "utf-8");
+	const append = async () => {
+		await fs.mkdir(path.dirname(filePath), { recursive: true });
+		await fs.appendFile(filePath, `${JSON.stringify(entry)}\n`, "utf-8");
+	};
+	if (options.lockHeld) await append();
+	else await withWorkflowStateLock(filePath, append, { cwd });
 	return filePath;
 }
 
