@@ -423,6 +423,7 @@ function hasLaterSupersedingCorrection(content: string, quote: string, statement
 				(clause.match(/[A-Za-z0-9][A-Za-z0-9+#.-]*/g) ?? []).some(isShortTechnicalIdentifier)) ||
 			Boolean(
 				statementUseTarget &&
+					(isShortTechnicalIdentifier(statementUseTarget) || /^[A-Z]/.test(statementUseTarget)) &&
 					(() => {
 						const target = /\buse\s+([A-Za-z0-9][A-Za-z0-9+#.-]*)/i.exec(clause)?.[1];
 						return Boolean(
