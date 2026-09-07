@@ -1,7 +1,9 @@
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "bun:test";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, spyOn } from "bun:test";
+import type { PathLike, StatOptions } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import * as url from "node:url";
+import { crystalSnapshotDigest } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-crystallize";
 import { runNativeDeepInterviewCommand } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-runtime";
 import {
 	createDeepInterviewIntentManifest,
@@ -26,6 +28,7 @@ const codingAgentRoot = path.resolve(path.dirname(url.fileURLToPath(import.meta.
 
 const TEST_SESSION_ID = "test-session";
 const originalSessionId = process.env.GJC_SESSION_ID;
+const originalSessionFile = process.env.GJC_SESSION_FILE;
 const originalAgentDir = process.env.GJC_CODING_AGENT_DIR;
 const fallbackAgentDir = path.join(getConfigRootDir(), "agent");
 async function tempDir(): Promise<string> {
@@ -45,6 +48,8 @@ beforeEach(async () => {
 
 afterEach(async () => {
 	resetSettingsForTest();
+	if (originalSessionFile !== undefined) process.env.GJC_SESSION_FILE = originalSessionFile;
+	else delete process.env.GJC_SESSION_FILE;
 	if (originalAgentDir) {
 		setAgentDir(originalAgentDir);
 	} else {
@@ -392,6 +397,109 @@ describe("native gjc deep-interview runtime", () => {
 		expect(result.status, result.stderr).toBe(0);
 		expect((await fs.stat(indexPath)).size).toBeLessThanOrEqual(1_000_000);
 		expect(await fs.readFile(indexPath, "utf8")).toContain('"slug":"current"');
+	});
+
+	it("projects synthetic user messages as developer-authored transcript entries", async () => {
+		const root = await tempDir();
+		const sessionPath = path.join(root, ".gjc", "sessions", `${TEST_SESSION_ID}.jsonl`);
+		await fs.mkdir(path.dirname(sessionPath), { recursive: true });
+		const messages: Array<{ index: number; role: "developer" | "user" | "assistant"; content: string }> = [
+			{ index: 0, role: "developer", content: "Synthetic context" },
+			{ index: 1, role: "user", content: "Preserve replay safety." },
+			{ index: 2, role: "assistant", content: "Understood." },
+		];
+		const snapshot = {
+			revision: messages.length,
+			start: 0,
+			end: messages.length - 1,
+			messages,
+			digest: crystalSnapshotDigest({
+				revision: messages.length,
+				start: 0,
+				end: messages.length - 1,
+				messages,
+			}),
+		};
+		await fs.writeFile(
+			sessionPath,
+			[
+				JSON.stringify({ type: "session", version: 1, id: TEST_SESSION_ID, cwd: root }),
+				JSON.stringify({
+					type: "message",
+					message: { role: "user", synthetic: true, content: "Synthetic context" },
+				}),
+				JSON.stringify({ type: "message", message: { role: "user", content: "Preserve replay safety." } }),
+				JSON.stringify({ type: "message", message: { role: "assistant", content: "Understood." } }),
+				"",
+			].join("\n"),
+			"utf8",
+		);
+		process.env.GJC_SESSION_FILE = sessionPath;
+
+		const result = await runNativeDeepInterviewCommand(
+			[
+				"--crystallize",
+				"--slug",
+				"synthetic-role",
+				"--input",
+				JSON.stringify({
+					session_id: TEST_SESSION_ID,
+					current_revision: messages.length,
+					snapshot,
+					items: [
+						{
+							id: "requirement:replay-safety",
+							kind: "acceptance_criterion",
+							classification: "confirmed",
+							statement: "Preserve replay safety.",
+							anchor: { message_index: 1, quote: "Preserve replay safety." },
+						},
+					],
+				}),
+				"--json",
+			],
+			root,
+		);
+		expect(result.status, result.stderr).toBe(0);
+		const payload = JSON.parse(result.stdout ?? "{}") as {
+			crystal?: { source?: { messages?: Array<{ role: string; content: string }> } };
+		};
+		expect(payload.crystal?.source?.messages).toEqual(messages);
+	});
+
+	it("rejects a transcript path replaced after the bounded descriptor read", async () => {
+		const root = await tempDir();
+		const sessionPath = path.join(root, ".gjc", "sessions", `${TEST_SESSION_ID}.jsonl`);
+		const transcript = `${JSON.stringify({ type: "session", version: 1, id: TEST_SESSION_ID, cwd: root })}\n${JSON.stringify({ type: "message", message: { role: "user", content: "Preserve replay safety." } })}\n`;
+		await fs.mkdir(path.dirname(sessionPath), { recursive: true });
+		await fs.writeFile(sessionPath, transcript, "utf8");
+		process.env.GJC_SESSION_FILE = sessionPath;
+
+		const originalLstat = fs.lstat;
+		let canonicalLstatCalls = 0;
+		const lstatImplementation = (async (file: PathLike, options?: StatOptions) => {
+			const target = typeof file === "string" ? path.resolve(file) : String(file);
+			if (target === sessionPath) {
+				canonicalLstatCalls += 1;
+				if (canonicalLstatCalls === 3) {
+					await fs.rename(sessionPath, `${sessionPath}.detached`);
+					await fs.writeFile(sessionPath, transcript, "utf8");
+				}
+			}
+			return await originalLstat(file, options as never);
+		}) as typeof fs.lstat;
+		const lstatSpy = spyOn(fs, "lstat").mockImplementation(lstatImplementation);
+		try {
+			const result = await runNativeDeepInterviewCommand(
+				["--crystallize", "--slug", "detached", "--input", JSON.stringify({ current_revision: 1 })],
+				root,
+			);
+			expect(result.status).toBe(2);
+			expect(result.stderr).toContain("live session transcript changed during recovery read");
+		} finally {
+			lstatSpy.mockRestore();
+		}
+		expect(canonicalLstatCalls).toBeGreaterThanOrEqual(3);
 	});
 
 	it("accepts a long inline --spec that exceeds the OS path-length limit", async () => {

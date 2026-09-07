@@ -611,6 +611,38 @@ describe("deep-interview crystallize contract", () => {
 			),
 		).toThrow("verbatim user anchor");
 	});
+	it("rejects region, compound-token, and positive replacement anchor drift", () => {
+		for (const [content, quote, statement] of [
+			["Deploy service in EU", "Deploy service in EU", "Deploy service in US"],
+			["Use NoSQL for storage", "SQL for storage", "Use SQL for storage"],
+			["Use JavaScript", "Java", "Use Java"],
+			["Use Go. Switch to JS.", "Use Go.", "Use Go"],
+			["Use Go. Don’t use Go; use JS.", "Use Go.", "Use Go"],
+		] as const) {
+			const snapshot: CrystalSnapshot = {
+				revision: 1,
+				start: 0,
+				end: 0,
+				messages: [{ index: 0, role: "user", content }],
+				digest: "",
+			};
+			snapshot.digest = crystalSnapshotDigest(snapshot);
+			expect(() =>
+				crystallizeDeepInterview(
+					input({
+						snapshot,
+						items: [
+							{
+								...input().items[0]!,
+								statement,
+								anchor: { message_index: 0, quote },
+							},
+						],
+					}),
+				),
+			).toThrow("verbatim user anchor");
+		}
+	});
 	it("requires fresh evidence when inferred material becomes confirmed", () => {
 		const first = crystallizeDeepInterview(
 			input({
@@ -1367,6 +1399,20 @@ describe("deep-interview crystallize contract", () => {
 			},
 		];
 		expect(crystallizeDeepInterview(next).removed_ids).toContain("constraint:latency");
+		const mixedMessage = "Remove the fast constraint. Keep PostgreSQL for storage.";
+		const mixed = withFreshUserEvidence(
+			input({ prior: first, items: [first.items[0]!], removed_ids: ["constraint:latency"] }),
+			mixedMessage,
+		);
+		mixed.removed_item_anchors = [
+			{
+				item: "constraint:latency",
+				message_index: 1,
+				quote: "Remove the fast constraint.",
+				resolution: "Remove the fast constraint.",
+			},
+		];
+		expect(crystallizeDeepInterview(mixed).removed_ids).toContain("constraint:latency");
 	});
 
 	it("persists an unauthenticated removal intent instead of becoming ready later", () => {

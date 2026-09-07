@@ -1077,8 +1077,8 @@ describe("native gjc ralplan runtime — duplicate --write guard", () => {
 
 		// The command-level dedup (findExistingStageArtifact) and the ledger append
 		// are not under one lock, so racing identical writes can both observe an
-		// empty index and both append. The shared appendJsonlIdempotent primitive
-		// serializes the append, so exactly one row survives regardless of the race.
+		// empty index and both append. The ledger writer serializes the append, so
+		// exactly one row survives regardless of the race.
 		const results = await Promise.all(Array.from({ length: 6 }, () => runNativeRalplanCommand([...args], root)));
 		for (const result of results) {
 			expect(result.status).toBe(0);
@@ -1112,6 +1112,59 @@ describe("native gjc ralplan runtime — duplicate --write guard", () => {
 			readSpy.mockRestore();
 		}
 		expect(prePersistLedgerReads).toBe(1);
+	});
+	it("compacts oversized ralplan ledgers while retaining the current final receipt", async () => {
+		const root = await tempDir();
+		const runId = "bounded-ledger";
+		const runDirPath = runDir(root, runId);
+		await fs.mkdir(runDirPath, { recursive: true });
+		const finalPath = path.join(runDirPath, "stage-01-final.md");
+		const finalAdmission = {
+			configuredTarget: "ultragoal",
+			effectiveTarget: "ultragoal",
+			degradationReason: null,
+			source: "project-config",
+		};
+		const rows = [
+			{
+				stage: "final",
+				stage_n: 1,
+				path: finalPath,
+				created_at: "2026-01-01T00:00:00.000Z",
+				sha256: "a".repeat(64),
+				auto_handoff: finalAdmission,
+			},
+			...Array.from({ length: 12_000 }, (_, index) => ({
+				stage: "architect",
+				stage_n: index + 1,
+				path: path.join(runDirPath, `stage-${String(index + 1).padStart(5, "0")}-architect.md`),
+				created_at: "2026-01-01T00:00:00.000Z",
+				sha256: `${String(index).padStart(64, "0")}`,
+			})),
+		];
+		const indexPath = path.join(runDirPath, "index.jsonl");
+		await fs.writeFile(indexPath, `${rows.map(row => JSON.stringify(row)).join("\n")}\n`, "utf-8");
+		expect((await fs.stat(indexPath)).size).toBeGreaterThan(1024 * 1024);
+
+		const result = await writeRalplanArtifact(root, runId, "adr", 2, "# adr");
+		expect(result.status, result.stderr).toBe(0);
+		const compacted = await fs.readFile(indexPath, "utf-8");
+		expect(Buffer.byteLength(compacted, "utf8")).toBeLessThanOrEqual(1024 * 1024);
+		const persistedRows = compacted
+			.trim()
+			.split("\n")
+			.map(line => JSON.parse(line) as Record<string, unknown>);
+		expect(persistedRows).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({
+					stage: "final",
+					stage_n: 1,
+					path: finalPath,
+					auto_handoff: finalAdmission,
+				}),
+				expect.objectContaining({ stage: "adr", stage_n: 2 }),
+			]),
+		);
 	});
 });
 
@@ -1856,6 +1909,28 @@ describe("ralplan automatic handoff admission (#3398)", () => {
 		expect((await readRalplanHudChips(root)).find(chip => chip.label === "handoff")).toMatchObject({
 			value: "ultragoal→ultragoal",
 		});
+	});
+	it("repairs the authenticated final admission projection after a crash-gap dedupe", async () => {
+		const root = await tempDir();
+		const runId = "final-admission-crash-gap";
+		await fs.mkdir(path.join(root, ".gjc"), { recursive: true });
+		await fs.writeFile(
+			path.join(root, ".gjc", "config.yml"),
+			YAML.stringify({ gjc: { ralplan: { autoHandoff: "ultragoal" } } }, null, 2),
+			"utf-8",
+		);
+		const first = JSON.parse((await writeRalplanArtifact(root, runId, "final", 1, "# final")).stdout ?? "{}");
+		const expectedAdmission = first.auto_handoff;
+		const statePath = ralplanStatePath(root);
+		const state = JSON.parse(await fs.readFile(statePath, "utf-8")) as Record<string, unknown>;
+		delete state.auto_handoff;
+		await fs.writeFile(statePath, `${JSON.stringify(state)}\n`, "utf-8");
+
+		const retry = JSON.parse((await writeRalplanArtifact(root, runId, "final", 1, "# final")).stdout ?? "{}");
+		expect(retry).toMatchObject({ deduplicated: true, auto_handoff: expectedAdmission });
+		const restoredState = JSON.parse(await fs.readFile(statePath, "utf-8")) as Record<string, unknown>;
+		expect(restoredState.auto_handoff).toEqual(expectedAdmission);
+		expect(restoredState.receipt).toMatchObject({ command: "gjc ralplan final-admission" });
 	});
 	it("overlays a later durable PLANNING-STUCK marker on final dedupe", async () => {
 		const root = await tempDir();
