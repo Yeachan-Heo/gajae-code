@@ -290,6 +290,7 @@ type CrystalSemanticProfile = {
 	obligation: string;
 	comparison: string;
 	exclusive: boolean;
+	stateValue: string;
 };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -519,6 +520,9 @@ function semanticProfile(value: string): CrystalSemanticProfile {
 		.sort()
 		.join(",");
 	const exclusive = /\b(?:only|exclusively|solely)\b/i.test(normalized);
+	const stateValue = [...new Set([...normalized.matchAll(/\b(?:on|off|up|down)\b/g)].map(match => match[0]))]
+		.sort()
+		.join(",");
 	return {
 		negative,
 		interrogative,
@@ -531,6 +535,7 @@ function semanticProfile(value: string): CrystalSemanticProfile {
 		obligation: [...obligationTerms].sort().join(","),
 		comparison,
 		exclusive,
+		stateValue,
 	};
 }
 
@@ -546,7 +551,8 @@ function sameSemanticIntent(left: CrystalSemanticProfile, right: CrystalSemantic
 		left.unresolved === right.unresolved &&
 		left.obligation === right.obligation &&
 		left.comparison === right.comparison &&
-		left.exclusive === right.exclusive
+		left.exclusive === right.exclusive &&
+		left.stateValue === right.stateValue
 	);
 }
 
@@ -651,6 +657,10 @@ function validateItems(value: unknown, snapshot?: CrystalSnapshot): CrystalItem[
 				const conjunctiveQuote = /\b(?:and|plus|as\s+well\s+as)\b/i.test(item.anchor.quote);
 				const statementSemantics = semanticProfile(item.statement);
 				const quoteSemantics = semanticProfile(anchoredClause(anchorMessage.content, item.anchor.quote));
+				const quoteClauses = item.anchor.quote.split(/(?:[!?。！？;]|\.(?=\s|$)|\n)+\s*/u).filter(Boolean);
+				const mixedClausePolarity =
+					quoteClauses.length > 1 &&
+					new Set(quoteClauses.map(clause => semanticProfile(clause).negative)).size > 1;
 				if (
 					anchorMessage.role !== "user" ||
 					containsNonTextMarker(item.anchor.quote) ||
@@ -664,6 +674,10 @@ function validateItems(value: unknown, snapshot?: CrystalSnapshot): CrystalItem[
 					(conjunctiveQuote && [...quoteTerms].some(term => !statementTerms.has(term))) ||
 					statementQuantitative.size !== quoteQuantitative.size ||
 					[...statementQuantitative].some(term => !quoteQuantitative.has(term)) ||
+					(statementQuantitative.size > 0 &&
+						JSON.stringify(quantitativeEvidenceSequence(item.statement)) !==
+							JSON.stringify(quantitativeEvidenceSequence(item.anchor.quote))) ||
+					mixedClausePolarity ||
 					!preservesEvidenceOrder(item.statement, item.anchor.quote) ||
 					isUnsafeConfirmedStatement(statementSemantics) ||
 					!sameSemanticIntent(statementSemantics, quoteSemantics)
@@ -932,10 +946,12 @@ function isUnsafeResolution(value: string, item: string, conflict: boolean): boo
 		);
 	return (
 		(profile.negative && !standaloneBinary && !statementBoundNegativeDecision) ||
-		/\b(?:different\s+from|other\s+than|not\s+equal\s+to|anything\s+but|except\s+for|less\s+than|greater\s+than|at\s+most|at\s+least|no\s+more\s+than|no\s+less\s+than|under|over|below|above)\b/i.test(
+		/\b(?:different\s+from|other\s+than|not\s+equal\s+to|anything\s+but|except\s+for)\b/i.test(value) ||
+		((/\b(?:less\s+than|greater\s+than|at\s+most|at\s+least|no\s+more\s+than|no\s+less\s+than|under|over|below|above)\b/i.test(
 			value,
 		) ||
-		/(?:<=|>=|<|>)/.test(value) ||
+			/(?:<=|>=|<|>)/.test(value)) &&
+			!/[0-9]/.test(value)) ||
 		profile.interrogative ||
 		profile.conditional ||
 		profile.hedged ||
@@ -968,9 +984,11 @@ function validateResolutionAnchors(
 		const conflict = field === "resolved_conflict_anchors";
 		const itemTerms = topicTerms(item, conflict);
 		const resolutionTerms = evidenceTerms(resolution);
+		const conciseAnswer = /^(?:yes|no|on|off|true|false)[.!]?$/i.test(resolution.trim());
 		const addressesItem =
 			(itemTerms.size > 0 && [...itemTerms].every(term => resolutionTerms.has(term))) ||
-			hasCjkTopicOverlap(item, resolution);
+			hasCjkTopicOverlap(item, resolution) ||
+			(resolutions.length === 1 && conciseAnswer);
 		const concreteAnswer = hasConcreteResolutionValue(resolution, item, conflict);
 		const unsafeResolution =
 			isUnsafeResolution(resolution, item, conflict) ||
@@ -1319,8 +1337,28 @@ export function crystallizeDeepInterview(value: unknown): DeepInterviewCrystal {
 			throw new Error(`changed confirmed item ${item.id} requires fresh user evidence`);
 	}
 	const mergedItems = [...items];
+	const crossIdSupersededIds = new Set(
+		canonicalPriorItems
+			.filter(previous =>
+				items.some(candidate => {
+					if (candidate.id === previous.id || candidate.kind !== previous.kind || !candidate.anchor) return false;
+					const message = snapshot.messages.find(entry => entry.index === candidate.anchor!.message_index);
+					return (
+						candidate.anchor.message_index > priorEnd &&
+						message?.role === "user" &&
+						/\b(?:actually|instead|rather|switch|change|replace)\b/i.test(message.content) &&
+						[...topicTerms(previous.statement, false)].some(term => evidenceTerms(candidate.statement).has(term))
+					);
+				}),
+			)
+			.map(item => item.id),
+	);
 	for (const item of canonicalPriorItems)
-		if (!allRemovedIds.includes(item.id) && !mergedItems.some(candidate => candidate.id === item.id))
+		if (
+			!allRemovedIds.includes(item.id) &&
+			!crossIdSupersededIds.has(item.id) &&
+			!mergedItems.some(candidate => candidate.id === item.id)
+		)
 			mergedItems.push(item);
 	for (const anchor of [...resolvedGapAnchors, ...resolvedConflictAnchors]) {
 		const answerTerms = evidenceTerms(anchor.resolution);
