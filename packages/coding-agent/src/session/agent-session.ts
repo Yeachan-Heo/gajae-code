@@ -3643,6 +3643,7 @@ export class AgentSession {
 		this.#sessionTransitionKind = undefined;
 		this.#sessionTransitionSettlement?.resolve();
 		this.#sessionTransitionSettlement = undefined;
+		this.yieldQueue.rearmIdle();
 		this.#flushOrSchedulePendingBackgroundExchanges();
 	}
 
@@ -4773,7 +4774,7 @@ export class AgentSession {
 		this.#setGuardedAgentTools(this.agent.state.tools);
 		this.#bindWorkflowGateEmitter();
 		this.yieldQueue = new YieldQueue({
-			isStreaming: () => this.isStreaming || this.#handoffTransitionActive,
+			isStreaming: () => this.isStreaming || this.#sessionTransitionKind !== undefined,
 			captureIdentity: () => ({ sessionId: this.sessionId, sessionIdentityEpoch: this.#sessionIdentityEpoch }),
 			isIdentityCurrent: identity => {
 				if (!identity || typeof identity !== "object") return false;
@@ -7317,6 +7318,8 @@ export class AgentSession {
 							// Schedule retry after a short delay
 							const retryToken = ++this.#ttsrRetryToken;
 							const generation = this.#promptGeneration;
+							const retrySessionId = this.sessionId;
+							const retrySessionIdentityEpoch = this.#sessionIdentityEpoch;
 							const targetMessageTimestamp =
 								event.message.role === "assistant" ? event.message.timestamp : undefined;
 							this.#schedulePostPromptTask(
@@ -7331,6 +7334,17 @@ export class AgentSession {
 										return;
 									}
 									if (this.#ttsrRetryToken !== retryToken) {
+										this.#resolveTtsrResume();
+										return;
+									}
+									if (
+										retrySessionId !== this.sessionId ||
+										retrySessionIdentityEpoch !== this.#sessionIdentityEpoch ||
+										this.#sessionTransitionKind !== undefined
+									) {
+										this.#ttsrAbortPending = false;
+										this.#pendingTtsrInjections = [];
+										this.#perToolTtsrInjections.clear();
 										this.#resolveTtsrResume();
 										return;
 									}
@@ -23622,6 +23636,7 @@ export class AgentSession {
 		awaitReply?: boolean;
 		signal?: AbortSignal;
 	}): Promise<{ replyText: string | null }> {
+		const exchangeIdentity = { sessionId: this.sessionId, sessionIdentityEpoch: this.#sessionIdentityEpoch };
 		const awaitReply = args.awaitReply !== false;
 		const incomingTimestamp = Date.now();
 		const incomingObservationId = crypto.randomUUID();
@@ -23650,7 +23665,7 @@ export class AgentSession {
 			args.signal?.throwIfAborted();
 			// Volatile session acceptance happens before any recipient or main-UI
 			// observation, and before this delivery reports success to its sender.
-			this.#queueBackgroundExchangeInjection([incomingRecord]);
+			this.#queueBackgroundExchangeInjection([incomingRecord], { identity: exchangeIdentity });
 			announceIncoming();
 			return { replyText: null };
 		}
@@ -23678,6 +23693,11 @@ export class AgentSession {
 					: undefined,
 				ircRosterClaim: rosterClaim,
 			});
+			if (
+				exchangeIdentity.sessionId !== this.sessionId ||
+				exchangeIdentity.sessionIdentityEpoch !== this.#sessionIdentityEpoch
+			)
+				return { replyText: null };
 			const replyText = dedupeIrcReply(generatedReplyText);
 			const replyObservationId = crypto.randomUUID();
 			const replyRecord: CustomMessage = {
@@ -23692,7 +23712,10 @@ export class AgentSession {
 			// Accept the ordered pair as one volatile batch before committing its
 			// roster claim, notifying either UI, or resolving the sender delivery.
 			args.signal?.throwIfAborted();
-			this.#queueBackgroundExchangeInjection([incomingRecord, replyRecord], { deferFlush: true });
+			this.#queueBackgroundExchangeInjection([incomingRecord, replyRecord], {
+				deferFlush: true,
+				identity: exchangeIdentity,
+			});
 			if (rosterClaim) this.#commitIrcRosterClaim(rosterClaim.token, rosterClaim.epoch);
 			this.#flushOrSchedulePendingBackgroundExchanges();
 			announceIncoming();
@@ -24188,11 +24211,21 @@ export class AgentSession {
 		};
 	}
 
-	#queueBackgroundExchangeInjection(messages: CustomMessage[], options?: { deferFlush?: boolean }): void {
-		this.#pendingBackgroundExchanges.push({
-			messages,
+	#queueBackgroundExchangeInjection(
+		messages: CustomMessage[],
+		options?: {
+			deferFlush?: boolean;
+			identity?: { sessionId: string; sessionIdentityEpoch: number };
+		},
+	): void {
+		const identity = options?.identity ?? {
 			sessionId: this.sessionId,
 			sessionIdentityEpoch: this.#sessionIdentityEpoch,
+		};
+		this.#pendingBackgroundExchanges.push({
+			messages,
+			sessionId: identity.sessionId,
+			sessionIdentityEpoch: identity.sessionIdentityEpoch,
 		});
 		if (!options?.deferFlush) this.#flushOrSchedulePendingBackgroundExchanges();
 	}
