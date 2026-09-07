@@ -3058,6 +3058,11 @@ export class AgentSession {
 		this.#currentSessionIdentityAttemptScopeKeys.add(this.#attemptScopeKey(scope));
 		this.#attemptRecordStore.register(scope);
 		this.#attemptRecordStore.establishClean(scope);
+		if (scope.lineage === "main" && this.#activeLogicalRunId !== undefined) {
+			this.#activeAttemptScope = scope;
+			if (this.#activeSdkRunToken !== undefined)
+				this.#sdkRunTokensByAttemptScope.set(scope, this.#activeSdkRunToken);
+		}
 	}
 	#isRetryScopeClean(scope: AttemptScope | undefined): boolean {
 		return scope !== undefined && this.#attemptRecordStore.isClean(scope);
@@ -3672,8 +3677,23 @@ export class AgentSession {
 
 	#assertTransitionIngressAllowed(): void {
 		if (this.#sessionTransitionKind === undefined) return;
-		if (this.#postCommitTransitionIngress.getStore() === this.#sessionIdentityEpoch) return;
+		const capability = this.#postCommitTransitionIngress.getStore();
+		if (
+			capability?.epoch === this.#sessionIdentityEpoch &&
+			this.#activePostCommitTransitionIngressTokens.has(capability.token)
+		)
+			return;
 		this.#assertNoSessionTransition();
+	}
+
+	async #withPostCommitTransitionIngress<T>(run: () => Promise<T>): Promise<T> {
+		const capability = { epoch: this.#sessionIdentityEpoch, token: Symbol("post-commit-transition-ingress") };
+		this.#activePostCommitTransitionIngressTokens.add(capability.token);
+		try {
+			return await this.#postCommitTransitionIngress.run(capability, run);
+		} finally {
+			this.#activePostCommitTransitionIngressTokens.delete(capability.token);
+		}
 	}
 
 	async #awaitSessionTransitionDisposition(expectedIdentityEpoch: number): Promise<boolean> {
@@ -3693,7 +3713,8 @@ export class AgentSession {
 	 */
 	#sessionTransitionKind: string | undefined;
 	#sessionTransitionSettlement: PromiseWithResolvers<void> | undefined;
-	#postCommitTransitionIngress = new AsyncLocalStorage<number>();
+	#postCommitTransitionIngress = new AsyncLocalStorage<{ epoch: number; token: symbol }>();
+	#activePostCommitTransitionIngressTokens = new Set<symbol>();
 	#coordinatorPersistGeneration = 0;
 	#coordinatorRescopeBarrier: Promise<void> | undefined;
 	#releaseCoordinatorRescopeBarrier: (() => void) | undefined;
@@ -3767,7 +3788,6 @@ export class AgentSession {
 				{ code: "busy" },
 			);
 		}
-		this.#externalIngressSealed = true;
 		this.#sessionTransitionSettlement = Promise.withResolvers<void>();
 		this.#sessionTransitionKind = kind;
 		this.#coordinatorPersistGeneration += 1;
@@ -3884,7 +3904,7 @@ export class AgentSession {
 		},
 	): Promise<T> {
 		const owner = this.#sessionAdmissionContext.getStore();
-		if (kind === "prompt" && this.#sessionTransitionKind !== undefined) this.#assertNoSessionTransition();
+		if (kind === "prompt" && this.#sessionTransitionKind !== undefined) this.#assertTransitionIngressAllowed();
 		if (owner && !owner.released) {
 			if (
 				continuationAdmission?.entry === owner &&
@@ -3938,9 +3958,7 @@ export class AgentSession {
 		// prompt/sendUserMessage/steer/follow-up/triggerTurn all funnel here — without
 		// blocking the handoff's own work or the exempt auto-maintenance owner.
 		if (kind === "prompt" && this.#sessionTransitionKind !== undefined) {
-			throw Object.assign(new AgentBusyError("Cannot start a turn while a session transition is in progress."), {
-				code: "busy",
-			});
+			this.#assertTransitionIngressAllowed();
 		}
 
 		const entry: SessionAdmissionEntry = {
@@ -3981,9 +3999,7 @@ export class AgentSession {
 			// Re-check the handoff fence after activation: a prompt queued before the
 			// transition began must not start once the fence is up.
 			if (kind === "prompt" && this.#sessionTransitionKind !== undefined) {
-				throw Object.assign(new AgentBusyError("Cannot start a turn while a session transition is in progress."), {
-					code: "busy",
-				});
+				this.#assertTransitionIngressAllowed();
 			}
 			if (kind === "prompt") await this.#reconcileTerminalPersistenceFailure();
 
@@ -5061,7 +5077,8 @@ export class AgentSession {
 					logger.warn("Owned streaming follow-up was rejected", { error: String(error) });
 				});
 			},
-			injectIdle: async (messages, signal) => {
+			injectIdle: async (messages, signal, identityIsCurrent = () => true) => {
+				if (messages.length === 0) return;
 				const sdkRunToken = this.#activeSdkRunToken;
 				// Mandated boundary comment (corrected turn semantics): same origin
 				// split as the streaming injector — an allowed owned-completion
@@ -5091,6 +5108,7 @@ export class AgentSession {
 								await awaitPromptInvocationPreflight(this.agent.waitForIdle(), signal);
 								if (settleIfDisposing()) return;
 							}
+							if (!identityIsCurrent()) return;
 							if (survivors.some(message => ownedCompletionResumeAction(message) === "fresh"))
 								this.#resumeFromOwnedCompletion();
 							if (survivors.length === 1) {
@@ -6844,7 +6862,7 @@ export class AgentSession {
 	#externalIngressSealed = false;
 	#terminalPersistenceRecovery:
 		| {
-				message: AssistantMessage;
+				message: Exclude<AgentMessage, { role: "branchSummary" | "compactionSummary" }>;
 				entryId: string | undefined;
 				attemptScopeKey: string | undefined;
 				sessionId: string;
@@ -7422,10 +7440,7 @@ export class AgentSession {
 				try {
 					this.sessionManager.appendMessage(event.message);
 				} catch (error) {
-					if (
-						event.message.role === "assistant" &&
-						!(error instanceof SessionNearLimitAppendError && error.entryRetained)
-					) {
+					if (!(error instanceof SessionNearLimitAppendError)) {
 						Object.defineProperty(event, "terminalPersistenceFailed", { value: true, enumerable: true });
 						this.#terminalPersistenceRecovery ??= {
 							message: event.message,
@@ -7434,11 +7449,11 @@ export class AgentSession {
 							sessionId: this.sessionId,
 							sessionIdentityEpoch: this.#sessionIdentityEpoch,
 						};
-						this.agent.discardRejectedAssistantEvent(event.message);
+						if (event.message.role === "assistant") this.agent.discardRejectedAssistantEvent(event.message);
 						this.agent.abort();
 						this.emitNotice(
 							"error",
-							"Assistant output could not be committed to session history. Reconcile session storage before continuing.",
+							"Agent output could not be committed to session history. Reconcile session storage before continuing.",
 							"session-persistence",
 						);
 						return;
@@ -7483,69 +7498,6 @@ export class AgentSession {
 							this.agent.touchContext();
 						}
 						return;
-					}
-					if (
-						event.message.role !== "toolResult" ||
-						event.message.toolName !== "todo_write" ||
-						!(error instanceof SessionAppendPersistenceError) ||
-						error.phase !== "current_append"
-					) {
-						this.agent.abort();
-						throw error;
-					}
-					this.agent.abort();
-
-					const failure = error.persistenceError.message;
-					const failedEntryId = error.entryId;
-					this.#syncTodoPhasesFromBranch();
-					event.message.isError = true;
-					event.message.content = [
-						{
-							type: "text",
-							text: `Todo state persistence failed: ${failure}\nDo not change the payload solely because of this failure. The durable outcome is unknown; reconcile the session state before retrying or continuing.`,
-						},
-					];
-					event.message.details = {
-						...(event.message.details && typeof event.message.details === "object" ? event.message.details : {}),
-						phases: this.getTodoPhases(),
-						failureKind: "persistence",
-					};
-					this.agent.touchContext();
-					let recovered = false;
-					try {
-						await this.sessionManager.recoverPersistenceFailure();
-						recovered = true;
-					} catch (recoveryError) {
-						logger.warn("Todo persistence recovery failed", {
-							error: recoveryError instanceof Error ? recoveryError.message : String(recoveryError),
-						});
-					}
-					if (recovered) {
-						const durableTodoResult = this.sessionManager
-							.getBranch()
-							.find(
-								entry =>
-									entry.id === failedEntryId &&
-									entry.type === "message" &&
-									entry.message.role === "toolResult" &&
-									entry.message.toolName === "todo_write",
-							);
-						this.#syncTodoPhasesFromBranch();
-						if (durableTodoResult?.type === "message" && durableTodoResult.message.role === "toolResult") {
-							event.message.content = durableTodoResult.message.content;
-							event.message.details = durableTodoResult.message.details;
-							event.message.isError = durableTodoResult.message.isError;
-						} else {
-							event.message.details = {
-								...(event.message.details && typeof event.message.details === "object"
-									? event.message.details
-									: {}),
-								phases: this.getTodoPhases(),
-								failureKind: "persistence",
-							};
-							this.sessionManager.appendMessage(event.message);
-							this.agent.touchContext();
-						}
 					}
 				}
 			}
@@ -13015,15 +12967,16 @@ export class AgentSession {
 				const recoveredEntry = previousEntryId
 					? this.sessionManager.getEntryForFidelity(previousEntryId)
 					: undefined;
-				let canonicalMessage =
-					recoveredEntry?.type === "message" && recoveredEntry.message.role === "assistant"
-						? recoveredEntry.message
-						: undefined;
+				let canonicalMessage = recoveredEntry?.type === "message" ? recoveredEntry.message : undefined;
 				if (!canonicalMessage) {
 					this.sessionManager.appendMessage(recovery.message);
 					canonicalMessage = recovery.message;
 				}
-				if (canonicalMessage !== recovery.message) {
+				if (
+					canonicalMessage !== recovery.message &&
+					canonicalMessage.role === "assistant" &&
+					recovery.message.role === "assistant"
+				) {
 					transferSessionMessageIdentity([canonicalMessage], [recovery.message]);
 				}
 				const liveProjection = this.agent.state.streamMessage;
@@ -15097,6 +15050,7 @@ export class AgentSession {
 			sdkRunCapability?: unknown;
 		},
 	): Promise<void> {
+		this.#assertTransitionIngressAllowed();
 		const sdkRunToken = readSdkRunCapability(options?.sdkRunCapability);
 		const internalOptions = options ? { ...options, ...(sdkRunToken ? { sdkRunToken } : {}) } : undefined;
 		this.#assertRecoveryHydrationPromoted();
@@ -16961,7 +16915,7 @@ export class AgentSession {
 		this.#reconnectToAgent();
 		this.#resetIrcRosterDeliveryState();
 		if (this.#extensionRunner) {
-			await this.#postCommitTransitionIngress.run(this.#sessionIdentityEpoch, async () => {
+			await this.#withPostCommitTransitionIngress(async () => {
 				await this.#extensionRunner?.emit({ type: "session_switch", reason: "new", previousSessionFile });
 			});
 		} else {
@@ -16975,6 +16929,7 @@ export class AgentSession {
 	async clearContext(): Promise<boolean> {
 		this.#beginSessionTransition("clear-context");
 		try {
+			this.#externalIngressSealed = true;
 			const sessionId = this.sessionId;
 			this.#disconnectFromAgent();
 			await this.abort();
@@ -17137,7 +17092,7 @@ export class AgentSession {
 
 			// Emit session_switch event with reason "fork" to hooks
 			if (this.#extensionRunner) {
-				await this.#postCommitTransitionIngress.run(this.#sessionIdentityEpoch, async () => {
+				await this.#withPostCommitTransitionIngress(async () => {
 					await this.#extensionRunner?.emit({ type: "session_switch", reason: "fork", previousSessionFile });
 				});
 			}
@@ -17168,6 +17123,7 @@ export class AgentSession {
 			onMutationStarted?: () => void;
 		},
 	): Promise<void> {
+		this.#assertTransitionIngressAllowed();
 		await this.#reconcileTerminalPersistenceFailure();
 		const previousEditMode = this.#resolveActiveEditMode();
 		const apiKey = await this.#modelRegistry.getApiKey(model, this.credentialSessionId);
@@ -17780,6 +17736,7 @@ export class AgentSession {
 		model: Model | undefined,
 		thinkingLevel: ThinkingLevel | undefined,
 	): Promise<void> {
+		this.#assertTransitionIngressAllowed();
 		await this.#reconcileTerminalPersistenceFailure();
 		if (model) {
 			await this.setModelTemporary(model, thinkingLevel, { cause: "rollback", reason: "other" });
@@ -18352,6 +18309,8 @@ export class AgentSession {
 	 * Set thinking level from a control surface. Global changes commit before affecting live state.
 	 */
 	async setThinkingLevelForControl(level: ThinkingLevel, persist: boolean): Promise<void> {
+		this.#assertTransitionIngressAllowed();
+		if (persist) await this.#reconcileTerminalPersistenceFailure();
 		const previousThinkingLevel = this.thinkingLevel;
 		if (!persist) {
 			this.#applyThinkingLevel(
@@ -18490,6 +18449,8 @@ export class AgentSession {
 	 * Set thinking visibility from a control surface. Global changes commit before affecting live state.
 	 */
 	async setThinkingVisibilityForControl(visibility: "visible" | "hidden", persist: boolean): Promise<void> {
+		this.#assertTransitionIngressAllowed();
+		if (persist) await this.#reconcileTerminalPersistenceFailure();
 		if (!persist) {
 			this.setThinkingVisibility(visibility);
 			return;
@@ -19179,6 +19140,7 @@ export class AgentSession {
 		// (bidirectional mutual exclusion with handoff/new/switch/branch/clear/fork/
 		// navigateTree). Released in the outer finally below.
 		this.#beginSessionTransition("compact");
+		this.#externalIngressSealed = true;
 		const completion = Promise.withResolvers<void>();
 		this.#compactionCompletion = completion.promise;
 		try {
@@ -19490,6 +19452,7 @@ export class AgentSession {
 		// maintenance orchestrator does not hold this lease, so acquiring it here does
 		// not self-deadlock. Released in the outer finally below.
 		this.#beginSessionTransition("handoff");
+		this.#externalIngressSealed = true;
 
 		this.#skipPostTurnMaintenanceAssistantTimestamp = undefined;
 		// Fence background async-job delivery for the whole transition (generation
@@ -19676,7 +19639,7 @@ export class AgentSession {
 				// errors are isolated by ExtensionRunner and must not roll back the
 				// already-committed switch.
 				if (this.#extensionRunner) {
-					await this.#postCommitTransitionIngress.run(this.#sessionIdentityEpoch, async () => {
+					await this.#withPostCommitTransitionIngress(async () => {
 						await this.#extensionRunner?.emit({ type: "session_switch", reason: "new", previousSessionFile });
 					});
 				}
@@ -25458,6 +25421,7 @@ export class AgentSession {
 			}
 			const previousStreamMessage = this.agent.state.streamMessage;
 			const previousProvisionalAssistantMessage = this.#provisionalAssistantMessage;
+			this.#externalIngressSealed = true;
 			await this.abort();
 			if (this.isCompacting) {
 				this.abortCompaction();
@@ -25719,7 +25683,7 @@ export class AgentSession {
 				// messages, model state, MCP selections, the agent subscription, and
 				// session-scoped tool cleanup are complete.
 				if (this.#extensionRunner) {
-					await this.#postCommitTransitionIngress.run(this.#sessionIdentityEpoch, async () => {
+					await this.#withPostCommitTransitionIngress(async () => {
 						await this.#extensionRunner?.emit({
 							type: "session_switch",
 							reason: "resume",
@@ -25953,9 +25917,8 @@ export class AgentSession {
 			// session_branch is the post-commit identity signal. Publish it only after
 			// the successor's messages and MCP selections are restored.
 			if (this.#extensionRunner) {
-				await this.#extensionRunner.emit({
-					type: "session_branch",
-					previousSessionFile,
+				await this.#withPostCommitTransitionIngress(async () => {
+					await this.#extensionRunner?.emit({ type: "session_branch", previousSessionFile });
 				});
 			}
 
