@@ -538,6 +538,55 @@ describe("AuthStorage codex oauth ranking", () => {
 		).resolves.toBe("api-acct-plus");
 	});
 
+	test("reuses cached Sol usage when OAuth resolution leaves the credential unchanged", async () => {
+		if (!authStorage) throw new Error("test setup failed");
+		await authStorage.set("openai-codex", [{ type: "oauth", ...createCredential("acct-plus", "plus@example.com") }]);
+		const report = createCodexUsageReport({
+			accountId: "acct-plus",
+			primary: { usedFraction: 0.1, resetInMs: HOUR_MS },
+			secondary: { usedFraction: 0.1, resetInMs: WEEK_MS },
+		});
+		report.metadata = { ...report.metadata, planType: "plus" };
+		usageByAccount.set("acct-plus", report);
+		// Unchanged authority can reuse ranking's ordinary usage cache.
+		await authStorage.fetchUsageReports({ provider: "openai-codex" });
+		const usageFetch = vi.spyOn(usageProvider, "fetchUsage");
+		await expect(
+			authStorage.getApiKey("openai-codex", "unchanged-sol", {
+				modelId: "gpt-5.6-sol",
+			}),
+		).resolves.toBe("api-acct-plus");
+		expect(usageFetch).not.toHaveBeenCalled();
+	});
+
+	test("refreshes Sol usage after OAuth resolution changes same-account credentials", async () => {
+		if (!authStorage) throw new Error("test setup failed");
+		await authStorage.set("openai-codex", [{ type: "oauth", ...createCredential("acct-plus", "plus@example.com") }]);
+		const report = createCodexUsageReport({
+			accountId: "acct-plus",
+			primary: { usedFraction: 0.1, resetInMs: HOUR_MS },
+			secondary: { usedFraction: 0.1, resetInMs: WEEK_MS },
+		});
+		report.metadata = { ...report.metadata, planType: "plus" };
+		usageByAccount.set("acct-plus", report);
+		await authStorage.fetchUsageReports({ provider: "openai-codex" });
+		const usageFetch = vi.spyOn(usageProvider, "fetchUsage");
+		vi.spyOn(oauthUtils, "getOAuthApiKey").mockImplementation(async (_provider, credentials) => {
+			usageByAccount.set("acct-plus", { ...report, metadata: { ...report.metadata, planType: "free" } });
+			return {
+				newCredentials: { ...credentials["openai-codex"]!, access: "rotated-access" },
+				apiKey: "rotated-access",
+			};
+		});
+		await expect(
+			authStorage.getApiKey("openai-codex", "rotated-sol", {
+				modelId: "gpt-5.6-sol",
+			}),
+		).resolves.toBe("rotated-access");
+		// Changed authority requires fresh usage, not a local entitlement denial.
+		expect(usageFetch).toHaveBeenCalledTimes(1);
+	});
+
 	test.each([
 		"pro",
 		"Pro",
