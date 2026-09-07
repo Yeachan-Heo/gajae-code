@@ -3859,7 +3859,7 @@ export class AgentSession {
 			if (kind === "prompt" && this.#sessionTransitionKind !== undefined) {
 				this.#assertTransitionIngressAllowed();
 			}
-			if (kind === "prompt") await this.#reconcileTerminalPersistenceFailure();
+			await this.#reconcileTerminalPersistenceFailure();
 
 			const release = () => {
 				releaseEntry();
