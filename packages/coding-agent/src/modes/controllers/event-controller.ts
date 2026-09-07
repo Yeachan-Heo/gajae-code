@@ -889,6 +889,10 @@ export class EventController {
 
 	async #handleMessageEnd(event: Extract<AgentSessionEvent, { type: "message_end" }>): Promise<void> {
 		if (event.message.role === "user") return;
+		if (event.message.role === "toolResult" && event.message.toolName === "todo_write") {
+			const details = event.message.details as { phases?: TodoPhase[] } | undefined;
+			if (details?.phases) this.ctx.setTodos(details.phases);
+		}
 		if (event.message.role === "assistant") this.#cancelAssistantTextPresentation();
 		if (event.message.role === "assistant" && event.terminalPersistenceFailed === true) {
 			if (this.ctx.streamingComponent) this.ctx.chatContainer.removeChild(this.ctx.streamingComponent);

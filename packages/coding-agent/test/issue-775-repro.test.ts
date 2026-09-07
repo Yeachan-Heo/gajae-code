@@ -213,7 +213,7 @@ describe("issue #775: per-model defaultLevel", () => {
 			commit.mockRestore();
 		}
 	});
-	it("applies committed thinking effort after a context-only clear", async () => {
+	it("keeps successor thinking effort when a global commit finishes after context clear", async () => {
 		const settings = Settings.isolated({ defaultThinkingLevel: Effort.Low });
 		await createSession(getSonnet(), settings);
 		const commitStarted = Promise.withResolvers<void>();
@@ -230,13 +230,15 @@ describe("issue #775: per-model defaultLevel", () => {
 			await commitStarted.promise;
 			await session.clearContext();
 			expect(session.thinkingLevel).toBe(Effort.Low);
+			const successorHistory = structuredClone(session.sessionManager.getBranch());
 
 			releaseCommit.resolve();
 			await persistentControl;
 
 			expect(settings.getGlobal("defaultThinkingLevel")).toBe(Effort.Medium);
-			expect(session.thinkingLevel).toBe(Effort.Medium);
+			expect(session.thinkingLevel).toBe(Effort.Low);
 			expect(session.getThinkingScopeForControl()).toBe("global config");
+			expect(session.sessionManager.getBranch()).toEqual(successorHistory);
 		} finally {
 			commit.mockRestore();
 		}
@@ -271,7 +273,7 @@ describe("issue #775: per-model defaultLevel", () => {
 			commit.mockRestore();
 		}
 	});
-	it("applies committed thinking visibility across a persistent default-model selection", async () => {
+	it("keeps successor thinking visibility when global commit crosses model selection", async () => {
 		const settings = Settings.isolated({ hideThinkingBlock: false });
 		await createSession(getSonnet(), settings);
 		session.setThinkingVisibility("hidden");
@@ -298,7 +300,46 @@ describe("issue #775: per-model defaultLevel", () => {
 			await persistentControl;
 
 			expect(settings.getGlobal("hideThinkingBlock")).toBe(false);
-			expect(session.getThinkingVisibility()).toBe("visible");
+			expect(session.getThinkingVisibility()).toBe("hidden");
+		} finally {
+			commit.mockRestore();
+		}
+	});
+
+	it("rechecks thinking visibility after queued model-selection admission", async () => {
+		const settings = Settings.isolated({ hideThinkingBlock: false });
+		await createSession(getSonnet(), settings);
+		session.setThinkingVisibility("hidden");
+		const commitStarted = Promise.withResolvers<void>();
+		const releaseCommit = Promise.withResolvers<void>();
+		const selectionReady = Promise.withResolvers<void>();
+		const releaseSelection = Promise.withResolvers<void>();
+		const commitAtomicBatch = settings.commitAtomicBatch.bind(settings);
+		const commit = spyOn(settings, "commitAtomicBatch").mockImplementation(async changes => {
+			commitStarted.resolve();
+			await releaseCommit.promise;
+			return commitAtomicBatch(changes);
+		});
+
+		try {
+			const persistentControl = session.setThinkingVisibilityForControl("visible", true);
+			await commitStarted.promise;
+			const modelSelection = session.setDefaultModelSelection(getOpus(), Effort.High, {
+				onAfterMutationAdmissionReadyForTests: async () => {
+					selectionReady.resolve();
+					await releaseSelection.promise;
+				},
+			});
+			await selectionReady.promise;
+			releaseCommit.resolve();
+			await Bun.sleep(0);
+			releaseSelection.resolve();
+			await modelSelection;
+			await persistentControl;
+
+			expect(settings.getGlobal("hideThinkingBlock")).toBe(false);
+			expect(session.getThinkingVisibility()).toBe("hidden");
+			expect(session.model?.id).toBe(getOpus().id);
 		} finally {
 			commit.mockRestore();
 		}
