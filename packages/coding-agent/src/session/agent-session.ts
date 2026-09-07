@@ -3763,8 +3763,7 @@ export class AgentSession {
 		},
 	): Promise<T> {
 		const owner = this.#sessionAdmissionContext.getStore();
-		const allowCausalSelectionReentry =
-			kind === "selection" && options?.allowPromptContinuationReentry === true && owner?.kind === "prompt";
+		const allowCausalSelectionReentry = kind === "selection" && options?.allowPromptContinuationReentry === true;
 		if (kind === "prompt" && this.#sessionTransitionKind !== undefined) this.#assertTransitionIngressAllowed();
 		if (kind === "selection" && this.#sessionTransitionKind !== undefined) this.#assertNoSessionTransition();
 		if (owner && !owner.released) {
@@ -6624,6 +6623,7 @@ export class AgentSession {
 	// agent_end handler can join the terminal's canonical admission before any
 	// post-turn write reaches the branch.
 	#lastAssistantAdmissionByMessage = new WeakMap<AssistantMessage, CanonicalMessageAdmission | undefined>();
+	#lastAssistantIdentityByMessage = new WeakMap<AssistantMessage, SessionSelectionIdentity>();
 	// Provider context construction must wait for this chain. Agent event listeners
 	// are synchronous dispatch only; their async work cannot otherwise gate the
 	// next tool-result provider request.
@@ -6698,6 +6698,7 @@ export class AgentSession {
 		eventLease?: RunResourceProducerLease,
 	): Promise<void> => {
 		const attemptScope = (event as AgentEvent & { scope?: AttemptScope }).scope;
+		let suppressTodoWriteErrorReminder = false;
 		const eventAdmission = this.#agentEventAdmission.get(event);
 		const eventSessionIdentity = this.#captureSessionSelectionIdentity();
 		const eventIdentityIsCurrent = (): boolean =>
@@ -6970,11 +6971,31 @@ export class AgentSession {
 				await canonicalAdmission.predecessor.promise;
 			}
 			if (!eventIdentityIsCurrent()) return;
+			const admittedTerminalAssistant = this.#lastAssistantMessage;
+			const admittedTerminalIdentity = admittedTerminalAssistant
+				? this.#lastAssistantIdentityByMessage.get(admittedTerminalAssistant)
+				: undefined;
+			const admittedTerminalScope = admittedTerminalAssistant
+				? this.#assistantAttemptScopes.get(admittedTerminalAssistant)?.scope
+				: undefined;
+			const correlatedCanonicalAssistant =
+				unadmittedTerminalAssistant &&
+				admittedTerminalIdentity !== undefined &&
+				this.#isSessionSelectionIdentityCurrent(admittedTerminalIdentity) &&
+				attemptScopeKey !== undefined &&
+				admittedTerminalScope !== undefined &&
+				this.#attemptScopeKey(admittedTerminalScope) === attemptScopeKey &&
+				getSessionMessageEntryId(admittedTerminalAssistant!) !== undefined
+					? admittedTerminalAssistant
+					: undefined;
+			if (correlatedCanonicalAssistant && terminalAssistant) {
+				transferSessionMessageIdentity([correlatedCanonicalAssistant], [terminalAssistant]);
+			}
 			if (this.#terminalPersistenceRecovery) {
 				Object.defineProperty(event, "terminalPersistenceFailed", { value: true, enumerable: true });
 			} else if (
-				!unadmittedTerminalAssistant ||
-				getSessionMessageEntryId(unadmittedTerminalAssistant) === undefined
+				!correlatedCanonicalAssistant &&
+				(!unadmittedTerminalAssistant || getSessionMessageEntryId(unadmittedTerminalAssistant) === undefined)
 			) {
 				const recoveredAssistant: AssistantMessage = structuredClone(
 					unadmittedTerminalAssistant ?? {
@@ -7071,6 +7092,11 @@ export class AgentSession {
 		if (event.type === "message_end" && event.message.role === "assistant") {
 			this.#lastAssistantMessage = event.message;
 			this.#lastAssistantAdmissionByMessage.set(event.message, canonicalAdmission);
+			this.#lastAssistantIdentityByMessage.set(event.message, eventSessionIdentity);
+			this.#assistantAttemptScopes.set(event.message, {
+				scope: attemptScope,
+				wasClean: false,
+			});
 		}
 
 		if (event.type === "message_end") {
@@ -7111,7 +7137,126 @@ export class AgentSession {
 				try {
 					this.sessionManager.appendMessage(event.message);
 				} catch (error) {
-					if (!(error instanceof SessionNearLimitAppendError)) {
+					let handledTodoPersistenceFailure = false;
+					if (
+						event.message.role === "toolResult" &&
+						event.message.toolName === "todo_write" &&
+						error instanceof SessionAppendPersistenceError &&
+						error.phase === "current_append"
+					) {
+						this.agent.abort();
+						const failure = error.persistenceError.message;
+						const failedEntryId = error.entryId;
+						this.#syncTodoPhasesFromBranch();
+						event.message.isError = true;
+						event.message.content = [
+							{
+								type: "text",
+								text: `Todo state persistence failed: ${failure}\nDo not change the payload solely because of this failure. The durable outcome is unknown; reconcile the session state before retrying or continuing.`,
+							},
+						];
+						event.message.details = {
+							...(event.message.details && typeof event.message.details === "object" ? event.message.details : {}),
+							phases: this.getTodoPhases(),
+							failureKind: "persistence",
+						};
+						this.agent.touchContext();
+						let recovered = false;
+						try {
+							await this.sessionManager.recoverPersistenceFailure();
+							recovered = true;
+						} catch (recoveryError) {
+							logger.warn("Todo persistence recovery failed", {
+								error: recoveryError instanceof Error ? recoveryError.message : String(recoveryError),
+							});
+						}
+						if (recovered) {
+							const durableTodoResult = this.sessionManager
+								.getBranch()
+								.find(
+									entry =>
+										entry.id === failedEntryId &&
+										entry.type === "message" &&
+										entry.message.role === "toolResult" &&
+										entry.message.toolName === "todo_write",
+								);
+							this.#syncTodoPhasesFromBranch();
+							if (durableTodoResult?.type === "message" && durableTodoResult.message.role === "toolResult") {
+								event.message.content = durableTodoResult.message.content;
+								event.message.details = durableTodoResult.message.details;
+								event.message.isError = durableTodoResult.message.isError;
+							} else {
+								event.message.details = {
+									...(event.message.details && typeof event.message.details === "object"
+										? event.message.details
+										: {}),
+									phases: this.getTodoPhases(),
+									failureKind: "persistence",
+								};
+								try {
+									this.sessionManager.appendMessage(event.message);
+									this.agent.touchContext();
+								} catch (replacementError) {
+									if (replacementError instanceof SessionNearLimitAppendError) {
+										this.agent.abort();
+										event.message.content = [
+											{
+												type: "text",
+												text: [
+													"Todo state was restored to its prior durable value, but the persistence-error receipt could not be recorded durably.",
+													replacementError.entryRetained
+														? "The receipt remains in live session history and will persist on the next successful write."
+														: "The receipt could not be retained in live session history.",
+													"Continue by compacting the session (`/compact`) or exporting to a fresh session (`gjc export <session-file>`).",
+												].join("\n"),
+											},
+										];
+										event.message.details = {
+											...(event.message.details && typeof event.message.details === "object"
+												? event.message.details
+												: {}),
+											failureKind: "persistence",
+											nearLimitAppend: {
+												code: replacementError.code,
+												entryBytes: replacementError.entryBytes,
+												liveBytes: replacementError.liveBytes,
+												capBytes: replacementError.capBytes,
+												entryRetained: replacementError.entryRetained,
+											},
+										};
+										this.agent.touchContext();
+									} else {
+										Object.defineProperty(event, "terminalPersistenceFailed", {
+											value: true,
+											enumerable: true,
+										});
+										this.#terminalPersistenceRecovery ??= {
+											message: event.message,
+											entryId:
+												replacementError instanceof SessionAppendPersistenceError
+													? replacementError.entryId
+													: undefined,
+											attemptScopeKey,
+											sessionId: this.sessionId,
+											sessionIdentityEpoch: this.#sessionIdentityEpoch,
+										};
+										this.agent.abort();
+										this.emitNotice(
+											"error",
+											"Agent output could not be committed to session history. Reconcile session storage before continuing.",
+											"session-persistence",
+										);
+										return;
+									}
+								}
+							}
+							handledTodoPersistenceFailure = true;
+							suppressTodoWriteErrorReminder = true;
+						}
+					}
+					if (handledTodoPersistenceFailure) {
+						// Continue through normal event publication with the durable converted receipt.
+					} else if (!(error instanceof SessionNearLimitAppendError)) {
 						Object.defineProperty(event, "terminalPersistenceFailed", { value: true, enumerable: true });
 						this.#terminalPersistenceRecovery ??= {
 							message: event.message,
@@ -7524,7 +7669,7 @@ export class AgentSession {
 				if (toolName === "todo_write" && !isError && Array.isArray(details?.phases)) {
 					this.setTodoPhases(details.phases);
 				}
-				if (toolName === "todo_write" && isError) {
+				if (toolName === "todo_write" && isError && !suppressTodoWriteErrorReminder) {
 					const errorText = content?.find(part => part.type === "text")?.text;
 					const payloadRejected =
 						details?.failureKind === "payload_rejected" || details?.failureKind === "argument_validation";
@@ -7655,7 +7800,16 @@ export class AgentSession {
 			const fallbackAssistant = [...event.messages]
 				.reverse()
 				.find((message): message is AssistantMessage => message.role === "assistant");
-			const msg = this.#lastAssistantMessage ?? fallbackAssistant;
+			const capturedLastAssistant = this.#lastAssistantMessage;
+			const capturedLastAssistantIdentity = capturedLastAssistant
+				? this.#lastAssistantIdentityByMessage.get(capturedLastAssistant)
+				: undefined;
+			const msg =
+				capturedLastAssistant &&
+				capturedLastAssistantIdentity !== undefined &&
+				this.#isSessionSelectionIdentityCurrent(capturedLastAssistantIdentity)
+					? capturedLastAssistant
+					: fallbackAssistant;
 			this.#lastAssistantMessage = undefined;
 			// Join the terminal's canonical admission before any post-turn write:
 			// an externally emitted terminal dispatches agent_end while its own
@@ -12629,6 +12783,7 @@ export class AgentSession {
 				this.agent.replaceMessages(this.sessionManager.buildSessionContext().messages, {
 					historyRewrite: { reason: "terminal-persistence-recovery", preserveSeededPrefix: true },
 				});
+				this.#syncTodoPhasesFromBranch();
 				if (recovery.attemptScopeKey !== undefined) {
 					this.#currentSessionIdentityAttemptScopeKeys.delete(recovery.attemptScopeKey);
 					this.#retiredSessionIdentityAttemptScopeKeys.add(recovery.attemptScopeKey);

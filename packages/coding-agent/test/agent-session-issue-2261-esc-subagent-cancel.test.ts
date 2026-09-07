@@ -461,7 +461,6 @@ describe("AgentSession Issue #2261 /new owner-subagent cancellation", () => {
 			});
 		}
 		const finishShutdown = vi.spyOn(ownerManager, "finishOwnerSubagentShutdown");
-		const appendMessage = vi.spyOn(sessionManager, "appendMessage");
 		const notices: string[] = [];
 		session.subscribe(event => {
 			if (event.type === "notice") notices.push(event.message);
@@ -474,13 +473,8 @@ describe("AgentSession Issue #2261 /new owner-subagent cancellation", () => {
 			expect(ownerManager.beginOwnerSubagentShutdown("owner")).toBeUndefined();
 			expect(await pathExists(fallbackRoot)).toBe(true);
 			expect(notices.some(message => message.includes("Successor session is active"))).toBe(true);
-			session.agent.emitExternalEvent({
-				type: "message_end",
-				message: { role: "user", content: "successor remains connected", timestamp: Date.now() },
-			});
-			expect(appendMessage).toHaveBeenCalledWith(
-				expect.objectContaining({ content: "successor remains connected" }),
-			);
+			await session.sendUserMessage("successor remains connected", { deliverAs: "followUp" });
+			expect(session.pendingMessageCounts.followUp).toBe(1);
 		} finally {
 			retryAllowed.resolve();
 		}
