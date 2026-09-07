@@ -2497,6 +2497,8 @@ async function handleHandoffUnlocked(
 			: migrateWorkflowState(existingCaller, caller).state;
 	if (caller === "deep-interview" && callee === "ultragoal" && !isPlainObject(existingCaller.state))
 		throw new StateCommandError(2, "deep-interview execution handoff requires normalized inner state");
+	if (caller === "deep-interview" && !calleeIsWorkflow)
+		throw new StateCommandError(2, "deep-interview handoff requires a canonical GJC workflow skill");
 	if (caller === "deep-interview")
 		await assertDeepInterviewHandoffReady(normalizedCaller, {
 			cwd,
@@ -2665,6 +2667,12 @@ async function handleHandoffUnlocked(
 		}
 	}
 	if (exactRecovery) {
+		const callerIntegrityWarning = await warnAndAuditOutOfBandIfNeeded(cwd, sessionId, callerPath, caller);
+		if (callerIntegrityWarning)
+			throw new StateCommandError(2, `${callerIntegrityWarning}; handoff recovery refuses tampered caller state`);
+		const calleeIntegrityWarning = await warnAndAuditOutOfBandIfNeeded(cwd, sessionId, calleePath, workflowCallee);
+		if (calleeIntegrityWarning)
+			throw new StateCommandError(2, `${calleeIntegrityWarning}; handoff recovery refuses tampered callee state`);
 		const retryAt = typeof existingCaller.handoff_at === "string" ? existingCaller.handoff_at.trim() : undefined;
 		if (!retryAt || !retryMutationId || retryMutationId !== `${caller}:handoff:${callee}:${retryAt}`)
 			throw new StateCommandError(2, "handoff retry lacks durable transition identity");
@@ -2756,6 +2764,12 @@ async function handleHandoffUnlocked(
 	if (pendingCalleeRecovery) {
 		if (calleeRead.kind !== "valid")
 			throw new StateCommandError(2, "handoff recovery cannot proceed without persisted callee state");
+		const callerIntegrityWarning = await warnAndAuditOutOfBandIfNeeded(cwd, sessionId, callerPath, caller);
+		if (callerIntegrityWarning)
+			throw new StateCommandError(2, `${callerIntegrityWarning}; handoff recovery refuses tampered caller state`);
+		const calleeIntegrityWarning = await warnAndAuditOutOfBandIfNeeded(cwd, sessionId, calleePath, workflowCallee);
+		if (calleeIntegrityWarning)
+			throw new StateCommandError(2, `${calleeIntegrityWarning}; handoff recovery refuses tampered callee state`);
 		const recoveryCalleeState = calleeRead.value;
 		const recoveryCallerState: Record<string, unknown> = {
 			...normalizedCaller,
