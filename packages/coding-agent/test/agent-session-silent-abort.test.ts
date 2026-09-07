@@ -14,7 +14,7 @@
  */
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
-import { Agent, type AgentEvent } from "@gajae-code/agent-core";
+import { Agent, type AgentEvent, ThinkingLevel } from "@gajae-code/agent-core";
 import type { AssistantMessage, TextContent } from "@gajae-code/ai";
 import { getBundledModel } from "@gajae-code/ai/models";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
@@ -407,6 +407,11 @@ describe("AgentSession silent-abort marker stamping", () => {
 		expect(session.agent.state.streamMessage).toBeNull();
 		disposeScope();
 		expect(() => session.newSession()).toThrow(expect.objectContaining({ code: "session_persistence_blocked" }));
+		const thinkingLevelBeforeBlockedMutation = session.thinkingLevel;
+		expect(() => session.setThinkingLevel(ThinkingLevel.High, false)).toThrow(
+			expect.objectContaining({ code: "session_persistence_blocked" }),
+		);
+		expect(session.thinkingLevel).toBe(thinkingLevelBeforeBlockedMutation);
 		const recovery = vi
 			.spyOn(session.sessionManager, "recoverPersistenceFailure")
 			.mockRejectedValueOnce(new Error("selection still unreconciled"))

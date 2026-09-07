@@ -17939,7 +17939,7 @@ export class AgentSession {
 	}
 
 	setThinkingLevel(level: ThinkingLevel | undefined, persist: boolean = false): void {
-		if (persist) this.#assertTerminalPersistenceSettledForHistoryMutation();
+		this.#assertTerminalPersistenceSettledForHistoryMutation();
 		this.#applyThinkingLevel(level, persist, false);
 	}
 
@@ -25469,6 +25469,9 @@ export class AgentSession {
 			// work at this boundary; cancelled or failed preparation above preserves it.
 			const queuedSdkWork = this.#queuedMessagesForSessionTransition();
 			this.#terminalizeQueuedSdkWorkForSessionTransition(queuedSdkWork);
+			this.#settleDeliveredOwnedRegistrations(this.#pendingNextTurnMessages.map(entry => entry.message));
+			this.#pendingNextTurnMessages = [];
+			this.#scheduledHiddenNextTurnGeneration = undefined;
 			this.#deferredSdkFollowUps = [];
 			this.agent.clearAllQueues();
 			this.#steeringMessages = [];
