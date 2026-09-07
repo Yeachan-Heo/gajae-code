@@ -361,7 +361,7 @@ function hasLaterSupersedingCorrection(content: string, quote: string, statement
 	if (quoteIndex < 0) return false;
 	const later = content.slice(quoteIndex + quote.length);
 	const following = later.replace(/^\s*[.!?。！？]+\s*/u, "");
-	const followingBoundary = /(?:[!?。！？](?:\s|$)|\.(?=\s+[\p{Lu}"']|$))/u.exec(following);
+	const followingBoundary = /(?:[!?。！？;]|\.(?=\s|$)|\n)/u.exec(following);
 	const followingClause = followingBoundary ? following.slice(0, followingBoundary.index + 1) : following;
 	const topicOverlap = [...topicTerms(statement, false)].some(term => evidenceTerms(followingClause).has(term));
 	const directNegativeReplacement =
