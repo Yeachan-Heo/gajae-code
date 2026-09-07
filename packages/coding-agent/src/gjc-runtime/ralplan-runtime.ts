@@ -2416,7 +2416,7 @@ async function seedRalplanState(
 				updated_at: now,
 				repository_binding: repositoryBinding,
 			};
-			if (existingStateRead.kind === "valid") {
+			if (existingStateRead.kind === "valid" && existingStateRead.value.active === true) {
 				for (const field of ["handoff_from", "handoff_at"] as const) {
 					if (typeof existingStateRead.value[field] === "string") payload[field] = existingStateRead.value[field];
 				}
