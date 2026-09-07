@@ -12899,14 +12899,14 @@ export class AgentSession {
 			resetRetryReplaySafety?: boolean;
 		},
 	): Promise<void> {
-		this.#assertNoSessionTransition();
+		this.#assertTransitionIngressAllowed();
 		await this.#reconcileTerminalPersistenceFailure();
 		if (options?.preflightSignal?.aborted) throw promptPreflightCancelledError();
 		await awaitPromptInvocationPreflight(this.#agentEndPublicationPromise, options?.preflightSignal);
 		// Re-check after the publication await: a handoff can engage during that
 		// window, and #beginInFlight below would otherwise start a turn against the
 		// session being handed off.
-		this.#assertNoSessionTransition();
+		this.#assertTransitionIngressAllowed();
 		const inFlightPrompt = this.#beginInFlight();
 		// Discard hidden next-turn successors queued by a PREVIOUS turn that a
 		// terminal abort closed. This must run BEFORE the admission bump below:
@@ -16322,6 +16322,10 @@ export class AgentSession {
 			}
 			if (this.isStreaming) await this.abort();
 			await this.awaitSessionSettlement();
+			if (this.isCompacting) {
+				this.abortCompaction();
+				while (this.isCompacting) await Bun.sleep(10);
+			}
 			this.#externalIngressSealed = true;
 
 			// Flush current session to ensure all entries are written
@@ -24505,6 +24509,10 @@ export class AgentSession {
 			}
 			if (this.isStreaming) await this.abort();
 			await this.awaitSessionSettlement();
+			if (this.isCompacting) {
+				this.abortCompaction();
+				while (this.isCompacting) await Bun.sleep(10);
+			}
 			this.#externalIngressSealed = true;
 
 			// Flush pending writes before preparing the successor.
@@ -24658,6 +24666,13 @@ export class AgentSession {
 					hookSummary = result.summary;
 					fromExtension = true;
 				}
+			}
+			this.#externalIngressSealed = true;
+			if (this.isStreaming) await this.abort();
+			await this.awaitSessionSettlement();
+			if (this.isCompacting) {
+				this.abortCompaction();
+				while (this.isCompacting) await Bun.sleep(10);
 			}
 
 			// Run default summarizer if needed
