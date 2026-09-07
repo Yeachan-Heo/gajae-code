@@ -28,8 +28,10 @@ import {
 	type StateCommandResult,
 } from "../../src/gjc-runtime/state-runtime";
 import {
+	beginWorkflowTransactionJournal,
 	readWorkflowTransactionJournal,
 	stampWorkflowEnvelopeChecksum,
+	updateWorkflowTransactionJournal,
 	withWorkflowStateLock,
 } from "../../src/gjc-runtime/state-writer";
 import { WORKFLOW_STATE_VERSION } from "../../src/skill-state/workflow-state-contract";
@@ -1149,6 +1151,45 @@ describe("gjc state handoff", () => {
 			const persisted = await readJson(ralplanPath);
 			expect(persisted?.handoff_from).toBe("deep-interview");
 			expect(persisted?.handoff_at).toBe("2026-06-05T00:00:00.000Z");
+		});
+	});
+
+	it("repairs a missing Deep Interview handoff index on exact retry", async () => {
+		await withTempCwd(async cwd => {
+			await writePublishedReadyCrystal(cwd);
+			const first = await runNativeStateCommand(
+				["handoff", "--mode", "deep-interview", "--to", "ralplan", "--json"],
+				cwd,
+			);
+			expect(first.status, first.stderr).toBe(0);
+			const callerPath = modeStatePath(cwd, TEST_SESSION_ID, "deep-interview");
+			const calleePath = modeStatePath(cwd, TEST_SESSION_ID, "ralplan");
+			const activePath = activeSnapshotPath(cwd, TEST_SESSION_ID);
+			const caller = (await readJson(callerPath)) as Record<string, unknown>;
+			const receipt = caller.receipt as Record<string, unknown>;
+			const mutationId = receipt.mutation_id as string;
+			const indexPath = path.join(
+				sessionStateDir(cwd, TEST_SESSION_ID),
+				"deep-interview-handoff-ralplan-audit.json",
+			);
+			await fs.rm(indexPath);
+			await beginWorkflowTransactionJournal({
+				cwd,
+				sessionId: TEST_SESSION_ID,
+				mutationId,
+				caller: "deep-interview",
+				callee: "ralplan",
+				paths: [callerPath, calleePath, activePath],
+			});
+			await updateWorkflowTransactionJournal(cwd, TEST_SESSION_ID, mutationId, {
+				steps: ["callee-mode-state", "caller-mode-state", "active-state"],
+			});
+			const retried = await runNativeStateCommand(
+				["handoff", "--mode", "deep-interview", "--to", "ralplan", "--json"],
+				cwd,
+			);
+			expect(retried.status, retried.stderr).toBe(0);
+			expect(JSON.parse(await fs.readFile(indexPath, "utf8")).mutation_id).toBe(mutationId);
 		});
 	});
 

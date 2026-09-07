@@ -1208,7 +1208,7 @@ describe("deep-interview crystallize contract", () => {
 	it("honors an explicit managed transcript beyond the discovery candidate cap", async () => {
 		const root = await fs.mkdtemp(path.join(process.cwd(), ".tmp-crystallize-explicit-cap-"));
 		const sessionId = "crystallize-explicit-cap";
-		const sessionDir = path.join(root, ".gjc", "sessions");
+		const sessionDir = path.join(root, ".gjc", "agent-session");
 		const sessionFile = path.join(sessionDir, "selected.jsonl");
 		const previousSessionFile = process.env.GJC_SESSION_FILE;
 		try {

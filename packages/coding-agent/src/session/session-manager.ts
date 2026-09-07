@@ -6367,7 +6367,7 @@ class NdjsonFileWriter {
 const PROJECT_SESSION_SCAN_MAX_DIRECTORIES = 4096;
 const PROJECT_SESSION_SCAN_MAX_FILES = 1000;
 
-function isProjectSessionTranscriptPath(projectGjcDir: string, filePath: string): boolean {
+export function isProjectSessionTranscriptPath(projectGjcDir: string, filePath: string): boolean {
 	if (isStagedSessionPath(filePath)) return false;
 	const relative = path.relative(projectGjcDir, filePath);
 	if (relative.startsWith("..") || path.isAbsolute(relative)) return false;
