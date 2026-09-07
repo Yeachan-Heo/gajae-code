@@ -478,6 +478,30 @@ describe("deep-interview crystallize contract", () => {
 			}),
 		);
 		expect(independent.lifecycle).toBe("ready");
+		const independentTemporalSnapshot: CrystalSnapshot = {
+			revision: 1,
+			start: 0,
+			end: 0,
+			messages: [
+				{ index: 0, role: "user", content: "Use PostgreSQL for storage. After deployment, rotate secrets." },
+			],
+			digest: "",
+		};
+		independentTemporalSnapshot.digest = crystalSnapshotDigest(independentTemporalSnapshot);
+		expect(
+			crystallizeDeepInterview(
+				input({
+					snapshot: independentTemporalSnapshot,
+					items: [
+						{
+							...input().items[0]!,
+							statement: "Use PostgreSQL for storage",
+							anchor: { message_index: 0, quote: "Use PostgreSQL for storage." },
+						},
+					],
+				}),
+			).lifecycle,
+		).toBe("ready");
 		const contractedSnapshot: CrystalSnapshot = {
 			revision: 1,
 			start: 0,
@@ -512,6 +536,26 @@ describe("deep-interview crystallize contract", () => {
 			crystallizeDeepInterview(
 				input({
 					snapshot: qualifiedSnapshot,
+					items: [
+						{
+							...input().items[0]!,
+							statement: "Build a fast report",
+							anchor: { message_index: 0, quote: "Build a fast report." },
+						},
+					],
+				}),
+			),
+		).toThrow("verbatim user anchor");
+		const ordinaryIfSnapshot: CrystalSnapshot = {
+			...qualifiedSnapshot,
+			messages: [{ index: 0, role: "user", content: "Build a fast report. If approved." }],
+			digest: "",
+		};
+		ordinaryIfSnapshot.digest = crystalSnapshotDigest(ordinaryIfSnapshot);
+		expect(() =>
+			crystallizeDeepInterview(
+				input({
+					snapshot: ordinaryIfSnapshot,
 					items: [
 						{
 							...input().items[0]!,
