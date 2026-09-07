@@ -2369,7 +2369,7 @@ async function hasSanctionedRalplanFinalAdmission(
 	const admission = isPlainObject(state.auto_handoff) ? state.auto_handoff : undefined;
 	if (!admission) return false;
 	if (
-		(admission.effectiveTarget !== "ultragoal" && admission.effectiveTarget !== "off") ||
+		admission.effectiveTarget !== "ultragoal" ||
 		admission.degradationReason !== null ||
 		typeof admission.source !== "string" ||
 		!admission.source.trim()
