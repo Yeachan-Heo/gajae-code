@@ -386,6 +386,28 @@ describe("deep-interview crystallize contract", () => {
 				}),
 			),
 		).toThrow("verbatim user anchor");
+		const correctedSnapshot: CrystalSnapshot = {
+			revision: 1,
+			start: 0,
+			end: 0,
+			messages: [{ index: 0, role: "user", content: "Build the API in Go. Actually use JS." }],
+			digest: "",
+		};
+		correctedSnapshot.digest = crystalSnapshotDigest(correctedSnapshot);
+		expect(() =>
+			crystallizeDeepInterview(
+				input({
+					snapshot: correctedSnapshot,
+					items: [
+						{
+							...input().items[0]!,
+							statement: "Build the API in Go",
+							anchor: { message_index: 0, quote: "Build the API in Go." },
+						},
+					],
+				}),
+			),
+		).toThrow("verbatim user anchor");
 	});
 	it("requires fresh evidence when inferred material becomes confirmed", () => {
 		const first = crystallizeDeepInterview(
@@ -1198,6 +1220,20 @@ describe("deep-interview crystallize contract", () => {
 			},
 		];
 		expect(() => crystallizeDeepInterview(narrow)).toThrow("fresh statement-bound user removal evidence");
+		const positiveKeepMessage = "Remove the fast constraint. Actually keep the fast constraint.";
+		const positiveKeep = withFreshUserEvidence(
+			input({ prior: first, items: [first.items[0]!], removed_ids: ["constraint:latency"] }),
+			positiveKeepMessage,
+		);
+		positiveKeep.removed_item_anchors = [
+			{
+				item: "constraint:latency",
+				message_index: 1,
+				quote: "Remove the fast constraint.",
+				resolution: "Remove the fast constraint.",
+			},
+		];
+		expect(() => crystallizeDeepInterview(positiveKeep)).toThrow("fresh statement-bound user removal evidence");
 	});
 
 	it("persists resolved removal tombstones and permanently rejects same-ID resurrection", () => {

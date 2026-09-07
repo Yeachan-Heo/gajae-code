@@ -1089,6 +1089,8 @@ describe("gjc state handoff", () => {
 			expect(seed.status, seed.stderr).toBe(0);
 			const runId = parseRequiredJson(seed.stdout, "ralplan seed stdout").run_id;
 			expect(typeof runId).toBe("string");
+			const artifactPath = path.join(cwd, "large-auto-final.md");
+			await fs.writeFile(artifactPath, `# Final\n${"계획".repeat(60_000)}`);
 			const final = await runNativeRalplanCommand(
 				[
 					"--write",
@@ -1097,7 +1099,7 @@ describe("gjc state handoff", () => {
 					"--stage_n",
 					"1",
 					"--artifact",
-					"# Final approved plan",
+					artifactPath,
 					"--run-id",
 					runId as string,
 					"--json",
@@ -1113,7 +1115,7 @@ describe("gjc state handoff", () => {
 		});
 	});
 
-	it("accepts explicit Ralplan execution from an ordinary off receipt with a large final artifact", async () => {
+	it("rejects Ralplan execution from an ordinary off receipt without user approval evidence", async () => {
 		await withTempCwd(async cwd => {
 			await writePublishedReadyCrystal(cwd);
 			expect(
@@ -1134,7 +1136,8 @@ describe("gjc state handoff", () => {
 				["handoff", "--mode", "ralplan", "--to", "ultragoal", "--json"],
 				cwd,
 			);
-			expect(result.status, result.stderr).toBe(0);
+			expect(result.status).toBe(2);
+			expect(result.stderr).toContain("approval lineage");
 		});
 	});
 
