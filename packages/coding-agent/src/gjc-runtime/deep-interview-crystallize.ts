@@ -348,11 +348,13 @@ function hasLaterSupersedingCorrection(content: string, quote: string, statement
 	const later = content.slice(quoteIndex + quote.length);
 	const topicOverlap = [...topicTerms(statement, false)].some(term => evidenceTerms(later).has(term));
 	const directNegativeReplacement =
-		/^\s*[.!?。！？]*\s*(?:no|not)\s*[,;:]?\s*(?:use|make|choose|select|switch|change|replace)\b/i.test(later);
+		/^\s*[.!?。！？]*\s*(?:no|not)\s*[,;:.!?。！？]?\s*(?:use|make|choose|select|switch|change|replace)\b/i.test(
+			later,
+		);
 	const explicitNegativeReplacement =
 		/\b(?:no|not|don't|do\s+not)\b/i.test(later) && (topicOverlap || directNegativeReplacement);
 	const standaloneConditionalQualifier =
-		/^\s*[.!?。！？]*\s*(?:only\s+)?(?:if|unless|until|before|after|once|provided(?:\s+that)?)\b[^,;.!?。！？]*[.!?。！？]?\s*$/i.test(
+		/^\s*[.!?。！？]*\s*(?:only\s+)?(?:if|unless|until|when|assuming|in\s+case|contingent|provided(?:\s+that)?|depending\s+on)\b[^,;.!?。！？]*[.!?。！？]?\s*$/i.test(
 			later,
 		);
 	return (
