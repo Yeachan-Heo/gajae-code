@@ -2096,19 +2096,18 @@ async function hasAuditedDeepInterviewHandoff(
 	cwd: string,
 	sessionId: string,
 	callee: CanonicalGjcWorkflowSkill,
-	options: { handoffAt?: string } = {},
+	options: { handoffAt?: string; indexOnly?: boolean } = {},
 ): Promise<boolean> {
 	const indexedRaw = await readBoundedIdentityText(
 		path.join(sessionStateDir(cwd, sessionId), `deep-interview-handoff-${callee}-audit.json`),
 		64 * 1024,
 		"deep-interview handoff index",
 	);
-	const auditRaw = await readBoundedIdentityText(
-		auditPath(cwd, sessionId),
-		1024 * 1024,
-		"deep-interview handoff audit",
-		{ tail: true },
-	);
+	const auditRaw = options.indexOnly
+		? undefined
+		: await readBoundedIdentityText(auditPath(cwd, sessionId), 1024 * 1024, "deep-interview handoff audit", {
+				tail: true,
+			});
 	const raw = `${indexedRaw ?? ""}${auditRaw ?? ""}`;
 	if (!raw) return false;
 	const sourcePath = path.resolve(modeStateFile(cwd, "deep-interview", sessionId));
@@ -2636,7 +2635,7 @@ async function syncHandoffRetryProjection(options: {
 	});
 }
 
-async function appendHandoffAudit(options: {
+interface HandoffAuditOptions {
 	cwd: string;
 	sessionId: string;
 	caller: CanonicalGjcWorkflowSkill;
@@ -2650,7 +2649,9 @@ async function appendHandoffAudit(options: {
 	callerState: Record<string, unknown>;
 	calleeState: Record<string, unknown>;
 	forced: boolean;
-}): Promise<void> {
+}
+
+function buildHandoffAuditEntry(options: HandoffAuditOptions): AuditEntry & Record<string, unknown> {
 	const callerReceipt = isPlainObject(options.callerState.receipt) ? options.callerState.receipt : undefined;
 	const calleeReceipt = isPlainObject(options.calleeState.receipt) ? options.calleeState.receipt : undefined;
 	const callerRevision = options.callerState.state_revision;
@@ -2666,7 +2667,7 @@ async function appendHandoffAudit(options: {
 		calleeReceipt.mutated_at !== options.handoffAt
 	)
 		throw new StateCommandError(1, "handoff writer did not return matching caller/callee receipts");
-	const entry = {
+	return {
 		ts: options.handoffAt,
 		skill: options.caller,
 		category: "state",
@@ -2686,27 +2687,34 @@ async function appendHandoffAudit(options: {
 		caller_receipt: callerReceipt,
 		callee_receipt: calleeReceipt,
 	} as AuditEntry & Record<string, unknown>;
-	await appendAuditEntry(options.cwd, options.sessionId, entry);
-	if (options.caller === "deep-interview") {
-		await writeArtifact(
-			path.join(
-				sessionStateDir(options.cwd, options.sessionId),
-				`deep-interview-handoff-${options.callee}-audit.json`,
-			),
-			`${JSON.stringify(entry)}\n`,
-			{
-				cwd: options.cwd,
-				audit: {
-					category: "artifact",
-					verb: "write",
-					owner: "gjc-state-cli",
-					skill: "deep-interview",
-					sessionId: options.sessionId,
-					mutationId: options.mutationId,
-				},
+}
+
+async function writeHandoffAuditIndex(
+	options: HandoffAuditOptions,
+	entry: AuditEntry & Record<string, unknown>,
+): Promise<void> {
+	if (options.caller !== "deep-interview") return;
+	await writeArtifact(
+		path.join(sessionStateDir(options.cwd, options.sessionId), `deep-interview-handoff-${options.callee}-audit.json`),
+		`${JSON.stringify(entry)}\n`,
+		{
+			cwd: options.cwd,
+			audit: {
+				category: "artifact",
+				verb: "write",
+				owner: "gjc-state-cli",
+				skill: "deep-interview",
+				sessionId: options.sessionId,
+				mutationId: options.mutationId,
 			},
-		);
-	}
+		},
+	);
+}
+
+async function appendHandoffAudit(options: HandoffAuditOptions): Promise<void> {
+	const entry = buildHandoffAuditEntry(options);
+	await appendAuditEntry(options.cwd, options.sessionId, entry);
+	await writeHandoffAuditIndex(options, entry);
 }
 
 /**
@@ -3029,13 +3037,8 @@ async function handleHandoffUnlocked(
 			steps.add("caller-mode-state");
 			steps.add("active-state");
 			await updateWorkflowTransactionJournal(cwd, sessionId, retryMutationId, { steps: [...steps] });
-			if (
-				caller === "deep-interview" &&
-				!(await hasAuditedDeepInterviewHandoff(cwd, sessionId, workflowCallee, {
-					handoffAt: retryAt,
-				}))
-			)
-				await appendHandoffAudit({
+			if (caller === "deep-interview") {
+				const auditOptions: HandoffAuditOptions = {
 					cwd,
 					sessionId,
 					caller,
@@ -3049,7 +3052,21 @@ async function handleHandoffUnlocked(
 					callerState: existingCaller,
 					calleeState: retryCalleeState,
 					forced: callerReceiptForRetry?.forced === true,
+				};
+				const audited = await hasAuditedDeepInterviewHandoff(cwd, sessionId, workflowCallee, {
+					handoffAt: retryAt,
 				});
+				if (!audited) {
+					await appendHandoffAudit(auditOptions);
+				} else if (
+					!(await hasAuditedDeepInterviewHandoff(cwd, sessionId, workflowCallee, {
+						handoffAt: retryAt,
+						indexOnly: true,
+					}))
+				) {
+					await writeHandoffAuditIndex(auditOptions, buildHandoffAuditEntry(auditOptions));
+				}
+			}
 			await completeWorkflowTransactionJournal(cwd, sessionId, retryMutationId);
 		}
 		await touchStateActivityMarker(cwd, sessionId, callerPath);
