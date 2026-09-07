@@ -3541,6 +3541,16 @@ export class AgentSession {
 		}
 	}
 
+	async #withActiveCompactionHook<T>(run: () => Promise<T>): Promise<T> {
+		const hookToken = Symbol("compaction-hook");
+		this.#activeCompactionHookTokens.add(hookToken);
+		try {
+			return await this.#compactionHookContext.run(hookToken, run);
+		} finally {
+			this.#activeCompactionHookTokens.delete(hookToken);
+		}
+	}
+
 	async #awaitSessionTransitionDisposition(expectedIdentityEpoch: number): Promise<boolean> {
 		const settlement = this.#sessionTransitionSettlement;
 		if (settlement) await settlement.promise;
@@ -15247,19 +15257,13 @@ export class AgentSession {
 
 		if (this.#extensionRunner && savedCompactionEntry) {
 			if (identityIsCurrent?.() === false) return undefined;
-			const hookToken = Symbol("compaction-hook");
-			this.#activeCompactionHookTokens.add(hookToken);
-			try {
-				await this.#compactionHookContext.run(hookToken, async () => {
-					await this.#extensionRunner?.emit({
-						type: "session_compact",
-						compactionEntry: savedCompactionEntry,
-						fromExtension: fromExtension ?? false,
-					});
+			await this.#withActiveCompactionHook(async () => {
+				await this.#extensionRunner?.emit({
+					type: "session_compact",
+					compactionEntry: savedCompactionEntry,
+					fromExtension: fromExtension ?? false,
 				});
-			} finally {
-				this.#activeCompactionHookTokens.delete(hookToken);
-			}
+			});
 		}
 
 		return savedCompactionEntry;
@@ -20604,11 +20608,13 @@ export class AgentSession {
 
 		if (!hookCompaction && this.#extensionRunner?.hasHandlers("session.compacting")) {
 			const compactMessages = preparation.messagesToSummarize.concat(preparation.turnPrefixMessages);
-			const result = (await this.#extensionRunner.emit({
-				type: "session.compacting",
-				sessionId: this.sessionId,
-				messages: compactMessages,
-			})) as { context?: string[]; prompt?: string; preserveData?: Record<string, unknown> } | undefined;
+			const result = (await this.#withActiveCompactionHook(() =>
+				this.#extensionRunner!.emit({
+					type: "session.compacting",
+					sessionId: this.sessionId,
+					messages: compactMessages,
+				}),
+			)) as { context?: string[]; prompt?: string; preserveData?: Record<string, unknown> } | undefined;
 			assertCurrent();
 
 			hookContext = result?.context;
@@ -20939,13 +20945,15 @@ export class AgentSession {
 			let preserveData: Record<string, unknown> | undefined;
 
 			if (this.#extensionRunner?.hasHandlers("session_before_compact")) {
-				const hookResult = (await this.#extensionRunner.emit({
-					type: "session_before_compact",
-					preparation,
-					branchEntries: pathEntries,
-					customInstructions: undefined,
-					signal: autoCompactionSignal,
-				})) as SessionBeforeCompactResult | undefined;
+				const hookResult = (await this.#withActiveCompactionHook(() =>
+					this.#extensionRunner!.emit({
+						type: "session_before_compact",
+						preparation,
+						branchEntries: pathEntries,
+						customInstructions: undefined,
+						signal: autoCompactionSignal,
+					}),
+				)) as SessionBeforeCompactResult | undefined;
 				if (autoCompactionSignal.aborted || !compactionIdentityIsCurrent()) return await emitAborted();
 
 				if (hookResult?.cancel) {
