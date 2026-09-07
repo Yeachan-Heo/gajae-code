@@ -345,7 +345,7 @@ function anchoredClause(content: string, quote: string): string {
 function hasVerbatimTokenBoundaries(content: string, quote: string): boolean {
 	const quoteIndex = content.indexOf(quote);
 	if (quoteIndex < 0) return false;
-	const word = /[\p{L}\p{N}_]/u;
+	const word = /[\p{L}\p{M}\p{N}_]/u;
 	const first = [...quote][0];
 	const last = [...quote].at(-1);
 	const before = quoteIndex > 0 ? content.slice(0, quoteIndex).match(/.$/u)?.[0] : undefined;
@@ -367,8 +367,17 @@ function hasLaterSupersedingCorrection(content: string, quote: string, statement
 		);
 	const explicitNegativeReplacement =
 		/\b(?:no|not|don['’]t|do\s+not)\b/i.test(later) && (topicOverlap || directNegativeReplacement);
+	const positiveReplacementMatch =
+		/^\s*[.!?。！？]*\s*(?:(?:switch|change)\s+to\s+([A-Za-z0-9+#.-]+)(?:[.!?。！？]|$)|replace\b[^.!?。！？]*\bwith\s+([A-Za-z0-9+#.-]+)(?:[.!?。！？]|$))/i.exec(
+			later,
+		);
 	const directPositiveReplacement =
-		/^\s*[.!?。！？]*\s*(?:(?:switch|change)\s+to\b|replace\b[^.!?。！？]*\bwith\b)/i.test(later);
+		positiveReplacementMatch !== null &&
+		(topicOverlap ||
+			[positiveReplacementMatch[1], positiveReplacementMatch[2]].some(
+				term =>
+					term !== undefined && (isShortTechnicalIdentifier(term) || /(?:[a-z][A-Z]|[A-Z].*[A-Z])/.test(term)),
+			));
 	const standaloneConditionalQualifier =
 		/^\s*[.!?。！？]*\s*(?:only\s+)?(?:if|unless|until|when|assuming|in\s+case|contingent|provided(?:\s+that)?|depending\s+on)\b[^,;.!?。！？]*[.!?。！？]?\s*$/i.test(
 			later,
@@ -403,7 +412,7 @@ function semanticProfile(value: string): CrystalSemanticProfile {
 	)
 		obligationTerms.add("permissive");
 	const negative =
-		/\b(?:no|not|never|neither|without|cannot|can't|won't|don't|doesn't|isn't|aren't|wasn't|weren't|shouldn't|mustn't|needn't|avoid|prohibit(?:s|ed)?|forbid(?:s|den)?|ban(?:s|ned)?)\b/i.test(
+		/\b(?:no|not|never|neither|without|cannot|can't|won't|don['’]t|doesn't|isn't|aren't|wasn't|weren't|shouldn't|mustn't|needn't|avoid|prohibit(?:s|ed)?|forbid(?:s|den)?|ban(?:s|ned)?)\b/i.test(
 			normalized,
 		) ||
 		/(?:안|않|못|없|아니|하지\s*마|마세요|말자|금지|禁止|ない|ません|ぬ|ず|たくない|不|無|无|没|沒|未|否|勿|毋|别|別|莫)/u.test(
@@ -946,6 +955,7 @@ function validateRemovalAnchors(
 						clause,
 					);
 				if (!directive) return false;
+				if (/\b(?:it|this|that|them|these|those)\b/i.test(clause)) return true;
 				const clauseTerms = evidenceTerms(clause);
 				return (
 					[...statementTerms].some(term => clauseTerms.has(term)) || hasCjkTopicOverlap(previous.statement, clause)
