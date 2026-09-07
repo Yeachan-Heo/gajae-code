@@ -242,6 +242,27 @@ describe("AgentSession silent-abort marker stamping", () => {
 		disposeScope();
 	});
 
+	it("retains a provisional assistant reused by the orphan terminal", async () => {
+		fixture = await createSessionWithObfuscator();
+		const { session } = fixture;
+		const { scope, dispose: disposeScope } = session.agent.mintSideAttemptScope();
+		const provisional = makeStoppedAssistantMessage("same object orphan");
+		session.agent.emitExternalEvent({ type: "message_start", message: provisional, scope });
+		const terminal: Extract<AgentEvent, { type: "agent_end" }> = {
+			type: "agent_end",
+			messages: [provisional],
+			stopReason: "cancelled",
+			scope,
+		};
+
+		session.agent.emitExternalEvent(terminal);
+		await session.awaitSessionSettlement();
+
+		expect(session.agent.state.messages.filter(message => message === provisional)).toHaveLength(1);
+		expect(getSessionMessageEntryId(provisional)).toBeDefined();
+		disposeScope();
+	});
+
 	it("canonically admits an authoritative external terminal without message_end", async () => {
 		fixture = await createSessionWithObfuscator();
 		const { session } = fixture;
