@@ -3489,57 +3489,25 @@ function buildExecutionApprovalAuditEntry(
 }
 
 async function approvalAuditContainsMutation(filePath: string, mutationId: string): Promise<boolean> {
-	let handle: fs.FileHandle | undefined;
-	try {
-		handle = await fs.open(filePath, "r");
-		const buffer = Buffer.alloc(64 * 1024);
-		const decoder = new TextDecoder("utf-8", { fatal: true });
-		let position = 0;
-		let carry = "";
-		let skippingOversizedLine = false;
-		const matches = (line: string): boolean => {
-			if (!line.includes(mutationId) || !line.includes('"approve-execution"')) return false;
-			try {
-				const parsed: unknown = JSON.parse(line);
-				return (
-					isPlainObject(parsed) &&
-					parsed.skill === "deep-interview" &&
-					parsed.category === "state" &&
-					parsed.verb === "approve-execution" &&
-					parsed.mutation_id === mutationId &&
-					typeof parsed.approved_at === "string" &&
-					Number.isSafeInteger(parsed.receipt_state_revision)
-				);
-			} catch {
-				return false;
-			}
-		};
-		while (true) {
-			const { bytesRead } = await handle.read(buffer, 0, buffer.length, position);
-			if (bytesRead === 0) break;
-			position += bytesRead;
-			carry += decoder.decode(buffer.subarray(0, bytesRead), { stream: true });
-			let newline = carry.indexOf("\n");
-			while (newline >= 0) {
-				const line = carry.slice(0, newline);
-				carry = carry.slice(newline + 1);
-				if (!skippingOversizedLine && matches(line)) return true;
-				skippingOversizedLine = false;
-				newline = carry.indexOf("\n");
-			}
-			if (carry.length > 128 * 1024) {
-				carry = "";
-				skippingOversizedLine = true;
-			}
+	const raw = await readBoundedIdentityText(filePath, 8 * 1024 * 1024, "execution approval recovery audit");
+	if (!raw) return false;
+	return raw.split(/\r?\n/).some(line => {
+		if (!line.includes(mutationId) || !line.includes('"approve-execution"')) return false;
+		try {
+			const parsed: unknown = JSON.parse(line);
+			return (
+				isPlainObject(parsed) &&
+				parsed.skill === "deep-interview" &&
+				parsed.category === "state" &&
+				parsed.verb === "approve-execution" &&
+				parsed.mutation_id === mutationId &&
+				typeof parsed.approved_at === "string" &&
+				Number.isSafeInteger(parsed.receipt_state_revision)
+			);
+		} catch {
+			return false;
 		}
-		carry += decoder.decode();
-		return !skippingOversizedLine && carry.length <= 128 * 1024 && matches(carry);
-	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
-		throw error;
-	} finally {
-		await handle?.close().catch(() => undefined);
-	}
+	});
 }
 
 async function appendExecutionApprovalAuditIdempotent(
