@@ -13,6 +13,7 @@ import {
 	createDeepInterviewIntentManifest,
 	reviewDeepInterviewIntent,
 } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-state";
+import { runNativeRalplanCommand } from "@gajae-code/coding-agent/gjc-runtime/ralplan-runtime";
 import {
 	activeSnapshotPath,
 	auditPath,
@@ -1080,42 +1081,81 @@ describe("gjc state handoff", () => {
 				(await runNativeStateCommand(["handoff", "--mode", "deep-interview", "--to", "ralplan", "--json"], cwd))
 					.status,
 			).toBe(0);
-			const ralplanPath = modeStatePath(cwd, TEST_SESSION_ID, "ralplan");
-			const ralplan = (await readJson(ralplanPath)) as Record<string, unknown>;
-			const admittedAt = "2026-06-04T00:00:00.000Z";
-			const admitted = stampWorkflowEnvelopeChecksum(
-				{
-					...ralplan,
-					active: true,
-					current_phase: "handoff",
-					auto_handoff: {
-						configuredTarget: "ultragoal",
-						effectiveTarget: "ultragoal",
-						degradationReason: null,
-						source: "project",
-					},
-					receipt: {
-						version: 1,
-						skill: "ralplan",
-						owner: "gjc-runtime",
-						command: "gjc ralplan final-admission",
-						state_path: ralplanPath,
-						storage_path: ralplanPath,
-						mutated_at: admittedAt,
-						fresh_until: admittedAt,
-						status: "fresh",
-						mutation_id: `ralplan:final-admission:${admittedAt}`,
-					},
-				},
-				ralplanPath,
-				admittedAt,
+			await fs.writeFile(path.join(cwd, ".gjc", "config.yml"), "gjc:\n  ralplan:\n    autoHandoff: ultragoal\n");
+			const seed = await runNativeRalplanCommand(["--json", "refine the crystallized specification"], cwd);
+			expect(seed.status, seed.stderr).toBe(0);
+			const runId = parseRequiredJson(seed.stdout, "ralplan seed stdout").run_id;
+			expect(typeof runId).toBe("string");
+			const final = await runNativeRalplanCommand(
+				[
+					"--write",
+					"--stage",
+					"final",
+					"--stage_n",
+					"1",
+					"--artifact",
+					"# Final approved plan",
+					"--run-id",
+					runId as string,
+					"--json",
+				],
+				cwd,
 			);
-			await writeJson(ralplanPath, admitted);
+			expect(final.status, final.stderr).toBe(0);
 			const result = await runNativeStateCommand(
 				["handoff", "--mode", "ralplan", "--to", "ultragoal", "--json"],
 				cwd,
 			);
 			expect(result.status, result.stderr).toBe(0);
+		});
+	});
+
+	it("rejects a restamped Ralplan final admission without its final ledger artifact", async () => {
+		await withTempCwd(async cwd => {
+			await writePublishedReadyCrystal(cwd);
+			expect(
+				(await runNativeStateCommand(["handoff", "--mode", "deep-interview", "--to", "ralplan", "--json"], cwd))
+					.status,
+			).toBe(0);
+			const ralplanPath = modeStatePath(cwd, TEST_SESSION_ID, "ralplan");
+			const ralplan = (await readJson(ralplanPath)) as Record<string, unknown>;
+			const admittedAt = "2026-06-04T00:00:00.000Z";
+			await writeJson(
+				ralplanPath,
+				stampWorkflowEnvelopeChecksum(
+					{
+						...ralplan,
+						run_id: "forged-run",
+						current_phase: "handoff",
+						auto_handoff: {
+							configuredTarget: "ultragoal",
+							effectiveTarget: "ultragoal",
+							degradationReason: null,
+							source: "project",
+						},
+						receipt: {
+							version: 1,
+							skill: "ralplan",
+							owner: "gjc-runtime",
+							command: "gjc ralplan final-admission",
+							state_path: ralplanPath,
+							storage_path: ralplanPath,
+							mutated_at: admittedAt,
+							fresh_until: admittedAt,
+							status: "fresh",
+							mutation_id: `ralplan:final-admission:${admittedAt}`,
+						},
+					},
+					ralplanPath,
+					admittedAt,
+				),
+			);
+			const result = await runNativeStateCommand(
+				["handoff", "--mode", "ralplan", "--to", "ultragoal", "--json"],
+				cwd,
+			);
+			expect(result.status).toBe(2);
+			expect(result.stderr).toContain("cannot authenticate Deep Interview approval lineage");
 		});
 	});
 
