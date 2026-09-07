@@ -147,7 +147,7 @@
   disposal cancellation, and custom-editor configuration while preserving
   synchronous TUI rendering; project-scoped settings cannot trigger execution.
 
-- Business/Enterprise/Team and Plus ChatGPT accounts can bind GPT-5.6 Sol again. The Codex entitlement preflight treated only `plan_type` values containing `"pro"` as eligible, so Business/Enterprise/Team accounts were rejected despite backend access and Plus was treated as authoritatively denied despite variable live access. Exact Pro/Business/Enterprise/Team tiers are recognized as entitled, every confirmed Free candidate is excluded from Sol dispatch and an all-Free pool fails locally, and Plus or unfamiliar plan names are deferred to the provider rather than guessed locally.
+- Business/Enterprise/Team ChatGPT accounts can bind GPT-5.6 Sol again. The Codex entitlement preflight treated only `plan_type` values containing `"pro"` as eligible, so an `openai-codex` OAuth account on a Business/Enterprise/Team plan was rejected at model-binding/subagent setup time with a spurious entitlement error even though the backend accepts the request. Exact Pro/Business/Enterprise/Team tiers are now recognized as entitled, Plus/Free remain rejected, and unfamiliar plan names are deferred to the provider rather than guessed locally.
 
 ## [0.16.3] - 2026-09-04
 
