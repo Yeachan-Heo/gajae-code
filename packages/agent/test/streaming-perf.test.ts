@@ -40,6 +40,8 @@ class CountingSignal extends EventTarget {
 for (const abort of [false, true]) {
 	it(`keeps one stream abort listener across 4096 reads (abort=${abort})`, async () => {
 		const signal = new CountingSignal();
+		let pendingAbortReactions = 0;
+		let maxPendingAbortReactions = 0;
 		const mock = createMockModel();
 		const message = createAssistantMessage([{ type: "text", text: "answer" }]);
 		let reads = 0;
@@ -75,6 +77,10 @@ for (const abort of [false, true]) {
 			{
 				model: mock.model,
 				convertToLlm: messages => messages as Message[],
+				onAbortRaceReactionChange: delta => {
+					pendingAbortReactions += delta;
+					maxPendingAbortReactions = Math.max(maxPendingAbortReactions, pendingAbortReactions);
+				},
 			},
 			signal as AbortSignal,
 			() => response,
@@ -88,8 +94,43 @@ for (const abort of [false, true]) {
 		expect(aborted).toBe(abort);
 		expect(signal.listeners.size).toBe(0);
 		expect(closes).toBe(abort ? 1 : 0);
+		expect(maxPendingAbortReactions).toBe(1);
+		expect(pendingAbortReactions).toBe(0);
 	});
 }
+
+it("cleans the pending abort race when the provider rejects", async () => {
+	const signal = new CountingSignal();
+	const mock = createMockModel();
+	const failure = new Error("provider failed");
+	let pendingAbortReactions = 0;
+	let maxPendingAbortReactions = 0;
+	const response = new AssistantMessageEventStream();
+	response.fail(failure);
+	const events = agentLoop(
+		[createUserMessage("hello")],
+		{ systemPrompt: [], messages: [], tools: [] },
+		{
+			model: mock.model,
+			convertToLlm: messages => messages as Message[],
+			onAbortRaceReactionChange: delta => {
+				pendingAbortReactions += delta;
+				maxPendingAbortReactions = Math.max(maxPendingAbortReactions, pendingAbortReactions);
+			},
+		},
+		signal as AbortSignal,
+		() => response,
+	);
+	await expect(
+		(async () => {
+			for await (const _event of events) {
+				// Drain the provider failure path.
+			}
+		})(),
+	).rejects.toBe(failure);
+	expect(maxPendingAbortReactions).toBe(1);
+	expect(pendingAbortReactions).toBe(0);
+});
 
 it("appends new history and replaces same-length in-place edits", () => {
 	const manager = new AppendOnlyContextManager();
