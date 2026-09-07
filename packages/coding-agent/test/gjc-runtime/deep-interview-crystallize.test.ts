@@ -502,6 +502,28 @@ describe("deep-interview crystallize contract", () => {
 				}),
 			).lifecycle,
 		).toBe("ready");
+		const unrelatedReplacementSnapshot: CrystalSnapshot = {
+			revision: 1,
+			start: 0,
+			end: 0,
+			messages: [{ index: 0, role: "user", content: "Use PostgreSQL for storage. Switch to dark mode." }],
+			digest: "",
+		};
+		unrelatedReplacementSnapshot.digest = crystalSnapshotDigest(unrelatedReplacementSnapshot);
+		expect(
+			crystallizeDeepInterview(
+				input({
+					snapshot: unrelatedReplacementSnapshot,
+					items: [
+						{
+							...input().items[0]!,
+							statement: "Use PostgreSQL for storage",
+							anchor: { message_index: 0, quote: "Use PostgreSQL for storage." },
+						},
+					],
+				}),
+			).lifecycle,
+		).toBe("ready");
 		const contractedSnapshot: CrystalSnapshot = {
 			revision: 1,
 			start: 0,
@@ -618,6 +640,8 @@ describe("deep-interview crystallize contract", () => {
 			["Use JavaScript", "Java", "Use Java"],
 			["Use Go. Switch to JS.", "Use Go.", "Use Go"],
 			["Use Go. Don’t use Go; use JS.", "Use Go.", "Use Go"],
+			["Don’t deploy to production.", "Don’t deploy to production.", "Deploy to production"],
+			["Use اّdatabase for storage", "database for storage", "Use database for storage"],
 		] as const) {
 			const snapshot: CrystalSnapshot = {
 				revision: 1,
@@ -1413,6 +1437,19 @@ describe("deep-interview crystallize contract", () => {
 			},
 		];
 		expect(crystallizeDeepInterview(mixed).removed_ids).toContain("constraint:latency");
+		const anaphoric = withFreshUserEvidence(
+			input({ prior: first, items: [first.items[0]!], removed_ids: ["constraint:latency"] }),
+			"Remove the fast constraint. Keep it.",
+		);
+		anaphoric.removed_item_anchors = [
+			{
+				item: "constraint:latency",
+				message_index: 1,
+				quote: "Remove the fast constraint.",
+				resolution: "Remove the fast constraint.",
+			},
+		];
+		expect(() => crystallizeDeepInterview(anaphoric)).toThrow("statement-bound user removal evidence");
 	});
 
 	it("persists an unauthenticated removal intent instead of becoming ready later", () => {
