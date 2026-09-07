@@ -7692,13 +7692,21 @@ export class AgentSession {
 									const injection = this.#getTtsrInjectionContent();
 									if (injection) {
 										const details = { rules: injection.rules.map(rule => rule.name) };
-										this.sessionManager.appendCustomMessageEntry(
-											"ttsr-injection",
-											injection.content,
-											false,
-											details,
-											"agent",
-										);
+										try {
+											this.sessionManager.appendCustomMessageEntry(
+												"ttsr-injection",
+												injection.content,
+												false,
+												details,
+												"agent",
+											);
+										} catch {
+											this.#ttsrAbortPending = false;
+											this.#pendingTtsrInjections = [];
+											this.#perToolTtsrInjections.clear();
+											this.#resolveTtsrResume();
+											return;
+										}
 										this.agent.appendMessage({
 											role: "custom",
 											customType: "ttsr-injection",
@@ -13003,6 +13011,16 @@ export class AgentSession {
 					this.#retiredSessionIdentityAttemptScopeKeys.add(recovery.attemptScopeKey);
 				}
 				this.#terminalPersistenceRecovery = undefined;
+				queueMicrotask(() => {
+					try {
+						this.#flushPendingBashMessages();
+						this.#flushPendingPythonMessages();
+					} catch (error) {
+						logger.warn("Deferred execution receipt flush failed after persistence recovery", {
+							error: error instanceof Error ? error.message : String(error),
+						});
+					}
+				});
 				this.#flushOrSchedulePendingBackgroundExchanges();
 				this.emitNotice(
 					"info",
@@ -24640,6 +24658,7 @@ export class AgentSession {
 		kind: "bash" | "python",
 	): void {
 		if (pendingMessages.length === 0) return;
+		if (this.#terminalPersistenceRecovery) return;
 
 		const total = pendingMessages.length;
 		const remaining: typeof pendingMessages = [];
@@ -25452,8 +25471,6 @@ export class AgentSession {
 				ownerShutdownManager = asyncManager;
 				ownerShutdownLease = lease;
 			}
-			const previousStreamMessage = this.agent.state.streamMessage;
-			const previousProvisionalAssistantMessage = this.#provisionalAssistantMessage;
 			this.#externalIngressSealed = true;
 			await this.abort();
 			if (this.isCompacting) {
@@ -25739,8 +25756,8 @@ export class AgentSession {
 				for (const key of previousCurrentAttemptScopeKeys) this.#currentSessionIdentityAttemptScopeKeys.add(key);
 				this.#retiredSessionIdentityAttemptScopeKeys.clear();
 				for (const key of previousRetiredAttemptScopeKeys) this.#retiredSessionIdentityAttemptScopeKeys.add(key);
-				this.agent.restoreStreamMessageForSessionRollback(previousStreamMessage);
-				this.#provisionalAssistantMessage = previousProvisionalAssistantMessage;
+				this.agent.restoreStreamMessageForSessionRollback(null);
+				this.#provisionalAssistantMessage = undefined;
 				// The switch never committed: rotate the manager's endpoint
 				// registration back to the predecessor before restoring it
 				// (review thread P1 — the map key must track the session id).
