@@ -130,6 +130,28 @@ class StubExtensionWrappedAskTool {
 	}
 }
 
+class PrivateMetadataAskTool {
+	#name = "ask";
+	#description = "Ask the user a question";
+
+	label = "Ask";
+	summary = "Ask";
+	parameters = {} as never;
+	strict = true;
+
+	get name(): string {
+		return this.#name;
+	}
+
+	get description(): string {
+		return this.#description;
+	}
+
+	async execute(): Promise<{ content: { type: "text"; text: string }[]; details: object }> {
+		return { content: [{ type: "text", text: "asked" }], details: {} };
+	}
+}
+
 describe("ultragoal ask guard", () => {
 	it("allows ask when durable ultragoal state is absent without requiring ambient GJC_SESSION_ID", async () => {
 		const cwd = await tempDir();
@@ -184,6 +206,16 @@ describe("ultragoal ask guard", () => {
 
 		expect(result.content[0]).toMatchObject({ type: "text", text: "asked" });
 		expect(tool.executeArgs).toEqual(["call", { foo: 1 }, undefined, undefined, undefined]);
+	});
+
+	it("preserves private-field metadata getters and avoids double-guarding", () => {
+		const tool = new PrivateMetadataAskTool();
+		const guarded = guardToolForUltragoalAsk(tool as unknown as AgentTool, () => process.cwd());
+
+		expect(guarded.name).toBe("ask");
+		expect(guarded.description).toBe("Ask the user a question");
+		const guardedAgain = guardToolForUltragoalAsk(guarded, () => process.cwd());
+		expect(guardedAgain).toBe(guarded);
 	});
 
 	it("blocks an unwrapped AskTool before prompting while ultragoal is active", async () => {

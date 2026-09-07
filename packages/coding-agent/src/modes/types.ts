@@ -74,6 +74,20 @@ export type ActivityIndicatorStopOptions = Readonly<{
 	foregroundSettled?: boolean;
 }>;
 
+export function clearInteractiveActivityIndicator(ctx: {
+	loadingAnimation?: Loader;
+	statusContainer?: PartialActivityStatusContainer;
+	clearLoadingAnimation?: () => void;
+}): void {
+	if (ctx.clearLoadingAnimation) {
+		ctx.clearLoadingAnimation();
+		return;
+	}
+	ctx.loadingAnimation?.stop();
+	ctx.loadingAnimation = undefined;
+	ctx.statusContainer?.clear?.();
+}
+
 export function stopInteractiveActivityIndicator(
 	ctx: {
 		loadingAnimation?: Loader;
@@ -86,9 +100,7 @@ export function stopInteractiveActivityIndicator(
 		ctx.stopLoadingAnimation(options);
 		return;
 	}
-	ctx.loadingAnimation?.stop();
-	ctx.loadingAnimation = undefined;
-	ctx.statusContainer?.clear?.();
+	clearInteractiveActivityIndicator(ctx);
 }
 
 export function clearInteractiveActivityLoaders(
@@ -285,6 +297,7 @@ export interface InteractiveModeContext {
 	setWorkingMessage(message?: string): void;
 	applyPendingWorkingMessage(): void;
 	ensureLoadingAnimation(): void;
+	clearLoadingAnimation(): void;
 	syncActivityIndicator(): void;
 	suspendActivityIndicator(): () => void;
 	stopLoadingAnimation(options?: ActivityIndicatorStopOptions): void;

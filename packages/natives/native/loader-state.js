@@ -484,10 +484,14 @@ export function detectWin32Avx2Support(
 	return probeWin32Avx2ViaPowerShell(run, report);
 }
 
-function getVariantOverride() {
-	const value = process.env.PI_NATIVE_VARIANT;
-	if (!value) return null;
-	if (value === "modern" || value === "baseline") return value;
+export function getVariantOverride(env = process.env) {
+	// `GJC_NATIVE_VARIANT` is the documented name (docs/natives-architecture.md,
+	// docs/natives-addon-loader-runtime.md, docs/natives-build-release-debugging.md);
+	// `PI_NATIVE_VARIANT` is the pre-rebrand name kept as a fallback. An empty or
+	// blank canonical value falls through rather than masking the legacy one.
+	const raw = env.GJC_NATIVE_VARIANT?.trim() || env.PI_NATIVE_VARIANT?.trim();
+	if (!raw) return null;
+	if (raw === "modern" || raw === "baseline") return raw;
 	return null;
 }
 

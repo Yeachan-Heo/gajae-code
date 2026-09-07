@@ -70,9 +70,9 @@ export function guardToolForUltragoalAsk<T extends AgentTool>(
 	const candidate = tool as GuardedTool;
 	if (candidate[ULTRAGOAL_ASK_GUARD]) return tool;
 	const wrapped = new Proxy(tool, {
-		get(target, prop, receiver) {
+		get(target, prop) {
 			if (prop === ULTRAGOAL_ASK_GUARD) return true;
-			if (prop !== "execute") return Reflect.get(target, prop, receiver);
+			if (prop !== "execute") return Reflect.get(target, prop);
 			return async (...args: unknown[]): Promise<unknown> => {
 				// The wrapper runs BEFORE AskTool.execute(): resolve the nudge
 				// budget against the SESSION profile, never the process-global one.

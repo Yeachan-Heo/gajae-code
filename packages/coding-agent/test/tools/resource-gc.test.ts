@@ -387,6 +387,190 @@ describe("resource GC controller", () => {
 		expect(logWarn.mock.calls.filter(call => call[0].includes("restart threshold sustained"))).toHaveLength(2);
 	});
 
+	for (const transition of ["disable", "disable-reenable", "unregister", "unregister-reregister"] as const) {
+		it(`discards an in-flight memory sample after ${transition} and preserves fresh GC eligibility`, async () => {
+			const settings = Settings.isolated({
+				"memoryGuard.enabled": true,
+				"memoryGuard.checkIntervalMs": 30_000,
+				"memoryGuard.policyLimitMb": 100,
+				"browser.gc.enabled": false,
+				"computer.screenshotGc.enabled": false,
+			});
+			const snapshot = {
+				hardCapBytes: 200 * MB,
+				totalUsageBytes: 90 * MB,
+				parentBytes: 90 * MB,
+				source: "host" as const,
+			};
+			const pendingSample = Promise.withResolvers<typeof snapshot>();
+			let now = NOW;
+			let samples = 0;
+			const runGc = vi.fn();
+			const logWarn = vi.fn();
+			const deps = baseDeps({
+				now: () => now,
+				memorySnapshot: () => (++samples === 1 ? pendingSample.promise : Promise.resolve(snapshot)),
+				runGc,
+				logWarn,
+			});
+			const registration = { sessionId: "changing-session", settings };
+			let unregister = registerResourceGcSession(registration);
+			const staleSweep = sweepOnce(deps);
+			try {
+				expect(samples).toBe(1);
+				if (transition.startsWith("disable")) {
+					settings.set("memoryGuard.enabled", false);
+					if (transition === "disable-reenable") settings.set("memoryGuard.enabled", true);
+				} else {
+					unregister();
+					if (transition === "unregister-reregister") unregister = registerResourceGcSession(registration);
+				}
+				pendingSample.resolve(snapshot);
+				await staleSweep;
+				const staleGcCalls = runGc.mock.calls.length;
+				const staleWarnings = logWarn.mock.calls.length;
+				runGc.mockClear();
+				logWarn.mockClear();
+
+				if (transition === "disable") settings.set("memoryGuard.enabled", true);
+				if (transition === "unregister") unregister = registerResourceGcSession(registration);
+				// A stale sample must neither latch GC nor start the next lifecycle's restart window.
+				now += 120_000;
+				await sweepOnce(deps);
+				expect(samples).toBe(2);
+				expect(runGc).toHaveBeenCalledTimes(1);
+				expect(logWarn.mock.calls.map(call => call[0])).toEqual(["Memory guard: GC threshold reached"]);
+				now += 90_000;
+				await sweepOnce(deps);
+				expect(runGc).toHaveBeenCalledTimes(1);
+				expect(logWarn.mock.calls.map(call => call[0])).toEqual([
+					"Memory guard: GC threshold reached",
+					"Memory guard: restart threshold sustained",
+				]);
+				expect(staleGcCalls).toBe(0);
+				expect(staleWarnings).toBe(0);
+			} finally {
+				pendingSample.resolve(snapshot);
+				await staleSweep;
+				unregister();
+			}
+		});
+	}
+
+	it("does not fence an in-flight sample for a redundant enabled write", async () => {
+		const settings = Settings.isolated({
+			"memoryGuard.enabled": true,
+			"memoryGuard.checkIntervalMs": 30_000,
+			"memoryGuard.policyLimitMb": 100,
+			"browser.gc.enabled": false,
+			"computer.screenshotGc.enabled": false,
+		});
+		const snapshot = {
+			hardCapBytes: 200 * MB,
+			totalUsageBytes: 90 * MB,
+			parentBytes: 90 * MB,
+			source: "host" as const,
+		};
+		const pendingSample = Promise.withResolvers<typeof snapshot>();
+		let samples = 0;
+		const runGc = vi.fn();
+		const logWarn = vi.fn();
+		const deps = baseDeps({
+			memorySnapshot: () => (++samples === 1 ? pendingSample.promise : Promise.resolve(snapshot)),
+			runGc,
+			logWarn,
+		});
+		const unregister = registerResourceGcSession({ sessionId: "redundant-enabled", settings });
+		const pending = sweepOnce(deps);
+		try {
+			settings.set("memoryGuard.enabled", true);
+			pendingSample.resolve(snapshot);
+			await pending;
+			expect(runGc).toHaveBeenCalledTimes(1);
+			expect(logWarn.mock.calls.map(call => call[0])).toEqual(["Memory guard: GC threshold reached"]);
+
+			await sweepOnce(deps);
+			expect(samples).toBe(1);
+		} finally {
+			pendingSample.resolve(snapshot);
+			await pending;
+			unregister();
+		}
+	});
+
+	it("keeps other registered sessions eligible when one guard is disabled during sampling", async () => {
+		const settings = () =>
+			Settings.isolated({
+				"memoryGuard.enabled": true,
+				"memoryGuard.policyLimitMb": 100,
+				"browser.gc.enabled": false,
+				"computer.screenshotGc.enabled": false,
+			});
+		const disabled = settings();
+		const live = settings();
+		const snapshot = {
+			hardCapBytes: 200 * MB,
+			totalUsageBytes: 75 * MB,
+			parentBytes: 75 * MB,
+			source: "host" as const,
+		};
+		const pendingSample = Promise.withResolvers<typeof snapshot>();
+		const runGc = vi.fn();
+		const logWarn = vi.fn();
+		const unregisterDisabled = registerResourceGcSession({ sessionId: "disabled", settings: disabled });
+		const unregisterLive = registerResourceGcSession({ sessionId: "live", settings: live });
+		const pending = sweepOnce(baseDeps({ memorySnapshot: () => pendingSample.promise, runGc, logWarn }));
+		try {
+			disabled.set("memoryGuard.enabled", false);
+			pendingSample.resolve(snapshot);
+			await pending;
+			expect(runGc).toHaveBeenCalledTimes(1);
+			expect(logWarn.mock.calls).toHaveLength(1);
+			expect(logWarn.mock.calls[0]?.[1]?.sessionId).toBe("live");
+		} finally {
+			pendingSample.resolve(snapshot);
+			await pending;
+			unregisterDisabled();
+			unregisterLive();
+		}
+	});
+
+	it("does not restore a cleared latch when the guard resets during the GC request", async () => {
+		const settings = Settings.isolated({
+			"memoryGuard.enabled": true,
+			"memoryGuard.policyLimitMb": 100,
+			"browser.gc.enabled": false,
+			"computer.screenshotGc.enabled": false,
+		});
+		const runGc = vi.fn(() => {
+			settings.set("memoryGuard.enabled", false);
+			settings.set("memoryGuard.enabled", true);
+		});
+		const logWarn = vi.fn();
+		const deps = baseDeps({
+			memorySnapshot: async () => ({
+				hardCapBytes: 200 * MB,
+				totalUsageBytes: 75 * MB,
+				parentBytes: 75 * MB,
+				source: "host",
+			}),
+			runGc,
+			logWarn,
+		});
+		const unregister = registerResourceGcSession({ sessionId: "reset-during-gc", settings });
+		try {
+			await sweepOnce(deps);
+			expect(runGc).toHaveBeenCalledTimes(1);
+			expect(logWarn).not.toHaveBeenCalled();
+			runGc.mockImplementation(() => undefined);
+			await sweepOnce(deps);
+			expect(runGc).toHaveBeenCalledTimes(2);
+			expect(logWarn.mock.calls.map(call => call[0])).toEqual(["Memory guard: GC threshold reached"]);
+		} finally {
+			unregister();
+		}
+	});
+
 	it("does not sample or mutate guard state before the configured check interval", async () => {
 		const settings = Settings.isolated({
 			"memoryGuard.enabled": true,
