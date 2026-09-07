@@ -319,6 +319,30 @@ describe("deep-interview crystallize contract", () => {
 			).toThrow("verbatim user anchor");
 		}
 	});
+	it("preserves short technical identifiers in anchor comparison", () => {
+		const snapshot: CrystalSnapshot = {
+			revision: 1,
+			start: 0,
+			end: 0,
+			messages: [{ index: 0, role: "user", content: "Build a Go API." }],
+			digest: "",
+		};
+		snapshot.digest = crystalSnapshotDigest(snapshot);
+		expect(() =>
+			crystallizeDeepInterview(
+				input({
+					snapshot,
+					items: [
+						{
+							...input().items[0]!,
+							statement: "Build a JS API",
+							anchor: { message_index: 0, quote: "Build a Go API." },
+						},
+					],
+				}),
+			),
+		).toThrow("verbatim user anchor");
+	});
 	it("requires fresh evidence when inferred material becomes confirmed", () => {
 		const first = crystallizeDeepInterview(
 			input({

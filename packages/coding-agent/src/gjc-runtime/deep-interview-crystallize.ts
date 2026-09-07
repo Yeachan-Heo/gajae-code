@@ -565,6 +565,11 @@ function isMeaningfulEvidenceWord(value: string): boolean {
 	);
 }
 
+function isShortTechnicalIdentifier(value: string): boolean {
+	const length = [...value].length;
+	return length >= 1 && length <= 2 && /^[A-Z0-9][A-Za-z0-9+#.-]*$/.test(value) && value !== "A" && value !== "I";
+}
+
 function evidenceTerms(value: string): Set<string> {
 	const ignored = new Set([
 		"and",
@@ -594,12 +599,14 @@ function evidenceTerms(value: string): Set<string> {
 		"use",
 		"using",
 	]);
-	const normalized = value.normalize("NFC").toLowerCase();
+	const canonical = value.normalize("NFC");
+	const normalized = canonical.toLowerCase();
 	const terms = new Set(
-		[...EVIDENCE_SEGMENTER.segment(normalized)]
+		[...EVIDENCE_SEGMENTER.segment(canonical)]
 			.filter(part => part.isWordLike)
-			.map(part => part.segment)
-			.filter(term => isMeaningfulEvidenceWord(term) && (!ignored.has(term) || SEMANTIC_EVIDENCE_TERMS.has(term))),
+			.filter(part => isMeaningfulEvidenceWord(part.segment) || isShortTechnicalIdentifier(part.segment))
+			.map(part => part.segment.toLowerCase())
+			.filter(term => !ignored.has(term) || SEMANTIC_EVIDENCE_TERMS.has(term)),
 	);
 	for (const negator of CJK_NEGATOR_TERMS) if (normalized.includes(negator)) terms.add(negator);
 	return terms;
