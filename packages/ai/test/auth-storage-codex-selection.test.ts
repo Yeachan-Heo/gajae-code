@@ -587,6 +587,51 @@ describe("AuthStorage codex oauth ranking", () => {
 		expect(usageFetch).toHaveBeenCalledTimes(1);
 	});
 
+	test("preserves cancellation during changed-authority Sol revalidation", async () => {
+		if (!authStorage) throw new Error("test setup failed");
+		await authStorage.set("openai-codex", [{ type: "oauth", ...createCredential("acct-plus", "plus@example.com") }]);
+		const report = createCodexUsageReport({
+			accountId: "acct-plus",
+			primary: { usedFraction: 0.1, resetInMs: HOUR_MS },
+			secondary: { usedFraction: 0.1, resetInMs: WEEK_MS },
+		});
+		report.metadata = { ...report.metadata, planType: "plus" };
+		usageByAccount.set("acct-plus", report);
+		let usageCalls = 0;
+		let revalidationStarted = false;
+		const usageFetch = vi.spyOn(usageProvider, "fetchUsage").mockImplementation(async params => {
+			usageCalls += 1;
+			if (usageCalls === 1) return report;
+			revalidationStarted = true;
+			const aborted = Promise.withResolvers<UsageReport | null>();
+			params.signal?.addEventListener("abort", () => aborted.reject(new Error("usage fetch aborted")), {
+				once: true,
+			});
+			return aborted.promise;
+		});
+		vi.spyOn(oauthUtils, "getOAuthApiKey").mockImplementation(async (_provider, credentials) => ({
+			newCredentials: { ...credentials["openai-codex"]!, access: "rotated-access" },
+			apiKey: "rotated-access",
+		}));
+		const controller = new AbortController();
+		const request = authStorage.getApiKey("openai-codex", "cancelled-rotated-sol", {
+			modelId: "gpt-5.6-sol",
+			credentialSelector: { kind: "email", value: "plus@example.com" },
+			signal: controller.signal,
+		});
+		await waitFor(() => revalidationStarted);
+		controller.abort(new Error("cancelled changed-authority revalidation"));
+
+		await expect(request).rejects.toThrow("usage fetch aborted");
+		usageFetch.mockRestore();
+		await expect(
+			authStorage.getApiKey("openai-codex", "retry-rotated-sol", {
+				modelId: "gpt-5.6-sol",
+				credentialSelector: { kind: "email", value: "plus@example.com" },
+			}),
+		).resolves.toBe("rotated-access");
+	});
+
 	test.each([
 		"pro",
 		"Pro",

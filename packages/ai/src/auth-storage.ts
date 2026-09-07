@@ -5531,6 +5531,7 @@ export class AuthStorage {
 			this.#recordSessionCredential(provider, sessionId, "oauth", selection.index);
 			return { apiKey: result.apiKey, credential: updated };
 		} catch (error) {
+			if (options?.signal?.aborted) throw error;
 			if (isSqliteError(error)) throw error;
 			// Auth-broker errors retain the sanitized upstream body separately from
 			// their transport message. Include that body for failure classification
