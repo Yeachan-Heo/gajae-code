@@ -104,6 +104,9 @@ describe("deep-interview crystallize contract", () => {
 				}),
 			),
 		).toThrow("id is invalid");
+		expect(() => crystallizeDeepInterview(input({ removed_ids: ["goal:report)\n- injected"] }))).toThrow(
+			"valid item identifiers",
+		);
 	});
 
 	it("rejects confirmed statements unrelated to their user quote", () => {
@@ -715,6 +718,9 @@ describe("deep-interview crystallize contract", () => {
 				"Use PostgreSQL for storage",
 			],
 			["Failure ratio must be 1:2.", "Failure ratio must be 1:2.", "Failure ratio must be 1 2"],
+			["Failure ratio must be 1 : 2.", "Failure ratio must be 1 : 2.", "Failure ratio must be 1 2"],
+			["Use Rust. Actually use Go.", "Use Rust.", "Use Rust"],
+			["Use PostgreSQL. Actually use MySQL.", "Use PostgreSQL.", "Use PostgreSQL"],
 			[
 				"Use Go for the backend. Please switch to JS for the backend.",
 				"Use Go for the backend.",
@@ -880,6 +886,19 @@ describe("deep-interview crystallize contract", () => {
 			},
 		];
 		expect(() => crystallizeDeepInterview(split)).toThrow("fresh verbatim user anchor");
+		const conditional = withFreshUserEvidence(
+			input({ prior: first, resolved_open_gaps: [gap] }),
+			"Use PostgreSQL database. If approved, use MySQL database.",
+		);
+		conditional.resolved_open_gap_anchors = [
+			{
+				item: gap,
+				message_index: 1,
+				quote: "Use PostgreSQL database.",
+				resolution: "If approved, use MySQL database.",
+			},
+		];
+		expect(() => crystallizeDeepInterview(conditional)).toThrow("fresh verbatim user anchor");
 	});
 	it("rejects unrelated unspaced CJK resolution evidence", () => {
 		const gap = "内存预算是多少？";

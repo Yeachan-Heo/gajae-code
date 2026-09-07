@@ -407,9 +407,11 @@ function hasLaterSupersedingCorrection(content: string, quote: string, statement
 		/^\s*[.!?。！？]*\s*(?:only\s+)?(?:if|unless|until|when|assuming|in\s+case|contingent|provided(?:\s+that)?|depending\s+on)\b[^,;.!?。！？]*[.!?。！？]?\s*$/i.test(
 			later,
 		);
-	const statementHasTechnical = (statement.match(/[A-Za-z0-9][A-Za-z0-9+#.-]*/g) ?? []).some(
-		isShortTechnicalIdentifier,
-	);
+	const hasTechnicalIdentity = (value: string): boolean =>
+		(value.match(/[A-Za-z0-9][A-Za-z0-9+#.-]*/g) ?? []).some(
+			term => isShortTechnicalIdentifier(term) || /^[A-Z][A-Za-z0-9+#.-]+$/.test(term),
+		);
+	const statementHasTechnical = hasTechnicalIdentity(statement);
 	const genericCorrection = followingClauses.some(clause => {
 		const marker =
 			/\b(?:actually|instead|rather|correction|on\s+second\s+thought|make\s+that)\b/i.test(clause) ||
@@ -418,8 +420,7 @@ function hasLaterSupersedingCorrection(content: string, quote: string, statement
 		const clauseTerms = evidenceTerms(clause);
 		return (
 			[...topicTerms(statement, false)].some(term => clauseTerms.has(term)) ||
-			(statementHasTechnical &&
-				(clause.match(/[A-Za-z0-9][A-Za-z0-9+#.-]*/g) ?? []).some(isShortTechnicalIdentifier))
+			(statementHasTechnical && hasTechnicalIdentity(clause))
 		);
 	});
 	return (
@@ -792,7 +793,7 @@ function quantitativeEvidenceTerms(value: string): Set<string> {
 	const canonical = value.normalize("NFC");
 	const terms = new Set<string>();
 	for (const match of canonical.matchAll(/\p{Sc}|%|>=|<=|>|</gu)) terms.add(match[0]);
-	if (/\d:\d/u.test(canonical)) terms.add(":");
+	if (/\d\s*:\s*\d/u.test(canonical)) terms.add(":");
 	for (const match of canonical.matchAll(/\b(\d+(?:\.\d+)?)\s*([A-Za-z]+)?\b/g)) {
 		terms.add(match[1]!);
 		if (match[2]) terms.add(match[2].length <= 3 && /[A-Z]/.test(match[2]) ? match[2] : match[2].toLowerCase());
@@ -943,7 +944,8 @@ function validateResolutionAnchors(
 		const unsafeResolution =
 			isUnsafeResolution(resolution, item, conflict) ||
 			isUnsafeResolution(quote, item, conflict) ||
-			(message ? isUnsafeResolution(anchoredClause(message.content, quote), item, conflict) : true);
+			(message ? isUnsafeResolution(anchoredClause(message.content, quote), item, conflict) : true) ||
+			(message ? isUnsafeResolution(anchoredClause(message.content, resolution), item, conflict) : true);
 		if (
 			!resolutions.includes(item) ||
 			seen.has(item) ||
@@ -1129,6 +1131,8 @@ function validateStoredRemovalAnchors(
 function validateRemovedIds(value: unknown): string[] {
 	if (!Array.isArray(value) || value.length > MAX_ITEMS) throw new Error("removed_ids must be a bounded array");
 	const ids = value.map((id, index) => text(id, `removed_ids[${index}]`, 128));
+	if (ids.some(id => !/^[A-Za-z0-9][A-Za-z0-9._:-]*$/.test(id)))
+		throw new Error("removed_ids must contain valid item identifiers");
 	if (new Set(ids).size !== ids.length) throw new Error("removed_ids must be unique");
 	return ids.sort();
 }
@@ -1289,6 +1293,10 @@ export function crystallizeDeepInterview(value: unknown): DeepInterviewCrystal {
 			mergedItems.push(item);
 	for (const anchor of [...resolvedGapAnchors, ...resolvedConflictAnchors]) {
 		const answerTerms = evidenceTerms(anchor.resolution);
+		const resolutionId = `resolution:${createHash("sha256")
+			.update(`${anchor.item}\0${anchor.resolution}`)
+			.digest("hex")
+			.slice(0, 16)}`;
 		if (
 			!mergedItems.some(
 				item =>
@@ -1297,7 +1305,7 @@ export function crystallizeDeepInterview(value: unknown): DeepInterviewCrystal {
 			)
 		)
 			mergedItems.push({
-				id: `resolution:${createHash("sha256").update(anchor.item).digest("hex").slice(0, 16)}`,
+				id: resolutionId,
 				kind: "constraint",
 				classification: "confirmed",
 				statement: anchor.resolution,
