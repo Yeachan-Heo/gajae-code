@@ -1248,6 +1248,79 @@ describe("deep-interview crystallize contract", () => {
 		}
 	});
 
+	it("normalizes canonical custom and file-mention messages into Crystal roles", async () => {
+		const root = await fs.mkdtemp(path.join(process.cwd(), ".tmp-crystallize-custom-roles-"));
+		const sessionId = "crystallize-custom-roles";
+		const sessionFile = path.join(root, ".gjc", "sessions", "conversation.jsonl");
+		const previousSessionFile = process.env.GJC_SESSION_FILE;
+		try {
+			await fs.mkdir(path.dirname(sessionFile), { recursive: true });
+			const customMessage = {
+				role: "custom",
+				customType: "skill",
+				content: "Deep Interview prompt",
+				display: false,
+			};
+			const fileMentionMessage = {
+				role: "fileMention",
+				files: [{ path: "requirements.md", content: "Supporting context" }],
+			};
+			const userMessage = { role: "user", content: "Build a fast report." };
+			await fs.writeFile(
+				sessionFile,
+				[
+					{ type: "session", id: sessionId, cwd: root },
+					{ type: "message", message: customMessage },
+					{ type: "message", message: fileMentionMessage },
+					{ type: "message", message: userMessage },
+				]
+					.map(record => JSON.stringify(record))
+					.join("\n") + "\n",
+			);
+			const messages: CrystalSnapshot["messages"] = [
+				{ index: 0, role: "system", content: customMessage.content },
+				{
+					index: 1,
+					role: "tool",
+					content: `[fileMention sha256:${createHash("sha256").update(JSON.stringify(fileMentionMessage)).digest("hex")}]`,
+				},
+				{ index: 2, role: "user", content: userMessage.content },
+			];
+			const snapshot: CrystalSnapshot = { revision: 3, start: 0, end: 2, messages, digest: "" };
+			snapshot.digest = crystalSnapshotDigest(snapshot);
+			process.env.GJC_SESSION_FILE = sessionFile;
+			const result = await runNativeDeepInterviewCommand(
+				[
+					"--crystallize",
+					"--input",
+					JSON.stringify(
+						input({
+							snapshot,
+							current_revision: 3,
+							items: [
+								{
+									...input().items[0]!,
+									anchor: { message_index: 2, quote: userMessage.content },
+								},
+							],
+						}),
+					),
+					"--session-id",
+					sessionId,
+					"--slug",
+					"custom-roles",
+					"--json",
+				],
+				root,
+			);
+			expect(result.status, result.stderr).toBe(0);
+		} finally {
+			if (previousSessionFile === undefined) delete process.env.GJC_SESSION_FILE;
+			else process.env.GJC_SESSION_FILE = previousSessionFile;
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
 	it("rejects caller-supplied prior material when no canonical Crystal exists", async () => {
 		const root = await fs.mkdtemp(path.join(process.cwd(), ".tmp-crystallize-fresh-prior-"));
 		const sessionId = "crystallize-fresh-prior";
