@@ -7986,7 +7986,21 @@ export class AgentSession {
 										skip("handoff_in_progress");
 										return;
 									}
-									if (!canContinue()) return;
+									if (scheduledSignal.aborted || this.#isDisposed) {
+										skip("aborted_signal");
+										return;
+									}
+									if (
+										this.sessionId !== scheduledSessionId ||
+										this.#sessionIdentityEpoch !== scheduledSessionIdentityEpoch
+									) {
+										skip("generation_changed");
+										return;
+									}
+									if (options?.shouldContinue && !options.shouldContinue()) {
+										skip("queue_drained");
+										return;
+									}
 									this.#assertNoSessionTransition();
 									const predecessorAgentEnd =
 										this.#claimDeferredAgentEndForContinuation(predecessorAgentEndHold);
