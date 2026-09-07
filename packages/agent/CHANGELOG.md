@@ -4,7 +4,7 @@
 
 ## [0.16.6] - 2026-09-07
 
-- External lifecycle emitters now pass a session-owned admission fence before mutating Agent state, and run-bound/Cursor split emissions resolve their current active attempt scope so session-identity transitions reject stale producers without discarding current work.
+- External lifecycle emitters now pass a session-owned admission fence before mutating Agent state. Run-bound terminals retain their authoritative attempt scope, while Cursor-native lifecycle emitters resolve the current main-attempt scope on every emission so in-loop retries and later tool turns are not mistaken for retired producers.
 - Provider iterators that close with a trailing assistant but no explicit `done`/`error` event now publish the canonical `message_end` before `turn_end` and `agent_end`, preventing session persistence from missing the authoritative final response.
 
 ## [0.16.5] - 2026-09-07

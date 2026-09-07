@@ -1037,9 +1037,10 @@ export class Agent {
 	createExternalEventEmitterForCurrentRun(): ((event: AgentEvent) => void) | undefined {
 		const runId = this.#activeRunId;
 		if (runId === undefined) return undefined;
-		const scope = this.#runHandles.get(this.#managedLogicalRunOwner ?? runId)?.scope;
+		const logicalRunId = this.#managedLogicalRunOwner ?? runId;
 		return (event: AgentEvent) => {
 			if (this.#activeRunId !== runId) return;
+			const scope = this.#runHandles.get(logicalRunId)?.scope;
 			this.emitExternalEvent(scope && !event.scope ? { ...event, scope } : event);
 		};
 	}
@@ -2035,6 +2036,7 @@ export class Agent {
 					const scope = this.#attemptAuthority.mintMain();
 					this.#observeMainAttemptScope(scope);
 					this.#runScopes.get(logicalRunId)?.add(scope);
+					this.#runHandles.set(logicalRunId, { logicalRunId, scope });
 					return scope;
 				},
 			},
