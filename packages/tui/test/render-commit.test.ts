@@ -402,6 +402,54 @@ describe("generation-scoped render commits", () => {
 		tui.stop();
 	});
 
+	it("commits coalesced forced generations behind held raster ingress", async () => {
+		const terminal = new VirtualTerminal(40, 8);
+		const tui = new TUI(terminal);
+		const text = new Text("initial", 0, 0);
+		tui.addChild(text);
+		tui.start();
+		await terminal.waitForRender();
+		const lease = await tui.acquireRasterLease({
+			ownerId: "coalesced-force-held-raster",
+			rect: { column: 0, row: 0, width: 2, height: 1 },
+			erase: { type: "raster-erase", bytes: new TextEncoder().encode("COALESCED_ERASE") },
+		});
+		if (lease.status !== "acquired") throw new Error("lease not acquired");
+		const ingressGate = Promise.withResolvers<void>();
+		const ingressStarted = Promise.withResolvers<void>();
+		const held = tui.submitTerminalOutput({
+			token: lease.token,
+			operation: {
+				type: "raster-multipart-batch",
+				prefix: new TextEncoder().encode("COALESCED_PREFIX"),
+				afterPrefix: async () => {
+					ingressStarted.resolve();
+					await ingressGate.promise;
+					return true;
+				},
+				records: [new TextEncoder().encode("COALESCED_RASTER")],
+				abortSuffix: new TextEncoder().encode("COALESCED_ABORT"),
+			},
+		});
+		try {
+			await ingressStarted.promise;
+			text.setText("COALESCED_FINAL_FRAME");
+			const first = tui.requestRenderWithGeneration(true, "test.coalesced-force.first");
+			const second = tui.requestRenderWithGeneration(true, "test.coalesced-force.second");
+			const firstCommit = tui.waitForRenderCommit(first);
+			const secondCommit = tui.waitForRenderCommit(second);
+			await new Promise<void>(resolve => process.nextTick(resolve));
+			ingressGate.resolve();
+			expect((await held).status).toBe("written");
+			expect(await Promise.all([firstCommit, secondCommit])).toEqual([true, true]);
+			expect(terminal.getWriteLog().join("")).toContain("FINAL_FRAME");
+		} finally {
+			ingressGate.resolve();
+			await held;
+			tui.stop();
+		}
+	});
+
 	it("fences a render queued behind held raster ingress when disposed", async () => {
 		const terminal = new VirtualTerminal(40, 8);
 		const tui = new TUI(terminal);

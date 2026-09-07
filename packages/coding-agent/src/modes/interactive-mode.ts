@@ -226,6 +226,7 @@ export function resolveActivityIndicatorMessage(
 }
 const WELCOME_RESERVED_CONTAINER_CHILD_LIMIT = 8;
 const COMPOSER_RIGHT_GUTTER_WIDTH = 1;
+const GRACEFUL_SHUTDOWN_RENDER_COMMIT_TIMEOUT_MS = 1000;
 
 const IRC_SIDEBAR_TOGGLE_SHADOWING_ACTIONS: readonly AppKeybinding[] = [
 	"app.plan.toggle",
@@ -1828,12 +1829,13 @@ export class InteractiveMode implements InteractiveModeContext {
 		await this.session.dispose();
 
 		if (this.isInitialized) {
-			this.ui.requestRender(true);
+			const finalRenderGeneration = this.ui.requestRenderWithGeneration(true, "shutdown");
+			// A scheduled frame is not necessarily painted: raster ingress may still
+			// own the terminal queue. Wait for the exact forced generation to commit
+			// before stop() advances the lifecycle fence, but keep terminal restoration
+			// bounded if a raster producer is permanently stuck.
+			await this.ui.waitForRenderCommit(finalRenderGeneration, GRACEFUL_SHUTDOWN_RENDER_COMMIT_TIMEOUT_MS);
 		}
-
-		// Wait for any pending renders to complete
-		// requestRender() uses process.nextTick(), so we wait one tick
-		await new Promise(resolve => process.nextTick(resolve));
 
 		// Drain any in-flight Kitty key release events before stopping.
 		// This prevents escape sequences from leaking to the parent shell over slow SSH.

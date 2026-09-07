@@ -3198,10 +3198,15 @@ export class TUI extends Container {
 			}
 			this.#renderRequested = true;
 			process.nextTick(() => {
-				if (this.#stopped || !this.#renderRequested) {
+				if (this.#stopped) {
 					this.#settleRenderCommitWaiters(false, generation);
 					return;
 				}
+				// Another next-tick callback may already have coalesced this forced
+				// generation into the active frame. Its queued terminal write owns the
+				// commit result; do not fail every waiter merely because renderRequested
+				// was cleared when that frame was prepared.
+				if (!this.#renderRequested) return;
 				this.#renderPreparedFrame();
 			});
 			return;
