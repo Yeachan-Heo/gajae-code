@@ -1635,6 +1635,24 @@ describe("gjc state handoff", () => {
 		});
 	});
 
+	it("rejects a symlinked oversized execution approval index", async () => {
+		await withTempCwd(async cwd => {
+			await writePublishedReadyCrystal(cwd);
+			expect((await runNativeDeepInterviewCommand(["approve-execution", "--json"], cwd)).status).toBe(0);
+			const indexPath = path.join(sessionStateDir(cwd, TEST_SESSION_ID), "deep-interview-approval-audit.json");
+			const oversizedPath = path.join(cwd, "oversized-approval.json");
+			await fs.writeFile(oversizedPath, "x".repeat(128 * 1024));
+			await fs.rm(indexPath);
+			await fs.symlink(oversizedPath, indexPath);
+			const result = await runNativeStateCommand(
+				["handoff", "--mode", "deep-interview", "--to", "ultragoal", "--json"],
+				cwd,
+			);
+			expect(result.status).toBe(2);
+			expect(result.stderr).toContain("failed to read execution approval index");
+		});
+	});
+
 	it("rejects a future deep-interview envelope at execution handoff", async () => {
 		await withTempCwd(async cwd => {
 			const { callerPath } = await writePublishedReadyCrystal(cwd);

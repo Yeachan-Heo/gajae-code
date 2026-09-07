@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import * as nodeFs from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 // Subpath import keeps this module native-free for the gjc-state-gates shards:
@@ -1846,10 +1847,22 @@ async function assertSanctionedExecutionApprovalAudit(
 	const indexedApprovalPath = path.join(sessionStateDir(cwd, sessionId), "deep-interview-approval-audit.json");
 	let indexedRaw = "";
 	try {
-		const indexedStat = await fs.stat(indexedApprovalPath);
-		if (!indexedStat.isFile() || indexedStat.size > 64 * 1024)
-			throw new StateCommandError(2, "deep-interview execution approval index is invalid");
-		indexedRaw = await fs.readFile(indexedApprovalPath, "utf-8");
+		const handle = await fs.open(indexedApprovalPath, nodeFs.constants.O_RDONLY | nodeFs.constants.O_NOFOLLOW);
+		try {
+			const indexedStat = await handle.stat();
+			if (!indexedStat.isFile() || indexedStat.size > 64 * 1024)
+				throw new StateCommandError(2, "deep-interview execution approval index is invalid");
+			const buffer = Buffer.alloc(indexedStat.size);
+			let offset = 0;
+			while (offset < buffer.length) {
+				const { bytesRead } = await handle.read(buffer, offset, buffer.length - offset, offset);
+				if (bytesRead === 0) throw new StateCommandError(2, "deep-interview execution approval index is invalid");
+				offset += bytesRead;
+			}
+			indexedRaw = buffer.subarray(0, offset).toString("utf-8");
+		} finally {
+			await handle.close();
+		}
 		const indexedRecord: unknown = JSON.parse(indexedRaw);
 		if (!isPlainObject(indexedRecord))
 			throw new StateCommandError(2, "deep-interview execution approval index is invalid");
