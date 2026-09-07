@@ -1027,6 +1027,7 @@ function parseStoredCrystal(value: unknown): DeepInterviewCrystal {
 			!isRecord(item) ||
 			typeof item.id !== "string" ||
 			item.id.trim() === "" ||
+			!/^[A-Za-z0-9][A-Za-z0-9._:-]*$/.test(item.id) ||
 			ids.has(item.id) ||
 			typeof item.kind !== "string" ||
 			!CRYSTAL_ITEM_KINDS.has(item.kind) ||
@@ -1054,7 +1055,7 @@ function parseStoredCrystal(value: unknown): DeepInterviewCrystal {
 		!Array.isArray(value.delta.preserved_ids) ||
 		typeof value.delta.approval_invalidated !== "boolean" ||
 		[...value.delta.changed_ids, ...value.delta.added_ids, ...value.delta.preserved_ids].some(
-			id => typeof id !== "string",
+			id => typeof id !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._:-]*$/.test(id),
 		)
 	)
 		throw new DeepInterviewCommandError(2, "stored Crystal delta is invalid");
@@ -1065,7 +1066,8 @@ function parseStoredCrystal(value: unknown): DeepInterviewCrystal {
 	for (const field of ["removed_ids", "pending_removals"] as const) {
 		if (
 			value[field] !== undefined &&
-			(!Array.isArray(value[field]) || value[field].some(item => typeof item !== "string"))
+			(!Array.isArray(value[field]) ||
+				value[field].some(item => typeof item !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._:-]*$/.test(item)))
 		)
 			throw new DeepInterviewCommandError(2, "stored Crystal removal fields are invalid");
 	}
