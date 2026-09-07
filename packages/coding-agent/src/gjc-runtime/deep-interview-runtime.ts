@@ -192,6 +192,7 @@ const VALUE_FLAGS = new Set([
 const CRYSTAL_MAX_MESSAGES = 200;
 const CRYSTAL_MAX_JOURNAL_BYTES = 64 * 1024;
 const CRYSTAL_MAX_INDEX_BYTES = 1_000_000;
+const CRYSTAL_INDEX_RECOVERY_BYTES = CRYSTAL_MAX_INDEX_BYTES + 64 * 1024;
 const CRYSTAL_MAX_ARTIFACT_BYTES = MAX_DEEP_INTERVIEW_STRUCTURED_RESPONSE_LENGTH * 4 + 4096;
 const READ_NOFOLLOW_FLAGS =
 	fs.constants.O_RDONLY | (typeof fs.constants.O_NOFOLLOW === "number" ? fs.constants.O_NOFOLLOW : 0);
@@ -207,6 +208,39 @@ interface CrystalIndexRow {
 
 interface CrystalIndexCatalog {
 	rows: CrystalIndexRow[];
+}
+
+function serializeCrystalIndexRows(rows: readonly CrystalIndexRow[]): string {
+	return rows
+		.map(row =>
+			JSON.stringify({
+				slug: row.slug,
+				stage: row.stage,
+				path: row.path,
+				created_at: row.created_at,
+				sha256: row.sha256,
+			}),
+		)
+		.join("\n")
+		.concat(rows.length > 0 ? "\n" : "");
+}
+
+function compactCrystalIndexRows(
+	rows: readonly CrystalIndexRow[],
+	protectedPaths: ReadonlySet<string>,
+): CrystalIndexRow[] {
+	const latestByPath = new Map<string, CrystalIndexRow>();
+	for (const row of rows) {
+		latestByPath.delete(row.canonicalPath);
+		latestByPath.set(row.canonicalPath, row);
+	}
+	const retained = [...latestByPath.values()];
+	while (Buffer.byteLength(serializeCrystalIndexRows(retained), "utf-8") > CRYSTAL_MAX_INDEX_BYTES) {
+		const removable = retained.findIndex(row => !protectedPaths.has(row.canonicalPath));
+		if (removable < 0) throw new DeepInterviewCommandError(2, "Crystal index live publication set exceeds its bound");
+		retained.splice(removable, 1);
+	}
+	return retained;
 }
 
 interface CrystalJournalRecord extends WorkflowTransactionJournal {
@@ -287,7 +321,7 @@ async function readCrystalIndexCatalog(
 	sessionId: string,
 	indexPath: string,
 ): Promise<CrystalIndexCatalog> {
-	const bytes = await readBoundedFileBytes(indexPath, CRYSTAL_MAX_INDEX_BYTES, "Crystal index", {
+	const bytes = await readBoundedFileBytes(indexPath, CRYSTAL_INDEX_RECOVERY_BYTES, "Crystal index", {
 		allowMissing: true,
 	});
 	if (!bytes) return { rows: [] };
@@ -342,7 +376,61 @@ async function readCrystalIndexCatalog(
 			canonicalPath,
 		});
 	}
+	if (bytes.length > CRYSTAL_MAX_INDEX_BYTES) {
+		const protectedPaths = new Set<string>();
+		const currentState = await readExistingStateForMutation(modeStatePath(cwd, sessionId, "deep-interview"));
+		if (currentState.kind === "valid" && typeof currentState.value.spec_path === "string")
+			protectedPaths.add(path.resolve(currentState.value.spec_path));
+		const compacted = compactCrystalIndexRows(rows, protectedPaths);
+		await writeArtifact(indexPath, serializeCrystalIndexRows(compacted), {
+			cwd,
+			audit: { category: "ledger", verb: "write", owner: "gjc-runtime", skill: "deep-interview", sessionId },
+		});
+		return { rows: compacted };
+	}
 	return { rows };
+}
+
+async function appendCrystalIndexRow(
+	cwd: string,
+	sessionId: string,
+	indexPath: string,
+	row: Omit<CrystalIndexRow, "canonicalPath">,
+	protectedPaths: readonly string[] = [],
+): Promise<void> {
+	await withWorkflowStateLock(
+		indexPath,
+		async () => {
+			const catalog = await readCrystalIndexCatalog(cwd, sessionId, indexPath);
+			const canonicalRow: CrystalIndexRow = {
+				...row,
+				canonicalPath: canonicalPublicationPath(cwd, sessionId, row.path),
+			};
+			const line = `${JSON.stringify(row)}\n`;
+			const currentSize = await fs
+				.stat(indexPath)
+				.then(stat => stat.size)
+				.catch(error => {
+					if (isErrnoCode(error, "ENOENT")) return 0;
+					throw error;
+				});
+			if (currentSize + Buffer.byteLength(line, "utf-8") <= CRYSTAL_MAX_INDEX_BYTES) {
+				await appendJsonl(indexPath, row, {
+					cwd,
+					audit: { category: "ledger", verb: "append", owner: "gjc-runtime", skill: "deep-interview", sessionId },
+				});
+				return;
+			}
+			const protectedCanonicalPaths = new Set(protectedPaths.map(value => path.resolve(value)));
+			protectedCanonicalPaths.add(canonicalRow.canonicalPath);
+			const compacted = compactCrystalIndexRows([...catalog.rows, canonicalRow], protectedCanonicalPaths);
+			await writeArtifact(indexPath, serializeCrystalIndexRows(compacted), {
+				cwd,
+				audit: { category: "ledger", verb: "write", owner: "gjc-runtime", skill: "deep-interview", sessionId },
+			});
+		},
+		{ cwd },
+	);
 }
 
 function indexRowsForPath(catalog: CrystalIndexCatalog, targetPath: string): CrystalIndexRow[] {
@@ -1218,13 +1306,12 @@ async function handleCrystallizeUnlocked(
 		if (journal?.steps.includes("index") && !indexAlreadyContains)
 			throw new DeepInterviewCommandError(2, "pending Crystal index verification failed");
 		if (!indexAlreadyContains)
-			await appendJsonl(
+			await appendCrystalIndexRow(
+				cwd,
+				sessionId,
 				indexPath,
-				{ slug, stage: "final", path: specPath, created_at: now, sha256: specHash },
-				{
-					cwd,
-					audit: { category: "ledger", verb: "append", owner: "gjc-runtime", skill: "deep-interview", sessionId },
-				},
+				{ slug, stage: "final", path: specPath!, created_at: now, sha256: specHash! },
+				existingSpecPath ? [existingSpecPath] : [],
 			);
 		await updateWorkflowTransactionJournal(cwd, sessionId, mutationId, {
 			steps: ["artifact", "index"],
@@ -1831,19 +1918,11 @@ async function persistDeepInterviewSpecUnlocked(
 
 	const sha256 = createHash("sha256").update(content).digest("hex");
 	const createdAt = new Date().toISOString();
-	await appendJsonl(
+	await appendCrystalIndexRow(
+		cwd,
+		resolved.sessionId,
 		path.join(sessionSpecsDir(cwd, resolved.sessionId), "deep-interview-index.jsonl"),
 		{ slug: resolved.slug, stage: resolved.stage, path: specPath, created_at: createdAt, sha256 },
-		{
-			cwd,
-			audit: {
-				category: "ledger",
-				verb: "append",
-				owner: "gjc-runtime",
-				skill: "deep-interview",
-				sessionId: resolved.sessionId,
-			},
-		},
 	);
 
 	const payload = normalizeDeepInterviewEnvelope({
