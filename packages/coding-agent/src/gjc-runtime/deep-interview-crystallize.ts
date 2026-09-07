@@ -345,7 +345,7 @@ function anchoredClause(content: string, quote: string): string {
 function hasVerbatimTokenBoundaries(content: string, quote: string): boolean {
 	const quoteIndex = content.indexOf(quote);
 	if (quoteIndex < 0) return false;
-	const word = /[\p{L}\p{M}\p{N}_]/u;
+	const word = /[\p{L}\p{M}\p{N}_\u200C\u200D]/u;
 	const first = [...quote][0];
 	const last = [...quote].at(-1);
 	const before = quoteIndex > 0 ? content.slice(0, quoteIndex).match(/.$/u)?.[0] : undefined;
@@ -368,16 +368,21 @@ function hasLaterSupersedingCorrection(content: string, quote: string, statement
 	const explicitNegativeReplacement =
 		/\b(?:no|not|don['’]t|do\s+not)\b/i.test(later) && (topicOverlap || directNegativeReplacement);
 	const positiveReplacementMatch =
-		/^\s*[.!?。！？]*\s*(?:(?:switch|change)\s+to\s+([A-Za-z0-9+#.-]+)(?:[.!?。！？]|$)|replace\b[^.!?。！？]*\bwith\s+([A-Za-z0-9+#.-]+)(?:[.!?。！？]|$))/i.exec(
+		/^\s*[.!?。！？]*\s*(?:(?:switch|change)\s+to\s+([A-Za-z0-9][A-Za-z0-9+#.-]*)|replace\b[^.!?。！？]*\bwith\s+([A-Za-z0-9][A-Za-z0-9+#.-]*))/i.exec(
 			later,
 		);
 	const directPositiveReplacement =
 		positiveReplacementMatch !== null &&
 		(topicOverlap ||
-			[positiveReplacementMatch[1], positiveReplacementMatch[2]].some(
-				term =>
-					term !== undefined && (isShortTechnicalIdentifier(term) || /(?:[a-z][A-Z]|[A-Z].*[A-Z])/.test(term)),
-			));
+			[positiveReplacementMatch[1], positiveReplacementMatch[2]]
+				.map(term => term?.replace(/[.!?。！？]+$/u, ""))
+				.filter((term): term is string => typeof term === "string")
+				.some(
+					term =>
+						isShortTechnicalIdentifier(term) ||
+						/^(?:C\+\+|C#|F#)$/i.test(term) ||
+						/(?:[a-z][A-Z]|[A-Z].*[A-Z])/.test(term),
+				));
 	const standaloneConditionalQualifier =
 		/^\s*[.!?。！？]*\s*(?:only\s+)?(?:if|unless|until|when|assuming|in\s+case|contingent|provided(?:\s+that)?|depending\s+on)\b[^,;.!?。！？]*[.!?。！？]?\s*$/i.test(
 			later,
