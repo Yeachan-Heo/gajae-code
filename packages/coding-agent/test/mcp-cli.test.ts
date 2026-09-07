@@ -269,10 +269,60 @@ describe("gjc mcp CLI helpers", () => {
 		expect(byName.denied.runtimeStatus).toBe("disabled");
 		expect(byName.lazy.runtimeStatus).toBe("autoload-off");
 		expect(byName.lazy.runtimeNote).toBe(
-			"Configured but not auto-loaded at startup (autoload: false); connect on demand via /mcp.",
+			"Configured but not auto-loaded at startup (autoload: false). To load it, set autoload to true or remove the key in this config file, then start a new session; --mcp-config does not override the flag. It must also stay enabled and out of disabledServers.",
 		);
 		expect(byName.alpha.scope).toBe("user");
 		expect(byName.alpha.path).toBe(configPath);
+	});
+
+	it("never points autoload-off servers at a connect surface the CLI does not expose", async () => {
+		const stdout = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+		const configPath = getMCPConfigPath("user", projectDir);
+		await fs.mkdir(path.dirname(configPath), { recursive: true });
+		await fs.writeFile(
+			configPath,
+			JSON.stringify({
+				mcpServers: { lazy: { type: "stdio", command: "lazy-bin", autoload: false } },
+			}),
+		);
+
+		await runMCPCommand({ action: "list", flags: { json: true }, cwd: projectDir });
+
+		const note = JSON.parse(stdoutText(stdout)).servers[0].runtimeNote as string;
+		// `/mcp` is quarantined (see mcp-quarantine-surface.test.ts), so the note must
+		// not send an operator to it, and `--mcp-config` still enforces autoload.
+		expect(note).not.toContain("/mcp");
+		expect(note).not.toContain("on demand");
+		expect(note).toContain("autoload to true or remove the key");
+		expect(note).toContain("start a new session");
+		// Autoload is necessary, never sufficient: separate blocks stay authoritative.
+		expect(note).toContain("enabled");
+		expect(note).toContain("disabledServers");
+	});
+
+	it("prints the corrected autoload-off guidance in human-readable list output", async () => {
+		const stdout = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+		const configPath = getMCPConfigPath("user", projectDir);
+		await fs.mkdir(path.dirname(configPath), { recursive: true });
+		await fs.writeFile(
+			configPath,
+			JSON.stringify({
+				mcpServers: { lazy: { type: "stdio", command: "lazy-bin", autoload: false } },
+			}),
+		);
+
+		await runMCPCommand({ action: "list", flags: {}, cwd: projectDir });
+
+		// Scope the assertion to the Runtime line: the header prints the config path,
+		// which legitimately contains "mcp.json".
+		const runtimeLine = stdoutText(stdout)
+			.split("\n")
+			.find(line => line.startsWith("Runtime: "));
+		expect(runtimeLine).toBeDefined();
+		expect(runtimeLine).toContain("Configured but not auto-loaded at startup (autoload: false).");
+		expect(runtimeLine).toContain("set autoload to true or remove the key in this config file");
+		expect(runtimeLine).not.toContain("/mcp.");
+		expect(runtimeLine).not.toContain("on demand");
 	});
 
 	it("add reports autoload status in text output without claiming storage-only", async () => {

@@ -341,4 +341,61 @@ describe("exact-file --mcp-config isolation", () => {
 		expect(loaded.configs.conventional).toBeUndefined();
 		expect(loaded.configurationWarning).toBe(false);
 	});
+
+	// The `gjc mcp list` autoload-off note tells operators to edit `autoload` and
+	// start a new session precisely because pointing `--mcp-config` at the same
+	// file does not load an opted-out server: exact-config sets autoloadOnly.
+	it("still enforces autoload: false when the file is named explicitly", async () => {
+		const exactPath = path.join(projectDir, "exact-autoload-off.json");
+		await fs.writeFile(
+			exactPath,
+			JSON.stringify({
+				mcpServers: {
+					lazy: { type: "stdio", command: "lazy-bin", autoload: false },
+					eager: { type: "stdio", command: "eager-bin" },
+				},
+			}),
+		);
+
+		const loaded = await loadAllMCPConfigs(projectDir, { filterExa: false, configPath: exactPath });
+		expect(loaded.configs.lazy).toBeUndefined();
+		expect(Object.keys(loaded.configs)).toEqual(["eager"]);
+	});
+
+	it("loads the same server once autoload is set to true or the key is removed", async () => {
+		const enabledPath = path.join(projectDir, "exact-autoload-on.json");
+		await fs.writeFile(
+			enabledPath,
+			JSON.stringify({
+				mcpServers: { lazy: { type: "stdio", command: "lazy-bin", autoload: true } },
+			}),
+		);
+		const removedPath = path.join(projectDir, "exact-autoload-removed.json");
+		await fs.writeFile(removedPath, JSON.stringify({ mcpServers: { lazy: { type: "stdio", command: "lazy-bin" } } }));
+
+		const withTrue = await loadAllMCPConfigs(projectDir, { filterExa: false, configPath: enabledPath });
+		const withoutKey = await loadAllMCPConfigs(projectDir, { filterExa: false, configPath: removedPath });
+		expect(Object.keys(withTrue.configs)).toEqual(["lazy"]);
+		expect(Object.keys(withoutKey.configs)).toEqual(["lazy"]);
+	});
+
+	// Autoload is necessary but never sufficient: the note must not imply that
+	// flipping it defeats an independent block.
+	it("keeps enabled: false and disabledServers authoritative even with autoload on", async () => {
+		const exactPath = path.join(projectDir, "exact-blocked.json");
+		await fs.writeFile(
+			exactPath,
+			JSON.stringify({
+				mcpServers: {
+					off: { type: "stdio", command: "off-bin", autoload: true, enabled: false },
+					denied: { type: "stdio", command: "denied-bin", autoload: true },
+					allowed: { type: "stdio", command: "allowed-bin", autoload: true },
+				},
+				disabledServers: ["denied"],
+			}),
+		);
+
+		const loaded = await loadAllMCPConfigs(projectDir, { filterExa: false, configPath: exactPath });
+		expect(Object.keys(loaded.configs)).toEqual(["allowed"]);
+	});
 });

@@ -92,7 +92,7 @@
           "type": "string"
         }
       },
-      "description": "Explicit OAuth client settings for servers that need them during /mcp reauth or initial connect."
+      "description": "Client settings for the interactive authorization flow, which has no public command today. Refreshing an already-stored credential does not read these: it uses the separate `auth` binding's clientId/clientSecret."
     },
     "serverBase": {
       "type": "object",
@@ -103,7 +103,7 @@
         },
         "autoload": {
           "type": "boolean",
-          "description": "Whether an explicit runtime MCP consumer should connect this server automatically when that consumer starts (default: true). Ordinary standalone gjc, gjc --tmux, and print-mode sessions honor autoload for conventional registrations; false keeps the server configured for on-demand /mcp connection, and --no-mcp opts a session out."
+          "description": "Whether an explicit runtime MCP consumer should connect this server automatically when that consumer starts (default: true). Ordinary standalone gjc, gjc --tmux, and print-mode sessions honor autoload for conventional registrations, and --no-mcp opts a session out. false keeps the server stored but unloaded: no in-session command connects it, and naming the file with --mcp-config does not override it, so set autoload to true or remove the key and start a new session. Autoload is necessary but not sufficient — enabled: false and disabledServers still block the server."
         },
         "sharing": {
           "type": "string",
@@ -112,7 +112,7 @@
             "shared"
           ],
           "default": "per-session",
-          "description": "MCP connection pool identity mode; W2 defaults to one connection per session."
+          "description": "MCP connection pool identity mode; W2 defaults to one connection per session. Sharing is scoped to a single consumer process: separate processes never join the same pooled connection."
         },
         "timeout": {
           "type": "number",
