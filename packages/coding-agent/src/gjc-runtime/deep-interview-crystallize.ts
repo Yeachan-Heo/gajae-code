@@ -289,6 +289,7 @@ type CrystalSemanticProfile = {
 	unresolved: boolean;
 	obligation: string;
 	comparison: string;
+	exclusive: boolean;
 };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -371,12 +372,12 @@ function hasLaterSupersedingCorrection(content: string, quote: string, statement
 		);
 	const explicitNegativeReplacement =
 		/\b(?:no|not|never|cannot|can['’]t|won['’]t|don['’]t|doesn['’]t|isn['’]t|aren['’]t|wasn['’]t|weren['’]t|shouldn['’]t|mustn['’]t|needn['’]t|do\s+not)\b/i.test(
-			later,
+			followingClause,
 		) &&
 		(topicOverlap || directNegativeReplacement);
 	const positiveReplacementMatch =
-		/^\s*[.!?。！？]*\s*(?:(?:switch|change)\s+to\s+([A-Za-z0-9][A-Za-z0-9+#.-]*)|replace\b[^.!?。！？]*\bwith\s+([A-Za-z0-9][A-Za-z0-9+#.-]*))/i.exec(
-			later,
+		/(?:(?:switch|change)\s+to\s+([A-Za-z0-9][A-Za-z0-9+#.-]*)|replace\b[^.!?。！？]*\bwith\s+([A-Za-z0-9][A-Za-z0-9+#.-]*))/i.exec(
+			followingClause,
 		);
 	const directPositiveReplacement =
 		positiveReplacementMatch !== null &&
@@ -480,6 +481,7 @@ function semanticProfile(value: string): CrystalSemanticProfile {
 	]
 		.sort()
 		.join(",");
+	const exclusive = /\b(?:only|exclusively|solely)\b/i.test(normalized);
 	return {
 		negative,
 		interrogative,
@@ -491,6 +493,7 @@ function semanticProfile(value: string): CrystalSemanticProfile {
 		unresolved: isExplicitlyUnresolved(normalized),
 		obligation: [...obligationTerms].sort().join(","),
 		comparison,
+		exclusive,
 	};
 }
 
@@ -505,7 +508,8 @@ function sameSemanticIntent(left: CrystalSemanticProfile, right: CrystalSemantic
 		left.refusal === right.refusal &&
 		left.unresolved === right.unresolved &&
 		left.obligation === right.obligation &&
-		left.comparison === right.comparison
+		left.comparison === right.comparison &&
+		left.exclusive === right.exclusive
 	);
 }
 
@@ -761,10 +765,10 @@ function evidenceTerms(value: string): Set<string> {
 function quantitativeEvidenceTerms(value: string): Set<string> {
 	const canonical = value.normalize("NFC");
 	const terms = new Set<string>();
-	for (const match of canonical.matchAll(/\p{Sc}|>=|<=|>|</gu)) terms.add(match[0]);
+	for (const match of canonical.matchAll(/\p{Sc}|%|>=|<=|>|</gu)) terms.add(match[0]);
 	for (const match of canonical.matchAll(/\b(\d+(?:\.\d+)?)\s*([A-Za-z]+)?\b/g)) {
 		terms.add(match[1]!);
-		if (match[2]) terms.add(match[2].toLowerCase());
+		if (match[2]) terms.add(match[2].length <= 3 && /[A-Z]/.test(match[2]) ? match[2] : match[2].toLowerCase());
 	}
 	return terms;
 }
