@@ -797,6 +797,9 @@ function validateRemovalAnchors(
 			/(?:삭제|제거|버리|제외|취소|중단|더\s+이상\s+필요\s+없|없애|削除|取り除|除外|破棄|取り消|停止|不要|删除|移除|去掉|丢弃|丟棄|排除|取消|停止|不再需要)/u.test(
 				resolution,
 			);
+		const explicitNegatedRemoval =
+			/\b(?:no\s+longer|do\s+not\s+need|don't\s+need|not\s+needed)\b/i.test(resolution) ||
+			/(?:더\s+이상\s+필요\s+없|不要|不再需要)/u.test(resolution);
 		const removalSemantics = semanticProfile(resolution);
 		const quotedRemovalSemantics = semanticProfile(quote);
 		const messageRemovalSemantics = message ? semanticProfile(anchoredClause(message.content, quote)) : undefined;
@@ -811,7 +814,7 @@ function validateRemovalAnchors(
 			resolution === previous.statement ||
 			!removalLanguage ||
 			!referencesStatement ||
-			removalSemantics.negative ||
+			(removalSemantics.negative && !explicitNegatedRemoval) ||
 			removalSemantics.interrogative ||
 			removalSemantics.conditional ||
 			removalSemantics.hedged ||
@@ -819,7 +822,7 @@ function validateRemovalAnchors(
 			removalSemantics.alternative ||
 			removalSemantics.contradictory ||
 			removalSemantics.unresolved ||
-			quotedRemovalSemantics.negative ||
+			(quotedRemovalSemantics.negative && !explicitNegatedRemoval) ||
 			quotedRemovalSemantics.interrogative ||
 			quotedRemovalSemantics.conditional ||
 			quotedRemovalSemantics.hedged ||
@@ -828,7 +831,7 @@ function validateRemovalAnchors(
 			quotedRemovalSemantics.contradictory ||
 			quotedRemovalSemantics.unresolved ||
 			!messageRemovalSemantics ||
-			messageRemovalSemantics.negative ||
+			(messageRemovalSemantics.negative && !explicitNegatedRemoval) ||
 			messageRemovalSemantics.interrogative ||
 			messageRemovalSemantics.conditional ||
 			messageRemovalSemantics.hedged ||

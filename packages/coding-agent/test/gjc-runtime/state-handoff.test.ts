@@ -1179,6 +1179,40 @@ describe("gjc state handoff", () => {
 		});
 	});
 
+	it("does not carry terminal Ralplan lineage into a newly seeded task", async () => {
+		await withTempCwd(async cwd => {
+			const ralplanPath = modeStatePath(cwd, TEST_SESSION_ID, "ralplan");
+			expect(
+				(
+					await runNativeStateCommand(
+						["write", "--mode", "ralplan", "--input", JSON.stringify({ current_phase: "planner" }), "--json"],
+						cwd,
+					)
+				).status,
+			).toBe(0);
+			const existing = (await readJson(ralplanPath)) as Record<string, unknown>;
+			await writeJson(
+				ralplanPath,
+				stampWorkflowEnvelopeChecksum(
+					{
+						...existing,
+						active: false,
+						current_phase: "complete",
+						handoff_from: "deep-interview",
+						handoff_at: "2026-06-06T00:00:00.000Z",
+					},
+					ralplanPath,
+					"2026-06-06T00:00:00.000Z",
+				),
+			);
+			const seed = await runNativeRalplanCommand(["--json", "start a distinct planning task"], cwd);
+			expect(seed.status, seed.stderr).toBe(0);
+			const persisted = await readJson(ralplanPath);
+			expect(persisted?.handoff_from).toBeUndefined();
+			expect(persisted?.handoff_at).toBeUndefined();
+		});
+	});
+
 	it("repairs a missing Deep Interview handoff index on exact retry", async () => {
 		await withTempCwd(async cwd => {
 			await writePublishedReadyCrystal(cwd);
