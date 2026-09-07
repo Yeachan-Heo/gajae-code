@@ -1081,6 +1081,7 @@ describe("gjc state handoff", () => {
 				(await runNativeStateCommand(["handoff", "--mode", "deep-interview", "--to", "ralplan", "--json"], cwd))
 					.status,
 			).toBe(0);
+			await fs.appendFile(auditPath(cwd, TEST_SESSION_ID), `${"x".repeat(2 * 1024 * 1024)}\n`);
 			await fs.writeFile(path.join(cwd, ".gjc", "config.yml"), "gjc:\n  ralplan:\n    autoHandoff: ultragoal\n");
 			const seed = await runNativeRalplanCommand(["--json", "refine the crystallized specification"], cwd);
 			expect(seed.status, seed.stderr).toBe(0);
@@ -1107,6 +1108,47 @@ describe("gjc state handoff", () => {
 				cwd,
 			);
 			expect(result.status, result.stderr).toBe(0);
+		});
+	});
+
+	it("reads Ralplan handoff lineage only after acquiring the seed lock", async () => {
+		await withTempCwd(async cwd => {
+			const ralplanPath = modeStatePath(cwd, TEST_SESSION_ID, "ralplan");
+			expect(
+				(
+					await runNativeStateCommand(
+						["write", "--mode", "ralplan", "--input", JSON.stringify({ current_phase: "planner" }), "--json"],
+						cwd,
+					)
+				).status,
+			).toBe(0);
+			let seedPromise: Promise<{ status: number; stdout?: string; stderr?: string }> | undefined;
+			await withWorkflowStateLock(
+				ralplanPath,
+				async () => {
+					seedPromise = runNativeRalplanCommand(["--json", "preserve concurrent handoff lineage"], cwd);
+					await Bun.sleep(25);
+					const current = (await readJson(ralplanPath)) as Record<string, unknown>;
+					await writeJson(
+						ralplanPath,
+						stampWorkflowEnvelopeChecksum(
+							{
+								...current,
+								handoff_from: "deep-interview",
+								handoff_at: "2026-06-05T00:00:00.000Z",
+							},
+							ralplanPath,
+							"2026-06-05T00:00:00.000Z",
+						),
+					);
+				},
+				{ cwd },
+			);
+			const seed = await seedPromise!;
+			expect(seed.status, seed.stderr).toBe(0);
+			const persisted = await readJson(ralplanPath);
+			expect(persisted?.handoff_from).toBe("deep-interview");
+			expect(persisted?.handoff_at).toBe("2026-06-05T00:00:00.000Z");
 		});
 	});
 
