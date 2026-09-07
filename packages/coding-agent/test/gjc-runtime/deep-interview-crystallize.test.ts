@@ -500,6 +500,28 @@ describe("deep-interview crystallize contract", () => {
 				}),
 			),
 		).toThrow("verbatim user anchor");
+		const qualifiedSnapshot: CrystalSnapshot = {
+			revision: 1,
+			start: 0,
+			end: 0,
+			messages: [{ index: 0, role: "user", content: "Build a fast report. Only if approved." }],
+			digest: "",
+		};
+		qualifiedSnapshot.digest = crystalSnapshotDigest(qualifiedSnapshot);
+		expect(() =>
+			crystallizeDeepInterview(
+				input({
+					snapshot: qualifiedSnapshot,
+					items: [
+						{
+							...input().items[0]!,
+							statement: "Build a fast report",
+							anchor: { message_index: 0, quote: "Build a fast report." },
+						},
+					],
+				}),
+			),
+		).toThrow("verbatim user anchor");
 	});
 	it("requires fresh evidence when inferred material becomes confirmed", () => {
 		const first = crystallizeDeepInterview(
@@ -588,12 +610,21 @@ describe("deep-interview crystallize contract", () => {
 		);
 		next.resolved_open_gap_anchors = [{ item: gap, message_index: 1, quote: answer, resolution: answer }];
 		expect(crystallizeDeepInterview(next).lifecycle).toBe("ready");
-		const conditionalAnswer = "Telemetry should not be enabled until security signs off.";
-		const conditional = withFreshUserEvidence(input({ prior: first, resolved_open_gaps: [gap] }), conditionalAnswer);
-		conditional.resolved_open_gap_anchors = [
-			{ item: gap, message_index: 1, quote: conditionalAnswer, resolution: conditionalAnswer },
-		];
-		expect(() => crystallizeDeepInterview(conditional)).toThrow("fresh verbatim user anchor");
+		for (const conditionalAnswer of [
+			"Telemetry should not be enabled until security signs off.",
+			"Telemetry should not be enabled before security signs off.",
+			"Telemetry should not be enabled after security signs off.",
+			"Telemetry should not be enabled once security signs off.",
+		]) {
+			const conditional = withFreshUserEvidence(
+				input({ prior: first, resolved_open_gaps: [gap] }),
+				conditionalAnswer,
+			);
+			conditional.resolved_open_gap_anchors = [
+				{ item: gap, message_index: 1, quote: conditionalAnswer, resolution: conditionalAnswer },
+			];
+			expect(() => crystallizeDeepInterview(conditional)).toThrow("fresh verbatim user anchor");
+		}
 	});
 	it("rejects unrelated unspaced CJK resolution evidence", () => {
 		const gap = "内存预算是多少？";

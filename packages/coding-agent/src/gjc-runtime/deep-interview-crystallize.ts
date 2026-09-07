@@ -353,6 +353,7 @@ function hasLaterSupersedingCorrection(content: string, quote: string, statement
 		/\b(?:no|not|don't|do\s+not)\b/i.test(later) && (topicOverlap || directNegativeReplacement);
 	return (
 		/\b(?:actually|instead|rather|correction|on\s+second\s+thought|make\s+that)\b/i.test(later) ||
+		/\b(?:only\s+if|unless|until|before|after|once|provided(?:\s+that)?|depending\s+on)\b/i.test(later) ||
 		explicitNegativeReplacement ||
 		/(?:사실|대신|정정|다시\s+생각|実際|代わり|訂正|やはり|实际上|實際上|改为|改為|更正)/u.test(later)
 	);
@@ -395,7 +396,7 @@ function semanticProfile(value: string): CrystalSemanticProfile {
 			normalized,
 		);
 	const conditional =
-		/\b(?:if|unless|until|provided(?:\s+that)?|assuming|in\s+case|contingent|when|depending\s+on)\b/i.test(
+		/\b(?:if|unless|until|before|after|once|provided(?:\s+that)?|assuming|in\s+case|contingent|when|depending\s+on)\b/i.test(
 			normalized,
 		) ||
 		/(?:만약|하면|라면|다면|으면|이면|경우|조건|경우에\s+따라|もし|なら|れば|たら|場合|条件|次第|如果|若|假如|倘若|除非|只要|情况下|取决于|取決於)/u.test(
