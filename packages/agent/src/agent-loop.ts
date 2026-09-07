@@ -4746,7 +4746,7 @@ async function streamAssistantResponse(
 
 			// Keep one listener, but race a fresh promise per read so pending abort
 			// reactions do not retain every event until the request ends.
-			let resolveReadAbort: ((value: typeof ABORTED) => void) | undefined;
+			let settleReadAbort: (() => void) | undefined;
 			let detachAbortListener: (() => void) | undefined;
 			if (requestSignal) {
 				if (requestSignal.aborted) {
@@ -4762,7 +4762,7 @@ async function streamAssistantResponse(
 					await finishChat(aborted);
 					return aborted;
 				}
-				const onAbort = () => resolveReadAbort?.(ABORTED);
+				const onAbort = () => settleReadAbort?.();
 				requestSignal.addEventListener("abort", onAbort, { once: true });
 				detachAbortListener = () => requestSignal.removeEventListener("abort", onAbort);
 			}
@@ -4772,12 +4772,21 @@ async function streamAssistantResponse(
 					let next: IteratorResult<AssistantMessageEvent>;
 					if (requestSignal) {
 						const { promise, resolve } = Promise.withResolvers<typeof ABORTED>();
-						resolveReadAbort = resolve;
+						let settled = false;
+						const settleAbort = (): void => {
+							if (settled) return;
+							settled = true;
+							resolve(ABORTED);
+							config.onAbortRaceReactionChange?.(-1);
+						};
+						config.onAbortRaceReactionChange?.(1);
+						settleReadAbort = settleAbort;
 						let result: IteratorResult<AssistantMessageEvent> | typeof ABORTED;
 						try {
 							result = requestSignal.aborted ? ABORTED : await Promise.race([responseIterator.next(), promise]);
 						} finally {
-							resolveReadAbort = undefined;
+							settleAbort();
+							settleReadAbort = undefined;
 						}
 						if (result === ABORTED) {
 							closeIterator();
