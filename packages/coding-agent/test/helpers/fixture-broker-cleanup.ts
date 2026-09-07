@@ -45,6 +45,65 @@ export interface FixtureRootCleanupOptions {
 const roots = new Map<string, FixtureRootCleanup>();
 const cleanupAttempts = new WeakMap<FixtureRootCleanup, Promise<void>>();
 const canonicalRoot = (root: string) => path.resolve(root);
+
+/**
+ * Abort-safe reap for fixture broker leases.
+ *
+ * `cleanupFixtureRoot` only runs on the success path. When a test throws,
+ * times out, or the runner kills the file early, the detached broker child
+ * this process spawned is reparented and keeps its port and memory forever
+ * (fixture roots under /tmp with a live `broker-internal --agent-dir` child
+ * are the signature). This registry targets exactly the leases created in
+ * this process — never a discovery-derived PID, never by name — and reaps
+ * them when the process exits abnormally. Normal cleanup unregisters first,
+ * so the exit hook is a no-op on the success path.
+ */
+interface TrackedFixtureLease {
+	cleanup: FixtureRootCleanup;
+}
+const trackedLeases = new Set<TrackedFixtureLease>();
+let reapHookInstalled = false;
+
+function installAbortReapHook(): void {
+	if (reapHookInstalled) return;
+	reapHookInstalled = true;
+	const reapTrackedLeases = (): void => {
+		// Synchronous only: the process is already exiting, so hand each
+		// retained child the same exact-child termination `close()` performs.
+		// Exact children only — a fixture lease never touches a foreign PID.
+		// The lease is dereferenced live: one caller reassigns `cleanup.lease`
+		// after construction when the real broker starts, and the hook must own
+		// the live lease, not the construction-time placeholder.
+		for (const tracked of [...trackedLeases]) {
+			trackedLeases.delete(tracked);
+			try {
+				const result = tracked.cleanup.lease.close();
+				if (result && typeof (result as Promise<void>).catch === "function")
+					(result as Promise<void>).catch(() => undefined);
+			} catch {
+				// Best-effort: teardown diagnostics must never throw from an exit hook.
+			}
+		}
+	};
+	process.once("beforeExit", reapTrackedLeases);
+	process.once("exit", reapTrackedLeases);
+}
+
+function trackFixtureLease(cleanup: FixtureRootCleanup): void {
+	installAbortReapHook();
+	trackedLeases.add({ cleanup });
+}
+
+function untrackFixtureLease(cleanup: FixtureRootCleanup): void {
+	for (const tracked of [...trackedLeases]) {
+		if (tracked.cleanup === cleanup) trackedLeases.delete(tracked);
+	}
+}
+
+/** Test hook: number of fixture broker leases still owned by this process. */
+export function trackedFixtureLeaseCountForTest(): number {
+	return trackedLeases.size;
+}
 async function exists(root: string): Promise<boolean> {
 	try {
 		await fs.stat(root);
@@ -141,6 +200,7 @@ export function createFixtureRootCleanup(
 		failures: {},
 	};
 	roots.set(canonical, cleanup);
+	trackFixtureLease(cleanup);
 	return cleanup;
 }
 
@@ -251,6 +311,7 @@ async function cleanupFixtureRootOnce(
 		throw error;
 	}
 	roots.delete(root.rootKey);
+	untrackFixtureLease(root);
 }
 
 export function cleanupFixtureRoot(root: FixtureRootCleanup, options: FixtureRootCleanupOptions = {}): Promise<void> {

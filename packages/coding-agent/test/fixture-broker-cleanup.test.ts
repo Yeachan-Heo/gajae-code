@@ -8,11 +8,10 @@ import {
 	createFixtureRootCleanup,
 	fixtureRootForTest,
 	registerFixtureRuntime,
+	trackedFixtureLeaseCountForTest,
 	withFixtureBrokerEnvironment,
 } from "./helpers/fixture-broker-cleanup";
-
 const temp = () => fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-fixture-cleanup-"));
-
 function lease(events: string[], failures = 0) {
 	let attempts = 0;
 	return {
@@ -340,5 +339,30 @@ describe("fixture broker root cleanup", () => {
 		// ...and is removed when the fixture root is cleaned up (no external residue).
 		await fs.rm(root, { recursive: true, force: true });
 		expect(await exists(child)).toBe(false);
+	});
+
+	it("tracks each created fixture broker lease until its root cleanup verifies", async () => {
+		const before = trackedFixtureLeaseCountForTest();
+		const root = await temp();
+		const cleanup = createFixtureRootCleanup(root, path.join(root, "agent"), lease([]));
+		expect(trackedFixtureLeaseCountForTest()).toBe(before + 1);
+		await cleanupFixtureRoot(cleanup, { absenceObservationMs: 0, rootExists: async () => false });
+		expect(trackedFixtureLeaseCountForTest()).toBe(before);
+		expect(fixtureRootForTest(root)).toBeUndefined();
+	});
+
+	it("retains the abort reap registration while lease close is still pending", async () => {
+		const before = trackedFixtureLeaseCountForTest();
+		const root = await temp();
+		const cleanup = createFixtureRootCleanup(root, path.join(root, "agent"), lease([], 1));
+		expect(trackedFixtureLeaseCountForTest()).toBe(before + 1);
+		await expect(
+			cleanupFixtureRoot(cleanup, { absenceObservationMs: 0, rootExists: async () => false }),
+		).rejects.toThrow("lease close failed");
+		// The child is still alive after a failed close, so the abort hook must still own it.
+		expect(trackedFixtureLeaseCountForTest()).toBe(before + 1);
+		expect(fixtureRootForTest(root)).toBe(cleanup);
+		await cleanupFixtureRoot(cleanup, { absenceObservationMs: 0, rootExists: async () => false });
+		expect(trackedFixtureLeaseCountForTest()).toBe(before);
 	});
 });
