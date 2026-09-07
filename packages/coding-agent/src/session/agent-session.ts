@@ -2294,6 +2294,10 @@ export class StreamingEditFileCache {
 	}
 }
 type SessionAdmissionKind = "prompt" | "selection";
+type SessionSelectionIdentity = {
+	readonly sessionId: string;
+	readonly sessionIdentityEpoch: number;
+};
 class SessionRunCancellationDomainBridge implements RunCancellationDomainBridge {
 	#domains = new Map<string, { domain: RunCancellationDomain; controller: AbortController }>();
 	#released = new Set<string>();
@@ -3468,6 +3472,26 @@ export class AgentSession {
 		});
 	}
 
+	#captureSessionSelectionIdentity(): SessionSelectionIdentity {
+		return { sessionId: this.sessionId, sessionIdentityEpoch: this.#sessionIdentityEpoch };
+	}
+
+	#isSessionSelectionIdentityCurrent(identity: SessionSelectionIdentity): boolean {
+		return identity.sessionId === this.sessionId && identity.sessionIdentityEpoch === this.#sessionIdentityEpoch;
+	}
+
+	#assertSessionSelectionIdentityCurrent(identity: SessionSelectionIdentity): void {
+		if (!this.#isSessionSelectionIdentityCurrent(identity)) {
+			throw new Error("Session changed while selecting model");
+		}
+	}
+
+	#assertSelectionMutationReady(identity: SessionSelectionIdentity): void {
+		this.#assertNoSessionTransition();
+		this.#assertSessionSelectionIdentityCurrent(identity);
+		this.#assertTerminalPersistenceSettledForHistoryMutation();
+	}
+
 	#assertSessionAdmissionOpen(): void {
 		if (this.#sessionAdmissionClosing || this.#sessionAdmissionClosed || this.#isDisposed) {
 			throw this.#sessionAdmissionBusyError();
@@ -3615,6 +3639,7 @@ export class AgentSession {
 				code: "session_persistence_blocked",
 			});
 		}
+		if (this.#activeSessionAdmission?.kind === "selection") throw this.#sessionAdmissionBusyError();
 		if (this.#sessionTransitionKind !== undefined) {
 			throw Object.assign(
 				new Error(`Cannot start ${kind} while a ${this.#sessionTransitionKind} transition is in progress.`),
@@ -3738,13 +3763,26 @@ export class AgentSession {
 		},
 	): Promise<T> {
 		const owner = this.#sessionAdmissionContext.getStore();
+		const allowCausalSelectionReentry =
+			kind === "selection" && options?.allowPromptContinuationReentry === true && owner?.kind === "prompt";
 		if (kind === "prompt" && this.#sessionTransitionKind !== undefined) this.#assertTransitionIngressAllowed();
+		if (kind === "selection" && this.#sessionTransitionKind !== undefined) this.#assertNoSessionTransition();
 		if (owner && !owner.released) {
 			if (
 				continuationAdmission?.entry === owner &&
 				continuationAdmission.capability === owner.continuationCapability
 			) {
 				if (kind === "prompt") await this.#reconcileTerminalPersistenceFailure();
+				return await body({ release: () => {} });
+			}
+			if (kind === "selection" && (owner.kind === "selection" || owner.kind === "prompt")) {
+				// Nested selection is causal work owned by the current admission. Do
+				// not await agent-end reconciliation here: context promotion is often
+				// reached from the agent-end handler itself, so that await would wait
+				// on the handler that is currently waiting for this selection. The
+				// synchronous fence below still rejects an active terminal recovery;
+				// the outer admission already reconciled before entering this owner.
+				this.#assertTerminalPersistenceSettledForHistoryMutation();
 				return await body({ release: () => {} });
 			}
 			if (options?.allowPromptContinuationReentry === true && owner.kind === "prompt") {
@@ -3794,6 +3832,9 @@ export class AgentSession {
 		if (kind === "prompt" && this.#sessionTransitionKind !== undefined) {
 			this.#assertTransitionIngressAllowed();
 		}
+		if (kind === "selection" && this.#sessionTransitionKind !== undefined) {
+			this.#assertNoSessionTransition();
+		}
 
 		const entry: SessionAdmissionEntry = {
 			kind,
@@ -3835,7 +3876,10 @@ export class AgentSession {
 			if (kind === "prompt" && this.#sessionTransitionKind !== undefined) {
 				this.#assertTransitionIngressAllowed();
 			}
-			await this.#reconcileTerminalPersistenceFailure();
+			if (kind === "selection" && this.#sessionTransitionKind !== undefined) {
+				this.#assertNoSessionTransition();
+			}
+			if (!allowCausalSelectionReentry) await this.#reconcileTerminalPersistenceFailure();
 
 			const release = () => {
 				releaseEntry();
@@ -3844,6 +3888,32 @@ export class AgentSession {
 		} finally {
 			releaseEntry();
 		}
+	}
+
+	async #withSelectionAdmission<T>(
+		identity: SessionSelectionIdentity,
+		body: (lease: SessionAdmissionLease) => Promise<T>,
+		signal?: AbortSignal,
+		options?: {
+			allowDuringClosing?: boolean;
+			closedSelectionTransaction?: symbol;
+			selectionTransaction?: symbol;
+			onAfterReadyForTests?: () => Promise<void>;
+			allowPromptContinuationReentry?: boolean;
+		},
+	): Promise<T> {
+		this.#assertNoSessionTransition();
+		this.#assertSessionSelectionIdentityCurrent(identity);
+		return this.#withSessionAdmission(
+			"selection",
+			async lease => {
+				this.#assertSelectionMutationReady(identity);
+				return body(lease);
+			},
+			signal,
+			undefined,
+			options,
+		);
 	}
 
 	async #closeSessionAdmission(options?: { waitForActive?: boolean }): Promise<void> {
@@ -4748,7 +4818,7 @@ export class AgentSession {
 				this.agent.followUp(message);
 			},
 			injectIdle: async (messages, signal, identityIsCurrent = () => true) => {
-				if (messages.length === 0) return;
+				if (messages.length === 0) return "delivered" as const;
 				// Mandated boundary comment (corrected turn semantics): same origin
 				// split as the streaming injector — an allowed owned-completion
 				// delivery starts a fresh turn attempt/lineage and is not a
@@ -4761,7 +4831,7 @@ export class AgentSession {
 				// must not occupy the bounded registry (review thread P2).
 				if (dropped.length > 0) this.#settleDeliveredOwnedRegistrations(dropped);
 				const first = survivors[0];
-				if (!first) return;
+				if (!first) return "dropped" as const;
 				const settleIfDisposing = (): boolean => {
 					if (!this.#isDisposed && !this.#sessionAdmissionClosing && !this.#disposeAbortController.signal.aborted)
 						return false;
@@ -4769,19 +4839,26 @@ export class AgentSession {
 					return true;
 				};
 				try {
-					await this.#withSessionAdmission(
+					const result = await this.#withSessionAdmission(
 						"prompt",
 						async () => {
-							if (settleIfDisposing()) return;
+							if (settleIfDisposing()) return "dropped" as const;
 							if (this.isStreaming) {
 								await awaitPromptInvocationPreflight(this.agent.waitForIdle(), signal);
-								if (settleIfDisposing()) return;
+								if (settleIfDisposing()) return "dropped" as const;
 							}
-							if (!identityIsCurrent()) return;
+							if (!identityIsCurrent()) {
+								this.#settleDeliveredOwnedRegistrations(survivors);
+								return "dropped" as const;
+							}
 							if (survivors.some(message => ownedCompletionResumeAction(message) === "fresh"))
 								this.#resumeFromOwnedCompletion();
 							if (survivors.length === 1) {
 								this.#assertNoSessionTransition();
+								if (!identityIsCurrent()) {
+									this.#settleDeliveredOwnedRegistrations(survivors);
+									return "dropped" as const;
+								}
 								await this.agent.prompt(first, {
 									...this.#managedFallbackPromptOptions(),
 									onRunAccepted: (handle: AttemptRunHandle) => {
@@ -4790,6 +4867,10 @@ export class AgentSession {
 								});
 							} else {
 								this.#assertNoSessionTransition();
+								if (!identityIsCurrent()) {
+									this.#settleDeliveredOwnedRegistrations(survivors);
+									return "dropped" as const;
+								}
 								await this.agent.prompt(survivors, {
 									...this.#managedFallbackPromptOptions(),
 									onRunAccepted: (handle: AttemptRunHandle) => {
@@ -4797,20 +4878,26 @@ export class AgentSession {
 									},
 								});
 							}
+							return "delivered" as const;
 						},
 						signal,
 						undefined,
 						{ idleDelivery: true },
 					);
-				} finally {
-					// The owned completions were delivered OR the prompt attempt
-					// failed (e.g. provider rejection): either way the yield
-					// queue already drained the entries, so this is their only
-					// delivery boundary — settle the registrations even on
-					// failure, otherwise repeated failed idle resumptions leak
-					// terminal tuples into the global registries until capacity
-					// is exhausted (review thread P2).
+					if (result === "dropped") return result;
 					this.#settleDeliveredOwnedRegistrations(survivors);
+					return "delivered" as const;
+				} catch (error) {
+					if (!identityIsCurrent()) {
+						this.#settleDeliveredOwnedRegistrations(survivors);
+						return "dropped" as const;
+					}
+					// Only transition/admission busy failures are retryable. Once
+					// prompt reaches the provider boundary, or rejects for any other
+					// reason, the drained delivery is terminal and must settle now.
+					if ((error as { code?: unknown })?.code === "busy") throw error;
+					this.#settleDeliveredOwnedRegistrations(survivors);
+					return "dropped" as const;
 				}
 			},
 			scheduleIdleFlush: (run, onSkip) => {
@@ -6612,10 +6699,16 @@ export class AgentSession {
 	): Promise<void> => {
 		const attemptScope = (event as AgentEvent & { scope?: AttemptScope }).scope;
 		const eventAdmission = this.#agentEventAdmission.get(event);
+		const eventSessionIdentity = this.#captureSessionSelectionIdentity();
 		const eventIdentityIsCurrent = (): boolean =>
 			eventAdmission?.sessionId === undefined ||
 			(eventAdmission.sessionId === this.sessionId &&
 				eventAdmission.sessionIdentityEpoch === this.#sessionIdentityEpoch);
+		const agentEndIdentity = event.type === "agent_end" ? eventSessionIdentity : undefined;
+		const agentEndIdentityIsCurrent = (): boolean =>
+			agentEndIdentity === undefined ||
+			(this.#sessionTransitionKind === undefined &&
+				this.#isSessionSelectionIdentityCurrent(agentEndIdentity));
 		const attemptScopeKey = attemptScope ? this.#attemptScopeKey(attemptScope) : undefined;
 		const discardRejectedAssistantEvent = (): void => {
 			if (
@@ -7129,6 +7222,10 @@ export class AgentSession {
 		}
 
 		await this.#emitSessionEvent(displayEvent, eventLease);
+		if (!eventIdentityIsCurrent() || !agentEndIdentityIsCurrent()) {
+			discardRejectedAssistantEvent();
+			return;
+		}
 		if (event.type === "message_end" && event.message.role === "assistant") {
 			this.#assistantAttemptScopes.set(event.message, {
 				scope: attemptScope,
@@ -7487,6 +7584,8 @@ export class AgentSession {
 
 		// Check auto-retry and auto-compaction after agent completes
 		if (event.type === "agent_end") {
+			if (!agentEndIdentityIsCurrent()) return;
+			if (!agentEndIdentity) return;
 			if ((event as AgentEndSessionEvent).terminalPersistenceFailed === true) {
 				this.#lastAssistantMessage = undefined;
 				this.#lastSuccessfulYieldToolCallId = undefined;
@@ -7508,6 +7607,7 @@ export class AgentSession {
 					if (
 						!maintenanceWasDisposed &&
 						!this.#isDisposed &&
+						agentEndIdentityIsCurrent() &&
 						maintenanceGeneration !== undefined &&
 						this.#promptGeneration === maintenanceGeneration
 					) {
@@ -7517,6 +7617,8 @@ export class AgentSession {
 							resourceRunId: activePromptHandle,
 							maintenanceContinuation: true,
 							sdkRunToken: attemptScope ? this.#sdkRunTokensByAttemptScope.get(attemptScope) : undefined,
+							scheduledSessionId: agentEndIdentity.sessionId,
+							scheduledSessionIdentityEpoch: agentEndIdentity.sessionIdentityEpoch,
 						});
 					}
 					return;
@@ -7527,6 +7629,7 @@ export class AgentSession {
 				// synthetic assistant error that must flow through terminal handling.
 				if (event.maintenanceOutcome === "aborted") return;
 			}
+			if (!agentEndIdentityIsCurrent()) return;
 			const usage = this.getSessionStats().tokens;
 			await this.#goalRuntime.onAgentEnd({
 				currentUsage: {
@@ -7536,12 +7639,15 @@ export class AgentSession {
 					cacheWrite: usage.cacheWrite,
 				},
 			});
+			if (!agentEndIdentityIsCurrent()) return;
 			if (this.#activeSkillState) {
 				const { skill, sessionId } = this.#activeSkillState;
+				if (!agentEndIdentityIsCurrent()) return;
 				await this.#syncSkillPromptActiveStateSafely(
 					{ customType: SKILL_PROMPT_MESSAGE_TYPE, details: { name: skill } },
 					false,
 				);
+				if (!agentEndIdentityIsCurrent()) return;
 				if (this.#activeSkillState?.skill === skill && this.#activeSkillState.sessionId === sessionId) {
 					this.#activeSkillState = undefined;
 				}
@@ -7561,6 +7667,7 @@ export class AgentSession {
 			if (terminalAdmission && !terminalAdmission.predecessor.released) {
 				await terminalAdmission.predecessor.promise;
 			}
+			if (!agentEndIdentityIsCurrent()) return;
 			if (!msg) {
 				this.#lastSuccessfulYieldToolCallId = undefined;
 				this.#resolveRetry();
@@ -7575,8 +7682,10 @@ export class AgentSession {
 				msg.errorMessage?.includes("GitHub Copilot authentication failed")
 			) {
 				await this.#modelRegistry.authStorage.remove("github-copilot");
+				if (!agentEndIdentityIsCurrent()) return;
 			}
 
+			if (!agentEndIdentityIsCurrent()) return;
 			if (this.#skipPostTurnMaintenanceAssistantTimestamp === msg.timestamp) {
 				this.#skipPostTurnMaintenanceAssistantTimestamp = undefined;
 				this.#lastSuccessfulYieldToolCallId = undefined;
@@ -7585,7 +7694,11 @@ export class AgentSession {
 
 			if (this.#assistantEndedWithSuccessfulYield(msg)) {
 				this.#lastSuccessfulYieldToolCallId = undefined;
-				if (msg.stopReason !== "error" && msg.stopReason !== "aborted" && (await this.#checkGoalCompletion(msg))) {
+				if (
+					msg.stopReason !== "error" &&
+					msg.stopReason !== "aborted" &&
+					(await this.#checkGoalCompletion(msg, agentEndIdentity))
+				) {
 					return;
 				}
 				return;
@@ -7601,6 +7714,7 @@ export class AgentSession {
 
 			// Check for retryable errors first (overloaded, rate limit, server errors)
 			if (this.#isRetryableError(msg)) {
+				if (!agentEndIdentityIsCurrent()) return;
 				const transportFailure = (msg as AssistantMessage & { transportFailure?: TransportFailureFacts })
 					.transportFailure;
 				const messageScope = this.#assistantAttemptScopes.get(msg);
@@ -7611,6 +7725,7 @@ export class AgentSession {
 					messageScope?.scope ?? event.scope,
 					messageScope?.wasClean ?? false,
 				);
+				if (!agentEndIdentityIsCurrent()) return;
 				if (didRetry) return; // Retry was initiated, don't proceed to compaction
 			}
 			if (this.#retryAttempt > 0) {
@@ -7624,37 +7739,50 @@ export class AgentSession {
 					attempt,
 					finalError: msg.errorMessage,
 				});
+				if (!agentEndIdentityIsCurrent()) return;
 			}
 			this.#resolveRetry();
-			if (this.#isDisposed || this.#sessionAdmissionClosing) return;
+			if (!agentEndIdentityIsCurrent() || this.#isDisposed || this.#sessionAdmissionClosing) return;
 
 			const compactionTask = this.#schedulePostPromptTask(
 				async () => {
 					if (this.#isDisposed || this.#sessionAdmissionClosing) return;
-					await this.#checkCompaction(msg, true, undefined, activePromptHandle);
+					await this.#checkCompaction(msg, true, undefined, activePromptHandle, undefined, agentEndIdentity);
 				},
-				{ resourceRunId: activePromptHandle },
+				{
+					resourceRunId: activePromptHandle,
+					scheduledSessionId: agentEndIdentity.sessionId,
+					scheduledSessionIdentityEpoch: agentEndIdentity.sessionIdentityEpoch,
+				},
 			);
 			await compactionTask;
+			if (!agentEndIdentityIsCurrent()) return;
 			// Check for incomplete todos only after a final assistant stop, not intermediate tool-use turns.
 			const hasToolCalls = msg.content.some(content => content.type === "toolCall");
 			if (hasToolCalls) {
 				return;
 			}
 			if (msg.stopReason !== "error" && msg.stopReason !== "aborted") {
-				if (this.#enforceRewindBeforeYield()) {
+				if (this.#enforceRewindBeforeYield(agentEndIdentity)) {
 					return;
 				}
 				if (
-					(await this.#checkActiveDeepInterviewCompletion(msg, agentEndGeneration, agentEndOwnerEpoch)) !==
+					(await this.#checkActiveDeepInterviewCompletion(
+						msg,
+						agentEndGeneration,
+						agentEndOwnerEpoch,
+						agentEndIdentity,
+					)) !==
 					"not_applicable"
 				) {
 					return;
 				}
-				if (await this.#checkGoalCompletion(msg)) {
+				if (!agentEndIdentityIsCurrent()) return;
+				if (await this.#checkGoalCompletion(msg, agentEndIdentity)) {
 					return;
 				}
-				await this.#checkTodoCompletion();
+				if (!agentEndIdentityIsCurrent()) return;
+				await this.#checkTodoCompletion(agentEndIdentity);
 			}
 		}
 	};
@@ -7733,6 +7861,8 @@ export class AgentSession {
 			leaseTask?: Promise<void>;
 			selectionFenceGeneration?: number;
 			excludeFromPostPromptRecovery?: boolean;
+			scheduledSessionId?: string;
+			scheduledSessionIdentityEpoch?: number;
 		},
 	): Promise<void> {
 		const selectionFenceGeneration =
@@ -7741,8 +7871,10 @@ export class AgentSession {
 			this.#sessionAdmissionContext.getStore()?.selectionFenceGeneration ??
 			this.#selectionFenceGeneration;
 		const delayMs = options?.delayMs ?? 0;
-		const scheduledSessionId = this.sessionId;
-		const scheduledSessionIdentityEpoch = this.#sessionIdentityEpoch;
+		const scheduledSessionIdentity: SessionSelectionIdentity = {
+			sessionId: options?.scheduledSessionId ?? this.sessionId,
+			sessionIdentityEpoch: options?.scheduledSessionIdentityEpoch ?? this.#sessionIdentityEpoch,
+		};
 		const resourceRunId = options?.resourceRunId;
 		const contextualLease = this.#runResourceLeaseContext.getStore();
 		const parentLease =
@@ -7783,7 +7915,10 @@ export class AgentSession {
 				options.onSkip?.();
 				return;
 			}
-			if (this.sessionId !== scheduledSessionId || this.#sessionIdentityEpoch !== scheduledSessionIdentityEpoch) {
+			if (
+				this.#sessionTransitionKind !== undefined ||
+				!this.#isSessionSelectionIdentityCurrent(scheduledSessionIdentity)
+			) {
 				options?.onSkip?.();
 				return;
 			}
@@ -7931,6 +8066,10 @@ export class AgentSession {
 										skip("generation_changed");
 										return false;
 									}
+									if (this.#sessionTransitionKind !== undefined) {
+										skip("handoff_in_progress");
+										return false;
+									}
 									if (this.#cancelAndSubmitInProgress && !options?.allowDuringCancelAndSubmit) {
 										skip("queue_drained");
 										return false;
@@ -7965,6 +8104,10 @@ export class AgentSession {
 									}
 									if (options?.shouldContinue && !options.shouldContinue()) {
 										skip("queue_drained");
+										return;
+									}
+									if (this.#sessionTransitionKind !== undefined) {
+										skip("handoff_in_progress");
 										return;
 									}
 									// Final synchronous boundary before agent.continue* entry; no await
@@ -8121,6 +8264,8 @@ export class AgentSession {
 					resourceRunId: options?.resourceRunId,
 					leaseTask: leaseSettlement.promise,
 					selectionFenceGeneration,
+					scheduledSessionId,
+					scheduledSessionIdentityEpoch,
 				},
 			);
 		};
@@ -8169,9 +8314,26 @@ export class AgentSession {
 		return compactionSettings.autoContinue === false ? "auto_continue_disabled_non_resumable_tail" : undefined;
 	}
 
-	async #scheduleOverflowRetryContinuation(generation: number, resourceRunId?: string): Promise<boolean> {
+	async #scheduleOverflowRetryContinuation(
+		generation: number,
+		resourceRunId?: string,
+		scheduledSessionIdentity?: SessionSelectionIdentity,
+	): Promise<boolean> {
+		const continuationIdentity = scheduledSessionIdentity ?? this.#captureSessionSelectionIdentity();
+		if (
+			this.#sessionTransitionKind !== undefined ||
+			!this.#isSessionSelectionIdentityCurrent(continuationIdentity)
+		) {
+			return false;
+		}
 		this.#stripOverflowFailedTurnForRetry();
 		const snapshot = await this.#compactionStateSnapshot();
+		if (
+			this.#sessionTransitionKind !== undefined ||
+			!this.#isSessionSelectionIdentityCurrent(continuationIdentity)
+		) {
+			return false;
+		}
 		if (
 			snapshot.goal?.status === "paused" &&
 			!snapshot.queuedMessages &&
@@ -8186,6 +8348,8 @@ export class AgentSession {
 				generation,
 				suppressPredecessorAgentEnd: true,
 				resourceRunId,
+				scheduledSessionId: continuationIdentity.sessionId,
+				scheduledSessionIdentityEpoch: continuationIdentity.sessionIdentityEpoch,
 				onSkip: reason => this.#logCompactionContinuationSkipped("overflow_retry", reason),
 				onError: error => this.#logCompactionContinuationError("overflow_retry", error),
 			});
@@ -8194,7 +8358,15 @@ export class AgentSession {
 
 		const compactionSettings = this.settings.getGroup("compaction");
 		if (compactionSettings.autoContinue !== false) {
-			this.#scheduleAutoContinuePrompt(generation, false, resourceRunId);
+			this.#scheduleAutoContinuePrompt(
+				generation,
+				false,
+				resourceRunId,
+				undefined,
+				undefined,
+				undefined,
+				continuationIdentity,
+			);
 			return true;
 		}
 
@@ -8209,8 +8381,12 @@ export class AgentSession {
 		deferredSelectionFenceGeneration?: number,
 		deferredPredecessorAgentEnd?: AgentSessionEvent,
 		sdkRunToken?: string,
+		scheduledSessionIdentity?: SessionSelectionIdentity,
 	): void {
 		const scheduledGeneration = generation;
+		const continuationIdentity = scheduledSessionIdentity ?? this.#captureSessionSelectionIdentity();
+		const continuationIdentityIsCurrent = (): boolean =>
+			this.#sessionTransitionKind === undefined && this.#isSessionSelectionIdentityCurrent(continuationIdentity);
 		const scheduledSdkRunToken =
 			sdkRunToken ??
 			(this.#activeAttemptScope ? this.#sdkRunTokensByAttemptScope.get(this.#activeAttemptScope) : undefined);
@@ -8218,12 +8394,20 @@ export class AgentSession {
 			signal: AbortSignal,
 			hasPendingNextTurnMessages = false,
 		): Promise<boolean> => {
+			if (!continuationIdentityIsCurrent()) {
+				this.#logCompactionContinuationSkipped("auto_continue_prompt", "generation_changed");
+				return false;
+			}
 			const snapshot = await this.#compactionStateSnapshot();
 			if (signal.aborted) {
 				this.#logCompactionContinuationSkipped("auto_continue_prompt", "aborted_signal");
 				return false;
 			}
-			if (this.#isDisposed || this.#promptGeneration !== scheduledGeneration) {
+			if (
+				this.#isDisposed ||
+				this.#promptGeneration !== scheduledGeneration ||
+				!continuationIdentityIsCurrent()
+			) {
 				this.#logCompactionContinuationSkipped(
 					"auto_continue_prompt",
 					this.#isDisposed ? "session_disposed" : "generation_changed",
@@ -8244,7 +8428,7 @@ export class AgentSession {
 					snapshot.lastAssistantStopReason === "length" ||
 					snapshot.goal?.status !== "paused";
 			if (!authorized) this.emitNotice("info", "Auto-continue skipped: no unfinished work detected");
-			return authorized;
+			return authorized && continuationIdentityIsCurrent();
 		};
 		const continuationAdmission = this.#captureScheduledContinuationAdmission();
 		const selectionFenceGeneration =
@@ -8267,6 +8451,7 @@ export class AgentSession {
 						selectionFenceGeneration,
 						predecessorAgentEnd,
 						scheduledSdkRunToken,
+						continuationIdentity,
 					);
 				} finally {
 					this.#endSelectionFenceDeferralTracking(selectionFenceGeneration);
@@ -8289,7 +8474,7 @@ export class AgentSession {
 								this.#logCompactionContinuationSkipped("auto_continue_prompt", "aborted_signal");
 								return;
 							}
-							if (this.#promptGeneration !== scheduledGeneration) {
+							if (!continuationIdentityIsCurrent() || this.#promptGeneration !== scheduledGeneration) {
 								this.#logCompactionContinuationSkipped("auto_continue_prompt", "generation_changed");
 								return;
 							}
@@ -8299,11 +8484,19 @@ export class AgentSession {
 							// prompt; unknown/paused/terminal workflows keep the
 							// generic continuation and latest-user-intent supremacy.
 							const recoverySnapshot = await this.#compactionStateSnapshot();
+							if (!continuationIdentityIsCurrent()) {
+								this.#logCompactionContinuationSkipped("auto_continue_prompt", "generation_changed");
+								return;
+							}
 							const recoveryPrompt = buildWorkflowRecoveryContinuationPrompt(
 								recoverySnapshot.workflowRecovery,
 								recoverySnapshot.activeSkills,
 							);
 							const promptText = recoveryPrompt ?? autoContinuePrompt;
+							if (!continuationIdentityIsCurrent()) {
+								this.#logCompactionContinuationSkipped("auto_continue_prompt", "generation_changed");
+								return;
+							}
 							await this.#promptWithMessage(
 								{
 									role: "developer",
@@ -8341,6 +8534,8 @@ export class AgentSession {
 				generation: scheduledGeneration,
 				resourceRunId,
 				selectionFenceGeneration,
+				scheduledSessionId: continuationIdentity.sessionId,
+				scheduledSessionIdentityEpoch: continuationIdentity.sessionIdentityEpoch,
 				onSkip: () => {
 					this.#logCompactionContinuationSkipped("auto_continue_prompt", "aborted_signal");
 					this.#releaseDeferredAgentEndContinuation(predecessorAgentEndHold);
@@ -16508,57 +16703,61 @@ export class AgentSession {
 			onMutationStarted?: () => void;
 		},
 	): Promise<void> {
-		this.#assertTransitionIngressAllowed();
-		await this.#reconcileTerminalPersistenceFailure();
-		const previousEditMode = this.#resolveActiveEditMode();
-		const apiKey = await this.#modelRegistry.getApiKey(model, this.credentialSessionId);
-		if (!apiKey) {
-			throw new Error(`No API key for ${model.provider}/${model.id}`);
-		}
+		const identity = this.#captureSessionSelectionIdentity();
+		await this.#withSelectionAdmission(identity, async () => {
+			const previousEditMode = this.#resolveActiveEditMode();
+			const apiKey = await this.#modelRegistry.getApiKey(model, this.credentialSessionId);
+			this.#assertSelectionMutationReady(identity);
+			if (!apiKey) {
+				throw new Error(`No API key for ${model.provider}/${model.id}`);
+			}
 
-		options?.onMutationStarted?.();
-		this.#setModelAuthoritatively(model, options?.cause ?? "user-selection");
-		this.#seedSessionCanonicalVariant(model);
-		this.sessionManager.appendModelChange(`${model.provider}/${model.id}`, role);
-		this.settings.setModelRole(
-			role,
-			this.#formatRoleModelValue(role, model, options?.selector, options?.thinkingLevel),
-		);
-		// Only an explicit user selection starts a new fallback epoch. Internal
-		// fallback switches must preserve the exhausted-model set while advancing.
-		if (role === "default" && (options?.cause ?? "user-selection") === "user-selection") {
-			this.#fallbackTransitionGeneration++;
-			this.#defaultFallbackController = undefined;
-			this.#defaultFallbackExhaustedLastTurn = false;
-			this.#escapedNonAsciiExhaustedModelKeys.clear();
-		}
-		this.settings.getStorage()?.recordModelUsage(`${model.provider}/${model.id}`);
+			options?.onMutationStarted?.();
+			this.#assertSelectionMutationReady(identity);
+			this.#setModelAuthoritatively(model, options?.cause ?? "user-selection");
+			this.#seedSessionCanonicalVariant(model);
+			this.sessionManager.appendModelChange(`${model.provider}/${model.id}`, role);
+			this.settings.setModelRole(
+				role,
+				this.#formatRoleModelValue(role, model, options?.selector, options?.thinkingLevel),
+			);
+			// Only an explicit user selection starts a new fallback epoch. Internal
+			// fallback switches must preserve the exhausted-model set while advancing.
+			if (role === "default" && (options?.cause ?? "user-selection") === "user-selection") {
+				this.#fallbackTransitionGeneration++;
+				this.#defaultFallbackController = undefined;
+				this.#defaultFallbackExhaustedLastTurn = false;
+				this.#escapedNonAsciiExhaustedModelKeys.clear();
+			}
+			this.settings.getStorage()?.recordModelUsage(`${model.provider}/${model.id}`);
 
-		// Persist configured intent rather than a transient controller index. A pick
-		// inside an existing chain keeps its deterministic suffix; a different
-		// thinking choice for the same concrete model becomes the new head followed
-		// by that concrete entry's tail. Picks outside the chain are one-entry intent.
-		const configuredChain = this.getConfiguredModelChain(role);
-		if (configuredChain) {
-			const selectedSelector = this.#canonicalSelector(model, options?.selector, options?.thinkingLevel);
-			const exactIndex = configuredChain.indexOf(selectedSelector);
-			const concreteIndex = configuredChain.findIndex(entry => {
-				const parsed = parseModelString(entry);
-				return parsed?.provider === model.provider && parsed.id === model.id;
-			});
-			const entries =
-				exactIndex !== -1
-					? configuredChain.slice(exactIndex)
-					: concreteIndex !== -1
-						? [selectedSelector, ...configuredChain.slice(concreteIndex + 1)]
-						: [selectedSelector];
-			this.setConfiguredModelChain(role, entries, "model_selection");
-		}
+			// Persist configured intent rather than a transient controller index. A pick
+			// inside an existing chain keeps its deterministic suffix; a different
+			// thinking choice for the same concrete model becomes the new head followed
+			// by that concrete entry's tail. Picks outside the chain are one-entry intent.
+			const configuredChain = this.getConfiguredModelChain(role);
+			if (configuredChain) {
+				const selectedSelector = this.#canonicalSelector(model, options?.selector, options?.thinkingLevel);
+				const exactIndex = configuredChain.indexOf(selectedSelector);
+				const concreteIndex = configuredChain.findIndex(entry => {
+					const parsed = parseModelString(entry);
+					return parsed?.provider === model.provider && parsed.id === model.id;
+				});
+				const entries =
+					exactIndex !== -1
+						? configuredChain.slice(exactIndex)
+						: concreteIndex !== -1
+							? [selectedSelector, ...configuredChain.slice(concreteIndex + 1)]
+							: [selectedSelector];
+				this.setConfiguredModelChain(role, entries, "model_selection");
+			}
 
-		// Apply the explicitly selected thinking level when the selector supplies one;
-		// otherwise prefer the model's configured defaultLevel, then preserve the current level.
-		this.setThinkingLevel(options?.thinkingLevel ?? model.thinking?.defaultLevel ?? this.thinkingLevel);
-		await this.#syncEditToolModeAfterModelChange(previousEditMode);
+			// Apply the explicitly selected thinking level when the selector supplies one;
+			// otherwise prefer the model's configured defaultLevel, then preserve the current level.
+			this.setThinkingLevel(options?.thinkingLevel ?? model.thinking?.defaultLevel ?? this.thinkingLevel);
+			await this.#syncEditToolModeAfterModelChange(previousEditMode);
+			this.#assertSessionSelectionIdentityCurrent(identity);
+		});
 	}
 
 	setActiveModelProfile(name: string | undefined): void {
@@ -16702,13 +16901,17 @@ export class AgentSession {
 	 * Session-scoped only: does not persist `modelProfile.default`.
 	 */
 	async activateModelProfileForControl(profileName: string): Promise<boolean> {
-		await activateModelProfile({
-			session: this,
-			modelRegistry: this.#modelRegistry,
-			settings: this.settings,
-			profileName,
+		const identity = this.#captureSessionSelectionIdentity();
+		return this.#withSelectionAdmission(identity, async () => {
+			await activateModelProfile({
+				session: this,
+				modelRegistry: this.#modelRegistry,
+				settings: this.settings,
+				profileName,
+			});
+			this.#assertSelectionMutationReady(identity);
+			return this.getActiveModelProfile() === profileName;
 		});
-		return this.getActiveModelProfile() === profileName;
 	}
 
 	/**
@@ -16742,10 +16945,12 @@ export class AgentSession {
 			onAfterActivation?: () => void;
 		},
 	): Promise<{ changed: boolean; id: string }> {
+		const identity = this.#captureSessionSelectionIdentity();
 		// Do not hold selection admission while waiting for a scheduled continuation:
 		// the continuation may need prompt admission to settle the current turn.
 		await this.waitForIdle();
-		const canonicalName = await this.#withSessionAdmission("selection", async () => {
+		this.#assertSessionSelectionIdentityCurrent(identity);
+		const canonicalName = await this.#withSelectionAdmission(identity, async () => {
 			const profiles = this.#modelRegistry.getModelProfiles();
 			let canonical: string;
 			try {
@@ -16757,6 +16962,7 @@ export class AgentSession {
 			}
 			const priorModel = this.model;
 			options?.onBeforeActivation?.();
+			this.#assertSelectionMutationReady(identity);
 			await activateModelProfile(
 				{
 					session: this,
@@ -16769,7 +16975,9 @@ export class AgentSession {
 					thinkingLevelOverride: options?.thinkingLevelOverride,
 				},
 			);
+			this.#assertSelectionMutationReady(identity);
 			options?.onAfterActivation?.();
+			this.#assertSelectionMutationReady(identity);
 			// A role-only profile has no default model, so the activation never
 			// calls `setModelTemporary` — the only place that consumes the
 			// thinking override. Apply the override to the existing model so the
@@ -16832,12 +17040,12 @@ export class AgentSession {
 	 * profile activation and default-model selection.
 	 */
 	async withSdkControlMutation<T>(body: () => Promise<T>): Promise<T> {
+		const identity = this.#captureSessionSelectionIdentity();
 		// Waiting while selection owns admission deadlocks with a scheduled
 		// continuation queued behind it. Wait before acquiring the mutation lease.
 		await this.waitForIdle();
-		return this.#withSessionAdmission("selection", async () => {
-			return await body();
-		});
+		this.#assertSessionSelectionIdentityCurrent(identity);
+		return this.#withSelectionAdmission(identity, body);
 	}
 
 	/** Return the persisted configured fallback selectors for a model role. */
@@ -16984,67 +17192,92 @@ export class AgentSession {
 			reason?: TemporaryModelReason;
 			providerSessionScope?: TemporaryProviderSessionScope;
 			signal?: AbortSignal;
+			allowPromptContinuationReentry?: boolean;
 		},
 		// biome-ignore lint/suspicious/noConfusingVoidType: Existing session adapters return Promise<void>; a scope is optional.
 	): Promise<TemporaryProviderSessionScope | void> {
 		if (options?.signal?.aborted) return;
-		const suppliedScope = options?.providerSessionScope;
-		if (suppliedScope && this.#temporaryProviderSessionScopes.at(-1)?.token !== suppliedScope) return;
-		const previousEditMode = this.#resolveActiveEditMode();
-		const expectedSessionId = this.sessionId;
-		const apiKey = await this.#modelRegistry.getApiKey(model, this.credentialSessionId);
-		if (options?.signal?.aborted) return;
-		if (this.sessionId !== expectedSessionId) {
-			throw new Error("Session changed while selecting model");
-		}
-		if (!apiKey) {
-			throw new Error(`No API key for ${model.provider}/${model.id}`);
-		}
-		if (suppliedScope && this.#temporaryProviderSessionScopes.at(-1)?.token !== suppliedScope) return;
-
-		const isTemporaryOperation = options?.cause === undefined || options.cause === "temporary-operation";
-		const autoCreateScope = isTemporaryOperation && !suppliedScope;
-		const currentAutoScope = this.#currentAutoTemporaryProviderSessionScope();
-		const replaceAutoScope =
-			autoCreateScope &&
-			currentAutoScope !== undefined &&
-			this.#temporaryProviderSessionScopes.at(-1) === currentAutoScope;
-		if (replaceAutoScope && currentAutoScope) {
-			await this.#restoreTopTemporaryProviderSessionScope();
-		}
-		const scope = isTemporaryOperation
-			? (suppliedScope ??
-				(replaceAutoScope && this.model && modelsAreEqual(this.model, model)
-					? undefined
-					: this.#beginTemporaryProviderSessionScope(options?.reason ?? "other", true)))
-			: undefined;
-		const ownsScope = scope !== undefined && !suppliedScope;
+		const identity = this.#captureSessionSelectionIdentity();
 		try {
-			if (isTemporaryOperation) {
-				this.#setAgentModelWithReasoningContext(model);
-				this.#syncAppendOnlyContext(model);
-			} else {
-				this.#setModelAuthoritatively(model, options?.cause ?? "temporary-operation");
-			}
-			this.sessionManager.appendModelChange(
-				`${model.provider}/${model.id}`,
-				options?.persistAsSessionDefault ? "default" : "temporary",
-			);
-			this.settings.getStorage()?.recordModelUsage(`${model.provider}/${model.id}`);
-			if (options?.persistAsSessionDefault) {
-				this.#seedSessionCanonicalVariant(model);
-			}
+			return await this.#withSelectionAdmission(
+				identity,
+				async () => {
+					const suppliedScope = options?.providerSessionScope;
+					if (suppliedScope && this.#temporaryProviderSessionScopes.at(-1)?.token !== suppliedScope) return;
+					const previousEditMode = this.#resolveActiveEditMode();
+					const apiKey = await this.#modelRegistry.getApiKey(model, this.credentialSessionId);
+					if (options?.signal?.aborted) return;
+					this.#assertSelectionMutationReady(identity);
+					if (!apiKey) {
+						throw new Error(`No API key for ${model.provider}/${model.id}`);
+					}
+					if (suppliedScope && this.#temporaryProviderSessionScopes.at(-1)?.token !== suppliedScope) return;
 
-			// Apply explicit thinking level if given; otherwise prefer the model's
-			// configured defaultLevel; otherwise re-clamp the current level.
-			this.setThinkingLevel(thinkingLevel ?? model.thinking?.defaultLevel ?? this.thinkingLevel);
-			if (options?.persistAsSessionDefault === true) this.#clearActiveModelProfileForConcreteDefault(options?.cause);
-			await this.#syncEditToolModeAfterModelChange(previousEditMode);
+					const isTemporaryOperation = options?.cause === undefined || options.cause === "temporary-operation";
+					const autoCreateScope = isTemporaryOperation && !suppliedScope;
+					const currentAutoScope = this.#currentAutoTemporaryProviderSessionScope();
+					const replaceAutoScope =
+						autoCreateScope &&
+						currentAutoScope !== undefined &&
+						this.#temporaryProviderSessionScopes.at(-1) === currentAutoScope;
+					if (replaceAutoScope && currentAutoScope) {
+						this.#assertSelectionMutationReady(identity);
+						await this.#restoreTopTemporaryProviderSessionScope();
+						if (options?.signal?.aborted) return;
+						this.#assertSelectionMutationReady(identity);
+					}
+					this.#assertSelectionMutationReady(identity);
+					const scope = isTemporaryOperation
+						? (suppliedScope ??
+							(replaceAutoScope && this.model && modelsAreEqual(this.model, model)
+								? undefined
+								: this.#beginTemporaryProviderSessionScope(options?.reason ?? "other", true)))
+						: undefined;
+					const ownsScope = scope !== undefined && !suppliedScope;
+					try {
+						this.#assertSelectionMutationReady(identity);
+						if (isTemporaryOperation) {
+							this.#setAgentModelWithReasoningContext(model);
+							this.#syncAppendOnlyContext(model);
+						} else {
+							this.#setModelAuthoritatively(model, options?.cause ?? "temporary-operation");
+						}
+						this.sessionManager.appendModelChange(
+							`${model.provider}/${model.id}`,
+							options?.persistAsSessionDefault ? "default" : "temporary",
+						);
+						this.settings.getStorage()?.recordModelUsage(`${model.provider}/${model.id}`);
+						if (options?.persistAsSessionDefault) {
+							this.#seedSessionCanonicalVariant(model);
+						}
+
+						// Apply explicit thinking level if given; otherwise prefer the model's
+						// configured defaultLevel; otherwise re-clamp the current level.
+						this.setThinkingLevel(thinkingLevel ?? model.thinking?.defaultLevel ?? this.thinkingLevel);
+						if (options?.persistAsSessionDefault === true)
+							this.#clearActiveModelProfileForConcreteDefault(options?.cause);
+						await this.#syncEditToolModeAfterModelChange(previousEditMode);
+						this.#assertSessionSelectionIdentityCurrent(identity);
+					} catch (error) {
+						if (
+							ownsScope &&
+							this.#isSessionSelectionIdentityCurrent(identity) &&
+							this.#sessionTransitionKind === undefined &&
+							!this.#terminalPersistenceRecovery
+						) {
+							await this.restoreTemporaryProviderSessionScope(scope);
+						}
+						throw error;
+					}
+					return scope;
+				},
+				options?.signal,
+				{ allowPromptContinuationReentry: options?.allowPromptContinuationReentry },
+			);
 		} catch (error) {
-			if (ownsScope) await this.restoreTemporaryProviderSessionScope(scope);
+			if (options?.signal?.aborted) return;
 			throw error;
 		}
-		return scope;
 	}
 
 	/** Restore the exact live-model state captured before a failed selector transaction. */
@@ -17052,17 +17285,21 @@ export class AgentSession {
 		model: Model | undefined,
 		thinkingLevel: ThinkingLevel | undefined,
 	): Promise<void> {
-		this.#assertTransitionIngressAllowed();
-		await this.#reconcileTerminalPersistenceFailure();
-		if (model) {
-			await this.setModelTemporary(model, thinkingLevel, { cause: "rollback", reason: "other" });
-			return;
-		}
-		const previousEditMode = this.#resolveActiveEditMode();
-		this.#clearActiveRetryFallback();
-		this.#setModelWithProviderSessionReset(undefined);
-		this.setThinkingLevel(thinkingLevel);
-		await this.#syncEditToolModeAfterModelChange(previousEditMode);
+		const identity = this.#captureSessionSelectionIdentity();
+		return this.#withSelectionAdmission(identity, async () => {
+			if (model) {
+				await this.setModelTemporary(model, thinkingLevel, { cause: "rollback", reason: "other" });
+				this.#assertSessionSelectionIdentityCurrent(identity);
+				return;
+			}
+			const previousEditMode = this.#resolveActiveEditMode();
+			this.#assertSelectionMutationReady(identity);
+			this.#clearActiveRetryFallback();
+			this.#setModelWithProviderSessionReset(undefined);
+			this.setThinkingLevel(thinkingLevel);
+			await this.#syncEditToolModeAfterModelChange(previousEditMode);
+			this.#assertSessionSelectionIdentityCurrent(identity);
+		});
 	}
 
 	async #restoreDefaultModelSelectionCommit(
@@ -17167,13 +17404,14 @@ export class AgentSession {
 		expectedSessionId: string = this.sessionId,
 		thinkingLevel?: ThinkingLevel,
 	): Promise<boolean> {
-		if (expectedSessionId !== this.sessionId) return false;
+		const identity = this.#captureSessionSelectionIdentity();
+		if (expectedSessionId !== identity.sessionId) return false;
 		try {
 			await this.setModelTemporary(model, thinkingLevel, {
 				persistAsSessionDefault: true,
 				cause: "user-selection",
 			});
-			return expectedSessionId === this.sessionId;
+			return this.#isSessionSelectionIdentityCurrent(identity);
 		} catch {
 			logger.warn("session: model control failed");
 			return false;
@@ -17205,7 +17443,7 @@ export class AgentSession {
 		if (thinkingLevel === ThinkingLevel.Inherit) {
 			throw new Error("Default model selection cannot inherit a thinking level");
 		}
-		const expectedSessionId = this.sessionId;
+		const identity = this.#captureSessionSelectionIdentity();
 		const selectionTransaction = Symbol("default-model-selection");
 		const priorSelectionFence = this.#selectionFenceTail;
 		const selectionFence = Promise.withResolvers<void>();
@@ -17219,16 +17457,11 @@ export class AgentSession {
 		void this.#selectionFenceTail.catch(() => {});
 		try {
 			await priorSelectionFence;
-			const { effectiveLevel } = await this.#withSessionAdmission(
-				"selection",
+			const { effectiveLevel } = await this.#withSelectionAdmission(
+				identity,
 				async () => {
-					if (this.sessionId !== expectedSessionId) {
-						throw new Error("Session changed while selecting model");
-					}
 					const apiKey = await this.#modelRegistry.getApiKey(model, this.credentialSessionId);
-					if (this.sessionId !== expectedSessionId) {
-						throw new Error("Session changed while selecting model");
-					}
+					this.#assertSelectionMutationReady(identity);
 					if (!apiKey) {
 						throw new Error(`No API key for ${model.provider}/${model.id}`);
 					}
@@ -17241,37 +17474,33 @@ export class AgentSession {
 					};
 				},
 				undefined,
-				undefined,
 				{ allowDuringClosing: true, selectionTransaction },
 			);
 			this.#selectionAwaitingMutationTransaction = selectionTransaction;
 			await this.waitForIdle(selectionFenceGeneration);
 			await options?.onBeforeMutationAdmissionForTests?.();
-			return await this.#withSessionAdmission(
-				"selection",
+			return await this.#withSelectionAdmission(
+				identity,
 				async () => {
 					options?.onBeforeMutation?.();
-					if (this.sessionId !== expectedSessionId) {
-						throw new Error("Session changed while selecting model");
-					}
+					this.#assertSelectionMutationReady(identity);
 					await this.sessionManager.flush();
+					this.#assertSelectionMutationReady(identity);
 					await this.#waitForAdmittedBaseSystemPromptRebuilds();
-					if (this.sessionId !== expectedSessionId) {
-						throw new Error("Session changed while selecting model");
-					}
+					this.#assertSelectionMutationReady(identity);
 					const expectedMutationRevision = this.#defaultModelSelectionMutationRevision;
 					const preparedSystemPrompt = await this.#prepareDefaultModelSelectionPrompt(model);
-					if (this.sessionId !== expectedSessionId) {
-						throw new Error("Session changed while selecting model");
-					}
+					this.#assertSelectionMutationReady(identity);
 					const stage = await this.sessionManager.stageDefaultModelSelection(
 						`${model.provider}/${model.id}`,
 						effectiveLevel,
 						{ appendThinkingLevel: true },
 					);
+					this.#assertSelectionMutationReady(identity);
 					let durableCommit: CasReceipt;
 					try {
 						const selector = formatModelSelectorValue(`${model.provider}/${model.id}`, effectiveLevel);
+						this.#assertSelectionMutationReady(identity);
 						durableCommit = await this.settings.commitAtomicBatchWithCurrent(() => [
 							{ path: "modelRoles.default" as SettingPath, op: "set", value: selector },
 						]);
@@ -17286,6 +17515,7 @@ export class AgentSession {
 						}
 						throw error;
 					}
+					this.#assertSelectionMutationReady(identity);
 					if (this.#defaultModelSelectionMutationRevision !== expectedMutationRevision) {
 						await this.#throwDefaultModelSelectionRecovery(
 							new Error("Default model selection was superseded before session promotion"),
@@ -17322,11 +17552,11 @@ export class AgentSession {
 							});
 						}
 					}
+					this.#assertSelectionMutationReady(identity);
 					this.#clearActiveModelProfileForConcreteDefault("user-selection");
 					options?.onAfterMutation?.();
 					return { provider: model.provider, modelId: model.id, thinkingLevel: effectiveLevel };
 				},
-				undefined,
 				undefined,
 				{
 					allowDuringClosing: true,
@@ -17353,10 +17583,15 @@ export class AgentSession {
 	 * @returns The new model info, or undefined if only one model available
 	 */
 	async cycleModel(direction: "forward" | "backward" = "forward"): Promise<ModelCycleResult | undefined> {
-		if (this.#scopedModels.length > 0) {
-			return this.#cycleScopedModel(direction);
-		}
-		return this.#cycleAvailableModel(direction);
+		const identity = this.#captureSessionSelectionIdentity();
+		return this.#withSelectionAdmission(identity, async () => {
+			const result =
+				this.#scopedModels.length > 0
+					? await this.#cycleScopedModel(direction)
+					: await this.#cycleAvailableModel(direction);
+			this.#assertSessionSelectionIdentityCurrent(identity);
+			return result;
+		});
 	}
 
 	/** Number of configured role-model candidates that can be cycled. */
@@ -17412,37 +17647,43 @@ export class AgentSession {
 		roleOrder: readonly string[],
 		options?: { temporary?: boolean },
 	): Promise<RoleModelCycleResult | undefined> {
-		const roleModels = this.#getRoleModelCycleCandidates(roleOrder, this.sessionId);
-		if (roleModels.length <= 1) return undefined;
+		const identity = this.#captureSessionSelectionIdentity();
+		return this.#withSelectionAdmission(identity, async () => {
+			const roleModels = this.#getRoleModelCycleCandidates(roleOrder, this.sessionId);
+			if (roleModels.length <= 1) return undefined;
 
-		const currentModel = this.model!;
+			const currentModel = this.model!;
 
-		const lastRole = this.sessionManager.getLastModelChangeRole();
-		let currentIndex = lastRole ? roleModels.findIndex(entry => entry.role === lastRole) : -1;
-		if (currentIndex === -1) {
-			currentIndex = roleModels.findIndex(entry => modelsAreEqual(entry.model, currentModel));
-		}
-		if (currentIndex === -1) currentIndex = 0;
-
-		const nextIndex = (currentIndex + 1) % roleModels.length;
-		const next = roleModels[nextIndex];
-
-		if (options?.temporary) {
-			await this.setModelTemporary(next.model, next.explicitThinkingLevel ? next.thinkingLevel : undefined, {
-				cause: "temporary-operation",
-				reason: "temporary-cycle",
-			});
-		} else {
-			await this.setModel(next.model, next.role, { cause: "user-selection" });
-			if (next.explicitThinkingLevel && next.thinkingLevel !== undefined) {
-				this.setThinkingLevel(next.thinkingLevel);
+			const lastRole = this.sessionManager.getLastModelChangeRole();
+			let currentIndex = lastRole ? roleModels.findIndex(entry => entry.role === lastRole) : -1;
+			if (currentIndex === -1) {
+				currentIndex = roleModels.findIndex(entry => modelsAreEqual(entry.model, currentModel));
 			}
-			// Materialize only after applying the selected explicit level so the
-			// durable selector matches the live cycle result after restart.
-			this.#clearActiveModelProfileForConcreteDefault("user-selection");
-		}
+			if (currentIndex === -1) currentIndex = 0;
 
-		return { model: next.model, thinkingLevel: this.thinkingLevel, role: next.role };
+			const nextIndex = (currentIndex + 1) % roleModels.length;
+			const next = roleModels[nextIndex];
+
+			if (options?.temporary) {
+				await this.setModelTemporary(next.model, next.explicitThinkingLevel ? next.thinkingLevel : undefined, {
+					cause: "temporary-operation",
+					reason: "temporary-cycle",
+				});
+			} else {
+				await this.setModel(next.model, next.role, { cause: "user-selection" });
+				if (next.explicitThinkingLevel && next.thinkingLevel !== undefined) {
+					this.#assertSelectionMutationReady(identity);
+					this.setThinkingLevel(next.thinkingLevel);
+				}
+				// Materialize only after applying the selected explicit level so the
+				// durable selector matches the live cycle result after restart.
+				this.#assertSelectionMutationReady(identity);
+				this.#clearActiveModelProfileForConcreteDefault("user-selection");
+			}
+
+			this.#assertSessionSelectionIdentityCurrent(identity);
+			return { model: next.model, thinkingLevel: this.thinkingLevel, role: next.role };
+		});
 	}
 
 	async #getScopedModelsWithApiKey(): Promise<Array<{ model: Model; thinkingLevel?: ThinkingLevel }>> {
@@ -17580,10 +17821,11 @@ export class AgentSession {
 	 * Set thinking level from a control surface. Global changes commit before affecting live state.
 	 */
 	async setThinkingLevelForControl(level: ThinkingLevel, persist: boolean): Promise<void> {
-		this.#assertTransitionIngressAllowed();
-		if (persist) await this.#reconcileTerminalPersistenceFailure();
-		const previousThinkingLevel = this.thinkingLevel;
+		const identity = this.#captureSessionSelectionIdentity();
+		return this.#withSelectionAdmission(identity, async lease => {
 		if (!persist) {
+			const previousThinkingLevel = this.thinkingLevel;
+			this.#assertSelectionMutationReady(identity);
 			this.#applyThinkingLevel(
 				level === ThinkingLevel.Inherit ? this.#getInheritedThinkingLevel() : level,
 				false,
@@ -17603,91 +17845,105 @@ export class AgentSession {
 		const persistedLevel = level === ThinkingLevel.Inherit ? getDefault("defaultThinkingLevel") : effectiveLevel;
 		const mutationRevision = ++this.#thinkingLevelMutationRevision;
 		const expectedLiveMutationRevision = this.#thinkingLevelLiveMutationRevision;
-		const expectedSessionId = this.sessionManager.getSessionId();
+		const expectedSessionId = identity.sessionId;
 		const expectedModel = this.model;
 		const expectedContextGeneration = this.#reasoningControlContextGeneration;
+		lease.release();
 		try {
 			await this.settings.commitAtomicBatch([{ path: "defaultThinkingLevel", op: "set", value: persistedLevel }]);
 		} catch {
+			await this.#withSelectionAdmission(identity, async () => {
+				if (
+					mutationRevision === this.#thinkingLevelMutationRevision &&
+					this.#reasoningControlContextGeneration === expectedContextGeneration &&
+					this.#isSessionSelectionIdentityCurrent(identity) &&
+					!this.#terminalPersistenceRecovery &&
+					this.model === expectedModel
+				) {
+					const pending = this.#pendingThinkingLevelControlSuccess;
+					this.#pendingThinkingLevelControlSuccess = undefined;
+					if (
+						pending &&
+						pending.contextGeneration === expectedContextGeneration &&
+						this.sessionManager.getSessionId() === pending.sessionId &&
+						this.model === pending.model
+					) {
+						this.#assertSelectionMutationReady(identity);
+						this.setThinkingLevel(
+							pending.level === ThinkingLevel.Inherit ? this.#getInheritedThinkingLevel() : pending.level,
+						);
+						this.sessionManager.appendThinkingLevelChange(ThinkingLevel.Inherit);
+					} else {
+						this.#pendingThinkingLevelControlFailure = {
+							mutationRevision,
+							liveMutationRevision: expectedLiveMutationRevision,
+							sessionId: expectedSessionId,
+							model: expectedModel,
+							contextGeneration: expectedContextGeneration,
+						};
+					}
+				}
+			});
+			throw new Error("Unable to persist reasoning settings.");
+		}
+
+		const postCommitIdentity = this.#captureSessionSelectionIdentity();
+		if (postCommitIdentity.sessionId !== expectedSessionId) return;
+		await this.#withSelectionAdmission(postCommitIdentity, async () => {
 			if (
 				mutationRevision === this.#thinkingLevelMutationRevision &&
-				this.#reasoningControlContextGeneration === expectedContextGeneration &&
-				this.sessionManager.getSessionId() === expectedSessionId &&
-				this.model === expectedModel
+				this.#thinkingLevelLiveMutationRevision === expectedLiveMutationRevision
 			) {
-				const pending = this.#pendingThinkingLevelControlSuccess;
-				this.#pendingThinkingLevelControlSuccess = undefined;
+				this.#assertSelectionMutationReady(postCommitIdentity);
+				this.setThinkingLevel(level === ThinkingLevel.Inherit ? this.#getInheritedThinkingLevel() : level);
+				this.sessionManager.appendThinkingLevelChange(ThinkingLevel.Inherit);
+				return;
+			}
+			if (
+				mutationRevision !== this.#thinkingLevelMutationRevision ||
+				this.#reasoningControlContextGeneration !== expectedContextGeneration ||
+				!this.#isSessionSelectionIdentityCurrent(identity) ||
+				this.model !== expectedModel
+			) {
 				if (
-					pending &&
-					pending.contextGeneration === expectedContextGeneration &&
-					this.sessionManager.getSessionId() === pending.sessionId &&
-					this.model === pending.model
+					this.#thinkingLevelLiveMutationRevision === expectedLiveMutationRevision &&
+					this.#reasoningControlContextGeneration === expectedContextGeneration &&
+					this.#isSessionSelectionIdentityCurrent(identity) &&
+					!this.#terminalPersistenceRecovery &&
+					this.model === expectedModel &&
+					(this.#pendingThinkingLevelControlSuccess?.mutationRevision ?? -1) < mutationRevision
 				) {
-					this.setThinkingLevel(
-						pending.level === ThinkingLevel.Inherit ? this.#getInheritedThinkingLevel() : pending.level,
-					);
-					this.sessionManager.appendThinkingLevelChange(ThinkingLevel.Inherit);
-				} else {
-					this.#pendingThinkingLevelControlFailure = {
+					this.#pendingThinkingLevelControlSuccess = {
+						level,
 						mutationRevision,
-						liveMutationRevision: expectedLiveMutationRevision,
 						sessionId: expectedSessionId,
 						model: expectedModel,
 						contextGeneration: expectedContextGeneration,
 					};
+					const failure = this.#pendingThinkingLevelControlFailure;
+					if (
+						failure &&
+						failure.mutationRevision === this.#thinkingLevelMutationRevision &&
+						failure.liveMutationRevision === expectedLiveMutationRevision &&
+						failure.sessionId === expectedSessionId &&
+						failure.model === expectedModel &&
+						failure.contextGeneration === expectedContextGeneration
+					) {
+						this.#assertSelectionMutationReady(postCommitIdentity);
+						this.#pendingThinkingLevelControlFailure = undefined;
+						this.setThinkingLevel(
+							level === ThinkingLevel.Inherit ? this.#getInheritedThinkingLevel() : effectiveLevel,
+						);
+						this.sessionManager.appendThinkingLevelChange(ThinkingLevel.Inherit);
+					}
 				}
+				return;
 			}
-			throw new Error("Unable to persist reasoning settings.");
-		}
-
-		if (
-			mutationRevision === this.#thinkingLevelMutationRevision &&
-			this.#thinkingLevelLiveMutationRevision === expectedLiveMutationRevision
-		) {
-			this.setThinkingLevel(level === ThinkingLevel.Inherit ? this.#getInheritedThinkingLevel() : level);
+			this.#assertSelectionMutationReady(postCommitIdentity);
+			this.setThinkingLevel(level === ThinkingLevel.Inherit ? this.#getInheritedThinkingLevel() : effectiveLevel);
 			this.sessionManager.appendThinkingLevelChange(ThinkingLevel.Inherit);
-			return;
-		}
-		if (
-			mutationRevision !== this.#thinkingLevelMutationRevision ||
-			this.#reasoningControlContextGeneration !== expectedContextGeneration ||
-			this.sessionManager.getSessionId() !== expectedSessionId ||
-			this.model !== expectedModel
-		) {
-			if (
-				this.#thinkingLevelLiveMutationRevision === expectedLiveMutationRevision &&
-				this.#reasoningControlContextGeneration === expectedContextGeneration &&
-				this.sessionManager.getSessionId() === expectedSessionId &&
-				this.model === expectedModel &&
-				(this.#pendingThinkingLevelControlSuccess?.mutationRevision ?? -1) < mutationRevision
-			) {
-				this.#pendingThinkingLevelControlSuccess = {
-					level,
-					mutationRevision,
-					sessionId: expectedSessionId,
-					model: expectedModel,
-					contextGeneration: expectedContextGeneration,
-				};
-				const failure = this.#pendingThinkingLevelControlFailure;
-				if (
-					failure &&
-					failure.mutationRevision === this.#thinkingLevelMutationRevision &&
-					failure.liveMutationRevision === expectedLiveMutationRevision &&
-					failure.sessionId === expectedSessionId &&
-					failure.model === expectedModel &&
-					failure.contextGeneration === expectedContextGeneration
-				) {
-					this.#pendingThinkingLevelControlFailure = undefined;
-					this.setThinkingLevel(
-						level === ThinkingLevel.Inherit ? this.#getInheritedThinkingLevel() : effectiveLevel,
-					);
-					this.sessionManager.appendThinkingLevelChange(ThinkingLevel.Inherit);
-				}
-			}
-			return;
-		}
-		this.setThinkingLevel(level === ThinkingLevel.Inherit ? this.#getInheritedThinkingLevel() : effectiveLevel);
-		this.sessionManager.appendThinkingLevelChange(ThinkingLevel.Inherit);
+		});
+		});
 	}
 
 	getThinkingScopeForControl(): "session" | "global config" {
@@ -17720,9 +17976,10 @@ export class AgentSession {
 	 * Set thinking visibility from a control surface. Global changes commit before affecting live state.
 	 */
 	async setThinkingVisibilityForControl(visibility: "visible" | "hidden", persist: boolean): Promise<void> {
-		this.#assertTransitionIngressAllowed();
-		if (persist) await this.#reconcileTerminalPersistenceFailure();
+		const identity = this.#captureSessionSelectionIdentity();
+		return this.#withSelectionAdmission(identity, async lease => {
 		if (!persist) {
+			this.#assertSelectionMutationReady(identity);
 			this.setThinkingVisibility(visibility);
 			return;
 		}
@@ -17730,85 +17987,102 @@ export class AgentSession {
 		this.#assertDurableSettingsWritable();
 		const mutationRevision = ++this.#thinkingVisibilityMutationRevision;
 		const expectedLiveMutationRevision = this.#thinkingVisibilityLiveMutationRevision;
-		const expectedSessionId = this.sessionManager.getSessionId();
+		const expectedSessionId = identity.sessionId;
 		const expectedModel = this.model;
 		const expectedContextGeneration = this.#reasoningControlContextGeneration;
+		lease.release();
 		try {
 			await this.settings.commitAtomicBatch([
 				{ path: "hideThinkingBlock", op: "set", value: visibility === "hidden" },
 			]);
 		} catch {
+			const recoveryIdentity = this.#captureSessionSelectionIdentity();
+			if (recoveryIdentity.sessionId === expectedSessionId) {
+			await this.#withSelectionAdmission(recoveryIdentity, async () => {
+				if (
+					mutationRevision === this.#thinkingVisibilityMutationRevision &&
+					this.#reasoningControlContextGeneration === expectedContextGeneration &&
+					this.#isSessionSelectionIdentityCurrent(identity) &&
+					!this.#terminalPersistenceRecovery &&
+					this.model === expectedModel
+				) {
+					const pending = this.#pendingThinkingVisibilityControlSuccess;
+					this.#pendingThinkingVisibilityControlSuccess = undefined;
+					if (
+						pending &&
+						pending.contextGeneration === expectedContextGeneration &&
+						this.sessionManager.getSessionId() === pending.sessionId &&
+						this.model === pending.model
+					) {
+						this.#assertSelectionMutationReady(recoveryIdentity);
+						this.setThinkingVisibility(pending.visibility);
+					} else {
+						this.#pendingThinkingVisibilityControlFailure = {
+							mutationRevision,
+							liveMutationRevision: expectedLiveMutationRevision,
+							sessionId: expectedSessionId,
+							model: expectedModel,
+							contextGeneration: expectedContextGeneration,
+						};
+					}
+				}
+			});
+			}
+			throw new Error("Unable to persist reasoning settings.");
+		}
+		const postCommitIdentity = this.#captureSessionSelectionIdentity();
+		if (postCommitIdentity.sessionId !== expectedSessionId) return;
+		await this.#withSelectionAdmission(postCommitIdentity, async () => {
 			if (
 				mutationRevision === this.#thinkingVisibilityMutationRevision &&
-				this.#reasoningControlContextGeneration === expectedContextGeneration &&
-				this.sessionManager.getSessionId() === expectedSessionId &&
-				this.model === expectedModel
+				this.#thinkingVisibilityLiveMutationRevision === expectedLiveMutationRevision
 			) {
-				const pending = this.#pendingThinkingVisibilityControlSuccess;
-				this.#pendingThinkingVisibilityControlSuccess = undefined;
+				this.#assertSelectionMutationReady(postCommitIdentity);
+				this.setThinkingVisibility(visibility);
+				return;
+			}
+
+			if (
+				mutationRevision !== this.#thinkingVisibilityMutationRevision ||
+				this.#reasoningControlContextGeneration !== expectedContextGeneration ||
+				!this.#isSessionSelectionIdentityCurrent(identity) ||
+				this.model !== expectedModel
+			) {
 				if (
-					pending &&
-					pending.contextGeneration === expectedContextGeneration &&
-					this.sessionManager.getSessionId() === pending.sessionId &&
-					this.model === pending.model
+					this.#thinkingVisibilityLiveMutationRevision === expectedLiveMutationRevision &&
+					this.#reasoningControlContextGeneration === expectedContextGeneration &&
+					this.#isSessionSelectionIdentityCurrent(identity) &&
+					!this.#terminalPersistenceRecovery &&
+					this.model === expectedModel &&
+					(this.#pendingThinkingVisibilityControlSuccess?.mutationRevision ?? -1) < mutationRevision
 				) {
-					this.setThinkingVisibility(pending.visibility);
-				} else {
-					this.#pendingThinkingVisibilityControlFailure = {
+					this.#pendingThinkingVisibilityControlSuccess = {
+						visibility,
 						mutationRevision,
-						liveMutationRevision: expectedLiveMutationRevision,
 						sessionId: expectedSessionId,
 						model: expectedModel,
 						contextGeneration: expectedContextGeneration,
 					};
+					const failure = this.#pendingThinkingVisibilityControlFailure;
+					if (
+						failure &&
+						failure.mutationRevision === this.#thinkingVisibilityMutationRevision &&
+						failure.liveMutationRevision === expectedLiveMutationRevision &&
+						failure.sessionId === expectedSessionId &&
+						failure.model === expectedModel &&
+						failure.contextGeneration === expectedContextGeneration
+					) {
+						this.#assertSelectionMutationReady(postCommitIdentity);
+						this.#pendingThinkingVisibilityControlFailure = undefined;
+						this.setThinkingVisibility(visibility);
+					}
 				}
+				return;
 			}
-			throw new Error("Unable to persist reasoning settings.");
-		}
-		if (
-			mutationRevision === this.#thinkingVisibilityMutationRevision &&
-			this.#thinkingVisibilityLiveMutationRevision === expectedLiveMutationRevision
-		) {
+			this.#assertSelectionMutationReady(postCommitIdentity);
 			this.setThinkingVisibility(visibility);
-			return;
-		}
-
-		if (
-			mutationRevision !== this.#thinkingVisibilityMutationRevision ||
-			this.#reasoningControlContextGeneration !== expectedContextGeneration ||
-			this.sessionManager.getSessionId() !== expectedSessionId ||
-			this.model !== expectedModel
-		) {
-			if (
-				this.#thinkingVisibilityLiveMutationRevision === expectedLiveMutationRevision &&
-				this.#reasoningControlContextGeneration === expectedContextGeneration &&
-				this.sessionManager.getSessionId() === expectedSessionId &&
-				this.model === expectedModel &&
-				(this.#pendingThinkingVisibilityControlSuccess?.mutationRevision ?? -1) < mutationRevision
-			) {
-				this.#pendingThinkingVisibilityControlSuccess = {
-					visibility,
-					mutationRevision,
-					sessionId: expectedSessionId,
-					model: expectedModel,
-					contextGeneration: expectedContextGeneration,
-				};
-				const failure = this.#pendingThinkingVisibilityControlFailure;
-				if (
-					failure &&
-					failure.mutationRevision === this.#thinkingVisibilityMutationRevision &&
-					failure.liveMutationRevision === expectedLiveMutationRevision &&
-					failure.sessionId === expectedSessionId &&
-					failure.model === expectedModel &&
-					failure.contextGeneration === expectedContextGeneration
-				) {
-					this.#pendingThinkingVisibilityControlFailure = undefined;
-					this.setThinkingVisibility(visibility);
-				}
-			}
-			return;
-		}
-		this.setThinkingVisibility(visibility);
+		});
+		});
 	}
 
 	/**
@@ -17817,6 +18091,16 @@ export class AgentSession {
 	 */
 	cycleThinkingLevel(): ThinkingLevel | undefined {
 		if (!this.model?.reasoning) return undefined;
+		const identity = this.#captureSessionSelectionIdentity();
+		const owner = this.#sessionAdmissionContext.getStore();
+		const active = this.#activeSessionAdmission;
+		if (
+			(active !== undefined && (active !== owner || active.kind !== "selection")) ||
+			this.#sessionAdmissionQueue.some(entry => entry !== active)
+		) {
+			throw this.#sessionAdmissionBusyError();
+		}
+		this.#assertSelectionMutationReady(identity);
 
 		const levels = [ThinkingLevel.Off, ...this.getAvailableThinkingLevels()];
 		const currentLevel = this.thinkingLevel === ThinkingLevel.Inherit ? ThinkingLevel.Off : this.thinkingLevel;
@@ -17825,6 +18109,7 @@ export class AgentSession {
 		const nextLevel = levels[nextIndex];
 		if (!nextLevel) return undefined;
 
+		this.#assertSelectionMutationReady(identity);
 		this.#applyThinkingLevel(nextLevel, false, true);
 		return nextLevel;
 	}
@@ -19006,7 +19291,12 @@ export class AgentSession {
 		onTerminalOverflowNoop?: () => void,
 		resourceRunId?: string,
 		ownershipSignal?: AbortSignal,
+		producerIdentity?: SessionSelectionIdentity,
 	): Promise<boolean> {
+		const continuationIdentity = producerIdentity ?? this.#captureSessionSelectionIdentity();
+		const continuationIdentityIsCurrent = (): boolean =>
+			this.#sessionTransitionKind === undefined && this.#isSessionSelectionIdentityCurrent(continuationIdentity);
+		if (!continuationIdentityIsCurrent()) return false;
 		// Safety stops are terminal and must not trigger context maintenance.
 		if (
 			assistantMessage.errorKind === "provider_safety_stop" ||
@@ -19037,6 +19327,7 @@ export class AgentSession {
 			!errorIsFromBeforeCompaction &&
 			classifyContextOverflow(assistantMessage, assistantMessage.transportFailure, contextWindow)
 		) {
+			if (!continuationIdentityIsCurrent()) return false;
 			this.#overflowMaintenanceAttempts += 1;
 			if (this.#overflowMaintenanceAttempts > 1) return false;
 			// Remove the error message from agent state (it IS saved to session for history,
@@ -19044,6 +19335,7 @@ export class AgentSession {
 			const messages = this.agent.state.messages;
 			let removedOverflowAssistant = false;
 			if (messages.length > 0 && messages[messages.length - 1].role === "assistant") {
+				if (!continuationIdentityIsCurrent()) return false;
 				this.agent.replaceMessages(messages.slice(0, -1), {
 					historyRewrite: { reason: "overflow-retry", preserveSeededPrefix: true },
 				});
@@ -19052,7 +19344,7 @@ export class AgentSession {
 
 			// Try context promotion first - switch to a larger model and retry without compacting
 			const promoted = await this.#tryContextPromotion(assistantMessage, ownershipSignal);
-			if (ownershipSignal?.aborted) return false;
+			if (ownershipSignal?.aborted || !continuationIdentityIsCurrent()) return false;
 			if (promoted) {
 				// Retry on the promoted (larger) model without compacting
 				this.#scheduleAgentContinue({
@@ -19060,6 +19352,8 @@ export class AgentSession {
 					generation,
 					suppressPredecessorAgentEnd: true,
 					resourceRunId,
+					scheduledSessionId: continuationIdentity.sessionId,
+					scheduledSessionIdentityEpoch: continuationIdentity.sessionIdentityEpoch,
 				});
 
 				return true;
@@ -19070,6 +19364,7 @@ export class AgentSession {
 			if (compactionSettings.enabled && compactionSettings.strategy !== "off") {
 				const status = await this.#runAutoCompaction("overflow", true, false, {
 					beforeTerminalOverflowNoop: () => {
+						if (!continuationIdentityIsCurrent()) return;
 						if (onTerminalOverflowNoop) {
 							onTerminalOverflowNoop();
 						} else if (removedOverflowAssistant) {
@@ -19079,9 +19374,10 @@ export class AgentSession {
 					resourceRunId,
 					signal: ownershipSignal,
 				});
+				if (!continuationIdentityIsCurrent()) return false;
 				return "continuationScheduled" in status && status.continuationScheduled === true;
 			}
-			return await this.#scheduleOverflowRetryContinuation(generation, resourceRunId);
+			return await this.#scheduleOverflowRetryContinuation(generation, resourceRunId, continuationIdentity);
 		}
 		const compactionSettings = this.settings.getGroup("compaction");
 		if (!compactionSettings.enabled || compactionSettings.strategy === "off") return false;
@@ -19118,15 +19414,16 @@ export class AgentSession {
 			)
 		) {
 			const pruneResult = await this.#pruneToolOutputs(ownershipSignal, true);
-			if (ownershipSignal?.aborted) return false;
+			if (ownershipSignal?.aborted || !continuationIdentityIsCurrent()) return false;
 			if (pruneResult) contextTokens = Math.max(0, contextTokens - pruneResult.tokensSaved);
 		}
 		const prunedCompactionSettings = this.#compactionSettingsWithAdaptiveState(compactionSettings);
 		if (shouldCompact(contextTokens, contextWindow, prunedCompactionSettings, autoCompactionOutputReserveTokens)) {
 			// Try promotion first — if a larger model is available, switch instead of compacting
 			const promoted = await this.#tryContextPromotion(assistantMessage, ownershipSignal);
-			if (ownershipSignal?.aborted) return false;
+			if (ownershipSignal?.aborted || !continuationIdentityIsCurrent()) return false;
 			if (!promoted) {
+				if (!continuationIdentityIsCurrent()) return false;
 				await this.#runAutoCompaction("threshold", false, false, { resourceRunId, signal: ownershipSignal });
 			}
 		}
@@ -19498,10 +19795,12 @@ export class AgentSession {
 		return lastToolCall?.name === "yield" && lastToolCall.id === toolCallId;
 	}
 
-	#enforceRewindBeforeYield(): boolean {
+	#enforceRewindBeforeYield(producerIdentity?: SessionSelectionIdentity): boolean {
 		if (!this.#checkpointState || this.#pendingRewindReport) {
 			return false;
 		}
+		const identity = producerIdentity ?? this.#captureSessionSelectionIdentity();
+		if (this.#sessionTransitionKind !== undefined || !this.#isSessionSelectionIdentityCurrent(identity)) return false;
 		const reminder = [
 			"<system-warning>",
 			"You are in an active checkpoint. You MUST call rewind with your investigation findings before yielding. Do NOT yield without completing the checkpoint.",
@@ -19513,7 +19812,12 @@ export class AgentSession {
 			attribution: "agent",
 			timestamp: Date.now(),
 		});
-		this.#scheduleAgentContinue({ generation: this.#promptGeneration });
+		if (this.#sessionTransitionKind !== undefined || !this.#isSessionSelectionIdentityCurrent(identity)) return false;
+		this.#scheduleAgentContinue({
+			generation: this.#promptGeneration,
+			scheduledSessionId: identity.sessionId,
+			scheduledSessionIdentityEpoch: identity.sessionIdentityEpoch,
+		});
 		return true;
 	}
 
@@ -19651,9 +19955,17 @@ export class AgentSession {
 		};
 	}
 
-	async #checkGoalCompletion(assistantMessage: AssistantMessage): Promise<boolean> {
+	async #checkGoalCompletion(
+		assistantMessage: AssistantMessage,
+		producerIdentity?: SessionSelectionIdentity,
+	): Promise<boolean> {
+		const identity = producerIdentity ?? this.#captureSessionSelectionIdentity();
+		const identityIsCurrent = (): boolean =>
+			this.#sessionTransitionKind === undefined && this.#isSessionSelectionIdentityCurrent(identity);
+		if (!identityIsCurrent()) return false;
 		const state = this.getGoalModeState();
 		if (!state?.enabled || state.goal.status !== "active") {
+			if (!identityIsCurrent()) return false;
 			this.#lastGoalReminderAssistantTimestamp = undefined;
 			this.#suppressNextGoalReminderAfterAbortGoalId = undefined;
 			return false;
@@ -19678,15 +19990,22 @@ export class AgentSession {
 			this.#suppressNextGoalReminderAfterAbortGoalId = undefined;
 			if (suppressReminder) return false;
 		}
+		if (!identityIsCurrent()) return false;
 
 		logger.debug("Goal completion: sending active-goal reminder", { goalId: state.goal.id });
+		if (!identityIsCurrent()) return false;
 		this.agent.appendMessage({
 			role: "developer",
 			content: [{ type: "text", text: reminder }],
 			attribution: "agent",
 			timestamp: Date.now(),
 		});
-		this.#scheduleAgentContinue({ generation: this.#promptGeneration });
+		if (!identityIsCurrent()) return false;
+		this.#scheduleAgentContinue({
+			generation: this.#promptGeneration,
+			scheduledSessionId: identity.sessionId,
+			scheduledSessionIdentityEpoch: identity.sessionIdentityEpoch,
+		});
 		return true;
 	}
 	#claimDeepInterviewUserIntent(): number {
@@ -19706,7 +20025,11 @@ export class AgentSession {
 		assistantMessage: AssistantMessage,
 		agentEndGeneration: number | undefined,
 		ownerEpoch: number | undefined,
+		producerIdentity: SessionSelectionIdentity,
 	): Promise<"not_applicable" | "continued" | "superseded" | "already_handled"> {
+		const identityIsCurrent = (): boolean =>
+			this.#sessionTransitionKind === undefined && this.#isSessionSelectionIdentityCurrent(producerIdentity);
+		if (!identityIsCurrent()) return "superseded";
 		const identity = this.#deepInterviewAssistantIdentity(assistantMessage);
 		if (this.#handledDeepInterviewAssistantIds.has(identity)) return "already_handled";
 
@@ -19720,7 +20043,8 @@ export class AgentSession {
 			ownerEpoch === undefined ||
 			this.#isDisposed ||
 			agentEndGeneration !== this.#promptGeneration ||
-			ownerEpoch !== this.#deepInterviewUserIntentEpoch
+			ownerEpoch !== this.#deepInterviewUserIntentEpoch ||
+			!identityIsCurrent()
 		) {
 			this.#handledDeepInterviewAssistantIds.add(identity);
 			return "superseded";
@@ -19744,7 +20068,8 @@ export class AgentSession {
 			if (
 				this.#isDisposed ||
 				agentEndGeneration !== this.#promptGeneration ||
-				ownerEpoch !== this.#deepInterviewUserIntentEpoch
+				ownerEpoch !== this.#deepInterviewUserIntentEpoch ||
+				!identityIsCurrent()
 			) {
 				return "superseded";
 			}
@@ -19765,12 +20090,17 @@ export class AgentSession {
 				attribution: "agent",
 				timestamp: Date.now(),
 			};
+			if (!identityIsCurrent()) return "superseded";
 			this.agent.appendMessage(reminderMessage);
+			if (!identityIsCurrent()) return "superseded";
 			this.sessionManager.appendMessage(reminderMessage);
+			if (!identityIsCurrent()) return "superseded";
 			this.#scheduleAgentContinue({
 				generation: agentEndGeneration,
 				skipCompactionCheck: true,
-				shouldContinue: () => ownerEpoch === this.#deepInterviewUserIntentEpoch,
+				scheduledSessionId: producerIdentity.sessionId,
+				scheduledSessionIdentityEpoch: producerIdentity.sessionIdentityEpoch,
+				shouldContinue: () => ownerEpoch === this.#deepInterviewUserIntentEpoch && identityIsCurrent(),
 			});
 			return "continued";
 		} finally {
@@ -19780,7 +20110,11 @@ export class AgentSession {
 	/**
 	 * Check if agent stopped with incomplete todos and prompt to continue.
 	 */
-	async #checkTodoCompletion(): Promise<void> {
+	async #checkTodoCompletion(producerIdentity?: SessionSelectionIdentity): Promise<void> {
+		const identity = producerIdentity ?? this.#captureSessionSelectionIdentity();
+		const identityIsCurrent = (): boolean =>
+			this.#sessionTransitionKind === undefined && this.#isSessionSelectionIdentityCurrent(identity);
+		if (!identityIsCurrent()) return;
 		// Skip todo reminders when the most recent turn was driven by an explicit user force —
 		// the user wanted exactly that tool, not a follow-up nag about incomplete todos.
 		const lastServedLabel = this.#toolChoiceQueue.consumeLastServedLabel();
@@ -19824,8 +20158,9 @@ export class AgentSession {
 			return;
 		}
 
-		// Build reminder message
-		this.#todoReminderCount++;
+		// Build reminder message. Commit the count only after the advisory event has
+		// returned and the producer identity is still current.
+		const reminderAttempt = this.#todoReminderCount + 1;
 		const todoList = incompleteByPhase
 			.map(phase => `- ${phase.name}\n${phase.tasks.map(task => `  - ${task.content}`).join("\n")}`)
 			.join("\n");
@@ -19833,16 +20168,18 @@ export class AgentSession {
 			`<system-reminder>\n` +
 			`You stopped with ${incomplete.length} incomplete todo item(s):\n${todoList}\n\n` +
 			`Please continue working on these tasks or mark them complete if finished.\n` +
-			`(Reminder ${this.#todoReminderCount}/${remindersMax})\n` +
+			`(Reminder ${reminderAttempt}/${remindersMax})\n` +
 			`</system-reminder>`;
 
 		// Emit event for UI to render notification
 		await this.#emitSessionEvent({
 			type: "todo_reminder",
 			todos: incomplete,
-			attempt: this.#todoReminderCount,
+			attempt: reminderAttempt,
 			maxAttempts: remindersMax,
 		});
+		if (!identityIsCurrent()) return;
+		this.#todoReminderCount = reminderAttempt;
 
 		// Consumers that cannot represent a server-initiated turn (ACP v1 clients, SDK
 		// hosts) keep reporting the prompt as running until the terminal `agent_end` is
@@ -19854,17 +20191,18 @@ export class AgentSession {
 		if (this.#clientBridge?.deferAgentInitiatedTurns && !this.#allowAcpAgentInitiatedTurns) {
 			logger.debug("Todo completion: advisory reminder only", {
 				incomplete: incomplete.length,
-				attempt: this.#todoReminderCount,
+				attempt: reminderAttempt,
 			});
 			return;
 		}
 
 		logger.debug("Todo completion: sending reminder", {
 			incomplete: incomplete.length,
-			attempt: this.#todoReminderCount,
+			attempt: reminderAttempt,
 		});
 
 		// Inject reminder and continue conversation
+		if (!identityIsCurrent()) return;
 		this.agent.appendMessage({
 			role: "developer",
 			content: [{ type: "text", text: reminder }],
@@ -19874,7 +20212,13 @@ export class AgentSession {
 		// The reminder continues the current prompt, so the predecessor `agent_end`
 		// must stay held until the continuation turn produces the real terminal.
 		// Publishing it here would settle the caller's prompt mid-reminder.
-		this.#scheduleAgentContinue({ skipCompactionCheck: true, suppressPredecessorAgentEnd: true });
+		if (!identityIsCurrent()) return;
+		this.#scheduleAgentContinue({
+			skipCompactionCheck: true,
+			suppressPredecessorAgentEnd: true,
+			scheduledSessionId: identity.sessionId,
+			scheduledSessionIdentityEpoch: identity.sessionIdentityEpoch,
+		});
 	}
 
 	/**
@@ -19899,6 +20243,7 @@ export class AgentSession {
 				cause: "temporary-operation",
 				reason: "context-promotion",
 				signal,
+				allowPromptContinuationReentry: true,
 			});
 			if (signal?.aborted) {
 				if (scope) await this.restoreTemporaryProviderSessionScope(scope);
@@ -20589,7 +20934,12 @@ export class AgentSession {
 					if (signal.aborted) return;
 					await this.#runAutoCompaction(reason, willRetry, true, options);
 				},
-				{ generation, resourceRunId: options?.resourceRunId },
+				{
+					generation,
+					resourceRunId: options?.resourceRunId,
+					scheduledSessionId: compactionSessionId,
+					scheduledSessionIdentityEpoch: compactionSessionIdentityEpoch,
+				},
 			);
 			return { kind: "skipped" };
 		}
@@ -20655,10 +21005,12 @@ export class AgentSession {
 						reason,
 					});
 					action = "context-full";
+					if (!compactionIdentityIsCurrent()) return { kind: "skipped" };
 				}
 				if (autoCompactionSignal.aborted) return await emitAborted();
 
 				if (handoffResult) {
+					const handoffSuccessorIdentity = this.#captureSessionSelectionIdentity();
 					await this.#emitSessionEvent({
 						type: "auto_compaction_end",
 						action,
@@ -20667,8 +21019,21 @@ export class AgentSession {
 						willRetry: false,
 					});
 					if (autoCompactionSignal.aborted) return { kind: "aborted", source: "signal" };
+					if (
+						this.#sessionTransitionKind !== undefined ||
+						!this.#isSessionSelectionIdentityCurrent(handoffSuccessorIdentity)
+					)
+						return { kind: "compacted" };
 					if (continueAfterMaintenance && reason !== "idle" && compactionSettings.autoContinue !== false) {
-						this.#scheduleAutoContinuePrompt(generation, true, options?.resourceRunId);
+						this.#scheduleAutoContinuePrompt(
+							generation,
+							true,
+							options?.resourceRunId,
+							undefined,
+							undefined,
+							undefined,
+							handoffSuccessorIdentity,
+						);
 					}
 
 					if (autoCompactionSignal.aborted) return { kind: "aborted", source: "signal" };
@@ -20732,7 +21097,11 @@ export class AgentSession {
 				}
 				const overflowContinuationScheduled =
 					!overflowNoopWouldReplay && willRetry && !continuationSkipReason
-						? await this.#scheduleOverflowRetryContinuation(generation, options?.resourceRunId)
+						? await this.#scheduleOverflowRetryContinuation(
+							generation,
+							options?.resourceRunId,
+							{ sessionId: compactionSessionId, sessionIdentityEpoch: compactionSessionIdentityEpoch },
+						)
 						: false;
 				await this.#emitSessionEvent({
 					type: "auto_compaction_end",
@@ -20757,6 +21126,8 @@ export class AgentSession {
 							onSkip: skipReason => this.#logCompactionContinuationSkipped("queued_continue", skipReason),
 							onError: error => this.#logCompactionContinuationError("queued_continue", error),
 							resourceRunId: options?.resourceRunId,
+							scheduledSessionId: compactionSessionId,
+							scheduledSessionIdentityEpoch: compactionSessionIdentityEpoch,
 						});
 						return { kind: "skipped", continuationScheduled: true };
 					}
@@ -20767,6 +21138,7 @@ export class AgentSession {
 						? { kind: "skipped", continuationScheduled: true }
 						: { kind: "skipped" };
 				}
+				if (!compactionIdentityIsCurrent()) return await emitAborted();
 				if (continueAfterMaintenance && reason !== "idle" && this.agent.hasQueuedMessages()) {
 					this.#scheduleAgentContinue({
 						delayMs: 100,
@@ -20779,9 +21151,19 @@ export class AgentSession {
 						onSkip: skipReason => this.#logCompactionContinuationSkipped("queued_continue", skipReason),
 						onError: error => this.#logCompactionContinuationError("queued_continue", error),
 						resourceRunId: options?.resourceRunId,
+						scheduledSessionId: compactionSessionId,
+						scheduledSessionIdentityEpoch: compactionSessionIdentityEpoch,
 					});
 				} else if (continueAfterMaintenance && reason !== "idle" && compactionSettings.autoContinue !== false) {
-					this.#scheduleAutoContinuePrompt(generation, true, options?.resourceRunId);
+					this.#scheduleAutoContinuePrompt(
+						generation,
+						true,
+						options?.resourceRunId,
+						undefined,
+						undefined,
+						undefined,
+						{ sessionId: compactionSessionId, sessionIdentityEpoch: compactionSessionIdentityEpoch },
+					);
 				}
 				return { kind: "skipped" };
 			}
@@ -21024,13 +21406,18 @@ export class AgentSession {
 			};
 			this.#lastOversizedAutoMaintenanceAttemptSignature = undefined;
 
+			if (!compactionIdentityIsCurrent()) return await emitAborted();
 			const continuationSkipReason = willRetry ? this.#detectOverflowRetryContinuationSkip() : undefined;
 			if (continuationSkipReason) {
 				this.#logCompactionContinuationSkipped("overflow_retry", continuationSkipReason);
 			}
 			const overflowContinuationScheduled =
 				willRetry && !continuationSkipReason
-					? await this.#scheduleOverflowRetryContinuation(generation, options?.resourceRunId)
+					? await this.#scheduleOverflowRetryContinuation(
+						generation,
+						options?.resourceRunId,
+						{ sessionId: compactionSessionId, sessionIdentityEpoch: compactionSessionIdentityEpoch },
+					)
 					: false;
 			await this.#emitSessionEvent({
 				type: "auto_compaction_end",
@@ -21060,9 +21447,19 @@ export class AgentSession {
 					onSkip: reason => this.#logCompactionContinuationSkipped("queued_continue", reason),
 					onError: error => this.#logCompactionContinuationError("queued_continue", error),
 					resourceRunId: options?.resourceRunId,
+					scheduledSessionId: compactionSessionId,
+					scheduledSessionIdentityEpoch: compactionSessionIdentityEpoch,
 				});
 			} else if (continueAfterMaintenance && reason !== "idle" && compactionSettings.autoContinue !== false) {
-				this.#scheduleAutoContinuePrompt(generation, true, options?.resourceRunId);
+				this.#scheduleAutoContinuePrompt(
+					generation,
+					true,
+					options?.resourceRunId,
+					undefined,
+					undefined,
+					undefined,
+					{ sessionId: compactionSessionId, sessionIdentityEpoch: compactionSessionIdentityEpoch },
+				);
 			}
 			return { kind: "compacted" };
 		} catch (error) {
@@ -23003,8 +23400,35 @@ export class AgentSession {
 	// Bash Execution
 	// =========================================================================
 
-	async #saveBashOriginalArtifact(originalText: string): Promise<BashArtifactSaveResult> {
-		return saveAgentBashOriginalArtifact(this.sessionManager, originalText);
+	async #saveBashOriginalArtifact(
+		originalText: string,
+		identity: SessionSelectionIdentity = this.#captureSessionSelectionIdentity(),
+	): Promise<BashArtifactSaveResult> {
+		if (!this.#isSessionSelectionIdentityCurrent(identity) || this.#sessionTransitionKind !== undefined) {
+			return { status: "unavailable" };
+		}
+		try {
+			return await this.#withSelectionAdmission(identity, async () => {
+				if (!this.#isSessionSelectionIdentityCurrent(identity)) return { status: "unavailable" };
+				const saved = await saveAgentBashOriginalArtifact(this.sessionManager, originalText);
+				return this.#isSessionSelectionIdentityCurrent(identity) ? saved : { status: "unavailable" };
+			});
+		} catch (error) {
+			if (!this.#isSessionSelectionIdentityCurrent(identity) || this.#sessionTransitionKind !== undefined) {
+				return { status: "unavailable" };
+			}
+			throw error;
+		}
+	}
+
+	async #activatePendingGjcGoalModeRequestForExecution(identity: SessionSelectionIdentity): Promise<void> {
+		if (!this.#isSessionSelectionIdentityCurrent(identity)) return;
+		if (this.#terminalPersistenceRecovery) await this.#reconcileTerminalPersistenceFailure();
+		if (!this.#isSessionSelectionIdentityCurrent(identity)) return;
+		await this.#withSelectionAdmission(identity, async () => {
+			await this.#activatePendingGjcGoalModeRequest();
+			this.#assertSessionSelectionIdentityCurrent(identity);
+		});
 	}
 
 	/**
@@ -23014,15 +23438,15 @@ export class AgentSession {
 	 * @param onChunk Optional streaming callback for output
 	 * @param options.excludeFromContext If true, command output won't be sent to LLM (!! prefix)
 	 * @param options.onPersisted Called once the execution's message is in session state
-	 *   (immediately when idle, at the post-turn flush while streaming)
+	 *   (immediately when idle, at the post-turn or recovery flush otherwise)
 	 */
 	async executeBash(
 		command: string,
 		onChunk?: (chunk: string) => void,
 		options?: { excludeFromContext?: boolean; onPersisted?: () => void },
 	): Promise<BashResult> {
-		await this.#reconcileTerminalPersistenceFailure();
-		const executionIdentity = { sessionId: this.sessionId, sessionIdentityEpoch: this.#sessionIdentityEpoch };
+		if (this.#terminalPersistenceRecovery) await this.#reconcileTerminalPersistenceFailure();
+		const executionIdentity = this.#captureSessionSelectionIdentity();
 		const excludeFromContext = options?.excludeFromContext === true;
 		this.#markRetryReplayUnsafe();
 
@@ -23037,8 +23461,13 @@ export class AgentSession {
 			});
 			if (hookResult?.result) {
 				this.recordBashResult(command, hookResult.result, options, executionIdentity);
-				if (hookResult.result.exitCode === 0 && !hookResult.result.cancelled) {
-					await this.#activatePendingGjcGoalModeRequest();
+				if (
+					hookResult.result.exitCode === 0 &&
+					!hookResult.result.cancelled &&
+					this.#isSessionSelectionIdentityCurrent(executionIdentity) &&
+					this.#sessionTransitionKind === undefined
+				) {
+					await this.#activatePendingGjcGoalModeRequestForExecution(executionIdentity);
 				}
 				return hookResult.result;
 			}
@@ -23052,25 +23481,31 @@ export class AgentSession {
 				onChunk,
 				settings: this.settings,
 				signal: abortController.signal,
-				sessionKey: this.sessionId,
+				sessionKey: executionIdentity.sessionId,
 				cwd,
 				timeout: clampTimeout("bash") * 1000,
 				env: buildGjcRuntimeSessionEnv({
 					sessionFile: null,
-					sessionId: this.sessionId,
+					sessionId: executionIdentity.sessionId,
 					cwd,
 				}),
-				onMinimizedSave: originalText => this.#saveBashOriginalArtifact(originalText),
+				onMinimizedSave: originalText => this.#saveBashOriginalArtifact(originalText, executionIdentity),
 			});
 
 			this.recordBashResult(command, result, options, executionIdentity);
-			if (result.exitCode === 0 && !result.cancelled) {
-				await this.#activatePendingGjcGoalModeRequest();
+			if (
+				result.exitCode === 0 &&
+				!result.cancelled &&
+				this.#isSessionSelectionIdentityCurrent(executionIdentity) &&
+				this.#sessionTransitionKind === undefined
+			) {
+				await this.#activatePendingGjcGoalModeRequestForExecution(executionIdentity);
 			}
 			return result;
 		} finally {
 			this.#bashAbortControllers.delete(abortController);
-			this.#scheduleQueuedFollowUpContinuation();
+			if (this.#isSessionSelectionIdentityCurrent(executionIdentity) && this.#sessionTransitionKind === undefined)
+				this.#scheduleQueuedFollowUpContinuation();
 		}
 	}
 
@@ -23082,13 +23517,9 @@ export class AgentSession {
 		command: string,
 		result: BashResult,
 		options?: { excludeFromContext?: boolean; onPersisted?: () => void },
-		executionIdentity = { sessionId: this.sessionId, sessionIdentityEpoch: this.#sessionIdentityEpoch },
+		executionIdentity = this.#captureSessionSelectionIdentity(),
 	): void {
-		if (
-			executionIdentity.sessionId !== this.sessionId ||
-			executionIdentity.sessionIdentityEpoch !== this.#sessionIdentityEpoch
-		)
-			return;
+		if (!this.#isSessionSelectionIdentityCurrent(executionIdentity) || this.#sessionTransitionKind !== undefined) return;
 		const meta = outputMeta().truncationFromSummary(result, { direction: "tail" }).get();
 		const bashMessage: BashExecutionMessage = {
 			role: "bashExecution",
@@ -23103,9 +23534,10 @@ export class AgentSession {
 			excludeFromContext: options?.excludeFromContext,
 		};
 
-		// If agent is streaming, defer adding to avoid breaking tool_use/tool_result ordering
-		if (this.isStreaming) {
-			// Queue for later - will be flushed on agent_end
+		// If agent is streaming or terminal persistence recovery is pending, defer adding
+		// to preserve canonical transcript ordering.
+		if (this.isStreaming || this.#terminalPersistenceRecovery) {
+			// Queue for later - will be flushed on agent_end or after recovery.
 			this.#pendingBashMessages.push({
 				message: bashMessage,
 				onPersisted: options?.onPersisted,
@@ -23144,7 +23576,7 @@ export class AgentSession {
 
 	/**
 	 * Flush pending bash messages to agent state and session.
-	 * Called after agent turn completes to maintain proper message ordering.
+	 * Called after agent turn completes or terminal persistence recovery succeeds.
 	 */
 	#flushPendingBashMessages(): void {
 		this.#flushPendingExecutionMessages(this.#pendingBashMessages, "bash");
@@ -23161,18 +23593,19 @@ export class AgentSession {
 	 * @param onChunk Optional streaming callback for output
 	 * @param options.excludeFromContext If true, execution won't be sent to LLM ($$ prefix)
 	 * @param options.onPersisted Called once the execution's message is in session state
-	 *   (immediately when idle, at the post-turn flush while streaming)
+	 *   (immediately when idle, at the post-turn or recovery flush otherwise)
 	 */
 	async executePython(
 		code: string,
 		onChunk?: (chunk: string) => void,
 		options?: { excludeFromContext?: boolean; onPersisted?: () => void },
 	): Promise<PythonResult> {
-		await this.#reconcileTerminalPersistenceFailure();
-		const executionIdentity = { sessionId: this.sessionId, sessionIdentityEpoch: this.#sessionIdentityEpoch };
+		if (this.#terminalPersistenceRecovery) await this.#reconcileTerminalPersistenceFailure();
+		const executionIdentity = this.#captureSessionSelectionIdentity();
 		const excludeFromContext = options?.excludeFromContext === true;
 		this.#markRetryReplayUnsafe();
 		const cwd = this.sessionManager.getCwd();
+		const sessionFile = this.sessionManager.getSessionFile();
 		this.assertEvalExecutionAllowed();
 
 		const abortController = new AbortController();
@@ -23192,7 +23625,6 @@ export class AgentSession {
 			}
 
 			// Use the same session ID as eval's Python backend for kernel sharing
-			const sessionFile = this.sessionManager.getSessionFile();
 			const sessionId = sessionFile ? `session:${sessionFile}:cwd:${cwd}` : `cwd:${cwd}`;
 			const result = await executePythonCommand(code, {
 				cwd,
@@ -23209,7 +23641,7 @@ export class AgentSession {
 			if (!this.#evalExecutionDisposing) this.recordPythonResult(code, result, options, executionIdentity);
 			return result;
 		})();
-		return await this.trackEvalExecution(execution, abortController);
+		return await this.trackEvalExecution(execution, abortController, executionIdentity);
 	}
 
 	assertEvalExecutionAllowed(): void {
@@ -23221,19 +23653,25 @@ export class AgentSession {
 	/**
 	 * Track Python work started outside AgentSession.executePython so dispose can await and abort it too.
 	 */
-	trackEvalExecution<T>(execution: Promise<T>, abortController: AbortController): Promise<T> {
+	trackEvalExecution<T>(
+		execution: Promise<T>,
+		abortController: AbortController,
+		identity: SessionSelectionIdentity = this.#captureSessionSelectionIdentity(),
+	): Promise<T> {
 		this.#evalAbortControllers.add(abortController);
 		this.#activeEvalExecutions.add(execution);
 		void execution.then(
 			() => {
 				this.#evalAbortControllers.delete(abortController);
 				this.#activeEvalExecutions.delete(execution);
-				this.#scheduleQueuedFollowUpContinuation();
+				if (this.#isSessionSelectionIdentityCurrent(identity) && this.#sessionTransitionKind === undefined)
+					this.#scheduleQueuedFollowUpContinuation();
 			},
 			() => {
 				this.#evalAbortControllers.delete(abortController);
 				this.#activeEvalExecutions.delete(execution);
-				this.#scheduleQueuedFollowUpContinuation();
+				if (this.#isSessionSelectionIdentityCurrent(identity) && this.#sessionTransitionKind === undefined)
+					this.#scheduleQueuedFollowUpContinuation();
 			},
 		);
 		return execution;
@@ -23246,13 +23684,9 @@ export class AgentSession {
 		code: string,
 		result: PythonResult,
 		options?: { excludeFromContext?: boolean; onPersisted?: () => void },
-		executionIdentity = { sessionId: this.sessionId, sessionIdentityEpoch: this.#sessionIdentityEpoch },
+		executionIdentity = this.#captureSessionSelectionIdentity(),
 	): void {
-		if (
-			executionIdentity.sessionId !== this.sessionId ||
-			executionIdentity.sessionIdentityEpoch !== this.#sessionIdentityEpoch
-		)
-			return;
+		if (!this.#isSessionSelectionIdentityCurrent(executionIdentity) || this.#sessionTransitionKind !== undefined) return;
 		const meta = outputMeta().truncationFromSummary(result, { direction: "tail" }).get();
 		const pythonMessage: PythonExecutionMessage = {
 			role: "pythonExecution",
@@ -23266,8 +23700,9 @@ export class AgentSession {
 			excludeFromContext: options?.excludeFromContext,
 		};
 
-		// If agent is streaming, defer adding to avoid breaking tool_use/tool_result ordering
-		if (this.isStreaming) {
+		// If agent is streaming or terminal persistence recovery is pending, defer adding
+		// to preserve canonical transcript ordering.
+		if (this.isStreaming || this.#terminalPersistenceRecovery) {
 			this.#pendingPythonMessages.push({
 				message: pythonMessage,
 				onPersisted: options?.onPersisted,
@@ -23342,6 +23777,7 @@ export class AgentSession {
 
 	/**
 	 * Flush pending Python messages to agent state and session.
+	 * Called after agent turn completes or terminal persistence recovery succeeds.
 	 */
 	#flushPendingPythonMessages(): void {
 		this.#flushPendingExecutionMessages(this.#pendingPythonMessages, "python");
@@ -23368,8 +23804,7 @@ export class AgentSession {
 		let persistenceBlocked = false;
 		let agentAppendBlocked = false;
 		for (const pending of pendingMessages) {
-			if (pending.sessionId !== this.sessionId || pending.sessionIdentityEpoch !== this.#sessionIdentityEpoch)
-				continue;
+			if (!this.#isSessionSelectionIdentityCurrent(pending)) continue;
 			if (!pending.appendedToAgent) {
 				if (agentAppendBlocked) {
 					remaining.push(pending);

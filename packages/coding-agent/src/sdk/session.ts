@@ -4724,6 +4724,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		if (sessionAsyncJobManager) {
 			session.yieldQueue.register<AsyncResultEntry>("async-result", {
 				onDrop: entry => sessionAsyncJobManager.releaseDeliveryClaim(entry.generation),
+				// YieldQueue calls this only after streaming/idle injection succeeds;
+				// admission retries therefore retain the claim with the queued entry.
+				onDelivered: entry => sessionAsyncJobManager.releaseDeliveryClaim(entry.generation),
 				isStale: entry => {
 					const stale = sessionAsyncJobManager.isDeliverySuppressed(entry.jobId, entry.generation);
 					if (stale) sessionAsyncJobManager.releaseDeliveryClaim(entry.generation);
@@ -4737,11 +4740,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						? `${entry.ownedCompletion.lineageIdHash}\u0000${entry.ownedCompletion.promptAttemptEpoch}`
 						: "ordinary",
 				build: entries => {
-					try {
-						return buildAsyncResultBatchMessage(entries);
-					} finally {
-						for (const entry of entries) sessionAsyncJobManager.releaseDeliveryClaim(entry.generation);
-					}
+					return buildAsyncResultBatchMessage(entries);
 				},
 			});
 		}

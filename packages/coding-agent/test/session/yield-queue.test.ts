@@ -170,6 +170,91 @@ describe("YieldQueue", () => {
 		expect(harness.streamingMessages.map(messageText)).toEqual(["good"]);
 	});
 
+	test("requeues an idle delivery rejected by admission and releases its claim once after retry", async () => {
+		let attempts = 0;
+		let delivered = 0;
+		const streaming = false;
+		const scheduledFlushes: Array<{ run: () => Promise<void>; onSkip: () => void }> = [];
+		const queue = new YieldQueue({
+			isStreaming: () => streaming,
+			injectStreaming: () => {},
+			injectIdle: async () => {
+				attempts += 1;
+				if (attempts === 1) throw Object.assign(new Error("transition busy"), { code: "busy" });
+				return "delivered" as const;
+			},
+			scheduleIdleFlush: (run, onSkip) => scheduledFlushes.push({ run, onSkip }),
+		});
+		queue.register<Entry>("items", {
+			build: entries => userMessage(entries.map(entry => entry.id).join(",")),
+			onDelivered: () => {
+				delivered += 1;
+			},
+		});
+
+		queue.enqueue("items", { id: "race" });
+		await scheduledFlushes[0]!.run();
+
+		expect(queue.has("items")).toBe(true);
+		expect(delivered).toBe(0);
+		expect(scheduledFlushes).toHaveLength(2);
+
+		await scheduledFlushes[1]!.run();
+		expect(queue.has("items")).toBe(false);
+		expect(attempts).toBe(2);
+		expect(delivered).toBe(1);
+	});
+
+	test("clearKind drops queued identity-bound entries through the dispatcher cleanup", () => {
+		const harness = createHarness(false);
+		let dropped = 0;
+		harness.queue.register<Entry>("items", {
+			build: entries => userMessage(entries.map(entry => entry.id).join(",")),
+			onDrop: () => {
+				dropped += 1;
+			},
+		});
+
+		harness.queue.enqueue("items", { id: "predecessor" });
+		harness.queue.clearKind("items");
+
+		expect(harness.queue.has("items")).toBe(false);
+		expect(dropped).toBe(1);
+	});
+
+	test("clear invalidates a drained idle batch instead of resurrecting it after a failed injection", async () => {
+		const injectionStarted = Promise.withResolvers<void>();
+		const releaseInjection = Promise.withResolvers<void>();
+		let dropped = 0;
+		const scheduledFlushes: Array<{ run: () => Promise<void>; onSkip: () => void }> = [];
+		const queue = new YieldQueue({
+			isStreaming: () => false,
+			injectStreaming: () => {},
+			injectIdle: async () => {
+				injectionStarted.resolve();
+				await releaseInjection.promise;
+				throw Object.assign(new Error("transition busy"), { code: "busy" });
+			},
+			scheduleIdleFlush: (run, onSkip) => scheduledFlushes.push({ run, onSkip }),
+		});
+		queue.register<Entry>("items", {
+			build: entries => userMessage(entries.map(entry => entry.id).join(",")),
+			onDrop: () => {
+				dropped += 1;
+			},
+		});
+
+		queue.enqueue("items", { id: "cleared" });
+		const runningFlush = scheduledFlushes[0]!.run();
+		await injectionStarted.promise;
+		queue.clear();
+		releaseInjection.resolve();
+		await runningFlush;
+
+		expect(queue.has("items")).toBe(false);
+		expect(dropped).toBe(1);
+	});
+
 	test("flush preserves registration order across kinds", async () => {
 		const harness = createHarness(true);
 		harness.queue.register<Entry>("second", {
