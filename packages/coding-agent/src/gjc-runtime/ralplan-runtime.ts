@@ -36,10 +36,14 @@ import { resolveGjcSessionForWrite, writeSessionActivityMarker } from "./session
 import { migrateWorkflowState } from "./state-migrations";
 import { runNativeStateCommand } from "./state-runtime";
 import {
-	appendJsonlIdempotent,
+	type AppendJsonlIdempotentOptions,
+	type AppendJsonlIdempotentResult,
+	appendJsonl,
+	detectWorkflowEnvelopeIntegrityMismatch,
 	readExistingStateForMutation,
 	withWorkflowStateLock,
 	writeArtifact,
+	writeTextAtomic,
 	writeWorkflowEnvelopeAtomic,
 } from "./state-writer";
 import { assertSafePathComponent, CommandError, flagValue, hasFlag } from "./workflow-cli-common";
@@ -1354,7 +1358,7 @@ async function recordRalplanPlanningStuck(
 	reason: string,
 ): Promise<void> {
 	const runDir = path.join(sessionPlansDir(cwd, sessionId), "ralplan", runId);
-	await appendJsonlIdempotent(
+	await appendRalplanIndexIdempotent(
 		path.join(runDir, "index.jsonl"),
 		{
 			event: "planning_stuck",
@@ -1453,6 +1457,33 @@ async function persistRalplanFinalAdmission(
 			}
 			let existing: Record<string, unknown> = existingRead.kind === "valid" ? existingRead.value : {};
 			if (existing.run_id !== runId) return;
+			const currentAdmission = parseRalplanFinalAdmission(existing.auto_handoff);
+			const receipt =
+				existing.receipt && typeof existing.receipt === "object" && !Array.isArray(existing.receipt)
+					? (existing.receipt as Record<string, unknown>)
+					: undefined;
+			const checksum =
+				receipt?.content_sha256 &&
+				typeof receipt.content_sha256 === "object" &&
+				!Array.isArray(receipt.content_sha256)
+					? (receipt.content_sha256 as Record<string, unknown>)
+					: undefined;
+			if (
+				currentAdmission &&
+				JSON.stringify(currentAdmission) === JSON.stringify(admission) &&
+				receipt?.skill === "ralplan" &&
+				receipt.owner === "gjc-runtime" &&
+				receipt.command === "gjc ralplan final-admission" &&
+				checksum?.algorithm === "sha256" &&
+				typeof checksum.value === "string" &&
+				/^[0-9a-f]{64}$/.test(checksum.value) &&
+				checksum.covered_path === path.resolve(statePath) &&
+				typeof checksum.computed_at === "string" &&
+				checksum.computed_at.trim() !== "" &&
+				!(await detectWorkflowEnvelopeIntegrityMismatch(statePath))
+			) {
+				return;
+			}
 			existing.auto_handoff = admission;
 			existing = migrateWorkflowState(existing, "ralplan").state;
 			existing.updated_at = new Date().toISOString();
@@ -1592,6 +1623,10 @@ interface PersistedArtifact {
 	pendingApprovalPath?: string;
 }
 
+/** Keep the writer-side ralplan ledger within the bound enforced by state-runtime. */
+const RALPLAN_MAX_INDEX_BYTES = 1024 * 1024;
+const RALPLAN_MAX_INDEX_RECOVERY_BYTES = 8 * 1024 * 1024;
+
 /**
  * Content-addressed identity for an `index.jsonl` row: a repeated `--write` of the
  * same `(stage, stage_n)` at identical content (same sha256) is the #638 duplicate
@@ -1603,6 +1638,102 @@ function ralplanIndexKey(entry: unknown): string | undefined {
 	const { stage, stage_n, sha256 } = record;
 	if (typeof stage !== "string" || typeof stage_n !== "number" || typeof sha256 !== "string") return undefined;
 	return `${stage}\u0000${stage_n}\u0000${sha256}`;
+}
+
+function serializeRalplanIndexEntries(entries: readonly unknown[]): string {
+	return entries.map(entry => `${JSON.stringify(entry)}\n`).join("");
+}
+
+/**
+ * Compact the append-only ralplan ledger without dropping the current final receipt.
+ * The newest row and newest planning-stuck marker are also retained so a write can
+ * never report success while silently losing the receipt it just persisted.
+ */
+function compactRalplanIndexEntries(entries: readonly unknown[]): unknown[] {
+	let latestFinal = -1;
+	let latestPlanningStuck = -1;
+	for (const [index, entry] of entries.entries()) {
+		if (entry && typeof entry === "object" && !Array.isArray(entry)) {
+			const record = entry as Record<string, unknown>;
+			if (record.stage === "final") latestFinal = index;
+			if (record.planning_stuck === true) latestPlanningStuck = index;
+		}
+	}
+	const retained = entries.map((entry, index) => ({
+		entry,
+		bytes: Buffer.byteLength(`${JSON.stringify(entry)}\n`, "utf8"),
+		protected: index === entries.length - 1 || index === latestFinal || index === latestPlanningStuck,
+	}));
+	let totalBytes = retained.reduce((total, item) => total + item.bytes, 0);
+	while (totalBytes > RALPLAN_MAX_INDEX_BYTES) {
+		const removable = retained.findIndex(item => !item.protected);
+		if (removable < 0) {
+			throw new RalplanCommandError(2, "ralplan index live receipt set exceeds the 1 MiB bound");
+		}
+		totalBytes -= retained[removable]!.bytes;
+		retained.splice(removable, 1);
+	}
+	return retained.map(item => item.entry);
+}
+
+/** Append a ralplan index row under the ledger lock, compacting before the write. */
+async function appendRalplanIndexIdempotent(
+	targetPath: string,
+	entry: unknown,
+	options: AppendJsonlIdempotentOptions,
+): Promise<AppendJsonlIdempotentResult> {
+	const { key, equals, ...writeOptions } = options;
+	const resolvedTargetPath = path.resolve(options.cwd ?? process.cwd(), targetPath);
+	return await withWorkflowStateLock(
+		targetPath,
+		async () => {
+			let raw = "";
+			try {
+				const stat = await fs.lstat(resolvedTargetPath);
+				if (!stat.isFile() || stat.isSymbolicLink() || stat.size > RALPLAN_MAX_INDEX_RECOVERY_BYTES)
+					throw new RalplanCommandError(2, "ralplan index exceeds its bounded recovery limit");
+				raw = await fs.readFile(resolvedTargetPath, "utf8");
+			} catch (error) {
+				const code = getErrorCode(error);
+				if (code !== "ENOENT") throw error;
+			}
+			const existing: unknown[] = [];
+			let malformed = false;
+			for (const line of raw.split(/\r?\n/)) {
+				const trimmed = line.trim();
+				if (!trimmed) continue;
+				try {
+					existing.push(JSON.parse(trimmed));
+				} catch {
+					malformed = true;
+				}
+			}
+			const candidateKey = key ? key(entry) : undefined;
+			const duplicate = equals
+				? existing.find(item => equals(entry, item))
+				: candidateKey === undefined
+					? undefined
+					: existing.find(item => key?.(item) === candidateKey);
+			const candidateLine = `${JSON.stringify(entry)}\n`;
+			if (Buffer.byteLength(raw, "utf8") + Buffer.byteLength(candidateLine, "utf8") <= RALPLAN_MAX_INDEX_BYTES) {
+				if (duplicate !== undefined) return { path: resolvedTargetPath, appended: false, duplicate };
+				await appendJsonl(targetPath, entry, writeOptions);
+				return { path: resolvedTargetPath, appended: true };
+			}
+			if (malformed) throw new RalplanCommandError(2, "oversized ralplan index contains malformed JSON");
+			const next = duplicate === undefined ? [...existing, entry] : existing;
+			const compacted = compactRalplanIndexEntries(next);
+			const serialized = serializeRalplanIndexEntries(compacted);
+			const existingSerialized = serializeRalplanIndexEntries(existing);
+			if (serialized !== existingSerialized) {
+				await writeTextAtomic(targetPath, serialized, writeOptions);
+			}
+			return duplicate === undefined
+				? { path: resolvedTargetPath, appended: true }
+				: { path: resolvedTargetPath, appended: false, duplicate };
+		},
+		options,
+	);
 }
 
 async function persistArtifact(
@@ -1636,7 +1767,7 @@ async function persistArtifact(
 		sha256,
 		...(finalAdmission ? { auto_handoff: finalAdmission } : {}),
 	};
-	await appendJsonlIdempotent(path.join(runDir, "index.jsonl"), indexEntry, {
+	await appendRalplanIndexIdempotent(path.join(runDir, "index.jsonl"), indexEntry, {
 		cwd,
 		audit: {
 			category: "ledger",
@@ -1837,7 +1968,7 @@ async function repairMissingStageArtifactLedger(
 		sha256: onDisk.sha256,
 		...(finalAdmission ? { auto_handoff: finalAdmission } : {}),
 	};
-	const result = await appendJsonlIdempotent(
+	const result = await appendRalplanIndexIdempotent(
 		path.join(sessionPlansDir(cwd, resolved.sessionId), "ralplan", resolved.runId, "index.jsonl"),
 		indexEntry,
 		{
@@ -2093,7 +2224,20 @@ async function handleArtifactWrite(
 				`refusing to overwrite ralplan ${resolved.stage} stage ${resolved.stageN} at ${existingArtifact.path}: an artifact with different content already exists (existing sha256=${existingArtifact.sha256}, new sha256=${sha256}). Use a new --stage_n to record another pass.`,
 			);
 		}
-		if (resolved.stage === "final") await ensureFinalPendingApproval(persistCwd, resolved, existingArtifact);
+		if (resolved.stage === "final") {
+			await ensureFinalPendingApproval(persistCwd, resolved, existingArtifact);
+			// The artifact and its authenticated ledger receipt are durable before the
+			// current-session admission projection. Repair that projection after a
+			// crash in the gap, before returning the deduplicated receipt.
+			if (existingArtifact.autoHandoff) {
+				await persistRalplanFinalAdmission(
+					persistCwd,
+					resolved.sessionId,
+					resolved.runId,
+					existingArtifact.autoHandoff,
+				);
+			}
+		}
 		return await buildDeduplicatedResult(resolved, existingArtifact, sha256, persistCwd, repositoryBinding);
 	}
 
