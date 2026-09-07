@@ -370,7 +370,10 @@ function hasLaterSupersedingCorrection(content: string, quote: string, statement
 			later,
 		);
 	const explicitNegativeReplacement =
-		/\b(?:no|not|don['’]t|do\s+not)\b/i.test(later) && (topicOverlap || directNegativeReplacement);
+		/\b(?:no|not|never|cannot|can['’]t|won['’]t|don['’]t|doesn['’]t|isn['’]t|aren['’]t|wasn['’]t|weren['’]t|shouldn['’]t|mustn['’]t|needn['’]t|do\s+not)\b/i.test(
+			later,
+		) &&
+		(topicOverlap || directNegativeReplacement);
 	const positiveReplacementMatch =
 		/^\s*[.!?。！？]*\s*(?:(?:switch|change)\s+to\s+([A-Za-z0-9][A-Za-z0-9+#.-]*)|replace\b[^.!?。！？]*\bwith\s+([A-Za-z0-9][A-Za-z0-9+#.-]*))/i.exec(
 			later,
@@ -470,7 +473,7 @@ function semanticProfile(value: string): CrystalSemanticProfile {
 		...new Set(
 			[
 				...normalized.matchAll(
-					/\b(?:at\s+least|at\s+most|no\s+less\s+than|no\s+more\s+than|less\s+than|more\s+than|under|over|below|above|exactly)\b/g,
+					/(?:>=|<=|>|<)|\b(?:at\s+least|at\s+most|no\s+less\s+than|no\s+more\s+than|less\s+than|more\s+than|under|over|below|above|exactly)\b/g,
 				),
 			].map(match => match[0]),
 		),
@@ -601,6 +604,8 @@ function validateItems(value: unknown, snapshot?: CrystalSnapshot): CrystalItem[
 					throw new Error(`confirmed item ${id} anchor message ${item.anchor!.message_index} is missing`);
 				const statementTerms = evidenceTerms(item.statement);
 				const quoteTerms = evidenceTerms(item.anchor.quote);
+				const statementQuantitative = quantitativeEvidenceTerms(item.statement);
+				const quoteQuantitative = quantitativeEvidenceTerms(item.anchor.quote);
 				const statementSemantics = semanticProfile(item.statement);
 				const quoteSemantics = semanticProfile(anchoredClause(anchorMessage.content, item.anchor.quote));
 				if (
@@ -613,6 +618,8 @@ function validateItems(value: unknown, snapshot?: CrystalSnapshot): CrystalItem[
 					quoteTerms.size === 0 ||
 					statementTerms.size === 0 ||
 					[...statementTerms].some(term => !quoteTerms.has(term)) ||
+					statementQuantitative.size !== quoteQuantitative.size ||
+					[...statementQuantitative].some(term => !quoteQuantitative.has(term)) ||
 					!preservesEvidenceOrder(item.statement, item.anchor.quote) ||
 					isUnsafeConfirmedStatement(statementSemantics) ||
 					!sameSemanticIntent(statementSemantics, quoteSemantics)
@@ -745,9 +752,17 @@ function evidenceTerms(value: string): Set<string> {
 	);
 	for (const match of canonical.matchAll(/(?:\b[A-Za-z][A-Za-z0-9]*\.[A-Za-z0-9.]+\b|\b[A-Za-z][+#]{1,2})/g))
 		terms.add(match[0].toLowerCase());
-	for (const match of canonical.matchAll(/[$€£¥₹₩]/gu)) terms.add(match[0]);
+	for (const match of canonical.matchAll(/\p{Sc}/gu)) terms.add(match[0]);
 	for (const match of canonical.matchAll(/\b\d+(?:\.\d+)?\s*([A-Za-z]{1,3})\b/g)) terms.add(match[1]!.toLowerCase());
 	for (const negator of CJK_NEGATOR_TERMS) if (normalized.includes(negator)) terms.add(negator);
+	return terms;
+}
+
+function quantitativeEvidenceTerms(value: string): Set<string> {
+	const canonical = value.normalize("NFC");
+	const terms = new Set<string>();
+	for (const match of canonical.matchAll(/\p{Sc}|>=|<=|>|</gu)) terms.add(match[0]);
+	for (const match of canonical.matchAll(/\b\d+(?:\.\d+)?\s*([A-Za-z]{1,3})\b/g)) terms.add(match[1]!.toLowerCase());
 	return terms;
 }
 
@@ -757,7 +772,7 @@ function evidenceTermSequence(value: string): string[] {
 	const technical = [...canonical.matchAll(/(?:\b[A-Za-z][A-Za-z0-9]*\.[A-Za-z0-9.]+\b|\b[A-Za-z][+#]{1,2})/g)].map(
 		match => ({ index: match.index, end: match.index + match[0].length, term: match[0].toLowerCase() }),
 	);
-	for (const match of canonical.matchAll(/[$€£¥₹₩]/gu))
+	for (const match of canonical.matchAll(/\p{Sc}/gu))
 		technical.push({ index: match.index, end: match.index + match[0].length, term: match[0] });
 	for (const match of canonical.matchAll(/\b\d+(?:\.\d+)?\s*([A-Za-z]{1,3})\b/g)) {
 		const unit = match[1]!;
@@ -908,6 +923,7 @@ function validateResolutionAnchors(
 			!hasVerbatimTokenBoundaries(message.content, quote) ||
 			!hasVerbatimTokenBoundaries(message.content, resolution) ||
 			hasLaterSupersedingCorrection(message.content, quote, resolution) ||
+			hasLaterSupersedingCorrection(message.content, resolution, resolution) ||
 			unsafeResolution ||
 			resolution === item
 		)

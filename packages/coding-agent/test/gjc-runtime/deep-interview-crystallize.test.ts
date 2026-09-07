@@ -656,7 +656,11 @@ describe("deep-interview crystallize contract", () => {
 			["Can’t store audit logs.", "Can’t store audit logs.", "Can store audit logs"],
 			["Latency should be at least 5 ms.", "Latency should be at least 5 ms.", "Latency should be 5 ms"],
 			["Budget is $5 million.", "Budget is $5 million.", "Budget is €5 million"],
+			["Budget is $5 million.", "Budget is $5 million.", "Budget is 5 million"],
 			["Package mass must be 5 kg.", "Package mass must be 5 kg.", "Package mass must be 5 g"],
+			["Package mass must be 5 kg.", "Package mass must be 5 kg.", "Package mass must be 5"],
+			["Latency must be >= 5 ms.", "Latency must be >= 5 ms.", "Latency must be <= 5 ms"],
+			["Use Go. Can’t use Go; use JS.", "Use Go.", "Use Go"],
 			["Use اّdatabase for storage", "database for storage", "Use database for storage"],
 			["Use Java‍Script", "Script", "Use Script"],
 		] as const) {
@@ -801,6 +805,19 @@ describe("deep-interview crystallize contract", () => {
 			next.resolved_open_gap_anchors = [{ item: gap, message_index: 1, quote, resolution: quote }];
 			expect(() => crystallizeDeepInterview(next)).toThrow("fresh verbatim user anchor");
 		}
+		const split = withFreshUserEvidence(
+			input({ prior: first, resolved_open_gaps: [gap] }),
+			"Use PostgreSQL database. Actually use MySQL database.",
+		);
+		split.resolved_open_gap_anchors = [
+			{
+				item: gap,
+				message_index: 1,
+				quote: "Actually use MySQL database.",
+				resolution: "Use PostgreSQL database.",
+			},
+		];
+		expect(() => crystallizeDeepInterview(split)).toThrow("fresh verbatim user anchor");
 	});
 	it("rejects unrelated unspaced CJK resolution evidence", () => {
 		const gap = "内存预算是多少？";
