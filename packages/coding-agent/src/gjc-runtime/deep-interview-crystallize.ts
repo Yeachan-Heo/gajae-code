@@ -301,6 +301,13 @@ function text(value: unknown, name: string, max = MAX_TEXT): string {
 	return result;
 }
 
+function snapshotText(value: unknown, name: string): string {
+	if (typeof value !== "string") throw new Error(`${name} must be text`);
+	const result = value.normalize("NFC").trim();
+	if ([...result].length > MAX_TEXT) throw new Error(`${name} exceeds max length ${MAX_TEXT}`);
+	return result;
+}
+
 function integer(value: unknown, name: string): number {
 	if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0)
 		throw new Error(`${name} must be a non-negative integer`);
@@ -475,7 +482,7 @@ function validateSnapshot(value: unknown): CrystalSnapshot {
 			role !== "developer"
 		)
 			throw new Error("snapshot message role is invalid");
-		return { index: messageIndex, role, content: text(entry.content, `snapshot.messages[${index}].content`) };
+		return { index: messageIndex, role, content: snapshotText(entry.content, `snapshot.messages[${index}].content`) };
 	});
 	if (messages.some((message, index) => index > 0 && message.index <= messages[index - 1]!.index))
 		throw new Error("snapshot messages must be ordered and unique");
