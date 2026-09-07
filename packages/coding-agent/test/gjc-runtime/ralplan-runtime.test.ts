@@ -1,5 +1,6 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it, spyOn } from "bun:test";
-import { existsSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { existsSync, type Mode, type PathLike } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import {
@@ -1096,13 +1097,14 @@ describe("native gjc ralplan runtime — duplicate --write guard", () => {
 		const runId = "sequential-snapshot";
 		const indexPath = path.join(ralplanRunDir(root, runId), "index.jsonl");
 		const artifactPath = path.join(ralplanRunDir(root, runId), "stage-01-planner.md");
-		const originalReadFile = fs.readFile;
+		const originalLstat = fs.lstat;
 		let prePersistLedgerReads = 0;
-		const readSpy = spyOn(fs, "readFile").mockImplementation(async (...args: any[]) => {
-			const target = typeof args[0] === "string" ? args[0] : String(args[0]);
+		const lstatImplementation = (async (file: PathLike, options?: unknown) => {
+			const target = typeof file === "string" ? file : String(file);
 			if (path.resolve(target) === indexPath && !existsSync(artifactPath)) prePersistLedgerReads += 1;
-			return await (originalReadFile as (...readArgs: any[]) => Promise<any>)(...args);
-		});
+			return await originalLstat(file, options as never);
+		}) as typeof fs.lstat;
+		const readSpy = spyOn(fs, "lstat").mockImplementation(lstatImplementation);
 		try {
 			// One invocation only: the documented sequence is intentionally not a
 			// cross-process admission claim, lock, or CAS test.
@@ -1119,6 +1121,8 @@ describe("native gjc ralplan runtime — duplicate --write guard", () => {
 		const runDirPath = runDir(root, runId);
 		await fs.mkdir(runDirPath, { recursive: true });
 		const finalPath = path.join(runDirPath, "stage-01-final.md");
+		const finalContent = "# final\n";
+		await fs.writeFile(finalPath, finalContent);
 		const finalAdmission = {
 			configuredTarget: "ultragoal",
 			effectiveTarget: "ultragoal",
@@ -1131,7 +1135,7 @@ describe("native gjc ralplan runtime — duplicate --write guard", () => {
 				stage_n: 1,
 				path: finalPath,
 				created_at: "2026-01-01T00:00:00.000Z",
-				sha256: "a".repeat(64),
+				sha256: createHash("sha256").update(finalContent).digest("hex"),
 				auto_handoff: finalAdmission,
 			},
 			...Array.from({ length: 12_000 }, (_, index) => ({
@@ -1146,7 +1150,7 @@ describe("native gjc ralplan runtime — duplicate --write guard", () => {
 		await fs.writeFile(indexPath, `${rows.map(row => JSON.stringify(row)).join("\n")}\n`, "utf-8");
 		expect((await fs.stat(indexPath)).size).toBeGreaterThan(1024 * 1024);
 
-		const result = await writeRalplanArtifact(root, runId, "adr", 2, "# adr");
+		const result = await writeRalplanArtifact(root, runId, "final", 1, "# final");
 		expect(result.status, result.stderr).toBe(0);
 		const compacted = await fs.readFile(indexPath, "utf-8");
 		expect(Buffer.byteLength(compacted, "utf8")).toBeLessThanOrEqual(1024 * 1024);
@@ -1162,7 +1166,6 @@ describe("native gjc ralplan runtime — duplicate --write guard", () => {
 					path: finalPath,
 					auto_handoff: finalAdmission,
 				}),
-				expect.objectContaining({ stage: "adr", stage_n: 2 }),
 			]),
 		);
 	});
@@ -1955,6 +1958,12 @@ describe("ralplan automatic handoff admission (#3398)", () => {
 				degradationReason: "planning_stuck",
 			},
 		});
+		const persisted = JSON.parse(await fs.readFile(ralplanStatePath(root), "utf8")) as Record<string, unknown>;
+		expect(persisted.auto_handoff).toMatchObject({
+			effectiveTarget: "off",
+			degradationReason: "planning_stuck",
+		});
+		expect(persisted.receipt).toMatchObject({ command: "gjc ralplan final-admission" });
 	});
 	it("uses the final ledger admission after state loss and config changes", async () => {
 		const root = await tempDir();
@@ -2017,14 +2026,15 @@ describe("ralplan automatic handoff admission (#3398)", () => {
 		);
 		expect((await writeRalplanArtifact(root, runId, "planner", 1, "# plan")).status).toBe(0);
 
-		const originalReadFile = fs.readFile;
+		const originalOpen = fs.open;
 		let indexReads = 0;
 		const injectedError = Object.assign(new Error("EIO: injected unreadable ledger"), { code: "EIO" });
-		const readSpy = spyOn(fs, "readFile").mockImplementation(async (...args: any[]) => {
-			const target = typeof args[0] === "string" ? args[0] : String(args[0]);
+		const openImplementation = (async (file: PathLike, flags: string | number, mode?: Mode) => {
+			const target = typeof file === "string" ? file : String(file);
 			if (path.resolve(target) === indexPath && ++indexReads === 2) throw injectedError;
-			return await (originalReadFile as (...readArgs: any[]) => Promise<any>)(...args);
-		});
+			return await originalOpen(file, flags, mode);
+		}) as typeof fs.open;
+		const readSpy = spyOn(fs, "open").mockImplementation(openImplementation);
 		try {
 			const final = JSON.parse(
 				(await writeRalplanArtifact(root, runId, "final", 2, "# best effort")).stdout ?? "{}",
