@@ -24,7 +24,7 @@ import {
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { EventBus } from "@gajae-code/coding-agent/utils/event-bus";
-import { Container, Loader } from "@gajae-code/tui";
+import { Container, Loader, Text } from "@gajae-code/tui";
 import { logger, postmortem, TempDir } from "@gajae-code/utils";
 import * as z from "zod/v4";
 import { VirtualTerminal } from "../../tui/test/virtual-terminal";
@@ -76,6 +76,7 @@ describe("interactive background activity indicator", () => {
 		manager = new AsyncJobManager({ onJobComplete: () => {}, retentionMs: 60_000 });
 		AsyncJobManager.setInstance(manager);
 		mode = new InteractiveMode(session, "test");
+		mode.ui.terminal = new VirtualTerminal(100, 30);
 		await mode.init();
 	});
 
@@ -436,6 +437,56 @@ describe("interactive background activity indicator", () => {
 		flush.resolve();
 		await firstShutdown;
 		expect(quit).toHaveBeenCalledWith(0);
+	});
+
+	it("commits the final forced frame before terminal restoration when raster ingress settles", async () => {
+		const terminal = mode.ui.terminal as VirtualTerminal;
+		const lease = await mode.ui.acquireRasterLease({
+			ownerId: "shutdown-held-raster",
+			rect: { column: 0, row: 0, width: 2, height: 1 },
+			erase: { type: "raster-erase", bytes: new TextEncoder().encode("SHUTDOWN_ERASE") },
+		});
+		if (lease.status !== "acquired") throw new Error("lease not acquired");
+		const ingressGate = Promise.withResolvers<void>();
+		const ingressStarted = Promise.withResolvers<void>();
+		const held = mode.ui.submitTerminalOutput({
+			token: lease.token,
+			operation: {
+				type: "raster-multipart-batch",
+				prefix: new TextEncoder().encode("SHUTDOWN_PREFIX"),
+				afterPrefix: async () => {
+					ingressStarted.resolve();
+					await ingressGate.promise;
+					return true;
+				},
+				records: [new TextEncoder().encode("SHUTDOWN_RASTER")],
+				abortSuffix: new TextEncoder().encode("SHUTDOWN_ABORT"),
+			},
+		});
+		const finalMarker = "FINAL_SHUTDOWN_MARKER";
+		mode.statusContainer.addChild(new Text(finalMarker, 0, 0));
+		const forcedRender = vi.spyOn(mode.ui, "requestRenderWithGeneration");
+		const quit = vi.spyOn(postmortem, "quit").mockResolvedValue(undefined);
+		try {
+			await ingressStarted.promise;
+			terminal.clearWriteLog();
+			const shutdown = mode.shutdown();
+			await waitFor(() => forcedRender.mock.calls.some(([, source]) => source === "shutdown"));
+			ingressGate.resolve();
+			expect((await held).status).toBe("written");
+			await shutdown;
+			const writes = terminal.getWriteLog();
+			const markerIndex = writes.findIndex(write => write.includes(finalMarker));
+			const restorationIndex = writes.findIndex(write => write.includes("\x1b[?2004l"));
+			expect(markerIndex).toBeGreaterThanOrEqual(0);
+			expect(restorationIndex).toBeGreaterThan(markerIndex);
+			expect(quit).toHaveBeenCalledWith(0);
+		} finally {
+			ingressGate.resolve();
+			await held;
+			forcedRender.mockRestore();
+			quit.mockRestore();
+		}
 	});
 
 	it.each([
