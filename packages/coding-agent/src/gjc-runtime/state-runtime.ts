@@ -1814,6 +1814,17 @@ function requireReadyCanonicalCrystal(value: unknown): Record<string, unknown> {
 	}
 	if (!Array.isArray(value.items) || value.items.length === 0 || !isPlainObject(value.delta))
 		throw new StateCommandError(2, "approve-execution requires complete canonical Crystal evidence");
+	const safeId = (id: unknown): id is string => typeof id === "string" && /^[A-Za-z0-9][A-Za-z0-9._:-]*$/.test(id);
+	if (
+		value.items.some(item => !isPlainObject(item) || !safeId(item.id)) ||
+		["removed_ids", "pending_removals"].some(
+			field => value[field] !== undefined && (!Array.isArray(value[field]) || value[field].some(id => !safeId(id))),
+		) ||
+		(value.removed_item_anchors !== undefined &&
+			(!Array.isArray(value.removed_item_anchors) ||
+				value.removed_item_anchors.some(anchor => !isPlainObject(anchor) || !safeId(anchor.item))))
+	)
+		throw new StateCommandError(2, "approve-execution requires safe canonical Crystal identifiers");
 	if (value.execution_approval !== "not-approved")
 		throw new StateCommandError(2, "canonical Crystal must remain execution_approval: not-approved");
 	return value;
