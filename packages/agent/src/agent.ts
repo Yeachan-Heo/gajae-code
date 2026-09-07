@@ -1041,6 +1041,7 @@ export class Agent {
 		return (event: AgentEvent) => {
 			if (this.#activeRunId !== runId) return;
 			const scope = this.#runHandles.get(logicalRunId)?.scope;
+			if (!event.scope && !scope) return;
 			this.emitExternalEvent(scope && !event.scope ? { ...event, scope } : event);
 		};
 	}
