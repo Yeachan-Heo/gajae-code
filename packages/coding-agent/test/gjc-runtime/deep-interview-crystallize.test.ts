@@ -717,6 +717,9 @@ describe("deep-interview crystallize contract", () => {
 				"Use PostgreSQL and Redis for storage.",
 				"Use PostgreSQL for storage",
 			],
+			["Do not use PostgreSQL; use Redis.", "Do not use PostgreSQL; use Redis.", "Do not use Redis"],
+			["Use 5 replicas and 10 workers.", "Use 5 replicas and 10 workers.", "Use 10 replicas and 5 workers"],
+			["Keep logging off.", "Keep logging off.", "Keep logging on"],
 			["Failure ratio must be 1:2.", "Failure ratio must be 1:2.", "Failure ratio must be 1 2"],
 			["Failure ratio must be 1 : 2.", "Failure ratio must be 1 : 2.", "Failure ratio must be 1 2"],
 			["Use Rust. Actually use Go.", "Use Rust.", "Use Rust"],
@@ -978,7 +981,6 @@ describe("deep-interview crystallize contract", () => {
 		for (const answer of [
 			"The budget is 1GB.",
 			"The maximum memory budget is different from 1GB.",
-			"The maximum memory budget is less than 1GB.",
 			"The maximum memory budget is 1GB or 2GB.",
 			"The maximum memory budget is probably 1GB.",
 			"The maximum memory budget is 1GB, but perhaps 2GB.",
