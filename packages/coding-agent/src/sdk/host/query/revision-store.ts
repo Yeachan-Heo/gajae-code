@@ -397,19 +397,28 @@ export class RevisionStore {
 		if (!revision) return undefined;
 		revision.lastAccessed = this.now();
 		if (!revision.index?.items) return undefined;
-		const items: unknown[] = [];
+		const ranges = revision.index.items.slice(offset);
+		let count = 0;
 		let itemsBytes = 2; // []
-		for (const range of revision.index.items.slice(offset)) {
-			// The manifest records the canonical item length, so reject an oversized
-			// item before reading or parsing its complete range.
-			if (range.end - range.start > targetBytes) break;
-			const value = JSON.parse(await this.#readRange(revision, range));
-			const itemBytes = Buffer.byteLength(JSON.stringify(value));
-			const candidateBytes = itemsBytes + itemBytes + (items.length ? 1 : 0);
-			if (candidateBytes > targetBytes && items.length) break;
+		for (const range of ranges) {
+			// Indexed ranges contain canonical JSON, so their byte lengths select
+			// the page without repeatedly loading and hashing the same chunk.
+			const itemBytes = range.end - range.start;
+			if (itemBytes > targetBytes) break;
+			const candidateBytes = itemsBytes + itemBytes + (count ? 1 : 0);
+			if (candidateBytes > targetBytes && count) break;
 			if (candidateBytes > 1024 * 1024) break;
-			items.push(value);
+			count++;
 			itemsBytes = candidateBytes;
+		}
+		const items: unknown[] = [];
+		if (count) {
+			const start = ranges[0]!.start;
+			const bytes = await this.#readBytes(revision, start, ranges[count - 1]!.end);
+			for (let index = 0; index < count; index++) {
+				const range = ranges[index]!;
+				items.push(JSON.parse(bytes.subarray(range.start - start, range.end - start).toString("utf8")));
+			}
 		}
 		return { items, complete: offset + items.length >= revision.index.items.length };
 	}
@@ -1094,9 +1103,6 @@ export class RevisionStore {
 			if (position >= end) break;
 		}
 		return Buffer.concat(values);
-	}
-	async #readRange(revision: Revision, range: { start: number; end: number }): Promise<string> {
-		return (await this.#readBytes(revision, range.start, range.end)).toString("utf8");
 	}
 
 	async #readChunks(chunks: string[], lengths: number[]): Promise<Buffer | undefined> {

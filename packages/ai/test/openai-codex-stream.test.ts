@@ -19,7 +19,6 @@ const originalWebSocket = global.WebSocket;
 const originalCodexWebSocketRetryBudget = Bun.env.PI_CODEX_WEBSOCKET_RETRY_BUDGET;
 const originalCodexWebSocketRetryDelayMs = Bun.env.PI_CODEX_WEBSOCKET_RETRY_DELAY_MS;
 const originalCodexWebSocketIdleTimeoutMs = Bun.env.PI_CODEX_WEBSOCKET_IDLE_TIMEOUT_MS;
-const originalCodexWebSocketV2 = Bun.env.PI_CODEX_WEBSOCKET_V2;
 
 function restoreEnv(name: string, value: string | undefined): void {
 	if (value === undefined) {
@@ -36,7 +35,6 @@ afterEach(() => {
 	restoreEnv("PI_CODEX_WEBSOCKET_RETRY_BUDGET", originalCodexWebSocketRetryBudget);
 	restoreEnv("PI_CODEX_WEBSOCKET_RETRY_DELAY_MS", originalCodexWebSocketRetryDelayMs);
 	restoreEnv("PI_CODEX_WEBSOCKET_IDLE_TIMEOUT_MS", originalCodexWebSocketIdleTimeoutMs);
-	restoreEnv("PI_CODEX_WEBSOCKET_V2", originalCodexWebSocketV2);
 	vi.restoreAllMocks();
 });
 
@@ -2915,10 +2913,9 @@ describe("openai-codex streaming", () => {
 		expect((capturedBodies[1]?.text as { verbosity?: string } | undefined)?.verbosity).toBe("high");
 	});
 
-	it("uses websocket v2 beta header when v2 mode is enabled", async () => {
+	it("sends the websocket v2 beta header on every websocket transport", async () => {
 		const tempDir = TempDir.createSync("@pi-codex-stream-");
 		setAgentDir(tempDir.path());
-		Bun.env.PI_CODEX_WEBSOCKET_V2 = "1";
 
 		const payload = Buffer.from(
 			JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: "acc_test" } }),

@@ -56,18 +56,25 @@ function upstreamUrl(url: string, token: string): string {
 	return endpoint.toString();
 }
 
-function waitForDrain(stream: Writable): Promise<void> {
+function waitForDrain(stream: Writable): { promise: Promise<void>; cancel: () => void } {
 	const { promise, reject, resolve } = Promise.withResolvers<void>();
+	let settled = false;
 	const onDrain = (): void => done(resolve);
 	const onError = (error: Error): void => done(() => reject(error));
+	const onClose = (): void => done(() => reject(new Error("downstream_closed")));
 	const done = (callback: () => void): void => {
+		if (settled) return;
+		settled = true;
 		stream.removeListener("drain", onDrain);
 		stream.removeListener("error", onError);
+		stream.removeListener("close", onClose);
 		callback();
 	};
 	stream.once("drain", onDrain);
 	stream.once("error", onError);
-	return promise;
+	stream.once("close", onClose);
+	if (stream.destroyed) onClose();
+	return { promise, cancel: onDrain };
 }
 
 const WEBSOCKET_CONNECTING = 0;
@@ -96,7 +103,9 @@ export async function startRelayPair(options: RelayOptions): Promise<RelayPair> 
 	const finished = Promise.withResolvers<void>();
 	let closed = false;
 	let completed = false;
-	let downstreamBuffer = Buffer.alloc(0);
+	let downstreamChunks: Buffer[] = [];
+	let downstreamBytes = 0;
+	let downstreamDrain: { promise: Promise<void>; cancel: () => void } | undefined;
 	const toWs: QueuedFrame[] = [];
 	const toDownstream: QueuedFrame[] = [];
 	let pendingToWs = 0;
@@ -123,6 +132,7 @@ export async function startRelayPair(options: RelayOptions): Promise<RelayPair> 
 	const close = async (error?: Error): Promise<void> => {
 		if (closed) return finished.promise.catch(() => undefined);
 		closed = true;
+		downstreamDrain?.cancel();
 		detach();
 		options.downstream.pause();
 		if (ws.readyState === WEBSOCKET_OPEN || ws.readyState === WEBSOCKET_CONNECTING) ws.close();
@@ -175,33 +185,45 @@ export async function startRelayPair(options: RelayOptions): Promise<RelayPair> 
 		writingDownstream = true;
 		if (frame.accounted) pendingToDownstream -= frame.bytes.length;
 		try {
-			if (!options.downstreamSink.write(frame.bytes)) await waitForDrain(options.downstreamSink);
+			if (!options.downstreamSink.write(frame.bytes) && !closed) {
+				downstreamDrain = waitForDrain(options.downstreamSink);
+				await downstreamDrain.promise;
+			}
 		} catch (error) {
 			await close(error instanceof Error ? error : new Error(String(error)));
 			return;
 		} finally {
+			downstreamDrain = undefined;
 			writingDownstream = false;
 		}
 		void pumpDownstream();
 	};
 	const consumeLines = (chunk: Buffer): void => {
-		downstreamBuffer = Buffer.concat([downstreamBuffer, chunk]);
-		let newline = downstreamBuffer.indexOf(0x0a);
+		let start = 0;
+		let newline = chunk.indexOf(0x0a);
 		while (newline >= 0) {
-			const line = downstreamBuffer.subarray(0, newline);
-			downstreamBuffer = downstreamBuffer.subarray(newline + 1);
-			if (line.length === 0)
+			const length = downstreamBytes + newline - start;
+			if (length === 0)
 				return fail({ type: "transport_error", code: "protocol_error", direction: "downstream->ws" });
-			if (line.length > REQUEST_FRAME_BYTES)
+			if (length > REQUEST_FRAME_BYTES)
 				return fail({ type: "transport_error", code: "frame_oversize", direction: "downstream->ws" });
+			downstreamChunks.push(chunk.subarray(start, newline));
+			const line = Buffer.concat(downstreamChunks, length);
+			downstreamChunks = [];
+			downstreamBytes = 0;
 			if (options.validateDownstreamFrame && !options.validateDownstreamFrame(line.toString("utf8")))
 				return fail({ type: "transport_error", code: "protocol_error", direction: "downstream->ws" });
 			enqueue(toWs, "downstream->ws", line);
 			if (closed) return;
-			newline = downstreamBuffer.indexOf(0x0a);
+			start = newline + 1;
+			newline = chunk.indexOf(0x0a, start);
 		}
-		if (downstreamBuffer.length > REQUEST_FRAME_BYTES)
-			fail({ type: "transport_error", code: "frame_oversize", direction: "downstream->ws" });
+		if (start < chunk.length) {
+			downstreamBytes += chunk.length - start;
+			if (downstreamBytes > REQUEST_FRAME_BYTES)
+				return fail({ type: "transport_error", code: "frame_oversize", direction: "downstream->ws" });
+			downstreamChunks.push(chunk.subarray(start));
+		}
 	};
 	const onData = (chunk: Buffer | string): void => consumeLines(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
 	const onEnd = (): void => void close();

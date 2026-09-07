@@ -118,6 +118,7 @@ function createResumeHarness(options: ResumeHarnessOptions = {}): {
 		rebuildInitialMessages: options.rebuildInitialMessages ?? vi.fn(),
 		reloadTodos: options.reloadTodos ?? vi.fn(async () => undefined),
 		showStatus,
+		resetAssistantTextPresentation: vi.fn(),
 	} as unknown as InteractiveModeContext;
 
 	return {
