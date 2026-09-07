@@ -16260,8 +16260,13 @@ export class AgentSession {
 			this.#externalIngressSealed = true;
 			const sessionId = this.sessionId;
 			this.#disconnectFromAgent();
-			await this.abort();
-			if (!this.#compactionHookContext.getStore()) await Promise.allSettled([...this.#autoCompactionCompletions]);
+			if (this.#compactionHookContext.getStore()) {
+				this.abortCompaction();
+				this.agent.abort();
+			} else {
+				await this.abort();
+				await Promise.allSettled([...this.#autoCompactionCompletions]);
+			}
 			this.#cancelOwnAsyncJobs();
 			this.#suppressOwnAsyncJobDeliveries();
 			this.yieldQueue.clear();
