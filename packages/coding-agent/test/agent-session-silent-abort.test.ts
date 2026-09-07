@@ -409,7 +409,13 @@ describe("AgentSession silent-abort marker stamping", () => {
 		expect(() => session.newSession()).toThrow(expect.objectContaining({ code: "session_persistence_blocked" }));
 		const recovery = vi
 			.spyOn(session.sessionManager, "recoverPersistenceFailure")
-			.mockRejectedValueOnce(new Error("still unreconciled"));
+			.mockRejectedValueOnce(new Error("selection still unreconciled"))
+			.mockRejectedValueOnce(new Error("prompt still unreconciled"));
+		const selectionMutation = vi.fn(async () => {});
+		await expect(session.withSdkControlMutation(selectionMutation)).rejects.toMatchObject({
+			code: "session_persistence_blocked",
+		});
+		expect(selectionMutation).not.toHaveBeenCalled();
 		await expect(session.prompt("must remain fenced")).rejects.toMatchObject({
 			code: "session_persistence_blocked",
 		});
@@ -417,7 +423,7 @@ describe("AgentSession silent-abort marker stamping", () => {
 			session.runWithPromptAdmissionForTests(async () => {}),
 			session.runWithPromptAdmissionForTests(async () => {}),
 		]);
-		expect(recovery).toHaveBeenCalledTimes(2);
+		expect(recovery).toHaveBeenCalledTimes(3);
 		expect(
 			events.filter(event => event.type === "notice" && event.source === "terminal-persistence-recovered"),
 		).toHaveLength(1);
