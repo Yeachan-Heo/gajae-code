@@ -481,10 +481,7 @@ mod platform {
 				return None;
 			}
 			let info = read_bsdinfo(pid)?;
-			if i32::try_from(info.pbi_pid).ok()? != pid {
-				return None;
-			}
-			Some(Self { pid, start_tvsec: info.pbi_start_tvsec, start_tvusec: info.pbi_start_tvusec })
+			Some(Self { pid, start_tvsec: info.start_tvsec, start_tvusec: info.start_tvusec })
 		}
 
 		pub const fn pid(&self) -> i32 {
@@ -533,7 +530,7 @@ mod platform {
 
 		pub fn parent_pid(&self) -> Option<i32> {
 			let info = self.live_bsdinfo()?;
-			i32::try_from(info.pbi_ppid).ok().filter(|ppid| *ppid > 0)
+			(info.ppid > 0).then_some(info.ppid)
 		}
 
 		pub fn args(&self) -> Vec<String> {
@@ -559,7 +556,7 @@ mod platform {
 
 		pub fn group_id(&self) -> Option<i32> {
 			let info = self.live_bsdinfo()?;
-			i32::try_from(info.pbi_pgid).ok().filter(|pgid| *pgid > 0)
+			(info.pgid > 0).then_some(info.pgid)
 		}
 
 		/// Walk the descendant tree in post-order (leaves first), de-duplicating
@@ -625,12 +622,12 @@ mod platform {
 			}
 		}
 
-		/// Returns the current `proc_bsdinfo` only if it still describes the same
+		/// Returns the current process record only if it still describes the same
 		/// process this reference was opened on — i.e. the start time has not
 		/// changed.
-		fn live_bsdinfo(&self) -> Option<libc::proc_bsdinfo> {
+		fn live_bsdinfo(&self) -> Option<ProcInfo> {
 			let info = read_bsdinfo(self.pid)?;
-			if info.pbi_start_tvsec == self.start_tvsec && info.pbi_start_tvusec == self.start_tvusec {
+			if info.start_tvsec == self.start_tvsec && info.start_tvusec == self.start_tvusec {
 				Some(info)
 			} else {
 				None
@@ -716,9 +713,7 @@ mod platform {
 				// race, not an observation failure: skip it and keep the snapshot.
 				continue;
 			};
-			let Ok(ppid) = i32::try_from(info.pbi_ppid) else {
-				continue;
-			};
+			let ppid = info.ppid;
 			if ppid <= 0 {
 				continue;
 			}
@@ -766,24 +761,72 @@ mod platform {
 		matches
 	}
 
-	fn read_bsdinfo(pid: i32) -> Option<libc::proc_bsdinfo> {
-		// SAFETY: `proc_bsdinfo` is a plain C data struct. Zero initialization is
-		// valid because every field is an integer or fixed-size integer array, and
-		// libproc fully overwrites the fields it reports on a successful call.
-		let mut info = unsafe { std::mem::zeroed::<libc::proc_bsdinfo>() };
-		// SAFETY: `info` is a writable `proc_bsdinfo` buffer whose exact byte size is
-		// supplied to libproc. The PID, flavor, and arg are scalar values passed by
-		// value; libproc writes at most the supplied buffer size.
-		let actual = unsafe {
-			libc::proc_pidinfo(
-				pid,
-				libc::PROC_PIDTBSDINFO,
+	/// The subset of `kinfo_proc` this module needs, read through
+	/// `sysctl(KERN_PROC_PID)`.
+	///
+	/// `proc_pidinfo(PROC_PIDTBSDINFO)` is deliberately not used: the kernel
+	/// refuses it with `EPERM` for setuid or entitlement-carrying children such
+	/// as `/bin/ps`, `/usr/bin/top`, and `sudo`, so a shell that spawned one of
+	/// them could never open a stable reference to its own child.
+	/// `KERN_PROC_PID` reports the same identity fields for every process
+	/// visible to the caller.
+	#[derive(Clone, Copy)]
+	struct ProcInfo {
+		pid:          i32,
+		ppid:         i32,
+		pgid:         i32,
+		start_tvsec:  u64,
+		start_tvusec: u64,
+	}
+
+	/// `sizeof(struct kinfo_proc)` and the field offsets used below, from
+	/// `<sys/sysctl.h>` on 64-bit Darwin (identical on `arm64` and `x86_64`):
+	/// `kp_proc.p_un.__p_starttime` is the leading `struct timeval`
+	/// (`tv_sec: i64` at 0, `tv_usec: i32` at 8), `kp_proc.p_pid` follows
+	/// `p_flag`/`p_stat` at 40, and `kp_eproc.e_ppid`/`e_pgid` sit after the
+	/// embedded credential and vmspace blocks at 560/564.
+	const KINFO_PROC_SIZE: usize = 648;
+	const KINFO_PROC_START_TVSEC: usize = 0;
+	const KINFO_PROC_START_TVUSEC: usize = 8;
+	const KINFO_PROC_PID: usize = 40;
+	const KINFO_PROC_PPID: usize = 560;
+	const KINFO_PROC_PGID: usize = 564;
+
+	fn read_bsdinfo(pid: i32) -> Option<ProcInfo> {
+		let mut mib = [libc::CTL_KERN, libc::KERN_PROC, libc::KERN_PROC_PID, pid];
+		let mut buffer = [0u8; KINFO_PROC_SIZE];
+		let mut len = buffer.len();
+		// SAFETY: `mib` points to four initialized integers, `buffer` is a
+		// writable region of exactly `len` bytes, and `len` is a valid in/out
+		// length parameter; the kernel writes at most `len` bytes.
+		let rc = unsafe {
+			libc::sysctl(
+				mib.as_mut_ptr(),
+				mib.len() as u32,
+				buffer.as_mut_ptr().cast::<std::ffi::c_void>(),
+				&raw mut len,
+				ptr::null_mut(),
 				0,
-				(&raw mut info).cast::<std::ffi::c_void>(),
-				size_of::<libc::proc_bsdinfo>() as i32,
 			)
 		};
-		if actual < size_of::<libc::proc_bsdinfo>() as i32 {
+		// A pid that does not exist returns success with zero bytes written.
+		if rc != 0 || len != KINFO_PROC_SIZE {
+			return None;
+		}
+		let read_i32 = |offset: usize| {
+			i32::from_ne_bytes(buffer[offset..offset + 4].try_into().expect("4-byte slice"))
+		};
+		let read_i64 = |offset: usize| {
+			i64::from_ne_bytes(buffer[offset..offset + 8].try_into().expect("8-byte slice"))
+		};
+		let info = ProcInfo {
+			pid:          read_i32(KINFO_PROC_PID),
+			ppid:         read_i32(KINFO_PROC_PPID),
+			pgid:         read_i32(KINFO_PROC_PGID),
+			start_tvsec:  u64::try_from(read_i64(KINFO_PROC_START_TVSEC)).ok()?,
+			start_tvusec: u64::try_from(read_i32(KINFO_PROC_START_TVUSEC)).ok()?,
+		};
+		if info.pid != pid {
 			return None;
 		}
 		Some(info)
@@ -2379,5 +2422,40 @@ mod tests {
 		assert!(child.try_wait().expect("poll child").is_none());
 		child.kill().expect("cleanup child");
 		let _ = child.wait();
+	}
+
+	/// Regression test for entitlement-restricted children on macOS. `/bin/ps`
+	/// and `/usr/bin/top` carry private entitlements, so
+	/// `proc_pidinfo(PROC_PIDTBSDINFO)` on them fails with `EPERM` even for
+	/// their own parent. The ownership ledger treats "cannot open a stable
+	/// reference to a child we just spawned" as a fatal integrity failure
+	/// (`exit(70)`), which turned every `ps`, `top`, or `sudo` invocation in
+	/// the bash tool into a dead shell runtime. `top -l 0` samples forever, so
+	/// the child is guaranteed alive while it is inspected.
+	#[cfg(target_os = "macos")]
+	#[test]
+	fn from_pid_opens_entitled_child() {
+		use std::process::{Command, Stdio};
+
+		let mut child = Command::new("/usr/bin/top")
+			.args(["-l", "0", "-s", "1", "-n", "0"])
+			.stdout(Stdio::null())
+			.stderr(Stdio::null())
+			.spawn()
+			.expect("spawn top");
+		let pid = i32::try_from(child.id()).expect("child pid fits in i32");
+		let self_pid = i32::try_from(std::process::id()).expect("self pid fits in i32");
+		let process = Process::from_pid(pid);
+		let ppid = process.as_ref().and_then(Process::ppid);
+		let pgid = process
+			.as_ref()
+			.and_then(|process| process.inner.group_id());
+		let _ = child.kill();
+		let _ = child.wait();
+		let process = process.expect("stable reference to an entitlement-restricted child");
+		assert_eq!(process.pid(), pid);
+		assert!(process.incarnation().starts_with("darwin:"));
+		assert_eq!(ppid, Some(self_pid));
+		assert!(pgid.is_some_and(|pgid| pgid > 0));
 	}
 }
