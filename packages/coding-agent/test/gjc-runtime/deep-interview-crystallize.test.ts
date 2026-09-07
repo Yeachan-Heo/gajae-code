@@ -483,7 +483,7 @@ describe("deep-interview crystallize contract", () => {
 			start: 0,
 			end: 0,
 			messages: [
-				{ index: 0, role: "user", content: "Use PostgreSQL for storage. After deployment, rotate secrets." },
+				{ index: 0, role: "user", content: "Use PostgreSQL for storage. After deployment rotate secrets." },
 			],
 			digest: "",
 		};
@@ -561,6 +561,50 @@ describe("deep-interview crystallize contract", () => {
 							...input().items[0]!,
 							statement: "Build a fast report",
 							anchor: { message_index: 0, quote: "Build a fast report." },
+						},
+					],
+				}),
+			),
+		).toThrow("verbatim user anchor");
+		for (const qualifier of ["When approved.", "Assuming approval.", "Depending on approval."]) {
+			const qualifierSnapshot: CrystalSnapshot = {
+				...qualifiedSnapshot,
+				messages: [{ index: 0, role: "user", content: `Build a fast report. ${qualifier}` }],
+				digest: "",
+			};
+			qualifierSnapshot.digest = crystalSnapshotDigest(qualifierSnapshot);
+			expect(() =>
+				crystallizeDeepInterview(
+					input({
+						snapshot: qualifierSnapshot,
+						items: [
+							{
+								...input().items[0]!,
+								statement: "Build a fast report",
+								anchor: { message_index: 0, quote: "Build a fast report." },
+							},
+						],
+					}),
+				),
+			).toThrow("verbatim user anchor");
+		}
+		const separatedCorrectionSnapshot: CrystalSnapshot = {
+			revision: 1,
+			start: 0,
+			end: 0,
+			messages: [{ index: 0, role: "user", content: "Build the API in Go. No. Use JS." }],
+			digest: "",
+		};
+		separatedCorrectionSnapshot.digest = crystalSnapshotDigest(separatedCorrectionSnapshot);
+		expect(() =>
+			crystallizeDeepInterview(
+				input({
+					snapshot: separatedCorrectionSnapshot,
+					items: [
+						{
+							...input().items[0]!,
+							statement: "Build the API in Go",
+							anchor: { message_index: 0, quote: "Build the API in Go." },
 						},
 					],
 				}),
