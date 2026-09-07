@@ -278,6 +278,28 @@ describe("deep-interview crystallize contract", () => {
 				}),
 			),
 		).toThrow("verbatim user anchor");
+		const orderedSnapshot: CrystalSnapshot = {
+			revision: 1,
+			start: 0,
+			end: 0,
+			messages: [{ index: 0, role: "user", content: "Build C++ before C#." }],
+			digest: "",
+		};
+		orderedSnapshot.digest = crystalSnapshotDigest(orderedSnapshot);
+		expect(() =>
+			crystallizeDeepInterview(
+				input({
+					snapshot: orderedSnapshot,
+					items: [
+						{
+							...input().items[0]!,
+							statement: "Build C# before C++",
+							anchor: { message_index: 0, quote: "Build C++ before C#." },
+						},
+					],
+				}),
+			),
+		).toThrow("verbatim user anchor");
 	});
 	it("rejects marker substrings in mixed text anchors", () => {
 		const snapshot: CrystalSnapshot = {
