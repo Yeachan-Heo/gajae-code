@@ -762,7 +762,10 @@ function quantitativeEvidenceTerms(value: string): Set<string> {
 	const canonical = value.normalize("NFC");
 	const terms = new Set<string>();
 	for (const match of canonical.matchAll(/\p{Sc}|>=|<=|>|</gu)) terms.add(match[0]);
-	for (const match of canonical.matchAll(/\b\d+(?:\.\d+)?\s*([A-Za-z]{1,3})\b/g)) terms.add(match[1]!.toLowerCase());
+	for (const match of canonical.matchAll(/\b(\d+(?:\.\d+)?)\s*([A-Za-z]+)?\b/g)) {
+		terms.add(match[1]!);
+		if (match[2]) terms.add(match[2].toLowerCase());
+	}
 	return terms;
 }
 
