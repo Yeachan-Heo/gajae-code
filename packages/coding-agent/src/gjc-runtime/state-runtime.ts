@@ -917,7 +917,9 @@ async function assertHandoffRecoveryEnvelopeIntegrity(
 		typeof checksum.value !== "string" ||
 		!/^[0-9a-f]{64}$/.test(checksum.value) ||
 		typeof checksum.covered_path !== "string" ||
-		path.resolve(checksum.covered_path) !== path.resolve(filePath)
+		path.resolve(checksum.covered_path) !== path.resolve(filePath) ||
+		typeof checksum.computed_at !== "string" ||
+		!checksum.computed_at.trim()
 	)
 		throw new StateCommandError(2, `handoff recovery requires checksummed canonical ${label} state`);
 	const integrityWarning = await warnAndAuditOutOfBandIfNeeded(cwd, sessionId, filePath, skill);
