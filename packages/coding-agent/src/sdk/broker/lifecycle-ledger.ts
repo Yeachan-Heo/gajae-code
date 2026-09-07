@@ -92,7 +92,6 @@ export interface LifecycleLedgerEntry {
 	unresolvedCleanupResponseDigest?: string;
 	uncertainCleanupSessionId?: string;
 	uncertainCleanupSessionIds?: string[];
-	uncertainCleanupAllSessions?: true;
 	ts: number;
 }
 export type BeginResult =
@@ -181,12 +180,6 @@ function pendingCleanupSessionId(response: unknown): string | undefined {
 	if (!response || typeof response !== "object") return undefined;
 	const cleanup = (response as { error?: { cleanup?: { sessionId?: unknown } } }).error?.cleanup;
 	return canonicalCleanupSessionId(cleanup?.sessionId) ? cleanup.sessionId : undefined;
-}
-
-function hasCleanupAuthorityShape(response: unknown): boolean {
-	if (!response || typeof response !== "object") return false;
-	const error = (response as { error?: unknown }).error;
-	return Boolean(error && typeof error === "object" && "cleanup" in error);
 }
 
 function hasValidTerminalDigests(entry: LifecycleLedgerEntry): boolean {
@@ -335,12 +328,10 @@ export class LifecycleLedger {
 								(candidate, index, candidates): candidate is string =>
 									canonicalCleanupSessionId(candidate) && candidates.indexOf(candidate) === index,
 							);
-							if (
-								hasCleanupAuthorityShape(entry.response) ||
-								hasCleanupAuthorityShape(entry.unresolvedCleanupResponse) ||
-								(entry.state === "terminal_uncertain" && entry.response === undefined)
-							)
-								uncertain.uncertainCleanupAllSessions = true;
+							// No blanket fence: the synthetic marker stays scoped to the
+							// session ids the quarantined row actually named (#5364).
+							// Rows that named nothing fence nothing; resurrecting a
+							// maximally-destructive flag here is the poison shape.
 							syntheticUncertain.set(entry.identity, uncertain);
 						}
 						continue;
@@ -895,8 +886,6 @@ export class LifecycleLedger {
 	hasUncertainCleanupForSession(sessionId: string, excludingIdentity: string): boolean {
 		for (const current of this.#byIdentity.values()) {
 			if (current.state !== "terminal_uncertain") continue;
-			if (current.uncertainCleanupAllSessions === true) return true;
-			if (current.response === undefined) return true;
 			if (current.identity === excludingIdentity) continue;
 			const fencedSessions = [
 				current.uncertainCleanupSessionId,
@@ -905,8 +894,9 @@ export class LifecycleLedger {
 				pendingCleanupSessionId(current.unresolvedCleanupResponse),
 				...(current.uncertainCleanupSessionIds ?? []),
 			];
-			const boundSessions = fencedSessions.filter((value): value is string => typeof value === "string");
-			if (boundSessions.length === 0) return true;
+			// An unbound uncertain entry names no session: it fences nothing.
+			// Fencing all ids on zero evidence is what made one refusal
+			// self-amplify into a permanent blanket fence (#5364).
 			if (fencedSessions.includes(sessionId)) return true;
 		}
 		return false;

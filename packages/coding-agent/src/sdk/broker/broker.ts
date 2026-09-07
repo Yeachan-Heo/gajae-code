@@ -3385,6 +3385,12 @@ export class Broker {
 				const response = outcome.response;
 				const storedResponse = credentialFreeLifecycleResponse(response) as BrokerResponse;
 				await this.ledger.transition(identity, lifecycleResponseState(response), {
+					...(operation === "session.delete" &&
+					typeof input.sessionId === "string" &&
+					lifecycleResponseState(response) === "terminal_uncertain" &&
+					!pendingCleanupSessionId(response)
+						? { intendedSessionId: input.sessionId }
+						: {}),
 					response: storedResponse,
 					responseDigest: createHash("sha256").update(canonicalJson(storedResponse)).digest("hex"),
 					...(outcome.durableEffects ? { durableEffects: outcome.durableEffects } : {}),
@@ -3404,6 +3410,12 @@ export class Broker {
 				const storedResponse = credentialFreeLifecycleResponse(response) as BrokerResponse;
 				await this.ledger.transition(identity, lifecycleResponseState(response), {
 					...(pendingCleanupSessionId(response) ? { intendedSessionId: pendingCleanupSessionId(response) } : {}),
+					...(operation === "session.delete" &&
+					typeof input.sessionId === "string" &&
+					lifecycleResponseState(response) === "terminal_uncertain" &&
+					!pendingCleanupSessionId(response)
+						? { intendedSessionId: input.sessionId }
+						: {}),
 					response: storedResponse,
 					responseDigest: createHash("sha256").update(canonicalJson(storedResponse)).digest("hex"),
 					...(outcome.durableEffects ? { durableEffects: outcome.durableEffects } : {}),
@@ -3415,8 +3427,21 @@ export class Broker {
 			const outcome = await executeLifecycle(this, operation, input, identity);
 			const response = outcome.response;
 			const storedResponse = credentialFreeLifecycleResponse(response) as BrokerResponse;
+			// Record the refusal's own target session so the fence it may leave
+			// is scoped to that session. Without this, a session.delete refusal
+			// for X persists as an unbound terminal_uncertain row and fences
+			// every later delete for unrelated sessions (#5364). A refusal that
+			// truly cannot name its target fences nothing (see
+			// hasUncertainCleanupForSession).
+			const refusalSessionId =
+				operation === "session.delete" && typeof input.sessionId === "string" ? input.sessionId : undefined;
 			await this.ledger.transition(identity, lifecycleResponseState(response), {
 				...(pendingCleanupSessionId(response) ? { intendedSessionId: pendingCleanupSessionId(response) } : {}),
+				...(refusalSessionId !== undefined &&
+				lifecycleResponseState(response) === "terminal_uncertain" &&
+				!pendingCleanupSessionId(response)
+					? { intendedSessionId: refusalSessionId }
+					: {}),
 				resultSessionId:
 					response.ok && typeof (response.result as { sessionId?: unknown } | undefined)?.sessionId === "string"
 						? (response.result as { sessionId: string }).sessionId
