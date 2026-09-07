@@ -1892,6 +1892,58 @@ async function readBoundedIdentityText(
 	}
 }
 
+async function hashIdentityFile(filePath: string, label: string): Promise<string | undefined> {
+	let initialStat: nodeFs.BigIntStats;
+	try {
+		initialStat = await fs.lstat(filePath, { bigint: true });
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+		throw new StateCommandError(2, `failed to hash ${label}: ${(error as Error).message}`);
+	}
+	if (initialStat.isSymbolicLink() || !initialStat.isFile() || initialStat.size > BigInt(Number.MAX_SAFE_INTEGER))
+		return undefined;
+	const openFlags =
+		nodeFs.constants.O_RDONLY | (process.platform === "win32" ? 0 : (nodeFs.constants.O_NOFOLLOW ?? 0));
+	let handle: fs.FileHandle | undefined;
+	try {
+		handle = await fs.open(filePath, openFlags);
+		const openedStat = await handle.stat({ bigint: true });
+		const beforeReadStat = await fs.lstat(filePath, { bigint: true });
+		if (
+			openedStat.isSymbolicLink() ||
+			!openedStat.isFile() ||
+			beforeReadStat.isSymbolicLink() ||
+			!sameBoundedFileIdentity(initialStat, openedStat) ||
+			!sameBoundedFileIdentity(initialStat, beforeReadStat)
+		)
+			return undefined;
+		const hasher = createHash("sha256");
+		const buffer = Buffer.alloc(64 * 1024);
+		let position = 0;
+		const size = Number(openedStat.size);
+		while (position < size) {
+			const { bytesRead } = await handle.read(buffer, 0, Math.min(buffer.length, size - position), position);
+			if (bytesRead === 0) return undefined;
+			hasher.update(buffer.subarray(0, bytesRead));
+			position += bytesRead;
+		}
+		const afterReadStat = await handle.stat({ bigint: true });
+		const afterPathStat = await fs.lstat(filePath, { bigint: true });
+		if (
+			afterPathStat.isSymbolicLink() ||
+			!afterPathStat.isFile() ||
+			!sameBoundedFileIdentity(initialStat, afterReadStat) ||
+			!sameBoundedFileIdentity(initialStat, afterPathStat)
+		)
+			return undefined;
+		return hasher.digest("hex");
+	} catch {
+		return undefined;
+	} finally {
+		await handle?.close().catch(() => undefined);
+	}
+}
+
 async function assertSanctionedExecutionApprovalAudit(
 	cwd: string,
 	sessionId: string,
@@ -2317,7 +2369,7 @@ async function hasSanctionedRalplanFinalAdmission(
 	const admission = isPlainObject(state.auto_handoff) ? state.auto_handoff : undefined;
 	if (!admission) return false;
 	if (
-		admission.effectiveTarget !== "ultragoal" ||
+		(admission.effectiveTarget !== "ultragoal" && admission.effectiveTarget !== "off") ||
 		admission.degradationReason !== null ||
 		typeof admission.source !== "string" ||
 		!admission.source.trim()
@@ -2377,15 +2429,7 @@ async function hasSanctionedRalplanFinalAdmission(
 		return false;
 	const artifactPath = path.resolve(finalRow.path);
 	if (!artifactPath.startsWith(`${path.resolve(runDir)}${path.sep}`)) return false;
-	try {
-		const stat = await fs.lstat(artifactPath);
-		if (!stat.isFile() || stat.isSymbolicLink() || stat.size > MAX_DEEP_INTERVIEW_STRUCTURED_RESPONSE_LENGTH)
-			return false;
-		const artifact = await fs.readFile(artifactPath);
-		return createHash("sha256").update(artifact).digest("hex") === finalRow.sha256;
-	} catch {
-		return false;
-	}
+	return (await hashIdentityFile(artifactPath, "ralplan final artifact")) === finalRow.sha256;
 }
 
 async function assertDeepInterviewExecutionLineage(
@@ -3412,7 +3456,7 @@ async function handleHandoff(args: readonly string[], cwd: string): Promise<Stat
 	);
 }
 
-async function appendExecutionApprovalAudit(options: {
+interface ExecutionApprovalAuditOptions {
 	cwd: string;
 	sessionId: string;
 	statePath: string;
@@ -3420,8 +3464,12 @@ async function appendExecutionApprovalAudit(options: {
 	mutationId: string;
 	revision: number;
 	receipt: WorkflowStateReceipt;
-}): Promise<void> {
-	const entry = {
+}
+
+function buildExecutionApprovalAuditEntry(
+	options: ExecutionApprovalAuditOptions,
+): AuditEntry & Record<string, unknown> {
+	return {
 		ts: options.approvedAt,
 		skill: "deep-interview",
 		category: "state",
@@ -3438,7 +3486,12 @@ async function appendExecutionApprovalAudit(options: {
 		receipt_state_revision: options.revision,
 		receipt: options.receipt,
 	} as AuditEntry & Record<string, unknown>;
-	await appendAuditEntry(options.cwd, options.sessionId, entry);
+}
+
+async function writeExecutionApprovalIndex(
+	options: ExecutionApprovalAuditOptions,
+	entry: AuditEntry & Record<string, unknown>,
+): Promise<void> {
 	await writeArtifact(
 		path.join(sessionStateDir(options.cwd, options.sessionId), "deep-interview-approval-audit.json"),
 		`${JSON.stringify(entry)}\n`,
@@ -3454,6 +3507,17 @@ async function appendExecutionApprovalAudit(options: {
 			},
 		},
 	);
+}
+
+async function appendExecutionApprovalAudit(
+	options: ExecutionApprovalAuditOptions,
+	hooks: { afterIndex?: () => Promise<unknown>; afterAudit?: () => Promise<unknown> } = {},
+): Promise<void> {
+	const entry = buildExecutionApprovalAuditEntry(options);
+	await writeExecutionApprovalIndex(options, entry);
+	await hooks.afterIndex?.();
+	await appendAuditEntry(options.cwd, options.sessionId, entry);
+	await hooks.afterAudit?.();
 }
 
 async function handleApproveExecutionUnlocked(cwd: string, selectors: ResolvedSelectors): Promise<StateCommandResult> {
@@ -3545,7 +3609,7 @@ async function handleApproveExecutionUnlocked(cwd: string, selectors: ResolvedSe
 				pendingJournal.paths.some((value, index) => path.resolve(value) !== expectedJournalPaths[index])
 			)
 				throw error;
-			await appendExecutionApprovalAudit({
+			const recoveryAuditOptions: ExecutionApprovalAuditOptions = {
 				cwd,
 				sessionId: selectors.gjcSessionId,
 				statePath: resolvedStatePath,
@@ -3553,9 +3617,16 @@ async function handleApproveExecutionUnlocked(cwd: string, selectors: ResolvedSe
 				mutationId: existingReceipt.mutation_id as string,
 				revision: persistedRevision,
 				receipt: persistedReceipt,
-			});
-			await updateWorkflowTransactionJournal(cwd, selectors.gjcSessionId, existingReceipt.mutation_id as string, {
-				steps: ["approval-state", "approval-audit"],
+			};
+			await appendExecutionApprovalAudit(recoveryAuditOptions, {
+				afterIndex: () =>
+					updateWorkflowTransactionJournal(cwd, selectors.gjcSessionId, existingReceipt.mutation_id as string, {
+						steps: ["approval-state", "approval-index"],
+					}),
+				afterAudit: () =>
+					updateWorkflowTransactionJournal(cwd, selectors.gjcSessionId, existingReceipt.mutation_id as string, {
+						steps: ["approval-state", "approval-index", "approval-audit"],
+					}),
 			});
 			await completeWorkflowTransactionJournal(cwd, selectors.gjcSessionId, existingReceipt.mutation_id as string);
 			await assertDeepInterviewHandoffReady(envelope, {
@@ -3564,6 +3635,51 @@ async function handleApproveExecutionUnlocked(cwd: string, selectors: ResolvedSe
 				statePath,
 				requireExecutionApproval: true,
 			});
+		}
+		if (typeof existingReceipt.mutation_id === "string") {
+			const pendingJournal = await readWorkflowTransactionJournal(
+				cwd,
+				selectors.gjcSessionId,
+				existingReceipt.mutation_id,
+			);
+			if (pendingJournal?.status === "pending") {
+				const persistedReceipt = persistedWorkflowReceipt(envelope.receipt, "deep-interview");
+				const persistedRevision = existingStateRevision(envelope);
+				const expectedJournalPaths = [resolvedStatePath, auditPath(cwd, selectors.gjcSessionId)].map(value =>
+					path.resolve(value),
+				);
+				if (
+					!persistedReceipt ||
+					typeof persistedRevision !== "number" ||
+					persistedRevision !== existingReceipt.state_revision ||
+					persistedReceipt.mutation_id !== existingReceipt.mutation_id ||
+					persistedReceipt.mutated_at !== existingReceipt.approved_at ||
+					pendingJournal.paths.length !== expectedJournalPaths.length ||
+					pendingJournal.paths.some((value, index) => path.resolve(value) !== expectedJournalPaths[index])
+				)
+					throw new StateCommandError(2, "pending execution approval recovery journal identity mismatch");
+				const approvalOptions: ExecutionApprovalAuditOptions = {
+					cwd,
+					sessionId: selectors.gjcSessionId,
+					statePath: resolvedStatePath,
+					approvedAt: existingReceipt.approved_at as string,
+					mutationId: existingReceipt.mutation_id,
+					revision: persistedRevision,
+					receipt: persistedReceipt,
+				};
+				const indexed = await readBoundedIdentityText(
+					path.join(sessionStateDir(cwd, selectors.gjcSessionId), "deep-interview-approval-audit.json"),
+					64 * 1024,
+					"deep-interview execution approval index",
+				);
+				if (!indexed) {
+					await writeExecutionApprovalIndex(approvalOptions, buildExecutionApprovalAuditEntry(approvalOptions));
+				}
+				await updateWorkflowTransactionJournal(cwd, selectors.gjcSessionId, existingReceipt.mutation_id, {
+					steps: [...new Set([...pendingJournal.steps, "approval-index"])],
+				});
+				await completeWorkflowTransactionJournal(cwd, selectors.gjcSessionId, existingReceipt.mutation_id);
+			}
 		}
 		return {
 			status: 0,
@@ -3628,7 +3744,7 @@ async function handleApproveExecutionUnlocked(cwd: string, selectors: ResolvedSe
 	await updateWorkflowTransactionJournal(cwd, selectors.gjcSessionId, mutationId, {
 		steps: ["approval-state"],
 	});
-	await appendExecutionApprovalAudit({
+	const approvalAuditOptions: ExecutionApprovalAuditOptions = {
 		cwd,
 		sessionId: selectors.gjcSessionId,
 		statePath: resolvedStatePath,
@@ -3636,9 +3752,16 @@ async function handleApproveExecutionUnlocked(cwd: string, selectors: ResolvedSe
 		mutationId,
 		revision: writeResult.revision,
 		receipt: persistedWorkflowReceipt(stampedApprovalReceipt, "deep-interview")!,
-	});
-	await updateWorkflowTransactionJournal(cwd, selectors.gjcSessionId, mutationId, {
-		steps: ["approval-state", "approval-audit"],
+	};
+	await appendExecutionApprovalAudit(approvalAuditOptions, {
+		afterIndex: () =>
+			updateWorkflowTransactionJournal(cwd, selectors.gjcSessionId, mutationId, {
+				steps: ["approval-state", "approval-index"],
+			}),
+		afterAudit: () =>
+			updateWorkflowTransactionJournal(cwd, selectors.gjcSessionId, mutationId, {
+				steps: ["approval-state", "approval-index", "approval-audit"],
+			}),
 	});
 	await completeWorkflowTransactionJournal(cwd, selectors.gjcSessionId, mutationId);
 	await syncSkillActiveState({
