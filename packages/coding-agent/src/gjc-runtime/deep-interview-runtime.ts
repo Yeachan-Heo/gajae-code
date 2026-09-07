@@ -1071,6 +1071,17 @@ function parseStoredCrystal(value: unknown): DeepInterviewCrystal {
 		)
 			throw new DeepInterviewCommandError(2, "stored Crystal removal fields are invalid");
 	}
+	if (
+		value.removed_item_anchors !== undefined &&
+		(!Array.isArray(value.removed_item_anchors) ||
+			value.removed_item_anchors.some(
+				anchor =>
+					!isRecord(anchor) ||
+					typeof anchor.item !== "string" ||
+					!/^[A-Za-z0-9][A-Za-z0-9._:-]*$/.test(anchor.item),
+			))
+	)
+		throw new DeepInterviewCommandError(2, "stored Crystal removal anchors are invalid");
 	return value as unknown as DeepInterviewCrystal;
 }
 
