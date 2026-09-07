@@ -1406,6 +1406,14 @@ test("broker directly resumes and forks a canonical cold saved session with scop
 		);
 		expect(resumed).toMatchObject({ ok: true, result: { sessionId: sourceId } });
 		if (!resumed.ok) throw new Error(resumed.error.message);
+		const resumedAuthority = resumed.result as {
+			endpointGeneration?: number;
+			endpointIncarnation?: string;
+			endpointFileId?: string;
+		};
+		expect(typeof resumedAuthority.endpointGeneration).toBe("number");
+		expect(resumedAuthority.endpointIncarnation).toMatch(/^[a-f0-9]{64}$/);
+		expect(typeof resumedAuthority.endpointFileId).toBe("string");
 		const resumedGeneration = broker.index
 			.listSessions()
 			.sessions.find(session => session.sessionId === sourceId)?.endpointGeneration;
@@ -1415,7 +1423,15 @@ test("broker directly resumes and forks a canonical cold saved session with scop
 		expect(resumedSourceCandidate.identity).toMatchObject({ canonicalPath: sourcePath, sessionId: sourceId });
 		expect(resumedSourceCandidate.identity).not.toEqual(sourceCandidate.identity);
 		expect(
-			await broker.handleRequest("session.close", { sessionId: sourceId }, "canonical-cold-resume-close"),
+			await broker.handleRequest(
+				"session.close",
+				{
+					sessionId: sourceId,
+					endpointGeneration: resumedAuthority.endpointGeneration,
+					endpointIncarnation: resumedAuthority.endpointIncarnation,
+				},
+				"canonical-cold-resume-close",
+			),
 		).toMatchObject({
 			ok: true,
 			result: { sessionId: sourceId },
@@ -4072,10 +4088,10 @@ test("reconcile_uncertain retires one dead create identity and refuses live host
 		await broker.start();
 		await fs.mkdir(path.join(stateRoot, "sdk"), { recursive: true });
 		const marker = { pid: child.pid!, effectMarker: "reconcile-effect", incarnation: processIdentity };
-		await fs.writeFile(path.join(stateRoot, "sdk", `${sessionId}.lifecycle.json`), canonicalJson(marker));
-		await fs.writeFile(path.join(stateRoot, "sdk", `${sessionId}.lifecycle.ready.json`), canonicalJson(marker));
+		await Bun.write(path.join(stateRoot, "sdk", `${sessionId}.lifecycle.json`), canonicalJson(marker));
+		await Bun.write(path.join(stateRoot, "sdk", `${sessionId}.lifecycle.ready.json`), canonicalJson(marker));
 		const endpointPath = path.join(stateRoot, "sdk", `${sessionId}.json`);
-		await fs.writeFile(endpointPath, canonicalJson({ sessionId, pid: child.pid! }));
+		await Bun.write(endpointPath, canonicalJson({ sessionId, pid: child.pid! }));
 		const endpointStat = await fs.stat(endpointPath);
 		const endpointFileId = `${endpointStat.dev}:${endpointStat.ino}`;
 		await broker.index.append({

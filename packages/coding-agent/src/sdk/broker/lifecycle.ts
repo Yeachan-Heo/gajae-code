@@ -5554,6 +5554,7 @@ async function executeLifecycleResponse(
 			{
 				endpointGeneration: verified.endpointGeneration,
 				endpointMtimeMs: verified.endpointMtimeMs,
+				...(verified.endpointFileId === undefined ? {} : { endpointFileId: verified.endpointFileId }),
 				pid: spawnedAuthority.pid,
 			},
 			launch.id,
