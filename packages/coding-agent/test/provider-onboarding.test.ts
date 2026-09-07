@@ -221,7 +221,13 @@ describe("provider onboarding setup core", () => {
 
 	it("adds Command Code GOAT with automatic discovery and Claude prefix routing", async () => {
 		const modelsPath = await tempModelsPath();
-		const result = await addApiCompatibleProvider({ preset: "goat", modelsPath });
+		const result = await addApiCompatibleProvider({
+			preset: "goat",
+			modelsPath,
+			probeDiscovery: async () => {
+				throw new Error("preset adds must not probe live endpoints");
+			},
+		});
 		const parsed = YAML.parse(await Bun.file(modelsPath).text()) as {
 			providers?: Record<
 				string,
@@ -559,6 +565,9 @@ describe("provider onboarding setup core", () => {
 			baseUrl: "http://127.0.0.1:4000",
 			apiKeyEnv: "LITELLM_API_KEY",
 			modelsPath,
+			probeDiscovery: async () => {
+				throw new Error("preset adds must not probe live endpoints");
+			},
 		});
 
 		expect(result.providerId).toBe("litellm");
@@ -579,6 +588,9 @@ describe("provider onboarding setup core", () => {
 			baseUrl: "https://gateway.example.com/v1",
 			apiKeyEnv: "GATEWAY_KEY",
 			modelsPath,
+			probeDiscovery: async () => {
+				throw new Error("preset adds must not probe live endpoints");
+			},
 		});
 
 		expect(result.providerId).toBe("openai-compatible-proxy");
@@ -610,6 +622,9 @@ describe("provider onboarding setup core", () => {
 			baseUrl: "http://127.0.0.1:4000",
 			apiKeyEnv: "MY_PROXY_KEY",
 			modelsPath,
+			probeDiscovery: async () => {
+				throw new Error("preset adds must not probe live endpoints");
+			},
 		});
 
 		expect(result.credentialSource).toBe("env");
