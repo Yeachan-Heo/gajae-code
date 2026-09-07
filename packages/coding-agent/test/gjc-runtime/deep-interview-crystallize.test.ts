@@ -866,6 +866,24 @@ describe("deep-interview crystallize contract", () => {
 		expect(() => crystallizeDeepInterview(broad)).toThrow("full deep-interview flow");
 	});
 
+	it("preserves empty canonical messages in a contiguous snapshot", () => {
+		const messages: CrystalSnapshot["messages"] = [
+			{ index: 0, role: "assistant", content: "" },
+			{ index: 1, role: "user", content: "Build a fast report." },
+		];
+		const snapshot: CrystalSnapshot = { revision: 2, start: 0, end: 1, messages, digest: "" };
+		snapshot.digest = crystalSnapshotDigest(snapshot);
+		const value = input({
+			snapshot,
+			current_revision: 2,
+			items: input().items.map(item => ({
+				...item,
+				anchor: { message_index: 1, quote: "Build a fast report." },
+			})),
+		});
+		expect(crystallizeDeepInterview(value).source.messages[0]?.content).toBe("");
+	});
+
 	it("carries omitted prior material forward", () => {
 		const first = crystallizeDeepInterview(input());
 		const second = crystallizeDeepInterview(later(input({ prior: first, items: [first.items[0]!] }), 2));
@@ -1265,6 +1283,11 @@ describe("deep-interview crystallize contract", () => {
 				role: "fileMention",
 				files: [{ path: "requirements.md", content: "Supporting context" }],
 			};
+			const agentAttributedMessage = {
+				role: "user",
+				attribution: "agent",
+				content: "Agent-injected follow-up must not become user evidence.",
+			};
 			const userMessage = { role: "user", content: "Build a fast report." };
 			await fs.writeFile(
 				sessionFile,
@@ -1272,6 +1295,7 @@ describe("deep-interview crystallize contract", () => {
 					{ type: "session", id: sessionId, cwd: root },
 					{ type: "message", message: customMessage },
 					{ type: "message", message: fileMentionMessage },
+					{ type: "message", message: agentAttributedMessage },
 					{ type: "message", message: userMessage },
 				]
 					.map(record => JSON.stringify(record))
@@ -1284,9 +1308,10 @@ describe("deep-interview crystallize contract", () => {
 					role: "tool",
 					content: `[fileMention sha256:${createHash("sha256").update(JSON.stringify(fileMentionMessage)).digest("hex")}]`,
 				},
-				{ index: 2, role: "user", content: userMessage.content },
+				{ index: 2, role: "developer", content: agentAttributedMessage.content },
+				{ index: 3, role: "user", content: userMessage.content },
 			];
-			const snapshot: CrystalSnapshot = { revision: 3, start: 0, end: 2, messages, digest: "" };
+			const snapshot: CrystalSnapshot = { revision: 4, start: 0, end: 3, messages, digest: "" };
 			snapshot.digest = crystalSnapshotDigest(snapshot);
 			process.env.GJC_SESSION_FILE = sessionFile;
 			const result = await runNativeDeepInterviewCommand(
@@ -1296,11 +1321,11 @@ describe("deep-interview crystallize contract", () => {
 					JSON.stringify(
 						input({
 							snapshot,
-							current_revision: 3,
+							current_revision: 4,
 							items: [
 								{
 									...input().items[0]!,
-									anchor: { message_index: 2, quote: userMessage.content },
+									anchor: { message_index: 3, quote: userMessage.content },
 								},
 							],
 						}),
