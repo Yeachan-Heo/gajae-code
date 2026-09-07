@@ -368,6 +368,32 @@ describe("native gjc deep-interview runtime", () => {
 		await expect(fs.access(sessionPlansDir(root, TEST_SESSION_ID))).rejects.toThrow();
 	});
 
+	it("compacts the Crystal index before a direct write crosses its read cap", async () => {
+		const root = await tempDir();
+		const specsDir = sessionSpecsDir(root, TEST_SESSION_ID);
+		await fs.mkdir(specsDir, { recursive: true });
+		const row = `${JSON.stringify({
+			slug: "old",
+			stage: "final",
+			path: path.join(specsDir, "deep-interview-old.md"),
+			created_at: "2026-01-01T00:00:00.000Z",
+			sha256: "a".repeat(64),
+		})}\n`;
+		const targetSize = 1_000_000 - 10;
+		const repeated = row.repeat(Math.floor(targetSize / Buffer.byteLength(row)));
+		const padding = " ".repeat(targetSize - Buffer.byteLength(repeated));
+		const indexPath = path.join(specsDir, "deep-interview-index.jsonl");
+		await fs.writeFile(indexPath, `${repeated}${padding}`);
+
+		const result = await runNativeDeepInterviewCommand(
+			["--write", "--stage", "final", "--slug", "current", "--spec", "# Current", "--json"],
+			root,
+		);
+		expect(result.status, result.stderr).toBe(0);
+		expect((await fs.stat(indexPath)).size).toBeLessThanOrEqual(1_000_000);
+		expect(await fs.readFile(indexPath, "utf8")).toContain('"slug":"current"');
+	});
+
 	it("accepts a long inline --spec that exceeds the OS path-length limit", async () => {
 		const root = await tempDir();
 		// A spec far longer than PATH_MAX so path.resolve(...) + fs.stat throws ENAMETOOLONG
