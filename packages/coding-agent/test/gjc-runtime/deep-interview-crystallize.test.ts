@@ -1115,6 +1115,21 @@ describe("deep-interview crystallize contract", () => {
 			];
 			expect(() => crystallizeDeepInterview(next)).toThrow("fresh statement-bound user removal evidence");
 		}
+		const fullMessage = "Do not remove the fast constraint. Fast performance is no longer needed.";
+		const narrowResolution = "Fast performance is no longer needed.";
+		const narrow = withFreshUserEvidence(
+			input({ prior: first, items: [first.items[0]!], removed_ids: ["constraint:latency"] }),
+			fullMessage,
+		);
+		narrow.removed_item_anchors = [
+			{
+				item: "constraint:latency",
+				message_index: 1,
+				quote: narrowResolution,
+				resolution: narrowResolution,
+			},
+		];
+		expect(() => crystallizeDeepInterview(narrow)).toThrow("fresh statement-bound user removal evidence");
 	});
 
 	it("persists resolved removal tombstones and permanently rejects same-ID resurrection", () => {
