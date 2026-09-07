@@ -639,9 +639,16 @@ describe("deep-interview crystallize contract", () => {
 			["Use NoSQL for storage", "SQL for storage", "Use SQL for storage"],
 			["Use JavaScript", "Java", "Use Java"],
 			["Use Go. Switch to JS.", "Use Go.", "Use Go"],
+			[
+				"Use Go for the backend. Switch to Rust for the backend.",
+				"Use Go for the backend.",
+				"Use Go for the backend",
+			],
+			["Use Go. Switch to C++.", "Use Go.", "Use Go"],
 			["Use Go. Don’t use Go; use JS.", "Use Go.", "Use Go"],
 			["Don’t deploy to production.", "Don’t deploy to production.", "Deploy to production"],
 			["Use اّdatabase for storage", "database for storage", "Use database for storage"],
+			["Use Java‍Script", "Script", "Use Script"],
 		] as const) {
 			const snapshot: CrystalSnapshot = {
 				revision: 1,
