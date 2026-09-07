@@ -104,6 +104,7 @@ export class YieldQueue {
 		}
 		const idleMessages: AgentMessage[] = [];
 		const idleIdentities: unknown[] = [];
+		const preservedIdleMessages: AgentMessage[] = [];
 		for (const [kind, dispatcher] of this.#dispatchers) {
 			const drained = this.#drain(kind);
 			const admitted = drained.filter(entry => {
@@ -123,8 +124,11 @@ export class YieldQueue {
 						logger.warn("Yield queue streaming dispatch failed", { kind, error: formatError(error) });
 					}
 				} else {
-					idleMessages.push(message);
-					idleIdentities.push(dispatcher.preserveAcrossIdentity ? undefined : admitted[0]?.identity);
+					if (dispatcher.preserveAcrossIdentity) preservedIdleMessages.push(message);
+					else {
+						idleMessages.push(message);
+						idleIdentities.push(admitted[0]?.identity);
+					}
 				}
 			}
 		}
@@ -137,6 +141,13 @@ export class YieldQueue {
 				);
 			} catch (error) {
 				logger.warn("Yield queue idle dispatch failed", { error: formatError(error) });
+			}
+		}
+		if (mode === "idle" && preservedIdleMessages.length > 0) {
+			try {
+				await this.#options.injectIdle(preservedIdleMessages, signal ?? this.#options.getIdleFlushSignal?.());
+			} catch (error) {
+				logger.warn("Yield queue preserved idle dispatch failed", { error: formatError(error) });
 			}
 		}
 	}

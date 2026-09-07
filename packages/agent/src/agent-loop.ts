@@ -5437,7 +5437,7 @@ async function executeToolCalls(
 				isError = true;
 			}
 
-			if (afterToolCall && record.started) {
+			if (afterToolCall && record.started && !signal?.aborted && !toolSignal.aborted) {
 				try {
 					const after = await afterToolCall(
 						{
