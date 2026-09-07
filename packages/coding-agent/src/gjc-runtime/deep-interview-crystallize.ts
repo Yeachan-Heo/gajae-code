@@ -410,6 +410,7 @@ function hasLaterSupersedingCorrection(content: string, quote: string, statement
 	const statementHasShortTechnical = (statement.match(/[A-Za-z0-9][A-Za-z0-9+#.-]*/g) ?? []).some(
 		isShortTechnicalIdentifier,
 	);
+	const statementUseTarget = /\buse\s+([A-Za-z0-9][A-Za-z0-9+#.-]*)/i.exec(statement)?.[1];
 	const genericCorrection = followingClauses.some(clause => {
 		const marker =
 			/\b(?:actually|instead|rather|correction|on\s+second\s+thought|make\s+that)\b/i.test(clause) ||
@@ -420,7 +421,14 @@ function hasLaterSupersedingCorrection(content: string, quote: string, statement
 			[...topicTerms(statement, false)].some(term => clauseTerms.has(term)) ||
 			(statementHasShortTechnical &&
 				(clause.match(/[A-Za-z0-9][A-Za-z0-9+#.-]*/g) ?? []).some(isShortTechnicalIdentifier)) ||
-			(/\buse\s+[A-Za-z0-9][A-Za-z0-9+#.-]*/i.test(statement) && /\buse\s+[A-Za-z0-9][A-Za-z0-9+#.-]*/i.test(clause))
+			Boolean(
+				statementUseTarget &&
+					(isShortTechnicalIdentifier(statementUseTarget) || /^[A-Z]/.test(statementUseTarget)) &&
+					(() => {
+						const target = /\buse\s+([A-Za-z0-9][A-Za-z0-9+#.-]*)/i.exec(clause)?.[1];
+						return Boolean(target && (isShortTechnicalIdentifier(target) || /^[A-Z]/.test(target)));
+					})(),
+			)
 		);
 	});
 	return (
@@ -1298,12 +1306,17 @@ export function crystallizeDeepInterview(value: unknown): DeepInterviewCrystal {
 			.digest("hex")
 			.slice(0, 16)}`;
 		const answerSemantics = semanticProfile(anchor.resolution);
-		const represented = mergedItems.some(
-			item =>
+		const answerQuantitative = quantitativeEvidenceTerms(anchor.resolution);
+		const represented = mergedItems.some(item => {
+			const itemQuantitative = quantitativeEvidenceTerms(item.statement);
+			return (
 				item.classification === "confirmed" &&
 				[...answerTerms].every(term => evidenceTerms(item.statement).has(term)) &&
-				sameSemanticIntent(answerSemantics, semanticProfile(item.statement)),
-		);
+				sameSemanticIntent(answerSemantics, semanticProfile(item.statement)) &&
+				answerQuantitative.size === itemQuantitative.size &&
+				[...answerQuantitative].every(term => itemQuantitative.has(term))
+			);
+		});
 		if (!represented)
 			if (mergedItems.some(item => item.id === resolutionId))
 				throw new Error(`promoted resolution item ID collides with submitted item: ${resolutionId}`);

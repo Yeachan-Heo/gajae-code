@@ -529,7 +529,7 @@ describe("deep-interview crystallize contract", () => {
 					index: 0,
 					role: "user",
 					content:
-						"Use PostgreSQL for storage. Switch to dark mode; I actually prefer dark mode. PostgreSQL supports backups.",
+						"Use PostgreSQL for storage. Switch to dark mode; Actually, use a code formatter. PostgreSQL supports backups.",
 				},
 			],
 			digest: "",
