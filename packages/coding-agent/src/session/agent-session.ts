@@ -20750,7 +20750,7 @@ export class AgentSession {
 				hookCompaction,
 				compactionStateSnapshot,
 			);
-			if (autoCompactionSignal.aborted) return await emitAborted();
+			if (autoCompactionSignal.aborted || !compactionIdentityIsCurrent()) return await emitAborted();
 
 			let summary: string;
 			let shortSummary: string | undefined;
@@ -20798,12 +20798,13 @@ export class AgentSession {
 
 				for (const candidate of candidates) {
 					const apiKey = await this.#modelRegistry.getApiKey(candidate, this.credentialSessionId);
+					if (!compactionIdentityIsCurrent()) return await emitAborted();
 					if (!apiKey) continue;
 
 					let attempt = 0;
 					while (true) {
 						try {
-							if (autoCompactionSignal.aborted) return await emitAborted();
+							if (autoCompactionSignal.aborted || !compactionIdentityIsCurrent()) return await emitAborted();
 
 							compactResult = await compact(preparation, candidate, apiKey, undefined, autoCompactionSignal, {
 								...this.#maintenanceProviderTransport(),
