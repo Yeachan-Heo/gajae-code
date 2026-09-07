@@ -18042,14 +18042,23 @@ export class AgentSession {
 			throw new Error("Unable to persist reasoning settings.");
 		}
 
-		const postCommitIdentity = this.#captureSessionSelectionIdentity();
-		if (postCommitIdentity.sessionId !== expectedSessionId) return;
-		await this.#withSelectionAdmission(postCommitIdentity, async () => {
+		if (
+			!this.#isSessionSelectionIdentityCurrent(identity) ||
+			this.#reasoningControlContextGeneration !== expectedContextGeneration
+		)
+			return;
+		await this.#withSelectionAdmission(identity, async () => {
+			if (
+				!this.#isSessionSelectionIdentityCurrent(identity) ||
+				this.#reasoningControlContextGeneration !== expectedContextGeneration ||
+				this.model !== expectedModel
+			)
+				return;
 			if (
 				mutationRevision === this.#thinkingLevelMutationRevision &&
 				this.#thinkingLevelLiveMutationRevision === expectedLiveMutationRevision
 			) {
-				this.#assertSelectionMutationReady(postCommitIdentity);
+				this.#assertSelectionMutationReady(identity);
 				this.setThinkingLevel(level === ThinkingLevel.Inherit ? this.#getInheritedThinkingLevel() : level);
 				this.sessionManager.appendThinkingLevelChange(ThinkingLevel.Inherit);
 				return;
@@ -18084,7 +18093,7 @@ export class AgentSession {
 						failure.model === expectedModel &&
 						failure.contextGeneration === expectedContextGeneration
 					) {
-						this.#assertSelectionMutationReady(postCommitIdentity);
+						this.#assertSelectionMutationReady(identity);
 						this.#pendingThinkingLevelControlFailure = undefined;
 						this.setThinkingLevel(
 							level === ThinkingLevel.Inherit ? this.#getInheritedThinkingLevel() : effectiveLevel,
@@ -18094,7 +18103,7 @@ export class AgentSession {
 				}
 				return;
 			}
-			this.#assertSelectionMutationReady(postCommitIdentity);
+			this.#assertSelectionMutationReady(identity);
 			this.setThinkingLevel(level === ThinkingLevel.Inherit ? this.#getInheritedThinkingLevel() : effectiveLevel);
 			this.sessionManager.appendThinkingLevelChange(ThinkingLevel.Inherit);
 		});
@@ -18185,14 +18194,23 @@ export class AgentSession {
 			}
 			throw new Error("Unable to persist reasoning settings.");
 		}
-		const postCommitIdentity = this.#captureSessionSelectionIdentity();
-		if (postCommitIdentity.sessionId !== expectedSessionId) return;
-		await this.#withSelectionAdmission(postCommitIdentity, async () => {
+		if (
+			!this.#isSessionSelectionIdentityCurrent(identity) ||
+			this.#reasoningControlContextGeneration !== expectedContextGeneration
+		)
+			return;
+		await this.#withSelectionAdmission(identity, async () => {
+			if (
+				!this.#isSessionSelectionIdentityCurrent(identity) ||
+				this.#reasoningControlContextGeneration !== expectedContextGeneration ||
+				this.model !== expectedModel
+			)
+				return;
 			if (
 				mutationRevision === this.#thinkingVisibilityMutationRevision &&
 				this.#thinkingVisibilityLiveMutationRevision === expectedLiveMutationRevision
 			) {
-				this.#assertSelectionMutationReady(postCommitIdentity);
+				this.#assertSelectionMutationReady(identity);
 				this.setThinkingVisibility(visibility);
 				return;
 			}
@@ -18227,14 +18245,14 @@ export class AgentSession {
 						failure.model === expectedModel &&
 						failure.contextGeneration === expectedContextGeneration
 					) {
-						this.#assertSelectionMutationReady(postCommitIdentity);
+						this.#assertSelectionMutationReady(identity);
 						this.#pendingThinkingVisibilityControlFailure = undefined;
 						this.setThinkingVisibility(visibility);
 					}
 				}
 				return;
 			}
-			this.#assertSelectionMutationReady(postCommitIdentity);
+			this.#assertSelectionMutationReady(identity);
 			this.setThinkingVisibility(visibility);
 		});
 		});
