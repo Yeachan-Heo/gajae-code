@@ -1649,7 +1649,7 @@ describe("gjc state handoff", () => {
 				cwd,
 			);
 			expect(result.status).toBe(2);
-			expect(result.stderr).toContain("failed to read execution approval index");
+			expect(result.stderr).toContain("execution approval index is invalid");
 		});
 	});
 
