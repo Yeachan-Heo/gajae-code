@@ -1205,6 +1205,49 @@ describe("deep-interview crystallize contract", () => {
 		}
 	});
 
+	it("honors an explicit managed transcript beyond the discovery candidate cap", async () => {
+		const root = await fs.mkdtemp(path.join(process.cwd(), ".tmp-crystallize-explicit-cap-"));
+		const sessionId = "crystallize-explicit-cap";
+		const sessionDir = path.join(root, ".gjc", "sessions");
+		const sessionFile = path.join(sessionDir, "selected.jsonl");
+		const previousSessionFile = process.env.GJC_SESSION_FILE;
+		try {
+			await fs.mkdir(sessionDir, { recursive: true });
+			await Promise.all(
+				Array.from({ length: 1001 }, (_, index) =>
+					fs.writeFile(path.join(sessionDir, `unrelated-${index}.jsonl`), "{}\n"),
+				),
+			);
+			const value = input();
+			await fs.writeFile(
+				sessionFile,
+				`${JSON.stringify({ type: "session", id: sessionId, cwd: root })}\n${JSON.stringify({
+					type: "message",
+					message: value.snapshot.messages[0],
+				})}\n`,
+			);
+			process.env.GJC_SESSION_FILE = sessionFile;
+			const result = await runNativeDeepInterviewCommand(
+				[
+					"--crystallize",
+					"--input",
+					JSON.stringify(value),
+					"--session-id",
+					sessionId,
+					"--slug",
+					"explicit-cap",
+					"--json",
+				],
+				root,
+			);
+			expect(result.status, result.stderr).toBe(0);
+		} finally {
+			if (previousSessionFile === undefined) delete process.env.GJC_SESSION_FILE;
+			else process.env.GJC_SESSION_FILE = previousSessionFile;
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
 	it("rejects caller-supplied prior material when no canonical Crystal exists", async () => {
 		const root = await fs.mkdtemp(path.join(process.cwd(), ".tmp-crystallize-fresh-prior-"));
 		const sessionId = "crystallize-fresh-prior";
