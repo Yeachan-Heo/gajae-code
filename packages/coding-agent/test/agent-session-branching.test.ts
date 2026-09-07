@@ -303,6 +303,19 @@ describe("AgentSession tree navigation local identity", () => {
 				timestamp: Date.now() - 1,
 			});
 			created.sessionManager.appendMessage({ role: "user", content: "tree leaf", timestamp: Date.now() });
+			session.queueDeferredMessageForTests(
+				{
+					role: "custom",
+					customType: "test-hidden-next-turn",
+					content: "stale predecessor context",
+					display: false,
+					details: {},
+					attribution: "agent",
+					timestamp: Date.now(),
+				},
+				false,
+			);
+			expect(session.queuedMessageCount).toBe(1);
 			const localOptions = {
 				getArtifactsDir: () => created.sessionManager.getArtifactsDir(),
 				getSessionId: () => created.sessionManager.getSessionId(),
@@ -327,6 +340,12 @@ describe("AgentSession tree navigation local identity", () => {
 			expect(path.dirname(markerPath)).toBe(before.root);
 			expect(fs.readFileSync(markerPath, "utf8")).toBe(before.marker);
 			expect(fs.existsSync(before.root)).toBe(true);
+			expect(session.queuedMessageCount).toBe(0);
+			expect(
+				session.messages.some(
+					message => message.role === "custom" && message.content === "stale predecessor context",
+				),
+			).toBe(false);
 		} finally {
 			await session?.dispose();
 			authStorage?.close();
