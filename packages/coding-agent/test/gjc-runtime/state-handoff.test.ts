@@ -1937,6 +1937,48 @@ describe("gjc state handoff", () => {
 		});
 	});
 
+	it("does not duplicate an aged approval audit after a post-append crash", async () => {
+		await withTempCwd(async cwd => {
+			const { callerPath } = await writePublishedReadyCrystal(cwd);
+			expect((await runNativeDeepInterviewCommand(["approve-execution", "--json"], cwd)).status).toBe(0);
+			const approved = (await readJson(callerPath)) as Record<string, unknown>;
+			const approval = (approved.state as Record<string, unknown>).execution_approval_receipt as Record<
+				string,
+				unknown
+			>;
+			const mutationId = approval.mutation_id as string;
+			const approvalAuditPath = auditPath(cwd, TEST_SESSION_ID);
+			const auditText = await fs.readFile(approvalAuditPath, "utf8");
+			let approvalOffset = 0;
+			for (const line of auditText.split(/(?<=\n)/)) {
+				const parsed = JSON.parse(line.trim()) as Record<string, unknown>;
+				if (parsed.mutation_id === mutationId && parsed.approved_at !== undefined) break;
+				approvalOffset += Buffer.byteLength(line);
+			}
+			await beginWorkflowTransactionJournal({
+				cwd,
+				sessionId: TEST_SESSION_ID,
+				mutationId,
+				caller: "deep-interview",
+				paths: [callerPath, approvalAuditPath],
+			});
+			await updateWorkflowTransactionJournal(cwd, TEST_SESSION_ID, mutationId, {
+				steps: ["approval-state", "approval-index"],
+				approval_audit_offset: approvalOffset,
+			});
+			const filler = `${JSON.stringify({ event: "filler", payload: "x".repeat(1024) })}\n`.repeat(9_000);
+			await fs.appendFile(approvalAuditPath, filler);
+			const retried = await runNativeDeepInterviewCommand(["approve-execution", "--json"], cwd);
+			expect(retried.status, retried.stderr).toBe(0);
+			const specialized = (await fs.readFile(approvalAuditPath, "utf8"))
+				.split(/\r?\n/)
+				.filter(Boolean)
+				.map(line => JSON.parse(line) as Record<string, unknown>)
+				.filter(entry => entry.mutation_id === mutationId && entry.approved_at !== undefined);
+			expect(specialized).toHaveLength(1);
+		});
+	});
+
 	it("does not mint approval audit provenance without a pending approval journal", async () => {
 		await withTempCwd(async cwd => {
 			await writePublishedReadyCrystal(cwd);
