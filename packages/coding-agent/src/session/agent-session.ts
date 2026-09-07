@@ -21259,6 +21259,7 @@ export class AgentSession {
 		preparation: CompactionPreparation,
 		hookCompaction: CompactionResult | undefined,
 		stateSnapshot: CompactionStateSnapshot,
+		identityIsCurrent?: () => boolean,
 	): Promise<
 		| {
 				kind: "fromHook";
@@ -21279,6 +21280,13 @@ export class AgentSession {
 		let hookContext: string[] | undefined;
 		let hookPrompt: string | undefined;
 		let preserveData: Record<string, unknown> | undefined;
+		const assertCurrent = (): void => {
+			if (identityIsCurrent?.() !== false) return;
+			throw Object.assign(new Error("Compaction session identity changed."), {
+				code: "compaction_identity_changed",
+			});
+		};
+		assertCurrent();
 
 		if (!hookCompaction && this.#extensionRunner?.hasHandlers("session.compacting")) {
 			const compactMessages = preparation.messagesToSummarize.concat(preparation.turnPrefixMessages);
@@ -21287,6 +21295,7 @@ export class AgentSession {
 				sessionId: this.sessionId,
 				messages: compactMessages,
 			})) as { context?: string[]; prompt?: string; preserveData?: Record<string, unknown> } | undefined;
+			assertCurrent();
 
 			hookContext = result?.context;
 			hookPrompt = result?.prompt;
@@ -21294,6 +21303,7 @@ export class AgentSession {
 		}
 
 		const memoryBackendContext = await this.#collectMemoryBackendContext(preparation);
+		assertCurrent();
 		if (memoryBackendContext) {
 			hookContext = hookContext ? [...hookContext, memoryBackendContext] : [memoryBackendContext];
 		}
@@ -21647,7 +21657,7 @@ export class AgentSession {
 					customInstructions: undefined,
 					signal: autoCompactionSignal,
 				})) as SessionBeforeCompactResult | undefined;
-				if (autoCompactionSignal.aborted) return await emitAborted();
+				if (autoCompactionSignal.aborted || !compactionIdentityIsCurrent()) return await emitAborted();
 
 				if (hookResult?.cancel) {
 					await this.#emitSessionEvent({
@@ -21670,6 +21680,7 @@ export class AgentSession {
 				preparation,
 				hookCompaction,
 				compactionStateSnapshot,
+				compactionIdentityIsCurrent,
 			);
 			if (autoCompactionSignal.aborted || !compactionIdentityIsCurrent()) return await emitAborted();
 
@@ -21870,7 +21881,7 @@ export class AgentSession {
 			);
 			this.#recordAdaptiveCompactionReset(tokensBefore);
 			await this.#applyCompactionPostAppend(compactionEntryId, firstKeptEntryId, fromExtension);
-			if (autoCompactionSignal.aborted) return await emitAborted();
+			if (autoCompactionSignal.aborted || !compactionIdentityIsCurrent()) return await emitAborted();
 
 			const result: CompactionResult = {
 				summary,
@@ -21937,7 +21948,11 @@ export class AgentSession {
 			}
 			return { kind: "compacted" };
 		} catch (error) {
-			if (autoCompactionSignal.aborted) {
+			if (
+				autoCompactionSignal.aborted ||
+				!compactionIdentityIsCurrent() ||
+				(error instanceof Error && (error as Error & { code?: string }).code === "compaction_identity_changed")
+			) {
 				await this.#emitSessionEvent({
 					type: "auto_compaction_end",
 					action,
