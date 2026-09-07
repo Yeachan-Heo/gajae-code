@@ -407,12 +407,23 @@ function hasLaterSupersedingCorrection(content: string, quote: string, statement
 		/^\s*[.!?。！？]*\s*(?:only\s+)?(?:if|unless|until|when|assuming|in\s+case|contingent|provided(?:\s+that)?|depending\s+on)\b[^,;.!?。！？]*[.!?。！？]?\s*$/i.test(
 			later,
 		);
+	const statementHasTechnical = (statement.match(/[A-Za-z0-9][A-Za-z0-9+#.-]*/g) ?? []).some(
+		isShortTechnicalIdentifier,
+	);
+	const genericCorrection = followingClauses.some(clause => {
+		const marker =
+			/\b(?:actually|instead|rather|correction|on\s+second\s+thought|make\s+that)\b/i.test(clause) ||
+			/(?:사실|대신|정정|다시\s+생각|実際|代わり|訂正|やはり|实际上|實際上|改为|改為|更正)/u.test(clause);
+		if (!marker) return false;
+		const clauseTerms = evidenceTerms(clause);
+		return (
+			[...topicTerms(statement, false)].some(term => clauseTerms.has(term)) ||
+			(statementHasTechnical &&
+				(clause.match(/[A-Za-z0-9][A-Za-z0-9+#.-]*/g) ?? []).some(isShortTechnicalIdentifier))
+		);
+	});
 	return (
-		/\b(?:actually|instead|rather|correction|on\s+second\s+thought|make\s+that)\b/i.test(later) ||
-		standaloneConditionalQualifier ||
-		explicitNegativeReplacement ||
-		directPositiveReplacement ||
-		/(?:사실|대신|정정|다시\s+생각|実際|代わり|訂正|やはり|实际上|實際上|改为|改為|更正)/u.test(later)
+		genericCorrection || standaloneConditionalQualifier || explicitNegativeReplacement || directPositiveReplacement
 	);
 }
 
@@ -595,6 +606,7 @@ function validateItems(value: unknown, snapshot?: CrystalSnapshot): CrystalItem[
 	return value.map((entry, index) => {
 		if (!isRecord(entry)) throw new Error(`crystallize item ${index} is invalid`);
 		const id = text(entry.id, `items[${index}].id`, 128);
+		if (!/^[A-Za-z0-9][A-Za-z0-9._:-]*$/.test(id)) throw new Error(`items[${index}].id is invalid`);
 		if (ids.has(id)) throw new Error(`duplicate crystallize item: ${id}`);
 		ids.add(id);
 		if (!ITEM_KINDS.includes(entry.kind as CrystalItemKind)) throw new Error(`items[${index}].kind is invalid`);
@@ -622,6 +634,7 @@ function validateItems(value: unknown, snapshot?: CrystalSnapshot): CrystalItem[
 				const quoteTerms = evidenceTerms(item.anchor.quote);
 				const statementQuantitative = quantitativeEvidenceTerms(item.statement);
 				const quoteQuantitative = quantitativeEvidenceTerms(item.anchor.quote);
+				const conjunctiveQuote = /\b(?:and|plus|as\s+well\s+as)\b/i.test(item.anchor.quote);
 				const statementSemantics = semanticProfile(item.statement);
 				const quoteSemantics = semanticProfile(anchoredClause(anchorMessage.content, item.anchor.quote));
 				if (
@@ -634,6 +647,7 @@ function validateItems(value: unknown, snapshot?: CrystalSnapshot): CrystalItem[
 					quoteTerms.size === 0 ||
 					statementTerms.size === 0 ||
 					[...statementTerms].some(term => !quoteTerms.has(term)) ||
+					(conjunctiveQuote && [...quoteTerms].some(term => !statementTerms.has(term))) ||
 					statementQuantitative.size !== quoteQuantitative.size ||
 					[...statementQuantitative].some(term => !quoteQuantitative.has(term)) ||
 					!preservesEvidenceOrder(item.statement, item.anchor.quote) ||
@@ -778,6 +792,7 @@ function quantitativeEvidenceTerms(value: string): Set<string> {
 	const canonical = value.normalize("NFC");
 	const terms = new Set<string>();
 	for (const match of canonical.matchAll(/\p{Sc}|%|>=|<=|>|</gu)) terms.add(match[0]);
+	if (/\d:\d/u.test(canonical)) terms.add(":");
 	for (const match of canonical.matchAll(/\b(\d+(?:\.\d+)?)\s*([A-Za-z]+)?\b/g)) {
 		terms.add(match[1]!);
 		if (match[2]) terms.add(match[2].length <= 3 && /[A-Z]/.test(match[2]) ? match[2] : match[2].toLowerCase());
@@ -905,11 +920,12 @@ function validateResolutionAnchors(
 	snapshot: CrystalSnapshot,
 	field: string,
 	afterIndex: number,
-): void {
-	if (resolutions.length === 0 && value === undefined) return;
+): CrystalResolutionAnchor[] {
+	if (resolutions.length === 0 && value === undefined) return [];
 	if (!Array.isArray(value) || value.length !== resolutions.length)
 		throw new Error(`${field} must contain one anchor per resolution`);
 	const seen = new Set<string>();
+	const anchors: CrystalResolutionAnchor[] = [];
 	for (const [index, raw] of value.entries()) {
 		if (!isRecord(raw)) throw new Error(`${field}[${index}] must be an object`);
 		const item = text(raw.item, `${field}[${index}].item`, 500);
@@ -950,7 +966,9 @@ function validateResolutionAnchors(
 		if (!addressesItem) throw new Error(`${field}[${index}] has no relevant verbatim user anchor`);
 		if (!concreteAnswer) throw new Error(`${field}[${index}] has no fresh verbatim user anchor`);
 		seen.add(item);
+		anchors.push({ item, message_index: messageIndex, quote, resolution });
 	}
+	return anchors;
 }
 
 function isExplicitlyUnresolved(value: string): boolean {
@@ -1179,14 +1197,14 @@ export function crystallizeDeepInterview(value: unknown): DeepInterviewCrystal {
 		throw new Error("open_gaps and resolved_open_gaps must be disjoint");
 	if (conflicts.some(conflict => resolvedConflicts.includes(conflict)))
 		throw new Error("conflicts and resolved_conflicts must be disjoint");
-	validateResolutionAnchors(
+	const resolvedGapAnchors = validateResolutionAnchors(
 		resolvedGaps,
 		value.resolved_open_gap_anchors,
 		snapshot,
 		"resolved_open_gap_anchors",
 		priorEnd,
 	);
-	validateResolutionAnchors(
+	const resolvedConflictAnchors = validateResolutionAnchors(
 		resolvedConflicts,
 		value.resolved_conflict_anchors,
 		snapshot,
@@ -1269,6 +1287,23 @@ export function crystallizeDeepInterview(value: unknown): DeepInterviewCrystal {
 	for (const item of canonicalPriorItems)
 		if (!allRemovedIds.includes(item.id) && !mergedItems.some(candidate => candidate.id === item.id))
 			mergedItems.push(item);
+	for (const anchor of [...resolvedGapAnchors, ...resolvedConflictAnchors]) {
+		const answerTerms = evidenceTerms(anchor.resolution);
+		if (
+			!mergedItems.some(
+				item =>
+					item.classification === "confirmed" &&
+					[...answerTerms].every(term => evidenceTerms(item.statement).has(term)),
+			)
+		)
+			mergedItems.push({
+				id: `resolution:${createHash("sha256").update(anchor.item).digest("hex").slice(0, 16)}`,
+				kind: "constraint",
+				classification: "confirmed",
+				statement: anchor.resolution,
+				anchor: { message_index: anchor.message_index, quote: anchor.resolution },
+			});
+	}
 	const currentItems = mergedItems;
 	if (currentItems.length > MAX_ITEMS) throw new Error("merged crystallize items exceed the bounded limit");
 	if (currentItems.length === 0) throw new Error("crystallize requires material conversation evidence");
