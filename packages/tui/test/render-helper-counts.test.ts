@@ -157,6 +157,52 @@ describe("TUI render helper counters", () => {
 		}
 	});
 
+	it.each(["process terminal", "tmux"])("preserves wrapped CJK viewport and settled scrollback on %s", async host => {
+		if (host === "tmux") Bun.env.TMUX = "/tmp/gjc-render-helper-tmux";
+		const term = new VirtualTerminal(100, 12, { isProcessTerminal: host === "process terminal" });
+		const tui = new TUI(term, false, { widthSettleMs: 100 });
+		const prefixes = Array.from({ length: 24 }, (_, i) => `M${String(i).padStart(2, "0")}:`);
+		for (const prefix of prefixes) tui.addChild(new Text(`\x1b[36m${prefix}${"漢".repeat(30)}\x1b[0m`, 0, 0));
+		const wrapped = prefixes.flatMap(prefix => [prefix + "漢".repeat(18), "漢".repeat(12)]);
+		try {
+			tui.start();
+			await committedFrame(tui, term, "setup");
+			expect(
+				term
+					.getScrollBuffer()
+					.map(line => line.trimEnd())
+					.filter(Boolean),
+			).toEqual(prefixes.map(prefix => prefix + "漢".repeat(30)));
+			TUI.resetRenderCountersForTest();
+			term.clearWriteLog();
+			term.resize(40, 12);
+			const generation = await committedFrame(tui, term, "resize");
+			expect(TUI.getRenderCountersForTest().widthReflowVisibleWidthCalls).toBe(0);
+			expect(TUI.getRenderCountersForTest().widthReflowScanRows).toBe(0);
+			expect(visible(term).filter(Boolean)).toEqual(wrapped.slice(-12));
+			expect(term.getViewportAnsi()).toContain("\x1b[36m");
+			// Immediate viewport repaint retains durable history. The scheduled
+			// repair must still replay every newly wrapped row once the width settles.
+			const redraws = tui.fullRedraws;
+			expect(await tui.waitForRenderCommit(generation + 1, 1_000)).toBe(true);
+			await term.flush();
+			expect(tui.fullRedraws).toBe(redraws + 1);
+			expect(
+				term
+					.getScrollBuffer()
+					.map(line => line.trimEnd())
+					.filter(Boolean),
+			).toEqual(wrapped);
+			expect(visible(term).filter(Boolean)).toEqual(wrapped.slice(-12));
+			expect(term.getViewportAnsi()).toContain("\x1b[36m");
+			for (const line of term.getScrollBuffer()) expect(visibleWidth(line)).toBeLessThanOrEqual(40);
+		} finally {
+			tui.stop();
+			tui.dispose();
+			term.reset();
+		}
+	});
+
 	it("skips width-scan row visits on established non-forced live frames", async () => {
 		const term = new VirtualTerminal(40, 8);
 		const lines = Array.from({ length: 40 }, (_value, index) => `row-${index}`);
@@ -267,12 +313,15 @@ describe("TUI render helper counters", () => {
 					}
 					for (const resizeFirst of [true, false]) {
 						const marker = resizeFirst ? "once-resize-first" : "once-mutation-first";
+						TUI.resetRenderCountersForTest();
 						if (resizeFirst) term.resize(30, 10);
 						lines.push(marker);
 						component.setLines(lines);
 						tui.requestRender(false, "mutation");
 						if (!resizeFirst) term.resize(40, 10);
 						await capture(marker);
+						expect(TUI.getRenderCountersForTest().widthReflowVisibleWidthCalls).toBe(0);
+						expect(TUI.getRenderCountersForTest().widthReflowScanRows).toBe(0);
 						expect(term.getScrollBuffer().filter(line => line.trimEnd() === marker)).toHaveLength(1);
 					}
 					lines[0] = "界".repeat(30);
@@ -420,7 +469,7 @@ describe("TUI render helper counters", () => {
 			// Viewport repaints skip the decision; plain hosts still consume the
 			// scan, including the overwide CJK fixture at 12 columns.
 			if (repaint === "viewport") expect(measurements).toBe(0);
-			else expect(measurements).toBeGreaterThan(0);
+			else expect(measurements).toBe(columns === 44 ? 80 : 1);
 			expect(visible(term).filter(Boolean)).toContain(visibleText);
 			expect(term.getViewportAnsi()).toContain("\x1b[36m");
 			for (const line of visible(term)) expect(visibleWidth(line)).toBeLessThanOrEqual(columns);
@@ -432,10 +481,11 @@ describe("TUI render helper counters", () => {
 	});
 });
 
-async function committedFrame(tui: TUI, term: VirtualTerminal, source: string, force = false): Promise<void> {
+async function committedFrame(tui: TUI, term: VirtualTerminal, source: string, force = false): Promise<number> {
 	const generation = tui.requestRenderWithGeneration(force, source);
 	expect(await tui.waitForRenderCommit(generation, 1_000)).toBe(true);
 	await term.flush();
+	return generation;
 }
 
 function frameObservation(label: string, tui: TUI, term: VirtualTerminal) {

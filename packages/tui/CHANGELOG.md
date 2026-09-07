@@ -2,9 +2,9 @@
 
 ## [Unreleased]
 
-### Fixed
+### Performance
 
-- Loader and other same-width frames, viewport-only resize repaints, and coalesced resize appends skip unused transcript-wide reflow measurements, reducing repeated text-width work in long sessions while preserving rendering.
+- Skip full-transcript resize-width scans on unchanged-width render frames, viewport-only resize repaints, and coalesced resize appends by measuring only where the reflow decision is consumed, while preserving rendering and settled scrollback repair.
 
 ## [0.16.6] - 2026-09-07
 
