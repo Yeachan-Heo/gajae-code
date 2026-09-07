@@ -178,6 +178,14 @@ The CLI connects to the broker as needed; broker bootstrap is not an embedder
 API. See the [external controller integration guide](./bot-integration.md#integration-surfaces)
 for the supported controller surfaces and lifecycle constraints.
 
+For an in-process application queue, treat `session.prompt()` as a bounded full
+turn and keep request identity and transport completion in the application.
+Use `steer`/`followUp` for live conversational controls, not as a durable queue
+receipt: admission can complete before a message is consumed, a follow-up can
+share the current run, and `waitForIdle()` does not by itself promise that every
+input queue is empty. See [Queued input lifecycle](./sdk-embedding.md#queued-input-lifecycle)
+for the admission, consumption, promotion, and terminal boundaries.
+
 
 ## Application recipes
 

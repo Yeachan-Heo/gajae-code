@@ -13088,7 +13088,7 @@ export class AgentSession {
 					if (this.#abortUnwind && !options?.forceOneAtATime) this.#abortUnwindSteerFallbacks.push(message);
 				},
 			});
-			this.#scheduleNonAdmittedSteerContinuation();
+			this.#scheduleNonAdmittedQueuedContinuation();
 			return;
 		}
 		if (options?.forceOneAtATime) this.#sequentialSteerMessages.add(message);
@@ -13106,15 +13106,14 @@ export class AgentSession {
 	}
 
 	/**
-	 * A steer that was not admitted into a live run was requeued as a follow-up.
+	 * A queued message that was not admitted to the live loop needs a wakeup when
+	 * the loop has already ended but the session is still unwinding its prompt.
 	 * `#queueFollowUp` already schedules delivery when the session is idle; this
-	 * covers the unwind window where the session still reports busy only because
-	 * a finished prompt is unwinding (deferred agent_end / post-prompt work), so
-	 * the follow-up gate refuses while no loop actually owns the queue. A live
-	 * loop, a prompt still in preflight, or a drained queue makes the scheduled
-	 * continue a no-op.
+	 * covers the unwind window where the public session still reports busy even
+	 * though no Agent loop owns the queue. A live loop, a prompt still in
+	 * preflight, or a drained queue makes the scheduled continue a no-op.
 	 */
-	#scheduleNonAdmittedSteerContinuation(): void {
+	#scheduleNonAdmittedQueuedContinuation(): void {
 		// `#queueFollowUp` already schedules delivery when the session is idle; this
 		// only covers the window where that gate refuses (a finished prompt is
 		// unwinding) while no loop owns the queue. The resumable-tail requirement
@@ -13184,10 +13183,12 @@ export class AgentSession {
 		// without waiting for the next user turn. A later accepted follow-up must
 		// not start unrelated queued work ahead of it, because that work has a
 		// different cancellation and terminal owner.
-		if (queueWasEmpty)
+		if (queueWasEmpty) {
 			this.#scheduleQueuedFollowUpContinuation(() =>
 				this.agent.snapshotFollowUp().some(candidate => candidate === message),
 			);
+			this.#scheduleNonAdmittedQueuedContinuation();
+		}
 		return {
 			cancel: () => {
 				const deferredIndex = this.#deferredSdkFollowUps.indexOf(message);

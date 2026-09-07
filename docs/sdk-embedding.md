@@ -232,6 +232,40 @@ Behavior:
    - appends user message
    - starts agent turn
 
+### Queued input lifecycle
+
+Keep admission, consumption, and completion separate when embedding the SDK:
+
+| Session state | Admission | Consumption | Completion |
+| --- | --- | --- | --- |
+| Fresh or settled idle with an assistant tail | `prompt()` starts a turn; an explicit `followUp` is accepted into the executable queue | The next turn consumes the queued message and normally starts its own run | That run publishes its own terminal `agent_end` |
+| Live model/tool loop | `steer` may be consumed by the current run; `followUp` waits for the next turn | The live loop can consume the message before its terminal boundary | The message may share the current run and terminal; it is not necessarily a separate model call |
+| Prompt unwind after the Agent loop emitted `agent_end` | An explicit `followUp` is still accepted | The SDK schedules a queued-only successor after the unwind finishes; it is not left waiting for an unrelated prompt | The successor owns a new run and terminal boundary |
+| Paused, cancelled, or a non-resumable non-assistant tail | The message can remain queued | No automatic successor is promised until a supported resume/abort path makes the queue deliverable | The admission is not completion; clear/remove the queue or resume it explicitly |
+| Existing queued input ahead of a new submission | The new message is ordered behind the existing queue | Queue order is preserved; later plain prompts do not overtake an earlier follow-up | Each consumed message is correlated at its actual dequeue boundary |
+
+`session.waitForIdle()` waits for active Agent work, session settlement, and
+continuations that the SDK has scheduled. It is **not** a receipt that every
+steering/follow-up queue is empty. Inspect `pendingMessageCounts` or use the
+queue APIs when queue state matters. A queued follow-up can also share the
+predecessor's run and terminal when the live loop consumes it; do not equate
+one accepted submission with one model call or one `agent_end` event.
+
+For generic embedders, prefer an application-owned queue of bounded full turns
+submitted through `session.prompt()`, and use `steer`/`followUp` only for live
+conversational controls. The lower-level `sendUserMessage` options
+`queuedAtDispatch: true` and `onQueuedPromoted` are available for hosts that
+must preserve dispatch-time ownership and correlate actual queue consumption:
+
+- `queuedAtDispatch` preserves the fact that the caller observed a busy/queued
+  dispatch across asynchronous admission fences. It does not promise a new run.
+- `onQueuedPromoted` fires at the actual dequeue/promotion boundary with
+  `startsOwnRun: false` for in-run consumption and `startsOwnRun: true` when a
+  queued-only continuation starts a new run.
+- The `sendUserMessage` promise reports admission into the selected delivery
+  path, not model completion. Use session events and the promotion callback to
+  correlate completion and cancellation.
+
 Related APIs:
 
 - `sendUserMessage(content, { deliverAs? })`

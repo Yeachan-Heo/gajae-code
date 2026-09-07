@@ -514,4 +514,48 @@ describe("queued promotion run identity (#4668)", () => {
 		await agent.continueQueuedMessages();
 		expect(promotions).toEqual([true]);
 	});
+
+	it("continues a follow-up admitted during prompt unwind", async () => {
+		// A raw Agent subscriber runs before AgentSession's listener and can submit
+		// from the narrow interval after the loop emits agent_end but before the
+		// session publishes its terminal event. The follow-up must not be stranded
+		// merely because AgentSession.isStreaming still includes that unwind.
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected bundled Anthropic test model to exist");
+		const mock = createMockModel({ responses: [{ content: ["initial answer"] }, { content: ["follow-up answer"] }] });
+		const agent = new Agent({
+			getApiKey: provider => `${provider}-test-key`,
+			initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: mock.stream,
+		});
+		const rawAgentEnd = Promise.withResolvers<void>();
+		const followUpAccepted = Promise.withResolvers<void>();
+		let followUpPromise: Promise<void> | undefined;
+		let promoted = false;
+		agent.subscribe(event => {
+			if (event.type !== "agent_end" || followUpPromise) return;
+			rawAgentEnd.resolve();
+			followUpPromise = session!.sendUserMessage("follow-up during unwind", {
+				deliverAs: "followUp",
+				queuedAtDispatch: true,
+				onPreflightAccepted: () => followUpAccepted.resolve(),
+				onQueuedPromoted: () => {
+					promoted = true;
+				},
+			});
+		});
+		const settings = Settings.isolated({ "compaction.enabled": false });
+		settings.setModelRole("default", `${model.provider}/${model.id}`);
+		session = new AgentSession({ agent, sessionManager: SessionManager.inMemory(), settings, modelRegistry });
+
+		const prompt = session.prompt("initial prompt");
+		await rawAgentEnd.promise;
+		if (!followUpPromise) throw new Error("Expected raw agent_end subscriber to submit a follow-up");
+		await Promise.all([prompt, followUpPromise, followUpAccepted.promise]);
+		await session.waitForIdle();
+
+		expect(mock.calls).toHaveLength(2);
+		expect(promoted).toBe(true);
+		expect(session.pendingMessageCounts.followUp).toBe(0);
+	});
 });
