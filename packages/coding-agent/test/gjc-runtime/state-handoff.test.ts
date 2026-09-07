@@ -1978,6 +1978,32 @@ describe("gjc state handoff", () => {
 		});
 	});
 
+	it("recovers an approved state from an empty-step transaction journal", async () => {
+		await withTempCwd(async cwd => {
+			const { callerPath } = await writePublishedReadyCrystal(cwd);
+			expect((await runNativeDeepInterviewCommand(["approve-execution", "--json"], cwd)).status).toBe(0);
+			const approved = (await readJson(callerPath)) as Record<string, unknown>;
+			const approval = (approved.state as Record<string, unknown>).execution_approval_receipt as Record<
+				string,
+				unknown
+			>;
+			const mutationId = approval.mutation_id as string;
+			const approvalAuditPath = auditPath(cwd, TEST_SESSION_ID);
+			await fs.rm(path.join(path.dirname(callerPath), "deep-interview-approval-audit.json"));
+			await fs.rm(approvalAuditPath);
+			await beginWorkflowTransactionJournal({
+				cwd,
+				sessionId: TEST_SESSION_ID,
+				mutationId,
+				caller: "deep-interview",
+				paths: [callerPath, approvalAuditPath],
+			});
+			const retried = await runNativeDeepInterviewCommand(["approve-execution", "--json"], cwd);
+			expect(retried.status, retried.stderr).toBe(0);
+			expect(await fs.readFile(approvalAuditPath, "utf8")).toContain(`"mutation_id":"${mutationId}"`);
+		});
+	});
+
 	it("fails closed when pending approval recovery sees a symlinked audit", async () => {
 		if (process.platform === "win32") return;
 		await withTempCwd(async cwd => {

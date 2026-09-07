@@ -3704,8 +3704,8 @@ async function handleApproveExecutionUnlocked(cwd: string, selectors: ResolvedSe
 				persistedReceipt.mutated_at !== existingReceipt.approved_at ||
 				pendingJournal?.status !== "pending" ||
 				pendingJournal.mutation_id !== existingReceipt.mutation_id ||
-				pendingJournal.steps.length !== 1 ||
-				pendingJournal.steps[0] !== "approval-state" ||
+				(pendingJournal.steps.length !== 0 &&
+					(pendingJournal.steps.length !== 1 || pendingJournal.steps[0] !== "approval-state")) ||
 				pendingJournal.paths.length !== expectedJournalPaths.length ||
 				pendingJournal.paths.some((value, index) => path.resolve(value) !== expectedJournalPaths[index])
 			)

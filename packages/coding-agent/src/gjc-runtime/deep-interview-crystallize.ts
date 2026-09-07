@@ -288,6 +288,7 @@ type CrystalSemanticProfile = {
 	refusal: boolean;
 	unresolved: boolean;
 	obligation: string;
+	comparison: string;
 };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -400,7 +401,7 @@ function hasLaterSupersedingCorrection(content: string, quote: string, statement
 }
 
 function semanticProfile(value: string): CrystalSemanticProfile {
-	const normalized = value.normalize("NFC").toLowerCase();
+	const normalized = value.normalize("NFC").replaceAll("’", "'").toLowerCase();
 	const obligationTerms = new Set<string>();
 	if (
 		/\b(?:must|have\s+to|required|required\s+to|require|shall)\b/i.test(normalized) ||
@@ -465,6 +466,17 @@ function semanticProfile(value: string): CrystalSemanticProfile {
 		/(?:답변할\s+수\s+없|대답할\s+수\s+없|말할\s+수\s+없|하지\s+않|않겠|거부|回答できない|答えられない|答えない|したくない|拒否|无法回答|不能回答|不愿回答|不願回答|不愿|不願|拒绝|拒絕|无法决定|不能决定)/u.test(
 			normalized,
 		);
+	const comparison = [
+		...new Set(
+			[
+				...normalized.matchAll(
+					/\b(?:at\s+least|at\s+most|no\s+less\s+than|no\s+more\s+than|less\s+than|more\s+than|under|over|below|above|exactly)\b/g,
+				),
+			].map(match => match[0]),
+		),
+	]
+		.sort()
+		.join(",");
 	return {
 		negative,
 		interrogative,
@@ -475,6 +487,7 @@ function semanticProfile(value: string): CrystalSemanticProfile {
 		refusal,
 		unresolved: isExplicitlyUnresolved(normalized),
 		obligation: [...obligationTerms].sort().join(","),
+		comparison,
 	};
 }
 
@@ -488,7 +501,8 @@ function sameSemanticIntent(left: CrystalSemanticProfile, right: CrystalSemantic
 		left.contradictory === right.contradictory &&
 		left.refusal === right.refusal &&
 		left.unresolved === right.unresolved &&
-		left.obligation === right.obligation
+		left.obligation === right.obligation &&
+		left.comparison === right.comparison
 	);
 }
 
@@ -731,6 +745,8 @@ function evidenceTerms(value: string): Set<string> {
 	);
 	for (const match of canonical.matchAll(/(?:\b[A-Za-z][A-Za-z0-9]*\.[A-Za-z0-9.]+\b|\b[A-Za-z][+#]{1,2})/g))
 		terms.add(match[0].toLowerCase());
+	for (const match of canonical.matchAll(/[$€£¥₹₩]/gu)) terms.add(match[0]);
+	for (const match of canonical.matchAll(/\b\d+(?:\.\d+)?\s*([A-Za-z]{1,3})\b/g)) terms.add(match[1]!.toLowerCase());
 	for (const negator of CJK_NEGATOR_TERMS) if (normalized.includes(negator)) terms.add(negator);
 	return terms;
 }
@@ -741,6 +757,13 @@ function evidenceTermSequence(value: string): string[] {
 	const technical = [...canonical.matchAll(/(?:\b[A-Za-z][A-Za-z0-9]*\.[A-Za-z0-9.]+\b|\b[A-Za-z][+#]{1,2})/g)].map(
 		match => ({ index: match.index, end: match.index + match[0].length, term: match[0].toLowerCase() }),
 	);
+	for (const match of canonical.matchAll(/[$€£¥₹₩]/gu))
+		technical.push({ index: match.index, end: match.index + match[0].length, term: match[0] });
+	for (const match of canonical.matchAll(/\b\d+(?:\.\d+)?\s*([A-Za-z]{1,3})\b/g)) {
+		const unit = match[1]!;
+		const index = match.index + match[0].lastIndexOf(unit);
+		technical.push({ index, end: index + unit.length, term: unit.toLowerCase() });
+	}
 	const segmented = [...EVIDENCE_SEGMENTER.segment(canonical)]
 		.filter(
 			part =>
@@ -882,6 +905,9 @@ function validateResolutionAnchors(
 			containsNonTextMarker(message.content) ||
 			!message.content.includes(quote) ||
 			!message.content.includes(resolution) ||
+			!hasVerbatimTokenBoundaries(message.content, quote) ||
+			!hasVerbatimTokenBoundaries(message.content, resolution) ||
+			hasLaterSupersedingCorrection(message.content, quote, resolution) ||
 			unsafeResolution ||
 			resolution === item
 		)
@@ -1160,8 +1186,32 @@ export function crystallizeDeepInterview(value: unknown): DeepInterviewCrystal {
 		priorEnd,
 	);
 	const resolvedRemovedIds = resolvedRemovalAnchors.map(anchor => anchor.item);
+	const cancelledPendingRemovalIds = priorPendingRemovals.filter(id => {
+		const submitted = items.find(item => item.id === id);
+		const previous = priorItems.get(id);
+		const anchor = submitted?.anchor;
+		const message = anchor
+			? snapshot.messages.find(candidate => candidate.index === anchor.message_index)
+			: undefined;
+		return Boolean(
+			submitted?.classification === "confirmed" &&
+				previous &&
+				anchor &&
+				message?.role === "user" &&
+				anchor.message_index > priorEnd &&
+				message.content.includes(anchor.quote) &&
+				hasVerbatimTokenBoundaries(message.content, anchor.quote) &&
+				/\b(?:keep|retain|restore|preserve|maintain)\b/i.test(anchor.quote) &&
+				([...topicTerms(previous.statement, false)].some(term => evidenceTerms(anchor.quote).has(term)) ||
+					hasCjkTopicOverlap(previous.statement, anchor.quote)),
+		);
+	});
 	const unresolvedRemovalIds = [
-		...new Set([...priorPendingRemovals, ...requestedRemovedIds].filter(id => !resolvedRemovedIds.includes(id))),
+		...new Set(
+			[...priorPendingRemovals, ...requestedRemovedIds].filter(
+				id => !resolvedRemovedIds.includes(id) && !cancelledPendingRemovalIds.includes(id),
+			),
+		),
 	].sort();
 	if (items.some(item => unresolvedRemovalIds.includes(item.id) || resolvedRemovedIds.includes(item.id)))
 		throw new Error("submitted items must not silently resurrect unresolved removals");
