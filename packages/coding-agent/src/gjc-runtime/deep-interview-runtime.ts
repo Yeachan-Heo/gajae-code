@@ -275,7 +275,7 @@ async function readBoundedFileBytes(
 	label: string,
 	options: { allowMissing?: boolean; rejectSymlink?: boolean } = {},
 ): Promise<Buffer | undefined> {
-	let lexicalStat: Awaited<ReturnType<typeof fs.lstat>>;
+	let lexicalStat: Stats;
 	try {
 		lexicalStat = await fs.lstat(filePath);
 	} catch (error) {
@@ -286,7 +286,7 @@ async function readBoundedFileBytes(
 	if (options.rejectSymlink !== false && lexicalStat.isSymbolicLink())
 		throw new DeepInterviewCommandError(2, `${label} must not be a symlink`);
 	if (!lexicalStat.isFile()) throw new DeepInterviewCommandError(2, `${label} is not a regular file`);
-	let handle: Awaited<ReturnType<typeof fs.open>> | undefined;
+	let handle: fs.FileHandle | undefined;
 	try {
 		handle = await fs.open(filePath, READ_NOFOLLOW_FLAGS);
 		const initial = await handle.stat();
@@ -1286,6 +1286,12 @@ async function handleCrystallizeUnlocked(
 		currentMutationId: mutationId,
 	});
 	const indexCatalog = await readCrystalIndexCatalog(cwd, sessionId, indexPath);
+	const publicationSnapshot = await authoritativeConversationSnapshot(cwd, sessionId);
+	if (
+		publicationSnapshot.revision !== liveSnapshot.revision ||
+		JSON.stringify(publicationSnapshot.messages) !== JSON.stringify(liveSnapshot.messages)
+	)
+		throw new DeepInterviewCommandError(2, "conversation snapshot changed before Crystal publication");
 	if (specPath && specContent && mutationId) {
 		await beginWorkflowTransactionJournal({
 			cwd,
