@@ -411,6 +411,11 @@ function hasLaterSupersedingCorrection(content: string, quote: string, statement
 		isShortTechnicalIdentifier,
 	);
 	const statementUseTarget = /\buse\s+([A-Za-z0-9][A-Za-z0-9+#.-]*)/i.exec(statement)?.[1];
+	const isTechnicalSubstitutionTarget = (term: string): boolean =>
+		isShortTechnicalIdentifier(term) ||
+		/^(?:C\+\+|C#|F#)$/i.test(term) ||
+		/(?:[a-z][A-Z]|[A-Z].*[A-Z])/.test(term) ||
+		LONG_TECHNICAL_TERMS.has(term.toLowerCase());
 	const genericCorrection = followingClauses.some(clause => {
 		const marker =
 			/\b(?:actually|instead|rather|correction|on\s+second\s+thought|make\s+that)\b/i.test(clause) ||
@@ -423,15 +428,10 @@ function hasLaterSupersedingCorrection(content: string, quote: string, statement
 				(clause.match(/[A-Za-z0-9][A-Za-z0-9+#.-]*/g) ?? []).some(isShortTechnicalIdentifier)) ||
 			Boolean(
 				statementUseTarget &&
-					(isShortTechnicalIdentifier(statementUseTarget) || /^[A-Z]/.test(statementUseTarget)) &&
+					isTechnicalSubstitutionTarget(statementUseTarget) &&
 					(() => {
 						const target = /\buse\s+([A-Za-z0-9][A-Za-z0-9+#.-]*)/i.exec(clause)?.[1];
-						return Boolean(
-							target &&
-								(isShortTechnicalIdentifier(target) ||
-									/^(?:C\+\+|C#|F#)$/i.test(target) ||
-									/(?:[a-z][A-Z]|[A-Z].*[A-Z])/.test(target)),
-						);
+						return Boolean(target && isTechnicalSubstitutionTarget(target));
 					})(),
 			)
 		);
@@ -741,6 +741,17 @@ const LOWERCASE_SHORT_TECHNICAL_TERMS = new Set([
 	"ui",
 	"us",
 	"vm",
+]);
+const LONG_TECHNICAL_TERMS = new Set([
+	"rust",
+	"python",
+	"java",
+	"swift",
+	"kotlin",
+	"ruby",
+	"scala",
+	"elixir",
+	"erlang",
 ]);
 
 function isShortTechnicalIdentifier(value: string): boolean {
