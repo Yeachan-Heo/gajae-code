@@ -744,7 +744,7 @@ describe("gjc state handoff", () => {
 				cwd,
 			);
 			expect(runtimeMissing.status).toBe(2);
-			expect(runtimeMissing.stderr).toContain("requires a locked Round 0 intent contract");
+			expect(runtimeMissing.stderr).toContain("requires a canonical GJC workflow skill");
 			const unchanged = await readJson(callerPath);
 			expect(unchanged?.active).toBe(true);
 		});
@@ -884,6 +884,73 @@ describe("gjc state handoff", () => {
 		});
 	});
 
+	it("rejects caller-write recovery when the persisted callee checksum is tampered", async () => {
+		await withTempCwd(async cwd => {
+			const callerPath = modeStatePath(cwd, TEST_SESSION_ID, "deep-interview");
+			const calleePath = modeStatePath(cwd, TEST_SESSION_ID, "ralplan");
+			const handoffAt = "2026-06-03T00:00:00.000Z";
+			const mutationId = `deep-interview:handoff:ralplan:${handoffAt}`;
+			await writeJson(callerPath, {
+				skill: "deep-interview",
+				version: 1,
+				active: true,
+				current_phase: "interviewing",
+			});
+			const priorFailpoint = process.env.GJC_STATE_HANDOFF_FAIL_AFTER_CALLER;
+			const originalToISOString = Date.prototype.toISOString;
+			Date.prototype.toISOString = () => handoffAt;
+			process.env.GJC_STATE_HANDOFF_FAIL_AFTER_CALLER = mutationId;
+			try {
+				expect(
+					(await runNativeStateCommand(["handoff", "--mode", "deep-interview", "--to", "ralplan"], cwd)).status,
+				).toBe(1);
+			} finally {
+				Date.prototype.toISOString = originalToISOString;
+				restoreEnvironmentValue("GJC_STATE_HANDOFF_FAIL_AFTER_CALLER", priorFailpoint);
+			}
+			const tamperedCallee = (await readJson(calleePath)) as Record<string, unknown>;
+			tamperedCallee.current_phase = "final";
+			await writeJson(calleePath, tamperedCallee);
+			const retried = await runNativeStateCommand(
+				["handoff", "--mode", "deep-interview", "--to", "ralplan", "--json"],
+				cwd,
+			);
+			expect(retried.status).toBe(2);
+			expect(retried.stderr).toContain("handoff recovery refuses tampered callee state");
+			expect((await readJson(calleePath))?.current_phase).toBe("final");
+		});
+	});
+
+	it("rejects callee-write recovery when the persisted caller checksum is tampered", async () => {
+		await withTempCwd(async cwd => {
+			const { callerPath } = await writePublishedReadyCrystal(cwd);
+			const handoffAt = "2026-06-03T00:00:00.000Z";
+			const mutationId = `deep-interview:handoff:ralplan:${handoffAt}`;
+			const priorFailpoint = process.env.GJC_STATE_HANDOFF_FAIL_AFTER_CALLEE;
+			const originalToISOString = Date.prototype.toISOString;
+			Date.prototype.toISOString = () => handoffAt;
+			process.env.GJC_STATE_HANDOFF_FAIL_AFTER_CALLEE = mutationId;
+			try {
+				expect(
+					(await runNativeStateCommand(["handoff", "--mode", "deep-interview", "--to", "ralplan"], cwd)).status,
+				).toBe(1);
+			} finally {
+				Date.prototype.toISOString = originalToISOString;
+				restoreEnvironmentValue("GJC_STATE_HANDOFF_FAIL_AFTER_CALLEE", priorFailpoint);
+			}
+			const tamperedCaller = (await readJson(callerPath)) as Record<string, unknown>;
+			(tamperedCaller.state as Record<string, unknown>).rounds = [{ round: 99 }];
+			await writeJson(callerPath, tamperedCaller);
+			const retried = await runNativeStateCommand(
+				["handoff", "--mode", "deep-interview", "--to", "ralplan", "--json"],
+				cwd,
+			);
+			expect(retried.status).toBe(2);
+			expect(retried.stderr).toContain("handoff recovery refuses tampered caller state");
+			expect(((await readJson(callerPath))?.state as Record<string, unknown>).rounds).toEqual([{ round: 99 }]);
+		});
+	});
+
 	it("serializes the callee read-modify-write with sanctioned callee writers", async () => {
 		await withTempCwd(async cwd => {
 			const callerPath = modeStatePath(cwd, TEST_SESSION_ID, "deep-interview");
@@ -1017,24 +1084,24 @@ describe("gjc state handoff", () => {
 		});
 	});
 
-	it("demotes canonical caller without creating runtime mode-state when callee is a runtime skill", async () => {
+	it("demotes a non-interview caller without creating runtime mode-state when callee is a runtime skill", async () => {
 		await withTempCwd(async cwd => {
-			await writeJson(modeStatePath(cwd, TEST_SESSION_ID, "deep-interview"), {
-				skill: "deep-interview",
+			await writeJson(modeStatePath(cwd, TEST_SESSION_ID, "ralplan"), {
+				skill: "ralplan",
 				version: 1,
 				active: true,
-				current_phase: "interviewing",
+				current_phase: "handoff",
 			});
 			const result = await runNativeStateCommand(
-				["handoff", "--mode", "deep-interview", "--to", "made-up-skill", "--json"],
+				["handoff", "--mode", "ralplan", "--to", "made-up-skill", "--json"],
 				cwd,
 			);
 			expect(result.status).toBe(0);
 			const payload = parseRequiredJson(result.stdout, "runtime-callee handoff stdout");
-			expect(payload.from).toBe("deep-interview");
+			expect(payload.from).toBe("ralplan");
 			expect(payload.to).toBe("made-up-skill");
 
-			const caller = await readJson(modeStatePath(cwd, TEST_SESSION_ID, "deep-interview"));
+			const caller = await readJson(modeStatePath(cwd, TEST_SESSION_ID, "ralplan"));
 			expect(caller?.active).toBe(false);
 			expect(caller?.current_phase).toBe("handoff");
 			expect(caller?.handoff_to).toBe("made-up-skill");
@@ -1043,9 +1110,27 @@ describe("gjc state handoff", () => {
 			const activeState = await readJson(activeSnapshotPath(cwd, TEST_SESSION_ID));
 			const activeSkills = (activeState?.active_skills as Array<Record<string, unknown>>) ?? [];
 			expect(activeSkills.find(e => e.skill === "made-up-skill")).toBeUndefined();
-			const callerEntry = activeSkills.find(e => e.skill === "deep-interview");
+			const callerEntry = activeSkills.find(e => e.skill === "ralplan");
 			expect(callerEntry?.active).not.toBe(true);
 			if (callerEntry) expect(callerEntry.handoff_to).toBe("made-up-skill");
+		});
+	});
+
+	it("rejects deep-interview handoff to a runtime skill", async () => {
+		await withTempCwd(async cwd => {
+			await writeJson(modeStatePath(cwd, TEST_SESSION_ID, "deep-interview"), {
+				skill: "deep-interview",
+				version: 1,
+				active: true,
+				current_phase: "interviewing",
+			});
+			const result = await runNativeStateCommand(
+				["handoff", "--mode", "deep-interview", "--to", "runtime-executor", "--json"],
+				cwd,
+			);
+			expect(result.status).toBe(2);
+			expect(result.stderr).toContain("requires a canonical GJC workflow skill");
+			expect((await readJson(modeStatePath(cwd, TEST_SESSION_ID, "deep-interview")))?.active).toBe(true);
 		});
 	});
 

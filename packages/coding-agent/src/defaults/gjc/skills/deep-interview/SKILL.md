@@ -856,20 +856,19 @@ After the spec is written, mark it `pending approval` and present execution opti
 
 ### Phase 5b: Handoff before chain
 
-Before invoking `/skill:ralplan` or `/skill:ultragoal`, the final spec must already be persisted through the native deep-interview write command (`gjc deep-interview --write --stage final …`). That command itself moves the workflow to the `handoff` phase, so no separate state write is needed for the skill tool's chain guard. Verify readiness with:
+Before invoking `/skill:ralplan` or `/skill:ultragoal`, the ready Crystal must already expose its canonical versioned `spec_path`. Crystallization itself publishes that artifact and moves the workflow to the `handoff` phase; never issue a second direct spec write after Crystal publication. Verify readiness and reuse the returned `spec_path` with:
 
 ```
 gjc deep-interview read --json
 ```
 
-For a preselected deliberate ralplan path, prefer the single sanctioned bridge command instead:
+For a selected ralplan refinement path, hand off the already-published Crystal state without rewriting its spec:
 
 ```
-gjc \
-deep-interview --write --stage final --slug {slug} --spec <markdown-or-path> --deliberate --json
+gjc state handoff --mode deep-interview --to ralplan --json
 ```
 
-That command persists `.gjc/_session-{sessionid}/specs/deep-interview-{slug}.md`, seeds ralplan in deliberate mode, and performs the safe deep-interview → ralplan state handoff. Skipping spec persistence leaves the Phase 5 chain blocked by design.
+Pass the canonical `spec_path` from `gjc deep-interview read --json` into `/skill:ralplan`. The state handoff is non-executing and does not grant execution approval. `/skill:ultragoal` still requires the separate `approve-execution` transition before its handoff.
 
 ### Approval-Gated Refinement Path (Recommended)
 
