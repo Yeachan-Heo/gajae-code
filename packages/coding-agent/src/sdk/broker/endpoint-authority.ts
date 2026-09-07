@@ -49,7 +49,6 @@ export function endpointIncarnation(
 				// genuine same-millisecond successor replacement still changes the
 				// digest even when pid/generation are reused.
 				endpointMtimeMs: Math.round(record.endpointMtimeMs),
-				...(record.endpointFileId === undefined ? {} : { endpointFileId: record.endpointFileId }),
 				pid: record.pid,
 				sessionId,
 			}),

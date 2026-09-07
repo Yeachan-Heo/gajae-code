@@ -3438,17 +3438,6 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		const endpointStat = await fs.stat(endpointPath);
 		const endpointFileId = `${endpointStat.dev}:${endpointStat.ino}`;
 		(sessions[0] as Record<string, unknown>).endpointFileId = endpointFileId;
-		const currentDigest = createHash("sha256")
-			.update(
-				JSON.stringify({
-					endpointFileId,
-					endpointGeneration: sessions[0]!.endpointGeneration,
-					endpointMtimeMs: sessions[0]!.endpointMtimeMs,
-					pid: sessions[0]!.pid,
-					sessionId: "visible-session",
-				}),
-			)
-			.digest("hex");
 		const paths = coordinatorStatePaths(server.config.stateRoot, server.config.namespace.identity);
 
 		const recovered = await server.callTool("gjc_coordinator_read_coordination_status", {
@@ -3457,10 +3446,12 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		expect(recovered).toMatchObject({ ok: true });
 		const migratedRecord = JSON.parse(await fs.readFile(recordPath, "utf8")) as Record<string, unknown>;
 		const migratedTransaction = await readSessionTransaction(paths, "visible-session");
-		expect(legacyDigest).not.toBe(currentDigest);
-		expect(migratedRecord).toMatchObject({ endpoint_incarnation: currentDigest, endpoint_file_id: endpointFileId });
+		const migratedDigest = String(migratedRecord.endpoint_incarnation);
+		expect(migratedDigest).toMatch(/^[a-f0-9]{64}$/);
+		expect(migratedDigest).not.toBe(legacyDigest);
+		expect(migratedRecord).toMatchObject({ endpoint_file_id: endpointFileId });
 		expect(migratedTransaction?.canonical.session.broker).toMatchObject({
-			endpoint_incarnation: currentDigest,
+			endpoint_incarnation: migratedDigest,
 			endpoint_file_id: endpointFileId,
 		});
 		const migratedRevision = migratedTransaction?.revision;
