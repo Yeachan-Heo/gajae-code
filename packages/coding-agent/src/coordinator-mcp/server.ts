@@ -5693,7 +5693,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					endpointGeneration,
 					endpointMtimeMs,
 					pid,
-					...(typeof session.endpointFileId === "string" ? { endpointFileId: session.endpointFileId } : {}),
+					...(endpointFileId === undefined ? {} : { endpointFileId }),
 				},
 				sessionId,
 			) ?? null

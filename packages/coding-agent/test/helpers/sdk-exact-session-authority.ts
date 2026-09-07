@@ -70,7 +70,6 @@ export async function publishExactSessionAuthority(
 		locator: { cwd: options.cwd, worktreeRoot: null, stateRoot },
 		endpointGeneration: authority.endpointGeneration,
 		pid: authority.pid,
-		endpointFileId: authority.endpointFileId,
 		// A real host publishes its own OS start incarnation; without it the
 		// pid-reuse fence (incarnationMatches) never holds and the session
 		// reads not-live, so the fixture publishes the test process's
