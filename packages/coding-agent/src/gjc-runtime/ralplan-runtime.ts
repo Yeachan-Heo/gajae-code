@@ -351,6 +351,53 @@ export async function countRalplanOnDiskLaneArtifacts(
  * signals so callers can fail closed when the ledger is empty/malformed while
  * opener artifacts already exist on disk.
  */
+async function readRalplanIndexBounded(indexPath: string): Promise<string | undefined> {
+	let lexical: fssync.BigIntStats;
+	try {
+		lexical = await fs.lstat(indexPath, { bigint: true });
+	} catch (error) {
+		if (getErrorCode(error) === "ENOENT") return undefined;
+		throw error;
+	}
+	if (lexical.isSymbolicLink() || !lexical.isFile() || lexical.size > BigInt(RALPLAN_MAX_INDEX_RECOVERY_BYTES))
+		throw new RalplanCommandError(2, "ralplan index exceeds its bounded recovery limit");
+	const flags = fssync.constants.O_RDONLY | (process.platform === "win32" ? 0 : (fssync.constants.O_NOFOLLOW ?? 0));
+	let handle: fs.FileHandle | undefined;
+	try {
+		handle = await fs.open(indexPath, flags);
+		const opened = await handle.stat({ bigint: true });
+		const same = (left: fssync.BigIntStats, right: fssync.BigIntStats) =>
+			left.dev === right.dev &&
+			left.ino === right.ino &&
+			left.mode === right.mode &&
+			left.size === right.size &&
+			left.mtimeNs === right.mtimeNs &&
+			left.ctimeNs === right.ctimeNs &&
+			left.nlink === right.nlink;
+		if (!opened.isFile() || !same(lexical, opened))
+			throw new RalplanCommandError(2, "ralplan index identity changed");
+		const buffer = Buffer.alloc(Number(opened.size));
+		let offset = 0;
+		while (offset < buffer.length) {
+			const { bytesRead } = await handle.read(buffer, offset, buffer.length - offset, offset);
+			if (bytesRead === 0) throw new RalplanCommandError(2, "ralplan index changed during bounded read");
+			offset += bytesRead;
+		}
+		const afterDescriptor = await handle.stat({ bigint: true });
+		const afterPath = await fs.lstat(indexPath, { bigint: true });
+		if (
+			afterPath.isSymbolicLink() ||
+			!afterPath.isFile() ||
+			!same(opened, afterDescriptor) ||
+			!same(opened, afterPath)
+		)
+			throw new RalplanCommandError(2, "ralplan index changed during bounded read");
+		return buffer.toString("utf8");
+	} finally {
+		await handle?.close();
+	}
+}
+
 export async function loadRalplanIndexForCap(
 	cwd: string,
 	sessionId: string,
@@ -364,7 +411,8 @@ export async function loadRalplanIndexForCap(
 }> {
 	const indexPath = path.join(sessionPlansDir(cwd, sessionId), "ralplan", runId, "index.jsonl");
 	try {
-		const text = await fs.readFile(indexPath, "utf8");
+		const text = await readRalplanIndexBounded(indexPath);
+		if (text === undefined) return { rows: [], indexPresent: false, parseableLines: 0, rawLineCount: 0 };
 		const lines = text.split(/\r?\n/).filter(line => line.trim().length > 0);
 		const rows: RalplanIndexRow[] = [];
 		for (const line of lines) {
@@ -1687,16 +1735,7 @@ async function appendRalplanIndexIdempotent(
 	return await withWorkflowStateLock(
 		targetPath,
 		async () => {
-			let raw = "";
-			try {
-				const stat = await fs.lstat(resolvedTargetPath);
-				if (!stat.isFile() || stat.isSymbolicLink() || stat.size > RALPLAN_MAX_INDEX_RECOVERY_BYTES)
-					throw new RalplanCommandError(2, "ralplan index exceeds its bounded recovery limit");
-				raw = await fs.readFile(resolvedTargetPath, "utf8");
-			} catch (error) {
-				const code = getErrorCode(error);
-				if (code !== "ENOENT") throw error;
-			}
+			const raw = (await readRalplanIndexBounded(resolvedTargetPath)) ?? "";
 			const existing: unknown[] = [];
 			let malformed = false;
 			for (const line of raw.split(/\r?\n/)) {
@@ -2226,15 +2265,38 @@ async function handleArtifactWrite(
 		}
 		if (resolved.stage === "final") {
 			await ensureFinalPendingApproval(persistCwd, resolved, existingArtifact);
+			await appendRalplanIndexIdempotent(
+				path.join(sessionPlansDir(persistCwd, resolved.sessionId), "ralplan", resolved.runId, "index.jsonl"),
+				{
+					stage: "final",
+					stage_n: resolved.stageN,
+					path: existingArtifact.path,
+					created_at: existingArtifact.createdAt,
+					sha256: existingArtifact.sha256,
+					...(existingArtifact.autoHandoff ? { auto_handoff: existingArtifact.autoHandoff } : {}),
+				},
+				{
+					cwd: persistCwd,
+					key: ralplanIndexKey,
+					audit: {
+						category: "ledger",
+						verb: "append",
+						owner: "gjc-runtime",
+						skill: "ralplan",
+						sessionId: resolved.sessionId,
+					},
+				},
+			);
 			// The artifact and its authenticated ledger receipt are durable before the
 			// current-session admission projection. Repair that projection after a
 			// crash in the gap, before returning the deduplicated receipt.
 			if (existingArtifact.autoHandoff) {
+				const planningStuck = await readRalplanPlanningStuck(persistCwd, resolved.sessionId, resolved.runId);
 				await persistRalplanFinalAdmission(
 					persistCwd,
 					resolved.sessionId,
 					resolved.runId,
-					existingArtifact.autoHandoff,
+					applyRalplanPlanningStuckOverride(existingArtifact.autoHandoff, planningStuck),
 				);
 			}
 		}
