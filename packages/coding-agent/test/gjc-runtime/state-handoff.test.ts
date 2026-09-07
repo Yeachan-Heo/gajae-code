@@ -1877,6 +1877,9 @@ describe("gjc state handoff", () => {
 			expect(
 				await readWorkflowTransactionJournal(cwd, TEST_SESSION_ID, approvalReceipt.mutation_id as string),
 			).toMatchObject({ status: "pending", steps: ["approval-state"] });
+			const filler = `${JSON.stringify({ event: "filler", payload: "x".repeat(1024) })}\n`.repeat(9_000);
+			await fs.appendFile(approvalAuditPath, filler);
+			expect((await fs.stat(approvalAuditPath)).size).toBeGreaterThan(8 * 1024 * 1024);
 			const retried = await runNativeDeepInterviewCommand(["approve-execution", "--json"], cwd);
 			expect(retried.status, retried.stderr).toBe(0);
 			expect(await fs.readFile(approvalAuditPath, "utf8")).toContain('"verb":"approve-execution"');

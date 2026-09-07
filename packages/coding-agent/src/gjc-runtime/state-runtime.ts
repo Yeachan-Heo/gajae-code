@@ -1892,6 +1892,62 @@ async function readBoundedIdentityText(
 	}
 }
 
+async function readBoundedIdentityTail(filePath: string, maxBytes: number, label: string): Promise<string | undefined> {
+	let initialStat: nodeFs.BigIntStats;
+	try {
+		initialStat = await fs.lstat(filePath, { bigint: true });
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+		throw new StateCommandError(2, `failed to read ${label}: ${(error as Error).message}`);
+	}
+	if (initialStat.isSymbolicLink() || !initialStat.isFile()) return undefined;
+	const openFlags =
+		nodeFs.constants.O_RDONLY | (process.platform === "win32" ? 0 : (nodeFs.constants.O_NOFOLLOW ?? 0));
+	let handle: fs.FileHandle | undefined;
+	try {
+		handle = await fs.open(filePath, openFlags);
+		const openedStat = await handle.stat({ bigint: true });
+		const beforeReadStat = await fs.lstat(filePath, { bigint: true });
+		if (
+			openedStat.isSymbolicLink() ||
+			!openedStat.isFile() ||
+			beforeReadStat.isSymbolicLink() ||
+			!sameBoundedFileIdentity(initialStat, openedStat) ||
+			!sameBoundedFileIdentity(initialStat, beforeReadStat)
+		)
+			return undefined;
+		const size = Number(openedStat.size);
+		if (!Number.isSafeInteger(size)) return undefined;
+		const start = Math.max(0, size - maxBytes);
+		const buffer = Buffer.alloc(size - start);
+		let offset = 0;
+		while (offset < buffer.length) {
+			const { bytesRead } = await handle.read(buffer, offset, buffer.length - offset, start + offset);
+			if (bytesRead === 0) return undefined;
+			offset += bytesRead;
+		}
+		const afterReadStat = await handle.stat({ bigint: true });
+		const afterPathStat = await fs.lstat(filePath, { bigint: true });
+		if (
+			afterPathStat.isSymbolicLink() ||
+			!afterPathStat.isFile() ||
+			!sameBoundedFileIdentity(initialStat, afterReadStat) ||
+			!sameBoundedFileIdentity(initialStat, afterPathStat)
+		)
+			return undefined;
+		let text = buffer.toString("utf-8");
+		if (start > 0) {
+			const firstNewline = text.indexOf("\n");
+			text = firstNewline >= 0 ? text.slice(firstNewline + 1) : "";
+		}
+		return text;
+	} catch {
+		return undefined;
+	} finally {
+		await handle?.close().catch(() => undefined);
+	}
+}
+
 async function hashIdentityFile(filePath: string, label: string): Promise<string | undefined> {
 	let initialStat: nodeFs.BigIntStats;
 	try {
@@ -3489,7 +3545,7 @@ function buildExecutionApprovalAuditEntry(
 }
 
 async function approvalAuditContainsMutation(filePath: string, mutationId: string): Promise<boolean> {
-	const raw = await readBoundedIdentityText(filePath, 8 * 1024 * 1024, "execution approval recovery audit");
+	const raw = await readBoundedIdentityTail(filePath, 8 * 1024 * 1024, "execution approval recovery audit");
 	if (!raw) return false;
 	return raw.split(/\r?\n/).some(line => {
 		if (!line.includes(mutationId) || !line.includes('"approve-execution"')) return false;
