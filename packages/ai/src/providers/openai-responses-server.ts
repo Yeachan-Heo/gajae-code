@@ -22,7 +22,7 @@ import type {
 	Tool,
 	ToolCall,
 } from "../types";
-import { sanitizeJsonStrings } from "../utils";
+import { sanitizeJsonStrings, wireToolCallId } from "../utils";
 import {
 	type OpenAIResponsesFunctionCallItem,
 	type OpenAIResponsesFunctionCallOutputItem,
@@ -666,7 +666,7 @@ function buildOutputItems(message: AssistantMessage): OutputItem[] {
 				out.push({
 					type: "custom_tool_call",
 					id: part.thoughtSignature ?? makeCustomCallId(),
-					call_id: part.id,
+					call_id: wireToolCallId(part.id),
 					name: part.customWireName,
 					input: rawInput,
 					status: "completed",
@@ -675,7 +675,7 @@ function buildOutputItems(message: AssistantMessage): OutputItem[] {
 				out.push({
 					type: "function_call",
 					id: part.thoughtSignature ?? makeFuncCallId(),
-					call_id: part.id,
+					call_id: wireToolCallId(part.id),
 					name: part.name,
 					arguments: JSON.stringify(sanitizeJsonStrings(part.arguments ?? {})),
 					status: "completed",
@@ -850,7 +850,7 @@ export function encodeStream(
 						: undefined;
 				const isCustom = customWireName !== undefined;
 				const itemId = tc?.thoughtSignature ?? (isCustom ? makeCustomCallId() : makeFuncCallId());
-				const callId = tc?.id ?? "";
+				const callId = tc ? wireToolCallId(tc.id) : "";
 				const name = customWireName ?? tc?.name ?? "";
 				const item = isCustom
 					? {
@@ -1143,7 +1143,7 @@ export function encodeStream(
 							const tc = ev.toolCall;
 							if (tc.customWireName && !cur.customWireName) cur.customWireName = tc.customWireName;
 							if (tc.thoughtSignature) cur.itemId = tc.thoughtSignature;
-							cur.callId = tc.id;
+							cur.callId = wireToolCallId(tc.id);
 							cur.name = cur.customWireName ?? tc.name;
 							if (cur.customWireName) {
 								// Custom tool: raw input string. Streamed deltas accumulated

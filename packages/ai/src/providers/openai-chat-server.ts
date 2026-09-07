@@ -20,7 +20,7 @@ import type {
 	ToolResultMessage,
 	TSchema,
 } from "../types";
-import { sanitizeJsonStrings } from "../utils";
+import { sanitizeJsonStrings, wireToolCallId } from "../utils";
 import {
 	type OpenAIChatContentPart,
 	type OpenAIChatMessage,
@@ -377,7 +377,7 @@ export function encodeResponse(message: AssistantMessage, requestedModelId: stri
 	}
 	if (toolCalls.length > 0) {
 		responseMessage.tool_calls = toolCalls.map(tc => ({
-			id: tc.id,
+			id: wireToolCallId(tc.id),
 			type: "function",
 			function: { name: tc.name, arguments: stringifyArgs(tc.arguments) },
 		}));
@@ -639,7 +639,7 @@ export function encodeStream(
 										tool_calls: [
 											{
 												index: idx,
-												id: call?.id ?? "",
+												id: call ? wireToolCallId(call.id) : "",
 												type: "function",
 												function: { name: call?.name ?? "", arguments: "" },
 											},

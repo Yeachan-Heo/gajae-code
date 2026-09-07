@@ -306,6 +306,39 @@ describe("openai-responses encodeResponse", () => {
 		});
 	});
 
+	it("emits only the call_id half of a Codex compound tool id", () => {
+		// Codex/Responses upstreams store `${call_id}|${item_id}` in ToolCall.id.
+		// A downstream Responses client truncates the compound value at 64 chars
+		// and then cannot pair its output with the call it echoed back.
+		const message: AssistantMessage = {
+			role: "assistant",
+			api: "openai-codex-responses",
+			provider: "openai-codex",
+			model: "gpt-5",
+			content: [
+				{
+					type: "toolCall",
+					id: "call_X0JvpoDX2wMBEwKU9g2sOpy3|fc_08831fab12f9c248016a9e3828210487d080cd050199114e89",
+					name: "skill",
+					arguments: { name: "autoresearch" },
+					thoughtSignature: "fc_08831fab12f9c248016a9e3828210487d080cd050199114e89",
+				},
+			],
+			usage: zeroUsage(),
+			stopReason: "toolUse",
+			timestamp: 1_700_000_000_000,
+		};
+
+		const output = encodeResponse(message, "gpt-5").output as Array<Record<string, unknown>>;
+		expect(output).toHaveLength(1);
+		expect(output[0]).toMatchObject({
+			type: "function_call",
+			id: "fc_08831fab12f9c248016a9e3828210487d080cd050199114e89",
+			call_id: "call_X0JvpoDX2wMBEwKU9g2sOpy3",
+		});
+		expect(output[0]!.call_id as string).not.toContain("|");
+	});
+
 	it("marks length-limited responses incomplete", () => {
 		const message: AssistantMessage = {
 			role: "assistant",
@@ -490,6 +523,45 @@ describe("openai-responses encodeStream", () => {
 		});
 		// Critical gotcha: id and call_id are distinct.
 		expect(output[2]!.id).not.toBe(output[2]!.call_id);
+	});
+
+	it("streams only the call_id half of a Codex compound tool id", async () => {
+		const stream = new AssistantMessageEventStream();
+		const compoundId = "call_X0JvpoDX2wMBEwKU9g2sOpy3|fc_08831fab12f9c248016a9e3828210487d080cd050199114e89";
+		const toolCall = {
+			type: "toolCall" as const,
+			id: compoundId,
+			name: "skill",
+			arguments: { name: "autoresearch" },
+			thoughtSignature: "fc_08831fab12f9c248016a9e3828210487d080cd050199114e89",
+		};
+		const message: AssistantMessage = {
+			role: "assistant",
+			api: "openai-codex-responses",
+			provider: "openai-codex",
+			model: "gpt-5",
+			content: [toolCall],
+			usage: zeroUsage(),
+			stopReason: "toolUse",
+			timestamp: 1_700_000_000_000,
+		};
+		queueMicrotask(() => {
+			stream.push({ type: "start", partial: { ...message, content: [] } });
+			stream.push({ type: "toolcall_start", contentIndex: 0, partial: message });
+			stream.push({ type: "toolcall_end", contentIndex: 0, toolCall, partial: message });
+			stream.push({ type: "done", reason: "toolUse", message });
+		});
+
+		const frames = parseSse(await collectStream(encodeStream(stream, "gpt-5")));
+		const added = frames.find(f => f.event === "response.output_item.added")!.data as Record<string, unknown>;
+		const completed = frames.find(f => f.event === "response.completed")!.data as Record<string, unknown>;
+		const output = (completed.response as Record<string, unknown>).output as Array<Record<string, unknown>>;
+		expect((added.item as Record<string, unknown>).call_id).toBe("call_X0JvpoDX2wMBEwKU9g2sOpy3");
+		expect(output[0]).toMatchObject({
+			type: "function_call",
+			id: "fc_08831fab12f9c248016a9e3828210487d080cd050199114e89",
+			call_id: "call_X0JvpoDX2wMBEwKU9g2sOpy3",
+		});
 	});
 
 	it("emits response.incomplete for length-limited streams", async () => {

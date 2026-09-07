@@ -64,6 +64,23 @@ export function normalizeToolCallId(id: string): string {
 	return sanitized.length > 64 ? sanitized.slice(0, 64) : sanitized;
 }
 
+/**
+ * Wire-facing tool call id for a canonical ToolCall served to a foreign client.
+ *
+ * Responses-backed upstreams (Codex, OpenAI Responses) encode the tool call as
+ * `${call_id}|${item_id}` in `ToolCall.id` so their own replay can recover the
+ * item id. That encoding is gjc-internal: a downstream OpenAI-format client
+ * (OpenCodex, another gjc) truncates the compound value at its own 64-char
+ * limit and can no longer pair its tool output with the call it echoed back,
+ * so the whole chained turn is rejected with "No tool output found". Emit only
+ * the `call_id` half on the wire; the item id travels separately as the item
+ * `id` where the wire format has one.
+ */
+export function wireToolCallId(id: string): string {
+	const separator = id.indexOf("|");
+	return separator === -1 ? id : id.slice(0, separator);
+}
+
 type ResponsesToolItemIdPrefix = "fc" | "ctc";
 
 export function normalizeResponsesToolCallId(

@@ -264,6 +264,27 @@ describe("auth-gateway openai-chat: encodeResponse", () => {
 		});
 	});
 
+	it("emits only the call_id half of a Codex compound tool id", () => {
+		const message: AssistantMessage = {
+			...emptyAssistant(),
+			api: "openai-codex-responses",
+			provider: "openai-codex",
+			content: [
+				{
+					type: "toolCall",
+					id: "call_X0JvpoDX2wMBEwKU9g2sOpy3|fc_08831fab12f9c248016a9e3828210487d080cd050199114e89",
+					name: "compute",
+					arguments: { x: 1 },
+				},
+			],
+			stopReason: "toolUse",
+		};
+
+		const out = encodeResponse(message, "gpt-5.2");
+		const choices = out.choices as Array<{ message: { tool_calls?: Array<{ id: string }> } }>;
+		expect(choices[0].message.tool_calls?.[0]?.id).toBe("call_X0JvpoDX2wMBEwKU9g2sOpy3");
+	});
+
 	it("surfaces only the finalized summary for mixed reasoning", () => {
 		const message: AssistantMessage = {
 			...emptyAssistant(),
@@ -312,6 +333,35 @@ describe("auth-gateway openai-chat: encodeResponse", () => {
 });
 
 describe("auth-gateway openai-chat: encodeStream", () => {
+	it("streams only the call_id half of a Codex compound tool id", async () => {
+		const partial = emptyAssistant();
+		partial.content = [
+			{
+				type: "toolCall",
+				id: "call_X0JvpoDX2wMBEwKU9g2sOpy3|fc_08831fab12f9c248016a9e3828210487d080cd050199114e89",
+				name: "skill",
+				arguments: {},
+			},
+		];
+		const events: AssistantMessageEvent[] = [
+			{ type: "toolcall_start", contentIndex: 0, partial },
+			{ type: "toolcall_delta", contentIndex: 0, delta: "{}", partial },
+			{ type: "done", reason: "toolUse", message: { ...partial, stopReason: "toolUse" } },
+		];
+
+		const payloads = (await collectStream(encodeStream(makeEventStream(events, partial), "gpt-5.2"))).map(
+			parseSseLine,
+		) as Array<{ choices?: Array<{ delta: { tool_calls?: Array<{ id?: string }> } }> } | string>;
+		const ids = payloads
+			.filter(
+				(p): p is { choices: Array<{ delta: { tool_calls?: Array<{ id?: string }> } }> } => typeof p === "object",
+			)
+			.flatMap(p => p.choices[0].delta.tool_calls ?? [])
+			.map(tc => tc.id)
+			.filter((id): id is string => typeof id === "string" && id.length > 0);
+		expect(ids).toEqual(["call_X0JvpoDX2wMBEwKU9g2sOpy3"]);
+	});
+
 	it("emits role chunk, text deltas, tool_call deltas with sequential indexes, then [DONE]", async () => {
 		const partial = emptyAssistant();
 		// Pre-populate partial.content so toolcall_start can look up id/name by contentIndex.
