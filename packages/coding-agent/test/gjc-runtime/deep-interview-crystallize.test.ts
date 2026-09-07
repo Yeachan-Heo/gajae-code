@@ -322,6 +322,33 @@ describe("deep-interview crystallize contract", () => {
 				}),
 			),
 		).toThrow("verbatim user anchor");
+		for (const [message, statement] of [
+			["build a go api", "build a js api"],
+			["Set timeout to 5 ms", "Set timeout to 5 s"],
+		] as const) {
+			const lowercaseSnapshot: CrystalSnapshot = {
+				revision: 1,
+				start: 0,
+				end: 0,
+				messages: [{ index: 0, role: "user", content: message }],
+				digest: "",
+			};
+			lowercaseSnapshot.digest = crystalSnapshotDigest(lowercaseSnapshot);
+			expect(() =>
+				crystallizeDeepInterview(
+					input({
+						snapshot: lowercaseSnapshot,
+						items: [
+							{
+								...input().items[0]!,
+								statement,
+								anchor: { message_index: 0, quote: message },
+							},
+						],
+					}),
+				),
+			).toThrow("verbatim user anchor");
+		}
 	});
 	it("rejects marker substrings in mixed text anchors", () => {
 		const snapshot: CrystalSnapshot = {
@@ -430,6 +457,29 @@ describe("deep-interview crystallize contract", () => {
 				}),
 			),
 		).toThrow("verbatim user anchor");
+		const independentNegativeSnapshot: CrystalSnapshot = {
+			revision: 1,
+			start: 0,
+			end: 0,
+			messages: [
+				{ index: 0, role: "user", content: "Use PostgreSQL for storage. Do not expose the database port." },
+			],
+			digest: "",
+		};
+		independentNegativeSnapshot.digest = crystalSnapshotDigest(independentNegativeSnapshot);
+		const independent = crystallizeDeepInterview(
+			input({
+				snapshot: independentNegativeSnapshot,
+				items: [
+					{
+						...input().items[0]!,
+						statement: "Use PostgreSQL for storage",
+						anchor: { message_index: 0, quote: "Use PostgreSQL for storage." },
+					},
+				],
+			}),
+		);
+		expect(independent.lifecycle).toBe("ready");
 	});
 	it("requires fresh evidence when inferred material becomes confirmed", () => {
 		const first = crystallizeDeepInterview(
@@ -504,6 +554,20 @@ describe("deep-interview crystallize contract", () => {
 			);
 			expect(resolved.lifecycle).toBe("ready");
 		}
+	});
+	it("accepts a statement-bound concrete negative gap decision", () => {
+		const gap = "Should telemetry be enabled?";
+		const answer = "Telemetry should not be enabled.";
+		const first = crystallizeDeepInterview(input({ open_gaps: [gap] }));
+		const next = withFreshUserEvidence(
+			input({
+				prior: first,
+				resolved_open_gaps: [gap],
+			}),
+			answer,
+		);
+		next.resolved_open_gap_anchors = [{ item: gap, message_index: 1, quote: answer, resolution: answer }];
+		expect(crystallizeDeepInterview(next).lifecycle).toBe("ready");
 	});
 	it("rejects unrelated unspaced CJK resolution evidence", () => {
 		const gap = "内存预算是多少？";
