@@ -11,6 +11,8 @@ export interface YieldDispatcher<P> {
 	 * another origin (review thread P2).
 	 */
 	groupKey?(entry: P): string;
+	onDrop?(entry: P): void;
+	preserveAcrossIdentity?: boolean;
 	/** Produce one batched AgentMessage from non-stale entries. Return null to skip. */
 	build(survivors: P[]): AgentMessage | null;
 }
@@ -18,7 +20,7 @@ export interface YieldDispatcher<P> {
 export interface YieldQueueOptions {
 	isStreaming: () => boolean;
 	injectStreaming(msg: AgentMessage): void;
-	injectIdle(messages: AgentMessage[], signal?: AbortSignal): Promise<void>;
+	injectIdle(messages: AgentMessage[], signal?: AbortSignal, identityIsCurrent?: () => boolean): Promise<void>;
 	scheduleIdleFlush(run: (signal?: AbortSignal) => Promise<void>, onSkip: () => void): void;
 	getIdleFlushSignal?(): AbortSignal | undefined;
 	captureIdentity?(): unknown;
@@ -30,6 +32,8 @@ type YieldFlushMode = "streaming" | "idle";
 interface StoredDispatcher {
 	isStale?: (entry: unknown) => boolean;
 	groupKey?: (entry: unknown) => string;
+	onDrop?: (entry: unknown) => void;
+	preserveAcrossIdentity: boolean;
 	build: (survivors: unknown[]) => AgentMessage | null;
 }
 
@@ -57,6 +61,8 @@ export class YieldQueue {
 		const stored: StoredDispatcher = {
 			...(dispatcher.isStale ? { isStale: entry => dispatcher.isStale?.(entry as P) ?? false } : {}),
 			...(dispatcher.groupKey ? { groupKey: entry => dispatcher.groupKey?.(entry as P) ?? "default" } : {}),
+			...(dispatcher.onDrop ? { onDrop: entry => dispatcher.onDrop?.(entry as P) } : {}),
+			preserveAcrossIdentity: dispatcher.preserveAcrossIdentity === true,
 			build: survivors => dispatcher.build(survivors as P[]),
 		};
 		this.#dispatchers.set(kind, stored);
@@ -97,10 +103,16 @@ export class YieldQueue {
 			this.#idleFlushPendingOwner = undefined;
 		}
 		const idleMessages: AgentMessage[] = [];
+		const idleIdentities: unknown[] = [];
 		for (const [kind, dispatcher] of this.#dispatchers) {
-			const entries = this.#drain(kind)
-				.filter(entry => this.#options.isIdentityCurrent?.(entry.identity) ?? true)
-				.map(entry => entry.value);
+			const drained = this.#drain(kind);
+			const admitted = drained.filter(entry => {
+				const current =
+					dispatcher.preserveAcrossIdentity || (this.#options.isIdentityCurrent?.(entry.identity) ?? true);
+				if (!current) dispatcher.onDrop?.(entry.value);
+				return current;
+			});
+			const entries = admitted.map(entry => entry.value);
 			if (entries.length === 0) continue;
 			const messages = this.#build(kind, dispatcher, entries) ?? [];
 			for (const message of messages) {
@@ -112,12 +124,17 @@ export class YieldQueue {
 					}
 				} else {
 					idleMessages.push(message);
+					idleIdentities.push(dispatcher.preserveAcrossIdentity ? undefined : admitted[0]?.identity);
 				}
 			}
 		}
 		if (mode === "idle" && idleMessages.length > 0) {
 			try {
-				await this.#options.injectIdle(idleMessages, signal ?? this.#options.getIdleFlushSignal?.());
+				await this.#options.injectIdle(idleMessages, signal ?? this.#options.getIdleFlushSignal?.(), () =>
+					idleIdentities.every(
+						identity => identity === undefined || (this.#options.isIdentityCurrent?.(identity) ?? true),
+					),
+				);
 			} catch (error) {
 				logger.warn("Yield queue idle dispatch failed", { error: formatError(error) });
 			}
