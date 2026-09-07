@@ -15,10 +15,15 @@ import * as os from "node:os";
 import type { SessionCloseTarget, SessionCreateTarget, SessionLifecycleResponse, SessionResumeTarget } from "./index";
 
 export type LifecycleCommandVerb = "session_create" | "session_close" | "session_resume";
-function normalizeLifecycleCommandToken(
-	token: string,
-	ctx: { chatType?: string; botUsername?: string } = {},
-): string | undefined {
+
+export interface LifecycleCommandContext {
+	chatType?: string;
+	botUsername?: string;
+	/** Session durably associated with the Telegram topic containing the command. */
+	threadSessionId?: string;
+}
+
+function normalizeLifecycleCommandToken(token: string, ctx: LifecycleCommandContext = {}): string | undefined {
 	const at = token.indexOf("@");
 	const command = at === -1 ? token : token.slice(0, at);
 	if (!/^\/session_(create|close|resume|recent)\b/.test(command)) return undefined;
@@ -44,8 +49,8 @@ const USAGE = [
 	"/session_create path <dir> [--mpreset <profile>]",
 	"/session_create worktree <repo> <branch> [--mpreset <profile>]",
 	"/session_create dir <newdir> [--mpreset <profile>]",
-	"/session_close <sessionId>",
-	"/session_resume <sessionId|prefix>",
+	"/session_close <sessionId> (ID optional inside its session thread)",
+	"/session_resume <sessionId|prefix> (ID optional inside its session thread)",
 	"/session_recent [create|resume]",
 ].join("\n");
 
@@ -103,10 +108,7 @@ export function isLifecycleCommandLikeText(text: string | undefined): boolean {
 }
 
 /** True when the text begins an addressable /session_* command (cheap pre-gate). */
-export function isLifecycleCommandText(
-	text: string | undefined,
-	ctx: { chatType?: string; botUsername?: string } = {},
-): boolean {
+export function isLifecycleCommandText(text: string | undefined, ctx: LifecycleCommandContext = {}): boolean {
 	if (!text) return false;
 	const [rawCommand] = text.trim().split(/\s+/, 1);
 	return normalizeLifecycleCommandToken(rawCommand ?? "", ctx) !== undefined;
@@ -139,7 +141,7 @@ function extractModelPreset(args: string[]): { positional: string[]; modelPreset
  */
 export function parseLifecycleCommand(
 	text: string | undefined,
-	ctx: { chatType?: string; botUsername?: string } = {},
+	ctx: LifecycleCommandContext = {},
 ): ParsedLifecycleCommand {
 	const tokens = tokenizeLifecycleCommand((text ?? "").trim());
 	if (!tokens) return { kind: "usage", message: USAGE };
@@ -166,6 +168,8 @@ export function parseLifecycleCommand(
 	}
 
 	if (command === "/session_close") {
+		if (args.length === 0 && ctx.threadSessionId)
+			return { kind: "close", target: { sessionId: ctx.threadSessionId } };
 		if (args.length !== 1) return { kind: "usage", message: USAGE };
 		const sessionId = args[0]!;
 		if (!isSafeIdentifier(sessionId)) {
@@ -175,6 +179,8 @@ export function parseLifecycleCommand(
 	}
 
 	if (command === "/session_resume") {
+		if (args.length === 0 && ctx.threadSessionId)
+			return { kind: "resume", target: { sessionIdOrPrefix: ctx.threadSessionId } };
 		if (args.length !== 1) return { kind: "usage", message: USAGE };
 		const idOrPrefix = args[0]!;
 		if (!isSafeIdentifier(idOrPrefix)) {

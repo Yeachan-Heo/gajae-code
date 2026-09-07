@@ -370,8 +370,13 @@ Reply paths:
   - `/session_create worktree <repo> <branch>`
   - `/session_create dir <newdir>`
   - `/session_recent [create|resume]`
-  - `/session_close <sessionId>`
-  - `/session_resume <sessionId|prefix>`
+  - `/session_close [sessionId]`
+  - `/session_resume [sessionId|prefix]`
+
+`/session_recent` labels daemon-connected sessions separately from saved
+history and prints a resume command for each saved session. The close/resume
+target is optional only inside the existing Telegram topic for that session;
+the chat root still requires an explicit ID or prefix.
 
 The removed legacy `/answer <session-tag> <answer>` flow is not the primary UX;
 Telegram topic routing identifies the target session when the configured chat

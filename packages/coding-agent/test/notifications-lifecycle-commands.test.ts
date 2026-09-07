@@ -64,6 +64,23 @@ describe("lifecycle command parser (G009)", () => {
 		expect(parseLifecycleCommand("/session_recent")).toEqual({ kind: "recent", which: "all" });
 		expect(parseLifecycleCommand("/session_recent create")).toEqual({ kind: "recent", which: "create" });
 	});
+
+	it("infers close and resume targets inside a known session thread", () => {
+		const ctx = { threadSessionId: "session-from-topic" };
+		expect(parseLifecycleCommand("/session_close", ctx)).toEqual({
+			kind: "close",
+			target: { sessionId: "session-from-topic" },
+		});
+		expect(parseLifecycleCommand("/session_resume", ctx)).toEqual({
+			kind: "resume",
+			target: { sessionIdOrPrefix: "session-from-topic" },
+		});
+		expect(parseLifecycleCommand("/session_resume")).toEqual({
+			kind: "usage",
+			message: lifecycleUsage(),
+		});
+	});
+
 	it("accepts only this bot's Telegram username suffix in non-private chats", () => {
 		const groupCtx = { chatType: "supergroup", botUsername: "GajaeCodeBot" };
 		expect(isLifecycleCommandText("/session_recent@GajaeCodeBot", groupCtx)).toBe(true);

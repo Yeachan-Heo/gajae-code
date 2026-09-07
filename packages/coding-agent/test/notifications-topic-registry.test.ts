@@ -372,6 +372,31 @@ describe("TopicRegistry", () => {
 		await expect(reg.getOrCreateTopic("s1", async () => "2")).rejects.toThrow("topic authority is archive-fenced");
 		expect(reg.get("s1")?.topicId).toBe("1");
 	});
+
+	test("resolves inactive topics only for explicit same-chat lifecycle controls", async () => {
+		const reg = new TopicRegistry({
+			version: 2,
+			registryGeneration: 1,
+			topics: {
+				s1: {
+					topicId: "1",
+					topicOrigin: "daemon_created",
+					sessionUuid: "00000000-0000-4000-8000-000000000001",
+					identitySent: true,
+					createdAt: 1,
+					authorityEpoch: 1,
+					authorityState: "inactive",
+					chatId: "42",
+					telegramBinding: { chatId: "42", transport: "telegram" },
+				},
+			},
+		});
+
+		expect(reg.sessionForTopic("1")).toBeUndefined();
+		expect(reg.sessionForLifecycleTopic("1", "42")).toBe("s1");
+		expect(reg.sessionForLifecycleTopic("1", "other-chat")).toBeUndefined();
+	});
+
 	test("clears disconnect grace before persisting an archive fence", async () => {
 		const reg = new TopicRegistry();
 		await reg.getOrCreateTopic("s1", async () => "1");

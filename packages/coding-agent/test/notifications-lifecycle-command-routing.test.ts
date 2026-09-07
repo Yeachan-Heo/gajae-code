@@ -96,10 +96,16 @@ function daemon(
 	});
 }
 
-function message(text: string, updateId: number): unknown {
+function message(text: string, updateId: number, threadId?: number): unknown {
 	return {
 		update_id: updateId,
-		message: { chat: { id: "42", type: "private" }, from: { id: 42, is_bot: false }, text, message_id: updateId },
+		message: {
+			chat: { id: "42", type: "private" },
+			from: { id: 42, is_bot: false },
+			text,
+			message_id: updateId,
+			...(threadId === undefined ? {} : { message_thread_id: threadId }),
+		},
 	};
 }
 
@@ -120,6 +126,47 @@ describe("Telegram lifecycle command routing", () => {
 		expect(JSON.stringify(botCalls)).not.toContain("token");
 		expect(factoryCalls.count).toBe(1);
 		fs.rmSync(agentDir, { recursive: true, force: true });
+	});
+
+	test("resumes the durably associated session when invoked without an id in its old thread", async () => {
+		const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-lifecycle-thread-route-"));
+		const notificationsDir = path.join(agentDir, "notifications");
+		fs.mkdirSync(notificationsDir, { recursive: true });
+		fs.writeFileSync(
+			path.join(notificationsDir, "telegram-topics.json"),
+			JSON.stringify({
+				version: 2,
+				registryGeneration: 1,
+				topics: {
+					"broker-session-1": {
+						topicId: "77",
+						topicOrigin: "daemon_created",
+						sessionUuid: "00000000-0000-4000-8000-000000000077",
+						identitySent: true,
+						createdAt: 1,
+						authorityEpoch: 1,
+						authorityState: "inactive",
+						chatId: "42",
+						telegramBinding: { chatId: "42", transport: "telegram" },
+					},
+				},
+			}),
+		);
+		const { calls, service } = lifecycleHarness();
+		const telegram = bot();
+		const daemonInstance = daemon(agentDir, telegram.api, service, { count: 0 });
+		try {
+			await daemonInstance.loadTopics();
+			await daemonInstance.handleTelegramUpdate(message("/session_resume", 13, 77));
+			expect(calls).toContainEqual(
+				expect.objectContaining({
+					operation: "session.resume",
+					target: { sessionIdOrPrefix: "broker-session-1" },
+				}),
+			);
+		} finally {
+			fs.rmSync(agentDir, { recursive: true, force: true });
+		}
 	});
 
 	test("duplicate update across daemon restart reuses one stable lifecycle request key", async () => {
@@ -177,6 +224,8 @@ describe("Telegram lifecycle command routing", () => {
 		const recent = calls.find(call => call.method === "sendMessage");
 		expect(recent?.body.parse_mode).toBe(TELEGRAM_PARSE_MODE);
 		expect(String(recent?.body.text)).toContain("broker-session-1");
+		expect(String(recent?.body.text)).toContain("saved");
+		expect(String(recent?.body.text)).toContain("/session_resume broker-session-1");
 		expect(JSON.stringify(calls)).not.toContain("endpoint");
 		expect(JSON.stringify(calls)).not.toContain("token");
 		fs.rmSync(agentDir, { recursive: true, force: true });

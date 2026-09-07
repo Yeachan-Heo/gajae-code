@@ -877,12 +877,16 @@ End-to-end manual check once `gjc notify setup` has paired your private chat:
    <branch>`, or `/session_create dir <newdir>`. The SDK lifecycle service submits
    one canonical Broker create request; the bot reports the credential-free
    outcome.
-3. `/session_recent` lists verified recent managed sessions.
+3. `/session_recent` lists verified recent managed sessions, marks whether each
+   session is connected or only saved, and includes a resume command for saved
+   sessions.
 4. `/session_close <sessionId>` asks Broker lifecycle to close the exact managed
-   session and preserves history.
+   session and preserves history. Inside that session's Telegram topic, omit the
+   ID and use `/session_close`.
 5. `/session_resume <sessionId|prefix>` resolves verified managed history,
    reattaches a live session or performs canonical Broker resume, and refuses
-   ambiguous prefixes.
+   ambiguous prefixes. Inside an existing session topic, including an inactive
+   topic left by a stopped session, omit the ID and use `/session_resume`.
 
 Commands are accepted only from the paired chat. Duplicate Telegram updates and
 replayed topic reservations reuse their original request identity; they never

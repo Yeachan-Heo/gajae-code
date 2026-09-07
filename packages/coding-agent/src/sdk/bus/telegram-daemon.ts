@@ -4821,7 +4821,11 @@ export class TelegramNotificationDaemon {
 					.catch(() => undefined);
 			}
 		};
-		const parsed = parseLifecycleCommand(text, commandCtx);
+		const threadSessionId =
+			threadId === undefined
+				? undefined
+				: this.topics.sessionForLifecycleTopic(String(threadId), String(this.opts.chatId));
+		const parsed = parseLifecycleCommand(text, { ...commandCtx, threadSessionId });
 		if (parsed.kind === "none") return false;
 		if (updateId !== undefined && this.dispatchState.seenUpdateIds.has(updateId)) return true;
 		if (updateId !== undefined) await this.rememberSeenUpdateId(updateId);
@@ -4841,7 +4845,17 @@ export class TelegramNotificationDaemon {
 					? `Recent sessions could not be verified: ${recent.message}`
 					: recent.entries.length
 						? recent.entries
-								.map(entry => `• ${code(entry.sessionId)}${entry.path ? ` (${code(entry.path)})` : ""}`)
+								.map(entry => {
+									const connected = this.#logicalSessionOwners.has(entry.sessionId);
+									return [
+										`${connected ? "🟢 connected" : "⚪ saved"} — ${code(entry.sessionId)}`,
+										entry.title ? `  ${code(entry.title)}` : undefined,
+										entry.path ? `  ${code(entry.path)}` : undefined,
+										connected ? undefined : `  Resume: ${code(`/session_resume ${entry.sessionId}`)}`,
+									]
+										.filter((line): line is string => line !== undefined)
+										.join("\n");
+								})
 								.join("\n")
 						: "No recent sessions.";
 			await replyHtml(

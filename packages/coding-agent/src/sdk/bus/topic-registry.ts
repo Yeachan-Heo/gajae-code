@@ -775,6 +775,25 @@ export class TopicRegistry {
 		return this.byTopic.get(topicId);
 	}
 
+	/**
+	 * Resolve a durable topic association for explicit lifecycle controls.
+	 *
+	 * Unlike inbound message routing, this may return an inactive session so a
+	 * user can resume it from its old topic. Ambiguous, malformed, cross-chat,
+	 * and quarantined records fail closed.
+	 */
+	sessionForLifecycleTopic(topicId: string, chatId: string): string | undefined {
+		if (!isValidTopicId(topicId)) return undefined;
+		const matches = [...this.topics].filter(
+			([, record]) =>
+				record.topicId === topicId &&
+				record.chatId === chatId &&
+				!record.bindingMalformed &&
+				record.authorityState !== "legacy_quarantined",
+		);
+		return matches.length === 1 ? matches[0]![0] : undefined;
+	}
+
 	/** All session ids with a persisted topic record. */
 	sessionIds(): string[] {
 		return [...this.topics.keys()];
