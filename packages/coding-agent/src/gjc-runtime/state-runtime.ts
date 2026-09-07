@@ -1900,62 +1900,6 @@ async function readBoundedIdentityText(
 	}
 }
 
-async function readBoundedIdentityTail(filePath: string, maxBytes: number, label: string): Promise<string | undefined> {
-	let initialStat: nodeFs.BigIntStats;
-	try {
-		initialStat = await fs.lstat(filePath, { bigint: true });
-	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
-		throw new StateCommandError(2, `failed to read ${label}: ${(error as Error).message}`);
-	}
-	if (initialStat.isSymbolicLink() || !initialStat.isFile()) return undefined;
-	const openFlags =
-		nodeFs.constants.O_RDONLY | (process.platform === "win32" ? 0 : (nodeFs.constants.O_NOFOLLOW ?? 0));
-	let handle: fs.FileHandle | undefined;
-	try {
-		handle = await fs.open(filePath, openFlags);
-		const openedStat = await handle.stat({ bigint: true });
-		const beforeReadStat = await fs.lstat(filePath, { bigint: true });
-		if (
-			openedStat.isSymbolicLink() ||
-			!openedStat.isFile() ||
-			beforeReadStat.isSymbolicLink() ||
-			!sameBoundedFileIdentity(initialStat, openedStat) ||
-			!sameBoundedFileIdentity(initialStat, beforeReadStat)
-		)
-			return undefined;
-		const size = Number(openedStat.size);
-		if (!Number.isSafeInteger(size)) return undefined;
-		const start = Math.max(0, size - maxBytes);
-		const buffer = Buffer.alloc(size - start);
-		let offset = 0;
-		while (offset < buffer.length) {
-			const { bytesRead } = await handle.read(buffer, offset, buffer.length - offset, start + offset);
-			if (bytesRead === 0) return undefined;
-			offset += bytesRead;
-		}
-		const afterReadStat = await handle.stat({ bigint: true });
-		const afterPathStat = await fs.lstat(filePath, { bigint: true });
-		if (
-			afterPathStat.isSymbolicLink() ||
-			!afterPathStat.isFile() ||
-			!sameBoundedFileIdentity(initialStat, afterReadStat) ||
-			!sameBoundedFileIdentity(initialStat, afterPathStat)
-		)
-			return undefined;
-		let text = buffer.toString("utf-8");
-		if (start > 0) {
-			const firstNewline = text.indexOf("\n");
-			text = firstNewline >= 0 ? text.slice(firstNewline + 1) : "";
-		}
-		return text;
-	} catch {
-		return undefined;
-	} finally {
-		await handle?.close().catch(() => undefined);
-	}
-}
-
 async function hashIdentityFile(filePath: string, label: string): Promise<string | undefined> {
 	let initialStat: nodeFs.BigIntStats;
 	try {
@@ -3594,6 +3538,7 @@ async function appendExecutionApprovalAuditIdempotent(
 	options: ExecutionApprovalAuditOptions,
 	entry: AuditEntry & Record<string, unknown>,
 	knownOffset?: number,
+	beforeAppend?: (offset: number) => Promise<unknown>,
 ): Promise<number | undefined> {
 	const filePath = auditPath(options.cwd, options.sessionId);
 	return withWorkflowStateLock(
@@ -3614,6 +3559,7 @@ async function appendExecutionApprovalAuditIdempotent(
 					if ((error as NodeJS.ErrnoException).code === "ENOENT") return 0;
 					throw error;
 				});
+			await beforeAppend?.(offset);
 			await appendAuditEntry(options.cwd, options.sessionId, entry, { lockHeld: true });
 			return offset;
 		},
@@ -3665,6 +3611,8 @@ async function appendExecutionApprovalAudit(
 					throw error;
 				});
 			await hooks.beforeAudit?.(offset);
+			if (process.env.GJC_STATE_APPROVAL_FAIL_BEFORE_AUDIT === "1")
+				throw new StateCommandError(1, "injected approval audit failure");
 			await appendAuditEntry(options.cwd, options.sessionId, entry, { lockHeld: true });
 		},
 		{ cwd: options.cwd },
@@ -3846,6 +3794,11 @@ async function handleApproveExecutionUnlocked(cwd: string, selectors: ResolvedSe
 						approvalOptions,
 						expectedApprovalEntry,
 						approvalAuditOffset,
+						offset =>
+							updateWorkflowTransactionJournal(cwd, selectors.gjcSessionId, approvalOptions.mutationId, {
+								steps: [...recoverySteps],
+								approval_audit_offset: offset,
+							}),
 					);
 					recoverySteps.add("approval-audit");
 				}
