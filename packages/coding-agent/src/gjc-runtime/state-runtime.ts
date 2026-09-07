@@ -3552,16 +3552,15 @@ async function appendExecutionApprovalAuditIdempotent(
 			)
 				return knownOffset;
 			if (knownOffset === undefined && (await approvalAuditContainsMutation(filePath, options.mutationId))) return;
-			const offset = await fs
-				.stat(filePath)
-				.then(stat => stat.size)
-				.catch(error => {
-					if ((error as NodeJS.ErrnoException).code === "ENOENT") return 0;
-					throw error;
-				});
-			await beforeAppend?.(offset);
-			await appendAuditEntry(options.cwd, options.sessionId, entry, { lockHeld: true });
-			return offset;
+			let appendedOffset: number | undefined;
+			await appendAuditEntry(options.cwd, options.sessionId, entry, {
+				lockHeld: true,
+				beforeAppend: async offset => {
+					appendedOffset = offset;
+					await beforeAppend?.(offset);
+				},
+			});
+			return appendedOffset;
 		},
 		{ cwd: options.cwd },
 	);
@@ -3603,17 +3602,19 @@ async function appendExecutionApprovalAudit(
 	await withWorkflowStateLock(
 		filePath,
 		async () => {
-			const offset = await fs
-				.stat(filePath)
-				.then(stat => stat.size)
-				.catch(error => {
-					if ((error as NodeJS.ErrnoException).code === "ENOENT") return 0;
-					throw error;
-				});
-			await hooks.beforeAudit?.(offset);
 			if (process.env.GJC_STATE_APPROVAL_FAIL_BEFORE_AUDIT === "1")
-				throw new StateCommandError(1, "injected approval audit failure");
-			await appendAuditEntry(options.cwd, options.sessionId, entry, { lockHeld: true });
+				await appendAuditEntry(options.cwd, options.sessionId, entry, {
+					lockHeld: true,
+					beforeAppend: async offset => {
+						await hooks.beforeAudit?.(offset);
+						throw new StateCommandError(1, "injected approval audit failure");
+					},
+				});
+			else
+				await appendAuditEntry(options.cwd, options.sessionId, entry, {
+					lockHeld: true,
+					beforeAppend: hooks.beforeAudit,
+				});
 		},
 		{ cwd: options.cwd },
 	);
