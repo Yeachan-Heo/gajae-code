@@ -530,6 +530,34 @@ describe("deep-interview crystallize contract", () => {
 				}),
 			).lifecycle,
 		).toBe("ready");
+		const unrelatedNegationSnapshot: CrystalSnapshot = {
+			revision: 1,
+			start: 0,
+			end: 0,
+			messages: [
+				{
+					index: 0,
+					role: "user",
+					content: "Use PostgreSQL for storage. PostgreSQL supports backups. Do not expose the API publicly.",
+				},
+			],
+			digest: "",
+		};
+		unrelatedNegationSnapshot.digest = crystalSnapshotDigest(unrelatedNegationSnapshot);
+		expect(
+			crystallizeDeepInterview(
+				input({
+					snapshot: unrelatedNegationSnapshot,
+					items: [
+						{
+							...input().items[0]!,
+							statement: "Use PostgreSQL for storage",
+							anchor: { message_index: 0, quote: "Use PostgreSQL for storage." },
+						},
+					],
+				}),
+			).lifecycle,
+		).toBe("ready");
 		const contractedSnapshot: CrystalSnapshot = {
 			revision: 1,
 			start: 0,
@@ -662,6 +690,14 @@ describe("deep-interview crystallize contract", () => {
 			["Package mass must be 5 kg.", "Package mass must be 5 kg.", "Package mass must be 5"],
 			["Latency must be >= 5 ms.", "Latency must be >= 5 ms.", "Latency must be <= 5 ms"],
 			["Timeout is 5 seconds.", "Timeout is 5 seconds.", "Timeout is 5"],
+			["Failure rate must be 5%.", "Failure rate must be 5%.", "Failure rate must be 5"],
+			["Limit payload to 5 MB.", "Limit payload to 5 MB.", "Limit payload to 5 Mb"],
+			["Only use PostgreSQL for storage.", "Only use PostgreSQL for storage.", "Use PostgreSQL for storage"],
+			[
+				"Use Go for the backend. Please switch to JS for the backend.",
+				"Use Go for the backend.",
+				"Use Go for the backend",
+			],
 			["Use Go. Can’t use Go; use JS.", "Use Go.", "Use Go"],
 			["Use اّdatabase for storage", "database for storage", "Use database for storage"],
 			["Use Java‍Script", "Script", "Use Script"],
