@@ -87,6 +87,7 @@ import {
 	updateWorkflowTransactionJournal,
 	type WorkflowEnvelopeIntegrityMismatch,
 	withWorkflowStateLock,
+	writeArtifact,
 	writeGuardedWorkflowEnvelopeAtomic,
 } from "./state-writer";
 import { assertSafePathComponent, CommandError, flagValue, hasFlag, isPlainObject } from "./workflow-cli-common";
@@ -1842,7 +1843,24 @@ async function assertSanctionedExecutionApprovalAudit(
 	)
 		throw new StateCommandError(2, "deep-interview execution approval lacks sanctioned transition provenance");
 
-	let raw: string;
+	const indexedApprovalPath = path.join(sessionStateDir(cwd, sessionId), "deep-interview-approval-audit.json");
+	let indexedRaw = "";
+	try {
+		const indexedStat = await fs.stat(indexedApprovalPath);
+		if (!indexedStat.isFile() || indexedStat.size > 64 * 1024)
+			throw new StateCommandError(2, "deep-interview execution approval index is invalid");
+		indexedRaw = await fs.readFile(indexedApprovalPath, "utf-8");
+		const indexedRecord: unknown = JSON.parse(indexedRaw);
+		if (!isPlainObject(indexedRecord))
+			throw new StateCommandError(2, "deep-interview execution approval index is invalid");
+		indexedRaw = `${JSON.stringify(indexedRecord)}\n`;
+	} catch (error) {
+		if (error instanceof StateCommandError) throw error;
+		const err = error as NodeJS.ErrnoException;
+		if (err.code !== "ENOENT")
+			throw new StateCommandError(2, `failed to read execution approval index: ${err.message}`);
+	}
+	let auditRaw = "";
 	try {
 		const filePath = auditPath(cwd, sessionId);
 		const stat = await fs.stat(filePath);
@@ -1857,20 +1875,22 @@ async function assertSanctionedExecutionApprovalAudit(
 				if (bytesRead === 0) throw new Error("execution approval audit ended before the bounded tail was read");
 				offset += bytesRead;
 			}
-			raw = buffer.subarray(0, offset).toString("utf-8");
+			auditRaw = buffer.subarray(0, offset).toString("utf-8");
 			if (start > 0) {
-				const firstNewline = raw.indexOf("\n");
-				raw = firstNewline >= 0 ? raw.slice(firstNewline + 1) : "";
+				const firstNewline = auditRaw.indexOf("\n");
+				auditRaw = firstNewline >= 0 ? auditRaw.slice(firstNewline + 1) : "";
 			}
 		} finally {
 			await handle.close();
 		}
 	} catch (error) {
 		const err = error as NodeJS.ErrnoException;
-		if (err.code === "ENOENT")
+		if (err.code === "ENOENT" && !indexedRaw)
 			throw new StateCommandError(2, "deep-interview execution approval lacks sanctioned approval audit record");
-		throw new StateCommandError(2, `failed to read execution approval audit: ${err.message}`);
+		if (err.code !== "ENOENT")
+			throw new StateCommandError(2, `failed to read execution approval audit: ${err.message}`);
 	}
+	const raw = `${indexedRaw}${auditRaw}`;
 
 	const found = raw.split(/\r?\n/).some(line => {
 		if (!line.trim()) return false;
@@ -3208,7 +3228,7 @@ async function appendExecutionApprovalAudit(options: {
 	revision: number;
 	receipt: WorkflowStateReceipt;
 }): Promise<void> {
-	await appendAuditEntry(options.cwd, options.sessionId, {
+	const entry = {
 		ts: options.approvedAt,
 		skill: "deep-interview",
 		category: "state",
@@ -3224,7 +3244,23 @@ async function appendExecutionApprovalAudit(options: {
 		state_revision: options.revision,
 		receipt_state_revision: options.revision,
 		receipt: options.receipt,
-	} as AuditEntry & Record<string, unknown>);
+	} as AuditEntry & Record<string, unknown>;
+	await appendAuditEntry(options.cwd, options.sessionId, entry);
+	await writeArtifact(
+		path.join(sessionStateDir(options.cwd, options.sessionId), "deep-interview-approval-audit.json"),
+		`${JSON.stringify(entry)}\n`,
+		{
+			cwd: options.cwd,
+			audit: {
+				category: "artifact",
+				verb: "write",
+				owner: "gjc-state-cli",
+				skill: "deep-interview",
+				sessionId: options.sessionId,
+				mutationId: options.mutationId,
+			},
+		},
+	);
 }
 
 async function handleApproveExecutionUnlocked(cwd: string, selectors: ResolvedSelectors): Promise<StateCommandResult> {
