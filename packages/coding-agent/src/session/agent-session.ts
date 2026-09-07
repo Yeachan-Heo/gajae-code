@@ -20470,6 +20470,7 @@ export class AgentSession {
 		},
 	): Promise<AutoCompactionTerminalStatus> {
 		if (this.#terminalPersistenceRecovery) return Promise.resolve({ kind: "skipped" });
+		if (this.#sessionTransitionKind !== undefined) return Promise.resolve({ kind: "skipped" });
 		if (this.#isDisposed || this.#sessionAdmissionClosing) return Promise.resolve({ kind: "skipped" });
 		const completion = this.#runAutoCompactionImpl(reason, willRetry, deferred, options);
 		this.#autoCompactionCompletions.add(completion);
@@ -20490,6 +20491,13 @@ export class AgentSession {
 			resourceRunId?: string;
 		},
 	): Promise<AutoCompactionTerminalStatus> {
+		const compactionSessionId = this.sessionId;
+		const compactionSessionIdentityEpoch = this.#sessionIdentityEpoch;
+		const compactionIdentityIsCurrent = (): boolean =>
+			this.#sessionTransitionKind === undefined &&
+			this.sessionId === compactionSessionId &&
+			this.#sessionIdentityEpoch === compactionSessionIdentityEpoch;
+		if (!compactionIdentityIsCurrent()) return { kind: "skipped" };
 		const compactionSettings = this.settings.getGroup("compaction");
 		// `force` is the non-disableable emergency floor (F6): it bypasses the user's
 		// disabled/off settings so a resource-floor breach still compacts before OOM.
@@ -20538,11 +20546,17 @@ export class AgentSession {
 		};
 
 		try {
-			if (autoCompactionSignal.aborted) return { kind: "aborted", source: "signal" };
+			if (autoCompactionSignal.aborted || !compactionIdentityIsCurrent())
+				return { kind: "aborted", source: "signal" };
 			await this.#emitSessionEvent({ type: "auto_compaction_start", reason, action });
 			if (autoCompactionSignal.aborted) return await emitAborted();
 			const compactionStateSnapshot = await this.#compactionStateSnapshot({ trackWorkflowRecoveryProgress: true });
-			if (autoCompactionSignal.aborted || this.#isDisposed || this.#promptGeneration !== generation) {
+			if (
+				autoCompactionSignal.aborted ||
+				!compactionIdentityIsCurrent() ||
+				this.#isDisposed ||
+				this.#promptGeneration !== generation
+			) {
 				return await emitAborted();
 			}
 
@@ -20893,7 +20907,7 @@ export class AgentSession {
 				preserveData = { ...(compactionPrep.preserveData ?? {}), ...(compactResult.preserveData ?? {}) };
 			}
 
-			if (autoCompactionSignal.aborted) {
+			if (autoCompactionSignal.aborted || !compactionIdentityIsCurrent()) {
 				await this.#emitSessionEvent({
 					type: "auto_compaction_end",
 					action,
@@ -20905,6 +20919,7 @@ export class AgentSession {
 			}
 
 			this.#assertTerminalPersistenceSettledForHistoryMutation();
+			if (!compactionIdentityIsCurrent()) return await emitAborted();
 			const compactionEntryId = this.sessionManager.appendCompaction(
 				summary,
 				shortSummary,
