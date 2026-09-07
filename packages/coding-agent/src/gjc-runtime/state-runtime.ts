@@ -87,6 +87,7 @@ import {
 	softDelete,
 	updateWorkflowTransactionJournal,
 	type WorkflowEnvelopeIntegrityMismatch,
+	type WorkflowTransactionJournal,
 	withWorkflowStateLock,
 	writeArtifact,
 	writeGuardedWorkflowEnvelopeAtomic,
@@ -2980,7 +2981,7 @@ async function handleHandoffUnlocked(
 		callerReceiptForRetry && typeof callerReceiptForRetry.mutation_id === "string"
 			? callerReceiptForRetry.mutation_id
 			: undefined;
-	let retryJournal: Awaited<ReturnType<typeof readWorkflowTransactionJournal>>;
+	let retryJournal: WorkflowTransactionJournal | undefined;
 	if (exactRecovery && retryMutationId) {
 		try {
 			retryJournal = await readWorkflowTransactionJournal(cwd, sessionId, retryMutationId);
