@@ -8268,9 +8268,14 @@ export class AgentSession {
 		sdkOwnership?: SdkContinuationOwnership;
 		/** Disable managed fallback retries for this continuation (used for terminal server-initiated turns). */
 		disableManagedFallback?: boolean;
+		/** Internal session identity retained across selection-fence deferral. */
+		scheduledSessionId?: string;
+		scheduledSessionIdentityEpoch?: number;
 	}): Promise<void> {
 		const continuationAdmission = this.#captureScheduledContinuationAdmission();
 		const scheduledSdkOwnership = options?.sdkOwnership;
+		const scheduledSessionId = options?.scheduledSessionId ?? this.sessionId;
+		const scheduledSessionIdentityEpoch = options?.scheduledSessionIdentityEpoch ?? this.#sessionIdentityEpoch;
 		const selectionFenceGeneration =
 			options?.selectionFenceGeneration ??
 			this.#selectionFenceGenerationContext.getStore() ??
@@ -8293,6 +8298,8 @@ export class AgentSession {
 						selectionFenceGeneration,
 						deferredPredecessorAgentEnd,
 						sdkOwnership: scheduledSdkOwnership,
+						scheduledSessionId,
+						scheduledSessionIdentityEpoch,
 					});
 				} finally {
 					// The recursive call synchronously re-reserved its settlement
@@ -8346,6 +8353,13 @@ export class AgentSession {
 										return false;
 									}
 									if (scheduledGeneration !== undefined && this.#promptGeneration !== scheduledGeneration) {
+										skip("generation_changed");
+										return false;
+									}
+									if (
+										this.sessionId !== scheduledSessionId ||
+										this.#sessionIdentityEpoch !== scheduledSessionIdentityEpoch
+									) {
 										skip("generation_changed");
 										return false;
 									}
@@ -8404,6 +8418,7 @@ export class AgentSession {
 										skip("handoff_in_progress");
 										return;
 									}
+									if (!canContinue()) return;
 									this.#assertNoSessionTransition();
 									const predecessorAgentEnd =
 										this.#claimDeferredAgentEndForContinuation(predecessorAgentEndHold);
