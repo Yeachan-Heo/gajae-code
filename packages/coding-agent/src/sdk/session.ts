@@ -4824,6 +4824,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		const sessionAsyncJobManager = asyncJobManager;
 		if (sessionAsyncJobManager) {
 			session.yieldQueue.register<AsyncResultEntry>("async-result", {
+				onDrop: entry => sessionAsyncJobManager.releaseDeliveryClaim(entry.generation),
 				isStale: entry => {
 					const stale = sessionAsyncJobManager.isDeliverySuppressed(entry.jobId, entry.generation);
 					if (stale) sessionAsyncJobManager.releaseDeliveryClaim(entry.generation);
@@ -4846,6 +4847,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			});
 		}
 		session.yieldQueue.register<McpNotificationEntry>("mcp-notification", {
+			preserveAcrossIdentity: true,
 			build: buildMcpNotificationBatchMessage,
 		});
 
