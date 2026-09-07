@@ -3672,9 +3672,16 @@ async function handleApproveExecutionUnlocked(cwd: string, selectors: ResolvedSe
 					64 * 1024,
 					"deep-interview execution approval index",
 				);
-				if (!indexed) {
-					await writeExecutionApprovalIndex(approvalOptions, buildExecutionApprovalAuditEntry(approvalOptions));
+				const expectedApprovalEntry = buildExecutionApprovalAuditEntry(approvalOptions);
+				let indexedMatches = false;
+				if (indexed) {
+					try {
+						const parsed: unknown = JSON.parse(indexed);
+						indexedMatches =
+							isPlainObject(parsed) && JSON.stringify(parsed) === JSON.stringify(expectedApprovalEntry);
+					} catch {}
 				}
+				if (!indexedMatches) await writeExecutionApprovalIndex(approvalOptions, expectedApprovalEntry);
 				await updateWorkflowTransactionJournal(cwd, selectors.gjcSessionId, existingReceipt.mutation_id, {
 					steps: [...new Set([...pendingJournal.steps, "approval-index"])],
 				});
