@@ -719,7 +719,6 @@ export class ChatEffectJournal {
 		}
 		return input;
 	}
-	}
 
 	async #pruneTerminal(): Promise<void> {
 		const terminal = (await this.list())

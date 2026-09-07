@@ -3398,19 +3398,10 @@ export class Broker {
 							typeof replayResult?.endpointIncarnation === "string" &&
 							/^[a-f0-9]{64}$/.test(replayResult.endpointIncarnation)
 								? replayResult.endpointIncarnation
-								: endpointIncarnation(
-										{
-											endpointGeneration: replayResult?.endpointGeneration as number,
-											endpointMtimeMs: replayResult?.endpointMtimeMs as number,
-											pid: replayResult?.pid as number,
-										},
-										replaySessionId,
-									);
-						if (!replayIncarnation)
-							return error("endpoint_stale", "lifecycle replay lacks original endpoint authority");
+								: undefined;
 						const refreshed = await this.#readLifecycleReplayEndpoint(replaySessionId);
 						if (isBrokerResponse(refreshed)) return refreshed;
-						if (refreshed.endpointIncarnation !== replayIncarnation)
+						if (replayIncarnation !== undefined && refreshed.endpointIncarnation !== replayIncarnation)
 							return error("endpoint_stale", "lifecycle replay target was replaced");
 						const { endpointFileId: _staleEndpointFileId, ...replayBase } = replay.result as Record<
 							string,

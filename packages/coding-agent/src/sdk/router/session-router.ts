@@ -2,7 +2,7 @@ import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { logger, resolveEquivalentPath } from "@gajae-code/utils";
-import { endpointIncarnation, matchesIndexedEndpointFile } from "../broker/endpoint-authority";
+import { endpointIncarnation } from "../broker/endpoint-authority";
 import {
 	canonicalSessionCwd,
 	SessionIndex as DefaultSessionIndex,

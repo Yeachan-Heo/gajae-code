@@ -5586,6 +5586,10 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		};
 	}
 
+	function retirementBrokerRequestKey(creationKeyDigest: string, proof: CreationRetirementProofV1): string {
+		return `coordinator-retire:${creationKeyDigest}:${createHash("sha256").update(canonicalJson(proof)).digest("hex")}`;
+	}
+
 	function coordinatorRetiredResponse(sessionId: string, lifecycle: Record<string, unknown>): Record<string, unknown> {
 		return { ok: true, session_id: sessionId, retired: true, lifecycle };
 	}
@@ -9511,15 +9515,20 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 										);
 									lifecycle = publicRetirementProof(staged);
 								} else {
-									const brokerRequestKey = `coordinator-retire:${creationKeyDigest}:${createHash("sha256")
-										.update(JSON.stringify(proof))
-										.digest("hex")}`;
-									await recordCreationRetirementIntent(
+									const stagedCreation = await recordCreationRetirementIntent(
 										questionPaths,
 										creationKeyDigest,
 										proof,
 										retirementKeyDigest,
 									);
+									const storedProof = stagedCreation.retirement_intent?.proof;
+									if (!storedProof)
+										throw new SdkClientError(
+											"state_corrupt",
+											"Retirement intent was not durably staged before broker admission.",
+										);
+									proof = storedProof;
+									const brokerRequestKey = retirementBrokerRequestKey(creationKeyDigest, proof);
 									const acknowledgement = await brokerSession(
 										cwd,
 										"session.reconcile_uncertain",

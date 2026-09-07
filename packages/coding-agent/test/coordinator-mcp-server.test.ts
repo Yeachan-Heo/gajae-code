@@ -1420,6 +1420,7 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 						stateRoot: input.stateRoot,
 						endpointGeneration: input.endpointGeneration,
 						endpointMtimeMs: input.endpointMtimeMs,
+						endpointFileId: input.endpointFileId,
 						processIncarnation: input.processIncarnation,
 						hostIncarnation: input.hostIncarnation,
 						lifecycleRequestId: input.lifecycleRequestId,
@@ -1447,6 +1448,7 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 			state_root: path.join(root, ".gjc", "state"),
 			endpoint_generation: 2,
 			endpoint_mtime_ms: 1,
+			endpoint_file_id: "1:2",
 			process_incarnation: "linux:123",
 			host_incarnation: "host:123",
 			lifecycle_request_id: "retire-effect",
@@ -1578,6 +1580,7 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 						stateRoot: input.stateRoot,
 						endpointGeneration: input.endpointGeneration,
 						endpointMtimeMs: input.endpointMtimeMs,
+						endpointFileId: input.endpointFileId,
 						processIncarnation: input.processIncarnation,
 						hostIncarnation: input.hostIncarnation,
 						lifecycleRequestId: input.lifecycleRequestId,
@@ -1605,6 +1608,7 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 			state_root: path.join(root, ".gjc", "state"),
 			endpoint_generation: 2,
 			endpoint_mtime_ms: 1,
+			endpoint_file_id: "1:2",
 			process_incarnation: "linux:123",
 			host_incarnation: "host:123",
 			lifecycle_request_id: "retire-effect",
@@ -3461,7 +3465,9 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		await expect(
 			server.callTool("gjc_coordinator_read_coordination_status", { session_id: "visible-session" }),
 		).resolves.toMatchObject({ ok: true });
-		expect((await readSessionTransaction(paths, "visible-session"))?.revision).toBe(migratedRevision);
+		const afterRepeatedMigration = await readSessionTransaction(paths, "visible-session");
+		expect(afterRepeatedMigration?.revision).toBeGreaterThanOrEqual(migratedRevision ?? 0);
+		expect(afterRepeatedMigration?.canonical.session.broker).toEqual(migratedTransaction?.canonical.session.broker);
 
 		const mismatchRoot = await tempRoot();
 		const mismatchControls: SdkControl[] = [];

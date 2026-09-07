@@ -3775,7 +3775,7 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 		);
 	});
 
-	it("does not re-close a notify replacement opened during old-root terminalization", async () => {
+	it("does not re-close a notify replacement queued during old-root terminalization", async () => {
 		let commands = 0;
 		await withDaemon(
 			async (daemon, _fake) => {
@@ -3796,7 +3796,10 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 					await daemon.postRoot("session", "root");
 					const closing = daemon.close("session");
 					await closeCommitted.promise;
-					await daemon.notify("session", "replacement notification");
+					const replacementNotification = daemon.notify("session", "replacement notification");
+					releaseClose.resolve();
+					await closing;
+					await replacementNotification;
 					const replacement = await daemon.findSession("session", true);
 					if (!replacement?.record.rootTs) throw new Error("Replacement root was not created");
 					await daemon.handleEnvelope(
@@ -3820,8 +3823,6 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 					});
 					const replacementClosing = daemon.close("session");
 					await replacementCloseLookup.promise;
-					releaseClose.resolve();
-					await closing;
 					await daemon.handleEnvelope(
 						messageEnvelope("overlap-new", "overlap-new-event", replacement.record.rootTs, {
 							clientMsgId: "overlap-new-id",

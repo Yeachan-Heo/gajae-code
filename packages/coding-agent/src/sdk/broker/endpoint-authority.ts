@@ -39,6 +39,7 @@ export function endpointIncarnation(
 	return createHash("sha256")
 		.update(
 			JSON.stringify({
+				...(record.endpointFileId === undefined ? {} : { endpointFileId: record.endpointFileId }),
 				endpointGeneration: record.endpointGeneration,
 				// Filesystem mtime is only millisecond-precise, and the two stat
 				// spellings used across this path (bigint mtimeNs/1e6 vs libuv

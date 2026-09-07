@@ -561,10 +561,16 @@ function sessionResult(value: unknown, expectedSessionId?: string): SessionLifec
 	} = { sessionId, ...sessionEndpointProjection(record) };
 	if (typeof record.cwd === "string") result.cwd = record.cwd;
 	const endpointGeneration = record.endpointGeneration;
-	if (typeof endpointGeneration === "number" && Number.isSafeInteger(endpointGeneration) && endpointGeneration > 0)
+	if (
+		typeof record.endpointFileId === "string" &&
+		record.endpointFileId.length > 0 &&
+		typeof endpointGeneration === "number" &&
+		Number.isSafeInteger(endpointGeneration) &&
+		endpointGeneration > 0
+	) {
 		result.endpointGeneration = endpointGeneration;
-	if (typeof record.endpointFileId === "string" && record.endpointFileId.length > 0)
 		result.endpointFileId = record.endpointFileId;
+	}
 	if (typeof record.reused === "boolean") result.reused = record.reused;
 	if (typeof record.note === "string") result.note = record.note;
 	return result;
