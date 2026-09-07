@@ -653,6 +653,10 @@ describe("deep-interview crystallize contract", () => {
 			["Use Go. Switch to C++.", "Use Go.", "Use Go"],
 			["Use Go. Don’t use Go; use JS.", "Use Go.", "Use Go"],
 			["Don’t deploy to production.", "Don’t deploy to production.", "Deploy to production"],
+			["Can’t store audit logs.", "Can’t store audit logs.", "Can store audit logs"],
+			["Latency should be at least 5 ms.", "Latency should be at least 5 ms.", "Latency should be 5 ms"],
+			["Budget is $5 million.", "Budget is $5 million.", "Budget is €5 million"],
+			["Package mass must be 5 kg.", "Package mass must be 5 kg.", "Package mass must be 5 g"],
 			["Use اّdatabase for storage", "database for storage", "Use database for storage"],
 			["Use Java‍Script", "Script", "Use Script"],
 		] as const) {
@@ -781,6 +785,21 @@ describe("deep-interview crystallize contract", () => {
 				{ item: gap, message_index: 1, quote: conditionalAnswer, resolution: conditionalAnswer },
 			];
 			expect(() => crystallizeDeepInterview(conditional)).toThrow("fresh verbatim user anchor");
+		}
+	});
+	it("rejects superseded and partial-token gap resolution anchors", () => {
+		const gap = "Which SQL database?";
+		const first = crystallizeDeepInterview(input({ open_gaps: [gap] }));
+		for (const { content, quote } of [
+			{
+				content: "Use PostgreSQL database. Actually use MySQL database.",
+				quote: "Use PostgreSQL database.",
+			},
+			{ content: "NoSQL database: MongoDB", quote: "SQL database: MongoDB" },
+		]) {
+			const next = withFreshUserEvidence(input({ prior: first, resolved_open_gaps: [gap] }), content);
+			next.resolved_open_gap_anchors = [{ item: gap, message_index: 1, quote, resolution: quote }];
+			expect(() => crystallizeDeepInterview(next)).toThrow("fresh verbatim user anchor");
 		}
 	});
 	it("rejects unrelated unspaced CJK resolution evidence", () => {
@@ -1486,6 +1505,25 @@ describe("deep-interview crystallize contract", () => {
 		);
 		expect(carried.pending_removals).toEqual(["constraint:latency"]);
 		expect(carried.lifecycle).toBe("needs-questions");
+		const keepIndex = pending.source.end + 1;
+		const cancelled = withFreshUserEvidence(
+			input({
+				prior: pending,
+				items: [
+					first.items[0]!,
+					{
+						...first.items[1]!,
+						anchor: { message_index: keepIndex, quote: "Keep the fast constraint." },
+					},
+				],
+				snapshot: pending.source,
+				current_revision: pending.source.revision,
+			}),
+			"Keep the fast constraint.",
+		);
+		const cancelledCrystal = crystallizeDeepInterview(cancelled);
+		expect(cancelledCrystal.lifecycle).toBe("ready");
+		expect(cancelledCrystal.pending_removals ?? []).toEqual([]);
 	});
 
 	it("rejects removal evidence that is stale, non-user, or not statement-bound", () => {
