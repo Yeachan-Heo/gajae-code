@@ -1182,8 +1182,9 @@ describe("gjc state handoff", () => {
 				paths: [callerPath, calleePath, activePath],
 			});
 			await updateWorkflowTransactionJournal(cwd, TEST_SESSION_ID, mutationId, {
-				steps: ["callee-mode-state", "caller-mode-state", "active-state"],
+				steps: ["callee-mode-state", "caller-mode-state", "active-state", "handoff-audit"],
 			});
+			await fs.appendFile(auditPath(cwd, TEST_SESSION_ID), `${"x".repeat(2 * 1024 * 1024)}\n`);
 			const retried = await runNativeStateCommand(
 				["handoff", "--mode", "deep-interview", "--to", "ralplan", "--json"],
 				cwd,
