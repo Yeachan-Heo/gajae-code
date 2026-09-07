@@ -608,6 +608,8 @@ function evidenceTerms(value: string): Set<string> {
 			.map(part => part.segment.toLowerCase())
 			.filter(term => !ignored.has(term) || SEMANTIC_EVIDENCE_TERMS.has(term)),
 	);
+	for (const match of canonical.matchAll(/(?:\b[A-Za-z][A-Za-z0-9]*\.[A-Za-z0-9.]+\b|\b[A-Za-z][+#]{1,2})/g))
+		terms.add(match[0].toLowerCase());
 	for (const negator of CJK_NEGATOR_TERMS) if (normalized.includes(negator)) terms.add(negator);
 	return terms;
 }
