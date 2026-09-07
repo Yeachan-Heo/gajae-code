@@ -1073,6 +1073,52 @@ describe("gjc state handoff", () => {
 		});
 	});
 
+	it("accepts sanctioned ralplan final admission after unapproved Crystal refinement", async () => {
+		await withTempCwd(async cwd => {
+			await writePublishedReadyCrystal(cwd);
+			expect(
+				(await runNativeStateCommand(["handoff", "--mode", "deep-interview", "--to", "ralplan", "--json"], cwd))
+					.status,
+			).toBe(0);
+			const ralplanPath = modeStatePath(cwd, TEST_SESSION_ID, "ralplan");
+			const ralplan = (await readJson(ralplanPath)) as Record<string, unknown>;
+			const admittedAt = "2026-06-04T00:00:00.000Z";
+			const admitted = stampWorkflowEnvelopeChecksum(
+				{
+					...ralplan,
+					active: true,
+					current_phase: "handoff",
+					auto_handoff: {
+						configuredTarget: "ultragoal",
+						effectiveTarget: "ultragoal",
+						degradationReason: null,
+						source: "project",
+					},
+					receipt: {
+						version: 1,
+						skill: "ralplan",
+						owner: "gjc-runtime",
+						command: "gjc ralplan final-admission",
+						state_path: ralplanPath,
+						storage_path: ralplanPath,
+						mutated_at: admittedAt,
+						fresh_until: admittedAt,
+						status: "fresh",
+						mutation_id: `ralplan:final-admission:${admittedAt}`,
+					},
+				},
+				ralplanPath,
+				admittedAt,
+			);
+			await writeJson(ralplanPath, admitted);
+			const result = await runNativeStateCommand(
+				["handoff", "--mode", "ralplan", "--to", "ultragoal", "--json"],
+				cwd,
+			);
+			expect(result.status, result.stderr).toBe(0);
+		});
+	});
+
 	it("rejects missing --to", async () => {
 		await withTempCwd(async cwd => {
 			await writeJson(modeStatePath(cwd, TEST_SESSION_ID, "deep-interview"), {
@@ -1524,6 +1570,21 @@ describe("gjc state handoff", () => {
 			expect(result.status).toBe(2);
 			expect(result.stderr).toContain("sanctioned transition provenance");
 			await expect(fs.access(modeStatePath(cwd, TEST_SESSION_ID, "ultragoal"))).rejects.toThrow();
+		});
+	});
+
+	it("finds execution approval in a bounded tail of a large audit ledger", async () => {
+		await withTempCwd(async cwd => {
+			await writePublishedReadyCrystal(cwd);
+			expect((await runNativeDeepInterviewCommand(["approve-execution", "--json"], cwd)).status).toBe(0);
+			const ledgerPath = auditPath(cwd, TEST_SESSION_ID);
+			const approvalLedger = await fs.readFile(ledgerPath, "utf8");
+			await fs.writeFile(ledgerPath, `${"x".repeat(2 * 1024 * 1024)}\n${approvalLedger}`);
+			const result = await runNativeStateCommand(
+				["handoff", "--mode", "deep-interview", "--to", "ultragoal", "--json"],
+				cwd,
+			);
+			expect(result.status, result.stderr).toBe(0);
 		});
 	});
 
