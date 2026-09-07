@@ -5403,10 +5403,9 @@ test("idempotent lifecycle replay refreshes unchanged authority after a broker r
 				result: {
 					sessionId,
 					cwd: root,
-					endpointGeneration: 1,
-					pid: host.pid + 1,
-					endpointMtimeMs: 1,
-					endpointFileId: "stale:identity",
+					endpointGeneration: 2,
+					pid: host.pid,
+					endpointMtimeMs: exactMtimeMs,
 					reused: true,
 				},
 			},
@@ -5428,6 +5427,26 @@ test("idempotent lifecycle replay refreshes unchanged authority after a broker r
 					token: "successor-token",
 				},
 			},
+		});
+		const replacedLegacyKey = "replay-authority-replaced-legacy";
+		const replacedLegacy = await deriveIdempotencyIdentity(agentDir, "session.resume", replacedLegacyKey, targetHash);
+		expect(await restarted.ledger.begin(replacedLegacy, requestHash)).toMatchObject({ kind: "new" });
+		await restarted.ledger.transition(replacedLegacy, "terminal_ok", {
+			response: {
+				ok: true,
+				result: {
+					sessionId,
+					cwd: root,
+					endpointGeneration: 1,
+					pid: host.pid + 1,
+					endpointMtimeMs: 1,
+					reused: true,
+				},
+			},
+		});
+		expect(await restarted.handleRequest("session.resume", { cwd: root, sessionId }, replacedLegacyKey)).toEqual({
+			ok: false,
+			error: { code: "endpoint_stale", message: "lifecycle replay target was replaced" },
 		});
 		const malformedReplayKey = "replay-authority-malformed-session";
 		const malformedReplayIdentity = await deriveIdempotencyIdentity(

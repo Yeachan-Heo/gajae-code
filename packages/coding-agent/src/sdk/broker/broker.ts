@@ -784,6 +784,35 @@ function sameEndpointRecord(expected: IndexedSession, current: IndexedSession): 
 	);
 }
 
+function matchesLegacyLifecycleReplayAuthority(
+	result: Record<string, unknown>,
+	refreshed: LifecycleReplayEndpoint,
+): boolean {
+	const endpointGeneration = result.endpointGeneration;
+	const pid = result.pid;
+	const endpointMtimeMs = result.endpointMtimeMs;
+	const endpointFileId = result.endpointFileId;
+	if (
+		typeof endpointGeneration !== "number" ||
+		!Number.isSafeInteger(endpointGeneration) ||
+		endpointGeneration <= 0 ||
+		typeof pid !== "number" ||
+		!Number.isSafeInteger(pid) ||
+		pid <= 0 ||
+		typeof endpointMtimeMs !== "number" ||
+		!Number.isFinite(endpointMtimeMs) ||
+		endpointMtimeMs <= 0 ||
+		(endpointFileId !== undefined && (typeof endpointFileId !== "string" || endpointFileId.length === 0))
+	)
+		return false;
+	if (endpointGeneration !== refreshed.endpointGeneration || pid !== refreshed.pid) return false;
+	if (typeof endpointFileId === "string")
+		return (
+			endpointFileId === refreshed.endpointFileId && Math.abs(endpointMtimeMs - refreshed.endpointMtimeMs) <= 0.001
+		);
+	return endpointMtimeMs === refreshed.endpointMtimeMs;
+}
+
 const BROKER_SESSION_CONTROL_FIELDS = new Set(["sessionId", "operation", "input", "confirm"]);
 const BROKER_SESSION_CONTROL_ABORT_FIELDS = new Set(["mode", "scope", "operator"]);
 const BROKER_SESSION_CONTROL_TIMEOUT_MS = 10_000;
@@ -3401,7 +3430,11 @@ export class Broker {
 								: undefined;
 						const refreshed = await this.#readLifecycleReplayEndpoint(replaySessionId);
 						if (isBrokerResponse(refreshed)) return refreshed;
-						if (replayIncarnation !== undefined && refreshed.endpointIncarnation !== replayIncarnation)
+						if (
+							(replayIncarnation !== undefined && refreshed.endpointIncarnation !== replayIncarnation) ||
+							(replayIncarnation === undefined &&
+								(!replayResult || !matchesLegacyLifecycleReplayAuthority(replayResult, refreshed)))
+						)
 							return error("endpoint_stale", "lifecycle replay target was replaced");
 						const { endpointFileId: _staleEndpointFileId, ...replayBase } = replay.result as Record<
 							string,
