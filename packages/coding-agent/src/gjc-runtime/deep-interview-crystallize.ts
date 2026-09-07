@@ -370,11 +370,21 @@ function hasLaterSupersedingCorrection(content: string, quote: string, statement
 		/^\s*[.!?。！？]*\s*(?:no|not)\s*[,;:.!?。！？]?\s*(?:use|make|choose|select|switch|change|replace)\b/i.test(
 			later,
 		);
+	const followingClauses = following.split(/[.!?。！？;\n]+/u).filter(clause => clause.trim() !== "");
+	const negativeCorrection =
+		/\b(?:no|not|never|cannot|can['’]t|won['’]t|don['’]t|doesn['’]t|isn['’]t|aren['’]t|wasn['’]t|weren['’]t|shouldn['’]t|mustn['’]t|needn['’]t|do\s+not)\b/i;
 	const explicitNegativeReplacement =
-		/\b(?:no|not|never|cannot|can['’]t|won['’]t|don['’]t|doesn['’]t|isn['’]t|aren['’]t|wasn['’]t|weren['’]t|shouldn['’]t|mustn['’]t|needn['’]t|do\s+not)\b/i.test(
-			followingClause,
-		) &&
-		(topicOverlap || directNegativeReplacement);
+		directNegativeReplacement ||
+		followingClauses.some((clause, index) => {
+			if (!negativeCorrection.test(clause)) return false;
+			const clauseTerms = evidenceTerms(clause);
+			if ([...topicTerms(statement, false)].some(term => clauseTerms.has(term))) return true;
+			const previousClause = index > 0 ? followingClauses[index - 1]! : "";
+			return (
+				/\b(?:it|this|that|them|these|those)\b/i.test(clause) &&
+				[...topicTerms(statement, false)].some(term => evidenceTerms(previousClause).has(term))
+			);
+		});
 	const positiveReplacementMatch =
 		/(?:(?:switch|change)\s+to\s+([A-Za-z0-9][A-Za-z0-9+#.-]*)|replace\b[^.!?。！？]*\bwith\s+([A-Za-z0-9][A-Za-z0-9+#.-]*))/i.exec(
 			followingClause,
