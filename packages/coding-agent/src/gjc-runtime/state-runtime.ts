@@ -1847,18 +1847,48 @@ async function assertSanctionedExecutionApprovalAudit(
 	const indexedApprovalPath = path.join(sessionStateDir(cwd, sessionId), "deep-interview-approval-audit.json");
 	let indexedRaw = "";
 	try {
-		const handle = await fs.open(indexedApprovalPath, nodeFs.constants.O_RDONLY | nodeFs.constants.O_NOFOLLOW);
+		const sameFileIdentity = (left: nodeFs.BigIntStats, right: nodeFs.BigIntStats): boolean =>
+			left.dev === right.dev &&
+			left.ino === right.ino &&
+			left.mode === right.mode &&
+			left.size === right.size &&
+			left.mtimeNs === right.mtimeNs &&
+			left.ctimeNs === right.ctimeNs &&
+			left.nlink === right.nlink;
+		const initialStat = await fs.lstat(indexedApprovalPath, { bigint: true });
+		if (initialStat.isSymbolicLink() || !initialStat.isFile())
+			throw new StateCommandError(2, "deep-interview execution approval index is invalid");
+		const openFlags =
+			nodeFs.constants.O_RDONLY | (process.platform === "win32" ? 0 : (nodeFs.constants.O_NOFOLLOW ?? 0));
+		const handle = await fs.open(indexedApprovalPath, openFlags);
 		try {
-			const indexedStat = await handle.stat();
-			if (!indexedStat.isFile() || indexedStat.size > 64 * 1024)
+			const indexedStat = await handle.stat({ bigint: true });
+			const beforeReadStat = await fs.lstat(indexedApprovalPath, { bigint: true });
+			if (
+				indexedStat.isSymbolicLink() ||
+				!indexedStat.isFile() ||
+				beforeReadStat.isSymbolicLink() ||
+				!sameFileIdentity(initialStat, indexedStat) ||
+				!sameFileIdentity(initialStat, beforeReadStat) ||
+				indexedStat.size > 64n * 1024n
+			)
 				throw new StateCommandError(2, "deep-interview execution approval index is invalid");
-			const buffer = Buffer.alloc(indexedStat.size);
+			const buffer = Buffer.alloc(Number(indexedStat.size));
 			let offset = 0;
 			while (offset < buffer.length) {
 				const { bytesRead } = await handle.read(buffer, offset, buffer.length - offset, offset);
 				if (bytesRead === 0) throw new StateCommandError(2, "deep-interview execution approval index is invalid");
 				offset += bytesRead;
 			}
+			const afterReadStat = await handle.stat({ bigint: true });
+			const afterPathStat = await fs.lstat(indexedApprovalPath, { bigint: true });
+			if (
+				afterPathStat.isSymbolicLink() ||
+				!afterPathStat.isFile() ||
+				!sameFileIdentity(initialStat, afterReadStat) ||
+				!sameFileIdentity(initialStat, afterPathStat)
+			)
+				throw new StateCommandError(2, "deep-interview execution approval index is invalid");
 			indexedRaw = buffer.subarray(0, offset).toString("utf-8");
 		} finally {
 			await handle.close();
