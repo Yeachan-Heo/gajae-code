@@ -1559,7 +1559,7 @@ export async function appendAuditEntry(
 	cwd: string,
 	sessionIdOrEntry: string | AuditEntry,
 	maybeEntry?: AuditEntry,
-	options: { lockHeld?: boolean } = {},
+	options: { lockHeld?: boolean; beforeAppend?: (offset: number) => Promise<unknown> } = {},
 ): Promise<string> {
 	const sessionId =
 		typeof sessionIdOrEntry === "string"
@@ -1599,6 +1599,9 @@ export async function appendAuditEntry(
 				!sameObject(openedStat, pathStat)
 			)
 				throw new Error("audit path identity changed before append");
+			if (openedStat.size > BigInt(Number.MAX_SAFE_INTEGER))
+				throw new Error("audit path is too large to append safely");
+			await options.beforeAppend?.(Number(openedStat.size));
 			await handle.writeFile(`${JSON.stringify(entry)}\n`, "utf-8");
 			await handle.sync();
 			const afterPathStat = await fs.lstat(filePath, { bigint: true });
