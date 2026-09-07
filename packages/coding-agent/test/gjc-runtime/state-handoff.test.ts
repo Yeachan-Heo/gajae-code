@@ -1877,6 +1877,22 @@ describe("gjc state handoff", () => {
 			const retried = await runNativeDeepInterviewCommand(["approve-execution", "--json"], cwd);
 			expect(retried.status, retried.stderr).toBe(0);
 			expect(await fs.readFile(approvalAuditPath, "utf8")).toContain('"verb":"approve-execution"');
+			const specializedRows = () =>
+				fs.readFile(approvalAuditPath, "utf8").then(raw =>
+					raw
+						.split(/\r?\n/)
+						.filter(Boolean)
+						.map(line => JSON.parse(line) as Record<string, unknown>)
+						.filter(
+							entry =>
+								entry.verb === "approve-execution" &&
+								entry.mutation_id === approvalReceipt.mutation_id &&
+								entry.approved_at !== undefined,
+						),
+				);
+			expect(await specializedRows()).toHaveLength(1);
+			expect((await runNativeDeepInterviewCommand(["approve-execution", "--json"], cwd)).status).toBe(0);
+			expect(await specializedRows()).toHaveLength(1);
 			expect(
 				(await runNativeStateCommand(["handoff", "--mode", "deep-interview", "--to", "ultragoal", "--json"], cwd))
 					.status,
