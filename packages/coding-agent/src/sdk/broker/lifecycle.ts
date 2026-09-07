@@ -69,7 +69,7 @@ import {
 	sanitizeSdkStartupMessage,
 } from "../startup-capability";
 import type { Broker, BrokerCleanupEvidence, BrokerCleanupIdentity, BrokerResponse } from "./broker";
-import { matchesIndexedEndpointFile, readEndpointFile } from "./endpoint-authority";
+import { endpointIncarnation, matchesIndexedEndpointFile, readEndpointFile } from "./endpoint-authority";
 import { decodeLifecycleUtf8, parseLifecycleJson } from "./lifecycle-codec";
 import type {
 	LifecycleCleanupProof,
@@ -4826,32 +4826,6 @@ type CloseRecord = {
 	processIncarnation?: string;
 };
 
-function endpointIncarnation(
-	record: Pick<CloseRecord, "endpointGeneration" | "endpointMtimeMs" | "pid">,
-	sessionId: string,
-): string | undefined {
-	if (
-		!Number.isSafeInteger(record.endpointGeneration) ||
-		record.endpointGeneration <= 0 ||
-		!Number.isSafeInteger(record.pid) ||
-		record.pid <= 0 ||
-		typeof record.endpointMtimeMs !== "number" ||
-		!Number.isFinite(record.endpointMtimeMs) ||
-		record.endpointMtimeMs <= 0
-	)
-		return undefined;
-	return createHash("sha256")
-		.update(
-			JSON.stringify({
-				endpointGeneration: record.endpointGeneration,
-				endpointMtimeMs: record.endpointMtimeMs,
-				pid: record.pid,
-				sessionId,
-			}),
-		)
-		.digest("hex");
-}
-
 function requestedCloseAuthority(input: Input): { authority: CloseAuthority | undefined } | { error: BrokerResponse } {
 	const endpointGeneration = input.endpointGeneration;
 	const endpointIncarnation = input.endpointIncarnation;
@@ -5022,13 +4996,15 @@ async function executeLifecycleResponse(
 					return fail("endpoint_stale", "Live session changed while its resume authority was being verified.");
 				if (current.endpointMtimeMs === undefined)
 					return fail("endpoint_stale", "Live session endpoint authority is incomplete.");
+				const finalIncarnation = endpointIncarnation(current, requestedSessionId!);
+				if (!finalIncarnation) return fail("endpoint_stale", "Live session endpoint incarnation is unavailable.");
 				return {
 					ok: true,
 					result: {
 						sessionId: requestedSessionId,
 						cwd: finalScope.cwd,
 						endpointGeneration: current.endpointGeneration,
-						endpointIncarnation: initialIncarnation,
+						endpointIncarnation: finalIncarnation,
 						pid: current.pid,
 						endpointMtimeMs: current.endpointMtimeMs,
 						endpoint: endpoint.result,

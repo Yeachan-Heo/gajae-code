@@ -34,7 +34,7 @@ import {
 	readBrokerDiscovery,
 	redactBrokerDiscovery,
 } from "./discovery";
-import { matchesIndexedEndpointFile, readEndpointFile } from "./endpoint-authority";
+import { endpointIncarnation, matchesIndexedEndpointFile, readEndpointFile } from "./endpoint-authority";
 import { deriveIdempotencyIdentity, getBrokerIdentityKey } from "./identity";
 import {
 	canonicalDeleteLocatorPath,
@@ -730,31 +730,6 @@ type LifecycleReplayEndpoint = {
 };
 
 type EndpointAuthority = { endpointGeneration?: number; endpointIncarnation?: string };
-function endpointIncarnation(
-	record: Pick<IndexedSession, "endpointGeneration" | "endpointMtimeMs" | "pid">,
-	sessionId: string,
-): string | undefined {
-	if (
-		!Number.isSafeInteger(record.endpointGeneration) ||
-		record.endpointGeneration <= 0 ||
-		!Number.isSafeInteger(record.pid) ||
-		record.pid <= 0 ||
-		typeof record.endpointMtimeMs !== "number" ||
-		!Number.isFinite(record.endpointMtimeMs) ||
-		record.endpointMtimeMs <= 0
-	)
-		return undefined;
-	return createHash("sha256")
-		.update(
-			canonicalJson({
-				endpointGeneration: record.endpointGeneration,
-				endpointMtimeMs: record.endpointMtimeMs,
-				pid: record.pid,
-				sessionId,
-			}),
-		)
-		.digest("hex");
-}
 function expectedEndpointAuthority(input: Record<string, unknown>): EndpointAuthority | BrokerResponse {
 	const endpointGeneration = input.endpointGeneration;
 	const endpointIncarnation = input.endpointIncarnation;
@@ -3114,7 +3089,8 @@ export class Broker {
 		};
 		const sessions = snapshot.sessions.slice(snapshot.offset, snapshot.offset + snapshot.limit).map(session => {
 			const { lifecycleRequestId: _lifecycleRequestId, ...publicSession } = session;
-			return publicSession;
+			const incarnation = endpointIncarnation(session, session.sessionId);
+			return incarnation === undefined ? publicSession : { ...publicSession, endpointIncarnation: incarnation };
 		});
 		const offset = snapshot.offset + sessions.length;
 		if (offset >= snapshot.sessions.length && typeof cursor === "string") this.#sessionListCursors.delete(cursor);

@@ -305,7 +305,7 @@ export function daemonCliLifecycleInput(host: AdapterFixture, operation: string)
 		case "session.resume":
 			return { cwd: host.repo, stateRoot: invalidStateRoot, sessionId: host.sessionId };
 		case "session.close":
-			return { sessionId: host.sessionId, endpointGeneration: 0 };
+			return { sessionId: host.sessionId, unexpected: true };
 		case "session.delete":
 			return { sessionId: "missing-session" };
 		case "session.reconcile_uncertain":

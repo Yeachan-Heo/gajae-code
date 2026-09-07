@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 
@@ -19,6 +20,33 @@ export type IndexedEndpointAuthority = {
 	endpointMtimeMs?: number;
 	endpointFileId?: string;
 };
+
+/** Derive the broker-compatible opaque authority for one indexed endpoint generation. */
+export function endpointIncarnation(
+	record: { endpointGeneration: number; endpointMtimeMs?: number; pid: number },
+	sessionId: string,
+): string | undefined {
+	if (
+		!Number.isSafeInteger(record.endpointGeneration) ||
+		record.endpointGeneration <= 0 ||
+		!Number.isSafeInteger(record.pid) ||
+		record.pid <= 0 ||
+		typeof record.endpointMtimeMs !== "number" ||
+		!Number.isFinite(record.endpointMtimeMs) ||
+		record.endpointMtimeMs <= 0
+	)
+		return undefined;
+	return createHash("sha256")
+		.update(
+			JSON.stringify({
+				endpointGeneration: record.endpointGeneration,
+				endpointMtimeMs: record.endpointMtimeMs,
+				pid: record.pid,
+				sessionId,
+			}),
+		)
+		.digest("hex");
+}
 
 function readFlags(): number {
 	return fsSync.constants.O_RDONLY | (fsSync.constants.O_NOFOLLOW ?? 0) | (fsSync.constants.O_NONBLOCK ?? 0);

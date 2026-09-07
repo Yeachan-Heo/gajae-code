@@ -146,6 +146,98 @@ describe("SessionLifecycleService", () => {
 		]);
 		expect(client.calls.at(-1)?.options).not.toHaveProperty("idempotencyKey");
 	});
+	it("forwards the exact paired close authority without allowing partial authority", async () => {
+		const authority = {
+			sessionId: "close-session",
+			endpointGeneration: 7,
+			endpointIncarnation: "a".repeat(64),
+		} as const;
+		const { service, client } = serviceWith({ ok: true, result: { sessionId: authority.sessionId } });
+
+		await expect(
+			service.close({
+				actor,
+				capability: "session.close",
+				requestKey: "exact-close",
+				target: authority,
+			}),
+		).resolves.toMatchObject({ ok: true, operation: "session.close" });
+		expect(client.calls[0]?.input).toEqual(authority);
+
+		const partial = await service.close({
+			actor,
+			capability: "session.close",
+			requestKey: "partial-close",
+			target: { sessionId: authority.sessionId, endpointGeneration: authority.endpointGeneration } as never,
+		});
+		expect(partial).toMatchObject({
+			ok: false,
+			certainty: "terminal",
+			error: { code: "invalid_input" },
+		});
+		expect(client.calls).toHaveLength(1);
+	});
+
+	it("preserves broker endpoint incarnation in create and list projections", async () => {
+		const endpointIncarnation = "b".repeat(64);
+		const { service, client } = serviceWith({
+			ok: true,
+			result: {
+				sessionId: "created",
+				cwd: "/repo",
+				endpointGeneration: 3,
+				endpointIncarnation,
+				endpoint: { url: "ws://127.0.0.1:9999", token: "secret" },
+			},
+		});
+		expect(
+			await service.create({ actor, capability: "session.create", requestKey: "authority-create", target }),
+		).toMatchObject({
+			ok: true,
+			result: { sessionId: "created", endpointGeneration: 3, endpointIncarnation },
+		});
+
+		client.response = {
+			ok: true,
+			result: {
+				indexSeq: 4,
+				sessions: [{ sessionId: "listed", live: true, endpointGeneration: 3, endpointIncarnation }],
+				warnings: [],
+			},
+		};
+		expect(await service.list({ actor, capability: "session.list" })).toMatchObject({
+			ok: true,
+			result: { sessions: [{ sessionId: "listed", endpointGeneration: 3, endpointIncarnation }] },
+		});
+	});
+
+	it("does not project incomplete endpoint authority", async () => {
+		const { service, client } = serviceWith({
+			ok: true,
+			result: { sessionId: "created", cwd: "/repo", endpointGeneration: 3 },
+		});
+		const created = await service.create({
+			actor,
+			capability: "session.create",
+			requestKey: "incomplete-create",
+			target,
+		});
+		expect((created as { result?: Record<string, unknown> }).result).toEqual({ sessionId: "created", cwd: "/repo" });
+
+		client.response = {
+			ok: true,
+			result: {
+				indexSeq: 5,
+				sessions: [{ sessionId: "listed", live: true, endpointIncarnation: "c".repeat(64) }],
+				warnings: [],
+			},
+		};
+		const listed = await service.list({ actor, capability: "session.list" });
+		expect((listed as { result?: { sessions?: readonly Record<string, unknown>[] } }).result?.sessions).toEqual([
+			{ sessionId: "listed", live: true },
+		]);
+	});
+
 	it("aggregates every Broker session.list page", async () => {
 		const { service, client } = serviceWith();
 		client.responses.push(

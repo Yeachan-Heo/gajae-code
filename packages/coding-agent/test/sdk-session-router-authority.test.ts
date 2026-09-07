@@ -2482,6 +2482,30 @@ describe("SessionRouter dispatch authority", () => {
 			await router.stop();
 		}
 	});
+	test("exposes the paired endpoint incarnation for an exact lifecycle close", async () => {
+		const fixture = await routerFixture();
+		try {
+			await expect(fixture.router.bindingAuthority(fixture.sessionId)).resolves.toEqual({
+				sessionId: fixture.sessionId,
+				endpointGeneration: fixture.authority.generation,
+				endpointIncarnation: expect.stringMatching(/^[a-f0-9]{64}$/),
+			});
+		} finally {
+			await fixture.router.stop();
+		}
+	});
+	test("fails closed when the endpoint evidence cannot produce an incarnation", async () => {
+		const fixture = await routerFixture();
+		try {
+			fixture.authority.endpointMtimeMs = Number.NaN;
+			await expect(fixture.router.bindingAuthority(fixture.sessionId)).resolves.toBeUndefined();
+			// No caller-visible generation-only fallback is returned when exact evidence
+			// is unavailable.
+			expect(fixture.router.attachment(fixture.sessionId)?.generation).toBe(1);
+		} finally {
+			await fixture.router.stop();
+		}
+	});
 	test("idle sweep reruns the reconcile body without an index change (#4689)", async () => {
 		// The gate must not park time-driven work forever: with the sweep due,
 		// a tick runs the full body again even though the index is unchanged.

@@ -534,7 +534,30 @@ if (!attachment) throw new Error("session attachment unavailable");
 await attachment.send({ type: "reply", id: actionId, answer });
 ```
 
-Telegram, Discord, Slack, and third-party adapters own only their provider transport and presentation state. `SessionRouter` performs exact endpoint resolution, credential custody, replay, reconnect, rotation, and dispatch-time stale-lease rejection.
+`SessionRouter` performs exact endpoint resolution, credential custody, replay, reconnect, rotation, and dispatch-time stale-lease rejection.
+
+### Exact fenced session close
+
+Capture the endpoint authority from the original Router binding and pass that
+same pair to the lifecycle service. The generation and incarnation are one
+authority: a partial target is rejected before it reaches the Broker.
+
+```ts
+const authority = await sessionRouter.bindingAuthority(sessionId);
+if (!authority) throw new Error("session endpoint authority unavailable");
+
+const outcome = await lifecycleService.close({
+  actor,
+  capability: "session.close",
+  requestKey: "close-captured-session",
+  target: authority,
+});
+```
+
+`bindingAuthority()` returns `undefined` when the Router cannot prove the
+current endpoint and its incarnation. Do not reconstruct the authority from
+endpoint credentials, process metadata, or a later session lookup; a
+replacement may become current between capture and close.
 
 ### Exact generation reconciliation
 

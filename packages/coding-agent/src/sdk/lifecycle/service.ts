@@ -9,12 +9,15 @@ import {
 	scopeRequestV1,
 	searchRowV1,
 } from "../broker/session-scope";
+import type { SessionBindingAuthority } from "../session-authority";
 import {
 	SessionListTraversalError,
 	type SessionListTraversalPage,
 	sessionListPageFromResponse,
 	traverseSessionList,
 } from "../session-list";
+
+export type { SessionBindingAuthority, SessionEndpointAuthority } from "../session-authority";
 
 export type SessionLifecycleOperation =
 	| "session.create"
@@ -122,11 +125,13 @@ export type SessionResumeTarget = SessionLifecycleCoordinatorTarget & {
 	readonly readinessTimeoutMs?: number;
 };
 
-export interface SessionCloseTarget {
-	readonly sessionId: string;
-	readonly endpointGeneration?: number;
-	readonly endpointIncarnation?: string;
-}
+export type SessionCloseTarget =
+	| {
+			readonly sessionId: string;
+			readonly endpointGeneration?: never;
+			readonly endpointIncarnation?: never;
+	  }
+	| SessionBindingAuthority;
 
 export interface SessionReconcileUncertainTarget {
 	readonly sessionId: string;
@@ -209,6 +214,7 @@ export interface SessionLifecycleListEntry {
 	readonly sessionId: string;
 	readonly live?: boolean;
 	readonly endpointGeneration?: number;
+	readonly endpointIncarnation?: string;
 	readonly terminalUncertain?: boolean;
 	readonly cwd?: string;
 	readonly locator?: { readonly cwd: string; readonly worktreeRoot: string | null; readonly stateRoot: string };
@@ -427,6 +433,20 @@ function validTarget(target: unknown): target is Readonly<Record<string, unknown
 	return isRecord(target);
 }
 
+function validSessionCloseTarget(target: Readonly<Record<string, unknown>>): boolean {
+	const hasGeneration = Object.hasOwn(target, "endpointGeneration");
+	const hasIncarnation = Object.hasOwn(target, "endpointIncarnation");
+	if (hasGeneration !== hasIncarnation) return false;
+	if (!hasGeneration) return true;
+	return (
+		typeof target.endpointGeneration === "number" &&
+		Number.isSafeInteger(target.endpointGeneration) &&
+		target.endpointGeneration > 0 &&
+		typeof target.endpointIncarnation === "string" &&
+		/^[a-f0-9]{64}$/u.test(target.endpointIncarnation)
+	);
+}
+
 export function validateSessionReconcileUncertainTarget(value: unknown): value is SessionReconcileUncertainTarget {
 	if (!isRecord(value)) return false;
 	const target = value;
@@ -468,6 +488,8 @@ export function validateSessionLifecycleMutationRequest(request: unknown): Sessi
 		return failure(operation, "terminal", "capability_denied", `capability does not authorize ${operation}`);
 	if (!validTarget(record.target))
 		return failure(operation, "terminal", "invalid_request", "target must be an object");
+	if (operation === "session.close" && !validSessionCloseTarget(record.target))
+		return failure(operation, "terminal", "invalid_input", "session.close endpoint authority is invalid");
 	if (operation === "session.reconcile_uncertain" && !validateSessionReconcileUncertainTarget(record.target))
 		return failure(
 			operation,
@@ -503,6 +525,23 @@ function credentialFreeRecord(value: Record<string, unknown>): Record<string, un
 	return output;
 }
 
+function sessionEndpointProjection(value: Record<string, unknown>): {
+	endpointGeneration?: number;
+	endpointIncarnation?: string;
+} {
+	const endpointGeneration = value.endpointGeneration;
+	const endpointIncarnation = value.endpointIncarnation;
+	if (
+		typeof endpointGeneration !== "number" ||
+		!Number.isSafeInteger(endpointGeneration) ||
+		endpointGeneration <= 0 ||
+		typeof endpointIncarnation !== "string" ||
+		!/^[a-f0-9]{64}$/u.test(endpointIncarnation)
+	)
+		return {};
+	return { endpointGeneration, endpointIncarnation };
+}
+
 function sessionResult(value: unknown, expectedSessionId?: string): SessionLifecycleSessionResult | undefined {
 	if (!isRecord(value)) return undefined;
 	const record = credentialFreeRecord(value);
@@ -515,13 +554,8 @@ function sessionResult(value: unknown, expectedSessionId?: string): SessionLifec
 		endpointIncarnation?: string;
 		reused?: boolean;
 		note?: string;
-	} = { sessionId };
+	} = { sessionId, ...sessionEndpointProjection(record) };
 	if (typeof record.cwd === "string") result.cwd = record.cwd;
-	const endpointGeneration = record.endpointGeneration;
-	if (typeof endpointGeneration === "number" && Number.isSafeInteger(endpointGeneration) && endpointGeneration > 0)
-		result.endpointGeneration = endpointGeneration;
-	if (typeof record.endpointIncarnation === "string" && /^[a-f0-9]{64}$/.test(record.endpointIncarnation))
-		result.endpointIncarnation = record.endpointIncarnation;
 	if (typeof record.reused === "boolean") result.reused = record.reused;
 	if (typeof record.note === "string") result.note = record.note;
 	return result;
@@ -601,12 +635,12 @@ function listResult(value: unknown): SessionLifecycleListResult | undefined {
 			sessionId: string;
 			live?: boolean;
 			endpointGeneration?: number;
+			endpointIncarnation?: string;
 			terminalUncertain?: boolean;
 			cwd?: string;
 			locator?: { cwd: string; worktreeRoot: string | null; stateRoot: string };
-		} = { sessionId: entry.sessionId };
+		} = { sessionId: entry.sessionId, ...sessionEndpointProjection(entry) };
 		if (typeof entry.live === "boolean") item.live = entry.live;
-		if (typeof entry.endpointGeneration === "number") item.endpointGeneration = entry.endpointGeneration;
 		if (typeof entry.terminalUncertain === "boolean") item.terminalUncertain = entry.terminalUncertain;
 		if (isRecord(entry.locator) && typeof entry.locator.cwd === "string") item.cwd = entry.locator.cwd;
 		if (

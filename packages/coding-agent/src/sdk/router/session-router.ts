@@ -2,7 +2,7 @@ import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { logger, resolveEquivalentPath } from "@gajae-code/utils";
-import { matchesIndexedEndpointFile } from "../broker/endpoint-authority";
+import { endpointIncarnation, matchesIndexedEndpointFile } from "../broker/endpoint-authority";
 import {
 	canonicalSessionCwd,
 	SessionIndex as DefaultSessionIndex,
@@ -31,7 +31,10 @@ import {
 	requestPreparedSessionActivation,
 	SessionActivationError,
 } from "../session-activation";
+import type { SessionBindingAuthority } from "../session-authority";
 import { ACP_SESSION_RECONNECT, SESSION_REQUEST_TIMEOUT_MS } from "../session-reconnect";
+
+export type { SessionBindingAuthority, SessionEndpointAuthority } from "../session-authority";
 
 export interface SessionEndpointIdentity {
 	readonly dev: bigint;
@@ -1005,7 +1008,7 @@ export class SessionRouter {
 	}
 
 	/** Resolves the exact provider-neutral binding authority for operator adoption. */
-	async bindingAuthority(sessionId: string): Promise<{ sessionId: string; endpointGeneration: number } | undefined> {
+	async bindingAuthority(sessionId: string): Promise<SessionBindingAuthority | undefined> {
 		const attached = this.#sessions.get(sessionId);
 		if (!attached || !this.#attachmentPublished(attached)) return undefined;
 		let indexed: IndexedSession | undefined;
@@ -1036,7 +1039,9 @@ export class SessionRouter {
 		)
 			return undefined;
 		if (this.#sessions.get(sessionId) !== attached || !this.#attachmentPublished(attached)) return undefined;
-		return { sessionId, endpointGeneration: attached.generation };
+		const incarnation = endpointIncarnation(indexed, sessionId);
+		if (!incarnation) return undefined;
+		return Object.freeze({ sessionId, endpointGeneration: attached.generation, endpointIncarnation: incarnation });
 	}
 
 	/**
