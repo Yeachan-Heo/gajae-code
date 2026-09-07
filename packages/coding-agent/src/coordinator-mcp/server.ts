@@ -321,7 +321,7 @@ interface CoordinatorServices {
 	afterDelegateCreationCompleted?: () => void | Promise<void>;
 	beforeDelegateResponseCommit?: () => void | Promise<void>;
 	afterDelegateResponseCommit?: () => void | Promise<void>;
-	beforeDelegatePinRecovery?: () => void | Promise<void>;
+	readCoordinatorSessionEntries?: (directory: string) => Promise<string[]>;
 }
 
 type CoordinatorModelResolution =
@@ -6475,11 +6475,10 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 	}
 
 	async function reconcileCompletedDelegateResponsePins(): Promise<void> {
-		await services.beforeDelegatePinRecovery?.();
 		const roster = await readSchedulerRoster(questionPaths);
 		let persisted: string[];
 		try {
-			persisted = await fs.readdir(questionPaths.sessions);
+			persisted = await (services.readCoordinatorSessionEntries ?? fs.readdir)(questionPaths.sessions);
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
 			persisted = [];
