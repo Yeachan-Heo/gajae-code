@@ -423,10 +423,14 @@ function hasLaterSupersedingCorrection(content: string, quote: string, statement
 				(clause.match(/[A-Za-z0-9][A-Za-z0-9+#.-]*/g) ?? []).some(isShortTechnicalIdentifier)) ||
 			Boolean(
 				statementUseTarget &&
-					(isShortTechnicalIdentifier(statementUseTarget) || /^[A-Z]/.test(statementUseTarget)) &&
 					(() => {
 						const target = /\buse\s+([A-Za-z0-9][A-Za-z0-9+#.-]*)/i.exec(clause)?.[1];
-						return Boolean(target && (isShortTechnicalIdentifier(target) || /^[A-Z]/.test(target)));
+						return Boolean(
+							target &&
+								(isShortTechnicalIdentifier(target) ||
+									/^(?:C\+\+|C#|F#)$/i.test(target) ||
+									/(?:[a-z][A-Z]|[A-Z].*[A-Z])/.test(target)),
+						);
 					})(),
 			)
 		);
@@ -807,6 +811,13 @@ function quantitativeEvidenceTerms(value: string): Set<string> {
 		if (match[2]) terms.add(match[2].length <= 3 && /[A-Z]/.test(match[2]) ? match[2] : match[2].toLowerCase());
 	}
 	return terms;
+}
+
+function quantitativeEvidenceSequence(value: string): string[] {
+	return [...value.normalize("NFC").matchAll(/\p{Sc}|%|>=|<=|>|<|:|\d+(?:\.\d+)?|[A-Za-z]+/gu)].map(match => {
+		const token = match[0];
+		return token.length <= 3 && /[A-Z]/.test(token) ? token : token.toLowerCase();
+	});
 }
 
 function evidenceTermSequence(value: string): string[] {
@@ -1307,6 +1318,7 @@ export function crystallizeDeepInterview(value: unknown): DeepInterviewCrystal {
 			.slice(0, 16)}`;
 		const answerSemantics = semanticProfile(anchor.resolution);
 		const answerQuantitative = quantitativeEvidenceTerms(anchor.resolution);
+		const answerQuantitativeSequence = quantitativeEvidenceSequence(anchor.resolution);
 		const represented = mergedItems.some(item => {
 			const itemQuantitative = quantitativeEvidenceTerms(item.statement);
 			return (
@@ -1314,7 +1326,8 @@ export function crystallizeDeepInterview(value: unknown): DeepInterviewCrystal {
 				[...answerTerms].every(term => evidenceTerms(item.statement).has(term)) &&
 				sameSemanticIntent(answerSemantics, semanticProfile(item.statement)) &&
 				answerQuantitative.size === itemQuantitative.size &&
-				[...answerQuantitative].every(term => itemQuantitative.has(term))
+				[...answerQuantitative].every(term => itemQuantitative.has(term)) &&
+				JSON.stringify(answerQuantitativeSequence) === JSON.stringify(quantitativeEvidenceSequence(item.statement))
 			);
 		});
 		if (!represented)
