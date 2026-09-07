@@ -148,7 +148,8 @@ describe("generation-scoped render commits", () => {
 				new Response(child.stderr).text(),
 			]);
 			expect(exitCode, `${stdout}\n${stderr}`).toBe(0);
-			expect(stderr).toContain("1 pass");
+			// Require proof that the assertions ran, independent of Bun reporter output.
+			expect(stdout.split("\n")).toContain("GJC_TUI_LIFETIME_PROBE_OK");
 			return;
 		}
 		const fixtures: PreparationLifetimeFixture[] = [];
@@ -215,6 +216,7 @@ describe("generation-scoped render commits", () => {
 				fixture.preparationMemoryOwner.dispose();
 			}
 		}
+		process.stdout.write("GJC_TUI_LIFETIME_PROBE_OK\n");
 	});
 
 	it("retires 1000 nested lifecycle holes without changing current or historical outcomes", async () => {
