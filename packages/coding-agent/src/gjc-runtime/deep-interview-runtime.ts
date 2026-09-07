@@ -1,4 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
+import type { Stats } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { isSettingsInitialized, Settings } from "../config/settings";
@@ -251,6 +252,18 @@ function isErrnoCode(error: unknown, code: string): boolean {
 	return typeof error === "object" && error !== null && "code" in error && (error as { code?: unknown }).code === code;
 }
 
+function sameFileIdentity(left: Stats, right: Stats): boolean {
+	return (
+		left.dev === right.dev &&
+		left.ino === right.ino &&
+		left.mode === right.mode &&
+		left.size === right.size &&
+		left.mtimeMs === right.mtimeMs &&
+		left.ctimeMs === right.ctimeMs &&
+		left.nlink === right.nlink
+	);
+}
+
 function isPathWithin(root: string, target: string): boolean {
 	const relative = path.relative(path.resolve(root), path.resolve(target));
 	return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
@@ -278,6 +291,8 @@ async function readBoundedFileBytes(
 		handle = await fs.open(filePath, READ_NOFOLLOW_FLAGS);
 		const initial = await handle.stat();
 		if (!initial.isFile()) throw new DeepInterviewCommandError(2, `${label} is not a regular file`);
+		if (!sameFileIdentity(lexicalStat, initial))
+			throw new DeepInterviewCommandError(2, `${label} changed before recovery read`);
 		if (initial.size > maxBytes) throw new DeepInterviewCommandError(2, `${label} exceeds the bounded read limit`);
 		const output = Buffer.alloc(Number(initial.size));
 		let offset = 0;
@@ -287,7 +302,11 @@ async function readBoundedFileBytes(
 			offset += bytesRead;
 		}
 		const final = await handle.stat();
-		if (final.size !== initial.size) throw new DeepInterviewCommandError(2, `${label} changed during recovery read`);
+		if (!sameFileIdentity(initial, final))
+			throw new DeepInterviewCommandError(2, `${label} changed during recovery read`);
+		const finalPath = await fs.lstat(filePath);
+		if (!finalPath.isFile() || finalPath.isSymbolicLink() || !sameFileIdentity(final, finalPath))
+			throw new DeepInterviewCommandError(2, `${label} changed during recovery read`);
 		return output;
 	} catch (error) {
 		if (error instanceof DeepInterviewCommandError) throw error;
@@ -720,7 +739,7 @@ async function authoritativeConversationSnapshot(
 			if (!isRecord(message) || typeof message.role !== "string")
 				throw new DeepInterviewCommandError(2, "live session transcript contains a malformed message");
 			const role =
-				message.role === "user" && message.attribution === "agent"
+				message.role === "user" && (message.attribution === "agent" || message.synthetic === true)
 					? "developer"
 					: ["custom", "hookMessage"].includes(message.role)
 						? "system"
