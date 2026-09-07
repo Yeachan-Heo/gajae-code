@@ -3536,7 +3536,8 @@ export class AgentSession {
 	#sessionTransitionSettlement: PromiseWithResolvers<void> | undefined;
 	#postCommitTransitionIngress = new AsyncLocalStorage<{ epoch: number; token: symbol }>();
 	#activePostCommitTransitionIngressTokens = new Set<symbol>();
-	#compactionHookContext = new AsyncLocalStorage<boolean>();
+	#compactionHookContext = new AsyncLocalStorage<symbol>();
+	#activeCompactionHookTokens = new Set<symbol>();
 	#coordinatorPersistGeneration = 0;
 	#coordinatorRescopeBarrier: Promise<void> | undefined;
 	#releaseCoordinatorRescopeBarrier: (() => void) | undefined;
@@ -15092,13 +15093,19 @@ export class AgentSession {
 
 		if (this.#extensionRunner && savedCompactionEntry) {
 			if (identityIsCurrent?.() === false) return undefined;
-			await this.#compactionHookContext.run(true, async () => {
-				await this.#extensionRunner?.emit({
-					type: "session_compact",
-					compactionEntry: savedCompactionEntry,
-					fromExtension: fromExtension ?? false,
+			const hookToken = Symbol("compaction-hook");
+			this.#activeCompactionHookTokens.add(hookToken);
+			try {
+				await this.#compactionHookContext.run(hookToken, async () => {
+					await this.#extensionRunner?.emit({
+						type: "session_compact",
+						compactionEntry: savedCompactionEntry,
+						fromExtension: fromExtension ?? false,
+					});
 				});
-			});
+			} finally {
+				this.#activeCompactionHookTokens.delete(hookToken);
+			}
 		}
 
 		return savedCompactionEntry;
@@ -16260,7 +16267,8 @@ export class AgentSession {
 			this.#externalIngressSealed = true;
 			const sessionId = this.sessionId;
 			this.#disconnectFromAgent();
-			if (this.#compactionHookContext.getStore()) {
+			const compactionHookToken = this.#compactionHookContext.getStore();
+			if (compactionHookToken && this.#activeCompactionHookTokens.has(compactionHookToken)) {
 				this.abortCompaction();
 				this.agent.abort();
 			} else {
