@@ -330,6 +330,8 @@ function anchoredClause(content: string, quote: string): string {
 	const quoteIndex = content.indexOf(quote);
 	if (quoteIndex < 0) return content;
 	const before = content.slice(0, quoteIndex);
+	if (/[.!?。！？]["'”’]?$/.test(quote.trim()) && (quoteIndex === 0 || /[.!?。！？]["'”’]?\s*$/u.test(before)))
+		return quote.trim();
 	const boundaryPattern = /(?:[!?]["'”’]?\s+|\.["'”’]?\s+(?=[\p{Lu}"'])|\n+)/gu;
 	let boundary = -1;
 	for (const match of before.matchAll(boundaryPattern)) boundary = match.index + match[0].length - 1;
@@ -340,12 +342,17 @@ function anchoredClause(content: string, quote: string): string {
 	return content.slice(boundary + 1, end).trim();
 }
 
-function hasLaterSupersedingCorrection(content: string, quote: string): boolean {
+function hasLaterSupersedingCorrection(content: string, quote: string, statement: string): boolean {
 	const quoteIndex = content.indexOf(quote);
 	if (quoteIndex < 0) return false;
 	const later = content.slice(quoteIndex + quote.length);
+	const explicitNegativeReplacement =
+		/\b(?:no|not)\b/i.test(later) &&
+		(/\b(?:use|make|choose|select|switch|change|replace)\b/i.test(later) ||
+			[...topicTerms(statement, false)].some(term => evidenceTerms(later).has(term)));
 	return (
-		/\b(?:actually|instead|rather|correction|on\s+second\s+thought|make\s+that|no|not)\b/i.test(later) ||
+		/\b(?:actually|instead|rather|correction|on\s+second\s+thought|make\s+that)\b/i.test(later) ||
+		explicitNegativeReplacement ||
 		/(?:사실|대신|정정|다시\s+생각|実際|代わり|訂正|やはり|实际上|實際上|改为|改為|更正)/u.test(later)
 	);
 }
@@ -543,7 +550,7 @@ function validateItems(value: unknown, snapshot?: CrystalSnapshot): CrystalItem[
 					containsNonTextMarker(item.anchor.quote) ||
 					containsNonTextMarker(anchorMessage.content) ||
 					!anchorMessage.content.includes(item.anchor.quote) ||
-					hasLaterSupersedingCorrection(anchorMessage.content, item.anchor.quote) ||
+					hasLaterSupersedingCorrection(anchorMessage.content, item.anchor.quote, item.statement) ||
 					quoteTerms.size === 0 ||
 					statementTerms.size === 0 ||
 					[...statementTerms].some(term => !quoteTerms.has(term)) ||
@@ -576,9 +583,65 @@ function isMeaningfulEvidenceWord(value: string): boolean {
 	);
 }
 
+const SHORT_EVIDENCE_STOPWORDS = new Set([
+	"a",
+	"an",
+	"as",
+	"at",
+	"be",
+	"by",
+	"do",
+	"he",
+	"i",
+	"if",
+	"in",
+	"is",
+	"it",
+	"me",
+	"my",
+	"of",
+	"on",
+	"or",
+	"so",
+	"to",
+	"up",
+	"us",
+	"we",
+]);
+const LOWERCASE_SHORT_TECHNICAL_TERMS = new Set([
+	"ai",
+	"cd",
+	"ci",
+	"db",
+	"gb",
+	"go",
+	"id",
+	"io",
+	"ip",
+	"js",
+	"kb",
+	"mb",
+	"ml",
+	"ms",
+	"ns",
+	"os",
+	"s",
+	"tb",
+	"ts",
+	"ui",
+	"us",
+	"vm",
+]);
+
 function isShortTechnicalIdentifier(value: string): boolean {
 	const length = [...value].length;
-	return length >= 1 && length <= 2 && /^[A-Z0-9][A-Za-z0-9+#.-]*$/.test(value) && value !== "A" && value !== "I";
+	return (
+		length >= 1 &&
+		length <= 2 &&
+		/^[A-Za-z0-9][A-Za-z0-9+#.-]*$/.test(value) &&
+		!SHORT_EVIDENCE_STOPWORDS.has(value.toLowerCase()) &&
+		(/^[A-Z0-9]/.test(value) || LOWERCASE_SHORT_TECHNICAL_TERMS.has(value.toLowerCase()))
+	);
 }
 
 function evidenceTerms(value: string): Set<string> {
@@ -703,12 +766,21 @@ function hasCjkTopicOverlap(item: string, resolution: string): boolean {
 	return false;
 }
 
-function isUnsafeResolution(value: string): boolean {
+function isUnsafeResolution(value: string, item: string, conflict: boolean): boolean {
 	const profile = semanticProfile(value);
 	const standaloneBinary =
 		/^(?:yes|no|true|false|enabled|disabled|예|네|아니요|아니|是|否|はい|いいえ)[.!。！？]?$/iu.test(value.trim());
+	const itemTerms = topicTerms(item, conflict);
+	const valueTerms = evidenceTerms(value);
+	const statementBoundNegativeDecision =
+		profile.negative &&
+		itemTerms.size > 0 &&
+		[...itemTerms].every(term => valueTerms.has(term)) &&
+		/\b(?:should|must|will|is|are)\s+not\s+(?:be\s+)?(?:enabled|disabled|allowed|permitted|required|needed|used|supported)\b/i.test(
+			value,
+		);
 	return (
-		(profile.negative && !standaloneBinary) ||
+		(profile.negative && !standaloneBinary && !statementBoundNegativeDecision) ||
 		/\b(?:different\s+from|other\s+than|not\s+equal\s+to|anything\s+but|except\s+for|less\s+than|greater\s+than|at\s+most|at\s+least|no\s+more\s+than|no\s+less\s+than|under|over|below|above)\b/i.test(
 			value,
 		) ||
@@ -749,9 +821,9 @@ function validateResolutionAnchors(
 			hasCjkTopicOverlap(item, resolution);
 		const concreteAnswer = hasConcreteResolutionValue(resolution, item, conflict);
 		const unsafeResolution =
-			isUnsafeResolution(resolution) ||
-			isUnsafeResolution(quote) ||
-			(message ? isUnsafeResolution(anchoredClause(message.content, quote)) : true);
+			isUnsafeResolution(resolution, item, conflict) ||
+			isUnsafeResolution(quote, item, conflict) ||
+			(message ? isUnsafeResolution(anchoredClause(message.content, quote), item, conflict) : true);
 		if (
 			!resolutions.includes(item) ||
 			seen.has(item) ||
