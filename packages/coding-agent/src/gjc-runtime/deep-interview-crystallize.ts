@@ -800,6 +800,10 @@ function validateRemovalAnchors(
 		const explicitNegatedRemoval =
 			/\b(?:no\s+longer|do\s+not\s+need|don't\s+need|not\s+needed)\b/i.test(resolution) ||
 			/(?:더\s+이상\s+필요\s+없|不要|不再需要)/u.test(resolution);
+		const competingKeepDirective =
+			/\b(?:do\s+not|don't|never)\s+(?:remove|drop|delete|discard|omit|exclude|retire|cancel|stop)\b/i.test(
+				resolution,
+			) || /(?:삭제|제거|제외|취소|중단)(?:하지\s*마|하지\s*않)/u.test(resolution);
 		const removalSemantics = semanticProfile(resolution);
 		const quotedRemovalSemantics = semanticProfile(quote);
 		const messageRemovalSemantics = message ? semanticProfile(anchoredClause(message.content, quote)) : undefined;
@@ -813,6 +817,7 @@ function validateRemovalAnchors(
 			!message.content.includes(resolution) ||
 			resolution === previous.statement ||
 			!removalLanguage ||
+			competingKeepDirective ||
 			!referencesStatement ||
 			(removalSemantics.negative && !explicitNegatedRemoval) ||
 			removalSemantics.interrogative ||
