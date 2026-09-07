@@ -407,11 +407,9 @@ function hasLaterSupersedingCorrection(content: string, quote: string, statement
 		/^\s*[.!?。！？]*\s*(?:only\s+)?(?:if|unless|until|when|assuming|in\s+case|contingent|provided(?:\s+that)?|depending\s+on)\b[^,;.!?。！？]*[.!?。！？]?\s*$/i.test(
 			later,
 		);
-	const hasTechnicalIdentity = (value: string): boolean =>
-		(value.match(/[A-Za-z0-9][A-Za-z0-9+#.-]*/g) ?? []).some(
-			term => isShortTechnicalIdentifier(term) || /^[A-Z][A-Za-z0-9+#.-]+$/.test(term),
-		);
-	const statementHasTechnical = hasTechnicalIdentity(statement);
+	const statementHasShortTechnical = (statement.match(/[A-Za-z0-9][A-Za-z0-9+#.-]*/g) ?? []).some(
+		isShortTechnicalIdentifier,
+	);
 	const genericCorrection = followingClauses.some(clause => {
 		const marker =
 			/\b(?:actually|instead|rather|correction|on\s+second\s+thought|make\s+that)\b/i.test(clause) ||
@@ -420,7 +418,9 @@ function hasLaterSupersedingCorrection(content: string, quote: string, statement
 		const clauseTerms = evidenceTerms(clause);
 		return (
 			[...topicTerms(statement, false)].some(term => clauseTerms.has(term)) ||
-			(statementHasTechnical && hasTechnicalIdentity(clause))
+			(statementHasShortTechnical &&
+				(clause.match(/[A-Za-z0-9][A-Za-z0-9+#.-]*/g) ?? []).some(isShortTechnicalIdentifier)) ||
+			(/\buse\s+[A-Za-z0-9][A-Za-z0-9+#.-]*/i.test(statement) && /\buse\s+[A-Za-z0-9][A-Za-z0-9+#.-]*/i.test(clause))
 		);
 	});
 	return (
@@ -1297,20 +1297,24 @@ export function crystallizeDeepInterview(value: unknown): DeepInterviewCrystal {
 			.update(`${anchor.item}\0${anchor.resolution}`)
 			.digest("hex")
 			.slice(0, 16)}`;
-		if (
-			!mergedItems.some(
-				item =>
-					item.classification === "confirmed" &&
-					[...answerTerms].every(term => evidenceTerms(item.statement).has(term)),
-			)
-		)
-			mergedItems.push({
-				id: resolutionId,
-				kind: "constraint",
-				classification: "confirmed",
-				statement: anchor.resolution,
-				anchor: { message_index: anchor.message_index, quote: anchor.resolution },
-			});
+		const answerSemantics = semanticProfile(anchor.resolution);
+		const represented = mergedItems.some(
+			item =>
+				item.classification === "confirmed" &&
+				[...answerTerms].every(term => evidenceTerms(item.statement).has(term)) &&
+				sameSemanticIntent(answerSemantics, semanticProfile(item.statement)),
+		);
+		if (!represented)
+			if (mergedItems.some(item => item.id === resolutionId))
+				throw new Error(`promoted resolution item ID collides with submitted item: ${resolutionId}`);
+			else
+				mergedItems.push({
+					id: resolutionId,
+					kind: "constraint",
+					classification: "confirmed",
+					statement: anchor.resolution,
+					anchor: { message_index: anchor.message_index, quote: anchor.resolution },
+				});
 	}
 	const currentItems = mergedItems;
 	if (currentItems.length > MAX_ITEMS) throw new Error("merged crystallize items exceed the bounded limit");
