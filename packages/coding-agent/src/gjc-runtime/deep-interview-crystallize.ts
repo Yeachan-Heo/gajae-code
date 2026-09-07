@@ -346,10 +346,11 @@ function hasLaterSupersedingCorrection(content: string, quote: string, statement
 	const quoteIndex = content.indexOf(quote);
 	if (quoteIndex < 0) return false;
 	const later = content.slice(quoteIndex + quote.length);
+	const topicOverlap = [...topicTerms(statement, false)].some(term => evidenceTerms(later).has(term));
+	const directNegativeReplacement =
+		/^\s*[.!?。！？]*\s*(?:no|not)\s*[,;:]?\s*(?:use|make|choose|select|switch|change|replace)\b/i.test(later);
 	const explicitNegativeReplacement =
-		/\b(?:no|not)\b/i.test(later) &&
-		(/\b(?:use|make|choose|select|switch|change|replace)\b/i.test(later) ||
-			[...topicTerms(statement, false)].some(term => evidenceTerms(later).has(term)));
+		/\b(?:no|not|don't|do\s+not)\b/i.test(later) && (topicOverlap || directNegativeReplacement);
 	return (
 		/\b(?:actually|instead|rather|correction|on\s+second\s+thought|make\s+that)\b/i.test(later) ||
 		explicitNegativeReplacement ||
@@ -394,7 +395,9 @@ function semanticProfile(value: string): CrystalSemanticProfile {
 			normalized,
 		);
 	const conditional =
-		/\b(?:if|unless|provided(?:\s+that)?|assuming|in\s+case|contingent|when|depending\s+on)\b/i.test(normalized) ||
+		/\b(?:if|unless|until|provided(?:\s+that)?|assuming|in\s+case|contingent|when|depending\s+on)\b/i.test(
+			normalized,
+		) ||
 		/(?:만약|하면|라면|다면|으면|이면|경우|조건|경우에\s+따라|もし|なら|れば|たら|場合|条件|次第|如果|若|假如|倘若|除非|只要|情况下|取决于|取決於)/u.test(
 			normalized,
 		);
