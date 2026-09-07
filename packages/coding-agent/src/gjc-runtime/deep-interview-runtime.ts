@@ -146,6 +146,7 @@ const DEEP_INTERVIEW_NON_TEXT_CONTENT_TYPES = new Set([
 	"content",
 	"toolCall",
 	"thinking",
+	"redactedThinking",
 ]);
 
 interface DeepInterviewTraceSummary {
@@ -622,8 +623,15 @@ async function authoritativeConversationSnapshot(
 			const message = entry.message as unknown;
 			if (!isRecord(message) || typeof message.role !== "string")
 				throw new DeepInterviewCommandError(2, "live session transcript contains a malformed message");
+			const role = ["custom", "hookMessage"].includes(message.role)
+				? "system"
+				: ["bashExecution", "pythonExecution", "fileMention"].includes(message.role)
+					? "tool"
+					: message.role;
 			let projectedContent: string;
-			if (typeof message.content === "string") {
+			if (["bashExecution", "pythonExecution", "fileMention"].includes(message.role)) {
+				projectedContent = `[${message.role} sha256:${createHash("sha256").update(JSON.stringify(message)).digest("hex")}]`;
+			} else if (typeof message.content === "string") {
 				projectedContent = message.content;
 			} else if (Array.isArray(message.content)) {
 				const projectedParts: string[] = [];
@@ -650,7 +658,7 @@ async function authoritativeConversationSnapshot(
 			} else {
 				throw new DeepInterviewCommandError(2, "live session transcript contains malformed message content");
 			}
-			messages.push({ index, role: message.role, content: projectedContent.normalize("NFC").trim() });
+			messages.push({ index, role, content: projectedContent.normalize("NFC").trim() });
 		}
 		if (messages.length === 0) throw new DeepInterviewCommandError(2, "live session transcript has no messages");
 		return { revision: messages.length, messages };
