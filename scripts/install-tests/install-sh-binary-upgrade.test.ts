@@ -153,6 +153,62 @@ esac
 	fs.chmodSync(bunPath, 0o755);
 }
 
+function writeLockRaceShims(dir: string): void {
+	const binDir = process.platform === "darwin" ? "/bin" : "/usr/bin";
+	const psShim = `#!/bin/sh
+barrier="$GJC_LOCK_RACE_DIR"
+if [ "\${1:-}" = "-p" ] && [ -n "$barrier" ]; then
+  if mkdir "$barrier/ps-first" 2>/dev/null; then
+    while [ ! -f "$barrier/ps-release" ]; do sleep 0.01; done
+  else
+    : > "$barrier/ps-release"
+  fi
+fi
+exit 1
+`;
+	const catShim = `#!/bin/sh
+barrier="$GJC_LOCK_RACE_DIR"
+lock="$GJC_INSTALL_DIR/.gjc-install.lock"
+if [ "\${1:-}" = "$lock" ] && [ -n "$barrier" ]; then
+  if mkdir "$barrier/cat-first" 2>/dev/null; then
+    while [ ! -f "$barrier/cat-release" ]; do sleep 0.01; done
+  else
+    : > "$barrier/cat-release"
+  fi
+fi
+exec "${binDir}/cat" "$@"
+`;
+	const mvShim = `#!/bin/sh
+barrier="$GJC_LOCK_RACE_DIR"
+lock="$GJC_INSTALL_DIR/.gjc-install.lock"
+source="$1"
+destination="$2"
+if [ "$source" = "$lock" ]; then
+  case "$destination" in
+    "$source.stale."*)
+      if [ -n "$barrier" ] && mkdir "$barrier/mv-first" 2>/dev/null; then
+        "${binDir}/mv" "$@"
+        exit $?
+      fi
+      if [ -n "$barrier" ]; then
+        while [ ! -f "$source" ]; do sleep 0.01; done
+      fi
+      ;;
+  esac
+fi
+exec "${binDir}/mv" "$@"
+`;
+	for (const [name, content] of [
+		["ps", psShim],
+		["cat", catShim],
+		["mv", mvShim],
+	] as const) {
+		const shimPath = path.join(dir, name);
+		fs.writeFileSync(shimPath, content);
+		fs.chmodSync(shimPath, 0o755);
+	}
+}
+
 interface InstallerOptions {
 	cwd?: string;
 	script?: string;
@@ -605,6 +661,30 @@ describe("install.sh binary-first contract", () => {
 		expect(result.exitCode).toBe(0);
 		expect(fs.readFileSync(path.join(sandbox.installDir, "gjc"), "utf8")).toBe(payload);
 		expect(fs.existsSync(lockFile)).toBe(false);
+	});
+
+	test("allows only one concurrent installer to reclaim the same stale lock", async () => {
+		const payload = fakeGjcScript({ version: VERSION });
+		writeCurlShim(sandbox.shimDir, {
+			assets: {
+				[hostBinaryName()]: payload,
+				"gajae-release-binaries.sha256": `${sha256(payload)}  ${hostBinaryName()}\n`,
+			},
+		});
+		const lockFile = path.join(sandbox.installDir, ".gjc-install.lock");
+		const raceDir = path.join(sandbox.root, "lock-race");
+		fs.mkdirSync(raceDir);
+		fs.writeFileSync(lockFile, "999999 stale-nonce\n");
+		writeLockRaceShims(sandbox.shimDir);
+
+		const env = { GJC_LOCK_RACE_DIR: raceDir };
+		const results = await Promise.all([runInstaller([], env), runInstaller([], env)]);
+		const successful = results.filter(result => result.exitCode === 0);
+		expect(successful).toHaveLength(1);
+		expect(results.some(result => (result.stderr + result.stdout).includes("Another GJC installer is already running"))).toBe(true);
+		expect(fs.readFileSync(path.join(sandbox.installDir, "gjc"), "utf8")).toBe(payload);
+		expect(fs.existsSync(lockFile)).toBe(false);
+		expect(fs.existsSync(`${lockFile}.reclaim`)).toBe(false);
 	});
 
 	test("fails closed when an installer lock owner cannot be proven stale", async () => {
