@@ -902,6 +902,29 @@ async function warnAndAuditOutOfBandIfNeeded(
 	return message;
 }
 
+async function assertHandoffRecoveryEnvelopeIntegrity(
+	cwd: string,
+	sessionId: string,
+	filePath: string,
+	skill: CanonicalGjcWorkflowSkill,
+	state: Record<string, unknown>,
+	label: "caller" | "callee",
+): Promise<void> {
+	const receipt = persistedWorkflowReceipt(state.receipt, skill);
+	const checksum = receipt?.content_sha256;
+	if (
+		checksum?.algorithm !== "sha256" ||
+		typeof checksum.value !== "string" ||
+		!/^[0-9a-f]{64}$/.test(checksum.value) ||
+		typeof checksum.covered_path !== "string" ||
+		path.resolve(checksum.covered_path) !== path.resolve(filePath)
+	)
+		throw new StateCommandError(2, `handoff recovery requires checksummed canonical ${label} state`);
+	const integrityWarning = await warnAndAuditOutOfBandIfNeeded(cwd, sessionId, filePath, skill);
+	if (integrityWarning)
+		throw new StateCommandError(2, `${integrityWarning}; handoff recovery refuses tampered ${label} state`);
+}
+
 function existingStateRevision(value: unknown): number | undefined {
 	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
 	const revision = (value as Record<string, unknown>).state_revision;
@@ -2667,17 +2690,20 @@ async function handleHandoffUnlocked(
 		}
 	}
 	if (exactRecovery) {
-		const callerIntegrityWarning = await warnAndAuditOutOfBandIfNeeded(cwd, sessionId, callerPath, caller);
-		if (callerIntegrityWarning)
-			throw new StateCommandError(2, `${callerIntegrityWarning}; handoff recovery refuses tampered caller state`);
-		const calleeIntegrityWarning = await warnAndAuditOutOfBandIfNeeded(cwd, sessionId, calleePath, workflowCallee);
-		if (calleeIntegrityWarning)
-			throw new StateCommandError(2, `${calleeIntegrityWarning}; handoff recovery refuses tampered callee state`);
+		if (calleeRead.kind !== "valid")
+			throw new StateCommandError(2, "completed handoff retry cannot recover a missing callee state");
+		await assertHandoffRecoveryEnvelopeIntegrity(cwd, sessionId, callerPath, caller, existingCaller, "caller");
+		await assertHandoffRecoveryEnvelopeIntegrity(
+			cwd,
+			sessionId,
+			calleePath,
+			workflowCallee,
+			calleeRead.value,
+			"callee",
+		);
 		const retryAt = typeof existingCaller.handoff_at === "string" ? existingCaller.handoff_at.trim() : undefined;
 		if (!retryAt || !retryMutationId || retryMutationId !== `${caller}:handoff:${callee}:${retryAt}`)
 			throw new StateCommandError(2, "handoff retry lacks durable transition identity");
-		if (calleeRead.kind !== "valid")
-			throw new StateCommandError(2, "completed handoff retry cannot recover a missing callee state");
 		if (
 			!handoffReceiptMatches(callerReceiptForRetry, caller, callerPath, activePath, retryMutationId, retryAt) ||
 			calleeRead.value.handoff_from !== caller ||
@@ -2764,12 +2790,15 @@ async function handleHandoffUnlocked(
 	if (pendingCalleeRecovery) {
 		if (calleeRead.kind !== "valid")
 			throw new StateCommandError(2, "handoff recovery cannot proceed without persisted callee state");
-		const callerIntegrityWarning = await warnAndAuditOutOfBandIfNeeded(cwd, sessionId, callerPath, caller);
-		if (callerIntegrityWarning)
-			throw new StateCommandError(2, `${callerIntegrityWarning}; handoff recovery refuses tampered caller state`);
-		const calleeIntegrityWarning = await warnAndAuditOutOfBandIfNeeded(cwd, sessionId, calleePath, workflowCallee);
-		if (calleeIntegrityWarning)
-			throw new StateCommandError(2, `${calleeIntegrityWarning}; handoff recovery refuses tampered callee state`);
+		await assertHandoffRecoveryEnvelopeIntegrity(cwd, sessionId, callerPath, caller, existingCaller, "caller");
+		await assertHandoffRecoveryEnvelopeIntegrity(
+			cwd,
+			sessionId,
+			calleePath,
+			workflowCallee,
+			calleeRead.value,
+			"callee",
+		);
 		const recoveryCalleeState = calleeRead.value;
 		const recoveryCallerState: Record<string, unknown> = {
 			...normalizedCaller,
