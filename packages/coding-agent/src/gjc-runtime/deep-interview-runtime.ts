@@ -517,6 +517,7 @@ async function authoritativeConversationSnapshot(
 	revision: number;
 	messages: Array<{ index: number; role: string; content: string }>;
 }> {
+	let sessionFile = process.env.GJC_SESSION_FILE?.trim();
 	const canonicalCandidates = new Set<string>();
 	const lexicalCandidates = new Set(listProjectSessionTranscriptFiles(cwd).map(candidate => path.resolve(candidate)));
 	const managedScope = await resolveManagedSessionScope({ cwd });
@@ -528,7 +529,7 @@ async function authoritativeConversationSnapshot(
 			throw new DeepInterviewCommandError(2, "managed session transcript listing is unavailable");
 		for (const candidate of managedListing.owned) lexicalCandidates.add(path.resolve(candidate.path));
 	}
-	if (lexicalCandidates.size > 1000)
+	if (!sessionFile && lexicalCandidates.size > 1000)
 		throw new DeepInterviewCommandError(2, "session transcript discovery exceeded the bounded candidate limit");
 	for (const candidate of [...lexicalCandidates].sort()) {
 		try {
@@ -539,7 +540,6 @@ async function authoritativeConversationSnapshot(
 			canonicalCandidates.add(realPath);
 		} catch {}
 	}
-	let sessionFile = process.env.GJC_SESSION_FILE?.trim();
 	// The native command accepts an explicit workspace cwd, which may differ from
 	// process.cwd(). Resolve relative managed transcript paths against that same
 	// workspace so transcript identity and content cannot drift with process launch location.
