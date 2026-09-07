@@ -2361,7 +2361,21 @@ describe("SDK broker identity and discovery", () => {
 			await fs.rm(dir, { recursive: true, force: true });
 		}
 	});
-	it("replays a lifecycle success when endpoint mtime differs by one float ulp (#5376)", async () => {
+	it("endpoint incarnation is stable across one float ulp but binds file identity (#5376)", async () => {
+		const base = { endpointGeneration: 1, endpointMtimeMs: 1788784000000.25, pid: 1234 };
+		const skewed = nextFloat(base.endpointMtimeMs);
+		expect(skewed).not.toBe(base.endpointMtimeMs);
+		expect(Math.abs(skewed - base.endpointMtimeMs)).toBeLessThan(0.001);
+		// Same file, two stat spellings: identical digest.
+		expect(endpointIncarnation({ ...base, endpointMtimeMs: skewed }, "s")).toBe(endpointIncarnation(base, "s"));
+		// Same-millisecond successor with a distinct file identity: stale.
+		expect(endpointIncarnation({ ...base, endpointMtimeMs: skewed, endpointFileId: "64768:111" }, "s")).not.toBe(
+			endpointIncarnation({ ...base, endpointFileId: "64768:222" }, "s"),
+		);
+		// Legacy rows without a file identity still hash (back-compat).
+		expect(endpointIncarnation(base, "s")).toBeString();
+	});
+	it("replays a lifecycle success when the indexed mtime matches the live file (#5376)", async () => {
 		const dir = await temp();
 		const cwd = path.join(dir, "repo");
 		const stateRoot = path.join(cwd, ".gjc", "state");
@@ -2384,7 +2398,8 @@ describe("SDK broker identity and discovery", () => {
 				JSON.stringify({ sessionId, pid: process.pid, url: "ws://127.0.0.1:1", token: "original-token" }),
 			);
 			await broker.start();
-			const firstEndpointMtimeMs = (await fs.stat(endpointPath)).mtimeMs;
+			const liveStat = await fs.stat(endpointPath, { bigint: true });
+			const liveMtimeMs = Number(liveStat.mtimeNs) / 1_000_000;
 			const locator = { cwd, worktreeRoot: null, stateRoot };
 			await broker.index.append({
 				type: "host_registered",
@@ -2392,7 +2407,8 @@ describe("SDK broker identity and discovery", () => {
 				locator,
 				endpointGeneration: 1,
 				pid: process.pid,
-				endpointMtimeMs: firstEndpointMtimeMs,
+				endpointMtimeMs: liveMtimeMs,
+				endpointFileId: `${liveStat.dev}:${liveStat.ino}`,
 			});
 			await broker.index.append({
 				type: "host_heartbeat",
@@ -2415,24 +2431,40 @@ describe("SDK broker identity and discovery", () => {
 					sha256: identity.sha256,
 				},
 			};
-			const first = await broker.handleRequest("session.resume", input, "ulp-replay");
+			const first = await broker.handleRequest("session.resume", input, "fileid-replay");
 			expect(first).toMatchObject({
 				ok: true,
 				result: { endpointGeneration: 1, endpoint: { token: "original-token" } },
 			});
-			const skewedMtimeMs = nextFloat(firstEndpointMtimeMs);
-			expect(Math.abs(skewedMtimeMs - firstEndpointMtimeMs)).toBeLessThan(0.001);
-			expect(skewedMtimeMs).not.toBe(firstEndpointMtimeMs);
+			// Same file re-registered through the libuv-double spelling must replay.
+			const floatStat = await fs.stat(endpointPath);
 			await broker.index.append({
 				type: "host_registered",
 				sessionId,
 				locator,
 				endpointGeneration: 1,
 				pid: process.pid,
-				endpointMtimeMs: skewedMtimeMs,
+				endpointMtimeMs: floatStat.mtimeMs,
+				endpointFileId: `${liveStat.dev}:${liveStat.ino}`,
 			});
-			const replayed = await broker.handleRequest("session.resume", input, "ulp-replay");
-			expect(replayed).toMatchObject({ ok: true });
+			expect(await broker.handleRequest("session.resume", input, "fileid-replay")).toMatchObject({ ok: true });
+			// A genuine successor with a distinct file identity but the same
+			// pid/generation and a colliding rounded mtime is descriptor-stale.
+			await broker.index.append({
+				type: "host_registered",
+				sessionId,
+				locator,
+				endpointGeneration: 1,
+				pid: process.pid,
+				endpointMtimeMs: floatStat.mtimeMs,
+				endpointFileId: "64768:999999999",
+			});
+			// The successor row no longer matches the live descriptor, so the
+			// descriptor-bound read rejects it before replay comparison.
+			expect(await broker.handleRequest("session.resume", input, "fileid-replay")).toEqual({
+				ok: false,
+				error: { code: "endpoint_stale", message: "session endpoint is stale" },
+			});
 		} finally {
 			await broker.stop();
 			await saved?.close();

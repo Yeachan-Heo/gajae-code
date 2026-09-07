@@ -25,6 +25,7 @@ import {
 import { listMcpDelegateHostContexts } from "../hooks/mcp-delegate-host-context";
 import type { WorkflowGate, WorkflowGateQueryRecord } from "../modes/shared/agent-wire/workflow-gate-types";
 import type { BrokerDiscovery } from "../sdk/broker/discovery";
+import { endpointIncarnation } from "../sdk/broker/endpoint-authority";
 import { type EnsureBrokerSettings, ensureBroker } from "../sdk/broker/ensure";
 import { lifecycleRequestTimeoutMs } from "../sdk/broker/startup-budget";
 import { UnsupportedStateVersionError } from "../sdk/broker/state-version";
@@ -5633,9 +5634,19 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			endpointMtimeMs <= 0
 		)
 			return null;
-		return createHash("sha256")
-			.update(canonicalJson({ endpointGeneration, endpointMtimeMs, pid, sessionId }))
-			.digest("hex");
+		// Single canonical producer lives in endpoint-authority.ts (#5376
+		// follow-up): never reimplement the digest recipe here.
+		return (
+			endpointIncarnation(
+				{
+					endpointGeneration,
+					endpointMtimeMs,
+					pid,
+					...(typeof session.endpointFileId === "string" ? { endpointFileId: session.endpointFileId } : {}),
+				},
+				sessionId,
+			) ?? null
+		);
 	}
 
 	type BrokerSessionAuthority = {

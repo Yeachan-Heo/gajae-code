@@ -9,6 +9,7 @@ export interface ExactSessionAuthorityFixture {
 	readonly endpointGeneration: number;
 	readonly pid: number;
 	readonly endpointMtimeMs: number;
+	readonly endpointFileId: string;
 	readonly endpoint: {
 		readonly sessionId: string;
 		readonly pid: number;
@@ -39,11 +40,13 @@ export async function prepareExactSessionAuthority(
 		token: options.token,
 	};
 	await Bun.write(endpointFile, `${JSON.stringify({ version: 1, ...endpoint })}\n`);
+	const stat = await fs.stat(endpointFile, { bigint: true });
 	return {
 		sessionId: options.sessionId,
 		endpointGeneration,
 		pid: process.pid,
-		endpointMtimeMs: (await fs.stat(endpointFile)).mtimeMs,
+		endpointMtimeMs: Number(stat.mtimeNs) / 1_000_000,
+		endpointFileId: `${stat.dev}:${stat.ino}`,
 		endpoint,
 	};
 }
@@ -67,6 +70,7 @@ export async function publishExactSessionAuthority(
 		locator: { cwd: options.cwd, worktreeRoot: null, stateRoot },
 		endpointGeneration: authority.endpointGeneration,
 		pid: authority.pid,
+		endpointFileId: authority.endpointFileId,
 		// A real host publishes its own OS start incarnation; without it the
 		// pid-reuse fence (incarnationMatches) never holds and the session
 		// reads not-live, so the fixture publishes the test process's

@@ -53,6 +53,7 @@ import {
 	readBrokerDiscovery,
 	writeBrokerDiscovery,
 } from "../src/sdk/broker/discovery";
+import { endpointIncarnation } from "../src/sdk/broker/endpoint-authority";
 import {
 	brokerOwnerForTest,
 	type EnsureBrokerSettings,
@@ -352,15 +353,20 @@ async function createSdkControlServer(
 			) as Record<string, unknown>;
 			existing.broker_workspace = brokerWorkspace;
 			existing.endpoint_generation = session.endpointGeneration ?? 1;
-			existing.endpoint_incarnation = createHash("sha256")
-				.update(
-					// brokerEndpointIncarnation hashes a sorted-key canonical object;
-					// keep the fixture digest byte-identical to the broker's.
-					`{"endpointGeneration":${JSON.stringify(session.endpointGeneration ?? 1)},"endpointMtimeMs":${
-						session.endpointMtimeMs
-					},"pid":${session.pid},"sessionId":${JSON.stringify(sessionId)}}`,
-				)
-				.digest("hex");
+			const generation = typeof session.endpointGeneration === "number" ? session.endpointGeneration : 1;
+			const pid = typeof session.pid === "number" ? session.pid : 0;
+			const mtimeMs = typeof session.endpointMtimeMs === "number" ? session.endpointMtimeMs : NaN;
+			const fixtureIncarnation = endpointIncarnation(
+				{
+					endpointGeneration: generation,
+					endpointMtimeMs: mtimeMs,
+					pid,
+					...(typeof session.endpointFileId === "string" ? { endpointFileId: session.endpointFileId } : {}),
+				},
+				sessionId,
+			);
+			if (!fixtureIncarnation) throw new Error("fixture session lacks endpoint authority");
+			existing.endpoint_incarnation = fixtureIncarnation;
 			// The verifier is minted through the server so its private key stays in
 			// the server's signing map and signed sidecar patches remain verifiable.
 			existing.sidecar_verifier ??= server.mintSidecarSigningAuthorityForTest();
@@ -384,6 +390,7 @@ async function createSdkControlServer(
 					endpointGeneration: session.endpointGeneration,
 					pid: session.pid,
 					endpointMtimeMs: session.endpointMtimeMs,
+					...(typeof session.endpointFileId === "string" ? { endpointFileId: session.endpointFileId } : {}),
 					indexSeq: 1,
 				};
 			}),

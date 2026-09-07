@@ -11,6 +11,7 @@ import { openLifecycleSessionManager, runSessionHost, watchSessionHostBrokerLive
 import { planLaunchWorktree } from "../src/gjc-runtime/launch-worktree";
 import { AcpAgent } from "../src/modes/acp/acp-agent";
 import { Broker, type BrokerCleanupEvidence, type BrokerResponse } from "../src/sdk/broker/broker";
+import { endpointIncarnation } from "../src/sdk/broker/endpoint-authority";
 import { brokerOwnerForTest, startFixtureBrokerWithLeaseForTest } from "../src/sdk/broker/ensure";
 import { deriveIdempotencyIdentity } from "../src/sdk/broker/identity";
 import {
@@ -4999,9 +5000,11 @@ test("idempotent lifecycle replay refreshes unchanged authority after a broker r
 		const targetHash = createHash("sha256").update(canonicalJson({ sessionId })).digest("hex");
 		const identity = await deriveIdempotencyIdentity(agentDir, "session.resume", key, targetHash);
 		const input = { cwd: root, stateRoot, sessionId };
-		const endpointIncarnation = createHash("sha256")
-			.update(canonicalJson({ endpointGeneration: 2, endpointMtimeMs, pid: host.pid, sessionId }))
-			.digest("hex");
+		const seededIncarnation = endpointIncarnation(
+			{ endpointGeneration: 2, endpointMtimeMs, pid: host.pid },
+			sessionId,
+		);
+		expect(seededIncarnation).toBeString();
 		const requestHash = createHash("sha256")
 			.update(canonicalJson({ operation: "session.resume", input }))
 			.digest("hex");
@@ -5013,7 +5016,7 @@ test("idempotent lifecycle replay refreshes unchanged authority after a broker r
 					sessionId,
 					cwd: root,
 					endpointGeneration: 2,
-					endpointIncarnation,
+					endpointIncarnation: seededIncarnation,
 					pid: host.pid,
 					endpointMtimeMs,
 					reused: true,
@@ -5030,7 +5033,7 @@ test("idempotent lifecycle replay refreshes unchanged authority after a broker r
 				sessionId,
 				cwd: root,
 				endpointGeneration: 2,
-				endpointIncarnation,
+				endpointIncarnation: seededIncarnation,
 				pid: host.pid,
 				endpointMtimeMs,
 				reused: true,

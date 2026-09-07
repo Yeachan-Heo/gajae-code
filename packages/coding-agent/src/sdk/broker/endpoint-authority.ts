@@ -23,7 +23,7 @@ export type IndexedEndpointAuthority = {
 
 /** Derive the broker-compatible opaque authority for one indexed endpoint generation. */
 export function endpointIncarnation(
-	record: { endpointGeneration: number; endpointMtimeMs?: number; pid: number },
+	record: { endpointGeneration: number; endpointMtimeMs?: number; pid: number; endpointFileId?: string },
 	sessionId: string,
 ): string | undefined {
 	if (
@@ -43,9 +43,12 @@ export function endpointIncarnation(
 				// Filesystem mtime is only millisecond-precise, and the two stat
 				// spellings used across this path (bigint mtimeNs/1e6 vs libuv
 				// double mtimeMs) can disagree by 1 float ulp (~0.00024ms) for the
-				// same file (#5376). Quantize so equivalent reads hash identically;
-				// a genuine replacement still differs by >=1ms or pid/generation.
+				// same file (#5376). Quantize so equivalent reads hash identically.
+				// The immutable endpoint file identity (dev:ino) stays exact, so a
+				// genuine same-millisecond successor replacement still changes the
+				// digest even when pid/generation are reused.
 				endpointMtimeMs: Math.round(record.endpointMtimeMs),
+				...(record.endpointFileId === undefined ? {} : { endpointFileId: record.endpointFileId }),
 				pid: record.pid,
 				sessionId,
 			}),
