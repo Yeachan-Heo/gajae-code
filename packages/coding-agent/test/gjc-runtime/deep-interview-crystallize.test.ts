@@ -506,7 +506,13 @@ describe("deep-interview crystallize contract", () => {
 			revision: 1,
 			start: 0,
 			end: 0,
-			messages: [{ index: 0, role: "user", content: "Use PostgreSQL for storage. Switch to dark mode." }],
+			messages: [
+				{
+					index: 0,
+					role: "user",
+					content: "Use PostgreSQL for storage. Switch to dark mode. PostgreSQL supports backups.",
+				},
+			],
 			digest: "",
 		};
 		unrelatedReplacementSnapshot.digest = crystalSnapshotDigest(unrelatedReplacementSnapshot);
