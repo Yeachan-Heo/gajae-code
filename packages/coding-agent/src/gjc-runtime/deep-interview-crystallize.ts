@@ -1372,8 +1372,8 @@ export function crystallizeDeepInterview(value: unknown): DeepInterviewCrystal {
 				anchor.message_index > priorEnd &&
 				message.content.includes(anchor.quote) &&
 				hasVerbatimTokenBoundaries(message.content, anchor.quote) &&
-				(/\b(?:keep|retain|restore|preserve|maintain)\b/i.test(message.content) ||
-					/(?:유지|보존|복원|保持|保留|恢复|恢復|復元)/u.test(message.content)) &&
+				(/\b(?:keep|retain|restore|preserve|maintain)\b/i.test(anchoredClause(message.content, anchor.quote)) ||
+					/(?:유지|보존|복원|保持|保留|恢复|恢復|復元)/u.test(anchoredClause(message.content, anchor.quote))) &&
 				([...topicTerms(previous.statement, false)].some(term => evidenceTerms(anchor.quote).has(term)) ||
 					hasCjkTopicOverlap(previous.statement, anchor.quote)),
 		);
@@ -1474,6 +1474,8 @@ export function crystallizeDeepInterview(value: unknown): DeepInterviewCrystal {
 			return (
 				replacement !== undefined &&
 				!sameIntent(replacement, previous) &&
+				replacement.anchor !== undefined &&
+				/\b(?:actually|instead|rather|replace|replaced|no longer|not)\b/i.test(replacement.anchor.quote) &&
 				[...directiveTerms].every(term => evidenceTerms(previous.statement).has(term))
 			);
 		});
@@ -1500,7 +1502,7 @@ export function crystallizeDeepInterview(value: unknown): DeepInterviewCrystal {
 		});
 		const unresolved = [...gaps, ...conflicts].some(item => {
 			const itemTerms = topicTerms(item, false);
-			return [...directiveTerms].every(term => itemTerms.has(term));
+			return directiveTerms.size === itemTerms.size && [...directiveTerms].every(term => itemTerms.has(term));
 		});
 		if (!represented && !explicitlySuperseded && !explicitlyPreserved && !representedRemoval && !unresolved)
 			throw new Error(`unrepresented user directive requires an item or unresolved gap: ${directive.clause}`);

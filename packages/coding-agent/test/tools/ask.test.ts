@@ -3079,24 +3079,32 @@ describe("AskTool deep-interview recorder persistence", () => {
 		expect(record).not.toHaveBeenCalled();
 	});
 
-	it("rejects multiple Deep Interview execution gates in one ask", async () => {
+	it("rejects multiple execution-authorizing gates across workflow stages", async () => {
 		const tool = new AskTool(createSession());
 		await expect(
 			tool.execute(
 				"conflicting-execution-gates",
 				{
-					questions: ["first", "second"].map(id => ({
-						id,
-						question: "Choose the execution path",
-						options: [{ label: "Execute with ultragoal" }, { label: "Stop here" }],
-						workflowGate: { stage: "deep-interview" as const, kind: "execution" as const },
-					})),
+					questions: [
+						{
+							id: "first",
+							question: "Choose the execution path",
+							options: [{ label: "Execute with ultragoal" }, { label: "Stop here" }],
+							workflowGate: { stage: "deep-interview", kind: "execution" },
+						},
+						{
+							id: "second",
+							question: "Approve the final plan",
+							options: [{ label: "Approve execution via ultragoal" }, { label: "Stop here" }],
+							workflowGate: { stage: "ralplan", kind: "approval" },
+						},
+					],
 				},
 				undefined,
 				undefined,
 				createContext({ select: async () => "Execute with ultragoal" }),
 			),
-		).rejects.toThrow("at most one Deep Interview execution gate");
+		).rejects.toThrow("at most one execution-authorizing workflow gate");
 	});
 
 	it("discards focused intent choices before multi-question timeout navigation", async () => {
