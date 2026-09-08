@@ -18,6 +18,8 @@
 - Cursor Connect exec handlers now receive a per-exec AbortSignal. The caller abort and the local exec deadline both abort it, and the coding-agent bridge threads it into `tool.execute`, so timed-out or caller-cancelled Cursor-local tools can actually stop instead of running to completion after the turn terminalizes. The transport abort fence is also installed before payload setup and rechecked immediately before proxy connect and request creation, closing the race where cancellation won after the check while bearer credentials were still transmitted (#4834 review).
 - A started non-abortable Cursor mutation now keeps stream/run terminal publication behind the mutation's actual settlement. Caller abort and the local exec deadline still determine the eventual terminal reason, but neither can publish while an archive write may still commit, preventing post-terminal filesystem mutation (#4834 review).
 - Cursor `delete` is now part of the non-abortable settlement fence: its dispatch forwards `markNonAbortable` through the Agent run guard and the coding-agent bridge marks before the unlink runs, so a caller abort or deadline can no longer publish the exec terminal while the deletion is still in flight (#4834 review).
+- Cursor usage-context caching now hashes only normalized wire-visible tool definitions instead of complete class-backed tool instances. Session state containing filesystem `bigint` identities can no longer fail requests during preflight serialization, while tool name, description, and schema changes still invalidate cached conversation state.
+
 ## [0.16.6] - 2026-09-07
 
 ## [0.16.5] - 2026-09-07

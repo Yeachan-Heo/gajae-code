@@ -4527,26 +4527,40 @@ function readCursorBlob(blobStore: Map<string, Uint8Array>, blobId: Uint8Array):
 
 const CURSOR_NATIVE_TOOL_NAMES = new Set(["bash", "read", "write", "delete", "ls", "grep", "lsp", "todo_write"]);
 
+interface CursorWireToolIdentity {
+	name: string;
+	description: string;
+	inputSchema: JsonValue;
+}
+
+function buildCursorWireToolIdentities(tools: Tool[] | undefined): CursorWireToolIdentity[] {
+	if (!tools || tools.length === 0) return [];
+
+	return tools
+		.filter(tool => !CURSOR_NATIVE_TOOL_NAMES.has(tool.name))
+		.map(tool => {
+			const jsonSchema = flattenToolRootCombinators(toolWireSchema(tool));
+			return {
+				name: tool.name,
+				description: tool.description || "",
+				inputSchema:
+					jsonSchema && typeof jsonSchema === "object"
+						? (jsonSchema as JsonValue)
+						: { type: "object", properties: {}, required: [] },
+			};
+		});
+}
+
+function buildCursorUsageToolsKey(tools: Tool[] | undefined): string {
+	return hashCursorConversationValue(buildCursorWireToolIdentities(tools));
+}
+
 function buildMcpToolDefinitions(tools: Tool[] | undefined): McpToolDefinition[] {
-	if (!tools || tools.length === 0) {
-		return [];
-	}
-
-	const advertisedTools = tools.filter(tool => !CURSOR_NATIVE_TOOL_NAMES.has(tool.name));
-	if (advertisedTools.length === 0) {
-		return [];
-	}
-
-	return advertisedTools.map(tool => {
-		const jsonSchema = flattenToolRootCombinators(toolWireSchema(tool));
-		const schemaValue: JsonValue =
-			jsonSchema && typeof jsonSchema === "object"
-				? (jsonSchema as JsonValue)
-				: { type: "object", properties: {}, required: [] };
-		const inputSchema = toBinary(ValueSchema, fromJson(ValueSchema, schemaValue));
+	return buildCursorWireToolIdentities(tools).map(tool => {
+		const inputSchema = toBinary(ValueSchema, fromJson(ValueSchema, tool.inputSchema));
 		return create(McpToolDefinitionSchema, {
 			name: tool.name,
-			description: tool.description || "",
+			description: tool.description,
 			providerIdentifier: "pi-agent",
 			toolName: tool.name,
 			inputSchema,
@@ -4827,6 +4841,11 @@ function buildConversationTurns(messages: Message[], blobStore: Map<string, Uint
 	return turns;
 }
 
+/** Exported for regression coverage of the tool usage-cache identity boundary. */
+export function buildCursorUsageToolsKeyForTest(tools: Tool[]): string {
+	return buildCursorUsageToolsKey(tools);
+}
+
 /** Exported for tests: decodes Cursor history blobs built from conversation messages. */
 export function buildCursorHistoryForTest(messages: Message[]): {
 	rootPromptMessagesJson: unknown[];
@@ -4898,16 +4917,7 @@ function buildCursorConversationContext(
 		}),
 		systemPromptKey: hashCursorConversationValue(context.systemPrompt ?? []),
 		customSystemPromptKey: hashCursorConversationValue(options?.customSystemPrompt ?? ""),
-		toolsKey: hashCursorConversationValue(
-			(context.tools ?? []).map(tool => ({
-				name: tool.name,
-				description: tool.description,
-				parameters: toolWireSchema(tool),
-				strict: tool.strict,
-				customFormat: tool.customFormat,
-				customWireName: tool.customWireName,
-			})),
-		),
+		toolsKey: buildCursorUsageToolsKey(context.tools),
 		messageKeys: context.messages.map(hashCursorConversationMessage),
 	};
 }
