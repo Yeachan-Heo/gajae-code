@@ -657,9 +657,10 @@ function validateItems(value: unknown, snapshot?: CrystalSnapshot): CrystalItem[
 				const conjunctiveQuote = /\b(?:and|plus|as\s+well\s+as)\b/i.test(item.anchor.quote);
 				const statementSemantics = semanticProfile(item.statement);
 				const quoteSemantics = semanticProfile(anchoredClause(anchorMessage.content, item.anchor.quote));
-				const quoteClauses = anchoredClause(anchorMessage.content, item.anchor.quote)
-					.split(/(?:[!?。！？;]|\.(?=\s|$)|\n)+\s*/u)
-					.filter(Boolean);
+				const fullAnchorClause = anchoredClause(anchorMessage.content, item.anchor.quote);
+				const quoteClauses = fullAnchorClause.split(/(?:[!?。！？;]|\.(?=\s|$)|\n)+\s*/u).filter(Boolean);
+				const partialMultiDirectiveAnchor =
+					quoteClauses.length > 1 && fullAnchorClause !== item.anchor.quote.trim();
 				const mixedClausePolarity =
 					quoteClauses.length > 1 &&
 					new Set(quoteClauses.map(clause => semanticProfile(clause).negative)).size > 1;
@@ -680,6 +681,7 @@ function validateItems(value: unknown, snapshot?: CrystalSnapshot): CrystalItem[
 						JSON.stringify(quantitativeEvidenceSequence(item.statement)) !==
 							JSON.stringify(quantitativeEvidenceSequence(item.anchor.quote))) ||
 					mixedClausePolarity ||
+					partialMultiDirectiveAnchor ||
 					!preservesEvidenceOrder(item.statement, item.anchor.quote) ||
 					isUnsafeConfirmedStatement(statementSemantics) ||
 					!sameSemanticIntent(statementSemantics, quoteSemantics)
@@ -914,7 +916,7 @@ function hasConcreteResolutionValue(value: string, item: string, conflict: boole
 	);
 	return (
 		newTerms.length > 0 ||
-		/\b(?:yes|no|true|false|enabled|disabled)\b/i.test(value) ||
+		/\b(?:yes|no|on|off|true|false|enabled|disabled)\b/i.test(value) ||
 		/(?:예|네|아니요|아니|是|否|はい|いいえ)/u.test(value) ||
 		/\d/.test(value)
 	);
@@ -1360,12 +1362,10 @@ export function crystallizeDeepInterview(value: unknown): DeepInterviewCrystal {
 			)
 			.map(item => item.id),
 	);
+	if (crossIdSupersededIds.size > 0)
+		throw new Error("cross-ID replacement requires explicit removal of the superseded item");
 	for (const item of canonicalPriorItems)
-		if (
-			!allRemovedIds.includes(item.id) &&
-			!crossIdSupersededIds.has(item.id) &&
-			!mergedItems.some(candidate => candidate.id === item.id)
-		)
+		if (!allRemovedIds.includes(item.id) && !mergedItems.some(candidate => candidate.id === item.id))
 			mergedItems.push(item);
 	for (const anchor of [...resolvedGapAnchors, ...resolvedConflictAnchors]) {
 		const answerTerms = evidenceTerms(anchor.resolution);
