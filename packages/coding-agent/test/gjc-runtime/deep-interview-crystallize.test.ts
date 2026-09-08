@@ -1570,6 +1570,19 @@ describe("deep-interview crystallize contract", () => {
 
 	it("accepts explicit no-longer-needed removal evidence", () => {
 		const first = crystallizeDeepInterview(input());
+		const boundary = withFreshUserEvidence(
+			input({ prior: first, items: [first.items[0]!], removed_ids: ["constraint:latency"] }),
+			"Unremove the fast constraint.",
+		);
+		boundary.removed_item_anchors = [
+			{
+				item: "constraint:latency",
+				message_index: 1,
+				quote: "remove the fast constraint",
+				resolution: "remove the fast constraint",
+			},
+		];
+		expect(() => crystallizeDeepInterview(boundary)).toThrow("fresh statement-bound user removal evidence");
 		const resolution = "We do not need fast performance any longer.";
 		const next = withFreshUserEvidence(
 			input({ prior: first, items: [first.items[0]!], removed_ids: ["constraint:latency"] }),
