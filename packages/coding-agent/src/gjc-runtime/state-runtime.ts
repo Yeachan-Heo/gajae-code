@@ -2887,6 +2887,35 @@ interface VerifiedRalplanFinalEvidence {
 	finalSha256: string;
 }
 
+async function hasDurableRalplanPlanningStuck(
+	cwd: string,
+	sessionId: string,
+	state: Record<string, unknown>,
+): Promise<boolean> {
+	if (isPlainObject(state.planning_stuck)) return true;
+	const admission = isPlainObject(state.auto_handoff) ? state.auto_handoff : undefined;
+	if (admission?.degradationReason === "planning_stuck") return true;
+	const runId = typeof state.run_id === "string" ? state.run_id.trim() : "";
+	if (!runId) return false;
+	try {
+		assertSafePathComponent(runId, "ralplan run-id");
+		const indexPath = path.join(sessionPlansDir(cwd, sessionId), "ralplan", runId, "index.jsonl");
+		const text = await readBoundedIdentityText(indexPath, 1024 * 1024, "ralplan final index");
+		if (text === undefined) return false;
+		return text.split(/\r?\n/).some(line => {
+			if (!line.trim()) return false;
+			try {
+				const row = JSON.parse(line) as unknown;
+				return isPlainObject(row) && (row.planning_stuck === true || row.event === "planning_stuck");
+			} catch {
+				return true;
+			}
+		});
+	} catch {
+		return true;
+	}
+}
+
 async function verifiedRalplanFinalEvidence(
 	cwd: string,
 	sessionId: string,
@@ -3470,6 +3499,8 @@ async function handleHandoffUnlocked(
 		if (integrityWarning)
 			throw new StateCommandError(2, `${integrityWarning}; execution handoff refuses tampered mode-state`);
 	}
+	if (caller === "ralplan" && (await hasDurableRalplanPlanningStuck(cwd, sessionId, existingCaller)))
+		throw new StateCommandError(2, "planning-stuck Ralplan is terminal and cannot hand off");
 	let ralplanExecutionFinal: VerifiedRalplanFinalEvidence | undefined;
 	if (caller === "ralplan" && callee === "ultragoal") {
 		ralplanExecutionFinal = await verifiedRalplanFinalEvidence(cwd, sessionId, existingCaller);
