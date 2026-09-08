@@ -249,6 +249,9 @@ function assertHandoffLineageUnchanged(
 ): void {
 	for (const field of ["handoff_from", "handoff_to", "handoff_at"] as const) {
 		const existing = typeof existingEnvelope[field] === "string" ? existingEnvelope[field].trim() : "";
+		const merged = typeof mergedEnvelope[field] === "string" ? mergedEnvelope[field].trim() : "";
+		if (!existing && merged && surface === "generic state write")
+			throw new StateCommandError(2, `handoff lineage cannot be introduced through ${surface}`);
 		if (existing && mergedEnvelope[field] !== existing)
 			throw new StateCommandError(2, `handoff lineage is immutable through ${surface}`);
 	}
