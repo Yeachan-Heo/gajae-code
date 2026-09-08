@@ -4723,7 +4723,19 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		const sessionAsyncJobManager = asyncJobManager;
 		if (sessionAsyncJobManager) {
 			session.yieldQueue.register<AsyncResultEntry>("async-result", {
-				onDrop: entry => sessionAsyncJobManager.releaseDeliveryClaim(entry.generation),
+				onDrop: entry => {
+					sessionAsyncJobManager.releaseDeliveryClaim(entry.generation);
+					if (!entry.ownedCompletion) return;
+					const job = sessionAsyncJobManager.getJob(entry.jobId);
+					if (
+						job?.generation === entry.generation &&
+						job.status !== "completed" &&
+						job.status !== "cancelled" &&
+						job.status !== "failed"
+					)
+						return;
+					unregisterOwnedRegistration(entry.ownedCompletion.registration);
+				},
 				// YieldQueue calls this only after streaming/idle injection succeeds;
 				// admission retries therefore retain the claim with the queued entry.
 				onDelivered: entry => sessionAsyncJobManager.releaseDeliveryClaim(entry.generation),

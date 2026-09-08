@@ -1029,6 +1029,28 @@ export async function writeActiveEntry(
 	return result;
 }
 
+/** Replace an exact caller-owned active entry with its predecessor under one lock. */
+export async function restoreActiveEntryIfOwned(
+	cwd: string,
+	receipt: GuardedStateWriteReceipt,
+	predecessor: SkillActiveEntry,
+): Promise<boolean> {
+	return lockResolvedWorkflowTarget(receipt.path, async () => {
+		const current = await readJsonIfPresent(receipt.path);
+		if (!matchesGuardedStateWriteReceipt(current, receipt)) return false;
+		const restored = await writeGuardedResolvedJsonAtomic(receipt.path, predecessor, {
+			cwd,
+			policy: "cache",
+			sourceRevision: persistedSourceRevision(current) + 1,
+			advanceSourceRevision: true,
+			lockHeld: true,
+		});
+		if (!restored.written) return false;
+		invalidateActiveStateCacheForScope(cwd, predecessor.session_id);
+		return true;
+	});
+}
+
 export async function removeActiveEntry(
 	cwd: string,
 	sessionScope: string | ActiveSessionScope | undefined,
