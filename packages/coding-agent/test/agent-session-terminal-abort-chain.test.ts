@@ -224,6 +224,11 @@ describe("terminal abort registers a turn scope so left-running owned work class
 				// teardown itself is responsible for settling.
 				await manager.dispose({ timeoutMs: 3_000 });
 				await session.awaitCoordinatorRuntimeStatePersistenceForTests();
+				// #5321's sidecar-settlement wait, kept but moved AFTER the manager
+				// disposal above: awaiting session work before that dispose is the
+				// order 3224ac7e27 removed, because a completion callback owned by
+				// this manager can enqueue persistence and deadlock teardown.
+				await session.awaitSessionSettlement();
 				await session.dispose();
 			}
 		} finally {
