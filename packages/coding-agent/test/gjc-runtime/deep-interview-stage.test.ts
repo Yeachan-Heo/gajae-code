@@ -697,6 +697,9 @@ describe("deep-interview staged transitions", () => {
 					"write",
 					"--input",
 					JSON.stringify({
+						current_phase: "handoff",
+						spec_path: "/tmp/legacy-spec.md",
+						spec_sha256: "a".repeat(64),
 						state: { note_a: "kept", established_facts: [{ id: "f1", statement: "fact", round: 1 }] },
 					}),
 					"--json",
@@ -726,6 +729,9 @@ describe("deep-interview staged transitions", () => {
 		expect(afterState.fresh).toBe(true);
 		expect(afterState.note_a).toBeUndefined();
 		expect(afterState.note_b).toBeUndefined();
+		expect(after.current_phase).not.toBe("handoff");
+		expect(after.spec_path).toBeUndefined();
+		expect(after.spec_sha256).toBeUndefined();
 	});
 
 	it("reset preserves canonical Crystal and spec ownership metadata", async () => {
