@@ -165,6 +165,30 @@ describe("deep-interview crystallize contract", () => {
 				}),
 			),
 		).toThrow("unrepresented user directive");
+		const commaSnapshot: CrystalSnapshot = {
+			revision: 1,
+			start: 0,
+			end: 0,
+			messages: [{ index: 0, role: "user", content: "Use PostgreSQL, encrypt backups." }],
+			digest: "",
+		};
+		commaSnapshot.digest = crystalSnapshotDigest(commaSnapshot);
+		expect(() =>
+			crystallizeDeepInterview(
+				input({
+					snapshot: commaSnapshot,
+					items: [
+						{
+							id: "decision:database",
+							kind: "decision",
+							classification: "confirmed",
+							statement: "Use PostgreSQL",
+							anchor: { message_index: 0, quote: "Use PostgreSQL" },
+						},
+					],
+				}),
+			),
+		).toThrow("unrepresented user directive");
 		const shortSnapshot: CrystalSnapshot = {
 			...snapshot,
 			messages: [
@@ -915,6 +939,7 @@ describe("deep-interview crystallize contract", () => {
 			["Use one replica.", "Use one replica.", "Use replica"],
 			["Keep logging off.", "Keep logging off.", "Keep logging on"],
 			["Make daily backups.", "Make daily backups.", "Support daily backups"],
+			["Store encrypted passwords.", "Store encrypted passwords.", "Store passwords"],
 			[
 				"Set the environment variable API_KEY.",
 				"Set the environment variable API_KEY.",
@@ -1587,7 +1612,7 @@ describe("deep-interview crystallize contract", () => {
 			current_revision: 2,
 			items: input().items.map(item => ({
 				...item,
-				anchor: { message_index: 1, quote: "Build a fast report." },
+				anchor: { ...item.anchor!, message_index: 1 },
 			})),
 		});
 		expect(crystallizeDeepInterview(value).source.messages[0]?.content).toBe("");
@@ -1831,7 +1856,7 @@ describe("deep-interview crystallize contract", () => {
 					first.items[0]!,
 					{
 						...first.items[1]!,
-						anchor: { message_index: keepIndex, quote: "Keep the fast constraint." },
+						anchor: { message_index: keepIndex, quote: "fast" },
 					},
 				],
 				snapshot: pending.source,
@@ -1960,7 +1985,7 @@ describe("deep-interview crystallize contract", () => {
 					first.items[0]!,
 					{
 						...first.items[1]!,
-						anchor: { message_index: 3, quote: "Restore the fast constraint." },
+						anchor: { message_index: 3, quote: "fast" },
 					},
 				],
 				snapshot: carried.source,
