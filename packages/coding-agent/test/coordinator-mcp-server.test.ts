@@ -9232,6 +9232,51 @@ describe("Coordinator MCP deep-audit regressions", () => {
 		expect(JSON.stringify(scoped)).toContain("audit-evidence.txt");
 	});
 
+	it.each([
+		{ code: null, expectedError: null },
+		{
+			code: "timeout",
+			expectedError: { code: "timeout", message: "Coordinator request timed out." },
+		},
+		{
+			code: "hostile_sdk_code",
+			expectedError: { code: "unavailable", message: "Coordinator service is unavailable." },
+		},
+	])("preserves null and sanitizes public turn errors ($code)", async ({ code, expectedError }) => {
+		const root = await tempRoot();
+		const server = await createSdkControlServer(root, []);
+		await registerSdkSession(server, root);
+		const sent = await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "visible-session",
+			prompt: "public error serialization",
+			idempotency_key: "public-error-serialization",
+			allow_mutation: true,
+		});
+		expect(sent).toMatchObject({ ok: true });
+		if (code === null) {
+			expect((sent.turn as Record<string, unknown>).error).toBeNull();
+		} else {
+			const paths = coordinatorStatePaths(server.config.stateRoot, server.config.namespace.identity);
+			await withSessionTransaction(paths, "visible-session", async transaction => {
+				const turn = transaction.canonical.turns[String(sent.turn_id)];
+				if (!turn) throw new Error("missing turn");
+				turn.error = {
+					code,
+					message: "Bearer secret-token https://controller.example.test/private /Users/secret/project",
+					recoverable: true,
+				};
+			});
+		}
+		const read = await server.callTool("gjc_coordinator_read_turn", { turn_id: sent.turn_id });
+		expect(read).toMatchObject({ ok: true, turn: { turn_id: sent.turn_id } });
+		expect((read.turn as Record<string, unknown>).error).toEqual(expectedError);
+		const status = await server.callTool("gjc_coordinator_read_coordination_status", {
+			session_id: "visible-session",
+		});
+		expect(status).toMatchObject({ ok: true, turns: [{ turn_id: sent.turn_id }] });
+		expect((status.turns as Array<Record<string, unknown>>)[0]!.error).toEqual(expectedError);
+	});
+
 	it("maps hostile SDK failures to fixed public errors", async () => {
 		const root = await tempRoot();
 		const hostile = "Bearer secret-token https://controller.example.test/private /Users/secret/project";

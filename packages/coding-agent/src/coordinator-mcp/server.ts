@@ -1377,7 +1377,7 @@ function boundedPublicValue(value: unknown, budget: { remaining: number }, depth
 	const output: Record<string, unknown> = {};
 	for (const key of Object.keys(value as Record<string, unknown>).slice(0, 128)) {
 		const field = (value as Record<string, unknown>)[key];
-		if (key === "error") {
+		if (key === "error" && field !== null) {
 			const rawCode =
 				field && typeof field === "object" && !Array.isArray(field)
 					? (field as Record<string, unknown>).code
