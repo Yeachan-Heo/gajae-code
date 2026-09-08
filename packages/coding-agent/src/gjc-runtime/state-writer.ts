@@ -1071,6 +1071,41 @@ export async function updateActiveEntryIfExact(
 	);
 }
 
+/** Merge active subskills against the authoritative raw entry under the active-store transaction. */
+export async function mergeActiveEntrySubskills(
+	cwd: string,
+	sessionScope: string | ActiveSessionScope,
+	skill: string,
+	fallback: SkillActiveEntry,
+	activeSubskills: SkillActiveEntry["active_subskills"],
+	updatedAt: string,
+): Promise<{ predecessor: SkillActiveEntry; result: GuardedWriteResult }> {
+	const filePath = activeEntryPath(path.resolve(cwd), sessionScope, skill);
+	return withActiveStateScopeLock(cwd, sessionScope, () =>
+		lockResolvedWorkflowTarget(filePath, async () => {
+			const current = await readJsonIfPresent(filePath);
+			const predecessor =
+				current && typeof current === "object" && !Array.isArray(current)
+					? (current as SkillActiveEntry)
+					: fallback;
+			const replacement: SkillActiveEntry = {
+				...predecessor,
+				skill,
+				active_subskills: activeSubskills,
+				updated_at: updatedAt,
+			};
+			const result = await writeGuardedResolvedJsonAtomic(filePath, replacement, {
+				cwd,
+				policy: "cache",
+				sourceRevision: persistedSourceRevision(current) + 1,
+				lockHeld: true,
+			});
+			invalidateActiveStateCacheForScope(cwd, sessionScope);
+			return { predecessor, result };
+		}),
+	);
+}
+
 /** Replace an exact caller-owned active entry with its predecessor under one lock. */
 export async function restoreActiveEntryIfOwned(
 	cwd: string,

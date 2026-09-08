@@ -5458,6 +5458,27 @@ async function executeToolCalls(
 				};
 				isError = true;
 			}
+			if (afterToolCall && !record.started) {
+				try {
+					await afterToolCall(
+						{
+							assistantMessage,
+							toolCall,
+							args: record.args,
+							result: {
+								content: [{ type: "text", text: "Tool call failed before dispatch." }],
+								isError: true,
+								details: { cancellation: "pre_dispatch_failure" },
+							},
+							isError: true,
+							context: currentContext,
+						},
+						toolSignal,
+					);
+				} catch {
+					// Pre-dispatch failure is authoritative; cleanup hooks are best-effort.
+				}
+			}
 
 			if (afterToolCall && record.started && (signal?.aborted || toolSignal.aborted)) {
 				try {
