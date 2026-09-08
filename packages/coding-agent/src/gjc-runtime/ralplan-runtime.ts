@@ -1062,6 +1062,8 @@ async function persistActiveRunId(cwd: string, sessionId: string, runId: string,
 				}
 				delete existing.planning_stuck;
 				delete existing.auto_handoff;
+				delete existing.handoff_from;
+				delete existing.handoff_at;
 			}
 			if (
 				existing.run_id === runId &&
