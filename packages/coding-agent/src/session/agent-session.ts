@@ -8440,6 +8440,16 @@ export class AgentSession {
 									}
 									this.#assertNoSessionTransition();
 									if (this.#turnEndPersistenceFailure) await this.#reconcileTurnEndPersistenceFailure();
+									if (!canContinue()) return;
+									if (this.#hasQueuedFreshRootRequest()) this.#resumeFromOwnedCompletion();
+									if (this.#isTurnContinuationBlocked()) {
+										skip("terminal_turn");
+										return;
+									}
+									if (this.#handoffTransitionActive) {
+										skip("handoff_in_progress");
+										return;
+									}
 									this.#assertNoSessionTransition();
 									if (
 										this.sessionId !== scheduledSessionId ||
