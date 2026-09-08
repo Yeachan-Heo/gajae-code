@@ -167,7 +167,9 @@ function deepInterviewExecutionTarget(selectedOptions: readonly string[]): "ultr
 		.replace(/\s*\(Recommended\)\s*$/i, "")
 		.toLowerCase();
 	return normalized === "approve execution via ultragoal" ||
-		normalized === "execute with ultragoal" ||
+		/^execute with ultragoal(?: \(only when spec is already implementation-ready and really simple\))?$/.test(
+			normalized ?? "",
+		) ||
 		normalized === "ultragoal" ||
 		normalized === "/skill:ultragoal" ||
 		normalized === "gjc ultragoal"
