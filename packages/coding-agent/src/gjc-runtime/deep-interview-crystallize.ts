@@ -994,7 +994,7 @@ function validateResolutionAnchors(
 			/^(?:should|is|are|can|could|do|does|did|will|would)\b/i.test(item.trim());
 		const conciseState =
 			/^(?:on|off)[.!]?$/i.test(resolution.trim()) &&
-			/\b(?:enabled|disabled|enable|disable|on|off|state|toggle)\b/i.test(item);
+			/\b(?:enabled|disabled|enable|disable|state|toggle)\b/i.test(item);
 		const conciseAnswer = conciseBoolean || conciseState;
 		const addressesItem =
 			(itemTerms.size > 0 && [...itemTerms].every(term => resolutionTerms.has(term))) ||
