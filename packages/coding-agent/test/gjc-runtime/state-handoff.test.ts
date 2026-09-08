@@ -713,8 +713,8 @@ describe("gjc state handoff", () => {
 				["handoff", "--mode", "deep-interview", "--to", "ralplan", "--json"],
 				cwd,
 			);
-			expect(rejected.status).toBe(1);
-			expect(rejected.stderr).toContain("persisted deep-interview spec exceeds max length 100000");
+			expect(rejected.status).toBe(2);
+			expect(rejected.stderr).toContain("persisted deep-interview spec is invalid");
 			expect(await fs.readFile(callerPath, "utf-8")).toBe(before);
 			await expect(fs.access(modeStatePath(cwd, TEST_SESSION_ID, "ralplan"))).rejects.toThrow();
 			await expect(fs.access(activeSnapshotPath(cwd, TEST_SESSION_ID))).rejects.toThrow();
