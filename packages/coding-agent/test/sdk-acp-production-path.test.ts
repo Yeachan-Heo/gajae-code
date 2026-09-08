@@ -1403,7 +1403,24 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 		input: { id: "codex-medium" },
 	});
 	const cliBrokerRequestCount = brokerRequests.length;
+	// A CLI-primary attachment never reaches broker lifecycle control, but closing it
+	// must still release the local attachment; a later prompt has no session to reach.
+	await expect(baseProviderAgent.deleteSession({ sessionId: created.sessionId })).rejects.toMatchObject({
+		code: "operation_prohibited",
+	});
 	await expect(baseProviderAgent.closeSession({ sessionId: created.sessionId })).resolves.toEqual({});
+	expect(brokerRequests).toHaveLength(cliBrokerRequestCount);
+	const cliPromptInputsAfterClose = promptInputs.length;
+	await expect(
+		bounded(
+			baseProviderAgent.prompt({
+				sessionId: created.sessionId,
+				prompt: [{ type: "text", text: "after CLI-primary close" }],
+			}),
+			"prompt after CLI-primary close",
+		),
+	).rejects.toMatchObject({ code: "not_found" });
+	expect(promptInputs).toHaveLength(cliPromptInputsAfterClose);
 	await expect(baseProviderAgent.deleteSession({ sessionId: created.sessionId })).resolves.toEqual({});
 	expect(brokerRequests).toHaveLength(cliBrokerRequestCount);
 	baseProviderAbort.abort();

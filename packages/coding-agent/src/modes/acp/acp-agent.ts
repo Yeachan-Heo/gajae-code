@@ -1398,6 +1398,10 @@ export class AcpAgent implements Agent {
 		const id = sessionId(result);
 		this.#knownSessionCwds.set(id, params.cwd);
 		this.#knownSessionMcpServers.set(id, mcpServers);
+		// This connection launched the host, so it owns the broker lifecycle before the
+		// attachment reports a control surface. Without it a failed attach discards the
+		// session as unowned and masks the real error with cleanup uncertainty.
+		this.#ownedSessionIds.add(id);
 		try {
 			await this.#attach(id, params.cwd, undefined, result);
 			await applyAcpStartupOptions(this.#adapter(id), this.#startupOptions);
@@ -1454,6 +1458,9 @@ export class AcpAgent implements Agent {
 		const id = sessionId(result);
 		this.#knownSessionCwds.set(id, params.cwd);
 		this.#knownSessionMcpServers.set(id, mcpServers);
+		// Forking launches a host through this connection, so lifecycle ownership is
+		// established before attachment for the same reason as `newSession`.
+		this.#ownedSessionIds.add(id);
 		try {
 			await this.#attach(id, params.cwd, undefined, result);
 			const response = { sessionId: id, ...(await this.#sessionState(id)) };
@@ -1499,8 +1506,10 @@ export class AcpAgent implements Agent {
 
 	closeSession(params: CloseSessionRequest): Promise<CloseSessionResponse> {
 		const record = this.#sessions.get(params.sessionId);
-		// ACP close has no cwd. Only connection-owned sessions may reach broker lifecycle control.
-		if (!this.#ownedSessionIds.has(params.sessionId)) return Promise.resolve({});
+		// ACP close has no cwd. Broker lifecycle control stays owner-only, but a live
+		// local attachment is always released: a CLI-primary session the client closed
+		// must not keep its adapter, lease heartbeat, subscriptions and pending prompt.
+		if (!this.#ownedSessionIds.has(params.sessionId) && record === undefined) return Promise.resolve({});
 		const cwd = record?.cwd ?? this.#knownSessionCwds.get(params.sessionId);
 		if (!cwd) return Promise.resolve({});
 		return this.#enqueueLifecycleOperation(params.sessionId, async () => {
@@ -1515,7 +1524,17 @@ export class AcpAgent implements Agent {
 		const pendingLocator = this.#pendingDeleteLocators.get(params.sessionId);
 		// Capture authority before joining the lifecycle chain: an admitted delete must
 		// remain authorized when a preceding close retires connection ownership.
-		if (!this.#ownedSessionIds.has(params.sessionId) && pendingLocator === undefined) return {};
+		if (!this.#ownedSessionIds.has(params.sessionId) && pendingLocator === undefined) {
+			// Deleting a live session this connection does not own would claim a durable
+			// deletion it never performs. Unknown ids stay the protocol no-op; a live
+			// CLI-primary attachment is refused explicitly instead of faking success.
+			if (record !== undefined)
+				throw new AcpSdkAdapterError(
+					"operation_prohibited",
+					`ACP session ${params.sessionId} is owned by its terminal host; delete it from that session instead.`,
+				);
+			return {};
+		}
 		const cwd = record?.cwd ?? this.#knownSessionCwds.get(params.sessionId) ?? pendingLocator?.cwd;
 		return this.#enqueueLifecycleOperation(params.sessionId, async () => {
 			// ACP's delete request has no cwd. Unknown ids remain the protocol no-op,
@@ -2449,7 +2468,10 @@ export class AcpAgent implements Agent {
 			this.#pendingRouterAdapters.delete(id);
 			this.#pendingRouterFrames.delete(id);
 			this.#knownSessionCwds.set(id, cwd);
+			// Host provenance is authoritative for lifecycle authority: a CLI-primary host
+			// keeps it in its terminal even when this connection created the session.
 			if (primaryControlSurface === "sdk") this.#ownedSessionIds.add(id);
+			else this.#ownedSessionIds.delete(id);
 			this.#assertSessionEpoch(id, epoch);
 			// A successful attachment establishes a new live-owner epoch. Any locator
 			// retained from an earlier cleanup_pending delete belongs to the terminal
@@ -2585,7 +2607,9 @@ export class AcpAgent implements Agent {
 			// The record is published before permission initialization. Let a canceled
 			// provisional attachment retire it before selecting the generation key.
 			if (attaching) await Promise.allSettled([attaching.task]);
-			await this.#teardownSession(id, "closed", true);
+			// A CLI-primary host owns its own process lifecycle: release this ACP
+			// attachment locally and never ask the broker to close the session.
+			await this.#teardownSession(id, "closed", this.#ownedSessionIds.has(id));
 			this.#knownSessionCwds.delete(id);
 			this.#ownedSessionIds.delete(id);
 			this.#knownSessionMcpServers.delete(id);
