@@ -18,7 +18,9 @@ import { reconcileWorkflowSkillState } from "../src/gjc-runtime/state-runtime";
 import { RequiredOnWriteEnvelopeSchema } from "../src/gjc-runtime/state-schema";
 import {
 	detectWorkflowEnvelopeIntegrityMismatch,
+	mergeActiveEntrySubskills,
 	readActiveEntries,
+	removeActiveEntry,
 	writeActiveEntry,
 	writeGuardedJsonAtomic,
 	writeGuardedWorkflowEnvelopeAtomic,
@@ -2063,6 +2065,37 @@ disabledExtensions:
 		expect(persistedMode.current_phase).toBe("requirements");
 		expect(persistedEntry.phase).toBe("requirements");
 		expect(rebuiltSnapshot.phase).toBe("requirements");
+	});
+
+	it("does not recreate an active entry removed before a subskill merge", async () => {
+		const root = await cwd();
+		const sessionId = "session-subskill-removal-race";
+		await ensureWorkflowSkillActivationSeed({ cwd: root, skill: "deep-interview", sessionId });
+		const [expected] = await readActiveEntries(root, { sessionId });
+		if (!expected) throw new Error("Expected seeded active entry");
+		await removeActiveEntry(root, { sessionId }, "deep-interview");
+
+		const merged = await mergeActiveEntrySubskills(
+			root,
+			{ sessionId },
+			"deep-interview",
+			expected,
+			[
+				{
+					plugin: "gjc",
+					subskillName: "ralplan",
+					parent: "deep-interview",
+					bindsTo: "session",
+					phase: "planner",
+					activationArg: "",
+				},
+			],
+			"2099-01-01T00:00:00.000Z",
+		);
+
+		expect(merged.result).toMatchObject({ written: false, reason: "stale-skip" });
+		expect(merged.predecessor).toBeUndefined();
+		expect(await readActiveEntries(root, { sessionId })).toEqual([]);
 	});
 
 	it("seeds ralplan repository binding for the first explicit-target role write", async () => {

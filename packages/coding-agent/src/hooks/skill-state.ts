@@ -10,6 +10,7 @@ import { ModeStateSchema, SkillActiveStateSchema } from "../gjc-runtime/state-sc
 import {
 	deleteIfOwned,
 	type GuardedStateWriteReceipt,
+	type GuardedWriteResult,
 	guardedStateWriteReceipt,
 	matchesGuardedStateWriteReceipt,
 	mergeActiveEntrySubskills,
@@ -590,27 +591,42 @@ export async function ensureWorkflowSkillActivationSeed(
 	const noRollback = async () => false;
 	if (!isGjcWorkflowSkill(skill)) return { state: null, seeded: false, rollback: noRollback };
 	const resolvedSessionId = await resolveBoundarySessionId(input.cwd, input.sessionId);
-	const existing = await readVisibleSkillActiveState(input.cwd, resolvedSessionId, input.stateDir);
-	const existingEntry = listActiveSkills(existing).find(
+	let existing = await readVisibleSkillActiveState(input.cwd, resolvedSessionId, input.stateDir);
+	let existingEntry = listActiveSkills(existing).find(
 		entry =>
 			entry.skill === skill &&
 			(existing ? entryMatchesContext(entry, existing, resolvedSessionId, input.threadId) : true),
 	);
 	if (existingEntry) {
-		if (!input.activeSubskills?.length || Bun.deepEquals(existingEntry.active_subskills, input.activeSubskills)) {
-			return { state: existing, seeded: false, rollback: noRollback };
+		let merged: { predecessor: SkillActiveEntry | undefined; result: GuardedWriteResult };
+		let mergedWrite: GuardedStateWriteReceipt | undefined;
+		while (true) {
+			if (!input.activeSubskills?.length || Bun.deepEquals(existingEntry.active_subskills, input.activeSubskills)) {
+				return { state: existing, seeded: false, rollback: noRollback };
+			}
+			merged = await mergeActiveEntrySubskills(
+				input.cwd,
+				{ sessionId: resolvedSessionId },
+				skill,
+				existingEntry,
+				input.activeSubskills,
+				input.nowIso ?? new Date().toISOString(),
+			);
+			mergedWrite = guardedStateWriteReceipt(merged.result);
+			if (mergedWrite) break;
+			if (merged.result.written || merged.result.reason !== "stale-skip") {
+				throw new Error(`Workflow subskill activation write was not persisted: ${skill}`);
+			}
+			existing = await readVisibleSkillActiveState(input.cwd, resolvedSessionId, input.stateDir);
+			existingEntry = listActiveSkills(existing).find(
+				entry =>
+					entry.skill === skill &&
+					(existing ? entryMatchesContext(entry, existing, resolvedSessionId, input.threadId) : true),
+			);
+			if (!existingEntry) return { state: existing, seeded: false, rollback: noRollback };
 		}
-		const merged = await mergeActiveEntrySubskills(
-			input.cwd,
-			{ sessionId: resolvedSessionId },
-			skill,
-			existingEntry,
-			input.activeSubskills,
-			input.nowIso ?? new Date().toISOString(),
-		);
-		const mergedWrite = guardedStateWriteReceipt(merged.result);
-		if (!mergedWrite) throw new Error(`Workflow subskill activation write was not persisted: ${skill}`);
 		const rawPredecessor = merged.predecessor;
+		if (!rawPredecessor) return { state: existing, seeded: false, rollback: noRollback };
 		const rollback = async (): Promise<boolean> => {
 			const restored = await restoreActiveEntryIfOwned(
 				input.cwd,

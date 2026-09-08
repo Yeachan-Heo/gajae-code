@@ -453,6 +453,37 @@ describe("agentLoop with AgentMessage", () => {
 		expect(agentEnd?.stopReason).toBe("paused");
 	});
 
+	it("waits for the turn-end checkpoint before admitting a successor turn", async () => {
+		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [] };
+		const mock = createMockModel({ responses: [{ content: ["first"] }, { content: ["second"] }] });
+		let checkpointCommitted = false;
+		let followUpDelivered = false;
+		const config: AgentLoopConfig = {
+			model: mock.model,
+			convertToLlm: identityConverter,
+			afterTurnEndPublished: async () => {
+				await Promise.resolve();
+				checkpointCommitted = true;
+			},
+			getSteeringMessages: async () => [],
+			getFollowUpMessages: async () => {
+				expect(checkpointCommitted).toBe(true);
+				if (followUpDelivered) return [];
+				followUpDelivered = true;
+				checkpointCommitted = false;
+				return [createUserMessage("continue")];
+			},
+		};
+
+		const stream = agentLoop([createUserMessage("start")], context, config, undefined, mock.stream);
+		for await (const _event of stream) {
+			// Drain the lifecycle stream.
+		}
+
+		expect(followUpDelivered).toBe(true);
+		expect(checkpointCommitted).toBe(true);
+	});
+
 	it("should handle tool calls and results", async () => {
 		const toolSchema = z.object({ value: z.string() });
 		const executed: string[] = [];
