@@ -1114,6 +1114,23 @@ function verifyCrystalSourceAgainstLive(
 	return source;
 }
 
+export async function assertDeepInterviewCrystalCoversLiveTranscript(cwd: string, sessionId: string): Promise<void> {
+	const statePath = deepInterviewStatePath(cwd, sessionId);
+	let parsed: unknown;
+	try {
+		parsed = await Bun.file(statePath).json();
+	} catch {
+		throw new DeepInterviewCommandError(2, "execution approval requires valid Deep Interview state");
+	}
+	if (!isRecord(parsed) || !isRecord(parsed.state))
+		throw new DeepInterviewCommandError(2, "execution approval requires canonical Crystal state");
+	const crystal = parseStoredCrystal(parsed.state.crystal);
+	const liveSnapshot = await authoritativeConversationSnapshot(cwd, sessionId);
+	const source = verifyCrystalSourceAgainstLive(crystal, liveSnapshot);
+	if (source.end !== liveSnapshot.messages.length - 1)
+		throw new DeepInterviewCommandError(2, "execution approval requires re-crystallization after transcript changes");
+}
+
 async function handleCrystallize(args: readonly string[], cwd: string): Promise<DeepInterviewCommandResult> {
 	assertCrystallizeArgs(args);
 	const input = await readCrystallizeInput(flagValue(args, "--input"), cwd);

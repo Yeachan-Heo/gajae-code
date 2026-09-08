@@ -4,6 +4,7 @@ import { validateToolArguments } from "@gajae-code/ai/utils/validation";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import type { AppendOrMergeResult } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-recorder";
 import * as deepInterviewRecorder from "@gajae-code/coding-agent/gjc-runtime/deep-interview-recorder";
+import * as deepInterviewRuntime from "@gajae-code/coding-agent/gjc-runtime/deep-interview-runtime";
 import { deepInterviewCharacterCount } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-state";
 import type { DeepInterviewExecutionApprovalRecord } from "@gajae-code/coding-agent/gjc-runtime/state-runtime";
 import * as stateRuntime from "@gajae-code/coding-agent/gjc-runtime/state-runtime";
@@ -2943,6 +2944,7 @@ describe("AskTool deep-interview recorder persistence", () => {
 	});
 
 	it("mints execution approval only from an accepted structured user choice", async () => {
+		spyOn(deepInterviewRuntime, "assertDeepInterviewCrystalCoversLiveTranscript").mockResolvedValue();
 		const record = spyOn(stateRuntime, "recordDeepInterviewExecutionApproval").mockResolvedValue({
 			path: "/tmp/deep-interview-execution-approval.json",
 			record: {} as DeepInterviewExecutionApprovalRecord,
