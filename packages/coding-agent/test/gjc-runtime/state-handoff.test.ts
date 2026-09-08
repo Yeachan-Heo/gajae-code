@@ -202,7 +202,14 @@ async function readJson(filePath: string): Promise<Record<string, unknown> | nul
 	}
 }
 
-async function recordExecutionApproval(cwd: string, questionId = "execution-approval"): Promise<void> {
+async function recordExecutionApproval(
+	cwd: string,
+	questionId = "execution-approval",
+	approvalStage: "deep-interview" | "ralplan" = "deep-interview",
+): Promise<void> {
+	const transcriptPath = path.join(cwd, "approval-session.jsonl");
+	const transcript = `${JSON.stringify({ type: "session", id: TEST_SESSION_ID, cwd })}\n`;
+	await fs.writeFile(transcriptPath, transcript);
 	await recordDeepInterviewExecutionApproval({
 		cwd,
 		sessionId: TEST_SESSION_ID,
@@ -210,6 +217,9 @@ async function recordExecutionApproval(cwd: string, questionId = "execution-appr
 		gateId: questionId,
 		target: "ultragoal",
 		selectedOptions: ["Approve execution via ultragoal"],
+		transcriptPath,
+		transcriptSha256: createHash("sha256").update(transcript).digest("hex"),
+		approvalStage,
 	});
 }
 
@@ -1225,15 +1235,7 @@ describe("gjc state handoff", () => {
 			);
 			expect(result.status).toBe(2);
 			expect(result.stderr).toContain("approval lineage");
-			await recordDeepInterviewExecutionApproval({
-				cwd,
-				sessionId: TEST_SESSION_ID,
-				questionId: "ralplan-final-approval",
-				gateId: "ralplan-final-approval",
-				target: "ultragoal",
-				selectedOptions: ["Approve execution via ultragoal"],
-				approvalStage: "ralplan",
-			});
+			await recordExecutionApproval(cwd, "ralplan-final-approval", "ralplan");
 			const approved = await runNativeDeepInterviewCommand(["approve-execution", "--json"], cwd);
 			expect(approved.status, approved.stderr).toBe(0);
 			const readyForHandoff = await runNativeStateCommand(
