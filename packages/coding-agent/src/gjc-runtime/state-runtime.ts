@@ -1621,7 +1621,14 @@ async function handleWrite(args: readonly string[], cwd: string): Promise<StateC
 				throw new StateCommandError(2, `unknown ${mode} phase "${toPhase}"; use --force to bypass`);
 			}
 			if (fromPhase && toPhase && isKnownWorkflowState(mode, fromPhase) && isKnownWorkflowState(mode, toPhase)) {
-				if (!isValidTransition(mode, fromPhase, toPhase) && !forced) {
+				let sanctionedRalplanHandoff = false;
+				if (mode === "ralplan" && fromPhase === "final" && toPhase === "handoff" && sessionId) {
+					try {
+						await assertDeepInterviewExecutionLineage(cwd, sessionId, "ralplan", merged);
+						sanctionedRalplanHandoff = true;
+					} catch {}
+				}
+				if (!isValidTransition(mode, fromPhase, toPhase) && !sanctionedRalplanHandoff && !forced) {
 					throw new StateCommandError(
 						2,
 						`invalid ${mode} phase transition from ${fromPhase} to ${toPhase}; use --force to bypass`,
@@ -2055,6 +2062,7 @@ export async function recordDeepInterviewExecutionApproval(options: {
 	target: string;
 	selectedOptions: readonly string[];
 	customInput?: string;
+	approvalStage?: "deep-interview" | "ralplan";
 }): Promise<{ path: string; record: DeepInterviewExecutionApprovalRecord }> {
 	if (options.target !== "ultragoal")
 		throw new StateCommandError(2, "deep-interview execution approval target must be ultragoal");
@@ -2075,9 +2083,17 @@ export async function recordDeepInterviewExecutionApproval(options: {
 			if (current.kind !== "valid")
 				throw new StateCommandError(2, "deep-interview execution approval requires valid current state");
 			const envelope = normalizeDeepInterviewEnvelope(current.value) as Record<string, unknown>;
+			const ralplanApproval =
+				options.approvalStage === "ralplan" &&
+				envelope.active === false &&
+				envelope.handoff_to === "ralplan" &&
+				typeof envelope.handoff_at === "string" &&
+				(await hasAuditedDeepInterviewHandoff(options.cwd, options.sessionId, "ralplan", {
+					handoffAt: envelope.handoff_at,
+				}));
 			if (
 				envelope.version !== WORKFLOW_STATE_VERSION ||
-				envelope.active !== true ||
+				(envelope.active !== true && !ralplanApproval) ||
 				envelope.current_phase !== "handoff"
 			)
 				throw new StateCommandError(2, "deep-interview execution approval requires active handoff state");
@@ -2090,8 +2106,11 @@ export async function recordDeepInterviewExecutionApproval(options: {
 				? publicationReceipt.content_sha256
 				: undefined;
 			if (
-				publicationReceipt?.owner !== "gjc-runtime" ||
-				publicationReceipt.command !== "gjc deep-interview crystallize" ||
+				(ralplanApproval
+					? publicationReceipt?.owner !== "gjc-state-cli" ||
+						publicationReceipt.command !== "gjc state deep-interview handoff --to ralplan"
+					: publicationReceipt?.owner !== "gjc-runtime" ||
+						publicationReceipt.command !== "gjc deep-interview crystallize") ||
 				publicationChecksum?.algorithm !== "sha256" ||
 				!isSha256(publicationChecksum.value) ||
 				publicationChecksum.covered_path !== path.resolve(statePath)
@@ -2157,21 +2176,31 @@ export async function recordDeepInterviewExecutionApproval(options: {
 						throw new StateCommandError(2, "deep-interview execution approval record is already consumed");
 					if (existing?.status === "pending") {
 						await assertExecutionApprovalSpecIdentity(existing);
-						assertExecutionApprovalRecordMatchesCurrentState(existing, {
-							sessionId: options.sessionId,
-							statePath,
-							envelope,
-							crystal,
-							allowConsumed: false,
-						});
-						if (
-							existing.status === "pending" &&
-							existing.question_id === record.question_id &&
-							existing.gate_id === record.gate_id &&
-							existing.answer_hash === record.answer_hash &&
-							existing.target === record.target
-						)
-							return { path: recordPath, record: existing };
+						try {
+							assertExecutionApprovalRecordMatchesCurrentState(existing, {
+								sessionId: options.sessionId,
+								statePath,
+								envelope,
+								crystal,
+								allowConsumed: false,
+							});
+							if (
+								existing.question_id === record.question_id &&
+								existing.gate_id === record.gate_id &&
+								existing.answer_hash === record.answer_hash &&
+								existing.target === record.target
+							)
+								return { path: recordPath, record: existing };
+						} catch (error) {
+							if (
+								!(error instanceof StateCommandError) ||
+								![
+									"deep-interview execution approval record is stale or consumed",
+									"deep-interview execution approval record does not match current Crystal",
+								].includes(error.message)
+							)
+								throw error;
+						}
 					}
 					await writeDeepInterviewExecutionApprovalRecord(options.cwd, options.sessionId, record);
 					return { path: recordPath, record };
@@ -4045,8 +4074,15 @@ async function handleApproveExecutionRecordLocked(
 	const envelope = normalizeDeepInterviewEnvelope(current.value) as Record<string, unknown>;
 	if (envelope.version !== WORKFLOW_STATE_VERSION)
 		throw new StateCommandError(2, "approve-execution requires current deep-interview state version");
-	if (envelope.active !== true)
-		throw new StateCommandError(2, "approve-execution requires active deep-interview state");
+	const ralplanApproval =
+		envelope.active === false &&
+		envelope.handoff_to === "ralplan" &&
+		typeof envelope.handoff_at === "string" &&
+		(await hasAuditedDeepInterviewHandoff(cwd, selectors.gjcSessionId, "ralplan", {
+			handoffAt: envelope.handoff_at,
+		}));
+	if (envelope.active !== true && !ralplanApproval)
+		throw new StateCommandError(2, "approve-execution requires active or Ralplan-handed-off deep-interview state");
 	if (envelope.current_phase !== "handoff")
 		throw new StateCommandError(2, "approve-execution requires deep-interview current_phase handoff");
 	const inner = isPlainObject(envelope.state) ? envelope.state : {};
@@ -4064,8 +4100,11 @@ async function handleApproveExecutionRecordLocked(
 		: undefined;
 	if (
 		inner.execution_approval !== "approved" &&
-		(publicationReceipt?.owner !== "gjc-runtime" ||
-			publicationReceipt.command !== "gjc deep-interview crystallize" ||
+		((ralplanApproval
+			? publicationReceipt?.owner !== "gjc-state-cli" ||
+				publicationReceipt.command !== "gjc state deep-interview handoff --to ralplan"
+			: publicationReceipt?.owner !== "gjc-runtime" ||
+				publicationReceipt.command !== "gjc deep-interview crystallize") ||
 			publicationChecksum?.algorithm !== "sha256" ||
 			typeof publicationChecksum?.value !== "string" ||
 			publicationChecksum.value.length !== 64 ||
