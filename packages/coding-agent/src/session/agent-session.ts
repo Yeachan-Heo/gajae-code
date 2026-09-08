@@ -7624,7 +7624,15 @@ export class AgentSession {
 											attribution: "agent",
 											timestamp: Date.now(),
 										});
-										this.#markTtsrInjected(details.rules);
+										try {
+											this.#markTtsrInjected(details.rules);
+										} catch {
+											this.#ttsrAbortPending = false;
+											this.#pendingTtsrInjections = [];
+											this.#perToolTtsrInjections.clear();
+											this.#resolveTtsrResume();
+											return;
+										}
 									}
 									await this.#scheduleAgentContinue({
 										delayMs: 0,
@@ -8974,12 +8982,20 @@ export class AgentSession {
 		if (uniqueRuleNames.length === 0) {
 			return;
 		}
-		this.#ttsrManager?.markInjectedByNames(uniqueRuleNames);
-		this.sessionManager.appendTtsrInjection(
-			uniqueRuleNames,
-			this.#ttsrManager?.getInjectedRecords(),
-			this.#ttsrManager?.getMessageCount(),
-		);
+		const manager = this.#ttsrManager;
+		const previousRecords = manager?.getInjectedRecords() ?? [];
+		const previousMessageCount = manager?.getMessageCount() ?? 0;
+		manager?.markInjectedByNames(uniqueRuleNames);
+		try {
+			this.sessionManager.appendTtsrInjection(
+				uniqueRuleNames,
+				manager?.getInjectedRecords(),
+				manager?.getMessageCount(),
+			);
+		} catch (error) {
+			manager?.replacePersistedState(previousRecords, previousMessageCount);
+			throw error;
+		}
 	}
 
 	#findTtsrAssistantIndex(targetTimestamp: number | undefined): number {

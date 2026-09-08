@@ -184,7 +184,15 @@ describe("agentLoop with AgentMessage", () => {
 			tools: [],
 		};
 		const mock = createMockModel();
-		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter };
+		const publicationOrder: string[] = [];
+		const config: AgentLoopConfig = {
+			model: mock.model,
+			convertToLlm: identityConverter,
+			afterTurnEndPublished: async () => {
+				await Promise.resolve();
+				publicationOrder.push("checkpoint");
+			},
+		};
 		const controller = new AbortController();
 		// The mock provider would reject without a configured response; we want the
 		// agent's abort path to kick in before any event is emitted. Use a raw stream
@@ -197,6 +205,7 @@ describe("agentLoop with AgentMessage", () => {
 
 		for await (const event of stream) {
 			events.push(event);
+			if (event.type === "agent_end") publicationOrder.push("agent_end");
 		}
 
 		const messages = await stream.result();
@@ -206,6 +215,7 @@ describe("agentLoop with AgentMessage", () => {
 		expect(finalMessage.stopReason).toBe("aborted");
 		expect(finalMessage.errorMessage).toBe("Request was aborted");
 		expect(events.map(event => event.type)).toContain("agent_end");
+		expect(publicationOrder).toEqual(["checkpoint", "agent_end"]);
 	});
 
 	it("should handle custom message types via convertToLlm", async () => {

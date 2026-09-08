@@ -1466,6 +1466,49 @@ describe("AgentSession TTSR resume gate", () => {
 		).toBe(true);
 	});
 
+	it("releases an interrupted TTSR continuation when repeat-state persistence fails", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		let streamCallCount = 0;
+		const ttsrManager = new TtsrManager({
+			enabled: true,
+			contextMode: "discard",
+			interruptMode: "always",
+			repeatMode: "once",
+			repeatGap: 10,
+		});
+		ttsrManager.addRule(testRule);
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [] },
+			streamFn: (_model, _context, options) => {
+				streamCallCount++;
+				const stream = new AssistantMessageEventStream();
+				if (streamCallCount === 1) pushAbortableTtsrStream(stream, options?.signal);
+				else pushContinuationStream(stream, () => {});
+				return stream;
+			},
+		});
+		const sessionManager = SessionManager.inMemory(tempDir);
+		const appendTtsrInjection = sessionManager.appendTtsrInjection.bind(sessionManager);
+		vi.spyOn(sessionManager, "appendTtsrInjection").mockImplementation((ruleNames, records, messageCount) => {
+			if (ruleNames.length > 0) throw new Error("injected interrupt persistence failure");
+			return appendTtsrInjection(ruleNames, records, messageCount);
+		});
+		const settings = Settings.isolated();
+		const authStorage = await AuthStorage.create(path.join(tempDir, "testauth-int-failure.db"));
+		authStorages.push(authStorage);
+		const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "models.yml"));
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		session = new AgentSession({ agent, sessionManager, settings, modelRegistry, ttsrManager });
+
+		await session.prompt("Write some Rust code");
+
+		expect(streamCallCount).toBe(1);
+		expect(session.isStreaming).toBe(false);
+		expect(session.isTtsrAbortPending).toBe(false);
+		expect(ttsrManager.getInjectedRuleNames()).toEqual([]);
+	});
+
 	it("prompt() blocks until TTSR deferred continuation completes", async () => {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
 		let streamCallCount = 0;

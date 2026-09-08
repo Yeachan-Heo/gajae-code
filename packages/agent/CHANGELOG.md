@@ -2,7 +2,7 @@
 
 ## [Unreleased]
 
-- Successor turns now wait for the published `turn_end` checkpoint consumer before polling steering or follow-up work, preventing repeat-rule state from lagging behind the next provider turn.
+- Successor and terminal-error handling now wait for the published `turn_end` checkpoint consumer before polling steering, admitting follow-up work, or publishing `agent_end`, preventing canonical repeat-rule state from lagging behind the terminal lifecycle.
 
 ## [0.16.6] - 2026-09-07
 
