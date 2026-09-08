@@ -5,6 +5,7 @@ import { Settings } from "@gajae-code/coding-agent/config/settings";
 import type { AppendOrMergeResult } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-recorder";
 import * as deepInterviewRecorder from "@gajae-code/coding-agent/gjc-runtime/deep-interview-recorder";
 import { deepInterviewCharacterCount } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-state";
+import * as stateRuntime from "@gajae-code/coding-agent/gjc-runtime/state-runtime";
 import { getThemeByName, initTheme } from "@gajae-code/coding-agent/modes/theme/theme";
 import type {
 	AskAnswerRequest,
@@ -2938,6 +2939,61 @@ describe("AskTool deep-interview recorder persistence", () => {
 		);
 		// A timeout is not execution authorization.
 		expect(result.details?.selectedOptions).toEqual([]);
+	});
+
+	it("mints execution approval only from an accepted structured user choice", async () => {
+		const record = spyOn(stateRuntime, "recordDeepInterviewExecutionApproval").mockResolvedValue({
+			path: "/tmp/deep-interview-execution-approval.json",
+			record: {} as Awaited<ReturnType<typeof stateRuntime.recordDeepInterviewExecutionApproval>>["record"],
+		});
+		const question = {
+			id: "deep-interview-execution",
+			question: "Choose the execution path",
+			options: [{ label: "Execute with ultragoal" }, { label: "Stop here" }],
+			workflowGate: { stage: "deep-interview", kind: "execution" } as const,
+		};
+		const local = await new AskTool(
+			createSession({ cwd: "/tmp/approval-local", getSessionId: () => "approval-local" }),
+		).execute(
+			"local-execution-choice",
+			{ questions: [question] },
+			undefined,
+			undefined,
+			createContext({
+				select: async () => "Execute with ultragoal",
+			}),
+		);
+		expect(local.details?.selectedOptions).toEqual(["Execute with ultragoal"]);
+		expect(record).toHaveBeenCalledTimes(1);
+		expect(record.mock.calls[0]?.[0]).toMatchObject({
+			sessionId: "approval-local",
+			questionId: "deep-interview-execution",
+			target: "ultragoal",
+		});
+
+		record.mockClear();
+		const emitter = {
+			supportsRemoteGateAnswers: () => true,
+			emitGate: vi.fn(async () => ({ selected: ["Execute with ultragoal"] })),
+		};
+		const remote = await new AskTool(
+			createSession({
+				cwd: "/tmp/approval-remote",
+				hasUI: false,
+				getSessionId: () => "approval-remote",
+				getWorkflowGateEmitter: () => emitter,
+			} as Partial<ToolSession>),
+		).execute("remote-execution-choice", { questions: [question] }, undefined, undefined, undefined);
+		expect(remote.details?.selectedOptions).toEqual(["Execute with ultragoal"]);
+		expect(emitter.emitGate).toHaveBeenCalledWith(
+			expect.objectContaining({ stage: "deep-interview", kind: "execution" }),
+		);
+		expect(record).toHaveBeenCalledTimes(1);
+		expect(record.mock.calls[0]?.[0]).toMatchObject({
+			sessionId: "approval-remote",
+			questionId: "deep-interview-execution",
+			target: "ultragoal",
+		});
 	});
 
 	it("discards focused intent choices before multi-question timeout navigation", async () => {
