@@ -4869,13 +4869,11 @@ async function streamAssistantResponse(
 									message: { ...partialMessage },
 									scope,
 								});
-								// Preserve ordinary text streaming. Once visible text is
-								// published, this response can no longer be silently resampled;
-								// a later escaped tool call therefore falls through to the
-								// existing terminal per-call rejection instead.
-								if (event.type === "text_start" || event.type === "text_delta" || event.type === "text_end") {
-									provisionalToolTransaction?.commitCallbacksAndUpdates();
-								}
+								// Publish unmanaged content as it arrives, including reasoning and
+								// tool arguments. Publication does not accept or execute tools:
+								// terminal validation and the consumer drain still precede dispatch.
+								// A published escaped call is rejected rather than silently resampled.
+								provisionalToolTransaction?.commitCallbacksAndUpdates();
 							}
 							break;
 
