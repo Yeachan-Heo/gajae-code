@@ -5712,13 +5712,29 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 
 	async function listSessions(cwd?: string): Promise<Array<Record<string, unknown>>> {
 		const roots = cwd ? [cwd] : config.allowedRoots;
+		const uniqueRoots = [...new Map(
+			roots.map(root => {
+				let canonical = path.resolve(root);
+				try {
+					canonical = nodeFs.realpathSync.native(canonical);
+				} catch {
+					// Preserve the configured path when the root is not materialized yet.
+				}
+				return [normalizePathForComparison(canonical, platform), root] as const;
+			}),
+		).values()];
 		const listings = await Promise.all(
-			roots.map(async root => {
+			uniqueRoots.map(async root => {
 				const listing = await paginatedBrokerSessionList(root, { cwd: root });
 				return scopedBrokerSessions(Array.isArray(listing.sessions) ? listing.sessions : [], root, platform);
 			}),
 		);
-		return listings.flat();
+		const uniqueSessions = new Map<string, Record<string, unknown>>();
+		for (const session of listings.flat()) {
+			const id = brokerSessionId(session);
+			if (id !== null) uniqueSessions.set(id, session);
+		}
+		return [...uniqueSessions.values()];
 	}
 	function sessionFile(sessionId: unknown): string {
 		return path.join(namespaceDir, "sessions", `${safeExternalId("session", sessionId)}.json`);
@@ -7935,7 +7951,8 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 						};
 					await reconcileSessionRuntime(canonicalSessionId, { observeQuestions: false });
 					try {
-						let indexedSession = (await listSessions(cwd)).find(
+						const brokerWorkspace = optionalString(session.broker_workspace) ?? cwd;
+						let indexedSession = (await listSessions(brokerWorkspace)).find(
 							candidate => brokerSessionId(candidate) === canonicalSessionId,
 						);
 						// Windows broker locators may differ in drive-letter casing or separator
@@ -7943,7 +7960,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 						// the coordinator path. The scoped listing request is still authoritative;
 						// only its local path filter is relaxed for the exact requested session.
 						if (!indexedSession && platform === "win32") {
-							const listing = await paginatedBrokerSessionList(cwd, { cwd });
+							const listing = await paginatedBrokerSessionList(brokerWorkspace, { cwd: brokerWorkspace });
 							indexedSession = jsonRecords(Array.isArray(listing.sessions) ? listing.sessions : []).find(
 								candidate => brokerSessionId(candidate) === canonicalSessionId,
 							);
