@@ -6647,6 +6647,15 @@ export class AgentSession {
 		this.#advanceSessionIdentityEpoch();
 		this.#activeSkillState = undefined;
 		this.#restoredWorkflowSkillState = undefined;
+		if (this.#ttsrManager) {
+			const context = this.sessionManager.buildSessionContext();
+			this.#ttsrManager.replacePersistedState(
+				context.injectedTtsrRuleRecords ?? context.injectedTtsrRules,
+				context.ttsrMessageCount ?? 0,
+			);
+			this.#pendingTtsrInjections = [];
+			this.#perToolTtsrInjections.clear();
+		}
 		this.#requestSubskillToolReconciliation();
 		this.#retiredSessionIdentityAttemptScopeKeys.clear();
 	}
@@ -7463,12 +7472,13 @@ export class AgentSession {
 				await canonicalAdmission.predecessor.promise;
 			}
 			if (!eventIdentityIsCurrent()) return;
-			this.#ttsrManager.incrementMessageCount();
+			const nextMessageCount = this.#ttsrManager.getMessageCount() + 1;
 			this.sessionManager.appendTtsrInjection(
 				[],
 				this.#ttsrManager.getInjectedRecords(),
-				this.#ttsrManager.getMessageCount(),
+				nextMessageCount,
 			);
+			this.#ttsrManager.restoreMessageCount(nextMessageCount);
 		}
 		// Finalize the tool-choice queue's in-flight yield after tools have executed.
 		// This must happen at turn_end (not message_end) because onInvoked handlers
