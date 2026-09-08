@@ -12,10 +12,10 @@ import {
 	type GuardedStateWriteReceipt,
 	guardedStateWriteReceipt,
 	matchesGuardedStateWriteReceipt,
+	mergeActiveEntrySubskills,
 	readActiveEntries,
 	rebuildActiveSnapshot,
 	restoreActiveEntryIfOwned,
-	updateActiveEntryIfExact,
 	writeActiveEntry,
 	writeGuardedJsonAtomic,
 	writeGuardedWorkflowEnvelopeAtomic,
@@ -600,25 +600,23 @@ export async function ensureWorkflowSkillActivationSeed(
 		if (!input.activeSubskills?.length || Bun.deepEquals(existingEntry.active_subskills, input.activeSubskills)) {
 			return { state: existing, seeded: false, rollback: noRollback };
 		}
-		const mergedResult = await updateActiveEntryIfExact(
+		const merged = await mergeActiveEntrySubskills(
 			input.cwd,
 			{ sessionId: resolvedSessionId },
 			skill,
 			existingEntry,
-			{
-				...existingEntry,
-				active_subskills: input.activeSubskills,
-				updated_at: input.nowIso ?? new Date().toISOString(),
-			},
+			input.activeSubskills,
+			input.nowIso ?? new Date().toISOString(),
 		);
-		const mergedWrite = guardedStateWriteReceipt(mergedResult);
+		const mergedWrite = guardedStateWriteReceipt(merged.result);
 		if (!mergedWrite) throw new Error(`Workflow subskill activation write was not persisted: ${skill}`);
+		const rawPredecessor = merged.predecessor;
 		const rollback = async (): Promise<boolean> => {
 			const restored = await restoreActiveEntryIfOwned(
 				input.cwd,
 				{ sessionId: resolvedSessionId },
 				mergedWrite,
-				existingEntry,
+				rawPredecessor,
 			);
 			if (!restored) return false;
 			await rebuildActiveSnapshot(input.cwd, { sessionId: resolvedSessionId }, { cwd: input.cwd });
