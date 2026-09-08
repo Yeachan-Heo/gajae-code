@@ -8993,8 +8993,12 @@ export class AgentSession {
 			.join("\n\n");
 		const ruleNames = rules.map(r => r.name.trim()).filter(n => n.length > 0);
 		if (ruleNames.length > 0) {
-			this.sessionManager.appendTtsrInjection(ruleNames, undefined, this.#ttsrManager?.getMessageCount());
 			this.#ttsrManager?.markInjectedByNames(ruleNames);
+			this.sessionManager.appendTtsrInjection(
+				ruleNames,
+				this.#ttsrManager?.getInjectedRecords(),
+				this.#ttsrManager?.getMessageCount(),
+			);
 		}
 
 		return {
@@ -9020,8 +9024,12 @@ export class AgentSession {
 		if (uniqueRuleNames.length === 0) {
 			return;
 		}
-		this.sessionManager.appendTtsrInjection(uniqueRuleNames, undefined, this.#ttsrManager?.getMessageCount());
 		this.#ttsrManager?.markInjectedByNames(uniqueRuleNames);
+		this.sessionManager.appendTtsrInjection(
+			uniqueRuleNames,
+			this.#ttsrManager?.getInjectedRecords(),
+			this.#ttsrManager?.getMessageCount(),
+		);
 	}
 
 	#findTtsrAssistantIndex(targetTimestamp: number | undefined): number {
