@@ -828,6 +828,8 @@ describe.skipIf(process.platform !== "linux")("Codex session import", () => {
 			["https://alice:https-secret-value@example.com/x", "https-secret-value"],
 			["postgres://svc:pg-secret-value@db.internal:5432/app", "pg-secret-value"],
 			["git+ssh://deploy:ssh-secret-value@git.example.com/x.git", "ssh-secret-value"],
+			["abcdefghijklmnopq://svc:long-scheme-secret@host/x", "long-scheme-secret"],
+			["1https://svc:digit-boundary-secret@host/x", "digit-boundary-secret"],
 		] as const) {
 			const { value } = sanitizeImportedString(input);
 			expect(value).not.toContain(secret);

@@ -352,11 +352,12 @@ const SETUP_FAILURE_SUMMARY_MAX_CHARS = 280;
 const SETUP_FAILURE_SUMMARY_MAX_BYTES = 1_024;
 const AUTHORIZATION_HEADER_VALUE_PATTERN = /(["']?(?:Proxy-)?Authorization\b["']?\s*:\s*)[^\r\n]*/gi;
 const COOKIE_HEADER_VALUE_PATTERN = /(["']?(?:Set-)?Cookie\b["']?\s*:\s*)[^\r\n]*/gi;
-// The scheme repetition is bounded and the leading boundary anchored: an
-// unbounded `[a-z0-9+.-]*` in front of the literal `://` re-tries every prefix of
-// a long alphabetic run, which is quadratic in the length of the failure text
-// (100 KB cost ~2.6s).
-const URL_CREDENTIAL_PATTERN = /(?<![A-Za-z0-9+.-])([a-z][a-z0-9+.-]{0,15}:\/\/)[^/?#\s:@]+:[^@/?#\s]+@/gi;
+// The scheme-character run is boundary anchored, so the unbounded suffix is
+// attempted once per maximal run instead of once at every prefix. Keeping the
+// leading non-letter characters in the capture preserves redaction for URLs
+// embedded after digits or scheme punctuation without imposing an arbitrary
+// scheme-length cap.
+const URL_CREDENTIAL_PATTERN = /(?<![A-Za-z0-9+.-])([0-9+.-]*[a-z][a-z0-9+.-]*:\/\/)[^/?#\s:@]+:[^@/?#\s]+@/gi;
 const API_KEY_LABEL_VALUE_PATTERN = /(["']?api\s+key["']?\s*:\s*)(?:"[^"]*"|'[^']*'|[^\s&]+)/gi;
 // Both name-prefix repetitions are bounded. `(?:[A-Za-z][A-Za-z0-9]*[_.-])*?`
 // nests an unbounded quantifier inside an unbounded quantified group, so at every

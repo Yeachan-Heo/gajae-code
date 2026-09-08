@@ -27,6 +27,8 @@ describe("cleanReason", () => {
 			["connect failed https://alice:https-secret-value@example.com/x", "https-secret-value"],
 			["connect failed postgres://svc:pg-secret-value@db.internal:5432/app", "pg-secret-value"],
 			["connect failed git+ssh://deploy:ssh-secret-value@git.example.com/x.git", "ssh-secret-value"],
+			["connect failed abcdefghijklmnopq://svc:long-scheme-secret@example.com/x", "long-scheme-secret"],
+			["connect failed 1https://svc:digit-boundary-secret@example.com/x", "digit-boundary-secret"],
 		] as const) {
 			const out = cleanReason(input);
 			expect(out).toBeDefined();
@@ -34,5 +36,10 @@ describe("cleanReason", () => {
 			// The scheme stays readable so the reason still names the remote.
 			expect(out).toContain(input.slice(input.indexOf("://") - 5, input.indexOf("://") + 3).slice(-8));
 		}
+	});
+
+	it("strips query credentials from underscore-wrapped URLs", () => {
+		const out = cleanReason("provider _https://example.test/callback?opaque=query-secret");
+		expect(out).toBe("provider _https://example.test/callback");
 	});
 });

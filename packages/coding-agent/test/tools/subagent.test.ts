@@ -731,11 +731,20 @@ describe("SubagentTool", () => {
 					"mytoken=unprefixed-secret",
 					"clone https://deploy:url-secret-value@git.example.com/x.git",
 					"git+ssh://user:scheme-secret-value@host/r.git",
+					"abcdefghijklmnopq://user:long-scheme-secret@host/r.git",
+					"1https://user:digit-boundary-secret@host/r.git",
 				].join("\n"),
 			),
 		).summary;
 
-		for (const secret of ["deep-secret-value", "unprefixed-secret", "url-secret-value", "scheme-secret-value"]) {
+		for (const secret of [
+			"deep-secret-value",
+			"unprefixed-secret",
+			"url-secret-value",
+			"scheme-secret-value",
+			"long-scheme-secret",
+			"digit-boundary-secret",
+		]) {
 			expect(summary).not.toContain(secret);
 		}
 		// Scheme and host stay readable so the failure still names the remote.
