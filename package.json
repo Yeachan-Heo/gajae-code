@@ -81,7 +81,8 @@
   },
   "overrides": {},
   "scripts": {
-    "install:dev": "bun install && bun run build:native && bun --cwd=packages/coding-agent link && bun --cwd=packages/ai link && bun run dev:link && bun packages/coding-agent/src/cli.ts setup defaults",
+    "install:dev": "bun install && bun run build:native && bun --cwd=packages/coding-agent link && bun --cwd=packages/ai link && bun run dev:link && bun run dev:hooks && bun packages/coding-agent/src/cli.ts setup defaults",
+    "dev:hooks": "git config core.hooksPath .githooks",
     "install:dev:bin": "bun install && bun run --cwd=packages/coding-agent build && bun run dev:link:bin && packages/coding-agent/dist/gjc setup defaults",
     "install:defaults": "bun packages/coding-agent/src/cli.ts setup defaults",
     "dev": "bun --cwd=packages/coding-agent src/cli.ts",

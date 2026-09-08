@@ -703,6 +703,78 @@ async function validatePreflight(command: string, cwd: string, trustedRoot: stri
 	return validatePrContract({ body, baseRef, baseSha, headSha, authorLogin: author, computedDiffSha256: diff.exitCode === 0 ? canonicalDiffSha256(diff.stdout) : "", baseIsAncestor: ancestry.exitCode === 0, fastGatePassed: await runFastGate(cwd, trustedRoot), requireMergeApproved: false });
 }
 
+async function gh(args: string[], cwd: string): Promise<{ exitCode: number; stdout: string; stderr: string }> {
+	const child = Bun.spawn(["gh", ...args], { cwd, stdout: "pipe", stderr: "pipe" });
+	const [stdout, stderr, exitCode] = await Promise.all([
+		new Response(child.stdout).text(),
+		new Response(child.stderr).text(),
+		child.exited,
+	]);
+	return { exitCode, stdout, stderr: stderr.trim() };
+}
+
+interface LivePullRequest {
+	number: number;
+	body: string | null;
+	baseRefName: string;
+	author: { login: string } | null;
+}
+
+/**
+ * Pre-push gate: validate the exact commit about to be published against the live PR
+ * body for `branch`, so a stale verdict digest, an unrebased base, a malformed verdict,
+ * or a missing risk classification is caught locally instead of burning a red CI run.
+ *
+ * Blocking verdicts (needs-human, merge-blocked) are NOT failures here: they are
+ * legitimate pre-review states and only the server merge gate rejects them, exactly as
+ * in the `gh pr create` preflight. A branch with no open PR has nothing to invalidate
+ * and passes.
+ */
+async function validatePushPreflight(branch: string, headSha: string, cwd: string, trustedRoot: string): Promise<PrValidationResult> {
+	if (!SHA40.test(headSha)) return { ok: false, diagnostics: [`Pushed commit ${headSha} is not a lowercase 40-hex commit.`] };
+	const listed = await gh(["pr", "list", "--head", branch, "--state", "open", "--json", "number,body,baseRefName,author"], cwd);
+	if (listed.exitCode !== 0) {
+		return { ok: false, diagnostics: [`Could not resolve the open PR for ${branch}: ${listed.stderr || `gh exited ${listed.exitCode}`}. Authenticate with gh auth login, or set GJC_SKIP_PR_PREFLIGHT=1 to push without the contract check.`] };
+	}
+	let pulls: LivePullRequest[];
+	try {
+		pulls = JSON.parse(listed.stdout) as LivePullRequest[];
+	} catch (error) {
+		return { ok: false, diagnostics: [`Could not parse the gh pr list response for ${branch}: ${error instanceof Error ? error.message : String(error)}`] };
+	}
+	const pr = pulls[0];
+	if (!pr) return { ok: true, diagnostics: [] };
+	const refreshBase = await git(["fetch", "--no-tags", "origin", "dev"], cwd);
+	if (refreshBase.exitCode !== 0) {
+		return { ok: false, diagnostics: [`Could not refresh origin/dev before the push preflight: ${refreshBase.stderr}. Run git fetch origin dev and retry.`] };
+	}
+	const base = await git(["rev-parse", "origin/dev"], cwd);
+	const baseSha = new TextDecoder().decode(base.stdout).trim();
+	if (!SHA40.test(baseSha)) return { ok: false, diagnostics: [`Could not resolve origin/dev to a commit: ${base.stderr}`] };
+	const ancestry = await git(["merge-base", "--is-ancestor", baseSha, headSha], cwd);
+	const diff = await git(["diff", "--binary", "--full-index", "--no-ext-diff", `${baseSha}...${headSha}`], cwd);
+	if (diff.exitCode !== 0) return { ok: false, diagnostics: [`Could not compute the exact ${baseSha}...${headSha} diff: ${diff.stderr}`] };
+	const body = pr.body ?? "";
+	const bodyRiskParsed = parseBodyRisk(body);
+	const result = validatePrContract({
+		body,
+		baseRef: pr.baseRefName,
+		baseSha,
+		headSha,
+		authorLogin: pr.author?.login ?? "",
+		computedDiffSha256: canonicalDiffSha256(diff.stdout),
+		baseIsAncestor: ancestry.exitCode === 0,
+		fastGatePassed: await runFastGate(cwd, trustedRoot),
+		bodyRisk: bodyRiskParsed.risk,
+		requireMergeApproved: false,
+	});
+	const diagnostics = [...bodyRiskParsed.diagnostics, ...result.diagnostics];
+	if (diagnostics.length > 0) {
+		diagnostics.push(`Update PR #${pr.number} for exact head ${headSha} before pushing; the current ${baseSha}...${headSha} digest is ${canonicalDiffSha256(diff.stdout)}.`);
+	}
+	return { ok: diagnostics.length === 0, verdict: result.verdict, diagnostics };
+}
+
 export async function main(argv: string[]): Promise<number> {
 	const repoIndex = argv.indexOf("--repo");
 	const trustedRootIndex = argv.indexOf("--trusted-root");
@@ -712,6 +784,7 @@ export async function main(argv: string[]): Promise<number> {
 	const invocationCwd = path.resolve(process.cwd(), invocationCwdIndex >= 0 && argv[invocationCwdIndex + 1] ? argv[invocationCwdIndex + 1]! : cwd);
 	const eventIndex = argv.indexOf("--event");
 	const preflightIndex = argv.indexOf("--preflight-command");
+	const pushIndex = argv.indexOf("--push-preflight");
 	const signIndex = argv.indexOf("--self-review-sign");
 	if (signIndex >= 0) {
 		const args = argv.slice(signIndex + 1);
@@ -735,9 +808,11 @@ export async function main(argv: string[]): Promise<number> {
 	}
 	const result = eventIndex >= 0 && argv[eventIndex + 1]
 		? await validateEvent(path.resolve(process.cwd(), argv[eventIndex + 1]!), cwd, trustedRoot)
-		: preflightIndex >= 0 && argv[preflightIndex + 1]
-			? await validatePreflight(argv[preflightIndex + 1]!, cwd, trustedRoot, invocationCwd)
-			: { ok: false, diagnostics: ["Usage: bun scripts/verify-pr-verdict.ts --event <github-event.json> | --preflight-command <command> | --self-review-sign <verdict> <base> <head> <digest> <reviewer-id> <risk> <extra> <evidence>"] };
+		: pushIndex >= 0 && argv[pushIndex + 1] && argv[pushIndex + 2]
+			? await validatePushPreflight(argv[pushIndex + 1]!, argv[pushIndex + 2]!, cwd, trustedRoot)
+			: preflightIndex >= 0 && argv[preflightIndex + 1]
+				? await validatePreflight(argv[preflightIndex + 1]!, cwd, trustedRoot, invocationCwd)
+				: { ok: false, diagnostics: ["Usage: bun scripts/verify-pr-verdict.ts --event <github-event.json> | --preflight-command <command> | --push-preflight <branch> <head-sha> | --self-review-sign <verdict> <base> <head> <digest> <reviewer-id> <risk> <extra> <evidence>"] };
 	for (const diagnostic of result.diagnostics) console.error(`::error::${diagnostic}`);
 	if (result.ok && result.verdict) console.log(`PR contract valid: ${result.verdict.verdict} ${result.verdict.diffSha256}`);
 	return result.ok ? 0 : 1;

@@ -608,6 +608,35 @@ test("preflight preserves missing body-file diagnostics", async () => {
 	}
 });
 
+describe("push preflight", () => {
+	test("pre-push hook validates every pushed branch head through the contract validator", async () => {
+		const hook = await Bun.file(new URL("../.githooks/pre-push", import.meta.url)).text();
+		// The pushed commit -- not local HEAD -- is what becomes the PR head.
+		expect(hook).toContain('--push-preflight "$branch" "$local_sha"');
+		expect(hook).toContain("GJC_SKIP_PR_PREFLIGHT");
+		// Deletions carry the zero sha and have no head to validate.
+		expect(hook).toContain('[[ "$local_sha" == "$zero" ]] && continue');
+	});
+
+	test("a branch with no open PR has no contract to invalidate", async () => {
+		const script = url.fileURLToPath(new URL("./verify-pr-verdict.ts", import.meta.url));
+		const repoRoot = url.fileURLToPath(new URL("..", import.meta.url));
+		const head = Bun.spawnSync(["git", "rev-parse", "HEAD"], { cwd: repoRoot });
+		const headSha = head.stdout.toString().trim();
+		const child = Bun.spawn([process.execPath, script, "--push-preflight", "gjc-preflight-branch-that-does-not-exist", headSha, "--repo", repoRoot, "--trusted-root", repoRoot], { stdout: "ignore", stderr: "ignore" });
+		expect(await child.exited).toBe(0);
+	});
+
+	test("a non-commit push target fails closed", async () => {
+		const script = url.fileURLToPath(new URL("./verify-pr-verdict.ts", import.meta.url));
+		const repoRoot = url.fileURLToPath(new URL("..", import.meta.url));
+		const child = Bun.spawn([process.execPath, script, "--push-preflight", "some-branch", "not-a-sha", "--repo", repoRoot, "--trusted-root", repoRoot], { stdout: "pipe", stderr: "pipe" });
+		const [stderr, exitCode] = await Promise.all([new Response(child.stderr).text(), child.exited]);
+		expect(exitCode).toBe(1);
+		expect(stderr).toContain("is not a lowercase 40-hex commit");
+	});
+});
+
 test("workflow is trusted-default-branch-controlled, read-only, exact-head, and invokes only base code", async () => {
 	const workflow = await Bun.file(new URL("../.github/workflows/pr-validation.yml", import.meta.url)).text();
 	expect(workflow).toContain("pull_request_target:");
