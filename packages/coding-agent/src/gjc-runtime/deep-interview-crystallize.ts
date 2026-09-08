@@ -941,13 +941,9 @@ function evidenceTermSequence(value: string): string[] {
 function preservesEvidenceOrder(statement: string, quote: string): boolean {
 	const statementTerms = evidenceTermSequence(statement);
 	const quoteTerms = evidenceTermSequence(quote);
-	let quoteIndex = 0;
-	for (const statementTerm of statementTerms) {
-		while (quoteIndex < quoteTerms.length && quoteTerms[quoteIndex] !== statementTerm) quoteIndex++;
-		if (quoteIndex >= quoteTerms.length) return false;
-		quoteIndex++;
-	}
-	return true;
+	return (
+		statementTerms.length === quoteTerms.length && statementTerms.every((term, index) => quoteTerms[index] === term)
+	);
 }
 
 function topicTerms(value: string, conflict: boolean): Set<string> {
