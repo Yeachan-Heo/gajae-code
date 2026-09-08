@@ -441,8 +441,8 @@ export async function appendOrMergeDeepInterviewRound(
 	const envelopeState = envelope.state as Record<string, unknown>;
 	const crystal = envelopeState.crystal;
 	if (crystal && typeof crystal === "object" && !Array.isArray(crystal)) {
-		if ((crystal as Record<string, unknown>).lifecycle === "ready")
-			throw new Error("cannot record a deep-interview turn after Crystal promotion");
+		if ((crystal as Record<string, unknown>).lifecycle === "ready" && envelopeState.execution_approval === "approved")
+			throw new Error("cannot record a deep-interview turn after execution approval");
 	}
 	const interviewId = input.interviewId ?? interviewIdOf(envelope);
 	const shell = buildAnswerShell({
@@ -573,9 +573,10 @@ export async function enrichDeepInterviewRoundScoring(
 		scoringCrystal &&
 		typeof scoringCrystal === "object" &&
 		!Array.isArray(scoringCrystal) &&
-		(scoringCrystal as Record<string, unknown>).lifecycle === "ready"
+		(scoringCrystal as Record<string, unknown>).lifecycle === "ready" &&
+		scoringState.execution_approval === "approved"
 	)
-		throw new Error("cannot score a deep-interview turn after Crystal promotion");
+		throw new Error("cannot score a deep-interview turn after execution approval");
 	const interviewId = input.interviewId ?? interviewIdOf(envelope);
 	const rounds = readRounds(envelope);
 	const { rounds: enrichedRounds, record: reportedRecord } = enrichRoundWithScoring(rounds, {
