@@ -4414,6 +4414,7 @@ async function runLoopBody(
 					});
 				}
 				stream.push({ type: "turn_end", message, toolResults, scope: attemptScope });
+				await config.afterTurnEndPublished?.();
 				publishAgentEnd(
 					stream,
 					config,
