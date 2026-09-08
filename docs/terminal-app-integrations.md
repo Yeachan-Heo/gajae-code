@@ -90,6 +90,16 @@ cancels pending or active work when the setting is disabled in the running Setti
 imports and password-required daemons are quiet skips; export `PASEO_PASSWORD` for a protected daemon.
 Other import failures appear as a nonblocking status and in the debug log.
 
+When the live session has an active model preset, the base provider inherits that session's preset
+in the ACP **Preset** picker; a separate `gjc-<preset>` provider is not required. A configured default
+alone does not turn a session using a directly selected model into a preset session.
+
+Primary control follows the host's startup surface, not the latest attachment. A CLI-started session
+keeps terminal permission prompts and UI; attaching Paseo does not grant it authority to close or
+delete the underlying session. A Paseo/SDK-started host keeps ACP provider and lifecycle authority
+when Paseo reloads or reconnects. Secondary clients can still submit prompts and change the model
+preset; per-turn prompt and cancellation ownership is unchanged.
+
 ### Lifecycle: GJC creates, you delete
 
 GJC adds one Paseo entry per new session and never deletes or rewrites it. `gjc -c` preserves the

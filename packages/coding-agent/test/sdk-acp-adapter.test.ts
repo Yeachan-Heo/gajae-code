@@ -215,6 +215,35 @@ test("a capability-less attachment is rejected on the handoff paths too (#4730 r
 	}
 });
 
+test("provider activation stays fail-closed until startup origin authorizes it", async () => {
+	const harness = createRouterHarness();
+	const adapter = new AcpSdkAdapter({
+		router: harness.router as never,
+		attachment: harness.attachment,
+		sessionId: harness.attachment.sessionId,
+		providers: [{ capability: "permission", definitions: [] }],
+		heartbeatMs: 5,
+	});
+	try {
+		await adapter.start({ activateProviders: false });
+		await adapter.start();
+		await adapter.ensureProviders();
+		await adapter.attachmentReady(harness.attachment);
+		expect(harness.requests.filter(frame => frame.type === "register_provider")).toHaveLength(0);
+
+		const replacement = { ...harness.attachment, connectionId: "router-connection-2" };
+		adapter.acceptAttachment(replacement);
+		await Bun.sleep(10);
+		expect(harness.requests.filter(frame => frame.type === "register_provider")).toHaveLength(0);
+
+		adapter.authorizeProviderActivation();
+		await adapter.ensureProviders();
+		expect(harness.requests.filter(frame => frame.type === "register_provider")).toHaveLength(1);
+	} finally {
+		await adapter.close();
+	}
+});
+
 test("ACP lease heartbeats take the maintenance route, never the reconciling send path (#4689)", async () => {
 	// The 5s lease heartbeat was one of the two timers that forced a locked
 	// authority reconcile per attached session. A regression back to send() (or

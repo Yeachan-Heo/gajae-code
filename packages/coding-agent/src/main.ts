@@ -1847,6 +1847,7 @@ export async function runRootCommand(
 	sessionOptions.hasUI = isInteractive;
 	sessionOptions.notificationHostModeSupported = isInteractive;
 	sessionOptions.sdkHostModeSupported = isInteractive;
+	sessionOptions.primaryControlSurface = "cli";
 	sessionOptions.settings = settingsInstance;
 	sessionOptions.masterModeContext = masterModeContext;
 	if (isInteractive && sessionOptions.mcpConfigPath) {

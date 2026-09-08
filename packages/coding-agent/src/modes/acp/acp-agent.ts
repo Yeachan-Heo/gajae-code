@@ -169,6 +169,7 @@ type PendingAttachment = { epoch: number; task: Promise<void> };
 type SessionRecord = {
 	cwd: string;
 	adapter: AcpSdkAdapter;
+	primaryControlSurface?: "cli" | "sdk";
 	attachment: SessionAttachment;
 	closeIdempotencyKey: string;
 	unsubscribe: () => void;
@@ -754,6 +755,22 @@ function configValues(query: unknown): Map<string, string> {
 		}
 	}
 	return values;
+}
+
+/**
+ * Recover a session-scoped preset only when the host's current model carries
+ * the synthetic profile namespace. A plain `modelPreset` value may be the
+ * persisted default and is therefore insufficient to identify an active
+ * profile, especially when attaching through the base ACP provider.
+ */
+export function activeModelPresetFromConfig(query: unknown): string | undefined {
+	const values = configValues(query);
+	const model = values.get(MODEL_CONFIG_ID);
+	const preset = values.get(MODEL_PRESET_CONFIG_KEY);
+	const prefix = `${SYNTHETIC_PROVIDER_ID}/`;
+	if (!model?.startsWith(prefix) || !preset) return undefined;
+	const syntheticPreset = model.slice(prefix.length);
+	return syntheticPreset === preset ? syntheticPreset : undefined;
 }
 
 function modelPresetConfigOptions(query: unknown, current: string): { value: string; name: string }[] {
@@ -1590,10 +1607,14 @@ export class AcpAgent implements Agent {
 				await this.setSessionMode({ sessionId: params.sessionId, modeId: params.value });
 				break;
 			case MODEL_CONFIG_ID:
-				if (this.#startupOptions?.modelPreset === undefined) {
-					await this.#adapter(params.sessionId).setModel(params.value);
-				} else if (params.value !== ACP_CUSTOM_MODEL_PRESET) {
-					await this.#adapter(params.sessionId).control("model.profile.set", { id: params.value });
+				{
+					const config = await this.#adapter(params.sessionId).query("config.list/get");
+					const activePreset = this.#startupOptions?.modelPreset ?? activeModelPresetFromConfig(config);
+					if (activePreset === undefined) {
+						await this.#adapter(params.sessionId).setModel(params.value);
+					} else if (params.value !== ACP_CUSTOM_MODEL_PRESET) {
+						await this.#adapter(params.sessionId).control("model.profile.set", { id: params.value });
+					}
 				}
 				break;
 			case THINKING_CONFIG_ID:
@@ -2227,7 +2248,7 @@ export class AcpAgent implements Agent {
 			// session host remains authoritative for its immutable configuration, so
 			// attachment must not reinterpret the replay as a mutation request.
 			this.#pendingDeleteLocators.delete(id);
-			await attached.adapter.ensureProviders();
+			if (attached.primaryControlSurface === "sdk") await attached.adapter.ensureProviders();
 			return;
 		}
 		const knownCwd = this.#knownSessionCwds.get(id);
@@ -2313,7 +2334,7 @@ export class AcpAgent implements Agent {
 		if (existing) {
 			if (path.resolve(existing.cwd) !== path.resolve(cwd))
 				throw new AcpSdkAdapterError("conflict", `ACP session ${id} has conflicting cwd authority.`);
-			await existing.adapter.ensureProviders();
+			if (existing.primaryControlSurface === "sdk") await existing.adapter.ensureProviders();
 			return;
 		}
 		const attaching = this.#attaching.get(id);
@@ -2368,7 +2389,10 @@ export class AcpAgent implements Agent {
 			});
 			unsubscribePendingFrames = adapter.onFrame(frame => pendingAdapterFrames.push(frame));
 			this.#pendingRouterAdapters.set(id, adapter);
-			await adapter.start();
+			// Query startup provenance before activating reverse providers. A CLI
+			// host must retain terminal permission/UI leases and lifecycle authority;
+			// a broker-launched SDK host keeps ACP ownership across reconnects.
+			await adapter.start({ activateProviders: false });
 			let capabilities: JsonObject | undefined;
 			try {
 				const response = object(await adapter.query("runtime.capabilities"));
@@ -2382,6 +2406,17 @@ export class AcpAgent implements Agent {
 					"unavailable",
 					"This ACP client requires a newer GJC SDK session; restart the session.",
 				);
+			const primaryControlSurface =
+				capabilities?.primaryControlSurface === "sdk"
+					? "sdk"
+					: capabilities?.primaryControlSurface === "cli"
+						? "cli"
+						: undefined;
+			if (primaryControlSurface === "sdk") {
+				adapter.authorizeProviderActivation();
+				await adapter.ensureProviders();
+				await applyAcpPermissionMode(adapter, this.#clientCapabilities);
+			}
 			this.#assertSessionEpoch(id, epoch);
 			const exactAttachment = this.#router.attachment(id) ?? currentAttachment;
 			if (!exactAttachment.isCurrent())
@@ -2389,6 +2424,7 @@ export class AcpAgent implements Agent {
 			const record: SessionRecord = {
 				cwd,
 				adapter,
+				primaryControlSurface,
 				attachment: exactAttachment,
 				closeIdempotencyKey: randomUUID(),
 				unsubscribe: () => {},
@@ -2415,8 +2451,7 @@ export class AcpAgent implements Agent {
 			this.#pendingRouterAdapters.delete(id);
 			this.#pendingRouterFrames.delete(id);
 			this.#knownSessionCwds.set(id, cwd);
-			this.#ownedSessionIds.add(id);
-			await applyAcpPermissionMode(adapter, this.#clientCapabilities);
+			if (primaryControlSurface === "sdk") this.#ownedSessionIds.add(id);
 			this.#assertSessionEpoch(id, epoch);
 			// A successful attachment establishes a new live-owner epoch. Any locator
 			// retained from an earlier cleanup_pending delete belongs to the terminal
@@ -3473,25 +3508,20 @@ export class AcpAgent implements Agent {
 	): Promise<Pick<NewSessionResponse, "configOptions" | "modes">> {
 		const record = this.#sessions.get(id);
 		if (!record) throw new AcpSdkAdapterError("not_found", `Unknown session, not found: ${id}`);
-		const modelPreset = this.#startupOptions?.modelPreset;
-		const [config, sessionCatalog] = await Promise.all([
-			record.adapter.query("config.list/get"),
-			modelPreset === undefined
-				? collectModelCatalogAndActiveProviders(record.adapter)
-				: record.adapter
-						.query("models.profiles.list")
-						.then((profiles): { modelCatalog: unknown; activeProviders: undefined } => ({
-							modelCatalog: profiles,
-							activeProviders: undefined,
-						})),
-		]);
-		// The active-provider walk overlaps the catalog inside the batch above, but
-		// only after the first models.list/current page has finalized host-side
-		// credential state, so catalog rows and provider availability never mix
-		// pre- and post-refresh credential snapshots. Only an older session host
-		// that rejects `providers.list/active` with `operation_not_session_owned`
-		// falls back to the full catalog; operational failures fail closed so the
-		// active-provider contract is not silently widened.
+		const config = await record.adapter.query("config.list/get");
+		const modelPreset = this.#startupOptions?.modelPreset ?? activeModelPresetFromConfig(config);
+		const sessionCatalog = await (modelPreset === undefined
+			? collectModelCatalogAndActiveProviders(record.adapter)
+			: record.adapter
+					.query("models.profiles.list")
+					.then((profiles): { modelCatalog: unknown; activeProviders: undefined } => ({
+						modelCatalog: profiles,
+						activeProviders: undefined,
+					})));
+		// Only an older session host that rejects `providers.list/active` with
+		// `operation_not_session_owned` falls back to the full catalog;
+		// operational failures fail closed so the active-provider contract is not
+		// silently widened.
 		const modelCatalog = sessionCatalog.modelCatalog;
 		const activeProviders = sessionCatalog.activeProviders;
 		record.authFailure = undefined;

@@ -107,13 +107,20 @@ export interface SdkCapabilities {
 	operations: string[];
 	hostTools: boolean;
 	promptTerminalOutcomeVersion: 1;
+	/** Startup surface that owns host-level permission and lifecycle authority. */
+	primaryControlSurface: "cli" | "sdk";
 }
 
-export function createSdkCapabilities(policy: SdkSurfacePolicy, hostTools = false): SdkCapabilities {
+export function createSdkCapabilities(
+	policy: SdkSurfacePolicy,
+	hostTools = false,
+	primaryControlSurface: SdkCapabilities["primaryControlSurface"] = "sdk",
+): SdkCapabilities {
 	return {
 		operations: [...policy.installedControls, ...policy.installedQueries],
 		hostTools,
 		promptTerminalOutcomeVersion: 1,
+		primaryControlSurface,
 	};
 }
 

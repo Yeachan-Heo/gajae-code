@@ -198,6 +198,8 @@ export class AcpSdkAdapter {
 	#reverseCancelTtlMs: number;
 	#closed = false;
 	#started = false;
+	/** Reverse-provider leases are enabled only after host origin is authenticated. */
+	#providerActivationAuthorized = false;
 	constructor(options: AcpSdkAdapterOptions) {
 		if ((options.client === undefined) === (options.router === undefined))
 			throw new AcpSdkAdapterError(
@@ -225,6 +227,11 @@ export class AcpSdkAdapter {
 		return adapter;
 	}
 
+	/** Authorize provider registration after the host startup origin is known. */
+	authorizeProviderActivation(): void {
+		this.#providerActivationAuthorized = true;
+	}
+
 	acceptAttachment(attachment: SessionAttachment): void {
 		if (!this.#router || attachment.sessionId !== this.#sessionId)
 			throw new AcpSdkAdapterError("invalid_input", "ACP attachment does not match this session adapter.");
@@ -238,7 +245,8 @@ export class AcpSdkAdapter {
 		this.#connectionId = undefined;
 		this.#routerConnectionReady = false;
 		this.#providersActivated = false;
-		if (attachment.isCurrent()) void this.#activateProviders().catch(error => this.#reportReconnectFailure(error));
+		if (attachment.isCurrent() && this.#providerActivationAuthorized)
+			void this.#activateProviders().catch(error => this.#reportReconnectFailure(error));
 	}
 
 	revokeAttachment(attachment: SessionAttachment): void {
@@ -264,7 +272,7 @@ export class AcpSdkAdapter {
 			this.#providersActivated = false;
 		}
 		if (!attachment.isCurrent()) throw new SessionRouterError("pre_send", "SDK session attachment is stale.");
-		await this.#activateProviders();
+		if (this.#providerActivationAuthorized) await this.#activateProviders();
 	}
 	/**
 	 * Re-register reverse providers on a live attachment without aborting in-flight
@@ -273,7 +281,7 @@ export class AcpSdkAdapter {
 	 * place for the life of the session (#4909).
 	 */
 	async ensureProviders(): Promise<void> {
-		if (this.#closed || this.#providers.length === 0) return;
+		if (!this.#providerActivationAuthorized || this.#closed || this.#providers.length === 0) return;
 		if (this.#ensuring) return await this.#ensuring;
 		const run = (async () => {
 			if (this.#closed) return;
@@ -307,9 +315,14 @@ export class AcpSdkAdapter {
 		return () => this.#frameHandlers.delete(handler);
 	}
 
-	async start(): Promise<void> {
+	async start(options: { activateProviders?: boolean } = {}): Promise<void> {
+		const activateProviders = options.activateProviders !== false;
 		if (this.#closed) throw new AcpSdkAdapterError("connection_closed");
 		if (!this.#started) {
+			// Direct adapter startup owns providers; ACP attachment defers this
+			// authority until runtime origin discovery. Repeated startup cannot
+			// promote a secondary attachment.
+			this.#providerActivationAuthorized = activateProviders;
 			this.#started = true;
 			if (this.#client) {
 				this.#unsubscribe ??= this.#client.onFrame(frame => void this.#onFrame(frame));
@@ -323,12 +336,14 @@ export class AcpSdkAdapter {
 				this.#connectionId = this.#client.connectionId;
 			}
 		}
-		if (this.#router) {
-			if (!this.#attachment?.isCurrent()) return;
-			if (this.#attachment) assertMaintenanceCapability(this.#attachment);
-			await this.#activateProviders();
-		} else {
-			await this.#activateProviders();
+		if (activateProviders) {
+			if (this.#router) {
+				if (!this.#attachment?.isCurrent()) return;
+				if (this.#attachment) assertMaintenanceCapability(this.#attachment);
+				if (this.#providerActivationAuthorized) await this.#activateProviders();
+			} else {
+				if (this.#providerActivationAuthorized) await this.#activateProviders();
+			}
 		}
 		this.#heartbeat ??= setInterval(
 			() => void this.#heartbeatLeases().catch(error => this.#reportReconnectFailure(error)),
@@ -575,7 +590,7 @@ export class AcpSdkAdapter {
 	}
 
 	async #activateProviders(force = false): Promise<void> {
-		if (this.#providers.length === 0) return;
+		if (!this.#providerActivationAuthorized || this.#providers.length === 0) return;
 		if (this.#providerActivation) {
 			await this.#providerActivation;
 			if (this.#closed) return;
@@ -656,7 +671,7 @@ export class AcpSdkAdapter {
 	}
 
 	async #reclaimProviders(): Promise<void> {
-		if (this.#closed || !this.#providers.length) return;
+		if (!this.#providerActivationAuthorized || this.#closed || !this.#providers.length) return;
 		if (this.#reclaiming) return await this.#reclaiming;
 		this.#reclaiming = (async () => {
 			this.#abortActiveReverseRequests();

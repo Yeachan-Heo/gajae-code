@@ -524,6 +524,8 @@ export interface CreateSdkSessionRuntimeOptions {
 	brokerRegistrationRequired?: boolean;
 	/** Trusted broker-issued lifecycle marker bound to lifecycle host index events. */
 	lifecycleRequestId?: string;
+	/** Startup surface that owns host-level permission and lifecycle authority. */
+	primaryControlSurface?: "cli" | "sdk";
 	createTransport(input: {
 		sessionId: string;
 		stateRoot: string;
@@ -1454,6 +1456,8 @@ export interface SdkSurfaceFactoryOptions {
 	ctx: ExtensionContext;
 	id: string;
 	api: ExtensionAPI;
+	/** Startup surface that owns host-level permission and lifecycle authority. */
+	primaryControlSurface?: "cli" | "sdk";
 	policy?: SdkSurfacePolicy;
 	getInstalledDefinitions?: (capability: string) => unknown | undefined;
 	getLiveState?: () => { isStreaming: boolean; steeringQueueDepth: number; followupQueueDepth: number };
@@ -1499,6 +1503,7 @@ function createQuerySurface(
 		steerStatusLookup?: (selector: { commandId?: string; turnId?: string; clientRef?: string }) => unknown;
 		hostTools?: boolean | (() => boolean);
 		getRuntimeHost?: () => SessionSdkHost | undefined;
+		primaryControlSurface?: "cli" | "sdk";
 	} = {},
 ): SessionSurface {
 	const policy =
@@ -1881,7 +1886,7 @@ function createQuerySurface(
 		getStats: () => ctx.sessionManager.getUsageStatistics(),
 		getBranchCandidates: () => ctx.getBranchCandidates(),
 		getLastAssistant: lastAssistant,
-		getCapabilities: () => createSdkCapabilities(policy, hasHostTools()),
+		getCapabilities: () => createSdkCapabilities(policy, hasHostTools(), options.primaryControlSurface),
 		getAuthProviders: () => [...new Set(ctx.modelRegistry.getAll().map(model => model.provider))],
 		getActiveProviders: () => ctx.modelRegistry.getActiveProviders(),
 		getTools: () => {
@@ -1974,6 +1979,7 @@ export function createSdkSurfaceFactory(
 		steerStatusLookup: options.steerStatusLookup,
 		hostTools: options.hostTools,
 		getRuntimeHost: options.getRuntimeHost,
+		primaryControlSurface: options.primaryControlSurface,
 	});
 	return {
 		policy,
@@ -5175,6 +5181,9 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			configOverrides: options.configOverrides,
 			settings: options.settings,
 			getRuntimeHost: () => runtime?.host,
+			// Origin is explicit at the session bootstrap boundary. The low-level
+			// runtime defaults to SDK for existing embedders; CLI roots pass cli.
+			primaryControlSurface: options.primaryControlSurface ?? "sdk",
 		});
 		const queryHandlers = new QueryHandlers(surfaceFactory.query, sessionId, revisions, cursors);
 		const inputGate = { quiescing: false };

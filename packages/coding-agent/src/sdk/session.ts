@@ -624,6 +624,8 @@ export interface CreateAgentSessionOptions {
 	notificationHostModeSupported?: boolean;
 	/** Whether this host mode can own the root SDK endpoint. Default: true. */
 	sdkHostModeSupported?: boolean;
+	/** Startup surface that owns host-level permission and lifecycle authority. */
+	primaryControlSurface?: "cli" | "sdk";
 	/** Override configured Discord/Slack daemon readiness, primarily for embedded hosts and deterministic tests. */
 	ensureNotificationProviderDaemon?: (provider: "discord" | "slack", settings: Settings) => Promise<unknown>;
 
@@ -3470,6 +3472,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 							createTransport: input => createSdkWebSocketTransport(input),
 							settings,
 							configOverrides: new Map(),
+							primaryControlSurface: options.primaryControlSurface ?? "sdk",
 							...(masterModeContext
 								? {
 										masterCapability: masterModeContext.getCapability(),

@@ -34,6 +34,13 @@ import { SdkTransportLifecycleError } from "./websocket-transport";
 
 setDefaultTimeout(30_000);
 
+test("runtime capabilities preserve explicit primary control surface", () => {
+	const policy = createSdkSurfacePolicy({ bindings: [], workflowGateAvailable: false });
+	expect(createSdkCapabilities(policy)).toMatchObject({ primaryControlSurface: "sdk" });
+	expect(createSdkCapabilities(policy, false, "sdk")).toMatchObject({ primaryControlSurface: "sdk" });
+	expect(createSdkCapabilities(policy, false, "cli")).toMatchObject({ primaryControlSurface: "cli" });
+});
+
 function memoryTransport(): SessionSdkTransport & {
 	feed(connectionId: string, frame: SdkFrame): void;
 	readonly sent: SdkFrame[];

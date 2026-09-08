@@ -9,6 +9,7 @@ import { resolveAcpStartupOptions } from "../src/main";
 import {
 	acpProviderRegistrations,
 	acpSessionStateFromConfig,
+	activeModelPresetFromConfig,
 	applyAcpPermissionMode,
 	applyAcpStartupOptions,
 	collectActiveProviderIds,
@@ -614,6 +615,54 @@ test("ACP reports the existing model list when --mpreset is absent", () => {
 			}),
 		]),
 	);
+});
+
+test("ACP inherits an active synthetic preset from a live host without --mpreset", () => {
+	const config = {
+		result: {
+			page: {
+				items: [
+					{
+						model: "gajae-code/codex-medium",
+						modelPreset: "codex-medium",
+					},
+				],
+			},
+		},
+	};
+	expect(activeModelPresetFromConfig(config)).toBe("codex-medium");
+	const state = acpSessionStateFromConfig(
+		config,
+		{
+			result: {
+				page: {
+					items: [{ id: "codex-medium", displayName: "Codex Medium", source: "builtin" }],
+				},
+			},
+		},
+		activeModelPresetFromConfig(config),
+	);
+	expect(state.configOptions).toEqual(
+		expect.arrayContaining([
+			expect.objectContaining({
+				id: "model",
+				name: "Preset",
+				currentValue: "codex-medium",
+			}),
+		]),
+	);
+});
+
+test("ACP does not infer an active preset from a raw model and persisted default", () => {
+	expect(
+		activeModelPresetFromConfig({
+			result: {
+				page: {
+					items: [{ model: "openai-codex/gpt-5.6", modelPreset: "persisted-default" }],
+				},
+			},
+		}),
+	).toBeUndefined();
 });
 
 test("ACP applies explicit CLI model and thinking through canonical SDK controls", async () => {
