@@ -25,7 +25,7 @@ const initialModel: Model = {
 	maxTokens: 128_000,
 };
 
-const blockedModel: Model = {
+const solModel: Model = {
 	...initialModel,
 	id: "gpt-5.6-sol",
 	name: "GPT-5.6 Sol",
@@ -88,14 +88,9 @@ describe("AgentSession Codex model entitlement", () => {
 		await fs.rm(tempDir, { recursive: true, force: true });
 	});
 
-	test("refuses a non-Pro Sol binding before changing the primary model", async () => {
-		const entriesBefore = sessionManager.getEntries();
+	test("binds Sol on a Plus-labelled account and leaves entitlement to the provider", async () => {
+		await session.setModel(solModel);
 
-		await expect(session.setModel(blockedModel)).rejects.toThrow(
-			'This ChatGPT Codex account cannot use model "gpt-5.6-sol"',
-		);
-
-		expect(session.model).toBe(initialModel);
-		expect(sessionManager.getEntries()).toEqual(entriesBefore);
+		expect(session.model).toBe(solModel);
 	});
 });

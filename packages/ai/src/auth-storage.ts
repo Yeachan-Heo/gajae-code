@@ -26,12 +26,7 @@ import type {
 	UsageReport,
 } from "./usage";
 
-import {
-	classifyOpenAICodexProEntitlement,
-	formatOpenAICodexChatGPTEntitlementError,
-	requiresOpenAICodexProModel,
-	requiresStrictOpenAICodexProModel,
-} from "./utils/codex-entitlement";
+import { classifyOpenAICodexProEntitlement, requiresOpenAICodexProModel } from "./utils/codex-entitlement";
 import { getOAuthApiKey, getOAuthProvider, refreshOAuthToken, resolveOAuthStorageProvider } from "./utils/oauth";
 import { loginDeepInfra } from "./utils/oauth/deepinfra";
 import { loginDeepSeek } from "./utils/oauth/deepseek";
@@ -1158,14 +1153,6 @@ function getOpenAICodexPlanPriority(report: UsageReport | null): number {
 	if (entitlement === "entitled") return 0;
 	if (entitlement === "denied") return 2;
 	return 1;
-}
-
-function hasOpenAICodexProPlan(report: UsageReport | null): boolean {
-	return classifyOpenAICodexProEntitlement(getUsagePlanType(report)) === "entitled";
-}
-
-function hasKnownOpenAICodexNonProPlan(report: UsageReport | null): boolean {
-	return classifyOpenAICodexProEntitlement(getUsagePlanType(report)) === "denied";
 }
 
 function resolveDefaultRankingStrategy(provider: Provider): CredentialRankingStrategy | undefined {
@@ -4961,23 +4948,12 @@ export class AuthStorage {
 			}),
 		);
 
-		// Skip the Pro-plan filter when no candidate is confirmed Pro, so users with only
-		// non-Pro accounts can still attempt Spark requests (e.g. trial/grandfathered access).
-		const enforceProRequirement =
-			requiresProModel && candidates.some(candidate => hasOpenAICodexProPlan(candidate.usage));
-		// Spark retains its historical Plus fallback for grandfathered accounts.
-		// Sol is different: confirmed Free/Plus plans cannot call it, so reject the
-		// model before returning an OAuth bearer and letting the turn fail remotely.
-		// Unknown plan names still reach the provider because the usage endpoint is
-		// authoritative and future tiers must not be denied by a client-side guess.
-		const strictProRequirement = requiresStrictOpenAICodexProModel(provider, options?.modelId);
-		if (
-			strictProRequirement &&
-			candidates.length > 0 &&
-			candidates.every(candidate => hasKnownOpenAICodexNonProPlan(candidate.usage))
-		) {
-			throw new Error(formatOpenAICodexChatGPTEntitlementError(options?.modelId));
-		}
+		// Plan metadata orders the candidates (see `getOpenAICodexPlanPriority`) but never
+		// discards one: the provider is the only authority on model entitlement. Trial,
+		// grandfathered and experiment-enabled accounts carry an ordinary plan label, so a
+		// local label check would deny requests the provider accepts. When the account truly
+		// lacks the model the provider says so, and `openai-codex-responses` normalizes that
+		// response through `formatOpenAICodexChatGPTEntitlementError`.
 
 		const fallback = candidates[0];
 
@@ -4993,7 +4969,6 @@ export class AuthStorage {
 					allowBlocked: false,
 					prefetchedUsage: candidate.usage,
 					usagePrechecked: candidate.usageChecked,
-					enforceProRequirement,
 				},
 				reloadsUsed,
 			);
@@ -5012,7 +4987,6 @@ export class AuthStorage {
 					allowBlocked: true,
 					prefetchedUsage: fallback.usage,
 					usagePrechecked: fallback.usageChecked,
-					enforceProRequirement,
 				},
 				reloadsUsed,
 			);
@@ -5298,17 +5272,10 @@ export class AuthStorage {
 			allowBlocked: boolean;
 			prefetchedUsage?: UsageReport | null;
 			usagePrechecked?: boolean;
-			enforceProRequirement?: boolean;
 		},
 		reloadsUsed = 0,
 	): Promise<OAuthResolutionResult | undefined> {
-		const {
-			checkUsage,
-			allowBlocked,
-			prefetchedUsage = null,
-			usagePrechecked = false,
-			enforceProRequirement,
-		} = usageOptions;
+		const { checkUsage, allowBlocked, prefetchedUsage = null, usagePrechecked = false } = usageOptions;
 		if (!this.#reconcileOAuthCredentialSelection(provider, selection)) return undefined;
 		if (!allowBlocked && this.#isCredentialBlocked(providerKey, selection.index)) {
 			return undefined;
@@ -5319,7 +5286,6 @@ export class AuthStorage {
 		}
 
 		const requiresProModel = requiresOpenAICodexProModel(provider, options?.modelId);
-		const applyProFilter = enforceProRequirement ?? requiresProModel;
 		let usage: UsageReport | null = null;
 		let usageChecked = false;
 
@@ -5333,9 +5299,6 @@ export class AuthStorage {
 					timeoutMs: this.#usageRequestTimeoutMs,
 				});
 				usageChecked = true;
-			}
-			if (applyProFilter && !hasOpenAICodexProPlan(usage)) {
-				return undefined;
 			}
 			if (checkUsage && !allowBlocked && usage && this.#isUsageLimitReached(usage)) {
 				const resetAtMs = this.#getUsageResetAtMs(usage, Date.now());
@@ -5415,9 +5378,6 @@ export class AuthStorage {
 						timeoutMs: this.#usageRequestTimeoutMs,
 					});
 					usageChecked = true;
-				}
-				if (applyProFilter && !hasOpenAICodexProPlan(usage)) {
-					return undefined;
 				}
 				if (checkUsage && !allowBlocked && usage && this.#isUsageLimitReached(usage)) {
 					const resetAtMs = this.#getUsageResetAtMs(usage, Date.now());

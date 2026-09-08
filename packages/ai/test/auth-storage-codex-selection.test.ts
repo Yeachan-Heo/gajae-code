@@ -376,7 +376,7 @@ describe("AuthStorage codex oauth ranking", () => {
 		"free",
 		" Plus ",
 		"FREE",
-	])("rejects GPT-5.6 Sol for the known denied %s ChatGPT plan", async planType => {
+	])("defers GPT-5.6 Sol on the lower-ranked %s ChatGPT plan to the provider", async planType => {
 		if (!authStorage) throw new Error("test setup failed");
 
 		await authStorage.set("openai-codex", [
@@ -394,9 +394,7 @@ describe("AuthStorage codex oauth ranking", () => {
 			authStorage.getApiKey("openai-codex", `session-sol-${planType.trim().toLowerCase()}`, {
 				modelId: "gpt-5.6-sol",
 			}),
-		).rejects.toThrow(
-			'This ChatGPT Codex account cannot use model "gpt-5.6-sol". Select a model available to this ChatGPT account',
-		);
+		).resolves.toBe("api-acct-denied");
 	});
 
 	test.each([
@@ -432,6 +430,33 @@ describe("AuthStorage codex oauth ranking", () => {
 				modelId: "gpt-5.6-sol",
 			}),
 		).resolves.toBe("api-acct-entitled");
+	});
+
+	test("falls back to a Plus account for GPT-5.6 Sol when the Pro account is exhausted", async () => {
+		if (!authStorage) throw new Error("test setup failed");
+
+		await authStorage.set("openai-codex", [
+			{ type: "oauth", ...createCredential("acct-pro", "pro@example.com") },
+			{ type: "oauth", ...createCredential("acct-plus", "plus@example.com") },
+		]);
+		const proReport = createCodexUsageReport({
+			accountId: "acct-pro",
+			primary: { usedFraction: 1, resetInMs: 30 * 60 * 1000 },
+			secondary: { usedFraction: 1, resetInMs: 6 * 24 * 60 * 60 * 1000 },
+		});
+		proReport.metadata = { ...proReport.metadata, planType: "pro" };
+		usageByAccount.set("acct-pro", proReport);
+		const plusReport = createCodexUsageReport({
+			accountId: "acct-plus",
+			primary: { usedFraction: 0.05, resetInMs: 30 * 60 * 1000 },
+			secondary: { usedFraction: 0.05, resetInMs: 6 * 24 * 60 * 60 * 1000 },
+		});
+		plusReport.metadata = { ...plusReport.metadata, planType: "plus" };
+		usageByAccount.set("acct-plus", plusReport);
+
+		await expect(
+			authStorage.getApiKey("openai-codex", "session-sol-pro-exhausted", { modelId: "gpt-5.6-sol" }),
+		).resolves.toBe("api-acct-plus");
 	});
 
 	test("does not reject GPT-5.6 Sol when the ChatGPT plan is unavailable", async () => {

@@ -2,9 +2,12 @@
  * Model entitlement facts shared by Codex credential selection and provider
  * error presentation.
  *
- * GPT-5.6 Sol is a Pro-tier ChatGPT Codex model. The usage endpoint is the
- * authority for the account tier; this module only names the model policy and
- * keeps the provider's deterministic rejection wording in one place.
+ * Pro-tier Codex models such as GPT-5.6 Sol are marketed for higher plans, but
+ * the provider grants them per account: trial, grandfathered and experiment
+ * accounts carry an ordinary plan label and are still accepted. The plan label
+ * therefore orders credentials; the provider decides entitlement. This module
+ * names the plan policy used for that ordering and keeps the provider's
+ * deterministic rejection wording in one place.
  */
 
 const OPENAI_CODEX_PRO_ENTITLED_PLAN_TYPES = new Set(["pro", "business", "enterprise", "team"]);
@@ -13,12 +16,11 @@ const OPENAI_CODEX_PRO_DENIED_PLAN_TYPES = new Set(["free", "plus"]);
 export type OpenAICodexProEntitlement = "entitled" | "denied" | "unknown";
 
 /**
- * Classify a ChatGPT `plan_type` for strict Pro-tier Codex models.
+ * Classify a ChatGPT `plan_type` for Pro-tier Codex model preference.
  *
- * The usage endpoint remains authoritative: only exact, documented tier names
- * are classified. Known Free/Plus tiers can be rejected locally, while missing
- * or unfamiliar values stay unknown and reach the provider instead of being
- * guessed from a substring.
+ * Only exact, documented tier names are classified; missing or unfamiliar
+ * values stay unknown rather than being guessed from a substring. The result
+ * ranks credentials — `denied` means "try this account last", not "refuse it".
  */
 export function classifyOpenAICodexProEntitlement(planType: string | undefined): OpenAICodexProEntitlement {
 	const normalized = planType?.trim().toLowerCase();
@@ -28,16 +30,13 @@ export function classifyOpenAICodexProEntitlement(planType: string | undefined):
 	return "unknown";
 }
 
+/** Models whose credential selection ranks candidates by ChatGPT plan tier. */
 export function requiresOpenAICodexProModel(provider: string, modelId: string | undefined): boolean {
 	return (
 		provider === "openai-codex" &&
 		typeof modelId === "string" &&
 		(modelId.toLowerCase().includes("-spark") || modelId.toLowerCase() === "gpt-5.6-sol")
 	);
-}
-
-export function requiresStrictOpenAICodexProModel(provider: string, modelId: string | undefined): boolean {
-	return provider === "openai-codex" && modelId?.toLowerCase() === "gpt-5.6-sol";
 }
 
 export function isOpenAICodexChatGPTEntitlementError(message: string | undefined, code?: string): boolean {
