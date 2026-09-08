@@ -2119,21 +2119,18 @@ export class SessionRouter {
 		if (attached.notificationCancelled || !this.#attachmentLive(attached)) return;
 		const callback = this.#deps.onNotificationFrame;
 		if (!callback) return;
-		const work = this.#boundedNotificationWork(async () => {
-			await callback(attached.notificationSubscription, frame);
-			return true;
-		}).then(
-			result => {
-				if (result === NOTIFICATION_WORK_TIMEOUT) {
-					this.#detachNotification(attached, "cancelled");
-					return;
+		const delivery = Promise.resolve()
+			.then(async () => {
+				await callback(attached.notificationSubscription, frame);
+				if (!attached.notificationCancelled && this.#attachmentLive(attached)) {
+					attached.notificationFailures = 0;
+					if (frame.seq !== undefined)
+						attached.notificationSubscription.advanceCursor(frame.generation ?? attached.generation, frame.seq);
 				}
-				// A delivered frame ends the consecutive-failure run.
-				attached.notificationFailures = 0;
-				if (frame.seq !== undefined)
-					attached.notificationSubscription.advanceCursor(frame.generation ?? attached.generation, frame.seq);
-			},
-			(error: unknown) => {
+				return true;
+			})
+			.catch((error: unknown) => {
+				if (attached.notificationCancelled || !this.#attachmentLive(attached)) return;
 				// Concede only after a bounded consecutive run: a single refused
 				// publication drops that frame, it does not end the subscription.
 				attached.notificationFailures += 1;
@@ -2148,8 +2145,14 @@ export class SessionRouter {
 				logger.warn(
 					`SDK notification subscription ${attached.notificationSubscription.subscriptionId} refused one frame (${attached.notificationFailures}/${NOTIFICATION_LOCAL_FAILURE_LIMIT}); subscription retained: ${detail}`,
 				);
-			},
-		);
+			});
+		const work = this.#boundedNotificationWork(() => delivery).then(result => {
+			if (result === NOTIFICATION_WORK_TIMEOUT) {
+				// Observe eventual success AND failure on the delivery promise,
+				// independently of this non-revoking wait budget.
+				logger.warn("SDK notification delivery remains pending after wait budget; subscription retained.");
+			}
+		});
 		void work;
 	}
 

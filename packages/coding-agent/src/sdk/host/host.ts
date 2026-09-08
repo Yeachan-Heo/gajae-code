@@ -2,6 +2,7 @@ import { logger } from "@gajae-code/utils";
 import { AUTOROUTING_INACTIVE_WARNING } from "../../config/autorouting-contract";
 import { FileLockAcquireError } from "../../config/file-lock";
 import { redactBrokerRuntimeCapabilities, redactObservedRequestContent } from "./control/runtime-gate";
+import { reserveEventGeneration } from "./event-generation";
 import { type EventFrame, SessionEventStream } from "./events";
 import { isAutoroutingInactive } from "./internal-autorouting-state";
 import { type ProviderLease, ReverseLeaseError, ReverseLeaseRuntime } from "./reverse-leases";
@@ -46,6 +47,8 @@ export type SessionActivationOutcome =
 export type SessionActivationGate = (input: { sessionId: string; generation: number }) => boolean | Promise<boolean>;
 
 export interface SessionSdkHostOptions extends HostEndpointAdapters {
+	/** Injectable reservation authority for isolated host tests. Production uses durable storage. */
+	reserveEventGeneration?: (minimum: number) => Promise<number>;
 	control?: (connectionId: string, frame: SdkFrame) => unknown | Promise<unknown>;
 	query?: (connectionId: string, frame: SdkFrame) => unknown | Promise<unknown>;
 	/** Supplies the durable transcript revision stamped on ordinary emitted events. */
@@ -206,6 +209,7 @@ export class SessionSdkHost {
 	readonly reverse: ReverseLeaseRuntime;
 	readonly #options: SessionSdkHostOptions;
 	#started = false;
+	#startPromise?: Promise<"started">;
 	#stopping = false;
 	#stopPromise?: Promise<"stopped">;
 	#unsubscribe?: () => void;
@@ -275,8 +279,27 @@ export class SessionSdkHost {
 	}
 
 	async start(): Promise<"started" | "already"> {
+		if (this.#stopPromise) await this.#stopPromise;
+		if (this.#startPromise) {
+			await this.#startPromise;
+			return "already";
+		}
 		if (this.#started) return "already";
-		this.events.restart();
+		const pending = this.#startHost();
+		this.#startPromise = pending;
+		try {
+			return await pending;
+		} finally {
+			if (this.#startPromise === pending) this.#startPromise = undefined;
+		}
+	}
+
+	async #startHost(): Promise<"started"> {
+		const minimum = this.events.generation + 1;
+		const generation = await (this.#options.reserveEventGeneration
+			? this.#options.reserveEventGeneration(minimum)
+			: reserveEventGeneration(this.#options.stateRoot, this.#options.sessionId, minimum));
+		this.events.restart(generation);
 		if (isAutoroutingInactive(this)) this.emitAutoroutingInactiveNotice();
 		if (this.#options.readiness !== "deferred") this.#publishReadiness();
 		else
@@ -365,6 +388,7 @@ export class SessionSdkHost {
 	}
 
 	async stop(options: { allowLockContention?: boolean } = {}): Promise<"stopped" | "already"> {
+		if (this.#startPromise) await this.#startPromise.catch(() => undefined);
 		if (this.#stopPromise) return this.#stopPromise;
 		if (!this.#started) return "already";
 		const stopPromise = this.#stopStartedHost(options);

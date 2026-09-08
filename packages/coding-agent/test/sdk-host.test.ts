@@ -104,12 +104,14 @@ describe("SessionSdkHost", () => {
 		});
 		expect(await host.start()).toBe("started");
 		expect(await host.start()).toBe("already");
-		expect(registered).toEqual([1]);
+		const firstGeneration = host.generation;
+		expect(registered).toEqual([firstGeneration]);
 		expect(handler).toBeDefined();
 		expect(await host.stop()).toBe("stopped");
 		expect(await host.stop()).toBe("already");
 		expect(await host.start()).toBe("started");
-		expect(registered).toEqual([1, 2]);
+		expect(host.generation).toBeGreaterThan(firstGeneration);
+		expect(registered).toEqual([firstGeneration, host.generation]);
 	});
 
 	test("retries broker unregister after a fail-once owner release", async () => {
@@ -295,13 +297,14 @@ describe("SessionSdkHost", () => {
 				type: "event_replay_result",
 				id: "replay-current",
 				ok: true,
-				generation: 1,
+				generation: host.generation,
 				lastSeq: 1,
 				events: [{ type: "event", seq: 1 }],
 			},
 		});
+		const previousGeneration = host.generation;
 		host.events.restart();
-		receive("replay", { type: "event_replay", id: "replay-gap", sinceGeneration: 1, sinceSeq: 1 });
+		receive("replay", { type: "event_replay", id: "replay-gap", sinceGeneration: previousGeneration, sinceSeq: 1 });
 		await new Promise(resolve => setTimeout(resolve, 0));
 		expect(sent.at(-1)).toMatchObject({
 			connectionId: "replay",
@@ -309,9 +312,14 @@ describe("SessionSdkHost", () => {
 				type: "event_replay_result",
 				id: "replay-gap",
 				ok: true,
-				generation: 2,
+				generation: host.generation,
 				lastSeq: 0,
-				gap: { kind: "generation_reset", fromGeneration: 1, toGeneration: 2, resyncQueries: ["Q01", "Q02", "Q03"] },
+				gap: {
+					kind: "generation_reset",
+					fromGeneration: previousGeneration,
+					toGeneration: host.generation,
+					resyncQueries: ["Q01", "Q02", "Q03"],
+				},
 				events: [],
 			},
 		});

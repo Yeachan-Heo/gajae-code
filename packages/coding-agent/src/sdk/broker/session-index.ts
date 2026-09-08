@@ -1238,9 +1238,6 @@ export class SessionIndex {
 		if (scan.diagnosis.status === "unsupported") throw scan.unsupportedError!;
 		this.#events = [...scan.snapshotEvents, ...scan.validLogEvents];
 		this.#warnings = [];
-		for (const event of this.#events) {
-			if (!hasSessionLocatorV2(event)) this.#warn(legacyLocatorDiagnostic(event));
-		}
 		this.#logOffset = scan.logContents?.length ?? 0;
 		this.#corruptSuffix = scan.diagnosis.status === "corrupt";
 		if (scan.diagnosis.reason === "invalid snapshot") this.#warnings.push("Invalid session index snapshot");
@@ -1762,8 +1759,24 @@ export class SessionIndex {
 		return {
 			indexSeq: this.indexSeq,
 			sessions: reduceEvents(this.#events, this.#policy.clock(), this.#agentDir).sessions,
-			warnings: this.#warnings,
+			warnings: this.#currentWarnings(),
 		};
+	}
+
+	#currentWarnings(): string[] {
+		const registrations = new Map<string, number>();
+		for (const event of admitEvents(this.#events).admitted) {
+			if (event.type === "host_registered" && hasSessionLocatorV2(event))
+				registrations.set(event.sessionId, Math.max(registrations.get(event.sessionId) ?? 0, event.indexSeq));
+		}
+		const warnings = new Set(this.#warnings);
+		for (const event of this.#events) {
+			// Keep rejected legacy rows in the audit, not as a permanent
+			// attachment veto after an admitted, later re-registration.
+			if (!hasSessionLocatorV2(event) && (registrations.get(event.sessionId) ?? 0) <= event.indexSeq)
+				warnings.add(legacyLocatorDiagnostic(event));
+		}
+		return [...warnings];
 	}
 
 	/**
@@ -1842,7 +1855,7 @@ export class SessionIndex {
 		probedIncarnations: ReadonlyMap<string, string | undefined>,
 	): SessionGenerationIndexStatus {
 		const observedIndexSeq = this.indexSeq;
-		if (this.#corruptSuffix || this.#warnings.length > 0)
+		if (this.#corruptSuffix || this.#currentWarnings().length > 0)
 			return { status: "unknown", observedIndexSeq, reason: "index_incomplete" };
 
 		const rawSessionEvents = this.#events.filter(event => event.sessionId === sessionId);

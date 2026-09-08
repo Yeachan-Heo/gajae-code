@@ -1190,6 +1190,7 @@ export class TopicRegistry {
 		record.authorityState = "active";
 		delete record.disconnectGraceExpiresAt;
 		delete record.orphanedAt;
+		this.rebuildInboundRoutes();
 		return true;
 	}
 

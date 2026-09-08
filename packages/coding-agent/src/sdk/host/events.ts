@@ -55,8 +55,10 @@ export class SessionEventStream {
 		return this.#seq;
 	}
 
-	restart(): number {
-		this.#generation += 1;
+	restart(generation = this.#generation + 1): number {
+		if (!Number.isSafeInteger(generation) || generation <= this.#generation)
+			throw new Error("SDK event generation must advance.");
+		this.#generation = generation;
 		this.#seq = 0;
 		this.#frames = [];
 		return this.#generation;

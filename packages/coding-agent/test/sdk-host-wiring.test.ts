@@ -554,6 +554,8 @@ test("lifecycle teardown swallows dual owner failures without surfacing an exten
 			lifecycleRequired: true,
 		});
 		await expect(capability.promise).resolves.toEqual({ status: "started" });
+		const endpointGeneration = tracker.result.endpointGeneration;
+		expect(endpointGeneration).toBeGreaterThan(0);
 
 		// Drive the production session_shutdown handler through a real ExtensionRunner
 		// so the onError seam proves the retained owner-release failure is NOT surfaced
@@ -589,7 +591,7 @@ test("lifecycle teardown swallows dual owner failures without surfacing an exten
 			),
 		).toBe(true);
 		expect(tracker.result).toEqual({
-			endpointGeneration: 1,
+			endpointGeneration,
 			fenced: false,
 			runtimeRemoved: true,
 			hostStopped: false,
@@ -603,7 +605,7 @@ test("lifecycle teardown swallows dual owner failures without surfacing an exten
 			handlers.get("session_shutdown")!({ type: "session_shutdown" }, sessionContext),
 		).resolves.toBeUndefined();
 		expect(tracker.result).toEqual({
-			endpointGeneration: 1,
+			endpointGeneration,
 			fenced: true,
 			runtimeRemoved: true,
 			hostStopped: true,
@@ -1496,7 +1498,8 @@ test("SDK host replays event frames over direct v3 ingress and routes queries th
 		"event replay response",
 	);
 	const replay = frames.find(frame => frame.type === "event_replay_result" && frame.id === "replay-1");
-	expect(replay).toMatchObject({ type: "event_replay_result", id: "replay-1", ok: true, generation: 1 });
+	expect(replay).toMatchObject({ type: "event_replay_result", id: "replay-1", ok: true });
+	expect(replay?.gap).toMatchObject({ kind: "generation_reset", fromGeneration: 1, toGeneration: replay?.generation });
 	const replayEvents = replay?.events as Array<Record<string, unknown>>;
 	expect(replayEvents.length).toBeGreaterThanOrEqual(4);
 	expect(replayEvents.map(event => event.seq)).toEqual(replayEvents.map((_event, index) => index + 1));

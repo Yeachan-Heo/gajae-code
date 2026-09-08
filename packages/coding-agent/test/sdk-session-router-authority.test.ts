@@ -795,6 +795,65 @@ describe("SessionRouter dispatch authority", () => {
 		}
 	});
 
+	test("slow provider delivery does not permanently cancel a live subscription", async () => {
+		const pending = Promise.withResolvers<void>();
+		const subscriptions: NotificationSubscription[] = [];
+		const delivered: string[] = [];
+		const fixture = await routerFixture({
+			onNotificationSubscription: subscription => {
+				subscriptions.push(subscription);
+			},
+			onNotificationFrame: async (_subscription, frame) => {
+				if (frame.name === "slow") await pending.promise;
+				delivered.push(String(frame.name));
+			},
+		});
+		try {
+			fixture.clients[0]?.emit({ type: "slow", sessionId: fixture.sessionId });
+			await Bun.sleep(5_100);
+			expect(subscriptions[0]?.isActive()).toBe(true);
+			expect(delivered).toEqual([]);
+			pending.resolve();
+			await waitFor(() => delivered.includes("slow"), "Slow publication never completed.");
+			fixture.clients[0]?.emit({ type: "next", sessionId: fixture.sessionId });
+			await waitFor(() => delivered.includes("next"), "Wait budget permanently cancelled notification delivery.");
+		} finally {
+			pending.resolve();
+			await fixture.router.stop();
+		}
+	}, 10_000);
+
+	test("accounts for provider failures after the notification wait budget exactly once", async () => {
+		const release = Promise.withResolvers<void>();
+		const subscriptions: NotificationSubscription[] = [];
+		let calls = 0;
+		const fixture = await routerFixture({
+			onNotificationSubscription: subscription => {
+				subscriptions.push(subscription);
+			},
+			onNotificationFrame: async () => {
+				calls++;
+				if (calls <= 4) await release.promise;
+				throw new Error("late provider failure");
+			},
+		});
+		try {
+			for (let i = 0; i < 4; i++) fixture.clients[0]?.emit({ type: `slow-${i}`, sessionId: fixture.sessionId });
+			await waitFor(() => calls === 4, "Slow callbacks were not dispatched.");
+			await Bun.sleep(5_100);
+			expect(subscriptions[0]?.isActive()).toBe(true);
+			release.resolve();
+			await Bun.sleep(20);
+			expect(subscriptions[0]?.isActive()).toBe(true);
+			fixture.clients[0]?.emit({ type: "fifth-failure", sessionId: fixture.sessionId });
+			await waitFor(() => subscriptions[0]?.isActive() === false, "Late failures bypassed the failure limit.");
+			expect(calls).toBe(5);
+		} finally {
+			release.resolve();
+			await fixture.router.stop();
+		}
+	}, 10_000);
+
 	test("ends the refusal run at the next delivered notification frame", async () => {
 		// The bound is on CONSECUTIVE refusals. A provider that refuses four frames,
 		// delivers one, then refuses four more never reaches the limit, so an

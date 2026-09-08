@@ -5157,6 +5157,7 @@ export class TelegramNotificationDaemon {
 				reason: "removed" | "replaced" | "replaced_same_generation",
 			) => await this.#onSessionRemoved(subscription, reason),
 			ownsLogicalSession: (sessionId: string) => this.#logicalSessionOwners.has(sessionId),
+			ready: (subscription: NotificationSubscription) => this.#onAttachmentReady(subscription),
 			cleanupReceipts: () => [...this.#cleanupReceipts.values()].map(receipt => ({ ...receipt })),
 		};
 	}
@@ -5282,11 +5283,15 @@ export class TelegramNotificationDaemon {
 				],
 			});
 			const cursor = this.topics.replayCursor(session.sessionId);
+			// Router has already authenticated the current endpoint generation.
+			// An older generation's cursor must not turn the new handshake into a
+			// generation_reset response, which strict replay admission rejects.
+			const currentCursor = cursor?.generation === session.replayGeneration ? cursor : undefined;
 			await this.#sendAttachment(session, {
 				type: "event_replay",
 				id: session.replayId,
-				sinceGeneration: cursor?.generation ?? session.replayGeneration,
-				sinceSeq: cursor?.seq ?? 0,
+				sinceGeneration: session.replayGeneration,
+				sinceSeq: currentCursor?.seq ?? 0,
 				capabilities: [TOOL_ACTIVITY_CAPABILITY],
 			});
 		} catch (error) {
@@ -6364,6 +6369,7 @@ export class TelegramNotificationDaemon {
 	}
 
 	#dropSession(session: AttachmentSession, reason: string): void {
+		logger.warn("Telegram attachment dropped", { reason });
 		// Capture the exact callback lease before revoking recovery authority. A
 		// predecessor transport can remain keyed by its own session id after a
 		// successor becomes the logical owner, so logical-session revocation
@@ -6957,14 +6963,34 @@ export class TelegramNotificationDaemon {
 			disconnectGraceExpiresAt: record.disconnectGraceExpiresAt,
 		};
 		return this.#persistTopicMutation(
-			() =>
-				this.topics.acquireLease(
+			() => {
+				const current = this.topics.get(sessionId);
+				// Only the authenticated current same-host attachment can
+				// restore its existing topic after disconnect grace expires.
+				if (
+					session?.logicalSessionIdTrusted &&
+					this.#attachmentIsCurrent(session) &&
+					this.#ownsLiveOpenEndpoint(session, this.#endpointBinding(session)) &&
+					current?.authorityState === "disconnect_grace" &&
+					current.leaseOwner === this.installationHostId &&
+					!current.bindingMalformed &&
+					current.chatId === String(this.opts.chatId) &&
+					sessionId === this.#logicalSessionId(session)
+				) {
+					this.topics.clearOrphaned(sessionId);
+					if (!this.topics.matchesEndpoint(sessionId, this.#endpointBinding(session))) {
+						Object.assign(current, previous);
+						return false;
+					}
+				}
+				return this.topics.acquireLease(
 					sessionId,
 					this.installationHostId,
 					this.runtime.now(),
 					HEARTBEAT_TTL_MS,
 					ORPHAN_TOPIC_GRACE_MS,
-				),
+				);
+			},
 			() => {
 				const current = this.topics.get(sessionId);
 				if (!current) return;
@@ -10127,7 +10153,14 @@ export class TelegramNotificationDaemon {
 				msg.generation >= 1 &&
 				Number.isSafeInteger(msg.lastSeq) &&
 				msg.lastSeq >= 0 &&
-				msg.gap === undefined &&
+				(msg.gap === undefined ||
+					(msg.gap?.kind === "sequence_gap" &&
+						msg.generation === session.lifecycleGeneration &&
+						Number.isSafeInteger(msg.gap.fromSeq) &&
+						msg.gap.fromSeq >= 1 &&
+						Number.isSafeInteger(msg.gap.toSeq) &&
+						msg.gap.toSeq >= msg.gap.fromSeq &&
+						msg.gap.toSeq <= msg.lastSeq)) &&
 				Array.isArray(msg.events) &&
 				msg.events.every((event: unknown) => event !== null && typeof event === "object" && !Array.isArray(event));
 			const replayed: Record<string, unknown>[] = replayValid
@@ -10172,6 +10205,8 @@ export class TelegramNotificationDaemon {
 			}
 			const replayIdentitySessionId = latestIdentity?.sessionId as string | undefined;
 			const endpointBinding = this.#endpointBinding(session);
+			if (!replayIdentitySessionId && this.topics.get(session.sessionId)?.authorityState === "disconnect_grace")
+				await this.#renewTopicLease(session.sessionId, session);
 			// Identity-less replay may resume only the exact transport owner. A
 			// rekeyed A→B transport remains denied unless replay proves B.
 			const endpointAuthority = this.#endpointAuthority(endpointBinding, session);
@@ -10192,6 +10227,12 @@ export class TelegramNotificationDaemon {
 			const replayCandidateSessionId =
 				replayIdentitySessionId ?? (canResumeTransport || canBootstrapTransport ? session.sessionId : undefined);
 			if (!replayCandidateSessionId) {
+				logger.warn("Telegram replay candidate refused", {
+					authority: endpointAuthority.state,
+					ownsLiveOpenEndpoint,
+					canResumeTransport,
+					canBootstrapTransport,
+				});
 				this.#dropSession(session, "recovery_rejected");
 				return;
 			}
@@ -10204,6 +10245,10 @@ export class TelegramNotificationDaemon {
 			);
 			if (this.sessions.get(session.sessionId) !== session) return;
 			if (!recovered) {
+				logger.warn("Telegram binding recovery refused", {
+					state: this.topics.get(replayCandidateSessionId)?.authorityState,
+					leaseState: session.recoveryLease?.state,
+				});
 				if (session.replayGeneration === msg.generation && session.recoveryLease?.state !== "pending")
 					this.#dropSession(session, "recovery_rejected");
 				return;
@@ -10682,6 +10727,15 @@ export class TelegramNotificationDaemon {
 					? summaryFreeToolFrame
 					: threadedFrame;
 			const preparedFrame = await prepareTelegramImageAttachment(renderedFrame);
+			if (
+				this.opts.settings.get("notifications.verbosity") === "lean" &&
+				(preparedFrame.type === "reasoning_summary" ||
+					preparedFrame.type === "context_update" ||
+					preparedFrame.type === "config_update" ||
+					(preparedFrame.type === "turn_stream" &&
+						(preparedFrame.phase !== "finalized" || preparedFrame.finalAnswer !== true)))
+			)
+				return;
 			const send = this.renderThreadedFrame(preparedFrame);
 			if (toolActivity?.phase === "terminal") {
 				const summaryFreeSend = this.renderThreadedFrame(summaryFreeToolFrame);
@@ -10801,6 +10855,7 @@ export class TelegramNotificationDaemon {
 			return;
 		}
 		if (msg.type === "action_needed" && msg.id) {
+			if (msg.kind === "idle" && this.opts.settings.get("notifications.verbosity") === "lean") return;
 			const logicalSessionId = this.#logicalSessionId(session);
 			const socketLease = this.#socketLease(session, logicalSessionId);
 			if (!socketLease) return await this.#failPublicationPreSend(publicationId, "action route has no socket lease");

@@ -55,9 +55,185 @@ import type { AgentDirSessionLifecycleService } from "../src/sdk/lifecycle/clien
 
 const BOT_TOKEN = "1234567890:ABCDEFghijkLmnOpQrsTuvWxYz012345678";
 
+test("attachment handshake never reuses another generation's replay cursor", async () => {
+	for (const generation of [1, 42]) {
+		const agentDir = tempAgentDir();
+		try {
+			const daemon = new TelegramNotificationDaemon({
+				settings: settings(agentDir),
+				ownerId: "provider-owner",
+				botToken: BOT_TOKEN,
+				chatId: "42",
+			});
+			await Bun.write(
+				path.join(agentDir, "notifications", "telegram-topics.json"),
+				JSON.stringify({
+					version: 2,
+					topics: {
+						session: {
+							topicId: "100",
+							topicOrigin: "daemon_created",
+							sessionUuid: "session",
+							identitySent: true,
+							createdAt: 1,
+							authorityState: "active",
+							chatId: "42",
+							replayGeneration: 1,
+							replaySeq: 279,
+						},
+					},
+				}),
+			);
+			await daemon.loadTopics();
+			const frames: Record<string, unknown>[] = [];
+			const subscription: NotificationSubscription = {
+				...notificationSubscription("session", generation),
+				send: frame => {
+					frames.push(frame);
+				},
+			};
+			const routing = daemon.attachmentRoutingHarnessForTest();
+			routing.attach(subscription);
+			await routing.ready(subscription);
+			expect(frames.find(frame => frame.type === "event_replay")).toMatchObject({
+				sinceGeneration: generation,
+				sinceSeq: generation === 1 ? 279 : 0,
+			});
+		} finally {
+			fs.rmSync(agentDir, { recursive: true, force: true });
+		}
+	}
+});
+
 function tempAgentDir(): string {
 	return fs.mkdtempSync(path.join(os.tmpdir(), "gjc-telegram-supervisor-test-"));
 }
+
+test("lean Telegram omits progress and idle while retaining final answers and questions", async () => {
+	const agentDir = tempAgentDir();
+	let now = Date.now();
+	try {
+		const { bot, calls } = topicAdmissionBot();
+		const daemon = new TelegramNotificationDaemon({
+			settings: settings(agentDir),
+			ownerId: "owner",
+			botToken: BOT_TOKEN,
+			chatId: "42",
+			botApi: bot,
+			toolActivity: { enabled: false },
+			now: () => now,
+		});
+		await daemon.loadTopics();
+		const subscription = notificationSubscription("quiet-session");
+		daemon.attachmentRoutingHarnessForTest().attach(subscription);
+		const session = daemon.sessions.get(subscription.sessionId);
+		if (!session) throw new Error("Attachment missing");
+		await daemon.handleSessionMessage(session, {
+			type: "event_replay_result",
+			id: session.replayId,
+			ok: true,
+			generation: 1,
+			lastSeq: 1,
+			events: [{ seq: 1, payload: { type: "identity_header", sessionId: subscription.sessionId, repo: "quiet" } }],
+		});
+		const isMessage = (call: { method: string }) =>
+			call.method === "sendMessage" || call.method === "sendRichMessage";
+		const sentBefore = calls.filter(isMessage).length;
+		now += 2_000;
+		for (const frame of [
+			{ type: "reasoning_summary", text: "Checking migration targeting" },
+			{ type: "turn_stream", phase: "live", text: "Preparing harness environment" },
+			{ type: "turn_stream", phase: "finalized", finalAnswer: false, text: "Inspecting runtime script" },
+			{ type: "tool_activity", toolCallId: "tool", toolName: "subagent", phase: "completed" },
+			{ type: "action_needed", kind: "idle", id: "idle" },
+		])
+			await daemon.handleSessionMessage(session, { ...frame, sessionId: subscription.sessionId });
+		expect(calls.filter(isMessage)).toHaveLength(sentBefore);
+		await daemon.handleSessionMessage(session, {
+			type: "turn_stream",
+			phase: "finalized",
+			finalAnswer: true,
+			text: "Verified final answer",
+			sessionId: subscription.sessionId,
+		});
+		now += 2_000;
+		await daemon.handleSessionMessage(session, {
+			type: "action_needed",
+			kind: "ask",
+			id: "approval",
+			title: "Approval required",
+			question: "Continue?",
+			options: ["Yes", "No"],
+			sessionId: subscription.sessionId,
+		});
+		const sent = calls.filter(isMessage).slice(sentBefore);
+		expect(sent.length).toBeGreaterThanOrEqual(2);
+		expect(JSON.stringify(sent)).toContain("Verified final answer");
+		expect(JSON.stringify(sent)).toContain("Continue?");
+		expect(subscription.isActive()).toBe(true);
+	} finally {
+		fs.rmSync(agentDir, { recursive: true, force: true });
+	}
+});
+
+test("current same-host attachment resumes expired grace with a bounded retention gap", async () => {
+	const agentDir = tempAgentDir();
+	try {
+		const { bot, calls } = topicAdmissionBot();
+		const daemon = new TelegramNotificationDaemon({
+			settings: settings(agentDir),
+			ownerId: "owner",
+			installationHostId: "local",
+			botToken: BOT_TOKEN,
+			chatId: "42",
+			botApi: bot,
+		});
+		await Bun.write(
+			path.join(agentDir, "notifications", "telegram-topics.json"),
+			JSON.stringify({
+				version: 2,
+				topics: {
+					session: {
+						topicId: "100",
+						topicOrigin: "daemon_created",
+						sessionUuid: "session",
+						identitySent: true,
+						createdAt: 1,
+						authorityState: "disconnect_grace",
+						chatId: "42",
+						leaseOwner: "local",
+						leaseHeartbeatAt: 1,
+						leaseExpiresAt: 1,
+						orphanedAt: 1,
+						disconnectGraceExpiresAt: 2,
+					},
+				},
+			}),
+		);
+		await daemon.loadTopics();
+		const subscription = notificationSubscription("session", 42);
+		const routing = daemon.attachmentRoutingHarnessForTest();
+		routing.attach(subscription);
+		const session = daemon.sessions.get("session");
+		if (!session) throw new Error("Attachment missing");
+		await daemon.handleSessionMessage(session, {
+			type: "event_replay_result",
+			id: session.replayId,
+			ok: true,
+			generation: 42,
+			lastSeq: 300,
+			gap: { kind: "sequence_gap", fromSeq: 1, toSeq: 299 },
+			events: [{ generation: 42, seq: 300, payload: { type: "activity", state: "idle" } }],
+		});
+		expect(subscription.isActive()).toBe(true);
+		expect(routing.ownsLogicalSession("session")).toBe(true);
+		expect(calls.filter(call => call.method === "createForumTopic")).toHaveLength(0);
+		const saved = JSON.parse(await Bun.file(path.join(agentDir, "notifications", "telegram-topics.json")).text());
+		expect(saved.topics.session).toMatchObject({ topicId: "100", authorityState: "active" });
+	} finally {
+		fs.rmSync(agentDir, { recursive: true, force: true });
+	}
+});
 
 function settings(agentDir: string): Settings {
 	const isolated = Settings.isolated({

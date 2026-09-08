@@ -25,6 +25,27 @@ For terminal-side session operation, use the broker-bound [SDK session CLI](./sd
 `control|query|global` hatch. The CLI resolves the exact attachment through SDK
 core and emits credential-free JSON.
 
+### Event generation persistence
+
+Session hosts reserve an increasing event generation in
+`<stateRoot>/sdk-event-generations.sqlite` before publishing readiness or an
+endpoint. Reservations survive host recreation and are serialized across
+processes. Treat generations as opaque safe integers, not counters that start
+at `1`. A reconnect to a new generation replays its retained events even when
+the previous generation's sequence was higher.
+
+Keep this database with the session's state root. Corrupt, unavailable, or
+exhausted generation storage refuses startup rather than reusing a namespace.
+Notification delivery receipts must not be cleared as a routine reconnect step.
+Provider delivery exceeding the Router's five-second wait budget stays pending;
+it does not revoke the live notification subscription. The cursor advances only
+after the provider callback completes. Telegram reconnect admits a bounded
+retention gap in the authenticated current generation without claiming that
+events outside the retained ring were recovered.
+Already-running hosts retain their current generation until they are restarted
+with the corrected runtime; restarting only the notification daemon cannot
+change a session host's generation.
+
 ## Migration from removed external transports
 
 The retired `--mode rpc`, `rpc-ui`, `bridge`, and `gjc sdk serve` transports

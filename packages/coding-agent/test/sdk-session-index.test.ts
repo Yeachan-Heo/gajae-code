@@ -1915,6 +1915,22 @@ describe("SDK session index", () => {
 		const audit = await fs.readFile(path.join(sessionsDir, "index-audit.jsonl"), "utf8");
 		expect(audit).toContain('"code":"rejected_legacy_locator"');
 		expect(audit).toContain('"sessionId":"legacy-session"');
+		const observer = new SessionIndex(dir);
+		await observer.refresh();
+		await index.append({
+			...event("legacy-session"),
+			locator: { cwd: dir, worktreeRoot: null, stateRoot: path.join(dir, ".gjc", "state") },
+			endpointGeneration: 2,
+		});
+		expect(index.listSessions().warnings).toEqual([]);
+		await observer.refresh();
+		expect(observer.listSessions().warnings).toEqual([]);
+		const reopened = await new SessionIndex(dir).open();
+		expect(reopened.listSessions().warnings).toEqual([]);
+		expect(reopened.listSessions().sessions).toMatchObject([{ sessionId: "legacy-session", live: true }]);
+		expect(await fs.readFile(path.join(sessionsDir, "index-audit.jsonl"), "utf8")).toContain(
+			'"code":"rejected_legacy_locator"',
+		);
 	});
 	it("quarantines mixed locator rows that retain a legacy repo key", async () => {
 		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-mixed-locator-"));

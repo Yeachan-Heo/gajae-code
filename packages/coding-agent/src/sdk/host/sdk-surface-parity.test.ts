@@ -139,6 +139,7 @@ describe("SDK surface parity", () => {
 		const createRuntime = (transport: ReturnType<typeof memoryTransport>) =>
 			new SessionSdkSessionRuntime({
 				transport,
+				reserveEventGeneration: async minimum => minimum,
 				control: async (_connectionId, frame) => {
 					if (frame.operation === "unsupported")
 						throw Object.assign(new Error("operation is unavailable"), { code: "unavailable" });
