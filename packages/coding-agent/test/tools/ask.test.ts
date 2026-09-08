@@ -2996,6 +2996,49 @@ describe("AskTool deep-interview recorder persistence", () => {
 		});
 	});
 
+	it("does not mint execution approval after a multi-question choice is revised", async () => {
+		const record = spyOn(stateRuntime, "recordDeepInterviewExecutionApproval").mockResolvedValue({
+			path: "/tmp/deep-interview-execution-approval.json",
+			record: {} as Awaited<ReturnType<typeof stateRuntime.recordDeepInterviewExecutionApproval>>["record"],
+		});
+		let executionVisits = 0;
+		let confirmationVisits = 0;
+		const context = createContext({
+			select: async (prompt, _options, dialogOptions) => {
+				if (prompt.includes("Choose the execution path")) {
+					executionVisits += 1;
+					return executionVisits === 1 ? "Execute with ultragoal" : "Stop here";
+				}
+				confirmationVisits += 1;
+				if (confirmationVisits === 1) {
+					dialogOptions?.onLeft?.();
+					return undefined;
+				}
+				return "Done";
+			},
+		});
+		await new AskTool(
+			createSession({ cwd: "/tmp/approval-revised", getSessionId: () => "approval-revised" }),
+		).execute(
+			"revised-execution-choice",
+			{
+				questions: [
+					{
+						id: "deep-interview-execution-revised",
+						question: "Choose the execution path",
+						options: [{ label: "Execute with ultragoal" }, { label: "Stop here" }],
+						workflowGate: { stage: "deep-interview", kind: "execution" },
+					},
+					{ id: "confirmation", question: "Confirm?", options: [{ label: "Done" }] },
+				],
+			},
+			undefined,
+			undefined,
+			context,
+		);
+		expect(record).not.toHaveBeenCalled();
+	});
+
 	it("discards focused intent choices before multi-question timeout navigation", async () => {
 		const recorder = spyOn(deepInterviewRecorder, "appendOrMergeDeepInterviewRound").mockResolvedValue({
 			action: "created",

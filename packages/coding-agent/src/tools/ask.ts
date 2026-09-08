@@ -1460,6 +1460,7 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 		}
 
 		const resultsByIndex: Array<QuestionResult | undefined> = Array.from({ length: params.questions.length });
+		const executionGateIdsByIndex: Array<string | undefined> = Array.from({ length: params.questions.length });
 		let questionIndex = 0;
 		while (questionIndex < params.questions.length) {
 			const q = params.questions[questionIndex]!;
@@ -1494,6 +1495,7 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 				customInput,
 				clarificationQuestion,
 			};
+			executionGateIdsByIndex[questionIndex] = executionGateId;
 
 			if (
 				clarificationQuestion === undefined &&
@@ -1506,8 +1508,6 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 				questionIndex = Math.max(0, questionIndex - 1);
 				continue;
 			}
-			await this.#recordDeepInterviewExecutionApproval(q, selectedOptions, customInput, executionGateId);
-
 			questionIndex += 1;
 		}
 
@@ -1524,6 +1524,13 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 		});
 
 		const details: AskToolDetails = { results };
+		for (const [index, result] of results.entries())
+			await this.#recordDeepInterviewExecutionApproval(
+				params.questions[index]!,
+				result.selectedOptions,
+				result.customInput,
+				executionGateIdsByIndex[index],
+			);
 		const responseLines = results.map(formatQuestionResult);
 		const responseText = `User answers:\n${responseLines.join("\n")}`;
 
