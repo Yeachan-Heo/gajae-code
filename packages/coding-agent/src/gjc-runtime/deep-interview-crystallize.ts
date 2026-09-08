@@ -890,7 +890,7 @@ function requirementBearingClauses(
 		if (message.role !== "user") continue;
 		let searchOffset = 0;
 		for (const raw of message.content.split(
-			/(?:(?:[!?。！？;]|\.(?=\s|$)|\n)+|,(?=\s*(?:actually|instead|rather)\b))\s*/iu,
+			/(?:(?:[!?。！？;]|\.(?=\s|$)|\n)+|,(?=\s*(?:actually|instead|rather|replace|replaced|no longer|not)\b))\s*/iu,
 		)) {
 			const clause = raw.trim();
 			const clauseOffset = clause ? message.content.indexOf(clause, searchOffset) : searchOffset;
