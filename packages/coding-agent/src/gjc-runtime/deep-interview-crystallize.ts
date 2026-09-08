@@ -1530,28 +1530,56 @@ export function crystallizeDeepInterview(value: unknown): DeepInterviewCrystal {
 	if (!currentItems.some(item => item.classification === "confirmed" && item.kind !== "non_goal"))
 		throw new Error("crystallize requires a confirmed user requirement");
 	const confirmedItems = currentItems.filter(item => item.classification === "confirmed");
-	const opposingActions: ReadonlyArray<readonly [string, string]> = [
-		["enable", "disable"],
-		["allow", "deny"],
-		["include", "exclude"],
-		["start", "stop"],
-		["add", "remove"],
+	const opposingActions: ReadonlyArray<readonly [readonly string[], readonly string[]]> = [
+		[
+			["enable", "enabled"],
+			["disable", "disabled"],
+		],
+		[
+			["allow", "allowed", "permit", "permitted"],
+			["deny", "denied", "prohibit", "prohibited", "forbid", "forbidden"],
+		],
+		[
+			["include", "included"],
+			["exclude", "excluded"],
+		],
+		[
+			["start", "started"],
+			["stop", "stopped"],
+		],
+		[
+			["add", "added"],
+			["remove", "removed"],
+		],
 	];
 	for (let leftIndex = 0; leftIndex < confirmedItems.length; leftIndex++) {
 		const left = confirmedItems[leftIndex]!;
 		const leftTerms = topicTerms(left.statement, false);
 		for (const right of confirmedItems.slice(leftIndex + 1)) {
 			const rightTerms = topicTerms(right.statement, false);
-			const opposingAction = opposingActions.some(([positive, negative]) => {
-				const leftAction = leftTerms.has(positive) ? positive : leftTerms.has(negative) ? negative : undefined;
-				const rightAction = rightTerms.has(positive) ? positive : rightTerms.has(negative) ? negative : undefined;
-				if (!leftAction || !rightAction || leftAction === rightAction) return false;
-				const leftSubject = new Set([...leftTerms].filter(term => term !== positive && term !== negative));
-				const rightSubject = new Set([...rightTerms].filter(term => term !== positive && term !== negative));
+			const opposingAction = opposingActions.some(([positiveTerms, negativeTerms]) => {
+				const signed = (
+					statement: string,
+					terms: Set<string>,
+				): { sign: number; subject: Set<string> } | undefined => {
+					const positive = positiveTerms.some(term => terms.has(term));
+					const negative = negativeTerms.some(term => terms.has(term));
+					if (positive === negative) return undefined;
+					const explicitlyNegated = /\b(?:do\s+not|don['’]t|never|not)\b/i.test(statement);
+					return {
+						sign: (positive ? 1 : -1) * (explicitlyNegated ? -1 : 1),
+						subject: new Set(
+							[...terms].filter(term => !positiveTerms.includes(term) && !negativeTerms.includes(term)),
+						),
+					};
+				};
+				const leftAction = signed(left.statement, leftTerms);
+				const rightAction = signed(right.statement, rightTerms);
+				if (!leftAction || !rightAction || leftAction.sign === rightAction.sign) return false;
 				return (
-					leftSubject.size > 0 &&
-					leftSubject.size === rightSubject.size &&
-					[...leftSubject].every(term => rightSubject.has(term))
+					leftAction.subject.size > 0 &&
+					leftAction.subject.size === rightAction.subject.size &&
+					[...leftAction.subject].every(term => rightAction.subject.has(term))
 				);
 			});
 			if (
