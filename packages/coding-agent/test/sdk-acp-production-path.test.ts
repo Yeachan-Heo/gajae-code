@@ -297,6 +297,7 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 	const sessionCloseLedger = new Map<string, Record<string, unknown>>();
 	let makeNextSessionCloseUncertain = true;
 	let rejectNextSessionClose = false;
+	let reportNextSessionCloseGone = false;
 	let activeModelPreset = "test-preset";
 	let primaryControlSurface: "cli" | "sdk" | "invalid" | undefined = "sdk";
 	let completeNextPromptBeforeAck = false;
@@ -394,6 +395,13 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 						if (replay) {
 							const replayError = replay.error as Record<string, unknown> | undefined;
 							const response = replayError?.code === "terminal_uncertain" ? { ok: true, result: {} } : replay;
+							sessionCloseLedger.set(idempotencyKey, response);
+							socket.send(JSON.stringify({ type: "broker_response", id: frame.id, ...response }));
+							return;
+						}
+						if (reportNextSessionCloseGone) {
+							reportNextSessionCloseGone = false;
+							const response = { ok: false, error: { code: "not_found", message: "session already gone" } };
 							sessionCloseLedger.set(idempotencyKey, response);
 							socket.send(JSON.stringify({ type: "broker_response", id: frame.id, ...response }));
 							return;
@@ -1304,6 +1312,25 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 		modelId: "test-preset",
 	});
 	expect(activeModelPreset).toBe("test-preset");
+
+	// A session this connection launched is owned before attachment reports a control
+	// surface, so discarding it after a failed attach tolerates an already-gone close
+	// and surfaces the real attach error instead of cleanup uncertainty.
+	primaryControlSurface = undefined;
+	reportNextSessionCloseGone = true;
+	const discardAbort = new AbortController();
+	const discardAgent = new AcpAgent(
+		{
+			sessionUpdate: async (update: SessionNotification) => updates.push(update),
+			signal: discardAbort.signal,
+			closed: Promise.withResolvers<void>().promise,
+		} as unknown as AgentSideConnection,
+		{ agentDir },
+	);
+	await expect(
+		bounded(discardAgent.newSession({ cwd, mcpServers: [] }), "attach failure discard"),
+	).rejects.toMatchObject({ code: "unavailable" });
+	discardAbort.abort();
 
 	primaryControlSurface = undefined;
 	const legacyCapabilityAbort = new AbortController();
