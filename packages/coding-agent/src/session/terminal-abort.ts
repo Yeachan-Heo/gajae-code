@@ -711,7 +711,7 @@ const toolCallLineageKey = (endpointId: string | undefined, toolCallId: string) 
  * never be mutated from a session-current fallback; missing/mismatched
  * context fails closed (resolve returns undefined).
  */
-export function bindToolLineage(toolCallId: string, binding: LineageBinding): void {
+export function bindToolLineage(toolCallId: string, binding: LineageBinding): LineageBinding {
 	if (lineageByToolCall.size >= MAX_LINEAGE_BINDINGS) {
 		const oldest = lineageByToolCall.keys().next().value;
 		if (oldest !== undefined) {
@@ -764,6 +764,7 @@ export function bindToolLineage(toolCallId: string, binding: LineageBinding): vo
 	// is in flight until its own afterToolCall settles.
 	settledToolCallLineages.delete(toolCallLineageKey(binding.endpointId, toolCallId));
 	lineageByToolCall.set(toolCallLineageKey(binding.endpointId, toolCallId), binding);
+	return binding;
 }
 
 export function resolveToolLineage(toolCallId: string | undefined, endpointId?: string): LineageBinding | undefined {
@@ -780,14 +781,20 @@ export function resolveToolLineage(toolCallId: string | undefined, endpointId?: 
 }
 
 /** Close an evicted tool's registration window after its execution settles. */
-export function settleToolLineageRegistrationWindow(toolCallId: string, endpointId?: string): void {
+export function settleToolLineageRegistrationWindow(
+	toolCallId: string,
+	endpointId?: string,
+	expectedBinding?: LineageBinding,
+): void {
 	const key = toolCallLineageKey(endpointId, toolCallId);
+	const current = lineageByToolCall.get(key);
+	if (expectedBinding !== undefined && current !== expectedBinding) return;
 	// Mark the execution settled ONLY while its binding remains in the lineage
 	// map: a later FIFO eviction of that binding consults this set and removes
 	// the key. An already-evicted binding lives only in the window closed
 	// below — retaining the marker there would leak the key forever because
 	// no eviction can ever execute the delete (review thread P2).
-	if (lineageByToolCall.has(key)) settledToolCallLineages.add(key);
+	if (current !== undefined) settledToolCallLineages.add(key);
 	const window = incompleteToolCallWindows.get(key);
 	if (window !== undefined) {
 		incompleteToolCallWindows.delete(key);

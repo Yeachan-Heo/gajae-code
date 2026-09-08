@@ -31,6 +31,7 @@ import {
 	type AgentMessage,
 	type AgentState,
 	type AgentTool,
+	type AgentToolCall,
 	assertImagePlaceholdersHavePayload,
 	type ContextMaintenanceResult,
 	canContinuePersistedHistory,
@@ -515,6 +516,7 @@ import {
 	isOwnedCompletionEnvelopeAllowed,
 	lookupOwnedRegistration,
 	lookupTerminalScope,
+	type LineageBinding,
 	mintTurnLineageIdHash,
 	type OwnedCompletionEnvelope,
 	registerTerminalTurnScope,
@@ -3271,6 +3273,7 @@ export class AgentSession {
 	 *  These are folded into the matched tool call's `toolResult` content as an
 	 *  in-band system reminder, instead of spawning a separate follow-up turn. */
 	#perToolTtsrInjections = new Map<string, Rule[]>();
+	#toolLifecycleOwnership = new WeakMap<AgentToolCall, { endpointId: string; binding?: LineageBinding; rules?: Rule[] }>();
 	#ttsrAbortPending = false;
 	#ttsrRetryToken = 0;
 	#ttsrResumePromise: Promise<void> | undefined = undefined;
@@ -5053,16 +5056,19 @@ export class AgentSession {
 		this.#asyncJobProviderSessionId = config.asyncJobProviderSessionId;
 		// Per-tool TTSR reminders are folded into the matched tool's result via this hook.
 		this.agent.afterToolCall = ctx => {
-			settleToolLineageRegistrationWindow(ctx.toolCall.id, this.#ownedRegistrationEndpoint());
+			const ownership = this.#toolLifecycleOwnership.get(ctx.toolCall);
+			settleToolLineageRegistrationWindow(ctx.toolCall.id, ownership?.endpointId, ownership?.binding);
 			if (
 				ctx.result.details &&
 				typeof ctx.result.details === "object" &&
 				typeof (ctx.result.details as { cancellation?: unknown }).cancellation === "string"
 			) {
-				this.#perToolTtsrInjections.delete(ctx.toolCall.id);
+				if (this.#perToolTtsrInjections.get(ctx.toolCall.id) === ownership?.rules) {
+					this.#perToolTtsrInjections.delete(ctx.toolCall.id);
+				}
 				return undefined;
 			}
-			return this.#ttsrAfterToolCall(ctx);
+			return this.#ttsrAfterToolCall(ctx, ownership?.rules);
 		};
 		// Bind immutable lineage/attempt metadata to each tool call id before the
 		// tool executes. Background registrations made inside the tool (task, Bash)
@@ -5084,8 +5090,10 @@ export class AgentSession {
 				return { block: true, reason: "Session transition is in progress." };
 			}
 			const lineageIdHash = this.#turnLineageIdHash;
+			const endpointId = this.#ownedRegistrationEndpoint();
+			let binding: LineageBinding | undefined;
 			if (lineageIdHash) {
-				bindToolLineage(ctx.toolCall.id, {
+				binding = bindToolLineage(ctx.toolCall.id, {
 					lineageIdHash,
 					promptAttemptEpoch: this.#promptGeneration,
 					endpointGeneration: this.#terminalEndpointGeneration,
@@ -5097,9 +5105,14 @@ export class AgentSession {
 					// sessionManager id is never registered, and the inherited
 					// manager's completion callback resolves registrations via
 					// AsyncJobManager.endpointIdOf(manager) (review thread P1).
-					endpointId: this.#ownedRegistrationEndpoint(),
+					endpointId,
 				});
 			}
+			this.#toolLifecycleOwnership.set(ctx.toolCall, {
+				endpointId,
+				binding,
+				rules: this.#perToolTtsrInjections.get(ctx.toolCall.id),
+			});
 			return undefined;
 		};
 		// A queued owned-completion follow-up is consumed by the agent loop
@@ -8897,9 +8910,10 @@ export class AgentSession {
 	}
 
 	/** `afterToolCall` hook: fold any per-tool TTSR reminders into the result. */
-	#ttsrAfterToolCall(ctx: AfterToolCallContext): AfterToolCallResult | undefined {
+	#ttsrAfterToolCall(ctx: AfterToolCallContext, expectedRules?: Rule[]): AfterToolCallResult | undefined {
 		const rules = this.#perToolTtsrInjections.get(ctx.toolCall.id);
 		if (!rules || rules.length === 0) return undefined;
+		if (expectedRules !== undefined && rules !== expectedRules) return undefined;
 		this.#perToolTtsrInjections.delete(ctx.toolCall.id);
 		const reminder = rules
 			.map(r => prompt.render(ttsrToolReminderTemplate, { name: r.name, path: r.path, content: r.content }))

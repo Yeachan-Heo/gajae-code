@@ -2088,7 +2088,13 @@ export class TUI extends Container {
 						this.#guardTerminalOperation(() => this.terminal.write(abortSuffix + cursorVisibility));
 				};
 				this.#inFlightMultipartAbort = abortBarrier;
-				const flushed = await (this.terminal as Terminal & { flush?: () => Promise<boolean> }).flush?.();
+				let flushed: boolean | undefined;
+				try {
+					flushed = await (this.terminal as Terminal & { flush?: () => Promise<boolean> }).flush?.();
+				} catch {
+					if (isCurrentLifecycle()) abortBarrier();
+					return failed();
+				}
 				// Async boundary: the terminal may have stopped while we awaited.
 				if (!isCurrentLifecycle()) return failed();
 				if (flushed === false) {
