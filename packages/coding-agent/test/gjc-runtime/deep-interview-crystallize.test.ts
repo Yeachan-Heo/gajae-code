@@ -2634,6 +2634,7 @@ describe("deep-interview crystallize contract", () => {
 				root,
 			);
 			expect(first.status).toBe(0);
+			const approvalTranscript = await fs.readFile(sessionFile);
 			await recordDeepInterviewExecutionApproval({
 				cwd: root,
 				sessionId,
@@ -2641,6 +2642,8 @@ describe("deep-interview crystallize contract", () => {
 				gateId: "crystallize-execution",
 				target: "ultragoal",
 				selectedOptions: ["Approve execution via ultragoal"],
+				transcriptPath: sessionFile,
+				transcriptSha256: createHash("sha256").update(approvalTranscript).digest("hex"),
 			});
 			const approved = await runNativeDeepInterviewCommand(
 				["approve-execution", "--session-id", sessionId, "--json"],

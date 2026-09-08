@@ -2951,7 +2951,10 @@ describe("AskTool deep-interview recorder persistence", () => {
 	});
 
 	it("mints execution approval only from an accepted structured user choice", async () => {
-		spyOn(deepInterviewRuntime, "assertDeepInterviewCrystalCoversLiveTranscript").mockResolvedValue();
+		spyOn(deepInterviewRuntime, "assertDeepInterviewCrystalCoversLiveTranscript").mockResolvedValue({
+			transcriptPath: "/tmp/session.jsonl",
+			transcriptSha256: "a".repeat(64),
+		});
 		const record = spyOn(stateRuntime, "recordDeepInterviewExecutionApproval").mockResolvedValue({
 			path: "/tmp/deep-interview-execution-approval.json",
 			record: {} as DeepInterviewExecutionApprovalRecord,
@@ -3429,6 +3432,10 @@ describe("AskTool deep-interview recorder persistence", () => {
 		const approvalRecord = spyOn(stateRuntime, "recordDeepInterviewExecutionApproval").mockResolvedValue({
 			path: "/tmp/ralplan-approval.json",
 			record: {} as DeepInterviewExecutionApprovalRecord,
+		});
+		spyOn(deepInterviewRuntime, "assertDeepInterviewCrystalCoversLiveTranscript").mockResolvedValue({
+			transcriptPath: "/tmp/ralplan-approval/session.jsonl",
+			transcriptSha256: "b".repeat(64),
 		});
 		const approvalTransition = spyOn(stateRuntime, "runNativeStateCommand").mockResolvedValue({
 			status: 0,
