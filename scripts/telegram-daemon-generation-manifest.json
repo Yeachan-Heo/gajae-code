@@ -587,7 +587,7 @@
     "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon.ts:confirmTelegramDaemonSpawn": "b983c7cef93976030409f557da2609f9ff696e15036f40151174aaef72188338",
     "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon.ts:createBotApiAdapter": "dbd5fee0de776d6b26329cc732b1a6a03e249ba083573c5384278fffd070ddcc",
     "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon.ts:createBotApiPipeline": "29f077f47b0b660ca4f44de5fd2f191bf31bec33657bb2a2cb8d1522f12953f3",
-    "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon.ts:defaultPidAlive": "437658a2f14ac5daa2a3e84dcd637078566e71a88841cd750efab6d48fc94c3f",
+    "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon.ts:defaultPidAlive": "2241783268ba493967de27d51fefb59b17c2b80132d18cc791303d9f19721be4",
     "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon.ts:defaultPidIncarnation": "377afc123d25710c634df1fcc7f39a0c24d2034e0c31e8ed407435cc4c55a313",
     "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon.ts:ensureTelegramDaemonRunning": "d0275209b2edfb6de302b2607491bd21441bbbb7945fd59cb3fd5125e28fa124",
     "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon.ts:ensureTelegramDaemonRunningDetailed": "7ef1ecd7183e0e362ea46be6a235d5535b4c3f26aaf11ab30ce9f5920b6ed4df",

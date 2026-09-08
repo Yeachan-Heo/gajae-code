@@ -30,7 +30,7 @@ function nativeNotification(): NativeNotificationBindings {
 }
 
 import type { Settings } from "../../config/settings";
-import { isProcessIncarnation, processIncarnation } from "../broker/process-incarnation";
+import { isProcessIncarnation, isZombieProcess, processIncarnation } from "../broker/process-incarnation";
 import {
 	getNotificationConfig,
 	hasAnyCompleteProvider,
@@ -299,11 +299,13 @@ export interface NotificationServiceDeps {
 function defaultPidAlive(pid: number): boolean {
 	try {
 		process.kill(pid, 0);
-		return true;
 	} catch (err) {
 		// EPERM means the process exists but is owned by another user: still alive.
 		return (err as NodeJS.ErrnoException).code === "EPERM";
 	}
+	// A delivered signal does not prove the process still runs: a zombie owns its
+	// PID slot until the launcher reaps it, and recovery would refuse to clear it.
+	return !isZombieProcess(pid);
 }
 
 function defaultStateRoot(): string {

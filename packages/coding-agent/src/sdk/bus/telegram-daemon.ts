@@ -11,7 +11,7 @@ import type { Settings } from "../../config/settings";
 import type { DaemonRuntimeInfo } from "../../daemon/control-types";
 import { resolveGjcRuntimeSpawnInfo } from "../../daemon/runtime";
 import { resizeImageBuffer } from "../../utils/image-resize";
-import { isProcessIncarnation, processIncarnation } from "../broker/process-incarnation";
+import { isProcessIncarnation, isZombieProcess, processIncarnation } from "../broker/process-incarnation";
 import {
 	getNotificationConfig,
 	isProviderEffectivelyEnabled,
@@ -3024,10 +3024,13 @@ export async function resolveTelegramSetupPreflight(
 function defaultPidAlive(pid: number): boolean {
 	try {
 		process.kill(pid, 0);
-		return true;
 	} catch (error) {
 		return (error as NodeJS.ErrnoException).code !== "ESRCH";
 	}
+	// A delivered signal does not prove the process still runs: a zombie owns its
+	// PID slot until the launcher reaps it, so an exited daemon reads as a live
+	// owner and its ownership records stay unreclaimable forever.
+	return !isZombieProcess(pid);
 }
 
 /**

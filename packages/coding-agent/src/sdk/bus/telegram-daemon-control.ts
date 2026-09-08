@@ -24,7 +24,7 @@ import type {
 } from "../../daemon/control-types";
 import { OWNERSHIP_MISMATCH_MESSAGE, ownershipMismatchRecovery } from "../../daemon/operator-contract";
 import { resolveGjcRuntimeSpawnInfo } from "../../daemon/runtime";
-import { isProcessIncarnation } from "../broker/process-incarnation";
+import { isProcessIncarnation, isZombieProcess } from "../broker/process-incarnation";
 
 import { getNotificationConfig, isTelegramComplete, tokenFingerprint } from "./config";
 import {
@@ -179,10 +179,12 @@ export type TelegramGenerationReloadResult =
 function defaultPidAlive(pid: number): boolean {
 	try {
 		process.kill(pid, 0);
-		return true;
 	} catch (error) {
 		return (error as NodeJS.ErrnoException).code !== "ESRCH";
 	}
+	// A delivered signal does not prove the process still runs: a zombie owns its
+	// PID slot until the launcher reaps it.
+	return !isZombieProcess(pid);
 }
 
 export class TelegramDaemonController implements BuiltInDaemonController {

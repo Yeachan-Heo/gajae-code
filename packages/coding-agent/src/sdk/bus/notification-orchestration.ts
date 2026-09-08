@@ -1,6 +1,6 @@
 import type { CasRestoreResult } from "../../config/atomic-yaml-patch";
 import type { RawSettings, SettingsAtomicPatch, SettingsAtomicReceipt } from "../../config/settings";
-import { isProcessIncarnation, processIncarnation } from "../broker/process-incarnation";
+import { isProcessIncarnation, isZombieProcess, processIncarnation } from "../broker/process-incarnation";
 import {
 	getCurrentTelegramActivationMarker,
 	getNotificationConfig,
@@ -64,10 +64,12 @@ export interface ProposedTelegramIdentityPreflightInput {
 function defaultPidAlive(pid: number): boolean {
 	try {
 		process.kill(pid, 0);
-		return true;
 	} catch (error) {
 		return (error as NodeJS.ErrnoException).code === "EPERM";
 	}
+	// A delivered signal does not prove the process still runs: a zombie owns its
+	// PID slot until the launcher reaps it.
+	return !isZombieProcess(pid);
 }
 
 function validPositiveInteger(value: unknown): value is number {

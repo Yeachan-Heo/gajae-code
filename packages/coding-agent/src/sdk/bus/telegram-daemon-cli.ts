@@ -4,7 +4,7 @@ import { logger, postmortem } from "@gajae-code/utils";
 import { YAML } from "bun";
 import { applyAtomicYamlPatches, setByPath } from "../../config/atomic-yaml-patch";
 import type { Settings } from "../../config/settings";
-import { isProcessIncarnation, processIncarnation } from "../broker/process-incarnation";
+import { isProcessIncarnation, isZombieProcess, processIncarnation } from "../broker/process-incarnation";
 import {
 	getNotificationConfig,
 	isProviderEffectivelyEnabled,
@@ -240,10 +240,12 @@ export function ownerPidFromOwnerId(ownerId: string): number | undefined {
 function defaultPidAlive(pid: number): boolean {
 	try {
 		process.kill(pid, 0);
-		return true;
 	} catch {
 		return false;
 	}
+	// A delivered signal does not prove the process still runs: a zombie owns its
+	// PID slot until the launcher reaps it.
+	return !isZombieProcess(pid);
 }
 
 function ownerProcessIsAlive(ownerId: string, deps: RunDaemonInternalDeps): boolean {
