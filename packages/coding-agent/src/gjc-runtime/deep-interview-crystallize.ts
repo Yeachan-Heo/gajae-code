@@ -892,12 +892,12 @@ function requirementBearingClauses(snapshot: CrystalSnapshot): Array<{ messageIn
 				!clause ||
 				/^(?:what|why|how|when|where|who|which)\b/i.test(clause) ||
 				/\basked\b[^"“”]*["“”][^"“”]*(?:should|could|would|can|will)\b/i.test(clause) ||
-				/^(?:no further changes|nothing else|another question remains|the ambiguity remains open|continue\b|thanks|thank you)\b/i.test(
+				/^(?:no further changes|nothing else|another question remains|the ambiguity remains open|continue (?:again|with the remaining goal)|yes|no|ok|okay|done|acknowledged|understood|got it|thanks|thank you)\b/i.test(
 					clause,
 				)
 			)
 				continue;
-			if (evidenceTerms(clause).size >= 2) clauses.push({ messageIndex: message.index, clause });
+			if (evidenceTerms(clause).size >= 1) clauses.push({ messageIndex: message.index, clause });
 		}
 	}
 	return clauses;
@@ -1462,9 +1462,6 @@ export function crystallizeDeepInterview(value: unknown): DeepInterviewCrystal {
 	if (currentItems.length > MAX_ITEMS) throw new Error("merged crystallize items exceed the bounded limit");
 	if (currentItems.length === 0) throw new Error("crystallize requires material conversation evidence");
 	for (const directive of requirementBearingClauses(snapshot)) {
-		const sourceMessage = snapshot.messages.find(message => message.index === directive.messageIndex);
-		if (sourceMessage && hasLaterSupersedingCorrection(sourceMessage.content, directive.clause, directive.clause))
-			continue;
 		const directiveTerms = topicTerms(directive.clause, false);
 		const represented = currentItems.some(
 			item =>
@@ -1486,7 +1483,7 @@ export function crystallizeDeepInterview(value: unknown): DeepInterviewCrystal {
 		});
 		const unresolved = [...gaps, ...conflicts].some(item => {
 			const itemTerms = topicTerms(item, false);
-			return [...directiveTerms].every(term => itemTerms.has(term)) || hasCjkTopicOverlap(item, directive.clause);
+			return [...directiveTerms].every(term => itemTerms.has(term));
 		});
 		if (!represented && !representedRemoval && !unresolved)
 			throw new Error(`unrepresented user directive requires an item or unresolved gap: ${directive.clause}`);
