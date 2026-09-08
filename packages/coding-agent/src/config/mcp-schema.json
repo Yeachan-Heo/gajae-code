@@ -92,7 +92,7 @@
           "type": "string"
         }
       },
-      "description": "Client settings consumed by the interactive OAuth authorization flow (for example /mcp reauth). Refreshing an already-stored credential does not read these: it uses the separate `auth` binding's clientId/clientSecret."
+      "description": "Client settings for an explicit MCP OAuth authorization consumer. These fields do not define a public standalone or ACP slash-command flow: those sessions do not expose /mcp reauth, /mcp test, or /mcp reconnect, and no public MCP OAuth authorization or reauthorization entry path is provided. Refreshing an already-stored credential does not read these: it uses the separate `auth` binding's clientId/clientSecret."
     },
     "serverBase": {
       "type": "object",

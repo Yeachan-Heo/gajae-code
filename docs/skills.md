@@ -18,6 +18,26 @@ Project scope (trusted from the repository you open):
 |---|---|
 | `<project>/.gjc/skills/<name>/SKILL.md` | Native GJC location; discovered from every ancestor of `cwd` up to the repo root (closest first) |
 
+A trusted Git repository may share its project skills through a root symlink:
+
+```text
+<project>/.agents/skills/<name>/SKILL.md
+<project>/.gjc/skills -> ../.agents/skills
+```
+
+The `.gjc/skills` entry remains the explicit runtime authority: `.agents/skills` is
+not independently auto-loaded. The link must resolve to a directory inside the same
+repository. Discovery, management listing, and skill invocation share this policy.
+The repository, link, and resolved target identities are checked during scanning and
+again when loading the body; replacing a captured link or target invalidates that
+discovery result. Dangling links, external targets, hardlinked skill files, and
+non-regular files are not admitted.
+
+This exception does not apply to user/profile roots, custom directories, or repositories
+without a verified Git root. Native skill creation/import writes still refuse symlinked
+destination roots; manage the shared source files directly rather than replacing the
+project link with a copy.
+
 User scope (installed once, available in every project):
 
 | Location | Scope notes |

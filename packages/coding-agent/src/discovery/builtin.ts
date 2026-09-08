@@ -337,6 +337,7 @@ async function loadSkills(ctx: LoadContext): Promise<LoadResult<Skill>> {
 		getProjectConfigDirs().map(projectConfigDir =>
 			scanSkillsFromDir(ctx, {
 				dir: path.join(dir, projectConfigDir, "skills"),
+				linkContainmentRoot: ctx.repoRoot ?? undefined,
 				providerId: PROVIDER_ID,
 				level: "project",
 				scope: "project",

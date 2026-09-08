@@ -92,7 +92,9 @@ const repositoryBindingSchema = z
 		branch: z.string().min(1).optional(),
 	})
 	.strict()
-	.describe("authoritative repository identity for multi-repo fail-closed spawn");
+	.describe(
+		"authoritative repository identity for multi-repo fail-closed spawn; must match the active session worktree. To target another approved repository, start a new session there (for example, gjc --cwd <approved-worktree>); changing tasks[].repositoryBinding cannot authorize a foreign repository.",
+	);
 
 const createTaskItemSchema = (_contextEnabled: boolean) =>
 	z.object({
@@ -118,7 +120,7 @@ const createTaskItemSchema = (_contextEnabled: boolean) =>
 		repositoryBinding: repositoryBindingSchema
 			.optional()
 			.describe(
-				"authoritative repository identity; omitted items are stamped from session cwd before discovery/spawn and still fail closed on sibling drift",
+				"authoritative repository identity; omitted items are stamped from session cwd before discovery/spawn and still fail closed on sibling drift. A declared binding must match the active session; use a new session rooted in the approved worktree (for example, gjc --cwd <approved-worktree>) for another repository.",
 			),
 		duplicate_policy: z.enum(["warn", "supersede"]).optional().describe("duplicate launch policy; defaults to warn"),
 	});

@@ -297,10 +297,11 @@ const TRUST_BY_KIND: Record<CustomizeSurfaceKind, string> = {
 };
 
 /** Whether a restart/new session is required for changes to take effect. */
-function restartRequiredFor(kind: CustomizeSurfaceKind): boolean {
-	// MCP startup set is fixed when the session starts; every other surface is
-	// also fixed at session startup.
-	return kind !== "mcp";
+function restartRequiredFor(_kind: CustomizeSurfaceKind): boolean {
+	// Every customization projection describes startup-owned state. MCP is not
+	// an in-session public reload surface, so it follows the same contract as
+	// every other customization kind.
+	return true;
 }
 
 function sourceClassFor(provider: string): CustomizeSourceClass {
@@ -1406,7 +1407,7 @@ function foreignMcpItem(
 		scope: "project",
 		path: server._source.path,
 		trust: TRUST_BY_KIND.mcp,
-		restartRequired: false,
+		restartRequired: restartRequiredFor("mcp"),
 		precedence: { priority: 0, shadowedBy },
 	};
 	return {

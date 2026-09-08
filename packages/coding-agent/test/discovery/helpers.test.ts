@@ -498,6 +498,271 @@ describe("safe discovery boundaries", () => {
 			await fs.rm(root, { recursive: true, force: true });
 		}
 	});
+
+	test("loads a project skills root symlink contained by the repository", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-project-skill-link-"));
+		try {
+			const target = path.join(root, ".agents", "skills", "demo");
+			const scanRoot = path.join(root, ".gjc", "skills");
+			await fs.mkdir(target, { recursive: true });
+			await fs.mkdir(path.dirname(scanRoot), { recursive: true });
+			await fs.writeFile(path.join(target, "SKILL.md"), "---\nname: demo\ndescription: linked\n---\nbody");
+			await fs.symlink(path.relative(path.dirname(scanRoot), path.join(root, ".agents", "skills")), scanRoot, "dir");
+
+			const result = await scanSkillsFromDir(
+				{ cwd: root, home: root, repoRoot: root },
+				{
+					dir: scanRoot,
+					linkContainmentRoot: root,
+					providerId: "test",
+					level: "project",
+					scope: "project",
+					requireDescription: true,
+				},
+			);
+			expect(result.items.map(item => item.name)).toEqual(["demo"]);
+			const loadContent = result.items[0].loadContent;
+			if (!loadContent) throw new Error("Expected deferred project skill body loader.");
+			await expect(loadContent()).resolves.toBe("body");
+			await fs.rename(path.join(root, ".agents", "skills"), path.join(root, ".agents", "skills-moved"));
+			await fs.mkdir(path.join(root, ".agents", "skills"), { recursive: true });
+			await expect(loadContent()).rejects.toThrow();
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
+	test("keeps absent project skill roots silent", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-project-missing-skills-"));
+		try {
+			const result = await scanSkillsFromDir(
+				{ cwd: root, home: root, repoRoot: root },
+				{
+					dir: path.join(root, ".gjc", "skills"),
+					linkContainmentRoot: root,
+					providerId: "test",
+					level: "project",
+				},
+			);
+			expect(result.items).toEqual([]);
+			expect(result.warnings).toEqual([]);
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
+	test("rejects project skill root links outside or missing their target", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-project-skill-link-invalid-"));
+		try {
+			const outside = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-project-skill-outside-"));
+			const scanRoot = path.join(root, ".gjc", "skills");
+			await fs.mkdir(path.dirname(scanRoot), { recursive: true });
+			await fs.symlink(outside, scanRoot, "dir");
+			const outsideResult = await scanSkillsFromDir(
+				{ cwd: root, home: root, repoRoot: root },
+				{ dir: scanRoot, linkContainmentRoot: root, providerId: "test", level: "project", scope: "project" },
+			);
+			expect(outsideResult.items).toEqual([]);
+			await fs.rm(scanRoot);
+			await fs.symlink(path.join(root, "missing"), scanRoot, "dir");
+			const danglingResult = await scanSkillsFromDir(
+				{ cwd: root, home: root, repoRoot: root },
+				{ dir: scanRoot, linkContainmentRoot: root, providerId: "test", level: "project", scope: "project" },
+			);
+			expect(danglingResult.items).toEqual([]);
+			expect(danglingResult.warnings).toEqual(
+				expect.arrayContaining([expect.stringContaining("Failed to read skills directory")]),
+			);
+			await fs.rm(outside, { recursive: true, force: true });
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
+	test("loads ordinary project skills through a symlinked repository alias", async () => {
+		const actual = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-project-repo-actual-"));
+		const alias = `${actual}-alias`;
+		const replacement = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-project-repo-replacement-"));
+		try {
+			const actualSkills = path.join(actual, ".gjc", "skills", "demo");
+			await fs.mkdir(actualSkills, { recursive: true });
+			await fs.writeFile(path.join(actualSkills, "SKILL.md"), "---\nname: demo\ndescription: alias\n---\nbody");
+			await fs.mkdir(path.join(replacement, ".gjc", "skills"), { recursive: true });
+			await fs.symlink(actual, alias, "dir");
+			const scanRoot = path.join(alias, ".gjc", "skills");
+			const result = await scanSkillsFromDir(
+				{ cwd: alias, home: alias, repoRoot: alias },
+				{ dir: scanRoot, linkContainmentRoot: alias, providerId: "test", level: "project", scope: "project" },
+			);
+			expect(result.items.map(item => item.name)).toEqual(["demo"]);
+			await fs.rm(alias);
+			await fs.symlink(replacement, alias, "dir");
+			const loadContent = result.items[0].loadContent;
+			if (!loadContent) throw new Error("Expected deferred project skill body loader.");
+			await expect(loadContent()).rejects.toThrow();
+		} finally {
+			await fs.rm(alias, { recursive: true, force: true });
+			await fs.rm(actual, { recursive: true, force: true });
+			await fs.rm(replacement, { recursive: true, force: true });
+		}
+	});
+
+	test("rejects a project scan root escaping through a parent symlink", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-project-parent-link-"));
+		const outside = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-project-parent-outside-"));
+		try {
+			const scanRoot = path.join(root, ".gjc", "skills");
+			await fs.mkdir(outside, { recursive: true });
+			await fs.mkdir(path.join(outside, "skills", "outside"), { recursive: true });
+			await fs.writeFile(
+				path.join(outside, "skills", "outside", "SKILL.md"),
+				"---\nname: outside\ndescription: outside\n---\n",
+			);
+			await fs.symlink(outside, path.join(root, ".gjc"), "dir");
+			const result = await scanSkillsFromDir(
+				{ cwd: root, home: root, repoRoot: root },
+				{ dir: scanRoot, linkContainmentRoot: root, providerId: "test", level: "project", scope: "project" },
+			);
+			expect(result.items).toEqual([]);
+			expect(result.warnings).toEqual(expect.arrayContaining([expect.stringContaining("outside repository root")]));
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+			await fs.rm(outside, { recursive: true, force: true });
+		}
+	});
+
+	test("does not enable repository link roots for user or disabled project scope", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-project-skill-link-scope-"));
+		try {
+			const target = path.join(root, "target");
+			const scanRoot = path.join(root, "scan");
+			await fs.mkdir(path.join(target, "blocked"), { recursive: true });
+			await fs.writeFile(
+				path.join(target, "blocked", "SKILL.md"),
+				"---\nname: blocked\ndescription: blocked\n---\n",
+			);
+			await fs.symlink(target, scanRoot, "dir");
+			const disabled = await scanSkillsFromDir(
+				{ cwd: root, home: root, repoRoot: root },
+				{ dir: scanRoot, providerId: "test", level: "project", scope: "project" },
+			);
+			expect(disabled.items).toEqual([]);
+			for (const options of [
+				{ level: "user" as const, scope: "user" as const },
+				{ level: "project" as const, scope: "native" as const },
+			]) {
+				const result = await scanSkillsFromDir(
+					{ cwd: root, home: root, repoRoot: root },
+					{ ...options, dir: scanRoot, linkContainmentRoot: root, providerId: "test" },
+				);
+				expect(result.items).toEqual([]);
+			}
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
+	test("rejects a project scan root replaced after validation and during deferred load", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-project-skill-link-swap-"));
+		try {
+			const target = path.join(root, "target");
+			const replacement = path.join(root, "replacement");
+			const scanRoot = path.join(root, ".gjc", "skills");
+			await fs.mkdir(path.join(target, "demo"), { recursive: true });
+			await fs.mkdir(path.dirname(scanRoot), { recursive: true });
+			await fs.mkdir(replacement, { recursive: true });
+			await fs.writeFile(path.join(target, "demo", "SKILL.md"), "---\nname: demo\ndescription: linked\n---\nbody");
+			await fs.symlink(path.relative(path.dirname(scanRoot), target), scanRoot, "dir");
+			SkillDiscoveryTestHooks.afterScanRootValidated = async validatedRoot => {
+				if (validatedRoot !== scanRoot) return;
+				delete SkillDiscoveryTestHooks.afterScanRootValidated;
+				await fs.rm(scanRoot);
+				await fs.symlink(replacement, scanRoot, "dir");
+			};
+			const result = await scanSkillsFromDir(
+				{ cwd: root, home: root, repoRoot: root },
+				{ dir: scanRoot, linkContainmentRoot: root, providerId: "test", level: "project", scope: "project" },
+			);
+			expect(result.items).toEqual([]);
+		} finally {
+			delete SkillDiscoveryTestHooks.afterScanRootValidated;
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
+	test("rejects a project scan root link replacement after scan", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-project-skill-link-postscan-"));
+		try {
+			const target = path.join(root, "target");
+			const replacement = path.join(root, "replacement");
+			const scanRoot = path.join(root, ".gjc", "skills");
+			await fs.mkdir(path.join(target, "demo"), { recursive: true });
+			await fs.mkdir(replacement, { recursive: true });
+			await fs.mkdir(path.dirname(scanRoot), { recursive: true });
+			await fs.writeFile(path.join(target, "demo", "SKILL.md"), "---\nname: demo\ndescription: linked\n---\nbody");
+			await fs.symlink(path.relative(path.dirname(scanRoot), target), scanRoot, "dir");
+			const result = await scanSkillsFromDir(
+				{ cwd: root, home: root, repoRoot: root },
+				{ dir: scanRoot, linkContainmentRoot: root, providerId: "test", level: "project", scope: "project" },
+			);
+			await fs.rm(scanRoot);
+			await fs.symlink(replacement, scanRoot, "dir");
+			const loadContent = result.items[0].loadContent;
+			if (!loadContent) throw new Error("Expected deferred project skill body loader.");
+			await expect(loadContent()).rejects.toThrow();
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
+	test("retains isolated project scan-root link identity for deferred loads", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-project-isolated-link-"));
+		try {
+			const target = path.join(root, ".agents", "skills");
+			const replacement = path.join(root, "replacement");
+			const scanRoot = path.join(root, ".gjc", "skills");
+			await fs.mkdir(path.join(target, "demo"), { recursive: true });
+			await fs.mkdir(replacement, { recursive: true });
+			await fs.mkdir(path.dirname(scanRoot), { recursive: true });
+			await fs.writeFile(path.join(target, "demo", "SKILL.md"), "---\nname: demo\ndescription: linked\n---\nbody");
+			await fs.symlink(path.relative(path.dirname(scanRoot), target), scanRoot, "dir");
+			const result = await scanSkillsFromDir(
+				{ cwd: root, home: root, repoRoot: root, isolatedHome: true },
+				{ dir: scanRoot, linkContainmentRoot: root, providerId: "test", level: "project", scope: "project" },
+			);
+			expect(result.items).toHaveLength(1);
+			await fs.rm(scanRoot);
+			await fs.symlink(replacement, scanRoot, "dir");
+			const loadContent = result.items[0].loadContent;
+			if (!loadContent) throw new Error("Expected deferred project skill body loader.");
+			await expect(loadContent()).rejects.toThrow();
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
+	test("rejects hardlinked and nonregular skill files under an admitted project link", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-project-linked-file-kinds-"));
+		try {
+			const target = path.join(root, ".agents", "skills");
+			const scanRoot = path.join(root, ".gjc", "skills");
+			await fs.mkdir(path.join(target, "hardlinked"), { recursive: true });
+			await fs.mkdir(path.join(target, "directory", "SKILL.md"), { recursive: true });
+			await fs.mkdir(path.dirname(scanRoot), { recursive: true });
+			const source = path.join(root, "source.md");
+			await fs.writeFile(source, "---\nname: hardlinked\ndescription: untrusted alias\n---\nbody");
+			await fs.link(source, path.join(target, "hardlinked", "SKILL.md"));
+			await fs.symlink("../.agents/skills", scanRoot, "dir");
+			const result = await scanSkillsFromDir(
+				{ cwd: root, home: root, repoRoot: root },
+				{ dir: scanRoot, linkContainmentRoot: root, providerId: "test", level: "project" },
+			);
+			expect(result.items).toEqual([]);
+			expect(result.warnings?.filter(warning => warning.includes("not a regular file"))).toHaveLength(2);
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
 });
 
 describe("getUserSkillScanDirs", () => {

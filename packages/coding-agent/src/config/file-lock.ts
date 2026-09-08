@@ -10,6 +10,7 @@ import type {
 	RecoveryFsPublishResult,
 } from "@gajae-code/natives";
 import {
+	exactRestore,
 	openRecoveryFsRoot,
 	renameDirectoryNoReplacePathAsync,
 	renameNoReplacePathAsync,
@@ -520,12 +521,66 @@ function sameFileLockTreeAfterPublication(
 	);
 }
 
-function rollbackPublishedFileLock(
+async function rollbackPublishedFileLock(
 	canonicalParent: string,
 	lockPath: string,
 	pendingPath: string,
 	stagedSnapshot: NativeDirectoryTreeSnapshot,
-): void {
+): Promise<void> {
+	if (process.platform !== "linux") {
+		// RecoveryFsRoot is Linux-only. POSIX exact restore retains the parent
+		// and checks the directory identity around a same-kind placeholder exchange.
+		const root = stagedSnapshot.entries.find(entry => entry.relativePath === "");
+		if (!root) throw new Error("File lock rollback snapshot has no root");
+		const rollback = exactRestore(lockPath, pendingPath, {
+			dev: BigInt(stagedSnapshot.rootDev),
+			ino: BigInt(stagedSnapshot.rootIno),
+			size: BigInt(root.size),
+			mtimeNs: BigInt(root.mtimeNs),
+			directory: true,
+		});
+		const placeholder = rollback.retainedPlaceholderPath;
+		const retainedPlaceholder =
+			!rollback.ok &&
+			rollback.code === "cleanup_pending" &&
+			placeholder !== undefined &&
+			rollback.detachedPath === undefined &&
+			rollback.retainedSuccessorPath === undefined &&
+			rollback.retainedUnknownPath === undefined;
+		if (!rollback.ok && !retainedPlaceholder) {
+			throw new Error(
+				`Failed to roll back file lock published during removal transition: ${rollback.code ?? "unknown"}.`,
+			);
+		}
+		// A root-only restore is not authority to delete substituted descendants.
+		// Leave the retained tree untouched unless the complete snapshot still matches.
+		const restored = snapshotDirectoryTree(pendingPath);
+		if (!restored.ok || !restored.snapshot || !sameFileLockTreeAfterPublication(stagedSnapshot, restored.snapshot)) {
+			throw new Error(`Failed to verify rolled back file lock: ${restored.code ?? "identity_mismatch"}.`);
+		}
+		if (retainedPlaceholder && placeholder !== undefined) {
+			// exactRestore returns a retained, empty exchange placeholder. Its native
+			// name encodes the identity it verified, not authority over an arbitrary path.
+			const identity = /^\.gjc-exact-unlink-placeholder-([0-9a-f]+)-([0-9a-f]+)$/.exec(placeholder);
+			if (!identity) throw new Error("File lock rollback placeholder identity is unavailable");
+			const placeholderPath = path.join(canonicalParent, placeholder);
+			try {
+				const current = await fs.lstat(placeholderPath, { bigint: true });
+				if (
+					!current.isDirectory() ||
+					current.isSymbolicLink() ||
+					current.dev !== BigInt(`0x${identity[1]}`) ||
+					current.ino !== BigInt(`0x${identity[2]}`)
+				) {
+					throw new Error("File lock rollback placeholder identity changed; refusing removal");
+				}
+				await fs.rmdir(placeholderPath);
+			} catch (error) {
+				if (!isEnoent(error)) throw error;
+			}
+		}
+		return;
+	}
 	const authority = openRecoveryFsRoot(canonicalParent);
 	let rollback: RecoveryFsPublishResult | undefined;
 	const errors: unknown[] = [];
@@ -1067,8 +1122,8 @@ async function tryAcquireLock(
 		// validation gets a chance to reject it.
 		const canonicalPendingPath = path.join(canonicalParent, path.basename(pendingPath));
 		let stagedSnapshot: NativeDirectoryTreeSnapshot | undefined;
-		if (process.platform === "linux") {
-			// Linux exact tree removal owns this deterministic sibling from detach
+		if (process.platform !== "win32") {
+			// POSIX exact tree removal owns this deterministic sibling from detach
 			// until cleanup. The outer acquisition loop supplies the existing bounded
 			// contention wait while the predecessor retains that namespace.
 			if (await fileLockRemovalTransitionExists(destinationPath)) return null;
@@ -1128,7 +1183,12 @@ async function tryAcquireLock(
 				if (publishedSnapshot.code) failure.code = publishedSnapshot.code;
 				throw failure;
 			}
-			rollbackPublishedFileLock(canonicalParent, destinationPath, canonicalPendingPath, publishedSnapshot.snapshot);
+			await rollbackPublishedFileLock(
+				canonicalParent,
+				destinationPath,
+				canonicalPendingPath,
+				publishedSnapshot.snapshot,
+			);
 			removePending = true;
 			return null;
 		}
@@ -1349,7 +1409,7 @@ async function releaseLock(lockPath: string, owner: FileLockOwnerToken, knownKey
  */
 async function lockHolderDescription(lockPath: string): Promise<string> {
 	try {
-		if (process.platform === "linux" && (await fileLockRemovalTransitionExists(lockPath))) {
+		if (process.platform !== "win32" && (await fileLockRemovalTransitionExists(lockPath))) {
 			return "blocked by retained removal transition; retry the owning process cleanup or inspect the exact orphan manually; unproven transition ownership is never removed";
 		}
 		const info = await readLockInfo(lockPath);

@@ -177,7 +177,7 @@ export async function assertCwdMatchesRepositoryBinding(
 	if (!repositoryBindingsMatch(active, binding)) {
 		throw new RepositoryBindingError(
 			"identity_mismatch",
-			`Active worktree does not match plan/task repository binding. active=${active.worktreeRoot} (commonDir=${active.commonDir ?? "none"}) bound=${binding.worktreeRoot} (commonDir=${binding.commonDir ?? "none"}).`,
+			`Active worktree does not match plan/task repository binding. A task cannot authorize a foreign repository by changing tasks[].repositoryBinding; start a new session in the approved worktree (for example, gjc --cwd <approved-worktree>) to establish task authority. active=${active.worktreeRoot} (commonDir=${active.commonDir ?? "none"}) bound=${binding.worktreeRoot} (commonDir=${binding.commonDir ?? "none"}).`,
 		);
 	}
 	return active;
@@ -233,6 +233,31 @@ export async function resolveTaskRepositoryBinding(
 	}
 	const taskBinding = parseRepositoryBinding(declared);
 	await assertCwdMatchesRepositoryBinding(sessionCwd, taskBinding);
+	const declaredRoot = await captureRepositoryBinding(taskBinding.worktreeRoot);
+	if (path.resolve(declaredRoot.worktreeRoot) !== path.resolve(taskBinding.worktreeRoot)) {
+		throw new RepositoryBindingError(
+			"identity_mismatch",
+			`Declared repository binding worktreeRoot is stale or forged: live=${declaredRoot.worktreeRoot} bound=${taskBinding.worktreeRoot}.`,
+		);
+	}
+	if (declaredRoot.commonDir !== taskBinding.commonDir) {
+		throw new RepositoryBindingError(
+			"identity_mismatch",
+			`Declared repository binding commonDir does not match the target worktree: live=${declaredRoot.commonDir ?? "none"} bound=${taskBinding.commonDir ?? "none"}.`,
+		);
+	}
+	if (taskBinding.head !== undefined && taskBinding.head !== declaredRoot.head) {
+		throw new RepositoryBindingError(
+			"identity_mismatch",
+			`Declared repository binding HEAD does not match the target worktree: live=${declaredRoot.head ?? "none"} bound=${taskBinding.head}.`,
+		);
+	}
+	if (taskBinding.branch !== undefined && taskBinding.branch !== declaredRoot.branch) {
+		throw new RepositoryBindingError(
+			"identity_mismatch",
+			`Declared repository binding branch does not match the target worktree: live=${declaredRoot.branch ?? "none"} bound=${taskBinding.branch}.`,
+		);
+	}
 	if (taskBinding.relativeSubdir) {
 		assertPathUnderRepositoryBinding(taskBinding, ".");
 	}

@@ -100,6 +100,36 @@ Loaded via symbolic link.
 		expect(session.skills.some((s: Skill) => s.name === "test-skill")).toBe(true);
 	});
 
+	it("loads project skills from a repo-contained symlinked .gjc root", async () => {
+		const repo = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-symlink-repo-"));
+		try {
+			fs.mkdirSync(path.join(repo, ".git"));
+			fs.mkdirSync(path.join(repo, ".agents", "skills", "linked-skill"), { recursive: true });
+			fs.writeFileSync(
+				path.join(repo, ".agents", "skills", "linked-skill", "SKILL.md"),
+				"---\nname: linked-skill\ndescription: Linked project skill.\n---\n\n# Linked\n\nSymlink body marker.\n",
+			);
+			fs.mkdirSync(path.join(repo, ".gjc"));
+			fs.symlinkSync("../.agents/skills", path.join(repo, ".gjc", "skills"), "dir");
+
+			const { session } = await createAgentSession({
+				cwd: repo,
+				agentDir: tempHomeDir,
+				sessionManager: SessionManager.inMemory(repo),
+				settings: createIsolatedSkillsSettings(),
+			});
+			try {
+				const skill = session.skills.find(item => item.name === "linked-skill");
+				expect(skill).toBeDefined();
+				expect(await skill?.loadContent?.()).toContain("Symlink body marker.");
+			} finally {
+				await session.dispose();
+			}
+		} finally {
+			safeRmSync(repo, { recursive: true, force: true });
+		}
+	});
+
 	it("registers marketplace skills for SDK and slash discovery without loading their bodies", async () => {
 		const pluginRoot = path.join(tempHomeDir, "marketplace-cache", "craft-skills");
 		const pluginSkillDir = path.join(pluginRoot, "skills", "design");

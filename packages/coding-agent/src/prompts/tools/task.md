@@ -29,6 +29,7 @@ Subagents have no conversation history. Every fact, file path, and direction the
 {{#if customSchemaEnabled}}- `schema`: JTD schema for expected structured output (do not put format rules in assignments){{/if}}
 - `spawnPlan` (optional): required before any batch with more than 4 tasks; include whyParallel, whyNotLocal, independence, expectedReceiptShape, and maxInlineTokens.
 {{#if isolationEnabled}}- `isolated`: run in an isolated environment; REQUIRED when the user explicitly requests a worktree (for example, "use worktree"), and use when tasks edit overlapping files{{/if}}
+- `repositoryBinding`: optional authoritative repository/worktree identity. It must match the active session and cannot authorize a foreign repository from this session. For another approved repository, start a fresh session rooted there (for example, `gjc --cwd <approved-worktree>`); do not use `/move` because materialized tasks retain their original binding.
 </parameters>
 
 <rules>
