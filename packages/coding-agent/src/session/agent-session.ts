@@ -6259,7 +6259,7 @@ export class AgentSession {
 	#canonicalMessageAdmissionTail: CanonicalMessageAdmissionSlot = { promise: Promise.resolve(), released: true };
 
 	#reserveCanonicalMessageAdmission(event: AgentEvent): CanonicalMessageAdmission | undefined {
-		if (event.type !== "message_end" && event.type !== "agent_end") return undefined;
+		if (event.type !== "message_end" && event.type !== "turn_end" && event.type !== "agent_end") return undefined;
 		const predecessor = this.#canonicalMessageAdmissionTail;
 		const settled = Promise.withResolvers<void>();
 		const slot: CanonicalMessageAdmissionSlot = { promise: settled.promise, released: false };
@@ -7557,6 +7557,10 @@ export class AgentSession {
 
 		// TTSR: Increment message count on turn end (for repeat-after-gap tracking)
 		if (event.type === "turn_end" && this.#ttsrManager) {
+			if (canonicalAdmission && !canonicalAdmission.predecessor.released) {
+				await canonicalAdmission.predecessor.promise;
+			}
+			if (!eventIdentityIsCurrent()) return;
 			this.#ttsrManager.incrementMessageCount();
 			this.sessionManager.appendTtsrInjection(
 				[],
