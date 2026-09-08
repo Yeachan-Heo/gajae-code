@@ -1053,20 +1053,22 @@ export async function updateActiveEntryIfExact(
 	replacement: SkillActiveEntry,
 ): Promise<GuardedWriteResult> {
 	const filePath = activeEntryPath(path.resolve(cwd), sessionScope, skill);
-	return lockResolvedWorkflowTarget(filePath, async () => {
-		const current = await readJsonIfPresent(filePath);
-		if (!Bun.deepEquals(current, expected)) {
-			return { path: filePath, written: false, reason: "stale-skip", revision: persistedStateRevision(current) };
-		}
-		const result = await writeGuardedResolvedJsonAtomic(filePath, replacement, {
-			cwd,
-			policy: "cache",
-			sourceRevision: persistedSourceRevision(current) + 1,
-			lockHeld: true,
-		});
-		invalidateActiveStateCacheForScope(cwd, sessionScope);
-		return result;
-	});
+	return withActiveStateScopeLock(cwd, sessionScope, () =>
+		lockResolvedWorkflowTarget(filePath, async () => {
+			const current = await readJsonIfPresent(filePath);
+			if (!Bun.deepEquals(current, expected)) {
+				return { path: filePath, written: false, reason: "stale-skip", revision: persistedStateRevision(current) };
+			}
+			const result = await writeGuardedResolvedJsonAtomic(filePath, replacement, {
+				cwd,
+				policy: "cache",
+				sourceRevision: persistedSourceRevision(current) + 1,
+				lockHeld: true,
+			});
+			invalidateActiveStateCacheForScope(cwd, sessionScope);
+			return result;
+		}),
+	);
 }
 
 /** Replace an exact caller-owned active entry with its predecessor under one lock. */
@@ -1075,20 +1077,22 @@ export async function restoreActiveEntryIfOwned(
 	receipt: GuardedStateWriteReceipt,
 	predecessor: SkillActiveEntry,
 ): Promise<boolean> {
-	return lockResolvedWorkflowTarget(receipt.path, async () => {
-		const current = await readJsonIfPresent(receipt.path);
-		if (!matchesGuardedStateWriteReceipt(current, receipt)) return false;
-		const restored = await writeGuardedResolvedJsonAtomic(receipt.path, predecessor, {
-			cwd,
-			policy: "cache",
-			sourceRevision: persistedSourceRevision(current) + 1,
-			advanceSourceRevision: true,
-			lockHeld: true,
-		});
-		if (!restored.written) return false;
-		invalidateActiveStateCacheForScope(cwd, predecessor.session_id);
-		return true;
-	});
+	return withActiveStateScopeLock(cwd, { sessionId: predecessor.session_id }, () =>
+		lockResolvedWorkflowTarget(receipt.path, async () => {
+			const current = await readJsonIfPresent(receipt.path);
+			if (!matchesGuardedStateWriteReceipt(current, receipt)) return false;
+			const restored = await writeGuardedResolvedJsonAtomic(receipt.path, predecessor, {
+				cwd,
+				policy: "cache",
+				sourceRevision: persistedSourceRevision(current) + 1,
+				advanceSourceRevision: true,
+				lockHeld: true,
+			});
+			if (!restored.written) return false;
+			invalidateActiveStateCacheForScope(cwd, predecessor.session_id);
+			return true;
+		}),
+	);
 }
 
 export async function removeActiveEntry(
