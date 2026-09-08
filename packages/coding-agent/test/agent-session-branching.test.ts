@@ -303,6 +303,11 @@ describe("AgentSession tree navigation local identity", () => {
 				timestamp: Date.now() - 1,
 			});
 			created.sessionManager.appendMessage({ role: "user", content: "tree leaf", timestamp: Date.now() });
+			session.setCheckpointState({
+				checkpointEntryId: rootEntryId,
+				checkpointMessageCount: 1,
+				startedAt: new Date().toISOString(),
+			});
 			session.queueDeferredMessageForTests(
 				{
 					role: "custom",
@@ -341,6 +346,7 @@ describe("AgentSession tree navigation local identity", () => {
 			expect(fs.readFileSync(markerPath, "utf8")).toBe(before.marker);
 			expect(fs.existsSync(before.root)).toBe(true);
 			expect(session.queuedMessageCount).toBe(0);
+			expect(session.getCheckpointState()).toBeUndefined();
 			expect(
 				session.messages.some(
 					message => message.role === "custom" && message.content === "stale predecessor context",

@@ -368,6 +368,68 @@ describe("TUI raster lease public boundary", () => {
 		tui.stop();
 		expect(terminal.getWriteLog().join("")).not.toContain("RESTORE");
 	});
+	it("closes multipart ownership when terminal loss occurs during prefix flush", async () => {
+		const { tui, terminal } = await setup();
+		const lease = await tui.acquireRasterLease(request("terminal-loss-flush"));
+		if (lease.status !== "acquired") throw new Error("lease not acquired");
+		const flushStarted = Promise.withResolvers<void>();
+		const releaseFlush = Promise.withResolvers<void>();
+		terminal.flush = async () => {
+			flushStarted.resolve();
+			await releaseFlush.promise;
+		};
+		let available = true;
+		Object.defineProperty(terminal, "available", { configurable: true, get: () => available });
+		terminal.clearWriteLog();
+		const pending = tui.submitTerminalOutput({
+			token: lease.token,
+			operation: {
+				type: "raster-multipart-batch",
+				prefix: bytes("FLUSH_PREFIX"),
+				afterPrefix: async () => true,
+				records: [bytes("FLUSH_BODY")],
+				abortSuffix: bytes("FLUSH_ABORT"),
+			},
+		});
+		await flushStarted.promise;
+		available = false;
+		tui.requestRender(true, "terminal-loss-during-flush");
+		releaseFlush.resolve();
+
+		expect((await pending).status).toBe("failed");
+		expect(terminal.getWriteLog().join("")).toBe("FLUSH_PREFIX");
+	});
+	it("closes multipart ownership when terminal loss occurs during afterPrefix", async () => {
+		const { tui, terminal } = await setup();
+		const lease = await tui.acquireRasterLease(request("terminal-loss-after-prefix"));
+		if (lease.status !== "acquired") throw new Error("lease not acquired");
+		const callbackStarted = Promise.withResolvers<void>();
+		const releaseCallback = Promise.withResolvers<void>();
+		let available = true;
+		Object.defineProperty(terminal, "available", { configurable: true, get: () => available });
+		terminal.clearWriteLog();
+		const pending = tui.submitTerminalOutput({
+			token: lease.token,
+			operation: {
+				type: "raster-multipart-batch",
+				prefix: bytes("CALLBACK_PREFIX"),
+				afterPrefix: async () => {
+					callbackStarted.resolve();
+					await releaseCallback.promise;
+					return true;
+				},
+				records: [bytes("CALLBACK_BODY")],
+				abortSuffix: bytes("CALLBACK_ABORT"),
+			},
+		});
+		await callbackStarted.promise;
+		available = false;
+		tui.requestRender(true, "terminal-loss-during-after-prefix");
+		releaseCallback.resolve();
+
+		expect((await pending).status).toBe("failed");
+		expect(terminal.getWriteLog().join("")).toBe("CALLBACK_PREFIX");
+	});
 	it("does not write records when the prefix callback returns false or throws", async () => {
 		const { tui, terminal } = await setup();
 		const lease = await tui.acquireRasterLease(request("prefix-failure"));
