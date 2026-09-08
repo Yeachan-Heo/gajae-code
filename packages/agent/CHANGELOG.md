@@ -2,7 +2,7 @@
 
 ## [Unreleased]
 
-- Successor and terminal-error handling now wait for the published `turn_end` checkpoint consumer before polling steering, admitting follow-up work, or publishing `agent_end`, preventing canonical repeat-rule state from lagging behind the terminal lifecycle.
+- Successor and terminal-error handling now wait for the published `turn_end` checkpoint consumer before polling steering, admitting follow-up work, or publishing `agent_end`, preventing canonical repeat-rule state from lagging behind the terminal lifecycle. Tool calls cancelled after their pre-dispatch hook now invoke the cleanup hook exactly once with the authoritative cancellation result.
 
 ## [0.16.6] - 2026-09-07
 
