@@ -1064,6 +1064,7 @@ async function persistActiveRunId(cwd: string, sessionId: string, runId: string,
 				delete existing.auto_handoff;
 				delete existing.handoff_from;
 				delete existing.handoff_at;
+				delete existing.upstream_handoff_at;
 				delete existing.final_admission_phase_transition;
 			}
 			if (
