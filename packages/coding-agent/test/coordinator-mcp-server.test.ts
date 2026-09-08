@@ -383,9 +383,15 @@ async function createSdkControlServer(
 			sessions: brokerSessions.map(session => {
 				const sessionId = String(session.sessionId ?? session.session_id ?? "");
 				const workspace = root;
+				const declaredLocator = (session.locator as Record<string, unknown> | undefined) ?? {};
+				const brokerWorkspace = typeof declaredLocator.cwd === "string" ? declaredLocator.cwd : workspace;
 				return {
 					sessionId,
-					locator: { cwd: workspace, worktreeRoot: null, stateRoot: path.join(workspace, ".gjc", "state") },
+				locator: {
+						cwd: brokerWorkspace,
+						worktreeRoot: declaredLocator.worktreeRoot ?? null,
+						stateRoot: declaredLocator.stateRoot ?? path.join(brokerWorkspace, ".gjc", "state"),
+					},
 					live: session.live === true,
 					terminalUncertain: session.terminalUncertain === true,
 					endpointGeneration: session.endpointGeneration,
