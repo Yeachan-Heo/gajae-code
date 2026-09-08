@@ -1879,7 +1879,7 @@ describe("gjc state handoff", () => {
 				cwd,
 			);
 			expect(result.status).toBe(2);
-			expect(result.stderr).toContain("sanctioned transition provenance");
+			expect(result.stderr).toContain("explicit provenance");
 			await expect(fs.access(modeStatePath(cwd, TEST_SESSION_ID, "ultragoal"))).rejects.toThrow();
 		});
 	});

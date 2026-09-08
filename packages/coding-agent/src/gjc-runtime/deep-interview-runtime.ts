@@ -626,6 +626,8 @@ async function authoritativeConversationSnapshot(
 ): Promise<{
 	revision: number;
 	messages: Array<{ index: number; role: string; content: string }>;
+	transcriptPath: string;
+	transcriptSha256: string;
 }> {
 	let sessionFile = process.env.GJC_SESSION_FILE?.trim();
 	let explicitProjectTranscript = false;
@@ -795,7 +797,12 @@ async function authoritativeConversationSnapshot(
 			messages.push({ index, role, content: projectedContent.normalize("NFC").trim() });
 		}
 		if (messages.length === 0) throw new DeepInterviewCommandError(2, "live session transcript has no messages");
-		return { revision: messages.length, messages };
+		return {
+			revision: messages.length,
+			messages,
+			transcriptPath: path.resolve(sessionFile),
+			transcriptSha256: createHash("sha256").update(bytes).digest("hex"),
+		};
 	} catch (error) {
 		if (error instanceof DeepInterviewCommandError) throw error;
 		throw new DeepInterviewCommandError(2, "live session transcript is unavailable");
@@ -1132,19 +1139,7 @@ export async function assertDeepInterviewCrystalCoversLiveTranscript(
 	const source = verifyCrystalSourceAgainstLive(crystal, liveSnapshot);
 	if (source.end !== liveSnapshot.messages.length - 1)
 		throw new DeepInterviewCommandError(2, "execution approval requires re-crystallization after transcript changes");
-	const transcriptPath = process.env.GJC_SESSION_FILE;
-	if (!transcriptPath)
-		throw new DeepInterviewCommandError(2, "execution approval requires an explicit authenticated transcript path");
-	const bytes = await readBoundedFileBytes(
-		transcriptPath,
-		RESUME_TRANSCRIPT_MAX_BYTES,
-		"execution approval transcript",
-	);
-	if (!bytes) throw new DeepInterviewCommandError(2, "execution approval transcript is unavailable");
-	return {
-		transcriptPath: path.resolve(transcriptPath),
-		transcriptSha256: createHash("sha256").update(bytes).digest("hex"),
-	};
+	return { transcriptPath: liveSnapshot.transcriptPath, transcriptSha256: liveSnapshot.transcriptSha256 };
 }
 
 async function handleCrystallize(args: readonly string[], cwd: string): Promise<DeepInterviewCommandResult> {
