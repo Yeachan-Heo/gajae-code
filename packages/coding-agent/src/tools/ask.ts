@@ -1256,10 +1256,12 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 		}
 		if (
 			params.questions.filter(
-				question => question.workflowGate?.stage === "deep-interview" && question.workflowGate.kind === "execution",
+				question =>
+					(question.workflowGate?.stage === "deep-interview" && question.workflowGate.kind === "execution") ||
+					(question.workflowGate?.stage === "ralplan" && question.workflowGate.kind === "approval"),
 			).length > 1
 		)
-			throw new ToolError("Ask accepts at most one Deep Interview execution gate per invocation");
+			throw new ToolError("Ask accepts at most one execution-authorizing workflow gate per invocation");
 
 		const askQuestion = async (
 			q: AskParams["questions"][number],
