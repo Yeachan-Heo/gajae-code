@@ -175,7 +175,7 @@ export default factory;
 		}
 	});
 
-	test("adds and removes sub-skill tools as the active phase changes", async () => {
+	test("adds, removes, and identically reactivates sub-skill tools", async () => {
 		const toolPath = await writeCustomTool("domain-note.ts", "domain_note");
 		await activateSubskill([toolPath], "planner");
 
@@ -186,7 +186,7 @@ export default factory;
 		await syncSkillActiveState({
 			cwd: tempDir.path(),
 			skill: "ralplan",
-			active: true,
+			active: false,
 			phase: "critic",
 			sessionId: sessionManager.getSessionId(),
 			active_subskills: [],
