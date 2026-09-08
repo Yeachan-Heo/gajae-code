@@ -2105,6 +2105,7 @@ export class TUI extends Container {
 				}
 				if (!shouldWrite) return { queueId: id, operation: op.type, status: "stale-token" };
 			}
+			let multipartAbortBarrier: (() => void) | undefined;
 			if (op.type === "raster-multipart-batch" && op.prefix !== undefined && op.afterPrefix !== undefined) {
 				const prefixWritten = this.#guardTerminalOperation(() =>
 					this.terminal.write(new TextDecoder().decode(op.prefix)),
@@ -2121,6 +2122,7 @@ export class TUI extends Container {
 					if (abortSuffix || cursorVisibility)
 						this.#guardTerminalOperation(() => this.terminal.write(abortSuffix + cursorVisibility));
 				};
+				multipartAbortBarrier = abortBarrier;
 				this.#inFlightMultipartAbort = abortBarrier;
 				let flushed: boolean | undefined;
 				try {
@@ -2146,7 +2148,6 @@ export class TUI extends Container {
 					if (isCurrentLifecycle()) abortBarrier();
 					return failed();
 				}
-				if (this.#inFlightMultipartAbort === abortBarrier) this.#inFlightMultipartAbort = undefined;
 				// Async boundary: afterPrefix awaited external work; re-check epoch.
 				if (!isCurrentLifecycle()) return failed();
 				const currentLease = this.#rasterLeases.get(request.token?.ownerId ?? "");
@@ -2182,6 +2183,11 @@ export class TUI extends Container {
 			const ok = dependent
 				? this.#writeProtectedRenderIngress(finalBytes)
 				: this.#guardTerminalOperation(() => this.terminal.write(finalBytes));
+			if (ok && this.#inFlightMultipartAbort === multipartAbortBarrier) {
+				this.#inFlightMultipartAbort = undefined;
+			} else if (!ok && multipartAbortBarrier && isCurrentLifecycle()) {
+				multipartAbortBarrier();
+			}
 			if (!ok && dependent) {
 				const rect = (op as { rect: CellRect }).rect;
 				const blockedBy = [...this.#rasterCleanup.entries()]
