@@ -2067,6 +2067,55 @@ describe("AgentSession TTSR resume gate", () => {
 		expect(ttsrManager.getInjectedRuleNames()).toEqual([]);
 	});
 
+	it("reconciles a failed turn-end repeat checkpoint before the next provider call", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const order: string[] = [];
+		let streamCallCount = 0;
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"] },
+			streamFn: () => {
+				order.push(`provider-${++streamCallCount}`);
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(() => {
+					const done = makeMsg("done");
+					stream.push({ type: "start", partial: done });
+					stream.push({ type: "done", reason: "stop", message: done });
+				});
+				return stream;
+			},
+		});
+		const sessionManager = SessionManager.inMemory(tempDir);
+		const appendTtsrInjection = sessionManager.appendTtsrInjection.bind(sessionManager);
+		let rejectNextTurnCheckpoint = true;
+		vi.spyOn(sessionManager, "appendTtsrInjection").mockImplementation((ruleNames, records, messageCount) => {
+			if (ruleNames.length === 0 && rejectNextTurnCheckpoint) {
+				rejectNextTurnCheckpoint = false;
+				order.push("persist-failed");
+				throw new Error("injected turn-end persistence failure");
+			}
+			order.push("persisted");
+			return appendTtsrInjection(ruleNames, records, messageCount);
+		});
+		const settings = Settings.isolated();
+		const authStorage = await AuthStorage.create(path.join(tempDir, "testauth-turn-end-failure.db"));
+		authStorages.push(authStorage);
+		const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "models.yml"));
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		const ttsrManager = new TtsrManager({ enabled: true });
+		session = new AgentSession({ agent, sessionManager, settings, modelRegistry, ttsrManager });
+
+		await expect(session.prompt("first turn")).rejects.toThrow("injected turn-end persistence failure");
+		expect(ttsrManager.getMessageCount()).toBe(0);
+		expect(() => session.newSession()).toThrow("Reconcile repeat-state persistence before changing session history.");
+		expect(order).toEqual(["provider-1", "persist-failed"]);
+
+		await session.prompt("second turn");
+
+		expect(order.slice(0, 4)).toEqual(["provider-1", "persist-failed", "persisted", "provider-2"]);
+		expect(ttsrManager.getMessageCount()).toBe(2);
+	});
+
 	it("interruptMode never deduplicates the reminder across sibling tool calls in one batch", async () => {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
 		let streamCallCount = 0;

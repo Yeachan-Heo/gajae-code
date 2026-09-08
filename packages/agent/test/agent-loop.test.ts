@@ -1714,6 +1714,101 @@ describe("agentLoopContinue with AgentMessage", () => {
 		}
 	});
 
+	it("runs afterToolCall once when cancellation lands before dispatch", async () => {
+		const toolSchema = z.object({ value: z.string() });
+		const abortController = new AbortController();
+		const afterCalls: Array<{ result: unknown; isError: boolean }> = [];
+		let executed = false;
+		const tool: AgentTool<typeof toolSchema, { value: string }> = {
+			name: "echo",
+			label: "Echo",
+			description: "Echo tool",
+			parameters: toolSchema,
+			async execute() {
+				executed = true;
+				return { content: [{ type: "text", text: "executed" }] };
+			},
+		};
+
+		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [tool] };
+		const mock = createMockModel({
+			responses: [{ content: [{ type: "toolCall", id: "tool-1", name: "echo", arguments: { value: "hello" } }] }],
+		});
+		const config: AgentLoopConfig = {
+			model: mock.model,
+			convertToLlm: identityConverter,
+			beforeToolCall: () => {
+				// Queue the abort after the hook returns but before the await continuation
+				// can publish the prepared dispatch.
+				queueMicrotask(() => abortController.abort());
+			},
+			afterToolCall: async ({ result, isError }) => {
+				afterCalls.push({ result, isError });
+			},
+		};
+
+		const stream = agentLoop(
+			[createUserMessage("echo something")],
+			context,
+			config,
+			abortController.signal,
+			mock.stream,
+		);
+		for await (const _event of stream) {
+			// drain
+		}
+
+		expect(executed).toBe(false);
+		expect(afterCalls).toHaveLength(1);
+		expect(afterCalls[0]).toMatchObject({
+			isError: true,
+			result: { isError: true, details: { cancellation: "before_dispatch" } },
+		});
+	});
+
+	it("settles dispatched cancellation cleanup before agent_end", async () => {
+		const toolSchema = z.object({});
+		const controller = new AbortController();
+		const never = Promise.withResolvers<never>();
+		const order: string[] = [];
+		const tool: AgentTool<typeof toolSchema, unknown> = {
+			name: "parked",
+			label: "Parked",
+			description: "Never completes",
+			parameters: toolSchema,
+			nonAbortable: true,
+			concurrency: "exclusive",
+			execute: async () => never.promise,
+		};
+		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [tool] };
+		const mock = createMockModel({
+			responses: [
+				{
+					content: [
+						{ type: "toolCall", id: "tool-1", name: "parked", arguments: {} },
+						{ type: "toolCall", id: "tool-2", name: "parked", arguments: {} },
+					],
+				},
+			],
+		});
+		const config: AgentLoopConfig = {
+			model: mock.model,
+			convertToLlm: identityConverter,
+			afterToolCall: async ({ result }) => {
+				expect(result).toMatchObject({ details: { cancellation: "after_dispatch" } });
+				order.push("cleanup");
+			},
+		};
+
+		const stream = agentLoop([createUserMessage("run")], context, config, controller.signal, mock.stream);
+		for await (const event of stream) {
+			if (event.type === "tool_execution_start") controller.abort();
+			if (event.type === "agent_end") order.push("agent_end");
+		}
+
+		expect(order).toEqual(["cleanup", "agent_end"]);
+	});
+
 	it("passes beforeToolCall args mutations into tool.execute without revalidation", async () => {
 		const toolSchema = z.object({ value: z.string() });
 		const executed: Array<string | number> = [];
