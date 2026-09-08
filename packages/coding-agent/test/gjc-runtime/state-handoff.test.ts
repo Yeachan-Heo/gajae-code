@@ -415,6 +415,32 @@ describe("gjc state handoff", () => {
 			).rejects.toThrow("canonical Crystal is immutable through runtime reconciliation");
 		});
 	});
+	it("rejects introducing Ralplan handoff lineage through generic state write", async () => {
+		await withTempCwd(async cwd => {
+			const statePath = modeStatePath(cwd, TEST_SESSION_ID, "ralplan");
+			await writeJson(statePath, {
+				skill: "ralplan",
+				version: 2,
+				active: true,
+				current_phase: "planner",
+				run_id: "fresh-standalone-run",
+			});
+			const result = await runNativeStateCommand(
+				[
+					"write",
+					"--mode",
+					"ralplan",
+					"--input",
+					JSON.stringify({ handoff_from: "deep-interview", handoff_at: "2026-01-01T00:00:00.000Z" }),
+					"--json",
+				],
+				cwd,
+			);
+			expect(result.status).toBe(2);
+			expect(result.stderr).toContain("handoff lineage cannot be introduced through generic state write");
+			expect(await readJson(statePath)).not.toHaveProperty("handoff_from");
+		});
+	});
 	it("revokes pre-v2 Crystal authority through generic and reconcile writers", async () => {
 		await withTempCwd(async cwd => {
 			const callerPath = await writeLegacyApprovedCrystal(cwd);
