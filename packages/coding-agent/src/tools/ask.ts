@@ -864,7 +864,11 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 			return;
 		}
 		if (!sessionId) throw new ToolAbortError("Deep Interview execution approval requires a session");
-		const transcriptEvidence = await assertDeepInterviewCrystalCoversLiveTranscript(this.session.cwd, sessionId);
+		const transcriptEvidence = await assertDeepInterviewCrystalCoversLiveTranscript(
+			this.session.cwd,
+			sessionId,
+			deepInterviewExecution,
+		);
 		await recordDeepInterviewExecutionApproval({
 			cwd: this.session.cwd,
 			sessionId,
