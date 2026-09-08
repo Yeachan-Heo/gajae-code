@@ -298,7 +298,7 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 	let makeNextSessionCloseUncertain = true;
 	let rejectNextSessionClose = false;
 	let activeModelPreset = "test-preset";
-	let primaryControlSurface: "cli" | "sdk" | undefined = "sdk";
+	let primaryControlSurface: "cli" | "sdk" | "invalid" | undefined = "sdk";
 	let completeNextPromptBeforeAck = false;
 	/** Queries `#sessionState` issues before `session/new` can answer. */
 	const SESSION_STATE_QUERIES = new Set(["config.list/get", "models.profiles.list", "providers.list/active"]);
@@ -1324,6 +1324,25 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 	).rejects.toMatchObject({ code: "unavailable" });
 	expect(providerRegistrations).toHaveLength(registrationsBeforeLegacyCapability);
 	legacyCapabilityAbort.abort();
+
+	primaryControlSurface = "invalid";
+	const invalidCapabilityAbort = new AbortController();
+	const invalidCapabilityAgent = new AcpAgent(
+		{
+			sessionUpdate: async (update: SessionNotification) => updates.push(update),
+			signal: invalidCapabilityAbort.signal,
+			closed: Promise.withResolvers<void>().promise,
+		} as unknown as AgentSideConnection,
+		{ agentDir },
+	);
+	await expect(
+		bounded(
+			invalidCapabilityAgent.loadSession({ sessionId: created.sessionId, cwd, mcpServers: [] }),
+			"invalid capability rejection",
+		),
+	).rejects.toMatchObject({ code: "unavailable" });
+	expect(providerRegistrations).toHaveLength(registrationsBeforeLegacyCapability);
+	invalidCapabilityAbort.abort();
 
 	const baseProviderAbort = new AbortController();
 	primaryControlSurface = "cli";

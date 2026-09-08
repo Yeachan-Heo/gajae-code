@@ -1397,7 +1397,6 @@ export class AcpAgent implements Agent {
 		);
 		const id = sessionId(result);
 		this.#knownSessionCwds.set(id, params.cwd);
-		this.#ownedSessionIds.add(id);
 		this.#knownSessionMcpServers.set(id, mcpServers);
 		try {
 			await this.#attach(id, params.cwd, undefined, result);
@@ -1454,7 +1453,6 @@ export class AcpAgent implements Agent {
 		);
 		const id = sessionId(result);
 		this.#knownSessionCwds.set(id, params.cwd);
-		this.#ownedSessionIds.add(id);
 		this.#knownSessionMcpServers.set(id, mcpServers);
 		try {
 			await this.#attach(id, params.cwd, undefined, result);

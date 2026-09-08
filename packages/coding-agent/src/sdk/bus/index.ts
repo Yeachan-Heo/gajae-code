@@ -2389,6 +2389,7 @@ function sdkQuerySurface(
 		status: "unknown",
 	}),
 	getRuntimeHost: () => SessionSdkHost | undefined = () => undefined,
+	primaryControlSurface: "cli" | "sdk" = "sdk",
 ): SessionSurface {
 	return createSdkSurfaceFactory({
 		ctx,
@@ -2402,6 +2403,7 @@ function sdkQuerySurface(
 		steerStatusLookup,
 		hostTools: () => getInstalledDefinitions("host_tools") !== undefined,
 		getRuntimeHost,
+		primaryControlSurface,
 	}).query;
 }
 
@@ -4052,6 +4054,8 @@ export function createNotificationsExtension(
 		controller?: NotificationSessionController;
 		/** Whether this host mode can own the root SDK endpoint. Default: true. */
 		sdkHostModeSupported?: boolean;
+		/** Startup surface that owns host-level permission and lifecycle authority. */
+		primaryControlSurface?: "cli" | "sdk";
 		/** In-memory master capability for private broker verification only. */
 		masterCapability?: string;
 		/** Opaque direct-role epoch this effective host may adopt. */
@@ -5469,6 +5473,7 @@ export function createNotificationsExtension(
 				selector => kindReconciliation.lookupResult(selector.kind, selector),
 				selector => kindReconciliation.lookupSteer(selector),
 				() => host,
+				options.primaryControlSurface ?? "sdk",
 			),
 			id,
 			revisions,

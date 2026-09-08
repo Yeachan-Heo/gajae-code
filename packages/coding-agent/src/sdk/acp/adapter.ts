@@ -318,6 +318,7 @@ export class AcpSdkAdapter {
 	async start(options: { activateProviders?: boolean } = {}): Promise<void> {
 		const activateProviders = options.activateProviders !== false;
 		if (this.#closed) throw new AcpSdkAdapterError("connection_closed");
+		if (this.#router && this.#attachment) assertMaintenanceCapability(this.#attachment);
 		if (!this.#started) {
 			// Direct adapter startup owns providers; ACP attachment defers this
 			// authority until runtime origin discovery. Repeated startup cannot
@@ -339,7 +340,6 @@ export class AcpSdkAdapter {
 		if (activateProviders) {
 			if (this.#router) {
 				if (!this.#attachment?.isCurrent()) return;
-				if (this.#attachment) assertMaintenanceCapability(this.#attachment);
 				if (this.#providerActivationAuthorized) await this.#activateProviders();
 			} else {
 				if (this.#providerActivationAuthorized) await this.#activateProviders();

@@ -70,6 +70,7 @@ import { newMasterAttestationEpoch, resolveSessionLocator, SessionIndex } from "
 import type { AgentSession } from "./session/agent-session";
 import { ManagedAppendIdentityMismatchError } from "./session/internal/managed-session-storage";
 import { SessionMigrationBusyError } from "./session/internal/session-open-errors";
+import { setPrimaryControlSurface } from "./session/primary-control-surface";
 import {
 	type ResumeSessionIdentity,
 	resolveResumableSession,
@@ -1847,7 +1848,7 @@ export async function runRootCommand(
 	sessionOptions.hasUI = isInteractive;
 	sessionOptions.notificationHostModeSupported = isInteractive;
 	sessionOptions.sdkHostModeSupported = isInteractive;
-	sessionOptions.primaryControlSurface = "cli";
+	setPrimaryControlSurface(sessionOptions, "cli");
 	sessionOptions.settings = settingsInstance;
 	sessionOptions.masterModeContext = masterModeContext;
 	if (isInteractive && sessionOptions.mcpConfigPath) {

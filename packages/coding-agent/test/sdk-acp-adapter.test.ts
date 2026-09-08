@@ -155,7 +155,7 @@ test("an attachment without sendMaintenance is rejected at setup, leaving no lea
 		providers: [{ capability: "ui", definitions: [] }],
 		heartbeatMs: 5,
 	});
-	await expect(adapter.start()).rejects.toThrow(/sendMaintenance/);
+	await expect(adapter.start({ activateProviders: false })).rejects.toThrow(/sendMaintenance/);
 	try {
 		// No heartbeat may be emitted for an attachment that cannot renew.
 		const before = harness.maintenance.length;
