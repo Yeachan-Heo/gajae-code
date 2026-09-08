@@ -5418,6 +5418,27 @@ async function executeToolCalls(
 				);
 				if (signal?.aborted) {
 					record.skipped = true;
+					if (afterToolCall && record.started) {
+						const cancelledResult: AgentToolResult = {
+							content: [{ type: "text", text: "Tool call cancelled before dispatch." }],
+							isError: true,
+						};
+						try {
+							await afterToolCall(
+								{
+									assistantMessage,
+									toolCall,
+									args: record.args,
+									result: cancelledResult,
+									isError: true,
+									context: currentContext,
+								},
+								toolSignal,
+							);
+						} catch {
+							// Cancellation is authoritative; the hook is best-effort cleanup only.
+						}
+					}
 					return;
 				}
 				// Preparation is complete. A successful publication is the only transition

@@ -674,19 +674,21 @@ async function mergeVisibleEntries(
 	// Per-skill files in active/<skill>.json are authoritative and are merged
 	// after the derived snapshot cache, so a stale skill-active-state.json row
 	// cannot override the latest entry file.
-	const activeEntries = await readActiveEntries(cwd, { sessionId });
-	const hasAuthoritativeEntryDirectory = await hasAuthoritativeActiveEntryDirectory(cwd, sessionId);
-	const authoritativeSkills = new Set(activeEntries.map(entry => entry.skill));
-	const snapshotFallbackEntries = rawActiveEntries(sessionState).filter(
-		entry => !hasAuthoritativeEntryDirectory || authoritativeSkills.has(entry.skill),
-	);
-	const entries = [...snapshotFallbackEntries, ...activeEntries];
-	const merged = new Map(entries.map(entry => [entryKey(entry), entry]));
-	const canonicalRalplanPhase = await readModeStatePhase(cwd, sessionId, "ralplan");
-	const visibleEntries = dedupeVisibleBySkill([...merged.values()], sessionId)
-		.filter(entry => entry.active !== false)
-		.map(entry => withCanonicalRalplanPhase(entry, canonicalRalplanPhase));
-	return collapsePlanningPipeline(visibleEntries).toSorted(comparePipelineEntry);
+	return withActiveStateScopeLock(cwd, { sessionId }, async () => {
+		const activeEntries = await readActiveEntries(cwd, { sessionId });
+		const hasAuthoritativeEntryDirectory = await hasAuthoritativeActiveEntryDirectory(cwd, sessionId);
+		const authoritativeSkills = new Set(activeEntries.map(entry => entry.skill));
+		const snapshotFallbackEntries = rawActiveEntries(sessionState).filter(
+			entry => !hasAuthoritativeEntryDirectory || authoritativeSkills.has(entry.skill),
+		);
+		const entries = [...snapshotFallbackEntries, ...activeEntries];
+		const merged = new Map(entries.map(entry => [entryKey(entry), entry]));
+		const canonicalRalplanPhase = await readModeStatePhase(cwd, sessionId, "ralplan");
+		const visibleEntries = dedupeVisibleBySkill([...merged.values()], sessionId)
+			.filter(entry => entry.active !== false)
+			.map(entry => withCanonicalRalplanPhase(entry, canonicalRalplanPhase));
+		return collapsePlanningPipeline(visibleEntries).toSorted(comparePipelineEntry);
+	});
 }
 
 async function hasAuthoritativeActiveEntryDirectory(cwd: string, sessionId: string): Promise<boolean> {
