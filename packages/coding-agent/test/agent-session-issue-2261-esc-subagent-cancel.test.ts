@@ -12,7 +12,11 @@ import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { ArtifactManager } from "@gajae-code/coding-agent/session/artifacts";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
-import { lookupOwnedRegistration, registerOwnedRegistration } from "@gajae-code/coding-agent/session/terminal-abort";
+import {
+	lookupOwnedRegistration,
+	registerOwnedRegistration,
+	unregisterOwnedRegistration,
+} from "@gajae-code/coding-agent/session/terminal-abort";
 import { TempDir } from "@gajae-code/utils";
 
 const CLEANUP_NOTICE =
@@ -330,6 +334,16 @@ describe("AgentSession Issue #2261 /new owner-subagent cancellation", () => {
 			sessionFile: "/tmp/copied-transcript-child.jsonl",
 			resumable: true,
 		});
+		const predecessorJob = manager.getJob(predecessorJobId);
+		if (!predecessorJob) throw new Error("Expected copied-transcript predecessor job");
+		registerOwnedRegistration({
+			endpointId: previousSessionId,
+			endpointGeneration: 0,
+			lineageIdHash: "copied-transcript-predecessor",
+			promptAttemptEpoch: 1,
+			jobId: predecessorJobId,
+			jobGeneration: predecessorJob.generation,
+		});
 		const finishShutdown = vi.spyOn(manager, "finishOwnerSubagentShutdown");
 
 		await expect(session.switchSession(copiedFile)).resolves.toBe(true);
@@ -340,6 +354,7 @@ describe("AgentSession Issue #2261 /new owner-subagent cancellation", () => {
 		expect(manager.getJob(predecessorJobId)?.status).toBe("cancelled");
 		expect(manager.getDeliveryState({ ownerId: "owner" }).queued).toBe(0);
 		expect(manager.getSubagentRecord("copied-transcript-child")).toBeUndefined();
+		expect(lookupOwnedRegistration(predecessorJobId, predecessorJob.generation, previousSessionId)).toBeUndefined();
 		expect(completions).toEqual([]);
 	});
 
@@ -364,6 +379,12 @@ describe("AgentSession Issue #2261 /new owner-subagent cancellation", () => {
 			{ ownerId: "owner" },
 		);
 		const predecessorEndpointId = sessionManager.getSessionId();
+		const checkpointState = {
+			checkpointEntryId: sessionManager.getLeafId(),
+			checkpointMessageCount: session.agent.state.messages.length,
+			startedAt: new Date().toISOString(),
+		};
+		session.setCheckpointState(checkpointState);
 		const ownerJob = ownerManager.getJob(ownerJobId);
 		if (!ownerJob) throw new Error("Expected owner job");
 		registerOwnedRegistration(
@@ -384,6 +405,7 @@ describe("AgentSession Issue #2261 /new owner-subagent cancellation", () => {
 
 		await expect(session.switchSession(copiedFile)).rejects.toThrow("injected successor validation failure");
 		expect(session.sessionFile).toBe(previousFile);
+		expect(session.getCheckpointState()).toEqual(checkpointState);
 		expect(ownerManager.getJob(ownerJobId)?.status).toBe("running");
 		// Rekey moved the manager mapping, but rollback restored the
 		// predecessor while the job remains live. Its predecessor tuple must
@@ -417,6 +439,71 @@ describe("AgentSession Issue #2261 /new owner-subagent cancellation", () => {
 
 		expect(ttsrManager.getInjectedRuleNames()).toEqual(["predecessor-rule"]);
 		expect(ttsrManager.getMessageCount()).toBe(7);
+	});
+
+	it("does not move a foreign endpoint manager when switch admission fails", async () => {
+		const ownerManager = installOwnerManager();
+		const predecessorEndpoint = sessionManager.getSessionId();
+		expect(AsyncJobManager.registerForEndpoint(predecessorEndpoint, ownerManager)).toBe(true);
+		await sessionManager.ensureOnDisk();
+		const previousFile = session.sessionFile;
+		if (!previousFile) throw new Error("Expected a persisted predecessor session");
+
+		const targetManager = SessionManager.create(tempDir.path(), tempDir.path());
+		await targetManager.ensureOnDisk();
+		const targetFile = targetManager.getSessionFile();
+		if (!targetFile) throw new Error("Expected a persisted target session");
+		const targetEndpoint = targetManager.getSessionId();
+		const foreignManager = new AsyncJobManager({ onJobComplete: async () => {} });
+		expect(AsyncJobManager.registerForEndpoint(targetEndpoint, foreignManager)).toBe(true);
+
+		try {
+			await expect(session.switchSession(targetFile)).rejects.toThrow("owned by another live session's job manager");
+			expect(session.sessionFile).toBe(previousFile);
+			expect(AsyncJobManager.forEndpoint(predecessorEndpoint)).toBe(ownerManager);
+			expect(AsyncJobManager.forEndpoint(targetEndpoint)).toBe(foreignManager);
+		} finally {
+			await targetManager.close();
+			AsyncJobManager.unregisterManager(foreignManager);
+			await foreignManager.dispose({ timeoutMs: 100 });
+		}
+	});
+
+	it("does not retire registrations owned by a foreign predecessor endpoint", async () => {
+		installOwnerManager();
+		await sessionManager.ensureOnDisk();
+		const predecessorEndpoint = sessionManager.getSessionId();
+		const foreignManager = new AsyncJobManager({ onJobComplete: async () => {} });
+		expect(AsyncJobManager.registerForEndpoint(predecessorEndpoint, foreignManager)).toBe(true);
+		const foreignJobId = foreignManager.register("task", "foreign predecessor", async () => "done");
+		const foreignJob = foreignManager.getJob(foreignJobId);
+		if (!foreignJob) throw new Error("Expected foreign predecessor job");
+		const registration = {
+			endpointId: predecessorEndpoint,
+			endpointGeneration: 0,
+			lineageIdHash: "foreign-predecessor",
+			promptAttemptEpoch: 1,
+			jobId: foreignJobId,
+			jobGeneration: foreignJob.generation,
+		};
+		registerOwnedRegistration(registration, { isJobTerminal: () => false });
+		const targetManager = SessionManager.create(tempDir.path(), tempDir.path());
+		await targetManager.ensureOnDisk();
+		const targetFile = targetManager.getSessionFile();
+		if (!targetFile) throw new Error("Expected a persisted target session");
+
+		try {
+			await expect(session.switchSession(targetFile)).resolves.toBe(true);
+			expect(AsyncJobManager.forEndpoint(predecessorEndpoint)).toBe(foreignManager);
+			expect(lookupOwnedRegistration(foreignJobId, foreignJob.generation, predecessorEndpoint)).toEqual(
+				registration,
+			);
+		} finally {
+			unregisterOwnedRegistration(registration);
+			await targetManager.close();
+			AsyncJobManager.unregisterManager(foreignManager);
+			await foreignManager.dispose({ timeoutMs: 100 });
+		}
 	});
 
 	it.each([

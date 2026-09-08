@@ -1,10 +1,22 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test, vi } from "bun:test";
+import * as path from "node:path";
 import type { AgentMessage } from "@gajae-code/agent-core";
+import { getBundledModel } from "@gajae-code/ai";
 import { type AsyncJob, AsyncJobManager } from "@gajae-code/coding-agent/async";
+import { Settings } from "@gajae-code/coding-agent/config/settings";
+import { createAgentSession } from "@gajae-code/coding-agent/sdk";
+import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import type { CustomMessage } from "@gajae-code/coding-agent/session/messages";
+import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
+import {
+	lookupOwnedRegistration,
+	registerOwnedRegistration,
+	type TurnRegistrationKey,
+} from "@gajae-code/coding-agent/session/terminal-abort";
 import { YieldQueue } from "@gajae-code/coding-agent/session/yield-queue";
 import type { ToolSession } from "@gajae-code/coding-agent/tools";
 import { JobTool } from "@gajae-code/coding-agent/tools/job";
+import { TempDir } from "@gajae-code/utils";
 
 type AsyncEntry = {
 	jobId: string;
@@ -171,6 +183,106 @@ describe("async result yield queue delivery", () => {
 		expect(harness.prompts).toHaveLength(1);
 		expect(harness.prompts[0]).toHaveLength(1);
 		expect(asyncDetails(harness.prompts[0]![0]!).jobs.map(job => job.jobId)).toEqual([jobId]);
+	});
+
+	test("acknowledgement during formatting settles only the stale owned registration", async () => {
+		const tempDir = TempDir.createSync("@gjc-async-yield-race-");
+		const authStorage = await AuthStorage.create(path.join(tempDir.path(), "testauth.db"));
+		let created: Awaited<ReturnType<typeof createAgentSession>> | undefined;
+		let staleRegistration: TurnRegistrationKey | undefined;
+		let liveRegistration: TurnRegistrationKey | undefined;
+		const formattingStarted = Promise.withResolvers<void>();
+		const releaseFormatting = Promise.withResolvers<{ id?: string; path?: string }>();
+		try {
+			const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+			if (!model) throw new Error("Expected bundled test model to exist");
+			created = await createAgentSession({
+				cwd: tempDir.path(),
+				agentDir: tempDir.path(),
+				sessionManager: SessionManager.inMemory(tempDir.path()),
+				authStorage,
+				settings: Settings.isolated({ "async.enabled": true, "compaction.enabled": false }),
+				model,
+				disableExtensionDiscovery: true,
+				extensions: [],
+				skills: [],
+				rules: [],
+				contextFiles: [],
+				promptTemplates: [],
+				slashCommands: [],
+				enableMCP: false,
+				enableLsp: false,
+				notificationHostModeSupported: false,
+				sdkHostModeSupported: false,
+			});
+			const manager = AsyncJobManager.instance();
+			if (!manager) throw new Error("Expected the SDK session to own an async job manager");
+			const endpointId = AsyncJobManager.endpointIdOf(manager);
+			if (!endpointId) throw new Error("Expected the async job manager endpoint to be registered");
+
+			vi.spyOn(created.session.sessionManager, "allocateArtifactPath").mockImplementation(async () => {
+				formattingStarted.resolve();
+				return await releaseFormatting.promise;
+			});
+			const staleResult = Promise.withResolvers<string>();
+			const staleJobId = manager.register("bash", "formatting race", async () => staleResult.promise);
+			const staleJob = manager.getJob(staleJobId);
+			if (!staleJob) throw new Error("Expected the formatting-race job to be registered");
+			staleRegistration = {
+				endpointId,
+				endpointGeneration: 0,
+				lineageIdHash: "formatting-race-lineage",
+				promptAttemptEpoch: 1,
+				jobId: staleJob.id,
+				jobGeneration: staleJob.generation,
+			};
+			registerOwnedRegistration(staleRegistration);
+
+			staleResult.resolve("x".repeat(12_001));
+			await formattingStarted.promise;
+			// The callback has passed its initial suppression check and is now
+			// awaiting artifact formatting. Acknowledgement suppresses the job
+			// before the callback can enqueue its async-result entry.
+			manager.acknowledgeDeliveries([staleJobId]);
+
+			const liveResult = Promise.withResolvers<string>();
+			const liveJobId = manager.register("task", "live job", async () => liveResult.promise);
+			const liveJob = manager.getJob(liveJobId);
+			if (!liveJob) throw new Error("Expected the live job to be registered");
+			liveRegistration = {
+				endpointId,
+				endpointGeneration: 0,
+				lineageIdHash: "live-lineage",
+				promptAttemptEpoch: 2,
+				jobId: liveJob.id,
+				jobGeneration: liveJob.generation,
+			};
+			registerOwnedRegistration(liveRegistration);
+
+			releaseFormatting.resolve({});
+			await waitUntil(
+				() =>
+					created!.session.yieldQueue.has("async-result") &&
+					manager.getDeliveryState().pendingJobIds.includes(staleJobId),
+				"stale completion to enqueue with its retained claim",
+			);
+			await created.session.yieldQueue.flush("streaming");
+
+			expect(manager.getDeliveryState().pendingJobIds).not.toContain(staleJobId);
+			expect(lookupOwnedRegistration(staleJob.id, staleJob.generation, endpointId)).toBeUndefined();
+			expect(lookupOwnedRegistration(liveJob.id, liveJob.generation, endpointId)).toEqual(liveRegistration);
+			expect(manager.getJob(liveJob.id)?.status).toBe("running");
+			liveResult.resolve("settle live job");
+		} finally {
+			releaseFormatting.resolve({});
+			if (staleRegistration) {
+				const manager = AsyncJobManager.forEndpoint(staleRegistration.endpointId);
+				if (manager) manager.acknowledgeDeliveries([staleRegistration.jobId]);
+			}
+			if (created) await created.session.dispose();
+			authStorage.close();
+			tempDir.removeSync();
+		}
 	});
 });
 
