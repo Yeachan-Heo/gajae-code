@@ -1032,8 +1032,6 @@ function validateResolutionAnchors(
 			!message.content.includes(resolution) ||
 			!hasVerbatimTokenBoundaries(message.content, quote) ||
 			!hasVerbatimTokenBoundaries(message.content, resolution) ||
-			!hasVerbatimTokenBoundaries(message.content, quote) ||
-			!hasVerbatimTokenBoundaries(message.content, resolution) ||
 			hasLaterSupersedingCorrection(message.content, quote, resolution) ||
 			hasLaterSupersedingCorrection(message.content, resolution, resolution) ||
 			unsafeResolution ||
@@ -1137,6 +1135,8 @@ function validateRemovalAnchors(
 			containsNonTextMarker(message.content) ||
 			!message.content.includes(quote) ||
 			!message.content.includes(resolution) ||
+			!hasVerbatimTokenBoundaries(message.content, quote) ||
+			!hasVerbatimTokenBoundaries(message.content, resolution) ||
 			resolution === previous.statement ||
 			!removalLanguage ||
 			competingKeepDirective ||
