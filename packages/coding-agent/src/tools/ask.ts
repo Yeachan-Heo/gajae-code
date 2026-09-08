@@ -44,6 +44,7 @@ import {
 import {
 	recordDeepInterviewExecutionApproval,
 	revokeDeepInterviewExecutionApproval,
+	runNativeStateCommand,
 } from "../gjc-runtime/state-runtime";
 import {
 	type AskGateQuestion,
@@ -881,14 +882,16 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 		customInput: string | undefined,
 		executionGateId?: string,
 	): Promise<void> {
-		if (q.workflowGate?.stage !== "deep-interview" || q.workflowGate.kind !== "execution") return;
-		const sessionId = this.session.getSessionId?.();
-		if (!sessionId) throw new ToolAbortError("Deep Interview execution approval requires a session");
+		const deepInterviewExecution = q.workflowGate?.stage === "deep-interview" && q.workflowGate.kind === "execution";
+		const ralplanApproval = q.workflowGate?.stage === "ralplan" && q.workflowGate.kind === "approval";
+		if (!deepInterviewExecution && !ralplanApproval) return;
 		const target = deepInterviewExecutionTarget(selectedOptions);
+		const sessionId = this.session.getSessionId?.();
 		if (!target || customInput !== undefined) {
-			await revokeDeepInterviewExecutionApproval(this.session.cwd, sessionId);
+			if (sessionId) await revokeDeepInterviewExecutionApproval(this.session.cwd, sessionId);
 			return;
 		}
+		if (!sessionId) throw new ToolAbortError("Deep Interview execution approval requires a session");
 		await recordDeepInterviewExecutionApproval({
 			cwd: this.session.cwd,
 			sessionId,
@@ -896,7 +899,16 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 			gateId: executionGateId ?? q.id,
 			target,
 			selectedOptions,
+			approvalStage: ralplanApproval ? "ralplan" : "deep-interview",
 		});
+		if (ralplanApproval) {
+			const result = await runNativeStateCommand(
+				["approve-execution", "--mode", "deep-interview", "--session-id", sessionId, "--json"],
+				this.session.cwd,
+			);
+			if (result.status !== 0)
+				throw new ToolAbortError(result.stderr?.trim() || "Ralplan execution approval could not be persisted");
+		}
 	}
 
 	async execute(
