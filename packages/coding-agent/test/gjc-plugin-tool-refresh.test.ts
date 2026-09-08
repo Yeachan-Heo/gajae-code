@@ -196,6 +196,11 @@ export default factory;
 		expect(session.getAllToolNames()).not.toContain("domain_note");
 		expect(session.getActiveToolNames()).not.toContain("domain_note");
 		expect(session.getActiveToolNames()).toEqual(["read", "bash"]);
+
+		await activateSubskill([toolPath], "planner");
+		await session.refreshGjcSubskillTools();
+		expect(session.getAllToolNames()).toContain("domain_note");
+		expect(session.getActiveToolNames()).toContain("domain_note");
 	});
 
 	test("rejects sub-skill tools whose names conflict with existing tools", async () => {
