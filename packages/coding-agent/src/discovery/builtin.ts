@@ -34,6 +34,7 @@ import {
 	getReadOptions,
 	getUserSkillScanDirs,
 	loadFilesFromDir,
+	readContainedFile,
 	SOURCE_PATHS,
 	scanSkillsFromDir,
 } from "./helpers";
@@ -286,9 +287,10 @@ registerProvider<MCPServer>(mcpCapability.id, {
 async function loadSystemPrompt(ctx: LoadContext): Promise<LoadResult<SystemPrompt>> {
 	const items: SystemPrompt[] = [];
 
-	const userPath = await canonicalBuiltinPath(ctx, path.join(resolveUserAgentDir(ctx), "SYSTEM.md"), "native");
-	const userContent = userPath ? await readBuiltinFile(ctx, userPath, "native") : null;
-	if (userContent && userPath) {
+	const userAgentDir = resolveUserAgentDir(ctx);
+	const userPath = path.join(userAgentDir, "SYSTEM.md");
+	const userContent = await readContainedFile(userAgentDir, userPath);
+	if (userContent) {
 		items.push({
 			path: userPath,
 			content: userContent,
@@ -462,9 +464,12 @@ async function loadStickyRulesFile(
 	level: "user" | "project",
 ): Promise<Rule | null> {
 	const scope = readScopeForLevel(level);
-	const canonicalPath = await canonicalBuiltinPath(ctx, filePath, scope);
+	const canonicalPath = level === "user" ? filePath : await canonicalBuiltinPath(ctx, filePath, scope);
 	if (!canonicalPath) return null;
-	const content = await readBuiltinFile(ctx, canonicalPath, scope);
+	const content =
+		level === "user"
+			? await readContainedFile(path.dirname(filePath), filePath)
+			: await readBuiltinFile(ctx, canonicalPath, scope);
 	if (!content) return null;
 	const source = createSourceMeta(PROVIDER_ID, canonicalPath, level);
 	const rule = buildRuleFromMarkdown("RULES.md", content, canonicalPath, source, { ruleName: "RULES" });
@@ -1025,9 +1030,10 @@ async function loadContextFiles(ctx: LoadContext): Promise<LoadResult<ContextFil
 	const items: ContextFile[] = [];
 	const warnings: string[] = [];
 
-	const userPath = await canonicalBuiltinPath(ctx, path.join(resolveUserAgentDir(ctx), "AGENTS.md"), "native");
-	const userContent = userPath ? await readBuiltinFile(ctx, userPath, "native") : null;
-	if (userContent && userPath) {
+	const userAgentDir = resolveUserAgentDir(ctx);
+	const userPath = path.join(userAgentDir, "AGENTS.md");
+	const userContent = await readContainedFile(userAgentDir, userPath);
+	if (userContent) {
 		items.push({
 			path: userPath,
 			content: userContent,
