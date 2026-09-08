@@ -41,7 +41,10 @@ import {
 	assertDeepInterviewStructuredResponseWithinLimit,
 	MAX_USER_RESPONSE_LENGTH,
 } from "../gjc-runtime/deep-interview-state";
-import { recordDeepInterviewExecutionApproval } from "../gjc-runtime/state-runtime";
+import {
+	recordDeepInterviewExecutionApproval,
+	revokeDeepInterviewExecutionApproval,
+} from "../gjc-runtime/state-runtime";
 import {
 	type AskGateQuestion,
 	gateAnswerToResult,
@@ -877,10 +880,13 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 		executionGateId?: string,
 	): Promise<void> {
 		if (q.workflowGate?.stage !== "deep-interview" || q.workflowGate.kind !== "execution") return;
-		const target = deepInterviewExecutionTarget(selectedOptions);
-		if (!target || customInput !== undefined) return;
 		const sessionId = this.session.getSessionId?.();
 		if (!sessionId) throw new ToolAbortError("Deep Interview execution approval requires a session");
+		const target = deepInterviewExecutionTarget(selectedOptions);
+		if (!target || customInput !== undefined) {
+			await revokeDeepInterviewExecutionApproval(this.session.cwd, sessionId);
+			return;
+		}
 		await recordDeepInterviewExecutionApproval({
 			cwd: this.session.cwd,
 			sessionId,
