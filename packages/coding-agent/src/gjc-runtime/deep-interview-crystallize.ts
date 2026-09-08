@@ -657,7 +657,9 @@ function validateItems(value: unknown, snapshot?: CrystalSnapshot): CrystalItem[
 				const conjunctiveQuote = /\b(?:and|plus|as\s+well\s+as)\b/i.test(item.anchor.quote);
 				const statementSemantics = semanticProfile(item.statement);
 				const quoteSemantics = semanticProfile(anchoredClause(anchorMessage.content, item.anchor.quote));
-				const quoteClauses = item.anchor.quote.split(/(?:[!?。！？;]|\.(?=\s|$)|\n)+\s*/u).filter(Boolean);
+				const quoteClauses = anchoredClause(anchorMessage.content, item.anchor.quote)
+					.split(/(?:[!?。！？;]|\.(?=\s|$)|\n)+\s*/u)
+					.filter(Boolean);
 				const mixedClausePolarity =
 					quoteClauses.length > 1 &&
 					new Set(quoteClauses.map(clause => semanticProfile(clause).negative)).size > 1;
@@ -984,7 +986,10 @@ function validateResolutionAnchors(
 		const conflict = field === "resolved_conflict_anchors";
 		const itemTerms = topicTerms(item, conflict);
 		const resolutionTerms = evidenceTerms(resolution);
-		const conciseAnswer = /^(?:yes|no|on|off|true|false)[.!]?$/i.test(resolution.trim());
+		const conciseAnswer =
+			/^(?:yes|no|on|off|true|false)[.!]?$/i.test(resolution.trim()) &&
+			(/^(?:should|is|are|can|could|do|does|did|will|would)\b/i.test(item.trim()) ||
+				/\b(?:enabled|disabled|enable|disable|allowed|permitted|required|needed)\b/i.test(item));
 		const addressesItem =
 			(itemTerms.size > 0 && [...itemTerms].every(term => resolutionTerms.has(term))) ||
 			hasCjkTopicOverlap(item, resolution) ||
@@ -1346,7 +1351,9 @@ export function crystallizeDeepInterview(value: unknown): DeepInterviewCrystal {
 					return (
 						candidate.anchor.message_index > priorEnd &&
 						message?.role === "user" &&
-						/\b(?:actually|instead|rather|switch|change|replace)\b/i.test(message.content) &&
+						/\b(?:actually\s+use|instead\s+use|switch|change|replace)\b/i.test(candidate.anchor.quote) &&
+						/\buse\b/i.test(previous.statement) &&
+						/\buse\b/i.test(candidate.statement) &&
 						[...topicTerms(previous.statement, false)].some(term => evidenceTerms(candidate.statement).has(term))
 					);
 				}),
