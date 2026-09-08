@@ -2638,7 +2638,12 @@ async function assertDeepInterviewHandoffReady(
 	let content: string | undefined;
 	if (specPath) {
 		try {
-			content = await fs.readFile(specPath, "utf-8");
+			content = await readBoundedIdentityText(
+				specPath,
+				MAX_DEEP_INTERVIEW_STRUCTURED_RESPONSE_LENGTH * 4 + 1,
+				"persisted deep-interview spec",
+			);
+			if (content === undefined) throw new Error("persisted spec is unavailable");
 		} catch (error) {
 			throw new StateCommandError(
 				2,
