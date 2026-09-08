@@ -2996,6 +2996,26 @@ describe("AskTool deep-interview recorder persistence", () => {
 			questionId: "deep-interview-execution",
 			target: "ultragoal",
 		});
+		record.mockClear();
+		const documentedLabel =
+			"Execute with ultragoal (only when spec is already implementation-ready and really simple)";
+		await new AskTool(
+			createSession({ cwd: "/tmp/approval-documented", getSessionId: () => "approval-documented" }),
+		).execute(
+			"documented-execution-choice",
+			{
+				questions: [
+					{
+						...question,
+						options: [{ label: documentedLabel }, { label: "Stop here" }],
+					},
+				],
+			},
+			undefined,
+			undefined,
+			createContext({ select: async () => documentedLabel }),
+		);
+		expect(record).toHaveBeenCalledTimes(1);
 
 		await new AskTool(
 			createSession({ cwd: "/tmp/approval-decline", getSessionId: () => "approval-decline" }),
