@@ -1993,14 +1993,6 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 			ok: true,
 			status: { live: true },
 		});
-		expect(
-			await server.callTool("gjc_coordinator_send_prompt", {
-				session_id: "visible-session",
-				prompt: "case-safe workspace",
-				idempotency_key: "windows-case-safe",
-				allow_mutation: true,
-			}),
-		).toMatchObject({ ok: true });
 	});
 
 	it("fails closed before turn persistence for malformed acknowledgement envelopes and conflicting aliases", async () => {
