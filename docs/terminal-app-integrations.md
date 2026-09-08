@@ -103,6 +103,12 @@ ACP attachments require the host's `runtime.capabilities` response to include th
 provenance; restart an older host before attaching so ownership is never inferred from an incomplete
 capability response.
 
+That boundary is observable. Closing a CLI-primary session from the editor ends your attachment —
+providers, subscriptions and any in-flight turn are released — while the terminal session itself keeps
+running; a prompt sent afterwards fails instead of reaching the host. Deleting one is refused rather
+than silently ignored, because the deletion would never happen. Close and delete the session from its
+own terminal, or from the client that started it.
+
 ### Lifecycle: GJC creates, you delete
 
 GJC adds one Paseo entry per new session and never deletes or rewrites it. `gjc -c` preserves the
