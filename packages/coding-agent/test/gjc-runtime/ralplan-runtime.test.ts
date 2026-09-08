@@ -1694,7 +1694,15 @@ describe("native gjc ralplan runtime — persisted role-agent state", () => {
 });
 
 describe("native gjc ralplan runtime — post-clear re-activation (#644)", () => {
-	const readState = async (root: string): Promise<{ active?: unknown; current_phase?: unknown; run_id?: unknown }> => {
+	const readState = async (
+		root: string,
+	): Promise<{
+		active?: unknown;
+		current_phase?: unknown;
+		run_id?: unknown;
+		handoff_from?: unknown;
+		handoff_at?: unknown;
+	}> => {
 		const raw = await fs.readFile(ralplanStatePath(root), "utf-8");
 		return JSON.parse(raw);
 	};
@@ -1707,7 +1715,17 @@ describe("native gjc ralplan runtime — post-clear re-activation (#644)", () =>
 		expect(seeded.active).toBe(true);
 
 		// Simulate `gjc state ralplan clear`: active -> false, phase -> complete.
-		await fs.writeFile(statePath, JSON.stringify({ ...seeded, active: false, current_phase: "complete" }), "utf-8");
+		await fs.writeFile(
+			statePath,
+			JSON.stringify({
+				...seeded,
+				active: false,
+				current_phase: "complete",
+				handoff_from: "deep-interview",
+				handoff_at: "2026-01-01T00:00:00.000Z",
+			}),
+			"utf-8",
+		);
 
 		// A subsequent --write with a NEW run_id starts a fresh run and must re-arm the skill.
 		const result = await runNativeRalplanCommand(
@@ -1720,6 +1738,8 @@ describe("native gjc ralplan runtime — post-clear re-activation (#644)", () =>
 		expect(after.run_id).toBe("new-run-after-clear");
 		expect(after.active).toBe(true);
 		expect(after.current_phase).toBe("planner");
+		expect(after.handoff_from).toBeUndefined();
+		expect(after.handoff_at).toBeUndefined();
 	});
 
 	it("re-asserts active:true on a same-run continuation write at the current phase", async () => {
