@@ -1364,6 +1364,12 @@ export function crystallizeDeepInterview(value: unknown): DeepInterviewCrystal {
 		const message = anchor
 			? snapshot.messages.find(candidate => candidate.index === anchor.message_index)
 			: undefined;
+		const keepClause =
+			anchor && message
+				? (anchoredClause(message.content, anchor.quote)
+						.split(/[,，、]/u)
+						.find(clause => clause.includes(anchor.quote)) ?? anchoredClause(message.content, anchor.quote))
+				: "";
 		return Boolean(
 			submitted?.classification === "confirmed" &&
 				previous &&
@@ -1372,10 +1378,10 @@ export function crystallizeDeepInterview(value: unknown): DeepInterviewCrystal {
 				anchor.message_index > priorEnd &&
 				message.content.includes(anchor.quote) &&
 				hasVerbatimTokenBoundaries(message.content, anchor.quote) &&
-				(/\b(?:keep|retain|restore|preserve|maintain)\b/i.test(anchoredClause(message.content, anchor.quote)) ||
-					/(?:유지|보존|복원|保持|保留|恢复|恢復|復元)/u.test(anchoredClause(message.content, anchor.quote))) &&
-				([...topicTerms(previous.statement, false)].some(term => evidenceTerms(anchor.quote).has(term)) ||
-					hasCjkTopicOverlap(previous.statement, anchor.quote)),
+				(/\b(?:keep|retain|restore|preserve|maintain)\b/i.test(keepClause) ||
+					/(?:유지|보존|복원|保持|保留|恢复|恢復|復元)/u.test(keepClause)) &&
+				([...topicTerms(previous.statement, false)].some(term => evidenceTerms(keepClause).has(term)) ||
+					hasCjkTopicOverlap(previous.statement, keepClause)),
 		);
 	});
 	const unresolvedRemovalIds = [
@@ -1475,6 +1481,7 @@ export function crystallizeDeepInterview(value: unknown): DeepInterviewCrystal {
 				replacement !== undefined &&
 				!sameIntent(replacement, previous) &&
 				replacement.anchor !== undefined &&
+				directive.messageIndex < replacement.anchor.message_index &&
 				/\b(?:actually|instead|rather|replace|replaced|no longer|not)\b/i.test(replacement.anchor.quote) &&
 				[...directiveTerms].every(term => evidenceTerms(previous.statement).has(term))
 			);
