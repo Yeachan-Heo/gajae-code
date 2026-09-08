@@ -870,7 +870,10 @@ function caseSensitiveIdentifierTerms(value: string): Set<string> {
 	return new Set(
 		[...value.normalize("NFC").matchAll(/\b[A-Za-z][A-Za-z0-9_]*\b/g)]
 			.map(match => match[0])
-			.filter(term => term.includes("_") || (term.length > 1 && term === term.toUpperCase())),
+			.filter(
+				term =>
+					term.includes("_") || (term.length > 1 && term === term.toUpperCase()) || /[a-z0-9][A-Z]/.test(term),
+			),
 	);
 }
 
@@ -880,9 +883,15 @@ function requirementBearingClauses(snapshot: CrystalSnapshot): Array<{ messageIn
 		if (message.role !== "user") continue;
 		for (const raw of message.content.split(/(?:[!?。！？;]|\.(?=\s|$)|\n)+\s*/u)) {
 			const clause = raw.trim();
-			if (!clause || /["“”]/u.test(clause) || /^(?:what|why|how|when|where|who|which)\b/i.test(clause)) continue;
 			if (
-				/\b(?:build|create|make|support|encrypt|decrypt|use|set|keep|retain|remove|delete|limit|allow|deny|require|requires|required|must|should|need|needs|want|wants|will|shall|only|never|do\s+not|don't|dont)\b/i.test(
+				!clause ||
+				/^(?:what|why|how|when|where|who|which)\b/i.test(clause) ||
+				/\b(?:asked|said|wrote|reported)\b[^"“”]*["“”]/i.test(clause) ||
+				/^(?:no further changes|nothing else|thanks|thank you)\b/i.test(clause)
+			)
+				continue;
+			if (
+				/\b(?:build|create|implement|configure|deploy|publish|make|support|supports|encrypt|decrypt|rotate|store|send|expose|use|choose|prefer|switch|set|keep|retain|remove|delete|limit|allow|deny|require|requires|required|must|should|need|needs|want|wants|will|shall|only|never|do\s+not|don't|dont)\b/i.test(
 					clause,
 				)
 			)
@@ -1467,15 +1476,12 @@ export function crystallizeDeepInterview(value: unknown): DeepInterviewCrystal {
 				anchor.message_index === directive.messageIndex &&
 				(directive.clause.includes(quote) ||
 					directive.clause.includes(resolution) ||
-					[...directiveTerms].some(term => resolutionTerms.has(term)))
+					[...directiveTerms].every(term => resolutionTerms.has(term)))
 			);
 		});
 		const unresolved = [...gaps, ...conflicts].some(item => {
 			const clauseTerms = evidenceTerms(directive.clause);
-			return (
-				[...topicTerms(item, false)].some(term => clauseTerms.has(term)) ||
-				hasCjkTopicOverlap(item, directive.clause)
-			);
+			return [...directiveTerms].every(term => clauseTerms.has(term)) || hasCjkTopicOverlap(item, directive.clause);
 		});
 		if (!represented && !representedRemoval && !unresolved)
 			throw new Error(`unrepresented user directive requires an item or unresolved gap: ${directive.clause}`);
