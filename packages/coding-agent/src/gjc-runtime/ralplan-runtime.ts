@@ -1592,6 +1592,8 @@ async function markRalplanFinalPublicationPending(
 			if (existingRead.kind === "corrupt")
 				throw new RalplanCommandError(2, `existing ralplan state is corrupt or tampered (${existingRead.error})`);
 			let existing: Record<string, unknown> = existingRead.kind === "valid" ? existingRead.value : {};
+			if (existing.run_id === runId && existing.active === false && existing.current_phase === "handoff")
+				throw new RalplanCommandError(2, "cannot publish a new final after the Ralplan run has handed off");
 			if (existing.run_id !== runId) {
 				delete existing.planning_stuck;
 				delete existing.auto_handoff;

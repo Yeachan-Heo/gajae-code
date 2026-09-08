@@ -477,9 +477,10 @@ function semanticProfile(value: string): CrystalSemanticProfile {
 		/\b(?:what|which|when|where|why|how|whether|do|does|did|is|are|can|could|should|would|will)\b[^.!。！？]*[?？]/iu.test(
 			normalized,
 		) ||
-		/(?:吗|嗎|呢|か|かな|나요|습니까|습니까|인가요|인가|ㄹ까요|을까요|까요|궁금|어떻게|무엇|무엇을|왜|언제|어디|얼마|몇|多少|什么|什麼|哪个|哪個|为何|為何|怎么|怎麼|如何|何时|何時|哪里|哪裡|是否|疑問|かどうか)/u.test(
+		/(?:吗|嗎|呢|나요|습니까|습니까|인가요|인가|ㄹ까요|을까요|까요|궁금|어떻게|무엇|무엇을|왜|언제|어디|얼마|몇|多少|什么|什麼|哪个|哪個|为何|為何|怎么|怎麼|如何|何时|何時|哪里|哪裡|是否|疑問|かどうか)/u.test(
 			normalized,
-		);
+		) ||
+		/(?:か|かな)(?:[?？。.!！]|$)/u.test(normalized);
 	const conditional =
 		/\b(?:if|unless|until|before|after|once|provided(?:\s+that)?|assuming|in\s+case|contingent|when|depending\s+on)\b/i.test(
 			normalized,
