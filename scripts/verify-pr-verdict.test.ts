@@ -627,6 +627,60 @@ describe("push preflight", () => {
 		expect(await child.exited).toBe(0);
 	});
 
+	test("derives the PR branch from the remote destination, not the local source ref", async () => {
+		const hook = await Bun.file(new URL("../.githooks/pre-push", import.meta.url)).text();
+		// `git push origin HEAD:refs/heads/feature` gives local_ref=HEAD, and a renamed
+		// refspec gives two different names; filtering on the local ref skips both.
+		expect(hook).toContain('[[ "$remote_ref" == refs/heads/* ]] || continue');
+		expect(hook).toContain('branch="${remote_ref#refs/heads/}"');
+		expect(hook).not.toContain('[[ "$local_ref" == refs/heads/* ]]');
+		// The pushed object, not the resolved remote branch tip, is the commit validated.
+		expect(hook).toContain('--push-preflight "$branch" "$local_sha"');
+		// The receiving remote is forwarded so the PR is looked up in the right repository.
+		expect(hook).toContain('--push-remote "$remote"');
+	});
+
+	test("binds PR lookup and base resolution to the receiving repository", async () => {
+		const source = await Bun.file(new URL("./verify-pr-verdict.ts", import.meta.url)).text();
+		const pushPreflight = source.slice(source.indexOf("async function validatePushPreflight"));
+		// An implicit gh context resolves a fork checkout to the fork, where the upstream PR
+		// does not exist -- the empty result would then wave the push through.
+		expect(pushPreflight).toContain('"--repo", baseRepo');
+		expect(pushPreflight).not.toContain('git(["fetch", "--no-tags", "origin", "dev"]');
+		expect(pushPreflight).not.toContain('rev-parse", "origin/dev"');
+		// The base is the PR's own base ref in the contract repository, never an assumed dev.
+		expect(pushPreflight).toContain("pr.baseRefName], cwd)");
+		// A same-named branch in another fork must not be mistaken for this PR.
+		expect(pushPreflight).toContain("headRepositoryOwner?.login?.toLowerCase() === headOwner.toLowerCase()");
+		// Ambiguity fails closed rather than guessing which contract governs the push.
+		expect(pushPreflight).toContain("cannot determine which contract governs this push");
+	});
+
+	test("resolves the GitHub repository from every supported remote URL form", async () => {
+		const source = await Bun.file(new URL("./verify-pr-verdict.ts", import.meta.url)).text();
+		const pattern = /const match = (\/.+\/u)\.exec\(text\);/u.exec(source.slice(source.indexOf("async function pushRemoteRepository")));
+		expect(pattern).not.toBeNull();
+		const remoteUrl = new RegExp(pattern![1]!.slice(1, -2), "u");
+		const resolve = (url: string): string | null => {
+			const match = remoteUrl.exec(url);
+			return match ? `${match[1]}/${match[2]}` : null;
+		};
+		expect(resolve("git@github.com:Yeachan-Heo/gajae-code.git")).toBe("Yeachan-Heo/gajae-code");
+		expect(resolve("https://github.com/Yeachan-Heo/gajae-code.git")).toBe("Yeachan-Heo/gajae-code");
+		expect(resolve("https://github.com/probepark/gajae-code")).toBe("probepark/gajae-code");
+		expect(resolve("ssh://git@github.com/Yeachan-Heo/gajae-code.git")).toBe("Yeachan-Heo/gajae-code");
+	});
+
+	test("a fork push resolves the contract to the upstream parent repository", async () => {
+		const source = await Bun.file(new URL("./verify-pr-verdict.ts", import.meta.url)).text();
+		const resolver = source.slice(source.indexOf("async function contractRepository"));
+		// A fork's PR lives upstream, so the parent owns the contract; the head stays
+		// qualified by the fork owner that actually receives the push.
+		expect(resolver).toContain('"isFork,parent"');
+		expect(resolver).toContain("return { repo: `${parentOwner}/${parentName}`, forkOwner: pushRepo.split(\"/\")[0]! };");
+		expect(resolver).toContain("if (!info.isFork || !parentOwner || !parentName) return { repo: pushRepo, forkOwner: null };");
+	});
+
 	test("mirrors the Dev CI bootstrap job, which has no requireMergeApproved escape hatch", async () => {
 		const source = await Bun.file(new URL("./verify-pr-verdict.ts", import.meta.url)).text();
 		const pushPreflight = source.slice(source.indexOf("async function validatePushPreflight"));

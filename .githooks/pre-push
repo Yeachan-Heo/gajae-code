@@ -2,9 +2,10 @@
 # Exact-head PR contract preflight (issue: red "PR contract bootstrap" runs).
 #
 # git feeds "<local-ref> <local-sha> <remote-ref> <remote-sha>" on stdin for every ref
-# being pushed. For each branch push with a real commit, validate the commit that is
-# about to become the PR head against the live PR body, so a stale verdict digest or an
-# unrebased base fails here instead of in CI.
+# being pushed. The PR identity is the REMOTE destination, not the local source: for
+# `git push origin HEAD:refs/heads/feature` the local ref is bare `HEAD`, and for a
+# renamed refspec the two names differ. So branch is derived from <remote-ref> while
+# <local-sha> stays the commit under validation.
 #
 # Install: git config core.hooksPath .githooks   (or: bun run install:dev)
 # Bypass:  GJC_SKIP_PR_PREFLIGHT=1 git push      (or: git push --no-verify)
@@ -15,15 +16,18 @@ if [[ -n "${GJC_SKIP_PR_PREFLIGHT:-}" ]]; then
 fi
 
 repo_root="$(git rev-parse --show-toplevel)"
+remote="${1:-origin}"
 zero="0000000000000000000000000000000000000000"
 status=0
 
-while read -r local_ref local_sha _remote_ref _remote_sha; do
+while read -r _local_ref local_sha remote_ref _remote_sha; do
+	# A zero local sha is a branch deletion: no head to validate.
 	[[ "$local_sha" == "$zero" ]] && continue
-	[[ "$local_ref" == refs/heads/* ]] || continue
-	branch="${local_ref#refs/heads/}"
+	# Only branch destinations carry a PR; tags and notes never do.
+	[[ "$remote_ref" == refs/heads/* ]] || continue
+	branch="${remote_ref#refs/heads/}"
 	[[ "$branch" == "dev" || "$branch" == "main" ]] && continue
-	if ! bun "$repo_root/scripts/verify-pr-verdict.ts" --push-preflight "$branch" "$local_sha" --repo "$repo_root" --trusted-root "$repo_root"; then
+	if ! bun "$repo_root/scripts/verify-pr-verdict.ts" --push-preflight "$branch" "$local_sha" --push-remote "$remote" --repo "$repo_root" --trusted-root "$repo_root"; then
 		status=1
 	fi
 done
