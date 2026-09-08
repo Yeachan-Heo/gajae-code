@@ -1517,6 +1517,8 @@ export interface SettingsCallbacks {
 	 * candidate could not be loaded, leaving the submenu open.
 	 */
 	onThemeCommit?: (path: "theme.dark" | "theme.light", theme: string, previousTheme: string) => Promise<boolean>;
+	/** Persist and apply reasoning effort through the session's recovery-aware control transaction. */
+	onThinkingLevelCommit?: (level: ThinkingLevelValue) => Promise<boolean>;
 	/** Called to live-preview the gajae pet skin while browsing the pet setting. */
 	onPetPreview?: (mode: string) => void;
 	/**
@@ -1937,6 +1939,13 @@ export class SettingsSelectorComponent extends Container {
 					}
 					if (!this.callbacks.onThemeCommit) return;
 					void this.callbacks.onThemeCommit(def.path, value, currentValue).then(accepted => {
+						if (accepted) done(value);
+					});
+					return;
+				}
+				if (def.path === "defaultThinkingLevel") {
+					if (!this.callbacks.onThinkingLevelCommit) return;
+					void this.callbacks.onThinkingLevelCommit(value as ThinkingLevelValue).then(accepted => {
 						if (accepted) done(value);
 					});
 					return;

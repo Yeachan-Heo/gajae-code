@@ -14,6 +14,7 @@ import {
 	matchesGuardedStateWriteReceipt,
 	readActiveEntries,
 	rebuildActiveSnapshot,
+	restoreActiveEntryIfOwned,
 	writeActiveEntry,
 	writeGuardedJsonAtomic,
 	writeGuardedWorkflowEnvelopeAtomic,
@@ -589,12 +590,58 @@ export async function ensureWorkflowSkillActivationSeed(
 	if (!isGjcWorkflowSkill(skill)) return { state: null, seeded: false, rollback: noRollback };
 	const resolvedSessionId = await resolveBoundarySessionId(input.cwd, input.sessionId);
 	const existing = await readVisibleSkillActiveState(input.cwd, resolvedSessionId, input.stateDir);
-	const alreadyActive = listActiveSkills(existing).some(
+	const existingEntry = listActiveSkills(existing).find(
 		entry =>
 			entry.skill === skill &&
 			(existing ? entryMatchesContext(entry, existing, resolvedSessionId, input.threadId) : true),
 	);
-	if (alreadyActive) return { state: existing, seeded: false, rollback: noRollback };
+	if (existingEntry) {
+		if (!input.activeSubskills?.length || Bun.deepEquals(existingEntry.active_subskills, input.activeSubskills)) {
+			return { state: existing, seeded: false, rollback: noRollback };
+		}
+		const mergedResult = await writeActiveEntry(
+			input.cwd,
+			{ sessionId: resolvedSessionId },
+			skill,
+			{
+				...existingEntry,
+				active_subskills: input.activeSubskills,
+				updated_at: input.nowIso ?? new Date().toISOString(),
+			},
+			{
+				cwd: input.cwd,
+				sourceRevision:
+					((existingEntry as SkillActiveEntry & { source_state_revision?: number }).source_state_revision ?? 0) +
+					1,
+			},
+		);
+		const mergedWrite = guardedStateWriteReceipt(mergedResult);
+		if (!mergedWrite) throw new Error(`Workflow subskill activation write was not persisted: ${skill}`);
+		const rollback = async (): Promise<boolean> => {
+			const restored = await restoreActiveEntryIfOwned(input.cwd, mergedWrite, existingEntry);
+			if (!restored) return false;
+			await rebuildActiveSnapshot(input.cwd, { sessionId: resolvedSessionId }, { cwd: input.cwd });
+			return true;
+		};
+		try {
+			await rebuildActiveSnapshot(input.cwd, { sessionId: resolvedSessionId }, { cwd: input.cwd });
+		} catch (error) {
+			await rollback();
+			throw error;
+		}
+		const mergedEntry = mergedWrite.stamped as SkillActiveEntry;
+		return {
+			state: existing
+				? {
+						...existing,
+						active_subskills: input.activeSubskills,
+						active_skills: listActiveSkills(existing).map(entry => (entry.skill === skill ? mergedEntry : entry)),
+					}
+				: null,
+			seeded: true,
+			rollback,
+		};
+	}
 	const seed = await seedSkillActivationState(skill, `/skill:${skill}`, "gjc-skill-invocation", {
 		cwd: input.cwd,
 		sessionId: resolvedSessionId,
