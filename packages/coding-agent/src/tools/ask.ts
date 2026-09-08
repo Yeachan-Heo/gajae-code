@@ -74,7 +74,7 @@ import {
 export { askSchema } from "./ask-contract";
 
 import { formatErrorMessage, formatMeta, formatTitle } from "./render-utils";
-import { ToolAbortError } from "./tool-errors";
+import { ToolAbortError, ToolError } from "./tool-errors";
 import { assertUltragoalAskAllowed } from "./ultragoal-ask-guard";
 
 // =============================================================================
@@ -1234,6 +1234,12 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 				details: {},
 			};
 		}
+		if (
+			params.questions.filter(
+				question => question.workflowGate?.stage === "deep-interview" && question.workflowGate.kind === "execution",
+			).length > 1
+		)
+			throw new ToolError("Ask accepts at most one Deep Interview execution gate per invocation");
 
 		const askQuestion = async (
 			q: AskParams["questions"][number],
