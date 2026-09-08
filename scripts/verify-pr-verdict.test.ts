@@ -627,6 +627,32 @@ describe("push preflight", () => {
 		expect(await child.exited).toBe(0);
 	});
 
+	test("mirrors the Dev CI bootstrap job, which has no requireMergeApproved escape hatch", async () => {
+		const source = await Bun.file(new URL("./verify-pr-verdict.ts", import.meta.url)).text();
+		const pushPreflight = source.slice(source.indexOf("async function validatePushPreflight"));
+		// The bootstrap job blocks needs-human/merge-blocked unconditionally, so a preflight
+		// that passed them locally would disagree with the very check it predicts.
+		expect(pushPreflight).toContain("requireMergeApproved: true");
+		expect(pushPreflight).not.toContain("requireMergeApproved: false");
+		// Mirroring the flag alone would fail a legitimately reviewed merge-approved PR, so
+		// the exact-head approval must be resolved from the same review data.
+		expect(pushPreflight).toContain("authenticatedReviewerLogin: approval.login");
+		expect(pushPreflight).toContain('review.state !== "COMMENTED"');
+		expect(pushPreflight).toContain("review.commit?.oid === headSha");
+	});
+
+	test("a blocking verdict fails the push exactly as the bootstrap job does", () => {
+		const body = approved.replace("merge-approved", "needs-human");
+		const blocked = validatePrContract(validInput({ body, requireMergeApproved: true }));
+		expect(blocked.ok).toBe(false);
+		expect(blocked.diagnostics.join("\n")).toContain("intentionally blocks merge");
+	});
+
+	test("an exact-head approved merge-approved PR still passes the push gate", () => {
+		const reviewed = validatePrContract(validInput({ requireMergeApproved: true }));
+		expect(reviewed.ok).toBe(true);
+	});
+
 	test("a non-commit push target fails closed", async () => {
 		const script = url.fileURLToPath(new URL("./verify-pr-verdict.ts", import.meta.url));
 		const repoRoot = url.fileURLToPath(new URL("..", import.meta.url));

@@ -718,21 +718,25 @@ interface LivePullRequest {
 	body: string | null;
 	baseRefName: string;
 	author: { login: string } | null;
+	reviews: { author: { login: string } | null; state: string; commit: { oid: string } | null }[];
 }
 
 /**
- * Pre-push gate: validate the exact commit about to be published against the live PR
- * body for `branch`, so a stale verdict digest, an unrebased base, a malformed verdict,
- * or a missing risk classification is caught locally instead of burning a red CI run.
+ * Reproduce the Dev CI "PR contract bootstrap" judgement for the exact commit being
+ * pushed. That job runs with NO requireMergeApproved escape hatch, so this gate must
+ * mirror it exactly (requireMergeApproved: true): a stale verdict digest, an unrebased
+ * base, a missing risk classification, AND a blocking verdict (needs-human,
+ * merge-blocked) all fail here, because all of them turn the required check red.
  *
- * Blocking verdicts (needs-human, merge-blocked) are NOT failures here: they are
- * legitimate pre-review states and only the server merge gate rejects them, exactly as
- * in the `gh pr create` preflight. A branch with no open PR has nothing to invalidate
- * and passes.
+ * A preflight that disagrees with CI is worthless, so the authenticated exact-head
+ * approval is resolved from the same GitHub review data the server reads; otherwise a
+ * legitimately reviewed merge-approved PR would fail locally while passing in CI.
+ *
+ * A branch with no open PR has no contract to invalidate and passes.
  */
 async function validatePushPreflight(branch: string, headSha: string, cwd: string, trustedRoot: string): Promise<PrValidationResult> {
 	if (!SHA40.test(headSha)) return { ok: false, diagnostics: [`Pushed commit ${headSha} is not a lowercase 40-hex commit.`] };
-	const listed = await gh(["pr", "list", "--head", branch, "--state", "open", "--json", "number,body,baseRefName,author"], cwd);
+	const listed = await gh(["pr", "list", "--head", branch, "--state", "open", "--json", "number,body,baseRefName,author,reviews"], cwd);
 	if (listed.exitCode !== 0) {
 		return { ok: false, diagnostics: [`Could not resolve the open PR for ${branch}: ${listed.stderr || `gh exited ${listed.exitCode}`}. Authenticate with gh auth login, or set GJC_SKIP_PR_PREFLIGHT=1 to push without the contract check.`] };
 	}
@@ -756,6 +760,20 @@ async function validatePushPreflight(branch: string, headSha: string, cwd: strin
 	if (diff.exitCode !== 0) return { ok: false, diagnostics: [`Could not compute the exact ${baseSha}...${headSha} diff: ${diff.stderr}`] };
 	const body = pr.body ?? "";
 	const bodyRiskParsed = parseBodyRisk(body);
+	// Latest non-COMMENTED review per identity on the exact head, matching the server's
+	// "effective review" semantics: a later CHANGES_REQUESTED supersedes an earlier APPROVED.
+	const parsedVerdict = parsePrVerdict(body).verdict;
+	const approval = ((): { login?: string; headSha?: string } => {
+		if (parsedVerdict?.verdict !== "merge-approved") return {};
+		const effective = (pr.reviews ?? [])
+			.filter(review =>
+				review.author?.login?.toLowerCase() === parsedVerdict.reviewerId.toLowerCase()
+				&& review.state !== "COMMENTED"
+				&& review.commit?.oid === headSha,
+			)
+			.at(-1);
+		return effective?.state === "APPROVED" ? { login: effective.author?.login, headSha: effective.commit?.oid } : {};
+	})();
 	const result = validatePrContract({
 		body,
 		baseRef: pr.baseRefName,
@@ -766,11 +784,14 @@ async function validatePushPreflight(branch: string, headSha: string, cwd: strin
 		baseIsAncestor: ancestry.exitCode === 0,
 		fastGatePassed: await runFastGate(cwd, trustedRoot),
 		bodyRisk: bodyRiskParsed.risk,
-		requireMergeApproved: false,
+		authenticatedReviewerLogin: approval.login,
+		authenticatedReviewHeadSha: approval.headSha,
+		requireMergeApproved: true,
 	});
 	const diagnostics = [...bodyRiskParsed.diagnostics, ...result.diagnostics];
 	if (diagnostics.length > 0) {
-		diagnostics.push(`Update PR #${pr.number} for exact head ${headSha} before pushing; the current ${baseSha}...${headSha} digest is ${canonicalDiffSha256(diff.stdout)}.`);
+		diagnostics.push(`This is exactly what the Dev CI "PR contract bootstrap" job will report for PR #${pr.number} at head ${headSha}; the current ${baseSha}...${headSha} digest is ${canonicalDiffSha256(diff.stdout)}.`);
+		diagnostics.push("Fix the PR body, or push anyway with GJC_SKIP_PR_PREFLIGHT=1 (or --no-verify) while the change is still awaiting review.");
 	}
 	return { ok: diagnostics.length === 0, verdict: result.verdict, diagnostics };
 }
