@@ -1650,6 +1650,16 @@ async function handleWrite(args: readonly string[], cwd: string): Promise<StateC
 					const evidence = await verifiedRalplanFinalEvidence(cwd, sessionId, existingPayload);
 					if (!evidence)
 						throw new StateCommandError(2, "Ralplan handoff phase requires verified final plan evidence");
+					if (
+						merged.run_id !== evidence.runId ||
+						createHash("sha256")
+							.update(JSON.stringify(merged.auto_handoff ?? null))
+							.digest("hex") !==
+							createHash("sha256")
+								.update(JSON.stringify(existingPayload.auto_handoff ?? null))
+								.digest("hex")
+					)
+						throw new StateCommandError(2, "Ralplan handoff phase cannot change final admission identity");
 					merged.final_admission_phase_transition = {
 						run_id: evidence.runId,
 						final_path: evidence.finalPath,
@@ -2934,6 +2944,7 @@ async function verifiedRalplanFinalEvidence(
 		return undefined;
 	}
 	let finalRow: Record<string, unknown> | undefined;
+	let planningStuck = false;
 	for (const line of indexText.split(/\r?\n/)) {
 		if (!line.trim()) continue;
 		let parsed: unknown;
@@ -2944,7 +2955,9 @@ async function verifiedRalplanFinalEvidence(
 		}
 		if (!isPlainObject(parsed)) return undefined;
 		if (parsed.stage === "final") finalRow = parsed;
+		if (parsed.planning_stuck === true || parsed.event === "planning_stuck") planningStuck = true;
 	}
+	if (planningStuck || isPlainObject(state.planning_stuck)) return undefined;
 	const indexedAdmission = isPlainObject(finalRow?.auto_handoff) ? finalRow.auto_handoff : undefined;
 	if (
 		!finalRow ||
@@ -3078,6 +3091,8 @@ async function assertDeepInterviewExecutionLineage(
 		const upstreamState = migrateWorkflowState(upstreamRead.value, upstream).state;
 		if (upstreamState.version !== WORKFLOW_STATE_VERSION)
 			throw new StateCommandError(2, "execution handoff requires current upstream workflow state version");
+		if (upstream === "ralplan" && !(await verifiedRalplanFinalEvidence(cwd, sessionId, upstreamState)))
+			throw new StateCommandError(2, "execution handoff cannot traverse a stuck or unverifiable Ralplan final");
 		if (upstream === "deep-interview") {
 			const currentLineageHandoffAt =
 				typeof currentState.upstream_handoff_at === "string"
