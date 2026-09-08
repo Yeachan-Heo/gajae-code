@@ -5244,7 +5244,7 @@ export class AgentSession {
 								this.#settleDeliveredOwnedRegistrations(survivors);
 								return "dropped" as const;
 							}
-							await this.#reconcileTurnEndPersistenceFailure();
+							if (this.#turnEndPersistenceFailure) await this.#reconcileTurnEndPersistenceFailure();
 							if (survivors.some(message => ownedCompletionResumeAction(message) === "fresh"))
 								this.#resumeFromOwnedCompletion();
 							if (survivors.length === 1) {
@@ -8886,7 +8886,7 @@ export class AgentSession {
 										return;
 									}
 									this.#assertNoSessionTransition();
-									await this.#reconcileTurnEndPersistenceFailure();
+									if (this.#turnEndPersistenceFailure) await this.#reconcileTurnEndPersistenceFailure();
 									this.#assertNoSessionTransition();
 									if (
 										this.sessionId !== scheduledSessionId ||
@@ -13547,7 +13547,7 @@ export class AgentSession {
 	async prompt(text: string, options?: PromptOptions): Promise<void> {
 		const releaseStartupPromptWaiter = this.#reserveStartupPromptWaiter();
 		try {
-			await this.#reconcileTurnEndPersistenceFailure();
+			if (this.#turnEndPersistenceFailure) await this.#reconcileTurnEndPersistenceFailure();
 			await this.#promptInternal(text, options, releaseStartupPromptWaiter);
 			if (this.#turnEndPersistenceFailure) throw this.#turnEndPersistenceFailure.error;
 			// Agent-core converts listener failures into an aborted response. Keep a
@@ -17493,7 +17493,7 @@ export class AgentSession {
 		if (!lease) {
 			this.#disconnectFromAgent();
 			await this.abort();
-			await this.#reconcileTurnEndPersistenceFailure();
+			if (this.#turnEndPersistenceFailure) await this.#reconcileTurnEndPersistenceFailure();
 			this.#externalIngressSealed = true;
 			if (this.isCompacting) {
 				this.abortCompaction();
@@ -17552,7 +17552,7 @@ export class AgentSession {
 			try {
 				manager.runOwnerProducerCleanupsStrict({ ownerId });
 				await this.abort();
-				await this.#reconcileTurnEndPersistenceFailure();
+				if (this.#turnEndPersistenceFailure) await this.#reconcileTurnEndPersistenceFailure();
 				this.#externalIngressSealed = true;
 				if (this.isCompacting) {
 					this.abortCompaction();
@@ -17730,7 +17730,7 @@ export class AgentSession {
 				await this.abort();
 				await Promise.allSettled([...this.#autoCompactionCompletions]);
 			}
-			await this.#reconcileTurnEndPersistenceFailure();
+			if (this.#turnEndPersistenceFailure) await this.#reconcileTurnEndPersistenceFailure();
 			this.#cancelOwnAsyncJobs();
 			this.#suppressOwnAsyncJobDeliveries();
 			this.yieldQueue.clear();
@@ -17799,7 +17799,7 @@ export class AgentSession {
 			}
 			if (this.isStreaming) await this.abort();
 			await this.awaitSessionSettlement();
-			await this.#reconcileTurnEndPersistenceFailure();
+			if (this.#turnEndPersistenceFailure) await this.#reconcileTurnEndPersistenceFailure();
 			if (this.isCompacting) {
 				this.abortCompaction();
 				while (this.isCompacting) await Bun.sleep(10);
@@ -20041,7 +20041,7 @@ export class AgentSession {
 				throw error;
 			}
 			await this.#waitForAutoCompactionCompletions();
-			await this.#reconcileTurnEndPersistenceFailure();
+			if (this.#turnEndPersistenceFailure) await this.#reconcileTurnEndPersistenceFailure();
 			try {
 				if (compactionAbortController.signal.aborted) {
 					throw new CompactionCancelledError();
@@ -22295,7 +22295,7 @@ export class AgentSession {
 			this.sessionId === compactionSessionId &&
 			this.#sessionIdentityEpoch === compactionSessionIdentityEpoch;
 		if (!compactionIdentityIsCurrent()) return { kind: "skipped" };
-		await this.#reconcileTurnEndPersistenceFailure();
+		if (this.#turnEndPersistenceFailure) await this.#reconcileTurnEndPersistenceFailure();
 		if (!compactionIdentityIsCurrent()) return { kind: "skipped" };
 		const compactionSettings = this.settings.getGroup("compaction");
 		// `force` is the non-disableable emergency floor (F6): it bypasses the user's
@@ -26503,7 +26503,7 @@ export class AgentSession {
 			}
 			this.#externalIngressSealed = true;
 			await this.abort();
-			await this.#reconcileTurnEndPersistenceFailure();
+			if (this.#turnEndPersistenceFailure) await this.#reconcileTurnEndPersistenceFailure();
 			if (this.isCompacting) {
 				this.abortCompaction();
 				while (this.isCompacting) await Bun.sleep(10);
@@ -26990,7 +26990,7 @@ export class AgentSession {
 			}
 			if (this.isStreaming) await this.abort();
 			await this.awaitSessionSettlement();
-			await this.#reconcileTurnEndPersistenceFailure();
+			if (this.#turnEndPersistenceFailure) await this.#reconcileTurnEndPersistenceFailure();
 			if (this.isCompacting) {
 				this.abortCompaction();
 				while (this.isCompacting) await Bun.sleep(10);
@@ -27152,7 +27152,7 @@ export class AgentSession {
 			this.#externalIngressSealed = true;
 			if (this.isStreaming) await this.abort();
 			await this.awaitSessionSettlement();
-			await this.#reconcileTurnEndPersistenceFailure();
+			if (this.#turnEndPersistenceFailure) await this.#reconcileTurnEndPersistenceFailure();
 			if (this.isCompacting) {
 				this.abortCompaction();
 				while (this.isCompacting) await Bun.sleep(10);
