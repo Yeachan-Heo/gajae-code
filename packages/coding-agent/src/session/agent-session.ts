@@ -374,7 +374,6 @@ import type { HindsightSessionState } from "../hindsight/state";
 import {
 	buildSkillStopOutput,
 	ensureWorkflowSkillActivationSeed,
-	ensureWorkflowSkillActivationState,
 	type WorkflowSkillActivationSeed,
 } from "../hooks/skill-state";
 import { initializeLocalRoot, type LocalProtocolOptions, resolveLocalUrlToPath } from "../internal-urls";
@@ -3358,6 +3357,8 @@ export class AgentSession {
 	#skillsSettings: SkillsSettings | undefined;
 	#activeSkillState: { skill: string; sessionId?: string } | undefined;
 	#restoredWorkflowSkillState: { skill: string; sessionId: string } | undefined;
+	readonly #skillStateSynchronizations = new Set<Promise<void>>();
+	#subskillToolRefreshAfterTransition = false;
 
 	// Model registry for API key resolution
 	#modelRegistry: ModelRegistry;
@@ -3710,6 +3711,16 @@ export class AgentSession {
 		this.#assertNoSessionTransition();
 	}
 
+	#isSessionSelectionIdentityAdmitted(identity: SessionSelectionIdentity): boolean {
+		if (!this.#isSessionSelectionIdentityCurrent(identity)) return false;
+		if (this.#sessionTransitionKind === undefined) return true;
+		const capability = this.#postCommitTransitionIngress.getStore();
+		return (
+			capability?.epoch === this.#sessionIdentityEpoch &&
+			this.#activePostCommitTransitionIngressTokens.has(capability.token)
+		);
+	}
+
 	async #withPostCommitTransitionIngress<T>(run: () => Promise<T>): Promise<T> {
 		const capability = { epoch: this.#sessionIdentityEpoch, token: Symbol("post-commit-transition-ingress") };
 		this.#activePostCommitTransitionIngressTokens.add(capability.token);
@@ -3837,6 +3848,32 @@ export class AgentSession {
 		this.#sessionTransitionSettlement = undefined;
 		this.yieldQueue.rearmIdle();
 		this.#flushOrSchedulePendingBackgroundExchanges();
+		if (this.#subskillToolRefreshAfterTransition) {
+			this.#subskillToolRefreshAfterTransition = false;
+			this.#requestSubskillToolReconciliation();
+		}
+	}
+
+	#requestSubskillToolReconciliation(): void {
+		if (this.#sessionTransitionKind !== undefined) {
+			this.#subskillToolRefreshAfterTransition = true;
+			return;
+		}
+		if (this.#subskillToolRefreshAfterTransition) return;
+		this.#subskillToolRefreshAfterTransition = true;
+		const identity = this.#captureSessionSelectionIdentity();
+		queueMicrotask(() => {
+			this.#subskillToolRefreshAfterTransition = false;
+			if (this.#sessionTransitionKind !== undefined || !this.#isSessionSelectionIdentityCurrent(identity)) {
+				this.#requestSubskillToolReconciliation();
+				return;
+			}
+			void this.refreshGjcSubskillTools(identity).catch(error => {
+				logger.warn("Failed to reconcile subskill tools after session transition", {
+					error: error instanceof Error ? error.message : String(error),
+				});
+			});
+		});
 	}
 
 	#activateNextSessionAdmission(): void {
@@ -7000,6 +7037,9 @@ export class AgentSession {
 		if (streamingMessage?.role === "assistant") this.agent.discardRejectedAssistantEvent(streamingMessage);
 		this.#retireCurrentSessionIdentityAttemptScopes();
 		this.#advanceSessionIdentityEpoch();
+		this.#activeSkillState = undefined;
+		this.#restoredWorkflowSkillState = undefined;
+		this.#requestSubskillToolReconciliation();
 		this.#retiredSessionIdentityAttemptScopeKeys.clear();
 	}
 
@@ -7368,7 +7408,7 @@ export class AgentSession {
 					}
 				}
 			}
-			await this.#syncSkillPromptActiveStateSafely(event.message, true);
+			await this.#syncSkillPromptActiveStateSafely(event.message, true, true, eventSessionIdentity);
 		}
 
 		// Plan-mode → compaction transition: stamp `SILENT_ABORT_MARKER` on the
@@ -11749,8 +11789,10 @@ export class AgentSession {
 			previousSelectedMCPToolNames?: string[];
 			previousSelectedDiscoveredBuiltinToolNames?: string[];
 			nextSelectedDiscoveredBuiltinToolNames?: string[];
+			admission?: () => boolean;
 		},
 	): Promise<void> {
+		if (options?.admission?.() === false) return;
 		toolNames = [...new Set([...toolNames.map(name => name.toLowerCase()), ...this.#mandatoryMCPToolNames])];
 		const previousSelectedMCPToolNames = options?.previousSelectedMCPToolNames ?? this.getSelectedMCPToolNames();
 		const previousSelectedDiscoveredBuiltinToolNames =
@@ -11793,6 +11835,10 @@ export class AgentSession {
 				const built = await this.#runAdmittedBaseSystemPromptRebuild(() =>
 					this.#rebuildSystemPrompt!(validToolNames, this.#toolRegistry),
 				);
+				if (options?.admission?.() === false) {
+					if (generation === this.#baseSystemPromptGeneration) this.#pendingAppliedToolSignature = undefined;
+					return;
+				}
 				if (this.#isDisposed) {
 					if (generation === this.#baseSystemPromptGeneration) {
 						this.#pendingAppliedToolSignature = undefined;
@@ -12103,11 +12149,20 @@ export class AgentSession {
 	/**
 	 * Refresh plugin sub-skill tools after workflow/sub-skill activation or phase changes.
 	 */
-	async refreshGjcSubskillTools(): Promise<void> {
+	async refreshGjcSubskillTools(expectedIdentity?: SessionSelectionIdentity): Promise<void> {
+		const refreshIdentity = expectedIdentity ?? this.#captureSessionSelectionIdentity();
+		const identityIsCurrent = (): boolean => this.#isSessionSelectionIdentityAdmitted(refreshIdentity);
+		const stopIfStale = (): boolean => {
+			if (identityIsCurrent()) return false;
+			this.#requestSubskillToolReconciliation();
+			return true;
+		};
+		if (stopIfStale()) return;
 		const activeState = await readVisibleSkillActiveState(
 			this.sessionManager.getCwd(),
 			this.sessionManager.getSessionId(),
 		);
+		if (stopIfStale()) return;
 		const activeSkill =
 			this.#activeSkillState?.skill ??
 			activeState?.skill ??
@@ -12124,20 +12179,29 @@ export class AgentSession {
 			this.#invalidateDiscoveryCaches();
 			await this.#applyActiveToolsByName(
 				previousActiveToolNames.filter(name => !previousGjcSubskillToolNames.has(name)),
+				{ admission: identityIsCurrent },
 			);
+			stopIfStale();
 			return;
 		}
 
 		const cwd = this.sessionManager.getCwd();
 		const sessionId =
 			this.#activeSkillState?.sessionId ?? activeState?.session_id ?? this.sessionManager.getSessionId();
-		if (this.#gjcSubskillToolNames.size === 0 && !(await this.#hasActiveGjcSubskillTools(parent, sessionId))) return;
+		if (this.#gjcSubskillToolNames.size === 0) {
+			const hasActiveSubskillTools = await this.#hasActiveGjcSubskillTools(parent, sessionId);
+			if (stopIfStale()) return;
+			if (!hasActiveSubskillTools) return;
+		}
+		if (stopIfStale()) return;
 
 		const phase = await resolveCurrentPhaseForParent({ cwd, sessionId, parent });
+		if (stopIfStale()) return;
 		const reservedToolNames = Array.from(this.#toolRegistry.keys()).filter(
 			name => !this.#gjcSubskillToolNames.has(name),
 		);
 		const customTools = await loadActiveSubskillTools({ cwd, sessionId, parent, phase, reservedToolNames });
+		if (stopIfStale()) return;
 		const nextToolNames = customTools.map(tool => tool.name);
 		const uniqueToolNames = new Set(nextToolNames);
 		if (uniqueToolNames.size !== nextToolNames.length) {
@@ -12186,7 +12250,9 @@ export class AgentSession {
 					...autoActivatedGjcSubskillToolNames,
 				]),
 			),
+			{ admission: identityIsCurrent },
 		);
+		stopIfStale();
 	}
 
 	/** Whether auto-compaction is currently running */
@@ -12907,17 +12973,20 @@ export class AgentSession {
 		}
 	}
 
-	#attachAskTool(): void {
-		if (this.#explicitEmptyToolSelection) return;
+	#attachAskTool(deferPromptRefresh = false): boolean {
+		if (this.#explicitEmptyToolSelection) return false;
 		const askTool = this.#toolRegistry.get("ask");
-		if (!askTool || this.getActiveToolNames().includes(askTool.name)) return;
+		if (!askTool || this.getActiveToolNames().includes(askTool.name)) return false;
 		this.#setGuardedAgentTools([...this.agent.state.tools, askTool]);
 		this.#invalidateDiscoveryCaches();
-		void this.refreshBaseSystemPrompt().catch(error => {
-			logger.warn("Failed to refresh system prompt after workflow gate ask tool activation", {
-				error: error instanceof Error ? error.message : String(error),
+		if (!deferPromptRefresh) {
+			void this.refreshBaseSystemPrompt().catch(error => {
+				logger.warn("Failed to refresh system prompt after workflow gate ask tool activation", {
+					error: error instanceof Error ? error.message : String(error),
+				});
 			});
-		});
+		}
+		return true;
 	}
 
 	get goalRuntime(): GoalRuntime {
@@ -13680,7 +13749,11 @@ export class AgentSession {
 		message: Pick<CustomMessage<unknown>, "customType" | "details">,
 		active: boolean,
 		persistActiveState = true,
+		expectedIdentity?: SessionSelectionIdentity,
 	): Promise<void> {
+		const identityIsCurrent = (): boolean =>
+			expectedIdentity === undefined || this.#isSessionSelectionIdentityAdmitted(expectedIdentity);
+		if (!identityIsCurrent()) return;
 		if (message.customType !== SKILL_PROMPT_MESSAGE_TYPE) return;
 		const details = message.details;
 		if (!details || typeof details !== "object") return;
@@ -13691,7 +13764,6 @@ export class AgentSession {
 		// observational state-sync below (whose failures are swallowed by
 		// #syncSkillPromptActiveStateSafely): attach ask first so canonical
 		// workflow skills can always call it.
-		if (active && isCanonicalGjcWorkflowSkill(skill)) this.#attachAskTool();
 		const sessionId = this.sessionManager.getSessionId();
 		// Canonical GJC workflow skills (deep-interview, ralplan, ultragoal, autoresearch)
 		// own their `.gjc/state/skill-active-state.json` row through the
@@ -13699,43 +13771,53 @@ export class AgentSession {
 		// observer must not overwrite an existing row (that clobbered handoff
 		// lineage `handoff_from`/`handoff_at` and desynced the HUD). But a fresh
 		// `/skill:<name>` invocation has no row yet, so seed `.gjc/state`
-		// idempotently here: `ensureWorkflowSkillActivationState` writes the
+		// idempotently here: `ensureWorkflowSkillActivationSeed` writes the
 		// initial mode-state + active row only when the skill is not already
 		// active, so the mutation guard and Stop hook engage immediately instead
 		// of relying on the skill prompt to run its own state-init steps.
+		const subskillDetails = details as {
+			subskillActivation?: LoadedSubskillActivation;
+			subskillActivationSet?: LoadedSubskillActivation[];
+		};
+		const subskillActivations =
+			subskillDetails.subskillActivationSet && subskillDetails.subskillActivationSet.length > 0
+				? subskillDetails.subskillActivationSet
+				: subskillDetails.subskillActivation
+					? [subskillDetails.subskillActivation]
+					: [];
+		if (active && isCanonicalGjcWorkflowSkill(skill)) {
+			const attachedAsk = this.#attachAskTool(true);
+			if (attachedAsk) await this.refreshBaseSystemPrompt();
+			if (!identityIsCurrent()) return;
+		}
+		let activationSeed: WorkflowSkillActivationSeed | undefined;
 		if (active && persistActiveState) {
-			await ensureWorkflowSkillActivationState({
+			activationSeed = await ensureWorkflowSkillActivationSeed({
 				cwd: this.sessionManager.getCwd(),
 				skill,
 				sessionId,
+				activeSubskills:
+					subskillActivations.length > 0 ? subskillActivations.map(toActiveSubskillEntry) : undefined,
 			});
-			const subskillDetails = details as {
-				subskillActivation?: LoadedSubskillActivation;
-				subskillActivationSet?: LoadedSubskillActivation[];
-			};
-			const subskillActivations =
-				subskillDetails.subskillActivationSet && subskillDetails.subskillActivationSet.length > 0
-					? subskillDetails.subskillActivationSet
-					: subskillDetails.subskillActivation
-						? [subskillDetails.subskillActivation]
-						: [];
-			if (subskillActivations.length > 0) {
-				const skillBoundActivation = subskillDetails.subskillActivation ?? subskillActivations[0];
-				await syncSkillActiveState({
-					cwd: this.sessionManager.getCwd(),
-					skill,
-					active: true,
-					phase: skillBoundActivation?.phase,
-					sessionId,
-					active_subskills: subskillActivations.map(toActiveSubskillEntry),
-				});
+			if (!identityIsCurrent()) {
+				if (activationSeed.seeded) await activationSeed.rollback();
+				return;
 			}
 		}
+		if (!identityIsCurrent()) return;
 		// In-memory tracking keeps `getActiveSkillState` accurate for the chain guard.
 		this.#restoredWorkflowSkillState = undefined;
 		this.#activeSkillState = active ? { skill, sessionId } : undefined;
 		if (active) {
-			await this.refreshGjcSubskillTools();
+			await this.refreshGjcSubskillTools(expectedIdentity);
+			if (!identityIsCurrent()) {
+				if (activationSeed?.seeded) await activationSeed.rollback();
+				if (this.#activeSkillState?.skill === skill && this.#activeSkillState.sessionId === sessionId) {
+					this.#activeSkillState = undefined;
+				}
+				await this.refreshGjcSubskillTools();
+				return;
+			}
 		}
 	}
 
@@ -13743,13 +13825,23 @@ export class AgentSession {
 		message: Pick<CustomMessage<unknown>, "customType" | "details">,
 		active: boolean,
 		persistActiveState = true,
+		expectedIdentity?: SessionSelectionIdentity,
 	): Promise<void> {
+		const synchronization = this.#syncSkillPromptActiveState(
+			message,
+			active,
+			persistActiveState,
+			expectedIdentity,
+		);
+		this.#skillStateSynchronizations.add(synchronization);
 		try {
-			await this.#syncSkillPromptActiveState(message, active, persistActiveState);
+			await synchronization;
 		} catch {
 			// Skill HUD state is observational; a filesystem write failure must not
 			// interrupt the prompt turn it is visualizing. The native Stop hook still
 			// performs authoritative workflow blocking from persisted state.
+		} finally {
+			this.#skillStateSynchronizations.delete(synchronization);
 		}
 	}
 
@@ -13835,6 +13927,7 @@ export class AgentSession {
 		await this.#withSessionAdmission(
 			"prompt",
 			async admission => {
+				const preflightIdentity = this.#captureSessionSelectionIdentity();
 				this.#throwIfPromptPreflightCancelled(admissionGeneration, admissionSignal);
 				if (options?.preflightSignal?.aborted) throw promptPreflightCancelledError();
 				const customMessage: CustomMessage<T> = {
@@ -13854,7 +13947,27 @@ export class AgentSession {
 				let durableAcceptanceCompleted = false;
 				const commitAcceptance = async () => {
 					activationSeed = await this.#seedSkillPromptActiveStateSafely(customMessage);
-					await this.#syncSkillPromptActiveStateSafely(customMessage, true, activationSeed?.seeded !== true);
+					if (!this.#isSessionSelectionIdentityCurrent(preflightIdentity)) {
+						await activationSeed?.rollback();
+						throw promptPreflightCancelledError();
+					}
+					await this.#syncSkillPromptActiveStateSafely(
+						customMessage,
+						true,
+						activationSeed?.seeded !== true,
+						preflightIdentity,
+					);
+					if (!this.#isSessionSelectionIdentityCurrent(preflightIdentity)) {
+						await activationSeed?.rollback();
+						const activeSkillState = this.#activeSkillState;
+						if (
+							activeSkillState &&
+							activeSkillState.skill === (customMessage.details as { name?: string } | undefined)?.name &&
+							activeSkillState.sessionId === preflightIdentity.sessionId
+						)
+							this.#activeSkillState = undefined;
+						throw promptPreflightCancelledError();
+					}
 					if (options?.preflightSignal?.aborted) {
 						await activationSeed?.rollback();
 						throw promptPreflightCancelledError();
@@ -13882,7 +13995,8 @@ export class AgentSession {
 					}
 					throw error;
 				} finally {
-					if (!preflightCancelled) await this.#syncSkillPromptActiveStateSafely(customMessage, false);
+					if (!preflightCancelled && this.#isSessionSelectionIdentityCurrent(preflightIdentity))
+						await this.#syncSkillPromptActiveStateSafely(customMessage, false, true, preflightIdentity);
 				}
 			},
 			options?.preflightSignal,
@@ -15036,6 +15150,7 @@ export class AgentSession {
 		}
 
 		const queuedMessages = [...this.#pendingNextTurnMessages];
+		const queuedSessionIdentity = this.#captureSessionSelectionIdentity();
 		this.#pendingNextTurnMessages = [];
 		// Reclassify deferred envelopes at the drain boundary: a monitor
 		// notification queued via the deferAgentInitiatedTurns branch never ran
@@ -15087,14 +15202,22 @@ export class AgentSession {
 
 		const prependMessages = reclassified.slice(0, -1).map(entry => entry.message);
 		const textContent = this.#getCustomMessageTextContent(message);
-		await this.#syncSkillPromptActiveStateSafely(message, true);
+		await this.#syncSkillPromptActiveStateSafely(message, true, true, queuedSessionIdentity);
 		try {
+			if (!this.#isSessionSelectionIdentityCurrent(queuedSessionIdentity)) {
+				this.#settleDeliveredOwnedRegistrations(reclassified.map(entry => entry.message));
+				return;
+			}
 			if (this.#isDisposed || this.#sessionAdmissionClosing || this.#disposeAbortController.signal.aborted) {
 				this.#settleDeliveredOwnedRegistrations(reclassified.map(entry => entry.message));
 				return;
 			}
 			if (signal?.aborted) {
 				this.#pendingNextTurnMessages = [...reclassified, ...this.#pendingNextTurnMessages];
+				return;
+			}
+			if (!this.#isSessionSelectionIdentityCurrent(queuedSessionIdentity)) {
+				this.#settleDeliveredOwnedRegistrations(reclassified.map(entry => entry.message));
 				return;
 			}
 			await this.#promptWithMessage(message, textContent, {
@@ -15117,7 +15240,9 @@ export class AgentSession {
 			this.#pendingNextTurnMessages = [...reclassified, ...this.#pendingNextTurnMessages];
 			throw error;
 		} finally {
-			await this.#syncSkillPromptActiveStateSafely(message, false);
+			if (this.#isSessionSelectionIdentityCurrent(queuedSessionIdentity)) {
+				await this.#syncSkillPromptActiveStateSafely(message, false, true, queuedSessionIdentity);
+			}
 		}
 	}
 
@@ -15338,14 +15463,18 @@ export class AgentSession {
 				// Every direct idle admission is a NEW ROOT TURN: allocate a fresh
 				// lineage so the turn never remints the previous turn's identical
 				// lineage+epoch (review thread P1).
+				const directTurnIdentity = this.#captureSessionSelectionIdentity();
 				this.#resumeFromOwnedCompletion();
-				await this.#syncSkillPromptActiveStateSafely(appMessage, true);
+				await this.#syncSkillPromptActiveStateSafely(appMessage, true, true, directTurnIdentity);
 				try {
+					if (!this.#isSessionSelectionIdentityCurrent(directTurnIdentity)) return;
 					await this.#promptWithMessage(appMessage, this.#getCustomMessageTextContent(appMessage), {
 						skipPostPromptRecoveryWait: true,
 					});
 				} finally {
-					await this.#syncSkillPromptActiveStateSafely(appMessage, false);
+					if (this.#isSessionSelectionIdentityCurrent(directTurnIdentity)) {
+						await this.#syncSkillPromptActiveStateSafely(appMessage, false, true, directTurnIdentity);
+					}
 					// The direct idle admission bypasses onFollowUpConsumed:
 					// settle any delivered owned-completion envelope so a
 					// terminal registration does not occupy the registry until
@@ -15392,14 +15521,18 @@ export class AgentSession {
 			// the turn would remint the previous turn's identical lineage+epoch
 			// and a later scope:"owned" abort could capture the earlier turn's
 			// unrelated jobs (review thread P1).
+			const directTurnIdentity = this.#captureSessionSelectionIdentity();
 			this.#resumeFromOwnedCompletion();
-			await this.#syncSkillPromptActiveStateSafely(appMessage, true);
+			await this.#syncSkillPromptActiveStateSafely(appMessage, true, true, directTurnIdentity);
 			try {
+				if (!this.#isSessionSelectionIdentityCurrent(directTurnIdentity)) return;
 				await this.#promptWithMessage(appMessage, this.#getCustomMessageTextContent(appMessage), {
 					skipPostPromptRecoveryWait: true,
 				});
 			} finally {
-				await this.#syncSkillPromptActiveStateSafely(appMessage, false);
+				if (this.#isSessionSelectionIdentityCurrent(directTurnIdentity)) {
+					await this.#syncSkillPromptActiveStateSafely(appMessage, false, true, directTurnIdentity);
+				}
 				// The direct idle admission bypasses onFollowUpConsumed:
 				// settle any delivered owned-completion envelope so a terminal
 				// registration does not occupy the registry until saturation —
@@ -16876,6 +17009,7 @@ export class AgentSession {
 		try {
 			return await this.#withSessionAdmission("prompt", async admission => {
 				const queueSnapshot = this.agent.snapshotQueues();
+				const cancelSubmitIdentity = this.#captureSessionSelectionIdentity();
 				const steeringDisplaySnapshot = [...this.#steeringMessages];
 				const followUpDisplaySnapshot = [...this.#followUpMessages];
 				const pendingNextTurnSnapshot = [...this.#pendingNextTurnMessages];
@@ -16939,7 +17073,7 @@ export class AgentSession {
 						: await this.#abortWithOutcome({ cause: "user_interrupt", timeoutMs: 5_000 });
 					this.#disownedSteeringDisposition = undefined;
 					if (outcome.kind !== "settled") {
-						restore();
+						if (this.#isSessionSelectionIdentityCurrent(cancelSubmitIdentity)) restore();
 						if (outcome.kind === "error") {
 							logger.error("Cancel-and-submit abort failed", { cause: outcome.cause });
 							this.emitNotice(
@@ -16949,6 +17083,12 @@ export class AgentSession {
 							);
 						}
 						return { kind: "rolled_back", outcome };
+					}
+					if (!this.#isSessionSelectionIdentityCurrent(cancelSubmitIdentity)) {
+						return {
+							kind: "rolled_back",
+							outcome: { kind: "error", cause: new Error("Session identity changed during cancellation") },
+						};
 					}
 
 					const currentQueues = this.agent.snapshotQueues();
@@ -17017,8 +17157,13 @@ export class AgentSession {
 							: message.role === "user"
 								? this.#getUserMessageText(message)
 								: text;
-					await this.refreshGjcSubskillTools();
-					if (message.role === "custom") await this.#syncSkillPromptActiveStateSafely(message, true);
+					const preparationIdentity = cancelSubmitIdentity;
+					await this.refreshGjcSubskillTools(preparationIdentity);
+					if (message.role === "custom")
+						await this.#syncSkillPromptActiveStateSafely(message, true, true, preparationIdentity);
+					if (!this.#isSessionSelectionIdentityCurrent(preparationIdentity)) {
+						throw new Error("Session identity changed during cancel-and-submit preparation");
+					}
 					if (selected) {
 						const displayTag = message.role === "custom" ? readPendingDisplayTag(message.details) : undefined;
 						if (displayTag) this.#displayDequeueAlreadyHandled = { role: "custom", tag: displayTag };
@@ -17051,7 +17196,8 @@ export class AgentSession {
 							},
 						});
 					} finally {
-						if (message.role === "custom") await this.#syncSkillPromptActiveStateSafely(message, false);
+						if (message.role === "custom" && this.#isSessionSelectionIdentityCurrent(preparationIdentity))
+							await this.#syncSkillPromptActiveStateSafely(message, false, true, preparationIdentity);
 						if (runAccepted) restoreHeldQueue();
 					}
 					restoreHeldQueue();
@@ -17062,6 +17208,9 @@ export class AgentSession {
 						return { kind: "submitted" };
 					}
 					this.#displayDequeueAlreadyHandled = undefined;
+					if (!this.#isSessionSelectionIdentityCurrent(cancelSubmitIdentity)) {
+						return { kind: "rolled_back", outcome: { kind: "error", cause } };
+					}
 					restore();
 					logger.error("Cancel-and-submit prompt failed before run acceptance", { cause });
 					this.emitNotice("error", `Unable to send immediately: ${String(cause)}`, "cancel-and-submit");
@@ -26811,6 +26960,10 @@ export class AgentSession {
 				// Non-user message: leaf = selected node
 				newLeafId = targetId;
 			}
+
+			// Skill activation and background completion ownership must settle before the selected tree boundary.
+			await Promise.allSettled([...this.#skillStateSynchronizations]);
+			await this.#settleOwnAsyncJobsBeforeArtifactRetirement();
 
 			// Switch leaf (with or without summary)
 			// Summary is attached at the navigation target position (newLeafId), not the old branch
