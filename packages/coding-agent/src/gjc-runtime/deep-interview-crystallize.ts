@@ -1530,16 +1530,36 @@ export function crystallizeDeepInterview(value: unknown): DeepInterviewCrystal {
 	if (!currentItems.some(item => item.classification === "confirmed" && item.kind !== "non_goal"))
 		throw new Error("crystallize requires a confirmed user requirement");
 	const confirmedItems = currentItems.filter(item => item.classification === "confirmed");
+	const opposingActions: ReadonlyArray<readonly [string, string]> = [
+		["enable", "disable"],
+		["allow", "deny"],
+		["include", "exclude"],
+		["start", "stop"],
+		["add", "remove"],
+	];
 	for (let leftIndex = 0; leftIndex < confirmedItems.length; leftIndex++) {
 		const left = confirmedItems[leftIndex]!;
 		const leftTerms = topicTerms(left.statement, false);
 		for (const right of confirmedItems.slice(leftIndex + 1)) {
 			const rightTerms = topicTerms(right.statement, false);
+			const opposingAction = opposingActions.some(([positive, negative]) => {
+				const leftAction = leftTerms.has(positive) ? positive : leftTerms.has(negative) ? negative : undefined;
+				const rightAction = rightTerms.has(positive) ? positive : rightTerms.has(negative) ? negative : undefined;
+				if (!leftAction || !rightAction || leftAction === rightAction) return false;
+				const leftSubject = new Set([...leftTerms].filter(term => term !== positive && term !== negative));
+				const rightSubject = new Set([...rightTerms].filter(term => term !== positive && term !== negative));
+				return (
+					leftSubject.size > 0 &&
+					leftSubject.size === rightSubject.size &&
+					[...leftSubject].every(term => rightSubject.has(term))
+				);
+			});
 			if (
-				leftTerms.size > 0 &&
-				leftTerms.size === rightTerms.size &&
-				[...leftTerms].every(term => rightTerms.has(term)) &&
-				semanticProfile(left.statement).negative !== semanticProfile(right.statement).negative
+				opposingAction ||
+				(leftTerms.size > 0 &&
+					leftTerms.size === rightTerms.size &&
+					[...leftTerms].every(term => rightTerms.has(term)) &&
+					semanticProfile(left.statement).negative !== semanticProfile(right.statement).negative)
 			)
 				throw new Error(`contradictory confirmed items require an explicit conflict: ${left.id}, ${right.id}`);
 		}
