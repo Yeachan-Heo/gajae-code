@@ -137,6 +137,36 @@ describe("deep-interview crystallize contract", () => {
 		).toThrow("statement-bound verbatim user anchor");
 	});
 
+	it("rejects snapshots with an unrepresented user directive", () => {
+		const base = input();
+		const snapshot: CrystalSnapshot = {
+			...base.snapshot,
+			end: 1,
+			messages: [
+				{ index: 0, role: "user", content: "Build audit reports." },
+				{ index: 1, role: "user", content: "Encrypt all backups." },
+			],
+			digest: "",
+		};
+		snapshot.digest = crystalSnapshotDigest(snapshot);
+		expect(() =>
+			crystallizeDeepInterview(
+				input({
+					snapshot,
+					items: [
+						{
+							id: "goal:audit",
+							kind: "goal",
+							classification: "confirmed",
+							statement: "Build audit reports",
+							anchor: { message_index: 0, quote: "Build audit reports." },
+						},
+					],
+				}),
+			),
+		).toThrow("unrepresented user directive");
+	});
+
 	it("rejects confirmed statements unrelated to their user quote", () => {
 		expect(() =>
 			crystallizeDeepInterview(
@@ -520,6 +550,13 @@ describe("deep-interview crystallize contract", () => {
 						statement: "Use PostgreSQL for storage",
 						anchor: { message_index: 0, quote: "Use PostgreSQL for storage." },
 					},
+					{
+						id: "non-goal:public-endpoint",
+						kind: "non_goal",
+						classification: "confirmed",
+						statement: "Do not use a public endpoint",
+						anchor: { message_index: 0, quote: "Do not use a public endpoint." },
+					},
 				],
 			}),
 		);
@@ -574,9 +611,10 @@ describe("deep-interview crystallize contract", () => {
 							anchor: { message_index: 0, quote: "Use PostgreSQL for storage." },
 						},
 					],
+					open_gaps: ["Dark mode preference"],
 				}),
-			).lifecycle,
-		).toBe("ready");
+			).items[0]?.statement,
+		).toBe("Use PostgreSQL for storage");
 		const unrelatedNegationSnapshot: CrystalSnapshot = {
 			revision: 1,
 			start: 0,
@@ -600,6 +638,13 @@ describe("deep-interview crystallize contract", () => {
 							...input().items[0]!,
 							statement: "Use PostgreSQL for storage",
 							anchor: { message_index: 0, quote: "Use PostgreSQL for storage." },
+						},
+						{
+							id: "non-goal:public-api",
+							kind: "non_goal",
+							classification: "confirmed",
+							statement: "Do not expose the API publicly",
+							anchor: { message_index: 0, quote: "Do not expose the API publicly." },
 						},
 					],
 				}),
@@ -749,6 +794,12 @@ describe("deep-interview crystallize contract", () => {
 			["Use 5 replicas and 10 workers.", "Use 5 replicas and 10 workers.", "Use 10 replicas and 5 workers"],
 			["Use one replica.", "Use one replica.", "Use replica"],
 			["Keep logging off.", "Keep logging off.", "Keep logging on"],
+			["Make daily backups.", "Make daily backups.", "Support daily backups"],
+			[
+				"Set the environment variable API_KEY.",
+				"Set the environment variable API_KEY.",
+				"Set the environment variable api_key",
+			],
 			["Failure ratio must be 1:2.", "Failure ratio must be 1:2.", "Failure ratio must be 1 2"],
 			["Failure ratio must be 1 : 2.", "Failure ratio must be 1 : 2.", "Failure ratio must be 1 2"],
 			["Use Rust. Actually use Go.", "Use Rust.", "Use Rust"],
@@ -1599,7 +1650,12 @@ describe("deep-interview crystallize contract", () => {
 		expect(crystallizeDeepInterview(next).removed_ids).toContain("constraint:latency");
 		const mixedMessage = "Remove the fast constraint. Keep PostgreSQL for storage.";
 		const mixed = withFreshUserEvidence(
-			input({ prior: first, items: [first.items[0]!], removed_ids: ["constraint:latency"] }),
+			input({
+				prior: first,
+				items: [first.items[0]!],
+				removed_ids: ["constraint:latency"],
+				open_gaps: ["PostgreSQL storage preservation"],
+			}),
 			mixedMessage,
 		);
 		mixed.removed_item_anchors = [
@@ -1759,17 +1815,23 @@ describe("deep-interview crystallize contract", () => {
 		];
 		const removed = crystallizeDeepInterview(removal);
 		expect(removed.removed_ids).toEqual(["constraint:latency"]);
-		const carried = crystallizeDeepInterview(
-			withFreshUserEvidence(
-				input({
-					prior: removed,
-					items: [first.items[0]!],
-					snapshot: removed.source,
-					current_revision: removed.source.revision,
-				}),
-				"Keep the report fast.",
-			),
+		const carriedInput = withFreshUserEvidence(
+			input({
+				prior: removed,
+				items: [first.items[0]!],
+				snapshot: removed.source,
+				current_revision: removed.source.revision,
+			}),
+			"Keep the report fast.",
 		);
+		carriedInput.items.push({
+			id: "constraint:keep-report-fast",
+			kind: "constraint",
+			classification: "confirmed",
+			statement: "Keep the report fast",
+			anchor: { message_index: 2, quote: "Keep the report fast." },
+		});
+		const carried = crystallizeDeepInterview(carriedInput);
 		expect(carried.removed_ids).toEqual(["constraint:latency"]);
 		const resurrection = withFreshUserEvidence(
 			input({
@@ -2365,7 +2427,22 @@ describe("deep-interview crystallize contract", () => {
 				[
 					"--crystallize",
 					"--input",
-					JSON.stringify(input({ snapshot, current_revision: 2 })),
+					JSON.stringify(
+						input({
+							snapshot,
+							current_revision: 2,
+							items: [
+								...input().items,
+								{
+									id: "constraint:keep-fast",
+									kind: "constraint",
+									classification: "confirmed",
+									statement: "Keep the report fast",
+									anchor: { message_index: 1, quote: "Keep the report fast." },
+								},
+							],
+						}),
+					),
 					"--session-id",
 					sessionId,
 					"--slug",
@@ -2445,7 +2522,22 @@ describe("deep-interview crystallize contract", () => {
 				[
 					"--crystallize",
 					"--input",
-					JSON.stringify(input({ snapshot, current_revision: 2 })),
+					JSON.stringify(
+						input({
+							snapshot,
+							current_revision: 2,
+							items: [
+								...input().items,
+								{
+									id: "constraint:keep-fast",
+									kind: "constraint",
+									classification: "confirmed",
+									statement: "Keep the report fast",
+									anchor: { message_index: 1, quote: "Keep the report fast." },
+								},
+							],
+						}),
+					),
 					"--session-id",
 					sessionId,
 					"--slug",
