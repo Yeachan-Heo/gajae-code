@@ -2434,6 +2434,17 @@ export class AuthStorage {
 		this.#sessionLastCredential.set(provider, sessionMap);
 	}
 
+	/** Locates a stored row by id in the provider's current index space. */
+	#findCredentialByRowId(
+		provider: string,
+		rowId: number,
+	): { type: AuthCredential["type"]; index: number } | undefined {
+		const index = this.#getStoredCredentials(provider).findIndex(entry => entry.id === rowId);
+		if (index === -1) return undefined;
+		const credential = this.#getStoredCredentials(provider)[index]?.credential;
+		return credential ? { type: credential.type, index } : undefined;
+	}
+
 	/** Retrieves the last credential used by a session. */
 	#getSessionCredential(
 		provider: string,
@@ -4558,19 +4569,28 @@ export class AuthStorage {
 	}
 
 	/**
-	 * Marks the current session's credential as temporarily blocked due to usage limits.
+	 * Marks a credential as temporarily blocked due to usage limits.
 	 * Uses usage reports to determine accurate reset time when available.
 	 * Returns true if a credential was blocked, enabling automatic fallback to the next credential.
+	 *
+	 * The target is `options.rowId` when given — the stored row the caller knows
+	 * the failed request used — and otherwise the session's sticky credential.
+	 * Callers that resolve a credential between the failure and this call must
+	 * pass the row id: a resolution re-runs the usage check and can move the
+	 * sticky pointer onto a healthy row, which this method would then block.
 	 */
 	async markUsageLimitReached(
 		provider: string,
 		sessionId: string | undefined,
-		options?: { retryAfterMs?: number; baseUrl?: string; signal?: AbortSignal; owner?: object },
+		options?: { retryAfterMs?: number; baseUrl?: string; signal?: AbortSignal; owner?: object; rowId?: number },
 	): Promise<boolean> {
 		provider = resolveOAuthStorageProvider(provider);
 		const ownerOverride = this.#configOverrideRegistration(provider, options?.owner);
 		if (ownerOverride && !ownerOverride.envSourced) return false;
-		const sessionCredential = this.#getSessionCredential(provider, sessionId);
+		const sessionCredential =
+			options?.rowId === undefined
+				? this.#getSessionCredential(provider, sessionId)
+				: this.#findCredentialByRowId(provider, options.rowId);
 		if (!sessionCredential) return false;
 
 		const providerKey = this.#getProviderTypeKey(provider, sessionCredential.type);

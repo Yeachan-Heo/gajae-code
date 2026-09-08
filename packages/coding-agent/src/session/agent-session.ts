@@ -21505,7 +21505,20 @@ export class AgentSession {
 	 *    reports "I matched and blocked a row", which is not the same as "the
 	 *    session now uses a different credential" — with a single-row pool it is
 	 *    true while nothing rotated. Both branches therefore re-resolve and
-	 *    require the active key to have actually changed.
+	 *    require the active credential to have actually changed.
+	 * 4. **The quota branch marks BEFORE it resolves, and names the row.**
+	 *    Resolving first re-runs the pre-request usage check, and once the
+	 *    cached usage report already reads exhausted (the status-bar poll
+	 *    refreshes it on its own clock) that check silently moves the session's
+	 *    sticky pointer to the next healthy row. The mark then blocks the
+	 *    healthy row, reports the pool exhausted, and the turn surfaces the raw
+	 *    usage-limit error with no replay while the row that failed stays
+	 *    unmarked. So the quota branch reads the row the session used, marks
+	 *    that row by id, and only then resolves — proving rotation by stored
+	 *    row id, not by key equality. When the sticky pointer no longer
+	 *    resolves to a row (a row removed earlier in the list shifts the
+	 *    index), the mark still goes first and falls back to the pointer;
+	 *    the proof then needs a row to appear after the resolution.
 	 */
 	async #markFailedCredential(trigger: {
 		class: FallbackTriggerClass;
@@ -21526,25 +21539,37 @@ export class AgentSession {
 		}
 
 		const credentialSessionId = this.credentialSessionId;
-		const activeApiKey = await this.#modelRegistry.getApiKey(this.model, credentialSessionId);
 
-		let remaining: boolean;
 		if (trigger.class === "auth") {
+			const activeApiKey = await this.#modelRegistry.getApiKey(this.model, credentialSessionId);
 			if (!isAuthenticated(activeApiKey)) return "unchanged";
-			remaining = await authStorage.invalidateCredentialMatching(provider, activeApiKey, {
+			const remaining = await authStorage.invalidateCredentialMatching(provider, activeApiKey, {
 				sessionId: credentialSessionId,
 				owner: this.#modelRegistry.getAuthStorageOwner(),
 			});
 			if (!remaining) return "unchanged";
-		} else {
-			remaining = await authStorage.markUsageLimitReached(provider, credentialSessionId, {
-				retryAfterMs: trigger.retryAfterMs,
-				owner: this.#modelRegistry.getAuthStorageOwner(),
-			});
+			// (3) Distinct-row proof.
+			if ((await this.#modelRegistry.getApiKey(this.model, credentialSessionId)) !== activeApiKey) {
+				return "rotated";
+			}
+			return "unchanged";
 		}
 
-		// (3) Distinct-row proof.
-		if ((await this.#modelRegistry.getApiKey(this.model, credentialSessionId)) !== activeApiKey) {
+		// (4) Quota / rate limit: mark the row the session used for the failed
+		// request before anything re-resolves it. Nothing here may await
+		// between reading the row and marking it.
+		const failedRowId = authStorage.getSessionCredentialRowId(provider, credentialSessionId);
+		const remaining = await authStorage.markUsageLimitReached(provider, credentialSessionId, {
+			retryAfterMs: trigger.retryAfterMs,
+			owner: this.#modelRegistry.getAuthStorageOwner(),
+			...(failedRowId === undefined ? {} : { rowId: failedRowId }),
+		});
+		// (3) Distinct-row proof, by stored row id: the resolution below is the
+		// first one after the mark, so the row it lands on is the row the replay
+		// will use.
+		await this.#modelRegistry.getApiKey(this.model, credentialSessionId);
+		const rowAfter = authStorage.getSessionCredentialRowId(provider, credentialSessionId);
+		if (rowAfter !== undefined && rowAfter !== failedRowId) {
 			return "rotated";
 		}
 		return remaining ? "unchanged" : "exhausted";
