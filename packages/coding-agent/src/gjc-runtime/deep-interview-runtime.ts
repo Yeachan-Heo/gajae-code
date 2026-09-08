@@ -1124,6 +1124,7 @@ function verifyCrystalSourceAgainstLive(
 export async function assertDeepInterviewCrystalCoversLiveTranscript(
 	cwd: string,
 	sessionId: string,
+	requireCrystalTail = true,
 ): Promise<{ transcriptPath: string; transcriptSha256: string }> {
 	const statePath = deepInterviewStatePath(cwd, sessionId);
 	let parsed: unknown;
@@ -1137,7 +1138,7 @@ export async function assertDeepInterviewCrystalCoversLiveTranscript(
 	const crystal = parseStoredCrystal(parsed.state.crystal);
 	const liveSnapshot = await authoritativeConversationSnapshot(cwd, sessionId);
 	const source = verifyCrystalSourceAgainstLive(crystal, liveSnapshot);
-	if (source.end !== liveSnapshot.messages.length - 1)
+	if (requireCrystalTail && source.end !== liveSnapshot.messages.length - 1)
 		throw new DeepInterviewCommandError(2, "execution approval requires re-crystallization after transcript changes");
 	return { transcriptPath: liveSnapshot.transcriptPath, transcriptSha256: liveSnapshot.transcriptSha256 };
 }
