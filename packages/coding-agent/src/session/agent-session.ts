@@ -3256,6 +3256,7 @@ export class AgentSession {
 	#discoverableToolAllowedNames: ReadonlySet<string> | undefined;
 	#gjcSubskillToolNames = new Set<string>();
 	#gjcSubskillToolSignature: string | undefined;
+	#gjcSubskillToolRefreshGeneration = 0;
 	#defaultSelectedMCPServerNames = new Set<string>();
 	#defaultSelectedMCPToolNames = new Set<string>();
 	#mandatoryMCPToolNames = new Set<string>();
@@ -5061,7 +5062,10 @@ export class AgentSession {
 		// Per-tool TTSR reminders are folded into the matched tool's result via this hook.
 		this.agent.afterToolCall = ctx => {
 			const ownership = this.#toolLifecycleOwnership.get(ctx.toolCall);
-			if (!ownership) return undefined;
+			if (!ownership) {
+				this.#perToolTtsrInjections.delete(ctx.toolCall.id);
+				return undefined;
+			}
 			settleToolLineageRegistrationWindow(ctx.toolCall.id, ownership.endpointId, ownership.binding);
 			if (
 				ctx.result.details &&
@@ -6652,6 +6656,8 @@ export class AgentSession {
 		this.#advanceSessionIdentityEpoch();
 		this.#activeSkillState = undefined;
 		this.#restoredWorkflowSkillState = undefined;
+		this.#checkpointState = undefined;
+		this.#pendingRewindReport = undefined;
 		this.#reloadTtsrStateFromSessionManager();
 		this.#requestSubskillToolReconciliation();
 		this.#retiredSessionIdentityAttemptScopeKeys.clear();
@@ -11666,10 +11672,13 @@ export class AgentSession {
 	 * Refresh plugin sub-skill tools after workflow/sub-skill activation or phase changes.
 	 */
 	async refreshGjcSubskillTools(expectedIdentity?: SessionSelectionIdentity): Promise<void> {
+		const refreshGeneration = ++this.#gjcSubskillToolRefreshGeneration;
 		const refreshIdentity = expectedIdentity ?? this.#captureSessionSelectionIdentity();
 		const identityIsCurrent = (): boolean => this.#isSessionSelectionIdentityAdmitted(refreshIdentity);
+		const refreshIsCurrent = (): boolean =>
+			identityIsCurrent() && refreshGeneration === this.#gjcSubskillToolRefreshGeneration;
 		const stopIfStale = (): boolean => {
-			if (identityIsCurrent()) return false;
+			if (refreshIsCurrent()) return false;
 			this.#requestSubskillToolReconciliation();
 			return true;
 		};
@@ -11695,7 +11704,7 @@ export class AgentSession {
 			this.#invalidateDiscoveryCaches();
 			await this.#applyActiveToolsByName(
 				previousActiveToolNames.filter(name => !previousGjcSubskillToolNames.has(name)),
-				{ admission: identityIsCurrent },
+				{ admission: refreshIsCurrent },
 			);
 			stopIfStale();
 			return;
@@ -11766,7 +11775,7 @@ export class AgentSession {
 					...autoActivatedGjcSubskillToolNames,
 				]),
 			),
-			{ admission: identityIsCurrent },
+			{ admission: refreshIsCurrent },
 		);
 		stopIfStale();
 	}
@@ -13287,6 +13296,8 @@ export class AgentSession {
 				await this.refreshGjcSubskillTools();
 				return;
 			}
+		} else {
+			await this.refreshGjcSubskillTools(expectedIdentity);
 		}
 	}
 
@@ -14663,7 +14674,11 @@ export class AgentSession {
 	}
 
 	#settleOwnedCompletionEnvelope(envelope: OwnedCompletionEnvelope): void {
-		const manager = this.#ownedAsyncJobManager ?? AsyncJobManager.instance();
+		const manager = AsyncJobManager.forEndpoint(envelope.registration.endpointId);
+		if (!manager) {
+			unregisterOwnedRegistration(envelope.registration);
+			return;
+		}
 		const job = manager?.getJob(envelope.registration.jobId);
 		const status = job?.generation === envelope.registration.jobGeneration ? job?.status : undefined;
 		// Evicted jobs have no live record (job === undefined); terminal statuses
@@ -14770,6 +14785,19 @@ export class AgentSession {
 			attribution: message.attribution ?? "agent",
 			timestamp: Date.now(),
 		};
+		const ownedCompletions = (
+			appMessage.details as { ownedCompletions?: unknown } | null | undefined
+		)?.ownedCompletions;
+		if (
+			Array.isArray(ownedCompletions) &&
+			ownedCompletions.some(
+				envelope =>
+					isOwnedCompletionEnvelope(envelope) &&
+					envelope.registration.endpointId !== this.#ownedRegistrationEndpoint(),
+			)
+		) {
+			throw new Error("Owned completion belongs to a different session endpoint.");
+		}
 		const preclaimedUserIntentEpoch = this.#deepInterviewPreclaimedCustomInputEpochs.get(message);
 		this.#deepInterviewPreclaimedCustomInputEpochs.delete(message);
 		if (appMessage.attribution === "user") {

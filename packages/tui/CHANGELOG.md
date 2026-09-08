@@ -4,7 +4,7 @@
 
 ### Fixed
 
-- Multipart raster output now releases its prefix-barrier ownership when the final terminal write is rejected, preventing stale synchronization ownership from surviving terminal loss.
+- Multipart raster output now releases its prefix-barrier ownership when the final terminal write is rejected, terminal availability is lost, or either asynchronous prefix boundary resumes into a stale lifecycle, preventing stale synchronization ownership from surviving terminal loss.
 
 ## [0.16.6] - 2026-09-07
 
