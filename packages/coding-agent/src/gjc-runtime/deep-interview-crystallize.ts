@@ -658,7 +658,7 @@ function validateItems(value: unknown, snapshot?: CrystalSnapshot): CrystalItem[
 				const quoteQuantitative = quantitativeEvidenceTerms(item.anchor.quote);
 				const statementIdentifiers = caseSensitiveIdentifierTerms(item.statement);
 				const quoteIdentifiers = caseSensitiveIdentifierTerms(item.anchor.quote);
-				const conjunctiveQuote = /\b(?:and|plus|as\s+well\s+as)\b/i.test(item.anchor.quote);
+
 				const statementSemantics = semanticProfile(item.statement);
 				const quoteSemantics = semanticProfile(anchoredClause(anchorMessage.content, item.anchor.quote));
 				const authenticatedNonGoal =
@@ -685,7 +685,7 @@ function validateItems(value: unknown, snapshot?: CrystalSnapshot): CrystalItem[
 					quoteTerms.size === 0 ||
 					statementTerms.size === 0 ||
 					[...statementTerms].some(term => !quoteTerms.has(term)) ||
-					(conjunctiveQuote && [...quoteTerms].some(term => !statementTerms.has(term))) ||
+					[...quoteTerms].some(term => !statementTerms.has(term)) ||
 					statementQuantitative.size !== quoteQuantitative.size ||
 					[...statementQuantitative].some(term => !quoteQuantitative.has(term)) ||
 					statementIdentifiers.size !== quoteIdentifiers.size ||
@@ -1372,7 +1372,8 @@ export function crystallizeDeepInterview(value: unknown): DeepInterviewCrystal {
 				anchor.message_index > priorEnd &&
 				message.content.includes(anchor.quote) &&
 				hasVerbatimTokenBoundaries(message.content, anchor.quote) &&
-				/\b(?:keep|retain|restore|preserve|maintain)\b/i.test(anchor.quote) &&
+				(/\b(?:keep|retain|restore|preserve|maintain)\b/i.test(message.content) ||
+					/(?:유지|보존|복원|保持|保留|恢复|恢復|復元)/u.test(message.content)) &&
 				([...topicTerms(previous.statement, false)].some(term => evidenceTerms(anchor.quote).has(term)) ||
 					hasCjkTopicOverlap(previous.statement, anchor.quote)),
 		);
@@ -1465,11 +1466,27 @@ export function crystallizeDeepInterview(value: unknown): DeepInterviewCrystal {
 		const directiveTerms = topicTerms(directive.clause, false);
 		const represented = currentItems.some(
 			item =>
-				(item.anchor?.message_index === directive.messageIndex &&
-					(directive.clause.includes(item.anchor.quote) || item.anchor.quote.includes(directive.clause))) ||
-				([...directiveTerms].every(term => evidenceTerms(item.statement).has(term)) &&
-					sameSemanticIntent(semanticProfile(directive.clause), semanticProfile(item.statement))),
+				[...directiveTerms].every(term => evidenceTerms(item.statement).has(term)) &&
+				sameSemanticIntent(semanticProfile(directive.clause), semanticProfile(item.statement)),
 		);
+		const explicitlySuperseded = canonicalPriorItems.some(previous => {
+			const replacement = items.find(item => item.id === previous.id);
+			return (
+				replacement !== undefined &&
+				!sameIntent(replacement, previous) &&
+				[...directiveTerms].every(term => evidenceTerms(previous.statement).has(term))
+			);
+		});
+		const explicitlyPreserved =
+			/(?:\b(?:keep|retain|restore|preserve|maintain)\b|유지|보존|복원|保持|保留|恢复|恢復|復元)/iu.test(
+				directive.clause,
+			) &&
+			currentItems.some(
+				item =>
+					item.anchor?.message_index === directive.messageIndex &&
+					([...topicTerms(item.statement, false)].some(term => directiveTerms.has(term)) ||
+						hasCjkTopicOverlap(item.statement, directive.clause)),
+			);
 		const representedRemoval = [...priorRemovedAnchors, ...resolvedRemovalAnchors].some(anchor => {
 			const quote = anchor.quote.replace(/[.!?。！？]+$/u, "");
 			const resolution = anchor.resolution.replace(/[.!?。！？]+$/u, "");
@@ -1485,7 +1502,7 @@ export function crystallizeDeepInterview(value: unknown): DeepInterviewCrystal {
 			const itemTerms = topicTerms(item, false);
 			return [...directiveTerms].every(term => itemTerms.has(term));
 		});
-		if (!represented && !representedRemoval && !unresolved)
+		if (!represented && !explicitlySuperseded && !explicitlyPreserved && !representedRemoval && !unresolved)
 			throw new Error(`unrepresented user directive requires an item or unresolved gap: ${directive.clause}`);
 	}
 	if (!currentItems.some(item => item.classification === "confirmed" && item.kind !== "non_goal"))
