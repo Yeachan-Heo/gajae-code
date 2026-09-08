@@ -1522,6 +1522,7 @@ async function persistRalplanFinalAdmission(
 					: undefined;
 			if (
 				currentAdmission &&
+				existing.final_publication_pending === undefined &&
 				JSON.stringify(currentAdmission) === JSON.stringify(admission) &&
 				receipt?.skill === "ralplan" &&
 				receipt.owner === "gjc-runtime" &&
@@ -1537,12 +1538,43 @@ async function persistRalplanFinalAdmission(
 				return;
 			}
 			existing.auto_handoff = admission;
+			delete existing.final_publication_pending;
 			existing = migrateWorkflowState(existing, "ralplan").state;
 			existing.updated_at = new Date().toISOString();
 			await writeWorkflowEnvelopeAtomic(statePath, existing, {
 				cwd,
 				lockHeld: true,
 				receipt: { cwd, skill: "ralplan", owner: "gjc-runtime", command: "gjc ralplan final-admission", sessionId },
+				audit: { category: "state", verb: "write", owner: "gjc-runtime", skill: "ralplan", sessionId },
+			});
+		},
+		{ cwd },
+	);
+}
+
+async function markRalplanFinalPublicationPending(cwd: string, sessionId: string, runId: string): Promise<void> {
+	const statePath = ralplanStatePath(cwd, sessionId);
+	await withWorkflowStateLock(
+		statePath,
+		async () => {
+			const existingRead = await readExistingStateForMutation(statePath);
+			if (existingRead.kind === "corrupt")
+				throw new RalplanCommandError(2, `existing ralplan state is corrupt or tampered (${existingRead.error})`);
+			let existing: Record<string, unknown> = existingRead.kind === "valid" ? existingRead.value : {};
+			existing.skill = "ralplan";
+			existing.version = WORKFLOW_STATE_VERSION;
+			existing.session_id = sessionId;
+			existing.run_id = runId;
+			existing.active = true;
+			existing.current_phase = "final";
+			const startedAt = new Date().toISOString();
+			existing.updated_at = startedAt;
+			existing.final_publication_pending = { run_id: runId, started_at: startedAt };
+			existing = migrateWorkflowState(existing, "ralplan").state;
+			await writeWorkflowEnvelopeAtomic(statePath, existing, {
+				cwd,
+				lockHeld: true,
+				receipt: { cwd, skill: "ralplan", owner: "gjc-runtime", command: "gjc ralplan final-pending", sessionId },
 				audit: { category: "state", verb: "write", owner: "gjc-runtime", skill: "ralplan", sessionId },
 			});
 		},
@@ -2407,6 +2439,7 @@ async function handleArtifactWrite(
 			agentDir,
 			planningStuck: await readRalplanPlanningStuck(persistCwd, resolved.sessionId, resolved.runId),
 		});
+		await markRalplanFinalPublicationPending(persistCwd, resolved.sessionId, resolved.runId);
 	}
 	// Keep run-state `current_phase` coherent with the stage being persisted.
 	await persistActiveRunId(persistCwd, resolved.sessionId, resolved.runId, resolved.stage);
