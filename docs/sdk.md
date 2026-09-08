@@ -938,3 +938,45 @@ blindly re-sent), close mutates only an exactly re-proven substrate, and
 orphaned children converge through ordinary close after
 `sdk.masterOrphanGraceMs`. Task text and master capability are transient
 dispatch inputs and never persist in any durable store, log, or output.
+
+Managed tmux startup on macOS and Linux publishes a private, command-free
+binding before the supervised child starts. The CLI validates its exact
+session, generation, run, incarnation and child token using a bounded native
+read that retains filesystem authority. Opaque bindings contain neither the
+launch command nor a command digest and never grant crash-recovery authority.
+Recoverable predecessor bindings remain a separate Linux-only capability;
+stale binding schemas are rejected rather than migrated. Windows managed-owner
+admission is unsupported: managed tmux/psmux launches are rejected before
+supervisor or session allocation and lifecycle-state writes, with the bounded
+reason `gjc_tmux_managed_launch_platform_unsupported:win32`. The Broker reports
+`substrate_proof_failed` without silently falling back to headless. Ordinary
+unmanaged Windows launches and independent headless selection are unchanged.
+
+Admission denial does not depend on being able to save a diagnostic. Unsafe or
+unavailable storage must not receive a fallback pathname write: the child stays
+blocked with exit 75 and a bounded `handoff_not_persisted` diagnostic when a
+handoff cannot be safely persisted. A generic registration uncertainty is not
+permission to retry seed delivery or discard the Broker claim. Substrate
+supervisor identity and registered SDK-host identity are distinct proofs.
+
+Before publishing the lifecycle marker, the Broker resolves the actual host
+under the original readiness deadline: the headless process itself, or the
+positively verified direct child of the pinned managed supervisor. Registration
+must match that host and the lifecycle request marker. The supervisor proof
+remains separate cleanup authority; an empty process observation is not proof
+of absence, and ambiguous or replaced children are not adopted.
+
+This registration repair does not change managed-owner shutdown. The existing
+Darwin provider-close limitation is addressed by the dependent shutdown change;
+registration success alone must not be reported as complete lifecycle support.
+This layer verifies the native reader, real CLI admission, host-identity mapping
+and headless registration. The dependent shutdown layer carries the combined
+managed source/compiled registration and provider-close integration tests;
+headless registration alone does not prove that managed lifecycle boundary.
+
+Source installations must rebuild the native addon and regenerate its exports
+when updating this admission boundary. Compiled installations need a matching
+CLI/native build. Editing source or replacing files does not update a running
+Broker; verify a fresh isolated runtime before a separately controlled Broker
+replacement. Registration tests must exercise the real managed supervisor and
+CLI host, not merely headless registration or successful tmux allocation.

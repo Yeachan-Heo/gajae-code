@@ -6,6 +6,7 @@ import type { ManagedTmuxLaunchProof } from "../src/gjc-runtime/tmux-sessions";
 import type { SpawnSubstrateLaunchSpec, SpawnSubstrateProof } from "../src/sdk/broker/spawn-authority";
 import {
 	createSpawnSubstrateProvider,
+	type SpawnLifecycleProcess,
 	type SpawnSubstrateProviderDependencies,
 } from "../src/sdk/broker/spawn-substrate";
 
@@ -65,6 +66,252 @@ afterEach(async () => {
 	await Promise.all(
 		temporaryDirectories.splice(0).map(directory => fs.rm(directory, { recursive: true, force: true })),
 	);
+});
+
+describe("lifecycle owner resolution", () => {
+	function fixture() {
+		let clock = 0;
+		let childrenReads = 0;
+		let verifies = 0;
+		const incarnations = new Map([
+			[701, "darwin:701"],
+			[702, "darwin:702"],
+		]);
+		const child: SpawnLifecycleProcess = {
+			pid: 702,
+			incarnation: "darwin:702",
+			ppid: 701,
+			status: () => "running",
+			children: () => [],
+		};
+		const parent: SpawnLifecycleProcess = {
+			pid: 701,
+			incarnation: "darwin:701",
+			ppid: 700,
+			status: () => "running",
+			children: () => [child],
+		};
+		const state = {
+			child,
+			parent,
+			incarnations,
+			open: (pid: number): SpawnLifecycleProcess | null => (pid === 701 ? parent : pid === 702 ? child : null),
+			children: (_read: number): SpawnLifecycleProcess[] => [child],
+			onVerify: (_read: number) => {},
+			verdict: "verified" as "verified" | "mismatch" | "gone",
+			advance: (ms: number) => {
+				clock += ms;
+			},
+			sleeps: [] as number[],
+		};
+		parent.children = () => state.children(++childrenReads);
+		const provider = createSpawnSubstrateProvider(
+			managedDependencies({
+				now: () => clock,
+				sleep: async ms => {
+					state.sleeps.push(ms);
+					clock += ms;
+				},
+				processIncarnation: pid => incarnations.get(pid),
+				openLifecycleProcess: pid => state.open(pid),
+				verifyManaged: () => {
+					state.onVerify(++verifies);
+					return state.verdict;
+				},
+			}),
+		);
+		return { state, provider };
+	}
+
+	it("waits for positive direct-child evidence and keeps supervisor cleanup proof", async () => {
+		const { state, provider } = fixture();
+		state.children = read => (read < 3 ? [] : [state.child]);
+		const proof = substrateProof();
+		expect(await provider.resolveLifecycleOwner(proof, 125)).toEqual({
+			ok: true,
+			owner: { pid: 702, incarnation: "darwin:702" },
+		});
+		expect(state.sleeps).toEqual([50, 50]);
+		expect(proof.pid).toBe(701);
+		expect(proof.processIncarnation).toBe("darwin:701");
+	});
+
+	it("treats empty enumeration as inconclusive until the original deadline", async () => {
+		const { state, provider } = fixture();
+		state.children = () => [];
+		expect(await provider.resolveLifecycleOwner(substrateProof(), 125)).toEqual({
+			ok: false,
+			code: "owner_deadline",
+		});
+		expect(state.sleeps).toEqual([50, 50, 25]);
+	});
+
+	it("rejects ambiguity without filtering an unverifiable second child", async () => {
+		const { state, provider } = fixture();
+		state.children = () => [state.child, { ...state.child, pid: 703, incarnation: "", status: () => "exited" }];
+		expect(await provider.resolveLifecycleOwner(substrateProof(), 125)).toEqual({
+			ok: false,
+			code: "owner_ambiguous",
+		});
+	});
+
+	for (const failure of [
+		"parent-exit",
+		"child-exit",
+		"parent-reuse",
+		"child-reuse",
+		"missing-identity",
+		"reparent",
+		"provider-drift",
+		"disappearance",
+		"replacement",
+		"late-ambiguity",
+		"throw",
+	] as const) {
+		it(`rejects ${failure} after pinning instead of adopting another child`, async () => {
+			const { state, provider } = fixture();
+			state.onVerify = read => {
+				if (read !== 2) return;
+				switch (failure) {
+					case "parent-exit":
+						state.parent.status = () => "exited";
+						break;
+					case "child-exit":
+						state.child.status = () => "exited";
+						break;
+					case "parent-reuse":
+						state.incarnations.set(701, "replacement");
+						break;
+					case "child-reuse":
+						state.incarnations.set(702, "replacement");
+						break;
+					case "missing-identity":
+						state.incarnations.delete(702);
+						break;
+					case "reparent":
+						Object.defineProperty(state.child, "ppid", { value: 999 });
+						break;
+					case "provider-drift":
+						state.verdict = "mismatch";
+						break;
+					case "disappearance":
+						state.children = () => [];
+						break;
+					case "replacement":
+						state.children = () => [{ ...state.child, pid: 703 }];
+						break;
+					case "late-ambiguity":
+						state.children = () => [state.child, { ...state.child, pid: 703 }];
+						break;
+					case "throw":
+						throw new Error("unavailable process evidence");
+				}
+			};
+			expect(await provider.resolveLifecycleOwner(substrateProof(), 125)).toEqual({
+				ok: false,
+				code: failure === "late-ambiguity" ? "owner_ambiguous" : "owner_proof_failed",
+			});
+			expect(state.sleeps).toEqual([]);
+		});
+	}
+
+	for (const check of [1, 2]) {
+		it(`checks the original deadline after awaited provider verification ${check}`, async () => {
+			const { state, provider } = fixture();
+			state.onVerify = read => {
+				if (read === check) state.advance(125);
+			};
+			expect(await provider.resolveLifecycleOwner(substrateProof(), 125)).toEqual({
+				ok: false,
+				code: "owner_deadline",
+			});
+		});
+	}
+
+	it("checks expiry after synchronous process observations too", async () => {
+		const { state, provider } = fixture();
+		state.children = read => {
+			if (read === 2) state.advance(125);
+			return [state.child];
+		};
+		expect(await provider.resolveLifecycleOwner(substrateProof(), 125)).toEqual({
+			ok: false,
+			code: "owner_deadline",
+		});
+	});
+
+	it("rejects unsupported managed topology", async () => {
+		const { provider } = fixture();
+		expect(await provider.resolveLifecycleOwner({ ...substrateProof(), substrateKind: "psmux" }, 125)).toEqual({
+			ok: false,
+			code: "owner_unsupported",
+		});
+	});
+
+	for (const evidence of ["missing", "reused", "exited", "reparented"] as const) {
+		it(`rejects ${evidence} fresh child evidence even when retained getters still match`, async () => {
+			const { state, provider } = fixture();
+			state.open = pid => {
+				if (pid === 701) return state.parent;
+				if (evidence === "missing") return null;
+				return {
+					...state.child,
+					incarnation: evidence === "reused" ? "replacement" : state.child.incarnation,
+					ppid: evidence === "reparented" ? 999 : 701,
+					status: () => (evidence === "exited" ? "exited" : "running"),
+				};
+			};
+			expect(await provider.resolveLifecycleOwner(substrateProof(), 125)).toEqual({
+				ok: false,
+				code: "owner_proof_failed",
+			});
+		});
+	}
+
+	it("does not begin observation with an expired or invalid deadline", async () => {
+		const { state, provider } = fixture();
+		state.onVerify = () => {
+			throw new Error("must not verify");
+		};
+		for (const deadline of [0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
+			expect(await provider.resolveLifecycleOwner(substrateProof(), deadline)).toEqual({
+				ok: false,
+				code: "owner_deadline",
+			});
+		}
+	});
+
+	it("reproves headless state and live identity instead of returning a stored tuple", async () => {
+		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "spawn-owner-"));
+		temporaryDirectories.push(directory);
+		let status = "running";
+		const reference: SpawnLifecycleProcess = {
+			pid: 701,
+			incarnation: "darwin:701",
+			ppid: 1,
+			status: () => status,
+			children: () => [],
+		};
+		const provider = createSpawnSubstrateProvider(
+			managedDependencies({
+				selectMultiplexer: () => "none",
+				startHeadless: () => ({ pid: 701, terminate() {} }),
+				now: () => 0,
+				openLifecycleProcess: () => reference,
+			}),
+		);
+		const launched = await provider.launch(launchSpec(directory));
+		if (!launched.ok) throw new Error("fixture launch failed");
+		expect(await provider.resolveLifecycleOwner(launched.proof, 125)).toEqual({
+			ok: true,
+			owner: { pid: 701, incarnation: "darwin:701" },
+		});
+		status = "exited";
+		expect(await provider.resolveLifecycleOwner(launched.proof, 125)).toEqual({
+			ok: false,
+			code: "owner_proof_failed",
+		});
+	});
 });
 
 describe("Broker spawn substrate provider", () => {

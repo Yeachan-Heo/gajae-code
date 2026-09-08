@@ -11,6 +11,7 @@ import {
 	exactRestore,
 	exactUnlink,
 	exactUnlinkDirect,
+	readOwnerOnlyFile,
 	snapshotDirectoryTree,
 	verifyOwnerOnlyPathSecurity,
 } from "../native/index.js";
@@ -87,6 +88,123 @@ afterEach(async () => {
 	await Promise.all(
 		temporaryDirectories.splice(0).map(directory => fs.rm(directory, { recursive: true, force: true })),
 	);
+});
+
+describe("native owner-only file reader", () => {
+	it.skipIf(process.platform === "darwin" || process.platform === "linux")(
+		"fails explicitly on unsupported platforms",
+		() => {
+			expect(readOwnerOnlyFile("binding.json", 65536)).toEqual({ ok: false, code: "unsupported_platform" });
+		},
+	);
+
+	describe.skipIf(process.platform !== "darwin" && process.platform !== "linux")("retained private read", () => {
+		async function fixture(contents: Uint8Array = Buffer.from('{"binding":true}\n')) {
+			const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-owner-read-"));
+			temporaryDirectories.push(root);
+			await fs.chmod(root, 0o700);
+			const file = path.join(root, "binding.json");
+			await fs.writeFile(file, contents, { mode: 0o600 });
+			return { root, file, contents };
+		}
+
+		it("returns only exact bytes and leaves bytes and security unchanged", async () => {
+			const { file, contents } = await fixture();
+			const before = await fs.stat(file);
+			const result = readOwnerOnlyFile(file, 65536);
+			expect(result.ok).toBe(true);
+			expect(result.data).toBeInstanceOf(Uint8Array);
+			if (!result.data) throw new Error("successful read must return bytes");
+			expect(Buffer.from(result.data)).toEqual(Buffer.from(contents));
+			expect(Object.keys(result).sort()).toEqual(["data", "ok"]);
+			const after = await fs.stat(file);
+			expect([after.mode, after.ino, after.size, after.mtimeMs, after.ctimeMs]).toEqual([
+				before.mode,
+				before.ino,
+				before.size,
+				before.mtimeMs,
+				before.ctimeMs,
+			]);
+			expect(await fs.readFile(file)).toEqual(Buffer.from(contents));
+		});
+
+		it("enforces exact nonzero byte and numeric limits without coercion", async () => {
+			const { file } = await fixture(Buffer.alloc(65536, 42));
+			expect(readOwnerOnlyFile(file, 65536).data?.length).toBe(65536);
+			expect(readOwnerOnlyFile(file, 65535)).toEqual({ ok: false, code: "invalid_size" });
+			for (const limit of [0, -1, 0.5, 65537, 2 ** 32 + 65536, NaN, Infinity]) {
+				expect(readOwnerOnlyFile(file, limit)).toEqual({ ok: false, code: "invalid_limit" });
+			}
+			for (const size of [0, 65537]) {
+				await fs.writeFile(file, Buffer.alloc(size));
+				expect(readOwnerOnlyFile(file, 65536)).toEqual({ ok: false, code: "invalid_size" });
+			}
+			await fs.writeFile(file, Buffer.from([255]));
+			expect(readOwnerOnlyFile(file, 1).data).toEqual(new Uint8Array([255]));
+		});
+
+		it("rejects unsafe file and lifecycle modes without repairing them", async () => {
+			const { root, file } = await fixture();
+			for (const [target, mode, restore] of [
+				[file, 0o640, 0o600],
+				[file, 0o4600, 0o600],
+				[root, 0o755, 0o700],
+			] as const) {
+				await fs.chmod(target, mode);
+				expect(readOwnerOnlyFile(file, 65536)).toEqual({ ok: false, code: "unsafe_security" });
+				expect((await fs.stat(target)).mode & 0o7777).toBe(mode);
+				await fs.chmod(target, restore);
+			}
+		});
+
+		it("rejects leaf and ancestor symlinks, hardlinks, traversal, NUL and directories", async () => {
+			const { root, file } = await fixture();
+			const alias = path.join(root, "alias");
+			await fs.symlink(file, alias);
+			expect(readOwnerOnlyFile(alias, 65536)).toEqual({ ok: false, code: "unsafe_path" });
+			const directoryAlias = path.join(root, "directory-alias");
+			await fs.symlink(root, directoryAlias);
+			expect(readOwnerOnlyFile(path.join(directoryAlias, "binding.json"), 65536)).toEqual({
+				ok: false,
+				code: "unsafe_path",
+			});
+			expect(readOwnerOnlyFile(`${root}/../${path.basename(root)}/binding.json`, 65536)).toEqual({
+				ok: false,
+				code: "unsafe_path",
+			});
+			expect(readOwnerOnlyFile(`${file}\0`, 65536)).toEqual({ ok: false, code: "invalid_path" });
+			expect(readOwnerOnlyFile(root, 65536)).toEqual({ ok: false, code: "unsafe_path" });
+			await fs.link(file, path.join(root, "hardlink"));
+			expect(readOwnerOnlyFile(file, 65536)).toEqual({ ok: false, code: "unsafe_file" });
+		});
+
+		it.skipIf(process.getuid?.() !== 0)("rejects a different owner even when root can read the file", async () => {
+			const { file } = await fixture();
+			await fs.chown(file, 65534, 65534);
+			expect(readOwnerOnlyFile(file, 65536)).toEqual({ ok: false, code: "unsafe_security" });
+		});
+
+		it.skipIf(process.platform !== "darwin")("allows only the exact macOS system aliases", async () => {
+			const root = await fs.mkdtemp("/tmp/pi-owner-read-");
+			temporaryDirectories.push(root);
+			const file = path.join(root, "binding.json");
+			await fs.writeFile(file, "binding", { mode: 0o600 });
+			expect(readOwnerOnlyFile(file, 65536).ok).toBe(true);
+			expect(readOwnerOnlyFile(`/private${file}`, 65536).data).toEqual(readOwnerOnlyFile(file, 65536).data);
+		});
+
+		it.skipIf(process.platform !== "darwin")("rejects read-denying ACLs without write retry or repair", async () => {
+			const { file } = await fixture();
+			const installed = Bun.spawnSync(["/bin/chmod", "+a", "everyone deny read", file]);
+			expect(installed.exitCode).toBe(0);
+			try {
+				expect(readOwnerOnlyFile(file, 65536)).toEqual({ ok: false, code: "unsafe_path" });
+				expect(verifyOwnerOnlyPathSecurity(file, "file")).toEqual({ ok: false, code: "acl_verify_failed" });
+			} finally {
+				expect(Bun.spawnSync(["/bin/chmod", "-N", file]).exitCode).toBe(0);
+			}
+		});
+	});
 });
 
 describe.skipIf(process.platform === "win32")("POSIX native path identity", () => {

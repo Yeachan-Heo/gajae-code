@@ -115,6 +115,7 @@ for (const scenario of [
 					return { ok: true, proof: launchedProof };
 				},
 				verify: async () => "verified",
+				resolveLifecycleOwner: async () => ({ ok: true, owner: { pid: 4321, incarnation: "inc-4321" } }),
 				close: async () => {
 					closes += 1;
 					return { ok: true };
@@ -227,7 +228,12 @@ test("real session.spawn publishes lifecycle authority and registers a live chil
 		release.resolve();
 		await spawning;
 		transition.mockRestore();
-		if (launchedProof) await provider.close(launchedProof);
+		if (launchedProof) {
+			if ((await provider.verify(launchedProof)) !== "gone") {
+				expect(await provider.close(launchedProof)).toMatchObject({ ok: true });
+			}
+			expect(await provider.verify(launchedProof)).toBe("gone");
+		}
 		await broker.stop();
 		setLifecycleCommandResolverForTest(broker, undefined);
 		await fs.rm(root, { recursive: true, force: true });

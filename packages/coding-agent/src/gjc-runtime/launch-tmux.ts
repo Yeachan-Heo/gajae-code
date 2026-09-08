@@ -2,10 +2,12 @@ import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { verifyOwnerOnlyPathSecurity } from "@gajae-code/natives";
 import { VERSION } from "@gajae-code/utils/dirs";
 import { isCompiledBinary } from "@gajae-code/utils/env";
 import { safeStderrWrite } from "@gajae-code/utils/safe-stderr";
 import type { Args } from "../cli/args";
+import { prepareManagedDirectoryRoot } from "../session/internal/managed-session-storage";
 import { readLinuxProcStartTimeSync } from "./linux-proc";
 import {
 	MANAGED_OWNER_PREDECESSOR_GENERATION_ENV,
@@ -1403,6 +1405,25 @@ function createIsolatedTmuxSession(
 ): TmuxSpawnResult {
 	const sessionId = plan.sessionId ?? plan.sessionName;
 	const stateDir = path.dirname(plan.sessionStateFile ?? path.join(plan.cwd, ".gjc", "runtime"));
+	if (plan.platform === "linux" || plan.platform === "darwin") {
+		try {
+			const root = lifecyclePaths(stateDir, sessionId, plan.ownerGeneration ?? plan.sessionName).root;
+			let exists = false;
+			try {
+				fs.lstatSync(root);
+				exists = true;
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+			}
+			if (exists && !verifyOwnerOnlyPathSecurity(root, "directory").ok)
+				throw new Error("managed_owner_storage_unsafe");
+			prepareManagedDirectoryRoot(root);
+			if (!verifyOwnerOnlyPathSecurity(root, "directory").ok) throw new Error("managed_owner_storage_unsafe");
+		} catch {
+			diagnostic("tmux owner lifecycle preparation failed");
+			return { exitCode: 1, stderr: "managed_owner_storage_unsafe" };
+		}
+	}
 	const baseline = plan.ownerGenerationBaseline ?? captureOwnerGenerationBaselineSync(stateDir, sessionId);
 	plan.ownerGenerationBaseline = baseline;
 	const ownerPlan = planTmuxOwnerIsolationSync(

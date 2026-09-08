@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { Broker } from "../src/sdk/broker/broker";
+import { Broker, type SpawnPromptLayer } from "../src/sdk/broker/broker";
 import { readEndpointFile } from "../src/sdk/broker/endpoint-authority";
 import { processIncarnation } from "../src/sdk/broker/process-incarnation";
 import { type SessionIndexEvent, sessionIndexChecksum } from "../src/sdk/broker/session-index";
@@ -107,13 +107,15 @@ const spawnSubstrateFake = {
 		},
 	}),
 	verify: async () => "verified" as const,
+	resolveLifecycleOwner: async () => ({ ok: true as const, owner: { pid: 4242, incarnation: "inc-4242" } }),
 	close: async () => ({ ok: true }),
 };
 const spawnPromptLayerFake = {
-	awaitRegistration: async (input: { childId: string; cwd: string; stateRoot: string }) => ({
+	awaitRegistration: async (input: Parameters<SpawnPromptLayer["awaitRegistration"]>[0]) => ({
 		ok: true as const,
 		registration: {
 			sessionId: input.childId,
+			lifecycleRequestId: input.effectMarker,
 			endpointGeneration: 1,
 			pid: 4242,
 			processIncarnation: "inc-4242",

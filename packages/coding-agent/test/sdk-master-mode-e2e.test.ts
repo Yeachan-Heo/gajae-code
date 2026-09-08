@@ -2,7 +2,7 @@ import { describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { Broker } from "../src/sdk/broker/broker";
+import { Broker, type SpawnPromptLayer } from "../src/sdk/broker/broker";
 import { getBrokerIdentityKey } from "../src/sdk/broker/identity";
 import { processIncarnation } from "../src/sdk/broker/process-incarnation";
 import { type SessionIndexEvent, sessionIndexChecksum } from "../src/sdk/broker/session-index";
@@ -51,6 +51,7 @@ function substrateFake(counters: { launches: number; closes: number }) {
 			};
 		},
 		verify: async () => (gone ? ("gone" as const) : ("verified" as const)),
+		resolveLifecycleOwner: async () => ({ ok: true as const, owner: { pid: 4321, incarnation: "inc-4321" } }),
 		close: async () => {
 			counters.closes += 1;
 			gone = true;
@@ -61,13 +62,14 @@ function substrateFake(counters: { launches: number; closes: number }) {
 
 function promptLayerFake(counters: { dispatches: number }) {
 	return {
-		awaitRegistration: async (input: { childId: string; cwd: string; stateRoot: string }) => {
+		awaitRegistration: async (input: Parameters<SpawnPromptLayer["awaitRegistration"]>[0]) => {
 			const marker = await Bun.file(path.join(input.stateRoot, "sdk", `${input.childId}.lifecycle.json`)).json();
 			expect(marker).toMatchObject({ pid: 4321, incarnation: "inc-4321", effectMarker: expect.any(String) });
 			return {
 				ok: true as const,
 				registration: {
 					sessionId: input.childId,
+					lifecycleRequestId: input.effectMarker,
 					endpointGeneration: 1,
 					pid: 4321,
 					processIncarnation: "inc-4321",

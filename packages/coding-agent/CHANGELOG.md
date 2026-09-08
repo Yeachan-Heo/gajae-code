@@ -4,6 +4,8 @@
 ### Fixed
 
 - Coordinator responses now preserve `error: null` instead of replacing it with an `unavailable` error. Non-null errors still use fixed public messages, and unknown error codes remain mapped to `unavailable`.
+- Unsupported Windows managed SDK launches are rejected before supervisor/session allocation instead of failing later at the POSIX-only admission reader; independently selected headless and unmanaged Windows paths remain unchanged.
+- Managed SDK child registration retains a command-free binding, validates ordinary admission with bounded filesystem authority on macOS and Linux, and publishes the actual SDK host identity rather than its supervisor in the lifecycle marker. Linux-only predecessor recovery and fail-closed diagnostics remain intact. Managed-owner shutdown is unchanged and is handled by a dependent fix.
 - File-lock acquisition now fences retained `.removing` transitions on macOS as well as Linux, preventing successor publication from racing predecessor cleanup and wedging session-index locking with `quarantine_collision`. Raced publications roll back only after exact-identity verification; unowned transitions remain untouched and produce bounded contention diagnostics.
 - Paseo's base ACP provider now inherits the active model preset when attaching to a live CLI session, including preset switching, without requiring a separately registered preset provider.
 - Primary control now follows the session host's startup surface: Paseo attachments cannot take over a CLI host's permission/UI providers or close/delete authority, while Paseo/SDK hosts retain ACP ownership across reloads and reconnects.

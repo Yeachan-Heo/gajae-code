@@ -67,6 +67,7 @@ import {
 	type SpawnAuthorityV1,
 	type SpawnClaimDecision,
 	type SpawnClaimV2,
+	type SpawnLifecycleOwner,
 	type SpawnSubstrateFailure,
 	type SpawnSubstrateProof,
 	type SpawnSubstrateProvider,
@@ -363,7 +364,10 @@ export interface SpawnPromptLayer {
 		childId: string;
 		cwd: string;
 		stateRoot: string;
-	}): Promise<{ ok: true; registration: SpawnHostRegistration } | { ok: false }>;
+		owner: SpawnLifecycleOwner;
+		effectMarker: string;
+		deadlineAt: number;
+	}): Promise<{ ok: true; registration: SpawnHostRegistration & { lifecycleRequestId: string } } | { ok: false }>;
 	dispatch(input: {
 		sessionId: string;
 		task: string;
@@ -476,7 +480,6 @@ function isBrokerResponse(value: unknown): value is BrokerResponse {
 	return typeof value === "object" && value !== null && "ok" in value && typeof value.ok === "boolean";
 }
 
-const SPAWN_HOST_REGISTRATION_TIMEOUT_MS = 10_000;
 const SPAWN_HOST_REGISTRATION_POLL_MS = 50;
 const SPAWN_PROMPT_EXCHANGE_TIMEOUT_MS = 10_000;
 const MASTER_ORPHAN_GRACE_DEFAULT_MS = 120_000;
@@ -1525,6 +1528,7 @@ export class Broker {
 		// Set the moment a substrate exists. After this point a failure is
 		// ambiguous, never an ordinary pre-effect failure.
 		let launchedProof: SpawnSubstrateProof | undefined;
+		let unownedReleaseAttempted = false;
 		let pinnedRegistration: SpawnHostRegistration | undefined;
 		try {
 			if (current.state === "prepared") {
@@ -1566,15 +1570,19 @@ export class Broker {
 					).claim;
 					return spawnFailureError(failure);
 				}
-				const { pid, processIncarnation: incarnation } = launched.proof;
-				if (pid === undefined || incarnation === undefined) {
+				if (
+					launched.proof.pid === undefined ||
+					!Number.isSafeInteger(launched.proof.pid) ||
+					launched.proof.pid <= 0 ||
+					!safeSpawnOpaque(launched.proof.processIncarnation)
+				) {
 					const failure: SpawnSubstrateFailure = {
 						substrateKind: launched.proof.substrateKind,
 						code: "substrate_proof_failed",
-						message: "session.spawn substrate lacks lifecycle process authority",
+						message: "session.spawn substrate lacks process authority",
 					};
+					unownedReleaseAttempted = true;
 					await this.#releaseUnownedSubstrate(provider, launchedProof);
-					launchedProof = undefined;
 					current = (
 						await store.persistTransition(lifecycleIdentity, {
 							claimId: current.claimId,
@@ -1585,17 +1593,52 @@ export class Broker {
 					).claim;
 					return spawnFailureError(failure);
 				}
+				const resolution = await provider.resolveLifecycleOwner(launched.proof, prep.semanticReadyDeadlineAt);
+				if (!resolution.ok || Date.now() >= prep.semanticReadyDeadlineAt) {
+					unownedReleaseAttempted = true;
+					await this.#releaseUnownedSubstrate(provider, launchedProof);
+					current = (
+						await store.persistTransition(lifecycleIdentity, {
+							claimId: current.claimId,
+							from: "substrate_starting",
+							to: "uncertain",
+						})
+					).claim;
+					return error(
+						"terminal_uncertain",
+						`session.spawn lifecycle owner resolution failed (${resolution.ok ? "owner_deadline" : resolution.code})`,
+					);
+				}
+				const { pid, incarnation } = resolution.owner;
+				if (!Number.isSafeInteger(pid) || pid <= 0 || !safeSpawnOpaque(incarnation))
+					throw new Error("Invalid resolved lifecycle owner");
 				const marker = { pid, incarnation, effectMarker: prep.effectMarker };
+				if (Date.now() >= prep.semanticReadyDeadlineAt) throw new Error("Lifecycle owner deadline expired");
 				await writeEffectMarker(prep.stateRoot, prep.childId, marker);
+				if (Date.now() >= prep.semanticReadyDeadlineAt) throw new Error("Lifecycle marker deadline expired");
 				const registration = await this.#spawnPromptLayer.awaitRegistration({
 					childId: prep.childId,
 					cwd: prep.cwd,
 					stateRoot: prep.stateRoot,
+					owner: resolution.owner,
+					effectMarker: prep.effectMarker,
+					deadlineAt: prep.semanticReadyDeadlineAt,
 				});
-				if (!registration.ok) {
+				if (
+					!registration.ok ||
+					Date.now() >= prep.semanticReadyDeadlineAt ||
+					registration.registration.sessionId !== prep.childId ||
+					registration.registration.pid !== pid ||
+					registration.registration.processIncarnation !== incarnation ||
+					registration.registration.lifecycleRequestId !== prep.effectMarker ||
+					!Number.isSafeInteger(registration.registration.endpointGeneration) ||
+					registration.registration.endpointGeneration <= 0 ||
+					resolveEquivalentPath(registration.registration.cwd) !== resolveEquivalentPath(prep.cwd) ||
+					resolveEquivalentPath(registration.registration.stateRoot) !== resolveEquivalentPath(prep.stateRoot)
+				) {
 					const startupFailure = await readSessionLifecycleFailure(prep.stateRoot, prep.childId, marker);
+					unownedReleaseAttempted = true;
 					await this.#releaseUnownedSubstrate(provider, launchedProof);
-					launchedProof = undefined;
 					current = (
 						await store.persistTransition(lifecycleIdentity, {
 							claimId: current.claimId,
@@ -1777,7 +1820,7 @@ export class Broker {
 			// EVERY post-launch failure exit, not just a returned registration
 			// failure: a throw from awaitRegistration, verify, close, or a durable
 			// transition all land here.
-			if (!handedOff) await this.#releaseUnownedSubstrate(provider, launchedProof);
+			if (!handedOff && !unownedReleaseAttempted) await this.#releaseUnownedSubstrate(provider, launchedProof);
 			return ambiguous
 				? error("terminal_uncertain", "session.spawn state could not be advanced durably")
 				: error("spawn_failed", "session.spawn could not be advanced durably");
@@ -1974,16 +2017,24 @@ export class Broker {
 		childId: string;
 		cwd: string;
 		stateRoot: string;
-	}): Promise<{ ok: true; registration: SpawnHostRegistration } | { ok: false }> {
-		const deadline = Date.now() + SPAWN_HOST_REGISTRATION_TIMEOUT_MS;
+		owner: SpawnLifecycleOwner;
+		effectMarker: string;
+		deadlineAt: number;
+	}): Promise<{ ok: true; registration: SpawnHostRegistration & { lifecycleRequestId: string } } | { ok: false }> {
+		const deadline = input.deadlineAt;
 		for (;;) {
+			if (Date.now() >= deadline) return { ok: false };
 			try {
 				await this.index.refresh();
+				if (Date.now() >= deadline) return { ok: false };
 				// The launch locator is authority: a same-id row registered by an
 				// unrelated workspace must never be adopted as this spawn's child.
 				const row = this.index.listSessionIdentities().find(
 					candidate =>
 						candidate.sessionId === input.childId &&
+						candidate.pid === input.owner.pid &&
+						(candidate.hostIncarnation ?? candidate.processIncarnation) === input.owner.incarnation &&
+						candidate.lifecycleRequestId === input.effectMarker &&
 						candidate.endpointGeneration > 0 &&
 						candidate.live &&
 						!candidate.terminal &&
@@ -2008,6 +2059,7 @@ export class Broker {
 								endpointGeneration: row.endpointGeneration,
 								pid: row.pid,
 								processIncarnation: incarnation,
+								lifecycleRequestId: input.effectMarker,
 								cwd: row.locator.cwd,
 								stateRoot: row.locator.stateRoot,
 							},
@@ -2017,8 +2069,8 @@ export class Broker {
 			} catch {
 				// A transient index read failure only delays the poll.
 			}
-			if (Date.now() > deadline) return { ok: false };
-			await Bun.sleep(SPAWN_HOST_REGISTRATION_POLL_MS);
+			if (Date.now() >= deadline) return { ok: false };
+			await Bun.sleep(Math.min(SPAWN_HOST_REGISTRATION_POLL_MS, deadline - Date.now()));
 		}
 	}
 

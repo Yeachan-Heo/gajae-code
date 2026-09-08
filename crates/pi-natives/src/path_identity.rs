@@ -1126,6 +1126,52 @@ pub fn apply_owner_only_path_security(path: String, kind: String) -> NativeOwner
 	platform::apply_owner_only_path_security(Path::new(&path), &kind)
 }
 
+/// Bounded, read-only owner-private file bytes. Failures never contain paths or
+/// bytes.
+#[napi(object)]
+pub struct NativeOwnerOnlyFileReadResult {
+	pub ok:   bool,
+	pub data: Option<Uint8Array>,
+	pub code: Option<String>,
+}
+
+/// Read a private regular file under a private lifecycle directory on
+/// macOS/Linux.
+///
+/// `max_bytes` must be an integer in 1..=65536. Both
+/// same-descriptor reads are bounded; no path, digest, descriptor, or partial
+/// bytes are returned on failure.
+#[napi]
+pub fn read_owner_only_file(path: String, max_bytes: f64) -> NativeOwnerOnlyFileReadResult {
+	let result: Result<Vec<u8>, &'static str> = if !max_bytes.is_finite()
+		|| max_bytes.fract() != 0.0
+		|| !(1.0..=65536.0).contains(&max_bytes)
+	{
+		Err("invalid_limit")
+	} else if path.is_empty() || path.contains('\0') {
+		Err("invalid_path")
+	} else {
+		#[cfg(any(target_os = "linux", target_os = "macos"))]
+		{
+			platform::read_owner_only_file(Path::new(&path), max_bytes as usize)
+		}
+		#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+		{
+			Err("unsupported_platform")
+		}
+	};
+	match result {
+		Ok(bytes) => NativeOwnerOnlyFileReadResult {
+			ok:   true,
+			data: Some(Uint8Array::new(bytes)),
+			code: None,
+		},
+		Err(code) => {
+			NativeOwnerOnlyFileReadResult { ok: false, data: None, code: Some(code.to_owned()) }
+		},
+	}
+}
+
 #[napi]
 pub fn verify_owner_only_path_security(
 	path: String,
@@ -2388,6 +2434,17 @@ pub(crate) mod platform {
 		path: &Path,
 		kind: &str,
 	) -> Result<CheckedPathAuthority, NativeOwnerOnlySecurityResult> {
+		checked_file_with_access(path, kind, true)
+	}
+
+	#[allow(clippy::result_large_err, reason = "preserves structured native security evidence")]
+	fn checked_file_with_access(
+		path: &Path,
+		kind: &str,
+		allow_write_retry: bool,
+	) -> Result<CheckedPathAuthority, NativeOwnerOnlySecurityResult> {
+		#[cfg(not(target_os = "macos"))]
+		let _ = allow_write_retry;
 		if !matches!(kind, "directory" | "file") {
 			return Err(NativeOwnerOnlySecurityResult::failure("io_error"));
 		}
@@ -2479,7 +2536,7 @@ pub(crate) mod platform {
 		// O_NOFOLLOW rejects symlinks.
 		let target_fd = unsafe { libc::openat(current.as_raw_fd(), name.as_ptr(), flags) };
 		#[cfg(target_os = "macos")]
-		let target_fd = if target_fd < 0 && !is_directory {
+		let target_fd = if target_fd < 0 && !is_directory && allow_write_retry {
 			let read_error = std::io::Error::last_os_error();
 			if read_error.raw_os_error() == Some(libc::EACCES) {
 				// A hostile macOS ACL may deny reads while leaving owner writes
@@ -2536,6 +2593,453 @@ pub(crate) mod platform {
 			return Err(NativeOwnerOnlySecurityResult::failure("identity_mismatch"));
 		}
 		Ok(actual)
+	}
+
+	#[cfg(any(target_os = "linux", target_os = "macos"))]
+	fn read_stat_unchanged(before: &libc::stat, after: &libc::stat) -> bool {
+		stat_same_object(before, after)
+			&& before.st_mode == after.st_mode
+			&& before.st_gid == after.st_gid
+			&& before.st_nlink == after.st_nlink
+			&& before.st_size == after.st_size
+			&& stat_mtime_ns(before) == stat_mtime_ns(after)
+			&& stat_ctime_ns(before) == stat_ctime_ns(after)
+	}
+
+	#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+	type OwnerReadHook = Box<dyn FnMut(&str, &CheckedPathAuthority) -> Result<(), &'static str>>;
+	#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+	thread_local! {
+		static OWNER_READ_HOOK: std::cell::RefCell<Option<OwnerReadHook>> = const { std::cell::RefCell::new(None) };
+		static OWNER_READ_DENIED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+	}
+	#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+	fn owner_read_hook(stage: &str, authority: &CheckedPathAuthority) -> Result<(), &'static str> {
+		OWNER_READ_HOOK.with(|hook| match hook.borrow_mut().as_mut() {
+			Some(hook) => hook(stage, authority),
+			None => Ok(()),
+		})
+	}
+
+	#[cfg(any(target_os = "linux", target_os = "macos"))]
+	fn read_private_snapshot(
+		authority: &CheckedPathAuthority,
+		max_bytes: usize,
+	) -> Result<usize, &'static str> {
+		let file = revalidate_authority(authority).map_err(|_| "authority_changed")?;
+		let parent = fstat(authority.parent.as_raw_fd()).map_err(|_| "io_error")?;
+		if !read_stat_unchanged(&authority.initial, &file)
+			|| !read_stat_unchanged(&authority.parent_initial, &parent)
+		{
+			return Err("metadata_changed");
+		}
+		if file.st_nlink != 1 {
+			return Err("unsafe_file");
+		}
+		if file.st_mode & 0o7000 != 0
+			|| parent.st_mode & 0o7000 != 0
+			|| !verify_file_security(&authority.file, &file, "file").ok
+			|| !verify_file_security(&authority.parent, &parent, "directory").ok
+		{
+			return Err("unsafe_security");
+		}
+		let size = usize::try_from(file.st_size).map_err(|_| "invalid_size")?;
+		if size == 0 || size > max_bytes {
+			return Err("invalid_size");
+		}
+		Ok(size)
+	}
+
+	#[cfg(any(target_os = "linux", target_os = "macos"))]
+	fn read_private_bytes(file: &File, size: usize) -> Result<Vec<u8>, &'static str> {
+		use std::os::unix::fs::FileExt;
+		let mut bytes = vec![0; size];
+		let mut offset = 0;
+		let mut interrupts = 0;
+		while offset < size {
+			#[cfg(test)]
+			let denied = OWNER_READ_DENIED.with(|fault| fault.replace(false));
+			#[cfg(not(test))]
+			let denied = false;
+			let result = if denied {
+				Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+			} else {
+				file.read_at(&mut bytes[offset..], offset as u64)
+			};
+			match result {
+				Ok(0) => return Err("content_changed"),
+				Ok(count) => offset += count,
+				Err(error)
+					if error.kind() == std::io::ErrorKind::Interrupted
+						&& interrupts < EINTR_RETRY_LIMIT =>
+				{
+					interrupts += 1;
+				},
+				Err(_) => return Err("read_failed"),
+			}
+		}
+		Ok(bytes)
+	}
+
+	#[cfg(any(target_os = "linux", target_os = "macos"))]
+	pub(super) fn read_owner_only_file(
+		path: &Path,
+		max_bytes: usize,
+	) -> Result<Vec<u8>, &'static str> {
+		if max_bytes == 0 || max_bytes > 65536 {
+			return Err("invalid_limit");
+		}
+		let authority = checked_file_with_access(path, "file", false).map_err(|_| "unsafe_path")?;
+		#[cfg(test)]
+		owner_read_hook("acquired", &authority)?;
+		let size = read_private_snapshot(&authority, max_bytes)?;
+		#[cfg(test)]
+		owner_read_hook("before_read", &authority)?;
+		let bytes = read_private_bytes(&authority.file, size)?;
+		#[cfg(test)]
+		owner_read_hook("after_read", &authority)?;
+		read_private_snapshot(&authority, max_bytes)?;
+		#[cfg(test)]
+		owner_read_hook("before_verify", &authority)?;
+		let verification = read_private_bytes(&authority.file, size)?;
+		#[cfg(test)]
+		owner_read_hook("after_verify", &authority)?;
+		if bytes != verification {
+			return Err("content_changed");
+		}
+		read_private_snapshot(&authority, max_bytes)?;
+		// ACL queries also take time: finish with named-edge and metadata checks.
+		let final_file = revalidate_authority(&authority).map_err(|_| "authority_changed")?;
+		let final_parent = fstat(authority.parent.as_raw_fd()).map_err(|_| "io_error")?;
+		if !read_stat_unchanged(&authority.initial, &final_file)
+			|| !read_stat_unchanged(&authority.parent_initial, &final_parent)
+		{
+			return Err("metadata_changed");
+		}
+		Ok(bytes)
+	}
+
+	#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+	mod owner_only_read_tests {
+		use std::{
+			cell::RefCell,
+			os::unix::fs::PermissionsExt,
+			path::PathBuf,
+			rc::Rc,
+			sync::atomic::{AtomicU64, Ordering},
+		};
+
+		use super::*;
+
+		static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+		struct Fixture(PathBuf);
+		impl Fixture {
+			fn new() -> Self {
+				let root = std::env::temp_dir().join(format!(
+					"gjc-private-read-{}-{}",
+					std::process::id(),
+					NEXT_ID.fetch_add(1, Ordering::Relaxed)
+				));
+				fs::create_dir(&root).expect("create fixture");
+				fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).expect("private root");
+				let fixture = Self(root);
+				fixture.write(b"binding");
+				fixture
+			}
+
+			fn path(&self) -> PathBuf {
+				self.0.join("binding")
+			}
+
+			fn write(&self, bytes: &[u8]) {
+				fs::write(self.path(), bytes).expect("write fixture");
+				fs::set_permissions(self.path(), fs::Permissions::from_mode(0o600))
+					.expect("private file");
+			}
+		}
+		impl Drop for Fixture {
+			fn drop(&mut self) {
+				OWNER_READ_HOOK.with(|hook| *hook.borrow_mut() = None);
+				OWNER_READ_DENIED.with(|fault| fault.set(false));
+				let _ = fs::remove_dir_all(&self.0);
+			}
+		}
+
+		#[test]
+		fn owner_only_read_bounds_and_read_only_descriptors() {
+			let fixture = Fixture::new();
+			OWNER_READ_HOOK.with(|hook| {
+				*hook.borrow_mut() = Some(Box::new(|_, authority| {
+					// SAFETY: the hook only inspects a retained live descriptor.
+					let flags = unsafe { libc::fcntl(authority.file.as_raw_fd(), libc::F_GETFL) };
+					assert_eq!(flags & libc::O_ACCMODE, libc::O_RDONLY);
+					Ok(())
+				}))
+			});
+			for size in [1, 65536] {
+				let bytes = vec![42; size];
+				fixture.write(&bytes);
+				assert_eq!(read_owner_only_file(&fixture.path(), 65536), Ok(bytes));
+			}
+			for size in [0, 65537] {
+				fixture.write(&vec![42; size]);
+				assert_eq!(read_owner_only_file(&fixture.path(), 65536), Err("invalid_size"));
+			}
+			fixture.write(b"1234");
+			assert_eq!(read_owner_only_file(&fixture.path(), 3), Err("invalid_size"));
+		}
+
+		#[test]
+		fn owner_only_read_rejects_content_metadata_and_namespace_races() {
+			for stage in ["before_read", "after_read", "after_verify"] {
+				let content_change = if stage == "after_read" {
+					"content"
+				} else {
+					"observable_content"
+				};
+				for change in [
+					content_change,
+					"truncate",
+					"grow",
+					"mode",
+					"parent_mode",
+					"hardlink",
+					"leaf",
+					"parent",
+				] {
+					let fixture = Fixture::new();
+					let root = fixture.0.clone();
+					OWNER_READ_HOOK.with(|hook| {
+						*hook.borrow_mut() = Some(Box::new(move |at, authority| {
+							if at != stage {
+								return Ok(());
+							}
+							let path = root.join("binding");
+							match change {
+								"content" => fs::write(path, b"changed").expect("same-size change"),
+								"observable_content" => {
+									let modified = authority
+										.file
+										.metadata()
+										.expect("file metadata")
+										.modified()
+										.expect("file mtime");
+									fs::write(path, b"changed").expect("same-size change");
+									// before_read is after the metadata snapshot, but before either
+									// byte read. Both reads can see coherent new bytes, so rejection
+									// requires observable metadata, as does a write after_verify.
+									// A fast write need not advance
+									// filesystem timestamps; force a change without waiting for a tick.
+									authority
+										.file
+										.set_modified(modified + std::time::Duration::from_secs(2))
+										.expect("advance mtime");
+									let changed =
+										fstat(authority.file.as_raw_fd()).unwrap_or_else(|result| {
+											panic!("changed metadata: {:?}", result.code)
+										});
+									assert_ne!(stat_mtime_ns(&authority.initial), stat_mtime_ns(&changed));
+								},
+								"truncate" => fs::write(path, b"").expect("truncate"),
+								"grow" => fs::write(path, vec![0; 65537]).expect("grow beyond bound"),
+								"mode" => fs::set_permissions(path, fs::Permissions::from_mode(0o644))
+									.expect("change mode"),
+								"parent_mode" => {
+									fs::set_permissions(&root, fs::Permissions::from_mode(0o755))
+										.expect("change parent mode")
+								},
+								"hardlink" => fs::hard_link(path, root.join("alias")).expect("add link"),
+								"leaf" => {
+									fs::rename(&path, root.join("old")).expect("detach leaf");
+									fs::write(path, b"binding").expect("replace leaf");
+								},
+								"parent" => {
+									let moved = root.with_extension("moved");
+									fs::rename(&root, &moved).expect("detach parent");
+									fs::create_dir(&root).expect("replace parent");
+									fs::rename(&moved, root.join("old")).expect("retain cleanup ownership");
+								},
+								_ => unreachable!(),
+							}
+							Ok(())
+						}))
+					});
+					assert!(read_owner_only_file(&fixture.path(), 65536).is_err(), "{stage}/{change}");
+				}
+			}
+		}
+
+		#[test]
+		fn owner_only_read_rejects_between_read_content_mismatch_without_timestamp_assistance() {
+			let fixture = Fixture::new();
+			let path = fixture.path();
+			OWNER_READ_HOOK.with(|hook| {
+				*hook.borrow_mut() = Some(Box::new(move |stage, _| {
+					if stage == "before_verify" {
+						// After the intervening metadata check, change only the bytes.
+						// The comparison must reject before any further metadata check,
+						// whether or not this filesystem advances timestamps on write.
+						fs::write(&path, b"changed").expect("same-size change between reads");
+					}
+					Ok(())
+				}))
+			});
+			assert_eq!(read_owner_only_file(&fixture.path(), 65536), Err("content_changed"));
+		}
+
+		#[test]
+		fn owner_only_read_closes_every_retained_descriptor_on_success_and_faults() {
+			for failure_stage in [
+				"none",
+				"acquired",
+				"before_read",
+				"after_read",
+				"before_verify",
+				"after_verify",
+				"read_denied",
+				"verify_denied",
+				"unsafe_security",
+				"invalid_size",
+				"unsafe_file",
+			] {
+				let fixture = Fixture::new();
+				match failure_stage {
+					"unsafe_security" => {
+						fs::set_permissions(fixture.path(), fs::Permissions::from_mode(0o640))
+							.expect("unsafe mode")
+					},
+					"invalid_size" => fixture.write(b""),
+					"unsafe_file" => {
+						fs::hard_link(fixture.path(), fixture.0.join("alias")).expect("hardlink")
+					},
+					_ => {},
+				}
+				let descriptors = Rc::new(RefCell::new(Vec::new()));
+				let captured = Rc::clone(&descriptors);
+				OWNER_READ_HOOK.with(|hook| {
+					*hook.borrow_mut() = Some(Box::new(move |stage, authority| {
+						if stage == "acquired" {
+							let mut fds = captured.borrow_mut();
+							fds.extend([authority.file.as_raw_fd(), authority.parent.as_raw_fd()]);
+							for edge in &authority.edges {
+								fds.extend([edge.parent.as_raw_fd(), edge.child.as_raw_fd()]);
+							}
+						}
+						if (failure_stage == "read_denied" && stage == "before_read")
+							|| (failure_stage == "verify_denied" && stage == "after_read")
+						{
+							OWNER_READ_DENIED.with(|fault| fault.set(true));
+						}
+						if stage == failure_stage {
+							Err("read_failed")
+						} else {
+							Ok(())
+						}
+					}))
+				});
+				let result = read_owner_only_file(&fixture.path(), 65536);
+				assert_eq!(result.is_ok(), failure_stage == "none");
+				for fd in descriptors.borrow().iter() {
+					// SAFETY: F_GETFD probes without taking ownership or changing descriptor state.
+					assert_eq!(unsafe { libc::fcntl(*fd, libc::F_GETFD) }, -1);
+					assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::EBADF));
+				}
+			}
+		}
+
+		#[test]
+		fn owner_only_read_rejects_fifo_without_opening_or_blocking() {
+			let fixture = Fixture::new();
+			fs::remove_file(fixture.path()).expect("remove leaf");
+			let name = CString::new(fixture.path().as_os_str().as_bytes()).expect("path");
+			// SAFETY: name is NUL terminated and names a test-owned absent leaf.
+			assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+			assert_eq!(read_owner_only_file(&fixture.path(), 65536), Err("unsafe_path"));
+		}
+
+		#[cfg(target_os = "macos")]
+		#[test]
+		fn owner_only_read_macos_system_aliases_are_component_exact() {
+			for alias in ["var", "tmp", "etc"] {
+				let accepted = PathBuf::from(format!("/{alias}/binding"));
+				assert_eq!(
+					descriptor_walk_path(&accepted).as_ref(),
+					Path::new(&format!("/private/{alias}/binding"))
+				);
+				let rejected = PathBuf::from(format!("/{alias}-alias/binding"));
+				assert_eq!(descriptor_walk_path(&rejected).as_ref(), rejected.as_path());
+			}
+		}
+
+		#[cfg(target_os = "macos")]
+		#[test]
+		fn owner_only_read_macos_acl_denial_never_retries_or_repairs() {
+			let fixture = Fixture::new();
+			for (target, acl) in
+				[(fixture.path(), "everyone deny read"), (fixture.0.clone(), "everyone allow read")]
+			{
+				assert!(
+					std::process::Command::new("/bin/chmod")
+						.args(["+a", acl])
+						.arg(&target)
+						.status()
+						.expect("install ACL")
+						.success()
+				);
+				let result = read_owner_only_file(&fixture.path(), 65536);
+				let security = super::verify_owner_only_path_security(
+					&target,
+					if target == fixture.0 {
+						"directory"
+					} else {
+						"file"
+					},
+				);
+				assert!(
+					std::process::Command::new("/bin/chmod")
+						.arg("-N")
+						.arg(&target)
+						.status()
+						.expect("remove ACL")
+						.success()
+				);
+				assert!(result.is_err());
+				assert_eq!(security.code.as_deref(), Some("acl_verify_failed"));
+			}
+			assert_eq!(fs::read(fixture.path()).expect("unchanged bytes"), b"binding");
+		}
+
+		#[cfg(target_os = "linux")]
+		#[test]
+		fn owner_only_read_linux_rejects_parent_default_acl_without_repair() {
+			let fixture = Fixture::new();
+			let directory = File::open(&fixture.0).expect("open directory");
+			// Linux POSIX ACL xattr v2: owner rwx, group ---, other ---.
+			// Even this restrictive default ACL must not be present on the lifecycle root.
+			let mut acl = 2_u32.to_le_bytes().to_vec();
+			for (tag, permissions) in [(1_u16, 7_u16), (4, 0), (32, 0)] {
+				acl.extend(tag.to_le_bytes());
+				acl.extend(permissions.to_le_bytes());
+				acl.extend(u32::MAX.to_le_bytes());
+			}
+			let name = c"system.posix_acl_default";
+			// SAFETY: fd and byte storage are live, name is NUL terminated.
+			assert_eq!(
+				unsafe {
+					libc::fsetxattr(
+						directory.as_raw_fd(),
+						name.as_ptr(),
+						acl.as_ptr().cast(),
+						acl.len(),
+						0,
+					)
+				},
+				0,
+				"fixture requires POSIX ACL support"
+			);
+			assert_eq!(read_owner_only_file(&fixture.path(), 65536), Err("unsafe_security"));
+			assert!(!super::verify_owner_only_path_security(&fixture.0, "directory").ok);
+		}
 	}
 
 	#[cfg(target_os = "linux")]
@@ -3438,6 +3942,25 @@ pub(crate) mod platform {
 			Ok(value) => value,
 			Err(result) => return result,
 		};
+		let result = verify_file_security(&authority.file, &metadata, kind);
+		if !result.ok {
+			return result;
+		}
+		#[cfg(all(test, target_os = "macos"))]
+		pause_after_owner_only_acl_query_for_test();
+		match revalidate_authority(authority) {
+			Ok(_) => result,
+			Err(result) => result,
+		}
+	}
+
+	fn verify_file_security(
+		file: &File,
+		metadata: &libc::stat,
+		kind: &str,
+	) -> NativeOwnerOnlySecurityResult {
+		#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+		let _ = file;
 		let expected = if kind == "directory" { 0o700 } else { 0o600 };
 		// SAFETY: geteuid has no preconditions and only reads the process effective
 		// user identity.
@@ -3449,37 +3972,23 @@ pub(crate) mod platform {
 		}
 		#[cfg(target_os = "linux")]
 		{
-			let access_query = match query_extended_acl(&authority.file, AclAttribute::Access) {
+			let access_query = match query_extended_acl(file, AclAttribute::Access) {
 				Ok(evidence) => evidence,
 				Err(result) => return result,
 			};
 			let default_query = if kind == "directory" {
-				match query_extended_acl(&authority.file, AclAttribute::Default) {
+				match query_extended_acl(file, AclAttribute::Default) {
 					Ok(evidence) => Some(evidence),
 					Err(result) => return result,
 				}
 			} else {
 				None
 			};
-			match revalidate_authority(authority) {
-				Ok(_) => NativeOwnerOnlySecurityResult::linux_verified_success(
-					kind,
-					access_query,
-					default_query,
-				),
-				Err(result) => result,
-			}
+			NativeOwnerOnlySecurityResult::linux_verified_success(kind, access_query, default_query)
 		}
 		#[cfg(target_os = "macos")]
-		match has_extended_acl(&authority.file) {
-			Ok(false) => {
-				#[cfg(test)]
-				pause_after_owner_only_acl_query_for_test();
-				match revalidate_authority(authority) {
-					Ok(_) => NativeOwnerOnlySecurityResult::success(),
-					Err(result) => result,
-				}
-			},
+		match has_extended_acl(file) {
+			Ok(false) => NativeOwnerOnlySecurityResult::success(),
 			Ok(true) => NativeOwnerOnlySecurityResult::failure("acl_verify_failed"),
 			Err(result) => result,
 		}

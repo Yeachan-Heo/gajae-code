@@ -1,9 +1,16 @@
 import * as crypto from "node:crypto";
 import * as fsSync from "node:fs";
-import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { readOwnerOnlyFile, verifyOwnerOnlyPathSecurity } from "@gajae-code/natives";
 import { nativeProcessBindings } from "@gajae-code/utils/native-process";
+import { prepareManagedDirectoryRoot, publishManagedFileNoReplace } from "../session/internal/managed-session-storage";
 import { readLinuxProcStartTime } from "./linux-proc";
+import {
+	isManagedOwnerBinding,
+	type ManagedOwnerBinding,
+	type ManagedOwnerSigabrtReceipt,
+	managedOwnerCommandDigest,
+} from "./managed-owner-binding";
 import { assertSafePathComponent } from "./session-layout";
 import { lifecyclePaths, type OwnerIntent, observeOwnerTerminal } from "./tmux-owner-isolation";
 
@@ -25,38 +32,6 @@ const captureBootstrapSigterm = () => {
 if (process.argv.includes(MANAGED_OWNER_SUPERVISOR_ARG)) {
 	process.removeAllListeners("SIGTERM");
 	process.on("SIGTERM", captureBootstrapSigterm);
-}
-
-export interface ManagedOwnerBinding {
-	schema_version: 2;
-	generation: string;
-	session_id: string;
-	run_id: string;
-	endpoint_incarnation: string;
-	child_token: string;
-	command: string[];
-	command_sha256: string;
-	supervisor_pid: number;
-	supervisor_start_time: string;
-	created_at: string;
-}
-
-export interface ManagedOwnerSigabrtReceipt {
-	schema_version: 2;
-	generation: string;
-	session_id: string;
-	run_id: string;
-	endpoint_incarnation: string;
-	child_token: string;
-	command_sha256: string;
-	supervisor_pid: number;
-	supervisor_start_time: string;
-	child_pid: number;
-	child_start_time: string;
-	signal: "SIGABRT";
-	signal_number: 6;
-	exit_code: number | null;
-	received_at: string;
 }
 
 function requiredEnvironment(name: string): string {
@@ -85,36 +60,31 @@ function lifecycleRoot(): {
 		[incarnation, "managed owner incarnation"],
 	] as const)
 		assertSafePathComponent(value, label);
-	if (!path.isAbsolute(stateDir)) throw new Error("managed_owner_lifecycle_path_unsafe");
+	if (!path.isAbsolute(stateDir) || stateDir.includes("\0") || stateDir.split(path.sep).includes(".."))
+		throw new Error("managed_owner_lifecycle_path_unsafe");
 	const root = lifecyclePaths(stateDir, sessionId, generation).root;
 	if (!root.startsWith(`${path.resolve(stateDir)}${path.sep}`)) throw new Error("managed_owner_lifecycle_path_unsafe");
 	return { root, stateDir, generation, sessionId, runId, incarnation };
 }
 
-function commandDigest(command: readonly string[]): string {
-	return crypto.createHash("sha256").update(JSON.stringify(command)).digest("hex");
-}
 async function managedOwnerProcessProvenance(pid: number): Promise<string | null> {
 	if (process.platform === "linux") return await readLinuxProcStartTime(pid);
 	return nativeProcessBindings().Process.fromPid(pid)?.incarnation ?? null;
 }
 
 async function writeDurableExclusive(file: string, value: object): Promise<void> {
-	const handle = await fs.open(file, "wx", 0o600);
-	try {
-		await handle.writeFile(`${JSON.stringify(value)}\n`);
-		await handle.sync();
-	} finally {
-		await handle.close();
-	}
-	const directory = await fs.open(path.dirname(file), "r");
-	try {
-		await directory.sync();
-	} finally {
-		await directory.close();
-	}
-	const persisted = JSON.parse(await fs.readFile(file, "utf8")) as unknown;
-	if (JSON.stringify(persisted) !== JSON.stringify(value)) throw new Error("managed_owner_durable_reread_failed");
+	const root = path.dirname(file);
+	const assertSafe = () => {
+		if (!verifyOwnerOnlyPathSecurity(root, "directory").ok) throw new Error("managed_owner_storage_unsafe");
+	};
+	assertSafe();
+	const authority = prepareManagedDirectoryRoot(root);
+	const bytes = Buffer.from(`${JSON.stringify(value)}\n`);
+	if (bytes.length > 65536) throw new Error("managed_owner_binding_too_large");
+	await publishManagedFileNoReplace(file, bytes, assertSafe, authority);
+	const persisted = readOwnerOnlyFile(file, 65536);
+	if (!persisted.ok || !persisted.data || !bytes.equals(Buffer.from(persisted.data)))
+		throw new Error("managed_owner_durable_reread_failed");
 }
 
 function childCommand(): string[] {
@@ -130,6 +100,15 @@ export function isManagedOwnerSupervisorArgv(args: readonly string[]): boolean {
 
 /** Runs one exact child and publishes authority only for a directly observed Linux signal 6. */
 export async function runManagedOwnerSupervisor(): Promise<void> {
+	try {
+		await superviseManagedOwner();
+	} catch {
+		// Spawn and JSON errors can contain opaque command bytes.
+		throw new Error("managed_owner_supervisor_failed");
+	}
+}
+
+async function superviseManagedOwner(): Promise<void> {
 	const { root, stateDir, generation, sessionId, runId, incarnation } = lifecycleRoot();
 	const command = childCommand();
 	let sigtermPending = bootstrapSigtermPending;
@@ -140,25 +119,29 @@ export async function runManagedOwnerSupervisor(): Promise<void> {
 	process.on("SIGTERM", captureEarlySigterm);
 	const supervisorStartTime = await managedOwnerProcessProvenance(process.pid);
 	if (!supervisorStartTime) throw new Error("managed_owner_supervisor_start_time_unavailable");
-	await fs.mkdir(root, { recursive: true, mode: 0o700 });
+	if (!verifyOwnerOnlyPathSecurity(root, "directory").ok) throw new Error("managed_owner_storage_unsafe");
 	const childToken = crypto.randomUUID();
 	const redactCommand = process.env[MANAGED_OWNER_REDACT_COMMAND_ENV] === "1";
-	const binding: ManagedOwnerBinding | null = redactCommand
-		? null
-		: {
-				schema_version: 2,
-				generation,
-				session_id: sessionId,
-				run_id: runId,
-				endpoint_incarnation: incarnation,
-				child_token: childToken,
-				command,
-				command_sha256: commandDigest(command),
-				supervisor_pid: process.pid,
-				supervisor_start_time: supervisorStartTime,
-				created_at: new Date().toISOString(),
-			};
-	if (binding) await writeDurableExclusive(path.join(root, `child-${childToken}.binding.json`), binding);
+	const binding: ManagedOwnerBinding = {
+		schema_version: 3,
+		generation,
+		session_id: sessionId,
+		run_id: runId,
+		endpoint_incarnation: incarnation,
+		child_token: childToken,
+		...(redactCommand
+			? { binding_kind: "opaque" as const }
+			: {
+					binding_kind: "recoverable" as const,
+					command,
+					command_sha256: managedOwnerCommandDigest(command),
+				}),
+		supervisor_pid: process.pid,
+		supervisor_start_time: supervisorStartTime,
+		created_at: new Date().toISOString(),
+	};
+	if (!isManagedOwnerBinding(binding)) throw new Error("managed_owner_binding_invalid");
+	await writeDurableExclusive(path.join(root, `child-${childToken}.binding.json`), binding);
 	const childEnvironment: NodeJS.ProcessEnv = { ...process.env, [MANAGED_OWNER_CHILD_TOKEN_ENV]: childToken };
 	delete childEnvironment[MANAGED_OWNER_COMMAND_ENV];
 	delete childEnvironment[MANAGED_OWNER_REDACT_COMMAND_ENV];
@@ -175,7 +158,7 @@ export async function runManagedOwnerSupervisor(): Promise<void> {
 	if (!childProcess) {
 		const exitCode = await child.exited;
 		if (child.signalCode === "SIGABRT") {
-			if (binding) {
+			if (process.platform === "linux" && binding.binding_kind === "recoverable") {
 				const receipt: ManagedOwnerSigabrtReceipt = {
 					schema_version: 2,
 					generation,
@@ -256,7 +239,7 @@ export async function runManagedOwnerSupervisor(): Promise<void> {
 		});
 	}
 	if (child.signalCode === "SIGABRT") {
-		if (binding) {
+		if (process.platform === "linux" && binding.binding_kind === "recoverable") {
 			const receipt: ManagedOwnerSigabrtReceipt = {
 				schema_version: 2,
 				generation,

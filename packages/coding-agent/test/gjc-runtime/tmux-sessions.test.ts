@@ -39,6 +39,7 @@ import {
 	removeGjcTmuxSession,
 	statusGjcTmuxSession,
 } from "@gajae-code/coding-agent/gjc-runtime/tmux-sessions";
+import { createSpawnSubstrateProvider } from "../../src/sdk/broker/spawn-substrate";
 import { prepareManagedDirectoryRoot } from "../../src/session/internal/managed-session-storage";
 
 // `Bun.spawnSync` is called in two shapes in production: the array form
@@ -793,7 +794,7 @@ describe("GJC tmux session management", () => {
 		);
 	});
 
-	it("passes the shared encoded command to injected win32 session creation", () => {
+	it("preserves the shared encoded command for unmanaged win32 session creation", () => {
 		let plannedArgv: string[] | undefined;
 		__setCreateOwnerIsolationForTests({
 			execute: plan => {
@@ -839,6 +840,68 @@ describe("GJC tmux session management", () => {
 			}),
 		);
 	});
+	for (const entry of ["direct", "managed", "broker"] as const) {
+		it(`rejects Windows managed launch through ${entry} before probes, allocation, or state writes`, async () => {
+			const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-windows-managed-rejected-"));
+			fixtureDirectories.push(cwd);
+			const launch = {
+				childSessionId: "windows-child",
+				cwd: path.win32.resolve(cwd),
+				argv: ["secret-command", "secret-task"],
+				env: { GJC_MANAGED_OWNER_CHILD_TOKEN: "secret-token" },
+			};
+			const env = { GJC_TMUX_COMMAND: "psmux", GJC_PSMUX_COMMAND: "psmux" };
+			const spawn = spyOn(Bun, "spawn").mockImplementation(() => {
+				throw new Error("unexpected spawn");
+			});
+			const spawnSync = spyOn(Bun, "spawnSync").mockImplementation(() => {
+				throw new Error("unexpected spawnSync");
+			});
+			const mkdir = spyOn(fsSync, "mkdirSync");
+			const write = spyOn(fsSync, "writeFileSync");
+			const open = spyOn(fsSync, "openSync");
+			const bunWrite = spyOn(Bun, "write");
+			const allocateIdentity = spyOn(crypto, "randomUUID");
+			const execute = vi.fn(() => {
+				throw new Error("unexpected allocation");
+			});
+			__setCreateOwnerIsolationForTests({ execute });
+			const reason = "gjc_tmux_managed_launch_platform_unsupported:win32";
+			if (entry === "broker") {
+				const startHeadless = vi.fn(() => {
+					throw new Error("unexpected headless fallback");
+				});
+				const provider = createSpawnSubstrateProvider({
+					platform: "win32",
+					env,
+					selectMultiplexer: () => "psmux",
+					startHeadless,
+				});
+				expect(await provider.launch(launch)).toEqual({
+					ok: false,
+					code: "substrate_proof_failed",
+					message: `psmux substrate launch failed: ${reason}; psmux substrate cleanup could not be verified`,
+				});
+				expect(startHeadless).not.toHaveBeenCalled();
+			} else {
+				const create = () =>
+					entry === "direct"
+						? createGjcTmuxSession(env, { platform: "win32", launch })
+						: createManagedGjcTmuxSession(launch, env, { platform: "win32" });
+				expect(create).toThrow(new Error(reason));
+			}
+			expect(spawn).not.toHaveBeenCalled();
+			expect(spawnSync).not.toHaveBeenCalled();
+			expect(execute).not.toHaveBeenCalled();
+			expect(mkdir).not.toHaveBeenCalled();
+			expect(write).not.toHaveBeenCalled();
+			expect(open).not.toHaveBeenCalled();
+			expect(bunWrite).not.toHaveBeenCalled();
+			expect(allocateIdentity).not.toHaveBeenCalled();
+			expect(await fs.readdir(cwd)).toEqual([]);
+		});
+	}
+
 	it("passes a structured Broker launch through managed tmux without inheriting the parent session identity", () => {
 		let plannedArgv: string[] | undefined;
 		__setCreateOwnerIsolationForTests({

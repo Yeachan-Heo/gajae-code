@@ -692,6 +692,8 @@ mod platform {
 			snapshot_all_pids()?
 				.into_iter()
 				.filter_map(Process::from_pid)
+				// SAFETY: getsid takes a scalar PID, dereferences no pointers, and returns -1 if the
+				// process is gone.
 				.filter(|process| unsafe { libc::getsid(process.pid()) } == sid)
 				.collect(),
 		)

@@ -12,21 +12,10 @@ import * as fs from "node:fs/promises";
 
 import * as path from "node:path";
 
-import type { RecoveryFsRoot } from "@gajae-code/natives";
-
-let nativeRecoveryFsRoot: typeof import("@gajae-code/natives")["openRecoveryFsRoot"] | undefined;
-
-function openRecoveryFsRootNative(): typeof import("@gajae-code/natives")["openRecoveryFsRoot"] {
-	nativeRecoveryFsRoot ??= (
-		require("@gajae-code/natives") as {
-			openRecoveryFsRoot: typeof import("@gajae-code/natives")["openRecoveryFsRoot"];
-		}
-	).openRecoveryFsRoot;
-	return nativeRecoveryFsRoot;
-}
-
+import { openRecoveryFsRoot, readOwnerOnlyFile, type RecoveryFsRoot } from "@gajae-code/natives";
 import { isCompiledBinary } from "@gajae-code/utils/env";
 import { parseLinuxProcStartTime } from "./linux-proc";
+import { isManagedOwnerBinding, isManagedOwnerSigabrtReceipt } from "./managed-owner-binding";
 
 export const TMUX_OWNER_ISOLATION_SCHEMA_VERSION = 1;
 export const TMUX_OWNER_ISOLATION_MAX_LINE_BYTES = 16 * 1024;
@@ -1157,61 +1146,25 @@ export function resolveManagedOwnerPredecessorSync(
 	if (tokens.length !== 1 || receipts.size !== 1) throw new Error("managed_owner_replacement_evidence_ambiguous");
 	const predecessorToken = tokens[0]!;
 	if (!/^[A-Za-z0-9._-]+$/.test(predecessorToken)) throw new Error("managed_owner_replacement_evidence_untrusted");
-	const authority = openRecoveryFsRootNative()(root);
+	if (process.platform !== "linux") throw new Error("managed_owner_replacement_evidence_unavailable");
+	const authority = openRecoveryFsRoot(root);
 	try {
-		const binding = exactManagedOwnerJson(authority, `child-${predecessorToken}.binding.json`) as Record<
-			string,
-			unknown
-		>;
-		const receipt = exactManagedOwnerJson(authority, `sigabrt-${predecessorToken}.receipt.json`) as Record<
-			string,
-			unknown
-		>;
-		const command = binding.command;
-		const runId = binding.run_id;
-		const incarnation = binding.endpoint_incarnation;
-		const commandDigest =
-			Array.isArray(command) && command.length > 0 && command.every(value => typeof value === "string" && value)
-				? crypto.createHash("sha256").update(JSON.stringify(command)).digest("hex")
-				: "";
-		const valid =
-			binding.schema_version === 2 &&
-			binding.generation === baseline.generation &&
-			binding.session_id === sessionId &&
-			typeof runId === "string" &&
-			runId.length > 0 &&
-			typeof incarnation === "string" &&
-			incarnation.length > 0 &&
-			binding.child_token === predecessorToken &&
-			binding.command_sha256 === commandDigest &&
-			typeof binding.supervisor_pid === "number" &&
-			Number.isSafeInteger(binding.supervisor_pid) &&
-			binding.supervisor_pid > 0 &&
-			typeof binding.supervisor_start_time === "string" &&
-			typeof binding.created_at === "string" &&
-			receipt.schema_version === 2 &&
-			receipt.generation === binding.generation &&
-			receipt.session_id === binding.session_id &&
-			receipt.run_id === runId &&
-			receipt.endpoint_incarnation === incarnation &&
-			receipt.child_token === binding.child_token &&
-			receipt.command_sha256 === binding.command_sha256 &&
-			receipt.supervisor_pid === binding.supervisor_pid &&
-			receipt.supervisor_start_time === binding.supervisor_start_time &&
-			typeof receipt.child_pid === "number" &&
-			Number.isSafeInteger(receipt.child_pid) &&
-			receipt.child_pid > 0 &&
-			typeof receipt.child_start_time === "string" &&
-			typeof receipt.received_at === "string" &&
-			(receipt.exit_code === null || Number.isSafeInteger(receipt.exit_code)) &&
-			receipt.signal === "SIGABRT" &&
-			receipt.signal_number === 6;
-		if (!valid) throw new Error("managed_owner_replacement_evidence_untrusted");
+		const binding = exactManagedOwnerJson(authority, `child-${predecessorToken}.binding.json`);
+		const receipt = exactManagedOwnerJson(authority, `sigabrt-${predecessorToken}.receipt.json`);
+		if (
+			!isManagedOwnerBinding(binding) ||
+			binding.binding_kind !== "recoverable" ||
+			binding.generation !== baseline.generation ||
+			binding.session_id !== sessionId ||
+			binding.child_token !== predecessorToken ||
+			!isManagedOwnerSigabrtReceipt(receipt, binding)
+		)
+			throw new Error("managed_owner_replacement_evidence_untrusted");
 		return {
 			generation: baseline.generation,
 			sessionId,
-			runId,
-			incarnation,
+			runId: binding.run_id,
+			incarnation: binding.endpoint_incarnation,
 			predecessorToken,
 		};
 	} finally {
@@ -1830,6 +1783,23 @@ export interface ExactOwnerCloseDependencies {
 	sendSigterm(pid: number): Promise<void>;
 	waitForVerdict(): Promise<OwnerVerdict | null>;
 	cleanupSession(): Promise<void>;
+}
+
+/** Bounded native evidence reads; never reopen through a pathname fallback. */
+export function readSecureOwnerJson(file: string): unknown {
+	const result = readOwnerOnlyFile(file, 65536);
+	if (!result.ok || !result.data) throw new Error("owner_evidence_unavailable");
+	return parseExactOwnerJson(result.data, "owner_evidence_framing_invalid");
+}
+
+export function parseExactOwnerJson(
+	data: Uint8Array,
+	framingError: "owner_evidence_framing_invalid" | "managed_owner_json_framing_invalid",
+): unknown {
+	const text = Buffer.from(data).toString("utf8");
+	if (!text.endsWith("\n") || text.indexOf("\n") !== text.length - 1 || text.includes("\r"))
+		throw new Error(framingError);
+	return JSON.parse(text);
 }
 
 async function isCurrentOwnerGeneration(stateDir: string, sessionId: string, generation: string): Promise<boolean> {

@@ -23,6 +23,15 @@ export interface SpawnHeadlessProcess {
 	terminate(): void;
 }
 
+/** The retained native reference, not a numeric-PID discovery shortcut. */
+export interface SpawnLifecycleProcess {
+	readonly pid: number;
+	readonly incarnation: string;
+	readonly ppid: number | null;
+	status(): string;
+	children(): SpawnLifecycleProcess[];
+}
+
 export interface SpawnSubstrateProviderDependencies {
 	platform?: NodeJS.Platform;
 	env?: NodeJS.ProcessEnv;
@@ -37,6 +46,9 @@ export interface SpawnSubstrateProviderDependencies {
 	verifyManaged?: (proof: ManagedTmuxLaunchProof, env: NodeJS.ProcessEnv) => "verified" | "mismatch" | "gone";
 	closeManaged?: (proof: ManagedTmuxLaunchProof, env: NodeJS.ProcessEnv) => Promise<void>;
 	processIncarnation?: (pid: number) => string | undefined;
+	/** @internal Bounded lifecycle-owner observation seams. */
+	openLifecycleProcess?: (pid: number) => SpawnLifecycleProcess | null;
+	now?: () => number;
 	startHeadless?: (spec: SpawnSubstrateLaunchSpec, env: NodeJS.ProcessEnv) => SpawnHeadlessProcess;
 	signalHeadless?: (
 		pid: number,
@@ -390,6 +402,8 @@ export function createSpawnSubstrateProvider(
 	const signalHeadless = dependencies.signalHeadless ?? signalExactHeadless;
 	const isGone = dependencies.isProcessGone ?? defaultIsProcessGone;
 	const sleep = dependencies.sleep ?? (milliseconds => Bun.sleep(milliseconds));
+	const now = dependencies.now ?? Date.now;
+	const openProcess = dependencies.openLifecycleProcess ?? (pid => nativeProcessBindings().Process.fromPid(pid));
 	const launchHeadlessSubstrate = async (spec: SpawnSubstrateLaunchSpec, launchEnv: NodeJS.ProcessEnv) => {
 		let child: SpawnHeadlessProcess;
 		try {
@@ -546,6 +560,84 @@ export function createSpawnSubstrateProvider(
 			const incarnation = proof.pid === undefined ? undefined : readIncarnation(proof.pid);
 			if (!incarnation) return proof.pid !== undefined && isGone(proof.pid) ? "gone" : "mismatch";
 			return incarnation === proof.processIncarnation ? "verified" : "mismatch";
+		},
+		async resolveLifecycleOwner(proof, deadlineAt) {
+			const expired = () => !Number.isSafeInteger(deadlineAt) || now() >= deadlineAt;
+			const failed = { ok: false as const, code: "owner_proof_failed" as const };
+			const timeout = { ok: false as const, code: "owner_deadline" as const };
+			try {
+				if (expired()) return timeout;
+				if (
+					proof.substrateKind !== "headless" &&
+					(proof.substrateKind !== "tmux" || (platform !== "darwin" && platform !== "linux"))
+				)
+					return { ok: false, code: "owner_unsupported" };
+				if (!isPositiveInteger(proof.pid) || !isNonEmptyString(proof.processIncarnation)) return failed;
+				const verified = await provider.verify(proof);
+				if (expired()) return timeout;
+				if (verified !== "verified") return failed;
+				const parentPid = proof.pid;
+				const parentIncarnation = proof.processIncarnation;
+				const parent = openProcess(parentPid);
+				if (!parent) return failed;
+				const live = (reference: SpawnLifecycleProcess, pid: number, incarnation: string, ppid?: number) => {
+					if (reference.pid !== pid || reference.incarnation !== incarnation || reference.status() !== "running")
+						return false;
+					if (ppid !== undefined && reference.ppid !== ppid) return false;
+					const fresh = openProcess(pid);
+					return (
+						fresh !== null &&
+						fresh.pid === pid &&
+						fresh.incarnation === incarnation &&
+						fresh.status() === "running" &&
+						(ppid === undefined || fresh.ppid === ppid) &&
+						readIncarnation(pid) === incarnation
+					);
+				};
+				const parentLive = () => live(parent, parentPid, parentIncarnation);
+				if (!parentLive()) return failed;
+				if (proof.substrateKind === "headless") {
+					const reverified = await provider.verify(proof);
+					if (expired()) return timeout;
+					if (reverified !== "verified" || !parentLive()) return failed;
+					if (expired()) return timeout;
+					return { ok: true, owner: { pid: proof.pid, incarnation: proof.processIncarnation } };
+				}
+				for (;;) {
+					if (expired()) return timeout;
+					if (!parentLive()) return failed;
+					const children = parent.children();
+					if (children.length > 1) return { ok: false, code: "owner_ambiguous" };
+					const child = children[0];
+					if (child) {
+						const { pid, incarnation } = child;
+						if (!isPositiveInteger(pid) || !isNonEmptyString(incarnation) || pid === parent.pid) return failed;
+						const childLive = () => live(child, pid, incarnation, parentPid);
+						if (!childLive() || !parentLive()) return failed;
+						const reverified = await provider.verify(proof);
+						if (expired()) return timeout;
+						if (reverified !== "verified" || !parentLive() || !childLive()) return failed;
+						const currentChildren = parent.children();
+						if (currentChildren.length > 1) return { ok: false, code: "owner_ambiguous" };
+						if (
+							currentChildren.length !== 1 ||
+							currentChildren[0]!.pid !== pid ||
+							currentChildren[0]!.incarnation !== incarnation ||
+							!childLive() ||
+							!parentLive()
+						)
+							return failed;
+						if (expired()) return timeout;
+						return { ok: true, owner: { pid, incarnation } };
+					}
+					const reverified = await provider.verify(proof);
+					if (expired()) return timeout;
+					if (reverified !== "verified" || !parentLive()) return failed;
+					await sleep(Math.min(HEADLESS_CLOSE_POLL_MS, Math.max(0, deadlineAt - now())));
+				}
+			} catch {
+				return expired() ? timeout : failed;
+			}
 		},
 		async close(proof) {
 			const verification = await provider.verify(proof);

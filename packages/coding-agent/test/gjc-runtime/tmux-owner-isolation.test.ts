@@ -1,5 +1,6 @@
 import { Database } from "bun:sqlite";
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, spyOn } from "bun:test";
+import * as crypto from "node:crypto";
 import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
@@ -20,11 +21,14 @@ import {
 	observeOwnerTerminal,
 	ownerProcessStartTime,
 	type PlanRequest,
+	parseExactOwnerJson,
 	parseOwnerIsolationRequest,
 	planTmuxOwnerIsolation,
 	planTmuxOwnerIsolationSync,
+	readSecureOwnerJson,
 	replaceOwnerGeneration,
 	replaceOwnerGenerationSync,
+	resolveManagedOwnerPredecessorSync,
 	TMUX_OWNER_ISOLATION_MAX_LINE_BYTES,
 	tmuxOwnerIsolationBootstrapArgv,
 } from "@gajae-code/coding-agent/gjc-runtime/tmux-owner-isolation";
@@ -32,6 +36,7 @@ import {
 	isTmuxOwnerIsolationCliArgv,
 	tmuxServerProof,
 } from "@gajae-code/coding-agent/gjc-runtime/tmux-owner-isolation-cli";
+import * as natives from "@gajae-code/natives";
 
 const repoRoot = path.resolve(import.meta.dir, "..", "..", "..", "..");
 const ownerIsolationCliEntry = path.join(repoRoot, "packages", "coding-agent", "src", "cli.ts");
@@ -40,6 +45,165 @@ const mainEntry = path.join(repoRoot, "packages", "coding-agent", "src", "main.t
 const ownerIsolationFlag = "--internal-tmux-owner-isolation";
 const invalidJsonLineResponse =
 	'{"schema_version":1,"ok":false,"code":"scope_unavailable","diagnostic":"invalid_json_line"}\n';
+
+describe("exact owner JSON framing", () => {
+	const specimens: [string, Uint8Array, "value" | "framing" | "json", unknown?][] = [
+		["object LF", Buffer.from("{}\n"), "value", {}],
+		["no LF", Buffer.from("{}"), "framing"],
+		["CRLF", Buffer.from("{}\r\n"), "framing"],
+		["two terminal LFs", Buffer.from("{}\n\n"), "framing"],
+		["embedded LF", Buffer.from("{\n}\n"), "framing"],
+		["leading LF", Buffer.from("\n{}\n"), "framing"],
+		["embedded CR", Buffer.from("{\r}\n"), "framing"],
+		["empty bytes", Buffer.alloc(0), "framing"],
+		["LF only", Buffer.from("\n"), "json"],
+		["BOM", Buffer.from("\ufeff{}\n"), "json"],
+		["invalid UTF8 in string", Uint8Array.from([34, 255, 34, 10]), "value", "�"],
+		["invalid UTF8 token", Uint8Array.from([255, 10]), "json"],
+		["escaped LF", Buffer.from('"\\n"\n'), "value", "\n"],
+		["escaped CR", Buffer.from('"\\r"\n'), "value", "\r"],
+		["surrounding horizontal whitespace", Buffer.from(" \t{} \t\n"), "value", {}],
+		["null", Buffer.from("null\n"), "value", null],
+		["trailing token", Buffer.from("{} true\n"), "json"],
+		["duplicate keys", Buffer.from('{"key":1,"key":2}\n'), "value", { key: 2 }],
+	];
+	it.each(
+		specimens.map(([name, bytes, kind, value]) => [name, bytes, kind, value] as const),
+	)("preserves native-reader and retained-byte semantics: %s", async (_name, bytes, kind, value) => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-owner-framing-"));
+		try {
+			const file = path.join(root, "evidence.json");
+			await fs.writeFile(file, bytes, { mode: 0o600 });
+			const secure = () => readSecureOwnerJson(file);
+			const retained = () => parseExactOwnerJson(bytes, "managed_owner_json_framing_invalid");
+			if (kind === "value") {
+				expect(secure()).toEqual(value);
+				expect(retained()).toEqual(value);
+			} else if (kind === "framing") {
+				expect(secure).toThrow(bytes.length ? "owner_evidence_framing_invalid" : "owner_evidence_unavailable");
+				expect(retained).toThrow("managed_owner_json_framing_invalid");
+			} else {
+				expect(secure).toThrow(SyntaxError);
+				expect(retained).toThrow(SyntaxError);
+			}
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("keeps native failure classification and the 65536-byte bound", () => {
+		const read = spyOn(natives, "readOwnerOnlyFile").mockReturnValue({ ok: false, code: "read_failed" });
+		try {
+			expect(() => readSecureOwnerJson("unavailable")).toThrow("owner_evidence_unavailable");
+			expect(read).toHaveBeenCalledWith("unavailable", 65536);
+			read.mockImplementation(() => {
+				throw new Error("native-thrown");
+			});
+			expect(() => readSecureOwnerJson("unavailable")).toThrow("native-thrown");
+		} finally {
+			read.mockRestore();
+		}
+	});
+});
+
+describe("closed managed predecessor evidence", () => {
+	it.skipIf(process.platform !== "linux")(
+		"resolves only one exact recoverable schema-3 binding and schema-2 receipt",
+		async () => {
+			const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-predecessor-schema-"));
+			try {
+				const baseline = {
+					state: "current",
+					schema_version: 1,
+					generation: "generation",
+					session_id: "session",
+					published_at: "2026-09-08T00:00:00.000Z",
+				} as const;
+				const root = lifecyclePaths(stateDir, "session", "generation").root;
+				await fs.mkdir(root, { recursive: true, mode: 0o700 });
+				const command = ["gjc", "--resume"];
+				const binding = {
+					schema_version: 3,
+					binding_kind: "recoverable",
+					generation: "generation",
+					session_id: "session",
+					run_id: "run",
+					endpoint_incarnation: "incarnation",
+					child_token: "token",
+					command,
+					command_sha256: crypto.createHash("sha256").update(JSON.stringify(command)).digest("hex"),
+					supervisor_pid: 1,
+					supervisor_start_time: "123",
+					created_at: baseline.published_at,
+				};
+				const receipt = {
+					schema_version: 2,
+					generation: binding.generation,
+					session_id: binding.session_id,
+					run_id: binding.run_id,
+					endpoint_incarnation: binding.endpoint_incarnation,
+					child_token: binding.child_token,
+					command_sha256: binding.command_sha256,
+					supervisor_pid: binding.supervisor_pid,
+					supervisor_start_time: binding.supervisor_start_time,
+					child_pid: 2,
+					child_start_time: "124",
+					signal: "SIGABRT",
+					signal_number: 6,
+					exit_code: null,
+					received_at: baseline.published_at,
+				};
+				const write = async (name: string, value: object) =>
+					fs.writeFile(path.join(root, name), `${JSON.stringify(value)}\n`, { mode: 0o600 });
+				await write("child-token.binding.json", binding);
+				await write("sigabrt-token.receipt.json", receipt);
+				const resolve = () => resolveManagedOwnerPredecessorSync(stateDir, "session", baseline);
+				expect(resolve()).toEqual({
+					generation: "generation",
+					sessionId: "session",
+					runId: "run",
+					incarnation: "incarnation",
+					predecessorToken: "token",
+				});
+				for (const patch of [
+					{ schema_version: 2 },
+					{ binding_kind: "opaque", command: undefined, command_sha256: undefined },
+					{ binding_kind: "opaque" },
+					{ extra: true },
+					{ generation: "stale" },
+					{ session_id: "other" },
+					{ run_id: "other" },
+					{ endpoint_incarnation: "other" },
+					{ command: ["other"] },
+					{ supervisor_pid: 0 },
+					{ created_at: "invalid" },
+				]) {
+					await write("child-token.binding.json", { ...binding, ...patch });
+					expect(resolve).toThrow("managed_owner_replacement_evidence_untrusted");
+				}
+				await write("child-token.binding.json", binding);
+				for (const patch of [
+					{ child_token: "other" },
+					{ child_start_time: "" },
+					{ supervisor_start_time: "other" },
+					{ signal: "EXIT", exit_code: 134 },
+					{ extra: true },
+				]) {
+					await write("sigabrt-token.receipt.json", { ...receipt, ...patch });
+					expect(resolve).toThrow("managed_owner_replacement_evidence_untrusted");
+				}
+				await write("sigabrt-token.receipt.json", receipt);
+				// Unpaired bindings remain discovery-only; a second paired candidate is ambiguous.
+				await write("child-second.binding.json", { ...binding, child_token: "second" });
+				expect(resolve()?.predecessorToken).toBe("token");
+				await write("sigabrt-second.receipt.json", { ...receipt, child_token: "second" });
+				expect(resolve).toThrow("managed_owner_replacement_evidence_ambiguous");
+			} finally {
+				await fs.rm(stateDir, { recursive: true, force: true });
+			}
+		},
+	);
+});
 
 it("accepts only the exact scoped bootstrap success receipt", () => {
 	expect(

@@ -1878,6 +1878,16 @@ export interface NativeNoReplaceResult {
   diagnostic: NativePublishDiagnostic
 }
 
+/**
+ * Bounded, read-only owner-private file bytes. Failures never contain paths or
+ * bytes.
+ */
+export interface NativeOwnerOnlyFileReadResult {
+  ok: boolean
+  data?: Uint8Array
+  code?: string
+}
+
 /** Result of applying or checking owner-only path security. */
 export type NativeOwnerOnlySecurityResult =
 	| {
@@ -2100,6 +2110,16 @@ export declare function ptyTimeoutCount(): bigint
  * Returns an error if clipboard access fails or image encoding fails.
  */
 export declare function readImageFromClipboard(): Promise<ClipboardImage | undefined | null>
+
+/**
+ * Read a private regular file under a private lifecycle directory on
+ * macOS/Linux.
+ *
+ * `max_bytes` must be an integer in 1..=65536. Both
+ * same-descriptor reads are bounded; no path, digest, descriptor, or partial
+ * bytes are returned on failure.
+ */
+export declare function readOwnerOnlyFile(path: string, maxBytes: number): NativeOwnerOnlyFileReadResult
 
 export interface RecoveryFsIdentity {
   dev: string
