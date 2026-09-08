@@ -176,7 +176,7 @@ describe("ACP transcript replay degradation", () => {
 									type: "query_response",
 									id: frame.id,
 									ok: true,
-									result: { promptTerminalOutcomeVersion: 1 },
+									result: { promptTerminalOutcomeVersion: 1, primaryControlSurface: "sdk" },
 								}),
 							);
 							return;

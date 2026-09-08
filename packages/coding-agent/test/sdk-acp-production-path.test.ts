@@ -298,7 +298,7 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 	let makeNextSessionCloseUncertain = true;
 	let rejectNextSessionClose = false;
 	let activeModelPreset = "test-preset";
-	let primaryControlSurface: "cli" | "sdk" = "sdk";
+	let primaryControlSurface: "cli" | "sdk" | undefined = "sdk";
 	let completeNextPromptBeforeAck = false;
 	/** Queries `#sessionState` issues before `session/new` can answer. */
 	const SESSION_STATE_QUERIES = new Set(["config.list/get", "models.profiles.list", "providers.list/active"]);
@@ -446,7 +446,10 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 								type: "query_response",
 								id: frame.id,
 								ok: true,
-								result: { promptTerminalOutcomeVersion: 1, primaryControlSurface },
+								result: {
+									promptTerminalOutcomeVersion: 1,
+									...(primaryControlSurface === undefined ? {} : { primaryControlSurface }),
+								},
 							}),
 						);
 						return;
@@ -1301,6 +1304,26 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 		modelId: "test-preset",
 	});
 	expect(activeModelPreset).toBe("test-preset");
+
+	primaryControlSurface = undefined;
+	const legacyCapabilityAbort = new AbortController();
+	const legacyCapabilityAgent = new AcpAgent(
+		{
+			sessionUpdate: async (update: SessionNotification) => updates.push(update),
+			signal: legacyCapabilityAbort.signal,
+			closed: Promise.withResolvers<void>().promise,
+		} as unknown as AgentSideConnection,
+		{ agentDir },
+	);
+	const registrationsBeforeLegacyCapability = providerRegistrations.length;
+	await expect(
+		bounded(
+			legacyCapabilityAgent.loadSession({ sessionId: created.sessionId, cwd, mcpServers: [] }),
+			"legacy capability rejection",
+		),
+	).rejects.toMatchObject({ code: "unavailable" });
+	expect(providerRegistrations).toHaveLength(registrationsBeforeLegacyCapability);
+	legacyCapabilityAbort.abort();
 
 	const baseProviderAbort = new AbortController();
 	primaryControlSurface = "cli";

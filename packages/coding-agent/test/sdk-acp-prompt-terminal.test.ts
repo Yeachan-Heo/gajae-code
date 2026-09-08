@@ -274,7 +274,7 @@ async function createFixture(
 									: [];
 					const result =
 						frame.query === "runtime.capabilities"
-							? { promptTerminalOutcomeVersion: 1 }
+							? { promptTerminalOutcomeVersion: 1, primaryControlSurface: "sdk" }
 							: frame.query === "context.get"
 								? { usage: { tokens: 0, contextWindow: 200_000, percent: 0, source: "test" } }
 								: { page: { items, complete: true } };

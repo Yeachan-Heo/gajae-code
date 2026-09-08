@@ -169,7 +169,7 @@ type PendingAttachment = { epoch: number; task: Promise<void> };
 type SessionRecord = {
 	cwd: string;
 	adapter: AcpSdkAdapter;
-	primaryControlSurface?: "cli" | "sdk";
+	primaryControlSurface: "cli" | "sdk";
 	attachment: SessionAttachment;
 	closeIdempotencyKey: string;
 	unsubscribe: () => void;
@@ -2401,17 +2401,17 @@ export class AcpAgent implements Agent {
 				// page item, so fall back to the envelope only for direct-result hosts.
 				capabilities = object(pageItems(result)[0]) ?? result;
 			} catch {}
-			if (capabilities?.promptTerminalOutcomeVersion !== 1)
-				throw new AcpSdkAdapterError(
-					"unavailable",
-					"This ACP client requires a newer GJC SDK session; restart the session.",
-				);
 			const primaryControlSurface =
 				capabilities?.primaryControlSurface === "sdk"
 					? "sdk"
 					: capabilities?.primaryControlSurface === "cli"
 						? "cli"
 						: undefined;
+			if (capabilities?.promptTerminalOutcomeVersion !== 1 || primaryControlSurface === undefined)
+				throw new AcpSdkAdapterError(
+					"unavailable",
+					"This ACP client requires a newer GJC SDK session with startup control provenance; restart the session.",
+				);
 			if (primaryControlSurface === "sdk") {
 				adapter.authorizeProviderActivation();
 				await adapter.ensureProviders();

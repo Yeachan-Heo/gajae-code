@@ -119,7 +119,7 @@ describe("ACP production cancellation completion", () => {
 									type: "query_response",
 									id: frame.id,
 									ok: true,
-									result: { promptTerminalOutcomeVersion: 1 },
+									result: { promptTerminalOutcomeVersion: 1, primaryControlSurface: "sdk" },
 								}),
 							);
 							return;

@@ -99,6 +99,9 @@ keeps terminal permission prompts and UI; attaching Paseo does not grant it auth
 delete the underlying session. A Paseo/SDK-started host keeps ACP provider and lifecycle authority
 when Paseo reloads or reconnects. Secondary clients can still submit prompts and change the model
 preset; per-turn prompt and cancellation ownership is unchanged.
+ACP attachments require the host's `runtime.capabilities` response to include this startup-surface
+provenance; restart an older host before attaching so ownership is never inferred from an incomplete
+capability response.
 
 ### Lifecycle: GJC creates, you delete
 
