@@ -1159,7 +1159,7 @@ describe("gjc state handoff", () => {
 			).toBe(0);
 			expect(
 				(await runNativeStateCommand(["handoff", "--mode", "ralplan", "--to", "ultragoal", "--json"], cwd)).status,
-			).toBe(0);
+			).toBe(2);
 		});
 	});
 
@@ -1424,7 +1424,7 @@ describe("gjc state handoff", () => {
 				cwd,
 			);
 			expect(result.status).toBe(2);
-			expect(result.stderr).toContain("cannot authenticate Deep Interview approval lineage");
+			expect(result.stderr).toContain("non-stuck verified final plan evidence");
 		});
 	});
 
@@ -1744,7 +1744,7 @@ describe("gjc state handoff", () => {
 				cwd,
 			);
 			expect(step2.status).toBe(2);
-			expect(step2.stderr).toContain("cannot authenticate Deep Interview approval lineage");
+			expect(step2.stderr).toContain("non-stuck verified final plan evidence");
 			await expect(fs.access(modeStatePath(cwd, TEST_SESSION_ID, "ultragoal"))).rejects.toThrow();
 
 			// The failed execution attempt must leave the already-persisted D -> R
@@ -2217,7 +2217,7 @@ describe("gjc state handoff", () => {
 				cwd,
 			);
 			expect(blocked.status, blocked.stderr).toBe(2);
-			expect(blocked.stderr).toContain("cannot authenticate Deep Interview approval lineage");
+			expect(blocked.stderr).toContain("non-stuck verified final plan evidence");
 		});
 	});
 
