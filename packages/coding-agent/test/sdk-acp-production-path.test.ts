@@ -1435,7 +1435,18 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 	await expect(baseProviderAgent.deleteSession({ sessionId: created.sessionId })).rejects.toMatchObject({
 		code: "operation_prohibited",
 	});
+	// Closing mid-turn settles the waiting prompt as cancelled. Leaving the record in
+	// place would strand the client on a turn that can never complete.
+	const inflightPromptCount = promptInputs.length;
+	const inflightPrompt = baseProviderAgent.prompt({
+		sessionId: created.sessionId,
+		prompt: [{ type: "text", text: "CLI-primary turn interrupted by close" }],
+	});
+	await waitFor(() => promptInputs.length === inflightPromptCount + 1, "in-flight CLI-primary prompt");
 	await expect(baseProviderAgent.closeSession({ sessionId: created.sessionId })).resolves.toEqual({});
+	await expect(bounded(inflightPrompt, "in-flight prompt settles on close")).resolves.toMatchObject({
+		stopReason: "cancelled",
+	});
 	expect(brokerRequests).toHaveLength(cliBrokerRequestCount);
 	const cliPromptInputsAfterClose = promptInputs.length;
 	await expect(
