@@ -2284,6 +2284,7 @@ async function handleArtifactWrite(
 	args: readonly string[],
 	cwd: string,
 	agentDir?: string,
+	finalPublicationLockHeld = false,
 ): Promise<RalplanCommandResult> {
 	// #4693: explicit --worktree-root binds every persistence root to the selected
 	// canonical worktree; the invocation cwd survives only for --artifact input
@@ -2294,6 +2295,17 @@ async function handleArtifactWrite(
 	const resolved = await resolveArtifactArgs(args, persistCwd, cwd, {
 		confineArtifactRoot: target.explicit ? cwd : undefined,
 	});
+	if (resolved.stage === "final" && !finalPublicationLockHeld) {
+		const publicationLockPath = path.join(
+			sessionPlansDir(persistCwd, resolved.sessionId),
+			"ralplan",
+			resolved.runId,
+			"final-publication",
+		);
+		return await withWorkflowStateLock(publicationLockPath, () => handleArtifactWrite(args, cwd, agentDir, true), {
+			cwd: persistCwd,
+		});
+	}
 	const persistedRoleState = parsePersistedRoleStateArgs(args, resolved.stage);
 	const laneVerdict = parseLaneVerdictArgs(args, resolved.stage, resolved.stageN);
 	// Fail closed before stage persistence / path writes when cwd drifted to a sibling repo.
@@ -2404,6 +2416,17 @@ async function handleArtifactWrite(
 			onDiskArtifact,
 			resolved.stage === "final" ? unavailableRalplanFinalAdmission() : undefined,
 		);
+		if (resolved.stage === "final") {
+			const recoveryPublication = { id: randomUUID(), sha256 };
+			await markRalplanFinalPublicationPending(persistCwd, resolved.sessionId, resolved.runId, recoveryPublication);
+			await persistRalplanFinalAdmission(
+				persistCwd,
+				resolved.sessionId,
+				resolved.runId,
+				unavailableRalplanFinalAdmission(),
+				recoveryPublication,
+			);
+		}
 		let appliedPersistedRoleState: PersistedRoleStateUpdate | undefined;
 		if (
 			persistedRoleState &&
