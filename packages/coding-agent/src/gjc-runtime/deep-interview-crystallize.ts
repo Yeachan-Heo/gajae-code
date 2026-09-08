@@ -1532,24 +1532,24 @@ export function crystallizeDeepInterview(value: unknown): DeepInterviewCrystal {
 	const confirmedItems = currentItems.filter(item => item.classification === "confirmed");
 	const opposingActions: ReadonlyArray<readonly [readonly string[], readonly string[]]> = [
 		[
-			["enable", "enabled"],
-			["disable", "disabled"],
+			["enable", "enables", "enabled"],
+			["disable", "disables", "disabled"],
 		],
 		[
-			["allow", "allowed", "permit", "permitted"],
-			["deny", "denied", "prohibit", "prohibited", "forbid", "forbidden"],
+			["allow", "allows", "allowed", "permit", "permits", "permitted"],
+			["deny", "denies", "denied", "prohibit", "prohibits", "prohibited", "forbid", "forbids", "forbidden"],
 		],
 		[
-			["include", "included"],
-			["exclude", "excluded"],
+			["include", "includes", "included"],
+			["exclude", "excludes", "excluded"],
 		],
 		[
-			["start", "started"],
-			["stop", "stopped"],
+			["start", "starts", "started"],
+			["stop", "stops", "stopped"],
 		],
 		[
-			["add", "added"],
-			["remove", "removed"],
+			["add", "adds", "added"],
+			["remove", "removes", "removed"],
 		],
 	];
 	for (let leftIndex = 0; leftIndex < confirmedItems.length; leftIndex++) {
