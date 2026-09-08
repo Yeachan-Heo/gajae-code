@@ -15,6 +15,7 @@ import {
 	rebuildActiveSnapshot,
 	removeActiveEntry,
 	setActiveStateCacheInvalidator,
+	withActiveStateScopeLock,
 	writeActiveEntry,
 } from "../gjc-runtime/state-writer";
 import { getSkillManifest } from "../gjc-runtime/workflow-manifest";
@@ -675,9 +676,11 @@ async function mergeVisibleEntries(
 	// cannot override the latest entry file.
 	const activeEntries = await readActiveEntries(cwd, { sessionId });
 	const hasAuthoritativeEntryDirectory = await hasAuthoritativeActiveEntryDirectory(cwd, sessionId);
-	const entries = hasAuthoritativeEntryDirectory
-		? activeEntries
-		: [...rawActiveEntries(sessionState), ...activeEntries];
+	const authoritativeSkills = new Set(activeEntries.map(entry => entry.skill));
+	const snapshotFallbackEntries = rawActiveEntries(sessionState).filter(
+		entry => !hasAuthoritativeEntryDirectory || authoritativeSkills.has(entry.skill),
+	);
+	const entries = [...snapshotFallbackEntries, ...activeEntries];
 	const merged = new Map(entries.map(entry => [entryKey(entry), entry]));
 	const canonicalRalplanPhase = await readModeStatePhase(cwd, sessionId, "ralplan");
 	const visibleEntries = dedupeVisibleBySkill([...merged.values()], sessionId)
@@ -887,6 +890,7 @@ async function writeHandoffEntry(
 	await writeActiveEntry(cwd, sessionScope, entry.skill, entry, {
 		cwd,
 		audit: activeStateWriterAudit("write-active-entry", sessionScope),
+		activeStateScopeLockHeld: true,
 	});
 }
 
@@ -1017,15 +1021,17 @@ export async function applyHandoffToActiveState(options: ApplyHandoffOptions): P
 		return [...kept, mergedCaller, mergedCallee];
 	};
 	const writeEntries = async (sessionScope: ActiveSessionScope, prior: SkillActiveState | null): Promise<void> => {
-		const authoritativeEntries = await hasAuthoritativeActiveEntryDirectory(options.cwd, sessionId);
-		const priorEntries = authoritativeEntries
-			? await readActiveEntries(options.cwd, sessionScope)
-			: rawActiveEntries(prior);
-		const nextEntries = applyEntries(priorEntries);
-		for (const entry of nextEntries) {
-			await writeHandoffEntry(options.cwd, sessionScope, entry);
-		}
-		await rebuildActiveState(options.cwd, sessionScope);
+		await withActiveStateScopeLock(options.cwd, sessionScope, async () => {
+			const authoritativeEntries = await hasAuthoritativeActiveEntryDirectory(options.cwd, sessionId);
+			const priorEntries = authoritativeEntries
+				? await readActiveEntries(options.cwd, sessionScope)
+				: rawActiveEntries(prior);
+			const nextEntries = applyEntries(priorEntries);
+			for (const entry of nextEntries) {
+				await writeHandoffEntry(options.cwd, sessionScope, entry);
+			}
+			await rebuildActiveState(options.cwd, sessionScope);
+		});
 	};
 
 	const prior = await readState(sessionPath);
