@@ -124,6 +124,7 @@ describe("customize doctor (#4288)", () => {
 			status: "ignored",
 			reason: "source-ignored",
 		});
+		expect(mcps.get("fixture-claude-mcp")?.restartRequired).toBe(true);
 		// Import candidates are never active runtime authority.
 		expect(mcps.get("fixture-claude-mcp")?.mcp?.connectable).toBe(false);
 
@@ -431,7 +432,10 @@ describe("customize doctor (#4288)", () => {
 		);
 		await makeSkill(path.join(cwd, ".claude", "skills"), "fixture-foreign", "Never loaded by startup");
 		await writeJson(path.join(cwd, ".gjc", "mcp.json"), {
-			mcpServers: { "fixture-connectable": { command: "true" } },
+			mcpServers: {
+				"fixture-connectable": { command: "true" },
+				"fixture-autoload-off": { command: "true", autoload: false },
+			},
 		});
 
 		const settings = Settings.isolated({});
@@ -477,6 +481,8 @@ describe("customize doctor (#4288)", () => {
 		expect(Object.keys(projection.configs)).toContain("fixture-connectable");
 		expect(fixture?.mcp?.connectable).toBe(true);
 		expect(fixture?.status).toBe("stored-only");
+		expect(fixture?.restartRequired).toBe(true);
+		expect(mcps.get("fixture-autoload-off")?.restartRequired).toBe(true);
 	});
 	it("disabled native provider does not shadow an enabled lower-priority source (bug A)", async () => {
 		const cwd = await makeTempProject();

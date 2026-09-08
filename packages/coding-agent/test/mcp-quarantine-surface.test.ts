@@ -50,4 +50,22 @@ describe("GJC MCP quarantine surface", () => {
 		expect(systemPrompt).not.toContain("mcp://");
 		expect(interactiveMode).not.toContain("MCPCommandController");
 	});
+
+	it("keeps public MCP guidance aligned with the slash-command quarantine", async () => {
+		const schema = await Bun.file(
+			path.join(repoRoot, "packages", "coding-agent", "src", "config", "mcp-schema.json"),
+		).text();
+		const standaloneMcp = await Bun.file(path.join(repoRoot, "docs", "standalone-mcp.md")).text();
+		const normalizedStandaloneMcp = standaloneMcp.replace(/\s+/g, " ");
+
+		expect(schema).not.toContain("for example /mcp reauth");
+		expect(schema).toContain("no public MCP OAuth authorization or reauthorization entry path is provided");
+		expect(normalizedStandaloneMcp).toContain("do not register a top-level `/mcp` command");
+		expect(normalizedStandaloneMcp).toContain("they do not initiate MCP OAuth authorization");
+		expect(normalizedStandaloneMcp).toContain(
+			"there is no public MCP OAuth authorization or reauthorization entry path",
+		);
+		expect(normalizedStandaloneMcp).toContain("nor a public `/mcp` reconnection or reload contract");
+		expect(normalizedStandaloneMcp).not.toContain("except `/mcp reload`");
+	});
 });

@@ -32,7 +32,19 @@ Malformed or unparseable definitions are skipped fail-closed: they are never par
 
 Pass `--no-mcp` to skip conventional autoload for one session (plugin-bundle MCPs and exact-file `--mcp-config` remain governed by their own surfaces). `--no-mcp` and `--mcp-config` are mutually exclusive.
 
-### Subagents and lifecycle
+## Public slash-command boundary
+
+The ordinary interactive TUI and ACP slash-command surfaces intentionally do not
+register a top-level `/mcp` command. `/mcp test`, `/mcp reauth`, `/mcp
+reconnect`, and `/mcp reload` are not supported user-input entry points. Use
+`gjc mcp add`, `gjc mcp list`, or `gjc mcp remove` to manage stored registrations
+and start a new session. `--mcp-config` and the SDK's `mcpConfigPath` are
+explicit connection-consumer entry points for a trusted config; they do not
+initiate MCP OAuth authorization. Existing credentials bound through `auth` may
+be refreshed by the runtime, but there is no public MCP OAuth authorization or
+reauthorization entry path, nor a public `/mcp` reconnection or reload contract.
+
+## Subagents and lifecycle
 
 Top-level sessions own their MCP manager and clean up server processes on session end. Subagents inherit the parent session's manager facade: they never spawn duplicate server processes and never take ownership of cleanup.
 
@@ -46,7 +58,7 @@ gjc --mcp-config /absolute/path/to/mcp.json
 
 The path must be absolute and identify a regular file directly; symbolic links and other indirection are rejected. GJC reads the file through one open handle and rejects it if the path, file identity, size, or modification metadata changes during the read. Exact-file mode **replaces** conventional autoload: it exposes only that file's MCP tools and does not overlay `.gjc/mcp.json` registrations from either scope. GJC owns the server processes for that session. It does not load server prompts, resources, instructions, sampling, or other config files. Expected read, parse, validation, and connection failures emit one sanitized warning and continue. Unexpected errors and final-catalog tool-name collisions clean up and abort startup.
 
-There is no MCP config reload while the session runs except `/mcp reload` in sessions without plugin-bundle MCP servers, and no subagent inheritance of exact-file tools beyond the parent session's exposed catalog.
+There is no public MCP config reload while the session runs; edit the config and start a new session. There is no subagent inheritance of exact-file tools beyond the parent session's exposed catalog.
 
 ## Supported integrations
 
