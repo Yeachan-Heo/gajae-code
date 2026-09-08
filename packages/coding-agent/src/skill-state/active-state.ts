@@ -671,13 +671,14 @@ async function mergeVisibleEntries(
 	sessionState: SkillActiveState | null,
 	sessionId: string,
 	perSkillEntries?: readonly SkillActiveEntry[],
+	activeStateScopeLockHeld = false,
 ): Promise<SkillActiveEntry[]> {
 	// Use the raw (active + inactive) rows so a handoff demotion stays visible
 	// long enough to supersede a stale same-skill row before the active filter.
 	// Per-skill files in active/<skill>.json are authoritative and are merged
 	// after the derived snapshot cache, so a stale skill-active-state.json row
 	// cannot override the latest entry file.
-	return withActiveStateScopeLock(cwd, { sessionId }, async () => {
+	const read = async () => {
 		const activeEntries = perSkillEntries ?? (await readActiveEntries(cwd, { sessionId }));
 		const hasAuthoritativeEntryDirectory = await hasAuthoritativeActiveEntryDirectory(cwd, sessionId);
 		const authoritativeSkills = new Set(activeEntries.map(entry => entry.skill));
@@ -691,7 +692,8 @@ async function mergeVisibleEntries(
 			.filter(entry => entry.active !== false)
 			.map(entry => withCanonicalRalplanPhase(entry, canonicalRalplanPhase));
 		return collapsePlanningPipeline(visibleEntries).toSorted(comparePipelineEntry);
-	});
+	};
+	return activeStateScopeLockHeld ? await read() : await withActiveStateScopeLock(cwd, { sessionId }, read);
 }
 
 async function hasAuthoritativeActiveEntryDirectory(cwd: string, sessionId: string): Promise<boolean> {
@@ -1053,11 +1055,12 @@ async function activeSubskillsForExistingEntry(
 	cwd: string,
 	sessionId: string | undefined,
 	skill: string,
+	activeStateScopeLockHeld = false,
 ): Promise<ActiveSubskillEntry[] | undefined> {
 	const resolvedSessionId = await resolveBoundarySessionId(cwd, sessionId);
 	const { sessionPath } = getSkillActiveStatePaths(cwd, resolvedSessionId);
 	const sessionState = await readRawActiveStateForHandoff(sessionPath, false);
-	const existing = (await mergeVisibleEntries(cwd, sessionState, resolvedSessionId)).find(
+	const existing = (await mergeVisibleEntries(cwd, sessionState, resolvedSessionId, activeStateScopeLockHeld)).find(
 		entry => entry.skill === skill,
 	);
 	return existing?.active_subskills;
@@ -1067,13 +1070,9 @@ export async function syncSkillActiveState(
 	options: SyncSkillActiveStateOptions,
 ): Promise<GuardedWriteResult | undefined> {
 	if (!options.sessionId) return undefined;
-	const preservedActiveSubskills =
-		options.active_subskills === undefined
-			? await activeSubskillsForExistingEntry(options.cwd, options.sessionId, options.skill)
-			: undefined;
 	const nowIso = options.nowIso ?? new Date().toISOString();
 	const hud = normalizeWorkflowHudSummary(options.hud);
-	const entry: SkillActiveEntry = {
+	const entryBase: SkillActiveEntry = {
 		skill: options.skill,
 		phase: options.phase,
 		active: options.active,
@@ -1087,15 +1086,22 @@ export async function syncSkillActiveState(
 		...(options.handoff_at ? { handoff_at: options.handoff_at } : {}),
 		...(hud ? { hud } : {}),
 		...(options.receipt ? { receipt: options.receipt } : {}),
-		...(options.active_subskills !== undefined
-			? { active_subskills: options.active_subskills }
-			: preservedActiveSubskills
-				? { active_subskills: preservedActiveSubskills }
-				: {}),
 		...(typeof options.sourceRevision === "number" ? { source_state_revision: options.sourceRevision } : {}),
 	};
 	const sessionScope = { sessionId: options.sessionId };
 	return withActiveStateScopeLock(options.cwd, sessionScope, async () => {
+		const preservedActiveSubskills =
+			options.active_subskills === undefined
+				? await activeSubskillsForExistingEntry(options.cwd, options.sessionId, options.skill, true)
+				: undefined;
+		const entry: SkillActiveEntry = {
+			...entryBase,
+			...(options.active_subskills !== undefined
+				? { active_subskills: options.active_subskills }
+				: preservedActiveSubskills
+					? { active_subskills: preservedActiveSubskills }
+					: {}),
+		};
 		await removeSupersededPlanningPipelineEntries(options.cwd, sessionScope, entry, true);
 		const entryWrite = await persistActiveEntry(options.cwd, sessionScope, entry, true);
 		try {
