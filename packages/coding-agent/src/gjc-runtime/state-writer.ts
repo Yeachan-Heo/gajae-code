@@ -130,6 +130,8 @@ export interface StateWriterOptions {
 	 * `withWorkflowStateLock`). Skip re-acquisition to avoid self-deadlock.
 	 */
 	lockHeld?: boolean;
+	/** Caller already holds the session-wide active-entry store lock. */
+	activeStateScopeLockHeld?: boolean;
 }
 
 export class StateWriteConflictError extends Error {
@@ -1016,17 +1018,30 @@ export async function writeActiveEntry(
 	options?: StateWriterOptions,
 ): Promise<GuardedWriteResult> {
 	const filePath = activeEntryPath(path.resolve(cwd), sessionScope, skill);
-	const result = await writeGuardedResolvedJsonAtomic(
-		filePath,
-		{ ...entry, skill },
-		{
-			...options,
-			policy: "cache",
-			advanceSourceRevision: true,
-		},
-	);
+	const write = () =>
+		writeGuardedResolvedJsonAtomic(
+			filePath,
+			{ ...entry, skill },
+			{
+				...options,
+				policy: "cache",
+				advanceSourceRevision: true,
+			},
+		);
+	const result = options?.activeStateScopeLockHeld
+		? await write()
+		: await withActiveStateScopeLock(cwd, sessionScope, write);
 	invalidateActiveStateCacheForScope(cwd, sessionScope);
 	return result;
+}
+
+export async function withActiveStateScopeLock<T>(
+	cwd: string,
+	sessionScope: string | ActiveSessionScope | undefined,
+	fn: () => Promise<T>,
+): Promise<T> {
+	const lockTarget = `${layoutActiveSnapshotPath(path.resolve(cwd), requireSessionId(sessionScope, "active state lock"))}.entries`;
+	return lockResolvedWorkflowTarget(lockTarget, fn);
 }
 
 /** Update an active entry only while it still exactly matches the observed predecessor. */
