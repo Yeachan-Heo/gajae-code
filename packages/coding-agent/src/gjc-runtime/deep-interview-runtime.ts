@@ -10,6 +10,7 @@ import {
 	listProjectSessionTranscriptFiles,
 	parseSessionEntries,
 	RESUME_TRANSCRIPT_MAX_BYTES,
+	readAuthorizedProjectSessionTranscript,
 } from "../session/session-manager";
 import { syncSkillActiveState } from "../skill-state/active-state";
 import { deriveDeepInterviewHud } from "../skill-state/workflow-hud";
@@ -638,6 +639,15 @@ async function authoritativeConversationSnapshot(
 			if (explicitRealPath !== sessionFile) throw new Error("symlink transcript");
 			sessionFile = explicitRealPath;
 			explicitProjectTranscript = isProjectSessionTranscriptPath(path.resolve(cwd, ".gjc"), explicitRealPath);
+			if (
+				explicitProjectTranscript &&
+				!readAuthorizedProjectSessionTranscript(
+					path.resolve(cwd, ".gjc"),
+					explicitRealPath,
+					RESUME_TRANSCRIPT_MAX_BYTES,
+				)
+			)
+				throw new Error("unauthorized project transcript");
 		} catch {
 			throw new DeepInterviewCommandError(2, "GJC_SESSION_FILE is not a managed canonical session transcript");
 		}
@@ -683,9 +693,12 @@ async function authoritativeConversationSnapshot(
 		}
 		for (const candidate of [...canonicalCandidates].sort()) {
 			try {
-				const bytes = await readBoundedFileBytes(candidate, RESUME_TRANSCRIPT_MAX_BYTES, "session transcript", {
-					allowMissing: true,
-				});
+				const projectGjcDir = path.resolve(cwd, ".gjc");
+				const bytes = isProjectSessionTranscriptPath(projectGjcDir, candidate)
+					? readAuthorizedProjectSessionTranscript(projectGjcDir, candidate, RESUME_TRANSCRIPT_MAX_BYTES)
+					: await readBoundedFileBytes(candidate, RESUME_TRANSCRIPT_MAX_BYTES, "session transcript", {
+							allowMissing: true,
+						});
 				if (!bytes) continue;
 				const header = JSON.parse(boundedUtf8(bytes, "session transcript").split(/\r?\n/, 1)[0]) as Record<
 					string,
@@ -705,7 +718,10 @@ async function authoritativeConversationSnapshot(
 	if (!sessionFile)
 		throw new DeepInterviewCommandError(2, "an authenticated session transcript is required for crystallization");
 	try {
-		const bytes = await readBoundedFileBytes(sessionFile, RESUME_TRANSCRIPT_MAX_BYTES, "live session transcript");
+		const projectGjcDir = path.resolve(cwd, ".gjc");
+		const bytes = isProjectSessionTranscriptPath(projectGjcDir, sessionFile)
+			? readAuthorizedProjectSessionTranscript(projectGjcDir, sessionFile, RESUME_TRANSCRIPT_MAX_BYTES)
+			: await readBoundedFileBytes(sessionFile, RESUME_TRANSCRIPT_MAX_BYTES, "live session transcript");
 		if (!bytes) throw new DeepInterviewCommandError(2, "live session transcript is unavailable");
 		const text = boundedUtf8(bytes, "live session transcript");
 		const records: unknown[] = [];

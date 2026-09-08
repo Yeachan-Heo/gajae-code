@@ -654,6 +654,8 @@ function validateItems(value: unknown, snapshot?: CrystalSnapshot): CrystalItem[
 				const quoteTerms = evidenceTerms(item.anchor.quote);
 				const statementQuantitative = quantitativeEvidenceTerms(item.statement);
 				const quoteQuantitative = quantitativeEvidenceTerms(item.anchor.quote);
+				const statementIdentifiers = caseSensitiveIdentifierTerms(item.statement);
+				const quoteIdentifiers = caseSensitiveIdentifierTerms(item.anchor.quote);
 				const conjunctiveQuote = /\b(?:and|plus|as\s+well\s+as)\b/i.test(item.anchor.quote);
 				const statementSemantics = semanticProfile(item.statement);
 				const quoteSemantics = semanticProfile(anchoredClause(anchorMessage.content, item.anchor.quote));
@@ -684,6 +686,8 @@ function validateItems(value: unknown, snapshot?: CrystalSnapshot): CrystalItem[
 					(conjunctiveQuote && [...quoteTerms].some(term => !statementTerms.has(term))) ||
 					statementQuantitative.size !== quoteQuantitative.size ||
 					[...statementQuantitative].some(term => !quoteQuantitative.has(term)) ||
+					statementIdentifiers.size !== quoteIdentifiers.size ||
+					[...statementIdentifiers].some(term => !quoteIdentifiers.has(term)) ||
 					(statementQuantitative.size > 0 &&
 						JSON.stringify(quantitativeEvidenceSequence(item.statement)) !==
 							JSON.stringify(quantitativeEvidenceSequence(item.anchor.quote))) ||
@@ -801,11 +805,9 @@ function evidenceTerms(value: string): Set<string> {
 		"does",
 		"for",
 		"how",
-		"make",
 		"needs",
 		"requirement",
 		"requirements",
-		"support",
 		"that",
 		"the",
 		"this",
@@ -862,6 +864,32 @@ function quantitativeEvidenceSequence(value: string): string[] {
 		const token = match[0];
 		return token.length <= 3 && /[A-Z]/.test(token) ? token : token.toLowerCase();
 	});
+}
+
+function caseSensitiveIdentifierTerms(value: string): Set<string> {
+	return new Set(
+		[...value.normalize("NFC").matchAll(/\b[A-Za-z][A-Za-z0-9_]*\b/g)]
+			.map(match => match[0])
+			.filter(term => term.includes("_") || (term.length > 1 && term === term.toUpperCase())),
+	);
+}
+
+function requirementBearingClauses(snapshot: CrystalSnapshot): Array<{ messageIndex: number; clause: string }> {
+	const clauses: Array<{ messageIndex: number; clause: string }> = [];
+	for (const message of snapshot.messages) {
+		if (message.role !== "user") continue;
+		for (const raw of message.content.split(/(?:[!?。！？;]|\.(?=\s|$)|\n)+\s*/u)) {
+			const clause = raw.trim();
+			if (!clause || /["“”]/u.test(clause) || /^(?:what|why|how|when|where|who|which)\b/i.test(clause)) continue;
+			if (
+				/\b(?:build|create|make|support|encrypt|decrypt|use|set|keep|retain|remove|delete|limit|allow|deny|require|requires|required|must|should|need|needs|want|wants|will|shall|only|never|do\s+not|don't|dont)\b/i.test(
+					clause,
+				)
+			)
+				clauses.push({ messageIndex: message.index, clause });
+		}
+	}
+	return clauses;
 }
 
 function evidenceTermSequence(value: string): string[] {
@@ -1422,6 +1450,36 @@ export function crystallizeDeepInterview(value: unknown): DeepInterviewCrystal {
 	const currentItems = mergedItems;
 	if (currentItems.length > MAX_ITEMS) throw new Error("merged crystallize items exceed the bounded limit");
 	if (currentItems.length === 0) throw new Error("crystallize requires material conversation evidence");
+	for (const directive of requirementBearingClauses(snapshot)) {
+		const directiveTerms = topicTerms(directive.clause, false);
+		const represented = currentItems.some(
+			item =>
+				(item.anchor?.message_index === directive.messageIndex &&
+					(directive.clause.includes(item.anchor.quote) || item.anchor.quote.includes(directive.clause))) ||
+				([...directiveTerms].every(term => evidenceTerms(item.statement).has(term)) &&
+					sameSemanticIntent(semanticProfile(directive.clause), semanticProfile(item.statement))),
+		);
+		const representedRemoval = [...priorRemovedAnchors, ...resolvedRemovalAnchors].some(anchor => {
+			const quote = anchor.quote.replace(/[.!?。！？]+$/u, "");
+			const resolution = anchor.resolution.replace(/[.!?。！？]+$/u, "");
+			const resolutionTerms = evidenceTerms(resolution);
+			return (
+				anchor.message_index === directive.messageIndex &&
+				(directive.clause.includes(quote) ||
+					directive.clause.includes(resolution) ||
+					[...directiveTerms].some(term => resolutionTerms.has(term)))
+			);
+		});
+		const unresolved = [...gaps, ...conflicts].some(item => {
+			const clauseTerms = evidenceTerms(directive.clause);
+			return (
+				[...topicTerms(item, false)].some(term => clauseTerms.has(term)) ||
+				hasCjkTopicOverlap(item, directive.clause)
+			);
+		});
+		if (!represented && !representedRemoval && !unresolved)
+			throw new Error(`unrepresented user directive requires an item or unresolved gap: ${directive.clause}`);
+	}
 	if (!currentItems.some(item => item.classification === "confirmed" && item.kind !== "non_goal"))
 		throw new Error("crystallize requires a confirmed user requirement");
 	const changed = currentItems

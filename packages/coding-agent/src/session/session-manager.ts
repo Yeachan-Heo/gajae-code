@@ -6378,6 +6378,25 @@ export function isProjectSessionTranscriptPath(projectGjcDir: string, filePath: 
 	return parent === "agent-session" || segments.includes("sessions");
 }
 
+export function readAuthorizedProjectSessionTranscript(
+	projectGjcDir: string,
+	filePath: string,
+	maxBytes: number,
+): Buffer | undefined {
+	const root = path.resolve(projectGjcDir);
+	const candidate = path.resolve(filePath);
+	if (!isProjectSessionTranscriptPath(root, candidate)) return undefined;
+	const relativePath = path.relative(root, candidate).split(path.sep).join("/");
+	const authority = nativeSessionManager().openRecoveryFsRoot(root);
+	try {
+		const result = authority.readManaged(relativePath);
+		if (!result.ok || !result.data || result.data.byteLength > maxBytes) return undefined;
+		return Buffer.from(result.data);
+	} finally {
+		authority.close();
+	}
+}
+
 /**
  * Discover resumable transcripts intentionally stored inside a project's `.gjc`.
  * Runtime token/audit JSONL files are excluded by requiring a known transcript
