@@ -1,4 +1,4 @@
-import { createHash, randomBytes } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import type { Dirent } from "node:fs";
 import * as fssync from "node:fs";
 import * as fs from "node:fs/promises";
@@ -1495,6 +1495,7 @@ async function persistRalplanFinalAdmission(
 	sessionId: string,
 	runId: string,
 	admission: RalplanAutoHandoffResolution,
+	publication: { id: string; sha256: string },
 ): Promise<void> {
 	const statePath = ralplanStatePath(cwd, sessionId);
 	await withWorkflowStateLock(
@@ -1509,6 +1510,31 @@ async function persistRalplanFinalAdmission(
 			}
 			let existing: Record<string, unknown> = existingRead.kind === "valid" ? existingRead.value : {};
 			if (existing.run_id !== runId) return;
+			const pending =
+				existing.final_publication_pending &&
+				typeof existing.final_publication_pending === "object" &&
+				!Array.isArray(existing.final_publication_pending)
+					? (existing.final_publication_pending as Record<string, unknown>)
+					: undefined;
+			if (
+				pending?.publication_id !== publication.id ||
+				pending.final_sha256 !== publication.sha256 ||
+				pending.run_id !== runId
+			)
+				throw new RalplanCommandError(2, "final publication was superseded by a concurrent writer");
+			const index = await loadRalplanIndexForCap(cwd, sessionId, runId);
+			let lastFinalSha: string | undefined;
+			for (const line of index.rawText?.split(/\r?\n/) ?? []) {
+				if (!line.trim()) continue;
+				try {
+					const row = JSON.parse(line) as Record<string, unknown>;
+					if (row.stage === "final" && typeof row.sha256 === "string") lastFinalSha = row.sha256;
+				} catch {
+					throw new RalplanCommandError(2, "final publication index is malformed");
+				}
+			}
+			if (lastFinalSha !== publication.sha256)
+				throw new RalplanCommandError(2, "final publication index does not match the active writer");
 			const currentAdmission = parseRalplanFinalAdmission(existing.auto_handoff);
 			const receipt =
 				existing.receipt && typeof existing.receipt === "object" && !Array.isArray(existing.receipt)
@@ -1552,7 +1578,12 @@ async function persistRalplanFinalAdmission(
 	);
 }
 
-async function markRalplanFinalPublicationPending(cwd: string, sessionId: string, runId: string): Promise<void> {
+async function markRalplanFinalPublicationPending(
+	cwd: string,
+	sessionId: string,
+	runId: string,
+	publication: { id: string; sha256: string },
+): Promise<void> {
 	const statePath = ralplanStatePath(cwd, sessionId);
 	await withWorkflowStateLock(
 		statePath,
@@ -1561,6 +1592,14 @@ async function markRalplanFinalPublicationPending(cwd: string, sessionId: string
 			if (existingRead.kind === "corrupt")
 				throw new RalplanCommandError(2, `existing ralplan state is corrupt or tampered (${existingRead.error})`);
 			let existing: Record<string, unknown> = existingRead.kind === "valid" ? existingRead.value : {};
+			if (existing.run_id !== runId) {
+				delete existing.planning_stuck;
+				delete existing.auto_handoff;
+				delete existing.handoff_from;
+				delete existing.handoff_at;
+				delete existing.upstream_handoff_at;
+				delete existing.final_admission_phase_transition;
+			}
 			existing.skill = "ralplan";
 			existing.version = WORKFLOW_STATE_VERSION;
 			existing.session_id = sessionId;
@@ -1569,7 +1608,12 @@ async function markRalplanFinalPublicationPending(cwd: string, sessionId: string
 			existing.current_phase = "final";
 			const startedAt = new Date().toISOString();
 			existing.updated_at = startedAt;
-			existing.final_publication_pending = { run_id: runId, started_at: startedAt };
+			existing.final_publication_pending = {
+				run_id: runId,
+				publication_id: publication.id,
+				final_sha256: publication.sha256,
+				started_at: startedAt,
+			};
 			existing = migrateWorkflowState(existing, "ralplan").state;
 			await writeWorkflowEnvelopeAtomic(statePath, existing, {
 				cwd,
@@ -2328,11 +2372,14 @@ async function handleArtifactWrite(
 			// crash in the gap, before returning the deduplicated receipt.
 			if (existingArtifact.autoHandoff) {
 				const planningStuck = await readRalplanPlanningStuck(persistCwd, resolved.sessionId, resolved.runId);
+				const publication = { id: randomUUID(), sha256: existingArtifact.sha256 };
+				await markRalplanFinalPublicationPending(persistCwd, resolved.sessionId, resolved.runId, publication);
 				await persistRalplanFinalAdmission(
 					persistCwd,
 					resolved.sessionId,
 					resolved.runId,
 					applyRalplanPlanningStuckOverride(existingArtifact.autoHandoff, planningStuck),
+					publication,
 				);
 			}
 		}
@@ -2431,6 +2478,7 @@ async function handleArtifactWrite(
 	}
 
 	let autoHandoff: RalplanAutoHandoffResolution | undefined;
+	let finalPublication: { id: string; sha256: string } | undefined;
 	if (resolved.stage === "final") {
 		// Resolve and validate the configured admission before any final artifact or
 		// state write. The ledger row below is the durable receipt for deduplicated
@@ -2439,7 +2487,8 @@ async function handleArtifactWrite(
 			agentDir,
 			planningStuck: await readRalplanPlanningStuck(persistCwd, resolved.sessionId, resolved.runId),
 		});
-		await markRalplanFinalPublicationPending(persistCwd, resolved.sessionId, resolved.runId);
+		finalPublication = { id: randomUUID(), sha256 };
+		await markRalplanFinalPublicationPending(persistCwd, resolved.sessionId, resolved.runId, finalPublication);
 	}
 	// Keep run-state `current_phase` coherent with the stage being persisted.
 	await persistActiveRunId(persistCwd, resolved.sessionId, resolved.runId, resolved.stage);
@@ -2451,7 +2500,13 @@ async function handleArtifactWrite(
 		await applyLaneVerdictUpdate(persistCwd, resolved.sessionId, laneVerdict);
 	}
 	if (autoHandoff) {
-		await persistRalplanFinalAdmission(persistCwd, resolved.sessionId, resolved.runId, autoHandoff);
+		await persistRalplanFinalAdmission(
+			persistCwd,
+			resolved.sessionId,
+			resolved.runId,
+			autoHandoff,
+			finalPublication!,
+		);
 	}
 	await writeSessionActivityMarker(persistCwd, resolved.sessionId, {
 		writer: "ralplan-runtime",
