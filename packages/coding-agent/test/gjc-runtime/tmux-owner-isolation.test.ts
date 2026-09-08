@@ -5,6 +5,7 @@ import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import type { ManagedOwnerOpaqueBinding } from "@gajae-code/coding-agent/gjc-runtime/managed-owner-binding";
 import {
 	type AttemptCapability,
 	type BootstrapRequest,
@@ -12,12 +13,14 @@ import {
 	captureOwnerGenerationBaselineSync,
 	classifyCgroup,
 	closeExactTmuxOwner,
+	consumeCooperativeOwnerIntent,
 	createOwnerIntent,
 	executeTmuxOwnerIsolationPlanSync,
 	isExactScopedBootstrapSuccessReceipt,
 	isOwnerGenerationBaselineCurrentSync,
 	isValidOwnerVerdict,
 	lifecyclePaths,
+	type OwnerIntent,
 	observeOwnerTerminal,
 	ownerProcessStartTime,
 	type PlanRequest,
@@ -102,6 +105,130 @@ describe("exact owner JSON framing", () => {
 			expect(() => readSecureOwnerJson("unavailable")).toThrow("native-thrown");
 		} finally {
 			read.mockRestore();
+		}
+	});
+});
+
+describe("owner intent construction", () => {
+	it.each(
+		process.platform === "darwin" ? ["kernel_signal", "cooperative_intent"] : ["kernel_signal"],
+	)("preserves invalid-record rejection, ordered publication and locked nonces: %s", async mode => {
+		const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-owner-intent-shape-"));
+		const ids: string[] = [];
+		try {
+			for (const generation of ["invalid", "first", "second"]) {
+				const invalid = generation === "invalid";
+				await replaceOwnerGeneration(state, "session", generation);
+				const paths = lifecyclePaths(state, "session", generation);
+				const request = {
+					stateDir: state,
+					sessionId: "session",
+					generation,
+					serverKey: "socket",
+					pid: 10,
+					startTime: "start",
+					dispatchId: invalid ? "" : `dispatch-${generation}`,
+					createdAt: new Date(Date.now() - 10).toISOString(),
+					expiresAt: new Date(Date.now() + 5_000).toISOString(),
+				};
+				const randomUUID = crypto.randomUUID;
+				let nonceCalls = 0;
+				const nonce = spyOn(crypto, "randomUUID").mockImplementation(() => {
+					const contender = new Database(paths.lockDatabaseFile);
+					try {
+						contender.exec("PRAGMA busy_timeout = 0");
+						expect(() => contender.exec("BEGIN IMMEDIATE")).toThrow();
+					} finally {
+						contender.close();
+					}
+					const id = randomUUID();
+					nonceCalls += 1;
+					// Kernel lock tokens precede the intent; cooperative staging nonces follow it.
+					if (!invalid && nonceCalls === (mode === "kernel_signal" ? 2 : 1)) ids.push(id);
+					return id;
+				});
+				let signals = 0;
+				let proofs = 0;
+				let cleanups = 0;
+				let verdicts = 0;
+				try {
+					const closing = closeExactTmuxOwner(request, {
+						readStartTime: async () => "start",
+						shutdown:
+							mode === "kernel_signal"
+								? {
+										kind: "kernel_signal",
+										sendSigterm: async () => {
+											signals += 1;
+										},
+									}
+								: {
+										kind: "cooperative_intent",
+										assertCooperativeOwner: () => {
+											proofs += 1;
+											expect(nonceCalls).toBe(proofs === 1 ? 1 : 2);
+											expect(fsSync.existsSync(paths.intentFile)).toBe(false);
+										},
+									},
+						waitForVerdict: async intent => {
+							verdicts += 1;
+							const expected = {
+								schema_version: 1,
+								intent_id: ids[ids.length - 1],
+								state: "pending",
+								generation,
+								session_id: "session",
+								server_key: "socket",
+								expected_terminal: { signal: "SIGTERM", result: "owner_term_then_session_cleanup" },
+								dispatch_id: request.dispatchId,
+								created_at: request.createdAt,
+								expires_at: request.expiresAt,
+							};
+							expect(JSON.stringify(intent)).toBe(JSON.stringify(expected));
+							expect(await fs.readFile(paths.intentFile, "utf8")).toBe(`${JSON.stringify(expected)}\n`);
+							return {
+								schema_version: 1,
+								generation,
+								session_id: "session",
+								server_key: "socket",
+								observed_at: new Date().toISOString(),
+								signal: "SIGTERM",
+								exit_code: 0,
+								result: "owner_term_then_session_cleanup",
+								observer: "raw_monitor",
+								classification: "expected_operator_shutdown",
+								reason: "test",
+								intent_id: intent.intent_id,
+								dedupe_key: `owner-loss:session:${generation}`,
+							};
+						},
+						cleanupSession: async () => {
+							cleanups += 1;
+						},
+					});
+					if (invalid) {
+						await expect(closing).rejects.toThrow(
+							mode === "kernel_signal" ? "owner_intent_invalid" : "owner_term_verdict_timeout",
+						);
+						expect([signals, proofs, cleanups, verdicts]).toEqual([0, 0, 0, 0]);
+						for (const suffix of ["", ".cancelled", ".expired", ".consumed"])
+							expect(fsSync.existsSync(`${paths.intentFile}${suffix}`)).toBe(false);
+						continue;
+					}
+					await closing;
+					expect(nonce).toHaveBeenCalledTimes(2);
+					expect(signals).toBe(mode === "kernel_signal" ? 1 : 0);
+					expect(proofs).toBe(mode === "cooperative_intent" ? 3 : 0);
+					expect(cleanups).toBe(1);
+					expect(verdicts).toBe(1);
+				} finally {
+					nonce.mockRestore();
+				}
+			}
+			expect(ids).toHaveLength(2);
+			expect(ids[0]).not.toBe(ids[1]);
+		} finally {
+			await fs.rm(state, { recursive: true, force: true });
 		}
 	});
 });
@@ -203,6 +330,285 @@ describe("closed managed predecessor evidence", () => {
 			}
 		},
 	);
+});
+
+describe.skipIf(process.platform !== "darwin")("cooperative owner dispatch commit", () => {
+	it("does not publish before final proof and never cancels a post-publication failure", async () => {
+		for (const fault of [
+			"final-proof",
+			"before-rename",
+			"after-rename",
+			"readback",
+			"release",
+			"generation",
+			"expired",
+			"mismatched-verdict",
+		]) {
+			const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-cooperative-commit-"));
+			let restore: (() => void) | undefined;
+			try {
+				await replaceOwnerGeneration(state, "session", "generation");
+				const paths = lifecyclePaths(state, "session", "generation");
+				let proofs = 0;
+				let cleanups = 0;
+				if (fault === "before-rename" || fault === "after-rename") {
+					const original = natives.renameNoReplacePathAsync;
+					const spy = spyOn(natives, "renameNoReplacePathAsync").mockImplementation(async (...args) => {
+						if (fault === "after-rename") await original(...args);
+						throw new Error("injected_publication_fault");
+					});
+					restore = () => spy.mockRestore();
+				}
+				if (fault === "readback") {
+					const original = natives.readOwnerOnlyFile;
+					const spy = spyOn(natives, "readOwnerOnlyFile").mockImplementation((file, limit) =>
+						file === paths.intentFile ? { ok: false, code: "read_failed" } : original(file, limit),
+					);
+					restore = () => spy.mockRestore();
+				}
+				if (fault === "release") {
+					const original = Database.prototype.exec;
+					const spy = spyOn(Database.prototype, "exec").mockImplementation(function (this: Database, sql: string) {
+						if (sql === "COMMIT") throw new Error("release_failed");
+						return original.call(this, sql);
+					});
+					restore = () => spy.mockRestore();
+				}
+				const request = {
+					stateDir: state,
+					sessionId: "session",
+					generation: "generation",
+					serverKey: "socket",
+					pid: 10,
+					startTime: "provenance",
+					dispatchId: "dispatch",
+					createdAt: new Date(Date.now() - 10).toISOString(),
+					expiresAt: new Date(Date.now() + (fault === "expired" ? -1 : 5_000)).toISOString(),
+				};
+				await expect(
+					closeExactTmuxOwner(request, {
+						readStartTime: async () => "provenance",
+						shutdown: {
+							kind: "cooperative_intent",
+							assertCooperativeOwner: () => {
+								proofs += 1;
+								expect(fsSync.existsSync(paths.intentFile)).toBe(false);
+								if (fault === "final-proof" && proofs === 3) throw new Error("final_proof_failed");
+								if (fault === "generation" && proofs === 2)
+									fsSync.writeFileSync(
+										paths.generationFile,
+										`${JSON.stringify({ schema_version: 1, generation: "replacement", session_id: "session", published_at: new Date().toISOString() })}\n`,
+									);
+							},
+						},
+						waitForVerdict: async () =>
+							fault === "mismatched-verdict"
+								? {
+										schema_version: 1,
+										generation: "generation",
+										session_id: "session",
+										server_key: "socket",
+										observed_at: new Date().toISOString(),
+										signal: "SIGTERM",
+										exit_code: 0,
+										result: "owner_term_then_session_cleanup",
+										observer: "raw_monitor",
+										classification: "expected_operator_shutdown",
+										reason: "test",
+										intent_id: "wrong-intent",
+										dedupe_key: "owner-loss:session:generation",
+									}
+								: null,
+						cleanupSession: async () => {
+							cleanups += 1;
+						},
+					}),
+				).rejects.toThrow();
+				expect(cleanups).toBe(0);
+				expect(fsSync.existsSync(paths.intentFile)).toBe(
+					["after-rename", "readback", "release", "mismatched-verdict"].includes(fault),
+				);
+				for (const suffix of [".cancelled", ".expired", ".consumed"])
+					expect(fsSync.existsSync(`${paths.intentFile}${suffix}`)).toBe(false);
+				if (fault === "final-proof") expect(proofs).toBe(3);
+			} finally {
+				restore?.();
+				await fs.rm(state, { recursive: true, force: true });
+			}
+		}
+	});
+
+	it("consumes only exact timely evidence while holding the same generation lock", async () => {
+		const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-cooperative-consumer-"));
+		try {
+			await replaceOwnerGeneration(state, "session", "prior-generation");
+			await observeOwnerTerminal({
+				schema_version: 1,
+				op: "observe_terminal",
+				session_id: "session",
+				owner_generation: "prior-generation",
+				state_dir: state,
+				socket_key: "socket",
+				observer: "raw_monitor",
+				observed_at: new Date().toISOString(),
+				signal: "EXIT",
+				exit_code: 0,
+				exit_kind: "exit",
+				reason: "test",
+			});
+			await replaceOwnerGeneration(state, "session", "generation");
+			const paths = lifecyclePaths(state, "session", "generation");
+			const priorAlias = readSecureOwnerJson(paths.verdictAliasFile) as Record<string, unknown>;
+			const binding: ManagedOwnerOpaqueBinding = {
+				schema_version: 3,
+				binding_kind: "opaque",
+				generation: "generation",
+				session_id: "session",
+				run_id: "run",
+				endpoint_incarnation: "incarnation",
+				child_token: "token",
+				supervisor_pid: 10,
+				supervisor_start_time: "provenance",
+				created_at: new Date(Date.now() - 1_000).toISOString(),
+			};
+			const intent: OwnerIntent = {
+				schema_version: 1,
+				intent_id: "intent",
+				state: "pending",
+				generation: "generation",
+				session_id: "session",
+				server_key: "socket",
+				expected_terminal: { signal: "SIGTERM", result: "owner_term_then_session_cleanup" },
+				dispatch_id: "dispatch",
+				created_at: new Date(Date.now() - 100).toISOString(),
+				expires_at: new Date(Date.now() + 10_000).toISOString(),
+			};
+			const write = (file: string, value: unknown) =>
+				fsSync.writeFileSync(file, `${JSON.stringify(value)}\n`, { mode: 0o600 });
+			write(path.join(paths.root, "child-token.binding.json"), binding);
+			let relays = 0;
+			const poll = () =>
+				consumeCooperativeOwnerIntent({
+					stateDir: state,
+					binding,
+					serverKey: "socket",
+					relay: () => {
+						const contender = new Database(paths.lockDatabaseFile);
+						try {
+							contender.exec("PRAGMA busy_timeout = 0");
+							expect(() => contender.exec("BEGIN IMMEDIATE")).toThrow();
+						} finally {
+							contender.close();
+						}
+						relays += 1;
+					},
+				});
+			write(`${paths.intentFile}.staging`, intent);
+			poll();
+			expect(relays).toBe(0);
+			for (const patch of [
+				{ server_key: "wrong" },
+				{ generation: "stale" },
+				{ session_id: "wrong" },
+				{ dispatch_id: "" },
+				{ extra: true },
+				{ created_at: new Date(Date.now() + 1_000).toISOString() },
+				{ created_at: new Date(Date.now() - 2_000).toISOString() },
+				{ expires_at: new Date(Date.now() - 1).toISOString() },
+			]) {
+				write(paths.intentFile, { ...intent, ...patch });
+				poll();
+				expect(relays).toBe(0);
+			}
+			write(paths.intentFile, intent);
+			for (const suffix of [".cancelled", ".expired", ".invalidated", ".consumed"]) {
+				write(`${paths.intentFile}${suffix}`, intent);
+				poll();
+				expect(relays).toBe(0);
+				fsSync.unlinkSync(`${paths.intentFile}${suffix}`);
+			}
+			for (const alias of [
+				{ ...priorAlias, extra: true },
+				{ ...priorAlias, session_id: "other" },
+				{
+					...priorAlias,
+					generation: "generation",
+					owner_generation: "generation",
+					dedupe_key: "owner-loss:session:generation",
+				},
+				{
+					...priorAlias,
+					generation: "unknown",
+					owner_generation: "unknown",
+					dedupe_key: "owner-loss:session:unknown",
+				},
+			]) {
+				write(paths.verdictAliasFile, alias);
+				poll();
+				expect(relays).toBe(0);
+			}
+			write(paths.verdictAliasFile, priorAlias);
+			write(path.join(paths.root, "child-token.binding.json"), { ...binding, run_id: "replacement" });
+			poll();
+			expect(relays).toBe(0);
+			write(path.join(paths.root, "child-token.binding.json"), binding);
+			const nativeRead = spyOn(natives, "readOwnerOnlyFile").mockReturnValue({ ok: false, code: "read_failed" });
+			try {
+				poll();
+				expect(relays).toBe(0);
+			} finally {
+				nativeRead.mockRestore();
+			}
+			const held = new Database(paths.lockDatabaseFile);
+			try {
+				held.exec("BEGIN IMMEDIATE");
+				poll();
+				expect(relays).toBe(0);
+				held.exec("COMMIT");
+			} finally {
+				held.close();
+			}
+			const holder = Bun.spawn({
+				cmd: [
+					process.execPath,
+					"-e",
+					`import { Database } from "bun:sqlite";
+const db = new Database(${JSON.stringify(paths.lockDatabaseFile)}); db.exec("BEGIN IMMEDIATE");
+process.stdout.write("locked\\n"); const timer = setTimeout(() => process.exit(93), 3_000);
+await Bun.stdin.text(); db.exec("COMMIT"); db.close(); clearTimeout(timer);`,
+				],
+				stdin: "pipe",
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			try {
+				const reader = holder.stdout.getReader();
+				try {
+					expect(new TextDecoder().decode((await reader.read()).value)).toBe("locked\n");
+				} finally {
+					reader.releaseLock();
+				}
+				poll();
+				expect(relays).toBe(0);
+			} finally {
+				holder.stdin.end();
+				const exited = await Promise.race([holder.exited, Bun.sleep(1_000).then(() => null)]);
+				if (exited === null) {
+					holder.kill("SIGKILL");
+					await holder.exited;
+				}
+				expect(exited).toBe(0);
+			}
+			poll();
+			expect(relays).toBe(1);
+			expect(readSecureOwnerJson(paths.intentFile)).toEqual(intent);
+			await replaceOwnerGeneration(state, "session", "replacement");
+			poll();
+			expect(relays).toBe(1);
+		} finally {
+			await fs.rm(state, { recursive: true, force: true });
+		}
+	});
 });
 
 it("accepts only the exact scoped bootstrap success receipt", () => {
@@ -1276,8 +1682,11 @@ describe("tmux owner isolation", () => {
 				},
 				{
 					readStartTime: async () => "start",
-					sendSigterm: async () => {
-						throw new Error("must not signal");
+					shutdown: {
+						kind: "kernel_signal",
+						sendSigterm: async () => {
+							throw new Error("must not signal");
+						},
 					},
 					waitForVerdict: async () => null,
 					cleanupSession: async () => undefined,
@@ -1542,9 +1951,12 @@ describe("tmux owner isolation", () => {
 		let cleanups = 0;
 		const dependencies = {
 			readStartTime: async () => "start",
-			sendSigterm: async () => {
-				signals += 1;
-				throw new Error("dispatch_failed");
+			shutdown: {
+				kind: "kernel_signal" as const,
+				sendSigterm: async () => {
+					signals += 1;
+					throw new Error("dispatch_failed");
+				},
 			},
 			waitForVerdict: async () => null,
 			cleanupSession: async () => {
@@ -1601,8 +2013,11 @@ describe("tmux owner isolation", () => {
 			await expect(
 				closeExactTmuxOwner(requestFor(generation, "2099-01-01T00:00:00.000Z"), {
 					...dependencies,
-					sendSigterm: async () => {
-						signals += 1;
+					shutdown: {
+						kind: "kernel_signal",
+						sendSigterm: async () => {
+							signals += 1;
+						},
 					},
 					waitForVerdict: async () => verdict,
 				}),

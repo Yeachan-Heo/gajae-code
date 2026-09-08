@@ -12,10 +12,16 @@ import * as fs from "node:fs/promises";
 
 import * as path from "node:path";
 
-import { openRecoveryFsRoot, readOwnerOnlyFile, type RecoveryFsRoot } from "@gajae-code/natives";
+import {
+	openRecoveryFsRoot,
+	type RecoveryFsRoot,
+	readOwnerOnlyFile,
+	verifyOwnerOnlyPathSecurity,
+} from "@gajae-code/natives";
 import { isCompiledBinary } from "@gajae-code/utils/env";
+import { managedDirectoryRoot, publishManagedFileNoReplace } from "../session/internal/managed-session-storage";
 import { parseLinuxProcStartTime } from "./linux-proc";
-import { isManagedOwnerBinding, isManagedOwnerSigabrtReceipt } from "./managed-owner-binding";
+import { isManagedOwnerBinding, isManagedOwnerSigabrtReceipt, type ManagedOwnerBinding } from "./managed-owner-binding";
 
 export const TMUX_OWNER_ISOLATION_SCHEMA_VERSION = 1;
 export const TMUX_OWNER_ISOLATION_MAX_LINE_BYTES = 16 * 1024;
@@ -1312,16 +1318,20 @@ export function publishOwnerGenerationSync(request: PublishGenerationRequest): P
 	return { schema_version: 1, ok: true, code: "generation_published", generation };
 }
 
-export async function createOwnerIntent(
-	stateDir: string,
-	input: Omit<OwnerIntent, "schema_version" | "intent_id" | "state">,
-): Promise<OwnerIntent> {
-	const intent: OwnerIntent = {
+function ownerIntentRecord(input: Omit<OwnerIntent, "schema_version" | "intent_id" | "state">): OwnerIntent {
+	return {
 		schema_version: 1,
 		intent_id: crypto.randomUUID(),
 		state: "pending",
 		...input,
 	};
+}
+
+export async function createOwnerIntent(
+	stateDir: string,
+	input: Omit<OwnerIntent, "schema_version" | "intent_id" | "state">,
+): Promise<OwnerIntent> {
+	const intent = ownerIntentRecord(input);
 	if (!isValidOwnerIntent(intent)) throw new Error("owner_intent_invalid");
 	const paths = lifecyclePaths(stateDir, input.session_id, input.generation);
 	await fs.mkdir(paths.root, { recursive: true });
@@ -1398,9 +1408,15 @@ async function acquireSqliteLock(paths: LifecyclePaths, waitMs: number): Promise
 	return null;
 }
 
-function acquireSqliteLockSync(paths: LifecyclePaths, waitMs: number): Database | null {
+function acquireSqliteLockSync(paths: LifecyclePaths, waitMs: number, existingOnly = false): Database | null {
 	try {
-		fsSync.mkdirSync(paths.root, { recursive: true, mode: 0o700 });
+		if (existingOnly) {
+			if (
+				!verifyOwnerOnlyPathSecurity(paths.root, "directory").ok ||
+				!verifyOwnerOnlyPathSecurity(paths.lockDatabaseFile, "file").ok
+			)
+				return null;
+		} else fsSync.mkdirSync(paths.root, { recursive: true, mode: 0o700 });
 		const database = new Database(paths.lockDatabaseFile);
 		try {
 			setLockDatabaseMode(paths.lockDatabaseFile);
@@ -1780,8 +1796,10 @@ export interface ExactOwnerCloseRequest {
 }
 export interface ExactOwnerCloseDependencies {
 	readStartTime(pid: number): Promise<string | null>;
-	sendSigterm(pid: number): Promise<void>;
-	waitForVerdict(): Promise<OwnerVerdict | null>;
+	shutdown:
+		| { kind: "kernel_signal"; sendSigterm(pid: number): Promise<void> }
+		| { kind: "cooperative_intent"; assertCooperativeOwner(): void };
+	waitForVerdict(intent: OwnerIntent): Promise<OwnerVerdict | null>;
 	cleanupSession(): Promise<void>;
 }
 
@@ -1802,6 +1820,120 @@ export function parseExactOwnerJson(
 	return JSON.parse(text);
 }
 
+function assertSecureGeneration(paths: LifecyclePaths, sessionId: string): void {
+	const generation = readSecureOwnerJson(paths.generationFile);
+	if (
+		!isRecord(generation) ||
+		Object.keys(generation).length !== 4 ||
+		generation.schema_version !== 1 ||
+		generation.session_id !== sessionId ||
+		generation.generation !== paths.generation ||
+		!isCanonicalUtcTimestamp(generation.published_at)
+	)
+		throw new Error("owner_generation_mismatch");
+}
+
+function assertNoIntentHistory(paths: LifecyclePaths, includeCanonical: boolean): void {
+	for (const suffix of [...(includeCanonical ? [""] : []), ".consumed", ".cancelled", ".expired", ".invalidated"]) {
+		try {
+			fsSync.lstatSync(`${paths.intentFile}${suffix}`);
+		} catch (error) {
+			if (isCode(error, "ENOENT")) continue;
+			throw error;
+		}
+		throw new Error("owner_intent_replay");
+	}
+}
+
+function assertNoConflictingOwnerTerminal(paths: LifecyclePaths, sessionId: string): void {
+	try {
+		fsSync.lstatSync(paths.verdictFile);
+		throw new Error("owner_terminal_conflict");
+	} catch (error) {
+		if (!isCode(error, "ENOENT")) throw error;
+	}
+	try {
+		fsSync.lstatSync(paths.verdictAliasFile);
+	} catch (error) {
+		if (isCode(error, "ENOENT")) return;
+		throw error;
+	}
+	const alias = readSecureOwnerJson(paths.verdictAliasFile);
+	if (!isRecord(alias)) throw new Error("owner_terminal_conflict");
+	const { owner_generation: aliasGeneration, ...verdict } = alias;
+	if (
+		!isValidOwnerVerdict(verdict) ||
+		aliasGeneration !== verdict.generation ||
+		verdict.session_id !== sessionId ||
+		verdict.generation === paths.generation
+	)
+		throw new Error("owner_terminal_conflict");
+	// A different generation alone is not predecessor proof: require its exact
+	// immutable publication marker and evidence predating the current generation.
+	const prior = readSecureOwnerJson(
+		path.join(paths.root, `generation-${encodeURIComponent(verdict.generation)}.published.json`),
+	);
+	const current = readSecureOwnerJson(paths.generationFile);
+	if (
+		!isRecord(prior) ||
+		Object.keys(prior).length !== 4 ||
+		prior.schema_version !== 1 ||
+		prior.session_id !== sessionId ||
+		prior.generation !== verdict.generation ||
+		!isCanonicalUtcTimestamp(prior.published_at) ||
+		!isRecord(current) ||
+		!isCanonicalUtcTimestamp(current.published_at) ||
+		Date.parse(prior.published_at) > Date.parse(current.published_at) ||
+		Date.parse(verdict.observed_at) > Date.parse(current.published_at)
+	)
+		throw new Error("owner_terminal_conflict");
+}
+
+/** One short critical section on the existing generation lock, including relay. */
+export function consumeCooperativeOwnerIntent(input: {
+	stateDir: string;
+	binding: ManagedOwnerBinding;
+	serverKey: string;
+	relay(intent: OwnerIntent, observedAt: string): void;
+}): void {
+	if (process.platform !== "darwin") return;
+	const binding = input.binding;
+	const paths = lifecyclePaths(input.stateDir, binding.session_id, binding.generation);
+	const db = acquireSqliteLockSync(paths, 1, true);
+	if (!db) return;
+	try {
+		assertSecureGeneration(paths, binding.session_id);
+		const persisted = readSecureOwnerJson(path.join(paths.root, `child-${binding.child_token}.binding.json`));
+		if (!isManagedOwnerBinding(persisted) || JSON.stringify(persisted) !== JSON.stringify(binding)) return;
+		assertNoIntentHistory(paths, false);
+		assertNoConflictingOwnerTerminal(paths, binding.session_id);
+		const intent = readSecureOwnerJson(paths.intentFile);
+		const now = new Date().toISOString();
+		if (
+			!isValidOwnerIntent(intent) ||
+			!isCanonicalUtcTimestamp(intent.created_at) ||
+			!isCanonicalUtcTimestamp(intent.expires_at) ||
+			intent.session_id !== binding.session_id ||
+			intent.generation !== binding.generation ||
+			intent.server_key !== input.serverKey ||
+			Date.parse(intent.created_at) < Date.parse(binding.created_at) ||
+			Date.parse(intent.created_at) > Date.parse(now) ||
+			Date.now() >= Date.parse(intent.expires_at)
+		)
+			return;
+		input.relay(intent, now);
+	} catch {
+		// Unavailable evidence and lock contention never authorize delivery.
+	} finally {
+		try {
+			db.exec("COMMIT");
+		} catch {
+		} finally {
+			db.close();
+		}
+	}
+}
+
 async function isCurrentOwnerGeneration(stateDir: string, sessionId: string, generation: string): Promise<boolean> {
 	return (
 		(await readJson<{ generation?: string }>(lifecyclePaths(stateDir, sessionId, generation).generationFile))
@@ -1815,6 +1947,69 @@ export async function closeExactTmuxOwner(
 	deps: ExactOwnerCloseDependencies,
 ): Promise<OwnerVerdict> {
 	const paths = lifecyclePaths(request.stateDir, request.sessionId, request.generation);
+	const intentInput = () => ({
+		generation: request.generation,
+		session_id: request.sessionId,
+		server_key: request.serverKey,
+		expected_terminal: { signal: "SIGTERM" as const, result: "owner_term_then_session_cleanup" as const },
+		dispatch_id: request.dispatchId,
+		created_at: request.createdAt,
+		expires_at: request.expiresAt,
+	});
+	if (deps.shutdown.kind === "cooperative_intent") {
+		if (process.platform !== "darwin") throw new Error("cooperative_owner_platform_unsupported");
+		const db = acquireSqliteLockSync(paths, 250, true);
+		if (!db) throw new Error("generation_lock_contended");
+		const intent = ownerIntentRecord(intentInput());
+		const shutdown = deps.shutdown;
+		const assertOwned = () => {
+			if (
+				!isValidOwnerIntent(intent) ||
+				!isCanonicalUtcTimestamp(intent.created_at) ||
+				!isCanonicalUtcTimestamp(intent.expires_at) ||
+				Date.parse(intent.created_at) > Date.now() ||
+				Date.parse(intent.expires_at) <= Date.now()
+			)
+				throw new Error("owner_term_verdict_timeout");
+			assertNoIntentHistory(paths, true);
+			assertSecureGeneration(paths, request.sessionId);
+			assertNoConflictingOwnerTerminal(paths, request.sessionId);
+			shutdown.assertCooperativeOwner();
+			assertSecureGeneration(paths, request.sessionId);
+			if (Date.now() >= Date.parse(intent.expires_at)) throw new Error("owner_term_verdict_timeout");
+		};
+		try {
+			assertOwned();
+			await publishManagedFileNoReplace(
+				paths.intentFile,
+				Buffer.from(`${JSON.stringify(intent)}\n`),
+				assertOwned,
+				managedDirectoryRoot(paths.root),
+			);
+			if (JSON.stringify(readSecureOwnerJson(paths.intentFile)) !== JSON.stringify(intent))
+				throw new Error("owner_intent_publication_uncertain");
+		} finally {
+			// Namespace publication cannot be undone by a SQLite rollback or error.
+			try {
+				db.exec("COMMIT");
+			} finally {
+				db.close();
+			}
+		}
+		const verdict = await deps.waitForVerdict(intent);
+		if (
+			Date.now() >= Date.parse(intent.expires_at) ||
+			!isValidOwnerVerdict(verdict) ||
+			verdict.intent_id !== intent.intent_id ||
+			verdict.generation !== request.generation ||
+			verdict.session_id !== request.sessionId ||
+			verdict.server_key !== request.serverKey ||
+			verdict.classification !== "expected_operator_shutdown"
+		)
+			throw new Error("owner_term_verdict_timeout");
+		await deps.cleanupSession();
+		return verdict;
+	}
 	const generationLockToken = await acquireOwnerGenerationLock(paths, request.sessionId);
 	if (!generationLockToken) throw new Error("generation_lock_contended");
 	let intent: OwnerIntent;
@@ -1822,18 +2017,7 @@ export async function closeExactTmuxOwner(
 		if ((await deps.readStartTime(request.pid)) !== request.startTime) throw new Error("owner_pid_identity_mismatch");
 		if (!(await isCurrentOwnerGeneration(request.stateDir, request.sessionId, request.generation)))
 			throw new Error("owner_generation_mismatch");
-		intent = await createOwnerIntent(request.stateDir, {
-			generation: request.generation,
-			session_id: request.sessionId,
-			server_key: request.serverKey,
-			expected_terminal: {
-				signal: "SIGTERM",
-				result: "owner_term_then_session_cleanup",
-			},
-			dispatch_id: request.dispatchId,
-			created_at: request.createdAt,
-			expires_at: request.expiresAt,
-		});
+		intent = await createOwnerIntent(request.stateDir, intentInput());
 		if (!(await isCurrentOwnerGeneration(request.stateDir, request.sessionId, request.generation))) {
 			await fs.rename(paths.intentFile, `${paths.intentFile}.cancelled`).catch(() => undefined);
 			throw new Error("owner_generation_mismatch");
@@ -1848,7 +2032,7 @@ export async function closeExactTmuxOwner(
 				throw new Error("owner_pid_identity_mismatch");
 			if (!(await isCurrentOwnerGeneration(request.stateDir, request.sessionId, request.generation)))
 				throw new Error("owner_generation_mismatch");
-			await deps.sendSigterm(request.pid);
+			await deps.shutdown.sendSigterm(request.pid);
 		} catch (error: unknown) {
 			await fs.rename(paths.intentFile, `${paths.intentFile}.cancelled`).catch(() => undefined);
 			throw error;
@@ -1856,7 +2040,7 @@ export async function closeExactTmuxOwner(
 	} finally {
 		await releaseVerdictLock(generationLockToken);
 	}
-	const verdict = await deps.waitForVerdict();
+	const verdict = await deps.waitForVerdict(intent);
 	if (!verdict || verdict.intent_id !== intent.intent_id || verdict.classification !== "expected_operator_shutdown") {
 		await fs.rename(paths.intentFile, `${paths.intentFile}.expired`).catch(() => undefined);
 		throw new Error("owner_term_verdict_timeout");

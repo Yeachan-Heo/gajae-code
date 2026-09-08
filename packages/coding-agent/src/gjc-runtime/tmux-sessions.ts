@@ -10,6 +10,7 @@ import {
 	prepareManagedDirectoryRoot,
 } from "../session/internal/managed-session-storage";
 import { readLinuxProcStartTime, readLinuxProcStartTimeSync } from "./linux-proc";
+import { isManagedOwnerBinding, type ManagedOwnerBinding } from "./managed-owner-binding";
 import {
 	MANAGED_OWNER_COMMAND_ENV,
 	MANAGED_OWNER_INCARNATION_ENV,
@@ -68,6 +69,7 @@ import {
 	observeOwnerTerminal,
 	type PlanResponse,
 	planTmuxOwnerIsolationSync,
+	readSecureOwnerJson,
 	replaceOwnerGenerationSync,
 	type TmuxOwnerIsolationExecutionDependencies,
 	type TmuxOwnerIsolationExecutionResult,
@@ -217,6 +219,8 @@ export interface ForceCloseOwnerDependencies {
 	waitForOwnerExitVerdict?(): Promise<OwnerVerdict>;
 	/** Broker close pin; production callers use this to reject reused session identity. */
 	expectedManagedProof?: ManagedTmuxLaunchProof;
+	/** @internal Exercise the kernel delivery branch with synthetic test dependencies. */
+	shutdownModeForTest?: "kernel_signal";
 }
 const GJC_TMUX_PSMUX_INCARNATION_OPTION = "@gjc-psmux-incarnation";
 const effectiveSessionEnvironments = new WeakMap<GjcTmuxSessionStatus, NodeJS.ProcessEnv>();
@@ -1725,20 +1729,22 @@ async function waitForExpectedVerdict(
 	sleep: (ms: number) => Promise<void>,
 	now: () => Date,
 	deadline: number,
+	intentId?: string,
 ): Promise<OwnerVerdict | null> {
 	const paths = lifecyclePaths(identity.stateDir, identity.sessionId, identity.generation);
 	const verdictFile = paths.verdictFile;
 	const verdictAliasFile = paths.verdictAliasFile;
 	while (now().getTime() <= deadline) {
 		try {
-			const [verdictBody, aliasBody] = await Promise.all([
-				fs.readFile(verdictFile, "utf8"),
-				fs.readFile(verdictAliasFile, "utf8"),
-			]);
-			const verdict: unknown = JSON.parse(verdictBody);
-			const alias: unknown = JSON.parse(aliasBody);
+			const verdict: unknown = intentId
+				? readSecureOwnerJson(verdictFile)
+				: JSON.parse(await fs.readFile(verdictFile, "utf8"));
+			const alias: unknown = intentId
+				? readSecureOwnerJson(verdictAliasFile)
+				: JSON.parse(await fs.readFile(verdictAliasFile, "utf8"));
 			if (
 				isValidOwnerVerdict(verdict) &&
+				(!intentId || verdict.intent_id === intentId) &&
 				typeof alias === "object" &&
 				alias !== null &&
 				Object.keys(alias).length === Object.keys(verdict).length + 1 &&
@@ -1759,6 +1765,42 @@ async function waitForExpectedVerdict(
 		await sleep(FORCE_CLOSE_VERDICT_POLL_MS);
 	}
 	return null;
+}
+
+function proveCooperativeSupervisorBinding(identity: ExactOwnerIdentity): ManagedOwnerBinding {
+	const root = lifecyclePaths(identity.stateDir, identity.sessionId, identity.generation).root;
+	if (!verifyOwnerOnlyPathSecurity(root, "directory").ok) throw new Error("managed_owner_binding_untrusted");
+	const directory = fsSync.opendirSync(root);
+	let binding: ManagedOwnerBinding | undefined;
+	try {
+		for (let count = 0; ; count += 1) {
+			const entry = directory.readSync();
+			if (!entry) break;
+			if (count >= 256) throw new Error("managed_owner_binding_discovery_limit");
+			const match = /^child-([A-Za-z0-9._-]+)\.binding\.json$/.exec(entry.name);
+			if (!match) {
+				if (entry.name.startsWith("child-") && entry.name.endsWith(".binding.json"))
+					throw new Error("managed_owner_binding_untrusted");
+				continue;
+			}
+			const value = readSecureOwnerJson(path.join(root, entry.name));
+			if (!isManagedOwnerBinding(value) || value.child_token !== match[1])
+				throw new Error("managed_owner_binding_untrusted");
+			if (
+				value.supervisor_pid !== identity.pid ||
+				value.supervisor_start_time !== identity.startTime ||
+				value.session_id !== identity.sessionId ||
+				value.generation !== identity.generation
+			)
+				continue;
+			if (binding) throw new Error("managed_owner_binding_ambiguous");
+			binding = value;
+		}
+	} finally {
+		directory.closeSync();
+	}
+	if (!binding || Date.parse(binding.created_at) > Date.now()) throw new Error("managed_owner_binding_unavailable");
+	return binding;
 }
 
 /**
@@ -1821,7 +1863,14 @@ export async function forceCloseGjcTmuxSession(
 	const sleep = deps.sleep ?? (ms => Bun.sleep(ms));
 	const dispatchId = crypto.randomUUID();
 	const verdictDeadline = now().getTime() + FORCE_CLOSE_VERDICT_TIMEOUT_MS;
-	let operatorVerdict: Promise<OwnerVerdict> | null = deps.waitForOwnerExitVerdict?.() ?? null;
+	const cooperativeSupervisor =
+		process.platform === "darwin" && deps.shutdownModeForTest !== "kernel_signal"
+			? exactManagedOwnerSupervisor(identity.pid, identity.startTime)
+			: null;
+	const cooperativeBinding = cooperativeSupervisor ? proveCooperativeSupervisorBinding(identity) : null;
+	let operatorVerdict: Promise<OwnerVerdict> | null = cooperativeSupervisor
+		? null
+		: (deps.waitForOwnerExitVerdict?.() ?? null);
 	await closeExactTmuxOwner(
 		{
 			stateDir: identity.stateDir,
@@ -1836,38 +1885,82 @@ export async function forceCloseGjcTmuxSession(
 		},
 		{
 			readStartTime: deps.readProcessStartTime ?? readProcessStartTime,
-			sendSigterm: async pid => {
-				if ((await (deps.readProcessStartTime ?? readProcessStartTime)(pid)) !== identity.startTime)
-					throw new Error("owner_pid_identity_mismatch");
-				if (deps.signalTerm) {
-					deps.signalTerm(pid);
-				} else {
-					const supervisor = exactManagedOwnerSupervisor(pid, identity.startTime);
-					if (!signalManagedOwnerTerm(supervisor, pid)) throw new Error("managed_owner_supervisor_signal_failed");
-					operatorVerdict = supervisor
-						.waitForExit({ timeoutMs: FORCE_CLOSE_VERDICT_TIMEOUT_MS - 500 })
-						.then(async exited => {
-							if (!exited) throw new Error("managed_owner_supervisor_exit_timeout");
-							return await observeOwnerTerminal({
-								schema_version: 1,
-								op: "observe_terminal",
-								session_id: identity.sessionId,
-								owner_generation: identity.generation,
-								state_dir: identity.stateDir,
-								socket_key: identity.socketKey,
-								observer: "raw_monitor",
-								observed_at: now().toISOString(),
-								signal: "SIGTERM",
-								exit_code: null,
-								exit_kind: "exact_owner_exit_observed",
-								reason: "operator_observed_owner_exit",
-								operator_dispatch_id: dispatchId,
-							});
-						});
-				}
-			},
+			shutdown:
+				cooperativeSupervisor && cooperativeBinding
+					? {
+							kind: "cooperative_intent",
+							assertCooperativeOwner: () => {
+								if (
+									cooperativeSupervisor.pid !== identity.pid ||
+									cooperativeSupervisor.incarnation !== identity.startTime ||
+									JSON.stringify(proveCooperativeSupervisorBinding(identity)) !==
+										JSON.stringify(cooperativeBinding)
+								)
+									throw new Error("managed_owner_supervisor_changed");
+								const live = exactManagedOwnerSupervisor(identity.pid, identity.startTime);
+								if (
+									live.pid !== cooperativeSupervisor.pid ||
+									readNativeTmuxSessionId(session.name, sessionEnv) !== nativeSessionId ||
+									readExactOptionForGc(session.name, GJC_TMUX_OWNER_GENERATION_OPTION, sessionEnv) !==
+										identity.generation ||
+									readExactOptionForGc(session.name, GJC_TMUX_SESSION_ID_OPTION, sessionEnv) !==
+										identity.sessionId ||
+									readExactOptionForGc(session.name, GJC_TMUX_SESSION_STATE_FILE_OPTION, sessionEnv) !==
+										actualStateFile ||
+									readExactOptionForGc(session.name, GJC_TMUX_OWNER_SERVER_KEY_OPTION, sessionEnv) !==
+										identity.socketKey ||
+									JSON.stringify((deps.listPanePids ?? readExactSessionPanePids)(session.name, sessionEnv)) !==
+										JSON.stringify([identity.pid])
+								)
+									throw new Error("managed_owner_supervisor_changed");
+								const server = requireSafeTmuxServerForMutation(resolveGjcTmuxCommand(sessionEnv), sessionEnv);
+								if (server.pid !== initialServer.pid || server.startTime !== initialServer.startTime)
+									throw new Error("managed_owner_server_changed");
+							},
+						}
+					: {
+							kind: "kernel_signal",
+							sendSigterm: async pid => {
+								if ((await (deps.readProcessStartTime ?? readProcessStartTime)(pid)) !== identity.startTime)
+									throw new Error("owner_pid_identity_mismatch");
+								if (deps.signalTerm) {
+									deps.signalTerm(pid);
+								} else {
+									const supervisor = exactManagedOwnerSupervisor(pid, identity.startTime);
+									if (!signalManagedOwnerTerm(supervisor, pid))
+										throw new Error("managed_owner_supervisor_signal_failed");
+									operatorVerdict = supervisor
+										.waitForExit({ timeoutMs: FORCE_CLOSE_VERDICT_TIMEOUT_MS - 500 })
+										.then(async exited => {
+											if (!exited) throw new Error("managed_owner_supervisor_exit_timeout");
+											return await observeOwnerTerminal({
+												schema_version: 1,
+												op: "observe_terminal",
+												session_id: identity.sessionId,
+												owner_generation: identity.generation,
+												state_dir: identity.stateDir,
+												socket_key: identity.socketKey,
+												observer: "raw_monitor",
+												observed_at: now().toISOString(),
+												signal: "SIGTERM",
+												exit_code: null,
+												exit_kind: "exact_owner_exit_observed",
+												reason: "operator_observed_owner_exit",
+												operator_dispatch_id: dispatchId,
+											});
+										});
+								}
+							},
+						},
 
-			waitForVerdict: async () => {
+			waitForVerdict: async intent => {
+				if (cooperativeSupervisor) {
+					const remaining = verdictDeadline - now().getTime();
+					if (remaining <= 0) return null;
+					const exited = await cooperativeSupervisor.waitForExit({ timeoutMs: remaining });
+					if (!exited || now().getTime() >= verdictDeadline) return null;
+					return await waitForExpectedVerdict(identity, sleep, now, verdictDeadline, intent.intent_id);
+				}
 				if (!operatorVerdict) return await waitForExpectedVerdict(identity, sleep, now, verdictDeadline);
 				try {
 					return await waitForOwnerVerdictUntil(operatorVerdict, now, verdictDeadline);

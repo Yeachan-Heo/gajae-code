@@ -9,7 +9,13 @@ import {
 	isManagedOwnerSigabrtReceipt,
 } from "@gajae-code/coding-agent/gjc-runtime/managed-owner-binding";
 import { sessionUltragoalDir } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
-import { lifecyclePaths, replaceOwnerGeneration } from "@gajae-code/coding-agent/gjc-runtime/tmux-owner-isolation";
+import {
+	closeExactTmuxOwner,
+	isValidOwnerVerdict,
+	lifecyclePaths,
+	readSecureOwnerJson,
+	replaceOwnerGeneration,
+} from "@gajae-code/coding-agent/gjc-runtime/tmux-owner-isolation";
 import type { Process } from "@gajae-code/natives";
 import { nativeProcessBindings } from "@gajae-code/utils/native-process";
 
@@ -458,7 +464,9 @@ try { await runManagedOwnerSupervisor(); process.exitCode = 22; } catch { proces
 			await fs.rm(stateDir, { recursive: true, force: true });
 		}
 	});
-	it("relays one SIGTERM to its exact child and waits for child cleanup", async () => {
+	it.each(
+		process.platform === "darwin" ? ["os-signal", "cooperative", "cooperative-os-race"] : ["os-signal"],
+	)("relays one SIGTERM to its exact child and waits for child cleanup: %s", async mode => {
 		const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-owner-"));
 		const readyFile = path.join(stateDir, "child-ready");
 		const cleanupFile = path.join(stateDir, "child-cleanup.json");
@@ -466,6 +474,7 @@ try { await runManagedOwnerSupervisor(); process.exitCode = 22; } catch { proces
 		let childReference: Process | null = null;
 		let supervisorExited = false;
 		let relayVerified = false;
+		let closing: Promise<unknown> | undefined;
 		const failures: unknown[] = [];
 		try {
 			await replaceOwnerGeneration(stateDir, "session-2681", "generation-2681");
@@ -495,13 +504,64 @@ setInterval(() => {}, 1_000);`;
 			childReference = nativeProcessBindings().Process.fromPid(ready.pid);
 			expect(childReference?.ppid).toBe(supervisor.pid);
 			expect(childReference?.incarnation).toBeTruthy();
-			supervisor.kill("SIGTERM");
+			if (mode === "os-signal") supervisor.kill("SIGTERM");
+			else {
+				const ownedSupervisor = supervisor;
+				const paths = lifecyclePaths(stateDir, "session-2681", "generation-2681");
+				const bindingFile = (await fs.readdir(paths.root)).find(file => file.endsWith(".binding.json"))!;
+				const binding = readSecureOwnerJson(path.join(paths.root, bindingFile));
+				if (!isManagedOwnerBinding(binding)) throw new Error("fixture_binding_invalid");
+				const nativeSupervisor = nativeProcessBindings().Process.fromPid(supervisor.pid);
+				closing = closeExactTmuxOwner(
+					{
+						stateDir,
+						sessionId: binding.session_id,
+						generation: binding.generation,
+						serverKey: "fixture-socket",
+						pid: binding.supervisor_pid,
+						startTime: binding.supervisor_start_time,
+						dispatchId: "fixture-dispatch",
+						createdAt: new Date().toISOString(),
+						expiresAt: new Date(Date.now() + 3_000).toISOString(),
+					},
+					{
+						readStartTime: async () => nativeSupervisor?.incarnation ?? null,
+						shutdown: {
+							kind: "cooperative_intent",
+							assertCooperativeOwner: () => {
+								expect(nativeSupervisor?.incarnation).toBe(binding.supervisor_start_time);
+								expect(readSecureOwnerJson(path.join(paths.root, bindingFile))).toEqual(binding);
+							},
+						},
+						waitForVerdict: async intent => {
+							const exit = await Promise.race([ownedSupervisor.exited, Bun.sleep(3_000).then(() => null)]);
+							expect(exit).toBe(0);
+							const verdict = readSecureOwnerJson(paths.verdictFile);
+							if (!isValidOwnerVerdict(verdict) || verdict.intent_id !== intent.intent_id) return null;
+							expect(readSecureOwnerJson(paths.verdictAliasFile)).toEqual({
+								...verdict,
+								owner_generation: binding.generation,
+							});
+							return verdict;
+						},
+						cleanupSession: async () => {
+							expect(supervisorExited).toBe(true);
+						},
+					},
+				);
+				void closing.catch(() => {});
+				if (mode === "cooperative-os-race") {
+					await waitForFile(paths.intentFile);
+					supervisor.kill("SIGTERM");
+				}
+			}
 			await waitForFile(cleanupFile);
 			const supervisorPid = supervisor.pid;
 			expect(() => process.kill(supervisorPid, 0)).not.toThrow();
 			supervisor.kill("SIGTERM");
 			const exit = await Promise.race([supervisor.exited, Bun.sleep(2_000).then(() => null)]);
 			expect(exit).toBe(0);
+			if (closing) await closing;
 			expect(await childReference?.waitForExit({ timeoutMs: 1_000 })).toBe(true);
 			expect(JSON.parse(await fs.readFile(cleanupFile, "utf8"))).toEqual({ signals: 1 });
 			expect(
@@ -528,6 +588,7 @@ setInterval(() => {}, 1_000);`;
 					} catch {}
 				}
 				const childExited = childReference ? await childReference.waitForExit({ timeoutMs: 8_000 }) : false;
+				if (closing) await closing.catch(() => {});
 				if (supervisor && childExited && !supervisorExited) {
 					// Only after separately proving child exit may parent teardown escalate.
 					try {

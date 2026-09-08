@@ -1,5 +1,4 @@
 import * as crypto from "node:crypto";
-import * as fsSync from "node:fs";
 import * as path from "node:path";
 import { readOwnerOnlyFile, verifyOwnerOnlyPathSecurity } from "@gajae-code/natives";
 import { nativeProcessBindings } from "@gajae-code/utils/native-process";
@@ -12,7 +11,14 @@ import {
 	managedOwnerCommandDigest,
 } from "./managed-owner-binding";
 import { assertSafePathComponent } from "./session-layout";
-import { lifecyclePaths, type OwnerIntent, observeOwnerTerminal } from "./tmux-owner-isolation";
+import {
+	consumeCooperativeOwnerIntent,
+	isValidOwnerIntent,
+	lifecyclePaths,
+	type OwnerIntent,
+	observeOwnerTerminal,
+	readSecureOwnerJson,
+} from "./tmux-owner-isolation";
 
 export const MANAGED_OWNER_SUPERVISOR_ARG = "--internal-managed-owner-supervisor";
 export const MANAGED_OWNER_CHILD_TOKEN_ENV = "GJC_MANAGED_OWNER_CHILD_TOKEN";
@@ -190,34 +196,82 @@ async function superviseManagedOwner(): Promise<void> {
 	let sigtermRelayed = false;
 	let relayedIntent: OwnerIntent | null = null;
 	let relayedAt: string | null = null;
-	const relaySigterm = () => {
+	const relayChild = (candidateIntent: OwnerIntent | null, observedAt: string) => {
 		if (childExited || sigtermRelayed) return;
-		let candidateIntent: OwnerIntent | null = null;
 		try {
-			const candidate = JSON.parse(
-				fsSync.readFileSync(lifecyclePaths(stateDir, sessionId, generation).intentFile, "utf8"),
-			) as Partial<OwnerIntent>;
-			candidateIntent = typeof candidate.dispatch_id === "string" ? (candidate as OwnerIntent) : null;
-		} catch {
-			candidateIntent = null;
-		}
-		try {
-			if (!childProcess.signalRoot(15)) return;
+			if (process.platform === "darwin") {
+				// Only the direct parent may use its original spawn handle. External
+				// process references still have no identity-bound Darwin signal API.
+				if (
+					child.exitCode !== null ||
+					child.signalCode !== null ||
+					childProcess.pid !== child.pid ||
+					childProcess.incarnation !== childStartTime ||
+					childProcess.ppid !== process.pid
+				)
+					return;
+				if (candidateIntent && Date.now() >= Date.parse(candidateIntent.expires_at)) return;
+				sigtermRelayed = true;
+				child.kill("SIGTERM");
+			} else {
+				sigtermRelayed = true;
+				if (!childProcess.signalRoot(15)) return;
+			}
 		} catch {
 			// The child exited between intent capture and delivery.
 			return;
 		}
-		sigtermRelayed = true;
-		relayedAt = new Date().toISOString();
+		relayedAt = observedAt;
 		relayedIntent = candidateIntent;
+	};
+	const pollIntent = () => {
+		if (childExited || sigtermRelayed) return;
+		try {
+			consumeCooperativeOwnerIntent({
+				stateDir,
+				binding,
+				serverKey: process.env.GJC_TMUX_OWNER_SERVER_KEY ?? "",
+				relay: (intent, observedAt) => relayChild(intent, observedAt),
+			});
+		} catch {
+			// Release failures cannot reset the relay latch or authorize a retry.
+		}
+	};
+	const relaySigterm = () => {
+		if (process.platform === "darwin") {
+			pollIntent();
+			// An actual OS signal may stop the owned child, but without validated
+			// cooperative authority it must not claim an operator verdict.
+			relayChild(null, new Date().toISOString());
+			return;
+		}
+		let intent: OwnerIntent | null = null;
+		try {
+			const candidate = readSecureOwnerJson(lifecyclePaths(stateDir, sessionId, generation).intentFile);
+			if (
+				isValidOwnerIntent(candidate) &&
+				candidate.session_id === sessionId &&
+				candidate.generation === generation &&
+				candidate.server_key === process.env.GJC_TMUX_OWNER_SERVER_KEY &&
+				Date.parse(candidate.created_at) <= Date.now() &&
+				Date.now() < Date.parse(candidate.expires_at)
+			)
+				intent = candidate;
+		} catch {}
+		relayChild(intent, new Date().toISOString());
 	};
 	sigtermPending ||= bootstrapSigtermPending;
 	process.removeListener("SIGTERM", captureBootstrapSigterm);
 	process.removeListener("SIGTERM", captureEarlySigterm);
 	process.on("SIGTERM", relaySigterm);
 	if (sigtermPending) relaySigterm();
+	// Synchronous, short lock attempts cannot overlap. The timer is never a
+	// lifetime owner and is stopped before terminal publication takes the lock.
+	const pollTimer = process.platform === "darwin" ? setInterval(pollIntent, 50) : undefined;
+	pollTimer?.unref();
 	const exitCode = await child.exited;
 	childExited = true;
+	if (pollTimer) clearInterval(pollTimer);
 	process.removeListener("SIGTERM", relaySigterm);
 	const terminalIntent = relayedIntent as OwnerIntent | null;
 	const terminalObservedAt = relayedAt as string | null;

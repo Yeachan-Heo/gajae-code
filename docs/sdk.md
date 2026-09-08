@@ -966,13 +966,14 @@ must match that host and the lifecycle request marker. The supervisor proof
 remains separate cleanup authority; an empty process observation is not proof
 of absence, and ambiguous or replaced children are not adopted.
 
-This registration repair does not change managed-owner shutdown. The existing
-Darwin provider-close limitation is addressed by the dependent shutdown change;
-registration success alone must not be reported as complete lifecycle support.
-This layer verifies the native reader, real CLI admission, host-identity mapping
-and headless registration. The dependent shutdown layer carries the combined
-managed source/compiled registration and provider-close integration tests;
-headless registration alone does not prove that managed lifecycle boundary.
+Darwin managed shutdown uses the existing generation-fenced owner intent rather
+than signaling an external process by a reconstructed PID. Final no-replace
+intent publication commits the request under the same generation lock used by
+the supervisor. The supervisor validates the request and relays SIGTERM once
+through its original child handle. Successful close requires both exact
+supervisor exit and the matching terminal verdict before guarded session
+cleanup. Publication alone, a timeout, or a verdict without exit is not success.
+Linux retains its kernel-signaled owner path.
 
 Source installations must rebuild the native addon and regenerate its exports
 when updating this admission boundary. Compiled installations need a matching
