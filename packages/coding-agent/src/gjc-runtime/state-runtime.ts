@@ -1611,14 +1611,16 @@ async function handleWrite(args: readonly string[], cwd: string): Promise<StateC
 			const existingAdmissionMarker = isPlainObject(existingPayload.final_admission_phase_transition)
 				? existingPayload.final_admission_phase_transition
 				: undefined;
+			delete merged.final_admission_phase_transition;
 			if (
-				!existingAdmissionMarker ||
-				merged.run_id !== existingAdmissionMarker.run_id ||
+				existingAdmissionMarker &&
+				merged.run_id === existingAdmissionMarker.run_id &&
 				createHash("sha256")
 					.update(JSON.stringify(merged.auto_handoff ?? null))
-					.digest("hex") !== existingAdmissionMarker.auto_handoff_sha256
+					.digest("hex") === existingAdmissionMarker.auto_handoff_sha256
 			)
-				if (typeof merged.active !== "boolean") merged.active = true;
+				merged.final_admission_phase_transition = existingAdmissionMarker;
+			if (typeof merged.active !== "boolean") merged.active = true;
 			merged.updated_at = nowIsoStr;
 			merged.receipt = receipt;
 			if (sessionId && typeof merged.session_id !== "string") merged.session_id = sessionId;
@@ -2007,6 +2009,17 @@ function assertExecutionApprovalRecordShape(value: unknown): asserts value is De
 			typeof value.ralplan_final_path !== "string" ||
 			!path.isAbsolute(value.ralplan_final_path) ||
 			!isSha256(value.ralplan_final_sha256))
+	)
+		throw new StateCommandError(2, "deep-interview execution approval record is invalid");
+	if (
+		value.approval_stage !== "ralplan" &&
+		[
+			value.ralplan_state_path,
+			value.ralplan_state_revision,
+			value.ralplan_run_id,
+			value.ralplan_final_path,
+			value.ralplan_final_sha256,
+		].some(field => field !== undefined)
 	)
 		throw new StateCommandError(2, "deep-interview execution approval record is invalid");
 }
@@ -3124,6 +3137,8 @@ async function assertDeepInterviewExecutionLineage(
 				if (record?.status !== "consumed")
 					throw new StateCommandError(2, "execution handoff requires consumed Ralplan approval evidence");
 				if (
+					record.approval_stage !== "ralplan" ||
+					upstreamApproval.approval_stage !== record.approval_stage ||
 					upstreamApproval.ralplan_state_path !== record.ralplan_state_path ||
 					upstreamApproval.ralplan_state_revision !== record.ralplan_state_revision ||
 					upstreamApproval.ralplan_run_id !== record.ralplan_run_id ||
@@ -3439,6 +3454,12 @@ async function handleHandoffUnlocked(
 		const integrityWarning = await warnAndAuditOutOfBandIfNeeded(cwd, sessionId, callerPath, "deep-interview");
 		if (integrityWarning)
 			throw new StateCommandError(2, `${integrityWarning}; execution handoff refuses tampered mode-state`);
+	}
+	let ralplanExecutionFinal: VerifiedRalplanFinalEvidence | undefined;
+	if (caller === "ralplan" && callee === "ultragoal") {
+		ralplanExecutionFinal = await verifiedRalplanFinalEvidence(cwd, sessionId, existingCaller);
+		if (!ralplanExecutionFinal)
+			throw new StateCommandError(2, "Ralplan execution handoff requires non-stuck verified final plan evidence");
 	}
 	if (callee === "ultragoal" && caller !== "deep-interview")
 		await assertDeepInterviewExecutionLineage(cwd, sessionId, caller, existingCaller);
@@ -3767,6 +3788,21 @@ async function handleHandoffUnlocked(
 			active: false,
 			current_phase: "handoff",
 			handoff_to: callee,
+			...(typeof normalizedCaller.handoff_from === "string" && typeof normalizedCaller.handoff_at === "string"
+				? { upstream_handoff_at: normalizedCaller.upstream_handoff_at ?? normalizedCaller.handoff_at }
+				: {}),
+			...(ralplanExecutionFinal
+				? {
+						final_admission_phase_transition: {
+							run_id: ralplanExecutionFinal.runId,
+							final_path: ralplanExecutionFinal.finalPath,
+							final_sha256: ralplanExecutionFinal.finalSha256,
+							auto_handoff_sha256: createHash("sha256")
+								.update(JSON.stringify(normalizedCaller.auto_handoff ?? null))
+								.digest("hex"),
+						},
+					}
+				: {}),
 			handoff_at: handoffAt,
 			updated_at: handoffAt,
 			receipt: callerReceipt,
@@ -3887,6 +3923,18 @@ async function handleHandoffUnlocked(
 		handoff_to: callee,
 		...(typeof normalizedCaller.handoff_from === "string" && typeof normalizedCaller.handoff_at === "string"
 			? { upstream_handoff_at: normalizedCaller.upstream_handoff_at ?? normalizedCaller.handoff_at }
+			: {}),
+		...(ralplanExecutionFinal
+			? {
+					final_admission_phase_transition: {
+						run_id: ralplanExecutionFinal.runId,
+						final_path: ralplanExecutionFinal.finalPath,
+						final_sha256: ralplanExecutionFinal.finalSha256,
+						auto_handoff_sha256: createHash("sha256")
+							.update(JSON.stringify(normalizedCaller.auto_handoff ?? null))
+							.digest("hex"),
+					},
+				}
 			: {}),
 		handoff_at: handoffAt,
 		updated_at: handoffAt,

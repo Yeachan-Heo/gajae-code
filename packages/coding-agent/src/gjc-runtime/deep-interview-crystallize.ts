@@ -882,12 +882,17 @@ function caseSensitiveIdentifierTerms(value: string): Set<string> {
 	);
 }
 
-function requirementBearingClauses(snapshot: CrystalSnapshot): Array<{ messageIndex: number; clause: string }> {
-	const clauses: Array<{ messageIndex: number; clause: string }> = [];
+function requirementBearingClauses(
+	snapshot: CrystalSnapshot,
+): Array<{ messageIndex: number; clause: string; clauseOffset: number }> {
+	const clauses: Array<{ messageIndex: number; clause: string; clauseOffset: number }> = [];
 	for (const message of snapshot.messages) {
 		if (message.role !== "user") continue;
+		let searchOffset = 0;
 		for (const raw of message.content.split(/(?:[!?。！？;]|\.(?=\s|$)|\n)+\s*/u)) {
 			const clause = raw.trim();
+			const clauseOffset = clause ? message.content.indexOf(clause, searchOffset) : searchOffset;
+			searchOffset = Math.max(searchOffset, clauseOffset + clause.length);
 			if (
 				!clause ||
 				/^(?:what|why|how|when|where|who|which)\b/i.test(clause) ||
@@ -897,7 +902,7 @@ function requirementBearingClauses(snapshot: CrystalSnapshot): Array<{ messageIn
 				)
 			)
 				continue;
-			if (evidenceTerms(clause).size >= 1) clauses.push({ messageIndex: message.index, clause });
+			if (evidenceTerms(clause).size >= 1) clauses.push({ messageIndex: message.index, clause, clauseOffset });
 		}
 	}
 	return clauses;
@@ -1377,6 +1382,7 @@ export function crystallizeDeepInterview(value: unknown): DeepInterviewCrystal {
 				message?.role === "user" &&
 				anchor.message_index > priorEnd &&
 				message.content.includes(anchor.quote) &&
+				message.content.indexOf(anchor.quote) === message.content.lastIndexOf(anchor.quote) &&
 				hasVerbatimTokenBoundaries(message.content, anchor.quote) &&
 				(/\b(?:keep|retain|restore|preserve|maintain)\b/i.test(keepClause) ||
 					/(?:유지|보존|복원|保持|保留|恢复|恢復|復元)/u.test(keepClause)) &&
@@ -1481,7 +1487,11 @@ export function crystallizeDeepInterview(value: unknown): DeepInterviewCrystal {
 				replacement !== undefined &&
 				!sameIntent(replacement, previous) &&
 				replacement.anchor !== undefined &&
-				directive.messageIndex < replacement.anchor.message_index &&
+				(directive.messageIndex < replacement.anchor.message_index ||
+					(directive.messageIndex === replacement.anchor.message_index &&
+						(snapshot.messages
+							.find(message => message.index === directive.messageIndex)
+							?.content.indexOf(replacement.anchor.quote) ?? -1) > directive.clauseOffset)) &&
 				/\b(?:actually|instead|rather|replace|replaced|no longer|not)\b/i.test(replacement.anchor.quote) &&
 				[...directiveTerms].every(term => evidenceTerms(previous.statement).has(term))
 			);
