@@ -1892,7 +1892,7 @@ function requireReadyCanonicalCrystal(value: unknown): Record<string, unknown> {
  */
 export const DEEP_INTERVIEW_EXECUTION_APPROVAL_RECORD_FILE = "deep-interview-execution-approval.json";
 export const DEEP_INTERVIEW_EXECUTION_APPROVAL_MAX_AGE_MS = 15 * 60 * 1000;
-const EXECUTION_APPROVAL_TRANSCRIPT_MAX_BYTES = 16 * 1024 * 1024;
+const EXECUTION_APPROVAL_TRANSCRIPT_MAX_BYTES = 128 * 1024 * 1024;
 const DEEP_INTERVIEW_EXECUTION_APPROVAL_RECORD_MAX_BYTES = 16 * 1024;
 const DEEP_INTERVIEW_EXECUTION_APPROVAL_ID_MAX_LENGTH = 256;
 
@@ -4475,6 +4475,21 @@ async function handleApproveExecutionRecordLocked(
 			typeof existingReceipt.state_revision !== "number"
 		)
 			throw new StateCommandError(2, "deep-interview execution approval lacks explicit provenance");
+		if (
+			existingReceipt.question_id !== approvalRecord.question_id ||
+			existingReceipt.gate_id !== approvalRecord.gate_id ||
+			existingReceipt.answer_hash !== approvalRecord.answer_hash ||
+			existingReceipt.transcript_path !== approvalRecord.transcript_path ||
+			existingReceipt.transcript_sha256 !== approvalRecord.transcript_sha256 ||
+			existingReceipt.target !== approvalRecord.target ||
+			existingReceipt.approval_stage !== (approvalRecord.approval_stage ?? "deep-interview") ||
+			existingReceipt.ralplan_state_path !== approvalRecord.ralplan_state_path ||
+			existingReceipt.ralplan_state_revision !== approvalRecord.ralplan_state_revision ||
+			existingReceipt.ralplan_run_id !== approvalRecord.ralplan_run_id ||
+			existingReceipt.ralplan_final_path !== approvalRecord.ralplan_final_path ||
+			existingReceipt.ralplan_final_sha256 !== approvalRecord.ralplan_final_sha256
+		)
+			throw new StateCommandError(2, "deep-interview execution approval recovery receipt identity mismatch");
 		if (
 			approvalRecord.status === "consumed" &&
 			(approvalRecord.consumed_mutation_id !== existingReceipt.mutation_id ||
