@@ -247,7 +247,7 @@ function assertHandoffLineageUnchanged(
 	mergedEnvelope: Record<string, unknown>,
 	surface: string,
 ): void {
-	for (const field of ["handoff_from", "handoff_to", "handoff_at"] as const) {
+	for (const field of ["handoff_from", "handoff_to", "handoff_at", "upstream_handoff_at"] as const) {
 		const existing = typeof existingEnvelope[field] === "string" ? existingEnvelope[field].trim() : "";
 		const merged = typeof mergedEnvelope[field] === "string" ? mergedEnvelope[field].trim() : "";
 		if (!existing && merged && surface === "generic state write")
@@ -1608,8 +1608,17 @@ async function handleWrite(args: readonly string[], cwd: string): Promise<StateC
 				assertApprovedDeepInterviewLifecycleUnchanged(existingPayload, merged, "generic state write");
 			}
 			merged.version = WORKFLOW_STATE_VERSION;
-			if (existingPayload.final_admission_phase_transition !== true) delete merged.final_admission_phase_transition;
-			if (typeof merged.active !== "boolean") merged.active = true;
+			const existingAdmissionMarker = isPlainObject(existingPayload.final_admission_phase_transition)
+				? existingPayload.final_admission_phase_transition
+				: undefined;
+			if (
+				!existingAdmissionMarker ||
+				merged.run_id !== existingAdmissionMarker.run_id ||
+				createHash("sha256")
+					.update(JSON.stringify(merged.auto_handoff ?? null))
+					.digest("hex") !== existingAdmissionMarker.auto_handoff_sha256
+			)
+				if (typeof merged.active !== "boolean") merged.active = true;
 			merged.updated_at = nowIsoStr;
 			merged.receipt = receipt;
 			if (sessionId && typeof merged.session_id !== "string") merged.session_id = sessionId;
@@ -1635,7 +1644,19 @@ async function handleWrite(args: readonly string[], cwd: string): Promise<StateC
 						`invalid ${mode} phase transition from ${fromPhase} to ${toPhase}; use --force to bypass`,
 					);
 				}
-				if (sanctionedRalplanHandoff) merged.final_admission_phase_transition = true;
+				if (sanctionedRalplanHandoff) {
+					const evidence = await verifiedRalplanFinalEvidence(cwd, sessionId, existingPayload);
+					if (!evidence)
+						throw new StateCommandError(2, "Ralplan handoff phase requires verified final plan evidence");
+					merged.final_admission_phase_transition = {
+						run_id: evidence.runId,
+						final_path: evidence.finalPath,
+						final_sha256: evidence.finalSha256,
+						auto_handoff_sha256: createHash("sha256")
+							.update(JSON.stringify(existingPayload.auto_handoff ?? null))
+							.digest("hex"),
+					};
+				}
 			}
 
 			const validation = validateWorkflowStateEnvelope(mode, merged);
@@ -2859,6 +2880,7 @@ async function verifiedRalplanFinalEvidence(
 	if (!admission) return undefined;
 	if (
 		typeof admission.effectiveTarget !== "string" ||
+		admission.degradationReason === "planning_stuck" ||
 		typeof admission.source !== "string" ||
 		!admission.source.trim()
 	)
@@ -2866,11 +2888,14 @@ async function verifiedRalplanFinalEvidence(
 	const ralplanPath = modeStateFile(cwd, "ralplan", sessionId);
 	const receipt = persistedWorkflowReceipt(state.receipt, "ralplan");
 	const checksum = receipt?.content_sha256;
+	const phaseMarker = isPlainObject(state.final_admission_phase_transition)
+		? state.final_admission_phase_transition
+		: undefined;
 	const phaseTransitionReceipt =
-		state.final_admission_phase_transition === true &&
+		Boolean(phaseMarker) &&
 		state.current_phase === "handoff" &&
 		receipt?.owner === "gjc-state-cli" &&
-		receipt.command === "gjc state ralplan write";
+		(receipt.command === "gjc state ralplan write" || receipt.command === "gjc state ralplan handoff --to ultragoal");
 	if (
 		(!phaseTransitionReceipt &&
 			(receipt?.owner !== "gjc-runtime" || receipt.command !== "gjc ralplan final-admission")) ||
@@ -2923,6 +2948,14 @@ async function verifiedRalplanFinalEvidence(
 	const artifactPath = path.resolve(finalRow.path);
 	if (!artifactPath.startsWith(`${path.resolve(runDir)}${path.sep}`)) return undefined;
 	if ((await hashIdentityFile(artifactPath, "ralplan final artifact")) !== finalRow.sha256) return undefined;
+	if (
+		phaseMarker &&
+		(phaseMarker.run_id !== runId ||
+			phaseMarker.final_path !== artifactPath ||
+			phaseMarker.final_sha256 !== finalRow.sha256 ||
+			phaseMarker.auto_handoff_sha256 !== createHash("sha256").update(JSON.stringify(admission)).digest("hex"))
+	)
+		return undefined;
 	const stateRevision = existingStateRevision(state);
 	if (typeof stateRevision !== "number" || !Number.isSafeInteger(stateRevision) || stateRevision < 0) return undefined;
 	return {
@@ -2961,32 +2994,7 @@ async function assertRalplanApprovalRecordCurrent(
 			throw new StateCommandError(2, "Ralplan execution approval final state is unavailable");
 		ralplanState = migrateWorkflowState(read.value, "ralplan").state;
 	}
-	let evidence = await verifiedRalplanFinalEvidence(cwd, sessionId, ralplanState);
-	if (
-		!evidence &&
-		ralplanState.current_phase === "handoff" &&
-		ralplanState.final_admission_phase_transition === true &&
-		typeof record.ralplan_run_id === "string" &&
-		typeof record.ralplan_final_path === "string" &&
-		typeof record.ralplan_final_sha256 === "string" &&
-		ralplanState.run_id === record.ralplan_run_id
-	) {
-		const runDir = path.resolve(sessionPlansDir(cwd, sessionId), "ralplan", record.ralplan_run_id);
-		const finalPath = path.resolve(record.ralplan_final_path);
-		const revision = existingStateRevision(ralplanState);
-		if (
-			finalPath.startsWith(`${runDir}${path.sep}`) &&
-			typeof revision === "number" &&
-			(await hashIdentityFile(finalPath, "Ralplan approved final artifact")) === record.ralplan_final_sha256
-		)
-			evidence = {
-				runId: record.ralplan_run_id,
-				statePath: path.resolve(modeStateFile(cwd, "ralplan", sessionId)),
-				stateRevision: revision,
-				finalPath,
-				finalSha256: record.ralplan_final_sha256,
-			};
-	}
+	const evidence = await verifiedRalplanFinalEvidence(cwd, sessionId, ralplanState);
 	if (!evidence) throw new StateCommandError(2, "Ralplan execution approval final evidence is unavailable");
 	if (
 		record.ralplan_state_path !== evidence.statePath ||
@@ -3013,11 +3021,13 @@ async function assertDeepInterviewExecutionLineage(
 				? activeEntry.handoff_from.trim()
 				: "";
 	const callerHandoffAt =
-		typeof existingCaller.handoff_at === "string"
-			? existingCaller.handoff_at.trim()
-			: activeEntry && typeof activeEntry.handoff_at === "string"
-				? activeEntry.handoff_at.trim()
-				: undefined;
+		typeof existingCaller.upstream_handoff_at === "string"
+			? existingCaller.upstream_handoff_at.trim()
+			: typeof existingCaller.handoff_at === "string"
+				? existingCaller.handoff_at.trim()
+				: activeEntry && typeof activeEntry.handoff_at === "string"
+					? activeEntry.handoff_at.trim()
+					: undefined;
 	if (!upstreamRaw) {
 		if (!(await hasAuditedDeepInterviewHandoff(cwd, sessionId, caller))) return;
 		upstreamRaw = "deep-interview";
@@ -3056,13 +3066,17 @@ async function assertDeepInterviewExecutionLineage(
 		if (upstreamState.version !== WORKFLOW_STATE_VERSION)
 			throw new StateCommandError(2, "execution handoff requires current upstream workflow state version");
 		if (upstream === "deep-interview") {
+			const currentLineageHandoffAt =
+				typeof currentState.upstream_handoff_at === "string"
+					? currentState.upstream_handoff_at
+					: currentState.handoff_at;
 			if (
 				upstreamState.active !== false ||
 				upstreamState.current_phase !== "handoff" ||
 				upstreamState.handoff_to !== currentSkill ||
 				typeof upstreamState.handoff_at !== "string" ||
-				typeof currentState.handoff_at !== "string" ||
-				upstreamState.handoff_at !== currentState.handoff_at
+				typeof currentLineageHandoffAt !== "string" ||
+				upstreamState.handoff_at !== currentLineageHandoffAt
 			)
 				throw new StateCommandError(2, "execution handoff cannot authenticate Deep Interview approval lineage");
 			const lineageHandoffAt = upstreamState.handoff_at as string;
@@ -3109,6 +3123,17 @@ async function assertDeepInterviewExecutionLineage(
 				);
 				if (record?.status !== "consumed")
 					throw new StateCommandError(2, "execution handoff requires consumed Ralplan approval evidence");
+				if (
+					upstreamApproval.ralplan_state_path !== record.ralplan_state_path ||
+					upstreamApproval.ralplan_state_revision !== record.ralplan_state_revision ||
+					upstreamApproval.ralplan_run_id !== record.ralplan_run_id ||
+					upstreamApproval.ralplan_final_path !== record.ralplan_final_path ||
+					upstreamApproval.ralplan_final_sha256 !== record.ralplan_final_sha256 ||
+					upstreamApproval.question_id !== record.question_id ||
+					upstreamApproval.gate_id !== record.gate_id ||
+					upstreamApproval.answer_hash !== record.answer_hash
+				)
+					throw new StateCommandError(2, "execution handoff Ralplan approval receipt identity mismatch");
 				await assertRalplanApprovalRecordCurrent(cwd, sessionId, record, currentState);
 			}
 			return;
@@ -3860,6 +3885,9 @@ async function handleHandoffUnlocked(
 		active: false,
 		current_phase: "handoff",
 		handoff_to: callee,
+		...(typeof normalizedCaller.handoff_from === "string" && typeof normalizedCaller.handoff_at === "string"
+			? { upstream_handoff_at: normalizedCaller.upstream_handoff_at ?? normalizedCaller.handoff_at }
+			: {}),
 		handoff_at: handoffAt,
 		updated_at: handoffAt,
 		receipt: callerReceipt,
