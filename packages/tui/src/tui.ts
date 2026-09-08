@@ -2157,7 +2157,7 @@ export class TUI extends Container {
 				: this.#guardTerminalOperation(() => this.terminal.write(finalBytes));
 			if (ok && this.#inFlightMultipartAbort === multipartAbortBarrier) {
 				this.#inFlightMultipartAbort = undefined;
-			} else if (!ok && multipartAbortBarrier && isCurrentLifecycle()) {
+			} else if (!ok && multipartAbortBarrier) {
 				multipartAbortBarrier();
 			}
 			if (!ok && dependent) {

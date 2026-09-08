@@ -788,15 +788,17 @@ export function settleToolLineageRegistrationWindow(
 ): void {
 	const key = toolCallLineageKey(endpointId, toolCallId);
 	const current = lineageByToolCall.get(key);
-	if (expectedBinding !== undefined && current !== expectedBinding) return;
+	const window = incompleteToolCallWindows.get(key);
+	if (expectedBinding !== undefined && current !== expectedBinding && window?.binding !== expectedBinding) return;
 	// Mark the execution settled ONLY while its binding remains in the lineage
 	// map: a later FIFO eviction of that binding consults this set and removes
 	// the key. An already-evicted binding lives only in the window closed
 	// below — retaining the marker there would leak the key forever because
 	// no eviction can ever execute the delete (review thread P2).
-	if (current !== undefined) settledToolCallLineages.add(key);
-	const window = incompleteToolCallWindows.get(key);
-	if (window !== undefined) {
+	if (current !== undefined && (expectedBinding === undefined || current === expectedBinding)) {
+		settledToolCallLineages.add(key);
+	}
+	if (window !== undefined && (expectedBinding === undefined || window.binding === expectedBinding)) {
 		incompleteToolCallWindows.delete(key);
 		const remaining = (incompleteAttemptWindowCounts.get(window.incompleteKey) ?? 1) - 1;
 		if (remaining <= 0) {

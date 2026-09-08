@@ -4371,6 +4371,7 @@ async function runLoopBody(
 			}
 
 			stream.push({ type: "turn_end", message, toolResults, scope: attemptScope });
+			await config.afterTurnEndPublished?.();
 
 			if (steeringMessagesFromExecution && steeringMessagesFromExecution.length > 0) {
 				// Same aborted-run guard as the drain below: the steer interrupt unwound

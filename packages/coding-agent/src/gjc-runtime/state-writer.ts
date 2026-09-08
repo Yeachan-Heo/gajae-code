@@ -1076,10 +1076,10 @@ export async function mergeActiveEntrySubskills(
 	cwd: string,
 	sessionScope: string | ActiveSessionScope,
 	skill: string,
-	fallback: SkillActiveEntry,
+	expected: SkillActiveEntry,
 	activeSubskills: SkillActiveEntry["active_subskills"],
 	updatedAt: string,
-): Promise<{ predecessor: SkillActiveEntry; result: GuardedWriteResult }> {
+): Promise<{ predecessor: SkillActiveEntry | undefined; result: GuardedWriteResult }> {
 	const filePath = activeEntryPath(path.resolve(cwd), sessionScope, skill);
 	return withActiveStateScopeLock(cwd, sessionScope, () =>
 		lockResolvedWorkflowTarget(filePath, async () => {
@@ -1087,7 +1087,18 @@ export async function mergeActiveEntrySubskills(
 			const predecessor =
 				current && typeof current === "object" && !Array.isArray(current)
 					? (current as SkillActiveEntry)
-					: fallback;
+					: undefined;
+			if (!predecessor || !Bun.deepEquals(predecessor, expected)) {
+				return {
+					predecessor,
+					result: {
+						path: filePath,
+						written: false,
+						reason: "stale-skip",
+						revision: persistedStateRevision(current),
+					},
+				};
+			}
 			const replacement: SkillActiveEntry = {
 				...predecessor,
 				skill,

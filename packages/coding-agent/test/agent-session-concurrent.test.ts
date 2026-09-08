@@ -1846,6 +1846,92 @@ describe("AgentSession TTSR resume gate", () => {
 		expect(text.indexOf("<system-reminder")).toBeLessThan(text.indexOf("edit applied"));
 	});
 
+	it("restores the repeat gate when per-tool TTSR persistence fails", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		let streamCallCount = 0;
+		const ttsrManager = new TtsrManager({
+			enabled: true,
+			contextMode: "discard",
+			interruptMode: "never",
+			repeatMode: "once",
+			repeatGap: 10,
+		});
+		ttsrManager.addRule(testRule);
+		const toolCall: ToolCall = {
+			type: "toolCall",
+			id: "call_failed_ttsr_persistence",
+			name: "mock_edit",
+			arguments: { snippet: "value.unwrap()" },
+		};
+		const mockTool: AgentTool = {
+			name: "mock_edit",
+			label: "Mock Edit",
+			description: "A mock edit tool",
+			parameters: z.object({ snippet: z.string().optional() }),
+			execute: async () => ({ content: [{ type: "text" as const, text: "edit applied" }] }),
+		};
+		const toolMessage = (): AssistantMessage => ({
+			role: "assistant",
+			content: [toolCall],
+			api: "anthropic-messages",
+			provider: "anthropic",
+			model: "mock",
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "toolUse",
+			timestamp: Date.now(),
+		});
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [mockTool] },
+			streamFn: () => {
+				streamCallCount++;
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(() => {
+					if (streamCallCount === 1) {
+						const partial = toolMessage();
+						stream.push({ type: "start", partial });
+						stream.push({ type: "toolcall_start", contentIndex: 0, partial });
+						stream.push({
+							type: "toolcall_delta",
+							contentIndex: 0,
+							delta: "value.unwrap()",
+							partial,
+						});
+						stream.push({ type: "toolcall_end", contentIndex: 0, toolCall, partial });
+						stream.push({ type: "done", reason: "toolUse", message: partial });
+					} else {
+						const done = makeMsg("done");
+						stream.push({ type: "start", partial: done });
+						stream.push({ type: "done", reason: "stop", message: done });
+					}
+				});
+				return stream;
+			},
+		});
+		const sessionManager = SessionManager.inMemory(tempDir);
+		const append = vi.spyOn(sessionManager, "appendTtsrInjection").mockImplementationOnce(() => {
+			throw new Error("injected TTSR persistence failure");
+		});
+		const settings = Settings.isolated();
+		const authStorage = await AuthStorage.create(path.join(tempDir, "testauth-failed-ttsr.db"));
+		authStorages.push(authStorage);
+		const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "models.yml"));
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		session = new AgentSession({ agent, sessionManager, settings, modelRegistry, ttsrManager });
+
+		await session.prompt("Write some Rust code");
+
+		expect(append).toHaveBeenCalled();
+		expect(ttsrManager.getInjectedRuleNames()).toEqual([]);
+	});
+
 	it("interruptMode never deduplicates the reminder across sibling tool calls in one batch", async () => {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
 		let streamCallCount = 0;

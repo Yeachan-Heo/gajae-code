@@ -23,9 +23,6 @@
 
 ## [0.16.6] - 2026-09-07
 
-- External lifecycle emitters now pass a session-owned admission fence before mutating Agent state. Run-bound terminals retain their authoritative attempt scope, while Cursor-native lifecycle emitters resolve the current main-attempt scope on every emission so in-loop retries and later tool turns are not mistaken for retired producers.
-- Provider iterators that close with a trailing assistant but no explicit `done`/`error` event now publish the canonical `message_end` before `turn_end` and `agent_end`, preventing session persistence from missing the authoritative final response.
-
 ## [0.16.5] - 2026-09-07
 
 - Compaction summary, turn-prefix summary, and handoff generation now clamp their reasoning effort to the model they are about to call instead of hard-coding `high`. A reasoning-capable model on a transport without reasoning control (the registry strips `thinking` when `openai-codex` or `anthropic` is routed through a non-audited proxy `baseUrl`) rejected the raw effort inside the provider mapper with "Model <provider>/<id> does not support thinking"; since the compaction fallback chain then reaches for the same-provider largest-context model, every candidate died on that throw and auto-compaction reported only the last one. The agent turn already clamps through `clampThinkingLevelForModel`; the maintenance calls were the one path still sending an unclamped effort.
