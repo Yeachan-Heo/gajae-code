@@ -875,8 +875,8 @@ describe("TUI raster lease public boundary", () => {
 		expect(after).not.toContain("SUFFIX");
 		expect(after).not.toContain("GIF");
 
-		// (c) A shouldWrite predicate that stops the terminal mid-operation must
-		// not emit abort or cursor-restoration bytes either.
+		// (c) A shouldWrite predicate that stops the terminal before prefix output
+		// emits neither abort nor body bytes.
 		tui.start();
 		const lease2 = await tui.acquireRasterLease(request("predicate-stop"));
 		if (lease2.status !== "acquired") throw new Error("lease not acquired");
@@ -898,6 +898,7 @@ describe("TUI raster lease public boundary", () => {
 		});
 		expect(ack2.status).toBe("failed");
 		expect(terminal.getWriteLog().join("")).not.toContain("ABORT2");
+		expect(terminal.getWriteLog().join("")).not.toContain("R2");
 
 		// (d) New-lifecycle work after restart writes normally.
 		tui.start();
