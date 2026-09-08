@@ -6392,6 +6392,7 @@ export function readAuthorizedProjectSessionTranscript(
 	try {
 		const result = authority.readManaged(relativePath);
 		if (!result.ok && result.code === "unsupported_platform") {
+			if (process.platform === "win32") return undefined;
 			const relativeParts = path.relative(projectGjcDir, path.dirname(candidate)).split(path.sep).filter(Boolean);
 			const parentPaths = [projectGjcDir];
 			for (const part of relativeParts) parentPaths.push(path.join(parentPaths[parentPaths.length - 1]!, part));
@@ -6400,7 +6401,28 @@ export function readAuthorizedProjectSessionTranscript(
 				if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("project transcript parent is unsafe");
 				return { path: parentPath, dev: stat.dev, ino: stat.ino, mode: stat.mode };
 			});
-			const captured = captureManagedFilePrefixNoFollow(candidate, maxBytes + 1);
+			const parentPath = path.dirname(candidate);
+			const parentFd = fs.openSync(
+				parentPath,
+				fs.constants.O_RDONLY | (fs.constants.O_DIRECTORY ?? 0) | (fs.constants.O_NOFOLLOW ?? 0),
+			);
+			let captured: ManagedFileSnapshot;
+			try {
+				const expectedParent = parentIdentities[parentIdentities.length - 1]!;
+				const openedParent = fs.fstatSync(parentFd, { bigint: true });
+				if (
+					openedParent.dev !== expectedParent.dev ||
+					openedParent.ino !== expectedParent.ino ||
+					openedParent.mode !== expectedParent.mode
+				)
+					throw new Error("project transcript parent handle identity mismatch");
+				captured = captureManagedFilePrefixNoFollow(
+					path.join("/dev/fd", String(parentFd), path.basename(candidate)),
+					maxBytes + 1,
+				);
+			} finally {
+				fs.closeSync(parentFd);
+			}
 			for (const expected of parentIdentities) {
 				const stat = fs.lstatSync(expected.path, { bigint: true });
 				if (

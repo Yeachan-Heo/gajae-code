@@ -5,7 +5,6 @@ import * as path from "node:path";
 // Subpath import keeps this module native-free for the gjc-state-gates shards:
 // the package barrel pulls procmgr/ptree → @gajae-code/natives.
 import * as logger from "@gajae-code/utils/logger";
-import { RESUME_TRANSCRIPT_MAX_BYTES } from "../session/session-manager";
 import type { WorkflowHudSummary } from "../skill-state/active-state";
 import {
 	applyHandoffToActiveState,
@@ -1893,6 +1892,7 @@ function requireReadyCanonicalCrystal(value: unknown): Record<string, unknown> {
  */
 export const DEEP_INTERVIEW_EXECUTION_APPROVAL_RECORD_FILE = "deep-interview-execution-approval.json";
 export const DEEP_INTERVIEW_EXECUTION_APPROVAL_MAX_AGE_MS = 15 * 60 * 1000;
+const EXECUTION_APPROVAL_TRANSCRIPT_MAX_BYTES = 16 * 1024 * 1024;
 const DEEP_INTERVIEW_EXECUTION_APPROVAL_RECORD_MAX_BYTES = 16 * 1024;
 const DEEP_INTERVIEW_EXECUTION_APPROVAL_ID_MAX_LENGTH = 256;
 
@@ -2880,9 +2880,22 @@ async function assertDeepInterviewHandoffReady(
 				typeof approval.mutation_id !== "string" ||
 				approval.spec_sha256 !== expectedSha ||
 				approval.crystal_spec_version !== crystal.spec_version ||
-				approval.crystal_source_digest !== (crystal.source as Record<string, unknown>).digest
+				approval.crystal_source_digest !== (crystal.source as Record<string, unknown>).digest ||
+				typeof approval.transcript_path !== "string" ||
+				!path.isAbsolute(approval.transcript_path) ||
+				!isSha256(approval.transcript_sha256)
 			)
 				throw new StateCommandError(2, "deep-interview execution approval lacks explicit provenance");
+			const transcriptText = await readBoundedIdentityText(
+				approval.transcript_path,
+				EXECUTION_APPROVAL_TRANSCRIPT_MAX_BYTES,
+				"deep-interview execution approval transcript",
+			);
+			if (
+				transcriptText === undefined ||
+				createHash("sha256").update(transcriptText).digest("hex") !== approval.transcript_sha256
+			)
+				throw new StateCommandError(2, "deep-interview execution approval transcript provenance is stale");
 			await assertSanctionedExecutionApprovalAudit(
 				options.cwd ?? "",
 				options.sessionId ?? "",
@@ -4435,7 +4448,7 @@ async function handleApproveExecutionRecordLocked(
 	await assertExecutionApprovalSpecIdentity(approvalRecord);
 	const transcriptText = await readBoundedIdentityText(
 		approvalRecord.transcript_path,
-		RESUME_TRANSCRIPT_MAX_BYTES,
+		EXECUTION_APPROVAL_TRANSCRIPT_MAX_BYTES,
 		"deep-interview execution approval transcript",
 	);
 	if (
