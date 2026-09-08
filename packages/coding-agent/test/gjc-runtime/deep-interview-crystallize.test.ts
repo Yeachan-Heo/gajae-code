@@ -165,6 +165,84 @@ describe("deep-interview crystallize contract", () => {
 				}),
 			),
 		).toThrow("unrepresented user directive");
+		const shortSnapshot: CrystalSnapshot = {
+			...snapshot,
+			messages: [
+				{ index: 0, role: "user", content: "Build audit reports." },
+				{ index: 1, role: "user", content: "Deploy." },
+			],
+			digest: "",
+		};
+		shortSnapshot.digest = crystalSnapshotDigest(shortSnapshot);
+		expect(() =>
+			crystallizeDeepInterview(
+				input({
+					snapshot: shortSnapshot,
+					items: [
+						{
+							id: "goal:audit",
+							kind: "goal",
+							classification: "confirmed",
+							statement: "Build audit reports",
+							anchor: { message_index: 0, quote: "Build audit reports." },
+						},
+					],
+				}),
+			),
+		).toThrow("unrepresented user directive requires an item or unresolved gap: Deploy");
+		const additiveSnapshot: CrystalSnapshot = {
+			revision: 1,
+			start: 0,
+			end: 1,
+			messages: [
+				{ index: 0, role: "user", content: "Build a report." },
+				{ index: 1, role: "user", content: "Actually, build a dashboard too." },
+			],
+			digest: "",
+		};
+		additiveSnapshot.digest = crystalSnapshotDigest(additiveSnapshot);
+		expect(() =>
+			crystallizeDeepInterview(
+				input({
+					snapshot: additiveSnapshot,
+					items: [
+						{
+							id: "goal:dashboard",
+							kind: "goal",
+							classification: "confirmed",
+							statement: "build a dashboard too",
+							anchor: { message_index: 1, quote: "build a dashboard too" },
+						},
+					],
+				}),
+			),
+		).toThrow("unrepresented user directive requires an item or unresolved gap: Build a report");
+		const cjkSnapshot: CrystalSnapshot = {
+			...snapshot,
+			messages: [
+				{ index: 0, role: "user", content: "Build audit reports." },
+				{ index: 1, role: "user", content: "暗号化バックアップと鍵をローテーションする。" },
+			],
+			digest: "",
+		};
+		cjkSnapshot.digest = crystalSnapshotDigest(cjkSnapshot);
+		expect(() =>
+			crystallizeDeepInterview(
+				input({
+					snapshot: cjkSnapshot,
+					items: [
+						{
+							id: "goal:audit",
+							kind: "goal",
+							classification: "confirmed",
+							statement: "Build audit reports",
+							anchor: { message_index: 0, quote: "Build audit reports." },
+						},
+					],
+					open_gaps: ["暗号化バックアップ"],
+				}),
+			),
+		).toThrow("unrepresented user directive");
 	});
 
 	it("rejects confirmed statements unrelated to their user quote", () => {
@@ -611,8 +689,15 @@ describe("deep-interview crystallize contract", () => {
 							statement: "Use PostgreSQL for storage",
 							anchor: { message_index: 0, quote: "Use PostgreSQL for storage." },
 						},
+						{
+							id: "constraint:postgres-backup-support",
+							kind: "constraint",
+							classification: "confirmed",
+							statement: "PostgreSQL supports backups",
+							anchor: { message_index: 0, quote: "PostgreSQL supports backups." },
+						},
 					],
-					open_gaps: ["Actually use Dark mode", "PostgreSQL supports backups"],
+					open_gaps: ["Switch to dark mode", "Actually use Dark mode"],
 				}),
 			).items[0]?.statement,
 		).toBe("Use PostgreSQL for storage");
