@@ -864,7 +864,7 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 			return;
 		}
 		if (!sessionId) throw new ToolAbortError("Deep Interview execution approval requires a session");
-		if (deepInterviewExecution) await assertDeepInterviewCrystalCoversLiveTranscript(this.session.cwd, sessionId);
+		const transcriptEvidence = await assertDeepInterviewCrystalCoversLiveTranscript(this.session.cwd, sessionId);
 		await recordDeepInterviewExecutionApproval({
 			cwd: this.session.cwd,
 			sessionId,
@@ -872,6 +872,8 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 			gateId: executionGateId ?? q.id,
 			target,
 			selectedOptions,
+			transcriptPath: transcriptEvidence.transcriptPath,
+			transcriptSha256: transcriptEvidence.transcriptSha256,
 			approvalStage: ralplanApproval ? "ralplan" : "deep-interview",
 		});
 		if (ralplanApproval) {
