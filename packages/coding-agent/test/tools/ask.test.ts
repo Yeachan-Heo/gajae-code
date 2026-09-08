@@ -3274,8 +3274,22 @@ describe("AskTool deep-interview recorder persistence", () => {
 			supportsRemoteGateAnswers: () => true,
 			emitGate: vi.fn(async () => ({ selected: ["Approve execution via ultragoal"] })),
 		};
+		const approvalRecord = spyOn(stateRuntime, "recordDeepInterviewExecutionApproval").mockResolvedValue({
+			path: "/tmp/ralplan-approval.json",
+			record: {} as DeepInterviewExecutionApprovalRecord,
+		});
+		const approvalTransition = spyOn(stateRuntime, "runNativeStateCommand").mockResolvedValue({
+			status: 0,
+			stdout: "{}\n",
+			stderr: "",
+		});
 		await new AskTool(
-			createSession({ hasUI: false, getWorkflowGateEmitter: () => ralplanGateEmitter } as Partial<ToolSession>),
+			createSession({
+				hasUI: false,
+				cwd: "/tmp/ralplan-approval",
+				getSessionId: () => "ralplan-approval",
+				getWorkflowGateEmitter: () => ralplanGateEmitter,
+			} as Partial<ToolSession>),
 		).execute(
 			"call-ralplan-workflow-gate",
 			{
@@ -3295,6 +3309,11 @@ describe("AskTool deep-interview recorder persistence", () => {
 
 		expect(ralplanGateEmitter.emitGate).toHaveBeenCalledWith(
 			expect.objectContaining({ stage: "ralplan", kind: "approval" }),
+		);
+		expect(approvalRecord).toHaveBeenCalledWith(expect.objectContaining({ approvalStage: "ralplan" }));
+		expect(approvalTransition).toHaveBeenCalledWith(
+			["approve-execution", "--mode", "deep-interview", "--session-id", "ralplan-approval", "--json"],
+			"/tmp/ralplan-approval",
 		);
 	});
 
