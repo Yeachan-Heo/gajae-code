@@ -5070,9 +5070,12 @@ export class AgentSession {
 		// intentionally survive the tool call: resumed registrations re-use the
 		// original tool call id and must retain the same owned-completion origin.
 		// They are superseded by a rebind on the same id or by bounded eviction.
-		this.agent.beforeToolCall = async ctx => {
+		this.agent.beforeToolCall = async (ctx, signal) => {
 			const canonicalAdmission = this.#canonicalMessageAdmissionTail;
 			if (!canonicalAdmission.released) await canonicalAdmission.promise;
+			if (signal?.aborted) {
+				return { block: true, reason: "Tool call was cancelled before dispatch." };
+			}
 			if (this.#terminalPersistenceRecovery) {
 				return { block: true, reason: "Assistant output was not committed to session history." };
 			}
