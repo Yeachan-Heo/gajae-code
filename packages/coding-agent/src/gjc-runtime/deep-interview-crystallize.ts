@@ -657,6 +657,12 @@ function validateItems(value: unknown, snapshot?: CrystalSnapshot): CrystalItem[
 				const conjunctiveQuote = /\b(?:and|plus|as\s+well\s+as)\b/i.test(item.anchor.quote);
 				const statementSemantics = semanticProfile(item.statement);
 				const quoteSemantics = semanticProfile(anchoredClause(anchorMessage.content, item.anchor.quote));
+				const authenticatedNonGoal =
+					item.kind !== "non_goal" ||
+					quoteSemantics.negative ||
+					/\b(?:non[- ]?goal|out\s+of\s+scope|excluded?|do\s+not|don't|dont|won't|will\s+not|must\s+not)\b/i.test(
+						item.anchor.quote,
+					);
 				const fullAnchorClause = anchoredClause(anchorMessage.content, item.anchor.quote);
 				const quoteClauses = fullAnchorClause.split(/(?:[!?。！？;]|\.(?=\s|$)|\n)+\s*/u).filter(Boolean);
 				const partialMultiDirectiveAnchor =
@@ -683,6 +689,7 @@ function validateItems(value: unknown, snapshot?: CrystalSnapshot): CrystalItem[
 							JSON.stringify(quantitativeEvidenceSequence(item.anchor.quote))) ||
 					mixedClausePolarity ||
 					partialMultiDirectiveAnchor ||
+					!authenticatedNonGoal ||
 					!preservesEvidenceOrder(item.statement, item.anchor.quote) ||
 					isUnsafeConfirmedStatement(statementSemantics) ||
 					!sameSemanticIntent(statementSemantics, quoteSemantics)
@@ -836,6 +843,12 @@ function quantitativeEvidenceTerms(value: string): Set<string> {
 	const canonical = value.normalize("NFC");
 	const terms = new Set<string>();
 	for (const match of canonical.matchAll(/\p{Sc}|%|>=|<=|>|</gu)) terms.add(match[0]);
+	for (const match of canonical
+		.toLowerCase()
+		.matchAll(
+			/\b(?:zero|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|hundred|thousand|million|billion)\b/g,
+		))
+		terms.add(match[0]);
 	if (/\d\s*:\s*\d/u.test(canonical)) terms.add(":");
 	for (const match of canonical.matchAll(/\b(\d+(?:\.\d+)?)\s*([A-Za-z]+)?\b/g)) {
 		terms.add(match[1]!);
