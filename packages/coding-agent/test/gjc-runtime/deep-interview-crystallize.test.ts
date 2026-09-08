@@ -582,9 +582,10 @@ describe("deep-interview crystallize contract", () => {
 							anchor: { message_index: 0, quote: "Use PostgreSQL for storage." },
 						},
 					],
+					open_gaps: ["After deployment rotate secrets"],
 				}),
-			).lifecycle,
-		).toBe("ready");
+			).items[0]?.statement,
+		).toBe("Use PostgreSQL for storage");
 		const unrelatedReplacementSnapshot: CrystalSnapshot = {
 			revision: 1,
 			start: 0,
@@ -611,7 +612,7 @@ describe("deep-interview crystallize contract", () => {
 							anchor: { message_index: 0, quote: "Use PostgreSQL for storage." },
 						},
 					],
-					open_gaps: ["Dark mode preference"],
+					open_gaps: ["Actually use Dark mode", "PostgreSQL supports backups"],
 				}),
 			).items[0]?.statement,
 		).toBe("Use PostgreSQL for storage");
@@ -645,6 +646,13 @@ describe("deep-interview crystallize contract", () => {
 							classification: "confirmed",
 							statement: "Do not expose the API publicly",
 							anchor: { message_index: 0, quote: "Do not expose the API publicly." },
+						},
+						{
+							id: "constraint:postgres-backups",
+							kind: "constraint",
+							classification: "confirmed",
+							statement: "PostgreSQL supports backups",
+							anchor: { message_index: 0, quote: "PostgreSQL supports backups." },
 						},
 					],
 				}),
