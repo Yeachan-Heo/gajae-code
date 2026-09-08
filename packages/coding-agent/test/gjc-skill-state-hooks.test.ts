@@ -497,6 +497,35 @@ describe("GJC native skill-state hooks", () => {
 		await expect(
 			activeStateModule.readVisibleSkillActiveState(root, sessionId, { bypassCache: true }),
 		).resolves.toBeNull();
+
+		await writeActiveEntry(
+			root,
+			{ sessionId },
+			"deep-interview",
+			{
+				skill: "deep-interview",
+				active: true,
+				phase: "interviewing",
+				session_id: sessionId,
+			},
+			{ cwd: root },
+		);
+		await expect(
+			activeStateModule.readVisibleSkillActiveState(root, sessionId, { bypassCache: true }),
+		).resolves.toMatchObject({
+			skill: "deep-interview",
+			phase: "interviewing",
+			active_skills: [expect.objectContaining({ skill: "deep-interview" })],
+		});
+
+		await activeStateModule.applyHandoffToActiveState({
+			cwd: root,
+			caller: { cwd: root, skill: "deep-interview", active: false, phase: "handoff", sessionId },
+			callee: { cwd: root, skill: "ralplan", active: true, phase: "planner", sessionId },
+		});
+		const entries = await readActiveEntries(root, { sessionId });
+		expect(entries.map(entry => entry.skill).sort()).toEqual(["deep-interview", "ralplan"]);
+		expect(entries.some(entry => entry.skill === "ultragoal")).toBe(false);
 	});
 
 	it("fails open and logs when custom skill-active state is corrupt", async () => {
