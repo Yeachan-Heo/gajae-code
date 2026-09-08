@@ -5398,6 +5398,13 @@ export class AgentSession {
 		// Per-tool TTSR reminders are folded into the matched tool's result via this hook.
 		this.agent.afterToolCall = ctx => {
 			settleToolLineageRegistrationWindow(ctx.toolCall.id, this.#ownedRegistrationEndpoint());
+			if (
+				ctx.result.details &&
+				typeof ctx.result.details === "object" &&
+				(ctx.result.details as { cancellation?: unknown }).cancellation === "before_dispatch"
+			) {
+				return undefined;
+			}
 			const ttsrResult = this.#ttsrAfterToolCall(ctx);
 			const delegationHintEnabled = this.settings.get("task.delegationHint.mode") === "hint";
 			this.#delegationHint.setEnabled(delegationHintEnabled);
