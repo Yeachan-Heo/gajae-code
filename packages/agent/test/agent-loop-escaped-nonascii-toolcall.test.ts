@@ -10,7 +10,7 @@ import type {
 	ManagedAttemptOutcome,
 } from "@gajae-code/agent-core/types";
 import type { AssistantMessage, Message, ToolCall } from "@gajae-code/ai";
-import { createMockModel } from "@gajae-code/ai/providers/mock";
+import { createMockModel, type MockModel } from "@gajae-code/ai/providers/mock";
 import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
 import { captureUnicodeEscapeEvidence, collectUnicodeEscapeEvidence } from "@gajae-code/ai/utils/json-parse";
 import * as logger from "@gajae-code/utils/logger";
@@ -154,7 +154,7 @@ function thinkingToolTurn(id: string, escaped = false) {
 }
 
 /** Only for unpublished recovery: this provider exposes no content before its terminal response. */
-function terminalOnlyStream(stream: ReturnType<typeof createMockModel>["stream"]): typeof stream {
+function terminalOnlyStream(stream: MockModel["stream"]): MockModel["stream"] {
 	return (model, context, options) => {
 		const upstream = stream(model, context, options);
 		const terminal = new AssistantMessageEventStream();
@@ -189,7 +189,7 @@ describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
 				for await (const event of upstream) {
 					if (event.type === "done" || event.type === "error") {
 						// Give the consumer a turn while the provider has not yet completed.
-						await new Promise(resolve => setTimeout(resolve, 0));
+						await Bun.sleep(0);
 						if (!terminalSent) executionsBeforeDone.push(executed.length);
 						terminalSent = true;
 					}
