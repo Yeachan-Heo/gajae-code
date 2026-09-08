@@ -7408,7 +7408,7 @@ export class AgentSession {
 					}
 				}
 			}
-			await this.#syncSkillPromptActiveStateSafely(event.message, true, true, eventSessionIdentity);
+			await this.#syncSkillPromptActiveStateSafely(event.message, true, true, eventSessionIdentity, false);
 		}
 
 		// Plan-mode → compaction transition: stamp `SILENT_ABORT_MARKER` on the
@@ -13750,6 +13750,7 @@ export class AgentSession {
 		active: boolean,
 		persistActiveState = true,
 		expectedIdentity?: SessionSelectionIdentity,
+		awaitAskPromptRebuild = true,
 	): Promise<void> {
 		const identityIsCurrent = (): boolean =>
 			expectedIdentity === undefined || this.#isSessionSelectionIdentityAdmitted(expectedIdentity);
@@ -13786,8 +13787,11 @@ export class AgentSession {
 					? [subskillDetails.subskillActivation]
 					: [];
 		if (active && isCanonicalGjcWorkflowSkill(skill)) {
-			this.#attachAskTool(true);
-			await this.refreshBaseSystemPrompt();
+			const attachedAsk = this.#attachAskTool(!awaitAskPromptRebuild);
+			if (awaitAskPromptRebuild) {
+				if (attachedAsk) await this.refreshBaseSystemPrompt();
+				else await this.#waitForAdmittedBaseSystemPromptRebuilds();
+			}
 			if (!identityIsCurrent()) return;
 		}
 		let activationSeed: WorkflowSkillActivationSeed | undefined;
@@ -13826,12 +13830,14 @@ export class AgentSession {
 		active: boolean,
 		persistActiveState = true,
 		expectedIdentity?: SessionSelectionIdentity,
+		awaitAskPromptRebuild = true,
 	): Promise<void> {
 		const synchronization = this.#syncSkillPromptActiveState(
 			message,
 			active,
 			persistActiveState,
 			expectedIdentity,
+			awaitAskPromptRebuild,
 		);
 		this.#skillStateSynchronizations.add(synchronization);
 		try {

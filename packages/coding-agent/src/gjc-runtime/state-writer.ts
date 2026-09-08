@@ -1387,10 +1387,11 @@ export async function updateActiveEntryIfExact(
 /** Replace an exact caller-owned active entry with its predecessor under one lock. */
 export async function restoreActiveEntryIfOwned(
 	cwd: string,
+	sessionScope: string | ActiveSessionScope,
 	receipt: GuardedStateWriteReceipt,
 	predecessor: SkillActiveEntry,
 ): Promise<boolean> {
-	return withActiveStateScopeLock(cwd, { sessionId: predecessor.session_id }, () =>
+	return withActiveStateScopeLock(cwd, sessionScope, () =>
 		lockResolvedWorkflowTarget(receipt.path, async () => {
 			const current = await readJsonIfPresent(receipt.path);
 			if (!matchesGuardedStateWriteReceipt(current, receipt)) return false;
@@ -1402,7 +1403,7 @@ export async function restoreActiveEntryIfOwned(
 				lockHeld: true,
 			});
 			if (!restored.written) return false;
-			invalidateActiveStateCacheForScope(cwd, predecessor.session_id);
+			invalidateActiveStateCacheForScope(cwd, sessionScope);
 			return true;
 		}),
 	);

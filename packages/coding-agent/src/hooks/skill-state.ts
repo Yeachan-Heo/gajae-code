@@ -614,7 +614,12 @@ export async function ensureWorkflowSkillActivationSeed(
 		const mergedWrite = guardedStateWriteReceipt(mergedResult);
 		if (!mergedWrite) throw new Error(`Workflow subskill activation write was not persisted: ${skill}`);
 		const rollback = async (): Promise<boolean> => {
-			const restored = await restoreActiveEntryIfOwned(input.cwd, mergedWrite, existingEntry);
+			const restored = await restoreActiveEntryIfOwned(
+				input.cwd,
+				{ sessionId: resolvedSessionId },
+				mergedWrite,
+				existingEntry,
+			);
 			if (!restored) return false;
 			await rebuildActiveSnapshot(input.cwd, { sessionId: resolvedSessionId }, { cwd: input.cwd });
 			return true;
