@@ -5,6 +5,7 @@ import * as path from "node:path";
 // Subpath import keeps this module native-free for the gjc-state-gates shards:
 // the package barrel pulls procmgr/ptree → @gajae-code/natives.
 import * as logger from "@gajae-code/utils/logger";
+import { RESUME_TRANSCRIPT_MAX_BYTES } from "../session/session-manager";
 import type { WorkflowHudSummary } from "../skill-state/active-state";
 import {
 	applyHandoffToActiveState,
@@ -1910,6 +1911,8 @@ export interface DeepInterviewExecutionApprovalRecord {
 	question_id: string;
 	gate_id: string;
 	answer_hash: string;
+	transcript_path: string;
+	transcript_sha256: string;
 	approval_stage?: "deep-interview" | "ralplan";
 	ralplan_state_path?: string;
 	ralplan_state_revision?: number;
@@ -1955,6 +1958,8 @@ function assertExecutionApprovalRecordShape(value: unknown): asserts value is De
 		"question_id",
 		"gate_id",
 		"answer_hash",
+		"transcript_path",
+		"transcript_sha256",
 		"approval_stage",
 		"ralplan_state_path",
 		"ralplan_state_revision",
@@ -1987,6 +1992,9 @@ function assertExecutionApprovalRecordShape(value: unknown): asserts value is De
 		!isExecutionApprovalId(value.question_id) ||
 		!isExecutionApprovalId(value.gate_id) ||
 		!isSha256(value.answer_hash) ||
+		typeof value.transcript_path !== "string" ||
+		!path.isAbsolute(value.transcript_path) ||
+		!isSha256(value.transcript_sha256) ||
 		typeof value.created_at !== "string" ||
 		typeof value.expires_at !== "string"
 	)
@@ -2145,6 +2153,8 @@ export async function recordDeepInterviewExecutionApproval(options: {
 	target: string;
 	selectedOptions: readonly string[];
 	customInput?: string;
+	transcriptPath: string;
+	transcriptSha256: string;
 	approvalStage?: "deep-interview" | "ralplan";
 }): Promise<{ path: string; record: DeepInterviewExecutionApprovalRecord }> {
 	if (options.target !== "ultragoal")
@@ -2258,6 +2268,8 @@ export async function recordDeepInterviewExecutionApproval(options: {
 				question_id: options.questionId,
 				gate_id: gateId,
 				answer_hash: answerHash([...options.selectedOptions], options.customInput),
+				transcript_path: path.resolve(options.transcriptPath),
+				transcript_sha256: options.transcriptSha256,
 				approval_stage: options.approvalStage ?? "deep-interview",
 				...(ralplanFinal
 					? {
@@ -3198,7 +3210,9 @@ async function assertDeepInterviewExecutionLineage(
 					upstreamApproval.ralplan_final_sha256 !== record.ralplan_final_sha256 ||
 					upstreamApproval.question_id !== record.question_id ||
 					upstreamApproval.gate_id !== record.gate_id ||
-					upstreamApproval.answer_hash !== record.answer_hash
+					upstreamApproval.answer_hash !== record.answer_hash ||
+					upstreamApproval.transcript_path !== record.transcript_path ||
+					upstreamApproval.transcript_sha256 !== record.transcript_sha256
 				)
 					throw new StateCommandError(2, "execution handoff Ralplan approval receipt identity mismatch");
 				await assertRalplanApprovalRecordCurrent(cwd, sessionId, record, currentState);
@@ -4419,6 +4433,16 @@ async function handleApproveExecutionRecordLocked(
 	if (!approvalRecord)
 		throw new StateCommandError(2, "approve-execution requires a user-origin execution approval record");
 	await assertExecutionApprovalSpecIdentity(approvalRecord);
+	const transcriptText = await readBoundedIdentityText(
+		approvalRecord.transcript_path,
+		RESUME_TRANSCRIPT_MAX_BYTES,
+		"deep-interview execution approval transcript",
+	);
+	if (
+		transcriptText === undefined ||
+		createHash("sha256").update(transcriptText).digest("hex") !== approvalRecord.transcript_sha256
+	)
+		throw new StateCommandError(2, "deep-interview execution approval transcript changed after user approval");
 	await assertRalplanApprovalRecordCurrent(cwd, selectors.gjcSessionId, approvalRecord);
 	assertExecutionApprovalRecordMatchesCurrentState(approvalRecord, {
 		sessionId: selectors.gjcSessionId,
@@ -4554,6 +4578,8 @@ async function handleApproveExecutionRecordLocked(
 		question_id: approvalRecord.question_id,
 		gate_id: approvalRecord.gate_id,
 		answer_hash: approvalRecord.answer_hash,
+		transcript_path: approvalRecord.transcript_path,
+		transcript_sha256: approvalRecord.transcript_sha256,
 		target: approvalRecord.target,
 		approval_stage: approvalRecord.approval_stage ?? "deep-interview",
 		...(approvalRecord.approval_stage === "ralplan"
