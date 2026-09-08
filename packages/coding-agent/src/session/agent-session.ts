@@ -11905,6 +11905,7 @@ export class AgentSession {
 				this.#toolRegistry.delete(name);
 			}
 			this.#gjcSubskillToolNames.clear();
+			this.#gjcSubskillToolSignature = undefined;
 			this.#invalidateDiscoveryCaches();
 			await this.#applyActiveToolsByName(
 				previousActiveToolNames.filter(name => !previousGjcSubskillToolNames.has(name)),
