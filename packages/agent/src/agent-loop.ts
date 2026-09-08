@@ -5418,10 +5418,11 @@ async function executeToolCalls(
 				);
 				if (signal?.aborted) {
 					record.skipped = true;
-					if (afterToolCall && record.started) {
+					if (afterToolCall) {
 						const cancelledResult: AgentToolResult = {
 							content: [{ type: "text", text: "Tool call cancelled before dispatch." }],
 							isError: true,
+							details: { cancellation: "before_dispatch" },
 						};
 						try {
 							await afterToolCall(
