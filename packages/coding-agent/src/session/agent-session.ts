@@ -13170,8 +13170,8 @@ export class AgentSession {
 					? [subskillDetails.subskillActivation]
 					: [];
 		if (active && isCanonicalGjcWorkflowSkill(skill)) {
-			const attachedAsk = this.#attachAskTool(true);
-			if (attachedAsk) await this.refreshBaseSystemPrompt();
+			this.#attachAskTool(true);
+			await this.refreshBaseSystemPrompt();
 			if (!identityIsCurrent()) return;
 		}
 		let activationSeed: WorkflowSkillActivationSeed | undefined;

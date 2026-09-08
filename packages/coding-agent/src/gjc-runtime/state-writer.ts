@@ -1029,6 +1029,31 @@ export async function writeActiveEntry(
 	return result;
 }
 
+/** Update an active entry only while it still exactly matches the observed predecessor. */
+export async function updateActiveEntryIfExact(
+	cwd: string,
+	sessionScope: string | ActiveSessionScope | undefined,
+	skill: string,
+	expected: SkillActiveEntry,
+	replacement: SkillActiveEntry,
+): Promise<GuardedWriteResult> {
+	const filePath = activeEntryPath(path.resolve(cwd), sessionScope, skill);
+	return lockResolvedWorkflowTarget(filePath, async () => {
+		const current = await readJsonIfPresent(filePath);
+		if (!Bun.deepEquals(current, expected)) {
+			return { path: filePath, written: false, reason: "stale-skip", revision: persistedStateRevision(current) };
+		}
+		const result = await writeGuardedResolvedJsonAtomic(filePath, replacement, {
+			cwd,
+			policy: "cache",
+			sourceRevision: persistedSourceRevision(current) + 1,
+			lockHeld: true,
+		});
+		invalidateActiveStateCacheForScope(cwd, sessionScope);
+		return result;
+	});
+}
+
 /** Replace an exact caller-owned active entry with its predecessor under one lock. */
 export async function restoreActiveEntryIfOwned(
 	cwd: string,
