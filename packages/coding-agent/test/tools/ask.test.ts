@@ -5,6 +5,7 @@ import { Settings } from "@gajae-code/coding-agent/config/settings";
 import type { AppendOrMergeResult } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-recorder";
 import * as deepInterviewRecorder from "@gajae-code/coding-agent/gjc-runtime/deep-interview-recorder";
 import { deepInterviewCharacterCount } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-state";
+import type { DeepInterviewExecutionApprovalRecord } from "@gajae-code/coding-agent/gjc-runtime/state-runtime";
 import * as stateRuntime from "@gajae-code/coding-agent/gjc-runtime/state-runtime";
 import { getThemeByName, initTheme } from "@gajae-code/coding-agent/modes/theme/theme";
 import type {
@@ -2951,8 +2952,9 @@ describe("AskTool deep-interview recorder persistence", () => {
 	it("mints execution approval only from an accepted structured user choice", async () => {
 		const record = spyOn(stateRuntime, "recordDeepInterviewExecutionApproval").mockResolvedValue({
 			path: "/tmp/deep-interview-execution-approval.json",
-			record: {} as Awaited<ReturnType<typeof stateRuntime.recordDeepInterviewExecutionApproval>>["record"],
+			record: {} as DeepInterviewExecutionApprovalRecord,
 		});
+		const revoke = spyOn(stateRuntime, "revokeDeepInterviewExecutionApproval").mockResolvedValue();
 		const question = {
 			id: "deep-interview-execution",
 			question: "Choose the execution path",
@@ -3001,12 +3003,23 @@ describe("AskTool deep-interview recorder persistence", () => {
 			questionId: "deep-interview-execution",
 			target: "ultragoal",
 		});
+
+		await new AskTool(
+			createSession({ cwd: "/tmp/approval-decline", getSessionId: () => "approval-decline" }),
+		).execute(
+			"decline-execution-choice",
+			{ questions: [question] },
+			undefined,
+			undefined,
+			createContext({ select: async () => "Stop here" }),
+		);
+		expect(revoke).toHaveBeenCalledWith("/tmp/approval-decline", "approval-decline");
 	});
 
 	it("does not mint execution approval after a multi-question choice is revised", async () => {
 		const record = spyOn(stateRuntime, "recordDeepInterviewExecutionApproval").mockResolvedValue({
 			path: "/tmp/deep-interview-execution-approval.json",
-			record: {} as Awaited<ReturnType<typeof stateRuntime.recordDeepInterviewExecutionApproval>>["record"],
+			record: {} as DeepInterviewExecutionApprovalRecord,
 		});
 		let executionVisits = 0;
 		let confirmationVisits = 0;

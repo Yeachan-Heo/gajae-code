@@ -1032,6 +1032,8 @@ function validateResolutionAnchors(
 			!message.content.includes(resolution) ||
 			!hasVerbatimTokenBoundaries(message.content, quote) ||
 			!hasVerbatimTokenBoundaries(message.content, resolution) ||
+			!hasVerbatimTokenBoundaries(message.content, quote) ||
+			!hasVerbatimTokenBoundaries(message.content, resolution) ||
 			hasLaterSupersedingCorrection(message.content, quote, resolution) ||
 			hasLaterSupersedingCorrection(message.content, resolution, resolution) ||
 			unsafeResolution ||
