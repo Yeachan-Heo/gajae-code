@@ -327,6 +327,41 @@ describe("AuthStorage codex oauth ranking", () => {
 		expect(apiKey).toBe("api-acct-pro");
 	});
 
+	test("does not fall through from a confirmed Pro Spark account to a Plus-labelled account", async () => {
+		if (!authStorage) throw new Error("test setup failed");
+
+		await authStorage.set("openai-codex", [
+			{ type: "oauth", ...createCredential("acct-plus", "plus@example.com") },
+			{ type: "oauth", ...createCredential("acct-pro", "pro@example.com") },
+		]);
+		const plusReport = createCodexUsageReport({
+			accountId: "acct-plus",
+			primary: { usedFraction: 0.05, resetInMs: 30 * 60 * 1000 },
+			secondary: { usedFraction: 0.05, resetInMs: 6 * 24 * 60 * 60 * 1000 },
+		});
+		plusReport.metadata = { ...plusReport.metadata, planType: "plus" };
+		usageByAccount.set("acct-plus", plusReport);
+		const proReport = createCodexUsageReport({
+			accountId: "acct-pro",
+			primary: { usedFraction: 0.2, resetInMs: 30 * 60 * 1000 },
+			secondary: { usedFraction: 0.2, resetInMs: 6 * 24 * 60 * 60 * 1000 },
+		});
+		proReport.metadata = { ...proReport.metadata, planType: "pro" };
+		usageByAccount.set("acct-pro", proReport);
+		const attemptedAccounts: string[] = [];
+		vi.spyOn(oauthUtils, "getOAuthApiKey").mockImplementation(async (_provider, credentials) => {
+			const credential = credentials["openai-codex"] as OAuthCredentials | undefined;
+			if (!credential?.accountId) return null;
+			attemptedAccounts.push(credential.accountId);
+			return null;
+		});
+
+		await expect(
+			authStorage.getApiKey("openai-codex", "session-spark-pro-filter", { modelId: "gpt-5.3-codex-spark" }),
+		).resolves.toBeUndefined();
+		expect(attemptedAccounts).toEqual(["acct-pro"]);
+	});
+
 	test("routes codex spark to a single Plus account when no Pro is connected", async () => {
 		if (!authStorage) throw new Error("test setup failed");
 

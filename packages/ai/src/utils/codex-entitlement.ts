@@ -39,6 +39,11 @@ export function requiresOpenAICodexProModel(provider: string, modelId: string | 
 	);
 }
 
+/** Spark retains its confirmed-Pro candidate filter; Sol is provider-authoritative. */
+export function requiresOpenAICodexSparkModel(provider: string, modelId: string | undefined): boolean {
+	return provider === "openai-codex" && typeof modelId === "string" && modelId.toLowerCase().includes("-spark");
+}
+
 export function isOpenAICodexChatGPTEntitlementError(message: string | undefined, code?: string): boolean {
 	return (
 		/\bnot supported when using codex with a chatgpt account\b/i.test(message ?? "") &&
