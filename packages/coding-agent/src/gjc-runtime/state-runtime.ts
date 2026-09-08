@@ -1588,6 +1588,13 @@ async function handleWrite(args: readonly string[], cwd: string): Promise<StateC
 				throw new StateCommandError(2, preDefaultValidation.error ?? `invalid ${mode} state envelope`);
 			}
 			assertHandoffLineageUnchanged(existingPayload, merged, "generic state write");
+			if (
+				mode === "ralplan" &&
+				typeof existingPayload.run_id === "string" &&
+				existingPayload.run_id.trim() !== "" &&
+				merged.run_id !== existingPayload.run_id
+			)
+				throw new StateCommandError(2, "Ralplan run identity cannot change through generic state write");
 			if (mode === "deep-interview") {
 				assertDeepInterviewEvidenceUnchanged(existingPayload, merged, "generic state write");
 			}
