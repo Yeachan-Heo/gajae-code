@@ -1504,7 +1504,7 @@ describe("deep-interview crystallize contract", () => {
 			items: [],
 			snapshot,
 			current_revision: 2,
-			open_gaps: ["Which export format should be used?"],
+			open_gaps: ["We still need to decide the export format"],
 		});
 		expect(next.lifecycle).toBe("needs-questions");
 		expect(next.items).toEqual(first.items);
@@ -1662,7 +1662,7 @@ describe("deep-interview crystallize contract", () => {
 				prior: first,
 				items: [first.items[0]!],
 				removed_ids: ["constraint:latency"],
-				open_gaps: ["PostgreSQL storage preservation"],
+				open_gaps: ["Keep PostgreSQL for storage"],
 			}),
 			mixedMessage,
 		);
