@@ -198,6 +198,8 @@ const RESOLUTION_META_TERMS = new Set([
 	"resolutions",
 	"determination",
 	"determinations",
+	"still",
+	"decide",
 ]);
 const RESOLUTION_QUESTION_TERMS = new Set([
 	"what",
@@ -872,7 +874,10 @@ function caseSensitiveIdentifierTerms(value: string): Set<string> {
 			.map(match => match[0])
 			.filter(
 				term =>
-					term.includes("_") || (term.length > 1 && term === term.toUpperCase()) || /[a-z0-9][A-Z]/.test(term),
+					term.includes("_") ||
+					(term.length > 1 && term === term.toUpperCase()) ||
+					/[a-z0-9][A-Z]/.test(term) ||
+					(term.match(/[A-Z]/g)?.length ?? 0) >= 2,
 			),
 	);
 }
@@ -886,16 +891,13 @@ function requirementBearingClauses(snapshot: CrystalSnapshot): Array<{ messageIn
 			if (
 				!clause ||
 				/^(?:what|why|how|when|where|who|which)\b/i.test(clause) ||
-				/\b(?:asked|said|wrote|reported)\b[^"“”]*["“”]/i.test(clause) ||
-				/^(?:no further changes|nothing else|thanks|thank you)\b/i.test(clause)
-			)
-				continue;
-			if (
-				/\b(?:build|create|implement|configure|deploy|publish|make|support|supports|encrypt|decrypt|rotate|store|send|expose|use|choose|prefer|switch|set|keep|retain|remove|delete|limit|allow|deny|require|requires|required|must|should|need|needs|want|wants|will|shall|only|never|do\s+not|don't|dont)\b/i.test(
+				/\basked\b[^"“”]*["“”][^"“”]*(?:should|could|would|can|will)\b/i.test(clause) ||
+				/^(?:no further changes|nothing else|another question remains|the ambiguity remains open|continue\b|thanks|thank you)\b/i.test(
 					clause,
 				)
 			)
-				clauses.push({ messageIndex: message.index, clause });
+				continue;
+			if (evidenceTerms(clause).size >= 2) clauses.push({ messageIndex: message.index, clause });
 		}
 	}
 	return clauses;
@@ -1460,6 +1462,9 @@ export function crystallizeDeepInterview(value: unknown): DeepInterviewCrystal {
 	if (currentItems.length > MAX_ITEMS) throw new Error("merged crystallize items exceed the bounded limit");
 	if (currentItems.length === 0) throw new Error("crystallize requires material conversation evidence");
 	for (const directive of requirementBearingClauses(snapshot)) {
+		const sourceMessage = snapshot.messages.find(message => message.index === directive.messageIndex);
+		if (sourceMessage && hasLaterSupersedingCorrection(sourceMessage.content, directive.clause, directive.clause))
+			continue;
 		const directiveTerms = topicTerms(directive.clause, false);
 		const represented = currentItems.some(
 			item =>
@@ -1480,8 +1485,8 @@ export function crystallizeDeepInterview(value: unknown): DeepInterviewCrystal {
 			);
 		});
 		const unresolved = [...gaps, ...conflicts].some(item => {
-			const clauseTerms = evidenceTerms(directive.clause);
-			return [...directiveTerms].every(term => clauseTerms.has(term)) || hasCjkTopicOverlap(item, directive.clause);
+			const itemTerms = topicTerms(item, false);
+			return [...directiveTerms].every(term => itemTerms.has(term)) || hasCjkTopicOverlap(item, directive.clause);
 		});
 		if (!represented && !representedRemoval && !unresolved)
 			throw new Error(`unrepresented user directive requires an item or unresolved gap: ${directive.clause}`);
