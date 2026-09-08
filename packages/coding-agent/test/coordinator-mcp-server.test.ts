@@ -385,12 +385,15 @@ async function createSdkControlServer(
 				const workspace = root;
 				const declaredLocator = (session.locator as Record<string, unknown> | undefined) ?? {};
 				const brokerWorkspace = typeof declaredLocator.cwd === "string" ? declaredLocator.cwd : workspace;
+				// The broker locator is allowed to use the host's Windows spelling while
+				// the local router index retains the materialized fixture path.
+				const routerWorkspace = serverOptions.platform === "win32" ? workspace : brokerWorkspace;
 				return {
 					sessionId,
 				locator: {
-						cwd: brokerWorkspace,
+						cwd: routerWorkspace,
 						worktreeRoot: declaredLocator.worktreeRoot ?? null,
-						stateRoot: declaredLocator.stateRoot ?? path.join(brokerWorkspace, ".gjc", "state"),
+						stateRoot: declaredLocator.stateRoot ?? path.join(routerWorkspace, ".gjc", "state"),
 					},
 					live: session.live === true,
 					terminalUncertain: session.terminalUncertain === true,
@@ -1981,7 +1984,6 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 			undefined,
 			{
 				platform: "win32",
-				preserveEndpointAuthority: true,
 				canonicalizePath: async value => path.win32.normalize(value === root ? canonicalWorkspace : value),
 			},
 		);
