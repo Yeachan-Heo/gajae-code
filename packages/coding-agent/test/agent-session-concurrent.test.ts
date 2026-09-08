@@ -1889,6 +1889,98 @@ describe("AgentSession TTSR resume gate", () => {
 		expect(text.indexOf("<system-reminder")).toBeLessThan(text.indexOf("edit applied"));
 	});
 
+	it("clears a per-tool reminder bucket after pre-dispatch argument validation fails", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		let streamCallCount = 0;
+		const ttsrManager = new TtsrManager({
+			enabled: true,
+			contextMode: "discard",
+			interruptMode: "never",
+			repeatMode: "once",
+			repeatGap: 10,
+		});
+		ttsrManager.addRule(testRule);
+		const mockTool: AgentTool = {
+			name: "mock_edit",
+			label: "Mock Edit",
+			description: "A mock edit tool",
+			parameters: z.object({ snippet: z.string() }),
+			execute: async () => ({ content: [{ type: "text" as const, text: "edit applied" }] }),
+		};
+		const toolCall = (snippet: unknown): ToolCall => ({
+			type: "toolCall",
+			id: "call_reused_after_validation",
+			name: "mock_edit",
+			arguments: { snippet },
+		});
+		const toolMessage = (call: ToolCall): AssistantMessage => ({
+			role: "assistant",
+			content: [call],
+			api: "anthropic-messages",
+			provider: "anthropic",
+			model: "mock",
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "toolUse",
+			timestamp: Date.now(),
+		});
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [mockTool] },
+			streamFn: () => {
+				streamCallCount++;
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(() => {
+					if (streamCallCount === 1 || streamCallCount === 3) {
+						const call = toolCall(streamCallCount === 1 ? 7 : "value.unwrap()");
+						const partial = toolMessage(call);
+						stream.push({ type: "start", partial });
+						stream.push({ type: "toolcall_start", contentIndex: 0, partial });
+						stream.push({ type: "toolcall_delta", contentIndex: 0, delta: "value.unwrap()", partial });
+						stream.push({ type: "toolcall_end", contentIndex: 0, toolCall: call, partial });
+						stream.push({ type: "done", reason: "toolUse", message: partial });
+					} else {
+						const done = makeMsg("done");
+						stream.push({ type: "start", partial: done });
+						stream.push({ type: "done", reason: "stop", message: done });
+					}
+				});
+				return stream;
+			},
+		});
+		const sessionManager = SessionManager.inMemory(tempDir);
+		const settings = Settings.isolated();
+		const authStorage = await AuthStorage.create(path.join(tempDir, "testauth-validation-ttsr.db"));
+		authStorages.push(authStorage);
+		const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "models.yml"));
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		session = new AgentSession({ agent, sessionManager, settings, modelRegistry, ttsrManager });
+
+		await session.prompt("invalid call");
+		await session.prompt("valid retry");
+
+		const results = agent.state.messages.filter(
+			(message): message is Extract<typeof message, { role: "toolResult" }> =>
+				message.role === "toolResult" && message.toolCallId === "call_reused_after_validation",
+		);
+		const finalResult = results.at(-1);
+		const resultText = Array.isArray(finalResult?.content)
+			? finalResult.content
+					.filter((content): content is { type: "text"; text: string } => content.type === "text")
+					.map(content => content.text)
+					.join("\n")
+			: "";
+		expect(results).toHaveLength(2);
+		expect(resultText).toContain('rule="no-unwrap"');
+		expect(resultText).toContain("edit applied");
+	});
+
 	it("restores the repeat gate when per-tool TTSR persistence fails", async () => {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
 		let streamCallCount = 0;
