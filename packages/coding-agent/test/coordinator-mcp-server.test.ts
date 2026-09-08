@@ -1974,12 +1974,14 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 					endpointGeneration: 1,
 					pid: 101,
 					endpointMtimeMs: 1,
+					endpointFileId: "1:1",
 				},
 			],
 			undefined,
 			undefined,
 			{
 				platform: "win32",
+				preserveEndpointAuthority: true,
 				canonicalizePath: async value => path.win32.normalize(value === root ? canonicalWorkspace : value),
 			},
 		);
