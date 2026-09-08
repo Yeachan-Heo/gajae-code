@@ -6392,7 +6392,26 @@ export function readAuthorizedProjectSessionTranscript(
 	try {
 		const result = authority.readManaged(relativePath);
 		if (!result.ok && result.code === "unsupported_platform") {
+			const relativeParts = path.relative(projectGjcDir, path.dirname(candidate)).split(path.sep).filter(Boolean);
+			const parentPaths = [projectGjcDir];
+			for (const part of relativeParts) parentPaths.push(path.join(parentPaths[parentPaths.length - 1]!, part));
+			const parentIdentities = parentPaths.map(parentPath => {
+				const stat = fs.lstatSync(parentPath, { bigint: true });
+				if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("project transcript parent is unsafe");
+				return { path: parentPath, dev: stat.dev, ino: stat.ino, mode: stat.mode };
+			});
 			const captured = captureManagedFilePrefixNoFollow(candidate, maxBytes + 1);
+			for (const expected of parentIdentities) {
+				const stat = fs.lstatSync(expected.path, { bigint: true });
+				if (
+					!stat.isDirectory() ||
+					stat.isSymbolicLink() ||
+					stat.dev !== expected.dev ||
+					stat.ino !== expected.ino ||
+					stat.mode !== expected.mode
+				)
+					throw new Error("project transcript parent identity changed during read");
+			}
 			if (captured.identity.size > BigInt(maxBytes) || captured.bytes.byteLength > maxBytes) return undefined;
 			return Buffer.from(captured.bytes);
 		}

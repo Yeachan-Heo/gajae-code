@@ -1114,7 +1114,10 @@ function verifyCrystalSourceAgainstLive(
 	return source;
 }
 
-export async function assertDeepInterviewCrystalCoversLiveTranscript(cwd: string, sessionId: string): Promise<void> {
+export async function assertDeepInterviewCrystalCoversLiveTranscript(
+	cwd: string,
+	sessionId: string,
+): Promise<{ transcriptPath: string; transcriptSha256: string }> {
 	const statePath = deepInterviewStatePath(cwd, sessionId);
 	let parsed: unknown;
 	try {
@@ -1129,6 +1132,19 @@ export async function assertDeepInterviewCrystalCoversLiveTranscript(cwd: string
 	const source = verifyCrystalSourceAgainstLive(crystal, liveSnapshot);
 	if (source.end !== liveSnapshot.messages.length - 1)
 		throw new DeepInterviewCommandError(2, "execution approval requires re-crystallization after transcript changes");
+	const transcriptPath = process.env.GJC_SESSION_FILE;
+	if (!transcriptPath)
+		throw new DeepInterviewCommandError(2, "execution approval requires an explicit authenticated transcript path");
+	const bytes = await readBoundedFileBytes(
+		transcriptPath,
+		RESUME_TRANSCRIPT_MAX_BYTES,
+		"execution approval transcript",
+	);
+	if (!bytes) throw new DeepInterviewCommandError(2, "execution approval transcript is unavailable");
+	return {
+		transcriptPath: path.resolve(transcriptPath),
+		transcriptSha256: createHash("sha256").update(bytes).digest("hex"),
+	};
 }
 
 async function handleCrystallize(args: readonly string[], cwd: string): Promise<DeepInterviewCommandResult> {
