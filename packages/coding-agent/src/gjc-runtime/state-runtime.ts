@@ -2928,6 +2928,7 @@ async function verifiedRalplanFinalEvidence(
 	sessionId: string,
 	state: Record<string, unknown>,
 ): Promise<VerifiedRalplanFinalEvidence | undefined> {
+	if (isPlainObject(state.final_publication_pending)) return undefined;
 	const runId = typeof state.run_id === "string" ? state.run_id.trim() : "";
 	if (!runId) return undefined;
 	try {
