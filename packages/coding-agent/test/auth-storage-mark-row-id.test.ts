@@ -9,6 +9,7 @@ import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { Snowflake } from "@gajae-code/utils";
 
 const PROVIDER = "openai-codex";
+const realDateNow = Date.now;
 
 /**
  * `markUsageLimitReached` blocks the row named by `rowId` even when the
@@ -73,6 +74,7 @@ describe("AuthStorage.markUsageLimitReached with an explicit row id", () => {
 	});
 
 	afterEach(() => {
+		Date.now = realDateNow;
 		deferUsageFor = undefined;
 		usageEntered = undefined;
 		releaseUsage = undefined;
@@ -156,6 +158,70 @@ describe("AuthStorage.markUsageLimitReached with an explicit row id", () => {
 				preferredCredentialSelector: { kind: "email", value: "c@x.test" },
 			}),
 		).toBe("api-acct-b");
+	});
+
+	test("the pointer path marks nothing when a preceding row is removed during the lookup", async () => {
+		// Same window, no row id. The removal drops the provider's session pointers,
+		// so the captured index (2, once C) now names D. The mark must not block D.
+		await authStorage.set(PROVIDER, [
+			{
+				type: "oauth",
+				access: "a",
+				refresh: "ra",
+				expires: Date.now() + 3_600_000,
+				accountId: "acct-a",
+				email: "a@x.test",
+			},
+			{
+				type: "oauth",
+				access: "b",
+				refresh: "rb",
+				expires: Date.now() + 3_600_000,
+				accountId: "acct-b",
+				email: "b@x.test",
+			},
+			{
+				type: "oauth",
+				access: "c",
+				refresh: "rc",
+				expires: Date.now() + 3_600_000,
+				accountId: "acct-c",
+				email: "c@x.test",
+			},
+			{
+				type: "oauth",
+				access: "d",
+				refresh: "rd",
+				expires: Date.now() + 3_600_000,
+				accountId: "acct-d",
+				email: "d@x.test",
+			},
+		]);
+		authStorage.setRuntimePreferredCredentialSelector(PROVIDER, { kind: "email", value: "c@x.test" });
+		expect(await authStorage.getApiKey(PROVIDER, "session-6")).toBe("api-acct-c");
+		authStorage.removeRuntimePreferredCredentialSelector(PROVIDER);
+		const [targetA] = authStorage.listCredentialRemovalTargets(PROVIDER);
+		if (!targetA) throw new Error("expected a removal target");
+		// The resolution above cached C's usage report; age the cache past its TTL so
+		// the mark's lookup reaches the provider and can be parked.
+		Date.now = () => realDateNow() + 6 * 60_000;
+
+		deferUsageFor = "acct-c";
+		const entered = new Promise<void>(resolve => {
+			usageEntered = resolve;
+		});
+		const pending = authStorage.markUsageLimitReached(PROVIDER, "session-6", { retryAfterMs: 120_000 });
+		await entered;
+		expect(authStorage.removeAuthCredentialsHard(PROVIDER, [targetA]).kind).toBe("removed");
+		releaseUsage?.();
+
+		expect(await pending).toBe(false);
+		expect(authStorage.getEarliestUnblockAt(PROVIDER)).toBeUndefined();
+		expect(
+			await authStorage.getApiKey(PROVIDER, "session-7", {
+				preferredCredentialSelector: { kind: "email", value: "d@x.test" },
+			}),
+		).toBe("api-acct-d");
 	});
 
 	test("an unknown row id marks nothing", async () => {
