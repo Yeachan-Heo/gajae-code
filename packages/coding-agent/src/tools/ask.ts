@@ -35,7 +35,10 @@ import {
 } from "../deep-interview/render-middleware";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import { appendOrMergeDeepInterviewRound, syncDeepInterviewRecorderHud } from "../gjc-runtime/deep-interview-recorder";
-import { deepInterviewStatePath } from "../gjc-runtime/deep-interview-runtime";
+import {
+	assertDeepInterviewCrystalCoversLiveTranscript,
+	deepInterviewStatePath,
+} from "../gjc-runtime/deep-interview-runtime";
 import {
 	assertDeepInterviewInputWithinLimit,
 	assertDeepInterviewStructuredResponseWithinLimit,
@@ -892,6 +895,7 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 			return;
 		}
 		if (!sessionId) throw new ToolAbortError("Deep Interview execution approval requires a session");
+		if (deepInterviewExecution) await assertDeepInterviewCrystalCoversLiveTranscript(this.session.cwd, sessionId);
 		await recordDeepInterviewExecutionApproval({
 			cwd: this.session.cwd,
 			sessionId,
