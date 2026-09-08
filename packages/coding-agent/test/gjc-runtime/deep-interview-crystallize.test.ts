@@ -190,6 +190,33 @@ describe("deep-interview crystallize contract", () => {
 				}),
 			),
 		).toThrow("unrepresented user directive requires an item or unresolved gap: Deploy");
+		for (const content of ["Done: deploy production.", "Continue with the remaining goal and encrypt backups."]) {
+			const mixedMetaSnapshot: CrystalSnapshot = {
+				...shortSnapshot,
+				messages: [
+					{ index: 0, role: "user", content: "Build audit reports." },
+					{ index: 1, role: "user", content },
+				],
+				digest: "",
+			};
+			mixedMetaSnapshot.digest = crystalSnapshotDigest(mixedMetaSnapshot);
+			expect(() =>
+				crystallizeDeepInterview(
+					input({
+						snapshot: mixedMetaSnapshot,
+						items: [
+							{
+								id: "goal:audit",
+								kind: "goal",
+								classification: "confirmed",
+								statement: "Build audit reports",
+								anchor: { message_index: 0, quote: "Build audit reports." },
+							},
+						],
+					}),
+				),
+			).toThrow("unrepresented user directive");
+		}
 		const additiveSnapshot: CrystalSnapshot = {
 			revision: 1,
 			start: 0,
