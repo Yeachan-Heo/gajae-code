@@ -1481,6 +1481,7 @@ export function crystallizeDeepInterview(value: unknown): DeepInterviewCrystal {
 		const represented = currentItems.some(
 			item =>
 				[...directiveTerms].every(term => evidenceTerms(item.statement).has(term)) &&
+				preservesEvidenceOrder(item.statement, directive.clause) &&
 				sameSemanticIntent(semanticProfile(directive.clause), semanticProfile(item.statement)),
 		);
 		const explicitlySuperseded = canonicalPriorItems.some(previous => {
@@ -1528,6 +1529,21 @@ export function crystallizeDeepInterview(value: unknown): DeepInterviewCrystal {
 	}
 	if (!currentItems.some(item => item.classification === "confirmed" && item.kind !== "non_goal"))
 		throw new Error("crystallize requires a confirmed user requirement");
+	const confirmedItems = currentItems.filter(item => item.classification === "confirmed");
+	for (let leftIndex = 0; leftIndex < confirmedItems.length; leftIndex++) {
+		const left = confirmedItems[leftIndex]!;
+		const leftTerms = topicTerms(left.statement, false);
+		for (const right of confirmedItems.slice(leftIndex + 1)) {
+			const rightTerms = topicTerms(right.statement, false);
+			if (
+				leftTerms.size > 0 &&
+				leftTerms.size === rightTerms.size &&
+				[...leftTerms].every(term => rightTerms.has(term)) &&
+				semanticProfile(left.statement).negative !== semanticProfile(right.statement).negative
+			)
+				throw new Error(`contradictory confirmed items require an explicit conflict: ${left.id}, ${right.id}`);
+		}
+	}
 	const changed = currentItems
 		.filter(item => {
 			const previous = priorItems.get(item.id);
