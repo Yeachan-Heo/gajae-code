@@ -892,7 +892,7 @@ function requirementBearingClauses(snapshot: CrystalSnapshot): Array<{ messageIn
 				!clause ||
 				/^(?:what|why|how|when|where|who|which)\b/i.test(clause) ||
 				/\basked\b[^"“”]*["“”][^"“”]*(?:should|could|would|can|will)\b/i.test(clause) ||
-				/^(?:no further changes|nothing else|another question remains|the ambiguity remains open|continue (?:again|with the remaining goal)|yes|no|ok|okay|done|acknowledged|understood|got it|thanks|thank you)\b/i.test(
+				/^(?:no further changes|nothing else|another question remains|the ambiguity remains open|continue (?:again|with the remaining goal)|yes|no|ok|okay|done|acknowledged|understood|got it|thanks|thank you)$/i.test(
 					clause,
 				)
 			)
