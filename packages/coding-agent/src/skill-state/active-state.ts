@@ -676,10 +676,16 @@ async function mergeVisibleEntries(
 	// Per-skill files in active/<skill>.json are authoritative and are merged
 	// after the derived snapshot cache, so a stale skill-active-state.json row
 	// cannot override the latest entry file.
-	const entries = [
-		...rawActiveEntries(sessionState),
-		...(perSkillEntries ?? (await readActiveEntries(cwd, { sessionId }))),
-	];
+	const activeEntries = perSkillEntries ?? (await readActiveEntries(cwd, { sessionId }));
+	let hasAuthoritativeEntryDirectory = false;
+	try {
+		hasAuthoritativeEntryDirectory = (await fs.stat(activeStateDir(cwd, sessionId))).isDirectory();
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+	}
+	const entries = hasAuthoritativeEntryDirectory
+		? activeEntries
+		: [...rawActiveEntries(sessionState), ...activeEntries];
 	const merged = new Map(entries.map(entry => [entryKey(entry), entry]));
 	const canonicalRalplanPhase = await readModeStatePhase(cwd, sessionId, "ralplan");
 	const visibleEntries = dedupeVisibleBySkill([...merged.values()], sessionId)

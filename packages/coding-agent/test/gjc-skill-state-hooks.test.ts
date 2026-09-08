@@ -9,6 +9,7 @@ import { runNativeRalplanCommand } from "../src/gjc-runtime/ralplan-runtime";
 import {
 	activeEntryPath,
 	activeSnapshotPath,
+	activeStateDir,
 	modeStatePath,
 	sessionSpecsDir,
 	sessionStateDir,
@@ -476,6 +477,26 @@ describe("GJC native skill-state hooks", () => {
 		await fs.writeFile(path.join(stateDir, "skill-active-state.json"), JSON.stringify(state));
 
 		await expect(readVisibleSkillActiveState(root, "test-session")).resolves.toMatchObject(state);
+	});
+
+	it("does not resurrect a stale snapshot after authoritative entries are cleared", async () => {
+		const root = await cwd();
+		const sessionId = "test-cleared-authoritative-entries";
+		const stateDir = sessionStateDir(root, sessionId);
+		await fs.mkdir(activeStateDir(root, sessionId), { recursive: true });
+		await fs.writeFile(
+			path.join(stateDir, "skill-active-state.json"),
+			JSON.stringify({
+				version: 1,
+				active: true,
+				skill: "ultragoal",
+				active_skills: [{ skill: "ultragoal", active: true, phase: "executing", session_id: sessionId }],
+			}),
+		);
+
+		await expect(
+			activeStateModule.readVisibleSkillActiveState(root, sessionId, { bypassCache: true }),
+		).resolves.toBeNull();
 	});
 
 	it("fails open and logs when custom skill-active state is corrupt", async () => {
