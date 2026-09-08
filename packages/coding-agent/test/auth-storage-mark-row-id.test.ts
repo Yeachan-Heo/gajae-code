@@ -10,6 +10,27 @@ import { Snowflake } from "@gajae-code/utils";
 
 const PROVIDER = "openai-codex";
 const realDateNow = Date.now;
+let releaseUsage: (() => void) | undefined;
+/** Longer than the usage-report TTL plus its +25% jitter, so an aged cache entry is always expired. */
+const USAGE_CACHE_AGE_MS = 15 * 60_000;
+
+/** Fails fast with a named reason instead of the runner's silent 5 s timeout. */
+async function within<T>(promise: Promise<T>, ms: number, what: string): Promise<T> {
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	const timeout = new Promise<never>((_, reject) => {
+		timer = setTimeout(() => reject(new Error(`${what} did not happen within ${ms}ms`)), ms);
+	});
+	try {
+		return await Promise.race([promise, timeout]);
+	} finally {
+		if (timer) clearTimeout(timer);
+	}
+}
+
+function release(): void {
+	if (!releaseUsage) throw new Error("no parked usage lookup to release");
+	releaseUsage();
+}
 
 /**
  * `markUsageLimitReached` blocks the row named by `rowId` even when the
@@ -21,10 +42,9 @@ describe("AuthStorage.markUsageLimitReached with an explicit row id", () => {
 	let tempDir: string;
 	let authStorage: AuthStorage;
 
-	/** When set, the usage lookup for this account parks until `releaseUsage` runs. */
+	/** When set, the usage lookup for this account parks until `release()` runs. */
 	let deferUsageFor: string | undefined;
 	let usageEntered: (() => void) | undefined;
-	let releaseUsage: (() => void) | undefined;
 
 	const usageProvider: UsageProvider = {
 		id: PROVIDER,
@@ -145,11 +165,11 @@ describe("AuthStorage.markUsageLimitReached with an explicit row id", () => {
 			rowId: targetC.id,
 			retryAfterMs: 120_000,
 		});
-		await entered;
+		await within(entered, 2_000, "the parked usage lookup");
 
 		const removal = authStorage.removeAuthCredentialsHard(PROVIDER, [targetA]);
 		expect(removal.kind).toBe("removed");
-		releaseUsage?.();
+		release();
 
 		expect(await pending).toBe(true);
 		// C is blocked, so a session that prefers C lands on B; A no longer exists.
@@ -204,16 +224,16 @@ describe("AuthStorage.markUsageLimitReached with an explicit row id", () => {
 		if (!targetA) throw new Error("expected a removal target");
 		// The resolution above cached C's usage report; age the cache past its TTL so
 		// the mark's lookup reaches the provider and can be parked.
-		Date.now = () => realDateNow() + 6 * 60_000;
+		Date.now = () => realDateNow() + USAGE_CACHE_AGE_MS;
 
 		deferUsageFor = "acct-c";
 		const entered = new Promise<void>(resolve => {
 			usageEntered = resolve;
 		});
 		const pending = authStorage.markUsageLimitReached(PROVIDER, "session-6", { retryAfterMs: 120_000 });
-		await entered;
+		await within(entered, 2_000, "the parked usage lookup");
 		expect(authStorage.removeAuthCredentialsHard(PROVIDER, [targetA]).kind).toBe("removed");
-		releaseUsage?.();
+		release();
 
 		expect(await pending).toBe(false);
 		expect(authStorage.getEarliestUnblockAt(PROVIDER)).toBeUndefined();
