@@ -1225,6 +1225,27 @@ describe("gjc state handoff", () => {
 			);
 			expect(result.status).toBe(2);
 			expect(result.stderr).toContain("approval lineage");
+			await recordDeepInterviewExecutionApproval({
+				cwd,
+				sessionId: TEST_SESSION_ID,
+				questionId: "ralplan-final-approval",
+				gateId: "ralplan-final-approval",
+				target: "ultragoal",
+				selectedOptions: ["Approve execution via ultragoal"],
+				approvalStage: "ralplan",
+			});
+			const approved = await runNativeDeepInterviewCommand(["approve-execution", "--json"], cwd);
+			expect(approved.status, approved.stderr).toBe(0);
+			const readyForHandoff = await runNativeStateCommand(
+				["write", "--mode", "ralplan", "--input", JSON.stringify({ current_phase: "handoff" }), "--json"],
+				cwd,
+			);
+			expect(readyForHandoff.status, readyForHandoff.stderr).toBe(0);
+			const admitted = await runNativeStateCommand(
+				["handoff", "--mode", "ralplan", "--to", "ultragoal", "--json"],
+				cwd,
+			);
+			expect(admitted.status, admitted.stderr).toBe(0);
 		});
 	});
 
