@@ -35,6 +35,7 @@ import { renderCliWriteReceipt } from "./cli-write-receipt";
 import { applyAmbiguityFloorToEnvelope } from "./deep-interview-ambiguity";
 import { crystalMarkdown, crystalSnapshotDigest, type DeepInterviewCrystal } from "./deep-interview-crystallize";
 import {
+	answerHash,
 	assertDeepInterviewEnvelopeInputLimits,
 	assertDeepInterviewInputWithinLimit,
 	assertDeepInterviewIntentManifest,
@@ -1830,6 +1831,352 @@ function requireReadyCanonicalCrystal(value: unknown): Record<string, unknown> {
 	return value;
 }
 
+/**
+ * A user-origin execution choice is deliberately kept outside the workflow
+ * envelope.  The envelope is agent/runtime state and therefore cannot itself
+ * be evidence that a human selected the execution path.  This record is the
+ * short-lived bridge from the structured ask surface to the explicit
+ * `approve-execution` command.
+ */
+export const DEEP_INTERVIEW_EXECUTION_APPROVAL_RECORD_FILE = "deep-interview-execution-approval.json";
+export const DEEP_INTERVIEW_EXECUTION_APPROVAL_MAX_AGE_MS = 15 * 60 * 1000;
+const DEEP_INTERVIEW_EXECUTION_APPROVAL_RECORD_MAX_BYTES = 16 * 1024;
+const DEEP_INTERVIEW_EXECUTION_APPROVAL_ID_MAX_LENGTH = 256;
+
+export interface DeepInterviewExecutionApprovalRecord {
+	schema_version: 1;
+	status: "pending" | "consumed";
+	session_id: string;
+	target: "ultragoal";
+	state_path: string;
+	state_revision: number;
+	spec_path: string;
+	spec_sha256: string;
+	crystal_spec_version: number;
+	crystal_source_digest: string;
+	crystal_digest: string;
+	question_id: string;
+	gate_id: string;
+	answer_hash: string;
+	created_at: string;
+	expires_at: string;
+	consumed_at?: string;
+	consumed_mutation_id?: string;
+}
+
+export function deepInterviewExecutionApprovalRecordPath(cwd: string, sessionId: string): string {
+	return path.join(sessionStateDir(cwd, sessionId), DEEP_INTERVIEW_EXECUTION_APPROVAL_RECORD_FILE);
+}
+
+function isExecutionApprovalId(value: unknown): value is string {
+	return (
+		typeof value === "string" &&
+		value.trim().length > 0 &&
+		value.length <= DEEP_INTERVIEW_EXECUTION_APPROVAL_ID_MAX_LENGTH
+	);
+}
+
+function isSha256(value: unknown): value is string {
+	return typeof value === "string" && /^[a-f0-9]{64}$/.test(value);
+}
+
+function assertExecutionApprovalRecordShape(value: unknown): asserts value is DeepInterviewExecutionApprovalRecord {
+	if (!isPlainObject(value)) throw new StateCommandError(2, "deep-interview execution approval record is invalid");
+	const allowed = new Set([
+		"schema_version",
+		"status",
+		"session_id",
+		"target",
+		"state_path",
+		"state_revision",
+		"spec_path",
+		"spec_sha256",
+		"crystal_spec_version",
+		"crystal_source_digest",
+		"crystal_digest",
+		"question_id",
+		"gate_id",
+		"answer_hash",
+		"created_at",
+		"expires_at",
+		"consumed_at",
+		"consumed_mutation_id",
+	]);
+	if (Object.keys(value).some(key => !allowed.has(key)))
+		throw new StateCommandError(2, "deep-interview execution approval record is invalid");
+	if (
+		value.schema_version !== 1 ||
+		(value.status !== "pending" && value.status !== "consumed") ||
+		!isExecutionApprovalId(value.session_id) ||
+		value.target !== "ultragoal" ||
+		typeof value.state_path !== "string" ||
+		!path.isAbsolute(value.state_path) ||
+		!Number.isSafeInteger(value.state_revision) ||
+		(value.state_revision as number) < 0 ||
+		typeof value.spec_path !== "string" ||
+		!path.isAbsolute(value.spec_path) ||
+		!isSha256(value.spec_sha256) ||
+		!Number.isSafeInteger(value.crystal_spec_version) ||
+		(value.crystal_spec_version as number) < 1 ||
+		!isSha256(value.crystal_source_digest) ||
+		!isSha256(value.crystal_digest) ||
+		!isExecutionApprovalId(value.question_id) ||
+		!isExecutionApprovalId(value.gate_id) ||
+		!isSha256(value.answer_hash) ||
+		typeof value.created_at !== "string" ||
+		typeof value.expires_at !== "string"
+	)
+		throw new StateCommandError(2, "deep-interview execution approval record is invalid");
+	const createdAt = Date.parse(value.created_at);
+	const expiresAt = Date.parse(value.expires_at);
+	if (
+		!Number.isFinite(createdAt) ||
+		!Number.isFinite(expiresAt) ||
+		expiresAt <= createdAt ||
+		expiresAt - createdAt > DEEP_INTERVIEW_EXECUTION_APPROVAL_MAX_AGE_MS
+	)
+		throw new StateCommandError(2, "deep-interview execution approval record timestamp is invalid");
+	if (value.status === "pending") {
+		if (value.consumed_at !== undefined || value.consumed_mutation_id !== undefined)
+			throw new StateCommandError(2, "deep-interview execution approval record is invalid");
+	} else if (
+		typeof value.consumed_at !== "string" ||
+		!Number.isFinite(Date.parse(value.consumed_at)) ||
+		!isExecutionApprovalId(value.consumed_mutation_id)
+	) {
+		throw new StateCommandError(2, "deep-interview execution approval record is invalid");
+	}
+}
+
+async function readDeepInterviewExecutionApprovalRecord(
+	filePath: string,
+): Promise<DeepInterviewExecutionApprovalRecord | undefined> {
+	const raw = await readBoundedIdentityText(
+		filePath,
+		DEEP_INTERVIEW_EXECUTION_APPROVAL_RECORD_MAX_BYTES,
+		"deep-interview execution approval record",
+	);
+	if (raw === undefined) return undefined;
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(raw);
+	} catch {
+		throw new StateCommandError(2, "deep-interview execution approval record is invalid");
+	}
+	assertExecutionApprovalRecordShape(parsed);
+	return parsed;
+}
+
+async function assertExecutionApprovalSpecIdentity(record: DeepInterviewExecutionApprovalRecord): Promise<void> {
+	const content = await readBoundedIdentityText(
+		record.spec_path,
+		MAX_DEEP_INTERVIEW_STRUCTURED_RESPONSE_LENGTH,
+		"deep-interview execution approval spec",
+	);
+	if (content === undefined || createHash("sha256").update(content).digest("hex") !== record.spec_sha256)
+		throw new StateCommandError(2, "deep-interview execution approval spec identity mismatch");
+}
+
+async function writeDeepInterviewExecutionApprovalRecord(
+	cwd: string,
+	sessionId: string,
+	record: DeepInterviewExecutionApprovalRecord,
+): Promise<void> {
+	const recordPath = deepInterviewExecutionApprovalRecordPath(cwd, sessionId);
+	await writeArtifact(recordPath, `${JSON.stringify(record)}\n`, {
+		cwd,
+		audit: {
+			category: "artifact",
+			verb: "write",
+			owner: "gjc-runtime",
+			skill: "deep-interview",
+			sessionId,
+		},
+	});
+}
+
+function crystalCanonicalDigest(crystal: Record<string, unknown>): string {
+	return createHash("sha256")
+		.update(crystalMarkdown(crystal as unknown as DeepInterviewCrystal))
+		.digest("hex");
+}
+
+function assertExecutionApprovalRecordMatchesCurrentState(
+	record: DeepInterviewExecutionApprovalRecord,
+	options: {
+		sessionId: string;
+		statePath: string;
+		envelope: Record<string, unknown>;
+		crystal: Record<string, unknown>;
+		recordRevision?: number;
+		allowConsumed?: boolean;
+	},
+): void {
+	const now = Date.now();
+	const createdAt = Date.parse(record.created_at);
+	const expiresAt = Date.parse(record.expires_at);
+	if (
+		(record.status === "consumed" && !options.allowConsumed) ||
+		!Number.isFinite(createdAt) ||
+		!Number.isFinite(expiresAt) ||
+		(!options.allowConsumed && (createdAt > now + 30_000 || expiresAt <= now))
+	)
+		throw new StateCommandError(2, "deep-interview execution approval record is stale or consumed");
+	if (record.status === "consumed") {
+		const consumedAt = Date.parse(record.consumed_at ?? "");
+		if (!Number.isFinite(consumedAt) || consumedAt < createdAt || consumedAt > now + 30_000)
+			throw new StateCommandError(2, "deep-interview execution approval record provenance is invalid");
+	}
+	const expectedSpecPath =
+		typeof options.envelope.spec_path === "string" ? path.resolve(options.envelope.spec_path) : "";
+	const expectedSpecSha = typeof options.envelope.spec_sha256 === "string" ? options.envelope.spec_sha256 : "";
+	const revision = options.recordRevision ?? existingStateRevision(options.envelope);
+	if (
+		record.session_id !== options.sessionId ||
+		record.state_path !== path.resolve(options.statePath) ||
+		record.state_revision !== revision ||
+		record.spec_path !== expectedSpecPath ||
+		record.spec_sha256 !== expectedSpecSha ||
+		record.crystal_spec_version !== options.crystal.spec_version ||
+		record.crystal_source_digest !== (options.crystal.source as Record<string, unknown>).digest ||
+		record.crystal_digest !== crystalCanonicalDigest(options.crystal)
+	)
+		throw new StateCommandError(2, "deep-interview execution approval record does not match current Crystal");
+}
+
+export async function recordDeepInterviewExecutionApproval(options: {
+	cwd: string;
+	sessionId: string;
+	questionId: string;
+	gateId?: string;
+	target: string;
+	selectedOptions: readonly string[];
+	customInput?: string;
+}): Promise<{ path: string; record: DeepInterviewExecutionApprovalRecord }> {
+	if (options.target !== "ultragoal")
+		throw new StateCommandError(2, "deep-interview execution approval target must be ultragoal");
+	if (!isExecutionApprovalId(options.sessionId) || !isExecutionApprovalId(options.questionId))
+		throw new StateCommandError(2, "deep-interview execution approval descriptor is invalid");
+	if (
+		!Array.isArray(options.selectedOptions) ||
+		options.selectedOptions.length !== 1 ||
+		options.customInput !== undefined
+	)
+		throw new StateCommandError(2, "deep-interview execution approval answer is invalid");
+	const statePath = modeStateFile(options.cwd, "deep-interview", options.sessionId);
+	const recordPath = deepInterviewExecutionApprovalRecordPath(options.cwd, options.sessionId);
+	return withWorkflowStateLock(
+		statePath,
+		async () => {
+			const current = await readExistingStateForMutation(statePath);
+			if (current.kind !== "valid")
+				throw new StateCommandError(2, "deep-interview execution approval requires valid current state");
+			const envelope = normalizeDeepInterviewEnvelope(current.value) as Record<string, unknown>;
+			if (
+				envelope.version !== WORKFLOW_STATE_VERSION ||
+				envelope.active !== true ||
+				envelope.current_phase !== "handoff"
+			)
+				throw new StateCommandError(2, "deep-interview execution approval requires active handoff state");
+			const inner = isPlainObject(envelope.state) ? envelope.state : {};
+			const crystal = requireReadyCanonicalCrystal(inner.crystal);
+			if (inner.execution_approval === "approved")
+				throw new StateCommandError(2, "deep-interview execution approval is already consumed");
+			const publicationReceipt = isPlainObject(envelope.receipt) ? envelope.receipt : undefined;
+			const publicationChecksum = isPlainObject(publicationReceipt?.content_sha256)
+				? publicationReceipt.content_sha256
+				: undefined;
+			if (
+				publicationReceipt?.owner !== "gjc-runtime" ||
+				publicationReceipt.command !== "gjc deep-interview crystallize" ||
+				publicationChecksum?.algorithm !== "sha256" ||
+				!isSha256(publicationChecksum.value) ||
+				publicationChecksum.covered_path !== path.resolve(statePath)
+			)
+				throw new StateCommandError(2, "deep-interview execution approval requires a published Crystal");
+			const integrityWarning = await warnAndAuditOutOfBandIfNeeded(
+				options.cwd,
+				options.sessionId,
+				statePath,
+				"deep-interview",
+			);
+			if (integrityWarning)
+				throw new StateCommandError(2, `${integrityWarning}; execution approval refuses tampered mode-state`);
+			await assertDeepInterviewHandoffReady(envelope, {
+				cwd: options.cwd,
+				sessionId: options.sessionId,
+				statePath,
+			});
+			const specPath = typeof envelope.spec_path === "string" ? path.resolve(envelope.spec_path) : "";
+			const specContent = await readBoundedIdentityText(
+				specPath,
+				MAX_DEEP_INTERVIEW_STRUCTURED_RESPONSE_LENGTH,
+				"canonical Crystal spec",
+			);
+			if (specContent === undefined || specContent !== crystalMarkdown(crystal as unknown as DeepInterviewCrystal))
+				throw new StateCommandError(
+					2,
+					"deep-interview execution approval requires canonical Crystal spec identity",
+				);
+			const currentRevision = existingStateRevision(envelope);
+			if (typeof currentRevision !== "number" || !Number.isSafeInteger(currentRevision) || currentRevision < 0)
+				throw new StateCommandError(2, "deep-interview execution approval requires a valid state revision");
+			const gateId = options.gateId ?? options.questionId;
+			if (!isExecutionApprovalId(gateId))
+				throw new StateCommandError(2, "deep-interview execution approval descriptor is invalid");
+			const now = nowIso();
+			const record: DeepInterviewExecutionApprovalRecord = {
+				schema_version: 1,
+				status: "pending",
+				session_id: options.sessionId,
+				target: "ultragoal",
+				state_path: path.resolve(statePath),
+				state_revision: currentRevision,
+				spec_path: specPath,
+				spec_sha256: createHash("sha256").update(specContent).digest("hex"),
+				crystal_spec_version: crystal.spec_version as number,
+				crystal_source_digest: (crystal.source as Record<string, unknown>).digest as string,
+				crystal_digest: crystalCanonicalDigest(crystal),
+				question_id: options.questionId,
+				gate_id: gateId,
+				answer_hash: answerHash([...options.selectedOptions], options.customInput),
+				created_at: now,
+				expires_at: new Date(Date.parse(now) + DEEP_INTERVIEW_EXECUTION_APPROVAL_MAX_AGE_MS).toISOString(),
+			};
+			return withWorkflowStateLock(
+				recordPath,
+				async () => {
+					const existing = await readDeepInterviewExecutionApprovalRecord(recordPath);
+					if (existing?.status === "consumed")
+						throw new StateCommandError(2, "deep-interview execution approval record is already consumed");
+					if (existing) {
+						await assertExecutionApprovalSpecIdentity(existing);
+						assertExecutionApprovalRecordMatchesCurrentState(existing, {
+							sessionId: options.sessionId,
+							statePath,
+							envelope,
+							crystal,
+							allowConsumed: false,
+						});
+						if (
+							existing.status === "pending" &&
+							existing.question_id === record.question_id &&
+							existing.gate_id === record.gate_id &&
+							existing.answer_hash === record.answer_hash &&
+							existing.target === record.target
+						)
+							return { path: recordPath, record: existing };
+					}
+					await writeDeepInterviewExecutionApprovalRecord(options.cwd, options.sessionId, record);
+					return { path: recordPath, record };
+				},
+				{ cwd: options.cwd },
+			);
+		},
+		{ cwd: options.cwd },
+	);
+}
+
 function sameBoundedFileIdentity(left: nodeFs.BigIntStats, right: nodeFs.BigIntStats): boolean {
 	return (
 		left.dev === right.dev &&
@@ -3480,6 +3827,11 @@ interface ExecutionApprovalAuditOptions {
 	cwd: string;
 	sessionId: string;
 	statePath: string;
+	approvalRecordPath?: string;
+	questionId?: string;
+	gateId?: string;
+	target?: "ultragoal";
+	answerHash?: string;
 	approvedAt: string;
 	mutationId: string;
 	revision: number;
@@ -3500,6 +3852,11 @@ function buildExecutionApprovalAuditEntry(
 		to_phase: "handoff",
 		forced: false,
 		paths: [options.statePath],
+		...(options.approvalRecordPath ? { approval_record_path: options.approvalRecordPath } : {}),
+		...(options.questionId ? { question_id: options.questionId } : {}),
+		...(options.gateId ? { gate_id: options.gateId } : {}),
+		...(options.target ? { target: options.target } : {}),
+		...(options.answerHash ? { answer_hash: options.answerHash } : {}),
 		approved_at: options.approvedAt,
 		state_path: options.statePath,
 		state_revision: options.revision,
@@ -3636,6 +3993,21 @@ async function appendExecutionApprovalAudit(
 async function handleApproveExecutionUnlocked(cwd: string, selectors: ResolvedSelectors): Promise<StateCommandResult> {
 	if (selectors.mode !== "deep-interview")
 		throw new StateCommandError(2, "approve-execution requires --mode deep-interview");
+	const approvalRecordPath = deepInterviewExecutionApprovalRecordPath(cwd, selectors.gjcSessionId);
+	return withWorkflowStateLock(
+		approvalRecordPath,
+		() => handleApproveExecutionRecordLocked(cwd, selectors, approvalRecordPath),
+		{ cwd },
+	);
+}
+
+async function handleApproveExecutionRecordLocked(
+	cwd: string,
+	selectors: ResolvedSelectors,
+	approvalRecordPath: string,
+): Promise<StateCommandResult> {
+	if (selectors.mode !== "deep-interview")
+		throw new StateCommandError(2, "approve-execution requires --mode deep-interview");
 	const statePath = modeStateFile(cwd, "deep-interview", selectors.gjcSessionId);
 	const current = await readExistingStateForMutation(statePath);
 	if (current.kind !== "valid")
@@ -3689,139 +4061,127 @@ async function handleApproveExecutionUnlocked(cwd: string, selectors: ResolvedSe
 	if (inner.execution_approval === "approved") {
 		if (existingReceipt?.schema_version !== 1 || existingReceipt.method !== "explicit-state-action")
 			throw new StateCommandError(2, "deep-interview execution approval lacks explicit provenance");
-		try {
-			await assertDeepInterviewHandoffReady(envelope, {
-				cwd,
-				sessionId: selectors.gjcSessionId,
-				statePath,
-				requireExecutionApproval: true,
-			});
-		} catch (error) {
-			if (!(error instanceof StateCommandError) || !error.message.includes("sanctioned approval audit record"))
-				throw error;
-			const persistedReceipt = persistedWorkflowReceipt(envelope.receipt, "deep-interview");
-			const persistedRevision = existingStateRevision(envelope);
-			const pendingJournal =
-				typeof existingReceipt.mutation_id === "string"
-					? await readWorkflowTransactionJournal(cwd, selectors.gjcSessionId, existingReceipt.mutation_id)
-					: undefined;
-			const expectedJournalPaths = [resolvedStatePath, auditPath(cwd, selectors.gjcSessionId)].map(value =>
-				path.resolve(value),
-			);
-			if (
-				!persistedReceipt ||
-				typeof persistedRevision !== "number" ||
-				persistedRevision !== existingReceipt.state_revision ||
-				persistedReceipt.mutation_id !== existingReceipt.mutation_id ||
-				persistedReceipt.mutated_at !== existingReceipt.approved_at ||
-				pendingJournal?.status !== "pending" ||
-				pendingJournal.mutation_id !== existingReceipt.mutation_id ||
-				(pendingJournal.steps.length !== 0 &&
-					(pendingJournal.steps.length !== 1 || pendingJournal.steps[0] !== "approval-state")) ||
-				pendingJournal.paths.length !== expectedJournalPaths.length ||
-				pendingJournal.paths.some((value, index) => path.resolve(value) !== expectedJournalPaths[index])
-			)
-				throw error;
-			const recoveryAuditOptions: ExecutionApprovalAuditOptions = {
-				cwd,
-				sessionId: selectors.gjcSessionId,
-				statePath: resolvedStatePath,
-				approvedAt: existingReceipt.approved_at as string,
-				mutationId: existingReceipt.mutation_id as string,
-				revision: persistedRevision,
-				receipt: persistedReceipt,
+		if (typeof existingReceipt.mutation_id !== "string")
+			throw new StateCommandError(2, "deep-interview execution approval lacks explicit provenance");
+	}
+	const approvalRecord = await readDeepInterviewExecutionApprovalRecord(approvalRecordPath);
+	if (!approvalRecord)
+		throw new StateCommandError(2, "approve-execution requires a user-origin execution approval record");
+	await assertExecutionApprovalSpecIdentity(approvalRecord);
+	assertExecutionApprovalRecordMatchesCurrentState(approvalRecord, {
+		sessionId: selectors.gjcSessionId,
+		statePath,
+		envelope,
+		crystal,
+		recordRevision: inner.execution_approval === "approved" ? currentRevision - 1 : currentRevision,
+		allowConsumed: inner.execution_approval === "approved",
+	});
+	if (inner.execution_approval !== "approved" && approvalRecord.status !== "pending")
+		throw new StateCommandError(2, "approve-execution requires an unconsumed execution approval record");
+	if (inner.execution_approval === "approved") {
+		if (
+			!existingReceipt ||
+			typeof existingReceipt.mutation_id !== "string" ||
+			typeof existingReceipt.approved_at !== "string" ||
+			typeof existingReceipt.state_revision !== "number"
+		)
+			throw new StateCommandError(2, "deep-interview execution approval lacks explicit provenance");
+		if (
+			approvalRecord.status === "consumed" &&
+			(approvalRecord.consumed_mutation_id !== existingReceipt.mutation_id ||
+				approvalRecord.consumed_at !== existingReceipt.approved_at)
+		)
+			throw new StateCommandError(2, "deep-interview execution approval record provenance mismatch");
+		const pendingJournal = await readWorkflowTransactionJournal(
+			cwd,
+			selectors.gjcSessionId,
+			existingReceipt.mutation_id,
+		);
+		if (pendingJournal?.status !== "pending")
+			throw new StateCommandError(2, "deep-interview execution approval record is already consumed");
+		const persistedReceipt = persistedWorkflowReceipt(envelope.receipt, "deep-interview");
+		const persistedRevision = existingStateRevision(envelope);
+		const expectedJournalPaths = [
+			resolvedStatePath,
+			path.resolve(approvalRecordPath),
+			auditPath(cwd, selectors.gjcSessionId),
+		].map(value => path.resolve(value));
+		if (
+			!persistedReceipt ||
+			typeof persistedRevision !== "number" ||
+			persistedRevision !== existingReceipt.state_revision ||
+			persistedReceipt.mutation_id !== existingReceipt.mutation_id ||
+			persistedReceipt.mutated_at !== existingReceipt.approved_at ||
+			pendingJournal.mutation_id !== existingReceipt.mutation_id ||
+			pendingJournal.paths.length !== expectedJournalPaths.length ||
+			pendingJournal.paths.some((value, index) => path.resolve(value) !== expectedJournalPaths[index])
+		)
+			throw new StateCommandError(2, "pending execution approval recovery journal identity mismatch");
+		const recoverySteps = new Set(pendingJournal.steps);
+		if (approvalRecord.status === "pending") {
+			const consumedRecord: DeepInterviewExecutionApprovalRecord = {
+				...approvalRecord,
+				status: "consumed",
+				consumed_at: existingReceipt.approved_at as string,
+				consumed_mutation_id: existingReceipt.mutation_id,
 			};
-			await appendExecutionApprovalAudit(recoveryAuditOptions, {
-				afterIndex: () =>
-					updateWorkflowTransactionJournal(cwd, selectors.gjcSessionId, existingReceipt.mutation_id as string, {
-						steps: ["approval-state", "approval-index"],
-					}),
-				beforeAudit: offset =>
-					updateWorkflowTransactionJournal(cwd, selectors.gjcSessionId, existingReceipt.mutation_id as string, {
-						steps: ["approval-state", "approval-index"],
+			await writeDeepInterviewExecutionApprovalRecord(cwd, selectors.gjcSessionId, consumedRecord);
+			recoverySteps.add("approval-record");
+		}
+		const approvalOptions: ExecutionApprovalAuditOptions = {
+			cwd,
+			sessionId: selectors.gjcSessionId,
+			statePath: resolvedStatePath,
+			approvalRecordPath: path.resolve(approvalRecordPath),
+			questionId: approvalRecord.question_id,
+			gateId: approvalRecord.gate_id,
+			target: approvalRecord.target,
+			answerHash: approvalRecord.answer_hash,
+			approvedAt: existingReceipt.approved_at as string,
+			mutationId: existingReceipt.mutation_id,
+			revision: persistedRevision,
+			receipt: persistedReceipt,
+		};
+		const indexed = await readBoundedIdentityText(
+			path.join(sessionStateDir(cwd, selectors.gjcSessionId), "deep-interview-approval-audit.json"),
+			64 * 1024,
+			"deep-interview execution approval index",
+		);
+		const expectedApprovalEntry = buildExecutionApprovalAuditEntry(approvalOptions);
+		let indexedMatches = false;
+		if (indexed) {
+			try {
+				const parsed: unknown = JSON.parse(indexed);
+				indexedMatches = isPlainObject(parsed) && JSON.stringify(parsed) === JSON.stringify(expectedApprovalEntry);
+			} catch {}
+		}
+		if (!indexedMatches) await writeExecutionApprovalIndex(approvalOptions, expectedApprovalEntry);
+		recoverySteps.add("approval-index");
+		let approvalAuditOffset = pendingJournal.approval_audit_offset;
+		if (!recoverySteps.has("approval-audit")) {
+			approvalAuditOffset = await appendExecutionApprovalAuditIdempotent(
+				approvalOptions,
+				expectedApprovalEntry,
+				approvalAuditOffset,
+				offset =>
+					updateWorkflowTransactionJournal(cwd, selectors.gjcSessionId, approvalOptions.mutationId, {
+						steps: [...recoverySteps],
 						approval_audit_offset: offset,
 					}),
-				afterAudit: () =>
-					updateWorkflowTransactionJournal(cwd, selectors.gjcSessionId, existingReceipt.mutation_id as string, {
-						steps: ["approval-state", "approval-index", "approval-audit"],
-					}),
-			});
-			await completeWorkflowTransactionJournal(cwd, selectors.gjcSessionId, existingReceipt.mutation_id as string);
-			await assertDeepInterviewHandoffReady(envelope, {
-				cwd,
-				sessionId: selectors.gjcSessionId,
-				statePath,
-				requireExecutionApproval: true,
-			});
-		}
-		if (typeof existingReceipt.mutation_id === "string") {
-			const pendingJournal = await readWorkflowTransactionJournal(
-				cwd,
-				selectors.gjcSessionId,
-				existingReceipt.mutation_id,
 			);
-			if (pendingJournal?.status === "pending") {
-				const persistedReceipt = persistedWorkflowReceipt(envelope.receipt, "deep-interview");
-				const persistedRevision = existingStateRevision(envelope);
-				const expectedJournalPaths = [resolvedStatePath, auditPath(cwd, selectors.gjcSessionId)].map(value =>
-					path.resolve(value),
-				);
-				if (
-					!persistedReceipt ||
-					typeof persistedRevision !== "number" ||
-					persistedRevision !== existingReceipt.state_revision ||
-					persistedReceipt.mutation_id !== existingReceipt.mutation_id ||
-					persistedReceipt.mutated_at !== existingReceipt.approved_at ||
-					pendingJournal.paths.length !== expectedJournalPaths.length ||
-					pendingJournal.paths.some((value, index) => path.resolve(value) !== expectedJournalPaths[index])
-				)
-					throw new StateCommandError(2, "pending execution approval recovery journal identity mismatch");
-				const approvalOptions: ExecutionApprovalAuditOptions = {
-					cwd,
-					sessionId: selectors.gjcSessionId,
-					statePath: resolvedStatePath,
-					approvedAt: existingReceipt.approved_at as string,
-					mutationId: existingReceipt.mutation_id,
-					revision: persistedRevision,
-					receipt: persistedReceipt,
-				};
-				const indexed = await readBoundedIdentityText(
-					path.join(sessionStateDir(cwd, selectors.gjcSessionId), "deep-interview-approval-audit.json"),
-					64 * 1024,
-					"deep-interview execution approval index",
-				);
-				const expectedApprovalEntry = buildExecutionApprovalAuditEntry(approvalOptions);
-				let indexedMatches = false;
-				if (indexed) {
-					try {
-						const parsed: unknown = JSON.parse(indexed);
-						indexedMatches =
-							isPlainObject(parsed) && JSON.stringify(parsed) === JSON.stringify(expectedApprovalEntry);
-					} catch {}
-				}
-				if (!indexedMatches) await writeExecutionApprovalIndex(approvalOptions, expectedApprovalEntry);
-				const recoverySteps = new Set([...pendingJournal.steps, "approval-index"]);
-				let approvalAuditOffset = pendingJournal.approval_audit_offset;
-				if (!recoverySteps.has("approval-audit")) {
-					approvalAuditOffset = await appendExecutionApprovalAuditIdempotent(
-						approvalOptions,
-						expectedApprovalEntry,
-						approvalAuditOffset,
-						offset =>
-							updateWorkflowTransactionJournal(cwd, selectors.gjcSessionId, approvalOptions.mutationId, {
-								steps: [...recoverySteps],
-								approval_audit_offset: offset,
-							}),
-					);
-					recoverySteps.add("approval-audit");
-				}
-				await updateWorkflowTransactionJournal(cwd, selectors.gjcSessionId, existingReceipt.mutation_id, {
-					steps: [...recoverySteps],
-					approval_audit_offset: approvalAuditOffset,
-				});
-				await completeWorkflowTransactionJournal(cwd, selectors.gjcSessionId, existingReceipt.mutation_id);
-			}
+			recoverySteps.add("approval-audit");
 		}
+		await updateWorkflowTransactionJournal(cwd, selectors.gjcSessionId, existingReceipt.mutation_id, {
+			steps: [...recoverySteps],
+			approval_audit_offset: approvalAuditOffset,
+		});
+		await completeWorkflowTransactionJournal(cwd, selectors.gjcSessionId, existingReceipt.mutation_id);
+		await assertDeepInterviewHandoffReady(envelope, {
+			cwd,
+			sessionId: selectors.gjcSessionId,
+			statePath,
+			requireExecutionApproval: true,
+		});
 		return {
 			status: 0,
 			stdout: `${JSON.stringify({ skill: "deep-interview", execution_approval: "approved", state_path: statePath })}\n`,
@@ -3838,6 +4198,11 @@ async function handleApproveExecutionUnlocked(cwd: string, selectors: ResolvedSe
 		spec_sha256: envelope.spec_sha256,
 		crystal_spec_version: crystal.spec_version,
 		crystal_source_digest: (crystal.source as Record<string, unknown>).digest,
+		approval_record_path: path.resolve(approvalRecordPath),
+		question_id: approvalRecord.question_id,
+		gate_id: approvalRecord.gate_id,
+		answer_hash: approvalRecord.answer_hash,
+		target: approvalRecord.target,
 	};
 	envelope.state = inner;
 	envelope.updated_at = approvedAt;
@@ -3846,7 +4211,7 @@ async function handleApproveExecutionUnlocked(cwd: string, selectors: ResolvedSe
 		sessionId: selectors.gjcSessionId,
 		mutationId,
 		caller: "deep-interview",
-		paths: [resolvedStatePath, auditPath(cwd, selectors.gjcSessionId)],
+		paths: [resolvedStatePath, path.resolve(approvalRecordPath), auditPath(cwd, selectors.gjcSessionId)],
 	});
 	const writeResult = await writeGuardedWorkflowEnvelopeAtomic(statePath, envelope, {
 		cwd,
@@ -3885,10 +4250,25 @@ async function handleApproveExecutionUnlocked(cwd: string, selectors: ResolvedSe
 	await updateWorkflowTransactionJournal(cwd, selectors.gjcSessionId, mutationId, {
 		steps: ["approval-state"],
 	});
+	const consumedApprovalRecord: DeepInterviewExecutionApprovalRecord = {
+		...approvalRecord,
+		status: "consumed",
+		consumed_at: approvedAt,
+		consumed_mutation_id: mutationId,
+	};
+	await writeDeepInterviewExecutionApprovalRecord(cwd, selectors.gjcSessionId, consumedApprovalRecord);
+	await updateWorkflowTransactionJournal(cwd, selectors.gjcSessionId, mutationId, {
+		steps: ["approval-state", "approval-record"],
+	});
 	const approvalAuditOptions: ExecutionApprovalAuditOptions = {
 		cwd,
 		sessionId: selectors.gjcSessionId,
 		statePath: resolvedStatePath,
+		approvalRecordPath: path.resolve(approvalRecordPath),
+		questionId: approvalRecord.question_id,
+		gateId: approvalRecord.gate_id,
+		target: approvalRecord.target,
+		answerHash: approvalRecord.answer_hash,
 		approvedAt,
 		mutationId,
 		revision: writeResult.revision,
@@ -3897,16 +4277,16 @@ async function handleApproveExecutionUnlocked(cwd: string, selectors: ResolvedSe
 	await appendExecutionApprovalAudit(approvalAuditOptions, {
 		afterIndex: () =>
 			updateWorkflowTransactionJournal(cwd, selectors.gjcSessionId, mutationId, {
-				steps: ["approval-state", "approval-index"],
+				steps: ["approval-state", "approval-record", "approval-index"],
 			}),
 		beforeAudit: offset =>
 			updateWorkflowTransactionJournal(cwd, selectors.gjcSessionId, mutationId, {
-				steps: ["approval-state", "approval-index"],
+				steps: ["approval-state", "approval-record", "approval-index"],
 				approval_audit_offset: offset,
 			}),
 		afterAudit: () =>
 			updateWorkflowTransactionJournal(cwd, selectors.gjcSessionId, mutationId, {
-				steps: ["approval-state", "approval-index", "approval-audit"],
+				steps: ["approval-state", "approval-record", "approval-index", "approval-audit"],
 			}),
 	});
 	await completeWorkflowTransactionJournal(cwd, selectors.gjcSessionId, mutationId);

@@ -23,7 +23,9 @@ import {
 } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
 import { migrateAndPersistLegacyState } from "../../src/gjc-runtime/state-migrations";
 import {
+	deepInterviewExecutionApprovalRecordPath,
 	reconcileWorkflowSkillState,
+	recordDeepInterviewExecutionApproval,
 	runNativeStateCommand,
 	type StateCommandResult,
 } from "../../src/gjc-runtime/state-runtime";
@@ -73,7 +75,10 @@ function readyCrystal(): DeepInterviewCrystal {
 	};
 }
 
-async function writePublishedReadyCrystal(cwd: string): Promise<{ callerPath: string; specPath: string }> {
+async function writePublishedReadyCrystal(
+	cwd: string,
+	options: { recordApproval?: boolean } = {},
+): Promise<{ callerPath: string; specPath: string }> {
 	const crystal = readyCrystal();
 	const content = crystalMarkdown(crystal);
 	const specsDir = sessionSpecsDir(cwd, TEST_SESSION_ID);
@@ -101,6 +106,7 @@ async function writePublishedReadyCrystal(cwd: string): Promise<{ callerPath: st
 		callerPath,
 	);
 	await writeJson(callerPath, published);
+	if (options.recordApproval !== false) await recordExecutionApproval(cwd);
 	return { callerPath, specPath };
 }
 
@@ -196,6 +202,17 @@ async function readJson(filePath: string): Promise<Record<string, unknown> | nul
 	}
 }
 
+async function recordExecutionApproval(cwd: string, questionId = "execution-approval"): Promise<void> {
+	await recordDeepInterviewExecutionApproval({
+		cwd,
+		sessionId: TEST_SESSION_ID,
+		questionId,
+		gateId: questionId,
+		target: "ultragoal",
+		selectedOptions: ["Approve execution via ultragoal"],
+	});
+}
+
 describe("gjc state handoff", () => {
 	it("transitions caller -> callee atomically across mode-state and active-state", async () => {
 		await withTempCwd(async cwd => {
@@ -252,6 +269,13 @@ describe("gjc state handoff", () => {
 	it("records ready-Crystal execution approval only through a separate explicit action", async () => {
 		await withTempCwd(async cwd => {
 			const { callerPath } = await writePublishedReadyCrystal(cwd);
+			await recordExecutionApproval(cwd);
+			const approvalRecord = await fs.readFile(
+				deepInterviewExecutionApprovalRecordPath(cwd, TEST_SESSION_ID),
+				"utf8",
+			);
+			expect(approvalRecord).not.toContain("Approve execution via ultragoal");
+			expect(JSON.parse(approvalRecord).answer_hash).toMatch(/^[a-f0-9]{64}$/);
 			const approval = await runNativeDeepInterviewCommand(["approve-execution", "--json"], cwd);
 			expect(approval.status).toBe(0);
 			const after = (await readJson(callerPath)) as Record<string, unknown>;
@@ -259,12 +283,45 @@ describe("gjc state handoff", () => {
 			expect((after.state as Record<string, unknown>).execution_approval_receipt).toMatchObject({
 				method: "explicit-state-action",
 			});
+			const reused = await runNativeDeepInterviewCommand(["approve-execution", "--json"], cwd);
+			expect(reused.status).toBe(2);
+			expect(reused.stderr).toContain("already consumed");
 			const handoff = await runNativeStateCommand(
 				["handoff", "--mode", "deep-interview", "--to", "ultragoal", "--json"],
 				cwd,
 			);
 			expect(handoff.status).toBe(0);
 		});
+	});
+	it("rejects direct execution approval without a structured user-origin record", async () => {
+		await withTempCwd(async cwd => {
+			const { callerPath } = await writePublishedReadyCrystal(cwd, { recordApproval: false });
+			const before = await fs.readFile(callerPath, "utf8");
+			const approval = await runNativeDeepInterviewCommand(["approve-execution", "--json"], cwd);
+			expect(approval.status).toBe(2);
+			expect(approval.stderr).toContain("user-origin execution approval record");
+			expect(await fs.readFile(callerPath, "utf8")).toBe(before);
+			await expect(fs.access(deepInterviewExecutionApprovalRecordPath(cwd, TEST_SESSION_ID))).rejects.toThrow();
+		});
+	});
+	it("rejects wrong-target, stale, and replaced execution approval records", async () => {
+		for (const mutation of ["wrong-target", "stale-revision", "symlink"] as const) {
+			await withTempCwd(async cwd => {
+				await writePublishedReadyCrystal(cwd);
+				const recordPath = deepInterviewExecutionApprovalRecordPath(cwd, TEST_SESSION_ID);
+				const record = (await readJson(recordPath)) as Record<string, unknown>;
+				if (mutation === "wrong-target") record.target = "ralplan";
+				if (mutation === "stale-revision") record.state_revision = (record.state_revision as number) + 1;
+				if (mutation === "symlink") {
+					const external = path.join(cwd, "external-approval.json");
+					await writeJson(external, record);
+					await fs.rm(recordPath);
+					await fs.symlink(external, recordPath);
+				} else await writeJson(recordPath, record);
+				const approval = await runNativeDeepInterviewCommand(["approve-execution", "--json"], cwd);
+				expect(approval.status).toBe(2);
+			});
+		}
 	});
 	it("rejects execution approval when no canonical ready Crystal exists", async () => {
 		await withTempCwd(async cwd => {
@@ -508,6 +565,7 @@ describe("gjc state handoff", () => {
 	it("rejects execution handoff after approved Crystal state is tampered", async () => {
 		await withTempCwd(async cwd => {
 			const { callerPath } = await writePublishedReadyCrystal(cwd);
+			await recordExecutionApproval(cwd);
 			const approval = await runNativeDeepInterviewCommand(["approve-execution", "--json"], cwd);
 			expect(approval.status).toBe(0);
 			const tampered = (await readJson(callerPath)) as Record<string, unknown>;
@@ -527,6 +585,7 @@ describe("gjc state handoff", () => {
 	it("rejects attempts to rewrite approved Crystal lifecycle before execution handoff", async () => {
 		await withTempCwd(async cwd => {
 			const { callerPath } = await writePublishedReadyCrystal(cwd);
+			await recordExecutionApproval(cwd);
 			const approval = await runNativeDeepInterviewCommand(["approve-execution", "--json"], cwd);
 			expect(approval.status).toBe(0);
 			const before = await fs.readFile(callerPath, "utf-8");
@@ -1000,6 +1059,7 @@ describe("gjc state handoff", () => {
 	it("recovers an approved ultragoal handoff after caller persistence", async () => {
 		await withTempCwd(async cwd => {
 			const { callerPath } = await writePublishedReadyCrystal(cwd);
+			await recordExecutionApproval(cwd);
 			const approval = await runNativeDeepInterviewCommand(["approve-execution", "--json"], cwd);
 			expect(approval.status).toBe(0);
 			const handoffAt = "2026-09-04T00:00:00.000Z";
@@ -1033,6 +1093,7 @@ describe("gjc state handoff", () => {
 	it("records recovered approved D-to-R provenance for a later R-to-U handoff", async () => {
 		await withTempCwd(async cwd => {
 			await writePublishedReadyCrystal(cwd);
+			await recordExecutionApproval(cwd);
 			expect((await runNativeDeepInterviewCommand(["approve-execution", "--json"], cwd)).status).toBe(0);
 			const handoffAt = "2026-09-04T00:00:00.000Z";
 			const mutationId = `deep-interview:handoff:ralplan:${handoffAt}`;
@@ -1746,7 +1807,7 @@ describe("gjc state handoff", () => {
 
 	it("rejects a restamped approved Crystal without the sanctioned approval audit record", async () => {
 		await withTempCwd(async cwd => {
-			const { callerPath } = await writePublishedReadyCrystal(cwd);
+			const { callerPath } = await writePublishedReadyCrystal(cwd, { recordApproval: false });
 			const forged = (await readJson(callerPath)) as Record<string, unknown>;
 			const inner = forged.state as Record<string, unknown>;
 			const crystal = inner.crystal as DeepInterviewCrystal;
@@ -1777,6 +1838,7 @@ describe("gjc state handoff", () => {
 	it("finds execution approval in a bounded tail of a large audit ledger", async () => {
 		await withTempCwd(async cwd => {
 			await writePublishedReadyCrystal(cwd);
+			await recordExecutionApproval(cwd);
 			expect((await runNativeDeepInterviewCommand(["approve-execution", "--json"], cwd)).status).toBe(0);
 			const ledgerPath = auditPath(cwd, TEST_SESSION_ID);
 			await fs.appendFile(ledgerPath, `${"x".repeat(2 * 1024 * 1024)}\n`);
@@ -1799,6 +1861,7 @@ describe("gjc state handoff", () => {
 	it("rejects a symlinked oversized execution approval index", async () => {
 		await withTempCwd(async cwd => {
 			await writePublishedReadyCrystal(cwd);
+			await recordExecutionApproval(cwd);
 			expect((await runNativeDeepInterviewCommand(["approve-execution", "--json"], cwd)).status).toBe(0);
 			const indexPath = path.join(sessionStateDir(cwd, TEST_SESSION_ID), "deep-interview-approval-audit.json");
 			const oversizedPath = path.join(cwd, "oversized-approval.json");
@@ -1817,6 +1880,7 @@ describe("gjc state handoff", () => {
 	it("rejects a future deep-interview envelope at execution handoff", async () => {
 		await withTempCwd(async cwd => {
 			const { callerPath } = await writePublishedReadyCrystal(cwd);
+			await recordExecutionApproval(cwd);
 			const approval = await runNativeDeepInterviewCommand(["approve-execution", "--json"], cwd);
 			expect(approval.status).toBe(0);
 			const future = (await readJson(callerPath)) as Record<string, unknown>;
@@ -1853,6 +1917,7 @@ describe("gjc state handoff", () => {
 	it("repairs a missing specialized approval audit on exact retry", async () => {
 		await withTempCwd(async cwd => {
 			const { callerPath } = await writePublishedReadyCrystal(cwd);
+			await recordExecutionApproval(cwd);
 			const approvalAuditPath = auditPath(cwd, TEST_SESSION_ID);
 			const priorFailpoint = process.env.GJC_STATE_APPROVAL_FAIL_BEFORE_AUDIT;
 			process.env.GJC_STATE_APPROVAL_FAIL_BEFORE_AUDIT = "1";
@@ -1873,7 +1938,7 @@ describe("gjc state handoff", () => {
 				await readWorkflowTransactionJournal(cwd, TEST_SESSION_ID, approvalReceipt.mutation_id as string),
 			).toMatchObject({
 				status: "pending",
-				steps: ["approval-state", "approval-index"],
+				steps: ["approval-state", "approval-record", "approval-index"],
 				approval_audit_offset: expect.any(Number),
 			});
 			const filler = `${JSON.stringify({ event: "filler", payload: "x".repeat(1024) })}\n`.repeat(9_000);
@@ -1896,7 +1961,7 @@ describe("gjc state handoff", () => {
 						),
 				);
 			expect(await specializedRows()).toHaveLength(1);
-			expect((await runNativeDeepInterviewCommand(["approve-execution", "--json"], cwd)).status).toBe(0);
+			expect((await runNativeDeepInterviewCommand(["approve-execution", "--json"], cwd)).status).toBe(2);
 			expect(await specializedRows()).toHaveLength(1);
 			expect(
 				(await runNativeStateCommand(["handoff", "--mode", "deep-interview", "--to", "ultragoal", "--json"], cwd))
@@ -1908,6 +1973,7 @@ describe("gjc state handoff", () => {
 	it("replaces a stale approval index from a pending post-audit journal", async () => {
 		await withTempCwd(async cwd => {
 			const { callerPath } = await writePublishedReadyCrystal(cwd);
+			await recordExecutionApproval(cwd);
 			expect((await runNativeDeepInterviewCommand(["approve-execution", "--json"], cwd)).status).toBe(0);
 			const approved = (await readJson(callerPath)) as Record<string, unknown>;
 			const approval = (approved.state as Record<string, unknown>).execution_approval_receipt as Record<
@@ -1924,7 +1990,11 @@ describe("gjc state handoff", () => {
 				sessionId: TEST_SESSION_ID,
 				mutationId,
 				caller: "deep-interview",
-				paths: [callerPath, auditPath(cwd, TEST_SESSION_ID)],
+				paths: [
+					callerPath,
+					deepInterviewExecutionApprovalRecordPath(cwd, TEST_SESSION_ID),
+					auditPath(cwd, TEST_SESSION_ID),
+				],
 			});
 			await updateWorkflowTransactionJournal(cwd, TEST_SESSION_ID, mutationId, {
 				steps: ["approval-state", "approval-audit"],
@@ -1959,7 +2029,7 @@ describe("gjc state handoff", () => {
 				sessionId: TEST_SESSION_ID,
 				mutationId,
 				caller: "deep-interview",
-				paths: [callerPath, approvalAuditPath],
+				paths: [callerPath, deepInterviewExecutionApprovalRecordPath(cwd, TEST_SESSION_ID), approvalAuditPath],
 			});
 			await updateWorkflowTransactionJournal(cwd, TEST_SESSION_ID, mutationId, {
 				steps: ["approval-state", "approval-index"],
@@ -1996,7 +2066,7 @@ describe("gjc state handoff", () => {
 				sessionId: TEST_SESSION_ID,
 				mutationId,
 				caller: "deep-interview",
-				paths: [callerPath, approvalAuditPath],
+				paths: [callerPath, deepInterviewExecutionApprovalRecordPath(cwd, TEST_SESSION_ID), approvalAuditPath],
 			});
 			const retried = await runNativeDeepInterviewCommand(["approve-execution", "--json"], cwd);
 			expect(retried.status, retried.stderr).toBe(0);
@@ -2021,7 +2091,7 @@ describe("gjc state handoff", () => {
 				sessionId: TEST_SESSION_ID,
 				mutationId,
 				caller: "deep-interview",
-				paths: [callerPath, approvalAuditPath],
+				paths: [callerPath, deepInterviewExecutionApprovalRecordPath(cwd, TEST_SESSION_ID), approvalAuditPath],
 			});
 			await updateWorkflowTransactionJournal(cwd, TEST_SESSION_ID, mutationId, {
 				steps: ["approval-state", "approval-index"],
@@ -2047,7 +2117,7 @@ describe("gjc state handoff", () => {
 			});
 			const retried = await runNativeDeepInterviewCommand(["approve-execution", "--json"], cwd);
 			expect(retried.status).toBe(2);
-			expect(retried.stderr).toContain("sanctioned approval audit record");
+			expect(retried.stderr).toContain("already consumed");
 		});
 	});
 
