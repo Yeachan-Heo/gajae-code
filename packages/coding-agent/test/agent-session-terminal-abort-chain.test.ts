@@ -170,6 +170,8 @@ describe("terminal abort registers a turn scope so left-running owned work class
 			await manager.dispose({ timeoutMs: 1_000 });
 			await chainSessionManager.close();
 		} else {
+			await session.awaitCoordinatorRuntimeStatePersistenceForTests();
+			await session.awaitSessionSettlement();
 			await session.dispose();
 		}
 		AsyncJobManager.setInstance(undefined);
