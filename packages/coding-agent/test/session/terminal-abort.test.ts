@@ -14,6 +14,7 @@ import {
 	findOwnedRegistrationsForTurn,
 	isOwnedAttemptRegistrationIncomplete,
 	isOwnedCompletionEnvelopeAllowed,
+	type LineageBinding,
 	lookupOwnedRegistration,
 	lookupTerminalScope,
 	mintTurnLineageIdHash,
@@ -1467,6 +1468,43 @@ test("incomplete attempt evidence remains until every evicted tool window settle
 	expect(isOwnedAttemptRegistrationIncomplete("shared-attempt-lineage", 77)).toBe(true);
 	settleToolLineageRegistrationWindow("shared-attempt-1");
 	expect(isOwnedAttemptRegistrationIncomplete("shared-attempt-lineage", 77)).toBe(false);
+});
+
+test("exact settlement closes an evicted binding after its map entry is gone", () => {
+	let evictedBinding: LineageBinding | undefined;
+	for (let index = 0; index < 8193; index++) {
+		const binding = bindToolLineage(`exact-evicted-${index}`, {
+			lineageIdHash: "exact-evicted-lineage",
+			promptAttemptEpoch: 91,
+			endpointGeneration: 2,
+		});
+		if (index === 0) evictedBinding = binding;
+	}
+	expect(isOwnedAttemptRegistrationIncomplete("exact-evicted-lineage", 91)).toBe(true);
+	settleToolLineageRegistrationWindow("exact-evicted-0", undefined, evictedBinding);
+	expect(isOwnedAttemptRegistrationIncomplete("exact-evicted-lineage", 91)).toBe(false);
+});
+
+test("successor settlement cannot close a predecessor retained window", () => {
+	let predecessor: LineageBinding | undefined;
+	for (let index = 0; index < 8193; index++) {
+		const binding = bindToolLineage(`rebound-window-${index}`, {
+			lineageIdHash: "rebound-predecessor-lineage",
+			promptAttemptEpoch: 92,
+			endpointGeneration: 3,
+		});
+		if (index === 0) predecessor = binding;
+	}
+	unbindToolLineage("rebound-window-1");
+	const successor = bindToolLineage("rebound-window-0", {
+		lineageIdHash: "rebound-successor-lineage",
+		promptAttemptEpoch: 93,
+		endpointGeneration: 4,
+	});
+	settleToolLineageRegistrationWindow("rebound-window-0", undefined, successor);
+	expect(isOwnedAttemptRegistrationIncomplete("rebound-predecessor-lineage", 92)).toBe(true);
+	settleToolLineageRegistrationWindow("rebound-window-0", undefined, predecessor);
+	expect(isOwnedAttemptRegistrationIncomplete("rebound-predecessor-lineage", 92)).toBe(false);
 });
 
 test("registerOwnedIfLineaged registers an evicted tool call's job with the retained lineage", () => {

@@ -6,6 +6,7 @@ import { getBundledModel } from "@gajae-code/ai";
 import { AsyncJobManager } from "@gajae-code/coding-agent/async/job-manager";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
+import { TtsrManager } from "@gajae-code/coding-agent/export/ttsr";
 import * as internalUrls from "@gajae-code/coding-agent/internal-urls";
 import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { ArtifactManager } from "@gajae-code/coding-agent/session/artifacts";
@@ -46,6 +47,7 @@ describe("AgentSession Issue #2261 /new owner-subagent cancellation", () => {
 	let sessionManager: SessionManager;
 	let session: AgentSession;
 	let manager: AsyncJobManager | undefined;
+	let ttsrManager: TtsrManager;
 
 	beforeEach(async () => {
 		tempDir = TempDir.createSync("@gjc-issue-2261-");
@@ -53,12 +55,14 @@ describe("AgentSession Issue #2261 /new owner-subagent cancellation", () => {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
 		if (!model) throw new Error("Expected bundled test model");
 		sessionManager = SessionManager.create(tempDir.path(), tempDir.path());
+		ttsrManager = new TtsrManager({ enabled: true });
 		session = new AgentSession({
 			agent: new Agent({ initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] } }),
 			sessionManager,
 			settings: Settings.isolated(),
 			modelRegistry: new ModelRegistry(authStorage),
 			agentId: "owner",
+			ttsrManager,
 		});
 	});
 
@@ -396,6 +400,23 @@ describe("AgentSession Issue #2261 /new owner-subagent cancellation", () => {
 		expect(lookupOwnedRegistration(ownerJobId, ownerJob.generation, predecessorEndpointId)).toBeUndefined();
 		expect(producerCleanupCalls).toBe(1);
 		expect(finishShutdown).toHaveBeenLastCalledWith(expect.any(Object), "commit");
+	});
+
+	it("restores predecessor TTSR state when successor validation rolls back", async () => {
+		const previousFile = session.sessionFile;
+		if (!previousFile) throw new Error("Expected a persisted predecessor session");
+		await sessionManager.ensureOnDisk();
+		const copiedFile = path.join(tempDir.path(), "fallible-ttsr-successor.jsonl");
+		await Bun.write(copiedFile, Bun.file(previousFile));
+		ttsrManager.replacePersistedState(["predecessor-rule"], 7);
+		vi.spyOn(internalUrls, "initializeLocalRoot").mockRejectedValueOnce(
+			new Error("injected successor validation failure"),
+		);
+
+		await expect(session.switchSession(copiedFile)).rejects.toThrow("injected successor validation failure");
+
+		expect(ttsrManager.getInjectedRuleNames()).toEqual(["predecessor-rule"]);
+		expect(ttsrManager.getMessageCount()).toBe(7);
 	});
 
 	it.each([

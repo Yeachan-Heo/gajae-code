@@ -345,6 +345,29 @@ describe("TUI raster lease public boundary", () => {
 		expect(ack.status).toBe("failed");
 		expect(terminal.getWriteLog()).toEqual(["SAVE+PLACE", "RESTORE"]);
 	});
+	it("closes the multipart barrier when the final write is rejected", async () => {
+		const { tui, terminal } = await setup();
+		const lease = await tui.acquireRasterLease(request("barrier-final-write"));
+		if (lease.status !== "acquired") throw new Error("lease not acquired");
+		terminal.clearWriteLog();
+		const ack = await tui.submitTerminalOutput({
+			operation: {
+				type: "raster-multipart-batch",
+				prefix: bytes("SAVE+PLACE"),
+				afterPrefix: async () => {
+					failNextWrites(terminal);
+					return true;
+				},
+				records: [bytes("IMAGE")],
+				abortSuffix: bytes("RESTORE"),
+			},
+			token: lease.token,
+		});
+		expect(ack.status).toBe("failed");
+		expect(terminal.getWriteLog()).toEqual(["SAVE+PLACE"]);
+		tui.stop();
+		expect(terminal.getWriteLog().join("")).not.toContain("RESTORE");
+	});
 	it("does not write records when the prefix callback returns false or throws", async () => {
 		const { tui, terminal } = await setup();
 		const lease = await tui.acquireRasterLease(request("prefix-failure"));
