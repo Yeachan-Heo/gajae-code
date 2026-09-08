@@ -23,8 +23,15 @@ export function cleanReason(value: unknown): string | undefined {
 		return "Credential diagnostic unavailable.";
 	reason = reason.replace(/bearer\s+[^\s,;]+/gi, "Bearer [redacted]");
 	reason = reason.replace(/basic\s+[^\s,;]+/gi, "Basic [redacted]");
-	reason = reason.replace(/([a-z][a-z0-9+.-]*:\/\/)[^\s/@]+@/gi, "$1[redacted]@");
-	reason = reason.replace(/\b([a-z][a-z0-9+.-]*:\/\/[^\s<>"']*?)(?:[?#][^\s<>"']*)/gi, "$1");
+	// The scheme repetition is bounded and the leading boundary anchored: an
+	// unbounded `[a-z0-9+.-]*` in front of the literal `://` re-tries every prefix
+	// of a long alphabetic run, which is quadratic in the length of the reason
+	// text (100 KB cost ~2.6s). Upstream failure text is remote-influenced.
+	reason = reason.replace(/(?<![A-Za-z0-9+.-])([a-z][a-z0-9+.-]{0,15}:\/\/)[^\s/@]+@/gi, "$1[redacted]@");
+	// Same bound as above: `\b` does not help here because a run of scheme
+	// characters carries a word boundary at every separator, so the unbounded
+	// repetition was re-tried across the whole run (120 KB cost ~1.9s).
+	reason = reason.replace(/\b([a-z][a-z0-9+.-]{0,15}:\/\/[^\s<>"']*?)(?:[?#][^\s<>"']*)/gi, "$1");
 	reason = reason.replace(
 		/((?:\\?["']?(?:key|api[_-]?key|client[_-]?secret|clientSecret|token|secret|authorization|password|access|refresh|cookie|credential)(?:[_-](?:token|key|secret|header|headers))?\\?["']?)\s*:\s*)\\?(["'])(?:\\.|(?!\2)[^\\])*\2/gi,
 		"$1$2[redacted]$2",

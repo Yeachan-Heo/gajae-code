@@ -706,6 +706,42 @@ describe("SubagentTool", () => {
 		);
 		for (const secret of secrets) expect(summary).not.toContain(secret);
 	});
+	it("summarizes a large credential-free failure in linear time", () => {
+		// Two patterns used to scan quadratically. The credential-name prefix
+		// `(?:[A-Za-z][A-Za-z0-9]*[_.-])*?` nested an unbounded quantifier inside an
+		// unbounded group, so the inner class ran to the end of a long identifier at
+		// every offset; the URL rule accepted an unbounded scheme before `://`.
+		// Together they cost ~8s on 100 KB of text holding no credential at all.
+		// A subagent setup failure message is not length-bounded before it gets here.
+		for (const body of ["x".repeat(100_000), "a_".repeat(50_000), "Ab1_".repeat(25_000)]) {
+			const startedAt = performance.now();
+			const summary = createSetupFailureSummary(new Error(body)).summary;
+			const elapsedMs = performance.now() - startedAt;
+			expect(summary.length).toBeGreaterThan(0);
+			// Linear scanning lands near 10ms; the budget is loose so it fails only on
+			// quadratic scanning.
+			expect(elapsedMs).toBeLessThan(1_000);
+		}
+	});
+	it("still redacts deeply prefixed credential names and url userinfo", () => {
+		const summary = createSetupFailureSummary(
+			new Error(
+				[
+					"A_B_C_D_E_F_G_H_I_J_K_token=deep-secret-value",
+					"mytoken=unprefixed-secret",
+					"clone https://deploy:url-secret-value@git.example.com/x.git",
+					"git+ssh://user:scheme-secret-value@host/r.git",
+				].join("\n"),
+			),
+		).summary;
+
+		for (const secret of ["deep-secret-value", "unprefixed-secret", "url-secret-value", "scheme-secret-value"]) {
+			expect(summary).not.toContain(secret);
+		}
+		// Scheme and host stay readable so the failure still names the remote.
+		expect(summary).toContain("https://[redacted]@git.example.com");
+		expect(summary).toContain("git+ssh://[redacted]@host");
+	});
 	it("redacts sensitive path basenames, local file URIs, and control-fragmented credential values", () => {
 		const pathSecret = "ghp_PATH_SECRET_DO_NOT_LEAK";
 		const valueSecret = "SECRET_SUFFIX_DO_NOT_LEAK";

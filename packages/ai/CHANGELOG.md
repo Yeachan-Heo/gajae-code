@@ -4,6 +4,8 @@
 
 ### Fixed
 
+- Auth-broker failure reasons are scanned in linear time. Two rules accepted an unbounded scheme before the literal `://`, so a long run of scheme characters was re-tried at every prefix: 120 KB of upstream failure text cost roughly two seconds. Upstream reason text is remote-influenced, and `cleanReason` is what makes it safe for less-trusted surfaces.
+
 - Cursor's first-event deadline now bounds asynchronous payload hooks before any authenticated request is opened, and successful HTTP/2 teardown sends END_STREAM before falling back to bounded cleanup for a peer that leaves its response half open (#4834 review).
 - Cursor conversation state and attachment blobs now reuse only within the same endpoint, credential, model, prompt, tool, and message-prefix authority. Request-local cache updates commit only after a successful terminal, preventing reused caller IDs or failed streams from disclosing prior session state (#4834 review).
 - Cursor Connect watchdog and terminal admission now preserve buffered raw progress, partial output, and usage across bounded held-exec backpressure and transport failures.

@@ -807,4 +807,31 @@ describe.skipIf(process.platform !== "linux")("Codex session import", () => {
 			results: [{ code: "content_too_large", phase: "source_event" }],
 		});
 	});
+	it("sanitizes a large credential-free payload in linear time", () => {
+		// The URL-credential rule accepted an unbounded scheme before the literal
+		// `://`, so a long run of scheme characters was re-tried at every prefix:
+		// quadratic in input length (25k/50k/100k cost 83ms/332ms/1329ms). The rule
+		// sits behind an `includes("://")` guard, so the payload must carry one URL
+		// for the scan to be reached at all. Imported Codex transcripts are external
+		// content and are not length-bounded before this runs.
+		for (const body of [`https://ok/ ${"a-b.c+".repeat(16_000)}`, `https://ok/ ${"x".repeat(96_000)}`]) {
+			const startedAt = performance.now();
+			const out = sanitizeImportedString(body);
+			const elapsedMs = performance.now() - startedAt;
+			expect(out.redacted).toBe(0);
+			expect(elapsedMs).toBeLessThan(1_000);
+		}
+	});
+
+	it("still redacts url userinfo across real scheme shapes", () => {
+		for (const [input, secret] of [
+			["https://alice:https-secret-value@example.com/x", "https-secret-value"],
+			["postgres://svc:pg-secret-value@db.internal:5432/app", "pg-secret-value"],
+			["git+ssh://deploy:ssh-secret-value@git.example.com/x.git", "ssh-secret-value"],
+		] as const) {
+			const { value } = sanitizeImportedString(input);
+			expect(value).not.toContain(secret);
+			expect(value).toContain(input.slice(0, input.indexOf("://") + 3));
+		}
+	});
 });

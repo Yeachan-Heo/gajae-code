@@ -352,10 +352,21 @@ const SETUP_FAILURE_SUMMARY_MAX_CHARS = 280;
 const SETUP_FAILURE_SUMMARY_MAX_BYTES = 1_024;
 const AUTHORIZATION_HEADER_VALUE_PATTERN = /(["']?(?:Proxy-)?Authorization\b["']?\s*:\s*)[^\r\n]*/gi;
 const COOKIE_HEADER_VALUE_PATTERN = /(["']?(?:Set-)?Cookie\b["']?\s*:\s*)[^\r\n]*/gi;
-const URL_CREDENTIAL_PATTERN = /([a-z][a-z0-9+.-]*:\/\/)[^/?#\s:@]+:[^@/?#\s]+@/gi;
+// The scheme repetition is bounded and the leading boundary anchored: an
+// unbounded `[a-z0-9+.-]*` in front of the literal `://` re-tries every prefix of
+// a long alphabetic run, which is quadratic in the length of the failure text
+// (100 KB cost ~2.6s).
+const URL_CREDENTIAL_PATTERN = /(?<![A-Za-z0-9+.-])([a-z][a-z0-9+.-]{0,15}:\/\/)[^/?#\s:@]+:[^@/?#\s]+@/gi;
 const API_KEY_LABEL_VALUE_PATTERN = /(["']?api\s+key["']?\s*:\s*)(?:"[^"]*"|'[^']*'|[^\s&]+)/gi;
+// Both name-prefix repetitions are bounded. `(?:[A-Za-z][A-Za-z0-9]*[_.-])*?`
+// nests an unbounded quantifier inside an unbounded quantified group, so at every
+// offset of a long identifier run the inner class scans to the end of the run
+// before backtracking to look for a separator. That is quadratic in the length of
+// the failure text: 50 KB cost ~1.7s. Sixteen segments of at most 64 characters is
+// far past any real credential name, and the suffix group below still absorbs
+// arbitrary trailing segments.
 const SENSITIVE_SETUP_FAILURE_VALUE_PATTERN =
-	/(["']?(?:(?:[A-Za-z][A-Za-z0-9]*[_.-])*?)(?:access[_-]?token|refresh[_-]?token|session[_-]?token|id[_-]?token|api[_-]?key|client[_-]?secret|private[_-]?key|signing[_-]?key|secret|password|passwd|pwd|authorization|credential|token)(?:[_.-][A-Za-z0-9]+)*["']?)(\s*[=:]\s*)(?:"[^"]*"|'[^']*'|[^\s&]+)/gi;
+	/(["']?(?:[A-Za-z][A-Za-z0-9]{0,63}[_.-]){0,16}?(?:access[_-]?token|refresh[_-]?token|session[_-]?token|id[_-]?token|api[_-]?key|client[_-]?secret|private[_-]?key|signing[_-]?key|secret|password|passwd|pwd|authorization|credential|token)(?:[_.-][A-Za-z0-9]+)*["']?)(\s*[=:]\s*)(?:"[^"]*"|'[^']*'|[^\s&]+)/gi;
 const BARE_PROVIDER_TOKEN_PATTERN =
 	/\b(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}|xox[baprs]-[A-Za-z0-9-]{20,}|sk-(?:proj-)?[A-Za-z0-9_-]{20,}|sk-ant-[A-Za-z0-9_-]{20,}|AIza[A-Za-z0-9_-]{35}|AKIA[A-Z0-9]{16})\b/g;
 const LOCAL_ABSOLUTE_PATH_PATTERN = /(^|[\s("'`=])((?:\/(?!\/)[^\s/:?"'`()[\]{},;<>]+){2,})/g;
