@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Successor turns now wait for the published `turn_end` checkpoint consumer before polling steering or follow-up work, preventing repeat-rule state from lagging behind the next provider turn.
+
 ## [0.16.6] - 2026-09-07
 
 - External lifecycle emitters now pass a session-owned admission fence before mutating Agent state. Run-bound terminals retain their authoritative attempt scope, while Cursor-native lifecycle emitters resolve the current main-attempt scope on every emission so in-loop retries and later tool turns are not mistaken for retired producers.

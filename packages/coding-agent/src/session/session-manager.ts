@@ -18301,6 +18301,34 @@ export class SessionManager {
 		return Array.from(ruleNames);
 	}
 
+	/** Read repeat-state authority without materializing the full session context. */
+	getTtsrPersistenceState(): { records: TtsrInjectionRecord[]; messageCount: number } {
+		const records = new Map<string, TtsrInjectionRecord>();
+		let messageCount: number | undefined;
+		const visited = new Set<string>();
+		let current = this.#leafId ? this.#resolveEntry(this.#leafId) : undefined;
+		while (current && !visited.has(current.id)) {
+			visited.add(current.id);
+			if (current.type === "ttsr_injection") {
+				if (
+					messageCount === undefined &&
+					typeof current.ttsrMessageCount === "number" &&
+					Number.isFinite(current.ttsrMessageCount)
+				) {
+					messageCount = current.ttsrMessageCount;
+				}
+				for (const record of current.injectedRuleRecords ?? []) {
+					if (!records.has(record.name)) records.set(record.name, { ...record });
+				}
+				for (const name of current.injectedRules) {
+					if (!records.has(name)) records.set(name, { name, lastInjectedAt: 0 });
+				}
+			}
+			current = current.parentId ? this.#resolveEntry(current.parentId) : undefined;
+		}
+		return { records: Array.from(records.values()), messageCount: messageCount ?? 0 };
+	}
+
 	// =========================================================================
 	// Tree Traversal
 	// =========================================================================

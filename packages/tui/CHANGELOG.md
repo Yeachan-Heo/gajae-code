@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Multipart raster output now releases its prefix-barrier ownership when the final terminal write is rejected, preventing stale synchronization ownership from surviving terminal loss.
+
 ## [0.16.6] - 2026-09-07
 
 ## [0.16.5] - 2026-09-07

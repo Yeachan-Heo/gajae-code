@@ -415,6 +415,8 @@ export interface AgentOptions {
 	onFollowUpConsumed?: AgentLoopConfig["onFollowUpConsumed"];
 	/** Invoked with the steering messages dequeued mid-run for the current turn (reassignable). */
 	onSteeringConsumed?: AgentLoopConfig["onSteeringConsumed"];
+	/** Waits for durable turn-end consumers before a successor turn is admitted. */
+	afterTurnEndPublished?: AgentLoopConfig["afterTurnEndPublished"];
 
 	/**
 	 * Opt-in OpenTelemetry instrumentation. Passing `{}` enables the loop's
@@ -621,6 +623,8 @@ export class Agent {
 	onFollowUpConsumed?: AgentLoopConfig["onFollowUpConsumed"];
 	/** Invoked with the steering messages dequeued mid-run for the current turn. Reassign at any time. */
 	onSteeringConsumed?: AgentLoopConfig["onSteeringConsumed"];
+	/** Waits for durable turn-end consumers before a successor turn is admitted. */
+	afterTurnEndPublished?: AgentLoopConfig["afterTurnEndPublished"];
 
 	constructor(opts: AgentOptions = {}) {
 		this.#state = { ...this.#state, ...opts.initialState };
@@ -666,6 +670,7 @@ export class Agent {
 		this.beforeToolCall = opts.beforeToolCall;
 		this.onFollowUpConsumed = opts.onFollowUpConsumed;
 		this.onSteeringConsumed = opts.onSteeringConsumed;
+		this.afterTurnEndPublished = opts.afterTurnEndPublished;
 		this.afterToolCall = opts.afterToolCall;
 		this.#telemetry = opts.telemetry;
 		this.#appendOnlyContext = opts.appendOnlyContext;
@@ -2099,6 +2104,14 @@ export class Agent {
 			onHarmonyLeak: this.#onHarmonyLeak,
 			getToolChoice,
 			getReasoning: () => this.#state.thinkingLevel,
+			afterTurnEndPublished: async () => {
+				if (this.#activeRunId !== runId) return;
+				const publication = Promise.withResolvers<void>();
+				pendingTurnEndPublications.push(publication);
+				await publication.promise;
+				if (this.#activeRunId !== runId) return;
+				await this.afterTurnEndPublished?.();
+			},
 			getSteeringMessages: async () => {
 				if (this.#activeRunId !== runId) {
 					return [];
@@ -2184,6 +2197,10 @@ export class Agent {
 		};
 
 		let partial: AgentMessage | null = null;
+		const pendingTurnEndPublications: Array<{
+			promise: Promise<void>;
+			resolve: () => void;
+		}> = [];
 
 		try {
 			const stream = messages
@@ -2268,6 +2285,7 @@ export class Agent {
 
 				// Emit to listeners
 				this.#emit(event);
+				if (event.type === "turn_end") pendingTurnEndPublications.shift()?.resolve();
 			}
 
 			if (this.#activeRunId !== runId) {

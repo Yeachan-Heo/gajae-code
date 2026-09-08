@@ -4954,6 +4954,10 @@ export class AgentSession {
 			getIdleFlushSignal: () => this.#postPromptTasksAbortController.signal,
 		});
 		this.agent.setOnBeforeYield(() => this.yieldQueue.flush("streaming"));
+		this.agent.afterTurnEndPublished = async () => {
+			const admission = this.#canonicalMessageAdmissionTail;
+			if (!admission.released) await admission.promise;
+		};
 		// Stop-after-result, never abort: a fold arms this once and the loop ends the
 		// turn at its next checkpoint. Consuming the flag here keeps the pause scoped
 		// to the folded turn instead of pausing everything that follows. The
@@ -5057,7 +5061,8 @@ export class AgentSession {
 		// Per-tool TTSR reminders are folded into the matched tool's result via this hook.
 		this.agent.afterToolCall = ctx => {
 			const ownership = this.#toolLifecycleOwnership.get(ctx.toolCall);
-			settleToolLineageRegistrationWindow(ctx.toolCall.id, ownership?.endpointId, ownership?.binding);
+			if (!ownership) return undefined;
+			settleToolLineageRegistrationWindow(ctx.toolCall.id, ownership.endpointId, ownership.binding);
 			if (
 				ctx.result.details &&
 				typeof ctx.result.details === "object" &&
@@ -5068,7 +5073,7 @@ export class AgentSession {
 				}
 				return undefined;
 			}
-			return this.#ttsrAfterToolCall(ctx, ownership?.rules);
+			return this.#ttsrAfterToolCall(ctx, ownership.rules);
 		};
 		// Bind immutable lineage/attempt metadata to each tool call id before the
 		// tool executes. Background registrations made inside the tool (task, Bash)
@@ -6647,17 +6652,17 @@ export class AgentSession {
 		this.#advanceSessionIdentityEpoch();
 		this.#activeSkillState = undefined;
 		this.#restoredWorkflowSkillState = undefined;
-		if (this.#ttsrManager) {
-			const context = this.sessionManager.buildSessionContext();
-			this.#ttsrManager.replacePersistedState(
-				context.injectedTtsrRuleRecords ?? context.injectedTtsrRules,
-				context.ttsrMessageCount ?? 0,
-			);
-			this.#pendingTtsrInjections = [];
-			this.#perToolTtsrInjections.clear();
-		}
+		this.#reloadTtsrStateFromSessionManager();
 		this.#requestSubskillToolReconciliation();
 		this.#retiredSessionIdentityAttemptScopeKeys.clear();
+	}
+
+	#reloadTtsrStateFromSessionManager(): void {
+		if (!this.#ttsrManager) return;
+		const state = this.sessionManager.getTtsrPersistenceState();
+		this.#ttsrManager.replacePersistedState(state.records, state.messageCount);
+		this.#pendingTtsrInjections = [];
+		this.#perToolTtsrInjections.clear();
 	}
 
 	#admitExternalAgentEvent(event: AgentEvent): boolean {
@@ -8920,22 +8925,30 @@ export class AgentSession {
 	}
 
 	/** `afterToolCall` hook: fold any per-tool TTSR reminders into the result. */
-	#ttsrAfterToolCall(ctx: AfterToolCallContext, expectedRules?: Rule[]): AfterToolCallResult | undefined {
+	#ttsrAfterToolCall(ctx: AfterToolCallContext, expectedRules: Rule[] | undefined): AfterToolCallResult | undefined {
 		const rules = this.#perToolTtsrInjections.get(ctx.toolCall.id);
 		if (!rules || rules.length === 0) return undefined;
-		if (expectedRules !== undefined && rules !== expectedRules) return undefined;
+		if (rules !== expectedRules) return undefined;
 		this.#perToolTtsrInjections.delete(ctx.toolCall.id);
 		const reminder = rules
 			.map(r => prompt.render(ttsrToolReminderTemplate, { name: r.name, path: r.path, content: r.content }))
 			.join("\n\n");
 		const ruleNames = rules.map(r => r.name.trim()).filter(n => n.length > 0);
 		if (ruleNames.length > 0) {
-			this.#ttsrManager?.markInjectedByNames(ruleNames);
-			this.sessionManager.appendTtsrInjection(
-				ruleNames,
-				this.#ttsrManager?.getInjectedRecords(),
-				this.#ttsrManager?.getMessageCount(),
-			);
+			const manager = this.#ttsrManager;
+			const previousRecords = manager?.getInjectedRecords() ?? [];
+			const previousMessageCount = manager?.getMessageCount() ?? 0;
+			manager?.markInjectedByNames(ruleNames);
+			try {
+				this.sessionManager.appendTtsrInjection(
+					ruleNames,
+					manager?.getInjectedRecords(),
+					manager?.getMessageCount(),
+				);
+			} catch (error) {
+				manager?.replacePersistedState(previousRecords, previousMessageCount);
+				throw error;
+			}
 		}
 
 		return {
@@ -20222,6 +20235,7 @@ export class AgentSession {
 			});
 			this.sessionManager.branchWithSummary(null, report, { startedAt: checkpointState.startedAt });
 		}
+		this.#reloadTtsrStateFromSessionManager();
 		const details = { startedAt: checkpointState.startedAt, rewoundAt: new Date().toISOString() };
 		this.agent.appendMessage({
 			role: "custom",
@@ -25022,6 +25036,10 @@ export class AgentSession {
 			const previousSessionIdentityEpoch = this.#sessionIdentityEpoch;
 			const previousCurrentAttemptScopeKeys = [...this.#currentSessionIdentityAttemptScopeKeys];
 			const previousRetiredAttemptScopeKeys = [...this.#retiredSessionIdentityAttemptScopeKeys];
+			const previousTtsrRecords = this.#ttsrManager?.getInjectedRecords() ?? [];
+			const previousTtsrMessageCount = this.#ttsrManager?.getMessageCount() ?? 0;
+			const previousPendingTtsrInjections = [...this.#pendingTtsrInjections];
+			const previousPerToolTtsrInjections = new Map(this.#perToolTtsrInjections);
 
 			this.#steeringMessages = [];
 			this.#followUpMessages = [];
@@ -25353,6 +25371,12 @@ export class AgentSession {
 				this.#thinkingLevel = previousThinkingLevel;
 				this.agent.setThinkingLevel(toReasoningEffort(previousThinkingLevel));
 				this.agent.serviceTier = previousServiceTier;
+				this.#ttsrManager?.replacePersistedState(previousTtsrRecords, previousTtsrMessageCount);
+				this.#pendingTtsrInjections = previousPendingTtsrInjections;
+				this.#perToolTtsrInjections.clear();
+				for (const [toolCallId, rules] of previousPerToolTtsrInjections) {
+					this.#perToolTtsrInjections.set(toolCallId, rules);
+				}
 				this.#syncTodoPhasesFromBranch();
 				this.#reconnectToAgent();
 				if (restoreMcpError) {

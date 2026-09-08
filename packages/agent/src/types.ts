@@ -346,6 +346,11 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	 * these messages are added to the context before the next LLM call.
 	 */
 	getSteeringMessages?: () => Promise<AgentMessage[]>;
+	/**
+	 * Waits for consumers of the published turn_end event to commit any
+	 * canonical per-turn state before the loop admits a successor turn.
+	 */
+	afterTurnEndPublished?: () => void | Promise<void>;
 
 	/**
 	 * Returns steering messages that were dequeued for this run but cannot be
