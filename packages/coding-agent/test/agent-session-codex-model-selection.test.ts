@@ -25,21 +25,23 @@ const initialModel: Model = {
 	maxTokens: 128_000,
 };
 
-const solModel: Model = {
+const selectedModel: Model = {
 	...initialModel,
 	id: "gpt-5.6-sol",
 	name: "GPT-5.6 Sol",
 };
 
-describe("AgentSession Codex model entitlement", () => {
+describe("AgentSession Codex model selection", () => {
 	let tempDir: string;
 	let authStorage: AuthStorage;
 	let session: AgentSession;
 	let sessionManager: SessionManager;
+	let usageFetches = 0;
 
 	const usageProvider: UsageProvider = {
 		id: "openai-codex",
 		async fetchUsage(params) {
+			usageFetches += 1;
 			return {
 				provider: "openai-codex",
 				fetchedAt: Date.now(),
@@ -50,7 +52,8 @@ describe("AgentSession Codex model entitlement", () => {
 	};
 
 	beforeEach(async () => {
-		tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-codex-entitlement-"));
+		usageFetches = 0;
+		tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-codex-model-selection-"));
 		authStorage = await AuthStorage.create(path.join(tempDir, "auth.db"), {
 			usageProviderResolver: provider => (provider === "openai-codex" ? usageProvider : undefined),
 		});
@@ -91,14 +94,16 @@ describe("AgentSession Codex model entitlement", () => {
 		await fs.rm(tempDir, { recursive: true, force: true });
 	});
 
-	test("binds Sol on a Plus-labelled account and leaves entitlement to the provider", async () => {
-		await session.setModel(solModel);
+	test("allows a Plus-labeled credential to bind Sol so the provider can decide availability", async () => {
+		await expect(session.setModel(selectedModel)).resolves.toBeUndefined();
 
-		expect(session.model).toBe(solModel);
+		expect(session.model).toBe(selectedModel);
+		expect(sessionManager.getEntries().filter(entry => entry.type === "model_change")).toHaveLength(1);
+		expect(usageFetches).toBe(0);
 	});
 
-	test("surfaces the provider Sol entitlement rejection after managed selection", async () => {
-		await session.setModel(solModel);
+	test("preserves provider model-access evidence after managed selection", async () => {
+		await session.setModel(selectedModel);
 		const providerMessage = "The 'gpt-5.6-sol' model is not supported when using Codex with a ChatGPT account.";
 		const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(
 			new Response(JSON.stringify({ error: { code: "invalid_request_error", message: providerMessage } }), {
@@ -114,7 +119,7 @@ describe("AgentSession Codex model entitlement", () => {
 			.find((message): message is AssistantMessage => message.role === "assistant");
 		expect(fetchSpy).toHaveBeenCalledTimes(1);
 		expect(assistant?.stopReason).toBe("error");
-		expect(assistant?.errorMessage).toContain('cannot use model "gpt-5.6-sol"');
-		expect(assistant?.errorMessage).toContain("Select a model available to this ChatGPT account");
+		expect(assistant?.errorMessage).toContain(providerMessage);
+		expect(assistant?.errorMessage).not.toContain("Select a model available to this ChatGPT account");
 	});
 });

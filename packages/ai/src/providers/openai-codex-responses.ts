@@ -51,10 +51,6 @@ import {
 	normalizeSystemPrompts,
 	sanitizeOpenAIResponsesHistoryItemsForReplay,
 } from "../utils";
-import {
-	formatOpenAICodexChatGPTEntitlementError,
-	isOpenAICodexChatGPTEntitlementError,
-} from "../utils/codex-entitlement";
 import { AssistantMessageEventStream } from "../utils/event-stream";
 import { STREAM_FIRST_EVENT_TIMEOUT_PROVIDER_CODE, transportFailureFacts } from "../utils/fallback-transport";
 import { finalizeErrorMessage, type RawHttpRequestDump } from "../utils/http-inspector";
@@ -1246,7 +1242,7 @@ function handleCodexStreamEvent(args: {
 	}
 
 	if (eventType === "error" || eventType === "response.failed") {
-		throw createCodexProviderStreamError(rawEvent, model.id);
+		throw createCodexProviderStreamError(rawEvent);
 	}
 
 	return firstTokenTime;
@@ -2865,11 +2861,7 @@ async function openCodexSseEventStream(
 	updateCodexSessionMetadataFromHeaders(state, response.headers);
 	if (!response.ok) {
 		const info = await parseCodexError(response);
-		const error = new Error(
-			isOpenAICodexChatGPTEntitlementError(info.message, info.code)
-				? formatOpenAICodexChatGPTEntitlementError(body.model)
-				: info.friendlyMessage || info.message,
-		);
+		const error = new Error(info.friendlyMessage || info.message);
 		(error as { headers?: Headers; status?: number }).headers = response.headers;
 		(error as { headers?: Headers; status?: number }).status = response.status;
 		(error as { code?: string }).code = info.code;
@@ -3251,12 +3243,11 @@ function isRetryableCodexFailureEvent(rawEvent: Record<string, unknown>): boolea
 	return !!message && CODEX_RETRYABLE_EVENT_MESSAGE.test(message);
 }
 
-function createCodexProviderStreamError(rawEvent: Record<string, unknown>, modelId: string): CodexProviderStreamError {
+function createCodexProviderStreamError(rawEvent: Record<string, unknown>): CodexProviderStreamError {
 	const code = getCodexEventErrorCode(rawEvent);
 	const message = getCodexEventErrorMessage(rawEvent);
-	const formattedMessage = isOpenAICodexChatGPTEntitlementError(message, code)
-		? formatOpenAICodexChatGPTEntitlementError(modelId)
-		: typeof rawEvent.type === "string" && rawEvent.type === "error"
+	const formattedMessage =
+		typeof rawEvent.type === "string" && rawEvent.type === "error"
 			? formatCodexErrorEvent(rawEvent, code, message)
 			: (formatCodexFailure(rawEvent) ?? "Codex response failed");
 	return new CodexProviderStreamError(

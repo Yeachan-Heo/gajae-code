@@ -1018,8 +1018,8 @@ describe("openai-codex streaming", () => {
 		expect(result.errorMessage).toContain("terminal completion event");
 	});
 
-	it("gives entitlement failures actionable account guidance", async () => {
-		const tempDir = TempDir.createSync("@pi-codex-entitlement-");
+	it("surfaces provider model-access failures without client-authored account claims", async () => {
+		const tempDir = TempDir.createSync("@pi-codex-provider-error-");
 		setAgentDir(tempDir.path());
 		const token = createCodexTestToken();
 		const model = {
@@ -1040,10 +1040,9 @@ describe("openai-codex streaming", () => {
 		) as unknown as typeof fetch;
 		const httpResult = await streamOpenAICodexResponses(model, context, { apiKey: token }).result();
 		expect(httpResult.stopReason).toBe("error");
-		expect(httpResult.errorMessage).toContain('cannot use model "gpt-5.6-sol"');
-		expect(httpResult.errorMessage).toContain("Select a model available to this ChatGPT account");
-		expect(httpResult.errorMessage).toContain("API-key credential");
-		expect(httpResult.errorMessage).not.toContain("not supported when using Codex");
+		expect(httpResult.errorMessage).toContain(providerMessage);
+		expect(httpResult.errorMessage).not.toContain("Select a model available to this ChatGPT account");
+		expect(httpResult.errorMessage).not.toContain("API-key credential");
 
 		const sse = `data: ${JSON.stringify({
 			type: "error",
@@ -1054,10 +1053,10 @@ describe("openai-codex streaming", () => {
 		) as unknown as typeof fetch;
 		const streamResult = await streamOpenAICodexResponses(model, context, { apiKey: token }).result();
 		expect(streamResult.stopReason).toBe("error");
-		expect(streamResult.errorMessage).toContain('cannot use model "gpt-5.6-sol"');
-		expect(streamResult.errorMessage).toContain("Select a model available to this ChatGPT account");
-		expect(streamResult.errorMessage).toContain("API-key credential");
-		expect(streamResult.errorMessage).not.toContain("not supported when using Codex");
+		expect(streamResult.errorMessage).toContain(providerMessage);
+		expect(streamResult.errorMessage).toContain("code=invalid_request_error");
+		expect(streamResult.errorMessage).not.toContain("Select a model available to this ChatGPT account");
+		expect(streamResult.errorMessage).not.toContain("API-key credential");
 	});
 
 	it("stops reading SSE responses after a terminal response event", async () => {

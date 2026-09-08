@@ -26,11 +26,6 @@ import type {
 	UsageReport,
 } from "./usage";
 
-import {
-	classifyOpenAICodexProEntitlement,
-	requiresOpenAICodexProModel,
-	requiresOpenAICodexSparkModel,
-} from "./utils/codex-entitlement";
 import { getOAuthApiKey, getOAuthProvider, refreshOAuthToken, resolveOAuthStorageProvider } from "./utils/oauth";
 import { loginDeepInfra } from "./utils/oauth/deepinfra";
 import { loginDeepSeek } from "./utils/oauth/deepseek";
@@ -1143,24 +1138,6 @@ export function readBrokerErrorBody(error: unknown): string | undefined {
 		// refresh failure with an inspection error.
 		throw error;
 	}
-}
-
-function getUsagePlanType(report: UsageReport | null): string | undefined {
-	const metadata = report?.metadata;
-	if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) return undefined;
-	const planType = (metadata as { planType?: unknown }).planType;
-	return typeof planType === "string" ? planType.toLowerCase() : undefined;
-}
-
-function getOpenAICodexPlanPriority(report: UsageReport | null): number {
-	const entitlement = classifyOpenAICodexProEntitlement(getUsagePlanType(report));
-	if (entitlement === "entitled") return 0;
-	if (entitlement === "denied") return 2;
-	return 1;
-}
-
-function hasOpenAICodexProPlan(report: UsageReport | null): boolean {
-	return classifyOpenAICodexProEntitlement(getUsagePlanType(report)) === "entitled";
 }
 
 function resolveDefaultRankingStrategy(provider: Provider): CredentialRankingStrategy | undefined {
@@ -4812,11 +4789,6 @@ export class AuthStorage {
 				if (leftBlockedUntil !== rightBlockedUntil) return leftBlockedUntil - rightBlockedUntil;
 				return left.orderPos - right.orderPos;
 			}
-			if (requiresOpenAICodexProModel(args.provider, args.options?.modelId)) {
-				const leftPlanPriority = getOpenAICodexPlanPriority(left.usage);
-				const rightPlanPriority = getOpenAICodexPlanPriority(right.usage);
-				if (leftPlanPriority !== rightPlanPriority) return leftPlanPriority - rightPlanPriority;
-			}
 			if (left.hasPriorityBoost !== right.hasPriorityBoost) return left.hasPriorityBoost ? -1 : 1;
 			if (this.#credentialRankingMode === "earliest-reset" && left.resetAtMs !== right.resetAtMs) {
 				// Earliest-expiry-first: drain the soonest-to-reset account before
@@ -4902,9 +4874,7 @@ export class AuthStorage {
 		const providerKey = this.#getProviderTypeKey(provider, "oauth");
 		const order = selectedCredential ? [0] : this.#getCredentialOrder(providerKey, sessionId, credentials.length);
 		const strategy = this.#rankingStrategyResolver?.(provider);
-		const requiresProModel = requiresOpenAICodexProModel(provider, options?.modelId);
-		const checkUsage =
-			strategy !== undefined && (selectedCredential !== undefined || credentials.length > 1 || requiresProModel);
+		const checkUsage = strategy !== undefined && (selectedCredential !== undefined || credentials.length > 1);
 		const sessionCredential = this.#getSessionCredential(provider, sessionId);
 		const sessionPreferredIndex = sessionCredential?.type === "oauth" ? sessionCredential.index : undefined;
 		// Skip ranking only when the session already has a working preferred credential — re-ranking
@@ -4913,7 +4883,7 @@ export class AuthStorage {
 		// with the most headroom proactively and fall back intelligently when rate-limited.
 		const sessionPreferredIsAvailable =
 			sessionPreferredIndex !== undefined && !this.#isCredentialBlocked(providerKey, sessionPreferredIndex);
-		const shouldRank = !selectedCredential && checkUsage && (!sessionPreferredIsAvailable || requiresProModel);
+		const shouldRank = !selectedCredential && checkUsage && !sessionPreferredIsAvailable;
 		const candidates = shouldRank
 			? await this.#rankOAuthSelections({ providerKey, provider, order, credentials, options, strategy: strategy! })
 			: order
@@ -4951,7 +4921,7 @@ export class AuthStorage {
 			}
 		}
 
-		if (!selectedCredential && sessionPreferredIndex !== undefined && !requiresProModel) {
+		if (!selectedCredential && sessionPreferredIndex !== undefined) {
 			const sessionPreferredCandidate = candidates.findIndex(
 				candidate =>
 					!this.#isCredentialBlocked(providerKey, candidate.selection.index) &&
@@ -4999,15 +4969,6 @@ export class AuthStorage {
 			}),
 		);
 
-		// Plan metadata orders candidates (see `getOpenAICodexPlanPriority`). Spark keeps its
-		// historical confirmed-Pro filter, while Sol leaves entitlement to the provider:
-		// trial, grandfathered and experiment-enabled accounts can carry an ordinary label
-		// that the provider still accepts. Provider refusals are normalized by
-		// `openai-codex-responses` through `formatOpenAICodexChatGPTEntitlementError`.
-		const enforceSparkProRequirement =
-			requiresOpenAICodexSparkModel(provider, options?.modelId) &&
-			candidates.some(candidate => hasOpenAICodexProPlan(candidate.usage));
-
 		const fallback = candidates[0];
 
 		for (const candidate of candidates) {
@@ -5022,7 +4983,6 @@ export class AuthStorage {
 					allowBlocked: false,
 					prefetchedUsage: candidate.usage,
 					usagePrechecked: candidate.usageChecked,
-					enforceSparkProRequirement,
 				},
 				reloadsUsed,
 				sessionSelector,
@@ -5042,7 +5002,6 @@ export class AuthStorage {
 					allowBlocked: true,
 					prefetchedUsage: fallback.usage,
 					usagePrechecked: fallback.usageChecked,
-					enforceSparkProRequirement,
 				},
 				reloadsUsed,
 				sessionSelector,
@@ -5329,18 +5288,11 @@ export class AuthStorage {
 			allowBlocked: boolean;
 			prefetchedUsage?: UsageReport | null;
 			usagePrechecked?: boolean;
-			enforceSparkProRequirement?: boolean;
 		},
 		reloadsUsed = 0,
 		sessionSelector?: AuthCredentialSelector,
 	): Promise<OAuthResolutionResult | undefined> {
-		const {
-			checkUsage,
-			allowBlocked,
-			prefetchedUsage = null,
-			usagePrechecked = false,
-			enforceSparkProRequirement = false,
-		} = usageOptions;
+		const { checkUsage, allowBlocked, prefetchedUsage = null, usagePrechecked = false } = usageOptions;
 		if (!this.#reconcileOAuthCredentialSelection(provider, selection)) return undefined;
 		if (!allowBlocked && this.#isCredentialBlocked(providerKey, selection.index)) {
 			return undefined;
@@ -5350,11 +5302,10 @@ export class AuthStorage {
 			return undefined;
 		}
 
-		const requiresProModel = requiresOpenAICodexProModel(provider, options?.modelId);
 		let usage: UsageReport | null = null;
 		let usageChecked = false;
 
-		if ((checkUsage && !allowBlocked) || requiresProModel) {
+		if (checkUsage && !allowBlocked) {
 			if (usagePrechecked) {
 				usage = prefetchedUsage;
 				usageChecked = true;
@@ -5374,7 +5325,6 @@ export class AuthStorage {
 				);
 				return undefined;
 			}
-			if (enforceSparkProRequirement && !hasOpenAICodexProPlan(usage)) return undefined;
 		}
 
 		try {
@@ -5436,7 +5386,7 @@ export class AuthStorage {
 				selectionCredentialId,
 			);
 
-			if ((checkUsage && !allowBlocked) || requiresProModel) {
+			if (checkUsage && !allowBlocked) {
 				const sameAccount = selection.credential.accountId === updated.accountId;
 				if (!usageChecked || !sameAccount) {
 					usage = await this.#getUsageReport(provider, updated, {
@@ -5454,7 +5404,6 @@ export class AuthStorage {
 					);
 					return undefined;
 				}
-				if (enforceSparkProRequirement && !hasOpenAICodexProPlan(usage)) return undefined;
 			}
 			if (!this.#reconcileOAuthCredentialSelection(provider, selection)) return undefined;
 			if (!authCredentialEquals(selection.credential, updated)) return undefined;
