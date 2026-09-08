@@ -4513,6 +4513,11 @@ export class AgentSession {
 		this.#unregisterAfterMoveListener = this.sessionManager.registerAfterMoveListener(async move => {
 			let completed = false;
 			try {
+				// A move can promote an explicit --session-dir destination to managed
+				// storage without changing the session id. Its local root changes from
+				// artifacts/local to scratch, so complete migration before releasing
+				// the rescope barrier or allowing the next prompt's sync resolver.
+				await initializeLocalRoot(this.#localProtocolOptions());
 				const relocated = await relocateCoordinatorRuntimeStateForRescope(
 					{
 						sessionId: this.sessionId,
