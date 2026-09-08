@@ -2150,9 +2150,12 @@ export async function recordDeepInterviewExecutionApproval(options: {
 				recordPath,
 				async () => {
 					const existing = await readDeepInterviewExecutionApprovalRecord(recordPath);
-					if (existing?.status === "consumed")
+					if (
+						existing?.status === "consumed" &&
+						!existing.consumed_mutation_id?.startsWith("deep-interview:approval-revoked:")
+					)
 						throw new StateCommandError(2, "deep-interview execution approval record is already consumed");
-					if (existing) {
+					if (existing?.status === "pending") {
 						await assertExecutionApprovalSpecIdentity(existing);
 						assertExecutionApprovalRecordMatchesCurrentState(existing, {
 							sessionId: options.sessionId,
@@ -2177,6 +2180,25 @@ export async function recordDeepInterviewExecutionApproval(options: {
 			);
 		},
 		{ cwd: options.cwd },
+	);
+}
+
+export async function revokeDeepInterviewExecutionApproval(cwd: string, sessionId: string): Promise<void> {
+	const recordPath = deepInterviewExecutionApprovalRecordPath(cwd, sessionId);
+	await withWorkflowStateLock(
+		recordPath,
+		async () => {
+			const existing = await readDeepInterviewExecutionApprovalRecord(recordPath);
+			if (existing?.status !== "pending") return;
+			const revokedAt = nowIso();
+			await writeDeepInterviewExecutionApprovalRecord(cwd, sessionId, {
+				...existing,
+				status: "consumed",
+				consumed_at: revokedAt,
+				consumed_mutation_id: `deep-interview:approval-revoked:${revokedAt}`,
+			});
+		},
+		{ cwd },
 	);
 }
 
