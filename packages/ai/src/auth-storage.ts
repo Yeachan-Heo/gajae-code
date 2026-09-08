@@ -4602,7 +4602,6 @@ export class AuthStorage {
 		const initialTarget = locateTarget();
 		if (!initialTarget) return false;
 
-		const providerKey = this.#getProviderTypeKey(provider, initialTarget.type);
 		const now = Date.now();
 		let blockedUntil = now + (options?.retryAfterMs ?? AuthStorage.#defaultBackoffMs);
 
@@ -4621,12 +4620,14 @@ export class AuthStorage {
 
 		// Indexes are positions in a mutable array: a credential snapshot that
 		// removes or reorders a preceding row while the usage lookup above was
-		// pending shifts them. Re-locate the row by id right before marking so
-		// the backoff lands on the row that failed, and mark nothing if it is gone.
-		// The pointer path keeps its captured position: the pointer is the only
-		// identity it has.
-		const target = rowId === undefined ? initialTarget : this.#findCredentialByRowId(provider, rowId);
+		// pending shifts them, and `#setStoredCredentials` then drops the
+		// session pointers for the provider. Locate the target again right
+		// before marking: by id the backoff lands on the row that failed, and
+		// by pointer a cleared pointer marks nothing rather than the row that
+		// now sits at the captured index.
+		const target = locateTarget();
 		if (!target) return false;
+		const providerKey = this.#getProviderTypeKey(provider, target.type);
 
 		this.#markCredentialBlocked(providerKey, target.index, blockedUntil);
 
