@@ -1041,6 +1041,11 @@ describe("openai-codex streaming", () => {
 		const httpResult = await streamOpenAICodexResponses(model, context, { apiKey: token }).result();
 		expect(httpResult.stopReason).toBe("error");
 		expect(httpResult.errorMessage).toContain(providerMessage);
+		expect(httpResult.transportFailure).toMatchObject({
+			status: 400,
+			providerCode: "invalid_request_error",
+			credentialModelUnavailable: true,
+		});
 		expect(httpResult.errorMessage).not.toContain("Select a model available to this ChatGPT account");
 		expect(httpResult.errorMessage).not.toContain("API-key credential");
 
@@ -1055,6 +1060,9 @@ describe("openai-codex streaming", () => {
 		expect(streamResult.stopReason).toBe("error");
 		expect(streamResult.errorMessage).toContain(providerMessage);
 		expect(streamResult.errorMessage).toContain("code=invalid_request_error");
+		expect(streamResult.transportFailure).toMatchObject({
+			credentialModelUnavailable: true,
+		});
 		expect(streamResult.errorMessage).not.toContain("Select a model available to this ChatGPT account");
 		expect(streamResult.errorMessage).not.toContain("API-key credential");
 	});

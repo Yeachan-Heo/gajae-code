@@ -174,6 +174,7 @@ const CODEX_NON_RETRYABLE_EVENT_MESSAGE =
 	/invalid[_ -]function[_ -]parameters|invalid schema for function|invalid[_ -]tool[_ -]schema|schema must have type ["']?object["']?|request blocked[^\n]*invalid[_ -]prompt|code=invalid[_ -]prompt/i;
 const CODEX_RETRYABLE_EVENT_MESSAGE =
 	/processing your request|retry your request|temporar(?:y|ily)|overloaded|service.?unavailable|internal error|server error/i;
+const CODEX_ACCOUNT_MODEL_UNAVAILABLE_MESSAGE = /\bnot supported when using codex with a chatgpt account\b/i;
 const CODEX_PROVIDER_SESSION_STATE_KEY = "openai-codex-responses";
 const X_CODEX_TURN_STATE_HEADER = "x-codex-turn-state";
 const X_MODELS_ETAG_HEADER = "x-models-etag";
@@ -2865,6 +2866,9 @@ async function openCodexSseEventStream(
 		(error as { headers?: Headers; status?: number }).headers = response.headers;
 		(error as { headers?: Headers; status?: number }).status = response.status;
 		(error as { code?: string }).code = info.code;
+		if (isCodexAccountModelUnavailable(info.message, info.code)) {
+			(error as { credentialModelUnavailable?: true }).credentialModelUnavailable = true;
+		}
 		throw error;
 	}
 	if (!response.body) {
@@ -3211,6 +3215,7 @@ function getCodexEventErrorMessage(rawEvent: Record<string, unknown>): string {
 class CodexProviderStreamError extends Error {
 	readonly retryable: boolean;
 	readonly code?: string;
+	readonly credentialModelUnavailable: boolean;
 	/**
 	 * Provider-supplied message, before display formatting appends `code=`/`status=`
 	 * metadata. Classification must read this, never `message`: the formatted string
@@ -3219,12 +3224,19 @@ class CodexProviderStreamError extends Error {
 	 */
 	readonly providerMessage: string;
 
-	constructor(message: string, retryable: boolean, code: string | undefined, providerMessage: string) {
+	constructor(
+		message: string,
+		retryable: boolean,
+		code: string | undefined,
+		providerMessage: string,
+		credentialModelUnavailable: boolean,
+	) {
 		super(message);
 		this.name = "CodexProviderStreamError";
 		this.retryable = retryable;
 		this.code = code;
 		this.providerMessage = providerMessage;
+		this.credentialModelUnavailable = credentialModelUnavailable;
 	}
 }
 
@@ -3255,6 +3267,13 @@ function createCodexProviderStreamError(rawEvent: Record<string, unknown>): Code
 		isRetryableCodexFailureEvent(rawEvent),
 		code || undefined,
 		message,
+		isCodexAccountModelUnavailable(message, code),
+	);
+}
+
+function isCodexAccountModelUnavailable(message: string | undefined, code: string | undefined): boolean {
+	return (
+		CODEX_ACCOUNT_MODEL_UNAVAILABLE_MESSAGE.test(message ?? "") && code?.toLowerCase() === "invalid_request_error"
 	);
 }
 
