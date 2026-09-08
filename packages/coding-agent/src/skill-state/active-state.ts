@@ -869,18 +869,21 @@ async function persistActiveEntry(
 	cwd: string,
 	sessionScope: ActiveSessionScope | undefined,
 	entry: SkillActiveEntry,
+	activeStateScopeLockHeld = false,
 ): Promise<GuardedWriteResult | undefined> {
 	if (entry.active === false) {
 		await removeActiveEntry(cwd, sessionScope, entry.skill, {
 			cwd,
 			audit: activeStateWriterAudit("remove-active-entry", sessionScope),
 			sourceRevision: entry.source_state_revision,
+			activeStateScopeLockHeld,
 		});
 		return undefined;
 	}
 	return await writeActiveEntry(cwd, sessionScope, entry.skill, entry, {
 		cwd,
 		audit: activeStateWriterAudit("write-active-entry", sessionScope),
+		activeStateScopeLockHeld,
 	});
 }
 
@@ -907,12 +910,14 @@ async function removeSupersededPlanningPipelineEntries(
 	cwd: string,
 	sessionScope: ActiveSessionScope | undefined,
 	entry: SkillActiveEntry,
+	activeStateScopeLockHeld = false,
 ): Promise<void> {
 	if (entry.active === false) return;
 	for (const skill of upstreamPlanningPipelineSkills(entry.skill)) {
 		await removeActiveEntry(cwd, sessionScope, skill, {
 			cwd,
 			audit: activeStateWriterAudit("remove-superseded-pipeline-entry", sessionScope),
+			activeStateScopeLockHeld,
 		});
 	}
 }
@@ -963,14 +968,16 @@ export async function syncSkillActiveState(
 		...(typeof options.sourceRevision === "number" ? { source_state_revision: options.sourceRevision } : {}),
 	};
 	const sessionScope = { sessionId: options.sessionId };
-	await removeSupersededPlanningPipelineEntries(options.cwd, sessionScope, entry);
-	const entryWrite = await persistActiveEntry(options.cwd, sessionScope, entry);
-	try {
-		await rebuildActiveState(options.cwd, sessionScope);
-	} catch (error) {
-		if (!options.bestEffortSnapshot) throw error;
-	}
-	return entryWrite;
+	return withActiveStateScopeLock(options.cwd, sessionScope, async () => {
+		await removeSupersededPlanningPipelineEntries(options.cwd, sessionScope, entry, true);
+		const entryWrite = await persistActiveEntry(options.cwd, sessionScope, entry, true);
+		try {
+			await rebuildActiveState(options.cwd, sessionScope);
+		} catch (error) {
+			if (!options.bestEffortSnapshot) throw error;
+		}
+		return entryWrite;
+	});
 }
 
 export interface ApplyHandoffOptions {

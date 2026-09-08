@@ -838,8 +838,8 @@ describe("TUI raster lease public boundary", () => {
 		// The retained payload is delivered by the first start() after stop.
 		expect(terminal.getWriteLog().join("")).toContain("PET_ERASE");
 
-		// (b) Started body paused at an await when stop occurs: no suffix/abort/GIF
-		// bytes and no cursor restoration may follow stop.
+		// (b) Started body paused at an await when stop occurs: stop synchronously
+		// closes the prefix barrier, and no body bytes may follow afterward.
 		const lease = await tui.acquireRasterLease(request("paused"));
 		if (lease.status !== "acquired") throw new Error("lease not acquired");
 		terminal.clearWriteLog();
@@ -865,12 +865,14 @@ describe("TUI raster lease public boundary", () => {
 		await Bun.sleep(5);
 		expect(terminal.getWriteLog().join("")).toContain("PREFIX");
 		tui.stop();
+		const multipartAtStop = terminal.getWriteLog().join("");
+		expect(multipartAtStop).toContain("ABORT_BYTES");
 		releaseAfterPrefix();
 		const ack = await submit;
 		expect(ack.status).toBe("failed");
 		const after = terminal.getWriteLog().join("");
+		expect(after).toBe(multipartAtStop);
 		expect(after).not.toContain("SUFFIX");
-		expect(after).not.toContain("ABORT_BYTES");
 		expect(after).not.toContain("GIF");
 
 		// (c) A shouldWrite predicate that stops the terminal mid-operation must

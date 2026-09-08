@@ -2075,7 +2075,6 @@ export class Agent {
 				: undefined,
 			afterToolCall: this.afterToolCall
 				? async (ctx, signal) => {
-						if (this.#activeRunId !== runId) return undefined;
 						const result = await this.afterToolCall?.(ctx, signal);
 						if (this.#activeRunId !== runId) return undefined;
 						return result;

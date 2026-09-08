@@ -5059,6 +5059,7 @@ export class AgentSession {
 				typeof ctx.result.details === "object" &&
 				typeof (ctx.result.details as { cancellation?: unknown }).cancellation === "string"
 			) {
+				this.#perToolTtsrInjections.delete(ctx.toolCall.id);
 				return undefined;
 			}
 			return this.#ttsrAfterToolCall(ctx);
@@ -7446,6 +7447,11 @@ export class AgentSession {
 		// TTSR: Increment message count on turn end (for repeat-after-gap tracking)
 		if (event.type === "turn_end" && this.#ttsrManager) {
 			this.#ttsrManager.incrementMessageCount();
+			this.sessionManager.appendTtsrInjection(
+				[],
+				this.#ttsrManager.getInjectedRecords(),
+				this.#ttsrManager.getMessageCount(),
+			);
 		}
 		// Finalize the tool-choice queue's in-flight yield after tools have executed.
 		// This must happen at turn_end (not message_end) because onInvoked handlers

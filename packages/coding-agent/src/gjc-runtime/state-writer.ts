@@ -1103,25 +1103,29 @@ export async function removeActiveEntry(
 	options?: StateWriterOptions,
 ): Promise<DeleteResult> {
 	const filePath = activeEntryPath(path.resolve(cwd), sessionScope, skill);
-	return lockResolvedWorkflowTarget(
-		filePath,
-		async () => {
-			const current = await readJsonIfPresent(filePath);
-			const incomingSourceRevision = options?.sourceRevision;
-			if (
-				current !== undefined &&
-				incomingSourceRevision !== undefined &&
-				incomingSourceRevision < persistedSourceRevision(current)
-			) {
-				return { path: filePath, deleted: false };
-			}
-			const deleted = await atomicRemove(filePath);
-			if (deleted) await maybeAudit(filePath, options);
-			if (deleted) invalidateActiveStateCacheForScope(cwd, sessionScope);
-			return { path: filePath, deleted };
-		},
-		options?.lock,
-	);
+	const remove = () =>
+		lockResolvedWorkflowTarget(
+			filePath,
+			async () => {
+				const current = await readJsonIfPresent(filePath);
+				const incomingSourceRevision = options?.sourceRevision;
+				if (
+					current !== undefined &&
+					incomingSourceRevision !== undefined &&
+					incomingSourceRevision < persistedSourceRevision(current)
+				) {
+					return { path: filePath, deleted: false };
+				}
+				const deleted = await atomicRemove(filePath);
+				if (deleted) await maybeAudit(filePath, options);
+				if (deleted) invalidateActiveStateCacheForScope(cwd, sessionScope);
+				return { path: filePath, deleted };
+			},
+			options?.lock,
+		);
+	return options?.activeStateScopeLockHeld
+		? await remove()
+		: await withActiveStateScopeLock(cwd, sessionScope, remove);
 }
 
 export async function readActiveEntries(
