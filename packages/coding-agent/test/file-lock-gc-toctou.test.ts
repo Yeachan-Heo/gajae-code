@@ -687,6 +687,46 @@ describe("host-qualified file lock publication", () => {
 	});
 });
 describe("file lock cleanup failure handling (#2478)", () => {
+	test.each([
+		"quarantine_collision",
+		"identity_mismatch",
+	] as const)("reports %s when dead-owner removal keeps failing without stealing the lock", async code => {
+		const lockedFile = path.join(await makeTemp(), "state.json");
+		const lockDir = `${lockedFile}.lock`;
+		await writeInfo(lockDir, { pid: DEAD_PID, timestamp: Date.now() - 60_000 });
+		const originalInfo = await Bun.file(path.join(lockDir, "info")).text();
+		const realKill = process.kill;
+		vi.spyOn(process, "kill").mockImplementation((pid, signal) => {
+			if (pid === DEAD_PID) throw Object.assign(new Error("dead owner"), { code: "ESRCH" });
+			return realKill(pid, signal);
+		});
+		let attempts = 0;
+		FileLockTestHooks.nativeQuarantineBindings = () => ({
+			snapshotDirectoryTree,
+			exactRemoveDirectoryTree: () => {
+				attempts++;
+				return { ok: false, code };
+			},
+		});
+		let entered = false;
+		const pending = withFileLock(
+			lockedFile,
+			async () => {
+				entered = true;
+			},
+			{ retries: 2, retryDelayMs: 1 },
+		);
+		await expect(pending).rejects.toBeInstanceOf(FileLockAcquireError);
+		await expect(pending).rejects.toThrow(
+			code === "identity_mismatch"
+				? "last stale removal refused: owner_changed"
+				: "last stale removal refused: Failed to remove file lock tree: quarantine_collision.",
+		);
+		expect(attempts).toBe(2);
+		expect(entered).toBe(false);
+		expect(await Bun.file(path.join(lockDir, "info")).text()).toBe(originalInfo);
+	});
+
 	test("refuses generic release without pre-verdict identity instead of capturing a successor", async () => {
 		const base = await makeTemp();
 		const lockedFile = path.join(base, "state.json");

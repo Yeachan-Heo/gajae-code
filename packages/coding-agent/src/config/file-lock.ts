@@ -980,16 +980,23 @@ async function staleLockSnapshot(
 	return { stale: false };
 }
 
-async function removeStaleLockForAcquire(lockPath: string, snapshot: LockStaleSnapshot): Promise<boolean> {
-	if (!snapshot.stale) return false;
+async function removeStaleLockForAcquire(
+	lockPath: string,
+	snapshot: LockStaleSnapshot,
+): Promise<{ removed: boolean; refusal?: string }> {
+	if (!snapshot.stale) return { removed: false };
 	try {
-		return (await removeFileLockDirForGc(lockPath, snapshot.owner, snapshot.identity)) === "removed";
-	} catch {
+		const result = await removeFileLockDirForGc(lockPath, snapshot.owner, snapshot.identity);
+		return result === "removed" ? { removed: true } : { removed: false, refusal: result };
+	} catch (error) {
 		// Exact removal refusal is not authority to fail or mutate by another path.
 		// Keep contending: a concurrent reclaimer may already be completing the same
 		// dead generation, while a persistent refusal remains fail-closed until the
 		// normal retry budget reports the still-held lock.
-		return false;
+		return {
+			removed: false,
+			refusal: error instanceof Error ? error.message : "unknown removal failure",
+		};
 	}
 }
 
@@ -1410,6 +1417,7 @@ export async function acquireFileLock(filePath: string, options: FileLockOptions
 	}
 	const ownerToken = crypto.randomUUID();
 	const contentionStartTimes = new Map<string, string | null>();
+	let lastStaleRemovalRefusal: string | undefined;
 	for (let attempt = 0; attempt < opts.retries; attempt++) {
 		if (opts.signal?.aborted) throw opts.signal.reason ?? new Error("File lock acquisition aborted");
 		const localKey = await localLockKey(lockPath);
@@ -1441,7 +1449,9 @@ export async function acquireFileLock(filePath: string, options: FileLockOptions
 			opts.previousOwnerHostIds,
 			contentionStartTimes,
 		);
-		if (await removeStaleLockForAcquire(lockPath, stale)) continue;
+		const removal = await removeStaleLockForAcquire(lockPath, stale);
+		lastStaleRemovalRefusal = removal.refusal;
+		if (removal.removed) continue;
 		if (!opts.signal) {
 			await Bun.sleep(opts.retryDelayMs);
 			continue;
@@ -1456,7 +1466,13 @@ export async function acquireFileLock(filePath: string, options: FileLockOptions
 			opts.signal.removeEventListener("abort", onAbort);
 		}
 	}
-	throw new FileLockAcquireError(filePath, lockPath, opts.retries, await lockHolderDescription(lockPath));
+	const holder = await lockHolderDescription(lockPath);
+	throw new FileLockAcquireError(
+		filePath,
+		lockPath,
+		opts.retries,
+		lastStaleRemovalRefusal ? `${holder}; last stale removal refused: ${lastStaleRemovalRefusal}` : holder,
+	);
 }
 
 /**
