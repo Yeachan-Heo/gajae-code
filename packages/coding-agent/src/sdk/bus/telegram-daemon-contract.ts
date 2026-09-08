@@ -291,7 +291,7 @@ export const SDK_LIFECYCLE_ROUTER_PROTOCOL_VERSION = 1;
  * killing a session's mirroring after one transient rejection and must be
  * replaced across this upgrade.
  */
-export const DAEMON_GENERATION = 182;
+export const DAEMON_GENERATION = 183;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 7
