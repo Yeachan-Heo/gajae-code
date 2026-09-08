@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test";
 
-import { finalizeCursorUsageForTest } from "../src/providers/cursor";
+import { finalizeCursorUsageForTest, hashCursorUsageValueForTest } from "../src/providers/cursor";
 import type { Usage } from "../src/types";
 
 /**
@@ -128,5 +128,34 @@ describe("cursor conversation usage", () => {
 		expect(firstTurn.totalTokens).toBe(10_000);
 		expect(secondTurn.input).toBe(225);
 		expect(secondTurn.totalTokens).toBe(250);
+	});
+});
+
+describe("cursor usage-context hashing", () => {
+	it("hashes tool definitions that carry bigint runtime identity fields", () => {
+		const tools = [
+			{
+				name: "read",
+				description: "read a file",
+				runner: { sessionManager: { securityContext: { rootAuthority: { dev: 16777234n, ino: 257191361n } } } },
+			},
+		];
+
+		expect(() => hashCursorUsageValueForTest(tools)).not.toThrow();
+		expect(hashCursorUsageValueForTest(tools)).toBe(hashCursorUsageValueForTest(tools));
+	});
+
+	it("still separates tool sets that differ only in a bigint field", () => {
+		const withDev = (dev: bigint) => [{ name: "read", runner: { rootAuthority: { dev } } }];
+
+		expect(hashCursorUsageValueForTest(withDev(1n))).not.toBe(hashCursorUsageValueForTest(withDev(2n)));
+	});
+
+	it("hashes tool definitions holding executor closures and cycles", () => {
+		const tool: Record<string, unknown> = { name: "bash", execute: async () => undefined };
+		tool.self = tool;
+
+		expect(() => hashCursorUsageValueForTest([tool])).not.toThrow();
+		expect(hashCursorUsageValueForTest([tool])).not.toBe(hashCursorUsageValueForTest([{ name: "bash" }]));
 	});
 });

@@ -3386,10 +3386,39 @@ function hashCursorUsageMessage(message: { role: string; content: unknown }): st
 	return hashCursorUsageValue({ role: message.role, content: message.content });
 }
 
+/**
+ * Serialize an arbitrary value for usage-context hashing.
+ *
+ * The hashed inputs are live runtime objects: tool definitions carry executor
+ * closures and back-references into the session runtime, whose file-identity
+ * fields hold `bigint` values from `fs.stat({ bigint: true })`. A bare
+ * `JSON.stringify` throws on those, which would abort every Cursor request
+ * instead of merely losing a cache key. Normalize the hostile shapes
+ * (`bigint`, functions, cycles) so hashing stays total and deterministic.
+ */
+function hashCursorUsageSerialize(value: unknown): string {
+	const seen = new WeakSet<object>();
+	return (
+		JSON.stringify(value, (_key, item) => {
+			if (typeof item === "bigint") return `[BigInt:${item.toString()}]`;
+			if (typeof item === "function") return `[Function:${item.name || "anonymous"}]`;
+			if (typeof item === "symbol") return `[Symbol:${item.description ?? ""}]`;
+			if (item !== null && typeof item === "object") {
+				if (seen.has(item)) return "[Circular]";
+				seen.add(item);
+			}
+			return item;
+		}) ?? ""
+	);
+}
+
+/** Exported for tests: hashes a usage-context input the way live requests do. */
+export function hashCursorUsageValueForTest(value: unknown): string {
+	return hashCursorUsageValue(value);
+}
+
 function hashCursorUsageValue(value: unknown): string {
-	return createHash("sha256")
-		.update(JSON.stringify(value) ?? "")
-		.digest("hex");
+	return createHash("sha256").update(hashCursorUsageSerialize(value)).digest("hex");
 }
 
 function canReuseCursorUsageContext(previous: CursorUsageContext | undefined, current: CursorUsageContext): boolean {
