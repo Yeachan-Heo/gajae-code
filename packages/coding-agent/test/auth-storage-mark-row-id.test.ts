@@ -20,10 +20,21 @@ describe("AuthStorage.markUsageLimitReached with an explicit row id", () => {
 	let tempDir: string;
 	let authStorage: AuthStorage;
 
+	/** When set, the usage lookup for this account parks until `releaseUsage` runs. */
+	let deferUsageFor: string | undefined;
+	let usageEntered: (() => void) | undefined;
+	let releaseUsage: (() => void) | undefined;
+
 	const usageProvider: UsageProvider = {
 		id: PROVIDER,
 		async fetchUsage(params) {
 			const accountId = params.credential.accountId ?? "unknown";
+			if (accountId === deferUsageFor) {
+				usageEntered?.();
+				await new Promise<void>(resolve => {
+					releaseUsage = resolve;
+				});
+			}
 			return {
 				provider: PROVIDER,
 				fetchedAt: Date.now(),
@@ -62,6 +73,9 @@ describe("AuthStorage.markUsageLimitReached with an explicit row id", () => {
 	});
 
 	afterEach(() => {
+		deferUsageFor = undefined;
+		usageEntered = undefined;
+		releaseUsage = undefined;
 		authStorage.close();
 		fs.rmSync(tempDir, { recursive: true, force: true });
 		vi.restoreAllMocks();
@@ -108,6 +122,40 @@ describe("AuthStorage.markUsageLimitReached with an explicit row id", () => {
 		const afterKey = await authStorage.getApiKey(PROVIDER, sessionId);
 		expect(afterKey).not.toBe(driftedKey);
 		expect(afterKey).not.toBe("api-acct-a");
+	});
+
+	test("re-locates the named row after the usage lookup when a preceding row is removed meanwhile", async () => {
+		// Rows are A, B, C. The failed row is C (index 2). While C's usage lookup is
+		// pending, A is removed, so C shifts to index 1. A mark that kept the index
+		// captured before the await would back off nothing (index 2 is gone) and
+		// leave C eligible; the mark must land on C by id.
+		authStorage.removeRuntimePreferredCredentialSelector(PROVIDER);
+		const targets = authStorage.listCredentialRemovalTargets(PROVIDER);
+		expect(targets.length).toBe(3);
+		const [targetA, , targetC] = targets;
+		if (!targetA || !targetC) throw new Error("expected three removal targets");
+
+		deferUsageFor = "acct-c";
+		const entered = new Promise<void>(resolve => {
+			usageEntered = resolve;
+		});
+		const pending = authStorage.markUsageLimitReached(PROVIDER, "session-4", {
+			rowId: targetC.id,
+			retryAfterMs: 120_000,
+		});
+		await entered;
+
+		const removal = authStorage.removeAuthCredentialsHard(PROVIDER, [targetA]);
+		expect(removal.kind).toBe("removed");
+		releaseUsage?.();
+
+		expect(await pending).toBe(true);
+		// C is blocked, so a session that prefers C lands on B; A no longer exists.
+		expect(
+			await authStorage.getApiKey(PROVIDER, "session-5", {
+				preferredCredentialSelector: { kind: "email", value: "c@x.test" },
+			}),
+		).toBe("api-acct-b");
 	});
 
 	test("an unknown row id marks nothing", async () => {

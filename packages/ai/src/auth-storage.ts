@@ -4594,18 +4594,20 @@ export class AuthStorage {
 		provider = resolveOAuthStorageProvider(provider);
 		const ownerOverride = this.#configOverrideRegistration(provider, options?.owner);
 		if (ownerOverride && !ownerOverride.envSourced) return false;
-		const sessionCredential =
-			options?.rowId === undefined
+		const rowId = options?.rowId;
+		const locateTarget = () =>
+			rowId === undefined
 				? this.#getSessionCredential(provider, sessionId)
-				: this.#findCredentialByRowId(provider, options.rowId);
-		if (!sessionCredential) return false;
+				: this.#findCredentialByRowId(provider, rowId);
+		const initialTarget = locateTarget();
+		if (!initialTarget) return false;
 
-		const providerKey = this.#getProviderTypeKey(provider, sessionCredential.type);
+		const providerKey = this.#getProviderTypeKey(provider, initialTarget.type);
 		const now = Date.now();
 		let blockedUntil = now + (options?.retryAfterMs ?? AuthStorage.#defaultBackoffMs);
 
-		if (sessionCredential.type === "oauth" && this.#rankingStrategyResolver?.(provider)) {
-			const credential = this.#getCredentialsForProvider(provider)[sessionCredential.index];
+		if (initialTarget.type === "oauth" && this.#rankingStrategyResolver?.(provider)) {
+			const credential = this.#getCredentialsForProvider(provider)[initialTarget.index];
 			if (credential?.type === "oauth") {
 				const report = await this.#getUsageReport(provider, credential, options);
 				if (report && this.#isUsageLimitReached(report)) {
@@ -4617,13 +4619,22 @@ export class AuthStorage {
 			}
 		}
 
-		this.#markCredentialBlocked(providerKey, sessionCredential.index, blockedUntil);
+		// Indexes are positions in a mutable array: a credential snapshot that
+		// removes or reorders a preceding row while the usage lookup above was
+		// pending shifts them. Re-locate the row by id right before marking so
+		// the backoff lands on the row that failed, and mark nothing if it is gone.
+		// The pointer path keeps its captured position: the pointer is the only
+		// identity it has.
+		const target = rowId === undefined ? initialTarget : this.#findCredentialByRowId(provider, rowId);
+		if (!target) return false;
+
+		this.#markCredentialBlocked(providerKey, target.index, blockedUntil);
 
 		const remainingCredentials = this.#getCredentialsForProvider(provider)
 			.map((credential, index) => ({ credential, index }))
 			.filter(
 				(entry): entry is { credential: AuthCredential; index: number } =>
-					entry.credential.type === sessionCredential.type && entry.index !== sessionCredential.index,
+					entry.credential.type === target.type && entry.index !== target.index,
 			);
 
 		return remainingCredentials.some(candidate => !this.#isCredentialBlocked(providerKey, candidate.index));
