@@ -41,6 +41,7 @@ import {
 	assertDeepInterviewStructuredResponseWithinLimit,
 	MAX_USER_RESPONSE_LENGTH,
 } from "../gjc-runtime/deep-interview-state";
+import { recordDeepInterviewExecutionApproval } from "../gjc-runtime/state-runtime";
 import {
 	type AskGateQuestion,
 	gateAnswerToResult,
@@ -154,6 +155,21 @@ function errorMessage(error: unknown): string {
 
 function nonEmptyCustomInput(value: string | undefined): string | undefined {
 	return value !== undefined && value.trim().length > 0 ? value : undefined;
+}
+
+function deepInterviewExecutionTarget(selectedOptions: readonly string[]): "ultragoal" | undefined {
+	if (selectedOptions.length !== 1) return undefined;
+	const normalized = selectedOptions[0]
+		?.trim()
+		.replace(/\s*\(Recommended\)\s*$/i, "")
+		.toLowerCase();
+	return normalized === "approve execution via ultragoal" ||
+		normalized === "execute with ultragoal" ||
+		normalized === "ultragoal" ||
+		normalized === "/skill:ultragoal" ||
+		normalized === "gjc ultragoal"
+		? "ultragoal"
+		: undefined;
 }
 
 function isAskTimeoutError(error: unknown): boolean {
@@ -318,6 +334,7 @@ interface SelectionResult {
 	selectedOptions: string[];
 	customInput?: string;
 	clarificationQuestion?: string;
+	executionGateId?: string;
 	timedOut: boolean;
 	navigation?: "back" | "forward";
 	cancelled?: boolean;
@@ -847,6 +864,33 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 		);
 	}
 
+	/**
+	 * The Deep Interview execution choice is the only ask answer that can mint
+	 * execution authority.  The runtime records only the redacted answer hash;
+	 * the subsequent CLI action must consume that record before it can approve
+	 * the canonical Crystal.
+	 */
+	async #recordDeepInterviewExecutionApproval(
+		q: AskParams["questions"][number],
+		selectedOptions: string[],
+		customInput: string | undefined,
+		executionGateId?: string,
+	): Promise<void> {
+		if (q.workflowGate?.stage !== "deep-interview" || q.workflowGate.kind !== "execution") return;
+		const target = deepInterviewExecutionTarget(selectedOptions);
+		if (!target || customInput !== undefined) return;
+		const sessionId = this.session.getSessionId?.();
+		if (!sessionId) throw new ToolAbortError("Deep Interview execution approval requires a session");
+		await recordDeepInterviewExecutionApproval({
+			cwd: this.session.cwd,
+			sessionId,
+			questionId: q.id,
+			gateId: executionGateId ?? q.id,
+			target,
+			selectedOptions,
+		});
+	}
+
 	async execute(
 		_toolCallId: string,
 		params: AskParams,
@@ -1217,13 +1261,25 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 					allowEmpty: q.multi === true && params.questions.length > 1,
 					navigationLabel: questionIndex === params.questions.length - 1 ? "Done" : "Next",
 				};
-				const answer = await awaitAskAnswer(() => gateEmitter.emitGate(questionToGate(gateQuestion)));
+				let executionGateId: string | undefined;
+				const stopGateObservation = gateEmitter.onGateEmitted?.(gate => {
+					const stageState = gate.context?.stage_state;
+					if (gate.stage === "deep-interview" && gate.kind === "execution" && stageState?.question_id === q.id)
+						executionGateId = gate.gate_id;
+				});
+				let answer: unknown;
+				try {
+					answer = await gateEmitter.emitGate(questionToGate(gateQuestion));
+				} finally {
+					stopGateObservation?.();
+				}
 				const decoded = gateAnswerToResult(gateQuestion, answer);
 				return {
 					optionLabels: rawOptionLabels,
 					selectedOptions: decoded.selectedOptions,
 					customInput: decoded.customInput,
 					clarificationQuestion: decoded.clarificationQuestion,
+					executionGateId,
 					navigation: undefined as NavigationControls | undefined,
 					cancelled: false,
 					timedOut: false,
@@ -1409,8 +1465,15 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 
 		if (params.questions.length === 1) {
 			const [q] = params.questions;
-			const { optionLabels, selectedOptions, customInput, clarificationQuestion, cancelled, timedOut } =
-				await askQuestion(q);
+			const {
+				optionLabels,
+				selectedOptions,
+				customInput,
+				clarificationQuestion,
+				executionGateId,
+				cancelled,
+				timedOut,
+			} = await askQuestion(q);
 
 			if (
 				!timedOut &&
@@ -1426,6 +1489,7 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 			) {
 				await this.#recordDeepInterviewRound(q, selectedOptions, customInput);
 			}
+			await this.#recordDeepInterviewExecutionApproval(q, selectedOptions, customInput, executionGateId);
 			const details: AskToolDetails = {
 				question: q.question,
 				options: optionLabels,
@@ -1481,6 +1545,7 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 				selectedOptions,
 				customInput,
 				clarificationQuestion,
+				executionGateId,
 				navigation: navAction,
 				cancelled,
 				timedOut,
@@ -1512,6 +1577,7 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 				questionIndex = Math.max(0, questionIndex - 1);
 				continue;
 			}
+			await this.#recordDeepInterviewExecutionApproval(q, selectedOptions, customInput, executionGateId);
 
 			questionIndex += 1;
 		}

@@ -14,6 +14,7 @@ import {
 	runNativeDeepInterviewCommand,
 } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-runtime";
 import { sessionSpecsDir } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
+import { recordDeepInterviewExecutionApproval } from "@gajae-code/coding-agent/gjc-runtime/state-runtime";
 import {
 	beginWorkflowTransactionJournal,
 	readWorkflowTransactionJournal,
@@ -107,6 +108,33 @@ describe("deep-interview crystallize contract", () => {
 		expect(() => crystallizeDeepInterview(input({ removed_ids: ["goal:report)\n- injected"] }))).toThrow(
 			"valid item identifiers",
 		);
+	});
+
+	it("rejects positive requirements classified as confirmed non-goals", () => {
+		const base = input();
+		const snapshot: CrystalSnapshot = {
+			...base.snapshot,
+			messages: [{ index: 0, role: "user", content: "Build a fast report. Build audit reports." }],
+			digest: "",
+		};
+		snapshot.digest = crystalSnapshotDigest(snapshot);
+		expect(() =>
+			crystallizeDeepInterview(
+				input({
+					snapshot,
+					items: [
+						input().items[0]!,
+						{
+							id: "non-goal:audit",
+							kind: "non_goal",
+							classification: "confirmed",
+							statement: "Build audit reports",
+							anchor: { message_index: 0, quote: "Build audit reports." },
+						},
+					],
+				}),
+			),
+		).toThrow("statement-bound verbatim user anchor");
 	});
 
 	it("rejects confirmed statements unrelated to their user quote", () => {
@@ -719,6 +747,7 @@ describe("deep-interview crystallize contract", () => {
 			],
 			["Do not use PostgreSQL; use Redis.", "Do not use PostgreSQL; use Redis.", "Do not use Redis"],
 			["Use 5 replicas and 10 workers.", "Use 5 replicas and 10 workers.", "Use 10 replicas and 5 workers"],
+			["Use one replica.", "Use one replica.", "Use replica"],
 			["Keep logging off.", "Keep logging off.", "Keep logging on"],
 			["Failure ratio must be 1:2.", "Failure ratio must be 1:2.", "Failure ratio must be 1 2"],
 			["Failure ratio must be 1 : 2.", "Failure ratio must be 1 : 2.", "Failure ratio must be 1 2"],
@@ -2370,6 +2399,14 @@ describe("deep-interview crystallize contract", () => {
 				root,
 			);
 			expect(first.status).toBe(0);
+			await recordDeepInterviewExecutionApproval({
+				cwd: root,
+				sessionId,
+				questionId: "crystallize-execution",
+				gateId: "crystallize-execution",
+				target: "ultragoal",
+				selectedOptions: ["Approve execution via ultragoal"],
+			});
 			const approved = await runNativeDeepInterviewCommand(
 				["approve-execution", "--session-id", sessionId, "--json"],
 				root,
