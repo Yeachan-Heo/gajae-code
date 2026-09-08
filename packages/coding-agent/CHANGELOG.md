@@ -46,6 +46,8 @@
 
 ### Fixed
 
+- SDK `session.close` now accepts a native payload-durable zero-byte endpoint placeholder when cleaning up a dead host. The broker no longer retries that proven placeholder as JSON and falsely reports `terminal_uncertain`; unknown or replaced artifacts remain refused.
+
 - SDK submissions that reject during post-turn cleanup no longer publish a contradictory second terminal after their correlation has already settled.
 - Paseo session imports discard unused CLI stdout instead of leaving an unread pipe.
 - SDK live-attach streams preserve producer order across text deltas, final messages, and tool events even when asynchronous extension handlers are slow, without replaying or broadcasting turn content. Content observed while the correlated `agent_start` is still being durably recorded is held and released after the start frame, so no consumer sees turn content before the turn it belongs to; held content is delivered only to the owners that held the run when it was produced, and the hold is bounded (256 events, oldest dropped with one warning) so a wedged start write can neither invert the start/content boundary nor accumulate a whole response in memory.

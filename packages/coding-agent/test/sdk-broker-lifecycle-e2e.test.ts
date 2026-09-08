@@ -4857,6 +4857,173 @@ test("close removes an unchanged dead endpoint with a fractional nanosecond mtim
 	}
 });
 
+test("close accepts a native durable placeholder for a dead endpoint", async () => {
+	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-dead-placeholder-"));
+	const agentDir = path.join(root, "agent");
+	const stateRoot = path.join(root, ".gjc", "state");
+	const sessionId = "durable-placeholder";
+	const endpointPath = path.join(stateRoot, "sdk", `${sessionId}.json`);
+	const deadPid = 4_194_304;
+	const broker = new Broker({ agentDir });
+	const originalKill = process.kill;
+	let sigkillAttempts = 0;
+	try {
+		expect(() => process.kill(deadPid, 0)).toThrow();
+		await fs.mkdir(path.dirname(endpointPath), { recursive: true });
+		await fs.writeFile(
+			endpointPath,
+			JSON.stringify({ sessionId, pid: deadPid, url: "ws://127.0.0.1:1", token: "durable-placeholder" }),
+		);
+		const endpointMtimeMs = (await fs.stat(endpointPath)).mtimeMs;
+		await broker.start();
+		await broker.index.append({
+			type: "host_registered",
+			sessionId,
+			locator: { cwd: root, worktreeRoot: null, stateRoot },
+			endpointGeneration: 1,
+			pid: deadPid,
+			processIncarnation: "dead-incarnation",
+			endpointMtimeMs,
+		});
+		const originalExactUnlink = native.exactUnlink.bind(native);
+		const unlinkSpy = vi.spyOn(native, "exactUnlink").mockImplementation((pathname, identity) => {
+			if (path.resolve(pathname) !== endpointPath) return originalExactUnlink(pathname, identity);
+			if (!identity.quarantineName) throw new Error("Expected endpoint cleanup quarantine name.");
+			const detachedPath = path.join(path.dirname(pathname), identity.quarantineName);
+			const retainedPlaceholderPath = path.join(path.dirname(pathname), ".gjc-exact-unlink-placeholder-fixture");
+			syncFs.renameSync(pathname, detachedPath);
+			syncFs.truncateSync(detachedPath, 0);
+			syncFs.writeFileSync(retainedPlaceholderPath, "");
+			return {
+				ok: false,
+				code: "cleanup_pending",
+				payloadDurable: true,
+				detachedPath,
+				retainedPlaceholderPath,
+			};
+		});
+		process.kill = ((pid: number, signal?: NodeJS.Signals | number) => {
+			if (pid === deadPid && signal === "SIGKILL") sigkillAttempts += 1;
+			return originalKill(pid, signal);
+		}) as typeof process.kill;
+		try {
+			expect(await broker.handleRequest("session.close", { sessionId }, "durable-placeholder-close")).toMatchObject({
+				ok: true,
+				result: { sessionId },
+			});
+		} finally {
+			unlinkSpy.mockRestore();
+		}
+		expect(sigkillAttempts).toBe(0);
+		await expect(fs.access(endpointPath)).rejects.toThrow();
+		expect(broker.index.listSessions().sessions).toEqual([
+			expect.objectContaining({ sessionId, terminal: true, live: false }),
+		]);
+	} finally {
+		process.kill = originalKill;
+		await broker.stop();
+		await fs.rm(root, { recursive: true, force: true });
+	}
+}, 15_000);
+
+test("close refuses an unknown empty endpoint placeholder", async () => {
+	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-unknown-placeholder-"));
+	const stateRoot = path.join(root, ".gjc", "state");
+	const endpointPath = path.join(stateRoot, "sdk/unknown-placeholder.json");
+	const broker = new Broker({ agentDir: path.join(root, "agent") });
+	try {
+		const deadPid = 4_194_304;
+		await fs.mkdir(path.dirname(endpointPath), { recursive: true });
+		await fs.writeFile(endpointPath, JSON.stringify({ sessionId: "unknown-placeholder", pid: deadPid }));
+		const endpointMtimeMs = (await fs.stat(endpointPath)).mtimeMs;
+		await broker.start();
+		await broker.index.append({
+			type: "host_registered",
+			sessionId: "unknown-placeholder",
+			locator: { cwd: root, worktreeRoot: null, stateRoot },
+			endpointGeneration: 1,
+			pid: deadPid,
+			processIncarnation: "dead-incarnation",
+			endpointMtimeMs,
+		});
+		const unlinkSpy = vi.spyOn(native, "exactUnlink").mockImplementation(pathname => {
+			syncFs.truncateSync(pathname, 0);
+			return { ok: false, code: "cleanup_pending", payloadDurable: true };
+		});
+		try {
+			expect(
+				await broker.handleRequest(
+					"session.close",
+					{ sessionId: "unknown-placeholder" },
+					"unknown-placeholder-close",
+				),
+			).toMatchObject({ ok: false, error: { code: "terminal_uncertain" } });
+		} finally {
+			unlinkSpy.mockRestore();
+		}
+		expect(syncFs.lstatSync(endpointPath).size).toBe(0);
+	} finally {
+		await broker.stop();
+		await fs.rm(root, { recursive: true, force: true });
+	}
+}, 15_000);
+
+test("close refuses a nonempty replacement of a durable endpoint placeholder", async () => {
+	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-replaced-placeholder-"));
+	const stateRoot = path.join(root, ".gjc", "state");
+	const sessionId = "replaced-placeholder";
+	const endpointPath = path.join(stateRoot, "sdk", `${sessionId}.json`);
+	const broker = new Broker({ agentDir: path.join(root, "agent") });
+	try {
+		const deadPid = 4_194_304;
+		await fs.mkdir(path.dirname(endpointPath), { recursive: true });
+		await fs.writeFile(endpointPath, JSON.stringify({ sessionId, pid: deadPid }));
+		const endpointMtimeMs = (await fs.stat(endpointPath)).mtimeMs;
+		await broker.start();
+		await broker.index.append({
+			type: "host_registered",
+			sessionId,
+			locator: { cwd: root, worktreeRoot: null, stateRoot },
+			endpointGeneration: 1,
+			pid: deadPid,
+			processIncarnation: "dead-incarnation",
+			endpointMtimeMs,
+			lifecycleRequestId: "replaced-placeholder-request",
+		});
+		const originalExactUnlink = native.exactUnlink.bind(native);
+		let detachedPath: string | undefined;
+		const unlinkSpy = vi.spyOn(native, "exactUnlink").mockImplementation((pathname, identity) => {
+			if (path.resolve(pathname) !== endpointPath) return originalExactUnlink(pathname, identity);
+			if (!identity.quarantineName) throw new Error("Expected endpoint cleanup quarantine name.");
+			detachedPath = path.join(path.dirname(pathname), identity.quarantineName);
+			syncFs.renameSync(pathname, detachedPath);
+			syncFs.writeFileSync(detachedPath, JSON.stringify({ sessionId, pid: deadPid, replacement: true }));
+			return {
+				ok: false,
+				code: "cleanup_pending",
+				payloadDurable: true,
+				detachedPath,
+				retainedPlaceholderPath: path.join(path.dirname(pathname), ".gjc-exact-unlink-placeholder-fixture"),
+			};
+		});
+		try {
+			expect(await broker.handleRequest("session.close", { sessionId }, "replaced-placeholder-close")).toMatchObject(
+				{
+					ok: false,
+					error: { code: "terminal_uncertain" },
+				},
+			);
+		} finally {
+			unlinkSpy.mockRestore();
+		}
+		if (!detachedPath) throw new Error("Expected retained replacement path.");
+		expect(JSON.parse(await fs.readFile(detachedPath, "utf8"))).toMatchObject({ replacement: true });
+	} finally {
+		await broker.stop();
+		await fs.rm(root, { recursive: true, force: true });
+	}
+}, 15_000);
+
 test("startup cleanup accepts a payload-durable scrubbed endpoint placeholder", async () => {
 	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-scrubbed-endpoint-"));
 	const agentDir = path.join(root, "agent");

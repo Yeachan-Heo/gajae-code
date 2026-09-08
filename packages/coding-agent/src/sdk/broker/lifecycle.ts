@@ -3812,7 +3812,17 @@ async function removeExactDeadSessionEndpoint(
 			? authorizedDetachedSource
 			: candidates.find(candidate => {
 					try {
-						return fsSync.lstatSync(candidate).isFile();
+						const metadata = fsSync.lstatSync(candidate);
+						// A native-proven scrubbed placeholder is no longer endpoint JSON.
+						// Unknown empty files and nonempty replacements still require validation.
+						if (
+							durablePlaceholders?.has(path.resolve(candidate)) &&
+							metadata.isFile() &&
+							metadata.nlink === 1 &&
+							metadata.size === 0
+						)
+							return false;
+						return metadata.isFile();
 					} catch {
 						return false;
 					}
