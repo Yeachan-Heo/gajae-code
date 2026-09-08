@@ -15,6 +15,7 @@ import {
 	readActiveEntries,
 	rebuildActiveSnapshot,
 	restoreActiveEntryIfOwned,
+	updateActiveEntryIfExact,
 	writeActiveEntry,
 	writeGuardedJsonAtomic,
 	writeGuardedWorkflowEnvelopeAtomic,
@@ -599,20 +600,15 @@ export async function ensureWorkflowSkillActivationSeed(
 		if (!input.activeSubskills?.length || Bun.deepEquals(existingEntry.active_subskills, input.activeSubskills)) {
 			return { state: existing, seeded: false, rollback: noRollback };
 		}
-		const mergedResult = await writeActiveEntry(
+		const mergedResult = await updateActiveEntryIfExact(
 			input.cwd,
 			{ sessionId: resolvedSessionId },
 			skill,
+			existingEntry,
 			{
 				...existingEntry,
 				active_subskills: input.activeSubskills,
 				updated_at: input.nowIso ?? new Date().toISOString(),
-			},
-			{
-				cwd: input.cwd,
-				sourceRevision:
-					((existingEntry as SkillActiveEntry & { source_state_revision?: number }).source_state_revision ?? 0) +
-					1,
 			},
 		);
 		const mergedWrite = guardedStateWriteReceipt(mergedResult);
