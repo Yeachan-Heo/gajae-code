@@ -110,6 +110,7 @@ import {
 import {
 	assertManagedDirectoryRoot,
 	captureManagedFileNoFollow,
+	captureManagedFilePrefixNoFollow,
 	fsyncManagedArtifactTree,
 	MANAGED_ARTIFACT_MAX_FILE_BYTES,
 	ManagedAppendIdentityMismatchError,
@@ -6390,6 +6391,11 @@ export function readAuthorizedProjectSessionTranscript(
 	const authority = nativeSessionManager().openRecoveryFsRoot(root);
 	try {
 		const result = authority.readManaged(relativePath);
+		if (!result.ok && result.code === "unsupported_platform") {
+			const captured = captureManagedFilePrefixNoFollow(candidate, maxBytes + 1);
+			if (captured.identity.size > BigInt(maxBytes) || captured.bytes.byteLength > maxBytes) return undefined;
+			return Buffer.from(captured.bytes);
+		}
 		if (!result.ok || !result.data || result.data.byteLength > maxBytes) return undefined;
 		return Buffer.from(result.data);
 	} finally {
