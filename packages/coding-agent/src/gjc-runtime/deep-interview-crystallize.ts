@@ -660,7 +660,8 @@ function validateItems(value: unknown, snapshot?: CrystalSnapshot): CrystalItem[
 				const fullAnchorClause = anchoredClause(anchorMessage.content, item.anchor.quote);
 				const quoteClauses = fullAnchorClause.split(/(?:[!?。！？;]|\.(?=\s|$)|\n)+\s*/u).filter(Boolean);
 				const partialMultiDirectiveAnchor =
-					quoteClauses.length > 1 && fullAnchorClause !== item.anchor.quote.trim();
+					fullAnchorClause !== item.anchor.quote.trim() &&
+					(quoteClauses.length > 1 || /:|\b(?:and|plus|as\s+well\s+as)\b/i.test(fullAnchorClause));
 				const mixedClausePolarity =
 					quoteClauses.length > 1 &&
 					new Set(quoteClauses.map(clause => semanticProfile(clause).negative)).size > 1;
@@ -988,10 +989,13 @@ function validateResolutionAnchors(
 		const conflict = field === "resolved_conflict_anchors";
 		const itemTerms = topicTerms(item, conflict);
 		const resolutionTerms = evidenceTerms(resolution);
-		const conciseAnswer =
-			/^(?:yes|no|on|off|true|false)[.!]?$/i.test(resolution.trim()) &&
-			(/^(?:should|is|are|can|could|do|does|did|will|would)\b/i.test(item.trim()) ||
-				/\b(?:enabled|disabled|enable|disable|allowed|permitted|required|needed)\b/i.test(item));
+		const conciseBoolean =
+			/^(?:yes|no|true|false)[.!]?$/i.test(resolution.trim()) &&
+			/^(?:should|is|are|can|could|do|does|did|will|would)\b/i.test(item.trim());
+		const conciseState =
+			/^(?:on|off)[.!]?$/i.test(resolution.trim()) &&
+			/\b(?:enabled|disabled|enable|disable|on|off|state|toggle)\b/i.test(item);
+		const conciseAnswer = conciseBoolean || conciseState;
 		const addressesItem =
 			(itemTerms.size > 0 && [...itemTerms].every(term => resolutionTerms.has(term))) ||
 			hasCjkTopicOverlap(item, resolution) ||
@@ -1362,6 +1366,7 @@ export function crystallizeDeepInterview(value: unknown): DeepInterviewCrystal {
 			)
 			.map(item => item.id),
 	);
+	for (const removedId of allRemovedIds) crossIdSupersededIds.delete(removedId);
 	if (crossIdSupersededIds.size > 0)
 		throw new Error("cross-ID replacement requires explicit removal of the superseded item");
 	for (const item of canonicalPriorItems)
