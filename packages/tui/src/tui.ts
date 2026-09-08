@@ -1194,6 +1194,7 @@ export class TUI extends Container {
 	 * it, so work enqueued in the new lifecycle carries the new epoch.
 	 */
 	#rasterLifecycle = 0;
+	#inFlightMultipartAbort?: () => void;
 
 	#unsubscribeTabWidthChange?: () => void;
 	static #renderCounters: TuiRenderCounterSnapshot = {
@@ -1352,6 +1353,7 @@ export class TUI extends Container {
 		// Invalidate every raster-queue body captured before disposal. Disposal does
 		// not stop the terminal itself, so the ingress epoch is the only fence that
 		// prevents a held body or queued render from writing after teardown.
+		this.#closeInFlightMultipartPrefix();
 		this.#rasterLifecycle++;
 		this.#preparationLifecycle = undefined;
 		this.#settleRenderCommitWaiters(false);
@@ -2109,6 +2111,7 @@ export class TUI extends Container {
 				);
 				if (!prefixWritten) return failed();
 				const abortBarrier = () => {
+					if (this.#inFlightMultipartAbort === abortBarrier) this.#inFlightMultipartAbort = undefined;
 					// Abort/cursor-restoration bytes are terminal writes: never emit
 					// them once the running epoch ended (e.g. a user predicate that
 					// itself stops the terminal before throwing or returning false).
@@ -2118,6 +2121,7 @@ export class TUI extends Container {
 					if (abortSuffix || cursorVisibility)
 						this.#guardTerminalOperation(() => this.terminal.write(abortSuffix + cursorVisibility));
 				};
+				this.#inFlightMultipartAbort = abortBarrier;
 				const flushed = await (this.terminal as Terminal & { flush?: () => Promise<boolean> }).flush?.();
 				// Async boundary: the terminal may have stopped while we awaited.
 				if (!isCurrentLifecycle()) return failed();
@@ -2136,6 +2140,7 @@ export class TUI extends Container {
 					if (isCurrentLifecycle()) abortBarrier();
 					return failed();
 				}
+				if (this.#inFlightMultipartAbort === abortBarrier) this.#inFlightMultipartAbort = undefined;
 				// Async boundary: afterPrefix awaited external work; re-check epoch.
 				if (!isCurrentLifecycle()) return failed();
 				const currentLease = this.#rasterLeases.get(request.token?.ownerId ?? "");
@@ -2308,6 +2313,12 @@ export class TUI extends Container {
 			},
 		);
 		return next;
+	}
+
+	#closeInFlightMultipartPrefix(): void {
+		const abort = this.#inFlightMultipartAbort;
+		this.#inFlightMultipartAbort = undefined;
+		abort?.();
 	}
 	#validRect(r: CellRect): boolean {
 		return (
@@ -2824,6 +2835,7 @@ export class TUI extends Container {
 		// Invalidate every raster-queue body captured under the running epoch
 		// before any teardown: nothing queued before stop may write after
 		// restoration. Synchronous stop cleanup below writes directly.
+		this.#closeInFlightMultipartPrefix();
 		this.#rasterLifecycle++;
 		this.#flushRasterLeasesBeforeStop("terminal-loss");
 		const placementCleanup = this.#kittyPlacementDeletePlan(this.#kittyPlacementSpans, [], [], true).output;
