@@ -4,7 +4,10 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import * as url from "node:url";
 import { crystalSnapshotDigest } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-crystallize";
-import { runNativeDeepInterviewCommand } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-runtime";
+import {
+	assertDeepInterviewCrystalCoversLiveTranscript,
+	runNativeDeepInterviewCommand,
+} from "@gajae-code/coding-agent/gjc-runtime/deep-interview-runtime";
 import {
 	createDeepInterviewIntentManifest,
 	MAX_INITIAL_CONTEXT_LENGTH,
@@ -465,6 +468,61 @@ describe("native gjc deep-interview runtime", () => {
 			crystal?: { source?: { messages?: Array<{ role: string; content: string }> } };
 		};
 		expect(payload.crystal?.source?.messages).toEqual(messages);
+	});
+
+	it("requires transcript-tail coverage for Deep approval but permits post-plan Ralplan evidence", async () => {
+		const root = await tempDir();
+		const sessionPath = path.join(root, ".gjc", "sessions", `${TEST_SESSION_ID}.jsonl`);
+		const messages = [{ index: 0, role: "user" as const, content: "Build a report." }];
+		const snapshot = {
+			revision: 1,
+			start: 0,
+			end: 0,
+			messages,
+			digest: crystalSnapshotDigest({ revision: 1, start: 0, end: 0, messages }),
+		};
+		await fs.mkdir(path.dirname(sessionPath), { recursive: true });
+		await fs.writeFile(
+			sessionPath,
+			`${JSON.stringify({ type: "session", version: 1, id: TEST_SESSION_ID, cwd: root })}\n${JSON.stringify({ type: "message", message: { role: "user", content: "Build a report." } })}\n`,
+		);
+		process.env.GJC_SESSION_FILE = sessionPath;
+		const crystallized = await runNativeDeepInterviewCommand(
+			[
+				"--crystallize",
+				"--slug",
+				"approval-tail",
+				"--input",
+				JSON.stringify({
+					session_id: TEST_SESSION_ID,
+					current_revision: 1,
+					snapshot,
+					items: [
+						{
+							id: "requirement:report",
+							kind: "acceptance_criterion",
+							classification: "confirmed",
+							statement: "Build a report.",
+							anchor: { message_index: 0, quote: "Build a report." },
+						},
+					],
+				}),
+				"--json",
+			],
+			root,
+		);
+		expect(crystallized.status, crystallized.stderr).toBe(0);
+		const deepEvidence = await assertDeepInterviewCrystalCoversLiveTranscript(root, TEST_SESSION_ID, true);
+		await fs.appendFile(
+			sessionPath,
+			`${JSON.stringify({ type: "message", message: { role: "user", content: "Also encrypt backups." } })}\n`,
+		);
+		await expect(assertDeepInterviewCrystalCoversLiveTranscript(root, TEST_SESSION_ID, true)).rejects.toThrow(
+			"re-crystallization",
+		);
+		const ralplanEvidence = await assertDeepInterviewCrystalCoversLiveTranscript(root, TEST_SESSION_ID, false);
+		expect(ralplanEvidence.transcriptPath).toBe(sessionPath);
+		expect(ralplanEvidence.transcriptSha256).not.toBe(deepEvidence.transcriptSha256);
 	});
 
 	it("rejects a transcript path replaced after the bounded descriptor read", async () => {
