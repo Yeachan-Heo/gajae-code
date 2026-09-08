@@ -5057,7 +5057,7 @@ export class AgentSession {
 			if (
 				ctx.result.details &&
 				typeof ctx.result.details === "object" &&
-				(ctx.result.details as { cancellation?: unknown }).cancellation === "before_dispatch"
+				typeof (ctx.result.details as { cancellation?: unknown }).cancellation === "string"
 			) {
 				return undefined;
 			}

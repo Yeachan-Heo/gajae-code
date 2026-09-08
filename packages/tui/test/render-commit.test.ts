@@ -498,7 +498,7 @@ describe("generation-scoped render commits", () => {
 			await terminal.waitForRender();
 			const output = terminal.getWriteLog().join("");
 			expect(output).not.toContain("DISPOSE_STALE_RENDER");
-			expect(output).not.toContain("DISPOSE_STALE_ABORT");
+			expect(output).toContain("DISPOSE_STALE_ABORT");
 			expect(output).not.toContain("DISPOSE_RASTER");
 		} finally {
 			ingressGate.resolve();

@@ -5459,7 +5459,27 @@ async function executeToolCalls(
 				isError = true;
 			}
 
-			if (afterToolCall && record.started && !signal?.aborted && !toolSignal.aborted) {
+			if (afterToolCall && record.started && (signal?.aborted || toolSignal.aborted)) {
+				try {
+					await afterToolCall(
+						{
+							assistantMessage,
+							toolCall,
+							args: record.args,
+							result: {
+								content: [{ type: "text", text: "Tool call cancelled after dispatch." }],
+								isError: true,
+								details: { cancellation: "after_dispatch" },
+							},
+							isError: true,
+							context: currentContext,
+						},
+						toolSignal,
+					);
+				} catch {
+					// Cancellation is authoritative; the hook is best-effort cleanup only.
+				}
+			} else if (afterToolCall && record.started && !signal?.aborted && !toolSignal.aborted) {
 				try {
 					const after = await afterToolCall(
 						{
