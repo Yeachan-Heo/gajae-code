@@ -13171,7 +13171,7 @@ export class AgentSession {
 					? [subskillDetails.subskillActivation]
 					: [];
 		if (active && isCanonicalGjcWorkflowSkill(skill)) {
-			const attachedAsk = this.#attachAskTool(!awaitAskPromptRebuild);
+			const attachedAsk = this.#attachAskTool(awaitAskPromptRebuild);
 			if (awaitAskPromptRebuild) {
 				if (attachedAsk) await this.refreshBaseSystemPrompt();
 				else await this.#waitForAdmittedBaseSystemPromptRebuilds();
