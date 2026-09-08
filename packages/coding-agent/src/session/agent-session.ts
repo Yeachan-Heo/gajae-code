@@ -8781,6 +8781,8 @@ export class AgentSession {
 			options?.onError?.(error);
 		};
 		const scheduledGeneration = options?.generation;
+		let admittedGeneration = scheduledGeneration;
+		let freshRootMigrated = false;
 		let busyReschedules = 0;
 		const scheduleAttempt = (delayMs = options?.delayMs): Promise<void> => {
 			const leaseSettlement = Promise.withResolvers<void>();
@@ -8796,7 +8798,7 @@ export class AgentSession {
 										skip("aborted_signal");
 										return false;
 									}
-									if (scheduledGeneration !== undefined && this.#promptGeneration !== scheduledGeneration) {
+									if (admittedGeneration !== undefined && this.#promptGeneration !== admittedGeneration) {
 										skip("generation_changed");
 										return false;
 									}
@@ -8839,7 +8841,7 @@ export class AgentSession {
 										skip("aborted_signal");
 										return;
 									}
-									if (scheduledGeneration !== undefined && this.#promptGeneration !== scheduledGeneration) {
+									if (admittedGeneration !== undefined && this.#promptGeneration !== admittedGeneration) {
 										skip("generation_changed");
 										return;
 									}
@@ -8858,7 +8860,11 @@ export class AgentSession {
 									// so a cancelled or emptied continuation never leaves the session on
 									// an identity that escapes the fence. Owned-completion deliveries are
 									// NOT affected (they use followUp).
-									if (this.#hasQueuedFreshRootRequest()) this.#resumeFromOwnedCompletion();
+									if (!freshRootMigrated && this.#hasQueuedFreshRootRequest()) {
+										this.#resumeFromOwnedCompletion();
+										admittedGeneration = this.#promptGeneration;
+										freshRootMigrated = true;
+									}
 									if (this.#isTurnContinuationBlocked()) {
 										skip("terminal_turn");
 										return;
@@ -8888,7 +8894,6 @@ export class AgentSession {
 									this.#assertNoSessionTransition();
 									if (this.#turnEndPersistenceFailure) await this.#reconcileTurnEndPersistenceFailure();
 									if (!canContinue()) return;
-									if (this.#hasQueuedFreshRootRequest()) this.#resumeFromOwnedCompletion();
 									if (this.#isTurnContinuationBlocked()) {
 										skip("terminal_turn");
 										return;
