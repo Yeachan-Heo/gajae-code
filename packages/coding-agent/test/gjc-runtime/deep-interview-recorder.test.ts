@@ -527,7 +527,7 @@ describe("deep-interview recorder: persistence (state-writer backed)", () => {
 		expect(persisted.state.current_ambiguity).toBe(0.5);
 	});
 
-	it("rejects scoring after ready Crystal promotion", async () => {
+	it("allows scoring after ready Crystal promotion before execution approval", async () => {
 		const cwd = await tempDir();
 		const statePath = statePathFor(cwd);
 		await appendOrMergeDeepInterviewRound(
@@ -539,17 +539,17 @@ describe("deep-interview recorder: persistence (state-writer backed)", () => {
 		const before = JSON.parse(await fs.readFile(statePath, "utf-8"));
 		before.state.crystal = { lifecycle: "ready" };
 		await fs.writeFile(statePath, `${JSON.stringify(before)}\n`, "utf8");
-		await expect(
-			enrichDeepInterviewRoundScoring(
-				cwd,
-				statePath,
-				{ round: 1, questionId: "q1", scores: { goal: 0.5 }, ambiguity: 0.5 },
-				{ sessionId: TEST_SESSION_ID },
-			),
-		).rejects.toThrow("after Crystal promotion");
+		await enrichDeepInterviewRoundScoring(
+			cwd,
+			statePath,
+			{ round: 1, questionId: "q1", scores: { goal: 0.5 }, ambiguity: 0.5 },
+			{ sessionId: TEST_SESSION_ID },
+		);
+		const scored = JSON.parse(await fs.readFile(statePath, "utf-8"));
+		expect(scored.state.rounds[0].lifecycle).toBe("scored");
 	});
 
-	it("rejects append attempts after handoff or Crystal promotion without mutation", async () => {
+	it("allows refinement after Crystal promotion and rejects append after handoff", async () => {
 		const cwd = await tempDir();
 		const statePath = statePathFor(cwd);
 		await appendOrMergeDeepInterviewRound(
@@ -564,16 +564,14 @@ describe("deep-interview recorder: persistence (state-writer backed)", () => {
 		const readyInner = readyState.state as Record<string, unknown>;
 		readyInner.crystal = { lifecycle: "ready" };
 		await fs.writeFile(statePath, `${JSON.stringify(readyState)}\n`, "utf8");
+		await appendOrMergeDeepInterviewRound(
+			cwd,
+			statePath,
+			{ round: 2, questionId: "q2", questionText: "Q2?" },
+			{ sessionId: TEST_SESSION_ID },
+		);
 		const readyBeforeAppend = await fs.readFile(statePath, "utf-8");
-		await expect(
-			appendOrMergeDeepInterviewRound(
-				cwd,
-				statePath,
-				{ round: 2, questionId: "q2", questionText: "Q2?" },
-				{ sessionId: TEST_SESSION_ID },
-			),
-		).rejects.toThrow("after Crystal promotion");
-		expect(await fs.readFile(statePath, "utf-8")).toBe(readyBeforeAppend);
+		expect((JSON.parse(readyBeforeAppend).state.rounds as unknown[]).length).toBe(2);
 
 		const inactiveState = JSON.parse(readyBeforeAppend) as Record<string, unknown>;
 		inactiveState.active = false;
