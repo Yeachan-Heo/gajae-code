@@ -329,7 +329,13 @@ export async function listNativeSkillsForManagement(options: {
 			scanJobs.push(
 				scanSkillsFromDir(
 					{ cwd: options.cwd, home, repoRoot: projectDirs.repoRoot },
-					{ dir, providerId: "runtime", level: "project", requireDescription: true },
+					{
+						dir,
+						linkContainmentRoot: projectDirs.repoRoot ?? undefined,
+						providerId: "runtime",
+						level: "project",
+						requireDescription: true,
+					},
 				).then(result => ({ dir, scope: "project" as const, items: result.items })),
 			);
 		}

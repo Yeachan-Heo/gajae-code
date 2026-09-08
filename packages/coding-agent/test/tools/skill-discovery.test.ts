@@ -9,6 +9,7 @@ import { buildSystemPrompt } from "@gajae-code/coding-agent/system-prompt";
 import type { ToolSession } from "@gajae-code/coding-agent/tools";
 import { SkillTool } from "@gajae-code/coding-agent/tools/skill";
 import { SkillDiscoveryTool } from "@gajae-code/coding-agent/tools/skill-discovery";
+import { $ } from "bun";
 import { safeRm } from "../../../../scripts/safe-cleanup";
 
 async function makeSkill(
@@ -63,6 +64,53 @@ function runtimeSkillSettings(overrides: Record<string, unknown> = {}): Settings
 }
 
 describe("SkillDiscoveryTool", () => {
+	it("discovers and invokes a repository-confined skills root symlink without trusting a later escape", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-linked-project-skill-"));
+		const cwd = path.join(root, "repo");
+		const home = path.join(root, "home");
+		const link = path.join(cwd, ".gjc", "skills");
+		try {
+			await fs.mkdir(path.dirname(link), { recursive: true });
+			await fs.mkdir(home);
+			await $`git init --quiet ${cwd}`.quiet();
+			await makeSkill(
+				path.join(cwd, ".agents", "skills"),
+				"linked-helper",
+				"Repository linked helper",
+				"Execute the repository-owned skill body.",
+			);
+			await fs.symlink("../.agents/skills", link, "dir");
+			const sent: string[] = [];
+			const session = createSession(cwd, {
+				home,
+				settings: runtimeSkillSettings({ "skills.trustUserSkills": false }),
+				sendCustomMessage: async message => {
+					sent.push(String(message.content));
+				},
+			});
+			const discovery = new SkillDiscoveryTool(session);
+			const result = await discovery.execute("discover-linked", { source: "project" });
+			expect(result.details?.candidates).toEqual([
+				expect.objectContaining({ name: "linked-helper", source: "project" }),
+			]);
+			await new SkillTool(session).execute("invoke-linked", { name: "linked-helper" });
+			expect(sent).toHaveLength(1);
+			expect(sent[0]).toContain("Execute the repository-owned skill body.");
+
+			const outside = path.join(root, "outside");
+			await makeSkill(outside, "linked-helper", "Outside helper", "Do not execute outside content.");
+			await fs.unlink(link);
+			await fs.symlink(outside, link, "dir");
+			expect((await discovery.execute("discover-escape", { source: "project" })).details?.candidates).toEqual([]);
+			await expect(new SkillTool(session).execute("invoke-escape", { name: "linked-helper" })).rejects.toThrow(
+				/unknown skill/i,
+			);
+			expect(sent).toHaveLength(1);
+		} finally {
+			await safeRm(root, { recursive: true, force: true });
+		}
+	});
+
 	it("discovers project runtime skills from .gjc/skills", async () => {
 		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-project-skills-"));
 		await makeSkill(path.join(cwd, ".gjc", "skills"), "project-helper", "Project helper skill");

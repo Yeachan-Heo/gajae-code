@@ -35,6 +35,34 @@
 
 `tasks[].description` is UI-only. `tasks[].assignment` is the actual per-task instruction.
 
+### Working in another repository
+
+`tasks[].repositoryBinding` is a checked identity, not a destination or an authorization
+grant. An omitted binding is captured from the active session. A declared binding cannot
+move a session from repository A into repository B, even when B's worktree already exists.
+Declared bindings are revalidated against the target worktree's canonical root and
+common Git directory; supplied branch and HEAD snapshots must still match. A symbolic
+`HEAD` string is not a commit snapshot. Omitted bindings are captured by the runtime.
+Isolation-created worktrees may differ from the source worktree while retaining its
+common Git repository identity.
+
+For work explicitly requested in another repository, start a **new session** at its
+approved worktree, then delegate from that session:
+
+```sh
+gjc --cwd /absolute/path/to/approved-repository-worktree
+```
+
+An existing linked Git worktree already isolates that session's edits from the main
+checkout. Do not change a binding payload to bypass a rejection. The `isolated` field
+requests additional per-task isolation in the session's own repository; it is exposed
+only when `task.isolation.mode` enables an isolation backend.
+
+`move_session` only narrows to a descendant directory, not a sibling repository.
+User-driven `/move` and SDK cwd relocation are separate surfaces; an already-created
+task tool retains its original repository binding. A fresh target-rooted session avoids
+carrying that old delegation authority across a repository move.
+
 `tasks[].tier` is inert while `task.autorouting.enabled` is `false`. When autorouting is active it selects the model chain for that item, an omitted `tier` routes as `balanced`, and the routed pin overrides the manual model chain. See [Autorouting](#autorouting).
 
 ### Schema-free mode (`task.simple = "schema-free"`)

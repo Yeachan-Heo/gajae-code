@@ -95,6 +95,43 @@ describe("skill-management", () => {
 				expect(records.map(record => record.name)).toEqual(["user-helper"]);
 			});
 		});
+
+		it("lists skills from a repo-contained symlinked project root", async () => {
+			await withTempDirs(async (cwd, home) => {
+				await fs.mkdir(path.join(cwd, ".git"));
+				await makeSkill(path.join(cwd, ".agents", "skills"), "linked-helper", "Linked helper");
+				await fs.mkdir(path.join(cwd, ".gjc"));
+				await fs.symlink("../.agents/skills", path.join(cwd, ".gjc", "skills"), "dir");
+
+				const records = await listNativeSkillsForManagement({ cwd, home });
+				expect(records).toContainEqual(
+					expect.objectContaining({
+						name: "linked-helper",
+						scope: "project",
+						source: "project .gjc/skills",
+						enabled: true,
+					}),
+				);
+				expect(await listNativeSkillsForManagement({ cwd, home, policy: { trustProjectSkills: false } })).toEqual(
+					[],
+				);
+			});
+		});
+
+		it("refuses a project skill root symlink outside the repository", async () => {
+			await withTempDirs(async (cwd, home) => {
+				await fs.mkdir(path.join(cwd, ".git"));
+				const outside = path.join(path.dirname(cwd), `${path.basename(cwd)}-outside`);
+				await fs.mkdir(outside);
+				await makeSkill(outside, "outside-helper", "Outside helper");
+				await fs.mkdir(path.join(cwd, ".gjc"));
+				await fs.symlink(outside, path.join(cwd, ".gjc", "skills"), "dir");
+
+				const records = await listNativeSkillsForManagement({ cwd, home });
+				expect(records.some(record => record.name === "outside-helper")).toBe(false);
+				await fs.rm(outside, { recursive: true, force: true });
+			});
+		});
 	});
 
 	describe("writeNativeSkill", () => {

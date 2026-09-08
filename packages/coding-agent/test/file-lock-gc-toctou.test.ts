@@ -13,6 +13,7 @@ import {
 } from "@gajae-code/coding-agent/config/file-lock";
 import { fileLocksGcAdapter } from "@gajae-code/coding-agent/config/file-lock-gc";
 import type { GcContext, GcPidProbe, GcRecord } from "@gajae-code/coding-agent/gjc-runtime/gc-runtime";
+import * as nativeBindings from "@gajae-code/natives";
 import {
 	exactRemoveDirectoryTree,
 	renameDirectoryNoReplacePathAsync,
@@ -754,7 +755,87 @@ describe("file lock cleanup failure handling (#2478)", () => {
 		expect(denied).toBe(false);
 	});
 
-	test.skipIf(process.platform !== "linux")(
+	test.skipIf(process.platform === "win32")(
+		"retains an unowned removal transition and reports bounded contention before publication",
+		async () => {
+			const lockedFile = path.join(await makeTemp(), "state.json");
+			const lockDir = `${lockedFile}.lock`;
+			const detachedPath = `${lockDir}.removing`;
+			await fs.mkdir(detachedPath);
+			await Bun.write(path.join(detachedPath, "info"), "");
+			const retainedIdentity = await fs.stat(detachedPath, { bigint: true });
+			let publications = 0;
+			let entered = false;
+			FileLockTestHooks.nativePublicationBindings = () => ({
+				renameNoReplacePathAsync: async (source, destination) => {
+					publications++;
+					return await renameNoReplacePathAsync(source, destination);
+				},
+				renameDirectoryNoReplacePathAsync,
+			});
+
+			await expect(
+				withFileLock(
+					lockedFile,
+					async () => {
+						entered = true;
+					},
+					{ retries: 2, retryDelayMs: 1 },
+				),
+			).rejects.toMatchObject({
+				code: "acquire_timeout",
+				holder: expect.stringContaining("blocked by retained removal transition"),
+			});
+			expect(entered).toBe(false);
+			expect(publications).toBe(0);
+			expect(await fs.exists(lockDir)).toBe(false);
+			const retained = await fs.stat(detachedPath, { bigint: true });
+			expect(retained.dev).toBe(retainedIdentity.dev);
+			expect(retained.ino).toBe(retainedIdentity.ino);
+			expect(await Bun.file(path.join(detachedPath, "info")).text()).toBe("");
+			expect(await fs.readdir(path.dirname(lockDir))).toEqual([path.basename(detachedPath)]);
+		},
+	);
+
+	test.skipIf(process.platform === "win32")(
+		"refuses transition rollback when the published lock is replaced",
+		async () => {
+			const lockedFile = path.join(await makeTemp(), "state.json");
+			const lockDir = `${lockedFile}.lock`;
+			const displacedPath = `${lockDir}.displaced`;
+			const detachedPath = `${lockDir}.removing`;
+			const replacement = { pid: process.pid, timestamp: Date.now(), owner_token: "replacement" };
+			let entered = false;
+			FileLockTestHooks.nativePublicationBindings = () => ({
+				renameNoReplacePathAsync: async (source, destination) => {
+					const result = await renameNoReplacePathAsync(source, destination);
+					if (result.ok) {
+						await fs.rename(destination, displacedPath);
+						await writeInfo(destination, replacement);
+						await fs.mkdir(detachedPath);
+					}
+					return result;
+				},
+				renameDirectoryNoReplacePathAsync,
+			});
+
+			await expect(
+				withFileLock(
+					lockedFile,
+					async () => {
+						entered = true;
+					},
+					{ retries: 1, retryDelayMs: 1 },
+				),
+			).rejects.toThrow("Failed to verify published file lock before transition rollback: identity_mismatch");
+			expect(entered).toBe(false);
+			expect(await Bun.file(path.join(lockDir, "info")).json()).toMatchObject(replacement);
+			expect(await fs.exists(displacedPath)).toBe(true);
+			expect(await fs.exists(detachedPath)).toBe(true);
+		},
+	);
+
+	test.skipIf(process.platform === "win32")(
 		"rolls back a successor when its predecessor detaches between the transition check and publication",
 		async () => {
 			const base = await makeTemp();
@@ -837,6 +918,7 @@ describe("file lock cleanup failure handling (#2478)", () => {
 				expect(successorEntered).toBe(true);
 				expect(await fs.exists(canonicalLockDir)).toBe(false);
 				expect(await fs.exists(detachedPath)).toBe(false);
+				expect(await fs.readdir(base)).toEqual([]);
 			} finally {
 				releaseHolder.resolve();
 				allowContenderPublication.resolve();
@@ -846,6 +928,67 @@ describe("file lock cleanup failure handling (#2478)", () => {
 		},
 		10_000,
 	);
+
+	test.skipIf(process.platform === "win32" || process.platform === "linux").each(["tree", "placeholder"])(
+		"retains a substituted rollback %s instead of deleting unowned state",
+		async target => {
+			const base = await makeTemp();
+			const lockedFile = path.join(base, "state.json");
+			const lockDir = `${lockedFile}.lock`;
+			let pendingPath = "";
+			let placeholderPath = "";
+			let entered = false;
+			FileLockTestHooks.nativePublicationBindings = () => ({
+				renameNoReplacePathAsync: async (source, destination) => {
+					pendingPath = source;
+					const result = await renameNoReplacePathAsync(source, destination);
+					if (result.ok) await fs.mkdir(`${destination}.removing`);
+					return result;
+				},
+				renameDirectoryNoReplacePathAsync,
+			});
+			const realRestore = nativeBindings.exactRestore;
+			vi.spyOn(nativeBindings, "exactRestore").mockImplementation((source, destination, identity) => {
+				const result = realRestore(source, destination, identity);
+				expect(result.code).toBe("cleanup_pending");
+				expect(result.retainedPlaceholderPath).toBeDefined();
+				placeholderPath = path.join(path.dirname(source), result.retainedPlaceholderPath!);
+				if (target === "tree") {
+					writeFileSync(path.join(destination, "info"), "replacement payload");
+				} else {
+					renameSync(placeholderPath, `${placeholderPath}.displaced`);
+					mkdirSync(placeholderPath);
+					writeFileSync(path.join(placeholderPath, "foreign"), "preserve");
+				}
+				return result;
+			});
+
+			await expect(
+				withFileLock(
+					lockedFile,
+					async () => {
+						entered = true;
+					},
+					{ retries: 1, retryDelayMs: 1 },
+				),
+			).rejects.toThrow(
+				target === "tree"
+					? "Failed to verify rolled back file lock: identity_mismatch"
+					: "File lock rollback placeholder identity changed; refusing removal",
+			);
+			expect(entered).toBe(false);
+			expect(await fs.exists(lockDir)).toBe(false);
+			expect(await fs.exists(`${lockDir}.removing`)).toBe(true);
+			expect(await fs.exists(pendingPath)).toBe(true);
+			expect(await fs.exists(placeholderPath)).toBe(true);
+			expect(
+				await Bun.file(
+					target === "tree" ? path.join(pendingPath, "info") : path.join(placeholderPath, "foreign"),
+				).text(),
+			).toBe(target === "tree" ? "replacement payload" : "preserve");
+		},
+	);
+
 	test("waits boundedly for a competing exact-removal quarantine to clear", async () => {
 		const base = await makeTemp();
 		const lockedFile = path.join(base, "state.json");

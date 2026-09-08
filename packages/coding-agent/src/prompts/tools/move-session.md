@@ -13,3 +13,7 @@ cwd from the new directory, and project-scoped plugins/capabilities reload for i
   speculatively — because the session file and caches move with the session.
 - This tool is unavailable in subagent sessions and restricted profiles; ask the top-level
   session to rescope instead.
+- For an explicitly requested sibling or unrelated repository, start a new session with
+  `gjc --cwd <approved-worktree>` and delegate from there. A task's `repositoryBinding`
+  verifies the session's repository; it cannot authorize relocation. Already-created task
+  tools retain their original repository binding even after a user-driven cwd move.

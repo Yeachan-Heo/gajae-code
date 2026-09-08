@@ -469,6 +469,8 @@ export interface ScanSkillsFromDirOptions {
 	requireDescription?: boolean;
 	/** Optional physical root that every discovered skill must remain within. */
 	containmentRoot?: string;
+	/** Physical repository root permitting the project scan directory itself to be a symlink. */
+	linkContainmentRoot?: string;
 	/** Filesystem authority for explicit-home reads. */
 	scope?: ReadScope;
 }
@@ -493,12 +495,51 @@ export const SkillDiscoveryTestHooks: {
 	afterAuthorityRootValidated?: (root: string) => void | Promise<void>;
 	afterAuthorityRootMissing?: (root: string) => void | Promise<void>;
 	afterContainedRootValidated?: (root: string) => void | Promise<void>;
+	afterScanRootValidated?: (root: string) => void | Promise<void>;
 } = {};
 
 interface DirectoryIdentity {
 	dev: bigint;
 	ino: bigint;
 	realPath: string;
+}
+
+interface ScanRootLinkIdentity {
+	dev: bigint;
+	ino: bigint;
+	linkText: string;
+	target: DirectoryIdentity;
+}
+
+async function captureScanRootLinkIdentity(root: string): Promise<ScanRootLinkIdentity | null> {
+	const observed = await fs.promises.lstat(root, { bigint: true });
+	if (!observed.isSymbolicLink()) return null;
+	const linkText = await fs.promises.readlink(root);
+	let targetPath: string;
+	try {
+		targetPath = await fs.promises.realpath(root);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT")
+			throw new Error(`Dangling skills directory link: ${root}`);
+		throw error;
+	}
+	const target = await captureDirectoryIdentity(targetPath);
+	if (!target) return null;
+	return { dev: observed.dev, ino: observed.ino, linkText, target };
+}
+
+async function scanRootLinkIdentityIsCurrent(root: string, expected: ScanRootLinkIdentity): Promise<boolean> {
+	try {
+		const observed = await fs.promises.lstat(root, { bigint: true });
+		if (!observed.isSymbolicLink() || observed.dev !== expected.dev || observed.ino !== expected.ino) return false;
+		const linkText = await fs.promises.readlink(root);
+		if (linkText !== expected.linkText) return false;
+		const targetPath = await fs.promises.realpath(root);
+		if (normalizePathForComparison(targetPath) !== normalizePathForComparison(expected.target.realPath)) return false;
+		return await directoryIdentityIsCurrent(targetPath, expected.target);
+	} catch {
+		return false;
+	}
 }
 
 async function captureDirectoryIdentity(root: string): Promise<DirectoryIdentity | null> {
@@ -530,17 +571,61 @@ export async function scanSkillsFromDir(
 ): Promise<LoadResult<Skill>> {
 	const items: Skill[] = [];
 	const warnings: string[] = [];
-	const { dir, level, providerId, requireDescription = false, containmentRoot } = options;
+	const { dir, level, providerId, requireDescription = false, containmentRoot, linkContainmentRoot } = options;
 	const scope = options.scope ?? (level === "user" ? "user" : "project");
+	if (linkContainmentRoot && (level !== "project" || scope !== "project")) {
+		warnings.push(`Refusing link containment root outside project scope: ${linkContainmentRoot}`);
+		return { items, warnings };
+	}
 	const readOptions = await getReadOptionsForContainment(_ctx, scope, containmentRoot);
 	if (_ctx.isolatedHome && containmentRoot && !readOptions) return { items, warnings };
-	const scanDir = await canonicalizePathWithinHome(_ctx, dir, containmentRoot, scope);
-	if (!scanDir) return { items, warnings };
+	const canonicalScanDir = await canonicalizePathWithinHome(_ctx, dir, containmentRoot, scope);
+	if (!canonicalScanDir) return { items, warnings };
+	// Preserve the lexical project root so a replacement link cannot be hidden
+	// by isolated-home canonicalization.
+	const scanDir = linkContainmentRoot ? path.resolve(dir) : canonicalScanDir;
+	let repositoryIdentity: DirectoryIdentity | null = null;
+	let repositoryLexicalRoot: string | undefined;
+	if (linkContainmentRoot) {
+		try {
+			repositoryLexicalRoot = path.resolve(linkContainmentRoot);
+			const repositoryRealPath = await fs.promises.realpath(repositoryLexicalRoot);
+			repositoryIdentity = await captureDirectoryIdentity(repositoryRealPath);
+			if (!repositoryIdentity) {
+				warnings.push(`Refusing unsafe repository root: ${linkContainmentRoot}`);
+				return { items, warnings };
+			}
+			const lexicalRelative = path.relative(repositoryLexicalRoot, path.resolve(dir));
+			if (lexicalRelative.startsWith("..") || path.isAbsolute(lexicalRelative)) {
+				warnings.push(`Refusing skills directory outside repository root: ${dir}`);
+				return { items, warnings };
+			}
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") return { items, warnings };
+			throw error;
+		}
+	}
 
 	let entries: fs.Dirent[];
 	let realRoot: string;
 	let authorityIdentity: DirectoryIdentity | null = null;
-	let scanRootIdentity: DirectoryIdentity;
+	let scanRootIdentity: DirectoryIdentity | null = null;
+	let scanRootLinkIdentity: ScanRootLinkIdentity | null = null;
+	const scanRootIsCurrent = async (): Promise<boolean> => {
+		if (!repositoryIdentity || !linkContainmentRoot) {
+			return scanRootIdentity !== null && (await directoryIdentityIsCurrent(scanDir, scanRootIdentity));
+		}
+		if (
+			!repositoryLexicalRoot ||
+			normalizePathForComparison(await fs.promises.realpath(repositoryLexicalRoot)) !==
+				normalizePathForComparison(repositoryIdentity.realPath) ||
+			!(await directoryIdentityIsCurrent(repositoryIdentity.realPath, repositoryIdentity))
+		) {
+			return false;
+		}
+		if (scanRootLinkIdentity) return await scanRootLinkIdentityIsCurrent(scanDir, scanRootLinkIdentity);
+		return scanRootIdentity !== null && (await directoryIdentityIsCurrent(scanDir, scanRootIdentity));
+	};
 	try {
 		if (options.authorityRoot) {
 			try {
@@ -560,22 +645,36 @@ export async function scanSkillsFromDir(
 				return { items, warnings };
 			}
 		}
-		const capturedScanRoot = await captureDirectoryIdentity(scanDir);
-		if (!capturedScanRoot) {
-			warnings.push(`Refusing unsafe skills directory: ${dir}`);
-			return { items, warnings };
+		if (linkContainmentRoot) {
+			scanRootLinkIdentity = await captureScanRootLinkIdentity(scanDir);
+			if (!scanRootLinkIdentity) scanRootIdentity = await captureDirectoryIdentity(scanDir);
+			if (!scanRootLinkIdentity && !scanRootIdentity) {
+				warnings.push(`Refusing unsafe skills directory: ${dir}`);
+				return { items, warnings };
+			}
+			const capturedRealRoot = scanRootLinkIdentity?.target.realPath ?? scanRootIdentity!.realPath;
+			if (!isWithinOrEqual(repositoryIdentity!.realPath, capturedRealRoot)) {
+				warnings.push(`Refusing skills directory outside repository root: ${dir}`);
+				return { items, warnings };
+			}
+			realRoot = capturedRealRoot;
+		} else {
+			scanRootIdentity = await captureDirectoryIdentity(scanDir);
+			if (!scanRootIdentity) {
+				warnings.push(`Refusing unsafe skills directory: ${dir}`);
+				return { items, warnings };
+			}
+			realRoot = scanRootIdentity.realPath;
 		}
-		scanRootIdentity = capturedScanRoot;
-		realRoot = scanRootIdentity.realPath;
 		entries = await fs.promises.readdir(scanDir, { withFileTypes: true });
-		if (!(await directoryIdentityIsCurrent(scanDir, scanRootIdentity))) {
+		await SkillDiscoveryTestHooks.afterScanRootValidated?.(scanDir);
+		if (!(await scanRootIsCurrent())) {
 			warnings.push(`Refusing changed skills directory: ${dir}`);
 			return { items, warnings };
 		}
 	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT")
 			warnings.push(`Failed to read skills directory: ${scanDir} (${String(error)})`);
-		}
 		return { items, warnings };
 	}
 	const isWithinRoot = (candidate: string): boolean => {
@@ -584,7 +683,7 @@ export async function scanSkillsFromDir(
 	};
 	const openSkillFileSafely = async (skillPath: string): Promise<FileHandle> => {
 		if (
-			!(await directoryIdentityIsCurrent(scanDir, scanRootIdentity)) ||
+			!(await scanRootIsCurrent()) ||
 			(options.authorityRoot &&
 				authorityIdentity &&
 				!(await directoryIdentityIsCurrent(options.authorityRoot, authorityIdentity)))
@@ -600,7 +699,7 @@ export async function scanSkillsFromDir(
 				handle.stat({ bigint: true }),
 				fs.promises.lstat(skillPath, { bigint: true }),
 				fs.promises.realpath(skillPath),
-				directoryIdentityIsCurrent(scanDir, scanRootIdentity),
+				scanRootIsCurrent(),
 				options.authorityRoot && authorityIdentity
 					? directoryIdentityIsCurrent(options.authorityRoot, authorityIdentity)
 					: true,
@@ -627,7 +726,16 @@ export async function scanSkillsFromDir(
 	const readSkillContentSafely = async (skillPath: string): Promise<string> => {
 		const handle = await openSkillFileSafely(skillPath);
 		try {
-			return await handle.readFile({ encoding: "utf8" });
+			const content = await handle.readFile({ encoding: "utf8" });
+			if (
+				!(await scanRootIsCurrent()) ||
+				(options.authorityRoot &&
+					authorityIdentity &&
+					!(await directoryIdentityIsCurrent(options.authorityRoot, authorityIdentity)))
+			) {
+				throw new Error(`Unsafe skill authority root for: ${skillPath}`);
+			}
+			return content;
 		} finally {
 			await handle.close();
 		}

@@ -267,6 +267,7 @@ async function scanProjectOrUserDir(
 ): Promise<ScanJobResult> {
 	const result = await scanSkillsFromDir(ctx, {
 		dir,
+		linkContainmentRoot: level === "project" ? (ctx.repoRoot ?? undefined) : undefined,
 		authorityRoot,
 		providerId: "runtime",
 		level,

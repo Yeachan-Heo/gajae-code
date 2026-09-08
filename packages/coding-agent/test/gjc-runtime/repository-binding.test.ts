@@ -137,9 +137,69 @@ describe("repository binding (#2901)", () => {
 		await initGitRepo(right);
 
 		const rightBinding = await captureRepositoryBinding(right, { relativeSubdir: "." });
-		await expect(resolveTaskRepositoryBinding(left, rightBinding)).rejects.toMatchObject({
-			code: "identity_mismatch",
+		const rejection = resolveTaskRepositoryBinding(left, rightBinding);
+		await expect(rejection).rejects.toMatchObject({ code: "identity_mismatch" });
+		await expect(rejection).rejects.toThrow(/start a new session.*gjc --cwd <approved-worktree>/i);
+	});
+
+	it("admits a binding captured by a fresh session in the approved linked worktree", async () => {
+		const root = await fsp.mkdtemp(path.join(os.tmpdir(), "gjc-repo-fresh-session-"));
+		tempRoots.push(root);
+		const main = path.join(root, "main");
+		const linked = path.join(root, "linked");
+		await fsp.mkdir(main);
+		await initGitRepo(main);
+
+		const proc = Bun.spawn(["git", "worktree", "add", "--detach", linked, "HEAD"], {
+			cwd: main,
+			stdout: "pipe",
+			stderr: "pipe",
 		});
+		const code = await proc.exited;
+		if (code !== 0) {
+			throw new Error(`git worktree add failed: ${await new Response(proc.stderr).text()}`);
+		}
+
+		const freshSessionBinding = await captureRepositoryBinding(linked, { displayPath: linked });
+		const resolved = await resolveTaskRepositoryBinding(linked, freshSessionBinding);
+		expect(path.resolve(resolved.worktreeRoot)).toBe(path.resolve(linked));
+		expect(resolved.commonDir).toBe(freshSessionBinding.commonDir);
+	});
+
+	it("rejects stale declared HEAD and branch snapshots", async () => {
+		const root = await fsp.mkdtemp(path.join(os.tmpdir(), "gjc-repo-stale-fields-"));
+		tempRoots.push(root);
+		await initGitRepo(root);
+		const binding = await captureRepositoryBinding(root);
+		const staleHead = { ...binding, head: `${binding.head}-stale` };
+		await expect(resolveTaskRepositoryBinding(root, staleHead)).rejects.toThrow(/HEAD does not match/i);
+		const staleBranch = { ...binding, branch: `${binding.branch ?? "branch"}-stale` };
+		await expect(resolveTaskRepositoryBinding(root, staleBranch)).rejects.toThrow(/branch does not match/i);
+	});
+
+	it("rejects forged nested roots and common directories", async () => {
+		const parent = await fsp.mkdtemp(path.join(os.tmpdir(), "gjc-repo-forged-fields-"));
+		tempRoots.push(parent);
+		const root = path.join(parent, "repo");
+		await fsp.mkdir(root);
+		await initGitRepo(root);
+		const binding = await captureRepositoryBinding(root);
+		await expect(
+			resolveTaskRepositoryBinding(root, { ...binding, worktreeRoot: path.join(root, "nested") }),
+		).rejects.toThrow(/worktreeRoot is stale or forged/i);
+		await expect(
+			resolveTaskRepositoryBinding(root, { ...binding, commonDir: path.join(root, "nested", ".git") }),
+		).rejects.toMatchObject({ code: "identity_mismatch" });
+	});
+
+	it("keeps non-git bindings valid while rejecting fabricated snapshots", async () => {
+		const root = await fsp.mkdtemp(path.join(os.tmpdir(), "gjc-repo-non-git-"));
+		tempRoots.push(root);
+		const binding = await captureRepositoryBinding(root);
+		await expect(resolveTaskRepositoryBinding(root, binding)).resolves.toMatchObject({ commonDir: null });
+		await expect(resolveTaskRepositoryBinding(root, { ...binding, head: "HEAD" })).rejects.toThrow(
+			/HEAD does not match/i,
+		);
 	});
 
 	it("preserves source repository identity in a linked git worktree", async () => {
