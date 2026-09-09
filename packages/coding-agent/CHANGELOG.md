@@ -13,7 +13,15 @@
 - Devin CLI models are selectable through the ordinary provider/model path. When `devin acp` is installed and authenticated, `devin` models are discovered from the account (`gjc models`, `/model`), resolve without a GJC credential (authentication stays in the CLI), and can be pointed at a non-PATH executable with `GJC_DEVIN_CLI_PATH`. See `docs/devin-provider.md` for the agent-level boundary, permissions, and billing.
 
 - Successful macOS installs and updates can offer the optional experimental, third-party community Gajae Code App (#5140), defaulting to No. The shared installer requires canonical release checksums and a verified bundle/signature, skips installed apps and automation, and supports `GJC_NO_COMMUNITY_APP=1`; app failures leave GJC installed.
+### Added
+- The in-process SDK now exposes `session.submitUserMessage()` for tracked queued steers and follow-ups. Each submission has a unique identity plus admission, execution, terminal, cancellation, removal, same-run, successor-run, and sequential FIFO lifecycle receipts without relying on private SDK-host correlation hooks.
 
+
+### Added
+- The in-process SDK now exposes `session.submitUserMessage()` for tracked queued steers and follow-ups. Each submission has a unique identity plus admission, execution, terminal, cancellation, removal, same-run, successor-run, and sequential FIFO lifecycle receipts without relying on private SDK-host correlation hooks.
+
+### Fixed
+- Tracked queued submissions settle as removed when successor startup fails before run acceptance, and overloaded AgentSession seams are coalesced in the generated SDK inventory.
 ### Fixed
 - Coordinator MCP now admits an authenticated workflow gate opened during an in-flight runtime turn while the sidecar is still `running`, preserving stable question bindings and live answer dispatch; terminal states without an accepted runtime receipt remain `terminal_uncertain` (#5513).
 - SDK session CLI raw globals now expose an explicit `--page` mode that preserves one bounded Broker `session.list` page and its opaque continuation cursor without changing semantic all-pages listing. The public `session.lookup` lifecycle global reconciles a previously submitted `session.create` from its retained request key and target without replaying creation, returns credential-free found/pending/not-found/conflict/uncertain/terminal outcomes, and keeps lookup identity and certainty in nonzero CLI results.

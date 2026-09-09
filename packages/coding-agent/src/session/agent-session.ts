@@ -830,6 +830,56 @@ export type AgentSessionEvent =
 	| { type: "thinking_level_changed"; thinkingLevel: ThinkingLevel | undefined }
 	| { type: "goal_updated"; goal: Goal | null; state?: GoalModeState };
 
+export type QueuedInputDelivery = "steer" | "followUp";
+export type QueuedInputQueuePolicy = "respect-mode" | "sequential";
+export type QueuedInputRemovalReason = "cancelled" | "removed";
+
+export interface QueuedInputAdmission {
+	submissionId: string;
+	delivery: QueuedInputDelivery;
+	queuePolicy: QueuedInputQueuePolicy;
+}
+
+export type QueuedInputExecution =
+	| {
+			submissionId: string;
+			delivery: QueuedInputDelivery;
+			disposition: "joined-current-run" | "promoted-to-run";
+			attemptScope: AttemptScopeRef;
+	  }
+	| {
+			submissionId: string;
+			delivery: QueuedInputDelivery;
+			disposition: "removed";
+			reason: QueuedInputRemovalReason;
+	  };
+
+export type QueuedInputTerminal =
+	| {
+			submissionId: string;
+			delivery: QueuedInputDelivery;
+			disposition: "completed";
+			attemptScope: AttemptScopeRef;
+	  }
+	| {
+			submissionId: string;
+			delivery: QueuedInputDelivery;
+			disposition: "removed";
+			reason: QueuedInputRemovalReason;
+	  };
+
+/**
+ * Lifecycle receipt for one explicitly queued `submitUserMessage` submission.
+ */
+export interface QueuedInputSubmission {
+	readonly submissionId: string;
+	readonly admitted: Promise<QueuedInputAdmission>;
+	readonly execution: Promise<QueuedInputExecution>;
+	readonly terminal: Promise<QueuedInputTerminal>;
+	/** Remove the submission if it is still queued. Returns false after execution or removal. */
+	readonly cancel: () => boolean;
+}
+
 /** Listener function for agent session events */
 export type AgentSessionEventListener = (event: AgentSessionEvent) => void;
 export type AsyncJobSnapshotItem = Pick<
@@ -1109,6 +1159,29 @@ export interface PromptOptions {
 	/** Internal host capability; ordinary package callers cannot construct the branded value. */
 	sdkRunCapability?: unknown;
 }
+
+export interface SendUserMessageOptions {
+	deliverAs?: QueuedInputDelivery;
+	/** Preserve a busy SDK dispatch as queued work across an admission fence. */
+	queuedAtDispatch?: boolean;
+	/** Delivery ordering for a tracked or SDK-queued submission. */
+	queuePolicy?: QueuedInputQueuePolicy;
+	onPreflightAccepted?: () => void;
+	onPreflightAcceptCommit?: () => void | Promise<void>;
+	/** Internal SDK ownership callback. */
+	onQueuedPromoted?: (promotion: { startsOwnRun?: boolean; removed?: boolean }) => void;
+	/** Internal dispatch disposition used before actual queue consumption. */
+	onDispatchDisposition?: (promotion: { startsOwnRun: boolean }) => void;
+	preflightSignal?: AbortSignal;
+	sdkRunCapability?: unknown;
+}
+
+export interface TrackedSendUserMessageOptions extends SendUserMessageOptions {
+	deliverAs: QueuedInputDelivery;
+	trackSubmission: true;
+}
+
+type SendUserMessageDispatchOptions = SendUserMessageOptions & { trackSubmission?: boolean };
 
 type InternalPromptOptions = PromptOptions & { sdkRunToken?: string };
 type InternalCustomMessageOptions = Pick<
@@ -2002,6 +2075,25 @@ function extractPermissionLocations(
 type QueuedDisplayEntry = { text: string; tag?: string; sequence: number; message?: AgentMessage };
 type IrcRosterClaim = { token: symbol; signature: string; epoch: number; message: CustomMessage };
 type QueuedFollowUpOwner = { cancel(): boolean };
+type DeferredValue<T> = {
+	promise: Promise<T>;
+	resolve: (value: T | PromiseLike<T>) => void;
+	reject: (reason?: unknown) => void;
+};
+type TrackedQueuedInput = {
+	submission: QueuedInputSubmission;
+	admitted: DeferredValue<QueuedInputAdmission>;
+	execution: DeferredValue<QueuedInputExecution>;
+	terminal: DeferredValue<QueuedInputTerminal>;
+	delivery: QueuedInputDelivery;
+	queuePolicy: QueuedInputQueuePolicy;
+	message?: AgentMessage;
+	cancelQueued?: () => boolean;
+	attemptScope?: AttemptScope;
+	executionSettled: boolean;
+	terminalSettled: boolean;
+	cancelRequested: boolean;
+};
 export type QueuedMessageEditMode = "steer" | "followUp";
 
 export interface QueuedMessageEditEntry {
@@ -2581,6 +2673,147 @@ export class AgentSession {
 	readonly #terminalAbortSteeringSnapshotKeys = new Map<number, string>();
 	#terminalAbortAdmissionSeq = 0;
 	#queuedDisplaySequence = 0;
+	readonly #trackedQueuedInputs = new Map<string, TrackedQueuedInput>();
+	readonly #trackedQueuedInputsAwaitingOwnRun = new Set<TrackedQueuedInput>();
+	readonly #trackedQueuedInputsByAttemptScope = new WeakMap<AttemptScope, Set<TrackedQueuedInput>>();
+
+	#createTrackedQueuedInput(delivery: QueuedInputDelivery, queuePolicy: QueuedInputQueuePolicy): TrackedQueuedInput {
+		const admitted = Promise.withResolvers<QueuedInputAdmission>();
+		const execution = Promise.withResolvers<QueuedInputExecution>();
+		const terminal = Promise.withResolvers<QueuedInputTerminal>();
+		const submissionId = `queued-${crypto.randomUUID()}`;
+		const state = {} as TrackedQueuedInput;
+		const submission: QueuedInputSubmission = {
+			submissionId,
+			admitted: admitted.promise,
+			execution: execution.promise,
+			terminal: terminal.promise,
+			cancel: () => {
+				if (state.executionSettled || state.terminalSettled || state.cancelQueued === undefined) return false;
+				state.cancelRequested = true;
+				const removed = state.cancelQueued();
+				if (!removed) state.cancelRequested = false;
+				return removed;
+			},
+		};
+		state.submission = submission;
+		state.admitted = admitted;
+		state.execution = execution;
+		state.terminal = terminal;
+		state.delivery = delivery;
+		state.queuePolicy = queuePolicy;
+		state.executionSettled = false;
+		state.terminalSettled = false;
+		state.cancelRequested = false;
+		this.#trackedQueuedInputs.set(submissionId, state);
+		return state;
+	}
+
+	#scopeRef(scope: AttemptScope): AttemptScopeRef {
+		return { attemptId: scope.attemptId, generation: scope.generation, lineage: scope.lineage };
+	}
+
+	#admitTrackedQueuedInput(state: TrackedQueuedInput, message: AgentMessage, cancelQueued: () => boolean): void {
+		if (state.message !== undefined || state.terminalSettled) return;
+		state.message = message;
+		state.cancelQueued = cancelQueued;
+		state.admitted.resolve({
+			submissionId: state.submission.submissionId,
+			delivery: state.delivery,
+			queuePolicy: state.queuePolicy,
+		});
+	}
+
+	#settleTrackedExecution(
+		state: TrackedQueuedInput,
+		disposition: "joined-current-run" | "promoted-to-run",
+		scope: AttemptScope,
+	): void {
+		if (state.executionSettled || state.terminalSettled) return;
+		state.executionSettled = true;
+		state.attemptScope = scope;
+		let states = this.#trackedQueuedInputsByAttemptScope.get(scope);
+		if (states === undefined) {
+			states = new Set<TrackedQueuedInput>();
+			this.#trackedQueuedInputsByAttemptScope.set(scope, states);
+		}
+		states.add(state);
+		state.execution.resolve({
+			submissionId: state.submission.submissionId,
+			delivery: state.delivery,
+			disposition,
+			attemptScope: this.#scopeRef(scope),
+		});
+	}
+
+	#settleTrackedOwnRunPromotions(scope: AttemptScope | undefined): void {
+		if (scope === undefined || this.#trackedQueuedInputsAwaitingOwnRun.size === 0) return;
+		for (const state of [...this.#trackedQueuedInputsAwaitingOwnRun]) {
+			this.#trackedQueuedInputsAwaitingOwnRun.delete(state);
+			this.#settleTrackedExecution(state, "promoted-to-run", scope);
+		}
+	}
+
+	#settleTrackedQueuedInputRemoved(state: TrackedQueuedInput, reason: QueuedInputRemovalReason): void {
+		if (!state.executionSettled) {
+			state.executionSettled = true;
+			state.execution.resolve({
+				submissionId: state.submission.submissionId,
+				delivery: state.delivery,
+				disposition: "removed",
+				reason,
+			});
+		}
+		if (state.terminalSettled) return;
+		state.terminalSettled = true;
+		state.terminal.resolve({
+			submissionId: state.submission.submissionId,
+			delivery: state.delivery,
+			disposition: "removed",
+			reason,
+		});
+		this.#trackedQueuedInputsAwaitingOwnRun.delete(state);
+		this.#trackedQueuedInputs.delete(state.submission.submissionId);
+	}
+
+	#handleTrackedQueuedInputPromotion(
+		state: TrackedQueuedInput,
+		promotion: { startsOwnRun?: boolean; removed?: boolean },
+	): void {
+		if (promotion.removed) {
+			this.#settleTrackedQueuedInputRemoved(state, state.cancelRequested ? "cancelled" : "removed");
+			return;
+		}
+		if (promotion.startsOwnRun === true) {
+			this.#trackedQueuedInputsAwaitingOwnRun.add(state);
+			return;
+		}
+		const scope = this.#activeAttemptScope;
+		if (scope === undefined) {
+			this.#settleTrackedQueuedInputRemoved(state, "removed");
+			return;
+		}
+		this.#settleTrackedExecution(state, "joined-current-run", scope);
+	}
+
+	#settleTrackedQueuedInputTerminal(scope: AttemptScope | undefined): void {
+		if (scope === undefined) return;
+		const states = this.#trackedQueuedInputsByAttemptScope.get(scope);
+		if (states === undefined) return;
+		this.#trackedQueuedInputsByAttemptScope.delete(scope);
+		for (const state of states) {
+			if (state.terminalSettled) continue;
+			state.terminalSettled = true;
+			state.terminal.resolve({
+				submissionId: state.submission.submissionId,
+				delivery: state.delivery,
+				disposition: "completed",
+				attemptScope: this.#scopeRef(scope),
+			});
+			this.#trackedQueuedInputs.delete(state.submission.submissionId);
+		}
+	}
+
 	/** Fire the stored promotion hook with a REMOVAL disposition for messages
 	 * leaving their queue without consumption (queue.message.remove, positional
 	 * editing, clearQueue, or the terminal-abort purge). The SDK terminalizes
@@ -2803,6 +3036,7 @@ export class AgentSession {
 			predecessorScope !== undefined &&
 			this.#skipPostPromptRecoveryWaitByAttemptScope.delete(predecessorScope);
 		this.#acceptRunHandle(handle);
+		this.#settleTrackedOwnRunPromotions(handle.scope);
 		if (sdkRunToken !== undefined) {
 			this.#activeSdkRunToken = sdkRunToken;
 			this.#sdkRunTokensByAttemptScope.set(handle.scope, sdkRunToken);
@@ -4330,6 +4564,7 @@ export class AgentSession {
 			// preserves transaction order; terminal publication is the user-visible
 			// authority and must not be suppressed by a secondary persistence failure.
 			const terminalPersistence = this.#queueCoordinatorRuntimeStatePersist(pending, true);
+			this.#settleTrackedQueuedInputTerminal(publicationScope);
 			this.#emit(pending);
 			void terminalPersistence.then(
 				() => {
@@ -6335,6 +6570,7 @@ export class AgentSession {
 			// re-enter prompt(), so a successor's running transition serializes after it.
 			// Do not let a lock-hostile sidecar suppress the terminal event itself.
 			const terminalPersistence = this.#queueCoordinatorRuntimeStatePersist(event);
+			this.#settleTrackedQueuedInputTerminal(attemptScope);
 			this.#emit(event);
 			void terminalPersistence;
 			await this.#emitExtensionEvent(event);
@@ -13130,6 +13366,8 @@ export class AgentSession {
 		options?: {
 			claimsGenuineUserIntent?: boolean;
 			onPromoted?: (promotion: { startsOwnRun?: boolean; removed?: boolean }) => void;
+			onQueued?: (message: AgentMessage) => void;
+			onQueuedAfterAdmission?: (message: AgentMessage, cancelQueued: () => boolean) => void;
 			external?: boolean;
 			sdkRunToken?: string;
 			forceOneAtATime?: boolean;
@@ -13156,7 +13394,9 @@ export class AgentSession {
 				scheduleNonAdmittedWake: false,
 				onQueued: message => {
 					if (this.#abortUnwind && !options?.forceOneAtATime) this.#abortUnwindSteerFallbacks.push(message);
+					options?.onQueued?.(message);
 				},
+				onQueuedAfterAdmission: options?.onQueuedAfterAdmission,
 			});
 			this.#scheduleNonAdmittedQueuedContinuation();
 			return;
@@ -13173,6 +13413,16 @@ export class AgentSession {
 			const epoch = this.#claimDeepInterviewUserIntent();
 			this.#deepInterviewGenuineUserMessageEpochs.set(message, epoch);
 		}
+		options?.onQueued?.(message);
+		options?.onQueuedAfterAdmission?.(message, () => {
+			const removed = this.agent.removeQueuedMessages(candidate => candidate === message).steering > 0;
+			if (!removed) return false;
+			this.#steeringMessages = this.#steeringMessages.filter(entry => entry.message !== message);
+			this.#externalSteerMessages.delete(message);
+			this.#sequentialSteerMessages.delete(message);
+			this.#fireQueuedRemovalHooks([message]);
+			return true;
+		});
 	}
 
 	/**
@@ -13223,6 +13473,7 @@ export class AgentSession {
 			sdkRunToken?: string;
 			onQueued?: (message: AgentMessage) => void;
 			scheduleNonAdmittedWake?: boolean;
+			onQueuedAfterAdmission?: (message: AgentMessage, cancelQueued: () => boolean) => void;
 		},
 	): Promise<QueuedFollowUpOwner> {
 		this.#assertNoHandoffTransition();
@@ -13261,6 +13512,41 @@ export class AgentSession {
 			if (options?.scheduleNonAdmittedWake !== false) this.#scheduleNonAdmittedQueuedContinuation();
 		}
 		return {
+
+		const owner: QueuedFollowUpOwner = {
+			cancel: () => {
+				const deferredIndex = this.#deferredSdkFollowUps.indexOf(message);
+				let removed = false;
+				if (deferredIndex !== -1) {
+					this.#deferredSdkFollowUps.splice(deferredIndex, 1);
+					removed = true;
+				} else {
+					removed = this.agent.removeQueuedMessages(candidate => candidate === message).followUp > 0;
+					if (removed) this.#releaseDeferredSdkFollowUps();
+				}
+				if (removed) {
+					this.#followUpMessages = this.#followUpMessages.filter(entry => entry !== displayEntry);
+					this.#deepInterviewGenuineUserMessageEpochs.delete(message);
+					this.#sdkRunTokensByQueuedMessage.delete(message);
+					this.#followUpPromotionHooks.get(message)?.({ removed: true });
+					this.#followUpPromotionHooks.delete(message);
+				}
+				return removed;
+			},
+		};
+		options?.onQueuedAfterAdmission?.(message, owner.cancel);
+		if (options?.sdkRunToken && (this.agent.state.isStreaming || this.agent.hasQueuedMessages())) {
+			this.#deferredSdkFollowUps.push(message);
+		} else {
+			this.agent.followUp(message, options?.forceOneAtATime ? { forceOneAtATime: true } : undefined);
+		}
+		if (queueWasEmpty) {
+			this.#scheduleQueuedFollowUpContinuation(() =>
+				this.agent.snapshotFollowUp().some(candidate => candidate === message),
+			);
+			if (options?.scheduleNonAdmittedWake !== false) this.#scheduleNonAdmittedQueuedContinuation();
+		}
+		return owner;
 			cancel: () => {
 				const deferredIndex = this.#deferredSdkFollowUps.indexOf(message);
 				let removed = false;
@@ -13287,6 +13573,24 @@ export class AgentSession {
 				return removed;
 			},
 		};
+		options?.onQueuedAfterAdmission?.(message, owner.cancel);
+		if (options?.sdkRunToken && (this.agent.state.isStreaming || this.agent.hasQueuedMessages())) {
+			this.#deferredSdkFollowUps.push(message);
+		} else {
+			this.agent.followUp(message, options?.forceOneAtATime ? { forceOneAtATime: true } : undefined);
+		}
+		// When this is the first queued message and the session is in a resumable
+		// assistant-ended state, schedule an immediate continue so it is delivered
+		// without waiting for the next user turn. A later accepted follow-up must
+		// not start unrelated queued work ahead of it, because that work has a
+		// different cancellation and terminal owner.
+		if (queueWasEmpty) {
+			this.#scheduleQueuedFollowUpContinuation(() =>
+				this.agent.snapshotFollowUp().some(candidate => candidate === message),
+			);
+			this.#scheduleNonAdmittedQueuedContinuation();
+		}
+		return owner;
 	}
 	#releaseDeferredSdkFollowUps(): void {
 		// A deferred SDK follow-up must become the sole first message at the next
@@ -13910,20 +14214,34 @@ export class AgentSession {
 	 */
 	async sendUserMessage(
 		content: string | (TextContent | ImageContent)[],
-		options?: {
-			deliverAs?: "steer" | "followUp";
-			/** Preserve a busy SDK dispatch as queued work across an admission fence. */
-			queuedAtDispatch?: boolean;
-			onPreflightAccepted?: () => void;
-			onPreflightAcceptCommit?: () => void | Promise<void>;
-			/** Fired when a queued submission (steering or follow-up) is promoted to its own run (SDK ownership correlation). */
-			onQueuedPromoted?: (promotion: { startsOwnRun?: boolean; removed?: boolean }) => void;
-			/** Internal dispatch disposition used before actual queue consumption. */
-			onDispatchDisposition?: (promotion: { startsOwnRun: boolean }) => void;
-			preflightSignal?: AbortSignal;
-			sdkRunCapability?: unknown;
-		},
+		options?: SendUserMessageOptions,
+	): Promise<void>;
+	async sendUserMessage(
+		content: string | (TextContent | ImageContent)[],
+		options?: SendUserMessageOptions,
 	): Promise<void> {
+		await this.#sendUserMessage(content, options);
+	}
+
+	/**
+	 * Queue one steer or follow-up and return a stable lifecycle handle for that
+	 * exact submission. Unlike `sendUserMessage`, this method resolves when the
+	 * queue admission receipt is available; use the returned promises to await
+	 * execution and the owning terminal boundary.
+	 */
+	async submitUserMessage(
+		content: string | (TextContent | ImageContent)[],
+		options: TrackedSendUserMessageOptions,
+	): Promise<QueuedInputSubmission> {
+		const submission = await this.#sendUserMessage(content, options);
+		if (submission === undefined) throw new Error("Tracked user message did not produce a submission handle.");
+		return submission;
+	}
+
+	async #sendUserMessage(
+		content: string | (TextContent | ImageContent)[],
+		options?: SendUserMessageDispatchOptions,
+	): Promise<undefined | QueuedInputSubmission> {
 		const sdkRunToken = readSdkRunCapability(options?.sdkRunCapability);
 		const internalOptions = options ? { ...options, ...(sdkRunToken ? { sdkRunToken } : {}) } : undefined;
 		this.#assertRecoveryHydrationPromoted();
@@ -13967,6 +14285,22 @@ export class AgentSession {
 			images?.some(image => typeof image?.data === "string" && image.data.trim().length > 0) === true;
 		if (text.trim().length === 0 && !hasUsableImage)
 			throw Object.assign(new Error("Prompt must not be empty."), { code: "invalid_input" });
+		if (options?.trackSubmission === true && options.deliverAs === undefined)
+			throw Object.assign(new Error("trackSubmission requires deliverAs: steer or followUp."), {
+				code: "invalid_input",
+			});
+		const trackedQueuedInput =
+			options?.trackSubmission === true && options.deliverAs !== undefined
+				? this.#createTrackedQueuedInput(options.deliverAs, options.queuePolicy ?? "respect-mode")
+				: undefined;
+		const onTrackedQueued = trackedQueuedInput
+			? (message: AgentMessage, cancelQueued: () => boolean) =>
+					this.#admitTrackedQueuedInput(trackedQueuedInput, message, cancelQueued)
+			: undefined;
+		const onQueuedPromoted = (promotion: { startsOwnRun?: boolean; removed?: boolean }): void => {
+			if (trackedQueuedInput) this.#handleTrackedQueuedInputPromotion(trackedQueuedInput, promotion);
+			options?.onQueuedPromoted?.(promotion);
+		};
 
 		let admissionSignal = options?.preflightSignal
 			? AbortSignal.any([this.#promptPreflightAbortController.signal, options.preflightSignal])
@@ -14058,27 +14392,32 @@ export class AgentSession {
 				assertPreflightStillOpen();
 				const queuedFollowUp = await this.#queueFollowUp(text, images, {
 					claimsGenuineUserIntent: true,
-					forceOneAtATime: Boolean(options?.preflightSignal || options?.queuedAtDispatch),
-					onPromoted: options?.onQueuedPromoted,
+					forceOneAtATime: Boolean(
+						options?.preflightSignal || options?.queuedAtDispatch || options?.queuePolicy === "sequential",
+					),
+					onPromoted: onQueuedPromoted,
 					sdkRunToken: internalOptions?.sdkRunToken,
+					onQueuedAfterAdmission: onTrackedQueued,
 				});
 				const cancelQueuedFollowUp = () => queuedFollowUp.cancel();
 				options?.preflightSignal?.addEventListener("abort", cancelQueuedFollowUp, { once: true });
 				if (options?.preflightSignal?.aborted) cancelQueuedFollowUp();
 				options?.onPreflightAccepted?.();
-				return;
+				return trackedQueuedInput?.submission;
 			}
 			if (deliverAs === "steer") {
 				if (options?.onPreflightAcceptCommit) await options.onPreflightAcceptCommit();
 				assertPreflightStillOpen();
 				await this.#queueSteer(text, images, {
 					claimsGenuineUserIntent: true,
-					onPromoted: options?.onQueuedPromoted,
+					onPromoted: onQueuedPromoted,
 					external: true,
 					sdkRunToken: internalOptions?.sdkRunToken,
+					forceOneAtATime: options?.queuePolicy === "sequential",
+					onQueuedAfterAdmission: onTrackedQueued,
 				});
 				options?.onPreflightAccepted?.();
-				return;
+				return trackedQueuedInput?.submission;
 			}
 
 			// No explicit delivery mode: only a live stream makes prompt() throw
@@ -14138,6 +14477,13 @@ export class AgentSession {
 				preflightSignal: options?.preflightSignal,
 			} as InternalPromptOptions);
 		} finally {
+			// A preflight fence or queue admission error can occur after the tracked
+			// state is allocated but before a queue callback binds its exact message.
+			// No handle escaped in that case, so discard the unreachable state rather
+			// than retaining an unresolved submission forever.
+			if (trackedQueuedInput?.message === undefined) {
+				this.#trackedQueuedInputs.delete(trackedQueuedInput?.submission.submissionId ?? "");
+			}
 			releaseFollowUpReservation();
 		}
 	}
@@ -15454,7 +15800,10 @@ export class AgentSession {
 									this.agent.restoreSteering(heldSteering);
 									this.#steeringMessages = [...heldSteeringDisplays, ...this.#steeringMessages];
 								}
-								if (selected) this.#fireQueuedPromotionHooks([message], { startsOwnRun: true });
+								if (selected) {
+									this.#fireQueuedPromotionHooks([message], { startsOwnRun: true });
+									this.#settleTrackedOwnRunPromotions(this.#activeAttemptScope);
+								}
 								if (selected) {
 									this.#steeringMessages = this.#steeringMessages.filter(entry => entry !== selected.display);
 									this.#followUpMessages = this.#followUpMessages.filter(entry => entry !== selected.display);

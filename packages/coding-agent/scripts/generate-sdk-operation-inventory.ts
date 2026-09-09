@@ -287,6 +287,8 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 		"internal fallback resolution bookkeeping, not a user-facing SDK control seam",
 	"agent_session:syncEagerDelegation":
 		"internal profile-derived eager delegation synchronization, not a user-facing SDK control seam",
+	"agent_session:submitUserMessage":
+		"public in-process embedder lifecycle API; direct handle surface, not an SDK transport operation",
 };
 /** Maps reviewed source seams to registry SDK operation IDs. */
 const SEAM_TO_SDK: Readonly<Record<string, string>> = {
