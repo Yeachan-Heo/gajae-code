@@ -1,0 +1,28 @@
+diff --git a/dist/converters/pdf/extract.js b/dist/converters/pdf/extract.js
+index 7e3f02ea889f166c30975cce53f7cbe4de620e54..ead075aa610637d1f42d14f81efb621c9d1094b7 100644
+--- a/dist/converters/pdf/extract.js
++++ b/dist/converters/pdf/extract.js
+@@ -428,8 +428,8 @@ function extractImageRegions(stext, pageNumber, pageHeight) {
+  * Render an image region from a PDF page as a PNG buffer.
+  * Uses mupdf's DrawDevice to render just the cropped area at 2x resolution.
+  */
+-export function renderImageRegion(input, region) {
+-    const mupdf = require("mupdf");
++export async function renderImageRegion(input, region) {
++    const mupdf = await import("mupdf");
+     const doc = mupdf.Document.openDocument(input, "application/pdf");
+     const page = doc.loadPage(region.pageNumber - 1);
+     const pad = 10;
+diff --git a/dist/converters/pdf/index.js b/dist/converters/pdf/index.js
+index 53b2703d354efefc44f5b364a3aab760efdc1138..cdb686c25c768184700903fc58167da9e3e67583 100644
+--- a/dist/converters/pdf/index.js
++++ b/dist/converters/pdf/index.js
+@@ -60,7 +60,7 @@ export class PdfConverter {
+                     const filename = `${img.id}.png`;
+                     const filepath = join(imageDir, filename);
+                     try {
+-                        const png = renderImageRegion(pdfBytes, img);
++                        const png = await renderImageRegion(pdfBytes, img);
+                         writeFileSync(filepath, png);
+                         imageBlocks.push({
+                             topY: img.topY,
