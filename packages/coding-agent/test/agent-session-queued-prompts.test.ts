@@ -326,6 +326,87 @@ describe("AgentSession queued prompts (issue #434)", () => {
 		expect(userTexts(session)).toEqual(["p1", "queue newest", "queue older"]);
 	});
 
+	it("keeps exact queued submissions cancellable after no-model admission failure and retries survivors", async () => {
+		session = buildSession([
+			{ content: ["root complete"] },
+			{ content: ["duplicate complete"] },
+			{ content: ["unrelated complete"] },
+			{ content: ["recovery complete"] },
+		]);
+		await session.prompt("root");
+		await session.waitForIdle();
+		const model = session.agent.state.model;
+		session.agent.setModel(undefined);
+		const events: QueuedInputEvent[] = [];
+		session.subscribe(event => {
+			if (event.type.startsWith("queued_input_")) events.push(event as QueuedInputEvent);
+		});
+		const failures: unknown[] = [];
+		const continueQueued = session.agent.continueQueuedMessages.bind(session.agent);
+		const continuationSpy = spyOn(session.agent, "continueQueuedMessages").mockImplementation(async options => {
+			try {
+				await continueQueued(options);
+			} catch (error) {
+				failures.push(error);
+				throw error;
+			}
+		});
+		try {
+			const submissions = [
+				session.submitQueuedInput("duplicate", { mode: "followUp", queuePolicy: "sequential" }),
+				session.submitQueuedInput("duplicate", { mode: "followUp", queuePolicy: "sequential" }),
+				session.submitQueuedInput("unrelated", { mode: "followUp", queuePolicy: "sequential" }),
+			] as const;
+			const queued = session.agent.snapshotFollowUp();
+			const [cancelled, survivor, unrelated] = await Promise.all(submissions);
+			await session.waitForIdle();
+			expect(failures.length).toBeGreaterThan(0);
+			for (const error of failures) expect(error).toMatchObject({ message: "No model configured" });
+			expect(session.agent.snapshotFollowUp()).toHaveLength(3);
+			for (const [index, message] of queued.entries()) expect(session.agent.snapshotFollowUp()[index]).toBe(message);
+			expect(events).toEqual([
+				{ type: "queued_input_admitted", submissionId: cancelled.submissionId, mode: "followUp" },
+				{ type: "queued_input_admitted", submissionId: survivor.submissionId, mode: "followUp" },
+				{ type: "queued_input_admitted", submissionId: unrelated.submissionId, mode: "followUp" },
+			]);
+			expect(cancelled.submissionId).not.toBe(survivor.submissionId);
+			expect(cancelled.cancel()).toBe(true);
+			expect(cancelled.cancel()).toBe(false);
+			expect(session.agent.snapshotFollowUp()[0]).toBe(queued[1]);
+			expect(session.agent.snapshotFollowUp()[1]).toBe(queued[2]);
+			expect(events.filter(event => event.type === "queued_input_removed")).toEqual([
+				{ type: "queued_input_removed", submissionId: cancelled.submissionId },
+			]);
+
+			// A later explicit prompt retries retained work after configuration is
+			// repaired; the duplicate must still precede the unrelated follow-up.
+			session.agent.setModel(model);
+			await session.prompt("recovery");
+			await session.waitForIdle();
+			expect(userTexts(session)).toEqual(["root", "recovery", "duplicate", "unrelated"]);
+			for (const submission of [survivor, unrelated]) {
+				const consumed = events.filter(
+					(event): event is Extract<QueuedInputEvent, { type: "queued_input_consumed" }> =>
+						event.type === "queued_input_consumed" && event.submissionId === submission.submissionId,
+				);
+				const terminal = events.filter(
+					(event): event is Extract<QueuedInputEvent, { type: "queued_input_terminal" }> =>
+						event.type === "queued_input_terminal" && event.submissionId === submission.submissionId,
+				);
+				expect(consumed).toHaveLength(1);
+				expect(terminal).toHaveLength(1);
+				expect(terminal[0]?.runId).toBe(consumed[0]?.runId);
+				expect(submission.cancel()).toBe(false);
+			}
+			expect(events.filter(event => event.submissionId === cancelled.submissionId).map(event => event.type)).toEqual(
+				["queued_input_admitted", "queued_input_removed"],
+			);
+			expect(session.agent.hasQueuedMessages()).toBe(false);
+		} finally {
+			continuationSpy.mockRestore();
+		}
+	});
+
 	it("correlates duplicate steers and follow-ups with their exact same-run terminal", async () => {
 		const gate = Promise.withResolvers<void>();
 		session = buildSession([

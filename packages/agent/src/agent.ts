@@ -1730,33 +1730,13 @@ export class Agent {
 		if (messages[messages.length - 1].role === "assistant") {
 			const queuedSteering = this.#dequeueSteeringMessages();
 			if (queuedSteering.length > 0) {
-				await this.#runLoop(queuedSteering, {
-					...options,
-					skipInitialSteeringPoll: true,
-					consumedQueuedMessages: queuedSteering,
-				});
+				await this.#continueQueuedBatch(queuedSteering, "steering", options);
 				return;
 			}
 
 			const queuedFollowUp = this.#dequeueFollowUpMessages();
 			if (queuedFollowUp.length > 0) {
-				// Route the DIRECT-dequeue batch through the same consumption hook
-				// the in-loop getFollowUpMessages path uses: denied owned-completion
-				// envelopes are filtered before they reach the loop, and delivered
-				// envelopes settle their registrations — the direct path otherwise
-				// bypasses onFollowUpConsumed entirely (review threads P1/P2). A
-				// maintenanceContinuation resumes the existing logical run (no new
-				// agent_start), so its batch is in-run consumption, not an own-run
-				// promotion (#4668 review P1).
-				await this.onFollowUpConsumed?.(queuedFollowUp, {
-					startsOwnRun: options?.maintenanceContinuation !== true,
-				});
-				// The hook can filter the WHOLE batch (every entry denied by a
-				// scope:"owned" abort): starting an empty provider run would
-				// violate the zero-final-call guarantee, so return without
-				// running the loop (review thread P1).
-				if (queuedFollowUp.length === 0) return;
-				await this.#runLoop(queuedFollowUp, { ...options, consumedQueuedMessages: queuedFollowUp });
+				await this.#continueQueuedBatch(queuedFollowUp, "followUp", options);
 				return;
 			}
 
@@ -1779,38 +1759,57 @@ export class Agent {
 		}
 		const queuedSteering = this.#dequeueSteeringMessages();
 		if (queuedSteering.length > 0) {
-			await this.#runLoop(queuedSteering, {
-				...options,
-				skipInitialSteeringPoll: true,
-				consumedQueuedMessages: queuedSteering,
-			});
+			await this.#continueQueuedBatch(queuedSteering, "steering", options);
 			return;
 		}
 		const queuedFollowUp = this.#dequeueFollowUpMessages();
 		if (queuedFollowUp.length > 0) {
-			// Route the queued-tail batch through the same consumption hook as the
-			// in-loop getFollowUpMessages path and the assistant-tail continue()
-			// path: denied owned-completion envelopes are filtered before they
-			// reach the loop, and delivered envelopes settle their registrations.
-			// A terminal abort that leaves a tool/result tail and rearms an
-			// authorized owned-completion follow-up reaches this branch, so
-			// bypassing the hook would leak every such job's ownership tuple and
-			// eventually exhaust the bounded ownership registries (review thread
-			// P2). A maintenanceContinuation resumes the existing logical run (no
-			// new agent_start), so its batch is in-run consumption, not an own-run
-			// promotion (#4668 review P1).
-			await this.onFollowUpConsumed?.(queuedFollowUp, {
-				startsOwnRun: options?.maintenanceContinuation !== true,
-			});
-			// The hook can filter the WHOLE batch (every entry denied by a
-			// scope:"owned" abort): starting an empty provider run would violate
-			// the zero-final-call guarantee, so return without running the loop
-			// (review thread P2).
-			if (queuedFollowUp.length === 0) return;
-			await this.#runLoop(queuedFollowUp, { ...options, consumedQueuedMessages: queuedFollowUp });
+			await this.#continueQueuedBatch(queuedFollowUp, "followUp", options);
 			return;
 		}
 		throw new Error("No queued messages to continue");
+	}
+
+	/** A direct dequeue transfers ownership only when the continuation accepts its run. */
+	async #continueQueuedBatch(
+		messages: AgentMessage[],
+		mode: "steering" | "followUp",
+		options?: AgentPromptOptions,
+	): Promise<void> {
+		let accepted = false;
+		try {
+			if (mode === "followUp") {
+				// Preserve owned-completion filtering/settlement for both direct paths.
+				// Maintenance resumes the existing logical run, not an own-run promotion.
+				await this.onFollowUpConsumed?.(messages, {
+					startsOwnRun: options?.maintenanceContinuation !== true,
+				});
+				// A fully denied batch must not start an empty provider run.
+				if (messages.length === 0) return;
+			}
+			await this.#runLoop(messages, {
+				...options,
+				skipInitialSteeringPoll: mode === "steering" || options?.skipInitialSteeringPoll === true,
+				consumedQueuedMessages: messages,
+				onRunAccepted: (handle, acceptance) => {
+					// Claim before invoking external code: even a throwing acceptance
+					// observer must never put an already-owned batch back in the queue.
+					accepted = true;
+					options?.onRunAccepted?.(handle, acceptance);
+				},
+			});
+		} catch (error) {
+			if (!accepted) {
+				// Restore surviving identities ahead of later admissions, without
+				// resurrecting messages removed by the follow-up filter.
+				if (mode === "steering") this.restoreSteering(messages);
+				else {
+					this.markFollowUpBatch(messages);
+					this.restoreFollowUp(messages);
+				}
+			}
+			throw error;
+		}
 	}
 
 	/**

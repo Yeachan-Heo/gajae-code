@@ -23,6 +23,154 @@ function assistantMessage() {
 }
 
 describe("persisted continuation tail", () => {
+	for (const tail of ["assistant", "toolResult"] as const) {
+		for (const mode of ["steering", "followUp"] as const) {
+			for (const rejection of ["no model", "maintenance owner"] as const) {
+				it(`restores ${mode} identities after ${rejection} rejection with a ${tail} tail`, async () => {
+					const mock = createMockModel({ handler: () => ({ content: ["resumed"] }) });
+					const agent = new Agent({ streamFn: mock.stream });
+					const model = agent.state.model;
+					agent.replaceMessages([tail === "assistant" ? assistantMessage() : toolResultMessage()]);
+					agent.setSteeringMode("one-at-a-time");
+					agent.setFollowUpMode("one-at-a-time");
+					const first = userMessage();
+					const duplicate = userMessage();
+					const unrelated = { ...userMessage(), content: "unrelated" };
+					if (mode === "steering") {
+						agent.restoreSteering([first, duplicate]);
+						agent.followUp(unrelated);
+					} else {
+						agent.followUp(first);
+						agent.followUp(duplicate);
+						agent.followUp(unrelated);
+					}
+					const before = agent.snapshotQueues();
+					const accepted: AgentMessage[][] = [];
+					const resume =
+						tail === "assistant" ? agent.continue.bind(agent) : agent.continueQueuedMessages.bind(agent);
+					if (rejection === "no model") agent.setModel(undefined);
+					await expect(
+						resume({
+							maintenanceContinuation: rejection === "maintenance owner",
+							onRunAccepted: (_handle, acceptance) => accepted.push([...acceptance.consumedQueuedMessages]),
+						}),
+					).rejects.toThrow(
+						rejection === "no model"
+							? "No model configured"
+							: "Maintenance continuation ownership is unavailable",
+					);
+					expect(accepted).toEqual([]);
+					expect(mock.calls).toHaveLength(0);
+					for (const queue of ["steering", "followUp"] as const) {
+						const restored = agent.snapshotQueues()[queue];
+						expect(restored).toHaveLength(before[queue].length);
+						for (const [index, message] of before[queue].entries()) expect(restored[index]).toBe(message);
+					}
+					agent.setModel(model);
+					await resume({
+						onRunAccepted: (_handle, acceptance) => accepted.push([...acceptance.consumedQueuedMessages]),
+					});
+					expect(accepted).toHaveLength(1);
+					expect(accepted[0]).toHaveLength(1);
+					expect(accepted[0]?.[0]).toBe(first);
+					expect(agent.hasQueuedMessages()).toBe(false);
+					expect(
+						agent.state.messages.filter(message => message.role === "user").map(message => message.content),
+					).toEqual(["resume", "resume", "unrelated"]);
+				});
+			}
+		}
+	}
+
+	it("restores only surviving follow-ups ahead of new admissions after a filtering hook rejects", async () => {
+		const mock = createMockModel({ handler: () => ({ content: ["resumed"] }) });
+		const agent = new Agent({ streamFn: mock.stream });
+		agent.replaceMessages([toolResultMessage()]);
+		agent.setFollowUpMode("one-at-a-time");
+		const first = userMessage();
+		const denied = { ...userMessage(), content: "denied" };
+		const second = { ...userMessage(), content: "second" };
+		const later = { ...userMessage(), content: "later" };
+		agent.restoreFollowUp([first, denied, second]);
+		agent.markFollowUpBatch([first, denied, second]);
+		agent.onFollowUpConsumed = messages => {
+			messages.splice(1, 1);
+			agent.followUp(later);
+			throw new Error("pre-admission hook rejected");
+		};
+		await expect(agent.continueQueuedMessages()).rejects.toThrow("pre-admission hook rejected");
+		const restored = agent.snapshotFollowUp();
+		expect(restored).toHaveLength(3);
+		expect(restored[0]).toBe(first);
+		expect(restored[1]).toBe(second);
+		expect(restored[2]).toBe(later);
+		expect(mock.calls).toHaveLength(0);
+		agent.onFollowUpConsumed = undefined;
+		const accepted: AgentMessage[][] = [];
+		await agent.continueQueuedMessages({
+			onRunAccepted: (_handle, acceptance) => accepted.push([...acceptance.consumedQueuedMessages]),
+		});
+		expect(accepted).toHaveLength(1);
+		expect(accepted[0]).toHaveLength(2);
+		expect(accepted[0]?.[0]).toBe(first);
+		expect(accepted[0]?.[1]).toBe(second);
+		expect(agent.hasQueuedMessages()).toBe(false);
+		expect(agent.state.messages.filter(message => message.role === "user").map(message => message.content)).toEqual([
+			"resume",
+			"second",
+			"later",
+		]);
+	});
+
+	it("does not restore a claimed batch when its acceptance observer throws", async () => {
+		const mock = createMockModel({ handler: () => ({ content: ["must not run"] }) });
+		const agent = new Agent({ streamFn: mock.stream });
+		agent.replaceMessages([toolResultMessage()]);
+		agent.setFollowUpMode("one-at-a-time");
+		const selected = userMessage();
+		const unrelated = { ...userMessage(), content: "unrelated" };
+		agent.followUp(selected);
+		agent.followUp(unrelated);
+		try {
+			await expect(
+				agent.continueQueuedMessages({
+					onRunAccepted: (_handle, acceptance) => {
+						expect(acceptance.consumedQueuedMessages).toHaveLength(1);
+						expect(acceptance.consumedQueuedMessages[0]).toBe(selected);
+						throw new Error("acceptance observer rejected");
+					},
+				}),
+			).rejects.toThrow("acceptance observer rejected");
+			expect(agent.snapshotFollowUp()).toHaveLength(1);
+			expect(agent.snapshotFollowUp()[0]).toBe(unrelated);
+			expect(mock.calls).toHaveLength(0);
+		} finally {
+			agent.forceAbort("release claimed test run");
+			await agent.waitForIdle();
+		}
+	});
+
+	for (const tail of ["assistant", "toolResult"] as const) {
+		it(`preserves an explicit initial steering skip for follow-up continuation after ${tail}`, async () => {
+			const mock = createMockModel({ handler: () => ({ content: ["response"] }) });
+			const agent = new Agent({ streamFn: mock.stream });
+			agent.replaceMessages([tail === "assistant" ? assistantMessage() : toolResultMessage()]);
+			agent.followUp({ ...userMessage(), content: "selected follow-up" });
+			const resume = tail === "assistant" ? agent.continue.bind(agent) : agent.continueQueuedMessages.bind(agent);
+			await resume({
+				skipInitialSteeringPoll: true,
+				onRunAccepted: () => agent.steer({ ...userMessage(), content: "new steering" }),
+			});
+			expect(mock.calls).toHaveLength(2);
+			expect(
+				mock.calls[0]?.context.messages.filter(message => message.role === "user").map(message => message.content),
+			).toEqual(["selected follow-up"]);
+			expect(
+				mock.calls[1]?.context.messages.filter(message => message.role === "user").map(message => message.content),
+			).toEqual(["selected follow-up", "new steering"]);
+		});
+	}
+
 	it("accepts user and tool-result tails but rejects empty and assistant tails", () => {
 		expect(canContinuePersistedHistory([])).toBe(false);
 		expect(canContinuePersistedHistory([userMessage()])).toBe(true);

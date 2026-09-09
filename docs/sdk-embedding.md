@@ -310,6 +310,12 @@ cancellation before execution instead emits `queued_input_removed` immediately.
 An idle steer may be admitted as a follow-up by the existing continuation rules;
 the admission event reports the actual mode.
 
+If continuation fails before a run is accepted (for example, no model is
+configured), surviving dequeued inputs return to their executable queue ahead of
+newer admissions. Their submission identities remain pending and cancellable;
+no consumption or terminal success is fabricated. A later supported continuation
+can deliver them after the admission problem is corrected.
+
 `queuePolicy: "sequential"` delivers one submission per queue poll in FIFO order
 within either selected queue, overriding its default batching mode. It does not
 promise a separate run per message or impose ordering between the steering and
