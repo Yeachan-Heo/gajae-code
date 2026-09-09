@@ -27,6 +27,34 @@ export interface ResolveContext {
 	tmpDir: string;
 }
 
+export function sourcePin(source: PluginSource): { ref?: string; sha?: string; immutable: boolean } {
+	if (typeof source === "string") return { immutable: false };
+	if (source.source === "npm") return { immutable: false };
+	return {
+		ref: source.ref,
+		sha: source.sha,
+		immutable: typeof source.sha === "string" && /^[a-f0-9]{40}$/i.test(source.sha),
+	};
+}
+
+export function assertPinnedSource(source: PluginSource): void {
+	const pin = sourcePin(source);
+	if (!pin.immutable) throw new Error("marketplace restore requires an immutable source SHA");
+}
+
+/**
+ * Independently verify that a resolved git checkout's HEAD matches the pinned
+ * SHA the plan/token claims to restore. `git.clone` already checks out the
+ * exact SHA, but this re-derives the fact from the checkout itself (a fresh
+ * `rev-parse HEAD` in the resolved directory) rather than trusting whatever
+ * the resolver returned, so a resolver bug or a swapped working tree cannot
+ * silently mismatch source and to-be-published bytes.
+ */
+export async function verifyResolvedProvenance(resolvedDir: string, expectedSha: string): Promise<boolean> {
+	const actual = await git.head.sha(resolvedDir).catch(() => null);
+	return typeof actual === "string" && actual.toLowerCase() === expectedSha.toLowerCase();
+}
+
 /**
  * Resolve a plugin source to an absolute local directory path.
  *

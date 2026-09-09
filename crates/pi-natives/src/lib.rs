@@ -27,6 +27,8 @@ pub mod build_info;
 pub mod clipboard;
 pub mod computer;
 pub mod crash;
+pub mod doctor_journal;
+pub mod doctor_link;
 pub mod edit_fuzzy;
 pub mod fd;
 pub mod fs_cache;

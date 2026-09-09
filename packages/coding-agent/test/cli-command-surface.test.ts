@@ -4,8 +4,8 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { lifecyclePaths } from "@gajae-code/coding-agent/gjc-runtime/tmux-owner-isolation";
 import packageJson from "../package.json";
-import { interactiveBootstrapText, routeModelsAlias, routeRootArgv } from "../src/cli";
 import { parseArgs } from "../src/cli/args";
+import { interactiveBootstrapText, routeModelsAlias, routeRootArgv } from "../src/cli-main";
 
 const repoRoot = path.resolve(import.meta.dir, "..", "..", "..");
 const cliEntry = path.join(repoRoot, "packages", "coding-agent", "src", "cli.ts");
@@ -142,8 +142,9 @@ process.exitCode = await child.exited;`;
 	}, 30_000);
 
 	it("registers launch plus retained workflow/runtime utility endpoints", async () => {
-		const source = await Bun.file(cliEntry).text();
+		const source = await Bun.file(path.join(path.dirname(cliEntry), "cli-main.ts")).text();
 		expect(extractRegisteredCommands(source)).toEqual([
+			"doctor",
 			"codex-native-hook",
 			"state",
 			"setup",

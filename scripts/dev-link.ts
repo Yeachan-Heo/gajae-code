@@ -24,7 +24,8 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { findForeignWorkspaceLinks, formatWorktreeReport, inspectWorktree } from "./worktree-deps";
+import { formatWorktreeReport, inspectWorktree } from "./worktree-deps";
+import { createHash } from "node:crypto";
 
 const repoRoot = path.join(import.meta.dir, "..");
 const cliSource = path.join(repoRoot, "packages", "coding-agent", "src", "cli.ts");
@@ -36,6 +37,7 @@ const BUN_SHIM_VERSION = 5478;
 const MAX_BUN_SHIM_METADATA_BYTES = 64 * 1024;
 const MAX_BUN_SHIM_EXECUTABLE_BYTES = 1024 * 1024;
 const EXPECTED_WORKSPACE_WRAPPER = '#!/usr/bin/env bun\nimport { runCli } from "@gajae-code/coding-agent/cli";\n\nawait runCli(process.argv.slice(2));\n';
+const RECEIPT_VERSION = 1;
 
 function realpath(p: string): string | null {
 	try {
@@ -50,6 +52,42 @@ function lexists(p: string): boolean {
 	try {
 		fs.lstatSync(p);
 		return true;
+	} catch {
+		return false;
+	}
+}
+
+function writeOwnershipReceipt(target: string, root: string, alias: string, source: string): void {
+	const parent = path.dirname(target);
+	const identity = fs.lstatSync(target);
+	const body = {
+		version: RECEIPT_VERSION,
+		alias,
+		target,
+		root,
+		source,
+		parent,
+		identity: { dev: String((identity as fs.Stats).dev), ino: String((identity as fs.Stats).ino) },
+	};
+	const auth = createHash("sha256").update(JSON.stringify(body)).digest("hex");
+	const receipt = `${target}.gjc-managed.json`;
+	if (lexists(receipt)) {
+		const existing = fs.readFileSync(receipt, "utf8");
+		if (existing !== JSON.stringify({ ...body, auth }) + "\n") throw new Error(`Refusing to overwrite foreign ownership receipt: ${receipt}`);
+		return;
+	}
+	const fd = fs.openSync(receipt, "wx", 0o600);
+	try { fs.writeFileSync(fd, JSON.stringify({ ...body, auth }) + "\n"); } finally { fs.closeSync(fd); }
+}
+
+function hasTrustedOwnershipReceipt(target: string, root: string, alias: string): boolean {
+	try {
+		const raw = JSON.parse(fs.readFileSync(`${target}.gjc-managed.json`, "utf8"));
+		const body = { version: RECEIPT_VERSION, alias, target, root, source: raw.source, parent: raw.parent, identity: raw.identity };
+		const current = fs.lstatSync(target);
+		return raw.version === RECEIPT_VERSION && raw.alias === alias && raw.target === target && raw.root === root &&
+			raw.parent === path.dirname(target) && raw.identity?.dev === String(current.dev) && raw.identity?.ino === String(current.ino) &&
+			raw.auth === createHash("sha256").update(JSON.stringify(body)).digest("hex");
 	} catch {
 		return false;
 	}
@@ -398,12 +436,30 @@ function link(binary: boolean): never {
 	const linkSourceReal = realpath(linkSource) ?? linkSource;
 	fs.mkdirSync(targetDir, { recursive: true });
 	const target = path.join(targetDir, "gjc");
-	if (lexists(target)) fs.rmSync(target, { force: true });
+	if (lexists(target)) {
+		const existing = realpath(target);
+		if (!hasTrustedOwnershipReceipt(target, repoRoot, "gjc") || !existing || (existing !== cliSourceReal && existing !== realpath(binarySource))) {
+			console.error(`✗ Refusing to replace foreign or unknown ${target}`);
+			process.exit(1);
+		}
+		fs.rmSync(target, { force: true });
+		if (lexists(`${target}.gjc-managed.json`)) fs.rmSync(`${target}.gjc-managed.json`, { force: true });
+	}
 	fs.symlinkSync(linkSource, target);
+	writeOwnershipReceipt(target, repoRoot, "gjc", linkSourceReal);
 	console.log(`✓ Linked ${target} -> ${linkSource}`);
 	const aliasTarget = path.join(targetDir, "가재씨");
-	if (lexists(aliasTarget)) fs.rmSync(aliasTarget, { force: true });
+	if (lexists(aliasTarget)) {
+		const existing = realpath(aliasTarget);
+		if (!hasTrustedOwnershipReceipt(aliasTarget, repoRoot, "가재씨") || !existing || (existing !== cliSourceReal && existing !== realpath(binarySource))) {
+			console.error(`✗ Refusing to replace foreign or unknown ${aliasTarget}`);
+			process.exit(1);
+		}
+		fs.rmSync(aliasTarget, { force: true });
+		if (lexists(`${aliasTarget}.gjc-managed.json`)) fs.rmSync(`${aliasTarget}.gjc-managed.json`, { force: true });
+	}
 	fs.symlinkSync(linkSource, aliasTarget);
+	writeOwnershipReceipt(aliasTarget, repoRoot, "가재씨", linkSourceReal);
 	console.log(`✓ Linked ${aliasTarget} -> ${linkSource}`);
 	if (!isOnPath(targetDir)) {
 		console.warn(`! ${targetDir} is not on your PATH — add it so \`gjc\` resolves:`);

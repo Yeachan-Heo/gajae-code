@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { commands } from "../../src/cli";
+import { commands } from "../../src/cli-main";
 import { classifyQuickLane } from "../../src/quick-lane/classify";
 
 describe("quick-lane classifier (issue #3984)", () => {

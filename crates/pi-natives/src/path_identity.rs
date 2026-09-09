@@ -32,6 +32,21 @@ pub struct NativeBrokerPublicationObservation {
 pub struct NativeBrokerPublicationOperation {
 	pub kind: String,
 }
+#[napi(object)]
+pub struct NativeBrokerRestartIntent {
+	pub request_id: String,
+	pub lease:      String,
+	pub expires_at: i64,
+}
+
+/// Existing file-identity cross-bind (never a secret) that authorizes a
+/// successor to remove a predecessor's restart-intent slot it never itself
+/// prepared.
+#[napi(object)]
+pub struct NativeBrokerRestartIntentIdentity {
+	pub dev: BigInt,
+	pub ino: BigInt,
+}
 
 /// Retained descriptors plus the serialization state for the two blocking
 /// primitives.
@@ -205,6 +220,142 @@ impl NativeRetainedBrokerPublication {
 		}
 		NativeBrokerPublicationOperation { kind: "closed".to_owned() }
 	}
+
+	/// Owner-side prepare: exclusively creates the retained restart-intent slot
+	/// and keeps its descriptor open, so a later commit/cancel from this same
+	/// process never reopens by name.
+	#[napi]
+	pub fn prepare_restart_intent_async(
+		&self,
+		intent: NativeBrokerRestartIntent,
+	) -> task::Promise<NativeBrokerPublicationOperation> {
+		let payload = encode_restart_intent(&intent, "prepared");
+		let handle = self.acquire();
+		task::blocking("broker_publication_prepare_restart", (), move |_| {
+			Ok(NativeBrokerPublicationOperation { kind: run_prepare_restart_intent(handle, payload) })
+		})
+	}
+
+	/// Owner-side commit: rewrites the SAME retained descriptor from prepare, so
+	/// the transition can never race a different file occupying the name.
+	#[napi]
+	pub fn commit_restart_intent_async(
+		&self,
+		intent: NativeBrokerRestartIntent,
+	) -> task::Promise<NativeBrokerPublicationOperation> {
+		let payload = encode_restart_intent(&intent, "committed");
+		let handle = self.acquire();
+		task::blocking("broker_publication_commit_restart", (), move |_| {
+			Ok(NativeBrokerPublicationOperation { kind: run_commit_restart_intent(handle, payload) })
+		})
+	}
+
+	/// Owner-side cancel: exact-identity unlink of this process's own retained
+	/// slot. A lease expiry (no live owner to call this) leaves the file for the
+	/// successor's verified `clear_restart_intent_async` instead.
+	#[napi]
+	pub fn cancel_restart_intent_async(&self) -> task::Promise<NativeBrokerPublicationOperation> {
+		let handle = self.acquire();
+		task::blocking("broker_publication_cancel_restart", (), move |_| {
+			Ok(NativeBrokerPublicationOperation { kind: run_cancel_restart_intent(handle) })
+		})
+	}
+
+	/// Successor-side clear: exact-identity unlink of a predecessor's restart
+	/// slot this process never prepared itself. Only removes the name when its
+	/// current on-disk identity still matches the caller-proven dev/ino.
+	#[napi]
+	pub fn clear_restart_intent_async(
+		&self,
+		identity: NativeBrokerRestartIntentIdentity,
+	) -> task::Promise<NativeBrokerPublicationOperation> {
+		let (dev_negative, dev, dev_lossless) = identity.dev.get_u64();
+		let (ino_negative, ino, ino_lossless) = identity.ino.get_u64();
+		let valid = !dev_negative && !ino_negative && dev_lossless && ino_lossless;
+		let handle = self.acquire();
+		task::blocking("broker_publication_clear_restart", (), move |_| {
+			Ok(NativeBrokerPublicationOperation {
+				kind: if valid {
+					run_clear_foreign_restart_intent(handle, dev, ino)
+				} else {
+					"ambiguous".to_owned()
+				},
+			})
+		})
+	}
+}
+
+fn valid_restart_token(value: &str) -> bool {
+	!value.is_empty()
+		&& value.len() <= 256
+		&& value
+			.bytes()
+			.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
+/// Encodes one restart-intent record. `phase` is server-chosen per operation,
+/// never caller-supplied, so a caller cannot lie its own record into a
+/// transition it did not durably reach.
+fn encode_restart_intent(
+	intent: &NativeBrokerRestartIntent,
+	phase: &'static str,
+) -> Option<String> {
+	if intent.expires_at <= 0
+		|| !valid_restart_token(&intent.request_id)
+		|| !valid_restart_token(&intent.lease)
+	{
+		return None;
+	}
+	Some(format!(
+		"{{\"requestId\":\"{}\",\"lease\":\"{}\",\"expiresAt\":{},\"phase\":\"{}\"}}\n",
+		intent.request_id, intent.lease, intent.expires_at, phase
+	))
+}
+
+fn run_prepare_restart_intent(
+	handle: Option<Arc<RetainedPublicationHandle>>,
+	payload: Option<String>,
+) -> String {
+	let Some(payload) = payload else {
+		return "ambiguous".to_owned();
+	};
+	handle.map_or_else(
+		|| "closed".to_owned(),
+		|handle| handle.write_serialized(|publication| publication.prepare_restart_intent(&payload)),
+	)
+}
+
+fn run_commit_restart_intent(
+	handle: Option<Arc<RetainedPublicationHandle>>,
+	payload: Option<String>,
+) -> String {
+	let Some(payload) = payload else {
+		return "ambiguous".to_owned();
+	};
+	handle.map_or_else(
+		|| "closed".to_owned(),
+		|handle| handle.write_serialized(|publication| publication.commit_restart_intent(&payload)),
+	)
+}
+
+fn run_cancel_restart_intent(handle: Option<Arc<RetainedPublicationHandle>>) -> String {
+	handle.map_or_else(
+		|| "closed".to_owned(),
+		|handle| handle.write_serialized(publication::RetainedPublication::cancel_restart_intent),
+	)
+}
+
+fn run_clear_foreign_restart_intent(
+	handle: Option<Arc<RetainedPublicationHandle>>,
+	dev: u64,
+	ino: u64,
+) -> String {
+	handle.map_or_else(
+		|| "closed".to_owned(),
+		|handle| {
+			handle.write_serialized(|publication| publication.clear_foreign_restart_intent(dev, ino))
+		},
+	)
 }
 
 /// Retain the existing no-follow SDK publication objects after one-time
@@ -258,6 +409,15 @@ pub struct NativeOwnerOnlySecurityResult {
 	pub code:         Option<String>,
 	pub operation:    Option<String>,
 	pub attribute:    Option<String>,
+}
+
+/// Result of removing group/other permission bits from one exact config file.
+#[napi(object)]
+pub struct NativePermissionRepairResult {
+	pub status:   String,
+	pub changed:  bool,
+	pub verified: bool,
+	pub code:     Option<String>,
 }
 
 /// Caller-supplied identity and preauthorized quarantine evidence for exact
@@ -954,6 +1114,20 @@ fn exact_file_identity(identity: &NativeExactFileIdentity) -> Option<ExactFileId
 		allow_hard_link: identity.allow_hard_link.unwrap_or(false),
 	})
 }
+
+fn validate_retained_backup_name(name: &str) -> Option<String> {
+	if name.is_empty() || name.len() > 255 || name.contains('\0') {
+		return None;
+	}
+	let path = Path::new(name);
+	match path.components().next() {
+		Some(Component::Normal(component)) if path.components().count() == 1 => component
+			.to_str()
+			.filter(|component| *component == name)
+			.map(str::to_owned),
+		_ => None,
+	}
+}
 impl NativeCanonicalDirectoryIdentity {
 	fn success(platform: &str, canonical_path: String) -> Self {
 		Self {
@@ -1075,6 +1249,35 @@ impl NativeOwnerOnlySecurityResult {
 	}
 }
 
+impl NativePermissionRepairResult {
+	fn refused(code: &str) -> Self {
+		Self {
+			status:   "refused".to_owned(),
+			changed:  false,
+			verified: false,
+			code:     Some(code.to_owned()),
+		}
+	}
+
+	fn uncertain(code: &str) -> Self {
+		Self {
+			status:   "uncertain".to_owned(),
+			changed:  true,
+			verified: false,
+			code:     Some(code.to_owned()),
+		}
+	}
+
+	fn verified(changed: bool) -> Self {
+		Self {
+			status: if changed { "changed" } else { "verified" }.to_owned(),
+			changed,
+			verified: true,
+			code: None,
+		}
+	}
+}
+
 #[cfg(unix)]
 fn io_code(error: &io::Error) -> &'static str {
 	match error.kind() {
@@ -1118,6 +1321,15 @@ pub fn canonical_existing_directory_identity(
 	platform::canonical_existing_directory_identity(&path)
 }
 
+#[cfg(unix)]
+pub(crate) fn verify_descriptor_acl_absent(
+	file: &std::fs::File,
+	directory: bool,
+) -> Result<(), String> {
+	platform::verify_descriptor_acl_absent(file, directory)
+		.map_err(|result| result.code.unwrap_or_else(|| "acl_unavailable".to_owned()))
+}
+
 #[napi]
 pub fn apply_owner_only_path_security(path: String, kind: String) -> NativeOwnerOnlySecurityResult {
 	if path.contains('\0') {
@@ -1135,6 +1347,40 @@ pub fn verify_owner_only_path_security(
 		return NativeOwnerOnlySecurityResult::failure("io_error");
 	}
 	platform::verify_owner_only_path_security(Path::new(&path), &kind)
+}
+
+/// Remove only group/other permission bits from an exact, user-owned regular
+/// file.
+#[napi]
+pub fn repair_config_file_permissions(
+	path: String,
+	identity: NativeExactFileIdentity,
+	expected_mode: u32,
+) -> NativePermissionRepairResult {
+	if path.contains('\0') {
+		return NativePermissionRepairResult::refused("io_error");
+	}
+	let Some(identity) = exact_file_identity(&identity) else {
+		return NativePermissionRepairResult::refused("identity_mismatch");
+	};
+	platform::repair_config_file_permissions(Path::new(&path), &identity, expected_mode, true)
+}
+
+/// Validate the exact permission repair preconditions without changing
+/// metadata.
+#[napi]
+pub fn inspect_config_file_permission_repair(
+	path: String,
+	identity: NativeExactFileIdentity,
+	expected_mode: u32,
+) -> NativePermissionRepairResult {
+	if path.contains('\0') {
+		return NativePermissionRepairResult::refused("io_error");
+	}
+	let Some(identity) = exact_file_identity(&identity) else {
+		return NativePermissionRepairResult::refused("identity_mismatch");
+	};
+	platform::repair_config_file_permissions(Path::new(&path), &identity, expected_mode, false)
 }
 /// Verify owner-only ACL security without mutation only when the retained
 /// no-follow handle identifies the expected object before and after inspection.
@@ -1290,6 +1536,77 @@ pub fn exact_replace_path(
 	#[cfg(not(any(unix, windows)))]
 	{
 		let _ = (source_path, destination_path, expected_source, expected_destination);
+		NativeExactUnlinkResult::failure("unsupported_platform")
+	}
+}
+
+/// Atomically replace an in-place executable (or other running-process
+/// payload) only after validating the exact staged source and current
+/// destination, retiring the old destination bytes to a caller-preauthorized
+/// backup name instead of scrubbing or unlinking them.
+///
+/// This exists for D4 self-replacement: [`exact_replace_path`] retires its
+/// predecessor through the same descriptor-scrub/exchange-cleanup protocol
+/// [`exact_unlink`] uses, which either truncates the old bytes in place
+/// (POSIX, when the exchange succeeds) or deletes them outright (Windows).
+/// Both are safe for a config file with no open executing mapping, but unsafe
+/// for a binary a running process may still be mapped from or about to
+/// re-exec: scrubbing or deleting those bytes out from under a live mapping
+/// can crash the very process performing the update. `exact_replace_retained`
+/// therefore never truncates or deletes the predecessor at all -- it commits
+/// the atomic exchange (POSIX) or native rename swap (Windows) and then
+/// renames the old destination to `backup_name` in the same parent, leaving
+/// its bytes byte-for-byte intact and readable at that retained path.
+///
+/// `backup_name` must be a bounded (<=255 bytes), single-path-component,
+/// separator-free, non-`.`/`..` name; it is used verbatim, with no
+/// auto-suffixing, and an already-occupied backup name is refused rather than
+/// overwritten -- the caller is responsible for choosing a name that will not
+/// collide with a foreign object, and a collision leaves the retired
+/// predecessor's replacement decision to a later caller rather than losing
+/// data. Both identities must describe regular files in the same retained
+/// parent, never directories or detach-only requests, and both are
+/// CAS-checked (parent identity + dev/ino/size/mtime/hash + regular/
+/// single-link ownership; hard-linked or symlinked source/destination are
+/// rejected) before anything is mutated. On Windows a pre-mutation
+/// `STATUS_SHARING_VIOLATION` on the destination open is reported as a
+/// distinct `sharing_violation` code with `windows_error_code` set -- exactly
+/// as [`exact_replace_path`] already reports it -- and is always surfaced
+/// before any rename, so it is never mistaken for a post-effect failure.
+#[napi]
+pub fn exact_replace_retained(
+	source_path: String,
+	destination_path: String,
+	backup_name: String,
+	expected_source: NativeExactFileIdentity,
+	expected_destination: NativeExactFileIdentity,
+) -> NativeExactUnlinkResult {
+	if source_path.contains('\0') || destination_path.contains('\0') {
+		return NativeExactUnlinkResult::failure("invalid_request");
+	}
+	let Some(backup_name) = validate_retained_backup_name(&backup_name) else {
+		return NativeExactUnlinkResult::failure("invalid_request");
+	};
+	let Some(expected_source) = exact_file_identity(&expected_source) else {
+		return NativeExactUnlinkResult::failure("identity_mismatch");
+	};
+	let Some(expected_destination) = exact_file_identity(&expected_destination) else {
+		return NativeExactUnlinkResult::failure("identity_mismatch");
+	};
+	#[cfg(any(unix, windows))]
+	{
+		platform::exact_replace_retained(
+			Path::new(&source_path),
+			Path::new(&destination_path),
+			&backup_name,
+			&expected_source,
+			&expected_destination,
+		)
+	}
+
+	#[cfg(not(any(unix, windows)))]
+	{
+		let _ = (source_path, destination_path, backup_name, expected_source, expected_destination);
 		NativeExactUnlinkResult::failure("unsupported_platform")
 	}
 }
@@ -1526,10 +1843,15 @@ fn path_from_bytes(bytes: &[u8]) -> Option<PathBuf> {
 mod publication {
 	use std::{
 		fs::File,
-		io::Read,
-		os::unix::fs::{FileExt, MetadataExt},
+		io::{Read, Write},
+		os::{
+			fd::{AsRawFd, FromRawFd},
+			unix::fs::{FileExt, MetadataExt},
+		},
 		path::{Path, PathBuf},
 	};
+
+	use parking_lot::Mutex;
 
 	#[cfg(target_vendor = "apple")]
 	const fn mode_kind(kind: libc::mode_t) -> u32 {
@@ -1631,6 +1953,14 @@ mod publication {
 		RetainedPublicationOpenFailure { object, reason: reason.into() }
 	}
 
+	/// Filename of the independent restart-intent slot. It lives directly
+	/// beneath the retained `sdk` root -- never inside `sdk/broker.lock` -- so
+	/// intent durably survives a stale-lock reclaim that renames the
+	/// incumbent's lock directory aside (`Broker#reclaimStaleLock`), which
+	/// would otherwise erase a still-pending restart the moment the old lock is
+	/// quarantined.
+	const RESTART_INTENT_NAME: &std::ffi::CStr = c"broker.restart.json";
+
 	pub(super) struct RetainedPublication {
 		// Declaration order is drop order: release publication authority first.
 		discovery:          File,
@@ -1643,6 +1973,11 @@ mod publication {
 		discovery_identity: Identity,
 		heartbeat_offset:   u64,
 		agent_dir:          PathBuf,
+		/// The owner-prepared restart-intent descriptor, retained across
+		/// prepare/commit so commit rewrites the exact same inode rather than
+		/// reopening (and potentially colliding with) the pathname. `None` before
+		/// prepare and after cancel.
+		restart_intent:     Mutex<Option<File>>,
 	}
 
 	impl RetainedPublication {
@@ -1701,6 +2036,7 @@ mod publication {
 				_owner: owner,
 				discovery,
 				heartbeat_offset: start as u64,
+				restart_intent: Mutex::new(None),
 			})
 		}
 
@@ -1764,6 +2100,101 @@ mod publication {
 				"ambiguous".to_owned()
 			}
 		}
+
+		pub(super) fn prepare_restart_intent(&self, payload: &str) -> String {
+			if payload.len() > 4096 || self.observe() != "owned" {
+				return "ambiguous".to_owned();
+			}
+			let mut slot = self.restart_intent.lock();
+			if slot.is_some() {
+				return "ambiguous".to_owned();
+			}
+			let fd = unsafe {
+				libc::openat(
+					self._root.as_raw_fd(),
+					RESTART_INTENT_NAME.as_ptr(),
+					libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+					0o600,
+				)
+			};
+			if fd < 0 {
+				return "ambiguous".to_owned();
+			}
+			let mut file = unsafe { File::from_raw_fd(fd) };
+			if file.write_all(payload.as_bytes()).is_err()
+				|| file.sync_all().is_err()
+				|| self._root.sync_all().is_err()
+				|| self.observe() != "owned"
+			{
+				unsafe { libc::unlinkat(self._root.as_raw_fd(), RESTART_INTENT_NAME.as_ptr(), 0) };
+				return "ambiguous".to_owned();
+			}
+			*slot = Some(file);
+			"written".to_owned()
+		}
+
+		pub(super) fn commit_restart_intent(&self, payload: &str) -> String {
+			if payload.len() > 4096 {
+				return "ambiguous".to_owned();
+			}
+			let mut slot = self.restart_intent.lock();
+			let Some(file) = slot.as_mut() else {
+				return "ambiguous".to_owned();
+			};
+			if self.observe() != "owned"
+				|| file.set_len(0).is_err()
+				|| file.write_at(payload.as_bytes(), 0).is_err()
+				|| file.sync_all().is_err()
+				|| self._root.sync_all().is_err()
+				|| self.observe() != "owned"
+			{
+				return "ambiguous".to_owned();
+			}
+			"written".to_owned()
+		}
+
+		pub(super) fn cancel_restart_intent(&self) -> String {
+			let mut slot = self.restart_intent.lock();
+			let Some(file) = slot.take() else {
+				return "ambiguous".to_owned();
+			};
+			let Some(held) = Identity::of(&file) else {
+				return "ambiguous".to_owned();
+			};
+			if !unlink_matching_restart_intent(self._root.as_raw_fd(), &held) {
+				return "ambiguous".to_owned();
+			}
+			let _ = self._root.sync_all();
+			"cancelled".to_owned()
+		}
+
+		pub(super) fn clear_foreign_restart_intent(&self, dev: u64, ino: u64) -> String {
+			if self.restart_intent.lock().is_some() {
+				return "ambiguous".to_owned();
+			}
+			if !unlink_matching_restart_intent(self._root.as_raw_fd(), &Identity { dev, ino }) {
+				return "ambiguous".to_owned();
+			}
+			let _ = self._root.sync_all();
+			"cleared".to_owned()
+		}
+	}
+
+	fn unlink_matching_restart_intent(root_fd: libc::c_int, expected: &Identity) -> bool {
+		let mut named: libc::stat = unsafe { std::mem::zeroed() };
+		if unsafe {
+			libc::fstatat(root_fd, RESTART_INTENT_NAME.as_ptr(), &mut named, libc::AT_SYMLINK_NOFOLLOW)
+		} != 0
+		{
+			return false;
+		}
+		if mode_kind(named.st_mode) & mode_kind(libc::S_IFMT) != mode_kind(libc::S_IFREG)
+			|| named.st_dev as u64 != expected.dev
+			|| named.st_ino as u64 != expected.ino
+		{
+			return false;
+		}
+		unsafe { libc::unlinkat(root_fd, RESTART_INTENT_NAME.as_ptr(), 0) == 0 }
 	}
 }
 
@@ -1831,6 +2262,22 @@ mod publication {
 		pub(super) fn sync(&self) -> String {
 			"ambiguous".to_owned()
 		}
+
+		pub(super) fn prepare_restart_intent(&self, _: &str) -> String {
+			"ambiguous".to_owned()
+		}
+
+		pub(super) fn commit_restart_intent(&self, _: &str) -> String {
+			"ambiguous".to_owned()
+		}
+
+		pub(super) fn cancel_restart_intent(&self) -> String {
+			"ambiguous".to_owned()
+		}
+
+		pub(super) fn clear_foreign_restart_intent(&self, _: u64, _: u64) -> String {
+			"ambiguous".to_owned()
+		}
 	}
 
 	#[cfg(test)]
@@ -1871,7 +2318,8 @@ pub(crate) mod platform {
 	use super::{
 		ExactFileIdentity, NativeCanonicalDirectoryIdentity, NativeDirectoryTreeEntry,
 		NativeDirectoryTreeResult, NativeDirectoryTreeSnapshot, NativeExactUnlinkResult,
-		NativeOwnerOnlySecurityResult, digest_reader, io_code, security_io_code, sha256,
+		NativeOwnerOnlySecurityResult, NativePermissionRepairResult, digest_reader, io_code,
+		security_io_code, sha256,
 	};
 
 	/// Bound on EINTR restarts for the no-replace rename primitive. A signal
@@ -3715,6 +4163,213 @@ pub(crate) mod platform {
 			Err(result) => result,
 		}
 	}
+	#[cfg(any(target_os = "linux", target_os = "macos"))]
+	pub(super) fn repair_config_file_permissions(
+		path: &Path,
+		expected: &ExactFileIdentity,
+		expected_mode: u32,
+		apply: bool,
+	) -> NativePermissionRepairResult {
+		let (Some(parent_dev), Some(parent_ino), Some(expected_hash)) =
+			(expected.parent_dev, expected.parent_ino, expected.sha256)
+		else {
+			return NativePermissionRepairResult::refused("identity_unavailable");
+		};
+		if expected.size > 1024 * 1024 {
+			return NativePermissionRepairResult::refused("file_limit_exceeded");
+		}
+		let authority = match checked_file(path, "file") {
+			Ok(value) => value,
+			Err(result) => {
+				return NativePermissionRepairResult::refused(
+					result.code.as_deref().unwrap_or("identity_unavailable"),
+				);
+			},
+		};
+		let before = match revalidate_authority(&authority) {
+			Ok(value) => value,
+			Err(result) => {
+				return NativePermissionRepairResult::refused(
+					result.code.as_deref().unwrap_or("identity_mismatch"),
+				);
+			},
+		};
+		if before.st_mode & libc::S_IFMT != libc::S_IFREG {
+			return NativePermissionRepairResult::refused("not_regular");
+		}
+		if before.st_nlink != 1 {
+			return NativePermissionRepairResult::refused("hardlink");
+		}
+		// SAFETY: geteuid has no preconditions and only reads process credentials.
+		if before.st_uid != unsafe { libc::geteuid() } {
+			return NativePermissionRepairResult::refused("owner_mismatch");
+		}
+		let parent = match fstat(authority.parent.as_raw_fd()) {
+			Ok(value) => value,
+			Err(result) => {
+				return NativePermissionRepairResult::refused(
+					result.code.as_deref().unwrap_or("io_error"),
+				);
+			},
+		};
+		if before.st_dev as u64 != expected.dev
+			|| before.st_ino != expected.ino
+			|| before.st_nlink as u64 != expected.nlink.unwrap_or(1)
+			|| before.st_size as u64 != expected.size
+			|| stat_mtime_ns(&before) != i128::from(expected.mtime_ns)
+		{
+			return NativePermissionRepairResult::refused("identity_mismatch");
+		}
+		if parent.st_dev as u64 != parent_dev || parent.st_ino != parent_ino {
+			return NativePermissionRepairResult::refused("identity_mismatch");
+		}
+		if parent.st_mode & 0o022 != 0 {
+			return NativePermissionRepairResult::refused("parent_shared_writable");
+		}
+		#[cfg(target_os = "linux")]
+		match query_extended_acl(&authority.file, AclAttribute::Access) {
+			Ok("absent") => {},
+			Ok(_) => return NativePermissionRepairResult::refused("acl_unavailable"),
+			Err(result) => {
+				return NativePermissionRepairResult::refused(
+					result.code.as_deref().unwrap_or("acl_unavailable"),
+				);
+			},
+		}
+		#[cfg(target_os = "macos")]
+		match has_extended_acl(&authority.file) {
+			Ok(false) => {},
+			Ok(true) => return NativePermissionRepairResult::refused("acl_present"),
+			Err(result) => {
+				return NativePermissionRepairResult::refused(
+					result.code.as_deref().unwrap_or("acl_unavailable"),
+				);
+			},
+		}
+		let clone = match authority.file.try_clone() {
+			Ok(file) => file,
+			Err(_) => return NativePermissionRepairResult::refused("io_error"),
+		};
+		let mut bounded = std::io::Read::take(clone, expected.size + 1);
+		match digest_reader(&mut bounded) {
+			Ok(hash) if hash == expected_hash => {},
+			Ok(_) => return NativePermissionRepairResult::refused("identity_mismatch"),
+			Err(error) => return NativePermissionRepairResult::refused(security_code(&error)),
+		}
+		let old_mode = before.st_mode & 0o7777;
+		if before.st_mode as u32 != expected_mode {
+			return NativePermissionRepairResult::refused("mode_mismatch");
+		}
+		let new_mode = old_mode & !0o077;
+		let latest = match revalidate_authority(&authority) {
+			Ok(value) => value,
+			Err(result) => {
+				return NativePermissionRepairResult::refused(
+					result.code.as_deref().unwrap_or("identity_mismatch"),
+				);
+			},
+		};
+		if latest.st_mode != before.st_mode
+			|| latest.st_uid != before.st_uid
+			|| latest.st_nlink != 1
+			|| latest.st_size != before.st_size
+			|| stat_mtime_ns(&latest) != stat_mtime_ns(&before)
+		{
+			return NativePermissionRepairResult::refused("identity_mismatch");
+		}
+		if new_mode == old_mode {
+			return NativePermissionRepairResult::verified(false);
+		}
+		if !apply {
+			return NativePermissionRepairResult {
+				status:   "ready".to_owned(),
+				changed:  false,
+				verified: false,
+				code:     None,
+			};
+		}
+		// SAFETY: authority.file is retained and live; this only removes bits.
+		if unsafe { libc::fchmod(authority.file.as_raw_fd(), new_mode) } != 0 {
+			return NativePermissionRepairResult::refused(security_code(
+				&std::io::Error::last_os_error(),
+			));
+		}
+		let after = match revalidate_authority(&authority) {
+			Ok(value) => value,
+			Err(result) => {
+				return NativePermissionRepairResult::uncertain(
+					result.code.as_deref().unwrap_or("identity_mismatch"),
+				);
+			},
+		};
+		if after.st_mode & 0o7777 != new_mode
+			|| after.st_uid != before.st_uid
+			|| after.st_nlink != 1
+			|| after.st_size != before.st_size
+			|| stat_mtime_ns(&after) != stat_mtime_ns(&before)
+		{
+			return NativePermissionRepairResult::uncertain("postverify_failed");
+		}
+		#[cfg(target_os = "linux")]
+		match query_extended_acl(&authority.file, AclAttribute::Access) {
+			Ok("absent") => {},
+			Ok(_) => return NativePermissionRepairResult::uncertain("acl_postverify_failed"),
+			Err(result) => {
+				return NativePermissionRepairResult::uncertain(
+					result.code.as_deref().unwrap_or("acl_unavailable"),
+				);
+			},
+		}
+		#[cfg(target_os = "macos")]
+		if !matches!(has_extended_acl(&authority.file), Ok(false)) {
+			return NativePermissionRepairResult::uncertain("acl_postverify_failed");
+		}
+		NativePermissionRepairResult::verified(true)
+	}
+
+	#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+	pub(super) fn repair_config_file_permissions(
+		_: &Path,
+		_: &ExactFileIdentity,
+		_: u32,
+		_: bool,
+	) -> NativePermissionRepairResult {
+		NativePermissionRepairResult::refused("unsupported_platform")
+	}
+
+	pub(super) fn verify_descriptor_acl_absent(
+		file: &File,
+		directory: bool,
+	) -> Result<(), NativeOwnerOnlySecurityResult> {
+		#[cfg(target_os = "linux")]
+		{
+			match query_extended_acl(file, AclAttribute::Access)? {
+				"absent" => {},
+				_ => return Err(NativeOwnerOnlySecurityResult::failure("acl_present")),
+			}
+			if directory {
+				match query_extended_acl(file, AclAttribute::Default)? {
+					"absent" => {},
+					_ => return Err(NativeOwnerOnlySecurityResult::failure("acl_present")),
+				}
+			}
+			Ok(())
+		}
+		#[cfg(target_os = "macos")]
+		{
+			let _ = directory;
+			if has_extended_acl(file)? {
+				Err(NativeOwnerOnlySecurityResult::failure("acl_present"))
+			} else {
+				Ok(())
+			}
+		}
+		#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+		{
+			let _ = (file, directory);
+			Err(NativeOwnerOnlySecurityResult::failure("acl_unavailable"))
+		}
+	}
 
 	pub(super) fn verify_owner_only_path_security(
 		path: &Path,
@@ -4120,7 +4775,23 @@ pub(crate) mod platform {
 		if !matches {
 			return ExchangePlaceholderRemoval::RetainedMismatch(detached_name);
 		}
-		ExchangePlaceholderRemoval::RetainedFailure(detached_name, "cleanup_pending")
+		// The detached object is proven to be this call's own placeholder: an empty
+		// directory or empty regular file it created moments earlier, never caller
+		// payload. Removing it here is what keeps the parent directory free of
+		// unrecorded custody debris; a failure is still reported as retained.
+		let removed = if expected.directory {
+			// SAFETY: descriptor and name are live for the duration of the call.
+			unsafe { libc::unlinkat(parent_fd, detached_name.as_ptr(), libc::AT_REMOVEDIR) == 0 }
+		} else {
+			detached.st_size == 0
+				// SAFETY: descriptor and name are live for the duration of the call.
+				&& unsafe { libc::unlinkat(parent_fd, detached_name.as_ptr(), 0) == 0 }
+		};
+		if removed {
+			ExchangePlaceholderRemoval::Removed
+		} else {
+			ExchangePlaceholderRemoval::RetainedFailure(detached_name, "cleanup_pending")
+		}
 	}
 
 	fn digest_openat(parent_fd: libc::c_int, name: &CString) -> Result<[u8; 32], &'static str> {
@@ -5329,6 +6000,8 @@ pub(crate) mod platform {
 			)
 		};
 		if destination_lock < 0 || unsafe { libc::flock(destination_lock, libc::LOCK_EX) } != 0 {
+			let symlink_replacement =
+				std::io::Error::last_os_error().raw_os_error() == Some(libc::ELOOP);
 			if destination_lock >= 0 {
 				unsafe { libc::close(destination_lock) };
 			}
@@ -5336,7 +6009,11 @@ pub(crate) mod platform {
 				libc::close(source_parent);
 				libc::close(destination_parent);
 			}
-			return NativeExactUnlinkResult::failure("lock_failed");
+			return NativeExactUnlinkResult::failure(if symlink_replacement {
+				"identity_mismatch"
+			} else {
+				"lock_failed"
+			});
 		}
 		let result = (|| {
 			for (parent, identity) in
@@ -5485,6 +6162,324 @@ pub(crate) mod platform {
 		}
 		result
 	}
+
+	/// Owner/no-shared-write/ACL-absence check for an executable-file candidate.
+	/// Unlike [`revalidate_authority`]'s config-file counterpart, this never
+	/// requires owner-only `0600`/`0700`: an executable regularly ships `0755`
+	/// (world read+execute), so only group/other **write** bits and any
+	/// extended ACL grant are refused.
+	fn verify_executable_ownership_no_shared_write(
+		parent_fd: libc::c_int,
+		name: &CString,
+	) -> Result<(), &'static str> {
+		// SAFETY: parent_fd is live and name is a validated NUL-terminated
+		// component; O_NOFOLLOW rejects a substituted symlink and O_NONBLOCK avoids
+		// blocking on a substituted special file before fstat rejects it.
+		let fd = unsafe {
+			libc::openat(
+				parent_fd,
+				name.as_ptr(),
+				libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+			)
+		};
+		if fd < 0 {
+			return Err(security_code(&std::io::Error::last_os_error()));
+		}
+		let result = (|| {
+			// SAFETY: zero is a valid initialized representation for fstat output.
+			let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+			// SAFETY: fd is live and stat is writable for the duration of the call.
+			if unsafe { libc::fstat(fd, &mut stat) } != 0 {
+				return Err(security_code(&std::io::Error::last_os_error()));
+			}
+			// SAFETY: geteuid has no preconditions and only reads process credentials.
+			if stat.st_uid != unsafe { libc::geteuid() } {
+				return Err("owner_mismatch");
+			}
+			// Group/other WRITE bits only; 0755 (world read+execute) is a valid
+			// executable mode and must not be rejected here.
+			if stat.st_mode & 0o022 != 0 {
+				return Err("shared_writable");
+			}
+			// SAFETY: fd is live; the returned descriptor is checked before ownership
+			// transfer.
+			let duplicated = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
+			if duplicated < 0 {
+				return Err(security_code(&std::io::Error::last_os_error()));
+			}
+			// SAFETY: duplicated is a newly owned descriptor returned by
+			// F_DUPFD_CLOEXEC.
+			let file = unsafe { File::from_raw_fd(duplicated) };
+			// Reuse the shared crate-level ACL-absence helper (owned by Main) rather
+			// than re-deriving ACL evidence here.
+			super::verify_descriptor_acl_absent(&file, false).map_err(|code| match code.as_str() {
+				"acl_present" => "acl_present",
+				"acl_denied" => "acl_denied",
+				"acl_io_error" => "acl_io_error",
+				"acl_malformed" => "acl_malformed",
+				_ => "acl_unavailable",
+			})
+		})();
+		// SAFETY: this function owns fd exactly once.
+		unsafe { libc::close(fd) };
+		result
+	}
+
+	/// D4-safe in-place replacement. Reuses [`exact_replace_path`]'s validated
+	/// preflight identity checks, but the exchange itself uses the
+	/// caller-preauthorized `backup_name` directly as the source-pin slot, so
+	/// the retired predecessor lands intact at exactly the caller-recorded
+	/// `backup_name` in the same rename that publishes the successor -- never
+	/// truncated, never unlinked, and never staged under an unrecorded
+	/// process-ID-derived private name a crash between pin and exchange could
+	/// leave uncustodied. An occupied `backup_name` is refused (precheck below)
+	/// before anything is pinned, so a process still mapped from (or about to
+	/// re-exec) the old bytes is never harmed and a foreign occupant is never
+	/// overwritten.
+	pub(super) fn exact_replace_retained(
+		source_path: &Path,
+		destination_path: &Path,
+		backup_name: &str,
+		expected_source: &ExactFileIdentity,
+		expected_destination: &ExactFileIdentity,
+	) -> NativeExactUnlinkResult {
+		if source_path == destination_path {
+			return NativeExactUnlinkResult::failure("invalid_request");
+		}
+		// Hard-linked source/destination objects are always rejected: a payload
+		// swap assumes exclusive ownership of the bytes being retired or
+		// published, which a second live hardlink to either object would violate.
+		if expected_source.directory
+			|| expected_source.detach_only
+			|| expected_source.allow_hard_link
+			|| expected_destination.directory
+			|| expected_destination.detach_only
+			|| expected_destination.allow_hard_link
+		{
+			return NativeExactUnlinkResult::failure("invalid_request");
+		}
+		if expected_source.parent_dev != expected_destination.parent_dev
+			|| expected_source.parent_ino != expected_destination.parent_ino
+		{
+			return NativeExactUnlinkResult::failure("parent_mismatch");
+		}
+		let Ok(backup_name) = CString::new(backup_name) else {
+			return NativeExactUnlinkResult::failure("invalid_request");
+		};
+		let (source_parent, source_name) = match open_parent_no_follow(source_path) {
+			Ok(value) => value,
+			Err(result) => return *result,
+		};
+		let (destination_parent, destination_name) = match open_parent_no_follow(destination_path) {
+			Ok(value) => value,
+			Err(result) => {
+				unsafe { libc::close(source_parent) };
+				return *result;
+			},
+		};
+		if source_name == destination_name {
+			unsafe {
+				libc::close(source_parent);
+				libc::close(destination_parent);
+			}
+			return NativeExactUnlinkResult::failure("invalid_request");
+		}
+		let destination_lock = unsafe {
+			libc::openat(
+				destination_parent,
+				destination_name.as_ptr(),
+				libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+			)
+		};
+		if destination_lock < 0 || unsafe { libc::flock(destination_lock, libc::LOCK_EX) } != 0 {
+			let symlink_replacement =
+				std::io::Error::last_os_error().raw_os_error() == Some(libc::ELOOP);
+			if destination_lock >= 0 {
+				unsafe { libc::close(destination_lock) };
+			}
+			unsafe {
+				libc::close(source_parent);
+				libc::close(destination_parent);
+			}
+			return NativeExactUnlinkResult::failure(if symlink_replacement {
+				"identity_mismatch"
+			} else {
+				"lock_failed"
+			});
+		}
+		let result = (|| {
+			for (parent, identity) in
+				[(source_parent, expected_source), (destination_parent, expected_destination)]
+			{
+				let Some((dev, ino)) = identity.parent_dev.zip(identity.parent_ino) else {
+					return NativeExactUnlinkResult::failure("parent_mismatch");
+				};
+				let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+				if unsafe { libc::fstat(parent, &mut stat) } != 0
+					|| stat.st_dev as u64 != dev
+					|| stat.st_ino as u64 != ino
+				{
+					return NativeExactUnlinkResult::failure("parent_mismatch");
+				}
+			}
+			if !matches!(exact_regular_matches(source_parent, &source_name, expected_source), Ok(true))
+				|| !matches!(
+					exact_regular_matches(destination_parent, &destination_name, expected_destination),
+					Ok(true)
+				) {
+				return NativeExactUnlinkResult::failure("identity_mismatch");
+			}
+			for (parent, name) in
+				[(source_parent, &source_name), (destination_parent, &destination_name)]
+			{
+				if let Err(code) = verify_executable_ownership_no_shared_write(parent, name) {
+					return NativeExactUnlinkResult::failure(code);
+				}
+			}
+			let mut backup_stat: libc::stat = unsafe { std::mem::zeroed() };
+			if unsafe {
+				libc::fstatat(
+					destination_parent,
+					backup_name.as_ptr(),
+					&mut backup_stat,
+					libc::AT_SYMLINK_NOFOLLOW,
+				)
+			} == 0
+			{
+				return NativeExactUnlinkResult::failure("quarantine_collision");
+			}
+			if std::io::Error::last_os_error().raw_os_error() != Some(libc::ENOENT) {
+				return NativeExactUnlinkResult::failure("io_error");
+			}
+			let (source_fd, source_stat) = match open_publication_source(source_parent, &source_name) {
+				Ok(value) => value,
+				Err(code) => return NativeExactUnlinkResult::failure(code),
+			};
+			// Pin the source directly into the caller-preauthorized `backup_name` slot
+			// instead of a process-ID-derived private name: an interrupted process
+			// between this link and the exchange below leaves `backup_name` holding an
+			// *extra hardlink of the still-unpublished successor* (not yet the retired
+			// predecessor), with the original destination untouched -- a state fully
+			// described by the caller's own recorded name, never an unrecorded custody
+			// path. The existing `quarantine_collision` precheck above already refuses
+			// to resume into an occupied `backup_name`, so a replay after this crash
+			// window fails closed rather than silently reinterpreting the debris.
+			let backup_path = destination_path.with_file_name(backup_name.to_string_lossy().as_ref());
+			let mut pinned_source_identity = expected_source.clone();
+			pinned_source_identity.nlink = None;
+			pinned_source_identity.allow_hard_link = true;
+			let link_result =
+				link_no_replace(source_parent, &source_name, destination_parent, &backup_name);
+			let pinned = matches!(link_result, Ok(()))
+				&& published_matches_open_source(destination_parent, &backup_name, &source_stat)
+				&& matches!(
+					exact_regular_matches(destination_parent, &backup_name, &pinned_source_identity),
+					Ok(true)
+				);
+			unsafe { libc::close(source_fd) };
+			if !pinned {
+				if link_result.is_ok() {
+					let _ =
+						cleanup_substituted_publication(destination_parent, &backup_name, &backup_path);
+				}
+				return NativeExactUnlinkResult::failure("identity_mismatch");
+			}
+			#[cfg(test)]
+			pause_before_exchange_for_test();
+			// Exchange backup_name<->destination_name directly: retired predecessor
+			// bytes land at the caller-recorded `backup_name` in the very same
+			// namespace mutation that publishes the successor. There is no further
+			// "move to backup" step after this point, so no unrecorded custody window
+			// exists once the exchange has committed.
+			if let Err(code) =
+				rename_exchange(destination_parent, destination_parent, &backup_name, &destination_name)
+			{
+				let _ = cleanup_substituted_publication(destination_parent, &backup_name, &backup_path);
+				return NativeExactUnlinkResult::failure(code);
+			}
+			#[cfg(test)]
+			pause_exact_replace_after_exchange_for_test();
+			if !matches!(
+				exact_regular_matches(destination_parent, &destination_name, &pinned_source_identity),
+				Ok(true)
+			) || !matches!(
+				exact_regular_matches(destination_parent, &backup_name, expected_destination),
+				Ok(true)
+			) {
+				return NativeExactUnlinkResult::detached_failure_with_unknown(
+					"identity_mismatch",
+					backup_path.to_string_lossy().into_owned(),
+					destination_path.to_string_lossy().into_owned(),
+				);
+			}
+			// The staging name is now an extra hardlink of the *live* successor (its
+			// inode is the same one now published at `destination_name`), not the
+			// retired predecessor, so removing it never touches payload bytes still
+			// reachable through the destination name. The retired predecessor already
+			// landed directly at `backup_name` in the exchange above -- there is no
+			// separate retirement rename left to perform or to fail.
+			let mut source_cleanup_identity = expected_source.clone();
+			source_cleanup_identity.nlink = None;
+			source_cleanup_identity.allow_hard_link = true;
+			source_cleanup_identity.quarantine_name = Some(format!(
+				".gjc-exact-replace-retained-source-cleanup-{:x}-{:x}",
+				expected_source.ino,
+				std::process::id(),
+			));
+			let source_cleanup = exact_unlink_at(
+				source_parent,
+				source_name.clone(),
+				source_path,
+				&source_cleanup_identity,
+			);
+			let cleanup_accepted = |cleanup: &NativeExactUnlinkResult| {
+				cleanup.ok
+					|| (cleanup.code.as_deref() == Some("cleanup_pending")
+						&& cleanup.payload_durable == Some(true)
+						&& cleanup.retained_successor_path.is_none()
+						&& cleanup.retained_unknown_path.is_none())
+			};
+			if !cleanup_accepted(&source_cleanup) {
+				return NativeExactUnlinkResult::retained_successor_failure(
+					"identity_mismatch",
+					destination_path.to_string_lossy().into_owned(),
+				);
+			}
+			#[cfg(test)]
+			pause_exact_replace_before_final_verify_for_test();
+			// source_parent and destination_parent were both verified above to
+			// resolve to the identical directory identity, so a single fsync durably
+			// covers both the destination-name publish and the backup-name retire.
+			if fsync_root_parent(source_parent).is_err() {
+				return NativeExactUnlinkResult::failure("durability_failed")
+					.with_retained_successor_and_expected_detached(
+						destination_path.to_string_lossy().into_owned(),
+						backup_path.to_string_lossy().into_owned(),
+					);
+			}
+			if !matches!(
+				exact_regular_matches(destination_parent, &destination_name, expected_source),
+				Ok(true)
+			) || !matches!(
+				exact_regular_matches(destination_parent, &backup_name, expected_destination),
+				Ok(true)
+			) {
+				return NativeExactUnlinkResult::detached_failure_with_unknown(
+					"identity_mismatch",
+					backup_path.to_string_lossy().into_owned(),
+					destination_path.to_string_lossy().into_owned(),
+				);
+			}
+			NativeExactUnlinkResult::detached(backup_path.to_string_lossy().into_owned())
+		})();
+		unsafe {
+			libc::close(destination_lock);
+			libc::close(source_parent);
+			libc::close(destination_parent);
+		}
+		result
+	}
+
 	pub(super) fn exact_restore(
 		detached_path: &Path,
 		original_path: &Path,
@@ -6593,9 +7588,9 @@ mod platform {
 		EXACT_REPLACE_DESTINATION_OPEN_RETRY_DELAY_MS, EXACT_REPLACE_DESTINATION_OPEN_RETRY_LIMIT,
 		ExactFileIdentity, NativeCanonicalDirectoryIdentity, NativeDirectoryTreeEntry,
 		NativeDirectoryTreeResult, NativeDirectoryTreeSnapshot, NativeExactUnlinkResult,
-		NativeOwnerOnlySecurityResult, STATUS_INVALID_PARAMETER, STATUS_SHARING_VIOLATION,
-		is_retryable_exact_replace_status, native_windows_error_code, open_with_transient_retry,
-		sha256,
+		NativeOwnerOnlySecurityResult, NativePermissionRepairResult, STATUS_INVALID_PARAMETER,
+		STATUS_SHARING_VIOLATION, is_retryable_exact_replace_status, native_windows_error_code,
+		open_with_transient_retry, sha256,
 	};
 
 	type UvGetOsfhandle = unsafe extern "C" fn(fd: i32) -> isize;
@@ -7570,6 +8565,403 @@ mod platform {
 		}
 	}
 
+	/// Owner/no-shared-write ACL check for an executable-file candidate.
+	/// Unlike the owner-only DACL this module applies to config files (a single
+	/// protected ACE granting the owner exactly
+	/// `FILE_ALL_ACCESS`/`GENERIC_ALL`), an executable regularly ships a
+	/// broader, world-readable/executable DACL, so this only refuses: an owner
+	/// mismatch, or any ACCESS_ALLOWED ACE that grants a write-capable right to
+	/// a principal other than the verified owner. Read/execute-only ACEs for
+	/// other principals are accepted.
+	fn verify_executable_ownership_no_shared_write(handle: HANDLE) -> Result<(), &'static str> {
+		const FILE_WRITE_DATA: u32 = 0x0000_0002;
+		const FILE_APPEND_DATA: u32 = 0x0000_0004;
+		const FILE_WRITE_EA: u32 = 0x0000_0010;
+		const DELETE: u32 = 0x0001_0000;
+		const GENERIC_WRITE: u32 = 0x4000_0000;
+		const WRITE_CAPABLE_MASK: u32 = FILE_WRITE_DATA
+			| FILE_APPEND_DATA
+			| FILE_WRITE_EA
+			| FILE_WRITE_ATTRIBUTES
+			| WRITE_DAC
+			| WRITE_OWNER
+			| DELETE
+			| GENERIC_WRITE
+			| GENERIC_ALL
+			| FILE_ALL_ACCESS;
+		let sid = match current_user_sid() {
+			Ok(sid) => sid,
+			Err(()) => return Err("acl_unavailable"),
+		};
+		let mut owner = null_mut();
+		let mut dacl = null_mut();
+		let mut descriptor = null_mut();
+		// SAFETY: the retained handle is valid and all output pointers are writable
+		// until the returned LocalAlloc descriptor is released below.
+		let status = unsafe {
+			GetSecurityInfo(
+				handle,
+				SE_FILE_OBJECT,
+				SECURITY_OWNER_DACL,
+				&mut owner,
+				null_mut(),
+				&mut dacl,
+				null_mut(),
+				&mut descriptor,
+			)
+		};
+		if status != 0 || descriptor.is_null() {
+			if !descriptor.is_null() {
+				// SAFETY: a non-null descriptor returned by GetSecurityInfo remains owned
+				// by this function on the error path.
+				unsafe { LocalFree(descriptor) };
+			}
+			return Err("acl_unavailable");
+		}
+		let result = (|| {
+			if owner.is_null() {
+				return Err("acl_unavailable");
+			}
+			// SAFETY: GetSecurityInfo returned owner within the live security
+			// descriptor; sid is a validated current-user SID.
+			if unsafe { EqualSid(owner, sid.as_ptr().cast_mut().cast()) } == 0 {
+				return Err("owner_mismatch");
+			}
+			if dacl.is_null() {
+				return Err("acl_present");
+			}
+			// SAFETY: zero is a valid output initialization for ACL_SIZE_INFORMATION.
+			let mut acl_info: ACL_SIZE_INFORMATION = unsafe { std::mem::zeroed() };
+			// SAFETY: GetSecurityInfo returned dacl within its still-live descriptor and
+			// acl_info is an aligned writable output.
+			if unsafe {
+				GetAclInformation(
+					dacl,
+					(&raw mut acl_info).cast(),
+					u32::try_from(size_of::<ACL_SIZE_INFORMATION>()).expect("ACL info size fits u32"),
+					AclSizeInformation,
+				)
+			} == 0
+			{
+				return Err("acl_unavailable");
+			}
+			let acl_start = dacl as usize;
+			let acl_bytes = acl_info.AclBytesInUse as usize;
+			let Some(acl_end) = acl_start.checked_add(acl_bytes) else {
+				return Err("acl_malformed");
+			};
+			if acl_bytes < size_of::<ACL>()
+				|| !acl_entries_are_structurally_valid(dacl, acl_info.AceCount, acl_start, acl_end)
+			{
+				return Err("acl_malformed");
+			}
+			for index in 0..acl_info.AceCount {
+				let mut ace: *mut c_void = null_mut();
+				// SAFETY: structural validation above proved every ACE up to AceCount is
+				// present and bounded; ace is a writable output pointer.
+				if unsafe { GetAce(dacl, index, &mut ace) } == 0 || ace.is_null() {
+					return Err("acl_malformed");
+				}
+				// SAFETY: the fixed ACE header range was bounded by structural validation.
+				let header = unsafe { std::ptr::read_unaligned(ace.cast::<ACE_HEADER>()) };
+				if header.AceType != 0 {
+					return Err("acl_present");
+				}
+				let ace_size = usize::from(header.AceSize);
+				let sid_offset = std::mem::offset_of!(ACCESS_ALLOWED_ACE, SidStart);
+				let mask_offset = std::mem::offset_of!(ACCESS_ALLOWED_ACE, Mask);
+				let Some(mask_end) = mask_offset.checked_add(size_of::<u32>()) else {
+					return Err("acl_malformed");
+				};
+				if mask_end > ace_size || sid_offset > ace_size {
+					return Err("acl_malformed");
+				}
+				// SAFETY: structural validation proved the mask range lies inside the
+				// live ACE.
+				let mask =
+					unsafe { std::ptr::read_unaligned(ace.cast::<u8>().add(mask_offset).cast::<u32>()) };
+				if mask & WRITE_CAPABLE_MASK == 0 {
+					continue;
+				}
+				// SAFETY: structural validation proved the SID range lies inside the
+				// live ACE.
+				let ace_sid = unsafe {
+					std::slice::from_raw_parts(ace.cast::<u8>().add(sid_offset), ace_size - sid_offset)
+				};
+				if valid_sid(ace_sid).is_none() {
+					return Err("acl_malformed");
+				}
+				// SAFETY: both pointers identify complete validated SIDs that remain live
+				// through comparison.
+				let grants_owner = unsafe {
+					EqualSid(ace_sid.as_ptr().cast_mut().cast(), sid.as_ptr().cast_mut().cast())
+				} != 0;
+				if !grants_owner {
+					return Err("acl_present");
+				}
+			}
+			Ok(())
+		})();
+		// SAFETY: GetSecurityInfo allocated descriptor with LocalAlloc and it is
+		// released exactly once after all reads have completed.
+		unsafe { LocalFree(descriptor) };
+		result
+	}
+
+	/// D4-safe in-place replacement mirroring [`exact_replace_path`]'s validated
+	/// preflight checks, but never deleting the retired predecessor. Windows has
+	/// no atomic two-name exchange primitive, so the sequence is: rename the
+	/// live, fully-validated destination handle (already opened with
+	/// `FILE_SHARE_READ | FILE_SHARE_DELETE` at most, denying external
+	/// delete/write) directly to the caller-preauthorized `backup_name` -- never
+	/// through an unrecorded process-ID-derived private name -- and only then
+	/// rename the validated source onto the destination name. If the publish
+	/// rename fails, the predecessor is restored to `destination_name` with an
+	/// exact no-replace rename whenever that name is still vacant; if it is not
+	/// (an external successor claimed it), the predecessor remains durably
+	/// recoverable at exactly its caller-recorded `backup_name`.
+	/// `STATUS_SHARING_VIOLATION` on the destination open is detected and
+	/// reported before any rename, exactly as in `exact_replace_path`, so it is
+	/// never confused with a post-effect failure.
+	pub(super) fn exact_replace_retained(
+		source_path: &Path,
+		destination_path: &Path,
+		backup_name: &str,
+		expected_source: &ExactFileIdentity,
+		expected_destination: &ExactFileIdentity,
+	) -> NativeExactUnlinkResult {
+		if expected_source.directory
+			|| expected_source.detach_only
+			|| expected_source.allow_hard_link
+			|| expected_destination.directory
+			|| expected_destination.detach_only
+			|| expected_destination.allow_hard_link
+		{
+			return NativeExactUnlinkResult::failure("invalid_request");
+		}
+		if expected_source.parent_dev.is_none()
+			|| expected_source.parent_ino.is_none()
+			|| expected_destination.parent_dev.is_none()
+			|| expected_destination.parent_ino.is_none()
+		{
+			return NativeExactUnlinkResult::failure("parent_mismatch");
+		}
+		let source_path = match lexical_absolute_path(source_path) {
+			Ok(path) => path,
+			Err(code) => return NativeExactUnlinkResult::failure(code),
+		};
+		let destination_path = match lexical_absolute_path(destination_path) {
+			Ok(path) => path,
+			Err(code) => return NativeExactUnlinkResult::failure(code),
+		};
+		if source_path == destination_path {
+			return NativeExactUnlinkResult::failure("invalid_request");
+		}
+		if source_path.parent() != destination_path.parent() {
+			return NativeExactUnlinkResult::failure("parent_mismatch");
+		}
+		match std::fs::symlink_metadata(destination_path.with_file_name(backup_name)) {
+			Ok(_) => return NativeExactUnlinkResult::failure("quarantine_collision"),
+			Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+			Err(_) => return NativeExactUnlinkResult::failure("io_error"),
+		}
+		let source = match open_exact_with_share(
+			&source_path,
+			"file",
+			FILE_READ_ATTRIBUTES | FILE_READ_DATA | 0x0001_0000,
+			FILE_SHARE_READ,
+		) {
+			Ok(handle) => handle,
+			Err(result) => {
+				return NativeExactUnlinkResult::failure(result.code.as_deref().unwrap_or("io_error"));
+			},
+		};
+		let mut source_information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+		if unsafe { GetFileInformationByHandle(source.target, &mut source_information) } == 0
+			|| source_information.dwFileAttributes
+				& (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)
+				!= 0 || !handle_identity_matches(&source_information, expected_source)
+			|| digest_handle(source.target).ok().as_ref() != expected_source.sha256.as_ref()
+		{
+			return NativeExactUnlinkResult::failure("identity_mismatch");
+		}
+		if source_information.nNumberOfLinks != 1 {
+			return NativeExactUnlinkResult::failure("hard_link_unsupported");
+		}
+		if let Err(code) = verify_executable_ownership_no_shared_write(source.target) {
+			return NativeExactUnlinkResult::failure(code);
+		}
+		let Some(parent_handle) = source.parent() else {
+			return NativeExactUnlinkResult::failure("io_error");
+		};
+		if let Some((expected_parent_dev, expected_parent_ino)) =
+			expected_source.parent_dev.zip(expected_source.parent_ino)
+		{
+			let mut parent_information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+			if unsafe { GetFileInformationByHandle(parent_handle, &mut parent_information) } == 0
+				|| u64::from(parent_information.dwVolumeSerialNumber) != expected_parent_dev
+				|| ((u64::from(parent_information.nFileIndexHigh) << 32)
+					| u64::from(parent_information.nFileIndexLow))
+					!= expected_parent_ino
+			{
+				return NativeExactUnlinkResult::failure("parent_mismatch");
+			}
+		}
+		if expected_source.parent_dev != expected_destination.parent_dev
+			|| expected_source.parent_ino != expected_destination.parent_ino
+		{
+			return NativeExactUnlinkResult::failure("parent_mismatch");
+		}
+		let Some(destination_name) = destination_path.file_name() else {
+			return NativeExactUnlinkResult::failure("io_error");
+		};
+		// Pre-mutation, retryable-sharing-violation destination open -- identical
+		// boundary to exact_replace_path. A sharing violation here always fires
+		// before any rename, so it is never mistaken for a post-effect failure.
+		let destination_handle = match open_with_transient_retry(|| {
+			if take_injected_exact_replace_destination_open_sharing_violation() {
+				return Err(STATUS_SHARING_VIOLATION);
+			}
+			open_relative_with_share_status(
+				parent_handle,
+				destination_name,
+				FILE_READ_ATTRIBUTES | 0x0001_0000 | FILE_WRITE_ATTRIBUTES | FILE_READ_DATA,
+				false,
+				FILE_SHARE_READ | FILE_SHARE_DELETE,
+			)
+		}) {
+			Ok(handle) => handle,
+			Err(status) => {
+				return NativeExactUnlinkResult::failure(
+					if is_retryable_exact_replace_status(status) {
+						"sharing_violation"
+					} else {
+						ntstatus_code(status)
+					},
+				)
+				.with_windows_error_code(native_windows_error_code(status));
+			},
+		};
+		let destination = HeldExact { target: destination_handle, ancestors: Vec::new() };
+		let mut information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+		if unsafe { GetFileInformationByHandle(destination.target, &mut information) } == 0 {
+			return NativeExactUnlinkResult::failure(last_error_code());
+		}
+		if information.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+			return NativeExactUnlinkResult::failure("reparse_point");
+		}
+		if information.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0
+			|| !handle_identity_matches(&information, expected_destination)
+			|| digest_handle(destination.target).ok().as_ref() != expected_destination.sha256.as_ref()
+		{
+			return NativeExactUnlinkResult::failure("identity_mismatch");
+		}
+		if information.nNumberOfLinks != 1 {
+			return NativeExactUnlinkResult::failure("hard_link_unsupported");
+		}
+		if let Err(code) = verify_executable_ownership_no_shared_write(destination.target) {
+			return NativeExactUnlinkResult::failure(code);
+		}
+		match handles_same_object_checked(source.target, destination.target) {
+			Ok(true) => return NativeExactUnlinkResult::failure("identity_mismatch"),
+			Ok(false) => {},
+			Err(code) => return NativeExactUnlinkResult::failure(code),
+		}
+		let mut source_revalidated: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+		if unsafe { GetFileInformationByHandle(source.target, &mut source_revalidated) } == 0
+			|| !handle_identity_matches(&source_revalidated, expected_source)
+			|| digest_handle(source.target).ok().as_ref() != expected_source.sha256.as_ref()
+		{
+			return NativeExactUnlinkResult::failure("identity_mismatch");
+		}
+		if source_revalidated.nNumberOfLinks != 1 {
+			return NativeExactUnlinkResult::failure("hard_link_unsupported");
+		}
+		let backup_path = destination_path.with_file_name(backup_name);
+		let backup_path_string = backup_path.to_string_lossy().into_owned();
+		let backup_name_wide: Vec<u16> = backup_name.encode_utf16().collect();
+		let destination_name_wide: Vec<u16> = destination_name.encode_wide().collect();
+		// Retire the predecessor directly into the caller-preauthorized backup_name
+		// slot -- this handle already denies external delete/write (opened above
+		// with FILE_SHARE_READ | FILE_SHARE_DELETE at most), so no unrecorded
+		// source/predecessor staging name is ever created. This is the only
+		// namespace mutation before the source is published: a crash before it
+		// commits leaves both objects exactly as already validated above, and a
+		// crash after it commits leaves the predecessor durably at the exact
+		// caller-recorded `backup_name` with `destination_name` vacant -- both
+		// states are fully described by evidence the caller already holds.
+		if let Err(code) = rename_handle(destination.target, parent_handle, &backup_name_wide, false)
+		{
+			return NativeExactUnlinkResult::failure(code);
+		}
+		let mut retired_destination: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+		if unsafe { GetFileInformationByHandle(destination.target, &mut retired_destination) } == 0
+			|| !handle_identity_matches(&retired_destination, expected_destination)
+			|| digest_handle(destination.target).ok().as_ref() != expected_destination.sha256.as_ref()
+		{
+			return NativeExactUnlinkResult::detached_failure("identity_mismatch", backup_path_string);
+		}
+		if retired_destination.nNumberOfLinks != 1 {
+			return NativeExactUnlinkResult::detached_failure(
+				"hard_link_unsupported",
+				backup_path_string,
+			);
+		}
+		let mut source_revalidated_again: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+		let source_readable =
+			unsafe { GetFileInformationByHandle(source.target, &mut source_revalidated_again) } != 0;
+		let source_still_valid = source_readable
+			&& handle_identity_matches(&source_revalidated_again, expected_source)
+			&& digest_handle(source.target).ok().as_ref() == expected_source.sha256.as_ref()
+			&& source_revalidated_again.nNumberOfLinks == 1;
+		if !source_still_valid {
+			// The publish never began: restore the predecessor to its original name
+			// with an exact no-replace rename -- never a scrub or delete -- whenever
+			// that name is still vacant.
+			let code = if source_readable && source_revalidated_again.nNumberOfLinks != 1 {
+				"hard_link_unsupported"
+			} else {
+				"identity_mismatch"
+			};
+			return if rename_handle(destination.target, parent_handle, &destination_name_wide, false)
+				.is_ok()
+			{
+				NativeExactUnlinkResult::failure(code)
+			} else {
+				NativeExactUnlinkResult::detached_failure(code, backup_path_string)
+			};
+		}
+		match rename_handle(source.target, parent_handle, &destination_name_wide, false) {
+			Ok(()) => NativeExactUnlinkResult::detached(backup_path_string),
+			Err(code) => {
+				// The publish itself failed: restore the predecessor to its original
+				// name (exact no-replace rename, never overwriting a name that is no
+				// longer vacant) whenever that name is still vacant, exactly as
+				// exact_replace_path does on this failure path.
+				let restored_destination =
+					rename_handle(destination.target, parent_handle, &destination_name_wide, false)
+						.is_ok();
+				if restored_destination {
+					NativeExactUnlinkResult::failure(code)
+				} else {
+					// The original name is no longer vacant (an external successor claimed
+					// it) while the predecessor remains durably recoverable at its exact
+					// caller-recorded backup_name.
+					NativeExactUnlinkResult {
+						ok: false,
+						code: Some(code.to_owned()),
+						payload_durable: None,
+						detached_path: Some(backup_path_string),
+						retained_successor_path: None,
+						retained_placeholder_path: None,
+						retained_unknown_path: Some(destination_path.to_string_lossy().into_owned()),
+						windows_error_code: None,
+					}
+				}
+			},
+		}
+	}
+
 	/// Windows implements no-replace renames natively, so the POSIX hard-link
 	/// stand-in is never requested here and is reported as unavailable rather
 	/// than emulated.
@@ -8286,6 +9678,15 @@ mod platform {
 			Ok(false) => NativeOwnerOnlySecurityResult::failure("identity_mismatch"),
 			Err(result) => result,
 		}
+	}
+
+	pub(super) fn repair_config_file_permissions(
+		_: &Path,
+		_: &ExactFileIdentity,
+		_: u32,
+		_: bool,
+	) -> NativePermissionRepairResult {
+		NativePermissionRepairResult::refused("unsupported_platform")
 	}
 
 	pub(super) fn verify_owner_only_path_security(
@@ -9163,6 +10564,7 @@ mod platform {
 	use super::{
 		ExactFileIdentity, NativeCanonicalDirectoryIdentity, NativeDirectoryTreeResult,
 		NativeDirectoryTreeSnapshot, NativeExactUnlinkResult, NativeOwnerOnlySecurityResult,
+		NativePermissionRepairResult,
 	};
 
 	pub(super) fn canonical_existing_directory_identity(
@@ -9208,6 +10610,14 @@ mod platform {
 		_: &str,
 	) -> NativeOwnerOnlySecurityResult {
 		NativeOwnerOnlySecurityResult::failure("acl_unavailable")
+	}
+	pub(super) fn repair_config_file_permissions(
+		_: &Path,
+		_: &ExactFileIdentity,
+		_: u32,
+		_: bool,
+	) -> NativePermissionRepairResult {
+		NativePermissionRepairResult::refused("unsupported_platform")
 	}
 	pub(super) fn verify_owner_only_path_security(
 		_: &Path,

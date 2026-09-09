@@ -21,6 +21,12 @@ import { DiscordNotificationDaemon } from "./discord-daemon";
 
 import { DiscordLiveProvider } from "./discord-live-provider";
 import type { DiscordProvider } from "./discord-provider";
+import {
+	type DoctorDaemonIdentity,
+	type DoctorDaemonOccupancy,
+	type DoctorDaemonStatus,
+	doctorDaemonOccupancySettled,
+} from "./doctor-daemon-restart";
 import { type NotificationEvent, NotificationPresentationEngine } from "./engine";
 import { SlackNotificationDaemon } from "./slack-daemon";
 import { SlackLiveProvider } from "./slack-live-provider";
@@ -299,6 +305,11 @@ export class ChatDaemonRuntime {
 	#slack: SlackNotificationDaemon | undefined;
 	#presentation: NotificationPresentationEngine | undefined;
 	#transportHealthy: (() => boolean) | undefined;
+	#doctorPrepared = false;
+	/** Real inbound `/sdk` command dispatches currently admitted and running. */
+	readonly #inboundInFlight = new Set<Promise<unknown>>();
+	/** Real outbound provider notify/resume deliveries currently in flight. */
+	readonly #outboundInFlight = new Set<Promise<unknown>>();
 
 	constructor(
 		private readonly input: { kind: ChatDaemonKind; agentDir: string; config: ChatDaemonRuntimeConfig },
@@ -315,6 +326,24 @@ export class ChatDaemonRuntime {
 				onSessionRemoved: async (attachment, reason) => await this.#onSessionRemoved(attachment, reason),
 			},
 		});
+	}
+
+	#trackInbound<T>(work: Promise<T>): Promise<T> {
+		this.#inboundInFlight.add(work);
+		void work.then(
+			() => this.#inboundInFlight.delete(work),
+			() => this.#inboundInFlight.delete(work),
+		);
+		return work;
+	}
+
+	#trackOutbound<T>(work: Promise<T>): Promise<T> {
+		this.#outboundInFlight.add(work);
+		void work.then(
+			() => this.#outboundInFlight.delete(work),
+			() => this.#outboundInFlight.delete(work),
+		);
+		return work;
 	}
 
 	async start(): Promise<void> {
@@ -443,6 +472,51 @@ export class ChatDaemonRuntime {
 		return this.#transportHealthy?.() ?? false;
 	}
 
+	/** Doctor reservation hook: stop admitting new `/sdk` command dispatch. Synchronous fence. */
+	prepareDoctorRestart(): boolean {
+		this.#doctorPrepared = true;
+		return true;
+	}
+
+	cancelDoctorRestart(): void {
+		if (!this.#stopping) this.#doctorPrepared = false;
+	}
+
+	/**
+	 * Real runtime occupancy, not synthetic placeholders. `attached` is live
+	 * session attachments; `inflight` is attachment (re)publication barriers
+	 * currently resolving; `inbound` is admitted `/sdk` command dispatches
+	 * (including operator `bindExistingRoot` binds) actually executing;
+	 * `outbound` is real Discord/Slack notify/resume provider deliveries in
+	 * flight; `cleanup` is provider close/retire work that has not yet
+	 * settled.
+	 */
+	doctorOccupancy(): DoctorDaemonOccupancy {
+		return {
+			attached: this.#attachments.size,
+			inflight: this.#attachmentBarriers.size,
+			inbound: this.#inboundInFlight.size,
+			outbound: this.#outboundInFlight.size,
+			cleanup: this.#cleanupWork.size + this.#retirementWork.size,
+		};
+	}
+
+	doctorRestartStatus(identity: DoctorDaemonIdentity, requestId: string, leaseExpiresAt: number): DoctorDaemonStatus {
+		const occupancy = this.doctorOccupancy();
+		return {
+			...identity,
+			requestId,
+			phase: this.#doctorPrepared ? "prepared" : "idle",
+			admitting: !this.#doctorPrepared && !this.#stopping,
+			occupancy,
+			leaseExpiresAt,
+		};
+	}
+
+	doctorRestartReady(): boolean {
+		return doctorDaemonOccupancySettled(this.doctorOccupancy());
+	}
+
 	/** Reconcile indexed attachments and optionally wait for their replay tails. */
 	async reconcile(options: { waitForReplay?: boolean } = {}): Promise<void> {
 		await this.#router.reconcile(options);
@@ -487,8 +561,19 @@ export class ChatDaemonRuntime {
 
 	/** Adopt an operator-supplied Slack root through the provider's presentation store. */
 	async bindExistingRoot(request: ChatDaemonCommandBindInput): Promise<ChatDaemonCommandOutcome> {
+		// Operator binds admit new provider-facing work exactly like /sdk command
+		// dispatch: they must be refused under the same doctor admission fence, not
+		// only the slash-command path.
+		if (this.#doctorPrepared) return { ok: false, certainty: "rejected", code: "target_not_configured" };
 		const slack = this.#slack;
 		if (!slack) return { ok: false, certainty: "rejected", code: "target_not_configured" };
+		return await this.#trackInbound(this.#bindExistingRoot(slack, request));
+	}
+
+	async #bindExistingRoot(
+		slack: SlackNotificationDaemon,
+		request: ChatDaemonCommandBindInput,
+	): Promise<ChatDaemonCommandOutcome> {
 		try {
 			const bound = await slack.bindExistingRoot(request.sessionId, request.rootTs, request.commitAuthority);
 			if (!bound.rootTs || bound.endpointGeneration === undefined)
@@ -662,23 +747,27 @@ export class ChatDaemonRuntime {
 				: undefined;
 		if (typeof content !== "string") return;
 		if (this.#discord)
-			await this.#discord.notify({
-				sessionId,
-				endpointGeneration: attachment.generation,
-				attachmentAuthorityId: attachment.authorityId,
-				content,
-				...(publicationId === undefined ? {} : { publicationId }),
-				...(notification.type === "action_needed"
-					? { actionId: notification.id, options: notification.options }
-					: {}),
-			});
+			await this.#trackOutbound(
+				this.#discord.notify({
+					sessionId,
+					endpointGeneration: attachment.generation,
+					attachmentAuthorityId: attachment.authorityId,
+					content,
+					...(publicationId === undefined ? {} : { publicationId }),
+					...(notification.type === "action_needed"
+						? { actionId: notification.id, options: notification.options }
+						: {}),
+				}),
+			);
 		if (this.#slack)
-			await this.#slack.notify(
-				sessionId,
-				content,
-				notification.type === "action_needed" && notification.kind === "ask" ? notification.id : undefined,
-				attachment.generation,
-				publicationId,
+			await this.#trackOutbound(
+				this.#slack.notify(
+					sessionId,
+					content,
+					notification.type === "action_needed" && notification.kind === "ask" ? notification.id : undefined,
+					attachment.generation,
+					publicationId,
+				),
 			);
 	}
 
@@ -721,16 +810,18 @@ export class ChatDaemonRuntime {
 		publicationId?: string,
 	): Promise<void> {
 		if (this.#discord) {
-			await this.#discord.resume(sessionId, generation, attachmentAuthorityId);
-			await this.#discord.notify({
-				sessionId,
-				endpointGeneration: generation,
-				attachmentAuthorityId,
-				content,
-				...(publicationId === undefined ? {} : { publicationId }),
-			});
+			await this.#trackOutbound(this.#discord.resume(sessionId, generation, attachmentAuthorityId));
+			await this.#trackOutbound(
+				this.#discord.notify({
+					sessionId,
+					endpointGeneration: generation,
+					attachmentAuthorityId,
+					content,
+					...(publicationId === undefined ? {} : { publicationId }),
+				}),
+			);
 		}
-		if (this.#slack) await this.#slack.resume(sessionId, content, generation, publicationId);
+		if (this.#slack) await this.#trackOutbound(this.#slack.resume(sessionId, content, generation, publicationId));
 	}
 
 	async #runChatCommand(
@@ -741,6 +832,31 @@ export class ChatDaemonRuntime {
 		idempotencyKey: string = randomUUID(),
 		beforeDispatch?: () => void,
 		dispatchFence?: <T>(dispatch: () => Promise<T>) => Promise<T>,
+	): Promise<boolean> {
+		// Fence BEFORE any admitted async work: a prepared doctor restart must
+		// refuse this dispatch synchronously, never merely self-report admitting.
+		if (this.#doctorPrepared) throw new ChatDeliveryError("pre_send");
+		return await this.#trackInbound(
+			this.#runChatCommandBody(
+				transport,
+				sessionId,
+				content,
+				expectedAttachment,
+				idempotencyKey,
+				beforeDispatch,
+				dispatchFence,
+			),
+		);
+	}
+
+	async #runChatCommandBody(
+		transport: ChatTransport,
+		sessionId: string,
+		content: string,
+		expectedAttachment: SessionAttachment,
+		idempotencyKey: string,
+		beforeDispatch: (() => void) | undefined,
+		dispatchFence: (<T>(dispatch: () => Promise<T>) => Promise<T>) | undefined,
 	): Promise<boolean> {
 		const match = /^\/sdk\s+(control|query|global)\s+([^\s]+)(?:\s+(.+))?\s*$/.exec(content);
 		if (!match) return false;

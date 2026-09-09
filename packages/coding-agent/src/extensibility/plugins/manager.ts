@@ -10,6 +10,7 @@ import {
 	isEnoent,
 	logger,
 } from "@gajae-code/utils";
+import { withFileLock } from "../../config/file-lock";
 import { extractPackageName, parsePluginSpec } from "./parser";
 import type {
 	DoctorCheck,
@@ -48,6 +49,11 @@ function validatePackageName(name: string): void {
 // Plugin Manager
 // =============================================================================
 
+export type PluginEnablementState =
+	| { status: "ok"; enabled: boolean; baseline: string }
+	| { status: "not_installed" }
+	| { status: "malformed" };
+
 export class PluginManager {
 	#runtimeConfig: PluginRuntimeConfig | null = null;
 	#cwd: string;
@@ -56,19 +62,179 @@ export class PluginManager {
 		this.#cwd = cwd;
 	}
 
+	/**
+	 * Read-only durable-enablement snapshot for one npm plugin, scope-qualified.
+	 * `"user"` reads the shared runtime lock file (~/.gjc/plugins/gjc-plugins.lock.json);
+	 * `"project"` reads this project's `.gjc/plugin-overrides.json` disabled list.
+	 * A malformed underlying file is reported distinctly from "not installed" —
+	 * neither is silently treated as an empty/enabled state.
+	 */
+	async getEnablementState(name: string, scope: "user" | "project"): Promise<PluginEnablementState> {
+		if (scope === "user") {
+			let config: PluginRuntimeConfig;
+			try {
+				config = await this.#loadRuntimeConfigStrict();
+			} catch {
+				return { status: "malformed" };
+			}
+			const current = config.plugins[name];
+			if (!current) return { status: "not_installed" };
+			return { status: "ok", enabled: current.enabled !== false, baseline: JSON.stringify({ scope, current }) };
+		}
+		let overrides: ProjectPluginOverrides;
+		try {
+			overrides = await this.#loadProjectOverridesStrict();
+		} catch {
+			return { status: "malformed" };
+		}
+		// Project scope has no independent "installed" concept (it modifies the
+		// same npm-managed package the user scope tracks); absence of a user
+		// entry means there is nothing this project scope could be disabling.
+		let config: PluginRuntimeConfig;
+		try {
+			config = await this.#loadRuntimeConfigStrict();
+		} catch {
+			return { status: "malformed" };
+		}
+		if (!config.plugins[name]) return { status: "not_installed" };
+		const disabled = [...(overrides.disabled ?? [])].sort();
+		return { status: "ok", enabled: !disabled.includes(name), baseline: JSON.stringify({ scope, disabled }) };
+	}
+
+	/**
+	 * Durable enablement toggle used by doctor quarantine and the plugin CLI.
+	 * No install/fetch/reinstall occurs — this only flips the durable enabled
+	 * flag a future session-startup load (`getEnabledPlugins`) consults: the
+	 * user-scope runtime lock file, or the project's disabled-list override.
+	 * Serialized under the canonical native-identity-bound file lock shared
+	 * with every other writer of the same file (bounded retry/timeout,
+	 * owner-safe release — never an unbounded wait, never a blind `rm`).
+	 * `expectedBaseline` is required: a caller with no prior
+	 * {@link getEnablementState} read has no CAS authority to mutate.
+	 */
+	async setEnabled(
+		name: string,
+		enabled: boolean,
+		scope: "user" | "project",
+		expectedBaseline: string,
+	): Promise<{ status: "updated" | "not_needed"; enabled: boolean; version?: string }> {
+		if (scope === "project") return await this.#setProjectEnabled(name, enabled, expectedBaseline);
+		const lockfilePath = getPluginsLockfile();
+		return await withFileLock(lockfilePath, async () => {
+			this.#runtimeConfig = null;
+			let config: PluginRuntimeConfig;
+			try {
+				config = await this.#loadRuntimeConfigStrict();
+			} catch (error) {
+				throw Object.assign(new Error(`Plugin runtime config is malformed at ${lockfilePath}`), {
+					code: "malformed_registry",
+					cause: error,
+				});
+			}
+			const current = config.plugins[name];
+			if (!current) throw Object.assign(new Error(`Plugin "${name}" is not installed`), { code: "not_installed" });
+			const baseline = JSON.stringify({ scope: "user" as const, current });
+			if (baseline !== expectedBaseline)
+				throw Object.assign(new Error("The installed plugin entry changed since it was reviewed"), {
+					code: "stale_baseline",
+				});
+			if (current.enabled === enabled) return { status: "not_needed" as const, enabled, version: current.version };
+			config.plugins[name] = { ...current, enabled };
+			this.#runtimeConfig = config;
+			await this.#saveRuntimeConfig();
+			return { status: "updated" as const, enabled, version: current.version };
+		});
+	}
+
+	/**
+	 * Project-scoped disable: adds/removes `name` from the project's
+	 * `.gjc/plugin-overrides.json` disabled list. Serialized under that exact
+	 * file's canonical file lock so an ordinary override edit and this doctor
+	 * toggle cannot race and clobber each other's sibling entries.
+	 */
+	async #setProjectEnabled(
+		name: string,
+		enabled: boolean,
+		expectedBaseline: string,
+	): Promise<{ status: "updated" | "not_needed"; enabled: boolean }> {
+		const overridesPath = getProjectPluginOverridesPath(this.#cwd);
+		return await withFileLock(overridesPath, async () => {
+			let overrides: ProjectPluginOverrides;
+			try {
+				overrides = await this.#loadProjectOverridesStrict();
+			} catch (error) {
+				throw Object.assign(new Error(`Project plugin overrides are malformed at ${overridesPath}`), {
+					code: "malformed_registry",
+					cause: error,
+				});
+			}
+			const disabled = [...(overrides.disabled ?? [])].sort();
+			const baseline = JSON.stringify({ scope: "project" as const, disabled });
+			if (baseline !== expectedBaseline)
+				throw Object.assign(new Error("The project plugin overrides changed since they were reviewed"), {
+					code: "stale_baseline",
+				});
+			const wasDisabled = disabled.includes(name);
+			if (wasDisabled === !enabled) return { status: "not_needed" as const, enabled };
+			const nextDisabled = enabled ? disabled.filter(n => n !== name) : [...new Set([...disabled, name])].sort();
+			const next: ProjectPluginOverrides = { ...overrides, disabled: nextDisabled };
+			await fs.promises.mkdir(path.dirname(overridesPath), { recursive: true });
+			const tmpPath = `${overridesPath}.tmp-${process.pid}-${Date.now()}`;
+			await fs.promises.writeFile(tmpPath, `${JSON.stringify(next, null, 2)}\n`);
+			await fs.promises.rename(tmpPath, overridesPath);
+			return { status: "updated" as const, enabled };
+		});
+	}
+
 	// ==========================================================================
 	// Runtime Config Management
 	// ==========================================================================
 
 	async #loadRuntimeConfig(): Promise<PluginRuntimeConfig> {
-		const lockPath = getPluginsLockfile();
 		try {
-			return await Bun.file(lockPath).json();
+			return await this.#loadRuntimeConfigStrict();
 		} catch (err) {
-			if (isEnoent(err)) return { plugins: {}, settings: {} };
-			logger.warn("Failed to load plugin runtime config", { path: lockPath, error: String(err) });
+			logger.warn("Failed to load plugin runtime config", { path: getPluginsLockfile(), error: String(err) });
 			return { plugins: {}, settings: {} };
 		}
+	}
+
+	/**
+	 * Strict variant: a missing lock file is legitimately empty (no plugins
+	 * installed yet), but malformed JSON must never be silently coerced into
+	 * an empty config — a mutating writer built on that would overwrite (and
+	 * lose) an unreadable but non-empty runtime config.
+	 */
+	async #loadRuntimeConfigStrict(): Promise<PluginRuntimeConfig> {
+		const lockPath = getPluginsLockfile();
+		let text: string;
+		try {
+			text = await Bun.file(lockPath).text();
+		} catch (err) {
+			if (isEnoent(err)) return { plugins: {}, settings: {} };
+			throw err;
+		}
+		let parsed: unknown;
+		try {
+			parsed = JSON.parse(text);
+		} catch (error) {
+			throw Object.assign(new Error(`Plugin runtime config is malformed at ${lockPath}`), {
+				code: "malformed_registry",
+				cause: error,
+			});
+		}
+		if (
+			typeof parsed !== "object" ||
+			parsed === null ||
+			typeof (parsed as PluginRuntimeConfig).plugins !== "object" ||
+			(parsed as PluginRuntimeConfig).plugins === null
+		) {
+			throw Object.assign(new Error(`Plugin runtime config has an unsupported shape at ${lockPath}`), {
+				code: "malformed_registry",
+			});
+		}
+		const config = parsed as PluginRuntimeConfig;
+		return { plugins: config.plugins ?? {}, settings: config.settings ?? {} };
 	}
 
 	async #ensureConfigLoaded(): Promise<PluginRuntimeConfig> {
@@ -84,14 +250,42 @@ export class PluginManager {
 	}
 
 	async #loadProjectOverrides(): Promise<ProjectPluginOverrides> {
-		const overridesPath = getProjectPluginOverridesPath(this.#cwd);
 		try {
-			return await Bun.file(overridesPath).json();
+			return await this.#loadProjectOverridesStrict();
 		} catch (err) {
-			if (isEnoent(err)) return {};
-			logger.warn("Failed to load project plugin overrides", { path: overridesPath, error: String(err) });
+			logger.warn("Failed to load project plugin overrides", {
+				path: getProjectPluginOverridesPath(this.#cwd),
+				error: String(err),
+			});
 			return {};
 		}
+	}
+
+	/** Strict variant: missing is empty; malformed JSON/shape throws. */
+	async #loadProjectOverridesStrict(): Promise<ProjectPluginOverrides> {
+		const overridesPath = getProjectPluginOverridesPath(this.#cwd);
+		let text: string;
+		try {
+			text = await Bun.file(overridesPath).text();
+		} catch (err) {
+			if (isEnoent(err)) return {};
+			throw err;
+		}
+		let parsed: unknown;
+		try {
+			parsed = JSON.parse(text);
+		} catch (error) {
+			throw Object.assign(new Error(`Project plugin overrides are malformed at ${overridesPath}`), {
+				code: "malformed_registry",
+				cause: error,
+			});
+		}
+		if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+			throw Object.assign(new Error(`Project plugin overrides have an unsupported shape at ${overridesPath}`), {
+				code: "malformed_registry",
+			});
+		}
+		return parsed as ProjectPluginOverrides;
 	}
 
 	// ==========================================================================
@@ -381,22 +575,6 @@ export class PluginManager {
 			enabledFeatures: null,
 			enabled: true,
 		};
-	}
-
-	// ==========================================================================
-	// Enable / Disable
-	// ==========================================================================
-
-	/**
-	 * Enable or disable a plugin globally.
-	 */
-	async setEnabled(name: string, enabled: boolean): Promise<void> {
-		const config = await this.#ensureConfigLoaded();
-		if (!config.plugins[name]) {
-			throw new Error(`Plugin ${name} not found in runtime config`);
-		}
-		config.plugins[name].enabled = enabled;
-		await this.#saveRuntimeConfig();
 	}
 
 	// ==========================================================================

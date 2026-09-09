@@ -15,6 +15,82 @@ pub enum ProcessStatus {
 	Exited,
 }
 
+/// Read-only, non-mutating observation of whether a pid currently names a
+/// verifiable process incarnation. See [`Process::observe`].
+///
+/// `Process::from_pid` returns `None` for both a genuinely dead pid and a pid
+/// whose identity simply could not be queried (permission denial, a
+/// transient read failure), and `ProcessStatus::Exited` on Darwin means only
+/// "the identity re-check failed", not "the kernel confirmed no such
+/// process". Neither collapse is safe to use as death proof. This type keeps
+/// the three outcomes distinct so callers can require positive absence
+/// evidence before treating a pid as dead.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProcessObservation {
+	/// The pid names a live process and its exact kernel-reported incarnation
+	/// was proved — the same evidence [`Process::incarnation`] returns.
+	Present {
+		/// Kernel-derived identity evidence for this exact process incarnation.
+		incarnation: String,
+	},
+	/// The operating system positively confirmed that no process currently
+	/// has this pid. This is proof of death, not merely an unread process
+	/// table.
+	Absent,
+	/// The query could not determine liveness: permission denial, a platform
+	/// limitation, an invalid (non-positive) pid, or a transient I/O
+	/// failure. Callers MUST NOT treat this as death proof.
+	Unknown {
+		/// Bounded, machine-readable classification of why the query was
+		/// inconclusive (e.g. `"invalid_pid"`, `"permission_denied"`,
+		/// `"identity_unavailable"`, `"query_failed"`).
+		reason_code: String,
+	},
+}
+
+/// Result of a POSIX `kill(pid, 0)` non-signalling existence probe, shared by
+/// the Linux and macOS platform modules.
+///
+/// `kill(pid, 0)` sends no signal; the kernel only validates that `pid`
+/// resolves to a process the caller may query. `ESRCH` is the *only* outcome
+/// that positively proves no such process exists. `EPERM` proves the
+/// opposite — the process exists but is owned by another user — and success
+/// (`0`) means the process exists and is signalable. Every other errno is a
+/// query failure, not an absence proof.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PosixExistenceProbe {
+	/// The kernel confirmed no process currently owns this pid.
+	ConfirmedAbsent,
+	/// The kernel confirmed a process owns this pid (signalable or
+	/// permission-denied); it is not absent.
+	ConfirmedPresent,
+	/// The probe itself failed for a reason other than `ESRCH`/`EPERM`/success.
+	QueryFailed(&'static str),
+}
+
+/// Issue a non-signalling `kill(pid, 0)` existence probe.
+///
+/// This never signals, kills, reaps, or waits on any process: signal `0` is
+/// defined by POSIX to perform only error checking.
+#[cfg(unix)]
+pub(crate) fn posix_existence_probe(pid: i32) -> PosixExistenceProbe {
+	// SAFETY: `kill` takes an integer pid and signal by value and does not access
+	// caller-owned memory. Signal `0` is the POSIX-documented no-op probe: it
+	// performs only error checking and delivers no signal, so this never affects
+	// process state.
+	let result = unsafe { libc::kill(pid, 0) };
+	if result == 0 {
+		return PosixExistenceProbe::ConfirmedPresent;
+	}
+	match std::io::Error::last_os_error().raw_os_error() {
+		Some(libc::ESRCH) => PosixExistenceProbe::ConfirmedAbsent,
+		Some(libc::EPERM) => PosixExistenceProbe::ConfirmedPresent,
+		Some(libc::EINVAL) => PosixExistenceProbe::QueryFailed("invalid_signal"),
+		_ => PosixExistenceProbe::QueryFailed("query_failed"),
+	}
+}
+
 #[cfg(target_os = "linux")]
 mod platform {
 	use std::{
@@ -26,7 +102,7 @@ mod platform {
 		sync::Arc,
 	};
 
-	use super::ProcessStatus;
+	use super::{ProcessObservation, ProcessStatus};
 
 	/// Stable Linux process reference backed by a pidfd.
 	#[derive(Clone)]
@@ -391,6 +467,33 @@ mod platform {
 		unsafe { libc::kill(-pgid, signal) == 0 }
 	}
 
+	/// Read-only observation of whether `pid` currently names a verifiable
+	/// process incarnation. Never signals, kills, reaps, or waits.
+	pub fn observe_pid(pid: i32) -> ProcessObservation {
+		if pid <= 0 {
+			return ProcessObservation::Unknown { reason_code: "invalid_pid".to_owned() };
+		}
+		if let Some(process) = Process::from_pid(pid) {
+			return ProcessObservation::Present { incarnation: process.incarnation() };
+		}
+		// `from_pid` failed: either the pid genuinely does not exist, or the
+		// pidfd/start-time query failed for a live process (race, permission).
+		// `kill(pid, 0)` never signals — it only asks the kernel whether the pid
+		// currently resolves to a process.
+		match super::posix_existence_probe(pid) {
+			super::PosixExistenceProbe::ConfirmedAbsent => ProcessObservation::Absent,
+			super::PosixExistenceProbe::ConfirmedPresent => {
+				// The kernel confirms the pid is alive, but pidfd_open or the start-time
+				// read failed (permission, race, or a resource limit) so identity could
+				// not be pinned. The process is not dead: report unavailable, not absent.
+				ProcessObservation::Unknown { reason_code: "identity_unavailable".to_owned() }
+			},
+			super::PosixExistenceProbe::QueryFailed(reason) => {
+				ProcessObservation::Unknown { reason_code: reason.to_owned() }
+			},
+		}
+	}
+
 	/// Find processes whose `/proc/{pid}/exe` symlink resolves to exactly
 	/// `target`.
 	pub fn find_by_path(target: &str) -> Vec<Process> {
@@ -440,7 +543,7 @@ mod platform {
 		ptr,
 	};
 
-	use super::ProcessStatus;
+	use super::{ProcessObservation, ProcessStatus};
 
 	#[link(name = "proc", kind = "dylib")]
 	unsafe extern "C" {
@@ -643,6 +746,40 @@ mod platform {
 		unsafe { libc::kill(-pgid, signal) == 0 }
 	}
 
+	/// Read-only observation of whether `pid` currently names a verifiable
+	/// process incarnation. Never signals, kills, reaps, or waits.
+	///
+	/// Darwin's `sysctl(KERN_PROC_PID)` (used by `Process::from_pid` via
+	/// `read_bsdinfo`) returns success with zero bytes written for a pid that
+	/// does not exist — that zero-byte result IS the kernel's positive absence
+	/// signal, so a `from_pid` failure here is corroborated with the same
+	/// `kill(pid, 0)` probe Linux uses rather than trusted alone, because a
+	/// transient sysctl failure (`rc != 0`) is indistinguishable from "absent"
+	/// without it.
+	pub fn observe_pid(pid: i32) -> ProcessObservation {
+		if pid <= 0 {
+			return ProcessObservation::Unknown { reason_code: "invalid_pid".to_owned() };
+		}
+		if let Some(process) = Process::from_pid(pid) {
+			return ProcessObservation::Present { incarnation: process.incarnation() };
+		}
+		match super::posix_existence_probe(pid) {
+			super::PosixExistenceProbe::ConfirmedAbsent => ProcessObservation::Absent,
+			super::PosixExistenceProbe::ConfirmedPresent => {
+				// `kill(pid, 0)` still succeeds for an unreaped zombie, so consult the
+				// kernel record: a terminated-pending-reap process is positively dead,
+				// while any other read failure remains inconclusive.
+				if terminated_pending_reap(pid) {
+					return ProcessObservation::Absent;
+				}
+				ProcessObservation::Unknown { reason_code: "identity_unavailable".to_owned() }
+			},
+			super::PosixExistenceProbe::QueryFailed(reason) => {
+				ProcessObservation::Unknown { reason_code: reason.to_owned() }
+			},
+		}
+	}
+
 	const KERN_PROCARGS2: libc::c_int = 49;
 
 	const PROC_PIDPATHINFO_MAXSIZE: usize = 4096;
@@ -791,6 +928,38 @@ mod platform {
 	const KINFO_PROC_PID: usize = 40;
 	const KINFO_PROC_PPID: usize = 560;
 	const KINFO_PROC_PGID: usize = 564;
+	/// `kp_proc.p_stat` precedes `p_pid`; `SZOMB` marks an already-terminated
+	/// process that only awaits reaping by its parent.
+	const KINFO_PROC_STAT: usize = 36;
+	const SZOMB: i32 = 5;
+
+	/// True only when the kernel record positively reports this pid as an
+	/// already-terminated process awaiting reaping. Any read failure returns
+	/// false so an unreadable record is never mistaken for death.
+	fn terminated_pending_reap(pid: i32) -> bool {
+		let mut mib = [libc::CTL_KERN, libc::KERN_PROC, libc::KERN_PROC_PID, pid];
+		let mut buffer = [0u8; KINFO_PROC_SIZE];
+		let mut len = buffer.len();
+		// SAFETY: identical contract to `read_bsdinfo` below: four initialized mib
+		// entries, a writable buffer of exactly `len` bytes, and a valid in/out length.
+		let rc = unsafe {
+			libc::sysctl(
+				mib.as_mut_ptr(),
+				mib.len() as u32,
+				buffer.as_mut_ptr().cast::<std::ffi::c_void>(),
+				&raw mut len,
+				ptr::null_mut(),
+				0,
+			)
+		};
+		if rc != 0 || len != KINFO_PROC_SIZE {
+			return false;
+		}
+		let read_i32 = |offset: usize| {
+			i32::from_ne_bytes(buffer[offset..offset + 4].try_into().expect("4-byte slice"))
+		};
+		read_i32(KINFO_PROC_PID) == pid && read_i32(KINFO_PROC_STAT) == SZOMB
+	}
 
 	fn read_bsdinfo(pid: i32) -> Option<ProcInfo> {
 		let mut mib = [libc::CTL_KERN, libc::KERN_PROC, libc::KERN_PROC_PID, pid];
@@ -819,6 +988,12 @@ mod platform {
 		let read_i64 = |offset: usize| {
 			i64::from_ne_bytes(buffer[offset..offset + 8].try_into().expect("8-byte slice"))
 		};
+		// A zombie has already run its last instruction and can never act again;
+		// treating it as live would make death proof depend on an unrelated
+		// parent's reaping schedule.
+		if read_i32(KINFO_PROC_STAT) == SZOMB {
+			return None;
+		}
 		let info = ProcInfo {
 			pid:          read_i32(KINFO_PROC_PID),
 			ppid:         read_i32(KINFO_PROC_PPID),
@@ -926,7 +1101,7 @@ mod platform {
 
 	use smallvec::SmallVec;
 
-	use super::ProcessStatus;
+	use super::{ProcessObservation, ProcessStatus};
 
 	#[repr(C)]
 	#[allow(non_snake_case, reason = "Windows PROCESSENTRY32W field names must match Win32 ABI")]
@@ -1479,6 +1654,51 @@ mod platform {
 		false
 	}
 
+	/// `OpenProcess` failure code the kernel reports when `dwProcessId` does not
+	/// resolve to any process object. `NtOpenProcess` returns
+	/// `STATUS_INVALID_CID` for a nonexistent client id, which the Win32 layer
+	/// maps to this error — the *only* `OpenProcess` failure that positively
+	/// proves absence. Every other failure (most commonly `ERROR_ACCESS_DENIED`
+	/// for a live process this caller may not query) means the process exists
+	/// or the query itself failed.
+	const ERROR_INVALID_PARAMETER: u32 = 87;
+
+	/// Read-only observation of whether `pid` currently names a verifiable
+	/// process incarnation. Never signals, kills, reaps, or waits.
+	pub fn observe_pid(pid: i32) -> ProcessObservation {
+		if pid <= 0 {
+			return ProcessObservation::Unknown { reason_code: "invalid_pid".to_owned() };
+		}
+		if let Some(process) = Process::from_pid(pid) {
+			return ProcessObservation::Present { incarnation: process.incarnation() };
+		}
+		let Ok(pid_u32) = u32::try_from(pid) else {
+			return ProcessObservation::Unknown { reason_code: "invalid_pid".to_owned() };
+		};
+		// `Process::from_pid` failed above; probe again with the minimal query
+		// access right so a permission-restricted-but-alive process (which denies
+		// the fuller `PROCESS_REFERENCE_ACCESS` set) is not misreported as absent.
+		// SAFETY: `OpenProcess` takes the access mask and pid by value and does not
+		// dereference caller-owned memory. The handle, if any, is immediately
+		// wrapped for RAII closure.
+		let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid_u32) };
+		if let Some(owned) = OwnedHandle::from_raw(handle) {
+			// The process exists (the OS handed back a valid handle) but identity
+			// (creation time) could not be pinned by `Process::from_pid`'s stricter
+			// access request — not proof of death.
+			drop(owned);
+			return ProcessObservation::Unknown { reason_code: "identity_unavailable".to_owned() };
+		}
+		// SAFETY: `GetLastError` reads this thread's last-error value set by the
+		// `OpenProcess` call immediately above and touches no caller-owned memory.
+		let last_error = unsafe { GetLastError() };
+		if last_error == ERROR_INVALID_PARAMETER {
+			ProcessObservation::Absent
+		} else {
+			ProcessObservation::Unknown { reason_code: "permission_denied".to_owned() }
+		}
+	}
+
 	/// Find processes whose `QueryFullProcessImageNameW` result equals `target`.
 	pub fn find_by_path(target: &str) -> Vec<Process> {
 		use std::{ffi::OsString, os::windows::ffi::OsStringExt};
@@ -1540,6 +1760,21 @@ impl Process {
 	/// Open a stable process reference from a PID.
 	pub fn from_pid(pid: i32) -> Option<Self> {
 		platform::Process::from_pid(pid).map(Self::from_inner)
+	}
+
+	/// Read-only observation of whether `pid` currently names a verifiable
+	/// process incarnation.
+	///
+	/// This is the sole death-proof primitive: unlike [`Self::from_pid`]
+	/// returning `None` (which conflates "confirmed absent" with "could not be
+	/// queried") or [`Self::status`] mapping an identity-check failure to
+	/// [`ProcessStatus::Exited`] on Darwin, `observe` keeps positive OS-reported
+	/// absence separate from every inconclusive outcome. It never signals,
+	/// kills, reaps, waits on, or spawns any process — it only reads existing
+	/// kernel state (pidfd status on Linux, `sysctl`/`kill(pid, 0)` on macOS,
+	/// `OpenProcess` on Windows).
+	pub fn observe(pid: i32) -> ProcessObservation {
+		platform::observe_pid(pid)
 	}
 
 	/// Open stable process references whose executable path matches exactly.
@@ -2457,5 +2692,103 @@ mod tests {
 		assert!(process.incarnation().starts_with("darwin:"));
 		assert_eq!(ppid, Some(self_pid));
 		assert!(pgid.is_some_and(|pgid| pgid > 0));
+	}
+
+	/// `Process::observe` on the current live process must report `Present`
+	/// with the same incarnation `Process::from_pid` proves, never `Absent` or
+	/// `Unknown` for a process that is unambiguously alive and self-queryable.
+	#[test]
+	fn observe_reports_present_for_self() {
+		let self_pid = i32::try_from(std::process::id()).expect("self pid fits in i32");
+		let observation = Process::observe(self_pid);
+		let ProcessObservation::Present { incarnation } = observation else {
+			panic!("expected Present for the current live process, got {observation:?}");
+		};
+		let reference = Process::from_pid(self_pid).expect("stable reference to self");
+		assert_eq!(incarnation, reference.incarnation());
+	}
+
+	/// `Process::observe` must positively confirm death for an owned child this
+	/// test spawns, kills, and waits on itself — never signalling, reaping, or
+	/// waiting on any process it does not own.
+	#[test]
+	fn observe_reports_absent_for_owned_exited_child() {
+		use std::{process::Command, thread, time::Duration as StdDuration};
+
+		let mut child = Command::new("sleep")
+			.arg("10")
+			.spawn()
+			.expect("spawn sleep");
+		let pid = i32::try_from(child.id()).expect("child pid fits in i32");
+
+		// Confirm the fixture is genuinely alive before killing it, so the
+		// absence assertion below proves a real live-to-dead transition.
+		assert!(
+			matches!(Process::observe(pid), ProcessObservation::Present { .. }),
+			"owned child must observe as present before it is killed",
+		);
+
+		child.kill().expect("kill owned child");
+		child.wait().expect("reap owned child");
+
+		// Process-table absence is not guaranteed to be visible to the very next
+		// observation on every platform; poll briefly for the confirmed-dead
+		// result before failing.
+		let mut observation = Process::observe(pid);
+		for _ in 0..100 {
+			if matches!(observation, ProcessObservation::Absent) {
+				break;
+			}
+			thread::sleep(StdDuration::from_millis(20));
+			observation = Process::observe(pid);
+		}
+
+		assert_eq!(
+			observation,
+			ProcessObservation::Absent,
+			"owned exited child must observe as positively absent",
+		);
+		// observe() and from_pid() must never disagree about a confirmed-dead pid.
+		assert!(Process::from_pid(pid).is_none());
+	}
+
+	/// Non-positive pids can never name a single process (0 is reserved,
+	/// negatives are the POSIX process-group form), so they must classify as
+	/// `Unknown`, never as `Absent` — an invalid query is not an OS death proof.
+	#[test]
+	fn observe_classifies_invalid_pids_as_unknown_not_absent() {
+		for invalid_pid in [0, -1, -12345] {
+			let observation = Process::observe(invalid_pid);
+			assert_eq!(
+				observation,
+				ProcessObservation::Unknown { reason_code: "invalid_pid".to_owned() },
+				"pid {invalid_pid} must classify as Unknown(invalid_pid), got {observation:?}",
+			);
+		}
+	}
+
+	/// A syntactically valid positive pid far outside any plausible allocation
+	/// range is still a definite OS answer (kill(pid, 0) still returns a crisp
+	/// ESRCH-equivalent for it), not an inconclusive one.
+	#[test]
+	fn observe_reports_absent_for_implausible_pid() {
+		const IMPLAUSIBLE_PID: i32 = i32::MAX - 1000;
+		assert_eq!(Process::observe(IMPLAUSIBLE_PID), ProcessObservation::Absent);
+		assert!(Process::from_pid(IMPLAUSIBLE_PID).is_none());
+	}
+
+	/// Shared POSIX `kill(pid, 0)` probe: `ESRCH` is the only errno that proves
+	/// absence; `EPERM` proves the opposite (present, but owned by another
+	/// user); every other outcome is a query failure. Exercised directly since
+	/// this is the primitive `observe_pid` corroborates `from_pid` failures
+	/// against on Linux and macOS.
+	#[cfg(unix)]
+	#[test]
+	fn posix_existence_probe_classifies_correctly() {
+		let self_pid = i32::try_from(std::process::id()).expect("self pid fits in i32");
+		assert_eq!(posix_existence_probe(self_pid), PosixExistenceProbe::ConfirmedPresent);
+
+		const IMPLAUSIBLE_PID: i32 = i32::MAX - 1000;
+		assert_eq!(posix_existence_probe(IMPLAUSIBLE_PID), PosixExistenceProbe::ConfirmedAbsent);
 	}
 }

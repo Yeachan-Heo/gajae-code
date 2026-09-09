@@ -13,6 +13,7 @@ import {
 	parseNotificationSettingsSnapshot,
 } from "./config";
 import { daemonPaths, HEARTBEAT_TTL_MS } from "./daemon-paths";
+import { doctorDaemonIdentityMatches, doctorDaemonOccupancySettled } from "./doctor-daemon-restart";
 import { type NotificationDebrisSweepReport, sweepNotificationDebris } from "./notification-service";
 import {
 	type DaemonState,
@@ -26,11 +27,26 @@ import {
 	type TelegramDaemonOptions,
 	TelegramNotificationDaemon,
 } from "./telegram-daemon";
-import { clearTelegramControlRequest, readTelegramControlRequest } from "./telegram-daemon-control";
+import {
+	clearTelegramControlRequest,
+	clearTelegramDoctorControlRequest,
+	readTelegramControlRequest,
+	readTelegramDoctorControlRequest,
+} from "./telegram-daemon-control";
 
 type TelegramDaemonRunner = {
 	run(): Promise<void>;
 	requestStop(reason?: "reload" | "signal" | "stop"): void;
+	prepareDoctorRestart?(): void;
+	cancelDoctorRestart?(): void;
+	doctorOccupancy?(): {
+		attached: number;
+		inflight: number;
+		inbound: number;
+		outbound: number;
+		cleanup: number;
+	};
+	doctorRestartReady?(): boolean;
 };
 
 type TelegramDaemonConstructor = new (opts: TelegramDaemonOptions) => TelegramDaemonRunner;
@@ -409,6 +425,22 @@ export async function runDaemonInternal(argv: string[], deps: RunDaemonInternalD
 		requireTelegramTopicEligibility: true,
 		orphanReap,
 	});
+	const doctorOwnerIdentity = async (): Promise<
+		| {
+				owner: "telegram";
+				ownerId: string;
+				generation: number;
+				incarnation: string;
+		  }
+		| undefined
+	> => {
+		const current = await readState(settings as Settings);
+		if (!current || !hasSafeDaemonStateShape(current) || current.ownerId !== ownerId) return undefined;
+		const expectedIncarnation = (deps.pidIncarnation ?? processIncarnation)(deps.processPid ?? process.pid);
+		if (!expectedIncarnation || current.incarnation !== expectedIncarnation || current.generation === undefined)
+			return undefined;
+		return { owner: "telegram", ownerId, generation: current.generation, incarnation: current.incarnation };
+	};
 	// Signals are a process concern: install them at the daemon-internal boundary,
 	// not inside the embeddable daemon class. SIGTERM is the reload wakeup path.
 	const onSignal = (): void => daemon.requestStop("signal");
@@ -418,6 +450,8 @@ export async function runDaemonInternal(argv: string[], deps: RunDaemonInternalD
 	let watchdogActive = true;
 	let watchdogTickInFlight = false;
 	let stopRequested = false;
+	let doctorPreparedRequestId: string | undefined;
+	let doctorPoll: Timer | undefined;
 	let lastHeartbeatAt: number | undefined;
 	let stalledSince: number | undefined;
 	const watchdogTick = async (): Promise<void> => {
@@ -526,8 +560,53 @@ export async function runDaemonInternal(argv: string[], deps: RunDaemonInternalD
 		await recordOwnerStopped();
 	});
 	try {
+		const doctorTick = async (): Promise<void> => {
+			const request = await readTelegramDoctorControlRequest(settings as Settings);
+			if (!request) return;
+			const identity = await doctorOwnerIdentity();
+			// The shared predicate is the single definition of "this request addresses
+			// exactly me"; spelling the four fields out here would let this owner and the
+			// doctor client drift apart silently.
+			if (
+				!identity ||
+				!doctorDaemonIdentityMatches(request, identity) ||
+				(request.action !== "prepare" &&
+					request.action !== "commit" &&
+					request.action !== "cancel" &&
+					request.action !== "status")
+			)
+				return;
+			if (request.leaseExpiresAt !== undefined && request.leaseExpiresAt <= (deps.now ?? Date.now)()) {
+				// Expiry never reopens admission implicitly; an authorized
+				// coordinator must issue cancel after recovering the lease.
+				return;
+			}
+			if (request.action === "prepare") {
+				daemon.prepareDoctorRestart?.();
+				doctorPreparedRequestId = request.requestId;
+				return;
+			}
+			if (request.action === "cancel") {
+				if (doctorPreparedRequestId === request.requestId) daemon.cancelDoctorRestart?.();
+				await clearTelegramDoctorControlRequest(settings as Settings, request.requestId);
+				doctorPreparedRequestId = undefined;
+				return;
+			}
+			if (request.action === "commit" && doctorPreparedRequestId === request.requestId) {
+				const occupancy = daemon.doctorOccupancy?.();
+				if (!occupancy || !doctorDaemonOccupancySettled(occupancy)) return;
+				if (!daemon.doctorRestartReady?.()) return;
+				// A committed intent is durable across this owner's exit. The
+				// successor/doctor clears it only after proving old death, cleanup,
+				// and successor publication.
+				daemon.requestStop("reload");
+				doctorPreparedRequestId = undefined;
+			}
+		};
+		doctorPoll = schedule(() => void doctorTick(), 50);
 		await daemon.run();
 	} finally {
+		if (doctorPoll !== undefined) unschedule(doctorPoll);
 		watchdogActive = false;
 		unschedule(watchdog);
 		process.off("SIGTERM", onSignal);

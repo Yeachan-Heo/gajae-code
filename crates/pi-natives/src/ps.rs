@@ -12,7 +12,10 @@ use napi::{
 	bindgen_prelude::{PromiseRaw, Unknown},
 };
 use napi_derive::napi;
-use pi_shell::process::{self as core_process, ProcessStatus as CoreProcessStatus};
+use pi_shell::process::{
+	self as core_process, ProcessObservation as CoreProcessObservation,
+	ProcessStatus as CoreProcessStatus,
+};
 pub use pi_shell::process::{KILL_SIGNAL, TERM_SIGNAL, TerminationTargets, kill_process_group};
 
 use crate::task;
@@ -63,6 +66,46 @@ impl From<CoreProcessStatus> for ProcessStatus {
 	}
 }
 
+/// Read-only, non-mutating observation of whether a pid currently names a
+/// verifiable process incarnation.
+///
+/// `status` discriminates the three outcomes described on
+/// [`pi_shell::process::ProcessObservation`]:
+/// - `"present"` — `incarnation` is the exact kernel-reported identity
+///   evidence.
+/// - `"absent"` — the OS positively confirmed no process currently has this
+///   pid.
+/// - `"unknown"` — `reasonCode` explains why liveness could not be determined
+///   (e.g. an invalid pid, a permission denial, or a platform limitation); this
+///   is never proof of death.
+#[napi(object)]
+pub struct NativeProcessObservation {
+	#[napi(ts_type = "'present' | 'absent' | 'unknown'")]
+	pub status:      String,
+	pub incarnation: Option<String>,
+	pub reason_code: Option<String>,
+}
+
+impl From<CoreProcessObservation> for NativeProcessObservation {
+	fn from(value: CoreProcessObservation) -> Self {
+		match value {
+			CoreProcessObservation::Present { incarnation } => Self {
+				status:      "present".to_owned(),
+				incarnation: Some(incarnation),
+				reason_code: None,
+			},
+			CoreProcessObservation::Absent => {
+				Self { status: "absent".to_owned(), incarnation: None, reason_code: None }
+			},
+			CoreProcessObservation::Unknown { reason_code } => Self {
+				status:      "unknown".to_owned(),
+				incarnation: None,
+				reason_code: Some(reason_code),
+			},
+		}
+	}
+}
+
 /// Stable process reference.
 #[napi]
 #[derive(Clone)]
@@ -86,6 +129,25 @@ impl Process {
 			.into_iter()
 			.map(Self::from_inner)
 			.collect()
+	}
+
+	/// Read-only observation of whether `pid` currently names a verifiable
+	/// process incarnation.
+	///
+	/// Unlike [`Self::from_pid`] returning `null` (which conflates a confirmed-
+	/// dead pid with one that simply could not be queried), this keeps positive
+	/// OS-reported absence separate from every inconclusive outcome. It never
+	/// signals, kills, reaps, waits on, or spawns any process.
+	#[napi]
+	pub fn observe(pid: f64) -> NativeProcessObservation {
+		if !pid.is_finite() || pid.fract() != 0.0 || pid <= 0.0 || pid > f64::from(i32::MAX) {
+			return NativeProcessObservation {
+				status:      "unknown".to_owned(),
+				incarnation: None,
+				reason_code: Some("invalid_pid".to_owned()),
+			};
+		}
+		core_process::Process::observe(pid as i32).into()
 	}
 
 	/// Operating-system process identifier for this process reference.

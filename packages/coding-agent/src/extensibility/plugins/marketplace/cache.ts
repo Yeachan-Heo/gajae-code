@@ -10,12 +10,11 @@
  * This ensures cache paths cannot be crafted to escape the cache directory.
  */
 
+import { createHash } from "node:crypto";
 import * as nodeFs from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-
 import { isEnoent } from "@gajae-code/utils";
-
 import { isValidNameSegment } from "./types";
 
 // Reject anything that could be used for path traversal or shell injection in
@@ -86,6 +85,60 @@ export async function cachePlugin(
 	}
 
 	return targetPath;
+}
+
+export async function stageCachedPlugin(sourcePath: string, stagingPath: string): Promise<string> {
+	await fs.rm(stagingPath, { recursive: true, force: true });
+	await fs.cp(sourcePath, stagingPath, { recursive: true, errorOnExist: true, verbatimSymlinks: true });
+	return stagingPath;
+}
+
+export async function digestCachedPlugin(targetPath: string): Promise<string | undefined> {
+	const hash = createHash("sha256");
+	const walk = async (root: string, rel = ""): Promise<void> => {
+		const entries = (await fs.readdir(root, { withFileTypes: true })).sort((a, b) => a.name.localeCompare(b.name));
+		for (const entry of entries) {
+			const childRel = rel ? path.join(rel, entry.name) : entry.name;
+			const child = path.join(root, entry.name);
+			const stat = await fs.lstat(child);
+			if (stat.isSymbolicLink() || (!stat.isDirectory() && !stat.isFile())) throw new Error("unsafe cache artifact");
+			// Reject a regular file with more than one hard link: its bytes could be
+			// mutated through a second pathname we never inspected, so a digest taken
+			// here would not be provably bound to the artifact this walk actually saw.
+			// Directory entries never carry meaningful hard-link counts on POSIX
+			// (nlink for a directory reflects '.'/subdir back-references), so this
+			// check applies only to regular files.
+			if (stat.isFile() && stat.nlink > 1) throw new Error("unsafe cache artifact: multiply-linked file");
+			if (stat.isDirectory()) await walk(child, childRel);
+			else {
+				hash.update(childRel);
+				hash.update("\0");
+				hash.update(await fs.readFile(child));
+				hash.update("\0");
+			}
+		}
+	};
+	try {
+		await walk(targetPath);
+		return hash.digest("hex");
+	} catch (error) {
+		hash.digest();
+		if (isEnoent(error)) return undefined;
+		return undefined;
+	}
+}
+
+export async function inspectCachedPlugin(
+	targetPath: string,
+): Promise<{ status: "present" | "absent" | "unreadable"; digest?: string }> {
+	try {
+		const stat = await fs.lstat(targetPath);
+		if (!stat.isDirectory() || stat.isSymbolicLink()) return { status: "unreadable" };
+		const digest = await digestCachedPlugin(targetPath);
+		return digest ? { status: "present", digest } : { status: "unreadable" };
+	} catch (error) {
+		return isEnoent(error) ? { status: "absent" } : { status: "unreadable" };
+	}
 }
 
 /**

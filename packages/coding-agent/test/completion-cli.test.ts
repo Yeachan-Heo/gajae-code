@@ -3,7 +3,6 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { Args, Command, type CommandEntry, Flags } from "@gajae-code/utils/cli";
-import { commands, RootHelpCommand } from "../src/cli";
 import {
 	buildGjcFigSpec,
 	defaultInshellisenseSpecDir,
@@ -13,6 +12,7 @@ import {
 	installGjcInshellisenseSpec,
 	renderFigSpecModule,
 } from "../src/cli/completion-cli";
+import { commands, RootHelpCommand } from "../src/cli-main";
 
 const tempDirs: string[] = [];
 

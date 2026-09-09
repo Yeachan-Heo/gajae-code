@@ -11,6 +11,8 @@ import {
 	exactRestore,
 	exactUnlink,
 	exactUnlinkDirect,
+	inspectConfigFilePermissionRepair,
+	repairConfigFilePermissions,
 	snapshotDirectoryTree,
 	verifyOwnerOnlyPathSecurity,
 } from "../native/index.js";
@@ -21,13 +23,11 @@ function sha256(contents: string): string {
 	return createHash("sha256").update(contents).digest("hex");
 }
 
+/** The canonical name is vacated and the retired payload is retained at its preauthorized destination. */
 function expectDetachedCleanupPending(result: ReturnType<typeof exactUnlink>, detachedPath: string): void {
-	expect(result).toMatchObject({
-		ok: false,
-		code: "cleanup_pending",
-		detachedPath,
-		retainedPlaceholderPath: expect.stringMatching(/\.gjc-exact-unlink-placeholder-/),
-	});
+	expect(result).toMatchObject({ ok: true, detachedPath });
+	expect(result.retainedPlaceholderPath).toBeUndefined();
+	expect(result.retainedUnknownPath).toBeUndefined();
 }
 
 function expectTreeCleanupPending(result: ReturnType<typeof exactRemoveDirectoryTree>, plannedPath: string): void {
@@ -90,6 +90,73 @@ afterEach(async () => {
 });
 
 describe.skipIf(process.platform === "win32")("POSIX native path identity", () => {
+	it("removes only non-owner bits and verifies the exact file", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-path-identity-posix-"));
+		temporaryDirectories.push(root);
+		const file = path.join(root, "config.json");
+		await fs.writeFile(file, "{}", { mode: 0o644 });
+		const stat = await fs.stat(file, { bigint: true });
+		const parent = await fs.stat(root, { bigint: true });
+		const identity = {
+			dev: stat.dev,
+			ino: stat.ino,
+			nlink: stat.nlink,
+			parentDev: parent.dev,
+			parentIno: parent.ino,
+			size: stat.size,
+			mtimeNs: stat.mtimeNs,
+			sha256: sha256("{}"),
+		};
+		expect(inspectConfigFilePermissionRepair(file, identity, Number(stat.mode))).toMatchObject({
+			status: "ready",
+			changed: false,
+			verified: false,
+		});
+		expect(repairConfigFilePermissions(file, identity, Number(stat.mode))).toEqual({
+			status: "changed",
+			changed: true,
+			verified: true,
+		});
+		expect((await fs.stat(file)).mode & 0o777).toBe(0o600);
+		expect(
+			inspectConfigFilePermissionRepair(file, identity, Number((await fs.stat(file, { bigint: true })).mode)),
+		).toMatchObject({ status: "verified", changed: false, verified: true });
+	});
+
+	it("refuses links, hardlinks, and shared-writable parents", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-path-identity-posix-"));
+		temporaryDirectories.push(root);
+		const file = path.join(root, "config.json");
+		await fs.writeFile(file, "{}", { mode: 0o644 });
+		await fs.link(file, `${file}.hard`);
+		const stat = await fs.stat(file, { bigint: true });
+		const parent = await fs.stat(root, { bigint: true });
+		const identity = {
+			dev: stat.dev,
+			ino: stat.ino,
+			nlink: stat.nlink,
+			parentDev: parent.dev,
+			parentIno: parent.ino,
+			size: stat.size,
+			mtimeNs: stat.mtimeNs,
+			sha256: sha256("{}"),
+		};
+		expect(inspectConfigFilePermissionRepair(file, identity, Number(stat.mode))).toMatchObject({
+			status: "refused",
+			code: "hardlink",
+		});
+		await fs.unlink(`${file}.hard`);
+		await fs.symlink(file, `${file}.link`);
+		expect(inspectConfigFilePermissionRepair(`${file}.link`, identity, Number(stat.mode))).toMatchObject({
+			status: "refused",
+		});
+		await fs.unlink(`${file}.link`);
+		await fs.chmod(root, 0o777);
+		const current = await fs.stat(file, { bigint: true });
+		expect(
+			inspectConfigFilePermissionRepair(file, { ...identity, nlink: current.nlink }, Number(current.mode)),
+		).toMatchObject({ status: "refused", code: "parent_shared_writable" });
+	});
 	it("rejects an existing directory whose canonical byte path is not UTF-8", async () => {
 		if (process.platform === "darwin") return;
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-path-identity-posix-"));
@@ -225,8 +292,10 @@ describe.skipIf(process.platform === "win32")("POSIX native path identity", () =
 			quarantineName: "staged.bin.cleanup",
 			allowHardLink: true,
 		});
-		expectDetachedCleanupPending(cleanup, path.join(root, "staged.bin.cleanup"));
+		// The authorized alias is fully removed, so no quarantine copy is retained.
+		expect(cleanup).toEqual({ ok: true });
 		await expect(fs.stat(staged)).rejects.toMatchObject({ code: "ENOENT" });
+		await expect(fs.stat(path.join(root, "staged.bin.cleanup"))).rejects.toMatchObject({ code: "ENOENT" });
 		expect(await fs.readFile(published, "utf8")).toBe("authorized");
 	});
 
@@ -390,12 +459,9 @@ describe.skipIf(process.platform === "win32")("POSIX native path identity", () =
 
 			expectDetachedCleanupPending(exactUnlink(original, identity), detached);
 
-			expect(exactRestore(detached, original, identity)).toMatchObject({
-				ok: false,
-				code: "cleanup_pending",
-				retainedPlaceholderPath: expect.any(String),
-			});
+			expect(exactRestore(detached, original, identity)).toMatchObject({ ok: true });
 			expect(await fs.readFile(original, "utf8")).toBe("authorized");
+			expect((await fs.readdir(root)).sort()).toEqual([path.basename(original)]);
 		},
 	);
 
