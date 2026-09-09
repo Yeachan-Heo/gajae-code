@@ -10,13 +10,18 @@ import { SKILL_PROMPT_MESSAGE_TYPE } from "@gajae-code/coding-agent/session/mess
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { postmortem, Snowflake } from "@gajae-code/utils";
 import { FileLockTestHooks } from "../src/config/file-lock";
-import { sessionRuntimeDir } from "../src/gjc-runtime/session-layout";
+import { modeStatePath, sessionRuntimeDir } from "../src/gjc-runtime/session-layout";
 import {
 	__sessionStateSidecarTestHooks,
 	persistCoordinatorRuntimeStateFromEvent,
 	prepareCoordinatorRuntimeStateRescope,
 } from "../src/gjc-runtime/session-state-sidecar";
-import { syncSkillActiveState } from "../src/skill-state/active-state";
+import { runNativeStateCommand } from "../src/gjc-runtime/state-runtime";
+import {
+	getSkillActiveStatePaths,
+	readVisibleSkillActiveState,
+	syncSkillActiveState,
+} from "../src/skill-state/active-state";
 import { moveSessionToolRenderer } from "../src/tools/move-session";
 
 function textContent(result: { content?: Array<{ type: string; text?: string }> }): string {
@@ -1076,6 +1081,348 @@ describe("move_session tool (agent-invokable session rescope)", () => {
 			await session.dispose();
 		}
 	});
+
+	for (const marker of ["live", "restored"] as const) {
+		for (const durable of ["cleared", "missing", "corrupt", "read-error"] as const) {
+			it(`reconciles ${marker} workflow marker against ${durable} durable state`, async () => {
+				const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
+				tempDirs.push(tempDir);
+				const cwd = path.join(tempDir, "root");
+				const child = path.join(cwd, "child");
+				const sibling = path.join(tempDir, "sibling");
+				fs.mkdirSync(child, { recursive: true });
+				fs.mkdirSync(sibling);
+				const manager = SessionManager.create(cwd, SessionManager.managedDestination(cwd, tempDir));
+				const sessionId = manager.getSessionId();
+				if (marker === "restored") {
+					await syncSkillActiveState({
+						cwd,
+						sessionId,
+						skill: "deep-interview",
+						active: true,
+						phase: "interview",
+					});
+				}
+				const { session } = await makeSession(cwd, manager, { toolNames: ["move_session"] });
+				try {
+					if (marker === "live") {
+						const activated = Promise.withResolvers<void>();
+						const unsubscribe = session.subscribe(event => {
+							if (
+								event.type === "message_start" &&
+								event.message.role === "custom" &&
+								event.message.customType === SKILL_PROMPT_MESSAGE_TYPE
+							) {
+								activated.resolve();
+							}
+						});
+						session.agent.emitExternalEvent({
+							type: "message_start",
+							message: {
+								role: "custom",
+								customType: SKILL_PROMPT_MESSAGE_TYPE,
+								content: "# Deep Interview",
+								display: true,
+								details: { name: "deep-interview" },
+								attribution: "agent",
+								timestamp: Date.now(),
+							},
+						});
+						await activated.promise;
+						unsubscribe();
+					}
+					expect(session.getEffectiveActiveWorkflowSkillState()).toMatchObject({ skill: "deep-interview" });
+					const cleared = await runNativeStateCommand(
+						["deep-interview", "clear", "--force", "--json", "--session-id", sessionId],
+						cwd,
+					);
+					expect(cleared.status).toBe(0);
+					const statePath = modeStatePath(cwd, sessionId, "deep-interview");
+					if (durable === "missing") fs.unlinkSync(statePath);
+					if (durable === "corrupt") await Bun.write(statePath, "{broken");
+					if (durable === "read-error") {
+						fs.unlinkSync(statePath);
+						fs.mkdirSync(statePath);
+					}
+					// Clearing on disk deliberately leaves the synchronous marker intact.
+					expect(session.getEffectiveActiveWorkflowSkillState()).toMatchObject({ skill: "deep-interview" });
+					const move = session.getToolByName("move_session")!;
+					if (durable === "cleared") {
+						await expect(move.execute("sibling-after-clear", { path: sibling })).rejects.toThrow(
+							"outside the current session directory",
+						);
+						expect(manager.getCwd()).toBe(cwd);
+						await move.execute("child-after-clear", { path: "child" });
+						expect(manager.getCwd()).toBe(fs.realpathSync(child));
+						await expect(move.execute("second-after-clear", { path: "child" })).rejects.toThrow("only one");
+					} else {
+						await expect(move.execute("unreadable-workflow", { path: "child" })).rejects.toThrow("workflow");
+						expect(manager.getCwd()).toBe(cwd);
+						expect(manager.getCwdGeneration()).toBe(0);
+					}
+				} finally {
+					await session.dispose();
+				}
+			});
+		}
+	}
+
+	for (const duringTransition of [false, true]) {
+		it(`blocks durable activation without a cached marker ${duringTransition ? "inside" : "before"} transition admission`, async () => {
+			const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
+			tempDirs.push(tempDir);
+			const cwd = path.join(tempDir, "root");
+			fs.mkdirSync(path.join(cwd, "child"), { recursive: true });
+			const manager = SessionManager.create(cwd, SessionManager.managedDestination(cwd, tempDir));
+			const { session } = await makeSession(cwd, manager, { toolNames: ["move_session"] });
+			const activate = () =>
+				syncSkillActiveState({
+					cwd,
+					sessionId: manager.getSessionId(),
+					skill: "deep-interview",
+					active: true,
+					phase: "interview",
+				});
+			const originalCheck = session.getFreshActiveWorkflowSkillState.bind(session);
+			let checks = 0;
+			const check = spyOn(session, "getFreshActiveWorkflowSkillState").mockImplementation(async () => {
+				const result = await originalCheck();
+				if (++checks === 1 && duringTransition) await activate();
+				return result;
+			});
+			try {
+				if (!duringTransition) await activate();
+				expect(session.getEffectiveActiveWorkflowSkillState()).toBeUndefined();
+				await expect(
+					session.getToolByName("move_session")!.execute("durable-active", { path: "child" }),
+				).rejects.toThrow(duringTransition ? "became active" : "workflow skill is active");
+				expect(check).toHaveBeenCalledTimes(duringTransition ? 2 : 1);
+				expect(manager.getCwd()).toBe(cwd);
+				expect(manager.getCwdGeneration()).toBe(0);
+			} finally {
+				check.mockRestore();
+				await session.dispose();
+			}
+		});
+	}
+
+	it("blocks an active canonical mode file without active entries or memory", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const cwd = path.join(tempDir, "root");
+		fs.mkdirSync(path.join(cwd, "child"), { recursive: true });
+		const manager = SessionManager.create(cwd, SessionManager.managedDestination(cwd, tempDir));
+		const { session } = await makeSession(cwd, manager, { toolNames: ["move_session"] });
+		try {
+			const cleared = await runNativeStateCommand(
+				["deep-interview", "clear", "--force", "--json", "--session-id", manager.getSessionId()],
+				cwd,
+			);
+			expect(cleared.status).toBe(0);
+			const statePath = modeStatePath(cwd, manager.getSessionId(), "deep-interview");
+			const state = await Bun.file(statePath).json();
+			await Bun.write(statePath, JSON.stringify({ ...state, active: true }));
+			expect(session.getEffectiveActiveWorkflowSkillState()).toBeUndefined();
+			await expect(
+				session.getToolByName("move_session")!.execute("mode-only-active", { path: "child" }),
+			).rejects.toThrow("workflow skill is active");
+			expect(manager.getCwd()).toBe(cwd);
+			expect(manager.getCwdGeneration()).toBe(0);
+		} finally {
+			await session.dispose();
+		}
+	});
+
+	for (const invalid of ["{}", '{"active":"true"}', '{"active":null}', '{"active":0}']) {
+		it(`rejects marker-free mode activation ${invalid}`, async () => {
+			const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
+			tempDirs.push(tempDir);
+			const cwd = path.join(tempDir, "root");
+			fs.mkdirSync(path.join(cwd, "child"), { recursive: true });
+			const manager = SessionManager.create(cwd, SessionManager.managedDestination(cwd, tempDir));
+			const { session } = await makeSession(cwd, manager, { toolNames: ["move_session"] });
+			try {
+				await Bun.write(modeStatePath(cwd, manager.getSessionId(), "deep-interview"), invalid);
+				expect(session.getEffectiveActiveWorkflowSkillState()).toBeUndefined();
+				await expect(
+					session.getToolByName("move_session")!.execute("invalid-mode", { path: "child" }),
+				).rejects.toThrow("Cannot verify workflow state");
+				expect(manager.getCwd()).toBe(cwd);
+				expect(manager.getCwdGeneration()).toBe(0);
+			} finally {
+				await session.dispose();
+			}
+		});
+	}
+
+	for (const invalid of ["{broken", "[]", "{}", "directory"]) {
+		it(`rejects marker-free unreadable active snapshot ${invalid}`, async () => {
+			const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
+			tempDirs.push(tempDir);
+			const cwd = path.join(tempDir, "root");
+			fs.mkdirSync(path.join(cwd, "child"), { recursive: true });
+			const manager = SessionManager.create(cwd, SessionManager.managedDestination(cwd, tempDir));
+			const { session } = await makeSession(cwd, manager, { toolNames: ["move_session"] });
+			try {
+				const snapshot = getSkillActiveStatePaths(cwd, manager.getSessionId()).sessionPath;
+				if (invalid === "directory") fs.mkdirSync(snapshot, { recursive: true });
+				else await Bun.write(snapshot, invalid);
+				expect(session.getEffectiveActiveWorkflowSkillState()).toBeUndefined();
+				await expect(
+					session.getToolByName("move_session")!.execute("invalid-snapshot", { path: "child" }),
+				).rejects.toThrow();
+				expect(manager.getCwd()).toBe(cwd);
+				expect(manager.getCwdGeneration()).toBe(0);
+			} finally {
+				await session.dispose();
+			}
+		});
+	}
+
+	it("does not let an earlier clear suppress reinvocation with a surviving active mirror", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const cwd = path.join(tempDir, "root");
+		fs.mkdirSync(path.join(cwd, "child"), { recursive: true });
+		const manager = SessionManager.create(cwd, SessionManager.managedDestination(cwd, tempDir));
+		const sessionId = manager.getSessionId();
+		await syncSkillActiveState({
+			cwd,
+			sessionId,
+			skill: "deep-interview",
+			active: true,
+			phase: "interview",
+			sourceRevision: 100,
+		});
+		const { session } = await makeSession(cwd, manager, { toolNames: ["move_session"] });
+		const clear = () =>
+			runNativeStateCommand(["deep-interview", "clear", "--force", "--json", "--session-id", sessionId], cwd);
+		try {
+			expect((await clear()).status).toBe(0);
+			const clearedIdentity = await Bun.file(modeStatePath(cwd, sessionId, "deep-interview")).text();
+			expect((await readVisibleSkillActiveState(cwd, sessionId, { strict: true }))?.active_skills).toContainEqual(
+				expect.objectContaining({ skill: "deep-interview", active: true }),
+			);
+			const activated = Promise.withResolvers<void>();
+			const unsubscribe = session.subscribe(event => {
+				if (
+					event.type === "message_start" &&
+					event.message.role === "custom" &&
+					event.message.customType === SKILL_PROMPT_MESSAGE_TYPE
+				)
+					activated.resolve();
+			});
+			session.agent.emitExternalEvent({
+				type: "message_start",
+				message: {
+					role: "custom",
+					customType: SKILL_PROMPT_MESSAGE_TYPE,
+					content: "# Deep Interview",
+					display: true,
+					details: { name: "deep-interview" },
+					attribution: "agent",
+					timestamp: Date.now(),
+				},
+			});
+			await activated.promise;
+			unsubscribe();
+			expect(session.getActiveSkillState()).toMatchObject({ skill: "deep-interview" });
+			expect(await Bun.file(modeStatePath(cwd, sessionId, "deep-interview")).text()).toBe(clearedIdentity);
+			await expect(session.getToolByName("move_session")!.execute("reinvoked", { path: "child" })).rejects.toThrow(
+				"workflow skill is active",
+			);
+			expect(manager.getCwd()).toBe(cwd);
+			expect(manager.getCwdGeneration()).toBe(0);
+			expect((await clear()).status).toBe(0);
+			expect(await Bun.file(modeStatePath(cwd, sessionId, "deep-interview")).text()).not.toBe(clearedIdentity);
+			await session.getToolByName("move_session")!.execute("cleared-again", { path: "child" });
+			expect(manager.getCwd()).toBe(fs.realpathSync(path.join(cwd, "child")));
+		} finally {
+			await session.dispose();
+		}
+	});
+
+	for (const restoreOldClear of [false, true]) {
+		it(`recovers failed invocation observation only after a later clear (restore old clear: ${restoreOldClear})`, async () => {
+			const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
+			tempDirs.push(tempDir);
+			const cwd = path.join(tempDir, "root");
+			const child = path.join(cwd, "child");
+			const sibling = path.join(tempDir, "sibling");
+			fs.mkdirSync(child, { recursive: true });
+			fs.mkdirSync(sibling);
+			const manager = SessionManager.create(cwd, SessionManager.managedDestination(cwd, tempDir));
+			const sessionId = manager.getSessionId();
+			await syncSkillActiveState({
+				cwd,
+				sessionId,
+				skill: "deep-interview",
+				active: true,
+				phase: "interview",
+				sourceRevision: 100,
+			});
+			const { session } = await makeSession(cwd, manager, { toolNames: ["move_session"] });
+			const clear = () =>
+				runNativeStateCommand(["deep-interview", "clear", "--force", "--json", "--session-id", sessionId], cwd);
+			const modePath = modeStatePath(cwd, sessionId, "deep-interview");
+			try {
+				expect((await clear()).status).toBe(0);
+				const oldClear = await Bun.file(modePath).text();
+				await Bun.write(modePath, "{broken");
+				const initialFile = fs.statSync(modePath, { bigint: true });
+				expect((await readVisibleSkillActiveState(cwd, sessionId, { strict: true }))?.active_skills).toContainEqual(
+					expect.objectContaining({ skill: "deep-interview", active: true }),
+				);
+				const activated = Promise.withResolvers<void>();
+				const unsubscribe = session.subscribe(event => {
+					if (
+						event.type === "message_start" &&
+						event.message.role === "custom" &&
+						event.message.customType === SKILL_PROMPT_MESSAGE_TYPE
+					)
+						activated.resolve();
+				});
+				session.agent.emitExternalEvent({
+					type: "message_start",
+					message: {
+						role: "custom",
+						customType: SKILL_PROMPT_MESSAGE_TYPE,
+						content: "# Deep Interview",
+						display: true,
+						details: { name: "deep-interview" },
+						attribution: "agent",
+						timestamp: Date.now(),
+					},
+				});
+				await activated.promise;
+				unsubscribe();
+				expect(session.getActiveSkillState()).toMatchObject({ skill: "deep-interview" });
+				const move = session.getToolByName("move_session")!;
+				await expect(move.execute("corrupt-invocation", { path: "child" })).rejects.toThrow(
+					"Cannot verify workflow state",
+				);
+				if (restoreOldClear) {
+					await Bun.write(modePath, oldClear);
+					expect(fs.statSync(modePath, { bigint: true }).ino).toBe(initialFile.ino);
+					await expect(move.execute("old-clear-restored", { path: "child" })).rejects.toThrow(
+						"workflow skill is active",
+					);
+				}
+				expect(manager.getCwd()).toBe(cwd);
+				expect(manager.getCwdGeneration()).toBe(0);
+				expect((await clear()).status).toBe(0);
+				expect(fs.statSync(modePath, { bigint: true }).ino).not.toBe(initialFile.ino);
+				await expect(move.execute("sibling-after-repair", { path: sibling })).rejects.toThrow(
+					"outside the current session directory",
+				);
+				expect(manager.getCwd()).toBe(cwd);
+				await move.execute("child-after-repair", { path: "child" });
+				expect(manager.getCwd()).toBe(fs.realpathSync(child));
+			} finally {
+				await session.dispose();
+			}
+		});
+	}
 
 	it("queues an unrelated cwd transition instead of skipping the lock", async () => {
 		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));

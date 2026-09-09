@@ -447,7 +447,11 @@ export function getSkillActiveStatePaths(cwd: string, sessionId?: string): Skill
  * Strict semantics: tolerates ENOENT only. Corrupt JSON / non-ENOENT I/O
  * errors propagate so callers can surface a non-zero CLI status.
  */
-async function readRawActiveStateForHandoff(filePath: string, strict: boolean): Promise<SkillActiveState | null> {
+async function readRawActiveStateForHandoff(
+	filePath: string,
+	strict: boolean,
+	validateObject = false,
+): Promise<SkillActiveState | null> {
 	let raw: string;
 	try {
 		raw = await Bun.file(filePath).text();
@@ -459,6 +463,9 @@ async function readRawActiveStateForHandoff(filePath: string, strict: boolean): 
 	}
 	try {
 		const parsed = JSON.parse(raw);
+		if (validateObject && (!parsed || typeof parsed !== "object" || Array.isArray(parsed))) {
+			throw new Error(`Invalid workflow snapshot object: ${filePath}`);
+		}
 		if (!parsed || typeof parsed !== "object") return null;
 		return parsed as SkillActiveState;
 	} catch (err) {
@@ -687,6 +694,8 @@ export interface ReadVisibleSkillActiveStateOptions {
 	tier?: VisibleSkillActiveStateCacheTier;
 	/** Bypass all signature/TTL caches for authorization decisions. */
 	bypassCache?: boolean;
+	/** Strict authorization read: rejects unreadable snapshots and bypasses caches. */
+	strict?: boolean;
 }
 
 interface ActiveStateStatSignature {
@@ -785,9 +794,26 @@ export function invalidateVisibleSkillActiveStateCache(cwd?: string, sessionId?:
 async function readVisibleSkillActiveStateUncached(
 	cwd: string,
 	resolvedSessionId: string,
+	strict = false,
 ): Promise<SkillActiveState | null> {
 	const { sessionPath } = getSkillActiveStatePaths(cwd, resolvedSessionId);
-	const sessionState = await readRawActiveStateForHandoff(sessionPath, false);
+	const sessionState = await readRawActiveStateForHandoff(sessionPath, strict, strict);
+	if (
+		strict &&
+		sessionState &&
+		(typeof sessionState.active !== "boolean" ||
+			!Array.isArray(sessionState.active_skills) ||
+			sessionState.active_skills.some(
+				entry =>
+					!entry ||
+					typeof entry !== "object" ||
+					Array.isArray(entry) ||
+					typeof entry.skill !== "string" ||
+					typeof entry.active !== "boolean",
+			))
+	) {
+		throw new Error(`Invalid workflow snapshot activation state: ${sessionPath}`);
+	}
 	const activeSkills = await mergeVisibleEntries(cwd, sessionState, resolvedSessionId);
 	if (activeSkills.length === 0) return null;
 	const primary = activeSkills[0];
@@ -819,9 +845,9 @@ export async function readVisibleSkillActiveState(
 	}
 	const resolvedCwd = path.resolve(cwd);
 	const cacheKey = visibleActiveStateCacheKey(resolvedCwd, resolvedSessionId);
-	if (opts?.bypassCache) {
+	if (opts?.bypassCache || opts?.strict) {
 		visibleSkillActiveStateCache.delete(cacheKey);
-		return await readVisibleSkillActiveStateUncached(resolvedCwd, resolvedSessionId);
+		return await readVisibleSkillActiveStateUncached(resolvedCwd, resolvedSessionId, opts?.strict);
 	}
 	const tier = opts?.tier ?? "security";
 	const now = Date.now();

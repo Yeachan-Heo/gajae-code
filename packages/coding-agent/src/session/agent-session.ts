@@ -335,6 +335,8 @@ import {
 	relocateCoordinatorRuntimeStateForRescope,
 	UNPROVEN_TOOL_LABEL,
 } from "../gjc-runtime/session-state-sidecar";
+import { RequiredWorkflowStateReceiptSchema } from "../gjc-runtime/state-schema";
+import { readExistingStateForMutation } from "../gjc-runtime/state-writer";
 import {
 	isWorkflowRecoveryStalled,
 	projectLatestRalplanRun,
@@ -387,6 +389,7 @@ import { sanitizePromptFailure } from "../sdk/prompt-failure";
 import type { SecretObfuscator } from "../secrets/obfuscator";
 import { formatNoCredentialOnboardingError, formatNoModelOnboardingError } from "../setup/model-onboarding-guidance";
 import {
+	CANONICAL_GJC_WORKFLOW_SKILLS,
 	isCanonicalGjcWorkflowSkill,
 	isWorkflowContinuationInert,
 	readVisibleSkillActiveState,
@@ -3149,7 +3152,15 @@ export class AgentSession {
 	#mcpPromptCommands: LoadedCustomCommand[] = [];
 
 	#skillsSettings: SkillsSettings | undefined;
-	#activeSkillState: { skill: string; sessionId?: string } | undefined;
+	#activeSkillState:
+		| {
+				skill: string;
+				sessionId?: string;
+				activationModeIdentity?: string;
+				activationObservationFailed?: boolean;
+				activationFileIdentity?: string;
+		  }
+		| undefined;
 	#restoredWorkflowSkillState: { skill: string; sessionId: string } | undefined;
 
 	// Model registry for API key resolution
@@ -5107,6 +5118,79 @@ export class AgentSession {
 			isCanonicalGjcWorkflowSkill(this.#restoredWorkflowSkillState.skill)
 		) {
 			return this.#restoredWorkflowSkillState;
+		}
+		return undefined;
+	}
+
+	/** Fresh, fail-closed workflow admission check for cwd-local rescoping only. */
+	async getFreshActiveWorkflowSkillState(): Promise<{ skill: string; sessionId: string } | undefined> {
+		const sessionId = this.sessionManager.getSessionId();
+		const cwd = this.sessionManager.getCwd();
+		const visible = await readVisibleSkillActiveState(cwd, sessionId, { strict: true });
+		const modeStates = await Promise.all(
+			CANONICAL_GJC_WORKFLOW_SKILLS.map(async skill => ({
+				skill,
+				state: await readExistingStateForMutation(sessionModeStatePath(cwd, sessionId, skill)),
+			})),
+		);
+		if (this.sessionManager.getSessionId() !== sessionId || this.sessionManager.getCwd() !== cwd) {
+			throw new Error("Session identity changed while checking workflow state; retry rescoping.");
+		}
+		for (const { skill, state } of modeStates) {
+			if (state.kind === "corrupt" || (state.kind === "valid" && typeof state.value.active !== "boolean")) {
+				throw new Error(`Cannot verify workflow state for ${skill}; repair or clear it before rescoping.`);
+			}
+			if (state.kind === "valid" && state.value.active === true) return { skill, sessionId };
+		}
+		// Active entries are derived mirrors. Clear can leave a stale entry when
+		// its source revision loses the mirror's conditional removal; the explicit
+		// inactive canonical mode file remains authoritative for that skill.
+		const durableActive = visible?.active_skills?.find(entry => {
+			if (entry.active === false || entry.session_id !== sessionId || !isCanonicalGjcWorkflowSkill(entry.skill))
+				return false;
+			const state = modeStates.find(candidate => candidate.skill === entry.skill)?.state;
+			return state?.kind !== "valid" || state.value.active !== false;
+		});
+		if (durableActive) return { skill: durableActive.skill, sessionId };
+		// An absent visible entry is not evidence of a clear: only an explicit
+		// inactive mode state can supersede a matching live or restored marker.
+		for (const marker of [this.#activeSkillState, this.#restoredWorkflowSkillState]) {
+			if (
+				!marker ||
+				(marker.sessionId && marker.sessionId !== sessionId) ||
+				!isCanonicalGjcWorkflowSkill(marker.skill)
+			) {
+				continue;
+			}
+			const state = modeStates.find(entry => entry.skill === marker.skill)?.state;
+			if (state?.kind !== "valid" || state.value.active !== false) return { skill: marker.skill, sessionId };
+			if (marker === this.#activeSkillState) {
+				if (this.#activeSkillState?.activationObservationFailed) {
+					const previousFile = this.#activeSkillState.activationFileIdentity;
+					const receipt = RequiredWorkflowStateReceiptSchema.safeParse(state.value.receipt);
+					const modePath = sessionModeStatePath(cwd, sessionId, marker.skill);
+					const currentFile = fs.statSync(modePath, { bigint: true });
+					// Canonical clear atomically replaces the file. Merely restoring
+					// readability of an older inactive inode is not a later clear.
+					if (
+						!previousFile ||
+						previousFile === `${currentFile.dev}:${currentFile.ino}` ||
+						!receipt.success ||
+						receipt.data.owner !== "gjc-state-cli" ||
+						receipt.data.skill !== marker.skill ||
+						receipt.data.command !== `gjc state ${marker.skill} clear` ||
+						receipt.data.storage_path !== modePath ||
+						state.value.current_phase !== "complete"
+					) {
+						return { skill: marker.skill, sessionId };
+					}
+				} else if (
+					this.#activeSkillState?.activationModeIdentity ===
+					crypto.createHash("sha256").update(JSON.stringify(state.value)).digest("hex")
+				) {
+					return { skill: marker.skill, sessionId };
+				}
+			}
 		}
 		return undefined;
 	}
@@ -12157,6 +12241,38 @@ export class AgentSession {
 		// workflow skills can always call it.
 		if (active && isCanonicalGjcWorkflowSkill(skill)) this.#attachAskTool();
 		const sessionId = this.sessionManager.getSessionId();
+		// Capture record identity, not wall-clock ordering: a clear that already
+		// existed when this invocation began cannot clear this new live marker.
+		let activationModeIdentity: string | undefined;
+		let activationObservationFailed = false;
+		let activationFileIdentity: string | undefined;
+		if (active && isCanonicalGjcWorkflowSkill(skill)) {
+			this.#activeSkillState = { skill, sessionId, activationObservationFailed: true };
+			try {
+				const file = fs.statSync(sessionModeStatePath(this.sessionManager.getCwd(), sessionId, skill), {
+					bigint: true,
+				});
+				activationFileIdentity = `${file.dev}:${file.ino}`;
+			} catch {
+				// Without initial filesystem identity, a later readable old clear
+				// cannot prove that it superseded this invocation.
+			}
+			const observed = await readExistingStateForMutation(
+				sessionModeStatePath(this.sessionManager.getCwd(), sessionId, skill),
+			);
+			activationObservationFailed = observed.kind === "corrupt";
+			activationModeIdentity =
+				observed.kind === "valid"
+					? crypto.createHash("sha256").update(JSON.stringify(observed.value)).digest("hex")
+					: undefined;
+			this.#activeSkillState = {
+				skill,
+				sessionId,
+				activationModeIdentity,
+				activationObservationFailed,
+				activationFileIdentity,
+			};
+		}
 		// Canonical GJC workflow skills (deep-interview, ralplan, ultragoal, autoresearch)
 		// own their `.gjc/state/skill-active-state.json` row through the
 		// `gjc state handoff` and `gjc state clear` runtime verbs. The prompt
@@ -12197,7 +12313,9 @@ export class AgentSession {
 		}
 		// In-memory tracking keeps `getActiveSkillState` accurate for the chain guard.
 		this.#restoredWorkflowSkillState = undefined;
-		this.#activeSkillState = active ? { skill, sessionId } : undefined;
+		this.#activeSkillState = active
+			? { skill, sessionId, activationModeIdentity, activationObservationFailed, activationFileIdentity }
+			: undefined;
 		if (active) {
 			await this.refreshGjcSubskillTools();
 		}

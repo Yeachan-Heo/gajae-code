@@ -2541,23 +2541,32 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 										"This session has already been rescoped; only one agent-invoked move is allowed per session.",
 									);
 								}
-								if (session?.getEffectiveActiveWorkflowSkillState()) {
-									throw new Error(
-										"A workflow skill is active in this session; finish or exit it before rescoping.",
-									);
-								}
 								if (options.mcpManager && !ownsMcpManager) {
 									throw new Error(
 										"Cannot rescope a session with caller-owned MCP authority; recreate the session at the target cwd.",
 									);
 								}
+								// Start the pre-transition read, but reserve admission before awaiting
+								// it: disposal must drain an already-invoked move. Observe rejection
+								// even when transition admission itself refuses the call.
+								const workflowCheck = Promise.resolve(session?.getFreshActiveWorkflowSkillState()).then(
+									active => ({ ok: true as const, active }),
+									(error: unknown) => ({ ok: false as const, error }),
+								);
 								return sessionManager.runExclusiveCwdMoveTransition(async () => {
+									const initialWorkflow = await workflowCheck;
+									if (!initialWorkflow.ok) throw initialWorkflow.error;
+									if (initialWorkflow.active) {
+										throw new Error(
+											"A workflow skill is active in this session; finish or exit it before rescoping.",
+										);
+									}
 									if (moveConsumed) {
 										throw new Error(
 											"This session has already been rescoped; only one agent-invoked move is allowed per session.",
 										);
 									}
-									if (session?.getEffectiveActiveWorkflowSkillState()) {
+									if (await session?.getFreshActiveWorkflowSkillState()) {
 										throw new Error(
 											"A workflow skill became active while waiting for the cwd transition; finish or exit it before rescoping.",
 										);
