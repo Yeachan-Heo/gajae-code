@@ -433,10 +433,10 @@ async function runNativeCommand(
 	const descendantTracker = (async () => {
 		while (trackingDescendants) {
 			captureOwnedDescendants();
-			await new Promise<void>(resolve => {
-				descendantTimer = setTimeout(resolve, 25);
-				if (ownershipTransferred && !releasingOwnership) descendantTimer.unref();
-			});
+			const delay = Promise.withResolvers<void>();
+			descendantTimer = setTimeout(delay.resolve, 25);
+			if (ownershipTransferred && !releasingOwnership) descendantTimer.unref();
+			await delay.promise;
 		}
 		captureOwnedDescendants();
 	})();

@@ -82,14 +82,7 @@ die() {
     exit 1
 }
 
-cleanup() {
-    old_status=$?
-    if [ -n "$TMP_FILES" ]; then
-        printf '%s\n' "$TMP_FILES" | while IFS= read -r tmp_file; do
-            [ -n "$tmp_file" ] || continue
-            rm -f "$tmp_file"
-        done || true
-    fi
+release_install_lock() {
     if [ -n "$LOCK_FILE" ] && [ -f "$LOCK_FILE" ]; then
         owner=""
         nonce=""
@@ -105,6 +98,20 @@ cleanup() {
             rm -f "$LOCK_RECLAIM_CLAIM"
         fi
     fi
+    LOCK_FILE=""
+    LOCK_NONCE=""
+    LOCK_RECLAIM_CLAIM=""
+}
+
+cleanup() {
+    old_status=$?
+    if [ -n "$TMP_FILES" ]; then
+        printf '%s\n' "$TMP_FILES" | while IFS= read -r tmp_file; do
+            [ -n "$tmp_file" ] || continue
+            rm -f "$tmp_file"
+        done || true
+    fi
+    release_install_lock
     if [ -n "$SOURCE_CLONE_DIR" ] && [ -d "$SOURCE_CLONE_DIR" ]; then
         rm -rf "$SOURCE_CLONE_DIR"
     fi
@@ -811,6 +818,7 @@ install_binary() {
 
     rm -f "$BACKUP_PATH"
     BACKUP_PATH=""
+    release_install_lock
 
     echo ""
     echo "Installed gjc ${EXPECTED_VERSION} to ${DEST_PATH}"

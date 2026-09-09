@@ -861,6 +861,92 @@ sys.exit(os.waitstatus_to_exitcode(status))
 		}, 20_000,
 	);
 
+	test("releases the core lock during a long-lived optional offer and preserves a successor lock on exit", async () => {
+		const offerReady = path.join(sandbox.root, "offer-ready");
+		const offerRelease = path.join(sandbox.root, "offer-release");
+		const successorReady = path.join(sandbox.root, "successor-ready");
+		const successorRelease = path.join(sandbox.root, "successor-release");
+		const lockFile = path.join(sandbox.installDir, ".gjc-install.lock");
+		const payload = `#!/bin/sh
+if [ "$1" = "--version" ]; then echo "gjc/${VERSION}"; exit 0; fi
+if [ "$1" = "--smoke-test" ] || [ "$1" = "--supports-macos-community-app" ]; then exit 0; fi
+if [ "$1" = "--internal-macos-community-app-offer" ]; then
+  [ ! -e "$GJC_INSTALL_DIR/.gjc-install.lock" ] || exit 1
+  printf 'absent\\n' > "$GJC_TEST_OFFER_READY"
+  attempts=0
+  while [ ! -f "$GJC_TEST_OFFER_RELEASE" ]; do
+    attempts=$((attempts + 1))
+    [ "$attempts" -lt 1000 ] || exit 1
+    sleep 0.01
+  done
+  exit 0
+fi
+exit 1
+`;
+		fs.writeFileSync(path.join(sandbox.shimDir, "uname"),
+			'#!/bin/sh\nif [ "$1" = "-s" ]; then echo Darwin; else echo x86_64; fi\n', { mode: 0o755 });
+		writeCurlShim(sandbox.shimDir, {
+			assets: {
+				"gjc-darwin-x64": payload,
+				"gajae-release-binaries.sha256": `${sha256(payload)}  gjc-darwin-x64\n`,
+			},
+		});
+		// Use the installer's real lock acquisition and EXIT cleanup, but hold the
+		// successor before publishing anything. All processes are sandbox fixtures.
+		const source = fs.readFileSync(installScript, "utf8");
+		const successorScript = path.join(sandbox.root, "successor.sh");
+		fs.writeFileSync(successorScript, `${source.slice(0, source.indexOf('while [ $# -gt 0 ]; do'))}
+acquire_lock
+printf 'acquired\\n' > "$GJC_TEST_SUCCESSOR_READY"
+attempts=0
+while [ ! -f "$GJC_TEST_SUCCESSOR_RELEASE" ]; do
+    attempts=$((attempts + 1))
+    [ "$attempts" -lt 1000 ] || exit 1
+    sleep 0.01
+done
+`);
+		const waitForMarker = async (marker: string): Promise<void> => {
+			const deadline = Date.now() + 15_000;
+			while (!fs.existsSync(marker) && Date.now() < deadline) await Bun.sleep(10);
+			expect(fs.existsSync(marker)).toBe(true);
+		};
+		const first = runInstaller([], {
+			CI: "false",
+			GITHUB_ACTIONS: "false",
+			GJC_NONINTERACTIVE: "false",
+			GJC_NO_COMMUNITY_APP: "false",
+			GJC_TEST_OFFER_READY: offerReady,
+			GJC_TEST_OFFER_RELEASE: offerRelease,
+		}, { shell: "bash" });
+		let successor: Promise<{ exitCode: number; stdout: string; stderr: string }> | undefined;
+		try {
+			await waitForMarker(offerReady);
+			expect(fs.readFileSync(offerReady, "utf8")).toBe("absent\n");
+			expect(fs.existsSync(lockFile)).toBe(false);
+			successor = runInstaller([], {
+				GJC_TEST_SUCCESSOR_READY: successorReady,
+				GJC_TEST_SUCCESSOR_RELEASE: successorRelease,
+			}, { shell: "bash", script: successorScript });
+			await waitForMarker(successorReady);
+			const successorClaim = fs.readFileSync(lockFile, "utf8");
+			expect(successorClaim).toMatch(/^\d+ [^\s]+\n$/);
+			fs.writeFileSync(offerRelease, "release");
+			const result = await first;
+			expect(result.exitCode).toBe(0);
+			expect(result.stdout).toContain(`Installed gjc ${VERSION}`);
+			expect(fs.readFileSync(lockFile, "utf8")).toBe(successorClaim);
+			expect(fs.readFileSync(path.join(sandbox.installDir, "gjc"), "utf8")).toBe(payload);
+			fs.writeFileSync(successorRelease, "release");
+			expect((await successor).exitCode).toBe(0);
+			expect(fs.existsSync(lockFile)).toBe(false);
+		} finally {
+			fs.writeFileSync(offerRelease, "release");
+			fs.writeFileSync(successorRelease, "release");
+			await first;
+			await successor;
+		}
+	}, 40_000);
+
 	for (const scenario of ["supported", "unsupported", "replacement", "suppressed"] as const) {
 		test(`optional runtime ${scenario} preserves core success and executes only a verified snapshot`, async () => {
 			const marker = path.join(sandbox.root, "runtime-calls");
