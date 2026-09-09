@@ -122,6 +122,28 @@ test("user RULES.md does not follow a symlink outside the selected agent directo
 	expect(rules.find(rule => rule._source.level === "user" && rule.name === "RULES")).toBeUndefined();
 });
 
+for (const alias of ["contained", "root", "hardlink"]) {
+	test(`user RULES.md ${alias} alias preserves selected-profile authority and project rules`, async () => {
+		const physicalAgentDir = path.join(home, "selected-profile");
+		const userAgentDir = alias === "root" ? path.join(home, "profile-alias") : physicalAgentDir;
+		writeFile(path.join(physicalAgentDir, "source.md"), "Selected profile rule.\n");
+		if (alias === "root") fs.symlinkSync(physicalAgentDir, userAgentDir, "dir");
+		if (alias === "hardlink") {
+			fs.linkSync(path.join(physicalAgentDir, "source.md"), path.join(userAgentDir, "RULES.md"));
+		} else {
+			fs.symlinkSync(path.join(physicalAgentDir, "source.md"), path.join(userAgentDir, "RULES.md"), "file");
+		}
+		writeFile(path.join(project, ".gjc", "RULES.md"), "Project rule.\n");
+
+		const rules = (await loadNativeRules({ cwd: project, home, userAgentDir, repoRoot: project })).filter(
+			rule => rule.name === "RULES",
+		);
+		expect(rules.map(rule => rule.content.trim())).toEqual(
+			alias === "hardlink" ? ["Project rule."] : ["Selected profile rule.", "Project rule."],
+		);
+	});
+}
+
 test("absent RULES.md does not produce a rule", async () => {
 	// No RULES.md anywhere — only a sibling .gjc/rules/ to make sure the directory exists.
 	writeFile(path.join(home, ".gjc", "agent", "rules", "other.md"), "# Unrelated rule\n");

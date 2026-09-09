@@ -847,56 +847,23 @@ export async function scanSkillsFromDir(
 }
 
 /** Read a regular single-link file that remains contained by its configured root. */
-export async function readContainedFile(root: string, filePath: string): Promise<string | null> {
-	let rootIdentity: DirectoryIdentity;
-	try {
-		const capturedRoot = await captureDirectoryIdentity(root);
-		if (!capturedRoot) return null;
-		rootIdentity = capturedRoot;
-		await SkillDiscoveryTestHooks.afterContainedRootValidated?.(root);
-		if (!(await directoryIdentityIsCurrent(root, rootIdentity))) return null;
-	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
-		throw error;
-	}
-	const relative = path.relative(root, filePath);
-	if (relative.startsWith("..") || path.isAbsolute(relative)) return null;
-	const flags =
-		fs.constants.O_RDONLY |
-		(process.platform === "win32" ? 0 : (fs.constants.O_NOFOLLOW ?? 0) | (fs.constants.O_NONBLOCK ?? 0));
-	let handle: FileHandle;
-	try {
-		handle = await fs.promises.open(filePath, flags);
-	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
-		return null;
-	}
-	try {
-		const [opened, observed, currentPath, currentRoot] = await Promise.all([
-			handle.stat({ bigint: true }),
-			fs.promises.lstat(filePath, { bigint: true }),
-			fs.promises.realpath(filePath),
-			directoryIdentityIsCurrent(root, rootIdentity),
-		]);
-		const currentRelative = path.relative(rootIdentity.realPath, currentPath);
-		if (
-			!opened.isFile() ||
-			opened.nlink !== 1n ||
-			observed.isSymbolicLink() ||
-			!observed.isFile() ||
-			opened.dev !== observed.dev ||
-			opened.ino !== observed.ino ||
-			!currentRoot ||
-			currentRelative.startsWith("..") ||
-			path.isAbsolute(currentRelative)
-		) {
-			return null;
-		}
-		const content = await handle.readFile({ encoding: "utf8" });
-		return (await directoryIdentityIsCurrent(root, rootIdentity)) ? content : null;
-	} finally {
-		await handle.close();
-	}
+export async function readContainedFile(root: string, filePath: string, ctx?: LoadContext): Promise<string | null> {
+	// Explicit-home loads already authorized this root (including its absence).
+	// Never replace that authority with the directory present at provider-read time.
+	const rootIdentity = ctx?.userAgentIdentity !== undefined ? ctx.userAgentIdentity : await capturePathIdentity(root);
+	if (!rootIdentity) return null;
+	await SkillDiscoveryTestHooks.afterContainedRootValidated?.(root);
+	return readFile(filePath, {
+		isolatedHome: true,
+		home: ctx?.home ?? root,
+		homeIdentity: ctx?.homeIdentity,
+		userAgentDir: root,
+		userAgentIdentity: rootIdentity,
+		scope: "native",
+		containmentRoot: root,
+		containmentRootIdentity: rootIdentity,
+		bypassCache: true,
+	});
 }
 
 /**
