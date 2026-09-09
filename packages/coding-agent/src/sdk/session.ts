@@ -604,7 +604,7 @@ export interface CreateAgentSessionOptions {
 	/** Override local:// protocol options for subagent local:// sharing. Default: uses the session's own artifacts dir and session ID. */
 	localProtocolOptions?: LocalProtocolOptions;
 
-	/** Settings instance. Default: a scope-local Settings.loadForScope({ cwd, agentDir }). */
+	/** Settings instance. Default: nonpersistent Settings.loadReadonly({ cwd, agentDir }); runtime overrides remain available. */
 	settings?: Settings;
 	/** Internal/advanced runtime-service injection. Omitted services use session defaults. */
 	runtimeServices?: OptionalRuntimeServicesOverrides;
@@ -1492,7 +1492,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			authStorage.setSessionCredentialSelector(scopeId, provider, selector, authStorageOwner);
 		};
 		const ownsScopedSettings = options.settings === undefined;
-		const settings = options.settings ?? (await logger.time("settings", Settings.loadForScope, { cwd, agentDir }));
+		// SDK-owned settings consume configuration without owning migrations or
+		// durable writes. Interactive callers retain their injected settings.
+		const settings = options.settings ?? (await logger.time("settings", Settings.loadReadonly, { cwd, agentDir }));
 		if (ownsModelRegistry) modelRegistry.setScopedSettings(settings);
 		const autoroutingInactive =
 			settings.get("task.autorouting.enabled") === true && !settings.getEffectiveAutorouting().active;

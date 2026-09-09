@@ -123,6 +123,133 @@ describe("createAgentSession deferred model pattern resolution", () => {
 		};
 	}
 
+	for (const activeProfile of ["global-fixture", "session-fixture", undefined]) {
+		test(`session model control preserves global config with profile ${activeProfile ?? "absent"}`, async () => {
+			let requests = 0;
+			using _fetch = hookFetch(() => {
+				requests += 1;
+				throw new Error("Synthetic model control must remain offline");
+			});
+			const configPath = path.join(tempDir, "config.yml");
+			await Bun.write(
+				configPath,
+				JSON.stringify({
+					modelProfile: activeProfile ? { default: "global-fixture" } : {},
+					modelRoles: {
+						default: "runtime-provider/runtime-global-b",
+						critic: "runtime-provider/runtime-policy-c",
+					},
+					task: { agentModelOverrides: { critic: "runtime-provider/runtime-policy-c" } },
+				}),
+			);
+			await modelRegistry.saveCustomModelProfile("global-fixture", {
+				required_providers: ["runtime-provider"],
+				model_mapping: { default: "runtime-provider/runtime-model", critic: "runtime-provider/runtime-model" },
+			});
+			await modelRegistry.saveCustomModelProfile("session-fixture", {
+				required_providers: ["runtime-provider"],
+				model_mapping: {
+					default: "runtime-provider/runtime-reasoning-model",
+					critic: "runtime-provider/runtime-reasoning-model",
+				},
+			});
+			// Deliberately inject writable settings: the model operation itself must
+			// be session-only, not merely rely on the SDK loader's write protection.
+			const settings = await Settings.loadForScope({ cwd: tempDir, agentDir: tempDir });
+			const originalBytes = await Bun.file(configPath).text();
+			const originalRoles = structuredClone(settings.getGlobal("modelRoles"));
+			const originalAgents = structuredClone(settings.getGlobal("task.agentModelOverrides"));
+			const manager = SessionManager.create(tempDir, path.join(tempDir, "sessions"));
+			const { session } = await createAgentSession({ ...buildSessionOptions(undefined, manager), settings });
+			let sessionFile: string | undefined;
+			try {
+				if (activeProfile) {
+					await session.setDefaultModelProfileForControl(activeProfile);
+					const profileModel = activeProfile === "global-fixture" ? "runtime-model" : "runtime-reasoning-model";
+					expect(session.model?.id).toBe(profileModel);
+					expect(settings.get("task.agentModelOverrides").critic).toBe(`runtime-provider/${profileModel}`);
+					expect(session.getConfiguredModelChainState("default")?.identity).toBe(activeProfile);
+					expect(session.getSessionDefaultModelSelector()).toBe(`runtime-provider/${profileModel}`);
+					expect(settings.getGlobal("modelProfile.default")).toBe("global-fixture");
+					expect(settings.getGlobal("modelRoles")).toEqual(originalRoles);
+					expect(settings.getGlobal("task.agentModelOverrides")).toEqual(originalAgents);
+					await settings.flushOrThrow();
+					expect(await Bun.file(configPath).text()).toBe(originalBytes);
+				}
+				// Seed a prior concrete chain too: model.set must replace it, not leave
+				// the earlier startup choice outranking the new scalar on resume.
+				if (!activeProfile)
+					session.setConfiguredModelChain("default", ["runtime-provider/runtime-global-b"], "startup-override");
+				const selected = modelRegistry.find("runtime-provider", "runtime-policy-c");
+				if (!selected) throw new Error("Expected synthetic model");
+				expect(await session.setModelTemporaryForControl(selected, session.sessionId, Effort.High)).toBe(true);
+				expect(session.model?.id).toBe("runtime-policy-c");
+				expect(session.thinkingLevel).toBe(Effort.High);
+				expect(session.getActiveModelProfile()).toBeUndefined();
+				expect(session.getSessionDefaultModelSelector()).toBe("runtime-provider/runtime-policy-c");
+				expect(session.getConfiguredModelChain("default")).toEqual(["runtime-provider/runtime-policy-c"]);
+				expect(settings.get("task.agentModelOverrides").critic).toBe("runtime-provider/runtime-policy-c");
+				expect(settings.getGlobal("modelProfile.default")).toBe(activeProfile ? "global-fixture" : undefined);
+				expect(settings.getGlobal("modelRoles")).toEqual(originalRoles);
+				expect(settings.getGlobal("task.agentModelOverrides")).toEqual(originalAgents);
+				await manager.ensureOnDisk();
+				await manager.flush();
+				sessionFile = manager.getSessionFile();
+				await Bun.sleep(150);
+				await settings.flushOrThrow();
+				expect(await Bun.file(configPath).text()).toBe(originalBytes);
+			} finally {
+				await session.dispose();
+				await settings.close();
+			}
+			expect(await Bun.file(configPath).text()).toBe(originalBytes);
+			if (!sessionFile) throw new Error("Expected synthetic journal");
+			const resumedManager = await SessionManager.open(sessionFile, tempDir);
+			const resumed = await createAgentSession(buildSessionOptions(undefined, resumedManager));
+			try {
+				expect(resumed.session.model?.id).toBe("runtime-policy-c");
+				expect(resumed.session.thinkingLevel).toBe(Effort.High);
+				expect(resumed.session.getActiveModelProfile()).toBeUndefined();
+			} finally {
+				await resumed.session.dispose();
+			}
+			expect(await Bun.file(configPath).text()).toBe(originalBytes);
+			expect(requests).toBe(0);
+		});
+	}
+
+	test("SDK-owned settings keep pending migrations off disk while allowing runtime overlays", async () => {
+		let requests = 0;
+		using _fetch = hookFetch(() => {
+			requests += 1;
+			throw new Error("Synthetic settings initialization must remain offline");
+		});
+		const configPath = path.join(tempDir, "config.yml");
+		const originalBytes =
+			"# Pending schema initialization must remain user-owned\nmodelRoles:\n  default: runtime-provider/runtime-global-b\n";
+		const legacyPath = path.join(tempDir, "settings.json");
+		const legacyBytes = '{"theme":"legacy-fixture"}\n';
+		await Bun.write(configPath, originalBytes);
+		await Bun.write(legacyPath, legacyBytes);
+		const { session } = await createAgentSession(buildSessionOptions());
+		try {
+			expect(session.model?.id).toBe("runtime-global-b");
+			expect(session.settings.canPersistDurableConfig()).toBe(false);
+			session.settings.override("task.agentModelOverrides", { critic: "runtime-provider/runtime-policy-c" });
+			expect(session.settings.get("task.agentModelOverrides").critic).toBe("runtime-provider/runtime-policy-c");
+			expect(session.settings.getGlobal("task.agentModelOverrides")).toBeUndefined();
+			await Bun.sleep(150);
+			await session.settings.flushOrThrow();
+			expect(await Bun.file(configPath).text()).toBe(originalBytes);
+			expect(await Bun.file(legacyPath).text()).toBe(legacyBytes);
+		} finally {
+			await session.dispose();
+		}
+		expect(await Bun.file(configPath).text()).toBe(originalBytes);
+		expect(await Bun.file(legacyPath).text()).toBe(legacyBytes);
+		expect(requests).toBe(0);
+	});
+
 	interface OwnedDiscoveryFixture {
 		root: string;
 		agentDir: string;

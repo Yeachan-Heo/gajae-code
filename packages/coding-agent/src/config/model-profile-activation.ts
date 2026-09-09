@@ -15,6 +15,36 @@ import {
 
 export { resolveModelProfileName } from "./model-profile-contract";
 
+/**
+ * Reinstall saved-profile routing on resume, without selecting its current
+ * default or probing its credentials. Selectors remain role-scoped intent;
+ * normal role resolution handles them when that role is actually invoked.
+ * This is not activation: model, thinking, canonical affinity and journal
+ * ownership remain exactly as restored by session construction.
+ */
+export function restoreModelProfileRuntimeRoles(session: AgentSession, profileName: string): void {
+	const profiles = session.modelRegistry.getModelProfiles();
+	const canonical = validateModelProfileName(profileName, profiles, session.modelRegistry.getError());
+	const profile = profiles.get(canonical)!;
+	const bindings = resolveProfileBindings(profile);
+	const installed = session.getProfileInstalledOverrideKeys();
+	const modelRoles = Object.fromEntries(
+		Object.entries(session.settings.get("modelRoles")).filter(([key]) => !installed.modelRoles.includes(key)),
+	);
+	const agentOverrides = Object.fromEntries(
+		Object.entries(session.settings.get("task.agentModelOverrides")).filter(
+			([key]) => !installed.agentModelOverrides.includes(key),
+		),
+	);
+	session.settings.override("modelRoles", { ...modelRoles, ...bindings.modelRoles });
+	session.settings.override("task.agentModelOverrides", { ...agentOverrides, ...bindings.agentModelOverrides });
+	session.noteProfileInstalledOverrides(
+		Object.keys(bindings.modelRoles),
+		Object.keys(bindings.agentModelOverrides),
+		session.model,
+	);
+}
+
 import {
 	GJC_MODEL_ASSIGNMENT_TARGETS,
 	type GjcModelAssignmentTargetId,

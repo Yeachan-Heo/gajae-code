@@ -15963,10 +15963,13 @@ export class AgentSession {
 	 * Only override keys a profile activation actually installed are removed:
 	 * configured `modelBindings` (also installed into these two override slots
 	 * once at startup) are not profile-owned and must survive the transition.
+	 * Concrete session-default selections disable preservation even for the
+	 * global default profile, without changing that profile's durable settings.
 	 */
-	#resetSessionScopedModelProfileState(): void {
+	#resetSessionScopedModelProfileState(preserveDefaultProfile = true): void {
 		const persistedProfile = this.settings.get("modelProfile.default");
-		if (persistedProfile !== undefined && persistedProfile === this.getActiveModelProfile()) return;
+		if (preserveDefaultProfile && persistedProfile !== undefined && persistedProfile === this.getActiveModelProfile())
+			return;
 		const hadInstalledKeys =
 			this.#activeProfileInstalledRoles.size > 0 || this.#activeProfileInstalledAgentOverrides.size > 0;
 		if (hadInstalledKeys) {
@@ -16122,11 +16125,9 @@ export class AgentSession {
 	}
 
 	/**
-	 * Clear the active-profile marker after a successful concrete
-	 * materialization that persists as the session default with a
-	 * user-selection or startup-override cause. Internal temporary/fallback/
-	 * restore/rollback switches and the activation transaction itself (cause
-	 * `profile-activation`) never clear the marker.
+	 * Replace the active profile after an explicit durable default selection.
+	 * Only global-default controls call this helper; session-default changes
+	 * reset runtime profile state without materializing or unsetting globals.
 	 */
 	#clearActiveModelProfileForConcreteDefault(cause: ModelChangeCause | undefined): void {
 		if (cause !== "user-selection" && cause !== "startup-override") return;
@@ -16377,7 +16378,26 @@ export class AgentSession {
 			// Apply explicit thinking level if given; otherwise prefer the model's
 			// configured defaultLevel; otherwise re-clamp the current level.
 			this.setThinkingLevel(thinkingLevel ?? model.thinking?.defaultLevel ?? this.thinkingLevel);
-			if (options?.persistAsSessionDefault === true) this.#clearActiveModelProfileForConcreteDefault(options?.cause);
+			// Session resume ownership never authorizes replacing the user's global
+			// profile or materializing its assignments into durable settings.
+			if (
+				options?.persistAsSessionDefault === true &&
+				(options.cause === "user-selection" || options.cause === "startup-override")
+			) {
+				this.#resetSessionScopedModelProfileState(false);
+				this.setConfiguredModelChain("default", [`${model.provider}/${model.id}`], options.cause);
+				// Construction can already have installed the startup effort in
+				// memory. setThinkingLevel then sees no live change, but the saved
+				// branch may still carry the predecessor's effort. Resume restores
+				// that journal value before consulting model defaults or suffixes.
+				const savedThinking = this.sessionManager
+					.getBranch()
+					.toReversed()
+					.find(entry => entry.type === "thinking_level_change");
+				if (!savedThinking || savedThinking.thinkingLevel !== this.thinkingLevel) {
+					this.sessionManager.appendThinkingLevelChange(this.thinkingLevel);
+				}
+			}
 			await this.#syncEditToolModeAfterModelChange(previousEditMode);
 		} catch (error) {
 			if (ownsScope) await this.restoreTemporaryProviderSessionScope(scope);

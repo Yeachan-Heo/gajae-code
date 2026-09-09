@@ -5,6 +5,7 @@ import * as path from "node:path";
 import { logger } from "@gajae-code/utils";
 import { Args, CliParseError, Command, Flags, renderCommandHelp } from "@gajae-code/utils/cli";
 import type { Args as ParsedArgs } from "../cli/args";
+import { restoreModelProfileRuntimeRoles } from "../config/model-profile-activation";
 import { parseModelString } from "../config/model-resolver";
 import { Settings } from "../config/settings";
 import { applyStartupModelProfiles, createSessionManager } from "../main";
@@ -39,12 +40,40 @@ import {
 	SdkStartupRollbackTracker,
 } from "../sdk/startup-capability";
 import { runSdkServe } from "../sdk/transport/serve-cli";
-import { isSessionDisposalIncompleteError } from "../session/agent-session";
+import { type AgentSession, isSessionDisposalIncompleteError } from "../session/agent-session";
 import {
 	type CapturedSessionTranscriptSnapshot,
 	type ResumeSessionIdentity,
 	SessionManager,
 } from "../session/session-manager";
+
+/** The model/profile startup policy used by the lifecycle host after construction. */
+export async function initializeLifecycleModelSelection(
+	session: AgentSession,
+	request: Pick<SessionLifecycleLaunchRequest, "operation" | "modelId" | "modelPreset">,
+	parsed: Pick<ParsedArgs, "default" | "model" | "mpreset" | "thinking">,
+	applyModelProfiles: typeof applyStartupModelProfiles = applyStartupModelProfiles,
+): Promise<void> {
+	const restoreSessionSelection =
+		request.operation !== "session.create" &&
+		!request.modelId &&
+		!request.modelPreset &&
+		session.settings.get("session.resumeModelBehavior") !== "useCurrentDefault";
+	if (restoreSessionSelection && session.model && session.getSessionDefaultModelSelector()) {
+		const profile = session.getActiveModelProfile();
+		if (profile) restoreModelProfileRuntimeRoles(session, profile);
+		return;
+	}
+	await applyModelProfiles({
+		session,
+		settings: session.settings,
+		modelRegistry: session.modelRegistry,
+		parsedArgs: parsed,
+		startupThinkingLevel: request.modelId ? parseModelString(request.modelId)?.thinkingLevel : undefined,
+		preferCachedModels: true,
+		preferCachedDefaultProfile: true,
+	});
+}
 
 export async function lifecycleArgs(
 	request: SessionLifecycleLaunchRequest,
@@ -325,7 +354,7 @@ export async function openLifecycleSessionManager(
 	agentDir: string,
 ): Promise<{ parsed: ParsedArgs; sessionManager: SessionManager | undefined }> {
 	const parsed = await lifecycleArgs(request, cwd, agentDir);
-	const lifecycleSettings = await Settings.loadForScope({ cwd, agentDir });
+	const lifecycleSettings = await Settings.loadReadonly({ cwd, agentDir });
 	let sessionManager: SessionManager | undefined;
 	let result: { parsed: ParsedArgs; sessionManager: SessionManager | undefined } | undefined;
 	let operationError: unknown;
@@ -717,19 +746,10 @@ export async function runSessionHost(
 	};
 
 	try {
-		const startupThinkingLevel = request.modelId ? parseModelString(request.modelId)?.thinkingLevel : undefined;
 		const modelProfileStartup =
 			process.env.GJC_SDK_TEST_HANG_MODEL_PROFILE === cwd
 				? new Promise<void>(() => {})
-				: applyModelProfiles({
-						session,
-						settings: session.settings,
-						modelRegistry: session.modelRegistry,
-						parsedArgs: parsed,
-						startupThinkingLevel,
-						preferCachedModels: true,
-						preferCachedDefaultProfile: true,
-					});
+				: initializeLifecycleModelSelection(session, request, parsed, applyModelProfiles);
 		await beforeCutoff(modelProfileStartup);
 		throwIfCutoff();
 		await beforeCutoff(
@@ -1087,13 +1107,18 @@ export default class Sdk extends Command {
 			return;
 		}
 		const agentDir = internal.agentDir;
+		const brokerSettings = await Settings.loadReadonly({ cwd: process.cwd(), agentDir });
+		let masterOrphanGraceMs: number;
+		try {
+			masterOrphanGraceMs = brokerSettings.get("sdk.masterOrphanGraceMs");
+		} finally {
+			await brokerSettings.close();
+		}
 		const broker = new Broker({
 			agentDir,
-			masterOrphanGraceMs: (await Settings.loadForScope({ cwd: process.cwd(), agentDir })).get(
-				"sdk.masterOrphanGraceMs",
-			),
+			masterOrphanGraceMs,
 			resolveDirectoryMigration: async cwd => {
-				const settings = await Settings.loadForScope({ cwd, agentDir });
+				const settings = await Settings.loadReadonly({ cwd, agentDir });
 				try {
 					const policy = settings.get("session.directoryMigration");
 					return policy === "disabled" ? "disabled" : "copy-retain";
