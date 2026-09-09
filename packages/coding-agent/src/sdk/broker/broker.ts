@@ -810,7 +810,7 @@ function matchesLegacyLifecycleReplayAuthority(
 		return (
 			endpointFileId === refreshed.endpointFileId && Math.abs(endpointMtimeMs - refreshed.endpointMtimeMs) <= 0.001
 		);
-	return endpointMtimeMs === refreshed.endpointMtimeMs;
+	return refreshed.endpointFileId === undefined && endpointMtimeMs === refreshed.endpointMtimeMs;
 }
 
 const BROKER_SESSION_CONTROL_FIELDS = new Set(["sessionId", "operation", "input", "confirm"]);

@@ -3848,7 +3848,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			canonicalizePath: services.canonicalizePath,
 			platform,
 		});
-		if (session.broker.endpoint_file_id !== undefined) await migrateLegacySessionEndpointAuthority(session);
+		await migrateLegacySessionEndpointAuthority(session);
 	}
 
 	async function authorizedCanonicalSessionIds(
@@ -5780,7 +5780,8 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				authority.endpointIncarnation,
 				authority.endpointFileId,
 			);
-			await writeJsonFile(sessionFile(session.session_id), sessionFromCreationSnapshot(reconciled));
+			if (canonicalJson(reconciled) !== canonicalJson(session))
+				await writeJsonFile(sessionFile(session.session_id), sessionFromCreationSnapshot(reconciled));
 			return reconciled;
 		}
 		if (authority.endpointFileId === undefined) {

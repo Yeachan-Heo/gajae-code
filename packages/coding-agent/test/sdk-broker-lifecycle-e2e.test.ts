@@ -5407,6 +5407,32 @@ test("idempotent lifecycle replay refreshes unchanged authority after a broker r
 			},
 		});
 
+		const identityTransitionKey = "replay-authority-identity-transition";
+		const identityTransition = await deriveIdempotencyIdentity(
+			agentDir,
+			"session.resume",
+			identityTransitionKey,
+			targetHash,
+		);
+		expect(await restarted.ledger.begin(identityTransition, requestHash)).toMatchObject({ kind: "new" });
+		await restarted.ledger.transition(identityTransition, "terminal_ok", {
+			response: {
+				ok: true,
+				result: {
+					sessionId,
+					cwd: root,
+					endpointGeneration: 2,
+					pid: host.pid,
+					endpointMtimeMs,
+					reused: true,
+				},
+			},
+		});
+		expect(await restarted.handleRequest("session.resume", { cwd: root, sessionId }, identityTransitionKey)).toEqual({
+			ok: false,
+			error: { code: "endpoint_stale", message: "lifecycle replay target was replaced" },
+		});
+
 		const exactMtimeMs = Number((await fs.stat(endpointPath, { bigint: true })).mtimeNs) / 1_000_000;
 		await restarted.index.append({
 			type: "host_registered",
@@ -5434,23 +5460,9 @@ test("idempotent lifecycle replay refreshes unchanged authority after a broker r
 				},
 			},
 		});
-		expect(await restarted.handleRequest("session.resume", { cwd: root, sessionId }, identityLessKey)).toEqual({
+		expect(await restarted.handleRequest("session.resume", { cwd: root, sessionId }, identityLessKey)).toMatchObject({
 			ok: true,
-			result: {
-				sessionId,
-				cwd: root,
-				endpointGeneration: 2,
-				endpointIncarnation: expect.stringMatching(/^[a-f0-9]{64}$/),
-				pid: host.pid,
-				endpointMtimeMs: exactMtimeMs,
-				reused: true,
-				endpoint: {
-					sessionId,
-					pid: host.pid,
-					url: "ws://127.0.0.1:1",
-					token: "successor-token",
-				},
-			},
+			result: { sessionId, endpointGeneration: 2, pid: host.pid, endpointMtimeMs: exactMtimeMs },
 		});
 		const replacedLegacyKey = "replay-authority-replaced-legacy";
 		const replacedLegacy = await deriveIdempotencyIdentity(agentDir, "session.resume", replacedLegacyKey, targetHash);

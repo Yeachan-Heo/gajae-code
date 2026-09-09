@@ -1263,13 +1263,14 @@ export async function withNamespaceRegistry<T>(
 			const registry = await readJson<NamespaceRegistryV1>(paths.registry);
 			if (registry?.schema_version !== 1 || registry.namespace_id !== path.basename(paths.root))
 				throw new Error("state_corrupt");
+			const beforeDigest = digest(JSON.stringify(registry));
 			registry.roster ??= {};
 			registry.scheduler_revision ??= 0;
 			registry.scheduler_cursor ??= "";
 			registry.retained_sessions ??= {};
 			registry.delivery_discovery_cursor ??= "@session:";
 			const result = await operation(registry);
-			await writeAtomic(paths.registry, registry);
+			if (digest(JSON.stringify(registry)) !== beforeDigest) await writeAtomic(paths.registry, registry);
 			return result;
 		},
 		lockOptions(options.signal),
