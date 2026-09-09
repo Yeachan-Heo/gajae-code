@@ -461,6 +461,9 @@ async function loadStickyRulesFile(
 	filePath: string,
 	level: "user" | "project",
 ): Promise<Rule | null> {
+	// RULES.md is executable configuration: never follow a symlink or accept a
+	// hard-linked file before the path is canonicalized for the selected scope.
+	if (!(await isSingleLinkRegularFileAt(filePath))) return null;
 	const scope = readScopeForLevel(level);
 	const canonicalPath = await canonicalBuiltinPath(ctx, filePath, scope);
 	if (!canonicalPath) return null;
