@@ -2439,9 +2439,9 @@ export class AuthStorage {
 		provider: string,
 		rowId: number,
 	): { type: AuthCredential["type"]; index: number } | undefined {
-		const index = this.#getStoredCredentials(provider).findIndex(entry => entry.id === rowId);
-		if (index === -1) return undefined;
-		const credential = this.#getStoredCredentials(provider)[index]?.credential;
+		const entries = this.#getStoredCredentials(provider);
+		const index = entries.findIndex(entry => entry.id === rowId);
+		const credential = entries[index]?.credential;
 		return credential ? { type: credential.type, index } : undefined;
 	}
 
