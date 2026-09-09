@@ -1,4 +1,4 @@
-import { afterEach, beforeAll, describe, expect, it } from "bun:test";
+import { afterEach, beforeAll, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -727,6 +727,116 @@ describe("issue #5387 custom provider auto-discovery", () => {
 		]);
 	});
 
+	for (const force of [false, true]) {
+		for (const revision of ["escape", "go-back"] as const) {
+			it(`aborts discovery-only ${force ? "force-confirm" : "confirm"} submission on ${revision} before editing`, async () => {
+				const modelsPath = await tempModelsPath();
+				const providerId = "revision-provider";
+				const authStorage = await AuthStorage.create(path.join(tempRoot!, "auth.db"));
+				const probeStarted = Promise.withResolvers<AbortSignal | undefined>();
+				const probeCompletion = Promise.withResolvers<void>();
+				let submission = Promise.resolve();
+				const success = vi.fn();
+				const errors: string[] = [];
+				const setCredential = vi.spyOn(authStorage, "set");
+				try {
+					if (force) {
+						await addApiCompatibleProvider({
+							compatibility: "openai",
+							providerId,
+							baseUrl: "https://old.example.com/v1",
+							apiKey: "sk-old-key",
+							models: ["old-model"],
+							modelsPath,
+							authStorage,
+						});
+					}
+					const originalConfig = force ? await Bun.file(modelsPath).text() : undefined;
+					setCredential.mockClear();
+					const wizard = new CustomProviderWizardComponent(
+						input => {
+							expect(input.discover).toBe(true);
+							expect(input.models).toEqual([]);
+							const generation = wizard.currentSubmitGeneration();
+							submission = addApiCompatibleProvider({
+								...input,
+								modelsPath,
+								authStorage,
+								probeDiscovery: async request => {
+									probeStarted.resolve(request.signal);
+									// Ignore abort to exercise the real precommit cancellation fence.
+									await probeCompletion.promise;
+									return { models: ["late-model"], endpoint: "https://api.example.com/v1/models" };
+								},
+							}).then(
+								result => {
+									if (wizard.isSubmitCurrent(generation)) success(result);
+								},
+								error => {
+									errors.push(String(error));
+									if (wizard.isSubmitCurrent(generation)) wizard.setSubmitError(String(error));
+								},
+							);
+							return submission;
+						},
+						() => undefined,
+						() => undefined,
+						{ discoverModels: async () => ({ models: ["preview-model"] }) },
+					);
+					wizard.handleInput("\n");
+					typeText(wizard, providerId);
+					wizard.handleInput("\n");
+					typeText(wizard, "https://api.example.com/v1");
+					wizard.handleInput("\n");
+					wizard.handleInput("\u001b[B");
+					wizard.handleInput("\n");
+					typeText(wizard, "sk-new-key");
+					wizard.handleInput("\n");
+					await setImmediate();
+					wizard.handleInput("\n");
+					wizard.handleInput("\n");
+					if (force) {
+						await submission;
+						expect(errors.pop()).toContain("already exists");
+						expect(wizard.render(120).join("\n")).toContain("replace it?");
+						wizard.handleInput("\u001b[A");
+						wizard.handleInput("\n");
+					}
+					const signal = await probeStarted.promise;
+					const generation = wizard.currentSubmitGeneration();
+					expect(signal?.aborted).toBe(false);
+					if (revision === "escape") wizard.handleInput("\u001b");
+					else {
+						wizard.handleInput("\u001b[B");
+						wizard.handleInput("\n");
+					}
+					expect(wizard.render(120).join("\n")).toContain("Enter model ids, comma-separated:");
+					expect(signal?.aborted).toBe(true);
+					expect(wizard.isSubmitCurrent(generation)).toBe(false);
+					probeCompletion.resolve();
+					await submission;
+					expect(errors).toHaveLength(1);
+					expect(errors[0]).toContain("was cancelled; setup did not write any config");
+					expect(success).not.toHaveBeenCalled();
+					expect(setCredential).not.toHaveBeenCalled();
+					if (force) {
+						if (originalConfig === undefined)
+							throw new Error("Force fixture requires an existing provider config");
+						expect(await Bun.file(modelsPath).text()).toBe(originalConfig);
+						expect(await authStorage.peekApiKey(providerId)).toBe("sk-old-key");
+					} else {
+						expect(await Bun.file(modelsPath).exists()).toBe(false);
+						expect(authStorage.has(providerId)).toBe(false);
+					}
+				} finally {
+					probeCompletion.resolve();
+					await submission;
+					setCredential.mockRestore();
+					authStorage.close();
+				}
+			});
+		}
+	}
 	it("aborts the submit-time probe when inputs are revised mid-submit", async () => {
 		const deferred = Promise.withResolvers<void>();
 		let submitProbeSignal: AbortSignal | null | undefined;
