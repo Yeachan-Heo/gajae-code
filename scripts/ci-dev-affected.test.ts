@@ -94,57 +94,51 @@ describe("dev-ci canonical-plan workflow contract", () => {
 		expect(guard).toContain("rebase onto current ${GITHUB_BASE_REF}");
 	});
 
-	test("a body-only edited run cannot cancel the validation run for the same ref", async () => {
+	test("a metadata-only edited run cannot cancel the validation run for the same ref", async () => {
 		const workflow = await Bun.file(path.join(import.meta.dir, "..", ".github", "workflows", "dev-ci.yml")).text();
 		const concurrency = workflow.slice(workflow.indexOf("\nconcurrency:"), workflow.indexOf("\njobs:"));
 		// Job-level `if:` runs far too late to matter here: a run that joins the
 		// shared group cancels the in-progress validation before any condition is
 		// evaluated, which would leave the SHA with no completed validation while
-		// skipped required jobs still report success. Body-only edits therefore
+		// skipped required jobs still report success. Metadata-only edits therefore
 		// need their own group AND must not cancel.
-		expect(concurrency).toContain("body-edit");
+		expect(concurrency).toContain("metadata-edit");
 		expect(concurrency).toContain("github.event.changes.body != null");
 		const cancel = concurrency.slice(concurrency.indexOf("cancel-in-progress:"));
 		expect(cancel).toContain("github.event.changes.body != null");
-		expect(cancel).toContain("github.event.changes.title == null");
+		expect(cancel).toContain("github.event.changes.title != null");
 		expect(cancel).toContain("github.event.changes.base == null");
 	});
 
-	test("title and base-change edits keep every validation root enabled", async () => {
+	test("base-change edits keep every validation root enabled even with metadata", async () => {
 		const workflow = await Bun.file(path.join(import.meta.dir, "..", ".github", "workflows", "dev-ci.yml")).text();
-		// `edited` also fires for title and base changes. Retargeting a PR to `dev`
-		// can be the first validation event for that head/base pair, so the guards
-		// must key on a body-only payload rather than on the action alone.
+		// Retargeting a PR can be the first validation for its head/base pair.
+		// Metadata and base changes both require real exact-head validation.
 		expect(workflow).not.toContain("github.event.action != 'edited'");
-		for (const root of ["affected-plan", "affected-evidence-producer", "affected", "gjc-state-gates", "gjc-state-gates-matrix"]) {
+		for (const root of ["affected-plan", "affected-evidence-producer", "affected", "gjc-state-gates", "gjc-state-gates-relevance"]) {
 			const start = workflow.indexOf(`\n  ${root}:\n`);
 			expect(start).toBeGreaterThan(0);
 			const guard = workflow.slice(start, workflow.indexOf("\n    runs-on:", start));
-			expect(guard).toContain("github.event.changes.title == null");
-			expect(guard).toContain("github.event.changes.base == null");
+			expect(guard).not.toContain("github.event.changes");
 		}
 	});
 
-	test("skips every code-validation job when a pull request body is edited", async () => {
+	test("validates code-validation roots for metadata edits while retaining the contract", async () => {
 		const workflow = await Bun.file(path.join(import.meta.dir, "..", ".github", "workflows", "dev-ci.yml")).text();
 		// `edited` must stay in the trigger list: the verdict line lives in the PR
 		// body, so `pr-contract-bootstrap` has to re-check it on every body change.
 		expect(workflow).toContain("types: [opened, edited, synchronize, reopened, ready_for_review]");
 		expect(workflow).toContain("  pr-contract-bootstrap:\n    name: PR contract bootstrap\n    if: ${{ github.event_name == 'pull_request' }}");
 
-		// Every job that validates code must opt out of that event. A body edit
-		// changes no tree, so running them re-queues an identical matrix and
-		// cancel-in-progress kills the run that was already doing the work.
-		// Roots need an explicit guard; the rest inherit it by depending on a
-		// skipped `affected-plan` (their conditions read its outputs) or on a
-		// skipped `affected` result.
-		for (const root of ["affected-plan", "affected-evidence-producer", "affected", "gjc-state-gates", "gjc-state-gates-matrix"]) {
+		// Metadata edits need their own evidence; only exact-head integration
+		// dispatches opt out of these roots. Concurrency isolation is tested in
+		// dev-ci-guard-topology.test.ts against the actual job conditions.
+		for (const root of ["affected-plan", "affected-evidence-producer", "affected", "gjc-state-gates", "gjc-state-gates-relevance"]) {
 			const start = workflow.indexOf(`\n  ${root}:\n`);
 			expect(start).toBeGreaterThan(0);
 			const guard = workflow.slice(start, workflow.indexOf("\n    runs-on:", start));
-			expect(guard).toContain("github.event.changes.body != null");
-			expect(guard).toContain("github.event.changes.title == null");
-			expect(guard).toContain("github.event.changes.base == null");
+			expect(guard).not.toContain("github.event.changes");
+			expect(guard).toContain("github.event_name == 'workflow_dispatch'");
 		}
 	});
 
@@ -153,7 +147,7 @@ describe("dev-ci canonical-plan workflow contract", () => {
 		expect(workflow).toContain("affected-evidence-producer:");
 		expect(workflow).toContain("name: Affected path validation / evidence producer");
 		expect(workflow).toContain(
-			"  affected:\n    name: Affected path validation\n    if: ${{ always() && !(github.event_name == 'workflow_dispatch' && inputs.head_sha != '') && !(github.event_name == 'pull_request' && github.event.action == 'edited' && github.event.changes.body != null && github.event.changes.title == null && github.event.changes.base == null) }}",
+			"  affected:\n    name: Affected path validation\n    if: ${{ always() && !(github.event_name == 'workflow_dispatch' && inputs.head_sha != '') }}",
 		);
 		expect(workflow).toContain("needs: [affected-evidence-producer, affected-plan, affected-native, affected-shards, telegram-daemon-generation, windows-dev-doctor, windows-native-build-toolchain, windows-telegram-daemon-safety, affected-darwin-arm64-tab-worker-smoke]");
 		expect(workflow).toContain("artifact_id: ${{ steps.upload-evidence.outputs.artifact-id }}");
@@ -188,8 +182,9 @@ describe("dev-ci canonical-plan workflow contract", () => {
 		expect(workflow).not.toContain("continue-on-error");
 		const protectedJob = workflow.slice(workflow.indexOf("  affected:\n"), workflow.indexOf("\n  gjc-state-gates-matrix:"));
 		expect(protectedJob).toContain(
-			"if: ${{ always() && !(github.event_name == 'workflow_dispatch' && inputs.head_sha != '') && !(github.event_name == 'pull_request' && github.event.action == 'edited' && github.event.changes.body != null && github.event.changes.title == null && github.event.changes.base == null) }}",
+			"if: ${{ always() && !(github.event_name == 'workflow_dispatch' && inputs.head_sha != '') }}",
 		);
+		expect(protectedJob).not.toContain("github.event.changes");
 		expect(protectedJob).toContain("name: Validate finalized affected evidence");
 		expect(protectedJob).not.toContain("continue-on-error");
 		const validationStart = protectedJob.indexOf("name: Validate finalized affected evidence");
@@ -670,6 +665,7 @@ describe("describeTasks matrix emission", () => {
 				"scripts/dev-ci-guard-topology.test.ts",
 				"scripts/ci-risk-canary-manifest.test.ts",
 				"scripts/ci-virtual-integration.test.ts",
+				"scripts/ci-gjc-state-gates.test.ts",
 			]);
 		}
 		const riskTasks = planTasks(["packages/coding-agent/src/session/session-manager.ts"], packages);
@@ -1559,6 +1555,7 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 			"scripts/dev-ci-guard-topology.test.ts",
 			"scripts/ci-risk-canary-manifest.test.ts",
 			"scripts/ci-virtual-integration.test.ts",
+			"scripts/ci-gjc-state-gates.test.ts",
 		]);
 	});
 
