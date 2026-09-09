@@ -7,7 +7,7 @@ import {
 	MODELS_LIST_REQUEST_TIMEOUT_MS,
 	readBoundedModelsJson,
 } from "@gajae-code/ai/utils/discovery/openai-compatible";
-import { getAgentDbPath, getAgentDir } from "@gajae-code/utils";
+import { getAgentDbPath, getAgentDir, logger } from "@gajae-code/utils";
 import { $rotatingCredentialEnv } from "@gajae-code/utils/env";
 import { YAML } from "bun";
 import { withFileLock } from "../config/file-lock";
@@ -46,9 +46,10 @@ export interface ProviderSetupInput {
 	/** Probe override for tests; defaults to the live endpoint probe. */
 	probeDiscovery?: (input: ProviderDiscoveryProbeInput) => Promise<ProviderDiscoveryProbeResult>;
 	/**
-	 * Abort the pre-write discovery probe when the caller is dismissed
-	 * (wizard Esc-cancel during submit). Combined with the shared deadline
-	 * inside the probe; callers that omit it get deadline-only behavior.
+	 * Cancel discovery and persistence until the atomic config rename is
+	 * invoked. Later cancellation does not undo a committed provider.
+	 * Combined with the shared deadline inside the probe; callers that omit
+	 * it get deadline-only probe behavior.
 	 */
 	discoverySignal?: AbortSignal;
 	/**
@@ -352,7 +353,7 @@ async function readModelsConfig(modelsPath: string): Promise<ModelsConfig> {
 	return checked.data;
 }
 
-async function writeModelsConfig(modelsPath: string, config: ModelsConfig): Promise<void> {
+async function writeModelsConfig(modelsPath: string, config: ModelsConfig, signal?: AbortSignal): Promise<void> {
 	const checked = ModelsConfigSchema.safeParse(config);
 	if (!checked.success) {
 		const first = checked.error.issues[0];
@@ -370,6 +371,8 @@ async function writeModelsConfig(modelsPath: string, config: ModelsConfig): Prom
 		} finally {
 			await tempHandle.close();
 		}
+		// Rename is the commit boundary. Cancellation after it cannot undo the saved provider.
+		if (signal?.aborted) throw new Error("Provider setup was cancelled; setup did not write any config.");
 		await fs.rename(tempPath, modelsPath);
 		try {
 			const directoryHandle = await fs.open(directory, "r");
@@ -446,15 +449,9 @@ export async function addApiCompatibleProvider(input: ProviderSetupInput): Promi
 	if (validated.credentialSource === "env") {
 		provider.apiKeyEnv = validated.apiKey;
 	}
-	// All persistence happens inside one serialized transaction: the
-	// pre-probe `existing` snapshot may be stale after a (potentially
-	// 10-second) network request, so re-read under the file lock and merge
-	// only this provider — concurrent writers' providers and settings
-	// survive, and the losing side of a duplicate race never mutates
-	// credential storage. Cancellation is rechecked inside the lock (after
-	// the awaited acquisition) and after the credential write; either abort
-	// rolls the literal write back to the snapshotted entries and stops
-	// before committing models.yml.
+	// Serialize config merging under the file lock. Credential storage is a
+	// separate authority, not an atomic transaction with models.yml: restore
+	// successful credential writes on precommit failure and report failed recovery.
 	type CredentialStore = Pick<AuthStorage, "set" | "remove" | "exportSnapshot">;
 	type ApiKeyEntry = { type: "api_key"; key: string };
 	const cancelledError = (): Error =>
@@ -477,9 +474,9 @@ export async function addApiCompatibleProvider(input: ProviderSetupInput): Promi
 	};
 	const rollbackCredential = async (store: CredentialStore, restorable: ApiKeyEntry[]): Promise<void> => {
 		if (restorable.length > 0) {
-			await store.set(validated.providerId, restorable).catch(() => undefined);
+			await store.set(validated.providerId, restorable);
 		} else {
-			await store.remove(validated.providerId).catch(() => undefined);
+			await store.remove(validated.providerId);
 		}
 	};
 	const withCredentialStore = async (fn: (store: CredentialStore) => Promise<void>): Promise<void> => {
@@ -499,16 +496,19 @@ export async function addApiCompatibleProvider(input: ProviderSetupInput): Promi
 			throw cancelledError();
 		}
 		const current = await readModelsConfig(modelsPath);
+		if (input.discoverySignal?.aborted) throw cancelledError();
 		if (current.providers?.[validated.providerId] && !input.force) {
 			throw new Error(`Provider '${validated.providerId}' already exists. Use --force to replace it.`);
 		}
-		if (validated.credentialSource !== "env") {
-			let restorable: ApiKeyEntry[] = [];
-			let wroteKey = false;
-			try {
+		let restorable: ApiKeyEntry[] = [];
+		let unrestorable = 0;
+		let wroteKey = false;
+		try {
+			if (validated.credentialSource !== "env") {
 				await withCredentialStore(async store => {
 					const snapshot = snapshotRestorableKeys(store);
 					restorable = snapshot.restorable;
+					unrestorable = snapshot.unrestorable;
 					if (snapshot.unrestorable > 0 && input.discoverySignal) {
 						throw new Error(
 							`Provider '${validated.providerId}' holds non-API-key credentials that cannot be restored if setup is cancelled; remove them first or omit --force.`,
@@ -517,29 +517,36 @@ export async function addApiCompatibleProvider(input: ProviderSetupInput): Promi
 					await store.set(validated.providerId, { type: "api_key", key: validated.apiKey });
 					wroteKey = true;
 				});
-			} catch (error) {
-				// An abort landing in the write gap rolls the literal write
-				// back; any other failure propagates unchanged. Nothing is
-				// rolled back when no write occurred (e.g. the upfront
-				// unrestorable refusal above).
-				if (wroteKey && input.discoverySignal?.aborted) {
-					await withCredentialStore(store => rollbackCredential(store, restorable)).catch(() => undefined);
-					throw cancelledError();
+			}
+			if (input.discoverySignal?.aborted) throw cancelledError();
+			await writeModelsConfig(
+				modelsPath,
+				{
+					...current,
+					providers: {
+						...(current.providers ?? {}),
+						[validated.providerId]: provider,
+					},
+				},
+				input.discoverySignal,
+			);
+		} catch (error) {
+			if (wroteKey) {
+				try {
+					if (unrestorable > 0) throw new Error("Prior credentials cannot be restored from a snapshot.");
+					await withCredentialStore(store => rollbackCredential(store, restorable));
+				} catch {
+					// Store errors can contain credentials; never log or interpolate them.
+					// Log independently of the wizard, which may already be dismissed.
+					const recovery =
+						restorable.length > 0 || unrestorable > 0 ? "restore prior credentials" : "remove new credentials";
+					const message = `Provider '${validated.providerId}' setup failed before config commit and could not ${recovery}; credential recovery is required.`;
+					logger.error(message);
+					throw new Error(message, { cause: error });
 				}
-				throw error;
 			}
-			if (input.discoverySignal?.aborted) {
-				await withCredentialStore(store => rollbackCredential(store, restorable)).catch(() => undefined);
-				throw cancelledError();
-			}
+			throw error;
 		}
-		await writeModelsConfig(modelsPath, {
-			...current,
-			providers: {
-				...(current.providers ?? {}),
-				[validated.providerId]: provider,
-			},
-		});
 	});
 	return {
 		providerId: validated.providerId,

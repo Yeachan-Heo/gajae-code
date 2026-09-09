@@ -301,11 +301,7 @@ export class CustomProviderWizardComponent extends Container {
 			const credential = secret.consume().trim();
 			if (!credential) return;
 			this.#state.credential = credential;
-			this.#clearStaleDiscovery();
-			this.#step = "discover";
-			this.#selectedIndex = 0;
-			this.#renderStep();
-			this.#onRender();
+			this.#enterDiscovery();
 		};
 		this.#input = input;
 		this.#contentContainer.addChild(input);
@@ -367,9 +363,8 @@ export class CustomProviderWizardComponent extends Container {
 			this.#selectedIndex = 0;
 		} else if (this.#step === "credential") {
 			this.#state.credential = value;
-			this.#clearStaleDiscovery();
-			this.#step = "discover";
-			this.#selectedIndex = 0;
+			this.#enterDiscovery();
+			return;
 		} else if (this.#step === "models") {
 			this.#state.models = value;
 			// Manual entry supersedes any accepted discovery (clearStale
@@ -382,6 +377,18 @@ export class CustomProviderWizardComponent extends Container {
 		}
 		this.#renderStep();
 		this.#onRender();
+	}
+
+	#enterDiscovery(): void {
+		this.#clearStaleDiscovery();
+		this.#step = "discover";
+		this.#selectedIndex = 0;
+		if (this.#state.compatibility === "openai" && this.#discoveryDeps.discoverModels) {
+			this.#runDiscovery();
+		} else {
+			this.#renderStep();
+			this.#onRender();
+		}
 	}
 
 	#selectCurrentOption(): void {
@@ -408,6 +415,7 @@ export class CustomProviderWizardComponent extends Container {
 				}
 			} else {
 				this.#state.discoverModels = false;
+				this.#cancelDiscovery();
 				this.#step = "models";
 			}
 		} else if (this.#step === "confirm" || this.#step === "force-confirm") {
@@ -654,6 +662,7 @@ export class CustomProviderWizardComponent extends Container {
 	}
 
 	#goBack(): void {
+		if (this.#step === "discover") this.#cancelDiscovery();
 		if (this.#step === "provider-id") this.#step = "compatibility";
 		else if (this.#step === "base-url") this.#step = "provider-id";
 		else if (this.#step === "credential-source") this.#step = "base-url";

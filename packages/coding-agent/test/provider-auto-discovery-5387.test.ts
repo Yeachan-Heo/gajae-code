@@ -2,6 +2,7 @@ import { afterEach, beforeAll, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { setImmediate } from "node:timers/promises";
 import { AuthStorage, SqliteAuthCredentialStore } from "@gajae-code/ai";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { CustomProviderWizardComponent } from "@gajae-code/coding-agent/modes/components/custom-provider-wizard";
@@ -405,6 +406,162 @@ describe("issue #5387 custom provider auto-discovery", () => {
 		).rejects.toThrow("exceeds the size limit");
 	});
 
+	for (const source of ["env", "literal"] as const) {
+		it(`automatically probes once per fresh ${source} credential entry without another Enter`, async () => {
+			const pending = Promise.withResolvers<{ models: string[] }>();
+			const requests: Array<{ apiKeyEnv?: string; apiKey?: string }> = [];
+			const wizard = new CustomProviderWizardComponent(
+				() => undefined,
+				() => undefined,
+				() => undefined,
+				{
+					discoverModels: request => {
+						requests.push(request);
+						return requests.length === 1 ? pending.promise : Promise.resolve({ models: ["fresh-model"] });
+					},
+				},
+			);
+			wizard.handleInput("\n");
+			typeText(wizard, "automatic-provider");
+			wizard.handleInput("\n");
+			typeText(wizard, "https://api.example.com/v1");
+			wizard.handleInput("\n");
+			if (source === "literal") wizard.handleInput("\x1b[B");
+			wizard.handleInput("\n");
+			typeText(wizard, source === "env" ? "AUTO_KEY" : "sk-auto-key");
+			wizard.handleInput("\n");
+			await setImmediate();
+			expect(requests).toHaveLength(1);
+			expect(requests[0]).toMatchObject(source === "env" ? { apiKeyEnv: "AUTO_KEY" } : { apiKey: "sk-auto-key" });
+			// Renders and repeated Enter while probing must not issue another request.
+			wizard.render(100);
+			wizard.handleInput("\n");
+			wizard.handleInput("\n");
+			await setImmediate();
+			expect(requests).toHaveLength(1);
+			pending.resolve({ models: ["first-model"] });
+			await setImmediate();
+			expect(wizard.render(100).join("\n")).toContain("first-model");
+			wizard.handleInput("\x1b");
+			typeText(wizard, source === "env" ? "_2" : "sk-revised-key");
+			wizard.handleInput("\n");
+			await setImmediate();
+			expect(requests).toHaveLength(2);
+			expect(requests[1]).toMatchObject(
+				source === "env" ? { apiKeyEnv: "AUTO_KEY_2" } : { apiKey: "sk-revised-key" },
+			);
+			expect(wizard.render(100).join("\n")).toContain("fresh-model");
+			// Returning from manual entry keeps the fresh preview, without probing on render.
+			wizard.handleInput("\x1b[B");
+			wizard.handleInput("\n");
+			wizard.handleInput("\x1b");
+			await setImmediate();
+			expect(requests).toHaveLength(2);
+			expect(wizard.render(100).join("\n")).toContain("fresh-model");
+		});
+	}
+
+	for (const outcome of ["success", "failure"] as const) {
+		it(`ignores late discovery ${outcome} after backing out to credential-source selection`, async () => {
+			const pending = Promise.withResolvers<{ models: string[] }>();
+			let signal: AbortSignal | undefined;
+			const wizard = new CustomProviderWizardComponent(
+				() => undefined,
+				() => undefined,
+				() => undefined,
+				{
+					discoverModels: request => {
+						signal = request.signal;
+						return pending.promise;
+					},
+				},
+			);
+			wizard.handleInput("\n");
+			typeText(wizard, "late-provider");
+			wizard.handleInput("\n");
+			typeText(wizard, "https://api.example.com/v1");
+			wizard.handleInput("\n");
+			wizard.handleInput("\n");
+			typeText(wizard, "LATE_KEY");
+			wizard.handleInput("\n");
+			await setImmediate();
+			wizard.handleInput("\x1b");
+			expect(signal?.aborted).toBe(true);
+			wizard.handleInput("\x1b");
+			if (outcome === "success") wizard.handleInput("\x1b[B");
+			const before = wizard.render(100);
+			if (outcome === "success") pending.resolve({ models: ["late-model"] });
+			else pending.reject(new Error("late failure"));
+			await setImmediate();
+			expect(wizard.render(100)).toEqual(before);
+			wizard.handleInput("\n");
+			expect(wizard.render(100).join("\n")).toContain(
+				outcome === "success" ? "Paste the API key:" : "Enter the API key environment variable name:",
+			);
+		});
+	}
+
+	it("automatically probes empty catalogs once and retains explicit retry and manual fallback", async () => {
+		let calls = 0;
+		const wizard = new CustomProviderWizardComponent(
+			() => undefined,
+			() => undefined,
+			() => undefined,
+			{
+				discoverModels: async () => {
+					calls += 1;
+					return { models: [] };
+				},
+			},
+		);
+		wizard.handleInput("\n");
+		typeText(wizard, "empty-provider");
+		wizard.handleInput("\n");
+		typeText(wizard, "https://api.example.com/v1");
+		wizard.handleInput("\n");
+		wizard.handleInput("\n");
+		typeText(wizard, "EMPTY_KEY");
+		wizard.handleInput("\n");
+		await setImmediate();
+		expect(calls).toBe(1);
+		expect(wizard.render(100).join("\n")).toContain("The endpoint returned no models.");
+		wizard.handleInput("\n");
+		await setImmediate();
+		expect(calls).toBe(2);
+		wizard.handleInput("\x1b[B");
+		wizard.handleInput("\n");
+		expect(wizard.render(100).join("\n")).toContain("Enter model ids, comma-separated:");
+	});
+
+	it("keeps Anthropic credentials on manual entry without probing", async () => {
+		let calls = 0;
+		const wizard = new CustomProviderWizardComponent(
+			() => undefined,
+			() => undefined,
+			() => undefined,
+			{
+				discoverModels: async () => {
+					calls += 1;
+					throw new Error("Anthropic must not request an OpenAI catalog");
+				},
+			},
+		);
+		wizard.handleInput("\x1b[B");
+		wizard.handleInput("\n");
+		typeText(wizard, "anthropic-provider");
+		wizard.handleInput("\n");
+		typeText(wizard, "https://api.example.com/v1");
+		wizard.handleInput("\n");
+		wizard.handleInput("\n");
+		typeText(wizard, "ANTHROPIC_KEY");
+		wizard.handleInput("\n");
+		await setImmediate();
+		expect(calls).toBe(0);
+		expect(wizard.render(100).join("\n")).toContain("Continue with manual model ids.");
+		wizard.handleInput("\n");
+		expect(wizard.render(100).join("\n")).toContain("Enter model ids, comma-separated:");
+	});
+
 	it("wizard ignores discovery completions superseded by input edits", async () => {
 		const { promise: gate, resolve: release } = Promise.withResolvers<string[]>();
 		const seen: string[] = [];
@@ -431,16 +588,15 @@ describe("issue #5387 custom provider auto-discovery", () => {
 		wizard.handleInput("\n");
 		typeText(wizard, "FIRST_KEY");
 		wizard.handleInput("\n");
-		// Start the probe, then edit the credential while it is in flight.
-		wizard.handleInput("\n");
+		// Credential submission starts the probe; edit while it is in flight.
+		await Promise.resolve();
 		wizard.handleInput("\u001b");
 		typeText(wizard, "_2");
 		wizard.handleInput("\n");
-		// Start the re-probe for the edited inputs, then resolve the stale
+		// Submitting edited inputs automatically re-probes. Resolve the stale
 		// first probe: its models must be dropped, not published.
-		wizard.handleInput("\n");
 		release(["stale-model"]);
-		await Bun.sleep(50);
+		await setImmediate();
 		expect(seen).toEqual(["https://api.example.com/v1|FIRST_KEY", "https://api.example.com/v1|FIRST_KEY_2"]);
 		// Accept the fresh catalog and submit: the stale completion must not
 		// be rendered or accepted — only fresh-model flows into the submit.
@@ -549,8 +705,7 @@ describe("issue #5387 custom provider auto-discovery", () => {
 		typeText(wizard, "SUPERSEDE_KEY");
 		wizard.handleInput("\n");
 		// Accept discovered models...
-		wizard.handleInput("\n");
-		await Bun.sleep(50);
+		await setImmediate();
 		wizard.handleInput("\n");
 		// ...then go back and enter a manual model instead.
 		wizard.handleInput("\u001b");
@@ -592,8 +747,7 @@ describe("issue #5387 custom provider auto-discovery", () => {
 		wizard.handleInput("\n");
 		typeText(wizard, "FIRST_KEY");
 		wizard.handleInput("\n");
-		wizard.handleInput("\n");
-		await Bun.sleep(50);
+		await setImmediate();
 		wizard.handleInput("\n");
 		wizard.handleInput("\n");
 		// Submit pending: Esc back (confirm -> models -> discover ->
@@ -607,19 +761,21 @@ describe("issue #5387 custom provider auto-discovery", () => {
 		wizard.handleInput("\n");
 		expect(submitProbeSignal?.aborted).toBe(true);
 		deferred.resolve();
-		await Bun.sleep(20);
+		await setImmediate();
 	});
 
 	it("does not erase input typed on another step when a probe settles", async () => {
 		const { promise: gate, resolve: release } = Promise.withResolvers<string[]>();
 		let calls = 0;
+		let signal: AbortSignal | undefined;
 		const submissions: unknown[] = [];
 		const wizard = new CustomProviderWizardComponent(
 			input => submissions.push(input),
 			() => undefined,
 			() => undefined,
 			{
-				discoverModels: async () => {
+				discoverModels: async request => {
+					signal = request.signal;
 					calls += 1;
 					return { models: calls === 1 ? await gate : ["fresh-model"] };
 				},
@@ -633,14 +789,15 @@ describe("issue #5387 custom provider auto-discovery", () => {
 		wizard.handleInput("\n");
 		typeText(wizard, "FIRST_KEY");
 		wizard.handleInput("\n");
-		// Start the probe, then choose manual entry while it is still in
-		// flight and type a model id there.
-		wizard.handleInput("\n");
+		await setImmediate();
+		// Choose manual entry while the automatic probe is still in flight
+		// and type a model id there.
 		wizard.handleInput("\u001b[B");
 		wizard.handleInput("\n");
+		expect(signal?.aborted).toBe(true);
 		typeText(wizard, "typed-model");
 		release(["late-model"]);
-		await Bun.sleep(50);
+		await setImmediate();
 		// The typed input must survive the late probe completion: submit
 		// the manual entry and assert it (not the late probe) is submitted.
 		wizard.handleInput("\n");
@@ -677,8 +834,7 @@ describe("issue #5387 custom provider auto-discovery", () => {
 		wizard.handleInput("\n");
 		typeText(wizard, "FIRST_KEY");
 		wizard.handleInput("\n");
-		wizard.handleInput("\n");
-		await Bun.sleep(50);
+		await setImmediate();
 		wizard.handleInput("\n");
 		wizard.handleInput("\n");
 		capturedGeneration = wizard.currentSubmitGeneration();
@@ -692,7 +848,7 @@ describe("issue #5387 custom provider auto-discovery", () => {
 		wizard.handleInput("\n");
 		expect(wizard.isSubmitCurrent(capturedGeneration)).toBe(false);
 		deferred.resolve();
-		await Bun.sleep(20);
+		await setImmediate();
 	});
 
 	it("aborts the submit-time probe when the wizard is cancelled mid-submit", async () => {
@@ -715,8 +871,7 @@ describe("issue #5387 custom provider auto-discovery", () => {
 		wizard.handleInput("\n");
 		typeText(wizard, "SUBMIT_ABORT_KEY");
 		wizard.handleInput("\n");
-		wizard.handleInput("\n");
-		await Bun.sleep(50);
+		await setImmediate();
 		// Accept the discovered catalog (discover -> confirm)...
 		wizard.handleInput("\n");
 		// ...then submit from the confirm screen (stays pending).
@@ -762,8 +917,7 @@ describe("issue #5387 custom provider auto-discovery", () => {
 		wizard.handleInput("\n");
 		typeText(wizard, "CANCEL_KEY");
 		wizard.handleInput("\n");
-		wizard.handleInput("\n");
-		await Bun.sleep(20);
+		await setImmediate();
 		// Esc back through discover -> credential -> source -> base -> id ->
 		// compatibility, then Esc again to cancel the wizard outright.
 		for (let i = 0; i < 5; i++) wizard.handleInput("\u001b");
@@ -1007,9 +1161,8 @@ describe("issue #5387 custom provider auto-discovery", () => {
 		wizard.handleInput("\n");
 		typeText(wizard, "DISCOVER_KEY");
 		wizard.handleInput("\n");
-		// Discover step: run the probe, then accept the discovered catalog.
-		wizard.handleInput("\n");
-		await Bun.sleep(50);
+		// Credential submission starts discovery without another Enter.
+		await setImmediate();
 		wizard.handleInput("\n");
 		wizard.handleInput("\n");
 		expect(submissions).toEqual([
@@ -1081,8 +1234,7 @@ describe("issue #5387 custom provider auto-discovery", () => {
 		wizard.handleInput("\n");
 		typeText(wizard, "FIRST_KEY");
 		wizard.handleInput("\n");
-		wizard.handleInput("\n");
-		await Bun.sleep(50);
+		await setImmediate();
 		// Go back to the credential step (discover -> credential), which
 		// pre-fills the previous value, and append a suffix so the credential
 		// differs: the prior probe results must be discarded, so confirming
@@ -1090,8 +1242,7 @@ describe("issue #5387 custom provider auto-discovery", () => {
 		wizard.handleInput("\u001b");
 		typeText(wizard, "_2");
 		wizard.handleInput("\n");
-		wizard.handleInput("\n");
-		await Bun.sleep(50);
+		await setImmediate();
 		expect(seen).toEqual(["https://api.example.com/v1|FIRST_KEY", "https://api.example.com/v1|FIRST_KEY_2"]);
 		wizard.handleInput("\n");
 		wizard.handleInput("\n");
@@ -1130,8 +1281,7 @@ describe("issue #5387 custom provider auto-discovery", () => {
 		wizard.handleInput("\n");
 		typeText(wizard, "FAILING_KEY");
 		wizard.handleInput("\n");
-		wizard.handleInput("\n");
-		await Bun.sleep(50);
+		await setImmediate();
 		// Failure selects manual entry; confirm the step, then type the fallback model id.
 		wizard.handleInput("\n");
 		typeText(wizard, "fallback-model");
