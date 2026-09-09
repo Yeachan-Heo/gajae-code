@@ -57,6 +57,7 @@ The model action object uses an exact snake_case discriminated schema. CamelCase
 - Do not use the desktop manually while a side-effecting action or batch runs; concurrent use is unsafe, and restoration can overwrite cursor movement made during the transaction.
 - `screenshot` is read-only, and `wait` posts no input. Screenshot/wait-only batches do not move or restore the cursor.
 - The kill switch gates future input, but it does not isolate the desktop or restore application focus. Cursor restoration does not target or reactivate any PID or window.
+- Key sequences recheck suspension, hotkey liveness, and heartbeat freshness between complete keys. A key already pressed gets its release attempt before stopping. Keyboard-event creation failures stop the sequence and retain the pressed key for cleanup before cursor restoration; the original failure remains visible even if cleanup succeeds. Persistent backend failure can prevent release: cleanup is best-effort within the transaction, not an acknowledgement of delivery by macOS.
 
 ## Errors
 
@@ -70,6 +71,7 @@ Stable computer error codes include:
 - `COMPUTER_DISPLAY_STALE`
 - `COMPUTER_COORD_INVALID`
 - `COMPUTER_CANCELLED`
+- `COMPUTER_KEY_EVENT_FAILED` (native virtual-key event creation failed)
 - `COMPUTER_CURSOR_CAPTURE_FAILED`
 - `COMPUTER_CURSOR_RESTORE_FAILED`
 - `COMPUTER_TRANSACTION_FAILED`

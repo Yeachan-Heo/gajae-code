@@ -54,8 +54,9 @@ pub trait EventSink {
 	fn scroll(&mut self, dx: f64, dy: f64);
 	/// Type a unicode string.
 	fn type_unicode(&mut self, text: &str);
-	/// Press or release a virtual key code.
-	fn key(&mut self, code: u16, down: bool);
+	/// Create and post a virtual-key event, or report creation failure.
+	/// Success does not acknowledge delivery by the window server.
+	fn key(&mut self, code: u16, down: bool) -> Result<(), InputError>;
 }
 
 /// Fallible global cursor operations that bracket an input transaction.
@@ -93,6 +94,8 @@ pub enum InputError {
 	Coord(CoordError),
 	/// A Core Graphics cursor warp failed with this status.
 	CursorWarpFailed(i32),
+	/// Core Graphics could not create a virtual-key event.
+	KeyEventCreationFailed { code: u16, down: bool },
 	/// A key name was not recognized.
 	UnknownKey(String),
 }
@@ -106,6 +109,10 @@ impl std::fmt::Display for InputError {
 		match self {
 			Self::Coord(err) => write!(f, "{err}"),
 			Self::CursorWarpFailed(status) => write!(f, "cursor warp failed with status {status}"),
+			Self::KeyEventCreationFailed { code, down } => {
+				let direction = if *down { "down" } else { "up" };
+				write!(f, "could not create key-{direction} event for virtual key {code}")
+			},
 			Self::UnknownKey(key) => write!(f, "unknown key name: {key}"),
 		}
 	}
@@ -131,19 +138,26 @@ pub fn key_code_for(name: &str) -> Option<u16> {
 	Some(code)
 }
 
-/// Orchestrates input actions over an [`EventSink`], tracking held buttons so
-/// [`InputController::release_all`] can clean up after an abort or error.
+/// Orchestrates input actions over an [`EventSink`], tracking held buttons and
+/// keys so [`InputController::release_all`] can clean up after an abort or
+/// error.
 pub struct InputController<S: EventSink> {
 	sink:         S,
 	cursor:       LogicalPoint,
 	held_buttons: Vec<MouseButton>,
+	held_key:     Option<u16>,
 }
 
 impl<S: EventSink> InputController<S> {
 	/// Construct a controller over `sink`. Prefer [`InputController::guarded`]
 	/// for any path that posts real events.
 	pub const fn new(sink: S) -> Self {
-		Self { sink, cursor: LogicalPoint { x: 0.0, y: 0.0 }, held_buttons: Vec::new() }
+		Self {
+			sink,
+			cursor: LogicalPoint { x: 0.0, y: 0.0 },
+			held_buttons: Vec::new(),
+			held_key: None,
+		}
 	}
 
 	/// The most recent cursor position.
@@ -291,31 +305,49 @@ impl<S: EventSink> InputController<S> {
 	///
 	/// # Errors
 	/// Returns [`InputError::UnknownKey`] when a name is unrecognized; keys
-	/// before the failure have already been sent.
+	/// before the failure have already been sent. Backend errors retain any
+	/// admitted key for [`Self::release_all`]; no subsequent key is admitted.
 	pub fn keypress(
 		&mut self,
 		keys: &[String],
 		cancelled: &dyn Fn() -> bool,
 	) -> Result<bool, InputError> {
+		// A reused controller must settle earlier release failures before input.
+		self.release_key()?;
 		for name in keys {
 			if cancelled() {
 				return Ok(false);
 			}
 			let code = key_code_for(name).ok_or_else(|| InputError::UnknownKey(name.clone()))?;
-			self.sink.key(code, true);
-			self.sink.key(code, false);
+			self.sink.key(code, true)?;
+			self.held_key = Some(code);
+			self.sink.key(code, false)?;
+			self.held_key = None;
 		}
 		Ok(true)
 	}
 
-	/// Release every held mouse button (idempotent). Run on abort/error paths
-	/// so a partial drag never leaves a button stuck.
-	pub fn release_all(&mut self) {
+	fn release_key(&mut self) -> Result<(), InputError> {
+		if let Some(code) = self.held_key {
+			self.sink.key(code, false)?;
+			self.held_key = None;
+		}
+		Ok(())
+	}
+
+	/// Attempt to release every held input. Successfully released keys are
+	/// removed; failed releases remain owned so a later cleanup can retry.
+	/// A persistent backend failure is reported, not a guarantee of OS delivery.
+	///
+	/// # Errors
+	/// Returns a keyboard release error after releasing the held mouse buttons.
+	pub fn release_all(&mut self) -> Result<(), InputError> {
 		let at = self.cursor;
 		let held: Vec<MouseButton> = self.held_buttons.drain(..).collect();
 		for button in held {
 			self.sink.mouse_button(at, button, false);
 		}
+		self.release_key()
 	}
 
 	#[cfg(test)]
@@ -530,15 +562,40 @@ mod mac {
 			}
 		}
 
-		fn key(&mut self, code: u16, down: bool) {
+		fn key(&mut self, code: u16, down: bool) -> Result<(), super::InputError> {
 			// SAFETY: created keyboard event is posted and released exactly once.
 			unsafe {
-				let event = CGEventCreateKeyboardEvent(self.source, code, down);
-				if !event.is_null() {
-					CGEventPost(HID_EVENT_TAP, event);
-					CFRelease(event.cast_const());
-				}
+				let event = require_keyboard_event(
+					CGEventCreateKeyboardEvent(self.source, code, down),
+					code,
+					down,
+				)?;
+				CGEventPost(HID_EVENT_TAP, event);
+				CFRelease(event.cast_const());
 			}
+			Ok(())
+		}
+	}
+
+	const fn require_keyboard_event(
+		event: CgEventRef,
+		code: u16,
+		down: bool,
+	) -> Result<CgEventRef, super::InputError> {
+		if event.is_null() {
+			Err(super::InputError::KeyEventCreationFailed { code, down })
+		} else {
+			Ok(event)
+		}
+	}
+
+	#[test]
+	fn null_keyboard_events_report_the_failed_key_edge() {
+		for down in [true, false] {
+			assert_eq!(
+				require_keyboard_event(std::ptr::null_mut(), 36, down),
+				Err(super::InputError::KeyEventCreationFailed { code: 36, down }),
+			);
 		}
 	}
 
@@ -598,8 +655,9 @@ mod tests {
 			self.ops.push(SinkOp::TypeUnicode(text.to_string()));
 		}
 
-		fn key(&mut self, code: u16, down: bool) {
+		fn key(&mut self, code: u16, down: bool) -> Result<(), InputError> {
 			self.ops.push(SinkOp::Key { code, down });
+			Ok(())
 		}
 	}
 	struct WarpFailingSink;
@@ -615,7 +673,9 @@ mod tests {
 
 		fn type_unicode(&mut self, _text: &str) {}
 
-		fn key(&mut self, _code: u16, _down: bool) {}
+		fn key(&mut self, _code: u16, _down: bool) -> Result<(), crate::computer::input::InputError> {
+			Ok(())
+		}
 	}
 
 	fn display() -> NormalizedDisplay {
@@ -698,11 +758,11 @@ mod tests {
 		c.move_to(&display(), 10.0, 10.0).unwrap();
 		c.press_for_test(MouseButton::Left);
 		assert!(c.has_held_buttons());
-		c.release_all();
+		c.release_all().unwrap();
 		assert!(!c.has_held_buttons());
 		assert!(matches!(c.ops_ref().last(), Some(SinkOp::Button { down: false, .. })));
 		// release_all is idempotent.
-		c.release_all();
+		c.release_all().unwrap();
 		assert!(!c.has_held_buttons());
 	}
 
@@ -740,6 +800,22 @@ mod tests {
 			.unwrap_err();
 		assert!(matches!(err, InputError::UnknownKey(_)));
 	}
+	#[test]
+	fn keypress_empty_and_partial_unknown_key_preserve_order() {
+		let mut controller = InputController::new(RecordingSink::default());
+		assert_eq!(controller.keypress(&[], &|| false), Ok(true));
+		assert!(controller.ops_ref().is_empty());
+		assert_eq!(
+			controller
+				.keypress(&["enter".to_string(), "unknown".to_string(), "tab".to_string()], &|| false),
+			Err(InputError::UnknownKey("unknown".to_string()))
+		);
+		assert_eq!(controller.into_ops(), vec![SinkOp::Key { code: 36, down: true }, SinkOp::Key {
+			code: 36,
+			down: false,
+		},]);
+	}
+
 	#[test]
 	fn keypress_cancellation_stops_between_complete_keys() {
 		let polls = std::cell::Cell::new(0usize);

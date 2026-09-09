@@ -14,6 +14,7 @@
 //! macOS supplies the concrete permission/display providers.
 
 use std::{
+	cell::Cell,
 	panic::{AssertUnwindSafe, catch_unwind},
 	sync::{LazyLock, Mutex, TryLockError},
 	time::Duration,
@@ -81,6 +82,8 @@ pub enum ExecError {
 	Coord(CoordError),
 	/// Core Graphics failed to move the hardware cursor.
 	CursorWarpFailed(i32),
+	/// Core Graphics could not create a virtual-key event.
+	KeyEventCreationFailed { code: u16, down: bool },
 	/// The action was cancelled (AbortSignal/timeout/supervisor stop).
 	Cancelled,
 	/// A key name was not recognized.
@@ -112,6 +115,7 @@ impl ExecError {
 			Self::DisplayStale => "COMPUTER_DISPLAY_STALE",
 			Self::Coord(_) => "COMPUTER_COORD_INVALID",
 			Self::CursorWarpFailed(_) => "COMPUTER_CURSOR_WARP_FAILED",
+			Self::KeyEventCreationFailed { .. } => "COMPUTER_KEY_EVENT_FAILED",
 			Self::UnknownKey(_) => "COMPUTER_UNKNOWN_KEY",
 			Self::Cancelled => "COMPUTER_CANCELLED",
 			Self::ScreenshotFailed => "COMPUTER_SCREENSHOT_FAILED",
@@ -129,6 +133,9 @@ impl From<InputError> for ExecError {
 		match value {
 			InputError::Coord(err) => Self::Coord(err),
 			InputError::CursorWarpFailed(status) => Self::CursorWarpFailed(status),
+			InputError::KeyEventCreationFailed { code, down } => {
+				Self::KeyEventCreationFailed { code, down }
+			},
 			InputError::UnknownKey(key) => Self::UnknownKey(key),
 		}
 	}
@@ -140,6 +147,12 @@ impl std::fmt::Display for ExecError {
 			Self::Coord(err) => write!(f, "{}: {err}", self.code()),
 			Self::CursorWarpFailed(status) => {
 				write!(f, "{}: cursor warp failed with status {status}", self.code())
+			},
+			Self::KeyEventCreationFailed { code, down } => {
+				write!(f, "{}: {}", self.code(), InputError::KeyEventCreationFailed {
+					code: *code,
+					down: *down,
+				})
 			},
 			Self::UnknownKey(key) => write!(f, "{}: {key}", self.code()),
 			Self::ActionFailed { index, source } => write!(f, "action {index}: {source}"),
@@ -194,6 +207,17 @@ impl DisplayContext for MacDisplayContext {
 	}
 }
 
+fn gate_supervisor(supervisor: &Supervisor) -> Result<(), ExecError> {
+	let status = supervisor.status();
+	if status.suspended {
+		return Err(ExecError::Suspended);
+	}
+	if !status.hotkey_live || !status.heartbeat_fresh {
+		return Err(ExecError::SupervisorNotLive);
+	}
+	Ok(())
+}
+
 /// Fail-closed gate run before any side-effecting input.
 fn gate<P: PermissionGate, D: DisplayContext>(
 	action: &InputAction,
@@ -202,13 +226,7 @@ fn gate<P: PermissionGate, D: DisplayContext>(
 	display_ctx: &D,
 	expected_epoch: Option<u64>,
 ) -> Result<(), ExecError> {
-	let status = supervisor.status();
-	if status.suspended {
-		return Err(ExecError::Suspended);
-	}
-	if !status.hotkey_live || !status.heartbeat_fresh {
-		return Err(ExecError::SupervisorNotLive);
-	}
+	gate_supervisor(supervisor)?;
 	if !perms.accessibility_granted() {
 		return Err(ExecError::PermissionRequired);
 	}
@@ -285,7 +303,8 @@ where
 	);
 	let suspended = supervisor.is_suspended();
 	if result.is_err() || suspended {
-		controller.release_all();
+		// Preserve the action/stop failure; the transaction retries held releases.
+		let _ = controller.release_all();
 	}
 	if result.is_ok() && suspended {
 		Err(ExecError::Suspended)
@@ -329,8 +348,10 @@ where
 		Ok(result) => result,
 		Err(_) => Err(ExecError::TransactionPanicked),
 	};
-	if catch_unwind(AssertUnwindSafe(|| controller.release_all())).is_err() {
-		primary = Err(ExecError::TransactionPanicked);
+	match catch_unwind(AssertUnwindSafe(|| controller.release_all())) {
+		Ok(Err(err)) if primary.is_ok() => primary = Err(err.into()),
+		Err(_) => primary = Err(ExecError::TransactionPanicked),
+		_ => {},
 	}
 	let restore = catch_unwind(AssertUnwindSafe(|| hooks.restore_cursor(cursor)));
 	match restore {
@@ -398,16 +419,36 @@ where
 	D: DisplayContext,
 {
 	gate(action, supervisor, perms, display_ctx, expected_epoch)?;
-	if cancelled() {
-		return Err(ExecError::Cancelled);
-	}
-	let result = dispatch(action, display, controller, cancelled);
-	if result.is_ok() && cancelled() {
+	// Keep the typed reason at the observation that stopped the boolean-driven
+	// input loop, even if the supervisor recovers before dispatch returns.
+	let is_keypress = matches!(action, InputAction::Keypress { .. });
+	let stop_reason = Cell::new(None);
+	let stopped = || {
+		let caller_cancelled = cancelled();
+		let reason = if is_keypress {
+			gate_supervisor(supervisor).err()
+		} else {
+			None
+		}
+		.or_else(|| caller_cancelled.then_some(ExecError::Cancelled));
+		let stop = reason.is_some();
+		if stop {
+			stop_reason.set(reason);
+		}
+		stop
+	};
+	let result = if stopped() {
 		Err(ExecError::Cancelled)
-	} else if result.is_ok() && supervisor.is_suspended() {
-		Err(ExecError::Suspended)
 	} else {
-		result
+		dispatch(action, display, controller, &stopped)
+	};
+	if result.is_ok() {
+		stopped();
+	}
+	match (result, stop_reason.into_inner()) {
+		(Ok(()) | Err(ExecError::Cancelled), Some(reason)) => Err(reason),
+		(Ok(()), None) if !is_keypress && supervisor.is_suspended() => Err(ExecError::Suspended),
+		(result, _) => result,
 	}
 }
 
@@ -470,7 +511,9 @@ mod tests {
 	};
 	use crate::computer::{
 		coords::{LogicalPoint, NormalizedDisplay},
-		input::{CursorError, CursorHooks, EventSink, InputController, MouseButton, SinkOp},
+		input::{
+			CursorError, CursorHooks, EventSink, InputController, InputError, MouseButton, SinkOp,
+		},
 		supervisor::Supervisor,
 	};
 
@@ -492,9 +535,12 @@ mod tests {
 		}
 	}
 
+	type KeyHook = dyn Fn(u16, bool) -> Result<(), InputError>;
+
 	#[derive(Default)]
 	struct RecordingSink {
-		ops: Vec<SinkOp>,
+		ops:    Vec<SinkOp>,
+		on_key: Option<Box<KeyHook>>,
 	}
 	impl EventSink for RecordingSink {
 		fn move_cursor(
@@ -517,8 +563,12 @@ mod tests {
 			self.ops.push(SinkOp::TypeUnicode(text.to_string()));
 		}
 
-		fn key(&mut self, code: u16, down: bool) {
+		fn key(&mut self, code: u16, down: bool) -> Result<(), crate::computer::input::InputError> {
+			if let Some(on_key) = &self.on_key {
+				on_key(code, down)?;
+			}
 			self.ops.push(SinkOp::Key { code, down });
+			Ok(())
 		}
 	}
 	struct WarpFailSink;
@@ -537,7 +587,9 @@ mod tests {
 
 		fn type_unicode(&mut self, _text: &str) {}
 
-		fn key(&mut self, _code: u16, _down: bool) {}
+		fn key(&mut self, _code: u16, _down: bool) -> Result<(), crate::computer::input::InputError> {
+			Ok(())
+		}
 	}
 	#[derive(Default)]
 	struct RecordingHooks {
@@ -590,7 +642,9 @@ mod tests {
 
 		fn type_unicode(&mut self, _text: &str) {}
 
-		fn key(&mut self, _code: u16, _down: bool) {}
+		fn key(&mut self, _code: u16, _down: bool) -> Result<(), crate::computer::input::InputError> {
+			Ok(())
+		}
 	}
 
 	struct PanicReleaseSink {
@@ -619,7 +673,9 @@ mod tests {
 
 		fn type_unicode(&mut self, _text: &str) {}
 
-		fn key(&mut self, _code: u16, _down: bool) {}
+		fn key(&mut self, _code: u16, _down: bool) -> Result<(), crate::computer::input::InputError> {
+			Ok(())
+		}
 	}
 
 	struct PanicRestoreHooks {
@@ -809,6 +865,280 @@ mod tests {
 			run(&InputAction::Keypress { keys: vec!["enter".to_string()] }, &sup, true, None, 0);
 		assert!(res2.is_ok());
 		assert_eq!(ops2.len(), 2); // key down + up
+	}
+
+	#[test]
+	fn non_key_actions_preserve_liveness_and_cancellation_semantics() {
+		for action in [InputAction::Wait { ms: 0 }, InputAction::Type { text: "ok".to_string() }] {
+			for cancelled in [false, true] {
+				let supervisor = live_supervisor();
+				let mut controller = InputController::new(RecordingSink::default());
+				let result = execute_input(
+					&action,
+					&supervisor,
+					&FakePerms { granted: true },
+					&FakeDisplay { epoch: 0 },
+					None,
+					&display(),
+					&mut controller,
+					&|| {
+						supervisor.set_hotkey_live(false);
+						supervisor.heartbeat_at(0);
+						cancelled
+					},
+				);
+				assert_eq!(
+					result,
+					if cancelled {
+						Err(ExecError::Cancelled)
+					} else {
+						Ok(())
+					}
+				);
+				let expected = if !cancelled && matches!(action, InputAction::Type { .. }) {
+					vec![SinkOp::TypeUnicode("ok".to_string())]
+				} else {
+					vec![]
+				};
+				assert_eq!(controller.into_sink().ops, expected);
+			}
+		}
+	}
+
+	fn assert_keypress_stop(stop: fn(&Supervisor), expected: ExecError, keys: &[&str]) {
+		for transaction in [false, true] {
+			let supervisor = Rc::new(live_supervisor());
+			let sink_supervisor = Rc::clone(&supervisor);
+			let mut controller = InputController::new(RecordingSink {
+				on_key: Some(Box::new(move |_, down| {
+					if down {
+						stop(&sink_supervisor);
+					}
+					Ok(())
+				})),
+				..RecordingSink::default()
+			});
+			let action =
+				InputAction::Keypress { keys: keys.iter().map(|key| (*key).to_string()).collect() };
+			let permissions = FakePerms { granted: true };
+			let context = FakeDisplay { epoch: 0 };
+			let cancelled = || supervisor.is_suspended();
+			let result = if transaction {
+				let mut hooks = RecordingHooks::default();
+				let result = execute_input_transaction(
+					&[action, InputAction::Type { text: "must-not-run".to_string() }],
+					&supervisor,
+					&permissions,
+					&context,
+					None,
+					&display(),
+					&mut controller,
+					&mut hooks,
+					&cancelled,
+				);
+				assert_eq!((hooks.captures, hooks.restores), (1, 1));
+				result.map_err(|err| match err {
+					ExecError::ActionFailed { index: 0, source } => *source,
+					other => panic!("unexpected transaction error: {other:?}"),
+				})
+			} else {
+				execute_input(
+					&action,
+					&supervisor,
+					&permissions,
+					&context,
+					None,
+					&display(),
+					&mut controller,
+					&cancelled,
+				)
+			};
+			assert_eq!(result, Err(expected.clone()));
+			assert_eq!(controller.into_sink().ops, vec![
+				SinkOp::Key { code: 36, down: true },
+				SinkOp::Key { code: 36, down: false },
+			]);
+		}
+	}
+
+	#[test]
+	fn keypress_stops_when_hotkey_liveness_is_lost() {
+		assert_keypress_stop(|s| s.set_hotkey_live(false), ExecError::SupervisorNotLive, &[
+			"enter", "tab",
+		]);
+	}
+
+	#[test]
+	fn keypress_stops_when_heartbeat_becomes_stale() {
+		assert_keypress_stop(|s| s.heartbeat_at(0), ExecError::SupervisorNotLive, &["enter", "tab"]);
+	}
+
+	#[test]
+	fn keypress_suspension_precedes_liveness_and_cancellation() {
+		assert_keypress_stop(
+			|s| {
+				s.trigger_stop();
+				s.set_hotkey_live(false);
+				s.heartbeat_at(0);
+			},
+			ExecError::Suspended,
+			&["enter", "tab"],
+		);
+	}
+
+	#[test]
+	fn keypress_checks_liveness_after_the_final_key() {
+		assert_keypress_stop(|s| s.set_hotkey_live(false), ExecError::SupervisorNotLive, &["enter"]);
+	}
+
+	#[test]
+	fn keypress_backend_failure_releases_before_restore_and_keeps_primary_error() {
+		for fail_down in [false, true] {
+			for batch_path in [false, true] {
+				let supervisor = live_supervisor();
+				let log = Rc::new(RefCell::new(Vec::new()));
+				let sink_log = Rc::clone(&log);
+				let failed = Cell::new(false);
+				let mut controller = InputController::new(RecordingSink {
+					on_key: Some(Box::new(move |code, down| {
+						assert_eq!(code, 36, "no subsequent key may be admitted");
+						if down == fail_down && !failed.replace(true) {
+							sink_log.borrow_mut().push("creation-failed");
+							return Err(InputError::KeyEventCreationFailed { code, down });
+						}
+						sink_log.borrow_mut().push(if down { "down" } else { "up" });
+						Ok(())
+					})),
+					..RecordingSink::default()
+				});
+				let mut hooks = OrderedHooks { log: Rc::clone(&log) };
+				let action =
+					InputAction::Keypress { keys: vec!["enter".to_string(), "tab".to_string()] };
+				let permissions = FakePerms { granted: true };
+				let context = FakeDisplay { epoch: 0 };
+				let result = if batch_path {
+					super::with_cursor_transaction(
+						&mut controller,
+						&mut hooks,
+						&|| false,
+						|controller| {
+							execute_input(
+								&action,
+								&supervisor,
+								&permissions,
+								&context,
+								None,
+								&display(),
+								controller,
+								&|| false,
+							)
+						},
+					)
+				} else {
+					execute_input_transaction(
+						&[action],
+						&supervisor,
+						&permissions,
+						&context,
+						None,
+						&display(),
+						&mut controller,
+						&mut hooks,
+						&|| false,
+					)
+					.map_err(|err| match err {
+						ExecError::ActionFailed { index: 0, source } => *source,
+						other => panic!("unexpected transaction error: {other:?}"),
+					})
+				};
+				assert_eq!(
+					result,
+					Err(ExecError::KeyEventCreationFailed { code: 36, down: fail_down })
+				);
+				let expected = if fail_down {
+					vec!["capture", "creation-failed", "restore"]
+				} else {
+					vec!["capture", "down", "creation-failed", "up", "restore"]
+				};
+				assert_eq!(*log.borrow(), expected);
+			}
+		}
+	}
+
+	#[test]
+	fn keypress_persistent_release_failure_retains_ownership_until_recovery() {
+		let supervisor = live_supervisor();
+		let fail_up = Rc::new(Cell::new(true));
+		let sink_fail_up = Rc::clone(&fail_up);
+		let attempts = Rc::new(RefCell::new(Vec::new()));
+		let sink_attempts = Rc::clone(&attempts);
+		let mut controller = InputController::new(RecordingSink {
+			on_key: Some(Box::new(move |code, down| {
+				sink_attempts.borrow_mut().push((code, down));
+				if !down && sink_fail_up.get() {
+					Err(InputError::KeyEventCreationFailed { code, down })
+				} else {
+					Ok(())
+				}
+			})),
+			..RecordingSink::default()
+		});
+		let mut hooks = RecordingHooks { restore_fails: true, ..RecordingHooks::default() };
+		let result = execute_input_transaction(
+			&[InputAction::Keypress { keys: vec!["enter".to_string(), "tab".to_string()] }],
+			&supervisor,
+			&FakePerms { granted: true },
+			&FakeDisplay { epoch: 0 },
+			None,
+			&display(),
+			&mut controller,
+			&mut hooks,
+			&|| false,
+		);
+		assert_eq!(
+			result,
+			Err(ExecError::CursorRestoreFailed {
+				primary: Some(Box::new(ExecError::ActionFailed {
+					index:  0,
+					source: Box::new(ExecError::KeyEventCreationFailed { code: 36, down: false }),
+				})),
+			})
+		);
+		assert_eq!(*attempts.borrow(), vec![(36, true), (36, false), (36, false)]);
+		assert_eq!((hooks.captures, hooks.restores), (1, 1));
+		assert_eq!(
+			controller.keypress(&["tab".to_string()], &|| false),
+			Err(InputError::KeyEventCreationFailed { code: 36, down: false })
+		);
+		assert_eq!(attempts.borrow().last(), Some(&(36, false)));
+		fail_up.set(false);
+		controller.release_all().unwrap();
+		let settled_attempts = attempts.borrow().len();
+		controller.release_all().unwrap();
+		assert_eq!(attempts.borrow().len(), settled_attempts, "successful cleanup is idempotent");
+		assert_eq!(controller.keypress(&["tab".to_string()], &|| false), Ok(true));
+		assert_eq!(&attempts.borrow()[settled_attempts..], &[(48, true), (48, false)]);
+	}
+
+	#[test]
+	fn keypress_admission_race_preserves_suspension_before_the_first_key() {
+		let supervisor = live_supervisor();
+		let mut controller = InputController::new(RecordingSink::default());
+		let result = execute_input(
+			&InputAction::Keypress { keys: vec!["enter".to_string()] },
+			&supervisor,
+			&FakePerms { granted: true },
+			&FakeDisplay { epoch: 0 },
+			None,
+			&display(),
+			&mut controller,
+			&|| {
+				supervisor.trigger_stop();
+				true
+			},
+		);
+		assert_eq!(result, Err(ExecError::Suspended));
+		assert!(controller.into_sink().ops.is_empty());
 	}
 
 	#[test]

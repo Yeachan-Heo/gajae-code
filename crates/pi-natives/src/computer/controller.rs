@@ -774,4 +774,29 @@ mod tests {
 
 		assert_eq!(error.code(), "COMPUTER_SCREENSHOT_FAILED");
 	}
+
+	#[test]
+	fn keyboard_backend_errors_survive_napi_and_batch_primary_mapping() {
+		let primary = ExecError::ActionFailed {
+			index:  1,
+			source: Box::new(ExecError::KeyEventCreationFailed { code: 36, down: false }),
+		};
+		let direct = exec_error(primary.clone());
+		assert_eq!(direct.status, napi::Status::GenericFailure);
+		assert!(direct.reason.starts_with("COMPUTER_KEY_EVENT_FAILED:"));
+		assert!(direct.reason.contains("key-up event for virtual key 36"));
+		let result = batch_failure(Vec::new(), primary.clone(), None);
+		assert_eq!(result.failure_code.as_deref(), Some("COMPUTER_KEY_EVENT_FAILED"));
+		assert_eq!(result.failure_index, Some(1));
+		assert_eq!(result.failure_message, Some(primary.to_string()));
+		let result = batch_failure(
+			Vec::new(),
+			ExecError::CursorRestoreFailed { primary: Some(Box::new(primary.clone())) },
+			None,
+		);
+		assert_eq!(result.failure_code.as_deref(), Some("COMPUTER_CURSOR_RESTORE_FAILED"));
+		assert_eq!(result.failure_index, Some(1));
+		assert_eq!(result.primary_failure_code.as_deref(), Some("COMPUTER_KEY_EVENT_FAILED"));
+		assert_eq!(result.primary_failure_message, Some(primary.to_string()));
+	}
 }

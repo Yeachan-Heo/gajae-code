@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Recheck full computer-use supervisor state between keys, and report keyboard-event creation failures while retaining pressed keys for cleanup before cursor restoration.
+
 ## [0.16.6] - 2026-09-07
 
 ## [0.16.5] - 2026-09-07
