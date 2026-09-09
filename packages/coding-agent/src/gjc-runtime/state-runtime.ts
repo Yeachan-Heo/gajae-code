@@ -2803,11 +2803,12 @@ export async function recordDeepInterviewExecutionApproval(options: {
 						const newPublication =
 							inner.execution_approval === "not-approved" &&
 							inner.execution_approval_receipt === undefined &&
-							publicationReceipt?.command === "gjc deep-interview crystallize" &&
-							crystal.spec_version === existing.crystal_spec_version + 1 &&
+							(ralplanApproval || publicationReceipt?.command === "gjc deep-interview crystallize") &&
+							record.crystal_spec_version > existing.crystal_spec_version &&
 							record.crystal_source_digest !== existing.crystal_source_digest &&
 							record.spec_sha256 !== existing.spec_sha256 &&
 							record.gate_id !== existing.gate_id &&
+							record.question_id !== existing.question_id &&
 							isPlainObject(crystal.delta) &&
 							crystal.delta.approval_invalidated === true;
 						if (!newPublication && !existing.consumed_mutation_id?.startsWith("deep-interview:approval-revoked:"))
