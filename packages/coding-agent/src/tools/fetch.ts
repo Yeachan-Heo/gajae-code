@@ -745,7 +745,7 @@ async function renderUrl(
 	const { finalUrl, content: rawContent } = response;
 	const mime = normalizeMime(response.contentType);
 	const extHint = getExtensionHint(finalUrl);
-	const isPdf = mime === "application/pdf" || (extHint === ".pdf" && isGenericMimeType(mime));
+	let isPdf = mime === "application/pdf" || (extHint === ".pdf" && isGenericMimeType(mime));
 
 	// Raw PDF inspection is explicit; never substitute PDF bytes for failed text extraction.
 	if (raw && isPdf) {
@@ -888,8 +888,17 @@ async function renderUrl(
 	}
 
 	// Step 3: Handle convertible binary files (PDF, DOCX, etc.)
-	if (!skipConvertibleBinaryRetry && isConvertible(mime, extHint)) {
-		const binary = await fetchBinary(finalUrl, timeout, signal);
+	// Generic downloads can identify PDFs only in Content-Disposition. Inspect the
+	// bounded binary response before raw fallback, and reuse it for conversion.
+	const dispositionBinary =
+		!raw && !isPdf && !skipConvertibleBinaryRetry && isGenericMimeType(mime)
+			? await fetchBinary(finalUrl, timeout, signal)
+			: undefined;
+	if (dispositionBinary?.ok && getExtensionHint(finalUrl, dispositionBinary.contentDisposition) === ".pdf") {
+		isPdf = true;
+	}
+	if (!skipConvertibleBinaryRetry && (isPdf || isConvertible(mime, extHint))) {
+		const binary = dispositionBinary ?? (await fetchBinary(finalUrl, timeout, signal));
 		if (binary.ok) {
 			const ext = isPdf ? ".pdf" : getExtensionHint(finalUrl, binary.contentDisposition) || extHint;
 			const converted = await convertWithMarkit(binary.buffer, ext, timeout, signal);
