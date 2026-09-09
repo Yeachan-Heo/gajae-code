@@ -98,7 +98,15 @@
 - `gjc doctor --fix --repair service.restart-owned` restarts the SDK broker and Discord, Slack, and Telegram daemons through each owner's prepare/commit protocol. Restart success requires kernel-confirmed predecessor absence and a genuinely different successor process incarnation; matching PIDs are not accepted as proof.
 
 - Successful macOS installs and updates can offer the optional experimental, third-party community Gajae Code App (#5140), defaulting to No. The shared installer requires canonical release checksums and a verified bundle/signature, skips installed apps and automation, and supports `GJC_NO_COMMUNITY_APP=1`; app failures leave GJC installed.
+### Added
+- The in-process SDK now exposes `session.submitUserMessage()` for tracked queued steers and follow-ups. Each submission has a unique identity plus admission, execution, terminal, cancellation, removal, same-run, successor-run, and sequential FIFO lifecycle receipts without relying on private SDK-host correlation hooks.
 
+
+### Added
+- The in-process SDK now exposes `session.submitUserMessage()` for tracked queued steers and follow-ups. Each submission has a unique identity plus admission, execution, terminal, cancellation, removal, same-run, successor-run, and sequential FIFO lifecycle receipts without relying on private SDK-host correlation hooks.
+
+### Fixed
+- Tracked queued submissions settle as removed when successor startup fails before run acceptance, and overloaded AgentSession seams are coalesced in the generated SDK inventory.
 ### Fixed
 
 - Coordinator runtime-state updates are no longer dropped when several gjc sessions write the same session-state projection. The state-file acquisition deadline was absolute rather than idle-based, so a contender gave up five seconds after it started waiting even while peers were taking and releasing the lock normally — and each of those writes runs inside the namespace transaction lock whose own budget is sixty seconds, so any critical section outlasting five seconds starved every waiter with `lock_owner_live_or_unverifiable` or `transition_claim_timeout`. A dropped update is permanent: nothing re-derives the snapshot, so the coordinator kept reporting stale lifecycle and tool activity for that session. The deadline now measures waiting without progress, restarting only on proof that the lock changed hands to a peer, and a separate ceiling still bounds total waiting. A change the contender's own stale reclaim caused is not counted as progress, so an endlessly recreated dead claim still fails on its original schedule, and a wedged lock is still refused promptly. Runtime-state persistence additionally retries a pure-contention refusal a bounded number of times; every other refusal is still reported on the first attempt.
