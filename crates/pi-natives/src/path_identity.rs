@@ -6541,7 +6541,10 @@ mod platform {
 	use std::{
 		ffi::{OsString, c_void},
 		mem::{align_of, size_of},
-		os::windows::ffi::{OsStrExt, OsStringExt},
+		os::windows::{
+			ffi::{OsStrExt, OsStringExt},
+			io::{AsRawHandle, FromRawHandle, OwnedHandle},
+		},
 		path::{Component, Path, PathBuf},
 		ptr::{null, null_mut},
 	};
@@ -6550,6 +6553,7 @@ mod platform {
 	use windows_sys::Win32::{
 		Foundation::{
 			CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, ERROR_FILE_NOT_FOUND,
+			ERROR_INVALID_FUNCTION, ERROR_INVALID_PARAMETER, ERROR_NOT_SUPPORTED,
 			ERROR_PATH_NOT_FOUND, ERROR_SHARING_VIOLATION, GENERIC_ALL, GetLastError, HANDLE,
 			INVALID_HANDLE_VALUE, LocalFree,
 		},
@@ -6564,12 +6568,14 @@ mod platform {
 		Storage::FileSystem::{
 			BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_ALL_ACCESS, FILE_ATTRIBUTE_DIRECTORY,
 			FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_READONLY, FILE_ATTRIBUTE_REPARSE_POINT,
-			FILE_BASIC_INFO, FILE_BEGIN, FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS,
-			FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_SHARE_DELETE,
-			FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE, FILE_WRITE_ATTRIBUTES, FileBasicInfo,
-			FileDispositionInfo, GetFileInformationByHandle, GetFinalPathNameByHandleW, OPEN_EXISTING,
-			READ_CONTROL, ReadFile, SetFileInformationByHandle, SetFilePointerEx, VOLUME_NAME_GUID,
-			WRITE_DAC, WRITE_OWNER,
+			FILE_BASIC_INFO, FILE_BEGIN, FILE_DISPOSITION_FLAG_DELETE,
+			FILE_DISPOSITION_FLAG_POSIX_SEMANTICS, FILE_DISPOSITION_INFO, FILE_DISPOSITION_INFO_EX,
+			FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
+			FILE_READ_DATA, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE,
+			FILE_WRITE_ATTRIBUTES, FileBasicInfo, FileDispositionInfo, FileDispositionInfoEx,
+			GetFileInformationByHandle, GetFinalPathNameByHandleW, OPEN_EXISTING, READ_CONTROL,
+			ReadFile, SetFileInformationByHandle, SetFilePointerEx, VOLUME_NAME_GUID, WRITE_DAC,
+			WRITE_OWNER,
 		},
 		System::Threading::{GetCurrentProcess, OpenProcessToken},
 	};
@@ -6600,6 +6606,32 @@ mod platform {
 	thread_local! {
 		static EXACT_REPLACE_DESTINATION_OPEN_SHARING_VIOLATION_INJECT: std::cell::Cell<u32> =
 			const { std::cell::Cell::new(0) };
+	}
+
+	#[cfg(test)]
+	thread_local! {
+		static TREE_OPERATION_FAILURE: std::cell::Cell<(&'static str, usize)> =
+			const { std::cell::Cell::new(("", 0)) };
+		static POSIX_DISPOSITION_ERROR: std::cell::Cell<Option<u32>> =
+			const { std::cell::Cell::new(None) };
+		static CLASSIC_DISPOSITION_CALLS: std::cell::Cell<usize> =
+			const { std::cell::Cell::new(0) };
+	}
+
+	#[cfg(test)]
+	fn inject_tree_operation_failure(point: &str) -> Result<(), &'static str> {
+		TREE_OPERATION_FAILURE.with(|failure| {
+			let (target, remaining) = failure.get();
+			if target != point || remaining == 0 {
+				return Ok(());
+			}
+			failure.set((target, remaining - 1));
+			if remaining == 1 {
+				Err("io_error")
+			} else {
+				Ok(())
+			}
+		})
 	}
 
 	#[cfg(test)]
@@ -6656,7 +6688,11 @@ mod platform {
 	}
 
 	fn last_error_code() -> &'static str {
-		match unsafe { GetLastError() } {
+		win32_error_code(unsafe { GetLastError() })
+	}
+
+	fn win32_error_code(error: u32) -> &'static str {
+		match error {
 			ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND => "not_found",
 			ERROR_SHARING_VIOLATION => "sharing_violation",
 			_ => "io_error",
@@ -8683,6 +8719,10 @@ mod platform {
 		relative_path: String,
 		kind: &str,
 	) -> Result<NativeDirectoryTreeEntry, &'static str> {
+		#[cfg(test)]
+		if !relative_path.is_empty() {
+			inject_tree_operation_failure("entry")?;
+		}
 		let mut information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
 		if unsafe { GetFileInformationByHandle(handle, &mut information) } == 0 {
 			return Err(last_error_code());
@@ -8743,22 +8783,18 @@ mod platform {
 					"directory",
 				),
 			};
-			let attributes = match handle_attributes(child) {
-				Ok(value) => value,
-				Err(code) => {
-					unsafe { CloseHandle(child) };
-					return Err(code);
-				},
-			};
+			// Own the child before any fallible inspection or recursive descent.
+			let child = unsafe { OwnedHandle::from_raw_handle(child) };
+			let attributes = handle_attributes(child.as_raw_handle())?;
 			let result = if attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
 				Err("reparse_point")
 			} else if attributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
-				snapshot_tree_handle(child, &child_relative, entries)
+				snapshot_tree_handle(child.as_raw_handle(), &child_relative, entries)
 			} else {
-				entries.push(tree_entry(child, child_relative, kind)?);
+				entries.push(tree_entry(child.as_raw_handle(), child_relative, kind)?);
 				Ok(())
 			};
-			unsafe { CloseHandle(child) };
+			drop(child);
 			result?;
 		}
 		Ok(())
@@ -8826,6 +8862,8 @@ mod platform {
 		parent: HANDLE,
 		expected: &NativeDirectoryTreeEntry,
 	) -> Result<(), &'static str> {
+		#[cfg(test)]
+		inject_tree_operation_failure("rename")?;
 		let name: Vec<u16> = tree_quarantine_name(expected).encode_utf16().collect();
 		rename_handle(handle, parent, &name, false)
 	}
@@ -8852,12 +8890,55 @@ mod platform {
 		Ok(())
 	}
 
+	fn set_posix_disposition(handle: HANDLE) -> Result<(), u32> {
+		#[cfg(test)]
+		if let Some(error) = POSIX_DISPOSITION_ERROR.with(|failure| failure.take()) {
+			return Err(error);
+		}
+		let mut extended = FILE_DISPOSITION_INFO_EX {
+			Flags: FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS,
+		};
+		if unsafe {
+			SetFileInformationByHandle(
+				handle,
+				FileDispositionInfoEx,
+				(&raw mut extended).cast(),
+				size_of::<FILE_DISPOSITION_INFO_EX>() as u32,
+			)
+		} != 0
+		{
+			Ok(())
+		} else {
+			Err(unsafe { GetLastError() })
+		}
+	}
+
 	fn delete_handle(handle: HANDLE) -> Result<(), &'static str> {
 		let original_attributes = handle_attributes(handle)?;
 		let readonly = original_attributes & FILE_ATTRIBUTE_READONLY != 0;
 		if readonly {
 			set_handle_attributes(handle, original_attributes & !FILE_ATTRIBUTE_READONLY)?;
 		}
+		// POSIX disposition removes this handle's directory entry when we close it,
+		// even while a compatible scanner retains a read handle. Classic disposition
+		// instead leaves a delete-pending child that can prevent parent removal.
+		// Keep the caller's deny-write/delete sharing fence: filters that conflict
+		// with that fence or deny DELETE still fail closed.
+		let error = match set_posix_disposition(handle) {
+			Ok(()) => return Ok(()),
+			Err(error) => error,
+		};
+		// Only capability rejection permits the existing descriptor-bound operation;
+		// sharing, permission, and other failures never authorize another path.
+		if !matches!(error, ERROR_INVALID_FUNCTION | ERROR_INVALID_PARAMETER | ERROR_NOT_SUPPORTED) {
+			let code = win32_error_code(error);
+			if readonly && set_handle_attributes(handle, original_attributes).is_err() {
+				return Err("restore_failed");
+			}
+			return Err(code);
+		}
+		#[cfg(test)]
+		CLASSIC_DISPOSITION_CALLS.with(|calls| calls.set(calls.get() + 1));
 		let mut disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
 		if unsafe {
 			SetFileInformationByHandle(
@@ -8906,16 +8987,22 @@ mod platform {
 				return Err("identity_mismatch");
 			}
 			let directory = expected_child.kind == "directory";
-			let child =
-				open_relative(handle, &name_os, FILE_READ_ATTRIBUTES | FILE_READ_DATA, directory)?;
-			let result = if !tree_entry_matches(child, expected_child)? {
+			let child = unsafe {
+				OwnedHandle::from_raw_handle(open_relative(
+					handle,
+					&name_os,
+					FILE_READ_ATTRIBUTES | FILE_READ_DATA,
+					directory,
+				)?)
+			};
+			let result = if !tree_entry_matches(child.as_raw_handle(), expected_child)? {
 				Err("identity_mismatch")
 			} else if directory {
-				validate_tree_handle(child, &expected_child.relative_path, expected)
+				validate_tree_handle(child.as_raw_handle(), &expected_child.relative_path, expected)
 			} else {
 				Ok(())
 			};
-			unsafe { CloseHandle(child) };
+			drop(child);
 			result?;
 		}
 		Ok(())
@@ -8958,25 +9045,24 @@ mod platform {
 					FILE_SHARE_READ,
 				)?
 			};
-			if !tree_entry_matches(child, expected_child)? {
-				unsafe { CloseHandle(child) };
+			let child = unsafe { OwnedHandle::from_raw_handle(child) };
+			if !tree_entry_matches(child.as_raw_handle(), expected_child)? {
 				return Err("identity_mismatch");
 			}
 			let already_quarantined = name == tree_quarantine_name(expected_child);
 			if !already_quarantined {
-				quarantine_tree_child(child, handle, expected_child)?;
+				quarantine_tree_child(child.as_raw_handle(), handle, expected_child)?;
 			}
-			if !tree_entry_matches(child, expected_child)? {
-				unsafe { CloseHandle(child) };
+			if !tree_entry_matches(child.as_raw_handle(), expected_child)? {
 				return Err("identity_mismatch");
 			}
 			let result = if directory {
-				remove_tree_handle(child, &expected_child.relative_path, expected)
-					.and_then(|()| delete_handle(child))
+				remove_tree_handle(child.as_raw_handle(), &expected_child.relative_path, expected)
+					.and_then(|()| delete_handle(child.as_raw_handle()))
 			} else {
-				delete_handle(child)
+				delete_handle(child.as_raw_handle())
 			};
-			unsafe { CloseHandle(child) };
+			drop(child);
 			result?;
 		}
 		Ok(())
@@ -9104,6 +9190,251 @@ mod platform {
 				Err(code) => NativeExactUnlinkResult::detached_failure(code, retained_path),
 			},
 			Err(code) => NativeExactUnlinkResult::detached_failure(code, retained_path),
+		}
+	}
+
+	#[cfg(test)]
+	mod windows_tree_release_tests {
+		use std::{
+			fs,
+			os::windows::fs::OpenOptionsExt,
+			time::{SystemTime, UNIX_EPOCH},
+		};
+
+		use super::*;
+
+		fn fixture() -> (PathBuf, PathBuf, NativeDirectoryTreeSnapshot) {
+			let root = std::env::temp_dir().join(format!(
+				"gjc-windows-tree-release-{}-{}",
+				std::process::id(),
+				SystemTime::now()
+					.duration_since(UNIX_EPOCH)
+					.expect("clock")
+					.as_nanos(),
+			));
+			let lock = root.join("probe.lock");
+			fs::create_dir_all(&lock).expect("create lock");
+			fs::write(lock.join("info"), b"owner").expect("write owner");
+			let snapshot = snapshot_directory_tree(&lock).snapshot.expect("snapshot");
+			(root, lock, snapshot)
+		}
+
+		fn assert_exclusive_file_open(path: &Path) {
+			let held = open_exact_with_share(path, "file", FILE_READ_DATA, 0)
+				.unwrap_or_else(|error| panic!("leaked child handle at {path:?}: {:?}", error.code));
+			drop(held);
+		}
+
+		#[test]
+		fn snapshot_validation_and_rename_errors_close_children_before_retry() {
+			for (point, occurrence) in
+				[("snapshot", 1), ("entry", 1), ("entry", 2), ("entry", 3), ("rename", 1)]
+			{
+				let (root, lock, snapshot) = fixture();
+				TREE_OPERATION_FAILURE.with(|failure| {
+					failure.set((if point == "snapshot" { "entry" } else { point }, occurrence))
+				});
+				if point == "snapshot" {
+					let result = snapshot_directory_tree(&lock);
+					assert!(!result.ok);
+					assert_eq!(result.code.as_deref(), Some("io_error"));
+				} else {
+					let result = exact_remove_directory_tree(&lock, &snapshot, None);
+					assert!(!result.ok);
+					assert_eq!(result.code.as_deref(), Some("io_error"));
+				}
+				TREE_OPERATION_FAILURE.with(|failure| assert_eq!(failure.get().1, 0));
+				let child = fs::read_dir(&lock)
+					.expect("retained lock")
+					.next()
+					.expect("retained child")
+					.expect("child entry")
+					.path();
+				assert_exclusive_file_open(&child);
+				assert_eq!(fs::read(&child).expect("retained owner"), b"owner");
+				let result = exact_remove_directory_tree(&lock, &snapshot, None);
+				assert!(result.ok, "retry: {:?}", result.code);
+				assert!(!lock.exists());
+				fs::remove_dir_all(root).expect("cleanup");
+			}
+		}
+
+		#[test]
+		fn failed_child_open_releases_root_and_retries_without_poisoning() {
+			let (root, lock, snapshot) = fixture();
+			// This reader denies DELETE. It is incompatible, not a reason to relax
+			// the content/rename fences or to attempt path-based recursive removal.
+			let reader = fs::OpenOptions::new()
+				.read(true)
+				.share_mode(FILE_SHARE_READ)
+				.open(lock.join("info"))
+				.expect("blocking reader");
+			for _ in 0..3 {
+				let result = exact_remove_directory_tree(&lock, &snapshot, None);
+				assert!(!result.ok);
+				assert_eq!(result.code.as_deref(), Some("sharing_violation"));
+				let root_handle = open_exact_with_share(&lock, "directory", FILE_READ_DATA, 0)
+					.unwrap_or_else(|error| panic!("leaked root handle: {:?}", error.code));
+				drop(root_handle);
+			}
+			drop(reader);
+			assert_exclusive_file_open(&lock.join("info"));
+			assert!(exact_remove_directory_tree(&lock, &snapshot, None).ok);
+			fs::remove_dir_all(root).expect("cleanup");
+		}
+
+		#[test]
+		fn open_exact_failed_descendant_open_releases_retained_ancestors() {
+			let (root, lock, _) = fixture();
+			let absent = lock.join("missing").join("info");
+			for _ in 0..3 {
+				let error = match open_exact(&absent, "file", FILE_READ_DATA) {
+					Ok(_) => panic!("missing descendant opened"),
+					Err(error) => error,
+				};
+				assert_eq!(error.code.as_deref(), Some("not_found"));
+			}
+			// Retained ancestor handles do not request DELETE. Removing and then
+			// exclusively recreating this directory also detects delete-pending pins.
+			fs::remove_dir_all(&lock).expect("remove failed-open ancestors");
+			fs::create_dir(&lock).expect("reuse ancestor name immediately");
+			fs::remove_dir_all(root).expect("cleanup");
+		}
+
+		#[test]
+		fn compatible_scanner_read_handle_does_not_leave_delete_pending_tree() {
+			let (root, lock, snapshot) = fixture();
+			let reader = fs::OpenOptions::new()
+				.read(true)
+				.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+				.open(lock.join("info"))
+				.expect("compatible scanner");
+			let result = exact_remove_directory_tree(&lock, &snapshot, None);
+			assert!(
+				result.ok,
+				"POSIX disposition required on this Windows filesystem: {:?}",
+				result.code
+			);
+			assert!(!lock.exists());
+			assert!(!root.join("probe.lock.removing").exists());
+			assert_eq!(
+				reader
+					.metadata()
+					.expect("scanner still owns its object")
+					.len(),
+				5
+			);
+			fs::create_dir(&lock).expect("successor lock");
+			fs::write(lock.join("info"), b"successor").expect("successor owner");
+			drop(reader);
+			assert_eq!(
+				fs::read(lock.join("info")).expect("successor survives scanner close"),
+				b"successor"
+			);
+			fs::remove_dir_all(root).expect("cleanup");
+		}
+
+		#[test]
+		fn write_and_delete_access_holders_remain_incompatible() {
+			for access in [0x0000_0002, 0x0001_0000] {
+				let (root, lock, snapshot) = fixture();
+				let holder = open_exact(&lock.join("info"), "file", access)
+					.unwrap_or_else(|error| panic!("holder: {:?}", error.code));
+				let result = exact_remove_directory_tree(&lock, &snapshot, None);
+				assert!(!result.ok);
+				assert_eq!(result.code.as_deref(), Some("sharing_violation"));
+				assert_eq!(fs::read(lock.join("info")).expect("owner retained"), b"owner");
+				drop(holder);
+				assert!(exact_remove_directory_tree(&lock, &snapshot, None).ok);
+				fs::remove_dir_all(root).expect("cleanup");
+			}
+		}
+
+		#[test]
+		fn retry_after_post_rename_failure_preserves_published_successor() {
+			let (root, lock, snapshot) = fixture();
+			TREE_OPERATION_FAILURE.with(|failure| failure.set(("entry", 3)));
+			let result = exact_remove_directory_tree(&lock, &snapshot, None);
+			assert_eq!(result.code.as_deref(), Some("io_error"));
+			let child = snapshot
+				.entries
+				.iter()
+				.find(|entry| entry.relative_path == "info")
+				.expect("info");
+			let detached = lock.join(tree_quarantine_name(child));
+			assert_exclusive_file_open(&detached);
+			fs::write(lock.join("info"), b"successor").expect("publish successor");
+			let result = exact_remove_directory_tree(&lock, &snapshot, None);
+			assert!(!result.ok);
+			assert_eq!(result.code.as_deref(), Some("identity_mismatch"));
+			assert_eq!(fs::read(&detached).expect("original retained"), b"owner");
+			assert_eq!(fs::read(lock.join("info")).expect("successor retained"), b"successor");
+			fs::remove_dir_all(root).expect("cleanup");
+		}
+
+		#[test]
+		fn final_rename_collision_preserves_successor_and_allows_exact_retry() {
+			let (root, lock, snapshot) = fixture();
+			let successor = root.join("probe.lock.removing");
+			fs::create_dir(&successor).expect("successor directory");
+			fs::write(successor.join("info"), b"successor").expect("successor owner");
+			let result = exact_remove_directory_tree(&lock, &snapshot, None);
+			assert!(!result.ok);
+			assert_eq!(result.code.as_deref(), Some("quarantine_collision"));
+			assert_eq!(fs::read(successor.join("info")).expect("successor retained"), b"successor");
+			fs::rename(&successor, root.join("retained-successor")).expect("move successor aside");
+			assert!(exact_remove_directory_tree(&lock, &snapshot, None).ok);
+			assert_eq!(
+				fs::read(root.join("retained-successor/info")).expect("successor still retained"),
+				b"successor"
+			);
+			fs::remove_dir_all(root).expect("cleanup");
+		}
+
+		#[test]
+		fn unsupported_posix_disposition_uses_only_existing_handle_deletion() {
+			for error in [ERROR_INVALID_FUNCTION, ERROR_INVALID_PARAMETER, ERROR_NOT_SUPPORTED] {
+				let (root, lock, _) = fixture();
+				let info = lock.join("info");
+				let held =
+					open_exact(&info, "file", FILE_READ_DATA | FILE_WRITE_ATTRIBUTES | 0x0001_0000)
+						.unwrap_or_else(|error| panic!("deletion handle: {:?}", error.code));
+				POSIX_DISPOSITION_ERROR.with(|failure| failure.set(Some(error)));
+				CLASSIC_DISPOSITION_CALLS.with(|calls| calls.set(0));
+				assert_eq!(delete_handle(held.target), Ok(()));
+				CLASSIC_DISPOSITION_CALLS.with(|calls| assert_eq!(calls.get(), 1));
+				drop(held);
+				assert!(!info.exists());
+				fs::remove_dir_all(root).expect("cleanup");
+			}
+		}
+
+		#[test]
+		fn posix_sharing_and_access_failures_restore_readonly_without_fallback() {
+			for error in [ERROR_SHARING_VIOLATION, 5] {
+				let (root, lock, _) = fixture();
+				let info = lock.join("info");
+				let held =
+					open_exact(&info, "file", FILE_READ_DATA | FILE_WRITE_ATTRIBUTES | 0x0001_0000)
+						.unwrap_or_else(|error| panic!("deletion handle: {:?}", error.code));
+				let attributes = handle_attributes(held.target).expect("attributes");
+				set_handle_attributes(held.target, attributes | FILE_ATTRIBUTE_READONLY)
+					.expect("readonly");
+				POSIX_DISPOSITION_ERROR.with(|failure| failure.set(Some(error)));
+				CLASSIC_DISPOSITION_CALLS.with(|calls| calls.set(0));
+				assert_eq!(delete_handle(held.target), Err(win32_error_code(error)));
+				CLASSIC_DISPOSITION_CALLS.with(|calls| assert_eq!(calls.get(), 0));
+				assert_ne!(
+					handle_attributes(held.target).expect("restored attributes")
+						& FILE_ATTRIBUTE_READONLY,
+					0
+				);
+				assert_eq!(fs::read(&info).expect("retained bytes"), b"owner");
+				assert_eq!(delete_handle(held.target), Ok(()));
+				drop(held);
+				assert!(!info.exists());
+				fs::remove_dir_all(root).expect("cleanup");
+			}
 		}
 	}
 }

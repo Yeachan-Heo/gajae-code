@@ -245,6 +245,21 @@ describe("dev-ci canonical-plan workflow contract", () => {
 		for (const line of requiredLines) expect(line).toContain("|| needs.affected-plan.outputs.has_windows_session_path == 'true'");
 	});
 
+	test("runs native identity-bound lock regressions after the Windows native build (#5434)", async () => {
+		const workflow = await Bun.file(path.join(import.meta.dir, "..", ".github", "workflows", "dev-ci.yml")).text();
+		const windowsJob = workflow.slice(workflow.indexOf("  windows-dev-doctor:"), workflow.indexOf("\n  windows-native-build-toolchain:"));
+		expect(windowsJob).toContain("runs-on: windows-latest");
+		const buildIndex = windowsJob.indexOf("run: bun run ci:build:native");
+		const testIndex = windowsJob.indexOf("- name: Windows identity-bound native lock regressions");
+		expect(buildIndex).toBeGreaterThanOrEqual(0);
+		expect(testIndex).toBeGreaterThan(buildIndex);
+		const nativeStep = windowsJob.slice(testIndex, windowsJob.indexOf("\n      - name:", testIndex + 1));
+		expect(nativeStep).toContain("shell: pwsh");
+		expect(nativeStep).toContain("cargo test -p pi-natives --lib path_identity::\n          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }");
+		expect(nativeStep).not.toContain("continue-on-error:");
+		expect(nativeStep).not.toContain("if: ");
+	});
+
 	describe("detached evidence subprocess contract", () => {
 		const scriptPath = path.join(import.meta.dir, "ci-dev-affected.ts");
 		const repoRoot = path.join(import.meta.dir, "..");

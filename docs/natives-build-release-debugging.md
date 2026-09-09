@@ -188,6 +188,30 @@ Generated declarations currently include exports from these Rust modules:
 - No candidate could load: throws with full candidate error list and mode-specific remediation hints.
 - Embedded extraction problems: extraction mkdir/write errors are recorded and included in final diagnostics if load fails.
 
+### Windows lock release versus WSL DrvFS
+
+A Windows-native `sharing_violation` during identity-bound directory removal can
+come from an antivirus/DRM minifilter retaining an incompatible file handle. It is
+not evidence of a stale owner, and a persistent filter conflict is not repaired
+by increasing retry counts. Native snapshot, validation, and removal traversal
+must close every child handle on failure as well as success; otherwise the failed
+attempt itself can keep the lock tree undeletable for the process lifetime.
+
+The removal contract still requires exact root/child identity and file contents,
+no-follow traversal, and protection against concurrent writes or replacement.
+A read-only observer is different from a writer or a handle that refuses delete
+sharing. An incompatible external handle can still cause a recoverable native
+failure; do not bypass the identity-bound primitive with a process-wide probe and
+recursive path deletion. Retain the lock and its diagnostic evidence rather than
+stealing a live or unverifiable holder's lock.
+
+WSL DrvFS is a separate Linux filesystem boundary: rename can commit while the
+reported post-rename identity changes. Its committed-operation reconciliation
+must validate the exact native receipt and retained tree; it does not establish
+that a Windows minifilter error is safe to ignore. Windows handle-sharing tests
+and DrvFS lifecycle tests are separate evidence. Cross-compilation and tests on
+macOS/Linux do not reproduce an enterprise Windows filter driver.
+
 ## Troubleshooting matrix
 
 | Symptom                                                                | Likely cause                                                                                | Verify                                                            | Fix                                                                                           |

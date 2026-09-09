@@ -4,6 +4,7 @@
 
 ### Fixed
 
+- Windows directory-tree snapshot, validation, and removal now scope-own child handles across fallible metadata, digest, and rename operations. Handle-bound POSIX disposition prevents compatible read-only scanners from keeping deleted children linked; incompatible write/delete sharing remains protected and errors no longer leak traversal handles (#5434).
 - Recheck full computer-use supervisor state between keys, and report keyboard-event creation failures while retaining pressed keys for cleanup before cursor restoration.
 
 ## [0.16.6] - 2026-09-07

@@ -143,6 +143,25 @@ describe("dev-ci Telegram daemon generation guard topology", () => {
 		}
 	});
 
+	test("requires Windows native lock regressions in both evidence and aggregate for path_identity changes (#5434)", async () => {
+		const d = await workflow();
+		const doctor = requiredJob(d, "windows-dev-doctor");
+		const producer = requiredJob(d, "affected-evidence-producer");
+		const affected = requiredJob(d, "affected");
+		const evidence = namedStep(producer, "Produce affected evidence");
+		const required = requiredEnvValue(evidence, "CI_DEV_WINDOWS_DOCTOR_REQUIRED");
+		expect(required).toContain("contains(needs.affected-plan.outputs.changed_paths, 'crates/pi-natives/src/path_identity.rs')");
+		expect(requiredEnvValue(affected, "CI_DEV_WINDOWS_DOCTOR_REQUIRED")).toBe(required);
+		expect(doctor.if).toBe(
+			"${{ needs.affected-plan.outputs.relevant == 'true' && (" + required.slice(4, -3) + ") }}",
+		);
+		for (const job of [producer, affected]) expect(job.needs).toContain("windows-dev-doctor");
+		for (const surface of [evidence, affected]) {
+			expect(requiredEnvValue(surface, "CI_DEV_WINDOWS_DOCTOR_RESULT")).toBe("${{ needs.windows-dev-doctor.result }}");
+		}
+		expect(namedStep(affected, "Validate live affected aggregate").run).toContain("--validate-aggregate");
+	});
+
 	test("keeps affected validation pinned while reserving an explicit virtual-integration dispatch head", async () => {
 		const d = await workflow();
 		const dispatchInputs = Object.keys(d.on.workflow_dispatch.inputs);
