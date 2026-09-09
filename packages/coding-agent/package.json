@@ -45,7 +45,7 @@
 		"format-prompts": "bun scripts/format-prompts.ts",
 		"generate-docs-index": "bun scripts/generate-docs-index.ts",
 		"generate-tool-catalog": "bun scripts/generate-tool-catalog.ts",
-		"prepack": "bun scripts/generate-tool-catalog.ts && bun scripts/generate-docs-index.ts",
+		"prepack": "bun scripts/generate-mupdf-wasm.ts && bun scripts/generate-tool-catalog.ts && bun scripts/generate-docs-index.ts",
 		"generate-template": "bun scripts/generate-template.ts",
 		"install:defaults": "bun src/cli.ts setup defaults",
 		"verify:insane-vendor": "bun scripts/verify-insane-vendor.ts",
@@ -90,6 +90,7 @@
 	},
 	"files": [
 		"src",
+		"src/utils/mupdf-wasm.generated.wasm",
 		"bin",
 		"scripts",
 		"examples",

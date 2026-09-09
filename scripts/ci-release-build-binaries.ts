@@ -138,6 +138,9 @@ async function buildBinary(target: BinaryTarget): Promise<void> {
 }
 
 async function generateBundle(): Promise<void> {
+	if (!isDryRun) {
+		await runCommand(["bun", "packages/coding-agent/scripts/generate-mupdf-wasm.ts"], repoRoot);
+	}
 	if (isDryRun) {
 		console.log("DRY RUN bun --cwd=packages/stats scripts/generate-client-bundle.ts --generate");
 		return;

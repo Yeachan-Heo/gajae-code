@@ -154,7 +154,7 @@
     "stats:edits": "python3 scripts/session-stats/analyze.py edits",
     "stats:followups": "python3 scripts/session-stats/analyze.py followups",
     "prepublishOnly": "bun run check",
-    "prepare": "bun --cwd=packages/coding-agent run generate-docs-index",
+    "prepare": "bun packages/coding-agent/scripts/generate-mupdf-wasm.ts && bun --cwd=packages/coding-agent run generate-docs-index",
     "publish": "bun run prepublishOnly && npm publish -ws --access public",
     "publish:dry": "bun run prepublishOnly && npm publish -ws --access public --dry-run",
     "release": "bun scripts/release.ts",

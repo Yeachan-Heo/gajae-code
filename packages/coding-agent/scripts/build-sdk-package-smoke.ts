@@ -159,6 +159,30 @@ async function runSmoke(): Promise<Surface> {
 			`\nconst rootBefore = JSON.stringify(await snapshot());\nconst rootListing = await root.listManagedSessionCandidates({ scope: resolved.scope });\nif (rootListing.kind !== "complete" || rootListing.owned.length !== listing.owned.length || rootListing.owned[0]?.sessionId !== listing.owned[0]?.sessionId || rootListing.owned[0]?.path !== listing.owned[0]?.path) throw new Error("packed root readonly listing diverged from SDK listing");\nconst rootAfter = JSON.stringify(await snapshot());\nif (rootAfter !== rootBefore) throw new Error("packed root readonly listing mutated the filesystem");\n`,
 		);
 		const surface = JSON.parse(run(["bun", "run", probePath], tempDir)) as Surface;
+		const pdfPath = path.join(tempDir, "fixture.pdf");
+		await fs.copyFile(path.join(packageDir, "test/fixtures/dummy-pdf-fixture.pdf"), pdfPath);
+		const pdfProbePath = path.join(tempDir, "pdf-probe.ts");
+		await fs.writeFile(
+			pdfProbePath,
+			`import * as root from ${JSON.stringify(packageName)};
+import { convertFileWithMarkit } from ${JSON.stringify(`${packageName}/utils/markit`)};
+if (typeof root.createAgentSession !== "function") throw new Error("packed root import failed");
+const result = await convertFileWithMarkit(${JSON.stringify(pdfPath)});
+if (!result.ok || !result.content.includes("Dummy PDF file")) throw new Error("packed PDF conversion failed: " + JSON.stringify(result));
+process.stdout.write("PACKED_PDF_OK");
+`,
+		);
+		if (run(["bun", "run", pdfProbePath], tempDir) !== "PACKED_PDF_OK") {
+			throw new Error("packed PDF probe did not finish");
+		}
+		// A future install may select a newer loader than the packing snapshot.
+		// Even unusable packaged bytes must not affect the source/SDK runtime mode.
+		const packedWasmPath = path.join(path.dirname(stagedPackageJsonPath), "src/utils/mupdf-wasm.generated.wasm");
+		await fs.access(packedWasmPath);
+		await fs.writeFile(packedWasmPath, "not a WASM module");
+		if (run(["bun", "run", pdfProbePath], tempDir) !== "PACKED_PDF_OK") {
+			throw new Error("packed PDF runtime used the build-time WASM snapshot");
+		}
 		assertExport(Object.fromEntries(surface.root.map(name => [name, true])), "createAgentSession", "root");
 		return { root: [...surface.root].sort(), sdk: [...surface.sdk].sort() };
 	} finally {

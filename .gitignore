@@ -81,6 +81,7 @@ out.html
 pi-*.html
 
 # Generated files
+packages/coding-agent/src/utils/mupdf-wasm.generated.wasm
 packages/coding-agent/src/internal-urls/docs-index.generated.ts
 /runs/
 # parallel-agent worktrees

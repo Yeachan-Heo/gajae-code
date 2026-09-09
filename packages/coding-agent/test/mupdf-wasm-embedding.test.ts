@@ -2,6 +2,7 @@ import { describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { resolveMarkitMupdfWasm } from "../scripts/generate-mupdf-wasm";
 
 import { convertFileWithMarkit } from "../src/utils/markit";
 import { ensureMupdfWasmResolution } from "../src/utils/mupdf-wasm";
@@ -10,6 +11,25 @@ const MODULE_CONFIG_KEY = "$libmupdf_wasm_Module";
 const fixturePdfPath = path.resolve(import.meta.dirname, "fixtures/dummy-pdf-fixture.pdf");
 
 describe("mupdf wasm embedding (#5433)", () => {
+	it("resolves markit's nested MuPDF rather than a different hoisted instance", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-mupdf-installed-"));
+		try {
+			const packageDir = path.join(tempDir, "node_modules/@gajae-code/coding-agent");
+			const installedMarkit = path.join(tempDir, "node_modules/markit-ai");
+			const markitRoot = path.resolve(path.dirname(Bun.resolveSync("markit-ai", import.meta.dirname)), "..");
+			const mupdfRoot = path.resolve(path.dirname(resolveMarkitMupdfWasm()), "..");
+			fs.mkdirSync(packageDir, { recursive: true });
+			fs.cpSync(markitRoot, installedMarkit, { recursive: true });
+			const nestedMupdf = path.join(installedMarkit, "node_modules/mupdf");
+			fs.cpSync(mupdfRoot, nestedMupdf, { recursive: true });
+			fs.cpSync(mupdfRoot, path.join(tempDir, "node_modules/mupdf"), { recursive: true });
+			const resolved = resolveMarkitMupdfWasm(packageDir);
+			expect(resolved).toBe(path.join(nestedMupdf, "dist/mupdf-wasm.wasm"));
+			expect(await Bun.file(resolved).bytes()).toEqual(await Bun.file(resolveMarkitMupdfWasm()).bytes());
+		} finally {
+			fs.rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
 	it("seeds the emscripten module config with a locateFile hook", () => {
 		const globalScope = globalThis as typeof globalThis & Record<string, unknown>;
 		const previous = globalScope[MODULE_CONFIG_KEY];
@@ -18,6 +38,7 @@ describe("mupdf wasm embedding (#5433)", () => {
 			ensureMupdfWasmResolution();
 			const seeded = globalScope[MODULE_CONFIG_KEY] as { locateFile?: unknown } | undefined;
 			expect(typeof seeded?.locateFile).toBe("function");
+			expect((seeded as { locateFile: () => string }).locateFile()).toBe(resolveMarkitMupdfWasm());
 			// Idempotent: seeding again must not replace an existing config.
 			ensureMupdfWasmResolution();
 			expect(globalScope[MODULE_CONFIG_KEY]).toBe(seeded);
@@ -74,8 +95,31 @@ describe("mupdf wasm embedding in a compiled binary (#5433)", () => {
 		const outDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-mupdf-compiled-"));
 		const executable = path.join(outDir, "mupdf-convert-fixture");
 		try {
+			const embeddedProbe = path.join(outDir, "embedded-probe.ts");
+			const expectedHash = new Bun.CryptoHasher("sha256")
+				.update(await Bun.file(resolveMarkitMupdfWasm()).bytes())
+				.digest("hex");
+			await Bun.write(
+				embeddedProbe,
+				`import { embeddedFiles } from "bun";
+import ${JSON.stringify(fixtureEntry)};
+const wasm = embeddedFiles.find(file => file.name.includes("mupdf-wasm"));
+if (!wasm) throw new Error("MuPDF WASM was not embedded");
+const hash = new Bun.CryptoHasher("sha256").update(await wasm.bytes()).digest("hex");
+if (hash !== ${JSON.stringify(expectedHash)}) throw new Error("Embedded WASM differs from markit's dependency instance");
+`,
+			);
 			const compile = Bun.spawn(
-				[process.execPath, "build", fixtureEntry, "--compile", "--minify", "--keep-names", "--outfile", executable],
+				[
+					process.execPath,
+					"build",
+					embeddedProbe,
+					"--compile",
+					"--minify",
+					"--keep-names",
+					"--outfile",
+					executable,
+				],
 				{ cwd: workspaceRoot, stdout: "pipe", stderr: "pipe" },
 			);
 			const [compileExit, compileStderr] = await Promise.all([compile.exited, new Response(compile.stderr).text()]);

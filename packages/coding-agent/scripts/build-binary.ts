@@ -31,6 +31,7 @@ async function stageWorkspaceNativeAddons(): Promise<void> {
 }
 
 async function main(): Promise<void> {
+	await runCommand(["bun", "scripts/generate-mupdf-wasm.ts"]);
 	await runCommand(["bun", "--cwd=../stats", "scripts/generate-client-bundle.ts", "--generate"]);
 	try {
 		await runCommand(["bun", "--cwd=../natives", "run", "embed:native"]);
