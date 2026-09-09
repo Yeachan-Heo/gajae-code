@@ -5792,14 +5792,6 @@ export class AuthStorage {
 	 */
 	async getApiKey(provider: string, sessionId?: string, options?: AuthApiKeyOptions): Promise<string | undefined> {
 		provider = resolveOAuthStorageProvider(provider);
-		if (sessionId && !options?.credentialSelector) {
-			const unavailableSelector = this.#sessionCredentialUnavailable.get(sessionId)?.get(provider);
-			if (unavailableSelector) {
-				throw new Error(
-					`Selected credential for ${provider} (${this.#formatCredentialSelector(unavailableSelector)}) is unavailable`,
-				);
-			}
-		}
 		const selectedCredential = this.#resolveSelectedStoredCredential(provider, options, sessionId);
 
 		// Runtime override takes highest priority after selector validation.
@@ -5823,6 +5815,14 @@ export class AuthStorage {
 			const storedApiKey = await this.#resolveStoredApiKeyOverEnvConfig(provider, selectedCredential, sessionId);
 			if (storedApiKey) return storedApiKey;
 			return configKey;
+		}
+		if (sessionId && !options?.credentialSelector) {
+			const unavailableSelector = this.#sessionCredentialUnavailable.get(sessionId)?.get(provider);
+			if (unavailableSelector) {
+				throw new Error(
+					`Selected credential for ${provider} (${this.#formatCredentialSelector(unavailableSelector)}) is unavailable`,
+				);
+			}
 		}
 
 		if (selectedCredential?.credential.type === "api_key") {
