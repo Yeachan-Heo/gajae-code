@@ -3,7 +3,7 @@ import * as fsNode from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { logger, VERSION } from "@gajae-code/utils";
+import { VERSION } from "@gajae-code/utils";
 import { runCli } from "../src/cli";
 import { offerMacosCommunityApp } from "../src/cli/macos-community-app";
 import type { BinaryUpdateFlow, UpdateCommandDependencies } from "../src/cli/update-cli";
@@ -74,6 +74,9 @@ describe("verified binary invocation formatting", () => {
 		expect(formatVerifiedBinaryInvocation("/my bin/O'Brien/‘’‚‛;$HOME`id`/gjc", platform)).toBe(
 			"'/my bin/O'\\''Brien/‘’‚‛;$HOME`id`/gjc'",
 		);
+	});
+});
+
 describe("macOS community app integration", () => {
 	const release = { tag: "v999.0.0", version: "999.0.0", registry: DEFAULT_NPM_REGISTRY, warnings: [] };
 

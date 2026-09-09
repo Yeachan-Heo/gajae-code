@@ -1594,10 +1594,6 @@ export async function runUpdateCommand(
 		const releaseLock = opts.check ? undefined : await acquireBinaryUpdateLock(target.path);
 		let verified = false;
 		try {
-		// Check mode is read-only, including when another installer holds the lock.
-		const releaseLock = opts.check ? undefined : await acquireBinaryUpdateLock(target.path);
-		let verified = false;
-		try {
 			verified = (await verifyTarget(release, target.path)).ok;
 		} finally {
 			await releaseLock?.();
@@ -1607,13 +1603,6 @@ export async function runUpdateCommand(
 			printVerifiedMigrationTarget(target, release.version, writeStdout);
 			if (opts.check) {
 				record("update_install_completed", { channel, result: "skipped" });
-				return;
-			}
-			record("update_install_started", { channel, installMethod: target.method });
-			record("update_install_completed", { channel, result: "installed", installMethod: target.method });
-			await offerCommunityAppAfterUpdate(deps);
-			return;
-		}
 				return;
 			}
 			record("update_install_started", { channel, installMethod: target.method });
