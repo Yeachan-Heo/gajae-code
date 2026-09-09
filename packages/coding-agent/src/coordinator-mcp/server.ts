@@ -5780,9 +5780,9 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				authority.endpointIncarnation,
 				authority.endpointFileId,
 			);
-			if (canonicalJson(reconciled) !== canonicalJson(session))
-				await writeJsonFile(sessionFile(session.session_id), sessionFromCreationSnapshot(reconciled));
-			return reconciled;
+			if (reconciled.changed)
+				await writeJsonFile(sessionFile(session.session_id), sessionFromCreationSnapshot(reconciled.session));
+			return reconciled.session;
 		}
 		if (authority.endpointFileId === undefined) {
 			if (authority.endpointIncarnation !== session.broker.endpoint_incarnation)
@@ -5798,8 +5798,9 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			authority.endpointIncarnation,
 			authority.endpointFileId,
 		);
-		await writeJsonFile(sessionFile(session.session_id), sessionFromCreationSnapshot(rewritten));
-		return rewritten;
+		if (rewritten.changed)
+			await writeJsonFile(sessionFile(session.session_id), sessionFromCreationSnapshot(rewritten.session));
+		return rewritten.session;
 	}
 
 	/**

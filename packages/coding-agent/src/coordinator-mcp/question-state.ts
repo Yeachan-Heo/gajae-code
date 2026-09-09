@@ -1656,9 +1656,10 @@ export async function rewriteSessionEndpointAuthorityAndDeletions(
 	currentEndpointIncarnation: string,
 	endpointFileId: string,
 	options: { signal?: AbortSignal } = {},
-): Promise<CanonicalSessionSnapshotV1> {
+): Promise<{ session: CanonicalSessionSnapshotV1; changed: boolean }> {
 	assertEndpointAuthorityMigrationInput(expectedLegacyEndpointIncarnation, currentEndpointIncarnation, endpointFileId);
 	let rewritten: CanonicalSessionSnapshotV1 | null = null;
+	let authorityChanged = false;
 	await withNamespaceRegistry(
 		paths,
 		async registry => {
@@ -1705,6 +1706,7 @@ export async function rewriteSessionEndpointAuthorityAndDeletions(
 								currentEndpointIncarnation,
 							);
 							broker.endpoint_file_id = endpointFileId;
+							authorityChanged = true;
 						}
 						rewritePendingDeletionEndpointAuthorities(
 							registry,
@@ -1745,7 +1747,7 @@ export async function rewriteSessionEndpointAuthorityAndDeletions(
 		options,
 	);
 	if (!rewritten) throw new Error("state_corrupt");
-	return rewritten;
+	return { session: rewritten, changed: authorityChanged };
 }
 
 /** Remove a retained-session hint once its WAL has no unacknowledged deliveries. */
