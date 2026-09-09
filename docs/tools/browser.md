@@ -169,7 +169,7 @@ Security and lifecycle rules:
    - `tab.waitForUrl(pattern, { timeout? })`
    - `tab.waitForResponse(pattern, { timeout? })`
    - `tab.id(n)`
-14. Selector handling in `normalizeSelector()` accepts plain CSS and Puppeteer query handlers, and rewrites legacy Playwright-style prefixes `p-text/`, `p-xpath/`, `p-pierce/`, `p-aria/`; other `p-*` prefixes throw a `ToolError`.
+14. Selector handling in `normalizeSelector()` requires a non-empty string, accepts plain CSS and Puppeteer query handlers, and rewrites legacy Playwright-style prefixes `p-text/`, `p-xpath/`, `p-pierce/`, `p-aria/`; other `p-*` prefixes throw a `ToolError`. Non-string and whitespace-only selectors fail before browser actions. Numeric observation ids must use `(await tab.id(58)).click()`, not `tab.click(58)`. Omit optional selectors (or pass `undefined`) for unfocused `tab.press()` or page-level `tab.screenshot()`; null, false, zero, and blank selectors are not omission.
 15. `tab.observe()` clears the element cache, takes a Puppeteer accessibility snapshot, filters to interactive nodes unless `includeAll`, optionally filters to viewport-visible nodes, assigns numeric ids, caches `ElementHandle`s, and returns URL/title/viewport/scroll metadata plus `elements`.
 16. `tab.id(n)` resolves the cached `ElementHandle`, verifies `el.isConnected`, and throws a stale-id error after cache invalidation if the DOM changed or the cache was cleared.
 17. `tab.goto()` clears the cached element ids before navigating. Any new `tab.observe()` also clears and rebuilds the cache.

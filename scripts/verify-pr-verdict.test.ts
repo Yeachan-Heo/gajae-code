@@ -1,13 +1,15 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, test, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import * as url from "node:url";
 import {
+	authenticatedApproval,
 	canonicalDiffSha256,
 	parseBodyRisk,
 	parseGhPrCreate,
 	parsePrVerdict,
 	parseSelfReview,
+	resolvePullRequestEvent,
 	selfReviewSatisfiesPolicy,
 	selfReviewSignature,
 	selfReviewSignedPayload,
@@ -19,6 +21,59 @@ const base = "a".repeat(40);
 const head = "b".repeat(40);
 const digest = "c".repeat(64);
 const approved = `gajae.pr-review-verdict.v1 merge-approved sha256:${digest} reviewer:architect reviewer-id:review-agent evidence:bun test scripts/verify-pr-verdict.test.ts`;
+
+describe("authenticated approval API evidence", () => {
+	const event = { repository: { full_name: "owner/repo" }, pull_request: { number: 5416 } };
+	const review = (state: string, commit = head) => ({ state, commit_id: commit, user: { login: "review-agent" } });
+
+	test.each([
+		{ name: "valid exact-head approval", reviews: [review("APPROVED")], permission: "write", approved: true },
+		{ name: "changes requested after approval", reviews: [review("APPROVED"), review("CHANGES_REQUESTED")], permission: "write", approved: false },
+		{ name: "dismissed approval", reviews: [review("APPROVED"), review("DISMISSED")], permission: "write", approved: false },
+		{ name: "revoked collaborator permission", reviews: [review("APPROVED")], permission: "read", approved: false },
+		{ name: "stale-head approval", reviews: [review("APPROVED", "d".repeat(40))], permission: "write", approved: false },
+	])("$name", async scenario => {
+		const requests: string[] = [];
+		const originalFetch = globalThis.fetch;
+		const replacement: typeof fetch = Object.assign(async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+			const endpoint = String(input);
+			requests.push(endpoint);
+			expect(new Headers(init?.headers).get("Authorization")).toBe("Bearer test-token");
+			if (endpoint === "https://api.github.com/repos/owner/repo/pulls/5416/reviews?per_page=100&page=1") return Response.json(scenario.reviews);
+			if (endpoint === "https://api.github.com/repos/owner/repo/collaborators/review-agent/permission") return Response.json({ permission: scenario.permission });
+			throw new Error(`Unexpected endpoint: ${endpoint}`);
+		}, { preconnect: originalFetch.preconnect });
+		const spy = vi.spyOn(globalThis, "fetch").mockImplementation(replacement);
+		try {
+			const approval = await authenticatedApproval(event, "review-agent", head, "test-token");
+			expect(approval).toEqual(scenario.approved ? { login: "review-agent", headSha: head } : {});
+			expect(validatePrContract(validInput({ authenticatedReviewerLogin: approval.login, authenticatedReviewHeadSha: approval.headSha })).ok).toBe(scenario.approved);
+			expect(requests.length).toBe(scenario.name === "valid exact-head approval" || scenario.name === "revoked collaborator permission" ? 2 : 1);
+		} finally {
+			spy.mockRestore();
+		}
+	});
+
+	test("unavailable and malformed review responses never provide authenticated approval", async () => {
+		for (const failure of ["network", "http", "invalid-json", "object", "null", "malformed-entry"]) {
+			const originalFetch = globalThis.fetch;
+			const replacement: typeof fetch = Object.assign(async () => {
+				if (failure === "network") throw new Error("Reviews network unavailable");
+				if (failure === "http") return new Response("unavailable", { status: 503 });
+				if (failure === "invalid-json") return new Response("{broken");
+				return Response.json(failure === "object" ? {} : failure === "null" ? null : [null]);
+			}, { preconnect: originalFetch.preconnect });
+			const spy = vi.spyOn(globalThis, "fetch").mockImplementation(replacement);
+			try {
+				if (failure === "http") expect(await authenticatedApproval(event, "review-agent", head, "test-token")).toEqual({});
+				else await expect(authenticatedApproval(event, "review-agent", head, "test-token")).rejects.toThrow();
+				expect(spy).toHaveBeenCalledTimes(1);
+			} finally {
+				spy.mockRestore();
+			}
+		}
+	});
+});
 
 function selfReviewComment(overrides: {
 	body?: string;
@@ -67,6 +122,107 @@ function validInput(overrides: Partial<Parameters<typeof validatePrContract>[0]>
 		...overrides,
 	};
 }
+
+describe("review-event mutable PR body refresh", () => {
+	function captured() {
+		return {
+			repository: { full_name: "owner/repo" },
+			pull_request: {
+				number: 5416,
+				body: approved.replace("merge-approved", "needs-human"),
+				user: { login: "author" },
+				base: { ref: "dev", sha: base, repo: { full_name: "owner/repo" } },
+				head: { sha: head },
+			},
+		};
+	}
+
+	test("refreshes only body on the same authority using an authenticated request", async () => {
+		const event = captured();
+		const live = { ...event.pull_request, body: approved };
+		const resolved = await resolvePullRequestEvent(event, "pull_request_review", "test-token", async (endpoint, init) => {
+			expect(endpoint).toBe("https://api.github.com/repos/owner/repo/pulls/5416");
+			expect(new Headers(init.headers).get("Authorization")).toBe("Bearer test-token");
+			return Response.json(live);
+		});
+		expect(resolved).toEqual({ ...event, pull_request: live });
+		expect(resolved.pull_request?.base).toBe(event.pull_request.base);
+		expect(resolved.pull_request?.head).toBe(event.pull_request.head);
+		expect(event.pull_request.body).toContain("needs-human");
+		expect(validatePrContract(validInput({ body: resolved.pull_request?.body ?? "" })).ok).toBe(true);
+		// Refreshing text provides no new approval, risk or fast-gate authority.
+		for (const denied of [
+			{ authenticatedReviewerLogin: undefined },
+			{ authenticatedReviewHeadSha: "d".repeat(40) },
+			{ fastGatePassed: false },
+		]) {
+			expect(validatePrContract(validInput({ body: resolved.pull_request?.body ?? "", ...denied })).ok).toBe(false);
+		}
+	});
+
+	test.each(["merge-blocked", "needs-human", "", null])("current revoked or empty body cannot reuse captured approval: %s", async verdict => {
+		const event = captured();
+		event.pull_request.body = approved;
+		const body = verdict ? approved.replace("merge-approved", verdict) : verdict;
+		const resolved = await resolvePullRequestEvent(event, "pull_request_review", "token", async () => Response.json({ ...event.pull_request, body }));
+		expect(resolved.pull_request?.body).toBe(body);
+		expect(validatePrContract(validInput({ body: resolved.pull_request?.body ?? "" })).ok).toBe(false);
+	});
+
+	test("rejects every live authority drift rather than replacing the captured target", async () => {
+		const event = captured();
+		const live = { ...event.pull_request, body: approved };
+		for (const changed of [
+			{ ...live, number: 5417 },
+			{ ...live, user: { login: "other" } },
+			{ ...live, head: { sha: "d".repeat(40) } },
+			{ ...live, base: { ...live.base, sha: "e".repeat(40) } },
+			{ ...live, base: { ...live.base, ref: "main" } },
+			{ ...live, base: { ...live.base, repo: { full_name: "other/repo" } } },
+		]) {
+			await expect(resolvePullRequestEvent(event, "pull_request_review", "token", async () => Response.json(changed))).rejects.toThrow("authority drift");
+		}
+	});
+
+	test("unavailable or malformed metadata never falls back to captured body", async () => {
+		const event = captured();
+		for (const response of [
+			new Response("denied", { status: 403 }),
+			new Response("{broken"),
+			Response.json(null), Response.json([]), Response.json({}),
+			Response.json({ ...event.pull_request, body: 42 }),
+			Response.json({ ...event.pull_request, body: undefined }),
+		]) {
+			await expect(resolvePullRequestEvent(event, "pull_request_review", "token", async () => response)).rejects.toThrow();
+		}
+		await expect(resolvePullRequestEvent(event, "pull_request_review", "token", async () => { throw new Error("network unavailable"); })).rejects.toThrow("network unavailable");
+		let requests = 0;
+		const request = async () => { requests++; return Response.json(event.pull_request); };
+		await expect(resolvePullRequestEvent(event, "pull_request_review", "", request)).rejects.toThrow("authority is incomplete");
+		await expect(resolvePullRequestEvent({ repository: event.repository }, "pull_request_review", "token", request)).rejects.toThrow("authority is incomplete");
+		expect(requests).toBe(0);
+	});
+
+	test("ordinary PR events retain their captured body without API calls", async () => {
+		const event = captured();
+		for (const name of ["pull_request", "pull_request_target"]) {
+			const resolved = await resolvePullRequestEvent(event, name, "token", async () => { throw new Error("must not fetch"); });
+			expect(resolved).toBe(event);
+		}
+	});
+
+	test("issue-comment resolution retains its authenticated fetch and failure semantics", async () => {
+		const event = { repository: captured().repository, issue: { number: 5416 } };
+		const live = { ...captured().pull_request, body: approved };
+		const resolved = await resolvePullRequestEvent(event, "issue_comment", "token", async (endpoint, init) => {
+			expect(endpoint).toBe("https://api.github.com/repos/owner/repo/pulls/5416");
+			expect(new Headers(init.headers).get("Authorization")).toBe("Bearer token");
+			return Response.json(live);
+		});
+		expect(resolved.pull_request).toEqual(live);
+		expect(await resolvePullRequestEvent(event, "issue_comment", "token", async () => new Response("denied", { status: 403 }))).toBe(event);
+	});
+});
 
 describe("parsePrVerdict", () => {
 	test("accepts exactly one strict verdict line", () => {

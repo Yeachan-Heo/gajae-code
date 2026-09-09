@@ -57,6 +57,47 @@ test("acquisition exhaustion reports typed context for a live in-process holder"
 	});
 });
 
+test("exhaustion reports a valid owner published after parsing a null owner observation", async () => {
+	const filePath = path.join(await makeTemp(), "diagnostic-publication.json");
+	const lockDir = `${filePath}.lock`;
+	const infoPath = path.join(lockDir, "info");
+	await fs.mkdir(lockDir);
+	await fs.writeFile(infoPath, "null");
+	const originalDirectory = await fs.stat(lockDir);
+	const timestamp = Date.now();
+	const replacementBytes = JSON.stringify({ pid: process.pid, timestamp, owner_host_id: "publisher-host" });
+	const contender = vi.fn(async () => {});
+	let exhausted = false;
+	let mutated = false;
+	const realSleep = Bun.sleep;
+	vi.spyOn(Bun, "sleep").mockImplementation((async (ms?: number) => {
+		if (ms === 1) exhausted = true;
+		return await realSleep(ms ?? 0);
+	}) as typeof Bun.sleep);
+	const realParse = JSON.parse;
+	vi.spyOn(JSON, "parse").mockImplementation((text, reviver) => {
+		const parsed = realParse(text, reviver);
+		// The validated diagnostic observation is null; publish before its next read.
+		if (exhausted && text === "null" && !mutated) {
+			writeFileSync(infoPath, replacementBytes);
+			mutated = true;
+		}
+		return parsed;
+	});
+
+	const attempt = withFileLock(filePath, contender, { retries: 1, retryDelayMs: 1 });
+	await expect(attempt).rejects.toBeInstanceOf(FileLockAcquireError);
+	await expect(attempt).rejects.toMatchObject({
+		holder:
+			`held by pid ${process.pid} on host publisher-host (liveness unknown from this host)` +
+			` since ${new Date(timestamp).toISOString()}`,
+	});
+	expect(mutated).toBe(true);
+	expect(await fs.readFile(infoPath, "utf8")).toBe(replacementBytes);
+	expect(await fs.stat(lockDir)).toMatchObject({ dev: originalDirectory.dev, ino: originalDirectory.ino });
+	expect(contender).not.toHaveBeenCalled();
+});
+
 async function writeInfo(
 	lockDir: string,
 	info: {
@@ -531,26 +572,141 @@ describe("withFileLock stale owner liveness (#652)", () => {
 		expect(await fs.exists(lockDir)).toBe(true);
 	});
 
-	test("fails closed when present lock metadata is malformed", async () => {
-		const invalidMetadata = [
+	test("fails closed on aged stable malformed records with no liveness proof", async () => {
+		const malformedMetadata = [
 			["empty", ""],
+			["truncated", "{"],
+			["non-json", "not-json"],
 			["null", "null"],
-			["bad pid", JSON.stringify({ pid: 0, start_time: "test-start", timestamp: Date.now() - 10_000 })],
+			["bad pid", JSON.stringify({ pid: 0, start_time: "test-start", timestamp: Date.now() - 60_000 })],
 			["bad timestamp", JSON.stringify({ pid: process.pid, start_time: "test-start", timestamp: "old" })],
 		] as const;
 
-		for (const [label, contents] of invalidMetadata) {
+		for (const [label, contents] of malformedMetadata) {
 			const base = await makeTemp();
 			const lockedFile = path.join(base, `${label}.json`);
 			const lockDir = `${lockedFile}.lock`;
 			await fs.mkdir(lockDir, { recursive: true });
 			await fs.writeFile(path.join(lockDir, "info"), contents);
+			const old = new Date(Date.now() - 60_000);
+			await fs.utimes(path.join(lockDir, "info"), old, old);
 
 			await expect(
 				withFileLock(lockedFile, async () => {}, { staleMs: 1, retries: 2, retryDelayMs: 1 }),
 			).rejects.toThrow(FileLockAcquireError);
 			expect(await fs.exists(lockDir)).toBe(true);
 		}
+	});
+
+	test("does not reclaim an aged stable malformed record while a live publisher may own it", async () => {
+		// A paused live legacy publisher holds the directory while its info bytes
+		// stay stable: without PID/incarnation/host proof no clock or stability
+		// argument may delete its exact dir and overlap two critical sections.
+		const base = await makeTemp();
+		const lockedFile = path.join(base, "paused-publisher.json");
+		const lockDir = `${lockedFile}.lock`;
+		await fs.mkdir(lockDir, { recursive: true });
+		await fs.writeFile(path.join(lockDir, "info"), "");
+		const old = new Date(Date.now() - 60_000);
+		await fs.utimes(path.join(lockDir, "info"), old, old);
+
+		await expect(
+			withFileLock(lockedFile, async () => {}, { staleMs: 1, retries: 2, retryDelayMs: 1 }),
+		).rejects.toThrow(FileLockAcquireError);
+		expect(await fs.exists(lockDir)).toBe(true);
+	});
+
+	test("does not reclaim a malformed record carrying a foreign owner_host_id", async () => {
+		const base = await makeTemp();
+		const lockedFile = path.join(base, "foreign-malformed.json");
+		const lockDir = `${lockedFile}.lock`;
+		await fs.mkdir(lockDir, { recursive: true });
+		await fs.writeFile(path.join(lockDir, "info"), "{foreign-partial");
+		const old = new Date(Date.now() - 60_000);
+		await fs.utimes(path.join(lockDir, "info"), old, old);
+
+		await expect(
+			withFileLock(lockedFile, async () => {}, {
+				staleMs: 1,
+				retries: 2,
+				retryDelayMs: 1,
+				ownerHostId: "this-host",
+			}),
+		).rejects.toThrow(FileLockAcquireError);
+		expect(await fs.exists(lockDir)).toBe(true);
+	});
+
+	test("does not reclaim a fresh malformed record inside the publication window", async () => {
+		const base = await makeTemp();
+		const lockedFile = path.join(base, "fresh-malformed.json");
+		const lockDir = `${lockedFile}.lock`;
+		await fs.mkdir(lockDir, { recursive: true });
+		await fs.writeFile(path.join(lockDir, "info"), "");
+
+		await expect(
+			withFileLock(lockedFile, async () => {}, { staleMs: 1, retries: 2, retryDelayMs: 1 }),
+		).rejects.toThrow(FileLockAcquireError);
+		expect(await fs.exists(lockDir)).toBe(true);
+	});
+
+	test("does not reclaim a malformed record rewritten during observation", async () => {
+		const base = await makeTemp();
+		const lockedFile = path.join(base, "racing-malformed.json");
+		const lockDir = `${lockedFile}.lock`;
+		await fs.mkdir(lockDir, { recursive: true });
+		await fs.writeFile(path.join(lockDir, "info"), "");
+		const old = new Date(Date.now() - 60_000);
+		await fs.utimes(path.join(lockDir, "info"), old, old);
+		const originalDirectory = await fs.stat(lockDir);
+		const replacementBytes = "{partial";
+		let mutated = false;
+		const contender = vi.fn(async () => {});
+		const realSleep = Bun.sleep;
+		vi.spyOn(Bun, "sleep").mockImplementation((async (ms?: number) => {
+			if (ms === 1 && !mutated) {
+				await fs.writeFile(path.join(lockDir, "info"), replacementBytes);
+				mutated = true;
+			}
+			return await realSleep(ms ?? 0);
+		}) as typeof Bun.sleep);
+
+		await expect(withFileLock(lockedFile, contender, { staleMs: 1, retries: 2, retryDelayMs: 1 })).rejects.toThrow(
+			FileLockAcquireError,
+		);
+		expect(mutated).toBe(true);
+		expect(await fs.readFile(path.join(lockDir, "info"), "utf8")).toBe(replacementBytes);
+		expect(await fs.stat(lockDir)).toMatchObject({ dev: originalDirectory.dev, ino: originalDirectory.ino });
+		expect(contender).not.toHaveBeenCalled();
+	});
+
+	test("does not reclaim a malformed record that becomes valid during observation", async () => {
+		const base = await makeTemp();
+		const lockedFile = path.join(base, "publishing-malformed.json");
+		const lockDir = `${lockedFile}.lock`;
+		await fs.mkdir(lockDir, { recursive: true });
+		await fs.writeFile(path.join(lockDir, "info"), "");
+		const old = new Date(Date.now() - 60_000);
+		await fs.utimes(path.join(lockDir, "info"), old, old);
+		const originalDirectory = await fs.stat(lockDir);
+		const replacementBytes = JSON.stringify({ pid: process.pid, start_time: "unknown", timestamp: Date.now() });
+		let mutated = false;
+		const contender = vi.fn(async () => {});
+		const realSleep = Bun.sleep;
+		vi.spyOn(Bun, "sleep").mockImplementation((async (ms?: number) => {
+			if (ms === 1 && !mutated) {
+				await fs.writeFile(path.join(lockDir, "info"), replacementBytes);
+				mutated = true;
+			}
+			return await realSleep(ms ?? 0);
+		}) as typeof Bun.sleep);
+
+		await expect(withFileLock(lockedFile, contender, { staleMs: 1, retries: 2, retryDelayMs: 1 })).rejects.toThrow(
+			FileLockAcquireError,
+		);
+		expect(mutated).toBe(true);
+		expect(await fs.readFile(path.join(lockDir, "info"), "utf8")).toBe(replacementBytes);
+		expect(await fs.stat(lockDir)).toMatchObject({ dev: originalDirectory.dev, ino: originalDirectory.ino });
+		expect(contender).not.toHaveBeenCalled();
 	});
 
 	test("fails closed when lock metadata is a dangling symlink", async () => {
@@ -1053,7 +1209,6 @@ describe("file lock cleanup failure handling (#2478)", () => {
 		expect(await fs.exists(lockDir)).toBe(false);
 		expect(await fs.exists(`${lockDir}.removing`)).toBe(false);
 	});
-
 	test("reclaims a self-owned release leak on the next same-process acquisition", async () => {
 		const base = await makeTemp();
 		const lockedFile = path.join(base, "state.json");

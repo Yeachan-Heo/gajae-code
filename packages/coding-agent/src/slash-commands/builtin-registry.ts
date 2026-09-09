@@ -436,7 +436,11 @@ async function resolveModelCommandSelection(
 	const providerRef = parseProviderQualifiedSelector(selector);
 	const discoverableProviders = runtime.session.modelRegistry?.getDiscoverableProviders?.() ?? [];
 	if (providerRef && discoverableProviders.includes(providerRef.provider)) {
-		await runtime.session.modelRegistry.refreshProvider?.(providerRef.provider, "online");
+		await runtime.session.modelRegistry.refreshProvider?.(
+			providerRef.provider,
+			"online",
+			runtime.session.credentialSessionId,
+		);
 		availableModels = runtime.session.getAvailableModels?.() ?? [];
 		const refreshedSelection = resolveModelCommandSelectionFromAvailable(
 			runtime,
@@ -1699,7 +1703,7 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 					models: parsed.models,
 					force: parsed.force,
 				});
-				await runtime.session.modelRegistry.refresh("offline");
+				await runtime.session.modelRegistry.refresh("offline", runtime.session.credentialSessionId);
 				await runtime.output(formatProviderSetupResult(result));
 				await runtime.notifyConfigChanged?.();
 				return commandConsumed();
@@ -1740,7 +1744,7 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 						models: parsed.models,
 						force: parsed.force,
 					});
-					await runtime.ctx.session.modelRegistry.refresh("offline");
+					await runtime.ctx.session.modelRegistry.refresh("offline", runtime.ctx.session.credentialSessionId);
 					runtime.ctx.showStatus(formatProviderSetupResult(result));
 				} catch (err) {
 					runtime.ctx.showError(`Provider setup failed: ${errorMessage(err)}`);

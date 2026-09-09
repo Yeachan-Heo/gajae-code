@@ -137,8 +137,12 @@ interface TabApi {
 	id(n: number): Promise<ElementHandle>;
 }
 
-function normalizeSelector(selector: string): string {
-	if (!selector) return selector;
+function normalizeSelector(selector: unknown): string {
+	if (typeof selector !== "string" || selector.trim().length === 0) {
+		throw new ToolError(
+			"Selector must be a non-empty string (CSS or a Puppeteer query handler). For numeric observation ids, use (await tab.id(id)).click() instead of tab.click(id).",
+		);
+	}
 	if (selector.startsWith("p-") && !LEGACY_SELECTOR_PREFIXES.some(prefix => selector.startsWith(prefix))) {
 		throw new ToolError(
 			`Unsupported selector prefix. Use CSS or puppeteer query handlers (aria/, text/, xpath/, pierce/). Got: ${selector}`,
@@ -735,7 +739,7 @@ export class WorkerCore {
 			},
 			press: async (key, opts) => {
 				const selector = opts?.selector;
-				if (selector) await untilAborted(signal, () => page.focus(normalizeSelector(selector)));
+				if (selector !== undefined) await untilAborted(signal, () => page.focus(normalizeSelector(selector)));
 				await untilAborted(signal, () => page.keyboard.press(key));
 			},
 			scroll: async (deltaX, deltaY) => {
@@ -829,12 +833,11 @@ export class WorkerCore {
 		opts: ScreenshotOptions = {},
 	): Promise<ScreenshotResult> {
 		const page = this.#requirePage();
-		const fullPage = opts.selector ? false : (opts.fullPage ?? false);
+		const selector = opts.selector === undefined ? undefined : normalizeSelector(opts.selector);
+		const fullPage = selector !== undefined ? false : (opts.fullPage ?? false);
 		let buffer: Buffer;
-		if (opts.selector) {
-			const handle = (await untilAborted(signal, () =>
-				page.$(normalizeSelector(opts.selector!)),
-			)) as ElementHandle | null;
+		if (selector !== undefined) {
+			const handle = (await untilAborted(signal, () => page.$(selector))) as ElementHandle | null;
 			if (!handle) throw new ToolError("Screenshot selector did not resolve to an element");
 			try {
 				buffer = (await untilAborted(signal, () => handle.screenshot({ type: "png" }))) as Buffer;

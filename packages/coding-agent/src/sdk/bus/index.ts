@@ -27,7 +27,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { promisify } from "node:util";
-import { type RunSettlementProof, ThinkingLevel } from "@gajae-code/agent-core";
+import { isNonDispatchedToolEvent, type RunSettlementProof, ThinkingLevel } from "@gajae-code/agent-core";
 import type { ImageContent, TextContent, Tool } from "@gajae-code/ai/core";
 import type { NotificationServer as NativeNotificationServer } from "@gajae-code/natives";
 
@@ -114,6 +114,13 @@ import {
 	syntheticModelInputError,
 	syntheticNamespaceCollision,
 } from "../model-profile-model";
+import {
+	createPromptDeadlineLease,
+	isAttributableProgressEventType,
+	type PromptDeadlineLease,
+	promptDeadlineAt,
+	recordAttributableProgress,
+} from "../prompt-deadline-lease";
 import { formatPromptFailureForLocalLog, sanitizePromptFailure } from "../prompt-failure";
 import { PROMPT_CLIENT_REF_MAX_LENGTH, type SdkPromptTerminalOutcome } from "../prompt-status";
 import { OPERATIONS } from "../protocol/operation-registry";
@@ -4779,8 +4786,22 @@ export function createNotificationsExtension(
 			/** Fatal/uncertain closure: transport-level only, never a semantic terminal. */
 			fatal?: boolean;
 			createdAt: number;
-			deadlineMs: number;
+			/**
+			 * Bounded progress-aware terminal deadline: the inactivity window renews
+			 * on attributable tool progress correlated to this exact accepted prompt,
+			 * up to a hard maximum runtime anchored to acceptance.
+			 */
+			deadlineLease: PromptDeadlineLease;
 			deadlineTimer?: Parameters<typeof clearTimeout>[0];
+			/**
+			 * Identity of the in-flight deadline expiry attempt (set synchronously
+			 * by the firing deadline timer, cleared when the attempt completes or
+			 * is superseded). Fresh attributable progress recorded while the
+			 * attempt awaits durable reconciliation advances the lease generation;
+			 * the attempt must then back off instead of terminalizing a live prompt
+			 * (mirrors PromptDeadlineManager).
+			 */
+			deadlineAttempt?: { lease: PromptDeadlineLease; generation: number };
 			phase: "active" | "outcome_claimed" | "terminalizing" | "publication_closed" | "delivered";
 			outcome?: SdkPromptTerminalOutcome;
 			/** Agent-owned resource run captured at acceptance; cleanup targets only this handle. */
@@ -4995,10 +5016,57 @@ export function createNotificationsExtension(
 				finalizePrompt(key, correlation);
 			}
 		};
+		const readFiniteSetting = (key: "sdk.promptDeadlineMs" | "sdk.promptMaxRuntimeMs", fallback: number): number => {
+			const value = settings?.get(key);
+			return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+		};
+		/**
+		 * (Re)arm the accepted prompt's terminal deadline from its current lease.
+		 * `terminalizePrompt` stays the single authoritative terminal owner; this
+		 * only decides when it is invoked.
+		 */
+		const armPromptDeadline = (key: string, correlation: { commandId: string; turnId: string }) => {
+			const submission = promptSubmissions.get(key);
+			if (!submission) return;
+			const lease = submission.deadlineLease;
+			if (submission.deadlineTimer) clearTimeout(submission.deadlineTimer);
+			submission.deadlineTimer = setTimeout(
+				() => {
+					const current = promptSubmissions.get(key);
+					// Identity fencing: a discarded, evicted or re-accepted submission is
+					// never terminalized by a predecessor's timer.
+					if (!current || current.deadlineLease !== lease) return;
+					// Progress delivered while this timer was pending renews the lease, so
+					// re-arm instead of terminalizing a demonstrably live prompt.
+					if (Date.now() < promptDeadlineAt(lease)) {
+						armPromptDeadline(key, correlation);
+						return;
+					}
+					// Register the expiry attempt BEFORE the awaited durable claim:
+					// progress arriving while the claim is in flight must supersede
+					// this attempt (see the post-claim fence in terminalizePrompt).
+					current.deadlineAttempt = { lease, generation: lease.generation };
+					void terminalizePrompt(
+						correlation,
+						{
+							kind: "failed",
+							code: "prompt_deadline_exceeded",
+							message: "Prompt deadline exceeded.",
+							provenance: "deadline",
+						},
+						{ fence: true },
+						{ diagnostic: { reason: "Prompt deadline exceeded." } },
+					);
+				},
+				Math.max(0, promptDeadlineAt(lease) - Date.now()),
+			);
+		};
 		const emitPromptEvent = (event: AgentSessionEvent) => {
 			if (!runtime?.activePromptCorrelation) return;
 			cleanupPromptRecords();
 			const correlation = runtime.activePromptCorrelation;
+			// Renewal is attributed exactly like the correlated delivery below.
+			renewPromptDeadline(correlation, event);
 			const submission = promptSubmissions.get(promptSubmissionKey(correlation));
 			if (!submission || submission.abandoned) return;
 			const frame = {
@@ -5017,6 +5085,59 @@ export function createNotificationsExtension(
 				logger.warn(`sdk: correlated agent event delivery failed: ${String(error)}`);
 				abandonPrompt(submission);
 			}
+		};
+		/**
+		 * Status of a registered deadline expiry attempt after an awaited
+		 * reconciliation transition (mirrors PromptDeadlineManager).
+		 * - "current": no superseding progress; the attempt may proceed.
+		 * - "superseded": fresh attributable progress renewed the lease past now.
+		 *   The hard cap needs no special case: promptDeadlineAt is the minimum
+		 *   of the renewed window and acceptedAt+maxMs, so progress at an
+		 *   already-due cap still reads expired and the attempt proceeds.
+		 * - "stale": the submission was cleared, evicted or re-accepted under
+		 *   this attempt; it must touch nothing.
+		 */
+		type DeadlineAttemptStatus = "current" | "superseded" | "stale";
+		const deadlineAttemptStatus = (
+			key: string,
+			submission: PromptSubmission,
+			attempt: { lease: PromptDeadlineLease; generation: number },
+		): DeadlineAttemptStatus => {
+			if (promptSubmissions.get(key) !== submission || submission.deadlineLease !== attempt.lease) return "stale";
+			const lease = submission.deadlineLease;
+			if (lease.generation !== attempt.generation && Date.now() < promptDeadlineAt(lease)) return "superseded";
+			return "current";
+		};
+		/**
+		 * Renew the accepted prompt's deadline on attributable progress. The
+		 * allowlist stays owned by the shared lease module, so streaming chatter,
+		 * tool updates, heartbeats and retry bookkeeping never renew. Pairing-only
+		 * synthetic tool pairs (never dispatched, marked via the dispatch-identity
+		 * side channel rather than the wire) never renew either: they prove
+		 * pairing, not progress. Only a pre-terminal submission may re-arm behind
+		 * its terminal owner; progress arriving while a deadline expiry attempt
+		 * awaits durable reconciliation is recorded (advancing the attempt fence)
+		 * but never re-arms — the attempt itself reschedules on supersession.
+		 */
+		const renewPromptDeadline = (correlation: { commandId: string; turnId: string }, event: { type: string }) => {
+			if (!isAttributableProgressEventType(event.type) || isNonDispatchedToolEvent(event)) return;
+			const key = promptSubmissionKey(correlation);
+			const submission = promptSubmissions.get(key);
+			if (!submission) return;
+			if (
+				submission.deadlineAttempt &&
+				submission.deadlineLease === submission.deadlineAttempt.lease &&
+				(submission.phase === "outcome_claimed" || submission.phase === "terminalizing")
+			) {
+				recordAttributableProgress(submission.deadlineLease, Date.now());
+				return;
+			}
+			if (submission.terminal || submission.phase !== "active") return;
+			const generation = submission.deadlineLease.generation;
+			recordAttributableProgress(submission.deadlineLease, Date.now());
+			// Monotonic: stale or out-of-order progress never moves the lease.
+			if (submission.deadlineLease.generation === generation) return;
+			armPromptDeadline(key, correlation);
 		};
 		const flushPromptLifecycle = (key: string, submission: PromptSubmission) => {
 			for (const frame of submission.bufferedFrames.splice(0)) {
@@ -5077,7 +5198,11 @@ export function createNotificationsExtension(
 				terminal: false,
 				retainCorrelation: trackReconciliation,
 				createdAt: Date.now(),
-				deadlineMs: settings?.get("sdk.promptDeadlineMs") ?? 1_800_000,
+				deadlineLease: createPromptDeadlineLease({
+					now: Date.now(),
+					leaseMs: readFiniteSetting("sdk.promptDeadlineMs", 1_800_000),
+					maxMs: readFiniteSetting("sdk.promptMaxRuntimeMs", 21_600_000),
+				}),
 				phase: "active",
 				// Bound to the Agent run at `agent_start`; acceptance precedes execution.
 				executionHandle: undefined,
@@ -5085,21 +5210,12 @@ export function createNotificationsExtension(
 				reconciliationKind,
 				bufferedFrames: [],
 			};
-			promptSubmissions.set(promptSubmissionKey(correlation), submission);
+			const key = promptSubmissionKey(correlation);
+			promptSubmissions.set(key, submission);
 			if (trackReconciliation) await notePromptReconciliationAccepted(correlation, clientRef);
-			submission.deadlineTimer = setTimeout(() => {
-				void terminalizePrompt(
-					correlation,
-					{
-						kind: "failed",
-						code: "prompt_deadline_exceeded",
-						message: "Prompt deadline exceeded.",
-						provenance: "deadline",
-					},
-					{ fence: true },
-					{ diagnostic: { reason: "Prompt deadline exceeded." } },
-				);
-			}, submission.deadlineMs);
+			// Armed only after the durable accept: a rolled-back acceptance
+			// (`discardPromptAcceptance`) must leave no deadline behind.
+			if (promptSubmissions.get(key) === submission) armPromptDeadline(key, correlation);
 		};
 		/** Roll back process-local registration when durable acceptance failed. */
 		const discardPromptAcceptance = (correlation: { commandId: string; turnId: string }) => {
@@ -5127,6 +5243,7 @@ export function createNotificationsExtension(
 			code: string,
 			message: string,
 		) => {
+			submission.deadlineAttempt = undefined;
 			if (submission.deadlineTimer) clearTimeout(submission.deadlineTimer);
 			if (!submission.terminal) {
 				submission.terminal = true;
@@ -5224,9 +5341,28 @@ export function createNotificationsExtension(
 				// The claim is the durability boundary: without it nothing may be published
 				// and the endpoint must fail closed so the client rejects exactly once. The
 				// last durable record stays active for restart recovery.
+				submission.deadlineAttempt = undefined;
 				logger.warn(`sdk: prompt claim persistence failed: ${String(error)}`);
 				failPromptClosed(correlation, submission, "terminal_uncertain", "Prompt reconciliation is unavailable.");
 				return;
+			}
+			// Deadline-attempt fence across the awaited claim (mirrors
+			// PromptDeadlineManager): fresh attributable progress recorded while
+			// the claim was in flight advances the lease generation. The pending
+			// attempt must then back off — reset to active and reschedule —
+			// instead of fencing and publishing a deadline terminal for a live
+			// prompt. A re-accepted or evicted submission is never touched.
+			const deadlineAttempt = submission.deadlineAttempt;
+			if (deadlineAttempt) {
+				const key = promptSubmissionKey(correlation);
+				const status = deadlineAttemptStatus(key, submission, deadlineAttempt);
+				if (status === "stale") return;
+				if (status === "superseded") {
+					submission.deadlineAttempt = undefined;
+					submission.phase = "active";
+					armPromptDeadline(key, correlation);
+					return;
+				}
 			}
 			submission.outcome = winner;
 			submission.phase = "terminalizing";
@@ -5296,20 +5432,59 @@ export function createNotificationsExtension(
 				}
 				if (capture) capture.proof = proof;
 			}
+			// Second deadline-attempt fence across the awaited fencing transition:
+			// progress recorded while fencing was in flight supersedes exactly
+			// like progress during the claim. Non-deadline attempts skip this —
+			// their attempt identity was never registered.
+			if (deadlineAttempt) {
+				const key = promptSubmissionKey(correlation);
+				const status = deadlineAttemptStatus(key, submission, deadlineAttempt);
+				if (status === "stale") return;
+				if (status === "superseded") {
+					submission.deadlineAttempt = undefined;
+					submission.phase = "active";
+					armPromptDeadline(key, correlation);
+					return;
+				}
+			}
 			try {
-				await kindReconciliation.finalizeOutcome(
-					submission.reconciliationKind,
-					correlation,
-					winner,
-					extra?.error,
-					extra?.finalText,
-				);
+				if (deadlineAttempt) {
+					await kindReconciliation.finalizeOutcome(
+						submission.reconciliationKind,
+						correlation,
+						winner,
+						() =>
+							deadlineAttemptStatus(promptSubmissionKey(correlation), submission, deadlineAttempt) === "current",
+						extra?.error,
+						extra?.finalText,
+					);
+				} else {
+					await kindReconciliation.finalizeOutcome(
+						submission.reconciliationKind,
+						correlation,
+						winner,
+						extra?.error,
+						extra?.finalText,
+					);
+				}
 			} catch (error) {
 				// The durable pending claim survives; publishing an unpersisted terminal
 				// would contradict it, so fail the endpoint closed instead.
 				logger.warn(`sdk: prompt terminal persistence failed: ${String(error)}`);
 				failPromptClosed(correlation, submission, "terminal_uncertain", "Prompt reconciliation is unavailable.");
 				return;
+			}
+			if (deadlineAttempt) {
+				const key = promptSubmissionKey(correlation);
+				const status = deadlineAttemptStatus(key, submission, deadlineAttempt);
+				if (status === "stale") return;
+				if (status === "superseded") {
+					submission.deadlineAttempt = undefined;
+					submission.phase = "active";
+					armPromptDeadline(key, correlation);
+					return;
+				}
+				submission.deadlineAttempt = undefined;
 			}
 			if (submission.deadlineTimer) clearTimeout(submission.deadlineTimer);
 			if (!recordPromptTerminal(correlation)) return;

@@ -337,7 +337,7 @@ interface PullRequestEvent {
 		number?: number;
 		body?: string | null;
 		user?: { login?: string };
-		base?: { ref?: string; sha?: string };
+		base?: { ref?: string; sha?: string; repo?: { full_name?: string } };
 		head?: { sha?: string };
 	};
 	/** issue_comment events carry the PR under issue.number instead of pull_request. */
@@ -401,10 +401,9 @@ function issueCommentToSelfReview(comment: IssueComment): AuthenticatedSelfRevie
 	return { login, authorAssociation: comment.author_association ?? "NONE", body: comment.body };
 }
 
-async function authenticatedApproval(event: PullRequestEvent, reviewerId: string, headSha: string): Promise<{ login?: string; headSha?: string }> {
+export async function authenticatedApproval(event: PullRequestEvent, reviewerId: string, headSha: string, token = Bun.env.GITHUB_TOKEN): Promise<{ login?: string; headSha?: string }> {
 	const repository = event.repository?.full_name;
 	const number = event.pull_request?.number;
-	const token = Bun.env.GITHUB_TOKEN;
 	if (!repository || !number || !token) return {};
 	const reviews: PullRequestReview[] = [];
 	for (let page = 1; ; page++) {
@@ -503,41 +502,54 @@ async function runFastGate(cwd: string, trustedRoot: string): Promise<boolean> {
 }
 
 /**
- * issue_comment events carry no pull_request object; the PR is identified by the
- * comment's issue number when that issue is a pull request. Resolve the authoritative
- * PR data (body, author, immutable base, exact head) from the GitHub API using the
- * trusted workflow token so comment-triggered validations use the same immutable
- * event semantics as pull_request events. Non-PR comments resolve to no PR and fail.
+ * Comment events resolve their PR through the authenticated API as before.
+ * Review events refresh only mutable body text: every captured authority binding
+ * must still match. A rerun must never validate a different source or target.
  */
-async function resolvePullRequestEvent(event: PullRequestEvent): Promise<PullRequestEvent> {
-	if (event.pull_request) return event;
+export async function resolvePullRequestEvent(
+	event: PullRequestEvent,
+	eventName = Bun.env.GITHUB_EVENT_NAME,
+	token = Bun.env.GITHUB_TOKEN,
+	request: (url: string, init: RequestInit) => Promise<Response> = fetch,
+): Promise<PullRequestEvent> {
+	const refreshBody = eventName === "pull_request_review";
+	if (event.pull_request && !refreshBody) return event;
+	const captured = event.pull_request;
 	const repository = event.repository?.full_name;
-	const number = event.issue?.number;
-	const token = Bun.env.GITHUB_TOKEN;
+	const number = refreshBody ? captured?.number : event.issue?.number;
+	if (refreshBody && (
+		!repository || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/u.test(repository) ||
+		!Number.isSafeInteger(number) || !number || number < 1 || !token ||
+		!captured?.user?.login || !captured.base?.ref ||
+		captured.base.repo?.full_name !== repository ||
+		!SHA40.test(captured.base.sha ?? "") || !SHA40.test(captured.head?.sha ?? "")
+	)) throw new Error("Review event PR authority is incomplete; failing closed.");
 	if (!repository || !number || !token) return event;
-	const response = await fetch(`https://api.github.com/repos/${repository}/pulls/${number}`, {
+	const response = await request(`https://api.github.com/repos/${repository}/pulls/${number}`, {
 		headers: {
 			Accept: "application/vnd.github+json",
 			Authorization: `Bearer ${token}`,
 			"X-GitHub-Api-Version": "2022-11-28",
 		},
 	});
-	if (!response.ok) return event;
-	const pr = await response.json() as {
-		body?: string | null;
-		user?: { login?: string };
-		base?: { ref?: string; sha?: string };
-		head?: { sha?: string };
-	};
+	if (!response.ok) {
+		if (refreshBody) throw new Error(`Review event PR refresh failed: ${response.status}; failing closed.`);
+		return event;
+	}
+	const pr = await response.json() as NonNullable<PullRequestEvent["pull_request"]>;
+	if (refreshBody) {
+		if (!pr || typeof pr !== "object" || Array.isArray(pr) ||
+			(pr.body !== null && typeof pr.body !== "string") ||
+			pr.number !== number || pr.base?.repo?.full_name !== repository ||
+			pr.user?.login !== captured!.user!.login ||
+			pr.base?.ref !== captured!.base!.ref || pr.base?.sha !== captured!.base!.sha ||
+			pr.head?.sha !== captured!.head!.sha
+		) throw new Error("Review event PR authority drift or malformed live metadata; failing closed.");
+		return { ...event, pull_request: { ...captured, body: pr.body } };
+	}
 	return {
 		...event,
-		pull_request: {
-			number,
-			body: pr.body,
-			user: pr.user,
-			base: pr.base,
-			head: pr.head,
-		},
+		pull_request: { number, body: pr.body, user: pr.user, base: pr.base, head: pr.head },
 	};
 }
 
