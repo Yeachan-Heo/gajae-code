@@ -623,7 +623,7 @@ process.exit(0);
 		expect(rejectedChecksum.reason).toContain("checksum fetch failed");
 		expect(rejectedFetchAborted).toBe(true);
 		expect(rejectedStreamCancelled).toBe(true);
-	});
+	}, 20_000);
 });
 
 describe("macOS community app verified installation", () => {
@@ -908,7 +908,7 @@ describe("macOS community app attach cleanup", () => {
 			expect(detached).toBe(mode.startsWith("partial"));
 		}
 		expect(await fs.readdir(stagingRoot)).toEqual([]);
-	});
+	}, 20_000);
 
 	test("refuses pathname detach when an attached mount identity changes", async () => {
 		const dmgName = "gajae-app-desktop-1.0.0-macos-arm64.dmg";

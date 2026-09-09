@@ -698,6 +698,9 @@ exec python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1], "rb"
 					for (let attempt = 0; attempt < 400; attempt++) {
 						marker = fs.existsSync(markerPath) ? fs.readFileSync(markerPath, "utf8").trim() : "";
 						if (marker.includes("|")) break;
+						if (installer.exitCode !== null) {
+							throw new Error(`Installer exited before ${phase} marker (${installer.exitCode}):\n${await stdout}\n${await stderr}`);
+						}
 						await Bun.sleep(50);
 					}
 					expect(marker).toContain("|");
@@ -813,13 +816,13 @@ try:
         else:
             time.sleep(0.05)
 finally:
-    try:
-        os.killpg(pid, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
-    os.close(master)
     if status is None:
+        try:
+            os.killpg(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
         os.waitpid(pid, 0)
+    os.close(master)
 sys.exit(os.waitstatus_to_exitcode(status))
 `;
 			const proc = Bun.spawn(["python3", "-c", driver, installScript], {
