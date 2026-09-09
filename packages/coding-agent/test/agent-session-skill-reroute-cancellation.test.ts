@@ -13,6 +13,7 @@ import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { createSdkRunCapability } from "../src/sdk/host/sdk-run-capability";
+import { readSdkRunCapability } from "../src/session/sdk-run-capability-internal";
 
 let session: AgentSession | undefined;
 let authStorage: AuthStorage | undefined;
@@ -163,13 +164,17 @@ test.serial("keeps SDK ownership when an internal skill invocation becomes a cus
 		],
 	});
 	const promptCustomMessage = vi.spyOn(session, "promptCustomMessage").mockResolvedValue(undefined);
+	const sdkRunCapability = createSdkRunCapability("skill-owner-token");
 	await session.invokeSkill("fixture-skill", "owned", {
-		sdkRunCapability: createSdkRunCapability("skill-owner-token"),
+		sdkRunCapability,
 	});
 	expect(promptCustomMessage).toHaveBeenCalledWith(
 		expect.objectContaining({ customType: expect.any(String) }),
-		expect.objectContaining({ sdkRunToken: "skill-owner-token" }),
+		expect.objectContaining({ sdkRunCapability }),
 	);
+	const forwardedCapability = promptCustomMessage.mock.calls[0]?.[1]?.sdkRunCapability;
+	expect(forwardedCapability).toBe(sdkRunCapability);
+	expect(readSdkRunCapability(forwardedCapability)).toBe("skill-owner-token");
 });
 
 test.serial("cancels an ordinary prompt while it waits on the startup barrier", async () => {

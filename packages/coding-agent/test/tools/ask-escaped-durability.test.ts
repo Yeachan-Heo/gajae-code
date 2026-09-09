@@ -2,7 +2,8 @@ import { afterEach, describe, expect, it } from "bun:test";
 import { agentLoop } from "@gajae-code/agent-core/agent-loop";
 import type { AgentContext, AgentLoopConfig, AgentMessage, AgentToolContext } from "@gajae-code/agent-core/types";
 import type { Message } from "@gajae-code/ai";
-import { createMockModel } from "@gajae-code/ai/providers/mock";
+import { createMockModel, type MockModel } from "@gajae-code/ai/providers/mock";
+import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { readDeepInterviewStateCompact } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-recorder";
 import { deepInterviewStatePath } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-runtime";
@@ -15,6 +16,21 @@ function identityConverter(messages: AgentMessage[]): Message[] {
 	return messages.filter(
 		message => message.role === "user" || message.role === "assistant" || message.role === "toolResult",
 	) as Message[];
+}
+
+/** Only for unpublished recovery: this provider exposes no content before its terminal response. */
+function terminalOnlyStream(stream: MockModel["stream"]): MockModel["stream"] {
+	return (model, context, options) => {
+		const upstream = stream(model, context, options);
+		const terminal = new AssistantMessageEventStream();
+		void (async () => {
+			for await (const event of upstream) {
+				if (event.type === "done" || event.type === "error") terminal.push(event);
+			}
+			terminal.end();
+		})().catch(error => terminal.fail(error));
+		return terminal;
+	};
 }
 
 function createSession(cwd: string, sessionId: string): ToolSession {
@@ -131,7 +147,7 @@ describe("AskTool escaped deep-interview durability (#4926)", () => {
 			const toolResults: Array<{ isError?: boolean; text: string }> = [];
 			const userMessage = { role: "user" as const, content: "Ask the durability question", timestamp: 1 };
 
-			const stream = agentLoop([userMessage], context, config, undefined, mock.stream);
+			const stream = agentLoop([userMessage], context, config, undefined, terminalOnlyStream(mock.stream));
 			for await (const event of stream) {
 				if (event.type === "tool_execution_end") {
 					const first = event.result.content?.[0];

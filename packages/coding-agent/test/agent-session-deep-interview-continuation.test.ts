@@ -712,9 +712,26 @@ describe("AgentSession deep-interview continuation", () => {
 
 	it("claims genuine ingress exactly once while synthetic and agent-attributed streaming inputs cannot supersede", async () => {
 		await activateWorkflow("deep-interview");
+		// No run is accepted or queue drained by these stubs. Assert wakeups and
+		// enqueue identities independently, so a duplicate scheduler cannot hide
+		// behind a drained queue or compensate for a missing wakeup in another row.
 		const continueSpy = vi.spyOn(session.agent, "continue").mockResolvedValue();
 		const continueQueuedSpy = vi.spyOn(session.agent, "continueQueuedMessages").mockResolvedValue();
 		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue();
+		const followUpSpy = vi.spyOn(session.agent, "followUp");
+		const expectedQueuedWakeups: Record<string, number> = {
+			synthetic: 1,
+			"agent-attributed": 0,
+			direct: 0,
+			"stream-steer": 1,
+			"stream-follow-up": 0,
+			"busy-default": 1,
+			"explicit-steer": 1,
+			"explicit-follow-up": 0,
+			"public-steer": 1,
+			"public-follow-up": 0,
+			"custom-skill": 1,
+		};
 		let isStreaming = false;
 		Object.defineProperty(session, "isStreaming", { configurable: true, get: () => isStreaming });
 		const rows = [
@@ -745,6 +762,11 @@ describe("AgentSession deep-interview continuation", () => {
 			],
 		] as const;
 		for (const [index, [name, genuine, ingress]] of rows.entries()) {
+			const queuedWakeupsBefore = continueQueuedSpy.mock.calls.length;
+			const continuesBefore = continueSpy.mock.calls.length;
+			const promptsBefore = promptSpy.mock.calls.length;
+			const enqueuesBefore = followUpSpy.mock.calls.length;
+			const queuedBefore = session.agent.snapshotFollowUp();
 			isStreaming = name !== "direct";
 			const remindersBefore = developerReminders().length;
 			const settled = Promise.withResolvers<void>();
@@ -763,6 +785,19 @@ describe("AgentSession deep-interview continuation", () => {
 			await settled.promise;
 			await session.waitForIdle();
 			expect(developerReminders().length - remindersBefore, name).toBe(genuine ? 0 : 1);
+			expect(continueQueuedSpy.mock.calls.length - queuedWakeupsBefore, `${name}: queued wakeups`).toBe(
+				expectedQueuedWakeups[name],
+			);
+			expect(continueSpy.mock.calls.length - continuesBefore, `${name}: stop-gate wakeups`).toBe(genuine ? 0 : 1);
+			expect(promptSpy.mock.calls.length - promptsBefore, `${name}: direct prompt`).toBe(name === "direct" ? 1 : 0);
+			const enqueues = followUpSpy.mock.calls.slice(enqueuesBefore);
+			expect(enqueues, `${name}: one enqueue, even when steer admission is refused`).toHaveLength(
+				name === "direct" ? 0 : 1,
+			);
+			expect(session.agent.snapshotFollowUp(), `${name}: no duplicate or lost queued message`).toEqual([
+				...queuedBefore,
+				...enqueues.map(([message]) => message),
+			]);
 		}
 		expect(promptSpy).toHaveBeenCalledTimes(1);
 		expect(continueSpy).toHaveBeenCalledTimes(2);

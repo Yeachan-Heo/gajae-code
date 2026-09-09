@@ -13313,12 +13313,11 @@ export class AgentSession {
 				claimsGenuineUserIntent: options?.claimsGenuineUserIntent,
 				onPromoted: options?.onPromoted,
 				sdkRunToken: options?.sdkRunToken,
-				scheduleNonAdmittedWake: false,
+				wakeNonAdmittedQueue: true,
 				onQueued: message => {
 					if (this.#abortUnwind && !options?.forceOneAtATime) this.#abortUnwindSteerFallbacks.push(message);
 				},
 			});
-			this.#scheduleNonAdmittedQueuedContinuation();
 			return owner;
 		}
 		if (options?.forceOneAtATime) this.#sequentialSteerMessages.add(message);
@@ -13387,8 +13386,9 @@ export class AgentSession {
 			claimsGenuineUserIntent?: boolean;
 			onPromoted?: (promotion: { startsOwnRun?: boolean; removed?: boolean }) => void;
 			sdkRunToken?: string;
+			/** Refused steers must wake an existing queue as well as an empty one. */
+			wakeNonAdmittedQueue?: boolean;
 			onQueued?: (message: AgentMessage) => void;
-			scheduleNonAdmittedWake?: boolean;
 		},
 	): Promise<QueuedFollowUpOwner> {
 		this.#assertNoHandoffTransition();
@@ -13425,8 +13425,11 @@ export class AgentSession {
 			this.#scheduleQueuedFollowUpContinuation(() =>
 				this.agent.snapshotFollowUp().some(candidate => candidate === message),
 			);
-			if (options?.scheduleNonAdmittedWake !== false) this.#scheduleNonAdmittedQueuedContinuation();
+
 		}
+		// Own the unwind wakeup here, including refused steers behind existing work.
+		// Scheduling again in #queueSteer would wake the first enqueue twice.
+		if (queueWasEmpty || options?.wakeNonAdmittedQueue) this.#scheduleNonAdmittedQueuedContinuation();
 		return {
 			submissionId,
 			cancel: () => this.#cancelQueuedInput(message),
