@@ -327,7 +327,10 @@ describe("AuthStorage codex oauth ranking", () => {
 		expect(apiKey).toBe("api-acct-plus");
 	});
 
-	test.each(["gpt-5.6-sol", "gpt-5.3-codex-spark"])("skips exhausted Pro usage for %s without a plan filter", async modelId => {
+	test.each([
+		"gpt-5.6-sol",
+		"gpt-5.3-codex-spark",
+	])("skips exhausted Pro usage for %s without a plan filter", async modelId => {
 		if (!authStorage) throw new Error("test setup failed");
 		await authStorage.set("openai-codex", [
 			{ type: "oauth", ...createCredential("acct-pro", "pro@example.com") },

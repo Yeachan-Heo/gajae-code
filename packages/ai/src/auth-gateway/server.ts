@@ -647,6 +647,45 @@ async function markManagedGatewayCredentialFailure(
 	}
 }
 
+/**
+ * Records a provider-confirmed account-specific model rejection against the
+ * leased credential on the ordinary (non-managed) gateway path. The leased
+ * account is excluded from future selection so later requests stop picking the
+ * same model-incompatible account, but the credential is never invalidated: it
+ * may still serve other models. Never returns a replacement key — the current
+ * request surfaces the provider's own error and the next lease picks another
+ * credential.
+ */
+async function markUnmanagedGatewayCredentialModelFailure(
+	storage: AuthStorage,
+	model: Model<Api>,
+	error: unknown,
+	signal: AbortSignal,
+	format: string,
+	peer: string,
+): Promise<void> {
+	const trigger = classifyFallbackTrigger(error);
+	if (trigger.class !== "credential") return;
+	try {
+		await storage.markUsageLimitReached(model.provider, undefined, {
+			retryAfterMs: trigger.retryAfterMs,
+			signal,
+		});
+		logger.debug("auth-gateway recorded credential model rejection", {
+			format,
+			provider: model.provider,
+			peer,
+		});
+	} catch (markError) {
+		logger.warn("auth-gateway failed to record credential model rejection", {
+			format,
+			provider: model.provider,
+			peer,
+			error: cleanReason(markError) ?? "Credential bookkeeping failed",
+		});
+	}
+}
+
 function observeManagedGatewayFailure(
 	events: AssistantMessageEventStream,
 	markFailure: (error: unknown) => Promise<void>,
@@ -831,6 +870,15 @@ async function handleFormatEndpoint(
 				route.label,
 				peer,
 			);
+		} else {
+			await markUnmanagedGatewayCredentialModelFailure(
+				bootOpts.storage,
+				model,
+				error,
+				controller.signal,
+				route.label,
+				peer,
+			);
 		}
 		const classified = classifyGatewayError(error);
 		logger.warn("auth-gateway streamSimple threw", { format: route.label, error: classified.message, peer });
@@ -843,6 +891,17 @@ async function handleFormatEndpoint(
 				bootOpts.storage,
 				model,
 				apiKey,
+				error,
+				controller.signal,
+				route.label,
+				peer,
+			),
+		);
+	} else {
+		events = observeManagedGatewayFailure(events, error =>
+			markUnmanagedGatewayCredentialModelFailure(
+				bootOpts.storage,
+				model,
 				error,
 				controller.signal,
 				route.label,
@@ -1041,6 +1100,15 @@ async function handlePiNative(
 				"pi-native",
 				peer,
 			);
+		} else {
+			await markUnmanagedGatewayCredentialModelFailure(
+				bootOpts.storage,
+				model,
+				error,
+				controller.signal,
+				"pi-native",
+				peer,
+			);
 		}
 		const classified = classifyGatewayError(error);
 		logger.warn("auth-gateway streamSimple threw", { format: "pi-native", error: classified.message, peer });
@@ -1053,6 +1121,17 @@ async function handlePiNative(
 				bootOpts.storage,
 				model,
 				apiKey,
+				error,
+				controller.signal,
+				"pi-native",
+				peer,
+			),
+		);
+	} else {
+		events = observeManagedGatewayFailure(events, error =>
+			markUnmanagedGatewayCredentialModelFailure(
+				bootOpts.storage,
+				model,
 				error,
 				controller.signal,
 				"pi-native",
