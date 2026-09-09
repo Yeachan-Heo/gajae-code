@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, spyOn, test } from "bun:test";
+import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as fsPromises from "node:fs/promises";
 import * as os from "node:os";
@@ -6,6 +7,7 @@ import * as path from "node:path";
 import { logger } from "@gajae-code/utils";
 
 import { brokerProcessIncarnation, writeBrokerDiscovery } from "../src/sdk/broker/discovery";
+import { endpointIncarnation, matchesIndexedEndpointFile } from "../src/sdk/broker/endpoint-authority";
 import { SessionIndex } from "../src/sdk/broker/session-index";
 import { SDK_STATE_VERSION } from "../src/sdk/broker/state-version";
 import { HEARTBEAT_TTL_MS } from "../src/sdk/bus/daemon-paths";
@@ -37,10 +39,147 @@ afterEach(() => {
 	for (const directory of tempDirs.splice(0)) fs.rmSync(directory, { recursive: true, force: true });
 });
 
+// Keep the existing serialized authority preimage: reordering fields is an authority migration.
+test("file-bound endpoint incarnation preserves its existing digest field order", () => {
+	const record = { endpointGeneration: 2, endpointMtimeMs: 1_700_000_000_000.25, endpointFileId: "7:11", pid: 42 };
+	const expected = createHash("sha256")
+		.update(
+			'{"endpointGeneration":2,"endpointMtimeMs":1700000000000,"endpointFileId":"7:11","pid":42,"sessionId":"resumed"}',
+		)
+		.digest("hex");
+	expect(endpointIncarnation(record, "resumed")).toBe(expected);
+	expect(endpointIncarnation({ ...record, endpointFileId: "7:12" }, "resumed")).not.toBe(expected);
+});
+
+test("endpoint precision tolerance requires matching device and inode", () => {
+	const file = { dev: 7n, ino: 11n, mtimeMs: 1_700_000_000_000 };
+	const rounded = { endpointMtimeMs: file.mtimeMs + 0.0005, endpointFileId: "7:11" };
+	expect(matchesIndexedEndpointFile(file, rounded)).toBe(true);
+	expect(matchesIndexedEndpointFile(file, { ...rounded, endpointFileId: "8:11" })).toBe(false);
+	expect(matchesIndexedEndpointFile(file, { ...rounded, endpointFileId: "7:12" })).toBe(false);
+	expect(matchesIndexedEndpointFile(file, { endpointMtimeMs: rounded.endpointMtimeMs })).toBe(false);
+	expect(matchesIndexedEndpointFile(file, { endpointMtimeMs: file.mtimeMs })).toBe(true);
+	expect(matchesIndexedEndpointFile(file, { ...rounded, endpointMtimeMs: file.mtimeMs + 0.002 })).toBe(false);
+	expect(matchesIndexedEndpointFile(file, { ...rounded, endpointMtimeMs: Number.NaN })).toBe(false);
+});
+
+for (const corruption of ["foreign-session", "foreign-pid", "stale"] as const) {
+	test(`file-bound Router authority rejects ${corruption} endpoint payload`, async () => {
+		const fixture = await routerFixture({ start: false });
+		await Bun.write(
+			fixture.endpointFile,
+			JSON.stringify({
+				sessionId: corruption === "foreign-session" ? "another-session" : fixture.sessionId,
+				pid: corruption === "foreign-pid" ? 43 : 42,
+				url: "ws://router.test",
+				token: "secret",
+				...(corruption === "stale" ? { stale: true } : {}),
+			}),
+		);
+		const identity = await fsPromises.lstat(fixture.endpointFile, { bigint: true });
+		fixture.authority.endpointFileId = `${identity.dev}:${identity.ino}`;
+		fixture.authority.endpointMtimeMs = Number(identity.mtimeNs) / 1_000_000;
+		try {
+			await fixture.router.start();
+			expect(fixture.router.attachment(fixture.sessionId)).toBeNull();
+			expect(fixture.clients).toHaveLength(0);
+		} finally {
+			await fixture.router.stop();
+		}
+	});
+}
+
+for (const kind of ["valid", "oversize", "symlink", "fifo"] as const) {
+	(process.platform === "win32" && kind === "fifo" ? test.skip : test)(
+		`Router bounded descriptor read settles for ${kind} without pathname payload reads`,
+		async () => {
+			const fixture = await routerFixture({ start: false });
+			const originalSource = await Bun.file(fixture.endpointFile).text();
+			let endpointOpens = 0;
+			let pathnameReads = 0;
+			const realOpen = fsPromises.open.bind(fsPromises);
+			const realReadFile = fsPromises.readFile.bind(fsPromises);
+			// A forbidden read throws rather than hanging the regression on a FIFO.
+			const readSpy = spyOn(fsPromises, "readFile").mockImplementation((async (
+				file: Parameters<typeof fsPromises.readFile>[0],
+				options: Parameters<typeof fsPromises.readFile>[1],
+			) => {
+				if (file === fixture.endpointFile) {
+					pathnameReads++;
+					throw new Error("Router must not read endpoint payloads by pathname");
+				}
+				return realReadFile(file, options);
+			}) as typeof fsPromises.readFile);
+			const openSpy = spyOn(fsPromises, "open").mockImplementation(async (file, flags, mode) => {
+				if (file === fixture.endpointFile && ++endpointOpens === 1 && kind !== "valid") {
+					const displaced = `${fixture.endpointFile}.original`;
+					await fsPromises.rename(fixture.endpointFile, displaced);
+					if (kind === "symlink") await fsPromises.symlink(displaced, fixture.endpointFile);
+					else if (kind === "fifo") {
+						const result = Bun.spawnSync(["mkfifo", fixture.endpointFile]);
+						if (result.exitCode !== 0) throw new Error(`mkfifo failed: ${result.stderr.toString()}`);
+					} else await Bun.write(fixture.endpointFile, originalSource + " ".repeat(4_097));
+				}
+				return realOpen(file, flags, mode);
+			});
+			try {
+				await fixture.router.start();
+				expect(pathnameReads).toBe(0);
+				expect(endpointOpens).toBeGreaterThan(0);
+				if (kind === "valid") {
+					const attachment = fixture.router.attachment(fixture.sessionId);
+					expect(attachment?.isCurrent()).toBe(true);
+					await attachment!.sendMaintenance?.("bounded-positive-control");
+					expect(fixture.clients[0].sent).toHaveLength(1);
+				} else {
+					const substituted = await fsPromises.lstat(fixture.endpointFile);
+					if (kind === "fifo") expect(substituted.isFIFO()).toBe(true);
+					else if (kind === "symlink") expect(substituted.isSymbolicLink()).toBe(true);
+					else expect(substituted.size).toBeGreaterThan(4_096);
+					expect(fixture.router.attachment(fixture.sessionId)).toBeNull();
+					expect(fixture.clients).toHaveLength(0);
+				}
+			} finally {
+				openSpy.mockRestore();
+				readSpy.mockRestore();
+				await fixture.router.stop();
+			}
+		},
+		2_000,
+	);
+}
+
+for (const invalid of [{ version: 2 }, { url: "" }, { token: 7 }, { token: "" }]) {
+	test(`Router bounded endpoint parser rejects ${JSON.stringify(invalid)}`, async () => {
+		const fixture = await routerFixture({ start: false });
+		await Bun.write(
+			fixture.endpointFile,
+			JSON.stringify({
+				sessionId: fixture.sessionId,
+				pid: 42,
+				url: "ws://router.test",
+				token: "secret",
+				...invalid,
+			}),
+		);
+		const identity = await fsPromises.lstat(fixture.endpointFile, { bigint: true });
+		fixture.authority.endpointFileId = `${identity.dev}:${identity.ino}`;
+		fixture.authority.endpointMtimeMs = Number(identity.mtimeNs) / 1_000_000;
+		try {
+			await fixture.router.start();
+			expect(fixture.router.attachment(fixture.sessionId)).toBeNull();
+			expect(fixture.clients).toHaveLength(0);
+		} finally {
+			await fixture.router.stop();
+		}
+	});
+}
+
 interface RouterFixtureAuthority {
 	generation: number;
 	pid: number;
 	endpointMtimeMs: number;
+	endpointFileId?: string;
 	indexed: boolean;
 	terminalUncertain: boolean;
 	warnings: string[];
@@ -103,7 +242,7 @@ async function routerFixture(
 	fs.writeFileSync(endpointFile, JSON.stringify({ sessionId, url: "ws://router.test", token: "secret", pid: 42 }));
 	const endpointMtimeMs = fs.statSync(endpointFile).mtimeMs;
 
-	const authority = {
+	const authority: RouterFixtureAuthority = {
 		generation: 1,
 		pid: 42,
 		endpointMtimeMs,
@@ -130,6 +269,7 @@ async function routerFixture(
 							endpointGeneration: authority.generation,
 							pid: authority.pid,
 							endpointMtimeMs: authority.endpointMtimeMs,
+							...(authority.endpointFileId === undefined ? {} : { endpointFileId: authority.endpointFileId }),
 							live: true,
 							indexSeq: authority.generation,
 							terminalUncertain: authority.terminalUncertain || undefined,
@@ -2716,6 +2856,7 @@ describe("SessionRouter dispatch authority", () => {
 			await fsPromises.utimes(fixture.endpointFile, timestamp, timestamp);
 			const original = await fsPromises.lstat(fixture.endpointFile);
 			fixture.authority.endpointMtimeMs = original.mtimeMs + delta;
+			fixture.authority.endpointFileId = `${original.dev}:${original.ino}`;
 			try {
 				await fixture.router.start();
 				const attachment = fixture.router.attachment(fixture.sessionId);
@@ -2737,6 +2878,132 @@ describe("SessionRouter dispatch authority", () => {
 			}
 		});
 	}
+
+	for (const delta of [-0.000244140625, 0.000244140625]) {
+		test(`identity-less endpoint rounding difference ${delta} fails closed`, async () => {
+			const fixture = await routerFixture({ start: false });
+			const timestamp = new Date(1_700_000_000_000);
+			await fsPromises.utimes(fixture.endpointFile, timestamp, timestamp);
+			fixture.authority.endpointMtimeMs = timestamp.getTime() + delta;
+			try {
+				await fixture.router.start();
+				expect(fixture.router.attachment(fixture.sessionId)).toBeNull();
+				expect(fixture.clients).toHaveLength(0);
+			} finally {
+				await fixture.router.stop();
+			}
+		});
+	}
+
+	for (const transition of ["gained", "lost", "replaced"] as const) {
+		test(`final index refresh rejects ${transition} endpoint file identity`, async () => {
+			let fixture: RouterFixture;
+			let refreshes = 0;
+			fixture = await routerFixture({
+				start: false,
+				onIndexRefresh: () => {
+					if (++refreshes !== 2) return;
+					if (transition === "lost") delete fixture.authority.endpointFileId;
+					else fixture.authority.endpointFileId = "999:999";
+				},
+			});
+			const identity = await fsPromises.lstat(fixture.endpointFile, { bigint: true });
+			if (transition !== "gained") fixture.authority.endpointFileId = `${identity.dev}:${identity.ino}`;
+			try {
+				await fixture.router.start();
+				expect(refreshes).toBeGreaterThanOrEqual(2);
+				expect(fixture.router.attachment(fixture.sessionId)).toBeNull();
+				expect(fixture.clients).toHaveLength(0);
+			} finally {
+				await fixture.router.stop();
+			}
+		});
+	}
+
+	test("rounded lifecycle adoption publishes the final indexed authority and remains usable", async () => {
+		const fixture = await routerFixture({ initiallyIndexed: false });
+		const endpoint = await Bun.file(fixture.endpointFile).json();
+		const identity = await fsPromises.lstat(fixture.endpointFile, { bigint: true });
+		const endpointMtimeMs = Number(identity.mtimeNs) / 1_000_000;
+		const endpointFileId = `${identity.dev}:${identity.ino}`;
+		const adopted = await fixture.router.adoptLifecycleResult(
+			{
+				ok: true,
+				result: {
+					sessionId: fixture.sessionId,
+					endpointGeneration: 1,
+					pid: 42,
+					endpointMtimeMs: endpointMtimeMs + 0.0005,
+					endpointFileId,
+					endpoint,
+				},
+			},
+			{ sessionId: fixture.sessionId, cwd: fixture.repo },
+		);
+		try {
+			expect(adopted.isCurrent()).toBe(false);
+			fixture.authority.endpointFileId = endpointFileId;
+			fixture.authority.endpointMtimeMs = endpointMtimeMs;
+			fixture.authority.indexed = true;
+			await fixture.router.reconcile();
+			expect(adopted.isCurrent()).toBe(true);
+			expect(fixture.router.attachment(fixture.sessionId)).toBe(adopted);
+			expect(adopted.authorityId).toBe(
+				sessionAttachmentAuthorityId({
+					sessionId: fixture.sessionId,
+					generation: 1,
+					pid: 42,
+					endpointMtimeMs,
+					url: endpoint.url,
+					token: endpoint.token,
+					endpointIdentity: {
+						dev: identity.dev,
+						ino: identity.ino,
+						mtimeMs: fs.statSync(fixture.endpointFile).mtimeMs,
+						mtimeNs: identity.mtimeNs,
+						ctimeNs: identity.ctimeNs,
+						size: identity.size,
+					},
+				}),
+			);
+			await adopted.sendMaintenance?.("resumed");
+			expect(fixture.clients[0].sent).toHaveLength(1);
+		} finally {
+			await fixture.router.stop();
+		}
+	});
+
+	test("rounded lifecycle adoption rejects a mismatched indexed file identity", async () => {
+		const fixture = await routerFixture({ initiallyIndexed: false });
+		const endpoint = await Bun.file(fixture.endpointFile).json();
+		const identity = await fsPromises.lstat(fixture.endpointFile, { bigint: true });
+		const endpointMtimeMs = Number(identity.mtimeNs) / 1_000_000 + 0.0005;
+		const adopted = await fixture.router.adoptLifecycleResult(
+			{
+				ok: true,
+				result: {
+					sessionId: fixture.sessionId,
+					endpointGeneration: 1,
+					pid: 42,
+					endpointMtimeMs,
+					endpointFileId: `${identity.dev}:${identity.ino}`,
+					endpoint,
+				},
+			},
+			{ sessionId: fixture.sessionId, cwd: fixture.repo },
+		);
+		try {
+			fixture.authority.endpointMtimeMs = endpointMtimeMs;
+			fixture.authority.endpointFileId = `${identity.dev}:${identity.ino + 1n}`;
+			fixture.authority.indexed = true;
+			await fixture.router.reconcile();
+			expect(adopted.isCurrent()).toBe(false);
+			expect(fixture.router.attachment(fixture.sessionId)).toBeNull();
+			expect(fixture.clients[0].sent).toHaveLength(0);
+		} finally {
+			await fixture.router.stop();
+		}
+	});
 
 	test("sendMaintenance fails closed when the endpoint file is replaced under it (#4730 review)", async () => {
 		// A replacement that preserves sessionId/pid/url/token and even mtime must

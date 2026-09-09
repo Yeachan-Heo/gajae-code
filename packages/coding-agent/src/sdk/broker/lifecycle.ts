@@ -777,6 +777,7 @@ type LiveResumeRecord = {
 	endpointGeneration: number;
 	pid: number;
 	endpointMtimeMs?: number;
+	endpointFileId?: string;
 	processIncarnation?: string;
 	hostIncarnation?: string;
 	live: boolean;
@@ -833,6 +834,7 @@ function sameLiveResumeRecord(expected: LiveResumeRecord, current: LiveResumeRec
 		current.endpointGeneration === expected.endpointGeneration &&
 		current.pid === expected.pid &&
 		current.endpointMtimeMs === expected.endpointMtimeMs &&
+		current.endpointFileId === expected.endpointFileId &&
 		(current.hostIncarnation ?? current.processIncarnation) ===
 			(expected.hostIncarnation ?? expected.processIncarnation) &&
 		sameResumeLocator(current, expected.locator.cwd, expected.locator.stateRoot)
@@ -4027,6 +4029,7 @@ async function currentReadyAuthority(
 			url?: unknown;
 			token?: unknown;
 			pid?: unknown;
+			stale?: unknown;
 		};
 		// Native-alive owned readiness is the admission authority. `record.live`
 		// also requires a fresh index heartbeat projection, which can lag a just-
@@ -4048,12 +4051,14 @@ async function currentReadyAuthority(
 			!record ||
 			record.terminal ||
 			record.terminalUncertain ||
+			!isSessionAuthorityEligible(record) ||
 			record.pid !== expected.pid ||
 			resolveEquivalentPath(record.locator.stateRoot) !== resolveEquivalentPath(root) ||
 			(record.hostIncarnation ?? record.processIncarnation) !== expected.incarnation ||
 			!matchesIndexedEndpointFile(endpointFile, record) ||
 			endpoint.pid !== expected.pid ||
 			endpoint.sessionId !== id ||
+			endpoint.stale === true ||
 			typeof endpoint.url !== "string" ||
 			typeof endpoint.token !== "string"
 		)
@@ -4061,6 +4066,16 @@ async function currentReadyAuthority(
 		if (
 			observeProcess(expected.pid, expected.incarnation, value => processIncarnationForBroker(broker, value)) !==
 			"alive"
+		)
+			return undefined;
+		const currentFile = await readEndpointFile(endpointPath);
+		if (
+			!currentFile ||
+			currentFile.dev !== endpointFile.dev ||
+			currentFile.ino !== endpointFile.ino ||
+			currentFile.mtimeNs !== endpointFile.mtimeNs ||
+			currentFile.source !== endpointSource ||
+			!matchesIndexedEndpointFile(currentFile, record)
 		)
 			return undefined;
 		// Every other field of this authority comes from the indexed record, and
@@ -4072,7 +4087,7 @@ async function currentReadyAuthority(
 		return {
 			endpoint: endpoint as Record<string, unknown>,
 			endpointSource,
-			endpointMtimeMs: record.endpointMtimeMs ?? endpointFile.mtimeMs,
+			endpointMtimeMs: record.endpointMtimeMs!,
 			...(record.endpointFileId === undefined ? {} : { endpointFileId: record.endpointFileId }),
 			endpointGeneration: record.endpointGeneration,
 		};
@@ -5023,6 +5038,7 @@ async function executeLifecycleResponse(
 						endpointIncarnation: finalIncarnation,
 						pid: current.pid,
 						endpointMtimeMs: current.endpointMtimeMs,
+						...(current.endpointFileId === undefined ? {} : { endpointFileId: current.endpointFileId }),
 						endpoint: endpoint.result,
 						reused: true,
 					},
@@ -5500,6 +5516,7 @@ async function executeLifecycleResponse(
 			{
 				endpointGeneration: verified.endpointGeneration,
 				endpointMtimeMs: verified.endpointMtimeMs,
+				...(verified.endpointFileId === undefined ? {} : { endpointFileId: verified.endpointFileId }),
 				pid: spawnedAuthority.pid,
 				...(verified.endpointFileId === undefined ? {} : { endpointFileId: verified.endpointFileId }),
 			},
@@ -5515,6 +5532,7 @@ async function executeLifecycleResponse(
 				endpointIncarnation: replayIncarnation,
 				pid: verified.endpoint.pid,
 				endpointMtimeMs: verified.endpointMtimeMs,
+				...(verified.endpointFileId === undefined ? {} : { endpointFileId: verified.endpointFileId }),
 				endpoint: verified.endpoint,
 				// Public, ledger-replayable evidence of the bootstrap authority that
 				// reached this runtime. The private key never enters the response.

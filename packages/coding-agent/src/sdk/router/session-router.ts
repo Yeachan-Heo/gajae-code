@@ -2,7 +2,7 @@ import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { logger, resolveEquivalentPath } from "@gajae-code/utils";
-import { endpointIncarnation, matchesIndexedEndpointFile } from "../broker/endpoint-authority";
+import { endpointIncarnation, matchesIndexedEndpointFile, readEndpointFile } from "../broker/endpoint-authority";
 import {
 	canonicalSessionCwd,
 	SessionIndex as DefaultSessionIndex,
@@ -21,8 +21,9 @@ import {
 } from "../client/client";
 import {
 	endpointDirectory,
+	isUsableSessionId,
+	parseSdkSessionEndpoint,
 	readSdkBrokerDiscovery,
-	readSdkSessionEndpoint,
 	type SdkSessionEndpoint,
 } from "../client/discovery";
 import {
@@ -338,12 +339,12 @@ type AttachedSession = {
 	readonly endpoint: SdkSessionEndpoint;
 	readonly generation: number;
 	readonly pid: number;
-	readonly endpointMtimeMs: number;
+	endpointMtimeMs: number;
 	/** No-follow endpoint identity proven before this attachment became current. */
 	readonly endpointIdentity: SessionEndpointIdentity;
 	readonly runEpoch: number;
 	readonly client: SessionRouterClient;
-	readonly indexed: IndexedSession;
+	indexed: IndexedSession;
 	readonly cursor: { seq: number };
 	readonly barrier: ReplayBarrier;
 	readonly capability: SessionAttachment;
@@ -586,6 +587,13 @@ function readReplayGap(
 }
 
 function sameIndexedAuthority(expected: IndexedSession, current: IndexedSession): boolean {
+	const sameEndpointAuthority =
+		expected.endpointMtimeMs !== undefined &&
+		current.endpointMtimeMs !== undefined &&
+		current.endpointFileId === expected.endpointFileId &&
+		(expected.endpointFileId === undefined
+			? current.endpointMtimeMs === expected.endpointMtimeMs
+			: Math.abs(current.endpointMtimeMs - expected.endpointMtimeMs) <= 0.001);
 	return (
 		current.sessionId === expected.sessionId &&
 		current.live &&
@@ -593,7 +601,12 @@ function sameIndexedAuthority(expected: IndexedSession, current: IndexedSession)
 		!current.terminalUncertain &&
 		current.endpointGeneration === expected.endpointGeneration &&
 		current.pid === expected.pid &&
-		current.endpointMtimeMs === expected.endpointMtimeMs
+		sameEndpointAuthority &&
+		current.locator.cwd === expected.locator.cwd &&
+		resolveEquivalentPath(current.locator.stateRoot) === resolveEquivalentPath(expected.locator.stateRoot) &&
+		(expected.processIncarnation === undefined || current.processIncarnation === expected.processIncarnation) &&
+		(expected.hostIncarnation === undefined || current.hostIncarnation === expected.hostIncarnation) &&
+		(expected.lifecycleRequestId === undefined || current.lifecycleRequestId === expected.lifecycleRequestId)
 	);
 }
 
@@ -601,8 +614,22 @@ type AdoptedSession = {
 	readonly generation: number;
 	readonly pid: number;
 	readonly endpointMtimeMs: number;
+	readonly endpointFileId?: string;
 	readonly attachment: SessionAttachment;
 };
+
+function matchesAdoptedSessionAuthority(adopted: AdoptedSession, indexed: IndexedSession): boolean {
+	if (
+		indexed.endpointGeneration !== adopted.generation ||
+		indexed.pid !== adopted.pid ||
+		indexed.endpointMtimeMs === undefined ||
+		indexed.endpointFileId !== adopted.endpointFileId
+	)
+		return false;
+	return adopted.endpointFileId === undefined
+		? indexed.endpointMtimeMs === adopted.endpointMtimeMs
+		: Math.abs(indexed.endpointMtimeMs - adopted.endpointMtimeMs) <= 0.001;
+}
 
 /**
  * Broker-index-backed SDK attachment authority. Providers receive only opaque
@@ -786,12 +813,14 @@ export class SessionRouter {
 		const endpointGeneration = readPositiveInteger(result.endpointGeneration);
 		const pid = readPositiveInteger(result.pid);
 		const endpointMtimeMs = readEndpointMtime(result.endpointMtimeMs);
+		const endpointFileId = typeof result.endpointFileId === "string" ? result.endpointFileId : undefined;
 		if (
 			sessionId !== fallback.sessionId ||
 			(this.#sessionIds !== undefined && !this.#sessionIds.has(sessionId ?? "")) ||
 			endpointGeneration === undefined ||
 			pid === undefined ||
 			endpointMtimeMs === undefined ||
+			(result.endpointFileId !== undefined && !endpointFileId) ||
 			endpointRecord.sessionId !== sessionId ||
 			endpointRecord.pid !== pid ||
 			typeof endpointRecord.url !== "string" ||
@@ -809,6 +838,7 @@ export class SessionRouter {
 			endpointGeneration,
 			pid,
 			endpointMtimeMs,
+			...(endpointFileId === undefined ? {} : { endpointFileId }),
 			live: true,
 			indexSeq: 0,
 			identityProvenance: "legacy",
@@ -1302,9 +1332,7 @@ export class SessionRouter {
 				indexedSession?.live === true &&
 				isSessionAuthorityEligible(indexedSession) &&
 				!indexedSession.terminalUncertain &&
-				indexedSession.endpointGeneration === adopted.generation &&
-				indexedSession.pid === adopted.pid &&
-				indexedSession.endpointMtimeMs === adopted.endpointMtimeMs;
+				matchesAdoptedSessionAuthority(adopted, indexedSession);
 			const endpoint = exactIndex ? await this.#readEndpoint(indexedSession).catch(() => null) : null;
 			if (
 				!exactIndex ||
@@ -1403,7 +1431,16 @@ export class SessionRouter {
 		if (!matchesIndexedEndpointFile(identityBefore, indexed)) return false;
 		let raw: Record<string, unknown>;
 		try {
-			const parsed = JSON.parse(await Bun.file(attached.endpoint.path).text());
+			const file = await readEndpointFile(attached.endpoint.path);
+			if (
+				!file ||
+				file.dev !== identityBefore.dev ||
+				file.ino !== identityBefore.ino ||
+				file.mtimeNs !== identityBefore.mtimeNs ||
+				file.size !== identityBefore.size
+			)
+				return false;
+			const parsed = JSON.parse(file.source);
 			if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return false;
 			raw = parsed as Record<string, unknown>;
 		} catch {
@@ -1437,7 +1474,7 @@ export class SessionRouter {
 	 */
 	async #readProvenEndpoint(
 		indexed: IndexedSession,
-	): Promise<{ endpoint: SdkSessionEndpoint; identity: SessionEndpointIdentity } | null> {
+	): Promise<{ endpoint: SdkSessionEndpoint; identity: SessionEndpointIdentity; indexed: IndexedSession } | null> {
 		if (!isSessionAuthorityEligible(indexed)) return null;
 		const cwd = indexed.locator.cwd;
 		const defaultStateRoot = path.join(cwd, ".gjc", "state");
@@ -1452,20 +1489,30 @@ export class SessionRouter {
 					? "chat"
 					: undefined;
 		if (!scope || indexed.endpointMtimeMs === undefined || !Number.isFinite(indexed.endpointMtimeMs)) return null;
+		if (!isUsableSessionId(indexed.sessionId)) return null;
 		const endpointPath = path.join(endpointDirectory(cwd, scope), `${indexed.sessionId}.json`);
 		const endpointIdentity = await lstatEndpoint(endpointPath);
-		const endpoint = await readSdkSessionEndpoint(cwd, indexed.sessionId, scope);
-		if (!endpoint || endpoint.stale || endpoint.pid !== indexed.pid) return null;
 		if (!endpointIdentity || !matchesIndexedEndpointFile(endpointIdentity, indexed)) return null;
 		// Identity is proven INSIDE this authority read (#4730 review): sampling it
 		// afterwards would let an identical rename between the read and the sample
 		// install the replacement's inode as the trusted baseline.
 		const provenIdentity = endpointIdentity;
 		let raw: Record<string, unknown>;
+		let endpoint: SdkSessionEndpoint;
 		try {
-			const parsed = JSON.parse(await Bun.file(endpoint.path).text());
+			const file = await readEndpointFile(endpointPath);
+			if (
+				!file ||
+				file.dev !== provenIdentity.dev ||
+				file.ino !== provenIdentity.ino ||
+				file.mtimeNs !== provenIdentity.mtimeNs ||
+				file.size !== provenIdentity.size
+			)
+				return null;
+			const parsed = JSON.parse(file.source);
 			if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
 			raw = parsed as Record<string, unknown>;
+			endpoint = parseSdkSessionEndpoint(indexed.sessionId, endpointPath, parsed);
 		} catch {
 			return null;
 		}
@@ -1473,6 +1520,8 @@ export class SessionRouter {
 			raw.sessionId !== indexed.sessionId ||
 			raw.pid !== indexed.pid ||
 			raw.stale === true ||
+			endpoint.stale === true ||
+			endpoint.pid !== indexed.pid ||
 			raw.url !== endpoint.url ||
 			raw.token !== endpoint.token
 		)
@@ -1489,8 +1538,16 @@ export class SessionRouter {
 		const listing = this.#index.listSessions();
 		if (listing.warnings.some(warning => warningAffectsSession(warning, indexed.sessionId))) return null;
 		const current = listing.sessions.find(session => session.sessionId === indexed.sessionId);
-		if (!current || !sameIndexedAuthority(indexed, current)) return null;
-		return { endpoint, identity: provenIdentity };
+		const finalIdentity = await lstatEndpoint(endpoint.path);
+		if (
+			!current ||
+			!sameIndexedAuthority(indexed, current) ||
+			!matchesIndexedEndpointFile(provenIdentity, current) ||
+			!finalIdentity ||
+			!sameEndpointIdentity(provenIdentity, finalIdentity)
+		)
+			return null;
+		return { endpoint, identity: provenIdentity, indexed: current };
 	}
 
 	/** Endpoint-only view for callers that do not make an authority decision. */
@@ -1584,6 +1641,8 @@ export class SessionRouter {
 		// review). A pre-resolved endpoint (adoption/lifecycle handoff) had no
 		// authority read of its own, so it samples once here.
 		const proven = resolvedEndpoint === undefined ? await this.#readProvenEndpoint(indexed) : null;
+		if (proven) indexed = proven.indexed;
+		if (indexed.endpointMtimeMs === undefined) return false;
 		const endpoint = resolvedEndpoint ?? proven?.endpoint ?? null;
 		const endpointIdentity =
 			resolvedEndpoint === undefined ? proven?.identity : await lstatEndpoint(resolvedEndpoint.path);
@@ -1598,9 +1657,7 @@ export class SessionRouter {
 			existing !== undefined &&
 			existing.endpoint.url === endpoint.url &&
 			existing.endpoint.token === endpoint.token &&
-			existing.generation === indexed.endpointGeneration &&
-			existing.pid === indexed.pid &&
-			existing.endpointMtimeMs === indexed.endpointMtimeMs &&
+			sameIndexedAuthority(existing.indexed, indexed) &&
 			endpointIdentity !== undefined &&
 			sameEndpointIdentity(existing.endpointIdentity, endpointIdentity);
 		if (
@@ -1666,15 +1723,18 @@ export class SessionRouter {
 		const publication = Promise.withResolvers<void>();
 		void publication.promise.catch(() => undefined);
 		const capability: SessionAttachment = Object.freeze({
-			authorityId: sessionAttachmentAuthorityId({
-				sessionId: indexed.sessionId,
-				generation: indexed.endpointGeneration,
-				pid: indexed.pid,
-				endpointMtimeMs: indexed.endpointMtimeMs,
-				url: endpoint.url,
-				token: endpoint.token,
-				endpointIdentity,
-			}),
+			get authorityId(): string {
+				const authority = attached?.indexed ?? indexed;
+				return sessionAttachmentAuthorityId({
+					sessionId: authority.sessionId,
+					generation: authority.endpointGeneration,
+					pid: authority.pid,
+					endpointMtimeMs: authority.endpointMtimeMs,
+					url: endpoint.url,
+					token: endpoint.token,
+					endpointIdentity,
+				});
+			},
 			sessionId: indexed.sessionId,
 			generation: indexed.endpointGeneration,
 			get connectionId(): string | undefined {
@@ -1837,6 +1897,7 @@ export class SessionRouter {
 				generation: indexed.endpointGeneration,
 				pid: indexed.pid,
 				endpointMtimeMs: indexed.endpointMtimeMs,
+				...(indexed.endpointFileId === undefined ? {} : { endpointFileId: indexed.endpointFileId }),
 				attachment: capability,
 			});
 		try {
@@ -1886,6 +1947,8 @@ export class SessionRouter {
 			await this.#retireAttachment(attached, proven ? "replaced_same_generation" : undefined);
 			return false;
 		}
+		attached.indexed = proven.indexed;
+		attached.endpointMtimeMs = proven.indexed.endpointMtimeMs!;
 		if (!skipReplay) attached.barrier.held ??= [];
 		attached.published = true;
 		attached.publication.resolve();

@@ -743,6 +743,7 @@ type LifecycleReplayEndpoint = {
 	endpointIncarnation: string;
 	pid: number;
 	endpointMtimeMs: number;
+	endpointFileId?: string;
 };
 
 type EndpointAuthority = { endpointGeneration?: number; endpointIncarnation?: string };
@@ -773,13 +774,16 @@ function matchesEndpointAuthority(record: IndexedSession, authority: EndpointAut
 function sameEndpointRecord(expected: IndexedSession, current: IndexedSession): boolean {
 	return (
 		current.live &&
+		!current.terminalUncertain &&
 		isSessionAuthorityEligible(current) &&
+		current.sessionId === expected.sessionId &&
 		current.endpointGeneration === expected.endpointGeneration &&
 		current.pid === expected.pid &&
 		current.endpointMtimeMs === expected.endpointMtimeMs &&
-		(expected.endpointFileId === undefined || current.endpointFileId === expected.endpointFileId) &&
+		current.endpointFileId === expected.endpointFileId &&
 		(expected.processIncarnation === undefined || current.processIncarnation === expected.processIncarnation) &&
 		(expected.hostIncarnation === undefined || current.hostIncarnation === expected.hostIncarnation) &&
+		current.lifecycleRequestId === expected.lifecycleRequestId &&
 		path.resolve(current.locator.cwd) === path.resolve(expected.locator.cwd) &&
 		path.resolve(current.locator.stateRoot) === path.resolve(expected.locator.stateRoot)
 	);
@@ -2877,6 +2881,8 @@ export class Broker {
 		return this.#readEndpoint(record, authority);
 	}
 	async #readLifecycleReplayEndpoint(sessionId: string): Promise<LifecycleReplayEndpoint | BrokerResponse> {
+		if (!isCanonicalSessionId(sessionId))
+			return error("invalid_input", "replayed sessionId must be a canonical safe identifier");
 		await this.index.refresh();
 		const record = this.index.listSessions().sessions.find(session => session.sessionId === sessionId);
 		if (!record) return error("resource_gone", "session endpoint record is gone");
@@ -2895,18 +2901,44 @@ export class Broker {
 			endpointMtimeMs <= 0
 		)
 			return error("endpoint_stale", "session endpoint authority is incomplete");
-		const currentIncarnation = endpointIncarnation(record, sessionId);
-		if (!currentIncarnation) return error("endpoint_stale", "session endpoint incarnation is unavailable");
-		const endpoint = await this.#readEndpoint(record, {});
-		if (!endpoint.ok) return endpoint;
-		if (endpoint.result === null || typeof endpoint.result !== "object" || Array.isArray(endpoint.result))
+		const endpointPath = path.join(record.locator.stateRoot, "sdk", `${sessionId}.json`);
+		const firstFile = await readEndpointFile(endpointPath);
+		if (!firstFile || !matchesIndexedEndpointFile(firstFile, record))
+			return error("endpoint_stale", "session endpoint is stale");
+		await this.index.refresh();
+		const current = this.index.listSessions().sessions.find(session => session.sessionId === sessionId);
+		if (!current || !sameEndpointRecord(record, current))
+			return error("endpoint_stale", "session endpoint authority changed during replay refresh");
+		const currentFile = await readEndpointFile(endpointPath);
+		if (
+			!currentFile ||
+			currentFile.dev !== firstFile.dev ||
+			currentFile.ino !== firstFile.ino ||
+			currentFile.mtimeNs !== firstFile.mtimeNs ||
+			currentFile.source !== firstFile.source ||
+			!matchesIndexedEndpointFile(currentFile, current)
+		)
+			return error("endpoint_stale", "session endpoint changed during replay refresh");
+		let endpoint: Record<string, unknown>;
+		try {
+			const parsed = JSON.parse(currentFile.source);
+			if (!parsed || typeof parsed !== "object" || Array.isArray(parsed))
+				return error("endpoint_stale", "session endpoint is malformed");
+			endpoint = parsed as Record<string, unknown>;
+		} catch {
 			return error("endpoint_stale", "session endpoint is malformed");
+		}
+		if (endpoint.sessionId !== sessionId || endpoint.pid !== current.pid || endpoint.stale === true)
+			return error("endpoint_stale", "session endpoint is stale");
+		const currentIncarnation = endpointIncarnation(current, sessionId);
+		if (!currentIncarnation) return error("endpoint_stale", "session endpoint incarnation is unavailable");
 		return {
-			endpoint: endpoint.result as Record<string, unknown>,
-			endpointGeneration: record.endpointGeneration,
+			endpoint,
+			endpointGeneration: current.endpointGeneration,
 			endpointIncarnation: currentIncarnation,
-			pid: record.pid,
-			endpointMtimeMs,
+			pid: current.pid,
+			endpointMtimeMs: current.endpointMtimeMs!,
+			...(current.endpointFileId === undefined ? {} : { endpointFileId: current.endpointFileId }),
 		};
 	}
 	async #readEndpoint(record: IndexedSession, authority: EndpointAuthority): Promise<BrokerResponse> {
@@ -2937,6 +2969,16 @@ export class Broker {
 			const current = this.index.listSessions().sessions.find(session => session.sessionId === record.sessionId);
 			if (!current || !sameEndpointRecord(record, current) || !matchesEndpointAuthority(current, authority))
 				return error("endpoint_stale", "session endpoint is stale");
+			const currentFile = await readEndpointFile(endpointPath);
+			if (
+				!currentFile ||
+				currentFile.dev !== file.dev ||
+				currentFile.ino !== file.ino ||
+				currentFile.mtimeNs !== file.mtimeNs ||
+				currentFile.source !== file.source ||
+				!matchesIndexedEndpointFile(currentFile, current)
+			)
+				return error("endpoint_stale", "session endpoint changed during refresh");
 			return { ok: true, result: endpoint };
 		} catch (e) {
 			if ((e as NodeJS.ErrnoException).code === "ENOENT")
@@ -3395,6 +3437,10 @@ export class Broker {
 										{
 											endpointGeneration: replayResult?.endpointGeneration as number,
 											endpointMtimeMs: replayResult?.endpointMtimeMs as number,
+											endpointFileId:
+												typeof replayResult?.endpointFileId === "string"
+													? replayResult.endpointFileId
+													: undefined,
 											pid: replayResult?.pid as number,
 										},
 										replaySessionId,
@@ -3405,14 +3451,19 @@ export class Broker {
 						if (isBrokerResponse(refreshed)) return refreshed;
 						if (refreshed.endpointIncarnation !== replayIncarnation)
 							return error("endpoint_stale", "lifecycle replay target was replaced");
+						const { endpointFileId: _staleEndpointFileId, ...replayBase } = replay.result as Record<
+							string,
+							unknown
+						>;
 						return {
 							ok: true,
 							result: {
-								...(replay.result as Record<string, unknown>),
+								...replayBase,
 								endpointGeneration: refreshed.endpointGeneration,
 								endpointIncarnation: refreshed.endpointIncarnation,
 								pid: refreshed.pid,
 								endpointMtimeMs: refreshed.endpointMtimeMs,
+								...(refreshed.endpointFileId === undefined ? {} : { endpointFileId: refreshed.endpointFileId }),
 								endpoint: refreshed.endpoint,
 							},
 						};
