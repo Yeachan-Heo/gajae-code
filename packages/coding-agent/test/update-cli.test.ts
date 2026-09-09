@@ -3,6 +3,7 @@ import * as fsNode from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { VERSION } from "@gajae-code/utils";
 import type { BinaryUpdateFlow } from "../src/cli/update-cli";
 import {
 	assertSupportedLinuxLibcForTest,
@@ -760,8 +761,117 @@ describe("update-cli managed notification recovery", () => {
 				expect(output.join("\n")).toContain(
 					`Standalone gjc ${release.version} is already installed and verified at ${target.path}`,
 				);
-				expect(output.join("\n")).toContain(`${target.previousPath} shadows it on PATH.`);
-				expect(output.join("\n")).toContain("must precede the shim directory");
+				expect(output.join("\n")).toContain("Shell activation is not verified");
+				expect(output.join("\n")).toContain(`'${target.path}' --version`);
+				expect(output.join("\n")).toContain("Only if resolution still selects another install");
+				expect(output.join("\n")).not.toContain("shadows it on PATH");
+				expect(output.join("\n")).not.toContain("Updated to");
+			} finally {
+				logSpy.mockRestore();
+			}
+		});
+
+		it.each([false, true])("distinguishes same-version migration from activation (existing=%s)", async existing => {
+			const root = await makeTempDir();
+			const runtimePath = path.join(root, "standalone space", "gjc");
+			const shimPath = path.join(root, "shim-gjc");
+			await fs.writeFile(shimPath, "package-manager shim");
+			const output: string[] = [];
+			const calls: string[] = [];
+			const logSpy = vi.spyOn(console, "log").mockImplementation(message => output.push(String(message)));
+			try {
+				await runUpdateCommand(
+					{ force: false, check: false },
+					{
+						getLatestRelease: async () => ({ ...release, tag: `v${VERSION}`, version: VERSION }),
+						resolveUpdateTarget: async () => ({ method: "migrate", path: runtimePath, previousPath: shimPath }),
+						verifyMigrationTarget: async () => ({ ok: existing, actual: VERSION, path: runtimePath }),
+						performUpdate: async (selected, version) => {
+							expect(selected).toEqual({ method: "migrate", path: runtimePath, previousPath: shimPath });
+							expect(version).toBe(VERSION);
+							calls.push("install");
+							return { ok: true, actual: version, path: runtimePath };
+						},
+						runPostUpdateRecovery: async verifiedPath => {
+							expect(verifiedPath).toBe(runtimePath);
+							calls.push("recovery");
+						},
+						refreshInstalledDefaultSkills: async () => {
+							calls.push("refresh");
+						},
+					},
+				);
+				expect(calls).toEqual(existing ? [] : ["install", "recovery", "refresh"]);
+				expect(await fs.readFile(shimPath, "utf8")).toBe("package-manager shim");
+				const text = output.join("\n");
+				expect(text).toContain(existing ? "already installed and verified" : "is installed and verified");
+				expect(text).toContain("Version unchanged");
+				expect(text).toContain(`'${runtimePath}' --version`);
+				expect(text).toContain("Shell activation is not verified");
+				expect(text).toContain("Only if resolution still selects another install");
+				if (process.platform !== "win32") {
+					for (const command of ["type -a gjc", "command -v gjc", "hash -r (Bash)", "rehash (zsh)"]) {
+						expect(text).toContain(command);
+					}
+				}
+				expect(text).not.toContain("Updated to");
+				expect(text).not.toContain("Restart gjc");
+			} finally {
+				logSpy.mockRestore();
+			}
+		});
+
+		it("sanitizes migration paths without presenting altered paths as executable commands", async () => {
+			const root = await makeTempDir();
+			const runtimePath = path.join(root, "gjc\nunsafe\x1b[31m");
+			const output: string[] = [];
+			const logSpy = vi.spyOn(console, "log").mockImplementation(message => output.push(String(message)));
+			try {
+				await runUpdateCommand(
+					{ force: false, check: false },
+					{
+						getLatestRelease: async () => release,
+						resolveUpdateTarget: async () => ({ method: "migrate", path: runtimePath }),
+						verifyMigrationTarget: async () => ({ ok: true, path: runtimePath }),
+					},
+				);
+				expect(output.join("\n")).not.toContain(runtimePath);
+				expect(output.join("\n")).toContain("displayed path was sanitized");
+			} finally {
+				logSpy.mockRestore();
+			}
+		});
+
+		it.each([false, true])("keeps normal binary update/check behavior (check=%s)", async check => {
+			const calls: string[] = [];
+			const output: string[] = [];
+			const logSpy = vi.spyOn(console, "log").mockImplementation(message => output.push(String(message)));
+			try {
+				await runUpdateCommand(
+					{ force: false, check },
+					{
+						getLatestRelease: async () => release,
+						resolveUpdateTarget: async () => ({ method: "binary", path: "/binary/gjc" }),
+						verifyMigrationTarget: async () => {
+							throw new Error("unexpected migration preflight");
+						},
+						performUpdate: async () => {
+							calls.push("install");
+							return { ok: true, path: "/binary/gjc" };
+						},
+						runPostUpdateRecovery: async () => {
+							calls.push("recovery");
+						},
+						refreshInstalledDefaultSkills: async () => {
+							calls.push("refresh");
+						},
+					},
+				);
+				expect(calls).toEqual(check ? [] : ["install", "recovery", "refresh"]);
+				expect(output.join("\n")).toContain(`New version available: ${release.version}`);
+				expect(output.filter(line => line.includes("Updated to"))).toHaveLength(check ? 0 : 1);
+				expect(output.filter(line => line.includes("Restart gjc"))).toHaveLength(check ? 0 : 1);
+				expect(output.join("\n")).not.toContain("Shell activation");
 			} finally {
 				logSpy.mockRestore();
 			}
