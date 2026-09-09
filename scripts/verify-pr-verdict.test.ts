@@ -10,6 +10,7 @@ import {
 	parsePrVerdict,
 	parseSelfReview,
 	resolvePullRequestEvent,
+	resolvePushedSourceTarget,
 	selfReviewSatisfiesPolicy,
 	selfReviewSignature,
 	selfReviewSignedPayload,
@@ -21,6 +22,59 @@ const base = "a".repeat(40);
 const head = "b".repeat(40);
 const digest = "c".repeat(64);
 const approved = `gajae.pr-review-verdict.v1 merge-approved sha256:${digest} reviewer:architect reviewer-id:review-agent evidence:bun test scripts/verify-pr-verdict.test.ts`;
+
+describe("pushed source host path containment", () => {
+	const prefix = "packages/coding-agent/src/";
+
+	test.each([
+		"..\\outside.ts",
+		"nested/..\\..\\outside.ts",
+		"nested\\example.ts",
+		"\\outside.ts",
+		"C:\\outside.ts",
+		"\\\\server\\share\\outside.ts",
+	])("Windows rejects Git backslash filename %s before materialization", suffix => {
+		expect(resolvePushedSourceTarget("C:\\scratch\\tree", prefix + suffix, path.win32)).toBeNull();
+	});
+
+	test.each([
+		"carrier:unsafe.ts",
+		"carrier.ts:unsafe.ts:$DATA",
+		"directory:stream/unsafe.ts",
+		"directory::$INDEX_ALLOCATION/unsafe.ts",
+	])("Windows rejects NTFS stream syntax while POSIX preserves literal colons: %s", suffix => {
+		const name = prefix + suffix;
+		expect(resolvePushedSourceTarget("C:\\scratch\\tree", name, path.win32)).toBeNull();
+		expect(resolvePushedSourceTarget("/scratch/tree", name, path.posix)).toBe(`/scratch/tree/${name}`);
+	});
+
+	test.each([
+		"/packages/coding-agent/src/example.ts",
+		"C:/packages/coding-agent/src/example.ts",
+		"C:packages/coding-agent/src/example.ts",
+		"packages\\coding-agent\\src\\example.ts",
+		`${prefix}../outside.ts`,
+		`${prefix}./example.ts`,
+		`${prefix}/example.ts`,
+		`${prefix}nested/../../outside.ts`,
+		prefix,
+	])("rejects noncanonical or out-of-scope Git path %s on either host", name => {
+		expect(resolvePushedSourceTarget("C:\\scratch\\tree", name, path.win32)).toBeNull();
+		expect(resolvePushedSourceTarget("/scratch/tree", name, path.posix)).toBeNull();
+	});
+
+	test("resolves valid nested source paths using the executing host semantics", () => {
+		const name = `${prefix}nested/example.ts`;
+		expect(resolvePushedSourceTarget("C:\\scratch\\tree", name, path.win32)).toBe("C:\\scratch\\tree\\packages\\coding-agent\\src\\nested\\example.ts");
+		expect(resolvePushedSourceTarget("/scratch/tree", name, path.posix)).toBe(`/scratch/tree/${name}`);
+		expect(resolvePushedSourceTarget("scratch", name)).toBe(path.resolve("scratch", name));
+	});
+
+	test("POSIX preserves literal backslashes rather than imposing Windows filename rules", () => {
+		const name = `${prefix}..\\outside.ts`;
+		expect(resolvePushedSourceTarget("/scratch/tree", name, path.posix)).toBe(`/scratch/tree/${name}`);
+	});
+});
 
 describe("authenticated approval API evidence", () => {
 	const event = { repository: { full_name: "owner/repo" }, pull_request: { number: 5416 } };

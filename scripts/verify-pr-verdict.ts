@@ -503,20 +503,32 @@ async function runFastGate(cwd: string, trustedRoot: string): Promise<boolean> {
 	return (await child.exited) === 0;
 }
 
+export function resolvePushedSourceTarget(tree: string, name: string, hostPath: typeof path.posix = path): string | null {
+	if (!name.startsWith("packages/coding-agent/src/") || name.split("/").some(part => !part || part === "." || part === "..")) return null;
+	// Windows interprets backslashes as separators and colons as non-enumerable NTFS streams.
+	if (hostPath.sep === "\\" && (name.includes("\\") || name.includes(":"))) return null;
+	const scope = hostPath.resolve(tree, "packages/coding-agent/src");
+	const target = hostPath.resolve(tree, name);
+	const relative = hostPath.relative(scope, target);
+	if (!relative || relative === ".." || relative.startsWith(`..${hostPath.sep}`) || hostPath.isAbsolute(relative)) return null;
+	return target;
+}
+
 async function runPushedTreeFastGate(cwd: string, trustedRoot: string, headSha: string): Promise<boolean> {
 	const tree = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-pushed-tree-"));
 	try {
 		const listed = await git(["ls-tree", "-rz", "--full-tree", headSha, "--", "packages/coding-agent/src"], cwd);
 		if (listed.exitCode !== 0) return false;
-		const files: { oid: string; name: string }[] = [];
+		const files: { oid: string; target: string }[] = [];
 		for (const entry of new TextDecoder("utf-8", { fatal: true }).decode(listed.stdout).split("\0").filter(Boolean)) {
 			const match = /^(100644|100755|120000|160000) (blob|commit) ([0-9a-f]{40})\t([\s\S]+)$/u.exec(entry);
 			if (!match) return false;
 			// Unsupported source entries must not disappear from the scan or escape it.
 			if (match[1] === "120000" || match[1] === "160000" || match[2] !== "blob") return false;
 			const name = match[4]!;
-			if (!name.startsWith("packages/coding-agent/src/") || name.split("/").some(part => !part || part === "." || part === "..")) return false;
-			files.push({ oid: match[3]!, name });
+			const target = resolvePushedSourceTarget(tree, name);
+			if (target === null) return false;
+			files.push({ oid: match[3]!, target });
 		}
 		await fs.mkdir(path.join(tree, "packages/coding-agent/src"), { recursive: true });
 		// Raw blobs bypass export-ignore/export-subst, checkout filters and dirty files.
@@ -535,7 +547,7 @@ async function runPushedTreeFastGate(cwd: string, trustedRoot: string, headSha: 
 			const size = Number(match[2]);
 			offset = end + 1;
 			if (!Number.isSafeInteger(size) || size > bytes.length - offset - 1 || bytes[offset + size] !== 10) return false;
-			const target = path.join(tree, file.name);
+			const target = file.target;
 			await fs.mkdir(path.dirname(target), { recursive: true });
 			await fs.writeFile(target, bytes.subarray(offset, offset + size), { flag: "wx" });
 			offset += size + 1;
