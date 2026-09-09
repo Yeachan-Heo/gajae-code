@@ -6384,44 +6384,72 @@ export function readAuthorizedProjectSessionTranscript(
 	filePath: string,
 	maxBytes: number,
 ): Buffer | undefined {
+	if (!Number.isSafeInteger(maxBytes) || maxBytes < 0 || maxBytes === Number.MAX_SAFE_INTEGER) return undefined;
 	const root = path.resolve(projectGjcDir);
 	const candidate = path.resolve(filePath);
 	if (!isProjectSessionTranscriptPath(root, candidate)) return undefined;
 	const relativePath = path.relative(root, candidate).split(path.sep).join("/");
-	const authority = nativeSessionManager().openRecoveryFsRoot(root);
+	let authority: native.RecoveryFsRoot | undefined;
 	try {
-		const result = authority.readManaged(relativePath);
+		authority = nativeSessionManager().openRecoveryFsRoot(root);
+	} catch (error) {
+		if (!(error instanceof Error) || error.message !== "unsupported_platform") throw error;
+	}
+	try {
+		const result: native.RecoveryFsResult = authority?.readManaged(relativePath) ?? {
+			ok: false,
+			code: "unsupported_platform",
+		};
 		if (!result.ok && result.code === "unsupported_platform") {
-			if (process.platform === "win32") return undefined;
-			const relativeParts = path.relative(projectGjcDir, path.dirname(candidate)).split(path.sep).filter(Boolean);
-			const parentPaths = [projectGjcDir];
+			const relativeParts = path.relative(root, path.dirname(candidate)).split(path.sep).filter(Boolean);
+			const parentPaths = [root];
 			for (const part of relativeParts) parentPaths.push(path.join(parentPaths[parentPaths.length - 1]!, part));
 			const parentIdentities = parentPaths.map(parentPath => {
 				const stat = fs.lstatSync(parentPath, { bigint: true });
 				if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("project transcript parent is unsafe");
-				return { path: parentPath, dev: stat.dev, ino: stat.ino, mode: stat.mode };
+				return { path: parentPath, dev: stat.dev, ino: stat.ino, mode: stat.mode, ctimeNs: stat.ctimeNs };
 			});
-			const parentPath = path.dirname(candidate);
-			const parentFd = fs.openSync(
-				parentPath,
-				fs.constants.O_RDONLY | (fs.constants.O_DIRECTORY ?? 0) | (fs.constants.O_NOFOLLOW ?? 0),
-			);
 			let captured: ManagedFileSnapshot;
-			try {
-				const expectedParent = parentIdentities[parentIdentities.length - 1]!;
-				const openedParent = fs.fstatSync(parentFd, { bigint: true });
+			if (os.platform() === "win32" || os.platform() === "darwin") {
+				// Windows and Darwin cannot traverse directory handles through /dev/fd.
+				// Bind the bounded capture to the inspected file and recheck every
+				// parent (including junctions) before allowing bytes to leave this reader.
+				const expected = fs.lstatSync(candidate, { bigint: true });
+				if (!expected.isFile() || expected.isSymbolicLink() || expected.nlink > 1)
+					throw new Error("project transcript file is unsafe");
+				if (expected.size > BigInt(maxBytes)) return undefined;
+				captured = captureManagedFilePrefixNoFollow(candidate, maxBytes + 1);
 				if (
-					openedParent.dev !== expectedParent.dev ||
-					openedParent.ino !== expectedParent.ino ||
-					openedParent.mode !== expectedParent.mode
+					captured.identity.dev !== BigInt.asUintN(64, expected.dev) ||
+					captured.identity.ino !== BigInt.asUintN(64, expected.ino) ||
+					captured.identity.nlink !== expected.nlink ||
+					captured.identity.size !== Number(expected.size) ||
+					captured.identity.mtimeNs !== expected.mtimeNs ||
+					captured.identity.ctimeNs !== expected.ctimeNs
 				)
-					throw new Error("project transcript parent handle identity mismatch");
-				captured = captureManagedFilePrefixNoFollow(
-					path.join("/dev/fd", String(parentFd), path.basename(candidate)),
-					maxBytes + 1,
+					throw new Error("project transcript file identity changed during read");
+			} else {
+				const parentPath = path.dirname(candidate);
+				const parentFd = fs.openSync(
+					parentPath,
+					fs.constants.O_RDONLY | (fs.constants.O_DIRECTORY ?? 0) | (fs.constants.O_NOFOLLOW ?? 0),
 				);
-			} finally {
-				fs.closeSync(parentFd);
+				try {
+					const expectedParent = parentIdentities[parentIdentities.length - 1]!;
+					const openedParent = fs.fstatSync(parentFd, { bigint: true });
+					if (
+						openedParent.dev !== expectedParent.dev ||
+						openedParent.ino !== expectedParent.ino ||
+						openedParent.mode !== expectedParent.mode
+					)
+						throw new Error("project transcript parent handle identity mismatch");
+					captured = captureManagedFilePrefixNoFollow(
+						path.join("/dev/fd", String(parentFd), path.basename(candidate)),
+						maxBytes + 1,
+					);
+				} finally {
+					fs.closeSync(parentFd);
+				}
 			}
 			for (const expected of parentIdentities) {
 				const stat = fs.lstatSync(expected.path, { bigint: true });
@@ -6430,7 +6458,8 @@ export function readAuthorizedProjectSessionTranscript(
 					stat.isSymbolicLink() ||
 					stat.dev !== expected.dev ||
 					stat.ino !== expected.ino ||
-					stat.mode !== expected.mode
+					stat.mode !== expected.mode ||
+					stat.ctimeNs !== expected.ctimeNs
 				)
 					throw new Error("project transcript parent identity changed during read");
 			}
@@ -6440,7 +6469,7 @@ export function readAuthorizedProjectSessionTranscript(
 		if (!result.ok || !result.data || result.data.byteLength > maxBytes) return undefined;
 		return Buffer.from(result.data);
 	} finally {
-		authority.close();
+		authority?.close();
 	}
 }
 

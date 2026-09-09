@@ -83,6 +83,258 @@ function singleGoalEvidence(quote: string, statement = quote.replace(/[.!?。！
 	});
 }
 
+function userDirectiveEvidence(
+	contents: string[],
+	anchors = contents.map((quote, message_index) => ({ message_index, quote })),
+): CrystalInput {
+	const snapshot: CrystalSnapshot = {
+		revision: 1,
+		start: 0,
+		end: contents.length - 1,
+		messages: contents.map((content, index) => ({ index, role: "user", content })),
+		digest: "",
+	};
+	snapshot.digest = crystalSnapshotDigest(snapshot);
+	return input({
+		snapshot,
+		items: anchors.map((anchor, index) => ({
+			id: `goal:directive-${index}`,
+			kind: "goal",
+			classification: "confirmed",
+			statement: anchor.quote,
+			anchor,
+		})),
+	});
+}
+
+describe("deep-interview Crystal semantic evidence", () => {
+	it("keeps punctuationless auxiliary questions unsettled without rejecting recommendations", () => {
+		for (const question of [
+			"Should we encrypt backups",
+			"Can we export reports",
+			"Do users need accounts",
+			"Should backups be encrypted",
+			"Are backups encrypted",
+		]) {
+			expect(() => crystallizeDeepInterview(singleGoalEvidence(question))).toThrow("verbatim user anchor");
+			const disputed = userDirectiveEvidence(["Build a report.", question]);
+			disputed.items[1]!.classification = "disputed";
+			expect(crystallizeDeepInterview(disputed).lifecycle).toBe("stale");
+		}
+		const recommendation = crystallizeDeepInterview(singleGoalEvidence("We should encrypt backups."));
+		expect(recommendation.lifecycle).toBe("ready");
+		expect(recommendation.items[0]!.statement).toBe("We should encrypt backups");
+		expect(crystallizeDeepInterview(singleGoalEvidence("Do not be verbose.")).lifecycle).toBe("ready");
+		expect(() =>
+			crystallizeDeepInterview(singleGoalEvidence("We should encrypt backups.", "We encrypt backups")),
+		).toThrow("verbatim user anchor");
+	});
+
+	it("detects require/prohibition contradictions using action signs and the same subject", () => {
+		for (const prohibition of ["Forbid audit logs.", "Prohibit audit logs.", "Do not require audit logs."]) {
+			expect(() => crystallizeDeepInterview(userDirectiveEvidence(["Require audit logs.", prohibition]))).toThrow(
+				"contradictory confirmed items",
+			);
+		}
+		for (const directives of [
+			["Require audit logs.", "Forbid telemetry."],
+			["Require audit logs.", "Prohibit telemetry."],
+			["Require audit logs.", "Do not forbid audit logs."],
+			["Require audit logs.", "Do not prohibit audit logs."],
+			["Do not require audit logs.", "Forbid audit logs."],
+			["Do not require audit logs.", "Prohibit audit logs."],
+		]) {
+			expect(crystallizeDeepInterview(userDirectiveEvidence(directives)).lifecycle).toBe("ready");
+		}
+	});
+
+	it("preserves explicit actor/action may permission without treating uncertain outcomes as requirements", () => {
+		const permission = "Admins may export reports.";
+		const crystal = crystallizeDeepInterview(singleGoalEvidence(permission));
+		expect(crystal.lifecycle).toBe("ready");
+		expect(crystal.items[0]!.statement).toBe("Admins may export reports");
+		for (const statement of ["Admins export reports", "Admins must export reports", "Admins should export reports"]) {
+			expect(() => crystallizeDeepInterview(singleGoalEvidence(permission, statement))).toThrow(
+				"verbatim user anchor",
+			);
+		}
+		for (const uncertain of [
+			"Maybe admins may export reports.",
+			"Backups may fail.",
+			"Admins may fail to export reports.",
+			"Admins may export reports and backups may fail.",
+		]) {
+			expect(() => crystallizeDeepInterview(singleGoalEvidence(uncertain))).toThrow("verbatim user anchor");
+		}
+	});
+
+	it("accepts authored requirements on either side of media while preserving the authenticated projection", () => {
+		for (const content of ["Build a report.[image]", "[image]Build a report."]) {
+			const value = userDirectiveEvidence([content], [{ message_index: 0, quote: "Build a report." }]);
+			const crystal = crystallizeDeepInterview(value);
+			expect(crystal.lifecycle).toBe("ready");
+			expect(crystal.source.messages).toEqual(value.snapshot.messages);
+			expect(crystal.source.digest).toBe(value.snapshot.digest);
+		}
+		const both = userDirectiveEvidence(
+			["Build a report.[image]Encrypt backups.", "[image]"],
+			[
+				{ message_index: 0, quote: "Build a report." },
+				{ message_index: 0, quote: "Encrypt backups." },
+			],
+		);
+		expect(crystallizeDeepInterview(both).items).toHaveLength(2);
+		both.items.pop();
+		expect(() => crystallizeDeepInterview(both)).toThrow("unrepresented user directive");
+		for (const content of ["Build a report.[image]Encrypt [file", "Build a report.[Encrypt backups]"]) {
+			const value = userDirectiveEvidence([content], [{ message_index: 0, quote: "Build a report." }]);
+			expect(() => crystallizeDeepInterview(value)).toThrow("unrepresented user directive");
+		}
+	});
+
+	it("rejects full, partial, bare, and cross-marker requirement anchors", () => {
+		for (const quote of [
+			"[image]",
+			"image",
+			"[image",
+			"image]",
+			"age",
+			"Build a report.[image]Encrypt backups.",
+			"Build a report.Encrypt backups.",
+		]) {
+			const value = userDirectiveEvidence(["Build a report.[image]Encrypt backups."], [{ message_index: 0, quote }]);
+			expect(() => crystallizeDeepInterview(value)).toThrow("verbatim user anchor");
+		}
+	});
+
+	it("uses the same media boundaries for gap and conflict resolution evidence", () => {
+		const gap = "What is the maximum memory budget?";
+		const conflict = "The maximum memory budget is disputed";
+		const answer = "The maximum memory budget is 256 MB.";
+		for (const isConflict of [false, true]) {
+			const item = isConflict ? conflict : gap;
+			const prior = crystallizeDeepInterview(input(isConflict ? { conflicts: [item] } : { open_gaps: [item] }));
+			const resolve = (content: string, quote = answer, resolution = answer): CrystalInput => {
+				const next = withFreshUserEvidence(input({ prior }), content);
+				const anchors = [{ item, message_index: 1, quote, resolution }];
+				return isConflict
+					? { ...next, resolved_conflicts: [item], resolved_conflict_anchors: anchors }
+					: { ...next, resolved_open_gaps: [item], resolved_open_gap_anchors: anchors };
+			};
+			for (const content of [`${answer}[image]`, `[image]${answer}`]) {
+				const crystal = crystallizeDeepInterview(resolve(content));
+				expect(crystal.lifecycle).toBe("ready");
+				expect(crystal.items.some(entry => entry.statement === answer)).toBe(true);
+			}
+			for (const quote of ["[image]", "image", "[image", "image]", `${answer}[image]`]) {
+				expect(() => crystallizeDeepInterview(resolve(`${answer}[image]`, quote))).toThrow("verbatim user anchor");
+				expect(() => crystallizeDeepInterview(resolve(`${answer}[image]`, answer, quote))).toThrow(
+					"verbatim user anchor",
+				);
+			}
+			expect(() => crystallizeDeepInterview(resolve(`Confirmed.[image]${answer}`, "Confirmed."))).toThrow(
+				"verbatim user anchor",
+			);
+			expect(() => crystallizeDeepInterview(resolve(`${answer}[image]Encrypt backups.`))).toThrow(
+				"unrepresented user directive",
+			);
+		}
+	});
+
+	it("uses the same media boundaries for fresh removal evidence", () => {
+		const prior = crystallizeDeepInterview(input());
+		const removal = "Remove the fast constraint.";
+		const remove = (content: string, quote = removal, resolution = removal): CrystalInput => {
+			const next = withFreshUserEvidence(
+				input({ prior, items: [prior.items[0]!], removed_ids: ["constraint:latency"] }),
+				content,
+			);
+			next.removed_item_anchors = [{ item: "constraint:latency", message_index: 1, quote, resolution }];
+			return next;
+		};
+		for (const content of [`${removal}[image]`, `[image]${removal}`]) {
+			const crystal = crystallizeDeepInterview(remove(content));
+			expect(crystal.removed_ids).toEqual(["constraint:latency"]);
+			expect(crystal.items.map(item => item.id)).toEqual(["goal:report"]);
+		}
+		for (const quote of ["[image]", "image", "[image", "image]", `${removal}[image]`]) {
+			expect(() => crystallizeDeepInterview(remove(`${removal}[image]`, quote))).toThrow("user removal evidence");
+			expect(() => crystallizeDeepInterview(remove(`${removal}[image]`, removal, quote))).toThrow(
+				"user removal evidence",
+			);
+		}
+		expect(() => crystallizeDeepInterview(remove(`Confirmed.[image]${removal}`, "Confirmed."))).toThrow(
+			"user removal evidence",
+		);
+		expect(() => crystallizeDeepInterview(remove(`${removal}[image]Encrypt backups.`))).toThrow(
+			"unrepresented user directive",
+		);
+	});
+
+	it("recognizes first-snapshot same-turn and cross-turn explicit database corrections", () => {
+		const earlier = "Use MySQL for storage.";
+		for (const replacement of ["Actually, use PostgreSQL for storage.", "Instead use PostgreSQL for storage."]) {
+			for (const contents of [
+				[`${earlier} ${replacement}`],
+				[`${earlier}[image]${replacement}`],
+				[earlier, replacement],
+			]) {
+				const value = userDirectiveEvidence(contents, [{ message_index: contents.length - 1, quote: replacement }]);
+				const crystal = crystallizeDeepInterview(value);
+				expect(crystal.lifecycle).toBe("ready");
+				expect(crystal.items.map(item => item.statement)).toEqual([replacement]);
+				expect(crystal.spec_version).toBe(1);
+				expect(crystal.execution_approval).toBe("not-approved");
+			}
+		}
+	});
+
+	it("does not let correction language erase additive or independent requirements", () => {
+		for (const [earlier, replacement] of [
+			["Build a report.", "Actually, build a dashboard too."],
+			["Build a report.", "Actually, build a dashboard."],
+			["Use MySQL for storage.", "Actually, use PostgreSQL for storage too."],
+			["Use MySQL for storage and encrypt backups.", "Actually, use PostgreSQL for storage."],
+			["Do not use MySQL for storage.", "Actually, use PostgreSQL for storage."],
+			["We should use MySQL for storage.", "Actually, use PostgreSQL for storage."],
+		]) {
+			for (const contents of [[`${earlier} ${replacement}`], [earlier!, replacement!]]) {
+				const value = userDirectiveEvidence(contents, [
+					{ message_index: contents.length - 1, quote: replacement! },
+				]);
+				expect(() => crystallizeDeepInterview(value)).toThrow("unrepresented user directive");
+			}
+		}
+		const replacement = "Actually, use PostgreSQL for storage.";
+		const value = userDirectiveEvidence(
+			["Use MySQL for storage. Encrypt backups.", replacement],
+			[{ message_index: 1, quote: replacement }],
+		);
+		expect(() => crystallizeDeepInterview(value)).toThrow("unrepresented user directive");
+		value.items.push({
+			id: "constraint:backups",
+			kind: "constraint",
+			classification: "confirmed",
+			statement: "Encrypt backups.",
+			anchor: { message_index: 0, quote: "Encrypt backups." },
+		});
+		expect(crystallizeDeepInterview(value).items.map(item => item.statement)).toEqual([
+			replacement,
+			"Encrypt backups.",
+		]);
+		for (const contents of [
+			["Build a report. Actually, build a dashboard too."],
+			["Build a report.", "Actually, build a dashboard too."],
+		]) {
+			const additive = userDirectiveEvidence(contents, [
+				{ message_index: 0, quote: "Build a report." },
+				{ message_index: contents.length - 1, quote: "Actually, build a dashboard too." },
+			]);
+			expect(crystallizeDeepInterview(additive).items).toHaveLength(2);
+		}
+	});
+});
+
 describe("deep-interview crystallize contract", () => {
 	it("creates a ready version with anchored confirmed material and no approval", () => {
 		const crystal = crystallizeDeepInterview(input());
@@ -2143,7 +2395,7 @@ describe("deep-interview crystallize contract", () => {
 			const userMessage = { role: "user", content: "Build a fast report." };
 			await fs.writeFile(
 				sessionFile,
-				[
+				`${[
 					{ type: "session", id: sessionId, cwd: root },
 					{ type: "message", message: customMessage },
 					{ type: "message", message: fileMentionMessage },
@@ -2151,7 +2403,7 @@ describe("deep-interview crystallize contract", () => {
 					{ type: "message", message: userMessage },
 				]
 					.map(record => JSON.stringify(record))
-					.join("\n") + "\n",
+					.join("\n")}\n`,
 			);
 			const messages: CrystalSnapshot["messages"] = [
 				{ index: 0, role: "system", content: customMessage.content },

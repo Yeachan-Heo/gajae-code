@@ -117,6 +117,8 @@ When a prior Crystal exists, compare only evidence after its bound revision. Pre
 
 `snapshot.messages` MUST be ordered, unique, contiguous, and cover every index from `start` through `end`; the range and message list are capped at 200 messages, `items` at 128 entries, and each text field at 10,000 characters. `snapshot.end` MUST be the live transcript tail, `current_revision` MUST equal `snapshot.revision`, and `digest` MUST be the SHA-256 digest of the normalized snapshot. For a prior Crystal, include every message after its stored boundary; never skip a range or reuse stale evidence. Items use exactly one of `goal`, `constraint`, `decision`, `acceptance_criterion`, or `non_goal` and exactly one of `confirmed`, `inferred`, or `disputed`; confirmed items require a verbatim user `anchor` and inferred/disputed items never count as confirmed requirements.
 
+For the first Crystal, `snapshot.start` MUST be 0 and the full authenticated transcript MUST fit within 200 messages (exactly 200 is valid). If it exceeds that bound, continue the ordinary interview flow; never submit only the last 200 messages or replace authenticated evidence with a summary. With a canonical stored prior Crystal preserving the prefix, a contiguous delta of at most 200 messages may start after its stored boundary even when the full transcript is longer than 200 messages.
+
 The ordinary state writer has a separate required shape: `gjc deep-interview write --input '{"state":{...}}'` and `stage --for <transition> --input '{"state":{...}}'`; stage transitions are incremental deltas, not whole-transcript replacements. A Crystal is ready only when ambiguity/readiness evidence has no unresolved gaps, conflicts, or disputed requirements; `needs-questions`, `stale`, and `superseded` results do not publish a spec and return to the ordinary interview/resolution path. A ready result persists the versioned artifact `.gjc/_session-{sessionid}/specs/deep-interview-{slug}-v{spec_version}.md`. Every Crystal starts with `execution_approval: not-approved`; only the separate `gjc deep-interview approve-execution --json` action records explicit user execution approval for a ready canonical Crystal, and handoff never grants that approval.
 </Execution_Policy>
 
@@ -832,6 +834,27 @@ Spec structure:
 After the spec is written, mark it `pending approval` and present execution options via the `ask` tool. Until the user selects an execution option, the deep-interview module MUST NOT run mutation-oriented shell commands, edit source files, commit, push, open PRs, invoke execution skills, or delegate implementation tasks:
 
 **Question:** "Your spec is ready (ambiguity: {score}%). How would you like to proceed?"
+
+The actual Phase 5 `ask` question MUST include `workflowGate: { stage: "deep-interview", kind: "execution" }`. Keep the recognized ultragoal option label so an explicit selection creates the user-origin pending approval record. Concrete `ask` input:
+
+```json
+{
+  "questions": [{
+    "id": "deep-interview-execution",
+    "question": "Your spec is ready (ambiguity: {score}%). How would you like to proceed?",
+    "workflowGate": { "stage": "deep-interview", "kind": "execution" },
+    "options": [
+      { "label": "Refine with ralplan consensus (Recommended — default for almost all specs)" },
+      { "label": "Execute with ultragoal (only when spec is already implementation-ready and really simple)" },
+      { "label": "Continue research with autoresearch (research continuation, not execution)" },
+      { "label": "Refine further" }
+    ],
+    "multi": false
+  }]
+}
+```
+
+This tagged question does not itself authorize or automatically start implementation. Only an explicit ultragoal selection may be consumed by the separate `gjc deep-interview approve-execution --json` action; require that action to succeed before invoking `/skill:ultragoal`. Research/refinement choices, custom responses, cancellation, timeout, and untagged asks do not grant execution approval.
 
 **Options:**
 
