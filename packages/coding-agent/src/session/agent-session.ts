@@ -13089,6 +13089,7 @@ export class AgentSession {
 				claimsGenuineUserIntent: options?.claimsGenuineUserIntent,
 				onPromoted: options?.onPromoted,
 				sdkRunToken: options?.sdkRunToken,
+				scheduleNonAdmittedWake: false,
 				onQueued: message => {
 					if (this.#abortUnwind && !options?.forceOneAtATime) this.#abortUnwindSteerFallbacks.push(message);
 				},
@@ -13157,6 +13158,7 @@ export class AgentSession {
 			onPromoted?: (promotion: { startsOwnRun?: boolean; removed?: boolean }) => void;
 			sdkRunToken?: string;
 			onQueued?: (message: AgentMessage) => void;
+			scheduleNonAdmittedWake?: boolean;
 		},
 	): Promise<QueuedFollowUpOwner> {
 		this.#assertNoHandoffTransition();
@@ -13192,7 +13194,7 @@ export class AgentSession {
 			this.#scheduleQueuedFollowUpContinuation(() =>
 				this.agent.snapshotFollowUp().some(candidate => candidate === message),
 			);
-			this.#scheduleNonAdmittedQueuedContinuation();
+			if (options?.scheduleNonAdmittedWake !== false) this.#scheduleNonAdmittedQueuedContinuation();
 		}
 		return {
 			cancel: () => {
