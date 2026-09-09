@@ -19,7 +19,7 @@ import {
 	redactBrokerDiscovery,
 	writeBrokerDiscovery,
 } from "../src/sdk/broker/discovery";
-import { endpointIncarnation } from "../src/sdk/broker/endpoint-authority";
+import { endpointIncarnation, readEndpointFile } from "../src/sdk/broker/endpoint-authority";
 import {
 	brokerOwnerForTest,
 	brokerSpawnEnvironmentForTest,
@@ -58,6 +58,12 @@ const nextFloat = (value: number): number => {
 	u64[0] = u64[0]! + 1n;
 	return f64[0]!;
 };
+
+async function captureEndpointAuthority(endpointPath: string) {
+	const file = await readEndpointFile(endpointPath);
+	if (!file) throw new Error("Expected a stable fixture endpoint before registration.");
+	return { endpointMtimeMs: file.mtimeMs, endpointFileId: `${file.dev}:${file.ino}` };
+}
 
 it("does not disclose launch paths when cleanup remains uncertain", () => {
 	const executable = "/private/runtime/gjc-secret";
@@ -2291,7 +2297,6 @@ describe("SDK broker identity and discovery", () => {
 				JSON.stringify({ sessionId, pid: process.pid, url: "ws://127.0.0.1:1", token: "original-token" }),
 			);
 			await broker.start();
-			const firstEndpointMtimeMs = (await fs.stat(endpointPath)).mtimeMs;
 			const locator = { cwd, worktreeRoot: null, stateRoot };
 			await broker.index.append({
 				type: "host_registered",
@@ -2299,7 +2304,7 @@ describe("SDK broker identity and discovery", () => {
 				locator,
 				endpointGeneration: 1,
 				pid: process.pid,
-				endpointMtimeMs: firstEndpointMtimeMs,
+				...(await captureEndpointAuthority(endpointPath)),
 			});
 			await broker.index.append({
 				type: "host_heartbeat",
@@ -2340,14 +2345,13 @@ describe("SDK broker identity and discovery", () => {
 				endpointPath,
 				JSON.stringify({ sessionId, pid: process.pid, url: "ws://127.0.0.1:1", token: "replacement-token" }),
 			);
-			const replacementEndpointMtimeMs = (await fs.stat(endpointPath)).mtimeMs;
 			await broker.index.append({
 				type: "host_registered",
 				sessionId,
 				locator,
 				endpointGeneration: 1,
 				pid: process.pid,
-				endpointMtimeMs: replacementEndpointMtimeMs,
+				...(await captureEndpointAuthority(endpointPath)),
 			});
 
 			const replayed = await broker.handleRequest("session.resume", input, "replacement-replay");
@@ -3706,13 +3710,21 @@ describe("SDK broker identity and discovery", () => {
 					token: "operator-token",
 				}),
 			);
+			// Exercise distinct fractional stat spellings without depending on the host filesystem's rounding.
+			const endpointTime = 1788784000.00025;
+			await fs.utimes(endpointPath, endpointTime, endpointTime);
+			const admittedAuthority = await captureEndpointAuthority(endpointPath);
+			const roundedMtimeMs = nextFloat(admittedAuthority.endpointMtimeMs);
+			expect(roundedMtimeMs).not.toBe(admittedAuthority.endpointMtimeMs);
+			expect(Math.abs(roundedMtimeMs - admittedAuthority.endpointMtimeMs)).toBeLessThan(0.001);
 			await broker.index.append({
 				type: "host_registered",
 				sessionId,
 				locator: { cwd: dir, worktreeRoot: null, stateRoot },
 				endpointGeneration: 1,
 				pid: process.pid,
-				endpointMtimeMs: (await fs.stat(endpointPath)).mtimeMs,
+				...admittedAuthority,
+				endpointMtimeMs: roundedMtimeMs,
 				lifecycleRequestId,
 			});
 			await broker.index.append({
@@ -3747,6 +3759,27 @@ describe("SDK broker identity and discovery", () => {
 				confirm: true,
 				idempotencyKey: "operator-abort-key",
 			});
+			// An identical-byte, same-time replacement is not the file admitted above.
+			const successorPath = `${endpointPath}.successor`;
+			await fs.copyFile(endpointPath, successorPath);
+			await fs.utimes(successorPath, endpointTime, endpointTime);
+			const successorStat = await fs.stat(successorPath, { bigint: true });
+			expect(`${successorStat.dev}:${successorStat.ino}`).not.toBe(admittedAuthority.endpointFileId);
+			expect(Number(successorStat.mtimeNs) / 1_000_000).toBe(admittedAuthority.endpointMtimeMs);
+			await fs.rename(successorPath, endpointPath);
+			expect(
+				await broker.handleRequest(
+					"session.control",
+					{
+						sessionId,
+						operation: "turn.abort",
+						input: { mode: "terminal", scope: "owned", operator: true },
+						confirm: true,
+					},
+					"unregistered-replacement-abort-key",
+				),
+			).toEqual({ ok: false, error: { code: "endpoint_stale", message: "session endpoint is stale" } });
+			expect(requests).toHaveLength(1);
 			await fs.writeFile(
 				endpointPath,
 				JSON.stringify({
@@ -3762,7 +3795,7 @@ describe("SDK broker identity and discovery", () => {
 				locator: { cwd: dir, worktreeRoot: null, stateRoot },
 				endpointGeneration: 2,
 				pid: process.pid,
-				endpointMtimeMs: (await fs.stat(endpointPath)).mtimeMs,
+				...(await captureEndpointAuthority(endpointPath)),
 			});
 			expect(
 				await broker.handleRequest(
@@ -3787,7 +3820,7 @@ describe("SDK broker identity and discovery", () => {
 				locator: { cwd: dir, worktreeRoot: null, stateRoot },
 				endpointGeneration: 3,
 				pid: process.pid,
-				endpointMtimeMs: (await fs.stat(endpointPath)).mtimeMs,
+				...(await captureEndpointAuthority(endpointPath)),
 				lifecycleRequestId,
 			});
 			fenceOnNextOpen = true;
@@ -3847,7 +3880,7 @@ describe("SDK broker identity and discovery", () => {
 							locator: { cwd: dir, worktreeRoot: null, stateRoot },
 							endpointGeneration: 2,
 							pid: process.pid,
-							endpointMtimeMs: (await fs.stat(endpointPath)).mtimeMs,
+							...(await captureEndpointAuthority(endpointPath)),
 						});
 						ws.send(JSON.stringify({ type: "hello" }));
 					})();
@@ -3877,7 +3910,7 @@ describe("SDK broker identity and discovery", () => {
 				locator: { cwd: dir, worktreeRoot: null, stateRoot },
 				endpointGeneration: 1,
 				pid: process.pid,
-				endpointMtimeMs: (await fs.stat(endpointPath)).mtimeMs,
+				...(await captureEndpointAuthority(endpointPath)),
 			});
 			await broker.index.append({
 				type: "host_heartbeat",
@@ -3946,7 +3979,7 @@ describe("SDK broker identity and discovery", () => {
 				locator: { cwd: dir, worktreeRoot: null, stateRoot },
 				endpointGeneration: 1,
 				pid: process.pid,
-				endpointMtimeMs: (await fs.stat(endpointPath)).mtimeMs,
+				...(await captureEndpointAuthority(endpointPath)),
 				lifecycleRequestId: "flush-close-capability",
 			});
 			await broker.index.append({
