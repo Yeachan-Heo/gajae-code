@@ -4,7 +4,7 @@
 
 ### Performance
 
-- Skip full-transcript resize-width scans on unchanged-width render frames, viewport-only resize repaints, and coalesced resize appends by measuring only where the reflow decision is consumed, while preserving rendering and settled scrollback repair.
+- Defer resize reflow-decision scans to their consuming branch, skipping them on unchanged-width frames and viewport-only repaints; coalesced resize appends avoid that decision scan while retained-prefix validation may still measure rows, preserving rendering and settled scrollback repair.
 
 ## [0.16.6] - 2026-09-07
 

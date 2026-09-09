@@ -1,7 +1,7 @@
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import { type Component, Container, Editor, Text, TUI } from "@gajae-code/tui";
-import { ImageProtocol, setTerminalImageProtocol, TERMINAL } from "@gajae-code/tui/terminal-capabilities";
 import { Loader } from "@gajae-code/tui/components/loader";
+import { ImageProtocol, setTerminalImageProtocol, TERMINAL } from "@gajae-code/tui/terminal-capabilities";
 import { visibleWidth } from "@gajae-code/tui/utils";
 import { defaultEditorTheme } from "./test-themes";
 import { VirtualTerminal } from "./virtual-terminal";
