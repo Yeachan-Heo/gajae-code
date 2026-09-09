@@ -3,15 +3,40 @@ import * as fs from "node:fs";
 import * as fsPromises from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { resolveMarkitMupdfWasm } from "../scripts/generate-mupdf-wasm";
-
 import { convertFileWithMarkit } from "../src/utils/markit";
 import { ensureMupdfWasmResolution } from "../src/utils/mupdf-wasm";
+import { resolveMarkitMupdfWasm } from "../src/utils/mupdf-wasm-path";
 
 const MODULE_CONFIG_KEY = "$libmupdf_wasm_Module";
 const fixturePdfPath = path.resolve(import.meta.dirname, "fixtures/dummy-pdf-fixture.pdf");
 
 describe("mupdf wasm embedding (#5433)", () => {
+	it("resolves from the coding-agent package root by default", () => {
+		const packageDir = path.resolve(import.meta.dirname, "..");
+		const markitEntry = Bun.resolveSync("markit-ai", packageDir);
+		const mupdfEntry = Bun.resolveSync("mupdf", path.dirname(markitEntry));
+		expect(resolveMarkitMupdfWasm()).toBe(path.join(path.dirname(mupdfEntry), "mupdf-wasm.wasm"));
+	});
+
+	it("keeps the executable WASM generator out of runtime asset imports", async () => {
+		const packageDir = path.resolve(import.meta.dirname, "..");
+		const parser = new Bun.Transpiler({ loader: "ts", target: "bun" });
+		const runtimeImports = parser
+			.scan(await Bun.file(path.join(packageDir, "src/utils/mupdf-wasm.ts")).text())
+			.imports.map(entry => entry.path);
+		const helperImports = parser
+			.scan(await Bun.file(path.join(packageDir, "src/utils/mupdf-wasm-path.ts")).text())
+			.imports.map(entry => entry.path);
+		const generatorImports = parser
+			.scan(await Bun.file(path.join(packageDir, "scripts/generate-mupdf-wasm.ts")).text())
+			.imports.map(entry => entry.path);
+		expect(runtimeImports).toContain("./mupdf-wasm-path");
+		expect(
+			runtimeImports.some(specifier => specifier.includes("scripts/") || specifier.includes("generate-mupdf")),
+		).toBe(false);
+		expect(helperImports).toEqual(["node:path"]);
+		expect(generatorImports).toContain("../src/utils/mupdf-wasm-path");
+	});
 	it("resolves markit's nested MuPDF rather than a different hoisted instance", async () => {
 		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-mupdf-installed-"));
 		try {

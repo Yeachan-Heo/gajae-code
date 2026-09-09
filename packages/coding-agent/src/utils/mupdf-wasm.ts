@@ -1,6 +1,6 @@
 import { isCompiledBinary } from "@gajae-code/utils";
-import { resolveMarkitMupdfWasm } from "../../scripts/generate-mupdf-wasm";
 import embeddedMupdfWasmPath from "./mupdf-wasm.generated.wasm" with { type: "file" };
+import { resolveMarkitMupdfWasm } from "./mupdf-wasm-path";
 
 const MODULE_CONFIG_KEY = "$libmupdf_wasm_Module";
 
