@@ -741,7 +741,8 @@ async function renderUrl(
 	const { finalUrl, content: rawContent } = response;
 	const mime = normalizeMime(response.contentType);
 	const extHint = getExtensionHint(finalUrl);
-	const isPdf = mime === "application/pdf" || (extHint === ".pdf" && !mime.includes("html"));
+	const isPdf =
+		mime === "application/pdf" || (extHint === ".pdf" && !mime.includes("html") && !mime.startsWith("image/"));
 
 	// Raw PDF inspection is explicit; never substitute PDF bytes for failed text extraction.
 	if (raw && isPdf) {

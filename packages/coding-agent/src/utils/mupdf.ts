@@ -1,5 +1,6 @@
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { embeddedMuPdfWasm } from "./mupdf-embedded";
+import { embeddedMuPdfModule, embeddedMuPdfWasm } from "./mupdf-embedded";
 
 export let mupdfAssetMapping = "module mupdf; WASM mupdf-wasm.wasm -> unresolved";
 let wasmAsset: string | undefined;
@@ -8,15 +9,19 @@ let preparation: Promise<void> | undefined;
 
 function resolveWasmAsset(): string {
 	if (wasmAsset) return wasmAsset;
+	let moduleMapping: string;
 	if (embeddedMuPdfWasm) {
 		wasmAsset = embeddedMuPdfWasm;
+		moduleMapping = `build-time provenance ${embeddedMuPdfModule}`;
 	} else {
 		if (process.env.PI_COMPILED || /\$bunfs|~BUN|%7EBUN/.test(import.meta.url)) {
 			throw new Error("Compiled MuPDF WASM mapping is missing; run scripts/embed-mupdf.ts before compiling.");
 		}
-		wasmAsset = fileURLToPath(new URL("./mupdf-wasm.wasm", import.meta.resolve("mupdf")));
+		const markitModule = fileURLToPath(import.meta.resolve("markit-ai"));
+		moduleMapping = Bun.resolveSync("mupdf", dirname(markitModule));
+		wasmAsset = join(dirname(moduleMapping), "mupdf-wasm.wasm");
 	}
-	mupdfAssetMapping = `module mupdf; WASM mupdf-wasm.wasm -> ${wasmAsset}`;
+	mupdfAssetMapping = `module mupdf -> ${moduleMapping}; WASM mupdf-wasm.wasm -> ${wasmAsset}`;
 	return wasmAsset;
 }
 
