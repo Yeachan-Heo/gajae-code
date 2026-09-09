@@ -56,17 +56,41 @@ describe("mupdf wasm embedding (#5433)", () => {
 			fs.rmSync(tempDir, { recursive: true, force: true });
 		}
 	});
-	it("seeds the emscripten module config with a locateFile hook", () => {
+	it("does not statically depend on the gitignored generated asset in the source path", async () => {
+		// `prepare`/`prepack`/the binary build produce the asset; a checkout that
+		// skipped them must still be able to import the source module and reach
+		// the non-compiled branch instead of failing at module load.
+		const packageDir = path.resolve(import.meta.dirname, "..");
+		const parser = new Bun.Transpiler({ loader: "ts", target: "bun" });
+		const source = await Bun.file(path.join(packageDir, "src/utils/mupdf-wasm.ts")).text();
+		const staticImports = parser.scan(source).imports.filter(entry => entry.kind === "import-statement");
+		expect(staticImports.some(entry => entry.path.includes("mupdf-wasm.generated"))).toBe(false);
+		const generated = path.join(packageDir, "src/utils/mupdf-wasm.generated.wasm");
+		const hidden = `${generated}.hidden-${process.pid}`;
+		const hadAsset = fs.existsSync(generated);
+		if (hadAsset) fs.renameSync(generated, hidden);
+		try {
+			const probe = Bun.spawnSync(
+				[process.execPath, "-e", 'import "./src/utils/markit.ts"; console.log("IMPORT_OK");'],
+				{ cwd: packageDir, stdout: "pipe", stderr: "pipe" },
+			);
+			expect(probe.stderr.toString()).not.toContain("mupdf-wasm.generated.wasm");
+			expect(probe.stdout.toString()).toContain("IMPORT_OK");
+		} finally {
+			if (hadAsset) fs.renameSync(hidden, generated);
+		}
+	});
+	it("seeds the emscripten module config with a locateFile hook", async () => {
 		const globalScope = globalThis as typeof globalThis & Record<string, unknown>;
 		const previous = globalScope[MODULE_CONFIG_KEY];
 		delete globalScope[MODULE_CONFIG_KEY];
 		try {
-			ensureMupdfWasmResolution();
+			await ensureMupdfWasmResolution();
 			const seeded = globalScope[MODULE_CONFIG_KEY] as { locateFile?: unknown } | undefined;
 			expect(typeof seeded?.locateFile).toBe("function");
 			expect((seeded as { locateFile: () => string }).locateFile()).toBe(resolveMarkitMupdfWasm());
 			// Idempotent: seeding again must not replace an existing config.
-			ensureMupdfWasmResolution();
+			await ensureMupdfWasmResolution();
 			expect(globalScope[MODULE_CONFIG_KEY]).toBe(seeded);
 		} finally {
 			if (previous === undefined) {
@@ -77,13 +101,13 @@ describe("mupdf wasm embedding (#5433)", () => {
 		}
 	});
 
-	it("preserves a pre-existing emscripten module config", () => {
+	it("preserves a pre-existing emscripten module config", async () => {
 		const globalScope = globalThis as typeof globalThis & Record<string, unknown>;
 		const sentinel = { locateFile: () => "/sentinel/mupdf-wasm.wasm" };
 		const previous = globalScope[MODULE_CONFIG_KEY];
 		globalScope[MODULE_CONFIG_KEY] = sentinel;
 		try {
-			ensureMupdfWasmResolution();
+			await ensureMupdfWasmResolution();
 			expect(globalScope[MODULE_CONFIG_KEY]).toBe(sentinel);
 		} finally {
 			if (previous === undefined) {

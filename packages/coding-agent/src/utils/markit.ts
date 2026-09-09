@@ -10,19 +10,19 @@ export interface MarkitConversionResult {
 }
 
 let markit: () => Markit | Promise<Markit> = async () => {
-	const promise = import("markit-ai").then(({ Markit }) => {
-		const instance = new Markit();
-		markit = () => instance;
-		return instance;
-	});
+	// #5433: mupdf's wasm asset is not reachable at the Emscripten loader's
+	// default bunfs path in compiled binaries. Seed the embedded-asset hook
+	// before the first markit import (and therefore before any mupdf import).
+	const promise = ensureMupdfWasmResolution()
+		.then(() => import("markit-ai"))
+		.then(({ Markit }) => {
+			const instance = new Markit();
+			markit = () => instance;
+			return instance;
+		});
 	markit = () => promise;
 	return promise;
 };
-
-// #5433: mupdf's wasm asset is not reachable at the Emscripten loader's
-// default bunfs path in compiled binaries. Seed the embedded-asset hook
-// before any markit conversion (and therefore before any mupdf import).
-ensureMupdfWasmResolution();
 
 function normalizeExtension(extension: string): string {
 	const trimmed = extension.trim().toLowerCase();
