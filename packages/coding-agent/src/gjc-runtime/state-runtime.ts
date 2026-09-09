@@ -1896,6 +1896,509 @@ const EXECUTION_APPROVAL_TRANSCRIPT_MAX_BYTES = 128 * 1024 * 1024;
 const DEEP_INTERVIEW_EXECUTION_APPROVAL_RECORD_MAX_BYTES = 16 * 1024;
 const DEEP_INTERVIEW_EXECUTION_APPROVAL_ID_MAX_LENGTH = 256;
 
+export interface ExecutionApprovalTranscriptBoundary {
+	byte_length: number;
+	device: string;
+	inode: string;
+	leaf_id: string | null;
+}
+
+function isExecutionApprovalTranscriptBoundary(value: unknown): value is ExecutionApprovalTranscriptBoundary {
+	return (
+		isPlainObject(value) &&
+		Number.isSafeInteger(value.byte_length) &&
+		(value.byte_length as number) > 0 &&
+		typeof value.device === "string" &&
+		/^\d+$/.test(value.device) &&
+		typeof value.inode === "string" &&
+		/^\d+$/.test(value.inode) &&
+		(value.leaf_id === null || isExecutionApprovalId(value.leaf_id))
+	);
+}
+
+function approvalTranscriptRecords(text: string): Record<string, unknown>[] {
+	try {
+		const records: unknown[] = Bun.JSONL.parse(text);
+		if (records.some(record => !isPlainObject(record))) throw new Error("invalid record");
+		return records as Record<string, unknown>[];
+	} catch {
+		throw new StateCommandError(2, "execution approval transcript is malformed");
+	}
+}
+
+function approvalTranscriptPrefix(
+	cwd: string,
+	sessionId: string,
+	text: string,
+): { leaf: string | null; ids: Set<string> } {
+	const [header, ...records] = approvalTranscriptRecords(text);
+	if (
+		header?.type !== "session" ||
+		header.id !== sessionId ||
+		typeof header.cwd !== "string" ||
+		path.resolve(header.cwd) !== path.resolve(cwd)
+	)
+		throw new StateCommandError(2, "execution approval transcript identity mismatch");
+	const ids = new Set<string>();
+	let leaf: string | null = null;
+	for (const record of records) {
+		if (record.type === "header_patch") {
+			const patch = record.patch;
+			if (!isPlainObject(patch) || ["id", "cwd", "version"].some(key => key in patch))
+				throw new StateCommandError(2, "execution approval transcript identity patch is invalid");
+			continue;
+		}
+		if (record.type === "entry_patch") {
+			const patch = record.patch;
+			if (
+				!isPlainObject(patch) ||
+				typeof record.entryId !== "string" ||
+				!ids.has(record.entryId) ||
+				["id", "parentId", "type"].some(key => key in patch)
+			)
+				throw new StateCommandError(2, "execution approval transcript branch patch is invalid");
+			continue;
+		}
+		if (
+			!isExecutionApprovalId(record.id) ||
+			ids.has(record.id) ||
+			(record.parentId !== null && (typeof record.parentId !== "string" || !ids.has(record.parentId)))
+		)
+			throw new StateCommandError(2, "execution approval transcript branch is invalid");
+		ids.add(record.id);
+		leaf = record.id;
+	}
+	return { leaf, ids };
+}
+
+export async function captureExecutionApprovalTranscriptBoundary(
+	cwd: string,
+	sessionId: string,
+	transcriptPath: string,
+	transcriptSha256: string,
+): Promise<ExecutionApprovalTranscriptBoundary> {
+	const before = await fs.lstat(transcriptPath, { bigint: true });
+	const text = await readBoundedIdentityText(
+		transcriptPath,
+		EXECUTION_APPROVAL_TRANSCRIPT_MAX_BYTES,
+		"execution approval transcript",
+	);
+	const after = await fs.lstat(transcriptPath, { bigint: true });
+	if ((await fs.realpath(transcriptPath)) !== path.resolve(transcriptPath))
+		throw new StateCommandError(2, "execution approval transcript path is not canonical");
+	if (
+		!sameBoundedFileIdentity(before, after) ||
+		text === undefined ||
+		!text.endsWith("\n") ||
+		createHash("sha256").update(text).digest("hex") !== transcriptSha256
+	)
+		throw new StateCommandError(2, "execution approval transcript changed before recording consent");
+	const { leaf } = approvalTranscriptPrefix(cwd, sessionId, text);
+	return {
+		byte_length: Buffer.byteLength(text),
+		device: after.dev.toString(),
+		inode: after.ino.toString(),
+		leaf_id: leaf,
+	};
+}
+
+export async function assertExecutionApprovalTranscriptBoundary(
+	cwd: string,
+	sessionId: string,
+	transcriptPath: string,
+	transcriptSha256: string,
+	boundary: unknown,
+): Promise<void> {
+	if (!isExecutionApprovalTranscriptBoundary(boundary))
+		throw new StateCommandError(2, "execution approval transcript boundary is invalid");
+	const before = await fs.lstat(transcriptPath, { bigint: true });
+	const text = await readBoundedIdentityText(
+		transcriptPath,
+		EXECUTION_APPROVAL_TRANSCRIPT_MAX_BYTES,
+		"execution approval transcript",
+	);
+	const after = await fs.lstat(transcriptPath, { bigint: true });
+	if ((await fs.realpath(transcriptPath)) !== path.resolve(transcriptPath))
+		throw new StateCommandError(2, "execution approval transcript path is not canonical");
+	if (
+		!sameBoundedFileIdentity(before, after) ||
+		after.dev.toString() !== boundary.device ||
+		after.ino.toString() !== boundary.inode ||
+		text === undefined
+	)
+		throw new StateCommandError(2, "execution approval transcript identity changed");
+	const bytes = Buffer.from(text);
+	const prefix = bytes.subarray(0, boundary.byte_length);
+	if (prefix.length !== boundary.byte_length || createHash("sha256").update(prefix).digest("hex") !== transcriptSha256)
+		throw new StateCommandError(2, "execution approval transcript prefix changed after user approval");
+	const branch = approvalTranscriptPrefix(cwd, sessionId, prefix.toString("utf8"));
+	if (branch.leaf !== boundary.leaf_id)
+		throw new StateCommandError(2, "execution approval transcript branch identity changed");
+	const suffix = bytes.subarray(boundary.byte_length).toString("utf8");
+	if (suffix && !suffix.endsWith("\n"))
+		throw new StateCommandError(2, "execution approval transcript continuation is incomplete");
+	for (const record of approvalTranscriptRecords(suffix)) {
+		if (
+			record.type !== "message" ||
+			!isExecutionApprovalId(record.id) ||
+			branch.ids.has(record.id) ||
+			record.parentId !== branch.leaf ||
+			!isPlainObject(record.message) ||
+			!["assistant", "toolResult"].includes(String(record.message.role))
+		)
+			throw new StateCommandError(2, "execution approval transcript continuation changed user evidence or branch");
+		branch.ids.add(record.id);
+		branch.leaf = record.id;
+	}
+}
+
+export type ExecutionApprovalStage = "deep-interview" | "ralplan";
+
+/** Select lineage before validation; malformed Crystal evidence must never fall back. */
+export async function executionApprovalLineage(
+	cwd: string,
+	sessionId: string,
+	stage: ExecutionApprovalStage,
+): Promise<"crystal" | "ordinary"> {
+	const current = await readExistingStateForMutation(modeStateFile(cwd, stage, sessionId));
+	if (current.kind !== "valid") throw new StateCommandError(2, "execution approval requires valid workflow state");
+	assertNoFutureWorkflowEnvelope(current.value, stage, "execution approval");
+	if (await warnAndAuditOutOfBandIfNeeded(cwd, sessionId, modeStateFile(cwd, stage, sessionId), stage))
+		throw new StateCommandError(2, "execution approval refuses tampered workflow state");
+	let interview = current.value;
+	if (stage === "ralplan") {
+		const upstream = current.value.handoff_from;
+		if (!upstream && !(await hasAuditedDeepInterviewHandoff(cwd, sessionId, "ralplan"))) return "ordinary";
+		if (upstream && upstream !== "deep-interview")
+			throw new StateCommandError(2, "execution approval has unsupported upstream lineage");
+		const read = await readExistingStateForMutation(modeStateFile(cwd, "deep-interview", sessionId));
+		if (read.kind !== "valid") throw new StateCommandError(2, "execution approval upstream state is unavailable");
+		assertNoFutureWorkflowEnvelope(read.value, "deep-interview", "execution approval upstream");
+		if (
+			await warnAndAuditOutOfBandIfNeeded(
+				cwd,
+				sessionId,
+				modeStateFile(cwd, "deep-interview", sessionId),
+				"deep-interview",
+			)
+		)
+			throw new StateCommandError(2, "execution approval refuses tampered upstream state");
+		interview = read.value;
+	}
+	const inner = isPlainObject(interview.state) ? interview.state : {};
+	const receipt = isPlainObject(interview.receipt) ? interview.receipt : {};
+	return inner.crystal !== undefined || receipt.command === "gjc deep-interview crystallize" ? "crystal" : "ordinary";
+}
+
+interface NonCrystalExecutionApprovalRecord {
+	schema_version: 1;
+	status: "pending" | "consumed" | "revoked";
+	session_id: string;
+	stage: ExecutionApprovalStage;
+	target: "ultragoal";
+	state_path: string;
+	state_revision: number;
+	artifact_path: string;
+	artifact_sha256: string;
+	run_id: string | null;
+	question_id: string;
+	gate_id: string;
+	answer_hash: string;
+	transcript_path: string;
+	transcript_sha256: string;
+	transcript_boundary: ExecutionApprovalTranscriptBoundary;
+	created_at: string;
+	expires_at: string;
+}
+
+export function nonCrystalExecutionApprovalRecordPath(
+	cwd: string,
+	sessionId: string,
+	stage: ExecutionApprovalStage,
+): string {
+	return path.join(sessionStateDir(cwd, sessionId), `${stage}-ordinary-execution-approval.json`);
+}
+
+async function nonCrystalApprovalPublication(cwd: string, sessionId: string, stage: ExecutionApprovalStage) {
+	if ((await executionApprovalLineage(cwd, sessionId, stage)) !== "ordinary")
+		throw new StateCommandError(2, "ordinary execution approval cannot authorize Crystal lineage");
+	const statePath = modeStateFile(cwd, stage, sessionId);
+	const read = await readExistingStateForMutation(statePath);
+	if (read.kind !== "valid") throw new StateCommandError(2, "execution approval state is unavailable");
+	const state = read.value;
+	if (state.active !== true || !["final", "handoff"].includes(String(state.current_phase)))
+		throw new StateCommandError(2, "execution approval requires an active final publication");
+	if (stage === "ralplan") {
+		const final = await verifiedRalplanFinalEvidence(cwd, sessionId, state);
+		if (!final) throw new StateCommandError(2, "execution approval requires verified Ralplan final evidence");
+		return {
+			state_path: final.statePath,
+			state_revision: final.stateRevision,
+			artifact_path: final.finalPath,
+			artifact_sha256: final.finalSha256,
+			run_id: final.runId,
+		};
+	}
+	await assertDeepInterviewHandoffReady(state, { cwd, sessionId, statePath });
+	const receipt = persistedWorkflowReceipt(state.receipt, "deep-interview");
+	if (
+		state.spec_stage !== "final" ||
+		typeof state.spec_path !== "string" ||
+		!isSha256(state.spec_sha256) ||
+		receipt?.owner !== "gjc-runtime" ||
+		receipt.command !== "gjc deep-interview persist-spec-state" ||
+		receipt.content_sha256?.covered_path !== path.resolve(statePath)
+	)
+		throw new StateCommandError(2, "execution approval requires a canonically published final spec");
+	const relative = path.relative(path.resolve(sessionSpecsDir(cwd, sessionId)), path.resolve(state.spec_path));
+	if (
+		relative.startsWith("..") ||
+		path.isAbsolute(relative) ||
+		(await hashIdentityFile(state.spec_path, "ordinary final spec")) !== state.spec_sha256
+	)
+		throw new StateCommandError(2, "execution approval final spec identity mismatch");
+	const revision = existingStateRevision(state);
+	if (!Number.isSafeInteger(revision) || typeof revision !== "number" || revision < 0)
+		throw new StateCommandError(2, "execution approval state revision is invalid");
+	return {
+		state_path: path.resolve(statePath),
+		state_revision: revision,
+		artifact_path: path.resolve(state.spec_path),
+		artifact_sha256: state.spec_sha256,
+		run_id: null,
+	};
+}
+
+async function writeNonCrystalApproval(cwd: string, record: NonCrystalExecutionApprovalRecord): Promise<void> {
+	const recordPath = nonCrystalExecutionApprovalRecordPath(cwd, record.session_id, record.stage);
+	const content = `${JSON.stringify(record)}\n`;
+	const digest = createHash("sha256").update(content).digest("hex");
+	await writeArtifact(recordPath, content, {
+		cwd,
+		audit: {
+			category: "artifact",
+			verb: "write",
+			owner: "gjc-runtime",
+			skill: record.stage,
+			sessionId: record.session_id,
+		},
+	});
+	const auditEntry = {
+		ts: nowIso(),
+		category: "state",
+		verb: "approve-execution",
+		owner: "gjc-runtime",
+		skill: record.stage,
+		mutation_id: `${record.stage}:ordinary-execution-approval:${record.status}:${digest}`,
+		forced: false,
+		paths: [recordPath],
+		ordinary_approval_status: record.status,
+		question_id: record.question_id,
+		gate_id: record.gate_id,
+		artifact_sha256: record.artifact_sha256,
+		run_id: record.run_id,
+		ordinary_approval_sha256: digest,
+	} satisfies AuditEntry & Record<string, unknown>;
+	await appendAuditEntry(cwd, record.session_id, auditEntry);
+}
+
+async function nonCrystalApprovalAuditRows(
+	cwd: string,
+	sessionId: string,
+	stage: ExecutionApprovalStage,
+): Promise<Record<string, unknown>[]> {
+	const recordPath = nonCrystalExecutionApprovalRecordPath(cwd, sessionId, stage);
+	const audit = await readBoundedIdentityText(auditPath(cwd, sessionId), 16 * 1024 * 1024, "execution approval audit");
+	const rows = (audit ?? "")
+		.split(/\r?\n/)
+		.filter(Boolean)
+		.map(line => {
+			const row: unknown = JSON.parse(line);
+			if (!isPlainObject(row)) throw new StateCommandError(2, "execution approval audit is invalid");
+			return row;
+		});
+	return rows.filter(
+		row =>
+			row.owner === "gjc-runtime" &&
+			row.verb === "approve-execution" &&
+			row.skill === stage &&
+			Array.isArray(row.paths) &&
+			row.paths.includes(recordPath) &&
+			row.ordinary_approval_sha256,
+	);
+}
+
+async function readNonCrystalApproval(
+	cwd: string,
+	sessionId: string,
+	stage: ExecutionApprovalStage,
+): Promise<NonCrystalExecutionApprovalRecord | undefined> {
+	const recordPath = nonCrystalExecutionApprovalRecordPath(cwd, sessionId, stage);
+	const content = await readBoundedIdentityText(
+		recordPath,
+		DEEP_INTERVIEW_EXECUTION_APPROVAL_RECORD_MAX_BYTES,
+		"ordinary execution approval",
+	);
+	if (content === undefined) return undefined;
+	const value: unknown = JSON.parse(content);
+	if (
+		!isPlainObject(value) ||
+		value.schema_version !== 1 ||
+		value.session_id !== sessionId ||
+		value.stage !== stage ||
+		value.target !== "ultragoal" ||
+		!["pending", "consumed", "revoked"].includes(String(value.status)) ||
+		!isExecutionApprovalId(value.question_id) ||
+		!isExecutionApprovalId(value.gate_id) ||
+		!isSha256(value.answer_hash) ||
+		typeof value.transcript_path !== "string" ||
+		!path.isAbsolute(value.transcript_path) ||
+		!isSha256(value.transcript_sha256) ||
+		!isExecutionApprovalTranscriptBoundary(value.transcript_boundary) ||
+		typeof value.expires_at !== "string" ||
+		!Number.isFinite(Date.parse(value.expires_at))
+	)
+		throw new StateCommandError(2, "ordinary execution approval record is invalid");
+	const digest = createHash("sha256").update(content).digest("hex");
+	const latest = (await nonCrystalApprovalAuditRows(cwd, sessionId, stage)).at(-1);
+	if (latest?.ordinary_approval_sha256 !== digest)
+		throw new StateCommandError(2, "ordinary execution approval lacks sanctioned audit provenance");
+	return value as unknown as NonCrystalExecutionApprovalRecord;
+}
+
+export async function recordNonCrystalExecutionApproval(options: {
+	cwd: string;
+	sessionId: string;
+	approvalStage: ExecutionApprovalStage;
+	questionId: string;
+	gateId: string;
+	target: "ultragoal";
+	selectedOptions: string[];
+	transcriptPath: string;
+	transcriptSha256: string;
+}): Promise<void> {
+	const { cwd, sessionId, approvalStage: stage } = options;
+	if (
+		!isExecutionApprovalId(options.questionId) ||
+		!isExecutionApprovalId(options.gateId) ||
+		options.target !== "ultragoal" ||
+		options.selectedOptions.length !== 1
+	)
+		throw new StateCommandError(2, "ordinary execution approval descriptor is invalid");
+	await withWorkflowStateLock(
+		modeStateFile(cwd, stage, sessionId),
+		async () => {
+			const publication = await nonCrystalApprovalPublication(cwd, sessionId, stage);
+			await withWorkflowStateLock(
+				nonCrystalExecutionApprovalRecordPath(cwd, sessionId, stage),
+				async () => {
+					await readNonCrystalApproval(cwd, sessionId, stage);
+					const history = await nonCrystalApprovalAuditRows(cwd, sessionId, stage);
+					if (
+						history.some(
+							row =>
+								row.question_id === options.questionId ||
+								row.gate_id === options.gateId ||
+								(row.ordinary_approval_status === "consumed" &&
+									row.artifact_sha256 === publication.artifact_sha256 &&
+									row.run_id === publication.run_id),
+						)
+					)
+						throw new StateCommandError(2, "ordinary execution approval consent replay refused");
+					await writeNonCrystalApproval(cwd, {
+						schema_version: 1,
+						status: "pending",
+						session_id: sessionId,
+						stage,
+						target: "ultragoal",
+						...publication,
+						question_id: options.questionId,
+						gate_id: options.gateId,
+						answer_hash: answerHash(options.selectedOptions, undefined),
+						transcript_path: options.transcriptPath,
+						transcript_sha256: options.transcriptSha256,
+						transcript_boundary: await captureExecutionApprovalTranscriptBoundary(
+							cwd,
+							sessionId,
+							options.transcriptPath,
+							options.transcriptSha256,
+						),
+						created_at: nowIso(),
+						expires_at: new Date(Date.now() + DEEP_INTERVIEW_EXECUTION_APPROVAL_MAX_AGE_MS).toISOString(),
+					});
+				},
+				{ cwd },
+			);
+		},
+		{ cwd },
+	);
+}
+
+async function assertNonCrystalApprovalCurrent(
+	cwd: string,
+	sessionId: string,
+	stage: ExecutionApprovalStage,
+	status: "pending" | "consumed",
+) {
+	const record = await readNonCrystalApproval(cwd, sessionId, stage);
+	if (!record || record.status !== status || (status === "pending" && Date.parse(record.expires_at) <= Date.now()))
+		throw new StateCommandError(2, "ordinary execution approval is missing, expired or consumed");
+	const publication = await nonCrystalApprovalPublication(cwd, sessionId, stage);
+	for (const key of ["state_path", "artifact_path", "artifact_sha256", "run_id"] as const)
+		if (record[key] !== publication[key])
+			throw new StateCommandError(2, "ordinary execution approval publication is stale");
+	if (record.state_revision !== publication.state_revision) {
+		const current = await readExistingStateForMutation(publication.state_path);
+		const sanctionedPhaseTransition =
+			stage === "ralplan" &&
+			current.kind === "valid" &&
+			current.value.current_phase === "handoff" &&
+			isPlainObject(current.value.final_admission_phase_transition) &&
+			publication.state_revision === record.state_revision + 1;
+		if (!sanctionedPhaseTransition)
+			throw new StateCommandError(2, "ordinary execution approval publication is stale");
+	}
+	await assertExecutionApprovalTranscriptBoundary(
+		cwd,
+		sessionId,
+		record.transcript_path,
+		record.transcript_sha256,
+		record.transcript_boundary,
+	);
+	return record;
+}
+
+/** Caller holds the workflow state lock. Consumption never rewrites final publication evidence. */
+async function consumeNonCrystalApprovalUnlocked(
+	cwd: string,
+	sessionId: string,
+	stage: ExecutionApprovalStage,
+): Promise<StateCommandResult> {
+	return withWorkflowStateLock(
+		nonCrystalExecutionApprovalRecordPath(cwd, sessionId, stage),
+		async () => {
+			const record = await assertNonCrystalApprovalCurrent(cwd, sessionId, stage, "pending");
+			await writeNonCrystalApproval(cwd, { ...record, status: "consumed" });
+			return { status: 0, stdout: `${JSON.stringify({ skill: stage, execution_approval: "approved" })}\n` };
+		},
+		{ cwd },
+	);
+}
+
+export async function revokeNonCrystalExecutionApproval(
+	cwd: string,
+	sessionId: string,
+	stage: ExecutionApprovalStage,
+): Promise<void> {
+	await withWorkflowStateLock(
+		nonCrystalExecutionApprovalRecordPath(cwd, sessionId, stage),
+		async () => {
+			const record = await readNonCrystalApproval(cwd, sessionId, stage);
+			if (record?.status === "pending") await writeNonCrystalApproval(cwd, { ...record, status: "revoked" });
+		},
+		{ cwd },
+	);
+}
 export interface DeepInterviewExecutionApprovalRecord {
 	schema_version: 1;
 	status: "pending" | "consumed";
@@ -1913,6 +2416,7 @@ export interface DeepInterviewExecutionApprovalRecord {
 	answer_hash: string;
 	transcript_path: string;
 	transcript_sha256: string;
+	transcript_boundary: ExecutionApprovalTranscriptBoundary;
 	approval_stage?: "deep-interview" | "ralplan";
 	ralplan_state_path?: string;
 	ralplan_state_revision?: number;
@@ -1960,6 +2464,7 @@ function assertExecutionApprovalRecordShape(value: unknown): asserts value is De
 		"answer_hash",
 		"transcript_path",
 		"transcript_sha256",
+		"transcript_boundary",
 		"approval_stage",
 		"ralplan_state_path",
 		"ralplan_state_revision",
@@ -1995,6 +2500,7 @@ function assertExecutionApprovalRecordShape(value: unknown): asserts value is De
 		typeof value.transcript_path !== "string" ||
 		!path.isAbsolute(value.transcript_path) ||
 		!isSha256(value.transcript_sha256) ||
+		!isExecutionApprovalTranscriptBoundary(value.transcript_boundary) ||
 		typeof value.created_at !== "string" ||
 		typeof value.expires_at !== "string"
 	)
@@ -2270,6 +2776,12 @@ export async function recordDeepInterviewExecutionApproval(options: {
 				answer_hash: answerHash([...options.selectedOptions], options.customInput),
 				transcript_path: path.resolve(options.transcriptPath),
 				transcript_sha256: options.transcriptSha256,
+				transcript_boundary: await captureExecutionApprovalTranscriptBoundary(
+					options.cwd,
+					options.sessionId,
+					options.transcriptPath,
+					options.transcriptSha256,
+				),
 				approval_stage: options.approvalStage ?? "deep-interview",
 				...(ralplanFinal
 					? {
@@ -2287,11 +2799,36 @@ export async function recordDeepInterviewExecutionApproval(options: {
 				recordPath,
 				async () => {
 					const existing = await readDeepInterviewExecutionApprovalRecord(recordPath);
-					if (
-						existing?.status === "consumed" &&
-						!existing.consumed_mutation_id?.startsWith("deep-interview:approval-revoked:")
-					)
-						throw new StateCommandError(2, "deep-interview execution approval record is already consumed");
+					if (existing?.status === "consumed") {
+						const newPublication =
+							inner.execution_approval === "not-approved" &&
+							inner.execution_approval_receipt === undefined &&
+							publicationReceipt?.command === "gjc deep-interview crystallize" &&
+							crystal.spec_version === existing.crystal_spec_version + 1 &&
+							record.crystal_source_digest !== existing.crystal_source_digest &&
+							record.spec_sha256 !== existing.spec_sha256 &&
+							record.gate_id !== existing.gate_id &&
+							isPlainObject(crystal.delta) &&
+							crystal.delta.approval_invalidated === true;
+						if (!newPublication && !existing.consumed_mutation_id?.startsWith("deep-interview:approval-revoked:"))
+							throw new StateCommandError(2, "deep-interview execution approval record is already consumed");
+						if (newPublication) {
+							await writeArtifact(
+								`${recordPath}.${existing.crystal_spec_version}.${existing.spec_sha256}.consumed`,
+								`${JSON.stringify(existing)}\n`,
+								{
+									cwd: options.cwd,
+									audit: {
+										category: "artifact",
+										verb: "write",
+										owner: "gjc-runtime",
+										skill: "deep-interview",
+										sessionId: options.sessionId,
+									},
+								},
+							);
+						}
+					}
 					if (existing?.status === "pending") {
 						await assertExecutionApprovalSpecIdentity(existing);
 						try {
@@ -2886,16 +3423,13 @@ async function assertDeepInterviewHandoffReady(
 				!isSha256(approval.transcript_sha256)
 			)
 				throw new StateCommandError(2, "deep-interview execution approval lacks explicit provenance");
-			const transcriptText = await readBoundedIdentityText(
+			await assertExecutionApprovalTranscriptBoundary(
+				options.cwd ?? "",
+				options.sessionId ?? "",
 				approval.transcript_path,
-				EXECUTION_APPROVAL_TRANSCRIPT_MAX_BYTES,
-				"deep-interview execution approval transcript",
+				approval.transcript_sha256,
+				approval.transcript_boundary,
 			);
-			if (
-				transcriptText === undefined ||
-				createHash("sha256").update(transcriptText).digest("hex") !== approval.transcript_sha256
-			)
-				throw new StateCommandError(2, "deep-interview execution approval transcript provenance is stale");
 			await assertSanctionedExecutionApprovalAudit(
 				options.cwd ?? "",
 				options.sessionId ?? "",
@@ -2907,7 +3441,7 @@ async function assertDeepInterviewHandoffReady(
 		return;
 	}
 	if (options.requireExecutionApproval)
-		throw new StateCommandError(2, "deep-interview execution handoff requires a ready approved Crystal");
+		await assertNonCrystalApprovalCurrent(options.cwd ?? "", options.sessionId ?? "", "deep-interview", "consumed");
 	assertLockedIntentContract();
 }
 
@@ -3190,12 +3724,18 @@ async function assertDeepInterviewExecutionLineage(
 				throw new StateCommandError(2, `${integrityWarning}; execution handoff refuses tampered mode-state`);
 			const ralplanAdmission =
 				currentSkill === "ralplan" && (await hasSanctionedRalplanFinalAdmission(cwd, sessionId, currentState));
+			const ordinaryRalplanApproval =
+				currentSkill === "ralplan" &&
+				isPlainObject(upstreamState.state) &&
+				upstreamState.state.crystal === undefined;
+			if (ordinaryRalplanApproval && !ralplanAdmission)
+				await assertNonCrystalApprovalCurrent(cwd, sessionId, "ralplan", "consumed");
 			try {
 				await assertDeepInterviewHandoffReady(upstreamState, {
 					cwd,
 					sessionId,
 					statePath: upstreamPath,
-					requireExecutionApproval: !ralplanAdmission,
+					requireExecutionApproval: !ralplanAdmission && !ordinaryRalplanApproval,
 				});
 			} catch (error) {
 				throw new StateCommandError(
@@ -3225,7 +3765,8 @@ async function assertDeepInterviewExecutionLineage(
 					upstreamApproval.gate_id !== record.gate_id ||
 					upstreamApproval.answer_hash !== record.answer_hash ||
 					upstreamApproval.transcript_path !== record.transcript_path ||
-					upstreamApproval.transcript_sha256 !== record.transcript_sha256
+					upstreamApproval.transcript_sha256 !== record.transcript_sha256 ||
+					JSON.stringify(upstreamApproval.transcript_boundary) !== JSON.stringify(record.transcript_boundary)
 				)
 					throw new StateCommandError(2, "execution handoff Ralplan approval receipt identity mismatch");
 				await assertRalplanApprovalRecordCurrent(cwd, sessionId, record, currentState);
@@ -3541,6 +4082,11 @@ async function handleHandoffUnlocked(
 		ralplanExecutionFinal = await verifiedRalplanFinalEvidence(cwd, sessionId, existingCaller);
 		if (!ralplanExecutionFinal)
 			throw new StateCommandError(2, "Ralplan execution handoff requires non-stuck verified final plan evidence");
+		if (
+			(await executionApprovalLineage(cwd, sessionId, "ralplan")) === "ordinary" &&
+			!(await hasSanctionedRalplanFinalAdmission(cwd, sessionId, existingCaller))
+		)
+			await assertNonCrystalApprovalCurrent(cwd, sessionId, "ralplan", "consumed");
 	}
 	if (callee === "ultragoal" && caller !== "deep-interview")
 		await assertDeepInterviewExecutionLineage(cwd, sessionId, caller, existingCaller);
@@ -4359,6 +4905,11 @@ async function appendExecutionApprovalAudit(
 }
 
 async function handleApproveExecutionUnlocked(cwd: string, selectors: ResolvedSelectors): Promise<StateCommandResult> {
+	if (
+		(selectors.mode === "deep-interview" || selectors.mode === "ralplan") &&
+		(await executionApprovalLineage(cwd, selectors.gjcSessionId, selectors.mode)) === "ordinary"
+	)
+		return consumeNonCrystalApprovalUnlocked(cwd, selectors.gjcSessionId, selectors.mode);
 	if (selectors.mode !== "deep-interview")
 		throw new StateCommandError(2, "approve-execution requires --mode deep-interview");
 	const approvalRecordPath = deepInterviewExecutionApprovalRecordPath(cwd, selectors.gjcSessionId);
@@ -4446,16 +4997,13 @@ async function handleApproveExecutionRecordLocked(
 	if (!approvalRecord)
 		throw new StateCommandError(2, "approve-execution requires a user-origin execution approval record");
 	await assertExecutionApprovalSpecIdentity(approvalRecord);
-	const transcriptText = await readBoundedIdentityText(
+	await assertExecutionApprovalTranscriptBoundary(
+		cwd,
+		selectors.gjcSessionId,
 		approvalRecord.transcript_path,
-		EXECUTION_APPROVAL_TRANSCRIPT_MAX_BYTES,
-		"deep-interview execution approval transcript",
+		approvalRecord.transcript_sha256,
+		approvalRecord.transcript_boundary,
 	);
-	if (
-		transcriptText === undefined ||
-		createHash("sha256").update(transcriptText).digest("hex") !== approvalRecord.transcript_sha256
-	)
-		throw new StateCommandError(2, "deep-interview execution approval transcript changed after user approval");
 	await assertRalplanApprovalRecordCurrent(cwd, selectors.gjcSessionId, approvalRecord);
 	assertExecutionApprovalRecordMatchesCurrentState(approvalRecord, {
 		sessionId: selectors.gjcSessionId,
@@ -4481,6 +5029,7 @@ async function handleApproveExecutionRecordLocked(
 			existingReceipt.answer_hash !== approvalRecord.answer_hash ||
 			existingReceipt.transcript_path !== approvalRecord.transcript_path ||
 			existingReceipt.transcript_sha256 !== approvalRecord.transcript_sha256 ||
+			JSON.stringify(existingReceipt.transcript_boundary) !== JSON.stringify(approvalRecord.transcript_boundary) ||
 			existingReceipt.target !== approvalRecord.target ||
 			existingReceipt.approval_stage !== (approvalRecord.approval_stage ?? "deep-interview") ||
 			existingReceipt.ralplan_state_path !== approvalRecord.ralplan_state_path ||
@@ -4608,6 +5157,7 @@ async function handleApproveExecutionRecordLocked(
 		answer_hash: approvalRecord.answer_hash,
 		transcript_path: approvalRecord.transcript_path,
 		transcript_sha256: approvalRecord.transcript_sha256,
+		transcript_boundary: approvalRecord.transcript_boundary,
 		target: approvalRecord.target,
 		approval_stage: approvalRecord.approval_stage ?? "deep-interview",
 		...(approvalRecord.approval_stage === "ralplan"
@@ -4727,9 +5277,9 @@ async function handleApproveExecutionRecordLocked(
 
 async function handleApproveExecution(args: readonly string[], cwd: string): Promise<StateCommandResult> {
 	const selectors = await resolveSelectors(args, cwd, "approve-execution");
-	if (selectors.mode !== "deep-interview")
-		throw new StateCommandError(2, "approve-execution requires --mode deep-interview");
-	const statePath = modeStateFile(cwd, "deep-interview", selectors.gjcSessionId);
+	if (selectors.mode !== "deep-interview" && selectors.mode !== "ralplan")
+		throw new StateCommandError(2, "approve-execution requires --mode deep-interview or ralplan");
+	const statePath = modeStateFile(cwd, selectors.mode, selectors.gjcSessionId);
 	return withWorkflowStateLock(statePath, () => handleApproveExecutionUnlocked(cwd, selectors), { cwd });
 }
 

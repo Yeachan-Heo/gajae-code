@@ -115,16 +115,58 @@ describe("deep-interview Crystal semantic evidence", () => {
 			"Do users need accounts",
 			"Should backups be encrypted",
 			"Are backups encrypted",
+			"Should customers export reports",
+			"Can administrators export reports",
+			"Can we",
+			"Should customers",
+			"Should archivists catalogue manuscripts",
+			"Can botanists classify seedlings",
+			"Do librarians catalogue manuscripts",
+			"Does telemetry record latency",
+			"Are seedlings growing",
+			"Have couriers delivered parcels",
+			"Should regional archivists catalogue manuscripts",
+			"Can the visiting botanists classify seedlings",
 		]) {
 			expect(() => crystallizeDeepInterview(singleGoalEvidence(question))).toThrow("verbatim user anchor");
 			const disputed = userDirectiveEvidence(["Build a report.", question]);
 			disputed.items[1]!.classification = "disputed";
 			expect(crystallizeDeepInterview(disputed).lifecycle).toBe("stale");
 		}
+		for (const compound of [
+			"Build a report; should customers export reports",
+			"Build a report.\nCan administrators export reports",
+		]) {
+			expect(() => crystallizeDeepInterview(singleGoalEvidence(compound))).toThrow("verbatim user anchor");
+		}
 		const recommendation = crystallizeDeepInterview(singleGoalEvidence("We should encrypt backups."));
 		expect(recommendation.lifecycle).toBe("ready");
 		expect(recommendation.items[0]!.statement).toBe("We should encrypt backups");
 		expect(crystallizeDeepInterview(singleGoalEvidence("Do not be verbose.")).lifecycle).toBe("ready");
+		for (const directive of [
+			"Customers should export reports",
+			"Administrators can export reports",
+			"Archivists should catalogue manuscripts",
+			"Botanists can classify seedlings",
+			"Librarians do catalogue manuscripts",
+			"Telemetry does record latency",
+			"Seedlings are growing",
+			"Couriers have delivered parcels",
+			"Do not export reports",
+			"Do not catalogue manuscripts",
+			"Do never export reports",
+		]) {
+			const crystal = crystallizeDeepInterview(singleGoalEvidence(directive));
+			expect(crystal.lifecycle).toBe("ready");
+			expect(crystal.items[0]!.statement).toBe(directive);
+		}
+		for (const [quote, statement] of [
+			["Customers should export reports", "Customers export reports"],
+			["Administrators can export reports", "Administrators must export reports"],
+			["Do not export reports", "Do export reports"],
+		] as const) {
+			expect(() => crystallizeDeepInterview(singleGoalEvidence(quote, statement))).toThrow("verbatim user anchor");
+		}
 		expect(() =>
 			crystallizeDeepInterview(singleGoalEvidence("We should encrypt backups.", "We encrypt backups")),
 		).toThrow("verbatim user anchor");
@@ -2868,6 +2910,8 @@ describe("deep-interview crystallize contract", () => {
 				sessionFile,
 				`${JSON.stringify({ type: "session", id: sessionId, cwd: root })}\n${JSON.stringify({
 					type: "message",
+					id: "report-request",
+					parentId: null,
 					message: { role: "user", content: "Build a fast report." },
 				})}\n`,
 			);
@@ -2915,6 +2959,8 @@ describe("deep-interview crystallize contract", () => {
 				sessionFile,
 				`${JSON.stringify({
 					type: "message",
+					id: "report-refinement",
+					parentId: "report-request",
 					message: { role: "user", content: "Keep the report fast." },
 				})}\n`,
 			);
