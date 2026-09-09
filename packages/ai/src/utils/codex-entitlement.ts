@@ -2,34 +2,38 @@
  * Model entitlement facts shared by Codex credential selection and provider
  * error presentation.
  *
- * Live provider entitlement is authoritative for GPT-5.6 Sol access: local
- * plan labels rank candidates without denying Sol requests before transport.
- * Spark retains its existing local filter that excludes non-Pro candidates
- * whenever a confirmed Pro candidate exists. This module names those model
- * policies and keeps the provider's deterministic rejection wording in one place.
+ * Live provider entitlement is authoritative for GPT-5.6 Sol access on Plus
+ * and unknown plans: those local usage labels only rank candidates. A
+ * confirmed Free-only pool remains locally unsupported. Spark retains its
+ * existing local filter that excludes non-Pro candidates whenever a confirmed
+ * Pro candidate exists. This module names those model policies and keeps the
+ * provider's deterministic rejection wording in one place.
  */
 
 const OPENAI_CODEX_PRO_ENTITLED_PLAN_TYPES = new Set(["pro", "business", "enterprise", "team"]);
-const OPENAI_CODEX_PRO_DENIED_PLAN_TYPES = new Set(["free", "plus"]);
+const OPENAI_CODEX_PRO_DENIED_PLAN_TYPES = new Set(["free"]);
+const OPENAI_CODEX_PRO_LIMITED_PLAN_TYPES = new Set(["plus"]);
 
-export type OpenAICodexProEntitlement = "entitled" | "denied" | "unknown";
+export type OpenAICodexProEntitlement = "entitled" | "limited" | "denied" | "unknown";
 
 /**
- * Classify a ChatGPT `plan_type` for Pro-tier Codex model preference.
+ * Classify a ChatGPT `plan_type` for strict Pro-tier Codex models.
  *
- * Only exact, documented tier names are classified; missing or unfamiliar
- * values stay unknown rather than being guessed from a substring. The result
- * ranks credentials — `denied` means "try this account last", not "refuse it".
+ * The usage endpoint remains authoritative: only exact, documented tier names
+ * are classified. Known Free tiers can be rejected locally. Plus remains a
+ * lower-priority provider-decided candidate, while missing or unfamiliar
+ * values stay unknown and reach the provider instead of being guessed from a
+ * substring.
  */
 export function classifyOpenAICodexProEntitlement(planType: string | undefined): OpenAICodexProEntitlement {
 	const normalized = planType?.trim().toLowerCase();
 	if (!normalized) return "unknown";
 	if (OPENAI_CODEX_PRO_ENTITLED_PLAN_TYPES.has(normalized)) return "entitled";
+	if (OPENAI_CODEX_PRO_LIMITED_PLAN_TYPES.has(normalized)) return "limited";
 	if (OPENAI_CODEX_PRO_DENIED_PLAN_TYPES.has(normalized)) return "denied";
 	return "unknown";
 }
 
-/** Models whose credential selection ranks candidates by ChatGPT plan tier. */
 export function requiresOpenAICodexProModel(provider: string, modelId: string | undefined): boolean {
 	return (
 		provider === "openai-codex" &&
@@ -38,9 +42,8 @@ export function requiresOpenAICodexProModel(provider: string, modelId: string | 
 	);
 }
 
-/** Spark retains its confirmed-Pro candidate filter; Sol is provider-authoritative. */
-export function requiresOpenAICodexSparkModel(provider: string, modelId: string | undefined): boolean {
-	return provider === "openai-codex" && typeof modelId === "string" && modelId.toLowerCase().includes("-spark");
+export function requiresStrictOpenAICodexProModel(provider: string, modelId: string | undefined): boolean {
+	return provider === "openai-codex" && modelId?.toLowerCase() === "gpt-5.6-sol";
 }
 
 export function isOpenAICodexChatGPTEntitlementError(message: string | undefined, code?: string): boolean {

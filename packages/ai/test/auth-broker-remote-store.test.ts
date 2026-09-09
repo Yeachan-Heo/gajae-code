@@ -77,7 +77,7 @@ describe("RemoteAuthCredentialStore SSE integration", () => {
 		}
 	});
 
-	test("force-fresh broker usage observes plan changes without locally denying Sol", async () => {
+	test("force-fresh broker usage observes a Free downgrade before Sol dispatch", async () => {
 		await handle!.close();
 		let planType = "plus";
 		const usageProvider: UsageProvider = {
@@ -113,8 +113,8 @@ describe("RemoteAuthCredentialStore SSE integration", () => {
 			clientStorage.getApiKey("openai-codex", "downgraded-sol", {
 				modelId: "gpt-5.6-sol",
 			}),
-		).resolves.toBe("access-codex");
-		expect(resolveKey).toHaveBeenCalledTimes(1);
+		).rejects.toThrow('This ChatGPT Codex account cannot use model "gpt-5.6-sol"');
+		expect(resolveKey).not.toHaveBeenCalled();
 	});
 
 	test("consumes initial snapshot, upsert, and removal over SSE without manual refresh", async () => {

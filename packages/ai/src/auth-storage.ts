@@ -28,8 +28,9 @@ import type {
 
 import {
 	classifyOpenAICodexProEntitlement,
+	formatOpenAICodexChatGPTEntitlementError,
 	requiresOpenAICodexProModel,
-	requiresOpenAICodexSparkModel,
+	requiresStrictOpenAICodexProModel,
 } from "./utils/codex-entitlement";
 import { getOAuthApiKey, getOAuthProvider, refreshOAuthToken, resolveOAuthStorageProvider } from "./utils/oauth";
 import { loginDeepInfra } from "./utils/oauth/deepinfra";
@@ -1086,6 +1087,7 @@ export interface AuthCredentialSelector {
 }
 
 type OAuthResolutionResult = { apiKey: string; credential: OAuthCredential };
+const OAUTH_CREDENTIAL_ENTITLEMENT_DENIED = Symbol("oauth-credential-entitlement-denied");
 
 /**
  * Refreshed OAuth access plus identity metadata returned by
@@ -1168,12 +1170,17 @@ function getUsagePlanType(report: UsageReport | null): string | undefined {
 function getOpenAICodexPlanPriority(report: UsageReport | null): number {
 	const entitlement = classifyOpenAICodexProEntitlement(getUsagePlanType(report));
 	if (entitlement === "entitled") return 0;
-	if (entitlement === "denied") return 2;
+	if (entitlement === "limited") return 2;
+	if (entitlement === "denied") return 3;
 	return 1;
 }
 
 function hasOpenAICodexProPlan(report: UsageReport | null): boolean {
 	return classifyOpenAICodexProEntitlement(getUsagePlanType(report)) === "entitled";
+}
+
+function hasKnownOpenAICodexNonProPlan(report: UsageReport | null): boolean {
+	return classifyOpenAICodexProEntitlement(getUsagePlanType(report)) === "denied";
 }
 
 function resolveDefaultRankingStrategy(provider: Provider): CredentialRankingStrategy | undefined {
@@ -2727,6 +2734,7 @@ export class AuthStorage {
 		if (expectedId !== undefined && target.id !== expectedId) {
 			throw new Error("Credential authority changed during refresh");
 		}
+		if (authCredentialEquals(target.credential, credential)) return;
 		if (persist && !this.#store.refreshSnapshot) this.#store.updateAuthCredential(target.id, credential);
 		const persisted = this.#store.listAuthCredentials(provider).find(entry => entry.id === target.id);
 		const updated = [...entries];
@@ -5035,13 +5043,28 @@ export class AuthStorage {
 			}),
 		);
 
-		// Plan metadata orders candidates (see `getOpenAICodexPlanPriority`). Spark keeps its
-		// historical confirmed-Pro filter, while Sol leaves entitlement to the provider:
-		// trial, grandfathered and experiment-enabled accounts can carry an ordinary label
-		// that the provider still accepts. Provider refusals are normalized by
-		// `openai-codex-responses` through `formatOpenAICodexChatGPTEntitlementError`.
-		const enforceSparkProRequirement =
-			requiresOpenAICodexSparkModel(provider, options?.modelId) &&
+		// Spark keeps its historical Pro filter when a confirmed Pro candidate exists,
+		// but still falls back when no candidate is confirmed Pro. GPT-5.6 Sol treats
+		// Plus and unknown plan labels as ranking hints, so an unusable preferred Pro
+		// row can fall through to provider-authorized access. Freshly confirmed Free
+		// candidates remain locally unsupported.
+		const strictProRequirement = requiresStrictOpenAICodexProModel(provider, options?.modelId);
+		if (strictProRequirement) {
+			await Promise.all(
+				candidates.map(async candidate => {
+					if (candidate.usageChecked) return;
+					candidate.usage = await this.#getUsageReport(provider, candidate.selection.credential, {
+						baseUrl: options?.baseUrl,
+						signal: options?.signal,
+						timeoutMs: this.#usageRequestTimeoutMs,
+					});
+					candidate.usageChecked = true;
+				}),
+			);
+		}
+		const enforceProRequirement =
+			requiresProModel &&
+			!strictProRequirement &&
 			candidates.some(candidate => hasOpenAICodexProPlan(candidate.usage));
 
 		const fallback = candidates[0];
@@ -5059,11 +5082,13 @@ export class AuthStorage {
 					prefetchedUsage: candidate.usage,
 					usagePrechecked: candidate.usageChecked,
 					prefetchedUsageAccountId: candidate.selection.credential.accountId,
-					enforceSparkProRequirement,
+					enforceProRequirement,
+					rejectKnownDeniedPlan: strictProRequirement,
 				},
 				reloadsUsed,
 				sessionSelector,
 			);
+			if (resolved === OAUTH_CREDENTIAL_ENTITLEMENT_DENIED) continue;
 			if (resolved) return resolved;
 		}
 
@@ -5080,12 +5105,30 @@ export class AuthStorage {
 					prefetchedUsage: fallback.usage,
 					usagePrechecked: fallback.usageChecked,
 					prefetchedUsageAccountId: fallback.selection.credential.accountId,
-					enforceSparkProRequirement,
+					enforceProRequirement,
+					rejectKnownDeniedPlan: strictProRequirement,
 				},
 				reloadsUsed,
 				sessionSelector,
 			);
-			if (resolved) return resolved;
+			if (resolved !== OAUTH_CREDENTIAL_ENTITLEMENT_DENIED && resolved) return resolved;
+		}
+		if (strictProRequirement && candidates.length > 0) {
+			const finalEntitlements = await Promise.all(
+				candidates.map(async candidate => {
+					if (!this.#reconcileOAuthCredentialSelection(provider, candidate.selection)) return null;
+					const usage = await this.#getUsageReport(provider, candidate.selection.credential, {
+						baseUrl: options?.baseUrl,
+						forceFresh: true,
+						signal: options?.signal,
+						timeoutMs: this.#usageRequestTimeoutMs,
+					});
+					return hasKnownOpenAICodexNonProPlan(usage);
+				}),
+			);
+			if (finalEntitlements.length > 0 && finalEntitlements.every(entitlement => entitlement === true)) {
+				throw new Error(formatOpenAICodexChatGPTEntitlementError(options?.modelId));
+			}
 		}
 		return undefined;
 	}
@@ -5368,18 +5411,20 @@ export class AuthStorage {
 			prefetchedUsage?: UsageReport | null;
 			usagePrechecked?: boolean;
 			prefetchedUsageAccountId?: string;
-			enforceSparkProRequirement?: boolean;
+			enforceProRequirement?: boolean;
+			rejectKnownDeniedPlan?: boolean;
 		},
 		reloadsUsed = 0,
 		sessionSelector?: AuthCredentialSelector,
-	): Promise<OAuthResolutionResult | undefined> {
+	): Promise<OAuthResolutionResult | typeof OAUTH_CREDENTIAL_ENTITLEMENT_DENIED | undefined> {
 		const {
 			checkUsage,
 			allowBlocked,
 			prefetchedUsage = null,
 			usagePrechecked = false,
 			prefetchedUsageAccountId,
-			enforceSparkProRequirement = false,
+			enforceProRequirement,
+			rejectKnownDeniedPlan = false,
 		} = usageOptions;
 		const prefetchedUsageRevision = usagePrechecked ? selection.revision : undefined;
 		if (!this.#reconcileOAuthCredentialSelection(provider, selection)) return undefined;
@@ -5392,6 +5437,7 @@ export class AuthStorage {
 		}
 
 		const requiresProModel = requiresOpenAICodexProModel(provider, options?.modelId);
+		const applyProFilter = enforceProRequirement ?? requiresProModel;
 		let usage: UsageReport | null = null;
 		let usageChecked = false;
 		let usageCredentialRevision: number | undefined;
@@ -5399,6 +5445,7 @@ export class AuthStorage {
 
 		if ((checkUsage && !allowBlocked) || requiresProModel) {
 			if (
+				!rejectKnownDeniedPlan &&
 				usagePrechecked &&
 				selection.revision === prefetchedUsageRevision &&
 				selection.credential.accountId === prefetchedUsageAccountId
@@ -5408,13 +5455,17 @@ export class AuthStorage {
 			} else {
 				usage = await this.#getUsageReport(provider, selection.credential, {
 					...options,
-					forceFresh: usagePrechecked,
+					forceFresh: rejectKnownDeniedPlan,
 					timeoutMs: this.#usageRequestTimeoutMs,
 				});
 				usageChecked = true;
 			}
 			usageCredentialRevision = selection.revision;
 			usageAccountId = selection.credential.accountId;
+			if (applyProFilter && !hasOpenAICodexProPlan(usage)) return undefined;
+			if (rejectKnownDeniedPlan && hasKnownOpenAICodexNonProPlan(usage)) {
+				return OAUTH_CREDENTIAL_ENTITLEMENT_DENIED;
+			}
 			if (checkUsage && !allowBlocked && usage && this.#isUsageLimitReached(usage)) {
 				const resetAtMs = this.#getUsageResetAtMs(usage, Date.now());
 				this.#markCredentialBlocked(
@@ -5424,7 +5475,6 @@ export class AuthStorage {
 				);
 				return undefined;
 			}
-			if (enforceSparkProRequirement && !hasOpenAICodexProPlan(usage)) return undefined;
 		}
 
 		try {
@@ -5436,13 +5486,16 @@ export class AuthStorage {
 				this.#invalidateUsageReport(provider, selection.credential, options?.baseUrl);
 				usage = await this.#getUsageReport(provider, selection.credential, {
 					...options,
-					forceFresh: true,
+					forceFresh: rejectKnownDeniedPlan,
 					timeoutMs: this.#usageRequestTimeoutMs,
 				});
 				usageChecked = true;
 				usageCredentialRevision = selection.revision;
 				usageAccountId = selection.credential.accountId;
-				if (enforceSparkProRequirement && !hasOpenAICodexProPlan(usage)) return undefined;
+				if (applyProFilter && !hasOpenAICodexProPlan(usage)) return undefined;
+				if (rejectKnownDeniedPlan && hasKnownOpenAICodexNonProPlan(usage)) {
+					return OAUTH_CREDENTIAL_ENTITLEMENT_DENIED;
+				}
 			}
 			const selectionCredentialId = selection.id;
 			let result: { newCredentials: OAuthCredentials; apiKey: string } | null;
@@ -5506,14 +5559,18 @@ export class AuthStorage {
 
 			if ((checkUsage && !allowBlocked) || requiresProModel) {
 				const sameAccount = usageAccountId === updated.accountId;
-				if (!sameUsageCredential || !usageChecked || !sameAccount) {
+				if ((rejectKnownDeniedPlan && !sameUsageCredential) || !usageChecked || !sameAccount) {
 					usage = await this.#getUsageReport(provider, updated, {
 						...options,
-						forceFresh: !sameUsageCredential || !sameAccount,
+						forceFresh: rejectKnownDeniedPlan,
 						timeoutMs: this.#usageRequestTimeoutMs,
 					});
 					usageChecked = true;
 					usageAccountId = updated.accountId;
+				}
+				if (applyProFilter && !hasOpenAICodexProPlan(usage)) return undefined;
+				if (rejectKnownDeniedPlan && hasKnownOpenAICodexNonProPlan(usage)) {
+					return OAUTH_CREDENTIAL_ENTITLEMENT_DENIED;
 				}
 				if (checkUsage && !allowBlocked && usage && this.#isUsageLimitReached(usage)) {
 					const resetAtMs = this.#getUsageResetAtMs(usage, Date.now());
@@ -5524,7 +5581,6 @@ export class AuthStorage {
 					);
 					return undefined;
 				}
-				if (enforceSparkProRequirement && !hasOpenAICodexProPlan(usage)) return undefined;
 			}
 			if (!this.#reconcileOAuthCredentialSelection(provider, selection)) return undefined;
 			if (!authCredentialEquals(selection.credential, updated)) return undefined;
