@@ -703,6 +703,7 @@ describe("macOS community app attach cleanup", () => {
 		const calls: string[][] = [];
 		const logs: string[] = [];
 		let mountPoint: string | undefined;
+		let mountIdentityChanged = false;
 		const command = async (argv: string[]) => {
 			calls.push(argv);
 			if (argv[0] === "/usr/bin/mdfind") return { exitCode: 1, stdout: "", stderr: "" };
@@ -720,11 +721,14 @@ describe("macOS community app attach cleanup", () => {
 				return { exitCode: 0, stdout: "", stderr: "" };
 			}
 			if (argv[0] === "/usr/bin/plutil") {
-				if (!mountPoint) throw new Error("mountpoint was not captured");
+				// Discovery may inspect a real installed app before attach. Only mutate our mounted fixture.
+				if (!mountPoint || argv.at(-1) !== path.join(mountPoint, "Gajae Code App.app", "Contents", "Info.plist"))
+					return { exitCode: 1, stdout: "", stderr: "not the mounted fixture" };
 				const replacement = `${mountPoint}-changed`;
 				await fs.mkdir(replacement);
 				await fs.rm(mountPoint, { recursive: true, force: true });
 				await fs.rename(replacement, mountPoint);
+				mountIdentityChanged = true;
 				return { exitCode: 1, stdout: "", stderr: "changed" };
 			}
 			if (argv[0] === "/usr/bin/hdiutil" && argv[1] === "detach") return { exitCode: 0, stdout: "", stderr: "" };
@@ -756,6 +760,7 @@ describe("macOS community app attach cleanup", () => {
 			},
 		});
 		expect(result.status).toBe("failed");
+		expect(mountIdentityChanged).toBe(true);
 		expect(calls.some(call => call[0] === "/usr/bin/hdiutil" && call[1] === "detach")).toBe(false);
 		expect(logs).toContain("Optional community app cleanup warning: mountpoint identity changed; refusing detach");
 		if (!mountPoint) throw new Error("mountpoint was not captured");
