@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 ### Fixed
+- `skill_discovery` zero-candidate results no longer pass as an empty catalog when the query itself filtered everything out. Query matching is conjunctive substring (every whitespace-separated term must appear in name/description/source/use-when, unless a term equals the exact skill name), so a single topic keyword that appears nowhere drops every skill; a query that matches nothing now carries a `notice` stating how many skills were scanned, the conjunctive-substring rule, and the retry guidance. The tool prompt and `query` schema description now document the semantics instead of implying relevance ranking, so a model can no longer answer "no such skill" from a filtered result. `discoverRuntimeSkills` results gained a `scanned` count backing the notice.
 - Headless ACP asks now abort their enclosing foreground turn when the remote client cancels the ask. Previously the ask tool rejected with a cancellation error without releasing foreground ownership, so the next client prompt could be rejected as already active.
 
 - CLI startup now preserves saved account pins when handing authentication to the SDK. Catalog refreshes with a session use its effective credential pin, preventing a cached free OpenAI Codex account catalog from hiding Astra or Sol during paid-account profile startup. Generic injected SDK authentication keeps its existing isolation, and persisted session selections retain precedence over global pins.
