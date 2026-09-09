@@ -24,8 +24,9 @@ let authStorage: AuthStorage | undefined;
 let tempDir: TempDir | undefined;
 
 afterEach(async () => {
-	vi.restoreAllMocks();
+	// Keep persistence spies installed until every admitted write has settled.
 	await session?.dispose();
+	vi.restoreAllMocks();
 	session = undefined;
 	authStorage?.close();
 	authStorage = undefined;
@@ -65,14 +66,11 @@ async function runResponse(content: string, sdk?: { token: string; onStart(handl
 	});
 	await session.prompt("respond", sdk ? { sdkRunCapability: createSdkRunCapability(sdk.token) } : undefined);
 	await terminal.promise;
-	for (let attempt = 0; attempt < 100; attempt++) {
-		if (await Bun.file(stateFile).exists()) {
-			const payload = JSON.parse(await Bun.file(stateFile).text()) as Record<string, unknown>;
-			if (payload.state === "completed" || payload.state === "errored") return payload;
-		}
-		await Bun.sleep(10);
-	}
-	throw new Error("Timed out waiting for terminal runtime state");
+	await session.awaitSessionSettlement();
+	await session.awaitCoordinatorRuntimeStatePersistenceForTests();
+	const payload = (await Bun.file(stateFile).json()) as Record<string, unknown>;
+	expect(payload.state === "completed" || payload.state === "errored").toBe(true);
+	return payload;
 }
 
 describe("AgentSession terminal receipt state", () => {
@@ -139,11 +137,14 @@ describe("AgentSession terminal receipt state", () => {
 			if (event.type === "agent_end") terminal.resolve();
 		});
 
-		await session.prompt("respond");
-		await Promise.race([terminal.promise, Bun.sleep(250).then(() => "timed_out" as const)]).then(result => {
-			expect(result).not.toBe("timed_out");
-		});
-		pending.resolve();
+		try {
+			await session.prompt("respond");
+			await Promise.race([terminal.promise, Bun.sleep(250).then(() => "timed_out" as const)]).then(result => {
+				expect(result).not.toBe("timed_out");
+			});
+		} finally {
+			pending.resolve();
+		}
 	});
 
 	it("writes present receipt truth through the real AgentSession event consumer", async () => {
@@ -224,21 +225,20 @@ describe("AgentSession terminal receipt state", () => {
 		async function waitForState(
 			predicate: (state: Record<string, unknown>) => boolean,
 		): Promise<Record<string, unknown>> {
-			for (let attempt = 0; attempt < 100; attempt++) {
-				if (await Bun.file(stateFile).exists()) {
-					const state = (await Bun.file(stateFile).json()) as Record<string, unknown>;
-					if (predicate(state)) return state;
-				}
-				await Bun.sleep(10);
-			}
-			const lastState = await Bun.file(stateFile).text();
+			if (!session) throw new Error("Expected session");
+			await session.awaitSessionSettlement();
+			// agent_end and transcript settlement do not join the secondary sidecar
+			// sink. Fence its actual queued writes before inspecting durable truth.
+			await session.awaitCoordinatorRuntimeStatePersistenceForTests();
+			const state = (await Bun.file(stateFile).json()) as Record<string, unknown>;
+			if (predicate(state)) return state;
 			const lifecycle = persist.mock.calls.map(([event]) => ({
 				type: event.type,
 				sdkRunToken: event.sdkRunToken,
 				scope: event.scope,
 			}));
 			throw new Error(
-				`Timed out waiting for run-correlated terminal state: ${lastState}; lifecycle=${JSON.stringify(lifecycle)}`,
+				`Unexpected run-correlated terminal state: ${JSON.stringify(state)}; lifecycle=${JSON.stringify(lifecycle)}`,
 			);
 		}
 		const failed = await waitForState(state => state.execution_state === "failed");
@@ -341,14 +341,11 @@ describe("AgentSession terminal receipt state", () => {
 				await session!.awaitSessionSettlement();
 				if (!tempDir) throw new Error("Expected sidecar fixture");
 				const expectedText = authorized ? "authorized" : "ordinary";
-				for (let attempt = 0; attempt < 100; attempt++) {
-					const state = (await Bun.file(path.join(tempDir.path(), "runtime-state.json")).json()) as {
-						final_response?: { text?: string };
-					};
-					if (state.final_response?.text === expectedText) return;
-					await Bun.sleep(10);
-				}
-				throw new Error(`Timed out waiting for ${surface} sidecar projection`);
+				await session!.awaitCoordinatorRuntimeStatePersistenceForTests();
+				const state = (await Bun.file(path.join(tempDir.path(), "runtime-state.json")).json()) as {
+					final_response?: { text?: string };
+				};
+				expect(state.final_response?.text).toBe(expectedText);
 			};
 			await submit(false);
 			expect(persist.mock.calls.map(([event]) => event.type)).toContain("agent_start");

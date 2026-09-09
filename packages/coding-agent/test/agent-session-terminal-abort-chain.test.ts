@@ -1369,8 +1369,16 @@ describe("terminal abort registers a turn scope so left-running owned work class
 				5_000,
 			);
 		} finally {
+			// Prompt completion and delivery acknowledgement precede the secondary
+			// sidecar sink. Join real work before starting bounded session disposal.
+			manager.cancelAll();
+			await manager.waitForAll();
+			await session.waitForIdle();
+			await session.awaitSessionSettlement();
+			await session.awaitCoordinatorRuntimeStatePersistenceForTests();
 			AsyncJobManager.setInstance(manager);
 			AsyncJobManager.unregisterManager(foreign);
+			expect(await foreign.dispose()).toBe(true);
 		}
 	}, 20_000);
 
@@ -1394,8 +1402,16 @@ describe("terminal abort registers a turn scope so left-running owned work class
 			expect(cancelResult.details?.cancelled?.[0]?.status).toBe("cancelled");
 			await waitFor(() => manager.getJob(job.id)?.status !== "running", "endpoint job cancelled", 5_000);
 		} finally {
+			// cancel() publishes status synchronously, before the shell unwinds.
+			// Await its owned promise and sidecar writes, not just the status flag.
+			manager.cancelAll();
+			await manager.waitForAll();
+			await session.waitForIdle();
+			await session.awaitSessionSettlement();
+			await session.awaitCoordinatorRuntimeStatePersistenceForTests();
 			AsyncJobManager.setInstance(manager);
 			AsyncJobManager.unregisterManager(foreign);
+			expect(await foreign.dispose()).toBe(true);
 		}
 	}, 20_000);
 
