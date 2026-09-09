@@ -633,6 +633,33 @@ Project executor override body.
 		}
 	});
 
+	it("documents full initial Crystal coverage and an explicit Phase 5 execution approval gate", () => {
+		const content =
+			getDefaultGjcDefinitions().find(
+				definition => definition.kind === "skill" && definition.name === "deep-interview",
+			)?.content ?? "";
+		expect(content).toContain("`snapshot.start` MUST be 0");
+		expect(content).toContain("exactly 200 is valid");
+		expect(content).toContain("canonical stored prior Crystal preserving the prefix");
+		expect(content).toContain("continue the ordinary interview flow");
+		const phase5 = content.split("## Phase 5: Execution Bridge")[1]?.split("### Phase 5b:")[0] ?? "";
+		const example = phase5.match(/```json\n([\s\S]*?)\n```/);
+		expect(example).not.toBeNull();
+		const input = JSON.parse(example![1]!);
+		expect(input.questions).toHaveLength(1);
+		expect(input.questions[0].workflowGate).toEqual({ stage: "deep-interview", kind: "execution" });
+		expect(input.questions[0].multi).toBe(false);
+		expect(input.questions[0].options).toContainEqual({
+			label: "Execute with ultragoal (only when spec is already implementation-ready and really simple)",
+		});
+		expect(phase5).toContain("separate `gjc deep-interview approve-execution --json` action");
+		expect(phase5).toContain("require that action to succeed before invoking `/skill:ultragoal`");
+		expect(phase5).toContain("does not itself authorize or automatically start implementation");
+		expect(phase5).toContain(
+			"Research/refinement choices, custom responses, cancellation, timeout, and untagged asks do not grant execution approval",
+		);
+	});
+
 	it("renders deep-interview arguments once through the loader-owned User field", async () => {
 		const skill = getEmbeddedDefaultGjcSkills().find(skill => skill.name === "deep-interview");
 		if (!skill) throw new Error("missing bundled deep-interview skill");

@@ -40,6 +40,56 @@ async function tempDir(): Promise<string> {
 	return dir;
 }
 
+async function crystallizeBoundedTranscript(root: string, count: number, start = 0) {
+	const sessionPath = path.join(root, ".gjc", "sessions", `${TEST_SESSION_ID}.jsonl`);
+	const messages = Array.from({ length: count }, (_, index) => ({
+		index,
+		role: index === 0 || index === 199 || index === 200 ? ("user" as const) : ("assistant" as const),
+		content:
+			index === 0
+				? "Build a report."
+				: index === 199
+					? "Encrypt backups."
+					: index === 200
+						? "Export reports."
+						: "Understood.",
+	}));
+	await fs.mkdir(path.dirname(sessionPath), { recursive: true });
+	await fs.writeFile(
+		sessionPath,
+		[
+			JSON.stringify({ type: "session", version: 1, id: TEST_SESSION_ID, cwd: root }),
+			...messages.map(({ role, content }) => JSON.stringify({ type: "message", message: { role, content } })),
+			"",
+		].join("\n"),
+	);
+	process.env.GJC_SESSION_FILE = sessionPath;
+	const source = { revision: count, start, end: count - 1, messages: messages.slice(start) };
+	return runNativeDeepInterviewCommand(
+		[
+			"--crystallize",
+			"--slug",
+			"bounded-transcript",
+			"--input",
+			JSON.stringify({
+				current_revision: count,
+				snapshot: { ...source, digest: crystalSnapshotDigest(source) },
+				items: source.messages
+					.filter(message => message.role === "user")
+					.map(message => ({
+						id: `requirement:${message.index}`,
+						kind: "acceptance_criterion",
+						classification: "confirmed",
+						statement: message.content,
+						anchor: { message_index: message.index, quote: message.content },
+					})),
+			}),
+			"--json",
+		],
+		root,
+	);
+}
+
 beforeAll(() => {
 	process.env.GJC_SESSION_ID = TEST_SESSION_ID;
 });
@@ -68,6 +118,47 @@ afterAll(() => {
 });
 
 describe("native gjc deep-interview runtime", () => {
+	it("accepts an initial Crystal covering exactly 200 authenticated messages", async () => {
+		const root = await tempDir();
+		const result = await crystallizeBoundedTranscript(root, 200);
+		expect(result.status, result.stderr).toBe(0);
+		const payload = JSON.parse(result.stdout ?? "{}");
+		expect(payload.crystal.lifecycle).toBe("ready");
+		expect(payload.crystal.source.start).toBe(0);
+		expect(payload.crystal.source.end).toBe(199);
+		const spec = await fs.readFile(payload.spec_path, "utf8");
+		expect(spec).toContain("Build a report.");
+		expect(spec).toContain("Encrypt backups.");
+	});
+
+	it("rejects an initial 201-message tail snapshot without promoting artifacts and permits ordinary interviewing", async () => {
+		const root = await tempDir();
+		const result = await crystallizeBoundedTranscript(root, 201, 1);
+		expect(result.status).toBe(2);
+		expect(result.stderr).toContain("full authenticated transcript from index 0 (maximum 200 messages)");
+		expect(result.stderr).toContain("ordinary interview flow");
+		expect(await Bun.file(modeStatePath(root, TEST_SESSION_ID, "deep-interview")).exists()).toBe(false);
+		await expect(fs.readdir(sessionSpecsDir(root, TEST_SESSION_ID))).rejects.toMatchObject({ code: "ENOENT" });
+		const interview = await runNativeDeepInterviewCommand(["--json", "Build a report."], root);
+		expect(interview.status, interview.stderr).toBe(0);
+	});
+
+	it("preserves rolled-out requirements through a canonical prior-backed 200-message delta", async () => {
+		const root = await tempDir();
+		const initial = await crystallizeBoundedTranscript(root, 200);
+		expect(initial.status, initial.stderr).toBe(0);
+		const result = await crystallizeBoundedTranscript(root, 400, 200);
+		expect(result.status, result.stderr).toBe(0);
+		const payload = JSON.parse(result.stdout ?? "{}");
+		expect(payload.crystal.lifecycle).toBe("ready");
+		expect(payload.crystal.spec_version).toBe(2);
+		expect(payload.crystal.source.start).toBe(200);
+		expect(payload.crystal.source.end).toBe(399);
+		const spec = await fs.readFile(payload.spec_path, "utf8");
+		expect(spec).toContain("Build a report.");
+		expect(spec).toContain("Encrypt backups.");
+		expect(spec).toContain("Export reports.");
+	});
 	it("rejects unsupported crystallize arguments before reading input", async () => {
 		const root = await tempDir();
 		const result = await runNativeDeepInterviewCommand(["--crystallize", "--write", "--json"], root);

@@ -331,9 +331,31 @@ function containsNonTextMarker(value: string): boolean {
 	);
 }
 
+// Projection markers are evidence boundaries, never authored text. Keep offsets in
+// the authenticated message so coverage and correction ordering use the same source.
+function authoredTextSpans(content: string): Array<{ text: string; offset: number }> {
+	const spans: Array<{ text: string; offset: number }> = [];
+	let offset = 0;
+	for (const marker of content.matchAll(
+		/\[(?:image|audio|video|file|content|toolCall|thinking|redactedThinking|sticker|attachment|document)\]/giu,
+	)) {
+		spans.push({ text: content.slice(offset, marker.index), offset });
+		offset = marker.index + marker[0].length;
+	}
+	spans.push({ text: content.slice(offset), offset });
+	return spans.filter(span => span.text.trim() !== "");
+}
+
+function anchoredTextSpan(content: string, quote: string): string | undefined {
+	if (containsNonTextMarker(quote)) return undefined;
+	return authoredTextSpans(content).find(span => !containsNonTextMarker(span.text) && span.text.includes(quote))?.text;
+}
+
 function anchoredClause(content: string, quote: string): string {
+	const span = anchoredTextSpan(content, quote);
+	if (span === undefined) return content;
+	content = span;
 	const quoteIndex = content.indexOf(quote);
-	if (quoteIndex < 0) return content;
 	const before = content.slice(0, quoteIndex);
 	if (/[.!?。！？]["'”’]?$/.test(quote.trim()) && (quoteIndex === 0 || /[.!?。！？]["'”’]?\s*$/u.test(before)))
 		return quote.trim();
@@ -348,8 +370,10 @@ function anchoredClause(content: string, quote: string): string {
 }
 
 function hasVerbatimTokenBoundaries(content: string, quote: string): boolean {
+	const span = anchoredTextSpan(content, quote);
+	if (span === undefined) return false;
+	content = span;
 	const quoteIndex = content.indexOf(quote);
-	if (quoteIndex < 0) return false;
 	const word = /[\p{L}\p{M}\p{N}_\u200C\u200D]/u;
 	const first = [...quote][0];
 	const last = [...quote].at(-1);
@@ -364,7 +388,9 @@ function hasVerbatimTokenBoundaries(content: string, quote: string): boolean {
 function hasLaterSupersedingCorrection(content: string, quote: string, statement: string): boolean {
 	const quoteIndex = content.indexOf(quote);
 	if (quoteIndex < 0) return false;
-	const later = content.slice(quoteIndex + quote.length);
+	const later = authoredTextSpans(content.slice(quoteIndex + quote.length))
+		.map(span => span.text)
+		.join("\n");
 	const following = later.replace(/^\s*[.!?。！？]+\s*/u, "");
 	const followingBoundary = /(?:[!?。！？;]|\.(?=\s|$)|\n)/u.exec(following);
 	const followingClause = followingBoundary ? following.slice(0, followingBoundary.index + 1) : following;
@@ -424,9 +450,12 @@ function hasLaterSupersedingCorrection(content: string, quote: string, statement
 			/\b(?:actually|instead|rather|correction|on\s+second\s+thought|make\s+that)\b/i.test(clause) ||
 			/(?:사실|대신|정정|다시\s+생각|実際|代わり|訂正|やはり|实际上|實際上|改为|改為|更正)/u.test(clause);
 		if (!marker) return false;
+		if (/\b(?:also|too|additionally|as\s+well|in\s+addition)\b/i.test(clause)) return false;
 		const clauseTerms = evidenceTerms(clause);
 		return (
-			[...topicTerms(statement, false)].some(term => clauseTerms.has(term)) ||
+			[...topicTerms(statement, false)].some(
+				term => !/^(?:build|make|create|implement|support|actually|please)$/.test(term) && clauseTerms.has(term),
+			) ||
 			(statementHasShortTechnical &&
 				(clause.match(/[A-Za-z0-9][A-Za-z0-9+#.-]*/g) ?? []).some(isShortTechnicalIdentifier)) ||
 			Boolean(
@@ -474,7 +503,7 @@ function semanticProfile(value: string): CrystalSemanticProfile {
 	const interrogative =
 		/[?？]/u.test(normalized) ||
 		/\b(?:whether|wonder(?:s|ing)?|question(?:s|ed|ing)?)\b/i.test(normalized) ||
-		/\b(?:what|which|when|where|why|how|whether|do|does|did|is|are|can|could|should|would|will)\b[^.!。！？]*[?？]/iu.test(
+		/(?:^|[.!?。！？;\n]\s*)\s*["'“‘]?(?:can|could|should|would|will|shall|must|may|do|does|did|is|are|was|were|has|have|had)\s+(?:we|you|they|he|she|it|i|(?:the|a|an|our|your|their|these|those)\s+\w+|admins?|users?|operators?|(?!not\b|never\b)[\p{L}][\p{L}\p{N}_'-]*\s+(?:be|have|enabled|disabled|encrypted|required|allowed))\b/iu.test(
 			normalized,
 		) ||
 		/(?:吗|嗎|呢|나요|습니까|습니까|인가요|인가|ㄹ까요|을까요|까요|궁금|어떻게|무엇|무엇을|왜|언제|어디|얼마|몇|多少|什么|什麼|哪个|哪個|为何|為何|怎么|怎麼|如何|何时|何時|哪里|哪裡|是否|疑問|かどうか)/u.test(
@@ -488,9 +517,15 @@ function semanticProfile(value: string): CrystalSemanticProfile {
 		/(?:만약|하면|라면|다면|으면|이면|경우|조건|경우에\s+따라|もし|なら|れば|たら|場合|条件|次第|如果|若|假如|倘若|除非|只要|情况下|取决于|取決於)/u.test(
 			normalized,
 		);
+	// Only explicit actors performing deliberate actions establish permission.
+	// Other uses of may (including a second uncertain clause) remain hedges.
+	const withoutPermissions = normalized.replace(
+		/\b(?:(?:the\s+)?(?:admins?|administrators?|users?|operators?|owners?|members?|guests?|clients?|customers?|editors?|viewers?)|we|you|they)\s+may\s+(?:not\s+)?(?:export|import|read|write|create|delete|update|view|access|manage|edit|download|upload|share|use|run|configure|approve|submit|invite)\b/g,
+		"",
+	);
 	const hedged =
 		/\b(?:maybe|perhaps|possibly|probably|might|may|could|would|likely|unlikely|seems?|apparently|approximately|around|roughly|tentative(?:ly)?|prefer(?:ably)?|i\s+think|i\s+guess|i\s+believe|believe(?:s|d)?)\b/i.test(
-			normalized,
+			withoutPermissions,
 		) ||
 		/(?:아마|어쩌면|가능성|수도|것\s+같|같습니다|추정|대략|たぶん|おそらく|かもしれ|可能性|と思|思われ|だろう|でしょう|也许|也許|可能|或许|大概|似乎|大約|估计|估計|据说|據說)/u.test(
 			normalized,
@@ -679,7 +714,6 @@ function validateItems(value: unknown, snapshot?: CrystalSnapshot): CrystalItem[
 				if (
 					anchorMessage.role !== "user" ||
 					containsNonTextMarker(item.anchor.quote) ||
-					containsNonTextMarker(anchorMessage.content) ||
 					!anchorMessage.content.includes(item.anchor.quote) ||
 					!hasVerbatimTokenBoundaries(anchorMessage.content, item.anchor.quote) ||
 					hasLaterSupersedingCorrection(anchorMessage.content, item.anchor.quote, item.statement) ||
@@ -889,23 +923,26 @@ function requirementBearingClauses(
 	const clauses: Array<{ messageIndex: number; clause: string; clauseOffset: number }> = [];
 	for (const message of snapshot.messages) {
 		if (message.role !== "user") continue;
-		let searchOffset = 0;
-		for (const raw of message.content.split(
-			/(?:(?:[!?。！？;]|\.(?=\s|$)|\n)+|,(?=\s*(?:actually|instead|rather|replace|replaced|no longer|not)\b))\s*/iu,
-		)) {
-			const clause = raw.trim();
-			const clauseOffset = clause ? message.content.indexOf(clause, searchOffset) : searchOffset;
-			searchOffset = Math.max(searchOffset, clauseOffset + clause.length);
-			if (
-				!clause ||
-				/^(?:what|why|how|when|where|who|which)\b/i.test(clause) ||
-				/\basked\b[^"“”]*["“”][^"“”]*(?:should|could|would|can|will)\b/i.test(clause) ||
-				/^(?:no further changes|nothing else|another question remains|the ambiguity remains open|continue (?:again|with the remaining goal)|yes|no|ok|okay|done|acknowledged|understood|got it|thanks|thank you)$/i.test(
-					clause,
+		for (const span of authoredTextSpans(message.content)) {
+			let searchOffset = 0;
+			for (const raw of span.text.split(
+				/(?:(?:[!?。！？;]|\.(?=\s|$)|\n)+|,(?=\s*(?:actually|instead|rather|replace|replaced|no longer|not)\b))\s*/iu,
+			)) {
+				const clause = raw.trim();
+				const localOffset = clause ? span.text.indexOf(clause, searchOffset) : searchOffset;
+				searchOffset = Math.max(searchOffset, localOffset + clause.length);
+				if (
+					!clause ||
+					/^(?:what|why|how|when|where|who|which)\b/i.test(clause) ||
+					/\basked\b[^"“”]*["“”][^"“”]*(?:should|could|would|can|will)\b/i.test(clause) ||
+					/^(?:no further changes|nothing else|another question remains|the ambiguity remains open|continue (?:again|with the remaining goal)|yes|no|ok|okay|done|acknowledged|understood|got it|thanks|thank you)$/i.test(
+						clause,
+					)
 				)
-			)
-				continue;
-			if (evidenceTerms(clause).size >= 1) clauses.push({ messageIndex: message.index, clause, clauseOffset });
+					continue;
+				if (evidenceTerms(clause).size >= 1)
+					clauses.push({ messageIndex: message.index, clause, clauseOffset: span.offset + localOffset });
+			}
 		}
 	}
 	return clauses;
@@ -1070,9 +1107,8 @@ function validateResolutionAnchors(
 			message.role !== "user" ||
 			containsNonTextMarker(quote) ||
 			containsNonTextMarker(resolution) ||
-			containsNonTextMarker(message.content) ||
 			!message.content.includes(quote) ||
-			!message.content.includes(resolution) ||
+			anchoredTextSpan(message.content, quote)?.includes(resolution) !== true ||
 			!hasVerbatimTokenBoundaries(message.content, quote) ||
 			!hasVerbatimTokenBoundaries(message.content, resolution) ||
 			hasLaterSupersedingCorrection(message.content, quote, resolution) ||
@@ -1175,9 +1211,8 @@ function validateRemovalAnchors(
 			messageIndex <= afterIndex ||
 			containsNonTextMarker(quote) ||
 			containsNonTextMarker(resolution) ||
-			containsNonTextMarker(message.content) ||
 			!message.content.includes(quote) ||
-			!message.content.includes(resolution) ||
+			anchoredTextSpan(message.content, quote)?.includes(resolution) !== true ||
 			!hasVerbatimTokenBoundaries(message.content, quote) ||
 			!hasVerbatimTokenBoundaries(message.content, resolution) ||
 			resolution === previous.statement ||
@@ -1481,21 +1516,58 @@ export function crystallizeDeepInterview(value: unknown): DeepInterviewCrystal {
 				preservesEvidenceOrder(item.statement, directive.clause) &&
 				sameSemanticIntent(semanticProfile(directive.clause), semanticProfile(item.statement)),
 		);
-		const explicitlySuperseded = canonicalPriorItems.some(previous => {
-			const replacement = items.find(item => item.id === previous.id);
+		const snapshotReplacement = items.some(replacement => {
+			const anchor = replacement.anchor;
+			if (replacement.classification !== "confirmed" || !anchor) return false;
+			const message = snapshot.messages.find(entry => entry.index === anchor.message_index);
+			if (
+				!message ||
+				anchor.message_index < directive.messageIndex ||
+				(anchor.message_index === directive.messageIndex &&
+					message.content.indexOf(anchor.quote) <= directive.clauseOffset) ||
+				!/\b(?:actually|instead|rather|correction|replace|switch|change)\b/i.test(anchor.quote) ||
+				/\b(?:also|too|additionally|as\s+well|in\s+addition)\b/i.test(anchor.quote)
+			)
+				return false;
+			// A use-target correction may replace that target, not other directives
+			// attached to it. The ordered correction helper must also recognize it.
+			const target = /\buse\s+([A-Za-z0-9][A-Za-z0-9+#.-]*)/i.exec(directive.clause)?.[1];
+			if (!target || !/\buse\s+/i.test(anchor.quote)) return false;
+			const directiveSemantics = semanticProfile(directive.clause);
+			const replacementSemantics = semanticProfile(replacement.statement);
+			if (
+				!sameSemanticIntent(
+					{ ...directiveSemantics, contradictory: replacementSemantics.contradictory },
+					replacementSemantics,
+				)
+			)
+				return false;
+			const remainingTerms = topicTerms(directive.clause, false);
+			remainingTerms.delete(target.toLowerCase());
+			for (const term of ["actually", "correction"]) remainingTerms.delete(term);
+			const replacementTerms = evidenceTerms(anchor.quote);
 			return (
-				replacement !== undefined &&
-				!sameIntent(replacement, previous) &&
-				replacement.anchor !== undefined &&
-				(directive.messageIndex < replacement.anchor.message_index ||
-					(directive.messageIndex === replacement.anchor.message_index &&
-						(snapshot.messages
-							.find(message => message.index === directive.messageIndex)
-							?.content.indexOf(replacement.anchor.quote) ?? -1) > directive.clauseOffset)) &&
-				/\b(?:actually|instead|rather|replace|replaced|no longer|not)\b/i.test(replacement.anchor.quote) &&
-				[...directiveTerms].every(term => evidenceTerms(previous.statement).has(term))
+				[...remainingTerms].every(term => replacementTerms.has(term)) &&
+				hasLaterSupersedingCorrection(`${directive.clause}. ${anchor.quote}`, directive.clause, directive.clause)
 			);
 		});
+		const explicitlySuperseded =
+			snapshotReplacement ||
+			canonicalPriorItems.some(previous => {
+				const replacement = items.find(item => item.id === previous.id);
+				return (
+					replacement !== undefined &&
+					!sameIntent(replacement, previous) &&
+					replacement.anchor !== undefined &&
+					(directive.messageIndex < replacement.anchor.message_index ||
+						(directive.messageIndex === replacement.anchor.message_index &&
+							(snapshot.messages
+								.find(message => message.index === directive.messageIndex)
+								?.content.indexOf(replacement.anchor.quote) ?? -1) > directive.clauseOffset)) &&
+					/\b(?:actually|instead|rather|replace|replaced|no longer|not)\b/i.test(replacement.anchor.quote) &&
+					[...directiveTerms].every(term => evidenceTerms(previous.statement).has(term))
+				);
+			});
 		const explicitlyPreserved =
 			/(?:\b(?:keep|retain|restore|preserve|maintain)\b|유지|보존|복원|保持|保留|恢复|恢復|復元)/iu.test(
 				directive.clause,
@@ -1548,6 +1620,10 @@ export function crystallizeDeepInterview(value: unknown): DeepInterviewCrystal {
 			["add", "adds", "added"],
 			["remove", "removes", "removed"],
 		],
+		[
+			["require", "requires", "required"],
+			["forbid", "forbids", "forbidden", "prohibit", "prohibits", "prohibited"],
+		],
 	];
 	for (let leftIndex = 0; leftIndex < confirmedItems.length; leftIndex++) {
 		const left = confirmedItems[leftIndex]!;
@@ -1559,8 +1635,9 @@ export function crystallizeDeepInterview(value: unknown): DeepInterviewCrystal {
 					statement: string,
 					terms: Set<string>,
 				): { sign: number; subject: Set<string> } | undefined => {
-					const positive = positiveTerms.some(term => terms.has(term));
-					const negative = negativeTerms.some(term => terms.has(term));
+					const actionTerms = evidenceTerms(statement);
+					const positive = positiveTerms.some(term => actionTerms.has(term));
+					const negative = negativeTerms.some(term => actionTerms.has(term));
 					if (positive === negative) return undefined;
 					const explicitlyNegated = /\b(?:do\s+not|don['’]t|never|not)\b/i.test(statement);
 					return {
