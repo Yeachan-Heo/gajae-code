@@ -112,6 +112,18 @@ cleanup() {
     return 0
 }
 
+release_install_lock() {
+    [ -n "$LOCK_FILE" ] && [ -f "$LOCK_FILE" ] || return 0
+    owner=""
+    nonce=""
+    read owner nonce < "$LOCK_FILE" || return 1
+    [ "$owner" = "$$" ] && [ -n "$LOCK_NONCE" ] && [ "$nonce" = "$LOCK_NONCE" ] || return 1
+    rm -f "$LOCK_FILE" || return 1
+    [ ! -e "$LOCK_FILE" ] || return 1
+    LOCK_FILE=""
+    LOCK_NONCE=""
+}
+
 trap cleanup EXIT
 forward_offer_signal() {
     [ -z "$OFFER_RUNTIME_SIGNAL" ] || return 0
@@ -763,10 +775,17 @@ install_binary() {
     echo ""
     echo "Installed gjc ${EXPECTED_VERSION} to ${DEST_PATH}"
 
+    OFFER_LOCK_RELEASED=""
+    if release_install_lock; then
+        OFFER_LOCK_RELEASED=1
+    else
+        echo "Warning: installed gjc, but could not release the installer lock before the optional app offer." >&2
+    fi
+
     # The verified runtime owns the optional macOS community-app flow so fresh
     # installs and `gjc update` share the same supply-chain checks. The offer is
     # strictly best-effort and must never change a successful GJC install.
-    if [ "$PLATFORM" = "darwin" ] && ! community_app_offer_suppressed; then
+    if [ -n "$OFFER_LOCK_RELEASED" ] && [ "$PLATFORM" = "darwin" ] && ! community_app_offer_suppressed; then
         OFFER_RUNTIME_DIR=$(mktemp -d "${INSTALL_DIR}/.gjc-community-app.XXXXXX" 2>/dev/null || true)
         OFFER_RUNTIME="${OFFER_RUNTIME_DIR}/gjc"
         if [ -n "$OFFER_RUNTIME_DIR" ] && [ ! -L "$DEST_PATH" ] && [ -f "$DEST_PATH" ] && cp -p "$DEST_PATH" "$OFFER_RUNTIME" 2>/dev/null; then

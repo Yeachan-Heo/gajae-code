@@ -950,6 +950,7 @@ export async function offerMacosCommunityApp(
 			staleMs: 30_000,
 			retries: 12_000,
 			retryDelayMs: 5,
+			signal: fetchAbortSignal,
 		});
 		if (!(await sameDirectoryIdentity(currentDestinationRoot, destinationRootIdentity)))
 			return failure("the Applications destination identity changed", log);
@@ -1162,7 +1163,13 @@ export async function offerMacosCommunityApp(
 			log,
 		);
 	} finally {
-		if (releaseReplacementLock) await releaseReplacementLock();
+		if (releaseReplacementLock) {
+			try {
+				await releaseReplacementLock();
+			} catch (error) {
+				log(`Optional community app cleanup warning: failed to release destination lock: ${String(error)}`);
+			}
+		}
 		let removeTempRoot = true;
 		if (mountAttempted && mountPoint) {
 			try {
