@@ -1383,29 +1383,63 @@ describe("terminal abort registers a turn scope so left-running owned work class
 	}, 20_000);
 
 	it("JobTool lists and cancels jobs on the endpoint-owned manager", async () => {
-		// Reproduction of the review-thread P1 scenario: JobTool.execute and
-		// #snapshotJobs must resolve the session's endpoint manager — a
-		// non-global session A otherwise inspects session B's manager and
-		// cannot manage the job A just launched.
+		// Colliding IDs make a wrong-manager lookup observable for both listing
+		// and cancellation, without coupling JobTool routing to a native shell.
 		const foreign = new AsyncJobManager({ maxRunningJobs: 2, onJobComplete: () => {} });
+		const jobId = "jobtool-manager-collision";
+		const registerCancellableJob = (jobManager: AsyncJobManager, label: string): Promise<AbortSignal> => {
+			const started = Promise.withResolvers<AbortSignal>();
+			jobManager.register(
+				"task",
+				label,
+				async ({ signal }) => {
+					const aborted = Promise.withResolvers<void>();
+					const onAbort = () => aborted.resolve();
+					signal.addEventListener("abort", onAbort, { once: true });
+					if (signal.aborted) onAbort();
+					started.resolve(signal);
+					try {
+						await aborted.promise;
+						return `${label} stopped`;
+					} finally {
+						signal.removeEventListener("abort", onAbort);
+					}
+				},
+				{ id: jobId },
+			);
+			return started.promise;
+		};
 		try {
 			AsyncJobManager.setInstance(foreign);
-			scriptedResponses = [bashCall("sleep 30", "call_jobtool", true), stopReply("ok")];
-			const promptPromise = session.prompt("spawn job").catch(() => {});
-			await waitFor(() => manager.getAllJobs().length > 0, "job registered");
-			await promptPromise;
+			const ownedSignal = await registerCancellableJob(manager, "owned job");
+			const foreignSignal = await registerCancellableJob(foreign, "foreign job");
+			const ownedJob = manager.getJob(jobId)!;
+			const foreignJob = foreign.getJob(jobId)!;
 			const jobTool = new JobTool(toolSession);
-			const job = manager.getAllJobs()[0]!;
 			const listResult = await jobTool.execute("job-call", { list: true });
-			expect(listResult.details?.jobs.some(snapshot => snapshot.id === job.id)).toBe(true);
-			const cancelResult = await jobTool.execute("job-call", { cancel: [job.id] });
-			expect(cancelResult.details?.cancelled?.[0]?.status).toBe("cancelled");
-			await waitFor(() => manager.getJob(job.id)?.status !== "running", "endpoint job cancelled", 5_000);
+			expect(listResult.details?.jobs).toMatchObject([{ id: jobId, label: "owned job", status: "running" }]);
+			expect(listResult.details?.jobs).toHaveLength(1);
+			expect(ownedSignal).not.toBe(foreignSignal);
+			expect(ownedSignal.aborted).toBe(false);
+			expect(foreignSignal.aborted).toBe(false);
+
+			const cancelResult = await jobTool.execute("job-call", { cancel: [jobId] });
+			expect(cancelResult.details?.cancelled).toEqual([{ id: jobId, status: "cancelled" }]);
+			expect(cancelResult.details?.jobs).toMatchObject([{ id: jobId, label: "owned job", status: "cancelled" }]);
+			expect(cancelResult.details?.jobs).toHaveLength(1);
+			expect(ownedSignal.aborted).toBe(true);
+			// Status changes synchronously; join the actual run to prove it unwound.
+			await ownedJob.promise;
+			expect(ownedJob.status).toBe("cancelled");
+			expect(ownedJob.resultText).toBe("owned job stopped");
+			expect(foreignSignal.aborted).toBe(false);
+			expect(foreignJob.status).toBe("running");
+			expect(foreignJob.resultText).toBeUndefined();
 		} finally {
-			// cancel() publishes status synchronously, before the shell unwinds.
-			// Await its owned promise and sidecar writes, not just the status flag.
 			manager.cancelAll();
-			await manager.waitForAll();
+			foreign.cancelAll();
+			await Promise.all([manager.waitForAll(), foreign.waitForAll()]);
+			// Join real session persistence before afterEach's bounded disposal.
 			await session.waitForIdle();
 			await session.awaitSessionSettlement();
 			await session.awaitCoordinatorRuntimeStatePersistenceForTests();

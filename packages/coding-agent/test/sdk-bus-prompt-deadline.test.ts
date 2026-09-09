@@ -64,18 +64,18 @@ async function closeSocket(socket: WebSocket): Promise<void> {
 	await Promise.race([promise, Bun.sleep(500)]);
 }
 
-async function waitFor(predicate: () => boolean, label: string, timeoutMs = 20_000): Promise<void> {
+async function waitFor(predicate: () => boolean | Promise<boolean>, label: string, timeoutMs = 20_000): Promise<void> {
 	const deadline = Date.now() + timeoutMs;
-	while (!predicate()) {
+	while (!(await predicate())) {
 		if (Date.now() > deadline) throw new Error(`Timed out waiting for ${label}`);
 		await Bun.sleep(10);
 	}
 }
 
-function deadlineSettings(cwd: string, leaseMs: number, maxRuntimeMs: number): Settings {
+function deadlineSettings(cwd: string, leaseMs: number | (() => number), maxRuntimeMs: number): Settings {
 	return {
 		get: (key: string) => {
-			if (key === "sdk.promptDeadlineMs") return leaseMs;
+			if (key === "sdk.promptDeadlineMs") return typeof leaseMs === "number" ? leaseMs : leaseMs();
 			if (key === "sdk.promptMaxRuntimeMs") return maxRuntimeMs;
 			return undefined;
 		},
@@ -242,6 +242,7 @@ async function acceptPrompt(
 		startAgent?: boolean;
 		extraPrompts?: string[];
 		captureSchedule?: boolean;
+		promptDeadlineMs?: () => number;
 		abortPromptAndWait?: (handle: string, options: { graceMs: number }) => Promise<RunSettlementProof>;
 	} = {},
 ): Promise<BusSession> {
@@ -250,12 +251,16 @@ async function acceptPrompt(
 	const sessionId = `sdk-bus-deadline-${label}-${Date.now()}`;
 	const sessionContext = context(cwd, sessionId, options.abortPromptAndWait);
 	const acceptFailure: AcceptFailure = { armed: false };
-	const handlers = start(sessionContext, deadlineSettings(cwd, leaseMs, maxRuntimeMs), acceptFailure);
+	const handlers = start(
+		sessionContext,
+		deadlineSettings(cwd, options.promptDeadlineMs ?? leaseMs, maxRuntimeMs),
+		acceptFailure,
+	);
 	const scheduled: (() => void)[] = [];
 
 	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
-	await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
-	const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+	await waitFor(() => Bun.file(endpointFile).exists(), "SDK endpoint");
+	const endpoint = (await Bun.file(endpointFile).json()) as { url: string; token: string };
 	const frames: Record<string, unknown>[] = [];
 	const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
 	sockets.push(socket);
@@ -1442,9 +1447,9 @@ for (const superseded of [false, true]) {
 			await session.waitForIdle();
 			await waitFor(() => events.filter(event => event === "agent_end").length === 2, "successor terminal");
 			await waitFor(
-				() =>
-					fs.existsSync(stateFile) &&
-					JSON.parse(fs.readFileSync(stateFile, "utf8")).final_response?.text === "successor receipt",
+				async () =>
+					(await Bun.file(stateFile).exists()) &&
+					(await Bun.file(stateFile).json()).final_response?.text === "successor receipt",
 				"successor receipt persistence",
 			);
 			const before = await Bun.file(stateFile).text();
@@ -1509,78 +1514,133 @@ test("committed deadline projection retries only its exact handle and cannot be 
 	}
 }, 30_000);
 
-test("a registered stalled projection cannot hold the committed wire terminal or mutate a successor", async () => {
-	const bus = await acceptPrompt("projection-stalled", 500, 60_000);
-	const producer = productionToolEmitter(bus);
-	const release = Promise.withResolvers<void>();
-	const entered = Promise.withResolvers<void>();
-	const settled = Promise.withResolvers<void>();
-	const log = spyOn(logger, "error");
-	let calls = 0;
-	let writes = 0;
-	let current: (() => boolean) | undefined;
-	registerCommittedPromptFailureWriter(producer.session, async (handle, failure, isCurrent) => {
-		calls++;
-		expect(handle).toBe("bus-deadline-run-handle");
-		expect(failure.code).toBe("prompt_deadline_exceeded");
-		current = isCurrent;
-		entered.resolve();
-		// Never settles during the entire observation window. Release only
-		// after a successor exists to exercise the late-write authority fence.
-		await release.promise;
-		if (isCurrent()) writes++;
-		settled.resolve();
-		return isCurrent() ? "persisted" : "stale";
-	});
-	bus.sessionContext.recordCommittedPromptFailure = (
-		handle: string,
-		failure: { code: "prompt_deadline_exceeded"; message: "Prompt deadline exceeded." },
-		isCurrent: () => boolean,
-	) => recordCommittedPromptFailure(producer.session, handle, failure, isCurrent);
-	try {
-		await entered.promise;
-		const observationStarted = Date.now();
-		expect(await promptResult(bus)).toMatchObject({ status: "failed", outcome: { provenance: "deadline" } });
-		await waitFor(() => bus.deadlineTerminals().length === 1, "bounded stalled projection terminal", 13_000);
-		expect(Date.now() - observationStarted).toBeLessThan(12_500);
-		expect(calls).toBe(1);
-		expect(current?.()).toBe(false);
-		expect(
-			log.mock.calls.some(
-				([name, detail]) =>
-					name === "sdk_prompt_failure_projection_unresolved" &&
-					(detail as { commandId?: string; retryable?: boolean })?.commandId === bus.correlation.commandId &&
-					(detail as { retryable?: boolean }).retryable === true,
-			),
-		).toBe(true);
-		await bus.handlers.get("agent_end")?.(
-			{ type: "agent_end", stopReason: "completed", messages: [] },
-			bus.sessionContext,
-		);
-		const ack = await sendPrompt(bus, "after-stalled-projection");
-		expect(ack.ok).toBe(true);
-		const successor = { commandId: String(ack.result?.commandId), turnId: String(ack.result?.turnId) };
-		await bus.handlers.get("agent_start")?.({ type: "agent_start" }, bus.sessionContext);
-		release.resolve();
-		await settled.promise;
-		await Bun.sleep(100);
-		expect(writes).toBe(0);
-		expect(calls).toBe(1);
-		expect(bus.deadlineTerminals()).toHaveLength(1);
-		expect(bus.terminals(successor)).toHaveLength(0);
-		await bus.handlers.get("agent_end")?.(
-			{ type: "agent_end", stopReason: "completed", messages: [] },
-			bus.sessionContext,
-		);
-		await waitFor(() => bus.terminals(successor).length === 1, "successor terminal after stalled projection");
-		expect(bus.deadlineTerminals()).toHaveLength(1);
-	} finally {
-		release.resolve();
-		log.mockRestore();
-		await producer.session.dispose();
-		await shutdown(bus);
-	}
-}, 30_000);
+for (const successorExpires of [false, true]) {
+	test(`a registered stalled projection cannot hold the committed wire terminal or mutate a successor${successorExpires ? " with its own deadline" : ""}`, async () => {
+		let leaseMs = 500;
+		const bus = await acceptPrompt("projection-stalled", leaseMs, 60_000, {
+			promptDeadlineMs: () => leaseMs,
+		});
+		const producer = productionToolEmitter(bus);
+		const predecessorHandle = "bus-deadline-run-handle";
+		const successorHandle = "successor-deadline-run-handle";
+		const release = Promise.withResolvers<void>();
+		const entered = Promise.withResolvers<void>();
+		const settled = Promise.withResolvers<void>();
+		const releaseSuccessor = Promise.withResolvers<void>();
+		const log = spyOn(logger, "error");
+		const owners = new Map([[predecessorHandle, bus.correlation]]);
+		const calls: string[] = [];
+		const writes: { handle: string; commandId: string; turnId: string }[] = [];
+		const guards = new Map<string, () => boolean>();
+		const results = new Map<string, "persisted" | "stale">();
+		// Registration lasts for the session, not one invocation. Distinct handles
+		// expose a legitimate successor callback instead of counting it as stale work.
+		registerCommittedPromptFailureWriter(producer.session, async (handle, failure, isCurrent) => {
+			const owner = owners.get(handle);
+			expect(owner).toBeDefined();
+			expect(failure.code).toBe("prompt_deadline_exceeded");
+			calls.push(handle);
+			guards.set(handle, isCurrent);
+			if (handle === predecessorHandle) {
+				entered.resolve();
+				await release.promise;
+			} else {
+				expect(handle).toBe(successorHandle);
+				await releaseSuccessor.promise;
+			}
+			const result = isCurrent() ? "persisted" : "stale";
+			if (result === "persisted") writes.push({ handle, ...owner! });
+			results.set(handle, result);
+			if (handle === predecessorHandle) settled.resolve();
+			return result;
+		});
+		bus.sessionContext.recordCommittedPromptFailure = (
+			handle: string,
+			failure: { code: "prompt_deadline_exceeded"; message: "Prompt deadline exceeded." },
+			isCurrent: () => boolean,
+		) => recordCommittedPromptFailure(producer.session, handle, failure, isCurrent);
+		try {
+			await entered.promise;
+			const observationStarted = Date.now();
+			expect(await promptResult(bus)).toMatchObject({ status: "failed", outcome: { provenance: "deadline" } });
+			await waitFor(() => bus.deadlineTerminals().length === 1, "bounded stalled projection terminal", 13_000);
+			expect(Date.now() - observationStarted).toBeLessThan(12_500);
+			expect(calls).toEqual([predecessorHandle]);
+			expect(guards.get(predecessorHandle)?.()).toBe(false);
+			expect(results.has(predecessorHandle)).toBe(false);
+			expect(
+				log.mock.calls.some(
+					([name, detail]) =>
+						name === "sdk_prompt_failure_projection_unresolved" &&
+						(detail as { commandId?: string; retryable?: boolean })?.commandId === bus.correlation.commandId &&
+						(detail as { retryable?: boolean }).retryable === true,
+				),
+			).toBe(true);
+			await bus.handlers.get("agent_end")?.(
+				{ type: "agent_end", stopReason: "completed", messages: [] },
+				bus.sessionContext,
+			);
+			// Isolation must not race a successor's 500ms lease against transport I/O.
+			// The other case deliberately waits for that independent deadline rather
+			// than assuming a sleep/acknowledgement leaves the successor nonterminal.
+			leaseMs = successorExpires ? 500 : 60_000;
+			bus.sessionContext.getActivePromptHandle = () => successorHandle;
+			const ack = await sendPrompt(bus, "after-stalled-projection");
+			expect(ack.ok).toBe(true);
+			const successor = { commandId: String(ack.result?.commandId), turnId: String(ack.result?.turnId) };
+			expect(successor.commandId).not.toBe(bus.correlation.commandId);
+			expect(successor.turnId).not.toBe(bus.correlation.turnId);
+			owners.set(successorHandle, successor);
+			await bus.handlers.get("agent_start")?.({ type: "agent_start", runId: successorHandle }, bus.sessionContext);
+			if (successorExpires) {
+				await waitFor(() => guards.has(successorHandle), "independent successor projection callback");
+				expect(calls).toEqual([predecessorHandle, successorHandle]);
+				expect(guards.get(successorHandle)?.()).toBe(true);
+				expect(guards.get(successorHandle)).not.toBe(guards.get(predecessorHandle));
+			}
+			release.resolve();
+			await settled.promise;
+			expect(results.get(predecessorHandle)).toBe("stale");
+			expect(guards.get(predecessorHandle)?.()).toBe(false);
+			expect(writes).toEqual([]);
+			expect(bus.terminals(bus.correlation)).toHaveLength(1);
+			expect(bus.deadlineTerminals()).toHaveLength(1);
+			expect(bus.terminals(successor)).toHaveLength(0);
+			if (successorExpires) {
+				// Releasing old work cannot close the successor's observation or write
+				// its receipt. Only releasing its own callback permits its own terminal.
+				expect(guards.get(successorHandle)?.()).toBe(true);
+				expect(results.has(successorHandle)).toBe(false);
+				releaseSuccessor.resolve();
+				await waitFor(() => bus.terminals(successor).length === 1, "independent successor deadline terminal");
+				expect(results.get(successorHandle)).toBe("persisted");
+				expect(writes).toEqual([{ handle: successorHandle, ...successor }]);
+				expect(calls).toEqual([predecessorHandle, successorHandle]);
+				expect(bus.deadlineTerminals(successor)).toHaveLength(1);
+				expect(guards.get(successorHandle)?.()).toBe(false);
+			} else {
+				await bus.handlers.get("agent_end")?.(
+					{ type: "agent_end", stopReason: "completed", messages: [] },
+					bus.sessionContext,
+				);
+				await waitFor(() => bus.terminals(successor).length === 1, "successor terminal after stalled projection");
+				expect(bus.deadlineTerminals(successor)).toHaveLength(0);
+				expect(bus.terminals(successor)[0]).toMatchObject({ type: "agent_end", ...successor });
+				expect(calls).toEqual([predecessorHandle]);
+				expect(writes).toEqual([]);
+			}
+			expect(bus.terminals(bus.correlation)).toHaveLength(1);
+			expect(bus.deadlineTerminals()).toHaveLength(1);
+			expect(results.get(predecessorHandle)).toBe("stale");
+		} finally {
+			release.resolve();
+			releaseSuccessor.resolve();
+			log.mockRestore();
+			await producer.session.dispose();
+			await shutdown(bus);
+		}
+	}, 30_000);
+}
 
 test("real atomic projection fsync timeout cannot publish predecessor failure before a successor", async () => {
 	const oldFile = process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV];
@@ -1740,9 +1800,9 @@ test("real atomic projection fsync timeout cannot publish predecessor failure be
 		await successorPrompt;
 		await session.waitForIdle();
 		await waitFor(
-			() =>
-				fs.existsSync(stateFile) &&
-				JSON.parse(fs.readFileSync(stateFile, "utf8")).final_response?.text === "atomic successor receipt",
+			async () =>
+				(await Bun.file(stateFile).exists()) &&
+				(await Bun.file(stateFile).json()).final_response?.text === "atomic successor receipt",
 			"atomic successor receipt persistence",
 		);
 		expect(await Bun.file(temporary!).exists()).toBe(false);
