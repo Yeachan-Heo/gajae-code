@@ -1,0 +1,74 @@
+{
+  "name": "markit-ai",
+  "version": "0.5.3",
+  "description": "Convert anything to markdown. PDF, DOCX, PPTX, XLSX, HTML, EPUB, Jupyter, RSS, images, audio, URLs, and more. Pluggable converters, built-in LLM providers for image description and audio transcription. Works as a CLI and as a library.",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.js",
+      "default": "./dist/index.js"
+    }
+  },
+  "bin": {
+    "markit": "./dist/main.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "prepublishOnly": "npm run build",
+    "dev": "bun run src/main.ts",
+    "build:bun": "bun build --compile src/main.ts --outfile mill",
+    "build:bun-linux": "bun build --compile --target=bun-linux-x64 src/main.ts --outfile mill-linux-x64",
+    "build:bun-mac-arm": "bun build --compile --target=bun-darwin-arm64 src/main.ts --outfile mill-darwin-arm64",
+    "build:bun-mac-x64": "bun build --compile --target=bun-darwin-x64 src/main.ts --outfile mill-darwin-x64",
+    "test": "bun test",
+    "format": "bunx biome format --write src/",
+    "lint": "bunx biome lint src/",
+    "check": "bunx biome check src/"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Michaelliv/markit.git"
+  },
+  "homepage": "https://github.com/Michaelliv/markit#readme",
+  "bugs": {
+    "url": "https://github.com/Michaelliv/markit/issues"
+  },
+  "keywords": [
+    "markdown",
+    "pdf",
+    "docx",
+    "html",
+    "converter",
+    "ai",
+    "llm",
+    "agents"
+  ],
+  "license": "MIT",
+  "devDependencies": {
+    "@biomejs/biome": "^2.3.14",
+    "@types/jszip": "^3.4.1",
+    "@types/node": "^25.5.0",
+    "@types/turndown": "^5.0.5",
+    "typescript": "^5.8.0"
+  },
+  "dependencies": {
+    "chalk": "^5.6.2",
+    "commander": "^14.0.3",
+    "exifr": "^7.1.3",
+    "fast-xml-parser": "^5.5.9",
+    "jszip": "^3.10.1",
+    "mammoth": "^1.9.0",
+    "mupdf": "^1.27.0",
+    "music-metadata": "^11.12.3",
+    "rss-parser": "^3.13.0",
+    "turndown": "^7.2.0",
+    "turndown-plugin-gfm": "^1.0.2"
+  }
+}
