@@ -34,9 +34,11 @@ Windows default location: `%LOCALAPPDATA%\gjc\gjc.exe`.
 
 Standalone builds embed MuPDF's WebAssembly asset; PDF text extraction does not depend on a global npm/Bun package or the current working directory. A one-page document with short text is valid output. If extraction fails or produces no text, reader mode reports a failed inspection with conversion diagnostics rather than displaying PDF bytes as successfully inspected text. `:raw` remains an explicit request for the original response.
 
+Published package tarballs also bundle the patched Markit converter and its runtime dependencies, including matching MuPDF JavaScript/WASM and license files. Publisher-side staging verifies the patch before packing; consumers do not need a root `patchedDependencies` declaration or a dependency-mutating postinstall script. The release packer checks canonical archive limits and deterministic output.
+
 The official 0.16.6 standalone can report a misleading “install mupdf” error because MuPDF was excluded from compilation. Installing a global dependency is not a supported repair for that executable. Use a corrected standalone release containing the packaging fix; this source change does not repair an already installed 0.16.6 binary. Tool-visible diagnostics identify the logical MuPDF/WASM component without exposing local dependency paths. Resolved module/asset provenance and original initialization causes belong in local debug logs, not model-facing read results; inspect and redact those logs before attaching them to a bug report.
 
-MuPDF is separately licensed under AGPL-3.0-or-later, not the repository's MIT license. See [third-party notices](../NOTICE.md); distributing a combined standalone requires the applicable license notices and corresponding-source obligations to be satisfied.
+MuPDF is separately licensed under AGPL-3.0-or-later, not the repository's MIT license. See [third-party notices](../NOTICE.md); distributing either the combined standalone or a package tarball containing MuPDF requires the applicable license notices and corresponding-source obligations to be satisfied.
 
 ## Korean launcher alias
 

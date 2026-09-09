@@ -45,7 +45,8 @@
 		"format-prompts": "bun scripts/format-prompts.ts",
 		"generate-docs-index": "bun scripts/generate-docs-index.ts",
 		"generate-tool-catalog": "bun scripts/generate-tool-catalog.ts",
-		"prepack": "bun scripts/generate-tool-catalog.ts && bun scripts/generate-docs-index.ts",
+		"prepack": "bun scripts/generate-tool-catalog.ts && bun scripts/generate-docs-index.ts && bun scripts/stage-markit.ts stage",
+		"postpack": "bun scripts/stage-markit.ts cleanup",
 		"generate-template": "bun scripts/generate-template.ts",
 		"install:defaults": "bun src/cli.ts setup defaults",
 		"verify:insane-vendor": "bun scripts/verify-insane-vendor.ts",
@@ -79,6 +80,7 @@
 		"turndown-plugin-gfm": "catalog:",
 		"zod": "catalog:"
 	},
+	"bundledDependencies": ["markit-ai"],
 	"devDependencies": {
 		"@babel/traverse": "catalog:",
 		"@babel/types": "catalog:",
