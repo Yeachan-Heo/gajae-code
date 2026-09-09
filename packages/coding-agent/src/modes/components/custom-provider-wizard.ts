@@ -423,7 +423,8 @@ export class CustomProviderWizardComponent extends Container {
 				this.#submit();
 				return;
 			}
-			this.#step = "models";
+			this.#goBack();
+			return;
 		}
 		this.#renderStep();
 		this.#onRender();
@@ -662,7 +663,10 @@ export class CustomProviderWizardComponent extends Container {
 	}
 
 	#goBack(): void {
-		if (this.#step === "discover") this.#cancelDiscovery();
+		if (this.#step === "discover" || this.#step === "confirm" || this.#step === "force-confirm") {
+			// Revision starts on entry to the editor, not when its new value is saved.
+			this.#cancelDiscovery();
+		}
 		if (this.#step === "provider-id") this.#step = "compatibility";
 		else if (this.#step === "base-url") this.#step = "provider-id";
 		else if (this.#step === "credential-source") this.#step = "base-url";

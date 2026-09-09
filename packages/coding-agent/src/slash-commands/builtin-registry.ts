@@ -36,7 +36,10 @@ import { parseUiLanguage, resolveUiLanguage, UI_LANGUAGE_LABELS, UI_LANGUAGES, u
 import type { NotificationProvider } from "../sdk/bus/config";
 import { computeCacheMissCostSummary, formatCacheMissSummaryLines } from "../session/cache-economics";
 import { formatProviderSessionImportSummary, runSessionImportCommand } from "../session-import";
-import { formatModelOnboardingGuidance } from "../setup/model-onboarding-guidance";
+import {
+	formatModelOnboardingGuidance,
+	MODEL_ONBOARDING_API_PROVIDER_COMMAND,
+} from "../setup/model-onboarding-guidance";
 import {
 	addApiCompatibleProvider,
 	formatProviderPresetList,
@@ -239,7 +242,7 @@ function providerSetupUsage(): string {
 		"Provider onboarding",
 		"Presets: /provider add --preset <id> [--force]",
 		"Aliases include minimax, zai, alibaba, cline, command-code, and goat.",
-		"API providers: /provider add --compat <openai|anthropic> --provider <id> --base-url <url> --api-key-env <ENV> (--model <model> | --discover) [--force]",
+		`API providers: ${MODEL_ONBOARDING_API_PROVIDER_COMMAND} [--force]`,
 		`Available presets:\n${formatProviderPresetList()}`,
 		"OAuth/subscription providers: /provider login [provider-id] or /login [provider-id]",
 		"Headless OAuth callbacks can be pasted with /login <redirect URL or code>.",
@@ -2270,7 +2273,7 @@ export function formatUnknownBuiltinSlashCommandDiagnostic(commandName: string):
 	return [
 		"Unknown slash command: /provicer.",
 		"Did you mean /provider?",
-		"Run: /provider add --compat <openai|anthropic> --provider <id> --base-url <url> --api-key-env <ENV> --model <model>",
+		`Run: ${MODEL_ONBOARDING_API_PROVIDER_COMMAND}`,
 	].join("\n");
 }
 
