@@ -11,7 +11,11 @@ import { openLifecycleSessionManager, runSessionHost, watchSessionHostBrokerLive
 import { planLaunchWorktree } from "../src/gjc-runtime/launch-worktree";
 import { AcpAgent } from "../src/modes/acp/acp-agent";
 import { Broker, type BrokerCleanupEvidence, type BrokerResponse } from "../src/sdk/broker/broker";
-import { endpointIncarnation } from "../src/sdk/broker/endpoint-authority";
+import {
+	endpointIncarnation,
+	matchesIndexedEndpointFile,
+	readEndpointFile,
+} from "../src/sdk/broker/endpoint-authority";
 import { brokerOwnerForTest, startFixtureBrokerWithLeaseForTest } from "../src/sdk/broker/ensure";
 import { deriveIdempotencyIdentity } from "../src/sdk/broker/identity";
 import {
@@ -3378,7 +3382,11 @@ test("broker promotes the lower-generation root after the higher-generation root
 			endpointPath,
 			JSON.stringify({ sessionId, pid: process.pid, url: "ws://127.0.0.1:1", token: "alternate-token" }),
 		);
-		const alternateEndpointMtimeMs = (await fs.stat(endpointPath)).mtimeMs;
+		// Match the descriptor reader's nanosecond conversion; numeric stat mtimeMs
+		// can differ by one float ULP on Linux for the very same file.
+		const alternateEndpointIdentity = await fs.stat(endpointPath, { bigint: true });
+		const alternateEndpointMtimeMs = Number(alternateEndpointIdentity.mtimeNs) / 1_000_000;
+		const alternateEndpointFileId = `${alternateEndpointIdentity.dev}:${alternateEndpointIdentity.ino}`;
 		await broker.start();
 		const alternate = await broker.index.append({
 			type: "host_registered",
@@ -3387,7 +3395,11 @@ test("broker promotes the lower-generation root after the higher-generation root
 			endpointGeneration: 1,
 			pid: process.pid,
 			endpointMtimeMs: alternateEndpointMtimeMs,
+			endpointFileId: alternateEndpointFileId,
 		});
+		const originalEndpoint = await readEndpointFile(endpointPath);
+		if (!originalEndpoint) throw new Error("Expected the original alternate endpoint to be readable.");
+		expect(matchesIndexedEndpointFile(originalEndpoint, alternate)).toBe(true);
 		const current = await broker.index.append({
 			type: "host_registered",
 			sessionId,
@@ -3415,6 +3427,8 @@ test("broker promotes the lower-generation root after the higher-generation root
 				sessionId,
 				locator: alternate.locator,
 				endpointGeneration: alternate.endpointGeneration,
+				endpointMtimeMs: alternateEndpointMtimeMs,
+				endpointFileId: alternateEndpointFileId,
 				ambiguous: false,
 				live: true,
 			}),
@@ -3422,6 +3436,22 @@ test("broker promotes the lower-generation root after the higher-generation root
 		expect(await broker.handleRequest("session.get_endpoint", { sessionId })).toMatchObject({
 			ok: true,
 			result: { sessionId, pid: process.pid, token: "alternate-token" },
+		});
+
+		// Retain the original inode so the replacement cannot reuse it. Even a
+		// same-mtime endpoint for the same PID and generation is not the indexed file.
+		await fs.rename(endpointPath, `${endpointPath}.displaced`);
+		await Bun.write(endpointPath, originalEndpoint.source);
+		const alternateEndpointSeconds = alternateEndpointMtimeMs / 1_000;
+		await fs.utimes(endpointPath, alternateEndpointSeconds, alternateEndpointSeconds);
+		const replacementEndpoint = await readEndpointFile(endpointPath);
+		if (!replacementEndpoint) throw new Error("Expected the replacement alternate endpoint to be readable.");
+		expect(replacementEndpoint.ino).not.toBe(originalEndpoint.ino);
+		expect(Math.abs(replacementEndpoint.mtimeMs - alternateEndpointMtimeMs)).toBeLessThanOrEqual(0.001);
+		expect(matchesIndexedEndpointFile(replacementEndpoint, alternate)).toBe(false);
+		expect(await broker.handleRequest("session.get_endpoint", { sessionId })).toMatchObject({
+			ok: false,
+			error: { code: "endpoint_stale" },
 		});
 	} finally {
 		await broker.stop();
