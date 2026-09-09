@@ -71,6 +71,9 @@ Options:
 Environment:
   GJC_INSTALL_DIR             Install directory (default: ~/.local/bin)
   GITHUB_TOKEN / GH_TOKEN     Optional GitHub API token (rate limits)
+
+The optional macOS community-app offer requires Bash for safe child cancellation;
+other shells still install GJC normally and skip that offer.
 EOF
 }
 
@@ -124,27 +127,32 @@ trap handle_int INT
 trap handle_term TERM
 trap handle_hup HUP
 
-# Only direct commands run here: never a shell function/pipeline with unowned
-# grandchildren. The runtime itself owns and reaps its app-install helpers.
-# A signal in the asynchronous launch/PID assignment gap is latched and replayed.
+# Bash's job-spec kill blocks SIGCHLD and skips exited pipeline members. A saved
+# PID is only a wait-status key, never signal authority. There is exactly one
+# asynchronous job here; do not launch another until it has been waited for.
+# Non-Bash shells skip this optional flow (dash's job kill lacks this guarantee).
+# Signals in the asynchronous launch/assignment gap are latched and replayed.
 run_offer_command() {
     offer_budget="$1"
     shift
     [ -z "$OFFER_RUNTIME_SIGNAL" ] || return 1
-    "$@" <&0 &
+    # Scrub before the executable starts: the real CLI otherwise spawns a malloc
+    # re-exec wrapper before its offer hooks. Do not forge its re-exec guard or
+    # change the caller's environment. exec keeps the job as the direct runtime.
+    (unset MallocStackLogging MallocStackLoggingNoCompact; exec "$@") <&0 &
     OFFER_RUNTIME_PID=$!
     offer_signal_delivered=""
     offer_elapsed=0
     offer_cancel_elapsed=0
     offer_timed_out=""
-    while kill -0 "$OFFER_RUNTIME_PID" 2>/dev/null; do
+    while [ -n "$(jobs -pr; jobs -ps)" ]; do
         if [ -n "$OFFER_RUNTIME_SIGNAL" ] && [ -z "$offer_signal_delivered" ]; then
-            kill -s "$OFFER_RUNTIME_SIGNAL" "$OFFER_RUNTIME_PID" 2>/dev/null || true
+            kill -s "$OFFER_RUNTIME_SIGNAL" %% 2>/dev/null || true
             offer_signal_delivered=1
         fi
         if [ -n "$OFFER_RUNTIME_SIGNAL" ] || [ -n "$offer_timed_out" ]; then
             if [ "$offer_cancel_elapsed" -ge 8 ]; then
-                kill -KILL "$OFFER_RUNTIME_PID" 2>/dev/null || true
+                kill -KILL %% 2>/dev/null || true
                 # Reaping the direct child after KILL does not prove its
                 # descendants completed cleanup. Keep their runtime available.
                 OFFER_RUNTIME_RETAIN=1
@@ -153,7 +161,7 @@ run_offer_command() {
             offer_cancel_elapsed=$((offer_cancel_elapsed + 1))
         elif [ "$offer_elapsed" -ge "$offer_budget" ]; then
             offer_timed_out=1
-            kill -TERM "$OFFER_RUNTIME_PID" 2>/dev/null || true
+            kill -TERM %% 2>/dev/null || true
         fi
         # POSIX sleep, with at most one second of signal-dispatch latency.
         sleep 1
@@ -810,7 +818,9 @@ install_binary() {
     # The verified runtime owns the optional macOS community-app flow so fresh
     # installs and `gjc update` share the same supply-chain checks. The offer is
     # strictly best-effort and must never change a successful GJC install.
-    if [ "$PLATFORM" = "darwin" ] && ! community_app_offer_suppressed; then
+    if [ "$PLATFORM" = "darwin" ] && ! community_app_offer_suppressed && { [ -z "${BASH_VERSION:-}" ] || ! (builtin declare -p BASH_VERSION >/dev/null 2>&1); }; then
+        echo "Optional community-app offer skipped: safe child ownership requires Bash. GJC remains installed." >&2
+    elif [ "$PLATFORM" = "darwin" ] && ! community_app_offer_suppressed; then
         # mktemp runs under the ordinary exit-on-signal traps. Do not intercept
         # termination until preparation can launch tracked, bounded commands.
         OFFER_RUNTIME_DIR=$(mktemp -d "${INSTALL_DIR}/.gjc-community-app.XXXXXX" 2>/dev/null || true)
@@ -818,11 +828,9 @@ install_binary() {
         if [ -n "$OFFER_RUNTIME_DIR" ]; then
             OFFER_RUNTIME_ACTIVE=1
             if prepare_community_app_runtime; then
-                if [ -t 1 ] && [ -r /dev/tty ]; then
-                    run_offer_command 1800 "$OFFER_RUNTIME" --internal-macos-community-app-offer < /dev/tty || true
-                else
-                    run_offer_command 1800 "$OFFER_RUNTIME" --internal-macos-community-app-offer || true
-                fi
+                # Preserve original stdin; reopening /dev/tty would turn a piped
+                # or unattended installation into an interactive consent flow.
+                run_offer_command 1800 "$OFFER_RUNTIME" --internal-macos-community-app-offer || true
             fi
             if [ -n "$OFFER_RUNTIME_RETAIN" ]; then
                 echo "Optional community-app cleanup was forced; retained runtime at ${OFFER_RUNTIME_DIR}. GJC remains installed." >&2

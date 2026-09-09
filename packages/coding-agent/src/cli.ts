@@ -5,7 +5,6 @@
  * lightweight CLI runner from pi-utils.
  */
 import "@gajae-code/utils/postmortem";
-import { logger } from "@gajae-code/utils";
 import { Args, type CliConfig, Command, type CommandEntry, run } from "@gajae-code/utils/cli";
 import { APP_NAME, formatBunRuntimeError, MIN_BUN_VERSION, VERSION } from "@gajae-code/utils/dirs";
 import { runFixtureReport } from "./cli/fixture-report";
@@ -480,10 +479,14 @@ export async function runCli(argv: string[]): Promise<void> {
 	}
 	if (argv.length === 1 && argv[0] === "--internal-macos-community-app-offer") {
 		try {
-			await offerMacosCommunityApp({ log: message => logger.warn(message) });
+			await offerMacosCommunityApp({
+				log: message => {
+					process.stderr.write(`${message}\n`);
+				},
+			});
 		} catch {
-			logger.warn(
-				`Optional community app offer failed; GJC remains installed. https://github.com/${COMMUNITY_APP_REPOSITORY}`,
+			process.stderr.write(
+				`Optional community app offer failed; GJC remains installed. https://github.com/${COMMUNITY_APP_REPOSITORY}\n`,
 			);
 		}
 		return;

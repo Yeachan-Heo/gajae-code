@@ -146,6 +146,52 @@ describe("macOS community app integration", () => {
 		expect(fsNode.existsSync(lock)).toBe(false);
 	});
 
+	it("writes the shared disclosure to stderr before prompting", async () => {
+		await initTheme();
+		const root = await makeTempDir();
+		const stderr: string[] = [];
+		let prompts = 0;
+		let disclosureAtPrompt = "";
+		const write = vi.spyOn(process.stderr, "write").mockImplementation(chunk => {
+			stderr.push(String(chunk));
+			return true;
+		});
+		try {
+			await runUpdateCommand(
+				{ force: false, check: false },
+				{
+					platform: "darwin",
+					getLatestRelease: async () => release,
+					resolveUpdateTarget: async () => ({ method: "binary", path: path.join(root, "gjc") }),
+					performUpdate: async () => ({ ok: true, path: path.join(root, "gjc") }),
+					runPostUpdateRecovery: async () => {},
+					refreshInstalledDefaultSkills: async () => {},
+					offerMacosCommunityApp: options =>
+						offerMacosCommunityApp({
+							...options,
+							env: {},
+							arch: "arm64",
+							homeDir: root,
+							stdinIsTTY: true,
+							stdoutIsTTY: true,
+							command: async () => ({ exitCode: 0, stdout: "", stderr: "" }),
+							prompt: async () => {
+								prompts++;
+								disclosureAtPrompt = stderr.join("");
+								return false;
+							},
+						}),
+					recordTelemetryEvent: () => {},
+				},
+			);
+			expect(prompts).toBe(1);
+			expect(disclosureAtPrompt).toContain("experimental, community-built THIRD-PARTY software");
+			expect(disclosureAtPrompt).toContain("separately licensed, with no first-party support");
+			expect(disclosureAtPrompt).toContain("https://github.com/devswha/gajae-code-app\n");
+		} finally {
+			write.mockRestore();
+		}
+	});
 	it.each([
 		"linux",
 		"check",
@@ -158,8 +204,9 @@ describe("macOS community app integration", () => {
 		let offers = 0;
 		const events: string[] = [];
 		const warnings: string[] = [];
-		const warning = vi.spyOn(logger, "warn").mockImplementation(message => {
-			warnings.push(String(message));
+		const warning = vi.spyOn(process.stderr, "write").mockImplementation(chunk => {
+			warnings.push(String(chunk));
+			return true;
 		});
 		const exit = new Error("exit");
 		const deps: UpdateCommandDependencies = {
@@ -174,7 +221,7 @@ describe("macOS community app integration", () => {
 			refreshInstalledDefaultSkills: async () => {},
 			offerMacosCommunityApp: async options => {
 				offers++;
-				if (scenario === "throw") throw new Error("optional failure");
+				if (scenario === "throw") throw new Error(`\x1b[31moptional failure\x1b[0m\n${"x".repeat(1_000)}`);
 				const result = await offerMacosCommunityApp({
 					...options,
 					env: { GJC_NO_COMMUNITY_APP: "1" },
@@ -205,6 +252,9 @@ describe("macOS community app integration", () => {
 				expect(events).not.toContain("update_install_failed");
 				expect(warnings.join("\n")).toContain("optional failure");
 				expect(warnings.join("\n")).toContain("https://github.com/devswha/gajae-code-app");
+				expect(warnings.join("")).not.toContain("\x1b");
+				expect(warnings.join("")).not.toContain("x".repeat(513));
+				expect(warnings.join("")).toContain("GJC remains installed.");
 			}
 		} finally {
 			warning.mockRestore();

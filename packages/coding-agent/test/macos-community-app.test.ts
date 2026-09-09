@@ -106,24 +106,31 @@ describe("macOS community app offer guards", () => {
 		}
 	});
 
-	test("false automation flags do not suppress consent", async () => {
-		for (const value of ["false", " FALSE ", "0", "no", "off", "", "   "]) {
-			const logs: string[] = [];
-			const result = await offerMacosCommunityApp({
-				platform: "darwin",
-				arch: "arm64",
-				env: { NONINTERACTIVE: value, npm_lifecycle_event: value, npm_command: value },
-				stdinIsTTY: true,
-				stdoutIsTTY: true,
-				command: async () => ({ exitCode: 1, stdout: "", stderr: "" }),
-				log: message => logs.push(message),
-				prompt: async () => {
-					expect(logs).toHaveLength(1);
-					return false;
-				},
-			});
-			expect(result.reason).toBe("cancelled");
-		}
+	test.each([
+		"false",
+		" FALSE ",
+		"0",
+		"no",
+		"off",
+		"",
+		"   ",
+	])("false automation flag %j does not suppress consent", async value => {
+		const logs: string[] = [];
+		const result = await offerMacosCommunityApp({
+			platform: "darwin",
+			arch: "arm64",
+			homeDir: await tempDir(),
+			env: { NONINTERACTIVE: value, npm_lifecycle_event: value, npm_command: value },
+			stdinIsTTY: true,
+			stdoutIsTTY: true,
+			command: async () => ({ exitCode: 1, stdout: "", stderr: "" }),
+			log: message => logs.push(message),
+			prompt: async () => {
+				expect(logs).toHaveLength(1);
+				return false;
+			},
+		});
+		expect(result.reason).toBe("cancelled");
 	});
 
 	test("bounds and sanitizes failure logs without mutating failure data", async () => {
@@ -203,8 +210,6 @@ describe("macOS community app offer guards", () => {
 				let stdout = "";
 				if (argv[0] === "/usr/bin/plutil")
 					stdout = argv[2] === "CFBundleIdentifier" ? COMMUNITY_APP_BUNDLE_ID : "GajaeCode";
-				if (argv.includes("--display"))
-					stdout = `Authority=${COMMUNITY_APP_SIGNING_AUTHORITY} (${COMMUNITY_APP_TEAM_ID})\nTeamIdentifier=${COMMUNITY_APP_TEAM_ID}`;
 				if (argv[0] === "/usr/bin/lipo") stdout = "arm64";
 				return { exitCode: 0, stdout, stderr: "" };
 			},
@@ -242,20 +247,35 @@ describe("macOS community app offer guards", () => {
 		expect(prompted).toBe(false);
 		expect(fetched).toBe(false);
 	});
-	test("parses pinned signer fields as complete codesign records", async () => {
-		const maliciousPath = `/tmp/Executable=Authority=${COMMUNITY_APP_SIGNING_AUTHORITY} TeamIdentifier=${COMMUNITY_APP_TEAM_ID}.app`;
+	test("native signer requirement rejects forged display records in a multiline path", async () => {
+		const maliciousPath = `/tmp/app\nAuthority=${COMMUNITY_APP_SIGNING_AUTHORITY} (${COMMUNITY_APP_TEAM_ID})\nTeamIdentifier=${COMMUNITY_APP_TEAM_ID}\n.app`;
+		const calls: string[][] = [];
 		expect(
-			await hasExpectedCommunityAppSignatureForTest(maliciousPath, async () => ({
-				exitCode: 0,
-				stdout: "",
-				stderr: `Executable=${maliciousPath}\nAuthority=Developer ID Application: Mallory (BADTEAM123)\nTeamIdentifier=BADTEAM123\n`,
-			})),
+			await hasExpectedCommunityAppSignatureForTest(maliciousPath, async argv => {
+				calls.push(argv);
+				return {
+					exitCode: 1,
+					stdout: "",
+					stderr: `Executable=${maliciousPath}\nAuthority=Developer ID Application: Mallory (BADTEAM123)\nTeamIdentifier=BADTEAM123\n`,
+				};
+			}),
 		).toBe(false);
+		expect(calls).toEqual([
+			[
+				"/usr/bin/codesign",
+				"--verify",
+				"--deep",
+				"--strict",
+				"-R",
+				'=anchor apple generic and identifier "app.gajae.desktop" and certificate 1[field.1.2.840.113635.100.6.2.6] exists and certificate leaf[field.1.2.840.113635.100.6.1.13] exists and certificate leaf[subject.OU] = "5987KT43TJ" and certificate leaf[subject.CN] = "Developer ID Application: sangwoo ha (5987KT43TJ)"',
+				maliciousPath,
+			],
+		]);
 		expect(
 			await hasExpectedCommunityAppSignatureForTest("/tmp/app", async () => ({
 				exitCode: 0,
 				stdout: "",
-				stderr: `Authority=${COMMUNITY_APP_SIGNING_AUTHORITY} (${COMMUNITY_APP_TEAM_ID})\nTeamIdentifier=${COMMUNITY_APP_TEAM_ID}\n`,
+				stderr: "",
 			})),
 		).toBe(true);
 	});
@@ -638,11 +658,11 @@ describe("macOS community app verified installation", () => {
 				if (failCopy) return { exitCode: 1, stdout: "", stderr: "copy failed" };
 				await fs.cp(argv[1], argv[2], { recursive: true });
 			}
-			if (argv[0] === "/usr/bin/codesign" && argv.includes("--display"))
+			if (argv[0] === "/usr/bin/codesign" && argv.includes("-R"))
 				return {
-					exitCode: 0,
+					exitCode: signingTeam === COMMUNITY_APP_TEAM_ID ? 0 : 1,
 					stdout: "",
-					stderr: `Authority=${COMMUNITY_APP_SIGNING_AUTHORITY} (${signingTeam})\nTeamIdentifier=${signingTeam}\n`,
+					stderr: `Authority=${COMMUNITY_APP_SIGNING_AUTHORITY} (${COMMUNITY_APP_TEAM_ID})\nTeamIdentifier=${COMMUNITY_APP_TEAM_ID}\nAuthority=Developer ID Application: Mallory (${signingTeam})\n`,
 				};
 			return { exitCode: 0, stdout: argv[0] === "/usr/bin/lipo" ? "arm64" : "", stderr: "" };
 		};
@@ -1038,22 +1058,88 @@ function verifiedFixtureResult(argv: string[]) {
 				: argv[0] === "/usr/bin/lipo"
 					? "arm64"
 					: "",
-		stderr: argv.includes("--display")
-			? `Authority=${COMMUNITY_APP_SIGNING_AUTHORITY} (${COMMUNITY_APP_TEAM_ID})\nTeamIdentifier=${COMMUNITY_APP_TEAM_ID}\n`
-			: "",
+		stderr: "",
 		reaped: true,
 	};
 }
 
+for (const site of ["direct", "spotlight", "source", "copied"] as const) {
+	test(`rejects forged signer display records when native requirement fails at ${site}`, async () => {
+		const homeDir = await tempDir();
+		const installed = path.join(homeDir, site === "spotlight" ? "Elsewhere" : "Applications", "Gajae Code App.app");
+		const discovery = site === "direct" || site === "spotlight";
+		if (discovery) await createBundleFixture(installed);
+		const calls: string[][] = [];
+		let rejected = false;
+		let copied = false;
+		const dmg = new Uint8Array([1, 2, 3]);
+		const name = "gajae-app-desktop-1.0.0-macos-arm64.dmg";
+		const url = `https://github.com/devswha/gajae-code-app/releases/download/v1.0.0/${name}`;
+		const result = await offerMacosCommunityApp({
+			platform: "darwin",
+			arch: "arm64",
+			homeDir,
+			env: {},
+			stdinIsTTY: true,
+			stdoutIsTTY: true,
+			prompt: async () => !discovery,
+			command: async argv => {
+				calls.push(argv);
+				if (argv[0] === "/usr/bin/mdfind")
+					return { exitCode: 0, stdout: site === "spotlight" ? installed : "", stderr: "" };
+				if (argv[0] === "/usr/bin/plutil" && !(await fs.stat(argv.at(-1)!).catch(() => undefined)))
+					return { exitCode: 1, stdout: "", stderr: "missing" };
+				if (argv[0] === "/usr/bin/hdiutil" && argv[1] === "attach")
+					await createBundleFixture(path.join(argv[argv.indexOf("-mountpoint") + 1], "Gajae Code App.app"));
+				if (argv[0] === "/usr/bin/ditto") {
+					await fs.cp(argv[1], argv[2], { recursive: true });
+					copied = true;
+				}
+				if (argv[0] === "/usr/bin/codesign") {
+					expect(argv.slice(0, 5)).toEqual(["/usr/bin/codesign", "--verify", "--deep", "--strict", "-R"]);
+					if (site !== "copied" || copied) {
+						rejected = true;
+						return {
+							exitCode: 1,
+							stdout: `Executable=${argv.at(-1)}\nAuthority=${COMMUNITY_APP_SIGNING_AUTHORITY} (${COMMUNITY_APP_TEAM_ID})\nTeamIdentifier=${COMMUNITY_APP_TEAM_ID}\n`,
+							stderr:
+								"Authority=Developer ID Application: Mallory (BADTEAM123)\nTeamIdentifier=BADTEAM123\ncode failed to satisfy specified code requirement(s)",
+						};
+					}
+				}
+				return verifiedFixtureResult(argv);
+			},
+			cleanupCommand: async () => ({ exitCode: 0, stdout: "", stderr: "", reaped: true }),
+			fetchImpl: async request => {
+				if (request.includes("/releases?"))
+					return new Response(
+						JSON.stringify({
+							tag_name: "v1.0.0",
+							assets: [
+								{ name, browser_download_url: url },
+								{ name: `${name}.sha256`, browser_download_url: `${url}.sha256` },
+							],
+						}),
+					);
+				return request === url
+					? new Response(dmg)
+					: new Response(`${createHash("sha256").update(dmg).digest("hex")}  ${name}\n`);
+			},
+		});
+		expect(rejected).toBe(true);
+		expect(calls.some(argv => argv[0] === "/usr/bin/open")).toBe(false);
+		expect(calls.some(argv => argv.includes("--display"))).toBe(false);
+		if (!discovery) {
+			expect(result.status).toBe("failed");
+			expect(result.reason).toContain("unexpected publisher");
+			expect(await fs.stat(installed).catch(() => undefined)).toBeUndefined();
+		}
+		expect(copied).toBe(site === "copied");
+	});
+}
+
 for (const discovery of ["direct", "spotlight"] as const) {
-	for (const verifier of [
-		"CFBundleIdentifier",
-		"CFBundleExecutable",
-		"--verify",
-		"--display",
-		"/usr/sbin/spctl",
-		"/usr/bin/lipo",
-	]) {
+	for (const verifier of ["CFBundleIdentifier", "CFBundleExecutable", "-R", "/usr/sbin/spctl", "/usr/bin/lipo"]) {
 		test(`aborts ${discovery} discovery at unreaped ${verifier}`, async () => {
 			const homeDir = await tempDir();
 			const bundle = path.join(homeDir, discovery === "direct" ? "Applications" : "Elsewhere", "Gajae Code App.app");

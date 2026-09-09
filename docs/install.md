@@ -141,16 +141,20 @@ existing verified app bundles in user-local or system Applications locations.
 Only interactive terminals are eligible: CI, pipes, automation, non-macOS hosts,
 and `gjc update --check` never prompt. Set `GJC_NO_COMMUNITY_APP=1` to suppress the
 offer for unattended or repeated installs.
+The fresh-install offer requires Bash job ownership (including macOS `/bin/sh`);
+other shells skip only the optional offer and leave the successful GJC installation intact.
+Piped installer input is preserved rather than replaced with `/dev/tty`.
 
 An accepted offer uses only a canonical published GitHub Release DMG and its
 SHA-256 checksum. If no canonical release exists, installation fails closed;
 there is no fallback to Actions artifacts, source execution, or raw builds.
 GJC verifies the bundle identity, architecture, and pinned Developer ID signature,
-copies to a writable Applications location, safely detaches the image, and launches
-with macOS `open`. It never implicitly uses `sudo`, disables Gatekeeper, removes
+copies to a writable Applications location, launches with macOS `open`, and safely
+detaches the image during cleanup. It never implicitly uses `sudo`, disables Gatekeeper, removes
 quarantine, or bypasses licensing or signature checks. App-specific failures are
 reported with the community repository URL and do not fail the successful GJC
 install or update.
+
 ## Retry configuration
 
 Provider retry budgets live in `~/.gjc/config.yml`:

@@ -212,6 +212,7 @@ exec "${binDir}/mv" "$@"
 interface InstallerOptions {
 	cwd?: string;
 	script?: string;
+	shell?: string;
 }
 
 async function runInstaller(
@@ -219,7 +220,7 @@ async function runInstaller(
 	env: Record<string, string> = {},
 	options: InstallerOptions = {},
 ): Promise<{ exitCode: number; stdout: string; stderr: string }> {
-	const proc = Bun.spawn(["sh", options.script ?? installScript, ...args], {
+	const proc = Bun.spawn([options.shell ?? "sh", options.script ?? installScript, ...args], {
 		cwd: options.cwd ?? repoRoot,
 		env: {
 			...process.env,
@@ -544,6 +545,57 @@ describe("install.sh binary-first contract", () => {
 		expect(installer).toContain('ARCH="arm64"');
 	});
 
+	test("optional app fails closed without Bash job ownership, preserving the core install", async () => {
+		const script = path.join(sandbox.root, "non-bash-install.sh");
+		// Exercise the refusal deterministically even on macOS where /bin/sh is Bash.
+		fs.writeFileSync(script, `unset BASH_VERSION\n${fs.readFileSync(installScript, "utf8")}`);
+		const payload = fakeGjcScript({ version: VERSION });
+		fs.writeFileSync(path.join(sandbox.shimDir, "uname"),
+			'#!/bin/sh\nif [ "$1" = "-s" ]; then echo Darwin; else echo x86_64; fi\n', { mode: 0o755 });
+		writeCurlShim(sandbox.shimDir, { assets: {
+			"gjc-darwin-x64": payload,
+			"gajae-release-binaries.sha256": `${sha256(payload)}  gjc-darwin-x64\n`,
+		} });
+		const result = await runInstaller([], {
+			CI: "false", GITHUB_ACTIONS: "false", GJC_NONINTERACTIVE: "false", GJC_NO_COMMUNITY_APP: "false",
+		}, { script });
+		expect(result.exitCode).toBe(0);
+		expect(result.stderr).toContain("safe child ownership requires Bash");
+		expect(fs.readFileSync(path.join(sandbox.installDir, "gjc"), "utf8")).toBe(payload);
+		expect(fs.readdirSync(sandbox.installDir)).toEqual(["gjc"]);
+	});
+
+	test("a reaped optional job never signals a modeled recycled PID", async () => {
+		const source = fs.readFileSync(installScript, "utf8");
+		const command = source.slice(source.indexOf("run_offer_command() {"), source.indexOf("prepare_community_app_runtime() {"));
+		// Interpose the signal boundary: a positive PID represents a recycled
+		// bystander, never a host process. Reap the real job between liveness and
+		// delivery, exactly where numerical kill authority used to become stale.
+		const harness = `${command}
+OFFER_RUNTIME_SIGNAL=""
+OFFER_RUNTIME_RETAIN=""
+kill() {
+    for target do :; done
+    case "$target" in
+        %%)
+            wait "$OFFER_RUNTIME_PID" || :
+            builtin kill "$@" 2>/dev/null || :
+            printf 'owned-job\\n'
+            ;;
+        *) printf 'recycled-bystander\\n'; return 1 ;;
+    esac
+}
+sleep() { :; }
+run_offer_command 0 /bin/sleep 1 || :
+`;
+		const child = Bun.spawn(["bash", "-c", harness], { stdout: "pipe", stderr: "pipe" });
+		const stdout = new Response(child.stdout).text();
+		const stderr = new Response(child.stderr).text();
+		expect(await child.exited).toBe(0);
+		expect(await stdout).toContain("owned-job");
+		expect(await stdout).not.toContain("recycled-bystander");
+		expect(await stderr).toBe("");
+	});
 	for (const phase of ["copy", "hash", "probe", "offer", "uncooperative-offer"] as const) {
 		for (const [signal, exitCode] of [["SIGTERM", 143], ["SIGINT", 130], ["SIGHUP", 129]] as const) {
 			test(`owns and reaps ${phase} on ${signal}, retaining the successful core install`, async () => {
@@ -552,6 +604,12 @@ describe("install.sh binary-first contract", () => {
 				const blocker = path.join(sandbox.root, "blocker.py");
 				fs.writeFileSync(blocker, `import os, signal, sys, time
 runtime = sys.argv[1]
+assert "MallocStackLogging" not in os.environ
+assert "MallocStackLoggingNoCompact" not in os.environ
+assert "GJC_MALLOC_ENV_REEXEC" not in os.environ
+# A fixture-owned deadline cleans up failed assertions without stale PID kills.
+signal.signal(signal.SIGALRM, lambda signum, frame: sys.exit(99))
+signal.alarm(25)
 def stop(signum, frame):
     with open(os.environ["GJC_TEST_OFFER_SIGNAL"], "a") as log:
         log.write(signal.Signals(signum).name + "\\n")
@@ -561,12 +619,15 @@ def stop(signum, frame):
 for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
     signal.signal(sig, stop)
 with open(os.environ["GJC_TEST_OFFER_MARKER"], "w") as marker:
-    marker.write(str(os.getpid()) + "|" + runtime)
+    marker.write(str(os.getpid()) + "|" + runtime + "|" + str(os.getppid()))
 while True:
     time.sleep(1)
 `);
 				const payload = `#!/bin/sh
-if [ "$1" = "--version" ]; then echo "gjc/${VERSION}"; exit 0; fi
+if [ "$1" = "--version" ]; then
+  [ "$MallocStackLogging" = 1 ] && [ "$MallocStackLoggingNoCompact" = 1 ] || exit 1
+  echo "gjc/${VERSION}"; exit 0
+fi
 if [ "$1" = "--smoke-test" ]; then exit 0; fi
 if [ "$1" = "--supports-macos-community-app" ]; then
   if [ "$GJC_TEST_PHASE" = probe ]; then exec python3 "$GJC_TEST_BLOCKER" "$0"; fi
@@ -606,7 +667,7 @@ exec python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1], "rb"
 						"gajae-release-binaries.sha256": `${sha256(payload)}  gjc-darwin-x64\n`,
 					},
 				});
-				const installer = Bun.spawn(["sh", installScript], {
+				const installer = Bun.spawn(["bash", installScript], {
 					env: {
 						...process.env,
 						PATH: `${sandbox.shimDir}:/usr/bin:/bin`,
@@ -622,6 +683,9 @@ exec python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1], "rb"
 						GJC_TEST_BLOCKER: blocker,
 						GJC_TEST_OFFER_MARKER: markerPath,
 						GJC_TEST_OFFER_SIGNAL: signalPath,
+						MallocStackLogging: "1",
+						MallocStackLoggingNoCompact: "1",
+						GJC_MALLOC_ENV_REEXEC: undefined,
 					},
 					stdout: "pipe",
 					stderr: "pipe",
@@ -637,15 +701,16 @@ exec python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1], "rb"
 						await Bun.sleep(50);
 					}
 					expect(marker).toContain("|");
-					const [pidText, runtimePath] = marker.split("|");
+					const [pidText, runtimePath, parentPid] = marker.split("|");
+					expect(Number(parentPid)).toBe(installer.pid);
 					runtimePid = Number(pidText);
 					expect(fs.existsSync(runtimePath)).toBe(true);
-					process.kill(installer.pid, signal);
+					installer.kill(signal);
 					for (let attempt = 0; attempt < 60 && !fs.existsSync(signalPath); attempt++) {
 						await Bun.sleep(50);
 					}
 					expect(fs.existsSync(signalPath)).toBe(true);
-					process.kill(installer.pid, signal === "SIGTERM" ? "SIGHUP" : "SIGTERM");
+					installer.kill(signal === "SIGTERM" ? "SIGHUP" : "SIGTERM");
 					await Bun.sleep(100);
 					expect(fs.existsSync(runtimePath)).toBe(true);
 					const result = await Promise.race([
@@ -666,9 +731,6 @@ exec python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1], "rb"
 					expect(await stdout).toContain(`Installed gjc ${VERSION}`);
 					await stderr;
 				} finally {
-					if (runtimePid) {
-						try { process.kill(runtimePid, "SIGKILL"); } catch {}
-					}
 					if (installer.exitCode === null) installer.kill("SIGKILL");
 					await installer.exited;
 					for (const name of fs.readdirSync(sandbox.installDir)) {
@@ -678,6 +740,123 @@ exec python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1], "rb"
 			}, 40_000);
 		}
 	}
+
+	// pty.fork establishes a private controlling terminal on macOS/Linux; redirect
+	// only fd 0 after the fork so terminal stdout cannot hide stdin promotion.
+	test.skipIf(process.platform !== "darwin" && process.platform !== "linux")(
+		"preserves nonTTY stdin with terminal stdout and a controlling tty for the verified offer runtime",
+		async () => {
+			const marker = path.join(sandbox.root, "runtime-fds");
+			const applications = path.join(sandbox.root, "Applications");
+			fs.mkdirSync(applications);
+			fs.writeFileSync(path.join(applications, "existing-app"), "unchanged");
+			const payload = `#!/bin/sh
+if [ "$1" = "--version" ]; then echo "gjc/${VERSION}"; exit 0; fi
+if [ "$1" = "--smoke-test" ]; then exit 0; fi
+if [ "$1" = "--supports-macos-community-app" ]; then exit 0; fi
+if [ "$1" = "--internal-macos-community-app-offer" ]; then
+  stdin=nonTTY; stdout=nonTTY; controlling=absent
+  [ ! -t 0 ] || stdin=TTY
+  [ ! -t 1 ] || stdout=TTY
+  if ( : < /dev/tty ) 2>/dev/null; then controlling=present; fi
+  printf '%s|%s|%s\\n' "$stdin" "$stdout" "$controlling" > "$GJC_TEST_FDS"
+  if [ -t 0 ]; then
+    echo 'FIXTURE OFFER PROMPT'
+    mkdir "$HOME/Applications/Gajae Community.app"
+  fi
+  exit 0
+fi
+exit 1
+`;
+			fs.writeFileSync(path.join(sandbox.shimDir, "uname"),
+				'#!/bin/sh\nif [ "$1" = "-s" ]; then echo Darwin; else echo x86_64; fi\n', { mode: 0o755 });
+			writeCurlShim(sandbox.shimDir, {
+				assets: {
+					"gjc-darwin-x64": payload,
+					"gajae-release-binaries.sha256": `${sha256(payload)}  gjc-darwin-x64\n`,
+				},
+			});
+			// No input is forwarded from the test runner and no host terminal settings
+			// are changed. Bound the whole private PTY session, including descendants.
+			const driver = `import errno, os, pty, select, signal, sys, time
+pid, master = pty.fork()
+if pid == 0:
+    fd = os.open(os.devnull, os.O_RDONLY)
+    os.dup2(fd, 0)
+    if fd != 0:
+        os.close(fd)
+    os.execv("/bin/bash", ["bash", sys.argv[1]])
+deadline = time.monotonic() + 15
+status = None
+try:
+    while True:
+        if time.monotonic() >= deadline:
+            raise TimeoutError("installer PTY session exceeded 15 seconds")
+        ready, _, _ = select.select([master], [], [], 0.1)
+        if ready:
+            try:
+                data = os.read(master, 65536)
+            except OSError as error:
+                if error.errno != errno.EIO:
+                    raise
+                data = b""
+            if not data:
+                break
+            sys.stdout.buffer.write(data)
+            sys.stdout.buffer.flush()
+    while status is None:
+        waited, result = os.waitpid(pid, os.WNOHANG)
+        if waited:
+            status = result
+        elif time.monotonic() >= deadline:
+            raise TimeoutError("installer did not exit after PTY close")
+        else:
+            time.sleep(0.05)
+finally:
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    os.close(master)
+    if status is None:
+        os.waitpid(pid, 0)
+sys.exit(os.waitstatus_to_exitcode(status))
+`;
+			const proc = Bun.spawn(["python3", "-c", driver, installScript], {
+				cwd: repoRoot,
+				stdin: "ignore",
+				stdout: "pipe",
+				stderr: "pipe",
+				env: {
+					...process.env,
+					PATH: `${sandbox.shimDir}:/usr/bin:/bin`,
+					GJC_INSTALL_DIR: sandbox.installDir,
+					HOME: sandbox.root,
+					GITHUB_TOKEN: "",
+					GH_TOKEN: "",
+					CI: "false",
+					GITHUB_ACTIONS: "false",
+					GJC_NONINTERACTIVE: "false",
+					GJC_NO_COMMUNITY_APP: "false",
+					GJC_TEST_FDS: marker,
+				},
+			});
+			const [stdout, stderr, exitCode] = await Promise.all([
+				new Response(proc.stdout).text(),
+				new Response(proc.stderr).text(),
+				proc.exited,
+			]);
+			expect(stderr).toBe("");
+			expect(exitCode).toBe(0);
+			expect(stdout).toContain(`Installed gjc ${VERSION}`);
+			expect(fs.readFileSync(marker, "utf8")).toBe("nonTTY|TTY|present\n");
+			expect(stdout).not.toContain("FIXTURE OFFER PROMPT");
+			expect(fs.readFileSync(path.join(sandbox.installDir, "gjc"), "utf8")).toBe(payload);
+			expect(fs.readdirSync(sandbox.installDir)).toEqual(["gjc"]);
+			expect(fs.readdirSync(applications)).toEqual(["existing-app"]);
+			expect(fs.readFileSync(path.join(applications, "existing-app"), "utf8")).toBe("unchanged");
+		}, 20_000,
+	);
 
 	for (const scenario of ["supported", "unsupported", "replacement", "suppressed"] as const) {
 		test(`optional runtime ${scenario} preserves core success and executes only a verified snapshot`, async () => {
@@ -719,7 +898,7 @@ exec /bin/cp "$@"
 				GJC_TEST_SCENARIO: scenario,
 				GJC_TEST_CALLS: marker,
 				GJC_TEST_REPLACEMENT: replacement,
-			});
+			}, { shell: "bash" });
 			expect(result.exitCode).toBe(0);
 			expect(result.stdout).toContain(`Installed gjc ${VERSION}`);
 			expect(fs.readFileSync(path.join(sandbox.installDir, "gjc"), "utf8")).toBe(payload);

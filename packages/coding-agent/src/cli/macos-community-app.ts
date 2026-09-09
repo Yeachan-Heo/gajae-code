@@ -12,6 +12,14 @@ export const COMMUNITY_APP_REPOSITORY = "devswha/gajae-code-app";
 export const COMMUNITY_APP_BUNDLE_ID = "app.gajae.desktop";
 export const COMMUNITY_APP_TEAM_ID = "5987KT43TJ";
 export const COMMUNITY_APP_SIGNING_AUTHORITY = "Developer ID Application: sangwoo ha";
+const COMMUNITY_APP_SIGNING_REQUIREMENT = [
+	"anchor apple generic",
+	`identifier "${COMMUNITY_APP_BUNDLE_ID}"`,
+	"certificate 1[field.1.2.840.113635.100.6.2.6] exists",
+	"certificate leaf[field.1.2.840.113635.100.6.1.13] exists",
+	`certificate leaf[subject.OU] = "${COMMUNITY_APP_TEAM_ID}"`,
+	`certificate leaf[subject.CN] = "${COMMUNITY_APP_SIGNING_AUTHORITY} (${COMMUNITY_APP_TEAM_ID})"`,
+].join(" and ");
 export const COMMUNITY_APP_SUPPRESS_ENV = "GJC_NO_COMMUNITY_APP";
 const GITHUB_API_ORIGIN = "https://api.github.com";
 const GITHUB_RELEASE_ORIGIN = "https://github.com";
@@ -658,17 +666,17 @@ async function resolveVerifiedExecutable(bundlePath: string, executable: string)
 }
 
 async function hasExpectedDeveloperIdSignature(bundlePath: string, command: CommandRunner): Promise<boolean> {
-	const result = await command(["/usr/bin/codesign", "--display", "--verbose=4", bundlePath]);
+	const result = await command([
+		"/usr/bin/codesign",
+		"--verify",
+		"--deep",
+		"--strict",
+		"-R",
+		`=${COMMUNITY_APP_SIGNING_REQUIREMENT}`,
+		bundlePath,
+	]);
 	requireReapedVerifier(result);
-	if (result.exitCode !== 0) return false;
-	const records = `${result.stdout}\n${result.stderr}`
-		.split(/\r?\n/)
-		.map(line => line.trim())
-		.filter(Boolean);
-	return (
-		records.includes(`Authority=${COMMUNITY_APP_SIGNING_AUTHORITY} (${COMMUNITY_APP_TEAM_ID})`) &&
-		records.includes(`TeamIdentifier=${COMMUNITY_APP_TEAM_ID}`)
-	);
+	return result.exitCode === 0;
 }
 
 async function isVerifiedCommunityApp(
@@ -680,9 +688,6 @@ async function isVerifiedCommunityApp(
 	const executable = await readBundleValue(bundlePath, "CFBundleExecutable", command);
 	const executablePath = executable ? await resolveVerifiedExecutable(bundlePath, executable) : undefined;
 	if (!executablePath) return false;
-	const signature = await command(["/usr/bin/codesign", "--verify", "--deep", "--strict", bundlePath]);
-	requireReapedVerifier(signature);
-	if (signature.exitCode !== 0) return false;
 	if (!(await hasExpectedDeveloperIdSignature(bundlePath, command))) return false;
 	const policyAssessment = await command(["/usr/sbin/spctl", "--assess", "--type", "execute", bundlePath]);
 	requireReapedVerifier(policyAssessment);
@@ -1061,9 +1066,6 @@ export async function offerMacosCommunityApp(
 		if (!executable) return failure("the app bundle has no executable identity", log);
 		const executablePath = await resolveVerifiedExecutable(sourceApp, executable);
 		if (!executablePath) return failure("the app bundle executable path was unsafe", log);
-		const signature = await command(["/usr/bin/codesign", "--verify", "--deep", "--strict", sourceApp]);
-		if (signature.exitCode !== 0 || signature.reaped === false)
-			return failure("the app bundle signature could not be verified", log);
 		if (!(await hasExpectedDeveloperIdSignature(sourceApp, command)))
 			return failure("the app bundle was signed by an unexpected publisher", log);
 		const policyAssessment = await command(["/usr/sbin/spctl", "--assess", "--type", "execute", sourceApp]);
@@ -1143,18 +1145,6 @@ export async function offerMacosCommunityApp(
 			: undefined;
 		if (!copiedExecutable || copiedExecutable !== executable || !copiedExecutablePath)
 			throw new Error("the copied app executable identity changed");
-		const copiedSignature = await command([
-			"/usr/bin/codesign",
-			"--verify",
-			"--deep",
-			"--strict",
-			stagingDestination,
-		]);
-		if (copiedSignature.reaped === false) {
-			cleanupUnsafe = true;
-			throw new Error("copied app signature helper did not terminate safely");
-		}
-		if (copiedSignature.exitCode !== 0) throw new Error("the copied app signature could not be verified");
 		if (!(await hasExpectedDeveloperIdSignature(stagingDestination, command)))
 			throw new Error("the copied app was signed by an unexpected publisher");
 		const copiedPolicyAssessment = await command([

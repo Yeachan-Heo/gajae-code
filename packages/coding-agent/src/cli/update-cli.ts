@@ -9,7 +9,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { pipeline } from "node:stream/promises";
-import { $which, APP_NAME, isCompiledBinary, isEnoent, logger, redactCrashSecrets, VERSION } from "@gajae-code/utils";
+import { $which, APP_NAME, isCompiledBinary, isEnoent, redactCrashSecrets, VERSION } from "@gajae-code/utils";
 import { $ } from "bun";
 import chalk from "chalk";
 import { Settings } from "../config/settings";
@@ -1278,12 +1278,14 @@ async function offerCommunityAppAfterUpdate(deps: UpdateCommandDependencies): Pr
 	try {
 		await (deps.offerMacosCommunityApp ?? offerMacosCommunityApp)({
 			platform,
-			log: message => logger.warn(message),
+			log: message => {
+				process.stderr.write(`${message}\n`);
+			},
 		});
 	} catch (error) {
 		const reason = sanitizeVerificationOutput(error instanceof Error ? error.message : String(error));
-		logger.warn(
-			`Optional community app offer failed: ${reason ?? "unknown error"}. GJC remains installed. https://github.com/${COMMUNITY_APP_REPOSITORY}`,
+		process.stderr.write(
+			`Optional community app offer failed: ${reason ?? "unknown error"}. GJC remains installed. https://github.com/${COMMUNITY_APP_REPOSITORY}\n`,
 		);
 	}
 }
