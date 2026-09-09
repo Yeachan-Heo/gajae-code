@@ -1657,7 +1657,12 @@ export class SessionRouter {
 			existing !== undefined &&
 			existing.endpoint.url === endpoint.url &&
 			existing.endpoint.token === endpoint.token &&
-			sameIndexedAuthority(existing.indexed, indexed) &&
+			// The freshly listed record is the expectation; the retained one is what
+			// must still satisfy it. Optional authority fields (lifecycleRequestId,
+			// incarnations) are only enforced when the expectation carries them, so
+			// passing the retained record as `expected` would demand fields a bare
+			// index row never has and tear down a live transport mid-replay.
+			sameIndexedAuthority(indexed, existing.indexed) &&
 			endpointIdentity !== undefined &&
 			sameEndpointIdentity(existing.endpointIdentity, endpointIdentity);
 		if (
