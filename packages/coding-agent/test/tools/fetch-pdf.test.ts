@@ -31,7 +31,7 @@ function pdfFixture(text: string): string {
 describe("PDF URL source-text inspection", () => {
 	let server: Bun.Server<undefined>;
 	let session: ToolSession;
-	let body: string;
+	let body: string | Buffer;
 	let contentType: string;
 	let requests: number;
 
@@ -145,6 +145,25 @@ describe("PDF URL source-text inspection", () => {
 		expect(result.details.method).toBe("failed");
 		expect(result.details.notes).toContain("Binary fetch failed: HTTP 503");
 		expect(result.output).not.toContain("%PDF-");
+	});
+
+	it("retains inline images when a .pdf URL actually serves PNG", async () => {
+		contentType = "image/png";
+		body = Buffer.from(
+			"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC",
+			"base64",
+		);
+		const result = await new ReadTool(session).execute("read-pdf-image", {
+			path: new URL("image.pdf", server.url).href,
+		});
+		expect(result.details?.method).toBe("image");
+		const image = result.content.find(item => item.type === "image");
+		if (image?.type !== "image") throw new Error("expected inline image");
+		expect(image.mimeType).toBe("image/png");
+		expect(image.data).toBe(body.toString("base64"));
+		const metadata = await new Bun.Image(Buffer.from(image.data, "base64")).metadata();
+		expect(metadata.width).toBe(1);
+		expect(metadata.height).toBe(1);
 	});
 
 	it("retains HTML fallback when a .pdf URL actually serves HTML", async () => {

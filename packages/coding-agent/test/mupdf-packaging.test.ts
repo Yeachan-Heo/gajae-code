@@ -73,7 +73,7 @@ if (mode === "success") {
 		id: "red-rectangle", pageNumber: 1,
 		bbox: { x: 50, y: 70, w: 100, h: 80 }, topY: 130,
 	});
-	const mupdf = await import("mupdf");
+	const mupdf = await import(${JSON.stringify(Bun.resolveSync("mupdf", path.dirname(fileURLToPath(import.meta.resolve("markit-ai")))))});
 	const image = new mupdf.Image(png);
 	const pixmap = image.toPixmap();
 	try {
@@ -103,6 +103,8 @@ interface ConversionOutput {
 	file?: { ok: boolean; content: string; error?: string };
 	mapping: string;
 	faultedReads?: number;
+	wasmValid?: boolean;
+	loaderError?: { name: string; message: string };
 	recovery?: { ok: boolean; content: string; error?: string };
 	rendered?: { signature: number[]; width: number; height: number; center: number[]; corner: number[] };
 }
@@ -158,9 +160,26 @@ console.log(JSON.stringify({ buffer: { ok: true, content: "" }, mapping: mupdfAs
 				);
 				const lazyOutput = await runIsolated([process.execPath, lazyEntry], directory);
 				expect(lazyOutput.mapping).toContain("unresolved");
-				const dependency = path.join(layout === "nested" ? installed : directory, "node_modules/mupdf");
-				const original = path.dirname(path.dirname(fileURLToPath(import.meta.resolve("mupdf"))));
+				const dependencies = path.join(layout === "nested" ? installed : directory, "node_modules");
+				const markit = path.join(dependencies, "markit-ai");
+				await fs.mkdir(markit, { recursive: true });
+				await Bun.write(path.join(markit, "package.json"), JSON.stringify({ name: "markit-ai", main: "index.js" }));
+				await Bun.write(path.join(markit, "index.js"), "export {};\n");
+				const dependency = path.join(markit, "node_modules/mupdf");
+				const original = path.dirname(
+					path.dirname(Bun.resolveSync("mupdf", path.dirname(fileURLToPath(import.meta.resolve("markit-ai"))))),
+				);
 				await fs.cp(original, dependency, { recursive: true, dereference: true });
+				// A distinct direct version must never supply the transitive loader's
+				// asset. Its invalid WASM makes accidental direct resolution fail.
+				const direct = path.join(dependencies, "mupdf");
+				await fs.mkdir(path.join(direct, "dist"), { recursive: true });
+				await Bun.write(
+					path.join(direct, "package.json"),
+					JSON.stringify({ name: "mupdf", version: "0.0.0", main: "dist/mupdf.js" }),
+				);
+				await Bun.write(path.join(direct, "dist/mupdf.js"), "export {};\n");
+				await Bun.write(path.join(direct, "dist/mupdf-wasm.wasm"), new Uint8Array([0, 1, 2, 3]));
 				const entry = path.join(installed, "probe.ts");
 				await Bun.write(
 					entry,
@@ -175,6 +194,104 @@ console.log(JSON.stringify({ buffer: { ok: true, content: "" }, mapping: mupdfAs
 				expect(output.buffer.ok).toBe(true);
 				expect(output.mapping).toContain(await fs.realpath(dependency));
 				expect(output.mapping).not.toContain(repoRoot);
+				expect(output.mapping).toContain(path.join(await fs.realpath(dependency), "dist/mupdf.js"));
+				expect(output.mapping).not.toContain(`${direct}${path.sep}`);
+				const scripts = path.join(installed, "scripts");
+				await fs.mkdir(scripts);
+				await fs.copyFile(path.join(packageRoot, "scripts/embed-mupdf.ts"), path.join(scripts, "embed-mupdf.ts"));
+				await Bun.write(
+					entry,
+					`
+import { generateMuPdfAsset } from "./scripts/embed-mupdf";
+await generateMuPdfAsset();
+console.log(JSON.stringify({ buffer: { ok: true, content: "" }, mapping: await Bun.file(new URL("./src/utils/mupdf-embedded.ts", import.meta.url)).text() }));
+`,
+				);
+				const generated = await runIsolated([process.execPath, entry], directory);
+				expect(generated.mapping).toContain(
+					JSON.stringify(path.join(await fs.realpath(dependency), "dist/mupdf-wasm.wasm")),
+				);
+				expect(generated.mapping).toContain(
+					JSON.stringify(path.join(await fs.realpath(dependency), "dist/mupdf.js")),
+				);
+				expect(generated.mapping).not.toContain(JSON.stringify(path.join(direct, "dist/mupdf-wasm.wasm")));
+			} finally {
+				await fs.rm(directory, { recursive: true, force: true });
+			}
+		});
+	}
+
+	for (const fault of ["missing", "corrupt"] as const) {
+		it(`preserves the original ${fault} JS loader error through the source conversion wrapper`, async () => {
+			const directory = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-mupdf-loader-"));
+			try {
+				const utils = path.join(directory, "src/utils");
+				await fs.mkdir(utils, { recursive: true });
+				for (const name of ["markit.ts", "mupdf.ts", "mupdf-embedded.ts"]) {
+					await fs.copyFile(path.join(packageRoot, "src/utils", name), path.join(utils, name));
+				}
+				await fs.mkdir(path.join(directory, "src/tools"));
+				await fs.copyFile(
+					path.join(packageRoot, "src/tools/tool-errors.ts"),
+					path.join(directory, "src/tools/tool-errors.ts"),
+				);
+				const modules = path.join(directory, "node_modules");
+				const markit = path.join(modules, "markit-ai");
+				const originalMarkit = path.dirname(path.dirname(fileURLToPath(import.meta.resolve("markit-ai"))));
+				await fs.cp(originalMarkit, markit, {
+					recursive: true,
+					dereference: true,
+					filter: source => path.basename(source) !== "node_modules",
+				});
+				const manifest = await Bun.file(path.join(originalMarkit, "package.json")).json();
+				for (const name of Object.keys(manifest.dependencies)) {
+					if (name === "mupdf") continue;
+					await fs.symlink(
+						await fs.realpath(path.join(repoRoot, "node_modules", name)),
+						path.join(modules, name),
+						"dir",
+					);
+				}
+				await fs.mkdir(path.join(modules, "@gajae-code"));
+				await fs.symlink(path.join(repoRoot, "packages/utils"), path.join(modules, "@gajae-code/utils"), "dir");
+				const originalMuPdf = path.dirname(
+					path.dirname(Bun.resolveSync("mupdf", path.join(originalMarkit, "dist"))),
+				);
+				const dependency = path.join(markit, "node_modules/mupdf");
+				await fs.cp(originalMuPdf, dependency, { recursive: true, dereference: true });
+				// Only the temporary package is damaged. Its real WASM stays intact.
+				const loader = path.join(dependency, "dist/mupdf-wasm.js");
+				if (fault === "missing") await fs.rm(loader);
+				else await Bun.write(loader, "export const broken = ;\n");
+				const entry = path.join(directory, "probe.ts");
+				await Bun.write(
+					entry,
+					`
+import { convertBufferWithMarkit } from "./src/utils/markit";
+import { mupdfAssetMapping } from "./src/utils/mupdf";
+const buffer = await convertBufferWithMarkit(Buffer.from(${JSON.stringify(dummyPdf())}), ".pdf");
+const wasmValid = WebAssembly.validate(globalThis.$libmupdf_wasm_Module.wasmBinary);
+let loaderError;
+try { await import(${JSON.stringify(path.join(dependency, "dist/mupdf.js"))}); }
+catch (error) { loaderError = { name: error.name, message: error.message }; }
+const recovery = await convertBufferWithMarkit(Buffer.from("<h1>Still usable</h1>"), ".html");
+await new Promise(resolve => setTimeout(resolve, 20));
+console.log(JSON.stringify({ buffer, wasmValid, loaderError, recovery, mapping: mupdfAssetMapping }));
+`,
+				);
+				const output = await runIsolated([process.execPath, entry], directory);
+				expect(output.wasmValid).toBe(true);
+				expect(output.buffer.ok).toBe(false);
+				expect(output.buffer.content).toBe("");
+				expect(output.buffer.error).toContain("AggregateError");
+				expect(output.buffer.error).toContain("MuPDF module initialization failed");
+				expect(output.loaderError?.message).toBeTruthy();
+				expect(output.buffer.error).toContain(`${output.loaderError!.name}: ${output.loaderError!.message}`);
+				if (fault === "missing") expect(output.loaderError?.message).toContain("mupdf-wasm.js");
+				else expect(output.loaderError?.name).toBe("BuildMessage");
+				expect(output.mapping).toContain(path.join(await fs.realpath(dependency), "dist/mupdf.js"));
+				expect(output.recovery?.ok).toBe(true);
+				expect(output.recovery?.content).toContain("Still usable");
 			} finally {
 				await fs.rm(directory, { recursive: true, force: true });
 			}
@@ -270,7 +387,10 @@ catch (error) { console.log(JSON.stringify({ buffer: { ok: false, content: "", e
 					center: [255, 0, 0],
 					corner: [255, 255, 255],
 				});
-				if (channel !== "source") expect(success.mapping).toContain("$bunfs");
+				if (channel !== "source") {
+					expect(success.mapping).toContain("$bunfs");
+					expect(success.mapping).toContain("build-time provenance");
+				}
 
 				for (const mode of ["invalid-pdf", "wasm-failure"]) {
 					const failure = await runIsolated([...command, mode], runtimeDir);
