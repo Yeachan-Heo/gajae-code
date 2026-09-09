@@ -620,6 +620,21 @@ function validateTranscriptRecords(records: unknown[]): void {
 	}
 }
 
+/**
+ * Crystallization treats a project transcript as authoritative conversation
+ * evidence, so only transcripts written by the session manager's managed
+ * containers (`agent-session/`, `sessions/`) are eligible. The shared project
+ * classifier additionally accepts legacy root-level `.gjc/*.jsonl` files, which
+ * any repository content can forge with a matching header; those are rejected
+ * here before evidence or approval binding.
+ */
+function isManagedProjectSessionTranscriptPath(projectGjcDir: string, filePath: string): boolean {
+	if (!isProjectSessionTranscriptPath(projectGjcDir, filePath)) return false;
+	const relative = path.relative(projectGjcDir, filePath);
+	const segments = relative.split(path.sep);
+	return segments.length >= 2;
+}
+
 export async function authoritativeConversationSnapshot(
 	cwd: string,
 	sessionId: string,
@@ -640,7 +655,7 @@ export async function authoritativeConversationSnapshot(
 			const explicitRealPath = await fs.realpath(sessionFile);
 			if (explicitRealPath !== sessionFile) throw new Error("symlink transcript");
 			sessionFile = explicitRealPath;
-			explicitProjectTranscript = isProjectSessionTranscriptPath(path.resolve(cwd, ".gjc"), explicitRealPath);
+			explicitProjectTranscript = isManagedProjectSessionTranscriptPath(path.resolve(cwd, ".gjc"), explicitRealPath);
 			if (
 				explicitProjectTranscript &&
 				!readAuthorizedProjectSessionTranscript(
@@ -658,7 +673,14 @@ export async function authoritativeConversationSnapshot(
 	const managedCandidates = new Set<string>();
 	const lexicalCandidates = new Set<string>();
 	if (!sessionFile) {
-		for (const candidate of listProjectSessionTranscriptFiles(cwd)) lexicalCandidates.add(path.resolve(candidate));
+		const projectGjcDir = path.resolve(cwd, ".gjc");
+		for (const candidate of listProjectSessionTranscriptFiles(cwd)) {
+			const resolved = path.resolve(candidate);
+			// Legacy root-level `.gjc/*.jsonl` files are listed for session resume
+			// compatibility, but they are not trusted-writer provenance, so they can
+			// never become authoritative crystallization evidence.
+			if (isManagedProjectSessionTranscriptPath(projectGjcDir, resolved)) lexicalCandidates.add(resolved);
+		}
 	}
 	if (!explicitProjectTranscript) {
 		const managedScope = await resolveManagedSessionScope({ cwd });
@@ -696,7 +718,7 @@ export async function authoritativeConversationSnapshot(
 		for (const candidate of [...canonicalCandidates].sort()) {
 			try {
 				const projectGjcDir = path.resolve(cwd, ".gjc");
-				const bytes = isProjectSessionTranscriptPath(projectGjcDir, candidate)
+				const bytes = isManagedProjectSessionTranscriptPath(projectGjcDir, candidate)
 					? readAuthorizedProjectSessionTranscript(projectGjcDir, candidate, RESUME_TRANSCRIPT_MAX_BYTES)
 					: await readBoundedFileBytes(candidate, RESUME_TRANSCRIPT_MAX_BYTES, "session transcript", {
 							allowMissing: true,
@@ -721,7 +743,7 @@ export async function authoritativeConversationSnapshot(
 		throw new DeepInterviewCommandError(2, "an authenticated session transcript is required for crystallization");
 	try {
 		const projectGjcDir = path.resolve(cwd, ".gjc");
-		const bytes = isProjectSessionTranscriptPath(projectGjcDir, sessionFile)
+		const bytes = isManagedProjectSessionTranscriptPath(projectGjcDir, sessionFile)
 			? readAuthorizedProjectSessionTranscript(projectGjcDir, sessionFile, RESUME_TRANSCRIPT_MAX_BYTES)
 			: await readBoundedFileBytes(sessionFile, RESUME_TRANSCRIPT_MAX_BYTES, "live session transcript");
 		if (!bytes) throw new DeepInterviewCommandError(2, "live session transcript is unavailable");
