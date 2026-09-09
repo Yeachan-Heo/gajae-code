@@ -1,6 +1,8 @@
 #!/usr/bin/env bun
 
 import * as path from "node:path";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
 
 const SHA40 = /^[0-9a-f]{40}$/u;
 const SHA256 = /^[0-9a-f]{64}$/u;
@@ -337,7 +339,7 @@ interface PullRequestEvent {
 		number?: number;
 		body?: string | null;
 		user?: { login?: string };
-		base?: { ref?: string; sha?: string };
+		base?: { ref?: string; sha?: string; repo?: { full_name?: string } };
 		head?: { sha?: string };
 	};
 	/** issue_comment events carry the PR under issue.number instead of pull_request. */
@@ -401,10 +403,9 @@ function issueCommentToSelfReview(comment: IssueComment): AuthenticatedSelfRevie
 	return { login, authorAssociation: comment.author_association ?? "NONE", body: comment.body };
 }
 
-async function authenticatedApproval(event: PullRequestEvent, reviewerId: string, headSha: string): Promise<{ login?: string; headSha?: string }> {
+export async function authenticatedApproval(event: PullRequestEvent, reviewerId: string, headSha: string, token = Bun.env.GITHUB_TOKEN): Promise<{ login?: string; headSha?: string }> {
 	const repository = event.repository?.full_name;
 	const number = event.pull_request?.number;
-	const token = Bun.env.GITHUB_TOKEN;
 	if (!repository || !number || !token) return {};
 	const reviews: PullRequestReview[] = [];
 	for (let page = 1; ; page++) {
@@ -502,42 +503,102 @@ async function runFastGate(cwd: string, trustedRoot: string): Promise<boolean> {
 	return (await child.exited) === 0;
 }
 
+async function runPushedTreeFastGate(cwd: string, trustedRoot: string, headSha: string): Promise<boolean> {
+	const tree = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-pushed-tree-"));
+	try {
+		const listed = await git(["ls-tree", "-rz", "--full-tree", headSha, "--", "packages/coding-agent/src"], cwd);
+		if (listed.exitCode !== 0) return false;
+		const files: { oid: string; name: string }[] = [];
+		for (const entry of new TextDecoder("utf-8", { fatal: true }).decode(listed.stdout).split("\0").filter(Boolean)) {
+			const match = /^(100644|100755|120000|160000) (blob|commit) ([0-9a-f]{40})\t([\s\S]+)$/u.exec(entry);
+			if (!match) return false;
+			// Unsupported source entries must not disappear from the scan or escape it.
+			if (match[1] === "120000" || match[1] === "160000" || match[2] !== "blob") return false;
+			const name = match[4]!;
+			if (!name.startsWith("packages/coding-agent/src/") || name.split("/").some(part => !part || part === "." || part === "..")) return false;
+			files.push({ oid: match[3]!, name });
+		}
+		await fs.mkdir(path.join(tree, "packages/coding-agent/src"), { recursive: true });
+		// Raw blobs bypass export-ignore/export-subst, checkout filters and dirty files.
+		const batch = Bun.spawn(["git", "cat-file", "--batch"], {
+			cwd, stdin: new Blob([files.map(file => `${file.oid}\n`).join("")]), stdout: "pipe", stderr: "pipe",
+		});
+		const [bytes, , exitCode] = await Promise.all([new Response(batch.stdout).bytes(), new Response(batch.stderr).text(), batch.exited]);
+		if (exitCode !== 0) return false;
+		let offset = 0;
+		for (const file of files) {
+			const end = bytes.indexOf(10, offset);
+			if (end < 0) return false;
+			const header = new TextDecoder().decode(bytes.subarray(offset, end));
+			const match = /^([0-9a-f]{40}) blob ([0-9]+)$/u.exec(header);
+			if (!match || match[1] !== file.oid) return false;
+			const size = Number(match[2]);
+			offset = end + 1;
+			if (!Number.isSafeInteger(size) || size > bytes.length - offset - 1 || bytes[offset + size] !== 10) return false;
+			const target = path.join(tree, file.name);
+			await fs.mkdir(path.dirname(target), { recursive: true });
+			await fs.writeFile(target, bytes.subarray(offset, offset + size), { flag: "wx" });
+			offset += size + 1;
+		}
+		if (offset !== bytes.length) return false;
+		return await runFastGate(tree, trustedRoot);
+	} catch (error) {
+		console.error(`Could not materialize pushed source tree: ${error instanceof Error ? error.message : String(error)}`);
+		return false;
+	} finally {
+		await fs.rm(tree, { recursive: true, force: true });
+	}
+}
+
 /**
- * issue_comment events carry no pull_request object; the PR is identified by the
- * comment's issue number when that issue is a pull request. Resolve the authoritative
- * PR data (body, author, immutable base, exact head) from the GitHub API using the
- * trusted workflow token so comment-triggered validations use the same immutable
- * event semantics as pull_request events. Non-PR comments resolve to no PR and fail.
+ * Comment events resolve their PR through the authenticated API as before.
+ * Review events refresh only mutable body text: every captured authority binding
+ * must still match. A rerun must never validate a different source or target.
  */
-async function resolvePullRequestEvent(event: PullRequestEvent): Promise<PullRequestEvent> {
-	if (event.pull_request) return event;
+export async function resolvePullRequestEvent(
+	event: PullRequestEvent,
+	eventName = Bun.env.GITHUB_EVENT_NAME,
+	token = Bun.env.GITHUB_TOKEN,
+	request: (url: string, init: RequestInit) => Promise<Response> = fetch,
+): Promise<PullRequestEvent> {
+	const refreshBody = eventName === "pull_request_review";
+	if (event.pull_request && !refreshBody) return event;
+	const captured = event.pull_request;
 	const repository = event.repository?.full_name;
-	const number = event.issue?.number;
-	const token = Bun.env.GITHUB_TOKEN;
+	const number = refreshBody ? captured?.number : event.issue?.number;
+	if (refreshBody && (
+		!repository || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/u.test(repository) ||
+		!Number.isSafeInteger(number) || !number || number < 1 || !token ||
+		!captured?.user?.login || !captured.base?.ref ||
+		captured.base.repo?.full_name !== repository ||
+		!SHA40.test(captured.base.sha ?? "") || !SHA40.test(captured.head?.sha ?? "")
+	)) throw new Error("Review event PR authority is incomplete; failing closed.");
 	if (!repository || !number || !token) return event;
-	const response = await fetch(`https://api.github.com/repos/${repository}/pulls/${number}`, {
+	const response = await request(`https://api.github.com/repos/${repository}/pulls/${number}`, {
 		headers: {
 			Accept: "application/vnd.github+json",
 			Authorization: `Bearer ${token}`,
 			"X-GitHub-Api-Version": "2022-11-28",
 		},
 	});
-	if (!response.ok) return event;
-	const pr = await response.json() as {
-		body?: string | null;
-		user?: { login?: string };
-		base?: { ref?: string; sha?: string };
-		head?: { sha?: string };
-	};
+	if (!response.ok) {
+		if (refreshBody) throw new Error(`Review event PR refresh failed: ${response.status}; failing closed.`);
+		return event;
+	}
+	const pr = await response.json() as NonNullable<PullRequestEvent["pull_request"]>;
+	if (refreshBody) {
+		if (!pr || typeof pr !== "object" || Array.isArray(pr) ||
+			(pr.body !== null && typeof pr.body !== "string") ||
+			pr.number !== number || pr.base?.repo?.full_name !== repository ||
+			pr.user?.login !== captured!.user!.login ||
+			pr.base?.ref !== captured!.base!.ref || pr.base?.sha !== captured!.base!.sha ||
+			pr.head?.sha !== captured!.head!.sha
+		) throw new Error("Review event PR authority drift or malformed live metadata; failing closed.");
+		return { ...event, pull_request: { ...captured, body: pr.body } };
+	}
 	return {
 		...event,
-		pull_request: {
-			number,
-			body: pr.body,
-			user: pr.user,
-			base: pr.base,
-			head: pr.head,
-		},
+		pull_request: { number, body: pr.body, user: pr.user, base: pr.base, head: pr.head },
 	};
 }
 
@@ -691,6 +752,137 @@ async function validatePreflight(command: string, cwd: string, trustedRoot: stri
 	return validatePrContract({ body, baseRef, baseSha, headSha, authorLogin: author, computedDiffSha256: diff.exitCode === 0 ? canonicalDiffSha256(diff.stdout) : "", baseIsAncestor: ancestry.exitCode === 0, fastGatePassed: await runFastGate(cwd, trustedRoot), requireMergeApproved: false });
 }
 
+async function gh(args: string[], cwd: string): Promise<{ exitCode: number; stdout: string; stderr: string }> {
+	const child = Bun.spawn(["gh", ...args], { cwd, env: { ...process.env, GH_HOST: "github.com" }, stdout: "pipe", stderr: "pipe" });
+	const [stdout, stderr, exitCode] = await Promise.all([
+		new Response(child.stdout).text(),
+		new Response(child.stderr).text(),
+		child.exited,
+	]);
+	return { exitCode, stdout, stderr: stderr.trim() };
+}
+
+interface LivePullRequest {
+	number: number;
+	body: string | null;
+	base: { ref: string };
+	user: { login: string } | null;
+	head: { ref: string; repo: { owner: { login: string } } | null };
+}
+
+/**
+ * Resolve the GitHub `owner/repo` actually receiving the push. A fork checkout's `origin`
+ * is the fork while the open PR lives upstream, so the implicit `gh` context would query
+ * the wrong repository (or none) and wave the push through.
+ */
+async function pushRemoteRepository(remote: string, cwd: string, destination?: string): Promise<string | null> {
+	let text = destination ?? remote;
+	if (destination === undefined && !remote.includes(":")) {
+		const url = await git(["remote", "get-url", "--push", "--all", remote], cwd);
+		if (url.exitCode !== 0) return null;
+		text = new TextDecoder().decode(url.stdout).trim();
+	}
+	// Only github.com is authenticated by the gh calls below. Unknown hosts, paths,
+	// and multiple configured push destinations must never inherit that authority.
+	const match = /^(?:git@github\.com:|https:\/\/github\.com\/|ssh:\/\/git@github\.com\/)([A-Za-z0-9-]+)\/([A-Za-z0-9_.-]+?)(?:\.git)?$/u.exec(text);
+	return match && match[2] !== "." && match[2] !== ".." ? `${match[1]}/${match[2]}` : null;
+}
+
+/**
+ * The repository whose PRs govern a push to `pushRepo`. Pushing a fork branch opens the
+ * PR upstream, so a fork resolves to its parent; a non-fork is its own authority.
+ */
+async function contractRepository(pushRepo: string, cwd: string): Promise<{ repo: string; forkOwner: string | null } | null> {
+	const viewed = await gh(["repo", "view", pushRepo, "--json", "isFork,parent"], cwd);
+	if (viewed.exitCode !== 0) return null;
+	try {
+		const info = JSON.parse(viewed.stdout) as { isFork?: boolean; parent?: { owner?: { login?: string }; name?: string } | null };
+		if (info.isFork === false) return { repo: pushRepo, forkOwner: null };
+		if (info.isFork !== true) return null;
+		const parentOwner = info.parent?.owner?.login;
+		const parentName = info.parent?.name;
+		if (typeof parentOwner !== "string" || !/^[A-Za-z0-9-]+$/u.test(parentOwner)
+			|| typeof parentName !== "string" || !/^[A-Za-z0-9_.-]+$/u.test(parentName)
+			|| parentName === "." || parentName === "..") return null;
+		return { repo: `${parentOwner}/${parentName}`, forkOwner: pushRepo.split("/")[0]! };
+	} catch {
+		return null;
+	}
+}
+
+/** Validate local contract structure and exact pushed bytes, not merge authorization. */
+async function validatePushPreflight(branch: string, headSha: string, remote: string, cwd: string, trustedRoot: string, destination?: string): Promise<PrValidationResult> {
+	if (!SHA40.test(headSha)) return { ok: false, diagnostics: [`Pushed commit ${headSha} is not a lowercase 40-hex commit.`] };
+	const pushRepo = await pushRemoteRepository(remote, cwd, destination);
+	if (!pushRepo) return { ok: false, diagnostics: [`Could not resolve the GitHub repository behind push remote ${remote}; refusing to validate against an unknown repository.`] };
+	// A fork push opens its PR upstream, so the contract lives in the parent repository.
+	const authority = await contractRepository(pushRepo, cwd);
+	if (!authority) return { ok: false, diagnostics: [`Could not establish the PR contract repository for ${pushRepo}; repository fork metadata must identify an explicit non-fork or a valid parent.`] };
+	const { repo: baseRepo, forkOwner } = authority;
+	// The head is qualified by the owner actually receiving the push, so a same-named
+	// branch in another fork can never be mistaken for this PR.
+	const headOwner = forkOwner ?? pushRepo.split("/")[0]!;
+	const candidates: LivePullRequest[] = [];
+	// REST pagination is supported by older gh releases. Explicit pages avoid relying
+	// on newer --slurp support or parsing concatenated JSON documents from --paginate.
+	for (let page = 1; ; page++) {
+		const endpoint = `repos/${baseRepo}/pulls?state=open&head=${encodeURIComponent(`${headOwner}:${branch}`)}&per_page=100&page=${page}`;
+		const listed = await gh(["api", endpoint], cwd);
+		if (listed.exitCode !== 0) return { ok: false, diagnostics: [`Could not resolve the open PR for ${branch} in ${baseRepo}: ${listed.stderr || `gh exited ${listed.exitCode}`}.`] };
+		let pulls: LivePullRequest[];
+		try {
+			const parsed: unknown = JSON.parse(listed.stdout);
+			if (!Array.isArray(parsed) || parsed.some(pr => !pr || !Number.isInteger(pr.number)
+				|| typeof pr.head?.ref !== "string" || typeof pr.head?.repo?.owner?.login !== "string"
+				|| typeof pr.base?.ref !== "string" || (pr.body !== null && typeof pr.body !== "string")
+				|| typeof pr.user?.login !== "string")) throw new Error("Malformed pull request metadata");
+			pulls = parsed;
+		} catch (error) {
+			return { ok: false, diagnostics: [`Could not parse the pull request response for ${branch}: ${error instanceof Error ? error.message : String(error)}`] };
+		}
+		candidates.push(...pulls.filter(pr => pr.head.ref === branch && pr.head.repo?.owner.login.toLowerCase() === headOwner.toLowerCase()));
+		if (pulls.length < 100) break;
+	}
+	if (candidates.length > 1) {
+		return { ok: false, diagnostics: [`Branch ${branch} matches ${candidates.length} open PRs in ${baseRepo} from ${headOwner} (#${candidates.map(candidate => candidate.number).join(", #")}); cannot determine which contract governs this push.`] };
+	}
+	const pr = candidates[0];
+	if (!pr) return { ok: true, diagnostics: [] };
+	// The base is the repository the PR was queried in -- for a fork push that is the
+	// upstream, never the contributor's local origin/dev. The ref is the PR's own base
+	// branch rather than an assumed "dev".
+	const baseRemoteUrl = `https://github.com/${baseRepo}.git`;
+	const refreshBase = await git(["fetch", "--no-tags", baseRemoteUrl, pr.base.ref], cwd);
+	if (refreshBase.exitCode !== 0) {
+		return { ok: false, diagnostics: [`Could not fetch the PR base ${baseRepo}#${pr.base.ref} before the push preflight: ${refreshBase.stderr}`] };
+	}
+	const base = await git(["rev-parse", "FETCH_HEAD"], cwd);
+	const baseSha = new TextDecoder().decode(base.stdout).trim();
+	if (!SHA40.test(baseSha)) return { ok: false, diagnostics: [`Could not resolve ${baseRepo}#${pr.base.ref} to a commit: ${base.stderr}`] };
+	const ancestry = await git(["merge-base", "--is-ancestor", baseSha, headSha], cwd);
+	const diff = await git(["diff", "--binary", "--full-index", "--no-ext-diff", `${baseSha}...${headSha}`], cwd);
+	if (diff.exitCode !== 0) return { ok: false, diagnostics: [`Could not compute the exact ${baseSha}...${headSha} diff: ${diff.stderr}`] };
+	const body = pr.body ?? "";
+	const bodyRiskParsed = parseBodyRisk(body);
+	const result = validatePrContract({
+		body,
+		baseRef: pr.base.ref,
+		baseSha,
+		headSha,
+		authorLogin: pr.user?.login ?? "",
+		computedDiffSha256: canonicalDiffSha256(diff.stdout),
+		baseIsAncestor: ancestry.exitCode === 0,
+		fastGatePassed: await runPushedTreeFastGate(cwd, trustedRoot, headSha),
+		bodyRisk: bodyRiskParsed.risk,
+		requireMergeApproved: false,
+	});
+	const diagnostics = [...bodyRiskParsed.diagnostics, ...result.diagnostics];
+	if (diagnostics.length > 0) {
+		diagnostics.push(`Local push contract failed for ${baseRepo}#${pr.number}; the exact ${baseSha}...${headSha} digest is ${canonicalDiffSha256(diff.stdout)}. Merge authorization remains a separate server check.`);
+	}
+	return { ok: diagnostics.length === 0, verdict: result.verdict, diagnostics };
+}
+
 export async function main(argv: string[]): Promise<number> {
 	const repoIndex = argv.indexOf("--repo");
 	const trustedRootIndex = argv.indexOf("--trusted-root");
@@ -700,6 +892,11 @@ export async function main(argv: string[]): Promise<number> {
 	const invocationCwd = path.resolve(process.cwd(), invocationCwdIndex >= 0 && argv[invocationCwdIndex + 1] ? argv[invocationCwdIndex + 1]! : cwd);
 	const eventIndex = argv.indexOf("--event");
 	const preflightIndex = argv.indexOf("--preflight-command");
+	const pushIndex = argv.indexOf("--push-preflight");
+	const pushRemoteIndex = argv.indexOf("--push-remote");
+	const pushRemote = pushRemoteIndex >= 0 && argv[pushRemoteIndex + 1] ? argv[pushRemoteIndex + 1]! : "origin";
+	const pushUrlIndex = argv.indexOf("--push-url");
+	const pushUrl = pushUrlIndex >= 0 ? argv[pushUrlIndex + 1] ?? "" : undefined;
 	const signIndex = argv.indexOf("--self-review-sign");
 	if (signIndex >= 0) {
 		const args = argv.slice(signIndex + 1);
@@ -723,9 +920,11 @@ export async function main(argv: string[]): Promise<number> {
 	}
 	const result = eventIndex >= 0 && argv[eventIndex + 1]
 		? await validateEvent(path.resolve(process.cwd(), argv[eventIndex + 1]!), cwd, trustedRoot)
-		: preflightIndex >= 0 && argv[preflightIndex + 1]
-			? await validatePreflight(argv[preflightIndex + 1]!, cwd, trustedRoot, invocationCwd)
-			: { ok: false, diagnostics: ["Usage: bun scripts/verify-pr-verdict.ts --event <github-event.json> | --preflight-command <command> | --self-review-sign <verdict> <base> <head> <digest> <reviewer-id> <risk> <extra> <evidence>"] };
+		: pushIndex >= 0 && argv[pushIndex + 1] && argv[pushIndex + 2]
+			? await validatePushPreflight(argv[pushIndex + 1]!, argv[pushIndex + 2]!, pushRemote, cwd, trustedRoot, pushUrl)
+			: preflightIndex >= 0 && argv[preflightIndex + 1]
+				? await validatePreflight(argv[preflightIndex + 1]!, cwd, trustedRoot, invocationCwd)
+				: { ok: false, diagnostics: ["Usage: bun scripts/verify-pr-verdict.ts --event <github-event.json> | --preflight-command <command> | --push-preflight <branch> <head-sha> [--push-remote <remote>] [--push-url <destination-url>] | --self-review-sign <verdict> <base> <head> <digest> <reviewer-id> <risk> <extra> <evidence>"] };
 	for (const diagnostic of result.diagnostics) console.error(`::error::${diagnostic}`);
 	if (result.ok && result.verdict) console.log(`PR contract valid: ${result.verdict.verdict} ${result.verdict.diffSha256}`);
 	return result.ok ? 0 : 1;

@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# Exact-head PR contract preflight (issue: red "PR contract bootstrap" runs).
+#
+# git feeds "<local-ref> <local-sha> <remote-ref> <remote-sha>" on stdin for every ref
+# being pushed. The PR identity is the REMOTE destination, not the local source: for
+# `git push origin HEAD:refs/heads/feature` the local ref is bare `HEAD`, and for a
+# renamed refspec the two names differ. So branch is derived from <remote-ref> while
+# <local-sha> stays the commit under validation.
+#
+# Install: git config core.hooksPath .githooks   (or: bun run install:dev)
+# Bypass:  GJC_SKIP_PR_PREFLIGHT=1 git push      (or: git push --no-verify)
+set -euo pipefail
+
+if [[ -n "${GJC_SKIP_PR_PREFLIGHT:-}" ]]; then
+	exit 0
+fi
+
+repo_root="$(git rev-parse --show-toplevel)"
+remote="${1:-origin}"
+push_url="${2:-}"
+zero="0000000000000000000000000000000000000000"
+status=0
+
+while read -r _local_ref local_sha remote_ref _remote_sha; do
+	# A zero local sha is a branch deletion: no head to validate.
+	[[ "$local_sha" == "$zero" ]] && continue
+	# Only branch destinations carry a PR; tags and notes never do.
+	[[ "$remote_ref" == refs/heads/* ]] || continue
+	branch="${remote_ref#refs/heads/}"
+	if ! bun "$repo_root/scripts/verify-pr-verdict.ts" --push-preflight "$branch" "$local_sha" --push-remote "$remote" --push-url "$push_url" --repo "$repo_root" --trusted-root "$repo_root"; then
+		status=1
+	fi
+done
+
+if [[ "$status" -ne 0 ]]; then
+	echo "pre-push: PR contract preflight failed. Fix the PR body/rebase, or push with GJC_SKIP_PR_PREFLIGHT=1." >&2
+fi
+exit "$status"

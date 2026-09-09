@@ -1,13 +1,15 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, test, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import * as url from "node:url";
 import {
+	authenticatedApproval,
 	canonicalDiffSha256,
 	parseBodyRisk,
 	parseGhPrCreate,
 	parsePrVerdict,
 	parseSelfReview,
+	resolvePullRequestEvent,
 	selfReviewSatisfiesPolicy,
 	selfReviewSignature,
 	selfReviewSignedPayload,
@@ -19,6 +21,59 @@ const base = "a".repeat(40);
 const head = "b".repeat(40);
 const digest = "c".repeat(64);
 const approved = `gajae.pr-review-verdict.v1 merge-approved sha256:${digest} reviewer:architect reviewer-id:review-agent evidence:bun test scripts/verify-pr-verdict.test.ts`;
+
+describe("authenticated approval API evidence", () => {
+	const event = { repository: { full_name: "owner/repo" }, pull_request: { number: 5416 } };
+	const review = (state: string, commit = head) => ({ state, commit_id: commit, user: { login: "review-agent" } });
+
+	test.each([
+		{ name: "valid exact-head approval", reviews: [review("APPROVED")], permission: "write", approved: true },
+		{ name: "changes requested after approval", reviews: [review("APPROVED"), review("CHANGES_REQUESTED")], permission: "write", approved: false },
+		{ name: "dismissed approval", reviews: [review("APPROVED"), review("DISMISSED")], permission: "write", approved: false },
+		{ name: "revoked collaborator permission", reviews: [review("APPROVED")], permission: "read", approved: false },
+		{ name: "stale-head approval", reviews: [review("APPROVED", "d".repeat(40))], permission: "write", approved: false },
+	])("$name", async scenario => {
+		const requests: string[] = [];
+		const originalFetch = globalThis.fetch;
+		const replacement: typeof fetch = Object.assign(async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+			const endpoint = String(input);
+			requests.push(endpoint);
+			expect(new Headers(init?.headers).get("Authorization")).toBe("Bearer test-token");
+			if (endpoint === "https://api.github.com/repos/owner/repo/pulls/5416/reviews?per_page=100&page=1") return Response.json(scenario.reviews);
+			if (endpoint === "https://api.github.com/repos/owner/repo/collaborators/review-agent/permission") return Response.json({ permission: scenario.permission });
+			throw new Error(`Unexpected endpoint: ${endpoint}`);
+		}, { preconnect: originalFetch.preconnect });
+		const spy = vi.spyOn(globalThis, "fetch").mockImplementation(replacement);
+		try {
+			const approval = await authenticatedApproval(event, "review-agent", head, "test-token");
+			expect(approval).toEqual(scenario.approved ? { login: "review-agent", headSha: head } : {});
+			expect(validatePrContract(validInput({ authenticatedReviewerLogin: approval.login, authenticatedReviewHeadSha: approval.headSha })).ok).toBe(scenario.approved);
+			expect(requests.length).toBe(scenario.name === "valid exact-head approval" || scenario.name === "revoked collaborator permission" ? 2 : 1);
+		} finally {
+			spy.mockRestore();
+		}
+	});
+
+	test("unavailable and malformed review responses never provide authenticated approval", async () => {
+		for (const failure of ["network", "http", "invalid-json", "object", "null", "malformed-entry"]) {
+			const originalFetch = globalThis.fetch;
+			const replacement: typeof fetch = Object.assign(async () => {
+				if (failure === "network") throw new Error("Reviews network unavailable");
+				if (failure === "http") return new Response("unavailable", { status: 503 });
+				if (failure === "invalid-json") return new Response("{broken");
+				return Response.json(failure === "object" ? {} : failure === "null" ? null : [null]);
+			}, { preconnect: originalFetch.preconnect });
+			const spy = vi.spyOn(globalThis, "fetch").mockImplementation(replacement);
+			try {
+				if (failure === "http") expect(await authenticatedApproval(event, "review-agent", head, "test-token")).toEqual({});
+				else await expect(authenticatedApproval(event, "review-agent", head, "test-token")).rejects.toThrow();
+				expect(spy).toHaveBeenCalledTimes(1);
+			} finally {
+				spy.mockRestore();
+			}
+		}
+	});
+});
 
 function selfReviewComment(overrides: {
 	body?: string;
@@ -67,6 +122,107 @@ function validInput(overrides: Partial<Parameters<typeof validatePrContract>[0]>
 		...overrides,
 	};
 }
+
+describe("review-event mutable PR body refresh", () => {
+	function captured() {
+		return {
+			repository: { full_name: "owner/repo" },
+			pull_request: {
+				number: 5416,
+				body: approved.replace("merge-approved", "needs-human"),
+				user: { login: "author" },
+				base: { ref: "dev", sha: base, repo: { full_name: "owner/repo" } },
+				head: { sha: head },
+			},
+		};
+	}
+
+	test("refreshes only body on the same authority using an authenticated request", async () => {
+		const event = captured();
+		const live = { ...event.pull_request, body: approved };
+		const resolved = await resolvePullRequestEvent(event, "pull_request_review", "test-token", async (endpoint, init) => {
+			expect(endpoint).toBe("https://api.github.com/repos/owner/repo/pulls/5416");
+			expect(new Headers(init.headers).get("Authorization")).toBe("Bearer test-token");
+			return Response.json(live);
+		});
+		expect(resolved).toEqual({ ...event, pull_request: live });
+		expect(resolved.pull_request?.base).toBe(event.pull_request.base);
+		expect(resolved.pull_request?.head).toBe(event.pull_request.head);
+		expect(event.pull_request.body).toContain("needs-human");
+		expect(validatePrContract(validInput({ body: resolved.pull_request?.body ?? "" })).ok).toBe(true);
+		// Refreshing text provides no new approval, risk or fast-gate authority.
+		for (const denied of [
+			{ authenticatedReviewerLogin: undefined },
+			{ authenticatedReviewHeadSha: "d".repeat(40) },
+			{ fastGatePassed: false },
+		]) {
+			expect(validatePrContract(validInput({ body: resolved.pull_request?.body ?? "", ...denied })).ok).toBe(false);
+		}
+	});
+
+	test.each(["merge-blocked", "needs-human", "", null])("current revoked or empty body cannot reuse captured approval: %s", async verdict => {
+		const event = captured();
+		event.pull_request.body = approved;
+		const body = verdict ? approved.replace("merge-approved", verdict) : verdict;
+		const resolved = await resolvePullRequestEvent(event, "pull_request_review", "token", async () => Response.json({ ...event.pull_request, body }));
+		expect(resolved.pull_request?.body).toBe(body);
+		expect(validatePrContract(validInput({ body: resolved.pull_request?.body ?? "" })).ok).toBe(false);
+	});
+
+	test("rejects every live authority drift rather than replacing the captured target", async () => {
+		const event = captured();
+		const live = { ...event.pull_request, body: approved };
+		for (const changed of [
+			{ ...live, number: 5417 },
+			{ ...live, user: { login: "other" } },
+			{ ...live, head: { sha: "d".repeat(40) } },
+			{ ...live, base: { ...live.base, sha: "e".repeat(40) } },
+			{ ...live, base: { ...live.base, ref: "main" } },
+			{ ...live, base: { ...live.base, repo: { full_name: "other/repo" } } },
+		]) {
+			await expect(resolvePullRequestEvent(event, "pull_request_review", "token", async () => Response.json(changed))).rejects.toThrow("authority drift");
+		}
+	});
+
+	test("unavailable or malformed metadata never falls back to captured body", async () => {
+		const event = captured();
+		for (const response of [
+			new Response("denied", { status: 403 }),
+			new Response("{broken"),
+			Response.json(null), Response.json([]), Response.json({}),
+			Response.json({ ...event.pull_request, body: 42 }),
+			Response.json({ ...event.pull_request, body: undefined }),
+		]) {
+			await expect(resolvePullRequestEvent(event, "pull_request_review", "token", async () => response)).rejects.toThrow();
+		}
+		await expect(resolvePullRequestEvent(event, "pull_request_review", "token", async () => { throw new Error("network unavailable"); })).rejects.toThrow("network unavailable");
+		let requests = 0;
+		const request = async () => { requests++; return Response.json(event.pull_request); };
+		await expect(resolvePullRequestEvent(event, "pull_request_review", "", request)).rejects.toThrow("authority is incomplete");
+		await expect(resolvePullRequestEvent({ repository: event.repository }, "pull_request_review", "token", request)).rejects.toThrow("authority is incomplete");
+		expect(requests).toBe(0);
+	});
+
+	test("ordinary PR events retain their captured body without API calls", async () => {
+		const event = captured();
+		for (const name of ["pull_request", "pull_request_target"]) {
+			const resolved = await resolvePullRequestEvent(event, name, "token", async () => { throw new Error("must not fetch"); });
+			expect(resolved).toBe(event);
+		}
+	});
+
+	test("issue-comment resolution retains its authenticated fetch and failure semantics", async () => {
+		const event = { repository: captured().repository, issue: { number: 5416 } };
+		const live = { ...captured().pull_request, body: approved };
+		const resolved = await resolvePullRequestEvent(event, "issue_comment", "token", async (endpoint, init) => {
+			expect(endpoint).toBe("https://api.github.com/repos/owner/repo/pulls/5416");
+			expect(new Headers(init.headers).get("Authorization")).toBe("Bearer token");
+			return Response.json(live);
+		});
+		expect(resolved.pull_request).toEqual(live);
+		expect(await resolvePullRequestEvent(event, "issue_comment", "token", async () => new Response("denied", { status: 403 }))).toBe(event);
+	});
+});
 
 describe("parsePrVerdict", () => {
 	test("accepts exactly one strict verdict line", () => {
@@ -450,6 +606,271 @@ test("preflight preserves missing body-file diagnostics", async () => {
 	} finally {
 		await fs.rm(temp, { recursive: true, force: true });
 	}
+});
+
+describe("push preflight", () => {
+	async function preflight(options: { metadata?: string; apiExit?: number; remote?: string; destination?: string; pushUrls?: string; openPr?: boolean; pages?: "late" | "ambiguous" | "failure" }) {
+		const temp = await fs.mkdtemp(path.join(Bun.env.TMPDIR ?? "/tmp", "push-authority-"));
+		const callsPath = path.join(temp, "calls.jsonl");
+		const executable = `#!${process.execPath}\n`;
+		try {
+			await fs.writeFile(callsPath, "");
+			await fs.writeFile(path.join(temp, "gh"), executable + `
+const args = process.argv.slice(2);
+require("node:fs").appendFileSync(process.env.CALLS, JSON.stringify(["gh", ...args]) + "\\n");
+if (process.env.GH_HOST !== "github.com") { console.error("wrong GH_HOST"); process.exit(96); }
+if (args[0] === "repo") {
+ console.log(process.env.METADATA);
+ process.exit(Number(process.env.API_EXIT));
+}
+if (args[0] === "api" && args[1].includes("/pulls?")) {
+ const pr = {number: 42, body: "", base: {ref: "release"}, user: {login: "author"}, head: {ref: "destination-branch", sha: "d".repeat(40), repo: {owner: {login: "receiver"}}}};
+ const page = Number(new URL("https://github.com/" + args[1]).searchParams.get("page"));
+ if (process.env.PAGES && page === 1) {
+  console.log(JSON.stringify(Array.from({length: 100}, (_, i) => ({...pr, number: i + 100, head: {...pr.head, repo: {owner: {login: "other"}}}})))); process.exit(0);
+ }
+ if (process.env.PAGES === "failure") process.exit(95);
+ console.log(JSON.stringify(process.env.PAGES === "ambiguous" ? [pr, {...pr, number: 43}] : process.env.OPEN_PR === "1" || process.env.PAGES === "late" ? [pr] : [])); process.exit(0);
+}
+process.exit(97);
+`);
+			await fs.writeFile(path.join(temp, "git"), executable + `
+const args = process.argv.slice(2);
+require("node:fs").appendFileSync(process.env.CALLS, JSON.stringify(["git", ...args]) + "\\n");
+if (JSON.stringify(args) === JSON.stringify(["remote", "get-url", "--push", "--all", "origin"])) {
+ console.log(process.env.PUSH_URLS); process.exit(0);
+}
+if (args[0] === "fetch" || args[0] === "merge-base") process.exit(0);
+if (args[0] === "rev-parse") { console.log("a".repeat(40)); process.exit(0); }
+if (args[0] === "diff") { console.error("mock exact diff stop"); process.exit(1); }
+process.exit(98);
+`);
+			await Promise.all(["gh", "git"].map(name => fs.chmod(path.join(temp, name), 0o755)));
+			const script = url.fileURLToPath(new URL("./verify-pr-verdict.ts", import.meta.url));
+			const args = [process.execPath, script, "--push-preflight", "destination-branch", head, "--push-remote", options.remote ?? "origin", "--repo", temp, "--trusted-root", temp];
+			if (options.destination !== undefined) args.push("--push-url", options.destination);
+			const child = Bun.spawn(args, {
+				env: { ...process.env, GH_HOST: "hostile.example", PATH: `${temp}:${process.env.PATH}`, CALLS: callsPath, METADATA: options.metadata ?? '{"isFork":false}', API_EXIT: String(options.apiExit ?? 0), PUSH_URLS: options.pushUrls ?? "git@github.com:receiver/project.git", OPEN_PR: options.openPr ? "1" : "0", PAGES: options.pages ?? "" },
+				stdout: "pipe", stderr: "pipe",
+			});
+			const [stdout, stderr, exitCode] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
+			const calls = (await fs.readFile(callsPath, "utf8")).trim().split("\n").filter(Boolean).map(line => JSON.parse(line) as string[]);
+			return { stdout, stderr, exitCode, calls };
+		} finally {
+			await fs.rm(temp, { recursive: true, force: true });
+		}
+	}
+
+	test("a named remote uses push URLs, never its fetch URL", async () => {
+		const result = await preflight({});
+		expect(result.exitCode).toBe(0);
+		expect(result.calls[0]).toEqual(["git", "remote", "get-url", "--push", "--all", "origin"]);
+		expect(result.calls[1]).toEqual(["gh", "repo", "view", "receiver/project", "--json", "isFork,parent"]);
+	});
+
+	test("REST discovery pins github.com and keeps the pushed object independent of remote head", async () => {
+		const result = await preflight({ openPr: true });
+		expect(result.exitCode).toBe(1);
+		expect(result.stderr).toContain("mock exact diff stop");
+		expect(result.calls).toContainEqual(["gh", "api", "repos/receiver/project/pulls?state=open&head=receiver%3Adestination-branch&per_page=100&page=1"]);
+		expect(result.calls).toContainEqual(["git", "fetch", "--no-tags", "https://github.com/receiver/project.git", "release"]);
+		expect(result.calls).toContainEqual(["git", "merge-base", "--is-ancestor", base, head]);
+		expect(result.calls).toContainEqual(["git", "diff", "--binary", "--full-index", "--no-ext-diff", `${base}...${head}`]);
+	});
+
+	test("the hook destination overrides split pushurl configuration", async () => {
+		const result = await preflight({ destination: "https://github.com/actual/destination.git", pushUrls: "https://github.com/wrong/one.git\nhttps://github.com/wrong/two.git" });
+		expect(result.exitCode).toBe(0);
+		expect(result.calls[0]).toEqual(["gh", "repo", "view", "actual/destination", "--json", "isFork,parent"]);
+		expect(result.calls.some(call => call[0] === "git")).toBe(false);
+		expect(result.calls[1]?.[2]).toContain("repos/actual/destination/pulls?");
+	});
+
+	for (const remote of ["git@github.com:receiver/project.git", "https://github.com/receiver/project", "ssh://git@github.com/receiver/project.git"]) {
+		test(`URL remote resolves directly: ${remote}`, async () => {
+			const result = await preflight({ remote });
+			expect(result.exitCode).toBe(0);
+			expect(result.calls[0]).toEqual(["gh", "repo", "view", "receiver/project", "--json", "isFork,parent"]);
+		});
+	}
+
+	for (const options of [
+		{ apiExit: 1 }, { metadata: "not-json" }, { metadata: "null" }, { metadata: "{}" },
+		{ metadata: '{"isFork":"false"}' }, { metadata: '{"isFork":true}' },
+		{ metadata: '{"isFork":true,"parent":null}' },
+		{ metadata: '{"isFork":true,"parent":{"owner":{"login":"upstream"}}}' },
+		{ metadata: '{"isFork":true,"parent":{"owner":{"login":"bad/owner"},"name":"project"}}' },
+	]) {
+		test(`unresolved repository authority fails closed: ${JSON.stringify(options)}`, async () => {
+			const result = await preflight(options);
+			expect(result.exitCode).toBe(1);
+			expect(result.stderr).toContain("Could not establish the PR contract repository");
+			expect(result.calls.some(call => call[1] === "api")).toBe(false);
+		});
+	}
+
+	for (const [metadata, repository] of [
+		['{"isFork":false}', "receiver/project"],
+		['{"isFork":true,"parent":{"owner":{"login":"upstream"},"name":"project"}}', "upstream/project"],
+	]) {
+		test(`validated authority selects ${repository}`, async () => {
+			const result = await preflight({ metadata });
+			expect(result.exitCode).toBe(0);
+			expect(result.calls.at(-1)).toEqual(["gh", "api", `repos/${repository}/pulls?state=open&head=receiver%3Adestination-branch&per_page=100&page=1`]);
+		});
+	}
+
+	for (const options of [
+		{ destination: "https://evil.example/receiver/project.git" }, { destination: "" },
+		{ pushUrls: "https://github.com/one/project.git\nhttps://github.com/two/project.git" },
+	]) {
+		test(`unresolved destination cannot query a different repository: ${JSON.stringify(options)}`, async () => {
+			const result = await preflight(options);
+			expect(result.exitCode).toBe(1);
+			expect(result.stderr).toContain("unknown repository");
+			expect(result.calls.some(call => call[0] === "gh")).toBe(false);
+		});
+	}
+
+	for (const pages of ["late", "ambiguous", "failure"] as const) {
+		test(`PR discovery exhausts pagination: ${pages}`, async () => {
+			const result = await preflight({ pages });
+			expect(result.exitCode).toBe(1);
+			expect(result.calls).toContainEqual(["gh", "api", "repos/receiver/project/pulls?state=open&head=receiver%3Adestination-branch&per_page=100&page=2"]);
+			expect(result.stderr).toContain(pages === "late" ? "mock exact diff stop" : pages === "ambiguous" ? "cannot determine which contract" : "Could not resolve the open PR");
+		});
+	}
+
+	async function exactTreePreflight(kind: "needs-human" | "merge-blocked" | "merge-approved" | "stale" | "malformed" | "missing-risk" | "multiple-risk" | "bad-pushed-tree" | "export-ignore" | "export-subst" | "source-symlink" | "case-collision") {
+		const temp = await fs.mkdtemp(path.join(Bun.env.TMPDIR ?? "/tmp", "push-exact-tree-"));
+		const repo = path.join(temp, "repo");
+		const bin = path.join(temp, "bin");
+		const scratch = path.join(temp, "scratch");
+		const realGit = Bun.which("git")!;
+		const runGit = (...args: string[]) => {
+			const result = Bun.spawnSync([realGit, ...args], { cwd: repo, env: { ...process.env, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null" } });
+			if (result.exitCode !== 0) throw new Error(result.stderr.toString());
+			return result.stdout;
+		};
+		try {
+			await Promise.all([repo, bin, scratch].map(dir => fs.mkdir(dir)));
+			runGit("init");
+			runGit("config", "user.email", "fixture@example.test");
+			runGit("config", "user.name", "Fixture");
+			const source = path.join(repo, "packages/coding-agent/src/example.ts");
+			await fs.mkdir(path.dirname(source), { recursive: true });
+			const bad = 'import * as fs from "node:fs";\nfs.writeFileSync(".gjc/unsafe.json", "unsafe");\n';
+			await fs.writeFile(source, "export const value = 1;\n");
+			runGit("add", ".");
+			runGit("-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false", "commit", "-m", "base");
+			const baseSha = runGit("rev-parse", "HEAD").toString().trim();
+			const badTree = kind === "bad-pushed-tree" || kind === "export-ignore" || kind === "export-subst" || kind === "case-collision";
+			const pushedSource = kind === "export-subst" ? bad.replace("unsafe.json", "$Format:%H$.json") : badTree && kind !== "case-collision" ? bad : "export const value = 2;\n";
+			await fs.writeFile(source, pushedSource);
+			if (kind === "export-ignore" || kind === "export-subst") await fs.writeFile(path.join(repo, ".gitattributes"), `packages/coding-agent/src/example.ts ${kind}\n`);
+			if (kind === "source-symlink") await fs.symlink("example.ts", path.join(path.dirname(source), "linked.ts"));
+			runGit("add", ".");
+			runGit("-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false", "commit", "-m", "pushed");
+			let pushedSha = runGit("rev-parse", "HEAD").toString().trim();
+			if (kind === "case-collision") {
+				// Populate the index directly: both Git paths must exist even when the
+				// host filesystem cannot represent their distinct casing simultaneously.
+				const unsafePath = path.join(temp, "unsafe-blob");
+				await fs.writeFile(unsafePath, bad);
+				const unsafeOid = runGit("hash-object", "-w", unsafePath).toString().trim();
+				const cleanPath = path.join(temp, "clean-blob");
+				await fs.writeFile(cleanPath, "export const value = 2;\n");
+				const cleanOid = runGit("hash-object", "-w", cleanPath).toString().trim();
+				runGit("-c", "core.ignorecase=false", "update-index", "--add", "--cacheinfo", `100644,${unsafeOid},packages/coding-agent/src/Foo.ts`);
+				runGit("-c", "core.ignorecase=false", "update-index", "--add", "--cacheinfo", `100644,${cleanOid},packages/coding-agent/src/foo.ts`);
+				const treeOid = runGit("write-tree").toString().trim();
+				pushedSha = runGit("-c", "commit.gpgsign=false", "commit-tree", treeOid, "-p", baseSha, "-m", "case-distinct pushed tree").toString().trim();
+				const entries = runGit("ls-tree", "-r", pushedSha).toString();
+				expect(entries).toContain(`${unsafeOid}\tpackages/coding-agent/src/Foo.ts`);
+				expect(entries).toContain(`${cleanOid}\tpackages/coding-agent/src/foo.ts`);
+				// Restore only the disposable fixture index; never check out colliding paths.
+				runGit("read-tree", "HEAD");
+			}
+			const diffSha = canonicalDiffSha256(runGit("diff", "--binary", "--full-index", "--no-ext-diff", `${baseSha}...${pushedSha}`));
+			// Checkout a different commit, then dirty it with bytes opposite to the pushed tree.
+			runGit("checkout", "--detach", baseSha);
+			const dirty = badTree ? "export const value = 3;\n" : bad;
+			await fs.writeFile(source, dirty);
+			const verdict = kind === "merge-blocked" || kind === "merge-approved" ? kind : "needs-human";
+			let body = `gajae.pr-review-verdict.v1 ${verdict} sha256:${kind === "stale" ? "0".repeat(64) : diffSha} reviewer:architect reviewer-id:review-agent evidence:fixture review\n`;
+			if (kind === "malformed") body = "gajae.pr-review-verdict.v1 invalid\n";
+			if (kind !== "missing-risk") body += "- [x] `low-risk`\n";
+			if (kind === "multiple-risk") body += "- [x] `high-risk`\n";
+			await fs.writeFile(path.join(temp, "pulls.json"), JSON.stringify([{ number: 42, body, base: { ref: "dev" }, user: { login: "author" }, head: { ref: "dev", sha: baseSha, repo: { owner: { login: "receiver" } } } }]));
+			await fs.writeFile(path.join(bin, "gh"), `#!${process.execPath}\n
+if (process.env.GH_HOST !== "github.com") process.exit(91);
+const args = process.argv.slice(2);
+if (args[0] === "repo") { console.log('{"isFork":false}'); process.exit(0); }
+if (args[0] === "api" && args[1] === "repos/receiver/project/pulls?state=open&head=receiver%3Adev&per_page=100&page=1") {
+ console.log(require("node:fs").readFileSync(process.env.PULLS, "utf8")); process.exit(0);
+}
+throw new Error("Unexpected gh invocation: " + JSON.stringify(args));
+`);
+			await fs.writeFile(path.join(bin, "git"), `#!${process.execPath}\n
+const args = process.argv.slice(2);
+if (args[0] === "fetch") {
+ require("node:fs").writeFileSync(".git/FETCH_HEAD", process.env.BASE_SHA + "\\n"); process.exit(0);
+}
+const result = Bun.spawnSync([process.env.REAL_GIT, ...args], {stdin: "inherit", stdout: "inherit", stderr: "inherit"});
+process.exit(result.exitCode);
+`);
+			await Promise.all(["gh", "git"].map(name => fs.chmod(path.join(bin, name), 0o755)));
+			const trustedRoot = path.resolve(import.meta.dir, "..");
+			const child = Bun.spawn([process.execPath, path.join(trustedRoot, "scripts/verify-pr-verdict.ts"), "--push-preflight", "dev", pushedSha, "--push-url", "https://github.com/receiver/project.git", "--repo", repo, "--trusted-root", trustedRoot], {
+				env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, GH_HOST: "hostile.example", PULLS: path.join(temp, "pulls.json"), BASE_SHA: baseSha, REAL_GIT: realGit, TMPDIR: scratch }, stdout: "pipe", stderr: "pipe",
+			});
+			const [stdout, stderr, exitCode] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
+			expect(await fs.readFile(source, "utf8")).toBe(dirty);
+			expect(runGit("rev-parse", "HEAD").toString().trim()).toBe(baseSha);
+			expect((await fs.readdir(scratch)).filter(name => name.startsWith("gjc-pushed-tree-"))).toEqual([]);
+			return { stdout, stderr, exitCode };
+		} finally {
+			await fs.rm(temp, { recursive: true, force: true });
+		}
+	}
+
+	for (const kind of ["needs-human", "merge-blocked", "merge-approved"] as const) {
+		test(`CLI permits valid ${kind} without local approval queries and ignores dirty checkout gate failures`, async () => {
+			const result = await exactTreePreflight(kind);
+			expect(result.exitCode).toBe(0);
+			expect(result.stdout).toContain(`PR contract valid: ${kind}`);
+		});
+	}
+
+	for (const [kind, message] of [
+		["stale", "digest"], ["malformed", "Malformed"], ["missing-risk", "found none"],
+		["multiple-risk", "found 2"], ["bad-pushed-tree", "fast gate"], ["source-symlink", "fast gate"], ["case-collision", "fast gate"],
+	] as const) {
+		test(`CLI rejects ${kind} despite clean working-tree bytes when applicable`, async () => {
+			const result = await exactTreePreflight(kind);
+			expect(result.exitCode).toBe(1);
+			expect(result.stderr).toContain(message);
+		});
+	}
+
+	for (const kind of ["export-ignore", "export-subst"] as const) {
+		test(`pushed attributes cannot omit or transform source bytes: ${kind}`, async () => {
+			const result = await exactTreePreflight(kind);
+			expect(result.exitCode).toBe(1);
+			expect(result.stderr).toContain("Repository fast gate failed");
+			expect(result.stdout + result.stderr).toContain("example.ts");
+			if (kind === "export-subst") expect(result.stdout + result.stderr).toContain("$Format:%H$");
+		});
+	}
+
+	test("a non-commit push target fails closed", async () => {
+		const script = url.fileURLToPath(new URL("./verify-pr-verdict.ts", import.meta.url));
+		const repoRoot = url.fileURLToPath(new URL("..", import.meta.url));
+		const child = Bun.spawn([process.execPath, script, "--push-preflight", "some-branch", "not-a-sha", "--repo", repoRoot, "--trusted-root", repoRoot], { stdout: "pipe", stderr: "pipe" });
+		const [stderr, exitCode] = await Promise.all([new Response(child.stderr).text(), child.exited]);
+		expect(exitCode).toBe(1);
+		expect(stderr).toContain("is not a lowercase 40-hex commit");
+	});
 });
 
 test("workflow is trusted-default-branch-controlled, read-only, exact-head, and invokes only base code", async () => {
