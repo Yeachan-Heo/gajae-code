@@ -26,6 +26,8 @@ import {
 } from "@gajae-code/coding-agent/tools/ask";
 import { ToolAbortError } from "@gajae-code/coding-agent/tools/tool-errors";
 import { logger } from "@gajae-code/utils";
+import type { OpenGateInput } from "../../src/modes/shared/agent-wire/workflow-gate-broker";
+import type { WorkflowGate } from "../../src/modes/shared/agent-wire/workflow-gate-types";
 
 function createSession(overrides: Partial<ToolSession> = {}): ToolSession {
 	return {
@@ -3431,9 +3433,39 @@ describe("AskTool deep-interview recorder persistence", () => {
 			expect.objectContaining({ stage: "deep-interview", kind: "question" }),
 		);
 
+		let listener: ((gate: WorkflowGate) => void) | undefined;
+		let gateSequence = 0;
+		const stopObservation = vi.fn(() => {
+			listener = undefined;
+		});
 		const ralplanGateEmitter = {
 			supportsRemoteGateAnswers: () => true,
-			emitGate: vi.fn(async () => ({ selected: ["Approve execution via ultragoal"] })),
+			onGateEmitted: (onGate: (gate: WorkflowGate) => void) => {
+				listener = onGate;
+				return stopObservation;
+			},
+			emitGate: vi.fn(async (input: OpenGateInput) => {
+				const gate: WorkflowGate = {
+					...input,
+					type: "workflow_gate",
+					gate_id: `ralplan-run:gate:${++gateSequence}`,
+					schema_hash: "a".repeat(64),
+					context: input.context ?? {},
+					created_at: "2026-09-09T00:00:00Z",
+					required: true,
+				};
+				listener?.(gate);
+				// Unrelated emissions must not overwrite the matching durable identity.
+				listener?.({ ...gate, gate_id: "wrong-stage", stage: "deep-interview" });
+				listener?.({ ...gate, gate_id: "wrong-kind", kind: "execution" });
+				listener?.({ ...gate, gate_id: "other-execution", stage: "deep-interview", kind: "execution" });
+				listener?.({
+					...gate,
+					gate_id: "wrong-question",
+					context: { ...gate.context, stage_state: { question_id: "other-question" } },
+				});
+				return { selected: ["Approve execution via ultragoal"] };
+			}),
 		};
 		spyOn(stateRuntime, "executionApprovalLineage").mockResolvedValue("crystal");
 		const approvalRecord = spyOn(stateRuntime, "recordDeepInterviewExecutionApproval").mockResolvedValue({
@@ -3451,29 +3483,40 @@ describe("AskTool deep-interview recorder persistence", () => {
 			stdout: "{}\n",
 			stderr: "",
 		});
-		await new AskTool(
+		const tool = new AskTool(
 			createSession({
 				hasUI: false,
 				cwd: "/tmp/ralplan-approval",
 				getSessionId: () => "ralplan-approval",
 				getWorkflowGateEmitter: () => ralplanGateEmitter,
 			} as Partial<ToolSession>),
-		).execute(
-			"call-ralplan-workflow-gate",
-			{
-				questions: [
-					{
-						id: "final-approval",
-						question: "Approve this plan?",
-						options: [{ label: "Refine further" }, { label: "Approve execution via ultragoal" }],
-						workflowGate: { stage: "ralplan", kind: "approval" },
-					},
-				],
-			},
-			undefined,
-			undefined,
-			undefined,
 		);
+		for (let pass = 1; pass <= 2; pass++) {
+			await tool.execute(
+				`call-ralplan-workflow-gate-${pass}`,
+				{
+					questions: [
+						{
+							id: "final-approval",
+							question: `Approve finalized plan pass ${pass}?`,
+							options: [{ label: "Refine further" }, { label: "Approve execution via ultragoal" }],
+							workflowGate: { stage: "ralplan", kind: "approval" },
+						},
+					],
+				},
+				undefined,
+				undefined,
+				undefined,
+			);
+		}
+		expect(
+			approvalRecord.mock.calls.map(([input]) => ({ questionId: input.questionId, gateId: input.gateId })),
+		).toEqual([
+			{ questionId: "final-approval", gateId: "ralplan-run:gate:1" },
+			{ questionId: "final-approval", gateId: "ralplan-run:gate:2" },
+		]);
+		expect(stopObservation).toHaveBeenCalledTimes(2);
+		expect(listener).toBeUndefined();
 
 		expect(ralplanGateEmitter.emitGate).toHaveBeenCalledWith(
 			expect.objectContaining({ stage: "ralplan", kind: "approval" }),
