@@ -163,6 +163,7 @@ import { createSdkWebSocketTransport } from "../sdk/host/websocket-transport";
 import type { SecretObfuscator } from "../secrets";
 import { AgentSession, type ForkContextSeed, isSessionDisposalIncompleteError } from "../session/agent-session";
 import { AuthBrokerClient, AuthStorage, RemoteAuthCredentialStore } from "../session/auth-storage";
+import { recordCommittedPromptFailure } from "../session/committed-prompt-failure";
 import { type CustomMessage, convertToLlm } from "../session/messages";
 import { primaryControlSurfaceFor } from "../session/primary-control-surface";
 import { createReadonlySessionManager, SessionManager } from "../session/session-manager";
@@ -3492,6 +3493,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 								abortPromptAndWaitWithTerminal: (handle, seamOptions) => {
 									if (!session) throw new Error("Terminal abort session is not initialized.");
 									return session.abortPromptAndWait(handle, seamOptions);
+								},
+								recordCommittedPromptFailure: (handle, failure, isCurrent) => {
+									if (!session) throw new Error("Committed prompt failure session is not initialized.");
+									return recordCommittedPromptFailure(session, handle, failure, isCurrent);
 								},
 							},
 							ensureProviderDaemon: options.ensureNotificationProviderDaemon,

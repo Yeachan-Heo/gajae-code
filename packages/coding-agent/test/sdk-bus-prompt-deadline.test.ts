@@ -3,10 +3,35 @@ import * as fs from "node:fs";
 import * as fsPromises from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { markNonDispatchedToolEvent, type RunSettlementProof } from "@gajae-code/agent-core";
-import type { Settings } from "../src/config/settings";
+import {
+	Agent,
+	type AgentEvent,
+	isNonDispatchedToolEvent,
+	markNonDispatchedToolEvent,
+	type RunSettlementProof,
+} from "@gajae-code/agent-core";
+import { getBundledModel } from "@gajae-code/ai";
+import { createMockModel } from "@gajae-code/ai/providers/mock";
+import { logger } from "@gajae-code/utils";
+import { ModelRegistry } from "../src/config/model-registry";
+import { Settings } from "../src/config/settings";
+import { ExtensionRunner } from "../src/extensibility/extensions/runner";
 import type { ExtensionActions, ExtensionAPI } from "../src/extensibility/extensions/types";
+import {
+	GJC_COORDINATOR_SESSION_ID_ENV,
+	GJC_COORDINATOR_SESSION_STATE_FILE_ENV,
+} from "../src/gjc-runtime/session-state-sidecar";
 import { createNotificationsExtension } from "../src/sdk/bus";
+import { createKindAwareReconciliation } from "../src/sdk/bus/kind-aware-reconciliation";
+import type { InternalSdkSendOptions } from "../src/sdk/host/sdk-run-capability";
+import { AgentSession } from "../src/session/agent-session";
+import { AuthStorage } from "../src/session/auth-storage";
+import {
+	recordCommittedPromptFailure,
+	registerCommittedPromptFailureWriter,
+} from "../src/session/committed-prompt-failure";
+import { readSdkRunCapability } from "../src/session/sdk-run-capability-internal";
+import { SessionManager } from "../src/session/session-manager";
 
 /**
  * The notification/SDK bus host route and the SDK-only host route are mutually
@@ -94,6 +119,7 @@ function context(
 /** Toggle that makes the very next accepted prompt fail its durable-accept commit. */
 interface AcceptFailure {
 	armed: boolean;
+	sdkRunCapabilities?: unknown[];
 }
 
 function start(
@@ -103,17 +129,31 @@ function start(
 ): Map<string, (event: unknown, context: unknown) => unknown> {
 	const handlers = new Map<string, (event: unknown, context: unknown) => unknown>();
 	const api = {
-		on: (event: string, handler: (event: unknown, context: unknown) => unknown) => handlers.set(event, handler),
+		on: (event: string, handler: (event: unknown, context: unknown) => unknown) =>
+			handlers.set(event, (payload, context) => {
+				if (event !== "agent_start") return handler(payload, context);
+				const start = payload as { type: string; sdkRunToken?: string };
+				const capabilities = acceptFailure.sdkRunCapabilities ?? [];
+				const index = start.sdkRunToken
+					? capabilities.findIndex(capability => readSdkRunCapability(capability) === start.sdkRunToken)
+					: 0;
+				const capability = index >= 0 ? capabilities.splice(index, 1)[0] : undefined;
+				return handler({ ...start, sdkRunToken: start.sdkRunToken ?? readSdkRunCapability(capability) }, context);
+			}),
 		registerCommand: () => {},
 		getThinkingLevel: () => undefined,
 		sendUserMessage: (
 			_content: Parameters<ExtensionActions["sendUserMessage"]>[0],
-			options?: Parameters<ExtensionActions["sendUserMessage"]>[1],
+			options?: InternalSdkSendOptions,
 		) => {
 			const commit = options?.onPreflightAcceptCommit;
 			const accepted = options?.onPreflightAccepted;
 			// The prompt never settles on its own: the deadline is the only terminal.
-			const deliver = () => new Promise<never>(() => {}) as never;
+			const deliver = () => {
+				acceptFailure.sdkRunCapabilities ??= [];
+				acceptFailure.sdkRunCapabilities.push(options?.sdkRunCapability);
+				return new Promise<never>(() => {}) as never;
+			};
 			if (acceptFailure.armed) {
 				acceptFailure.armed = false;
 				// Reject AFTER the durable accept committed, which is the boundary the
@@ -142,6 +182,17 @@ function start(
 						abortPromptAndWait: (handle: string, options: { graceMs: number }) => Promise<RunSettlementProof>;
 					}
 				).abortPromptAndWait(handle, seamOptions),
+			recordCommittedPromptFailure: async (handle, failure, isCurrent) => {
+				const writer = ctx.recordCommittedPromptFailure as
+					| ((
+							handle: string,
+							failure: { code: "prompt_deadline_exceeded"; message: "Prompt deadline exceeded." },
+							isCurrent: () => boolean,
+					  ) => Promise<"persisted" | "stale">)
+					| undefined;
+				if (!writer) throw new Error("No committed receipt writer in this fixture");
+				return writer(handle, failure, isCurrent);
+			},
 		},
 	});
 	void handlers.get("session_start")?.({ type: "session_start" }, ctx);
@@ -166,14 +217,7 @@ interface BusSession {
 }
 
 /** Send one `turn.prompt` on an established session and return its acknowledgement. */
-async function sendPrompt(
-	session: BusSession,
-	id: string,
-): Promise<{
-	ok?: boolean;
-	error?: { code?: string; message?: string };
-	result?: { commandId?: string; turnId?: string };
-}> {
+async function sendPrompt(session: BusSession, id: string): Promise<PromptAcknowledgement> {
 	session.socket.send(
 		JSON.stringify({ type: "control_request", id, operation: "turn.prompt", input: { text: `deadline ${id}` } }),
 	);
@@ -184,6 +228,11 @@ async function sendPrompt(
 	return session.frames.find(frame => frame.type === "control_response" && frame.id === id) as never;
 }
 
+interface PromptAcknowledgement {
+	ok?: boolean;
+	error?: { code?: string; message?: string };
+	result?: { commandId?: string; turnId?: string };
+}
 /** Accept one prompt over the real bus transport, optionally binding an agent run. */
 async function acceptPrompt(
 	label: string,
@@ -505,7 +554,7 @@ test("a rolled-back durable acceptance leaves no armed deadline", async () => {
 				throw Object.assign(new Error("injected durable acceptance failure"), { code: "EACCES" });
 			await realRename(from, to);
 		});
-		let rejected: Awaited<ReturnType<typeof sendPrompt>>;
+		let rejected: PromptAcknowledgement;
 		try {
 			rejected = await sendPrompt(session, "rolled-back");
 		} finally {
@@ -754,3 +803,977 @@ test("pairing-only synthetic tool progress never renews the bus deadline", async
 		await shutdown(session);
 	}
 }, 30_000);
+
+/** Drive the production AgentSession listener and its extension-event cloning. */
+function productionToolEmitter(bus: BusSession) {
+	const agent = new Agent({
+		initialState: { model: getBundledModel("anthropic", "claude-sonnet-4-5"), tools: [], messages: [] },
+	});
+	let deliver: ((event: AgentEvent) => void) | undefined;
+	const subscription = spyOn(agent, "subscribe").mockImplementation(listener => {
+		deliver = listener;
+		return () => {};
+	});
+	const clones: object[] = [];
+	const runner = {
+		hasHandlers: (type: string) => type === "tool_execution_start" || type === "tool_execution_end",
+		emit: async (event: { type: string }) => {
+			clones.push(event);
+			await bus.handlers.get(event.type)?.(event, bus.sessionContext);
+		},
+	} as unknown as ExtensionRunner;
+	const session = new AgentSession({
+		agent,
+		sessionManager: SessionManager.inMemory(),
+		settings: Settings.isolated({ "compaction.enabled": false }),
+		modelRegistry: {} as never,
+		extensionRunner: runner,
+	});
+	subscription.mockRestore();
+	return {
+		session,
+		clones,
+		emit: async (event: AgentEvent) => {
+			if (!deliver) throw new Error("AgentSession did not subscribe to its agent");
+			await deliver(event);
+		},
+	};
+}
+
+async function promptResult(session: BusSession): Promise<Record<string, unknown>> {
+	const id = `result-${session.frames.length}`;
+	session.socket.send(
+		JSON.stringify({
+			type: "query_request",
+			id,
+			query: "turn.result",
+			input: { kind: "prompt", ...session.correlation },
+		}),
+	);
+	await waitFor(
+		() => session.frames.some(frame => frame.type === "query_response" && frame.id === id),
+		"durable result",
+	);
+	const response = session.frames.find(frame => frame.type === "query_response" && frame.id === id)!;
+	expect(response.ok).toBe(true);
+	return response.result as Record<string, unknown>;
+}
+
+async function completeNaturally(session: BusSession): Promise<void> {
+	await session.handlers.get("agent_end")?.(
+		{
+			type: "agent_end",
+			stopReason: "completed",
+			messages: [{ role: "assistant", stopReason: "stop", content: [{ type: "text", text: "finished" }] }],
+		},
+		session.sessionContext,
+	);
+	await waitFor(
+		() =>
+			session.frames.some(frame => frame.type === "agent_end" && frame.commandId === session.correlation.commandId),
+		"natural terminal",
+	);
+	expect(await promptResult(session)).toMatchObject({
+		status: "terminal_ok",
+		receiptState: "present",
+		content: { text: "finished" },
+	});
+	expect(session.deadlineTerminals()).toHaveLength(0);
+}
+
+for (const synthetic of [true, false]) {
+	test(`AgentSession extension clones ${synthetic ? "preserve pairing-only provenance" : "renew genuine tool progress"} on the bus`, async () => {
+		const bus = await acceptPrompt(`production-${synthetic}`, LEASE_MS, 60_000);
+		const producer = productionToolEmitter(bus);
+		try {
+			await Bun.sleep(600);
+			const start: AgentEvent = {
+				type: "tool_execution_start",
+				toolCallId: "production-tool",
+				toolName: "read",
+				args: {},
+			};
+			const end: AgentEvent = {
+				type: "tool_execution_end",
+				toolCallId: "production-tool",
+				toolName: "read",
+				result: { content: [{ type: "text", text: "tool result" }] },
+				isError: false,
+			};
+			for (const original of [start, end]) {
+				if (synthetic) markNonDispatchedToolEvent(original);
+				await producer.emit(original);
+				const clone = producer.clones.at(-1)!;
+				expect(clone).not.toBe(original);
+				expect(isNonDispatchedToolEvent(clone)).toBe(synthetic);
+			}
+			if (synthetic) {
+				await waitFor(() => bus.deadlineTerminals().length > 0, "pairing-only production deadline");
+				expect(Date.now() - bus.acceptedAt).toBeLessThan(600 + LEASE_MS);
+			} else {
+				await waitFor(() => Date.now() - bus.acceptedAt > LEASE_MS + 200, "original production deadline");
+				expect(bus.deadlineTerminals()).toHaveLength(0);
+				await completeNaturally(bus);
+			}
+		} finally {
+			await producer.session.dispose();
+			await shutdown(bus);
+		}
+	}, 30_000);
+}
+
+for (const boundary of ["claim", "fencing", "finalization"] as const) {
+	test(`progress during ${boundary} releases the deadline claim before natural success`, async () => {
+		const bus = await acceptPrompt(`release-${boundary}`, 800, 60_000);
+		const producer = productionToolEmitter(bus);
+		const reached = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const realRename = fsPromises.rename.bind(fsPromises);
+		let gated = false;
+		const rename = spyOn(fsPromises, "rename").mockImplementation(async (from, to) => {
+			if (!gated && boundary !== "fencing" && String(to).includes(".sdk-reconciliation")) {
+				const document = JSON.parse(await fsPromises.readFile(from, "utf8")) as {
+					records: Array<{
+						commandId: string;
+						pendingOutcome?: { provenance: string };
+						outcome?: { provenance: string };
+						terminalAt?: number;
+					}>;
+				};
+				const record = document.records.find(row => row.commandId === bus.correlation.commandId);
+				if (
+					record &&
+					(boundary === "claim"
+						? record.pendingOutcome?.provenance === "deadline"
+						: record.outcome?.provenance === "deadline" && record.terminalAt !== undefined)
+				) {
+					gated = true;
+					reached.resolve();
+					await release.promise;
+				}
+			}
+			return realRename(from, to);
+		});
+		if (boundary === "fencing")
+			bus.sessionContext.abortPromptAndWait = async () => {
+				if (!gated) {
+					gated = true;
+					reached.resolve();
+					await release.promise;
+				}
+				return { status: "settled", terminalScope: {} };
+			};
+		try {
+			await Promise.race([
+				reached.promise,
+				Bun.sleep(10_000).then(() => {
+					throw new Error(`No ${boundary} gate`);
+				}),
+			]);
+			await producer.emit({
+				type: "tool_execution_end",
+				toolCallId: `release-${boundary}`,
+				toolName: "read",
+				result: { content: [] },
+				isError: false,
+			});
+			release.resolve();
+			await Bun.sleep(100);
+			expect(bus.terminals(bus.correlation)).toHaveLength(0);
+			await completeNaturally(bus);
+			await Bun.sleep(900);
+			expect(bus.terminals(bus.correlation)).toHaveLength(1);
+		} finally {
+			release.resolve();
+			rename.mockRestore();
+			await producer.session.dispose();
+			await shutdown(bus);
+		}
+	}, 30_000);
+}
+
+test("agent_failed followed by an empty agent_end remains failed with a missing receipt", async () => {
+	const bus = await acceptPrompt("failure-empty", 60_000, 600_000);
+	try {
+		await bus.handlers.get("agent_failed")?.(
+			{ type: "agent_failed", error: { code: "provider_down", message: "SECRET provider response" } },
+			bus.sessionContext,
+		);
+		await bus.handlers.get("agent_end")?.(
+			{ type: "agent_end", stopReason: "completed", messages: [] },
+			bus.sessionContext,
+		);
+		await waitFor(() => bus.frames.some(frame => frame.type === "agent_failed" && frame.outcome), "failed terminal");
+		expect(
+			bus.frames.some(frame => frame.type === "agent_end" && frame.commandId === bus.correlation.commandId),
+		).toBe(false);
+		expect(await promptResult(bus)).toMatchObject({
+			status: "failed",
+			receiptState: "missing",
+			error: { code: "provider_down" },
+			outcome: { kind: "failed", provenance: "agent_failed" },
+		});
+		expect(JSON.stringify(bus.frames)).not.toContain("SECRET");
+	} finally {
+		await shutdown(bus);
+	}
+}, 30_000);
+
+test("expiry diagnostics contain bounded lease state and exact correlation but no prompt data", async () => {
+	const log = spyOn(logger, "error");
+	const bus = await acceptPrompt("safe-diagnostic", 400, 60_000);
+	try {
+		await waitFor(() => bus.deadlineTerminals().length > 0, "diagnostic deadline");
+		const call = log.mock.calls.find(
+			([name, detail]) =>
+				name === "sdk_prompt_terminal_failed" &&
+				(detail as { commandId?: string })?.commandId === bus.correlation.commandId,
+		);
+		expect(call).toBeDefined();
+		const detail = call![1] as Record<string, unknown>;
+		expect(detail).toMatchObject({ ...bus.correlation, leaseMs: 400, maxMs: 60_000, generation: 0 });
+		expect(detail.lastProgressAt).toBe(detail.acceptedAt);
+		expect(detail.effectiveDeadline).toBe(Number(detail.acceptedAt) + 400);
+		expect(JSON.stringify(detail)).not.toContain("deadline safe-diagnostic");
+	} finally {
+		log.mockRestore();
+		await shutdown(bus);
+	}
+}, 30_000);
+
+for (const terminal of ["cancel", "provider_failure"] as const) {
+	test(`superseded fencing preserves a concurrent ${terminal} terminal`, async () => {
+		const bus = await acceptPrompt(`race-${terminal}`, 800, 60_000);
+		const release = Promise.withResolvers<void>();
+		let gated = false;
+		bus.sessionContext.abortPromptAndWait = async () => {
+			if (!gated) {
+				gated = true;
+				await release.promise;
+			}
+			return { status: "settled", terminalScope: {} };
+		};
+		try {
+			await waitFor(() => gated, "in-flight fencing");
+			bus.handlers.get("tool_execution_end")?.(
+				{
+					type: "tool_execution_end",
+					toolCallId: "race-tool",
+					toolName: "read",
+					result: { content: [] },
+					isError: false,
+				},
+				bus.sessionContext,
+			);
+			if (terminal === "cancel") {
+				bus.socket.send(
+					JSON.stringify({
+						type: "control_request",
+						id: "race-cancel",
+						operation: "turn.abort",
+						input: {},
+						idempotencyKey: "race-cancel",
+					}),
+				);
+			} else {
+				await bus.handlers.get("agent_failed")?.(
+					{ type: "agent_failed", error: { code: "provider_down", message: "private failure" } },
+					bus.sessionContext,
+				);
+				await bus.handlers.get("agent_end")?.(
+					{ type: "agent_end", stopReason: "completed", messages: [] },
+					bus.sessionContext,
+				);
+			}
+			release.resolve();
+			await waitFor(
+				() => bus.frames.some(frame => frame.commandId === bus.correlation.commandId && frame.outcome),
+				"race terminal",
+			);
+			const result = await promptResult(bus);
+			if (terminal === "cancel") {
+				expect(result).toMatchObject({
+					status: "terminal_ok",
+					outcome: { kind: "stopped", reason: "cancelled", provenance: "client_cancel" },
+				});
+			} else {
+				expect(result).toMatchObject({
+					status: "failed",
+					receiptState: "missing",
+					error: { code: "provider_down" },
+					outcome: { kind: "failed", provenance: "agent_failed" },
+				});
+			}
+			expect(bus.deadlineTerminals()).toHaveLength(0);
+			await Bun.sleep(900);
+			expect(
+				bus.frames.filter(frame => frame.commandId === bus.correlation.commandId && frame.outcome),
+			).toHaveLength(1);
+		} finally {
+			release.resolve();
+			await shutdown(bus);
+		}
+	}, 30_000);
+}
+
+test("progress during fencing cannot supersede the acceptance-anchored hard maximum", async () => {
+	const bus = await acceptPrompt("fencing-cap", 400, 400);
+	const release = Promise.withResolvers<void>();
+	let gated = false;
+	bus.sessionContext.abortPromptAndWait = async () => {
+		gated = true;
+		await release.promise;
+		return { status: "settled", terminalScope: {} };
+	};
+	try {
+		await waitFor(() => gated, "hard-cap fencing");
+		bus.handlers.get("tool_execution_start")?.(
+			{ type: "tool_execution_start", toolCallId: "cap-fence-tool", toolName: "read", args: {} },
+			bus.sessionContext,
+		);
+		release.resolve();
+		await waitFor(() => bus.deadlineTerminals().length > 0, "hard-cap terminal");
+		expect(bus.deadlineTerminals()).toHaveLength(1);
+		expect(await promptResult(bus)).toMatchObject({
+			status: "failed",
+			receiptState: "missing",
+			outcome: { code: "prompt_deadline_exceeded" },
+		});
+	} finally {
+		release.resolve();
+		await shutdown(bus);
+	}
+}, 30_000);
+
+test("a natural agent_end emitted by awaited fencing does not deadlock its expiry owner", async () => {
+	const bus = await acceptPrompt("fencing-agent-end", 800, 60_000);
+	bus.sessionContext.abortPromptAndWait = async () => {
+		bus.handlers.get("tool_execution_end")?.(
+			{
+				type: "tool_execution_end",
+				toolCallId: "settled-tool",
+				toolName: "read",
+				result: { content: [] },
+				isError: false,
+			},
+			bus.sessionContext,
+		);
+		await bus.handlers.get("agent_end")?.(
+			{
+				type: "agent_end",
+				stopReason: "completed",
+				messages: [{ role: "assistant", stopReason: "stop", content: [{ type: "text", text: "settled receipt" }] }],
+			},
+			bus.sessionContext,
+		);
+		return { status: "settled", terminalScope: {} };
+	};
+	try {
+		await waitFor(
+			() => bus.frames.some(frame => frame.type === "agent_end" && frame.commandId === bus.correlation.commandId),
+			"fencing-owned natural terminal",
+		);
+		expect(bus.deadlineTerminals()).toHaveLength(0);
+		expect(await promptResult(bus)).toMatchObject({
+			status: "terminal_ok",
+			receiptState: "present",
+			content: { text: "settled receipt" },
+		});
+	} finally {
+		await shutdown(bus);
+	}
+}, 30_000);
+
+test("deadline release retains acceptance and receipt evidence and refuses stale or non-deadline owners", async () => {
+	let now = 100;
+	const reconciliation = createKindAwareReconciliation({ now: () => now });
+	const correlation = { commandId: "release-command", turnId: "release-turn" };
+	const deadline = {
+		kind: "failed",
+		code: "prompt_deadline_exceeded",
+		message: "Prompt deadline exceeded.",
+		provenance: "deadline",
+	} as const;
+	await reconciliation.noteAccepted("prompt", correlation);
+	await reconciliation.noteTransition("prompt", correlation, { type: "agent_start" });
+	await reconciliation.claimPendingOutcome("prompt", correlation, deadline, "present");
+	await reconciliation.releaseDeadlineOutcome("prompt", correlation, () => false);
+	expect(reconciliation.peekPendingOutcome("prompt", correlation)).toEqual(deadline);
+	await reconciliation.finalizeOutcome("prompt", correlation, deadline, undefined, "retained receipt");
+	now = 200;
+	await reconciliation.releaseDeadlineOutcome("prompt", correlation, () => true);
+	expect(reconciliation.lookup("prompt", correlation)).toMatchObject({
+		status: "in_flight",
+		acceptedAt: 100,
+		startedAt: 100,
+	});
+	expect(reconciliation.peekPendingOutcome("prompt", correlation)).toBeUndefined();
+	const cancelled = { kind: "stopped", reason: "cancelled", provenance: "client_cancel" } as const;
+	await reconciliation.claimPendingOutcome("prompt", correlation, cancelled, "missing");
+	await reconciliation.releaseDeadlineOutcome("prompt", correlation, () => true);
+	expect(reconciliation.peekPendingOutcome("prompt", correlation)).toEqual(cancelled);
+	await reconciliation.finalizeOutcome("prompt", correlation, cancelled);
+	const settled = reconciliation.lookupResult("prompt", correlation);
+	expect(settled).toMatchObject({
+		status: "terminal_ok",
+		acceptedAt: 100,
+		receiptState: "present",
+		content: { text: "retained receipt" },
+		outcome: cancelled,
+	});
+	await reconciliation.releaseDeadlineOutcome("prompt", correlation, () => true);
+	expect(reconciliation.lookupResult("prompt", correlation)).toEqual(settled);
+});
+
+for (const providerFailure of [false, true]) {
+	test(`superseded finalization stays query-invisible through compensation${providerFailure ? " and preserves provider receipt" : ""}`, async () => {
+		const bus = await acceptPrompt(`compensation-${providerFailure}`, 2_000, 60_000);
+		const finalizeReached = Promise.withResolvers<void>();
+		const releaseFinalize = Promise.withResolvers<void>();
+		const compensationReached = Promise.withResolvers<void>();
+		const releaseCompensation = Promise.withResolvers<void>();
+		const realRename = fsPromises.rename.bind(fsPromises);
+		let finalized = false;
+		let compensated = false;
+		let projected = false;
+		bus.sessionContext.recordCommittedPromptFailure = async () => {
+			projected = true;
+			return "persisted";
+		};
+		const rename = spyOn(fsPromises, "rename").mockImplementation(async (from, to) => {
+			if (String(to).includes(".sdk-reconciliation")) {
+				const document = JSON.parse(await fsPromises.readFile(from, "utf8")) as {
+					records: Array<{ commandId: string; terminalAt?: number; outcome?: { provenance?: string } }>;
+				};
+				const row = document.records.find(record => record.commandId === bus.correlation.commandId);
+				if (!finalized && row?.terminalAt !== undefined && row.outcome?.provenance === "deadline") {
+					finalized = true;
+					finalizeReached.resolve();
+					await releaseFinalize.promise;
+				} else if (finalized && !compensated && row && row.terminalAt === undefined) {
+					compensated = true;
+					compensationReached.resolve();
+					await releaseCompensation.promise;
+				}
+			}
+			return realRename(from, to);
+		});
+		try {
+			await finalizeReached.promise;
+			bus.handlers.get("tool_execution_end")?.(
+				{
+					type: "tool_execution_end",
+					toolCallId: "compensation-progress",
+					toolName: "read",
+					result: { content: [] },
+				},
+				bus.sessionContext,
+			);
+			const diagnostic = providerFailure
+				? bus.handlers.get("agent_failed")?.(
+						{ type: "agent_failed", error: { code: "provider_down", message: "private provider text" } },
+						bus.sessionContext,
+					)
+				: undefined;
+			releaseFinalize.resolve();
+			await compensationReached.promise;
+			expect(await promptResult(bus)).toMatchObject({ status: "in_flight", receiptState: "absent" });
+			expect(bus.deadlineTerminals()).toHaveLength(0);
+			expect(projected).toBe(false);
+			releaseCompensation.resolve();
+			await diagnostic;
+			await bus.handlers.get("agent_end")?.(
+				{
+					type: "agent_end",
+					stopReason: "completed",
+					messages: [
+						{
+							role: "assistant",
+							stopReason: "stop",
+							content: [{ type: "text", text: "retained provider receipt" }],
+						},
+					],
+				},
+				bus.sessionContext,
+			);
+			await waitFor(
+				() => bus.frames.some(frame => frame.commandId === bus.correlation.commandId && frame.outcome),
+				"compensated terminal",
+			);
+			expect(await promptResult(bus)).toMatchObject({
+				status: providerFailure ? "failed" : "terminal_ok",
+				receiptState: "present",
+				content: { text: "retained provider receipt" },
+				...(providerFailure ? { error: { code: "provider_down" } } : {}),
+			});
+			expect(projected).toBe(false);
+			expect(
+				bus.frames.filter(frame => frame.commandId === bus.correlation.commandId && frame.outcome),
+			).toHaveLength(1);
+		} finally {
+			releaseFinalize.resolve();
+			releaseCompensation.resolve();
+			rename.mockRestore();
+			await shutdown(bus);
+		}
+	}, 30_000);
+}
+
+for (const superseded of [false, true]) {
+	test(`production deadline abort with an empty runtime terminal ${superseded ? "does not persist a superseded failure" : "projects committed failure into its sidecar"}`, async () => {
+		const oldFile = process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV];
+		const oldId = process.env[GJC_COORDINATOR_SESSION_ID_ENV];
+		const bus = await acceptPrompt(`sidecar-${superseded}`, 2_000, 60_000, { startAgent: false });
+		const stateFile = path.join(bus.cwd, "runtime-state.json");
+		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
+		process.env[GJC_COORDINATOR_SESSION_ID_ENV] = `deadline-sidecar-${superseded}`;
+		const auth = await AuthStorage.create(path.join(bus.cwd, "auth.db"));
+		auth.setRuntimeApiKey("anthropic", "test-key");
+		const modelRegistry = new ModelRegistry(auth);
+		const settings = Settings.isolated({ "compaction.enabled": false });
+		const manager = SessionManager.inMemory();
+		const runner = new ExtensionRunner(
+			[],
+			{ flagValues: new Map(), pendingProviderRegistrations: [] } as never,
+			bus.cwd,
+			manager,
+			modelRegistry,
+			undefined,
+			settings,
+		);
+		const releaseModel = Promise.withResolvers<void>();
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: {
+				model: getBundledModel("anthropic", "claude-sonnet-4-5"),
+				systemPrompt: ["Test"],
+				tools: [],
+				messages: [],
+			},
+			streamFn: createMockModel({
+				responses: [
+					async () => {
+						await releaseModel.promise;
+						return { content: ["   "] };
+					},
+					{ content: ["successor receipt"] },
+				],
+			}).stream,
+		});
+		const session = new AgentSession({
+			agent,
+			sessionManager: manager,
+			settings,
+			modelRegistry,
+			extensionRunner: runner,
+		});
+		const events: string[] = [];
+		const originalEmit = runner.emit.bind(runner);
+		const consumer = spyOn(runner, "emit").mockImplementation(async (event, continueWhile, scope) => {
+			events.push(event.type);
+			await bus.handlers.get(event.type)?.(event, bus.sessionContext);
+			return originalEmit(event, continueWhile, scope);
+		});
+		bus.sessionContext.getActivePromptHandle = () => session.activePromptHandle;
+		let handle: string | undefined;
+		let projections = 0;
+		bus.sessionContext.recordCommittedPromptFailure = async (
+			executionHandle: string,
+			failure: { code: "prompt_deadline_exceeded"; message: "Prompt deadline exceeded." },
+			isCurrent: () => boolean,
+		) => {
+			projections++;
+			if (!handle) throw new Error("Expected captured execution handle");
+			expect(executionHandle).toBe(handle);
+			expect(await promptResult(bus)).toMatchObject({ status: "failed", outcome: { provenance: "deadline" } });
+			return recordCommittedPromptFailure(session, executionHandle, failure, isCurrent);
+		};
+		bus.sessionContext.abortPromptAndWait = async (executionHandle: string, options: { graceMs: number }) => {
+			if (superseded)
+				await bus.handlers.get("tool_execution_end")?.(
+					{
+						type: "tool_execution_end",
+						toolCallId: "before-abort-progress",
+						toolName: "read",
+						result: { content: [] },
+					},
+					bus.sessionContext,
+				);
+			const abort = session.abortPromptAndWait(executionHandle, options);
+			releaseModel.resolve();
+			return abort;
+		};
+		const sdkRunCapability = bus.acceptFailure.sdkRunCapabilities?.[0];
+		expect(readSdkRunCapability(sdkRunCapability)).toBeDefined();
+		// Forward the actual capability minted by ordinary bus admission; the
+		// fixture never invents a run token or repairs missing production input.
+		const prompt = session.prompt("wait for deadline", { sdkRunCapability });
+		try {
+			await waitFor(() => session.activePromptHandle !== undefined, "real runtime execution handle");
+			handle = session.activePromptHandle;
+			await waitFor(
+				() => bus.frames.some(frame => frame.commandId === bus.correlation.commandId && frame.outcome),
+				"production deadline terminal",
+			);
+			await prompt;
+			await session.waitForIdle();
+			expect(events).toContain("agent_end");
+			expect(events).not.toContain("agent_failed");
+			if (superseded) {
+				expect(projections).toBe(0);
+				expect(bus.deadlineTerminals()).toHaveLength(0);
+			} else {
+				expect(projections).toBe(1);
+				expect(bus.deadlineTerminals()).toHaveLength(1);
+			}
+			const state = JSON.parse(await Bun.file(stateFile).text()) as Record<string, unknown>;
+			if (superseded) expect(state.error).not.toMatchObject({ code: "prompt_deadline_exceeded" });
+			else
+				expect(state).toMatchObject({
+					execution_state: "failed",
+					receipt_state: "absent",
+					run_failure: { code: "prompt_deadline_exceeded" },
+				});
+			// Retrying a captured predecessor failure after a clean successor must
+			// neither borrow its identity nor replace its receipt.
+			await session.prompt("successor");
+			await session.waitForIdle();
+			await waitFor(() => events.filter(event => event === "agent_end").length === 2, "successor terminal");
+			await waitFor(
+				() =>
+					fs.existsSync(stateFile) &&
+					JSON.parse(fs.readFileSync(stateFile, "utf8")).final_response?.text === "successor receipt",
+				"successor receipt persistence",
+			);
+			const before = await Bun.file(stateFile).text();
+			expect(
+				await recordCommittedPromptFailure(
+					session,
+					handle!,
+					{ code: "prompt_deadline_exceeded", message: "Prompt deadline exceeded." },
+					() => true,
+				),
+			).toBe("stale");
+			expect(await Bun.file(stateFile).text()).toBe(before);
+		} finally {
+			releaseModel.resolve();
+			await prompt.catch(() => {});
+			consumer.mockRestore();
+			await session.dispose();
+			auth.close();
+			await shutdown(bus);
+			if (oldFile === undefined) delete process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV];
+			else process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = oldFile;
+			if (oldId === undefined) delete process.env[GJC_COORDINATOR_SESSION_ID_ENV];
+			else process.env[GJC_COORDINATOR_SESSION_ID_ENV] = oldId;
+		}
+	}, 30_000);
+}
+
+test("committed deadline projection retries only its exact handle and cannot be superseded after commitment", async () => {
+	const bus = await acceptPrompt("projection-retry", 500, 60_000);
+	const reached = Promise.withResolvers<void>();
+	const release = Promise.withResolvers<void>();
+	let attempts = 0;
+	bus.sessionContext.recordCommittedPromptFailure = async (
+		handle: string,
+		failure: unknown,
+		isCurrent: () => boolean,
+	) => {
+		expect(handle).toBe("bus-deadline-run-handle");
+		expect(failure).toEqual({ code: "prompt_deadline_exceeded", message: "Prompt deadline exceeded." });
+		expect(isCurrent()).toBe(true);
+		attempts++;
+		if (attempts < 3) throw new Error("transient projection write failure");
+		reached.resolve();
+		await release.promise;
+		expect(isCurrent()).toBe(true);
+		return "persisted";
+	};
+	try {
+		await reached.promise;
+		expect(await promptResult(bus)).toMatchObject({ status: "failed", outcome: { provenance: "deadline" } });
+		bus.handlers.get("tool_execution_end")?.(
+			{ type: "tool_execution_end", toolCallId: "postcommit-progress", toolName: "read", result: { content: [] } },
+			bus.sessionContext,
+		);
+		release.resolve();
+		await waitFor(() => bus.deadlineTerminals().length === 1, "committed projection terminal");
+		expect(attempts).toBe(3);
+		expect(await promptResult(bus)).toMatchObject({ status: "failed", outcome: { provenance: "deadline" } });
+	} finally {
+		release.resolve();
+		await shutdown(bus);
+	}
+}, 30_000);
+
+test("a registered stalled projection cannot hold the committed wire terminal or mutate a successor", async () => {
+	const bus = await acceptPrompt("projection-stalled", 500, 60_000);
+	const producer = productionToolEmitter(bus);
+	const release = Promise.withResolvers<void>();
+	const entered = Promise.withResolvers<void>();
+	const settled = Promise.withResolvers<void>();
+	const log = spyOn(logger, "error");
+	let calls = 0;
+	let writes = 0;
+	let current: (() => boolean) | undefined;
+	registerCommittedPromptFailureWriter(producer.session, async (handle, failure, isCurrent) => {
+		calls++;
+		expect(handle).toBe("bus-deadline-run-handle");
+		expect(failure.code).toBe("prompt_deadline_exceeded");
+		current = isCurrent;
+		entered.resolve();
+		// Never settles during the entire observation window. Release only
+		// after a successor exists to exercise the late-write authority fence.
+		await release.promise;
+		if (isCurrent()) writes++;
+		settled.resolve();
+		return isCurrent() ? "persisted" : "stale";
+	});
+	bus.sessionContext.recordCommittedPromptFailure = (
+		handle: string,
+		failure: { code: "prompt_deadline_exceeded"; message: "Prompt deadline exceeded." },
+		isCurrent: () => boolean,
+	) => recordCommittedPromptFailure(producer.session, handle, failure, isCurrent);
+	try {
+		await entered.promise;
+		const observationStarted = Date.now();
+		expect(await promptResult(bus)).toMatchObject({ status: "failed", outcome: { provenance: "deadline" } });
+		await waitFor(() => bus.deadlineTerminals().length === 1, "bounded stalled projection terminal", 13_000);
+		expect(Date.now() - observationStarted).toBeLessThan(12_500);
+		expect(calls).toBe(1);
+		expect(current?.()).toBe(false);
+		expect(
+			log.mock.calls.some(
+				([name, detail]) =>
+					name === "sdk_prompt_failure_projection_unresolved" &&
+					(detail as { commandId?: string; retryable?: boolean })?.commandId === bus.correlation.commandId &&
+					(detail as { retryable?: boolean }).retryable === true,
+			),
+		).toBe(true);
+		await bus.handlers.get("agent_end")?.(
+			{ type: "agent_end", stopReason: "completed", messages: [] },
+			bus.sessionContext,
+		);
+		const ack = await sendPrompt(bus, "after-stalled-projection");
+		expect(ack.ok).toBe(true);
+		const successor = { commandId: String(ack.result?.commandId), turnId: String(ack.result?.turnId) };
+		await bus.handlers.get("agent_start")?.({ type: "agent_start" }, bus.sessionContext);
+		release.resolve();
+		await settled.promise;
+		await Bun.sleep(100);
+		expect(writes).toBe(0);
+		expect(calls).toBe(1);
+		expect(bus.deadlineTerminals()).toHaveLength(1);
+		expect(bus.terminals(successor)).toHaveLength(0);
+		await bus.handlers.get("agent_end")?.(
+			{ type: "agent_end", stopReason: "completed", messages: [] },
+			bus.sessionContext,
+		);
+		await waitFor(() => bus.terminals(successor).length === 1, "successor terminal after stalled projection");
+		expect(bus.deadlineTerminals()).toHaveLength(1);
+	} finally {
+		release.resolve();
+		log.mockRestore();
+		await producer.session.dispose();
+		await shutdown(bus);
+	}
+}, 30_000);
+
+test("real atomic projection fsync timeout cannot publish predecessor failure before a successor", async () => {
+	const oldFile = process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV];
+	const oldId = process.env[GJC_COORDINATOR_SESSION_ID_ENV];
+	const bus = await acceptPrompt("atomic-projection-timeout", 2_000, 60_000, { startAgent: false });
+	const stateFile = path.join(bus.cwd, "runtime-state.json");
+	process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
+	process.env[GJC_COORDINATOR_SESSION_ID_ENV] = "atomic-projection-timeout";
+	const auth = await AuthStorage.create(path.join(bus.cwd, "auth.db"));
+	auth.setRuntimeApiKey("anthropic", "test-key");
+	const modelRegistry = new ModelRegistry(auth);
+	const settings = Settings.isolated({ "compaction.enabled": false });
+	const manager = SessionManager.inMemory();
+	const runner = new ExtensionRunner(
+		[],
+		{ flagValues: new Map(), pendingProviderRegistrations: [] } as never,
+		bus.cwd,
+		manager,
+		modelRegistry,
+		undefined,
+		settings,
+	);
+	const releaseModel = Promise.withResolvers<void>();
+	const mock = createMockModel({
+		responses: [
+			async () => {
+				await releaseModel.promise;
+				return { content: ["   "] };
+			},
+			{ content: ["atomic successor receipt"] },
+		],
+	});
+	const agent = new Agent({
+		getApiKey: () => "test-key",
+		initialState: {
+			model: getBundledModel("anthropic", "claude-sonnet-4-5"),
+			systemPrompt: ["Test"],
+			tools: [],
+			messages: [],
+		},
+		streamFn: mock.stream,
+	});
+	const session = new AgentSession({
+		agent,
+		sessionManager: manager,
+		settings,
+		modelRegistry,
+		extensionRunner: runner,
+	});
+	const originalEmit = runner.emit.bind(runner);
+	const events: string[] = [];
+	const consumer = spyOn(runner, "emit").mockImplementation(async (event, continueWhile, scope) => {
+		events.push(event.type);
+		await bus.handlers.get(event.type)?.(event, bus.sessionContext);
+		return originalEmit(event, continueWhile, scope);
+	});
+	const entered = Promise.withResolvers<void>();
+	const releaseSync = Promise.withResolvers<void>();
+	const projectionSettled = Promise.withResolvers<void>();
+	const open = fsPromises.open;
+	const rename = fsPromises.rename;
+	let projectionStarted = false;
+	let temporary: string | undefined;
+	const syncSpies: Array<{ mockRestore(): void }> = [];
+	let projectionCalls = 0;
+	let projectionResult: "persisted" | "stale" | undefined;
+	const publications: Record<string, unknown>[] = [];
+	const openSpy = spyOn(fsPromises, "open").mockImplementation(async (file, flags, mode) => {
+		const handle = await open(file, flags, mode);
+		if (
+			projectionStarted &&
+			!temporary &&
+			String(file).startsWith(`${stateFile}.`) &&
+			String(file).endsWith(".tmp")
+		) {
+			const sync = handle.sync.bind(handle);
+			const syncSpy = spyOn(handle, "sync").mockImplementation(async () => {
+				const payload = (await Bun.file(String(file)).json()) as { run_failure?: { code?: string } };
+				if (!temporary && payload.run_failure?.code === "prompt_deadline_exceeded") {
+					temporary = String(file);
+					entered.resolve();
+					await releaseSync.promise;
+				}
+				await sync();
+			});
+			syncSpies.push(syncSpy);
+		}
+		return handle;
+	});
+	const renameSpy = spyOn(fsPromises, "rename").mockImplementation(async (source, destination) => {
+		if (String(destination) === stateFile)
+			publications.push((await Bun.file(String(source)).json()) as Record<string, unknown>);
+		await rename(source, destination);
+	});
+	bus.sessionContext.getActivePromptHandle = () => session.activePromptHandle;
+	bus.sessionContext.abortPromptAndWait = (handle: string, options: { graceMs: number }) => {
+		const abort = session.abortPromptAndWait(handle, options);
+		releaseModel.resolve();
+		return abort;
+	};
+	bus.sessionContext.recordCommittedPromptFailure = async (
+		handle: string,
+		failure: { code: "prompt_deadline_exceeded"; message: "Prompt deadline exceeded." },
+		isCurrent: () => boolean,
+	) => {
+		projectionCalls++;
+		projectionStarted = true;
+		try {
+			// Invoke the actual AgentSession-registered writer and its atomic I/O.
+			projectionResult = await recordCommittedPromptFailure(session, handle, failure, isCurrent);
+			return projectionResult;
+		} finally {
+			projectionSettled.resolve();
+		}
+	};
+	const capability = bus.acceptFailure.sdkRunCapabilities?.[0];
+	expect(readSdkRunCapability(capability)).toBeDefined();
+	const prompt = session.prompt("wait for atomic deadline", { sdkRunCapability: capability });
+	let successorPrompt: Promise<void> | undefined;
+	try {
+		await entered.promise;
+		const observationStarted = Date.now();
+		expect(temporary).toBeDefined();
+		const candidate = (await Bun.file(temporary!).json()) as Record<string, unknown>;
+		expect(candidate.run_failure).toMatchObject({ code: "prompt_deadline_exceeded" });
+		const before = await Bun.file(stateFile).text();
+		const publicationBoundary = publications.length;
+		expect(await promptResult(bus)).toMatchObject({ status: "failed", outcome: { provenance: "deadline" } });
+		await waitFor(
+			() => bus.deadlineTerminals().length === 1,
+			"wire terminal while real fsync remains blocked",
+			13_000,
+		);
+		expect(Date.now() - observationStarted).toBeGreaterThan(9_000);
+		expect(Date.now() - observationStarted).toBeLessThan(12_500);
+		expect(projectionCalls).toBe(1);
+		expect(projectionResult).toBeUndefined();
+		expect(await Bun.file(stateFile).text()).toBe(before);
+		expect(publications).toHaveLength(publicationBoundary);
+		await prompt;
+		expect(events).not.toContain("agent_failed");
+		const ack = await sendPrompt(bus, "atomic-successor");
+		expect(ack.ok).toBe(true);
+		const successor = { commandId: String(ack.result?.commandId), turnId: String(ack.result?.turnId) };
+		const successorCapability = bus.acceptFailure.sdkRunCapabilities?.[0];
+		expect(readSdkRunCapability(successorCapability)).toBeDefined();
+		successorPrompt = session.prompt("atomic successor", { sdkRunCapability: successorCapability });
+		await waitFor(
+			() => events.filter(type => type === "agent_start").length === 2,
+			"successor admitted while predecessor fsync is blocked",
+		);
+		// Inspect every rename, including the interval before successor publication:
+		// final-file checks alone would miss a transient stale failure overwrite.
+		releaseSync.resolve();
+		await projectionSettled.promise;
+		expect(projectionResult).toBe("stale");
+		await successorPrompt;
+		await session.waitForIdle();
+		await waitFor(
+			() =>
+				fs.existsSync(stateFile) &&
+				JSON.parse(fs.readFileSync(stateFile, "utf8")).final_response?.text === "atomic successor receipt",
+			"atomic successor receipt persistence",
+		);
+		expect(await Bun.file(temporary!).exists()).toBe(false);
+		const after = publications.slice(publicationBoundary);
+		expect(after.length).toBeGreaterThan(0);
+		expect(
+			after.some(payload => payload.state === "running" && payload.run_provenance !== candidate.run_provenance),
+		).toBe(true);
+		expect(after.every(payload => payload.run_failure === undefined)).toBe(true);
+		expect(await Bun.file(stateFile).json()).toMatchObject({
+			execution_state: "terminal_ok",
+			receipt_state: "present",
+			final_response: { text: "atomic successor receipt" },
+		});
+		expect(mock.calls).toHaveLength(2);
+		expect(projectionCalls).toBe(1);
+		expect(bus.deadlineTerminals()).toHaveLength(1);
+		expect(bus.terminals(successor)).toHaveLength(1);
+	} finally {
+		releaseSync.resolve();
+		releaseModel.resolve();
+		await Promise.allSettled([prompt, ...(successorPrompt ? [successorPrompt] : [])]);
+		if (projectionStarted) await projectionSettled.promise;
+		for (const spy of syncSpies) spy.mockRestore();
+		openSpy.mockRestore();
+		renameSpy.mockRestore();
+		consumer.mockRestore();
+		await session.dispose();
+		auth.close();
+		await shutdown(bus);
+		if (oldFile === undefined) delete process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV];
+		else process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = oldFile;
+		if (oldId === undefined) delete process.env[GJC_COORDINATOR_SESSION_ID_ENV];
+		else process.env[GJC_COORDINATOR_SESSION_ID_ENV] = oldId;
+	}
+}, 40_000);

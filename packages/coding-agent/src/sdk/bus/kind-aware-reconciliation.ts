@@ -682,22 +682,43 @@ export function createKindAwareReconciliation(
 		arg4?: (() => boolean) | { code: string; message: string },
 		arg5?: { code: string; message: string } | unknown,
 		arg6?: unknown,
-	) => {
-		const isCurrent = typeof arg4 === "function" ? arg4 : typeof arg6 === "function" ? arg6 : undefined;
+		onCommitted?: () => void,
+	): Promise<"committed" | "superseded" | "retained" | "missing"> => {
+		const isCurrent: (() => boolean) | undefined =
+			typeof arg4 === "function" ? arg4 : typeof arg6 === "function" ? () => arg6() === true : undefined;
 		const recordError =
 			typeof arg4 === "object" && arg4 !== null && "code" in arg4
 				? arg4
 				: typeof arg5 === "object" && arg5 !== null && "code" in arg5
 					? (arg5 as { code: string; message: string })
 					: undefined;
-		const content =
-			typeof arg4 === "function" ? arg6 : typeof arg5 === "object" && arg5 !== null && "code" in arg5 ? arg6 : arg5;
+					? arg6
+					: arg5;
 		const sanitizedContent = sanitizeTurnResultContent(content);
-		await queueMutation(candidate => {
-			if (isCurrent !== undefined && !isCurrent()) return { value: undefined, changed: false };
-			const record = candidate.get(keyOf(kind, correlation));
-			if (!record || record.terminalAt !== undefined || record.kind !== kind)
+		let committed = false;
+		let superseded = false;
+		await queueMutation(
+			candidate => {
+				if (isCurrent !== undefined && !isCurrent()) {
+					superseded = true;
 				return { value: undefined, changed: false };
+				}
+			const record = candidate.get(keyOf(kind, correlation));
+				if (!record || record.kind !== kind) return { value: undefined, changed: false };
+				if (record.terminalAt !== undefined) {
+					// A queued provider diagnostic may already own this terminal. Merge
+					// deferred receipt evidence without replacing its classifier.
+					const content = reduceTurnResultContent(record.content, sanitizedContent);
+					const receipt = reduceReceiptState(
+				record.receiptState,
+						reportableTurnResultContent(content) ? "present" : undefined,
+			);
+					if (content === record.content && receipt === record.receiptState)
+				return { value: undefined, changed: false };
+					record.content = content;
+					record.receiptState = receipt;
+			return { value: undefined, changed: true };
+				}
 			const requestedOutcome = normalizeTerminalOutcome(outcome, failureEvidence(record)) ?? record.pendingOutcome;
 			const providerErrorRecord = record.error;
 			const providerError =
@@ -744,7 +765,20 @@ export function createKindAwareReconciliation(
 			delete record.pendingReceiptState;
 			cleanupRecords(candidate);
 			return { value: undefined, changed: true };
-		});
+			},
+			isCurrent,
+			() => {
+				committed = true;
+				onCommitted?.();
+			},
+			() => {
+				superseded = true;
+			},
+			);
+		if (committed) return "committed";
+		if (superseded) return "superseded";
+		const retained = records.get(keyOf(kind, correlation));
+		return retained?.terminalAt !== undefined ? "retained" : "missing";
 	};
 
 	const markUncertain = async (

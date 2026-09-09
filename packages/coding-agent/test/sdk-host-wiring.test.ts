@@ -73,7 +73,6 @@ import { reconciliationStorePath } from "../src/sdk/bus/reconciliation-store";
 import type { NotificationSessionController } from "../src/sdk/bus/session-control";
 import { SdkClient } from "../src/sdk/client";
 import { SessionSdkHost } from "../src/sdk/host";
-import { createSdkRunCapability } from "../src/sdk/host/sdk-run-capability";
 import type { SessionAttachment } from "../src/sdk/router/session-router";
 import { createAgentSession } from "../src/sdk/session";
 import {
@@ -100,7 +99,6 @@ type CapturedSendUserMessage = (
 ) => void | Promise<void>;
 type InternalCapturedOptions = NonNullable<Parameters<ExtensionActions["sendUserMessage"]>[1]> & {
 	sdkRunCapability?: unknown;
-	sdkRunToken?: unknown;
 };
 type CapturedSendCall = [Parameters<ExtensionActions["sendUserMessage"]>[0], InternalCapturedOptions?];
 
@@ -109,12 +107,13 @@ function captureInternalSend(
 	content: CapturedSendCall[0],
 	options?: InternalCapturedOptions,
 ): void {
-	if (options && typeof options.sdkRunToken === "string") {
-		const { sdkRunToken, ...publicOptions } = options;
-		sent.push([content, { ...publicOptions, sdkRunCapability: createSdkRunCapability(sdkRunToken) }]);
-		return;
-	}
 	sent.push([content, options]);
+}
+
+function sdkRunContext(ctx: Record<string, unknown>, options?: InternalCapturedOptions): Record<string, unknown> {
+	const sdkRunToken = readSdkRunCapability(options?.sdkRunCapability);
+	if (typeof sdkRunToken !== "string") throw new Error("missing private SDK run capability");
+	return { ...ctx, sdkRunToken };
 }
 
 import { getAskAnswerSource, registerAskAnswerSource } from "../src/tools/ask-answer-registry";
@@ -270,7 +269,18 @@ function start(
 ): Map<string, (event: unknown, context: unknown) => unknown> {
 	const handlers = new Map<string, (event: unknown, context: unknown) => unknown>();
 	const api = {
-		on: (event: string, handler: (event: unknown, context: unknown) => unknown) => handlers.set(event, handler),
+		on: (event: string, handler: (event: unknown, context: unknown) => unknown) =>
+			handlers.set(event, (payload, eventContext) => {
+				// Model AgentSession's event envelope only for an explicitly selected run context.
+				// Untagged contexts stay unowned; no active or most-recent token is inferred.
+				const sdkRunToken = (eventContext as { sdkRunToken?: unknown })?.sdkRunToken;
+				return handler(
+					typeof sdkRunToken === "string" && payload && typeof payload === "object"
+						? { sdkRunToken, ...payload }
+						: payload,
+					eventContext,
+				);
+			}),
 		registerCommand: (name: string, command: { handler: (args: string, ctx: unknown) => Promise<void> }) =>
 			commands.set(name, command),
 		getThinkingLevel: () =>
@@ -1766,8 +1776,9 @@ test("SDK host preserves ordered prompt image blocks in the host payload", async
 		text: "Compare these screenshots.",
 		images: [{ data: "cG5nLWJ5dGVz", mimeType: "image/png" }, { data: "ZGVmYXVsdC1taW1l" }],
 	});
-	await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
-	await handlers.get("agent_end")?.({ type: "agent_end" }, sessionContext);
+	const firstRunContext = sdkRunContext(sessionContext, sent[0]?.[1]);
+	await handlers.get("agent_start")?.({ type: "agent_start" }, firstRunContext);
+	await handlers.get("agent_end")?.({ type: "agent_end" }, firstRunContext);
 	await prompt("images-only", {
 		text: "",
 		images: [{ data: "d2VicC1ieXRlcw", mimeType: "image/webp" }],
@@ -1780,13 +1791,17 @@ test("SDK host preserves ordered prompt image blocks in the host payload", async
 				{ type: "image", data: "cG5nLWJ5dGVz", mimeType: "image/png" },
 				{ type: "image", data: "ZGVmYXVsdC1taW1l", mimeType: "image/jpeg" },
 			],
-			{ preflightSignal: expect.any(AbortSignal) },
+			{ preflightSignal: expect.any(AbortSignal), sdkRunCapability: expect.any(Object) },
 		],
 		[
 			[{ type: "image", data: "d2VicC1ieXRlcw", mimeType: "image/webp" }],
-			{ preflightSignal: expect.any(AbortSignal) },
+			{ preflightSignal: expect.any(AbortSignal), sdkRunCapability: expect.any(Object) },
 		],
 	]);
+	for (const [, options] of sent) {
+		expect(readSdkRunCapability(options?.sdkRunCapability)).toEqual(expect.any(String));
+		expect("sdkRunToken" in (options ?? {})).toBe(false);
+	}
 });
 
 test("SDK host correlates follow-up acknowledgements with the later agent start", async () => {
@@ -1851,7 +1866,7 @@ test("SDK host correlates follow-up acknowledgements with the later agent start"
 	void handlers.get("agent_end")?.({ type: "agent_end", messages: [], stopReason: "completed" }, sessionContext);
 	await Bun.sleep(10);
 	expect(frames.some(frame => frame.type === "agent_start" && frame.commandId === commandId)).toBe(false);
-	void handlers.get("agent_start")?.({ type: "agent_start", sdkRunToken }, sessionContext);
+	void handlers.get("agent_start")?.({ type: "agent_start", sdkRunToken }, sdkRunContext(sessionContext, sentOptions));
 	await waitFor(
 		() => frames.some(frame => frame.type === "agent_start" && frame.commandId === commandId),
 		"correlated agent start",
@@ -1867,7 +1882,8 @@ test("SDK host directly delivers correlated lifecycle frames for an accepted pro
 	dirs.push(cwd);
 	const sessionId = `sdk-prompt-success-${Date.now()}`;
 	const sessionContext = context(cwd, sessionId);
-	const handlers = start(sessionContext);
+	const sent: CapturedSendCall[] = [];
+	const handlers = start(sessionContext, undefined, (...args) => captureInternalSend(sent, ...args));
 	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
 	await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
 	const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
@@ -1910,14 +1926,15 @@ test("SDK host directly delivers correlated lifecycle frames for an accepted pro
 		ok: true,
 		result: { accepted: true, commandId: expect.any(String), turnId: expect.any(String) },
 	});
-	await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
+	const runContext = sdkRunContext(sessionContext, sent[0]?.[1]);
+	await handlers.get("agent_start")?.({ type: "agent_start" }, runContext);
 	await handlers.get("message_update")?.(
 		{
 			type: "message_update",
 			message: { role: "assistant", content: [{ type: "text", text: "hi" }] },
 			assistantMessageEvent: { type: "text_delta", delta: "hi" },
 		},
-		sessionContext,
+		runContext,
 	);
 	await handlers.get("tool_execution_start")?.(
 		{
@@ -1926,7 +1943,7 @@ test("SDK host directly delivers correlated lifecycle frames for an accepted pro
 			toolName: "read",
 			args: { path: "README.md" },
 		},
-		sessionContext,
+		runContext,
 	);
 	await handlers.get("tool_execution_update")?.(
 		{
@@ -1936,7 +1953,7 @@ test("SDK host directly delivers correlated lifecycle frames for an accepted pro
 			args: { path: "README.md" },
 			partialResult: { content: [{ type: "text", text: "reading" }] },
 		},
-		sessionContext,
+		runContext,
 	);
 	await handlers.get("tool_execution_end")?.(
 		{
@@ -1946,7 +1963,7 @@ test("SDK host directly delivers correlated lifecycle frames for an accepted pro
 			result: { content: [{ type: "text", text: "# Gajae-Code" }] },
 			isError: false,
 		},
-		sessionContext,
+		runContext,
 	);
 	socket.send(
 		JSON.stringify({
@@ -1975,7 +1992,7 @@ test("SDK host directly delivers correlated lifecycle frames for an accepted pro
 				},
 			],
 		} as never,
-		sessionContext,
+		runContext,
 	);
 	await waitFor(
 		() => frames.some(frame => frame.type === "agent_start") && frames.some(frame => frame.type === "agent_end"),
@@ -2086,8 +2103,9 @@ test("SDK host buffers synchronous pre-ack start and end until after acknowledge
 		undefined,
 		async (_content, options) => {
 			await firePreflightAccept(options);
-			void handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
-			void handlers.get("agent_end")?.({ type: "agent_end" }, sessionContext);
+			const runContext = sdkRunContext(sessionContext, options);
+			void handlers.get("agent_start")?.({ type: "agent_start" }, runContext);
+			void handlers.get("agent_end")?.({ type: "agent_end" }, runContext);
 		},
 		true,
 	);
@@ -2144,7 +2162,7 @@ test("SDK host buffers synchronous pre-ack accepted failure until after acknowle
 		undefined,
 		async (_content, options) => {
 			await firePreflightAccept(options);
-			void handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
+			void handlers.get("agent_start")?.({ type: "agent_start" }, sdkRunContext(sessionContext, options));
 			throw Object.assign(new Error("synchronous accepted failure"), { code: "unavailable" });
 		},
 		true,
@@ -2209,7 +2227,8 @@ test("SDK host replays an accepted prompt terminal after its requester disconnec
 	dirs.push(cwd);
 	const sessionId = `sdk-prompt-disconnect-replay-${Date.now()}`;
 	const sessionContext = context(cwd, sessionId);
-	const handlers = start(sessionContext);
+	const sent: CapturedSendCall[] = [];
+	const handlers = start(sessionContext, undefined, (...args) => captureInternalSend(sent, ...args));
 	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
 	await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
 	const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
@@ -2239,7 +2258,8 @@ test("SDK host replays an accepted prompt terminal after its requester disconnec
 		result?: { commandId?: unknown; turnId?: unknown };
 	};
 	const correlation = { commandId: acknowledgement.result?.commandId, turnId: acknowledgement.result?.turnId };
-	await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
+	const runContext = sdkRunContext(sessionContext, sent[0]?.[1]);
+	await handlers.get("agent_start")?.({ type: "agent_start" }, runContext);
 	await waitFor(
 		() => frames.some(frame => frame.type === "agent_start" && frame.commandId === correlation.commandId),
 		"correlated agent start",
@@ -2249,7 +2269,7 @@ test("SDK host replays an accepted prompt terminal after its requester disconnec
 	);
 	requester.close();
 	await requesterClosed;
-	await handlers.get("agent_end")?.({ type: "agent_end" }, sessionContext);
+	await handlers.get("agent_end")?.({ type: "agent_end" }, runContext);
 	const recoveryFrames: Record<string, unknown>[] = [];
 	const recovery = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
 	sockets.push(recovery);
@@ -2306,6 +2326,7 @@ test("SDK host serializes concurrent prompt admission and replays correlated lif
 	dirs.push(cwd);
 	const sessionId = `sdk-prompt-concurrent-${Date.now()}`;
 	const submissions: string[] = [];
+	let runContext: Record<string, unknown>;
 	const preflightStarted = Promise.withResolvers<void>();
 	const releasePreflight = Promise.withResolvers<void>();
 	const sessionContext = context(cwd, sessionId);
@@ -2314,6 +2335,7 @@ test("SDK host serializes concurrent prompt admission and replays correlated lif
 		undefined,
 		async (content, options) => {
 			submissions.push(String(content));
+			runContext = sdkRunContext(sessionContext, options);
 			preflightStarted.resolve();
 			await releasePreflight.promise;
 			await firePreflightAccept(options);
@@ -2382,13 +2404,13 @@ test("SDK host serializes concurrent prompt admission and replays correlated lif
 		result?: { commandId?: unknown; turnId?: unknown };
 	};
 	const correlation = { commandId: acknowledgement.result?.commandId, turnId: acknowledgement.result?.turnId };
-	await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
-	await handlers.get("agent_end")?.({ type: "agent_end" }, sessionContext);
+	await handlers.get("agent_start")?.({ type: "agent_start" }, runContext!);
+	await handlers.get("agent_end")?.({ type: "agent_end" }, runContext!);
 	await waitFor(
 		() => firstFrames.some(frame => frame.type === "agent_end" && frame.commandId === correlation.commandId),
 		"accepted prompt terminal",
 	);
-	await handlers.get("agent_end")?.({ type: "agent_end" }, sessionContext);
+	await handlers.get("agent_end")?.({ type: "agent_end" }, runContext!);
 	expect(
 		firstFrames.filter(frame => frame.type === "agent_end" && frame.commandId === correlation.commandId),
 	).toHaveLength(1);
@@ -7598,12 +7620,14 @@ test("turn.prompt_status settles durable acceptance after disconnect before agen
 		getSessionFile: () => sessionFile,
 	};
 	const deliveries: unknown[] = [];
+	let runContext: Record<string, unknown>;
 	const releaseExecution = Promise.withResolvers<void>();
 	let preflightAborted = false;
 	const handlers = start(
 		sessionContext,
 		undefined,
 		async (content, options) => {
+			runContext = sdkRunContext(sessionContext, options);
 			await options?.onPreflightAcceptCommit?.();
 			deliveries.push(content);
 			const signal = options?.preflightSignal;
@@ -7661,7 +7685,7 @@ test("turn.prompt_status settles durable acceptance after disconnect before agen
 	await closeSocket(first.socket);
 	await Bun.sleep(20);
 	expect(preflightAborted).toBe(false);
-	await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
+	await handlers.get("agent_start")?.({ type: "agent_start" }, runContext!);
 
 	// Reconnect: clientRef recovers the canonical generated pair, which then
 	// reconciles identically through the generated-ID selector.
@@ -7708,7 +7732,7 @@ test("turn.prompt_status settles durable acceptance after disconnect before agen
 	});
 	expect(duplicate).toMatchObject({ ok: false, error: { code: "client_ref_conflict" } });
 
-	await handlers.get("agent_end")?.({ type: "agent_end" }, sessionContext);
+	await handlers.get("agent_end")?.({ type: "agent_end" }, runContext!);
 	let terminal: Record<string, unknown> | undefined;
 	for (let attempt = 0; attempt < 50; attempt++) {
 		terminal = await second.request({
@@ -7734,7 +7758,9 @@ test("ordered turn.prompt ignores envelope idempotencyKey: no replay and no idem
 	const sessionId = `sdk-prompt-ordered-${Date.now()}`;
 	const sessionContext = context(cwd, sessionId);
 	const deliveries: unknown[] = [];
-	const handlers = start(sessionContext, undefined, (content: unknown) => {
+	const sent: CapturedSendCall[] = [];
+	const handlers = start(sessionContext, undefined, (content, options) => {
+		captureInternalSend(sent, content, options);
 		deliveries.push(content);
 	});
 	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
@@ -7765,8 +7791,9 @@ test("ordered turn.prompt ignores envelope idempotencyKey: no replay and no idem
 	const first = await prompt("ordered-1", "first ordered prompt", "ordered-ref-1");
 	expect(first).toMatchObject({ ok: true, result: { accepted: true } });
 	const firstIds = first.result as { commandId: string; turnId: string };
-	await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
-	await handlers.get("agent_end")?.({ type: "agent_end" }, sessionContext);
+	const firstRunContext = sdkRunContext(sessionContext, sent[0]?.[1]);
+	await handlers.get("agent_start")?.({ type: "agent_start" }, firstRunContext);
+	await handlers.get("agent_end")?.({ type: "agent_end" }, firstRunContext);
 
 	// Same envelope idempotencyKey with different input: a NEW ordered execution,
 	// not a replay of the first response and not an idempotency_conflict.
@@ -7775,15 +7802,17 @@ test("ordered turn.prompt ignores envelope idempotencyKey: no replay and no idem
 	const secondIds = second.result as { commandId: string; turnId: string };
 	expect(secondIds.commandId).not.toBe(firstIds.commandId);
 	expect(secondIds.turnId).not.toBe(firstIds.turnId);
-	await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
-	await handlers.get("agent_end")?.({ type: "agent_end" }, sessionContext);
+	const secondRunContext = sdkRunContext(sessionContext, sent[1]?.[1]);
+	await handlers.get("agent_start")?.({ type: "agent_start" }, secondRunContext);
+	await handlers.get("agent_end")?.({ type: "agent_end" }, secondRunContext);
 
 	// Same key AND same input still executes anew (ordered, never replayed).
 	const third = await prompt("ordered-3", "first ordered prompt", "ordered-ref-3");
 	expect(third).toMatchObject({ ok: true, result: { accepted: true } });
 	expect(((third.result ?? {}) as { commandId?: string }).commandId).not.toBe(firstIds.commandId);
-	await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
-	await handlers.get("agent_end")?.({ type: "agent_end" }, sessionContext);
+	const thirdRunContext = sdkRunContext(sessionContext, sent[2]?.[1]);
+	await handlers.get("agent_start")?.({ type: "agent_start" }, thirdRunContext);
+	await handlers.get("agent_end")?.({ type: "agent_end" }, thirdRunContext);
 
 	expect(deliveries).toHaveLength(3);
 	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
@@ -7946,7 +7975,8 @@ test("busy rejection releases the clientRef admission so a same-ref retry succee
 	dirs.push(cwd);
 	const sessionId = `sdk-prompt-busy-release-${Date.now()}`;
 	const sessionContext = context(cwd, sessionId);
-	const handlers = start(sessionContext);
+	const sent: CapturedSendCall[] = [];
+	const handlers = start(sessionContext, undefined, (...args) => captureInternalSend(sent, ...args));
 	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
 	await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
 	const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
@@ -7969,19 +7999,21 @@ test("busy rejection releases the clientRef admission so a same-ref retry succee
 	// Occupy the session with a running turn.
 	const first = await prompt("busy-first", "occupy the session", "busy-ref-first");
 	expect(first.ok).toBe(true);
-	await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
+	const firstRunContext = sdkRunContext(sessionContext, sent[0]?.[1]);
+	await handlers.get("agent_start")?.({ type: "agent_start" }, firstRunContext);
 
 	// While busy, the same clientRef admission is rejected but must not linger.
 	const rejected = await prompt("busy-rejected", "rejected while busy", "busy-ref-retry");
 	expect(rejected).toMatchObject({ ok: false, error: { code: "busy" } });
 
-	await handlers.get("agent_end")?.({ type: "agent_end" }, sessionContext);
+	await handlers.get("agent_end")?.({ type: "agent_end" }, firstRunContext);
 
 	// After the turn, the same clientRef is admissible again (no phantom reservation).
 	const retry = await prompt("busy-retry", "retry after idle", "busy-ref-retry");
 	expect(retry).toMatchObject({ ok: true, result: { accepted: true } });
-	await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
-	await handlers.get("agent_end")?.({ type: "agent_end" }, sessionContext);
+	const secondRunContext = sdkRunContext(sessionContext, sent[1]?.[1]);
+	await handlers.get("agent_start")?.({ type: "agent_start" }, secondRunContext);
+	await handlers.get("agent_end")?.({ type: "agent_end" }, secondRunContext);
 	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
 });
 
@@ -8068,7 +8100,8 @@ test("long-running prompt settles terminally after the delivery buffer expires",
 	dirs.push(cwd);
 	const sessionId = `sdk-prompt-longrun-${Date.now()}`;
 	const sessionContext = context(cwd, sessionId);
-	const handlers = start(sessionContext);
+	const sent: CapturedSendCall[] = [];
+	const handlers = start(sessionContext, undefined, (...args) => captureInternalSend(sent, ...args));
 	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
 	await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
 	const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
@@ -8124,7 +8157,8 @@ test("long-running prompt settles terminally after the delivery buffer expires",
 		input: followUpIds,
 	});
 	expect(untrackedFollowUp).toMatchObject({ ok: true, result: { status: "unknown" } });
-	await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
+	const runContext = sdkRunContext(sessionContext, sent[0]?.[1]);
+	await handlers.get("agent_start")?.({ type: "agent_start" }, runContext);
 	const inFlight = await request({
 		type: "query_request",
 		id: "long-inflight",
@@ -8146,7 +8180,7 @@ test("long-running prompt settles terminally after the delivery buffer expires",
 				},
 			],
 		},
-		sessionContext,
+		runContext,
 	);
 
 	// Authoritative settlement fired at lifecycle ingress even though the delivery
@@ -8266,7 +8300,8 @@ test("canonical subagent lifecycle keeps the parent workflow-gate runtime turn c
 		new FileGateStore(path.join(cwd, ".gjc", "state", "workflow-gates.json")),
 	);
 	const sessionContext = context(cwd, sessionId, "main", {}, emitter);
-	const handlers = start(sessionContext);
+	const sent: CapturedSendCall[] = [];
+	const handlers = start(sessionContext, undefined, (...args) => captureInternalSend(sent, ...args));
 	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
 	await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
 	const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
@@ -8301,7 +8336,8 @@ test("canonical subagent lifecycle keeps the parent workflow-gate runtime turn c
 		result: { accepted: true, commandId: expect.any(String), turnId: expect.any(String) },
 	});
 
-	await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
+	const runContext = sdkRunContext(sessionContext, sent[0]?.[1]);
+	await handlers.get("agent_start")?.({ type: "agent_start" }, runContext);
 	await waitFor(
 		() => frames.some(frame => frame.type === "agent_start" && frame.commandId === commandId),
 		"correlated parent agent start",
@@ -8356,7 +8392,7 @@ test("canonical subagent lifecycle keeps the parent workflow-gate runtime turn c
 
 		await handlers.get("agent_end")?.(
 			{ type: "agent_end", stopReason: "completed", messages: [{ role: "assistant", stopReason: "stop" }] } as never,
-			sessionContext,
+			runContext,
 		);
 		await waitFor(
 			() => frames.some(frame => frame.type === "agent_end" && frame.commandId === commandId),
@@ -8391,7 +8427,8 @@ test("SDK host keeps the prompt correlation across a mid-prompt continuation age
 	dirs.push(cwd);
 	const sessionId = `sdk-continuation-correlation-${Date.now()}`;
 	const sessionContext = context(cwd, sessionId);
-	const handlers = start(sessionContext);
+	const sent: CapturedSendCall[] = [];
+	const handlers = start(sessionContext, undefined, (...args) => captureInternalSend(sent, ...args));
 	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
 	await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
 	const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
@@ -8427,19 +8464,20 @@ test("SDK host keeps the prompt correlation across a mid-prompt continuation age
 	});
 
 	// First loop entry claims the pending correlation.
-	await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
+	const runContext = sdkRunContext(sessionContext, sent[0]?.[1]);
+	await handlers.get("agent_start")?.({ type: "agent_start" }, runContext);
 	await waitFor(
 		() => frames.some(frame => frame.type === "agent_start" && frame.commandId === commandId),
 		"correlated agent start",
 	);
 
 	// The continuation re-enters the loop while the same prompt is still in flight.
-	await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
+	await handlers.get("agent_start")?.({ type: "agent_start" }, runContext);
 
 	// The terminal must still carry this prompt's exact identity.
 	await handlers.get("agent_end")?.(
 		{ type: "agent_end", stopReason: "completed", messages: [{ role: "assistant", stopReason: "stop" }] } as never,
-		sessionContext,
+		runContext,
 	);
 	await waitFor(() => frames.some(frame => frame.type === "agent_end"), "correlated prompt terminal");
 	expect(frames.find(frame => frame.type === "agent_end")).toMatchObject({
@@ -8478,7 +8516,12 @@ test("notification host rebinds the steering snapshot before terminalizing with 
 		},
 		abortPromptAndWait: async () => ({ status: "settled", terminalScope: {} }),
 	};
-	const handlers = start(sessionContext, { get: () => undefined, getAgentDir: () => cwd } as unknown as Settings);
+	const sent: CapturedSendCall[] = [];
+	const handlers = start(
+		sessionContext,
+		{ get: () => undefined, getAgentDir: () => cwd } as unknown as Settings,
+		(...args) => captureInternalSend(sent, ...args),
+	);
 	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
 	await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
 	const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
@@ -8513,7 +8556,7 @@ test("notification host rebinds the steering snapshot before terminalizing with 
 		// so the abort reaches the ACTIVE terminalization path.
 		await handlers.get("agent_start")?.(
 			{ type: "agent_start", runId: "exact-run-handle", commandId: ackResult.commandId, turnId: ackResult.turnId },
-			sessionContext,
+			sdkRunContext(sessionContext, sent[0]?.[1]),
 		);
 		// Terminal abort: the admission captured token 42 and the
 		// terminalization passes it through — the bus must rebind it before the

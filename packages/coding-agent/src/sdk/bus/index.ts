@@ -53,6 +53,7 @@ import { AsyncJobManager } from "../../async";
 import { Settings, validateSettingPatch } from "../../config/settings";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "../../extensibility/extensions";
 import { INTERACTIVE_SELECTOR_RESUME_ORIGIN } from "../../extensibility/shared-events";
+import { isAgentWireSessionEvent } from "../../modes/shared/agent-wire/event-contract";
 import { toAgentWireEventPayload } from "../../modes/shared/agent-wire/event-envelope";
 import {
 	NotificationGatePolicyChangedError,
@@ -106,6 +107,7 @@ import { type AbortScope, type ControlSurface, dispatchControl, TypedControlErro
 import { BROKER_RUNTIME_CLOSE_CAPABILITY_FIELD } from "../host/control/runtime-gate";
 import { isAutoroutingInactive, markAutoroutingInactive } from "../host/internal-autorouting-state";
 import { CursorRegistry, QueryHandlers, RevisionStore, type SessionSurface } from "../host/query";
+import { createSdkRunCapability, type InternalSdkSubmissionApi } from "../host/sdk-run-capability";
 import type { SdkFrame } from "../host/types";
 import {
 	parseSyntheticModelId,
@@ -119,6 +121,7 @@ import {
 	isAttributableProgressEventType,
 	type PromptDeadlineLease,
 	promptDeadlineAt,
+	promptDeadlineDiagnostics,
 	recordAttributableProgress,
 } from "../prompt-deadline-lease";
 import {
@@ -2571,6 +2574,7 @@ function sdkControlSurface(
 	cancelPendingPreflights(): Promise<void>;
 	cancelPendingPreflightsForConnection(connectionId: string): Promise<void>;
 } {
+	const internalApi = api as InternalSdkSubmissionApi;
 	const unavailable = (operation: string, reason: string) => () => {
 		throw Object.assign(new Error(`${operation} is unavailable: ${reason}`), { code: "unavailable" });
 	};
@@ -2779,7 +2783,7 @@ function sdkControlSurface(
 				: text;
 		const commandId = crypto.randomUUID();
 		const turnId = crypto.randomUUID();
-		const sdkRunToken = deliverAs === "followUp" ? crypto.randomUUID() : undefined;
+		const sdkRunToken = crypto.randomUUID();
 		type PreflightTerminalResult = { status: "accepted" } | { status: "rejected"; error: unknown };
 		const preflight = Promise.withResolvers<PreflightTerminalResult>();
 		const preflightController = new AbortController();
@@ -2860,12 +2864,12 @@ function sdkControlSurface(
 		// succeeds. The terminal result records correlation before agent_start can fire.
 		try {
 			submission = Promise.resolve(
-				api.sendUserMessage(content, {
+				internalApi.sendUserMessage(content, {
 					...(deliverAs ? { deliverAs } : !forceFresh && isBusy() ? { deliverAs: "steer" as const } : {}),
 					onPreflightAcceptCommit,
 					onPreflightAccepted,
 					preflightSignal: preflightController.signal,
-					...(sdkRunToken ? { sdkRunToken } : {}),
+					sdkRunCapability: createSdkRunCapability(sdkRunToken),
 				}),
 			);
 		} catch (error) {
@@ -4096,6 +4100,11 @@ export function createNotificationsExtension(
 				handle: string,
 				options: { graceMs: number; terminal?: { scope: "turn" | "owned"; expectedEpoch?: number } },
 			) => Promise<RunSettlementProof>;
+			recordCommittedPromptFailure?: (
+				handle: string,
+				failure: { code: "prompt_deadline_exceeded"; message: "Prompt deadline exceeded." },
+				isCurrent: () => boolean,
+			) => Promise<"persisted" | "stale">;
 		};
 	} = {},
 ): void {
@@ -4807,7 +4816,8 @@ export function createNotificationsExtension(
 			 * (mirrors PromptDeadlineManager).
 			 */
 			deadlineAttempt?: { lease: PromptDeadlineLease; generation: number };
-			phase: "active" | "outcome_claimed" | "terminalizing" | "publication_closed" | "delivered";
+			deadlineTask?: Promise<void>;
+			phase: "active" | "outcome_claimed" | "terminalizing" | "committed" | "publication_closed" | "delivered";
 			outcome?: SdkPromptTerminalOutcome;
 			/** Agent-owned resource run captured at acceptance; cleanup targets only this handle. */
 			executionHandle?: string;
@@ -5040,7 +5050,7 @@ export function createNotificationsExtension(
 					const current = promptSubmissions.get(key);
 					// Identity fencing: a discarded, evicted or re-accepted submission is
 					// never terminalized by a predecessor's timer.
-					if (!current || current.deadlineLease !== lease) return;
+					if (!current || current.deadlineLease !== lease || current.phase !== "active") return;
 					// Progress delivered while this timer was pending renews the lease, so
 					// re-arm instead of terminalizing a demonstrably live prompt.
 					if (Date.now() < promptDeadlineAt(lease)) {
@@ -5051,7 +5061,12 @@ export function createNotificationsExtension(
 					// progress arriving while the claim is in flight must supersede
 					// this attempt (see the post-claim fence in terminalizePrompt).
 					current.deadlineAttempt = { lease, generation: lease.generation };
-					void terminalizePrompt(
+					logger.warn("sdk_prompt_deadline_expiry", {
+						commandId: correlation.commandId,
+						turnId: correlation.turnId,
+						...promptDeadlineDiagnostics(lease),
+					});
+					current.deadlineTask = terminalizePrompt(
 						correlation,
 						{
 							kind: "failed",
@@ -5063,12 +5078,17 @@ export function createNotificationsExtension(
 						},
 						{ fence: true },
 						{ diagnostic: { reason: "Prompt deadline exceeded." } },
-					);
+					).finally(() => {
+						current.deadlineTask = undefined;
+						current.deadlineAttempt = undefined;
+					});
+					trackReconciliationProducer(current.deadlineTask);
 				},
 				Math.max(0, promptDeadlineAt(lease) - Date.now()),
 			);
 		};
 		const emitPromptEvent = (event: AgentSessionEvent) => {
+			if (!isAgentWireSessionEvent(event)) return;
 			if (!runtime?.activePromptCorrelation) return;
 			cleanupPromptRecords();
 			const correlation = runtime.activePromptCorrelation;
@@ -5115,6 +5135,34 @@ export function createNotificationsExtension(
 			if (lease.generation !== attempt.generation && Date.now() < promptDeadlineAt(lease)) return "superseded";
 			return "current";
 		};
+		const releaseSupersededDeadline = async (
+			correlation: { commandId: string; turnId: string },
+			submission: PromptSubmission,
+			attempt: { lease: PromptDeadlineLease; generation: number },
+		) => {
+			const key = promptSubmissionKey(correlation);
+			const ownsAttempt = () => promptSubmissions.get(key) === submission && submission.deadlineAttempt === attempt;
+			try {
+				await kindReconciliation.releaseDeadlineOutcome(submission.reconciliationKind, correlation, ownsAttempt);
+			} catch (error) {
+				logger.warn(`sdk: superseded deadline release failed: ${String(error)}`);
+				if (ownsAttempt())
+					failPromptClosed(correlation, submission, "terminal_uncertain", "Prompt reconciliation is unavailable.");
+				return;
+			}
+			if (!ownsAttempt()) return;
+			submission.deadlineAttempt = undefined;
+			const retained = kindReconciliation.lookup(submission.reconciliationKind, correlation);
+			if (retained.status === "failed" || retained.status === "terminal_ok") {
+				submission.outcome = retained.outcome;
+				submission.phase = "committed";
+				if (submission.deadlineTimer) clearTimeout(submission.deadlineTimer);
+			} else {
+				submission.outcome = undefined;
+				submission.phase = "active";
+				armPromptDeadline(key, correlation);
+			}
+		};
 		/**
 		 * Renew the accepted prompt's deadline on attributable progress. The
 		 * allowlist stays owned by the shared lease module, so streaming chatter,
@@ -5132,9 +5180,9 @@ export function createNotificationsExtension(
 			const submission = promptSubmissions.get(key);
 			if (!submission) return;
 			if (
+				(submission.phase === "outcome_claimed" || submission.phase === "terminalizing") &&
 				submission.deadlineAttempt &&
-				submission.deadlineLease === submission.deadlineAttempt.lease &&
-				(submission.phase === "outcome_claimed" || submission.phase === "terminalizing")
+				submission.deadlineLease === submission.deadlineAttempt.lease
 			) {
 				recordAttributableProgress(submission.deadlineLease, Date.now());
 				return;
@@ -5326,10 +5374,27 @@ export function createNotificationsExtension(
 				/** Whether terminalization reached the durable terminal (fail-closed paths leave this unset). */
 				terminalized?: boolean;
 			},
-		) => {
+		): Promise<void> => {
 			const receiptState = extra?.finalText?.trim() ? "present" : "missing";
 			const submission = promptSubmissions.get(promptSubmissionKey(correlation));
-			if (!submission || submission.terminal || submission.phase !== "active") return;
+			// A real terminal/cancel arriving during an expiry await must not be
+			// dropped. Join that exact attempt, then compete against its released
+			// claim (or observe the already-published terminal).
+			if (
+				submission?.deadlineTask &&
+				!(requestedOutcome.kind === "failed" && requestedOutcome.provenance === "deadline")
+			) {
+				const pending = submission.deadlineTask.then(() =>
+					terminalizePrompt(correlation, requestedOutcome, options, extra, capture),
+				);
+				trackReconciliationProducer(pending);
+				// agent_end can be emitted by the very abort we are awaiting. Do not
+				// make run settlement wait on its own deadline terminalization.
+				if (options.fence) await pending;
+				return;
+			}
+			if (!submission || submission.terminal || (submission.phase !== "active" && submission.phase !== "committed"))
+				return;
 			submission.phase = "outcome_claimed";
 			// Capture the attempt epoch BEFORE the durable claim: a successor
 			// prompt admitted while the claim is awaited advances the epoch, so
@@ -5365,9 +5430,7 @@ export function createNotificationsExtension(
 				const status = deadlineAttemptStatus(key, submission, deadlineAttempt);
 				if (status === "stale") return;
 				if (status === "superseded") {
-					submission.deadlineAttempt = undefined;
-					submission.phase = "active";
-					armPromptDeadline(key, correlation);
+					await releaseSupersededDeadline(correlation, submission, deadlineAttempt);
 					return;
 				}
 			}
@@ -5448,31 +5511,35 @@ export function createNotificationsExtension(
 				const status = deadlineAttemptStatus(key, submission, deadlineAttempt);
 				if (status === "stale") return;
 				if (status === "superseded") {
-					submission.deadlineAttempt = undefined;
-					submission.phase = "active";
-					armPromptDeadline(key, correlation);
+					await releaseSupersededDeadline(correlation, submission, deadlineAttempt);
 					return;
 				}
 			}
 			try {
-				if (deadlineAttempt) {
-					await kindReconciliation.finalizeOutcome(
-						submission.reconciliationKind,
-						correlation,
-						winner,
-						() =>
-							deadlineAttemptStatus(promptSubmissionKey(correlation), submission, deadlineAttempt) === "current",
-						extra?.error,
-						extra?.finalText,
-					);
-				} else {
-					await kindReconciliation.finalizeOutcome(
-						submission.reconciliationKind,
-						correlation,
-						winner,
-						extra?.error,
-						extra?.finalText,
-					);
+				const disposition = await kindReconciliation.finalizeOutcome(
+					submission.reconciliationKind,
+					correlation,
+					winner,
+					() =>
+						!deadlineAttempt ||
+						deadlineAttemptStatus(promptSubmissionKey(correlation), submission, deadlineAttempt) === "current",
+					extra?.error,
+					extra?.finalText,
+					() => {
+						// This runs synchronously with query-visible reconciliation commit.
+						// Subsequent tool events cannot renew an already terminal invocation.
+						submission.phase = "committed";
+						if (submission.deadlineTimer) clearTimeout(submission.deadlineTimer);
+					},
+				);
+				if (disposition === "superseded") {
+					if (deadlineAttempt) await releaseSupersededDeadline(correlation, submission, deadlineAttempt);
+					return;
+				}
+				if (disposition === "retained") submission.phase = "committed";
+				if (disposition === "missing") {
+					failPromptClosed(correlation, submission, "terminal_uncertain", "Prompt reconciliation is unavailable.");
+					return;
 				}
 			} catch (error) {
 				// The durable pending claim survives; publishing an unpersisted terminal
@@ -5481,18 +5548,73 @@ export function createNotificationsExtension(
 				failPromptClosed(correlation, submission, "terminal_uncertain", "Prompt reconciliation is unavailable.");
 				return;
 			}
-			if (deadlineAttempt) {
-				const key = promptSubmissionKey(correlation);
-				const status = deadlineAttemptStatus(key, submission, deadlineAttempt);
-				if (status === "stale") return;
-				if (status === "superseded") {
-					submission.deadlineAttempt = undefined;
-					submission.phase = "active";
-					armPromptDeadline(key, correlation);
-					return;
+			if (promptSubmissions.get(promptSubmissionKey(correlation)) !== submission) return;
+			// Publish the committed classifier, including an agent_failed diagnostic
+			// that arrived while the requested outcome was being finalized.
+			let committed = kindReconciliation.lookup(submission.reconciliationKind, correlation);
+			if ((committed.status === "failed" || committed.status === "terminal_ok") && committed.outcome)
+				winner = committed.outcome;
+			submission.outcome = winner;
+			if (winner.kind === "failed" && winner.provenance === "deadline") {
+				const handle = submission.executionHandle;
+				let observingProjection = true;
+				const projectionTimeout = Promise.withResolvers<"timed_out">();
+				const projectionTimer = setTimeout(() => {
+					observingProjection = false;
+					projectionTimeout.resolve("timed_out");
+				}, PROMPT_TERMINALIZATION_GRACE_MS);
+				const isCommittedOwner = () => {
+					if (!observingProjection) return false;
+					const record = kindReconciliation.lookup(submission.reconciliationKind, correlation);
+					return (
+						record.status === "failed" &&
+						record.outcome?.kind === "failed" &&
+						record.outcome.provenance === "deadline"
+					);
+				};
+				let projected = false;
+				try {
+					for (let attempt = 0; attempt < 3; attempt++) {
+						if (!isCommittedOwner()) break;
+						try {
+							if (!handle || !terminalAbortSeams?.recordCommittedPromptFailure)
+								throw new Error("Committed prompt failure persistence is unavailable.");
+							const result = await Promise.race([
+								terminalAbortSeams.recordCommittedPromptFailure(
+									handle,
+									{ code: "prompt_deadline_exceeded", message: "Prompt deadline exceeded." },
+									isCommittedOwner,
+								),
+								projectionTimeout.promise,
+							]);
+							// A timeout ends observation, not the underlying write. Never
+							// launch a concurrent retry over that still-running projection.
+							if (result === "timed_out" || result === "stale") break;
+							projected = true;
+							break;
+						} catch {
+							// Retry only rejected projections within the shared total budget.
+							if (attempt < 2 && observingProjection) await Bun.sleep(10);
+						}
+					}
+				} finally {
+					clearTimeout(projectionTimer);
+					// Late continuations cannot borrow authority after observation ends.
+					observingProjection = false;
 				}
-				submission.deadlineAttempt = undefined;
+				if (!projected)
+					logger.error("sdk_prompt_failure_projection_unresolved", {
+						commandId: correlation.commandId,
+						turnId: correlation.turnId,
+						code: "prompt_failure_projection_unavailable",
+						retryable: true,
+					});
 			}
+			// A real diagnostic may enrich the terminal during projection I/O.
+			committed = kindReconciliation.lookup(submission.reconciliationKind, correlation);
+			if ((committed.status === "failed" || committed.status === "terminal_ok") && committed.outcome)
+				winner = committed.outcome;
+			submission.outcome = winner;
 			if (submission.deadlineTimer) clearTimeout(submission.deadlineTimer);
 			if (!recordPromptTerminal(correlation)) return;
 			if (!runtime) {
@@ -5517,6 +5639,7 @@ export function createNotificationsExtension(
 					turnId: correlation.turnId,
 					code: winner.code,
 					provenance: winner.provenance,
+					...(winner.provenance === "deadline" ? promptDeadlineDiagnostics(submission.deadlineLease) : {}),
 					...(diagnostic?.loopStopReason ? { loopStopReason: diagnostic.loopStopReason } : {}),
 					...(diagnostic?.assistantStopReason ? { assistantStopReason: diagnostic.assistantStopReason } : {}),
 					...(diagnostic?.errorKind ? { errorKind: diagnostic.errorKind } : {}),
@@ -5530,9 +5653,9 @@ export function createNotificationsExtension(
 						sessionId: runtime.id,
 						...correlation,
 						error:
-							extra?.error !== undefined
-								? { code: extra.error.code, message: winner.message }
-								: { code: winner.code, message: winner.message },
+							committed.status === "failed"
+								? committed.error
+								: (extra?.error ?? { code: winner.code, message: winner.message }),
 						outcome: winner,
 					});
 				} else {
@@ -8936,6 +9059,7 @@ export function createNotificationsExtension(
 		const correlation = rt.activePromptCorrelation;
 		if (!correlation) return;
 		const error = sanitizePromptFailure(event.error);
+		await rt.notePromptReconciliation(correlation, { type: "agent_failed", error });
 		rt.emitPromptLifecycle(correlation, {
 			type: "agent_failed",
 			sessionId: id,
@@ -8969,7 +9093,8 @@ export function createNotificationsExtension(
 				| undefined;
 			const pendingOutcome = rt.peekPromptPendingOutcome(correlation);
 			let outcome: SdkPromptTerminalOutcome;
-			if (pendingOutcome) outcome = pendingOutcome;
+			if (pendingOutcome && !(pendingOutcome.kind === "failed" && pendingOutcome.provenance === "deadline"))
+				outcome = pendingOutcome;
 			else if (finalAssistant?.stopReason === "length")
 				outcome = { kind: "stopped", reason: "max_tokens", provenance: "agent" };
 			else if (finalAssistant?.errorKind === "provider_safety_stop")

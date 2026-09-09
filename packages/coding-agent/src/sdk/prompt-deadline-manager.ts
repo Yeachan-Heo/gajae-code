@@ -1,3 +1,4 @@
+import { logger } from "@gajae-code/utils";
 import type { KindAwareReconciliation } from "./bus/kind-aware-reconciliation";
 import type { InvocationCorrelation, InvocationReconciliation } from "./host/session-runtime";
 import {
@@ -5,6 +6,7 @@ import {
 	isAttributableProgressEventType,
 	type PromptDeadlineLease,
 	promptDeadlineAt,
+	promptDeadlineDiagnostics,
 	recordAttributableProgress,
 } from "./prompt-deadline-lease";
 import { failedPromptOutcome } from "./prompt-failure";
@@ -95,6 +97,11 @@ export class PromptDeadlineManager {
 			this.#schedule(key);
 			return;
 		}
+		logger.warn("sdk_prompt_deadline_expiry", {
+			commandId: correlation.commandId,
+			turnId: correlation.turnId,
+			...promptDeadlineDiagnostics(lease),
+		});
 		// Fence lifecycle adoption before replaying a real terminal transition.
 		// A successor agent_start must not drain this correlation while its
 		// durable upgrade is still pending or being retried.

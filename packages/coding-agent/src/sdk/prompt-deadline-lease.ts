@@ -44,6 +44,18 @@ export function promptDeadlineAt(lease: PromptDeadlineLease): number {
 	return Math.min(lease.lastProgressAt + lease.leaseMs, lease.acceptedAt + lease.maxMs);
 }
 
+/** Explicit numeric-only projection: never log prompt, tool, or provider data. */
+export function promptDeadlineDiagnostics(lease: PromptDeadlineLease) {
+	return {
+		acceptedAt: lease.acceptedAt,
+		lastProgressAt: lease.lastProgressAt,
+		leaseMs: lease.leaseMs,
+		maxMs: lease.maxMs,
+		effectiveDeadline: promptDeadlineAt(lease),
+		generation: lease.generation,
+	};
+}
+
 /**
  * Record fresh attributable progress. Monotonic: a stale or equal timestamp
  * never moves the lease backwards, so out-of-order delivery cannot shorten it.
