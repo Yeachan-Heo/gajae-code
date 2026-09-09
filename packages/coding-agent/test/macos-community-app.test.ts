@@ -218,6 +218,68 @@ describe("macOS community app offer guards", () => {
 		expect(logs).toEqual([]);
 		expect(prompted).toBe(false);
 	});
+
+	test.each([
+		["nested user Applications", "Applications/Utilities", true, "none"],
+		["Downloads", "Downloads", false, "none"],
+		["Trash", ".Trash", false, "none"],
+		["external volume", "Volumes/External/Applications", false, "none"],
+		["mounted DMG", "Volumes/Gajae Code App", false, "none"],
+		["Applications prefix sibling", "Applications-other", false, "none"],
+		["direct bundle symlink escape", "Downloads", false, "bundle"],
+		["nested directory symlink escape", "Downloads", false, "directory"],
+		["canonical Applications root alias", "CanonicalApplications/Utilities", true, "root"],
+	] as const)("scopes installed discovery: %s", async (_label, location, installed, alias) => {
+		const homeDir = await tempDir();
+		const applications = path.join(homeDir, "Applications");
+		const bundle = path.join(homeDir, location, "Gajae Code App.app");
+		await createBundleFixture(bundle);
+		if (alias === "root") {
+			await fs.symlink(path.join(homeDir, "CanonicalApplications"), applications);
+		} else {
+			await fs.mkdir(applications, { recursive: true });
+		}
+		let candidate = bundle;
+		if (alias === "bundle") {
+			candidate = path.join(applications, "Gajae Code App.app");
+			await fs.symlink(bundle, candidate);
+		} else if (alias === "directory") {
+			await fs.symlink(path.dirname(bundle), path.join(applications, "Linked"));
+			candidate = path.join(applications, "Linked", "Gajae Code App.app");
+		} else if (alias === "root") {
+			candidate = path.join(applications, "Utilities", "Gajae Code App.app");
+		}
+		const canonicalBundle = await fs.realpath(bundle);
+		const calls: string[][] = [];
+		let prompted = false;
+		const result = await offerMacosCommunityApp({
+			platform: "darwin",
+			arch: "arm64",
+			homeDir,
+			env: {},
+			stdinIsTTY: true,
+			stdoutIsTTY: true,
+			log: () => {},
+			prompt: async () => {
+				prompted = true;
+				return false;
+			},
+			fetchImpl: async () => {
+				throw new Error("discovery or declining must not fetch");
+			},
+			command: async argv => {
+				calls.push(argv);
+				if (argv[0] === "/usr/bin/mdfind") return { exitCode: 0, stdout: candidate, stderr: "" };
+				if (!argv.some(arg => arg.startsWith(canonicalBundle)))
+					return { exitCode: 1, stdout: "", stderr: "not the fixture" };
+				return verifiedFixtureResult(argv);
+			},
+		});
+		expect(result).toEqual({ status: "skipped", reason: installed ? "already installed" : "cancelled" });
+		expect(prompted).toBe(!installed);
+		expect(calls.some(argv => argv[0] === "/usr/bin/codesign")).toBe(installed);
+		expect(calls.some(argv => argv[0] === "/usr/bin/open")).toBe(false);
+	});
 	test("fails before prompting when installed-app discovery cannot be reaped", async () => {
 		let prompted = false;
 		let fetched = false;
@@ -1066,7 +1128,12 @@ function verifiedFixtureResult(argv: string[]) {
 for (const site of ["direct", "spotlight", "source", "copied"] as const) {
 	test(`rejects forged signer display records when native requirement fails at ${site}`, async () => {
 		const homeDir = await tempDir();
-		const installed = path.join(homeDir, site === "spotlight" ? "Elsewhere" : "Applications", "Gajae Code App.app");
+		const installed = path.join(
+			homeDir,
+			"Applications",
+			...(site === "spotlight" ? ["Nested"] : []),
+			"Gajae Code App.app",
+		);
 		const discovery = site === "direct" || site === "spotlight";
 		if (discovery) await createBundleFixture(installed);
 		const calls: string[][] = [];
@@ -1142,8 +1209,14 @@ for (const discovery of ["direct", "spotlight"] as const) {
 	for (const verifier of ["CFBundleIdentifier", "CFBundleExecutable", "-R", "/usr/sbin/spctl", "/usr/bin/lipo"]) {
 		test(`aborts ${discovery} discovery at unreaped ${verifier}`, async () => {
 			const homeDir = await tempDir();
-			const bundle = path.join(homeDir, discovery === "direct" ? "Applications" : "Elsewhere", "Gajae Code App.app");
+			const bundle = path.join(
+				homeDir,
+				"Applications",
+				...(discovery === "direct" ? [] : ["Nested"]),
+				"Gajae Code App.app",
+			);
 			await createBundleFixture(bundle);
+			const canonicalBundle = await fs.realpath(bundle);
 			let reached = false;
 			let prompted = false;
 			let fetched = false;
@@ -1164,7 +1237,7 @@ for (const discovery of ["direct", "spotlight"] as const) {
 				},
 				command: async argv => {
 					if (argv[0] === "/usr/bin/mdfind") return { exitCode: 0, stdout: bundle, stderr: "", reaped: true };
-					if (!argv.some(arg => arg.startsWith(bundle)))
+					if (!argv.some(arg => arg.startsWith(canonicalBundle)))
 						return { exitCode: 1, stdout: "", stderr: "", reaped: true };
 					if (reached) throw new Error("discovery continued after unsafe helper");
 					const result = verifiedFixtureResult(argv);

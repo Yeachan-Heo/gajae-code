@@ -705,6 +705,22 @@ async function findInstalledApp(
 	arch: "arm64" | "x64",
 	command: CommandRunner,
 ): Promise<string | undefined> {
+	const applicationRoots = await Promise.all(
+		[path.join(homeDir, "Applications"), "/Applications"].map(root => fs.realpath(root).catch(() => undefined)),
+	);
+	const verifiedInstalledCandidate = async (candidate: string): Promise<string | undefined> => {
+		const canonical = await fs.realpath(candidate).catch(() => undefined);
+		if (!canonical) return undefined;
+		const beneathApplications = applicationRoots.some(root => {
+			if (!root) return false;
+			const relative = path.relative(root, canonical);
+			return (
+				relative !== "" && relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative)
+			);
+		});
+		if (!beneathApplications) return undefined;
+		return (await isVerifiedCommunityApp(canonical, arch, command)) ? canonical : undefined;
+	};
 	const candidates = [
 		path.join(homeDir, "Applications", "Gajae Code App.app"),
 		path.join(homeDir, "Applications", "Gajae-Code-App.app"),
@@ -712,7 +728,8 @@ async function findInstalledApp(
 		"/Applications/Gajae-Code-App.app",
 	];
 	for (const candidate of candidates) {
-		if (await isVerifiedCommunityApp(candidate, arch, command)) return candidate;
+		const installed = await verifiedInstalledCandidate(candidate);
+		if (installed) return installed;
 	}
 	const result = await command(["/usr/bin/mdfind", `kMDItemCFBundleIdentifier == '${COMMUNITY_APP_BUNDLE_ID}'`]);
 	if (result.reaped === false) throw new Error("installed app discovery helper did not terminate safely");
@@ -721,7 +738,8 @@ async function findInstalledApp(
 		.split(/\r?\n/)
 		.map(line => line.trim())
 		.filter(Boolean)) {
-		if (await isVerifiedCommunityApp(candidate, arch, command)) return candidate;
+		const installed = await verifiedInstalledCandidate(candidate);
+		if (installed) return installed;
 	}
 	return undefined;
 }
