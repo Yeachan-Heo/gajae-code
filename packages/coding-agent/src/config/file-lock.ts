@@ -1415,7 +1415,12 @@ async function lockHolderDescription(lockPath: string): Promise<string> {
 		if (process.platform !== "win32" && (await fileLockRemovalTransitionExists(lockPath))) {
 			return "blocked by retained removal transition; retry the owning process cleanup or inspect the exact orphan manually; unproven transition ownership is never removed";
 		}
-		const info = await readLockInfo(lockPath);
+		let info = await readLockInfo(lockPath);
+		let bytes: string | null = null;
+		if (!info) {
+			bytes = await readLockInfoBytes(lockPath);
+			info = bytes === null ? null : parseLockInfoBytes(bytes);
+		}
 		if (info) {
 			// A lock record carrying a foreign owner_host_id belongs to another
 			// machine (shared-volume topic registry): its pid is meaningful only
@@ -1443,7 +1448,6 @@ async function lockHolderDescription(lockPath: string): Promise<string> {
 			);
 		}
 		try {
-			const bytes = await readLockInfoBytes(lockPath);
 			if (bytes !== null)
 				return "held by an owner record that never became readable (empty, truncated, or non-JSON info); malformed records carry no liveness proof and are never reclaimed — inspect and remove the directory manually once no publisher remains";
 			await fs.stat(path.join(lockPath, "info"));
