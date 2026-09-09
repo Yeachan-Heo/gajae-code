@@ -192,6 +192,33 @@ The gateway has no dedicated env vars — it inherits `GJC_AUTH_BROKER_*` becaus
 
 `<config-dir>` resolves to `~/.gjc/` (respecting `GJC_CONFIG_DIR`).
 
+### Dedicated publication profiles and one OAuth authority
+
+A publication workload can use a separate agent directory through
+`GJC_CODING_AGENT_DIR` while resolving credentials through the **same existing auth
+broker** using `GJC_AUTH_BROKER_URL` and `GJC_AUTH_BROKER_TOKEN`. This separates SDK
+session-index publication from another profile without copying its SQLite vault,
+OAuth refresh tokens, or `config.yml`. Broker mode bypasses the client's local
+credential store; it does not migrate that store implicitly. Supply the broker
+bearer through the trusted environment or the nested configuration above, not in
+command output or checked-in files. The bearer itself is sensitive authority.
+
+This requires an explicitly configured, available auth broker already serving the
+intended credential authority. Merely selecting an empty agent directory does not
+make existing local OAuth credentials available there. Starting a broker, moving
+credentials, or running `migrate --from-local` is a separate operator decision,
+not a session-index recovery step. Do not copy a credential database to work around
+index contention.
+
+All children using **one** dedicated agent directory still share its SDK index and
+can contend with one another. `--no-session` disables transcript persistence, not
+the direct-session registration/teardown records used to fence artifact GC and
+process ownership. Keep those registrations; a raw JSONL line count includes
+history and is not evidence of leaked live sessions. Diagnose the bounded index
+operation and holder information rather than deleting a live holder's lock or
+increasing retry counts. An auth broker is separate from the SDK session broker;
+auth configuration neither restarts nor repairs the latter.
+
 ## Interaction with the local API-key resolution order
 
 The broker only owns OAuth credentials and provider-API-key credentials that were uploaded to it. The standard credential ladder in `models.md` (`Auth and API key resolution order`) is preserved, with one addition committed alongside the gateway:
