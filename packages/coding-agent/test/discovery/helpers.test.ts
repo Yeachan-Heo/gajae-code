@@ -462,6 +462,49 @@ describe("safe discovery boundaries", () => {
 		}
 	});
 
+	test("follows a symlinked root and an in-root leaf symlink", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-contained-symlinks-"));
+		try {
+			const realAgentDir = path.join(root, "real-agent");
+			const linkedAgentDir = path.join(root, "agent");
+			const target = path.join(realAgentDir, "SYSTEM.target.md");
+			await fs.mkdir(realAgentDir, { recursive: true });
+			await fs.writeFile(target, "linked instructions");
+			await fs.symlink(realAgentDir, linkedAgentDir, "dir");
+			await fs.symlink(target, path.join(linkedAgentDir, "SYSTEM.md"), "file");
+
+			expect(await readContainedFile(linkedAgentDir, path.join(linkedAgentDir, "SYSTEM.md"))).toBe(
+				"linked instructions",
+			);
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
+	test("rejects a preauthorized root replaced before the contained read", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-contained-authority-swap-"));
+		try {
+			const agentDir = path.join(root, "agent");
+			const replacement = path.join(root, "replacement");
+			await fs.mkdir(agentDir, { recursive: true });
+			await fs.mkdir(replacement, { recursive: true });
+			await fs.writeFile(path.join(agentDir, "SYSTEM.md"), "authorized");
+			await fs.writeFile(path.join(replacement, "SYSTEM.md"), "replacement");
+			const identity = await fs.stat(agentDir);
+			await fs.rm(agentDir, { recursive: true });
+			await fs.symlink(replacement, agentDir, "dir");
+
+			expect(
+				await readContainedFile(agentDir, path.join(agentDir, "SYSTEM.md"), {
+					dev: identity.dev,
+					ino: identity.ino,
+				}),
+			).toBeNull();
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
 	test("rejects a parent swap before frontmatter bytes are read", async () => {
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-frontmatter-swap-"));
 		try {

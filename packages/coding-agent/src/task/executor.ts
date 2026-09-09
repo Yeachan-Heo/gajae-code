@@ -925,7 +925,8 @@ function formatExecutionError(error: unknown): string {
 	const message = error.message;
 	const stack = error.stack;
 	if (!stack) return message;
-	if (!message || stack.includes(message)) return stack;
+	const stackHeadline = stack.split(/\r?\n/u, 1)[0] ?? "";
+	if (!message || stackHeadline.includes(message)) return stack;
 	return `${error.name || "Error"}: ${message}\n${stack}`;
 }
 

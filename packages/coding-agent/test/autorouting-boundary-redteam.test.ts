@@ -2400,11 +2400,11 @@ describe("autorouting boundary red-team generation 4 delta re-attacks", () => {
 		vi.spyOn(modelRegistry, "getAll").mockReturnValue(models);
 		vi.spyOn(modelRegistry, "getAvailable").mockReturnValue(models);
 		vi.spyOn(modelRegistry, "getApiKey").mockImplementation(async () => "key");
-		const postFenceFailure = new Error("post-fence failure evidence");
+		const postFenceFailure = new Error("executor");
 		// Bun can expose an Error stack without its message when this fresh-process case
 		// runs beside several other heavyweight test children. The executor must retain
 		// the message instead of treating that incomplete stack as the whole diagnostic.
-		postFenceFailure.stack = "Error\n    at concurrent-post-fence-fixture";
+		postFenceFailure.stack = "Error\n    at concurrent-executor-fixture";
 		const originalCreate = sdkModule.createAgentSession;
 		let createCalls = 0;
 		const createErrors: string[] = [];
@@ -2489,7 +2489,7 @@ describe("autorouting boundary red-team generation 4 delta re-attacks", () => {
 				]) &&
 			result?.preflightFenceCrossed === true &&
 			result?.preflightFailure?.kind === "transport" &&
-			result?.error?.includes(postFenceFailure.message) === true &&
+			result?.error?.startsWith("Error: executor\n") === true &&
 			stagingTree.length === 0 &&
 			finalExists;
 		record(
