@@ -5,6 +5,8 @@
 ### Fixed
 
 - Multipart raster output now releases its prefix-barrier ownership when the final terminal write is rejected, terminal availability is lost, or either asynchronous prefix boundary resumes into a stale lifecycle, preventing stale synchronization ownership from surviving terminal loss.
+- Coalesced forced redraw generations now remain pending until their shared terminal write commits instead of being failed by a later next-tick callback after frame preparation.
+- Disposal and terminal-loss recovery now fence render and raster work already queued behind raster ingress, preventing stale terminal bytes or a falsely successful render generation after the owning TUI lifecycle ends.
 
 ## [0.16.6] - 2026-09-07
 
@@ -17,7 +19,6 @@
 
 ### Fixed
 
-- Coalesced forced redraw generations now remain pending until their shared terminal write commits instead of being failed by a later next-tick callback after frame preparation.
 - Markdown cache ownership now finalizes after styling callbacks, so reentrant text replacement cannot inherit stale rejection hints and streaming completion releases local parse tokens. Cache diagnostics measure insertion-time payload sizes; returned render arrays are borrowed and must not be mutated.
 - Streaming Markdown retains only its current parse locally instead of publishing partial documents to the shared render/parse caches. Completed documents remain reusable, with 8 MiB render, 8 MiB parse and 4 MiB highlight accounted-payload budgets and per-entry limits. The render-cache diagnostic now includes UTF-16 keys, full token graphs, styled lines and anchors; it is not a live heap/RSS measurement.
 - Markdown reflow avoids redundant parse-cache admissions and repeated accounting of already rejected normalized content, without retaining completed parse tokens. Render payload accounting uses its owned layout schema, and oversized highlighting inputs are rejected earlier while preserving byte/line limits and guard ordering.
@@ -27,10 +28,6 @@
 ### Added
 
 - Added cancellable, one-shot `enqueueBeforeRender` preparation on the existing frame scheduler and a single-owner `setRenderPreparationLifecycleCallbacks` seam for invalidation and restart preparation. Stop, terminal loss, and disposal cancel stale work; restart preparation runs before the first forced frame without adding another streaming timer.
-
-### Fixed
-
-- Disposal and terminal-loss recovery now fence render and raster work already queued behind raster ingress, preventing stale terminal bytes or a falsely successful render generation after the owning TUI lifecycle ends.
 
 ## [0.16.3] - 2026-09-04
 

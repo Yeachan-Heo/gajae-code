@@ -3672,6 +3672,9 @@ export class AgentSession {
 		}
 		this.#sessionTransitionSettlement = Promise.withResolvers<void>();
 		this.#sessionTransitionKind = kind;
+		this.#promptPreflightCancellationGeneration++;
+		this.#promptPreflightAbortController.abort();
+		this.#promptPreflightAbortController = new AbortController();
 		this.#coordinatorPersistGeneration += 1;
 	}
 
@@ -3681,11 +3684,27 @@ export class AgentSession {
 		this.#sessionTransitionSettlement?.resolve();
 		this.#sessionTransitionSettlement = undefined;
 		this.yieldQueue.rearmIdle();
-		this.#flushOrSchedulePendingBackgroundExchanges();
+		const flushErrors: unknown[] = [];
+		try {
+			this.#flushPendingBashMessages();
+		} catch (error) {
+			flushErrors.push(error);
+		}
+		try {
+			this.#flushPendingPythonMessages();
+		} catch (error) {
+			flushErrors.push(error);
+		}
+		try {
+			this.#flushOrSchedulePendingBackgroundExchanges();
+		} catch (error) {
+			flushErrors.push(error);
+		}
 		if (this.#subskillToolRefreshAfterTransition) {
 			this.#subskillToolRefreshAfterTransition = false;
 			this.#requestSubskillToolReconciliation();
 		}
+		if (flushErrors.length > 0) throw new AggregateError(flushErrors, "Deferred session work failed after transition.");
 	}
 
 	#requestSubskillToolReconciliation(): void {
@@ -7504,6 +7523,29 @@ export class AgentSession {
 			this.#resetStreamingEditState();
 			// TTSR: Reset buffer on turn start
 			this.#ttsrManager?.resetBuffer();
+		}
+
+		if (event.type === "turn_end" && event.message.role === "assistant") {
+			if (canonicalAdmission && !canonicalAdmission.predecessor.released) {
+				await canonicalAdmission.predecessor.promise;
+			}
+			if (canonicalAdmission?.predecessor.error !== undefined) throw canonicalAdmission.predecessor.error;
+			if (!eventIdentityIsCurrent()) return;
+			const entryId = getSessionMessageEntryId(event.message);
+			const entry = entryId ? this.sessionManager.getEntryForFidelity(entryId) : undefined;
+			if (
+				entry?.type === "message" &&
+				entry.message.role === "assistant" &&
+				event.message.stopReason === "error"
+			) {
+				try {
+					this.sessionManager.applyEntryMessageUpdates([{ ...entry, message: event.message }]);
+					await this.sessionManager.rewriteEntries();
+				} catch (error) {
+					canonicalAdmission?.fail(error);
+					throw error;
+				}
+			}
 		}
 
 		// TTSR: Increment message count on turn end (for repeat-after-gap tracking)
@@ -13554,7 +13596,6 @@ export class AgentSession {
 					}
 					if (options?.onPreflightAcceptCommit) await options.onPreflightAcceptCommit();
 					else options?.onPreflightAccepted?.();
-					durableAcceptanceCompleted = true;
 					if (options?.preflightSignal?.aborted) {
 						await activationSeed?.rollback();
 						throw promptPreflightCancelledError();
@@ -13565,6 +13606,9 @@ export class AgentSession {
 						...internalOptions,
 						onPreflightAccepted: undefined,
 						onPreflightAcceptCommit: commitAcceptance,
+						onPreflightCommitted: () => {
+							durableAcceptanceCompleted = true;
+						},
 						admissionLease: admission,
 						resetRetryReplaySafety: true,
 					});
@@ -13600,6 +13644,7 @@ export class AgentSession {
 			skipPostPromptRecoveryWait?: boolean;
 			predecessorAgentEndHold?: symbol;
 			admissionLease?: SessionAdmissionLease;
+			onPreflightCommitted?: () => void;
 			skipInitialSteeringPoll?: boolean;
 			onRunAccepted?: (handle: AttemptRunHandle) => void;
 			onFinalPreflight?: (context: { hasPendingNextTurnMessages: boolean }) => Promise<boolean>;
@@ -13998,6 +14043,7 @@ export class AgentSession {
 					if (options?.onPreflightAcceptCommit) return options.onPreflightAcceptCommit();
 					options?.onPreflightAccepted?.();
 				},
+				onPreflightCommitted: options?.onPreflightCommitted,
 			});
 			const activeTerminalScope = this.#activeAttemptScope;
 			const terminalAttemptScope =
@@ -23783,6 +23829,7 @@ export class AgentSession {
 			signal?: AbortSignal;
 			resourceRunId?: string;
 			onPreflightAccepted?: () => void | Promise<void>;
+			onPreflightCommitted?: () => void;
 		},
 	): Promise<void> {
 		const deadline = Date.now() + 30_000;
@@ -23804,8 +23851,11 @@ export class AgentSession {
 						return;
 					}
 					if (!preflightAccepted) {
+						this.#assertNoSessionTransition();
 						await seam?.onPreflightAccepted?.();
 						if (seam?.signal?.aborted) throw promptPreflightCancelledError();
+						this.#assertNoSessionTransition();
+						seam?.onPreflightCommitted?.();
 						preflightAccepted = true;
 					}
 					this.#assertNoSessionTransition();
@@ -24337,6 +24387,7 @@ export class AgentSession {
 		kind: "bash" | "python",
 	): void {
 		if (pendingMessages.length === 0) return;
+		if (this.#sessionTransitionKind !== undefined) return;
 		if (this.#terminalPersistenceRecovery) return;
 
 		const total = pendingMessages.length;
@@ -24373,6 +24424,17 @@ export class AgentSession {
 			try {
 				this.sessionManager.appendMessage(pending.message);
 			} catch (error) {
+				if (error instanceof SessionNearLimitAppendError && error.entryRetained) {
+					persisted.push("command" in pending.message ? pending.message.command : pending.message.code);
+					try {
+						pending.onPersisted?.();
+					} catch (callbackError) {
+						callbackFailureCount++;
+						errors.push(callbackError);
+					}
+					errors.push(error);
+					continue;
+				}
 				// Session entries form a leaf-linked transcript. Once one append fails,
 				// later entries must remain queued behind it or a retry would append the
 				// failed entry after messages that originally followed it.
@@ -25027,7 +25089,12 @@ export class AgentSession {
 	}
 
 	#flushOrSchedulePendingBackgroundExchanges(): void {
-		if (!this.isStreaming && !this.#externalIngressSealed && !this.#terminalPersistenceRecovery) {
+		if (
+			!this.isStreaming &&
+			!this.#externalIngressSealed &&
+			this.#sessionTransitionKind === undefined &&
+			!this.#terminalPersistenceRecovery
+		) {
 			this.#flushPendingBackgroundExchanges();
 			return;
 		}
@@ -25043,7 +25110,12 @@ export class AgentSession {
 				this.#scheduledBackgroundExchangeFlush = false;
 				return;
 			}
-			if (this.isStreaming || this.#externalIngressSealed || this.#terminalPersistenceRecovery) {
+			if (
+				this.isStreaming ||
+				this.#externalIngressSealed ||
+				this.#sessionTransitionKind !== undefined ||
+				this.#terminalPersistenceRecovery
+			) {
 				// Re-poll while streaming, but do not let this housekeeping timer
 				// keep the event loop alive on its own (CPU-7).
 				const pollTimer = setTimeout(attempt, 50);
@@ -25059,7 +25131,11 @@ export class AgentSession {
 
 	#flushPendingBackgroundExchanges(): void {
 		if (this.#pendingBackgroundExchanges.length === 0) return;
-		if (this.#externalIngressSealed || this.#terminalPersistenceRecovery) {
+		if (
+			this.#externalIngressSealed ||
+			this.#sessionTransitionKind !== undefined ||
+			this.#terminalPersistenceRecovery
+		) {
 			this.#scheduleBackgroundExchangeFlush();
 			return;
 		}

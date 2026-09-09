@@ -5248,21 +5248,55 @@ async function executeToolCalls(
 		record.cleanupClaimed = true;
 		try {
 			if (afterToolCall) {
-				await afterToolCall(
-					{
-						assistantMessage,
-						toolCall: record.toolCall,
-						args: record.args,
-						result: {
-							content: [{ type: "text", text: "Tool call cancelled after dispatch." }],
+				await Promise.race([
+					afterToolCall(
+						{
+							assistantMessage,
+							toolCall: record.toolCall,
+							args: record.args,
+							result: {
+								content: [{ type: "text", text: "Tool call cancelled after dispatch." }],
+								isError: true,
+								details: { cancellation: "after_dispatch" },
+							},
 							isError: true,
-							details: { cancellation: "after_dispatch" },
+							context: currentContext,
 						},
-						isError: true,
-						context: currentContext,
-					},
-					toolSignal,
-				);
+						toolSignal,
+					),
+					Bun.sleep(1_000),
+				]);
+			}
+		} catch {
+			// Cancellation is authoritative; the hook is best-effort cleanup only.
+		} finally {
+			record.cleanupSettled.resolve();
+		}
+	};
+
+	const settlePreDispatchCancellationCleanup = async (record: (typeof records)[number]): Promise<void> => {
+		if (record.cleanupClaimed) return record.cleanupSettled.promise;
+		record.cleanupClaimed = true;
+		try {
+			if (afterToolCall) {
+				await Promise.race([
+					afterToolCall(
+						{
+							assistantMessage,
+							toolCall: record.toolCall,
+							args: record.args,
+							result: {
+								content: [{ type: "text", text: "Tool call cancelled before dispatch." }],
+								isError: true,
+								details: { cancellation: "before_dispatch" },
+							},
+							isError: true,
+							context: currentContext,
+						},
+						toolSignal,
+					),
+					Bun.sleep(1_000),
+				]);
 			}
 		} catch {
 			// Cancellation is authoritative; the hook is best-effort cleanup only.
@@ -5478,7 +5512,7 @@ async function executeToolCalls(
 				};
 				isError = true;
 			}
-			if (afterToolCall && !record.started) {
+			if (afterToolCall && !record.started && !record.cleanupClaimed) {
 				record.cleanupClaimed = true;
 				try {
 					await afterToolCall(
@@ -5647,9 +5681,8 @@ async function executeToolCalls(
 					emitToolResult(record, createAbortedToolExecutionResult(), true);
 				}
 				for (const record of records) {
-					if (record.started || record.preDispatchEntered || record.cleanupClaimed) continue;
-					record.cleanupClaimed = true;
-					record.cleanupSettled.resolve();
+					if (record.started || record.cleanupClaimed) continue;
+					void settlePreDispatchCancellationCleanup(record);
 				}
 				await Promise.all(
 					records.map(record =>
