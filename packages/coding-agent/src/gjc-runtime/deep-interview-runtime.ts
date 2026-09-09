@@ -1313,11 +1313,11 @@ async function handleCrystallizeUnlocked(
 	}
 	if (priorSource && snapshot.revision <= priorSource.revision)
 		throw new DeepInterviewCommandError(2, "conversation snapshot is stale against the stored Crystal");
-	if (!priorCrystal) {
-		const canonicalStart = Math.max(0, liveSnapshot.messages.length - CRYSTAL_MAX_MESSAGES);
-		if (snapshot.start !== canonicalStart)
-			throw new DeepInterviewCommandError(2, "first Crystal must cover the canonical bounded transcript window");
-	}
+	if (!priorCrystal && (liveSnapshot.messages.length > CRYSTAL_MAX_MESSAGES || snapshot.start !== 0))
+		throw new DeepInterviewCommandError(
+			2,
+			`first Crystal must cover the full authenticated transcript from index 0 (maximum ${CRYSTAL_MAX_MESSAGES} messages); continue the ordinary interview flow instead of dropping earlier messages`,
+		);
 	const payload = { ...input, prior: storedPrior };
 	const crystal = crystallizeDeepInterview(payload);
 	const slug = flagValue(args, "--slug")!.trim();
