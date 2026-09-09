@@ -335,7 +335,12 @@ async function withPersistedApprovalSession(
 	});
 }
 
-async function askAndPersistExecutionApproval(cwd: string, manager: SessionManager, questionId: string): Promise<void> {
+async function askAndPersistExecutionApproval(
+	cwd: string,
+	manager: SessionManager,
+	questionId: string,
+	stage: "deep-interview" | "ralplan" = "deep-interview",
+): Promise<void> {
 	const label = "Approve execution via ultragoal";
 	const args = {
 		questions: [
@@ -343,7 +348,10 @@ async function askAndPersistExecutionApproval(cwd: string, manager: SessionManag
 				id: questionId,
 				question: "Approve this published specification for execution?",
 				options: [{ label }, { label: "Keep planning" }],
-				workflowGate: { stage: "deep-interview" as const, kind: "execution" as const },
+				workflowGate:
+					stage === "ralplan"
+						? { stage: "ralplan" as const, kind: "approval" as const }
+						: { stage: "deep-interview" as const, kind: "execution" as const },
 			},
 		],
 	};
@@ -458,6 +466,115 @@ describe("gjc state handoff", () => {
 			const handoff = await handoffPersistedCrystal(cwd, sessionId);
 			expect(handoff.status, handoff.stderr).toBe(0);
 			expect((await readJson(recordPath))?.crystal_spec_version).toBe(2);
+		});
+	});
+
+	it("renews consumed Crystal v1 consent through published v2 and a fresh Ralplan final Ask", async () => {
+		await withPersistedApprovalSession(async (cwd, manager, sessionId) => {
+			await askAndPersistExecutionApproval(cwd, manager, "ralplan-renewal-v1");
+			const firstApproval = await approvePersistedCrystal(cwd, sessionId);
+			expect(firstApproval.status, firstApproval.stderr).toBe(0);
+			const recordPath = deepInterviewExecutionApprovalRecordPath(cwd, sessionId);
+			const consumedV1 = (await readJson(recordPath))!;
+			manager.appendMessage({ role: "user", content: "Encrypt backups.", timestamp: Date.now() });
+			await manager.flush();
+			const publishedV2 = await publishPersistedCrystal(cwd, sessionId);
+			const crystalV2 = (publishedV2.state as Record<string, unknown>).crystal as DeepInterviewCrystal;
+			expect(crystalV2.spec_version).toBe(2);
+			const planning = await runNativeStateCommand(
+				["handoff", "--mode", "deep-interview", "--to", "ralplan", "--session-id", sessionId, "--json"],
+				cwd,
+			);
+			expect(planning.status, planning.stderr).toBe(0);
+			await fs.writeFile(path.join(cwd, ".gjc", "config.yml"), "gjc:\n  ralplan:\n    autoHandoff: off\n");
+			const seed = await runNativeRalplanCommand(["--json", "refine the encrypted backup specification"], cwd);
+			expect(seed.status, seed.stderr).toBe(0);
+			const runId = parseRequiredJson(seed.stdout, "ralplan seed stdout").run_id as string;
+			const artifactPath = path.join(cwd, "renewal-final.md");
+			await fs.writeFile(artifactPath, `# Final\n${"계획".repeat(60_000)}`);
+			const final = await runNativeRalplanCommand(
+				["--write", "--stage", "final", "--stage_n", "1", "--artifact", artifactPath, "--run-id", runId, "--json"],
+				cwd,
+			);
+			expect(final.status, final.stderr).toBe(0);
+			const handoff = () =>
+				runNativeStateCommand(
+					["handoff", "--mode", "ralplan", "--to", "ultragoal", "--session-id", sessionId, "--json"],
+					cwd,
+				);
+			expect((await handoff()).status).toBe(2);
+			await askAndPersistExecutionApproval(cwd, manager, "ralplan-renewal-v2", "ralplan");
+			const consumedV2 = (await readJson(recordPath))!;
+			expect(consumedV2.status).toBe("consumed");
+			expect(consumedV2.approval_stage).toBe("ralplan");
+			expect(consumedV2.ralplan_run_id).toBe(runId);
+			expect(consumedV2.crystal_spec_version).toBe(2);
+			expect(consumedV2.crystal_source_digest).toBe(crystalV2.source.digest);
+			expect(consumedV2.spec_sha256).toBe(publishedV2.spec_sha256);
+			expect(consumedV2.question_id).not.toBe(consumedV1.question_id);
+			expect(consumedV2.gate_id).not.toBe(consumedV1.gate_id);
+			expect(await readJson(`${recordPath}.1.${consumedV1.spec_sha256}.consumed`)).toEqual(consumedV1);
+			const approvedState = (await readJson(modeStatePath(cwd, sessionId, "deep-interview")))!;
+			expect((approvedState.state as Record<string, unknown>).execution_approval).toBe("approved");
+			await expect(
+				askAndPersistExecutionApproval(cwd, manager, "ralplan-renewal-replay", "ralplan"),
+			).rejects.toThrow("already consumed");
+			expect((await approvePersistedCrystal(cwd, sessionId)).status).toBe(2);
+			const ready = await runNativeStateCommand(
+				["write", "--mode", "ralplan", "--input", JSON.stringify({ current_phase: "handoff" }), "--json"],
+				cwd,
+			);
+			expect(ready.status, ready.stderr).toBe(0);
+			expect(await readJson(modeStatePath(cwd, sessionId, "ultragoal"))).toBeNull();
+			const admitted = await handoff();
+			expect(admitted.status, admitted.stderr).toBe(0);
+			expect((await readJson(modeStatePath(cwd, sessionId, "ultragoal")))?.handoff_from).toBe("ralplan");
+			expect((await readJson(recordPath))?.status).toBe("consumed");
+		});
+	});
+
+	it("renews consumed Crystal v1 consent for changed v3 after an unapproved v2 publication", async () => {
+		await withPersistedApprovalSession(async (cwd, manager, sessionId) => {
+			await askAndPersistExecutionApproval(cwd, manager, "skipped-version-v1");
+			const firstApproval = await approvePersistedCrystal(cwd, sessionId);
+			expect(firstApproval.status, firstApproval.stderr).toBe(0);
+			const recordPath = deepInterviewExecutionApprovalRecordPath(cwd, sessionId);
+			const consumedV1 = (await readJson(recordPath))!;
+			for (const [version, content] of [
+				[2, "Encrypt backups."],
+				[3, "Retain backups for thirty days."],
+			] as const) {
+				manager.appendMessage({ role: "user", content, timestamp: Date.now() });
+				await manager.flush();
+				const published = await publishPersistedCrystal(cwd, sessionId);
+				const inner = published.state as Record<string, unknown>;
+				expect((inner.crystal as DeepInterviewCrystal).spec_version).toBe(version);
+				expect(inner.execution_approval).toBe("not-approved");
+				expect(inner.execution_approval_receipt).toBeUndefined();
+				expect(await readJson(recordPath)).toEqual(consumedV1);
+				expect((await handoffPersistedCrystal(cwd, sessionId)).status).toBe(2);
+			}
+			await askAndPersistExecutionApproval(cwd, manager, "skipped-version-v3");
+			const publishedV3 = (await readJson(modeStatePath(cwd, sessionId, "deep-interview")))!;
+			const crystalV3 = (publishedV3.state as Record<string, unknown>).crystal as DeepInterviewCrystal;
+			const pendingV3 = (await readJson(recordPath))!;
+			expect(pendingV3.status).toBe("pending");
+			expect(pendingV3.crystal_spec_version).toBe(3);
+			expect(pendingV3.crystal_source_digest).toBe(crystalV3.source.digest);
+			expect(pendingV3.spec_sha256).toBe(publishedV3.spec_sha256);
+			expect(pendingV3.question_id).not.toBe(consumedV1.question_id);
+			expect(pendingV3.gate_id).not.toBe(consumedV1.gate_id);
+			expect(await readJson(`${recordPath}.1.${consumedV1.spec_sha256}.consumed`)).toEqual(consumedV1);
+			const approved = await approvePersistedCrystal(cwd, sessionId);
+			expect(approved.status, approved.stderr).toBe(0);
+			await expect(askAndPersistExecutionApproval(cwd, manager, "skipped-version-replay")).rejects.toThrow(
+				"already consumed",
+			);
+			expect((await approvePersistedCrystal(cwd, sessionId)).status).toBe(2);
+			const handoff = await handoffPersistedCrystal(cwd, sessionId);
+			expect(handoff.status, handoff.stderr).toBe(0);
+			expect((await readJson(recordPath))?.crystal_spec_version).toBe(3);
+			expect((await readJson(recordPath))?.status).toBe("consumed");
 		});
 	});
 
