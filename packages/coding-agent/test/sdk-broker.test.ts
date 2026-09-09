@@ -2080,14 +2080,16 @@ describe("SDK broker identity and discovery", () => {
 		await broker.index.open();
 		await fs.mkdir(path.dirname(endpointPath), { recursive: true });
 		await fs.writeFile(endpointPath, JSON.stringify({ sessionId: "s", pid: process.pid, token: "session-secret" }));
-		const endpointMtimeMs = (await fs.stat(endpointPath)).mtimeMs;
+		// Register the way production hosts do: descriptor-bound identity, not a
+		// libuv double mtimeMs that can differ from the bigint read by one ulp (#5376).
+		const authority = await captureEndpointAuthority(endpointPath);
 		await broker.index.append({
 			type: "host_registered",
 			sessionId: "s",
 			locator: { cwd: "r", worktreeRoot: null, stateRoot },
 			endpointGeneration: 3,
 			pid: process.pid,
-			endpointMtimeMs,
+			...authority,
 		});
 		await broker.index.append({
 			type: "host_heartbeat",
@@ -2096,7 +2098,7 @@ describe("SDK broker identity and discovery", () => {
 			endpointGeneration: 3,
 			pid: process.pid,
 		});
-		const boundIncarnation = endpointIncarnation({ endpointGeneration: 3, endpointMtimeMs, pid: process.pid }, "s");
+		const boundIncarnation = endpointIncarnation({ endpointGeneration: 3, ...authority, pid: process.pid }, "s");
 		expect(boundIncarnation).toBeString();
 		expect(
 			await broker.handleRequest("session.get_endpoint", {
@@ -2128,7 +2130,8 @@ describe("SDK broker identity and discovery", () => {
 			locator: { cwd: "r", worktreeRoot: null, stateRoot },
 			endpointGeneration: 4,
 			pid: process.pid,
-			endpointMtimeMs: endpointMtimeMs + 1,
+			endpointMtimeMs: authority.endpointMtimeMs + 1,
+			endpointFileId: authority.endpointFileId,
 		});
 		await broker.index.append({
 			type: "host_heartbeat",
@@ -2138,6 +2141,69 @@ describe("SDK broker identity and discovery", () => {
 			pid: process.pid,
 		});
 		expect(await broker.handleRequest("session.get_endpoint", { sessionId: "s", endpointGeneration: 4 })).toEqual({
+			ok: false,
+			error: { code: "endpoint_stale", message: "session endpoint is stale" },
+		});
+	});
+	it("serves a legacy index row without endpointFileId when its mtime matches the descriptor read exactly", async () => {
+		// Legacy rows predate file identity and match by exact mtime only. Source
+		// the mtime from the same bigint descriptor read production uses so the
+		// exact-equality branch is exercised deterministically on every platform,
+		// not through a libuv double that can differ by one ulp (#5376).
+		const dir = await temp();
+		const stateRoot = path.join(dir, "state");
+		const endpointPath = path.join(stateRoot, "sdk", "legacy.json");
+		const broker = new Broker({ agentDir: dir });
+		await broker.index.open();
+		await fs.mkdir(path.dirname(endpointPath), { recursive: true });
+		await fs.writeFile(
+			endpointPath,
+			JSON.stringify({ sessionId: "legacy", pid: process.pid, token: "legacy-secret" }),
+		);
+		const descriptorRead = await readEndpointFile(endpointPath);
+		if (!descriptorRead) throw new Error("Expected a readable legacy endpoint fixture.");
+		await broker.index.append({
+			type: "host_registered",
+			sessionId: "legacy",
+			locator: { cwd: "r", worktreeRoot: null, stateRoot },
+			endpointGeneration: 1,
+			pid: process.pid,
+			endpointMtimeMs: descriptorRead.mtimeMs,
+		});
+		await broker.index.append({
+			type: "host_heartbeat",
+			sessionId: "legacy",
+			locator: { cwd: "r", worktreeRoot: null, stateRoot },
+			endpointGeneration: 1,
+			pid: process.pid,
+		});
+		expect(
+			await broker.handleRequest("session.get_endpoint", { sessionId: "legacy", endpointGeneration: 1 }),
+		).toEqual({
+			ok: true,
+			result: { sessionId: "legacy", pid: process.pid, token: "legacy-secret" },
+		});
+		// A sub-millisecond skew that the file-identity branch tolerates is still
+		// rejected for legacy rows: without an inode to pin identity, exact mtime is
+		// the only authority and any drift fails closed.
+		await broker.index.append({
+			type: "host_registered",
+			sessionId: "legacy",
+			locator: { cwd: "r", worktreeRoot: null, stateRoot },
+			endpointGeneration: 2,
+			pid: process.pid,
+			endpointMtimeMs: descriptorRead.mtimeMs + 0.0005,
+		});
+		await broker.index.append({
+			type: "host_heartbeat",
+			sessionId: "legacy",
+			locator: { cwd: "r", worktreeRoot: null, stateRoot },
+			endpointGeneration: 2,
+			pid: process.pid,
+		});
+		expect(
+			await broker.handleRequest("session.get_endpoint", { sessionId: "legacy", endpointGeneration: 2 }),
+		).toEqual({
 			ok: false,
 			error: { code: "endpoint_stale", message: "session endpoint is stale" },
 		});
