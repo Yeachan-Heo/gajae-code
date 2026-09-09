@@ -1766,6 +1766,60 @@ describe("agentLoopContinue with AgentMessage", () => {
 		});
 	});
 
+	it("runs pre-dispatch cleanup once when abort lands inside an awaited hook", async () => {
+		const toolSchema = z.object({});
+		const controller = new AbortController();
+		const beforeEntered = Promise.withResolvers<void>();
+		const releaseBefore = Promise.withResolvers<void>();
+		let executed = false;
+		let cleanupCalls = 0;
+		const tool: AgentTool<typeof toolSchema, unknown> = {
+			name: "gated",
+			label: "Gated",
+			description: "Waits in pre-dispatch",
+			parameters: toolSchema,
+			execute: async () => {
+				executed = true;
+				return { content: [{ type: "text", text: "executed" }] };
+			},
+		};
+		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [tool] };
+		const mock = createMockModel({
+			responses: [{ content: [{ type: "toolCall", id: "tool-1", name: "gated", arguments: {} }] }],
+		});
+		const stream = agentLoop(
+			[createUserMessage("run")],
+			context,
+			{
+				model: mock.model,
+				convertToLlm: identityConverter,
+				beforeToolCall: async () => {
+					beforeEntered.resolve();
+					await releaseBefore.promise;
+				},
+				afterToolCall: async ({ result }) => {
+					expect(result).toMatchObject({ details: { cancellation: "before_dispatch" } });
+					cleanupCalls++;
+				},
+			},
+			controller.signal,
+			mock.stream,
+		);
+		const drained = (async () => {
+			for await (const _event of stream) {
+				// drain
+			}
+		})();
+		await beforeEntered.promise;
+		controller.abort();
+		await drained;
+		expect(executed).toBe(false);
+		expect(cleanupCalls).toBe(1);
+		releaseBefore.resolve();
+		await Bun.sleep(0);
+		expect(cleanupCalls).toBe(1);
+	});
+
 	it("settles dispatched cancellation cleanup before agent_end", async () => {
 		const toolSchema = z.object({});
 		const controller = new AbortController();
