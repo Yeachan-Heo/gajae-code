@@ -369,9 +369,15 @@ that the interrupted operation finished. Reconcile read-only with the original
 session and exact selector above; never replay `turn.prompt` because its transport
 reported `uncertain_after_send`.
 
-For an acknowledged ACP prompt, transport uncertainty triggers at most one
-read-only `turn.result` observation, bounded to five seconds. The adapter accepts
-only the original invocation kind (`prompt` or `skill`), correlation, and a valid terminal result. Ordinary
+ACP gives each prompt or skill invocation a fresh `clientRef` before dispatch.
+Uncertainty from either the request itself or its transport triggers at most one
+read-only `turn.result` observation, bounded to five seconds. When acknowledgement
+was lost, recovery uses the original invocation kind and `clientRef`; otherwise
+it uses the acknowledged command/turn pair. The adapter validates the returned
+identity before adopting terminal evidence and never resends the mutation. An
+unresolved request retains its waiter until the attachment is safely retired,
+preventing another prompt from overlapping potentially running uncertain work.
+Ordinary
 `end_turn` recovery also requires a present, readable non-empty text receipt;
 explicit cancellation/refusal/limit outcomes do not require invented text. If
 status remains pending, unknown, unavailable, mismatched, or lacks required

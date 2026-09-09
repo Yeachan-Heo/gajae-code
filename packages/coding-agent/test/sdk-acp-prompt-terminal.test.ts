@@ -6,7 +6,7 @@ import packageJson from "../package.json" with { type: "json" };
 import { AcpAgent } from "../src/modes/acp/acp-agent";
 import { AcpSdkAdapter } from "../src/sdk/acp/adapter";
 import { writeBrokerDiscovery } from "../src/sdk/broker/discovery";
-import { SdkClientError } from "../src/sdk/client";
+import { SdkClient, SdkClientError } from "../src/sdk/client";
 import {
 	type ExactSessionAuthorityFixture,
 	type ExactSessionAuthorityOptions,
@@ -42,6 +42,9 @@ type Fixture = {
 	queryCalls: string[];
 	turnResultInputs: unknown[];
 	invocationOperations: string[];
+	controlOperations: string[];
+	invocationInputs: Record<string, unknown>[];
+	releaseTurnResult(): void;
 	blockedAdvisoryQueryCount(): number;
 	releaseBlockedAdvisoryQueries(): void;
 	releaseIdleUpdate(): void;
@@ -49,6 +52,7 @@ type Fixture = {
 	releaseAgentMessageUpdate(): void;
 	releaseFailureDiagnostic(): void;
 	releasePromptAcknowledgement(): void;
+	releaseInvocationAcknowledgement(delivery: number): void;
 	sendTerminal(frame: Record<string, unknown>): void;
 };
 
@@ -103,6 +107,11 @@ async function createFixture(
 		turnResultUnavailable?: boolean;
 		turnResultStalled?: boolean;
 		turnResultError?: { code: string; message: string };
+		loseInvocationAcknowledgement?: boolean;
+		delayCompleteInvocationAcknowledgement?: boolean;
+		holdInvocationAcknowledgements?: number[];
+		changedConnectionBeforeAcknowledgement?: boolean;
+		deferTurnResult?: boolean;
 	} = {},
 ): Promise<Fixture> {
 	const tempDir = TempDir.createSync("@sdk-acp-prompt-terminal-");
@@ -116,6 +125,9 @@ async function createFixture(
 	const queryCalls: string[] = [];
 	const turnResultInputs: unknown[] = [];
 	const invocationOperations: string[] = [];
+	const controlOperations: string[] = [];
+	const invocationInputs: Record<string, unknown>[] = [];
+	let deferredTurnResult: (() => void) | undefined;
 	const blockedAdvisoryQueries: Array<{ socket: TestSocket; id: string; result: unknown }> = [];
 	const idleUpdateRelease = Promise.withResolvers<void>();
 	const idleUpdateEntered = Promise.withResolvers<void>();
@@ -133,6 +145,7 @@ async function createFixture(
 	let promptSocket: TestSocket | undefined;
 	let promptDeliveries = 0;
 	let deferredPromptAcknowledgement: (() => void) | undefined;
+	const heldInvocationAcknowledgements = new Map<number, () => void>();
 	const activeCorrelation = (): { commandId: string; turnId: string } => {
 		const suffix = promptDeliveries > 1 && !options.reusePromptCorrelationOnSecond ? `-${promptDeliveries}` : "";
 		return { commandId: `${commandId}${suffix}`, turnId: `${turnId}${suffix}` };
@@ -276,18 +289,33 @@ async function createFixture(
 					if (frame.query === "turn.result") {
 						turnResultInputs.push(frame.input);
 						if (options.turnResultStalled) return;
-						socket.send(
-							JSON.stringify({
-								type: "query_response",
-								id: frame.id,
-								ok: !options.turnResultUnavailable && !options.turnResultError,
-								...(options.turnResultError
-									? { error: options.turnResultError }
-									: options.turnResultUnavailable
-										? { error: { code: "session_unavailable", message: "live session query unavailable" } }
-										: { result: options.turnResult ?? { status: "unknown", receiptState: "unknown" } }),
-							}),
-						);
+						const respond = () =>
+							socket.send(
+								JSON.stringify({
+									type: "query_response",
+									id: frame.id,
+									ok: !options.turnResultUnavailable && !options.turnResultError,
+									...(options.turnResultError
+										? { error: options.turnResultError }
+										: options.turnResultUnavailable
+											? { error: { code: "session_unavailable", message: "live session query unavailable" } }
+											: {
+													result: {
+														...(options.loseInvocationAcknowledgement
+															? {
+																	kind:
+																		invocationOperations[0] === "skill.invoke" ? "skill" : "prompt",
+																	clientRef: invocationInputs[0]?.clientRef,
+																	sessionId,
+																}
+															: {}),
+														...(options.turnResult ?? { status: "unknown", receiptState: "unknown" }),
+													},
+												}),
+								}),
+							);
+						if (options.deferTurnResult) deferredTurnResult = respond;
+						else respond();
 						return;
 					}
 					const items =
@@ -316,8 +344,10 @@ async function createFixture(
 					return;
 				}
 				if (frame.type !== "control_request") return;
+				controlOperations.push(String(frame.operation));
 				if (frame.operation === "turn.prompt" || frame.operation === "skill.invoke") {
 					invocationOperations.push(String(frame.operation));
+					invocationInputs.push(frame.input as Record<string, unknown>);
 					promptSocket = socket;
 					promptDeliveries++;
 					delivered.resolve();
@@ -333,6 +363,39 @@ async function createFixture(
 								outcome: { kind: "stopped", reason: "end_turn", provenance: "agent" },
 							},
 						);
+					// The real client request must expire after send: no response and no
+					// synthetic reconnect callback or mocked adapter rejection.
+					if (options.holdInvocationAcknowledgements?.includes(promptDeliveries)) {
+						const acknowledgement = { ...activeCorrelation(), accepted: true };
+						heldInvocationAcknowledgements.set(promptDeliveries, () =>
+							socket.send(
+								JSON.stringify({
+									type: "control_response",
+									id: frame.id,
+									ok: true,
+									result: acknowledgement,
+								}),
+							),
+						);
+						return;
+					}
+					if (options.loseInvocationAcknowledgement && promptDeliveries === 1) {
+						if (options.delayCompleteInvocationAcknowledgement) {
+							const acknowledgement = { ...activeCorrelation(), accepted: true };
+							deferredPromptAcknowledgement = () =>
+								socket.send(
+									JSON.stringify({
+										type: "control_response",
+										id: frame.id,
+										ok: true,
+										result: acknowledgement,
+									}),
+								);
+						}
+						if (options.changedConnectionBeforeAcknowledgement)
+							sendTerminal({ type: "hello", connectionId: "replacement-owner-before-timeout" });
+						return;
+					}
 				}
 				const response = JSON.stringify({
 					type: "control_response",
@@ -497,6 +560,9 @@ async function createFixture(
 		queryCalls,
 		turnResultInputs,
 		invocationOperations,
+		controlOperations,
+		invocationInputs,
+		releaseTurnResult: () => deferredTurnResult?.(),
 		blockedAdvisoryQueryCount: () => blockedAdvisoryQueries.length,
 		releaseBlockedAdvisoryQueries: () => {
 			for (const blocked of blockedAdvisoryQueries.splice(0))
@@ -512,6 +578,7 @@ async function createFixture(
 		releaseAgentMessageUpdate: () => agentMessageUpdateRelease.resolve(),
 		releaseFailureDiagnostic: () => failureDiagnosticRelease.resolve(),
 		releasePromptAcknowledgement: () => deferredPromptAcknowledgement?.(),
+		releaseInvocationAcknowledgement: delivery => heldInvocationAcknowledgements.get(delivery)?.(),
 		sendTerminal,
 		dispose: () => {
 			agentMessageUpdateRelease.resolve();
@@ -2136,6 +2203,392 @@ test("ACP keeps correlationless session updates publishable after terminal settl
 		fixture.dispose();
 	}
 });
+
+// Keep Router, WebSocket, SdkClient and adapter request handling real; only shorten
+// the request budget for the acknowledgement that the server deliberately loses.
+function shortenInvocationAcknowledgementBudget() {
+	const request = SdkClient.prototype.request;
+	return vi.spyOn(SdkClient.prototype, "request").mockImplementation(function (this: SdkClient, frame, options) {
+		const invocation =
+			frame.type === "control_request" && (frame.operation === "turn.prompt" || frame.operation === "skill.invoke");
+		return request.call(
+			this,
+			frame,
+			invocation ? { ...(typeof options === "number" ? {} : options), timeoutMs: 100 } : options,
+		);
+	});
+}
+
+for (const kind of ["prompt", "skill"] as const) {
+	test(`ACP recovered ${kind} acknowledgement cannot release a successor-owned fence`, async () => {
+		let recover: ((error: SdkClientError) => void) | undefined;
+		const subscribe = AcpSdkAdapter.prototype.onReconnectFailed;
+		const subscription = vi.spyOn(AcpSdkAdapter.prototype, "onReconnectFailed").mockImplementation(function (
+			this: AcpSdkAdapter,
+			handler,
+		) {
+			recover = handler;
+			return subscribe.call(this, handler);
+		});
+		const fixture = await createFixture({
+			loseInvocationAcknowledgement: true,
+			holdInvocationAcknowledgements: [1, 2],
+			abortAcknowledgement: {
+				ok: true,
+				selection: "turn",
+				turn: "stopped",
+				terminal: "terminal_no_effect",
+				disposition: "preflight_cancelled",
+			},
+			turnResult: {
+				commandId: "prompt-terminal-command",
+				turnId: "prompt-terminal-turn",
+				status: "terminal_ok",
+				receiptState: "present",
+				content: { version: 1, type: "text", text: "recovered A" },
+				outcome: { kind: "stopped", reason: "end_turn", provenance: "agent" },
+			},
+		});
+		try {
+			const first = prompt(fixture, kind === "skill" ? "/skill:review A" : "A");
+			void first.catch(() => undefined);
+			await bounded(fixture.promptDelivered, "A held acknowledgement");
+			expect(recover).toBeDefined();
+			recover!(new SdkClientError("provider_rebind_failed", "recover A before acceptance"));
+			expect(await bounded(first, "A recovery")).toEqual({ stopReason: "end_turn" });
+			const { pending: second } = await promptWhenDelivered(fixture, "B held acknowledgement", 2);
+			await bounded(fixture.agent.cancel({ sessionId: fixture.sessionId }), "B preflight cancel");
+			expect(await bounded(second, "B cancellation")).toEqual({ stopReason: "cancelled" });
+			await expect(prompt(fixture, "C before A acknowledgement")).rejects.toMatchObject({ code: "conflict" });
+			fixture.releaseInvocationAcknowledgement(1);
+			await Bun.sleep(50);
+			await expect(prompt(fixture, "C after A acknowledgement")).rejects.toMatchObject({ code: "conflict" });
+			expect(fixture.promptDeliveryCount()).toBe(2);
+			expect(fixture.controlOperations.filter(operation => operation === "turn.abort")).toHaveLength(1);
+			fixture.releaseInvocationAcknowledgement(2);
+			const { pending: third } = await promptWhenDelivered(fixture, "C after B acknowledgement", 3);
+			fixture.sendStopped("refusal");
+			expect(await bounded(third, "C terminal")).toEqual({ stopReason: "refusal" });
+			expect(fixture.turnResultInputs).toEqual([{ kind, clientRef: fixture.invocationInputs[0]?.clientRef }]);
+			expect(fixture.invocationOperations).toEqual([
+				kind === "skill" ? "skill.invoke" : "turn.prompt",
+				"turn.prompt",
+				"turn.prompt",
+			]);
+			expect(fixture.controlOperations.filter(operation => operation === "turn.abort")).toHaveLength(1);
+		} finally {
+			fixture.releaseInvocationAcknowledgement(1);
+			fixture.releaseInvocationAcknowledgement(2);
+			fixture.dispose();
+			subscription.mockRestore();
+		}
+	});
+}
+
+for (const kind of ["prompt", "skill"] as const) {
+	test(`ACP recovered ${kind} late matching acknowledgement never aborts its successor`, async () => {
+		let recover: ((error: SdkClientError) => void) | undefined;
+		const subscribe = AcpSdkAdapter.prototype.onReconnectFailed;
+		const subscription = vi.spyOn(AcpSdkAdapter.prototype, "onReconnectFailed").mockImplementation(function (
+			this: AcpSdkAdapter,
+			handler,
+		) {
+			recover = handler;
+			return subscribe.call(this, handler);
+		});
+		// Do not shorten the real request budget: acceptance remains pending while
+		// a still-live transport reports its independent provider reclaim failure.
+		const fixture = await createFixture({
+			loseInvocationAcknowledgement: true,
+			delayCompleteInvocationAcknowledgement: true,
+			turnResult: {
+				commandId: "prompt-terminal-command",
+				turnId: "prompt-terminal-turn",
+				status: "terminal_ok",
+				receiptState: "present",
+				content: { version: 1, type: "text", text: "recovered before acceptance" },
+				outcome: { kind: "stopped", reason: "end_turn", provenance: "agent" },
+			},
+		});
+		try {
+			const first = prompt(fixture, kind === "skill" ? "/skill:review inspect" : "inspect");
+			void first.catch(() => undefined);
+			await bounded(fixture.promptDelivered, "pending real acceptance");
+			expect(fixture.turnResultInputs).toHaveLength(0);
+			expect(recover).toBeDefined();
+			recover!(new SdkClientError("provider_rebind_failed", "live transport provider reclaim failed"));
+			expect(await bounded(first, "recovery before original acknowledgement")).toEqual({ stopReason: "end_turn" });
+			const { pending: second } = await promptWhenDelivered(fixture, "successor remains active", 2);
+			let settled = false;
+			void second.then(
+				() => {
+					settled = true;
+				},
+				() => {
+					settled = true;
+				},
+			);
+			fixture.releasePromptAcknowledgement();
+			await Bun.sleep(50);
+			expect(settled).toBe(false);
+			expect(fixture.controlOperations.filter(operation => operation === "turn.abort")).toEqual([]);
+			expect(fixture.invocationOperations).toEqual([
+				kind === "skill" ? "skill.invoke" : "turn.prompt",
+				"turn.prompt",
+			]);
+			expect(fixture.turnResultInputs).toEqual([{ kind, clientRef: fixture.invocationInputs[0]?.clientRef }]);
+			fixture.sendStopped("refusal");
+			expect(await bounded(second, "unaffected successor terminal")).toEqual({ stopReason: "refusal" });
+		} finally {
+			fixture.releasePromptAcknowledgement();
+			fixture.dispose();
+			subscription.mockRestore();
+		}
+	});
+}
+
+for (const kind of ["prompt", "skill"] as const) {
+	for (const code of ["reconnect_exhausted", "provider_rebind_failed"] as const) {
+		test(`ACP real lost ${kind} acknowledgement retains recovery across ${code}`, async () => {
+			const budget = shortenInvocationAcknowledgementBudget();
+			let recover: ((error: SdkClientError) => void) | undefined;
+			const subscribe = AcpSdkAdapter.prototype.onReconnectFailed;
+			const subscription = vi.spyOn(AcpSdkAdapter.prototype, "onReconnectFailed").mockImplementation(function (
+				this: AcpSdkAdapter,
+				handler,
+			) {
+				recover = handler;
+				return subscribe.call(this, handler);
+			});
+			const fixture = await createFixture({
+				loseInvocationAcknowledgement: true,
+				deferTurnResult: true,
+				turnResult: {
+					commandId: "prompt-terminal-command",
+					turnId: "prompt-terminal-turn",
+					status: "terminal_ok",
+					receiptState: "present",
+					content: { version: 1, type: "text", text: "exact recovered receipt" },
+					outcome: { kind: "stopped", reason: "end_turn", provenance: "agent" },
+				},
+			});
+			try {
+				let settled = false;
+				const pending = prompt(fixture, kind === "skill" ? "/skill:review inspect" : "inspect");
+				void pending.then(
+					() => {
+						settled = true;
+					},
+					() => {
+						settled = true;
+					},
+				);
+				await waitFor(() => fixture.turnResultInputs.length === 1, "real request loss recovery");
+				expect(recover).toBeDefined();
+				const recoveryHandler = recover;
+				recover!(new SdkClientError(code, "competing reconnect failure"));
+				recover!(new SdkClientError(code, "duplicate competing reconnect failure"));
+				await Bun.sleep(30);
+				expect(settled).toBe(false);
+				await expect(prompt(fixture, "cannot overlap original mutation")).rejects.toMatchObject({
+					code: "conflict",
+				});
+				expect(recover).toBe(recoveryHandler);
+				expect(fixture.invocationOperations).toEqual([kind === "skill" ? "skill.invoke" : "turn.prompt"]);
+				expect(fixture.turnResultInputs).toEqual([{ kind, clientRef: fixture.invocationInputs[0]?.clientRef }]);
+				fixture.releaseTurnResult();
+				expect(await bounded(pending, "exact recovery after reconnect failure")).toEqual({
+					stopReason: "end_turn",
+				});
+				expect(fixture.turnResultInputs).toHaveLength(1);
+			} finally {
+				fixture.dispose();
+				subscription.mockRestore();
+				budget.mockRestore();
+			}
+		});
+	}
+}
+
+for (const kind of ["prompt", "skill"] as const) {
+	for (const scenario of [
+		"terminal",
+		"before_ack",
+		"racing_terminal",
+		"failed",
+		"failure_detail",
+		"unknown",
+		"pending",
+		"unavailable",
+		"wrong_ref",
+		"missing_ref",
+		"wrong_kind",
+		"missing_kind",
+		"wrong_session",
+		"missing",
+		"empty",
+		"stalled",
+	] as const) {
+		test(`ACP real lost ${kind} acknowledgement reconciles once: ${scenario}`, async () => {
+			const budget = shortenInvocationAcknowledgementBudget();
+			const failed = scenario === "failed" || scenario === "failure_detail";
+			const fixture = await createFixture({
+				loseInvocationAcknowledgement: true,
+				terminalBeforeAcknowledgement: scenario === "before_ack",
+				deferTurnResult: scenario !== "stalled",
+				turnResultUnavailable: scenario === "unavailable",
+				turnResultStalled: scenario === "stalled",
+				turnResult: {
+					commandId: "prompt-terminal-command",
+					turnId: "prompt-terminal-turn",
+					...(scenario === "wrong_ref" ? { clientRef: "foreign-invocation" } : {}),
+					...(scenario === "missing_ref" ? { clientRef: undefined } : {}),
+					...(scenario === "wrong_kind" ? { kind: kind === "skill" ? "prompt" : "skill" } : {}),
+					...(scenario === "missing_kind" ? { kind: undefined } : {}),
+					...(scenario === "wrong_session" ? { sessionId: "foreign-session" } : {}),
+					status: failed
+						? "failed"
+						: scenario === "unknown"
+							? "unknown"
+							: scenario === "pending"
+								? "in_flight"
+								: "terminal_ok",
+					receiptState: failed ? "unknown" : scenario === "missing" ? "missing" : "present",
+					content: { version: 1, type: "text", text: scenario === "empty" ? " \n " : "exact recovered receipt" },
+					error: { code: "provider_rejected", message: "Authoritative execution failure" },
+					outcome:
+						scenario === "failure_detail"
+							? undefined
+							: failed
+								? {
+										kind: "failed",
+										code: "prompt_failed",
+										message: "Authoritative execution failure",
+										provenance: "agent_failed",
+									}
+								: { kind: "stopped", reason: "end_turn", provenance: "agent" },
+				},
+			});
+			try {
+				const pending = prompt(fixture, kind === "skill" ? "/skill:review inspect" : "inspect");
+				void pending.catch(() => undefined);
+				await waitFor(() => fixture.turnResultInputs.length === 1, "real lost acknowledgement status request");
+				const clientRef = fixture.invocationInputs[0]?.clientRef;
+				expect(clientRef).toEqual(expect.any(String));
+				expect(fixture.turnResultInputs).toEqual([{ kind, clientRef }]);
+				await expect(prompt(fixture, "must not overlap uncertain invocation")).rejects.toMatchObject({
+					code: "conflict",
+				});
+				if (scenario === "racing_terminal") fixture.sendStopped("refusal");
+				fixture.releaseTurnResult();
+				if (scenario === "terminal" || scenario === "before_ack" || scenario === "racing_terminal") {
+					expect(await bounded(pending, "exact receipt recovery")).toEqual({ stopReason: "end_turn" });
+				} else {
+					await expect(bounded(pending, "lost acknowledgement failure")).rejects.toMatchObject({
+						code:
+							scenario === "failed"
+								? "prompt_failed"
+								: scenario === "failure_detail"
+									? "provider_rejected"
+									: "terminal_uncertain",
+					});
+					if (!failed)
+						await expect(prompt(fixture, "old attachment is retired")).rejects.toMatchObject({
+							code: "not_found",
+						});
+				}
+				expect(fixture.invocationOperations).toEqual([kind === "skill" ? "skill.invoke" : "turn.prompt"]);
+				expect(fixture.turnResultInputs).toHaveLength(1);
+			} finally {
+				fixture.dispose();
+				budget.mockRestore();
+			}
+		});
+	}
+}
+
+for (const kind of ["prompt", "skill"] as const) {
+	for (const retirement of ["close", "changed_connection", "connection_before_timeout"] as const) {
+		test(`ACP lost ${kind} acknowledgement recovery cannot affect a replacement attachment: ${retirement}`, async () => {
+			const budget = shortenInvocationAcknowledgementBudget();
+			const fixture = await createFixture({
+				loseInvocationAcknowledgement: true,
+				changedConnectionBeforeAcknowledgement: retirement === "connection_before_timeout",
+				deferTurnResult: true,
+				failBrokerSessionClose: true,
+				turnResult: {
+					commandId: "prompt-terminal-command",
+					turnId: "prompt-terminal-turn",
+					status: "terminal_ok",
+					receiptState: "present",
+					content: { version: 1, type: "text", text: "obsolete recovered receipt" },
+					outcome: { kind: "stopped", reason: "end_turn", provenance: "agent" },
+				},
+			});
+			try {
+				const first = prompt(fixture, kind === "skill" ? "/skill:review inspect" : "inspect");
+				void first.catch(() => undefined);
+				if (retirement === "connection_before_timeout") {
+					await bounded(fixture.promptDelivered, "sent invocation without acknowledgement");
+				} else {
+					await waitFor(() => fixture.turnResultInputs.length === 1, "lost acknowledgement recovery");
+				}
+				if (retirement !== "close") {
+					const clientRef = fixture.invocationInputs[0]?.clientRef;
+					expect(clientRef).toEqual(expect.any(String));
+					if (retirement === "changed_connection")
+						fixture.sendTerminal({ type: "hello", connectionId: "replacement-owner-connection" });
+					await expect(bounded(first, "changed connection uncertainty")).rejects.toMatchObject({
+						code: "terminal_uncertain",
+						message: expect.stringContaining(`kind=${kind}, clientRef=${clientRef}`),
+					});
+					await expect(prompt(fixture, "cannot reuse uncertain attachment")).rejects.toMatchObject({
+						code: "not_found",
+					});
+					expect(fixture.promptDeliveryCount()).toBe(1);
+					expect(fixture.turnResultInputs).toHaveLength(retirement === "connection_before_timeout" ? 0 : 1);
+				} else {
+					await expect(fixture.agent.closeSession({ sessionId: fixture.sessionId })).rejects.toMatchObject({
+						code: "terminal_uncertain",
+					});
+					expect(await bounded(first, "retired prompt")).toEqual({ stopReason: "cancelled" });
+				}
+				await fixture.agent.loadSession({ sessionId: fixture.sessionId, cwd: fixture.cwd, mcpServers: [] });
+				let settled = false;
+				const second = prompt(fixture, "replacement prompt");
+				void second.then(
+					() => {
+						settled = true;
+					},
+					() => {
+						settled = true;
+					},
+				);
+				await waitFor(() => fixture.promptDeliveryCount() === 2, "replacement invocation");
+				expect(fixture.invocationInputs[1]?.clientRef).not.toBe(fixture.invocationInputs[0]?.clientRef);
+				fixture.releaseTurnResult();
+				// Retirement may close the old query socket; its bounded deadline must
+				// also be harmless to the replacement, not just a late successful reply.
+				await Bun.sleep(retirement === "close" ? 30 : 5_100);
+				expect(settled).toBe(false);
+				expect(
+					fixture.updates.some(
+						update =>
+							update.update.sessionUpdate === "agent_message_chunk" &&
+							update.update.content.type === "text" &&
+							update.update.content.text === "obsolete recovered receipt",
+					),
+				).toBe(false);
+				fixture.sendStopped("refusal");
+				expect(await bounded(second, "replacement terminal")).toEqual({ stopReason: "refusal" });
+				expect(fixture.turnResultInputs).toHaveLength(retirement === "connection_before_timeout" ? 0 : 1);
+			} finally {
+				fixture.dispose();
+				budget.mockRestore();
+			}
+		});
+	}
+}
 
 test("ACP activity idle alone does not settle a prompt", async () => {
 	const fixture = await createFixture();
