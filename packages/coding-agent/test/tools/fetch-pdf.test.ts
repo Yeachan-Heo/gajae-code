@@ -220,6 +220,42 @@ describe("PDF URL source-text inspection", () => {
 		expect(result.output).not.toContain("%PDF-");
 	});
 
+	for (const error of ["Network connection closed", "content-length 20971521 exceeds 20971520"]) {
+		it(`fails an ambiguous download when binary classification fails: ${error}`, async () => {
+			contentType = "application/octet-stream";
+			contentDisposition = "attachment; filename=report.pdf";
+			body = "%PDF-1.4\nmalformed payload without a document";
+			const binaryFetch = vi.spyOn(scrapers, "fetchBinary").mockResolvedValueOnce({ ok: false, error });
+			const conversion = vi.spyOn(scrapers, "convertWithMarkit");
+			const target = new URL("download", server.url).href;
+			const result = await loadReadUrlCacheEntry(session, { path: target });
+			expect(result.details.method).toBe("failed");
+			expect(result.details.notes).toContain(`Binary fetch failed: ${error}`);
+			expect(result.output).not.toContain("%PDF-");
+			expect(result.output).not.toContain("malformed payload");
+			expect(binaryFetch).toHaveBeenCalledTimes(1);
+			expect(binaryFetch.mock.calls[0][0]).toBe(target);
+			expect(conversion).not.toHaveBeenCalled();
+			expect(requests).toBe(1);
+		});
+
+		it(`skips failed binary classification for an explicit raw download: ${error}`, async () => {
+			contentType = "application/octet-stream";
+			contentDisposition = "attachment; filename=report.pdf";
+			body = "%PDF-1.4\nmalformed payload without a document";
+			const binaryFetch = vi.spyOn(scrapers, "fetchBinary").mockResolvedValueOnce({ ok: false, error });
+			const conversion = vi.spyOn(scrapers, "convertWithMarkit");
+			const result = await new ReadTool(session).execute("read-download-raw", {
+				path: `${new URL("download", server.url).href}:raw`,
+			});
+			expect(result.details?.method).toBe("raw");
+			expect(result.content.some(item => item.type === "text" && item.text.includes(body as string))).toBe(true);
+			expect(binaryFetch).not.toHaveBeenCalled();
+			expect(conversion).not.toHaveBeenCalled();
+			expect(requests).toBe(1);
+		});
+	}
+
 	it("retains inline images when a .pdf URL actually serves PNG", async () => {
 		contentType = "image/png";
 		contentDisposition = 'attachment; filename="report.pdf"';

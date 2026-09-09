@@ -894,6 +894,19 @@ async function renderUrl(
 		!raw && !isPdf && !skipConvertibleBinaryRetry && isGenericMimeType(mime)
 			? await fetchBinary(finalUrl, timeout, signal)
 			: undefined;
+	if (dispositionBinary && !dispositionBinary.ok) {
+		notes.push(dispositionBinary.error ? `Binary fetch failed: ${dispositionBinary.error}` : "Binary fetch failed");
+		return {
+			url,
+			finalUrl,
+			contentType: mime,
+			method: "failed",
+			content: "",
+			fetchedAt,
+			truncated: false,
+			notes,
+		};
+	}
 	if (dispositionBinary?.ok && getExtensionHint(finalUrl, dispositionBinary.contentDisposition) === ".pdf") {
 		isPdf = true;
 	}
