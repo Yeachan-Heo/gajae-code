@@ -5,6 +5,7 @@ import * as path from "node:path";
 import { Agent, type AgentTool } from "@gajae-code/agent-core";
 import { getBundledModel } from "@gajae-code/ai";
 import { createMockModel, type MockModel, type MockResponse } from "@gajae-code/ai/providers/mock";
+import { FileLockTestHooks, withFileLock } from "@gajae-code/coding-agent/config/file-lock";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { resetSettingsForTest, Settings } from "@gajae-code/coding-agent/config/settings";
 import { createAgentSession } from "@gajae-code/coding-agent/sdk";
@@ -1341,13 +1342,23 @@ describe("terminal abort registers a turn scope so left-running owned work class
 		}
 	}, 20_000);
 
-	it("foreground bash completes and acknowledges on the endpoint-owned manager, never the process-global instance", async () => {
+	async function runForegroundEndpointCase(holdNamespaceLock = false): Promise<void> {
 		// Reproduction of the review-thread P1 scenario: the FOREGROUND
 		// completion/abort branches must use the same endpoint-owned manager
 		// the job was created in — the process-global instance belongs to a
 		// different concurrent session and would ack a same-id foreign delivery
 		// while leaving this session's delivery queued.
 		const foreign = new AsyncJobManager({ maxRunningJobs: 2, onJobComplete: () => {} });
+		const stateFile = path.join(tempDir, "state", "runtime-state.json");
+		const lockFile = path.join(tempDir, "locks", "mutation.lock");
+		const previousStateFile = process.env.GJC_COORDINATOR_SESSION_STATE_FILE;
+		const previousHook = FileLockTestHooks.afterParentMkdir;
+		const held = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const attempted = Promise.withResolvers<void>();
+		let owner: Promise<void> | undefined;
+		let ownerReleased = false;
+		let persistenceObserver: Promise<void> | undefined;
 		let phase = "setup";
 		const diagnostic = setTimeout(() => {
 			process.stderr.write(
@@ -1363,10 +1374,25 @@ describe("terminal abort registers a turn scope so left-running owned work class
 		}, 18_000);
 		diagnostic.unref();
 		try {
+			if (holdNamespaceLock) {
+				process.env.GJC_COORDINATOR_SESSION_STATE_FILE = stateFile;
+				owner = withFileLock(lockFile, async () => {
+					held.resolve();
+					await release.promise;
+				}).then(() => {
+					ownerReleased = true;
+				});
+				phase = "foreign namespace lock acquisition";
+				await held.promise;
+				FileLockTestHooks.afterParentMkdir = async lockPath => {
+					await previousHook?.(lockPath);
+					if (lockPath === `${lockFile}.lock`) attempted.resolve();
+				};
+			}
 			AsyncJobManager.setInstance(foreign);
 			const bindEndpoint = chainSessionManager.getSessionId() ?? "local";
 			scriptedResponses = [bashCall("echo foreground-ok", "call_fg_endpoint", false), stopReply("done")];
-			const promptPromise = session.prompt("run foreground work").catch(() => {});
+			const promptPromise = session.prompt("run foreground work");
 			phase = "prompt completion";
 			await promptPromise;
 			// The foreground job landed in the endpoint-owned manager and its
@@ -1379,25 +1405,45 @@ describe("terminal abort registers a turn scope so left-running owned work class
 			// The foreground owned-bash registration is unregistered on the
 			// endpoint manager's tuple after completion.
 			const job = endpointJobs[0]!;
+			expect(job.status).toBe("completed");
+			expect(job.resultText).toContain("foreground-ok");
+			expect(manager.getDeliveryState()).toMatchObject({ queued: 0, delivering: false });
+			expect(session.agent.state.isStreaming).toBe(false);
 			phase = "owned registration retirement";
 			await waitFor(
 				() => lookupOwnedRegistration(job.id, job.generation, bindEndpoint) === undefined,
 				"foreground owned-bash registration unregistered",
 				5_000,
 			);
+			if (holdNamespaceLock) {
+				phase = "contended coordinator observation";
+				await attempted.promise;
+				persistenceObserver = session.awaitCoordinatorRuntimeStatePersistenceForTests();
+				// This observer cannot settle while the foreign owner holds the lock.
+				// Making it a disposal precondition prevents disposal's acquisition
+				// cancellation from ever running; foreground completion is already proven.
+				expect(
+					await Promise.race([persistenceObserver.then(() => "settled"), Bun.sleep(25).then(() => "pending")]),
+				).toBe("pending");
+				expect(ownerReleased).toBe(false);
+			}
 		} finally {
 			try {
-				// Prompt completion and delivery acknowledgement precede the secondary
-				// sidecar sink. Join real work before starting bounded session disposal.
+				// Join the real job, then let disposal revoke pre-admission observers
+				// and join admitted writers. A secondary-sink pre-drain would deadlock
+				// behind the foreign lock before disposal could signal cancellation.
 				manager.cancelAll();
 				phase = "owned job promises";
 				await manager.waitForAll();
-				phase = "session idle";
-				await session.waitForIdle();
-				phase = "session settlement";
-				await session.awaitSessionSettlement();
-				phase = "coordinator persistence";
-				await session.awaitCoordinatorRuntimeStatePersistenceForTests();
+				phase = "disposal-owned settlement";
+				await session.dispose();
+				if (holdNamespaceLock) {
+					await persistenceObserver;
+					expect(ownerReleased).toBe(false);
+					expect(fs.existsSync(`${lockFile}.lock`)).toBe(true);
+					expect(await Bun.file(stateFile).exists()).toBe(false);
+					expect(foreign.getAllJobs()).toHaveLength(0);
+				}
 				phase = "foreign manager disposal";
 				AsyncJobManager.setInstance(manager);
 				AsyncJobManager.unregisterManager(foreign);
@@ -1405,8 +1451,26 @@ describe("terminal abort registers a turn scope so left-running owned work class
 				phase = "completed";
 			} finally {
 				clearTimeout(diagnostic);
+				release.resolve();
+				try {
+					await owner;
+				} finally {
+					if (holdNamespaceLock) {
+						FileLockTestHooks.afterParentMkdir = previousHook;
+						if (previousStateFile === undefined) delete process.env.GJC_COORDINATOR_SESSION_STATE_FILE;
+						else process.env.GJC_COORDINATOR_SESSION_STATE_FILE = previousStateFile;
+					}
+				}
 			}
 		}
+	}
+
+	it("foreground bash completes and acknowledges on the endpoint-owned manager, never the process-global instance", async () => {
+		await runForegroundEndpointCase();
+	}, 20_000);
+
+	it("foreground bash disposes its contended coordinator observer while the foreign namespace lock remains held", async () => {
+		await runForegroundEndpointCase(true);
 	}, 20_000);
 
 	it("JobTool lists and cancels jobs on the endpoint-owned manager", async () => {
