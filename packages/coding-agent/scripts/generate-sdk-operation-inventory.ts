@@ -11,6 +11,8 @@ const inventoryPath = process.env.GJC_SDK_OPERATION_INVENTORY
 
 /** Reviewed seams deliberately excluded from the public SDK operation surface. */
 const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
+	"agent_session:submitQueuedInput":
+		"public in-process queued-input ownership API; transport dispatch uses turn.steer/turn.follow_up, not a separate wire operation or wire submission handle",
 	"agent_session:reloadSkills":
 		"internal marketplace lifecycle refresh for the session skill catalog; not an independent SDK ingress operation",
 	"agent_session:getTerminalTurnEpoch":

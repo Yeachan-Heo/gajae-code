@@ -251,10 +251,10 @@ queue APIs when queue state matters. A queued follow-up can also share the
 predecessor's run and terminal when the live loop consumes it; do not equate
 one accepted submission with one model call or one `agent_end` event.
 
-For generic embedders, prefer an application-owned queue of bounded full turns
-submitted through `session.prompt()`, and use `steer`/`followUp` only for live
-conversational controls. The `sendUserMessage` promise has delivery-mode
-dependent completion semantics:
+Generic embedders can use `session.submitQueuedInput()` for independently
+correlated live controls, or an application-owned queue of bounded
+`session.prompt()` calls for full turns. The `sendUserMessage` promise still has
+delivery-mode dependent completion semantics:
 
 - An ordinary idle submission with no `deliverAs` queues nothing and awaits the
   prompt turn, including its terminal completion.
@@ -266,9 +266,62 @@ dependent completion semantics:
 Neither promise is a generic queue-drained receipt. Do not build a generic
 embedder contract around internal dispatch or promotion-correlation hooks.
 
+### Supported queued-submission ownership
+
+`submitQueuedInput(text, { mode: "steer" | "followUp", images?, queuePolicy? })`
+returns a `QueuedInputSubmission` with a stable `submissionId` and `cancel()`.
+Subscribe **before** submission: admission and even consumption may be published
+before the returned promise resolves. `QueuedInputEvent` is exported from
+`@gajae-code/coding-agent` and is part of `AgentSessionEvent`.
+
+```ts
+const unsubscribe = session.subscribe(event => {
+  switch (event.type) {
+    case "queued_input_admitted":
+      // Record event.submissionId and the actual event.mode.
+      break;
+    case "queued_input_consumed":
+      // Bind this exact submission to event.runId and consumption attempt scope.
+      // startsOwnRun distinguishes successor promotion from joining a run.
+      break;
+    case "queued_input_removed":
+      // Finish this submission as removed, without waiting for any agent_end.
+      break;
+    case "queued_input_terminal":
+      // event.terminal is the owning run's published agent_end.
+      break;
+  }
+});
+const submission = await session.submitQueuedInput("Check the result", {
+  mode: "followUp",
+  queuePolicy: "sequential",
+});
+// submission.cancel() removes only this input while still queued; it returns
+// false after consumption/removal and never aborts the owning run.
+```
+
+Each admission has its own identity even when text is identical. Consumption
+binds to actual executable dequeue, not disappearance from a display queue.
+`startsOwnRun: false` means the input joined the current run; `true` means it was
+promoted into a new run. `runId` is the logical owning run across attempt-scope
+changes during retry or maintenance. Only that run's final published terminal
+completes a consumed submission; continuing maintenance boundaries do not. Removal or
+cancellation before execution instead emits `queued_input_removed` immediately.
+An idle steer may be admitted as a follow-up by the existing continuation rules;
+the admission event reports the actual mode.
+
+`queuePolicy: "sequential"` delivers one submission per queue poll in FIFO order
+within either selected queue, overriding its default batching mode. It does not
+promise a separate run per message or impose ordering between the steering and
+follow-up queues. Follow-ups admitted during predecessor unwind retain automatic
+successor scheduling. These events are in-process lifecycle observations, not a
+durable receipt across process restart; use SDK reconciliation for that boundary.
+Unsubscribe when the embedder no longer needs lifecycle events.
+
 Related APIs:
 
 - `sendUserMessage(content, { deliverAs? })`
+- `submitQueuedInput(text, { mode, images?, queuePolicy? })`
 - `steer(text, images?)`
 - `followUp(text, images?)`
 - `sendCustomMessage({ customType, content, ... }, { deliverAs?, triggerTurn? })`

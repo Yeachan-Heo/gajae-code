@@ -4,14 +4,13 @@
  * raw args, raw command output) so redaction can be asserted by tests.
  */
 
-import type { AgentWireEventType } from "../../src/modes/shared/agent-wire/event-contract";
-import type { AgentSessionEvent } from "../../src/session/agent-session";
+import type { AgentWireEventType, AgentWireSessionEvent } from "../../src/modes/shared/agent-wire/event-contract";
 
 /** A raw secret marker that must NEVER appear in bounded owner evidence. */
 export const RAW_SECRET = "RAW_SECRET_MUST_NOT_LEAK";
 
-function ev(value: unknown): AgentSessionEvent {
-	return value as AgentSessionEvent;
+function ev(value: unknown): AgentWireSessionEvent {
+	return value as AgentWireSessionEvent;
 }
 
 const message = (id: string) => ({
@@ -20,7 +19,7 @@ const message = (id: string) => ({
 	content: [{ type: "text", text: RAW_SECRET }],
 });
 
-export const EVENT_FIXTURES: Record<AgentWireEventType, AgentSessionEvent> = {
+export const EVENT_FIXTURES: Record<AgentWireEventType, AgentWireSessionEvent> = {
 	agent_start: ev({ type: "agent_start" }),
 	agent_failed: ev({
 		type: "agent_failed",

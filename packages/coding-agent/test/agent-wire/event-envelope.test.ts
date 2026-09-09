@@ -1,14 +1,51 @@
 import { describe, expect, it } from "bun:test";
-import { AGENT_WIRE_EVENT_TYPES, AGENT_WIRE_PROTOCOL_VERSION } from "../../src/modes/shared/agent-wire/event-contract";
+import {
+	AGENT_WIRE_EVENT_TYPES,
+	AGENT_WIRE_PROTOCOL_VERSION,
+	isAgentWireSessionEvent,
+} from "../../src/modes/shared/agent-wire/event-contract";
 import * as envelope from "../../src/modes/shared/agent-wire/event-envelope";
 import {
 	AgentWireFrameSequencer,
 	agentSessionEventType,
 	toAgentWireEventFrame,
 } from "../../src/modes/shared/agent-wire/event-envelope";
+import type { QueuedInputEvent } from "../../src/session/agent-session";
 import { EVENT_FIXTURES } from "./fixtures";
 
 describe("canonical agent-wire envelope", () => {
+	it("excludes queued ownership events from wire admission and the event registry", () => {
+		const queuedEvents: QueuedInputEvent[] = [
+			{ type: "queued_input_admitted", submissionId: "q1", mode: "steer" },
+			{
+				type: "queued_input_consumed",
+				submissionId: "q1",
+				startsOwnRun: false,
+				runId: "run-1",
+				scope: { attemptId: "attempt-1", generation: 1, lineage: "main" },
+			},
+			{ type: "queued_input_removed", submissionId: "q1" },
+			{
+				type: "queued_input_terminal",
+				submissionId: "q1",
+				runId: "run-1",
+				terminal: { type: "agent_end", messages: [], stopReason: "completed" },
+			},
+			{
+				type: "queued_input_terminal",
+				submissionId: "q1",
+				runId: "run-1",
+				terminal: { type: "agent_end", messages: [], stopReason: "cancelled" },
+			},
+		];
+		for (const event of queuedEvents) {
+			expect(isAgentWireSessionEvent(event)).toBe(false);
+			expect(AGENT_WIRE_EVENT_TYPES).not.toContain(event.type);
+		}
+		for (const event of Object.values(EVENT_FIXTURES)) {
+			expect(isAgentWireSessionEvent(event)).toBe(true);
+		}
+	});
 	it("emits the exact pinned event frame shape", () => {
 		const seq = new AgentWireFrameSequencer("sess-1");
 		const frame = toAgentWireEventFrame(EVENT_FIXTURES.tool_execution_start, seq);

@@ -2,7 +2,7 @@
  * Serialize `AgentSessionEvent`s into versioned agent-wire frames.
  *
  * The mapping is intentionally exhaustive: `agentSessionEventType` switches over
- * every variant of the event union and calls `assertNever` in the default arm,
+ * every wire-eligible variant and calls `assertNever` in the default arm,
  * so a newly added event variant fails to compile until it is handled here.
  *
  * The canonical sequencer + frame builders live here under `AgentWire*` names;
@@ -20,6 +20,7 @@ import {
 	type AgentWireEventType,
 	type AgentWireFrameEnvelope,
 	type AgentWireFrameType,
+	type AgentWireSessionEvent,
 } from "./event-contract";
 
 export const AGENT_WIRE_COMPACT_MESSAGE_UPDATE_CHECKPOINT_INTERVAL = 32;
@@ -47,11 +48,11 @@ function assertNever(value: never): never {
 }
 
 /**
- * Resolve the stable wire event-type for an `AgentSessionEvent`.
+ * Resolve the stable wire event-type for a wire-eligible session event.
  *
- * Exhaustive over the union; adding a variant without a case is a type error.
+ * Exhaustive over the wire union; in-process ownership events must be filtered first.
  */
-export function agentSessionEventType(event: AgentSessionEvent): AgentWireEventType {
+export function agentSessionEventType(event: AgentWireSessionEvent): AgentWireEventType {
 	switch (event.type) {
 		case "agent_start":
 		case "agent_failed":
@@ -127,9 +128,9 @@ export class AgentWireFrameSequencer {
 	}
 }
 
-/** Serialize a single `AgentSessionEvent` into a canonical `event` wire frame. */
+/** Serialize a wire-eligible session event into a canonical `event` wire frame. */
 export function toAgentWireEventFrame(
-	event: AgentSessionEvent,
+	event: AgentWireSessionEvent,
 	sequencer: AgentWireFrameSequencer,
 ): AgentWireEventFrame {
 	return sequencer.next("event", {
@@ -138,8 +139,8 @@ export function toAgentWireEventFrame(
 	});
 }
 
-/** Build the rich event payload (renderer-facing) for an `AgentSessionEvent`. */
-export function toAgentWireEventPayload(event: AgentSessionEvent): AgentWireEventPayload {
+/** Build the rich renderer-facing payload for a wire-eligible session event. */
+export function toAgentWireEventPayload(event: AgentWireSessionEvent): AgentWireEventPayload {
 	return { event_type: agentSessionEventType(event), event };
 }
 export function sanitizeAssistantMessageEventForCompact(
@@ -177,7 +178,7 @@ export class AgentWireCompactEventEncoder {
 		this.#checkpointInterval = options.checkpointInterval ?? AGENT_WIRE_COMPACT_MESSAGE_UPDATE_CHECKPOINT_INTERVAL;
 	}
 
-	frame(event: AgentSessionEvent): AgentWireCompactEventFrame {
+	frame(event: AgentWireSessionEvent): AgentWireCompactEventFrame {
 		if (event.type !== "message_update") return toAgentWireEventFrame(event, this.#sequencer);
 		this.#messageUpdateCount += 1;
 		const payload: AgentWireCompactMessageUpdatePayload = {
@@ -196,7 +197,7 @@ export class AgentWireCompactEventEncoder {
 }
 
 export function toAgentWireCompactEventFrame(
-	event: AgentSessionEvent,
+	event: AgentWireSessionEvent,
 	encoder: AgentWireCompactEventEncoder,
 ): AgentWireCompactEventFrame {
 	return encoder.frame(event);

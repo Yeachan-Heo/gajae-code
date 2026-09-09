@@ -327,6 +327,7 @@ import {
 	hasCoordinatorRuntimeStateRescopeJournal,
 	markCoordinatorRuntimeStateRescopePublishing,
 	ownerTerminalContextFromEnvironment,
+	persistCoordinatorCommittedPromptFailure,
 	persistCoordinatorRuntimeStateFromEvent,
 	persistCoordinatorWorkerIntegrationOutcome,
 	prepareCoordinatorRuntimeStateRescope,
@@ -454,6 +455,7 @@ import type {
 	ClientBridgePermissionOutcome,
 	ClientBridgePermissionToolCall,
 } from "./client-bridge";
+import { registerCommittedPromptFailureWriter } from "./committed-prompt-failure";
 import { computeNonMessageTokens } from "./context-estimation";
 import {
 	type ContributionPrepOptions,
@@ -786,8 +788,30 @@ class ToolOutputPruneRollbackError extends Error {
 /** Session-specific events that extend the core AgentEvent */
 export type AutoCompactionContinuationSkipReason = "auto_continue_disabled_non_resumable_tail";
 
+/** Supported embedder lifecycle. IDs identify submissions, never message text.
+ * Admission is not execution. Consumption records its attempt scope and owning
+ * logical run ID; that run's terminal may have a newer scope. Removal is terminal
+ * without execution. Subscribe before calling submitQueuedInput(). */
+export type QueuedInputEvent =
+	| { type: "queued_input_admitted"; submissionId: string; mode: QueuedMessageEditMode }
+	| { type: "queued_input_consumed"; submissionId: string; startsOwnRun: boolean; scope: AttemptScope; runId: string }
+	| { type: "queued_input_removed"; submissionId: string }
+	| {
+			type: "queued_input_terminal";
+			submissionId: string;
+			runId: string;
+			terminal: Extract<AgentEvent, { type: "agent_end" }>;
+	  };
+
+export interface QueuedInputSubmission {
+	readonly submissionId: string;
+	/** Remove only this still-queued submission. False once consumed or removed. */
+	cancel(): boolean;
+}
+
 export type AgentSessionEvent =
 	| AgentEvent
+	| QueuedInputEvent
 	| { type: "auto_compaction_start"; reason: "threshold" | "overflow" | "idle"; action: "context-full" | "handoff" }
 	| {
 			type: "auto_compaction_end";
@@ -2001,7 +2025,7 @@ function extractPermissionLocations(
  *  stable edit id while the display arrays preserve delivery order. */
 type QueuedDisplayEntry = { text: string; tag?: string; sequence: number; message?: AgentMessage };
 type IrcRosterClaim = { token: symbol; signature: string; epoch: number; message: CustomMessage };
-type QueuedFollowUpOwner = { cancel(): boolean };
+type QueuedFollowUpOwner = QueuedInputSubmission;
 export type QueuedMessageEditMode = "steer" | "followUp";
 
 export interface QueuedMessageEditEntry {
@@ -2581,6 +2605,117 @@ export class AgentSession {
 	readonly #terminalAbortSteeringSnapshotKeys = new Map<number, string>();
 	#terminalAbortAdmissionSeq = 0;
 	#queuedDisplaySequence = 0;
+	readonly #queuedInputSubmissions = new Map<
+		AgentMessage,
+		{ submissionId: string; scope?: AttemptScope; domain?: RunCancellationDomain }
+	>();
+	readonly #queuedInputBatches = new WeakMap<
+		AgentMessage,
+		{ messages: readonly AgentMessage[]; startsOwnRun: boolean; domain: RunCancellationDomain }
+	>();
+	#queuedInputTeardownUnsubscribe: (() => void) | undefined;
+	readonly #queuedInputDomainsByScope = new WeakMap<AttemptScope, RunCancellationDomain>();
+
+	#admitQueuedInput(message: AgentMessage, entry: QueuedDisplayEntry, mode: QueuedMessageEditMode): string {
+		const submissionId = this.#queuedMessageEditId(mode, entry.sequence);
+		this.#queuedInputSubmissions.set(message, { submissionId });
+		this.#emit({ type: "queued_input_admitted", submissionId, mode });
+		return submissionId;
+	}
+
+	#stageQueuedInputs(messages: readonly AgentMessage[], startsOwnRun: boolean): void {
+		// Dequeue is provisional: the loop may still requeue on abort. Publication
+		// of message_start is the irrevocable materialization boundary.
+		const resourceRunId = this.agent.activeResourceRunId;
+		const domain = resourceRunId ? this.#runCancellationDomains.lookup(resourceRunId) : undefined;
+		if (!domain) return;
+		const batch = { messages: [...messages], startsOwnRun, domain };
+		for (const message of messages) this.#queuedInputBatches.set(message, batch);
+	}
+
+	#commitQueuedInputs(message: AgentMessage, scope: AttemptScope | undefined): void {
+		const batch = this.#queuedInputBatches.get(message);
+		if (!batch || !scope) return;
+		const domain = batch.domain;
+		const events: QueuedInputEvent[] = [];
+		// Commit the whole batch before any subscriber can cancel a sibling.
+		for (const member of batch.messages) {
+			if (this.#queuedInputBatches.get(member) !== batch) continue;
+			this.#queuedInputBatches.delete(member);
+			const submission = this.#queuedInputSubmissions.get(member);
+			if (!submission || submission.scope) continue;
+			submission.scope = scope;
+			submission.domain = domain;
+			events.push({
+				type: "queued_input_consumed",
+				submissionId: submission.submissionId,
+				startsOwnRun: batch.startsOwnRun,
+				scope,
+				runId: domain.resourceRunId,
+			});
+		}
+		for (const event of events) this.#emit(event);
+	}
+
+	#settleQueuedInputTerminal(event: Extract<AgentEvent, { type: "agent_end" }>): void {
+		if (event.stopReason === "maintenance" && isContinuingMidRunMaintenanceOutcome(event.maintenanceOutcome)) return;
+		// Quarantine can remove the ledger's domain before Agent publishes teardown's
+		// real terminal. Retain the accepted scope's immutable domain for that case.
+		const domain =
+			getAgentTerminalOwnerContext(event)?.domain ??
+			(event.scope ? this.#queuedInputDomainsByScope.get(event.scope) : undefined);
+		if (!domain) return;
+		const events: QueuedInputEvent[] = [];
+		for (const [message, submission] of this.#queuedInputSubmissions) {
+			if (submission.domain !== domain) continue;
+			this.#queuedInputSubmissions.delete(message);
+			events.push({
+				type: "queued_input_terminal",
+				submissionId: submission.submissionId,
+				runId: domain.resourceRunId,
+				terminal: event,
+			});
+		}
+		if (this.#queuedInputSubmissions.size === 0) {
+			this.#queuedInputTeardownUnsubscribe?.();
+			this.#queuedInputTeardownUnsubscribe = undefined;
+		}
+		for (const event of events) this.#emit(event);
+	}
+
+	#closeQueuedInputLifecycle(): void {
+		for (const [message, submission] of this.#queuedInputSubmissions) {
+			if (!submission.scope) this.#removeQueuedInput(message);
+		}
+		if (this.#queuedInputSubmissions.size === 0 || this.#queuedInputTeardownUnsubscribe) return;
+		// Teardown disconnects the normal event bridge to prevent maintenance.
+		// Retain only terminal observation, never fabricate a cancellation receipt.
+		this.#queuedInputTeardownUnsubscribe = this.agent.subscribe(event => {
+			if (event.type !== "agent_end") return;
+			this.#settleQueuedInputTerminal(event);
+		});
+	}
+
+	#cancelQueuedInput(message: AgentMessage): boolean {
+		const submission = this.#queuedInputSubmissions.get(message);
+		if (!submission || submission.scope) return false;
+		const deferredIndex = this.#deferredSdkFollowUps.indexOf(message);
+		const removed = this.agent.removeQueuedMessages(candidate => candidate === message);
+		if (deferredIndex < 0 && removed.steering + removed.followUp === 0) return false;
+		if (deferredIndex >= 0) this.#deferredSdkFollowUps.splice(deferredIndex, 1);
+		this.#steeringMessages = this.#steeringMessages.filter(entry => entry.message !== message);
+		this.#followUpMessages = this.#followUpMessages.filter(entry => entry.message !== message);
+		this.#fireQueuedRemovalHooks([message]);
+		this.#releaseDeferredSdkFollowUps();
+		return true;
+	}
+
+	#removeQueuedInput(message: AgentMessage): void {
+		const submission = this.#queuedInputSubmissions.get(message);
+		if (!submission || submission.scope) return;
+		this.#queuedInputSubmissions.delete(message);
+		this.#emit({ type: "queued_input_removed", submissionId: submission.submissionId });
+	}
 	/** Fire the stored promotion hook with a REMOVAL disposition for messages
 	 * leaving their queue without consumption (queue.message.remove, positional
 	 * editing, clearQueue, or the terminal-abort purge). The SDK terminalizes
@@ -2588,6 +2723,7 @@ export class AgentSession {
 	 * forever (#4668 review P1). */
 	#fireQueuedRemovalHooks(messages: readonly AgentMessage[]): void {
 		for (const message of messages) {
+			this.#removeQueuedInput(message);
 			const steerHook = this.#steerPromotionHooks.get(message);
 			if (steerHook) {
 				this.#steerPromotionHooks.delete(message);
@@ -2754,6 +2890,7 @@ export class AgentSession {
 		this.#scheduleQueuedDelivery();
 	}
 	#fireQueuedPromotionHooks(messages: readonly AgentMessage[], promotion?: { startsOwnRun?: boolean }): void {
+		if (promotion?.startsOwnRun !== true) this.#stageQueuedInputs(messages, false);
 		for (const message of messages) {
 			const steerHook = this.#steerPromotionHooks.get(message);
 			if (steerHook) {
@@ -2788,7 +2925,11 @@ export class AgentSession {
 		for (const message of messages) this.#sdkRunTokensByQueuedMessage.delete(message);
 		this.#deferredSdkFollowUps = this.#deferredSdkFollowUps.filter(message => !messages.includes(message));
 	}
+	#committedPromptFailureOwner:
+		| { executionHandle: string; sdkRunToken: string; context: CoordinatorRuntimeStatePersistContext }
+		| undefined;
 	#resetActiveSdkRunOwnership(): void {
+		this.#committedPromptFailureOwner = undefined;
 		this.#activeSdkRunToken = undefined;
 		this.#activeAttemptScope = undefined;
 		this.#activeLogicalRunId = undefined;
@@ -2804,6 +2945,14 @@ export class AgentSession {
 			this.#skipPostPromptRecoveryWaitByAttemptScope.delete(predecessorScope);
 		this.#acceptRunHandle(handle);
 		if (sdkRunToken !== undefined) {
+			const executionHandle = String(handle.logicalRunId);
+			if (this.#committedPromptFailureOwner?.executionHandle !== executionHandle) {
+				this.#committedPromptFailureOwner = {
+					executionHandle,
+					sdkRunToken,
+					context: this.#captureCoordinatorRuntimeStatePersistContext(),
+				};
+			}
 			this.#activeSdkRunToken = sdkRunToken;
 			this.#sdkRunTokensByAttemptScope.set(handle.scope, sdkRunToken);
 			const inheritedCohort =
@@ -3131,8 +3280,12 @@ export class AgentSession {
 		// Integration doubles can accept a run without minting a handle; keep the
 		// previously recorded run id rather than throwing inside the callback.
 		if (!handle) return;
+		if (this.#committedPromptFailureOwner?.executionHandle !== String(handle.logicalRunId))
+			this.#committedPromptFailureOwner = undefined;
 		this.#activeLogicalRunId = handle.logicalRunId;
 		this.#activeAttemptScope = handle.scope;
+		const domain = this.#runCancellationDomains.lookup(String(handle.logicalRunId));
+		if (domain) this.#queuedInputDomainsByScope.set(handle.scope, domain);
 	}
 
 	#turnIndex = 0;
@@ -4622,6 +4775,16 @@ export class AgentSession {
 			this.#extensionRunner.setAttemptRecordStore(this.#attemptRecordStore);
 		}
 		this.agent.setMainAttemptScopeObserver(scope => this.#bindAttemptScope(scope));
+		registerCommittedPromptFailureWriter(this, async (executionHandle, _failure, isCurrent) => {
+			if (!isCurrent()) return "stale";
+			const owner = this.#committedPromptFailureOwner;
+			if (!owner || owner.executionHandle !== executionHandle) return "stale";
+			return persistCoordinatorCommittedPromptFailure(
+				owner.context,
+				owner.sdkRunToken,
+				() => isCurrent() && this.#committedPromptFailureOwner === owner,
+			);
+		});
 		this.#skills = config.skills ?? [];
 		this.#skillWarnings = config.skillWarnings ?? [];
 		this.#reloadSkills = config.reloadSkills;
@@ -5865,6 +6028,7 @@ export class AgentSession {
 
 	/** Emit an event to all listeners without letting one subscriber poison lifecycle settlement. */
 	#emit(event: AgentSessionEvent): void {
+		if (event.type === "agent_end") this.#settleQueuedInputTerminal(event);
 		for (const listener of this.#eventListenerSnapshot) {
 			try {
 				listener(event);
@@ -5990,9 +6154,10 @@ export class AgentSession {
 	}
 
 	#trackAgentEvent = (event: AgentEvent): Promise<void> => {
+		if (event.type === "message_start") this.#commitQueuedInputs(event.message, event.scope);
 		this.#agentEventAdmission.set(event, {
 			scope: this.#activeAttemptScope,
-			sdkRunToken: this.#activeSdkRunToken,
+			sdkRunToken: event.scope === undefined ? undefined : this.#sdkRunTokensByAttemptScope.get(event.scope),
 			persistGeneration: this.#coordinatorPersistGeneration,
 			persistBarrier: this.#coordinatorRescopeBarrier,
 		});
@@ -6245,7 +6410,16 @@ export class AgentSession {
 		propagateFailure: boolean,
 	): Promise<void> {
 		try {
-			await persistCoordinatorRuntimeStateFromEvent(event, context, observation);
+			const sdkRunToken = this.#agentEventAdmission.get(event)?.sdkRunToken;
+			const persistedEvent =
+				sdkRunToken !== undefined &&
+				(event.type === "agent_start" ||
+					event.type === "turn_start" ||
+					event.type === "agent_failed" ||
+					event.type === "agent_end")
+					? { ...event, sdkRunToken }
+					: event;
+			await persistCoordinatorRuntimeStateFromEvent(persistedEvent, context, observation);
 		} catch (error) {
 			this.#warnPersistFailure(
 				"Failed to persist coordinator runtime state",
@@ -7602,6 +7776,7 @@ export class AgentSession {
 												// agent_start (review P1); their queued messages are in-run
 												// consumptions, not own-run promotions.
 												const startsOwn = options?.maintenanceContinuation !== true;
+												this.#stageQueuedInputs(acceptance.consumedQueuedMessages, startsOwn);
 												const inheritedSdkRunToken = options?.continueQueuedOnly
 													? undefined
 													: (options?.sdkRunToken ?? scheduledSdkRunToken);
@@ -9145,6 +9320,7 @@ export class AgentSession {
 			this.abortCompaction();
 			this.abortRetry();
 			this.#quarantineAgentRunResources();
+			this.#closeQueuedInputLifecycle();
 			this.agent.abort();
 			this.agent.setMainAttemptScopeObserver(undefined);
 			this.#disconnectFromAgent();
@@ -9242,6 +9418,7 @@ export class AgentSession {
 		this.#evalExecutionDisposing = true;
 		this.#abortActiveMidRunBarriers();
 		this.abortCompaction();
+		this.#closeQueuedInputLifecycle();
 		this.agent.abort();
 		this.agent.setMainAttemptScopeObserver(undefined);
 		// Disconnect the Agent event bridge NOW — before the maintenance join and the
@@ -11213,10 +11390,6 @@ export class AgentSession {
 			"onPreflightAccepted" | "onPreflightAcceptCommit" | "onSkillPrepared" | "preflightSignal" | "sdkRunCapability"
 		>,
 	): Promise<{ name: string; path: string; args?: string; lineCount?: number }> {
-		const internalOptions = {
-			...options,
-			sdkRunToken: readSdkRunCapability(options?.sdkRunCapability),
-		};
 		if (options?.preflightSignal?.aborted) throw promptPreflightCancelledError();
 		const skillName = name.trim();
 		if (!skillName) throw Object.assign(new Error("skill.invoke requires a skill name."), { code: "invalid_input" });
@@ -11262,7 +11435,7 @@ export class AgentSession {
 			lineCount: built.details.lineCount,
 			cleanedArgs: activation.cleanedArgs || undefined,
 		});
-		await this.promptCustomMessage(skillPromptMessage, internalOptions as InternalCustomMessageOptions);
+		await this.promptCustomMessage(skillPromptMessage, options);
 		return {
 			name: skill.name,
 			path: skill.filePath,
@@ -11975,9 +12148,7 @@ export class AgentSession {
 		if (typeof text !== "string" || (text.trim().length === 0 && !hasUsableImage))
 			throw Object.assign(new Error("Prompt must not be empty."), { code: "invalid_input" });
 		const sdkRunToken = readSdkRunCapability(options?.sdkRunCapability);
-		const internalOptions: InternalPromptOptions | undefined = options
-			? { ...options, ...(sdkRunToken ? { sdkRunToken } : {}) }
-			: undefined;
+		const internalOptions: InternalPromptOptions | undefined = options ? { ...options, sdkRunToken } : undefined;
 		this.#assertRecoveryHydrationPromoted();
 		const owner = this.#sessionAdmissionContext.getStore();
 		if (owner && !owner.released) throw this.#sessionAdmissionBusyError();
@@ -12178,7 +12349,7 @@ export class AgentSession {
 
 				try {
 					await this.#promptWithMessage(message, expandedText, {
-						...options,
+						...internalOptions,
 						prependMessages: eagerTodoPrelude ? [eagerTodoPrelude.message] : undefined,
 						admissionLease: admission,
 						resetRetryReplaySafety: true,
@@ -12320,7 +12491,7 @@ export class AgentSession {
 	): Promise<void> {
 		const sdkRunToken = readSdkRunCapability(options?.sdkRunCapability);
 		const internalOptions: InternalCustomMessageOptions | undefined = options
-			? { ...options, ...(sdkRunToken ? { sdkRunToken } : {}) }
+			? { ...options, sdkRunToken }
 			: undefined;
 		if (options?.preflightSignal?.aborted) throw promptPreflightCancelledError();
 		const textContent =
@@ -13078,20 +13249,7 @@ export class AgentSession {
 	 * Queue a steering message to interrupt the agent mid-run.
 	 */
 	async steer(text: string, images?: ImageContent[]): Promise<void> {
-		const hasUsableImage =
-			images?.some(image => typeof image?.data === "string" && image.data.trim().length > 0) === true;
-		if (typeof text !== "string" || (text.trim().length === 0 && !hasUsableImage))
-			throw Object.assign(new Error("Prompt must not be empty."), { code: "invalid_input" });
-		this.#assertRecoveryHydrationPromoted();
-		if (text.startsWith("/")) {
-			this.#throwIfExtensionCommand(text);
-		}
-
-		const expandedText = expandPromptTemplate(text, [...this.#promptTemplates]);
-		if (expandedText.trim().length === 0 && !hasUsableImage)
-			throw Object.assign(new Error("Prompt must not be empty."), { code: "invalid_input" });
-		assertImagePlaceholdersHavePayload(expandedText, images);
-		await this.#queueSteer(expandedText, images, { claimsGenuineUserIntent: true });
+		await this.submitQueuedInput(text, { mode: "steer", images });
 	}
 
 	/**
@@ -13102,22 +13260,43 @@ export class AgentSession {
 		images?: ImageContent[],
 		options?: Pick<PromptOptions, "followUpQueuePolicy">,
 	): Promise<void> {
+		await this.submitQueuedInput(text, { mode: "followUp", images, queuePolicy: options?.followUpQueuePolicy });
+	}
+
+	/** Admit independently correlated queued input. The returned handle cancels
+	 * only pending input, never an owning run. queuePolicy: "sequential" delivers
+	 * one submission per queue poll in FIFO order for either mode, even when that
+	 * mode batches by default. It does not require a separate run per submission
+	 * or impose ordering between the steering and follow-up queues. */
+	async submitQueuedInput(
+		text: string,
+		options: {
+			mode: QueuedMessageEditMode;
+			images?: ImageContent[];
+			queuePolicy?: PromptOptions["followUpQueuePolicy"];
+		},
+	): Promise<QueuedInputSubmission> {
+		if (options?.mode !== "steer" && options?.mode !== "followUp")
+			throw Object.assign(new Error("Queued input mode must be steer or followUp."), { code: "invalid_input" });
+		const images = options.images;
 		const hasUsableImage =
 			images?.some(image => typeof image?.data === "string" && image.data.trim().length > 0) === true;
 		if (typeof text !== "string" || (text.trim().length === 0 && !hasUsableImage))
 			throw Object.assign(new Error("Prompt must not be empty."), { code: "invalid_input" });
 		this.#assertRecoveryHydrationPromoted();
-		if (text.startsWith("/")) {
-			this.#throwIfExtensionCommand(text);
-		}
-
+		if (text.startsWith("/")) this.#throwIfExtensionCommand(text);
 		const expandedText = expandPromptTemplate(text, [...this.#promptTemplates]);
 		if (expandedText.trim().length === 0 && !hasUsableImage)
 			throw Object.assign(new Error("Prompt must not be empty."), { code: "invalid_input" });
 		assertImagePlaceholdersHavePayload(expandedText, images);
-		await this.#queueFollowUp(expandedText, images, {
-			forceOneAtATime: options?.followUpQueuePolicy === "sequential",
+		if (options.mode === "steer")
+			return this.#queueSteer(expandedText, images, {
+				claimsGenuineUserIntent: true,
+				forceOneAtATime: options.queuePolicy === "sequential",
+			});
+		return this.#queueFollowUp(expandedText, images, {
 			claimsGenuineUserIntent: true,
+			forceOneAtATime: options.queuePolicy === "sequential",
 		});
 	}
 
@@ -13134,7 +13313,7 @@ export class AgentSession {
 			sdkRunToken?: string;
 			forceOneAtATime?: boolean;
 		},
-	): Promise<void> {
+	): Promise<QueuedInputSubmission> {
 		this.#assertNoHandoffTransition();
 		assertImagePlaceholdersHavePayload(text, images);
 		const displayText = text || (images && images.length > 0 ? "[Image]" : "");
@@ -13148,7 +13327,7 @@ export class AgentSession {
 		// in a queue nobody owns.
 		const admission = this.agent.steer(message, options?.forceOneAtATime ? { forceOneAtATime: true } : undefined);
 		if (!admission.admitted) {
-			await this.#queueFollowUp(text, images, {
+			const owner = await this.#queueFollowUp(text, images, {
 				forceOneAtATime: options?.forceOneAtATime,
 				claimsGenuineUserIntent: options?.claimsGenuineUserIntent,
 				onPromoted: options?.onPromoted,
@@ -13159,10 +13338,11 @@ export class AgentSession {
 				},
 			});
 			this.#scheduleNonAdmittedQueuedContinuation();
-			return;
+			return owner;
 		}
 		if (options?.forceOneAtATime) this.#sequentialSteerMessages.add(message);
-		this.#steeringMessages.push(this.#createQueuedDisplayEntry(displayText, undefined, message));
+		const displayEntry = this.#createQueuedDisplayEntry(displayText, undefined, message);
+		this.#steeringMessages.push(displayEntry);
 		if (options?.external) {
 			this.#externalSteerMessages.add(message);
 			this.#externalSteerAdmissionSeq.set(message, ++this.#steeringAdmissionSeq);
@@ -13173,6 +13353,11 @@ export class AgentSession {
 			const epoch = this.#claimDeepInterviewUserIntent();
 			this.#deepInterviewGenuineUserMessageEpochs.set(message, epoch);
 		}
+		const submissionId = this.#admitQueuedInput(message, displayEntry, "steer");
+		return {
+			submissionId,
+			cancel: () => this.#cancelQueuedInput(message),
+		};
 	}
 
 	/**
@@ -13249,6 +13434,7 @@ export class AgentSession {
 		} else {
 			this.agent.followUp(message, options?.forceOneAtATime ? { forceOneAtATime: true } : undefined);
 		}
+		const submissionId = this.#admitQueuedInput(message, displayEntry, "followUp");
 		// When this is the first queued message and the session is in a resumable
 		// assistant-ended state, schedule an immediate continue so it is delivered
 		// without waiting for the next user turn. A later accepted follow-up must
@@ -13261,31 +13447,8 @@ export class AgentSession {
 			if (options?.scheduleNonAdmittedWake !== false) this.#scheduleNonAdmittedQueuedContinuation();
 		}
 		return {
-			cancel: () => {
-				const deferredIndex = this.#deferredSdkFollowUps.indexOf(message);
-				let removed = false;
-				if (deferredIndex !== -1) {
-					this.#deferredSdkFollowUps.splice(deferredIndex, 1);
-					removed = true;
-				} else {
-					removed = this.agent.removeQueuedMessages(candidate => candidate === message).followUp > 0;
-					// This message was already released from the deferred queue; its
-					// scheduled continuation was cancelled before it started. No further
-					// agent_end may arrive to release the next deferred follow-up, so
-					// advance the queue here to keep the next accepted SDK request moving.
-					if (removed) this.#releaseDeferredSdkFollowUps();
-				}
-				if (removed) {
-					this.#followUpMessages = this.#followUpMessages.filter(entry => entry !== displayEntry);
-					this.#deepInterviewGenuineUserMessageEpochs.delete(message);
-					this.#sdkRunTokensByQueuedMessage.delete(message);
-					// A canceled follow-up never reaches the normal promotion boundary,
-					// so terminalize its SDK owner through the same removal disposition.
-					this.#followUpPromotionHooks.get(message)?.({ removed: true });
-					this.#followUpPromotionHooks.delete(message);
-				}
-				return removed;
-			},
+			submissionId,
+			cancel: () => this.#cancelQueuedInput(message),
 		};
 	}
 	#releaseDeferredSdkFollowUps(): void {
@@ -13925,7 +14088,7 @@ export class AgentSession {
 		},
 	): Promise<void> {
 		const sdkRunToken = readSdkRunCapability(options?.sdkRunCapability);
-		const internalOptions = options ? { ...options, ...(sdkRunToken ? { sdkRunToken } : {}) } : undefined;
+		const internalOptions = options ? { ...options, sdkRunToken } : undefined;
 		this.#assertRecoveryHydrationPromoted();
 		const owner = this.#sessionAdmissionContext.getStore();
 		if (owner && !owner.released) throw this.#sessionAdmissionBusyError();
@@ -14121,7 +14284,7 @@ export class AgentSession {
 			await this.prompt(text, {
 				expandPromptTemplates: false,
 				images,
-				sdkRunToken: internalOptions?.sdkRunToken,
+				sdkRunCapability: options?.sdkRunCapability,
 				onPreflightAccepted: () => {
 					options?.onPreflightAccepted?.();
 					fireQueuedPromotion();
@@ -14136,7 +14299,7 @@ export class AgentSession {
 							}
 						: undefined,
 				preflightSignal: options?.preflightSignal,
-			} as InternalPromptOptions);
+			});
 		} finally {
 			releaseFollowUpReservation();
 		}
@@ -14248,7 +14411,7 @@ export class AgentSession {
 		}
 		if (index === -1) return undefined;
 
-		const [entry] = queue.splice(index, 1);
+		const entry = queue[index];
 		// Identity-based removal across BOTH storage sites (exact-head review): a
 		// deferred SDK follow-up lives in #deferredSdkFollowUps OUTSIDE the Agent
 		// live queue, so a display index cannot address the live queue — positional
@@ -14260,7 +14423,8 @@ export class AgentSession {
 			if (deferredIndex !== -1) {
 				this.#deferredSdkFollowUps.splice(deferredIndex, 1);
 			} else {
-				this.agent.removeQueuedMessages(candidate => candidate === removedMessage);
+				const removed = this.agent.removeQueuedMessages(candidate => candidate === removedMessage);
+				if (removed.steering + removed.followUp === 0) return undefined;
 			}
 		} else if (index >= 0) {
 			// Legacy entries without an identity link keep positional removal.
@@ -14268,6 +14432,7 @@ export class AgentSession {
 				resolvedMode === "steer" ? this.agent.removeSteerAt(index) : this.agent.removeFollowUpAt(index);
 			if (positional !== undefined) removedMessage = positional;
 		}
+		queue.splice(index, 1);
 		// The removed message left its queue WITHOUT consumption: its accepted SDK
 		// submission must terminalize boundedly, not strand accepted forever
 		// (#4668 review P1).
@@ -15444,6 +15609,7 @@ export class AgentSession {
 							skipInitialSteeringPoll: heldSteering.length > 0,
 							onRunAccepted: () => {
 								runAccepted = true;
+								if (selected) this.#stageQueuedInputs([message], true);
 								if (heldSteering.length > 0) {
 									// Re-admit the aborted turn's steers into the replacement run the
 									// moment it is accepted, with the run's INITIAL poll skipped: the
@@ -15554,6 +15720,7 @@ export class AgentSession {
 		}
 
 		if (!lease) {
+			this.#closeQueuedInputLifecycle();
 			this.#disconnectFromAgent();
 			await this.abort();
 			if (this.isCompacting) {
@@ -15661,6 +15828,7 @@ export class AgentSession {
 			} catch (error) {
 				throw await discardPreparedNewSessionAfterFailure(this.sessionManager, prepared, error);
 			}
+			this.#closeQueuedInputLifecycle();
 			this.#disconnectFromAgent();
 			this.#closeAllProviderSessions("new session");
 			this.#rebindProviderSessionState(new Map());
@@ -15781,6 +15949,7 @@ export class AgentSession {
 		this.#beginSessionTransition("clear-context");
 		try {
 			const sessionId = this.sessionId;
+			this.#closeQueuedInputLifecycle();
 			this.#disconnectFromAgent();
 			await this.abort();
 			this.#cancelOwnAsyncJobs();

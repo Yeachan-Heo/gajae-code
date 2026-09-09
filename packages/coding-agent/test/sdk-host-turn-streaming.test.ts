@@ -11,12 +11,14 @@ import type { ExtensionAPI, ExtensionContext } from "../src/extensibility/extens
 import { ExtensionRuntime, loadExtensionFromFactory } from "../src/extensibility/extensions/loader";
 import { ExtensionRunner } from "../src/extensibility/extensions/runner";
 import { mapAgentWireEventPayloadToAcpSessionUpdates } from "../src/modes/acp/acp-event-mapper";
+import { type AgentWireSessionEvent, isAgentWireSessionEvent } from "../src/modes/shared/agent-wire/event-contract";
 import { toAgentWireEventPayload } from "../src/modes/shared/agent-wire/event-envelope";
 import { createReconciliationStore, type ReconciliationStore } from "../src/sdk/bus/reconciliation-store";
 import { createSdkSessionRuntimeExtension } from "../src/sdk/host/session-runtime";
 import type { SdkFrame } from "../src/sdk/host/types";
 import { AgentSession, type AgentSessionEvent } from "../src/session/agent-session";
 import { AuthStorage } from "../src/session/auth-storage";
+import { readSdkRunCapability } from "../src/session/sdk-run-capability";
 import { SessionManager } from "../src/session/session-manager";
 import { EventBus } from "../src/utils/event-bus";
 
@@ -40,6 +42,7 @@ const SESSION_ID = "01a04638-0f98-73ee-b0a6-f6eac6bc8ee5";
 
 /** The exact frame `streamTurnEvent` builds in sdk/host/session-runtime.ts. */
 function streamedFrame(event: AgentSessionEvent, correlation: { commandId: string; turnId: string }) {
+	if (!isAgentWireSessionEvent(event)) throw new Error(`Cannot stream in-process event: ${event.type}`);
 	return { type: "event", kind: event.type, payload: toAgentWireEventPayload(event), ...correlation };
 }
 
@@ -48,32 +51,32 @@ const CORRELATION = {
 	turnId: "62f36efe-0d5e-430a-913a-2d37a4207c90",
 };
 
-function textDelta(delta: string): AgentSessionEvent {
+function textDelta(delta: string): AgentWireSessionEvent {
 	return {
 		type: "message_update",
 		message: { role: "assistant", content: [{ type: "text", text: delta }] },
 		assistantMessageEvent: { type: "text_delta", delta, contentIndex: 0 },
-	} as unknown as AgentSessionEvent;
+	} as unknown as AgentWireSessionEvent;
 }
 
-function thinkingDelta(delta: string): AgentSessionEvent {
+function thinkingDelta(delta: string): AgentWireSessionEvent {
 	return {
 		type: "message_update",
 		message: { role: "assistant", content: [{ type: "thinking", thinking: delta }] },
 		assistantMessageEvent: { type: "thinking_delta", delta, contentIndex: 0 },
-	} as unknown as AgentSessionEvent;
+	} as unknown as AgentWireSessionEvent;
 }
 
-function toolStart(): AgentSessionEvent {
+function toolStart(): AgentWireSessionEvent {
 	return {
 		type: "tool_execution_start",
 		toolCallId: "call_1",
 		toolName: "read",
 		args: { path: "README.md" },
-	} as unknown as AgentSessionEvent;
+	} as unknown as AgentWireSessionEvent;
 }
 
-function toolEnd(): AgentSessionEvent {
+function toolEnd(): AgentWireSessionEvent {
 	return {
 		type: "tool_execution_end",
 		toolCallId: "call_1",
@@ -81,7 +84,7 @@ function toolEnd(): AgentSessionEvent {
 		args: { path: "README.md" },
 		result: { output: "hello" },
 		isError: false,
-	} as unknown as AgentSessionEvent;
+	} as unknown as AgentWireSessionEvent;
 }
 
 interface ControlResponse {
@@ -92,6 +95,8 @@ interface ControlResponse {
 interface HostHarness {
 	control(operation: string, input: Record<string, unknown>, connectionId?: string): Promise<ControlResponse>;
 	emit(event: string, payload?: unknown): Promise<void>;
+	runToken(submissionIndex: number): string;
+	emitRun(event: string, payload?: Record<string, unknown>, submissionIndex?: number): Promise<void>;
 	setIdle(idle: boolean): void;
 	/** Promote every queued (non-idle) submission whose promotion was deferred by `deferPromotion`. */
 	promoteQueued(): void;
@@ -129,6 +134,12 @@ async function createHostHarness(
 	let nextId = 0;
 	let idle = true;
 	const deferredPromotions: Array<() => void> = [];
+	const runTokens: string[] = [];
+	const runToken = (index: number): string => {
+		const token = runTokens[index];
+		if (!token) throw new Error(`missing private SDK run capability for submission ${index}`);
+		return token;
+	};
 	const api = {
 		on(event: string, handler: (event: unknown, ctx: ExtensionContext) => Promise<void> | void) {
 			handlers.set(event, handler);
@@ -138,10 +149,14 @@ async function createHostHarness(
 		sendUserMessage: async (
 			_content: unknown,
 			options?: {
+				sdkRunCapability?: unknown;
 				onPreflightAcceptCommit?: () => void | Promise<void>;
 				onQueuedPromoted?: (promotion?: { startsOwnRun?: boolean; removed?: boolean }) => void;
 			},
 		) => {
+			const token = readSdkRunCapability(options?.sdkRunCapability);
+			if (typeof token !== "string") throw new Error("missing private SDK run capability");
+			runTokens.push(token);
 			await options?.onPreflightAcceptCommit?.();
 			if (!idle) {
 				const promote = () => options?.onQueuedPromoted?.({ startsOwnRun: false });
@@ -218,9 +233,17 @@ async function createHostHarness(
 			receive?.(connectionId, { type: "control_request", operation, input, id });
 			return promise;
 		},
+		runToken,
+		emitRun: async (event, payload = {}, submissionIndex = 0) => {
+			const sdkRunToken = runToken(submissionIndex);
+			const runEvent = { ...payload, type: event, sdkRunToken };
+			for (const listener of listeners) listener(runEvent as AgentSessionEvent);
+			await handlers.get(event)?.(runEvent, { ...ctx, sdkRunToken } as ExtensionContext);
+		},
 		emit: async (event, payload = {}) => {
 			for (const listener of listeners) listener(payload as AgentSessionEvent);
-			await handlers.get(event)?.(payload, ctx);
+			const sdkRunToken = (payload as { sdkRunToken?: string }).sdkRunToken;
+			await handlers.get(event)?.(payload, { ...ctx, sdkRunToken } as ExtensionContext);
 		},
 		clearFrames: () => {
 			sent.length = 0;
@@ -371,7 +394,7 @@ describe("SDK host turn streaming", () => {
 		let prompt: Promise<void> | undefined;
 		try {
 			await harness.control("turn.prompt", { text: "stream this" });
-			await harness.emit("agent_start");
+			await harness.emitRun("agent_start");
 			harness.clearFrames();
 			prompt = session.prompt("stream this");
 			await entered.promise;
@@ -390,7 +413,9 @@ describe("SDK host turn streaming", () => {
 			});
 			gate.resolve();
 			await prompt;
-			expect(frames().map(entry => entry.frame.payload)).toEqual(produced.map(toAgentWireEventPayload));
+			expect(frames().map(entry => entry.frame.payload)).toEqual(
+				produced.filter(isAgentWireSessionEvent).map(toAgentWireEventPayload),
+			);
 			const textEvents = produced.flatMap(event =>
 				event.type === "message_update" && event.assistantMessageEvent.type === "text_delta"
 					? [event.assistantMessageEvent.delta]
@@ -436,7 +461,7 @@ describe("SDK host turn streaming", () => {
 			await harness.control("turn.prompt", { text: "delayed start" });
 			harness.clearFrames();
 			holdNextTransact = true;
-			const start = harness.emit("agent_start");
+			const start = harness.emitRun("agent_start");
 			await startEntered.promise;
 			// Producer emits content while the start transition is still persisting.
 			await harness.emit("message_update", textDelta("early"));
@@ -500,7 +525,7 @@ describe("SDK host turn streaming", () => {
 			expect(attached.ok).toBe(true);
 			harness.clearFrames();
 			holdNextTransact = true;
-			const start = harness.emit("agent_start");
+			const start = harness.emitRun("agent_start");
 			await startEntered.promise;
 			await harness.emit("message_update", textDelta("before-attach"));
 			// The queued prompt is consumed (attached) while the start is still held.
@@ -565,7 +590,7 @@ describe("SDK host turn streaming", () => {
 			await harness.control("turn.prompt", { text: "long answer" });
 			harness.clearFrames();
 			holdNextTransact = true;
-			const start = harness.emit("agent_start");
+			const start = harness.emitRun("agent_start");
 			await startEntered.promise;
 			const bound = 256;
 			const overflow = 40;
@@ -601,7 +626,7 @@ describe("SDK host turn streaming", () => {
 		try {
 			const accepted = await harness.control("turn.prompt", { text: "stream this" });
 			expect(accepted.ok).toBe(true);
-			await harness.emit("agent_start");
+			await harness.emitRun("agent_start");
 			harness.clearFrames();
 
 			const event = textDelta("delivered");
@@ -649,7 +674,7 @@ describe("SDK host turn streaming", () => {
 		try {
 			const root = await harness.control("turn.prompt", { text: "root" }, "root-client");
 			expect(root.ok).toBe(true);
-			await harness.emit("agent_start");
+			await harness.emitRun("agent_start");
 			harness.setIdle(false);
 			const attached = await harness.control("turn.prompt", { text: "attached" }, "attached-client");
 			expect(attached.ok).toBe(true);
@@ -688,8 +713,8 @@ describe("SDK host turn streaming", () => {
 		try {
 			const first = await harness.control("turn.prompt", { text: "first" }, "first-client");
 			const second = await harness.control("turn.prompt", { text: "second" }, "second-client");
-			const firstToken = `${first.result?.commandId}:${first.result?.turnId}`;
-			const secondToken = `${second.result?.commandId}:${second.result?.turnId}`;
+			const firstToken = harness.runToken(0);
+			const secondToken = harness.runToken(1);
 
 			await harness.emit("agent_start", { sdkRunToken: firstToken });
 			harness.clearFrames();
@@ -711,6 +736,10 @@ describe("SDK host turn streaming", () => {
 			harness.clearFrames();
 			await harness.emit("message_update", textDelta("second-only"));
 			expect(harness.sent.map(frame => frame.connectionId)).toEqual(["second-client"]);
+			expect(harness.sent[0]?.frame).toMatchObject({
+				commandId: second.result?.commandId,
+				turnId: second.result?.turnId,
+			});
 			await harness.emit("agent_end", { sdkRunToken: secondToken, stopReason: "completed" });
 		} finally {
 			await harness.stop();
@@ -718,17 +747,43 @@ describe("SDK host turn streaming", () => {
 		}
 	});
 
-	test("streams a tokenless shared batch to every accepted owner", async () => {
+	test("tokenless lifecycle cannot claim independently accepted token-bound prompts", async () => {
 		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-stream-tokenless-"));
 		const harness = await createHostHarness(SESSION_ID, cwd);
 		try {
 			const first = await harness.control("turn.prompt", { text: "first" }, "first-client");
 			const second = await harness.control("turn.prompt", { text: "second" }, "second-client");
+			harness.clearFrames();
 			await harness.emit("agent_start");
+			await harness.emit("message_update", textDelta("unowned"));
+			await harness.emit("agent_end", { stopReason: "completed" });
+			expect(harness.sent).toHaveLength(0);
+			for (const accepted of [first, second]) {
+				expect(
+					harness.broadcasts.some(
+						frame =>
+							(frame.payload as { commandId?: unknown } | undefined)?.commandId === accepted.result?.commandId,
+					),
+				).toBe(false);
+			}
+		} finally {
+			await harness.stop();
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	test("streams an explicitly coaccepted run to both capability-bound owners", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-stream-cohort-"));
+		const harness = await createHostHarness(SESSION_ID, cwd);
+		try {
+			const first = await harness.control("turn.prompt", { text: "first" }, "first-client");
+			const second = await harness.control("turn.prompt", { text: "second" }, "second-client");
+			const sdkRunTokens = [harness.runToken(0), harness.runToken(1)];
+			await harness.emitRun("agent_start", { sdkRunTokens });
 			harness.clearFrames();
 			await harness.emit("message_update", textDelta("shared"));
 			expect(harness.sent.map(frame => frame.connectionId)).toEqual(["first-client", "second-client"]);
-			await harness.emit("agent_end", { stopReason: "completed" });
+			await harness.emitRun("agent_end", { stopReason: "completed" });
 			for (const accepted of [first, second]) {
 				expect(
 					harness.broadcasts.some(
@@ -750,8 +805,8 @@ describe("SDK host turn streaming", () => {
 		try {
 			const first = await harness.control("turn.prompt", { text: "first" }, "first-client");
 			const second = await harness.control("turn.prompt", { text: "second" }, "second-client");
-			const firstToken = `${first.result?.commandId}:${first.result?.turnId}`;
-			const secondToken = `${second.result?.commandId}:${second.result?.turnId}`;
+			const firstToken = harness.runToken(0);
+			const secondToken = harness.runToken(1);
 			await harness.emit("agent_start", { sdkRunToken: firstToken });
 			await harness.emit("agent_start", { sdkRunToken: secondToken });
 			harness.clearFrames();
@@ -782,8 +837,8 @@ describe("SDK host turn streaming", () => {
 		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-stream-continuation-"));
 		const harness = await createHostHarness(SESSION_ID, cwd);
 		try {
-			const accepted = await harness.control("turn.prompt", { text: "continue" }, "owner-client");
-			const token = `${accepted.result?.commandId}:${accepted.result?.turnId}`;
+			await harness.control("turn.prompt", { text: "continue" }, "owner-client");
+			const token = harness.runToken(0);
 			await harness.emit("agent_start", { sdkRunToken: token });
 			await harness.emit("agent_start", { sdkRunToken: token });
 			harness.clearFrames();
@@ -832,7 +887,7 @@ describe("SDK host turn streaming", () => {
 		try {
 			const accepted = await harness.control("turn.prompt", { text: "guard progress" });
 			expect(accepted.ok).toBe(true);
-			await harness.emit("agent_start");
+			await harness.emitRun("agent_start");
 			harness.clearFrames();
 
 			await expect(harness.emit("tool_execution_start")).resolves.toBeUndefined();

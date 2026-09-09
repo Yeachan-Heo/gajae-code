@@ -11,7 +11,7 @@
  * deltas, command output, raw args, or raw tool results.
  */
 import type { AgentSessionEvent } from "../../../session/agent-session";
-import type { AgentWireEventPayload, AgentWireOwnerObservation } from "./event-contract";
+import type { AgentWireEventPayload, AgentWireOwnerObservation, AgentWireSessionEvent } from "./event-contract";
 import { toAgentWireEventPayload } from "./event-envelope";
 
 const TEST_RE = /\b(bun test|npm test|yarn test|pnpm test|jest|vitest|pytest|go test|cargo test|mocha|ava)\b/i;
@@ -79,7 +79,7 @@ function resultStatus(result: unknown, isError?: boolean): string | undefined {
 }
 
 function obs(
-	event: AgentSessionEvent,
+	event: AgentWireSessionEvent,
 	partial: Omit<AgentWireOwnerObservation, "eventType">,
 ): AgentWireOwnerObservation {
 	return { eventType: event.type, ...partial };
@@ -298,6 +298,12 @@ export function observeAgentSessionEvent(event: AgentSessionEvent): AgentWireOwn
 				semantic: false,
 				coalesceKey: null,
 			});
+		case "queued_input_admitted":
+		case "queued_input_consumed":
+		case "queued_input_removed":
+		case "queued_input_terminal":
+			// In-process ownership only; the underlying agent_end owns completion.
+			return null;
 		case "agent_end":
 			return obs(event, {
 				kind: "rpc_agent_completed",
@@ -317,7 +323,7 @@ function assertNeverEvent(event: never): null {
 	return null;
 }
 
-/** Build the rich event payload (renderer-facing) for an `AgentSessionEvent`. */
+/** Build the rich renderer-facing payload for a wire-eligible session event. */
 export { toAgentWireEventPayload };
 
 /** Observe the bounded owner signal carried by a rich event payload. */

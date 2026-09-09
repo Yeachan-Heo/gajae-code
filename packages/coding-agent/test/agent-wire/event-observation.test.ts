@@ -5,9 +5,47 @@ import {
 	observeAgentWireFrame,
 	toAgentWireEventPayload,
 } from "../../src/modes/shared/agent-wire/event-observation";
+import type { QueuedInputEvent } from "../../src/session/agent-session";
 import { EVENT_FIXTURES, RAW_SECRET } from "./fixtures";
 
 describe("agent-wire event observation", () => {
+	it("ignores queued ownership including nested completion and cancellation with secret content", () => {
+		const queuedEvents: QueuedInputEvent[] = [
+			{ type: "queued_input_admitted", submissionId: RAW_SECRET, mode: "steer" },
+			{
+				type: "queued_input_consumed",
+				submissionId: RAW_SECRET,
+				startsOwnRun: true,
+				runId: RAW_SECRET,
+				scope: { attemptId: RAW_SECRET, generation: 1, lineage: "main" },
+			},
+			{ type: "queued_input_removed", submissionId: RAW_SECRET },
+		];
+		for (const stopReason of ["completed", "cancelled"] as const) {
+			queuedEvents.push({
+				type: "queued_input_terminal",
+				submissionId: RAW_SECRET,
+				runId: RAW_SECRET,
+				terminal: {
+					type: "agent_end",
+					stopReason,
+					scope: { attemptId: RAW_SECRET, generation: 2, lineage: "main" },
+					messages: [{ role: "user", content: RAW_SECRET, timestamp: 0 }],
+				},
+			});
+		}
+		for (const event of queuedEvents) {
+			const direct = observeAgentSessionEvent(event);
+			// Defensive observation of an unsolicited frame must not unwrap its terminal either.
+			const wire = observeAgentWireFrame({ type: "event", payload: { event_type: event.type, event } });
+			expect(direct).toBeNull();
+			expect(wire).toBeNull();
+			expect(JSON.stringify({ direct, wire })).not.toContain(RAW_SECRET);
+		}
+		expect(observeAgentSessionEvent({ type: "agent_end", messages: [], stopReason: "completed" })?.signal).toBe(
+			"completed",
+		);
+	});
 	it("has exactly one fixture per registered event type", () => {
 		const fixtureTypes = Object.keys(EVENT_FIXTURES).sort();
 		const registryTypes = [...AGENT_WIRE_EVENT_TYPES].sort();

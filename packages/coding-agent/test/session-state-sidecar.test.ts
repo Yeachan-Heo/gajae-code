@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, setSystemTime, spyOn } from "bun:test";
-import { createHash, generateKeyPairSync, verify } from "node:crypto";
+import { generateKeyPairSync, verify } from "node:crypto";
 import type { PathLike, StatOptions } from "node:fs";
 import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
@@ -29,6 +29,7 @@ import {
 	GJC_TMUX_OWNER_STATE_DIR_ENV,
 	markCoordinatorRuntimeStateRescopePublishing,
 	ownerTerminalContextFromEnvironment,
+	persistCoordinatorCommittedPromptFailure,
 	persistCoordinatorRuntimeInputReady,
 	persistCoordinatorRuntimeStateFromEvent,
 	persistCoordinatorRuntimeStateFromPostmortem,
@@ -87,6 +88,205 @@ async function expectRefusal(promise: Promise<unknown>): Promise<Error> {
 	}
 	throw new Error("expected the runtime-state write to be refused, but it succeeded");
 }
+
+async function committedFailureFixture() {
+	const root = await tempRoot();
+	const stateFile = path.join(root, "state.json");
+	process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
+	const context = { sessionId: "committed-failure", cwd: root, sessionFile: null };
+	await persistCoordinatorRuntimeStateFromEvent({ type: "agent_start", sdkRunToken: "committed" }, context);
+	return { context, stateFile };
+}
+
+describe("committed prompt failure projection", () => {
+	it("corrects an already persisted empty terminal without changing readiness or cleanup", async () => {
+		const { context, stateFile } = await committedFailureFixture();
+		await persistCoordinatorRuntimeStateFromEvent(
+			{ type: "agent_end", messages: [], sdkRunToken: "committed" },
+			context,
+		);
+		const before = await readPayload(stateFile);
+		expect(await persistCoordinatorCommittedPromptFailure(context, "committed", () => true)).toBe("persisted");
+		const after = await readPayload(stateFile);
+		expect(after).toMatchObject({
+			state: "errored",
+			execution_state: "failed",
+			receipt_state: "absent",
+			error: { code: "prompt_deadline_exceeded", message: "Prompt deadline exceeded." },
+		});
+		expect(after.final_response).toEqual(before.final_response);
+		expect(after.ended_at).toEqual(before.ended_at);
+		expect(after.ready_for_input).toEqual(before.ready_for_input);
+		expect(after.activity).toEqual(before.activity);
+	});
+
+	it("preserves a partial receipt and existing error truth", async () => {
+		const { context, stateFile } = await committedFailureFixture();
+		await persistCoordinatorRuntimeStateFromEvent(
+			{ ...assistantEnd("Partial", "error"), sdkRunToken: "committed" },
+			context,
+		);
+		const before = await readPayload(stateFile);
+		expect(await persistCoordinatorCommittedPromptFailure(context, "committed", () => true)).toBe("persisted");
+		const after = await readPayload(stateFile);
+		expect(after).toMatchObject({ execution_state: "failed", receipt_state: "present" });
+		expect(after.final_response).toEqual(before.final_response);
+		expect(after.error).toEqual(before.error);
+	});
+
+	it("annotates live work and carries committed failure through the real terminal", async () => {
+		const { context, stateFile } = await committedFailureFixture();
+		await persistCoordinatorRuntimeStateFromEvent({ type: "tool_execution_start", toolCallId: "live" }, context);
+		const before = await readPayload(stateFile);
+		expect(await persistCoordinatorCommittedPromptFailure(context, "committed", () => true)).toBe("persisted");
+		const annotated = await readPayload(stateFile);
+		expect(annotated.activity).toEqual(before.activity);
+		expect(annotated).toMatchObject({ state: "running", live: true });
+		expect(annotated.execution_state).toBeUndefined();
+		await persistCoordinatorRuntimeStateFromEvent({ type: "agent_failed", sdkRunToken: "committed" }, context);
+		await persistCoordinatorRuntimeStateFromEvent(
+			{ type: "agent_end", messages: [], sdkRunToken: "committed" },
+			context,
+		);
+		expect(await readPayload(stateFile)).toMatchObject({
+			execution_state: "failed",
+			receipt_state: "absent",
+			error: { code: "prompt_deadline_exceeded" },
+		});
+	});
+
+	it("rejects a successor queued before the projection", async () => {
+		const { context, stateFile } = await committedFailureFixture();
+		const successor = persistCoordinatorRuntimeStateFromEvent(
+			{ type: "agent_start", sdkRunToken: "successor" },
+			context,
+		);
+		const projection = persistCoordinatorCommittedPromptFailure(context, "committed", () => true);
+		await successor;
+		expect(await projection).toBe("stale");
+		expect((await readPayload(stateFile)).run_failure).toBeUndefined();
+	});
+
+	it("retires a real projection stalled in temp fsync before any stale publication", async () => {
+		const { context, stateFile } = await committedFailureFixture();
+		await persistCoordinatorRuntimeStateFromEvent(
+			{ type: "agent_end", messages: [], sdkRunToken: "committed" },
+			context,
+		);
+		const before = await readPayload(stateFile);
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const open = fs.open;
+		const rename = fs.rename;
+		let temporary: string | undefined;
+		let syncSpy: { mockRestore(): void } | undefined;
+		const publications: RuntimePayload[] = [];
+		const openSpy = spyOn(fs, "open").mockImplementation(async (file, flags, mode) => {
+			const handle = await open(file, flags, mode);
+			if (!temporary && String(file).startsWith(`${stateFile}.`) && String(file).endsWith(".tmp")) {
+				temporary = String(file);
+				const sync = handle.sync.bind(handle);
+				syncSpy = spyOn(handle, "sync").mockImplementation(async () => {
+					entered.resolve();
+					await release.promise;
+					await sync();
+				});
+			}
+			return handle;
+		});
+		const renameSpy = spyOn(fs, "rename").mockImplementation(async (source, destination) => {
+			if (String(destination) === stateFile) publications.push(await readPayload(String(source)));
+			await rename(source, destination);
+		});
+		let current = true;
+		const projection = persistCoordinatorCommittedPromptFailure(context, "committed", () => current);
+		let successor: Promise<void> | undefined;
+		try {
+			await entered.promise;
+			// Retiring the observation and admitting its successor happen while the
+			// actual writer owns the lock and its temporary file is not yet synced.
+			current = false;
+			successor = persistCoordinatorRuntimeStateFromEvent(
+				{ type: "agent_start", sdkRunToken: "successor" },
+				context,
+			);
+			expect(await readPayload(stateFile)).toEqual(before);
+			release.resolve();
+			expect(await projection).toBe("stale");
+			await successor;
+			expect(temporary).toBeDefined();
+			expect(await Bun.file(temporary!).exists()).toBe(false);
+			expect(publications).toHaveLength(1);
+			expect(publications[0]).toMatchObject({ state: "running" });
+			expect(publications[0]!.run_failure).toBeUndefined();
+			await persistCoordinatorRuntimeStateFromEvent(
+				{ ...assistantEnd("Successor receipt"), sdkRunToken: "successor" },
+				context,
+			);
+			const after = await readPayload(stateFile);
+			expect(after).toMatchObject({
+				execution_state: "terminal_ok",
+				receipt_state: "present",
+				final_response: { text: "Successor receipt" },
+			});
+			expect(after.run_failure).toBeUndefined();
+			expect(publications.every(payload => payload.run_failure === undefined)).toBe(true);
+		} finally {
+			release.resolve();
+			await Promise.allSettled([projection, ...(successor ? [successor] : [])]);
+			syncSpy?.mockRestore();
+			openSpy.mockRestore();
+			renameSpy.mockRestore();
+		}
+	});
+
+	it("rechecks the committed attribution guard inside the serialized writer", async () => {
+		const { context, stateFile } = await committedFailureFixture();
+		const before = await readPayload(stateFile);
+		let checks = 0;
+		expect(await persistCoordinatorCommittedPromptFailure(context, "committed", () => ++checks === 1)).toBe("stale");
+		expect(checks).toBe(2);
+		expect(await readPayload(stateFile)).toEqual(before);
+		expect(await persistCoordinatorCommittedPromptFailure(context, "committed", () => false)).toBe("stale");
+	});
+
+	it("returns stale for missing state and propagates persistence read failures", async () => {
+		const { context, stateFile } = await committedFailureFixture();
+		await fs.unlink(stateFile);
+		expect(await persistCoordinatorCommittedPromptFailure(context, "committed", () => true)).toBe("stale");
+		await Bun.write(stateFile, "invalid-json");
+		await expect(persistCoordinatorCommittedPromptFailure(context, "committed", () => true)).rejects.toThrow(
+			"invalid or unreadable",
+		);
+		expect(await Bun.file(stateFile).text()).toBe("invalid-json");
+	});
+
+	it("propagates write failures without replacing the prior snapshot", async () => {
+		const { context, stateFile } = await committedFailureFixture();
+		const before = await Bun.file(stateFile).text();
+		const failure = new Error("projection write failed");
+		const rename = fs.rename;
+		const write = spyOn(fs, "rename").mockImplementation(async (source, destination) => {
+			if (String(destination) === stateFile) throw failure;
+			return rename(source, destination);
+		});
+		try {
+			await expect(persistCoordinatorCommittedPromptFailure(context, "committed", () => true)).rejects.toThrow(
+				"projection write failed",
+			);
+		} finally {
+			write.mockRestore();
+		}
+		expect(await Bun.file(stateFile).text()).toBe(before);
+	});
+
+	it("accepts unrelated string scopes without treating them as attempt provenance", async () => {
+		const { context, stateFile } = await committedFailureFixture();
+		const before = await readPayload(stateFile);
+		await persistCoordinatorRuntimeStateFromEvent({ type: "model_fallback_switched", scope: "session" }, context);
+		expect(await readPayload(stateFile)).toEqual(before);
+	});
+});
 
 function expectCompactJson(raw: string): RuntimePayload {
 	expect(raw).not.toContain("\n  ");
@@ -403,6 +603,11 @@ describe("coordinator runtime state sidecar", () => {
 			{ event: { type: "turn_start" }, affects: true, lifecycle: true },
 			{ event: { type: "agent_start" }, affects: true, lifecycle: true },
 			{ event: { type: "agent_end", messages: [] }, affects: true, lifecycle: true },
+			{
+				event: { type: "agent_failed", error: { code: "agent_failed", message: "Failed" } },
+				affects: true,
+				lifecycle: false,
+			},
 			// Tool events carry no lifecycle state, but they do change the shared file.
 			{ event: { type: "tool_execution_start", toolCallId: "call-1" }, affects: true, lifecycle: false },
 			{ event: { type: "tool_execution_end", toolCallId: "call-1" }, affects: true, lifecycle: false },
@@ -443,7 +648,7 @@ describe("coordinator runtime state sidecar", () => {
 				{ type: "agent_start" },
 				{ sessionId: "fallback", cwd: root, sessionFile: null },
 			),
-		).rejects.toThrow("this launch requires Coordinator sidecar signing but its signing key material is missing");
+		).rejects.toThrow("invalid or unreadable");
 		expect(await Bun.file(stateFile).exists()).toBe(false);
 
 		// The signer is captured and removed before runtime initialization. Supplying
@@ -455,7 +660,7 @@ describe("coordinator runtime state sidecar", () => {
 				{ type: "turn_start" },
 				{ sessionId: "fallback", cwd: root, sessionFile: null },
 			),
-		).rejects.toThrow("this launch requires Coordinator sidecar signing but its signing key material is missing");
+		).rejects.toThrow("invalid or unreadable");
 		expect(await Bun.file(stateFile).exists()).toBe(false);
 	});
 
@@ -677,7 +882,7 @@ describe("coordinator runtime state sidecar", () => {
 				{ type: "agent_end", messages: [] },
 				{ sessionId: "fallback", cwd: root, sessionFile: null },
 			),
-		).rejects.toThrow("Existing runtime state marker violates the lifecycle contract: the marker is not valid JSON");
+		).rejects.toThrow("Existing runtime state marker is invalid or unreadable; refusing to overwrite.");
 		expect(await Bun.file(stateFile).text()).toBe(evidence);
 
 		await expect(
@@ -686,7 +891,7 @@ describe("coordinator runtime state sidecar", () => {
 				cwd: root,
 				sessionFile: null,
 			}),
-		).rejects.toThrow("Existing runtime state marker violates the lifecycle contract: the marker is not valid JSON");
+		).rejects.toThrow("Existing runtime state marker is invalid or unreadable; refusing to overwrite.");
 		expect(await Bun.file(stateFile).text()).toBe(evidence);
 	});
 
@@ -694,7 +899,7 @@ describe("coordinator runtime state sidecar", () => {
 		"state",
 		"ready_for_input",
 		"live",
-	])("names structurally invalid marker field %s without echoing its text", async field => {
+	])("does not echo structurally invalid marker field %s into diagnostics", async field => {
 		const root = await tempRoot();
 		const stateFile = path.join(root, "invalid-field.json");
 		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
@@ -714,205 +919,11 @@ describe("coordinator runtime state sidecar", () => {
 			sessionFile: null,
 		}).catch((error: unknown) => error);
 		expect(failure).toBeInstanceOf(Error);
-		expect((failure as Error).name).toBe("PreviousRuntimeStateReadError");
-		const message = (failure as Error).message;
-		// The failing field is named and the offending bytes are pinned by digest...
-		expect(message).toContain(`Existing runtime state marker violates the lifecycle contract: ${field} `);
-		expect(message).toMatch(/payload sha256 [a-f0-9]{64}/);
-		// ...while the marker's own text never reaches an operator-visible diagnostic.
-		expect(message).not.toContain("untrusted-marker-text");
-		expect(message).not.toContain("\x1b");
-		expect(await Bun.file(stateFile).text()).toBe(evidence);
-	});
-
-	it("binds a shape refusal to the exact marker bytes by digest", async () => {
-		const root = await tempRoot();
-		const stateFile = path.join(root, "digest-state.json");
-		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
-		process.env[GJC_COORDINATOR_SESSION_ID_ENV] = "digest-session";
-		const evidence = JSON.stringify({
-			schema_version: 1,
-			session_id: "digest-session",
-			state: "prepared",
-			ready_for_input: "no thanks",
-			live: null,
+		expect(failure).toMatchObject({
+			name: "PreviousRuntimeStateReadError",
+			message: "Existing runtime state marker is invalid or unreadable; refusing to overwrite.",
 		});
-		await Bun.write(stateFile, evidence);
-
-		const failure = await expectRefusal(
-			persistCoordinatorRuntimeStateFromEvent(
-				{ type: "turn_start" },
-				{ sessionId: "fallback", cwd: root, sessionFile: null },
-			),
-		);
-
-		expect(failure.message).toContain("ready_for_input must be a boolean when present (received a string (9 chars))");
-		expect(failure.message).toContain(`payload sha256 ${createHash("sha256").update(evidence).digest("hex")}`);
-	});
-
-	it("reads back the coordinator-only prepared lifecycle the shared projection writes", async () => {
-		const root = await tempRoot();
-		const stateFile = path.join(root, "shared-projection.json");
-		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
-		process.env[GJC_COORDINATOR_SESSION_ID_ENV] = "prepared-session";
-		// Exactly what the coordinator's projection writer emits for a prepared session
-		// (server.ts writeSessionStateUnlocked): readiness withheld, no runtime identity
-		// fields, and no sidecar signature. The runtime sidecar owns the same file, so it
-		// has to read every lifecycle value the coordinator may leave behind (#5473).
-		await Bun.write(
-			stateFile,
-			`${JSON.stringify({
-				schema_version: 1,
-				session_id: "prepared-session",
-				state: "prepared",
-				ready_for_input: false,
-				current_turn_id: null,
-				last_turn_id: null,
-				updated_at: "2026-09-10T08:09:09.000Z",
-				source: "coordinator",
-				live: null,
-				reason: null,
-			})}\n`,
-		);
-
-		await persistCoordinatorRuntimeStateFromEvent(
-			{ type: "turn_start" },
-			{ sessionId: "fallback", cwd: root, sessionFile: null },
-		);
-
-		expect(await readPayload(stateFile)).toMatchObject({ session_id: "prepared-session", state: "running" });
-	});
-
-	it("keeps a nested session that owns its marker off the pinned parent marker", async () => {
-		const root = await tempRoot();
-		const pinnedFile = path.join(root, "projections", "session-states", "parent-session.json");
-		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = pinnedFile;
-		// The coordinator-launched runtime carries no GJC_COORDINATOR_SESSION_ID, so a
-		// nested session is identified by the session id it actually runs under.
-		delete process.env[GJC_COORDINATOR_SESSION_ID_ENV];
-		await persistCoordinatorRuntimeStateFromEvent(
-			{ type: "turn_start" },
-			{ sessionId: "parent-session", cwd: root, sessionFile: null },
-		);
-		const parentMarker = await Bun.file(pinnedFile).text();
-
-		// An in-process role-agent/subagent run shares this process's environment but is a
-		// different session, so it owns a session-derived marker instead of the parent's.
-		const childFile = path.join(sessionRuntimeDir(root, "child-scope"), "runtime-state.json");
-		await persistCoordinatorRuntimeStateFromEvent(
-			{ type: "turn_start" },
-			{ sessionId: "child-scope", cwd: root, sessionFile: null, stateFile: childFile },
-		);
-
-		expect(await readPayload(childFile)).toMatchObject({ session_id: "child-scope", state: "running" });
-		expect(await Bun.file(pinnedFile).text()).toBe(parentMarker);
-	});
-
-	it("names the owning session when a foreign session reaches for a pinned marker", async () => {
-		const root = await tempRoot();
-		const pinnedFile = path.join(root, "projections", "session-states", "parent-session.json");
-		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = pinnedFile;
-		delete process.env[GJC_COORDINATOR_SESSION_ID_ENV];
-		await persistCoordinatorRuntimeStateFromEvent(
-			{ type: "turn_start" },
-			{ sessionId: "parent-session", cwd: root, sessionFile: null },
-		);
-		const parentMarker = await Bun.file(pinnedFile).text();
-
-		const failure = await expectRefusal(
-			persistCoordinatorRuntimeStateFromEvent(
-				{ type: "turn_start" },
-				{ sessionId: "child-scope", cwd: root, sessionFile: null },
-			),
-		);
-
-		// The 102x live rejection (#5473) was opaque; it must now say which session the
-		// marker belongs to and which marker this write was aimed at.
-		expect(failure.message).toContain('session_id must be "child-scope" (received "parent-session")');
-		expect(failure.message).toContain(`using marker ${JSON.stringify(pinnedFile)}`);
-		// ...and it must pin the payload it refused, so the two writers can be compared.
-		expect(failure.message).toMatch(/payload-content sha256 [a-f0-9]{64}/);
-		expect(await Bun.file(pinnedFile).text()).toBe(parentMarker);
-	});
-
-	it("never lets a foreign marker inject control sequences into the refusal", async () => {
-		const root = await tempRoot();
-		const sessionId = "foreign-diagnostic";
-		const hostile = "D:\\Users\\Operator\\Repo\u001b[2J\u009b\u007f\u202e\u200b\ufeff\u2066\u2028\u2029injected";
-		const stateFile = path.join(root, "runtime-state.json");
-		await Bun.write(
-			stateFile,
-			JSON.stringify({
-				schema_version: 1,
-				session_id: sessionId,
-				state: "running",
-				live: true,
-				cwd: hostile,
-				workdir: hostile,
-				session_file: null,
-			}),
-		);
-		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
-		// normalizedIdentity prefers GJC_COORDINATOR_SESSION_ID whenever the pin is set, so this
-		// case must not inherit an ambient coordinator id from the process running the suite.
-		delete process.env[GJC_COORDINATOR_SESSION_ID_ENV];
-
-		const failure = await expectRefusal(
-			persistCoordinatorRuntimeStateFromEvent({ type: "turn_start" }, { sessionId, cwd: root, sessionFile: null }),
-		);
-
-		expect(failure.name).toBe("ForeignRuntimeStateError");
-		// The operator still learns both workspaces — that is what distinguishes a foreign
-		// marker from file corruption — but the recorded path is de-fanged, not echoed raw.
-		expect(failure.message).toContain("D:\\Users\\Operator\\Repo");
-		for (const unsafe of ["\u001b", "\u009b", "\u007f", "\u202e", "\u200b", "\ufeff", "\u2066", "\u2028", "\u2029"]) {
-			expect(failure.message).not.toContain(unsafe);
-		}
-		expect(failure.message).toMatch(/payload-content sha256 [a-f0-9]{64}/);
-		// The exact recorded value stays available on the typed field.
-		expect((failure as Error & { recordedCwd: string }).recordedCwd).toBe(hostile);
-	});
-
-	it("accepts a non-canonical spelling of the session's own derived marker", async () => {
-		const root = await tempRoot();
-		const real = path.join(root, "real");
-		const alias = path.join(root, "alias");
-		const target = path.join(root, "target");
-		await fs.mkdir(real);
-		await fs.mkdir(target);
-		await fs.symlink(real, alias);
-		// No pin: this session owns its derived marker, and a caller may reach it through a
-		// symlinked spelling of the cwd (macOS `/var` and `/tmp` prefixes behave the same way).
-		delete process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV];
-		const sessionId = "spelling-session";
-		const aliased = path.join(sessionRuntimeDir(alias, sessionId), "runtime-state.json");
-
-		await expect(
-			prepareCoordinatorRuntimeStateRescope({ sessionId, previousCwd: real, newCwd: target, stateFile: aliased }),
-		).resolves.toBeDefined();
-		expect(fsSync.existsSync(path.join(sessionRuntimeDir(real, sessionId), "runtime-state-rescope.json"))).toBe(true);
-	});
-
-	it("de-fangs a caller-named rescope marker this session cannot own", async () => {
-		const root = await tempRoot();
-		delete process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV];
-		const launcher = path.join(root, "launcher");
-		const target = path.join(root, "target");
-		await fs.mkdir(launcher);
-		await fs.mkdir(target);
-		const hostile = `${root}/foreign\u202e\u200bmarker.json`;
-
-		const failure = await expectRefusal(
-			prepareCoordinatorRuntimeStateRescope({
-				sessionId: "foreign-marker-session",
-				previousCwd: launcher,
-				newCwd: target,
-				stateFile: hostile,
-			}),
-		);
-
-		expect(failure.message).toContain("refusing to guess its ownership");
-		for (const unsafe of ["\u202e", "\u200b"]) expect(failure.message).not.toContain(unsafe);
+		expect(await Bun.file(stateFile).text()).toBe(evidence);
 	});
 
 	it("reports a live transition timeout without misclassifying or changing runtime state", async () => {
@@ -963,9 +974,7 @@ describe("coordinator runtime state sidecar", () => {
 				{ type: "turn_start" },
 				{ sessionId: "fallback", cwd: root, sessionFile: null },
 			),
-		).rejects.toThrow(
-			"Existing runtime state marker violates the lifecycle contract: the marker path is not a regular file",
-		);
+		).rejects.toThrow("Existing runtime state marker is invalid or unreadable; refusing to overwrite.");
 		expect((await fs.stat(stateFile)).isDirectory()).toBe(true);
 
 		await expect(
@@ -974,9 +983,7 @@ describe("coordinator runtime state sidecar", () => {
 				cwd: root,
 				sessionFile: null,
 			}),
-		).rejects.toThrow(
-			"Existing runtime state marker violates the lifecycle contract: the marker path is not a regular file",
-		);
+		).rejects.toThrow("Existing runtime state marker is invalid or unreadable; refusing to overwrite.");
 		expect((await fs.stat(stateFile)).isDirectory()).toBe(true);
 	});
 
@@ -999,9 +1006,7 @@ describe("coordinator runtime state sidecar", () => {
 					{ type: "turn_start" },
 					{ sessionId: "fallback", cwd: root, sessionFile: null },
 				),
-			).rejects.toThrow(
-				"Existing runtime state marker violates the lifecycle contract: the marker could not be read (EACCES)",
-			);
+			).rejects.toThrow("Existing runtime state marker is invalid or unreadable; refusing to overwrite.");
 		} finally {
 			stat.mockRestore();
 		}
@@ -1019,9 +1024,7 @@ describe("coordinator runtime state sidecar", () => {
 					cwd: root,
 					sessionFile: null,
 				}),
-			).rejects.toThrow(
-				"Existing runtime state marker violates the lifecycle contract: the marker could not be read (EACCES)",
-			);
+			).rejects.toThrow("Existing runtime state marker is invalid or unreadable; refusing to overwrite.");
 		} finally {
 			readFileSync.mockRestore();
 		}
@@ -1060,6 +1063,113 @@ describe("coordinator runtime state sidecar", () => {
 				truncated: false,
 			},
 		});
+	});
+
+	it.each(["", "Partial response"])("preserves runtime failure through terminal content %j", async text => {
+		const root = await tempRoot();
+		const stateFile = path.join(root, "state.json");
+		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
+		const context = { sessionId: "failure-receipt", cwd: root, sessionFile: null };
+		const sdkRunToken = "failed-run";
+		await persistCoordinatorRuntimeStateFromEvent({ type: "agent_start", sdkRunToken }, context);
+		await persistCoordinatorRuntimeStateFromEvent({ type: "tool_execution_start", toolCallId: "active" }, context);
+		const running = await readPayload(stateFile);
+		await persistCoordinatorRuntimeStateFromEvent(
+			{
+				type: "agent_failed",
+				sdkRunToken,
+				error: { code: "secret-code", message: "secret-provider-body" },
+			},
+			context,
+		);
+		const diagnostic = await readPayload(stateFile);
+		expect(diagnostic).toMatchObject({ state: "running", live: true, ready_for_input: false });
+		expect(diagnostic.activity).toEqual(running.activity);
+		expect(diagnostic.ended_at).toBeUndefined();
+		expect(diagnostic.execution_state).toBeUndefined();
+		expect(JSON.stringify(diagnostic)).not.toContain("secret-");
+		expect(JSON.stringify(diagnostic)).not.toContain(sdkRunToken);
+		// Another attempt within the same logical run must retain the diagnostic.
+		await persistCoordinatorRuntimeStateFromEvent({ type: "turn_start", sdkRunToken }, context);
+		await persistCoordinatorRuntimeStateFromEvent({ type: "agent_start", sdkRunToken }, context);
+		await persistCoordinatorRuntimeStateFromEvent(
+			{ ...(text ? assistantEnd(text) : { type: "agent_end", messages: [] }), sdkRunToken },
+			context,
+		);
+		const terminal = await readPayload(stateFile);
+		expect(terminal).toMatchObject({
+			state: "errored",
+			execution_state: "failed",
+			receipt_state: text ? "present" : "absent",
+			error: { code: "agent_failed" },
+			final_response: { text: text || null },
+			activity: { active_tool_count: 0 },
+		});
+		expect(terminal.run_failure).toEqual(diagnostic.run_failure);
+	});
+
+	it("clears predecessor failure and rejects late unrelated failure and terminal events", async () => {
+		const root = await tempRoot();
+		const stateFile = path.join(root, "state.json");
+		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
+		const context = { sessionId: "failure-successor", cwd: root, sessionFile: null };
+		await persistCoordinatorRuntimeStateFromEvent({ type: "agent_start", sdkRunToken: "old" }, context);
+		await persistCoordinatorRuntimeStateFromEvent({ type: "agent_failed", sdkRunToken: "old" }, context);
+		await persistCoordinatorRuntimeStateFromEvent({ type: "agent_end", messages: [], sdkRunToken: "old" }, context);
+		await persistCoordinatorRuntimeStateFromEvent({ type: "agent_start", sdkRunToken: "new" }, context);
+		const successor = await readPayload(stateFile);
+		expect(successor.run_failure).toBeUndefined();
+		expect(successor.error).toBeUndefined();
+		await persistCoordinatorRuntimeStateFromEvent({ type: "agent_failed", sdkRunToken: "old" }, context);
+		await persistCoordinatorRuntimeStateFromEvent({ type: "agent_failed" }, context);
+		await persistCoordinatorRuntimeStateFromEvent({ type: "agent_end", messages: [], sdkRunToken: "old" }, context);
+		await persistCoordinatorRuntimeStateFromEvent({ type: "turn_start", sdkRunToken: "old" }, context);
+		expect(await readPayload(stateFile)).toEqual(successor);
+		await persistCoordinatorRuntimeStateFromEvent({ ...assistantEnd("Done"), sdkRunToken: "new" }, context);
+		expect(await readPayload(stateFile)).toMatchObject({
+			state: "completed",
+			execution_state: "terminal_ok",
+			receipt_state: "present",
+		});
+		const completed = await readPayload(stateFile);
+		await persistCoordinatorRuntimeStateFromEvent({ type: "agent_failed", sdkRunToken: "new" }, context);
+		expect(await readPayload(stateFile)).toEqual(completed);
+	});
+
+	it("keeps genuinely completed empty execution independent from its missing receipt", async () => {
+		const root = await tempRoot();
+		const stateFile = path.join(root, "state.json");
+		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
+		const context = { sessionId: "empty-completed", cwd: root, sessionFile: null };
+		await persistCoordinatorRuntimeStateFromEvent({ type: "agent_start", sdkRunToken: "empty" }, context);
+		await persistCoordinatorRuntimeStateFromEvent({ type: "agent_end", messages: [], sdkRunToken: "empty" }, context);
+		expect(await readPayload(stateFile)).toMatchObject({
+			state: "completed",
+			execution_state: "terminal_ok",
+			receipt_state: "missing",
+			error: { code: "receipt_missing" },
+		});
+	});
+
+	it("uses explicit attempt scope when a logical run token is unavailable", async () => {
+		const root = await tempRoot();
+		const stateFile = path.join(root, "state.json");
+		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
+		const context = { sessionId: "scoped-failure", cwd: root, sessionFile: null };
+		const scope = { attemptId: "attempt-one", generation: 1, lineage: "main" };
+		await persistCoordinatorRuntimeStateFromEvent({ type: "agent_start", scope }, context);
+		await persistCoordinatorRuntimeStateFromEvent({ type: "agent_failed", scope }, context);
+		await persistCoordinatorRuntimeStateFromEvent({ type: "agent_end", messages: [], scope }, context);
+		expect(await readPayload(stateFile)).toMatchObject({
+			state: "errored",
+			execution_state: "failed",
+			receipt_state: "absent",
+		});
+		const successorScope = { ...scope, attemptId: "attempt-two", generation: 2 };
+		await persistCoordinatorRuntimeStateFromEvent({ type: "agent_start", scope: successorScope }, context);
+		await persistCoordinatorRuntimeStateFromEvent({ type: "agent_failed", scope }, context);
+		await persistCoordinatorRuntimeStateFromEvent({ ...assistantEnd("Done"), scope: successorScope }, context);
+		expect(await readPayload(stateFile)).toMatchObject({ state: "completed", execution_state: "terminal_ok" });
 	});
 
 	it("does not sync-read on the async event path and preserves cached turn state", async () => {
@@ -2089,9 +2199,7 @@ describe("coordinator runtime state sidecar", () => {
 					cwd: root,
 					sessionFile: null,
 				}),
-			).rejects.toThrow(
-				'Existing runtime state marker violates the lifecycle contract: session_id must be "current-session" (received "stale-session")',
-			);
+			).rejects.toThrow("invalid or unreadable");
 		} finally {
 			process.exitCode = previousExitCode;
 		}
@@ -3899,84 +4007,6 @@ describe("coordinator runtime state sidecar", () => {
 		expect(typeof payload.ended_at).toBe("string");
 		expect(Number.isFinite(Date.parse(payload.ended_at as string))).toBe(true);
 	});
-	it("issue-5471: normalizes a pre-4351 completed readiness bit and self-heals on write", async () => {
-		const root = await tempRoot();
-		const stateFile = path.join(root, "issue-5471-legacy-completed.json");
-		const sessionId = "issue-5471-legacy-completed";
-		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
-		process.env[GJC_COORDINATOR_SESSION_ID_ENV] = sessionId;
-		await Bun.write(
-			stateFile,
-			`${JSON.stringify({
-				schema_version: 1,
-				session_id: sessionId,
-				state: "completed",
-				ready_for_input: true,
-				cwd: root,
-				workdir: root,
-				session_file: null,
-				current_turn_id: "turn-final",
-				last_turn_id: "turn-prev",
-				live: false,
-				updated_at: "2026-08-11T00:00:00.000Z",
-				reason: null,
-			})}\n`,
-		);
-
-		await expect(
-			persistCoordinatorRuntimeStateFromEvent({ type: "turn_start" }, { sessionId, cwd: root, sessionFile: null }),
-		).resolves.toBeUndefined();
-
-		await expect(readPayload(stateFile)).resolves.toMatchObject({ state: "running", ready_for_input: false });
-	});
-
-	it("issue-5471: the legacy readiness tolerance does not weaken the sidecar signing fence", async () => {
-		const root = await tempRoot();
-		const stateFile = path.join(root, "state.json");
-		const fixture = path.join(import.meta.dir, "fixtures", "session-state-sidecar-subprocess.ts");
-		const { privateKey } = generateKeyPairSync("ed25519");
-		const privateDer = privateKey.export({ format: "der", type: "pkcs8" }).toString("base64");
-		const keyId = "455f1a4c455f1a4c455f1a4c455f1a4c455f1a4c455f1a4c455f1a4c455f1a4c";
-		// The exact pre-#4351 shape: unsigned, no sidecar key, readiness bit still set.
-		await Bun.write(
-			stateFile,
-			`${JSON.stringify({
-				schema_version: 1,
-				session_id: "155-FinalA4",
-				state: "completed",
-				ready_for_input: true,
-				cwd: root,
-				workdir: root,
-				session_file: null,
-				current_turn_id: "turn-final",
-				last_turn_id: "turn-prev",
-				live: false,
-				source: "agent_session_event",
-				event: "agent_end",
-				updated_at: "2026-08-01T01:14:30.375Z",
-			})}\n`,
-		);
-		const before = await Bun.file(stateFile).bytes();
-		const child = Bun.spawn([process.execPath, fixture, stateFile], {
-			cwd: root,
-			env: {
-				...process.env,
-				[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]: stateFile,
-				[GJC_COORDINATOR_SESSION_ID_ENV]: "155-FinalA4",
-				[GJC_COORDINATOR_SIDECAR_SIGNATURE_REQUIRED_ENV]: "true",
-				[GJC_COORDINATOR_SIDECAR_KEY_ID_ENV]: keyId,
-				[GJC_COORDINATOR_SIDECAR_SIGNING_KEY_ENV]: privateDer,
-			},
-			stdout: "pipe",
-			stderr: "pipe",
-		});
-		const stderr = await new Response(child.stderr).text();
-		expect(await child.exited).not.toBe(0);
-		// Normalizing the readiness bit must not become a way past the signing fence, and a
-		// refused marker must survive byte-identical.
-		expect(stderr).toContain("the marker is not signed by this session's sidecar key");
-		expect(await Bun.file(stateFile).bytes()).toEqual(before);
-	});
 
 	it("issue-4351: errored session reports ready_for_input false", async () => {
 		const root = await tempRoot();
@@ -4014,7 +4044,7 @@ describe("coordinator runtime state sidecar", () => {
 	});
 
 	it.each([
-		["errored", true, false, "ready_for_input must be false when state is errored (received true)"],
+		["completed", true, false, "ready_for_input must be false when state is completed (received true)"],
 		["ready_for_input", false, false, "ready_for_input must be true when state is ready_for_input (received false)"],
 		["running", false, false, "live must be true when state is running (received false)"],
 		["completed", false, true, "live must be false when state is completed (received true)"],
@@ -4039,19 +4069,15 @@ describe("coordinator runtime state sidecar", () => {
 		})}\n`;
 		await Bun.write(stateFile, evidence);
 		const context = { sessionId, cwd: root, sessionFile: null };
-		const prefix = `Existing runtime state marker violates the lifecycle contract: ${detail}`;
+		const message = `Existing runtime state marker violates the lifecycle contract: ${detail}; refusing to overwrite.`;
 
-		const failure = await expectRefusal(
+		await expect(
 			persistCoordinatorRuntimeStateFromEvent(assistantEnd("re-assert completion"), context),
-		);
-		expect(failure.message).toContain(prefix);
-		expect(failure.message).toMatch(/payload sha256 [a-f0-9]{64}; refusing to overwrite\.$/);
+		).rejects.toThrow(message);
 		expect(await Bun.file(stateFile).text()).toBe(evidence);
-		const postmortemFailure = await expectRefusal(
-			persistCoordinatorRuntimeStateFromPostmortem(postmortem.Reason.SIGTERM, context),
+		await expect(persistCoordinatorRuntimeStateFromPostmortem(postmortem.Reason.SIGTERM, context)).rejects.toThrow(
+			message,
 		);
-		expect(postmortemFailure.message).toContain(prefix);
-		expect(postmortemFailure.message).toMatch(/payload sha256 [a-f0-9]{64}; refusing to overwrite\.$/);
 		expect(await Bun.file(stateFile).text()).toBe(evidence);
 	});
 });

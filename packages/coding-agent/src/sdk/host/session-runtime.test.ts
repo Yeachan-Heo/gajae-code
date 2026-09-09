@@ -7,6 +7,7 @@ import { logger } from "@gajae-code/utils";
 import { AsyncJobManager } from "../../async";
 import type { Settings } from "../../config/settings";
 import type { ExtensionAPI, ExtensionContext, ExtensionTranscriptEntry } from "../../extensibility/extensions";
+import { readSdkRunCapability } from "../../session/sdk-run-capability-internal";
 import {
 	registerOwnedRegistration,
 	resetTerminalAbortRegistriesForTests,
@@ -1555,6 +1556,7 @@ describe("SessionSdkSessionRuntime", () => {
 		let idle = true;
 		let promoted: ((promotion: { startsOwnRun: boolean }) => void) | undefined;
 		const queuedDispositions: boolean[] = [];
+		const sdkRunTokens: Array<string | undefined> = [];
 		const handlers = new Map<string, (event: unknown, ctx: ExtensionContext) => Promise<void> | void>();
 		const api = {
 			on(event: string, handler: (event: unknown, ctx: ExtensionContext) => Promise<void> | void) {
@@ -1565,6 +1567,7 @@ describe("SessionSdkSessionRuntime", () => {
 				options:
 					| {
 							onPreflightAccepted?: () => void;
+							sdkRunCapability?: unknown;
 							onPreflightAcceptCommit?: () => void;
 							onQueuedPromoted?: (promotion: { startsOwnRun?: boolean; removed?: boolean }) => void;
 							queuedAtDispatch?: boolean;
@@ -1572,6 +1575,7 @@ describe("SessionSdkSessionRuntime", () => {
 					| undefined,
 			) =>
 				Promise.resolve(options?.onPreflightAcceptCommit?.()).then(() => {
+					sdkRunTokens.push(readSdkRunCapability(options?.sdkRunCapability));
 					queuedDispositions.push(options?.queuedAtDispatch === true);
 					promoted = options?.onQueuedPromoted;
 					options?.onPreflightAccepted?.();
@@ -1626,7 +1630,7 @@ describe("SessionSdkSessionRuntime", () => {
 			// A submits while idle and STARTS its run: owner becomes conn-a.
 			prompt("conn-a", "unwind-a");
 			await waitResponse("unwind-a");
-			await handlers.get("agent_start")?.({ type: "agent_start" }, ctx);
+			await handlers.get("agent_start")?.({ type: "agent_start", sdkRunToken: sdkRunTokens[0] }, ctx);
 			// B submits while the session still reports busy (unwinding): the prompt
 			// is queued as steering and NO pending entry is created at accept.
 			idle = false;
@@ -1638,7 +1642,7 @@ describe("SessionSdkSessionRuntime", () => {
 			// correlation hook fires before agent_start...
 			promoted!({ startsOwnRun: true });
 			// ...and B's run starts: ownership transfers to conn-b.
-			await handlers.get("agent_start")?.({ type: "agent_start" }, ctx);
+			await handlers.get("agent_start")?.({ type: "agent_start", sdkRunToken: sdkRunTokens[1] }, ctx);
 			// B's own terminal abort now stops its turn (previously no_active_turn).
 			transport.feed("conn-b", {
 				type: "control_request",
@@ -2088,11 +2092,16 @@ describe("SessionSdkSessionRuntime", () => {
 	test("delayed predecessor and maintenance ends cannot resolve a successor publication waiter", async () => {
 		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-terminal-epoch-isolation-"));
 		const handlers = new Map<string, (event: unknown, ctx: ExtensionContext) => Promise<void> | void>();
+		const sdkRunTokens: Array<string | undefined> = [];
 		const api = {
 			on(event: string, handler: (event: unknown, ctx: ExtensionContext) => Promise<void> | void) {
 				handlers.set(event, handler);
 			},
-			sendUserMessage: async (_content: string, options: { onPreflightAcceptCommit?: () => Promise<void> }) => {
+			sendUserMessage: async (
+				_content: string,
+				options: { sdkRunCapability?: unknown; onPreflightAcceptCommit?: () => Promise<void> },
+			) => {
+				sdkRunTokens.push(readSdkRunCapability(options.sdkRunCapability));
 				await options?.onPreflightAcceptCommit?.();
 				await neverSettlingPromise();
 			},
@@ -2132,9 +2141,14 @@ describe("SessionSdkSessionRuntime", () => {
 				input: { text: "predecessor" },
 			} as SdkFrame);
 			while (!transport.sent.some(frame => frame.id === "predecessor-prompt")) await Bun.sleep(10);
-			await handlers.get("agent_start")?.({}, ctx); // lifecycle epoch 1
+			await handlers.get("agent_start")?.({ sdkRunToken: sdkRunTokens[0] }, ctx); // lifecycle epoch 1
 			await handlers.get("agent_end")?.(
-				{ type: "agent_end", stopReason: "maintenance", maintenanceOutcome: "compacted" },
+				{
+					type: "agent_end",
+					sdkRunToken: sdkRunTokens[0],
+					stopReason: "maintenance",
+					maintenanceOutcome: "compacted",
+				},
 				ctx,
 			);
 			transport.feed("client", {
@@ -2146,7 +2160,7 @@ describe("SessionSdkSessionRuntime", () => {
 			while (!transport.sent.some(frame => frame.id === "successor-prompt")) await Bun.sleep(10);
 			activeEpoch = 2;
 			activeHandle = "successor";
-			await handlers.get("agent_start")?.({}, ctx); // lifecycle epoch 2
+			await handlers.get("agent_start")?.({ sdkRunToken: sdkRunTokens[1] }, ctx); // lifecycle epoch 2
 			transport.feed("client", {
 				type: "control_request",
 				id: "successor-abort",
@@ -2155,15 +2169,23 @@ describe("SessionSdkSessionRuntime", () => {
 				idempotencyKey: "successor-abort-key",
 			} as SdkFrame);
 			while (abortCalls < 1) await Bun.sleep(10);
-			await handlers.get("agent_end")?.({ type: "agent_end" }, ctx); // delayed predecessor
+			await handlers.get("agent_end")?.({ type: "agent_end", sdkRunToken: sdkRunTokens[0] }, ctx); // delayed predecessor
 			await handlers.get("agent_end")?.(
-				{ type: "agent_end", stopReason: "maintenance", maintenanceOutcome: "compacted" },
+				{
+					type: "agent_end",
+					sdkRunToken: sdkRunTokens[1],
+					stopReason: "maintenance",
+					maintenanceOutcome: "compacted",
+				},
 				ctx,
 			);
 			abortRelease.resolve();
 			await Bun.sleep(50);
 			expect(transport.sent.some(frame => frame.id === "successor-abort")).toBe(false);
-			await handlers.get("agent_end")?.({ type: "agent_end" }, ctx); // successor
+			await handlers.get("agent_end")?.(
+				{ type: "agent_end", sdkRunToken: sdkRunTokens[1], stopReason: "cancelled" },
+				ctx,
+			); // successor's actual abort terminal
 			const deadline = Date.now() + 5_000;
 			while (!transport.sent.some(frame => frame.id === "successor-abort")) {
 				if (Date.now() > deadline) throw new Error("Timed out waiting for successor abort response");
@@ -2353,12 +2375,18 @@ describe("SessionSdkSessionRuntime", () => {
 				},
 			},
 		});
+		let sdkRunToken: string | undefined;
 		const ctx = {
 			...extensionContext(transport.sessionId, cwd),
 			// Declare the binding so the surface policy installs skill.invoke, and
 			// accept the preflight so the skill turn is ADMITTED under conn-a.
 			sdkBindings: () => ["invokeSkill"],
-			invokeSkill: async (_name: string, _args: unknown, options: { onPreflightAccepted?: () => void }) => {
+			invokeSkill: async (
+				_name: string,
+				_args: unknown,
+				options: { sdkRunCapability?: unknown; onPreflightAccepted?: () => void },
+			) => {
+				sdkRunToken = readSdkRunCapability(options.sdkRunCapability);
 				options.onPreflightAccepted?.();
 				return { accepted: true };
 			},
@@ -2385,7 +2413,7 @@ describe("SessionSdkSessionRuntime", () => {
 			// Ownership is associated when the accepted submission STARTS its run
 			// (agent_start), not at acceptance: fire the lifecycle event so the
 			// skill run is owned by conn-a (review thread P1).
-			await handlers.get("agent_start")?.({ type: "agent_start" }, ctx);
+			await handlers.get("agent_start")?.({ type: "agent_start", sdkRunToken }, ctx);
 			// Client B's terminal abort must NOT stop A's skill run: owner is A.
 			transport.feed("conn-b", {
 				type: "control_request",
@@ -2435,14 +2463,18 @@ describe("SessionSdkSessionRuntime", () => {
 		// turn while A is refused (review thread P1).
 		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-queued-owner-"));
 		const handlers = new Map<string, (event: unknown, ctx: ExtensionContext) => Promise<void> | void>();
+		const sdkRunTokens: Array<string | undefined> = [];
 		const api = {
 			on(event: string, handler: (event: unknown, ctx: ExtensionContext) => Promise<void> | void) {
 				handlers.set(event, handler);
 			},
 			sendUserMessage: async (
 				_content: string,
-				options: { onPreflightAccepted?: () => void; onPreflightAcceptCommit?: () => void } | undefined,
+				options:
+					| { sdkRunCapability?: unknown; onPreflightAccepted?: () => void; onPreflightAcceptCommit?: () => void }
+					| undefined,
 			) => {
+				sdkRunTokens.push(readSdkRunCapability(options?.sdkRunCapability));
 				await options?.onPreflightAcceptCommit?.();
 				options?.onPreflightAccepted?.();
 				// Production-faithful: an accepted run stays in-flight for the whole
@@ -2491,7 +2523,7 @@ describe("SessionSdkSessionRuntime", () => {
 			// A submits and STARTS its run: owner becomes conn-a.
 			prompt("conn-a", "prompt-a");
 			await waitResponse("prompt-a");
-			await handlers.get("agent_start")?.({ type: "agent_start" }, ctx);
+			await handlers.get("agent_start")?.({ type: "agent_start", sdkRunToken: sdkRunTokens[0] }, ctx);
 			// B submits and is ACCEPTED, but only queued (agent_start not fired).
 			prompt("conn-b", "prompt-b");
 			await waitResponse("prompt-b");
@@ -2515,7 +2547,7 @@ describe("SessionSdkSessionRuntime", () => {
 			expect(seamCalls).toHaveLength(0);
 			// B's run now STARTS: ownership transfers to conn-b, and B's own abort
 			// stops it.
-			await handlers.get("agent_start")?.({ type: "agent_start" }, ctx);
+			await handlers.get("agent_start")?.({ type: "agent_start", sdkRunToken: sdkRunTokens[1] }, ctx);
 			transport.feed("conn-b", {
 				type: "control_request",
 				id: "queued-abort-2",
@@ -2544,15 +2576,19 @@ describe("SessionSdkSessionRuntime", () => {
 		// P1).
 		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-stale-owner-"));
 		const handlers = new Map<string, (event: unknown, ctx: ExtensionContext) => Promise<void> | void>();
+		const sdkRunTokens: Array<string | undefined> = [];
 		const api = {
 			on(event: string, handler: (event: unknown, ctx: ExtensionContext) => Promise<void> | void) {
 				handlers.set(event, handler);
 			},
 			sendUserMessage: (
 				_content: string,
-				options: { onPreflightAccepted?: () => void; onPreflightAcceptCommit?: () => void } | undefined,
+				options:
+					| { sdkRunCapability?: unknown; onPreflightAccepted?: () => void; onPreflightAcceptCommit?: () => void }
+					| undefined,
 			) =>
 				Promise.resolve(options?.onPreflightAcceptCommit?.()).then(() => {
+					sdkRunTokens.push(readSdkRunCapability(options?.sdkRunCapability));
 					options?.onPreflightAccepted?.();
 					return {};
 				}),
@@ -2601,7 +2637,7 @@ describe("SessionSdkSessionRuntime", () => {
 			// A submits while idle and STARTS its run: owner becomes conn-a.
 			prompt("conn-a", "stale-a");
 			await waitResponse("stale-a");
-			await handlers.get("agent_start")?.({ type: "agent_start" }, ctx);
+			await handlers.get("agent_start")?.({ type: "agent_start", sdkRunToken: sdkRunTokens[0] }, ctx);
 			// A's turn is now streaming: B's plain prompt is queued as steering and
 			// consumed in-run — its pending entry must NOT be created.
 			idle = false;
@@ -2638,15 +2674,19 @@ describe("SessionSdkSessionRuntime", () => {
 		// P1).
 		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-stale-followup-"));
 		const handlers = new Map<string, (event: unknown, ctx: ExtensionContext) => Promise<void> | void>();
+		const sdkRunTokens: Array<string | undefined> = [];
 		const api = {
 			on(event: string, handler: (event: unknown, ctx: ExtensionContext) => Promise<void> | void) {
 				handlers.set(event, handler);
 			},
 			sendUserMessage: (
 				_content: string,
-				options: { onPreflightAccepted?: () => void; onPreflightAcceptCommit?: () => void } | undefined,
+				options:
+					| { sdkRunCapability?: unknown; onPreflightAccepted?: () => void; onPreflightAcceptCommit?: () => void }
+					| undefined,
 			) =>
 				Promise.resolve(options?.onPreflightAcceptCommit?.()).then(() => {
+					sdkRunTokens.push(readSdkRunCapability(options?.sdkRunCapability));
 					options?.onPreflightAccepted?.();
 					return {};
 				}),
@@ -2693,7 +2733,7 @@ describe("SessionSdkSessionRuntime", () => {
 				input: { text: "a", images: [] },
 			} as SdkFrame);
 			await waitResponse("fu-a");
-			await handlers.get("agent_start")?.({ type: "agent_start" }, ctx);
+			await handlers.get("agent_start")?.({ type: "agent_start", sdkRunToken: sdkRunTokens[0] }, ctx);
 			// A streams: B's follow-up is consumed in-run -> NO pending entry.
 			idle = false;
 			transport.feed("conn-b", {
@@ -2741,7 +2781,7 @@ describe("SessionSdkSessionRuntime", () => {
 			const prompt = await harness.control("turn.prompt", { text: "predecessor" });
 			expect(prompt.ok).toBe(true);
 			const ids = { commandId: prompt.result?.commandId, turnId: prompt.result?.turnId };
-			await harness.emit("agent_start");
+			await harness.emitRun(0, "agent_start");
 			// Empty drain represents an agent-initiated successor with no SDK owner.
 			await harness.emit("agent_start");
 			for (let i = 0; i < 3; i += 1) {
@@ -2766,14 +2806,18 @@ describe("SessionSdkSessionRuntime", () => {
 		// the failed submission's connection as owner (review thread P1).
 		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-failed-owner-"));
 		const handlers = new Map<string, (event: unknown, ctx: ExtensionContext) => Promise<void> | void>();
+		const sdkRunTokens: Array<string | undefined> = [];
 		const api = {
 			on(event: string, handler: (event: unknown, ctx: ExtensionContext) => Promise<void> | void) {
 				handlers.set(event, handler);
 			},
 			sendUserMessage: (
 				content: string | { text: string }[],
-				options: { onPreflightAccepted?: () => void; onPreflightAcceptCommit?: () => void } | undefined,
+				options:
+					| { sdkRunCapability?: unknown; onPreflightAccepted?: () => void; onPreflightAcceptCommit?: () => void }
+					| undefined,
 			) => {
+				sdkRunTokens.push(readSdkRunCapability(options?.sdkRunCapability));
 				const commit = Promise.resolve(options?.onPreflightAcceptCommit?.()).then(() => {
 					options?.onPreflightAccepted?.();
 					return {};
@@ -2827,7 +2871,7 @@ describe("SessionSdkSessionRuntime", () => {
 			// A submits while idle and STARTS its run: owner becomes conn-a.
 			prompt("conn-a", "ok-a", "ok-a");
 			await waitResponse("ok-a");
-			await handlers.get("agent_start")?.({ type: "agent_start" }, ctx);
+			await handlers.get("agent_start")?.({ type: "agent_start", sdkRunToken: sdkRunTokens[0] }, ctx);
 			// B submits while idle (entry pushed), then its run REJECTS.
 			transport.feed("conn-b", {
 				type: "control_request",
@@ -3733,6 +3777,7 @@ describe("SessionSdkSessionRuntime", () => {
 });
 interface PreflightHooks {
 	onPreflightAccepted?: () => void;
+	sdkRunCapability?: unknown;
 	onPreflightAcceptCommit?: () => void | Promise<void>;
 }
 
@@ -3748,6 +3793,8 @@ interface InvocationHarness {
 	control(operation: string, input: Record<string, unknown>): Promise<ResponseFrame>;
 	query(name: string, input: Record<string, unknown>): Promise<ResponseFrame>;
 	emit(event: string, payload?: unknown): Promise<void>;
+	/** Emit for an explicit zero-based submission or shared cohort; emit() stays unowned. */
+	emitRun(run: number | number[], event: string, payload?: object): Promise<void>;
 	switchSession(sessionId: string): Promise<void>;
 	branch(sessionId: string): Promise<void>;
 	requestOnSession(sessionId: string, frame: Record<string, unknown>): Promise<ResponseFrame>;
@@ -3788,11 +3835,13 @@ async function invocationHarness(
 	const deliveries = new Map<string, (connectionId: string, frame: SdkFrame) => void>();
 	const sentFrames = new Map<string, SdkFrame[]>();
 	let nextId = 0;
+	const sdkRunTokens: Array<string | undefined> = [];
 	const api = {
 		on(event: string, handler: (event: unknown, ctx: unknown) => Promise<void> | void) {
 			handlers.set(event, handler);
 		},
 		sendUserMessage: async (content: unknown, options?: PreflightHooks & { deliverAs?: string }) => {
+			sdkRunTokens.push(readSdkRunCapability(options?.sdkRunCapability));
 			const result = await hooks.sendUserMessage?.(content, options);
 			return result === undefined ? "completed" : result;
 		},
@@ -3857,7 +3906,14 @@ async function invocationHarness(
 		sdkBindings: () => (hooks.invokeSkill ? ["invokeSkill"] : []),
 		isIdle: hooks.isIdle ?? (() => true),
 		abort: hooks.abort ?? (() => {}),
-		...(hooks.invokeSkill ? { invokeSkill: hooks.invokeSkill } : {}),
+		...(hooks.invokeSkill
+			? {
+					invokeSkill: (name: string, args?: string, options?: PreflightHooks) => {
+						sdkRunTokens.push(readSdkRunCapability(options?.sdkRunCapability));
+						return hooks.invokeSkill!(name, args, options);
+					},
+				}
+			: {}),
 		sessionManager: {
 			getSessionId: () => sessionId,
 			getSessionFile: () => path.join(cwd, ".gjc", "state", `${sessionId}.jsonl`),
@@ -3880,6 +3936,20 @@ async function invocationHarness(
 		broadcasts,
 		emit: async (event, payload) => {
 			await handlers.get(event)?.(payload ?? {}, ctx);
+		},
+		emitRun: async (run, event, payload = {}) => {
+			const tokens = (Array.isArray(run) ? run : [run]).map(index => {
+				const token = sdkRunTokens[index];
+				if (!token) throw new Error(`No SDK run capability captured for invocation ${index}`);
+				return token;
+			});
+			await handlers.get(event)?.(
+				Object.defineProperties(payload, {
+					sdkRunToken: { value: tokens[0], configurable: true },
+					sdkRunTokens: { value: tokens, configurable: true },
+				}),
+				ctx,
+			);
 		},
 		stop: async () => {
 			await handlers.get("session_shutdown")?.({}, ctx);
@@ -4031,8 +4101,8 @@ describe("post-acceptance invocation terminalization", () => {
 			const failed = await harness.control("turn.prompt", { text: "provider rejects", clientRef: `http-${status}` });
 			expect(failed.ok).toBe(true);
 			const failedIds = { commandId: failed.result?.commandId, turnId: failed.result?.turnId };
-			await harness.emit("agent_start");
-			await harness.emit("agent_end", {
+			await harness.emitRun(0, "agent_start");
+			await harness.emitRun(0, "agent_end", {
 				messages: [
 					{
 						role: "assistant",
@@ -4067,8 +4137,8 @@ describe("post-acceptance invocation terminalization", () => {
 			const replacement = await harness.control("turn.abort_and_prompt", { text: "replacement" });
 			expect(replacement).toMatchObject({ ok: true, result: { accepted: true } });
 			const replacementIds = { commandId: replacement.result?.commandId, turnId: replacement.result?.turnId };
-			await harness.emit("agent_start");
-			await harness.emit("agent_end", {
+			await harness.emitRun(1, "agent_start");
+			await harness.emitRun(1, "agent_end", {
 				messages: [
 					{ role: "assistant", stopReason: "error", errorStatus: 429 },
 					{ role: "assistant", stopReason: "stop" },
@@ -4097,8 +4167,8 @@ describe("post-acceptance invocation terminalization", () => {
 			const accepted = await harness.control("turn.prompt", { text: "provider rejects" });
 			expect(accepted.ok).toBe(true);
 			const ids = { commandId: accepted.result?.commandId, turnId: accepted.result?.turnId };
-			await harness.emit("agent_start");
-			await harness.emit("agent_end", { messages: [{ role: "assistant", stopReason: "error" }] });
+			await harness.emitRun(0, "agent_start");
+			await harness.emitRun(0, "agent_end", { messages: [{ role: "assistant", stopReason: "error" }] });
 			expect(await settledStatus(harness, "turn.prompt_status", ids)).toMatchObject({
 				status: "failed",
 				error: { code: "provider_rejected" },
@@ -4122,11 +4192,11 @@ describe("post-acceptance invocation terminalization", () => {
 			const accepted = await harness.control("turn.prompt", { text: "provider rejects" });
 			expect(accepted.ok).toBe(true);
 			const ids = { commandId: accepted.result?.commandId, turnId: accepted.result?.turnId };
-			await harness.emit("agent_start");
-			await harness.emit("agent_failed", {
+			await harness.emitRun(0, "agent_start");
+			await harness.emitRun(0, "agent_failed", {
 				error: Object.assign(new Error("generic agent failure"), { code: "agent_failed" }),
 			});
-			await harness.emit("agent_end", { messages: [{ role: "assistant", stopReason: "error" }] });
+			await harness.emitRun(0, "agent_end", { messages: [{ role: "assistant", stopReason: "error" }] });
 			expect(await settledStatus(harness, "turn.prompt_status", ids)).toMatchObject({
 				status: "failed",
 				error: { code: "provider_rejected" },
@@ -4152,11 +4222,11 @@ describe("post-acceptance invocation terminalization", () => {
 			const accepted = await harness.control("turn.prompt", { text: "provider unavailable" });
 			expect(accepted.ok).toBe(true);
 			const ids = { commandId: accepted.result?.commandId, turnId: accepted.result?.turnId };
-			await harness.emit("agent_start");
-			await harness.emit("agent_failed", {
+			await harness.emitRun(0, "agent_start");
+			await harness.emitRun(0, "agent_failed", {
 				error: Object.assign(new Error("provider unavailable"), { code: "provider_unavailable" }),
 			});
-			await harness.emit("agent_end", { messages: [{ role: "assistant", stopReason: "error" }] });
+			await harness.emitRun(0, "agent_end", { messages: [{ role: "assistant", stopReason: "error" }] });
 			expect(await settledStatus(harness, "turn.prompt_status", ids)).toMatchObject({
 				status: "failed",
 				error: { code: "provider_unavailable" },
@@ -4186,14 +4256,16 @@ describe("post-acceptance invocation terminalization", () => {
 			});
 			const first = await harness.control("turn.prompt", { text: "first" });
 			expect(first.ok).toBe(true);
-			await harness.emit("agent_start");
+			await harness.emitRun(0, "agent_start");
 			const attached = await harness.control("turn.follow_up", { text: "attached" });
 			expect(attached.ok).toBe(true);
 			promoted?.({ startsOwnRun: false });
 			const firstIds = { commandId: first.result?.commandId, turnId: first.result?.turnId };
 			const attachedIds = { commandId: attached.result?.commandId, turnId: attached.result?.turnId };
-			await harness.emit("agent_failed", { error: Object.assign(new Error("generic"), { code: "agent_failed" }) });
-			await harness.emit("agent_end", { messages: [{ role: "assistant", stopReason: "error" }] });
+			await harness.emitRun([0, 1], "agent_failed", {
+				error: Object.assign(new Error("generic"), { code: "agent_failed" }),
+			});
+			await harness.emitRun([0, 1], "agent_end", { messages: [{ role: "assistant", stopReason: "error" }] });
 			expect(await settledStatus(harness, "turn.prompt_status", firstIds)).toMatchObject({
 				status: "failed",
 				error: { code: "provider_rejected" },
@@ -4221,8 +4293,8 @@ describe("post-acceptance invocation terminalization", () => {
 			const accepted = await harness.control("turn.prompt", { text: "local malformed tool" });
 			expect(accepted.ok).toBe(true);
 			const ids = { commandId: accepted.result?.commandId, turnId: accepted.result?.turnId };
-			await harness.emit("agent_start");
-			await harness.emit("agent_end", {
+			await harness.emitRun(0, "agent_start");
+			await harness.emitRun(0, "agent_end", {
 				messages: [
 					{
 						role: "assistant",
@@ -4255,8 +4327,8 @@ describe("post-acceptance invocation terminalization", () => {
 			const accepted = await harness.control("turn.prompt", { text: "local composer policy" });
 			expect(accepted.ok).toBe(true);
 			const ids = { commandId: accepted.result?.commandId, turnId: accepted.result?.turnId };
-			await harness.emit("agent_start");
-			await harness.emit("agent_end", {
+			await harness.emitRun(0, "agent_start");
+			await harness.emitRun(0, "agent_end", {
 				messages: [
 					{
 						role: "assistant",
@@ -4289,14 +4361,14 @@ describe("post-acceptance invocation terminalization", () => {
 			const accepted = await harness.control("turn.prompt", { text: "provider metadata" });
 			expect(accepted.ok).toBe(true);
 			const ids = { commandId: accepted.result?.commandId, turnId: accepted.result?.turnId };
-			await harness.emit("agent_start");
+			await harness.emitRun(0, "agent_start");
 			const event = {} as Record<string, unknown>;
 			Object.defineProperty(event, "messages", {
 				get() {
 					throw new Error("provider metadata accessor failed");
 				},
 			});
-			await harness.emit("agent_end", event);
+			await harness.emitRun(0, "agent_end", event);
 			expect(await settledStatus(harness, "turn.prompt_status", ids)).toMatchObject({
 				status: "failed",
 				error: { code: "prompt_failed" },
@@ -4326,13 +4398,13 @@ describe("post-acceptance invocation terminalization", () => {
 			const first = await harness.control("turn.prompt", { text: "first", clientRef: "delayed-first" });
 			expect(first.ok).toBe(true);
 			const firstIds = { commandId: first.result?.commandId, turnId: first.result?.turnId };
-			await harness.emit("agent_start");
+			await harness.emitRun(0, "agent_start");
 			const replacement = await harness.control("turn.abort_and_prompt", { text: "replacement" });
 			expect(replacement).toMatchObject({ ok: true, result: { accepted: true } });
 			const replacementIds = { commandId: replacement.result?.commandId, turnId: replacement.result?.turnId };
-			await harness.emit("agent_start");
+			await harness.emitRun(1, "agent_start");
 			expect((await harness.query("turn.prompt_status", replacementIds)).result?.status).toBe("in_flight");
-			await harness.emit("agent_end", {
+			await harness.emitRun(0, "agent_end", {
 				messages: [{ role: "assistant", stopReason: "error", errorStatus: 402 }],
 			});
 			expect(await settledStatus(harness, "turn.prompt_status", firstIds)).toMatchObject({
@@ -4340,7 +4412,7 @@ describe("post-acceptance invocation terminalization", () => {
 				error: { code: "provider_http_402" },
 			});
 			expect((await harness.query("turn.prompt_status", replacementIds)).result?.status).toBe("in_flight");
-			await harness.emit("agent_end", {
+			await harness.emitRun(1, "agent_end", {
 				messages: [{ role: "assistant", stopReason: "stop", content: "completed" }],
 			});
 			expect(await settledStatus(harness, "turn.prompt_status", replacementIds)).toMatchObject({
@@ -4396,8 +4468,8 @@ describe("post-acceptance invocation terminalization", () => {
 				});
 				expect(first.ok).toBe(true);
 				const firstIds = { commandId: first.result?.commandId, turnId: first.result?.turnId };
-				await harness.emit("agent_start");
-				const end = harness.emit("agent_end", {
+				await harness.emitRun(0, "agent_start");
+				const end = harness.emitRun(0, "agent_end", {
 					messages: [{ role: "assistant", stopReason: "error", errorStatus: status }],
 				});
 				await entered.promise;
@@ -4467,8 +4539,8 @@ describe("post-acceptance invocation terminalization", () => {
 				const successor = await harness.control("turn.prompt", { text: "successor" });
 				expect(successor.ok).toBe(true);
 				const successorIds = { commandId: successor.result?.commandId, turnId: successor.result?.turnId };
-				await harness.emit("agent_start");
-				await harness.emit("agent_end", {
+				await harness.emitRun(1, "agent_start");
+				await harness.emitRun(1, "agent_end", {
 					messages: [{ role: "assistant", stopReason: "stop", content: "completed" }],
 				});
 				secondInflight.resolve();
@@ -4510,8 +4582,8 @@ describe("post-acceptance invocation terminalization", () => {
 				});
 				const first = await harness.control("turn.prompt", { text: "first" });
 				expect(first.ok).toBe(true);
-				await harness.emit("agent_start");
-				const end = harness.emit("agent_end", {
+				await harness.emitRun(0, "agent_start");
+				const end = harness.emitRun(0, "agent_end", {
 					messages: [{ role: "assistant", stopReason: "error", errorStatus: status }],
 				});
 				await entered.promise;
@@ -4542,10 +4614,10 @@ describe("post-acceptance invocation terminalization", () => {
 			const accepted = await harness.control("turn.prompt", { text: "hello" });
 			expect(accepted.ok).toBe(true);
 			const correlation = accepted.result;
-			await harness.emit("agent_start");
+			await harness.emitRun(0, "agent_start");
 			const failure = { error: Object.assign(new Error("provider failed"), { code: "provider_rejected" }) };
-			await harness.emit("agent_failed", failure);
-			await harness.emit("agent_failed", failure);
+			await harness.emitRun(0, "agent_failed", failure);
+			await harness.emitRun(0, "agent_failed", failure);
 			expect(
 				harness.broadcasts.filter(
 					frame =>
@@ -4554,7 +4626,7 @@ describe("post-acceptance invocation terminalization", () => {
 						(frame.payload as { turnId?: string }).turnId === correlation?.turnId,
 				),
 			).toHaveLength(1);
-			await harness.emit("agent_end");
+			await harness.emitRun(0, "agent_end");
 			inflight.resolve();
 			await harness.stop();
 		} finally {
@@ -4581,9 +4653,9 @@ describe("post-acceptance invocation terminalization", () => {
 			const first = await harness.control("turn.prompt", { text: "first" });
 			expect(first.ok).toBe(true);
 			const firstIds = { commandId: first.result?.commandId, turnId: first.result?.turnId };
-			await harness.emit("agent_start");
+			await harness.emitRun(0, "agent_start");
 			await harness.switchSession("retired-owner-b");
-			await harness.emit("agent_end", {
+			await harness.emitRun(0, "agent_end", {
 				messages: [{ role: "assistant", stopReason: "error", errorStatus: 402 }],
 			});
 			const failure = harness.broadcasts.find(frame => {
@@ -4600,8 +4672,8 @@ describe("post-acceptance invocation terminalization", () => {
 			const successor = await harness.control("turn.prompt", { text: "successor" });
 			expect(successor.ok).toBe(true);
 			const successorIds = { commandId: successor.result?.commandId, turnId: successor.result?.turnId };
-			await harness.emit("agent_start");
-			await harness.emit("agent_end", {
+			await harness.emitRun(1, "agent_start");
+			await harness.emitRun(1, "agent_end", {
 				messages: [{ role: "assistant", stopReason: "stop", content: "completed" }],
 			});
 			secondInflight.resolve();
@@ -4631,7 +4703,7 @@ describe("post-acceptance invocation terminalization", () => {
 			const first = await harness.control("turn.prompt", { text: "first" });
 			expect(first.ok).toBe(true);
 			const firstIds = { commandId: first.result?.commandId, turnId: first.result?.turnId };
-			await harness.emit("agent_start");
+			await harness.emitRun(0, "agent_start");
 			await harness.switchSession("different-session");
 			await harness.switchSession("reused-session");
 			await harness.emit("agent_start");
@@ -4669,11 +4741,11 @@ describe("post-acceptance invocation terminalization", () => {
 			const accepted = await harness.control("turn.prompt", { text: "hello" });
 			expect(accepted.ok).toBe(true);
 			const { commandId, turnId } = accepted.result ?? {};
-			await harness.emit("agent_start");
-			await harness.emit("agent_failed", {
+			await harness.emitRun(0, "agent_start");
+			await harness.emitRun(0, "agent_failed", {
 				error: Object.assign(new Error("stream interrupted"), { code: "upstream_stream_interrupted" }),
 			});
-			await harness.emit("agent_end");
+			await harness.emitRun(0, "agent_end");
 			// Provider text is redacted on the wire by contract (sanitizePromptFailure);
 			// the failure reason survives as the safe-token code.
 			expect(await settledStatus(harness, "turn.prompt_status", { commandId, turnId })).toMatchObject({
@@ -4709,9 +4781,11 @@ describe("post-acceptance invocation terminalization", () => {
 			});
 			const accepted = await harness.control("turn.prompt", { text: "hello" });
 			const { commandId, turnId } = accepted.result ?? {};
-			await harness.emit("agent_start");
-			await harness.emit("agent_failed", { error: Object.assign(new Error("turn aborted"), { code: "aborted" }) });
-			await harness.emit("agent_end");
+			await harness.emitRun(0, "agent_start");
+			await harness.emitRun(0, "agent_failed", {
+				error: Object.assign(new Error("turn aborted"), { code: "aborted" }),
+			});
+			await harness.emitRun(0, "agent_end");
 			expect(await settledStatus(harness, "turn.prompt_status", { commandId, turnId })).toMatchObject({
 				status: "failed",
 				error: { code: "aborted" },
@@ -4743,7 +4817,7 @@ describe("post-acceptance invocation terminalization", () => {
 			const first = await harness.control("turn.prompt", { text: "first" });
 			expect(first.ok).toBe(true);
 			const firstIds = { commandId: first.result?.commandId, turnId: first.result?.turnId };
-			await harness.emit("agent_start");
+			await harness.emitRun(0, "agent_start");
 			expect(await harness.control("turn.abort", {})).toMatchObject({ ok: true });
 			firstInflight.reject(Object.assign(new Error("turn aborted"), { code: "aborted" }));
 			const second = await harness.control("turn.prompt", { text: "successor" });
@@ -4751,9 +4825,9 @@ describe("post-acceptance invocation terminalization", () => {
 			const secondIds = { commandId: second.result?.commandId, turnId: second.result?.turnId };
 			expect(secondIds.commandId).not.toBe(firstIds.commandId);
 			expect(secondIds.turnId).not.toBe(firstIds.turnId);
-			await harness.emit("agent_start");
+			await harness.emitRun(1, "agent_start");
 			await successorStarted.promise;
-			await harness.emit("agent_end", {
+			await harness.emitRun(0, "agent_end", {
 				messages: [{ role: "assistant", content: "predecessor delayed" }],
 			});
 			expect(await harness.query("turn.prompt_status", secondIds)).toMatchObject({
@@ -4767,7 +4841,7 @@ describe("post-acceptance invocation terminalization", () => {
 			expect(firstResult).toMatchObject({
 				result: { status: "failed", content: { text: "predecessor delayed" } },
 			});
-			await harness.emit("agent_end", { messages: [{ role: "assistant", content: "completed" }] });
+			await harness.emitRun(1, "agent_end", { messages: [{ role: "assistant", content: "completed" }] });
 			expect(await settledStatus(harness, "turn.prompt_status", secondIds)).toMatchObject({
 				status: "terminal_ok",
 			});
@@ -4812,13 +4886,13 @@ describe("post-acceptance invocation terminalization", () => {
 			});
 			const first = await harness.control("turn.prompt", { text: "first" });
 			expect(first.ok).toBe(true);
-			await harness.emit("agent_start");
+			await harness.emitRun(0, "agent_start");
 			expect(await harness.control("turn.abort", {})).toMatchObject({ ok: true });
 			firstInflight.reject(Object.assign(new Error("turn aborted"), { code: "aborted" }));
 			const successor = await harness.control("turn.prompt", { text: "successor" });
 			expect(successor.ok).toBe(true);
 			const successorIds = { commandId: successor.result?.commandId, turnId: successor.result?.turnId };
-			await harness.emit("agent_start");
+			await harness.emitRun(1, "agent_start");
 			await successorStarted.promise;
 			for (let index = 0; index < 4; index += 1) {
 				await harness.emit("tool_execution_start");
@@ -4827,8 +4901,8 @@ describe("post-acceptance invocation terminalization", () => {
 			expect(await harness.query("turn.prompt_status", successorIds)).toMatchObject({
 				result: { status: expect.stringMatching(/accepted|in_flight/) },
 			});
-			await harness.emit("agent_end", { messages: [{ role: "assistant", content: "completed" }] });
-			await harness.emit("agent_end", { messages: [{ role: "assistant", content: "completed" }] });
+			await harness.emitRun(0, "agent_end", { messages: [{ role: "assistant", content: "completed" }] });
+			await harness.emitRun(1, "agent_end", { messages: [{ role: "assistant", content: "completed" }] });
 			expect(await settledStatus(harness, "turn.prompt_status", successorIds)).toMatchObject({
 				status: "terminal_ok",
 			});
@@ -4863,13 +4937,13 @@ describe("post-acceptance invocation terminalization", () => {
 			});
 			const first = await harness.control("turn.prompt", { text: "first" });
 			expect(first.ok).toBe(true);
-			await harness.emit("agent_start");
+			await harness.emitRun(0, "agent_start");
 			await harness.switchSession("reused-successor-progress-other");
 			await harness.switchSession("reused-successor-progress");
 			const successor = await harness.control("turn.prompt", { text: "successor" });
 			expect(successor.ok).toBe(true);
 			const successorIds = { commandId: successor.result?.commandId, turnId: successor.result?.turnId };
-			await harness.emit("agent_start");
+			await harness.emitRun(1, "agent_start");
 			await successorStarted.promise;
 			for (let index = 0; index < 4; index += 1) {
 				await harness.emit("tool_execution_start");
@@ -4878,7 +4952,7 @@ describe("post-acceptance invocation terminalization", () => {
 			expect(await harness.query("turn.prompt_status", successorIds)).toMatchObject({
 				result: { status: expect.stringMatching(/accepted|in_flight/) },
 			});
-			await harness.emit("agent_end");
+			await harness.emitRun(0, "agent_end");
 			firstInflight.resolve();
 			await harness.stop();
 			expect(prompts).toBe(2);
@@ -4907,16 +4981,16 @@ describe("post-acceptance invocation terminalization", () => {
 			});
 			const first = await harness.control("turn.prompt", { text: "first" });
 			expect(first.ok).toBe(true);
-			await harness.emit("agent_start");
+			await harness.emitRun(0, "agent_start");
 			const replacement = harness.control("turn.abort_and_prompt", { text: "replacement" });
 			firstInflight.reject(Object.assign(new Error("turn aborted"), { code: "aborted" }));
-			await harness.emit("agent_end");
+			await harness.emitRun(0, "agent_end");
 			abortReleased.resolve();
 			const accepted = await replacement;
 			expect(accepted.ok).toBe(true);
 			const successorIds = { commandId: accepted.result?.commandId, turnId: accepted.result?.turnId };
-			await harness.emit("agent_start");
-			await harness.emit("agent_end", { messages: [{ role: "assistant", content: "completed" }] });
+			await harness.emitRun(1, "agent_start");
+			await harness.emitRun(1, "agent_end", { messages: [{ role: "assistant", content: "completed" }] });
 			expect(await settledStatus(harness, "turn.prompt_status", successorIds)).toMatchObject({
 				status: "terminal_ok",
 			});
@@ -4940,11 +5014,11 @@ describe("post-acceptance invocation terminalization", () => {
 			const accepted = await harness.control("skill.invoke", { name: "ralplan" });
 			expect(accepted.ok).toBe(true);
 			const { commandId, turnId } = accepted.result ?? {};
-			await harness.emit("agent_start");
-			await harness.emit("agent_failed", {
+			await harness.emitRun(0, "agent_start");
+			await harness.emitRun(0, "agent_failed", {
 				error: Object.assign(new Error("skill provider stream interrupted"), { code: "upstream_error" }),
 			});
-			await harness.emit("agent_end");
+			await harness.emitRun(0, "agent_end");
 			expect(await settledStatus(harness, "skill.invoke_status", { commandId, turnId })).toMatchObject({
 				status: "failed",
 				error: { code: "upstream_error" },
@@ -4999,8 +5073,8 @@ describe("post-acceptance invocation terminalization", () => {
 					},
 				});
 				const accepted = await harness.control("turn.prompt", { text: "hello" });
-				await harness.emit("agent_start");
-				await harness.emit("agent_end", { messages: [{ role: "assistant", content: testCase.agent }] });
+				await harness.emitRun(0, "agent_start");
+				await harness.emitRun(0, "agent_end", { messages: [{ role: "assistant", content: testCase.agent }] });
 				const result = await settledStatus(harness, "turn.result", {
 					kind: "prompt",
 					commandId: accepted.result?.commandId,
@@ -5035,8 +5109,8 @@ describe("post-acceptance invocation terminalization", () => {
 				},
 			});
 			const accepted = await harness.control("turn.prompt", { text: "hello" });
-			await harness.emit("agent_start");
-			await harness.emit("agent_end", {
+			await harness.emitRun(0, "agent_start");
+			await harness.emitRun(0, "agent_end", {
 				messages: [
 					{
 						role: "assistant",
@@ -5072,8 +5146,8 @@ describe("post-acceptance invocation terminalization", () => {
 			});
 			const successor = await harness.control("turn.prompt", { text: "successor" });
 			expect(successor).toMatchObject({ ok: true, result: { accepted: true } });
-			await harness.emit("agent_start");
-			await harness.emit("agent_end", { messages: [{ role: "assistant", content: "completed" }] });
+			await harness.emitRun(1, "agent_start");
+			await harness.emitRun(1, "agent_end", { messages: [{ role: "assistant", content: "completed" }] });
 			expect(
 				await settledStatus(harness, "turn.result", {
 					kind: "prompt",
@@ -5119,8 +5193,8 @@ describe("post-acceptance invocation terminalization", () => {
 					},
 				});
 				const accepted = await harness.control("turn.prompt", { text: "hello" });
-				await harness.emit("agent_start");
-				await harness.emit("agent_end", {
+				await harness.emitRun(0, "agent_start");
+				await harness.emitRun(0, "agent_end", {
 					messages: [
 						{
 							role: "assistant",
@@ -5152,8 +5226,8 @@ describe("post-acceptance invocation terminalization", () => {
 				},
 			});
 			const accepted = await harness.control("turn.prompt", { text: "hello" });
-			await harness.emit("agent_start");
-			await harness.emit("agent_end", {
+			await harness.emitRun(0, "agent_start");
+			await harness.emitRun(0, "agent_end", {
 				messages: [
 					{
 						role: "assistant",
@@ -5251,8 +5325,8 @@ describe("post-acceptance invocation terminalization", () => {
 					},
 				});
 				const accepted = await harness.control("turn.prompt", { text: "hello" });
-				await harness.emit("agent_start");
-				await harness.emit("agent_end", {
+				await harness.emitRun(0, "agent_start");
+				await harness.emitRun(0, "agent_end", {
 					messages: [
 						{
 							role: "assistant",
@@ -5295,8 +5369,8 @@ describe("post-acceptance invocation terminalization", () => {
 				},
 			});
 			const accepted = await harness.control("turn.prompt", { text: "hello" });
-			await harness.emit("agent_start");
-			await harness.emit("agent_end", {
+			await harness.emitRun(0, "agent_start");
+			await harness.emitRun(0, "agent_end", {
 				stopReason: "cancelled",
 				messages: [
 					{
@@ -5337,8 +5411,8 @@ describe("post-acceptance invocation terminalization", () => {
 				commandId: accepted.result?.commandId,
 				turnId: accepted.result?.turnId,
 			};
-			await harness.emit("agent_start");
-			await harness.emit("agent_end", { messages: [] });
+			await harness.emitRun(0, "agent_start");
+			await harness.emitRun(0, "agent_end", { messages: [] });
 			const result = await settledStatus(harness, "turn.result", selector);
 			expect((result as Record<string, unknown>).content).toBeUndefined();
 			await harness.stop();
@@ -5432,9 +5506,9 @@ describe("post-acceptance invocation terminalization", () => {
 					commandId: accepted.result?.commandId,
 					turnId: accepted.result?.turnId,
 				};
-				await harness.emit("agent_start");
+				await harness.emitRun(0, "agent_start");
 				const emitAgentEnd = () =>
-					harness.emit("agent_end", {
+					harness.emitRun(0, "agent_end", {
 						messages: testCase.agent === null ? [] : [{ role: "assistant", content: testCase.agent }],
 					});
 				if (testCase.order === "completion-first") {
@@ -5594,14 +5668,14 @@ describe("post-acceptance invocation terminalization", () => {
 			});
 			const accepted = await harness.control("turn.prompt", { text: "hello" });
 			const { commandId, turnId } = accepted.result ?? {};
-			await harness.emit("agent_start");
-			await harness.emit("agent_end", { messages: [{ role: "assistant", content: "completed" }] });
+			await harness.emitRun(0, "agent_start");
+			await harness.emitRun(0, "agent_end", { messages: [{ role: "assistant", content: "completed" }] });
 			const claimed = await settledStatus(harness, "turn.prompt_status", { commandId, turnId });
 			expect(claimed).toMatchObject({ status: "terminal_ok" });
 			inflight.reject(Object.assign(new Error("late provider failure"), { code: "upstream_error" }));
 			await Bun.sleep(20);
 			// A lifecycle frame arriving after the terminal must not resurrect the record either.
-			await harness.emit("agent_start");
+			await harness.emitRun(0, "agent_start");
 			const settled = await harness.query("turn.prompt_status", { commandId, turnId });
 			// A rejected submission after terminal publication is only a cleanup diagnostic.
 			expect(settled.result).toEqual(claimed);
@@ -5714,7 +5788,7 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 			});
 			const first = await harness.control("turn.prompt", { text: "first" });
 			expect(first.ok).toBe(true);
-			await harness.emit("agent_start");
+			await harness.emitRun(0, "agent_start");
 			const followUpB = await harness.control("turn.follow_up", { text: "b" });
 			const followUpC = await harness.control("turn.follow_up", { text: "c" });
 			expect(followUpB.ok).toBe(true);
@@ -5724,7 +5798,7 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 			// agent_start drains the batch.
 			promoted[0]?.({ startsOwnRun: true });
 			promoted[1]?.({ startsOwnRun: true });
-			await harness.emit("agent_start");
+			await harness.emitRun([1, 2], "agent_start");
 			const idsB = { commandId: followUpB.result?.commandId, turnId: followUpB.result?.turnId };
 			const idsC = { commandId: followUpC.result?.commandId, turnId: followUpC.result?.turnId };
 			for (const ids of [idsB, idsC]) {
@@ -5757,17 +5831,17 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 			});
 			const first = await harness.control("turn.prompt", { text: "first" });
 			expect(first.ok).toBe(true);
-			await harness.emit("agent_start");
-			await harness.emit("agent_end", { messages: [{ role: "assistant", content: "completed" }] });
+			await harness.emitRun(0, "agent_start");
+			await harness.emitRun(0, "agent_end", { messages: [{ role: "assistant", content: "completed" }] });
 			const followUpB = await harness.control("turn.follow_up", { text: "b" });
 			const followUpC = await harness.control("turn.follow_up", { text: "c" });
 			promoted[0]?.({ startsOwnRun: true });
 			promoted[1]?.({ startsOwnRun: true });
-			await harness.emit("agent_start");
-			await harness.emit("agent_failed", {
+			await harness.emitRun([1, 2], "agent_start");
+			await harness.emitRun([1, 2], "agent_failed", {
 				error: Object.assign(new Error("provider failed"), { code: "provider_unavailable" }),
 			});
-			await harness.emit("agent_end");
+			await harness.emitRun([1, 2], "agent_end");
 			for (const response of [followUpB, followUpC]) {
 				const ids = { commandId: response.result?.commandId, turnId: response.result?.turnId };
 				expect(await settledStatus(harness, "turn.prompt_status", ids)).toMatchObject({
@@ -5806,12 +5880,12 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 			});
 			const first = await harness.control("turn.prompt", { text: "first" });
 			expect(first.ok).toBe(true);
-			await harness.emit("agent_start");
+			await harness.emitRun(0, "agent_start");
 			const followUp = await harness.control("turn.follow_up", { text: "replacement" });
 			expect(followUp.ok).toBe(true);
 			promoted?.({ startsOwnRun: true });
 			// Re-entry with a non-empty drain while the first turn never ended.
-			await harness.emit("agent_start");
+			await harness.emitRun(1, "agent_start");
 			const idsFirst = { commandId: first.result?.commandId, turnId: first.result?.turnId };
 			const idsFollowUp = { commandId: followUp.result?.commandId, turnId: followUp.result?.turnId };
 			expect(await settledStatus(harness, "turn.prompt_status", idsFirst)).toMatchObject({
@@ -5850,7 +5924,7 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 			});
 			const first = await harness.control("turn.prompt", { text: "first" });
 			expect(first.ok).toBe(true);
-			await harness.emit("agent_start");
+			await harness.emitRun(0, "agent_start");
 			const followUp = await harness.control("turn.follow_up", { text: "promoted" });
 			expect(followUp.ok).toBe(true);
 			// Promotion to its own run fires, but the run's agent_start never arrives.
@@ -5896,7 +5970,7 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 			});
 			const first = await harness.control("turn.prompt", { text: "first" });
 			expect(first.ok).toBe(true);
-			await harness.emit("agent_start");
+			await harness.emitRun(0, "agent_start");
 			const consumed = await harness.control("turn.follow_up", { text: "consumed" });
 			expect(consumed.ok).toBe(true);
 			promoted?.({ startsOwnRun: false });
@@ -5910,7 +5984,7 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 			}
 			const midRun = await harness.query("turn.prompt_status", ids);
 			expect(midRun.result?.status).not.toBe("failed");
-			await harness.emit("agent_end", { messages: [{ role: "assistant", content: "completed" }] });
+			await harness.emitRun([0, 1], "agent_end", { messages: [{ role: "assistant", content: "completed" }] });
 			const final = await harness.query("turn.prompt_status", ids);
 			expect(final.result?.status).toBe("terminal_ok");
 			await harness.stop();
@@ -5929,6 +6003,7 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 		let idle = true;
 		const handlers = new Map<string, (event: unknown, ctx: ExtensionContext) => Promise<void> | void>();
 		let promoted: ((promotion: { startsOwnRun: boolean }) => void) | undefined;
+		const sdkRunTokens: Array<string | undefined> = [];
 		const api = {
 			on(event: string, handler: (event: unknown, ctx: ExtensionContext) => Promise<void> | void) {
 				handlers.set(event, handler);
@@ -5938,10 +6013,12 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 				options:
 					| {
 							onPreflightAcceptCommit?: () => Promise<void>;
+							sdkRunCapability?: unknown;
 							onQueuedPromoted?: (promotion: { startsOwnRun?: boolean; removed?: boolean }) => void;
 					  }
 					| undefined,
 			) => {
+				sdkRunTokens.push(readSdkRunCapability(options?.sdkRunCapability));
 				await options?.onPreflightAcceptCommit?.();
 				if (content === "consumed") {
 					promoted = options?.onQueuedPromoted;
@@ -5991,7 +6068,7 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 			} as SdkFrame);
 			await waitFrame("inrun-a");
 			idle = false;
-			await handlers.get("agent_start")?.({}, ctx);
+			await handlers.get("agent_start")?.({ sdkRunToken: sdkRunTokens[0] }, ctx);
 			// conn-b's prompt is queued while streaming, then CONSUMED inside the
 			// running turn (no new agent_start for it).
 			transport.feed("conn-b", {
@@ -6005,7 +6082,14 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 			// The consuming run ends. The consumed submission must terminalize
 			// WITH it (terminal_ok, never a fabricated prompt_deadline_exceeded):
 			// with the bug it would still be parked in pending as merely accepted.
-			await handlers.get("agent_end")?.({ messages: [{ role: "assistant", content: "completed" }] }, ctx);
+			await handlers.get("agent_end")?.(
+				{
+					sdkRunToken: sdkRunTokens[0],
+					sdkRunTokens: sdkRunTokens.slice(0, 2),
+					messages: [{ role: "assistant", content: "completed" }],
+				},
+				ctx,
+			);
 			const statusOf = async (ids: { commandId?: string; turnId?: string }, frameId: string) => {
 				transport.feed("conn-a", {
 					type: "query_request",
@@ -6026,7 +6110,7 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 				input: { text: "later" },
 			} as SdkFrame);
 			await waitFrame("inrun-c");
-			await handlers.get("agent_start")?.({}, ctx);
+			await handlers.get("agent_start")?.({ sdkRunToken: sdkRunTokens[2] }, ctx);
 			transport.feed("conn-b", {
 				type: "control_request",
 				id: "inrun-abort-b",
@@ -6073,7 +6157,7 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 			});
 			const first = await harness.control("turn.prompt", { text: "first" });
 			expect(first.ok).toBe(true);
-			await harness.emit("agent_start");
+			await harness.emitRun(0, "agent_start");
 			const raced = await harness.control("turn.prompt", { text: "raced" });
 			expect(raced.ok).toBe(true);
 			const idsRaced = { commandId: raced.result?.commandId, turnId: raced.result?.turnId };
@@ -6083,7 +6167,7 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 			expect(midRun.result?.status).not.toBe("terminal_ok");
 			expect(midRun.result?.status).not.toBe("failed");
 			// The in-flight run ends: the diverted correlation terminalizes with it.
-			await harness.emit("agent_end", { messages: [{ role: "assistant", content: "completed" }] });
+			await harness.emitRun([0, 1], "agent_end", { messages: [{ role: "assistant", content: "completed" }] });
 			expect(await settledStatus(harness, "turn.prompt_status", idsRaced)).toMatchObject({
 				status: "terminal_ok",
 			});
@@ -6131,7 +6215,7 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 			});
 			const first = await harness.control("turn.prompt", { text: "first" });
 			expect(first.ok).toBe(true);
-			await harness.emit("agent_start");
+			await harness.emitRun(0, "agent_start");
 			const raced = await harness.control("turn.prompt", { text: "raced" });
 			expect(raced.ok).toBe(true);
 			const idsRaced = { commandId: raced.result?.commandId, turnId: raced.result?.turnId };
@@ -6142,7 +6226,9 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 			expect(queued.result?.status).not.toBe("failed");
 			// Real consumption re-leases and attaches to the in-flight run.
 			consumed?.({ startsOwnRun: false });
-			await harness.emit("agent_end", { messages: [{ role: "assistant", content: "completed" }] });
+			// The first submission's lease expired while this one was parked. Route
+			// the shared terminal through the freshly consumed, live correlation.
+			await harness.emitRun([1, 0], "agent_end", { messages: [{ role: "assistant", content: "completed" }] });
 			expect(await settledStatus(harness, "turn.prompt_status", idsRaced)).toMatchObject({
 				status: "terminal_ok",
 			});
@@ -6214,14 +6300,14 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 			});
 			const submitted = await harness.control("turn.prompt", { text: "run", clientRef: "end-reason-ref" });
 			expect(submitted.ok).toBe(true);
-			await harness.emit("agent_start");
+			await harness.emitRun(0, "agent_start");
 			// The first agent_failed write and the agent_end re-record both fail.
 			// The deadline owner must retain the sanitized reason and replay the
 			// compound reason+boundary transition after persistence recovers.
-			await harness.emit("agent_failed", {
+			await harness.emitRun(0, "agent_failed", {
 				error: Object.assign(new Error("provider exploded"), { code: "provider_unavailable" }),
 			});
-			await harness.emit("agent_end");
+			await harness.emitRun(0, "agent_end");
 			const settled = await settledStatus(harness, "turn.prompt_status", { clientRef: "end-reason-ref" });
 			expect(failedWrites).toBeGreaterThan(0);
 			expect(settled.status).toBe("failed");
@@ -6301,8 +6387,8 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 				clientRef: "skill-terminal-retry-ref",
 			});
 			expect(submitted.ok).toBe(true);
-			await harness.emit("agent_start");
-			await harness.emit("agent_end");
+			await harness.emitRun(0, "agent_start");
+			await harness.emitRun(0, "agent_end");
 			let settled: { status?: string } | undefined;
 			for (let attempt = 0; attempt < 500 && settled === undefined; attempt += 1) {
 				const frame = await harness.query("skill.invoke_status", { clientRef: "skill-terminal-retry-ref" });
@@ -6341,8 +6427,8 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 				clientRef: "skill-terminal-replacement-ref",
 			});
 			expect(submitted.ok).toBe(true);
-			await harness.emit("agent_start");
-			await harness.emit("agent_end");
+			await harness.emitRun(0, "agent_start");
+			await harness.emitRun(0, "agent_end");
 			await Bun.sleep(50);
 			await harness.switchSession("skill-terminal-replacement-next");
 			await Bun.sleep(1_100);
@@ -6456,15 +6542,15 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 			});
 			const first = await harness.control("turn.prompt", { text: "first" });
 			expect(first.ok).toBe(true);
-			await harness.emit("agent_start");
+			await harness.emitRun(0, "agent_start");
 			const attached = await harness.control("turn.follow_up", { text: "attached" });
 			expect(attached.ok).toBe(true);
 			promoted?.({ startsOwnRun: false });
 			const idsAttached = { commandId: attached.result?.commandId, turnId: attached.result?.turnId };
-			await harness.emit("agent_failed", {
+			await harness.emitRun([0, 1], "agent_failed", {
 				error: Object.assign(new Error("provider unavailable"), { code: "provider_unavailable" }),
 			});
-			await harness.emit("agent_end");
+			await harness.emitRun([0, 1], "agent_end");
 			expect(await settledStatus(harness, "turn.prompt_status", idsAttached)).toMatchObject({
 				status: "failed",
 				error: { code: "provider_unavailable" },
@@ -6491,8 +6577,8 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 			const failing = await harness.control("turn.prompt", { text: "failing" });
 			expect(failing.ok).toBe(true);
 			const idsFailing = { commandId: failing.result?.commandId, turnId: failing.result?.turnId };
-			await harness.emit("agent_start");
-			await harness.emit("agent_failed", {
+			await harness.emitRun(0, "agent_start");
+			await harness.emitRun(0, "agent_failed", {
 				error: Object.assign(new Error("provider unavailable"), { code: "provider_unavailable" }),
 			});
 			const diagnosticFrames = harness.broadcasts.filter(frame => frame.kind === "agent_failed");
@@ -6508,7 +6594,7 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 			});
 			expect(JSON.stringify(diagnosticFrames[0])).not.toContain("provider unavailable");
 			expect((await harness.query("turn.prompt_status", idsFailing)).result?.status).toBe("in_flight");
-			await harness.emit("agent_end");
+			await harness.emitRun(0, "agent_end");
 			expect(await settledStatus(harness, "turn.prompt_status", idsFailing)).toMatchObject({
 				status: "failed",
 				error: { code: "provider_unavailable" },
@@ -6527,14 +6613,16 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 		// the old requester an owner of a turn it did not start.
 		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-settle-early-owner-"));
 		const handlers = new Map<string, (event: unknown, ctx: ExtensionContext) => Promise<void> | void>();
+		const sdkRunTokens: Array<string | undefined> = [];
 		const api = {
 			on(event: string, handler: (event: unknown, ctx: ExtensionContext) => Promise<void> | void) {
 				handlers.set(event, handler);
 			},
 			sendUserMessage: async (
 				content: string,
-				options: { onPreflightAcceptCommit?: () => Promise<void> } | undefined,
+				options: { sdkRunCapability?: unknown; onPreflightAcceptCommit?: () => Promise<void> } | undefined,
 			) => {
+				sdkRunTokens.push(readSdkRunCapability(options?.sdkRunCapability));
 				await options?.onPreflightAcceptCommit?.();
 				if (content === "hangs") await neverSettlingPromise();
 			},
@@ -6608,7 +6696,7 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 				input: { text: "hangs" },
 			} as SdkFrame);
 			await waitFrame("settle-early-b");
-			await handlers.get("agent_start")?.({}, ctx);
+			await handlers.get("agent_start")?.({ sdkRunToken: sdkRunTokens[1] }, ctx);
 			// conn-a must NOT be an owner of conn-b's turn.
 			transport.feed("conn-a", {
 				type: "control_request",
@@ -6925,11 +7013,16 @@ test("SDK-only host keeps the idle-submitted prompt's owner when isIdle flips du
 	const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-startsown-snapshot-"));
 	let idle = true;
 	const handlers = new Map<string, (event: unknown, ctx: ExtensionContext) => Promise<void> | void>();
+	let sdkRunToken: string | undefined;
 	const api = {
 		on(event: string, handler: (event: unknown, ctx: ExtensionContext) => Promise<void> | void) {
 			handlers.set(event, handler);
 		},
-		sendUserMessage: async (_content: string, options: { onPreflightAcceptCommit?: () => Promise<void> }) => {
+		sendUserMessage: async (
+			_content: string,
+			options: { sdkRunCapability?: unknown; onPreflightAcceptCommit?: () => Promise<void> },
+		) => {
+			sdkRunToken = readSdkRunCapability(options.sdkRunCapability);
 			await options?.onPreflightAcceptCommit?.();
 			// The session's in-flight bookkeeping begins during the accept
 			// window: a re-read of isIdle() now reports streaming.
@@ -6974,7 +7067,7 @@ test("SDK-only host keeps the idle-submitted prompt's owner when isIdle flips du
 		expect(transport.sent.find(frame => frame.id === "idle-owner-prompt")).toMatchObject({ ok: true });
 		// The run starts: the dispatch-time idle snapshot recorded the pending
 		// owner for the submitting connection.
-		await handlers.get("agent_start")?.({}, ctx);
+		await handlers.get("agent_start")?.({ sdkRunToken }, ctx);
 		transport.feed("client", {
 			type: "control_request",
 			id: "idle-owner-abort",
@@ -7144,6 +7237,7 @@ test("SDK-only host does not assign a follow-up requester ownership until the fo
 	const idle = true;
 	let promoted: ((promotion: { startsOwnRun: boolean }) => void) | undefined;
 	const handlers = new Map<string, (event: unknown, ctx: ExtensionContext) => Promise<void> | void>();
+	let sdkRunToken: string | undefined;
 	const api = {
 		on(event: string, handler: (event: unknown, ctx: ExtensionContext) => Promise<void> | void) {
 			handlers.set(event, handler);
@@ -7153,12 +7247,14 @@ test("SDK-only host does not assign a follow-up requester ownership until the fo
 			options:
 				| {
 						onPreflightAccepted?: () => void;
+						sdkRunCapability?: unknown;
 						onPreflightAcceptCommit?: () => void;
 						onQueuedPromoted?: (promotion: { startsOwnRun?: boolean; removed?: boolean }) => void;
 				  }
 				| undefined,
 		) =>
 			Promise.resolve(options?.onPreflightAcceptCommit?.()).then(() => {
+				sdkRunToken = readSdkRunCapability(options?.sdkRunCapability);
 				promoted = options?.onQueuedPromoted;
 				options?.onPreflightAccepted?.();
 				return {};
@@ -7228,7 +7324,7 @@ test("SDK-only host does not assign a follow-up requester ownership until the fo
 		expect(seamCalls).toHaveLength(0);
 		// When the follow-up IS promoted, B owns its run and can abort it.
 		promoted!({ startsOwnRun: true });
-		await handlers.get("agent_start")?.({ type: "agent_start" }, ctx);
+		await handlers.get("agent_start")?.({ type: "agent_start", sdkRunToken }, ctx);
 		transport.feed("conn-b", {
 			type: "control_request",
 			id: "followup-abort-2",
@@ -7257,6 +7353,7 @@ test("SDK-only host lets every connection whose follow-up was promoted abort the
 	const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-multi-followup-"));
 	const promoted: Array<(promotion: { startsOwnRun: boolean }) => void> = [];
 	const handlers = new Map<string, (event: unknown, ctx: ExtensionContext) => Promise<void> | void>();
+	const sdkRunTokens: Array<string | undefined> = [];
 	const api = {
 		on(event: string, handler: (event: unknown, ctx: ExtensionContext) => Promise<void> | void) {
 			handlers.set(event, handler);
@@ -7266,12 +7363,14 @@ test("SDK-only host lets every connection whose follow-up was promoted abort the
 			options:
 				| {
 						onPreflightAccepted?: () => void;
+						sdkRunCapability?: unknown;
 						onPreflightAcceptCommit?: () => void;
 						onQueuedPromoted?: (promotion: { startsOwnRun?: boolean; removed?: boolean }) => void;
 				  }
 				| undefined,
 		) =>
 			Promise.resolve(options?.onPreflightAcceptCommit?.()).then(() => {
+				sdkRunTokens.push(readSdkRunCapability(options?.sdkRunCapability));
 				if (options?.onQueuedPromoted) promoted.push(options.onQueuedPromoted);
 				options?.onPreflightAccepted?.();
 				return "completed";
@@ -7323,7 +7422,7 @@ test("SDK-only host lets every connection whose follow-up was promoted abort the
 		// ONE continuation drains both follow-ups into one run: both per-message
 		// hooks fire at dequeue, then the run starts.
 		for (const hook of promoted) hook({ startsOwnRun: true });
-		await handlers.get("agent_start")?.({ type: "agent_start" }, ctx);
+		await handlers.get("agent_start")?.({ type: "agent_start", sdkRunToken: sdkRunTokens[0], sdkRunTokens }, ctx);
 		// Both submitting connections can terminal-abort the shared run.
 		for (const [connectionId, id] of [
 			["conn-a", "multi-abort-a"],
@@ -7362,7 +7461,10 @@ test("SDK-only host lets every connection whose follow-up was promoted abort the
 		// invocation left the remaining follow-ups durably accepted — their
 		// result lookups would never complete and a restart would report them
 		// failed even though they ran in the shared turn.
-		await handlers.get("agent_end")?.({ type: "agent_end", stopReason: "cancelled", messages: [] }, ctx);
+		await handlers.get("agent_end")?.(
+			{ type: "agent_end", sdkRunToken: sdkRunTokens[0], sdkRunTokens, stopReason: "cancelled", messages: [] },
+			ctx,
+		);
 		{
 			const terminalDeadline = Date.now() + 15_000;
 			const promptStatuses = () =>
@@ -7477,8 +7579,8 @@ describe("rejection terminalization idempotency", () => {
 			const accepted = await harness.control("turn.prompt", { text: "complete before cleanup" });
 			expect(accepted.ok).toBe(true);
 			const ids = { commandId: accepted.result?.commandId, turnId: accepted.result?.turnId };
-			await harness.emit("agent_start");
-			await harness.emit("agent_end", {
+			await harness.emitRun(0, "agent_start");
+			await harness.emitRun(0, "agent_end", {
 				messages: [{ role: "assistant", content: [{ type: "text", text: "Completed." }], stopReason: "stop" }],
 			});
 			const before = await settledStatus(harness, "turn.result", { kind: "prompt", ...ids });

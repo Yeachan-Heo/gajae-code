@@ -14,6 +14,8 @@ export interface CoordinatorAtomicWriteOptions
 	extends CoordinatorDirectoryBarrierOptions,
 		CoordinatorFileDurabilityOptions {
 	rename?: (source: string, destination: string) => Promise<void>;
+	/** Synchronous authority fence, checked after preparation immediately before publication. */
+	isCurrent?: () => boolean;
 }
 
 /** The file was published, but its final directory barrier did not complete. */
@@ -148,11 +150,21 @@ export async function appendCoordinatorFile(
 }
 
 /** Atomically publish a synced coordinator state file, then barrier its parent. */
+export function writeCoordinatorAtomic(
+	file: string,
+	contents: string,
+	options: CoordinatorAtomicWriteOptions & { isCurrent: () => boolean },
+): Promise<"persisted" | "stale">;
+export function writeCoordinatorAtomic(
+	file: string,
+	contents: string,
+	options?: CoordinatorAtomicWriteOptions,
+): Promise<undefined>;
 export async function writeCoordinatorAtomic(
 	file: string,
 	contents: string,
 	options: CoordinatorAtomicWriteOptions = {},
-): Promise<void> {
+): Promise<undefined | "persisted" | "stale"> {
 	await ensureCoordinatorDirectory(path.dirname(file), options);
 	const temporary = `${file}.${process.pid}.${crypto.randomUUID()}.tmp`;
 	let published = false;
@@ -172,9 +184,15 @@ export async function writeCoordinatorAtomic(
 			throw closeError;
 		}
 		if (writeError) throw writeError;
+		if (options.isCurrent && !options.isCurrent()) {
+			await fs.rm(temporary, { force: true });
+			await syncCoordinatorDirectory(path.dirname(file), options);
+			return "stale";
+		}
 		await (options.rename ?? fs.rename)(temporary, file);
 		published = true;
 		await syncCoordinatorDirectory(path.dirname(file), options);
+		if (options.isCurrent) return "persisted";
 	} catch (error) {
 		let cleanupError: unknown;
 		try {

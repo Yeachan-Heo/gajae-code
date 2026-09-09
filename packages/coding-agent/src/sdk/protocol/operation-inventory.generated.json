@@ -3808,6 +3808,17 @@
 		]
 	},
 	{
+		"sourceId": "agent_session:submitQueuedInput",
+		"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
+		"sourceKind": "agent_session",
+		"decision": "exclude",
+		"rationale": "public in-process queued-input ownership API; transport dispatch uses turn.steer/turn.follow_up, not a separate wire operation or wire submission handle",
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
+	},
+	{
 		"sourceId": "agent_session:queueDeferredMessage",
 		"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
 		"sourceKind": "agent_session",

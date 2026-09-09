@@ -1,6 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import type { QueuedInputEvent, QueuedInputSubmission } from "@gajae-code/coding-agent";
 import type {
 	ActiveProviderConnectionKind,
 	ActiveProviderDescriptor,
@@ -45,6 +46,8 @@ const q29DtoTypes: [ActiveProviderDescriptor, ActiveProviderConnectionKind] | un
 
 void sdkCapabilityDtoTypes;
 void q29DtoTypes;
+const queuedInputDtoTypes: [QueuedInputEvent, QueuedInputSubmission] | undefined = undefined;
+void queuedInputDtoTypes;
 
 describe("SDK package exports", () => {
 	it("preserves the session SDK surface and bus namespace after the namespace move", () => {
@@ -78,6 +81,8 @@ describe("SDK package exports", () => {
 		"@gajae-code/coding-agent/sdk/startup-capability.js",
 		"@gajae-code/coding-agent/sdk/providers",
 		"@gajae-code/coding-agent/sdk/providers.js",
+		"@gajae-code/coding-agent/session/committed-prompt-failure",
+		"@gajae-code/coding-agent/session/committed-prompt-failure.js",
 	])("rejects resolution of the private %s subpath", async subpath => {
 		const child = Bun.spawn([process.execPath, "-e", `await import(${JSON.stringify(subpath)})`], {
 			cwd: import.meta.dir,
@@ -132,6 +137,8 @@ describe("SDK package exports", () => {
 			"./sdk/startup-capability.js",
 			"./sdk/providers",
 			"./sdk/providers.js",
+			"./session/committed-prompt-failure",
+			"./session/committed-prompt-failure.js",
 		] as const)
 			expect(packageJson.exports[subpath]).toBeNull();
 	});

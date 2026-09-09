@@ -10,8 +10,9 @@ import {
 	mapAgentWireEventPayloadToAcpSessionUpdates,
 	normalizeReplayToolArguments,
 } from "../src/modes/acp/acp-event-mapper";
+import type { AgentWireSessionEvent } from "../src/modes/shared/agent-wire/event-contract";
 import { toAgentWireEventPayload } from "../src/modes/shared/agent-wire/event-envelope";
-import type { AgentSessionEvent } from "../src/session/agent-session";
+import type { AgentSessionEvent, QueuedInputEvent } from "../src/session/agent-session";
 import { expectAcpStructure, expectAcpStructureRejects } from "./helpers/acp-schema";
 
 const zSessionNotification = fromJSONSchema({
@@ -52,6 +53,36 @@ function expectAcpNotifications(updates: SessionNotification[]): void {
 }
 
 describe("ACP event mapper", () => {
+	it("emits no ACP updates for queued ownership, including completed and cancelled terminals", () => {
+		const queuedEvents: QueuedInputEvent[] = [
+			{ type: "queued_input_admitted", submissionId: "q1", mode: "steer" },
+			{
+				type: "queued_input_consumed",
+				submissionId: "q1",
+				startsOwnRun: true,
+				runId: "run-1",
+				scope: { attemptId: "attempt-1", generation: 1, lineage: "main" },
+			},
+			{ type: "queued_input_removed", submissionId: "q1" },
+		];
+		for (const stopReason of ["completed", "cancelled"] as const) {
+			queuedEvents.push({
+				type: "queued_input_terminal",
+				submissionId: "q1",
+				runId: "run-1",
+				terminal: {
+					type: "agent_end",
+					stopReason,
+					scope: { attemptId: "attempt-2", generation: 2, lineage: "main" },
+					messages: [makeAssistantMessage("queued terminal text must not be published")],
+				},
+			});
+		}
+		for (const event of queuedEvents) {
+			expect(mapAgentSessionEventToAcpSessionUpdates(event, "session-1")).toEqual([]);
+		}
+	});
+
 	it("keeps ownership running for diagnostic agent_failed until agent_end", () => {
 		const updates = mapAgentSessionEventToAcpSessionUpdates(
 			{ type: "agent_failed", error: { code: "agent_failed", message: "Agent run failed." } } as AgentSessionEvent,
@@ -113,14 +144,19 @@ describe("ACP event mapper", () => {
 		const messageEvent = {
 			type: "message_update",
 			message: assistantMessage,
-			assistantMessageEvent: { type: "text_delta", delta: "wire chunk" },
-		} as AgentSessionEvent;
+			assistantMessageEvent: {
+				type: "text_delta",
+				delta: "wire chunk",
+				contentIndex: 0,
+				partial: assistantMessage,
+			},
+		} satisfies AgentWireSessionEvent;
 		const toolStartEvent = {
 			type: "tool_execution_start",
 			toolCallId: "toolu_wire_1",
 			toolName: "bash",
 			args: { command: "bun test" },
-		} as AgentSessionEvent;
+		} satisfies AgentWireSessionEvent;
 
 		expect(mapAgentWireEventPayloadToAcpSessionUpdates(toAgentWireEventPayload(toolStartEvent), "session-1")).toEqual(
 			mapAgentSessionEventToAcpSessionUpdates(toolStartEvent, "session-1"),

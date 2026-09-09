@@ -29,6 +29,7 @@ import { type Settings, validateSettingPatch } from "../../config/settings";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "../../extensibility/extensions";
 import type { AgentEndEvent } from "../../extensibility/shared-events";
 import { normalizeGoal } from "../../goals/state";
+import { isAgentWireSessionEvent } from "../../modes/shared/agent-wire/event-contract";
 import { toAgentWireEventPayload } from "../../modes/shared/agent-wire/event-envelope";
 import type { AgentSessionEvent } from "../../session/agent-session";
 import type { SdkRunCapability } from "../../session/sdk-run-capability";
@@ -93,7 +94,7 @@ import {
 import { SessionSdkHost, type SessionSdkHostOptions } from "./host";
 import { clearAutoroutingInactive, isAutoroutingInactive, markAutoroutingInactive } from "./internal-autorouting-state";
 import { CursorRegistry, QueryHandlers, RevisionStore, type SessionSurface } from "./query";
-import { createSdkRunCapability } from "./sdk-run-capability";
+import { createSdkRunCapability, type InternalSdkSubmissionApi } from "./sdk-run-capability";
 import {
 	createSdkCapabilities,
 	createSdkSurfacePolicyForContext,
@@ -2440,16 +2441,7 @@ function createControlSurface(
 		}
 		return normalized;
 	};
-	type InternalSendOptions = NonNullable<Parameters<ExtensionAPI["sendUserMessage"]>[1]> & {
-		sdkRunCapability?: SdkRunCapability;
-	};
-	type InternalSdkApi = Omit<ExtensionAPI, "sendUserMessage"> & {
-		sendUserMessage: (
-			content: Parameters<ExtensionAPI["sendUserMessage"]>[0],
-			options?: InternalSendOptions,
-		) => Promise<void>;
-	};
-	const internalApi = api as InternalSdkApi;
+	const internalApi = api as InternalSdkSubmissionApi;
 	const sendSdkUserMessage = (
 		content: Parameters<ExtensionAPI["sendUserMessage"]>[0],
 		options?: Record<string, unknown>,
@@ -4398,6 +4390,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		event: AgentSessionEvent,
 		invocations: ReadonlyArray<{ correlation: InvocationCorrelation; connectionId: string | undefined }>,
 	): void => {
+		if (!isAgentWireSessionEvent(event)) return;
 		try {
 			const payload = toAgentWireEventPayload(event);
 			for (const invocation of invocations) {
@@ -4525,8 +4518,9 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			// untouched (review thread P1).
 			const cohort = new Set(startTokens);
 			if (startToken) cohort.add(startToken);
-			const matchingPending =
-				cohort.size > 0 ? current.pending.filter(entry => cohort.has(entry.sdkRunToken)) : current.pending.slice();
+			// Pending SDK invocations all carry private tokens. A tokenless start
+			// cannot prove which admission it belongs to, even if only one is queued.
+			const matchingPending = current.pending.filter(entry => cohort.has(entry.sdkRunToken));
 			const matchingKeys = new Set(matchingPending.map(entry => entry.sdkRunToken));
 			const pendingSnapshot = current.pending.splice(0);
 			const drained = pendingSnapshot
@@ -5010,6 +5004,8 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				event.stopReason,
 			);
 		}, owner).finally(() => {
+			if (event.stopReason === "maintenance" && isContinuingMidRunMaintenanceOutcome(event.maintenanceOutcome))
+				return;
 			if (typeof event.sdkRunToken === "string" && lifecycleRunOwners.get(event.sdkRunToken)?.state === owner)
 				lifecycleRunOwners.delete(event.sdkRunToken);
 		});

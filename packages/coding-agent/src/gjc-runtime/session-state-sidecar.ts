@@ -184,6 +184,9 @@ interface RuntimeStateEvent {
 	messages?: unknown[];
 	toolCallId?: unknown;
 	isError?: unknown;
+	sdkRunToken?: string;
+	scope?: unknown;
+	error?: unknown;
 }
 
 export type RuntimeToolActivityPhase = "started" | "finished";
@@ -1029,6 +1032,40 @@ function finalResponseForEvent(event: RuntimeStateEvent): {
 	};
 }
 
+/** Correlation only; this evidence grants no SDK or wire execution authority. */
+function eventRunProvenance(event: RuntimeStateEvent): string | null {
+	if (event.sdkRunToken) return createHash("sha256").update(`run:${event.sdkRunToken}`).digest("hex");
+	if (!event.scope || typeof event.scope !== "object") return null;
+	const scope = event.scope as Record<string, unknown>;
+	if (
+		typeof scope.attemptId !== "string" ||
+		!scope.attemptId ||
+		typeof scope.generation !== "number" ||
+		!Number.isSafeInteger(scope.generation) ||
+		typeof scope.lineage !== "string" ||
+		!scope.lineage
+	)
+		return null;
+	return createHash("sha256")
+		.update(JSON.stringify([scope.attemptId, scope.generation, scope.lineage]))
+		.digest("hex");
+}
+
+function runtimeFailureEvidence() {
+	// Never persist a provider message, arbitrary classifier, or raw error object.
+	return { code: "agent_failed", message: "GJC agent reported a runtime failure", recoverable: true };
+}
+
+function committedPromptFailureEvidence() {
+	return { code: "prompt_deadline_exceeded", message: "Prompt deadline exceeded.", recoverable: true };
+}
+
+function retainedRunFailure(value: unknown) {
+	return value && typeof value === "object" && (value as Record<string, unknown>).code === "prompt_deadline_exceeded"
+		? committedPromptFailureEvidence()
+		: runtimeFailureEvidence();
+}
+
 export function stateForEvent(event: RuntimeStateEvent): RuntimeState | null {
 	if (event.type === "agent_start" || event.type === "turn_start") return "running";
 	if (event.type === "agent_end") {
@@ -1041,7 +1078,7 @@ export function stateForEvent(event: RuntimeStateEvent): RuntimeState | null {
 
 /** True for every event the coordinator-shared file records: lifecycle state or tool activity. */
 export function eventAffectsCoordinatorRuntimeState(event: RuntimeStateEvent): boolean {
-	return stateForEvent(event) !== null || toolActivityPhaseForEvent(event) !== null;
+	return event.type === "agent_failed" || stateForEvent(event) !== null || toolActivityPhaseForEvent(event) !== null;
 }
 
 class PreviousRuntimeStateReadError extends Error {
@@ -2058,7 +2095,7 @@ export async function persistCoordinatorRuntimeStateFromEvent(
 	if (!stateFile) return;
 	const beforePersistFromEvent = __sessionStateSidecarTestHooks.beforePersistFromEvent;
 	if (beforePersistFromEvent) await beforePersistFromEvent(event.type, context.cwd);
-	if (!state) {
+	if (!state && event.type !== "agent_failed") {
 		const activityPhase = toolActivityPhaseForEvent(event);
 		if (!activityPhase) return;
 		await persistCoordinatorRuntimeToolActivity(
@@ -2085,11 +2122,35 @@ export async function persistCoordinatorRuntimeStateFromEvent(
 						const now = new Date(nowMs).toISOString();
 						const previous = await readPreviousPayloadForEvent(stateFile);
 						assertPreviousRuntimeStateIdentity(previous, identity, stateFile);
+						const provenance = eventRunProvenance(event);
+						const sameRun = provenance !== null && previous.run_provenance === provenance;
+						if (event.type === "agent_failed") {
+							// A diagnostic is not a terminal boundary: preserve tools, readiness,
+							// and execution/receipt state until this run's agent_end arrives.
+							if (!sameRun || previous.state !== "running") return;
+							await writeStateFileSync(
+								stateFile,
+								{
+									...previous,
+									updated_at: now,
+									run_failure: previous.run_failure
+										? retainedRunFailure(previous.run_failure)
+										: runtimeFailureEvidence(),
+								},
+								identity.sidecarKeyId,
+							);
+							return;
+						}
+						if (!state) return;
+						// Late lifecycle events must not overwrite a successor snapshot.
+						if (event.type !== "agent_start" && previous.run_provenance && !sameRun) return;
+						const failed = sameRun && previous.run_failure !== undefined;
+						const nextState = event.type === "agent_end" && failed ? "errored" : state;
 						const finalResponse = finalResponseForEvent(event);
 						const terminalReceipt =
-							state === "completed" || state === "errored"
+							nextState === "completed" || nextState === "errored"
 								? reduceTerminalReceiptState({
-										execution: state === "errored" ? "failed" : "completed",
+										execution: nextState === "errored" ? "failed" : "completed",
 										reportable: Boolean(finalResponse?.text?.trim()),
 									})
 								: null;
@@ -2097,13 +2158,15 @@ export async function persistCoordinatorRuntimeStateFromEvent(
 							...basePayload({
 								context,
 								previous,
-								state,
+								state: nextState,
 								now,
 								source: "agent_session_event",
 								event: event.type,
 								reason: null,
 								sessionId: identity.sessionId,
 							}),
+							...(provenance ? { run_provenance: provenance } : {}),
+							...(failed ? { run_failure: retainedRunFailure(previous.run_failure) } : {}),
 							...(terminalReceipt
 								? {
 										execution_state: terminalReceipt.execution,
@@ -2120,13 +2183,15 @@ export async function persistCoordinatorRuntimeStateFromEvent(
 											recoverable: true,
 										},
 									}
-								: state === "errored"
+								: nextState === "errored"
 									? {
-											error: {
-												code: "agent_error",
-												message: "GJC agent reported an error",
-												recoverable: true,
-											},
+											error: failed
+												? retainedRunFailure(previous.run_failure)
+												: {
+														code: "agent_error",
+														message: "GJC agent reported an error",
+														recoverable: true,
+													},
 										}
 									: {}),
 						};
@@ -2135,6 +2200,78 @@ export async function persistCoordinatorRuntimeStateFromEvent(
 					}),
 			),
 	);
+}
+
+/** Project an already committed bus outcome; never creates authority or terminates live work. */
+export async function persistCoordinatorCommittedPromptFailure(
+	context: RuntimeStateContext,
+	sdkRunToken: string,
+	isCurrent: () => boolean,
+): Promise<"persisted" | "stale"> {
+	const stateFile = runtimeStateFileForContext(context);
+	if (!stateFile || !sdkRunToken || !isCurrent()) return "stale";
+	context = contextWithManagedOwnerGeneration(context);
+	const identity = normalizedIdentity(context);
+	const provenance = eventRunProvenance({ type: "agent_failed", sdkRunToken });
+	let result: "persisted" | "stale" = "stale";
+	await serializeStateFileWrite(stateFile, async () =>
+		withCoordinatorTransactionLock(stateFile, async () =>
+			withStateFileLock(stateFile, async () => {
+				if (!isCurrent()) return;
+				assertNoRuntimeStateRescopeJournal(context, identity);
+				const previous = await readPreviousPayloadForEvent(stateFile);
+				if (previous.run_provenance !== provenance) return;
+				if (
+					previous.session_id !== identity.sessionId ||
+					typeof previous.cwd !== "string" ||
+					typeof previous.workdir !== "string" ||
+					!sameResolvedPath(previous.cwd, identity.cwd, identity.platform) ||
+					!sameResolvedPath(previous.workdir, identity.workdir, identity.platform) ||
+					!(
+						previous.session_file === identity.sessionFile ||
+						(typeof previous.session_file === "string" &&
+							typeof identity.sessionFile === "string" &&
+							sameResolvedPath(previous.session_file, identity.sessionFile, identity.platform))
+					)
+				)
+					return;
+				assertPreviousRuntimeStateIdentity(previous, identity, stateFile);
+				const terminal = previous.state === "completed" || previous.state === "errored";
+				if (!terminal && previous.state !== "running") return;
+				const response = previous.final_response;
+				const reportable = response && typeof response === "object" ? (response as Record<string, unknown>) : {};
+				const receipt = reduceTerminalReceiptState({
+					execution: "failed",
+					reportable:
+						previous.receipt_state === "present" ||
+						(typeof reportable.text === "string" && Boolean(reportable.text.trim())) ||
+						(typeof reportable.artifact_path === "string" && Boolean(reportable.artifact_path.trim())),
+				});
+				const error = previous.error;
+				const preserveError =
+					error && typeof error === "object" && (error as Record<string, unknown>).code !== "receipt_missing";
+				const payload = {
+					...previous,
+					updated_at: new Date().toISOString(),
+					run_failure: committedPromptFailureEvidence(),
+					...(terminal
+						? {
+								state: "errored",
+								execution_state: receipt.execution,
+								receipt_state: receipt.receipt,
+								error: preserveError ? error : committedPromptFailureEvidence(),
+							}
+						: {}),
+				};
+				result = await writeCoordinatorAtomic(
+					stateFile,
+					`${JSON.stringify(finalizeSidecarPayload(payload, identity.sidecarKeyId))}\n`,
+					{ isCurrent },
+				);
+			}),
+		),
+	);
+	return result;
 }
 
 export async function persistCoordinatorWorkerIntegrationOutcome(

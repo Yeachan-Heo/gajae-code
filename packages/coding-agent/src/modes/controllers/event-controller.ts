@@ -193,6 +193,11 @@ export class EventController {
 			model_fallback_switched: e => this.#handleModelFallbackSwitched(e),
 			thinking_level_changed: async () => {},
 			goal_updated: async () => {},
+			// Embedder ownership observations must not duplicate run/UI lifecycle effects.
+			queued_input_admitted: async () => {},
+			queued_input_consumed: async () => {},
+			queued_input_removed: async () => {},
+			queued_input_terminal: async () => {},
 		} satisfies AgentSessionEventHandlers;
 	}
 

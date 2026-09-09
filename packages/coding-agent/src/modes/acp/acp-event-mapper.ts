@@ -403,6 +403,12 @@ export function mapAgentSessionEventToAcpSessionUpdates(
 					},
 				}),
 			];
+		case "queued_input_admitted":
+		case "queued_input_consumed":
+		case "queued_input_removed":
+		case "queued_input_terminal":
+			// Embedder ownership observations are not ACP updates or terminal authority.
+			return [];
 		default:
 			return assertNeverAcp(event);
 	}

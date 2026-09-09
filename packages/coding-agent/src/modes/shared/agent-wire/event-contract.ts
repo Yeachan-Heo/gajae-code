@@ -3,29 +3,45 @@
  * for AgentSession events and bounded owner observations.
  *
  * Two distinct consumer-facing shapes, deliberately NOT collapsed into one:
- * - `AgentWireEventPayload`: rich, full `AgentSessionEvent` for event
+ * - `AgentWireEventPayload`: rich, full wire-eligible session events for event
  *   consumers on any agent-wire transport.
  * - `AgentWireOwnerObservation`: bounded/redacted owner evidence for control
  *   planes (Harness). Never carries assistant text, message deltas, raw tool
  *   args, raw command output, raw tool results, answers, or oversize strings.
  *
  * The exhaustive `AGENT_SESSION_EVENT_TYPE_REGISTRY` lives here so that adding
- * an `AgentSessionEvent` variant fails typecheck until it is registered, and so
+ * a wire-eligible `AgentSessionEvent` variant fails typecheck until registered, and so
  * conformance tests can assert fixture coverage equals the registry exactly.
  */
 
 import type { AssistantMessageEvent } from "@gajae-code/ai/core";
-import type { AgentSessionEvent } from "../../../session/agent-session";
+import type { AgentSessionEvent, QueuedInputEvent } from "../../../session/agent-session";
 
 /** Wire protocol version. Bump on breaking envelope/semantic changes. */
 export const AGENT_WIRE_PROTOCOL_VERSION = 2 as const;
 export type AgentWireProtocolVersion = typeof AGENT_WIRE_PROTOCOL_VERSION;
 
-/** The discriminant of every `AgentSessionEvent` the agent can emit. */
-export type AgentWireEventType = AgentSessionEvent["type"];
+/** Queue ownership observations are in-process only, not wire protocol events. */
+export type AgentWireSessionEvent = Exclude<AgentSessionEvent, QueuedInputEvent>;
+
+/** The discriminant of every wire-eligible session event. */
+export type AgentWireEventType = AgentWireSessionEvent["type"];
+
+/** Narrow at transport boundaries before serializing a session event. */
+export function isAgentWireSessionEvent(event: AgentSessionEvent): event is AgentWireSessionEvent {
+	switch (event.type) {
+		case "queued_input_admitted":
+		case "queued_input_consumed":
+		case "queued_input_removed":
+		case "queued_input_terminal":
+			return false;
+		default:
+			return true;
+	}
+}
 
 /**
- * Compile-time exhaustive registry of every `AgentSessionEvent` variant. The
+ * Compile-time exhaustive registry of every wire-eligible session event variant. The
  * `Record<AgentWireEventType, true>` shape forces every member to be present:
  * a new union variant is a type error until added here, and a removed variant
  * is a type error until deleted.
@@ -57,18 +73,18 @@ const AGENT_SESSION_EVENT_TYPE_REGISTRY: Record<AgentWireEventType, true> = {
 	goal_updated: true,
 };
 
-/** Every agent-session event type, derived from the exhaustive registry. */
+/** Every wire-eligible event type, derived from the exhaustive registry. */
 export const AGENT_WIRE_EVENT_TYPES: readonly AgentWireEventType[] = Object.keys(
 	AGENT_SESSION_EVENT_TYPE_REGISTRY,
 ) as AgentWireEventType[];
 
 /**
- * Rich event payload. Carries the full `AgentSessionEvent` so event consumers
+ * Rich event payload. Carries the full wire-eligible event so event consumers
  * can present message content, tool args/results, todo state, and related data.
  */
 export interface AgentWireEventPayload {
 	event_type: AgentWireEventType;
-	event: AgentSessionEvent;
+	event: AgentWireSessionEvent;
 }
 export type AgentWireCompactAssistantMessageEvent = AssistantMessageEvent extends infer TEvent
 	? TEvent extends { type: string }
