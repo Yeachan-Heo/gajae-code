@@ -19,7 +19,7 @@ function resolveWasmAsset(): string {
 		if (process.env.PI_COMPILED || /\$bunfs|~BUN|%7EBUN/.test(import.meta.url)) {
 			throw new Error("Compiled MuPDF WASM mapping is missing; run scripts/embed-mupdf.ts before compiling.");
 		}
-		const markitModule = url.fileURLToPath(import.meta.resolve("markit-ai"));
+		const markitModule = url.fileURLToPath(new URL("../../vendor/markit-ai/dist/index.js", import.meta.url));
 		moduleMapping = Bun.resolveSync("mupdf", path.dirname(markitModule));
 		wasmAsset = path.join(path.dirname(moduleMapping), "mupdf-wasm.wasm");
 	}

@@ -2,7 +2,6 @@ import { describe, expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import * as url from "node:url";
 import { logger } from "@gajae-code/utils";
 import { resolvePublishDependency } from "../../../scripts/ci-release-publish";
 import { canonicalizePackageTarball } from "../../../scripts/release-evidence";
@@ -13,11 +12,13 @@ import {
 	releaseEntrypoints,
 } from "../scripts/compile-args";
 import { generateMuPdfAsset, resetMuPdfAsset } from "../scripts/embed-mupdf";
-import { stageMarkit } from "../scripts/stage-markit";
 import { mupdfAssetMapping, sanitizeMuPdfDiagnostic, withMuPdfDiagnostic } from "../src/utils/mupdf";
 
 const repoRoot = path.resolve(import.meta.dir, "../../..");
 const packageRoot = path.join(repoRoot, "packages/coding-agent");
+const markitRoot = path.join(packageRoot, "vendor/markit-ai");
+const markitEntry = path.join(markitRoot, "dist/index.js");
+const mupdfEntry = Bun.resolveSync("mupdf", path.dirname(markitEntry));
 
 // A generated, valid one-page PDF keeps this regression independent of network
 // access, the W3C endpoint, and an installed PDF authoring program.
@@ -45,7 +46,7 @@ function dummyPdf(): string {
 const entrySource = `
 import { convertBufferWithMarkit, convertFileWithMarkit } from ${JSON.stringify(path.join(packageRoot, "src/utils/markit.ts"))};
 import { mupdfAssetMapping } from ${JSON.stringify(path.join(packageRoot, "src/utils/mupdf.ts"))};
-import { extractPages, renderImageRegion } from ${JSON.stringify(url.fileURLToPath(new URL("./converters/pdf/extract.js", import.meta.resolve("markit-ai"))))};
+import { extractPages, renderImageRegion } from ${JSON.stringify(path.join(markitRoot, "dist/converters/pdf/extract.js"))};
 const mode = process.argv[2];
 const originalFile = Bun.file;
 let faultedReads = 0;
@@ -82,7 +83,8 @@ if (mode === "success") {
 		id: "red-rectangle", pageNumber: 1,
 		bbox: { x: 50, y: 70, w: 100, h: 80 }, topY: 130,
 	});
-	const mupdf = await import(${JSON.stringify(Bun.resolveSync("mupdf", path.dirname(url.fileURLToPath(import.meta.resolve("markit-ai")))))});
+	// Deliberately delayed: eager import would bypass Markit's initialization lifecycle.
+	const mupdf = await import(${JSON.stringify(mupdfEntry)});
 	const image = new mupdf.Image(png);
 	const pixmap = image.toPixmap();
 	try {
@@ -124,6 +126,7 @@ async function runIsolated(command: string[], cwd: string): Promise<ConversionOu
 		env: { HOME: cwd, TMPDIR: cwd, PATH: "", NODE_PATH: "", LANG: "C" },
 		stdout: "pipe",
 		stderr: "pipe",
+		timeout: 30_000,
 	});
 	const [exitCode, stdout, stderr] = await Promise.all([
 		child.exited,
@@ -173,27 +176,12 @@ console.log(JSON.stringify({ buffer: { ok: true, content: "" }, mapping: mupdfAs
 				const lazyOutput = await runIsolated([process.execPath, lazyEntry], directory);
 				expect(lazyOutput.mapping).toContain("unresolved");
 				const dependencies = path.join(layout === "nested" ? installed : directory, "node_modules");
-				const markit = path.join(dependencies, "markit-ai");
+				const markit = path.join(installed, "vendor/markit-ai/dist");
 				await fs.mkdir(markit, { recursive: true });
-				await Bun.write(path.join(markit, "package.json"), JSON.stringify({ name: "markit-ai", main: "index.js" }));
 				await Bun.write(path.join(markit, "index.js"), "export {};\n");
-				const dependency = path.join(markit, "node_modules/mupdf");
-				const original = path.dirname(
-					path.dirname(
-						Bun.resolveSync("mupdf", path.dirname(url.fileURLToPath(import.meta.resolve("markit-ai")))),
-					),
-				);
+				const dependency = path.join(dependencies, "mupdf");
+				const original = path.dirname(path.dirname(mupdfEntry));
 				await fs.cp(original, dependency, { recursive: true, dereference: true });
-				// A distinct direct version must never supply the transitive loader's
-				// asset. Its invalid WASM makes accidental direct resolution fail.
-				const direct = path.join(dependencies, "mupdf");
-				await fs.mkdir(path.join(direct, "dist"), { recursive: true });
-				await Bun.write(
-					path.join(direct, "package.json"),
-					JSON.stringify({ name: "mupdf", version: "0.0.0", main: "dist/mupdf.js" }),
-				);
-				await Bun.write(path.join(direct, "dist/mupdf.js"), "export {};\n");
-				await Bun.write(path.join(direct, "dist/mupdf-wasm.wasm"), new Uint8Array([0, 1, 2, 3]));
 				const entry = path.join(installed, "probe.ts");
 				await Bun.write(
 					entry,
@@ -209,7 +197,6 @@ console.log(JSON.stringify({ buffer: { ok: true, content: "" }, mapping: mupdfAs
 				expect(output.mapping).toContain(await fs.realpath(dependency));
 				expect(output.mapping).not.toContain(repoRoot);
 				expect(output.mapping).toContain(path.join(await fs.realpath(dependency), "dist/mupdf.js"));
-				expect(output.mapping).not.toContain(`${direct}${path.sep}`);
 				const scripts = path.join(installed, "scripts");
 				await fs.mkdir(scripts);
 				await fs.copyFile(path.join(packageRoot, "scripts/embed-mupdf.ts"), path.join(scripts, "embed-mupdf.ts"));
@@ -228,7 +215,6 @@ console.log(JSON.stringify({ buffer: { ok: true, content: "" }, mapping: await B
 				expect(generated.mapping).toContain(
 					JSON.stringify(path.join(await fs.realpath(dependency), "dist/mupdf.js")),
 				);
-				expect(generated.mapping).not.toContain(JSON.stringify(path.join(direct, "dist/mupdf-wasm.wasm")));
 			} finally {
 				await fs.rm(directory, { recursive: true, force: true });
 			}
@@ -250,16 +236,18 @@ console.log(JSON.stringify({ buffer: { ok: true, content: "" }, mapping: await B
 					path.join(directory, "src/tools/tool-errors.ts"),
 				);
 				const modules = path.join(directory, "node_modules");
-				const markit = path.join(modules, "markit-ai");
-				const originalMarkit = path.dirname(path.dirname(url.fileURLToPath(import.meta.resolve("markit-ai"))));
+				const markit = path.join(directory, "vendor/markit-ai");
+				const originalMarkit = markitRoot;
 				await fs.cp(originalMarkit, markit, {
 					recursive: true,
 					dereference: true,
 					filter: source => path.basename(source) !== "node_modules",
 				});
-				const manifest = await Bun.file(path.join(originalMarkit, "package.json")).json();
+				const manifest = await Bun.file(path.join(packageRoot, "package.json")).json();
+				await fs.mkdir(modules, { recursive: true });
 				for (const name of Object.keys(manifest.dependencies)) {
-					if (name === "mupdf") continue;
+					if (name === "mupdf" || name.startsWith("@gajae-code/")) continue;
+					await fs.mkdir(path.dirname(path.join(modules, name)), { recursive: true });
 					await fs.symlink(
 						await fs.realpath(path.join(repoRoot, "node_modules", name)),
 						path.join(modules, name),
@@ -271,7 +259,7 @@ console.log(JSON.stringify({ buffer: { ok: true, content: "" }, mapping: await B
 				const originalMuPdf = path.dirname(
 					path.dirname(Bun.resolveSync("mupdf", path.join(originalMarkit, "dist"))),
 				);
-				const dependency = path.join(markit, "node_modules/mupdf");
+				const dependency = path.join(modules, "mupdf");
 				await fs.cp(originalMuPdf, dependency, { recursive: true, dereference: true });
 				// Only the temporary package is damaged. Its real WASM stays intact.
 				const loader = path.join(dependency, "dist/mupdf-wasm.js");
@@ -484,131 +472,141 @@ catch (error) { console.log(JSON.stringify({ buffer: { ok: false, content: "", e
 	}
 });
 
-// These are real package-manager operations, including dependency installation
-// from the registry. No repository symlink or root patchedDependencies survives.
-describe("published Markit dependency bundle", () => {
-	it("refuses pre-existing dependency directories without changing them", async () => {
-		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-markit-owner-"));
-		try {
-			const target = path.join(directory, "node_modules/markit-ai");
-			await fs.mkdir(target, { recursive: true });
-			await Bun.write(path.join(target, "user-file"), "preserve");
-			await expect(stageMarkit(packageRoot, directory)).rejects.toThrow();
-			expect(await Bun.file(path.join(target, "user-file")).text()).toBe("preserve");
-			expect(await fs.readdir(target)).toEqual(["user-file"]);
-		} finally {
-			await fs.rm(directory, { recursive: true, force: true });
+// Real pack/install roundtrips must work without repository symlinks or patches.
+async function snapshotFiles(directory: string): Promise<Record<string, string>> {
+	const files: Record<string, string> = {};
+	async function visit(current: string): Promise<void> {
+		for (const entry of await fs.readdir(current, { withFileTypes: true })) {
+			const filename = path.join(current, entry.name);
+			if (entry.isDirectory()) await visit(filename);
+			else
+				files[path.relative(directory, filename)] = entry.isSymbolicLink()
+					? `symlink:${await fs.readlink(filename)}`
+					: new Bun.CryptoHasher("sha256").update(await Bun.file(filename).bytes()).digest("hex");
 		}
-	});
+	}
+	await visit(directory);
+	return files;
+}
 
-	it("refuses unpatched Markit before creating a publish dependency", async () => {
-		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-markit-unpatched-"));
-		try {
-			const source = path.join(directory, "source");
-			const markit = path.join(source, "node_modules/markit-ai");
-			const target = path.join(directory, "target");
-			const original = path.dirname(path.dirname(url.fileURLToPath(import.meta.resolve("markit-ai"))));
-			await fs.cp(original, markit, {
-				recursive: true,
-				dereference: true,
-				filter: entry => path.basename(entry) !== "node_modules",
-			});
-			await Bun.write(path.join(markit, "dist/converters/pdf/extract.js"), 'const mupdf = require("mupdf");\n');
-			await expect(stageMarkit(source, target)).rejects.toThrow("Publishing requires the patched markit-ai@0.5.3");
-			expect(await Bun.file(path.join(target, "node_modules/markit-ai/package.json")).exists()).toBe(false);
-		} finally {
-			await fs.rm(directory, { recursive: true, force: true });
-		}
+async function runPackageCommand(command: string[], cwd: string): Promise<void> {
+	const child = Bun.spawn(command, {
+		cwd,
+		env: { ...process.env, PATH: `${path.dirname(process.execPath)}${path.delimiter}${process.env.PATH ?? ""}` },
+		stdout: "pipe",
+		stderr: "pipe",
+		timeout: 120_000,
 	});
-	for (const packer of ["npm", "bun"] as const) {
-		it(`${packer} tarball retains patched conversion, rendering and safe diagnostics`, async () => {
+	const [exitCode, stdout, stderr] = await Promise.all([
+		child.exited,
+		new Response(child.stdout).text(),
+		new Response(child.stderr).text(),
+	]);
+	expect({ exitCode, diagnostics: exitCode ? stdout + stderr : "" }).toEqual({ exitCode: 0, diagnostics: "" });
+}
+
+describe("published vendored Markit", () => {
+	for (const packer of ["npm", "bun"]) {
+		it(`${packer} packs twice without changing dependencies and installs portable conversion and read tools`, async () => {
 			const directory = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-markit-tarball-"));
-			async function run(command: string[], cwd: string): Promise<void> {
-				const child = Bun.spawn(command, { cwd, stdout: "pipe", stderr: "pipe" });
-				const [exitCode, stdout, stderr] = await Promise.all([
-					child.exited,
-					new Response(child.stdout).text(),
-					new Response(child.stderr).text(),
-				]);
-				expect({ exitCode, diagnostics: exitCode ? stdout + stderr : "" }).toEqual({
-					exitCode: 0,
-					diagnostics: "",
-				});
-			}
 			try {
-				const staged = path.join(directory, "staged");
+				await resetMuPdfAsset();
+				const publisher = path.join(directory, "workspace/packages/coding-agent");
 				const tarballs = path.join(directory, "tarballs");
 				const consumer = path.join(directory, "consumer");
 				await fs.mkdir(tarballs);
 				await fs.mkdir(consumer);
-				await fs.cp(packageRoot, staged, {
+				await fs.cp(packageRoot, publisher, {
 					recursive: true,
-					filter: source => path.basename(source) !== "node_modules",
+					filter: source => path.basename(source) !== "node_modules" && !source.endsWith(".tgz"),
 				});
-				const manifest = await Bun.file(path.join(staged, "package.json")).json();
+				const manifest = await Bun.file(path.join(publisher, "package.json")).json();
 				for (const field of ["dependencies", "devDependencies", "optionalDependencies", "peerDependencies"]) {
 					for (const [name, version] of Object.entries(manifest[field] ?? {})) {
 						manifest[field][name] = await resolvePublishDependency(name, version as string);
 					}
 				}
-				expect(manifest.bundledDependencies).toEqual(["markit-ai"]);
+				expect(manifest.dependencies["markit-ai"]).toBeUndefined();
+				expect(manifest.bundledDependencies).toBeUndefined();
+				expect(manifest.bundleDependencies).toBeUndefined();
 				expect(manifest.patchedDependencies).toBeUndefined();
-				await Bun.write(path.join(staged, "package.json"), JSON.stringify(manifest));
-				await stageMarkit(packageRoot, staged);
-				await run(
-					packer === "npm"
-						? ["npm", "pack", "--ignore-scripts", "--pack-destination", tarballs]
-						: [process.execPath, "pm", "pack", "--ignore-scripts", "--destination", tarballs],
-					staged,
+				expect(manifest.scripts.postinstall).toBeUndefined();
+				expect(manifest.scripts.prepack).not.toMatch(/stage-markit|node_modules|patch/);
+				await Bun.write(path.join(publisher, "package.json"), JSON.stringify(manifest));
+				// Reproduce the build workspace explicitly; none of these links are packed.
+				const buildScripts = path.join(directory, "workspace/scripts");
+				await fs.mkdir(buildScripts, { recursive: true });
+				await fs.copyFile(
+					path.join(repoRoot, "scripts/safe-cleanup.ts"),
+					path.join(buildScripts, "safe-cleanup.ts"),
 				);
+				// Pre-existing dependency contents must remain untouched by every pack lifecycle.
+				const modules = path.join(publisher, "node_modules");
+				const existing = path.join(modules, "markit-ai");
+				await fs.mkdir(existing, { recursive: true });
+				for (const name of await fs.readdir(path.join(repoRoot, "node_modules"))) {
+					if (name === "markit-ai" || name.startsWith(".")) continue;
+					await fs.symlink(
+						await fs.realpath(path.join(repoRoot, "node_modules", name)),
+						path.join(modules, name),
+						"dir",
+					);
+				}
+				await Bun.write(path.join(existing, "user-file"), "preserve existing dependency");
+				const before = await fs.lstat(existing);
+				const contents = await snapshotFiles(modules);
+				const pack =
+					packer === "npm"
+						? ["npm", "pack", "--pack-destination", tarballs]
+						: [process.execPath, "pm", "pack", "--destination", tarballs];
+				await runPackageCommand(pack, publisher);
 				const archives = (await fs.readdir(tarballs)).filter(name => name.endsWith(".tgz"));
 				expect(archives).toHaveLength(1);
-				const firstTarball = await Bun.file(path.join(tarballs, archives[0]!)).bytes();
-				const canonical = canonicalizePackageTarball(firstTarball);
+				const archive = path.join(tarballs, archives[0]!);
+				// Default canonicalization enforces release compressed/unpacked/member/count limits.
+				const canonical = canonicalizePackageTarball(await Bun.file(archive).bytes());
 				expect(canonical.byteLength).toBeGreaterThan(0);
-				await run(
-					packer === "npm"
-						? ["npm", "pack", "--ignore-scripts", "--pack-destination", tarballs]
-						: [process.execPath, "pm", "pack", "--ignore-scripts", "--destination", tarballs],
-					staged,
-				);
-				expect(canonicalizePackageTarball(await Bun.file(path.join(tarballs, archives[0]!)).bytes())).toEqual(
-					canonical,
-				);
-				await fs.rm(staged, { recursive: true });
+				await runPackageCommand(pack, publisher);
+				expect(canonicalizePackageTarball(await Bun.file(archive).bytes())).toEqual(canonical);
+				const after = await fs.lstat(existing);
+				expect({ dev: after.dev, ino: after.ino }).toEqual({ dev: before.dev, ino: before.ino });
+				expect(await snapshotFiles(modules)).toEqual(contents);
+				const unpacked = path.join(directory, "unpacked");
+				await fs.mkdir(unpacked);
+				await runPackageCommand(["tar", "-xzf", archive, "-C", unpacked], directory);
+				const packed = path.join(unpacked, "package");
+				expect(await snapshotFiles(path.join(packed, "vendor/markit-ai"))).toEqual(await snapshotFiles(markitRoot));
+				const packedFiles = await snapshotFiles(packed);
+				expect(Object.values(packedFiles).some(value => value.startsWith("symlink:"))).toBe(false);
+				expect(await fs.readdir(packed)).not.toContain("node_modules");
+				await fs.rm(publisher, { recursive: true });
 				await Bun.write(path.join(consumer, "package.json"), JSON.stringify({ private: true, type: "module" }));
-				await run(
+				await runPackageCommand(
 					packer === "npm"
-						? ["npm", "install", "--ignore-scripts", "--no-audit", "--no-fund", path.join(tarballs, archives[0]!)]
-						: [process.execPath, "add", "--ignore-scripts", path.join(tarballs, archives[0]!)],
+						? ["npm", "install", "--ignore-scripts", "--no-audit", "--no-fund", archive]
+						: [process.execPath, "add", "--ignore-scripts", archive],
 					consumer,
 				);
 				const installed = await fs.realpath(path.join(consumer, "node_modules/@gajae-code/coding-agent"));
-				const markitEntry = Bun.resolveSync("markit-ai", installed);
-				const markitRoot = path.dirname(path.dirname(markitEntry));
-				expect(markitRoot).toBe(path.join(installed, "node_modules/markit-ai"));
-				const extraction = path.join(markitRoot, "dist/converters/pdf/extract.js");
-				expect(await Bun.file(extraction).text()).not.toContain('require("mupdf")');
-				expect(await Bun.file(path.join(markitRoot, "dist/markit.js")).text()).toContain("new AggregateError");
-				expect(await Bun.file(path.join(markitRoot, "LICENSE")).text()).toContain("MIT");
-				const mupdf = Bun.resolveSync("mupdf", path.dirname(markitEntry));
-				expect(mupdf.startsWith(`${markitRoot}${path.sep}`)).toBe(true);
+				expect(installed.startsWith(`${await fs.realpath(consumer)}${path.sep}`)).toBe(true);
+				const vendored = path.join(installed, "vendor/markit-ai");
+				expect(await snapshotFiles(vendored)).toEqual(await snapshotFiles(markitRoot));
+				expect(await Bun.file(path.join(vendored, "LICENSE")).text()).toContain("MIT");
+				expect(await Bun.file(path.join(vendored, "dist/markit.js")).text()).toContain("new AggregateError");
+				expect(await Bun.file(path.join(vendored, "dist/converters/pdf/extract.js")).text()).not.toContain(
+					'require("mupdf")',
+				);
+				const mupdf = Bun.resolveSync("mupdf", path.join(vendored, "dist"));
+				expect(mupdf.startsWith(`${await fs.realpath(consumer)}${path.sep}`)).toBe(true);
+				const mupdfManifest = await Bun.file(path.join(path.dirname(path.dirname(mupdf)), "package.json")).json();
+				expect(mupdfManifest.version).toBe(manifest.dependencies.mupdf);
 				expect(await Bun.file(path.join(path.dirname(path.dirname(mupdf)), "LICENSE")).text()).toContain(
 					"GNU AFFERO GENERAL PUBLIC LICENSE",
 				);
-				const originalMarkitEntry = url.fileURLToPath(import.meta.resolve("markit-ai"));
-				const originalExtract = url.fileURLToPath(
-					new URL("./converters/pdf/extract.js", import.meta.resolve("markit-ai")),
-				);
-				const originalMuPdf = Bun.resolveSync("mupdf", path.dirname(originalMarkitEntry));
 				const entry = path.join(installed, "published-probe.ts");
-				await Bun.write(
-					entry,
-					entrySource
-						.replaceAll(packageRoot, installed)
-						.replaceAll(originalExtract, extraction)
-						.replaceAll(originalMuPdf, mupdf),
-				);
+				const installedSource = entrySource.replaceAll(packageRoot, installed).replaceAll(mupdfEntry, mupdf);
+				expect(installedSource).not.toContain(repoRoot);
+				await Bun.write(entry, installedSource);
 				const success = await runIsolated([process.execPath, entry, "success"], consumer);
 				expect(success.buffer.ok).toBe(true);
 				expect(success.buffer.content).toContain("Dummy PDF file");
@@ -622,17 +620,39 @@ describe("published Markit dependency bundle", () => {
 				});
 				expect(success.mapping).toContain(mupdf);
 				expect(success.mapping).not.toContain(repoRoot);
-				// Damage only the installed loader. A fresh process must retain its
-				// original cause through Markit's AggregateError, not suggest install.
+				const readEntry = path.join(installed, "published-read.ts");
+				await Bun.write(
+					readEntry,
+					`
+import { Settings } from "./src/config/settings";
+import { ReadTool } from "./src/tools/read";
+const session = { cwd: process.cwd(), hasUI: false, getSessionFile: () => null, getSessionSpawns: () => null, settings: Settings.isolated({ "fetch.enabled": true }) };
+await Bun.write("read.pdf", ${JSON.stringify(dummyPdf())});
+await Bun.write("invalid.pdf", "%PDF-1.4 malformed payload");
+await Bun.write("image.png", Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC", "base64"));
+const reader = new ReadTool(session);
+const text = await reader.execute("published-text", { path: "read.pdf" });
+if (!JSON.stringify(text).includes("Dummy PDF file")) throw new Error("Published read lost PDF text");
+const image = await reader.execute("published-image", { path: "image.png" });
+if (!image.content.some(item => item.type === "image" && item.mimeType === "image/png")) throw new Error("Published read lost image");
+let diagnostic;
+try { diagnostic = JSON.stringify(await reader.execute("published-invalid", { path: "invalid.pdf" })); }
+catch (error) { diagnostic = String(error); }
+if (!diagnostic.includes("MuPDF") || diagnostic.includes(${JSON.stringify(path.dirname(mupdf))}) || diagnostic.includes("build-time provenance")) throw new Error("Published read lost safe PDF diagnostic");
+console.log(JSON.stringify({ buffer: { ok: true, content: "published read text/image/privacy" }, mapping: "" }));
+`,
+				);
+				const read = await runIsolated([process.execPath, readEntry], consumer);
+				expect(read.buffer.ok).toBe(true);
+				// Damage only the installed loader; a fresh process must preserve its cause.
 				await fs.rm(path.join(path.dirname(mupdf), "mupdf-wasm.js"));
 				const failure = await runIsolated([process.execPath, entry, "loader-failure"], consumer);
 				expect(failure.buffer.ok).toBe(false);
 				expect(failure.buffer.error).toContain("AggregateError");
 				expect(failure.buffer.error).toContain("MuPDF module initialization failed");
 				expect(failure.buffer.error).toMatch(/Cannot find|Module not found/i);
-				expect(failure.buffer.error).not.toContain(directory);
-				expect(failure.buffer.error).not.toContain(await fs.realpath(directory));
-				expect(failure.buffer.error).not.toContain(repoRoot);
+				for (const privatePath of [directory, await fs.realpath(directory), repoRoot])
+					expect(failure.buffer.error).not.toContain(privatePath);
 				expect(failure.buffer.error).not.toContain("npm install");
 			} finally {
 				await fs.rm(directory, { recursive: true, force: true });

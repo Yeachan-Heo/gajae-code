@@ -33,7 +33,10 @@ function pdfFixture(text: string): string {
 	return `${pdf}trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF\n`;
 }
 
-const mupdfModulePath = Bun.resolveSync("mupdf", path.dirname(url.fileURLToPath(import.meta.resolve("markit-ai"))));
+const mupdfModulePath = Bun.resolveSync(
+	"mupdf",
+	path.dirname(url.fileURLToPath(new URL("../../vendor/markit-ai/dist/index.js", import.meta.url))),
+);
 
 describe("PDF URL source-text inspection", () => {
 	let server: Bun.Server<undefined>;
@@ -333,6 +336,63 @@ describe("PDF URL source-text inspection", () => {
 			expect(binaryFetch).not.toHaveBeenCalled();
 			expect(conversion).not.toHaveBeenCalled();
 			expect(requests).toBe(1);
+		});
+	}
+
+	for (const mime of ["application/octet-stream", "binary/octet-stream", "unknown", ""]) {
+		for (const [route, disposition] of [
+			["download", "attachment; filename=photo.png"],
+			["download", 'attachment; filename="photo.png"'],
+			["download", "attachment; filename=report.pdf; filename*=UTF-8''photo%2Epng"],
+			["report.pdf", "attachment; filename=photo.png"],
+		]) {
+			it(`inlines validated PNG bytes for ${mime} ${route} ${disposition}`, async () => {
+				contentType = mime;
+				contentDisposition = disposition;
+				body = Buffer.from(
+					"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC",
+					"base64",
+				);
+				const binaryFetch = vi.spyOn(scrapers, "fetchBinary");
+				const conversion = vi.spyOn(scrapers, "convertWithMarkit");
+				const result = await new ReadTool(session).execute("read-disposition-image", {
+					path: new URL(route, server.url).href,
+				});
+				expect(result.details?.method).toBe("image");
+				const image = result.content.find(item => item.type === "image");
+				if (image?.type !== "image") throw new Error("expected inline image");
+				expect(image.mimeType).toBe("image/png");
+				expect(image.data).toBe(body.toString("base64"));
+				const metadata = await new Bun.Image(Buffer.from(image.data, "base64")).metadata();
+				expect(metadata.width).toBe(1);
+				expect(metadata.height).toBe(1);
+				expect(binaryFetch).toHaveBeenCalledTimes(1);
+				expect(conversion).toHaveBeenCalledTimes(1);
+				expect(conversion.mock.calls[0][1]).toBe(".png");
+				expect(requests).toBe(2);
+			});
+		}
+	}
+
+	for (const [mime, disposition] of [
+		["application/pdf", "attachment; filename=photo.png"],
+		["application/octet-stream", "attachment; filename=report.pdf"],
+	]) {
+		it(`keeps PDF dispatch ahead of the image URL for ${mime} ${disposition}`, async () => {
+			contentType = mime;
+			contentDisposition = disposition;
+			const binaryFetch = vi.spyOn(scrapers, "fetchBinary");
+			const conversion = vi.spyOn(scrapers, "convertWithMarkit");
+			const result = await new ReadTool(session).execute("read-image-url-pdf", {
+				path: new URL("photo.png", server.url).href,
+			});
+			expect(result.details?.method).toBe("markit");
+			expect(result.content.some(item => item.type === "text" && item.text.includes("Dummy PDF file"))).toBe(true);
+			expect(result.content.some(item => item.type === "image")).toBe(false);
+			expect(binaryFetch).toHaveBeenCalledTimes(1);
+			expect(conversion).toHaveBeenCalledTimes(1);
+			expect(conversion.mock.calls[0][1]).toBe(".pdf");
+			expect(requests).toBe(2);
 		});
 	}
 

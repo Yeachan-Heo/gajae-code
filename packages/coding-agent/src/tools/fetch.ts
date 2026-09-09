@@ -797,14 +797,34 @@ async function renderUrl(
 		};
 	}
 
-	const imageMimeType = isPdf ? undefined : resolveImageMimeType(mime, extHint);
+	// Classify generic downloads from the bounded binary response before dispatch.
+	// Both image rendering and document conversion reuse these bytes.
+	const dispositionBinary = !raw && isGenericMimeType(mime) ? await fetchBinary(finalUrl, timeout, signal) : undefined;
+	if (dispositionBinary && !dispositionBinary.ok) {
+		notes.push(dispositionBinary.error ? `Binary fetch failed: ${dispositionBinary.error}` : "Binary fetch failed");
+		return {
+			url,
+			finalUrl,
+			contentType: mime,
+			method: "failed",
+			content: "",
+			fetchedAt,
+			truncated: false,
+			notes,
+		};
+	}
+	const effectiveExt = dispositionBinary?.ok
+		? getExtensionHint(finalUrl, dispositionBinary.contentDisposition)
+		: extHint;
+	isPdf = mime === "application/pdf" || (effectiveExt === ".pdf" && isGenericMimeType(mime));
+	const imageMimeType = isPdf ? undefined : resolveImageMimeType(mime, effectiveExt);
 	let skipConvertibleBinaryRetry = false;
 	if (imageMimeType) {
 		if (!isInlineImageMimeTypeSupported(imageMimeType)) {
 			notes.push(
 				`Image MIME type ${imageMimeType} is unsupported for inline model serialization; returning text metadata only`,
 			);
-			const shouldTryConvertibleFallback = isConvertible(mime, extHint);
+			const shouldTryConvertibleFallback = isConvertible(mime, effectiveExt);
 			if (shouldTryConvertibleFallback) {
 				notes.push("Attempting binary conversion fallback for unsupported image MIME type");
 			} else {
@@ -812,7 +832,7 @@ async function renderUrl(
 			}
 			skipConvertibleBinaryRetry = !shouldTryConvertibleFallback;
 		} else {
-			const binary = await fetchBinary(finalUrl, timeout, signal);
+			const binary = dispositionBinary ?? (await fetchBinary(finalUrl, timeout, signal));
 			if (binary.ok) {
 				notes.push("Fetched image binary");
 				const conversionExtension = getExtensionHint(finalUrl, binary.contentDisposition) || extHint;
@@ -923,29 +943,6 @@ async function renderUrl(
 	}
 
 	// Step 3: Handle convertible binary files (PDF, DOCX, etc.)
-	// Generic downloads can identify PDFs only in Content-Disposition. Inspect the
-	// bounded binary response before raw fallback, and reuse it for conversion.
-	const dispositionBinary =
-		!raw && !skipConvertibleBinaryRetry && isGenericMimeType(mime)
-			? await fetchBinary(finalUrl, timeout, signal)
-			: undefined;
-	if (dispositionBinary && !dispositionBinary.ok) {
-		notes.push(dispositionBinary.error ? `Binary fetch failed: ${dispositionBinary.error}` : "Binary fetch failed");
-		return {
-			url,
-			finalUrl,
-			contentType: mime,
-			method: "failed",
-			content: "",
-			fetchedAt,
-			truncated: false,
-			notes,
-		};
-	}
-	const effectiveExt = dispositionBinary?.ok
-		? getExtensionHint(finalUrl, dispositionBinary.contentDisposition)
-		: extHint;
-	isPdf = mime === "application/pdf" || (effectiveExt === ".pdf" && isGenericMimeType(mime));
 	if (!skipConvertibleBinaryRetry && (isPdf || isConvertible(mime, effectiveExt))) {
 		const binary = dispositionBinary ?? (await fetchBinary(finalUrl, timeout, signal));
 		if (binary.ok) {

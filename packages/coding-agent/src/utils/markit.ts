@@ -1,5 +1,5 @@
 import { untilAborted } from "@gajae-code/utils";
-import { Markit, type StreamInfo } from "markit-ai";
+import { Markit, type StreamInfo } from "../../vendor/markit-ai/dist/index.js";
 import { ToolAbortError } from "../tools/tool-errors";
 import { prepareMuPdf, sanitizeMuPdfDiagnostic, withMuPdfDiagnostic } from "./mupdf";
 

@@ -18,7 +18,7 @@ export async function resetMuPdfAsset(): Promise<void> {
 export async function generateMuPdfAsset(): Promise<void> {
 	const temporaryPath = `${outputPath}.tmp`;
 	try {
-		const markitModule = url.fileURLToPath(import.meta.resolve("markit-ai"));
+		const markitModule = url.fileURLToPath(new URL("../vendor/markit-ai/dist/index.js", import.meta.url));
 		const modulePath = Bun.resolveSync("mupdf", path.dirname(markitModule));
 		const wasmPath = path.join(path.dirname(modulePath), "mupdf-wasm.wasm");
 		await fs.access(wasmPath);
@@ -34,7 +34,9 @@ export const embeddedMuPdfModule: string | undefined = ${JSON.stringify(modulePa
 		await fs.rename(temporaryPath, outputPath);
 	} catch (cause) {
 		await resetMuPdfAsset();
-		throw new Error("Unable to embed MuPDF WASM; install markit-ai's mupdf dependency before compiling.", { cause });
+		throw new Error("Unable to embed MuPDF WASM; install coding-agent's mupdf dependency before compiling.", {
+			cause,
+		});
 	} finally {
 		await fs.rm(temporaryPath, { force: true });
 	}

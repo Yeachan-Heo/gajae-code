@@ -24,7 +24,6 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { $ } from "bun";
-import { stageMarkit } from "../packages/coding-agent/scripts/stage-markit";
 import {
 	EXPECTED_EVIDENCE_FILE,
 	FINAL_EVIDENCE_FILE,
@@ -549,9 +548,7 @@ async function packPackageTwice(pkg: PublishPackage): Promise<Buffer> {
 			const packOutputDir = path.join(temporaryRoot, "tarballs");
 			await fs.cp(pkgDir, copiedPackageDir, {
 				recursive: true, force: false, errorOnExist: true,
-				filter: source => pkg.dir !== "packages/coding-agent" || path.basename(source) !== "node_modules",
 			});
-			if (pkg.dir === "packages/coding-agent") await stageMarkit(pkgDir, copiedPackageDir);
 			await fs.mkdir(packOutputDir);
 			const result = await $`npm pack --ignore-scripts --json --pack-destination ${packOutputDir}`.cwd(copiedPackageDir).quiet().nothrow();
 			if (result.exitCode !== 0) throw new Error(`npm pack failed for ${pkg.dir}: ${outputOf(result)}`);
