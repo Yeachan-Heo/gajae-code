@@ -3,6 +3,7 @@
 ## [Unreleased]
 ### Fixed
 
+- Managed migration-lock release now detects closed or reused Linux descriptors before native security verification and validates ownership through the recovered descriptor. Recovery still requires the original file identity, attempt id, and owner-only security; repeated release cannot change a successor. This fixes the retained-descriptor failure in #5399 without changing test timing or retry policy.
 - Coordinator responses now preserve `error: null` instead of replacing it with an `unavailable` error. Non-null errors still use fixed public messages, and unknown error codes remain mapped to `unavailable`.
 - File-lock acquisition now fences retained `.removing` transitions on macOS as well as Linux, preventing successor publication from racing predecessor cleanup and wedging session-index locking with `quarantine_collision`. Raced publications roll back only after exact-identity verification; unowned transitions remain untouched and produce bounded contention diagnostics.
 - Paseo's base ACP provider now inherits the active model preset when attaching to a live CLI session, including preset switching, without requiring a separately registered preset provider.
