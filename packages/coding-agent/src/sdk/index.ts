@@ -9,6 +9,17 @@ export {
 	type UnknownModelProfileDetails,
 	UnknownModelProfileError,
 } from "../config/model-profile-contract";
+export type {
+	QueuedInputAdmission,
+	QueuedInputDelivery,
+	QueuedInputExecution,
+	QueuedInputQueuePolicy,
+	QueuedInputRemovalReason,
+	QueuedInputSubmission,
+	QueuedInputTerminal,
+	SendUserMessageOptions,
+	TrackedSendUserMessageOptions,
+} from "../session/agent-session";
 export * as bus from "./bus";
 export * as host from "./host";
 export * as lifecycle from "./lifecycle";

@@ -6,6 +6,7 @@ import { getBundledModel } from "@gajae-code/ai";
 import { createMockModel, type MockHandler } from "@gajae-code/ai/providers/mock";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
+import type { QueuedInputSubmission } from "@gajae-code/coding-agent/sdk";
 import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
@@ -473,12 +474,13 @@ describe("queued promotion run identity (#4668)", () => {
 		);
 		const promptDone = session.prompt("first task");
 		await toolStarted.promise;
-		const queuedDone = session.sendUserMessage("queued steer", {
+		const submission = await session.submitUserMessage("queued steer", {
+			deliverAs: "steer",
+			trackSubmission: true,
 			onQueuedPromoted: promotion => {
 				if (promotion.removed) removals.push(promotion);
 			},
 		});
-		void queuedDone;
 		// Remove the queued message through the real editing API.
 		const entries = session.getQueuedMessageEntries();
 		expect(entries.length).toBeGreaterThan(0);
@@ -486,6 +488,16 @@ describe("queued promotion run identity (#4668)", () => {
 		expect(removedText).toBe("queued steer");
 		// The removal disposition must have fired exactly once for it.
 		expect(removals).toEqual([{ startsOwnRun: false, removed: true }]);
+		expect(await submission.execution).toMatchObject({
+			submissionId: submission.submissionId,
+			disposition: "removed",
+			reason: "removed",
+		});
+		expect(await submission.terminal).toMatchObject({
+			submissionId: submission.submissionId,
+			disposition: "removed",
+			reason: "removed",
+		});
 		gate.resolve();
 		await promptDone;
 	});
@@ -557,5 +569,165 @@ describe("queued promotion run identity (#4668)", () => {
 		expect(mock.calls).toHaveLength(2);
 		expect(promoted).toBe(true);
 		expect(session.pendingMessageCounts.followUp).toBe(0);
+	});
+
+	it("returns a stable handle for same-run steering and its terminal scope", async () => {
+		const gate = Promise.withResolvers<void>();
+		const toolStarted = Promise.withResolvers<void>();
+		const tool: AgentTool<typeof echoSchema, EchoParams> = {
+			name: "echo",
+			label: "Echo",
+			description: "Echo tool",
+			parameters: echoSchema,
+			async execute(_toolCallId, params) {
+				toolStarted.resolve();
+				await gate.promise;
+				return { content: [{ type: "text", text: `echoed: ${params.value}` }] };
+			},
+		};
+		session = buildSession(
+			[
+				{ content: [{ type: "toolCall", name: "echo", arguments: { value: "first" } }] },
+				{ content: ["first answer"] },
+			],
+			tool,
+		);
+
+		const prompt = session.prompt("first task");
+		await toolStarted.promise;
+		const submission: QueuedInputSubmission = await session.submitUserMessage("same-run steer", {
+			deliverAs: "steer",
+			trackSubmission: true,
+		});
+		const admission = await submission.admitted;
+		expect(admission).toMatchObject({
+			submissionId: submission.submissionId,
+			delivery: "steer",
+			queuePolicy: "respect-mode",
+		});
+
+		gate.resolve();
+		const execution = await submission.execution;
+		const terminal = await submission.terminal;
+		if (execution.disposition === "removed") throw new Error("Expected same-run execution");
+		expect(execution).toMatchObject({
+			submissionId: submission.submissionId,
+			disposition: "joined-current-run",
+		});
+		expect(terminal).toMatchObject({
+			submissionId: submission.submissionId,
+			disposition: "completed",
+			attemptScope: execution.attemptScope,
+		});
+		await prompt;
+	});
+
+	it("correlates successor-run follow-ups without message-text matching", async () => {
+		session = buildSession([{ content: ["first answer"] }, { content: ["successor answer"] }], {
+			name: "echo",
+			label: "Echo",
+			description: "Echo tool",
+			parameters: echoSchema,
+			async execute(_toolCallId, params) {
+				return { content: [{ type: "text", text: `echoed: ${params.value}` }] };
+			},
+		});
+
+		await session.prompt("first task");
+		const submission = await session.submitUserMessage("duplicate text", {
+			deliverAs: "followUp",
+			trackSubmission: true,
+		});
+		const execution = await submission.execution;
+		const terminal = await submission.terminal;
+		if (execution.disposition === "removed") throw new Error("Expected successor execution");
+		expect(execution).toMatchObject({
+			submissionId: submission.submissionId,
+			disposition: "promoted-to-run",
+		});
+		expect(terminal).toMatchObject({
+			submissionId: submission.submissionId,
+			disposition: "completed",
+			attemptScope: execution.attemptScope,
+		});
+		await session.waitForIdle();
+	});
+
+	it("keeps identical sequential submissions independently ordered", async () => {
+		session = buildSession([{ content: ["first"] }, { content: ["second"] }, { content: ["third"] }], {
+			name: "echo",
+			label: "Echo",
+			description: "Echo tool",
+			parameters: echoSchema,
+			async execute(_toolCallId, params) {
+				return { content: [{ type: "text", text: `echoed: ${params.value}` }] };
+			},
+		});
+		await session.prompt("first task");
+		const first = await session.submitUserMessage("identical", {
+			deliverAs: "followUp",
+			queuePolicy: "sequential",
+			trackSubmission: true,
+		});
+		const second = await session.submitUserMessage("identical", {
+			deliverAs: "followUp",
+			queuePolicy: "sequential",
+			trackSubmission: true,
+		});
+		expect(first.submissionId).not.toBe(second.submissionId);
+		expect((await first.admitted).queuePolicy).toBe("sequential");
+		expect((await second.admitted).queuePolicy).toBe("sequential");
+
+		const terminalOrder: string[] = [];
+		void first.terminal.then(() => terminalOrder.push(first.submissionId));
+		void second.terminal.then(() => terminalOrder.push(second.submissionId));
+		const firstExecution = await first.execution;
+		const secondExecution = await second.execution;
+		await Promise.all([first.terminal, second.terminal]);
+		if (firstExecution.disposition === "removed" || secondExecution.disposition === "removed")
+			throw new Error("Expected both sequential submissions to execute");
+		expect(["joined-current-run", "promoted-to-run"]).toContain(firstExecution.disposition);
+		expect(["joined-current-run", "promoted-to-run"]).toContain(secondExecution.disposition);
+		expect(firstExecution.attemptScope.generation).toBeLessThanOrEqual(secondExecution.attemptScope.generation);
+		expect(terminalOrder).toEqual([first.submissionId, second.submissionId]);
+	});
+
+	it("settles exact cancellation without waiting for a later terminal", async () => {
+		const gate = Promise.withResolvers<void>();
+		const toolStarted = Promise.withResolvers<void>();
+		const tool: AgentTool<typeof echoSchema, EchoParams> = {
+			name: "echo",
+			label: "Echo",
+			description: "Echo tool",
+			parameters: echoSchema,
+			async execute() {
+				toolStarted.resolve();
+				await gate.promise;
+				return { content: [{ type: "text", text: "done" }] };
+			},
+		};
+		session = buildSession(
+			[{ content: [{ type: "toolCall", name: "echo", arguments: { value: "first" } }] }, { content: ["done"] }],
+			tool,
+		);
+		const prompt = session.prompt("first task");
+		await toolStarted.promise;
+		const submission = await session.submitUserMessage("cancel me", {
+			deliverAs: "followUp",
+			trackSubmission: true,
+		});
+		expect(submission.cancel()).toBe(true);
+		expect(await submission.execution).toMatchObject({
+			submissionId: submission.submissionId,
+			disposition: "removed",
+			reason: "cancelled",
+		});
+		expect(await submission.terminal).toMatchObject({
+			submissionId: submission.submissionId,
+			disposition: "removed",
+			reason: "cancelled",
+		});
+		gate.resolve();
+		await prompt;
 	});
 });
