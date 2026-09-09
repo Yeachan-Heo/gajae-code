@@ -489,7 +489,7 @@ function semanticProfile(value: string): CrystalSemanticProfile {
 			normalized,
 		);
 	const deonticPermission =
-		/\b(?:users?|admins?|operators?|clients?|callers?|members?|roles?|applications?|services?)\b[^.!?]{0,40}\b(?:may|can)\s+(?:access|create|delete|edit|export|import|manage|read|run|use|view|write)\b/i.test(
+		/\b(?:users?|admins?|administrators?|operators?|clients?|callers?|members?|reviewers?|roles?|applications?|services?)\b[^.!?]{0,40}\b(?:may|can)\s+(?:access|approve|create|delete|edit|export|import|manage|read|run|submit|use|view|write)\b/i.test(
 			normalized,
 		);
 	const hedged =
@@ -1493,7 +1493,7 @@ export function crystallizeDeepInterview(value: unknown): DeepInterviewCrystal {
 			const replacementTerms = topicTerms(item.statement, false);
 			const overlap = [...directiveTerms].filter(term => replacementTerms.has(term));
 			if (overlap.length === 0) return false;
-			if (/\b(?:and|plus|also|along\s+with)\b/i.test(directive.clause))
+			if (/\b(?:and|plus|also|along\s+with|as\s+well\s+as)\b/i.test(directive.clause))
 				return [...directiveTerms].every(term => replacementTerms.has(term));
 			return true;
 		});
@@ -1513,7 +1513,7 @@ export function crystallizeDeepInterview(value: unknown): DeepInterviewCrystal {
 								?.content.indexOf(replacement.anchor.quote) ?? -1) > directive.clauseOffset)) &&
 					/\b(?:actually|instead|rather|replace|replaced|no longer|not)\b/i.test(replacement.anchor.quote) &&
 					[...directiveTerms].every(term => evidenceTerms(previous.statement).has(term)) &&
-					(!/\b(?:and|plus|also|along\s+with)\b/i.test(directive.clause) ||
+					(!/\b(?:and|plus|also|along\s+with|as\s+well\s+as)\b/i.test(directive.clause) ||
 						[...directiveTerms].every(term => replacementTerms.has(term)))
 				);
 			});
@@ -1580,36 +1580,40 @@ export function crystallizeDeepInterview(value: unknown): DeepInterviewCrystal {
 		for (const right of confirmedItems.slice(leftIndex + 1)) {
 			const rightTerms = topicTerms(right.statement, false);
 			const opposingAction = opposingActions.some(([positiveTerms, negativeTerms]) => {
-				const signed = (
-					statement: string,
-					terms: Set<string>,
-				): { sign: number; subject: Set<string> } | undefined => {
-					const normalizedStatement = statement.normalize("NFC").toLowerCase();
-					const containsAction = (term: string) =>
-						new RegExp(`(?:^|[^\\p{L}\\p{N}_])${term}(?:$|[^\\p{L}\\p{N}_])`, "u").test(normalizedStatement);
-					const positive = positiveTerms.some(containsAction);
-					const negative = negativeTerms.some(containsAction);
-					if (positive === negative) return undefined;
-					const actionTerm = (positive ? positiveTerms : negativeTerms).find(containsAction)!;
-					const actionIndex = normalizedStatement.search(
-						new RegExp(`(?:^|[^\\p{L}\\p{N}_])${actionTerm}(?:$|[^\\p{L}\\p{N}_])`, "u"),
-					);
-					const actionPrefix = normalizedStatement.slice(Math.max(0, actionIndex - 16), actionIndex + 1);
-					const explicitlyNegated = /\b(?:do\s+not|don['’]t|never|not)\s*$/i.test(actionPrefix);
-					return {
-						sign: (positive ? 1 : -1) * (explicitlyNegated ? -1 : 1),
-						subject: new Set(
-							[...terms].filter(term => !positiveTerms.includes(term) && !negativeTerms.includes(term)),
-						),
-					};
-				};
-				const leftAction = signed(left.statement, leftTerms);
-				const rightAction = signed(right.statement, rightTerms);
-				if (!leftAction || !rightAction || leftAction.sign === rightAction.sign) return false;
-				const sharedSubject = [...leftAction.subject].filter(term => rightAction.subject.has(term));
-				const smallerSubject =
-					leftAction.subject.size <= rightAction.subject.size ? leftAction.subject : rightAction.subject;
-				return sharedSubject.length > 0 && [...smallerSubject].every(term => sharedSubject.includes(term));
+				const signed = (statement: string): Array<{ sign: number; subject: Set<string> }> =>
+					statement.split(/\b(?:but|however)\b|[;,]/i).flatMap(fragment => {
+						const normalizedStatement = fragment.normalize("NFC").toLowerCase();
+						const containsAction = (term: string) =>
+							new RegExp(`(?:^|[^\\p{L}\\p{N}_])${term}(?:$|[^\\p{L}\\p{N}_])`, "u").test(normalizedStatement);
+						const positive = positiveTerms.some(containsAction);
+						const negative = negativeTerms.some(containsAction);
+						if (positive === negative) return [];
+						const actionTerm = (positive ? positiveTerms : negativeTerms).find(containsAction)!;
+						const actionIndex = normalizedStatement.search(
+							new RegExp(`(?:^|[^\\p{L}\\p{N}_])${actionTerm}(?:$|[^\\p{L}\\p{N}_])`, "u"),
+						);
+						const actionPrefix = normalizedStatement.slice(Math.max(0, actionIndex - 16), actionIndex + 1);
+						const explicitlyNegated = /\b(?:do\s+not|don['’]t|never|not)\s*$/i.test(actionPrefix);
+						return [
+							{
+								sign: (positive ? 1 : -1) * (explicitlyNegated ? -1 : 1),
+								subject: new Set(
+									[...topicTerms(fragment, false)].filter(
+										term => !positiveTerms.includes(term) && !negativeTerms.includes(term),
+									),
+								),
+							},
+						];
+					});
+				return signed(left.statement).some(leftAction =>
+					signed(right.statement).some(rightAction => {
+						if (leftAction.sign === rightAction.sign) return false;
+						const sharedSubject = [...leftAction.subject].filter(term => rightAction.subject.has(term));
+						const smallerSubject =
+							leftAction.subject.size <= rightAction.subject.size ? leftAction.subject : rightAction.subject;
+						return sharedSubject.length > 0 && [...smallerSubject].every(term => sharedSubject.includes(term));
+					}),
+				);
 			});
 			if (
 				opposingAction ||

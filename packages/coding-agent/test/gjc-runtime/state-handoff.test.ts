@@ -328,6 +328,70 @@ describe("gjc state handoff", () => {
 			await expect(fs.access(deepInterviewExecutionApprovalRecordPath(cwd, TEST_SESSION_ID))).rejects.toThrow();
 		});
 	});
+	it("rejects approval until the matching Ask result is durably recorded", async () => {
+		await withTempCwd(async cwd => {
+			await writePublishedReadyCrystal(cwd, { recordApproval: false });
+			const transcriptPath = path.join(cwd, "approval-pending.jsonl");
+			const transcript = `${JSON.stringify({ type: "session", id: TEST_SESSION_ID, cwd })}\n`;
+			await fs.writeFile(transcriptPath, transcript);
+			await recordDeepInterviewExecutionApproval({
+				cwd,
+				sessionId: TEST_SESSION_ID,
+				questionId: "pending-ask",
+				gateId: "ask-approval:pending",
+				target: "ultragoal",
+				selectedOptions: ["Approve execution via ultragoal"],
+				transcriptPath,
+				transcriptSha256: createHash("sha256").update(transcript).digest("hex"),
+				transcriptPrefixBytes: Buffer.byteLength(transcript),
+				toolCallId: "ask-pending",
+			});
+			const premature = await runNativeDeepInterviewCommand(["approve-execution", "--json"], cwd);
+			expect(premature.status).toBe(2);
+			expect(premature.stderr).toContain("not durably recorded");
+			await fs.appendFile(
+				transcriptPath,
+				`${JSON.stringify({
+					type: "message",
+					message: {
+						role: "toolResult",
+						toolName: "ask",
+						toolCallId: "ask-pending",
+						details: { selectedOptions: ["Approve execution via ultragoal"] },
+					},
+				})}\n`,
+			);
+			const approved = await runNativeDeepInterviewCommand(["approve-execution", "--json"], cwd);
+			expect(approved.status, approved.stderr).toBe(0);
+		});
+	});
+	it("rejects approval superseded by a later user transcript message", async () => {
+		await withTempCwd(async cwd => {
+			await writePublishedReadyCrystal(cwd, { recordApproval: false });
+			const transcriptPath = path.join(cwd, "approval-superseded.jsonl");
+			const transcript = `${JSON.stringify({ type: "session", id: TEST_SESSION_ID, cwd })}\n`;
+			await fs.writeFile(transcriptPath, transcript);
+			await recordDeepInterviewExecutionApproval({
+				cwd,
+				sessionId: TEST_SESSION_ID,
+				questionId: "superseded-ask",
+				gateId: "ask-approval:superseded",
+				target: "ultragoal",
+				selectedOptions: ["Approve execution via ultragoal"],
+				transcriptPath,
+				transcriptSha256: createHash("sha256").update(transcript).digest("hex"),
+				transcriptPrefixBytes: Buffer.byteLength(transcript),
+				toolCallId: "ask-superseded",
+			});
+			await fs.appendFile(
+				transcriptPath,
+				`${JSON.stringify({ type: "message", message: { role: "toolResult", toolName: "ask", toolCallId: "ask-superseded", details: { selectedOptions: ["Approve execution via ultragoal"] } } })}\n${JSON.stringify({ type: "message", message: { role: "user", content: "Stop here." } })}\n`,
+			);
+			const result = await runNativeDeepInterviewCommand(["approve-execution", "--json"], cwd);
+			expect(result.status).toBe(2);
+			expect(result.stderr).toContain("superseded by a later user decision");
+		});
+	});
 	it("rejects wrong-target, stale, and replaced execution approval records", async () => {
 		for (const mutation of ["wrong-target", "stale-revision", "symlink"] as const) {
 			await withTempCwd(async cwd => {

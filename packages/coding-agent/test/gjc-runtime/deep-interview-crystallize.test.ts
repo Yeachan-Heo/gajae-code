@@ -168,7 +168,7 @@ describe("deep-interview crystallize contract", () => {
 	});
 
 	it("does not let a partial correction drop an additive storage requirement", () => {
-		const content = "Use PostgreSQL and Redis for storage. Actually, use PostgreSQL 16 for storage.";
+		const content = "Use PostgreSQL as well as Redis for storage. Actually, use PostgreSQL 16 for storage.";
 		const snapshot: CrystalSnapshot = {
 			revision: 1,
 			start: 0,
@@ -237,6 +237,9 @@ describe("deep-interview crystallize contract", () => {
 			"conservative derivation failed",
 		);
 		expect(crystallizeDeepInterview(singleGoalEvidence("Admins may export reports.")).lifecycle).toBe("ready");
+		expect(crystallizeDeepInterview(singleGoalEvidence("Administrators may approve deployment.")).lifecycle).toBe(
+			"ready",
+		);
 	});
 
 	it("rejects multiline or Markdown-bearing item identifiers", () => {

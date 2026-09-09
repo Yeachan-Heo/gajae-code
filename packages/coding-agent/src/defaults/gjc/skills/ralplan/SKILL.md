@@ -113,7 +113,7 @@ The consensus workflow:
    - **Stop here** — keep the plan as `pending approval` and make no further changes
 
    Always include a free-text option for the ordinary `off` approval flow. Do not stop with plain text and no `ask` in that flow; its terminal action is this `ask`.
-9. On valid automatic admission or explicit approval, invoke the admitted/approved `/skill:ultragoal` target by default. On **Refine further**, return to the step 5 re-review loop. On **Stop here**, leave the `pending approval` artifact and stop. A `planning_stuck` final receipt never reaches this step. Never implement directly.
+9. On valid automatic admission or explicit approval, invoke the admitted/approved `/skill:ultragoal` target by default. After a structured explicit approval answer, first run `gjc state deep-interview approve-execution --json` in the following turn, after the `ask` tool result is durably recorded; this consumes the exact transcript-bound approval record and must succeed before dispatch. On **Refine further**, return to the step 5 re-review loop. On **Stop here**, leave the `pending approval` artifact and stop. A `planning_stuck` final receipt never reaches this step. Never implement directly.
 
    Before invoking `/skill:ultragoal`, mark ralplan ready for handoff so the skill tool's chain guard permits the transition:
 

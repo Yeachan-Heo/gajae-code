@@ -1222,6 +1222,11 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 			const recommended = validRecommendedIndex(q.recommended, rawOptionLabels.length);
 			const questionIndex = params.questions.indexOf(q);
 			const emptyCustomAttempt = options?.emptyCustomAttempt ?? 0;
+			let executionGateId =
+				(q.workflowGate?.stage === "deep-interview" && q.workflowGate.kind === "execution") ||
+				(q.workflowGate?.stage === "ralplan" && q.workflowGate.kind === "approval")
+					? `ask-approval:${randomUUID()}`
+					: undefined;
 			// Route headless asks through the SDK workflow-gate emitter; a connected
 			// SDK responder supplies the durable answer instead of an interactive UI.
 			if (gateEmitter && canUseWorkflowGate) {
@@ -1236,10 +1241,13 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 					allowEmpty: q.multi === true && params.questions.length > 1,
 					navigationLabel: questionIndex === params.questions.length - 1 ? "Done" : "Next",
 				};
-				let executionGateId: string | undefined;
 				const stopGateObservation = gateEmitter.onGateEmitted?.(gate => {
 					const stageState = gate.context?.stage_state;
-					if (gate.stage === "deep-interview" && gate.kind === "execution" && stageState?.question_id === q.id)
+					if (
+						((gate.stage === "deep-interview" && gate.kind === "execution") ||
+							(gate.stage === "ralplan" && gate.kind === "approval")) &&
+						stageState?.question_id === q.id
+					)
 						executionGateId = gate.gate_id;
 				});
 				let answer: unknown;

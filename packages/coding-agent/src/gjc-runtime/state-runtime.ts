@@ -2093,6 +2093,8 @@ async function assertExecutionApprovalTranscriptEvidence(
 		}
 		if (!isPlainObject(entry) || entry.type !== "message" || !isPlainObject(entry.message)) continue;
 		const message = entry.message;
+		if (durableAnswer && (message.role === "user" || (message.role === "toolResult" && message.toolName === "ask")))
+			throw new StateCommandError(2, "deep-interview execution approval was superseded by a later user decision");
 		if (message.role !== "toolResult" || message.toolName !== "ask" || message.toolCallId !== record.tool_call_id)
 			continue;
 		const details = isPlainObject(message.details) ? message.details : undefined;

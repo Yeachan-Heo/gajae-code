@@ -2983,7 +2983,9 @@ describe("AskTool deep-interview recorder persistence", () => {
 			sessionId: "approval-local",
 			questionId: "deep-interview-execution",
 			target: "ultragoal",
+			toolCallId: "local-execution-choice",
 		});
+		expect(record.mock.calls[0]?.[0].gateId).toMatch(/^ask-approval:/);
 
 		record.mockClear();
 		const emitter = {
