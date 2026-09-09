@@ -1,4 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
+import * as url from "node:url";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import type { ToolSession } from "@gajae-code/coding-agent/tools";
 import { loadReadUrlCacheEntry, readUrlCacheTestHooks } from "@gajae-code/coding-agent/tools/fetch";
@@ -28,16 +32,20 @@ function pdfFixture(text: string): string {
 	return `${pdf}trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF\n`;
 }
 
+const mupdfModulePath = Bun.resolveSync("mupdf", path.dirname(url.fileURLToPath(import.meta.resolve("markit-ai"))));
+
 describe("PDF URL source-text inspection", () => {
 	let server: Bun.Server<undefined>;
 	let session: ToolSession;
 	let body: string | Buffer;
 	let contentType: string;
+	let contentDisposition: string;
 	let requests: number;
 
 	beforeEach(() => {
 		body = pdfFixture("Dummy PDF file");
 		contentType = "application/pdf";
+		contentDisposition = "";
 		requests = 0;
 		server = Bun.serve({
 			hostname: "127.0.0.1",
@@ -45,7 +53,9 @@ describe("PDF URL source-text inspection", () => {
 			fetch(request) {
 				requests++;
 				if (new URL(request.url).pathname.endsWith(".md")) return new Response(null, { status: 404 });
-				const response = new Response(body, { headers: { "content-type": contentType } });
+				const headers = new Headers({ "content-type": contentType });
+				if (contentDisposition) headers.set("content-disposition", contentDisposition);
+				const response = new Response(body, { headers });
 				return response;
 			},
 		});
@@ -84,20 +94,52 @@ describe("PDF URL source-text inspection", () => {
 		server.stop(true);
 	});
 
-	for (const [route, mime] of [
+	it("keeps dependency paths out of local and remote malformed-PDF read results", async () => {
+		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-pdf-private-read-"));
+		try {
+			body = "%PDF-1.4\nmalformed payload without a document";
+			const localFile = path.join(directory, "invalid.pdf");
+			await Bun.write(localFile, body);
+			for (const target of [localFile, new URL("invalid.pdf", server.url).href]) {
+				let rendered: string;
+				try {
+					const result = await new ReadTool(session).execute("pdf-private-read", { path: target });
+					rendered = JSON.stringify(result);
+				} catch (error) {
+					rendered = String(error);
+				}
+				expect(rendered).toContain("MuPDF");
+				expect(rendered).not.toContain(path.dirname(mupdfModulePath));
+				expect(rendered).not.toContain(path.resolve(import.meta.dir, "../../../.."));
+				expect(rendered).not.toContain("build-time provenance");
+			}
+		} finally {
+			await fs.rm(directory, { recursive: true, force: true });
+		}
+	});
+
+	for (const [route, mime, disposition = ""] of [
 		["document", "application/pdf; charset=binary"],
 		["document.txt", "application/pdf"],
 		["document.pdf", "application/octet-stream"],
 		["document.pdf", "binary/octet-stream"],
 		["document.pdf", "unknown"],
 		["document.pdf", ""],
+		["download", "application/octet-stream", "attachment; filename=report.pdf"],
+		["download", "application/octet-stream", 'attachment; filename="report.pdf"'],
+		["download", "binary/octet-stream", "attachment; filename=report.pdf"],
+		["download", "unknown", "attachment; filename=report.pdf"],
+		["download", "", "attachment; filename=report.pdf"],
 	]) {
-		it(`extracts short text from ${mime}`, async () => {
+		it(`extracts short text from ${mime} ${disposition}`, async () => {
 			contentType = mime;
+			contentDisposition = disposition;
+			const binaryFetch = vi.spyOn(scrapers, "fetchBinary");
 			const result = await loadReadUrlCacheEntry(session, { path: new URL(route, server.url).href });
 			expect(result.details.method).toBe("markit");
 			expect(result.output).toContain("Dummy PDF file");
 			expect(result.output).not.toContain("%PDF-");
+			expect(binaryFetch).toHaveBeenCalledTimes(1);
 		});
 
 		for (const [label, payload] of [
@@ -105,19 +147,26 @@ describe("PDF URL source-text inspection", () => {
 			["empty body", ""],
 			["malformed PDF", "%PDF-1.4\nmalformed payload without a document"],
 		]) {
-			it(`fails ${label} with ${mime} rather than returning PDF source`, async () => {
+			it(`fails ${label} with ${mime} ${disposition} rather than returning PDF source`, async () => {
 				contentType = mime;
+				contentDisposition = disposition;
+				const binaryFetch = vi.spyOn(scrapers, "fetchBinary");
 				body = payload;
 				const result = await loadReadUrlCacheEntry(session, { path: new URL(route, server.url).href });
 				expect(result.details.method).toBe("failed");
 				expect(result.details.notes.join("\n")).toMatch(/markit conversion (failed: .+|produced no usable output)/);
 				expect(result.output).not.toContain("%PDF-");
 				expect(result.output).not.toContain("malformed payload");
+				expect(result.output).not.toContain(path.dirname(mupdfModulePath));
+				expect(result.output).not.toContain("build-time provenance");
+				expect(binaryFetch).toHaveBeenCalledTimes(1);
 			});
 		}
 
-		it(`keeps explicit :raw intentional for ${mime}`, async () => {
+		it(`keeps explicit :raw intentional for ${mime} ${disposition}`, async () => {
 			contentType = mime;
+			contentDisposition = disposition;
+			const binaryFetch = vi.spyOn(scrapers, "fetchBinary");
 			const conversion = vi.spyOn(scrapers, "convertWithMarkit");
 			const result = await new ReadTool(session).execute("read-pdf-raw", {
 				path: `${new URL(route, server.url).href}:raw`,
@@ -125,9 +174,21 @@ describe("PDF URL source-text inspection", () => {
 			expect(result.details?.method).toBe("raw");
 			expect(result.content.some(item => item.type === "text" && item.text.includes("%PDF-1.4"))).toBe(true);
 			expect(conversion).not.toHaveBeenCalled();
+			expect(binaryFetch).not.toHaveBeenCalled();
 			expect(requests).toBe(1);
 		});
 	}
+
+	it("does not classify a generic download as PDF from bytes alone", async () => {
+		contentType = "application/octet-stream";
+		const conversion = vi.spyOn(scrapers, "convertWithMarkit");
+		const binaryFetch = vi.spyOn(scrapers, "fetchBinary");
+		const result = await loadReadUrlCacheEntry(session, { path: new URL("download", server.url).href });
+		expect(result.details.method).toBe("raw");
+		expect(result.output).toContain("%PDF-1.4");
+		expect(conversion).not.toHaveBeenCalled();
+		expect(binaryFetch).toHaveBeenCalledTimes(1);
+	});
 
 	it("preserves the detailed converter failure in the read receipt", async () => {
 		vi.spyOn(scrapers, "convertWithMarkit").mockResolvedValue({
@@ -161,6 +222,7 @@ describe("PDF URL source-text inspection", () => {
 
 	it("retains inline images when a .pdf URL actually serves PNG", async () => {
 		contentType = "image/png";
+		contentDisposition = 'attachment; filename="report.pdf"';
 		body = Buffer.from(
 			"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC",
 			"base64",
@@ -196,6 +258,7 @@ describe("PDF URL source-text inspection", () => {
 	]) {
 		it(`retains the ${method} handler when a .pdf URL serves ${mime}`, async () => {
 			contentType = mime;
+			contentDisposition = 'attachment; filename="report.pdf"';
 			body = payload;
 			const conversion = vi.spyOn(scrapers, "convertWithMarkit");
 			const binaryFetch = vi.spyOn(scrapers, "fetchBinary");
@@ -216,6 +279,7 @@ describe("PDF URL source-text inspection", () => {
 
 	it("retains HTML fallback when a .pdf URL actually serves HTML", async () => {
 		contentType = "text/html";
+		contentDisposition = 'attachment; filename="report.pdf"';
 		body = "<html><body><p>Document unavailable</p></body></html>";
 		const result = await loadReadUrlCacheEntry(session, { path: new URL("unavailable.pdf", server.url).href });
 		expect(result.details.method).toBe("raw-html");

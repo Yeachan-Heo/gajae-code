@@ -1,8 +1,9 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
+import { logger } from "@gajae-code/utils";
 import {
 	buildDevCompileArgs,
 	buildReleaseCompileArgs,
@@ -10,7 +11,7 @@ import {
 	releaseEntrypoints,
 } from "../scripts/compile-args";
 import { generateMuPdfAsset, resetMuPdfAsset } from "../scripts/embed-mupdf";
-import { withMuPdfDiagnostic } from "../src/utils/mupdf";
+import { mupdfAssetMapping, sanitizeMuPdfDiagnostic, withMuPdfDiagnostic } from "../src/utils/mupdf";
 
 const repoRoot = path.resolve(import.meta.dir, "../../..");
 const packageRoot = path.join(repoRoot, "packages/coding-agent");
@@ -63,6 +64,11 @@ Bun.file = originalFile;
 let file;
 let rendered;
 let recovery;
+if (mode === "invalid-pdf") {
+	const filePath = process.cwd() + "/malformed.pdf";
+	await Bun.write(filePath, bytes);
+	file = await convertFileWithMarkit(filePath);
+}
 if (mode === "success") {
 	await Bun.write("input.pdf", bytes);
 	file = await convertFileWithMarkit("input.pdf");
@@ -150,6 +156,9 @@ describe("MuPDF standalone packaging", () => {
 				for (const name of ["mupdf.ts", "mupdf-embedded.ts"]) {
 					await fs.copyFile(path.join(packageRoot, "src/utils", name), path.join(utils, name));
 				}
+				const scope = path.join(directory, "node_modules/@gajae-code");
+				await fs.mkdir(scope, { recursive: true });
+				await fs.symlink(path.join(repoRoot, "packages/utils"), path.join(scope, "utils"), "dir");
 				const lazyEntry = path.join(installed, "lazy.ts");
 				await Bun.write(
 					lazyEntry,
@@ -222,7 +231,7 @@ console.log(JSON.stringify({ buffer: { ok: true, content: "" }, mapping: await B
 	}
 
 	for (const fault of ["missing", "corrupt"] as const) {
-		it(`preserves the original ${fault} JS loader error through the source conversion wrapper`, async () => {
+		it(`retains the ${fault} JS loader error class and safe reason without resolved paths`, async () => {
 			const directory = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-mupdf-loader-"));
 			try {
 				const utils = path.join(directory, "src/utils");
@@ -286,7 +295,16 @@ console.log(JSON.stringify({ buffer, wasmValid, loaderError, recovery, mapping: 
 				expect(output.buffer.error).toContain("AggregateError");
 				expect(output.buffer.error).toContain("MuPDF module initialization failed");
 				expect(output.loaderError?.message).toBeTruthy();
-				expect(output.buffer.error).toContain(`${output.loaderError!.name}: ${output.loaderError!.message}`);
+				expect(output.buffer.error).toContain(`${output.loaderError!.name}:`);
+				expect(output.buffer.error).toContain(sanitizeMuPdfDiagnostic(output.loaderError!.message));
+				expect(output.buffer.error).not.toContain(directory);
+				expect(output.buffer.error).not.toContain(repoRoot);
+				if (fault === "missing") {
+					expect(output.buffer.error).toMatch(/Cannot find|Module not found/i);
+					expect(output.buffer.error).toContain("[path redacted]");
+				} else {
+					expect(output.buffer.error).toMatch(/Unexpected|Expected|Syntax/i);
+				}
 				if (fault === "missing") expect(output.loaderError?.message).toContain("mupdf-wasm.js");
 				else expect(output.loaderError?.name).toBe("BuildMessage");
 				expect(output.mapping).toContain(path.join(await fs.realpath(dependency), "dist/mupdf.js"));
@@ -324,14 +342,45 @@ catch (error) { console.log(JSON.stringify({ buffer: { ok: false, content: "", e
 			await fs.rm(directory, { recursive: true, force: true });
 		}
 	}, 120_000);
-	it("keeps the original exception and its cause in the diagnostic error", () => {
-		const rootCause = new WebAssembly.CompileError("invalid WASM");
-		const failure = new Error("asset initialization failed", { cause: rootCause });
-		const diagnostic = withMuPdfDiagnostic(failure);
-		expect(diagnostic.cause).toBe(failure);
-		expect(failure.cause).toBe(rootCause);
-		expect(diagnostic.message).toContain("module mupdf");
-		expect(diagnostic.message).toContain("mupdf-wasm.wasm ->");
+	it("keeps original causes and resolved provenance in operational debug logging only", () => {
+		const debug = spyOn(logger, "debug").mockImplementation(() => {});
+		try {
+			const rootCause = new WebAssembly.CompileError("invalid WASM at /private/install/mupdf-wasm.wasm");
+			const failure = new Error("asset initialization failed", { cause: rootCause });
+			const diagnostic = withMuPdfDiagnostic(failure);
+			expect(diagnostic.cause).toBe(failure);
+			expect(failure.cause).toBe(rootCause);
+			expect(diagnostic.message).toContain("MuPDF; package asset; mupdf-wasm.wasm");
+			expect(diagnostic.message).not.toContain(mupdfAssetMapping);
+			expect(diagnostic.message).not.toContain("/private/install");
+			expect(debug).toHaveBeenCalledWith("MuPDF conversion failed", {
+				mapping: mupdfAssetMapping,
+				error: expect.stringContaining(rootCause.message),
+				initializationFailure: "undefined",
+			});
+		} finally {
+			debug.mockRestore();
+		}
+	});
+
+	it("redacts path-bearing cause fields and control characters while retaining safe reasons", () => {
+		for (const location of [
+			"/Users/private user/install/mupdf-wasm.js",
+			"C:\\Users\\private user\\mupdf-wasm.js",
+			"\\\\host\\private\\mupdf-wasm.js",
+			"~/private/mupdf-wasm.js",
+			"[REDACTED]/private/mupdf-wasm.js",
+			"file:%2FUsers%2Fprivate%2Fmupdf-wasm.js",
+			"/Users/pri\u0000vate/mupdf-wasm.js",
+		]) {
+			const cause = new Error(`Cannot find module '${location}' from '${location}'`);
+			const diagnostic = withMuPdfDiagnostic(cause);
+			expect(diagnostic.cause).toBe(cause);
+			expect(sanitizeMuPdfDiagnostic(`${cause.name}: ${cause.message}`)).toBe(
+				"Error: Cannot find module '[path redacted]' from '[path redacted]'",
+			);
+		}
+		expect(sanitizeMuPdfDiagnostic("CompileError: invalid WASM")).toBe("CompileError: invalid WASM");
 	});
 
 	for (const channel of ["source", "release", "dev"] as const) {
@@ -396,8 +445,22 @@ catch (error) { console.log(JSON.stringify({ buffer: { ok: false, content: "", e
 					const failure = await runIsolated([...command, mode], runtimeDir);
 					expect(failure.buffer.ok).toBe(false);
 					expect(failure.buffer.content).toBe("");
-					expect(failure.buffer.error).toContain("module mupdf");
-					expect(failure.buffer.error).toContain("mupdf-wasm.wasm ->");
+					expect(failure.buffer.error).toContain("MuPDF;");
+					expect(failure.buffer.error).toContain(channel === "source" ? "package asset" : "embedded asset");
+					for (const result of mode === "invalid-pdf" ? [failure.buffer, failure.file!] : [failure.buffer]) {
+						expect(result.ok).toBe(false);
+						expect(result.content).toBe("");
+						expect(result.error).toContain("PDF conversion failed");
+						expect(result.error).not.toContain(repoRoot);
+						expect(result.error).not.toContain(buildDir);
+						expect(result.error).not.toContain(runtimeDir);
+						expect(result.error).not.toContain("$bunfs");
+						for (const resolvedPath of failure.mapping.split(" -> ").slice(1)) {
+							expect(result.error).not.toContain(
+								resolvedPath.split("; WASM")[0].replace("build-time provenance ", ""),
+							);
+						}
+					}
 					expect(failure.buffer.error).not.toContain("npm install");
 					if (mode === "wasm-failure") {
 						expect(failure.buffer.error).toContain("CompileError");

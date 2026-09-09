@@ -1,7 +1,7 @@
 import { untilAborted } from "@gajae-code/utils";
 import { Markit, type StreamInfo } from "markit-ai";
 import { ToolAbortError } from "../tools/tool-errors";
-import { prepareMuPdf, withMuPdfDiagnostic } from "./mupdf";
+import { prepareMuPdf, sanitizeMuPdfDiagnostic, withMuPdfDiagnostic } from "./mupdf";
 
 export interface MarkitConversionResult {
 	content: string;
@@ -17,16 +17,17 @@ function normalizeExtension(extension: string): string {
 	return trimmed.startsWith(".") ? trimmed : `.${trimmed}`;
 }
 
-function normalizeError(error: unknown): string {
+function normalizeError(error: unknown, pdf = false): string {
 	const messages: string[] = [];
 	const seen = new Set<unknown>();
 	while (error !== undefined && !seen.has(error)) {
 		seen.add(error);
 		if (error instanceof Error) {
-			messages.push(`${error.name}: ${error.message}`);
+			const message = `${error.name}: ${error.message}`;
+			messages.push(pdf ? sanitizeMuPdfDiagnostic(message) : message);
 			error = error.cause;
 		} else {
-			messages.push(String(error));
+			messages.push(pdf ? sanitizeMuPdfDiagnostic(String(error)) : String(error));
 			break;
 		}
 	}
@@ -71,7 +72,9 @@ export async function convertFileWithMarkit(filePath: string, signal?: AbortSign
 		return {
 			content: "",
 			ok: false,
-			error: normalizeError(filePath.toLowerCase().endsWith(".pdf") ? withMuPdfDiagnostic(error) : error),
+			error: filePath.toLowerCase().endsWith(".pdf")
+				? normalizeError(withMuPdfDiagnostic(error), true)
+				: normalizeError(error),
 		};
 	}
 }
@@ -100,7 +103,8 @@ export async function convertBufferWithMarkit(
 		return {
 			content: "",
 			ok: false,
-			error: normalizeError(normalizedExtension === ".pdf" ? withMuPdfDiagnostic(error) : error),
+			error:
+				normalizedExtension === ".pdf" ? normalizeError(withMuPdfDiagnostic(error), true) : normalizeError(error),
 		};
 	}
 }

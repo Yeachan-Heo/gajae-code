@@ -1,5 +1,7 @@
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import * as path from "node:path";
+import * as url from "node:url";
+import * as util from "node:util";
+import { logger } from "@gajae-code/utils";
 import { embeddedMuPdfModule, embeddedMuPdfWasm } from "./mupdf-embedded";
 
 export let mupdfAssetMapping = "module mupdf; WASM mupdf-wasm.wasm -> unresolved";
@@ -17,9 +19,9 @@ function resolveWasmAsset(): string {
 		if (process.env.PI_COMPILED || /\$bunfs|~BUN|%7EBUN/.test(import.meta.url)) {
 			throw new Error("Compiled MuPDF WASM mapping is missing; run scripts/embed-mupdf.ts before compiling.");
 		}
-		const markitModule = fileURLToPath(import.meta.resolve("markit-ai"));
-		moduleMapping = Bun.resolveSync("mupdf", dirname(markitModule));
-		wasmAsset = join(dirname(moduleMapping), "mupdf-wasm.wasm");
+		const markitModule = url.fileURLToPath(import.meta.resolve("markit-ai"));
+		moduleMapping = Bun.resolveSync("mupdf", path.dirname(markitModule));
+		wasmAsset = path.join(path.dirname(moduleMapping), "mupdf-wasm.wasm");
 	}
 	mupdfAssetMapping = `module mupdf -> ${moduleMapping}; WASM mupdf-wasm.wasm -> ${wasmAsset}`;
 	return wasmAsset;
@@ -53,5 +55,21 @@ export function prepareMuPdf(): Promise<void> {
 
 export function withMuPdfDiagnostic(error: unknown): Error {
 	const cause = initializationFailure ?? error;
-	return new Error(`PDF conversion failed [${mupdfAssetMapping}]`, { cause });
+	logger.debug("MuPDF conversion failed", {
+		mapping: mupdfAssetMapping,
+		error: util.inspect(error, { depth: null, colors: false }),
+		initializationFailure: util.inspect(initializationFailure, { depth: null, colors: false }),
+	});
+	const asset = embeddedMuPdfWasm ? "embedded asset" : "package asset";
+	return new Error(`PDF conversion failed [MuPDF; ${asset}; mupdf-wasm.wasm]`, { cause });
+}
+
+// Only the model-facing rendering is redacted; Error.cause remains intact for
+// internal inspection and operational debug logging. Conservatively redact the
+// rest of a path-bearing field so spaces in install paths cannot leak suffixes.
+export function sanitizeMuPdfDiagnostic(message: string): string {
+	return util
+		.stripVTControlCharacters(message)
+		.replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029\u202a-\u202e\u2066-\u2069]/g, "")
+		.replace(/[^\s"'`]*(?:[/\\]|%2f|%5c)[^"'`]*(?=["'`]|$)/gi, "[path redacted]");
 }
