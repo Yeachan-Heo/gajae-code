@@ -506,16 +506,23 @@ async function runFastGate(cwd: string, trustedRoot: string): Promise<boolean> {
 async function runPushedTreeFastGate(cwd: string, trustedRoot: string, headSha: string): Promise<boolean> {
 	const tree = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-pushed-tree-"));
 	try {
-		const listed = await git(["ls-tree", "-rz", "--full-tree", headSha, "--", "packages/coding-agent/src"], cwd);
+		const listed = await git(["ls-tree", "-r", "-z", "--full-tree", headSha, "--", "packages/coding-agent/src"], cwd);
 		if (listed.exitCode !== 0) return false;
 		const files: { oid: string; name: string }[] = [];
+		const treeRoot = path.resolve(tree);
 		for (const entry of new TextDecoder("utf-8", { fatal: true }).decode(listed.stdout).split("\0").filter(Boolean)) {
 			const match = /^(100644|100755|120000|160000) (blob|commit) ([0-9a-f]{40})\t([\s\S]+)$/u.exec(entry);
 			if (!match) return false;
 			// Unsupported source entries must not disappear from the scan or escape it.
 			if (match[1] === "120000" || match[1] === "160000" || match[2] !== "blob") return false;
 			const name = match[4]!;
-			if (!name.startsWith("packages/coding-agent/src/") || name.split("/").some(part => !part || part === "." || part === "..")) return false;
+			// Git stores slash-separated names, but a backslash becomes a path separator
+			// on Windows. Reject it before host-native joining so a pushed Git name such
+			// as `src/..\\escaped.ts` can never leave the staging root.
+			if (name.includes("\\") || !name.startsWith("packages/coding-agent/src/") || name.split("/").some(part => !part || part === "." || part === "..")) return false;
+			const target = path.resolve(tree, name);
+			const relativeTarget = path.relative(treeRoot, target);
+			if (!relativeTarget || relativeTarget.startsWith(`..${path.sep}`) || path.isAbsolute(relativeTarget)) return false;
 			files.push({ oid: match[3]!, name });
 		}
 		await fs.mkdir(path.join(tree, "packages/coding-agent/src"), { recursive: true });

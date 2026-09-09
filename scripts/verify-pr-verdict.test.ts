@@ -741,7 +741,7 @@ process.exit(98);
 		});
 	}
 
-	async function exactTreePreflight(kind: "needs-human" | "merge-blocked" | "merge-approved" | "stale" | "malformed" | "missing-risk" | "multiple-risk" | "bad-pushed-tree" | "export-ignore" | "export-subst" | "source-symlink" | "case-collision") {
+	async function exactTreePreflight(kind: "needs-human" | "merge-blocked" | "merge-approved" | "stale" | "malformed" | "missing-risk" | "multiple-risk" | "bad-pushed-tree" | "export-ignore" | "export-subst" | "source-symlink" | "source-backslash" | "case-collision") {
 		const temp = await fs.mkdtemp(path.join(Bun.env.TMPDIR ?? "/tmp", "push-exact-tree-"));
 		const repo = path.join(temp, "repo");
 		const bin = path.join(temp, "bin");
@@ -764,12 +764,18 @@ process.exit(98);
 			runGit("add", ".");
 			runGit("-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false", "commit", "-m", "base");
 			const baseSha = runGit("rev-parse", "HEAD").toString().trim();
-			const badTree = kind === "bad-pushed-tree" || kind === "export-ignore" || kind === "export-subst" || kind === "case-collision";
+			const badTree = kind === "bad-pushed-tree" || kind === "export-ignore" || kind === "export-subst" || kind === "source-backslash" || kind === "case-collision";
 			const pushedSource = kind === "export-subst" ? bad.replace("unsafe.json", "$Format:%H$.json") : badTree && kind !== "case-collision" ? bad : "export const value = 2;\n";
 			await fs.writeFile(source, pushedSource);
 			if (kind === "export-ignore" || kind === "export-subst") await fs.writeFile(path.join(repo, ".gitattributes"), `packages/coding-agent/src/example.ts ${kind}\n`);
 			if (kind === "source-symlink") await fs.symlink("example.ts", path.join(path.dirname(source), "linked.ts"));
 			runGit("add", ".");
+			if (kind === "source-backslash") {
+				const unsafePath = path.join(temp, "unsafe-backslash-blob");
+				await fs.writeFile(unsafePath, bad);
+				const unsafeOid = runGit("hash-object", "-w", unsafePath).toString().trim();
+				runGit("update-index", "--add", "--cacheinfo", `100644,${unsafeOid},packages/coding-agent/src/..\\escaped.ts`);
+			}
 			runGit("-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false", "commit", "-m", "pushed");
 			let pushedSha = runGit("rev-parse", "HEAD").toString().trim();
 			if (kind === "case-collision") {
@@ -844,7 +850,7 @@ process.exit(result.exitCode);
 
 	for (const [kind, message] of [
 		["stale", "digest"], ["malformed", "Malformed"], ["missing-risk", "found none"],
-		["multiple-risk", "found 2"], ["bad-pushed-tree", "fast gate"], ["source-symlink", "fast gate"], ["case-collision", "fast gate"],
+		["multiple-risk", "found 2"], ["bad-pushed-tree", "fast gate"], ["source-symlink", "fast gate"], ["source-backslash", "fast gate"], ["case-collision", "fast gate"],
 	] as const) {
 		test(`CLI rejects ${kind} despite clean working-tree bytes when applicable`, async () => {
 			const result = await exactTreePreflight(kind);
