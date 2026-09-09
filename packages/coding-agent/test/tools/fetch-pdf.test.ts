@@ -45,7 +45,8 @@ describe("PDF URL source-text inspection", () => {
 			fetch(request) {
 				requests++;
 				if (new URL(request.url).pathname.endsWith(".md")) return new Response(null, { status: 404 });
-				return new Response(body, { headers: { "content-type": contentType } });
+				const response = new Response(body, { headers: { "content-type": contentType } });
+				return response;
 			},
 		});
 		// Only bypass the public-address boundary for this local fixture server.
@@ -58,7 +59,14 @@ describe("PDF URL source-text inspection", () => {
 		vi.spyOn(urlGuard, "guardedPublicFetch").mockImplementation(async (rawUrl, init) => {
 			const url = new URL(rawUrl);
 			expect(url.origin).toBe(server.url.origin);
-			return { ok: true, response: await fetch(url, init), logicalUrl: url, wireUrl: url };
+			let response = await fetch(url, init);
+			if (!contentType) {
+				// Bun.serve inserts text/plain for an untyped body. Remove only that
+				// transport default to exercise a genuinely absent response header.
+				response = new Response(response.body, { status: response.status, headers: response.headers });
+				response.headers.delete("content-type");
+			}
+			return { ok: true, response, logicalUrl: url, wireUrl: url };
 		});
 		session = {
 			cwd: process.cwd(),
@@ -78,7 +86,11 @@ describe("PDF URL source-text inspection", () => {
 
 	for (const [route, mime] of [
 		["document", "application/pdf; charset=binary"],
+		["document.txt", "application/pdf"],
 		["document.pdf", "application/octet-stream"],
+		["document.pdf", "binary/octet-stream"],
+		["document.pdf", "unknown"],
+		["document.pdf", ""],
 	]) {
 		it(`extracts short text from ${mime}`, async () => {
 			contentType = mime;
@@ -165,6 +177,42 @@ describe("PDF URL source-text inspection", () => {
 		expect(metadata.width).toBe(1);
 		expect(metadata.height).toBe(1);
 	});
+
+	for (const [mime, payload, method, expectedContent] of [
+		["application/json", '{"error":"Document unavailable"}', "json", '"error": "Document unavailable"'],
+		[
+			"application/xml",
+			'<?xml version="1.0"?><rss version="2.0"><channel><title>Document feed</title><link>https://example.com</link><description>Document updates</description><item><title>Document unavailable</title><link>https://example.com/status</link><description>Try again later</description></item></channel></rss>',
+			"feed",
+			"# RSS Feed",
+		],
+		[
+			"application/atom+xml",
+			'<?xml version="1.0"?><feed xmlns="http://www.w3.org/2005/Atom"><title>Document feed</title><id>urn:document:feed</id><updated>2026-01-01T00:00:00Z</updated><entry><title>Document unavailable</title><id>urn:document:status</id><updated>2026-01-01T00:00:00Z</updated><summary>Try again later</summary></entry></feed>',
+			"feed",
+			"# Atom Feed",
+		],
+		["text/plain", "Document unavailable", "text", "Document unavailable"],
+	]) {
+		it(`retains the ${method} handler when a .pdf URL serves ${mime}`, async () => {
+			contentType = mime;
+			body = payload;
+			const conversion = vi.spyOn(scrapers, "convertWithMarkit");
+			const binaryFetch = vi.spyOn(scrapers, "fetchBinary");
+			const result = await loadReadUrlCacheEntry(session, { path: new URL("unavailable.pdf", server.url).href });
+			expect(result.details.method).toBe(method);
+			expect(result.output).toContain(expectedContent);
+			expect(result.details.notes.join("\n")).not.toContain("markit");
+			expect(conversion).not.toHaveBeenCalled();
+			expect(binaryFetch).not.toHaveBeenCalled();
+			expect(requests).toBe(1);
+			// Preserve the existing handler's output for the same payload at a non-PDF URL.
+			const ordinary = await loadReadUrlCacheEntry(session, { path: new URL("unavailable", server.url).href });
+			expect(result.output.split("---\n").slice(1).join("---\n")).toBe(
+				ordinary.output.split("---\n").slice(1).join("---\n"),
+			);
+		});
+	}
 
 	it("retains HTML fallback when a .pdf URL actually serves HTML", async () => {
 		contentType = "text/html";

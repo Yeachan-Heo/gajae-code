@@ -251,21 +251,25 @@ function getExtensionHint(url: string, contentDisposition?: string): string {
 	return "";
 }
 
+function isGenericMimeType(mime: string): boolean {
+	return (
+		mime.length === 0 || mime === "application/octet-stream" || mime === "binary/octet-stream" || mime === "unknown"
+	);
+}
+
 /**
  * Check if content type is convertible via markit.
  */
 function isConvertible(mime: string, extensionHint: string): boolean {
-	if (CONVERTIBLE_MIMES.has(mime)) return true;
-	if (mime === "application/octet-stream" && CONVERTIBLE_EXTENSIONS.has(extensionHint)) return true;
-	if (CONVERTIBLE_EXTENSIONS.has(extensionHint)) return true;
-	return false;
+	return (
+		CONVERTIBLE_MIMES.has(mime) ||
+		(CONVERTIBLE_EXTENSIONS.has(extensionHint) && (extensionHint !== ".pdf" || isGenericMimeType(mime)))
+	);
 }
 
 function resolveImageMimeType(mime: string, extensionHint: string): string | null {
 	if (mime.startsWith("image/")) return mime;
-	const shouldUseExtensionHint =
-		mime.length === 0 || mime === "application/octet-stream" || mime === "binary/octet-stream" || mime === "unknown";
-	if (!shouldUseExtensionHint) return null;
+	if (!isGenericMimeType(mime)) return null;
 	return IMAGE_MIME_BY_EXTENSION.get(extensionHint) ?? null;
 }
 
@@ -741,8 +745,7 @@ async function renderUrl(
 	const { finalUrl, content: rawContent } = response;
 	const mime = normalizeMime(response.contentType);
 	const extHint = getExtensionHint(finalUrl);
-	const isPdf =
-		mime === "application/pdf" || (extHint === ".pdf" && !mime.includes("html") && !mime.startsWith("image/"));
+	const isPdf = mime === "application/pdf" || (extHint === ".pdf" && isGenericMimeType(mime));
 
 	// Raw PDF inspection is explicit; never substitute PDF bytes for failed text extraction.
 	if (raw && isPdf) {
