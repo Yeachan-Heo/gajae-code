@@ -8,6 +8,7 @@ import {
 	modeStatePath,
 } from "../gjc-runtime/session-layout";
 import { resolveGjcSessionForRead, SessionResolutionError } from "../gjc-runtime/session-resolution";
+import { SkillActiveStateSchema } from "../gjc-runtime/state-schema";
 import {
 	type ActiveSessionScope,
 	type GuardedWriteResult,
@@ -798,21 +799,16 @@ async function readVisibleSkillActiveStateUncached(
 ): Promise<SkillActiveState | null> {
 	const { sessionPath } = getSkillActiveStatePaths(cwd, resolvedSessionId);
 	const sessionState = await readRawActiveStateForHandoff(sessionPath, strict, strict);
-	if (
-		strict &&
-		sessionState &&
-		(typeof sessionState.active !== "boolean" ||
-			!Array.isArray(sessionState.active_skills) ||
-			sessionState.active_skills.some(
-				entry =>
-					!entry ||
-					typeof entry !== "object" ||
-					Array.isArray(entry) ||
-					typeof entry.skill !== "string" ||
-					typeof entry.active !== "boolean",
-			))
-	) {
-		throw new Error(`Invalid workflow snapshot activation state: ${sessionPath}`);
+	if (strict && sessionState) {
+		const parsed = SkillActiveStateSchema.safeParse(sessionState);
+		const hasLegacyShape =
+			!Array.isArray(sessionState.active_skills) &&
+			typeof sessionState.active === "boolean" &&
+			typeof sessionState.skill === "string" &&
+			sessionState.skill.trim().length > 0;
+		if (!parsed.success || (!Array.isArray(sessionState.active_skills) && !hasLegacyShape)) {
+			throw new Error(`Invalid workflow snapshot activation state: ${sessionPath}`);
+		}
 	}
 	const activeSkills = await mergeVisibleEntries(cwd, sessionState, resolvedSessionId);
 	if (activeSkills.length === 0) return null;

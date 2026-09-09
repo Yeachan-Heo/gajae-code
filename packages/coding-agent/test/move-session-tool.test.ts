@@ -1278,6 +1278,46 @@ describe("move_session tool (agent-invokable session rescope)", () => {
 			}
 		});
 	}
+	it("reconciles a valid active snapshot entry whose active flag is omitted", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const cwd = path.join(tempDir, "root");
+		const child = path.join(cwd, "child");
+		fs.mkdirSync(child, { recursive: true });
+		const manager = SessionManager.create(cwd, SessionManager.managedDestination(cwd, tempDir));
+		const { session } = await makeSession(cwd, manager, { toolNames: ["move_session"] });
+		try {
+			const snapshot = getSkillActiveStatePaths(cwd, manager.getSessionId()).sessionPath;
+			// The persisted schema makes the entry-level active flag optional and the
+			// normalizer treats an omitted value as active; strict admission must not
+			// reject this representation before canonical reconciliation.
+			await Bun.write(snapshot, JSON.stringify({ active: true, active_skills: [{ skill: "ralplan" }] }));
+			expect(session.getEffectiveActiveWorkflowSkillState()).toBeUndefined();
+			await session.getToolByName("move_session")!.execute("omitted-active-flag", { path: "child" });
+			expect(manager.getCwd()).toBe(fs.realpathSync(child));
+		} finally {
+			await session.dispose();
+		}
+	});
+
+	it("reconciles a valid legacy inactive workflow snapshot", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const cwd = path.join(tempDir, "root");
+		const child = path.join(cwd, "child");
+		fs.mkdirSync(child, { recursive: true });
+		const manager = SessionManager.create(cwd, SessionManager.managedDestination(cwd, tempDir));
+		const { session } = await makeSession(cwd, manager, { toolNames: ["move_session"] });
+		try {
+			const snapshot = getSkillActiveStatePaths(cwd, manager.getSessionId()).sessionPath;
+			await Bun.write(snapshot, JSON.stringify({ active: false, skill: "deep-interview", phase: "complete" }));
+			expect(session.getEffectiveActiveWorkflowSkillState()).toBeUndefined();
+			await session.getToolByName("move_session")!.execute("legacy-inactive", { path: "child" });
+			expect(manager.getCwd()).toBe(fs.realpathSync(child));
+		} finally {
+			await session.dispose();
+		}
+	});
 
 	it("does not let an earlier clear suppress reinvocation with a surviving active mirror", async () => {
 		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
