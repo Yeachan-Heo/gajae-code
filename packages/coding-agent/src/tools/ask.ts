@@ -1323,7 +1323,13 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 				let executionGateId: string | undefined;
 				const stopGateObservation = gateEmitter.onGateEmitted?.(gate => {
 					const stageState = gate.context?.stage_state;
-					if (gate.stage === "deep-interview" && gate.kind === "execution" && stageState?.question_id === q.id)
+					if (
+						gate.stage === q.workflowGate?.stage &&
+						gate.kind === q.workflowGate?.kind &&
+						((gate.stage === "deep-interview" && gate.kind === "execution") ||
+							(gate.stage === "ralplan" && gate.kind === "approval")) &&
+						stageState?.question_id === q.id
+					)
 						executionGateId = gate.gate_id;
 				});
 				let answer: unknown;

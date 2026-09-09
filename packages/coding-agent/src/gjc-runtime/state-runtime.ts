@@ -2068,9 +2068,9 @@ export async function executionApprovalLineage(
 	let interview = current.value;
 	if (stage === "ralplan") {
 		const upstream = current.value.handoff_from;
-		if (!upstream && !(await hasAuditedDeepInterviewHandoff(cwd, sessionId, "ralplan"))) return "ordinary";
 		if (upstream && upstream !== "deep-interview")
 			throw new StateCommandError(2, "execution approval has unsupported upstream lineage");
+		if (!(await hasCurrentDeepInterviewHandoff(cwd, sessionId, "ralplan", current.value))) return "ordinary";
 		const read = await readExistingStateForMutation(modeStateFile(cwd, "deep-interview", sessionId));
 		if (read.kind !== "valid") throw new StateCommandError(2, "execution approval upstream state is unavailable");
 		assertNoFutureWorkflowEnvelope(read.value, "deep-interview", "execution approval upstream");
@@ -2083,6 +2083,13 @@ export async function executionApprovalLineage(
 			)
 		)
 			throw new StateCommandError(2, "execution approval refuses tampered upstream state");
+		if (
+			read.value.active !== false ||
+			read.value.current_phase !== "handoff" ||
+			read.value.handoff_to !== stage ||
+			read.value.handoff_at !== (current.value.upstream_handoff_at ?? current.value.handoff_at)
+		)
+			throw new StateCommandError(2, "execution approval cannot authenticate Deep Interview approval lineage");
 		interview = read.value;
 	}
 	const inner = isPlainObject(interview.state) ? interview.state : {};
@@ -2297,7 +2304,6 @@ export async function recordNonCrystalExecutionApproval(options: {
 					if (
 						history.some(
 							row =>
-								row.question_id === options.questionId ||
 								row.gate_id === options.gateId ||
 								(row.ordinary_approval_status === "consumed" &&
 									row.artifact_sha256 === publication.artifact_sha256 &&
@@ -2800,6 +2806,8 @@ export async function recordDeepInterviewExecutionApproval(options: {
 				async () => {
 					const existing = await readDeepInterviewExecutionApprovalRecord(recordPath);
 					if (existing?.status === "consumed") {
+						if (record.gate_id === existing.gate_id)
+							throw new StateCommandError(2, "deep-interview execution approval record is already consumed");
 						const newPublication =
 							inner.execution_approval === "not-approved" &&
 							inner.execution_approval_receipt === undefined &&
@@ -2807,8 +2815,6 @@ export async function recordDeepInterviewExecutionApproval(options: {
 							record.crystal_spec_version > existing.crystal_spec_version &&
 							record.crystal_source_digest !== existing.crystal_source_digest &&
 							record.spec_sha256 !== existing.spec_sha256 &&
-							record.gate_id !== existing.gate_id &&
-							record.question_id !== existing.question_id &&
 							isPlainObject(crystal.delta) &&
 							crystal.delta.approval_invalidated === true;
 						if (!newPublication && !existing.consumed_mutation_id?.startsWith("deep-interview:approval-revoked:"))
@@ -2857,6 +2863,8 @@ export async function recordDeepInterviewExecutionApproval(options: {
 							)
 								throw error;
 						}
+						if (record.gate_id === existing.gate_id)
+							throw new StateCommandError(2, "deep-interview execution approval consent replay refused");
 					}
 					await writeDeepInterviewExecutionApprovalRecord(options.cwd, options.sessionId, record);
 					return { path: recordPath, record };
@@ -3219,6 +3227,29 @@ async function assertSanctionedExecutionApprovalAudit(
 		if (!auditedReceipt || JSON.stringify(auditedReceipt) !== JSON.stringify(currentReceipt))
 			throw new StateCommandError(2, "deep-interview execution approval receipt binding mismatch");
 	}
+}
+
+/** Historical audit entries do not attach lineage to a replacement workflow run. */
+async function hasCurrentDeepInterviewHandoff(
+	cwd: string,
+	sessionId: string,
+	callee: CanonicalGjcWorkflowSkill,
+	state: Record<string, unknown>,
+): Promise<boolean> {
+	const handoffAt = state.upstream_handoff_at ?? state.handoff_at;
+	if (
+		state.handoff_from === undefined &&
+		state.upstream_handoff_at === undefined &&
+		(handoffAt === undefined || state.handoff_to !== undefined)
+	)
+		return false;
+	if (
+		typeof handoffAt !== "string" ||
+		!handoffAt.trim() ||
+		!(await hasAuditedDeepInterviewHandoff(cwd, sessionId, callee, { handoffAt }))
+	)
+		throw new StateCommandError(2, "execution handoff cannot authenticate Deep Interview approval lineage");
+	return true;
 }
 
 async function hasAuditedDeepInterviewHandoff(
@@ -3635,30 +3666,13 @@ async function assertDeepInterviewExecutionLineage(
 	caller: CanonicalGjcWorkflowSkill,
 	existingCaller: Record<string, unknown>,
 ): Promise<void> {
-	const activeState = await readVisibleSkillActiveState(cwd, sessionId);
-	const activeEntry = listActiveSkills(activeState).find(entry => entry.skill === caller);
-	let upstreamRaw =
-		typeof existingCaller.handoff_from === "string"
-			? existingCaller.handoff_from.trim()
-			: activeEntry && typeof activeEntry.handoff_from === "string"
-				? activeEntry.handoff_from.trim()
-				: "";
-	const callerHandoffAt =
-		typeof existingCaller.upstream_handoff_at === "string"
-			? existingCaller.upstream_handoff_at.trim()
-			: typeof existingCaller.handoff_at === "string"
-				? existingCaller.handoff_at.trim()
-				: activeEntry && typeof activeEntry.handoff_at === "string"
-					? activeEntry.handoff_at.trim()
-					: undefined;
+	let upstreamRaw = typeof existingCaller.handoff_from === "string" ? existingCaller.handoff_from.trim() : "";
 	if (!upstreamRaw) {
-		if (!(await hasAuditedDeepInterviewHandoff(cwd, sessionId, caller))) return;
+		if (!(await hasCurrentDeepInterviewHandoff(cwd, sessionId, caller, existingCaller))) return;
 		upstreamRaw = "deep-interview";
-	} else if (upstreamRaw === "deep-interview" && !callerHandoffAt) {
-		throw new StateCommandError(2, "execution handoff cannot authenticate Deep Interview approval lineage");
 	} else if (
 		upstreamRaw === "deep-interview" &&
-		!(await hasAuditedDeepInterviewHandoff(cwd, sessionId, caller, { handoffAt: callerHandoffAt }))
+		!(await hasCurrentDeepInterviewHandoff(cwd, sessionId, caller, existingCaller))
 	) {
 		throw new StateCommandError(2, "execution handoff cannot authenticate Deep Interview approval lineage");
 	}
@@ -3674,7 +3688,7 @@ async function assertDeepInterviewExecutionLineage(
 			throw new StateCommandError(2, "execution handoff cannot authenticate Deep Interview approval lineage");
 		seen.add(currentSkill);
 		let upstreamValue = typeof currentState.handoff_from === "string" ? currentState.handoff_from.trim() : undefined;
-		if (!upstreamValue && (await hasAuditedDeepInterviewHandoff(cwd, sessionId, currentSkill)))
+		if (!upstreamValue && (await hasCurrentDeepInterviewHandoff(cwd, sessionId, currentSkill, currentState)))
 			upstreamValue = "deep-interview";
 		if (!upstreamValue) return;
 		const upstream = canonicalWorkflowSkill(upstreamValue);
