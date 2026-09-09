@@ -13,6 +13,7 @@ import {
 	formatBinaryDownloadFailureMessageForTest,
 	formatManualUpdateInstructionsForTest,
 	formatVerificationFailureForTest,
+	formatVerifiedBinaryInvocation,
 	fsyncFileForTest,
 	getLatestReleaseForTest,
 	hasManagedNotifySetup,
@@ -51,6 +52,27 @@ async function makeTempDir(): Promise<string> {
 
 afterEach(async () => {
 	await Promise.all(tempDirs.splice(0).map(dir => fs.rm(dir, { recursive: true, force: true })));
+});
+
+describe("verified binary invocation formatting", () => {
+	it("quotes Windows paths with spaces and ASCII single quotes", () => {
+		expect(formatVerifiedBinaryInvocation("C:\\Users\\O'Brien\\my bin\\gjc.exe", "win32")).toBe(
+			"& 'C:\\Users\\O''Brien\\my bin\\gjc.exe'",
+		);
+	});
+
+	it.each(["'", "‘", "’", "‚", "‛"])("doubles PowerShell quote %s without changing the path", quote => {
+		const runtimePath = `C:\\bin\\gjc${quote}; Write-Output $env:PATH; ${quote}.exe`;
+		expect(formatVerifiedBinaryInvocation(runtimePath, "win32")).toBe(
+			`& 'C:\\bin\\gjc${quote}${quote}; Write-Output $env:PATH; ${quote}${quote}.exe'`,
+		);
+	});
+
+	it.each(["linux", "darwin"] as const)("uses POSIX quoting on %s and preserves smart quotes", platform => {
+		expect(formatVerifiedBinaryInvocation("/my bin/O'Brien/‘’‚‛;$HOME`id`/gjc", platform)).toBe(
+			"'/my bin/O'\\''Brien/‘’‚‛;$HOME`id`/gjc'",
+		);
+	});
 });
 
 describe("update-cli recovery command surface", () => {

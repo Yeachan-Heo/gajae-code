@@ -1446,13 +1446,17 @@ export function resolveUpdateDecision(options: {
 	return { install: true, kind: options.comparison > 0 ? "new-version" : "force" };
 }
 
+export function formatVerifiedBinaryInvocation(runtimePath: string, platform: NodeJS.Platform): string {
+	// PowerShell treats smart single quotes as delimiters too; preserve each by doubling it.
+	return platform === "win32"
+		? `& '${runtimePath.replace(/['‘’‚‛]/g, quote => quote + quote)}'`
+		: `'${runtimePath.replace(/'/g, "'\\''")}'`;
+}
+
 function printVerifiedMigrationTarget(target: MigrationUpdateTarget, version: string, alreadyInstalled = true): void {
 	const displayPath = sanitizeVerificationOutput(target.path);
 	const directory = sanitizeVerificationOutput(path.dirname(target.path));
-	const quotedPath =
-		process.platform === "win32"
-			? `& '${target.path.replace(/'/g, "''")}'`
-			: `'${target.path.replace(/'/g, "'\\''")}'`;
+	const quotedPath = formatVerifiedBinaryInvocation(target.path, process.platform);
 	const invocation =
 		displayPath === target.path
 			? `Run the verified binary directly: ${quotedPath} --version (omit --version to launch).`
