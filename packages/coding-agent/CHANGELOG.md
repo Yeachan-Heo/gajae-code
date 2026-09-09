@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 ### Fixed
+- Headless ACP asks now abort their enclosing foreground turn when the remote client cancels the ask. Previously the ask tool rejected with a cancellation error without releasing foreground ownership, so the next client prompt could be rejected as already active.
+
 - CLI startup now preserves saved account pins when handing authentication to the SDK. Catalog refreshes with a session use its effective credential pin, preventing a cached free OpenAI Codex account catalog from hiding Astra or Sol during paid-account profile startup. Generic injected SDK authentication keeps its existing isolation, and persisted session selections retain precedence over global pins.
 
 - Managed migration-lock release now detects closed or reused Linux descriptors before native security verification and validates ownership through the recovered descriptor. Recovery still requires the original file identity, attempt id, and owner-only security; repeated release cannot change a successor. This fixes the retained-descriptor failure in #5399 without changing test timing or retry policy.
@@ -19,7 +21,6 @@
 - Public MCP guidance now states the shipped boundary precisely: ordinary standalone interactive and ACP sessions do not expose `/mcp` OAuth, test, reconnect, or reload commands; `--mcp-config` and the SDK's `mcpConfigPath` consume trusted connection configs but do not initiate MCP OAuth authorization, while existing `auth` bindings remain runtime-owned for refresh. `gjc customize doctor` now reports that MCP changes require a new session instead of contradicting that startup-only contract.
 - `gjc update` now distinguishes same-version package-manager migration from a version update and installed binaries from shell activation (#5432). Fresh and already-verified standalone targets share explicit launch and command-resolution guidance, including Bash `hash -r` / zsh `rehash` before conditional PATH advice; verified targets are reused without another binary download and Bun/npm shims remain untouched.
 - MCP OAuth discovery parses failed connection error text in linear time. The challenge-parameter scan no longer retries long identifier runs at every offset, malformed JSON framing uses bounded first/last-brace slicing, and the redundant greedy `realm`/`token_url` fallback is removed. Oversized keys remain ignored as whole runs, so their suffixes cannot be reinterpreted as OAuth parameters.
-
 
 ## [0.16.6] - 2026-09-07
 ### Fixed
