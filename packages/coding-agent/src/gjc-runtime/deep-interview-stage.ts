@@ -932,9 +932,16 @@ async function handleWrite(args: readonly string[], cwd: string): Promise<Record
 				payload,
 				created_at: nowIso,
 			};
-			// Canonical Crystal resets are rejected above. An ordinary reset starts a
-			// genuinely fresh envelope and must not retain legacy handoff/spec metadata.
-			const base: Record<string, unknown> = reset ? {} : current.value;
+			// Canonical Crystal resets are rejected above. Ordinary resets retain only
+			// locked intent, never legacy handoff/spec metadata or execution authority.
+			const base: Record<string, unknown> = reset
+				? {
+						state: {
+							intent_contract: currentInner.intent_contract,
+							intent_contract_required: currentInner.intent_contract_required,
+						},
+					}
+				: current.value;
 			const merged = computeMergedEnvelope(base as Record<string, unknown>, syntheticDraft, nowIso);
 			merged.last_applied_draft_id = syntheticDraft.draft_id;
 			const written = await writeGuardedWorkflowEnvelopeAtomic(statePath, merged, {
