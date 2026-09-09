@@ -15,6 +15,8 @@ import {
 	type CoordinatorMcpServer,
 	createCoordinatorMcpServer,
 } from "../src/coordinator-mcp/server";
+import { endpointIncarnation } from "../src/sdk/broker/endpoint-authority";
+import type { SdkClient } from "../src/sdk/client";
 
 const tempDirs: string[] = [];
 
@@ -97,6 +99,34 @@ function createServer(
 			GJC_COORDINATOR_MCP_MUTATIONS: "sessions",
 		},
 		services: {
+			getAgentDir: () => root,
+			ensureBroker: async () => ({}) as never,
+			readSdkBrokerDiscovery: async () => ({ url: "ws://broker.test", token: "token" }) as never,
+			connectBroker: async () =>
+				({
+					global: async (operation: string) =>
+						operation === "session.list"
+							? {
+									ok: true,
+									result: {
+										sessions: ["session-1", "session-2", "session-3", "session-4"].map(sessionId => ({
+											sessionId,
+											locator: {
+												cwd: root,
+												worktreeRoot: null,
+												stateRoot: path.join(root, ".gjc", "state"),
+											},
+											endpointGeneration: 1,
+											endpointMtimeMs: 1,
+											endpointFileId: "1:1",
+											pid: process.pid,
+											live: true,
+										})),
+									},
+								}
+							: { ok: false },
+					close: async () => {},
+				}) as unknown as SdkClient,
 			codexTransportFactory: async () => {
 				if (control.throwOnFactory) throw new Error(control.factoryError ?? "codex_transport_unavailable");
 				return {
@@ -134,7 +164,10 @@ async function createSession(root: string, server: CoordinatorMcpServer, session
 				workspace: root,
 				endpoint_url: "",
 				endpoint_generation: 1,
-				endpoint_incarnation: `test-${sessionId}`,
+				endpoint_incarnation: endpointIncarnation(
+					{ endpointGeneration: 1, endpointMtimeMs: 1, pid: process.pid },
+					sessionId,
+				)!,
 				sidecar_verifier: {
 					key_id: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
 					public_key: "test-public-key",

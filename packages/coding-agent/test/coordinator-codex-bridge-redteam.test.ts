@@ -38,6 +38,8 @@ import {
 import { dispatchGjcNativeSkillHook } from "../src/hooks/native-skill-hook";
 import { GJC_SKILL_KEYWORD_DEFINITIONS } from "../src/hooks/skill-keywords";
 import { readVisibleSkillActiveState } from "../src/hooks/skill-state";
+import { endpointIncarnation } from "../src/sdk/broker/endpoint-authority";
+import type { SdkClient } from "../src/sdk/client";
 
 const tempDirs: string[] = [];
 
@@ -112,7 +114,10 @@ async function createSession(root: string, server: CoordinatorMcpServer): Promis
 				workspace: root,
 				endpoint_url: "",
 				endpoint_generation: 1,
-				endpoint_incarnation: "test-session-1",
+				endpoint_incarnation: endpointIncarnation(
+					{ endpointGeneration: 1, endpointMtimeMs: 1, pid: process.pid },
+					"session-1",
+				)!,
 				sidecar_verifier: {
 					key_id: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
 					public_key: "test-public-key",
@@ -143,6 +148,36 @@ function createServer(
 			GJC_COORDINATOR_MCP_MUTATIONS: "sessions",
 		},
 		services: {
+			getAgentDir: () => root,
+			ensureBroker: async () => ({}) as never,
+			readSdkBrokerDiscovery: async () => ({ url: "ws://broker.test", token: "token" }) as never,
+			connectBroker: async () =>
+				({
+					global: async (operation: string) =>
+						operation === "session.list"
+							? {
+									ok: true,
+									result: {
+										sessions: [
+											{
+												sessionId: "session-1",
+												locator: {
+													cwd: root,
+													worktreeRoot: null,
+													stateRoot: path.join(root, ".gjc", "state"),
+												},
+												endpointGeneration: 1,
+												endpointMtimeMs: 1,
+												endpointFileId: "1:1",
+												pid: process.pid,
+												live: true,
+											},
+										],
+									},
+								}
+							: { ok: false },
+					close: async () => {},
+				}) as unknown as SdkClient,
 			codexTransportFactory: async (): Promise<CodexAppServerTransport> => ({
 				request: async (method, params) => {
 					requests.push({ method, params });
