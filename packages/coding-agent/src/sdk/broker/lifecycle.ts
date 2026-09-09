@@ -1991,7 +1991,10 @@ function findRetirementRecord(
 ): IndexedSession | undefined {
 	if (receipt !== undefined) {
 		if (receipt.identity.endpointFileId === undefined)
-			return broker.index.findUniqueHistoricalFileBoundSessionIdentity(receipt.identity);
+			return (
+				broker.index.findUniqueHistoricalFileBoundSessionIdentity(receipt.identity) ??
+				broker.index.findHistoricalSessionIdentity(receipt.identity)
+			);
 		const historical = broker.index.findHistoricalSessionIdentity(receipt.identity);
 		if (historical) return historical;
 		// A later registration may make a same-ID successor the public authority.
