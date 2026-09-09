@@ -6,7 +6,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { postmortem } from "@gajae-code/utils";
-import { FileLockTestHooks, processStartTime } from "../src/config/file-lock";
+import { FileLockTestHooks, processStartTime, withFileLock } from "../src/config/file-lock";
 import { loadInstallationHostId } from "../src/config/machine-identity";
 import { sessionRuntimeDir } from "../src/gjc-runtime/session-layout";
 import { SessionStateLockUnavailableError, withSessionStateFileLock } from "../src/gjc-runtime/session-state-lock";
@@ -200,7 +200,7 @@ describe("committed prompt failure projection", () => {
 		});
 		let current = true;
 		const projection = persistCoordinatorCommittedPromptFailure(context, "committed", () => current);
-		let successor: Promise<void> | undefined;
+		let successor: Promise<"completed" | "skipped"> | undefined;
 		try {
 			await entered.promise;
 			// Retiring the observation and admitting its successor happen while the
@@ -312,6 +312,134 @@ async function tempRoot(): Promise<string> {
 	tempDirs.push(dir);
 	return dir;
 }
+
+it.each([
+	["turn_start"],
+	["tool_execution_start"],
+] as const)("revokes %s observer namespace-lock acquisition without waiting for its current owner", async eventType => {
+	const root = await fs.realpath(await tempRoot());
+	const stateFile = path.join(root, "state", "runtime-state.json");
+	process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
+	const context = { sessionId: "observer-revocation", cwd: root, sessionFile: null };
+	await persistCoordinatorRuntimeStateFromEvent({ type: "agent_start" }, context);
+	const before = await Bun.file(stateFile).text();
+	const held = Promise.withResolvers<void>();
+	const release = Promise.withResolvers<void>();
+	const attempted = Promise.withResolvers<void>();
+	const controller = new AbortController();
+	const reason = new Error("observer admission revoked");
+	const lockFile = path.join(root, "locks", "mutation.lock");
+	const previousHook = FileLockTestHooks.afterParentMkdir;
+	const owner = withFileLock(lockFile, async () => {
+		held.resolve();
+		await release.promise;
+	});
+	let writer: Promise<"completed" | "skipped"> | undefined;
+	try {
+		await held.promise;
+		const heldLockIdentity = await fs.realpath(`${lockFile}.lock`);
+		FileLockTestHooks.afterParentMkdir = async lockPath => {
+			await previousHook?.(lockPath);
+			if (path.resolve(lockPath) !== `${lockFile}.lock`) return;
+			expect(await fs.realpath(lockPath)).toBe(heldLockIdentity);
+			attempted.resolve();
+		};
+		expect(eventAffectsCoordinatorRuntimeState({ type: eventType })).toBe(true);
+		writer = persistCoordinatorRuntimeStateFromEvent(
+			{ type: eventType, toolCallId: "revoked-call" },
+			context,
+			undefined,
+			controller.signal,
+		);
+		// Join a premature completion too, so an ignored event fails here rather
+		// than leaving an unobserved assertion promise behind a five-second timeout.
+		const acquisition = Promise.race([
+			attempted.promise,
+			writer.then(() => {
+				throw new Error("Observer completed before attempting the held namespace lock");
+			}),
+		]);
+		await acquisition;
+		controller.abort(reason);
+		await expect(writer).resolves.toBe("skipped");
+		expect(await Bun.file(stateFile).text()).toBe(before);
+		expect(fsSync.existsSync(`${lockFile}.lock`)).toBe(true);
+	} finally {
+		controller.abort(reason);
+		release.resolve();
+		await Promise.allSettled([owner, ...(writer ? [writer] : [])]);
+		FileLockTestHooks.afterParentMkdir = previousHook;
+	}
+	expect(await Bun.file(stateFile).text()).toBe(before);
+});
+
+it.each([
+	[false],
+	[true],
+])("retains an admitted observer transaction through atomic sync after revocation (fail=%s)", async failSync => {
+	const root = await tempRoot();
+	const stateFile = path.join(root, "state", "runtime-state.json");
+	process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
+	const entered = Promise.withResolvers<void>();
+	const release = Promise.withResolvers<void>();
+	const controller = new AbortController();
+	const reason = new Error("admitted sync failure");
+	const open = fs.open;
+	let syncSpy: { mockRestore(): void } | undefined;
+	const openSpy = spyOn(fs, "open").mockImplementation(async (file, flags, mode) => {
+		const handle = await open(file, flags, mode);
+		if (!syncSpy && String(file).startsWith(`${stateFile}.`) && String(file).endsWith(".tmp")) {
+			const sync = handle.sync.bind(handle);
+			syncSpy = spyOn(handle, "sync").mockImplementation(async () => {
+				entered.resolve();
+				await release.promise;
+				if (failSync) throw reason;
+				await sync();
+			});
+		}
+		return handle;
+	});
+	let settled = false;
+	const writer = persistCoordinatorRuntimeStateFromEvent(
+		{ type: "agent_start" },
+		{ sessionId: "observer-retention", cwd: root, sessionFile: null },
+		undefined,
+		controller.signal,
+	).then(
+		value => {
+			settled = true;
+			return { value };
+		},
+		error => {
+			settled = true;
+			return { error };
+		},
+	);
+	try {
+		await entered.promise;
+		controller.abort(reason);
+		await Promise.resolve();
+		expect(settled).toBe(false);
+		expect(await Bun.file(stateFile).exists()).toBe(false);
+		expect(fsSync.existsSync(path.join(root, "locks", "mutation.lock.lock"))).toBe(true);
+		release.resolve();
+		const outcome = await writer;
+		expect(settled).toBe(true);
+		if (failSync) {
+			expect(outcome).toEqual({ error: reason });
+			expect(await Bun.file(stateFile).exists()).toBe(false);
+		} else {
+			expect(outcome).toEqual({ value: "completed" });
+			expect(await readPayload(stateFile)).toMatchObject({ event: "agent_start", state: "running" });
+		}
+		expect(fsSync.existsSync(path.join(root, "locks", "mutation.lock.lock"))).toBe(false);
+	} finally {
+		release.resolve();
+		await Promise.allSettled([writer]);
+		syncSpy?.mockRestore();
+		openSpy.mockRestore();
+	}
+});
 
 function git(cwd: string, args: string[]): void {
 	const proc = Bun.spawnSync(["git", ...args], { cwd, stdout: "pipe", stderr: "pipe" });

@@ -1899,13 +1899,36 @@ function coordinatorTransactionLockFile(stateFile: string): string {
  * protocol.
  */
 async function withCoordinatorTransactionLock<T>(stateFile: string, operation: () => Promise<T>): Promise<T> {
-	// Namespace-lock failures are contention or filesystem failures, not evidence that
-	// runtime-state.json is malformed. Let the original diagnostic reach the caller.
 	return await withFileLock(coordinatorTransactionLockFile(stateFile), operation, {
 		staleMs: 30_000,
 		retries: 12_000,
 		retryDelayMs: 5,
 	});
+}
+
+async function withObserverTransactionLock(
+	stateFile: string,
+	operation: () => Promise<void>,
+	signal?: AbortSignal,
+): Promise<"completed" | "skipped"> {
+	let admitted = false;
+	try {
+		await withFileLock(
+			coordinatorTransactionLockFile(stateFile),
+			async () => {
+				signal?.throwIfAborted();
+				admitted = true;
+				await operation();
+			},
+			{ staleMs: 30_000, retries: 12_000, retryDelayMs: 5, signal },
+		);
+	} catch (error) {
+		// Exact acquisition revocation only. Entered transactions and release errors
+		// (including aggregates) remain failures and retain their real owner.
+		if (!admitted && signal?.aborted === true && error === signal.reason) return "skipped";
+		throw error;
+	}
+	return "completed";
 }
 
 function orderedDistinctStateFiles(stateFiles: readonly string[], platform: NodeJS.Platform): string[] {
@@ -2028,12 +2051,13 @@ async function persistCoordinatorRuntimeToolActivity(
 	phase: RuntimeToolActivityPhase,
 	label: string | undefined,
 	observedAt: string,
-): Promise<void> {
+	signal?: AbortSignal,
+): Promise<"completed" | "skipped"> {
 	const identity = normalizedIdentity(context);
-	await serializeStateFileWrite(
+	return await serializeStateFileWrite(
 		stateFile,
 		async () =>
-			await withCoordinatorTransactionLock(
+			await withObserverTransactionLock(
 				stateFile,
 				async () =>
 					await withStateFileLock(stateFile, async () => {
@@ -2067,6 +2091,7 @@ async function persistCoordinatorRuntimeToolActivity(
 							identity.sidecarKeyId,
 						);
 					}),
+				signal,
 			),
 	);
 }
@@ -2081,7 +2106,9 @@ export async function persistCoordinatorRuntimeStateFromEvent(
 	 * sidecar never trusts a model-supplied name.
 	 */
 	observation?: CoordinatorToolObservation,
-): Promise<void> {
+	/** Revokes only observer-write admission, never an already admitted transaction. */
+	signal?: AbortSignal,
+): Promise<"completed" | "skipped"> {
 	// The caller's observation time wins so that queueing, subscriber latency, and lock
 	// contention cannot compress a real elapsed interval into near zero. A value this
 	// writer could not have produced is not trusted enough to persist.
@@ -2092,28 +2119,28 @@ export async function persistCoordinatorRuntimeStateFromEvent(
 	__sessionStateSidecarPerfCounters.persistFromEventCalls += 1;
 	const stateFile = runtimeStateFileForContext(context);
 	const state = stateForEvent(event);
-	if (!stateFile) return;
+	if (!stateFile) return "completed";
 	const beforePersistFromEvent = __sessionStateSidecarTestHooks.beforePersistFromEvent;
 	if (beforePersistFromEvent) await beforePersistFromEvent(event.type, context.cwd);
 	if (!state && event.type !== "agent_failed") {
 		const activityPhase = toolActivityPhaseForEvent(event);
-		if (!activityPhase) return;
-		await persistCoordinatorRuntimeToolActivity(
+		if (!activityPhase) return "completed";
+		return await persistCoordinatorRuntimeToolActivity(
 			event,
 			context,
 			stateFile,
 			activityPhase,
 			observation?.label,
 			observedAt,
+			signal,
 		);
-		return;
 	}
 	context = contextWithManagedOwnerGeneration(context);
 	const identity = normalizedIdentity(context);
-	await serializeStateFileWrite(
+	return await serializeStateFileWrite(
 		stateFile,
 		async () =>
-			await withCoordinatorTransactionLock(
+			await withObserverTransactionLock(
 				stateFile,
 				async () =>
 					await withStateFileLock(stateFile, async () => {
@@ -2198,6 +2225,7 @@ export async function persistCoordinatorRuntimeStateFromEvent(
 						if (shouldSkipRuntimeStateWrite(previous, payload, nowMs)) return;
 						await writeStateFileSync(stateFile, payload, identity.sidecarKeyId);
 					}),
+				signal,
 			),
 	);
 }

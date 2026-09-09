@@ -3658,9 +3658,28 @@ export class AgentSession {
 		if (admission) admission.persistBarrier = this.#coordinatorRescopeBarrier;
 	}
 
-	#appendCoordinatorPersist(run: () => Promise<void>): Promise<void> {
-		const queued = this.#coordinatorPersistQueue.then(run, run);
-		this.#coordinatorPersistQueue = queued.catch(() => {});
+	#coordinatorPendingWriteCount = 0;
+	#coordinatorActiveWrite: AgentSessionEvent["type"] | "worker-integration" | undefined;
+
+	#appendCoordinatorPersist<T>(
+		run: () => Promise<T>,
+		label: AgentSessionEvent["type"] | "worker-integration" = "worker-integration",
+	): Promise<T> {
+		this.#coordinatorPendingWriteCount++;
+		const trackedRun = async () => {
+			this.#coordinatorActiveWrite = label;
+			try {
+				return await run();
+			} finally {
+				this.#coordinatorActiveWrite = undefined;
+				this.#coordinatorPendingWriteCount--;
+			}
+		};
+		const queued = this.#coordinatorPersistQueue.then(trackedRun, trackedRun);
+		this.#coordinatorPersistQueue = queued.then(
+			() => {},
+			() => {},
+		);
 		return queued;
 	}
 
@@ -4483,7 +4502,8 @@ export class AgentSession {
 			const terminalPersistence = this.#queueCoordinatorRuntimeStatePersist(pending, true);
 			this.#emit(pending);
 			void terminalPersistence.then(
-				() => {
+				disposition => {
+					if (disposition === "skipped") return;
 					if (workerIntegrationOutcome) {
 						this.#recordPostPublicationOutcome(
 							publicationContext,
@@ -6358,8 +6378,11 @@ export class AgentSession {
 	 * its end. It describes a call that was never dispatched, and this file is read as the
 	 * answer to "what is this session doing right now".
 	 */
-	#queueCoordinatorRuntimeStatePersist(event: AgentSessionEvent, propagateFailure = false): Promise<void> {
-		if (isNonDispatchedToolEvent(event)) return Promise.resolve();
+	#queueCoordinatorRuntimeStatePersist(
+		event: AgentSessionEvent,
+		propagateFailure = false,
+	): Promise<"completed" | "skipped"> {
+		if (isNonDispatchedToolEvent(event)) return Promise.resolve("skipped");
 		const observation = this.#coordinatorToolObservations.get(event);
 		const admission = this.#agentEventAdmission.get(event);
 		const barrier = admission?.persistBarrier;
@@ -6367,10 +6390,10 @@ export class AgentSession {
 			const run = async () => {
 				await barrier;
 				const context = this.#captureCoordinatorRuntimeStatePersistContext();
-				await this.#persistRuntimeStateInBackground(event, context, observation, propagateFailure);
+				return await this.#persistRuntimeStateInBackground(event, context, observation, propagateFailure);
 			};
-			const queued = barrier.then(() => this.#appendCoordinatorPersist(run));
-			this.#trackReleasedBarrierPersist(queued);
+			const queued = barrier.then(() => this.#appendCoordinatorPersist(run, event.type));
+			this.#trackReleasedBarrierPersist(queued.then(() => {}));
 			return queued;
 		}
 		const context = this.#captureCoordinatorRuntimeStatePersistContext();
@@ -6378,9 +6401,9 @@ export class AgentSession {
 		const run = () =>
 			generation === this.#coordinatorPersistGeneration
 				? this.#persistRuntimeStateInBackground(event, context, observation, propagateFailure)
-				: Promise.resolve();
-		const queued = this.#appendCoordinatorPersist(run);
-		this.#trackUnbarrieredCoordinatorPersist(queued);
+				: Promise.resolve("skipped" as const);
+		const queued = this.#appendCoordinatorPersist(run, event.type);
+		this.#trackUnbarrieredCoordinatorPersist(queued.then(() => {}));
 		return queued;
 	}
 
@@ -6389,7 +6412,7 @@ export class AgentSession {
 		context: CoordinatorRuntimeStatePersistContext,
 		observation: CoordinatorToolObservation | undefined,
 		propagateFailure: boolean,
-	): Promise<void> {
+	): Promise<"completed" | "skipped"> {
 		try {
 			const sdkRunToken = this.#agentEventAdmission.get(event)?.sdkRunToken;
 			const persistedEvent =
@@ -6400,7 +6423,12 @@ export class AgentSession {
 					event.type === "agent_end")
 					? { ...event, sdkRunToken }
 					: event;
-			await persistCoordinatorRuntimeStateFromEvent(persistedEvent, context, observation);
+			return await persistCoordinatorRuntimeStateFromEvent(
+				persistedEvent,
+				context,
+				observation,
+				this.#disposeAbortController.signal,
+			);
 		} catch (error) {
 			this.#warnPersistFailure(
 				"Failed to persist coordinator runtime state",
@@ -6411,6 +6439,7 @@ export class AgentSession {
 			);
 			if (propagateFailure) throw error;
 		}
+		return "completed";
 	}
 
 	#warnPersistFailure(
@@ -9282,7 +9311,21 @@ export class AgentSession {
 		if (!this.#disposeRunPromise) {
 			this.#disposeDeadline = Date.now() + this.#disposeTimeoutMs;
 			this.#disposeDeadlineExpired = Promise.withResolvers<void>();
-			this.#disposeDeadlineTimer = setTimeout(() => this.#disposeDeadlineExpired?.resolve(), this.#disposeTimeoutMs);
+			this.#disposeDeadlineTimer = setTimeout(() => {
+				// Observe retained owners without changing their lifetime or the caller deadline.
+				logger.warn("Session disposal deadline reached with retained work", {
+					step: this.#disposeActiveStepLabel,
+					coordinatorPendingWrites: this.#coordinatorPendingWriteCount,
+					coordinatorRunningWrites: this.#coordinatorActiveWrite === undefined ? 0 : 1,
+					coordinatorActiveWrite: this.#coordinatorActiveWrite,
+					coordinatorUnbarrieredPersists: this.#coordinatorUnbarrieredPersists.size,
+					coordinatorReleasedBarrierPersists: this.#coordinatorReleasedBarrierPersists.size,
+					coordinatorEventHandlers: this.#coordinatorEventHandlers.size,
+					coordinatorRescopeBarrier: this.#coordinatorRescopeBarrier !== undefined,
+					activePrompts: this.#livePromptsInFlight(),
+				});
+				this.#disposeDeadlineExpired?.resolve();
+			}, this.#disposeTimeoutMs);
 			this.#disposeDeadlineTimer.unref?.();
 			this.#abortAdmissionEpoch++;
 			this.#isDisposed = true;

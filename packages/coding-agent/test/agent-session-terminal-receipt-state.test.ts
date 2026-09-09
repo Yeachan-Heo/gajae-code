@@ -130,7 +130,7 @@ describe("AgentSession terminal receipt state", () => {
 			settings: Settings.isolated({ "compaction.enabled": false }),
 			modelRegistry,
 		});
-		const pending = Promise.withResolvers<void>();
+		const pending = Promise.withResolvers<"completed" | "skipped">();
 		vi.spyOn(sidecar, "persistCoordinatorRuntimeStateFromEvent").mockReturnValue(pending.promise);
 		const terminal = Promise.withResolvers<void>();
 		session.subscribe(event => {
@@ -143,7 +143,7 @@ describe("AgentSession terminal receipt state", () => {
 				expect(result).not.toBe("timed_out");
 			});
 		} finally {
-			pending.resolve();
+			pending.resolve("completed");
 		}
 	});
 

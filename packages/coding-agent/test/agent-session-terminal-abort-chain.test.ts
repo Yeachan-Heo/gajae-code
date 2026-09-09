@@ -1348,37 +1348,64 @@ describe("terminal abort registers a turn scope so left-running owned work class
 		// different concurrent session and would ack a same-id foreign delivery
 		// while leaving this session's delivery queued.
 		const foreign = new AsyncJobManager({ maxRunningJobs: 2, onJobComplete: () => {} });
+		let phase = "setup";
+		const diagnostic = setTimeout(() => {
+			process.stderr.write(
+				`${JSON.stringify({
+					event: "foreground_endpoint_await_stalled",
+					phase,
+					agentStreaming: session.agent.state.isStreaming,
+					ownedJobs: manager.getAllJobs().map(job => ({ status: job.status, type: job.type })),
+					ownedDelivery: manager.getDeliveryState(),
+					foreignJobCount: foreign.getAllJobs().length,
+				})}\n`,
+			);
+		}, 18_000);
+		diagnostic.unref();
 		try {
 			AsyncJobManager.setInstance(foreign);
 			const bindEndpoint = chainSessionManager.getSessionId() ?? "local";
 			scriptedResponses = [bashCall("echo foreground-ok", "call_fg_endpoint", false), stopReply("done")];
 			const promptPromise = session.prompt("run foreground work").catch(() => {});
+			phase = "prompt completion";
 			await promptPromise;
 			// The foreground job landed in the endpoint-owned manager and its
 			// terminal delivery was acknowledged there.
 			expect(foreign.getAllJobs().length).toBe(0);
 			const endpointJobs = manager.getAllJobs();
 			expect(endpointJobs.length).toBeGreaterThan(0);
+			phase = "delivery acknowledgement";
 			await waitFor(() => manager.getDeliveryState().queued === 0, "endpoint delivery acknowledged", 5_000);
 			// The foreground owned-bash registration is unregistered on the
 			// endpoint manager's tuple after completion.
 			const job = endpointJobs[0]!;
+			phase = "owned registration retirement";
 			await waitFor(
 				() => lookupOwnedRegistration(job.id, job.generation, bindEndpoint) === undefined,
 				"foreground owned-bash registration unregistered",
 				5_000,
 			);
 		} finally {
-			// Prompt completion and delivery acknowledgement precede the secondary
-			// sidecar sink. Join real work before starting bounded session disposal.
-			manager.cancelAll();
-			await manager.waitForAll();
-			await session.waitForIdle();
-			await session.awaitSessionSettlement();
-			await session.awaitCoordinatorRuntimeStatePersistenceForTests();
-			AsyncJobManager.setInstance(manager);
-			AsyncJobManager.unregisterManager(foreign);
-			expect(await foreign.dispose()).toBe(true);
+			try {
+				// Prompt completion and delivery acknowledgement precede the secondary
+				// sidecar sink. Join real work before starting bounded session disposal.
+				manager.cancelAll();
+				phase = "owned job promises";
+				await manager.waitForAll();
+				phase = "session idle";
+				await session.waitForIdle();
+				phase = "session settlement";
+				await session.awaitSessionSettlement();
+				phase = "coordinator persistence";
+				await session.awaitCoordinatorRuntimeStatePersistenceForTests();
+				phase = "foreign manager disposal";
+				AsyncJobManager.setInstance(manager);
+				AsyncJobManager.unregisterManager(foreign);
+				expect(await foreign.dispose()).toBe(true);
+				phase = "completed";
+			} finally {
+				clearTimeout(diagnostic);
+			}
 		}
 	}, 20_000);
 

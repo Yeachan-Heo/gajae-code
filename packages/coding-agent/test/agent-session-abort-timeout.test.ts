@@ -5,8 +5,10 @@ import type { AssistantMessage } from "@gajae-code/ai";
 import { getBundledModel } from "@gajae-code/ai";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
 import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
+import { FileLockTestHooks, withFileLock } from "@gajae-code/coding-agent/config/file-lock";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
+import { __sessionStateSidecarTestHooks } from "@gajae-code/coding-agent/gjc-runtime/session-state-sidecar";
 import {
 	AgentSession,
 	type AgentSessionConfig,
@@ -14,7 +16,7 @@ import {
 } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
-import { TempDir } from "@gajae-code/utils";
+import { logger, TempDir } from "@gajae-code/utils";
 import * as z from "zod/v4";
 
 describe("AgentSession abort timeout", () => {
@@ -768,6 +770,111 @@ describe("AgentSession abort timeout", () => {
 			if (previousStateFile === undefined) delete process.env.GJC_COORDINATOR_SESSION_STATE_FILE;
 			else process.env.GJC_COORDINATOR_SESSION_STATE_FILE = previousStateFile;
 			vi.useRealTimers();
+		}
+	});
+
+	it("reports the active coordinator write without releasing its disposal owner", async () => {
+		const activeSession = await createDisposableSession();
+		activeSession.setDisposeTimeoutForTests(50);
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const previousHook = __sessionStateSidecarTestHooks.beforePersistFromEvent;
+		let releasedWrites = 0;
+		__sessionStateSidecarTestHooks.beforePersistFromEvent = async (eventType, cwd) => {
+			if (cwd !== tempDir!.path() || eventType !== "turn_start") {
+				await previousHook?.(eventType, cwd);
+				return;
+			}
+			entered.resolve();
+			await release.promise;
+			releasedWrites++;
+		};
+		const warnings = vi.spyOn(logger, "warn");
+		let disposalCompleted = false;
+		try {
+			const persist = activeSession.queueCoordinatorRuntimeStatePersistForTests(
+				{ type: "turn_start" },
+				Promise.resolve(),
+			);
+			await entered.promise;
+			vi.useFakeTimers();
+			const disposing = activeSession.dispose();
+			const completion = activeSession.awaitDisposeCompletion().then(() => {
+				disposalCompleted = true;
+			});
+			vi.advanceTimersByTime(50);
+			await expect(disposing).rejects.toMatchObject({ name: "SessionDisposalIncompleteError" });
+			expect(warnings).toHaveBeenCalledWith(
+				"Session disposal deadline reached with retained work",
+				expect.objectContaining({
+					coordinatorPendingWrites: 1,
+					coordinatorRunningWrites: 1,
+					coordinatorActiveWrite: "turn_start",
+				}),
+			);
+			expect(releasedWrites).toBe(0);
+			expect(disposalCompleted).toBe(false);
+			vi.useRealTimers();
+			release.resolve();
+			await persist;
+			await completion;
+			expect(releasedWrites).toBe(1);
+			expect(disposalCompleted).toBe(true);
+			await activeSession.dispose();
+			expect(releasedWrites).toBe(1);
+			session = undefined;
+		} finally {
+			release.resolve();
+			vi.useRealTimers();
+			try {
+				await activeSession.awaitDisposeCompletion();
+			} finally {
+				__sessionStateSidecarTestHooks.beforePersistFromEvent = previousHook;
+				warnings.mockRestore();
+			}
+		}
+	});
+
+	it("disposes deferred agent_end observation without waiting for or replacing the foreign namespace lock", async () => {
+		const activeSession = await createDisposableSession();
+		const stateFile = path.join(tempDir!.path(), "state", "runtime-state.json");
+		const previousStateFile = process.env.GJC_COORDINATOR_SESSION_STATE_FILE;
+		process.env.GJC_COORDINATOR_SESSION_STATE_FILE = stateFile;
+		const lockFile = path.join(tempDir!.path(), "locks", "mutation.lock");
+		const held = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const attempted = Promise.withResolvers<void>();
+		const previousHook = FileLockTestHooks.afterParentMkdir;
+		let ownerReleased = false;
+		const owner = withFileLock(lockFile, async () => {
+			held.resolve();
+			await release.promise;
+		}).then(() => {
+			ownerReleased = true;
+		});
+		try {
+			await held.promise;
+			FileLockTestHooks.afterParentMkdir = async lockPath => {
+				await previousHook?.(lockPath);
+				if (lockPath === `${lockFile}.lock`) attempted.resolve();
+			};
+			activeSession.parkAgentEndForCoordinatorPersistForTests({ type: "agent_end", messages: [] });
+			activeSession.flushParkedAgentEndForCoordinatorPersistForTests();
+			await attempted.promise;
+			await activeSession.dispose();
+			await activeSession.awaitCoordinatorRuntimeStatePersistenceForTests();
+			expect(ownerReleased).toBe(false);
+			expect(await Bun.file(stateFile).exists()).toBe(false);
+			release.resolve();
+			await owner;
+			expect(await Bun.file(stateFile).exists()).toBe(false);
+			session = undefined;
+		} finally {
+			release.resolve();
+			await owner;
+			FileLockTestHooks.afterParentMkdir = previousHook;
+			if (previousStateFile === undefined) delete process.env.GJC_COORDINATOR_SESSION_STATE_FILE;
+			else process.env.GJC_COORDINATOR_SESSION_STATE_FILE = previousStateFile;
 		}
 	});
 
