@@ -377,21 +377,26 @@ type SessionRows = {
 
 async function sessionRows(agentDir: string): Promise<SessionRows> {
 	await ensureBroker({ agentDir });
-	return await withRouter(agentDir, async router => {
-		const response = await paginatedSessionList(router);
-		const result = resultObject(response) ?? {};
-		let sessions: SdkSessionRowV1[];
-		try {
-			sessions = arrayOf(result.sessions).map(toSessionRowV1);
-		} catch {
-			throw new SdkClientError("protocol_error", "session.list returned a malformed session row.");
-		}
-		return {
-			...(typeof result.indexSeq === "number" ? { indexSeq: result.indexSeq } : {}),
-			warnings: arrayOf(result.warnings),
-			sessions,
-		};
-	});
+	return await withRouter(
+		agentDir,
+		async router => {
+			const response = await paginatedSessionList(router);
+			const result = resultObject(response) ?? {};
+			let sessions: SdkSessionRowV1[];
+			try {
+				sessions = arrayOf(result.sessions).map(toSessionRowV1);
+			} catch {
+				throw new SdkClientError("protocol_error", "session.list returned a malformed session row.");
+			}
+			return {
+				...(typeof result.indexSeq === "number" ? { indexSeq: result.indexSeq } : {}),
+				warnings: arrayOf(result.warnings),
+				sessions,
+			};
+		},
+		undefined,
+		[],
+	);
 }
 
 function searchScopeRequest(scope: ScopeNameV1, locator: { cwd: string; worktreeRoot: string | null }): ScopeRequestV1 {
@@ -912,28 +917,33 @@ async function runSend(agentDir: string, sessionId: string, args: SdkSessionCliA
 	if (invalid) throw new SdkSessionCliError(invalid.code, invalid.message, 2);
 	await ensureBroker({ agentDir });
 
-	return await withRouter(agentDir, async router => {
-		const response = await requestControl(router, sessionId, "turn.prompt", promptInput, args);
-		const result: JsonRecord = {
-			version: SESSION_ROWS_VERSION,
-			operationRef: clientRef,
-			status: "accepted",
-			receipt: resultObject(response) ?? response,
-		};
-		if (args.wait === true) {
-			const outcome = await waitForTerminalStatus(router, sessionId, clientRef, args.timeoutMs ?? 30_000);
-			if (!outcome.terminal)
-				throw new SdkSessionCliError(
-					"wait_timeout",
-					`Prompt ${clientRef} did not reach a terminal state within the wait window.`,
-					1,
-					{ operationRef: clientRef, status: outcome.status },
-				);
-			result.status = outcome.status;
-			result.statusDetail = outcome.detail;
-		}
-		return { ok: true, result };
-	});
+	return await withRouter(
+		agentDir,
+		async router => {
+			const response = await requestControl(router, sessionId, "turn.prompt", promptInput, args);
+			const result: JsonRecord = {
+				version: SESSION_ROWS_VERSION,
+				operationRef: clientRef,
+				status: "accepted",
+				receipt: resultObject(response) ?? response,
+			};
+			if (args.wait === true) {
+				const outcome = await waitForTerminalStatus(router, sessionId, clientRef, args.timeoutMs ?? 30_000);
+				if (!outcome.terminal)
+					throw new SdkSessionCliError(
+						"wait_timeout",
+						`Prompt ${clientRef} did not reach a terminal state within the wait window.`,
+						1,
+						{ operationRef: clientRef, status: outcome.status },
+					);
+				result.status = outcome.status;
+				result.statusDetail = outcome.detail;
+			}
+			return { ok: true, result };
+		},
+		undefined,
+		[sessionId],
+	);
 }
 
 async function runStatus(
@@ -944,20 +954,31 @@ async function runStatus(
 ): Promise<unknown> {
 	assertClientRef(opRef);
 	await ensureBroker({ agentDir });
-	return await withRouter(agentDir, async router => {
-		const response = await requestQuery(router, sessionId, "turn.result", { kind: "prompt", clientRef: opRef }, args);
-		const status = resultObject(response) ?? {};
-		const raw = typeof status.status === "string" ? status.status : "unknown";
-		return {
-			ok: true,
-			result: {
-				version: SESSION_ROWS_VERSION,
-				operationRef: opRef,
-				status,
-				summary: { completed: raw === "terminal_ok" || raw === "failed" },
-			},
-		};
-	});
+	return await withRouter(
+		agentDir,
+		async router => {
+			const response = await requestQuery(
+				router,
+				sessionId,
+				"turn.result",
+				{ kind: "prompt", clientRef: opRef },
+				args,
+			);
+			const status = resultObject(response) ?? {};
+			const raw = typeof status.status === "string" ? status.status : "unknown";
+			return {
+				ok: true,
+				result: {
+					version: SESSION_ROWS_VERSION,
+					operationRef: opRef,
+					status,
+					summary: { completed: raw === "terminal_ok" || raw === "failed" },
+				},
+			};
+		},
+		undefined,
+		[sessionId],
+	);
 }
 
 type CheckpointExtraction = {
@@ -1662,6 +1683,7 @@ async function runLiveTail(
 			};
 		},
 		recordLiveFrame,
+		[sessionId],
 	);
 }
 
@@ -1692,7 +1714,12 @@ async function runRawControl(
 	await ensureBroker({ agentDir });
 	const operatorRequest = operatorAbortBrokerRequest(sessionId, operation, input, args);
 	if (operatorRequest) return await requestBrokerOperatorAbort(agentDir, operatorRequest, args);
-	return await withRouter(agentDir, async router => await requestControl(router, sessionId, operation, input, args));
+	return await withRouter(
+		agentDir,
+		async router => await requestControl(router, sessionId, operation, input, args),
+		undefined,
+		[sessionId],
+	);
 }
 
 async function runRawQuery(
@@ -1703,7 +1730,12 @@ async function runRawQuery(
 	args: SdkSessionCliArgs,
 ): Promise<unknown> {
 	await ensureBroker({ agentDir });
-	return await withRouter(agentDir, async router => await requestQuery(router, sessionId, operation, input, args));
+	return await withRouter(
+		agentDir,
+		async router => await requestQuery(router, sessionId, operation, input, args),
+		undefined,
+		[sessionId],
+	);
 }
 
 function lifecycleMutationRequest(
@@ -1752,7 +1784,7 @@ async function runRawGlobal(
 ): Promise<unknown> {
 	if (operation === "session.list") {
 		await ensureBroker({ agentDir });
-		return await withRouter(agentDir, async router => await paginatedSessionList(router, input));
+		return await withRouter(agentDir, async router => await paginatedSessionList(router, input), undefined, []);
 	}
 	if (!isLifecycleOperation(operation))
 		throw new SdkSessionCliError("unknown_operation", `Unknown global operation: ${operation}`, 1);
