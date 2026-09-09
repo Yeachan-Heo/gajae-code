@@ -286,7 +286,7 @@ function isProvenRuntimeImageAbsence(error: unknown): boolean {
 }
 
 /**
- * Whether a published runtime image is still on disk. A resident broker keeps
+ * Whether a published runtime image is still a regular file on disk. A resident broker keeps
  * answering requests after the executable it was started from is deleted (a
  * Homebrew Bun upgrade removing the Cellar path, an install directory swapped
  * underneath it), yet every internal spawn it then attempts is refused. Callers
@@ -296,7 +296,7 @@ function isProvenRuntimeImageAbsence(error: unknown): boolean {
  */
 export async function isSdkInternalRuntimeImagePresent(file: string): Promise<boolean> {
 	const probe = fsp.stat(path.resolve(file)).then(
-		() => true,
+		stats => stats.isFile(),
 		(error: unknown) => !isProvenRuntimeImageAbsence(error),
 	);
 	const inconclusive = Promise.withResolvers<boolean>();

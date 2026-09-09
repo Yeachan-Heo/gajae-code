@@ -149,12 +149,15 @@ describe("sdk broker stale runtime image", () => {
 		BROKER_TEST_TIMEOUT_MS,
 	);
 
-	test("a present image, and a path whose parent is no longer a directory", async () => {
+	test("a regular image is present, while missing and non-file paths are absent", async () => {
 		const dir = await fs.mkdtemp(path.join(import.meta.dir, "../.tmp-runtime-probe-"));
 		try {
 			const image = await writeRuntimeImage(path.join(dir, "image"));
 			expect(await isSdkInternalRuntimeImagePresent(image)).toBe(true);
 			expect(await isSdkInternalRuntimeImagePresent(path.join(dir, "missing"))).toBe(false);
+			const replacementDirectory = path.join(dir, "replacement-directory");
+			await fs.mkdir(replacementDirectory);
+			expect(await isSdkInternalRuntimeImagePresent(replacementDirectory)).toBe(false);
 			// Every host reports this as absence: ENOTDIR on POSIX, ENOENT on Windows.
 			expect(await isSdkInternalRuntimeImagePresent(path.join(image, "nested"))).toBe(false);
 		} finally {
