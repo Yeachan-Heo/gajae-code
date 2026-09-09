@@ -1245,6 +1245,8 @@ async function updateViaBinaryAt(
  * Run the update command.
  */
 export interface UpdateCommandDependencies {
+	/** User-visible migration guidance owned by the standalone update command, not the TUI logger. */
+	writeStdout?: (text: string) => void;
 	getLatestRelease?: (options?: LatestReleaseLookupOptions) => Promise<ReleaseInfo>;
 	resolveUpdateTarget?: () => Promise<UpdateTarget>;
 	verifyMigrationTarget?: (release: ReleaseInfo, runtimePath: string) => Promise<InstalledVersionVerification>;
@@ -1453,7 +1455,12 @@ export function formatVerifiedBinaryInvocation(runtimePath: string, platform: No
 		: `'${runtimePath.replace(/'/g, "'\\''")}'`;
 }
 
-function printVerifiedMigrationTarget(target: MigrationUpdateTarget, version: string, alreadyInstalled = true): void {
+function printVerifiedMigrationTarget(
+	target: MigrationUpdateTarget,
+	version: string,
+	writeStdout: (text: string) => void,
+	alreadyInstalled = true,
+): void {
 	const displayPath = sanitizeVerificationOutput(target.path);
 	const directory = sanitizeVerificationOutput(path.dirname(target.path));
 	const quotedPath = formatVerifiedBinaryInvocation(target.path, process.platform);
@@ -1461,13 +1468,13 @@ function printVerifiedMigrationTarget(target: MigrationUpdateTarget, version: st
 		displayPath === target.path
 			? `Run the verified binary directly: ${quotedPath} --version (omit --version to launch).`
 			: "Run the verified binary directly using its exact local path (displayed path was sanitized).";
-	console.log(
-		chalk.green(
+	writeStdout(
+		`${chalk.green(
 			`${theme.status.success} Standalone ${APP_NAME} ${version} is ${alreadyInstalled ? "already installed" : "installed"} and verified at ${displayPath}.${version === VERSION ? " Version unchanged; this is an installation migration, not a version update." : ""}`,
-		),
+		)}\n`,
 	);
-	console.log(
-		chalk.cyan(
+	writeStdout(
+		`${chalk.cyan(
 			[
 				"Shell activation is not verified; package-manager shims were not overwritten or uninstalled.",
 				invocation,
@@ -1476,7 +1483,7 @@ function printVerifiedMigrationTarget(target: MigrationUpdateTarget, version: st
 					: "In your current shell, check: type -a gjc; command -v gjc. Clear cached commands with hash -r (Bash) or rehash (zsh), then repeat the checks and run gjc --version.",
 				`Only if resolution still selects another install, ensure ${directory} is on PATH before the shim directory; also check shell aliases/functions.`,
 			].join("\n"),
-		),
+		)}\n`,
 	);
 }
 
@@ -1491,6 +1498,7 @@ export async function runUpdateCommand(
 	const update = deps.performUpdate ?? performUpdate;
 	const refreshDefaults = deps.refreshInstalledDefaultSkills ?? refreshInstalledDefaultSkills;
 	const exit = deps.exit ?? process.exit;
+	const writeStdout = deps.writeStdout ?? (text => process.stdout.write(text));
 	const recordEvent = deps.recordTelemetryEvent ?? ((event, details) => recordTelemetryEvent(event, details));
 	const pendingTelemetry = new Set<Promise<void>>();
 	const record = (event: TelemetryEventName, details: TelemetryDetails): void => {
@@ -1567,7 +1575,7 @@ export async function runUpdateCommand(
 			if (verification.ok) {
 				record("update_check_completed", { channel, result: "available" });
 				record("update_install_started", { channel, installMethod: target.method });
-				printVerifiedMigrationTarget(target, release.version);
+				printVerifiedMigrationTarget(target, release.version, writeStdout);
 				record("update_install_completed", { channel, result: "installed", installMethod: target.method });
 				return;
 			}
@@ -1606,7 +1614,7 @@ export async function runUpdateCommand(
 		if (verification?.ok && verification.path) {
 			installedVersion = release.version;
 			if (resolved.method === "migrate") {
-				printVerifiedMigrationTarget({ ...resolved, path: verification.path }, release.version, false);
+				printVerifiedMigrationTarget({ ...resolved, path: verification.path }, release.version, writeStdout, false);
 			} else {
 				printSuccessfulVerification(release.version);
 			}

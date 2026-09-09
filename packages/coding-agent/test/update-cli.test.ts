@@ -755,7 +755,13 @@ describe("update-cli managed notification recovery", () => {
 		it("skips update recovery and defaults refresh when the standalone target already verifies", async () => {
 			const calls: string[] = [];
 			const output: string[] = [];
-			const logSpy = vi.spyOn(console, "log").mockImplementation(message => output.push(String(message)));
+			const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+			const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+			const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+			const stdoutSpy = vi.spyOn(process.stdout, "write").mockImplementation(chunk => {
+				output.push(String(chunk));
+				return true;
+			});
 			try {
 				await runUpdateCommand(
 					{ force: false, check: false },
@@ -788,8 +794,18 @@ describe("update-cli managed notification recovery", () => {
 				expect(output.join("\n")).toContain("Only if resolution still selects another install");
 				expect(output.join("\n")).not.toContain("shadows it on PATH");
 				expect(output.join("\n")).not.toContain("Updated to");
+				expect(stdoutSpy).toHaveBeenCalledTimes(2);
+				expect(output.every(block => block.endsWith("\n"))).toBe(true);
+				// Only the pre-existing version banner uses console; migration guidance must not.
+				expect(logSpy).toHaveBeenCalledTimes(1);
+				expect(String(logSpy.mock.calls[0]?.[0])).toContain("Current version:");
+				expect(warnSpy).not.toHaveBeenCalled();
+				expect(errorSpy).not.toHaveBeenCalled();
 			} finally {
 				logSpy.mockRestore();
+				warnSpy.mockRestore();
+				errorSpy.mockRestore();
+				stdoutSpy.mockRestore();
 			}
 		});
 
@@ -800,11 +816,12 @@ describe("update-cli managed notification recovery", () => {
 			await fs.writeFile(shimPath, "package-manager shim");
 			const output: string[] = [];
 			const calls: string[] = [];
-			const logSpy = vi.spyOn(console, "log").mockImplementation(message => output.push(String(message)));
+			const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
 			try {
 				await runUpdateCommand(
 					{ force: false, check: false },
 					{
+						writeStdout: text => output.push(text),
 						getLatestRelease: async () => ({ ...release, tag: `v${VERSION}`, version: VERSION }),
 						resolveUpdateTarget: async () => ({ method: "migrate", path: runtimePath, previousPath: shimPath }),
 						verifyMigrationTarget: async () => ({ ok: existing, actual: VERSION, path: runtimePath }),
@@ -838,6 +855,8 @@ describe("update-cli managed notification recovery", () => {
 				}
 				expect(text).not.toContain("Updated to");
 				expect(text).not.toContain("Restart gjc");
+				expect(logSpy.mock.calls.flat().join("\n")).not.toContain("Standalone gjc");
+				expect(logSpy.mock.calls.flat().join("\n")).not.toContain("Shell activation");
 			} finally {
 				logSpy.mockRestore();
 			}
@@ -847,11 +866,12 @@ describe("update-cli managed notification recovery", () => {
 			const root = await makeTempDir();
 			const runtimePath = path.join(root, "gjc\nunsafe\x1b[31m");
 			const output: string[] = [];
-			const logSpy = vi.spyOn(console, "log").mockImplementation(message => output.push(String(message)));
+			const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
 			try {
 				await runUpdateCommand(
 					{ force: false, check: false },
 					{
+						writeStdout: text => output.push(text),
 						getLatestRelease: async () => release,
 						resolveUpdateTarget: async () => ({ method: "migrate", path: runtimePath }),
 						verifyMigrationTarget: async () => ({ ok: true, path: runtimePath }),
