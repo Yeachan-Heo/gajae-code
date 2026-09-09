@@ -29,7 +29,7 @@ import {
 	sessionStateDir,
 } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
 import { initTheme } from "@gajae-code/coding-agent/modes/theme/theme";
-import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
+import { CURRENT_SESSION_VERSION, SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { AskTool } from "@gajae-code/coding-agent/tools/ask";
 import { migrateAndPersistLegacyState } from "../../src/gjc-runtime/state-migrations";
 import {
@@ -223,10 +223,23 @@ async function recordExecutionApproval(
 		// Repeated fixture calls must not rewrite the prefix bound by pending consent.
 		transcriptPath = existingRecord.transcript_path;
 	} else {
-		const manager = SessionManager.create(
-			cwd,
-			SessionManager.explicitDestination(path.join(cwd, ".gjc", "sessions")),
+		// GJC_SESSION_ID selects workflow state; create() only adopts it for lifecycle launches.
+		// Open an explicit header so transcript authority never depends on inherited lifecycle env.
+		const sessionDir = path.join(cwd, ".gjc", "sessions");
+		transcriptPath = path.join(sessionDir, `${TEST_SESSION_ID}.jsonl`);
+		await fs.mkdir(sessionDir, { recursive: true });
+		await fs.writeFile(
+			transcriptPath,
+			`${JSON.stringify({
+				type: "session",
+				version: CURRENT_SESSION_VERSION,
+				id: TEST_SESSION_ID,
+				timestamp: new Date().toISOString(),
+				cwd,
+			})}\n`,
+			{ mode: 0o600, flag: "wx" },
 		);
+		const manager = await SessionManager.open(transcriptPath, SessionManager.explicitDestination(sessionDir));
 		try {
 			expect(manager.getSessionId()).toBe(TEST_SESSION_ID);
 			manager.appendMessage({ role: "user", content: "Build the approved feature.", timestamp: 1 });
