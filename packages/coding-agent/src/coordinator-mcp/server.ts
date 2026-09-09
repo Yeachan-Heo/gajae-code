@@ -5712,17 +5712,19 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 
 	async function listSessions(cwd?: string): Promise<Array<Record<string, unknown>>> {
 		const roots = cwd ? [cwd] : config.allowedRoots;
-		const uniqueRoots = [...new Map(
-			roots.map(root => {
-				let canonical = path.resolve(root);
-				try {
-					canonical = nodeFs.realpathSync.native(canonical);
-				} catch {
-					// Preserve the configured path when the root is not materialized yet.
-				}
-				return [normalizePathForComparison(canonical, platform), root] as const;
-			}),
-		).values()];
+		const uniqueRoots = [
+			...new Map(
+				roots.map(root => {
+					let canonical = path.resolve(root);
+					try {
+						canonical = nodeFs.realpathSync.native(canonical);
+					} catch {
+						// Preserve the configured path when the root is not materialized yet.
+					}
+					return [normalizePathForComparison(canonical, platform), root] as const;
+				}),
+			).values(),
+		];
 		const listings = await Promise.all(
 			uniqueRoots.map(async root => {
 				const listing = await paginatedBrokerSessionList(root, { cwd: root });
@@ -6001,7 +6003,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			// incarnation cannot be blocked by old local state.
 			let preflightWorkspace: string;
 			try {
-				preflightWorkspace = await canonicalBrokerWorkspace(cwd);
+				preflightWorkspace = await canonicalBrokerWorkspace(persistedWorkspace);
 				const authority = await exactBrokerSessionAuthority(id, preflightWorkspace);
 				if (
 					!sameCanonicalPath(authority.workspace, persistedWorkspace, platform) ||
@@ -6105,7 +6107,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			const closeAlreadyProven = deletionPhase === "broker_closed" || deletionPhase === "cleanup_pending";
 			let workspace = "";
 			try {
-				workspace = await canonicalBrokerWorkspace(cwd);
+				workspace = await canonicalBrokerWorkspace(persistedWorkspace);
 				let authority: BrokerSessionAuthority | null = null;
 				if (!closeAlreadyProven) {
 					authority = await exactBrokerSessionAuthority(id, workspace);

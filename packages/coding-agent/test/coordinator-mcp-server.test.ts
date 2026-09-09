@@ -390,7 +390,7 @@ async function createSdkControlServer(
 				const routerWorkspace = serverOptions.platform === "win32" ? workspace : brokerWorkspace;
 				return {
 					sessionId,
-				locator: {
+					locator: {
 						cwd: routerWorkspace,
 						worktreeRoot: declaredLocator.worktreeRoot ?? null,
 						stateRoot: declaredLocator.stateRoot ?? path.join(routerWorkspace, ".gjc", "state"),
@@ -3653,6 +3653,38 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		]);
 		expect(closes[0]!.idempotencyKey).not.toBe(closes[1]!.idempotencyKey);
 		expect(closes[0]!.input.endpointIncarnation).not.toBe(closes[1]!.input.endpointIncarnation);
+	});
+	it("reaps a managed-worktree session scoped to its persisted broker workspace", async () => {
+		const root = await tempRoot();
+		const worktree = path.join(root, "hermes-worktree");
+		const controls: SdkControl[] = [];
+		const server = await createSdkControlServer(root, controls, undefined, undefined, [], "gjc --worktree hermes");
+		await expect(
+			server.callTool("gjc_coordinator_start_session", {
+				cwd: root,
+				idempotency_key: "managed-worktree-reap",
+				allow_mutation: true,
+			}),
+		).resolves.toMatchObject({ ok: true, session: { session_id: "created-session-1" } });
+		const recordPath = path.join(coordinatorNamespace(root), "sessions", "created-session-1.json");
+		const record = JSON.parse(await fs.readFile(recordPath, "utf8")) as Record<string, unknown>;
+		// Persist the requested coordinator cwd separately from the broker-returned
+		// managed-worktree workspace, matching the delegate creation binding.
+		await Bun.write(
+			recordPath,
+			JSON.stringify({ ...record, cwd: root, broker_workspace: worktree, ephemeral: true }, null, 2),
+		);
+		const record2 = JSON.parse(await fs.readFile(recordPath, "utf8")) as Record<string, unknown>;
+		expect(record2.cwd).toBe(root);
+		expect(record2.broker_workspace).toBe(worktree);
+		await expect(
+			server.callTool("gjc_coordinator_stop_session", { session_id: "created-session-1", allow_mutation: true }),
+		).resolves.toMatchObject({ ok: true, closed: true });
+		const listScopes = controls
+			.filter(control => control.operation === "session.list")
+			.map(control => control.input.cwd);
+		expect(listScopes).toContain(worktree);
+		expect(controls.filter(control => control.operation === "session.close")).toHaveLength(1);
 	});
 	it("never returns credential-contaminated reused session records", async () => {
 		const root = await tempRoot();
