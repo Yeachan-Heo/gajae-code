@@ -4,6 +4,8 @@
 
 ### Fixed
 
+- Credential-scoped model discovery now peeks the OAuth account selected for that session instead of falling back to unscoped pool ranking. An expired hard-pinned token returns unavailable rather than querying another account's catalog, while AUTO and callers without a scope retain their existing selection behavior.
+
 - ChatGPT Codex Sol credential selection no longer denies `gpt-5.6-sol` from the account's plan label. A Plus-labelled OAuth account was rejected locally before any request, but the provider accepts that account and returns a normal `200`; trial, grandfathered and experiment-enabled accounts all carry an ordinary plan label. Plan tier now only ranks Sol candidates, so a Pro account is still preferred and a Plus account is used when it is the only one connected or the preferred one is exhausted. Spark keeps its existing confirmed-Pro filtering when a Pro account is present. The provider remains the entitlement authority for Sol, and its refusal is still surfaced through the same actionable message (#5270).
 - Auth-broker failure reasons are scanned in linear time. Two rules accepted an unbounded scheme before the literal `://`, so a long run of scheme characters was re-tried at every prefix: 120 KB of upstream failure text cost roughly two seconds. Upstream reason text is remote-influenced, and `cleanReason` is what makes it safe for less-trusted surfaces.
 - Cursor's first-event deadline now bounds asynchronous payload hooks before any authenticated request is opened, and successful HTTP/2 teardown sends END_STREAM before falling back to bounded cleanup for a peer that leaves its response half open (#4834 review).
@@ -25,10 +27,6 @@
 - Documented `GJC_OPENAI_CODE_WEBSOCKET_V2` as a switch that enables a websocket v2 path. No code read it under that name, under the legacy `PI_CODEX_WEBSOCKET_V2`, or under the `PI_OPENAI_CODE_WEBSOCKET_V2` the historical entry records; the v2 beta header has been unconditional for websocket transport. The documentation row is removed rather than reintroducing a knob, and the test that claimed to gate on it no longer writes an environment variable nothing reads.
 - Maintenance reasoning now fails closed for Anthropic models routed through an unverified custom endpoint and for raw reasoning-enabled models without thinking metadata. This prevents unsupported thinking controls and avoids a synchronous missing-metadata crash before provider wire transformation.
 - The auth-gateway OpenAI Responses and Chat Completions encoders now emit only the `call_id` half of a Codex/Responses compound tool-call id (`call_…|fc_…`) on the wire. The compound encoding is gjc-internal replay state; a downstream OpenAI-format client that echoed it back truncated it at its own 64-character limit and every chained tool turn was then rejected with `400 No tool output found for function call`. The item id still travels as the Responses item `id`.
-
-### Fixed
-
-- Credential-scoped model discovery now peeks the OAuth account selected for that session instead of falling back to unscoped pool ranking. An expired hard-pinned token returns unavailable rather than querying another account's catalog, while AUTO and callers without a scope retain their existing selection behavior.
 
 ## [0.16.4] - 2026-09-05
 

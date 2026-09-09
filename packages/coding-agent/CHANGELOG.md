@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 ### Fixed
+- CLI startup now preserves saved account pins when handing authentication to the SDK. Catalog refreshes with a session use its effective credential pin, preventing a cached free OpenAI Codex account catalog from hiding Astra or Sol during paid-account profile startup. Generic injected SDK authentication keeps its existing isolation, and persisted session selections retain precedence over global pins.
 
 - Managed migration-lock release now detects closed or reused Linux descriptors before native security verification and validates ownership through the recovered descriptor. Recovery still requires the original file identity, attempt id, and owner-only security; repeated release cannot change a successor. This fixes the retained-descriptor failure in #5399 without changing test timing or retry policy.
 - Coordinator responses now preserve `error: null` instead of replacing it with an `unavailable` error. Non-null errors still use fixed public messages, and unknown error codes remain mapped to `unavailable`.
@@ -86,10 +87,6 @@
 - SDK prompts consumed together after queued steering is interrupted now each receive correlated starts, streamed content, and one terminal, without adopting unrelated pending submissions.
 
 - Tool hot paths avoid overlap-table allocations for equal/append-only ACP output, redundant UTF-8 tail previews, repeated diagnostics suffix scans, and duplicate background GitHub-cache refreshes. Job polling now releases watches and timers when a progress callback throws.
-
-### Fixed
-
-- CLI startup now preserves saved account pins when handing authentication to the SDK. Catalog refreshes with a session use its effective credential pin, preventing a cached free OpenAI Codex account catalog from hiding Astra or Sol during paid-account profile startup. Generic injected SDK authentication keeps its existing isolation, and persisted session selections retain precedence over global pins.
 
 ## [0.16.4] - 2026-09-05
 ### Added

@@ -2831,7 +2831,9 @@ export class AuthStorage {
 			const selector = selectors.get(storageProvider);
 			if (!selector) continue;
 			const selected = previousEntries.find(entry => this.#credentialMatchesSelector(entry, selector));
-			if (selected && removedIds.has(selected.id)) this.clearSessionCredentialSelector(storageProvider, scopeId);
+			if (selected && removedIds.has(selected.id)) {
+				this.markSessionCredentialUnavailable(scopeId, storageProvider, selector);
+			}
 		}
 		for (const [sessionId, sticky] of this.#sessionLastCredential.get(storageProvider) ?? []) {
 			if (removedIds.has(previousEntries[sticky.index]?.id ?? -1))
@@ -4993,17 +4995,6 @@ export class AuthStorage {
 					);
 				} catch (error) {
 					if (isSqliteError(error)) throw error;
-					if (
-						sessionSelector &&
-						/invalid_grant|grant is invalid|invalid_token|revoked|unauthorized|expired.*refresh|refresh.*expired/i.test(
-							String(error),
-						)
-					) {
-						this.markSessionCredentialUnavailable(sessionId!, provider, sessionSelector);
-						throw new Error(
-							`Selected credential for ${provider} (${this.#formatCredentialSelector(sessionSelector)}) is unavailable`,
-						);
-					}
 				}
 			}),
 		);
@@ -5801,6 +5792,14 @@ export class AuthStorage {
 	 */
 	async getApiKey(provider: string, sessionId?: string, options?: AuthApiKeyOptions): Promise<string | undefined> {
 		provider = resolveOAuthStorageProvider(provider);
+		if (sessionId && !options?.credentialSelector) {
+			const unavailableSelector = this.#sessionCredentialUnavailable.get(sessionId)?.get(provider);
+			if (unavailableSelector) {
+				throw new Error(
+					`Selected credential for ${provider} (${this.#formatCredentialSelector(unavailableSelector)}) is unavailable`,
+				);
+			}
+		}
 		const selectedCredential = this.#resolveSelectedStoredCredential(provider, options, sessionId);
 
 		// Runtime override takes highest priority after selector validation.

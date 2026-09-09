@@ -1098,9 +1098,10 @@ function resolveOAuthAccountIdForAccessToken(
 	authStorage: AuthStorage,
 	provider: string,
 	accessToken: string,
+	sessionId?: string,
 	owner?: object,
 ): string | undefined {
-	if (authStorage.getEffectiveCredentialType(provider, undefined, owner ? { owner } : undefined) !== "oauth") {
+	if (authStorage.getEffectiveCredentialType(provider, sessionId, owner ? { owner } : undefined) !== "oauth") {
 		return undefined;
 	}
 	const oauthCredentials = getOAuthCredentialsForProvider(authStorage, provider);
@@ -3646,6 +3647,7 @@ export class ModelRegistry {
 						this.authStorage,
 						"openai-codex",
 						accessToken,
+						credentialSessionId,
 						this.#authStorageConfigOwner,
 					);
 					return openaiCodexModelManagerOptions({

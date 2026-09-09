@@ -117,6 +117,31 @@ describe("AuthStorage session credential selectors", () => {
 		}
 	});
 
+	test("unavailable scoped pins never fall through to stored API keys", async () => {
+		const store = await SqliteAuthCredentialStore.open(":memory:");
+		store.replaceAuthCredentialsForProvider("anthropic", [
+			oauth("pinned"),
+			{ type: "api_key", key: "alternate-api-key" },
+		]);
+		const storage = new AuthStorage(store);
+		await storage.reload();
+		try {
+			storage.acquireCredentialScope("unavailable-api-key");
+			storage.setSessionCredentialSelector("unavailable-api-key", "anthropic", {
+				kind: "email",
+				value: "pinned@example.com",
+			});
+			storage.markSessionCredentialUnavailable("unavailable-api-key", "anthropic", {
+				kind: "email",
+				value: "pinned@example.com",
+			});
+
+			await expect(storage.getApiKey("anthropic", "unavailable-api-key")).rejects.toThrow(/is unavailable/);
+		} finally {
+			storage.close();
+		}
+	});
+
 	test("unavailable scoped pins fail loudly and final lease release clears only that scope", async () => {
 		const storage = await createStorage();
 		try {
