@@ -591,7 +591,7 @@ export async function ensureWorkflowSkillActivationSeed(
 	const noRollback = async () => false;
 	if (!isGjcWorkflowSkill(skill)) return { state: null, seeded: false, rollback: noRollback };
 	const resolvedSessionId = await resolveBoundarySessionId(input.cwd, input.sessionId);
-	let existing = await readVisibleSkillActiveState(input.cwd, resolvedSessionId, input.stateDir);
+	const existing = await readVisibleSkillActiveState(input.cwd, resolvedSessionId, input.stateDir);
 	let existingEntry = listActiveSkills(existing).find(
 		entry =>
 			entry.skill === skill &&
@@ -617,12 +617,7 @@ export async function ensureWorkflowSkillActivationSeed(
 			if (merged.result.written || merged.result.reason !== "stale-skip") {
 				throw new Error(`Workflow subskill activation write was not persisted: ${skill}`);
 			}
-			existing = await readVisibleSkillActiveState(input.cwd, resolvedSessionId, input.stateDir);
-			existingEntry = listActiveSkills(existing).find(
-				entry =>
-					entry.skill === skill &&
-					(existing ? entryMatchesContext(entry, existing, resolvedSessionId, input.threadId) : true),
-			);
+			existingEntry = merged.predecessor;
 			if (!existingEntry) return { state: existing, seeded: false, rollback: noRollback };
 		}
 		const rawPredecessor = merged.predecessor;
