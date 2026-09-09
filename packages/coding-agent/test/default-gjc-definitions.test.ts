@@ -896,60 +896,55 @@ Project executor override body.
 			FORCE_COLOR: undefined,
 		};
 
-		const installProc = Bun.spawn(
-			[process.execPath, path.join(repoRoot, "packages", "coding-agent", "src", "cli.ts"), "setup", "defaults"],
-			{
-				cwd: externalRoot,
-				stdout: "pipe",
-				stderr: "pipe",
-				env,
-			},
-		);
-		const installStdout = await new Response(installProc.stdout).text();
-		const installStderr = await new Response(installProc.stderr).text();
-		expect(await installProc.exited).toBe(0);
+		// Three sequential CLI startups plus installation need more than Bun's 5s unit-test budget.
+		// Bound each owned child below the 30s test deadline, leaving time to join it on failure.
+		const runSetupDefaults = async (args: string[] = []) => {
+			const proc = Bun.spawn(
+				[
+					process.execPath,
+					path.join(repoRoot, "packages", "coding-agent", "src", "cli.ts"),
+					"setup",
+					"defaults",
+					...args,
+				],
+				{
+					cwd: externalRoot,
+					stdout: "pipe",
+					stderr: "pipe",
+					env,
+					timeout: 8_000,
+					killSignal: "SIGKILL",
+				},
+			);
+			try {
+				const [stdout, stderr, exitCode] = await Promise.all([
+					new Response(proc.stdout).text(),
+					new Response(proc.stderr).text(),
+					proc.exited,
+				]);
+				expect(exitCode, `setup defaults ${args.join(" ")} (8s deadline): ${stderr}`).toBe(0);
+				return { stdout, stderr };
+			} finally {
+				if (proc.exitCode === null) proc.kill("SIGKILL");
+				await proc.exited;
+			}
+		};
+
+		const { stdout: installStdout, stderr: installStderr } = await runSetupDefaults();
 		expect(installStderr).toBe("");
 		expect(installStdout).toContain("gjc skills list");
 		expect(installStdout).toContain("gjc skills read ralplan");
 
-		const skippedProc = Bun.spawn(
-			[process.execPath, path.join(repoRoot, "packages", "coding-agent", "src", "cli.ts"), "setup", "defaults"],
-			{
-				cwd: externalRoot,
-				stdout: "pipe",
-				stderr: "pipe",
-				env,
-			},
-		);
-		const skippedStdout = await new Response(skippedProc.stdout).text();
-		const skippedStderr = await new Response(skippedProc.stderr).text();
-		expect(await skippedProc.exited).toBe(0);
+		const { stdout: skippedStdout, stderr: skippedStderr } = await runSetupDefaults();
 		expect(skippedStderr).toBe("");
 		expect(skippedStdout).toContain("gjc skills list");
 		expect(skippedStdout).toContain("gjc setup defaults --force");
 
-		const jsonProc = Bun.spawn(
-			[
-				process.execPath,
-				path.join(repoRoot, "packages", "coding-agent", "src", "cli.ts"),
-				"setup",
-				"defaults",
-				"--json",
-			],
-			{
-				cwd: externalRoot,
-				stdout: "pipe",
-				stderr: "pipe",
-				env,
-			},
-		);
-		const jsonStdout = await new Response(jsonProc.stdout).text();
-		const jsonStderr = await new Response(jsonProc.stderr).text();
-		expect(await jsonProc.exited).toBe(0);
+		const { stdout: jsonStdout, stderr: jsonStderr } = await runSetupDefaults(["--json"]);
 		expect(jsonStderr).toBe("");
 		expect(jsonStdout).not.toContain("gjc skills list");
 		expect(JSON.parse(jsonStdout) as { skipped: number }).toMatchObject({ skipped: 10 });
-	});
+	}, 30_000);
 });
 
 describe("bundled skills CLI", () => {
