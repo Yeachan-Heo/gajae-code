@@ -7,6 +7,7 @@ import type { Process as NativeProcess } from "@gajae-code/natives";
 import { nativeProcessBindings } from "@gajae-code/utils/native-process";
 import * as postmortem from "@gajae-code/utils/postmortem";
 import { sanitizeDisplayLine } from "@gajae-code/utils/sanitize-text";
+import { acquireFileLock } from "../config/file-lock";
 
 export const COMMUNITY_APP_REPOSITORY = "devswha/gajae-code-app";
 export const COMMUNITY_APP_BUNDLE_ID = "app.gajae.desktop";
@@ -899,6 +900,7 @@ export async function offerMacosCommunityApp(
 	let launchCommitted = false;
 	let destinationRoot: string | undefined;
 	let destinationRootIdentity: FileIdentity | undefined;
+	let releaseDestinationLock: (() => Promise<void>) | undefined;
 	const throwIfInterrupted = () => {
 		if (receivedSignal) throw new Error(`community app offer interrupted by ${receivedSignal}`);
 		if (fetchAbortSignal.aborted) throw new Error("community app offer interrupted");
@@ -1184,6 +1186,15 @@ export async function offerMacosCommunityApp(
 		}
 		if (copiedArchCheck.exitCode !== 0 || !copiedArchCheck.stdout.split(/\s+/).includes(executableArch))
 			throw new Error("the copied app architecture changed");
+		// Copy and verify privately; serialize only publication, launch, and rollback.
+		releaseDestinationLock = await acquireFileLock(destination, {
+			retries: 6_000,
+			retryDelayMs: 100,
+			signal: fetchAbortSignal,
+		});
+		throwIfInterrupted();
+		if (!(await sameDirectoryIdentity(currentDestinationRoot, destinationRootIdentity)))
+			throw new Error("the Applications destination identity changed before publication");
 		const currentExistingDestination = await fs.lstat(destination).catch(() => undefined);
 		if (
 			currentExistingDestination &&
@@ -1193,18 +1204,22 @@ export async function offerMacosCommunityApp(
 		const currentExistingDestinationIdentity = currentExistingDestination
 			? await fileIdentity(destination)
 			: undefined;
-		if (
-			existingDestinationIdentity
-				? !currentExistingDestinationIdentity ||
-					currentExistingDestinationIdentity.dev !== existingDestinationIdentity.dev ||
-					currentExistingDestinationIdentity.ino !== existingDestinationIdentity.ino
-				: currentExistingDestinationIdentity
-		)
+		const destinationChanged = existingDestinationIdentity
+			? !currentExistingDestinationIdentity ||
+				currentExistingDestinationIdentity.dev !== existingDestinationIdentity.dev ||
+				currentExistingDestinationIdentity.ino !== existingDestinationIdentity.ino
+			: Boolean(currentExistingDestinationIdentity);
+		if (destinationChanged && !currentExistingDestinationIdentity)
 			throw new Error("the existing destination identity changed before replacement");
 		if (currentExistingDestinationIdentity) {
 			if (!(await sameDirectoryIdentity(destination, currentExistingDestinationIdentity)))
 				throw new Error("the existing destination identity changed before replacement");
 			if (await isVerifiedCommunityApp(destination, arch, command)) {
+				if (
+					!(await sameDirectoryIdentity(currentDestinationRoot, destinationRootIdentity)) ||
+					!(await sameDirectoryIdentity(destination, currentExistingDestinationIdentity))
+				)
+					throw new Error("the verified concurrent destination identity changed");
 				try {
 					const stagedRemoved = await removeClaimedDirectory(
 						stagingDestination,
@@ -1225,6 +1240,7 @@ export async function offerMacosCommunityApp(
 				installedDestination = undefined;
 				return { status: "skipped", reason: "already installed" };
 			}
+			if (destinationChanged) throw new Error("the concurrent destination was not a verified community app");
 			const backupPath = path.join(currentDestinationRoot, `.${appEntry.name}.${randomUUID()}.previous`);
 			await fs.rename(destination, backupPath);
 			priorDestination = { originalPath: destination, backupPath, identity: currentExistingDestinationIdentity };
@@ -1335,6 +1351,11 @@ export async function offerMacosCommunityApp(
 			log,
 		);
 	} finally {
+		try {
+			await releaseDestinationLock?.();
+		} catch (error) {
+			log(`Optional community app cleanup warning: failed to release destination lock: ${String(error)}`);
+		}
 		let removeTempRoot = true;
 		if (mountAttempted && mountPoint) {
 			try {

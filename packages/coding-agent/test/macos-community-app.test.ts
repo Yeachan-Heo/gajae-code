@@ -1125,6 +1125,107 @@ function verifiedFixtureResult(argv: string[]) {
 	};
 }
 
+for (const outcome of ["verified", "wrong-signer", "launch-failure"] as const) {
+	test(`concurrent community app publication preserves ownership: ${outcome}`, async () => {
+		const homeDir = await tempDir();
+		const stagingRoot = await tempDir();
+		const destination = path.join(homeDir, "Applications", "Gajae Code App.app");
+		const bothConsented = Promise.withResolvers<void>();
+		const bothCopying = Promise.withResolvers<void>();
+		let consentCount = 0;
+		let copyCount = 0;
+		let launchCount = 0;
+		let rejectedSignerCount = 0;
+		const dmg = new Uint8Array([1, 2, 3]);
+		const name = "gajae-app-desktop-1.0.0-macos-arm64.dmg";
+		const url = `https://github.com/devswha/gajae-code-app/releases/download/v1.0.0/${name}`;
+		const offer = () =>
+			offerMacosCommunityApp({
+				platform: "darwin",
+				arch: "arm64",
+				homeDir,
+				tempDir: stagingRoot,
+				env: {},
+				stdinIsTTY: true,
+				stdoutIsTTY: true,
+				log: () => {},
+				prompt: async () => {
+					if (++consentCount === 2) bothConsented.resolve();
+					await bothConsented.promise;
+					return true;
+				},
+				command: async argv => {
+					if (argv[0] === "/usr/bin/mdfind") return { exitCode: 1, stdout: "", stderr: "" };
+					if (
+						argv[0] === "/usr/bin/plutil" &&
+						!argv.at(-1)!.startsWith(`${homeDir}${path.sep}`) &&
+						!argv.at(-1)!.startsWith(`${stagingRoot}${path.sep}`)
+					)
+						return { exitCode: 1, stdout: "", stderr: "not the fixture" };
+					if (argv[0] === "/usr/bin/plutil" && !(await fs.stat(argv.at(-1)!).catch(() => undefined)))
+						return { exitCode: 1, stdout: "", stderr: "missing" };
+					if (argv[0] === "/usr/bin/hdiutil" && argv[1] === "attach")
+						await createBundleFixture(path.join(argv[argv.indexOf("-mountpoint") + 1], "Gajae Code App.app"));
+					if (argv[0] === "/usr/bin/ditto") {
+						await fs.cp(argv[1], argv[2], { recursive: true });
+						if (++copyCount === 2) {
+							if (outcome === "wrong-signer") {
+								await createBundleFixture(destination);
+								await fs.writeFile(path.join(destination, "peer-marker"), "untrusted peer app");
+							}
+							bothCopying.resolve();
+						}
+						await bothCopying.promise;
+					}
+					if (argv[0] === "/usr/bin/codesign" && argv.at(-1) === destination && outcome === "wrong-signer") {
+						expect(argv.slice(0, 5)).toEqual(["/usr/bin/codesign", "--verify", "--deep", "--strict", "-R"]);
+						rejectedSignerCount++;
+						return { exitCode: 1, stdout: "", stderr: "wrong signer" };
+					}
+					if (argv[0] === "/usr/bin/open" && ++launchCount === 1 && outcome === "launch-failure")
+						return { exitCode: 1, stdout: "", stderr: "launch failed" };
+					return verifiedFixtureResult(argv);
+				},
+				cleanupCommand: async () => ({ exitCode: 0, stdout: "", stderr: "", reaped: true }),
+				fetchImpl: async request =>
+					request.includes("/releases?")
+						? Response.json({
+								tag_name: "v1.0.0",
+								assets: [
+									{ name, browser_download_url: url },
+									{ name: `${name}.sha256`, browser_download_url: `${url}.sha256` },
+								],
+							})
+						: request === url
+							? new Response(dmg)
+							: new Response(`${createHash("sha256").update(dmg).digest("hex")}  ${name}\n`),
+			});
+		const results = await Promise.all([offer(), offer()]);
+		expect(consentCount).toBe(2);
+		expect(copyCount).toBe(2);
+		if (outcome === "wrong-signer") {
+			expect(
+				results.every(result => result.status === "failed" && result.reason.includes("concurrent destination")),
+			).toBe(true);
+			expect(rejectedSignerCount).toBe(2);
+			expect(launchCount).toBe(0);
+			expect(await fs.readFile(path.join(destination, "peer-marker"), "utf8")).toBe("untrusted peer app");
+		} else {
+			expect(results.map(result => result.status).sort()).toEqual(
+				outcome === "verified" ? ["installed", "skipped"] : ["failed", "installed"],
+			);
+			if (outcome === "verified")
+				expect(results.find(result => result.status === "skipped")?.reason).toBe("already installed");
+			else expect(results.find(result => result.status === "failed")?.reason).toContain("could not be launched");
+			expect(launchCount).toBe(outcome === "verified" ? 1 : 2);
+			expect(await fs.readFile(path.join(destination, "Contents", "MacOS", "GajaeCode"), "utf8")).toBe("new app");
+		}
+		// Neither contender may remove its peer's destination or leave a held lock/staging bundle.
+		expect(await fs.readdir(path.dirname(destination))).toEqual(["Gajae Code App.app"]);
+		expect(await fs.readdir(stagingRoot)).toEqual([]);
+	}, 20_000);
+}
+
 for (const site of ["direct", "spotlight", "source", "copied"] as const) {
 	test(`rejects forged signer display records when native requirement fails at ${site}`, async () => {
 		const homeDir = await tempDir();
