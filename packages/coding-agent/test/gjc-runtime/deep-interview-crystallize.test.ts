@@ -3117,6 +3117,80 @@ describe("deep-interview crystallize contract", () => {
 		}
 	});
 
+	it("rejects a root-level forged project transcript through GJC_SESSION_FILE", async () => {
+		const root = await fs.mkdtemp(path.join(process.cwd(), ".tmp-crystallize-root-forged-"));
+		const sessionId = "crystallize-root-forged";
+		const forged = path.join(root, ".gjc", "forged.jsonl");
+		const previousSessionFile = process.env.GJC_SESSION_FILE;
+		try {
+			await fs.mkdir(path.dirname(forged), { recursive: true });
+			await fs.writeFile(
+				forged,
+				`${JSON.stringify({ type: "session", id: sessionId, cwd: root })}\n${JSON.stringify({
+					type: "message",
+					message: { role: "user", content: "Build a fast report." },
+				})}\n`,
+			);
+			process.env.GJC_SESSION_FILE = forged;
+			const result = await runNativeDeepInterviewCommand(
+				[
+					"--crystallize",
+					"--input",
+					JSON.stringify(input()),
+					"--session-id",
+					sessionId,
+					"--slug",
+					"root-forged-session-file",
+					"--json",
+				],
+				root,
+			);
+			expect(result.status).toBe(2);
+			expect(result.stderr).toContain("managed canonical session transcript");
+		} finally {
+			if (previousSessionFile === undefined) delete process.env.GJC_SESSION_FILE;
+			else process.env.GJC_SESSION_FILE = previousSessionFile;
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects a root-level forged project transcript during discovery", async () => {
+		const root = await fs.mkdtemp(path.join(process.cwd(), ".tmp-crystallize-root-discovery-"));
+		const sessionId = "crystallize-root-discovery";
+		const forged = path.join(root, ".gjc", "forged.jsonl");
+		const previousSessionFile = process.env.GJC_SESSION_FILE;
+		try {
+			await fs.mkdir(path.dirname(forged), { recursive: true });
+			await fs.writeFile(
+				forged,
+				`${JSON.stringify({ type: "session", id: sessionId, cwd: root })}\n${JSON.stringify({
+					type: "message",
+					message: { role: "user", content: "Build a fast report." },
+				})}\n`,
+			);
+			delete process.env.GJC_SESSION_FILE;
+			const result = await runNativeDeepInterviewCommand(
+				[
+					"--crystallize",
+					"--input",
+					JSON.stringify(input()),
+					"--session-id",
+					sessionId,
+					"--slug",
+					"root-forged-discovery",
+					"--json",
+				],
+				root,
+			);
+			expect(result.status).toBe(2);
+			expect(result.stderr).toContain("authenticated session transcript");
+		} finally {
+			if (previousSessionFile === undefined) delete process.env.GJC_SESSION_FILE;
+			else process.env.GJC_SESSION_FILE = previousSessionFile;
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
 	it("does not reactivate an inactive deep-interview state through crystallization", async () => {
 		const root = await fs.mkdtemp(path.join(process.cwd(), ".tmp-crystallize-inactive-"));
 		const sessionId = "crystallize-inactive";
