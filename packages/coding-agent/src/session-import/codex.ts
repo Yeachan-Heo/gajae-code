@@ -31,7 +31,12 @@ const JWT_VALUE = /\b[A-Za-z0-9_-]{8,2048}\.[A-Za-z0-9_-]{8,8192}\.[A-Za-z0-9_-]
 const SECRET_ASSIGNMENT =
 	/(\b(?:password|passwd|secret|token|api[-_]?key|access[-_]?key)\b\s*[:=]\s*)(?:"[^"\r\n]{4,4096}"|'[^'\r\n]{4,4096}'|[^\s,;]{4,4096})/giu;
 const PRIVATE_KEY = /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]{1,65536}?-----END [A-Z ]*PRIVATE KEY-----/gu;
-const URL_CREDENTIAL = /([a-z][a-z0-9+.-]*:\/\/)[^\s/@:]+:[^\s/@]+@/giu;
+// The scheme-character run is boundary anchored, so the unbounded suffix is
+// attempted once per maximal run instead of once at every prefix. Keeping the
+// leading non-letter characters in the capture preserves redaction for URLs
+// embedded after digits or scheme punctuation without imposing an arbitrary
+// scheme-length cap.
+const URL_CREDENTIAL = /(?<![A-Za-z0-9+.-])([0-9+.-]*[a-z][a-z0-9+.-]*:\/\/)[^\s/@:]+:[^\s/@]+@/giu;
 const HEADER_CREDENTIAL = /(\b(authorization|cookie|set-cookie)\b[ \t]*:[ \t]*)([^\r\n]*)/giu;
 const JSON_AUTHORIZATION_CREDENTIAL = /((?:\\?")authorization(?:\\?")\s*:\s*(?:\\?")?)([^\\",}\r\n]+)/giu;
 
