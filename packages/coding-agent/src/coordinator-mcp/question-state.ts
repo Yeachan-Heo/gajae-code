@@ -2799,6 +2799,8 @@ export async function upgradeCreationRetirementEndpointFileId(
 		const request = registry.creations[keyDigest];
 		if (!request) throw new Error("state_corrupt");
 		if (legacyProof.endpoint_file_id !== undefined || !endpointFileId) throw new Error("invalid_input");
+		if (request.phase !== "remote_started" && request.phase !== "uncertain" && request.phase !== "retired")
+			throw new Error("retire_not_allowed");
 		const intent = request.canonical_create_intent;
 		if (!intent || intent.session.broker.endpoint_incarnation !== expectedLegacyEndpointIncarnation)
 			throw new Error("idempotency_conflict");

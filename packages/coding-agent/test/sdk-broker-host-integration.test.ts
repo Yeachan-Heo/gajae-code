@@ -171,7 +171,7 @@ test("broker rejects stale close authority after a preserved-mtime endpoint repl
 				"preserved-mtime-stale-close",
 			),
 		).toEqual({ ok: false, error: { code: "endpoint_stale", message: "session endpoint is stale" } });
-		expect(await fs.readFile(endpointPath, "utf8")).toContain('"token":"new"');
+		expect(await Bun.file(endpointPath).text()).toContain('"token":"new"');
 	} finally {
 		if (host.exitCode === null) host.kill("SIGKILL");
 		await host.exited;

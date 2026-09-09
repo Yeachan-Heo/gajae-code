@@ -441,6 +441,14 @@ describe("coordinator question-state direct contracts", () => {
 			).rejects.toThrow("idempotency_conflict");
 			const creation = await withNamespaceRegistry(paths, async registry => registry.creations.creation);
 			expect(creation?.canonical_create_intent?.session.broker).not.toHaveProperty("endpoint_file_id");
+			await withNamespaceRegistry(paths, async registry => {
+				registry.creations.creation!.phase = "wal_committed";
+			});
+			await expect(
+				upgradeCreationRetirementEndpointFileId(paths, "creation", proof, "legacy-predecessor", "2:3"),
+			).rejects.toThrow("retire_not_allowed");
+			const ineligible = await withNamespaceRegistry(paths, async registry => registry.creations.creation);
+			expect(ineligible?.canonical_create_intent?.session.broker).not.toHaveProperty("endpoint_file_id");
 		});
 	});
 

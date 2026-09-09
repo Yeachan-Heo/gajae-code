@@ -5166,7 +5166,7 @@ test("close fails closed when a dead endpoint is replaced before its descriptor 
 	try {
 		expect(() => process.kill(deadPid, 0)).toThrow();
 		await fs.mkdir(path.dirname(endpointPath), { recursive: true });
-		await fs.writeFile(endpointPath, predecessorSource);
+		await Bun.write(endpointPath, predecessorSource);
 		const fixedMtimeSeconds = 1_700_000_000;
 		await fs.utimes(endpointPath, fixedMtimeSeconds, fixedMtimeSeconds);
 		const predecessor = await fs.stat(endpointPath, { bigint: true });
@@ -5188,7 +5188,7 @@ test("close fails closed when a dead endpoint is replaced before its descriptor 
 			if (!replacedBeforeOpen && path.resolve(file) === path.resolve(endpointPath)) {
 				replacedBeforeOpen = true;
 				await fs.rename(endpointPath, displacedPath);
-				await fs.writeFile(endpointPath, successorSource);
+				await Bun.write(endpointPath, successorSource);
 				await fs.utimes(endpointPath, fixedMtimeSeconds, fixedMtimeSeconds);
 			}
 			return await (realOpen as (file: string, ...args: unknown[]) => Promise<fs.FileHandle>)(file, ...rest);
@@ -5207,7 +5207,7 @@ test("close fails closed when a dead endpoint is replaced before its descriptor 
 		const successor = await fs.stat(endpointPath, { bigint: true });
 		expect(`${successor.dev}:${successor.ino}`).not.toBe(predecessorFileId);
 		expect(Number(successor.mtimeNs / 1_000_000n)).toBe(endpointMtimeMs);
-		expect(await fs.readFile(endpointPath, "utf8")).toBe(successorSource);
+		expect(await Bun.file(endpointPath).text()).toBe(successorSource);
 	} finally {
 		await broker.stop();
 		await fs.rm(root, { recursive: true, force: true });
