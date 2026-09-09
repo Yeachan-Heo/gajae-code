@@ -624,6 +624,51 @@ exit 0
 		expect(fs.readFileSync(signalPath, "utf8").trim()).toBe("TERM");
 	}, 15_000);
 
+	test("does not intercept termination before the optional runtime starts", async () => {
+		const capabilityMarker = path.join(sandbox.root, "capability-marker");
+		const unamePath = path.join(sandbox.shimDir, "uname");
+		fs.writeFileSync(unamePath, '#!/bin/sh\nif [ "$1" = "-s" ]; then echo Darwin; else echo x86_64; fi\n');
+		fs.chmodSync(unamePath, 0o755);
+		const payload = `#!/bin/sh
+if [ "$1" = "--version" ]; then echo "gjc/${VERSION}"; exit 0; fi
+if [ "$1" = "--smoke-test" ]; then exit 0; fi
+if [ "$1" = "--supports-macos-community-app" ]; then
+  printf 'probing\n' > "$GJC_TEST_CAPABILITY_MARKER"
+  sleep 30
+  exit 0
+fi
+exit 0
+`;
+		const binaryName = "gjc-darwin-x64";
+		writeCurlShim(sandbox.shimDir, {
+			assets: {
+				[binaryName]: payload,
+				"gajae-release-binaries.sha256": `${sha256(payload)}  ${binaryName}\n`,
+			},
+		});
+		const installer = Bun.spawn(["sh", installScript], {
+			env: {
+				...process.env,
+				PATH: `${sandbox.shimDir}:/usr/bin:/bin`,
+				GJC_INSTALL_DIR: sandbox.installDir,
+				HOME: sandbox.root,
+				GITHUB_TOKEN: "",
+				GH_TOKEN: "",
+				CI: "false",
+				GITHUB_ACTIONS: "false",
+				GJC_NONINTERACTIVE: "false",
+				GJC_TEST_CAPABILITY_MARKER: capabilityMarker,
+			},
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		for (let attempt = 0; attempt < 100 && !fs.existsSync(capabilityMarker); attempt++) await Bun.sleep(50);
+		expect(fs.existsSync(capabilityMarker)).toBe(true);
+		process.kill(installer.pid, "SIGTERM");
+		expect(await installer.exited).toBe(143);
+		expect(fs.readdirSync(sandbox.installDir).some(name => name.startsWith(".gjc-community-app."))).toBe(false);
+	}, 15_000);
+
 	test("follows redirects and fail-closes checksum fetch except HTTP 404", async () => {
 		const installer = await Bun.file(installScript).text();
 		expect(installer).toContain("curl -sSL");

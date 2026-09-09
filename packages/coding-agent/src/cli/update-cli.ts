@@ -1355,10 +1355,10 @@ async function spawnPostUpdateRecovery(argv: string[], onSpawn?: (pid: number) =
 			setTimeout(() => process.exit(exitCode), 4_500);
 			const signalNumber = signal === "SIGINT" ? 2 : signal === "SIGHUP" ? 1 : 15;
 			processRef.killTree(signalNumber);
-			if (!(await processRef.waitForExit({ timeoutMs: 3_000 }))) {
+			if (!(await processRef.waitForExit({ timeoutMs: 4_000 }))) {
 				processRef.killTree(9);
 				processRef.signalRoot(9);
-				if (!(await processRef.waitForExit({ timeoutMs: 1_000 })))
+				if (!(await processRef.waitForExit({ timeoutMs: 500 })))
 					throw new Error("verified recovery child remained alive after forceful termination");
 			}
 			await child.exited;
@@ -1387,7 +1387,7 @@ async function spawnPostUpdateRecovery(argv: string[], onSpawn?: (pid: number) =
 			// Signal dispatch itself is not awaitable. Reserve most of the shared
 			// five-second postmortem budget for the child offer's bounded cleanup,
 			// then force the pinned process tree down before other exit handlers run.
-			Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 3_000);
+			Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 4_000);
 			processRef.killTree(9);
 			processRef.signalRoot(9);
 			void terminate(signal);
@@ -1408,14 +1408,13 @@ export const spawnPostUpdateRecoveryForTest = spawnPostUpdateRecovery;
 
 async function runCommunityAppOfferFromRuntime(
 	runtimePath: string,
-	deps: Pick<UpdateCommandDependencies, "offerCommunityApp">,
+	deps: Pick<UpdateCommandDependencies, "offerCommunityApp" | "runPostUpdateRecovery">,
 ): Promise<void> {
 	if (deps.offerCommunityApp) {
 		await deps.offerCommunityApp(runtimePath);
 		return;
 	}
-	const result = await offerMacosCommunityApp();
-	if (result.status === "failed") throw new Error(result.reason);
+	await (deps.runPostUpdateRecovery ?? runPostUpdateRecovery)(runtimePath);
 }
 
 export async function runVerifiedRuntimeRecovery(
@@ -1427,8 +1426,15 @@ export async function runVerifiedRuntimeRecovery(
 ): Promise<void> {
 	await (options.recover ?? (() => runManagedNotifyRecovery({})))();
 	if ((options.platform ?? process.platform) !== "darwin") return;
-	const result = await (options.offer ?? offerMacosCommunityApp)();
-	if (result.status === "failed") logger.warn(`Warning: optional macOS community app offer failed: ${result.reason}`);
+	try {
+		const result = await (
+			options.offer ?? (() => offerMacosCommunityApp({ log: message => logger.warn(message) }))
+		)();
+		if (result.status === "failed")
+			logger.warn(`Warning: optional macOS community app offer failed: ${result.reason}`);
+	} catch (error) {
+		logger.warn(`Warning: optional macOS community app offer failed: ${error}`);
+	}
 }
 
 async function supportsUpdateRecovery(runtimePath: string): Promise<boolean> {

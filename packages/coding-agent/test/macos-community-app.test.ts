@@ -59,6 +59,41 @@ describe("macOS community app offer guards", () => {
 		expect(prompted).toBe(false);
 		expect(fetched).toBe(false);
 	});
+
+	test("fails before prompting when an existing-app verifier cannot be reaped", async () => {
+		const homeDir = await tempDir();
+		const app = path.join(homeDir, "Applications", "Gajae Code App.app");
+		await fs.mkdir(path.join(app, "Contents", "MacOS"), { recursive: true });
+		await fs.writeFile(path.join(app, "Contents", "Info.plist"), "fixture");
+		let prompted = false;
+		let fetched = false;
+		const result = await offerMacosCommunityApp({
+			platform: "darwin",
+			arch: "arm64",
+			homeDir,
+			env: {},
+			stdinIsTTY: true,
+			stdoutIsTTY: true,
+			prompt: async () => {
+				prompted = true;
+				return true;
+			},
+			fetchImpl: async () => {
+				fetched = true;
+				return new Response("unexpected");
+			},
+			command: async argv => ({
+				exitCode: argv[0] === "/usr/bin/plutil" ? 0 : 1,
+				stdout: argv[0] === "/usr/bin/plutil" ? COMMUNITY_APP_BUNDLE_ID : "",
+				stderr: "",
+				reaped: argv[0] !== "/usr/bin/plutil",
+			}),
+		});
+		expect(result.status).toBe("failed");
+		expect(result.reason).toContain("verification helper did not terminate safely");
+		expect(prompted).toBe(false);
+		expect(fetched).toBe(false);
+	});
 	test("parses pinned signer fields as complete codesign records", async () => {
 		const maliciousPath = `/tmp/Executable=Authority=${COMMUNITY_APP_SIGNING_AUTHORITY} TeamIdentifier=${COMMUNITY_APP_TEAM_ID}.app`;
 		expect(
@@ -411,6 +446,25 @@ process.exit(0);
 		expect(rejectedChecksum.reason).toContain("checksum fetch failed");
 		expect(rejectedFetchAborted).toBe(true);
 		expect(rejectedStreamCancelled).toBe(true);
+	});
+
+	test("authenticates community release metadata with the ambient GitHub token", async () => {
+		const authorizations: string[] = [];
+		const result = await offerMacosCommunityApp({
+			platform: "darwin",
+			arch: "arm64",
+			env: { GITHUB_TOKEN: "release-token" },
+			stdinIsTTY: true,
+			stdoutIsTTY: true,
+			prompt: async () => true,
+			command: async () => ({ exitCode: 1, stdout: "", stderr: "" }),
+			fetchImpl: async (_url, init) => {
+				authorizations.push(new Headers(init?.headers).get("Authorization") ?? "");
+				return new Response("missing", { status: 404 });
+			},
+		});
+		expect(result.status).toBe("failed");
+		expect(authorizations).toEqual(["Bearer release-token"]);
 	});
 });
 

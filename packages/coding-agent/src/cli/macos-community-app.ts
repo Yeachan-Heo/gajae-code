@@ -6,6 +6,8 @@ import { createInterface } from "node:readline/promises";
 import type { Process as NativeProcess } from "@gajae-code/natives";
 import { nativeProcessBindings } from "@gajae-code/utils/native-process";
 import * as postmortem from "@gajae-code/utils/postmortem";
+import { acquireFileLock } from "../config/file-lock";
+import { githubReleaseHeaders } from "./github-release";
 
 export const COMMUNITY_APP_REPOSITORY = "devswha/gajae-code-app";
 export const COMMUNITY_APP_BUNDLE_ID = "app.gajae.desktop";
@@ -21,7 +23,7 @@ const MAX_COMMAND_OUTPUT_BYTES = 1024 * 1024;
 const METADATA_FETCH_TIMEOUT_MS = 30_000;
 const ASSET_FETCH_TIMEOUT_MS = 10 * 60_000;
 const COMMAND_TIMEOUT_MS = 120_000;
-const CLEANUP_COMMAND_TIMEOUT_MS = 1_000;
+const CLEANUP_COMMAND_TIMEOUT_MS = 2_000;
 const HELPER_REAP_TIMEOUT_MS = 750;
 const HELPER_REAP_POLL_ATTEMPTS = 10;
 const HELPER_OUTPUT_SETTLE_GRACE_MS = 250;
@@ -229,14 +231,16 @@ async function removeClaimedDirectory(
 		return false;
 	}
 	const quarantineRoot = path.join(parentPath, `.gjc-community-app-cleanup-${process.pid}-${Date.now().toString(16)}`);
+	let quarantineIdentity: FileIdentity | undefined;
+	let tombstone: string | undefined;
 	try {
 		await fs.mkdir(quarantineRoot, { mode: 0o700 });
-		const quarantineIdentity = await fileIdentity(quarantineRoot);
+		quarantineIdentity = await fileIdentity(quarantineRoot);
 		if (!quarantineIdentity || !(await sameDirectoryIdentity(parentPath, parentIdentity))) {
 			log("Optional community app cleanup warning: quarantine identity changed before removal");
 			return false;
 		}
-		const tombstone = path.join(quarantineRoot, path.basename(filePath));
+		tombstone = path.join(quarantineRoot, path.basename(filePath));
 		await fs.rename(filePath, tombstone);
 		if (
 			!(await sameDirectoryIdentity(parentPath, parentIdentity)) ||
@@ -251,6 +255,22 @@ async function removeClaimedDirectory(
 			await fs.rm(quarantineRoot, { force: true, recursive: true });
 		return true;
 	} catch (error) {
+		if (tombstone && quarantineIdentity) {
+			try {
+				const originalExists = await fs.lstat(filePath).catch(() => undefined);
+				if (
+					!originalExists &&
+					(await sameDirectoryIdentity(parentPath, parentIdentity)) &&
+					(await sameDirectoryIdentity(quarantineRoot, quarantineIdentity)) &&
+					(await sameDirectoryIdentity(tombstone, identity))
+				) {
+					await fs.rename(tombstone, filePath);
+					if (await sameDirectoryIdentity(filePath, identity)) await fs.rm(quarantineRoot, { force: true });
+				}
+			} catch (restoreError) {
+				log(`Optional community app cleanup warning: failed to restore cleanup tombstone: ${String(restoreError)}`);
+			}
+		}
 		log(`Optional community app cleanup warning: failed to remove partial app state: ${String(error)}`);
 		return false;
 	}
@@ -290,6 +310,17 @@ async function runCommand(argv: string[], timeoutMs = COMMAND_TIMEOUT_MS): Promi
 			reaped,
 		};
 	}
+	const processGroupId = processRef.groupId();
+	if (processGroupId === null) {
+		await processRef.terminate({ gracefulMs: -1, timeoutMs: HELPER_REAP_TIMEOUT_MS });
+		activeCommandControllers.delete(controller);
+		return {
+			exitCode: 125,
+			stdout: "",
+			stderr: `could not bind helper process-group identity: ${argv[0]}`,
+			reaped: false,
+		};
+	}
 	const descendants = new Map<string, NativeProcess>();
 	const captureDescendants = (parent: NativeProcess): void => {
 		for (const descendant of parent.children()) {
@@ -320,6 +351,13 @@ async function runCommand(argv: string[], timeoutMs = COMMAND_TIMEOUT_MS): Promi
 						descendant.terminate({ gracefulMs: -1, timeoutMs: HELPER_REAP_TIMEOUT_MS }),
 					),
 				);
+				if (!(await waitForSpawnGroupGone())) {
+					try {
+						process.kill(-processGroupId, "SIGKILL");
+					} catch (error) {
+						if ((error as NodeJS.ErrnoException).code !== "ESRCH") return false;
+					}
+				}
 				return rootExited && descendantResults.every(Boolean) && (await waitForSpawnGroupGone());
 			})();
 		}
@@ -615,6 +653,16 @@ export async function offerMacosCommunityApp(
 		if (result.reaped === false) cleanupUnsafe = true;
 		return result;
 	};
+	const discoveryCommand: CommandRunner = async argv => {
+		const result = await command(argv);
+		if (result.reaped === false)
+			throw new Error(
+				argv[0] === "/usr/bin/mdfind"
+					? "installed app discovery helper did not terminate safely"
+					: "installed app verification helper did not terminate safely",
+			);
+		return result;
+	};
 	const signalNames = ["SIGINT", "SIGTERM", "SIGHUP"] as const;
 	const signalHandlers = new Map<NodeJS.Signals, () => void>();
 	const offerSettled = Promise.withResolvers<void>();
@@ -655,7 +703,7 @@ export async function offerMacosCommunityApp(
 	const arch = deps.arch ?? process.arch;
 	if (!isMacArchitecture(arch)) return finishOwnership(failure(`unsupported macOS architecture ${arch}`, log));
 	try {
-		if (await findInstalledApp(homeDir, arch, command))
+		if (await findInstalledApp(homeDir, arch, discoveryCommand))
 			return finishOwnership({ status: "skipped", reason: "already installed" });
 		if (!(await (deps.prompt ?? (() => defaultPrompt(fetchAbortSignal)))()))
 			return finishOwnership({ status: "skipped", reason: "cancelled" });
@@ -677,6 +725,7 @@ export async function offerMacosCommunityApp(
 	let priorDestination: { originalPath: string; backupPath: string; identity: FileIdentity } | undefined;
 	let destinationRoot: string | undefined;
 	let destinationRootIdentity: FileIdentity | undefined;
+	let releaseReplacementLock: (() => Promise<void>) | undefined;
 	const throwIfInterrupted = () => {
 		if (receivedSignal) throw new Error(`community app offer interrupted by ${receivedSignal}`);
 		if (fetchAbortSignal.aborted) throw new Error("community app offer interrupted");
@@ -685,11 +734,7 @@ export async function offerMacosCommunityApp(
 		const releaseResponse = await fetchImpl(
 			`${GITHUB_API_ORIGIN}/repos/${COMMUNITY_APP_REPOSITORY}/releases?per_page=20`,
 			{
-				headers: {
-					Accept: "application/vnd.github+json",
-					"User-Agent": "gjc-community-app-offer",
-					"X-GitHub-Api-Version": "2022-11-28",
-				},
+				headers: githubReleaseHeaders(env.GITHUB_TOKEN || env.GH_TOKEN),
 				signal: fetchOptions(METADATA_FETCH_TIMEOUT_MS).signal,
 			},
 		);
@@ -901,6 +946,11 @@ export async function offerMacosCommunityApp(
 		destinationRootIdentity = await fileIdentity(currentDestinationRoot);
 		if (!destinationRootIdentity) return failure("the Applications destination identity was unavailable", log);
 		const destination = path.join(currentDestinationRoot, appEntry.name);
+		releaseReplacementLock = await acquireFileLock(destination, {
+			staleMs: 30_000,
+			retries: 12_000,
+			retryDelayMs: 5,
+		});
 		if (!(await sameDirectoryIdentity(currentDestinationRoot, destinationRootIdentity)))
 			return failure("the Applications destination identity changed", log);
 		throwIfInterrupted();
@@ -1020,14 +1070,15 @@ export async function offerMacosCommunityApp(
 			}
 			const backupPath = path.join(currentDestinationRoot, `.${appEntry.name}.${randomUUID()}.previous`);
 			await fs.rename(destination, backupPath);
+			priorDestination = { originalPath: destination, backupPath, identity: currentExistingDestinationIdentity };
 			if (
 				!(await sameDirectoryIdentity(currentDestinationRoot, destinationRootIdentity)) ||
 				!(await sameDirectoryIdentity(backupPath, currentExistingDestinationIdentity))
 			)
 				throw new Error("the prior app bundle identity changed during replacement staging");
-			priorDestination = { originalPath: destination, backupPath, identity: currentExistingDestinationIdentity };
 		}
 		await fs.rename(stagingDestination, destination);
+		installedDestination = { path: destination, identity: stagingIdentity };
 		const destinationIdentity = await fileIdentity(destination);
 		if (!destinationIdentity) throw new Error("the installed destination identity was unavailable");
 		installedDestination = { path: destination, identity: destinationIdentity };
@@ -1055,7 +1106,11 @@ export async function offerMacosCommunityApp(
 				destinationRootIdentity,
 				log,
 			);
-			if (!removed) throw new Error("the prior app bundle backup could not be removed safely");
+			if (!removed) {
+				log("Optional community app cleanup warning: the launched replacement was retained with its prior backup");
+				priorDestination = undefined;
+				return { status: "installed", reason: destination };
+			}
 			priorDestination = undefined;
 		}
 		return { status: "installed", reason: destination };
@@ -1107,6 +1162,7 @@ export async function offerMacosCommunityApp(
 			log,
 		);
 	} finally {
+		if (releaseReplacementLock) await releaseReplacementLock();
 		let removeTempRoot = true;
 		if (mountAttempted && mountPoint) {
 			try {

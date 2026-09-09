@@ -48,6 +48,7 @@ OFFER_RUNTIME_DIR=""
 OFFER_RUNTIME_ACTIVE=""
 OFFER_RUNTIME_SIGNAL=""
 OFFER_RUNTIME_PID=""
+VERIFIED_BINARY_SHA256=""
 
 usage() {
     cat <<'EOF'
@@ -576,6 +577,7 @@ verify_checksum() {
             die "Checksum mismatch for ${asset_name}: expected ${expected}, got ${actual}. Existing install was not changed."
         fi
         echo "Verified SHA-256 for ${asset_name}"
+        VERIFIED_BINARY_SHA256="$actual"
         return 0
     fi
     if [ "$http_code" != "404" ]; then
@@ -611,6 +613,7 @@ verify_checksum() {
             die "Checksum mismatch for ${asset_name}: expected ${expected}, got ${actual}. Existing install was not changed."
         fi
         echo "Verified SHA-256 for ${asset_name} from ${BINARY_MANIFEST_ASSET}"
+        VERIFIED_BINARY_SHA256="$actual"
         return 0
     fi
     if [ "$http_code" != "404" ]; then
@@ -764,16 +767,23 @@ install_binary() {
     # installs and `gjc update` share the same supply-chain checks. The offer is
     # strictly best-effort and must never change a successful GJC install.
     if [ "$PLATFORM" = "darwin" ] && ! community_app_offer_suppressed; then
-        OFFER_RUNTIME_ACTIVE=1
         OFFER_RUNTIME_DIR=$(mktemp -d "${INSTALL_DIR}/.gjc-community-app.XXXXXX" 2>/dev/null || true)
         OFFER_RUNTIME="${OFFER_RUNTIME_DIR}/gjc"
         if [ -n "$OFFER_RUNTIME_DIR" ] && [ ! -L "$DEST_PATH" ] && [ -f "$DEST_PATH" ] && cp -p "$DEST_PATH" "$OFFER_RUNTIME" 2>/dev/null; then
-            if chmod 500 "$OFFER_RUNTIME" 2>/dev/null && chmod 500 "$OFFER_RUNTIME_DIR" 2>/dev/null && [ -f "$OFFER_RUNTIME" ] && verify_checksum "$BINARY" "$OFFER_RUNTIME" optional; then
-                if "$OFFER_RUNTIME" --supports-macos-community-app </dev/null >/dev/null 2>&1; then
+            if chmod 500 "$OFFER_RUNTIME" 2>/dev/null && chmod 500 "$OFFER_RUNTIME_DIR" 2>/dev/null && [ -f "$OFFER_RUNTIME" ] && [ -n "$VERIFIED_BINARY_SHA256" ] && [ "$(file_sha256 "$OFFER_RUNTIME")" = "$VERIFIED_BINARY_SHA256" ]; then
+                OFFER_RUNTIME_ACTIVE=1
+                env -u MallocStackLogging -u MallocStackLoggingNoCompact "$OFFER_RUNTIME" --supports-macos-community-app </dev/null >/dev/null 2>&1 &
+                OFFER_RUNTIME_PID=$!
+                OFFER_RUNTIME_SUPPORTED=""
+                if wait "$OFFER_RUNTIME_PID" 2>/dev/null; then
+                    OFFER_RUNTIME_SUPPORTED=1
+                fi
+                OFFER_RUNTIME_PID=""
+                if [ -n "$OFFER_RUNTIME_SUPPORTED" ] && [ -z "$OFFER_RUNTIME_SIGNAL" ]; then
                     if [ -t 1 ] && [ -r /dev/tty ]; then
-                        "$OFFER_RUNTIME" --internal-macos-community-app-offer < /dev/tty &
+                        env -u MallocStackLogging -u MallocStackLoggingNoCompact "$OFFER_RUNTIME" --internal-macos-community-app-offer < /dev/tty &
                     else
-                        "$OFFER_RUNTIME" --internal-macos-community-app-offer &
+                        env -u MallocStackLogging -u MallocStackLoggingNoCompact "$OFFER_RUNTIME" --internal-macos-community-app-offer &
                     fi
                     OFFER_RUNTIME_PID=$!
                     if [ -n "$OFFER_RUNTIME_SIGNAL" ]; then

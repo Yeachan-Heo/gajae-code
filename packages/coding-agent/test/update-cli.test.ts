@@ -79,6 +79,29 @@ describe("update-cli recovery command surface", () => {
 		expect(calls).toEqual(["recover", "offer"]);
 	});
 
+	it("contains optional offer exceptions after recovery but preserves recovery failures", async () => {
+		const calls: string[] = [];
+		await runVerifiedRuntimeRecovery({
+			platform: "darwin",
+			recover: async () => {
+				calls.push("recover");
+			},
+			offer: async () => {
+				calls.push("offer");
+				throw new Error("optional cleanup failed");
+			},
+		});
+		expect(calls).toEqual(["recover", "offer"]);
+		await expect(
+			runVerifiedRuntimeRecovery({
+				platform: "darwin",
+				recover: async () => {
+					throw new Error("required recovery failed");
+				},
+			}),
+		).rejects.toThrow("required recovery failed");
+	});
+
 	it.skipIf(process.platform === "win32" || Bun.which("python3") === null)(
 		"reaps a non-cooperative verified recovery child before updater signal exit",
 		async () => {
@@ -961,7 +984,7 @@ describe("update-cli managed notification recovery", () => {
 			expect(calls).toEqual(["recovery", "refresh", "offer:/standalone/gjc"]);
 		});
 
-		it("runs the optional app offer from a verified migration runtime", async () => {
+		it("runs verified migration recovery through the production runtime handoff", async () => {
 			const calls: string[] = [];
 			const events: string[] = [];
 			await runUpdateCommand(
@@ -971,13 +994,13 @@ describe("update-cli managed notification recovery", () => {
 					getLatestRelease: async () => release,
 					resolveUpdateTarget: async () => target,
 					verifyMigrationTarget: async () => ({ ok: true, actual: release.version, path: target.path }),
-					offerCommunityApp: async runtimePath => {
-						calls.push(`offer:${runtimePath}`);
+					runPostUpdateRecovery: async runtimePath => {
+						calls.push(`recovery:${runtimePath}`);
 					},
 					recordTelemetryEvent: event => events.push(event),
 				},
 			);
-			expect(calls).toEqual(["offer:/standalone/gjc"]);
+			expect(calls).toEqual(["recovery:/standalone/gjc"]);
 			expect(events).toContain("update_install_completed");
 		});
 
