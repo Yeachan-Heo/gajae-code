@@ -4,6 +4,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { logger, VERSION } from "@gajae-code/utils";
+import { runCli } from "../src/cli";
 import { offerMacosCommunityApp } from "../src/cli/macos-community-app";
 import type { BinaryUpdateFlow, UpdateCommandDependencies } from "../src/cli/update-cli";
 import {
@@ -262,7 +263,6 @@ describe("macOS community app integration", () => {
 	});
 
 	it("dispatches only exact single-argument capability and internal offer flags", async () => {
-		const { runCli } = await import("../src/cli");
 		const stdout: string[] = [];
 		const write = vi.spyOn(process.stdout, "write").mockImplementation(chunk => {
 			stdout.push(String(chunk));
