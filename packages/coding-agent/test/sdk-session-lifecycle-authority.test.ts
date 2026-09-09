@@ -17,6 +17,8 @@ const providerAuthorityFiles = [
 const forbiddenProviderAuthorities = [
 	"readSdkBrokerDiscovery",
 	"readSdkSessionEndpoint",
+	"parseSdkSessionEndpoint",
+	"broker/endpoint-authority",
 	"SdkSessionEndpoint",
 	"SessionIndex",
 	"lifecycle-control-runtime",
@@ -61,7 +63,9 @@ describe("SDK-owned session lifecycle authority", () => {
 		const router = await source("src/sdk/router/session-router.ts");
 		const lifecycleClient = await source("src/sdk/lifecycle/client.ts");
 		const brokerClient = await source("src/sdk/lifecycle/broker-client.ts");
-		expect(router).toContain("readSdkSessionEndpoint");
+		expect(router).not.toContain("readSdkSessionEndpoint");
+		expect(router).toContain("await readEndpointFile(endpointPath)");
+		expect(router).toContain("parseSdkSessionEndpoint(indexed.sessionId, endpointPath, parsed)");
 		expect(router).toContain("readSdkBrokerDiscovery");
 		expect(lifecycleClient).toContain('from "./broker-client"');
 		expect(brokerClient).toContain("readSdkBrokerDiscovery");

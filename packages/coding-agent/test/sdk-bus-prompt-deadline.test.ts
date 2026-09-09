@@ -1427,8 +1427,10 @@ for (const superseded of [false, true]) {
 				expect(bus.deadlineTerminals()).toHaveLength(1);
 			}
 			const state = JSON.parse(await Bun.file(stateFile).text()) as Record<string, unknown>;
-			if (superseded) expect(state.error).not.toMatchObject({ code: "prompt_deadline_exceeded" });
-			else
+			if (superseded) {
+				expect(state).not.toMatchObject({ error: { code: "prompt_deadline_exceeded" } });
+				expect(state.run_failure).toBeUndefined();
+			} else
 				expect(state).toMatchObject({
 					execution_state: "failed",
 					receipt_state: "absent",

@@ -8,6 +8,7 @@ import { logger } from "@gajae-code/utils";
 import type { ExtensionActions, ExtensionAPI } from "../src/extensibility/extensions/types";
 import { brokerOwnerForTest } from "../src/sdk/broker/ensure";
 import { createNotificationsExtension } from "../src/sdk/bus";
+import { readSdkRunCapability } from "../src/session/sdk-run-capability";
 
 /**
  * A provider failure reaches this extension as an `agent_end` carrying an error
@@ -21,6 +22,13 @@ import { createNotificationsExtension } from "../src/sdk/bus";
 const dirs: string[] = [];
 const sockets: WebSocket[] = [];
 type AgentEndEvent = Extract<AgentEvent, { type: "agent_end" }>;
+type InternalCapturedOptions = NonNullable<Parameters<ExtensionActions["sendUserMessage"]>[1]> & {
+	sdkRunCapability?: unknown;
+};
+type CapturedSendUserMessage = (
+	content: Parameters<ExtensionActions["sendUserMessage"]>[0],
+	options?: InternalCapturedOptions,
+) => void | Promise<void>;
 const isolatedSdkHostTest = process.env.GJC_CI_SDK_HOST_ISOLATED === "1" ? test : test.skip;
 
 afterEach(async () => {
@@ -68,9 +76,18 @@ function context(cwd: string, sessionId: string): Record<string, unknown> {
 	};
 }
 
+function sdkRunContext(
+	ctx: Record<string, unknown>,
+	options?: InternalCapturedOptions,
+): Record<string, unknown> & { sdkRunToken: string } {
+	const sdkRunToken = readSdkRunCapability(options?.sdkRunCapability);
+	if (typeof sdkRunToken !== "string") throw new Error("missing private SDK run capability");
+	return { ...ctx, sdkRunToken };
+}
+
 function start(
 	ctx: Record<string, unknown>,
-	deliverUserMessage: ExtensionActions["sendUserMessage"] = () => undefined,
+	deliverUserMessage: CapturedSendUserMessage = () => undefined,
 ): Map<string, (event: unknown, context: unknown) => unknown> {
 	const handlers = new Map<string, (event: unknown, context: unknown) => unknown>();
 	const api = {
@@ -79,11 +96,11 @@ function start(
 		getThinkingLevel: () => undefined,
 		sendUserMessage: (
 			content: Parameters<ExtensionActions["sendUserMessage"]>[0],
-			options?: Parameters<ExtensionActions["sendUserMessage"]>[1],
+			options?: InternalCapturedOptions,
 		) => {
 			const commit = options?.onPreflightAcceptCommit;
 			const accepted = options?.onPreflightAccepted;
-			const deliver = () => Promise.resolve(deliverUserMessage(content));
+			const deliver = () => Promise.resolve(deliverUserMessage(content, options));
 			if (commit)
 				return Promise.resolve(commit()).then(() => {
 					accepted?.();
@@ -114,11 +131,17 @@ isolatedSdkHostTest(
 			streamMaxRetries: 0,
 		});
 		let handlers!: Map<string, (event: unknown, context: unknown) => unknown>;
-		handlers = await start(sessionContext, async () => {
-			await agent.prompt("reproduce the reviewer findings");
-		});
-		const unsubscribe = agent.subscribe(event => {
-			void handlers.get(event.type)?.(event, sessionContext);
+		handlers = await start(sessionContext, async (_content, options) => {
+			const runContext = sdkRunContext(sessionContext, options);
+			// Bind only this prompt's Agent subscription to its captured capability.
+			const unsubscribe = agent.subscribe(event => {
+				void handlers.get(event.type)?.({ ...event, sdkRunToken: runContext.sdkRunToken }, runContext);
+			});
+			try {
+				await agent.prompt("reproduce the reviewer findings");
+			} finally {
+				unsubscribe();
+			}
 		});
 		const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
 		await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
@@ -193,7 +216,6 @@ isolatedSdkHostTest(
 			});
 			expect(diagnostics[0]?.reason).toHaveLength(512);
 		} finally {
-			unsubscribe();
 			errorSpy.mockRestore();
 		}
 
@@ -366,7 +388,10 @@ isolatedSdkHostTest(
 		dirs.push(cwd);
 		const sessionId = `sdk-prompt-terminal-cancel-${Date.now()}`;
 		const sessionContext = context(cwd, sessionId);
-		const handlers = await start(sessionContext);
+		const capturedOptions = Promise.withResolvers<InternalCapturedOptions | undefined>();
+		const handlers = await start(sessionContext, (_content, options) => {
+			capturedOptions.resolve(options);
+		});
 		const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
 		await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
 		const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
@@ -398,15 +423,26 @@ isolatedSdkHostTest(
 				() => frames.some(frame => frame.type === "control_response" && frame.id === "cancelled-prompt"),
 				"prompt acknowledgement",
 			);
+			const acknowledgement = frames.find(
+				frame => frame.type === "control_response" && frame.id === "cancelled-prompt",
+			) as { result?: { commandId?: unknown; turnId?: unknown } };
+			const runContext = sdkRunContext(sessionContext, await capturedOptions.promise);
+			const { sdkRunToken } = runContext;
 			const cancelled: AgentEndEvent = { type: "agent_end", stopReason: "cancelled", messages: [] };
-			await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
+			await handlers.get("agent_start")?.({ type: "agent_start", sdkRunToken }, runContext);
 			await handlers.get("agent_failed")?.(
-				{ type: "agent_failed", error: Object.assign(new Error("cancel secret"), { code: "aborted" }) },
-				sessionContext,
+				{
+					type: "agent_failed",
+					sdkRunToken,
+					error: Object.assign(new Error("cancel secret"), { code: "aborted" }),
+				},
+				runContext,
 			);
-			await handlers.get("agent_end")?.(cancelled, sessionContext);
+			await handlers.get("agent_end")?.({ ...cancelled, sdkRunToken }, runContext);
 			await waitFor(() => frames.some(frame => frame.type === "agent_failed"), "cancelled prompt terminal");
 			expect(frames.find(frame => frame.type === "agent_failed")).toMatchObject({
+				commandId: acknowledgement.result?.commandId,
+				turnId: acknowledgement.result?.turnId,
 				error: { code: "aborted", message: "Prompt submission failed." },
 			});
 

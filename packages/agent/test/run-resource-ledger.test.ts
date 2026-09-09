@@ -480,7 +480,7 @@ test("aborted tool output does not release discovery or execution before real se
 	let terminal = false;
 	const draining = (async () => {
 		for await (const event of stream) {
-			if (event.type === "tool_execution_end") abortedResult = event.isError;
+			if (event.type === "tool_execution_end") abortedResult = event.isError === true;
 			if (event.type === "agent_end") terminal = true;
 		}
 	})();
