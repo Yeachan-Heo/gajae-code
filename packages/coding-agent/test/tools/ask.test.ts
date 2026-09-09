@@ -2958,8 +2958,10 @@ describe("AskTool deep-interview recorder persistence", () => {
 			id: "deep-interview-execution",
 			question: "Your spec is ready (ambiguity: 0%). How would you like to proceed?",
 			options: [
+				{ label: "Refine with ralplan consensus" },
 				{ label: "Execute with ultragoal (only when spec is already implementation-ready and really simple)" },
-				{ label: "Stop here" },
+				{ label: "Continue research with autoresearch (research continuation, not execution)" },
+				{ label: "Refine further" },
 			],
 			workflowGate: { stage: "deep-interview", kind: "execution" } as const,
 		};
@@ -3025,7 +3027,6 @@ describe("AskTool deep-interview recorder persistence", () => {
 				questions: [
 					{
 						...question,
-						options: [{ label: documentedLabel }, { label: "Stop here" }],
 					},
 				],
 			},
@@ -3348,7 +3349,7 @@ describe("AskTool deep-interview recorder persistence", () => {
 				questions: [
 					{
 						id: "final-approval",
-						question: "Approve this plan?",
+						question: "The final plan is ready. Approve execution?",
 						options: [
 							{ label: "Refine further" },
 							{ label: "Approve execution via ultragoal" },

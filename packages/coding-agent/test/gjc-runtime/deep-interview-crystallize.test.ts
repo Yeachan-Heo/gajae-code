@@ -197,7 +197,7 @@ describe("deep-interview crystallize contract", () => {
 	});
 
 	it("scopes action negation independently from unrelated exclusions", () => {
-		const content = "Require audit logs but not metrics. Forbid audit logs.";
+		const content = "Require audit logs and forbid metrics. Forbid audit logs.";
 		const snapshot: CrystalSnapshot = {
 			revision: 1,
 			start: 0,
@@ -216,8 +216,8 @@ describe("deep-interview crystallize contract", () => {
 							id: "constraint:require-audit",
 							kind: "constraint",
 							classification: "confirmed",
-							statement: "Require audit logs but not metrics.",
-							anchor: { message_index: 0, quote: "Require audit logs but not metrics." },
+							statement: "Require audit logs and forbid metrics.",
+							anchor: { message_index: 0, quote: "Require audit logs and forbid metrics." },
 						},
 						{
 							id: "constraint:forbid-audit",

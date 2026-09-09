@@ -150,6 +150,11 @@ function deepInterviewExecutionTarget(selectedOptions: readonly string[]): "ultr
 		: undefined;
 }
 
+function exactOptionSet(options: readonly { label: string }[], expected: readonly string[]): boolean {
+	const labels = options.map(option => option.label.trim().replace(/\s*\(Recommended\)\s*$/i, ""));
+	return labels.length === expected.length && expected.every(label => labels.includes(label));
+}
+
 function isAskTimeoutError(error: unknown): boolean {
 	return typeof error === "object" && error !== null && (error as { code?: unknown }).code === GJC_ASK_TIMEOUT_CODE;
 }
@@ -868,13 +873,18 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 		const canonicalGate = deepInterviewExecution
 			? normalizedSelection ===
 					"Execute with ultragoal (only when spec is already implementation-ready and really simple)" &&
-				/spec is ready/i.test(q.question) &&
-				/how would you like to proceed/i.test(q.question)
+				/^Your spec is ready \(ambiguity: (?:100|\d{1,2})(?:\.\d+)?%\)\. How would you like to proceed\?$/.test(
+					q.question,
+				) &&
+				exactOptionSet(q.options, [
+					"Refine with ralplan consensus",
+					"Execute with ultragoal (only when spec is already implementation-ready and really simple)",
+					"Continue research with autoresearch (research continuation, not execution)",
+					"Refine further",
+				])
 			: normalizedSelection === "Approve execution via ultragoal" &&
-				/approve/i.test(q.question) &&
-				/plan/i.test(q.question) &&
-				q.options.some(option => option.label.trim() === "Refine further") &&
-				q.options.some(option => option.label.trim() === "Stop here");
+				q.question === "The final plan is ready. Approve execution?" &&
+				exactOptionSet(q.options, ["Refine further", "Approve execution via ultragoal", "Stop here"]);
 		if (!canonicalGate || !toolCallId)
 			throw new ToolAbortError("Execution approval requires the canonical runtime approval gate");
 		if (!sessionId) throw new ToolAbortError("Deep Interview execution approval requires a session");

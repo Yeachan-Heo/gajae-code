@@ -1329,6 +1329,25 @@ describe("gjc state handoff", () => {
 		});
 	});
 
+	it("rejects standalone Ralplan off admission without approved lineage", async () => {
+		await withTempCwd(async cwd => {
+			const seed = await runNativeRalplanCommand(["--json", "standalone final approval required"], cwd);
+			expect(seed.status, seed.stderr).toBe(0);
+			const runId = parseRequiredJson(seed.stdout, "standalone ralplan seed").run_id as string;
+			const final = await runNativeRalplanCommand(
+				["--write", "--stage", "final", "--stage_n", "1", "--artifact", "# Final", "--run-id", runId, "--json"],
+				cwd,
+			);
+			expect(final.status, final.stderr).toBe(0);
+			const phase = await runNativeStateCommand(
+				["write", "--mode", "ralplan", "--input", JSON.stringify({ current_phase: "handoff" }), "--json"],
+				cwd,
+			);
+			expect(phase.status).toBe(2);
+			expect(phase.stderr).toContain("invalid ralplan phase transition");
+		});
+	});
+
 	it("reads Ralplan handoff lineage only after acquiring the seed lock", async () => {
 		await withTempCwd(async cwd => {
 			const ralplanPath = modeStatePath(cwd, TEST_SESSION_ID, "ralplan");

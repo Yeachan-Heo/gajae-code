@@ -1643,8 +1643,14 @@ async function handleWrite(args: readonly string[], cwd: string): Promise<StateC
 				let sanctionedRalplanHandoff = false;
 				if (mode === "ralplan" && fromPhase === "final" && toPhase === "handoff" && sessionId) {
 					try {
-						await assertDeepInterviewExecutionLineage(cwd, sessionId, "ralplan", existingPayload);
-						sanctionedRalplanHandoff = true;
+						const approvedLineage = await assertDeepInterviewExecutionLineage(
+							cwd,
+							sessionId,
+							"ralplan",
+							existingPayload,
+						);
+						sanctionedRalplanHandoff =
+							approvedLineage || (await hasSanctionedRalplanFinalAdmission(cwd, sessionId, existingPayload));
 					} catch {}
 				}
 				if (!isValidTransition(mode, fromPhase, toPhase) && !sanctionedRalplanHandoff && !forced) {
@@ -3180,7 +3186,7 @@ async function assertDeepInterviewExecutionLineage(
 	sessionId: string,
 	caller: CanonicalGjcWorkflowSkill,
 	existingCaller: Record<string, unknown>,
-): Promise<void> {
+): Promise<boolean> {
 	const activeState = await readVisibleSkillActiveState(cwd, sessionId);
 	const activeEntry = listActiveSkills(activeState).find(entry => entry.skill === caller);
 	let upstreamRaw =
@@ -3198,7 +3204,7 @@ async function assertDeepInterviewExecutionLineage(
 					? activeEntry.handoff_at.trim()
 					: undefined;
 	if (!upstreamRaw) {
-		if (!(await hasAuditedDeepInterviewHandoff(cwd, sessionId, caller))) return;
+		if (!(await hasAuditedDeepInterviewHandoff(cwd, sessionId, caller))) return false;
 		upstreamRaw = "deep-interview";
 	} else if (upstreamRaw === "deep-interview" && !callerHandoffAt) {
 		throw new StateCommandError(2, "execution handoff cannot authenticate Deep Interview approval lineage");
@@ -3222,7 +3228,7 @@ async function assertDeepInterviewExecutionLineage(
 		let upstreamValue = typeof currentState.handoff_from === "string" ? currentState.handoff_from.trim() : undefined;
 		if (!upstreamValue && (await hasAuditedDeepInterviewHandoff(cwd, sessionId, currentSkill)))
 			upstreamValue = "deep-interview";
-		if (!upstreamValue) return;
+		if (!upstreamValue) return false;
 		const upstream = canonicalWorkflowSkill(upstreamValue);
 		if (!upstream)
 			throw new StateCommandError(2, "execution handoff cannot authenticate Deep Interview approval lineage");
@@ -3313,7 +3319,7 @@ async function assertDeepInterviewExecutionLineage(
 					throw new StateCommandError(2, "execution handoff Ralplan approval receipt identity mismatch");
 				await assertRalplanApprovalRecordCurrent(cwd, sessionId, record, currentState);
 			}
-			return;
+			return true;
 		}
 		currentSkill = upstream;
 		currentState = upstreamState;
@@ -3625,8 +3631,15 @@ async function handleHandoffUnlocked(
 		if (!ralplanExecutionFinal)
 			throw new StateCommandError(2, "Ralplan execution handoff requires non-stuck verified final plan evidence");
 	}
-	if (callee === "ultragoal" && caller !== "deep-interview")
-		await assertDeepInterviewExecutionLineage(cwd, sessionId, caller, existingCaller);
+	if (callee === "ultragoal" && caller !== "deep-interview") {
+		const approvedLineage = await assertDeepInterviewExecutionLineage(cwd, sessionId, caller, existingCaller);
+		if (
+			caller === "ralplan" &&
+			!approvedLineage &&
+			!(await hasSanctionedRalplanFinalAdmission(cwd, sessionId, existingCaller))
+		)
+			throw new StateCommandError(2, "Ralplan execution handoff requires explicit approval or automatic admission");
+	}
 
 	let handoffAt = nowIso();
 	let mutationId = `${caller}:handoff:${callee}:${handoffAt}`;

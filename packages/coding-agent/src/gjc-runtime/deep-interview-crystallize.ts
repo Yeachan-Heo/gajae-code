@@ -1581,7 +1581,7 @@ export function crystallizeDeepInterview(value: unknown): DeepInterviewCrystal {
 			const rightTerms = topicTerms(right.statement, false);
 			const opposingAction = opposingActions.some(([positiveTerms, negativeTerms]) => {
 				const signed = (statement: string): Array<{ sign: number; subject: Set<string> }> =>
-					statement.split(/\b(?:but|however)\b|[;,]/i).flatMap(fragment => {
+					statement.split(/\b(?:but|however|and)\b|[;,]/i).flatMap(fragment => {
 						const normalizedStatement = fragment.normalize("NFC").toLowerCase();
 						const containsAction = (term: string) =>
 							new RegExp(`(?:^|[^\\p{L}\\p{N}_])${term}(?:$|[^\\p{L}\\p{N}_])`, "u").test(normalizedStatement);
