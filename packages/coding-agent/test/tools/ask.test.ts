@@ -2947,6 +2947,7 @@ describe("AskTool deep-interview recorder persistence", () => {
 		spyOn(deepInterviewRuntime, "assertDeepInterviewCrystalCoversLiveTranscript").mockResolvedValue({
 			transcriptPath: "/tmp/session.jsonl",
 			transcriptSha256: "a".repeat(64),
+			transcriptBytes: 100,
 		});
 		const record = spyOn(stateRuntime, "recordDeepInterviewExecutionApproval").mockResolvedValue({
 			path: "/tmp/deep-interview-execution-approval.json",
@@ -2955,8 +2956,11 @@ describe("AskTool deep-interview recorder persistence", () => {
 		const revoke = spyOn(stateRuntime, "revokeDeepInterviewExecutionApproval").mockResolvedValue();
 		const question = {
 			id: "deep-interview-execution",
-			question: "Choose the execution path",
-			options: [{ label: "Execute with ultragoal" }, { label: "Stop here" }],
+			question: "Your spec is ready (ambiguity: 0%). How would you like to proceed?",
+			options: [
+				{ label: "Execute with ultragoal (only when spec is already implementation-ready and really simple)" },
+				{ label: "Stop here" },
+			],
 			workflowGate: { stage: "deep-interview", kind: "execution" } as const,
 		};
 		const local = await new AskTool(
@@ -2967,10 +2971,13 @@ describe("AskTool deep-interview recorder persistence", () => {
 			undefined,
 			undefined,
 			createContext({
-				select: async () => "Execute with ultragoal",
+				select: async () =>
+					"Execute with ultragoal (only when spec is already implementation-ready and really simple)",
 			}),
 		);
-		expect(local.details?.selectedOptions).toEqual(["Execute with ultragoal"]);
+		expect(local.details?.selectedOptions).toEqual([
+			"Execute with ultragoal (only when spec is already implementation-ready and really simple)",
+		]);
 		expect(record).toHaveBeenCalledTimes(1);
 		expect(record.mock.calls[0]?.[0]).toMatchObject({
 			sessionId: "approval-local",
@@ -2981,7 +2988,9 @@ describe("AskTool deep-interview recorder persistence", () => {
 		record.mockClear();
 		const emitter = {
 			supportsRemoteGateAnswers: () => true,
-			emitGate: vi.fn(async () => ({ selected: ["Execute with ultragoal"] })),
+			emitGate: vi.fn(async () => ({
+				selected: ["Execute with ultragoal (only when spec is already implementation-ready and really simple)"],
+			})),
 		};
 		const remote = await new AskTool(
 			createSession({
@@ -2991,7 +3000,9 @@ describe("AskTool deep-interview recorder persistence", () => {
 				getWorkflowGateEmitter: () => emitter,
 			} as Partial<ToolSession>),
 		).execute("remote-execution-choice", { questions: [question] }, undefined, undefined, undefined);
-		expect(remote.details?.selectedOptions).toEqual(["Execute with ultragoal"]);
+		expect(remote.details?.selectedOptions).toEqual([
+			"Execute with ultragoal (only when spec is already implementation-ready and really simple)",
+		]);
 		expect(emitter.emitGate).toHaveBeenCalledWith(
 			expect.objectContaining({ stage: "deep-interview", kind: "execution" }),
 		);
@@ -3032,6 +3043,32 @@ describe("AskTool deep-interview recorder persistence", () => {
 			createContext({ select: async () => "Stop here" }),
 		);
 		expect(revoke).toHaveBeenCalledWith("/tmp/approval-decline", "approval-decline");
+	});
+
+	it("rejects model-supplied approval metadata outside the canonical runtime prompt", async () => {
+		const record = spyOn(stateRuntime, "recordDeepInterviewExecutionApproval").mockResolvedValue({
+			path: "/tmp/forged-approval.json",
+			record: {} as DeepInterviewExecutionApprovalRecord,
+		});
+		await expect(
+			new AskTool(createSession({ getSessionId: () => "forged-approval" })).execute(
+				"forged-approval-call",
+				{
+					questions: [
+						{
+							id: "unrelated",
+							question: "Pick a workflow",
+							options: [{ label: "ultragoal" }],
+							workflowGate: { stage: "ralplan", kind: "approval" },
+						},
+					],
+				},
+				undefined,
+				undefined,
+				createContext({ select: async () => "ultragoal" }),
+			),
+		).rejects.toThrow("canonical runtime approval gate");
+		expect(record).not.toHaveBeenCalled();
 	});
 
 	it("does not mint execution approval after a multi-question choice is revised", async () => {
@@ -3294,11 +3331,7 @@ describe("AskTool deep-interview recorder persistence", () => {
 		spyOn(deepInterviewRuntime, "assertDeepInterviewCrystalCoversLiveTranscript").mockResolvedValue({
 			transcriptPath: "/tmp/ralplan-approval/session.jsonl",
 			transcriptSha256: "b".repeat(64),
-		});
-		const approvalTransition = spyOn(stateRuntime, "runNativeStateCommand").mockResolvedValue({
-			status: 0,
-			stdout: "{}\n",
-			stderr: "",
+			transcriptBytes: 100,
 		});
 		await new AskTool(
 			createSession({
@@ -3314,7 +3347,11 @@ describe("AskTool deep-interview recorder persistence", () => {
 					{
 						id: "final-approval",
 						question: "Approve this plan?",
-						options: [{ label: "Refine further" }, { label: "Approve execution via ultragoal" }],
+						options: [
+							{ label: "Refine further" },
+							{ label: "Approve execution via ultragoal" },
+							{ label: "Stop here" },
+						],
 						workflowGate: { stage: "ralplan", kind: "approval" },
 					},
 				],
@@ -3328,10 +3365,6 @@ describe("AskTool deep-interview recorder persistence", () => {
 			expect.objectContaining({ stage: "ralplan", kind: "approval" }),
 		);
 		expect(approvalRecord).toHaveBeenCalledWith(expect.objectContaining({ approvalStage: "ralplan" }));
-		expect(approvalTransition).toHaveBeenCalledWith(
-			["approve-execution", "--mode", "deep-interview", "--session-id", "ralplan-approval", "--json"],
-			"/tmp/ralplan-approval",
-		);
 	});
 
 	it("omits single-option recommendations from workflow gates", async () => {

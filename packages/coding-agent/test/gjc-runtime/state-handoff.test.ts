@@ -219,8 +219,22 @@ async function recordExecutionApproval(
 		selectedOptions: ["Approve execution via ultragoal"],
 		transcriptPath,
 		transcriptSha256: createHash("sha256").update(transcript).digest("hex"),
+		transcriptPrefixBytes: Buffer.byteLength(transcript),
+		toolCallId: `ask-${questionId}`,
 		approvalStage,
 	});
+	await fs.appendFile(
+		transcriptPath,
+		`${JSON.stringify({
+			type: "message",
+			message: {
+				role: "toolResult",
+				toolName: "ask",
+				toolCallId: `ask-${questionId}`,
+				details: { selectedOptions: ["Approve execution via ultragoal"] },
+			},
+		})}\n`,
+	);
 }
 
 describe("gjc state handoff", () => {

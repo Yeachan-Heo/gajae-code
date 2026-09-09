@@ -628,6 +628,7 @@ async function authoritativeConversationSnapshot(
 	messages: Array<{ index: number; role: string; content: string }>;
 	transcriptPath: string;
 	transcriptSha256: string;
+	transcriptBytes: number;
 }> {
 	let sessionFile = process.env.GJC_SESSION_FILE?.trim();
 	let explicitProjectTranscript = false;
@@ -802,6 +803,7 @@ async function authoritativeConversationSnapshot(
 			messages,
 			transcriptPath: path.resolve(sessionFile),
 			transcriptSha256: createHash("sha256").update(bytes).digest("hex"),
+			transcriptBytes: bytes.byteLength,
 		};
 	} catch (error) {
 		if (error instanceof DeepInterviewCommandError) throw error;
@@ -1125,7 +1127,7 @@ export async function assertDeepInterviewCrystalCoversLiveTranscript(
 	cwd: string,
 	sessionId: string,
 	requireCrystalTail = true,
-): Promise<{ transcriptPath: string; transcriptSha256: string }> {
+): Promise<{ transcriptPath: string; transcriptSha256: string; transcriptBytes: number }> {
 	const statePath = deepInterviewStatePath(cwd, sessionId);
 	let parsed: unknown;
 	try {
@@ -1140,7 +1142,11 @@ export async function assertDeepInterviewCrystalCoversLiveTranscript(
 	const source = verifyCrystalSourceAgainstLive(crystal, liveSnapshot);
 	if (requireCrystalTail && source.end !== liveSnapshot.messages.length - 1)
 		throw new DeepInterviewCommandError(2, "execution approval requires re-crystallization after transcript changes");
-	return { transcriptPath: liveSnapshot.transcriptPath, transcriptSha256: liveSnapshot.transcriptSha256 };
+	return {
+		transcriptPath: liveSnapshot.transcriptPath,
+		transcriptSha256: liveSnapshot.transcriptSha256,
+		transcriptBytes: liveSnapshot.transcriptBytes,
+	};
 }
 
 async function handleCrystallize(args: readonly string[], cwd: string): Promise<DeepInterviewCommandResult> {

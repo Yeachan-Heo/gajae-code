@@ -15,6 +15,7 @@
  *   - Questions may time out and auto-select the recommended option (configurable, disabled in plan mode)
  */
 
+import { randomUUID } from "node:crypto";
 import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@gajae-code/agent-core";
 import type { RawArgumentValidationResult } from "@gajae-code/ai/types";
 import {
@@ -47,7 +48,6 @@ import {
 import {
 	recordDeepInterviewExecutionApproval,
 	revokeDeepInterviewExecutionApproval,
-	runNativeStateCommand,
 } from "../gjc-runtime/state-runtime";
 import {
 	type AskGateQuestion,
@@ -853,6 +853,7 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 		selectedOptions: string[],
 		customInput: string | undefined,
 		executionGateId?: string,
+		toolCallId?: string,
 	): Promise<void> {
 		const deepInterviewExecution = q.workflowGate?.stage === "deep-interview" && q.workflowGate.kind === "execution";
 		const ralplanApproval = q.workflowGate?.stage === "ralplan" && q.workflowGate.kind === "approval";
@@ -863,6 +864,19 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 			if (sessionId) await revokeDeepInterviewExecutionApproval(this.session.cwd, sessionId);
 			return;
 		}
+		const normalizedSelection = selectedOptions[0]?.trim().replace(/\s*\(Recommended\)\s*$/i, "");
+		const canonicalGate = deepInterviewExecution
+			? normalizedSelection ===
+					"Execute with ultragoal (only when spec is already implementation-ready and really simple)" &&
+				/spec is ready/i.test(q.question) &&
+				/how would you like to proceed/i.test(q.question)
+			: normalizedSelection === "Approve execution via ultragoal" &&
+				/approve/i.test(q.question) &&
+				/plan/i.test(q.question) &&
+				q.options.some(option => option.label.trim() === "Refine further") &&
+				q.options.some(option => option.label.trim() === "Stop here");
+		if (!canonicalGate || !toolCallId)
+			throw new ToolAbortError("Execution approval requires the canonical runtime approval gate");
 		if (!sessionId) throw new ToolAbortError("Deep Interview execution approval requires a session");
 		const transcriptEvidence = await assertDeepInterviewCrystalCoversLiveTranscript(
 			this.session.cwd,
@@ -873,21 +887,15 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 			cwd: this.session.cwd,
 			sessionId,
 			questionId: q.id,
-			gateId: executionGateId ?? q.id,
+			gateId: executionGateId ?? `ask-approval:${randomUUID()}`,
 			target,
 			selectedOptions,
 			transcriptPath: transcriptEvidence.transcriptPath,
 			transcriptSha256: transcriptEvidence.transcriptSha256,
+			transcriptPrefixBytes: transcriptEvidence.transcriptBytes,
+			toolCallId,
 			approvalStage: ralplanApproval ? "ralplan" : "deep-interview",
 		});
-		if (ralplanApproval) {
-			const result = await runNativeStateCommand(
-				["approve-execution", "--mode", "deep-interview", "--session-id", sessionId, "--json"],
-				this.session.cwd,
-			);
-			if (result.status !== 0)
-				throw new ToolAbortError(result.stderr?.trim() || "Ralplan execution approval could not be persisted");
-		}
 	}
 
 	async execute(
@@ -1456,7 +1464,13 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 			) {
 				await this.#recordDeepInterviewRound(q, selectedOptions, customInput);
 			}
-			await this.#recordDeepInterviewExecutionApproval(q, selectedOptions, customInput, executionGateId);
+			await this.#recordDeepInterviewExecutionApproval(
+				q,
+				selectedOptions,
+				customInput,
+				executionGateId,
+				_toolCallId,
+			);
 			const details: AskToolDetails = {
 				question: q.question,
 				options: optionLabels,
@@ -1568,6 +1582,7 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 				result.selectedOptions,
 				result.customInput,
 				executionGateIdsByIndex[index],
+				_toolCallId,
 			);
 		const responseLines = results.map(formatQuestionResult);
 		const responseText = `User answers:\n${responseLines.join("\n")}`;

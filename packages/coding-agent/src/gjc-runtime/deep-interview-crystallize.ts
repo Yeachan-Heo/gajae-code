@@ -488,10 +488,15 @@ function semanticProfile(value: string): CrystalSemanticProfile {
 		/(?:만약|하면|라면|다면|으면|이면|경우|조건|경우에\s+따라|もし|なら|れば|たら|場合|条件|次第|如果|若|假如|倘若|除非|只要|情况下|取决于|取決於)/u.test(
 			normalized,
 		);
+	const deonticPermission =
+		/\b(?:users?|admins?|operators?|clients?|callers?|members?|roles?|applications?|services?)\b[^.!?]{0,40}\b(?:may|can)\s+(?:access|create|delete|edit|export|import|manage|read|run|use|view|write)\b/i.test(
+			normalized,
+		);
 	const hedged =
-		/\b(?:maybe|perhaps|possibly|probably|might|likely|unlikely|seems?|apparently|approximately|around|roughly|tentative(?:ly)?|prefer(?:ably)?|i\s+think|i\s+guess|i\s+believe|believe(?:s|d)?)\b/i.test(
+		/\b(?:maybe|perhaps|possibly|probably|might|could|would|likely|unlikely|seems?|apparently|approximately|around|roughly|tentative(?:ly)?|prefer(?:ably)?|i\s+think|i\s+guess|i\s+believe|believe(?:s|d)?)\b/i.test(
 			normalized,
 		) ||
+		(!deonticPermission && /\bmay\b/i.test(normalized)) ||
 		/(?:아마|어쩌면|가능성|수도|것\s+같|같습니다|추정|대략|たぶん|おそらく|かもしれ|可能性|と思|思われ|だろう|でしょう|也许|也許|可能|或许|大概|似乎|大約|估计|估計|据说|據說)/u.test(
 			normalized,
 		);
@@ -1486,12 +1491,17 @@ export function crystallizeDeepInterview(value: unknown): DeepInterviewCrystal {
 			if (!afterDirective || !/\b(?:actually|instead|rather|replace|replaced|no longer|not)\b/i.test(anchor.quote))
 				return false;
 			const replacementTerms = topicTerms(item.statement, false);
-			return [...directiveTerms].some(term => replacementTerms.has(term));
+			const overlap = [...directiveTerms].filter(term => replacementTerms.has(term));
+			if (overlap.length === 0) return false;
+			if (/\b(?:and|plus|also|along\s+with)\b/i.test(directive.clause))
+				return [...directiveTerms].every(term => replacementTerms.has(term));
+			return true;
 		});
 		const explicitlySuperseded =
 			snapshotCorrection ||
 			canonicalPriorItems.some(previous => {
 				const replacement = items.find(item => item.id === previous.id);
+				const replacementTerms = replacement ? topicTerms(replacement.statement, false) : new Set<string>();
 				return (
 					replacement !== undefined &&
 					!sameIntent(replacement, previous) &&
@@ -1502,7 +1512,9 @@ export function crystallizeDeepInterview(value: unknown): DeepInterviewCrystal {
 								.find(message => message.index === directive.messageIndex)
 								?.content.indexOf(replacement.anchor.quote) ?? -1) > directive.clauseOffset)) &&
 					/\b(?:actually|instead|rather|replace|replaced|no longer|not)\b/i.test(replacement.anchor.quote) &&
-					[...directiveTerms].every(term => evidenceTerms(previous.statement).has(term))
+					[...directiveTerms].every(term => evidenceTerms(previous.statement).has(term)) &&
+					(!/\b(?:and|plus|also|along\s+with)\b/i.test(directive.clause) ||
+						[...directiveTerms].every(term => replacementTerms.has(term)))
 				);
 			});
 		const explicitlyPreserved =
@@ -1578,7 +1590,12 @@ export function crystallizeDeepInterview(value: unknown): DeepInterviewCrystal {
 					const positive = positiveTerms.some(containsAction);
 					const negative = negativeTerms.some(containsAction);
 					if (positive === negative) return undefined;
-					const explicitlyNegated = /\b(?:do\s+not|don['’]t|never|not)\b/i.test(statement);
+					const actionTerm = (positive ? positiveTerms : negativeTerms).find(containsAction)!;
+					const actionIndex = normalizedStatement.search(
+						new RegExp(`(?:^|[^\\p{L}\\p{N}_])${actionTerm}(?:$|[^\\p{L}\\p{N}_])`, "u"),
+					);
+					const actionPrefix = normalizedStatement.slice(Math.max(0, actionIndex - 16), actionIndex + 1);
+					const explicitlyNegated = /\b(?:do\s+not|don['’]t|never|not)\s*$/i.test(actionPrefix);
 					return {
 						sign: (positive ? 1 : -1) * (explicitlyNegated ? -1 : 1),
 						subject: new Set(
@@ -1589,11 +1606,10 @@ export function crystallizeDeepInterview(value: unknown): DeepInterviewCrystal {
 				const leftAction = signed(left.statement, leftTerms);
 				const rightAction = signed(right.statement, rightTerms);
 				if (!leftAction || !rightAction || leftAction.sign === rightAction.sign) return false;
-				return (
-					leftAction.subject.size > 0 &&
-					leftAction.subject.size === rightAction.subject.size &&
-					[...leftAction.subject].every(term => rightAction.subject.has(term))
-				);
+				const sharedSubject = [...leftAction.subject].filter(term => rightAction.subject.has(term));
+				const smallerSubject =
+					leftAction.subject.size <= rightAction.subject.size ? leftAction.subject : rightAction.subject;
+				return sharedSubject.length > 0 && [...smallerSubject].every(term => sharedSubject.includes(term));
 			});
 			if (
 				opposingAction ||

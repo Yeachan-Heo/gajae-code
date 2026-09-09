@@ -167,6 +167,78 @@ describe("deep-interview crystallize contract", () => {
 		).toThrow("contradictory confirmed items");
 	});
 
+	it("does not let a partial correction drop an additive storage requirement", () => {
+		const content = "Use PostgreSQL and Redis for storage. Actually, use PostgreSQL 16 for storage.";
+		const snapshot: CrystalSnapshot = {
+			revision: 1,
+			start: 0,
+			end: 0,
+			messages: [{ index: 0, role: "user", content }],
+			digest: "",
+		};
+		snapshot.digest = crystalSnapshotDigest(snapshot);
+		expect(() =>
+			crystallizeDeepInterview(
+				input({
+					snapshot,
+					current_revision: 1,
+					items: [
+						{
+							id: "constraint:postgres-version",
+							kind: "constraint",
+							classification: "confirmed",
+							statement: "Actually, use PostgreSQL 16 for storage.",
+							anchor: { message_index: 0, quote: "Actually, use PostgreSQL 16 for storage." },
+						},
+					],
+				}),
+			),
+		).toThrow("unrepresented user directive");
+	});
+
+	it("scopes action negation independently from unrelated exclusions", () => {
+		const content = "Require audit logs but not metrics. Forbid audit logs.";
+		const snapshot: CrystalSnapshot = {
+			revision: 1,
+			start: 0,
+			end: 0,
+			messages: [{ index: 0, role: "user", content }],
+			digest: "",
+		};
+		snapshot.digest = crystalSnapshotDigest(snapshot);
+		expect(() =>
+			crystallizeDeepInterview(
+				input({
+					snapshot,
+					current_revision: 1,
+					items: [
+						{
+							id: "constraint:require-audit",
+							kind: "constraint",
+							classification: "confirmed",
+							statement: "Require audit logs but not metrics.",
+							anchor: { message_index: 0, quote: "Require audit logs but not metrics." },
+						},
+						{
+							id: "constraint:forbid-audit",
+							kind: "constraint",
+							classification: "confirmed",
+							statement: "Forbid audit logs.",
+							anchor: { message_index: 0, quote: "Forbid audit logs." },
+						},
+					],
+				}),
+			),
+		).toThrow("contradictory confirmed items");
+	});
+
+	it("keeps epistemic may unresolved while accepting deontic permission", () => {
+		expect(() => crystallizeDeepInterview(singleGoalEvidence("The deployment may fail."))).toThrow(
+			"conservative derivation failed",
+		);
+		expect(crystallizeDeepInterview(singleGoalEvidence("Admins may export reports.")).lifecycle).toBe("ready");
+	});
+
 	it("rejects multiline or Markdown-bearing item identifiers", () => {
 		expect(() =>
 			crystallizeDeepInterview(
@@ -2719,7 +2791,22 @@ describe("deep-interview crystallize contract", () => {
 				selectedOptions: ["Approve execution via ultragoal"],
 				transcriptPath: sessionFile,
 				transcriptSha256: createHash("sha256").update(approvalTranscript).digest("hex"),
+				transcriptPrefixBytes: approvalTranscript.byteLength,
+				toolCallId: "ask-crystallize-execution",
 			});
+			await fs.appendFile(
+				sessionFile,
+				`${JSON.stringify({
+					type: "message",
+					message: {
+						role: "toolResult",
+						toolName: "ask",
+						toolCallId: "ask-crystallize-execution",
+						content: [{ type: "text", text: "User selected execution." }],
+						details: { selectedOptions: ["Approve execution via ultragoal"] },
+					},
+				})}\n`,
+			);
 			const approved = await runNativeDeepInterviewCommand(
 				["approve-execution", "--session-id", sessionId, "--json"],
 				root,
@@ -2727,10 +2814,14 @@ describe("deep-interview crystallize contract", () => {
 			expect(approved.status).toBe(0);
 
 			const snapshot: CrystalSnapshot = {
-				revision: 2,
+				revision: 3,
 				start: 0,
-				end: 1,
-				messages: [...input().snapshot.messages, { index: 1, role: "user", content: "Keep the report fast." }],
+				end: 2,
+				messages: [
+					...input().snapshot.messages,
+					{ index: 1, role: "toolResult", content: "User selected execution." },
+					{ index: 2, role: "user", content: "Keep the report fast." },
+				],
 				digest: "",
 			};
 			snapshot.digest = crystalSnapshotDigest(snapshot);
@@ -2748,7 +2839,7 @@ describe("deep-interview crystallize contract", () => {
 					JSON.stringify(
 						input({
 							snapshot,
-							current_revision: 2,
+							current_revision: 3,
 							items: [
 								...input().items,
 								{
@@ -2756,7 +2847,7 @@ describe("deep-interview crystallize contract", () => {
 									kind: "constraint",
 									classification: "confirmed",
 									statement: "Keep the report fast",
-									anchor: { message_index: 1, quote: "Keep the report fast." },
+									anchor: { message_index: 2, quote: "Keep the report fast." },
 								},
 							],
 						}),

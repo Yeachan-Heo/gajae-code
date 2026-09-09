@@ -1913,6 +1913,8 @@ export interface DeepInterviewExecutionApprovalRecord {
 	answer_hash: string;
 	transcript_path: string;
 	transcript_sha256: string;
+	transcript_prefix_bytes: number;
+	tool_call_id: string;
 	approval_stage?: "deep-interview" | "ralplan";
 	ralplan_state_path?: string;
 	ralplan_state_revision?: number;
@@ -1960,6 +1962,8 @@ function assertExecutionApprovalRecordShape(value: unknown): asserts value is De
 		"answer_hash",
 		"transcript_path",
 		"transcript_sha256",
+		"transcript_prefix_bytes",
+		"tool_call_id",
 		"approval_stage",
 		"ralplan_state_path",
 		"ralplan_state_revision",
@@ -1995,6 +1999,9 @@ function assertExecutionApprovalRecordShape(value: unknown): asserts value is De
 		typeof value.transcript_path !== "string" ||
 		!path.isAbsolute(value.transcript_path) ||
 		!isSha256(value.transcript_sha256) ||
+		!Number.isSafeInteger(value.transcript_prefix_bytes) ||
+		(value.transcript_prefix_bytes as number) < 1 ||
+		!isExecutionApprovalId(value.tool_call_id) ||
 		typeof value.created_at !== "string" ||
 		typeof value.expires_at !== "string"
 	)
@@ -2047,6 +2054,64 @@ function assertExecutionApprovalRecordShape(value: unknown): asserts value is De
 		].some(field => field !== undefined)
 	)
 		throw new StateCommandError(2, "deep-interview execution approval record is invalid");
+}
+
+async function assertExecutionApprovalTranscriptEvidence(
+	record: Pick<
+		DeepInterviewExecutionApprovalRecord,
+		| "transcript_path"
+		| "transcript_sha256"
+		| "transcript_prefix_bytes"
+		| "tool_call_id"
+		| "question_id"
+		| "answer_hash"
+	>,
+): Promise<void> {
+	const transcriptText = await readBoundedIdentityText(
+		record.transcript_path,
+		EXECUTION_APPROVAL_TRANSCRIPT_MAX_BYTES,
+		"deep-interview execution approval transcript",
+	);
+	if (transcriptText === undefined)
+		throw new StateCommandError(2, "deep-interview execution approval transcript is unavailable");
+	const transcriptBytes = Buffer.from(transcriptText);
+	if (
+		transcriptBytes.byteLength < record.transcript_prefix_bytes ||
+		createHash("sha256").update(transcriptBytes.subarray(0, record.transcript_prefix_bytes)).digest("hex") !==
+			record.transcript_sha256
+	)
+		throw new StateCommandError(2, "deep-interview execution approval transcript prefix changed");
+	const suffix = transcriptBytes.subarray(record.transcript_prefix_bytes).toString("utf8");
+	let durableAnswer = false;
+	for (const line of suffix.split(/\r?\n/)) {
+		if (!line.trim()) continue;
+		let entry: unknown;
+		try {
+			entry = JSON.parse(line);
+		} catch {
+			throw new StateCommandError(2, "deep-interview execution approval transcript suffix is malformed");
+		}
+		if (!isPlainObject(entry) || entry.type !== "message" || !isPlainObject(entry.message)) continue;
+		const message = entry.message;
+		if (message.role !== "toolResult" || message.toolName !== "ask" || message.toolCallId !== record.tool_call_id)
+			continue;
+		const details = isPlainObject(message.details) ? message.details : undefined;
+		const candidates = Array.isArray(details?.results) ? details.results : details ? [details] : [];
+		for (const candidate of candidates) {
+			if (!isPlainObject(candidate)) continue;
+			if (candidate.id !== undefined && candidate.id !== record.question_id) continue;
+			if (
+				!Array.isArray(candidate.selectedOptions) ||
+				candidate.selectedOptions.some(value => typeof value !== "string")
+			)
+				continue;
+			const customInput = typeof candidate.customInput === "string" ? candidate.customInput : undefined;
+			if (answerHash(candidate.selectedOptions as string[], customInput) === record.answer_hash)
+				durableAnswer = true;
+		}
+	}
+	if (!durableAnswer)
+		throw new StateCommandError(2, "deep-interview execution approval Ask result is not durably recorded");
 }
 
 async function readDeepInterviewExecutionApprovalRecord(
@@ -2155,12 +2220,21 @@ export async function recordDeepInterviewExecutionApproval(options: {
 	customInput?: string;
 	transcriptPath: string;
 	transcriptSha256: string;
+	transcriptPrefixBytes: number;
+	toolCallId: string;
 	approvalStage?: "deep-interview" | "ralplan";
 }): Promise<{ path: string; record: DeepInterviewExecutionApprovalRecord }> {
 	if (options.target !== "ultragoal")
 		throw new StateCommandError(2, "deep-interview execution approval target must be ultragoal");
 	if (!isExecutionApprovalId(options.sessionId) || !isExecutionApprovalId(options.questionId))
 		throw new StateCommandError(2, "deep-interview execution approval descriptor is invalid");
+	if (
+		!isExecutionApprovalId(options.toolCallId) ||
+		!Number.isSafeInteger(options.transcriptPrefixBytes) ||
+		options.transcriptPrefixBytes < 1 ||
+		options.transcriptPrefixBytes > EXECUTION_APPROVAL_TRANSCRIPT_MAX_BYTES
+	)
+		throw new StateCommandError(2, "deep-interview execution approval transcript descriptor is invalid");
 	if (
 		!Array.isArray(options.selectedOptions) ||
 		options.selectedOptions.length !== 1 ||
@@ -2270,6 +2344,8 @@ export async function recordDeepInterviewExecutionApproval(options: {
 				answer_hash: answerHash([...options.selectedOptions], options.customInput),
 				transcript_path: path.resolve(options.transcriptPath),
 				transcript_sha256: options.transcriptSha256,
+				transcript_prefix_bytes: options.transcriptPrefixBytes,
+				tool_call_id: options.toolCallId,
 				approval_stage: options.approvalStage ?? "deep-interview",
 				...(ralplanFinal
 					? {
@@ -2883,19 +2959,22 @@ async function assertDeepInterviewHandoffReady(
 				approval.crystal_source_digest !== (crystal.source as Record<string, unknown>).digest ||
 				typeof approval.transcript_path !== "string" ||
 				!path.isAbsolute(approval.transcript_path) ||
-				!isSha256(approval.transcript_sha256)
+				!isSha256(approval.transcript_sha256) ||
+				!Number.isSafeInteger(approval.transcript_prefix_bytes) ||
+				(approval.transcript_prefix_bytes as number) < 1 ||
+				!isExecutionApprovalId(approval.tool_call_id) ||
+				!isExecutionApprovalId(approval.question_id) ||
+				!isSha256(approval.answer_hash)
 			)
 				throw new StateCommandError(2, "deep-interview execution approval lacks explicit provenance");
-			const transcriptText = await readBoundedIdentityText(
-				approval.transcript_path,
-				EXECUTION_APPROVAL_TRANSCRIPT_MAX_BYTES,
-				"deep-interview execution approval transcript",
-			);
-			if (
-				transcriptText === undefined ||
-				createHash("sha256").update(transcriptText).digest("hex") !== approval.transcript_sha256
-			)
-				throw new StateCommandError(2, "deep-interview execution approval transcript provenance is stale");
+			await assertExecutionApprovalTranscriptEvidence({
+				transcript_path: approval.transcript_path,
+				transcript_sha256: approval.transcript_sha256,
+				transcript_prefix_bytes: approval.transcript_prefix_bytes as number,
+				tool_call_id: approval.tool_call_id,
+				question_id: approval.question_id,
+				answer_hash: approval.answer_hash,
+			});
 			await assertSanctionedExecutionApprovalAudit(
 				options.cwd ?? "",
 				options.sessionId ?? "",
@@ -3225,7 +3304,9 @@ async function assertDeepInterviewExecutionLineage(
 					upstreamApproval.gate_id !== record.gate_id ||
 					upstreamApproval.answer_hash !== record.answer_hash ||
 					upstreamApproval.transcript_path !== record.transcript_path ||
-					upstreamApproval.transcript_sha256 !== record.transcript_sha256
+					upstreamApproval.transcript_sha256 !== record.transcript_sha256 ||
+					upstreamApproval.transcript_prefix_bytes !== record.transcript_prefix_bytes ||
+					upstreamApproval.tool_call_id !== record.tool_call_id
 				)
 					throw new StateCommandError(2, "execution handoff Ralplan approval receipt identity mismatch");
 				await assertRalplanApprovalRecordCurrent(cwd, sessionId, record, currentState);
@@ -4446,16 +4527,7 @@ async function handleApproveExecutionRecordLocked(
 	if (!approvalRecord)
 		throw new StateCommandError(2, "approve-execution requires a user-origin execution approval record");
 	await assertExecutionApprovalSpecIdentity(approvalRecord);
-	const transcriptText = await readBoundedIdentityText(
-		approvalRecord.transcript_path,
-		EXECUTION_APPROVAL_TRANSCRIPT_MAX_BYTES,
-		"deep-interview execution approval transcript",
-	);
-	if (
-		transcriptText === undefined ||
-		createHash("sha256").update(transcriptText).digest("hex") !== approvalRecord.transcript_sha256
-	)
-		throw new StateCommandError(2, "deep-interview execution approval transcript changed after user approval");
+	await assertExecutionApprovalTranscriptEvidence(approvalRecord);
 	await assertRalplanApprovalRecordCurrent(cwd, selectors.gjcSessionId, approvalRecord);
 	assertExecutionApprovalRecordMatchesCurrentState(approvalRecord, {
 		sessionId: selectors.gjcSessionId,
@@ -4481,6 +4553,8 @@ async function handleApproveExecutionRecordLocked(
 			existingReceipt.answer_hash !== approvalRecord.answer_hash ||
 			existingReceipt.transcript_path !== approvalRecord.transcript_path ||
 			existingReceipt.transcript_sha256 !== approvalRecord.transcript_sha256 ||
+			existingReceipt.transcript_prefix_bytes !== approvalRecord.transcript_prefix_bytes ||
+			existingReceipt.tool_call_id !== approvalRecord.tool_call_id ||
 			existingReceipt.target !== approvalRecord.target ||
 			existingReceipt.approval_stage !== (approvalRecord.approval_stage ?? "deep-interview") ||
 			existingReceipt.ralplan_state_path !== approvalRecord.ralplan_state_path ||
@@ -4608,6 +4682,8 @@ async function handleApproveExecutionRecordLocked(
 		answer_hash: approvalRecord.answer_hash,
 		transcript_path: approvalRecord.transcript_path,
 		transcript_sha256: approvalRecord.transcript_sha256,
+		transcript_prefix_bytes: approvalRecord.transcript_prefix_bytes,
+		tool_call_id: approvalRecord.tool_call_id,
 		target: approvalRecord.target,
 		approval_stage: approvalRecord.approval_stage ?? "deep-interview",
 		...(approvalRecord.approval_stage === "ralplan"
