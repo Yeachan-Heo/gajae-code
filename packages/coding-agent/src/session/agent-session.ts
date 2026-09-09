@@ -21853,6 +21853,15 @@ export class AgentSession {
 			if (providerRetryCeilingReached && outcome === "retry") {
 				outcome = controller.advance() ? "advance" : "exhausted";
 			}
+			// The one content-free account retry was already spent: never spend
+			// another same-model attempt on a third account, advance instead.
+			if (
+				outcome === "retry" &&
+				this.#isCodexCredentialModelUnavailable(message) &&
+				this.#codexCredentialModelUnavailableRetried
+			) {
+				outcome = controller.advance() ? "advance" : "exhausted";
+			}
 		} else {
 			outcome = providerRetryCeilingReached
 				? "exhausted"
@@ -21945,7 +21954,12 @@ export class AgentSession {
 			if (ownership && (!ownership.isCurrent() || cancellationSignal?.aborted)) return;
 			if (retryCancelled()) return;
 			let quotaPoolExhausted = false;
-			if (managedFallback && !credentialRotated && !providerRetryCeilingReached) {
+			if (
+				managedFallback &&
+				!credentialRotated &&
+				!providerRetryCeilingReached &&
+				!(this.#isCodexCredentialModelUnavailable(message) && this.#codexCredentialModelUnavailableRetried)
+			) {
 				const mark = await this.#markFailedCredential(trigger);
 				if (mark === "rotated") credentialRotated = true;
 				quotaPoolExhausted = mark === "exhausted";

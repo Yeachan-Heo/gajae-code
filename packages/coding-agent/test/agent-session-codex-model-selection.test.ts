@@ -245,4 +245,44 @@ describe("AgentSession Codex model selection", () => {
 			content: [{ type: "text", text: "rotated account succeeded" }],
 		});
 	});
+	test("does not spend a third account on the same model after the one managed retry bound", async () => {
+		failAfterRotation = true;
+		await authStorage.set("openai-codex", [
+			{
+				type: "oauth",
+				access: "access-acct-first",
+				refresh: "refresh-acct-first",
+				expires: Date.now() + 60 * 60 * 1000,
+				accountId: "acct-first",
+				email: "first@example.com",
+			},
+			{
+				type: "oauth",
+				access: "access-acct-second",
+				refresh: "refresh-acct-second",
+				expires: Date.now() + 60 * 60 * 1000,
+				accountId: "acct-second",
+				email: "second@example.com",
+			},
+			{
+				type: "oauth",
+				access: "access-acct-third",
+				refresh: "refresh-acct-third",
+				expires: Date.now() + 60 * 60 * 1000,
+				accountId: "acct-third",
+				email: "third@example.com",
+			},
+		]);
+		await session.setModel(selectedModel);
+		session.setConfiguredModelChain("default", ["openai-codex/gpt-5.6-sol", "openai-codex/gpt-5.5"], "test");
+
+		await expect(session.prompt("hello")).resolves.toBeUndefined();
+
+		expect(requestedModels.filter(modelId => modelId === "openai-codex/gpt-5.6-sol")).toHaveLength(2);
+		expect(requestedModels).toContain("openai-codex/gpt-5.5");
+		expect(session.agent.state.messages.at(-1)).toMatchObject({
+			role: "assistant",
+			stopReason: "stop",
+		});
+	});
 });

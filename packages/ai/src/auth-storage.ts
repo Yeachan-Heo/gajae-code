@@ -4610,6 +4610,36 @@ export class AuthStorage {
 	}
 
 	/**
+	 * Mark the stored credential whose key matches `apiKey` usage-limited for
+	 * `retryAfterMs` (or the default backoff). Used when the caller knows
+	 * exactly which leased credential failed (e.g. the auth-gateway leases a
+	 * concrete row without a session binding) so bookkeeping cannot land on the
+	 * wrong credential. The credential is never invalidated or marked suspect:
+	 * the block is a bounded backoff only. Returns false when no stored
+	 * credential matches the key.
+	 */
+	async markUsageLimitReachedMatching(
+		provider: string,
+		apiKey: string,
+		options?: { retryAfterMs?: number },
+	): Promise<boolean> {
+		const storageProvider = resolveOAuthStorageProvider(provider);
+		const stored = this.#getStoredCredentials(storageProvider);
+		for (let index = 0; index < stored.length; index++) {
+			const entry = stored[index];
+			if (entry && (await this.#credentialMatchesApiKey(storageProvider, entry.credential, apiKey))) {
+				this.#markCredentialBlocked(
+					this.#getProviderTypeKey(storageProvider, entry.credential.type),
+					index,
+					Date.now() + (options?.retryAfterMs ?? AuthStorage.#defaultBackoffMs),
+				);
+				return true;
+			}
+		}
+		return false;
+	}
+
+	/**
 	 * Earliest instant at which any currently blocked stored credential for this
 	 * provider becomes usable again. Undefined when nothing is blocked.
 	 * When `sessionId` is provided, only the session's active credential type is
