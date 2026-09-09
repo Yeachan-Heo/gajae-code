@@ -1,7 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+import * as childProcess from "node:child_process";
+import { EventEmitter } from "node:events";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { PassThrough } from "node:stream";
 import { resetSettingsForTest, Settings } from "@gajae-code/coding-agent/config/settings";
 import { getRuntimeResourceCounts } from "@gajae-code/coding-agent/debug/runtime-gauges";
 import {
@@ -588,6 +591,72 @@ describe("executeBash", () => {
 		const startedAt = Date.now();
 		await shell.close();
 		expect(Date.now() - startedAt).toBeLessThan(2_000);
+	});
+
+	it.each([
+		"run",
+		"abort",
+		"close",
+		"close-before-ready",
+	] as const)("retires an unsent isolated %s request before terminal cleanup", async operation => {
+		const stdin = new PassThrough();
+		const stdout = new PassThrough();
+		const stderr = new PassThrough();
+		const child = Object.assign(new EventEmitter(), {
+			stdin,
+			stdout,
+			stderr,
+			exitCode: null,
+			signalCode: null,
+			kill: vi.fn((): boolean => {
+				queueMicrotask(() => child.emit("close", 0, null));
+				return true;
+			}),
+		});
+		// A live child whose input has closed deterministically exercises the
+		// gap between request registration and successful protocol dispatch.
+		vi.spyOn(childProcess, "spawn").mockReturnValue(child as unknown as childProcess.ChildProcessWithoutNullStreams);
+		let token: string | undefined;
+		stdin.once("data", chunk => {
+			token = JSON.parse(String(chunk)).token;
+		});
+		const onTerminal = vi.fn();
+		const shell = new IsolatedShell(undefined, { onTerminal });
+		const controller = new AbortController();
+		const removeListener = vi.spyOn(controller.signal, "removeEventListener");
+		try {
+			const closing = operation === "close-before-ready" ? shell.close() : undefined;
+			stdin.end();
+			expect(stdin.writable).toBe(false);
+			stdout.write(`${JSON.stringify({ type: "ready", token })}\n`);
+			await shell.ready();
+			if (operation === "run") {
+				await expect(shell.run({ command: "echo unsent", signal: controller.signal })).rejects.toThrow(
+					"Isolated shell worker input is closed.",
+				);
+				expect(shell.isRunSignalActive(controller.signal)).toBe(false);
+				expect(shell.wasRunSignalDispatched(controller.signal)).toBe(false);
+				expect(removeListener).toHaveBeenCalledTimes(1);
+				const abort = vi.spyOn(shell, "abort");
+				controller.abort();
+				expect(abort).not.toHaveBeenCalled();
+			} else if (operation === "abort") {
+				await expect(shell.abort()).rejects.toThrow("Isolated shell worker input is closed.");
+			}
+			await (closing ?? shell.close());
+			// Let Bun's ordinary unhandled-rejection check run. Before the fix,
+			// close rejected the abandoned deferred even though its caller had
+			// already observed the send error (also for close's own request).
+			await Bun.sleep(0);
+			expect(shell.isTerminal()).toBe(true);
+			expect(onTerminal).toHaveBeenCalledTimes(1);
+			expect(child.kill).toHaveBeenCalledTimes(1);
+		} finally {
+			await shell.close();
+			stdin.destroy();
+			stdout.destroy();
+			stderr.destroy();
+		}
 	});
 
 	it("does not execute or globally abort a cancelled queued isolated run", async () => {

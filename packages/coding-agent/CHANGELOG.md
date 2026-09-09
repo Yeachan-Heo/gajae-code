@@ -3,6 +3,7 @@
 ## [Unreleased]
 ### Fixed
 
+- Isolated-shell protocol send failures now retire unsent pending requests and their abort listeners before terminal cleanup. Callers still receive the original send error, while closing a worker with unavailable input no longer rejects an abandoned deferred later as an unhandled `Isolated shell worker closed` error.
 - Coordinator responses now preserve `error: null` instead of replacing it with an `unavailable` error. Non-null errors still use fixed public messages, and unknown error codes remain mapped to `unavailable`.
 - Fresh-process CI harness output now records the configured worker/shard counts plus per-file wall, child, and spawn timing, making runner contention measurable without changing timeout or failure policy. Autorouting setup diagnostics retain an Error message when a loaded Bun process exposes a stack without its headline, and the chat-daemon replay regression waits for the router's explicit cursor-settlement boundary instead of a timing delay.
 - Native SYSTEM.md, AGENTS.md, and RULES.md reads now reject symlinked user-scope leaves outside the selected agent directory. SDK lifecycle create replays retain endpoint file identity so same-key replays accept the live host without weakening same-generation replacement fencing.
