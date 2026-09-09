@@ -741,8 +741,24 @@ async function renderUrl(
 	const { finalUrl, content: rawContent } = response;
 	const mime = normalizeMime(response.contentType);
 	const extHint = getExtensionHint(finalUrl);
+	const isPdf = mime === "application/pdf" || (extHint === ".pdf" && !mime.includes("html"));
 
-	const imageMimeType = resolveImageMimeType(mime, extHint);
+	// Raw PDF inspection is explicit; never substitute PDF bytes for failed text extraction.
+	if (raw && isPdf) {
+		const output = finalizeOutput(rawContent);
+		return {
+			url,
+			finalUrl,
+			contentType: mime,
+			method: "raw",
+			content: output.content,
+			fetchedAt,
+			truncated: output.truncated,
+			notes,
+		};
+	}
+
+	const imageMimeType = isPdf ? undefined : resolveImageMimeType(mime, extHint);
 	let skipConvertibleBinaryRetry = false;
 	if (imageMimeType) {
 		if (!isInlineImageMimeTypeSupported(imageMimeType)) {
@@ -871,7 +887,7 @@ async function renderUrl(
 	if (!skipConvertibleBinaryRetry && isConvertible(mime, extHint)) {
 		const binary = await fetchBinary(finalUrl, timeout, signal);
 		if (binary.ok) {
-			const ext = getExtensionHint(finalUrl, binary.contentDisposition) || extHint;
+			const ext = isPdf ? ".pdf" : getExtensionHint(finalUrl, binary.contentDisposition) || extHint;
 			const converted = await convertWithMarkit(binary.buffer, ext, timeout, signal);
 			if (converted.ok) {
 				// Any non-empty markit conversion is preferable to a raw-bytes
@@ -901,6 +917,18 @@ async function renderUrl(
 			notes.push(`Binary fetch failed: ${binary.error}`);
 		} else {
 			notes.push("Binary fetch failed");
+		}
+		if (isPdf) {
+			return {
+				url,
+				finalUrl,
+				contentType: mime,
+				method: "failed",
+				content: "",
+				fetchedAt,
+				truncated: false,
+				notes,
+			};
 		}
 	}
 
@@ -1066,7 +1094,7 @@ async function renderUrl(
 				if (binary.ok) {
 					const ext = getExtensionHint(docUrl, binary.contentDisposition);
 					const converted = await convertWithMarkit(binary.buffer, ext, timeout, signal);
-					if (converted.ok && converted.content.trim().length > htmlResult.content.length) {
+					if (converted.ok && converted.content.trim().length > (ext === ".pdf" ? 0 : htmlResult.content.length)) {
 						notes.push(`Extracted and converted document: ${docUrl}`);
 						const output = finalizeOutput(converted.content);
 						return {
@@ -1082,6 +1110,8 @@ async function renderUrl(
 					}
 					if (!converted.ok && converted.error) {
 						notes.push(`markit conversion failed: ${converted.error}`);
+					} else if (converted.ok && !converted.content.trim()) {
+						notes.push("markit conversion produced no usable output");
 					}
 				} else if (binary.error) {
 					notes.push(`Binary fetch failed: ${binary.error}`);

@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Standalone builds now package MuPDF and its WASM asset for PDF extraction instead of requiring a globally installed module (#5433). Short PDFs are accepted as readable text; failed or empty PDF extraction reports a failed inspection rather than raw bytes, with module/asset diagnostics and available initialization causes. Explicit raw reads remain available.
+
 ## [0.17.2] - 2026-09-18
 
 ### Added
