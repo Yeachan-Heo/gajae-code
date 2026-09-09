@@ -163,6 +163,7 @@ Avoid placeholder tests, tautologies, broad `not.toThrow()` assertions, duplicat
 
 - Always commit incrementally; atomic commits are preferred. One logical change per commit — never batch unrelated work.
 - For targeted branch / PR-like work, always open a PR targeting `dev`.
+- The exact-head PR contract is validated locally before it can go red in CI: `git config core.hooksPath .githooks` (done by `bun run install:dev`, or `bun run dev:hooks`) enables a `pre-push` hook that runs `scripts/verify-pr-verdict.ts --push-preflight <branch> <pushed-sha>` against the live PR body. Stale verdict digests, unrebased bases, malformed verdicts, and missing risk classifications fail at push time. Blocking verdicts (`needs-human`, `merge-blocked`) are allowed locally — only the server merge gate rejects them. Bypass with `GJC_SKIP_PR_PREFLIGHT=1` or `--no-verify`.
 - Commit messages use the lore format: conventional-commit subject, a short why-focused body, then structured trailers. Include only the trailers that apply.
 
   ```

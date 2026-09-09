@@ -23,8 +23,16 @@ export function cleanReason(value: unknown): string | undefined {
 		return "Credential diagnostic unavailable.";
 	reason = reason.replace(/bearer\s+[^\s,;]+/gi, "Bearer [redacted]");
 	reason = reason.replace(/basic\s+[^\s,;]+/gi, "Basic [redacted]");
-	reason = reason.replace(/([a-z][a-z0-9+.-]*:\/\/)[^\s/@]+@/gi, "$1[redacted]@");
-	reason = reason.replace(/\b([a-z][a-z0-9+.-]*:\/\/[^\s<>"']*?)(?:[?#][^\s<>"']*)/gi, "$1");
+	// The scheme-character run is boundary anchored, so the unbounded suffix is
+	// attempted once per maximal run instead of once at every prefix. Keeping the
+	// leading non-letter characters in the capture preserves redaction for URLs
+	// embedded after digits or scheme punctuation without imposing an arbitrary
+	// scheme-length cap. Upstream failure text is remote-influenced.
+	reason = reason.replace(/(?<![A-Za-z0-9+.-])([0-9+.-]*[a-z][a-z0-9+.-]*:\/\/)[^\s/@]+@/gi, "$1[redacted]@");
+	// Apply the same maximal-run boundary to query and fragment stripping. A word
+	// boundary would skip underscore-wrapped URLs, while an unbounded scheme with
+	// no boundary would retry every prefix of a long scheme-character run.
+	reason = reason.replace(/(?<![A-Za-z0-9+.-])([0-9+.-]*[a-z][a-z0-9+.-]*:\/\/[^\s<>"']*?)(?:[?#][^\s<>"']*)/gi, "$1");
 	reason = reason.replace(
 		/((?:\\?["']?(?:key|api[_-]?key|client[_-]?secret|clientSecret|token|secret|authorization|password|access|refresh|cookie|credential)(?:[_-](?:token|key|secret|header|headers))?\\?["']?)\s*:\s*)\\?(["'])(?:\\.|(?!\2)[^\\])*\2/gi,
 		"$1$2[redacted]$2",

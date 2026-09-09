@@ -604,25 +604,55 @@ describe("Cursor hostile server storage bounds", () => {
 		expect(queue.pendingBytes()).toBe(0);
 	});
 
-	it("rejects blob entry and byte growth without evicting retained values", () => {
+	it("admits a blob over budget by shedding the oldest entries", () => {
 		const blobs = new Map<string, Uint8Array>();
 		const a = new Uint8Array(32).fill(1);
 		const b = new Uint8Array(32).fill(2);
 		const c = new Uint8Array(32).fill(3);
-		expect(storeCursorBlobForTest(blobs, a, new Uint8Array(4), { maxEntries: 2, maxBytes: 6 })).toBe(true);
-		expect(storeCursorBlobForTest(blobs, b, new Uint8Array(2), { maxEntries: 2, maxBytes: 6 })).toBe(true);
-		expect(storeCursorBlobForTest(blobs, c, new Uint8Array(1), { maxEntries: 2, maxBytes: 6 })).toBe(false);
-		expect(storeCursorBlobForTest(blobs, a, new Uint8Array(5), { maxEntries: 2, maxBytes: 6 })).toBe(false);
+		expect(storeCursorBlobForTest(blobs, a, new Uint8Array(4), { maxBytes: 6 })).toBe(true);
+		expect(storeCursorBlobForTest(blobs, b, new Uint8Array(2), { maxBytes: 6 })).toBe(true);
+		expect(storeCursorBlobForTest(blobs, c, new Uint8Array(1), { maxBytes: 6 })).toBe(true);
 		expect([...blobs.entries()].map(([id, value]) => [id, value.byteLength])).toEqual([
-			[Buffer.from(a).toString("hex"), 4],
 			[Buffer.from(b).toString("hex"), 2],
+			[Buffer.from(c).toString("hex"), 1],
 		]);
+	});
+
+	it("keeps admitting writes once entry count passes any historical ceiling", () => {
+		const blobs = new Map<string, Uint8Array>();
+		for (let i = 0; i < 512; i++) {
+			const id = new Uint8Array(32);
+			new DataView(id.buffer).setUint32(0, i);
+			expect(storeCursorBlobForTest(blobs, id, new Uint8Array(8), { maxBytes: 64 * 1024 })).toBe(true);
+		}
+		expect(blobs.size).toBe(512);
+	});
+
+	it("refreshes recency for a re-stored blob so it outlives older entries", () => {
+		const blobs = new Map<string, Uint8Array>();
+		const a = new Uint8Array(32).fill(1);
+		const b = new Uint8Array(32).fill(2);
+		const c = new Uint8Array(32).fill(3);
+		expect(storeCursorBlobForTest(blobs, a, new Uint8Array(2), { maxBytes: 4 })).toBe(true);
+		expect(storeCursorBlobForTest(blobs, b, new Uint8Array(2), { maxBytes: 4 })).toBe(true);
+		expect(storeCursorBlobForTest(blobs, a, new Uint8Array(2), { maxBytes: 4 })).toBe(true);
+		expect(storeCursorBlobForTest(blobs, c, new Uint8Array(2), { maxBytes: 4 })).toBe(true);
+		expect([...blobs.keys()]).toEqual([Buffer.from(a).toString("hex"), Buffer.from(c).toString("hex")]);
+	});
+
+	it("refuses only a blob larger than the entire budget, and retains the store", () => {
+		const blobs = new Map<string, Uint8Array>();
+		const a = new Uint8Array(32).fill(1);
+		const b = new Uint8Array(32).fill(2);
+		expect(storeCursorBlobForTest(blobs, a, new Uint8Array(4), { maxBytes: 6 })).toBe(true);
+		expect(storeCursorBlobForTest(blobs, b, new Uint8Array(7), { maxBytes: 6 })).toBe(false);
+		expect([...blobs.keys()]).toEqual([Buffer.from(a).toString("hex")]);
 	});
 
 	it("rejects oversized server blob identifiers before retaining their hex keys", () => {
 		const blobs = new Map<string, Uint8Array>();
 		const oversizedId = Buffer.alloc(16 * 1024 * 1024);
-		expect(storeCursorBlobForTest(blobs, oversizedId, new Uint8Array(), { maxEntries: 2, maxBytes: 6 })).toBe(false);
+		expect(storeCursorBlobForTest(blobs, oversizedId, new Uint8Array(), { maxBytes: 6 })).toBe(false);
 		expect(blobs.size).toBe(0);
 	});
 });

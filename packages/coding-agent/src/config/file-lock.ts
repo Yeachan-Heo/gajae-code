@@ -43,7 +43,8 @@ export class FileLockAcquireError extends Error {
 	) {
 		super(
 			`Failed to acquire lock for ${filePath} after ${attempts} attempts: ${holder} (${lockPath}); ` +
-				`a live owner is never displaced — if this is an SDK broker (gjc sdk status), it must finish or be stopped before retrying`,
+				`a live owner is never displaced — if this is an SDK broker (gjc sdk session list), it must finish or be stopped before retrying; ` +
+				`the lock is a directory, remove it only by deleting the directory (${lockPath}) once no live owner remains`,
 		);
 		this.name = "FileLockAcquireError";
 	}
@@ -985,9 +986,11 @@ async function staleLockSnapshot(
 	}
 	if (!info) {
 		// A directory without a valid owner record is either a contender between
-		// native mkdirat ownership and metadata publication, or malformed/foreign
-		// state. Neither case carries enough identity evidence for stale removal;
-		// elapsed mtime must never make this empty namespace reclaimable.
+		// native directory ownership and metadata publication, or malformed state
+		// with no PID/incarnation/host proof of any process generation. Neither
+		// case carries liveness evidence, so elapsed time and byte stability must
+		// never make this namespace reclaimable: only an independently committed
+		// owner record proving its process generation dead authorizes removal.
 		return { stale: false };
 	}
 
@@ -1412,7 +1415,12 @@ async function lockHolderDescription(lockPath: string): Promise<string> {
 		if (process.platform !== "win32" && (await fileLockRemovalTransitionExists(lockPath))) {
 			return "blocked by retained removal transition; retry the owning process cleanup or inspect the exact orphan manually; unproven transition ownership is never removed";
 		}
-		const info = await readLockInfo(lockPath);
+		let info = await readLockInfo(lockPath);
+		let bytes: string | null = null;
+		if (!info) {
+			bytes = await readLockInfoBytes(lockPath);
+			info = bytes === null ? null : parseLockInfoBytes(bytes);
+		}
 		if (info) {
 			// A lock record carrying a foreign owner_host_id belongs to another
 			// machine (shared-volume topic registry): its pid is meaningful only
@@ -1440,6 +1448,8 @@ async function lockHolderDescription(lockPath: string): Promise<string> {
 			);
 		}
 		try {
+			if (bytes !== null)
+				return "held by an owner record that never became readable (empty, truncated, or non-JSON info); malformed records carry no liveness proof and are never reclaimed — inspect and remove the directory manually once no publisher remains";
 			await fs.stat(path.join(lockPath, "info"));
 			return "held by an owner whose metadata is not yet readable";
 		} catch (error) {

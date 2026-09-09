@@ -53,6 +53,8 @@ Managed storage enforces owner-only directory/file security and refuses unsafe s
 
 On Linux filesystems where the exact POSIX ACL xattr operation returns `ENOTSUP`/`EOPNOTSUPP`, GJC treats that result only as proof that the filesystem cannot store that ACL attribute. The ACL gate still requires the same opened object to pass effective-owner, exact `0700` directory or `0600` file mode, safe-type, no-follow traversal, and identity/replacement checks. Permission denial, I/O errors, present or malformed ACL data, and unknown results remain failures. Managed descriptors use close-on-exec and are not delegated as authority to subprocesses. This compatibility rule does not change explicit `--session-dir`, macOS ACL, or Windows DACL policy.
 
+Managed migration-lock release checks its retained descriptor before native security verification. On Linux, a closed or reused descriptor can be replaced only by reopening the same lock file with no-follow, owner-only security and original file identity checks; the original attempt id must still own the lock before its released record is written. A successor or an insecure replacement is never release authority. Repeated release is inert and cannot retire a successor.
+
 Blob store location:
 
 ```text

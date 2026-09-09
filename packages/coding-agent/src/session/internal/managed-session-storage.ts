@@ -3565,11 +3565,13 @@ export async function acquireManagedLock(
 					descriptorClosed = true;
 				}
 			};
-			const assertOwned = (): void => {
+			const assertOwnedWithDescriptor = (ownedFd: number): void => {
 				const current = parseLock(lockPath);
 				let named: fs.BigIntStats;
+				let opened: fs.BigIntStats;
 				try {
 					named = fs.lstatSync(lockPath, { bigint: true });
+					opened = fs.fstatSync(ownedFd, { bigint: true });
 				} catch {
 					throw new Error("migration_busy");
 				}
@@ -3579,18 +3581,22 @@ export async function acquireManagedLock(
 					!current ||
 					current.released === true ||
 					!sameFileIdentity(lockIdentity, named) ||
+					!named.isFile() ||
+					named.isSymbolicLink() ||
+					!sameFileIdentity(lockIdentity, opened) ||
 					current.attemptId !== attemptId
 				)
 					throw new Error("migration_busy");
 				const now = Date.now();
 				if (current.leaseExpiresAt < now + LOCK_HEARTBEAT_MS) {
-					writeLockDescriptor(fd, {
+					writeLockDescriptor(ownedFd, {
 						...record,
 						heartbeatAt: now,
 						leaseExpiresAt: now + LOCK_LEASE_MS,
 					});
 				}
 			};
+			const assertOwned = (): void => assertOwnedWithDescriptor(fd);
 			const heartbeat = setInterval(() => {
 				try {
 					assertOwned();
@@ -3603,13 +3609,18 @@ export async function acquireManagedLock(
 				attemptId,
 				assertOwned,
 				async release(): Promise<void> {
+					if (released) return;
 					clearInterval(heartbeat);
 					let releaseFd = fd;
 					let replacementFd: number | undefined;
 					try {
-						assertOwned();
+						// Check the descriptor before native security verification: native failures
+						// do not preserve Node's EBADF code for a closed retained descriptor.
 						ManagedLockTestHooks.beforeReleaseDescriptorVerification?.({ path: lockPath, fd });
 						try {
+							const opened = fs.fstatSync(fd, { bigint: true });
+							if (!sameFileIdentity(lockIdentity, opened))
+								throw securityError(lockPath, { ok: false, code: "identity_mismatch" });
 							secureFileDescriptor(lockPath, fd, "verify", true);
 						} catch (error) {
 							const descriptorUnavailable = (error as NodeJS.ErrnoException).code === "EBADF";
@@ -3621,6 +3632,7 @@ export async function acquireManagedLock(
 							replacementFd = openVerifiedLockReleaseDescriptor(lockPath, lockIdentity);
 							releaseFd = replacementFd;
 						}
+						assertOwnedWithDescriptor(releaseFd);
 						const now = Date.now();
 						// A released record is the only live-process reclaim authority. Expiry alone
 						// never authorizes stealing from a holder whose process is still present.
@@ -3638,9 +3650,12 @@ export async function acquireManagedLock(
 						}
 						fsyncDirectory(locksDirectory);
 					} finally {
-						if (replacementFd !== undefined) fs.closeSync(replacementFd);
 						released = true;
-						closeDescriptor();
+						try {
+							if (replacementFd !== undefined) fs.closeSync(replacementFd);
+						} finally {
+							closeDescriptor();
+						}
 					}
 				},
 			};

@@ -73,6 +73,108 @@ export function detectAuthError(error: Error): boolean {
 	return false;
 }
 
+const CHALLENGE_KEY_MAX_LENGTH = 64;
+
+function isChallengeKeyStart(code: number): boolean {
+	return (code >= 65 && code <= 90) || (code >= 97 && code <= 122) || code === 95;
+}
+
+function isChallengeKeyPart(code: number): boolean {
+	return isChallengeKeyStart(code) || (code >= 48 && code <= 57) || code === 45;
+}
+
+/**
+ * Scan challenge parameters without retrying an entire identifier run at every
+ * offset. Skipping a failed run is important: a bounded regex could reinterpret
+ * the suffix of an oversized key as a different, recognized parameter.
+ */
+function extractChallengeEntries(errorMessage: string): Array<[string, string]> {
+	const entries: Array<[string, string]> = [];
+	let cursor = 0;
+
+	while (cursor < errorMessage.length) {
+		const keyStart = cursor;
+		if (!isChallengeKeyStart(errorMessage.charCodeAt(keyStart))) {
+			cursor++;
+			continue;
+		}
+
+		let keyEnd = keyStart + 1;
+		while (isChallengeKeyPart(errorMessage.charCodeAt(keyEnd))) keyEnd++;
+
+		if (errorMessage.charCodeAt(keyEnd) !== 61 || errorMessage.charCodeAt(keyEnd + 1) !== 34) {
+			cursor = keyEnd + 1;
+			continue;
+		}
+
+		const valueStart = keyEnd + 2;
+		const valueEnd = errorMessage.indexOf('"', valueStart);
+		if (valueEnd === -1) break;
+		if (valueEnd > valueStart && keyEnd - keyStart <= CHALLENGE_KEY_MAX_LENGTH) {
+			entries.push([errorMessage.slice(keyStart, keyEnd).toLowerCase(), errorMessage.slice(valueStart, valueEnd)]);
+		}
+		cursor = valueEnd + 1;
+	}
+
+	return entries;
+}
+
+interface QuotedParameter {
+	markerStart: number;
+	valueEnd: number;
+	value: string;
+}
+
+function isRegexLineTerminator(code: number): boolean {
+	return code === 10 || code === 13 || code === 0x2028 || code === 0x2029;
+}
+
+function collectQuotedParameters(errorMessage: string, prefix: string): QuotedParameter[] {
+	const entries: QuotedParameter[] = [];
+	for (
+		let markerStart = errorMessage.indexOf(prefix);
+		markerStart !== -1;
+		markerStart = errorMessage.indexOf(prefix, markerStart + 1)
+	) {
+		const valueStart = markerStart + prefix.length;
+		const valueEnd = errorMessage.indexOf('"', valueStart);
+		if (valueEnd === -1) break;
+		if (valueEnd > valueStart)
+			entries.push({ markerStart, valueEnd, value: errorMessage.slice(valueStart, valueEnd) });
+	}
+	return entries;
+}
+
+/**
+ * Preserve the legacy `realm="...".*token_url="..."` fallback without the
+ * greedy wildcard rescanning every later `realm` marker. The wildcard cannot
+ * cross a JavaScript regex line terminator and selects the last valid token on
+ * the matching line.
+ */
+function extractLegacyWwwAuth(errorMessage: string): { authorizationUrl: string; tokenUrl: string } | null {
+	const lineAt = new Uint32Array(errorMessage.length + 1);
+	let line = 0;
+	for (let index = 0; index < errorMessage.length; index++) {
+		lineAt[index] = line;
+		if (isRegexLineTerminator(errorMessage.charCodeAt(index))) line++;
+	}
+	lineAt[errorMessage.length] = line;
+
+	const realms = collectQuotedParameters(errorMessage, 'realm="');
+	const tokens = collectQuotedParameters(errorMessage, 'token_url="');
+	const lastTokenByLine = new Map<number, QuotedParameter>();
+	for (const token of tokens) lastTokenByLine.set(lineAt[token.markerStart]!, token);
+
+	for (const realm of realms) {
+		const token = lastTokenByLine.get(lineAt[realm.valueEnd + 1]!);
+		if (token && token.markerStart > realm.valueEnd) {
+			return { authorizationUrl: realm.value, tokenUrl: token.value };
+		}
+	}
+
+	return null;
+}
+
 /**
  * Extract OAuth endpoints from error response.
  * Looks for WWW-Authenticate header format or JSON error bodies.
@@ -130,9 +232,10 @@ export function extractOAuthEndpoints(error: Error): OAuthEndpoints | null {
 	try {
 		// Try to parse as JSON error response
 		// Many MCP servers return JSON with OAuth endpoints in error body
-		const jsonMatch = errorMsg.match(/\{[\s\S]*\}/);
-		if (jsonMatch) {
-			const errorBody = JSON.parse(jsonMatch[0]) as Record<string, unknown>;
+		const jsonStart = errorMsg.indexOf("{");
+		const jsonEnd = errorMsg.lastIndexOf("}");
+		if (jsonEnd > jsonStart) {
+			const errorBody = JSON.parse(errorMsg.slice(jsonStart, jsonEnd + 1)) as Record<string, unknown>;
 
 			// Check for OAuth endpoints in error body
 			if (errorBody.oauth || errorBody.authorization || errorBody.auth) {
@@ -160,11 +263,11 @@ export function extractOAuthEndpoints(error: Error): OAuthEndpoints | null {
 		// Not JSON, continue with other detection methods
 	}
 
-	const challengeEntries = Array.from(errorMsg.matchAll(/([a-zA-Z_][a-zA-Z0-9_-]*)="([^"]+)"/g));
+	const challengeEntries = extractChallengeEntries(errorMsg);
 	if (challengeEntries.length > 0) {
 		const challengeValues = new Map<string, string>();
-		for (const [, rawKey, value] of challengeEntries) {
-			challengeValues.set(rawKey.toLowerCase(), value);
+		for (const [key, value] of challengeEntries) {
+			challengeValues.set(key, value);
 		}
 
 		const authorizationUrl =
@@ -186,15 +289,12 @@ export function extractOAuthEndpoints(error: Error): OAuthEndpoints | null {
 		}
 	}
 
-	// Try to extract from WWW-Authenticate header format
-	// Example: Bearer realm="https://auth.example.com/oauth/authorize" token_url="https://auth.example.com/oauth/token"
-	const wwwAuthMatch = errorMsg.match(/realm="([^"]+)".*token_url="([^"]+)"/);
-	if (wwwAuthMatch) {
+	const wwwAuth = extractLegacyWwwAuth(errorMsg);
+	if (wwwAuth) {
 		return {
-			authorizationUrl: wwwAuthMatch[1],
-			tokenUrl: wwwAuthMatch[2],
-			clientId: clientIdFromAuthUrl(wwwAuthMatch[1]),
-			scopes: scopeFromAuthUrl(wwwAuthMatch[1]),
+			...wwwAuth,
+			clientId: clientIdFromAuthUrl(wwwAuth.authorizationUrl),
+			scopes: scopeFromAuthUrl(wwwAuth.authorizationUrl),
 		};
 	}
 

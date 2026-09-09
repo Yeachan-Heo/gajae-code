@@ -783,7 +783,7 @@ async function resolveBaseRef(): Promise<string> {
 	return "origin/dev";
 }
 
-async function getWorkspacePackages(): Promise<WorkspacePackage[]> {
+export async function getWorkspacePackages(): Promise<WorkspacePackage[]> {
 	const dirs = await getWorkspaceDirs();
 	const packages: WorkspacePackage[] = [];
 	for (const dir of dirs) {
@@ -819,6 +819,15 @@ async function getWorkspaceDirs(): Promise<string[]> {
 async function readPackageManifest(filePath: string): Promise<PackageManifest | null> {
 	const value = await readJsonRecord(filePath);
 	if (!value) return null;
+	// Validate graph-bearing fields before readStringMap can discard malformed
+	// entries and make a real dependency disappear from relevance planning.
+	for (const scope of PACKAGE_SCOPES) {
+		const dependencies = value[scope];
+		if (dependencies === undefined) continue;
+		if (!isRecord(dependencies) || Object.values(dependencies).some(version => !isString(version))) {
+			throw new Error(`Invalid workspace dependency map ${scope} in ${filePath}`);
+		}
+	}
 	return {
 		name: isString(value.name) ? value.name : undefined,
 		scripts: readStringMap(value.scripts),
@@ -926,7 +935,7 @@ export function planTasks(
 	}
 	if (paths.some(isWorkflowOrScriptPath)) {
 		add(tasks, "affected-dry-run", "Affected CI selector self-check", ["bun", "scripts/ci-dev-affected.ts", "--dry-run"]);
-		add(tasks, "affected-selftest", "Affected CI selector unit tests", ["bun", "test", "scripts/ci-dev-affected.test.ts", "scripts/run-bun-test-files.test.ts", "scripts/dev-ci-guard-topology.test.ts", "scripts/ci-risk-canary-manifest.test.ts", "scripts/ci-virtual-integration.test.ts"]);
+		add(tasks, "affected-selftest", "Affected CI selector unit tests", ["bun", "test", "scripts/ci-dev-affected.test.ts", "scripts/run-bun-test-files.test.ts", "scripts/dev-ci-guard-topology.test.ts", "scripts/ci-risk-canary-manifest.test.ts", "scripts/ci-virtual-integration.test.ts", "scripts/ci-gjc-state-gates.test.ts"]);
 		add(tasks, "workflow-permissions", "Workflow permission policy regression", ["bun", "test", "scripts/check-workflow-permissions.test.ts", "scripts/release-policy.test.ts"]);
 		if (paths.some(isWorkflowPath)) {
 			add(tasks, "workflow-yaml-parse", "Workflow YAML parse check", ["bun", "scripts/check-workflow-yaml.ts"]);
@@ -1070,7 +1079,7 @@ export function planTargetedTasks(
 		add(tasks, "install-methods", "Install method smoke tests", ["bun", "run", "ci:test:install-methods"]);
 	}
 	if (needCiSelftest) {
-		add(tasks, "ci-selftest", "Affected CI selector unit tests", ["bun", "test", "scripts/ci-dev-affected.test.ts", "scripts/run-bun-test-files.test.ts", "scripts/dev-ci-guard-topology.test.ts", "scripts/ci-risk-canary-manifest.test.ts", "scripts/ci-virtual-integration.test.ts"]);
+		add(tasks, "ci-selftest", "Affected CI selector unit tests", ["bun", "test", "scripts/ci-dev-affected.test.ts", "scripts/run-bun-test-files.test.ts", "scripts/dev-ci-guard-topology.test.ts", "scripts/ci-risk-canary-manifest.test.ts", "scripts/ci-virtual-integration.test.ts", "scripts/ci-gjc-state-gates.test.ts"]);
 		add(tasks, "ci-dry-run", "Affected CI selector dry-run", ["bun", "scripts/ci-dev-affected.ts", "--dry-run"]);
 	}
 	if (needYamlParse) {
@@ -1223,7 +1232,7 @@ function ensureNativeBuild(tasks: Map<string, Task>): void {
 	}
 }
 
-function isDocOrChangelogPath(changedPath: string): boolean {
+export function isDocOrChangelogPath(changedPath: string): boolean {
 	return changedPath.endsWith(".md") || changedPath.startsWith("docs/") || changedPath.startsWith(".gjc/");
 }
 
@@ -1319,7 +1328,7 @@ function dependsOnWorkspace(manifest: PackageManifest, dependencyName: string, w
 	return false;
 }
 
-function isFullWorkspacePath(changedPath: string): boolean {
+export function isFullWorkspacePath(changedPath: string): boolean {
 	return [
 		"package.json",
 		"bunfig.toml",
@@ -1360,7 +1369,7 @@ function addReleasePublishTasks(tasks: Map<string, Task>): void {
 
 
 
-function isRustPath(changedPath: string): boolean {
+export function isRustPath(changedPath: string): boolean {
 	const fileName = path.basename(changedPath);
 	return (
 		changedPath.startsWith("crates/") ||

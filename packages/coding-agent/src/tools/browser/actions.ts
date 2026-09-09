@@ -154,7 +154,7 @@ for (const s of __steps) {
 			__results.push({ verb: "select", selected: await tab.select(s.selector, ...(s.values || [])) });
 			break;
 		case "press":
-			await tab.press(s.key, s.selector ? { selector: s.selector } : undefined);
+			await tab.press(s.key, s.selector !== undefined ? { selector: s.selector } : undefined);
 			__results.push({ verb: "press", key: s.key });
 			break;
 		case "scroll":
@@ -166,7 +166,7 @@ for (const s of __steps) {
 			__results.push({ verb: "back" });
 			break;
 		case "wait":
-			if (s.selector) { await tab.waitFor(s.selector); }
+			if (s.selector !== undefined) { await tab.waitFor(s.selector); }
 			else { await new Promise(r => setTimeout(r, s.ms)); }
 			__results.push({ verb: "wait", selector: s.selector ?? null, ms: s.ms ?? null });
 			break;

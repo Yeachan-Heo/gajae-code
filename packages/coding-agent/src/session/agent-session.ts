@@ -42,6 +42,7 @@ import {
 	type ManagedAttemptDecision,
 	type ManagedAttemptOutcome,
 	type MidRunMaintenanceOutcome,
+	markNonDispatchedToolEvent,
 	type RunCancellationDomain,
 	type RunCancellationDomainBridge,
 	type RunResourceProducerLease,
@@ -2876,6 +2877,7 @@ export class AgentSession {
 		this.#retryReplayUnsafeEpoch = undefined;
 		this.#firstEventTimeoutRetryStartedAt = Date.now();
 		this.#providerRetryMaxAttempts = undefined;
+		this.#codexCredentialModelUnavailableRetried = false;
 	}
 
 	#markRetryReplayUnsafe(): void {
@@ -2914,6 +2916,8 @@ export class AgentSession {
 	#retryNowRequested = false;
 	#firstEventTimeoutRetryStartedAt: number | undefined;
 	#providerRetryMaxAttempts: number | undefined;
+	/** One content-free retry is allowed after Codex says the active account lacks the model. */
+	#codexCredentialModelUnavailableRetried = false;
 	#retryAttempt = 0;
 	#retryPromise: Promise<void> | undefined = undefined;
 	#retryResolve: (() => void) | undefined = undefined;
@@ -8789,6 +8793,7 @@ export class AgentSession {
 					args: event.args,
 					intent: event.intent,
 				};
+				if (isNonDispatchedToolEvent(event)) markNonDispatchedToolEvent(extensionEvent);
 				await this.#extensionRunner.emit(extensionEvent, undefined, deliveryScope);
 			} else if (event.type === "tool_execution_update") {
 				const extensionEvent: ToolExecutionUpdateEvent = {
@@ -8807,6 +8812,7 @@ export class AgentSession {
 					result: event.result,
 					isError: event.isError ?? false,
 				};
+				if (isNonDispatchedToolEvent(event)) markNonDispatchedToolEvent(extensionEvent);
 				await this.#extensionRunner.emit(extensionEvent, undefined, deliveryScope);
 			} else if (event.type === "auto_compaction_start") {
 				await this.#extensionRunner.emit(
@@ -20534,6 +20540,30 @@ export class AgentSession {
 		);
 	}
 
+	#isCodexCredentialModelUnavailable(message: AssistantMessage): boolean {
+		return (
+			message.api === "openai-codex-responses" &&
+			message.provider === "openai-codex" &&
+			message.transportFailure?.credentialModelUnavailable === true
+		);
+	}
+
+	#canRotateCodexCredential(message: AssistantMessage): boolean {
+		if (!this.#isCodexCredentialModelUnavailable(message)) return false;
+		if (this.#codexCredentialModelUnavailableRetried || assistantMessageHasVisibleOrToolContent(message))
+			return false;
+		const authStorage = this.#modelRegistry.authStorage;
+		const provider = message.provider;
+		const owner = this.#modelRegistry.getAuthStorageOwner();
+		return (
+			authStorage.getSessionCredentialType(provider, this.credentialSessionId) === "oauth" &&
+			!authStorage.hasRuntimeApiKey(provider) &&
+			!authStorage.hasRuntimeCredentialSelector(provider) &&
+			!authStorage.hasSessionCredentialSelector(provider, this.credentialSessionId) &&
+			!authStorage.hasConfigApiKey(provider, owner)
+		);
+	}
+
 	#isRetryableError(message: AssistantMessage): boolean {
 		if (this.#isTerminalProviderFirstEventTimeout(message)) return false;
 		if (message.errorMessage?.startsWith("Model fallback chain exhausted;")) return false;
@@ -20546,6 +20576,16 @@ export class AgentSession {
 		const contextWindow = this.model?.contextWindow ?? 0;
 		if (classifyContextOverflow(message, transportFailure, contextWindow)) return false;
 		const managedFallback = this.#defaultFallbackChain().chain.entries.length > 1;
+		// An account-specific model rejection that cannot rotate to another
+		// credential stays terminal only on the session's own retry path; managed
+		// fallback still advances the model chain through the controller.
+		if (
+			this.#isCodexCredentialModelUnavailable(message) &&
+			!this.#canRotateCodexCredential(message) &&
+			!managedFallback
+		) {
+			return false;
+		}
 		if (!managedFallback) {
 			const classification = this.#classifyErrorForRetry(message);
 			return (
@@ -20676,6 +20716,9 @@ export class AgentSession {
 		if (message.errorKind === "local_buffer_overflow") return "local_buffer_overflow";
 		if (this.#isTypedFirstEventTimeout(message)) return "first_event_timeout";
 		if (this.#isTypedEmptyResponse(message)) return "empty_response";
+		if (this.#isCodexCredentialModelUnavailable(message)) {
+			return this.#canRotateCodexCredential(message) ? "unknown" : "terminal";
+		}
 		if (!message.errorMessage) return "none";
 		const err = message.errorMessage;
 		// Managed-attempt local failures from restored sessions may lack the
@@ -21512,7 +21555,13 @@ export class AgentSession {
 		retryAfterMs?: number;
 		authDisposition?: AuthDisposition;
 	}): Promise<"rotated" | "exhausted" | "unchanged"> {
-		if (!this.model || (trigger.class !== "auth" && trigger.class !== "quota" && trigger.class !== "rate_limit")) {
+		if (
+			!this.model ||
+			(trigger.class !== "auth" &&
+				trigger.class !== "quota" &&
+				trigger.class !== "rate_limit" &&
+				trigger.class !== "credential")
+		) {
 			return "unchanged";
 		}
 		// (2) Terminal forbidden: no credential state may change.
@@ -21521,7 +21570,12 @@ export class AgentSession {
 		const authStorage = this.#modelRegistry.authStorage;
 		const provider = this.model.provider;
 		// (1) Pin guard, before any mutation and for every branch.
-		if (authStorage.hasRuntimeApiKey(provider) || authStorage.hasRuntimeCredentialSelector(provider)) {
+		if (
+			authStorage.hasRuntimeApiKey(provider) ||
+			authStorage.hasRuntimeCredentialSelector(provider) ||
+			authStorage.hasSessionCredentialSelector(provider, this.credentialSessionId) ||
+			authStorage.hasConfigApiKey(provider, this.#modelRegistry.getAuthStorageOwner())
+		) {
 			return "unchanged";
 		}
 
@@ -21536,6 +21590,11 @@ export class AgentSession {
 				owner: this.#modelRegistry.getAuthStorageOwner(),
 			});
 			if (!remaining) return "unchanged";
+		} else if (trigger.class === "credential") {
+			if (authStorage.getSessionCredentialType(provider, credentialSessionId) !== "oauth") return "unchanged";
+			remaining = await authStorage.markUsageLimitReached(provider, credentialSessionId, {
+				owner: this.#modelRegistry.getAuthStorageOwner(),
+			});
 		} else {
 			remaining = await authStorage.markUsageLimitReached(provider, credentialSessionId, {
 				retryAfterMs: trigger.retryAfterMs,
@@ -21627,10 +21686,19 @@ export class AgentSession {
 					}
 				: false;
 		}
+		const canRotateCodexCredential = this.#canRotateCodexCredential(message);
+		if (this.#isCodexCredentialModelUnavailable(message) && !canRotateCodexCredential && !managedFallback) {
+			return managedOutcome
+				? {
+						type: "terminal",
+						terminal: { stopReason: "error", messages: [message] },
+					}
+				: false;
+		}
 		// retry.enabled=false always surfaces immediately, matching the explicit
 		// user opt-out. The managed provider-fallback chain keeps its own
 		// availability policy.
-		if (!retrySettings.enabled && !managedFallback) {
+		if (!retrySettings.enabled && !managedFallback && !canRotateCodexCredential) {
 			return managedOutcome
 				? {
 						type: "terminal",
@@ -21710,6 +21778,19 @@ export class AgentSession {
 		// extension lifecycle participation. Mark the failed credential and
 		// retry with the next stored credential of the same provider.
 		let credentialRotated = false;
+		if (canRotateCodexCredential && trigger.class === "credential") {
+			const mark = await this.#markFailedCredential(trigger);
+			this.#codexCredentialModelUnavailableRetried = true;
+			credentialRotated = mark === "rotated";
+			if (!credentialRotated && !managedFallback) {
+				return managedOutcome
+					? {
+							type: "terminal",
+							terminal: { stopReason: "error", messages: [message] },
+						}
+					: false;
+			}
+		}
 		if (
 			!managedFallback &&
 			!providerRetryCeilingReached &&
@@ -21770,6 +21851,15 @@ export class AgentSession {
 		if (managedFallback) {
 			outcome = controller.onAttemptFailure(trigger.class, message.errorMessage || "Unknown error");
 			if (providerRetryCeilingReached && outcome === "retry") {
+				outcome = controller.advance() ? "advance" : "exhausted";
+			}
+			// The one content-free account retry was already spent: never spend
+			// another same-model attempt on a third account, advance instead.
+			if (
+				outcome === "retry" &&
+				this.#isCodexCredentialModelUnavailable(message) &&
+				this.#codexCredentialModelUnavailableRetried
+			) {
 				outcome = controller.advance() ? "advance" : "exhausted";
 			}
 		} else {
@@ -21864,7 +21954,12 @@ export class AgentSession {
 			if (ownership && (!ownership.isCurrent() || cancellationSignal?.aborted)) return;
 			if (retryCancelled()) return;
 			let quotaPoolExhausted = false;
-			if (managedFallback && !credentialRotated && !providerRetryCeilingReached) {
+			if (
+				managedFallback &&
+				!credentialRotated &&
+				!providerRetryCeilingReached &&
+				!(this.#isCodexCredentialModelUnavailable(message) && this.#codexCredentialModelUnavailableRetried)
+			) {
 				const mark = await this.#markFailedCredential(trigger);
 				if (mark === "rotated") credentialRotated = true;
 				quotaPoolExhausted = mark === "exhausted";
