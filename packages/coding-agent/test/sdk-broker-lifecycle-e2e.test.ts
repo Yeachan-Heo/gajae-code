@@ -32,7 +32,7 @@ import {
 } from "../src/sdk/broker/lifecycle";
 import { parseLifecycleJson } from "../src/sdk/broker/lifecycle-codec";
 import { LifecycleLedger } from "../src/sdk/broker/lifecycle-ledger";
-import { SessionIndex, type SessionIndexEvent } from "../src/sdk/broker/session-index";
+import { SessionIndex, type SessionIndexEvent, sessionIndexChecksum } from "../src/sdk/broker/session-index";
 import { runSdkSessionCli } from "../src/sdk/cli";
 import { SdkClient } from "../src/sdk/client";
 import { readSdkBrokerDiscovery } from "../src/sdk/client/discovery";
@@ -3016,8 +3016,8 @@ test("session index proves ordinary host unregistration using a newer matching r
 
 test("session index accepts a legacy unregister that predates endpoint file identity", async () => {
 	const agentDir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-session-index-legacy-unregister-"));
-	const index = await new SessionIndex(agentDir).open();
 	try {
+		const index = await new SessionIndex(agentDir).open();
 		const shared = {
 			sessionId: "legacy-unregister",
 			locator: { cwd: "fixture", worktreeRoot: null, stateRoot: path.join(agentDir, "state") },
@@ -3031,8 +3031,22 @@ test("session index accepts a legacy unregister that predates endpoint file iden
 			endpointMtimeMs: 1234,
 			endpointFileId: "11:22",
 		});
-		await index.append({ type: "host_unregistered", ...shared });
-		expect(index.hostUnregisteredAfter(registration)).toEqual({
+		const unregister = await index.append({
+			type: "host_unregistered",
+			...shared,
+			endpointMtimeMs: 1234,
+			endpointFileId: "11:22",
+		});
+		const { checksum: _checksum, endpointFileId: _endpointFileId, ...legacyUnregister } = unregister;
+		const logPath = path.join(agentDir, "sdk", "sessions", "index.jsonl");
+		const rows = (await Bun.file(logPath).text()).trim().split("\n");
+		rows[rows.length - 1] = JSON.stringify({
+			...legacyUnregister,
+			checksum: sessionIndexChecksum(legacyUnregister),
+		});
+		await Bun.write(logPath, `${rows.join("\n")}\n`);
+		const reopened = await new SessionIndex(agentDir).open();
+		expect(reopened.hostUnregisteredAfter(registration)).toEqual({
 			indexSeq: registration.indexSeq + 1,
 			lifecycleRequestId: "legacy-close",
 		});

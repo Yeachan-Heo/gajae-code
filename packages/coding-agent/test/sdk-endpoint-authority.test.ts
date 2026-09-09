@@ -1,7 +1,23 @@
 import { describe, expect, test } from "bun:test";
-import { matchesIndexedEndpointFile } from "../src/sdk/broker/endpoint-authority";
+import { createHash } from "node:crypto";
+import { endpointIncarnation, matchesIndexedEndpointFile } from "../src/sdk/broker/endpoint-authority";
 
 describe("SDK endpoint index authority", () => {
+	test("preserves the established identityful digest field order", () => {
+		const record = { endpointGeneration: 3, endpointMtimeMs: 1_000.4, endpointFileId: "7:11", pid: 42 };
+		const expected = createHash("sha256")
+			.update(
+				JSON.stringify({
+					endpointGeneration: 3,
+					endpointMtimeMs: 1_000,
+					endpointFileId: "7:11",
+					pid: 42,
+					sessionId: "session",
+				}),
+			)
+			.digest("hex");
+		expect(endpointIncarnation(record, "session")).toBe(expected);
+	});
 	test("accepts the index timestamp precision used by broker endpoint reads", () => {
 		const file = { dev: 7n, ino: 11n, mtimeMs: 1_000.123_456 };
 

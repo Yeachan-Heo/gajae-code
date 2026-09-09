@@ -1747,6 +1747,27 @@ describe("SessionRouter dispatch authority", () => {
 		}
 	});
 
+	test("rejects a refreshed file identity that differs from the descriptor already proven", async () => {
+		let refreshCount = 0;
+		let fixture!: RouterFixture;
+		fixture = await routerFixture({
+			start: false,
+			onIndexRefresh: () => {
+				refreshCount += 1;
+				if (refreshCount !== 2) return;
+				const stat = fs.statSync(fixture.endpointFile, { bigint: true });
+				fixture.authority.endpointFileId = `${stat.dev}:${stat.ino + 1n}`;
+			},
+		});
+		await fixture.router.start();
+		try {
+			expect(refreshCount).toBeGreaterThanOrEqual(2);
+			expect(fixture.router.attachment(fixture.sessionId)).toBeNull();
+		} finally {
+			await fixture.router.stop();
+		}
+	});
+
 	test("revokes attachments when Broker terminal authority is uncertain", async () => {
 		const fixture = await routerFixture();
 		const attachment = fixture.attachments[0]!;

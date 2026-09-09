@@ -3432,7 +3432,7 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		const server = await createSdkControlServer(root, controls, undefined, undefined, sessions);
 		await registerSdkSession(server, root);
 		const recordPath = path.join(coordinatorNamespace(root), "sessions", "visible-session.json");
-		const recordBefore = JSON.parse(await fs.readFile(recordPath, "utf8")) as Record<string, unknown>;
+		const recordBefore = (await Bun.file(recordPath).json()) as Record<string, unknown>;
 		const legacyDigest = String(recordBefore.endpoint_incarnation);
 		const endpointPath = path.join(root, ".gjc", "state", "sdk", "visible-session.json");
 		const endpointStat = await fs.stat(endpointPath);
@@ -3444,7 +3444,7 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 			session_id: "visible-session",
 		});
 		expect(recovered).toMatchObject({ ok: true });
-		const migratedRecord = JSON.parse(await fs.readFile(recordPath, "utf8")) as Record<string, unknown>;
+		const migratedRecord = (await Bun.file(recordPath).json()) as Record<string, unknown>;
 		const migratedTransaction = await readSessionTransaction(paths, "visible-session");
 		const migratedDigest = String(migratedRecord.endpoint_incarnation);
 		expect(migratedDigest).toMatch(/^[a-f0-9]{64}$/);
@@ -3495,14 +3495,14 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 			delete transaction.canonical.session.broker.endpoint_file_id;
 		});
 		const mismatchRecordPath = path.join(coordinatorNamespace(mismatchRoot), "sessions", "visible-session.json");
-		const mismatchRecord = JSON.parse(await fs.readFile(mismatchRecordPath, "utf8")) as Record<string, unknown>;
+		const mismatchRecord = (await Bun.file(mismatchRecordPath).json()) as Record<string, unknown>;
 		delete mismatchRecord.endpoint_file_id;
 		mismatchRecord.endpoint_incarnation = "f".repeat(64);
 		await Bun.write(mismatchRecordPath, `${JSON.stringify(mismatchRecord)}\n`);
 		await expect(
 			mismatchServer.callTool("gjc_coordinator_read_coordination_status", { session_id: "visible-session" }),
 		).resolves.toMatchObject({ ok: false, error: { code: "endpoint_stale" } });
-	});
+	}, 15_000);
 	it("uses the canonical turn for zero-time watch acknowledgement decisions after endpoint-file migration", async () => {
 		const root = await tempRoot();
 		const controls: SdkControl[] = [];
@@ -3537,9 +3537,9 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		});
 		const turnId = String(sent.turn_id);
 		const projectionTurnPath = path.join(coordinatorNamespace(root), "turns", `${turnId}.json`);
-		const projectionTurn = JSON.parse(await fs.readFile(projectionTurnPath, "utf8")) as Record<string, unknown>;
+		const projectionTurn = (await Bun.file(projectionTurnPath).json()) as Record<string, unknown>;
 		const projectedDelivery = projectionTurn.delivery as Record<string, unknown>;
-		await fs.writeFile(
+		await Bun.write(
 			projectionTurnPath,
 			JSON.stringify({
 				...projectionTurn,

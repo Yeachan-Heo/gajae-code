@@ -39,7 +39,6 @@ export function endpointIncarnation(
 	return createHash("sha256")
 		.update(
 			JSON.stringify({
-				...(record.endpointFileId === undefined ? {} : { endpointFileId: record.endpointFileId }),
 				endpointGeneration: record.endpointGeneration,
 				// Filesystem mtime is only millisecond-precise, and the two stat
 				// spellings used across this path (bigint mtimeNs/1e6 vs libuv
@@ -49,6 +48,7 @@ export function endpointIncarnation(
 				// genuine same-millisecond successor replacement still changes the
 				// digest even when pid/generation are reused.
 				endpointMtimeMs: Math.round(record.endpointMtimeMs),
+				...(record.endpointFileId === undefined ? {} : { endpointFileId: record.endpointFileId }),
 				pid: record.pid,
 				sessionId,
 			}),

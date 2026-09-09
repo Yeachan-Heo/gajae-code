@@ -492,6 +492,33 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 		);
 	});
 
+	it("rejects a provider effect when any nested authority branch is stale", async () => {
+		await withDaemon(
+			async (daemon, _fake, _injected, _setEndpointGeneration, agentDir) => {
+				await daemon.notify("session", "root");
+				const journal = new ChatEffectJournal({ agentDir, transport: "slack" });
+				await expect(
+					journal.enqueue({
+						id: "mixed-authorities",
+						kind: "provider-post",
+						transport: "slack",
+						sessionId: "session",
+						endpointGeneration: 1,
+						payload: {
+							branches: [
+								{ attachmentAuthorityId: "current-authority" },
+								{ nested: { attachmentAuthorityId: "stale-authority" } },
+							],
+						},
+					}),
+				).rejects.toThrow("attachment authority");
+			},
+			{
+				resolveAttachment: async sessionId => ({ ...endpoint(sessionId), authorityId: "current-authority" }),
+			},
+		);
+	});
+
 	it("fences an effect enqueued after the migration journal snapshot", async () => {
 		let authorityId = "legacy-authority";
 		await withDaemon(

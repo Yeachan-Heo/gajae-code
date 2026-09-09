@@ -1542,6 +1542,12 @@ export class SessionRouter {
 		const listing = this.#index.listSessions();
 		if (listing.warnings.some(warning => warningAffectsSession(warning, indexed.sessionId))) return null;
 		const current = listing.sessions.find(session => session.sessionId === indexed.sessionId);
+		if (
+			indexed.endpointFileId === undefined &&
+			current?.endpointFileId !== undefined &&
+			(provenIdentity.dev === undefined || current.endpointFileId !== `${provenIdentity.dev}:${provenIdentity.ino}`)
+		)
+			return null;
 		if (!current || !sameIndexedAuthority(indexed, current)) return null;
 		return { endpoint, identity: provenIdentity };
 	}

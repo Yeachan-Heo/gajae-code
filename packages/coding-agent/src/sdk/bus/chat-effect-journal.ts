@@ -84,7 +84,10 @@ function mappingAcceptsAuthority(mapping: EffectReferenceMapping, authorityId: s
 function collectAttachmentAuthorityIds(value: unknown, authorities: Set<string | undefined>): boolean {
 	if (Array.isArray(value)) {
 		let found = false;
-		for (const entry of value) found ||= collectAttachmentAuthorityIds(entry, authorities);
+		for (const entry of value) {
+			const entryFound = collectAttachmentAuthorityIds(entry, authorities);
+			found = entryFound || found;
+		}
 		return found;
 	}
 	if (!value || typeof value !== "object") return false;
@@ -95,7 +98,8 @@ function collectAttachmentAuthorityIds(value: unknown, authorities: Set<string |
 			found = true;
 			continue;
 		}
-		found ||= collectAttachmentAuthorityIds(candidate, authorities);
+		const candidateFound = collectAttachmentAuthorityIds(candidate, authorities);
+		found = candidateFound || found;
 	}
 	return found;
 }
