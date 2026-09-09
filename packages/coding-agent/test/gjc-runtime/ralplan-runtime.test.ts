@@ -1933,7 +1933,11 @@ describe("ralplan automatic handoff admission (#3398)", () => {
 			value: "ultragoal→ultragoal",
 		});
 	});
-	it("repairs the authenticated final admission projection after a crash-gap dedupe", async () => {
+	it.each([
+		"missing admission",
+		"pending publication",
+		"missing state",
+	])("repairs the authenticated final admission projection after a crash-gap dedupe: %s", async gap => {
 		const root = await tempDir();
 		const runId = "final-admission-crash-gap";
 		await fs.mkdir(path.join(root, ".gjc"), { recursive: true });
@@ -1947,13 +1951,24 @@ describe("ralplan automatic handoff admission (#3398)", () => {
 		const statePath = ralplanStatePath(root);
 		const state = JSON.parse(await fs.readFile(statePath, "utf-8")) as Record<string, unknown>;
 		delete state.auto_handoff;
-		await fs.writeFile(statePath, `${JSON.stringify(state)}\n`, "utf-8");
+		if (gap === "pending publication") {
+			state.final_publication_pending = {
+				run_id: runId,
+				publication_id: "interrupted-final-publication",
+				final_sha256: first.sha256,
+				started_at: new Date().toISOString(),
+			};
+		}
+		if (gap === "missing state") await fs.rm(statePath);
+		else await fs.writeFile(statePath, `${JSON.stringify(state)}\n`, "utf-8");
 
 		const retry = JSON.parse((await writeRalplanArtifact(root, runId, "final", 1, "# final")).stdout ?? "{}");
 		expect(retry).toMatchObject({ deduplicated: true, auto_handoff: expectedAdmission });
 		const restoredState = JSON.parse(await fs.readFile(statePath, "utf-8")) as Record<string, unknown>;
 		expect(restoredState.auto_handoff).toEqual(expectedAdmission);
 		expect(restoredState.receipt).toMatchObject({ command: "gjc ralplan final-admission" });
+		expect(restoredState).toMatchObject({ run_id: runId, active: true, current_phase: "final" });
+		expect(restoredState.final_publication_pending).toBeUndefined();
 	});
 	it("overlays a later durable PLANNING-STUCK marker on final dedupe", async () => {
 		const root = await tempDir();
@@ -1998,6 +2013,8 @@ describe("ralplan automatic handoff admission (#3398)", () => {
 
 		await fs.rm(ralplanStatePath(root));
 		expect((await writeRalplanArtifact(root, "another-run", "planner", 1, "# other")).status).toBe(0);
+		const currentState = await fs.readFile(ralplanStatePath(root), "utf-8");
+		expect(JSON.parse(currentState)).toMatchObject({ run_id: "another-run", active: true, current_phase: "planner" });
 		await fs.writeFile(
 			path.join(root, ".gjc", "config.yml"),
 			YAML.stringify({ gjc: { ralplan: { autoHandoff: "off" } } }, null, 2),
@@ -2008,6 +2025,44 @@ describe("ralplan automatic handoff admission (#3398)", () => {
 			deduplicated: true,
 			auto_handoff: { configuredTarget: "ultragoal", effectiveTarget: "ultragoal" },
 		});
+		expect(await fs.readFile(ralplanStatePath(root), "utf-8")).toBe(currentState);
+	});
+	it("returns a cleared run's final receipt without reactivating its projection", async () => {
+		const root = await tempDir();
+		const runId = "cleared-final-retry";
+		const first = await writeRalplanArtifact(root, runId, "final", 1, "# final");
+		expect(first.status).toBe(0);
+		expect((await runNativeStateCommand(["clear", "--mode", "ralplan"], root)).status).toBe(0);
+		const clearedState = await fs.readFile(ralplanStatePath(root), "utf-8");
+		expect(JSON.parse(clearedState)).toMatchObject({ run_id: runId, active: false, current_phase: "complete" });
+
+		const retry = await writeRalplanArtifact(root, runId, "final", 1, "# final");
+		expect(retry.status).toBe(0);
+		expect(JSON.parse(retry.stdout ?? "{}")).toMatchObject({
+			deduplicated: true,
+			auto_handoff: JSON.parse(first.stdout ?? "{}").auto_handoff,
+		});
+		expect(await fs.readFile(ralplanStatePath(root), "utf-8")).toBe(clearedState);
+	});
+	it("rejects a new final publication for a cleared run without changing state or artifacts", async () => {
+		const root = await tempDir();
+		const runId = "cleared-final-new";
+		expect((await writeRalplanArtifact(root, runId, "final", 1, "# final")).status).toBe(0);
+		expect((await runNativeStateCommand(["clear", "--mode", "ralplan"], root)).status).toBe(0);
+		const clearedState = await fs.readFile(ralplanStatePath(root), "utf-8");
+		expect(JSON.parse(clearedState)).toMatchObject({ run_id: runId, active: false, current_phase: "complete" });
+		const indexPath = ralplanPlanPath(root, runId, "index.jsonl");
+		const indexBefore = await fs.readFile(indexPath, "utf-8");
+		const pendingPath = ralplanPlanPath(root, runId, "pending-approval.md");
+		const pendingBefore = await fs.readFile(pendingPath, "utf-8");
+
+		const result = await writeRalplanArtifact(root, runId, "final", 2, "# replacement final");
+		expect(result.status).toBe(2);
+		expect(result.stderr).toContain("locked phase");
+		expect(await fs.readFile(ralplanStatePath(root), "utf-8")).toBe(clearedState);
+		expect(await fs.readFile(indexPath, "utf-8")).toBe(indexBefore);
+		expect(await fs.readFile(pendingPath, "utf-8")).toBe(pendingBefore);
+		expect(existsSync(ralplanPlanPath(root, runId, "stage-02-final.md"))).toBe(false);
 	});
 
 	it("makes persisted PLANNING-STUCK dominate automatic handoff", async () => {
