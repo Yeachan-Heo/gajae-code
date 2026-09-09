@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
+import * as fsPromises from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { resolveMarkitMupdfWasm } from "../scripts/generate-mupdf-wasm";
@@ -138,4 +139,104 @@ if (hash !== ${JSON.stringify(expectedHash)}) throw new Error("Embedded WASM dif
 			fs.rmSync(outDir, { recursive: true, force: true });
 		}
 	}, 240_000);
+});
+
+// The PDF fixture does not load the CLI's complete minified module/worker graph.
+// Exercise the real build entrypoint as well: hosted run 34365508250 compiled
+// successfully, then dist/gjc --smoke-test failed while parsing an identifier.
+describe("full compiled CLI startup (#5452)", () => {
+	it("builds dist/gjc and completes the full smoke test in a clean environment", async () => {
+		const repoRoot = path.resolve(import.meta.dirname, "../../..");
+		const packageDir = path.join(repoRoot, "packages/coding-agent");
+		const artifactsRoot = path.join(repoRoot, "artifacts");
+		await fsPromises.mkdir(artifactsRoot, { recursive: true });
+		const evidenceDir = await fsPromises.mkdtemp(path.join(artifactsRoot, "compiled-cli-smoke-"));
+		const runtimeDir = await fsPromises.mkdtemp(path.join(os.tmpdir(), "gjc-full-compiled-smoke-"));
+		try {
+			// Do not inherit GJC session/broker/managed-runtime variables or credentials.
+			// Keep the Bun executable used by this test first on PATH for build subprocesses.
+			const baseEnv: NodeJS.ProcessEnv = {
+				PATH: [path.dirname(process.execPath), process.env.PATH ?? ""].join(path.delimiter),
+				TMPDIR: os.tmpdir(),
+				TEMP: os.tmpdir(),
+				TMP: os.tmpdir(),
+			};
+			for (const key of ["SystemRoot", "WINDIR", "COMSPEC", "PATHEXT"]) {
+				if (process.env[key] !== undefined) baseEnv[key] = process.env[key];
+			}
+			const phases = [
+				{
+					name: "build",
+					command: [process.execPath, "run", "build"],
+					cwd: packageDir,
+					timeout: 300_000,
+				},
+				{
+					name: "smoke",
+					command: [path.join(packageDir, "dist/gjc"), "--smoke-test"],
+					// No project files or node_modules in the runtime working directory.
+					cwd: runtimeDir,
+					timeout: 120_000,
+				},
+			];
+			for (const phase of phases) {
+				const home = path.join(runtimeDir, phase.name, "home");
+				const xdg = path.join(runtimeDir, phase.name, "xdg");
+				const env = {
+					...baseEnv,
+					HOME: home,
+					USERPROFILE: home,
+					XDG_CONFIG_HOME: path.join(xdg, "config"),
+					XDG_DATA_HOME: path.join(xdg, "data"),
+					XDG_CACHE_HOME: path.join(xdg, "cache"),
+					XDG_STATE_HOME: path.join(xdg, "state"),
+				};
+				for (const directory of [
+					home,
+					env.XDG_CONFIG_HOME,
+					env.XDG_DATA_HOME,
+					env.XDG_CACHE_HOME,
+					env.XDG_STATE_HOME,
+				]) {
+					await fsPromises.mkdir(directory, { recursive: true });
+				}
+				const proc = Bun.spawn(phase.command, {
+					cwd: phase.cwd,
+					env,
+					stdin: "ignore",
+					stdout: "pipe",
+					stderr: "pipe",
+					timeout: phase.timeout,
+				});
+				const [exitCode, stdout, stderr] = await Promise.all([
+					proc.exited,
+					new Response(proc.stdout).text(),
+					new Response(proc.stderr).text(),
+				]);
+				await Promise.all([
+					Bun.write(path.join(evidenceDir, `${phase.name}.stdout.log`), stdout),
+					Bun.write(path.join(evidenceDir, `${phase.name}.stderr.log`), stderr),
+					Bun.write(
+						path.join(evidenceDir, `${phase.name}.json`),
+						JSON.stringify(
+							{
+								command: phase.command,
+								cwd: phase.cwd,
+								bunVersion: Bun.version,
+								exitCode,
+								signalCode: proc.signalCode,
+							},
+							null,
+							2,
+						),
+					),
+				]);
+				const diagnostic = `${phase.name} failed; evidence: ${evidenceDir}\nexit=${exitCode} signal=${proc.signalCode}\nstdout:\n${stdout}\nstderr:\n${stderr}`;
+				expect(exitCode, diagnostic).toBe(0);
+				if (phase.name === "smoke") expect(stdout, diagnostic).toContain("smoke-test: ok");
+			}
+		} finally {
+			await fsPromises.rm(runtimeDir, { recursive: true, force: true });
+		}
+	}, 600_000);
 });
