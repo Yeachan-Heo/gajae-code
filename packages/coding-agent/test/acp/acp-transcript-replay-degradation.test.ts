@@ -117,6 +117,7 @@ describe("ACP transcript replay degradation", () => {
 	let cwd = "";
 	let authority: ExactSessionAuthorityFixture;
 	let authorityOptions: ExactSessionAuthorityOptions;
+	let brokerMtimeDelta = 0;
 
 	beforeEach(async () => {
 		tempDir = TempDir.createSync("@acp-transcript-replay-");
@@ -126,6 +127,7 @@ describe("ACP transcript replay degradation", () => {
 		updates = [];
 		attempted = [];
 		loadRejection = undefined;
+		brokerMtimeDelta = 0;
 		agentDir = path.join(tempDir.path(), "agent");
 		cwd = path.join(tempDir.path(), "workspace");
 
@@ -160,7 +162,8 @@ describe("ACP transcript replay degradation", () => {
 										sessionId: authority.sessionId,
 										endpointGeneration: authority.endpointGeneration,
 										pid: authority.pid,
-										endpointMtimeMs: authority.endpointMtimeMs,
+										endpointMtimeMs: authority.endpointMtimeMs + brokerMtimeDelta,
+										endpointFileId: authority.endpointFileId,
 										endpoint: authority.endpoint,
 									}
 								: {};
@@ -307,6 +310,18 @@ describe("ACP transcript replay degradation", () => {
 		else await load;
 		return updates;
 	}
+
+	it("preserves same-inode authority across rounded lifecycle adoption and transcript replay", async () => {
+		brokerMtimeDelta = 0.000244140625;
+		expect(authority.endpointMtimeMs + brokerMtimeDelta).not.toBe(authority.endpointMtimeMs);
+		const replayed = await loadReplayedSession([
+			{ id: "rounded-replay", role: "assistant", body: "Still the indexed session" },
+		]);
+		expect(textChunks(replayed)).toEqual([
+			{ sessionUpdate: "agent_message_chunk", text: "Still the indexed session", messageId: "rounded-replay" },
+		]);
+		expect(skipBoundaries(replayed)).toEqual([]);
+	});
 
 	it("skips a transcript entry without a production body and reports the boundary", async () => {
 		const replayed = await loadReplayedSession([

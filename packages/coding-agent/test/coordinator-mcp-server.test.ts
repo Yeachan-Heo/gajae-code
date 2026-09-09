@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, spyOn } from "bun:test";
 import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
@@ -54,7 +54,7 @@ import {
 	readBrokerDiscovery,
 	writeBrokerDiscovery,
 } from "../src/sdk/broker/discovery";
-import { endpointIncarnation } from "../src/sdk/broker/endpoint-authority";
+import { endpointIncarnation, readEndpointFile } from "../src/sdk/broker/endpoint-authority";
 import {
 	brokerOwnerForTest,
 	type EnsureBrokerSettings,
@@ -336,6 +336,7 @@ async function createSdkControlServer(
 		});
 		session.pid = authority.pid;
 		session.endpointMtimeMs = authority.endpointMtimeMs;
+		session.endpointFileId = authority.endpointFileId;
 	}
 	const seedEstablishedSidecarAuthority = async (): Promise<void> => {
 		const sessionsDirectory = path.join(coordinatorNamespace(root), "sessions");
@@ -480,7 +481,9 @@ async function createSdkControlServer(
 									token: "test-token",
 								}),
 							);
-							const endpointMtimeMs = (await fs.stat(endpointPath)).mtimeMs;
+							const endpointFile = await readEndpointFile(endpointPath);
+							if (!endpointFile) throw new Error("missing created endpoint authority");
+							const endpointMtimeMs = endpointFile.mtimeMs;
 							brokerSessions.push({
 								sessionId,
 								locator: {
@@ -492,6 +495,7 @@ async function createSdkControlServer(
 								endpointGeneration: 1,
 								pid: process.pid,
 								endpointMtimeMs,
+								endpointFileId: `${endpointFile.dev}:${endpointFile.ino}`,
 							});
 							return {
 								ok: true,
@@ -2200,6 +2204,74 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		}
 	});
 
+	for (const scenario of ["rounded", "foreign identity", "stale mtime", "same-mtime replacement"] as const) {
+		it(`checks descriptor-bound endpoint authority before dispatch: ${scenario}`, async () => {
+			const root = await tempRoot();
+			const controls: SdkControl[] = [];
+			const authority = await prepareExactSessionAuthority({
+				agentDir: path.join(root, "agent-global"),
+				cwd: root,
+				sessionId: "visible-session",
+				url: "ws://sdk.example.test",
+				token: "test-token",
+			});
+			const endpointPath = path.join(root, ".gjc", "state", "sdk", "visible-session.json");
+			// Pin a representable timestamp so the one-ULP difference below is
+			// exercised on every filesystem, rather than relying on clock timing.
+			await fs.utimes(endpointPath, 1_700_000_000, 1_700_000_000);
+			const file = await readEndpointFile(endpointPath);
+			if (!file) throw new Error("missing original endpoint authority");
+			const session = {
+				sessionId: authority.sessionId,
+				locator: { cwd: root, worktreeRoot: null, stateRoot: path.join(root, ".gjc", "state") },
+				live: true,
+				endpointGeneration: authority.endpointGeneration,
+				pid: authority.pid,
+				endpointMtimeMs: file.mtimeMs + 0.000244140625,
+				endpointFileId: `${file.dev}:${file.ino}`,
+			};
+			expect(session.endpointMtimeMs).not.toBe(file.mtimeMs);
+			expect(Math.abs(session.endpointMtimeMs - file.mtimeMs)).toBeLessThan(0.001);
+			if (scenario === "stale mtime") session.endpointMtimeMs = file.mtimeMs + 1;
+			if (scenario === "foreign identity" || scenario === "same-mtime replacement") {
+				const successorPath = `${endpointPath}.successor`;
+				await Bun.write(successorPath, file.source);
+				await fs.utimes(successorPath, 1_700_000_000, 1_700_000_000);
+				const successor = await readEndpointFile(successorPath);
+				if (!successor) throw new Error("missing successor endpoint authority");
+				const successorId = `${successor.dev}:${successor.ino}`;
+				expect(successorId).not.toBe(session.endpointFileId);
+				expect(successor.mtimeMs).toBe(file.mtimeMs);
+				if (scenario === "foreign identity") session.endpointFileId = successorId;
+				else await fs.rename(successorPath, endpointPath);
+			}
+			const server = await createSdkControlServer(root, controls, [], undefined, [session], undefined, undefined, {
+				preserveEndpointAuthority: true,
+			});
+			expect(await registerSdkSession(server, root)).toMatchObject({ ok: true });
+			const reconcile = spyOn(server.router, "reconcile");
+			try {
+				const result = await server.callTool("gjc_coordinator_send_prompt", {
+					session_id: "visible-session",
+					prompt: "descriptor-bound dispatch",
+					idempotency_key: `descriptor-${scenario.replaceAll(" ", "-")}`,
+					allow_mutation: true,
+				});
+				expect(reconcile).toHaveBeenCalled();
+				if (scenario === "rounded") {
+					expect(result).toMatchObject({ ok: true });
+					expect(controls.filter(control => control.operation === "turn.prompt")).toHaveLength(1);
+				} else {
+					expect(result).toMatchObject({ ok: false, error: { code: "endpoint_stale" } });
+					expect(server.router.attachment("visible-session", 1)).toBeNull();
+					expect(controls.filter(control => control.operation === "turn.prompt")).toEqual([]);
+				}
+			} finally {
+				reconcile.mockRestore();
+			}
+		});
+	}
+
 	it("derives aggregate liveness from scoped broker records", async () => {
 		const root = await tempRoot();
 		const controls: SdkControl[] = [];
@@ -2617,13 +2689,16 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 							token: "test-token",
 						}),
 					);
+					const endpointFile = await readEndpointFile(endpointPath);
+					if (!endpointFile) throw new Error("missing deferred endpoint authority");
 					brokerSessions.push({
 						sessionId: "created-session-1",
 						locator: { cwd: root, worktreeRoot: null, stateRoot: path.join(root, ".gjc", "state") },
 						live: true,
 						endpointGeneration: 1,
 						pid: process.pid,
-						endpointMtimeMs: (await fs.stat(endpointPath)).mtimeMs,
+						endpointMtimeMs: endpointFile.mtimeMs,
+						endpointFileId: `${endpointFile.dev}:${endpointFile.ino}`,
 					});
 					return {
 						...(result as Record<string, unknown>),
@@ -3576,7 +3651,7 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 	it("uses an incarnation-bound close key for each reaped session incarnation", async () => {
 		const root = await tempRoot();
 		const controls: SdkControl[] = [];
-		const sessions = [
+		const sessions: Array<Record<string, unknown>> = [
 			{
 				sessionId: "visible-session",
 				locator: { cwd: root, worktreeRoot: null, stateRoot: path.join(root, ".gjc", "state") },
@@ -3588,23 +3663,27 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		];
 		const server = await createSdkControlServer(root, controls, undefined, undefined, sessions);
 		const recordPath = path.join(coordinatorNamespace(root), "sessions", "visible-session.json");
-		for (const [registrationKey, endpointMtimeMs] of [
+		for (const [registrationKey, endpointGeneration] of [
 			["reap-first-registration", 1],
 			["reap-second-registration", 2],
 		] as const) {
-			if (sessions.length === 0)
-				sessions.push({
-					sessionId: "visible-session",
-					locator: { cwd: root, worktreeRoot: null, stateRoot: path.join(root, ".gjc", "state") },
-					live: true,
-					endpointGeneration: 1,
-					pid: 101,
-					endpointMtimeMs,
-				});
-			else {
-				sessions[0]!.endpointMtimeMs = endpointMtimeMs;
-				sessions[0]!.endpointGeneration = endpointMtimeMs;
-			}
+			const authority = await prepareExactSessionAuthority({
+				agentDir: path.join(root, "agent-global"),
+				cwd: root,
+				sessionId: "visible-session",
+				url: "ws://sdk.example.test",
+				token: "test-token",
+				endpointGeneration,
+			});
+			sessions[0] = {
+				sessionId: authority.sessionId,
+				locator: { cwd: root, worktreeRoot: null, stateRoot: path.join(root, ".gjc", "state") },
+				live: true,
+				endpointGeneration: authority.endpointGeneration,
+				pid: authority.pid,
+				endpointMtimeMs: authority.endpointMtimeMs,
+				endpointFileId: authority.endpointFileId,
+			};
 			const authorityRecord = (
 				(await Bun.file(recordPath).exists())
 					? JSON.parse(await fs.readFile(recordPath, "utf8"))
@@ -3616,13 +3695,9 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 						}
 			) as Record<string, unknown>;
 			authorityRecord.endpoint_generation = sessions[0]!.endpointGeneration;
-			authorityRecord.endpoint_incarnation = createHash("sha256")
-				.update(
-					`{"endpointGeneration":${sessions[0]!.endpointGeneration},"endpointMtimeMs":${
-						sessions[0]!.endpointMtimeMs
-					},"pid":${sessions[0]!.pid},"sessionId":"visible-session"}`,
-				)
-				.digest("hex");
+			// Registration accepts the verifier only when its complete endpoint
+			// binding matches, including the real descriptor's file identity.
+			authorityRecord.endpoint_incarnation = endpointIncarnation(authority, authority.sessionId);
 			await Bun.write(recordPath, JSON.stringify(authorityRecord));
 			await expect(
 				server.callTool("gjc_coordinator_register_session", {

@@ -1,5 +1,6 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { readEndpointFile } from "../../src/sdk/broker/endpoint-authority";
 import { processIncarnation } from "../../src/sdk/broker/process-incarnation";
 import { type SessionIndexEvent, sessionIndexChecksum } from "../../src/sdk/broker/session-index";
 import { SESSION_INDEX_EVENT_VERSION } from "../../src/sdk/broker/state-version";
@@ -40,13 +41,16 @@ export async function prepareExactSessionAuthority(
 		token: options.token,
 	};
 	await Bun.write(endpointFile, `${JSON.stringify({ version: 1, ...endpoint })}\n`);
-	const stat = await fs.stat(endpointFile, { bigint: true });
+	// Use the host registration's stable no-follow descriptor proof, not a
+	// pathname stat whose numeric mtime can round differently from mtimeNs.
+	const file = await readEndpointFile(endpointFile);
+	if (!file) throw new Error("Fixture endpoint is not a stable regular file");
 	return {
 		sessionId: options.sessionId,
 		endpointGeneration,
 		pid: process.pid,
-		endpointMtimeMs: Number(stat.mtimeNs) / 1_000_000,
-		endpointFileId: `${stat.dev}:${stat.ino}`,
+		endpointMtimeMs: file.mtimeMs,
+		endpointFileId: `${file.dev}:${file.ino}`,
 		endpoint,
 	};
 }
