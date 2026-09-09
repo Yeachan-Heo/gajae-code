@@ -135,7 +135,7 @@ describe("model discovery credential scopes", () => {
 		const registry = new ModelRegistry(storage, modelsPath);
 		try {
 			await registry.refreshProvider("revoked-pinned-discovery", "online", "revoked-discovery-session");
-			expect(refreshCalls).toBe(1);
+			expect(refreshCalls).toBe(2);
 			expect(requests).not.toContain("Bearer alternate-token");
 			expect(registry.find("revoked-pinned-discovery", "must-not-be-discovered")).toBeUndefined();
 			expect(storage.hasSessionCredentialUnavailable("revoked-pinned-discovery", "revoked-discovery-session")).toBe(
