@@ -11,6 +11,13 @@ import { ModelRegistry } from "../src/config/model-registry";
 import { Settings } from "../src/config/settings";
 import { AuthStorage, SqliteAuthCredentialStore } from "../src/session/auth-storage";
 import {
+	formatModelOnboardingGuidance,
+	formatModelOnboardingInlineHint,
+	formatNoCredentialOnboardingError,
+	formatNoModelOnboardingError,
+	formatNoModelsAvailableFallback,
+} from "../src/setup/model-onboarding-guidance";
+import {
 	addApiCompatibleProvider,
 	findProviderPreset,
 	formatProviderPresetList,
@@ -20,6 +27,7 @@ import {
 	redactSecret,
 	validateModelApi,
 } from "../src/setup/provider-onboarding";
+import { formatUnknownBuiltinSlashCommandDiagnostic } from "../src/slash-commands/builtin-registry";
 
 let tempRoot: string | undefined;
 const originalAgentDir = getAgentDir();
@@ -38,6 +46,23 @@ afterEach(async () => {
 		await fs.rm(tempRoot, { recursive: true, force: true });
 		tempRoot = undefined;
 	}
+});
+
+describe("provider onboarding recovery guidance", () => {
+	it("offers manual models or discovery on every custom-provider recovery surface", () => {
+		const command =
+			"/provider add --compat <openai|anthropic> --provider <id> --base-url <url> --api-key-env <ENV> (--model <model> | --discover)";
+		for (const guidance of [
+			formatModelOnboardingGuidance(),
+			formatModelOnboardingInlineHint(),
+			formatNoModelOnboardingError(),
+			formatNoCredentialOnboardingError("custom-provider"),
+			formatNoModelsAvailableFallback(),
+			formatUnknownBuiltinSlashCommandDiagnostic("provicer"),
+		]) {
+			expect(guidance).toContain(command);
+		}
+	});
 });
 
 describe("provider onboarding setup core", () => {
