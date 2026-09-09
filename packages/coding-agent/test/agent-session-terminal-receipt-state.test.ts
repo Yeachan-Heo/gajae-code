@@ -15,6 +15,7 @@ import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { createSdkRunCapability } from "@gajae-code/coding-agent/session/sdk-run-capability-internal";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { logger, TempDir } from "@gajae-code/utils";
+import { z } from "zod";
 import { recordCommittedPromptFailure } from "../src/session/committed-prompt-failure";
 
 const originalStateFile = process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV];
@@ -360,4 +361,77 @@ describe("AgentSession terminal receipt state", () => {
 			expect(persist.mock.calls.some(([event]) => event.sdkRunToken === "forged-token")).toBe(false);
 		});
 	}
+
+	it("persists one lifecycle provenance when SDK steering is consumed mid-run", async () => {
+		// Mid-run steering rebinds the attempt to the attached submitter for reply
+		// routing, but the sidecar must see agent_start and agent_end under the
+		// token the run was accepted with. A drifted terminal fails the sameRun guard
+		// and leaves runtime-state.json running forever.
+		tempDir = TempDir.createSync("@gjc-terminal-steer-provenance-");
+		const stateFile = path.join(tempDir.path(), "runtime-state.json");
+		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
+		process.env[GJC_COORDINATOR_SESSION_ID_ENV] = "terminal-steer-provenance";
+		authStorage = await AuthStorage.create(path.join(tempDir.path(), "auth.db"));
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		const modelRegistry = new ModelRegistry(authStorage);
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected bundled model");
+		const gate = Promise.withResolvers<void>();
+		const toolStarted = Promise.withResolvers<void>();
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: {
+				model,
+				systemPrompt: ["Test"],
+				tools: [
+					{
+						name: "echo",
+						label: "Echo",
+						description: "Echo tool",
+						parameters: z.object({ value: z.string() }),
+						async execute(_toolCallId, params) {
+							toolStarted.resolve();
+							await gate.promise;
+							return { content: [{ type: "text", text: `echoed: ${params.value}` }] };
+						},
+					},
+				],
+				messages: [],
+			},
+			streamFn: createMockModel({
+				responses: [
+					{ content: [{ type: "toolCall", name: "echo", arguments: { value: "first" } }] },
+					{ content: ["steered answer"] },
+				],
+			}).stream,
+		});
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated({ "compaction.enabled": false }),
+			modelRegistry,
+		});
+		const persist = vi.spyOn(sidecar, "persistCoordinatorRuntimeStateFromEvent");
+		const terminal = Promise.withResolvers<void>();
+		session.subscribe(event => {
+			if (event.type === "agent_end") terminal.resolve();
+		});
+		const promptDone = session.prompt("first task", { sdkRunCapability: createSdkRunCapability("original") });
+		await toolStarted.promise;
+		const steerDone = session.sendUserMessage("steer me", {
+			deliverAs: "steer",
+			sdkRunCapability: createSdkRunCapability("attached"),
+		});
+		gate.resolve();
+		await Promise.all([promptDone, steerDone, terminal.promise]);
+		await session.awaitSessionSettlement();
+		await session.awaitCoordinatorRuntimeStatePersistenceForTests();
+		const lifecycle = persist.mock.calls
+			.map(([event]) => event)
+			.filter(event => event.type === "agent_start" || event.type === "agent_end");
+		expect(lifecycle.map(event => event.type)).toEqual(["agent_start", "agent_end"]);
+		expect(lifecycle.map(event => event.sdkRunToken)).toEqual(["original", "original"]);
+		const payload = (await Bun.file(stateFile).json()) as Record<string, unknown>;
+		expect(payload.state).toBe("completed");
+	});
 });

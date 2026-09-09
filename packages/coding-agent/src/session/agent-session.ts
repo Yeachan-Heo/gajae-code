@@ -2665,7 +2665,15 @@ export class AgentSession {
 		if (!domain) return;
 		const events: QueuedInputEvent[] = [];
 		for (const [message, submission] of this.#queuedInputSubmissions) {
-			if (submission.domain !== domain) continue;
+			// A batch is staged at acceptance but only committed at message_start.
+			// If the run fails between the two (e.g. the managed-fallback Cursor
+			// invariant), the dequeued messages are no longer queued, so cancel is
+			// impossible and no commit will ever bind them. Settle them under the
+			// domain that accepted them; no `consumed` is fabricated because the
+			// message never materialized into the run.
+			const staged = submission.scope === undefined ? this.#queuedInputBatches.get(message) : undefined;
+			if ((submission.domain ?? staged?.domain) !== domain) continue;
+			if (staged) this.#queuedInputBatches.delete(message);
 			this.#queuedInputSubmissions.delete(message);
 			events.push({
 				type: "queued_input_terminal",
@@ -2953,6 +2961,7 @@ export class AgentSession {
 			}
 			this.#activeSdkRunToken = sdkRunToken;
 			this.#sdkRunTokensByAttemptScope.set(handle.scope, sdkRunToken);
+			this.#sdkLifecycleTokensByAttemptScope.set(handle.scope, sdkRunToken);
 			const inheritedCohort =
 				predecessorScope !== undefined && predecessorSdkRunToken === sdkRunToken
 					? this.#sdkRunCohortsByAttemptScope.get(predecessorScope)
@@ -3269,6 +3278,13 @@ export class AgentSession {
 	#skipPostPromptRecoveryWaitByAttemptScope = new WeakSet<AttemptScope>();
 	#sdkRunTokensByAttemptScope = new WeakMap<AttemptScope, string>();
 	#sdkRunCohortsByAttemptScope = new WeakMap<AttemptScope, string[]>();
+	/**
+	 * The token an attempt was accepted with. Mid-run steering rebinds
+	 * `#sdkRunTokensByAttemptScope` to the attached submitter so replies route to it,
+	 * but the sidecar keys `agent_start`/`agent_end` of one logical run by a single
+	 * provenance; that identity must not drift with in-run consumption.
+	 */
+	#sdkLifecycleTokensByAttemptScope = new WeakMap<AttemptScope, string>();
 	#activeSdkRunToken: string | undefined;
 	#activeAttemptScope: AttemptScope | undefined;
 	#attemptAuthority!: AttemptScopeAuthority;
@@ -5123,6 +5139,8 @@ export class AgentSession {
 					promotion.startsOwnRun !== true
 				) {
 					this.#sdkRunTokensByAttemptScope.set(this.#activeAttemptScope, consumedSdkRunToken);
+					if (!this.#sdkLifecycleTokensByAttemptScope.has(this.#activeAttemptScope))
+						this.#sdkLifecycleTokensByAttemptScope.set(this.#activeAttemptScope, consumedSdkRunToken);
 					this.#skipPostPromptRecoveryWaitByAttemptScope.add(this.#activeAttemptScope);
 					this.#activeSdkRunToken = consumedSdkRunToken;
 				}
@@ -5154,6 +5172,8 @@ export class AgentSession {
 				promotion.startsOwnRun !== true
 			) {
 				this.#sdkRunTokensByAttemptScope.set(this.#activeAttemptScope, consumedSdkRunToken);
+				if (!this.#sdkLifecycleTokensByAttemptScope.has(this.#activeAttemptScope))
+					this.#sdkLifecycleTokensByAttemptScope.set(this.#activeAttemptScope, consumedSdkRunToken);
 				this.#skipPostPromptRecoveryWaitByAttemptScope.add(this.#activeAttemptScope);
 				this.#activeSdkRunToken = consumedSdkRunToken;
 			}
@@ -6098,7 +6118,14 @@ export class AgentSession {
 	#coordinatorToolObservations = new WeakMap<object, CoordinatorToolObservation>();
 	#agentEventAdmission = new WeakMap<
 		object,
-		{ scope?: AttemptScope; sdkRunToken?: string; persistGeneration: number; persistBarrier?: Promise<void> }
+		{
+			scope?: AttemptScope;
+			sdkRunToken?: string;
+			/** Stable identity for sidecar lifecycle provenance; survives in-run steering rebinds. */
+			sdkLifecycleToken?: string;
+			persistGeneration: number;
+			persistBarrier?: Promise<void>;
+		}
 	>();
 
 	/**
@@ -6159,6 +6186,8 @@ export class AgentSession {
 		this.#agentEventAdmission.set(event, {
 			scope: this.#activeAttemptScope,
 			sdkRunToken: event.scope === undefined ? undefined : this.#sdkRunTokensByAttemptScope.get(event.scope),
+			sdkLifecycleToken:
+				event.scope === undefined ? undefined : this.#sdkLifecycleTokensByAttemptScope.get(event.scope),
 			persistGeneration: this.#coordinatorPersistGeneration,
 			persistBarrier: this.#coordinatorRescopeBarrier,
 		});
@@ -6414,7 +6443,12 @@ export class AgentSession {
 		propagateFailure: boolean,
 	): Promise<"completed" | "skipped"> {
 		try {
-			const sdkRunToken = this.#agentEventAdmission.get(event)?.sdkRunToken;
+			// Provenance is the token the attempt was accepted with, not the submitter
+			// currently attached by steering: one logical run must persist agent_start
+			// and agent_end under one identity or the sidecar's sameRun guard rejects
+			// the terminal and leaves runtime-state permanently running.
+			const admission = this.#agentEventAdmission.get(event);
+			const sdkRunToken = admission?.sdkLifecycleToken ?? admission?.sdkRunToken;
 			const persistedEvent =
 				sdkRunToken !== undefined &&
 				(event.type === "agent_start" ||

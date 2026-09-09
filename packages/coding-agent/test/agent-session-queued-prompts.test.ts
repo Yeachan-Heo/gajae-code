@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import * as path from "node:path";
 import type { AgentMessage } from "@gajae-code/agent-core";
 import { Agent } from "@gajae-code/agent-core";
-import { getBundledModel, type TextContent } from "@gajae-code/ai";
+import { type CursorToolResultHandler, getBundledModel, type TextContent } from "@gajae-code/ai";
 import { createMockModel, type MockHandler } from "@gajae-code/ai/providers/mock";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
@@ -15,6 +15,7 @@ import {
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { TempDir } from "@gajae-code/utils";
+import { z } from "zod";
 
 function isRetryableRemoveError(error: unknown): boolean {
 	if (typeof error !== "object" || error === null) return false;
@@ -885,4 +886,112 @@ describe("AgentSession queued prompts (issue #434)", () => {
 			expect(submission.cancel()).toBe(false);
 		});
 	}
+
+	it("settles an accepted follow-up when the run terminates before message_start", async () => {
+		// Acceptance stages the dequeued batch; message_start commits it. A run that
+		// fails between the two leaves the message neither queued nor committed:
+		// cancel is impossible and no commit will bind it. The terminal must still
+		// settle it. Drive the real gap: `ManagedCursorInvariantError` fires right
+		// after acceptance when a managed-fallback attempt starts with buffered
+		// provider-side tool results left behind by the previous run.
+		const primary = getBundledModel("anthropic", "claude-sonnet-4-5");
+		const fallback = getBundledModel("openai", "gpt-4o-mini");
+		if (!primary || !fallback) throw new Error("Expected bundled test models");
+		// Root run: a real tool call. The provider-side Cursor hook fires while the
+		// LOCAL tool runs, and the run is then aborted before any further assistant
+		// message_end can split the buffered result out — as an interrupted remote
+		// turn leaves it. The buffer survives into the next run.
+		const toolStarted = Promise.withResolvers<void>();
+		const echoSchema = z.object({ value: z.string() });
+		const mock = createMockModel({
+			responses: [
+				{ content: [{ type: "toolCall", name: "echo", arguments: { value: "first" } }] },
+				{ content: ["never reached"] },
+			],
+		});
+		let cursorHook: CursorToolResultHandler | undefined;
+		const agent = new Agent({
+			getApiKey: provider => `${provider}-test-key`,
+			initialState: {
+				model: primary,
+				systemPrompt: ["Test"],
+				tools: [
+					{
+						name: "echo",
+						label: "Echo",
+						description: "Echo tool",
+						parameters: echoSchema,
+						async execute(_toolCallId, params) {
+							await cursorHook?.({
+								role: "toolResult",
+								toolCallId: "remote-call",
+								toolName: "remote",
+								content: [{ type: "text", text: "remote-result" }],
+								isError: false,
+								timestamp: Date.now(),
+							});
+							toolStarted.resolve();
+							return { content: [{ type: "text", text: `echoed: ${params.value}` }] };
+						},
+					},
+				],
+				messages: [],
+			},
+			cursorOnToolResult: async message => message,
+			streamFn: (model, context, options) => {
+				cursorHook ??= options?.cursorOnToolResult;
+				return mock.stream(model, context, options);
+			},
+		});
+		const settings = Settings.isolated({ "compaction.enabled": false });
+		settings.setModelRole("default", `${primary.provider}/${primary.id}`);
+		session = new AgentSession({ agent, sessionManager: SessionManager.inMemory(), settings, modelRegistry });
+		const events: AgentSessionEvent[] = [];
+		session.subscribe(event => events.push(event));
+		const root = session.prompt("root");
+		await toolStarted.promise;
+		session.abort();
+		await root;
+		await session.waitForIdle();
+		// Follow-up delivery requires an assistant tail; the interrupted remote
+		// turn's assistant reply lands here without a further stream call, so the
+		// buffered Cursor result is never split out.
+		agent.appendMessage({
+			role: "assistant",
+			content: [{ type: "text", text: "interrupted" }],
+			api: primary.api,
+			provider: primary.provider,
+			model: primary.id,
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "stop",
+			timestamp: Date.now(),
+		});
+		// Promote the queued follow-up under a managed-fallback chain: acceptance
+		// stages the batch, then `ManagedCursorInvariantError` fires on the
+		// buffered result before the loop materializes any message_start.
+		session.setConfiguredModelChain(
+			"default",
+			[`${primary.provider}/${primary.id}`, `${fallback.provider}/${fallback.id}`],
+			"test",
+		);
+		const submission = await session.submitQueuedInput("staged", { mode: "followUp" });
+		await session.waitForIdle();
+		expect(events.filter(event => event.type === "queued_input_consumed")).toEqual([]);
+		expect(events.filter(event => event.type === "queued_input_removed")).toEqual([]);
+		const terminals = events.filter(
+			(event): event is Extract<QueuedInputEvent, { type: "queued_input_terminal" }> =>
+				event.type === "queued_input_terminal",
+		);
+		expect(terminals.map(event => event.submissionId)).toEqual([submission.submissionId]);
+		expect(terminals[0]?.terminal.type).toBe("agent_end");
+		expect(session.agent.hasQueuedMessages()).toBe(false);
+		expect(submission.cancel()).toBe(false);
+	});
 });
