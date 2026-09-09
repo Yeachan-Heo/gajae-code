@@ -44,6 +44,11 @@ DEV_REPO_ROOT=""
 DEV_REQUESTED=0
 SOURCE_REQUESTED=0
 BINARY_REQUESTED=0
+OFFER_RUNTIME_DIR=""
+OFFER_RUNTIME_ACTIVE=""
+OFFER_RUNTIME_SIGNAL=""
+OFFER_RUNTIME_PID=""
+OFFER_RUNTIME_RETAIN=""
 
 usage() {
     cat <<'EOF'
@@ -100,13 +105,86 @@ cleanup() {
     if [ -n "$SOURCE_CLONE_DIR" ] && [ -d "$SOURCE_CLONE_DIR" ]; then
         rm -rf "$SOURCE_CLONE_DIR"
     fi
+    if [ -z "$OFFER_RUNTIME_ACTIVE" ] && [ -z "$OFFER_RUNTIME_RETAIN" ] && [ -n "$OFFER_RUNTIME_DIR" ] && [ -d "$OFFER_RUNTIME_DIR" ]; then
+        chmod 700 "$OFFER_RUNTIME_DIR" 2>/dev/null || true
+        rm -rf "$OFFER_RUNTIME_DIR" || true
+    fi
     return 0
 }
 
 trap cleanup EXIT
-trap 'cleanup; exit 130' INT
-trap 'cleanup; exit 143' TERM
-trap 'cleanup; exit 129' HUP
+forward_offer_signal() {
+    [ -z "$OFFER_RUNTIME_SIGNAL" ] || return 0
+    OFFER_RUNTIME_SIGNAL="$1"
+}
+handle_int() { if [ -n "$OFFER_RUNTIME_ACTIVE" ]; then forward_offer_signal INT; else cleanup; exit 130; fi; }
+handle_term() { if [ -n "$OFFER_RUNTIME_ACTIVE" ]; then forward_offer_signal TERM; else cleanup; exit 143; fi; }
+handle_hup() { if [ -n "$OFFER_RUNTIME_ACTIVE" ]; then forward_offer_signal HUP; else cleanup; exit 129; fi; }
+trap handle_int INT
+trap handle_term TERM
+trap handle_hup HUP
+
+# Only direct commands run here: never a shell function/pipeline with unowned
+# grandchildren. The runtime itself owns and reaps its app-install helpers.
+# A signal in the asynchronous launch/PID assignment gap is latched and replayed.
+run_offer_command() {
+    offer_budget="$1"
+    shift
+    [ -z "$OFFER_RUNTIME_SIGNAL" ] || return 1
+    "$@" <&0 &
+    OFFER_RUNTIME_PID=$!
+    offer_signal_delivered=""
+    offer_elapsed=0
+    offer_cancel_elapsed=0
+    offer_timed_out=""
+    while kill -0 "$OFFER_RUNTIME_PID" 2>/dev/null; do
+        if [ -n "$OFFER_RUNTIME_SIGNAL" ] && [ -z "$offer_signal_delivered" ]; then
+            kill -s "$OFFER_RUNTIME_SIGNAL" "$OFFER_RUNTIME_PID" 2>/dev/null || true
+            offer_signal_delivered=1
+        fi
+        if [ -n "$OFFER_RUNTIME_SIGNAL" ] || [ -n "$offer_timed_out" ]; then
+            if [ "$offer_cancel_elapsed" -ge 8 ]; then
+                kill -KILL "$OFFER_RUNTIME_PID" 2>/dev/null || true
+                # Reaping the direct child after KILL does not prove its
+                # descendants completed cleanup. Keep their runtime available.
+                OFFER_RUNTIME_RETAIN=1
+                break
+            fi
+            offer_cancel_elapsed=$((offer_cancel_elapsed + 1))
+        elif [ "$offer_elapsed" -ge "$offer_budget" ]; then
+            offer_timed_out=1
+            kill -TERM "$OFFER_RUNTIME_PID" 2>/dev/null || true
+        fi
+        # POSIX sleep, with at most one second of signal-dispatch latency.
+        sleep 1
+        offer_elapsed=$((offer_elapsed + 1))
+    done
+    offer_status=0
+    wait "$OFFER_RUNTIME_PID" 2>/dev/null || offer_status=$?
+    OFFER_RUNTIME_PID=""
+    [ -z "$OFFER_RUNTIME_SIGNAL" ] && [ -z "$offer_timed_out" ] && [ "$offer_status" -eq 0 ]
+}
+
+prepare_community_app_runtime() {
+    [ ! -L "$DEST_PATH" ] && [ -f "$DEST_PATH" ] || return 1
+    run_offer_command 30 cp -p "$DEST_PATH" "$OFFER_RUNTIME" || return 1
+    run_offer_command 30 chmod 500 "$OFFER_RUNTIME" || return 1
+    # Reuse the authenticated release digest, not the mutable installed path or
+    # a second network request. A replacement during copy must fail this check.
+    if command -v sha256sum >/dev/null 2>&1; then
+        run_offer_command 30 sha256sum "$OFFER_RUNTIME" > "$OFFER_RUNTIME_DIR/digest" || return 1
+        read -r offer_digest offer_rest < "$OFFER_RUNTIME_DIR/digest" || return 1
+    elif command -v shasum >/dev/null 2>&1; then
+        run_offer_command 30 shasum -a 256 "$OFFER_RUNTIME" > "$OFFER_RUNTIME_DIR/digest" || return 1
+        read -r offer_digest offer_rest < "$OFFER_RUNTIME_DIR/digest" || return 1
+    else
+        run_offer_command 30 openssl dgst -sha256 -r "$OFFER_RUNTIME" > "$OFFER_RUNTIME_DIR/digest" || return 1
+        read -r offer_digest offer_rest < "$OFFER_RUNTIME_DIR/digest" || return 1
+    fi
+    [ "$offer_digest" = "$VERIFIED_RELEASE_SHA256" ] || return 1
+    run_offer_command 30 chmod 500 "$OFFER_RUNTIME_DIR" || return 1
+    run_offer_command 30 "$OFFER_RUNTIME" --supports-macos-community-app </dev/null >/dev/null 2>&1
+}
 
 remember_tmp() {
     TMP_FILES="${TMP_FILES}$1
@@ -373,6 +451,21 @@ require_bun_version() {
 Install or upgrade Bun yourself: https://bun.sh/docs/installation
 This installer never downloads Bun."
     fi
+}
+
+community_app_offer_suppressed() {
+    no_offer=$(printf '%s' "${GJC_NO_COMMUNITY_APP:-}" | tr '[:upper:]' '[:lower:]')
+    case "$no_offer" in
+        1|true|yes|on) return 0 ;;
+    esac
+    for marker in "${CI:-}" "${GITHUB_ACTIONS:-}" "${GJC_NONINTERACTIVE:-}"; do
+        normalized_marker=$(printf '%s' "$marker" | tr '[:upper:]' '[:lower:]')
+        case "$normalized_marker" in
+            ""|0|false|no|off) ;;
+            *) return 0 ;;
+        esac
+    done
+    return 1
 }
 
 detect_platform() {
@@ -684,6 +777,7 @@ install_binary() {
     fi
 
     verify_checksum "$BINARY" "$DOWNLOAD_TMP"
+    VERIFIED_RELEASE_SHA256="$expected"
     chmod +x "$DOWNLOAD_TMP"
 
     if [ -h "$DEST_PATH" ]; then
@@ -712,6 +806,43 @@ install_binary() {
 
     echo ""
     echo "Installed gjc ${EXPECTED_VERSION} to ${DEST_PATH}"
+
+    # The verified runtime owns the optional macOS community-app flow so fresh
+    # installs and `gjc update` share the same supply-chain checks. The offer is
+    # strictly best-effort and must never change a successful GJC install.
+    if [ "$PLATFORM" = "darwin" ] && ! community_app_offer_suppressed; then
+        # mktemp runs under the ordinary exit-on-signal traps. Do not intercept
+        # termination until preparation can launch tracked, bounded commands.
+        OFFER_RUNTIME_DIR=$(mktemp -d "${INSTALL_DIR}/.gjc-community-app.XXXXXX" 2>/dev/null || true)
+        OFFER_RUNTIME="${OFFER_RUNTIME_DIR}/gjc"
+        if [ -n "$OFFER_RUNTIME_DIR" ]; then
+            OFFER_RUNTIME_ACTIVE=1
+            if prepare_community_app_runtime; then
+                if [ -t 1 ] && [ -r /dev/tty ]; then
+                    run_offer_command 1800 "$OFFER_RUNTIME" --internal-macos-community-app-offer < /dev/tty || true
+                else
+                    run_offer_command 1800 "$OFFER_RUNTIME" --internal-macos-community-app-offer || true
+                fi
+            fi
+            if [ -n "$OFFER_RUNTIME_RETAIN" ]; then
+                echo "Optional community-app cleanup was forced; retained runtime at ${OFFER_RUNTIME_DIR}. GJC remains installed." >&2
+            else
+                chmod 700 "$OFFER_RUNTIME_DIR" 2>/dev/null || true
+                rm -rf "$OFFER_RUNTIME_DIR" || true
+                OFFER_RUNTIME_DIR=""
+            fi
+        fi
+        OFFER_SIGNAL_EXIT=0
+        case "$OFFER_RUNTIME_SIGNAL" in
+            INT) OFFER_SIGNAL_EXIT=130 ;;
+            TERM) OFFER_SIGNAL_EXIT=143 ;;
+            HUP) OFFER_SIGNAL_EXIT=129 ;;
+        esac
+        if [ "$OFFER_SIGNAL_EXIT" -ne 0 ]; then
+            exit "$OFFER_SIGNAL_EXIT"
+        fi
+        OFFER_RUNTIME_ACTIVE=""
+    fi
 
     case ":$PATH:" in
         *":$INSTALL_DIR:"*) echo "Run 'gjc' to get started!" ;;

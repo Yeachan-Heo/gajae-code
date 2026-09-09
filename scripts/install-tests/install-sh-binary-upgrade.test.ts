@@ -544,6 +544,193 @@ describe("install.sh binary-first contract", () => {
 		expect(installer).toContain('ARCH="arm64"');
 	});
 
+	for (const phase of ["copy", "hash", "probe", "offer", "uncooperative-offer"] as const) {
+		for (const [signal, exitCode] of [["SIGTERM", 143], ["SIGINT", 130], ["SIGHUP", 129]] as const) {
+			test(`owns and reaps ${phase} on ${signal}, retaining the successful core install`, async () => {
+				const markerPath = path.join(sandbox.root, "offer-marker");
+				const signalPath = path.join(sandbox.root, "offer-signal");
+				const blocker = path.join(sandbox.root, "blocker.py");
+				fs.writeFileSync(blocker, `import os, signal, sys, time
+runtime = sys.argv[1]
+def stop(signum, frame):
+    with open(os.environ["GJC_TEST_OFFER_SIGNAL"], "a") as log:
+        log.write(signal.Signals(signum).name + "\\n")
+    if os.environ["GJC_TEST_PHASE"] != "uncooperative-offer":
+        time.sleep(1.5)
+        sys.exit(0)
+for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+    signal.signal(sig, stop)
+with open(os.environ["GJC_TEST_OFFER_MARKER"], "w") as marker:
+    marker.write(str(os.getpid()) + "|" + runtime)
+while True:
+    time.sleep(1)
+`);
+				const payload = `#!/bin/sh
+if [ "$1" = "--version" ]; then echo "gjc/${VERSION}"; exit 0; fi
+if [ "$1" = "--smoke-test" ]; then exit 0; fi
+if [ "$1" = "--supports-macos-community-app" ]; then
+  if [ "$GJC_TEST_PHASE" = probe ]; then exec python3 "$GJC_TEST_BLOCKER" "$0"; fi
+  exit 0
+fi
+if [ "$1" = "--internal-macos-community-app-offer" ]; then
+  exec python3 "$GJC_TEST_BLOCKER" "$0"
+fi
+exit 1
+`;
+				const shims: Record<string, string> = {
+					uname: '#!/bin/sh\nif [ "$1" = "-s" ]; then echo Darwin; else echo x86_64; fi\n',
+					cp: `#!/bin/sh
+case "$3" in
+  */.gjc-community-app.*/gjc)
+    if [ "$GJC_TEST_PHASE" = copy ]; then
+      /bin/cp "$@" || exit 1
+      exec python3 "$GJC_TEST_BLOCKER" "$3"
+    fi ;;
+esac
+exec /bin/cp "$@"
+`,
+					sha256sum: `#!/bin/sh
+case "$1" in
+  */.gjc-community-app.*/gjc)
+    if [ "$GJC_TEST_PHASE" = hash ]; then exec python3 "$GJC_TEST_BLOCKER" "$1"; fi ;;
+esac
+exec python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest(), sys.argv[1])' "$1"
+`,
+				};
+				for (const [name, content] of Object.entries(shims)) {
+					fs.writeFileSync(path.join(sandbox.shimDir, name), content, { mode: 0o755 });
+				}
+				writeCurlShim(sandbox.shimDir, {
+					assets: {
+						"gjc-darwin-x64": payload,
+						"gajae-release-binaries.sha256": `${sha256(payload)}  gjc-darwin-x64\n`,
+					},
+				});
+				const installer = Bun.spawn(["sh", installScript], {
+					env: {
+						...process.env,
+						PATH: `${sandbox.shimDir}:/usr/bin:/bin`,
+						GJC_INSTALL_DIR: sandbox.installDir,
+						HOME: sandbox.root,
+						GITHUB_TOKEN: "",
+						GH_TOKEN: "",
+						CI: "false",
+						GITHUB_ACTIONS: "false",
+						GJC_NONINTERACTIVE: "false",
+						GJC_NO_COMMUNITY_APP: "false",
+						GJC_TEST_PHASE: phase,
+						GJC_TEST_BLOCKER: blocker,
+						GJC_TEST_OFFER_MARKER: markerPath,
+						GJC_TEST_OFFER_SIGNAL: signalPath,
+					},
+					stdout: "pipe",
+					stderr: "pipe",
+				});
+				const stdout = new Response(installer.stdout).text();
+				const stderr = new Response(installer.stderr).text();
+				let runtimePid: number | undefined;
+				try {
+					let marker = "";
+					for (let attempt = 0; attempt < 400; attempt++) {
+						marker = fs.existsSync(markerPath) ? fs.readFileSync(markerPath, "utf8").trim() : "";
+						if (marker.includes("|")) break;
+						await Bun.sleep(50);
+					}
+					expect(marker).toContain("|");
+					const [pidText, runtimePath] = marker.split("|");
+					runtimePid = Number(pidText);
+					expect(fs.existsSync(runtimePath)).toBe(true);
+					process.kill(installer.pid, signal);
+					for (let attempt = 0; attempt < 60 && !fs.existsSync(signalPath); attempt++) {
+						await Bun.sleep(50);
+					}
+					expect(fs.existsSync(signalPath)).toBe(true);
+					process.kill(installer.pid, signal === "SIGTERM" ? "SIGHUP" : "SIGTERM");
+					await Bun.sleep(100);
+					expect(fs.existsSync(runtimePath)).toBe(true);
+					const result = await Promise.race([
+						installer.exited,
+						Bun.sleep(12_000).then(() => "cancellation deadline exceeded"),
+					]);
+					expect(result).toBe(exitCode);
+					expect(() => process.kill(runtimePid!, 0)).toThrow();
+					expect(fs.existsSync(runtimePath)).toBe(phase === "uncooperative-offer");
+					expect(fs.readFileSync(signalPath, "utf8").trim()).toBe(signal);
+					expect(fs.readFileSync(path.join(sandbox.installDir, "gjc"), "utf8")).toBe(payload);
+					if (phase === "uncooperative-offer") {
+						expect(fs.readdirSync(sandbox.installDir).sort()).toEqual([path.basename(path.dirname(runtimePath)), "gjc"].sort());
+						expect(await stderr).toContain("retained runtime");
+					} else {
+						expect(fs.readdirSync(sandbox.installDir)).toEqual(["gjc"]);
+					}
+					expect(await stdout).toContain(`Installed gjc ${VERSION}`);
+					await stderr;
+				} finally {
+					if (runtimePid) {
+						try { process.kill(runtimePid, "SIGKILL"); } catch {}
+					}
+					if (installer.exitCode === null) installer.kill("SIGKILL");
+					await installer.exited;
+					for (const name of fs.readdirSync(sandbox.installDir)) {
+						if (name.startsWith(".gjc-community-app.")) fs.chmodSync(path.join(sandbox.installDir, name), 0o700);
+					}
+				}
+			}, 40_000);
+		}
+	}
+
+	for (const scenario of ["supported", "unsupported", "replacement", "suppressed"] as const) {
+		test(`optional runtime ${scenario} preserves core success and executes only a verified snapshot`, async () => {
+			const marker = path.join(sandbox.root, "runtime-calls");
+			const payload = `#!/bin/sh
+if [ "$1" = "--version" ]; then echo "gjc/${VERSION}"; exit 0; fi
+if [ "$1" = "--smoke-test" ]; then exit 0; fi
+printf '%s\\n' "$1" >> "$GJC_TEST_CALLS"
+if [ "$1" = "--supports-macos-community-app" ]; then
+  [ "$GJC_TEST_SCENARIO" != unsupported ]; exit $?
+fi
+if [ "$1" = "--internal-macos-community-app-offer" ]; then exit 0; fi
+exit 1
+`;
+			fs.writeFileSync(path.join(sandbox.shimDir, "uname"),
+				'#!/bin/sh\nif [ "$1" = "-s" ]; then echo Darwin; else echo x86_64; fi\n', { mode: 0o755 });
+			// Replace only the test snapshot copy, after core verification. Neither
+			// the attacker's capability hook nor its offer hook may be executed.
+			const replacement = path.join(sandbox.root, "unverified");
+			fs.writeFileSync(replacement, '#!/bin/sh\necho unverified >> "$GJC_TEST_CALLS"\nexit 0\n');
+			fs.writeFileSync(path.join(sandbox.shimDir, "cp"), `#!/bin/sh
+case "$3" in
+  */.gjc-community-app.*/gjc)
+    if [ "$GJC_TEST_SCENARIO" = replacement ]; then exec /bin/cp "$GJC_TEST_REPLACEMENT" "$3"; fi ;;
+esac
+exec /bin/cp "$@"
+`, { mode: 0o755 });
+			writeCurlShim(sandbox.shimDir, {
+				assets: {
+					"gjc-darwin-x64": payload,
+					"gajae-release-binaries.sha256": `${sha256(payload)}  gjc-darwin-x64\n`,
+				},
+			});
+			const result = await runInstaller([], {
+				CI: "false",
+				GITHUB_ACTIONS: "false",
+				GJC_NONINTERACTIVE: "false",
+				GJC_NO_COMMUNITY_APP: scenario === "suppressed" ? "true" : "false",
+				GJC_TEST_SCENARIO: scenario,
+				GJC_TEST_CALLS: marker,
+				GJC_TEST_REPLACEMENT: replacement,
+			});
+			expect(result.exitCode).toBe(0);
+			expect(result.stdout).toContain(`Installed gjc ${VERSION}`);
+			expect(fs.readFileSync(path.join(sandbox.installDir, "gjc"), "utf8")).toBe(payload);
+			expect(fs.readdirSync(sandbox.installDir)).toEqual(["gjc"]);
+			const calls = fs.existsSync(marker) ? fs.readFileSync(marker, "utf8").trim().split("\n") : [];
+			expect(calls).toEqual(scenario === "supported"
+				? ["--supports-macos-community-app", "--internal-macos-community-app-offer"]
+				: scenario === "unsupported" ? ["--supports-macos-community-app"] : []);
+		}, 20_000);
+	}
+
 	test("follows redirects and fail-closes checksum fetch except HTTP 404", async () => {
 		const installer = await Bun.file(installScript).text();
 		expect(installer).toContain("curl -sSL");

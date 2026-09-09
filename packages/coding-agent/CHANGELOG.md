@@ -1,6 +1,10 @@
 # Changelog
 
 ## [Unreleased]
+
+### Added
+
+- Successful macOS installs and updates can offer the optional experimental, third-party community Gajae Code App (#5140), defaulting to No. The shared installer requires canonical release checksums and a verified bundle/signature, skips installed apps and automation, and supports `GJC_NO_COMMUNITY_APP=1`; app failures leave GJC installed.
 ### Fixed
 - CLI startup now preserves saved account pins when handing authentication to the SDK. Catalog refreshes with a session use its effective credential pin, preventing a cached free OpenAI Codex account catalog from hiding Astra or Sol during paid-account profile startup. Generic injected SDK authentication keeps its existing isolation, and persisted session selections retain precedence over global pins.
 

@@ -3,8 +3,9 @@ import * as fsNode from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { VERSION } from "@gajae-code/utils";
-import type { BinaryUpdateFlow } from "../src/cli/update-cli";
+import { logger, VERSION } from "@gajae-code/utils";
+import { offerMacosCommunityApp } from "../src/cli/macos-community-app";
+import type { BinaryUpdateFlow, UpdateCommandDependencies } from "../src/cli/update-cli";
 import {
 	assertSupportedLinuxLibcForTest,
 	buildReleaseBinaryUrlForTest,
@@ -72,6 +73,173 @@ describe("verified binary invocation formatting", () => {
 		expect(formatVerifiedBinaryInvocation("/my bin/O'Brien/‘’‚‛;$HOME`id`/gjc", platform)).toBe(
 			"'/my bin/O'\\''Brien/‘’‚‛;$HOME`id`/gjc'",
 		);
+describe("macOS community app integration", () => {
+	const release = { tag: "v999.0.0", version: "999.0.0", registry: DEFAULT_NPM_REGISTRY, warnings: [] };
+
+	it.each(["binary", "migrate"] as const)("offers once after successful %s recovery and defaults", async method => {
+		await initTheme();
+		const root = await makeTempDir();
+		const calls: string[] = [];
+		await runUpdateCommand(
+			{ force: false, check: false },
+			{
+				platform: "darwin",
+				getLatestRelease: async () => release,
+				resolveUpdateTarget: async () => ({ method, path: path.join(root, "gjc") }),
+				verifyMigrationTarget: async () => ({ ok: false }),
+				performUpdate: async () => {
+					calls.push("install");
+					return { ok: true, path: path.join(root, "gjc") };
+				},
+				runPostUpdateRecovery: async () => {
+					calls.push("recovery");
+				},
+				refreshInstalledDefaultSkills: async () => {
+					calls.push("defaults");
+				},
+				offerMacosCommunityApp: async deps => {
+					expect(deps?.platform).toBe("darwin");
+					expect(fsNode.existsSync(path.join(root, ".gjc-install.lock"))).toBe(false);
+					calls.push("offer");
+					return { status: "skipped", reason: "declined" };
+				},
+				recordTelemetryEvent: () => {},
+			},
+		);
+		expect(calls).toEqual(["install", "recovery", "defaults", "offer"]);
+	});
+
+	it.each([false, true])("reused migration releases its lock before offering; check=%s", async check => {
+		await initTheme();
+		const root = await makeTempDir();
+		const lock = path.join(root, ".gjc-install.lock");
+		const calls: string[] = [];
+		await runUpdateCommand(
+			{ force: false, check },
+			{
+				platform: "darwin",
+				getLatestRelease: async () => release,
+				resolveUpdateTarget: async () => ({ method: "migrate", path: path.join(root, "gjc") }),
+				verifyMigrationTarget: async () => {
+					expect(fsNode.existsSync(lock)).toBe(!check);
+					calls.push("verify");
+					return { ok: true };
+				},
+				performUpdate: async () => {
+					throw new Error("unexpected install");
+				},
+				runPostUpdateRecovery: async () => {
+					throw new Error("unexpected recovery");
+				},
+				refreshInstalledDefaultSkills: async () => {
+					throw new Error("unexpected defaults");
+				},
+				offerMacosCommunityApp: async () => {
+					expect(fsNode.existsSync(lock)).toBe(false);
+					calls.push("offer");
+					return { status: "skipped", reason: "declined" };
+				},
+				recordTelemetryEvent: () => {},
+			},
+		);
+		expect(calls).toEqual(check ? ["verify"] : ["verify", "offer"]);
+		expect(fsNode.existsSync(lock)).toBe(false);
+	});
+
+	it.each([
+		"linux",
+		"check",
+		"up-to-date",
+		"failed",
+		"throw",
+		"suppressed",
+	] as const)("preserves update behavior for %s", async scenario => {
+		await initTheme();
+		let offers = 0;
+		const events: string[] = [];
+		const warnings: string[] = [];
+		const warning = vi.spyOn(logger, "warn").mockImplementation(message => {
+			warnings.push(String(message));
+		});
+		const exit = new Error("exit");
+		const deps: UpdateCommandDependencies = {
+			platform: scenario === "linux" ? "linux" : "darwin",
+			getLatestRelease: async () => (scenario === "up-to-date" ? { ...release, version: "0.0.1" } : release),
+			resolveUpdateTarget: async () => ({ method: "binary", path: "/verified/gjc" }),
+			performUpdate: async () => {
+				if (scenario === "failed") throw new Error("core update failed");
+				return { ok: true, path: "/verified/gjc" };
+			},
+			runPostUpdateRecovery: async () => {},
+			refreshInstalledDefaultSkills: async () => {},
+			offerMacosCommunityApp: async options => {
+				offers++;
+				if (scenario === "throw") throw new Error("optional failure");
+				const result = await offerMacosCommunityApp({
+					...options,
+					env: { GJC_NO_COMMUNITY_APP: "1" },
+					prompt: async () => {
+						throw new Error("must not prompt");
+					},
+					fetchImpl: async () => {
+						throw new Error("must not fetch");
+					},
+				});
+				expect(result).toEqual({ status: "skipped", reason: "suppressed by environment" });
+				return result;
+			},
+			recordTelemetryEvent: event => {
+				events.push(event);
+			},
+			exit: () => {
+				throw exit;
+			},
+		};
+		try {
+			const result = runUpdateCommand({ force: false, check: scenario === "check" }, deps);
+			if (scenario === "failed") await expect(result).rejects.toBe(exit);
+			else await result;
+			expect(offers).toBe(scenario === "throw" || scenario === "suppressed" ? 1 : 0);
+			if (scenario === "throw") {
+				expect(events).toContain("update_install_completed");
+				expect(events).not.toContain("update_install_failed");
+				expect(warnings.join("\n")).toContain("optional failure");
+				expect(warnings.join("\n")).toContain("https://github.com/devswha/gajae-code-app");
+			}
+		} finally {
+			warning.mockRestore();
+		}
+	});
+
+	it("dispatches only exact single-argument capability and internal offer flags", async () => {
+		const { runCli } = await import("../src/cli");
+		const stdout: string[] = [];
+		const write = vi.spyOn(process.stdout, "write").mockImplementation(chunk => {
+			stdout.push(String(chunk));
+			return true;
+		});
+		try {
+			await runCli(["--supports-macos-community-app"]);
+			expect(stdout.join("")).toBe("macos-community-app-offer\n");
+		} finally {
+			write.mockRestore();
+		}
+		for (const args of [
+			["--supports-macos-community-app", "--help"],
+			["--supports-macos-community-app=yes", "--help"],
+			["--internal-macos-community-app-offer", "--help"],
+			["--internal-macos-community-app-offer"],
+		]) {
+			const result = Bun.spawnSync([process.execPath, "src/cli.ts", ...args], {
+				cwd: path.join(repoRoot, "packages/coding-agent"),
+				env: { ...process.env, GJC_NO_COMMUNITY_APP: "1" },
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			expect(result.exitCode).toBe(0);
+			expect(result.stdout.toString()).not.toContain("macos-community-app-offer\n");
+			if (args.length > 1) expect(result.stdout.toString()).toContain("USAGE");
+		}
 	});
 });
 

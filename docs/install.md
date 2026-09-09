@@ -126,6 +126,31 @@ gjc --version
 
 A stale Bash command hash can retain the Bun shim even when `type -a gjc` lists the standalone binary first. Clearing that hash can activate the standalone binary without any PATH edit. Only if resolution still selects another install should you check aliases/functions and ensure the standalone directory precedes the shim directory on PATH. On PowerShell, inspect `Get-Command gjc -All` and `where.exe gjc`, and invoke the printed binary path with `& 'path/to/gjc.exe'`. No shim removal is required.
 
+## Optional macOS community app
+
+After a successful macOS binary install or update, GJC may offer:
+
+```text
+Install Gajae Code App (experimental, community-built)? [y/N]
+```
+
+The default is **No**. This optional, third-party app is experimental, separately
+licensed, and community-maintained at <https://github.com/devswha/gajae-code-app>;
+it is not an official first-party support offering. The shared installer skips
+existing verified app bundles in user-local or system Applications locations.
+Only interactive terminals are eligible: CI, pipes, automation, non-macOS hosts,
+and `gjc update --check` never prompt. Set `GJC_NO_COMMUNITY_APP=1` to suppress the
+offer for unattended or repeated installs.
+
+An accepted offer uses only a canonical published GitHub Release DMG and its
+SHA-256 checksum. If no canonical release exists, installation fails closed;
+there is no fallback to Actions artifacts, source execution, or raw builds.
+GJC verifies the bundle identity, architecture, and pinned Developer ID signature,
+copies to a writable Applications location, safely detaches the image, and launches
+with macOS `open`. It never implicitly uses `sudo`, disables Gatekeeper, removes
+quarantine, or bypasses licensing or signature checks. App-specific failures are
+reported with the community repository URL and do not fail the successful GJC
+install or update.
 ## Retry configuration
 
 Provider retry budgets live in `~/.gjc/config.yml`:
