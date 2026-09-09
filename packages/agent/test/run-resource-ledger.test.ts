@@ -443,3 +443,64 @@ test("scheduler ownership fences dependency waits and tool hooks", async () => {
 	expect(afterCalls).toBe(1);
 	expect(await ledger.waitForSettlement("tool-run", { graceMs: 25 })).toEqual({ status: "settled" });
 });
+
+test("aborted tool output does not release discovery or execution before real settlement", async () => {
+	const ledger = createRunResourceLedger();
+	const started = Promise.withResolvers<void>();
+	const release = Promise.withResolvers<void>();
+	const controller = new AbortController();
+	const schema = z.object({});
+	const tool: AgentTool<typeof schema, Record<string, never>> = {
+		name: "delayed",
+		label: "Delayed",
+		description: "Retains real work after cancellation",
+		parameters: schema,
+		async execute() {
+			started.resolve();
+			await release.promise;
+			return { content: [{ type: "text", text: "late result" }] };
+		},
+	};
+	const model = createMockModel({
+		responses: [{ content: [{ type: "toolCall", id: "aborted-tool", name: "delayed", arguments: {} }] }],
+	});
+	const convertToLlm = (messages: AgentMessage[]): Message[] =>
+		messages.filter(
+			(message): message is Message =>
+				message.role === "user" || message.role === "assistant" || message.role === "toolResult",
+		);
+	const stream = agentLoop(
+		[createUserMessage("run")],
+		{ systemPrompt: [], messages: [], tools: [tool] },
+		{ model: model.model, convertToLlm, resourceLedger: ledger, resourceRunId: "aborted-run" },
+		controller.signal,
+		model.stream,
+	);
+	let abortedResult = false;
+	let terminal = false;
+	const draining = (async () => {
+		for await (const event of stream) {
+			if (event.type === "tool_execution_end") abortedResult = event.isError;
+			if (event.type === "agent_end") terminal = true;
+		}
+	})();
+	try {
+		await started.promise;
+		controller.abort();
+		await draining;
+		expect(abortedResult).toBe(true);
+		expect(terminal).toBe(true);
+		const pending = await ledger.waitForSettlement("aborted-run", { graceMs: 1 });
+		expect(pending).toMatchObject({ status: "unfenced", reason: "resources_pending" });
+		if (pending.status === "unfenced") {
+			expect(pending.pending.filter(entry => entry.kind === "tool").map(entry => entry.label)).toEqual([
+				"delayed:aborted-tool",
+				"delayed:aborted-tool",
+			]);
+		}
+	} finally {
+		release.resolve();
+		await draining;
+	}
+	expect(await ledger.waitForSettlement("aborted-run", { graceMs: 100 })).toEqual({ status: "settled" });
+});

@@ -6,6 +6,7 @@ import packageJson from "../package.json" with { type: "json" };
 import { AcpAgent } from "../src/modes/acp/acp-agent";
 import { AcpSdkAdapter } from "../src/sdk/acp/adapter";
 import { writeBrokerDiscovery } from "../src/sdk/broker/discovery";
+import { SdkClientError } from "../src/sdk/client";
 import {
 	type ExactSessionAuthorityFixture,
 	type ExactSessionAuthorityOptions,
@@ -39,6 +40,8 @@ type Fixture = {
 	sendIdle(): void;
 	dispose(): void;
 	queryCalls: string[];
+	turnResultInputs: unknown[];
+	invocationOperations: string[];
 	blockedAdvisoryQueryCount(): number;
 	releaseBlockedAdvisoryQueries(): void;
 	releaseIdleUpdate(): void;
@@ -96,6 +99,10 @@ async function createFixture(
 		reusePromptCorrelationOnSecond?: boolean;
 		failBrokerSessionClose?: boolean;
 		observeTerminalReservation?: boolean;
+		turnResult?: Record<string, unknown>;
+		turnResultUnavailable?: boolean;
+		turnResultStalled?: boolean;
+		turnResultError?: { code: string; message: string };
 	} = {},
 ): Promise<Fixture> {
 	const tempDir = TempDir.createSync("@sdk-acp-prompt-terminal-");
@@ -107,6 +114,8 @@ async function createFixture(
 	const turnId = "prompt-terminal-turn";
 	const updates: SessionNotification[] = [];
 	const queryCalls: string[] = [];
+	const turnResultInputs: unknown[] = [];
+	const invocationOperations: string[] = [];
 	const blockedAdvisoryQueries: Array<{ socket: TestSocket; id: string; result: unknown }> = [];
 	const idleUpdateRelease = Promise.withResolvers<void>();
 	const idleUpdateEntered = Promise.withResolvers<void>();
@@ -264,6 +273,23 @@ async function createFixture(
 				}
 				if (frame.type === "query_request") {
 					queryCalls.push(String(frame.query));
+					if (frame.query === "turn.result") {
+						turnResultInputs.push(frame.input);
+						if (options.turnResultStalled) return;
+						socket.send(
+							JSON.stringify({
+								type: "query_response",
+								id: frame.id,
+								ok: !options.turnResultUnavailable && !options.turnResultError,
+								...(options.turnResultError
+									? { error: options.turnResultError }
+									: options.turnResultUnavailable
+										? { error: { code: "session_unavailable", message: "live session query unavailable" } }
+										: { result: options.turnResult ?? { status: "unknown", receiptState: "unknown" } }),
+							}),
+						);
+						return;
+					}
 					const items =
 						frame.query === "config.list/get"
 							? [{ mode: "default", model: "openai/gpt", thinking: "medium" }]
@@ -290,7 +316,8 @@ async function createFixture(
 					return;
 				}
 				if (frame.type !== "control_request") return;
-				if (frame.operation === "turn.prompt") {
+				if (frame.operation === "turn.prompt" || frame.operation === "skill.invoke") {
+					invocationOperations.push(String(frame.operation));
 					promptSocket = socket;
 					promptDeliveries++;
 					delivered.resolve();
@@ -312,7 +339,7 @@ async function createFixture(
 					id: frame.id,
 					ok: true,
 					result:
-						frame.operation === "turn.prompt"
+						frame.operation === "turn.prompt" || frame.operation === "skill.invoke"
 							? (options.promptAcknowledgement ?? { ...activeCorrelation(), accepted: true })
 							: frame.operation === "turn.abort"
 								? (options.abortAcknowledgement ??
@@ -468,6 +495,8 @@ async function createFixture(
 		sendAssistantMessage,
 		sendIdle,
 		queryCalls,
+		turnResultInputs,
+		invocationOperations,
 		blockedAdvisoryQueryCount: () => blockedAdvisoryQueries.length,
 		releaseBlockedAdvisoryQueries: () => {
 			for (const blocked of blockedAdvisoryQueries.splice(0))
@@ -2126,3 +2155,314 @@ test("ACP activity idle alone does not settle a prompt", async () => {
 		fixture.dispose();
 	}
 });
+
+for (const scenario of [
+	"terminal",
+	"failed",
+	"failure_detail",
+	"empty_content",
+	"blank_content",
+	"cancelled",
+	"refusal",
+	"max_tokens",
+	"max_turn_requests",
+	"pending",
+	"unknown",
+	"missing",
+	"mismatch",
+	"unavailable",
+	"stalled",
+] as const) {
+	test(`ACP uncertain abort recovery reads exact status without replay: ${scenario}`, async () => {
+		const explicitStop =
+			scenario === "cancelled" ||
+			scenario === "refusal" ||
+			scenario === "max_tokens" ||
+			scenario === "max_turn_requests";
+		let recover: ((error: SdkClientError) => void) | undefined;
+		const subscribe = AcpSdkAdapter.prototype.onReconnectFailed;
+		const subscription = vi.spyOn(AcpSdkAdapter.prototype, "onReconnectFailed").mockImplementation(function (
+			this: AcpSdkAdapter,
+			handler,
+		) {
+			recover = handler;
+			return subscribe.call(this, handler);
+		});
+		const fixture = await createFixture({
+			abortAcknowledgement: { ok: false, reason: "resources_pending" },
+			turnResultUnavailable: scenario === "unavailable",
+			turnResultStalled: scenario === "stalled",
+			turnResult: {
+				commandId: scenario === "mismatch" ? "another-command" : "prompt-terminal-command",
+				turnId: "prompt-terminal-turn",
+				status:
+					scenario === "pending"
+						? "in_flight"
+						: scenario === "unknown"
+							? "unknown"
+							: scenario === "failed" || scenario === "failure_detail"
+								? "failed"
+								: "terminal_ok",
+				receiptState:
+					scenario === "missing" || explicitStop ? "missing" : scenario === "pending" ? "absent" : "present",
+				content:
+					scenario === "empty_content" || explicitStop
+						? undefined
+						: { version: 1, type: "text", text: scenario === "blank_content" ? " \n " : "Recovered result" },
+				error: { code: "provider_rejected", message: "Provider rejected execution." },
+				outcome:
+					scenario === "failure_detail"
+						? undefined
+						: scenario === "failed"
+							? {
+									kind: "failed",
+									code: "prompt_failed",
+									message: "aborted tool failed",
+									provenance: "agent_failed",
+								}
+							: { kind: "stopped", reason: explicitStop ? scenario : "end_turn", provenance: "agent" },
+			},
+		});
+		try {
+			const pending = prompt(fixture, "abort with pending resource settlement");
+			void pending.catch(() => undefined);
+			await bounded(fixture.promptDelivered, "prompt delivery");
+			fixture.sendTerminal({
+				type: "tool_execution_start",
+				sessionId: fixture.sessionId,
+				commandId: "prompt-terminal-command",
+				turnId: "prompt-terminal-turn",
+				toolCallId: "aborted-tool",
+				toolName: "bash",
+				args: { command: "offline regression" },
+			});
+			await expect(fixture.agent.cancel({ sessionId: fixture.sessionId })).rejects.toBeDefined();
+			fixture.sendTerminal({
+				type: "agent_failed",
+				sessionId: fixture.sessionId,
+				commandId: "prompt-terminal-command",
+				turnId: "prompt-terminal-turn",
+				error: { code: "terminal_uncertain", message: "resources_pending" },
+			});
+			// A diagnostic failure after abort cannot supply an authoritative outcome.
+			await Bun.sleep(30);
+			expect(recover).toBeDefined();
+			recover!(new SdkClientError("uncertain_after_send", "mutation outcome uncertain"));
+			recover!(new SdkClientError("uncertain_after_send", "repeated heartbeat failure"));
+			if (scenario === "terminal" || explicitStop)
+				expect(await bounded(pending, "status recovery")).toEqual({
+					stopReason: explicitStop ? scenario : "end_turn",
+				});
+			else
+				await expect(bounded(pending, "bounded uncertain recovery")).rejects.toMatchObject({
+					code:
+						scenario === "failed"
+							? "prompt_failed"
+							: scenario === "failure_detail"
+								? "provider_rejected"
+								: "terminal_uncertain",
+				});
+			expect(fixture.queryCalls.filter(query => query === "turn.result")).toHaveLength(1);
+			expect(fixture.promptDeliveryCount()).toBe(1);
+		} finally {
+			fixture.dispose();
+			subscription.mockRestore();
+		}
+	});
+}
+
+for (const race of ["replacement", "authoritative_terminal"] as const) {
+	test(`ACP pending status recovery cannot override ${race} after its deadline`, async () => {
+		let recover: ((error: SdkClientError) => void) | undefined;
+		const subscribe = AcpSdkAdapter.prototype.onReconnectFailed;
+		const subscription = vi.spyOn(AcpSdkAdapter.prototype, "onReconnectFailed").mockImplementation(function (
+			this: AcpSdkAdapter,
+			handler,
+		) {
+			recover = handler;
+			return subscribe.call(this, handler);
+		});
+		const fixture = await createFixture({ turnResultStalled: true, failBrokerSessionClose: race === "replacement" });
+		try {
+			const first = prompt(fixture, "status recovery race");
+			void first.catch(() => undefined);
+			await bounded(fixture.promptDelivered, "initial prompt delivery");
+			await Bun.sleep(30);
+			recover!(new SdkClientError("uncertain_after_send", "uncertain mutation"));
+			await waitFor(() => fixture.queryCalls.includes("turn.result"), "pending status query");
+			if (race === "replacement") {
+				await expect(fixture.agent.closeSession({ sessionId: fixture.sessionId })).rejects.toMatchObject({
+					code: "terminal_uncertain",
+				});
+				expect(await bounded(first, "retired prompt")).toEqual({ stopReason: "cancelled" });
+				await fixture.agent.loadSession({ sessionId: fixture.sessionId, cwd: fixture.cwd, mcpServers: [] });
+			} else {
+				fixture.sendStopped("refusal");
+				expect(await bounded(first, "authoritative ingress terminal")).toEqual({ stopReason: "refusal" });
+			}
+			let replacementSettled = false;
+			const replacement = prompt(fixture, "replacement prompt");
+			void replacement.then(
+				() => {
+					replacementSettled = true;
+				},
+				() => {
+					replacementSettled = true;
+				},
+			);
+			await waitFor(() => fixture.promptDeliveryCount() === 2, "replacement delivery");
+			// Allow the original five-second status deadline to reject. It must neither
+			// retire this attachment nor settle a successor that owns a new correlation.
+			await Bun.sleep(5_100);
+			expect(replacementSettled).toBe(false);
+			fixture.sendStopped("end_turn");
+			expect(await bounded(replacement, "successor terminal")).toEqual({ stopReason: "end_turn" });
+			expect(fixture.queryCalls.filter(query => query === "turn.result")).toHaveLength(1);
+			expect(fixture.promptDeliveryCount()).toBe(2);
+		} finally {
+			fixture.dispose();
+			subscription.mockRestore();
+		}
+	});
+}
+
+for (const scenario of ["skill", "wrong_kind", "sensitive_error"] as const) {
+	test(`ACP recovery preserves invocation kind and bounded query diagnostics: ${scenario}`, async () => {
+		let recover: ((error: SdkClientError) => void) | undefined;
+		const subscribe = AcpSdkAdapter.prototype.onReconnectFailed;
+		const subscription = vi.spyOn(AcpSdkAdapter.prototype, "onReconnectFailed").mockImplementation(function (
+			this: AcpSdkAdapter,
+			handler,
+		) {
+			recover = handler;
+			return subscribe.call(this, handler);
+		});
+		const secret = `Bearer private-token /private/transcript ${"sensitive".repeat(1_000)}`;
+		const fixture = await createFixture({
+			turnResultError: scenario === "sensitive_error" ? { code: "session_unavailable", message: secret } : undefined,
+			turnResult: {
+				kind: scenario === "wrong_kind" ? "prompt" : "skill",
+				commandId: "prompt-terminal-command",
+				turnId: "prompt-terminal-turn",
+				status: "terminal_ok",
+				receiptState: "present",
+				content: { version: 1, type: "text", text: "Skill result" },
+				outcome: { kind: "stopped", reason: "end_turn", provenance: "agent" },
+			},
+		});
+		try {
+			const pending = prompt(fixture, "/skill:review inspect");
+			void pending.catch(() => undefined);
+			await bounded(fixture.promptDelivered, "skill dispatch");
+			await Bun.sleep(30);
+			recover!(new SdkClientError("uncertain_after_send", secret));
+			if (scenario === "skill") {
+				expect(await bounded(pending, "skill recovery")).toEqual({ stopReason: "end_turn" });
+			} else {
+				const error = await bounded(
+					pending.then(
+						() => undefined,
+						error => error,
+					),
+					"recovery rejection",
+				);
+				expect(error).toMatchObject({ code: "terminal_uncertain" });
+				expect(error.message).toContain("kind=skill");
+				expect(error.message).not.toContain("private-token");
+				expect(error.message).not.toContain("/private/transcript");
+				expect(error.message.length).toBeLessThan(512);
+				if (scenario === "sensitive_error") expect(error.message).toContain("status query unavailable");
+			}
+			expect(fixture.turnResultInputs).toEqual([
+				{ kind: "skill", commandId: "prompt-terminal-command", turnId: "prompt-terminal-turn" },
+			]);
+			expect(fixture.invocationOperations).toEqual(["skill.invoke"]);
+		} finally {
+			fixture.dispose();
+			subscription.mockRestore();
+		}
+	});
+}
+
+for (const scenario of [
+	"prompt_failed",
+	"prompt_deadline_exceeded",
+	"error_detail",
+	"accepted",
+	"in_flight",
+	"unknown",
+	"absent_receipt",
+	"missing_receipt_field",
+] as const) {
+	test(`ACP separates failed execution from unknown receipt availability: ${scenario}`, async () => {
+		let recover: ((error: SdkClientError) => void) | undefined;
+		const subscribe = AcpSdkAdapter.prototype.onReconnectFailed;
+		const subscription = vi.spyOn(AcpSdkAdapter.prototype, "onReconnectFailed").mockImplementation(function (
+			this: AcpSdkAdapter,
+			handler,
+		) {
+			recover = handler;
+			return subscribe.call(this, handler);
+		});
+		const authoritative =
+			scenario === "prompt_failed" || scenario === "prompt_deadline_exceeded" || scenario === "error_detail";
+		const classifier =
+			scenario === "error_detail"
+				? "provider_rejected"
+				: scenario === "prompt_deadline_exceeded"
+					? scenario
+					: "prompt_failed";
+		const fixture = await createFixture({
+			turnResult: {
+				kind: "prompt",
+				commandId: "prompt-terminal-command",
+				turnId: "prompt-terminal-turn",
+				status: scenario === "accepted" || scenario === "in_flight" || scenario === "unknown" ? scenario : "failed",
+				receiptState:
+					scenario === "absent_receipt" ? "absent" : scenario === "missing_receipt_field" ? undefined : "unknown",
+				error: { code: classifier, message: "Execution failed." },
+				outcome:
+					scenario === "error_detail"
+						? undefined
+						: {
+								kind: "failed",
+								code: classifier,
+								message: "Execution failed.",
+								provenance: scenario === "prompt_deadline_exceeded" ? "deadline" : "agent_failed",
+							},
+			},
+		});
+		try {
+			const pending = prompt(fixture, "failed execution without receipt");
+			void pending.catch(() => undefined);
+			await bounded(fixture.promptDelivered, "initial dispatch");
+			if (!authoritative) fixture.sendDiagnostic();
+			await Bun.sleep(30);
+			recover!(new SdkClientError("uncertain_after_send", "uncertain transport"));
+			await expect(bounded(pending, "failed status recovery")).rejects.toMatchObject({
+				code: authoritative ? classifier : "terminal_uncertain",
+				...(authoritative ? { message: "Execution failed." } : {}),
+			});
+			expect(fixture.turnResultInputs).toEqual([
+				{ kind: "prompt", commandId: "prompt-terminal-command", turnId: "prompt-terminal-turn" },
+			]);
+			expect(fixture.invocationOperations).toEqual(["turn.prompt"]);
+			expect(fixture.updates.filter(update => update.update.sessionUpdate === "agent_message_chunk")).toEqual([]);
+			if (authoritative) {
+				// A new prompt on the same attachment proves unknown receipt availability
+				// did not invoke failSession/teardown. This is new work, not a replay.
+				const successor = prompt(fixture, "distinct successor");
+				void successor.catch(() => undefined);
+				await waitFor(() => fixture.promptDeliveryCount() === 2, "same attachment successor");
+				fixture.sendStopped("refusal");
+				expect(await bounded(successor, "successor terminal")).toEqual({ stopReason: "refusal" });
+				expect(fixture.turnResultInputs).toHaveLength(1);
+				expect(fixture.invocationOperations).toEqual(["turn.prompt", "turn.prompt"]);
+				expect(fixture.updates.filter(update => update.update.sessionUpdate === "agent_message_chunk")).toEqual([]);
+			}
+		} finally {
+			fixture.dispose();
+			subscription.mockRestore();
+		}
+	});
+}

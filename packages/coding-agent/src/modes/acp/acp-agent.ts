@@ -116,6 +116,7 @@ const ACP_SESSION_READINESS_TIMEOUT_MS = ACP_MCP_LIFECYCLE_TIMEOUT_MS;
 type JsonObject = Record<string, unknown>;
 interface PromptWaiter {
 	acknowledged: boolean;
+	invocationKind: "prompt" | "skill";
 	/** True once turn.prompt / skill.invoke has been sent; cancel must not fake-settle after this. */
 	dispatched: boolean;
 	/** True only while the dispatched control request can still reveal its correlation. */
@@ -198,6 +199,8 @@ type SessionRecord = {
 	/** Replayable startup notice captured before ACP bootstrap; emitted once after the session id is known. */
 	routingInactiveNotice?: string;
 	activePrompt?: PromptWaiter;
+	/** One bounded read-only reconciliation per attachment and prompt. */
+	statusRecovery?: PromptWaiter;
 	/** Set by `session/cancel` so an in-flight prompt settles as `cancelled`, never as an error. */
 	cancelRequested?: boolean;
 };
@@ -1727,6 +1730,7 @@ export class AcpAgent implements Agent {
 		record.publicationGeneration++;
 		const { promise: response, resolve, reject } = Promise.withResolvers<PromptResponse>();
 		const waiter: PromptWaiter = {
+			invocationKind: skillInvocation ? "skill" : "prompt",
 			acknowledged: false,
 			dispatched: false,
 			acknowledgementPending: false,
@@ -2546,6 +2550,13 @@ export class AcpAgent implements Agent {
 	#recoverSessionAfterTransportFailure(id: string, adapter: AcpSdkAdapter, error: Error): void {
 		const record = this.#sessions.get(id);
 		if (!record || record.adapter !== adapter) return;
+		if (error instanceof SdkClientError && error.code === "uncertain_after_send") {
+			const waiter = record.activePrompt;
+			if (!waiter || waiter.settled || waiter.terminalReserved || record.statusRecovery === waiter) return;
+			record.statusRecovery = waiter;
+			void this.#recoverUncertainPrompt(id, record, waiter);
+			return;
+		}
 		if (
 			error instanceof SdkClientError &&
 			error.code !== "reconnect_exhausted" &&
@@ -2563,6 +2574,118 @@ export class AcpAgent implements Agent {
 		const detail = error.message || "SDK transport reconnect failed.";
 		const terminal = new AcpSdkAdapterError("connection_closed", `ACP session transport was lost: ${detail}`);
 		void this.#recoverSessionAfterTransportFailureAsync(id, adapter, record.cwd, terminal);
+	}
+
+	async #recoverUncertainPrompt(id: string, record: SessionRecord, waiter: PromptWaiter): Promise<void> {
+		// Never resend the mutation, use local agent_end, or interpret process liveness
+		// as a cleanup fence. Only the exact host reconciliation record owns a result.
+		let detail = "missing complete prompt correlation";
+		let timer: NodeJS.Timeout | undefined;
+		let timedOut = false;
+		try {
+			if (waiter.acknowledged && hasCompleteCorrelation(waiter.correlation)) {
+				const deadline = Promise.withResolvers<never>();
+				timer = setTimeout(() => {
+					timedOut = true;
+					deadline.reject(new Error("status query timeout"));
+				}, 5_000);
+				const response = object(
+					await Promise.race([
+						record.adapter.query("turn.result", { kind: waiter.invocationKind, ...waiter.correlation }),
+						deadline.promise,
+					]),
+				);
+				if (this.#sessions.get(id) !== record || promptWaiterRetired(record, waiter) || waiter.terminalReserved)
+					return;
+				const status = object(response?.result) ?? response;
+				const correlation = status ? strictCorrelationFrom(status) : undefined;
+				const outcome = status ? terminalOutcome(status) : undefined;
+				const content = object(status?.content);
+				const readableText =
+					content?.version === 1 &&
+					content.type === "text" &&
+					typeof content.text === "string" &&
+					content.text.trim().length > 0;
+				const failure = object(status?.error);
+				if (
+					(status?.kind !== undefined && status.kind !== waiter.invocationKind) ||
+					!correlation ||
+					!hasCompleteCorrelation(correlation) ||
+					!correlationsExactlyMatch(waiter.correlation, correlation)
+				) {
+					detail =
+						status?.status === "unknown"
+							? "operation status is unknown"
+							: "status correlation is missing or mismatched";
+				} else if (
+					status?.status === "failed" &&
+					status.outcome === undefined &&
+					(status.receiptState === "present" ||
+						status.receiptState === "missing" ||
+						status.receiptState === "unknown") &&
+					typeof failure?.code === "string" &&
+					/^[a-zA-Z0-9_.-]{1,64}$/.test(failure.code) &&
+					typeof failure.message === "string" &&
+					failure.message.trim().length > 0 &&
+					failure.message.length <= 512
+				) {
+					record.busy = record.backgroundBusy;
+					this.#advanceTerminalGeneration(record);
+					await this.#rejectPrompt(record, id, waiter, new AcpSdkAdapterError(failure.code, failure.message));
+					return;
+				} else if (
+					(status?.status === "terminal_ok" &&
+						outcome?.kind === "stopped" &&
+						(status.receiptState === "present" || status.receiptState === "missing") &&
+						(outcome.reason !== "end_turn" || (status.receiptState === "present" && readableText))) ||
+					(status?.status === "failed" &&
+						outcome?.kind === "failed" &&
+						(status.receiptState === "present" ||
+							status.receiptState === "missing" ||
+							status.receiptState === "unknown"))
+				) {
+					record.busy = record.backgroundBusy;
+					this.#advanceTerminalGeneration(record);
+					waiter.terminal = { outcome, correlation };
+					this.#settlePrompt(id, record, waiter);
+					this.#scheduleTerminalUpdates(
+						id,
+						record.adapter,
+						record.publicationGeneration,
+						{
+							type: outcome.kind === "failed" ? "agent_failed" : "agent_end",
+							outcome,
+							finalText: readableText ? content.text : undefined,
+						},
+						waiter,
+					);
+					return;
+				} else if (status?.status === "accepted" || status?.status === "in_flight") {
+					detail = "execution or resource cleanup is still pending";
+				} else if (status?.status === "unknown") {
+					detail = "operation status is unknown";
+				} else if (status?.status === "failed") {
+					detail = "execution failed but its terminal outcome or receipt is unavailable";
+				} else if (status?.receiptState === "missing") {
+					detail = "terminal execution has no retrievable receipt";
+				} else {
+					detail = "terminal status lacks a fenced outcome or readable non-empty receipt";
+				}
+			}
+		} catch {
+			detail = timedOut ? "status query timed out after 5000ms" : "status query unavailable";
+		} finally {
+			if (timer !== undefined) clearTimeout(timer);
+		}
+		if (this.#sessions.get(id) !== record || promptWaiterRetired(record, waiter) || waiter.terminalReserved) return;
+		await this.#failSession(
+			id,
+			record.adapter,
+			new AcpSdkAdapterError(
+				"terminal_uncertain",
+				`ACP prompt outcome remains uncertain: ${detail}. No mutation was replayed. Inspect turn.result for kind=${waiter.invocationKind}, commandId=${waiter.correlation.commandId ?? "unknown"}, turnId=${waiter.correlation.turnId ?? "unknown"} before submitting more work.`,
+			),
+		);
 	}
 
 	async #recoverSessionAfterTransportFailureAsync(
