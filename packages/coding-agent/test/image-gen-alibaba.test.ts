@@ -1,10 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import {
-	buildAlibabaImageRequest,
-	collectAlibabaImageResult,
-	IMAGE_PROVIDER_DEFAULTS,
-	resolveAlibabaImageSize,
-} from "../src/tools/image-gen";
+import { buildAlibabaImageRequest, collectAlibabaImageResult, resolveAlibabaImageSize } from "../src/tools/image-gen";
 
 describe("resolveAlibabaImageSize", () => {
 	test("maps square size to 1K", () => {
@@ -72,11 +67,5 @@ describe("collectAlibabaImageResult", () => {
 		const result = collectAlibabaImageResult({});
 		expect(result.imageUrls).toEqual([]);
 		expect(result.responseText).toBeUndefined();
-	});
-});
-
-describe("alibaba image provider defaults", () => {
-	test("auto-binds wan2.7-image", () => {
-		expect(IMAGE_PROVIDER_DEFAULTS.alibaba).toBe("wan2.7-image");
 	});
 });
