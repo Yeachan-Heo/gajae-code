@@ -718,9 +718,13 @@ interface LivePullRequest {
 	body: string | null;
 	baseRefName: string;
 	author: { login: string } | null;
-	headRefOid: string;
 	headRepositoryOwner: { login: string } | null;
-	reviews: { author: { login: string } | null; state: string; commit: { oid: string } | null }[];
+}
+
+interface LiveReview {
+	author: { login: string } | null;
+	state: string;
+	commit: { oid: string } | null;
 }
 
 /**
@@ -776,7 +780,7 @@ async function validatePushPreflight(branch: string, headSha: string, remote: st
 	// The head is qualified by the owner actually receiving the push, so a same-named
 	// branch in another fork can never be mistaken for this PR.
 	const headOwner = forkOwner ?? pushRepo.split("/")[0]!;
-	const listed = await gh(["pr", "list", "--repo", baseRepo, "--head", branch, "--state", "open", "--json", "number,body,baseRefName,author,reviews,headRefOid,headRepositoryOwner"], cwd);
+	const listed = await gh(["pr", "list", "--repo", baseRepo, "--head", branch, "--state", "open", "--json", "number,body,baseRefName,author,headRepositoryOwner"], cwd);
 	if (listed.exitCode !== 0) {
 		return { ok: false, diagnostics: [`Could not resolve the open PR for ${branch} in ${baseRepo}: ${listed.stderr || `gh exited ${listed.exitCode}`}. Authenticate with gh auth login, or set GJC_SKIP_PR_PREFLIGHT=1 to push without the contract check.`] };
 	}
@@ -792,6 +796,15 @@ async function validatePushPreflight(branch: string, headSha: string, remote: st
 	}
 	const pr = candidates[0];
 	if (!pr) return { ok: true, diagnostics: [] };
+	// gh pr list's JSON mapping omits headRefOid and review commit oids on older gh
+	// releases (e.g. 2.4.x), which would fail closed on every push, so the head and
+	// the review commits are resolved through the stable `gh api` surface instead.
+	const currentHead = await gh(["api", `repos/${baseRepo}/pulls/${pr.number}`, "--jq", ".head.sha"], cwd);
+	if (currentHead.exitCode !== 0) {
+		return { ok: false, diagnostics: [`Could not resolve the current head of ${baseRepo}#${pr.number}: ${currentHead.stderr || `gh exited ${currentHead.exitCode}`}.`] };
+	}
+	const prHeadSha = currentHead.stdout.trim();
+	if (!SHA40.test(prHeadSha)) return { ok: false, diagnostics: [`Current head of ${baseRepo}#${pr.number} (${prHeadSha}) is not a lowercase 40-hex commit.`] };
 	// The base is the repository the PR was queried in -- for a fork push that is the
 	// upstream, never the contributor's local origin/dev. The ref is the PR's own base
 	// branch rather than an assumed "dev".
@@ -811,9 +824,22 @@ async function validatePushPreflight(branch: string, headSha: string, remote: st
 	// Latest non-COMMENTED review per identity on the exact head, matching the server's
 	// "effective review" semantics: a later CHANGES_REQUESTED supersedes an earlier APPROVED.
 	const parsedVerdict = parsePrVerdict(body).verdict;
+	// Review commit oids come from `gh api` because `gh pr list` omits them on older gh.
+	let reviews: LiveReview[] = [];
+	if (parsedVerdict?.verdict === "merge-approved") {
+		const liveReviews = await gh(["api", `repos/${baseRepo}/pulls/${pr.number}/reviews`, "--jq", "[.[] | {author: {login: .user.login}, state, commit: {oid: .commit_id}}]"], cwd);
+		if (liveReviews.exitCode !== 0) {
+			return { ok: false, diagnostics: [`Could not fetch the reviews of ${baseRepo}#${pr.number} to verify the exact-head approval: ${liveReviews.stderr || `gh exited ${liveReviews.exitCode}`}.`] };
+		}
+		try {
+			reviews = JSON.parse(liveReviews.stdout) as LiveReview[];
+		} catch (error) {
+			return { ok: false, diagnostics: [`Could not parse the review list of ${baseRepo}#${pr.number}: ${error instanceof Error ? error.message : String(error)}`] };
+		}
+	}
 	const approval = ((): { login?: string; headSha?: string } => {
 		if (parsedVerdict?.verdict !== "merge-approved") return {};
-		const effective = (pr.reviews ?? [])
+		const effective = reviews
 			.filter(review =>
 				review.author?.login?.toLowerCase() === parsedVerdict.reviewerId.toLowerCase()
 				&& review.state !== "COMMENTED"
@@ -827,7 +853,7 @@ async function validatePushPreflight(branch: string, headSha: string, remote: st
 		baseRef: pr.baseRefName,
 		baseSha,
 		headSha,
-		// The push is what MAKES headSha the PR head, so pr.headRefOid is the pre-push
+		// The push is what MAKES headSha the PR head, so prHeadSha is the pre-push
 		// value and is expected to differ; it is reported, never used as the contract head.
 		authorLogin: pr.author?.login ?? "",
 		computedDiffSha256: canonicalDiffSha256(diff.stdout),
@@ -840,7 +866,7 @@ async function validatePushPreflight(branch: string, headSha: string, remote: st
 	});
 	const diagnostics = [...bodyRiskParsed.diagnostics, ...result.diagnostics];
 	if (diagnostics.length > 0) {
-		diagnostics.push(`This is exactly what the Dev CI "PR contract bootstrap" job will report for ${baseRepo}#${pr.number} once ${headSha} lands (currently ${pr.headRefOid}); the exact ${baseSha}...${headSha} digest is ${canonicalDiffSha256(diff.stdout)}.`);
+		diagnostics.push(`This is exactly what the Dev CI "PR contract bootstrap" job will report for ${baseRepo}#${pr.number} once ${headSha} lands (currently ${prHeadSha}); the exact ${baseSha}...${headSha} digest is ${canonicalDiffSha256(diff.stdout)}.`);
 		diagnostics.push("Fix the PR body, or push anyway with GJC_SKIP_PR_PREFLIGHT=1 (or --no-verify) while the change is still awaiting review.");
 	}
 	return { ok: diagnostics.length === 0, verdict: result.verdict, diagnostics };

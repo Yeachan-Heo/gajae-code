@@ -654,6 +654,12 @@ describe("push preflight", () => {
 		expect(pushPreflight).toContain("headRepositoryOwner?.login?.toLowerCase() === headOwner.toLowerCase()");
 		// Ambiguity fails closed rather than guessing which contract governs the push.
 		expect(pushPreflight).toContain("cannot determine which contract governs this push");
+		// gh pr list's JSON mapping drops headRefOid and review commit oids on older gh
+		// releases (e.g. 2.4.x), which would fail closed on every push, so the head oid
+		// and the review commits must be resolved through the stable `gh api` surface.
+		expect(pushPreflight).toContain('"--jq", ".head.sha"');
+		expect(pushPreflight).toContain("/pulls/${pr.number}/reviews");
+		expect(pushPreflight).not.toContain("reviews,headRefOid");
 	});
 
 	test("resolves the GitHub repository from every supported remote URL form", async () => {
