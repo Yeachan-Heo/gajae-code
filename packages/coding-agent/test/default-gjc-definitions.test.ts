@@ -556,7 +556,17 @@ Project executor override body.
 		const ralplan = await Bun.file(
 			path.join(repoRoot, "packages", "coding-agent", "src", "defaults", "gjc", "skills", "ralplan", "SKILL.md"),
 		).text();
-		expect(ralplan).toContain("counts as opting into execution for that skill");
+		expect(ralplan).toContain("it does not replace structured approval for the current final artifact");
+		expect(ralplan).toContain("Never invent a direct approval record or infer execution consent from the skill name");
+		expect(ralplan).toContain("even if the user already named an execution skill");
+		expect(ralplan).toContain("A revised final artifact requires a fresh structured approval");
+		expect(ralplan).toContain(
+			'"plan this, then use `/skill:ultragoal`" still requires the tagged final approval `ask`',
+		);
+		expect(ralplan).toContain(
+			"Free text, refinement, cancellation, timeout, and **Stop here** do not authorize execution",
+		);
+		expect(ralplan).not.toContain("skip the re-ask");
 		expect(ralplan).toContain("gjc.ralplan.autoHandoff");
 		expect(ralplan).toContain("`off` (default), `ultragoal`, or `autoresearch`");
 		expect(ralplan).not.toContain("team_unavailable");

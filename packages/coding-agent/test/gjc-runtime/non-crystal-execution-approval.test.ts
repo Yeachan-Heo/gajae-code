@@ -1,17 +1,26 @@
 import { describe, expect, it } from "bun:test";
+import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { AgentToolContext } from "@gajae-code/agent-core";
 import type { AssistantMessage } from "@gajae-code/ai/types";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
-import { runNativeDeepInterviewCommand } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-runtime";
+import { crystalSnapshotDigest } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-crystallize";
+import {
+	authoritativeConversationSnapshot,
+	runNativeDeepInterviewCommand,
+} from "@gajae-code/coding-agent/gjc-runtime/deep-interview-runtime";
 import { runNativeRalplanCommand } from "@gajae-code/coding-agent/gjc-runtime/ralplan-runtime";
-import { modeStatePath } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
+import { auditPath, modeStatePath, sessionStateDir } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
 import {
 	DEEP_INTERVIEW_EXECUTION_APPROVAL_MAX_AGE_MS,
+	deepInterviewExecutionApprovalRecordPath,
 	type ExecutionApprovalStage,
+	executionApprovalLineage,
 	nonCrystalExecutionApprovalRecordPath,
+	recordDeepInterviewExecutionApproval,
+	recordNonCrystalExecutionApproval,
 	runNativeStateCommand,
 } from "@gajae-code/coding-agent/gjc-runtime/state-runtime";
 import { initTheme } from "@gajae-code/coding-agent/modes/theme/theme";
@@ -157,6 +166,37 @@ async function approval(cwd: string, sessionId: string, stage: ExecutionApproval
 	return JSON.parse(await fs.readFile(nonCrystalExecutionApprovalRecordPath(cwd, sessionId, stage), "utf8"));
 }
 
+async function publishCrystal(cwd: string, sessionId: string) {
+	const live = await authoritativeConversationSnapshot(cwd, sessionId);
+	const source = { revision: live.revision, start: 0, end: live.messages.length - 1, messages: live.messages };
+	const result = await runNativeDeepInterviewCommand(
+		[
+			"--crystallize",
+			"--session-id",
+			sessionId,
+			"--slug",
+			"historical-crystal",
+			"--input",
+			JSON.stringify({
+				current_revision: live.revision,
+				snapshot: { ...source, digest: crystalSnapshotDigest(source) },
+				items: live.messages
+					.filter(message => message.role === "user")
+					.map(message => ({
+						id: `requirement:${message.index}`,
+						kind: "acceptance_criterion",
+						classification: "confirmed",
+						statement: message.content,
+						anchor: { message_index: message.index, quote: message.content },
+					})),
+			}),
+			"--json",
+		],
+		cwd,
+	);
+	expect(result.status, result.stderr).toBe(0);
+}
+
 describe("non-Crystal user-gated execution approval", () => {
 	for (const stage of ["deep-interview", "ralplan"] as const) {
 		it(`${stage}: real Ask and persistent continuation approve the published artifact before handoff`, async () => {
@@ -229,6 +269,46 @@ describe("non-Crystal user-gated execution approval", () => {
 				await ask(cwd, manager, stage);
 				if (stage === "deep-interview") expect((await consume(cwd, sessionId)).status).toBe(0);
 				await expect(ask(cwd, manager, stage, "replayed-answer")).rejects.toThrow("replay");
+			});
+		});
+
+		it(`${stage}: a repeated question label accepts a fresh gate only for a newer publication`, async () => {
+			await withSession(async (cwd, manager, sessionId) => {
+				await publish(cwd, sessionId, stage);
+				await ask(cwd, manager, stage);
+				if (stage === "deep-interview") expect((await consume(cwd, sessionId)).status).toBe(0);
+				const previous = await approval(cwd, sessionId, stage);
+				const record = async (gateId: string) => {
+					const transcriptPath = manager.getSessionFile()!;
+					await recordNonCrystalExecutionApproval({
+						cwd,
+						sessionId,
+						approvalStage: stage,
+						questionId: previous.question_id,
+						gateId,
+						target: "ultragoal",
+						selectedOptions: ["Approve execution via ultragoal"],
+						transcriptPath,
+						transcriptSha256: createHash("sha256")
+							.update(await fs.readFile(transcriptPath))
+							.digest("hex"),
+					});
+				};
+				await expect(record("fresh-gate-same-publication")).rejects.toThrow("replay");
+				await publish(cwd, sessionId, stage, 2);
+				await expect(record(previous.gate_id)).rejects.toThrow("replay");
+				await record("fresh-gate-new-publication");
+				const renewed = await approval(cwd, sessionId, stage);
+				expect(renewed.question_id).toBe(previous.question_id);
+				expect(renewed.gate_id).not.toBe(previous.gate_id);
+				expect(renewed.artifact_sha256).not.toBe(previous.artifact_sha256);
+				const consumed = await runNativeStateCommand(
+					["approve-execution", "--mode", stage, "--session-id", sessionId, "--json"],
+					cwd,
+				);
+				expect(consumed.status, consumed.stderr).toBe(0);
+				const result = await handoff(cwd, sessionId, stage);
+				expect(result.status, result.stderr).toBe(0);
 			});
 		});
 	}
@@ -306,6 +386,129 @@ describe("non-Crystal user-gated execution approval", () => {
 			expect(result.status, result.stderr).toBe(0);
 		});
 	});
+	it("Crystal renewal accepts a repeated question label but rejects its consumed gate", async () => {
+		await withSession(async (cwd, manager, sessionId) => {
+			await publishCrystal(cwd, sessionId);
+			await ask(cwd, manager, "deep-interview");
+			expect((await consume(cwd, sessionId)).status).toBe(0);
+			const recordPath = deepInterviewExecutionApprovalRecordPath(cwd, sessionId);
+			const previous = JSON.parse(await fs.readFile(recordPath, "utf8"));
+			manager.appendMessage({ role: "user", content: "Encrypt backups.", timestamp: Date.now() });
+			await manager.flush();
+			await publishCrystal(cwd, sessionId);
+			const transcriptPath = manager.getSessionFile()!;
+			const descriptor = {
+				cwd,
+				sessionId,
+				questionId: previous.question_id,
+				target: "ultragoal",
+				selectedOptions: ["Approve execution via ultragoal"],
+				transcriptPath,
+				transcriptSha256: createHash("sha256")
+					.update(await fs.readFile(transcriptPath))
+					.digest("hex"),
+			};
+			await expect(
+				recordDeepInterviewExecutionApproval({ ...descriptor, gateId: previous.gate_id }),
+			).rejects.toThrow("already consumed");
+			const renewed = await recordDeepInterviewExecutionApproval({ ...descriptor, gateId: "fresh-crystal-gate" });
+			expect(renewed.record.question_id).toBe(previous.question_id);
+			expect(renewed.record.crystal_spec_version).toBe(previous.crystal_spec_version + 1);
+			expect(renewed.record.spec_sha256).not.toBe(previous.spec_sha256);
+			const result = await consume(cwd, sessionId);
+			expect(result.status, result.stderr).toBe(0);
+		});
+	});
+
+	it("a replacement Ralplan run does not inherit consumed Crystal consent from a historical handoff", async () => {
+		await withSession(async (cwd, manager, sessionId) => {
+			await publishCrystal(cwd, sessionId);
+			const planning = await runNativeStateCommand(
+				["handoff", "--mode", "deep-interview", "--to", "ralplan", "--session-id", sessionId, "--json"],
+				cwd,
+			);
+			expect(planning.status, planning.stderr).toBe(0);
+			await publish(cwd, sessionId, "ralplan");
+			expect(await executionApprovalLineage(cwd, sessionId, "ralplan")).toBe("crystal");
+			await ask(cwd, manager, "ralplan", "approve-linked-crystal");
+			const crystalApprovalPath = deepInterviewExecutionApprovalRecordPath(cwd, sessionId);
+			const crystalApproval = await fs.readFile(crystalApprovalPath, "utf8");
+			expect(JSON.parse(crystalApproval).status).toBe("consumed");
+			const indexPath = path.join(sessionStateDir(cwd, sessionId), "deep-interview-handoff-ralplan-audit.json");
+			const oldIndex = await fs.readFile(indexPath, "utf8");
+			const oldAudit = await fs.readFile(auditPath(cwd, sessionId), "utf8");
+			const replacement = await runNativeRalplanCommand(
+				[
+					"--write",
+					"--stage",
+					"final",
+					"--stage_n",
+					"1",
+					"--artifact",
+					"# Independent replacement plan",
+					"--run-id",
+					"replacement-plan",
+					"--session-id",
+					sessionId,
+					"--json",
+				],
+				cwd,
+			);
+			expect(replacement.status, replacement.stderr).toBe(0);
+			expect(await executionApprovalLineage(cwd, sessionId, "ralplan")).toBe("ordinary");
+			expect((await handoff(cwd, sessionId, "ralplan")).status).toBe(2);
+			await ask(cwd, manager, "ralplan", "approve-independent-plan");
+			const result = await handoff(cwd, sessionId, "ralplan");
+			expect(result.status, result.stderr).toBe(0);
+			expect(await fs.readFile(indexPath, "utf8")).toBe(oldIndex);
+			expect((await fs.readFile(auditPath(cwd, sessionId), "utf8")).startsWith(oldAudit)).toBe(true);
+			expect(await fs.readFile(crystalApprovalPath, "utf8")).toBe(crystalApproval);
+		});
+	});
+
+	for (const damage of ["missing-upstream", "missing-audit", "missing-lineage", "wrong-timestamp"] as const) {
+		it(`linked Ralplan refuses ${damage} instead of falling back to ordinary approval`, async () => {
+			await withSession(async (cwd, manager, sessionId) => {
+				await publishCrystal(cwd, sessionId);
+				const planning = await runNativeStateCommand(
+					["handoff", "--mode", "deep-interview", "--to", "ralplan", "--session-id", sessionId, "--json"],
+					cwd,
+				);
+				expect(planning.status, planning.stderr).toBe(0);
+				await publish(cwd, sessionId, "ralplan");
+				if (damage === "missing-upstream") {
+					await fs.rm(modeStatePath(cwd, sessionId, "deep-interview"));
+				} else if (damage === "missing-audit") {
+					await fs.rm(path.join(sessionStateDir(cwd, sessionId), "deep-interview-handoff-ralplan-audit.json"));
+					const audit = await fs.readFile(auditPath(cwd, sessionId), "utf8");
+					await fs.writeFile(
+						auditPath(cwd, sessionId),
+						audit
+							.split("\n")
+							.filter(line => !line || JSON.parse(line).verb !== "handoff")
+							.join("\n"),
+					);
+				} else {
+					const statePath = modeStatePath(cwd, sessionId, "ralplan");
+					const state = JSON.parse(await fs.readFile(statePath, "utf8"));
+					if (damage === "missing-lineage") {
+						delete state.handoff_from;
+						delete state.handoff_at;
+						delete state.upstream_handoff_at;
+					} else {
+						state.handoff_at = "2026-01-01T00:00:00.000Z";
+					}
+					await fs.writeFile(statePath, JSON.stringify(state));
+				}
+				await expect(ask(cwd, manager, "ralplan")).rejects.toThrow();
+				expect(await Bun.file(nonCrystalExecutionApprovalRecordPath(cwd, sessionId, "ralplan")).exists()).toBe(
+					false,
+				);
+				expect((await handoff(cwd, sessionId, "ralplan")).status).toBe(2);
+			});
+		});
+	}
+
 	for (const firstStage of ["planner", "final"] as const) {
 		it(`Ralplan ${firstStage} establishes incoming lineage once and clears it when replacing the run`, async () => {
 			await withSession(async (cwd, _manager, sessionId) => {
