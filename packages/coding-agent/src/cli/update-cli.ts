@@ -1237,9 +1237,7 @@ async function updateViaBinaryAt(
 		beforeReplace: () => console.log(chalk.dim("Installing update...")),
 	});
 
-	printVerifiedVersion(expectedVersion);
 	if (verification.cleanupWarning) console.warn(chalk.yellow(verification.cleanupWarning));
-	printRestartGuidance();
 	return verification;
 }
 
@@ -1247,6 +1245,8 @@ async function updateViaBinaryAt(
  * Run the update command.
  */
 export interface UpdateCommandDependencies {
+	/** User-visible migration guidance owned by the standalone update command, not the TUI logger. */
+	writeStdout?: (text: string) => void;
 	getLatestRelease?: (options?: LatestReleaseLookupOptions) => Promise<ReleaseInfo>;
 	resolveUpdateTarget?: () => Promise<UpdateTarget>;
 	verifyMigrationTarget?: (release: ReleaseInfo, runtimePath: string) => Promise<InstalledVersionVerification>;
@@ -1394,17 +1394,11 @@ async function performUpdate(
 		if (target.previousPath) {
 			console.log(
 				chalk.yellow(
-					`Current ${APP_NAME} at ${target.previousPath} is a package-manager shim or wrapper; installing a standalone binary at ${target.path} without overwriting the shim.`,
+					`Current ${APP_NAME} at ${sanitizeVerificationOutput(target.previousPath)} is a package-manager shim or wrapper; installing a standalone binary at ${sanitizeVerificationOutput(target.path)} without overwriting the shim.`,
 				),
 			);
 		}
-		const verification = await updateViaBinaryAt(target.path, expectedVersion, registry);
-		console.log(
-			chalk.cyan(
-				`Put ${path.dirname(target.path)} first on PATH so the standalone binary wins over any leftover Bun/npm shim.`,
-			),
-		);
-		return verification;
+		return await updateViaBinaryAt(target.path, expectedVersion, registry);
 	}
 	if (target.method === "binary") {
 		return await updateViaBinaryAt(target.path, expectedVersion, registry);
@@ -1454,22 +1448,43 @@ export function resolveUpdateDecision(options: {
 	return { install: true, kind: options.comparison > 0 ? "new-version" : "force" };
 }
 
-function printVerifiedMigrationTarget(target: MigrationUpdateTarget, version: string): void {
-	console.log(
-		chalk.green(
-			`${theme.status.success} Standalone ${APP_NAME} ${version} is already installed and verified at ${target.path}`,
-		),
+export function formatVerifiedBinaryInvocation(runtimePath: string, platform: NodeJS.Platform): string {
+	// PowerShell treats smart single quotes as delimiters too; preserve each by doubling it.
+	return platform === "win32"
+		? `& '${runtimePath.replace(/['‘’‚‛]/g, quote => quote + quote)}'`
+		: `'${runtimePath.replace(/'/g, "'\\''")}'`;
+}
+
+function printVerifiedMigrationTarget(
+	target: MigrationUpdateTarget,
+	version: string,
+	writeStdout: (text: string) => void,
+	alreadyInstalled = true,
+): void {
+	const displayPath = sanitizeVerificationOutput(target.path);
+	const directory = sanitizeVerificationOutput(path.dirname(target.path));
+	const quotedPath = formatVerifiedBinaryInvocation(target.path, process.platform);
+	const invocation =
+		displayPath === target.path
+			? `Run the verified binary directly: ${quotedPath} --version (omit --version to launch).`
+			: "Run the verified binary directly using its exact local path (displayed path was sanitized).";
+	writeStdout(
+		`${chalk.green(
+			`${theme.status.success} Standalone ${APP_NAME} ${version} is ${alreadyInstalled ? "already installed" : "installed"} and verified at ${displayPath}.${version === VERSION ? " Version unchanged; this is an installation migration, not a version update." : ""}`,
+		)}\n`,
 	);
-	if (target.previousPath) {
-		console.log(chalk.yellow(`${target.previousPath} shadows it on PATH.`));
-		console.log(
-			chalk.cyan(
-				`The standalone directory ${path.dirname(target.path)} must precede the shim directory ${path.dirname(target.previousPath)} on PATH.`,
-			),
-		);
-		return;
-	}
-	console.log(chalk.cyan(`Ensure the standalone directory ${path.dirname(target.path)} is on PATH.`));
+	writeStdout(
+		`${chalk.cyan(
+			[
+				"Shell activation is not verified; package-manager shims were not overwritten or uninstalled.",
+				invocation,
+				process.platform === "win32"
+					? "Check resolution in PowerShell: Get-Command gjc -All; where.exe gjc."
+					: "In your current shell, check: type -a gjc; command -v gjc. Clear cached commands with hash -r (Bash) or rehash (zsh), then repeat the checks and run gjc --version.",
+				`Only if resolution still selects another install, ensure ${directory} is on PATH before the shim directory; also check shell aliases/functions.`,
+			].join("\n"),
+		)}\n`,
+	);
 }
 
 export async function runUpdateCommand(
@@ -1483,6 +1498,7 @@ export async function runUpdateCommand(
 	const update = deps.performUpdate ?? performUpdate;
 	const refreshDefaults = deps.refreshInstalledDefaultSkills ?? refreshInstalledDefaultSkills;
 	const exit = deps.exit ?? process.exit;
+	const writeStdout = deps.writeStdout ?? (text => process.stdout.write(text));
 	const recordEvent = deps.recordTelemetryEvent ?? ((event, details) => recordTelemetryEvent(event, details));
 	const pendingTelemetry = new Set<Promise<void>>();
 	const record = (event: TelemetryEventName, details: TelemetryDetails): void => {
@@ -1559,7 +1575,7 @@ export async function runUpdateCommand(
 			if (verification.ok) {
 				record("update_check_completed", { channel, result: "available" });
 				record("update_install_started", { channel, installMethod: target.method });
-				printVerifiedMigrationTarget(target, release.version);
+				printVerifiedMigrationTarget(target, release.version, writeStdout);
 				record("update_install_completed", { channel, result: "installed", installMethod: target.method });
 				return;
 			}
@@ -1595,14 +1611,19 @@ export async function runUpdateCommand(
 	try {
 		const resolved = target ?? (await resolveTarget());
 		const verification = await update(resolved, release.version, release.registry);
-		if (verification?.path) {
+		if (verification?.ok && verification.path) {
 			installedVersion = release.version;
+			if (resolved.method === "migrate") {
+				printVerifiedMigrationTarget({ ...resolved, path: verification.path }, release.version, writeStdout, false);
+			} else {
+				printSuccessfulVerification(release.version);
+			}
 			await (deps.runPostUpdateRecovery ?? runPostUpdateRecovery)(verification.path);
 		} else if (!deps.performUpdate) throw new Error("verified installed runtime path is unavailable");
 	} catch (err) {
 		record("update_install_failed", { channel, result: "failed", installMethod: target.method });
 		const prefix = installedVersion
-			? `Updated to ${installedVersion}, but post-update recovery failed`
+			? `${target.method === "migrate" ? "Standalone binary installed and verified at version" : "Updated to"} ${installedVersion}, but post-update recovery failed`
 			: "Update failed";
 		console.error(chalk.red(`${prefix}: ${err}`));
 		return flushTelemetryBeforeExit();

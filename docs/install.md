@@ -96,13 +96,35 @@ The installer writes `gjc.js` plus a minimal `index.js` into inshellisense's def
 
 Interactive startup checks GitHub releases for a newer GJC version in the background by default. This check is notify-only and non-mutating: GJC never installs or replaces itself during launch.
 
-- Standalone binary or former Bun/npm install on a supported platform → `gjc update` downloads and atomically replaces the matching GitHub release binary (package-manager shims are not overwritten; a user binary path is used and PATH migration is printed).
+- Standalone binary or former Bun/npm install on a supported platform → `gjc update` installs the matching GitHub release binary. Existing standalone binaries are atomically replaced. Package-manager installs migrate to a separate user binary path, even at the same version; shims are neither overwritten nor uninstalled. A target that already passes release-checksum, version, and smoke-test verification is reused without downloading the binary again (unless `--force` is set).
 - Source checkout or `dev:link` executable → update, pull, build, and link through that checkout's original workflow. `gjc update` refuses to self-overwrite it.
 - Unsupported platform or unknown target → rerun the documented platform installer.
 
 Run `gjc config set startup.checkUpdate false` to disable the launch-time check. Network failures are ignored so they do not block startup.
 
 `gjc update` resolves `stable` from GitHub `/releases/latest` and `nightly` from the newest published GitHub prerelease. Optional `GITHUB_TOKEN` / `GH_TOKEN` raises API rate limits. `--check`, `--force`, and channel switch-back semantics are unchanged.
+
+### After a package-manager migration
+
+“Installed and verified” confirms the standalone binary, not which executable your current shell will run. A same-version migration changes the installation type, not the version. Use the explicit verified binary path printed by the updater to launch it directly; for the default POSIX location:
+
+```sh
+"$HOME/.local/bin/gjc" --version
+"$HOME/.local/bin/gjc"
+```
+
+Check command resolution in the same shell where you ran the update:
+
+```sh
+type -a gjc
+command -v gjc
+hash -r                  # Bash: clear cached command locations
+# rehash                 # zsh equivalent
+command -v gjc
+gjc --version
+```
+
+A stale Bash command hash can retain the Bun shim even when `type -a gjc` lists the standalone binary first. Clearing that hash can activate the standalone binary without any PATH edit. Only if resolution still selects another install should you check aliases/functions and ensure the standalone directory precedes the shim directory on PATH. On PowerShell, inspect `Get-Command gjc -All` and `where.exe gjc`, and invoke the printed binary path with `& 'path/to/gjc.exe'`. No shim removal is required.
 
 ## Retry configuration
 
