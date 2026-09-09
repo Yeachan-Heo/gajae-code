@@ -898,17 +898,25 @@ Project executor override body.
 	it("prints skill inspection guidance for setup defaults without changing JSON output", async () => {
 		const externalRoot = await makeTempRoot();
 		const home = await makeTempRoot();
-		const env = {
-			...process.env,
+		// A fresh HOME alone does not override inherited profile or managed-owner authority.
+		const env: NodeJS.ProcessEnv = {
+			...Object.fromEntries(
+				Object.entries(process.env).filter(([key]) => !key.startsWith("GJC_") && !key.startsWith("PI_")),
+			),
 			HOME: home,
+			GJC_CONFIG_DIR: ".gjc",
+			GJC_CODING_AGENT_DIR: path.join(home, ".gjc", "agent"),
 			PI_NO_TITLE: "1",
 			NO_COLOR: "1",
 			FORCE_COLOR: undefined,
 		};
 
-		// Three sequential CLI startups plus installation need more than Bun's 5s unit-test budget.
-		// Bound each owned child below the 30s test deadline, leaving time to join it on failure.
+		// Hosted cold source startup hit the former 8s kill deadline with no stderr.
+		// Allow 30s per process; the 100s test budget covers all three plus cleanup.
+		const processTimeoutMs = 30_000;
 		const runSetupDefaults = async (args: string[] = []) => {
+			const startedAt = performance.now();
+			let timedOut = false;
 			const proc = Bun.spawn(
 				[
 					process.execPath,
@@ -922,19 +930,31 @@ Project executor override body.
 					stdout: "pipe",
 					stderr: "pipe",
 					env,
-					timeout: 8_000,
-					killSignal: "SIGKILL",
 				},
 			);
+			const timer = setTimeout(() => {
+				if (proc.exitCode !== null) return;
+				timedOut = true;
+				proc.kill("SIGKILL");
+			}, processTimeoutMs);
 			try {
 				const [stdout, stderr, exitCode] = await Promise.all([
 					new Response(proc.stdout).text(),
 					new Response(proc.stderr).text(),
 					proc.exited,
 				]);
-				expect(exitCode, `setup defaults ${args.join(" ")} (8s deadline): ${stderr}`).toBe(0);
+				const diagnostic = [
+					`setup defaults ${args.join(" ")}: ${timedOut ? "timed out" : "exited"}`,
+					`elapsed=${Math.round(performance.now() - startedAt)}ms budget=${processTimeoutMs}ms`,
+					`exitCode=${exitCode} signal=${proc.signalCode ?? "none"}`,
+					`stdout: ${stdout}`,
+					`stderr: ${stderr}`,
+				].join("\n");
+				expect(timedOut, diagnostic).toBe(false);
+				expect(exitCode, diagnostic).toBe(0);
 				return { stdout, stderr };
 			} finally {
+				clearTimeout(timer);
 				if (proc.exitCode === null) proc.kill("SIGKILL");
 				await proc.exited;
 			}
@@ -954,7 +974,7 @@ Project executor override body.
 		expect(jsonStderr).toBe("");
 		expect(jsonStdout).not.toContain("gjc skills list");
 		expect(JSON.parse(jsonStdout) as { skipped: number }).toMatchObject({ skipped: 10 });
-	}, 30_000);
+	}, 100_000);
 });
 
 describe("bundled skills CLI", () => {
