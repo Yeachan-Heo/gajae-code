@@ -46,6 +46,12 @@ describe("persisted continuation tail", () => {
 					}
 					const before = agent.snapshotQueues();
 					const accepted: AgentMessage[][] = [];
+					const committed: AgentMessage[][] = [];
+					agent.onFollowUpConsumed = (messages, promotion) => {
+						const commit = () => committed.push([...messages]);
+						if (promotion?.deferUntilAccepted) promotion.deferUntilAccepted(commit);
+						else commit();
+					};
 					const resume =
 						tail === "assistant" ? agent.continue.bind(agent) : agent.continueQueuedMessages.bind(agent);
 					if (rejection === "no model") agent.setModel(undefined);
@@ -60,6 +66,7 @@ describe("persisted continuation tail", () => {
 							: "Maintenance continuation ownership is unavailable",
 					);
 					expect(accepted).toEqual([]);
+					expect(committed).toEqual([]);
 					expect(mock.calls).toHaveLength(0);
 					for (const queue of ["steering", "followUp"] as const) {
 						const restored = agent.snapshotQueues()[queue];
@@ -68,12 +75,19 @@ describe("persisted continuation tail", () => {
 					}
 					agent.setModel(model);
 					await resume({
-						onRunAccepted: (_handle, acceptance) => accepted.push([...acceptance.consumedQueuedMessages]),
+						onRunAccepted: (_handle, acceptance) => {
+							accepted.push([...acceptance.consumedQueuedMessages]);
+							if (mode === "followUp") {
+								expect(committed).toHaveLength(1);
+								expect(committed[0]?.[0]).toBe(first);
+							}
+						},
 					});
 					expect(accepted).toHaveLength(1);
 					expect(accepted[0]).toHaveLength(1);
 					expect(accepted[0]?.[0]).toBe(first);
 					expect(agent.hasQueuedMessages()).toBe(false);
+					expect(committed.flat()).toEqual(mode === "followUp" ? [first, duplicate, unrelated] : [unrelated]);
 					expect(
 						agent.state.messages.filter(message => message.role === "user").map(message => message.content),
 					).toEqual(["resume", "resume", "unrelated"]);
@@ -82,6 +96,39 @@ describe("persisted continuation tail", () => {
 		}
 	}
 
+	for (const tail of ["assistant", "toolResult"] as const) {
+		it(`admits the ${tail} follow-up synchronously before a filtering microtask removes the model`, async () => {
+			const mock = createMockModel({ handler: () => ({ content: ["resumed"] }) });
+			const agent = new Agent({ streamFn: mock.stream });
+			agent.replaceMessages([tail === "assistant" ? assistantMessage() : toolResultMessage()]);
+			const queued = userMessage();
+			agent.followUp(queued);
+			const events: string[] = [];
+			agent.onFollowUpConsumed = (_messages, promotion) => {
+				events.push("filtered");
+				queueMicrotask(() => {
+					events.push("model removed");
+					agent.setModel(undefined);
+				});
+				promotion?.deferUntilAccepted?.(() => events.push("committed"));
+			};
+			const resume = tail === "assistant" ? agent.continue.bind(agent) : agent.continueQueuedMessages.bind(agent);
+			const completion = resume({
+				onRunAccepted: (_handle, acceptance) => {
+					events.push("accepted");
+					expect(acceptance.consumedQueuedMessages).toEqual([queued]);
+				},
+			});
+			// No await here: both the commit and acceptance must precede the first
+			// microtask, not merely happen eventually after provider work begins.
+			expect(events).toEqual(["filtered", "committed", "accepted"]);
+			await completion;
+			expect(events).toEqual(["filtered", "committed", "accepted", "model removed"]);
+			expect(mock.calls).toHaveLength(1);
+			expect(agent.state.messages.filter(message => message === queued)).toHaveLength(1);
+			expect(agent.hasQueuedMessages()).toBe(false);
+		});
+	}
 	it("restores only surviving follow-ups ahead of new admissions after a filtering hook rejects", async () => {
 		const mock = createMockModel({ handler: () => ({ content: ["resumed"] }) });
 		const agent = new Agent({ streamFn: mock.stream });

@@ -1777,12 +1777,15 @@ export class Agent {
 		options?: AgentPromptOptions,
 	): Promise<void> {
 		let accepted = false;
+		const acceptanceCommits: Array<() => void> = [];
 		try {
 			if (mode === "followUp") {
-				// Preserve owned-completion filtering/settlement for both direct paths.
+				// Filter now, but defer irreversible consumption until run acceptance.
 				// Maintenance resumes the existing logical run, not an own-run promotion.
-				await this.onFollowUpConsumed?.(messages, {
+				// The void hook is synchronous: do not yield between filtering and admission.
+				this.onFollowUpConsumed?.(messages, {
 					startsOwnRun: options?.maintenanceContinuation !== true,
+					deferUntilAccepted: commit => acceptanceCommits.push(commit),
 				});
 				// A fully denied batch must not start an empty provider run.
 				if (messages.length === 0) return;
@@ -1795,6 +1798,7 @@ export class Agent {
 					// Claim before invoking external code: even a throwing acceptance
 					// observer must never put an already-owned batch back in the queue.
 					accepted = true;
+					for (const commit of acceptanceCommits) commit();
 					options?.onRunAccepted?.(handle, acceptance);
 				},
 			});

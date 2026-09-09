@@ -2557,11 +2557,9 @@ export class AgentSession {
 	#followUpMessages: QueuedDisplayEntry[] = [];
 	/** User/SDK-requested next turns, distinct from aborted-turn continuations. */
 	readonly #externalFollowUps = new WeakSet<AgentMessage>();
-	// SDK requester-ownership correlation per queued follow-up message: the hook
-	// fires when the message is actually DEQUEUED into a run (onFollowUpConsumed),
-	// not when an independently scheduled continuation is accepted — a skipped
-	// continuation must never discard the correlation of work that is still
-	// consumed (review thread P2).
+	// SDK requester correlation follows the specific message into an admitted
+	// run: direct-dequeue hooks commit at acceptance, in-run hooks at consumption.
+	// Failed or skipped continuations retain the queued message's correlation.
 	readonly #followUpPromotionHooks = new Map<
 		AgentMessage,
 		(promotion: { startsOwnRun?: boolean; removed?: boolean }) => void
@@ -5072,12 +5070,9 @@ export class AgentSession {
 			}
 			return undefined;
 		};
-		// A queued owned-completion follow-up is consumed by the agent loop
-		// DIRECTLY (getFollowUpMessages), never through #promptWithMessage, so
-		// the fresh attempt/lineage promised for the resume is allocated HERE at
-		// actual resume admission — when the loop dequeues the follow-up for the
-		// next turn, the previously streaming turn has ended, so mutating the
-		// session-wide epoch/lineage is safe and its tools bind the fresh lineage.
+		// Direct dequeues filter before run admission; in-run dequeues are already
+		// admitted. Only commit owned settlement, fresh lineage and SDK promotion
+		// once the batch is accepted, so failed admission can restore its authority.
 		this.agent.onFollowUpConsumed = (messages, promotion = { startsOwnRun: false }) => {
 			// A follow-up whose owned-completion origin is DENIED — an owned
 			// scope landed after the result was queued, or the tuple is
@@ -5092,52 +5087,38 @@ export class AgentSession {
 					messages.splice(i, 1);
 				}
 			}
-			// An allowed owned-completion resume allocates the fresh lineage at
-			// actual admission (see the comment above).
-			if (messages.some(message => ownedCompletionResumeAction(message) === "fresh")) {
-				this.#resumeFromOwnedCompletion();
-			}
-			const consumedSdkRunTokenForCurrentRun = messages
-				.map(message => this.#sdkRunTokensByQueuedMessage.get(message))
-				.find((token): token is string => token !== undefined);
-			if (
-				consumedSdkRunTokenForCurrentRun !== undefined &&
-				this.#activeAttemptScope !== undefined &&
-				promotion.startsOwnRun !== true
-			) {
-				this.#sdkRunTokensByAttemptScope.set(this.#activeAttemptScope, consumedSdkRunTokenForCurrentRun);
-				this.#skipPostPromptRecoveryWaitByAttemptScope.add(this.#activeAttemptScope);
-				this.#activeSdkRunToken = consumedSdkRunTokenForCurrentRun;
-			}
-			// Monitor task-notifications now carry the owned-completion envelope
-			// (see tools/monitor.ts), so the general drop + fresh-admission paths
-			// above cover them exactly like async results — no monitor-specific
-			// filter is needed.
-			// Every consumed envelope (delivered OR dropped) is settled: the
-			// dropped ones are captured above so their now-terminal
-			// registrations are retired too — otherwise an owned_unsettled
-			// abort's later drop would keep occupying the global registration
-			// and retained-policy capacities (review thread P2).
-			this.#settleDeliveredOwnedRegistrations([...messages, ...dropped]);
-			// Transfer SDK requester ownership correlation at the ACTUAL dequeue:
-			// every follow-up consumed by this batch's run fires its hook — even
-			// when the batch is drained by a continuation the message did not
-			// schedule (a skipped continuation must never discard the correlation
-			// of work that is still consumed; review thread P2).
-			const consumedSdkRunToken =
-				promotion.startsOwnRun === true
-					? [...messages, ...dropped]
-							.map(message => this.#sdkRunTokensByQueuedMessage.get(message))
-							.find((token): token is string => token !== undefined)
-					: undefined;
-			this.#fireQueuedPromotionHooks(messages, promotion);
-			if (consumedSdkRunToken !== undefined) this.#activeSdkRunToken = consumedSdkRunToken;
-			// Dropped or in-run follow-ups have no later own-run acceptance callback;
-			// delete those tokens now. Own-run messages stay mapped until
-			// #scheduleAgentContinue.onRunAccepted binds the new attempt scope.
+			// Denied entries never return to the queue, even if admission fails.
+			this.#settleDeliveredOwnedRegistrations(dropped);
 			for (const message of dropped) this.#sdkRunTokensByQueuedMessage.delete(message);
-			if (promotion.startsOwnRun !== true)
-				for (const message of messages) this.#sdkRunTokensByQueuedMessage.delete(message);
+			const commit = () => {
+				if (messages.some(message => ownedCompletionResumeAction(message) === "fresh")) {
+					this.#resumeFromOwnedCompletion();
+				}
+				const consumedSdkRunToken = messages
+					.map(message => this.#sdkRunTokensByQueuedMessage.get(message))
+					.find((token): token is string => token !== undefined);
+				if (
+					consumedSdkRunToken !== undefined &&
+					this.#activeAttemptScope !== undefined &&
+					promotion.startsOwnRun !== true
+				) {
+					this.#sdkRunTokensByAttemptScope.set(this.#activeAttemptScope, consumedSdkRunToken);
+					this.#skipPostPromptRecoveryWaitByAttemptScope.add(this.#activeAttemptScope);
+					this.#activeSdkRunToken = consumedSdkRunToken;
+				}
+				this.#settleDeliveredOwnedRegistrations(messages);
+				// Hooks remove themselves before invoking observers, so the scheduling
+				// acceptance callback cannot promote the same submission twice.
+				this.#fireQueuedPromotionHooks(messages, promotion);
+				if (promotion.startsOwnRun && consumedSdkRunToken !== undefined)
+					this.#activeSdkRunToken = consumedSdkRunToken;
+				// Direct consumption (including maintenance) keeps tokens through the
+				// caller's acceptance callback, which binds the accepted attempt scope.
+				if (!promotion.deferUntilAccepted)
+					for (const message of messages) this.#sdkRunTokensByQueuedMessage.delete(message);
+			};
+			if (promotion.deferUntilAccepted) promotion.deferUntilAccepted(commit);
+			else commit();
 		};
 		// Steering consumed mid-run never starts its own run: fire the stored
 		// promotion hook at the REAL dequeue boundary so the SDK attaches the

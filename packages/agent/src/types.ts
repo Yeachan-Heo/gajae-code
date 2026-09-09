@@ -368,17 +368,17 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	 */
 	getFollowUpMessages?: () => Promise<AgentMessage[]>;
 	/**
-	 * Invoked with the follow-up messages the loop dequeues for the next turn
-	 * (right after {@link getFollowUpMessages}). The consumer may use this to
-	 * attach per-turn state (e.g., a fresh owned-completion lineage) at actual
-	 * resume admission rather than when the message was merely queued.
+	 * Invoked once when follow-ups are dequeued. Remove denied messages in place.
+	 * `startsOwnRun` is false for maintenance and in-run consumption.
+	 * Direct continuations supply `deferUntilAccepted`: register irreversible
+	 * settlement/promotion there, not while filtering. Its synchronous commits
+	 * run before the caller's onRunAccepted, and never on failed admission.
+	 * Without it, the batch is already inside an admitted run and can commit now.
 	 */
-	/**
-	 * Invoked when follow-up messages are consumed. `startsOwnRun` is true only
-	 * when the batch owns a new agent run; maintenance and in-run consumption
-	 * report false so callers attach to the existing lifecycle.
-	 */
-	onFollowUpConsumed?: (messages: AgentMessage[], promotion?: { startsOwnRun: boolean }) => void;
+	onFollowUpConsumed?: (
+		messages: AgentMessage[],
+		promotion?: { startsOwnRun: boolean; deferUntilAccepted?: (commit: () => void) => void },
+	) => void;
 	/**
 	 * Invoked with the steering messages the loop dequeues mid-run for the
 	 * CURRENT turn (right after getSteeringMessages). `promotion.startsOwnRun`

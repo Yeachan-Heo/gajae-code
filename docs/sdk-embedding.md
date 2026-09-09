@@ -315,6 +315,9 @@ configured), surviving dequeued inputs return to their executable queue ahead of
 newer admissions. Their submission identities remain pending and cancellable;
 no consumption or terminal success is fabricated. A later supported continuation
 can deliver them after the admission problem is corrected.
+Owned-completion registrations and SDK promotion remain provisional until that
+run accepts the batch. Failed admission does not consume their authority; denied
+entries remain filtered and are never restored as authorized work.
 
 `queuePolicy: "sequential"` delivers one submission per queue poll in FIFO order
 within either selected queue, overriding its default batching mode. It does not
