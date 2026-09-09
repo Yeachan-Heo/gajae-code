@@ -30,6 +30,14 @@ The installer downloads the current platform's GitHub release asset, verifies HT
 Unix default location: `~/.local/bin/gjc` (`GJC_INSTALL_DIR` overrides).
 Windows default location: `%LOCALAPPDATA%\gjc\gjc.exe`.
 
+### PDF extraction in standalone builds
+
+Standalone builds embed MuPDF's WebAssembly asset; PDF text extraction does not depend on a global npm/Bun package or the current working directory. A one-page document with short text is valid output. If extraction fails or produces no text, reader mode reports a failed inspection with conversion diagnostics rather than displaying PDF bytes as successfully inspected text. `:raw` remains an explicit request for the original response.
+
+The official 0.16.6 standalone can report a misleading “install mupdf” error because MuPDF was excluded from compilation. Installing a global dependency is not a supported repair for that executable. Use a corrected standalone release containing the packaging fix; this source change does not repair an already installed 0.16.6 binary. Diagnostics identify the module/WASM mapping and retain available initialization causes; include them with the binary version in a bug report.
+
+MuPDF is separately licensed under AGPL-3.0-or-later, not the repository's MIT license. See [third-party notices](../NOTICE.md); distributing a combined standalone requires the applicable license notices and corresponding-source obligations to be satisfied.
+
 ## Korean launcher alias
 
 `가재씨` is installed alongside `gjc` as a launcher alias on package-manager installs. Standalone binaries expose `gjc`. On Windows, use `gjc` (or run from Windows Terminal / PowerShell with UTF-8 `chcp 65001` if a Hangul alias is needed).

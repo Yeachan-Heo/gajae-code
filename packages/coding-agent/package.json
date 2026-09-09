@@ -73,6 +73,7 @@
 		"lru-cache": "catalog:",
 		"markit-ai": "catalog:",
 		"marked": "catalog:",
+		"mupdf": "1.28.0",
 		"puppeteer-core": "catalog:",
 		"turndown": "catalog:",
 		"turndown-plugin-gfm": "catalog:",

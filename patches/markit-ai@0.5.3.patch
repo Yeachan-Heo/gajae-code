@@ -1,28 +1,36 @@
 diff --git a/dist/converters/pdf/extract.js b/dist/converters/pdf/extract.js
-index 7e3f02ea889f166c30975cce53f7cbe4de620e54..ead075aa610637d1f42d14f81efb621c9d1094b7 100644
+index 7e3f02ea889f166c30975cce53f7cbe4de620e54..e1dcd4517128adf1021299cb5aa937bf2f98fab7 100644
 --- a/dist/converters/pdf/extract.js
 +++ b/dist/converters/pdf/extract.js
-@@ -428,8 +428,8 @@ function extractImageRegions(stext, pageNumber, pageHeight) {
-  * Render an image region from a PDF page as a PNG buffer.
+@@ -14,6 +14,8 @@
+ const SAME_LINE_Y_TOLERANCE = 2;
+ /** Max horizontal gap (pts) to merge adjacent fragments into one text box. */
+ const MAX_MERGE_GAP = 14;
++// Reuse the asynchronously initialized module when rendering extracted images.
++let mupdf;
+ /**
+  * Merge horizontally adjacent raw text items on the same visual line into
+  * word/phrase-level text boxes.
+@@ -429,7 +431,6 @@ function extractImageRegions(stext, pageNumber, pageHeight) {
   * Uses mupdf's DrawDevice to render just the cropped area at 2x resolution.
   */
--export function renderImageRegion(input, region) {
+ export function renderImageRegion(input, region) {
 -    const mupdf = require("mupdf");
-+export async function renderImageRegion(input, region) {
-+    const mupdf = await import("mupdf");
      const doc = mupdf.Document.openDocument(input, "application/pdf");
      const page = doc.loadPage(region.pageNumber - 1);
      const pad = 10;
-diff --git a/dist/converters/pdf/index.js b/dist/converters/pdf/index.js
-index 53b2703d354efefc44f5b364a3aab760efdc1138..cdb686c25c768184700903fc58167da9e3e67583 100644
---- a/dist/converters/pdf/index.js
-+++ b/dist/converters/pdf/index.js
-@@ -60,7 +60,7 @@ export class PdfConverter {
-                     const filename = `${img.id}.png`;
-                     const filepath = join(imageDir, filename);
-                     try {
--                        const png = renderImageRegion(pdfBytes, img);
-+                        const png = await renderImageRegion(pdfBytes, img);
-                         writeFileSync(filepath, png);
-                         imageBlocks.push({
-                             topY: img.topY,
+@@ -453,12 +454,11 @@ export function renderImageRegion(input, region) {
+  * Extract text boxes and vector segments from all pages of a PDF buffer.
+  */
+ export async function extractPages(input) {
+-    let mupdf;
+     try {
+         mupdf = await import("mupdf");
+     }
+-    catch {
+-        throw new Error("PDF support requires 'mupdf'. Install it: npm install mupdf");
++    catch (cause) {
++        throw new Error("MuPDF module initialization failed", { cause });
+     }
+     const doc = mupdf.Document.openDocument(input, "application/pdf");
+     const pages = [];

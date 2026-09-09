@@ -1,7 +1,7 @@
 import { untilAborted } from "@gajae-code/utils";
-import type { Markit, StreamInfo } from "markit-ai";
+import { Markit, type StreamInfo } from "markit-ai";
 import { ToolAbortError } from "../tools/tool-errors";
-import { ensureMupdfWasmResolution } from "./mupdf-wasm";
+import { prepareMuPdf, withMuPdfDiagnostic } from "./mupdf";
 
 export interface MarkitConversionResult {
 	content: string;
@@ -9,20 +9,7 @@ export interface MarkitConversionResult {
 	error?: string;
 }
 
-let markit: () => Markit | Promise<Markit> = async () => {
-	const promise = import("markit-ai").then(({ Markit }) => {
-		const instance = new Markit();
-		markit = () => instance;
-		return instance;
-	});
-	markit = () => promise;
-	return promise;
-};
-
-// #5433: mupdf's wasm asset is not reachable at the Emscripten loader's
-// default bunfs path in compiled binaries. Seed the embedded-asset hook
-// before any markit conversion (and therefore before any mupdf import).
-ensureMupdfWasmResolution();
+let instance: Markit | undefined;
 
 function normalizeExtension(extension: string): string {
 	const trimmed = extension.trim().toLowerCase();
@@ -31,32 +18,26 @@ function normalizeExtension(extension: string): string {
 }
 
 function normalizeError(error: unknown): string {
-	if (error instanceof Error && error.message.trim().length > 0) {
-		return error.message.trim();
+	const messages: string[] = [];
+	const seen = new Set<unknown>();
+	while (error !== undefined && !seen.has(error)) {
+		seen.add(error);
+		if (error instanceof Error) {
+			messages.push(`${error.name}: ${error.message}`);
+			error = error.cause;
+		} else {
+			messages.push(String(error));
+			break;
+		}
 	}
-	return "Conversion failed";
-}
-
-/**
- * markit-ai's PDF converter swallows the real mupdf import failure behind a
- * generic "Install it" message (#5433). Re-run the import here so release
- * diagnostics carry the actual module/asset/initialization error.
- */
-async function describeConversionError(error: unknown): Promise<string> {
-	const base = normalizeError(error);
-	if (!base.includes("PDF support requires 'mupdf'")) return base;
-	try {
-		await import("mupdf");
-	} catch (cause) {
-		return `${base} (mupdf import failed: ${normalizeError(cause)})`;
-	}
-	return base;
+	return messages.join("; caused by: ") || "Conversion failed";
 }
 
 async function runMarkitConversion<T>(task: (markit: Markit) => Promise<T>, signal?: AbortSignal): Promise<T> {
 	try {
-		const instance = await markit();
-		return signal ? await untilAborted(signal, () => task(instance)) : await task(instance);
+		instance ??= new Markit();
+		const markit = instance;
+		return signal ? await untilAborted(signal, () => task(markit)) : await task(markit);
 	} catch (error) {
 		if (error instanceof ToolAbortError) {
 			throw error;
@@ -78,13 +59,20 @@ function finalizeConversion(markdown?: string): MarkitConversionResult {
 
 export async function convertFileWithMarkit(filePath: string, signal?: AbortSignal): Promise<MarkitConversionResult> {
 	try {
-		const result = await runMarkitConversion(markit => markit.convertFile(filePath), signal);
+		const result = await runMarkitConversion(async markit => {
+			if (filePath.toLowerCase().endsWith(".pdf")) await prepareMuPdf();
+			return markit.convertFile(filePath);
+		}, signal);
 		return finalizeConversion(result.markdown);
 	} catch (error) {
 		if (error instanceof ToolAbortError) {
 			throw error;
 		}
-		return { content: "", ok: false, error: await describeConversionError(error) };
+		return {
+			content: "",
+			ok: false,
+			error: normalizeError(filePath.toLowerCase().endsWith(".pdf") ? withMuPdfDiagnostic(error) : error),
+		};
 	}
 }
 
@@ -100,12 +88,19 @@ export async function convertBufferWithMarkit(
 	};
 
 	try {
-		const result = await runMarkitConversion(markit => markit.convert(Buffer.from(buffer), streamInfo), signal);
+		const result = await runMarkitConversion(async markit => {
+			if (normalizedExtension === ".pdf") await prepareMuPdf();
+			return markit.convert(Buffer.from(buffer), streamInfo);
+		}, signal);
 		return finalizeConversion(result.markdown);
 	} catch (error) {
 		if (error instanceof ToolAbortError) {
 			throw error;
 		}
-		return { content: "", ok: false, error: await describeConversionError(error) };
+		return {
+			content: "",
+			ok: false,
+			error: normalizeError(normalizedExtension === ".pdf" ? withMuPdfDiagnostic(error) : error),
+		};
 	}
 }
