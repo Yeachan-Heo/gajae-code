@@ -92,6 +92,81 @@ describe("deep-interview crystallize contract", () => {
 		expect(crystal.items[0]?.anchor?.quote).toBe("Build a fast report.");
 	});
 
+	it("accepts concrete conditional, permission, and hyphenated requirements", () => {
+		for (const requirement of [
+			"Send an alert when the build fails.",
+			"Admins may export reports.",
+			"How-to guides must be searchable.",
+		]) {
+			const crystal = crystallizeDeepInterview(singleGoalEvidence(requirement));
+			expect(crystal.lifecycle, requirement).toBe("ready");
+		}
+	});
+
+	it("recognizes an authenticated first-snapshot correction", () => {
+		const content = "Use MySQL for storage. Actually, use PostgreSQL for storage.";
+		const snapshot: CrystalSnapshot = {
+			revision: 1,
+			start: 0,
+			end: 0,
+			messages: [{ index: 0, role: "user", content }],
+			digest: "",
+		};
+		snapshot.digest = crystalSnapshotDigest(snapshot);
+		const crystal = crystallizeDeepInterview(
+			input({
+				snapshot,
+				current_revision: 1,
+				items: [
+					{
+						id: "constraint:storage",
+						kind: "constraint",
+						classification: "confirmed",
+						statement: "Actually, use PostgreSQL for storage.",
+						anchor: { message_index: 0, quote: "Actually, use PostgreSQL for storage." },
+					},
+				],
+			}),
+		);
+		expect(crystal.lifecycle).toBe("ready");
+	});
+
+	it("rejects require-versus-forbid confirmed contradictions", () => {
+		const content = "Require audit logs. Forbid audit logs.";
+		const snapshot: CrystalSnapshot = {
+			revision: 1,
+			start: 0,
+			end: 0,
+			messages: [{ index: 0, role: "user", content }],
+			digest: "",
+		};
+		snapshot.digest = crystalSnapshotDigest(snapshot);
+		expect(() =>
+			crystallizeDeepInterview(
+				input({
+					snapshot,
+					current_revision: 1,
+					items: [
+						{
+							id: "constraint:require-logs",
+							kind: "constraint",
+							classification: "confirmed",
+							statement: "Require audit logs.",
+							anchor: { message_index: 0, quote: "Require audit logs." },
+						},
+						{
+							id: "constraint:forbid-logs",
+							kind: "constraint",
+							classification: "confirmed",
+							statement: "Forbid audit logs.",
+							anchor: { message_index: 0, quote: "Forbid audit logs." },
+						},
+					],
+				}),
+			),
+		).toThrow("contradictory confirmed items");
+	});
+
 	it("rejects multiline or Markdown-bearing item identifiers", () => {
 		expect(() =>
 			crystallizeDeepInterview(

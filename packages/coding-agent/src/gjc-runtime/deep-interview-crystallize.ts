@@ -489,7 +489,7 @@ function semanticProfile(value: string): CrystalSemanticProfile {
 			normalized,
 		);
 	const hedged =
-		/\b(?:maybe|perhaps|possibly|probably|might|may|could|would|likely|unlikely|seems?|apparently|approximately|around|roughly|tentative(?:ly)?|prefer(?:ably)?|i\s+think|i\s+guess|i\s+believe|believe(?:s|d)?)\b/i.test(
+		/\b(?:maybe|perhaps|possibly|probably|might|likely|unlikely|seems?|apparently|approximately|around|roughly|tentative(?:ly)?|prefer(?:ably)?|i\s+think|i\s+guess|i\s+believe|believe(?:s|d)?)\b/i.test(
 			normalized,
 		) ||
 		/(?:아마|어쩌면|가능성|수도|것\s+같|같습니다|추정|대략|たぶん|おそらく|かもしれ|可能性|と思|思われ|だろう|でしょう|也许|也許|可能|或许|大概|似乎|大約|估计|估計|据说|據說)/u.test(
@@ -560,14 +560,7 @@ function sameSemanticIntent(left: CrystalSemanticProfile, right: CrystalSemantic
 }
 
 function isUnsafeConfirmedStatement(profile: CrystalSemanticProfile): boolean {
-	return (
-		profile.interrogative ||
-		profile.conditional ||
-		profile.hedged ||
-		profile.alternative ||
-		profile.refusal ||
-		profile.unresolved
-	);
+	return profile.interrogative || profile.hedged || profile.alternative || profile.refusal || profile.unresolved;
 }
 
 export function crystalSnapshotDigest(
@@ -898,7 +891,7 @@ function requirementBearingClauses(
 			searchOffset = Math.max(searchOffset, clauseOffset + clause.length);
 			if (
 				!clause ||
-				/^(?:what|why|how|when|where|who|which)\b/i.test(clause) ||
+				/^(?:what|why|how|when|where|who|which)(?:\s|$)/i.test(clause) ||
 				/\basked\b[^"“”]*["“”][^"“”]*(?:should|could|would|can|will)\b/i.test(clause) ||
 				/^(?:no further changes|nothing else|another question remains|the ambiguity remains open|continue (?:again|with the remaining goal)|yes|no|ok|okay|done|acknowledged|understood|got it|thanks|thank you)$/i.test(
 					clause,
@@ -1481,21 +1474,37 @@ export function crystallizeDeepInterview(value: unknown): DeepInterviewCrystal {
 				preservesEvidenceOrder(item.statement, directive.clause) &&
 				sameSemanticIntent(semanticProfile(directive.clause), semanticProfile(item.statement)),
 		);
-		const explicitlySuperseded = canonicalPriorItems.some(previous => {
-			const replacement = items.find(item => item.id === previous.id);
-			return (
-				replacement !== undefined &&
-				!sameIntent(replacement, previous) &&
-				replacement.anchor !== undefined &&
-				(directive.messageIndex < replacement.anchor.message_index ||
-					(directive.messageIndex === replacement.anchor.message_index &&
-						(snapshot.messages
-							.find(message => message.index === directive.messageIndex)
-							?.content.indexOf(replacement.anchor.quote) ?? -1) > directive.clauseOffset)) &&
-				/\b(?:actually|instead|rather|replace|replaced|no longer|not)\b/i.test(replacement.anchor.quote) &&
-				[...directiveTerms].every(term => evidenceTerms(previous.statement).has(term))
-			);
+		const snapshotCorrection = currentItems.some(item => {
+			const anchor = item.anchor;
+			if (!anchor) return false;
+			const afterDirective =
+				directive.messageIndex < anchor.message_index ||
+				(directive.messageIndex === anchor.message_index &&
+					(snapshot.messages
+						.find(message => message.index === directive.messageIndex)
+						?.content.indexOf(anchor.quote) ?? -1) > directive.clauseOffset);
+			if (!afterDirective || !/\b(?:actually|instead|rather|replace|replaced|no longer|not)\b/i.test(anchor.quote))
+				return false;
+			const replacementTerms = topicTerms(item.statement, false);
+			return [...directiveTerms].some(term => replacementTerms.has(term));
 		});
+		const explicitlySuperseded =
+			snapshotCorrection ||
+			canonicalPriorItems.some(previous => {
+				const replacement = items.find(item => item.id === previous.id);
+				return (
+					replacement !== undefined &&
+					!sameIntent(replacement, previous) &&
+					replacement.anchor !== undefined &&
+					(directive.messageIndex < replacement.anchor.message_index ||
+						(directive.messageIndex === replacement.anchor.message_index &&
+							(snapshot.messages
+								.find(message => message.index === directive.messageIndex)
+								?.content.indexOf(replacement.anchor.quote) ?? -1) > directive.clauseOffset)) &&
+					/\b(?:actually|instead|rather|replace|replaced|no longer|not)\b/i.test(replacement.anchor.quote) &&
+					[...directiveTerms].every(term => evidenceTerms(previous.statement).has(term))
+				);
+			});
 		const explicitlyPreserved =
 			/(?:\b(?:keep|retain|restore|preserve|maintain)\b|유지|보존|복원|保持|保留|恢复|恢復|復元)/iu.test(
 				directive.clause,
@@ -1529,6 +1538,10 @@ export function crystallizeDeepInterview(value: unknown): DeepInterviewCrystal {
 	const confirmedItems = currentItems.filter(item => item.classification === "confirmed");
 	const opposingActions: ReadonlyArray<readonly [readonly string[], readonly string[]]> = [
 		[
+			["require", "requires", "required", "mandate", "mandates", "mandated"],
+			["forbid", "forbids", "forbidden", "prohibit", "prohibits", "prohibited", "ban", "bans", "banned"],
+		],
+		[
 			["enable", "enables", "enabled"],
 			["disable", "disables", "disabled"],
 		],
@@ -1559,8 +1572,11 @@ export function crystallizeDeepInterview(value: unknown): DeepInterviewCrystal {
 					statement: string,
 					terms: Set<string>,
 				): { sign: number; subject: Set<string> } | undefined => {
-					const positive = positiveTerms.some(term => terms.has(term));
-					const negative = negativeTerms.some(term => terms.has(term));
+					const normalizedStatement = statement.normalize("NFC").toLowerCase();
+					const containsAction = (term: string) =>
+						new RegExp(`(?:^|[^\\p{L}\\p{N}_])${term}(?:$|[^\\p{L}\\p{N}_])`, "u").test(normalizedStatement);
+					const positive = positiveTerms.some(containsAction);
+					const negative = negativeTerms.some(containsAction);
 					if (positive === negative) return undefined;
 					const explicitlyNegated = /\b(?:do\s+not|don['’]t|never|not)\b/i.test(statement);
 					return {
