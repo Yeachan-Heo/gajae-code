@@ -4977,7 +4977,9 @@ test("close accepts a native durable placeholder for a dead endpoint", async () 
 			endpointPath,
 			JSON.stringify({ sessionId, pid: deadPid, url: "ws://127.0.0.1:1", token: "durable-placeholder" }),
 		);
-		const endpointMtimeMs = (await fs.stat(endpointPath)).mtimeMs;
+		const endpointIdentity = await fs.stat(endpointPath, { bigint: true });
+		// Rounded index timestamps require the same device/inode proof as real hosts.
+		const endpointMtimeMs = Number(endpointIdentity.mtimeNs) / 1_000_000;
 		await broker.start();
 		await broker.index.append({
 			type: "host_registered",
@@ -4987,6 +4989,7 @@ test("close accepts a native durable placeholder for a dead endpoint", async () 
 			pid: deadPid,
 			processIncarnation: "dead-incarnation",
 			endpointMtimeMs,
+			endpointFileId: `${endpointIdentity.dev}:${endpointIdentity.ino}`,
 		});
 		const originalExactUnlink = native.exactUnlink.bind(native);
 		const unlinkSpy = vi.spyOn(native, "exactUnlink").mockImplementation((pathname, identity) => {
@@ -5014,6 +5017,7 @@ test("close accepts a native durable placeholder for a dead endpoint", async () 
 				ok: true,
 				result: { sessionId },
 			});
+			expect(unlinkSpy).toHaveBeenCalled();
 		} finally {
 			unlinkSpy.mockRestore();
 		}
@@ -5038,7 +5042,8 @@ test("close refuses an unknown empty endpoint placeholder", async () => {
 		const deadPid = 4_194_304;
 		await fs.mkdir(path.dirname(endpointPath), { recursive: true });
 		await fs.writeFile(endpointPath, JSON.stringify({ sessionId: "unknown-placeholder", pid: deadPid }));
-		const endpointMtimeMs = (await fs.stat(endpointPath)).mtimeMs;
+		const endpointIdentity = await fs.stat(endpointPath, { bigint: true });
+		const endpointMtimeMs = Number(endpointIdentity.mtimeNs) / 1_000_000;
 		await broker.start();
 		await broker.index.append({
 			type: "host_registered",
@@ -5048,6 +5053,7 @@ test("close refuses an unknown empty endpoint placeholder", async () => {
 			pid: deadPid,
 			processIncarnation: "dead-incarnation",
 			endpointMtimeMs,
+			endpointFileId: `${endpointIdentity.dev}:${endpointIdentity.ino}`,
 		});
 		const unlinkSpy = vi.spyOn(native, "exactUnlink").mockImplementation(pathname => {
 			syncFs.truncateSync(pathname, 0);
@@ -5061,6 +5067,7 @@ test("close refuses an unknown empty endpoint placeholder", async () => {
 					"unknown-placeholder-close",
 				),
 			).toMatchObject({ ok: false, error: { code: "terminal_uncertain" } });
+			expect(unlinkSpy).toHaveBeenCalled();
 		} finally {
 			unlinkSpy.mockRestore();
 		}
@@ -5081,7 +5088,8 @@ test("close refuses a nonempty replacement of a durable endpoint placeholder", a
 		const deadPid = 4_194_304;
 		await fs.mkdir(path.dirname(endpointPath), { recursive: true });
 		await fs.writeFile(endpointPath, JSON.stringify({ sessionId, pid: deadPid }));
-		const endpointMtimeMs = (await fs.stat(endpointPath)).mtimeMs;
+		const endpointIdentity = await fs.stat(endpointPath, { bigint: true });
+		const endpointMtimeMs = Number(endpointIdentity.mtimeNs) / 1_000_000;
 		await broker.start();
 		await broker.index.append({
 			type: "host_registered",
@@ -5091,6 +5099,7 @@ test("close refuses a nonempty replacement of a durable endpoint placeholder", a
 			pid: deadPid,
 			processIncarnation: "dead-incarnation",
 			endpointMtimeMs,
+			endpointFileId: `${endpointIdentity.dev}:${endpointIdentity.ino}`,
 			lifecycleRequestId: "replaced-placeholder-request",
 		});
 		const originalExactUnlink = native.exactUnlink.bind(native);
@@ -5116,6 +5125,7 @@ test("close refuses a nonempty replacement of a durable endpoint placeholder", a
 					error: { code: "terminal_uncertain" },
 				},
 			);
+			expect(unlinkSpy).toHaveBeenCalled();
 		} finally {
 			unlinkSpy.mockRestore();
 		}
