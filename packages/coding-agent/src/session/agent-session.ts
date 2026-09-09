@@ -20575,8 +20575,17 @@ export class AgentSession {
 			return false;
 		const contextWindow = this.model?.contextWindow ?? 0;
 		if (classifyContextOverflow(message, transportFailure, contextWindow)) return false;
-		if (this.#isCodexCredentialModelUnavailable(message) && !this.#canRotateCodexCredential(message)) return false;
 		const managedFallback = this.#defaultFallbackChain().chain.entries.length > 1;
+		// An account-specific model rejection that cannot rotate to another
+		// credential stays terminal only on the session's own retry path; managed
+		// fallback still advances the model chain through the controller.
+		if (
+			this.#isCodexCredentialModelUnavailable(message) &&
+			!this.#canRotateCodexCredential(message) &&
+			!managedFallback
+		) {
+			return false;
+		}
 		if (!managedFallback) {
 			const classification = this.#classifyErrorForRetry(message);
 			return (
@@ -21678,7 +21687,7 @@ export class AgentSession {
 				: false;
 		}
 		const canRotateCodexCredential = this.#canRotateCodexCredential(message);
-		if (this.#isCodexCredentialModelUnavailable(message) && !canRotateCodexCredential) {
+		if (this.#isCodexCredentialModelUnavailable(message) && !canRotateCodexCredential && !managedFallback) {
 			return managedOutcome
 				? {
 						type: "terminal",
@@ -21773,7 +21782,7 @@ export class AgentSession {
 			const mark = await this.#markFailedCredential(trigger);
 			this.#codexCredentialModelUnavailableRetried = true;
 			credentialRotated = mark === "rotated";
-			if (!credentialRotated) {
+			if (!credentialRotated && !managedFallback) {
 				return managedOutcome
 					? {
 							type: "terminal",

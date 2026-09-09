@@ -40,6 +40,7 @@ describe("AgentSession Codex model selection", () => {
 	let usageFetches = 0;
 	let streamCalls = 0;
 	let failAfterRotation = false;
+	let requestedModels: string[] = [];
 
 	const usageProvider: UsageProvider = {
 		id: "openai-codex",
@@ -57,6 +58,7 @@ describe("AgentSession Codex model selection", () => {
 	beforeEach(async () => {
 		usageFetches = 0;
 		streamCalls = 0;
+		requestedModels = [];
 		failAfterRotation = false;
 		tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-codex-model-selection-"));
 		authStorage = await AuthStorage.create(path.join(tempDir, "auth.db"), {
@@ -82,8 +84,9 @@ describe("AgentSession Codex model selection", () => {
 		const agent = new Agent({
 			initialState: { model: initialModel, systemPrompt: [], tools: [] },
 			streamFn: model => {
+				requestedModels.push(`${model.provider}/${model.id}`);
 				const call = ++streamCalls;
-				const failed = call === 1 || failAfterRotation;
+				const failed = (call === 1 || failAfterRotation) && model.id === "gpt-5.6-sol";
 				const stream = new AssistantMessageEventStream();
 				const message: AssistantMessage = {
 					role: "assistant",
@@ -207,6 +210,39 @@ describe("AgentSession Codex model selection", () => {
 			role: "assistant",
 			stopReason: "error",
 			errorMessage: "The 'gpt-5.6-sol' model is not supported when using Codex with a ChatGPT account.",
+		});
+	});
+	test("advances the managed fallback model chain when account rotation is exhausted", async () => {
+		failAfterRotation = true;
+		await authStorage.set("openai-codex", [
+			{
+				type: "oauth",
+				access: "access-acct-first",
+				refresh: "refresh-acct-first",
+				expires: Date.now() + 60 * 60 * 1000,
+				accountId: "acct-first",
+				email: "first@example.com",
+			},
+			{
+				type: "oauth",
+				access: "access-acct-second",
+				refresh: "refresh-acct-second",
+				expires: Date.now() + 60 * 60 * 1000,
+				accountId: "acct-second",
+				email: "second@example.com",
+			},
+		]);
+		await session.setModel(selectedModel);
+		session.setConfiguredModelChain("default", ["openai-codex/gpt-5.6-sol", "openai-codex/gpt-5.5"], "test");
+
+		await expect(session.prompt("hello")).resolves.toBeUndefined();
+
+		expect(requestedModels[0]).toBe("openai-codex/gpt-5.6-sol");
+		expect(requestedModels).toContain("openai-codex/gpt-5.5");
+		expect(session.agent.state.messages.at(-1)).toMatchObject({
+			role: "assistant",
+			stopReason: "stop",
+			content: [{ type: "text", text: "rotated account succeeded" }],
 		});
 	});
 });
