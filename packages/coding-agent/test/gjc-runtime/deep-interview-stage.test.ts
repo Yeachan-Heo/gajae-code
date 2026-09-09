@@ -1,10 +1,11 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { appendOrMergeDeepInterviewRound } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-recorder";
 import { runNativeDeepInterviewCommand } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-runtime";
 import { deepInterviewDraftPath } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-stage";
 import { ENVELOPE_RESERVED_STATE_KEYS } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-state";
-import { modeStatePath } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
+import { modeStatePath, sessionSpecsDir } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
 
 const TEST_SESSION_ID = "stage-test-session";
 const tempRoots: string[] = [];
@@ -734,6 +735,102 @@ describe("deep-interview staged transitions", () => {
 		expect(after.spec_sha256).toBeUndefined();
 	});
 
+	it("reset retains confirmed ordinary intent without retaining old execution authority", async () => {
+		const root = await tempDir();
+		await seed(root);
+		const statePath = modeStatePath(root, TEST_SESSION_ID, "deep-interview");
+		await appendOrMergeDeepInterviewRound(
+			root,
+			statePath,
+			{
+				round: 0,
+				questionId: "intent-confirmation",
+				questionText: "Confirm locked intent",
+				component: "review-topology",
+				dimension: "topology",
+				selectedOptions: ["Confirm"],
+				intent_contract: {
+					items: [
+						{ id: "artifact:report", category: "artifact", statement: "Produce an audit report" },
+						{ id: "surface:review", category: "surface", statement: "Provide a reviewer surface" },
+					],
+					confirmation_options: ["Confirm"],
+				},
+			},
+			{ sessionId: TEST_SESSION_ID },
+		);
+		const confirmed = await readState(root);
+		const contract = (confirmed.state as Record<string, unknown>).intent_contract;
+		expect(contract).toMatchObject({ confirmation_round: 0 });
+		expect((confirmed.state as Record<string, unknown>).intent_contract_required).toBe(true);
+		const fullSpec = "# Full\nartifact:report\nsurface:review";
+		expect(
+			(await run(root, ["--write", "--stage", "final", "--slug", "old", "--spec", fullSpec, "--json"])).status,
+		).toBe(0);
+		const old = await readState(root);
+		// Model persisted ordinary approval metadata from before the reset.
+		(old.state as Record<string, unknown>).execution_approval = "approved";
+		(old.state as Record<string, unknown>).execution_approval_receipt = { mutation_id: "old-approval" };
+		await fs.writeFile(statePath, `${JSON.stringify(old)}\n`, "utf8");
+		const reset = await run(root, [
+			"write",
+			"--reset",
+			"--input",
+			JSON.stringify({ state: { fresh: true, intent_contract: null, intent_contract_required: false } }),
+			"--json",
+		]);
+		expect(reset.status).toBe(0);
+		const after = await readState(root);
+		const inner = after.state as Record<string, unknown>;
+		expect(inner.intent_contract).toEqual(contract);
+		expect(inner.intent_contract_required).toBe(true);
+		expect(inner.fresh).toBe(true);
+		expect(inner.initial_idea).toBeUndefined();
+		expect(inner.rounds ?? []).toEqual([]);
+		expect(inner.intent_review).toBeUndefined();
+		expect(inner.execution_approval).toBeUndefined();
+		expect(inner.execution_approval_receipt).toBeUndefined();
+		expect(after.current_phase).not.toBe("handoff");
+		for (const key of ["spec_path", "spec_sha256", "spec_slug", "spec_stage", "spec_persisted_at"]) {
+			expect(after[key]).toBeUndefined();
+		}
+		const omitted = await run(root, [
+			"--write",
+			"--stage",
+			"final",
+			"--slug",
+			"omitted",
+			"--spec",
+			"# Reduced\nartifact:report",
+			"--json",
+		]);
+		expect(omitted.status).toBe(2);
+		expect(omitted.stderr).toContain("locked intent blocks spec persistence: missing intent review");
+		await expect(
+			fs.access(path.join(sessionSpecsDir(root, TEST_SESSION_ID), "deep-interview-omitted.md")),
+		).rejects.toThrow();
+		expect(await readState(root)).toEqual(after);
+		const faithful = await run(root, [
+			"--write",
+			"--stage",
+			"final",
+			"--slug",
+			"faithful",
+			"--spec",
+			fullSpec,
+			"--json",
+		]);
+		expect(faithful.status).toBe(0);
+		expect(
+			await fs.readFile(path.join(sessionSpecsDir(root, TEST_SESSION_ID), "deep-interview-faithful.md"), "utf8"),
+		).toBe(`${fullSpec}\n`);
+		const published = (await readState(root)).state as Record<string, unknown>;
+		expect(published.intent_contract).toEqual(contract);
+		expect(published.intent_contract_required).toBe(true);
+		expect(published.intent_review).toMatchObject({ status: "not_required", removed_locked_ids: [] });
+		expect(published.execution_approval).toBeUndefined();
+		expect(published.execution_approval_receipt).toBeUndefined();
+	});
 	it("reset preserves canonical Crystal and spec ownership metadata", async () => {
 		const root = await tempDir();
 		await seed(root);
