@@ -2,8 +2,10 @@ import { describe, expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { fileURLToPath } from "node:url";
+import * as url from "node:url";
 import { logger } from "@gajae-code/utils";
+import { resolvePublishDependency } from "../../../scripts/ci-release-publish";
+import { canonicalizePackageTarball } from "../../../scripts/release-evidence";
 import {
 	buildDevCompileArgs,
 	buildReleaseCompileArgs,
@@ -11,6 +13,7 @@ import {
 	releaseEntrypoints,
 } from "../scripts/compile-args";
 import { generateMuPdfAsset, resetMuPdfAsset } from "../scripts/embed-mupdf";
+import { stageMarkit } from "../scripts/stage-markit";
 import { mupdfAssetMapping, sanitizeMuPdfDiagnostic, withMuPdfDiagnostic } from "../src/utils/mupdf";
 
 const repoRoot = path.resolve(import.meta.dir, "../../..");
@@ -42,7 +45,7 @@ function dummyPdf(): string {
 const entrySource = `
 import { convertBufferWithMarkit, convertFileWithMarkit } from ${JSON.stringify(path.join(packageRoot, "src/utils/markit.ts"))};
 import { mupdfAssetMapping } from ${JSON.stringify(path.join(packageRoot, "src/utils/mupdf.ts"))};
-import { extractPages, renderImageRegion } from ${JSON.stringify(fileURLToPath(new URL("./converters/pdf/extract.js", import.meta.resolve("markit-ai"))))};
+import { extractPages, renderImageRegion } from ${JSON.stringify(url.fileURLToPath(new URL("./converters/pdf/extract.js", import.meta.resolve("markit-ai"))))};
 const mode = process.argv[2];
 const originalFile = Bun.file;
 let faultedReads = 0;
@@ -79,7 +82,7 @@ if (mode === "success") {
 		id: "red-rectangle", pageNumber: 1,
 		bbox: { x: 50, y: 70, w: 100, h: 80 }, topY: 130,
 	});
-	const mupdf = await import(${JSON.stringify(Bun.resolveSync("mupdf", path.dirname(fileURLToPath(import.meta.resolve("markit-ai")))))});
+	const mupdf = await import(${JSON.stringify(Bun.resolveSync("mupdf", path.dirname(url.fileURLToPath(import.meta.resolve("markit-ai")))))});
 	const image = new mupdf.Image(png);
 	const pixmap = image.toPixmap();
 	try {
@@ -99,7 +102,7 @@ if (mode === "success") {
 if (mode === "wasm-failure") {
 	recovery = await convertBufferWithMarkit(Buffer.from("<h1>Still usable</h1>"), ".html");
 	// Let any secondary rejection surface before this process exits naturally.
-	await new Promise(resolve => setTimeout(resolve, 20));
+	await Bun.sleep(20);
 }
 process.stdout.write(JSON.stringify({ buffer, file, rendered, recovery, faultedReads, mapping: mupdfAssetMapping }));
 `;
@@ -176,7 +179,9 @@ console.log(JSON.stringify({ buffer: { ok: true, content: "" }, mapping: mupdfAs
 				await Bun.write(path.join(markit, "index.js"), "export {};\n");
 				const dependency = path.join(markit, "node_modules/mupdf");
 				const original = path.dirname(
-					path.dirname(Bun.resolveSync("mupdf", path.dirname(fileURLToPath(import.meta.resolve("markit-ai"))))),
+					path.dirname(
+						Bun.resolveSync("mupdf", path.dirname(url.fileURLToPath(import.meta.resolve("markit-ai")))),
+					),
 				);
 				await fs.cp(original, dependency, { recursive: true, dereference: true });
 				// A distinct direct version must never supply the transitive loader's
@@ -246,7 +251,7 @@ console.log(JSON.stringify({ buffer: { ok: true, content: "" }, mapping: await B
 				);
 				const modules = path.join(directory, "node_modules");
 				const markit = path.join(modules, "markit-ai");
-				const originalMarkit = path.dirname(path.dirname(fileURLToPath(import.meta.resolve("markit-ai"))));
+				const originalMarkit = path.dirname(path.dirname(url.fileURLToPath(import.meta.resolve("markit-ai"))));
 				await fs.cp(originalMarkit, markit, {
 					recursive: true,
 					dereference: true,
@@ -284,7 +289,7 @@ let loaderError;
 try { await import(${JSON.stringify(path.join(dependency, "dist/mupdf.js"))}); }
 catch (error) { loaderError = { name: error.name, message: error.message }; }
 const recovery = await convertBufferWithMarkit(Buffer.from("<h1>Still usable</h1>"), ".html");
-await new Promise(resolve => setTimeout(resolve, 20));
+await Bun.sleep(20);
 console.log(JSON.stringify({ buffer, wasmValid, loaderError, recovery, mapping: mupdfAssetMapping }));
 `,
 				);
@@ -476,5 +481,162 @@ catch (error) { console.log(JSON.stringify({ buffer: { ok: false, content: "", e
 				await fs.rm(runtimeDir, { recursive: true, force: true });
 			}
 		}, 120_000);
+	}
+});
+
+// These are real package-manager operations, including dependency installation
+// from the registry. No repository symlink or root patchedDependencies survives.
+describe("published Markit dependency bundle", () => {
+	it("refuses pre-existing dependency directories without changing them", async () => {
+		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-markit-owner-"));
+		try {
+			const target = path.join(directory, "node_modules/markit-ai");
+			await fs.mkdir(target, { recursive: true });
+			await Bun.write(path.join(target, "user-file"), "preserve");
+			await expect(stageMarkit(packageRoot, directory)).rejects.toThrow();
+			expect(await Bun.file(path.join(target, "user-file")).text()).toBe("preserve");
+			expect(await fs.readdir(target)).toEqual(["user-file"]);
+		} finally {
+			await fs.rm(directory, { recursive: true, force: true });
+		}
+	});
+
+	it("refuses unpatched Markit before creating a publish dependency", async () => {
+		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-markit-unpatched-"));
+		try {
+			const source = path.join(directory, "source");
+			const markit = path.join(source, "node_modules/markit-ai");
+			const target = path.join(directory, "target");
+			const original = path.dirname(path.dirname(url.fileURLToPath(import.meta.resolve("markit-ai"))));
+			await fs.cp(original, markit, {
+				recursive: true,
+				dereference: true,
+				filter: entry => path.basename(entry) !== "node_modules",
+			});
+			await Bun.write(path.join(markit, "dist/converters/pdf/extract.js"), 'const mupdf = require("mupdf");\n');
+			await expect(stageMarkit(source, target)).rejects.toThrow("Publishing requires the patched markit-ai@0.5.3");
+			expect(await Bun.file(path.join(target, "node_modules/markit-ai/package.json")).exists()).toBe(false);
+		} finally {
+			await fs.rm(directory, { recursive: true, force: true });
+		}
+	});
+	for (const packer of ["npm", "bun"] as const) {
+		it(`${packer} tarball retains patched conversion, rendering and safe diagnostics`, async () => {
+			const directory = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-markit-tarball-"));
+			async function run(command: string[], cwd: string): Promise<void> {
+				const child = Bun.spawn(command, { cwd, stdout: "pipe", stderr: "pipe" });
+				const [exitCode, stdout, stderr] = await Promise.all([
+					child.exited,
+					new Response(child.stdout).text(),
+					new Response(child.stderr).text(),
+				]);
+				expect({ exitCode, diagnostics: exitCode ? stdout + stderr : "" }).toEqual({
+					exitCode: 0,
+					diagnostics: "",
+				});
+			}
+			try {
+				const staged = path.join(directory, "staged");
+				const tarballs = path.join(directory, "tarballs");
+				const consumer = path.join(directory, "consumer");
+				await fs.mkdir(tarballs);
+				await fs.mkdir(consumer);
+				await fs.cp(packageRoot, staged, {
+					recursive: true,
+					filter: source => path.basename(source) !== "node_modules",
+				});
+				const manifest = await Bun.file(path.join(staged, "package.json")).json();
+				for (const field of ["dependencies", "devDependencies", "optionalDependencies", "peerDependencies"]) {
+					for (const [name, version] of Object.entries(manifest[field] ?? {})) {
+						manifest[field][name] = await resolvePublishDependency(name, version as string);
+					}
+				}
+				expect(manifest.bundledDependencies).toEqual(["markit-ai"]);
+				expect(manifest.patchedDependencies).toBeUndefined();
+				await Bun.write(path.join(staged, "package.json"), JSON.stringify(manifest));
+				await stageMarkit(packageRoot, staged);
+				await run(
+					packer === "npm"
+						? ["npm", "pack", "--ignore-scripts", "--pack-destination", tarballs]
+						: [process.execPath, "pm", "pack", "--ignore-scripts", "--destination", tarballs],
+					staged,
+				);
+				const archives = (await fs.readdir(tarballs)).filter(name => name.endsWith(".tgz"));
+				expect(archives).toHaveLength(1);
+				const firstTarball = await Bun.file(path.join(tarballs, archives[0]!)).bytes();
+				const canonical = canonicalizePackageTarball(firstTarball);
+				expect(canonical.byteLength).toBeGreaterThan(0);
+				await run(
+					packer === "npm"
+						? ["npm", "pack", "--ignore-scripts", "--pack-destination", tarballs]
+						: [process.execPath, "pm", "pack", "--ignore-scripts", "--destination", tarballs],
+					staged,
+				);
+				expect(canonicalizePackageTarball(await Bun.file(path.join(tarballs, archives[0]!)).bytes())).toEqual(
+					canonical,
+				);
+				await fs.rm(staged, { recursive: true });
+				await Bun.write(path.join(consumer, "package.json"), JSON.stringify({ private: true, type: "module" }));
+				await run(
+					packer === "npm"
+						? ["npm", "install", "--ignore-scripts", "--no-audit", "--no-fund", path.join(tarballs, archives[0]!)]
+						: [process.execPath, "add", "--ignore-scripts", path.join(tarballs, archives[0]!)],
+					consumer,
+				);
+				const installed = await fs.realpath(path.join(consumer, "node_modules/@gajae-code/coding-agent"));
+				const markitEntry = Bun.resolveSync("markit-ai", installed);
+				const markitRoot = path.dirname(path.dirname(markitEntry));
+				expect(markitRoot).toBe(path.join(installed, "node_modules/markit-ai"));
+				const extraction = path.join(markitRoot, "dist/converters/pdf/extract.js");
+				expect(await Bun.file(extraction).text()).not.toContain('require("mupdf")');
+				expect(await Bun.file(path.join(markitRoot, "dist/markit.js")).text()).toContain("new AggregateError");
+				expect(await Bun.file(path.join(markitRoot, "LICENSE")).text()).toContain("MIT");
+				const mupdf = Bun.resolveSync("mupdf", path.dirname(markitEntry));
+				expect(mupdf.startsWith(`${markitRoot}${path.sep}`)).toBe(true);
+				expect(await Bun.file(path.join(path.dirname(path.dirname(mupdf)), "LICENSE")).text()).toContain(
+					"GNU AFFERO GENERAL PUBLIC LICENSE",
+				);
+				const originalMarkitEntry = url.fileURLToPath(import.meta.resolve("markit-ai"));
+				const originalExtract = url.fileURLToPath(
+					new URL("./converters/pdf/extract.js", import.meta.resolve("markit-ai")),
+				);
+				const originalMuPdf = Bun.resolveSync("mupdf", path.dirname(originalMarkitEntry));
+				const entry = path.join(installed, "published-probe.ts");
+				await Bun.write(
+					entry,
+					entrySource
+						.replaceAll(packageRoot, installed)
+						.replaceAll(originalExtract, extraction)
+						.replaceAll(originalMuPdf, mupdf),
+				);
+				const success = await runIsolated([process.execPath, entry, "success"], consumer);
+				expect(success.buffer.ok).toBe(true);
+				expect(success.buffer.content).toContain("Dummy PDF file");
+				expect(success.file?.content).toContain("Dummy PDF file");
+				expect(success.rendered).toEqual({
+					signature: [137, 80, 78, 71, 13, 10, 26, 10],
+					width: 240,
+					height: 200,
+					center: [255, 0, 0],
+					corner: [255, 255, 255],
+				});
+				expect(success.mapping).toContain(mupdf);
+				expect(success.mapping).not.toContain(repoRoot);
+				// Damage only the installed loader. A fresh process must retain its
+				// original cause through Markit's AggregateError, not suggest install.
+				await fs.rm(path.join(path.dirname(mupdf), "mupdf-wasm.js"));
+				const failure = await runIsolated([process.execPath, entry, "loader-failure"], consumer);
+				expect(failure.buffer.ok).toBe(false);
+				expect(failure.buffer.error).toContain("AggregateError");
+				expect(failure.buffer.error).toContain("MuPDF module initialization failed");
+				expect(failure.buffer.error).toMatch(/Cannot find|Module not found/i);
+				expect(failure.buffer.error).not.toContain(directory);
+				expect(failure.buffer.error).not.toContain(await fs.realpath(directory));
+				expect(failure.buffer.error).not.toContain(repoRoot);
+				expect(failure.buffer.error).not.toContain("npm install");
+			} finally {
+				await fs.rm(directory, { recursive: true, force: true });
+			}
+		}, 300_000);
 	}
 });
