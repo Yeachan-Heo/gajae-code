@@ -10,6 +10,8 @@
 
 ### Added
 
+- Generic SDK embedders can use `submitQueuedInput()` and public `queued_input_*` events to correlate identical steering/follow-up submissions with admission, actual consumption, successor promotion, exact owning terminals, and removal/cancellation. Sequential queue policy preserves per-queue FIFO without relying on display entries or internal host hooks (#5429).
+
 - Devin CLI models are selectable through the ordinary provider/model path. When `devin acp` is installed and authenticated, `devin` models are discovered from the account (`gjc models`, `/model`), resolve without a GJC credential (authentication stays in the CLI), and can be pointed at a non-PATH executable with `GJC_DEVIN_CLI_PATH`. See `docs/devin-provider.md` for the agent-level boundary, permissions, and billing.
 
 - Successful macOS installs and updates can offer the optional experimental, third-party community Gajae Code App (#5140), defaulting to No. The shared installer requires canonical release checksums and a verified bundle/signature, skips installed apps and automation, and supports `GJC_NO_COMMUNITY_APP=1`; app failures leave GJC installed.
@@ -74,6 +76,11 @@
 
 - The default bash interceptor no longer rejects commands that never redirect to a file. Its `write` rule scanned the whole command string, so a redirection after `;`, `&&`, or `||` was attributed to a leading `echo`/`printf` and `2>/dev/null` was counted as a file write: `echo x; date 2>/dev/null` was blocked with "use the `write` tool" while the same two commands in the opposite order ran. A redirection must now belong to the leading command, fd redirections such as `2>/dev/null` are no longer treated as writes, and the heredoc spelling the rule exists for (`cat <<EOF > out.txt`, with no space after `<<`) is now detected instead of silently skipped.
 - Memory consolidation, Codex/Claude session import, image-provider text, and subagent setup-failure summaries now redact the vendor token shapes `crash/upstream/envelope.ts` classifies as credential-like and refuses to transmit: npm, GitLab PAT, Stripe live/test keys, and Hugging Face tokens. Stripe and Hugging Face separate with `_`, so the existing `sk-`/`sk|rk|pk-` rules never matched them at any length, and a GitLab PAT and a Hugging Face token both fall under the image scrubber's 40-character catch-all. Setup-failure summaries additionally listed only `AKIA` of the four AWS access-key id prefixes and had no PEM rule, so `ASIA`, `ABIA`, `ACCA`, and whole private-key blocks survived into the diagnostic.
+
+- ACP reconciles `uncertain_after_send` through one bounded, read-only, exactly correlated `turn.result` query instead of ignoring recovery until the prompt watchdog. Unavailable, pending, mismatched, or receipt-less ordinary completion fails explicitly without replaying the mutation or treating local tool-abort output as a resource cleanup fence (#5401).
+- SDK-bus prompt deadlines renew on attributable tool execution, remain bounded by the acceptance-anchored maximum runtime, and reject synthetic pairing-only events. Progress racing durable expiry releases only its superseded deadline claim, preserving real failures, cancellation, and final receipts; expiry diagnostics include correlation and lease state (#5340).
+- Runtime sidecars retain sanitized run-correlated failure diagnostics through an empty `agent_end`, without prematurely terminalizing tools or carrying a predecessor's failure into a successor. Branded SDK run capabilities now survive prompt admission; raw caller-supplied tokens cannot forge ownership. Committed bus deadline failures project to the original run's sidecar even after an empty terminal, with explicit unresolved projection diagnostics (#5340, #5401).
+- Direct resumed SDK sessions retain descriptor-bound endpoint identity through Broker readiness, replay, and Router publication. Timestamp precision differences are accepted only for the same proven file, while replacement/ownership checks and existing incarnation digests remain unchanged (#5077).
 
 ## [0.16.6] - 2026-09-07
 ### Fixed

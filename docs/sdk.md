@@ -96,6 +96,15 @@ A running session publishes an implementation-private credential record for Brok
 
 The record path, schema, credential transport, and handshake are not public client contracts. ACP, MCP, Coordinator, CLI, provider daemons, extensions, and integrations must use Router-issued attachments or Broker lifecycle services; they must not scan state roots, parse discovery files, retain endpoint credentials, or open raw per-session WebSockets. Broker and Router validate process identity, endpoint generation, incarnation, and file integrity before attachment, and fail closed on stale or uncertain state.
 
+Resuming an eligible direct session follows the same hosting contract. A live
+bookkeeping row with endpoint generation `0` is not yet attachable authority.
+Successful resume/adoption must retain the same descriptor-bound endpoint file
+identity through Broker readiness and the Router's final indexed publication
+check. Filesystem timestamp rounding is tolerated only when the retained file
+identity proves the same endpoint; replacement, unreachable endpoints, foreign
+ownership, and `GJC_SDK_DISABLE=1` do not become routable merely because the
+process is alive. Existing endpoint incarnation digests remain unchanged.
+
 ### Internal broker launch isolation
 
 When the SDK starts its default internal broker or session host from the published TypeScript source, GJC uses a fixed Bun launch policy: `--no-env-file`, a product-owned empty `bunfig.toml`, absolute product entrypoint paths, and no inherited `BUN_OPTIONS` or mutable compiled-mode markers. The broker bootstraps from the product SDK directory rather than the caller project; a session host still runs with the lifecycle-authorized workspace as its process cwd.
@@ -349,6 +358,27 @@ a new prompt while the old outcome remains unknown.
 receives `resource_gone`; it must not treat that result as cancellation of another
 prompt.
 
+Cancellation output is not a cleanup fence. A tool may publish an aborted result
+while its underlying execution or cleanup promise is still pending. A
+`resources_pending` proof retains those resources until they actually settle;
+two entries with the same label can represent producer discovery and execution,
+not duplicate execution. Local `agent_end`, zero displayed active tools, and a
+live process are not substitutes for a correlated SDK terminal outcome. Likewise,
+`session_unavailable` or `resource_gone` from a status/output query does not prove
+that the interrupted operation finished. Reconcile read-only with the original
+session and exact selector above; never replay `turn.prompt` because its transport
+reported `uncertain_after_send`.
+
+For an acknowledged ACP prompt, transport uncertainty triggers at most one
+read-only `turn.result` observation, bounded to five seconds. The adapter accepts
+only the original invocation kind (`prompt` or `skill`), correlation, and a valid terminal result. Ordinary
+`end_turn` recovery also requires a present, readable non-empty text receipt;
+explicit cancellation/refusal/limit outcomes do not require invented text. If
+status remains pending, unknown, unavailable, mismatched, or lacks required
+receipt evidence, ACP rejects with `terminal_uncertain` and retires the local
+attachment. The error identifies the original selector for read-only inspection;
+it does not authorize another prompt, abort, or tool replay.
+
 `sdk.promptDeadlineMs` defaults to `1_800_000`. It accepts only safe integers in
 `[60_000, 86_400_000]`; there is no disable value. The SDK snapshots the setting
 when the prompt is durably accepted as the initial inactivity lease. Fresh
@@ -357,12 +387,35 @@ when the prompt is durably accepted as the initial inactivity lease. Fresh
 `lastProgressAt + sdk.promptDeadlineMs`, bounded by the hard maximum `sdk.promptMaxRuntimeMs`
 (default `21_600_000`, same `60_000–86_400_000` range). Only tool-execution boundaries for the
 accepted turn count; heartbeats, streaming text/thinking deltas, retries, other turns/sessions, and
-unrelated session noise do not renew the lease, and out-of-order delivery never shortens it. The
+unrelated session noise and synthetic non-dispatched tool-result pairing events do
+not renew the lease, and out-of-order delivery never shortens it. The
 hard maximum is never unbounded: every renewal is capped at `acceptedAt + sdk.promptMaxRuntimeMs` so a
 wedged or continuously noisy prompt still reaches a deterministic terminal outcome. Terminalization then has a fixed `10_000` ms
 grace period, which is not configurable. A controlled terminal failure reaches ACP
 as JSON-RPC `-32603` with `data.code` of `prompt_failed` or
 `prompt_deadline_exceeded`.
+
+Both SDK-only and SDK-bus routes use this lease contract. Expiry diagnostics
+include `acceptedAt`, `lastProgressAt`, `leaseMs`, `maxMs`, `effectiveDeadline`,
+`generation`, and the prompt correlation, without prompt contents. A superseded
+expiry cannot retain a pending deadline claim that overrides later real
+completion, cancellation, or provider failure.
+
+Runtime sidecars separately record execution and receipt state. A run-correlated
+`agent_failed` diagnostic preserves active execution until its terminal boundary;
+a subsequent empty `agent_end` cannot erase that failure. A new logical run
+clears predecessor failure evidence. A genuinely completed empty execution can
+still have `terminal_ok` plus `missing`; that combination is not ordinary success
+and never substitutes for an SDK cleanup or terminal proof.
+
+A committed SDK-bus deadline failure is also projected to the original run's
+sidecar, including when that run already wrote an empty terminal. This is an
+exact-run projection of an authoritative result, not a second authority vote:
+progress before commitment may supersede expiry, but progress after commitment
+cannot revive the invocation. A successor cannot inherit the predecessor's
+failure. Projection failures remain explicitly logged as unresolved/retryable;
+retrying that projection never replays the prompt or changes its committed SDK
+outcome. The projection bridge is private, not an embedder or wire API.
 
 ## Skill invoke reconciliation
 
