@@ -228,17 +228,52 @@ function normalizeMime(contentType: string): string {
 	return contentType.split(";")[0].trim().toLowerCase();
 }
 
+// Bound both parsing work and decoded filename size to a single modest header.
+function getDispositionFilename(header: string): string | undefined {
+	if (header.length > 8192 || /[\x00-\x1f\x7f]/.test(header.replaceAll("\t", ""))) return undefined;
+	const separator = header.indexOf(";");
+	if (separator < 0) return undefined;
+	const parameter = /;[ \t]*([!#$%&'*+.^_`|~\w-]+)[ \t]*=[ \t]*(?:"((?:[^"\\]|\\.)*)"|([!#$%&'*+.^_`|~\w-]+))[ \t]*/y;
+	let offset = separator;
+	let plain: string | undefined;
+	let extended: string | undefined;
+	const seen = new Set<string>();
+	while (offset < header.length) {
+		parameter.lastIndex = offset;
+		const match = parameter.exec(header);
+		if (!match) return undefined;
+		offset = parameter.lastIndex;
+		const name = match[1].toLowerCase();
+		if (name !== "filename" && name !== "filename*") continue;
+		// Duplicate filename parameters are ambiguous, not an ordering override.
+		if (seen.has(name)) return undefined;
+		seen.add(name);
+		const value = match[2] === undefined ? match[3] : match[2].replace(/\\(.)/g, "$1");
+		if (name === "filename") {
+			if (value) plain = value;
+			continue;
+		}
+		// RFC 8187 ext-value: only UTF-8 is supported; quoted ext-values are invalid.
+		const encoded =
+			match[2] === undefined ? /^UTF-8'[A-Za-z0-9-]*'((?:[!#$&+.^_`|~\w-]|%[\da-fA-F]{2})*)$/i.exec(value) : null;
+		if (!encoded) continue;
+		try {
+			const decoded = decodeURIComponent(encoded[1]);
+			if (decoded && !/[\x00-\x1f\x7f]/.test(decoded)) extended = decoded;
+		} catch {
+			// Invalid UTF-8 or percent encoding must not escape classification.
+		}
+	}
+	return extended ?? plain;
+}
+
 /**
  * Get extension from URL or Content-Disposition
  */
 function getExtensionHint(url: string, contentDisposition?: string): string {
-	// Try Content-Disposition filename first
 	if (contentDisposition) {
-		const match = contentDisposition.match(/filename[*]?=["']?([^"';\n]+)/i);
-		if (match) {
-			const ext = path.extname(match[1]).toLowerCase();
-			if (ext) return ext;
-		}
+		const filename = getDispositionFilename(contentDisposition);
+		if (filename !== undefined) return path.extname(filename).toLowerCase();
 	}
 
 	// Fall back to URL path
@@ -891,7 +926,7 @@ async function renderUrl(
 	// Generic downloads can identify PDFs only in Content-Disposition. Inspect the
 	// bounded binary response before raw fallback, and reuse it for conversion.
 	const dispositionBinary =
-		!raw && !isPdf && !skipConvertibleBinaryRetry && isGenericMimeType(mime)
+		!raw && !skipConvertibleBinaryRetry && isGenericMimeType(mime)
 			? await fetchBinary(finalUrl, timeout, signal)
 			: undefined;
 	if (dispositionBinary && !dispositionBinary.ok) {
@@ -907,13 +942,14 @@ async function renderUrl(
 			notes,
 		};
 	}
-	if (dispositionBinary?.ok && getExtensionHint(finalUrl, dispositionBinary.contentDisposition) === ".pdf") {
-		isPdf = true;
-	}
-	if (!skipConvertibleBinaryRetry && (isPdf || isConvertible(mime, extHint))) {
+	const effectiveExt = dispositionBinary?.ok
+		? getExtensionHint(finalUrl, dispositionBinary.contentDisposition)
+		: extHint;
+	isPdf = mime === "application/pdf" || (effectiveExt === ".pdf" && isGenericMimeType(mime));
+	if (!skipConvertibleBinaryRetry && (isPdf || isConvertible(mime, effectiveExt))) {
 		const binary = dispositionBinary ?? (await fetchBinary(finalUrl, timeout, signal));
 		if (binary.ok) {
-			const ext = isPdf ? ".pdf" : getExtensionHint(finalUrl, binary.contentDisposition) || extHint;
+			const ext = isPdf ? ".pdf" : getExtensionHint(finalUrl, binary.contentDisposition);
 			const converted = await convertWithMarkit(binary.buffer, ext, timeout, signal);
 			if (converted.ok) {
 				// Any non-empty markit conversion is preferable to a raw-bytes

@@ -9,6 +9,7 @@ import { loadReadUrlCacheEntry, readUrlCacheTestHooks } from "@gajae-code/coding
 import { ReadTool } from "@gajae-code/coding-agent/tools/read";
 import * as urlGuard from "@gajae-code/coding-agent/web/insane/url-guard";
 import * as scrapers from "@gajae-code/coding-agent/web/scrapers/utils";
+import { strToU8, zipSync } from "fflate";
 
 // A real, deterministic one-page PDF, including byte-accurate cross references.
 function pdfFixture(text: string): string {
@@ -130,6 +131,19 @@ describe("PDF URL source-text inspection", () => {
 		["download", "binary/octet-stream", "attachment; filename=report.pdf"],
 		["download", "unknown", "attachment; filename=report.pdf"],
 		["download", "", "attachment; filename=report.pdf"],
+		["download", "application/octet-stream", "attachment; filename*=UTF-8''report.pdf"],
+		["download", "application/octet-stream", "attachment; filename*=UTF-8''r%C3%A9sum%C3%A9%20report.pdf"],
+		["download", "application/octet-stream", "attachment; filename*=utf-8'en-US'report%2Epdf"],
+		["download", "application/octet-stream", "attachment; filename=report.docx; filename*=UTF-8''report.pdf"],
+		["download", "application/octet-stream", "attachment; filename*=UTF-8''report.pdf; filename=report.docx"],
+		["download", "application/octet-stream", "attachment; filename*=UTF-8''bad%ZZ.docx; filename=report.pdf"],
+		["download", "application/octet-stream", "attachment; filename=report.pdf; filename*=UTF-8''bad%C3%28.docx"],
+		["download", "application/octet-stream", 'attachment; filename="report; final.pdf"'],
+		["download", "application/octet-stream", 'attachment; filename="report final.pdf"'],
+		["download", "application/octet-stream", 'attachment; filename="report\\"final.pdf"'],
+		["download", "application/octet-stream", "attachment; filename=report.pdf; filename*=ISO-8859-1''report.docx"],
+		["download", "application/octet-stream", "attachment; filename=report.pdf; filename*=UTF-8''bad%00.docx"],
+		["document.pdf", "application/pdf", "attachment; filename=report.docx"],
 	]) {
 		it(`extracts short text from ${mime} ${disposition}`, async () => {
 			contentType = mime;
@@ -176,6 +190,72 @@ describe("PDF URL source-text inspection", () => {
 			expect(conversion).not.toHaveBeenCalled();
 			expect(binaryFetch).not.toHaveBeenCalled();
 			expect(requests).toBe(1);
+		});
+	}
+
+	for (const disposition of [
+		"attachment; filename=report.docx",
+		"attachment; filename=report.pdf; filename*=UTF-8''report.docx",
+		'attachment; filename="report.docx"',
+	]) {
+		it(`uses real DOCX conversion instead of the generic .pdf URL for ${disposition}`, async () => {
+			contentType = "application/octet-stream";
+			contentDisposition = disposition;
+			const text = "This real Word document must be converted as DOCX rather than PDF despite its URL filename.";
+			body = Buffer.from(
+				zipSync({
+					"[Content_Types].xml": strToU8(
+						'<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>',
+					),
+					"_rels/.rels": strToU8(
+						'<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>',
+					),
+					"word/document.xml": strToU8(
+						`<?xml version="1.0"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>${text}</w:t></w:r></w:p></w:body></w:document>`,
+					),
+				}),
+			);
+			const binaryFetch = vi.spyOn(scrapers, "fetchBinary");
+			const conversion = vi.spyOn(scrapers, "convertWithMarkit");
+			const result = await loadReadUrlCacheEntry(session, { path: new URL("report.pdf", server.url).href });
+			expect(result.details.method).toBe("markit");
+			expect(result.output).toContain(text);
+			expect(binaryFetch).toHaveBeenCalledTimes(1);
+			expect(conversion).toHaveBeenCalledTimes(1);
+			expect(conversion.mock.calls[0][1]).toBe(".docx");
+		});
+	}
+
+	it("lets a valid extensionless disposition suppress the generic URL PDF hint", async () => {
+		contentType = "application/octet-stream";
+		contentDisposition = "attachment; filename=report.pdf; filename*=UTF-8''download";
+		const binaryFetch = vi.spyOn(scrapers, "fetchBinary");
+		const conversion = vi.spyOn(scrapers, "convertWithMarkit");
+		const result = await loadReadUrlCacheEntry(session, { path: new URL("report.pdf", server.url).href });
+		expect(result.details.method).toBe("raw");
+		expect(conversion).not.toHaveBeenCalled();
+		expect(binaryFetch).toHaveBeenCalledTimes(1);
+	});
+	for (const disposition of [
+		"attachment; filename*=UTF-8''bad%",
+		"attachment; filename*=UTF-8''bad%FF.pdf",
+		"attachment; filename*=UTF-8''bad%00.pdf",
+		"attachment; filename*=ISO-8859-1''report.pdf",
+		"attachment; filename*=report.pdf",
+		"attachment; xfilename=report.pdf",
+		'attachment; filename="unterminated.pdf',
+		"attachment; filename=first.pdf; filename=second.pdf",
+		`attachment; filename=${"x".repeat(8192)}.pdf`,
+	]) {
+		it(`ignores malformed or unsupported filename parameters: ${disposition.slice(0, 100)}`, async () => {
+			contentType = "application/octet-stream";
+			contentDisposition = disposition;
+			const binaryFetch = vi.spyOn(scrapers, "fetchBinary");
+			const conversion = vi.spyOn(scrapers, "convertWithMarkit");
+			const result = await loadReadUrlCacheEntry(session, { path: new URL("download", server.url).href });
+			expect(result.details.method).toBe("raw");
+			expect(conversion).not.toHaveBeenCalled();
+			expect(binaryFetch).toHaveBeenCalledTimes(1);
 		});
 	}
 
