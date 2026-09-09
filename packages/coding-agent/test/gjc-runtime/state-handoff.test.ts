@@ -3,12 +3,19 @@ import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import type { AgentToolContext } from "@gajae-code/agent-core";
+import type { AssistantMessage } from "@gajae-code/ai/types";
+import { Settings } from "@gajae-code/coding-agent/config/settings";
 import {
 	crystalMarkdown,
 	crystalSnapshotDigest,
 	type DeepInterviewCrystal,
 } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-crystallize";
-import { runNativeDeepInterviewCommand } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-runtime";
+import {
+	assertDeepInterviewCrystalCoversLiveTranscript,
+	authoritativeConversationSnapshot,
+	runNativeDeepInterviewCommand,
+} from "@gajae-code/coding-agent/gjc-runtime/deep-interview-runtime";
 import {
 	createDeepInterviewIntentManifest,
 	reviewDeepInterviewIntent,
@@ -21,6 +28,9 @@ import {
 	sessionSpecsDir,
 	sessionStateDir,
 } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
+import { initTheme } from "@gajae-code/coding-agent/modes/theme/theme";
+import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
+import { AskTool } from "@gajae-code/coding-agent/tools/ask";
 import { migrateAndPersistLegacyState } from "../../src/gjc-runtime/state-migrations";
 import {
 	deepInterviewExecutionApprovalRecordPath,
@@ -172,7 +182,7 @@ function parseRequiredJson(text: string | undefined, source: string): Record<str
 }
 
 async function withTempCwd(fn: (cwd: string) => Promise<void>): Promise<void> {
-	const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-state-handoff-"));
+	const dir = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "gjc-state-handoff-")));
 	// Most tests use an isolated session id so the runtime's env-default lookup
 	// cannot select a host-shell session. Tests targeting that lookup set and
 	// restore their own session id exactly.
@@ -207,9 +217,32 @@ async function recordExecutionApproval(
 	questionId = "execution-approval",
 	approvalStage: "deep-interview" | "ralplan" = "deep-interview",
 ): Promise<void> {
-	const transcriptPath = path.join(cwd, "approval-session.jsonl");
-	const transcript = `${JSON.stringify({ type: "session", id: TEST_SESSION_ID, cwd })}\n`;
-	await fs.writeFile(transcriptPath, transcript);
+	const existingRecord = await readJson(deepInterviewExecutionApprovalRecordPath(cwd, TEST_SESSION_ID));
+	let transcriptPath: string;
+	if (typeof existingRecord?.transcript_path === "string") {
+		// Repeated fixture calls must not rewrite the prefix bound by pending consent.
+		transcriptPath = existingRecord.transcript_path;
+	} else {
+		const manager = SessionManager.create(
+			cwd,
+			SessionManager.explicitDestination(path.join(cwd, ".gjc", "sessions")),
+		);
+		try {
+			expect(manager.getSessionId()).toBe(TEST_SESSION_ID);
+			manager.appendMessage({ role: "user", content: "Build the approved feature.", timestamp: 1 });
+			manager.appendMessage(
+				persistedApprovalAssistant([
+					{ type: "toolCall", id: questionId, name: "ask", arguments: { question: "Approve execution?" } },
+				]),
+			);
+			await manager.ensureOnDisk();
+			await manager.flush();
+			transcriptPath = manager.getSessionFile()!;
+		} finally {
+			await manager.close();
+		}
+	}
+	const transcript = await Bun.file(transcriptPath).text();
 	await recordDeepInterviewExecutionApproval({
 		cwd,
 		sessionId: TEST_SESSION_ID,
@@ -223,7 +256,255 @@ async function recordExecutionApproval(
 	});
 }
 
+function persistedApprovalAssistant(content: AssistantMessage["content"]): AssistantMessage {
+	return {
+		role: "assistant",
+		content,
+		api: "openai-responses",
+		provider: "openai",
+		model: "approval-test",
+		usage: {
+			input: 1,
+			output: 1,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 2,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		},
+		stopReason: content.some(part => part.type === "toolCall") ? "toolUse" : "stop",
+		timestamp: Date.now(),
+	};
+}
+
+async function publishPersistedCrystal(cwd: string, sessionId: string): Promise<Record<string, unknown>> {
+	const live = await authoritativeConversationSnapshot(cwd, sessionId);
+	const source = { revision: live.revision, start: 0, end: live.messages.length - 1, messages: live.messages };
+	const result = await runNativeDeepInterviewCommand(
+		[
+			"--crystallize",
+			"--session-id",
+			sessionId,
+			"--slug",
+			"persisted-approval",
+			"--input",
+			JSON.stringify({
+				current_revision: live.revision,
+				snapshot: { ...source, digest: crystalSnapshotDigest(source) },
+				items: live.messages
+					.filter(message => message.role === "user")
+					.map(message => ({
+						id: `requirement:${message.index}`,
+						kind: "acceptance_criterion",
+						classification: "confirmed",
+						statement: message.content,
+						anchor: { message_index: message.index, quote: message.content },
+					})),
+			}),
+			"--json",
+		],
+		cwd,
+	);
+	expect(result.status, result.stderr).toBe(0);
+	return (await readJson(modeStatePath(cwd, sessionId, "deep-interview")))!;
+}
+
+async function withPersistedApprovalSession(
+	fn: (cwd: string, manager: SessionManager, sessionId: string, transcriptPath: string) => Promise<void>,
+): Promise<void> {
+	await withTempCwd(async cwd => {
+		await initTheme(false);
+		const previousFile = process.env.GJC_SESSION_FILE;
+		const manager = SessionManager.create(
+			cwd,
+			SessionManager.explicitDestination(path.join(cwd, ".gjc", "sessions")),
+		);
+		const sessionId = manager.getSessionId();
+		process.env.GJC_SESSION_ID = sessionId;
+		try {
+			manager.appendMessage({ role: "user", content: "Build a report.", timestamp: Date.now() });
+			await manager.ensureOnDisk();
+			await manager.flush();
+			const transcriptPath = manager.getSessionFile()!;
+			process.env.GJC_SESSION_FILE = transcriptPath;
+			await publishPersistedCrystal(cwd, sessionId);
+			await fn(cwd, manager, sessionId, transcriptPath);
+		} finally {
+			await manager.close();
+			restoreEnvironmentValue("GJC_SESSION_FILE", previousFile);
+		}
+	});
+}
+
+async function askAndPersistExecutionApproval(cwd: string, manager: SessionManager, questionId: string): Promise<void> {
+	const label = "Approve execution via ultragoal";
+	const args = {
+		questions: [
+			{
+				id: questionId,
+				question: "Approve this published specification for execution?",
+				options: [{ label }, { label: "Keep planning" }],
+				workflowGate: { stage: "deep-interview" as const, kind: "execution" as const },
+			},
+		],
+	};
+	manager.appendMessage(
+		persistedApprovalAssistant([{ type: "toolCall", id: questionId, name: "ask", arguments: args }]),
+	);
+	await manager.flush();
+	const tool = new AskTool({
+		cwd,
+		hasUI: true,
+		settings: Settings.isolated(),
+		getSessionId: () => manager.getSessionId(),
+		getSessionFile: () => manager.getSessionFile() ?? null,
+		getSessionSpawns: () => "*",
+	});
+	const context = { hasUI: true, ui: { select: async () => label }, abort: () => {} } as unknown as AgentToolContext;
+	const result = await tool.execute(questionId, args, undefined, undefined, context);
+	manager.appendMessage({
+		role: "toolResult",
+		toolCallId: questionId,
+		toolName: "ask",
+		content: result.content,
+		details: result.details,
+		isError: false,
+		timestamp: Date.now(),
+	});
+	manager.appendMessage(
+		persistedApprovalAssistant([{ type: "text", text: "Your approval is recorded; execution has not started." }]),
+	);
+	await manager.flush();
+}
+
+async function approvePersistedCrystal(cwd: string, sessionId: string): Promise<StateCommandResult> {
+	return runNativeDeepInterviewCommand(["approve-execution", "--session-id", sessionId, "--json"], cwd);
+}
+
+async function handoffPersistedCrystal(cwd: string, sessionId: string): Promise<StateCommandResult> {
+	return runNativeStateCommand(
+		["handoff", "--mode", "deep-interview", "--to", "ultragoal", "--session-id", sessionId, "--json"],
+		cwd,
+	);
+}
+
 describe("gjc state handoff", () => {
+	it("persists real Ask toolResult and assistant continuation before Crystal approval and handoff", async () => {
+		await withPersistedApprovalSession(async (cwd, manager, sessionId, transcriptPath) => {
+			await askAndPersistExecutionApproval(cwd, manager, "persisted-ask-v1");
+			const recordPath = deepInterviewExecutionApprovalRecordPath(cwd, sessionId);
+			const pending = (await readJson(recordPath))!;
+			expect(pending.status).toBe("pending");
+			expect(pending.transcript_path).toBe(transcriptPath);
+			expect(
+				createHash("sha256")
+					.update(await Bun.file(transcriptPath).text())
+					.digest("hex"),
+			).not.toBe(pending.transcript_sha256);
+			expect(await readJson(modeStatePath(cwd, sessionId, "ultragoal"))).toBeNull();
+			const approved = await approvePersistedCrystal(cwd, sessionId);
+			expect(approved.status, approved.stderr).toBe(0);
+			manager.appendMessage(persistedApprovalAssistant([{ type: "text", text: "The approved handoff is ready." }]));
+			await manager.flush();
+			const caller = (await readJson(modeStatePath(cwd, sessionId, "deep-interview")))!;
+			const inner = caller.state as Record<string, unknown>;
+			const receipt = inner.execution_approval_receipt as Record<string, unknown>;
+			expect(receipt.transcript_boundary).toEqual(pending.transcript_boundary);
+			expect(receipt.spec_sha256).toBe(pending.spec_sha256);
+			expect(receipt.crystal_source_digest).toBe(pending.crystal_source_digest);
+			expect(await readJson(modeStatePath(cwd, sessionId, "ultragoal"))).toBeNull();
+			const handoff = await handoffPersistedCrystal(cwd, sessionId);
+			expect(handoff.status, handoff.stderr).toBe(0);
+			const callee = (await readJson(modeStatePath(cwd, sessionId, "ultragoal")))!;
+			expect(callee.handoff_from).toBe("deep-interview");
+			expect((await readJson(recordPath))?.status).toBe("consumed");
+		});
+	});
+
+	it("accepts fresh Ask consent for invalidated Crystal v2 while retaining v1 audit and rejecting replay", async () => {
+		await withPersistedApprovalSession(async (cwd, manager, sessionId) => {
+			await askAndPersistExecutionApproval(cwd, manager, "approval-v1");
+			const firstApproval = await approvePersistedCrystal(cwd, sessionId);
+			expect(firstApproval.status, firstApproval.stderr).toBe(0);
+			const recordPath = deepInterviewExecutionApprovalRecordPath(cwd, sessionId);
+			const consumedV1 = (await readJson(recordPath))!;
+			expect(consumedV1.status).toBe("consumed");
+			await expect(askAndPersistExecutionApproval(cwd, manager, "same-publication-replay")).rejects.toThrow(
+				"already consumed",
+			);
+			manager.appendMessage({ role: "user", content: "Encrypt backups.", timestamp: Date.now() });
+			await manager.flush();
+			await expect(assertDeepInterviewCrystalCoversLiveTranscript(cwd, sessionId)).rejects.toThrow(
+				"re-crystallization",
+			);
+			expect((await handoffPersistedCrystal(cwd, sessionId)).status).toBe(2);
+			const publishedV2 = await publishPersistedCrystal(cwd, sessionId);
+			const crystalV2 = (publishedV2.state as Record<string, unknown>).crystal as DeepInterviewCrystal;
+			expect(crystalV2.spec_version).toBe(2);
+			expect(crystalV2.delta.approval_invalidated).toBe(true);
+			expect((publishedV2.state as Record<string, unknown>).execution_approval).toBe("not-approved");
+			expect((await handoffPersistedCrystal(cwd, sessionId)).status).toBe(2);
+			await askAndPersistExecutionApproval(cwd, manager, "approval-v2");
+			const pendingV2 = (await readJson(recordPath))!;
+			expect(pendingV2.crystal_spec_version).toBe(2);
+			expect(pendingV2.crystal_source_digest).toBe(crystalV2.source.digest);
+			expect(pendingV2.spec_path).toBe(publishedV2.spec_path);
+			expect(pendingV2.spec_sha256).toBe(publishedV2.spec_sha256);
+			expect(pendingV2.gate_id).not.toBe(consumedV1.gate_id);
+			expect(await readJson(`${recordPath}.1.${consumedV1.spec_sha256}.consumed`)).toEqual(consumedV1);
+			const secondApproval = await approvePersistedCrystal(cwd, sessionId);
+			expect(secondApproval.status, secondApproval.stderr).toBe(0);
+			expect((await approvePersistedCrystal(cwd, sessionId)).status).toBe(2);
+			expect(await readJson(modeStatePath(cwd, sessionId, "ultragoal"))).toBeNull();
+			const handoff = await handoffPersistedCrystal(cwd, sessionId);
+			expect(handoff.status, handoff.stderr).toBe(0);
+			expect((await readJson(recordPath))?.crystal_spec_version).toBe(2);
+		});
+	});
+
+	for (const mutation of ["replacement", "prefix-edit", "new-user", "branch-rewind", "stale-spec"] as const) {
+		for (const afterApproval of [false, true]) {
+			it(`rejects persisted Ask consent after ${mutation} ${afterApproval ? "at handoff" : "before approval"}`, async () => {
+				await withPersistedApprovalSession(async (cwd, manager, sessionId, transcriptPath) => {
+					await askAndPersistExecutionApproval(cwd, manager, "negative-approval");
+					const pending = (await readJson(deepInterviewExecutionApprovalRecordPath(cwd, sessionId)))!;
+					if (afterApproval) {
+						const approved = await approvePersistedCrystal(cwd, sessionId);
+						expect(approved.status, approved.stderr).toBe(0);
+					}
+					const transcript = await Bun.file(transcriptPath).text();
+					if (mutation === "replacement") {
+						await Bun.write(`${transcriptPath}.replacement`, transcript);
+						await fs.chmod(`${transcriptPath}.replacement`, 0o600);
+						await fs.rename(`${transcriptPath}.replacement`, transcriptPath);
+					} else if (mutation === "prefix-edit") {
+						await Bun.write(transcriptPath, transcript.replace("Build a report.", "Build a portal."));
+					} else if (mutation === "new-user") {
+						manager.appendMessage({ role: "user", content: "Also delete backups.", timestamp: Date.now() });
+						await manager.flush();
+					} else if (mutation === "branch-rewind") {
+						await fs.appendFile(
+							transcriptPath,
+							`${JSON.stringify({
+								type: "message",
+								id: "rewound-assistant",
+								parentId: null,
+								message: persistedApprovalAssistant([{ type: "text", text: "Continue on an earlier branch." }]),
+							})}\n`,
+						);
+					} else {
+						await fs.appendFile(pending.spec_path as string, "\nChanged requirement.\n");
+					}
+					const approved = await approvePersistedCrystal(cwd, sessionId);
+					expect(approved.status, approved.stderr).toBe(2);
+					expect((await handoffPersistedCrystal(cwd, sessionId)).status).toBe(2);
+					expect((await readJson(deepInterviewExecutionApprovalRecordPath(cwd, sessionId)))?.status).toBe(
+						afterApproval ? "consumed" : "pending",
+					);
+					expect(await readJson(modeStatePath(cwd, sessionId, "ultragoal"))).toBeNull();
+				});
+			});
+		}
+	}
 	it("transitions caller -> callee atomically across mode-state and active-state", async () => {
 		await withTempCwd(async cwd => {
 			const callerPath = modeStatePath(cwd, TEST_SESSION_ID, "deep-interview");
@@ -287,7 +568,7 @@ describe("gjc state handoff", () => {
 			expect(approvalRecord).not.toContain("Approve execution via ultragoal");
 			expect(JSON.parse(approvalRecord).answer_hash).toMatch(/^[a-f0-9]{64}$/);
 			const approval = await runNativeDeepInterviewCommand(["approve-execution", "--json"], cwd);
-			expect(approval.status).toBe(0);
+			expect(approval.status, approval.stderr).toBe(0);
 			const after = (await readJson(callerPath)) as Record<string, unknown>;
 			expect((after.state as Record<string, unknown>).execution_approval).toBe("approved");
 			expect((after.state as Record<string, unknown>).execution_approval_receipt).toMatchObject({
@@ -333,7 +614,7 @@ describe("gjc state handoff", () => {
 			});
 		}
 	});
-	it("rejects execution approval when no canonical ready Crystal exists", async () => {
+	it("rejects ordinary spec execution approval without a user-origin approval record", async () => {
 		await withTempCwd(async cwd => {
 			const specPath = path.join(cwd, "legacy.md");
 			await fs.writeFile(specPath, "# Legacy\n");
@@ -350,7 +631,7 @@ describe("gjc state handoff", () => {
 			const before = await fs.readFile(callerPath, "utf-8");
 			const result = await runNativeDeepInterviewCommand(["approve-execution", "--json"], cwd);
 			expect(result.status).toBe(2);
-			expect(result.stderr).toContain("requires a ready canonical Crystal");
+			expect(result.stderr).toContain("ordinary execution approval is missing, expired or consumed");
 			expect(await fs.readFile(callerPath, "utf-8")).toBe(before);
 		});
 	});
@@ -363,7 +644,7 @@ describe("gjc state handoff", () => {
 			const before = await fs.readFile(callerPath, "utf-8");
 			const result = await runNativeDeepInterviewCommand(["approve-execution", "--json"], cwd);
 			expect(result.status).toBe(2);
-			expect(result.stderr).toContain("approval refuses tampered mode-state");
+			expect(result.stderr).toContain("execution approval refuses tampered workflow state");
 			expect(await fs.readFile(callerPath, "utf-8")).toBe(before);
 		});
 	});

@@ -620,12 +620,12 @@ function validateTranscriptRecords(records: unknown[]): void {
 	}
 }
 
-async function authoritativeConversationSnapshot(
+export async function authoritativeConversationSnapshot(
 	cwd: string,
 	sessionId: string,
 ): Promise<{
 	revision: number;
-	messages: Array<{ index: number; role: string; content: string }>;
+	messages: CrystalSnapshot["messages"];
 	transcriptPath: string;
 	transcriptSha256: string;
 }> {
@@ -749,7 +749,7 @@ async function authoritativeConversationSnapshot(
 			path.resolve(header.cwd) !== path.resolve(cwd)
 		)
 			throw new DeepInterviewCommandError(2, "live session transcript identity mismatch");
-		const messages: Array<{ index: number; role: string; content: string }> = [];
+		const messages: CrystalSnapshot["messages"] = [];
 		for (const entry of activeSessionEntries(entries)) {
 			if (entry.type !== "message") continue;
 			const index = messages.length;
@@ -764,6 +764,8 @@ async function authoritativeConversationSnapshot(
 						: ["bashExecution", "pythonExecution", "fileMention"].includes(message.role)
 							? "tool"
 							: message.role;
+			if (!["user", "assistant", "system", "developer", "tool", "toolResult"].includes(role))
+				throw new DeepInterviewCommandError(2, "live session transcript contains an unsupported message role");
 			let projectedContent: string;
 			if (["bashExecution", "pythonExecution", "fileMention"].includes(message.role)) {
 				projectedContent = `[${message.role} sha256:${createHash("sha256").update(JSON.stringify(message)).digest("hex")}]`;
@@ -794,7 +796,11 @@ async function authoritativeConversationSnapshot(
 			} else {
 				throw new DeepInterviewCommandError(2, "live session transcript contains malformed message content");
 			}
-			messages.push({ index, role, content: projectedContent.normalize("NFC").trim() });
+			messages.push({
+				index,
+				role: role as CrystalSnapshot["messages"][number]["role"],
+				content: projectedContent.normalize("NFC").trim(),
+			});
 		}
 		if (messages.length === 0) throw new DeepInterviewCommandError(2, "live session transcript has no messages");
 		return {
@@ -1138,7 +1144,10 @@ export async function assertDeepInterviewCrystalCoversLiveTranscript(
 	const crystal = parseStoredCrystal(parsed.state.crystal);
 	const liveSnapshot = await authoritativeConversationSnapshot(cwd, sessionId);
 	const source = verifyCrystalSourceAgainstLive(crystal, liveSnapshot);
-	if (requireCrystalTail && source.end !== liveSnapshot.messages.length - 1)
+	if (
+		requireCrystalTail &&
+		liveSnapshot.messages.slice(source.end + 1).some(message => !["assistant", "toolResult"].includes(message.role))
+	)
 		throw new DeepInterviewCommandError(2, "execution approval requires re-crystallization after transcript changes");
 	return { transcriptPath: liveSnapshot.transcriptPath, transcriptSha256: liveSnapshot.transcriptSha256 };
 }

@@ -500,10 +500,12 @@ function semanticProfile(value: string): CrystalSemanticProfile {
 		/(?:안|않|못|없|아니|하지\s*마|마세요|말자|금지|禁止|ない|ません|ぬ|ず|たくない|不|無|无|没|沒|未|否|勿|毋|别|別|莫)/u.test(
 			normalized,
 		);
+	// Clause-initial auxiliary inversion is unsafe regardless of the actor or action.
+	// Exclude direct negative imperatives such as "Do not export reports".
 	const interrogative =
 		/[?？]/u.test(normalized) ||
 		/\b(?:whether|wonder(?:s|ing)?|question(?:s|ed|ing)?)\b/i.test(normalized) ||
-		/(?:^|[.!?。！？;\n]\s*)\s*["'“‘]?(?:can|could|should|would|will|shall|must|may|do|does|did|is|are|was|were|has|have|had)\s+(?:we|you|they|he|she|it|i|(?:the|a|an|our|your|their|these|those)\s+\w+|admins?|users?|operators?|(?!not\b|never\b)[\p{L}][\p{L}\p{N}_'-]*\s+(?:be|have|enabled|disabled|encrypted|required|allowed))\b/iu.test(
+		/(?:^|[.!?。！？;\n]\s*)\s*["'“‘]?(?:can|could|should|would|will|shall|must|may|do|does|did|is|are|was|were|has|have|had)\s+(?!not\b|never\b)[\p{L}][\p{L}\p{N}_'-]*/iu.test(
 			normalized,
 		) ||
 		/(?:吗|嗎|呢|나요|습니까|습니까|인가요|인가|ㄹ까요|을까요|까요|궁금|어떻게|무엇|무엇을|왜|언제|어디|얼마|몇|多少|什么|什麼|哪个|哪個|为何|為何|怎么|怎麼|如何|何时|何時|哪里|哪裡|是否|疑問|かどうか)/u.test(

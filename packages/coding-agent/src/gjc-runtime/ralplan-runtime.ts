@@ -1062,9 +1062,12 @@ async function persistActiveRunId(cwd: string, sessionId: string, runId: string,
 				}
 				delete existing.planning_stuck;
 				delete existing.auto_handoff;
-				delete existing.handoff_from;
-				delete existing.handoff_at;
-				delete existing.upstream_handoff_at;
+				// Initial run establishment retains the incoming handoff; only a replacement run severs it.
+				if (existing.run_id !== undefined) {
+					delete existing.handoff_from;
+					delete existing.handoff_at;
+					delete existing.upstream_handoff_at;
+				}
 				delete existing.final_admission_phase_transition;
 			}
 			if (
@@ -1510,6 +1513,9 @@ async function persistRalplanFinalAdmission(
 			}
 			let existing: Record<string, unknown> = existingRead.kind === "valid" ? existingRead.value : {};
 			if (existing.run_id !== runId) return;
+			const phase = typeof existing.current_phase === "string" ? existing.current_phase.trim() : "";
+			if (getSkillManifest("ralplan").phaseLock.includes(phase) && (phase !== "final" || existing.active === false))
+				return;
 			const pending =
 				existing.final_publication_pending &&
 				typeof existing.final_publication_pending === "object" &&
@@ -1583,23 +1589,53 @@ async function markRalplanFinalPublicationPending(
 	sessionId: string,
 	runId: string,
 	publication: { id: string; sha256: string },
-): Promise<void> {
+	recovery = false,
+): Promise<boolean> {
 	const statePath = ralplanStatePath(cwd, sessionId);
-	await withWorkflowStateLock(
+	return await withWorkflowStateLock(
 		statePath,
 		async () => {
 			const existingRead = await readExistingStateForMutation(statePath);
 			if (existingRead.kind === "corrupt")
 				throw new RalplanCommandError(2, `existing ralplan state is corrupt or tampered (${existingRead.error})`);
 			let existing: Record<string, unknown> = existingRead.kind === "valid" ? existingRead.value : {};
-			if (existing.run_id === runId && existing.active === false && existing.current_phase === "handoff")
-				throw new RalplanCommandError(2, "cannot publish a new final after the Ralplan run has handed off");
+			const phase = typeof existing.current_phase === "string" ? existing.current_phase.trim() : "";
+			// Active final is publication/approval, not a terminal lifecycle despite its stage phase lock.
+			const phaseLocked =
+				getSkillManifest("ralplan").phaseLock.includes(phase) && (phase !== "final" || existing.active === false);
+			if (recovery) {
+				// A receipt lookup may repair its current projection, never select a historical run.
+				if (phaseLocked || (existingRead.kind === "valid" && existing.run_id !== runId)) return false;
+				const pending = existing.final_publication_pending;
+				if (
+					pending !== undefined &&
+					(!pending ||
+						typeof pending !== "object" ||
+						Array.isArray(pending) ||
+						(pending as Record<string, unknown>).run_id !== runId ||
+						(pending as Record<string, unknown>).final_sha256 !== publication.sha256)
+				)
+					return false;
+				const index = await loadRalplanIndexForCap(cwd, sessionId, runId);
+				let lastFinalSha: unknown;
+				for (const line of index.rawText?.split(/\r?\n/) ?? []) {
+					if (!line.trim()) continue;
+					const row = JSON.parse(line) as Record<string, unknown>;
+					if (row.stage === "final") lastFinalSha = row.sha256;
+				}
+				if (lastFinalSha !== publication.sha256) return false;
+			} else if (existing.run_id === runId && phaseLocked) {
+				throw new RalplanCommandError(2, "cannot publish a new final after the Ralplan run reached a locked phase");
+			}
 			if (existing.run_id !== runId) {
 				delete existing.planning_stuck;
 				delete existing.auto_handoff;
-				delete existing.handoff_from;
-				delete existing.handoff_at;
-				delete existing.upstream_handoff_at;
+				// A first final may establish the run directly after a planning handoff.
+				if (existing.run_id !== undefined) {
+					delete existing.handoff_from;
+					delete existing.handoff_at;
+					delete existing.upstream_handoff_at;
+				}
 				delete existing.final_admission_phase_transition;
 			}
 			existing.skill = "ralplan";
@@ -1623,6 +1659,7 @@ async function markRalplanFinalPublicationPending(
 				receipt: { cwd, skill: "ralplan", owner: "gjc-runtime", command: "gjc ralplan final-pending", sessionId },
 				audit: { category: "state", verb: "write", owner: "gjc-runtime", skill: "ralplan", sessionId },
 			});
+			return true;
 		},
 		{ cwd },
 	);
@@ -2387,14 +2424,23 @@ async function handleArtifactWrite(
 			if (existingArtifact.autoHandoff) {
 				const planningStuck = await readRalplanPlanningStuck(persistCwd, resolved.sessionId, resolved.runId);
 				const publication = { id: randomUUID(), sha256: existingArtifact.sha256 };
-				await markRalplanFinalPublicationPending(persistCwd, resolved.sessionId, resolved.runId, publication);
-				await persistRalplanFinalAdmission(
-					persistCwd,
-					resolved.sessionId,
-					resolved.runId,
-					applyRalplanPlanningStuckOverride(existingArtifact.autoHandoff, planningStuck),
-					publication,
-				);
+				if (
+					await markRalplanFinalPublicationPending(
+						persistCwd,
+						resolved.sessionId,
+						resolved.runId,
+						publication,
+						true,
+					)
+				) {
+					await persistRalplanFinalAdmission(
+						persistCwd,
+						resolved.sessionId,
+						resolved.runId,
+						applyRalplanPlanningStuckOverride(existingArtifact.autoHandoff, planningStuck),
+						publication,
+					);
+				}
 			}
 		}
 		return await buildDeduplicatedResult(resolved, existingArtifact, sha256, persistCwd, repositoryBinding);
@@ -2420,14 +2466,23 @@ async function handleArtifactWrite(
 		);
 		if (resolved.stage === "final") {
 			const recoveryPublication = { id: randomUUID(), sha256 };
-			await markRalplanFinalPublicationPending(persistCwd, resolved.sessionId, resolved.runId, recoveryPublication);
-			await persistRalplanFinalAdmission(
-				persistCwd,
-				resolved.sessionId,
-				resolved.runId,
-				unavailableRalplanFinalAdmission(),
-				recoveryPublication,
-			);
+			if (
+				await markRalplanFinalPublicationPending(
+					persistCwd,
+					resolved.sessionId,
+					resolved.runId,
+					recoveryPublication,
+					true,
+				)
+			) {
+				await persistRalplanFinalAdmission(
+					persistCwd,
+					resolved.sessionId,
+					resolved.runId,
+					unavailableRalplanFinalAdmission(),
+					recoveryPublication,
+				);
+			}
 		}
 		let appliedPersistedRoleState: PersistedRoleStateUpdate | undefined;
 		if (

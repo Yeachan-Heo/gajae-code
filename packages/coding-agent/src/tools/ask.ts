@@ -37,6 +37,7 @@ import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import { appendOrMergeDeepInterviewRound, syncDeepInterviewRecorderHud } from "../gjc-runtime/deep-interview-recorder";
 import {
 	assertDeepInterviewCrystalCoversLiveTranscript,
+	authoritativeConversationSnapshot,
 	deepInterviewStatePath,
 } from "../gjc-runtime/deep-interview-runtime";
 import {
@@ -45,8 +46,11 @@ import {
 	MAX_USER_RESPONSE_LENGTH,
 } from "../gjc-runtime/deep-interview-state";
 import {
+	executionApprovalLineage,
 	recordDeepInterviewExecutionApproval,
+	recordNonCrystalExecutionApproval,
 	revokeDeepInterviewExecutionApproval,
+	revokeNonCrystalExecutionApproval,
 	runNativeStateCommand,
 } from "../gjc-runtime/state-runtime";
 import {
@@ -891,16 +895,26 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 		const target = deepInterviewExecutionTarget(selectedOptions);
 		const sessionId = this.session.getSessionId?.();
 		if (!target || customInput !== undefined) {
-			if (sessionId) await revokeDeepInterviewExecutionApproval(this.session.cwd, sessionId);
+			if (sessionId) {
+				await revokeDeepInterviewExecutionApproval(this.session.cwd, sessionId);
+				await revokeNonCrystalExecutionApproval(
+					this.session.cwd,
+					sessionId,
+					ralplanApproval ? "ralplan" : "deep-interview",
+				);
+			}
 			return;
 		}
 		if (!sessionId) throw new ToolAbortError("Deep Interview execution approval requires a session");
-		const transcriptEvidence = await assertDeepInterviewCrystalCoversLiveTranscript(
-			this.session.cwd,
-			sessionId,
-			deepInterviewExecution,
-		);
-		await recordDeepInterviewExecutionApproval({
+		const approvalStage = ralplanApproval ? "ralplan" : "deep-interview";
+		const lineage = await executionApprovalLineage(this.session.cwd, sessionId, approvalStage);
+		const transcriptEvidence =
+			lineage === "crystal"
+				? await assertDeepInterviewCrystalCoversLiveTranscript(this.session.cwd, sessionId, deepInterviewExecution)
+				: await authoritativeConversationSnapshot(this.session.cwd, sessionId);
+		const recordApproval =
+			lineage === "crystal" ? recordDeepInterviewExecutionApproval : recordNonCrystalExecutionApproval;
+		await recordApproval({
 			cwd: this.session.cwd,
 			sessionId,
 			questionId: q.id,
@@ -909,11 +923,18 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 			selectedOptions,
 			transcriptPath: transcriptEvidence.transcriptPath,
 			transcriptSha256: transcriptEvidence.transcriptSha256,
-			approvalStage: ralplanApproval ? "ralplan" : "deep-interview",
+			approvalStage,
 		});
 		if (ralplanApproval) {
 			const result = await runNativeStateCommand(
-				["approve-execution", "--mode", "deep-interview", "--session-id", sessionId, "--json"],
+				[
+					"approve-execution",
+					"--mode",
+					lineage === "crystal" ? "deep-interview" : approvalStage,
+					"--session-id",
+					sessionId,
+					"--json",
+				],
 				this.session.cwd,
 			);
 			if (result.status !== 0)

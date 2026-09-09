@@ -2951,13 +2951,17 @@ describe("AskTool deep-interview recorder persistence", () => {
 	});
 
 	it("mints execution approval only from an accepted structured user choice", async () => {
+		spyOn(stateRuntime, "executionApprovalLineage").mockResolvedValue("crystal");
+		spyOn(stateRuntime, "revokeNonCrystalExecutionApproval").mockResolvedValue();
 		spyOn(deepInterviewRuntime, "assertDeepInterviewCrystalCoversLiveTranscript").mockResolvedValue({
 			transcriptPath: "/tmp/session.jsonl",
 			transcriptSha256: "a".repeat(64),
 		});
 		const record = spyOn(stateRuntime, "recordDeepInterviewExecutionApproval").mockResolvedValue({
 			path: "/tmp/deep-interview-execution-approval.json",
-			record: {} as DeepInterviewExecutionApprovalRecord,
+			record: {
+				transcript_boundary: { byte_length: 1, device: "1", inode: "1", leaf_id: null },
+			} as DeepInterviewExecutionApprovalRecord,
 		});
 		const revoke = spyOn(stateRuntime, "revokeDeepInterviewExecutionApproval").mockResolvedValue();
 		const question = {
@@ -3044,7 +3048,9 @@ describe("AskTool deep-interview recorder persistence", () => {
 	it("does not mint execution approval after a multi-question choice is revised", async () => {
 		const record = spyOn(stateRuntime, "recordDeepInterviewExecutionApproval").mockResolvedValue({
 			path: "/tmp/deep-interview-execution-approval.json",
-			record: {} as DeepInterviewExecutionApprovalRecord,
+			record: {
+				transcript_boundary: { byte_length: 1, device: "1", inode: "1", leaf_id: null },
+			} as DeepInterviewExecutionApprovalRecord,
 		});
 		let executionVisits = 0;
 		let confirmationVisits = 0;
@@ -3429,9 +3435,12 @@ describe("AskTool deep-interview recorder persistence", () => {
 			supportsRemoteGateAnswers: () => true,
 			emitGate: vi.fn(async () => ({ selected: ["Approve execution via ultragoal"] })),
 		};
+		spyOn(stateRuntime, "executionApprovalLineage").mockResolvedValue("crystal");
 		const approvalRecord = spyOn(stateRuntime, "recordDeepInterviewExecutionApproval").mockResolvedValue({
 			path: "/tmp/ralplan-approval.json",
-			record: {} as DeepInterviewExecutionApprovalRecord,
+			record: {
+				transcript_boundary: { byte_length: 1, device: "1", inode: "1", leaf_id: null },
+			} as DeepInterviewExecutionApprovalRecord,
 		});
 		spyOn(deepInterviewRuntime, "assertDeepInterviewCrystalCoversLiveTranscript").mockResolvedValue({
 			transcriptPath: "/tmp/ralplan-approval/session.jsonl",
