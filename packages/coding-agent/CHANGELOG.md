@@ -3,6 +3,7 @@
 ## [Unreleased]
 ### Changed
 
+- The embedded changelog is parsed once per process instead of on every lookup. Startup and each `/changelog` invocation re-split and re-scanned the full 710 KB embedded text; the text is immutable, so the first parse is now reused.
 - The macOS file-descriptor preflight reads the inherited soft limit with a plain `sh -c` instead of a login shell, so launching no longer sources the user's shell profile on every start. The inherited limit is also the value the warning actually describes — a login-shell value could disagree with what the process is really running under.
 - `GJC_TIMING` now measures the real cold start. The timing window opens at the first CLI statement (`cli:installRuntimeGlobals`, `cli:dispatch` spans), exposing the runtime-globals install, the macOS nofile preflight, and the launch command's module graph that previously escaped measurement because the window opened inside `main.ts`. `GJC_TIMING=x` boots interactive mode through the first transcript paint (`interactive:init` / `interactive:firstPaint` spans) before printing the tree and exiting, making the total a true time-to-first-render measure instead of a pre-TUI proxy.
 
