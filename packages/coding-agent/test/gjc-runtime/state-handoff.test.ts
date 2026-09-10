@@ -1302,6 +1302,11 @@ describe("gjc state handoff", () => {
 				cwd,
 			);
 			expect(final.status, final.stderr).toBe(0);
+			const ready = await runNativeStateCommand(
+				["write", "--mode", "ralplan", "--input", JSON.stringify({ current_phase: "handoff" }), "--json"],
+				cwd,
+			);
+			expect(ready.status, ready.stderr).toBe(0);
 			const wrongTarget = await runNativeStateCommand(
 				["handoff", "--mode", "ralplan", "--to", "ultragoal", "--json"],
 				cwd,

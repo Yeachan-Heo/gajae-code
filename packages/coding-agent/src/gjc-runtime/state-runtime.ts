@@ -1649,8 +1649,15 @@ async function handleWrite(args: readonly string[], cwd: string): Promise<StateC
 							"ralplan",
 							existingPayload,
 						);
+						const admission = isPlainObject(existingPayload.auto_handoff)
+							? existingPayload.auto_handoff
+							: undefined;
 						sanctionedRalplanHandoff =
-							approvedLineage || (await hasSanctionedRalplanFinalAdmission(cwd, sessionId, existingPayload));
+							approvedLineage ||
+							(admission?.effectiveTarget === "ultragoal" &&
+								(await hasSanctionedRalplanFinalAdmission(cwd, sessionId, existingPayload, "ultragoal"))) ||
+							(admission?.effectiveTarget === "autoresearch" &&
+								(await hasSanctionedRalplanFinalAdmission(cwd, sessionId, existingPayload, "autoresearch")));
 					} catch {}
 				}
 				if (!isValidTransition(mode, fromPhase, toPhase) && !sanctionedRalplanHandoff && !forced) {
@@ -2091,6 +2098,7 @@ async function assertExecutionApprovalTranscriptEvidence(
 	const entryOffsets = new WeakMap<Record<string, unknown>, number>();
 	const replayById = new Map<string, Record<string, unknown>>();
 	let transcriptVersion: number | undefined;
+	let sawSessionHeader = false;
 	let transcriptOffset = 0;
 	for (const rawLine of transcriptText.match(/[^\n]*(?:\n|$)/g) ?? []) {
 		const lineOffset = transcriptOffset;
@@ -2104,11 +2112,20 @@ async function assertExecutionApprovalTranscriptEvidence(
 			throw new StateCommandError(2, "deep-interview execution approval transcript is malformed");
 		}
 		if (!isPlainObject(entry))
-			throw new StateCommandError(2, "deep-interview execution approval transcript is malformed");
+			if (!isPlainObject(entry))
+				throw new StateCommandError(2, "deep-interview execution approval transcript is malformed");
 		if (entry.type === "session") {
+			if (sawSessionHeader)
+				throw new StateCommandError(2, "deep-interview execution approval transcript has multiple session headers");
+			sawSessionHeader = true;
 			transcriptVersion = typeof entry.version === "number" ? entry.version : undefined;
 		} else if (entry.type === "entry_patch") {
-			if (typeof entry.entryId !== "string" || !isPlainObject(entry.patch))
+			if (
+				typeof entry.entryId !== "string" ||
+				!isPlainObject(entry.patch) ||
+				!Object.keys(entry).every(key => key === "type" || key === "entryId" || key === "patch") ||
+				!Object.keys(entry.patch).every(key => key === "message")
+			)
 				throw new StateCommandError(2, "deep-interview execution approval transcript patch is malformed");
 			const target = replayById.get(entry.entryId);
 			if (
@@ -2124,6 +2141,8 @@ async function assertExecutionApprovalTranscriptEvidence(
 			if (typeof entry.id === "string") replayById.set(entry.id, entry);
 		}
 	}
+	if (!sawSessionHeader)
+		throw new StateCommandError(2, "deep-interview execution approval transcript lacks a session header");
 	let activeEntries = persistedEntries;
 	if (persistedEntries.some(entry => "id" in entry || "parentId" in entry)) {
 		const byId = new Map<string, Record<string, unknown>>();

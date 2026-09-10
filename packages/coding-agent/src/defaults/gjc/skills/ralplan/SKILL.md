@@ -123,7 +123,7 @@ The consensus workflow:
    gjc state ralplan write --input '{"current_phase":"handoff"}' --json
    ```
 
-   The skill tool then dispatches the execution skill same-turn and runs `gjc state ralplan handoff --to ultragoal --json` in-process to atomically demote ralplan, promote the callee, and sync `.gjc/_session-{sessionid}/state/skill-active-state.json`. You do not need to run the handoff verb yourself.
+   The skill tool then dispatches the admitted skill same-turn and runs `gjc state ralplan handoff --to <effectiveTarget> --json` in-process (`ultragoal` or `autoresearch`) to atomically demote ralplan, promote the callee, and sync `.gjc/_session-{sessionid}/state/skill-active-state.json`. You do not need to run the handoff verb yourself.
 
 > **Important:** Architect and Critic MAY run in the same parallel batch only for the plan-only Critic lane after Planner persistence (review pass 1). Pass 2+ re-reviews MUST run sequentially Architect -> Critic: await Architect before issuing Critic, pass the current-pass Architect receipt/path to Critic for the rule-5 counter-review, then apply the same review join gate before consensus.
 
