@@ -2099,6 +2099,7 @@ async function assertExecutionApprovalTranscriptEvidence(
 	const replayById = new Map<string, Record<string, unknown>>();
 	let transcriptVersion: number | undefined;
 	let sawSessionHeader = false;
+	let recordOrdinal = 0;
 	let transcriptOffset = 0;
 	for (const rawLine of transcriptText.match(/[^\n]*(?:\n|$)/g) ?? []) {
 		const lineOffset = transcriptOffset;
@@ -2112,13 +2113,20 @@ async function assertExecutionApprovalTranscriptEvidence(
 			throw new StateCommandError(2, "deep-interview execution approval transcript is malformed");
 		}
 		if (!isPlainObject(entry))
-			if (!isPlainObject(entry))
-				throw new StateCommandError(2, "deep-interview execution approval transcript is malformed");
+			throw new StateCommandError(2, "deep-interview execution approval transcript is malformed");
 		if (entry.type === "session") {
-			if (sawSessionHeader)
+			if (sawSessionHeader || recordOrdinal !== 0)
 				throw new StateCommandError(2, "deep-interview execution approval transcript has multiple session headers");
 			sawSessionHeader = true;
 			transcriptVersion = typeof entry.version === "number" ? entry.version : undefined;
+		} else if (entry.type === "header_patch") {
+			if (
+				!sawSessionHeader ||
+				!isPlainObject(entry.patch) ||
+				!Object.keys(entry).every(key => key === "type" || key === "patch") ||
+				!Object.keys(entry.patch).every(key => key === "cwd" || key === "title")
+			)
+				throw new StateCommandError(2, "deep-interview execution approval transcript header patch is malformed");
 		} else if (entry.type === "entry_patch") {
 			if (
 				typeof entry.entryId !== "string" ||
@@ -2140,6 +2148,7 @@ async function assertExecutionApprovalTranscriptEvidence(
 			entryOffsets.set(entry, lineOffset);
 			if (typeof entry.id === "string") replayById.set(entry.id, entry);
 		}
+		recordOrdinal++;
 	}
 	if (!sawSessionHeader)
 		throw new StateCommandError(2, "deep-interview execution approval transcript lacks a session header");
