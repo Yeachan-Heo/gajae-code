@@ -2118,6 +2118,14 @@ interface NonCrystalExecutionApprovalRecord {
 	expires_at: string;
 }
 
+export interface ExecutionApprovalPresentation {
+	state_path: string;
+	state_revision: number;
+	artifact_path: string;
+	artifact_sha256: string;
+	run_id: string | null;
+}
+
 export function nonCrystalExecutionApprovalRecordPath(
 	cwd: string,
 	sessionId: string,
@@ -2172,6 +2180,45 @@ async function nonCrystalApprovalPublication(cwd: string, sessionId: string, sta
 		state_revision: revision,
 		artifact_path: path.resolve(state.spec_path),
 		artifact_sha256: state.spec_sha256,
+		run_id: null,
+	};
+}
+
+/** Capture the exact publication shown by an execution approval gate. */
+export async function captureExecutionApprovalPresentation(
+	cwd: string,
+	sessionId: string,
+	stage: ExecutionApprovalStage,
+): Promise<ExecutionApprovalPresentation> {
+	if ((await executionApprovalLineage(cwd, sessionId, stage)) === "ordinary")
+		return nonCrystalApprovalPublication(cwd, sessionId, stage);
+	const statePath = modeStateFile(cwd, "deep-interview", sessionId);
+	const read = await readExistingStateForMutation(statePath);
+	if (read.kind !== "valid") throw new StateCommandError(2, "execution approval state is unavailable");
+	const envelope = read.value;
+	if (stage === "ralplan") {
+		const ralplanRead = await readExistingStateForMutation(modeStateFile(cwd, "ralplan", sessionId));
+		if (ralplanRead.kind !== "valid")
+			throw new StateCommandError(2, "Ralplan execution approval requires valid final state");
+		const final = await verifiedRalplanFinalEvidence(cwd, sessionId, ralplanRead.value);
+		if (!final) throw new StateCommandError(2, "execution approval requires verified Ralplan final evidence");
+		return {
+			state_path: path.resolve(statePath),
+			state_revision: existingStateRevision(envelope)!,
+			artifact_path: final.finalPath,
+			artifact_sha256: final.finalSha256,
+			run_id: final.runId,
+		};
+	}
+	if (typeof envelope.spec_path !== "string" || !isSha256(envelope.spec_sha256))
+		throw new StateCommandError(2, "execution approval requires a canonically published final spec");
+	const revision = existingStateRevision(envelope);
+	if (revision === undefined) throw new StateCommandError(2, "execution approval state revision is invalid");
+	return {
+		state_path: path.resolve(statePath),
+		state_revision: revision,
+		artifact_path: path.resolve(envelope.spec_path),
+		artifact_sha256: envelope.spec_sha256,
 		run_id: null,
 	};
 }
@@ -2283,6 +2330,7 @@ export async function recordNonCrystalExecutionApproval(options: {
 	selectedOptions: string[];
 	transcriptPath: string;
 	transcriptSha256: string;
+	presentation?: ExecutionApprovalPresentation;
 }): Promise<void> {
 	const { cwd, sessionId, approvalStage: stage } = options;
 	if (
@@ -2296,6 +2344,8 @@ export async function recordNonCrystalExecutionApproval(options: {
 		modeStateFile(cwd, stage, sessionId),
 		async () => {
 			const publication = await nonCrystalApprovalPublication(cwd, sessionId, stage);
+			if (options.presentation && JSON.stringify(options.presentation) !== JSON.stringify(publication))
+				throw new StateCommandError(2, "ordinary execution approval publication changed while awaiting consent");
 			await withWorkflowStateLock(
 				nonCrystalExecutionApprovalRecordPath(cwd, sessionId, stage),
 				async () => {
@@ -2668,6 +2718,7 @@ export async function recordDeepInterviewExecutionApproval(options: {
 	transcriptPath: string;
 	transcriptSha256: string;
 	approvalStage?: "deep-interview" | "ralplan";
+	presentation?: ExecutionApprovalPresentation;
 }): Promise<{ path: string; record: DeepInterviewExecutionApprovalRecord }> {
 	if (options.target !== "ultragoal")
 		throw new StateCommandError(2, "deep-interview execution approval target must be ultragoal");
@@ -2761,6 +2812,26 @@ export async function recordDeepInterviewExecutionApproval(options: {
 			const currentRevision = existingStateRevision(envelope);
 			if (typeof currentRevision !== "number" || !Number.isSafeInteger(currentRevision) || currentRevision < 0)
 				throw new StateCommandError(2, "deep-interview execution approval requires a valid state revision");
+			const currentPresentation: ExecutionApprovalPresentation = ralplanFinal
+				? {
+						state_path: path.resolve(statePath),
+						state_revision: currentRevision,
+						artifact_path: ralplanFinal.finalPath,
+						artifact_sha256: ralplanFinal.finalSha256,
+						run_id: ralplanFinal.runId,
+					}
+				: {
+						state_path: path.resolve(statePath),
+						state_revision: currentRevision,
+						artifact_path: specPath,
+						artifact_sha256: envelope.spec_sha256 as string,
+						run_id: null,
+					};
+			if (options.presentation && JSON.stringify(options.presentation) !== JSON.stringify(currentPresentation))
+				throw new StateCommandError(
+					2,
+					"deep-interview execution approval publication changed while awaiting consent",
+				);
 			const gateId = options.gateId ?? options.questionId;
 			if (!isExecutionApprovalId(gateId))
 				throw new StateCommandError(2, "deep-interview execution approval descriptor is invalid");
