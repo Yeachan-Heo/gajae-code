@@ -12,6 +12,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import path from "node:path";
 import packageJson from "../../package.json" with { type: "json" };
+import { PublicCommandFailure, renderPublicCommandFailure } from "../../src/cli/public-command-errors";
 import { AcpSdkAdapter } from "../../src/sdk/acp";
 import { Broker } from "../../src/sdk/broker";
 import { brokerOwnerForTest } from "../../src/sdk/broker/ensure";
@@ -529,15 +530,22 @@ export async function runDaemonCli(
 ): Promise<{ output: unknown; exitCode: number | undefined }> {
 	let output: unknown;
 	let exitCode: number | undefined;
-	await runSdkSessionCli(
-		args,
-		value => {
+	try {
+		await runSdkSessionCli(args, value => {
 			output = value;
-		},
-		code => {
-			exitCode = code;
-		},
-	);
+		});
+	} catch (error) {
+		expect(error).toBeInstanceOf(PublicCommandFailure);
+		if (!(error instanceof PublicCommandFailure)) throw error;
+		expect(output).toBeUndefined();
+		const rendered = await renderPublicCommandFailure(error, {
+			command: ["sdk", "session", "raw"],
+			json: true,
+			agentDir: args.agentDir,
+		});
+		output = JSON.parse(rendered.stdout);
+		exitCode = rendered.exitCode;
+	}
 	return { output, exitCode };
 }
 
@@ -563,13 +571,55 @@ export async function assertDaemonCliRow(operation: Operation, secret: boolean):
 		};
 		const result = await runDaemonCli(args);
 		if (expected === "forwarded") {
-			if (action === "global") {
-				if (operation.sdkId === "session.close")
-					expect(result.output).toMatchObject({ ok: false, error: { code: "not_found" } });
-				else expectGlobalSemanticResult(operation, result.output);
-			} else expectSemanticResult(operation, result.output);
+			const domainCode =
+				action === "global"
+					? operation.sdkId === "session.close"
+						? "not_found"
+						: expectedGlobalErrors[operation.sdkId]
+					: expectedDomainErrors[operation.sdkId];
+			if (domainCode) {
+				// The public boundary deliberately replaces private domain codes with safe categories.
+				const publicCode =
+					domainCode === "invalid_input" && action !== "global"
+						? "usage"
+						: domainCode === "unavailable"
+							? "unavailable"
+							: "operation_failed";
+				expect(result.output).toMatchObject({
+					schema: "gjc.command-error",
+					ok: false,
+					error: { code: publicCode },
+				});
+				expect(result.exitCode).toBe(publicCode === "usage" ? 2 : 1);
+				if (action === "global") {
+					const error = (
+						result.output as {
+							error: { outcomeCertainty: string; references: { kind: string; value: string }[] };
+						}
+					).error;
+					expect(error.outcomeCertainty).toBe("unknown");
+					expect(Array.isArray(error.references)).toBe(true);
+					expect(
+						error.references.some(
+							reference => reference.kind === "idempotencyKey" && reference.value === `parity-${operation.id}`,
+						),
+					).toBe(true);
+					if (typeof input.sessionId === "string")
+						expect(
+							error.references.some(
+								reference => reference.kind === "sessionId" && reference.value === input.sessionId,
+							),
+						).toBe(true);
+				}
+			} else {
+				if (action === "global") expectGlobalSemanticResult(operation, result.output);
+				else expectSemanticResult(operation, result.output);
+				expect(result.exitCode).toBeUndefined();
+			}
 		} else expect(result.output).toMatchObject({ ok: false, error: expect.any(Object) });
 		expectObservation(host, before, operation, expected);
+		expect(JSON.stringify(result.output)).not.toContain("capability-shaped-probe");
+		expect(JSON.stringify(result.output)).not.toContain(host.endpoint.token);
 	} finally {
 		await stopFixture(host, operation);
 	}

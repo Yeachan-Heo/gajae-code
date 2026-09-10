@@ -39,8 +39,14 @@ export function resolveDaemonAction(token: string | undefined): DaemonAction | u
 	return DAEMON_ACTION_ALIASES[token];
 }
 
-/** Exit codes for `gjc daemon`. Backward compatible: success 0, any failure 1. */
-export const DAEMON_EXIT = { ok: 0, failure: 1 } as const;
+/** Public input failures exit 2; operational failures retain exit 1. */
+export const DAEMON_EXIT = { ok: 0, failure: 1, usage: 2 } as const;
+
+/** A refused result may follow a successful stop or spawn; snapshots and prose
+ * do not prove that no effect occurred. Only completed results prove applied. */
+export function daemonOperationOutcome(result: DaemonOperationResult): "applied" | "unknown" {
+	return result.ok ? "applied" : "unknown";
+}
 
 /** Human-facing headline when a spawn/reload is refused by a live foreign identity. */
 export const OWNERSHIP_MISMATCH_MESSAGE =

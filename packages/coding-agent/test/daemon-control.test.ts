@@ -4,6 +4,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { parseDaemonArgs, runDaemonCommand, UnknownDaemonKindError } from "../src/cli/daemon-cli";
+import { classifyPublicCommandFailure, PublicCommandFailure } from "../src/cli/public-command-errors";
 import { Settings } from "../src/config/settings";
 import { createBuiltInDaemonControllers, selectDaemonControllers } from "../src/daemon/builtin";
 import type { BuiltInDaemonController, DaemonOperationResult, DaemonStatus } from "../src/daemon/control-types";
@@ -847,7 +848,8 @@ describe("TelegramDaemonController.reload", () => {
 				{ controllers: undefined },
 			),
 		).rejects.toMatchObject({
-			message: "Unknown daemon kind(s): bogus. Known kinds: telegram, discord, slack.",
+			message: "Public command failed",
+			input: { kind: "operation_failed", proof: "pre-effect" },
 			kinds: ["bogus"],
 			knownKinds: ["telegram", "discord", "slack"],
 		});
@@ -2860,42 +2862,167 @@ describe("runDaemonCommand", () => {
 		expect(out).toContain("reloaded telegram daemon");
 	});
 
-	test("a refused restart surfaces recovery guidance and exits non-zero", async () => {
-		const prevExit = process.exitCode;
+	test.each([false, true])("refused restart throws sanitized uncertainty before output (json=%s)", async json => {
+		const result: DaemonOperationResult = {
+			kind: "telegram",
+			action: "reload",
+			ok: false,
+			warnings: ["secret-warning"],
+			message: "secret-message",
+			recovery: ownershipMismatchRecovery(),
+		};
+		const out = await captureStdout(async () => {
+			try {
+				await runDaemonCommand(
+					{ action: "restart", kinds: ["telegram"], all: false, json, force: false },
+					{ controllers: [fakeController({} as DaemonStatus, result)] },
+				);
+				throw new Error("Expected failure");
+			} catch (error) {
+				expect(error).toBeInstanceOf(PublicCommandFailure);
+				const classified = classifyPublicCommandFailure(error, ["daemon", "restart"]);
+				expect(classified.exitCode).toBe(1);
+				expect(classified.outcomeCertainty).toBe("unknown");
+				expect(JSON.stringify(classified)).not.toContain("secret-");
+				expect(classified.nextSteps.some(step => step.argv?.[1] === "restart")).toBe(false);
+			}
+		});
+		expect(out).toBe("");
+	});
+
+	test.each([
+		false,
+		true,
+	])("mixed targets retain successes and stop on interruption (throws=%s)", async interrupted => {
+		const calls: string[] = [];
+		const controllers = (["telegram", "discord", "slack"] as const).map(kind => ({
+			kind,
+			status: async () => {
+				throw new Error("Unused");
+			},
+			stop: async () => {
+				throw new Error("Unused");
+			},
+			reload: async (): Promise<DaemonOperationResult> => {
+				calls.push(kind);
+				if (kind === "discord" && interrupted) throw new Error("private detail");
+				return { kind, action: "reload", ok: kind !== "discord", message: "private detail", warnings: [] };
+			},
+		}));
+		const out = await captureStdout(async () => {
+			try {
+				await runDaemonCommand(
+					{ action: "restart", kinds: [], all: true, json: true, force: true },
+					{ controllers },
+				);
+				throw new Error("Expected failure");
+			} catch (error) {
+				expect(error).toBeInstanceOf(PublicCommandFailure);
+				expect((error as PublicCommandFailure).input.targets).toEqual([
+					{ kind: "telegram", outcome: "applied" },
+					{ kind: "discord", outcome: "unknown" },
+					{ kind: "slack", outcome: interrupted ? "not-applied" : "applied" },
+				]);
+			}
+		});
+		expect(out).toBe("");
+		expect(calls).toEqual(interrupted ? ["telegram", "discord"] : ["telegram", "discord", "slack"]);
+	});
+
+	test.each(["stale", "error"] as const)("unhealthy %s status remains successful", async health => {
 		const status: DaemonStatus = {
 			kind: "telegram",
 			configured: true,
-			health: "stopped",
-			runtime: { mode: "source", execPath: "/usr/bin/node", reloadPicksUpSourceEdits: true },
+			health,
+			runtime: { mode: "source", execPath: "/runtime", reloadPicksUpSourceEdits: true },
 		};
+		const out = await captureStdout(() =>
+			runDaemonCommand(
+				{ action: "status", kinds: [], all: false, json: true, force: false },
+				{ controllers: [fakeController(status, {} as DaemonOperationResult)] },
+			),
+		);
+		expect(JSON.parse(out)).toEqual([status]);
+	});
+
+	test("internal updater callback preserves failed result rendering and option forwarding", async () => {
 		const result: DaemonOperationResult = {
 			kind: "telegram",
 			action: "reload",
 			ok: false,
 			warnings: [],
-			message: OWNERSHIP_MISMATCH_MESSAGE,
-			recovery: ownershipMismatchRecovery(),
+			message: "internal failure",
+		};
+		const options: unknown[] = [];
+		const exitCodes: number[] = [];
+		const controller = fakeController({} as DaemonStatus, result);
+		controller.reload = async opts => {
+			options.push(opts);
+			return result;
 		};
 		const out = await captureStdout(() =>
 			runDaemonCommand(
-				{ action: "restart", kinds: ["telegram"], all: false, json: false, force: false },
-				{ controllers: [fakeController(status, result)] },
+				{
+					action: "restart",
+					kinds: [],
+					all: false,
+					json: true,
+					force: true,
+					gracefulTimeoutMs: 11,
+					killTimeoutMs: 22,
+					spawnIfStopped: false,
+					allowDisabledNoop: true,
+				},
+				{ controllers: [controller], setExitCode: code => exitCodes.push(code) },
 			),
 		);
-		expect(out).toContain("telegram reload: failed");
-		expect(out).toContain("to recover:");
-		expect(process.exitCode).toBe(1);
-		// Reset so this expected non-zero exitCode does not leak into the runner's exit status.
-		process.exitCode = typeof prevExit === "number" ? prevExit : 0;
+		expect(JSON.parse(out)).toEqual([result]);
+		expect(exitCodes).toEqual([1]);
+		expect(options).toEqual([
+			{ force: true, gracefulTimeoutMs: 11, killTimeoutMs: 22, spawnIfStopped: false, allowDisabledNoop: true },
+		]);
 	});
 });
 
 describe("cli registration", () => {
-	test("gjc daemon is registered in the explicit command registry", () => {
-		const cliSource = fs.readFileSync(path.join(import.meta.dir, "../src/cli.ts"), "utf8");
-		expect(cliSource).toContain('{ name: "daemon"');
-		expect(cliSource).toContain('import("./commands/daemon")');
-	});
+	test("registered daemon dispatch serves inert command-local public help", () => {
+		const agentDir = tempAgentDir();
+		const stateDir = path.join(agentDir, "uninitialized");
+		try {
+			for (const action of [undefined, "restart"]) {
+				const command = ["daemon", ...(action ? [action] : [])];
+				const result = Bun.spawnSync(
+					[
+						process.execPath,
+						path.join(import.meta.dir, "../src/cli.ts"),
+						...command,
+						"--help",
+						"--help-section",
+						"options",
+						"--json",
+					],
+					{
+						env: { ...process.env, GJC_CODING_AGENT_DIR: stateDir },
+						stdout: "pipe",
+						stderr: "pipe",
+					},
+				);
+				expect(result.exitCode, result.stderr.toString()).toBe(0);
+				expect(result.stderr.toString()).toBe("");
+				const help = JSON.parse(result.stdout.toString());
+				expect(help.command).toEqual(command);
+				expect(help.canonicalCommand).toEqual(command);
+				expect(help.section).toBe("options");
+				expect(help.entries.some((entry: { kind: string }) => entry.kind === "option")).toBe(true);
+				for (const privateToken of ["discord-internal", "slack-internal", "owner-id", "smoke"]) {
+					expect(result.stdout.toString()).not.toContain(privateToken);
+				}
+				expect(fs.existsSync(stateDir)).toBe(false);
+			}
+		} finally {
+			fs.rmSync(agentDir, { recursive: true, force: true });
+		}
+	}, 15_000);
 });
 
 describe("topic registry reload persistence", () => {

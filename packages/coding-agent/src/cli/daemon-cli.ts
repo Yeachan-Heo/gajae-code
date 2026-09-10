@@ -15,23 +15,24 @@ import type {
 } from "../daemon/control-types";
 import {
 	DAEMON_ACTION_TOKENS,
-	DAEMON_EXIT,
+	daemonOperationOutcome,
 	formatDaemonResult,
 	formatDaemonStatus,
 	resolveDaemonAction,
 } from "../daemon/operator-contract";
 import { runChatDaemonInternal } from "../sdk/bus/chat-daemon-cli";
+import { PublicCommandFailure, type PublicDaemonTargetOutcome } from "./public-command-errors";
 
 export type DaemonCliAction = "list" | "status" | "stop" | "restart";
 export type DaemonInternalCliAction = "discord-internal" | "slack-internal";
 export type DaemonCommandAction = DaemonCliAction | DaemonInternalCliAction;
 
-export class UnknownDaemonKindError extends Error {
+export class UnknownDaemonKindError extends PublicCommandFailure {
 	constructor(
 		readonly kinds: readonly string[],
 		readonly knownKinds: readonly DaemonKind[],
 	) {
-		super(`Unknown daemon kind(s): ${kinds.join(", ")}. Known kinds: ${knownKinds.join(", ")}.`);
+		super({ kind: "operation_failed", proof: "pre-effect" });
 		this.name = "UnknownDaemonKindError";
 	}
 }
@@ -60,6 +61,7 @@ export interface DaemonCommandArgs {
 export interface DaemonCommandDeps {
 	settings?: Settings;
 	controllers?: BuiltInDaemonController[];
+	/** Internal update orchestration retains result rendering and failure aggregation. */
 	setExitCode?: (code: number) => void;
 }
 
@@ -131,11 +133,28 @@ export async function runDaemonCommand(cmd: DaemonCommandArgs, deps: DaemonComma
 	}
 	const unknownKinds = cmd.kinds.filter(kind => !(KNOWN_KINDS as readonly string[]).includes(kind));
 	if (unknownKinds.length > 0) throw new UnknownDaemonKindError(unknownKinds, KNOWN_KINDS);
-	const settings = deps.settings ?? (await Settings.init());
-	const controllers = deps.controllers ?? selectDaemonControllers(settings, cmd.kinds, cmd.all);
+	let controllers: BuiltInDaemonController[];
+	try {
+		const settings = deps.settings ?? (await Settings.init());
+		controllers = deps.controllers ?? selectDaemonControllers(settings, cmd.kinds, cmd.all);
+	} catch {
+		throw new PublicCommandFailure({ kind: "unavailable", proof: "pre-effect" });
+	}
 
 	if (cmd.action === "list" || cmd.action === "status") {
-		const statuses = await Promise.all(controllers.map(c => c.status()));
+		const statuses = await Promise.all(
+			controllers.map(async controller => {
+				try {
+					return await controller.status();
+				} catch {
+					throw new PublicCommandFailure({
+						kind: "unavailable",
+						proof: "pre-effect",
+						daemonKind: controller.kind,
+					});
+				}
+			}),
+		);
 		if (cmd.json) {
 			process.stdout.write(`${JSON.stringify(statuses, null, 2)}\n`);
 		} else {
@@ -152,19 +171,26 @@ export async function runDaemonCommand(cmd: DaemonCommandArgs, deps: DaemonComma
 		allowDisabledNoop: cmd.allowDisabledNoop,
 	};
 	const results: DaemonOperationResult[] = [];
-	for (const controller of controllers) {
-		results.push(cmd.action === "restart" ? await controller.reload(opts) : await controller.stop(opts));
+	const targets: PublicDaemonTargetOutcome[] = [];
+	for (const [index, controller] of controllers.entries()) {
+		let result: DaemonOperationResult;
+		try {
+			result = cmd.action === "restart" ? await controller.reload(opts) : await controller.stop(opts);
+		} catch {
+			targets.push({ kind: controller.kind, outcome: "unknown" });
+			for (const pending of controllers.slice(index + 1))
+				targets.push({ kind: pending.kind, outcome: "not-applied" });
+			throw new PublicCommandFailure({ kind: "daemon_mixed", targets });
+		}
+		results.push(result);
+		targets.push({ kind: controller.kind, outcome: daemonOperationOutcome(result) });
 	}
+	const failed = results.some(result => !result.ok);
+	if (failed && !deps.setExitCode) throw new PublicCommandFailure({ kind: "daemon_mixed", targets });
 	if (cmd.json) {
 		process.stdout.write(`${JSON.stringify(results, null, 2)}\n`);
 	} else {
 		process.stdout.write(`${results.map(formatDaemonResult).join("\n")}\n`);
 	}
-	if (results.some(r => !r.ok))
-		(
-			deps.setExitCode ??
-			(code => {
-				process.exitCode = code;
-			})
-		)(DAEMON_EXIT.failure);
+	if (failed) deps.setExitCode?.(1);
 }
