@@ -2,12 +2,18 @@ import { describe, expect, it } from "bun:test";
 import * as path from "node:path";
 import { EMBEDDED_DOC_FILENAMES, EMBEDDED_DOCS } from "../src/internal-urls/docs-index.generated";
 
+// These probes check loading semantics, not a five-second cold-start budget.
+// Keep a child deadline below the test deadline so stalled imports still fail.
+const DOCS_PROBE_TIMEOUT_MS = 30_000;
+
 function runBunEval(script: string) {
 	const result = Bun.spawnSync({
 		cmd: [process.execPath, "-e", script],
 		cwd: path.join(import.meta.dir, ".."),
 		stdout: "pipe",
 		stderr: "pipe",
+		timeout: DOCS_PROBE_TIMEOUT_MS,
+		killSignal: "SIGKILL",
 	});
 	const stdout = result.stdout.toString();
 	const stderr = result.stderr.toString();
@@ -45,21 +51,27 @@ function isTracked(relativePath: string): boolean {
 }
 
 describe("internal-urls docs index loading", () => {
-	it("does not load the generated docs corpus when importing the barrel", () => {
-		const stdout = runBunEval(`
+	it(
+		"does not load the generated docs corpus when importing the barrel",
+		() => {
+			const stdout = runBunEval(`
 			const marker = Symbol.for("gjc.docs-index.generated.loaded");
 			Reflect.deleteProperty(globalThis, marker);
 			await import("@gajae-code/coding-agent/internal-urls");
 			const loaded = Reflect.get(globalThis, marker) === true;
 			console.log(JSON.stringify({ loaded }));
 		`);
-		const result = JSON.parse(stdout.trim()) as { loaded: boolean };
+			const result = JSON.parse(stdout.trim()) as { loaded: boolean };
 
-		expect(result.loaded).toBe(false);
-	});
+			expect(result.loaded).toBe(false);
+		},
+		DOCS_PROBE_TIMEOUT_MS + 5_000,
+	);
 
-	it("loads the generated docs corpus when resolving gjc docs", () => {
-		const stdout = runBunEval(`
+	it(
+		"loads the generated docs corpus when resolving gjc docs",
+		() => {
+			const stdout = runBunEval(`
 			const { InternalUrlRouter } = await import("@gajae-code/coding-agent/internal-urls");
 			const resource = await InternalUrlRouter.instance().resolve("gjc://");
 			console.log(JSON.stringify({
@@ -67,10 +79,12 @@ describe("internal-urls docs index loading", () => {
 				contentLength: resource.content.length,
 			}));
 		`);
-		const result = JSON.parse(stdout.trim()) as { contentType: string; contentLength: number };
-		expect(result.contentType).toBe("text/markdown");
-		expect(result.contentLength).toBeGreaterThan(0);
-	});
+			const result = JSON.parse(stdout.trim()) as { contentType: string; contentLength: number };
+			expect(result.contentType).toBe("text/markdown");
+			expect(result.contentLength).toBeGreaterThan(0);
+		},
+		DOCS_PROBE_TIMEOUT_MS + 5_000,
+	);
 
 	it("embeds exactly the docs corpus that exists on disk", async () => {
 		const onDisk = await scanDocsCorpus();

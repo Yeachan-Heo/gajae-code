@@ -128,6 +128,37 @@ describe("sanitizeExternalCrashV1 — hostile inputs", () => {
 		sanitized("x".repeat(200_000));
 		expect(performance.now() - startedAt).toBeLessThan(1_000);
 	});
+
+	it("drops the shapes the Sentry egress guard refuses to transmit", () => {
+		// crash/upstream/envelope.ts lists these five as credential-like and
+		// refuses the whole envelope, but that guard only wraps the Sentry frame
+		// fields. `gjc crash report` builds its body through this function alone,
+		// and the user files that body as a public issue. All fixtures are
+		// assembled at runtime so no literal of this shape lands in the repo.
+		const npmToken = ["npm", "a".repeat(36)].join("_");
+		const gitlabToken = ["glpat", "b".repeat(24)].join("-");
+		const stripeKey = ["sk", "live", "c".repeat(24)].join("_");
+		const hfToken = ["hf", "d".repeat(34)].join("_");
+		const output = sanitized(
+			[`registry auth ${npmToken}`, `ci token ${gitlabToken}`, `billing ${stripeKey}`, `inference ${hfToken}`].join(
+				"\n",
+			),
+		);
+
+		for (const secret of [npmToken, gitlabToken, stripeKey, hfToken]) {
+			expect(output).not.toContain(secret);
+		}
+		// The surrounding diagnostic text survives.
+		expect(output).toContain("registry auth");
+		expect(output).toContain("inference");
+	});
+
+	it("keeps prefix lookalikes that are too short to be tokens", () => {
+		const output = sanitized("npm install express and the hf_ prefix and glpat-short");
+		expect(output).toContain("npm install express");
+		expect(output).toContain("hf_ prefix");
+		expect(output).toContain("glpat-short");
+	});
 });
 
 describe("fenceCrashText", () => {

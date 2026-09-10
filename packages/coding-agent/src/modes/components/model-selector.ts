@@ -871,7 +871,7 @@ export class ModelSelectorComponent extends Container {
 		} else {
 			// Reload config and cached discovery state without blocking on live provider refresh
 			if (options.refreshRegistry !== false) {
-				await this.#modelRegistry.refresh("offline");
+				await this.#modelRegistry.refresh("offline", this.#authSessionId);
 			}
 
 			// Check for models.json errors
@@ -1054,7 +1054,7 @@ export class ModelSelectorComponent extends Container {
 			// Cache-aware: a fresh discovery cache answers instantly instead of
 			// forcing a provider round-trip (hundreds of ms on remote gateways)
 			// on every provider-tab visit. Stale/missing cache still fetches.
-			await this.#modelRegistry.refreshProvider(providerId, "online-if-uncached");
+			await this.#modelRegistry.refreshProvider(providerId, "online-if-uncached", this.#authSessionId);
 		} catch (error) {
 			refreshError = error;
 		}

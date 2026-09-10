@@ -106,7 +106,15 @@ type HarnessContext = {
 	managed: boolean;
 };
 
-const fallbackClasses: FallbackTriggerClass[] = ["rate_limit", "quota", "auth", "server", "unknown", "other"];
+const fallbackClasses: FallbackTriggerClass[] = [
+	"rate_limit",
+	"quota",
+	"auth",
+	"credential",
+	"server",
+	"unknown",
+	"other",
+];
 
 function retryCode(failure: AutoroutingPreflightFailure): AutoroutingAttemptCode {
 	if (failure.kind === "local" && failure.op === "auth_resolve") return "credential_unavailable";

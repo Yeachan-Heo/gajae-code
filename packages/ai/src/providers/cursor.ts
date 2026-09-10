@@ -333,7 +333,12 @@ const CURSOR_MAX_GRPC_MESSAGE_LENGTH = 16 * 1024 * 1024;
 // a complete frame while parser backpressure is active; additional input is a
 // protocol failure rather than silently dropping raw progress.
 const CURSOR_MAX_PENDING_SERVER_BYTES = CURSOR_MAX_GRPC_MESSAGE_LENGTH + 5;
-const CURSOR_MAX_BLOB_STORE_ENTRIES = 256;
+// The conversation blob store is a content-addressed cache written by BOTH
+// sides: request construction stores one blob per history message plus the
+// per-turn structures, and the server stores its own state through `setBlob`.
+// Bound it by bytes only. A separate entry ceiling was below the working set of
+// an ordinary long session — a few hundred small blobs — so it rejected writes
+// while the store held well under a megabyte.
 const CURSOR_MAX_BLOB_STORE_BYTES = 64 * 1024 * 1024;
 const CURSOR_BLOB_ID_BYTES = 32;
 
@@ -2474,8 +2479,7 @@ function handleKvServerMessage(
 	} else if (kvCase === "setBlobArgs") {
 		const { blobId, blobData } = kvMsg.message.value;
 		const blobIdKey = Buffer.from(blobId).toString("hex");
-		const stored =
-			blobId.byteLength === CURSOR_BLOB_ID_BYTES && storeCursorServerBlob(blobStore, blobIdKey, blobData);
+		const stored = blobId.byteLength === CURSOR_BLOB_ID_BYTES && putCursorBlob(blobStore, blobIdKey, blobData);
 
 		const response = create(KvClientMessageSchema, {
 			id: kvMsg.id,
@@ -2498,21 +2502,40 @@ function handleKvServerMessage(
 	}
 }
 
-function storeCursorServerBlob(
+/**
+ * Insert a blob into the conversation store under a byte budget, shedding the
+ * least recently written entries when the budget is exceeded.
+ *
+ * Refusing the write is not an option a conversation can recover from. The
+ * store is carried across turns, so once it is full every later `setBlob`
+ * fails, every tool result that depends on one fails with it, and the session
+ * is dead for the rest of its life — compaction and process restart both
+ * rebuild the same oversized store. A dropped historical blob is an already
+ * modelled `getBlob` miss; a refused write is terminal. Shed instead.
+ *
+ * Only two writes are refused: a blob larger than the entire budget, which can
+ * never be retained, and an invalid identifier (rejected by the caller).
+ */
+function putCursorBlob(
 	blobStore: Map<string, Uint8Array>,
 	blobId: string,
 	blobData: Uint8Array,
-	limits: { maxEntries: number; maxBytes: number } = {
-		maxEntries: CURSOR_MAX_BLOB_STORE_ENTRIES,
-		maxBytes: CURSOR_MAX_BLOB_STORE_BYTES,
-	},
+	limits: { maxBytes: number } = { maxBytes: CURSOR_MAX_BLOB_STORE_BYTES },
 ): boolean {
-	const existingBytes = blobStore.get(blobId)?.byteLength ?? 0;
+	if (blobData.byteLength > limits.maxBytes) return false;
+	// Re-insert so an overwritten or re-stored blob counts as the newest entry:
+	// Map iteration order is insertion order, which is what eviction walks.
+	blobStore.delete(blobId);
+	blobStore.set(blobId, blobData);
 	let totalBytes = 0;
 	for (const value of blobStore.values()) totalBytes += value.byteLength;
-	if (!blobStore.has(blobId) && blobStore.size >= limits.maxEntries) return false;
-	if (totalBytes - existingBytes + blobData.byteLength > limits.maxBytes) return false;
-	blobStore.set(blobId, blobData);
+	if (totalBytes <= limits.maxBytes) return true;
+	for (const [key, value] of blobStore) {
+		if (totalBytes <= limits.maxBytes) break;
+		if (key === blobId) continue;
+		blobStore.delete(key);
+		totalBytes -= value.byteLength;
+	}
 	return true;
 }
 
@@ -2520,11 +2543,11 @@ export function storeCursorBlobForTest(
 	blobStore: Map<string, Uint8Array>,
 	blobId: Uint8Array,
 	blobData: Uint8Array,
-	limits: { maxEntries: number; maxBytes: number },
+	limits: { maxBytes: number },
 ): boolean {
 	return (
 		blobId.byteLength === CURSOR_BLOB_ID_BYTES &&
-		storeCursorServerBlob(blobStore, Buffer.from(blobId).toString("hex"), blobData, limits)
+		putCursorBlob(blobStore, Buffer.from(blobId).toString("hex"), blobData, limits)
 	);
 }
 
@@ -4513,7 +4536,9 @@ function createBlobId(data: Uint8Array): Uint8Array {
 
 function storeCursorBlob(blobStore: Map<string, Uint8Array>, data: Uint8Array): Uint8Array {
 	const blobId = createBlobId(data);
-	blobStore.set(Buffer.from(blobId).toString("hex"), data);
+	// Request construction is the larger writer of the two. Charging it to the
+	// same budget is what makes the budget describe the real map.
+	putCursorBlob(blobStore, Buffer.from(blobId).toString("hex"), data);
 	return blobId;
 }
 
@@ -4527,26 +4552,40 @@ function readCursorBlob(blobStore: Map<string, Uint8Array>, blobId: Uint8Array):
 
 const CURSOR_NATIVE_TOOL_NAMES = new Set(["bash", "read", "write", "delete", "ls", "grep", "lsp", "todo_write"]);
 
+interface CursorWireToolIdentity {
+	name: string;
+	description: string;
+	inputSchema: JsonValue;
+}
+
+function buildCursorWireToolIdentities(tools: Tool[] | undefined): CursorWireToolIdentity[] {
+	if (!tools || tools.length === 0) return [];
+
+	return tools
+		.filter(tool => !CURSOR_NATIVE_TOOL_NAMES.has(tool.name))
+		.map(tool => {
+			const jsonSchema = flattenToolRootCombinators(toolWireSchema(tool));
+			return {
+				name: tool.name,
+				description: tool.description || "",
+				inputSchema:
+					jsonSchema && typeof jsonSchema === "object"
+						? (jsonSchema as JsonValue)
+						: { type: "object", properties: {}, required: [] },
+			};
+		});
+}
+
+function buildCursorUsageToolsKey(tools: Tool[] | undefined): string {
+	return hashCursorConversationValue(buildCursorWireToolIdentities(tools));
+}
+
 function buildMcpToolDefinitions(tools: Tool[] | undefined): McpToolDefinition[] {
-	if (!tools || tools.length === 0) {
-		return [];
-	}
-
-	const advertisedTools = tools.filter(tool => !CURSOR_NATIVE_TOOL_NAMES.has(tool.name));
-	if (advertisedTools.length === 0) {
-		return [];
-	}
-
-	return advertisedTools.map(tool => {
-		const jsonSchema = flattenToolRootCombinators(toolWireSchema(tool));
-		const schemaValue: JsonValue =
-			jsonSchema && typeof jsonSchema === "object"
-				? (jsonSchema as JsonValue)
-				: { type: "object", properties: {}, required: [] };
-		const inputSchema = toBinary(ValueSchema, fromJson(ValueSchema, schemaValue));
+	return buildCursorWireToolIdentities(tools).map(tool => {
+		const inputSchema = toBinary(ValueSchema, fromJson(ValueSchema, tool.inputSchema));
 		return create(McpToolDefinitionSchema, {
 			name: tool.name,
-			description: tool.description || "",
+			description: tool.description,
 			providerIdentifier: "pi-agent",
 			toolName: tool.name,
 			inputSchema,
@@ -4827,6 +4866,11 @@ function buildConversationTurns(messages: Message[], blobStore: Map<string, Uint
 	return turns;
 }
 
+/** Exported for regression coverage of the tool usage-cache identity boundary. */
+export function buildCursorUsageToolsKeyForTest(tools: Tool[]): string {
+	return buildCursorUsageToolsKey(tools);
+}
+
 /** Exported for tests: decodes Cursor history blobs built from conversation messages. */
 export function buildCursorHistoryForTest(messages: Message[]): {
 	rootPromptMessagesJson: unknown[];
@@ -4898,16 +4942,7 @@ function buildCursorConversationContext(
 		}),
 		systemPromptKey: hashCursorConversationValue(context.systemPrompt ?? []),
 		customSystemPromptKey: hashCursorConversationValue(options?.customSystemPrompt ?? ""),
-		toolsKey: hashCursorConversationValue(
-			(context.tools ?? []).map(tool => ({
-				name: tool.name,
-				description: tool.description,
-				parameters: toolWireSchema(tool),
-				strict: tool.strict,
-				customFormat: tool.customFormat,
-				customWireName: tool.customWireName,
-			})),
-		),
+		toolsKey: buildCursorUsageToolsKey(context.tools),
 		messageKeys: context.messages.map(hashCursorConversationMessage),
 	};
 }

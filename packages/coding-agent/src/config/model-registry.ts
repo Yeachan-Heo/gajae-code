@@ -1098,9 +1098,10 @@ function resolveOAuthAccountIdForAccessToken(
 	authStorage: AuthStorage,
 	provider: string,
 	accessToken: string,
+	sessionId?: string,
 	owner?: object,
 ): string | undefined {
-	if (authStorage.getEffectiveCredentialType(provider, undefined, owner ? { owner } : undefined) !== "oauth") {
+	if (authStorage.getEffectiveCredentialType(provider, sessionId, owner ? { owner } : undefined) !== "oauth") {
 		return undefined;
 	}
 	const oauthCredentials = getOAuthCredentialsForProvider(authStorage, provider);
@@ -1851,7 +1852,7 @@ export class ModelRegistry {
 	/**
 	 * Reload models from disk and refresh runtime provider discovery state.
 	 */
-	async refresh(strategy: ModelRefreshStrategy = "online-if-uncached"): Promise<void> {
+	async refresh(strategy: ModelRefreshStrategy = "online-if-uncached", credentialSessionId?: string): Promise<void> {
 		if (this.#disposed) return;
 		await this.#enqueueCatalogMutation(async () => {
 			if (this.#disposed) return;
@@ -1863,7 +1864,13 @@ export class ModelRegistry {
 			try {
 				this.#reloadStaticModels();
 				this.#suppressedSelectors.clear();
-				await this.#refreshRuntimeDiscoveries(strategy, undefined, refreshGeneration, providerRefreshFence);
+				await this.#refreshRuntimeDiscoveries(
+					strategy,
+					undefined,
+					refreshGeneration,
+					providerRefreshFence,
+					credentialSessionId,
+				);
 				if (refreshGeneration === this.#catalogRefreshGeneration) this.#modelBindingsApplier.apply();
 			} finally {
 				this.#resumeRebuild();
@@ -1871,11 +1878,11 @@ export class ModelRegistry {
 		});
 	}
 
-	refreshInBackground(strategy: ModelRefreshStrategy = "online-if-uncached"): void {
+	refreshInBackground(strategy: ModelRefreshStrategy = "online-if-uncached", credentialSessionId?: string): void {
 		if (this.#backgroundRefresh) {
 			return;
 		}
-		const refreshPromise = this.refresh(strategy)
+		const refreshPromise = this.refresh(strategy, credentialSessionId)
 			.catch(error => {
 				logger.warn("background model refresh failed", {
 					error: error instanceof Error ? error.message : String(error),
@@ -1889,7 +1896,11 @@ export class ModelRegistry {
 		this.#backgroundRefresh = refreshPromise;
 	}
 
-	async refreshProvider(providerId: string, strategy: ModelRefreshStrategy = "online"): Promise<void> {
+	async refreshProvider(
+		providerId: string,
+		strategy: ModelRefreshStrategy = "online",
+		credentialSessionId?: string,
+	): Promise<void> {
 		if (this.#disposed) return;
 		const providerRefreshGeneration = (this.#providerRefreshGenerations.get(providerId) ?? 0) + 1;
 		this.#providerRefreshGenerations.set(providerId, providerRefreshGeneration);
@@ -1905,10 +1916,16 @@ export class ModelRegistry {
 						this.#suppressedSelectors.delete(selector);
 					}
 				}
-				await this.#refreshRuntimeDiscoveries(strategy, new Set([providerId]), refreshGeneration, {
-					providerId,
-					generation: providerRefreshGeneration,
-				});
+				await this.#refreshRuntimeDiscoveries(
+					strategy,
+					new Set([providerId]),
+					refreshGeneration,
+					{
+						providerId,
+						generation: providerRefreshGeneration,
+					},
+					credentialSessionId,
+				);
 				if (
 					refreshGeneration === this.#catalogRefreshGeneration &&
 					this.#providerRefreshGenerations.get(providerId) === providerRefreshGeneration
@@ -3042,6 +3059,7 @@ export class ModelRegistry {
 		providerFilter?: ReadonlySet<string>,
 		refreshGeneration = this.#catalogRefreshGeneration,
 		providerRefresh?: ProviderRefreshFence,
+		credentialSessionId?: string,
 	): Promise<void> {
 		const profileAvailabilityEvidenceBefore = this.#profileAvailabilityEvidenceFingerprint();
 		const disabledProviders = getDisabledProviderIdsFromSettings(this.#settings);
@@ -3055,12 +3073,12 @@ export class ModelRegistry {
 				? Promise.resolve([] as ConfiguredDiscoveryResult[])
 				: Promise.all(
 						selectedDiscoverableProviders.map(provider =>
-							this.#discoverProviderModels(provider, strategy, providerRefresh),
+							this.#discoverProviderModels(provider, strategy, providerRefresh, credentialSessionId),
 						),
 					);
 		const [configuredDiscoveryResults, builtInDiscovered] = await Promise.all([
 			configuredDiscoveriesPromise,
-			this.#discoverBuiltInProviderModels(strategy, providerFilter, providerRefresh),
+			this.#discoverBuiltInProviderModels(strategy, providerFilter, providerRefresh, credentialSessionId),
 		]);
 		if (
 			refreshGeneration !== this.#catalogRefreshGeneration ||
@@ -3301,6 +3319,7 @@ export class ModelRegistry {
 		providerConfig: DiscoveryProviderConfig,
 		strategy: ModelRefreshStrategy,
 		providerRefresh?: ProviderRefreshFence,
+		credentialSessionId?: string,
 	): Promise<ConfiguredDiscoveryResult> {
 		const provider = providerConfig.provider;
 		const preflightEpoch = this.#optionalAuthPreflightEpoch;
@@ -3330,6 +3349,7 @@ export class ModelRegistry {
 						ignoreCredentiallessFallback: optionalAuth,
 						refreshOAuth: true,
 						baseUrl: providerConfig.baseUrl,
+						credentialSessionId,
 					}),
 				);
 				const currentAuthConfigurationGeneration = this.authStorage.getProviderConfigurationGeneration(provider);
@@ -3459,6 +3479,7 @@ export class ModelRegistry {
 					: this.#peekApiKeyForProvider(provider.provider, {
 							refreshOAuth: true,
 							baseUrl: provider.baseUrl,
+							credentialSessionId,
 						}),
 			isAuthenticated,
 			fetchModels: async (provider, apiKey) => {
@@ -3565,6 +3586,7 @@ export class ModelRegistry {
 		strategy: ModelRefreshStrategy,
 		providerFilter?: ReadonlySet<string>,
 		providerRefresh?: ProviderRefreshFence,
+		credentialSessionId?: string,
 	): Promise<Model<Api>[]> {
 		// Skip providers already handled by configured discovery (e.g. user-configured ollama with discovery.type)
 		const configuredDiscoveryProviders = new Set(this.#discoveryManager.providers.map(p => p.provider));
@@ -3578,6 +3600,7 @@ export class ModelRegistry {
 		const managerOptions = await this.#collectBuiltInModelManagerOptions(
 			configuredDiscoveryProviders,
 			providerFilter,
+			credentialSessionId,
 		);
 		if (managerOptions.length === 0) {
 			return [];
@@ -3591,6 +3614,7 @@ export class ModelRegistry {
 	async #collectBuiltInModelManagerOptions(
 		excludedProviderIds: ReadonlySet<string> = new Set(),
 		providerFilter?: ReadonlySet<string>,
+		credentialSessionId?: string,
 	): Promise<ModelManagerDiscoveryOptions[]> {
 		const specialProviderDescriptors: Array<{
 			providerId: string;
@@ -3623,6 +3647,7 @@ export class ModelRegistry {
 						this.authStorage,
 						"openai-codex",
 						accessToken,
+						credentialSessionId,
 						this.#authStorageConfigOwner,
 					);
 					return openaiCodexModelManagerOptions({
@@ -3655,7 +3680,7 @@ export class ModelRegistry {
 		// and failures there are handled gracefully.
 		const peekKey = async (descriptor: { providerId: string }) => {
 			const configurationGeneration = this.authStorage.getProviderConfigurationGeneration(descriptor.providerId);
-			const apiKey = await this.#peekApiKeyForProvider(descriptor.providerId);
+			const apiKey = await this.#peekApiKeyForProvider(descriptor.providerId, { credentialSessionId });
 			if (configurationGeneration !== this.authStorage.getProviderConfigurationGeneration(descriptor.providerId)) {
 				return { apiKey: undefined, authGeneration: undefined };
 			}
@@ -5645,6 +5670,7 @@ export class ModelRegistry {
 			ignoreCredentiallessFallback?: boolean;
 			refreshOAuth?: boolean;
 			baseUrl?: string;
+			credentialSessionId?: string;
 		} = {},
 	): Promise<string | undefined> {
 		this.#refreshRotatingConfigApiKey(provider);
@@ -5657,16 +5683,17 @@ export class ModelRegistry {
 			return undefined;
 		}
 		if (options.refreshOAuth && this.authStorage.hasOAuth(provider)) {
-			return this.authStorage.getApiKey(provider, undefined, {
+			return this.authStorage.getApiKey(provider, options.credentialSessionId, {
 				baseUrl: options.baseUrl,
 				owner: this.#authStorageConfigOwner,
 			});
 		}
+		const peekOptions = options.credentialSessionId
+			? { owner: this.#authStorageConfigOwner, sessionId: options.credentialSessionId }
+			: { owner: this.#authStorageConfigOwner };
 		return options.ignoreCredentiallessFallback
-			? this.authStorage.peekApiKey(provider, { owner: this.#authStorageConfigOwner })
-			: this.#getApiKeyOrNoAuth(provider, () =>
-					this.authStorage.peekApiKey(provider, { owner: this.#authStorageConfigOwner }),
-				);
+			? this.authStorage.peekApiKey(provider, peekOptions)
+			: this.#getApiKeyOrNoAuth(provider, () => this.authStorage.peekApiKey(provider, peekOptions));
 	}
 
 	/**

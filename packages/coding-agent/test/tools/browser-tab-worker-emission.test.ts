@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import type { Browser, CDPSession, Page } from "puppeteer-core";
+import { compileActionSteps } from "../../src/tools/browser/actions";
 import type { Transport, WorkerInbound, WorkerInitPayload, WorkerOutbound } from "../../src/tools/browser/tab-protocol";
 import { __setLoadPuppeteerInWorkerForTest, WorkerCore } from "../../src/tools/browser/tab-worker";
 
@@ -68,7 +69,7 @@ function createFakeCdpSession(): FakeCdpSession {
 	return session;
 }
 
-function createFakePage(session: FakeCdpSession): Page {
+function createFakePage(session: FakeCdpSession, calls: string[] = []): Page {
 	const target = {
 		_targetId: "target-1",
 		createCDPSession: async (): Promise<CDPSession> => session as unknown as CDPSession,
@@ -85,14 +86,43 @@ function createFakePage(session: FakeCdpSession): Page {
 		evaluate: async () => undefined,
 		goto: async () => {},
 		content: async () => "<html></html>",
-		locator: () => ({
-			setTimeout: () => ({
-				click: async () => {},
-				waitHandle: async () => ({ type: async () => {}, dispose: async () => {} }),
-				fill: async () => {},
-			}),
-		}),
-		$: async () => undefined,
+		locator: (selector: string) => {
+			calls.push(`locator:${selector}`);
+			return {
+				setTimeout: () => ({
+					click: async () => {
+						calls.push("click");
+					},
+					waitHandle: async () => ({ type: async () => {}, dispose: async () => {} }),
+					fill: async () => {},
+				}),
+			};
+		},
+		focus: async (selector: string) => {
+			calls.push(`focus:${selector}`);
+		},
+		keyboard: {
+			press: async (key: string) => {
+				calls.push(`press:${key}`);
+			},
+		},
+		screenshot: async (opts: { fullPage: boolean }) => {
+			calls.push(`screenshot:${opts.fullPage}`);
+			// Stop at the capture boundary, avoiding image resizing and disk writes.
+			throw new Error("fake capture reached");
+		},
+		$: async (selector: string) => {
+			calls.push(`query:${selector}`);
+			return {
+				screenshot: async () => {
+					calls.push("element screenshot");
+					throw new Error("fake capture reached");
+				},
+				dispose: async () => {
+					calls.push("dispose");
+				},
+			};
+		},
 		$eval: async () => undefined,
 		$$eval: async () => [],
 	};
@@ -144,6 +174,240 @@ function diagnosticsText(result: Extract<WorkerOutbound, { type: "result" }>): s
 		.filter(display => display.type === "text")
 		.find(display => display.text.includes("runtimeDiagnostics"))?.text;
 }
+
+describe("browser tab worker selector validation", () => {
+	afterEach(() => {
+		__setLoadPuppeteerInWorkerForTest(undefined);
+	});
+
+	async function createHarness() {
+		const session = createFakeCdpSession();
+		const calls: string[] = [];
+		const page = createFakePage(session, calls);
+		const transport = new FakeTransport();
+		__setLoadPuppeteerInWorkerForTest(async () => ({ connect: async () => createFakeBrowser(page) }) as never);
+		new WorkerCore(transport as unknown as Transport);
+		transport.dispatch({ type: "init", payload: initPayload });
+		await waitFor(() => transport.sent.some(msg => msg.type === "ready"));
+		let sequence = 0;
+		return {
+			calls,
+			async run(code: string) {
+				const id = `selector-${++sequence}`;
+				transport.dispatch(runMessage(id, code));
+				await waitFor(() => transport.results().some(result => result.id === id));
+				return transport.resultFor(id);
+			},
+			async close() {
+				transport.dispatch({ type: "close" });
+				await waitFor(() => transport.sent.some(msg => msg.type === "closed"));
+			},
+		};
+	}
+
+	it("returns actionable numeric-id errors and accepts a valid run after rejection", async () => {
+		const harness = await createHarness();
+		try {
+			const failed = await harness.run("await tab.click(58); return await tab.observe();");
+			expect(failed.ok).toBe(false);
+			if (failed.ok) throw new Error("expected selector rejection");
+			expect(failed.error.isToolError).toBe(true);
+			expect(failed.error.message).toContain("Selector must be a non-empty string");
+			expect(failed.error.message).toContain("(await tab.id(id)).click()");
+			expect(failed.error.message).not.toContain("startsWith");
+			expect(failed.error.name).not.toBe("TypeError");
+			expect(harness.calls).toEqual([]);
+			const recovered = await harness.run('await tab.click("#continue"); return "clicked";');
+			expect(recovered.ok).toBe(true);
+			if (!recovered.ok) throw new Error(recovered.error.message);
+			expect(recovered.payload.returnValue).toBe("clicked");
+			expect(harness.calls).toEqual(["locator:#continue", "click"]);
+		} finally {
+			await harness.close();
+		}
+	});
+
+	it("rejects blank structured press selectors without key presses or later actions", async () => {
+		const harness = await createHarness();
+		try {
+			for (const selector of ["", " \t\n"]) {
+				const result = await harness.run(
+					compileActionSteps([
+						{ verb: "press", key: "Enter", selector },
+						{ verb: "press", key: "Tab" },
+					]),
+				);
+				expect(result.ok).toBe(false);
+				if (result.ok) throw new Error("expected structured selector rejection");
+				expect(result.error.isToolError).toBe(true);
+				expect(result.error.message).toContain("Selector must be a non-empty string");
+				expect(harness.calls).toEqual([]);
+			}
+		} finally {
+			await harness.close();
+		}
+	});
+
+	it("rejects blank structured wait selectors without later actions", async () => {
+		const harness = await createHarness();
+		try {
+			for (const selector of ["", " \t\n"]) {
+				const result = await harness.run(
+					compileActionSteps([
+						{ verb: "wait", selector, ms: 1000 },
+						{ verb: "wait", ms: 1000 },
+					]),
+				);
+				expect(result.ok).toBe(false);
+				if (result.ok) throw new Error("expected structured wait selector rejection");
+				expect(result.error.isToolError).toBe(true);
+				expect(result.error.message).toContain("Selector must be a non-empty string");
+				expect(harness.calls).toEqual([]);
+			}
+			const timed = await harness.run(compileActionSteps([{ verb: "wait", ms: 1000 }]));
+			expect(timed.ok).toBe(true);
+			if (!timed.ok) throw new Error(timed.error.message);
+			expect(timed.payload.returnValue).toEqual([{ verb: "wait", selector: null, ms: 1000 }]);
+		} finally {
+			await harness.close();
+		}
+	});
+
+	it("preserves omitted and valid structured press selectors through the worker", async () => {
+		const harness = await createHarness();
+		try {
+			const result = await harness.run(
+				compileActionSteps([
+					{ verb: "press", key: "Enter" },
+					{ verb: "press", key: "Tab", selector: undefined },
+					{ verb: "press", key: "Space", selector: "#continue" },
+					{ verb: "press", key: "Escape", selector: "p-aria/Cancel" },
+				]),
+			);
+			expect(result.ok).toBe(true);
+			if (!result.ok) throw new Error(result.error.message);
+			expect(result.payload.returnValue).toEqual([
+				{ verb: "press", key: "Enter" },
+				{ verb: "press", key: "Tab" },
+				{ verb: "press", key: "Space" },
+				{ verb: "press", key: "Escape" },
+			]);
+			expect(harness.calls).toEqual([
+				"press:Enter",
+				"press:Tab",
+				"focus:#continue",
+				"press:Space",
+				"focus:aria/Cancel",
+				"press:Escape",
+			]);
+		} finally {
+			await harness.close();
+		}
+	});
+
+	it("rejects invalid selector values across helpers before browser side effects", async () => {
+		const harness = await createHarness();
+		const invalid = [
+			"58",
+			"0",
+			"NaN",
+			"false",
+			"true",
+			"null",
+			"undefined",
+			"58n",
+			'Symbol("secret")',
+			'({ secret: "do-not-echo", toString() { throw new Error("coercion attempted"); } })',
+			"[]",
+			'["#valid"]',
+			'""',
+			'" \\t\\n"',
+		];
+		try {
+			for (const value of invalid) {
+				const codes = [
+					`await tab.click(${value})`,
+					`await tab.type(${value}, "text")`,
+					`await tab.fill(${value}, "value")`,
+					`await tab.waitFor(${value})`,
+					`await tab.scrollIntoView(${value})`,
+					`await tab.select(${value}, "option")`,
+					`await tab.uploadFile(${value}, "file.txt")`,
+				];
+				if (value !== "undefined") {
+					codes.push(`await tab.press("Enter", { selector: ${value} })`);
+					codes.push(`await tab.screenshot({ selector: ${value}, fullPage: true })`);
+				}
+				for (const code of codes) {
+					const result = await harness.run(code);
+					expect(result.ok).toBe(false);
+					if (result.ok) throw new Error(`Expected rejection: ${code}`);
+					expect(result.error.isToolError).toBe(true);
+					expect(result.error.message).toContain("Selector must be a non-empty string");
+					expect(result.error.message).not.toContain("do-not-echo");
+					expect(result.error.message).not.toContain("coercion attempted");
+					expect(harness.calls).toEqual([]);
+				}
+			}
+		} finally {
+			await harness.close();
+		}
+	});
+
+	it("preserves CSS and query selectors, legacy aliases, and omitted optional selectors", async () => {
+		const harness = await createHarness();
+		try {
+			const selectors = [
+				["  button[data-name='Continue']  ", "  button[data-name='Continue']  "],
+				["aria/Sign in", "aria/Sign in"],
+				["text/Continue", "text/Continue"],
+				["xpath///button", "xpath///button"],
+				["pierce/button", "pierce/button"],
+				["p-text/Continue", "text/Continue"],
+				["p-xpath///button", "xpath///button"],
+				["p-pierce/button", "pierce/button"],
+				["p-aria/Sign in", "aria/Sign in"],
+				['p-aria/[name="Sign in"]', "aria/Sign in"],
+			];
+			for (const [input, expected] of selectors) {
+				const result = await harness.run(`await tab.waitFor(${JSON.stringify(input)}); return "found";`);
+				expect(result.ok).toBe(true);
+				expect(harness.calls.splice(0)).toEqual([`locator:${expected}`]);
+			}
+			const pressed = await harness.run(`
+				await tab.press("Enter");
+				await tab.press("Tab", {});
+				await tab.press("Escape", { selector: undefined });
+				await tab.press("Space", { selector: "p-aria/Continue" });
+			`);
+			expect(pressed.ok).toBe(true);
+			expect(harness.calls.splice(0)).toEqual([
+				"press:Enter",
+				"press:Tab",
+				"press:Escape",
+				"focus:aria/Continue",
+				"press:Space",
+			]);
+			for (const [options, expected] of [
+				["", ["screenshot:false"]],
+				["{}", ["screenshot:false"]],
+				["{ selector: undefined, fullPage: true }", ["screenshot:true"]],
+				[
+					'{ selector: "p-aria/Continue", fullPage: true }',
+					["query:aria/Continue", "element screenshot", "dispose"],
+				],
+			] as const) {
+				const result = await harness.run(`await tab.screenshot(${options});`);
+				expect(result.ok).toBe(false);
+				if (result.ok) throw new Error("fake capture should stop before image persistence");
+				expect(result.error.message).toBe("fake capture reached");
+				expect(harness.calls.splice(0)).toEqual([...expected]);
+			}
+		} finally {
+			await harness.close();
+		}
+	});
+});
 
 describe("browser tab worker runtime diagnostics emission", () => {
 	afterEach(() => {
