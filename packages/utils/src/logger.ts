@@ -249,20 +249,18 @@ export function printTimings(): void {
 	}
 
 	gRootSpan.end = performance.now();
+	// Close still-open spans (e.g. cli:dispatch, which wraps the very run that
+	// prints) so they report elapsed-at-print instead of a misleading 0ms.
+	const closeOpenSpans = (span: Span): void => {
+		for (const child of span.children) closeOpenSpans(child);
+		if (span.end === undefined && !span.point) span.end = gRootSpan.end;
+	};
+	closeOpenSpans(gRootSpan);
 	const lines: string[] = [];
 	lines.push("");
 	lines.push("--- Startup timings (hierarchical) ---");
-	const work: Span[] = [];
-	const loads: Span[] = [];
-	for (const child of gRootSpan.children) {
-		if (isModuleLoadSpan(child)) loads.push(child);
-		else work.push(child);
-	}
-	for (const child of work.sort((a, b) => a.start - b.start)) {
+	for (const child of [...gRootSpan.children].sort((a, b) => a.start - b.start)) {
 		printSpan(child, 0, lines);
-	}
-	if (loads.length > 0) {
-		printModuleLoadSummary(loads, 0, lines);
 	}
 	const totalMs = (gRootSpan.end - gRootSpan.start).toFixed(1);
 	lines.push(`Total: ${totalMs}ms`);
@@ -274,8 +272,9 @@ export function printTimings(): void {
 
 /**
  * Begin recording startup timings under a new root span.
- * Idempotent: a second call while already recording is a no-op so that side-effect
- * starters (see module-timer.ts) and explicit starters (main.ts) can coexist.
+ * Idempotent: a second call while already recording is a no-op so that the
+ * early starter (cli.ts, process start) and the explicit starter (main.ts)
+ * can coexist.
  */
 export function startTiming(): void {
 	if (gRecordTimings) return;
@@ -286,32 +285,6 @@ export function startTiming(): void {
 		children: [],
 	};
 	gRecordTimings = true;
-}
-
-/**
- * Record an externally-measured span as a leaf child of the active span (or root
- * when no span is active). Used by the module-load timing plugin to splice load
- * events into the tree retroactively.
- */
-export function recordModuleLoadSpan(path: string, start: number, durationMs: number): void {
-	if (!gRecordTimings || !gRootSpan) return;
-	const parent = spanStorage.getStore() ?? gRootSpan;
-	const span: Span = {
-		op: `load:${shortenLoadPath(path)}`,
-		start,
-		end: start + durationMs,
-		parent,
-		children: [],
-	};
-	parent.children.push(span);
-}
-
-function shortenLoadPath(p: string): string {
-	const cwd = process.cwd();
-	if (p.startsWith(`${cwd}/`)) return p.slice(cwd.length + 1);
-	const home = process.env.HOME;
-	if (home && p.startsWith(`${home}/`)) return `~/${p.slice(home.length + 1)}`;
-	return p;
 }
 
 /**
@@ -359,13 +332,6 @@ function fmtMs(ms: number): string {
 	return `${ms.toFixed(0)}ms`;
 }
 
-const MODULE_LOAD_PREFIX = "load:";
-const MODULE_LOAD_VERBOSE_TOP = 10;
-
-function isModuleLoadSpan(span: Span): boolean {
-	return span.op.startsWith(MODULE_LOAD_PREFIX);
-}
-
 function printSpan(span: Span, depth: number, lines: string[]): void {
 	const indent = "  ".repeat(depth);
 	if (span.point) {
@@ -380,50 +346,8 @@ function printSpan(span: Span, depth: number, lines: string[]): void {
 	const selfStr = span.children.length > 0 && self > LOGGED_TIMING_THRESHOLD_MS ? ` (self ${fmtMs(self)})` : "";
 	lines.push(`${indent}${span.op}: ${fmtMs(dur)}${selfStr}${tag}`);
 
-	// Split children into work spans and module-load spans for summarization.
-	const work: Span[] = [];
-	const loads: Span[] = [];
-	for (const child of span.children) {
-		if (isModuleLoadSpan(child)) loads.push(child);
-		else work.push(child);
-	}
-	for (const child of work.sort((a, b) => a.start - b.start)) {
+	for (const child of [...span.children].sort((a, b) => a.start - b.start)) {
 		printSpan(child, depth + 1, lines);
-	}
-	if (loads.length > 0) {
-		printModuleLoadSummary(loads, depth + 1, lines);
-	}
-}
-
-/** Collapse the (typically hundreds of) module-load spans into one summary line. */
-function printModuleLoadSummary(loads: Span[], depth: number, lines: string[]): void {
-	const childIndent = "  ".repeat(depth);
-	const grandIndent = "  ".repeat(depth + 1);
-	let unionStart = Number.POSITIVE_INFINITY;
-	let unionEnd = 0;
-	let totalSelf = 0;
-	for (const span of loads) {
-		if (span.end === undefined) continue;
-		if (span.start < unionStart) unionStart = span.start;
-		if (span.end > unionEnd) unionEnd = span.end;
-		totalSelf += span.end - span.start;
-	}
-	const wall = unionEnd > unionStart ? unionEnd - unionStart : 0;
-	lines.push(`${childIndent}(modules): ${loads.length} loaded, wall ${fmtMs(wall)}, sum ${fmtMs(totalSelf)}`);
-	// Resolve GJC-first with PI fallback inline (no ./env import) so this
-	// foundational logger stays off the env module's dependency graph, which the
-	// tab-worker native-free runtime contract (issue-2598-repro) walks.
-	const showAll = (process.env.GJC_TIMING?.trim() || process.env.PI_TIMING?.trim()) === "full";
-	const sorted = [...loads].sort((a, b) => durationOf(b) - durationOf(a));
-	const visible = showAll ? sorted : sorted.slice(0, MODULE_LOAD_VERBOSE_TOP);
-	for (const span of visible) {
-		const dur = durationOf(span);
-		if (dur < LOGGED_TIMING_THRESHOLD_MS) break;
-		const tag = isParallel(span) ? " [parallel]" : "";
-		lines.push(`${grandIndent}${span.op}: ${fmtMs(dur)}${tag}`);
-	}
-	if (!showAll && sorted.length > MODULE_LOAD_VERBOSE_TOP) {
-		lines.push(`${grandIndent}… ${sorted.length - MODULE_LOAD_VERBOSE_TOP} more (PI_TIMING=full to show all)`);
 	}
 }
 
