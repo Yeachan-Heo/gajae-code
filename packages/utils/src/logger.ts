@@ -251,11 +251,13 @@ export function printTimings(): void {
 	gRootSpan.end = performance.now();
 	// Close still-open spans (e.g. cli:dispatch, which wraps the very run that
 	// prints) so they report elapsed-at-print instead of a misleading 0ms.
+	const root = gRootSpan;
+	const printNow = root.end;
 	const closeOpenSpans = (span: Span): void => {
 		for (const child of span.children) closeOpenSpans(child);
-		if (span.end === undefined && !span.point) span.end = gRootSpan.end;
+		if (span.end === undefined && !span.point) span.end = printNow;
 	};
-	closeOpenSpans(gRootSpan);
+	closeOpenSpans(root);
 	const lines: string[] = [];
 	lines.push("");
 	lines.push("--- Startup timings (hierarchical) ---");
