@@ -4,7 +4,8 @@ import * as os from "node:os";
 import * as path from "node:path";
 import * as lockModule from "../src/config/file-lock";
 import * as incarnationModule from "../src/sdk/broker/process-incarnation";
-import { SessionIndex } from "../src/sdk/broker/session-index";
+import { SessionIndex, type SessionIndexEvent, sessionIndexChecksum } from "../src/sdk/broker/session-index";
+import { SESSION_INDEX_EVENT_VERSION } from "../src/sdk/broker/state-version";
 
 const event = (sessionId: string) => ({
 	type: "host_registered" as const,
@@ -29,6 +30,90 @@ function deferred<T = void>() {
  * attempt count.
  */
 describe("SDK session index lock contention (#4544)", () => {
+	it("parses shared history outside the append lock, including concurrent prefix growth (#5438)", async () => {
+		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-5438-prepared-"));
+		const sessionsDir = path.join(dir, "sdk", "sessions");
+		const log = path.join(sessionsDir, "index.jsonl");
+		const signed = (indexSeq: number, sessionId: string): SessionIndexEvent => {
+			const unsigned: Omit<SessionIndexEvent, "checksum"> = {
+				...event(sessionId),
+				version: SESSION_INDEX_EVENT_VERSION,
+				indexSeq,
+				ts: Date.now(),
+			};
+			return { ...unsigned, checksum: sessionIndexChecksum(unsigned) };
+		};
+		const history = Array.from({ length: 1024 }, (_, i) => signed(i + 1, `prepared-history-${i}`));
+		await fs.mkdir(sessionsDir, { recursive: true });
+		await Bun.write(
+			path.join(sessionsDir, "index.snapshot.json"),
+			JSON.stringify({ version: SESSION_INDEX_EVENT_VERSION, indexSeq: 512, events: history.slice(0, 512) }),
+		);
+		await Bun.write(
+			log,
+			`${history
+				.slice(512)
+				.map(row => JSON.stringify(row))
+				.join("\n")}\n`,
+		);
+		const index = new SessionIndex(dir);
+		const realWithFileLock = lockModule.withFileLock;
+		const parse = JSON.parse;
+		let locked = false;
+		let lockedHistoryParses = 0;
+		let unlockedHistoryParses = 0;
+		let acquisitions = 0;
+		const locking = vi.spyOn(lockModule, "withFileLock").mockImplementation(async (file, fn, options) => {
+			acquisitions++;
+			// A separate cooperative writer commits after preparation but before
+			// this acquisition. The existing prefix is unchanged, so only this
+			// new row needs parsing/checksumming under the append lock.
+			await realWithFileLock(
+				file,
+				async () => {
+					await fs.appendFile(log, `${JSON.stringify(signed(1025, "racing-registration"))}\n`);
+				},
+				options,
+			);
+			return await realWithFileLock(
+				file,
+				async () => {
+					locked = true;
+					try {
+						return await fn();
+					} finally {
+						locked = false;
+					}
+				},
+				options,
+			);
+		});
+		const parsing = vi.spyOn(JSON, "parse").mockImplementation((text, reviver) => {
+			if (String(text).includes("prepared-history-")) {
+				if (locked) lockedHistoryParses++;
+				else unlockedHistoryParses++;
+			}
+			return parse(text, reviver);
+		});
+		try {
+			const appended = await index.append(event("prepared-append"));
+			expect(appended.indexSeq).toBe(1026);
+			expect(acquisitions).toBe(1);
+			expect(unlockedHistoryParses).toBe(513);
+			expect(lockedHistoryParses).toBe(0);
+		} finally {
+			parsing.mockRestore();
+			locking.mockRestore();
+		}
+		try {
+			const replay = await new SessionIndex(dir).open();
+			expect(replay.indexSeq).toBe(1026);
+			expect(replay.listSessions().sessions).toHaveLength(1026);
+			expect((await replay.diagnose()).status).toBe("healthy");
+		} finally {
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	});
 	it("reports the live lock owner when a launch exhausts the lock budget", async () => {
 		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-4544-owner-"));
 		const sessionsDir = path.join(dir, "sdk", "sessions");
