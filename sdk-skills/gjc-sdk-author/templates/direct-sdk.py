@@ -66,10 +66,17 @@ def redact(value: Any) -> Any:
     return value
 
 
+class CliFailure(Exception):
+    def __init__(self, envelope: dict[str, Any], exit_code: int) -> None:
+        super().__init__("broker_request_failed")
+        self.envelope = envelope
+        self.exit_code = exit_code
+
+
 def run_gjc_session(repo: str, arguments: list[str]) -> dict[str, Any]:
     try:
         completed = subprocess.run(
-            ["gjc", "sdk", "session", *arguments],
+            ["gjc", "sdk", "session", *arguments, "--json"],
             cwd=repo,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
@@ -80,14 +87,16 @@ def run_gjc_session(repo: str, arguments: list[str]) -> dict[str, Any]:
         )
     except (OSError, subprocess.SubprocessError):
         raise ValueError("broker_request_failed") from None
-    if completed.returncode != 0:
-        raise ValueError("broker_request_failed")
     try:
         response: Any = json.loads(completed.stdout)
     except json.JSONDecodeError:
         raise ValueError("invalid_cli_response") from None
     if not isinstance(response, dict):
         raise ValueError("invalid_cli_response")
+    if completed.returncode != 0 or response.get("ok") is False:
+        if len(completed.stdout.encode("utf-8")) > 8192 or response.get("schema") != "gjc.command-error" or response.get("version") != 1 or response.get("ok") is not False:
+            raise ValueError("invalid_cli_response")
+        raise CliFailure(response, 2 if completed.returncode == 2 else 1)
     return response
 
 
@@ -99,6 +108,8 @@ def inspect(repo: str, session_id: str) -> dict[str, Any]:
             if response.get("ok") is False:
                 raise ValueError("query_unavailable")
             snapshot[query] = {"status": "confirmed", "source": query, "value": redact(response)}
+        except CliFailure as error:
+            snapshot[query] = {"status": "unavailable", "source": query, "failure": error.envelope}
         except Exception:
             snapshot[query] = {"status": "unavailable", "source": query}
     return snapshot
@@ -127,7 +138,7 @@ def main() -> None:
         raise ValueError("secret_input_forbidden")
     if args.mode == "inspect":
         result = inspect(args.repo, args.session_id)
-        print(json.dumps(redact({"sessionId": args.session_id, "result": result}), indent=2))
+        print(json.dumps({"sessionId": args.session_id, "result": result}, indent=2))
         return
     operation = args.operation
     if operation is None or operation not in ALLOWED_CONTROLS:
@@ -155,6 +166,9 @@ def main() -> None:
 
 try:
     main()
+except CliFailure as error:
+    print(json.dumps(error.envelope, ensure_ascii=False, separators=(",", ":")))
+    raise SystemExit(error.exit_code)
 except Exception:
     print("GJC SDK request failed safely.", file=sys.stderr)
     raise SystemExit(1)

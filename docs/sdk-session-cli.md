@@ -11,6 +11,40 @@ The session CLI is advisory tooling over the SDK: every semantic verb resolves
 sessions through the SDK broker, and output is rendered through a versioned,
 credential-free DTO. Endpoint credentials are never printed.
 
+## Command-local help
+
+Discovery is static and inert for every public SDK and daemon parent, leaf and
+alias; it does not initialize a broker, settings, transport or evidence store.
+Use the deepest known command for its arguments, applicable options and risks:
+
+```sh
+gjc sdk session raw query --help --json
+gjc daemon reload --help --help-section options --help-page 1
+```
+
+`-h` is equivalent to `--help`. Sections traverse in this fixed order:
+`overview`, `usage`, `children`, `arguments`, `options`, `examples`, `recovery`.
+The defaults are `overview` and page `1`; an empty section has a valid page 1.
+Each response includes only the selected node and, in `children`, its immediate
+children. Follow the returned `next.argv` unchanged, including
+`--help-revision <sha256>`, section, page and `--json` when selected. A changed
+revision requires a new traversal; do not merge pages from different revisions.
+
+Valued selectors accept separate or `=` operands. Pages are positive decimal
+safe integers. Repeated/invalid selectors, selectors without actual help, and
+unknown descendants fail with usage exit 2 at the nearest known command.
+`--help=json` is unsupported. Option values and tokens after `--` do not activate
+help or JSON mode. Syntax containing `<placeholders>` is documentation, not a
+ready-to-run recovery command.
+
+Text and `gjc.command-help` version 1 JSON responses are each at most 8192 UTF-8
+bytes including the newline. Text escapes controls and labels display literals;
+never paste escaped display text as shell argv. Complete entries have stable
+IDs. Oversized values use non-executable base64 fragments: concatenate contiguous
+`offsetBytes` ranges, verify `totalBytes` and `sha256`, then decode the complete
+UTF-8 JSON value. `sectionComplete` ends a section; only `documentComplete: true`
+with `next: null` ends traversal. Help paging never reruns an operation.
+
 ## Broker authority
 
 `list`, `inspect`, `send`, `status`, and `tail` resolve sessions through the
@@ -283,11 +317,86 @@ direct discovery-file reads, and output is versioned and credential-free.
 
 ## Exit codes and error envelope
 
-Verbs exit `0` on success and write JSON to stdout. Failures write a JSON error
-envelope to stdout with a non-zero exit: usage errors exit `2`, operational
-failures (broker unavailable, session unavailable, retention gap, wait
-timeout) exit `1`. Error details are recursively redacted of secret-shaped
-fields before rendering.
+Session verbs exit `0` and keep their existing successful JSON stdout contract,
+including when `--json` is absent. **Machine callers must explicitly add
+`--json` for machine-readable failures.** Ordinary failures otherwise write
+bounded text to stderr only. With `--json`, failure writes exactly one
+`gjc.command-error` version 1 envelope and newline to stdout, with empty stderr.
+Both modes are limited to 8192 UTF-8 bytes including formatting and newline.
+Usage errors exit `2`; operation failures (including unavailable broker/session,
+retention gaps and wait timeouts) exit `1`.
+
+The envelope preserves `command`, `error.code`, `category`, `retryability`,
+`outcomeCertainty`, allowlisted `references` and evidence-based `nextSteps`, plus
+`omittedOptional`, `complete`, `evidence` and `continuation`. Safe fields are
+explicitly projected; arbitrary exception messages, request bodies, credentials
+and stacks are not public error evidence. Do not infer non-execution from a
+nonzero exit or timeout: `wait_timeout` after acceptance means applied work,
+whereas `uncertain_after_send` means the outcome is unknown. Preserve session,
+operation, idempotency, claim, command and turn references when supplied.
+
+Error guidance performs no additional probes, status calls, retries, restarts or
+kills. Execute an appropriate explicit observation only when the task warrants
+it; reconcile before considering replay. `retire` is a proof-bound mutation,
+not a generic status check, and requires confirmed intent and actual applicable
+proof. Daemon `stop`/`restart` interrupt work; `--force` permits SIGKILL escalation.
+Daemon kinds are `telegram`, `discord`, `slack` (default `telegram`); `daemon`
+defaults to `status`, and `reload` aliases `restart`. There is no
+`gjc daemon restart sdk` recovery command. Never repeat successful mutations
+when a multi-target daemon result contains failures.
+
+### Retained error evidence
+
+When essential sanitized reconciliation references do not fit inline, the CLI
+may retain them locally, but advertises `evidence.status: "retained"` and a
+continuation only after successful publication and read-back verification.
+Retrieval is an explicit family-root operation, not an operation retry:
+
+```text
+gjc sdk --error-ref <32-lowercase-hex-id> --error-sha256 <64-lowercase-hex> [--error-page <N>] [--error-agent-dir <dir>] [--json]
+gjc daemon --error-ref <32-lowercase-hex-id> --error-sha256 <64-lowercase-hex> [--error-page <N>] [--error-agent-dir <dir>] [--json]
+```
+
+Use the actual returned argv rather than constructing a locator. Ref and digest
+are required together; page defaults to 1 and is a positive decimal safe integer.
+Selectors support separate/equals forms; duplicates are invalid. Retrieval is
+exclusive with help, operation positionals and operation flags. Scope/page
+selectors require retrieval. `--error-agent-dir` is distinct from SDK operation
+`--agent-dir`; daemon worker `--agent-dir` is private. Retrieval uses only the
+explicit/default root and checks the stored family, never scans other roots.
+
+The store is `<effective-agent-dir>/cli-error-evidence-v1`. Records expire exactly
+24 hours after creation, without sliding reads. Expiry refuses retrieval; lazy
+cleanup is not a promise of immediate secure erasure. Limits are 64 committed
+records, 1 MiB per record and 16 MiB committed aggregate, plus at most one 1 MiB
+pending file and one 4096-byte lock: at most 66 files and 17 MiB + 4096 bytes of
+logical payload (filesystem allocation overhead is separate). Unexpired records
+are not evicted to make space. POSIX owner-only permissions are verified; an
+unsupported secure permission mechanism fails closed. No success/help output
+initializes the store and there is no background cleanup service.
+
+Successful retrieval is `gjc.command-error-evidence` version 1 on stdout, exit 0,
+with each text/JSON page bounded to 8192 bytes. It means retrieval succeeded, not
+that the original operation did. Follow the pinned digest/scope/mode continuation;
+reassemble contiguous base64 bytes and verify total length and SHA256 before
+UTF-8/JSON decoding or using references. Pages contain immutable retained evidence,
+not resampled runtime state.
+
+Disk, permissions, quota, lock contention or verification failure may prevent
+retention. The original failure remains nonzero with its original outcome
+certainty and retryability: `complete: false`, `evidence.status: "unavailable"`,
+and `continuation: null`, with the explicit warning that necessary evidence
+could not be retained and **do not blindly retry the original operation**.
+Missing essential evidence is not described as optional, and no invented path,
+ID, digest or fallback store is advertised. Lossless retrieval is guaranteed only
+for successfully published records within their retention lifetime; expiry,
+deletion or corruption can make later retrieval unavailable.
+
+These bounds do not paginate successful session/search/spawn/guides results.
+Search outside Git retains its successful exit-0 result; observing an unhealthy
+daemon is still a successful status operation. Serve preflight errors use the
+ordinary failure contract; after relay ownership, protocol framing and termination
+remain unchanged, without CLI error envelopes injected into the stream.
 
 ## Scoped search (`gjc sdk search`)
 
