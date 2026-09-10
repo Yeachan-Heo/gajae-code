@@ -3117,6 +3117,11 @@ describe("deep-interview crystallize contract", () => {
 		}
 	});
 
+	it("rejects a context-free affirmative as a confirmed requirement", () => {
+		const value = singleGoalEvidence("Yes", "Yes");
+		expect(() => crystallizeDeepInterview(value)).toThrow("verbatim user anchor");
+	});
+
 	it("rejects a root-level forged project transcript through GJC_SESSION_FILE", async () => {
 		const root = await fs.mkdtemp(path.join(process.cwd(), ".tmp-crystallize-root-forged-"));
 		const sessionId = "crystallize-root-forged";
