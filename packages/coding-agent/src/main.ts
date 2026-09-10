@@ -741,6 +741,7 @@ export async function runInteractiveMode(
 	resumeAction?: "continue-tail" | "open-idle",
 	startDeferredMcpConfig?: CreateAgentSessionResult["startDeferredMcpConfig"],
 	startDeferredModelProfiles?: DeferredModelProfileStartup,
+	options?: { stopAfterFirstPaint?: boolean },
 ): Promise<void> {
 	const mode = createInteractiveMode
 		? createInteractiveMode({
@@ -762,7 +763,7 @@ export async function runInteractiveMode(
 				eventBus,
 			);
 
-	await initializeInteractiveModeWithStartupUpdate(mode, startupUpdate);
+	await logger.time("interactive:init", () => initializeInteractiveModeWithStartupUpdate(mode, startupUpdate));
 	try {
 		await persistCoordinatorRuntimeInputReady();
 	} catch (error) {
@@ -788,7 +789,14 @@ export async function runInteractiveMode(
 			if (shouldOfferOnboarding(onboardingState)) await mode.showFrictionlessOnboarding();
 		}
 	}
-	mode.renderInitialMessages(undefined, { preserveExistingChat: true });
+	logger.time("interactive:firstPaint", () => mode.renderInitialMessages(undefined, { preserveExistingChat: true }));
+	if (options?.stopAfterFirstPaint) {
+		// GJC_TIMING=x probe: the cold-start measurement ends here, so tear the UI
+		// down with the same shutdown/stop order the interactive exit path uses.
+		await mode.shutdown();
+		mode.stop();
+		return;
+	}
 
 	for (const notify of notifs) {
 		if (!notify) {
@@ -2075,7 +2083,8 @@ export async function runRootCommand(
 		}
 
 		if (isInteractive) {
-			let exitForTiming = false;
+			const timingEnv = $pickenv("GJC_TIMING", "PI_TIMING");
+			const exitForTiming = timingEnv === "x";
 			try {
 				startupUpdate.startBeforeInteractiveInitialization();
 				const changelogMarkdown = await logger.time(
@@ -2095,9 +2104,8 @@ export async function runRootCommand(
 					process.stdout.write(`${chalk.dim(`Model scope: ${modelList} ${chalk.gray("(Alt+N to cycle)")}`)}\n`);
 				}
 
-				if ($pickenv("GJC_TIMING", "PI_TIMING")) {
+				if (timingEnv && !exitForTiming) {
 					logger.printTimings();
-					exitForTiming = $pickenv("GJC_TIMING", "PI_TIMING") === "x";
 				}
 
 				if (!exitForTiming) {
@@ -2120,6 +2128,31 @@ export async function runRootCommand(
 						startDeferredMcpConfig,
 						startDeferredModelProfiles,
 					);
+				} else {
+					// GJC_TIMING=x measures through the first transcript paint, so the
+					// cold-start number includes interactive init and time-to-first-render.
+					// runInteractiveMode's probe stop already disposed the session.
+					await runInteractiveMode(
+						session,
+						VERSION,
+						changelogMarkdown,
+						notifs,
+						startupUpdate,
+						parsedArgs.messages,
+						setToolUIContext,
+						lspServers,
+						mcpManager,
+						eventBus,
+						initialMessage,
+						initialImages,
+						deps.createInteractiveMode,
+						bareResumeAction,
+						startDeferredMcpConfig,
+						startDeferredModelProfiles,
+						{ stopAfterFirstPaint: true },
+					);
+					logger.printTimings();
+					process.exit(0);
 				}
 			} catch (error) {
 				try {
@@ -2131,11 +2164,6 @@ export async function runRootCommand(
 					return;
 				}
 				throw error;
-			}
-
-			if (exitForTiming) {
-				await session.dispose();
-				process.exit(0);
 			}
 		} else {
 			const runPrint = deps.runPrintMode ?? (await import("./modes/print-mode")).runPrintMode;

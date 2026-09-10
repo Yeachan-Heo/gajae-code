@@ -1,10 +1,14 @@
 # Changelog
 
 ## [Unreleased]
+### Changed
+
+- `GJC_TIMING` now measures the real cold start. The timing window opens at the first CLI statement (`cli:installRuntimeGlobals`, `cli:dispatch` spans), exposing the runtime-globals install, the macOS nofile preflight, and the launch command's module graph that previously escaped measurement because the window opened inside `main.ts`. `GJC_TIMING=x` boots interactive mode through the first transcript paint (`interactive:init` / `interactive:firstPaint` spans) before printing the tree and exiting, making the total a true time-to-first-render measure instead of a pre-TUI proxy.
 
 ### Added
 
 - Successful macOS installs and updates can offer the optional experimental, third-party community Gajae Code App (#5140), defaulting to No. The shared installer requires canonical release checksums and a verified bundle/signature, skips installed apps and automation, and supports `GJC_NO_COMMUNITY_APP=1`; app failures leave GJC installed.
+
 ### Fixed
 - The `opencode-go/muse-spark-1.3-contributor` catalog row added in #5485 is now declared in the autorouting tier-map skip list, so `check:autorouting-map` and its CI gate pass again instead of failing on the unlabeled new key.
 - Image generation now sends the selected image-role model instead of silently substituting a provider default for Antigravity, Gemini, OpenRouter, and Alibaba.

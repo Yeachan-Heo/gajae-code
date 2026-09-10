@@ -7,6 +7,7 @@
 import "@gajae-code/utils/postmortem";
 import { Args, type CliConfig, Command, type CommandEntry, run } from "@gajae-code/utils/cli";
 import { APP_NAME, formatBunRuntimeError, MIN_BUN_VERSION, VERSION } from "@gajae-code/utils/dirs";
+import { startTiming, time } from "@gajae-code/utils/logger";
 import { runFixtureReport } from "./cli/fixture-report";
 import { COMMUNITY_APP_REPOSITORY, offerMacosCommunityApp } from "./cli/macos-community-app";
 import { ROOT_LAUNCH_FLAGS } from "./cli/root-flags";
@@ -21,6 +22,14 @@ import {
 } from "./exec/bash-shell-worker-protocol";
 import { smokeTestIsolatedShell } from "./exec/isolated-shell";
 import { smokeTestTabWorker } from "./tools/browser/tab-worker-smoke";
+
+// Open the startup-timing window at the first CLI statement. With GJC_TIMING set
+// the printed tree then covers the pre-main costs (fast paths, runtime globals,
+// the launch command's module graph) that main.ts's later startTiming() call
+// cannot observe. Without the env gate nothing records and behavior is unchanged.
+if (process.env.GJC_TIMING || process.env.PI_TIMING) {
+	startTiming();
+}
 
 if (Bun.semver.order(Bun.version, MIN_BUN_VERSION) < 0) {
 	process.stderr.write(
@@ -527,8 +536,8 @@ export async function runCli(argv: string[]): Promise<void> {
 	}
 	const bootstrap = interactiveBootstrapText(runArgv);
 	if (bootstrap) process.stdout.write(bootstrap);
-	await installRuntimeGlobals();
-	return run({ bin: APP_NAME, version: VERSION, argv: runArgv, commands, help: showHelp });
+	await time("cli:installRuntimeGlobals", installRuntimeGlobals);
+	return time("cli:dispatch", () => run({ bin: APP_NAME, version: VERSION, argv: runArgv, commands, help: showHelp }));
 }
 
 if (import.meta.main) {
