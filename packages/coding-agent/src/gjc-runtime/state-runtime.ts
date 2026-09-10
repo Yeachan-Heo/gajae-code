@@ -2088,8 +2088,9 @@ async function assertExecutionApprovalTranscriptEvidence(
 	)
 		throw new StateCommandError(2, "deep-interview execution approval transcript prefix changed");
 	const persistedEntries: Record<string, unknown>[] = [];
-	const entryPatches = new Map<string, Record<string, unknown>>();
 	const entryOffsets = new WeakMap<Record<string, unknown>, number>();
+	const replayById = new Map<string, Record<string, unknown>>();
+	let transcriptVersion: number | undefined;
 	let transcriptOffset = 0;
 	for (const rawLine of transcriptText.match(/[^\n]*(?:\n|$)/g) ?? []) {
 		const lineOffset = transcriptOffset;
@@ -2104,19 +2105,24 @@ async function assertExecutionApprovalTranscriptEvidence(
 		}
 		if (!isPlainObject(entry))
 			throw new StateCommandError(2, "deep-interview execution approval transcript is malformed");
-		if (entry.type === "entry_patch") {
+		if (entry.type === "session") {
+			transcriptVersion = typeof entry.version === "number" ? entry.version : undefined;
+		} else if (entry.type === "entry_patch") {
 			if (typeof entry.entryId !== "string" || !isPlainObject(entry.patch))
 				throw new StateCommandError(2, "deep-interview execution approval transcript patch is malformed");
-			entryPatches.set(entry.entryId, entry.patch);
-		} else if (entry.type !== "header_patch" && entry.type !== "session") {
+			const target = replayById.get(entry.entryId);
+			if (
+				transcriptVersion !== undefined &&
+				transcriptVersion >= 4 &&
+				target?.type === "message" &&
+				entry.patch.message !== undefined
+			)
+				target.message = entry.patch.message;
+		} else if (entry.type !== "header_patch") {
 			persistedEntries.push(entry);
 			entryOffsets.set(entry, lineOffset);
+			if (typeof entry.id === "string") replayById.set(entry.id, entry);
 		}
-	}
-	for (const entry of persistedEntries) {
-		if (typeof entry.id !== "string") continue;
-		const patch = entryPatches.get(entry.id);
-		if (patch?.message !== undefined) entry.message = patch.message;
 	}
 	let activeEntries = persistedEntries;
 	if (persistedEntries.some(entry => "id" in entry || "parentId" in entry)) {
