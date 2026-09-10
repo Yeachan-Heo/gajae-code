@@ -10,21 +10,23 @@
 import { randomUUID } from "node:crypto";
 import * as path from "node:path";
 import { getAgentDir } from "@gajae-code/utils";
+import { PublicCommandFailure } from "../../cli/public-command-errors";
 import { type IndexedSession, isSessionAuthorityEligible, SessionIndex } from "../broker/session-index";
 import { SdkClientError } from "../client";
 import { dispatchSpawnGlobal } from "../lifecycle/broker-client";
+import { sdkPublicFailure } from "./session-cli";
 
 const MASTER_CAPABILITY_ENV = "GJC_MASTER_CAPABILITY";
 const MASTER_SESSION_ENV = "GJC_MASTER_OWNER_SESSION_ID";
 const SPAWN_TIMEOUT_MS = 120_000;
 
-export class SdkMasterCliError extends Error {
+export class SdkMasterCliError extends PublicCommandFailure {
 	constructor(
 		readonly code: string,
-		message: string,
+		_message: string,
 		readonly exitCode: 1 | 2 = 1,
 	) {
-		super(message);
+		super(sdkPublicFailure(exitCode === 2 ? "usage" : code, undefined, "pre-effect").input);
 		this.name = "SdkMasterCliError";
 	}
 }
@@ -46,8 +48,6 @@ export interface SdkSpawnRendered {
 	sessionId?: string;
 	substrateKind?: string;
 	seed?: { phase?: string; clientRef?: string; commandId?: string; turnId?: string; status?: string };
-	idempotencyKey?: string;
-	error?: { code: string; message: string };
 }
 
 export interface SdkSpawnDependencies {
@@ -144,7 +144,10 @@ function opaque(value: unknown): string | undefined {
 }
 
 /** Projects an arbitrary Broker response onto the allowlisted render shape. */
-export function safeSpawnRender(response: unknown): { rendered: SdkSpawnRendered; exitCode: 0 | 1 } {
+export function safeSpawnRender(
+	response: unknown,
+	idempotencyKey?: string,
+): { rendered: SdkSpawnRendered; exitCode: 0 } {
 	const outer = record(response);
 	if (outer?.ok === true) {
 		const result = record(outer.result);
@@ -171,20 +174,20 @@ export function safeSpawnRender(response: unknown): { rendered: SdkSpawnRendered
 		};
 	}
 	const error = record(outer?.error);
-	const code = opaque(error?.code) ?? "spawn_failed";
-	const retryIdempotencyKey = code === "uncertain_after_send" ? opaque(error?.idempotencyKey) : undefined;
-	// Error messages are Broker-typed and never quote request input; an uncertain
-	// post-send result may additionally expose its non-secret replay key.
-	const message =
-		typeof error?.message === "string" && error.message.length <= 512 ? error.message : "session.spawn failed";
-	return {
-		rendered: {
-			code,
-			...(retryIdempotencyKey === undefined ? {} : { idempotencyKey: retryIdempotencyKey }),
-			error: { code, message },
-		},
-		exitCode: 1,
-	};
+	const result = record(outer?.result);
+	const seed = record(result?.seed);
+	const failure = sdkPublicFailure(typeof error?.code === "string" ? error.code : "operation_failed", error);
+	const resultReferences = sdkPublicFailure("operation_failed", result).input.references ?? [];
+	const seedReferences = sdkPublicFailure("operation_failed", seed).input.references ?? [];
+	throw new PublicCommandFailure({
+		...failure.input,
+		references: [
+			...(failure.input.references ?? []),
+			...resultReferences,
+			...seedReferences,
+			...(idempotencyKey === undefined ? [] : [{ kind: "idempotencyKey" as const, value: idempotencyKey }]),
+		],
+	});
 }
 
 export function renderSpawnTable(rendered: SdkSpawnRendered): string {
@@ -194,8 +197,6 @@ export function renderSpawnTable(rendered: SdkSpawnRendered): string {
 	if (rendered.substrateKind) lines.push(`Substrate: ${rendered.substrateKind}`);
 	if (rendered.seed?.phase) lines.push(`Seed phase: ${rendered.seed.phase}`);
 	if (rendered.seed?.status) lines.push(`Seed status: ${rendered.seed.status}`);
-	if (rendered.error) lines.push(`Error: ${rendered.error.code}: ${rendered.error.message}`);
-	if (rendered.idempotencyKey) lines.push(`Retry idempotency key: ${rendered.idempotencyKey}`);
 
 	return lines.join("\n");
 }
@@ -207,7 +208,7 @@ export function renderSpawnTable(rendered: SdkSpawnRendered): string {
 export async function runSdkSpawn(
 	args: SdkSpawnArgs,
 	dependencies: Partial<SdkSpawnDependencies> = {},
-): Promise<{ rendered: SdkSpawnRendered; exitCode: 0 | 1 }> {
+): Promise<{ rendered: SdkSpawnRendered; exitCode: 0 }> {
 	const deps: SdkSpawnDependencies = {
 		env: dependencies.env ?? process.env,
 		dispatch: dependencies.dispatch ?? brokerSpawnDispatch,
@@ -246,14 +247,19 @@ export async function runSdkSpawn(
 			},
 			idempotencyKey,
 		);
-		return safeSpawnRender(response);
+		return safeSpawnRender(response, idempotencyKey);
 	} catch (error) {
-		if (error instanceof SdkClientError && error.code === "uncertain_after_send") {
-			return safeSpawnRender({
-				ok: false,
-				error: { code: error.code, message: error.message, idempotencyKey },
+		if (error instanceof PublicCommandFailure) throw error;
+		if (error instanceof SdkClientError) {
+			const failure = sdkPublicFailure(error.code, error.details);
+			throw new PublicCommandFailure({
+				...failure.input,
+				references: [...(failure.input.references ?? []), { kind: "idempotencyKey", value: idempotencyKey }],
 			});
 		}
-		throw error;
+		throw new PublicCommandFailure({
+			kind: "operation_failed",
+			references: [{ kind: "idempotencyKey", value: idempotencyKey }],
+		});
 	}
 }

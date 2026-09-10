@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test";
+import { PublicCommandFailure, renderPublicCommandFailure } from "../src/cli/public-command-errors";
 import { acpPromptPayload } from "../src/modes/acp/acp-agent";
 import { runSdkSessionCli } from "../src/sdk/cli/session-cli";
 import { dispatchControl } from "../src/sdk/host/control/dispatch";
@@ -38,14 +39,24 @@ test("SDK session send rejects empty text before broker startup and operation al
 		{ action: "send", sessionId: "missing", jsonInput: JSON.stringify({ text: "\n  \t" }) },
 	] as const) {
 		const outputs: unknown[] = [];
-		const exitCodes: number[] = [];
-		await runSdkSessionCli(
-			{ ...args, agentDir: "/definitely/not/used" },
-			value => outputs.push(value),
-			code => exitCodes.push(code),
-		);
-		expect(outputs).toEqual([{ ok: false, error: { code: "invalid_input", message: "Prompt must not be empty." } }]);
-		expect(exitCodes).toEqual([2]);
+		let failure: unknown;
+		try {
+			await runSdkSessionCli({ ...args, agentDir: "/definitely/not/used" }, value => outputs.push(value));
+		} catch (error) {
+			failure = error;
+		}
+		expect(failure).toBeInstanceOf(PublicCommandFailure);
+		expect(outputs).toEqual([]);
+		const rendered = await renderPublicCommandFailure(failure, { command: ["sdk", "session", "send"], json: true });
+		expect(rendered.envelope).toMatchObject({
+			ok: false,
+			error: { code: "usage", category: "usage", outcomeCertainty: "not-applied" },
+		});
+		expect(rendered.envelope.error.references).not.toContainEqual({
+			kind: "operationRef",
+			value: expect.any(String),
+		});
+		expect(rendered.exitCode).toBe(2);
 	}
 });
 

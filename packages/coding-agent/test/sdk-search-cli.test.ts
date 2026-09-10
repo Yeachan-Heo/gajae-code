@@ -1,6 +1,7 @@
 import { expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { PublicCommandFailure, renderPublicCommandFailure } from "../src/cli/public-command-errors";
 import { type SdkSearchResultV1, sdkSearchResultV1 } from "../src/sdk/broker/session-scope";
 import { mergeProbedSearchRows, renderSdkSearchTable, runSdkSearch } from "../src/sdk/cli/session-cli";
 import { type SessionLifecycleClient, SessionLifecycleService } from "../src/sdk/lifecycle/service";
@@ -196,33 +197,42 @@ test("non-Git repo is successful and makes zero probes", async () => {
 	}
 });
 
-test("unavailable search prints a scoped redacted envelope and exits nonzero without probes", async () => {
+test("unavailable search renders a redacted public envelope and exits nonzero without probes", async () => {
 	const root = await temp();
 	const git = Bun.spawn(["git", "init", "-q", root]);
 	await git.exited;
 	try {
 		let probes = 0;
-		const search = await runSdkSearch(
-			{ repo: root },
-			() =>
-				new SessionLifecycleService(
-					new Client({ ok: false, error: { code: "unavailable", message: "fixture-endpoint-token" } }),
-				),
-			async (_agentDir, value) => {
-				probes++;
-				return value;
-			},
-		);
-		expect(search.exitCode).toBe(1);
-		expect(search.result).toMatchObject({
+		let failure: unknown;
+		try {
+			await runSdkSearch(
+				{ repo: root },
+				() =>
+					new SessionLifecycleService(
+						new Client({ ok: false, error: { code: "unavailable", message: "fixture-endpoint-token" } }),
+					),
+				async (_agentDir, value) => {
+					probes++;
+					return value;
+				},
+			);
+		} catch (error) {
+			failure = error;
+		}
+		expect(failure).toBeInstanceOf(PublicCommandFailure);
+		const rendered = await renderPublicCommandFailure(failure, { command: ["sdk", "search"], json: true });
+		expect(rendered.exitCode).toBe(1);
+		expect(JSON.parse(rendered.stdout)).toEqual(rendered.envelope);
+		expect(rendered.envelope).toMatchObject({
+			schema: "gjc.command-error",
 			version: 1,
-			status: "unavailable",
-			rows: [],
-			error: { code: "unavailable" },
+			ok: false,
+			command: ["sdk", "search"],
+			error: { code: "unavailable", category: "unavailable" },
 		});
 		expect(probes).toBe(0);
-		expect(JSON.stringify(search.result)).not.toContain("fixture-endpoint-token");
-		expect(renderSdkSearchTable(search.result)).toContain("Status: unavailable");
+		expect(rendered.stdout).not.toContain("fixture-endpoint-token");
+		expect(rendered.stderr).toBe("");
 	} finally {
 		await fs.rm(root, { recursive: true, force: true });
 	}
