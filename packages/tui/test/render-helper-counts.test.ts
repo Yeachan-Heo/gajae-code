@@ -164,6 +164,16 @@ describe("TUI render helper counters", () => {
 		const prefixes = Array.from({ length: 24 }, (_, i) => `M${String(i).padStart(2, "0")}:`);
 		for (const prefix of prefixes) tui.addChild(new Text(`\x1b[36m${prefix}${"漢".repeat(30)}\x1b[0m`, 0, 0));
 		const wrapped = prefixes.flatMap(prefix => [prefix + "漢".repeat(18), "漢".repeat(12)]);
+		const settledCommit = Promise.withResolvers<boolean>();
+		const requestRender = tui.requestRenderWithGeneration.bind(tui);
+		vi.spyOn(tui, "requestRenderWithGeneration").mockImplementation((force, source) => {
+			const generation = requestRender(force, source);
+			if (source === "resize.width-settled") {
+				void tui.waitForRenderCommit(generation, 1_000).then(settledCommit.resolve);
+			}
+			return generation;
+		});
+		const settleTimeout = setTimeout(() => settledCommit.resolve(false), 1_000);
 		try {
 			tui.start();
 			await committedFrame(tui, term, "setup");
@@ -176,7 +186,7 @@ describe("TUI render helper counters", () => {
 			TUI.resetRenderCountersForTest();
 			term.clearWriteLog();
 			term.resize(40, 12);
-			const generation = await committedFrame(tui, term, "resize");
+			await committedFrame(tui, term, "resize");
 			expect(TUI.getRenderCountersForTest().widthReflowVisibleWidthCalls).toBe(0);
 			expect(TUI.getRenderCountersForTest().widthReflowScanRows).toBe(0);
 			expect(visible(term).filter(Boolean)).toEqual(wrapped.slice(-12));
@@ -184,7 +194,10 @@ describe("TUI render helper counters", () => {
 			// Immediate viewport repaint retains durable history. The scheduled
 			// repair must still replay every newly wrapped row once the width settles.
 			const redraws = tui.fullRedraws;
-			expect(await tui.waitForRenderCommit(generation + 1, 1_000)).toBe(true);
+			// An unrelated request can consume the next generation (and may coalesce
+			// with repair). Wait for the actual settle request, not generation + 1.
+			tui.requestRenderWithGeneration(false, "intermediate-layout");
+			expect(await settledCommit.promise).toBe(true);
 			await term.flush();
 			expect(tui.fullRedraws).toBe(redraws + 1);
 			expect(
@@ -197,6 +210,7 @@ describe("TUI render helper counters", () => {
 			expect(term.getViewportAnsi()).toContain("\x1b[36m");
 			for (const line of term.getScrollBuffer()) expect(visibleWidth(line)).toBeLessThanOrEqual(40);
 		} finally {
+			clearTimeout(settleTimeout);
 			tui.stop();
 			tui.dispose();
 			term.reset();
