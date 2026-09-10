@@ -1870,7 +1870,13 @@ export async function runRootCommand(
 	setPrimaryControlSurface(sessionOptions, "cli");
 	sessionOptions.settings = settingsInstance;
 	sessionOptions.masterModeContext = masterModeContext;
-	if (isInteractive && sessionOptions.mcpConfigPath) {
+	// Interactive launches paint before MCP connects: the deferred starter runs
+	// after first paint and a startup turn barrier keeps the first prompt from
+	// racing tool registration. A no-op whenever no MCP servers apply — exact
+	// `--mcp-config`, conventional autoload, or plugin bundles (plugins never
+	// defer; their connect evidence is published during session creation).
+	// ACP/print/SDK sessions connect eagerly and are not carved out here.
+	if (isInteractive) {
 		sessionOptions.deferMcpConfigStartup = true;
 	}
 	// ACP is not carved out: `gjc acp` is broker-backed and never builds a local

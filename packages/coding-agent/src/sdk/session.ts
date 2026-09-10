@@ -142,6 +142,7 @@ import {
 	type OptionalRuntimeServicesOverrides,
 } from "../runtime/optional-runtime-services";
 import { loadAllMCPConfigs, MCPManager } from "../runtime-mcp";
+import type { MCPLoadResult } from "../runtime-mcp/manager";
 import type { MCPServerConfig } from "../runtime-mcp/types";
 import {
 	getNotificationConfig,
@@ -2997,6 +2998,14 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		const pluginMcpToolNames: string[] = [];
 		const conventionalMcpToolNames: string[] = [];
 		let deferredExactMcpConfig: { manager: MCPManager; configPath: string } | undefined;
+		let deferredConventionalMcp:
+			| {
+					manager: MCPManager;
+					configs: Record<string, MCPServerConfig>;
+					sources: Record<string, SourceMeta>;
+					conventionalConfigs: Record<string, MCPServerConfig>;
+			  }
+			| undefined;
 
 		// Add image tools when an image role model is configured.
 		const { getImageGenTools } = await import("../tools/image-gen");
@@ -3102,6 +3111,88 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		}
 
 		const preExactCustomToolNames = customTools.map(tool => tool.name);
+		// Connect the conventional-autoload manager and run its registration
+		// bookkeeping. Shared by the eager startup path and the deferred starter so
+		// a deferred session registers exactly what an eager one would.
+		const connectOwnedConventionalMcp = async (
+			owned: MCPManager,
+			mergedConfigs: Record<string, MCPServerConfig>,
+			mergedSources: Record<string, SourceMeta>,
+			conventionalConfigs: Record<string, MCPServerConfig>,
+			pluginNames: ReadonlySet<string>,
+		): Promise<MCPLoadResult> => {
+			let result: MCPLoadResult;
+			try {
+				result = await owned.connectServers(mergedConfigs, mergedSources as never);
+			} catch (error) {
+				if (safeIsInstanceOf(error, McpManagerCleanupError)) throw error;
+				// Avoid leaking partially-started server processes on failure.
+				let cleanupError: unknown;
+				try {
+					await owned.disconnectAll();
+				} catch (disconnectError) {
+					cleanupError = disconnectError;
+				} finally {
+					cleanupOwnedMcpManager = undefined;
+				}
+				if (cleanupError !== undefined) throw attachMcpCleanupDiagnostic(error, cleanupError);
+				throw error;
+			}
+			for (const [server, err] of result.errors) {
+				// A server that failed to connect leaves this generation incomplete: its
+				// surfaces produced no evidence, so publishing would present a partial
+				// pass as a clear one. On the deferred path this flag is already
+				// consumed (publication happens before the starter can run), which is
+				// acceptable only because deferral never carries plugin-bundle servers.
+				gjcProducersComplete = false;
+				logger.warn("GJC plugin MCP connect failed", {
+					path: `mcp:${server}`,
+					error: safeErrorForLog(err),
+				});
+			}
+			const connectedPluginNames = new Set(result.connectedServers.filter(name => pluginNames.has(name)));
+			// Retain while any conventional server is still live: "connecting"
+			// covers the declared-timeout window, and a server that landed in
+			// "connected" inside the microtask between connectServers() resolving
+			// and this synchronous check must not be torn down either.
+			const unsettledConventionalNames = Object.keys(conventionalConfigs).filter(
+				name => owned.getConnectionStatus(name) !== "disconnected",
+			);
+			const retainOwnedManager = result.connectedServers.length > 0 || unsettledConventionalNames.length > 0;
+			if (retainOwnedManager) {
+				mcpManager = owned;
+				ownsMcpManager = true;
+				customTools.push(...(result.tools as CustomTool[]));
+				cwdCapturingToolNames.push(...result.tools.map(tool => tool.name));
+				for (const name of Object.keys(conventionalConfigs)) ownedConventionalMcpServerNames.add(name);
+				pluginMcpManagerServers.set(owned, connectedPluginNames);
+				conventionalMcpManagerServers.set(owned, new Set(Object.keys(conventionalConfigs)));
+				for (const tool of result.tools) {
+					const serverName = tool.mcpServerName;
+					if (serverName === undefined) continue;
+					if (connectedPluginNames.has(serverName)) pluginMcpToolNames.push(tool.name);
+					else {
+						conventionalMcpToolNames.push(tool.name);
+						ownedConventionalMcpToolNames.push(tool.name);
+					}
+				}
+				publishOwnedConventionalMcpTools = ownedConventionalMcpServerNames.size > 0;
+				ownedPluginServersConnected = connectedPluginNames.size > 0;
+				// Plugin-bundle connections are fixed for the session lifetime only
+				// when no conventional server is still connecting in the same manager;
+				// otherwise the seal is re-applied once they settle (below).
+				if (connectedPluginNames.size > 0 && unsettledConventionalNames.length === 0) owned.sealConnectionSet();
+			} else {
+				try {
+					await owned.disconnectAll();
+					cleanupOwnedMcpManager = undefined;
+				} catch (cleanupError) {
+					cleanupOwnedMcpManager = undefined;
+					throw new McpManagerCleanupError(cleanupError);
+				}
+			}
+			return result;
+		};
 		if (explicitMcpConfigPath !== undefined) {
 			const owned = new MCPManager(cwd, null, {
 				toolsOnly: true,
@@ -3204,78 +3295,34 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						]),
 					),
 				};
+				// Plugin-source entries omit SourceMeta.path (see connectOwnedConventionalMcp's
+				// own bypass of the same mismatch at the manager boundary).
+				const mergedSourceMetas = mergedSources as Record<string, SourceMeta>;
 				if (Object.keys(mergedConfigs).length > 0) {
 					const owned = new MCPManager(cwd, null, { sharedPoolIdleMs: settings.get("mcp.sharedPoolIdleMs") });
 					owned.setAuthStorage(authStorage);
 					cleanupOwnedMcpManager = () => owned.disconnectAll();
-					try {
-						const result = await owned.connectServers(mergedConfigs, mergedSources as never);
-						for (const [server, err] of result.errors) {
-							// A server that failed to connect leaves this generation
-							// incomplete: its surfaces produced no evidence, so publishing
-							// would present a partial pass as a clear one.
-							gjcProducersComplete = false;
-							logger.warn("GJC plugin MCP connect failed", {
-								path: `mcp:${server}`,
-								error: safeErrorForLog(err),
-							});
-						}
-						const connectedPluginNames = new Set(result.connectedServers.filter(name => pluginNames.has(name)));
-						// Retain while any conventional server is still live: "connecting"
-						// covers the declared-timeout window, and a server that landed in
-						// "connected" inside the microtask between connectServers() resolving
-						// and this synchronous check must not be torn down either.
-						const unsettledConventionalNames = Object.keys(conventionalConfigs).filter(
-							name => owned.getConnectionStatus(name) !== "disconnected",
+					// Interactive launches may paint before MCP connects; the deferred
+					// starter reconnects this manager after first paint and a startup
+					// turn barrier keeps the first prompt from racing tool registration.
+					// Plugin-bundle servers never defer: their connect evidence feeds the
+					// GJC runtime snapshot published during creation, and a late failure
+					// would present a partial pass as a clear one.
+					if (options.deferMcpConfigStartup && pluginNames.size === 0) {
+						deferredConventionalMcp = {
+							manager: owned,
+							configs: mergedConfigs,
+							sources: mergedSourceMetas,
+							conventionalConfigs,
+						};
+					} else {
+						await connectOwnedConventionalMcp(
+							owned,
+							mergedConfigs,
+							mergedSourceMetas,
+							conventionalConfigs,
+							pluginNames,
 						);
-						const retainOwnedManager =
-							result.connectedServers.length > 0 || unsettledConventionalNames.length > 0;
-						if (retainOwnedManager) {
-							mcpManager = owned;
-							ownsMcpManager = true;
-							customTools.push(...(result.tools as CustomTool[]));
-							cwdCapturingToolNames.push(...result.tools.map(tool => tool.name));
-							for (const name of Object.keys(conventionalConfigs)) ownedConventionalMcpServerNames.add(name);
-							pluginMcpManagerServers.set(owned, connectedPluginNames);
-							conventionalMcpManagerServers.set(owned, new Set(Object.keys(conventionalConfigs)));
-							for (const tool of result.tools) {
-								const serverName = tool.mcpServerName;
-								if (serverName === undefined) continue;
-								if (connectedPluginNames.has(serverName)) pluginMcpToolNames.push(tool.name);
-								else {
-									conventionalMcpToolNames.push(tool.name);
-									ownedConventionalMcpToolNames.push(tool.name);
-								}
-							}
-							publishOwnedConventionalMcpTools = ownedConventionalMcpServerNames.size > 0;
-							ownedPluginServersConnected = connectedPluginNames.size > 0;
-							// Plugin-bundle connections are fixed for the session lifetime only
-							// when no conventional server is still connecting in the same manager;
-							// otherwise the seal is re-applied once they settle (below).
-							if (connectedPluginNames.size > 0 && unsettledConventionalNames.length === 0)
-								owned.sealConnectionSet();
-						} else {
-							try {
-								await owned.disconnectAll();
-								cleanupOwnedMcpManager = undefined;
-							} catch (cleanupError) {
-								cleanupOwnedMcpManager = undefined;
-								throw new McpManagerCleanupError(cleanupError);
-							}
-						}
-					} catch (error) {
-						if (safeIsInstanceOf(error, McpManagerCleanupError)) throw error;
-						// Avoid leaking partially-started server processes on failure.
-						let cleanupError: unknown;
-						try {
-							await owned.disconnectAll();
-						} catch (disconnectError) {
-							cleanupError = disconnectError;
-						} finally {
-							cleanupOwnedMcpManager = undefined;
-						}
-						if (cleanupError !== undefined) throw attachMcpCleanupDiagnostic(error, cleanupError);
-						throw error;
 					}
 				}
 			} catch (error) {
@@ -4590,7 +4637,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			}
 		}
 
-		const deferredMcpTurnReady = deferredExactMcpConfig ? Promise.withResolvers<void>() : undefined;
+		const deferredMcpTurnReady =
+			deferredExactMcpConfig || deferredConventionalMcp ? Promise.withResolvers<void>() : undefined;
 		if (deferredMcpTurnReady) void deferredMcpTurnReady.promise.catch(() => {});
 
 		session = new AgentSession({
@@ -4887,68 +4935,80 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		// createAgentSession rather than surfacing as an unhandled rejection.
 		if (!options.deferMemoryBackendStartup) await startMemoryBackend();
 
-		// Exact-config managers do not receive reactive callbacks; their tools are
-		// registered once in the session-owned catalog.
-		if (mcpManager && !options.mcpManager && explicitMcpConfigPath === undefined) {
-			if (publishOwnedConventionalMcpTools) {
-				// Late conventional connections can publish near-simultaneously.
-				// Serialize the swaps so an older snapshot cannot interleave with a
-				// newer one inside replaceNamedCustomTools and leave a stale list.
-				// Each link swallows (and logs) its own failure so one bad
-				// publication cannot kill the chain for every later one.
-				let conventionalToolsSync: Promise<void> = Promise.resolve();
-				const syncConventionalTools = (tools: CustomTool[]): Promise<void> => {
-					conventionalToolsSync = conventionalToolsSync
-						.then(async () => {
-							if (session.isDisposed) return;
-							const nextTools = tools.filter(tool =>
-								tool.mcpServerName ? ownedConventionalMcpServerNames.has(tool.mcpServerName) : false,
-							);
-							const previousNames = ownedConventionalMcpToolNames;
-							ownedConventionalMcpToolNames = nextTools.map(tool => tool.name);
-							const previousSet = new Set(previousNames);
-							cwdCapturingToolNames.splice(
-								0,
-								cwdCapturingToolNames.length,
-								...cwdCapturingToolNames.filter(name => !previousSet.has(name)),
-								...ownedConventionalMcpToolNames,
-							);
-							await session.replaceNamedCustomTools(previousNames, nextTools);
-							// Mixed plugin + conventional sessions deferred the seal while
-							// a conventional server was still connecting; restore the
-							// fixed-connection plugin contract once every conventional
-							// server has reached a terminal state.
-							if (
-								ownedPluginServersConnected &&
-								mcpManager !== undefined &&
-								!mcpManager.isConnectionSetSealed() &&
-								![...ownedConventionalMcpServerNames].some(
-									name => mcpManager?.getConnectionStatus(name) === "connecting",
-								)
-							) {
-								mcpManager.sealConnectionSet();
-							}
-						})
-						.catch(error => {
-							logger.warn("Failed to publish conventional MCP tools", { error: safeErrorForLog(error) });
-						});
-					return conventionalToolsSync;
-				};
-				mcpManager.setOnToolsChanged(tools => {
-					void syncConventionalTools(tools as CustomTool[]);
-				});
-				void syncConventionalTools(mcpManager.getTools() as CustomTool[]);
-			} else if (!ownsMcpManager) {
-				mcpManager.setOnToolsChanged(tools => {
-					void session.refreshMCPTools(tools);
-				});
-			}
+		// Wire the owned manager's late tool publications into the live session.
+		// Shared by the eager startup path below and by the deferred conventional
+		// starter once its connect lands. No-op when there is no owned manager or
+		// nothing conventional to publish.
+		const wireOwnedConventionalToolSync = (): void => {
+			if (!mcpManager || !publishOwnedConventionalMcpTools) return;
+			// Late conventional connections can publish near-simultaneously.
+			// Serialize the swaps so an older snapshot cannot interleave with a
+			// newer one inside replaceNamedCustomTools and leave a stale list.
+			// Each link swallows (and logs) its own failure so one bad
+			// publication cannot kill the chain for every later one.
+			let conventionalToolsSync: Promise<void> = Promise.resolve();
+			const syncConventionalTools = (tools: CustomTool[]): Promise<void> => {
+				conventionalToolsSync = conventionalToolsSync
+					.then(async () => {
+						if (session.isDisposed) return;
+						const nextTools = tools.filter(tool =>
+							tool.mcpServerName ? ownedConventionalMcpServerNames.has(tool.mcpServerName) : false,
+						);
+						const previousNames = ownedConventionalMcpToolNames;
+						ownedConventionalMcpToolNames = nextTools.map(tool => tool.name);
+						const previousSet = new Set(previousNames);
+						cwdCapturingToolNames.splice(
+							0,
+							cwdCapturingToolNames.length,
+							...cwdCapturingToolNames.filter(name => !previousSet.has(name)),
+							...ownedConventionalMcpToolNames,
+						);
+						await session.replaceNamedCustomTools(previousNames, nextTools);
+						// Mixed plugin + conventional sessions deferred the seal while
+						// a conventional server was still connecting; restore the
+						// fixed-connection plugin contract once every conventional
+						// server has reached a terminal state.
+						if (
+							ownedPluginServersConnected &&
+							mcpManager !== undefined &&
+							!mcpManager.isConnectionSetSealed() &&
+							![...ownedConventionalMcpServerNames].some(
+								name => mcpManager?.getConnectionStatus(name) === "connecting",
+							)
+						) {
+							mcpManager.sealConnectionSet();
+						}
+					})
+					.catch(error => {
+						logger.warn("Failed to publish conventional MCP tools", { error: safeErrorForLog(error) });
+					});
+				return conventionalToolsSync;
+			};
+			mcpManager.setOnToolsChanged(tools => {
+				void syncConventionalTools(tools as CustomTool[]);
+			});
+			void syncConventionalTools(mcpManager.getTools() as CustomTool[]);
+		};
+		const wireOwnedMcpManagerLifecycle = (): void => {
+			if (!mcpManager) return;
 			const clearDebounceTimers = () => {
 				for (const timer of notificationDebounceTimers.values()) clearTimeout(timer);
 				notificationDebounceTimers.clear();
 			};
 			postmortem.register("mcp-notification-cleanup", clearDebounceTimers);
 			wireMcpManagerCallbacks(mcpManager);
+		};
+		// Exact-config managers do not receive reactive callbacks; their tools are
+		// registered once in the session-owned catalog.
+		if (mcpManager && !options.mcpManager && explicitMcpConfigPath === undefined) {
+			if (publishOwnedConventionalMcpTools) {
+				wireOwnedConventionalToolSync();
+			} else if (!ownsMcpManager) {
+				mcpManager.setOnToolsChanged(tools => {
+					void session.refreshMCPTools(tools);
+				});
+			}
+			wireOwnedMcpManagerLifecycle();
 		}
 
 		// Constructor-time workflow-gate tool restoration is deferred by one
@@ -4956,15 +5016,15 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		// so a resumed canonical workflow session returns with `ask` resident.
 		await session.workflowGateToolRestoration;
 		let startDeferredMcpConfig: (() => Promise<DeferredMcpConfigStartupResult>) | undefined;
-		if (deferredExactMcpConfig) {
-			const { manager, configPath } = deferredExactMcpConfig;
+		if (deferredExactMcpConfig || deferredConventionalMcp) {
 			let cancelled = false;
 			let startupPromise: Promise<DeferredMcpConfigStartupResult> | undefined;
 			session.registerToolSessionCleanup(async () => {
 				cancelled = true;
 				deferredMcpTurnReady?.resolve();
 				if (startupPromise) {
-					await manager.disconnectAll().catch(() => {});
+					await deferredExactMcpConfig?.manager.disconnectAll().catch(() => {});
+					await deferredConventionalMcp?.manager.disconnectAll().catch(() => {});
 					await startupPromise.catch(() => {});
 				}
 			});
@@ -4974,33 +5034,66 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				}
 				startupPromise ??= (async () => {
 					try {
-						const result = await manager.discoverAndConnect({ configPath });
-						const resultTools = result.tools as CustomTool[];
-						const toolNames = resultTools.map(tool => tool.name);
-						const collidingToolNames = findDeferredExactMcpToolNameCollisions(
-							toolNames,
-							exactMcpCatalogToolNames,
-						);
-						if (collidingToolNames.length > 0) {
-							throw new ExactMcpToolNameCollisionError(collidingToolNames);
-						}
-						if (!cancelled && !session.isDisposed) {
-							await session.refreshMCPTools(resultTools);
-							if (
-								!session.isDisposed &&
-								(!mcpDiscoveryEnabled || !existingSession.hasPersistedMCPToolSelection)
-							) {
-								await session.activateDiscoveredTools(toolNames);
+						const exact = deferredExactMcpConfig;
+						const conventional = deferredConventionalMcp;
+						let loadedToolCount = 0;
+						let hasErrors = false;
+						if (exact) {
+							const result = await exact.manager.discoverAndConnect({ configPath: exact.configPath });
+							const resultTools = result.tools as CustomTool[];
+							const toolNames = resultTools.map(tool => tool.name);
+							const collidingToolNames = findDeferredExactMcpToolNameCollisions(
+								toolNames,
+								exactMcpCatalogToolNames,
+							);
+							if (collidingToolNames.length > 0) {
+								throw new ExactMcpToolNameCollisionError(collidingToolNames);
 							}
+							if (!cancelled && !session.isDisposed) {
+								await session.refreshMCPTools(resultTools);
+								if (
+									!session.isDisposed &&
+									(!mcpDiscoveryEnabled || !existingSession.hasPersistedMCPToolSelection)
+								) {
+									await session.activateDiscoveredTools(toolNames);
+								}
+							}
+							loadedToolCount = resultTools.length;
+							hasErrors = result.errors.size > 0 || resultTools.length === 0;
+						} else if (conventional) {
+							// Deferral never carries plugin-bundle servers, so this merge is
+							// purely conventional and the GJC evidence snapshot published
+							// during creation has no deferred producer to wait for.
+							const result = await connectOwnedConventionalMcp(
+								conventional.manager,
+								conventional.configs,
+								conventional.sources,
+								conventional.conventionalConfigs,
+								new Set<string>(),
+							);
+							const resultTools = result.tools as CustomTool[];
+							if (!cancelled && !session.isDisposed) {
+								wireOwnedConventionalToolSync();
+								wireOwnedMcpManagerLifecycle();
+								await session.refreshMCPTools(resultTools);
+								if (
+									!session.isDisposed &&
+									(!mcpDiscoveryEnabled || !existingSession.hasPersistedMCPToolSelection)
+								) {
+									await session.activateDiscoveredTools(resultTools.map(tool => tool.name));
+								}
+							}
+							loadedToolCount = resultTools.length;
+							hasErrors = result.errors.size > 0 || resultTools.length === 0;
 						}
 						deferredMcpTurnReady?.resolve();
-						const hasErrors = result.errors.size > 0 || result.tools.length === 0;
 						if (hasErrors) logger.warn(DEFERRED_MCP_CONFIG_STARTUP_ERROR);
-						return { loadedToolCount: cancelled || session.isDisposed ? 0 : resultTools.length, hasErrors };
+						return { loadedToolCount: cancelled || session.isDisposed ? 0 : loadedToolCount, hasErrors };
 					} catch {
 						const startupError = new Error(DEFERRED_MCP_CONFIG_STARTUP_ERROR);
 						deferredMcpTurnReady?.reject(startupError);
-						await manager.disconnectAll().catch(() => {});
+						await deferredExactMcpConfig?.manager.disconnectAll().catch(() => {});
+						await deferredConventionalMcp?.manager.disconnectAll().catch(() => {});
 						throw startupError;
 					}
 				})();
