@@ -200,6 +200,33 @@ describe("ultragoal nudge guard", () => {
 		expect(askNudges.length).toBe(1);
 	});
 
+	it.each([
+		undefined,
+		"autoresearch",
+		"ultragoal",
+	])("charges only the caller's ask budget with active skill %s and an unrelated environment session", async skill => {
+		const cwd = await tempDir();
+		await setProjectBudget(cwd, 1);
+		process.env.GJC_SESSION_ID = TEST_SESSION_ID;
+		await createUltragoalPlan({ cwd, brief: SINGLE_BRIEF });
+		const unrelatedSessionId = "unrelated-ultragoal-session";
+		process.env.GJC_SESSION_ID = unrelatedSessionId;
+		await createUltragoalPlan({ cwd, brief: "Implement the unrelated story" });
+		const unrelatedLedger = await readUltragoalLedger(cwd, unrelatedSessionId);
+		const context = {
+			sessionId: ` ${TEST_SESSION_ID} `,
+			activeSkillState: skill ? { skill, session_id: unrelatedSessionId } : undefined,
+		};
+		await expect(assertUltragoalAskAllowed(cwd, context)).rejects.toThrow(/try-harder nudge \(1\/1\)/);
+		expect(await readUltragoalLedger(cwd, unrelatedSessionId)).toEqual(unrelatedLedger);
+		await expect(assertUltragoalAskAllowed(cwd, context)).rejects.toThrow(/record-review-blockers/);
+		const ledger = await readUltragoalLedger(cwd, TEST_SESSION_ID);
+		const askNudges = ledger.filter(event => event.event === "nudge" && event.surface === "ask");
+		expect(askNudges).toHaveLength(1);
+		expect(askNudges[0]?.attempt).toBe(1);
+		expect(await readUltragoalLedger(cwd, unrelatedSessionId)).toEqual(unrelatedLedger);
+	});
+
 	// Session profile: the ask guard resolves the nudge budget from the
 	// session agent directory (a tenant profile with nudgeBudget 0 is never
 	// nudged) instead of the process-default profile.

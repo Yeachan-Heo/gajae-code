@@ -26,11 +26,12 @@ function sessionScopedAskGuardId(
 	context: UltragoalAskGuardContext,
 	activeSkill: string | undefined,
 ): string | undefined {
+	const sessionId = context.sessionId?.trim();
+	if (sessionId) return sessionId;
 	if (activeSkill !== "ultragoal" && !UPSTREAM_PLANNING_ASK_SKILLS.has(activeSkill ?? "")) return undefined;
 	const activeSessionId = context.activeSkillState?.session_id?.trim();
 	if (activeSessionId) return activeSessionId;
-	const sessionId = context.sessionId?.trim();
-	return sessionId || undefined;
+	return undefined;
 }
 
 export function formatUltragoalAskBlockMessage(diagnostic: UltragoalAskBlockDiagnostic): string {
@@ -47,11 +48,8 @@ export async function assertUltragoalAskAllowed(
 	agentDir?: string,
 ): Promise<void> {
 	const activeSkill = normalizedActiveSkill(context);
-	// Deep-interview and ralplan are upstream planning workflows whose core gates
-	// are `ask` calls. Scope their Ultragoal check to the current session so stale
-	// or ambiguous Ultragoal durable state from another session cannot hijack those
-	// prompts; same-session active Ultragoal state still falls through to the
-	// blocker/nudge checks below.
+	// Caller identity binds both the lookup and nudge, regardless of active skill.
+	// Without a caller ID, preserve the existing skill/environment resolution.
 	const sessionId = sessionScopedAskGuardId(context, activeSkill);
 	const diagnostic = await isUltragoalAskBlocked(cwd, { sessionId });
 	if (!diagnostic.active) return;
