@@ -6,6 +6,7 @@
 
 - Successful macOS installs and updates can offer the optional experimental, third-party community Gajae Code App (#5140), defaulting to No. The shared installer requires canonical release checksums and a verified bundle/signature, skips installed apps and automation, and supports `GJC_NO_COMMUNITY_APP=1`; app failures leave GJC installed.
 ### Fixed
+- Image generation now sends the selected image-role model instead of silently substituting a provider default for Antigravity, Gemini, OpenRouter, and Alibaba.
 - `skill_discovery` zero-candidate results no longer pass as an empty catalog when the query itself filtered everything out. Query matching is conjunctive substring (every whitespace-separated term must appear in name/description/source/use-when, unless a term equals the exact skill name), so a single topic keyword that appears nowhere drops every skill; a query that matches nothing now carries a `notice` stating how many skills were scanned, the conjunctive-substring rule, and the retry guidance. The tool prompt and `query` schema description now document the semantics instead of implying relevance ranking, so a model can no longer answer "no such skill" from a filtered result. `discoverRuntimeSkills` results gained a `scanned` count backing the notice.
 - Headless ACP asks now abort their enclosing foreground turn when the remote client cancels the ask. Previously the ask tool rejected with a cancellation error without releasing foreground ownership, so the next client prompt could be rejected as already active.
 
