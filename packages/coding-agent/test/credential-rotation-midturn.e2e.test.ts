@@ -21,7 +21,7 @@ function identityConverter(messages: AgentMessage[]): Message[] {
 	return messages.filter(m => m.role === "user" || m.role === "assistant" || m.role === "toolResult") as Message[];
 }
 
-function usageLimitStream(model: Model, trigger: "quota" | "rate_limit"): AssistantMessageEventStream {
+function usageLimitStream(model: Model, trigger: "quota" | "rate_limit" | "credential"): AssistantMessageEventStream {
 	const stream = new AssistantMessageEventStream();
 	const message: AssistantMessage = {
 		role: "assistant",
@@ -41,12 +41,22 @@ function usageLimitStream(model: Model, trigger: "quota" | "rate_limit"): Assist
 		errorMessage:
 			trigger === "quota"
 				? "Codex error event: The usage limit has been reached (code=usage_limit_reached)"
-				: "Codex error event: Rate limit exceeded (code=rate_limit_exceeded)",
+				: trigger === "credential"
+					? "This model is not supported when using Codex with a ChatGPT account"
+					: "Codex error event: Rate limit exceeded (code=rate_limit_exceeded)",
 		timestamp: Date.now(),
 		transportFailure:
 			trigger === "quota"
 				? { kind: "transport", providerCode: "usage_limit_reached" }
-				: { kind: "transport", status: 429, providerCode: "rate_limit_exceeded" },
+				: trigger === "credential"
+					? {
+							kind: "transport",
+							status: 400,
+							providerCode: "invalid_request_error",
+							credentialModelUnavailable: true,
+							headers: { "retry-after": "3600" },
+						}
+					: { kind: "transport", status: 429, providerCode: "rate_limit_exceeded" },
 	};
 	expect(classifyFallbackTrigger(message.transportFailure).class).toBe(trigger);
 	queueMicrotask(() => {
@@ -73,12 +83,16 @@ const strategy: CredentialRankingStrategy = {
 };
 
 const scenarios = ["first", "after-tool", "already-exhausted", "unknown-before"] as const;
-const triggers = ["quota", "rate_limit"] as const;
-
-describe("quota and rate-limit marking before credential re-resolution", () => {
-	for (const { scenario, trigger } of triggers.flatMap(trigger =>
+const cases = [
+	...(["quota", "rate_limit", "credential"] as const).flatMap(trigger =>
 		scenarios.map(scenario => ({ scenario, trigger })),
-	)) {
+	),
+	{ trigger: "credential", scenario: "no-oauth" } as const,
+	{ trigger: "credential", scenario: "pinned" } as const,
+];
+
+describe("credential marking before re-resolution", () => {
+	for (const { scenario, trigger } of cases) {
 		test(`${trigger}: ${scenario}`, async () => {
 			const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-quota-replay-"));
 			let failureIssued = false;
@@ -125,6 +139,10 @@ describe("quota and rate-limit marking before credential re-resolution", () => {
 					})),
 				);
 				storage.setRuntimePreferredCredentialSelector(provider, { kind: "account", value: "a" });
+				if (scenario === "no-oauth") {
+					await storage.set(provider, { type: "api_key", key: "synthetic-api-key" });
+					storage.removeRuntimePreferredCredentialSelector(provider);
+				}
 				const model = getBundledModel(provider, "gpt-5.1-codex");
 				if (!model) throw new Error("Missing bundled Codex fixture model");
 				const settings = Settings.isolated({ "compaction.enabled": false });
@@ -172,15 +190,39 @@ describe("quota and rate-limit marking before credential re-resolution", () => {
 					settings,
 					modelRegistry: registry,
 				});
+				if (scenario === "pinned") {
+					storage.setSessionCredentialSelector(session.credentialSessionId, provider, {
+						kind: "account",
+						value: "a",
+					});
+				}
 				const marks = vi.spyOn(storage, "markUsageLimitReached");
 				pending = session.prompt("go");
 				await pending;
 				await session.waitForIdle();
+				if (scenario === "no-oauth" || scenario === "pinned") {
+					expect(marks).not.toHaveBeenCalled();
+					expect(keys).toHaveLength(1);
+					expect(storage.getEarliestUnblockAt(provider)).toBeUndefined();
+					if (scenario === "pinned") {
+						expect(storage.hasSessionCredentialSelector(provider, session.credentialSessionId)).toBe(true);
+						expect(storage.getSessionCredentialRowId(provider, session.credentialSessionId)).toBe(rowAtFailure);
+					}
+					return;
+				}
 				expect(marks).toHaveBeenCalledTimes(1);
 				expect(rowAtFailure).toBeDefined();
 				const after = storage.getSessionCredentialRowId(provider, session.credentialSessionId);
 				expect(after).toBeDefined();
 				expect(after).not.toBe(rowAtFailure);
+				if (trigger === "credential") {
+					expect(marks.mock.calls[0]?.[2]).not.toHaveProperty("retryAfterMs");
+					if (scenario !== "already-exhausted") {
+						const unblockAt = storage.getEarliestUnblockAt(provider);
+						expect(unblockAt).toBeGreaterThan(Date.now());
+						expect(unblockAt).toBeLessThan(Date.now() + 120_000);
+					}
+				}
 				if (scenario === "unknown-before") {
 					expect(keys).toHaveLength(failOn);
 					expect(marks.mock.calls[0]?.[2]?.rowId).toBeUndefined();

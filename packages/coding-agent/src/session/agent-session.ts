@@ -21546,8 +21546,8 @@ export class AgentSession {
 	 *    path invalidated pinned credentials outright.
 	 * 2. **A terminal `forbidden` never mutates credential state.** Rotation
 	 *    would hide an authorization defect and cycle through healthy rows.
-	 * 3. Auth/account-rejection paths retain their existing key-change proof.
-	 *    Quota/rate-limit paths mark before resolving and require two known,
+	 * 3. Auth failures retain their existing key-change proof. Quota, rate-limit
+	 *    and OAuth account-model rejections mark before resolving and require two known,
 	 *    different stored row IDs before reporting rotation. This is mark-time
 	 *    identity, not dispatch-bound attribution across shared sessions.
 	 */
@@ -21581,10 +21581,16 @@ export class AgentSession {
 		}
 
 		const credentialSessionId = this.credentialSessionId;
-		if (trigger.class === "quota" || trigger.class === "rate_limit") {
+		if (trigger.class !== "auth") {
+			if (
+				trigger.class === "credential" &&
+				authStorage.getSessionCredentialType(provider, credentialSessionId) !== "oauth"
+			)
+				return "unchanged";
 			const before = authStorage.getSessionCredentialRowId(provider, credentialSessionId);
 			const remaining = await authStorage.markUsageLimitReached(provider, credentialSessionId, {
-				retryAfterMs: trigger.retryAfterMs,
+				// Account-model rejection retains default backoff, not response retry-after.
+				...(trigger.class === "credential" ? {} : { retryAfterMs: trigger.retryAfterMs }),
 				owner: this.#modelRegistry.getAuthStorageOwner(),
 				...(before === undefined ? {} : { rowId: before }),
 			});
@@ -21595,20 +21601,12 @@ export class AgentSession {
 		}
 		const activeApiKey = await this.#modelRegistry.getApiKey(this.model, credentialSessionId);
 
-		let remaining: boolean;
-		if (trigger.class === "auth") {
-			if (!isAuthenticated(activeApiKey)) return "unchanged";
-			remaining = await authStorage.invalidateCredentialMatching(provider, activeApiKey, {
-				sessionId: credentialSessionId,
-				owner: this.#modelRegistry.getAuthStorageOwner(),
-			});
-			if (!remaining) return "unchanged";
-		} else {
-			if (authStorage.getSessionCredentialType(provider, credentialSessionId) !== "oauth") return "unchanged";
-			remaining = await authStorage.markUsageLimitReached(provider, credentialSessionId, {
-				owner: this.#modelRegistry.getAuthStorageOwner(),
-			});
-		}
+		if (!isAuthenticated(activeApiKey)) return "unchanged";
+		const remaining = await authStorage.invalidateCredentialMatching(provider, activeApiKey, {
+			sessionId: credentialSessionId,
+			owner: this.#modelRegistry.getAuthStorageOwner(),
+		});
+		if (!remaining) return "unchanged";
 
 		// (3) Distinct-row proof.
 		if ((await this.#modelRegistry.getApiKey(this.model, credentialSessionId)) !== activeApiKey) {
