@@ -217,7 +217,10 @@ describe("conventional MCP autoload in standalone sessions", () => {
 			deferMcpConfigStartup: true,
 		});
 		try {
-			expect(mcpManager).toBeUndefined();
+			// The manager publishes immediately (empty) so /mcp can see it; the
+			// connection itself happens in the deferred starter.
+			expect(mcpManager).toBeDefined();
+			expect(mcpManager?.getConnectedServers() ?? []).toEqual([]);
 			expect(startDeferredMcpConfig).toBeDefined();
 			expect(session.getAllToolNames().filter(name => name.startsWith("mcp__"))).toEqual([]);
 
@@ -225,6 +228,7 @@ describe("conventional MCP autoload in standalone sessions", () => {
 			await expect(startup).resolves.toEqual({ loadedToolCount: 1, hasErrors: false });
 			expect(session.getAllToolNames()).toContain("mcp__demo_hello");
 			expect(session.getActiveToolNames()).toContain("mcp__demo_hello");
+			expect(mcpManager?.getConnectedServers()).toContain("demo");
 			expect(startDeferredMcpConfig!()).toBe(startup);
 		} finally {
 			await session.dispose();
@@ -257,7 +261,7 @@ describe("conventional MCP autoload in standalone sessions", () => {
 			deferMcpConfigStartup: true,
 		});
 		try {
-			expect(mcpManager).toBeUndefined();
+			expect(mcpManager).toBeDefined();
 			const agentPrompt = vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined);
 			const prompt = session.prompt("wait for deferred conventional MCP");
 			await Bun.sleep(0);

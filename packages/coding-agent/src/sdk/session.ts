@@ -3315,6 +3315,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 							sources: mergedSourceMetas,
 							conventionalConfigs,
 						};
+						// Publish the manager immediately (empty until the starter connects)
+						// so /mcp status, reconnect, and resource inspection resolve it once
+						// the deferred tools land instead of reporting no manager.
+						mcpManager = owned;
+						ownsMcpManager = true;
 					} else {
 						await connectOwnedConventionalMcp(
 							owned,
@@ -4203,13 +4208,18 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		);
 		let initialToolNames = [...initialRequestedActiveToolNames];
 		if (mcpDiscoveryEnabled) {
-			const restoredSelectedMCPToolNames = deferredExactMcpConfig
+			// A pending deferred MCP connect (exact or conventional) registers its
+			// tools after construction, so persisted selections must be preserved
+			// verbatim instead of being trimmed to names the registry currently has.
+			const deferredMcpConnectPending =
+				deferredExactMcpConfig !== undefined || deferredConventionalMcp !== undefined;
+			const restoredSelectedMCPToolNames = deferredMcpConnectPending
 				? existingSession.selectedMCPToolNames.filter(name => !mandatoryMCPToolNameSet.has(name))
 				: existingSession.selectedMCPToolNames.filter(
 						name => toolRegistry.has(name) && !mandatoryMCPToolNameSet.has(name),
 					);
 			if (
-				!deferredExactMcpConfig &&
+				!deferredMcpConnectPending &&
 				existingSession.hasPersistedMCPToolSelection &&
 				restoredSelectedMCPToolNames.length !== existingSession.selectedMCPToolNames.length
 			) {
@@ -4999,8 +5009,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			wireMcpManagerCallbacks(mcpManager);
 		};
 		// Exact-config managers do not receive reactive callbacks; their tools are
-		// registered once in the session-owned catalog.
-		if (mcpManager && !options.mcpManager && explicitMcpConfigPath === undefined) {
+		// registered once in the session-owned catalog. A pending conventional
+		// deferral wires its own callbacks from the starter after it connects, so
+		// nothing is wired here yet.
+		if (mcpManager && !options.mcpManager && explicitMcpConfigPath === undefined && !deferredConventionalMcp) {
 			if (publishOwnedConventionalMcpTools) {
 				wireOwnedConventionalToolSync();
 			} else if (!ownsMcpManager) {
@@ -5084,7 +5096,15 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 								}
 							}
 							loadedToolCount = resultTools.length;
-							hasErrors = result.errors.size > 0 || resultTools.length === 0;
+							// A server whose declared timeout outlived the startup budget is
+							// still connecting and publishes reactively (same steady state as
+							// the eager path): that is not a failure, so do not warn or count
+							// it as one while its handshake window is open.
+							const stillConnectingServers = Object.keys(conventional.conventionalConfigs).filter(
+								name => conventional.manager.getConnectionStatus(name) === "connecting",
+							);
+							hasErrors =
+								result.errors.size > 0 || (resultTools.length === 0 && stillConnectingServers.length === 0);
 						}
 						deferredMcpTurnReady?.resolve();
 						if (hasErrors) logger.warn(DEFERRED_MCP_CONFIG_STARTUP_ERROR);

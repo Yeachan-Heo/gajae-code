@@ -776,7 +776,10 @@ export async function runInteractiveMode(
 			normalInteractive: true,
 			automation:
 				/^(?:1|true|yes|on)$/i.test(process.env.CI ?? "") ||
-				/^(?:1|true|yes|on)$/i.test(process.env.GJC_AUTOMATION ?? ""),
+				/^(?:1|true|yes|on)$/i.test(process.env.GJC_AUTOMATION ?? "") ||
+				// The timing probe must never block on a fresh-profile onboarding
+				// selector waiting for input that will never come.
+				options?.stopAfterFirstPaint === true,
 			initialMessage,
 			initialMessages,
 			initialImages,
@@ -2179,8 +2182,10 @@ export async function runRootCommand(
 				} catch (error) {
 					logger.warn("Timing probe interactive boot failed", { error: String(error) });
 				}
-				await session.dispose();
+				// Report before teardown so Total ends at first paint, not at the end
+				// of session persistence and resource cleanup.
 				logger.printTimings();
+				await session.dispose();
 				process.exit(0);
 			}
 		} else {
