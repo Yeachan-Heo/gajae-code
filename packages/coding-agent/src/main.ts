@@ -2091,9 +2091,10 @@ export async function runRootCommand(
 		if (isInteractive) {
 			const timingEnv = $pickenv("GJC_TIMING", "PI_TIMING");
 			const exitForTiming = timingEnv === "x";
+			let changelogMarkdown: string | undefined;
 			try {
 				startupUpdate.startBeforeInteractiveInitialization();
-				const changelogMarkdown = await logger.time(
+				changelogMarkdown = await logger.time(
 					"main:getChangelogForDisplay",
 					deps.getChangelogForDisplay ?? getChangelogForDisplay,
 					parsedArgs,
@@ -2134,10 +2135,28 @@ export async function runRootCommand(
 						startDeferredMcpConfig,
 						startDeferredModelProfiles,
 					);
-				} else {
-					// GJC_TIMING=x measures through the first transcript paint, so the
-					// cold-start number includes interactive init and time-to-first-render.
-					// runInteractiveMode's probe stop already disposed the session.
+				}
+			} catch (error) {
+				try {
+					await session.dispose();
+				} catch {
+					logger.warn("Failed to dispose session after interactive error");
+				}
+				if (error !== null && typeof error === "object" && "code" in error && error.code === "cancelled") {
+					return;
+				}
+				throw error;
+			}
+
+			if (exitForTiming) {
+				// GJC_TIMING=x measures through the first transcript paint, so the
+				// cold-start number includes interactive init and time-to-first-render.
+				// The probe's deliverable is the timing report: a mode boot or teardown
+				// failure is logged, but session disposal still precedes the exit (the
+				// contract under startup-update-contract) and the report still prints.
+				// This block sits outside the try/catch so the mock-throwing exit in
+				// tests cannot unwind into a second disposal.
+				try {
 					await runInteractiveMode(
 						session,
 						VERSION,
@@ -2157,19 +2176,12 @@ export async function runRootCommand(
 						startDeferredModelProfiles,
 						{ stopAfterFirstPaint: true },
 					);
-					logger.printTimings();
-					process.exit(0);
+				} catch (error) {
+					logger.warn("Timing probe interactive boot failed", { error: String(error) });
 				}
-			} catch (error) {
-				try {
-					await session.dispose();
-				} catch {
-					logger.warn("Failed to dispose session after interactive error");
-				}
-				if (error !== null && typeof error === "object" && "code" in error && error.code === "cancelled") {
-					return;
-				}
-				throw error;
+				await session.dispose();
+				logger.printTimings();
+				process.exit(0);
 			}
 		} else {
 			const runPrint = deps.runPrintMode ?? (await import("./modes/print-mode")).runPrintMode;
