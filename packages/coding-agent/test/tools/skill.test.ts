@@ -561,7 +561,7 @@ describe("SkillTool", () => {
 			getActiveSkillPhase: () => "handoff",
 		});
 		await expect(SkillTool.createIf(session)!.execute("call-1", { name: "project-executor" })).rejects.toThrow(
-			"admitted ultragoal target",
+			"admitted target",
 		);
 		expect(captured).toHaveLength(0);
 	});

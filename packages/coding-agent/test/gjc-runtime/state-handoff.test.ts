@@ -1290,6 +1290,31 @@ describe("gjc state handoff", () => {
 		});
 	});
 
+	it("accepts sanctioned Ralplan autoresearch admission only for autoresearch", async () => {
+		await withTempCwd(async cwd => {
+			await fs.mkdir(path.join(cwd, ".gjc"), { recursive: true });
+			await fs.writeFile(path.join(cwd, ".gjc", "config.yml"), "gjc:\n  ralplan:\n    autoHandoff: autoresearch\n");
+			const seed = await runNativeRalplanCommand(["--json", "research the final plan"], cwd);
+			expect(seed.status, seed.stderr).toBe(0);
+			const runId = parseRequiredJson(seed.stdout, "autoresearch seed").run_id as string;
+			const final = await runNativeRalplanCommand(
+				["--write", "--stage", "final", "--stage_n", "1", "--artifact", "# Final", "--run-id", runId, "--json"],
+				cwd,
+			);
+			expect(final.status, final.stderr).toBe(0);
+			const wrongTarget = await runNativeStateCommand(
+				["handoff", "--mode", "ralplan", "--to", "ultragoal", "--json"],
+				cwd,
+			);
+			expect(wrongTarget.status).toBe(2);
+			const admitted = await runNativeStateCommand(
+				["handoff", "--mode", "ralplan", "--to", "autoresearch", "--json"],
+				cwd,
+			);
+			expect(admitted.status, admitted.stderr).toBe(0);
+		});
+	});
+
 	it("rejects Ralplan execution from an ordinary off receipt without user approval evidence", async () => {
 		await withTempCwd(async cwd => {
 			await writePublishedReadyCrystal(cwd);
@@ -1554,7 +1579,7 @@ describe("gjc state handoff", () => {
 				cwd,
 			);
 			expect(result.status).toBe(2);
-			expect(result.stderr).toContain("admitted ultragoal target");
+			expect(result.stderr).toContain("admitted target");
 			await expect(fs.access(modeStatePath(cwd, TEST_SESSION_ID, "made-up-skill"))).rejects.toThrow();
 		});
 	});

@@ -3200,10 +3200,11 @@ async function hasSanctionedRalplanFinalAdmission(
 	cwd: string,
 	sessionId: string,
 	state: Record<string, unknown>,
+	target: "ultragoal" | "autoresearch" = "ultragoal",
 ): Promise<boolean> {
 	const admission = isPlainObject(state.auto_handoff) ? state.auto_handoff : undefined;
 	return (
-		admission?.effectiveTarget === "ultragoal" &&
+		admission?.effectiveTarget === target &&
 		admission.degradationReason === null &&
 		(await verifiedRalplanFinalEvidence(cwd, sessionId, state)) !== undefined
 	);
@@ -3680,9 +3681,13 @@ async function handleHandoffUnlocked(
 	if (
 		caller === "ralplan" &&
 		(existingCaller.current_phase === "final" || existingCaller.current_phase === "handoff") &&
-		callee !== "ultragoal"
+		callee !== "ultragoal" &&
+		!(
+			callee === "autoresearch" &&
+			(await hasSanctionedRalplanFinalAdmission(cwd, sessionId, existingCaller, "autoresearch"))
+		)
 	)
-		throw new StateCommandError(2, "Ralplan final may hand off only through its admitted ultragoal target");
+		throw new StateCommandError(2, "Ralplan final may hand off only through its admitted target");
 	if (caller === "ralplan" && (await hasDurableRalplanPlanningStuck(cwd, sessionId, existingCaller)))
 		throw new StateCommandError(2, "planning-stuck Ralplan is terminal and cannot hand off");
 	let ralplanExecutionFinal: VerifiedRalplanFinalEvidence | undefined;
