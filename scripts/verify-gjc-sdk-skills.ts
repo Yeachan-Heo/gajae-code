@@ -133,11 +133,11 @@ const endpointBypassMarkers = [
 
 gate(
 	"templates use the broker-bound session CLI",
-	typeScript.includes('Bun.spawn(["gjc", "sdk", "session"') &&
-		python.includes('["gjc", "sdk", "session", *arguments]') &&
+	typeScript.includes('Bun.spawn(["gjc", "sdk", "session", ...arguments_, "--json"], {') &&
+		python.includes('["gjc", "sdk", "session", *arguments, "--json"]') &&
 		typeScript.includes("cwd: repo") &&
 		python.includes("cwd=repo"),
-	"gjc sdk session through repository cwd",
+	"exact gjc sdk session argv with explicit --json through repository cwd",
 );
 gate(
 	"templates require explicit repository and session inputs",
