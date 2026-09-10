@@ -2124,7 +2124,9 @@ async function assertExecutionApprovalTranscriptEvidence(
 				!sawSessionHeader ||
 				!isPlainObject(entry.patch) ||
 				!Object.keys(entry).every(key => key === "type" || key === "patch") ||
-				!Object.keys(entry.patch).every(key => key === "cwd" || key === "title")
+				!Object.keys(entry.patch).every(key => key === "cwd" || key === "title") ||
+				(entry.patch.cwd !== undefined && typeof entry.patch.cwd !== "string") ||
+				(entry.patch.title !== undefined && typeof entry.patch.title !== "string")
 			)
 				throw new StateCommandError(2, "deep-interview execution approval transcript header patch is malformed");
 		} else if (entry.type === "entry_patch") {
