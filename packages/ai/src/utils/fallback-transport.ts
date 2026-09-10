@@ -1,4 +1,4 @@
-export type FallbackTriggerClass = "rate_limit" | "quota" | "auth" | "server" | "unknown" | "other";
+export type FallbackTriggerClass = "rate_limit" | "quota" | "auth" | "credential" | "server" | "unknown" | "other";
 
 /**
  * Refinement of an `auth` trigger.
@@ -55,6 +55,8 @@ export interface TransportFailureFacts {
 	anthropicErrorType?: string;
 	/** OpenAI's typed `error.code`, preserved separately at the transport boundary. */
 	openaiErrorCode?: string;
+	/** Provider-authoritative model rejection that is specific to the active credential. */
+	credentialModelUnavailable?: true;
 	headers?: Record<string, string>;
 	/** Safe request-size observation for retry amplification policy. Never contains body content. */
 	requestBytes?: number;
@@ -109,6 +111,7 @@ export interface FallbackTriggerInput {
 	status?: number;
 	providerCode?: string;
 	code?: string;
+	credentialModelUnavailable?: boolean;
 	headers?: TransportHeaders;
 	response?: { status?: number; headers?: TransportHeaders };
 	error?: { code?: string; type?: string };
@@ -239,6 +242,7 @@ export function transportFailureFacts(
 	const endpointClassValue = propertyOf(value, "endpointClass");
 	const endpointClass =
 		endpointClassValue === "canonical" || endpointClassValue === "custom" ? endpointClassValue : undefined;
+	const credentialModelUnavailable = propertyOf(value, "credentialModelUnavailable") === true;
 	if (
 		status === undefined &&
 		headers === undefined &&
@@ -253,6 +257,7 @@ export function transportFailureFacts(
 		// must not materialize facts that would disqualify an unrelated
 		// bare-default retry.
 		providerCode !== SERVER_OVERLOADED_PROVIDER_CODE &&
+		!credentialModelUnavailable &&
 		requestBytes === undefined &&
 		firstEventElapsedMs === undefined &&
 		firstEventTimeoutMs === undefined &&
@@ -267,6 +272,7 @@ export function transportFailureFacts(
 		providerCode,
 		anthropicErrorType,
 		openaiErrorCode,
+		...(credentialModelUnavailable ? { credentialModelUnavailable: true as const } : {}),
 		headers,
 		...(requestBytes === undefined ? {} : { requestBytes }),
 		...(firstEventElapsedMs === undefined ? {} : { firstEventElapsedMs }),
@@ -379,10 +385,11 @@ export function classifyFallbackTrigger(
 	// classify without a status, so it is matched case-sensitively — the same
 	// exactness the parser and the session admission use.
 	const rawCode = rawCodes[0] ?? rawCodes[1] ?? rawCodes[2];
-	const triggerClass: FallbackTriggerClass =
-		code === STREAM_FIRST_EVENT_TIMEOUT_PROVIDER_CODE ||
-		code === EMPTY_RESPONSE_PROVIDER_CODE ||
-		(facts.status === undefined && rawCode === SERVER_OVERLOADED_PROVIDER_CODE)
+	const triggerClass: FallbackTriggerClass = facts.credentialModelUnavailable
+		? "credential"
+		: code === STREAM_FIRST_EVENT_TIMEOUT_PROVIDER_CODE ||
+				code === EMPTY_RESPONSE_PROVIDER_CODE ||
+				(facts.status === undefined && rawCode === SERVER_OVERLOADED_PROVIDER_CODE)
 			? "server"
 			: isQuotaCode(code)
 				? "quota"

@@ -73,7 +73,7 @@ Sources: `packages/ai/src/providers/openai-responses.ts`, `openai-code-responses
 Normalization points:
 
 - `response.output_item.added` starts reasoning/text/function-call blocks
-- reasoning summary events (`response.reasoning_summary_text.delta`) become `thinking_delta`
+- reasoning summary events (`response.reasoning_summary_text.delta`) become `reasoning_summary_delta` and update the message's thinking block
 - output/refusal deltas become `text_delta`
 - `response.function_call_arguments.delta` becomes `toolcall_delta`
 - `response.output_item.done` emits `thinking_end` / `text_end` / `toolcall_end`
@@ -177,8 +177,18 @@ Current design favors responsiveness and simple ordering over bounded-buffer flo
 `agentLoop.streamAssistantResponse()` bridges `AssistantMessageEvent` to `AgentEvent`:
 
 - on `start`: pushes placeholder assistant message and emits `message_start`
-- on block events (`text_*`, `thinking_*`, `toolcall_*`): updates last assistant message, emits `message_update` with raw `assistantMessageEvent`
+- on block events (`text_*`, `thinking_*`, `reasoning_summary_*`, `toolcall_*`): updates last assistant message, emits `message_update` with raw `assistantMessageEvent`
 - on terminal (`done`/`error`): resolves final message from `response.result()`, emits `message_end`
+
+For ordinary unmanaged turns, the first content event publishes the provisional
+nonterminal lifecycle, including reasoning-only and tool-only streams. Subsequent
+updates are delivered live without waiting for text, response completion, or an
+interrupt. This is presentation, not tool acceptance: terminal validation and the
+consumer drain still precede execution. A legacy guarded call that has already
+been published receives an explicit rejection instead of silently disappearing
+through same-turn resampling; unpublished terminal-only attempts can still retry.
+Managed fallback attempts retain atomic publication/discard semantics and do not
+use this unmanaged early-publication path.
 
 `AgentSession` then consumes those events for session-level behaviors:
 

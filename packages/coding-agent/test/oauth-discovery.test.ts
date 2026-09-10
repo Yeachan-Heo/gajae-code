@@ -1,5 +1,10 @@
 import { describe, expect, it } from "bun:test";
-import { analyzeAuthError, discoverOAuthEndpoints, extractMcpAuthServerUrl } from "../src/runtime-mcp/oauth-discovery";
+import {
+	analyzeAuthError,
+	discoverOAuthEndpoints,
+	extractMcpAuthServerUrl,
+	extractOAuthEndpoints,
+} from "../src/runtime-mcp/oauth-discovery";
 import type { AddressResolver } from "../src/web/insane/url-guard";
 
 const resolver: AddressResolver = async () => ["8.8.8.8"];
@@ -138,5 +143,57 @@ describe("mcp oauth discovery", () => {
 			},
 			{ host: "mcp.example", serverName: "mcp.example", url: "https://8.8.8.4/oauth" },
 		]);
+	});
+	it("parses a large challenge-free error in linear time", () => {
+		// The challenge-parameter rule scanned to the end of a long identifier run
+		// at every offset before failing to find `="`: 25k/50k/100k characters cost
+		// 498ms/1990ms/7959ms. `errorMsg` is the failure text a remote MCP server
+		// produced, reached whenever a connection attempt fails, so its length is
+		// not ours to assume.
+		for (const body of [
+			"a".repeat(100_000),
+			"ab_".repeat(33_000),
+			"{".repeat(100_000),
+			`realm="x" `.repeat(10_000),
+		]) {
+			const startedAt = performance.now();
+			expect(extractOAuthEndpoints(new Error(body))).toBeNull();
+			expect(performance.now() - startedAt).toBeLessThan(1_000);
+		}
+
+		const startedAt = performance.now();
+		analyzeAuthError(new Error(`401 unauthorized ${"a".repeat(100_000)}`));
+		expect(performance.now() - startedAt).toBeLessThan(1_000);
+	});
+
+	it("still reads challenge parameters around an oversized key", () => {
+		// A bounded regex could reinterpret this suffix as a different parameter;
+		// the original parser does not recognize it as authorization_endpoint.
+		expect(
+			extractOAuthEndpoints(
+				new Error(`${"x".repeat(70)}authorization_endpoint="ignored" token_url="https://a.example/tok"`),
+			),
+		).toBeNull();
+
+		// The legacy realm fallback still recognizes a realm suffix, preserving
+		// the existing WWW-Authenticate behavior.
+		const legacyEndpoints = extractOAuthEndpoints(
+			new Error(`${"x".repeat(70)}realm="https://a.example/auth" token_url="https://a.example/tok"`),
+		);
+		expect(legacyEndpoints).toMatchObject({
+			authorizationUrl: "https://a.example/auth",
+			tokenUrl: "https://a.example/tok",
+		});
+
+		// Neighboring parameters still resolve after an oversized unknown key.
+		const endpoints = extractOAuthEndpoints(
+			new Error(
+				`Bearer ${"x".repeat(70)}="ignored" realm="https://a.example/auth" token_url="https://a.example/tok"`,
+			),
+		);
+		expect(endpoints).toMatchObject({
+			authorizationUrl: "https://a.example/auth",
+			tokenUrl: "https://a.example/tok",
+		});
 	});
 });

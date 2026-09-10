@@ -3,7 +3,10 @@ import * as fsNode from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { BinaryUpdateFlow } from "../src/cli/update-cli";
+import { VERSION } from "@gajae-code/utils";
+import { runCli } from "../src/cli";
+import { offerMacosCommunityApp } from "../src/cli/macos-community-app";
+import type { BinaryUpdateFlow, UpdateCommandDependencies } from "../src/cli/update-cli";
 import {
 	assertSupportedLinuxLibcForTest,
 	buildReleaseBinaryUrlForTest,
@@ -12,6 +15,7 @@ import {
 	formatBinaryDownloadFailureMessageForTest,
 	formatManualUpdateInstructionsForTest,
 	formatVerificationFailureForTest,
+	formatVerifiedBinaryInvocation,
 	fsyncFileForTest,
 	getLatestReleaseForTest,
 	hasManagedNotifySetup,
@@ -50,6 +54,246 @@ async function makeTempDir(): Promise<string> {
 
 afterEach(async () => {
 	await Promise.all(tempDirs.splice(0).map(dir => fs.rm(dir, { recursive: true, force: true })));
+});
+
+describe("verified binary invocation formatting", () => {
+	it("quotes Windows paths with spaces and ASCII single quotes", () => {
+		expect(formatVerifiedBinaryInvocation("C:\\Users\\O'Brien\\my bin\\gjc.exe", "win32")).toBe(
+			"& 'C:\\Users\\O''Brien\\my bin\\gjc.exe'",
+		);
+	});
+
+	it.each(["'", "‘", "’", "‚", "‛"])("doubles PowerShell quote %s without changing the path", quote => {
+		const runtimePath = `C:\\bin\\gjc${quote}; Write-Output $env:PATH; ${quote}.exe`;
+		expect(formatVerifiedBinaryInvocation(runtimePath, "win32")).toBe(
+			`& 'C:\\bin\\gjc${quote}${quote}; Write-Output $env:PATH; ${quote}${quote}.exe'`,
+		);
+	});
+
+	it.each(["linux", "darwin"] as const)("uses POSIX quoting on %s and preserves smart quotes", platform => {
+		expect(formatVerifiedBinaryInvocation("/my bin/O'Brien/‘’‚‛;$HOME`id`/gjc", platform)).toBe(
+			"'/my bin/O'\\''Brien/‘’‚‛;$HOME`id`/gjc'",
+		);
+	});
+});
+
+describe("macOS community app integration", () => {
+	const release = { tag: "v999.0.0", version: "999.0.0", registry: DEFAULT_NPM_REGISTRY, warnings: [] };
+
+	it.each(["binary", "migrate"] as const)("offers once after successful %s recovery and defaults", async method => {
+		await initTheme();
+		const root = await makeTempDir();
+		const calls: string[] = [];
+		await runUpdateCommand(
+			{ force: false, check: false },
+			{
+				platform: "darwin",
+				getLatestRelease: async () => release,
+				resolveUpdateTarget: async () => ({ method, path: path.join(root, "gjc") }),
+				verifyMigrationTarget: async () => ({ ok: false }),
+				performUpdate: async () => {
+					calls.push("install");
+					return { ok: true, path: path.join(root, "gjc") };
+				},
+				runPostUpdateRecovery: async () => {
+					calls.push("recovery");
+				},
+				refreshInstalledDefaultSkills: async () => {
+					calls.push("defaults");
+				},
+				offerMacosCommunityApp: async deps => {
+					expect(deps?.platform).toBe("darwin");
+					expect(fsNode.existsSync(path.join(root, ".gjc-install.lock"))).toBe(false);
+					calls.push("offer");
+					return { status: "skipped", reason: "declined" };
+				},
+				recordTelemetryEvent: () => {},
+			},
+		);
+		expect(calls).toEqual(["install", "recovery", "defaults", "offer"]);
+	});
+
+	it.each([false, true])("reused migration releases its lock before offering; check=%s", async check => {
+		await initTheme();
+		const root = await makeTempDir();
+		const lock = path.join(root, ".gjc-install.lock");
+		const calls: string[] = [];
+		await runUpdateCommand(
+			{ force: false, check },
+			{
+				platform: "darwin",
+				getLatestRelease: async () => release,
+				resolveUpdateTarget: async () => ({ method: "migrate", path: path.join(root, "gjc") }),
+				verifyMigrationTarget: async () => {
+					expect(fsNode.existsSync(lock)).toBe(!check);
+					calls.push("verify");
+					return { ok: true };
+				},
+				performUpdate: async () => {
+					throw new Error("unexpected install");
+				},
+				runPostUpdateRecovery: async () => {
+					throw new Error("unexpected recovery");
+				},
+				refreshInstalledDefaultSkills: async () => {
+					throw new Error("unexpected defaults");
+				},
+				offerMacosCommunityApp: async () => {
+					expect(fsNode.existsSync(lock)).toBe(false);
+					calls.push("offer");
+					return { status: "skipped", reason: "declined" };
+				},
+				recordTelemetryEvent: () => {},
+			},
+		);
+		expect(calls).toEqual(check ? ["verify"] : ["verify", "offer"]);
+		expect(fsNode.existsSync(lock)).toBe(false);
+	});
+
+	it("writes the shared disclosure to stderr before prompting", async () => {
+		await initTheme();
+		const root = await makeTempDir();
+		const stderr: string[] = [];
+		let prompts = 0;
+		let disclosureAtPrompt = "";
+		const write = vi.spyOn(process.stderr, "write").mockImplementation(chunk => {
+			stderr.push(String(chunk));
+			return true;
+		});
+		try {
+			await runUpdateCommand(
+				{ force: false, check: false },
+				{
+					platform: "darwin",
+					getLatestRelease: async () => release,
+					resolveUpdateTarget: async () => ({ method: "binary", path: path.join(root, "gjc") }),
+					performUpdate: async () => ({ ok: true, path: path.join(root, "gjc") }),
+					runPostUpdateRecovery: async () => {},
+					refreshInstalledDefaultSkills: async () => {},
+					offerMacosCommunityApp: options =>
+						offerMacosCommunityApp({
+							...options,
+							env: {},
+							arch: "arm64",
+							homeDir: root,
+							stdinIsTTY: true,
+							stdoutIsTTY: true,
+							command: async () => ({ exitCode: 0, stdout: "", stderr: "" }),
+							prompt: async () => {
+								prompts++;
+								disclosureAtPrompt = stderr.join("");
+								return false;
+							},
+						}),
+					recordTelemetryEvent: () => {},
+				},
+			);
+			expect(prompts).toBe(1);
+			expect(disclosureAtPrompt).toContain("experimental, community-built THIRD-PARTY software");
+			expect(disclosureAtPrompt).toContain("separately licensed, with no first-party support");
+			expect(disclosureAtPrompt).toContain("https://github.com/devswha/gajae-code-app\n");
+		} finally {
+			write.mockRestore();
+		}
+	});
+	it.each([
+		"linux",
+		"check",
+		"up-to-date",
+		"failed",
+		"throw",
+		"suppressed",
+	] as const)("preserves update behavior for %s", async scenario => {
+		await initTheme();
+		let offers = 0;
+		const events: string[] = [];
+		const warnings: string[] = [];
+		const warning = vi.spyOn(process.stderr, "write").mockImplementation(chunk => {
+			warnings.push(String(chunk));
+			return true;
+		});
+		const exit = new Error("exit");
+		const deps: UpdateCommandDependencies = {
+			platform: scenario === "linux" ? "linux" : "darwin",
+			getLatestRelease: async () => (scenario === "up-to-date" ? { ...release, version: "0.0.1" } : release),
+			resolveUpdateTarget: async () => ({ method: "binary", path: "/verified/gjc" }),
+			performUpdate: async () => {
+				if (scenario === "failed") throw new Error("core update failed");
+				return { ok: true, path: "/verified/gjc" };
+			},
+			runPostUpdateRecovery: async () => {},
+			refreshInstalledDefaultSkills: async () => {},
+			offerMacosCommunityApp: async options => {
+				offers++;
+				if (scenario === "throw") throw new Error(`\x1b[31moptional failure\x1b[0m\n${"x".repeat(1_000)}`);
+				const result = await offerMacosCommunityApp({
+					...options,
+					env: { GJC_NO_COMMUNITY_APP: "1" },
+					prompt: async () => {
+						throw new Error("must not prompt");
+					},
+					fetchImpl: async () => {
+						throw new Error("must not fetch");
+					},
+				});
+				expect(result).toEqual({ status: "skipped", reason: "suppressed by environment" });
+				return result;
+			},
+			recordTelemetryEvent: event => {
+				events.push(event);
+			},
+			exit: () => {
+				throw exit;
+			},
+		};
+		try {
+			const result = runUpdateCommand({ force: false, check: scenario === "check" }, deps);
+			if (scenario === "failed") await expect(result).rejects.toBe(exit);
+			else await result;
+			expect(offers).toBe(scenario === "throw" || scenario === "suppressed" ? 1 : 0);
+			if (scenario === "throw") {
+				expect(events).toContain("update_install_completed");
+				expect(events).not.toContain("update_install_failed");
+				expect(warnings.join("\n")).toContain("optional failure");
+				expect(warnings.join("\n")).toContain("https://github.com/devswha/gajae-code-app");
+				expect(warnings.join("")).not.toContain("\x1b");
+				expect(warnings.join("")).not.toContain("x".repeat(513));
+				expect(warnings.join("")).toContain("GJC remains installed.");
+			}
+		} finally {
+			warning.mockRestore();
+		}
+	});
+
+	it("dispatches only exact single-argument capability and internal offer flags", async () => {
+		const stdout: string[] = [];
+		const write = vi.spyOn(process.stdout, "write").mockImplementation(chunk => {
+			stdout.push(String(chunk));
+			return true;
+		});
+		try {
+			await runCli(["--supports-macos-community-app"]);
+			expect(stdout.join("")).toBe("macos-community-app-offer\n");
+		} finally {
+			write.mockRestore();
+		}
+		for (const args of [
+			["--supports-macos-community-app", "--help"],
+			["--supports-macos-community-app=yes", "--help"],
+			["--internal-macos-community-app-offer", "--help"],
+			["--internal-macos-community-app-offer"],
+		]) {
+			const result = Bun.spawnSync([process.execPath, "src/cli.ts", ...args], {
+				cwd: path.join(repoRoot, "packages/coding-agent"),
+				env: { ...process.env, GJC_NO_COMMUNITY_APP: "1" },
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			expect(result.exitCode).toBe(0);
+			expect(result.stdout.toString()).not.toContain("macos-community-app-offer\n");
+			if (args.length > 1) expect(result.stdout.toString()).toContain("USAGE");
+		}
+	});
 });
 
 describe("update-cli recovery command surface", () => {
@@ -732,7 +976,13 @@ describe("update-cli managed notification recovery", () => {
 		it("skips update recovery and defaults refresh when the standalone target already verifies", async () => {
 			const calls: string[] = [];
 			const output: string[] = [];
-			const logSpy = vi.spyOn(console, "log").mockImplementation(message => output.push(String(message)));
+			const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+			const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+			const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+			const stdoutSpy = vi.spyOn(process.stdout, "write").mockImplementation(chunk => {
+				output.push(String(chunk));
+				return true;
+			});
 			try {
 				await runUpdateCommand(
 					{ force: false, check: false },
@@ -760,8 +1010,131 @@ describe("update-cli managed notification recovery", () => {
 				expect(output.join("\n")).toContain(
 					`Standalone gjc ${release.version} is already installed and verified at ${target.path}`,
 				);
-				expect(output.join("\n")).toContain(`${target.previousPath} shadows it on PATH.`);
-				expect(output.join("\n")).toContain("must precede the shim directory");
+				expect(output.join("\n")).toContain("Shell activation is not verified");
+				expect(output.join("\n")).toContain(`'${target.path}' --version`);
+				expect(output.join("\n")).toContain("Only if resolution still selects another install");
+				expect(output.join("\n")).not.toContain("shadows it on PATH");
+				expect(output.join("\n")).not.toContain("Updated to");
+				expect(stdoutSpy).toHaveBeenCalledTimes(2);
+				expect(output.every(block => block.endsWith("\n"))).toBe(true);
+				// Only the pre-existing version banner uses console; migration guidance must not.
+				expect(logSpy).toHaveBeenCalledTimes(1);
+				expect(String(logSpy.mock.calls[0]?.[0])).toContain("Current version:");
+				expect(warnSpy).not.toHaveBeenCalled();
+				expect(errorSpy).not.toHaveBeenCalled();
+			} finally {
+				logSpy.mockRestore();
+				warnSpy.mockRestore();
+				errorSpy.mockRestore();
+				stdoutSpy.mockRestore();
+			}
+		});
+
+		it.each([false, true])("distinguishes same-version migration from activation (existing=%s)", async existing => {
+			const root = await makeTempDir();
+			const runtimePath = path.join(root, "standalone space", "gjc");
+			const shimPath = path.join(root, "shim-gjc");
+			await fs.writeFile(shimPath, "package-manager shim");
+			const output: string[] = [];
+			const calls: string[] = [];
+			const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+			try {
+				await runUpdateCommand(
+					{ force: false, check: false },
+					{
+						writeStdout: text => output.push(text),
+						getLatestRelease: async () => ({ ...release, tag: `v${VERSION}`, version: VERSION }),
+						resolveUpdateTarget: async () => ({ method: "migrate", path: runtimePath, previousPath: shimPath }),
+						verifyMigrationTarget: async () => ({ ok: existing, actual: VERSION, path: runtimePath }),
+						performUpdate: async (selected, version) => {
+							expect(selected).toEqual({ method: "migrate", path: runtimePath, previousPath: shimPath });
+							expect(version).toBe(VERSION);
+							calls.push("install");
+							return { ok: true, actual: version, path: runtimePath };
+						},
+						runPostUpdateRecovery: async verifiedPath => {
+							expect(verifiedPath).toBe(runtimePath);
+							calls.push("recovery");
+						},
+						refreshInstalledDefaultSkills: async () => {
+							calls.push("refresh");
+						},
+					},
+				);
+				expect(calls).toEqual(existing ? [] : ["install", "recovery", "refresh"]);
+				expect(await fs.readFile(shimPath, "utf8")).toBe("package-manager shim");
+				const text = output.join("\n");
+				expect(text).toContain(existing ? "already installed and verified" : "is installed and verified");
+				expect(text).toContain("Version unchanged");
+				expect(text).toContain(`'${runtimePath}' --version`);
+				expect(text).toContain("Shell activation is not verified");
+				expect(text).toContain("Only if resolution still selects another install");
+				if (process.platform !== "win32") {
+					for (const command of ["type -a gjc", "command -v gjc", "hash -r (Bash)", "rehash (zsh)"]) {
+						expect(text).toContain(command);
+					}
+				}
+				expect(text).not.toContain("Updated to");
+				expect(text).not.toContain("Restart gjc");
+				expect(logSpy.mock.calls.flat().join("\n")).not.toContain("Standalone gjc");
+				expect(logSpy.mock.calls.flat().join("\n")).not.toContain("Shell activation");
+			} finally {
+				logSpy.mockRestore();
+			}
+		});
+
+		it("sanitizes migration paths without presenting altered paths as executable commands", async () => {
+			const root = await makeTempDir();
+			const runtimePath = path.join(root, "gjc\nunsafe\x1b[31m");
+			const output: string[] = [];
+			const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+			try {
+				await runUpdateCommand(
+					{ force: false, check: false },
+					{
+						writeStdout: text => output.push(text),
+						getLatestRelease: async () => release,
+						resolveUpdateTarget: async () => ({ method: "migrate", path: runtimePath }),
+						verifyMigrationTarget: async () => ({ ok: true, path: runtimePath }),
+					},
+				);
+				expect(output.join("\n")).not.toContain(runtimePath);
+				expect(output.join("\n")).toContain("displayed path was sanitized");
+			} finally {
+				logSpy.mockRestore();
+			}
+		});
+
+		it.each([false, true])("keeps normal binary update/check behavior (check=%s)", async check => {
+			const calls: string[] = [];
+			const output: string[] = [];
+			const logSpy = vi.spyOn(console, "log").mockImplementation(message => output.push(String(message)));
+			try {
+				await runUpdateCommand(
+					{ force: false, check },
+					{
+						getLatestRelease: async () => release,
+						resolveUpdateTarget: async () => ({ method: "binary", path: "/binary/gjc" }),
+						verifyMigrationTarget: async () => {
+							throw new Error("unexpected migration preflight");
+						},
+						performUpdate: async () => {
+							calls.push("install");
+							return { ok: true, path: "/binary/gjc" };
+						},
+						runPostUpdateRecovery: async () => {
+							calls.push("recovery");
+						},
+						refreshInstalledDefaultSkills: async () => {
+							calls.push("refresh");
+						},
+					},
+				);
+				expect(calls).toEqual(check ? [] : ["install", "recovery", "refresh"]);
+				expect(output.join("\n")).toContain(`New version available: ${release.version}`);
+				expect(output.filter(line => line.includes("Updated to"))).toHaveLength(check ? 0 : 1);
+				expect(output.filter(line => line.includes("Restart gjc"))).toHaveLength(check ? 0 : 1);
+				expect(output.join("\n")).not.toContain("Shell activation");
 			} finally {
 				logSpy.mockRestore();
 			}

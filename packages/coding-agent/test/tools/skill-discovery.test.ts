@@ -360,9 +360,19 @@ describe("SkillDiscoveryTool", () => {
 		expect(allScope.details?.candidates).toEqual([]);
 		expect(allScope.details?.notice).toContain("`skills.trustProjectSkills` is false");
 
-		// Fully enabled policy with a non-matching query: genuinely empty, no notice.
+		// Fully enabled policy with a non-matching query: the conjunctive filter
+		// dropped the one scanned skill, so the notice explains why and how to retry.
 		const enabled = runtimeSkillSettings();
-		const genuine = await new SkillDiscoveryTool(createSession(cwd, { settings: enabled })).execute("call", {
+		const filtered = await new SkillDiscoveryTool(createSession(cwd, { settings: enabled })).execute("call", {
+			query: "no-such-skill-anywhere",
+		});
+		expect(filtered.details?.candidates).toEqual([]);
+		expect(filtered.details?.notice).toContain("No skill matched every query term (1 skill scanned)");
+		expect(filtered.details?.notice).toContain("conjunctive substring");
+
+		// Fully enabled policy with no scanned skills at all: genuinely empty, no notice.
+		const emptyCwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-skills-notice-empty-"));
+		const genuine = await new SkillDiscoveryTool(createSession(emptyCwd, { settings: enabled })).execute("call", {
 			query: "no-such-skill-anywhere",
 		});
 		expect(genuine.details?.candidates).toEqual([]);
@@ -374,6 +384,30 @@ describe("SkillDiscoveryTool", () => {
 		});
 		expect(found.details?.count).toBe(1);
 		expect(found.details?.notice).toBeUndefined();
+	});
+
+	it("explains zero-candidate topic queries as conjunctive filtering instead of a missing catalog", async () => {
+		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-skills-topic-query-"));
+		await makeSkill(path.join(cwd, ".gjc", "skills"), "deploy-lens", "Deployment advisory lens");
+
+		const settings = runtimeSkillSettings();
+
+		// One term matches the skill's metadata, one appears nowhere: conjunctive
+		// filtering drops it, and the notice must say so rather than imply the
+		// catalog is empty (the toss-po-lens incident shape).
+		const topic = await new SkillDiscoveryTool(createSession(cwd, { settings })).execute("call", {
+			query: "deploy kubernetes payments",
+		});
+		expect(topic.details?.candidates).toEqual([]);
+		expect(topic.details?.notice).toContain("No skill matched every query term (1 skill scanned)");
+		expect(topic.details?.notice).toContain("Retry with the exact skill name");
+
+		// The exact hyphenated name still matches and carries no notice.
+		const exact = await new SkillDiscoveryTool(createSession(cwd, { settings })).execute("call", {
+			query: "deploy-lens",
+		});
+		expect(exact.details?.candidates.map(candidate => candidate.name)).toEqual(["deploy-lens"]);
+		expect(exact.details?.notice).toBeUndefined();
 	});
 
 	it("discovers canonical and legacy user roots in native precedence order", async () => {

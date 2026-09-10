@@ -26,11 +26,6 @@ import type {
 	UsageReport,
 } from "./usage";
 
-import {
-	classifyOpenAICodexProEntitlement,
-	requiresOpenAICodexProModel,
-	requiresOpenAICodexSparkModel,
-} from "./utils/codex-entitlement";
 import { getOAuthApiKey, getOAuthProvider, refreshOAuthToken, resolveOAuthStorageProvider } from "./utils/oauth";
 import { loginDeepInfra } from "./utils/oauth/deepinfra";
 import { loginDeepSeek } from "./utils/oauth/deepseek";
@@ -1145,24 +1140,6 @@ export function readBrokerErrorBody(error: unknown): string | undefined {
 	}
 }
 
-function getUsagePlanType(report: UsageReport | null): string | undefined {
-	const metadata = report?.metadata;
-	if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) return undefined;
-	const planType = (metadata as { planType?: unknown }).planType;
-	return typeof planType === "string" ? planType.toLowerCase() : undefined;
-}
-
-function getOpenAICodexPlanPriority(report: UsageReport | null): number {
-	const entitlement = classifyOpenAICodexProEntitlement(getUsagePlanType(report));
-	if (entitlement === "entitled") return 0;
-	if (entitlement === "denied") return 2;
-	return 1;
-}
-
-function hasOpenAICodexProPlan(report: UsageReport | null): boolean {
-	return classifyOpenAICodexProEntitlement(getUsagePlanType(report)) === "entitled";
-}
-
 function resolveDefaultRankingStrategy(provider: Provider): CredentialRankingStrategy | undefined {
 	return DEFAULT_RANKING_STRATEGIES.get(provider);
 }
@@ -1335,6 +1312,8 @@ export class AuthStorage {
 	#sessionCredentialSelectors: Map<string, Map<string, AuthCredentialSelector>> = new Map();
 	/** Explicit AUTO masks suppress both scoped and process-global selectors for a scope/provider. */
 	#sessionCredentialAutoMasks: Map<string, Set<string>> = new Map();
+	/** Hard-pin failures that must remain unavailable until an explicit user choice. */
+	#sessionCredentialUnavailable: Map<string, Map<string, AuthCredentialSelector>> = new Map();
 	/** Reference counts for sessions sharing one credential scope (top-level + subagents). */
 	#credentialScopeLeases: Map<string, number> = new Map();
 	/** Tracks next credential index per provider:type key for round-robin distribution (non-session use). */
@@ -1441,6 +1420,7 @@ export class AuthStorage {
 		this.#credentialScopeLeases.clear();
 		this.#sessionCredentialSelectors.clear();
 		this.#sessionCredentialAutoMasks.clear();
+		this.#sessionCredentialUnavailable.clear();
 		this.#sessionLastCredential.clear();
 		this.#store.close();
 	}
@@ -1667,6 +1647,7 @@ export class AuthStorage {
 		this.#credentialScopeLeases.delete(scope);
 		this.#sessionCredentialSelectors.delete(scope);
 		this.#sessionCredentialAutoMasks.delete(scope);
+		this.#sessionCredentialUnavailable.delete(scope);
 		for (const [provider, sessions] of this.#sessionLastCredential) {
 			if (!sessions.delete(scope)) continue;
 			if (sessions.size === 0) this.#sessionLastCredential.delete(provider);
@@ -1688,6 +1669,7 @@ export class AuthStorage {
 		if (!scope) throw new Error("Credential scope id must not be empty");
 		const storageProvider = resolveOAuthStorageProvider(provider);
 		this.#assertCredentialSelectorUsable(storageProvider, selector, owner);
+		this.#sessionCredentialUnavailable.get(scope)?.delete(storageProvider);
 		const selectors = this.#sessionCredentialSelectors.get(scope) ?? new Map<string, AuthCredentialSelector>();
 		selectors.set(storageProvider, selector);
 		this.#sessionCredentialSelectors.set(scope, selectors);
@@ -1701,6 +1683,7 @@ export class AuthStorage {
 		if (!scope) throw new Error("Credential scope id must not be empty");
 		const storageProvider = resolveOAuthStorageProvider(provider);
 		this.#sessionCredentialSelectors.get(scope)?.delete(storageProvider);
+		this.#sessionCredentialUnavailable.get(scope)?.delete(storageProvider);
 		const masks = this.#sessionCredentialAutoMasks.get(scope) ?? new Set<string>();
 		masks.add(storageProvider);
 		this.#sessionCredentialAutoMasks.set(scope, masks);
@@ -1718,6 +1701,28 @@ export class AuthStorage {
 		if (selectors?.size === 0) this.#sessionCredentialSelectors.delete(scope);
 		if (masks?.size === 0) this.#sessionCredentialAutoMasks.delete(scope);
 		if (changed) this.#bumpGeneration("clear-session-credential-selector", storageProvider);
+	}
+
+	/** Preserve a failed hard pin as unavailable instead of allowing AUTO fallback. */
+	markSessionCredentialUnavailable(scopeId: string, provider: string, selector: AuthCredentialSelector): void {
+		const scope = scopeId.trim();
+		if (!scope) throw new Error("Credential scope id must not be empty");
+		const storageProvider = resolveOAuthStorageProvider(provider);
+		const unavailable = this.#sessionCredentialUnavailable.get(scope) ?? new Map<string, AuthCredentialSelector>();
+		unavailable.set(storageProvider, selector);
+		this.#sessionCredentialUnavailable.set(scope, unavailable);
+		this.#sessionCredentialSelectors.get(scope)?.delete(storageProvider);
+		this.#sessionCredentialAutoMasks.get(scope)?.delete(storageProvider);
+		this.#bumpGeneration("mark-session-credential-unavailable", storageProvider);
+	}
+
+	/** Return a failed hard pin retained for this scope, if any. */
+	hasSessionCredentialUnavailable(provider: string, scopeId?: string): boolean {
+		const scope = scopeId?.trim();
+		return (
+			scope !== undefined &&
+			this.#sessionCredentialUnavailable.get(scope)?.has(resolveOAuthStorageProvider(provider)) === true
+		);
 	}
 
 	/** Whether the effective selection for a scope is explicitly pinned (AUTO masks are not pins). */
@@ -2803,7 +2808,9 @@ export class AuthStorage {
 			const selector = selectors.get(storageProvider);
 			if (!selector) continue;
 			const selected = previousEntries.find(entry => this.#credentialMatchesSelector(entry, selector));
-			if (selected && removedIds.has(selected.id)) this.clearSessionCredentialSelector(storageProvider, scopeId);
+			if (selected && removedIds.has(selected.id)) {
+				this.markSessionCredentialUnavailable(scopeId, storageProvider, selector);
+			}
 		}
 		for (const [sessionId, sticky] of this.#sessionLastCredential.get(storageProvider) ?? []) {
 			if (removedIds.has(previousEntries[sticky.index]?.id ?? -1))
@@ -4603,6 +4610,36 @@ export class AuthStorage {
 	}
 
 	/**
+	 * Mark the stored credential whose key matches `apiKey` usage-limited for
+	 * `retryAfterMs` (or the default backoff). Used when the caller knows
+	 * exactly which leased credential failed (e.g. the auth-gateway leases a
+	 * concrete row without a session binding) so bookkeeping cannot land on the
+	 * wrong credential. The credential is never invalidated or marked suspect:
+	 * the block is a bounded backoff only. Returns false when no stored
+	 * credential matches the key.
+	 */
+	async markUsageLimitReachedMatching(
+		provider: string,
+		apiKey: string,
+		options?: { retryAfterMs?: number },
+	): Promise<boolean> {
+		const storageProvider = resolveOAuthStorageProvider(provider);
+		const stored = this.#getStoredCredentials(storageProvider);
+		for (let index = 0; index < stored.length; index++) {
+			const entry = stored[index];
+			if (entry && (await this.#credentialMatchesApiKey(storageProvider, entry.credential, apiKey))) {
+				this.#markCredentialBlocked(
+					this.#getProviderTypeKey(storageProvider, entry.credential.type),
+					index,
+					Date.now() + (options?.retryAfterMs ?? AuthStorage.#defaultBackoffMs),
+				);
+				return true;
+			}
+		}
+		return false;
+	}
+
+	/**
 	 * Earliest instant at which any currently blocked stored credential for this
 	 * provider becomes usable again. Undefined when nothing is blocked.
 	 * When `sessionId` is provided, only the session's active credential type is
@@ -4782,11 +4819,6 @@ export class AuthStorage {
 				if (leftBlockedUntil !== rightBlockedUntil) return leftBlockedUntil - rightBlockedUntil;
 				return left.orderPos - right.orderPos;
 			}
-			if (requiresOpenAICodexProModel(args.provider, args.options?.modelId)) {
-				const leftPlanPriority = getOpenAICodexPlanPriority(left.usage);
-				const rightPlanPriority = getOpenAICodexPlanPriority(right.usage);
-				if (leftPlanPriority !== rightPlanPriority) return leftPlanPriority - rightPlanPriority;
-			}
 			if (left.hasPriorityBoost !== right.hasPriorityBoost) return left.hasPriorityBoost ? -1 : 1;
 			if (this.#credentialRankingMode === "earliest-reset" && left.resetAtMs !== right.resetAtMs) {
 				// Earliest-expiry-first: drain the soonest-to-reset account before
@@ -4822,6 +4854,15 @@ export class AuthStorage {
 		options?: AuthApiKeyOptions,
 		reloadsUsed = 0,
 	): Promise<OAuthResolutionResult | undefined> {
+		const unavailableSelector =
+			sessionId && !options?.credentialSelector
+				? this.#sessionCredentialUnavailable.get(sessionId)?.get(resolveOAuthStorageProvider(provider))
+				: undefined;
+		if (unavailableSelector) {
+			throw new Error(
+				`Selected credential for ${provider} (${this.#formatCredentialSelector(unavailableSelector)}) is unavailable`,
+			);
+		}
 		if (reloadsUsed > MAX_OAUTH_RESOLUTION_RELOADS) {
 			logger.warn("OAuth credential resolution exhausted its reload budget", {
 				provider,
@@ -4830,6 +4871,10 @@ export class AuthStorage {
 			return undefined;
 		}
 		const selectedCredential = this.#resolveSelectedStoredCredential(provider, options, sessionId);
+		const sessionSelector =
+			sessionId && !options?.credentialSelector && selectedCredential?.credential.type === "oauth"
+				? { kind: "id" as const, value: String(selectedCredential.id) }
+				: undefined;
 		const selectedOAuthCredential: OAuthCredentialSelection | undefined =
 			selectedCredential?.credential.type === "oauth"
 				? {
@@ -4859,9 +4904,7 @@ export class AuthStorage {
 		const providerKey = this.#getProviderTypeKey(provider, "oauth");
 		const order = selectedCredential ? [0] : this.#getCredentialOrder(providerKey, sessionId, credentials.length);
 		const strategy = this.#rankingStrategyResolver?.(provider);
-		const requiresProModel = requiresOpenAICodexProModel(provider, options?.modelId);
-		const checkUsage =
-			strategy !== undefined && (selectedCredential !== undefined || credentials.length > 1 || requiresProModel);
+		const checkUsage = strategy !== undefined && (selectedCredential !== undefined || credentials.length > 1);
 		const sessionCredential = this.#getSessionCredential(provider, sessionId);
 		const sessionPreferredIndex = sessionCredential?.type === "oauth" ? sessionCredential.index : undefined;
 		// Skip ranking only when the session already has a working preferred credential — re-ranking
@@ -4870,7 +4913,7 @@ export class AuthStorage {
 		// with the most headroom proactively and fall back intelligently when rate-limited.
 		const sessionPreferredIsAvailable =
 			sessionPreferredIndex !== undefined && !this.#isCredentialBlocked(providerKey, sessionPreferredIndex);
-		const shouldRank = !selectedCredential && checkUsage && (!sessionPreferredIsAvailable || requiresProModel);
+		const shouldRank = !selectedCredential && checkUsage && !sessionPreferredIsAvailable;
 		const candidates = shouldRank
 			? await this.#rankOAuthSelections({ providerKey, provider, order, credentials, options, strategy: strategy! })
 			: order
@@ -4908,7 +4951,7 @@ export class AuthStorage {
 			}
 		}
 
-		if (!selectedCredential && sessionPreferredIndex !== undefined && !requiresProModel) {
+		if (!selectedCredential && sessionPreferredIndex !== undefined) {
 			const sessionPreferredCandidate = candidates.findIndex(
 				candidate =>
 					!this.#isCredentialBlocked(providerKey, candidate.selection.index) &&
@@ -4956,15 +4999,6 @@ export class AuthStorage {
 			}),
 		);
 
-		// Plan metadata orders candidates (see `getOpenAICodexPlanPriority`). Spark keeps its
-		// historical confirmed-Pro filter, while Sol leaves entitlement to the provider:
-		// trial, grandfathered and experiment-enabled accounts can carry an ordinary label
-		// that the provider still accepts. Provider refusals are normalized by
-		// `openai-codex-responses` through `formatOpenAICodexChatGPTEntitlementError`.
-		const enforceSparkProRequirement =
-			requiresOpenAICodexSparkModel(provider, options?.modelId) &&
-			candidates.some(candidate => hasOpenAICodexProPlan(candidate.usage));
-
 		const fallback = candidates[0];
 
 		for (const candidate of candidates) {
@@ -4979,9 +5013,9 @@ export class AuthStorage {
 					allowBlocked: false,
 					prefetchedUsage: candidate.usage,
 					usagePrechecked: candidate.usageChecked,
-					enforceSparkProRequirement,
 				},
 				reloadsUsed,
+				sessionSelector,
 			);
 			if (resolved) return resolved;
 		}
@@ -4998,9 +5032,9 @@ export class AuthStorage {
 					allowBlocked: true,
 					prefetchedUsage: fallback.usage,
 					usagePrechecked: fallback.usageChecked,
-					enforceSparkProRequirement,
 				},
 				reloadsUsed,
+				sessionSelector,
 			);
 		}
 
@@ -5284,17 +5318,11 @@ export class AuthStorage {
 			allowBlocked: boolean;
 			prefetchedUsage?: UsageReport | null;
 			usagePrechecked?: boolean;
-			enforceSparkProRequirement?: boolean;
 		},
 		reloadsUsed = 0,
+		sessionSelector?: AuthCredentialSelector,
 	): Promise<OAuthResolutionResult | undefined> {
-		const {
-			checkUsage,
-			allowBlocked,
-			prefetchedUsage = null,
-			usagePrechecked = false,
-			enforceSparkProRequirement = false,
-		} = usageOptions;
+		const { checkUsage, allowBlocked, prefetchedUsage = null, usagePrechecked = false } = usageOptions;
 		if (!this.#reconcileOAuthCredentialSelection(provider, selection)) return undefined;
 		if (!allowBlocked && this.#isCredentialBlocked(providerKey, selection.index)) {
 			return undefined;
@@ -5304,11 +5332,10 @@ export class AuthStorage {
 			return undefined;
 		}
 
-		const requiresProModel = requiresOpenAICodexProModel(provider, options?.modelId);
 		let usage: UsageReport | null = null;
 		let usageChecked = false;
 
-		if ((checkUsage && !allowBlocked) || requiresProModel) {
+		if (checkUsage && !allowBlocked) {
 			if (usagePrechecked) {
 				usage = prefetchedUsage;
 				usageChecked = true;
@@ -5328,7 +5355,6 @@ export class AuthStorage {
 				);
 				return undefined;
 			}
-			if (enforceSparkProRequirement && !hasOpenAICodexProPlan(usage)) return undefined;
 		}
 
 		try {
@@ -5390,7 +5416,7 @@ export class AuthStorage {
 				selectionCredentialId,
 			);
 
-			if ((checkUsage && !allowBlocked) || requiresProModel) {
+			if (checkUsage && !allowBlocked) {
 				const sameAccount = selection.credential.accountId === updated.accountId;
 				if (!usageChecked || !sameAccount) {
 					usage = await this.#getUsageReport(provider, updated, {
@@ -5408,7 +5434,6 @@ export class AuthStorage {
 					);
 					return undefined;
 				}
-				if (enforceSparkProRequirement && !hasOpenAICodexProPlan(usage)) return undefined;
 			}
 			if (!this.#reconcileOAuthCredentialSelection(provider, selection)) return undefined;
 			if (!authCredentialEquals(selection.credential, updated)) return undefined;
@@ -5498,6 +5523,9 @@ export class AuthStorage {
 					`oauth refresh failed: ${errorMsg}`,
 					attemptedCredentialId,
 				);
+				if (sessionSelector && sessionId) {
+					this.markSessionCredentialUnavailable(sessionId, provider, sessionSelector);
+				}
 				if (!disabled) {
 					// The CAS predicate compares the row's serialized `data`, so it also
 					// misses when nothing was rotated: the row may have been replaced by
@@ -5510,7 +5538,12 @@ export class AuthStorage {
 					// peer rotation to clobber — so apply it directly instead of looping.
 					const stillHoldsAttemptedToken =
 						attemptedCredentialId !== undefined &&
-						this.#credentialRowHoldsRefreshToken(provider, attemptedCredentialId, attemptedRefreshToken);
+						(this.#credentialRowHoldsRefreshToken(provider, attemptedCredentialId, attemptedRefreshToken) ||
+							this.#credentialRowHoldsRefreshToken(
+								provider,
+								attemptedCredentialId,
+								selection.credential.refresh,
+							));
 					if (stillHoldsAttemptedToken && attemptedCredentialId !== undefined) {
 						logger.warn("OAuth refresh disable CAS mismatched an unrotated row; disabling by id", {
 							provider,
@@ -5568,6 +5601,9 @@ export class AuthStorage {
 		}
 		if (this.#getCredentialSelector(provider, options, sessionId)) {
 			const selector = this.#getCredentialSelector(provider, options, sessionId);
+			if (selector && sessionId && !options?.credentialSelector) {
+				this.markSessionCredentialUnavailable(sessionId, provider, selector);
+			}
 			throw new Error(
 				`Selected credential for ${provider} (${selector ? this.#formatCredentialSelector(selector) : "unknown"}) is unavailable`,
 			);
@@ -5644,7 +5680,10 @@ export class AuthStorage {
 	 * and get a best-effort token. For GitHub Copilot we preserve enterprise
 	 * routing metadata so discovery can hit the correct host.
 	 */
-	async peekApiKey(provider: string, options?: Pick<AuthApiKeyOptions, "owner">): Promise<string | undefined> {
+	async peekApiKey(
+		provider: string,
+		options?: Pick<AuthApiKeyOptions, "owner"> & { sessionId?: string },
+	): Promise<string | undefined> {
 		provider = resolveOAuthStorageProvider(provider);
 		const runtimeKey = this.#runtimeOverrides.get(provider);
 		if (runtimeKey) return runtimeKey;
@@ -5652,11 +5691,12 @@ export class AuthStorage {
 		const configOverride = this.#configOverrideRegistration(provider, options?.owner);
 		const configKey = configOverride?.apiKey;
 		if (configKey && !configOverride?.envSourced) return configKey;
+		if (options?.sessionId && this.hasSessionCredentialUnavailable(provider, options.sessionId)) return undefined;
 
 		const selectedCredential = this.#resolveSelectedStoredCredential(
 			provider,
 			options?.owner ? { owner: options.owner } : undefined,
-			undefined,
+			options?.sessionId,
 		);
 		if (configKey) {
 			// Env-sourced (`apiKeyEnv`) override: same precedence as getApiKey —
@@ -5683,6 +5723,10 @@ export class AuthStorage {
 			}
 			return undefined;
 		}
+		// A hard selector is an identity boundary. If its selected row cannot
+		// provide a current token, discovery must not continue into the shared
+		// credential pool and silently query another account's catalog.
+		if (this.#getCredentialSelector(provider, undefined, options?.sessionId)) return undefined;
 
 		const attemptedApiKeyIndices = new Set<number>();
 		for (;;) {
@@ -5750,6 +5794,14 @@ export class AuthStorage {
 			const storedApiKey = await this.#resolveStoredApiKeyOverEnvConfig(provider, selectedCredential, sessionId);
 			if (storedApiKey) return storedApiKey;
 			return configKey;
+		}
+		if (sessionId && !options?.credentialSelector) {
+			const unavailableSelector = this.#sessionCredentialUnavailable.get(sessionId)?.get(provider);
+			if (unavailableSelector) {
+				throw new Error(
+					`Selected credential for ${provider} (${this.#formatCredentialSelector(unavailableSelector)}) is unavailable`,
+				);
+			}
 		}
 
 		if (selectedCredential?.credential.type === "api_key") {

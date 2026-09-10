@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Publish reasoning summaries, thinking, and tool-call updates during ordinary unmanaged streaming instead of holding them until text, response completion, or interruption. Tool execution still waits for terminal validation; already-published legacy guarded calls receive explicit rejection instead of silent resampling. Managed fallback attempts remain atomic.
+
 ## [0.16.6] - 2026-09-07
 
 ## [0.16.5] - 2026-09-07

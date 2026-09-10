@@ -16,16 +16,17 @@ interface WorkflowStep {
 }
 
 interface WorkflowJob {
+	name: string;
 	needs?: string[];
 	if?: string;
 	env?: Record<string, string>;
-	concurrency?: { group: string; "cancel-in-progress"?: string | boolean };
+	concurrency?: { group: string; "cancel-in-progress"?: string | boolean; queue?: string };
 	steps: WorkflowStep[];
 }
 
 interface WorkflowDocument {
 	on: { workflow_dispatch: { inputs: Record<string, unknown> } };
-	concurrency?: { group: string };
+	concurrency?: { group: string; "cancel-in-progress": string };
 	jobs: Record<string, WorkflowJob>;
 }
 
@@ -67,6 +68,72 @@ function requiredEnvValue(value: WorkflowJob | WorkflowStep, key: string): strin
 
 
 describe("dev-ci Telegram daemon generation guard topology", () => {
+	test("metadata event matrix isolates concurrency and skips the entire code DAG, not the contract", async () => {
+		const document = await workflow();
+		if (!document.concurrency) throw new Error("Missing workflow concurrency");
+		const body = { from: "old verdict" };
+		const title = { from: "old title" };
+		const base = { ref: { from: "main" }, sha: { from: "a".repeat(40) } };
+		for (const scenario of [
+			{ name: "body only", event: "pull_request", action: "edited", changes: { body }, skip: true },
+			{ name: "title only", event: "pull_request", action: "edited", changes: { title }, skip: true },
+			{ name: "body and title", event: "pull_request", action: "edited", changes: { body, title }, skip: true },
+			{ name: "base only", event: "pull_request", action: "edited", changes: { base }, skip: false },
+			{ name: "base and body", event: "pull_request", action: "edited", changes: { base, body }, skip: false },
+			{ name: "base and title", event: "pull_request", action: "edited", changes: { base, title }, skip: false },
+			{ name: "base and both", event: "pull_request", action: "edited", changes: { base, body, title }, skip: false },
+			{ name: "unknown edit", event: "pull_request", action: "edited", changes: {}, skip: false },
+			{ name: "source push", event: "pull_request", action: "synchronize", changes: {}, skip: false },
+			{ name: "branch push", event: "push", action: "", changes: {}, skip: false },
+			{ name: "head-only dispatch", event: "workflow_dispatch", action: "", changes: {}, skip: false, headSha: "b".repeat(40) },
+			{ name: "ordinary dispatch", event: "workflow_dispatch", action: "", changes: {}, skip: false, headSha: "" },
+		]) {
+			const github = { event_name: scenario.event, event: { action: scenario.action, changes: scenario.changes }, workflow: "Dev CI", ref: "refs/pull/5367/merge", run_id: 34300623114 };
+			const headOnlyDispatch = "headSha" in scenario && scenario.headSha !== "";
+			const needs: Record<string, { result: string; outputs: Record<string, string> }> = {};
+			// Evaluate the actual checked-in boolean expressions, not a duplicate
+			// metadata predicate. This fixture uses only their JS-compatible subset.
+			const evaluate = (expression: string): unknown => {
+				const source = expression.trim().replace(/^\$\{\{\s*|\s*\}\}$/g, "")
+					.replace(/needs\.([a-z][a-z0-9-]*)/g, 'needs["$1"]');
+				return new Function("github", "inputs", "needs", "always", "contains", "format", `return (${source});`)(
+					github, { head_sha: "headSha" in scenario ? scenario.headSha : "" }, needs, () => true,
+					(value: string = "", part: string) => value.includes(part),
+					(template: string, ...values: unknown[]) => template.replace(/\{(\d+)\}/g, (_, index: string) => String(values[Number(index)])),
+				);
+			};
+			expect({ scenario: scenario.name, group: evaluate(document.concurrency.group) }).toEqual({
+				scenario: scenario.name, group: headOnlyDispatch ? "dev-ci-dispatch-34300623114" : `Dev CI-refs/pull/5367/merge${scenario.skip ? "-metadata-edit" : ""}`,
+			});
+			expect(Boolean(evaluate(document.concurrency["cancel-in-progress"]))).toBe(!scenario.skip && !headOnlyDispatch);
+			// GitHub publishes contexts even for skipped jobs: evaluate their names
+			// independently of scheduling so metadata cannot forge code evidence.
+			for (const [id, canonical, nonCode] of [
+				["affected", "Affected path validation", "Not code evidence - affected validation skipped"],
+				["gjc-state-gates", "gjc-state-gates", "Not code evidence - state gates skipped"],
+				["virtual-integration", "Virtual integration validation", "Not code evidence - virtual integration skipped"],
+			]) {
+				const expected = scenario.skip || (headOnlyDispatch && id !== "virtual-integration") ? nonCode : canonical;
+				expect({ scenario: scenario.name, id, context: evaluate(requiredJob(document, id!).name) }).toEqual({ scenario: scenario.name, id, context: expected });
+			}
+			const scheduled: string[] = [];
+			for (const [name, job] of Object.entries(document.jobs)) {
+				for (const dependency of job.needs ?? []) expect(needs[dependency]).toBeDefined();
+				const implicitSuccess = job.if?.includes("always()") || (job.needs ?? []).every(dependency => needs[dependency].result === "success");
+				const enabled = implicitSuccess && Boolean(evaluate(job.if ?? "true"));
+				if (enabled) scheduled.push(name);
+				needs[name] = { result: enabled ? "success" : "skipped", outputs: enabled ? { relevant: "true", has_native: "true", has_tasks: "true" } : {} };
+			}
+			if (scenario.skip) expect({ scenario: scenario.name, scheduled }).toEqual({ scenario: scenario.name, scheduled: ["pr-contract-bootstrap"] });
+			else if (headOnlyDispatch) expect(scheduled).toEqual(["virtual-integration"]);
+			else {
+				expect(scheduled).toContain("affected-plan");
+				expect(scheduled).toContain("affected-shards");
+				expect(scheduled).toContain("gjc-state-gates-matrix");
+				if (scenario.event === "pull_request") expect(scheduled).toContain("pr-contract-bootstrap");
+			}
+		}
+	});
 	test("does not resurrect the removed Windows notification atomicity gate", async () => {
 		const raw = await Bun.file(".github/workflows/dev-ci.yml").text();
 		expect(raw).not.toMatch(/notification-atomic-windows/);
@@ -205,13 +272,12 @@ describe("dev-ci Telegram daemon generation guard topology", () => {
 		const source = await Bun.file(".github/workflows/dev-ci.yml").text();
 		// Every candidate must serialize: each one selects a dev base and materializes
 		// a merge, so concurrent runs could validate incompatible integration states.
-		// Candidates must serialize on one non-cancelling lane with schema-valid keys
-		// only: GitHub Actions concurrency has exactly `group` and
-		// `cancel-in-progress`; unknown keys make the workflow fail actionlint.
+		// The serial lane retains pending candidates using GitHub.com's max queue.
 		expect(source).toContain("group: dev-ci-virtual-integration\n      cancel-in-progress: false");
 		expect(d.concurrency?.group).not.toContain("'dev-ci-virtual-integration'");
 		expect(source).toContain("format('dev-ci-dispatch-{0}', github.run_id)");
-		expect(source).not.toMatch(/^\s+queue:/m);
+		expect(source.match(/^\s+queue: max$/gm)).toHaveLength(1);
+		expect(d.concurrency).not.toHaveProperty("queue");
 		expect(source).toContain("Select authoritative terminal-green dev base");
 		expect(source).toContain("bun scripts/ci-virtual-integration.ts --select-base");
 		expect(source).toContain("CI_VI_BASE_SHA: ${{ steps.green-dev.outputs.base_sha }}");
@@ -277,7 +343,8 @@ describe("dev-ci Telegram daemon generation guard topology", () => {
 		expect(verify.run).toContain("pi_natives.linux-x64-modern.node");
 		const upload = namedStep(native, "Upload state-gate native addon(s)");
 		expect(upload.with?.name).toBe("dev-state-gates-native-${{ github.run_id }}");
-		expect(matrix.needs).toEqual(["gjc-state-gates-native"]);
+		expect(native.needs).toEqual(["gjc-state-gates-relevance"]);
+		expect(matrix.needs).toEqual(["gjc-state-gates-relevance", "gjc-state-gates-native"]);
 		const download = namedStep(matrix, "Download state-gate native addon(s)");
 		expect(download.with?.name).toBe("dev-state-gates-native-${{ github.run_id }}");
 		expect(download.with?.path).toBe("packages/natives/native");
@@ -292,13 +359,10 @@ describe("dev-ci Telegram daemon generation guard topology", () => {
 		expect(raw).toBeDefined();
 		expect(raw!.group).toBe("dev-ci-virtual-integration");
 		expect(raw!["cancel-in-progress"]).toBe(false);
-		// Regression for the dev workflow_dispatch zero-step "Virtual integration
-		// validation" terminal-red incident burst (runs 33025650533..33038420275):
-		// the job block previously carried an unsupported `queue: max` key that is
-		// outside GitHub Actions' documented concurrency schema and made every
-		// static workflow gate fail. Concurrency admits only group +
-		// cancel-in-progress; queue depth is platform-controlled.
-		expect(Object.keys(raw!).sort()).toEqual(["cancel-in-progress", "group"]);
+		// queue: max retains up to 100 pending candidates and requires cancellation
+		// to remain disabled; it does not increase concurrent execution.
+		expect(raw!.queue).toBe("max");
+		expect(Object.keys(raw!).sort()).toEqual(["cancel-in-progress", "group", "queue"]);
 	});
 	test("dispatch workflow admission cannot deadlock its virtual integration job", async () => {
 		const source = await Bun.file(".github/workflows/dev-ci.yml").text();

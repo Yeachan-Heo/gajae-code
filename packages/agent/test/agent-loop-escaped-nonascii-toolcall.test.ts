@@ -10,7 +10,7 @@ import type {
 	ManagedAttemptOutcome,
 } from "@gajae-code/agent-core/types";
 import type { AssistantMessage, Message, ToolCall } from "@gajae-code/ai";
-import { createMockModel } from "@gajae-code/ai/providers/mock";
+import { createMockModel, type MockModel } from "@gajae-code/ai/providers/mock";
 import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
 import { captureUnicodeEscapeEvidence, collectUnicodeEscapeEvidence } from "@gajae-code/ai/utils/json-parse";
 import * as logger from "@gajae-code/utils/logger";
@@ -153,7 +153,97 @@ function thinkingToolTurn(id: string, escaped = false) {
 	};
 }
 
+/** Only for unpublished recovery: this provider exposes no content before its terminal response. */
+function terminalOnlyStream(stream: MockModel["stream"]): MockModel["stream"] {
+	return (model, context, options) => {
+		const upstream = stream(model, context, options);
+		const terminal = new AssistantMessageEventStream();
+		void (async () => {
+			for await (const event of upstream) {
+				if (event.type === "done" || event.type === "error") terminal.push(event);
+			}
+			terminal.end();
+		})().catch(error => terminal.fail(error));
+		return terminal;
+	};
+}
+
 describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
+	it.each([
+		["reasoning and clean tool", true, false, false],
+		["tool only", false, false, false],
+		["reasoning and rejected tool", true, true, false],
+		["reasoning and callback abort", true, false, true],
+	] as const)("publishes %s callbacks before done without premature execution", async (_label, reasoning, escaped, abort) => {
+		const executed: Array<Record<string, unknown>> = [];
+		const turn = reasoning ? thinkingToolTurn("tc-streamed", escaped) : literalTurn("tc-streamed");
+		const mock = createMockModel({ responses: [turn, { content: ["done"] }] });
+		const controller = new AbortController();
+		let terminalSent = false;
+		const callbacksBeforeDone: string[] = [];
+		const executionsBeforeDone: number[] = [];
+		const streamFn: typeof mock.stream = (model, context, options) => {
+			const upstream = mock.stream(model, context, options);
+			const live = new AssistantMessageEventStream();
+			void (async () => {
+				for await (const event of upstream) {
+					if (event.type === "done" || event.type === "error") {
+						// Give the consumer a turn while the provider has not yet completed.
+						await Bun.sleep(0);
+						if (!terminalSent) executionsBeforeDone.push(executed.length);
+						terminalSent = true;
+					}
+					live.push(event);
+				}
+				live.end();
+			})().catch(error => live.fail(error));
+			return live;
+		};
+		const events: AgentEvent[] = [];
+		const stream = agentLoop(
+			[createUserMessage("ask me")],
+			{ systemPrompt: [""], messages: [], tools: [askTool(executed)] },
+			{
+				model: mock.model,
+				convertToLlm: identityConverter,
+				onAssistantMessageEvent: (_message, event) => {
+					if (!terminalSent) {
+						callbacksBeforeDone.push(event.type);
+						executionsBeforeDone.push(executed.length);
+					}
+					if (abort && event.type === "toolcall_end") controller.abort();
+				},
+			},
+			controller.signal,
+			streamFn,
+		);
+		for await (const event of stream) events.push(event);
+		expect(callbacksBeforeDone).toEqual([
+			...(reasoning ? ["thinking_start", "thinking_delta", "thinking_end"] : []),
+			"toolcall_start",
+			"toolcall_delta",
+			"toolcall_end",
+		]);
+		expect(executionsBeforeDone.every(count => count === 0)).toBe(true);
+		expect(executed).toEqual(escaped || abort ? [] : [{ question: QUESTION }]);
+		const toolEnds = events.filter(
+			(event): event is Extract<AgentEvent, { type: "tool_execution_end" }> => event.type === "tool_execution_end",
+		);
+		expect(toolEnds.map(event => [event.toolCallId, event.isError])).toEqual([["tc-streamed", escaped || abort]]);
+		if (escaped) {
+			const first = toolEnds[0]?.result.content[0];
+			expect(first?.type === "text" ? first.text : "").toContain("\\uXXXX");
+		}
+		if (abort) {
+			expect(mock.calls).toHaveLength(1);
+			const terminal = events.findLast(event => event.type === "message_end" && event.message.role === "assistant");
+			expect(
+				terminal?.type === "message_end" && terminal.message.role === "assistant"
+					? terminal.message.stopReason
+					: undefined,
+			).toBe("aborted");
+		}
+	});
 	it("executes canonical valid escapes without a resample, including mutating tools", async () => {
 		const executed: Array<Record<string, unknown>> = [];
 		const call: ToolCall = {
@@ -210,7 +300,7 @@ describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
 				context,
 				{ model: mock.model, convertToLlm: identityConverter },
 				undefined,
-				mock.stream,
+				terminalOnlyStream(mock.stream),
 			);
 			for await (const _event of stream) {
 				// drain
@@ -352,7 +442,7 @@ describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
 				context,
 				{ model: mock.model, convertToLlm: identityConverter },
 				undefined,
-				mock.stream,
+				terminalOnlyStream(mock.stream),
 			);
 			for await (const _event of stream) {
 				// drain
@@ -368,17 +458,26 @@ describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
 		}
 	});
 
-	it("resamples the turn instead of executing or reporting escaped arguments", async () => {
+	it("silently resamples unpublished reasoning and escaped arguments without replaying the discarded turn", async () => {
 		const executed: Array<Record<string, unknown>> = [];
 		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [askTool(executed)] };
 		const mock = createMockModel({
-			responses: [escapedTurn("tc-1"), literalTurn("tc-2"), { content: ["done"] }],
+			responses: [thinkingToolTurn("tc-1", true), literalTurn("tc-2"), { content: ["done"] }],
 		});
 		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter };
 
 		const toolResults: Array<{ isError?: boolean; text: string }> = [];
-		const stream = agentLoop([createUserMessage("ask me")], context, config, undefined, mock.stream);
+		const publishedAssistants: AssistantMessage[] = [];
+		const stream = agentLoop(
+			[createUserMessage("ask me")],
+			context,
+			config,
+			undefined,
+			terminalOnlyStream(mock.stream),
+		);
 		for await (const event of stream) {
+			if (event.type === "message_end" && event.message.role === "assistant")
+				publishedAssistants.push(event.message);
 			if (event.type === "tool_execution_end") {
 				const first = event.result.content?.[0];
 				toolResults.push({ isError: event.isError, text: first?.type === "text" ? first.text : "" });
@@ -393,6 +492,15 @@ describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
 		const resampleRequest = mock.model.calls[1];
 		expect(resampleRequest).toBeDefined();
 		expect(resampleRequest.context.messages.some(message => message.role === "assistant")).toBe(false);
+		expect(publishedAssistants).toHaveLength(2);
+		expect(publishedAssistants.some(message => message.content.some(block => block.type === "thinking"))).toBe(false);
+		expect(
+			context.messages.some(
+				message =>
+					message.role === "assistant" &&
+					message.content.some(block => block.type === "toolCall" && block.id === "tc-1"),
+			),
+		).toBe(false);
 	});
 
 	it("steers the resample with a transient synthetic instruction and keeps tools enabled", async () => {
@@ -403,7 +511,13 @@ describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
 		});
 		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter };
 
-		const stream = agentLoop([createUserMessage("ask me")], context, config, undefined, mock.stream);
+		const stream = agentLoop(
+			[createUserMessage("ask me")],
+			context,
+			config,
+			undefined,
+			terminalOnlyStream(mock.stream),
+		);
 		for await (const _event of stream) {
 			// drain
 		}
@@ -445,7 +559,7 @@ describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
 		).toHaveLength(0);
 	});
 
-	it("publishes and stores only the accepted assistant lifecycle", async () => {
+	it("publishes and stores rejected streamed turns with paired errors before a clean turn", async () => {
 		const executed: Array<Record<string, unknown>> = [];
 		const mock = createMockModel({
 			responses: [escapedTurn("tc-defective"), literalTurn("tc-accepted"), { content: ["done"] }],
@@ -469,29 +583,37 @@ describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
 			(event): event is Extract<AgentEvent, { type: "message_end" }> =>
 				event.type === "message_end" && event.message.role === "assistant",
 		);
-		expect(assistantEnds).toHaveLength(2);
+		expect(assistantEnds).toHaveLength(3);
 		expect(
 			assistantEnds.some(event =>
 				event.message.role === "assistant"
 					? event.message.content.some(block => block.type === "toolCall" && block.id === "tc-defective")
 					: false,
 			),
-		).toBe(false);
+		).toBe(true);
 		expect(
 			agent.state.messages.some(
 				message =>
 					message.role === "assistant" &&
 					message.content.some(block => block.type === "toolCall" && block.id === "tc-defective"),
 			),
-		).toBe(false);
+		).toBe(true);
 		expect(events.filter(event => event.type === "turn_start")).toHaveLength(3);
-		expect(events.filter(event => event.type === "turn_end")).toHaveLength(2);
+		expect(events.filter(event => event.type === "turn_end")).toHaveLength(3);
+		expect(executed).toEqual([{ question: QUESTION }]);
+		const toolEnds = events.filter(
+			(event): event is Extract<AgentEvent, { type: "tool_execution_end" }> => event.type === "tool_execution_end",
+		);
+		expect(toolEnds.map(event => [event.toolCallId, event.isError])).toEqual([
+			["tc-defective", true],
+			["tc-accepted", false],
+		]);
 	});
 
 	it("preserves provider-native thinking and usage metadata through accepted Agent state and replay", async () => {
 		const executed: Array<Record<string, unknown>> = [];
 		const mock = createMockModel({
-			responses: [thinkingToolTurn("tc-defective", true), thinkingToolTurn("tc-accepted"), { content: ["done"] }],
+			responses: [thinkingToolTurn("tc-accepted"), { content: ["done"] }],
 		});
 		const agent = new Agent({
 			initialState: { systemPrompt: [""], model: mock.model, tools: [askTool(executed)], messages: [] },
@@ -508,6 +630,7 @@ describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
 		);
 		expect(accepted).toBeDefined();
 		expect(accepted?.content[0]).toEqual(thinkingToolTurn("unused").content[0]);
+		expect(accepted?.content[1]).toEqual(thinkingToolTurn("tc-accepted").content[1]);
 		expect(accepted?.usage).toEqual(PROVIDER_USAGE);
 		expect(accepted?.responseId).toBe("provider-response-id");
 		expect(accepted?.disabledFeatures).toEqual(["priority"]);
@@ -516,14 +639,8 @@ describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
 			provider: "mock",
 			items: [{ id: "native-item" }],
 		});
-		expect(
-			agent.state.messages.some(
-				message =>
-					message.role === "assistant" &&
-					message.content.some(block => block.type === "toolCall" && block.id === "tc-defective"),
-			),
-		).toBe(false);
-		const replayed = mock.calls[2]?.context.messages.find(
+		expect(executed).toEqual([{ question: QUESTION }]);
+		const replayed = mock.calls[1]?.context.messages.find(
 			(message): message is AssistantMessage =>
 				message.role === "assistant" &&
 				message.content.some(block => block.type === "toolCall" && block.id === "tc-accepted"),
@@ -559,7 +676,13 @@ describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
 		const mock = createMockModel({ responses: [escapedTurn("tc-1"), literalTurn("tc-2"), { content: ["done"] }] });
 		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter };
 
-		const stream = agentLoop([createUserMessage("ask me")], context, config, undefined, mock.stream);
+		const stream = agentLoop(
+			[createUserMessage("ask me")],
+			context,
+			config,
+			undefined,
+			terminalOnlyStream(mock.stream),
+		);
 		for await (const _event of stream) {
 			// drain
 		}
@@ -669,8 +792,17 @@ describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
 
 		expect(executed).toEqual([{ question: QUESTION }]);
 		expect(toolEvents.map(event => ("toolCallId" in event ? event.toolCallId : undefined))).toEqual([
+			"tc-clean-never",
+			"tc-clean-never",
+			"tc-escaped",
+			"tc-escaped",
 			"tc-retry",
 			"tc-retry",
+		]);
+		expect(toolEvents.filter(event => event.type === "tool_execution_end").map(event => event.isError)).toEqual([
+			true,
+			true,
+			false,
 		]);
 	});
 
@@ -722,7 +854,13 @@ describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
 		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter };
 		const toolEnds: AgentEvent[] = [];
 
-		const stream = agentLoop([createUserMessage("ask me")], context, config, undefined, mock.stream);
+		const stream = agentLoop(
+			[createUserMessage("ask me")],
+			context,
+			config,
+			undefined,
+			terminalOnlyStream(mock.stream),
+		);
 		for await (const event of stream) if (event.type === "tool_execution_end") toolEnds.push(event);
 
 		expect(mock.calls).toHaveLength(4);
@@ -747,7 +885,13 @@ describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
 		});
 		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter };
 
-		const stream = agentLoop([createUserMessage("ask twice")], context, config, undefined, mock.stream);
+		const stream = agentLoop(
+			[createUserMessage("ask twice")],
+			context,
+			config,
+			undefined,
+			terminalOnlyStream(mock.stream),
+		);
 		for await (const _event of stream) {
 			// drain
 		}
@@ -773,7 +917,13 @@ describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
 			},
 		};
 
-		const stream = agentLoop([createUserMessage("ask me")], context, config, undefined, mock.stream);
+		const stream = agentLoop(
+			[createUserMessage("ask me")],
+			context,
+			config,
+			undefined,
+			terminalOnlyStream(mock.stream),
+		);
 		for await (const _event of stream) {
 			// drain
 		}
@@ -1074,7 +1224,13 @@ describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
 		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter };
 
 		const toolResults: Array<{ isError?: boolean; text: string }> = [];
-		const stream = agentLoop([createUserMessage("ask me")], context, config, undefined, mock.stream);
+		const stream = agentLoop(
+			[createUserMessage("ask me")],
+			context,
+			config,
+			undefined,
+			terminalOnlyStream(mock.stream),
+		);
 		for await (const event of stream) {
 			if (event.type === "tool_execution_end") {
 				const first = event.result.content?.[0];
@@ -1401,7 +1557,13 @@ describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
 		});
 		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter };
 
-		const stream = agentLoop([createUserMessage("ask me")], context, config, undefined, mock.stream);
+		const stream = agentLoop(
+			[createUserMessage("ask me")],
+			context,
+			config,
+			undefined,
+			terminalOnlyStream(mock.stream),
+		);
 		for await (const _event of stream) {
 			// drain
 		}
@@ -1478,7 +1640,7 @@ describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
 	it.each([
 		["U+00B7 one-nibble ASCII landing", String.raw`{"question":"\u0077"}`, "w"],
 		["U+2026 one-nibble ASCII landing", String.raw`{"question":"\u0026"}`, "&"],
-	])("rejects %s after the full resample budget", async (_label, rawArguments, decodedQuestion) => {
+	])("rejects each published %s turn without executing", async (_label, rawArguments, decodedQuestion) => {
 		const executed: Array<Record<string, unknown>> = [];
 		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [displaySafeAskTool(executed)] };
 		const turn = (id: string) => ({
@@ -1513,9 +1675,13 @@ describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
 
 		expect(mock.calls).toHaveLength(4);
 		expect(executed).toHaveLength(0);
-		expect(toolResults).toHaveLength(1);
-		expect(toolResults[0]).toMatchObject({ isError: true });
+		expect(toolResults).toHaveLength(3);
+		expect(toolResults.map(result => result.isError)).toEqual([true, true, true]);
 		expect(toolResults[0].text).toContain("\\uXXXX");
+		expect(toolResults[1].text).toContain("\\uXXXX");
+		expect(toolResults[2].text).toBe(
+			"Tool execution failed due to an error: Tool calls are disabled during repeated malformed tool-call recovery.",
+		);
 	});
 
 	it("allows exact U+2014 evidence at duplicate nested array/object display positions", async () => {
@@ -1902,9 +2068,13 @@ describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
 		}
 
 		expect(executed).toHaveLength(0);
-		expect(toolResults).toHaveLength(1);
-		expect(toolResults[0].isError).toBe(true);
+		expect(toolResults).toHaveLength(3);
+		expect(toolResults.map(result => result.isError)).toEqual([true, true, true]);
 		expect(toolResults[0].text).toContain("\\uXXXX");
+		expect(toolResults[1].text).toContain("\\uXXXX");
+		expect(toolResults[2].text).toBe(
+			"Tool execution failed due to an error: Tool calls are disabled during repeated malformed tool-call recovery.",
+		);
 	});
 
 	it("never executes the same em-dash payload when the tool is not display-safe", async () => {
@@ -1929,11 +2099,15 @@ describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
 			}
 		}
 
-		// Mutating tools stay fail-closed: budget spent, then terminal rejection.
+		// Mutating tools stay fail-closed: every published turn receives a terminal rejection.
 		expect(executed).toHaveLength(0);
-		expect(toolResults).toHaveLength(1);
-		expect(toolResults[0].isError).toBe(true);
+		expect(toolResults).toHaveLength(3);
+		expect(toolResults.map(result => result.isError)).toEqual([true, true, true]);
 		expect(toolResults[0].text).toContain("\\uXXXX");
+		expect(toolResults[1].text).toContain("\\uXXXX");
+		expect(toolResults[2].text).toBe(
+			"Tool execution failed due to an error: Tool calls are disabled during repeated malformed tool-call recovery.",
+		);
 	});
 
 	it("rejects an uncorroborated symbol escape even on a display-safe tool", async () => {
@@ -1969,9 +2143,13 @@ describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
 		// Without corroborating raw evidence even display-field text keeps the
 		// fail-closed rejection — the decode can never be verified.
 		expect(executed).toHaveLength(0);
-		expect(toolResults).toHaveLength(1);
-		expect(toolResults[0].isError).toBe(true);
+		expect(toolResults).toHaveLength(3);
+		expect(toolResults.map(result => result.isError)).toEqual([true, true, true]);
 		expect(toolResults[0].text).toContain("\\uXXXX");
+		expect(toolResults[1].text).toContain("\\uXXXX");
+		expect(toolResults[2].text).toBe(
+			"Tool execution failed due to an error: Tool calls are disabled during repeated malformed tool-call recovery.",
+		);
 	});
 
 	it("rejects uncorroborated currency, math, full-width, separator, letter, and emoji escapes on a display-safe tool", async () => {
@@ -2012,9 +2190,13 @@ describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
 			}
 
 			expect(executed).toHaveLength(0);
-			expect(toolResults).toHaveLength(1);
-			expect(toolResults[0].isError).toBe(true);
+			expect(toolResults).toHaveLength(3);
+			expect(toolResults.map(result => result.isError)).toEqual([true, true, true]);
 			expect(toolResults[0].text).toContain("\\uXXXX");
+			expect(toolResults[1].text).toContain("\\uXXXX");
+			expect(toolResults[2].text).toBe(
+				"Tool execution failed due to an error: Tool calls are disabled during repeated malformed tool-call recovery.",
+			);
 			expect(label).toBeTruthy();
 		}
 	});
