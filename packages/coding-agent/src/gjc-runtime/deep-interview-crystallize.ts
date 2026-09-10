@@ -607,6 +607,13 @@ function isUnsafeConfirmedStatement(profile: CrystalSemanticProfile): boolean {
 	);
 }
 
+/** A binary reply has no requirement context of its own and cannot anchor a Crystal item. */
+function isContextFreeAffirmative(value: string): boolean {
+	return /^(?:yes|yep|yeah|yup|sure|okay|ok|affirmative|true|correct|agreed|네|예|맞아|맞습니다|是|对|對|はい|ええ)[.!。！？]?$/iu.test(
+		value.trim(),
+	);
+}
+
 export function crystalSnapshotDigest(
 	snapshot: Pick<CrystalSnapshot, "revision" | "start" | "end" | "messages">,
 ): string {
@@ -720,6 +727,8 @@ function validateItems(value: unknown, snapshot?: CrystalSnapshot): CrystalItem[
 					!hasVerbatimTokenBoundaries(anchorMessage.content, item.anchor.quote) ||
 					hasLaterSupersedingCorrection(anchorMessage.content, item.anchor.quote, item.statement) ||
 					quoteTerms.size === 0 ||
+					isContextFreeAffirmative(item.statement) ||
+					isContextFreeAffirmative(item.anchor.quote) ||
 					statementTerms.size === 0 ||
 					[...statementTerms].some(term => !quoteTerms.has(term)) ||
 					[...quoteTerms].some(term => !statementTerms.has(term)) ||
