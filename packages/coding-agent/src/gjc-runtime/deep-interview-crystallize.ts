@@ -496,7 +496,7 @@ function semanticProfile(value: string): CrystalSemanticProfile {
 		/\b(?:maybe|perhaps|possibly|probably|might|could|would|likely|unlikely|seems?|apparently|approximately|around|roughly|tentative(?:ly)?|prefer(?:ably)?|i\s+think|i\s+guess|i\s+believe|believe(?:s|d)?)\b/i.test(
 			normalized,
 		) ||
-		(!deonticPermission && /\bmay\b/i.test(normalized)) ||
+		(!deonticPermission && /\b(?:may|can)\b/i.test(normalized)) ||
 		/(?:아마|어쩌면|가능성|수도|것\s+같|같습니다|추정|대략|たぶん|おそらく|かもしれ|可能性|と思|思われ|だろう|でしょう|也许|也許|可能|或许|大概|似乎|大約|估计|估計|据说|據說)/u.test(
 			normalized,
 		);
@@ -1574,6 +1574,37 @@ export function crystallizeDeepInterview(value: unknown): DeepInterviewCrystal {
 			["remove", "removes", "removed"],
 		],
 	];
+	for (const item of confirmedItems) {
+		const internalConflict = opposingActions.some(([positiveTerms, negativeTerms]) => {
+			const actions = item.statement.split(/\b(?:but|however|and)\b|[;,]/i).flatMap(fragment => {
+				const normalized = fragment.normalize("NFC").toLowerCase();
+				const contains = (term: string) =>
+					new RegExp(`(?:^|[^\\p{L}\\p{N}_])${term}(?:$|[^\\p{L}\\p{N}_])`, "u").test(normalized);
+				const positive = positiveTerms.some(contains);
+				const negative = negativeTerms.some(contains);
+				if (positive === negative) return [];
+				return [
+					{
+						sign: positive ? 1 : -1,
+						subject: new Set(
+							[...topicTerms(fragment, false)].filter(
+								term => !positiveTerms.includes(term) && !negativeTerms.includes(term),
+							),
+						),
+					},
+				];
+			});
+			return actions.some((left, index) =>
+				actions.slice(index + 1).some(right => {
+					if (left.sign === right.sign) return false;
+					const shared = [...left.subject].filter(term => right.subject.has(term));
+					const smaller = left.subject.size <= right.subject.size ? left.subject : right.subject;
+					return shared.length > 0 && [...smaller].every(term => shared.includes(term));
+				}),
+			);
+		});
+		if (internalConflict) throw new Error(`contradictory confirmed item requires an explicit conflict: ${item.id}`);
+	}
 	for (let leftIndex = 0; leftIndex < confirmedItems.length; leftIndex++) {
 		const left = confirmedItems[leftIndex]!;
 		const leftTerms = topicTerms(left.statement, false);

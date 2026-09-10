@@ -2963,6 +2963,7 @@ describe("AskTool deep-interview recorder persistence", () => {
 				{ label: "Continue research with autoresearch (research continuation, not execution)" },
 				{ label: "Refine further" },
 			],
+			recommended: 0,
 			workflowGate: { stage: "deep-interview", kind: "execution" } as const,
 		};
 		const local = await new AskTool(
@@ -3355,6 +3356,7 @@ describe("AskTool deep-interview recorder persistence", () => {
 							{ label: "Approve execution via ultragoal" },
 							{ label: "Stop here" },
 						],
+						recommended: 1,
 						workflowGate: { stage: "ralplan", kind: "approval" },
 					},
 				],

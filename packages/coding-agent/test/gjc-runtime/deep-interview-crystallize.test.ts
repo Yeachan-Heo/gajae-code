@@ -240,6 +240,39 @@ describe("deep-interview crystallize contract", () => {
 		expect(crystallizeDeepInterview(singleGoalEvidence("Administrators may approve deployment.")).lifecycle).toBe(
 			"ready",
 		);
+		expect(() => crystallizeDeepInterview(singleGoalEvidence("The deployment can fail."))).toThrow(
+			"conservative derivation failed",
+		);
+		expect(crystallizeDeepInterview(singleGoalEvidence("Reviewers can submit reports.")).lifecycle).toBe("ready");
+	});
+
+	it("rejects opposing actions inside one confirmed item", () => {
+		const content = "Require audit logs and forbid audit logs.";
+		const snapshot: CrystalSnapshot = {
+			revision: 1,
+			start: 0,
+			end: 0,
+			messages: [{ index: 0, role: "user", content }],
+			digest: "",
+		};
+		snapshot.digest = crystalSnapshotDigest(snapshot);
+		expect(() =>
+			crystallizeDeepInterview(
+				input({
+					snapshot,
+					current_revision: 1,
+					items: [
+						{
+							id: "constraint:self-conflict",
+							kind: "constraint",
+							classification: "confirmed",
+							statement: content,
+							anchor: { message_index: 0, quote: content },
+						},
+					],
+				}),
+			),
+		).toThrow("contradictory confirmed item");
 	});
 
 	it("rejects multiline or Markdown-bearing item identifiers", () => {

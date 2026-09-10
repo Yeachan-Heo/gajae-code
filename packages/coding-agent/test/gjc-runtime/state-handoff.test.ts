@@ -1541,7 +1541,7 @@ describe("gjc state handoff", () => {
 		});
 	});
 
-	it("demotes a non-interview caller without creating runtime mode-state when callee is a runtime skill", async () => {
+	it("rejects Ralplan final handoff to a runtime skill", async () => {
 		await withTempCwd(async cwd => {
 			await writeJson(modeStatePath(cwd, TEST_SESSION_ID, "ralplan"), {
 				skill: "ralplan",
@@ -1553,23 +1553,9 @@ describe("gjc state handoff", () => {
 				["handoff", "--mode", "ralplan", "--to", "made-up-skill", "--json"],
 				cwd,
 			);
-			expect(result.status).toBe(0);
-			const payload = parseRequiredJson(result.stdout, "runtime-callee handoff stdout");
-			expect(payload.from).toBe("ralplan");
-			expect(payload.to).toBe("made-up-skill");
-
-			const caller = await readJson(modeStatePath(cwd, TEST_SESSION_ID, "ralplan"));
-			expect(caller?.active).toBe(false);
-			expect(caller?.current_phase).toBe("handoff");
-			expect(caller?.handoff_to).toBe("made-up-skill");
+			expect(result.status).toBe(2);
+			expect(result.stderr).toContain("admitted ultragoal target");
 			await expect(fs.access(modeStatePath(cwd, TEST_SESSION_ID, "made-up-skill"))).rejects.toThrow();
-
-			const activeState = await readJson(activeSnapshotPath(cwd, TEST_SESSION_ID));
-			const activeSkills = (activeState?.active_skills as Array<Record<string, unknown>>) ?? [];
-			expect(activeSkills.find(e => e.skill === "made-up-skill")).toBeUndefined();
-			const callerEntry = activeSkills.find(e => e.skill === "ralplan");
-			expect(callerEntry?.active).not.toBe(true);
-			if (callerEntry) expect(callerEntry.handoff_to).toBe("made-up-skill");
 		});
 	});
 

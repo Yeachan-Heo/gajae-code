@@ -2087,18 +2087,72 @@ async function assertExecutionApprovalTranscriptEvidence(
 			record.transcript_sha256
 	)
 		throw new StateCommandError(2, "deep-interview execution approval transcript prefix changed");
-	const suffix = transcriptBytes.subarray(record.transcript_prefix_bytes).toString("utf8");
-	let durableAnswer = false;
-	for (const line of suffix.split(/\r?\n/)) {
+	const persistedEntries: Record<string, unknown>[] = [];
+	const entryPatches = new Map<string, Record<string, unknown>>();
+	const entryOffsets = new WeakMap<Record<string, unknown>, number>();
+	let transcriptOffset = 0;
+	for (const rawLine of transcriptText.match(/[^\n]*(?:\n|$)/g) ?? []) {
+		const lineOffset = transcriptOffset;
+		transcriptOffset += Buffer.byteLength(rawLine);
+		const line = rawLine.replace(/\r?\n$/u, "");
 		if (!line.trim()) continue;
 		let entry: unknown;
 		try {
 			entry = JSON.parse(line);
 		} catch {
-			throw new StateCommandError(2, "deep-interview execution approval transcript suffix is malformed");
+			throw new StateCommandError(2, "deep-interview execution approval transcript is malformed");
 		}
-		if (!isPlainObject(entry) || entry.type !== "message" || !isPlainObject(entry.message)) continue;
+		if (!isPlainObject(entry))
+			throw new StateCommandError(2, "deep-interview execution approval transcript is malformed");
+		if (entry.type === "entry_patch") {
+			if (typeof entry.entryId !== "string" || !isPlainObject(entry.patch))
+				throw new StateCommandError(2, "deep-interview execution approval transcript patch is malformed");
+			entryPatches.set(entry.entryId, entry.patch);
+		} else if (entry.type !== "header_patch" && entry.type !== "session") {
+			persistedEntries.push(entry);
+			entryOffsets.set(entry, lineOffset);
+		}
+	}
+	for (const entry of persistedEntries) {
+		if (typeof entry.id !== "string") continue;
+		const patch = entryPatches.get(entry.id);
+		if (patch?.message !== undefined) entry.message = patch.message;
+	}
+	let activeEntries = persistedEntries;
+	if (persistedEntries.some(entry => "id" in entry || "parentId" in entry)) {
+		const byId = new Map<string, Record<string, unknown>>();
+		for (const entry of persistedEntries) {
+			if (
+				typeof entry.id !== "string" ||
+				!("parentId" in entry) ||
+				(entry.parentId !== null && typeof entry.parentId !== "string") ||
+				byId.has(entry.id)
+			)
+				throw new StateCommandError(2, "deep-interview execution approval transcript branch is malformed");
+			byId.set(entry.id, entry);
+		}
+		const branch: Record<string, unknown>[] = [];
+		const visited = new Set<string>();
+		let current = persistedEntries.at(-1);
+		while (current) {
+			const id = current.id as string;
+			if (visited.has(id))
+				throw new StateCommandError(2, "deep-interview execution approval transcript branch has a cycle");
+			visited.add(id);
+			branch.push(current);
+			if (current.parentId === null) break;
+			current = byId.get(current.parentId as string);
+			if (!current)
+				throw new StateCommandError(2, "deep-interview execution approval transcript branch is incomplete");
+		}
+		activeEntries = branch.reverse();
+	}
+	let durableAnswer = false;
+	for (const entry of activeEntries) {
+		if (entry.type !== "message" || !isPlainObject(entry.message)) continue;
 		const message = entry.message;
+		const serializedOffset = entryOffsets.get(entry) ?? -1;
+		if (serializedOffset < record.transcript_prefix_bytes) continue;
 		if (durableAnswer && (message.role === "user" || (message.role === "toolResult" && message.toolName === "ask")))
 			throw new StateCommandError(2, "deep-interview execution approval was superseded by a later user decision");
 		if (message.role !== "toolResult" || message.toolName !== "ask" || message.toolCallId !== record.tool_call_id)
@@ -3623,6 +3677,12 @@ async function handleHandoffUnlocked(
 		if (integrityWarning)
 			throw new StateCommandError(2, `${integrityWarning}; execution handoff refuses tampered mode-state`);
 	}
+	if (
+		caller === "ralplan" &&
+		(existingCaller.current_phase === "final" || existingCaller.current_phase === "handoff") &&
+		callee !== "ultragoal"
+	)
+		throw new StateCommandError(2, "Ralplan final may hand off only through its admitted ultragoal target");
 	if (caller === "ralplan" && (await hasDurableRalplanPlanningStuck(cwd, sessionId, existingCaller)))
 		throw new StateCommandError(2, "planning-stuck Ralplan is terminal and cannot hand off");
 	let ralplanExecutionFinal: VerifiedRalplanFinalEvidence | undefined;

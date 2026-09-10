@@ -107,44 +107,6 @@ async function readModeState(cwd: string, skill: string, sessionId?: string): Pr
 		throw err;
 	}
 }
-async function readActiveEntry(
-	cwd: string,
-	skill: string,
-	sessionId?: string,
-): Promise<Record<string, unknown> | null> {
-	try {
-		const raw = await fs.readFile(
-			path.join(stateBaseDir(cwd, sessionId), "active", `${encodeSessionSegment(skill)}.json`),
-			"utf-8",
-		);
-		return JSON.parse(raw) as Record<string, unknown>;
-	} catch (err) {
-		const e = err as NodeJS.ErrnoException;
-		if (e.code === "ENOENT") return null;
-		throw err;
-	}
-}
-async function writeActiveEntry(
-	cwd: string,
-	skill: string,
-	entry: Record<string, unknown>,
-	sessionId?: string,
-): Promise<void> {
-	const filePath = path.join(stateBaseDir(cwd, sessionId), "active", `${encodeSessionSegment(skill)}.json`);
-	await fs.mkdir(path.dirname(filePath), { recursive: true });
-	await fs.writeFile(
-		filePath,
-		JSON.stringify(
-			{
-				skill,
-				...(sessionId ? { session_id: sessionId } : {}),
-				...entry,
-			},
-			null,
-			2,
-		),
-	);
-}
 
 function createTestModel(id: string): Model {
 	return {
@@ -588,10 +550,9 @@ describe("SkillTool", () => {
 		expect(rp?.active).toBe(true);
 		expect(rp?.handoff_from).toBe("deep-interview");
 	});
-	it("chains from a native workflow skill into a runtime skill and demotes the caller", async () => {
+	it("rejects final native workflow chaining into an unadmitted runtime skill", async () => {
 		const cwd = await makeTempCwd();
 		await writeCallerModeState(cwd, "ralplan", "handoff", "s1");
-		await writeActiveEntry(cwd, "ralplan", { active: true, phase: "handoff" }, "s1");
 		const ralplan = await makeSkill("ralplan", "---\nname: ralplan\n---\nPlan");
 		const runtimeSkill = await makeSkill("project-executor", "---\nname: project-executor\n---\nRun");
 		const captured: CapturedSend[] = [];
@@ -599,21 +560,13 @@ describe("SkillTool", () => {
 			getActiveSkillState: () => ({ skill: "ralplan", session_id: "s1" }),
 			getActiveSkillPhase: () => "handoff",
 		});
-		const tool = SkillTool.createIf(session)!;
-
-		await tool.execute("call-1", { name: "project-executor" });
-
-		const rp = await readModeState(cwd, "ralplan", "s1");
-		expect(rp?.active).toBe(false);
-		expect(rp?.current_phase).toBe("handoff");
-		expect(rp?.handoff_to).toBe("project-executor");
-		expect(await readActiveEntry(cwd, "ralplan", "s1")).toBeNull();
-		expect(await readModeState(cwd, "project-executor", "s1")).toBeNull();
-		expect(await readActiveEntry(cwd, "project-executor", "s1")).toBeNull();
-		expect(captured).toHaveLength(1);
+		await expect(SkillTool.createIf(session)!.execute("call-1", { name: "project-executor" })).rejects.toThrow(
+			"admitted ultragoal target",
+		);
+		expect(captured).toHaveLength(0);
 	});
 
-	it("supports R->U handoff (ralplan in handoff phase chains to ultragoal)", async () => {
+	it("rejects unverified R->U handoff from a bare handoff phase", async () => {
 		const cwd = await makeTempCwd();
 		await writeCallerModeState(cwd, "ralplan", "handoff", "s1");
 		const ralplan = await makeSkill("ralplan", "---\nname: ralplan\n---\nPlan");
@@ -623,15 +576,10 @@ describe("SkillTool", () => {
 			getActiveSkillState: () => ({ skill: "ralplan", session_id: "s1" }),
 			getActiveSkillPhase: () => "handoff",
 		});
-		const tool = SkillTool.createIf(session)!;
-
-		await tool.execute("call-1", { name: "ultragoal" });
-		const rp = await readModeState(cwd, "ralplan", "s1");
-		expect(rp?.active).toBe(false);
-		expect(rp?.handoff_to).toBe("ultragoal");
-		const ug = await readModeState(cwd, "ultragoal", "s1");
-		expect(ug?.active).toBe(true);
-		expect(ug?.handoff_from).toBe("ralplan");
+		await expect(SkillTool.createIf(session)!.execute("call-1", { name: "ultragoal" })).rejects.toThrow(
+			"verified final plan evidence",
+		);
+		expect(captured).toHaveLength(0);
 	});
 
 	it("keeps explicit default model selection stable across workflow handoffs", async () => {
@@ -646,7 +594,7 @@ describe("SkillTool", () => {
 		settings.setModelRole("default", `${explicitModel.provider}/${explicitModel.id}`);
 		settings.setModelRole("plan", `${staleDefaultModel.provider}/${staleDefaultModel.id}`);
 
-		let activeSkill = "deep-interview";
+		const activeSkill = "deep-interview";
 		const captured: CapturedSend[] = [];
 		const session = createSession(cwd, [deepInterview, ralplan, ultragoal], captured, {
 			settings,
@@ -658,19 +606,13 @@ describe("SkillTool", () => {
 		const tool = SkillTool.createIf(session)!;
 
 		await tool.execute("call-1", { name: "ralplan" });
-		activeSkill = "ralplan";
-		await writeCallerModeState(cwd, "ralplan", "handoff", "s1");
-		await tool.execute("call-2", { name: "ultragoal" });
 
 		expect(session.model).toBe(explicitModel);
 		expect(session.getActiveModelString?.()).toBe("openai-codex/gpt-5.5");
 		expect(settings.getModelRole("default")).toBe("openai-codex/gpt-5.5");
 		expect(settings.getModelRole("plan")).toBe("openai-codex/gpt-5.4");
-		expect(captured).toHaveLength(2);
-		expect(captured.map(item => item.message.details)).toEqual([
-			expect.objectContaining({ name: "ralplan" }),
-			expect.objectContaining({ name: "ultragoal" }),
-		]);
+		expect(captured).toHaveLength(1);
+		expect(captured.map(item => item.message.details)).toEqual([expect.objectContaining({ name: "ralplan" })]);
 	});
 
 	it("supports backward U->R chain (ultragoal in handoff phase chains to ralplan)", async () => {
@@ -755,7 +697,7 @@ describe("SkillTool", () => {
 		});
 	}
 
-	it("allows ralplan (phase=final, manifest terminal) to chain into ultragoal", async () => {
+	it("rejects bare ralplan final without verified admission evidence", async () => {
 		const cwd = await makeTempCwd();
 		await writeCallerModeState(cwd, "ralplan", "final", "s1");
 		const ralplan = await makeSkill("ralplan", "---\nname: ralplan\n---\nPlan");
@@ -765,15 +707,10 @@ describe("SkillTool", () => {
 			getActiveSkillState: () => ({ skill: "ralplan", session_id: "s1" }),
 			getActiveSkillPhase: () => "final",
 		});
-		const tool = SkillTool.createIf(session)!;
-
-		const result = await tool.execute("call-1", { name: "ultragoal" });
-		expect(result.details?.name).toBe("ultragoal");
-		const rp = await readModeState(cwd, "ralplan", "s1");
-		expect(rp?.active).toBe(false);
-		expect(rp?.handoff_to).toBe("ultragoal");
-		const ug = await readModeState(cwd, "ultragoal", "s1");
-		expect(ug?.active).toBe(true);
+		await expect(SkillTool.createIf(session)!.execute("call-1", { name: "ultragoal" })).rejects.toThrow(
+			"verified final plan evidence",
+		);
+		expect(captured).toHaveLength(0);
 	});
 
 	for (const [caller, phase, callee] of [

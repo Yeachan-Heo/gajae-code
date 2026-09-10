@@ -151,8 +151,8 @@ function deepInterviewExecutionTarget(selectedOptions: readonly string[]): "ultr
 }
 
 function exactOptionSet(options: readonly { label: string }[], expected: readonly string[]): boolean {
-	const labels = options.map(option => option.label.trim().replace(/\s*\(Recommended\)\s*$/i, ""));
-	return labels.length === expected.length && expected.every(label => labels.includes(label));
+	const labels = options.map(option => option.label.trim());
+	return labels.length === expected.length && labels.every((label, index) => label === expected[index]);
 }
 
 function isAskTimeoutError(error: unknown): boolean {
@@ -881,10 +881,14 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 					"Execute with ultragoal (only when spec is already implementation-ready and really simple)",
 					"Continue research with autoresearch (research continuation, not execution)",
 					"Refine further",
-				])
+				]) &&
+				q.multi !== true &&
+				q.recommended === 0
 			: normalizedSelection === "Approve execution via ultragoal" &&
 				q.question === "The final plan is ready. Approve execution?" &&
-				exactOptionSet(q.options, ["Refine further", "Approve execution via ultragoal", "Stop here"]);
+				exactOptionSet(q.options, ["Refine further", "Approve execution via ultragoal", "Stop here"]) &&
+				q.multi !== true &&
+				q.recommended === 1;
 		if (!canonicalGate || !toolCallId)
 			throw new ToolAbortError("Execution approval requires the canonical runtime approval gate");
 		if (!sessionId) throw new ToolAbortError("Deep Interview execution approval requires a session");
