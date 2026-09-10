@@ -2135,7 +2135,7 @@ async function assertExecutionApprovalTranscriptEvidence(
 				entry.patch.message !== undefined
 			)
 				target.message = entry.patch.message;
-		} else if (entry.type !== "header_patch") {
+		} else if (entry.type !== "header_patch" && entry.type !== "session") {
 			persistedEntries.push(entry);
 			entryOffsets.set(entry, lineOffset);
 			if (typeof entry.id === "string") replayById.set(entry.id, entry);
