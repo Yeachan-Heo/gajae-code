@@ -4565,45 +4565,51 @@ export class AuthStorage {
 	}
 
 	/**
-	 * Marks the current session's credential as temporarily blocked due to usage limits.
-	 * Uses usage reports to determine accurate reset time when available.
-	 * Returns true if a credential was blocked, enabling automatic fallback to the next credential.
+	 * Marks the explicit stored row, or the session row captured at entry, as usage-limited.
+	 * Re-finds that same row after the usage lookup; a vanished row marks nothing.
+	 * Returns whether another credential of the same type remains unblocked.
 	 */
 	async markUsageLimitReached(
 		provider: string,
 		sessionId: string | undefined,
-		options?: { retryAfterMs?: number; baseUrl?: string; signal?: AbortSignal; owner?: object },
+		options?: { retryAfterMs?: number; baseUrl?: string; signal?: AbortSignal; owner?: object; rowId?: number },
 	): Promise<boolean> {
 		provider = resolveOAuthStorageProvider(provider);
 		const ownerOverride = this.#configOverrideRegistration(provider, options?.owner);
 		if (ownerOverride && !ownerOverride.envSourced) return false;
+		const entries = this.#getStoredCredentials(provider);
 		const sessionCredential = this.#getSessionCredential(provider, sessionId);
-		if (!sessionCredential) return false;
-
-		const providerKey = this.#getProviderTypeKey(provider, sessionCredential.type);
+		const initial =
+			options?.rowId !== undefined
+				? entries.find(entry => entry.id === options.rowId)
+				: sessionCredential
+					? entries[sessionCredential.index]
+					: undefined;
+		if (!initial) return false;
 		const now = Date.now();
 		let blockedUntil = now + (options?.retryAfterMs ?? AuthStorage.#defaultBackoffMs);
 
-		if (sessionCredential.type === "oauth" && this.#rankingStrategyResolver?.(provider)) {
-			const credential = this.#getCredentialsForProvider(provider)[sessionCredential.index];
-			if (credential?.type === "oauth") {
-				const report = await this.#getUsageReport(provider, credential, options);
-				if (report && this.#isUsageLimitReached(report)) {
-					const resetAtMs = this.#getUsageResetAtMs(report, Date.now());
-					if (resetAtMs && resetAtMs > blockedUntil) {
-						blockedUntil = resetAtMs;
-					}
-				}
+		if (initial.credential.type === "oauth" && this.#rankingStrategyResolver?.(provider)) {
+			const report = await this.#getUsageReport(provider, initial.credential, options);
+			if (report && this.#isUsageLimitReached(report)) {
+				const resetAtMs = this.#getUsageResetAtMs(report, Date.now());
+				if (resetAtMs && resetAtMs > blockedUntil) blockedUntil = resetAtMs;
 			}
 		}
 
-		this.#markCredentialBlocked(providerKey, sessionCredential.index, blockedUntil);
+		// Never consult the possibly reassigned sticky pointer after the await.
+		const current = this.#getStoredCredentials(provider);
+		const targetIndex = current.findIndex(entry => entry.id === initial.id);
+		const target = current[targetIndex];
+		if (!target) return false;
+		const providerKey = this.#getProviderTypeKey(provider, target.credential.type);
+		this.#markCredentialBlocked(providerKey, targetIndex, blockedUntil);
 
 		const remainingCredentials = this.#getCredentialsForProvider(provider)
 			.map((credential, index) => ({ credential, index }))
 			.filter(
 				(entry): entry is { credential: AuthCredential; index: number } =>
-					entry.credential.type === sessionCredential.type && entry.index !== sessionCredential.index,
+					entry.credential.type === target.credential.type && entry.index !== targetIndex,
 			);
 
 		return remainingCredentials.some(candidate => !this.#isCredentialBlocked(providerKey, candidate.index));

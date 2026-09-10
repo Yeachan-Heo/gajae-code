@@ -21536,7 +21536,7 @@ export class AgentSession {
 	 * Marks the credential that just failed and reports whether the session
 	 * actually moved to a DIFFERENT stored credential.
 	 *
-	 * Three invariants this enforces, in order:
+	 * Credential mutation invariants:
 	 *
 	 * 1. **Pin guard, first and for every trigger class.** A pinned credential
 	 *    (`--api-key` or `--credential`) must never be mutated or rotated away
@@ -21546,11 +21546,10 @@ export class AgentSession {
 	 *    path invalidated pinned credentials outright.
 	 * 2. **A terminal `forbidden` never mutates credential state.** Rotation
 	 *    would hide an authorization defect and cycle through healthy rows.
-	 * 3. **Distinct-row proof in BOTH branches.** `invalidateCredentialMatching`
-	 *    reports "I matched and blocked a row", which is not the same as "the
-	 *    session now uses a different credential" — with a single-row pool it is
-	 *    true while nothing rotated. Both branches therefore re-resolve and
-	 *    require the active key to have actually changed.
+	 * 3. Auth/account-rejection paths retain their existing key-change proof.
+	 *    Quota/rate-limit paths mark before resolving and require two known,
+	 *    different stored row IDs before reporting rotation. This is mark-time
+	 *    identity, not dispatch-bound attribution across shared sessions.
 	 */
 	async #markFailedCredential(trigger: {
 		class: FallbackTriggerClass;
@@ -21582,6 +21581,18 @@ export class AgentSession {
 		}
 
 		const credentialSessionId = this.credentialSessionId;
+		if (trigger.class === "quota" || trigger.class === "rate_limit") {
+			const before = authStorage.getSessionCredentialRowId(provider, credentialSessionId);
+			const remaining = await authStorage.markUsageLimitReached(provider, credentialSessionId, {
+				retryAfterMs: trigger.retryAfterMs,
+				owner: this.#modelRegistry.getAuthStorageOwner(),
+				...(before === undefined ? {} : { rowId: before }),
+			});
+			await this.#modelRegistry.getApiKey(this.model, credentialSessionId);
+			const after = authStorage.getSessionCredentialRowId(provider, credentialSessionId);
+			if (before !== undefined && after !== undefined && before !== after) return "rotated";
+			return remaining ? "unchanged" : "exhausted";
+		}
 		const activeApiKey = await this.#modelRegistry.getApiKey(this.model, credentialSessionId);
 
 		let remaining: boolean;
@@ -21592,14 +21603,9 @@ export class AgentSession {
 				owner: this.#modelRegistry.getAuthStorageOwner(),
 			});
 			if (!remaining) return "unchanged";
-		} else if (trigger.class === "credential") {
+		} else {
 			if (authStorage.getSessionCredentialType(provider, credentialSessionId) !== "oauth") return "unchanged";
 			remaining = await authStorage.markUsageLimitReached(provider, credentialSessionId, {
-				owner: this.#modelRegistry.getAuthStorageOwner(),
-			});
-		} else {
-			remaining = await authStorage.markUsageLimitReached(provider, credentialSessionId, {
-				retryAfterMs: trigger.retryAfterMs,
 				owner: this.#modelRegistry.getAuthStorageOwner(),
 			});
 		}

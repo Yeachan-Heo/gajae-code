@@ -4,6 +4,7 @@
 
 ### Fixed
 
+- Usage-limit marking now captures a stable stored row at mark time, including when no explicit row ID is supplied, and re-finds that same row after awaiting usage. Concurrent pointer reassignment or row reordering cannot redirect the mark; a vanished target marks nothing. This does not add dispatch-bound credential attribution (#5422).
 - Credential-scoped model discovery now peeks the OAuth account selected for that session instead of falling back to unscoped pool ranking. An expired hard-pinned token returns unavailable rather than querying another account's catalog, while AUTO and callers without a scope retain their existing selection behavior.
 
 - The Cursor conversation blob store no longer bricks a long session. Its entry ceiling sat below the working set of an ordinary long conversation — a few hundred small blobs — and request construction wrote past that ceiling without being charged for it, so every later server `setBlob` was refused and every tool result that depended on one failed with `Cursor blob store exceeded its bounded capacity` for the rest of the session; neither compaction nor restarting the process recovered it. The store is now bounded by bytes alone, both writers are charged to that budget, and an overflowing write sheds the oldest entries instead of being refused (#5454).
