@@ -964,6 +964,11 @@ function sameRegularFileIdentity(left: fsSync.BigIntStats, right: fsSync.BigIntS
 	);
 }
 
+/** Whether two path/descriptor stats name the same Windows file object. */
+function sameWindowsFileObject(left: fsSync.BigIntStats, right: fsSync.BigIntStats): boolean {
+	return left.isFile() && right.isFile() && left.dev === right.dev && left.ino === right.ino;
+}
+
 function ownerSnapshotFrom(stat: fsSync.BigIntStats, bytes: Buffer): LockOwnerSnapshot {
 	return {
 		dev: stat.dev,
@@ -1044,8 +1049,8 @@ async function captureWindowsLockOwner(lockFile: string, flags: number): Promise
 			throw new SessionStateLockUnavailableError(new Error("Lock path became a reparse point under the read."));
 		// The open landed on the object the pre-`lstat` judged, and the pathname still
 		// names it. Either disagreement means the bytes have no attributable identity.
-		if (!sameRegularFileIdentity(before, opened)) return null;
-		if (!relinked || !sameRegularFileIdentity(before, relinked)) return null;
+		if (!sameWindowsFileObject(before, opened)) return null;
+		if (!relinked || !sameWindowsFileObject(before, relinked)) return null;
 		const bytes = await handle.readFile();
 		const settled = await handle.stat({ bigint: true });
 		if (!sameRegularFileIdentity(opened, settled) || settled.size !== BigInt(bytes.byteLength)) return null;
@@ -1382,11 +1387,11 @@ async function rewriteHeldOwnerRecord(
 	try {
 		const opened = await handle.stat({ bigint: true });
 		if (!opened.isFile()) throw new SessionStateLockUnavailableError(new Error("Owner record is not regular."));
-		if (before && !sameRegularFileIdentity(before, opened))
+		if (before && !sameWindowsFileObject(before, opened))
 			throw new SessionStateLockUnavailableError(new Error("Owner record changed while opening for rewrite."));
 		if (before) {
 			const relinked = await fs.lstat(file, { bigint: true }).catch(() => null);
-			if (!relinked || !sameRegularFileIdentity(opened, relinked))
+			if (!relinked || !sameWindowsFileObject(opened, relinked))
 				throw new SessionStateLockUnavailableError(new Error("Owner pathname changed while opening for rewrite."));
 		}
 		const currentBytes = await handle.readFile();
