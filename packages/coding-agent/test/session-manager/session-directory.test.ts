@@ -81,6 +81,24 @@ async function committedReceiptNames(directory: string): Promise<string[]> {
 	});
 }
 
+function forcePendingArtifactDetach() {
+	const exactUnlink = native.exactUnlink;
+	return vi.spyOn(native, "exactUnlink").mockImplementation((pathname, identity) => {
+		if (!identity.directory || !identity.detachOnly || !identity.quarantineName)
+			return exactUnlink(pathname, identity);
+		const detachedPath = path.join(path.dirname(pathname), identity.quarantineName);
+		const retainedPlaceholderPath = `${pathname}.gjc-exact-unlink-placeholder-test`;
+		syncFs.renameSync(pathname, detachedPath);
+		syncFs.mkdirSync(retainedPlaceholderPath);
+		return {
+			ok: false,
+			code: "cleanup_pending",
+			detachedPath,
+			retainedPlaceholderPath,
+		};
+	});
+}
+
 function encoded(value: string): string {
 	return value.replace(/[/\\:]/g, "-");
 }
@@ -878,7 +896,12 @@ describe("managed session write protocol", () => {
 		await fs.writeFile(source, transcript("committed-cleanup-pending", cwd));
 		const listed = listManagedCandidates(scope);
 		if (listed.kind !== "complete" || !listed.owned[0]) throw new Error("Missing legacy candidate");
-		await expect(openManagedCandidateForWrite(scope, listed.owned[0])).resolves.toMatchObject({ kind: "opened" });
+		const pendingDetach = forcePendingArtifactDetach();
+		try {
+			await expect(openManagedCandidateForWrite(scope, listed.owned[0])).resolves.toMatchObject({ kind: "opened" });
+		} finally {
+			pendingDetach.mockRestore();
+		}
 
 		const receipts = path.join(scope.directoryPath, ".gjc-managed-session-internal", "receipts");
 		const [committed] = await committedReceiptNames(receipts);
@@ -907,6 +930,7 @@ describe("managed session write protocol", () => {
 		const listed = listManagedCandidates(scope);
 		if (listed.kind !== "complete" || !listed.owned[0]) throw new Error("Missing legacy candidate");
 
+		const pendingDetach = forcePendingArtifactDetach();
 		const restore = vi.spyOn(native, "exactRestore").mockReturnValue({ ok: false, code: "io_error" });
 		try {
 			await expect(openManagedCandidateForWrite(scope, listed.owned[0])).resolves.toMatchObject({
@@ -915,6 +939,7 @@ describe("managed session write protocol", () => {
 			});
 		} finally {
 			restore.mockRestore();
+			pendingDetach.mockRestore();
 		}
 
 		const receipts = path.join(scope.directoryPath, ".gjc-managed-session-internal", "receipts");

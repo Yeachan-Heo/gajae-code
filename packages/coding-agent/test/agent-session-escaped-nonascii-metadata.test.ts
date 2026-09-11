@@ -2,7 +2,8 @@ import { afterEach, describe, expect, it } from "bun:test";
 import * as path from "node:path";
 import { Agent, type AgentMessage, type AgentTool } from "@gajae-code/agent-core";
 import type { AssistantMessage, Message } from "@gajae-code/ai";
-import { createMockModel } from "@gajae-code/ai/providers/mock";
+import { createMockModel, type MockModel } from "@gajae-code/ai/providers/mock";
+import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
@@ -29,6 +30,20 @@ function identityConverter(messages: AgentMessage[]): Message[] {
 	return messages.filter(
 		message => message.role === "user" || message.role === "assistant" || message.role === "toolResult",
 	) as Message[];
+}
+
+function terminalOnlyStream(stream: MockModel["stream"]): MockModel["stream"] {
+	return (model, context, options) => {
+		const upstream = stream(model, context, options);
+		const terminal = new AssistantMessageEventStream();
+		void (async () => {
+			for await (const event of upstream) {
+				if (event.type === "done" || event.type === "error") terminal.push(event);
+			}
+			terminal.end();
+		})().catch(error => terminal.fail(error));
+		return terminal;
+	};
 }
 
 function turn(id: string, escaped: boolean) {
@@ -96,7 +111,7 @@ describe("AgentSession escaped non-ASCII metadata fidelity", () => {
 		const agent = new Agent({
 			initialState: { model: mock.model, systemPrompt: ["test"], tools: [askTool()], messages: [] },
 			convertToLlm: identityConverter,
-			streamFn: mock.stream,
+			streamFn: terminalOnlyStream(mock.stream),
 		});
 		session = new AgentSession({
 			agent,

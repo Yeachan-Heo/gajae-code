@@ -3629,7 +3629,13 @@ export async function acquireManagedLock(
 								(!descriptorUnavailable && managedSecurityFailureClassification(error) !== "identity_mismatch")
 							)
 								throw error;
-							replacementFd = openVerifiedLockReleaseDescriptor(lockPath, lockIdentity);
+							try {
+								replacementFd = openVerifiedLockReleaseDescriptor(lockPath, lockIdentity);
+							} catch (replacementError) {
+								if (managedSecurityFailureClassification(replacementError) === "identity_mismatch")
+									throw new Error("migration_busy");
+								throw replacementError;
+							}
 							releaseFd = replacementFd;
 						}
 						assertOwnedWithDescriptor(releaseFd);

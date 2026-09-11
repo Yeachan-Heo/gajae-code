@@ -6,20 +6,9 @@ import type {
 	NativeBrokerRestartIntent,
 	NativeBrokerRestartIntentIdentity,
 	NativeRetainedBrokerPublication,
-	retainBrokerPublication as retainBrokerPublicationFn,
 } from "@gajae-code/natives";
+import { retainBrokerPublication as retainBrokerPublicationFn } from "@gajae-code/natives";
 import { BROKER_ARTIFACT_PATHS, canonicalServiceRootDigest } from "../service-artifact-paths";
-
-let nativeRetainBrokerPublicationFn: typeof retainBrokerPublicationFn | undefined;
-
-function retainBrokerPublicationNative(
-	...args: Parameters<typeof retainBrokerPublicationFn>
-): NativeRetainedBrokerPublication {
-	nativeRetainBrokerPublicationFn ??= (
-		require("@gajae-code/natives") as { retainBrokerPublication: typeof retainBrokerPublicationFn }
-	).retainBrokerPublication;
-	return nativeRetainBrokerPublicationFn(...args);
-}
 
 import { processIncarnation } from "./process-incarnation";
 import { assertSupportedStateVersion, SDK_STATE_VERSION } from "./state-version";
@@ -232,7 +221,7 @@ function describeWithheldPublicationAuthority(agentDir: string): string | undefi
 
 function requireRetainedBrokerPublication(agentDir: string): NativeRetainedBrokerPublication {
 	try {
-		return retainBrokerPublicationNative(agentDir);
+		return retainBrokerPublicationFn(agentDir);
 	} catch (error) {
 		// Fail closed exactly as before; only name the condition on the way out.
 		const obstruction = nativeRetainedObstruction(error);
