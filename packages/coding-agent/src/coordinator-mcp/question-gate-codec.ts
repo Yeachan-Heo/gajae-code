@@ -9,6 +9,7 @@ export type PublicReason =
 	| "pagination_malformed"
 	| "row_unrepresentable"
 	| "missing_runtime_turn"
+	| "pending_registration"
 	| "invalid_runtime_turn"
 	| "invalid_gate_row"
 	| "wrong_session"

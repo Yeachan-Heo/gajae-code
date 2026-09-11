@@ -38,7 +38,11 @@ export function warnIfMacOSNoFileLimitTooLow(deps: WarnIfMacOSNoFileLimitTooLowD
 	const run = deps.execFileSync ?? execFileSync;
 	let currentLimit: number | undefined;
 	try {
-		currentLimit = parseNoFileLimit(run("/bin/sh", ["-lc", "ulimit -n"], { encoding: "utf8" }));
+		// Plain `sh -c`, not `-lc`: the value that matters is the limit this process
+		// inherited (children report their inherited soft limit), and `-l` sources
+		// the user's shell profile on every launch purely to produce a number that
+		// may not even match what gjc is actually running under.
+		currentLimit = parseNoFileLimit(run("/bin/sh", ["-c", "ulimit -n"], { encoding: "utf8" }));
 	} catch {
 		return;
 	}

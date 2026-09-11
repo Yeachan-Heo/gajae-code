@@ -211,4 +211,60 @@ describe("Responses provider: truncated tool-call detection", () => {
 		expect(tools[0].arguments).toEqual({ input: fullPatch });
 		expect(tools[0].incompleteArguments).toBeFalsy();
 	});
+
+	test("flags a truncated tool call when response.incomplete omits response.status", async () => {
+		// A relay that drops `status` must not downgrade the terminal frame to a
+		// plain completion: the event type proves the turn was cut short, so the
+		// call stays flagged and the stop reason stays `length`.
+		const events = [
+			{
+				type: "response.output_item.added",
+				output_index: 0,
+				item: { type: "function_call", id: "fc_1", call_id: "call_1", name: "write_file", arguments: "" },
+			},
+			{
+				type: "response.function_call_arguments.delta",
+				item_id: "fc_1",
+				output_index: 0,
+				delta: '{"path":"/etc/hosts","content":"line1\\nline2',
+			},
+			{ type: "response.incomplete", response: { id: "resp_1" } },
+		];
+		const output = makeOutput();
+		const { stream } = makeCapture();
+		await processResponsesStream(makeStream(events), output, stream, makeModel());
+
+		expect(output.stopReason).toBe("length");
+		const tools = toolBlocks(output);
+		expect(tools).toHaveLength(1);
+		expect(tools[0].incompleteArguments).toBe(true);
+		expect(tools[0].incompleteArgumentsReason).toBe("truncated");
+	});
+
+	test("flags a truncated tool call when response.incomplete carries a rewritten status", async () => {
+		// A relay that rewrites the status to "completed" must not defeat the
+		// terminal-frame truncation contract either.
+		const events = [
+			{
+				type: "response.output_item.added",
+				output_index: 0,
+				item: { type: "function_call", id: "fc_1", call_id: "call_1", name: "read_file", arguments: "" },
+			},
+			{
+				type: "response.function_call_arguments.delta",
+				item_id: "fc_1",
+				output_index: 0,
+				delta: '{"path":"/etc/secret',
+			},
+			{ type: "response.incomplete", response: { id: "resp_1", status: "completed" } },
+		];
+		const output = makeOutput();
+		const { stream } = makeCapture();
+		await processResponsesStream(makeStream(events), output, stream, makeModel());
+
+		expect(output.stopReason).toBe("length");
+		const tools = toolBlocks(output);
+		expect(tools).toHaveLength(1);
+		expect(tools[0].incompleteArguments).toBe(true);
+	});
 });

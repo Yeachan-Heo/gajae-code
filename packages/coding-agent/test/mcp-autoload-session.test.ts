@@ -16,7 +16,7 @@ import { SessionManager } from "@gajae-code/coding-agent/session/session-manager
 import { getAgentDir, setAgentDir } from "@gajae-code/utils";
 import { safeRm } from "../../../scripts/safe-cleanup";
 import { runMCPCommand } from "../src/cli/mcp-cli";
-import { MCPManager } from "../src/runtime-mcp";
+import { type MCPLoadResult, MCPManager } from "../src/runtime-mcp";
 
 const DEMO_MCP_SERVER_SCRIPT = `
 const readline = require('node:readline');
@@ -200,6 +200,162 @@ describe("conventional MCP autoload in standalone sessions", () => {
 			await session.dispose();
 		}
 	}, 45_000);
+
+	it("defers conventional autoload connection until the deferred startup handle runs", async () => {
+		const stdout = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+		await runMCPCommand({
+			action: "add",
+			name: "demo",
+			commandArgs: [process.execPath, "-e", DEMO_MCP_SERVER_SCRIPT],
+			flags: { project: true, timeout: 5_000 },
+			cwd: projectDir,
+		});
+		stdout.mockRestore();
+
+		const { session, mcpManager, startDeferredMcpConfig } = await createAgentSession({
+			...isolatedSessionOptions(),
+			deferMcpConfigStartup: true,
+		});
+		try {
+			// The manager publishes immediately (empty) so /mcp can see it; the
+			// connection itself happens in the deferred starter.
+			expect(mcpManager).toBeDefined();
+			expect(mcpManager?.getConnectedServers() ?? []).toEqual([]);
+			expect(startDeferredMcpConfig).toBeDefined();
+			expect(session.getAllToolNames().filter(name => name.startsWith("mcp__"))).toEqual([]);
+
+			const startup = startDeferredMcpConfig!();
+			await expect(startup).resolves.toEqual({ loadedToolCount: 1, hasErrors: false });
+			expect(session.getAllToolNames()).toContain("mcp__demo_hello");
+			expect(session.getActiveToolNames()).toContain("mcp__demo_hello");
+			expect(mcpManager?.getConnectedServers()).toContain("demo");
+			expect(startDeferredMcpConfig!()).toBe(startup);
+		} finally {
+			await session.dispose();
+		}
+	}, 45_000);
+
+	it("holds the first prompt until deferred conventional startup completes", async () => {
+		// The gated prompt passes model-credential preflight once the barrier
+		// releases; mirror the sdk deferred-MCP harness's throwaway key.
+		authStorage.setRuntimeApiKey("openai", "test-key");
+		await fs.promises.mkdir(path.join(projectDir, ".gjc"), { recursive: true });
+		await fs.promises.writeFile(
+			path.join(projectDir, ".gjc", "mcp.json"),
+			JSON.stringify({
+				mcpServers: {
+					demo: {
+						type: "stdio",
+						command: process.execPath,
+						args: ["-e", DEMO_MCP_SERVER_SCRIPT],
+						timeout: 5_000,
+					},
+				},
+			}),
+		);
+		const connect = Promise.withResolvers<MCPLoadResult>();
+		vi.spyOn(MCPManager.prototype, "connectServers").mockImplementation(async () => await connect.promise);
+
+		const { session, mcpManager, startDeferredMcpConfig } = await createAgentSession({
+			...isolatedSessionOptions(),
+			deferMcpConfigStartup: true,
+		});
+		try {
+			expect(mcpManager).toBeDefined();
+			const agentPrompt = vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined);
+			const prompt = session.prompt("wait for deferred conventional MCP");
+			await Bun.sleep(0);
+			expect(agentPrompt).not.toHaveBeenCalled();
+
+			connect.resolve({
+				tools: [],
+				errors: new Map(),
+				connectedServers: ["demo"],
+				exaApiKeys: [],
+			});
+			// Zero delivered tools reports hasErrors under the same convention the
+			// deferred exact-config handle uses; the barrier still releases.
+			await expect(startDeferredMcpConfig!()).resolves.toEqual({ loadedToolCount: 0, hasErrors: true });
+			await prompt;
+			expect(agentPrompt).toHaveBeenCalledTimes(1);
+		} finally {
+			await session.dispose();
+		}
+	}, 30_000);
+
+	it("preserves persisted conventional MCP selections while the deferred catalog is pending", async () => {
+		await fs.promises.mkdir(path.join(projectDir, ".gjc"), { recursive: true });
+		await fs.promises.writeFile(
+			path.join(projectDir, ".gjc", "mcp.json"),
+			JSON.stringify({
+				mcpServers: {
+					demo: {
+						type: "stdio",
+						command: process.execPath,
+						args: ["-e", DEMO_MCP_SERVER_SCRIPT],
+						timeout: 5_000,
+					},
+				},
+			}),
+		);
+
+		// Seed a session whose persisted MCP discovery selection names the conventional
+		// tool, then resume it under deferral, where the registry is empty until the
+		// starter connects. Pruning at construction would silently drop the selection
+		// and the resumed catalog could never restore it.
+		const seededManager = SessionManager.create(projectDir, projectDir);
+		seededManager.appendMCPToolSelection(["mcp__demo_hello"]);
+		const { session, startDeferredMcpConfig } = await createAgentSession({
+			...isolatedSessionOptions(),
+			sessionManager: seededManager,
+			settings: Settings.isolated({ "mcp.discoveryMode": true }),
+			deferMcpConfigStartup: true,
+		});
+		try {
+			expect(session.sessionManager.buildSessionContext().selectedMCPToolNames).toEqual(["mcp__demo_hello"]);
+			await expect(startDeferredMcpConfig!()).resolves.toEqual({ loadedToolCount: 1, hasErrors: false });
+			expect(session.getSelectedMCPToolNames()).toEqual(["mcp__demo_hello"]);
+			expect(session.getActiveToolNames()).toContain("mcp__demo_hello");
+		} finally {
+			await session.dispose();
+		}
+	}, 45_000);
+
+	it("releases the first-prompt barrier when deferred conventional startup fails", async () => {
+		authStorage.setRuntimeApiKey("openai", "test-key");
+		await fs.promises.mkdir(path.join(projectDir, ".gjc"), { recursive: true });
+		await fs.promises.writeFile(
+			path.join(projectDir, ".gjc", "mcp.json"),
+			JSON.stringify({
+				mcpServers: {
+					demo: {
+						type: "stdio",
+						command: process.execPath,
+						args: ["-e", DEMO_MCP_SERVER_SCRIPT],
+						timeout: 5_000,
+					},
+				},
+			}),
+		);
+		vi.spyOn(MCPManager.prototype, "connectServers").mockRejectedValue(new Error("connect failed"));
+		vi.spyOn(MCPManager.prototype, "disconnectAll").mockResolvedValue();
+
+		const { session, startDeferredMcpConfig } = await createAgentSession({
+			...isolatedSessionOptions(),
+			deferMcpConfigStartup: true,
+		});
+		try {
+			// The connect failure is still reported through the returned handle...
+			await expect(startDeferredMcpConfig!()).rejects.toThrow("MCP tools could not be loaded.");
+			// ...but the startup turn barrier must release, or every later prompt would
+			// await a permanently rejected barrier and the session would be unusable.
+			const agentPrompt = vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined);
+			await session.prompt("prompt after failed deferred conventional startup");
+			expect(agentPrompt).toHaveBeenCalledTimes(1);
+		} finally {
+			await session.dispose();
+		}
+	}, 30_000);
 
 	it("opts out with enableMcpAutoload: false (CLI --no-mcp) without loading conventional registrations", async () => {
 		await runMCPCommand({

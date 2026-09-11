@@ -11,6 +11,7 @@ import {
 	pathDirs,
 	smokeTest,
 } from "./dev-link";
+import { WORKTREE_SETUP_COMMAND } from "./worktree-deps";
 
 const tempRoots: string[] = [];
 const shimFlags = (5478 << 3) | 0b101;
@@ -265,6 +266,33 @@ describe.skipIf(process.platform === "win32")("dev:link Windows Bun workspace sh
 });
 
 describe("dev:link", () => {
+	test("fails --worktree in a checkout with no installed dependencies and names the fix", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-dev-link-worktree-"));
+		tempRoots.push(root);
+		const scriptsDir = path.join(root, "scripts");
+		await fs.mkdir(scriptsDir, { recursive: true });
+		await Bun.write(path.join(scriptsDir, "dev-link.ts"), Bun.file(path.join(import.meta.dir, "dev-link.ts")));
+		await Bun.write(path.join(scriptsDir, "worktree-deps.ts"), Bun.file(path.join(import.meta.dir, "worktree-deps.ts")));
+		await fs.mkdir(path.join(root, "packages", "utils"), { recursive: true });
+		await Bun.write(
+			path.join(root, "packages", "utils", "package.json"),
+			JSON.stringify({ name: "@gajae-code/utils", exports: { ".": "./src/index.ts" } }),
+		);
+
+		const result = Bun.spawnSync([process.execPath, path.join(scriptsDir, "dev-link.ts"), "--worktree"], {
+			cwd: root,
+			stderr: "pipe",
+			stdout: "pipe",
+		});
+
+		expect(result.exitCode).not.toBe(0);
+		const combined = `${result.stdout.toString()}${result.stderr.toString()}`;
+		expect(combined).toContain("node_modules:       ABSENT");
+		expect(combined).toContain("✗ This checkout cannot run the test suite.");
+		expect(combined).toContain(WORKTREE_SETUP_COMMAND);
+		expect(combined).toContain("install:dev");
+	});
+
 	test.skipIf(process.platform === "win32")("fails when --binary is shadowed by this checkout's source", async () => {
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-dev-link-mode-shadow-"));
 		tempRoots.push(root);
@@ -277,6 +305,10 @@ describe("dev:link", () => {
 
 		await fs.mkdir(path.dirname(fixtureScript), { recursive: true });
 		await Bun.write(fixtureScript, Bun.file(path.join(import.meta.dir, "dev-link.ts")));
+		await Bun.write(
+			path.join(root, "scripts", "worktree-deps.ts"),
+			Bun.file(path.join(import.meta.dir, "worktree-deps.ts")),
+		);
 		await makeExecutable(source, smokeFixture);
 		await makeExecutable(binary, smokeFixture);
 		await fs.mkdir(shadowDir, { recursive: true });

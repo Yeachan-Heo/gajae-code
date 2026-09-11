@@ -56,6 +56,21 @@ Before command dispatch, the exact-prefix helper increments the Ouroboros bridge
 
 ## Installation and discovery
 
+### Runtime status
+
+Session startup quarantines filesystem extension modules. `createAgentSession` seeds its extension set from `options.preloadedExtensions` and falls back to an empty set, so discovered `extensions/**` paths are ignored even when `options.additionalExtensionPaths` is supplied (`packages/coding-agent/src/sdk/session.ts`). `discoverAndLoadExtensions` has no production caller: its only remaining call site is `packages/coding-agent/src/cli/list-models.ts`, and `gjc --list-models` calls that entry point with `disableExtensionDiscovery: true`, bypassing discovery. No session entrypoint calls it.
+
+A bridge installed under the locations below is therefore present and inspectable, and its `input` handler never runs. `gjc customize doctor` reports the state directly:
+
+```text
+ouroboros-ooo-bridge  [stored-only]  gjc/user  (canonical)
+  reason: managed — Discovered and shown in the extension dashboard, but session startup
+          does not load filesystem extension modules. Runtime extensions come from
+          validated GJC plugin bundles.
+```
+
+GJC plugin bundles carry `subskills`, `tools`, `hooks`, `mcps`, `system_appendix`, and `agent-appendix` (`docs/gjc-plugins.md`). An `input`-event surface is outside that set, so the bridge has no bundle equivalent today. Treat the steps below as the contract for the interception surface and the install layout, and expect `ooo ...` to reach the model as ordinary chat until session startup loads extension modules again.
+
 ### Pinned Ouroboros baseline
 
 This path is verified against [Q00/ouroboros `v0.50.7`](https://github.com/Q00/ouroboros/releases/tag/v0.50.7). Install its MCP profile at the exact version, then configure GJC:

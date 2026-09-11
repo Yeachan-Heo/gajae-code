@@ -373,6 +373,9 @@ export const TIER_MAP_SKIP_LIST = {
 	"opencode-go/muse-spark-1.2-contributor": {
 		rationale: "post-rebase catalog addition from dev; not yet curated",
 	},
+	"opencode-go/muse-spark-1.3-contributor": {
+		rationale: "catalog addition from PR #5485; not yet curated",
+	},
 	"opencode-go/qwen3.8-flash": { rationale: "post-rebase catalog addition from dev; not yet curated" },
 	"opencode-go/qwen3.8-max": { rationale: "post-rebase catalog addition from dev; not yet curated" },
 	"opencode-zen/grok-4.6": { rationale: "post-rebase catalog addition from dev; not yet curated" },
@@ -4330,6 +4333,8 @@ export const TIER_MAP_SKIP_LIST = {
 	"openai-codex/gpt-5.5": { baseline: true, rationale: "pre-feature baseline; not yet curated" },
 	"openai-codex/gpt-5.6-luna": { baseline: true, rationale: "pre-feature baseline; not yet curated" },
 	"openai-codex/gpt-image-2": { baseline: true, rationale: "multimodal catalog addition; not yet curated" },
+	"openai-codex/gpt-image-2.5-flare": { baseline: true, rationale: "multimodal catalog addition; not yet curated" },
+	"openai-codex/gpt-image-2.5-sunburst": { baseline: true, rationale: "multimodal catalog addition; not yet curated" },
 	"openai/codex-mini-latest": { baseline: true, rationale: "pre-feature baseline; not yet curated" },
 	"openai/gpt-4": { baseline: true, rationale: "pre-feature baseline; not yet curated" },
 	"openai/gpt-4-turbo": { baseline: true, rationale: "pre-feature baseline; not yet curated" },
@@ -4370,6 +4375,8 @@ export const TIER_MAP_SKIP_LIST = {
 	"openai/gpt-5.6-sol": { baseline: true, rationale: "pre-feature baseline; not yet curated" },
 	"openai/gpt-5.6-terra": { baseline: true, rationale: "pre-feature baseline; not yet curated" },
 	"openai/gpt-image-2": { baseline: true, rationale: "multimodal catalog addition; not yet curated" },
+	"openai/gpt-image-2.5-flare": { baseline: true, rationale: "multimodal catalog addition; not yet curated" },
+	"openai/gpt-image-2.5-sunburst": { baseline: true, rationale: "multimodal catalog addition; not yet curated" },
 	"openai/gpt-realtime-2.1": { baseline: true, rationale: "pre-feature baseline; not yet curated" },
 	"openai/o1": { baseline: true, rationale: "pre-feature baseline; not yet curated" },
 	"openai/o1-pro": { baseline: true, rationale: "pre-feature baseline; not yet curated" },

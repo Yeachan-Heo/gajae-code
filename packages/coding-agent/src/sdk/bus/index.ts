@@ -121,7 +121,12 @@ import {
 	promptDeadlineAt,
 	recordAttributableProgress,
 } from "../prompt-deadline-lease";
-import { formatPromptFailureForLocalLog, sanitizePromptFailure } from "../prompt-failure";
+import {
+	assistantFailureCode,
+	failedPromptOutcome,
+	formatPromptFailureForLocalLog,
+	sanitizePromptFailure,
+} from "../prompt-failure";
 import { PROMPT_CLIENT_REF_MAX_LENGTH, type SdkPromptTerminalOutcome } from "../prompt-status";
 import { OPERATIONS } from "../protocol/operation-registry";
 import {
@@ -5053,6 +5058,8 @@ export function createNotificationsExtension(
 							code: "prompt_deadline_exceeded",
 							message: "Prompt deadline exceeded.",
 							provenance: "deadline",
+							phase: "submission",
+							category: "deadline",
 						},
 						{ fence: true },
 						{ diagnostic: { reason: "Prompt deadline exceeded." } },
@@ -5522,7 +5529,10 @@ export function createNotificationsExtension(
 						type: "agent_failed",
 						sessionId: runtime.id,
 						...correlation,
-						error: extra?.error ?? { code: winner.code, message: winner.message },
+						error:
+							extra?.error !== undefined
+								? { code: extra.error.code, message: winner.message }
+								: { code: winner.code, message: winner.message },
 						outcome: winner,
 					});
 				} else {
@@ -5580,12 +5590,12 @@ export function createNotificationsExtension(
 				error: formatPromptFailureForLocalLog(error),
 			});
 			const sanitized = sanitizePromptFailure(error);
-			const outcome: SdkPromptTerminalOutcome = {
-				kind: "failed",
+			const outcome: SdkPromptTerminalOutcome = failedPromptOutcome({
 				code: "prompt_failed",
-				message: sanitized.message,
 				provenance: "agent_failed",
-			};
+				providerCode: sanitized.code,
+				evidence: {},
+			});
 			// This rejection bypasses `agent_end`, so record its local-only reason at
 			// the accepted submission failure boundary before terminalization begins.
 			logger.error("sdk_prompt_terminal_failed", {
@@ -8948,8 +8958,15 @@ export function createNotificationsExtension(
 		if (correlation) {
 			const assistants = (Array.isArray(event.messages) ? [...event.messages].reverse() : []).filter(
 				message => message && typeof message === "object" && (message as { role?: unknown }).role === "assistant",
-			) as Array<{ stopReason?: unknown; errorKind?: unknown }>;
+			) as Array<{ stopReason?: unknown; errorKind?: unknown; errorCode?: unknown }>;
 			const finalAssistant = assistants[0];
+			const terminalAssistant = assistants.find(
+				message =>
+					(message as { stopReason?: unknown }).stopReason === "error" ||
+					(message as { stopReason?: unknown }).stopReason === "aborted",
+			) as
+				| { stopReason?: "error" | "aborted"; errorMessage?: unknown; errorKind?: unknown; errorCode?: unknown }
+				| undefined;
 			const pendingOutcome = rt.peekPromptPendingOutcome(correlation);
 			let outcome: SdkPromptTerminalOutcome;
 			if (pendingOutcome) outcome = pendingOutcome;
@@ -8966,24 +8983,24 @@ export function createNotificationsExtension(
 				finalAssistant?.stopReason !== "aborted"
 			)
 				outcome = { kind: "stopped", reason: "end_turn", provenance: "agent" };
-			else
-				outcome = {
-					kind: "failed",
+			else {
+				// The provider/agent's own bounded classifier travels on the terminal
+				// assistant message; the phase is finalized against the durable record
+				// (startedAt) when the outcome is claimed.
+				const providerCode = assistantFailureCode(terminalAssistant);
+				outcome = failedPromptOutcome({
 					code: "prompt_failed",
-					message: "Prompt submission failed.",
 					provenance: "agent_failed",
-				};
+					...(providerCode !== undefined ? { providerCode } : {}),
+					evidence: {},
+				});
+			}
 			const successAssistant = assistants.find(
 				message => (message as { stopReason?: unknown }).stopReason === "stop",
 			);
 			const finalText = successAssistant ? acpFinalTextFromMessage(successAssistant).text : "";
 			// The normalized outcome is the ACP contract; existing SDK clients keep the
 			// legacy failure discriminator on the wire and in the reconciliation record.
-			const terminalAssistant = assistants.find(
-				message =>
-					(message as { stopReason?: unknown }).stopReason === "error" ||
-					(message as { stopReason?: unknown }).stopReason === "aborted",
-			) as { stopReason?: "error" | "aborted"; errorMessage?: unknown; errorKind?: unknown } | undefined;
 			const legacyCode =
 				event.stopReason === "cancelled"
 					? "cancelled"
@@ -9015,7 +9032,7 @@ export function createNotificationsExtension(
 					? {
 							// Only the legacy discriminator is preserved; provider text is never
 							// retained, matching `sanitizePromptFailure`.
-							error: { code: legacyCode, message: "Prompt submission failed." },
+							error: { code: legacyCode, message: outcome.message },
 						}
 					: {}),
 			});

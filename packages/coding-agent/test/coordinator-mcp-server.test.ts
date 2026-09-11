@@ -8460,6 +8460,56 @@ describe("Coordinator MCP retained-delivery ordering", () => {
 		expect(await fs.readFile(file, "utf8")).toBe(hostile);
 	});
 
+	it("reports a published gate that is not yet linked to any coordinator turn", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const server = await createSdkControlServer(root, controls, [], query =>
+			query === "Q12"
+				? {
+						ok: true,
+						page: {
+							// The runtime published a pending gate, but its runtime turn id belongs to no
+							// coordinator turn, so the question stays unmaterialized (deferred_link).
+							items: [
+								{
+									...sharedAskGate("unlinked-ask", "runtime-turn-no-owner"),
+									created_at: new Date().toISOString(),
+								},
+							],
+							complete: true,
+							revision: "unlinked-ask",
+						},
+					}
+				: { ok: true, page: { items: [], complete: true, revision: "context" } },
+		);
+		await registerSdkSession(server, root);
+		await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "visible-session",
+			prompt: "unlinked ask",
+			idempotency_key: "unlinked-ask-prompt",
+			allow_mutation: true,
+		});
+
+		const listed = await server.callTool("gjc_coordinator_list_questions", { session_id: "visible-session" });
+		expect(listed).toMatchObject({
+			ok: true,
+			questions: [],
+			diagnostics: [expect.objectContaining({ reason: "pending_registration", gate_id: "unlinked-ask" })],
+		});
+
+		// The operator-visible signal must also reach the aggregate status surface that
+		// external orchestrators poll instead of reading host logs.
+		const status = await server.callTool("gjc_coordinator_read_coordination_status", {
+			session_id: "visible-session",
+		});
+		expect(status).toMatchObject({
+			ok: true,
+			summary: {
+				question_diagnostics: [expect.objectContaining({ reason: "pending_registration" })],
+			},
+		});
+	}, 15_000);
+
 	it("accepts a valid unlinked deferred gate authority", async () => {
 		const root = await tempRoot();
 		const server = await createSdkControlServer(root, []);

@@ -44,6 +44,13 @@ const REDACTION_RULES: readonly RedactionRule[] = [
 	{ id: "openai-key", pattern: /sk-(?:proj|svcacct|admin)-[A-Za-z0-9_-]{20,}|sk-[A-Za-z0-9]{20,}/g },
 	// Slack tokens.
 	{ id: "slack-token", pattern: /xox[baprs]-[A-Za-z0-9-]{10,}/g },
+	// The four shapes `crash/upstream/envelope.ts` classifies as credential-like
+	// and refuses to transmit. Stripe and Hugging Face separate with `_`, so the
+	// `sk-` rules above never matched them.
+	{ id: "npm-token", pattern: /npm_[A-Za-z0-9]{20,}/g },
+	{ id: "gitlab-token", pattern: /glpat-[A-Za-z0-9_-]{20,}/g },
+	{ id: "stripe-key", pattern: /(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{16,}/g },
+	{ id: "huggingface-token", pattern: /hf_[A-Za-z0-9]{20,}/g },
 	// Google API keys.
 	{ id: "google-api-key", pattern: /AIza[0-9A-Za-z_-]{35}/g },
 	// Bearer tokens carried in Authorization text.

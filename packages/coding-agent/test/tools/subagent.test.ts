@@ -706,6 +706,33 @@ describe("SubagentTool", () => {
 		);
 		for (const secret of secrets) expect(summary).not.toContain(secret);
 	});
+	it("redacts every AWS key prefix, PEM key material, and vendor tokens", () => {
+		// BARE_PROVIDER_TOKEN_PATTERN listed only AKIA of the four AWS access-key
+		// id prefixes, had no PEM rule, and lacked the four shapes
+		// `crash/upstream/envelope.ts` refuses to transmit. Assembled at runtime.
+		const pemBody = "MIIEowIBAAKCAQEAxGZ0000abcdefgHIJKLmnop";
+		const secrets = [
+			"ASIAIOSFODNN7EXAMPLE",
+			"ABIAIOSFODNN7EXAMPLE",
+			"ACCAIOSFODNN7EXAMPLE",
+			["npm", "a".repeat(36)].join("_"),
+			["glpat", "b".repeat(24)].join("-"),
+			["sk", "live", "c".repeat(24)].join("_"),
+			["hf", "d".repeat(34)].join("_"),
+		];
+		const summary = createSetupFailureSummary(
+			new Error(
+				[
+					`setup failed: ${secrets.join(" ")}`,
+					`-----BEGIN RSA PRIVATE KEY-----\n${pemBody}\n-----END RSA PRIVATE KEY-----`,
+				].join(" "),
+			),
+		).summary;
+
+		expect(summary).toContain("setup failed");
+		for (const secret of secrets) expect(summary).not.toContain(secret);
+		expect(summary).not.toContain(pemBody);
+	});
 	it("summarizes a large credential-free failure in linear time", () => {
 		// Two patterns used to scan quadratically. The credential-name prefix
 		// `(?:[A-Za-z][A-Za-z0-9]*[_.-])*?` nested an unbounded quantifier inside an

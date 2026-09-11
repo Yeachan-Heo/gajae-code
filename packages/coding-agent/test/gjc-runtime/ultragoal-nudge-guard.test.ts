@@ -193,11 +193,47 @@ describe("ultragoal nudge guard", () => {
 		process.env.GJC_SESSION_ID = TEST_SESSION_ID;
 		await setProjectBudget(cwd, 1);
 		await createUltragoalPlan({ cwd, brief: SINGLE_BRIEF });
-		await expect(assertUltragoalAskAllowed(cwd)).rejects.toThrow(/try-harder nudge/);
-		await expect(assertUltragoalAskAllowed(cwd)).rejects.toThrow(/record-review-blockers/);
+		await expect(assertUltragoalAskAllowed(cwd, { sessionId: TEST_SESSION_ID })).rejects.toThrow(/try-harder nudge/);
+		await expect(assertUltragoalAskAllowed(cwd, { sessionId: TEST_SESSION_ID })).rejects.toThrow(
+			/record-review-blockers/,
+		);
 		const ledger = await readUltragoalLedger(cwd, TEST_SESSION_ID);
 		const askNudges = ledger.filter(event => event.event === "nudge" && event.surface === "ask");
 		expect(askNudges.length).toBe(1);
+	});
+
+	it("charges only the caller's ask budget when an unrelated environment session is active", async () => {
+		const cwd = await tempDir();
+		await setProjectBudget(cwd, 1);
+		process.env.GJC_SESSION_ID = TEST_SESSION_ID;
+		await createUltragoalPlan({ cwd, brief: SINGLE_BRIEF });
+		const unrelatedSessionId = "unrelated-ultragoal-session";
+		process.env.GJC_SESSION_ID = unrelatedSessionId;
+		await createUltragoalPlan({ cwd, brief: "Implement the unrelated story" });
+		const unrelatedLedger = await readUltragoalLedger(cwd, unrelatedSessionId);
+		const context = { sessionId: ` ${TEST_SESSION_ID} ` };
+		await expect(assertUltragoalAskAllowed(cwd, context)).rejects.toThrow(/try-harder nudge \(1\/1\)/);
+		expect(await readUltragoalLedger(cwd, unrelatedSessionId)).toEqual(unrelatedLedger);
+		await expect(assertUltragoalAskAllowed(cwd, context)).rejects.toThrow(/record-review-blockers/);
+		const ledger = await readUltragoalLedger(cwd, TEST_SESSION_ID);
+		const askNudges = ledger.filter(event => event.event === "nudge" && event.surface === "ask");
+		expect(askNudges).toHaveLength(1);
+		expect(askNudges[0]?.attempt).toBe(1);
+		expect(await readUltragoalLedger(cwd, unrelatedSessionId)).toEqual(unrelatedLedger);
+	});
+
+	// An anonymous caller has no attributable run: the ask assert permits the ask
+	// instead of charging a foreign session's nudge budget (issue #5465).
+	it("permits an anonymous ask without charging an ambient session's nudge budget", async () => {
+		const cwd = await tempDir();
+		await setProjectBudget(cwd, 1);
+		process.env.GJC_SESSION_ID = TEST_SESSION_ID;
+		await createUltragoalPlan({ cwd, brief: SINGLE_BRIEF });
+		const ledgerBefore = await readUltragoalLedger(cwd, TEST_SESSION_ID);
+		for (const context of [undefined, {}, { sessionId: null }, { sessionId: "   " }]) {
+			await expect(assertUltragoalAskAllowed(cwd, context ?? undefined)).resolves.toBeUndefined();
+		}
+		expect(await readUltragoalLedger(cwd, TEST_SESSION_ID)).toEqual(ledgerBefore);
 	});
 
 	// Session profile: the ask guard resolves the nudge budget from the

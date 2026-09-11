@@ -1,8 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
-import { FileLockTestHooks, withFileLock } from "../../src/config/file-lock";
+import { FileLockAcquireError, FileLockTestHooks, withFileLock } from "../../src/config/file-lock";
 import {
 	acquireLease,
 	canWriteEvents,
@@ -36,6 +36,25 @@ describe("SessionLease", () => {
 			const attempt = releaseLease(root, SID, "owner-a");
 			await expect(attempt).rejects.toBeInstanceOf(LeaseError);
 			await expect(attempt).rejects.toMatchObject({ code: "lease_lock_timeout" });
+		});
+	});
+
+	it("preserves orphan transition diagnostics instead of mapping them to lease timeout", async () => {
+		const filePath = sessionPaths(root, SID).lease;
+		const orphanPath = `${filePath}.lock.removing`;
+		const infoPath = path.join(orphanPath, "info");
+		await mkdir(orphanPath, { recursive: true });
+		await writeFile(infoPath, "", "utf8");
+		await writeFile(filePath, JSON.stringify({ ownerId: "owner-a" }), "utf8");
+		const old = new Date(Date.now() - 120_000);
+		await utimes(infoPath, old, old);
+
+		const failure = await releaseLease(root, SID, "owner-a").catch(error => error);
+		if (!(failure instanceof FileLockAcquireError)) throw new Error("Expected an orphan transition lock failure");
+		expect(failure).toMatchObject({
+			code: "orphan_transition",
+			reason: "orphan_transition",
+			orphanPath,
 		});
 	});
 

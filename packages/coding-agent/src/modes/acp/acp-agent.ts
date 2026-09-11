@@ -53,6 +53,7 @@ import { canonicalSessionCwd } from "../../sdk/broker/session-index";
 import { readSdkBrokerDiscovery, SdkClient, SdkClientError } from "../../sdk/client";
 import type { AbortScope } from "../../sdk/host/control/operations";
 import { SYNTHETIC_PROVIDER_ID } from "../../sdk/model-profile-namespace";
+import { failedPromptOutcome, isSdkPromptFailurePhase } from "../../sdk/prompt-failure";
 import type { SdkPromptTerminalOutcome } from "../../sdk/prompt-status";
 import { PromptActivity, type PromptWatchdogClock, systemPromptWatchdogClock } from "../../sdk/prompt-watchdog";
 import { validateRequiredPromptText } from "../../sdk/protocol/adapter-validation";
@@ -515,13 +516,15 @@ function terminalOutcome(event: JsonObject): SdkPromptTerminalOutcome | undefine
 		(outcome.code === "prompt_failed" || outcome.code === "prompt_deadline_exceeded") &&
 		typeof outcome.message === "string" &&
 		(outcome.provenance === "agent_failed" || outcome.provenance === "deadline")
-	)
-		return {
-			kind: "failed",
+	) {
+		return failedPromptOutcome({
 			code: outcome.code,
-			message: outcome.message,
 			provenance: outcome.provenance,
-		};
+			...(typeof outcome.providerCode === "string" ? { providerCode: outcome.providerCode } : {}),
+			...(isSdkPromptFailurePhase(outcome.phase) ? { phase: outcome.phase } : {}),
+			evidence: {},
+		});
+	}
 	return undefined;
 }
 

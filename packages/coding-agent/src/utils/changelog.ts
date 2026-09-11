@@ -87,9 +87,15 @@ export async function parseChangelog(changelogPath: string): Promise<ChangelogEn
  * dev runs, and `GJC_PACKAGE_DIR` / `PI_PACKAGE_DIR` overrides (which scope to
  * optional package assets like docs/examples and do not influence the
  * binary-identity changelog).
+ *
+ * Parsed once per process and cached: the embedded text is immutable, and the
+ * parse runs on the interactive startup path plus every /changelog invocation.
  */
+let displayChangelogEntriesCache: ChangelogEntry[] | undefined;
+
 export function getDisplayChangelogEntries(): ChangelogEntry[] {
-	return parseChangelogContent(CHANGELOG_TEXT);
+	displayChangelogEntriesCache ??= parseChangelogContent(CHANGELOG_TEXT);
+	return displayChangelogEntriesCache;
 }
 
 export function getInstalledVersionChangelogEntry(

@@ -242,6 +242,67 @@ async function runInstaller(
 	return { exitCode, stdout, stderr };
 }
 
+for (const [signal, exitCode] of [["INT", 130], ["TERM", 143], ["HUP", 129], ["none", 0]] as const) {
+	test(`settles late offer cancellation at the final signal check: ${signal}`, async () => {
+		const marker = path.join(sandbox.root, "signal-boundary");
+		const bashEnv = path.join(sandbox.root, "boundary.bash");
+		// DEBUG observes the actual script without rewriting it or adding a production hook.
+		await Bun.write(bashEnv, `set -T
+boundary_injected=""
+boundary_debug() {
+  case "$BASH_COMMAND" in
+    *OFFER_SIGNAL_EXIT*"-ne 0"*)
+      if [ -z "$boundary_injected" ]; then
+        boundary_injected=1
+        printf 'boundary\\n' >> "$GJC_TEST_BOUNDARY"
+        trap - DEBUG
+        if [ "$GJC_TEST_BOUNDARY_SIGNAL" != none ]; then
+          kill -s "$GJC_TEST_BOUNDARY_SIGNAL" "$$"
+        fi
+      fi
+      ;;
+  esac
+}
+trap boundary_debug DEBUG
+`);
+		const payload = `#!/bin/sh
+if [ "$1" = "--version" ]; then echo "gjc/${VERSION}"; exit 0; fi
+if [ "$1" = "--smoke-test" ] || [ "$1" = "--supports-macos-community-app" ]; then exit 0; fi
+if [ "$1" = "--internal-macos-community-app-offer" ]; then
+  printf 'offer\\n' >> "$GJC_TEST_OFFER_CALLS"
+  exit 0
+fi
+exit 1
+`;
+		await Bun.write(path.join(sandbox.shimDir, "uname"),
+			'#!/bin/sh\nif [ "$1" = "-s" ]; then echo Darwin; else echo x86_64; fi\n');
+		fs.chmodSync(path.join(sandbox.shimDir, "uname"), 0o755);
+		writeCurlShim(sandbox.shimDir, { assets: {
+			"gjc-darwin-x64": payload,
+			"gajae-release-binaries.sha256": `${sha256(payload)}  gjc-darwin-x64\n`,
+		} });
+		const offerCalls = path.join(sandbox.root, "offer-calls");
+		const result = await runInstaller([], {
+			BASH_ENV: bashEnv,
+			GJC_TEST_BOUNDARY: marker,
+			GJC_TEST_BOUNDARY_SIGNAL: signal,
+			GJC_TEST_OFFER_CALLS: offerCalls,
+			GJC_NO_COMMUNITY_APP: "0",
+			GJC_NONINTERACTIVE: "0",
+			CI: "0",
+			GITHUB_ACTIONS: "0",
+		}, { shell: "/bin/bash" });
+		expect(await Bun.file(marker).text()).toBe("boundary\n");
+		expect(result.exitCode).toBe(exitCode);
+		expect(await Bun.file(path.join(sandbox.installDir, "gjc")).text()).toBe(payload);
+		expect(await Bun.file(offerCalls).text()).toBe("offer\n");
+		expect(fs.readdirSync(sandbox.installDir)).toEqual(["gjc"]);
+		expect(result.stdout).toContain(`Installed gjc ${VERSION}`);
+		if (signal === "none") expect(result.stdout).toMatch(/Run 'gjc' to get started!|Add .+ to your PATH, then run 'gjc'/);
+		else expect(result.stdout).not.toMatch(/Run 'gjc' to get started!|Add .+ to your PATH, then run 'gjc'/);
+	}, 30_000);
+}
+
 async function runPipedInstaller(
 	args: string[],
 	env: Record<string, string> = {},

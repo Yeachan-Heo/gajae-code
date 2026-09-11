@@ -5,10 +5,12 @@ import * as path from "node:path";
 import { getBundledModel } from "@gajae-code/ai";
 import { AsyncJobManager } from "@gajae-code/coding-agent/async";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
+import * as internalUrls from "@gajae-code/coding-agent/internal-urls";
+import { resolveLocalRoot, resolveLocalUrlToPath } from "@gajae-code/coding-agent/internal-urls";
 import { createAgentSession } from "@gajae-code/coding-agent/sdk";
 import { SKILL_PROMPT_MESSAGE_TYPE } from "@gajae-code/coding-agent/session/messages";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
-import { postmortem, Snowflake } from "@gajae-code/utils";
+import { getAgentDir, postmortem, Snowflake, setAgentDir } from "@gajae-code/utils";
 import { FileLockTestHooks } from "../src/config/file-lock";
 import { sessionRuntimeDir } from "../src/gjc-runtime/session-layout";
 import {
@@ -37,8 +39,10 @@ describe("move_session tool (agent-invokable session rescope)", () => {
 	// are deleted, or every later shell init in this process fails with a
 	// dead getcwd (matches the real /move semantics: the process follows).
 	const processCwdAtStart = process.cwd();
+	const agentDirAtStart = getAgentDir();
 
 	afterEach(() => {
+		setAgentDir(agentDirAtStart);
 		FileLockTestHooks.afterParentMkdir = undefined;
 		__sessionStateSidecarTestHooks.beforePersistFromEvent = undefined;
 		__sessionStateSidecarTestHooks.beforeRescopeClear = undefined;
@@ -97,6 +101,91 @@ describe("move_session tool (agent-invokable session rescope)", () => {
 			const pwd = await bashTool.execute("pwd-after-move-session", { command: "pwd" });
 			expect(textContent(pwd)).toContain(cwdB);
 		} finally {
+			await session.dispose();
+		}
+	}, 20_000);
+
+	it.each([
+		false,
+		true,
+	])("initializes local storage when an explicit session moves to managed storage (populated=%s)", async populated => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		setAgentDir(tempDir);
+		const cwdA = path.join(tempDir, "root");
+		const cwdB = path.join(cwdA, "repo-b");
+		fs.mkdirSync(cwdB, { recursive: true });
+		const sessionManager = SessionManager.create(
+			cwdA,
+			SessionManager.explicitDestination(path.join(tempDir, "shared")),
+		);
+		const { session } = await makeSession(cwdA, sessionManager, { toolNames: ["move_session"] });
+		const localOptions = {
+			getArtifactsDir: () => sessionManager.getArtifactsDir(),
+			isManagedDestination: () => sessionManager.isManagedDestination(),
+			getManagedLegacyLocalMigrationSource: () => sessionManager.getManagedLegacyLocalMigrationSource(),
+			getSessionId: () => sessionManager.getSessionId(),
+		};
+		tempDirs.push(resolveLocalRoot({ ...localOptions, isManagedDestination: () => true }));
+		let observerPath: string | undefined;
+		const unregister = sessionManager.registerAfterMoveListener(() => {
+			observerPath = resolveLocalUrlToPath("local://note.txt", localOptions);
+		});
+		try {
+			await sessionManager.ensureOnDisk();
+			if (populated)
+				await Bun.write(resolveLocalUrlToPath("local://note.txt", localOptions), "preserved across move\n");
+			if (populated)
+				await session.getToolByName("move_session")!.execute("move-local-artifacts", { path: "repo-b" });
+			else await sessionManager.moveTo(cwdB);
+			expect(sessionManager.isManagedDestination()).toBe(true);
+			const resolved = resolveLocalUrlToPath("local://note.txt", localOptions);
+			expect(resolved).toBe(path.join(os.tmpdir(), "gjc-local", session.sessionId, "note.txt"));
+			expect(observerPath).toBe(resolved);
+			if (populated) expect(await Bun.file(resolved).text()).toBe("preserved across move\n");
+			else expect(await Bun.file(resolved).exists()).toBe(false);
+			await Bun.write(resolved, "writable after move\n");
+			expect(await Bun.file(resolved).text()).toBe("writable after move\n");
+		} finally {
+			unregister();
+			await session.dispose();
+		}
+	}, 20_000);
+
+	it("settles coordinator persistence when post-move local initialization fails", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const cwdA = path.join(tempDir, "root");
+		const cwdB = path.join(cwdA, "repo-b");
+		fs.mkdirSync(cwdB, { recursive: true });
+		const sessionManager = SessionManager.create(cwdA, SessionManager.managedDestination(cwdA, tempDir));
+		const { session } = await makeSession(cwdA, sessionManager, { toolNames: ["move_session"] });
+		const readiness = spyOn(internalUrls, "initializeLocalRoot").mockRejectedValueOnce(
+			new Error("injected post-move local initialization failure"),
+		);
+		try {
+			const sessionId = session.sessionId;
+			await persistCoordinatorRuntimeStateFromEvent(
+				{ type: "agent_start" },
+				{ sessionId, cwd: cwdA, sessionFile: sessionManager.getSessionFile() ?? null },
+			);
+			const launcherFile = path.join(sessionRuntimeDir(cwdA, sessionId), "runtime-state.json");
+			const targetFile = path.join(sessionRuntimeDir(cwdB, sessionId), "runtime-state.json");
+
+			await sessionManager.moveTo(cwdB);
+			await Promise.race([
+				persistCoordinatorRuntimeStateFromEvent(
+					{ type: "turn_start" },
+					{ sessionId, cwd: cwdB, sessionFile: sessionManager.getSessionFile() ?? null },
+				),
+				Bun.sleep(5_000).then(() => {
+					throw new Error("coordinator persistence remained blocked after post-move failure");
+				}),
+			]);
+			expect(fs.existsSync(launcherFile)).toBe(false);
+			expect((JSON.parse(fs.readFileSync(targetFile, "utf8")) as Record<string, unknown>).event).toBe("turn_start");
+		} finally {
+			readiness.mockRestore();
 			await session.dispose();
 		}
 	}, 20_000);

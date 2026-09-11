@@ -1,6 +1,6 @@
 import { logger } from "@gajae-code/utils";
 import { AUTOROUTING_INACTIVE_WARNING } from "../../config/autorouting-contract";
-import { FileLockAcquireError } from "../../config/file-lock";
+import { isFileLockAcquireTimeout } from "../../config/file-lock";
 import { redactBrokerRuntimeCapabilities, redactObservedRequestContent } from "./control/runtime-gate";
 import { type EventFrame, SessionEventStream } from "./events";
 import { isAutoroutingInactive } from "./internal-autorouting-state";
@@ -395,12 +395,7 @@ export class SessionSdkHost {
 				// the durable row in place is fail-closed because peers still fence
 				// authority on process liveness and incarnation, while propagating the
 				// contention error turns ordinary shutdown into an uncaught failure.
-				if (
-					!options.allowLockContention ||
-					!(error instanceof FileLockAcquireError) ||
-					error.code !== "acquire_timeout"
-				)
-					throw error;
+				if (!options.allowLockContention || !isFileLockAcquireTimeout(error)) throw error;
 				logger.warn("sdk broker unregister deferred because the session index is busy", {
 					holder: error.holder,
 					lockPath: error.lockPath,

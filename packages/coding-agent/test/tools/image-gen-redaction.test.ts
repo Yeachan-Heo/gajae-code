@@ -125,4 +125,25 @@ describe("redactImageProviderText", () => {
 		// Scheme and host stay readable so the error still says which host failed.
 		expect(url).toContain("assets.example.com");
 	});
+	it("redacts the vendor tokens the egress guard classifies as credential-like", () => {
+		// `crash/upstream/envelope.ts` refuses to transmit these four shapes.
+		// Assembled at runtime so no literal of this shape is committed.
+		const cases = {
+			npm: ["npm", "a".repeat(36)].join("_"),
+			gitlab: ["glpat", "b".repeat(24)].join("-"),
+			stripe: ["sk", "live", "c".repeat(24)].join("_"),
+			huggingface: ["hf", "d".repeat(34)].join("_"),
+		};
+		for (const value of Object.values(cases)) {
+			const out = redactImageProviderText(`observed ${value} in the log`);
+			expect(out).not.toContain(value);
+			expect(out).toContain("observed");
+		}
+	});
+
+	it("keeps vendor prefix lookalikes that are too short to be tokens", () => {
+		for (const benign of ["npm install express", "the hf_ prefix", "glpat-short"]) {
+			expect(redactImageProviderText(benign)).toContain(benign.split(" ")[0]);
+		}
+	});
 });

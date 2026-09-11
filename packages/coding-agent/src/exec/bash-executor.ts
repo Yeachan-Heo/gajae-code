@@ -533,6 +533,10 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 			!abortPromise
 		) {
 			abortPromise = activeShell.abort();
+			// Cancellation owns this acknowledgement immediately: the run can settle
+			// before cleanup reaches it, and worker close can reject both promises.
+			// Keep the original promise for cleanup without an unobserved window.
+			void abortPromise.catch(() => undefined);
 		}
 	};
 	const abortDeferred = Promise.withResolvers<"abort">();
@@ -549,9 +553,6 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 			),
 			Bun.sleep(CANCEL_CLEANUP_WAIT_MS).then(() => false),
 		]);
-		if (abortPromise) {
-			await Promise.race([abortPromise.catch(() => undefined), Bun.sleep(CANCEL_CLEANUP_WAIT_MS)]);
-		}
 		return settled;
 	};
 	if (userSignal) {
@@ -796,6 +797,12 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 			// must not wait behind an abort acknowledgement from a stopped runtime.
 			const disposePromise = oneShotShell.close();
 			await Promise.race([disposePromise.catch(() => undefined), Bun.sleep(CANCEL_CLEANUP_WAIT_MS)]);
+		}
+		// Also join cancellation requested after run settlement or on a path that
+		// skipped run cleanup. Close first so a pending acknowledgement cannot
+		// hold a one-shot worker open.
+		if (abortPromise) {
+			await Promise.race([abortPromise.catch(() => undefined), Bun.sleep(CANCEL_CLEANUP_WAIT_MS)]);
 		}
 	}
 }

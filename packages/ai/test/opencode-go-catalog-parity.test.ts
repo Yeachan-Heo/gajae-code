@@ -1,5 +1,8 @@
 import { describe, expect, test } from "bun:test";
+import { Effort, getSupportedEfforts } from "../src/model-thinking";
+import { getBundledModel } from "../src/models";
 import models from "../src/models.json" with { type: "json" };
+import { MODELS_DEV_PROVIDER_DESCRIPTORS, mapModelsDevToModels } from "../src/provider-models/openai-compat";
 
 const LIVE_OPENCODE_GO_MODEL_IDS = [
 	"minimax-m3",
@@ -35,11 +38,46 @@ const LIVE_OPENCODE_GO_MODEL_IDS = [
 	"grok-4.5",
 	"grok-4.6",
 	"muse-spark-1.2-contributor",
+	"muse-spark-1.3-contributor",
 ] as const;
 
 const catalog = models["opencode-go"];
 
 describe("OpenCode Go catalog parity", () => {
+	test("bundles the provisional Muse 1.3 contract without advertising unsupported modalities", () => {
+		const model = getBundledModel("opencode-go", "muse-spark-1.3-contributor");
+		expect(model).toMatchObject({
+			id: "muse-spark-1.3-contributor",
+			name: "Muse Spark 1.3 Contributor",
+			api: "openai-responses",
+			provider: "opencode-go",
+			baseUrl: "https://opencode.ai/zen/go/v1",
+			reasoning: true,
+			contextWindow: 1_048_576,
+			maxTokens: 131_072,
+			cost: { input: 0.1, output: 0.2, cacheRead: 0.002, cacheWrite: 0 },
+		});
+		expect(model.input).toEqual(["text", "image"]);
+		expect(getSupportedEfforts(model)).toEqual([
+			Effort.Minimal,
+			Effort.Low,
+			Effort.Medium,
+			Effort.High,
+			Effort.XHigh,
+		]);
+	});
+
+	test("routes only the exact Go Contributor id through the curated Responses override", () => {
+		const ids = ["muse-spark-1.3-contributor", "muse-spark-1.3", "muse-spark-1.4-contributor"];
+		const entries = Object.fromEntries(ids.map(id => [id, { name: id, tool_call: true }]));
+		const mapped = mapModelsDevToModels({ "opencode-go": { models: entries } }, MODELS_DEV_PROVIDER_DESCRIPTORS);
+		for (const id of ids) {
+			expect(mapped.find(model => model.provider === "opencode-go" && model.id === id)?.api).toBe(
+				id === "muse-spark-1.3-contributor" ? "openai-responses" : "openai-completions",
+			);
+		}
+	});
+
 	test("represents every id in the live provider fixture", () => {
 		expect(Object.keys(catalog).sort()).toEqual([...LIVE_OPENCODE_GO_MODEL_IDS].sort());
 	});
