@@ -487,7 +487,8 @@ async function finishDetachedLockCleanup(owner: FileLockOwnerToken): Promise<boo
 		}
 		if (process.platform === "win32") {
 			const removal = nativeFileLockBindings().exactRemoveDirectoryTree(pending.path, pending.snapshot);
-			if (!removal.ok && removal.code !== "not_found" && removal.code !== "cleanup_pending")
+			if (removal.code === "cleanup_pending") return false;
+			if (!removal.ok && removal.code !== "not_found")
 				throw new Error(`Failed to finish detached file lock cleanup: ${removal.code ?? "unknown"}.`);
 		} else {
 			await fs.rm(pending.path, { recursive: true, force: true });
@@ -919,6 +920,7 @@ async function isNativeExactRemovalUsable(): Promise<boolean> {
 async function removeVerifiedLockDirWithoutNative(
 	lockDir: string,
 	expected: NonNullable<NativeDirectoryTreeResult["snapshot"]>,
+	owner?: FileLockOwnerToken,
 ): Promise<FileLockGcRemoval> {
 	let parent: BigIntStats;
 	try {
@@ -938,15 +940,23 @@ async function removeVerifiedLockDirWithoutNative(
 	if (removal.code === "not_found") return "removed";
 	if (removal.code === "identity_mismatch" || removal.code === "parent_mismatch") return "owner_changed";
 	if (!removal.detachedPath) return "cleanup_failed";
+	if (owner) {
+		pendingDetachedLockCleanups.set(owner, {
+			path: removal.detachedPath,
+			rootDev: expected.rootDev,
+			rootIno: expected.rootIno,
+			snapshot: expected,
+		});
+		return (await finishDetachedLockCleanup(owner)) ? "removed" : "cleanup_failed";
+	}
 	const completed = nativeFileLockBindings().exactRemoveDirectoryTree(removal.detachedPath, expected);
-	return completed.ok || completed.code === "not_found" || completed.code === "cleanup_pending"
-		? "removed"
-		: "cleanup_failed";
+	return completed.ok || completed.code === "not_found" ? "removed" : "cleanup_failed";
 }
 
 async function removeVerifiedOwnedLockDirWithoutNative(
 	lockDir: string,
 	expected: GenericFileLockDirIdentity,
+	owner: FileLockOwnerToken,
 ): Promise<FileLockGcRemoval> {
 	try {
 		await fs.lstat(lockDir, { bigint: true });
@@ -973,7 +983,7 @@ async function removeVerifiedOwnedLockDirWithoutNative(
 		infoEntry.sha256 !== expected.infoSha256
 	)
 		return "owner_changed";
-	return await removeVerifiedLockDirWithoutNative(lockDir, captured.snapshot);
+	return await removeVerifiedLockDirWithoutNative(lockDir, captured.snapshot, owner);
 }
 
 export type GenericFileLockDirStaleVerdict = { stale: false } | { stale: true; identity: GenericFileLockDirIdentity };
@@ -1025,7 +1035,7 @@ export async function removeFileLockDirForGc(
 		return "owner_changed";
 	}
 	if (!(await isNativeExactRemovalUsable()))
-		return await removeVerifiedOwnedLockDirWithoutNative(lockDir, expectedIdentity);
+		return await removeVerifiedOwnedLockDirWithoutNative(lockDir, expectedIdentity, expected);
 	// The token comparison above authorizes the content that was judged, not the
 	// pathname. When the caller carried pre-verdict root/info identity, require
 	// the post-verdict native snapshot to match that same object before removal;
@@ -1090,8 +1100,7 @@ export async function removeFileLockDirForGc(
 			rootIno: captured.snapshot.rootIno,
 			snapshot: captured.snapshot,
 		});
-		await finishDetachedLockCleanup(expected);
-		return "removed";
+		return (await finishDetachedLockCleanup(expected)) ? "removed" : "cleanup_failed";
 	}
 	if (removed.code === "not_found") return "removed";
 	if (removed.code === "identity_mismatch") return "owner_changed";
@@ -1430,7 +1439,7 @@ async function quarantineReleasedLock(
 	// failure instead of risking a successor lock.
 	if (!expectedIdentity) return false;
 	if (!(await isNativeExactRemovalUsable()))
-		return (await removeVerifiedOwnedLockDirWithoutNative(lockPath, expectedIdentity)) === "removed";
+		return (await removeVerifiedOwnedLockDirWithoutNative(lockPath, expectedIdentity, owner)) === "removed";
 	let captured: NativeDirectoryTreeResult;
 	const nativeCapturePath = await canonicalLockPathPreservingFinal(lockPath);
 	try {
@@ -1486,8 +1495,7 @@ async function quarantineReleasedLock(
 					rootIno: captured.snapshot.rootIno,
 					snapshot: captured.snapshot,
 				});
-				await finishDetachedLockCleanup(owner);
-				return true;
+				return await finishDetachedLockCleanup(owner);
 			}
 			throw error;
 		}

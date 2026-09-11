@@ -911,6 +911,53 @@ describe("file lock cleanup failure handling (#2478)", () => {
 		expect(await fs.exists(lockDir)).toBe(false);
 	});
 
+	test("does not report success while detached cleanup is pending", async () => {
+		const base = await makeTemp();
+		const lockedFile = path.join(base, "state.json");
+		const lockDir = `${lockedFile}.lock`;
+		let detachedPath: string | undefined;
+		let cleanupCalls = 0;
+		let failFilesystemCleanup = true;
+		const realRm = fs.rm;
+		vi.spyOn(fs, "rm").mockImplementation((async (target, options) => {
+			if (process.platform !== "win32" && failFilesystemCleanup && detachedPath === String(target)) {
+				failFilesystemCleanup = false;
+				throw Object.assign(new Error("cleanup pending"), { code: "cleanup_pending" });
+			}
+			return realRm(target, options);
+		}) as typeof fs.rm);
+		FileLockTestHooks.nativeExactRemovalProbe = () => false;
+		FileLockTestHooks.nativeQuarantineBindings = () => ({
+			snapshotDirectoryTree,
+			exactRemoveDirectoryTree: (target, _snapshot, _parent, detachOnly) => {
+				if (detachOnly) {
+					detachedPath = `${target}.removing`;
+					renameSync(target, detachedPath);
+					return { ok: true, detachedPath };
+				}
+				cleanupCalls++;
+				if (cleanupCalls === 1) return { ok: false, code: "cleanup_pending", detachedPath: target };
+				rmSync(target, { recursive: true, force: true });
+				return { ok: true };
+			},
+		});
+
+		await expect(withFileLock(lockedFile, async () => undefined)).rejects.toThrow();
+		expect(detachedPath).toBeDefined();
+		if (!detachedPath) throw new Error("Expected a detached lock path");
+		expect(await fs.exists(lockDir)).toBe(false);
+		expect(await fs.exists(detachedPath)).toBe(true);
+
+		let entered = false;
+		await withFileLock(lockedFile, async () => {
+			entered = true;
+		});
+
+		expect(entered).toBe(true);
+		expect(await fs.exists(detachedPath)).toBe(false);
+		expect(await fs.exists(lockDir)).toBe(false);
+	});
+
 	test("keeps a successor after fallback validation races with replacement", async () => {
 		const base = await makeTemp();
 		const lockedFile = path.join(base, "state.json");
