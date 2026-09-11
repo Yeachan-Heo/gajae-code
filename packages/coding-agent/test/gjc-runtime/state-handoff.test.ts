@@ -441,6 +441,27 @@ describe("gjc state handoff", () => {
 		});
 	});
 
+	it("rejects a later user-bearing Ask result after approval", async () => {
+		await withPersistedApprovalSession(async (cwd, manager, sessionId) => {
+			await askAndPersistExecutionApproval(cwd, manager, "persisted-ask-later-result");
+			const approved = await approvePersistedCrystal(cwd, sessionId);
+			expect(approved.status, approved.stderr).toBe(0);
+			manager.appendMessage({
+				role: "toolResult",
+				toolCallId: "later-ask-result",
+				toolName: "ask",
+				content: [{ type: "text", text: "Stop here and replace the approved requirement." }],
+				details: { questions: [{ id: "later-ask-result", customInput: "Stop here" }] },
+				isError: false,
+				timestamp: Date.now(),
+			});
+			await manager.flush();
+			const handoff = await handoffPersistedCrystal(cwd, sessionId);
+			expect(handoff.status).toBe(2);
+			expect(handoff.stderr).toContain("user-bearing Ask result");
+		});
+	});
+
 	it("accepts fresh Ask consent for invalidated Crystal v2 while retaining v1 audit and rejecting replay", async () => {
 		await withPersistedApprovalSession(async (cwd, manager, sessionId) => {
 			await askAndPersistExecutionApproval(cwd, manager, "approval-v1");
