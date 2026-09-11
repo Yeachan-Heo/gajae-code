@@ -151,24 +151,35 @@ function safeReferences(references: readonly EvidenceReference[] | undefined): E
 		.filter(ref => ref && referenceKinds.has(ref.kind) && typeof ref.value === "string")
 		.map(ref => ({ kind: ref.kind, value: ref.value }));
 }
+const DAEMON_STATUS_TEXT_BYTES = 128;
+const DAEMON_KINDS = ["telegram", "discord", "slack"] as const;
+const DAEMON_HEALTHS = ["not_configured", "stopped", "running", "stale", "stopping", "error"] as const;
+
+function boundedUtf8(value: string, maxBytes: number): string {
+	if (Buffer.byteLength(value, "utf8") <= maxBytes) return value;
+	let end = Math.min(value.length, maxBytes);
+	while (end > 0 && Buffer.byteLength(value.slice(0, end), "utf8") > maxBytes) end--;
+	return value.slice(0, end);
+}
+
 function boundedDaemonStatuses(statuses: readonly DaemonStatus[] | undefined): DaemonStatus[] {
 	if (!Array.isArray(statuses)) return [];
 	return statuses.slice(0, 3).map(status => ({
-		kind: status.kind,
+		kind: DAEMON_KINDS.includes(status.kind) ? status.kind : "telegram",
 		configured: status.configured === true,
-		health: status.health,
+		health: DAEMON_HEALTHS.includes(status.health) ? status.health : "error",
 		...(Number.isSafeInteger(status.pid) && status.pid > 0 ? { pid: status.pid } : {}),
-		...(typeof status.ownerId === "string" && status.ownerId.length <= 1024 ? { ownerId: status.ownerId } : {}),
+		...(typeof status.ownerId === "string" ? { ownerId: boundedUtf8(status.ownerId, DAEMON_STATUS_TEXT_BYTES) } : {}),
 		...(Number.isSafeInteger(status.rootCount) && status.rootCount >= 0 ? { rootCount: status.rootCount } : {}),
 		runtime: {
-			mode: status.runtime.mode,
-			execPath: status.runtime.execPath.slice(0, 1024),
+			mode: status.runtime.mode === "compiled" ? "compiled" : "source",
+			execPath: boundedUtf8(status.runtime.execPath, DAEMON_STATUS_TEXT_BYTES),
 			reloadPicksUpSourceEdits: status.runtime.reloadPicksUpSourceEdits === true,
-			...(typeof status.runtime.warning === "string" && status.runtime.warning.length <= 1024
-				? { warning: status.runtime.warning }
+			...(typeof status.runtime.warning === "string"
+				? { warning: boundedUtf8(status.runtime.warning, DAEMON_STATUS_TEXT_BYTES) }
 				: {}),
 		},
-		...(typeof status.detail === "string" && status.detail.length <= 1024 ? { detail: status.detail } : {}),
+		...(typeof status.detail === "string" ? { detail: boundedUtf8(status.detail, DAEMON_STATUS_TEXT_BYTES) } : {}),
 	}));
 }
 export function normalizePublicCommandFailure(error: unknown): PublicCommandFailure {
