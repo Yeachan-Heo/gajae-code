@@ -609,8 +609,12 @@ function isUnsafeConfirmedStatement(profile: CrystalSemanticProfile): boolean {
 
 /** A terse acknowledgement has no requirement context of its own and cannot anchor a Crystal item. */
 function isContextFreeAcknowledgement(value: string): boolean {
-	return /^(?:yes|no|yep|yeah|yup|sure|okay|ok|affirmative|true|false|correct|incorrect|agreed|absolutely|done|finished|confirmed|confirm|acknowledged|understood|got\s+it|sounds\s+good|looks\s+good|great|fine|thanks|thank\s+you|네|예|맞아|맞습니다|是|对|對|はい|ええ)[.!。！？]?$/iu.test(
-		value.trim(),
+	const normalized = value
+		.trim()
+		.replace(/\p{P}{1,8}$/gu, "")
+		.trim();
+	return /^(?:yes|no|yep|yeah|yup|sure|okay|ok|affirmative|true|false|correct|incorrect|agreed|absolutely|done|finished|confirmed|confirm|acknowledged|understood|got\s+it|sounds\s+good|looks\s+good|great|fine|thanks|thank\s+you|네|예|맞아|맞습니다|是|对|對|はい|ええ)$/iu.test(
+		normalized,
 	);
 }
 
