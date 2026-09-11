@@ -14,6 +14,7 @@ import {
 import { runNativeRalplanCommand } from "@gajae-code/coding-agent/gjc-runtime/ralplan-runtime";
 import { auditPath, modeStatePath, sessionStateDir } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
 import {
+	captureExecutionApprovalPresentation,
 	DEEP_INTERVIEW_EXECUTION_APPROVAL_MAX_AGE_MS,
 	deepInterviewExecutionApprovalRecordPath,
 	type ExecutionApprovalStage,
@@ -112,6 +113,7 @@ async function publish(cwd: string, sessionId: string, stage: ExecutionApprovalS
 
 async function ask(cwd: string, manager: SessionManager, stage: ExecutionApprovalStage, id = "approve-report") {
 	const label = "Approve execution via ultragoal";
+	const toolCallId = `provider-${id}`;
 	const workflowGate =
 		stage === "deep-interview"
 			? { stage: "deep-interview" as const, kind: "execution" as const }
@@ -126,7 +128,7 @@ async function ask(cwd: string, manager: SessionManager, stage: ExecutionApprova
 			},
 		],
 	};
-	manager.appendMessage(assistant([{ type: "toolCall", id, name: "ask", arguments: args }]));
+	manager.appendMessage(assistant([{ type: "toolCall", id: toolCallId, name: "ask", arguments: args }]));
 	await manager.flush();
 	const tool = new AskTool({
 		cwd,
@@ -137,10 +139,10 @@ async function ask(cwd: string, manager: SessionManager, stage: ExecutionApprova
 		getSessionSpawns: () => "*",
 	});
 	const context = { hasUI: true, ui: { select: async () => label }, abort: () => {} } as unknown as AgentToolContext;
-	const result = await tool.execute(id, args, undefined, undefined, context);
+	const result = await tool.execute(toolCallId, args, undefined, undefined, context);
 	manager.appendMessage({
 		role: "toolResult",
-		toolCallId: id,
+		toolCallId,
 		toolName: "ask",
 		content: result.content,
 		details: result.details,
@@ -286,12 +288,14 @@ describe("non-Crystal user-gated execution approval", () => {
 						approvalStage: stage,
 						questionId: previous.question_id,
 						gateId,
+						toolCallId: `provider-${previous.question_id}`,
 						target: "ultragoal",
 						selectedOptions: ["Approve execution via ultragoal"],
 						transcriptPath,
 						transcriptSha256: createHash("sha256")
 							.update(await fs.readFile(transcriptPath))
 							.digest("hex"),
+						presentation: await captureExecutionApprovalPresentation(cwd, sessionId, stage),
 					});
 				};
 				await expect(record("fresh-gate-same-publication")).rejects.toThrow("replay");
@@ -407,6 +411,8 @@ describe("non-Crystal user-gated execution approval", () => {
 				transcriptSha256: createHash("sha256")
 					.update(await fs.readFile(transcriptPath))
 					.digest("hex"),
+				toolCallId: `provider-${previous.question_id}`,
+				presentation: await captureExecutionApprovalPresentation(cwd, sessionId, "deep-interview"),
 			};
 			await expect(
 				recordDeepInterviewExecutionApproval({ ...descriptor, gateId: previous.gate_id }),

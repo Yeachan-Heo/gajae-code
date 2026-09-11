@@ -607,9 +607,9 @@ function isUnsafeConfirmedStatement(profile: CrystalSemanticProfile): boolean {
 	);
 }
 
-/** A binary reply has no requirement context of its own and cannot anchor a Crystal item. */
-function isContextFreeAffirmative(value: string): boolean {
-	return /^(?:yes|yep|yeah|yup|sure|okay|ok|affirmative|true|correct|agreed|네|예|맞아|맞습니다|是|对|對|はい|ええ)[.!。！？]?$/iu.test(
+/** A terse acknowledgement has no requirement context of its own and cannot anchor a Crystal item. */
+function isContextFreeAcknowledgement(value: string): boolean {
+	return /^(?:yes|no|yep|yeah|yup|sure|okay|ok|affirmative|true|false|correct|incorrect|agreed|absolutely|done|finished|confirmed|confirm|acknowledged|understood|got\s+it|sounds\s+good|looks\s+good|great|fine|thanks|thank\s+you|네|예|맞아|맞습니다|是|对|對|はい|ええ)[.!。！？]?$/iu.test(
 		value.trim(),
 	);
 }
@@ -727,8 +727,8 @@ function validateItems(value: unknown, snapshot?: CrystalSnapshot): CrystalItem[
 					!hasVerbatimTokenBoundaries(anchorMessage.content, item.anchor.quote) ||
 					hasLaterSupersedingCorrection(anchorMessage.content, item.anchor.quote, item.statement) ||
 					quoteTerms.size === 0 ||
-					isContextFreeAffirmative(item.statement) ||
-					isContextFreeAffirmative(item.anchor.quote) ||
+					isContextFreeAcknowledgement(item.statement) ||
+					isContextFreeAcknowledgement(item.anchor.quote) ||
 					statementTerms.size === 0 ||
 					[...statementTerms].some(term => !quoteTerms.has(term)) ||
 					[...quoteTerms].some(term => !statementTerms.has(term)) ||
