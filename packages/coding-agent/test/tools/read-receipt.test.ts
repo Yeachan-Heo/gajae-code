@@ -21,7 +21,7 @@ function createSession(cwd: string, settings: Settings = Settings.isolated()): T
 	return {
 		cwd,
 		hasUI: false,
-		hasEditTool: false,
+		hasEditTool: true,
 		getSessionFile: () => path.join(cwd, "session.jsonl"),
 		getSessionSpawns: () => "*",
 		getArtifactsDir: () => sessionDir,
@@ -206,7 +206,7 @@ describe("read receipt by default", () => {
 			endLine: i + 1,
 			text: `const line${i} = "${"x".repeat(300)}";`,
 		}));
-		summarySegments = [{ kind: "elided", startLine: 101, endLine: 110 }, ...kept];
+		summarySegments = [...kept, { kind: "elided", startLine: 101, endLine: 110 }];
 
 		const result = await read(file, receiptSettings({ "read.summarize.enabled": true }));
 		const text = textOf(result);
@@ -220,6 +220,203 @@ describe("read receipt by default", () => {
 		const small = await read(file, receiptSettings({ "read.summarize.enabled": true }));
 		expect(textOf(small)).not.toContain("Summary truncated at");
 	});
+	it("caps directional summaries in source order without splitting merged UTF-8 brace units", async () => {
+		const file = path.join(testDir, "directional-summary.ts");
+		fs.writeFileSync(file, "export const fixture = true;\n");
+		summarySegments = Array.from({ length: 10 }, (_, index) => [
+			{
+				kind: "code",
+				startLine: index * 5 + 1,
+				endLine: index * 5 + 1,
+				text: `export function fn${index}_${"한".repeat(90)}() {`,
+			},
+			{ kind: "elided", startLine: index * 5 + 2, endLine: index * 5 + 4 },
+			{ kind: "code", startLine: index * 5 + 5, endLine: index * 5 + 5, text: "}" },
+		]).flat();
+		const settings = receiptSettings({
+			"read.summarize.enabled": true,
+			"read.summaryMaxBytes": 1,
+			readHashLines: true,
+		});
+		for (const truncation of ["head", "last", "both"] as const) {
+			const result = await read(file, settings, { truncation });
+			const text = textOf(result);
+			const body = text.split("\n\n[")[0] ?? "";
+			const expected = truncation === "head" ? [0, 1, 2] : truncation === "last" ? [7, 8, 9] : [0, 1, 9];
+			const indexes = (value: string) =>
+				[...value.matchAll(/export function fn(\d+)_/g)].map(match => Number(match[1]));
+			expect(indexes(body)).toEqual(expected);
+			expect(indexes(bodyOf(result))).toEqual(expected);
+			expect(Buffer.byteLength(body, "utf8")).toBeLessThanOrEqual(1024);
+			expect(Buffer.from(body, "utf8").toString("utf8")).toBe(body);
+			const anchors = [...body.matchAll(/^(\d+)[a-z]{2}-(\d+)[a-z]{2}\|/gm)].map(match => [
+				Number(match[1]),
+				Number(match[2]),
+			]);
+			expect(anchors).toEqual(expected.map(index => [index * 5 + 1, index * 5 + 5]));
+			expect(body.match(/\{ \.\. \}/g)).toHaveLength(3);
+			const omitted = truncation === "head" ? "16-50" : truncation === "last" ? "1-35" : "11-45";
+			expect(body).toContain(`[… source lines ${omitted} omitted …]`);
+			expect(body.match(/source lines .* omitted/g)).toHaveLength(1);
+			expect(
+				bodyOf(result)
+					.split("\n")
+					.find(line => line.includes("omitted")),
+			).toBe(`[… source lines ${omitted} omitted …]`);
+			expect(text.match(/Summary truncated at 1 KiB/g)).toHaveLength(1);
+			expect(text.match(/elided regions;/g)).toHaveLength(1);
+			expect(text).toContain(`${file}:1-50`);
+			if (truncation !== "head") {
+				expect(text).toContain(`; truncation: ${truncation};`);
+			}
+			expect(result.details?.summary).toMatchObject({ elidedSpans: 10, elidedLines: 44, lines: 4 });
+		}
+		const defaultResult = await read(file, settings);
+		const explicitHead = await read(file, settings, { truncation: "head" });
+		expect(textOf(defaultResult)).toBe(textOf(explicitHead));
+	});
+
+	it("omits oversized edge units at their actual positions without fabricating anchors", async () => {
+		const file = path.join(testDir, "oversized-summary.ts");
+		fs.writeFileSync(file, "export const fixture = true;\n");
+		const settings = receiptSettings({ "read.summarize.enabled": true, "read.summaryMaxBytes": 1 });
+		for (const oversizedFirst of [true, false]) {
+			summarySegments = [
+				{ kind: "code", startLine: 1, endLine: 1, text: oversizedFirst ? "한".repeat(400) : "first" },
+				{ kind: "elided", startLine: 2, endLine: 4 },
+				{ kind: "code", startLine: 5, endLine: 5, text: oversizedFirst ? "last" : "한".repeat(400) },
+			];
+			for (const truncation of ["head", "last", "both"] as const) {
+				const result = await read(file, settings, { truncation });
+				const body = bodyOf(result);
+				expect(Buffer.byteLength(body, "utf8")).toBeLessThanOrEqual(1024);
+				expect(body).not.toContain("한");
+				expect(textOf(result)).not.toContain("retained");
+				if (truncation !== "head") expect(textOf(result)).toContain(`; truncation: ${truncation};`);
+				const blocked = oversizedFirst ? truncation === "head" : truncation === "last";
+				if (blocked) {
+					expect(body).toBe("[… source lines 1-5 omitted …]");
+					expect(result.details?.summary).toMatchObject({ elidedSpans: 3, elidedLines: 5 });
+				} else {
+					expect(body).toBe(
+						oversizedFirst
+							? "[… source lines 1-1 omitted …]\n...\nlast"
+							: "first\n...\n[… source lines 5-5 omitted …]",
+					);
+					expect(result.details?.summary).toMatchObject({ elidedSpans: 2, elidedLines: 4 });
+				}
+			}
+		}
+	});
+
+	it("keeps a zero-byte summary body empty and places the omitted range in recovery notices", async () => {
+		const file = path.join(testDir, "zero-budget-summary.ts");
+		fs.writeFileSync(file, "export const fixture = true;\n");
+		summarySegments = [
+			{ kind: "code", startLine: 1, endLine: 1, text: "first" },
+			{ kind: "elided", startLine: 2, endLine: 4 },
+		];
+		const settings = receiptSettings({ "read.summarize.enabled": true, "read.summaryMaxBytes": 0 });
+		for (const truncation of ["head", "last", "both"] as const) {
+			const result = await read(file, settings, { truncation });
+			expect(bodyOf(result)).toBe("");
+			expect(textOf(result)).not.toContain("retained");
+			if (truncation !== "head") expect(textOf(result)).toContain(`; truncation: ${truncation};`);
+			expect(textOf(result).match(/source lines 1-4 omitted/g)).toHaveLength(1);
+			expect(textOf(result)).toContain(`${file}:1-4`);
+			expect(result.details?.summary).toMatchObject({ elidedSpans: 2, elidedLines: 4 });
+		}
+	});
+
+	it("distinguishes exact-fit summaries from one-byte-over bodies including separators", async () => {
+		const file = path.join(testDir, "exact-summary.ts");
+		fs.writeFileSync(file, "fixture\n");
+		const settings = receiptSettings({ "read.summarize.enabled": true, "read.summaryMaxBytes": 1 });
+		for (const extra of [0, 1]) {
+			summarySegments = [
+				{ kind: "code", startLine: 1, endLine: 1, text: "x".repeat(1020 + extra) },
+				{ kind: "elided", startLine: 2, endLine: 4 },
+			];
+			for (const truncation of ["head", "last", "both"] as const) {
+				const result = await read(file, settings, { truncation });
+				if (extra === 0) {
+					expect(bodyOf(result)).toBe(`${"x".repeat(1020)}\n...`);
+					expect(Buffer.byteLength(bodyOf(result), "utf8")).toBe(1024);
+					expect(textOf(result)).not.toContain("Summary truncated");
+				} else {
+					expect(textOf(result)).toContain("Summary truncated at 1 KiB");
+					expect(Buffer.byteLength(bodyOf(result), "utf8")).toBeLessThanOrEqual(1024);
+					expect(bodyOf(result)).not.toContain("x");
+				}
+			}
+		}
+	});
+
+	it("charges the omission marker and its separator at the exact capped boundary", async () => {
+		const file = path.join(testDir, "marker-budget-summary.ts");
+		fs.writeFileSync(file, "fixture\n");
+		const marker = "[… source lines 2-4 omitted …]";
+		const first = "x".repeat(1024 - Buffer.byteLength(marker, "utf8") - 1);
+		summarySegments = [
+			{ kind: "code", startLine: 1, endLine: 1, text: first },
+			{ kind: "code", startLine: 2, endLine: 2, text: "y".repeat(2000) },
+			{ kind: "elided", startLine: 3, endLine: 4 },
+		];
+		for (const budget of [1024, 1023]) {
+			const result = await read(
+				file,
+				receiptSettings({
+					"read.summarize.enabled": true,
+					"read.summaryMaxBytes": budget / 1024,
+				}),
+				{ truncation: "head" },
+			);
+			expect(bodyOf(result)).toBe(budget === 1024 ? `${first}\n${marker}` : "[… source lines 1-4 omitted …]");
+			expect(Buffer.byteLength(bodyOf(result), "utf8")).toBeLessThanOrEqual(budget);
+		}
+	});
+
+	it("retains unequal-width feasible ends for both and omits both oversized endpoints safely", async () => {
+		const file = path.join(testDir, "unequal-summary.ts");
+		fs.writeFileSync(file, "fixture\n");
+		const settings = receiptSettings({ "read.summarize.enabled": true, "read.summaryMaxBytes": 1 });
+		for (const oversized of [false, true]) {
+			const first = "a".repeat(oversized ? 1100 : 100);
+			const last = "z".repeat(oversized ? 1100 : 700);
+			summarySegments = [
+				{ kind: "code", startLine: 1, endLine: 1, text: first },
+				{ kind: "code", startLine: 2, endLine: 2, text: "b".repeat(2000) },
+				{ kind: "elided", startLine: 3, endLine: 4 },
+				{ kind: "code", startLine: 5, endLine: 5, text: last },
+			];
+			const result = await read(file, settings, { truncation: "both" });
+			expect(bodyOf(result)).toBe(
+				oversized ? "[… source lines 1-5 omitted …]" : `${first}\n[… source lines 2-2 omitted …]\n...\n${last}`,
+			);
+			expect(Buffer.byteLength(bodyOf(result), "utf8")).toBeLessThanOrEqual(1024);
+			expect(textOf(result)).toContain("; truncation: both;");
+			expect(textOf(result)).not.toContain("retained");
+		}
+	});
+
+	it("flattens multiline kept segments without renumbering their source anchors", async () => {
+		const file = path.join(testDir, "multiline-summary.ts");
+		fs.writeFileSync(file, "fixture\n");
+		summarySegments = [
+			{ kind: "code", startLine: 1, endLine: 2, text: "first\nsecond" },
+			{ kind: "elided", startLine: 3, endLine: 8 },
+			{ kind: "code", startLine: 9, endLine: 10, text: "ninth\ntenth" },
+		];
+		const settings = receiptSettings({ "read.summarize.enabled": true, readHashLines: true });
+		for (const truncation of ["head", "last", "both"] as const) {
+			const result = await read(file, settings, { truncation });
+			const anchors = [...textOf(result).matchAll(/^(\d+)[a-z]{2}\|/gm)].map(match => Number(match[1]));
+			expect(anchors).toEqual([1, 2, 9, 10]);
+			expect(bodyOf(result)).toBe("first\nsecond\n...\nninth\ntenth");
+			expect(result.details?.summary).toMatchObject({ elidedSpans: 1, elidedLines: 6 });
+		}
+	});
+
 	it("stubs summarizeCode as a real async SummaryResult with the full schema", async () => {
 		const file = path.join(testDir, "summary-schema-regression.ts");
 		fs.writeFileSync(file, "export const x = 1;\n");

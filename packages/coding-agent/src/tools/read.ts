@@ -479,8 +479,7 @@ function formatSummaryCapFooter(
 	totalLines: number,
 	direction: TruncationDirection = "head",
 ): string {
-	const retained = direction === "last" ? "last" : direction === "both" ? "first and last" : "first";
-	const directionPart = direction === "head" ? "" : `; retained ${retained} summary units`;
+	const directionPart = direction === "head" ? "" : `; truncation: ${direction}`;
 	return `[Summary truncated at ${Math.ceil(maxBytes / 1024)} KiB${directionPart}; re-read ${readPath}:1-${totalLines} or ${readPath}:raw for the full source]`;
 }
 const READ_CHUNK_SIZE = 8 * 1024;
@@ -2498,12 +2497,16 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		}
 	}
 
-	#renderSummary(summary: SummaryResult): {
+	#renderSummary(
+		summary: SummaryResult,
+		direction: TruncationDirection,
+	): {
 		text: string;
 		displayText: string;
 		elidedSpans: number;
 		elidedLines: number;
 		capped: boolean;
+		omissionNotice: string;
 	} {
 		const displayMode = resolveFileDisplayMode(this.session);
 		const shouldAddHashLines = displayMode.hashLines;
@@ -2561,14 +2564,8 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			i++;
 		}
 
-		const modelParts: string[] = [];
-		const displayParts: string[] = [];
 		const capBytes = this.session.settings.get("read.summaryMaxBytes") * 1024;
-		let usedBytes = 0;
-		let elidedSpans = 0;
-		let elidedLines = 0;
-		let capDropped = false;
-		for (const unit of units) {
+		const rendered = units.map(unit => {
 			let model: string;
 			let display: string;
 			let implicitElidedLines = 0;
@@ -2591,24 +2588,74 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 				model = formatSingleLine(unit.line, unit.text, shouldAddHashLines, shouldAddLineNumbers);
 				display = unit.text;
 			}
-			const separatorBytes = modelParts.length > 0 ? 1 : 0;
-			if (usedBytes + separatorBytes + Buffer.byteLength(model, "utf-8") > capBytes) {
-				capDropped = true;
-				elidedSpans++;
-				elidedLines += unit.kind === "line" ? 1 : unit.endLine - unit.startLine + 1;
-				continue;
-			}
-			usedBytes += separatorBytes + Buffer.byteLength(model, "utf-8");
-			modelParts.push(model);
-			displayParts.push(display);
-			if (unit.kind === "elided" || unit.kind === "merged") {
-				elidedSpans++;
-				elidedLines += implicitElidedLines;
+			return { model, display, implicitElidedLines };
+		});
+		// Prefix sums include each unit's separator. Removing the final separator
+		// gives the exact UTF-8 body size, without charging recovery footers.
+		const bytes = [0];
+		for (const part of rendered) {
+			bytes.push(bytes[bytes.length - 1] + Buffer.byteLength(part.model, "utf-8") + 1);
+		}
+		const omissionMarker = (head: number, tail: number): string => {
+			const first = units[head];
+			const last = units[tail - 1];
+			const start = first.kind === "line" ? first.line : first.startLine;
+			const end = last.kind === "line" ? last.line : last.endLine;
+			return `[… source lines ${start}-${end} omitted …]`;
+		};
+		let head = units.length;
+		let tail = units.length;
+		const capDropped = bytes[units.length] - 1 > capBytes;
+		if (capDropped) {
+			head = 0;
+			const fits = (nextHead: number, nextTail: number): boolean =>
+				bytes[nextHead] +
+					bytes[units.length] -
+					bytes[nextTail] +
+					Buffer.byteLength(omissionMarker(nextHead, nextTail), "utf-8") <=
+				capBytes;
+			let headBlocked = direction === "last";
+			let tailBlocked = direction === "head";
+			// Keep contiguous edge windows: an oversized unit blocks that edge,
+			// never splits an anchor or turns a prefix/suffix into scattered lines.
+			while (head + 1 < tail && (!headBlocked || !tailBlocked)) {
+				const takeHead = !headBlocked && (tailBlocked || bytes[head] <= bytes[units.length] - bytes[tail]);
+				if (takeHead) {
+					if (fits(head + 1, tail)) head++;
+					else headBlocked = true;
+				} else {
+					if (fits(head, tail - 1)) tail--;
+					else tailBlocked = true;
+				}
 			}
 		}
-		if (capDropped) {
-			modelParts.push("…");
-			displayParts.push("…");
+		const modelParts: string[] = [];
+		const displayParts: string[] = [];
+		let elidedSpans = 0;
+		let elidedLines = 0;
+		let omissionNotice = "";
+		for (let index = 0; index < units.length; index++) {
+			const unit = units[index];
+			if (index >= head && index < tail) {
+				if (index === head) {
+					const marker = omissionMarker(head, tail);
+					// A sub-marker budget can retain no units. Keep its source-range
+					// notice with the recovery footers rather than exceeding the body cap.
+					if (Buffer.byteLength(marker, "utf-8") > capBytes) omissionNotice = marker;
+					else {
+						modelParts.push(marker);
+						displayParts.push(marker);
+					}
+				}
+				elidedSpans++;
+				elidedLines += unit.kind === "line" ? 1 : unit.endLine - unit.startLine + 1;
+			} else {
+				const part = rendered[index];
+				modelParts.push(part.model);
+				displayParts.push(part.display);
+				if (unit.kind !== "line") elidedSpans++;
+				elidedLines += part.implicitElidedLines;
+			}
 		}
 		return {
 			text: modelParts.join("\n"),
@@ -2616,6 +2663,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			elidedSpans,
 			elidedLines,
 			capped: capDropped,
+			omissionNotice,
 		};
 	}
 
@@ -2911,27 +2959,25 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 				(this.session.settings.get("read.summarize.prose") || !PROSE_SUMMARY_EXTENSIONS.has(ext))
 			) {
 				const summary = await this.#trySummarize(absolutePath, fileSize, signal);
-				if (params.truncation !== undefined && params.truncation !== "head" && summary?.parsed) {
-					throw new ToolError(
-						"Explicit truncation for structural summaries is not yet supported; summary direction will be applied after summary units become directional.",
-					);
-				}
 				if (summary?.parsed && summary.elided) {
-					const renderedSummary = this.#renderSummary(summary);
+					const direction = resolveEffectiveDirection(params.truncation, "local-summary", this.session.settings);
+					const renderedSummary = this.#renderSummary(summary, direction);
 					const footer = formatSummaryElisionFooter(
 						localReadPath,
 						renderedSummary.elidedSpans,
 						renderedSummary.elidedLines,
 					);
-					const summaryTotalLines = Math.max(...summary.segments.map(segment => segment.endLine));
+					const summaryTotalLines = summary.totalLines;
 					const modelText = [
 						renderedSummary.text,
+						renderedSummary.omissionNotice,
 						footer,
 						renderedSummary.capped
 							? formatSummaryCapFooter(
 									localReadPath,
 									this.session.settings.get("read.summaryMaxBytes") * 1024,
 									summaryTotalLines,
+									direction,
 								)
 							: "",
 					]
