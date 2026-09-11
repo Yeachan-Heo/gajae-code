@@ -815,7 +815,12 @@ function managedRetryableFailure(failure: unknown): boolean {
 	// caller is not authorized to make, and the credential-mutating consumers
 	// downstream would block healthy credentials on the way.
 	if (trigger.class === "auth") return trigger.authDisposition !== "forbidden";
-	return trigger.class === "rate_limit" || trigger.class === "quota" || trigger.class === "server";
+	return (
+		trigger.class === "rate_limit" ||
+		trigger.class === "quota" ||
+		trigger.class === "credential" ||
+		trigger.class === "server"
+	);
 }
 
 function promoteTypedEmptyResponseStop(message: AssistantMessage): void {
@@ -2027,6 +2032,7 @@ function losslessDetachedClone<T>(value: T): T {
 						"providerCode",
 						"openaiErrorCode",
 						"anthropicErrorType",
+						"credentialModelUnavailable",
 						"retryAfterMs",
 						"headers",
 					] as const) {

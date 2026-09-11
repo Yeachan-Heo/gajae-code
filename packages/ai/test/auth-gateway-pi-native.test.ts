@@ -754,6 +754,75 @@ describe("pi-native managed gateway credential failure marking", () => {
 			await fs.rm(tempDir, { recursive: true, force: true });
 		}
 	});
+	it("marks an unmanaged credential-specific model rejection and rotates the next lease without invalidating", async () => {
+		const providerMessage = "The 'gpt-5.6-sol' model is not supported when using Codex with a ChatGPT account";
+		const keys: Array<string | undefined> = [];
+		registerCustomApi(
+			SYNC_THROW_API,
+			(_model, _context, options) => {
+				keys.push(options?.apiKey);
+				throw Object.assign(new Error(providerMessage), {
+					status: 400,
+					transportFailure: {
+						kind: "transport",
+						status: 400,
+						providerCode: "invalid_request_error",
+						credentialModelUnavailable: true,
+					},
+				});
+			},
+			SYNC_THROW_SOURCE,
+		);
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-ai-auth-gateway-unmanaged-credential-"));
+		const store = await SqliteAuthCredentialStore.open(path.join(tempDir, "auth.db"));
+		const storage = new AuthStorage(store);
+		const provider = "gateway-unmanaged-credential-test";
+		const model: Model<Api> = {
+			id: "gateway-unmanaged-credential-model",
+			name: "Gateway unmanaged credential test model",
+			api: SYNC_THROW_API,
+			provider,
+			baseUrl: "mock://",
+			reasoning: false,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 128_000,
+			maxTokens: 4_096,
+		};
+		await storage.set(provider, [
+			{ type: "api_key", key: "gateway-key-one" },
+			{ type: "api_key", key: "gateway-key-two" },
+		]);
+		const gateway = startAuthGateway({
+			bind: "127.0.0.1:0",
+			providerScope: { provider },
+			bearerTokens: ["gateway-test-token"],
+			version: "test",
+			storage,
+			...testAuthority(storage, provider),
+			resolveModel: id => (id === model.id ? model : undefined),
+			listModels: () => [model],
+		});
+		const request = () =>
+			fetch(`${gateway.url}/v1/pi/stream`, {
+				method: "POST",
+				headers: { Authorization: "Bearer gateway-test-token", "Content-Type": "application/json" },
+				body: JSON.stringify({ modelId: model.id, context: baseContext, stream: true }),
+			});
+		try {
+			const firstText = await (await request()).text();
+			expect(firstText).toContain("not supported when using Codex with a ChatGPT account");
+			expect(firstText).not.toContain("Select a model available to this ChatGPT account");
+			const secondText = await (await request()).text();
+			expect(secondText).toContain("not supported when using Codex with a ChatGPT account");
+			expect(keys).toEqual(["gateway-key-one", "gateway-key-two"]);
+		} finally {
+			unregisterCustomApis(SYNC_THROW_SOURCE);
+			await gateway.close();
+			store.close();
+			await fs.rm(tempDir, { recursive: true, force: true });
+		}
+	});
 });
 
 describe("pi-native client wire context", () => {

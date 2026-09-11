@@ -1,6 +1,9 @@
 # Changelog
 
 ## [Unreleased]
+### Fixed
+
+- `redactCrashSecrets` now recognizes the five vendor token shapes `crash/upstream/envelope.ts` already classifies as credential-like: npm, GitLab PAT, Stripe live/test keys, and Hugging Face tokens. That classification only guards the Sentry frame fields it wraps; the crash log this module persists and the `gjc crash report` body a user files as a public issue both reach egress through this function alone, so four of the five survived verbatim on both paths. Stripe and Hugging Face separate with `_`, which is why the existing `sk-` rule never matched them.
 
 ## [0.16.6] - 2026-09-07
 

@@ -239,19 +239,25 @@ describe("read truncation direction resolution", () => {
 		expect(text).not.toContain("omitted lines 2-1");
 	});
 
-	test("rejects explicit directions for structural summaries", async () => {
+	test("preserves under-budget structural summaries for every direction without duplicates", async () => {
 		const file = path.join(tempDir, "summary.ts");
 		const source = Array.from(
 			{ length: 20 },
-			(_, index) => `export function fn${index}(): number {\n\treturn ${index};\n}`,
+			(_, index) =>
+				`export function fn${index}(): number {\n\tconst one = ${index};\n\tconst two = 2;\n\treturn one + two;\n}`,
 		).join("\n\n");
 		await fs.writeFile(file, source);
 		const settings = Settings.isolated({ readHashLines: false });
 		const tool = new ReadTool(createSession(tempDir, settings));
 
-		await expect(tool.execute("direction-summary", { path: file, truncation: "both" })).rejects.toThrow(
-			/structural summaries.*not yet supported/,
-		);
+		const baseline = textOf(await tool.execute("direction-summary-default", { path: file }));
+		for (const truncation of ["head", "last", "both"] as const) {
+			const result = await tool.execute("direction-summary", { path: file, truncation });
+			expect(textOf(result)).toBe(baseline);
+			expect(textOf(result).match(/export function fn0\(/g)).toHaveLength(1);
+			expect(textOf(result)).toContain("export function fn19()");
+			expect(result.details?.summary?.elidedSpans).toBe(20);
+		}
 	});
 
 	test("passes explicit head through unchanged on every unsupported-direction route", async () => {

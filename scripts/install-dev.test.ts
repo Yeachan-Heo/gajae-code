@@ -5,7 +5,7 @@ interface RootManifest {
 	scripts: Record<string, string>;
 }
 
-test("install:dev builds the native addon before linking the source CLI", async () => {
+test("install:dev builds the native addon, links the source CLI, and enables the repo git hooks", async () => {
 	const repoRoot = path.resolve(import.meta.dir, "..");
 	const manifest = (await Bun.file(path.join(repoRoot, "package.json")).json()) as RootManifest;
 
@@ -15,6 +15,7 @@ test("install:dev builds the native addon before linking the source CLI", async 
 		"bun --cwd=packages/coding-agent link",
 		"bun --cwd=packages/ai link",
 		"bun run dev:link",
+		"bun run dev:hooks",
 		"bun packages/coding-agent/src/cli.ts setup defaults",
 	]);
 });

@@ -608,6 +608,121 @@ test("preflight preserves missing body-file diagnostics", async () => {
 	}
 });
 
+describe("push preflight", () => {
+	test("pre-push hook validates every pushed branch head through the contract validator", async () => {
+		const hook = await Bun.file(new URL("../.githooks/pre-push", import.meta.url)).text();
+		// The pushed commit -- not local HEAD -- is what becomes the PR head.
+		expect(hook).toContain('--push-preflight "$branch" "$local_sha"');
+		expect(hook).toContain("GJC_SKIP_PR_PREFLIGHT");
+		// Deletions carry the zero sha and have no head to validate.
+		expect(hook).toContain('[[ "$local_sha" == "$zero" ]] && continue');
+	});
+
+	test("a branch with no open PR has no contract to invalidate", async () => {
+		const script = url.fileURLToPath(new URL("./verify-pr-verdict.ts", import.meta.url));
+		const repoRoot = url.fileURLToPath(new URL("..", import.meta.url));
+		const head = Bun.spawnSync(["git", "rev-parse", "HEAD"], { cwd: repoRoot });
+		const headSha = head.stdout.toString().trim();
+		const child = Bun.spawn([process.execPath, script, "--push-preflight", "gjc-preflight-branch-that-does-not-exist", headSha, "--repo", repoRoot, "--trusted-root", repoRoot], { stdout: "ignore", stderr: "ignore" });
+		expect(await child.exited).toBe(0);
+	});
+
+	test("derives the PR branch from the remote destination, not the local source ref", async () => {
+		const hook = await Bun.file(new URL("../.githooks/pre-push", import.meta.url)).text();
+		// `git push origin HEAD:refs/heads/feature` gives local_ref=HEAD, and a renamed
+		// refspec gives two different names; filtering on the local ref skips both.
+		expect(hook).toContain('[[ "$remote_ref" == refs/heads/* ]] || continue');
+		expect(hook).toContain('branch="${remote_ref#refs/heads/}"');
+		expect(hook).not.toContain('[[ "$local_ref" == refs/heads/* ]]');
+		// The pushed object, not the resolved remote branch tip, is the commit validated.
+		expect(hook).toContain('--push-preflight "$branch" "$local_sha"');
+		// The receiving remote is forwarded so the PR is looked up in the right repository.
+		expect(hook).toContain('--push-remote "$remote"');
+	});
+
+	test("binds PR lookup and base resolution to the receiving repository", async () => {
+		const source = await Bun.file(new URL("./verify-pr-verdict.ts", import.meta.url)).text();
+		const pushPreflight = source.slice(source.indexOf("async function validatePushPreflight"));
+		// An implicit gh context resolves a fork checkout to the fork, where the upstream PR
+		// does not exist -- the empty result would then wave the push through.
+		expect(pushPreflight).toContain('"--repo", baseRepo');
+		expect(pushPreflight).not.toContain('git(["fetch", "--no-tags", "origin", "dev"]');
+		expect(pushPreflight).not.toContain('rev-parse", "origin/dev"');
+		// The base is the PR's own base ref in the contract repository, never an assumed dev.
+		expect(pushPreflight).toContain("pr.baseRefName], cwd)");
+		// A same-named branch in another fork must not be mistaken for this PR.
+		expect(pushPreflight).toContain("headRepositoryOwner?.login?.toLowerCase() === headOwner.toLowerCase()");
+		// Ambiguity fails closed rather than guessing which contract governs the push.
+		expect(pushPreflight).toContain("cannot determine which contract governs this push");
+		// gh pr list's JSON mapping drops headRefOid and review commit oids on older gh
+		// releases (e.g. 2.4.x), which would fail closed on every push, so the head oid
+		// and the review commits must be resolved through the stable `gh api` surface.
+		expect(pushPreflight).toContain('"--jq", ".head.sha"');
+		expect(pushPreflight).toContain("/pulls/${pr.number}/reviews");
+		expect(pushPreflight).not.toContain("reviews,headRefOid");
+	});
+
+	test("resolves the GitHub repository from every supported remote URL form", async () => {
+		const source = await Bun.file(new URL("./verify-pr-verdict.ts", import.meta.url)).text();
+		const pattern = /const match = (\/.+\/u)\.exec\(text\);/u.exec(source.slice(source.indexOf("async function pushRemoteRepository")));
+		expect(pattern).not.toBeNull();
+		const remoteUrl = new RegExp(pattern![1]!.slice(1, -2), "u");
+		const resolve = (url: string): string | null => {
+			const match = remoteUrl.exec(url);
+			return match ? `${match[1]}/${match[2]}` : null;
+		};
+		expect(resolve("git@github.com:Yeachan-Heo/gajae-code.git")).toBe("Yeachan-Heo/gajae-code");
+		expect(resolve("https://github.com/Yeachan-Heo/gajae-code.git")).toBe("Yeachan-Heo/gajae-code");
+		expect(resolve("https://github.com/probepark/gajae-code")).toBe("probepark/gajae-code");
+		expect(resolve("ssh://git@github.com/Yeachan-Heo/gajae-code.git")).toBe("Yeachan-Heo/gajae-code");
+	});
+
+	test("a fork push resolves the contract to the upstream parent repository", async () => {
+		const source = await Bun.file(new URL("./verify-pr-verdict.ts", import.meta.url)).text();
+		const resolver = source.slice(source.indexOf("async function contractRepository"));
+		// A fork's PR lives upstream, so the parent owns the contract; the head stays
+		// qualified by the fork owner that actually receives the push.
+		expect(resolver).toContain('"isFork,parent"');
+		expect(resolver).toContain("return { repo: `${parentOwner}/${parentName}`, forkOwner: pushRepo.split(\"/\")[0]! };");
+		expect(resolver).toContain("if (!info.isFork || !parentOwner || !parentName) return { repo: pushRepo, forkOwner: null };");
+	});
+
+	test("mirrors the Dev CI bootstrap job, which has no requireMergeApproved escape hatch", async () => {
+		const source = await Bun.file(new URL("./verify-pr-verdict.ts", import.meta.url)).text();
+		const pushPreflight = source.slice(source.indexOf("async function validatePushPreflight"));
+		// The bootstrap job blocks needs-human/merge-blocked unconditionally, so a preflight
+		// that passed them locally would disagree with the very check it predicts.
+		expect(pushPreflight).toContain("requireMergeApproved: true");
+		expect(pushPreflight).not.toContain("requireMergeApproved: false");
+		// Mirroring the flag alone would fail a legitimately reviewed merge-approved PR, so
+		// the exact-head approval must be resolved from the same review data.
+		expect(pushPreflight).toContain("authenticatedReviewerLogin: approval.login");
+		expect(pushPreflight).toContain('review.state !== "COMMENTED"');
+		expect(pushPreflight).toContain("review.commit?.oid === headSha");
+	});
+
+	test("a blocking verdict fails the push exactly as the bootstrap job does", () => {
+		const body = approved.replace("merge-approved", "needs-human");
+		const blocked = validatePrContract(validInput({ body, requireMergeApproved: true }));
+		expect(blocked.ok).toBe(false);
+		expect(blocked.diagnostics.join("\n")).toContain("intentionally blocks merge");
+	});
+
+	test("an exact-head approved merge-approved PR still passes the push gate", () => {
+		const reviewed = validatePrContract(validInput({ requireMergeApproved: true }));
+		expect(reviewed.ok).toBe(true);
+	});
+
+	test("a non-commit push target fails closed", async () => {
+		const script = url.fileURLToPath(new URL("./verify-pr-verdict.ts", import.meta.url));
+		const repoRoot = url.fileURLToPath(new URL("..", import.meta.url));
+		const child = Bun.spawn([process.execPath, script, "--push-preflight", "some-branch", "not-a-sha", "--repo", repoRoot, "--trusted-root", repoRoot], { stdout: "pipe", stderr: "pipe" });
+		const [stderr, exitCode] = await Promise.all([new Response(child.stderr).text(), child.exited]);
+		expect(exitCode).toBe(1);
+		expect(stderr).toContain("is not a lowercase 40-hex commit");
+	});
+});
+
 test("workflow is trusted-default-branch-controlled, read-only, exact-head, and invokes only base code", async () => {
 	const workflow = await Bun.file(new URL("../.github/workflows/pr-validation.yml", import.meta.url)).text();
 	expect(workflow).toContain("pull_request_target:");

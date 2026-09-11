@@ -49,6 +49,8 @@ export interface RuntimeSkillDiscoveryDiagnostics {
 
 export interface RuntimeSkillDiscoveryResult {
 	candidates: RuntimeSkillDiscoveryCandidate[];
+	/** Deduped, policy-allowed skills the query filter ran against; candidates.length <= scanned. */
+	scanned: number;
 	diagnostics: RuntimeSkillDiscoveryDiagnostics;
 }
 
@@ -380,6 +382,19 @@ export function describeDisabledSkillScopes(
 	return `Skill discovery skipped disabled scope(s): ${skipped.join(", ")}. Enable them with ${commands.join(" and ")}.`;
 }
 
+/**
+ * Explain a zero-candidate result caused by the conjunctive query filter rather
+ * than by an empty catalog or disabled scopes: every whitespace-separated term
+ * must appear in a candidate's name, description, source, or use conditions (or
+ * one term must equal the exact skill name), so a single keyword that appears
+ * nowhere drops every skill. Shared by the skill_discovery tool.
+ */
+export function describeNoSkillMatch(query: string | undefined, scanned: number): string | undefined {
+	const trimmed = (query ?? "").trim();
+	if (trimmed.length === 0 || scanned === 0) return undefined;
+	return `No skill matched every query term (${scanned} skill${scanned === 1 ? "" : "s"} scanned). Matching is conjunctive substring: every whitespace-separated term must appear in the skill's name, description, source, or use conditions, unless a term equals the exact skill name. Retry with the exact skill name or fewer terms; a zero-candidate result does not prove no skills exist.`;
+}
+
 export async function discoverRuntimeSkills(
 	options: DiscoverRuntimeSkillsOptions,
 ): Promise<RuntimeSkillDiscoveryResult> {
@@ -462,6 +477,7 @@ export async function discoverRuntimeSkills(
 	const seenNames = new Set<string>();
 	const seenPaths = new Set<string>();
 	const candidates: RuntimeSkillDiscoveryCandidate[] = [];
+	let scanned = 0;
 	const orderedItems: ScanJobResult["items"] = [];
 	for (const entry of settled) {
 		if ("error" in entry) {
@@ -500,6 +516,7 @@ export async function discoverRuntimeSkills(
 			path: item.skill.path,
 			useWhen: getUseWhen(item.skill),
 		};
+		scanned += 1;
 		if (matchesQuery(candidate, options.query ?? "")) candidates.push(candidate);
 	}
 	candidates.sort((a, b) => compareSkillOrder(a.name, a.path, b.name, b.path));
@@ -510,6 +527,7 @@ export async function discoverRuntimeSkills(
 	);
 	return {
 		candidates: candidates.slice(0, normalizeLimit(options.limit)),
+		scanned,
 		diagnostics: { messages: diagnostics },
 	};
 }

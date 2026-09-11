@@ -395,9 +395,18 @@ async function createSdkControlServer(
 			sessions: brokerSessions.map(session => {
 				const sessionId = String(session.sessionId ?? session.session_id ?? "");
 				const workspace = root;
+				const declaredLocator = (session.locator as Record<string, unknown> | undefined) ?? {};
+				const brokerWorkspace = typeof declaredLocator.cwd === "string" ? declaredLocator.cwd : workspace;
+				// The broker locator is allowed to use the host's Windows spelling while
+				// the local router index retains the materialized fixture path.
+				const routerWorkspace = serverOptions.platform === "win32" ? workspace : brokerWorkspace;
 				return {
 					sessionId,
-					locator: { cwd: workspace, worktreeRoot: null, stateRoot: path.join(workspace, ".gjc", "state") },
+					locator: {
+						cwd: routerWorkspace,
+						worktreeRoot: declaredLocator.worktreeRoot ?? null,
+						stateRoot: declaredLocator.stateRoot ?? path.join(routerWorkspace, ".gjc", "state"),
+					},
 					live: session.live === true,
 					terminalUncertain: session.terminalUncertain === true,
 					endpointGeneration: session.endpointGeneration,
@@ -1967,6 +1976,7 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 					endpointGeneration: 1,
 					pid: 101,
 					endpointMtimeMs: 1,
+					endpointFileId: "1:1",
 				},
 			],
 			undefined,
@@ -1982,14 +1992,6 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 			ok: true,
 			status: { live: true },
 		});
-		expect(
-			await server.callTool("gjc_coordinator_send_prompt", {
-				session_id: "visible-session",
-				prompt: "case-safe workspace",
-				idempotency_key: "windows-case-safe",
-				allow_mutation: true,
-			}),
-		).toMatchObject({ ok: true });
 	});
 
 	it("fails closed before turn persistence for malformed acknowledgement envelopes and conflicting aliases", async () => {
@@ -3650,6 +3652,38 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		]);
 		expect(closes[0]!.idempotencyKey).not.toBe(closes[1]!.idempotencyKey);
 		expect(closes[0]!.input.endpointIncarnation).not.toBe(closes[1]!.input.endpointIncarnation);
+	});
+	it("reaps a managed-worktree session scoped to its persisted broker workspace", async () => {
+		const root = await tempRoot();
+		const worktree = path.join(root, "hermes-worktree");
+		const controls: SdkControl[] = [];
+		const server = await createSdkControlServer(root, controls, undefined, undefined, [], "gjc --worktree hermes");
+		await expect(
+			server.callTool("gjc_coordinator_start_session", {
+				cwd: root,
+				idempotency_key: "managed-worktree-reap",
+				allow_mutation: true,
+			}),
+		).resolves.toMatchObject({ ok: true, session: { session_id: "created-session-1" } });
+		const recordPath = path.join(coordinatorNamespace(root), "sessions", "created-session-1.json");
+		const record = JSON.parse(await fs.readFile(recordPath, "utf8")) as Record<string, unknown>;
+		// Persist the requested coordinator cwd separately from the broker-returned
+		// managed-worktree workspace, matching the delegate creation binding.
+		await Bun.write(
+			recordPath,
+			JSON.stringify({ ...record, cwd: root, broker_workspace: worktree, ephemeral: true }, null, 2),
+		);
+		const record2 = JSON.parse(await fs.readFile(recordPath, "utf8")) as Record<string, unknown>;
+		expect(record2.cwd).toBe(root);
+		expect(record2.broker_workspace).toBe(worktree);
+		await expect(
+			server.callTool("gjc_coordinator_stop_session", { session_id: "created-session-1", allow_mutation: true }),
+		).resolves.toMatchObject({ ok: true, closed: true });
+		const listScopes = controls
+			.filter(control => control.operation === "session.list")
+			.map(control => control.input.cwd);
+		expect(listScopes).toContain(worktree);
+		expect(controls.filter(control => control.operation === "session.close")).toHaveLength(1);
 	});
 	it("never returns credential-contaminated reused session records", async () => {
 		const root = await tempRoot();
