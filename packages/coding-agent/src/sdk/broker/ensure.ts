@@ -7,22 +7,17 @@ import packageJson from "../../../package.json" with { type: "json" };
 import { acquireFileLock, type FileLockOptions, withFileLock } from "../../config/file-lock";
 import { loadInstallationHostId, loadLegacyInstallationHostId } from "../../config/machine-identity";
 import { SdkClient } from "../client/client";
-<<<<<<< HEAD
-import { type BrokerDiscovery, brokerProcessIncarnation, readBrokerDiscovery } from "./discovery";
-import {
-	isSdkInternalRuntimeImagePresent,
-	resolveSdkInternalSpawnCommand,
-	type SdkInternalSpawnCommand,
-} from "./runtime";
-=======
 import {
 	type BrokerDiscovery,
 	brokerProcessIncarnation,
 	readBrokerDiscovery,
 	readBrokerRestartIntent,
 } from "./discovery";
-import { resolveSdkInternalSpawnCommand, type SdkInternalSpawnCommand } from "./runtime";
->>>>>>> 3ce8083b9d9a (feat(doctor): add gjc doctor diagnosis and bounded repair)
+import {
+	isSdkInternalRuntimeImagePresent,
+	resolveSdkInternalSpawnCommand,
+	type SdkInternalSpawnCommand,
+} from "./runtime";
 import { BrokerStartupError, clearBrokerStartupFailureMarker, readBrokerStartupFailureMarker } from "./startup-failure";
 
 function resolveExpectedBrokerGeneration(): string {
