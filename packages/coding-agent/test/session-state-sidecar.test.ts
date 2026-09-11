@@ -3848,6 +3848,54 @@ describe("coordinator runtime state sidecar", () => {
 		await expect(readPayload(stateFile)).resolves.toMatchObject({ state: "running", ready_for_input: false });
 	});
 
+	it("issue-5471: the legacy readiness tolerance does not weaken the sidecar signing fence", async () => {
+		const root = await tempRoot();
+		const stateFile = path.join(root, "state.json");
+		const fixture = path.join(import.meta.dir, "fixtures", "session-state-sidecar-subprocess.ts");
+		const { privateKey } = generateKeyPairSync("ed25519");
+		const privateDer = privateKey.export({ format: "der", type: "pkcs8" }).toString("base64");
+		const keyId = "455f1a4c455f1a4c455f1a4c455f1a4c455f1a4c455f1a4c455f1a4c455f1a4c";
+		// The exact pre-#4351 shape: unsigned, no sidecar key, readiness bit still set.
+		await Bun.write(
+			stateFile,
+			`${JSON.stringify({
+				schema_version: 1,
+				session_id: "155-FinalA4",
+				state: "completed",
+				ready_for_input: true,
+				cwd: root,
+				workdir: root,
+				session_file: null,
+				current_turn_id: "turn-final",
+				last_turn_id: "turn-prev",
+				live: false,
+				source: "agent_session_event",
+				event: "agent_end",
+				updated_at: "2026-08-01T01:14:30.375Z",
+			})}\n`,
+		);
+		const before = await Bun.file(stateFile).bytes();
+		const child = Bun.spawn([process.execPath, fixture, stateFile], {
+			cwd: root,
+			env: {
+				...process.env,
+				[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]: stateFile,
+				[GJC_COORDINATOR_SESSION_ID_ENV]: "155-FinalA4",
+				[GJC_COORDINATOR_SIDECAR_SIGNATURE_REQUIRED_ENV]: "true",
+				[GJC_COORDINATOR_SIDECAR_KEY_ID_ENV]: keyId,
+				[GJC_COORDINATOR_SIDECAR_SIGNING_KEY_ENV]: privateDer,
+			},
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const stderr = await new Response(child.stderr).text();
+		expect(await child.exited).not.toBe(0);
+		// Normalizing the readiness bit must not become a way past the signing fence, and a
+		// refused marker must survive byte-identical.
+		expect(stderr).toContain("the marker is not signed by this session's sidecar key");
+		expect(await Bun.file(stateFile).bytes()).toEqual(before);
+	});
+
 	it("issue-4351: errored session reports ready_for_input false", async () => {
 		const root = await tempRoot();
 		const stateFile = path.join(root, "issue-4351-errored.json");

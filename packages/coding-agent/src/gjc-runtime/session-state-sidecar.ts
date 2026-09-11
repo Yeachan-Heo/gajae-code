@@ -1144,6 +1144,12 @@ function parsePreviousPayload(raw: string): Record<string, unknown> {
 	// or boolean; never include arbitrary marker contents in a terminal diagnostic.
 	// Before #4351, completed markers could retain the readiness bit. Normalize only
 	// that legacy shape; all other lifecycle contradictions remain errors.
+	// This mutation runs before the sidecar fence in {@link assertPreviousRuntimeStateIdentity},
+	// which is safe only because signing postdates the pre-#4351 writer contract (#4351 landed
+	// 2026-08-12, sidecar signing 2026-08-22): no signed payload can carry this shape, so the
+	// fence never sees a normalized predecessor it should have rejected. A future signed
+	// predecessor written under the old contract must be handled here explicitly rather than
+	// escaping as a misleading signature mismatch.
 	if (marker.state === "completed" && marker.ready_for_input === true) marker.ready_for_input = false;
 	if (marker.ready_for_input !== undefined) {
 		const expectedReady = marker.state === "ready_for_input";
