@@ -19841,6 +19841,10 @@ export class AgentSession {
 	 * provider session state and configured WebSocket transport preference
 	 * instead of falling back to a fresh HTTP/SSE session. Mirrors the
 	 * `providerSessionId ?? sessionId` affinity the agent loop sends per turn.
+	 *
+	 * `maintenanceCall` is what lets an agent-level provider (for example Devin
+	 * over ACP) refuse work it cannot serve instead of forwarding a
+	 * summarization prompt to a billed upstream agent.
 	 */
 	#maintenanceProviderTransport(): {
 		sessionId: string | undefined;
@@ -19848,6 +19852,7 @@ export class AgentSession {
 		providerSessionState: Map<string, ProviderSessionState>;
 		preferWebsockets: boolean | undefined;
 		remoteCompactionFallbackHealth: RemoteCompactionFallbackHealthHooks;
+		maintenanceCall: boolean;
 	} {
 		const providerSessionId = this.agent.providerSessionId ?? this.agent.sessionId;
 		return {
@@ -19856,6 +19861,7 @@ export class AgentSession {
 			providerSessionState: this.#providerSessionState,
 			preferWebsockets: this.agent.preferWebsockets,
 			remoteCompactionFallbackHealth: this.#remoteCompactionFallbackHealth,
+			maintenanceCall: true,
 		};
 	}
 

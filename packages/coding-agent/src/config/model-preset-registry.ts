@@ -374,6 +374,7 @@ const RegistryPresetSchema = z
 			"azure-openai-responses",
 			"bedrock-converse-stream",
 			"cursor-agent",
+			"devin-acp",
 			"google-gemini-cli",
 			"google-generative-ai",
 			"google-vertex",

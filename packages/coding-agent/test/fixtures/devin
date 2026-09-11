@@ -1,0 +1,10 @@
+#!/usr/bin/env bun
+// Test stand-in for the Devin CLI.
+//
+// The Devin provider always spawns `<cli> acp`, matching `devin acp`
+// (https://docs.devin.ai/cli/reference/commands#devin-acp). An unrecognized
+// scenario argument makes the shared ACP fixture behave as its default agent,
+// which is everything model discovery needs: initialize, then session/new with
+// a `model` config option. It reuses the ACP fixture from the ai package so the
+// coding-agent surface tests speak the same protocol implementation.
+import "../../../ai/test/fixtures/devin-acp-agent.ts";

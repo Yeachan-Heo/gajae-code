@@ -759,6 +759,23 @@ Extensions can register providers at runtime (`pi.registerProvider(...)`), inclu
 - custom stream handler registration for new API IDs
 - custom OAuth provider registration
 
+### Agent-level providers (ACP)
+
+Some upstreams publish a complete agent instead of a model endpoint. Those are
+integrated as **agent-level providers**: the provider id is selectable like any
+other, but the upstream agent owns model choice, tool execution, conversation
+history, and usage accounting.
+
+`devin` (Devin CLI) is the first one. GJC spawns `devin acp` and speaks the
+Agent Client Protocol over stdio; `devin` models appear through the ordinary
+provider/model selection path once the CLI is installed and authenticated, and
+the provider is credentialless (`getApiKey*` returns `kNoAuth`) because
+authentication belongs to the CLI (`devin auth login`).
+
+See [Devin CLI provider (ACP)](./devin-provider.md) for the full boundary: which
+GJC surfaces apply to a Devin turn, the tool-call permission policy
+(`GJC_DEVIN_PERMISSION_MODE`), and billing.
+
 ## Auth and API key resolution order
 
 When requesting a key for a provider, effective order is:

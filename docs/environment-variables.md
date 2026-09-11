@@ -627,7 +627,18 @@ See [External control readiness](./external-control-readiness.md#jetbrains-air-c
 
 ---
 
-## 12) Removed ingress modes
+## 12) Devin CLI provider (ACP)
+
+| Variable | Values | Default | Behavior |
+| --- | --- | --- | --- |
+| `GJC_DEVIN_CLI_PATH` | executable path | `devin` on `PATH` | Executable GJC spawns as `<path> acp`. Use it when the Devin CLI is installed outside `PATH`. |
+| `GJC_DEVIN_PERMISSION_MODE` | `allow`, `deny` | `allow` | How GJC answers Devin's ACP permission requests for Devin's own tool calls. `allow` grants the least-privileged option Devin offered (`allow_once` before `allow_always`); `deny` selects `reject_once`/`reject_always`. Invalid values fail closed to `deny`. |
+
+Devin authentication lives entirely in the Devin CLI (`devin auth login`, or `WINDSURF_API_KEY` for enterprise builds); GJC stores no Devin credential. See [Devin CLI provider (ACP)](./devin-provider.md) for the integration boundary, model discovery, and billing.
+
+---
+
+## 13) Removed ingress modes
 
 `--mode rpc`, `--mode rpc-ui`, and `--mode bridge` have been removed. The retired bridge-prefixed variables and `GJC_RPC_EMIT_TITLE` are not runtime configuration variables. Use the [SDK machine interface](./sdk.md) for external machine control.
 
