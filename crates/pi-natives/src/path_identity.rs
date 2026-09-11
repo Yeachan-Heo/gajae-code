@@ -9102,9 +9102,27 @@ mod platform {
 			}
 		}
 		if detach_only {
-			let quarantine_name = String::from_utf16(&final_name).map_err(|_| "io_error");
-			let Ok(quarantine_name) = quarantine_name else {
+			let Ok(quarantine_name) = String::from_utf16(&final_name) else {
 				return NativeExactUnlinkResult::failure("io_error");
+			};
+			// `detach_directory` re-verifies the renamed object through
+			// `handle_identity_matches`, so the identity has to come from this
+			// retained handle. Placeholder constants never match a directory's
+			// non-zero mtime (and zeroing the size would too), which would turn
+			// every filter-hosted detach into a spurious identity mismatch.
+			let identity = ExactFileIdentity {
+				dev:             root_entry.dev.parse().unwrap_or_default(),
+				ino:             root_entry.ino.parse().unwrap_or_default(),
+				nlink:           None,
+				parent_dev:      expected_parent.map(|value| value.0),
+				parent_ino:      expected_parent.map(|value| value.1),
+				size:            root_entry.size.parse().unwrap_or_default(),
+				mtime_ns:        root_entry.mtime_ns.parse().unwrap_or_default(),
+				directory:       true,
+				detach_only:     true,
+				quarantine_name: Some(quarantine_name.clone()),
+				sha256:          None,
+				allow_hard_link: false,
 			};
 			return detach_directory(
 				root.target,
@@ -9112,21 +9130,7 @@ mod platform {
 				path.file_name().expect("validated directory name"),
 				&quarantine_name,
 				final_path,
-				&ExactFileIdentity {
-					dev:             expected.root_dev.parse().unwrap_or_default(),
-					ino:             expected.root_ino.parse().unwrap_or_default(),
-					nlink:           None,
-					parent_dev:      expected_parent.map(|value| value.0),
-					parent_ino:      expected_parent.map(|value| value.1),
-					size:            0,
-					mtime_ns:        0,
-					ctime_ns:        0,
-					directory:       true,
-					detach_only:     true,
-					quarantine_name: Some(quarantine_name),
-					sha256:          None,
-					allow_hard_link: false,
-				},
+				&identity,
 			);
 		}
 		match remove_tree_handle(root.target, "", &expected.entries) {
@@ -10327,6 +10331,41 @@ mod exact_unlink_placeholder_tests {
 			assert!(tree_is_descriptor_scrubbed(&replayed_snapshot, &snapshot));
 			fs::remove_dir_all(root).expect("remove temporary directory");
 		}
+	}
+
+	#[test]
+	fn detach_only_parks_the_verified_tree_without_scrubbing_the_payload() {
+		let root = std::env::temp_dir().join(format!(
+			"gjc-tree-detach-only-{}-{}",
+			std::process::id(),
+			SystemTime::now()
+				.duration_since(UNIX_EPOCH)
+				.expect("system time")
+				.as_nanos(),
+		));
+		fs::create_dir(&root).expect("create temporary directory");
+		let target = root.join("target");
+		fs::create_dir(&target).expect("create target");
+		fs::write(target.join("payload.bin"), b"authorized payload").expect("write payload");
+		let snapshot = platform::snapshot_directory_tree(&target)
+			.snapshot
+			.expect("snapshot target");
+		let detached = std::path::PathBuf::from(format!("{}.removing", target.to_string_lossy()));
+
+		let retired = platform::exact_remove_directory_tree_with_mode(&target, &snapshot, None, true);
+
+		assert!(retired.ok);
+		assert_eq!(retired.code.as_deref(), None);
+		assert_eq!(retired.detached_path.as_deref(), Some(detached.to_string_lossy().as_ref()));
+		// Detach-only parks the verified tree at the quarantine name; the payload is
+		// removed by the replay, never by the detach itself.
+		assert_eq!(retired.payload_durable, None);
+		assert!(!target.exists());
+		assert_eq!(
+			fs::read(detached.join("payload.bin")).expect("read retained payload"),
+			b"authorized payload"
+		);
+		fs::remove_dir_all(root).expect("remove temporary directory");
 	}
 
 	#[test]

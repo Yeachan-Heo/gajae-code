@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "bun:test";
+import { rmSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import path from "node:path";
 import * as native from "@gajae-code/natives";
@@ -30,6 +31,23 @@ const event = (sessionId: string) => ({
 
 function deferred<T = void>() {
 	return Promise.withResolvers<T>();
+}
+
+/**
+ * Faking `process.platform` to exercise a Windows code path also selects the lock
+ * layer's Windows release branch, which replays detached cleanup through the native
+ * addon. A test run only ever loads the host addon, so pin the bindings to a
+ * deterministic single-phase removal: without this, the POSIX addon's two-phase
+ * "cleanup_pending" result is read as a release failure by the Windows branch.
+ */
+function pinWindowsLockRemoval(): void {
+	FileLockTestHooks.nativeQuarantineBindings = () => ({
+		snapshotDirectoryTree: native.snapshotDirectoryTree,
+		exactRemoveDirectoryTree: target => {
+			rmSync(target, { recursive: true, force: true });
+			return { ok: true };
+		},
+	});
 }
 describe("SDK session index", () => {
 	it("diagnoses a missing index without creating session directories", async () => {
@@ -128,6 +146,7 @@ describe("SDK session index", () => {
 			throw Object.assign(new Error("signal zero unavailable"), { code: "EINVAL" });
 		}) as typeof process.kill;
 		Object.defineProperty(process, "platform", { configurable: true, value: "win32" });
+		pinWindowsLockRemoval();
 		try {
 			const index = await new SessionIndex(dir).open();
 			await index.append({
@@ -142,6 +161,7 @@ describe("SDK session index", () => {
 			Object.defineProperty(process, "platform", { configurable: true, value: originalPlatform });
 			process.kill = originalKill;
 			fromPid.mockRestore();
+			FileLockTestHooks.nativeQuarantineBindings = undefined;
 			await fs.rm(dir, { recursive: true, force: true });
 		}
 	});
@@ -320,6 +340,7 @@ describe("SDK session index", () => {
 		const sessionsDir = path.join(dir, "sdk", "sessions");
 		const platform = Object.getOwnPropertyDescriptor(process, "platform");
 		Object.defineProperty(process, "platform", { configurable: true, value: "win32" });
+		pinWindowsLockRemoval();
 		try {
 			for (const [stage, code] of [
 				["open", "EPERM"],
@@ -346,6 +367,7 @@ describe("SDK session index", () => {
 				}
 			}
 		} finally {
+			FileLockTestHooks.nativeQuarantineBindings = undefined;
 			if (platform) Object.defineProperty(process, "platform", platform);
 		}
 	});
@@ -356,6 +378,7 @@ describe("SDK session index", () => {
 		const platform = Object.getOwnPropertyDescriptor(process, "platform");
 		const open = fs.open.bind(fs);
 		Object.defineProperty(process, "platform", { configurable: true, value: "win32" });
+		pinWindowsLockRemoval();
 		const error = Object.assign(new Error("EIO"), { code: "EIO" });
 		const spy = vi.spyOn(fs, "open").mockImplementation((async (file: string, ...rest: unknown[]) => {
 			const handle = await (open as (file: string, ...args: unknown[]) => Promise<fs.FileHandle>)(file, ...rest);
@@ -369,6 +392,7 @@ describe("SDK session index", () => {
 			await expect(index.snapshot()).rejects.toBe(error);
 		} finally {
 			spy.mockRestore();
+			FileLockTestHooks.nativeQuarantineBindings = undefined;
 			if (platform) Object.defineProperty(process, "platform", platform);
 		}
 	});
