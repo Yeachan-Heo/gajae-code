@@ -1,0 +1,3 @@
+### Changed
+
+- Release notes are now per-change fragments under `packages/<pkg>/changelog.d/` (#5491). Every pull request used to append to the same `## [Unreleased]` lines of the same `CHANGELOG.md`, so each merge dirtied every other open PR and the rebase that cleared it invalidated the head-bound approval that PR had already earned. Distinct fragment file names cannot conflict. `scripts/release.ts` folds pending fragments into the package changelog and consumes them as part of the release commit, `bun run check:changelog-fragments` validates them locally, and Dev CI rejects a pull request that edits a guarded `## [Unreleased]` section directly or deletes a fragment.
