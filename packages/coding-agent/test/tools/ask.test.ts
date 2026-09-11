@@ -3594,10 +3594,7 @@ describe("AskTool deep-interview recorder persistence", () => {
 			expect.objectContaining({ stage: "ralplan", kind: "approval" }),
 		);
 		expect(approvalRecord).toHaveBeenCalledWith(expect.objectContaining({ approvalStage: "ralplan" }));
-		expect(approvalTransition).toHaveBeenCalledWith(
-			["approve-execution", "--mode", "deep-interview", "--session-id", "ralplan-approval", "--json"],
-			"/tmp/ralplan-approval",
-		);
+		expect(approvalTransition).not.toHaveBeenCalled();
 	});
 
 	it("omits single-option recommendations from workflow gates", async () => {
