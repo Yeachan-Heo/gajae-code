@@ -1,3 +1,4 @@
+import * as path from "node:path";
 import { CliParseError, type CommandCtor, type CommandEntryContext } from "@gajae-code/utils/cli";
 import { getAgentDir } from "@gajae-code/utils/dirs";
 import {
@@ -270,6 +271,7 @@ export function isSafeSdkInternalAgentDir(value: string): boolean {
 	return (
 		value.length > 0 &&
 		value.length <= 4096 &&
+		path.isAbsolute(value) &&
 		!value.startsWith("-") &&
 		!/[\x00-\x1f\x7f-\x9f\u2028\u2029]/u.test(value)
 	);
