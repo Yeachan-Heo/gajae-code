@@ -777,6 +777,9 @@ function buildHelpMessage(ctx) {
 	return (
 		"If installed via npm/bun, try reinstalling: bun install @gajae-code/natives\n" +
 		"If developing locally, build with: bun --cwd=packages/natives run build\n" +
+		(ctx.isWorkspaceLoad
+			? "In a fresh `git worktree add` checkout, run the worktree-safe setup: bun run setup:worktree\n"
+			: "") +
 		"Optional x64 variants: TARGET_VARIANT=baseline|modern bun --cwd=packages/natives run build"
 	);
 }
