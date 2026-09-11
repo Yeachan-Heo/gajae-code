@@ -58,18 +58,18 @@ Before command dispatch, the exact-prefix helper increments the Ouroboros bridge
 
 ### Runtime status
 
-Session startup quarantines filesystem extension modules. `createAgentSession` seeds its extension set from `options.preloadedExtensions` and falls back to an empty set, so discovered `extensions/**` paths are ignored even when `options.additionalExtensionPaths` is supplied (`packages/coding-agent/src/sdk/session.ts`). `discoverAndLoadExtensions` has no production caller: its only remaining call site is `packages/coding-agent/src/cli/list-models.ts`, and `gjc --list-models` calls that entry point with `disableExtensionDiscovery: true`, bypassing discovery. No session entrypoint calls it.
+Session startup loads filesystem extension modules. Unless `options.disableExtensionDiscovery` is set, `createAgentSession` calls `discoverAndLoadExtensions` with the explicit `options.additionalExtensionPaths`, the `extensions` setting, and the canonical native locations below, applying the `disabledExtensions` setting (`packages/coding-agent/src/sdk/session.ts`). `options.preloadedExtensions` still short-circuits discovery for callers that load extensions before argument parsing, and `disableExtensionDiscovery` keeps its documented opt-out semantics: explicit paths still load. A module that fails to import is reported through the shared logger and startup continues, so one broken module cannot block the session.
 
-A bridge installed under the locations below is therefore present and inspectable, and its `input` handler never runs. `gjc customize doctor` reports the state directly:
+A bridge installed under the locations below is therefore discovered and activated, and its `input` handler runs. `gjc customize doctor` is read-only and never executes a module, so it reports the module as `[stored-only]` and says why its dynamic registrations remain opaque:
 
 ```text
 ouroboros-ooo-bridge  [stored-only]  gjc/user  (canonical)
-  reason: managed — Discovered and shown in the extension dashboard, but session startup
-          does not load filesystem extension modules. Runtime extensions come from
-          validated GJC plugin bundles.
+  reason: managed — Trusted filesystem extension module discovered for session-start
+          loading. Doctor does not execute the module, so its runtime input handlers,
+          tools, commands, and flags remain opaque until a session loads it.
 ```
 
-GJC plugin bundles carry `subskills`, `tools`, `hooks`, `mcps`, `system_appendix`, and `agent-appendix` (`docs/gjc-plugins.md`). An `input`-event surface is outside that set, so the bridge has no bundle equivalent today. Treat the steps below as the contract for the interception surface and the install layout, and expect `ooo ...` to reach the model as ordinary chat until session startup loads extension modules again.
+GJC plugin bundles carry `subskills`, `tools`, `hooks`, `mcps`, `system_appendix`, and `agent-appendix` (`docs/gjc-plugins.md`). An `input`-event surface is still outside that set, so a bundle cannot deliver this bridge; the extension module location below is its supported delivery surface.
 
 ### Pinned Ouroboros baseline
 
