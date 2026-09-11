@@ -965,8 +965,11 @@ async function collectExtensions(cwd: string, activeSettings: SettingsInstance):
 		nameOf: ext => ext.name,
 		pathOf: ext => ext.path,
 		notExecutedDetail:
-			"Discovered and shown in the extension dashboard, but session startup does not load filesystem extension modules. Runtime extensions come from validated GJC plugin bundles.",
-		notExecutedRemediation: ["See `gjc plugin list` for plugin bundles that contribute extensions"],
+			"Trusted filesystem extension module discovered for session-start loading. Doctor does not execute the module, so its runtime input handlers, tools, commands, and flags remain opaque until a session loads it.",
+		notExecutedRemediation: [
+			"Review the trusted extension source before session startup",
+			"Disable it with the disabledExtensions setting, or set disableExtensionDiscovery in the SDK",
+		],
 	});
 }
 

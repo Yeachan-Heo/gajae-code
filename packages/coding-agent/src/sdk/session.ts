@@ -92,6 +92,7 @@ import type { CustomTool, CustomToolContext, CustomToolSessionEvent } from "../e
 import { CustomToolAdapter } from "../extensibility/custom-tools/wrapper";
 import {
 	createCustomToolSettings,
+	discoverAndLoadExtensions,
 	type ExtensionContext,
 	type ExtensionEvent,
 	type ExtensionFactory,
@@ -103,6 +104,7 @@ import {
 	type FunctionHookResult,
 	type LoadExtensionsResult,
 	loadExtensionFromFactory,
+	loadExtensions,
 	type ToolDefinition,
 	wrapRegisteredTools,
 } from "../extensibility/extensions";
@@ -3612,15 +3614,29 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			});
 		}
 
-		// Extension/module discovery is quarantined; retain only the private
-		// runtime needed for bundled product extensions, explicitly supplied SDK
-		// extension factories, and custom tools. Filesystem extension paths remain
-		// ignored here even when options.additionalExtensionPaths is supplied.
-		const extensionsResult: LoadExtensionsResult = options.preloadedExtensions ?? {
-			extensions: [],
-			errors: [],
-			runtime: new ExtensionRuntime(),
-		};
+		// Extension modules are discovered at session startup from the canonical
+		// native locations (`<agentDir>/extensions`, `<cwd>/.gjc/extensions`),
+		// installed plugin bundles, the `extensions` setting, and explicitly
+		// supplied `additionalExtensionPaths`. `disableExtensionDiscovery` keeps its
+		// documented opt-out semantics: explicit paths still load, matching
+		// `cli/list-models.ts`. `preloadedExtensions` (CLI early load so extension
+		// flags exist before argument parsing) suppresses discovery entirely.
+		const extensionsResult: LoadExtensionsResult =
+			options.preloadedExtensions ??
+			(options.disableExtensionDiscovery
+				? await loadExtensions(options.additionalExtensionPaths ?? [], cwd, eventBus)
+				: await discoverAndLoadExtensions(
+						[...(options.additionalExtensionPaths ?? []), ...settings.get("extensions")],
+						cwd,
+						eventBus,
+						settings.get("disabledExtensions"),
+						{ agentDir, profileAuthority, settings },
+					));
+		if (options.preloadedExtensions === undefined) {
+			for (const { path: extPath, error } of extensionsResult.errors) {
+				logger.warn("Failed to load extension", { path: extPath, error });
+			}
+		}
 
 		if (!extensionsResult.extensions.some(extension => extension.path === BUNDLED_GROK_BUILD_EXTENSION_ID)) {
 			const bundledGrokExtension = await loadExtensionFromFactory(

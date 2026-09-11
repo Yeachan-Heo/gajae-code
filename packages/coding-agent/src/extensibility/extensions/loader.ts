@@ -10,6 +10,7 @@ import type { KeyId } from "@gajae-code/tui";
 import { hasFsCode, isEacces, isEnoent, logger } from "@gajae-code/utils";
 import * as Zod from "zod/v4";
 import { type ExtensionModule, extensionModuleCapability } from "../../capability/extension-module";
+import type { Settings } from "../../config/settings";
 import { loadCapability } from "../../discovery";
 import { getExtensionNameFromPath } from "../../discovery/helpers";
 import type { ExecOptions } from "../../exec/exec";
@@ -730,6 +731,23 @@ async function discoverExtensionsInDir(dir: string): Promise<string[]> {
 }
 
 /**
+ * Session-scoped discovery inputs.
+ *
+ * A session's selected agent directory is not necessarily the process-global
+ * one (`createAgentSession({ agentDir })`), so user-scope extension modules and
+ * provider policy must resolve against the caller's profile rather than
+ * `getAgentDir()`.
+ */
+export interface DiscoverExtensionsOptions {
+	/** Agent directory backing user-scope discovery. Default: `getAgentDir()`. */
+	agentDir?: string;
+	/** Resolver-owned classification for `agentDir`. */
+	profileAuthority?: "default" | "custom";
+	/** Session settings whose provider policy applies to this load. */
+	settings?: Settings;
+}
+
+/**
  * Discover and load extensions from standard locations.
  */
 export async function discoverAndLoadExtensions(
@@ -737,6 +755,7 @@ export async function discoverAndLoadExtensions(
 	cwd: string,
 	eventBus?: EventBus,
 	disabledExtensionIds: string[] = [],
+	options: DiscoverExtensionsOptions = {},
 ): Promise<LoadExtensionsResult> {
 	const allPaths: string[] = [];
 	const seen = new Set<string>();
@@ -760,7 +779,12 @@ export async function discoverAndLoadExtensions(
 	};
 
 	// 1. Discover extension modules via capability API (native .gjc/.pi only)
-	const discovered = await loadCapability<ExtensionModule>(extensionModuleCapability.id, { cwd });
+	const discovered = await loadCapability<ExtensionModule>(extensionModuleCapability.id, {
+		cwd,
+		...(options.agentDir === undefined ? {} : { agentDir: options.agentDir }),
+		...(options.profileAuthority === undefined ? {} : { profileAuthority: options.profileAuthority }),
+		...(options.settings === undefined ? {} : { settings: options.settings }),
+	});
 	for (const ext of discovered.items) {
 		if (ext._source.provider !== "native") continue;
 		if (isDisabledName(ext.name)) continue;
