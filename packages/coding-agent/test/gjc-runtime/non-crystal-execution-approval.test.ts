@@ -28,6 +28,8 @@ import { initTheme } from "@gajae-code/coding-agent/modes/theme/theme";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { AskTool } from "@gajae-code/coding-agent/tools/ask";
 
+let askInvocationCounter = 0;
+
 function assistant(content: AssistantMessage["content"]): AssistantMessage {
 	return {
 		role: "assistant",
@@ -119,7 +121,7 @@ async function ask(
 	consumeRalplan = true,
 ) {
 	const label = "Approve execution via ultragoal";
-	const toolCallId = `provider-${id}`;
+	const toolCallId = `provider-${id}-${++askInvocationCounter}`;
 	const workflowGate =
 		stage === "deep-interview"
 			? { stage: "deep-interview" as const, kind: "execution" as const }
@@ -312,6 +314,8 @@ describe("non-Crystal user-gated execution approval", () => {
 				const record = async (gateId: string) => {
 					const transcriptPath = manager.getSessionFile()!;
 					const toolCallId = `provider-${gateId}`;
+					manager.appendMessage(assistant([{ type: "toolCall", id: toolCallId, name: "ask", arguments: {} }]));
+					await manager.flush();
 					await recordNonCrystalExecutionApproval({
 						cwd,
 						sessionId,
