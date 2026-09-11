@@ -2919,6 +2919,25 @@ describe("runDaemonCommand", () => {
 		expect(rendered.stderr).toBe("");
 		expect(JSON.parse(rendered.stdout)).toEqual(rendered.envelope);
 		expect(rendered.envelope.error.partialStatuses).toEqual([healthy]);
+		const oversized = await renderPublicCommandFailure(
+			new PublicCommandFailure({
+				kind: "daemon_mixed",
+				partialStatuses: [
+					{
+						...healthy,
+						ownerId: "漢字😀".repeat(10_000),
+						detail: "detail".repeat(10_000),
+						runtime: {
+							...healthy.runtime,
+							execPath: "path".repeat(10_000),
+							warning: "warning".repeat(10_000),
+						},
+					},
+				],
+			}),
+			{ command: ["daemon", "status"], json: true },
+		);
+		expect(Buffer.byteLength(oversized.stdout)).toBeLessThanOrEqual(8192);
 	});
 
 	test("restart prints a human result line", async () => {

@@ -284,10 +284,8 @@ function parseInput(raw: string | undefined, source: string): JsonRecord {
 	}
 }
 
-function matchesSecureInputIdentity(before: fsSync.BigIntStats, after: fsSync.BigIntStats): boolean {
+function matchesSecurePathIdentity(before: fsSync.BigIntStats, after: fsSync.BigIntStats): boolean {
 	return (
-		before.isFile() &&
-		after.isFile() &&
 		before.dev === after.dev &&
 		before.ino === after.ino &&
 		before.nlink === after.nlink &&
@@ -298,19 +296,58 @@ function matchesSecureInputIdentity(before: fsSync.BigIntStats, after: fsSync.Bi
 	);
 }
 
-async function secureInputPath(filePath: string): Promise<string> {
+function matchesSecureInputIdentity(before: fsSync.BigIntStats, after: fsSync.BigIntStats): boolean {
+	return before.isFile() && after.isFile() && matchesSecurePathIdentity(before, after);
+}
+
+type SecureInputPathSnapshot = {
+	resolvedPath: string;
+	ancestors: readonly { path: string; stat: fsSync.BigIntStats }[];
+};
+
+async function secureInputPath(filePath: string): Promise<SecureInputPathSnapshot> {
 	const resolved = path.resolve(filePath);
 	const canonical = await fs.realpath(resolved);
 	if (canonical !== resolved)
 		throw new SdkSessionCliError("input_file_unavailable", "Unable to read --json-input-file.", 2);
-	return resolved;
+	const ancestorPaths: string[] = [];
+	for (let current = path.dirname(resolved); ; ) {
+		ancestorPaths.unshift(current);
+		const parent = path.dirname(current);
+		if (parent === current) break;
+		current = parent;
+	}
+	const ancestors = [] as { path: string; stat: fsSync.BigIntStats }[];
+	for (const ancestor of ancestorPaths) {
+		const stat = await fs.lstat(ancestor, { bigint: true });
+		if (!stat.isDirectory())
+			throw new SdkSessionCliError("input_file_unavailable", "Unable to read --json-input-file.", 2);
+		ancestors.push({ path: ancestor, stat });
+	}
+	return { resolvedPath: resolved, ancestors };
+}
+
+function sameSecureInputAncestors(
+	before: readonly { path: string; stat: fsSync.BigIntStats }[],
+	after: readonly { path: string; stat: fsSync.BigIntStats }[],
+): boolean {
+	return (
+		before.length === after.length &&
+		before.every(
+			(entry, index) =>
+				after[index]?.path === entry.path &&
+				after[index] !== undefined &&
+				matchesSecurePathIdentity(entry.stat, after[index]!.stat),
+		)
+	);
 }
 
 /** Reads a 0600 JSON input through one descriptor, never through a replaceable pathname. */
 export async function readSecureJsonInputFile(filePath: string): Promise<string> {
 	let descriptor: fs.FileHandle | undefined;
 	try {
-		const resolvedPath = await secureInputPath(filePath);
+		const beforePath = await secureInputPath(filePath);
+		const resolvedPath = beforePath.resolvedPath;
 		const noFollow = process.platform === "win32" ? 0 : fsSync.constants.O_NOFOLLOW;
 		descriptor = await fs.open(resolvedPath, fsSync.constants.O_RDONLY | noFollow);
 		const before = await descriptor.stat({ bigint: true });
@@ -333,7 +370,11 @@ export async function readSecureJsonInputFile(filePath: string): Promise<string>
 			);
 
 		const pathIdentity = await fs.lstat(resolvedPath, { bigint: true });
-		if (!matchesSecureInputIdentity(before, pathIdentity))
+		const openedPath = await secureInputPath(resolvedPath);
+		if (
+			!matchesSecureInputIdentity(before, pathIdentity) ||
+			!sameSecureInputAncestors(beforePath.ancestors, openedPath.ancestors)
+		)
 			throw new SdkSessionCliError("input_file_unavailable", "Unable to read --json-input-file.", 2);
 
 		const size = Number(before.size);
@@ -348,9 +389,13 @@ export async function readSecureJsonInputFile(filePath: string): Promise<string>
 			throw new SdkSessionCliError("input_file_unavailable", "Unable to read --json-input-file.", 2);
 
 		const after = await descriptor.stat({ bigint: true });
-		await secureInputPath(resolvedPath);
+		const finalPath = await secureInputPath(resolvedPath);
 		const finalPathIdentity = await fs.lstat(resolvedPath, { bigint: true });
-		if (!matchesSecureInputIdentity(before, after) || !matchesSecureInputIdentity(before, finalPathIdentity))
+		if (
+			!matchesSecureInputIdentity(before, after) ||
+			!matchesSecureInputIdentity(before, finalPathIdentity) ||
+			!sameSecureInputAncestors(beforePath.ancestors, finalPath.ancestors)
+		)
 			throw new SdkSessionCliError("input_file_unavailable", "Unable to read --json-input-file.", 2);
 		return bytes.toString("utf8");
 	} catch (error) {
