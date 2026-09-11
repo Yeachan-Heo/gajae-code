@@ -31,7 +31,6 @@ import imageGenDescription from "../prompts/tools/image-gen.md" with { type: "te
 import { isPrivateOrSpecialAddress, validatePublicHttpUrl } from "../web/insane/url-guard";
 import { resolveReadPath } from "./path-utils";
 
-const DEFAULT_MODEL = "gemini-3-pro-image-preview";
 const IMAGE_TIMEOUT = 3 * 60 * 1000; // 3 minutes
 const MAX_IMAGE_SIZE = 35 * 1024 * 1024;
 const MAX_IMAGE_REDIRECTS = 5;
@@ -835,16 +834,6 @@ function extractOpenRouterImageUrls(message: OpenRouterMessage | undefined): str
 	return urls;
 }
 
-/** Provider → default image model mapping for fallbacks */
-export const IMAGE_PROVIDER_DEFAULTS: Record<string, string> = {
-	openai: "gpt-image-2",
-	alibaba: "wan2.7-image",
-	"openai-codex": "gpt-image-2",
-	antigravity: "gemini-3-pro-image",
-	gemini: "gemini-3-pro-image-preview",
-	openrouter: "google/gemini-3-pro-image-preview",
-};
-
 /**
  * Resolve the image-generation model from the `modelRoles.image` settings entry.
  * Returns the resolved Model (with provider identity) or undefined when no
@@ -865,12 +854,6 @@ export function resolveImageRoleModel(
 		credentialSessionId: options?.credentialSessionId,
 	});
 	return resolved.model;
-}
-
-/** Resolve the effective image model for a configured provider */
-export function resolveImageModel(provider: string, modelOverride: string | null): string {
-	if (modelOverride) return modelOverride;
-	return IMAGE_PROVIDER_DEFAULTS[provider] ?? DEFAULT_MODEL;
 }
 
 interface ParsedAntigravityCredentials {
@@ -961,10 +944,11 @@ async function findImageApiKey(
 	settings: ModelRoleSettings,
 	sessionId?: string,
 	credentialSessionId?: string,
-): Promise<ImageApiKey | null> {
+): Promise<(ImageApiKey & { model: Model }) | null> {
 	const imageModel = resolveImageRoleModel(settings, modelRegistry, { sessionId, credentialSessionId });
 	if (!imageModel) return null;
-	return resolveCredentialsForImageModel(imageModel, modelRegistry, sessionId);
+	const credentials = await resolveCredentialsForImageModel(imageModel, modelRegistry, sessionId);
+	return credentials ? { ...credentials, model: imageModel } : null;
 }
 
 /**
@@ -1512,16 +1496,7 @@ export const imageGenTool: CustomTool<typeof imageGenSchema, ImageGenToolDetails
 			}
 
 			const provider = apiKey.provider;
-			const imageModel = apiKey.model;
-			const model = imageModel
-				? imageModel.id
-				: provider === "antigravity"
-					? resolveImageModel("antigravity", null)
-					: provider === "alibaba"
-						? resolveImageModel("alibaba", null)
-						: provider === "openrouter"
-							? resolveImageModel("openrouter", null)
-							: resolveImageModel("gemini", null);
+			const model = apiKey.model.id;
 			const resolvedModel = provider === "openrouter" ? resolveOpenRouterModel(model) : model;
 			const cwd = ctx.sessionManager.getCwd();
 
@@ -1535,10 +1510,6 @@ export const imageGenTool: CustomTool<typeof imageGenSchema, ImageGenToolDetails
 			const requestSignal = ptree.combineSignals(signal, IMAGE_TIMEOUT);
 
 			if (provider === "openai" || provider === "openai-codex") {
-				if (!apiKey.model) {
-					throw new Error("Missing active GPT model for OpenAI image generation");
-				}
-
 				const parsed = await generateOpenAIHostedImage(
 					apiKey.apiKey,
 					apiKey.model,
