@@ -1,6 +1,10 @@
 # Changelog
 
 ## [Unreleased]
+### Added
+
+- `CommandEntry` accepts an optional `dispatch(argv, context)` hook, so a registered command family can own its own inert parsing, help, lazy loading and failure rendering before the generic help and command-load path runs. `gjc sdk` and `gjc daemon` use it to intercept their family argv and keep private worker grammar out of public discovery.
+
 ### Changed
 
 - The startup timing tree drops the unused module-load span machinery (`recordModuleLoadSpan` and the `(modules)` summary renderer) that had no producer since the module-timer hook was removed, and any span still open at print time — such as a dispatch span wrapping the very run that prints — now reports elapsed-at-print instead of a misleading `0.00ms`.
