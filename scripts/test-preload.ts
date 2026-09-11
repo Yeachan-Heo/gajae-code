@@ -1,8 +1,19 @@
 import { installRuntimeDeletionGuard } from "./safe-cleanup";
 import { decideAgentDirIsolation, readProjectEnvFile, stripAmbientProviderEnvironment } from "./test-agent-dir-isolation";
+import { formatWorkspaceDependencyFailure, inspectWorkspaceDependencies } from "./worktree-deps";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+
+// Fail fast in a fresh `git worktree add` checkout (issue #5484). Without
+// installed workspace dependencies every test file dies on a bare
+// `Cannot find module '@gajae-code/...'` error that names neither the cause nor
+// the fix. This runs before any test import and before the isolation guards
+// below, because there is nothing to isolate when the suite cannot even start.
+const workspaceDependencies = inspectWorkspaceDependencies({ repoRoot: path.join(import.meta.dir, "..") });
+if (workspaceDependencies.status !== "ready") {
+	throw new Error(formatWorkspaceDependencyFailure(workspaceDependencies));
+}
 
 // macOS `os.tmpdir()` resolves through the `/var -> /private/var` symlink, and the
 // native owner-only primitive plus the session-storage reparse guard intentionally

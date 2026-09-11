@@ -15,6 +15,7 @@
  *   bun scripts/dev-link.ts            # link `gjc` -> src/cli.ts on PATH
  *   bun scripts/dev-link.ts --binary   # link `gjc` -> dist/gjc compiled binary
  *   bun scripts/dev-link.ts --check    # doctor: fail if `gjc` has drifted
+ *   bun scripts/dev-link.ts --worktree # doctor: node_modules / native addon readiness
  *
  * Env:
  *   GJC_DEV_LINK_DIR   override the target bin dir (default ~/.local/bin)
@@ -23,6 +24,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { formatWorktreeReport, inspectWorktree } from "./worktree-deps";
 
 const repoRoot = path.join(import.meta.dir, "..");
 const cliSource = path.join(repoRoot, "packages", "coding-agent", "src", "cli.ts");
@@ -353,6 +355,13 @@ function assertSourceExists(): void {
 	process.exit(1);
 }
 
+function worktreeCheck(): never {
+	const report = inspectWorktree(repoRoot);
+	const write = report.ok ? console.log : console.error;
+	write(formatWorktreeReport(report));
+	process.exit(report.ok ? 0 : 1);
+}
+
 function check(): never {
 	assertSourceExists();
 	assertWorkspaceLinksLocal();
@@ -443,6 +452,7 @@ function link(binary: boolean): never {
 }
 
 if (import.meta.main) {
-	if (process.argv.includes("--check")) check();
+	if (process.argv.includes("--worktree")) worktreeCheck();
+	else if (process.argv.includes("--check")) check();
 	else link(process.argv.includes("--binary"));
 }
