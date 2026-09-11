@@ -599,6 +599,71 @@ function isFileLockOrphanTransition(value: FileLockAcquisitionResult): value is 
 	return value !== null && "kind" in value && value.kind === "orphan_transition";
 }
 
+/**
+ * Whether `snapshot` has the exact shape the native removal primitive leaves
+ * behind after its payload scrub: a directory tree in which every file entry
+ * has already been truncated to zero bytes. Only the identity-bound native
+ * exact-removal primitive produces that residue, and it does so after every
+ * authorized payload mutation is complete, so the shape itself is the proof
+ * that no live owner can still be using the tree.
+ */
+function isScrubbedRemovalTransition(snapshot: NativeDirectoryTreeSnapshot): boolean {
+	if (snapshot.entries.length === 0) return false;
+	const root = snapshot.entries.find(entry => entry.relativePath === "");
+	if (root?.kind !== "directory") return false;
+	return snapshot.entries.every(entry => entry.kind === "directory" || entry.size === "0");
+}
+
+/**
+ * Adopt-and-finish a provably orphaned POSIX removal transition.
+ *
+ * On POSIX the native exact-removal primitive detaches the verified tree to its
+ * deterministic `<lock>.removing` sibling, scrubs every authorized file payload
+ * (truncating each to zero bytes), and hands the retained tree to the caller for
+ * the final on-disk unlink. A process SIGKILLed in that gap leaves the scrubbed
+ * tree behind with a zero-byte `info`, so the original owner record is gone and
+ * no token or liveness proof can identify the owner. Ownership is therefore
+ * proven by the object: a plain `.removing` directory whose snapshot is the
+ * native scrub residue and whose `info` mtime is at least the full acquisition
+ * budget old. Finishing that removal deletes only already-scrubbed residue and
+ * never live lock state; any successor, placeholder, unscrubbed tree, or
+ * transient native refusal is returned unadopted so the caller keeps the typed
+ * `orphan_transition` diagnostic.
+ */
+async function adoptOrphanedFileLockRemovalTransition(lockPath: string, orphanAgeMs: number): Promise<boolean> {
+	const transitionPath = fileLockRemovalTransitionPath(lockPath);
+	// Re-validate at the moment of adoption: a successor that published a parsed
+	// owner or replaced the tree must never inherit an earlier orphan verdict.
+	if ((await classifyFileLockRemovalTransition(lockPath, orphanAgeMs)) !== "orphan_transition") return false;
+	const captured = snapshotDirectoryTree(transitionPath);
+	if (!captured.ok || !captured.snapshot) return false;
+	const snapshot = captured.snapshot;
+	if (!isScrubbedRemovalTransition(snapshot)) return false;
+	let removal: NativeExactUnlinkResult;
+	try {
+		removal = nativeFileLockBindings().exactRemoveDirectoryTree(transitionPath, snapshot);
+	} catch (error) {
+		if (isTransientReleaseError(error)) return false;
+		throw error;
+	}
+	if (removal.ok || removal.code === "not_found") return true;
+	// POSIX cannot bind a namespace unlink to the verified descriptor, so the
+	// primitive retains the scrubbed tree under its deterministic name and the
+	// caller finishes the on-disk removal. Finish only the exact tree this call
+	// scrubbed; a retained successor/placeholder/unknown path is refused so a
+	// replacement is never deleted.
+	if (
+		removal.code === "cleanup_pending" &&
+		removal.detachedPath !== undefined &&
+		path.resolve(removal.detachedPath) === path.resolve(transitionPath) &&
+		removal.retainedSuccessorPath === undefined &&
+		removal.retainedPlaceholderPath === undefined &&
+		removal.retainedUnknownPath === undefined
+	)
+		return await removeDetachedLockQuarantineOnDisk(transitionPath, snapshot.rootDev, snapshot.rootIno);
+	return false;
+}
+
 function sameFileLockTreeAfterPublication(
 	staged: NativeDirectoryTreeSnapshot,
 	published: NativeDirectoryTreeSnapshot,
@@ -1406,12 +1471,25 @@ async function tryAcquireLock(
 			// POSIX exact tree removal owns this deterministic sibling from detach
 			// until cleanup. The outer acquisition loop supplies the existing bounded
 			// contention wait while the predecessor retains that namespace.
-			const transitionState = await classifyFileLockRemovalTransition(
+			let transitionState = await classifyFileLockRemovalTransition(
 				destinationPath,
 				orphanTransitionAgeMs,
 				ownerHostId,
 				previousOwnerHostIds,
 			);
+			if (transitionState === "orphan_transition") {
+				// A scrubbed, aged transition is the residue of a removal whose owner died
+				// before its final on-disk cleanup. Adopt and finish it here so the wedged
+				// namespace heals instead of aborting (or re-spinning the whole budget).
+				if (!(await adoptOrphanedFileLockRemovalTransition(destinationPath, orphanTransitionAgeMs)))
+					return { kind: "orphan_transition", path: fileLockRemovalTransitionPath(destinationPath) };
+				transitionState = await classifyFileLockRemovalTransition(
+					destinationPath,
+					orphanTransitionAgeMs,
+					ownerHostId,
+					previousOwnerHostIds,
+				);
+			}
 			if (transitionState === "orphan_transition")
 				return { kind: "orphan_transition", path: fileLockRemovalTransitionPath(destinationPath) };
 			if (transitionState !== null) return null;
