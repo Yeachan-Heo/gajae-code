@@ -1,6 +1,7 @@
 import * as crypto from "node:crypto";
 import type { BigIntStats } from "node:fs";
 import * as fs from "node:fs/promises";
+import * as os from "node:os";
 import * as path from "node:path";
 import type {
 	NativeDirectoryTreeResult,
@@ -95,6 +96,7 @@ export const FileLockTestHooks: {
 		renameDirectoryNoReplacePathAsync: typeof renameDirectoryNoReplacePathAsync;
 	};
 	nativeQuarantineBindings?: () => NativeFileLockBindings;
+	nativeExactRemovalProbe?: () => boolean | Promise<boolean>;
 } = {};
 
 /**
@@ -465,7 +467,10 @@ export interface FileLockOwnerToken {
  * another process may copy into a new lock generation.
  */
 const fileLockDirIdentities = new WeakMap<object, GenericFileLockDirIdentity>();
-const pendingDetachedLockCleanups = new WeakMap<object, { path: string; rootDev: string; rootIno: string }>();
+const pendingDetachedLockCleanups = new WeakMap<
+	object,
+	{ path: string; rootDev: string; rootIno: string; snapshot: NativeDirectoryTreeSnapshot }
+>();
 
 async function finishDetachedLockCleanup(owner: FileLockOwnerToken): Promise<boolean> {
 	const pending = pendingDetachedLockCleanups.get(owner);
@@ -480,7 +485,13 @@ async function finishDetachedLockCleanup(owner: FileLockOwnerToken): Promise<boo
 		) {
 			throw new Error("Detached file lock cleanup identity changed; refusing removal");
 		}
-		await fs.rm(pending.path, { recursive: true, force: true });
+		if (process.platform === "win32") {
+			const removal = nativeFileLockBindings().exactRemoveDirectoryTree(pending.path, pending.snapshot);
+			if (!removal.ok && removal.code !== "not_found" && removal.code !== "cleanup_pending")
+				throw new Error(`Failed to finish detached file lock cleanup: ${removal.code ?? "unknown"}.`);
+		} else {
+			await fs.rm(pending.path, { recursive: true, force: true });
+		}
 	} catch (error) {
 		if (!isEnoent(error)) throw error;
 	}
@@ -854,6 +865,117 @@ function sameGenericFileLockDirIdentity(left: GenericFileLockDirIdentity, right:
 	);
 }
 
+let nativeExactRemovalUsable: boolean | undefined;
+let nativeExactRemovalProbePromise: Promise<boolean> | undefined;
+
+async function probeNativeExactRemoval(): Promise<boolean> {
+	const testProbe = FileLockTestHooks.nativeExactRemovalProbe;
+	if (testProbe) return await testProbe();
+	if (process.platform !== "win32") return true;
+
+	let root: string;
+	try {
+		root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-lock-probe-"));
+	} catch {
+		// There is no evidence that native exact removal is unusable. Keep the
+		// identity-bound path rather than changing cleanup semantics on an
+		// unrelated temporary-directory failure.
+		return true;
+	}
+	const probeDir = path.join(root, "probe.lock");
+	try {
+		await fs.mkdir(probeDir, { recursive: true, mode: 0o700 });
+		await fs.writeFile(path.join(probeDir, "info"), "probe");
+		const captured = nativeFileLockBindings().snapshotDirectoryTree(probeDir);
+		if (!captured.ok || !captured.snapshot) return false;
+		return nativeFileLockBindings().exactRemoveDirectoryTree(probeDir, captured.snapshot).ok === true;
+	} catch {
+		return false;
+	} finally {
+		await fs.rm(root, { recursive: true, force: true }).catch(() => undefined);
+	}
+}
+
+async function isNativeExactRemovalUsable(): Promise<boolean> {
+	if (FileLockTestHooks.nativeExactRemovalProbe) return await probeNativeExactRemoval();
+	if (process.platform !== "win32") return true;
+	if (FileLockTestHooks.nativeQuarantineBindings) return true;
+	if (nativeExactRemovalUsable !== undefined) return nativeExactRemovalUsable;
+	let probe = nativeExactRemovalProbePromise;
+	if (!probe) {
+		probe = probeNativeExactRemoval().then(usable => {
+			nativeExactRemovalUsable = usable;
+			return usable;
+		});
+		nativeExactRemovalProbePromise = probe;
+	}
+	try {
+		return await probe;
+	} finally {
+		if (nativeExactRemovalProbePromise === probe) nativeExactRemovalProbePromise = undefined;
+	}
+}
+
+async function removeVerifiedLockDirWithoutNative(
+	lockDir: string,
+	expected: NonNullable<NativeDirectoryTreeResult["snapshot"]>,
+): Promise<FileLockGcRemoval> {
+	let parent: BigIntStats;
+	try {
+		parent = await fs.lstat(path.dirname(lockDir), { bigint: true });
+	} catch (error) {
+		if (isEnoent(error)) return "owner_changed";
+		if (isTransientReleaseError(error)) throw error;
+		return "cleanup_failed";
+	}
+	const removal = nativeFileLockBindings().exactRemoveDirectoryTree(
+		lockDir,
+		expected,
+		{ dev: parent.dev, ino: parent.ino },
+		true,
+	);
+	if (removal.ok && !removal.detachedPath) return "removed";
+	if (removal.code === "not_found") return "removed";
+	if (removal.code === "identity_mismatch" || removal.code === "parent_mismatch") return "owner_changed";
+	if (!removal.detachedPath) return "cleanup_failed";
+	const completed = nativeFileLockBindings().exactRemoveDirectoryTree(removal.detachedPath, expected);
+	return completed.ok || completed.code === "not_found" || completed.code === "cleanup_pending"
+		? "removed"
+		: "cleanup_failed";
+}
+
+async function removeVerifiedOwnedLockDirWithoutNative(
+	lockDir: string,
+	expected: GenericFileLockDirIdentity,
+): Promise<FileLockGcRemoval> {
+	try {
+		await fs.lstat(lockDir, { bigint: true });
+	} catch (error) {
+		if (isEnoent(error)) return "removed";
+		if (isTransientReleaseError(error)) throw error;
+		return "cleanup_failed";
+	}
+	const current = await captureFileLockDirIdentity(lockDir);
+	if (!current || !sameGenericFileLockDirIdentity(current, expected)) return "owner_changed";
+	const captured = nativeFileLockBindings().snapshotDirectoryTree(lockDir);
+	if (!captured.ok || !captured.snapshot) return "owner_changed";
+	const infoEntry = captured.snapshot.entries.find(entry => entry.relativePath === "info");
+	if (
+		captured.snapshot.rootDev !== expected.rootDev ||
+		captured.snapshot.rootIno !== expected.rootIno ||
+		!infoEntry ||
+		infoEntry.dev !== expected.infoDev ||
+		infoEntry.ino !== expected.infoIno ||
+		infoEntry.nlink !== expected.infoNlink ||
+		infoEntry.size !== expected.infoSize ||
+		infoEntry.mtimeNs !== expected.infoMtimeNs ||
+		infoEntry.ctimeNs !== expected.infoCtimeNs ||
+		infoEntry.sha256 !== expected.infoSha256
+	)
+		return "owner_changed";
+	return await removeVerifiedLockDirWithoutNative(lockDir, captured.snapshot);
+}
+
 export type GenericFileLockDirStaleVerdict = { stale: false } | { stale: true; identity: GenericFileLockDirIdentity };
 
 /**
@@ -902,6 +1024,8 @@ export async function removeFileLockDirForGc(
 	) {
 		return "owner_changed";
 	}
+	if (!(await isNativeExactRemovalUsable()))
+		return await removeVerifiedOwnedLockDirWithoutNative(lockDir, expectedIdentity);
 	// The token comparison above authorizes the content that was judged, not the
 	// pathname. When the caller carried pre-verdict root/info identity, require
 	// the post-verdict native snapshot to match that same object before removal;
@@ -964,6 +1088,7 @@ export async function removeFileLockDirForGc(
 			path: detachedPath,
 			rootDev: captured.snapshot.rootDev,
 			rootIno: captured.snapshot.rootIno,
+			snapshot: captured.snapshot,
 		});
 		await finishDetachedLockCleanup(expected);
 		return "removed";
@@ -1275,6 +1400,8 @@ type NativeFileLockBindings = {
 	exactRemoveDirectoryTree(
 		lockPath: string,
 		snapshot: NonNullable<NativeDirectoryTreeResult["snapshot"]>,
+		parentIdentity?: { dev: bigint; ino: bigint },
+		detachOnly?: boolean,
 	): NativeExactUnlinkResult;
 };
 
@@ -1302,6 +1429,8 @@ async function quarantineReleasedLock(
 	// judged; without pre-verdict evidence, refuse and let the caller surface the retry
 	// failure instead of risking a successor lock.
 	if (!expectedIdentity) return false;
+	if (!(await isNativeExactRemovalUsable()))
+		return (await removeVerifiedOwnedLockDirWithoutNative(lockPath, expectedIdentity)) === "removed";
 	let captured: NativeDirectoryTreeResult;
 	const nativeCapturePath = await canonicalLockPathPreservingFinal(lockPath);
 	try {
@@ -1355,6 +1484,7 @@ async function quarantineReleasedLock(
 					path: removed.detachedPath,
 					rootDev: captured.snapshot.rootDev,
 					rootIno: captured.snapshot.rootIno,
+					snapshot: captured.snapshot,
 				});
 				await finishDetachedLockCleanup(owner);
 				return true;
@@ -1729,6 +1859,10 @@ export async function inspectFileLockStagingDir(
 	if (status !== "dead" || !remove) return result;
 	if (observation) {
 		const removal = await removeFileLockDirForGc(canonical, observation.info, observation.identity);
+		return { ...result, removed: removal === "removed", reason: removal };
+	}
+	if (!(await isNativeExactRemovalUsable())) {
+		const removal = await removeVerifiedLockDirWithoutNative(canonical, captured.snapshot);
 		return { ...result, removed: removal === "removed", reason: removal };
 	}
 	const removal = nativeFileLockBindings().exactRemoveDirectoryTree(canonical, captured.snapshot);

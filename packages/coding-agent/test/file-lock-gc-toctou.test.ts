@@ -31,6 +31,7 @@ afterEach(async () => {
 	FileLockTestHooks.afterParentMkdir = undefined;
 	FileLockTestHooks.nativePublicationBindings = undefined;
 	FileLockTestHooks.nativeQuarantineBindings = undefined;
+	FileLockTestHooks.nativeExactRemovalProbe = undefined;
 	for (const dir of tempDirs.splice(0)) {
 		await fs.rm(dir, { recursive: true, force: true });
 	}
@@ -886,6 +887,59 @@ describe("file lock cleanup failure handling (#2478)", () => {
 		});
 		expect(snapshotCalls).toBeGreaterThan(0);
 		expect(await fs.exists(lockDir)).toBe(true);
+	});
+
+	test("uses verified filesystem removal when native exact removal is unavailable", async () => {
+		const base = await makeTemp();
+		const lockedFile = path.join(base, "state.json");
+		const lockDir = `${lockedFile}.lock`;
+		FileLockTestHooks.nativeExactRemovalProbe = () => false;
+		FileLockTestHooks.nativeQuarantineBindings = () => ({
+			snapshotDirectoryTree,
+			exactRemoveDirectoryTree: (target, _snapshot, _parent, detachOnly) => {
+				if (detachOnly) {
+					renameSync(target, `${target}.removing`);
+					return { ok: false, code: "cleanup_pending", detachedPath: `${target}.removing` };
+				}
+				rmSync(target, { recursive: true, force: true });
+				return { ok: true };
+			},
+		});
+
+		await expect(withFileLock(lockedFile, async () => undefined)).resolves.toBeUndefined();
+
+		expect(await fs.exists(lockDir)).toBe(false);
+	});
+
+	test("keeps a successor after fallback validation races with replacement", async () => {
+		const base = await makeTemp();
+		const lockedFile = path.join(base, "state.json");
+		const lockDir = `${lockedFile}.lock`;
+		await fs.mkdir(lockDir);
+		await writeInfo(lockDir, { pid: DEAD_PID, timestamp: Date.now() - 10_000 });
+		FileLockTestHooks.nativeExactRemovalProbe = () => false;
+		let replaced = false;
+		FileLockTestHooks.nativeQuarantineBindings = () => ({
+			snapshotDirectoryTree(target) {
+				const result = snapshotDirectoryTree(target);
+				if (target === lockDir && !replaced && result.ok && result.snapshot) {
+					replaced = true;
+					rmSync(lockDir, { recursive: true, force: true });
+					mkdirSync(lockDir);
+					writeFileSync(path.join(lockDir, "info"), JSON.stringify({ pid: LIVE_PID, timestamp: Date.now() }));
+				}
+				return result;
+			},
+			exactRemoveDirectoryTree: () => {
+				return { ok: false, code: "identity_mismatch" };
+			},
+		});
+
+		const expected = await readFileLockObservationForGc(lockDir);
+		await removeFileLockDirForGc(lockDir, expected?.info ?? { pid: DEAD_PID, timestamp: Date.now() - 10_000 }).then(
+			result => expect(result).toBe("owner_changed"),
+		);
+		expect(await fs.readFile(path.join(lockDir, "info"), "utf8")).toContain(`"pid":${LIVE_PID}`);
 	});
 
 	test("retries transient Windows release denial before reporting success", async () => {
