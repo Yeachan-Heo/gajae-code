@@ -60,3 +60,15 @@ test("pre-push forwards the actual destination, remote branch and pushed object"
 		await fs.rm(temp, { recursive: true, force: true });
 	}
 });
+
+test("setup:worktree installs dependencies and builds natives without touching primary-checkout global state", async () => {
+	const repoRoot = path.resolve(import.meta.dir, "..");
+	const manifest = (await Bun.file(path.join(repoRoot, "package.json")).json()) as RootManifest;
+	const script = manifest.scripts["setup:worktree"] ?? "";
+
+	expect(script.split(" && ")).toEqual(["bun install", "bun run build:native"]);
+	// install:dev's global-state steps would hijack the primary checkout from a worktree.
+	for (const forbidden of ["link", "dev:hooks", "setup defaults"]) {
+		expect(script).not.toContain(forbidden);
+	}
+});

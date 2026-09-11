@@ -42,11 +42,22 @@ bun run stats               # gjc stats from source
 One-time / environment setup:
 
 ```sh
-bun run install:dev         # bun install + native build + workspace links + dev:link + setup defaults
+bun run install:dev         # PRIMARY CHECKOUT ONLY: bun install + native build + workspace links + dev:link + setup defaults
+bun run setup:worktree      # git worktree only: bun install + native build, no global-state changes
 bun run dev:link            # symlink `gjc` on PATH to the source CLI (scripts/dev-link.ts)
 bun run dev:doctor          # verify PATH resolution of `gjc` points at this workspace
+bun run dev:doctor -- --worktree   # verify this checkout can resolve workspace deps and load the native addon
 bun run install:defaults    # (re)install bundled default definitions
 ```
+
+A second checkout created with `git worktree add` starts with no `node_modules/` and no
+built native addon, so every `bun test` fails with a bare module-resolution error until
+dependencies are installed. Run `bun run setup:worktree` there (equivalent to
+`bun install && bun run build:native`). Do **not** run `bun run install:dev` in a
+worktree: it repoints the global `gjc` on `PATH`, rewrites `core.hooksPath`, and
+overwrites user-level defaults for your primary checkout. `bun run dev:doctor -- --worktree`
+reports whether the current checkout can resolve workspace packages and load the native
+addon, and names the fix when it cannot.
 
 Removing build output (never touches sources, `node_modules/`, `.gjc/` state, or `artifacts/` test working space):
 
