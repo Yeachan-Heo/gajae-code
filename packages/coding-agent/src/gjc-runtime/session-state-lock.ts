@@ -1407,9 +1407,12 @@ async function rewriteHeldOwnerRecord(
 		await SessionStateLockTestHooks.beforeOwnerRecordRewrite?.(file);
 		rewriteHookPassed = true;
 		await writeOwnerBytes(handle, replacementBytes);
-		const rewritten = await handle.stat({ bigint: true });
 		const canonical = await captureRegularLockOwner(file);
-		if (!canonical || canonical.dev !== rewritten.dev || canonical.ino !== rewritten.ino)
+		// On Windows, an in-place truncate/write can expose refreshed descriptor
+		// metadata even though the file object is unchanged. The descriptor opened
+		// before mutation is the stable identity bracket; the path capture still
+		// proves that the pathname resolves to that same object after the rewrite.
+		if (!canonical || canonical.dev !== opened.dev || canonical.ino !== opened.ino)
 			throw new SessionStateLockUnavailableError(new Error("Owner pathname changed after rewrite."));
 		if (canonical.bytes !== replacementBytes.toString("utf8")) {
 			let successor: unknown;
