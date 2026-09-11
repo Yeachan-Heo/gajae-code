@@ -17,8 +17,9 @@ import {
 	AskTool,
 	askSchema,
 	askToolRenderer,
-	GJC_ASK_ACK_TIMEOUT_MS_ENV,
-	resolveAskAckTimeoutMs,
+	GJC_ASK_ANSWER_DEADLINE_MS_ENV,
+	MAX_ASK_ANSWER_DEADLINE_MS,
+	resolveAskAnswerDeadlineMs,
 } from "@gajae-code/coding-agent/tools/ask";
 import { ToolAbortError } from "@gajae-code/coding-agent/tools/tool-errors";
 import { logger } from "@gajae-code/utils";
@@ -3045,8 +3046,9 @@ describe("AskTool deep-interview recorder persistence", () => {
 		expect(warn).toHaveBeenCalledWith(expect.stringContaining("deep-interview round recording failed"));
 	});
 
-	it("bounds a headless ask whose answer source never takes the question", async () => {
-		process.env[GJC_ASK_ACK_TIMEOUT_MS_ENV] = "50";
+	it("aborts a headless ask that no answer source answers within the configured deadline", async () => {
+		const prior = process.env[GJC_ASK_ANSWER_DEADLINE_MS_ENV];
+		process.env[GJC_ASK_ANSWER_DEADLINE_MS_ENV] = "50";
 		try {
 			const warn = spyOn(logger, "warn").mockImplementation(() => {});
 			const abort = vi.fn();
@@ -3061,7 +3063,7 @@ describe("AskTool deep-interview recorder persistence", () => {
 					}),
 				)
 					.execute(
-						"call-headless-ack-timeout",
+						"call-headless-deadline",
 						{
 							questions: [
 								{ id: "join_gate", question: "Join the plan?", options: [{ label: "Yes" }, { label: "No" }] },
@@ -3082,61 +3084,101 @@ describe("AskTool deep-interview recorder persistence", () => {
 			]);
 
 			expect(outcome).toBe("rejected");
-			expect(abortError.value?.message).toContain("no answer source acknowledged the question within 0.05s");
+			expect(abortError.value?.message).toContain(
+				"no answer was received within 0.05s of the headless ask answer deadline",
+			);
 			expect(abort).toHaveBeenCalledTimes(1);
 			expect(warn).toHaveBeenCalledWith(
-				"ask_answer_source_ack_timeout",
-				expect.objectContaining({ answerSource: "remote", ackTimeoutMs: 50 }),
+				"ask_answer_deadline_exceeded",
+				expect.objectContaining({ answerSource: "remote", deadlineMs: 50 }),
 			);
 		} finally {
-			delete process.env[GJC_ASK_ACK_TIMEOUT_MS_ENV];
+			if (prior === undefined) delete process.env[GJC_ASK_ANSWER_DEADLINE_MS_ENV];
+			else process.env[GJC_ASK_ANSWER_DEADLINE_MS_ENV] = prior;
 		}
 	});
 
-	it("leaves a headless ask unbounded when no acknowledgement window is configured", async () => {
-		delete process.env[GJC_ASK_ACK_TIMEOUT_MS_ENV];
-		const warn = spyOn(logger, "warn").mockImplementation(() => {});
-		const abort = vi.fn();
-		const neverAnswers = () => new Promise<never>(() => {});
-		const pending = new AskTool(
-			createSession({
-				hasUI: false,
-				getAskAnswerSource: () => ({ awaitAnswer: neverAnswers, awaitAnswerRequest: neverAnswers }),
-			}),
-		).execute(
-			"call-headless-unbounded",
-			{
-				questions: [{ id: "join_gate", question: "Join the plan?", options: [{ label: "Yes" }, { label: "No" }] }],
-			},
-			undefined,
-			undefined,
-			{ hasUI: false, abort } as unknown as AgentToolContext,
-		);
-		void pending.catch(() => undefined);
+	it("locks the unbounded default for a headless ask with no configured deadline", async () => {
+		const prior = process.env[GJC_ASK_ANSWER_DEADLINE_MS_ENV];
+		delete process.env[GJC_ASK_ANSWER_DEADLINE_MS_ENV];
+		try {
+			const warn = spyOn(logger, "warn").mockImplementation(() => {});
+			const abort = vi.fn();
+			const neverAnswers = () => new Promise<never>(() => {});
+			const pending = new AskTool(
+				createSession({
+					hasUI: false,
+					getAskAnswerSource: () => ({ awaitAnswer: neverAnswers, awaitAnswerRequest: neverAnswers }),
+				}),
+			).execute(
+				"call-headless-default",
+				{
+					questions: [
+						{ id: "join_gate", question: "Join the plan?", options: [{ label: "Yes" }, { label: "No" }] },
+					],
+				},
+				undefined,
+				undefined,
+				{ hasUI: false, abort } as unknown as AgentToolContext,
+			);
+			void pending.catch(() => undefined);
 
-		// An attended remote responder may legitimately answer arbitrarily late, so the
-		// default must stay unbounded rather than cut a real answer short.
-		expect(
-			await Promise.race([
-				pending.then(
-					() => "settled",
-					() => "rejected",
-				),
-				Bun.sleep(25).then(() => "pending"),
-			]),
-		).toBe("pending");
-		expect(abort).not.toHaveBeenCalled();
-		expect(warn).not.toHaveBeenCalledWith("ask_answer_source_ack_timeout", expect.anything());
+			// An attended remote responder may legitimately answer arbitrarily late, so the
+			// default must stay unbounded rather than cut a real answer short. This test
+			// cannot fail on a revert of the deadline hunk (the base is equally unbounded);
+			// it locks the default against a future flip.
+			expect(
+				await Promise.race([
+					pending.then(
+						() => "settled",
+						() => "rejected",
+					),
+					Bun.sleep(25).then(() => "pending"),
+				]),
+			).toBe("pending");
+			expect(abort).not.toHaveBeenCalled();
+			expect(warn).not.toHaveBeenCalledWith("ask_answer_deadline_exceeded", expect.anything());
+		} finally {
+			if (prior === undefined) delete process.env[GJC_ASK_ANSWER_DEADLINE_MS_ENV];
+			else process.env[GJC_ASK_ANSWER_DEADLINE_MS_ENV] = prior;
+		}
 	});
 
-	it("resolves the acknowledgement window only from a positive integer environment value", () => {
-		expect(resolveAskAckTimeoutMs({})).toBeNull();
-		expect(resolveAskAckTimeoutMs({ [GJC_ASK_ACK_TIMEOUT_MS_ENV]: "" })).toBeNull();
-		expect(resolveAskAckTimeoutMs({ [GJC_ASK_ACK_TIMEOUT_MS_ENV]: "0" })).toBeNull();
-		expect(resolveAskAckTimeoutMs({ [GJC_ASK_ACK_TIMEOUT_MS_ENV]: "-1" })).toBeNull();
-		expect(resolveAskAckTimeoutMs({ [GJC_ASK_ACK_TIMEOUT_MS_ENV]: "soon" })).toBeNull();
-		expect(resolveAskAckTimeoutMs({ [GJC_ASK_ACK_TIMEOUT_MS_ENV]: "1.5" })).toBeNull();
-		expect(resolveAskAckTimeoutMs({ [GJC_ASK_ACK_TIMEOUT_MS_ENV]: "250" })).toBe(250);
+	it("never applies the headless deadline to an attended ask", async () => {
+		const prior = process.env[GJC_ASK_ANSWER_DEADLINE_MS_ENV];
+		process.env[GJC_ASK_ANSWER_DEADLINE_MS_ENV] = "1";
+		try {
+			const abort = vi.fn();
+			const result = await new AskTool(createSession()).execute(
+				"call-attended-deadline",
+				{ questions: [{ id: "confirm", question: "Proceed?", options: [{ label: "yes" }, { label: "no" }] }] },
+				undefined,
+				undefined,
+				createContext({ select: async () => "yes", abort }),
+			);
+			expect(result.details?.selectedOptions).toEqual(["yes"]);
+			expect(abort).not.toHaveBeenCalled();
+		} finally {
+			if (prior === undefined) delete process.env[GJC_ASK_ANSWER_DEADLINE_MS_ENV];
+			else process.env[GJC_ASK_ANSWER_DEADLINE_MS_ENV] = prior;
+		}
+	});
+
+	it("resolves the answer deadline only from a positive integer the runtime timer can represent", () => {
+		const env = (value: string) => ({ [GJC_ASK_ANSWER_DEADLINE_MS_ENV]: value });
+		expect(resolveAskAnswerDeadlineMs({})).toBeNull();
+		expect(resolveAskAnswerDeadlineMs(env(""))).toBeNull();
+		expect(resolveAskAnswerDeadlineMs(env("0"))).toBeNull();
+		expect(resolveAskAnswerDeadlineMs(env("-1"))).toBeNull();
+		expect(resolveAskAnswerDeadlineMs(env("soon"))).toBeNull();
+		expect(resolveAskAnswerDeadlineMs(env("1.5"))).toBeNull();
+		expect(resolveAskAnswerDeadlineMs(env("NaN"))).toBeNull();
+		expect(resolveAskAnswerDeadlineMs(env("250"))).toBe(250);
+		// setTimeout silently clamps a longer delay to 1 ms, so a deadline beyond the
+		// timer range must be disabled instead of inverting the contract.
+		expect(resolveAskAnswerDeadlineMs(env(String(MAX_ASK_ANSWER_DEADLINE_MS)))).toBe(MAX_ASK_ANSWER_DEADLINE_MS);
+		expect(resolveAskAnswerDeadlineMs(env(String(MAX_ASK_ANSWER_DEADLINE_MS + 1)))).toBeNull();
+		expect(resolveAskAnswerDeadlineMs(env("9007199254740991"))).toBeNull();
 	});
 
 	it("passes optional metadata for single, multi-question, and SDK workflow gate asks", async () => {

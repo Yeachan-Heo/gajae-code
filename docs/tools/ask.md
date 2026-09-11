@@ -69,7 +69,7 @@
 ## Limits & Caps
 - `questions` must contain at least 1 item (`askSchema` in `packages/coding-agent/src/tools/ask.ts`).
 - `ask.timeout` default is `0` (disabled); a positive value auto-selects the recommended option after that many seconds (`packages/coding-agent/src/config/settings-schema.ts`).
-- `GJC_ASK_ACK_TIMEOUT_MS` bounds how long a **headless** ask waits for an answer source to take the question, in milliseconds. Unset, empty, `0`, negative, or non-integer values disable the bound, which is the default. On expiry the ask logs `ask_answer_source_ack_timeout`, aborts the enclosing turn, and throws `ToolAbortError("Ask was aborted: no answer source acknowledged the question within Ns")`. It is deliberately separate from `ask.timeout`: `ask.timeout` auto-selects an answer, while this window exists to end a wait that no answer source ever acknowledged, and a remote responder may legitimately answer later than `ask.timeout`.
+- `GJC_ASK_ANSWER_DEADLINE_MS` bounds how long a **headless** ask waits for an answer, in milliseconds. Unset, empty, `0`, negative, non-integer, or greater than `MAX_ASK_ANSWER_DEADLINE_MS` (`2_147_483_647`, the largest delay the runtime timer can represent) disables the bound, which is the default. On expiry the ask logs `ask_answer_deadline_exceeded`, aborts the enclosing turn, and throws `ToolAbortError("Ask was aborted: no answer was received within Ns of the headless ask answer deadline")`. This is an answer deadline, not an acknowledgement bound: no answer source reports that it has taken the question, so a late answer is settled as `resolve_without_commit`/`aborted` rather than attributed to an unresponsive source. It is deliberately separate from `ask.timeout`, which auto-selects an answer for the interactive picker and may legitimately let a remote responder answer later.
 - Prompt guidance says provide 2-5 options, but code does not enforce that (`packages/coding-agent/src/prompts/tools/ask.md`).
 - Timeout only applies to the option picker; once the user chooses `Other`, the editor has no timeout (`packages/coding-agent/src/prompts/tools/ask.md`).
 
@@ -78,7 +78,7 @@
 - User cancels picker/editor without timeout: throws `ToolAbortError("Ask tool was cancelled by the user")`.
 - Abort signal during input: converted to `ToolAbortError("Ask input was cancelled")`.
 - Remote answer source closes the ask: throws `ToolAbortError("Ask was cancelled by the remote client")`.
-- `GJC_ASK_ACK_TIMEOUT_MS` expires with no answer source: throws `ToolAbortError("Ask was aborted: no answer source acknowledged the question within Ns")`.
+- `GJC_ASK_ANSWER_DEADLINE_MS` expires with no answer: throws `ToolAbortError("Ask was aborted: no answer was received within Ns of the headless ask answer deadline")`.
 - Empty `questions` at runtime returns a text error payload instead of throwing: `Error: questions must not be empty`.
 
 ## Notes

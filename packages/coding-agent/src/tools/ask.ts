@@ -110,11 +110,36 @@ export const OTHER_OPTION = "Other (type your own)";
 export const ASK_CLARIFICATION_OPTION = "Ask about these choices";
 export const RECOMMENDED_SUFFIX = " (Recommended)";
 /**
- * Environment override bounding how long a headless ask waits for an answer
- * source to take the question, in milliseconds. Unset, empty, or non-positive
- * disables the bound.
+ * Environment override bounding how long a headless ask waits for its answer, in
+ * milliseconds. Unset, empty, non-positive, non-integer, or larger than
+ * {@link MAX_ASK_ANSWER_DEADLINE_MS} disables the bound.
  */
-export const GJC_ASK_ACK_TIMEOUT_MS_ENV = "GJC_ASK_ACK_TIMEOUT_MS";
+export const GJC_ASK_ANSWER_DEADLINE_MS_ENV = "GJC_ASK_ANSWER_DEADLINE_MS";
+/**
+ * Largest deadline the runtime timer can represent. `setTimeout` silently clamps
+ * a longer delay to one millisecond, which would invert the contract and abort a
+ * headless ask almost immediately, so a value beyond this is not a usable bound
+ * and is treated as disabled exactly like any other invalid value.
+ */
+export const MAX_ASK_ANSWER_DEADLINE_MS = 2_147_483_647;
+
+/**
+ * How long a headless ask may wait for an answer before it gives up.
+ *
+ * A headless ask has no local selector, so it is answered only by a remote
+ * answer source or by a workflow gate waiting for a remote responder. Neither
+ * channel reports that the question was taken up, so the only observable event
+ * is the answer itself: this is an answer deadline, not an acknowledgement.
+ * `GJC_ASK_ANSWER_DEADLINE_MS` arms it. It stays disabled by default: an
+ * attended remote responder may legitimately answer arbitrarily late, and
+ * silently cutting such a wait short would corrupt a real answer into an abort.
+ */
+export function resolveAskAnswerDeadlineMs(env: Record<string, string | undefined> = process.env): number | null {
+	const raw = env[GJC_ASK_ANSWER_DEADLINE_MS_ENV];
+	if (raw === undefined) return null;
+	const parsed = Number(raw);
+	return Number.isSafeInteger(parsed) && parsed > 0 && parsed <= MAX_ASK_ANSWER_DEADLINE_MS ? parsed : null;
+}
 const REMOTE_NAVIGATION_FORWARD = "\u0000ask-navigation-forward";
 const HEADLESS_CHECKBOX_CHECKED = "[x]";
 const HEADLESS_CHECKBOX_UNCHECKED = "[ ]";
@@ -162,24 +187,6 @@ async function awaitDeepInterviewRecorderPersistence(persistence: Promise<void>,
 function getDoneOptionLabel(): string {
 	const success = theme?.status?.success;
 	return success ? `${success} Done selecting` : "Done selecting";
-}
-
-/**
- * How long a headless ask may wait for an answer source to take the question.
- *
- * A headless ask has no local selector, so it is answered only by a remote
- * answer source or by a workflow gate waiting for a remote responder. Neither
- * channel acknowledges that the question was actually taken up, so without a
- * bound the ask waits forever while the operator sees only silence (#5475).
- * `GJC_ASK_ACK_TIMEOUT_MS` arms the bound. It stays disabled by default: an
- * attended remote responder may legitimately answer arbitrarily late, and
- * silently cutting such a wait short would corrupt a real answer into an abort.
- */
-export function resolveAskAckTimeoutMs(env: Record<string, string | undefined> = process.env): number | null {
-	const raw = env[GJC_ASK_ACK_TIMEOUT_MS_ENV];
-	if (raw === undefined) return null;
-	const parsed = Number(raw);
-	return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : null;
 }
 
 export function validRecommendedIndex(recommended: number | undefined, optionCount: number): number | undefined {
@@ -892,34 +899,39 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 			throw new ToolAbortError("Ask tool requires interactive mode");
 		}
 
-		// Only a headless ask needs an acknowledgement bound: an interactive UI
-		// answers locally, and its own `ask.timeout` already applies there.
-		const askAckTimeoutMs = hasInteractiveUi ? null : resolveAskAckTimeoutMs();
-		const askAckExpired = Symbol("ask-ack-expired");
+		// Only a headless ask needs an answer deadline: an interactive UI answers
+		// locally, and its own `ask.timeout` already applies there.
+		const askAnswerDeadlineMs = hasInteractiveUi ? null : resolveAskAnswerDeadlineMs();
+		const askDeadlineExpired = Symbol("ask-deadline-expired");
 		/**
-		 * Bound one headless answer wait. On expiry the ask must fail with a
-		 * distinguishable origin ("no answer source acknowledged the question")
-		 * instead of degrading into the empty answer the model would otherwise
-		 * read as "the user declined", and the enclosing turn is aborted so the
-		 * stall cannot outlive the tool call.
+		 * Bound one headless answer wait. No answer source reports that it has taken
+		 * the question, so the only observable event is the answer itself; on expiry
+		 * the ask must fail with a distinguishable origin instead of degrading into
+		 * the empty answer the model would otherwise read as "the user declined",
+		 * and the enclosing turn is aborted so the stall cannot outlive the call.
 		 */
-		const awaitAskAck = async <T>(work: () => Promise<T>): Promise<T> => {
-			if (askAckTimeoutMs === null) return await work();
-			const expired = Promise.withResolvers<typeof askAckExpired>();
-			const timer = setTimeout(() => expired.resolve(askAckExpired), askAckTimeoutMs);
+		const awaitAskAnswer = async <T>(work: () => Promise<T>): Promise<T> => {
+			if (askAnswerDeadlineMs === null) return await work();
+			const expired = Promise.withResolvers<typeof askDeadlineExpired>();
+			const timer = setTimeout(() => expired.resolve(askDeadlineExpired), askAnswerDeadlineMs);
 			try {
 				const settled = await Promise.race([work(), expired.promise]);
-				if (settled !== askAckExpired) return settled;
-				logger.warn("ask_answer_source_ack_timeout", {
+				if (settled !== askDeadlineExpired) return settled;
+				logger.warn("ask_answer_deadline_exceeded", {
 					sessionId: this.session.getSessionId?.() ?? null,
-					answerSource: canUseWorkflowGate ? "workflow_gate" : "remote",
-					ackTimeoutMs: askAckTimeoutMs,
+					// Re-derive the routed channel at expiry: the answer source can be
+					// registered or removed after the ask entered `execute`.
+					answerSource:
+						!this.session.getAskAnswerSource?.() && gateEmitter?.supportsRemoteGateAnswers() === true
+							? "workflow_gate"
+							: "remote",
+					deadlineMs: askAnswerDeadlineMs,
 				});
 				await settleActiveRemote({ kind: "resolve_without_commit", reason: "aborted" });
 				activeRemoteRequest = undefined;
 				context?.abort();
 				throw new ToolAbortError(
-					`Ask was aborted: no answer source acknowledged the question within ${askAckTimeoutMs / 1000}s`,
+					`Ask was aborted: no answer was received within ${askAnswerDeadlineMs / 1000}s of the headless ask answer deadline`,
 				);
 			} finally {
 				clearTimeout(timer);
@@ -1053,7 +1065,7 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 				// The losing selector may reject when aborted after the race already settled;
 				// swallow that so it is not an unhandled rejection (the race result is unaffected).
 				void local.catch(() => undefined);
-				return awaitAskAck(() =>
+				return awaitAskAnswer(() =>
 					Promise.race([local, remote])
 						.then(async result => {
 							if (result.winner === "remote") {
@@ -1144,7 +1156,7 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 							})
 					: new Promise<never>(() => {});
 				void local.catch(() => undefined);
-				return awaitAskAck(() =>
+				return awaitAskAnswer(() =>
 					Promise.race([local, remote])
 						.then(result => {
 							if (result.winner === "remote") {
@@ -1205,7 +1217,7 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 					allowEmpty: q.multi === true && params.questions.length > 1,
 					navigationLabel: questionIndex === params.questions.length - 1 ? "Done" : "Next",
 				};
-				const answer = await awaitAskAck(() => gateEmitter.emitGate(questionToGate(gateQuestion)));
+				const answer = await awaitAskAnswer(() => gateEmitter.emitGate(questionToGate(gateQuestion)));
 				const decoded = gateAnswerToResult(gateQuestion, answer);
 				return {
 					optionLabels: rawOptionLabels,
