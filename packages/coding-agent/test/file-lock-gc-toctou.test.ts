@@ -1908,3 +1908,86 @@ describe("fileLocksGcAdapter.prune TOCTOU (#606)", () => {
 		expect(JSON.parse(await fs.readFile(path.join(lockDir, "info"), "utf8")).timestamp).toBe(1000);
 	});
 });
+
+describe("withFileLock stale-removal diagnostics (#5434)", () => {
+	test("reclaims a dead-owner lock through the filter-host detach fallback", async () => {
+		const root = await makeTemp();
+		const file = path.join(root, "index.jsonl");
+		const lockDir = `${file}.lock`;
+		await writeInfo(lockDir, { pid: DEAD_PID, timestamp: Date.now() - 60_000 });
+		FileLockTestHooks.nativeExactRemovalProbe = () => false;
+		FileLockTestHooks.nativeQuarantineBindings = () => ({
+			snapshotDirectoryTree,
+			exactRemoveDirectoryTree: (target, _snapshot, _parent, detachOnly) => {
+				if (!detachOnly) return { ok: false, code: "sharing_violation" };
+				renameSync(target, `${target}.removing`);
+				return { ok: true, detachedPath: `${target}.removing` };
+			},
+		});
+
+		await expect(withFileLock(file, async () => undefined, { retries: 3, retryDelayMs: 1 })).resolves.toBeUndefined();
+
+		expect(await fs.exists(lockDir)).toBe(false);
+	});
+
+	test("reports the stale-removal cause instead of a bare dead-but-not-reaped timeout", async () => {
+		const root = await makeTemp();
+		const file = path.join(root, "index.jsonl");
+		const lockDir = `${file}.lock`;
+		await writeInfo(lockDir, { pid: DEAD_PID, timestamp: Date.now() - 60_000 });
+		// A filter-hosted host where the probe rejects the primitive and the verified
+		// detach fallback is refused too: removal is impossible, not contended.
+		FileLockTestHooks.nativeExactRemovalProbe = () => false;
+		FileLockTestHooks.nativeQuarantineBindings = () => ({
+			snapshotDirectoryTree,
+			exactRemoveDirectoryTree: () => ({ ok: false, code: "sharing_violation" }),
+		});
+
+		const attempt = withFileLock(file, async () => undefined, { retries: 3, retryDelayMs: 1 });
+		await expect(attempt).rejects.toBeInstanceOf(FileLockAcquireError);
+		await expect(attempt).rejects.toMatchObject({
+			code: "acquire_timeout",
+			removalFailure: { outcome: "cleanup_failed" },
+		});
+		await expect(attempt).rejects.toThrow(/could not be retired on this host/);
+	});
+
+	test("surfaces the native refusal code when strict removal is refused", async () => {
+		const root = await makeTemp();
+		const file = path.join(root, "index.jsonl");
+		const lockDir = `${file}.lock`;
+		await writeInfo(lockDir, { pid: DEAD_PID, timestamp: Date.now() - 60_000 });
+		FileLockTestHooks.nativeExactRemovalProbe = () => true;
+		FileLockTestHooks.nativeQuarantineBindings = () => ({
+			snapshotDirectoryTree,
+			exactRemoveDirectoryTree: () => ({ ok: false, code: "sharing_violation" }),
+		});
+
+		const attempt = withFileLock(file, async () => undefined, { retries: 3, retryDelayMs: 1 });
+		await expect(attempt).rejects.toMatchObject({
+			code: "acquire_timeout",
+			removalFailure: { outcome: "error", code: "EACCES" },
+		});
+		await expect(attempt).rejects.toThrow(/Failed to remove file lock tree: sharing_violation/);
+	});
+
+	test("propagates an unexpected removal failure instead of hiding it behind the timeout", async () => {
+		const root = await makeTemp();
+		const file = path.join(root, "index.jsonl");
+		const lockDir = `${file}.lock`;
+		await writeInfo(lockDir, { pid: DEAD_PID, timestamp: Date.now() - 60_000 });
+		FileLockTestHooks.nativeExactRemovalProbe = () => true;
+		FileLockTestHooks.nativeQuarantineBindings = () => ({
+			snapshotDirectoryTree: () => {
+				throw new Error("native snapshot exploded");
+			},
+			exactRemoveDirectoryTree: () => {
+				throw new Error("must not be reached");
+			},
+		});
+
+		await expect(withFileLock(file, async () => undefined, { retries: 3, retryDelayMs: 1 })).rejects.toThrow(
+			"native snapshot exploded",
+		);
+	});
+});

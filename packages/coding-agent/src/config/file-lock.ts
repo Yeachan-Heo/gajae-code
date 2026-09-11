@@ -35,6 +35,22 @@ export interface FileLockOptions {
 
 export type FileLockAcquireReason = "acquire_timeout" | "orphan_transition";
 
+/**
+ * Why the acquire path could not retire a lock directory whose owner it had already
+ * proven dead. Attached to `FileLockAcquireError` so a host whose lock-removal path
+ * refuses the directory is not misreported as a live or unreaped owner. The acquire
+ * loop still contends after a refusal (a concurrent reclaimer may finish the same dead
+ * generation); this records the cause that exhaustion must report.
+ */
+export interface FileLockStaleRemovalFailure {
+	/** Guarded-removal outcome, or `"error"` when the removal attempt threw. */
+	outcome: FileLockGcRemoval | "error";
+	/** Transient native/errno code carried by the refusal, when one was present. */
+	code?: string;
+	/** Human-readable cause surfaced to the operator at exhaustion. */
+	message: string;
+}
+
 export class FileLockAcquireError extends Error {
 	readonly code: FileLockAcquireReason;
 
@@ -45,10 +61,16 @@ export class FileLockAcquireError extends Error {
 		readonly holder: string,
 		readonly reason: FileLockAcquireReason = "acquire_timeout",
 		readonly orphanPath?: string,
+		readonly removalFailure?: FileLockStaleRemovalFailure,
 	) {
 		const detail = reason === "orphan_transition" && orphanPath ? `orphan_transition at ${orphanPath}` : holder;
+		const removalDetail = removalFailure
+			? ` The stale lock directory could not be retired on this host (${removalFailure.message}${
+					removalFailure.code ? ` [${removalFailure.code}]` : ""
+				}); the removal path refused it, so this is not a live or unreaped owner`
+			: "";
 		super(
-			`Failed to acquire lock for ${filePath} after ${attempts} attempts: ${detail} (${lockPath}); ` +
+			`Failed to acquire lock for ${filePath} after ${attempts} attempts: ${detail}${removalDetail} (${lockPath}); ` +
 				`a live owner is never displaced — if this is an SDK broker (gjc sdk session list), it must finish or be stopped before retrying; ` +
 				`the lock is a directory, remove it only by deleting the directory (${lockPath}) once no live owner remains`,
 		);
@@ -1251,16 +1273,43 @@ async function staleLockSnapshot(
 	return { stale: false };
 }
 
-async function removeStaleLockForAcquire(lockPath: string, snapshot: LockStaleSnapshot): Promise<boolean> {
-	if (!snapshot.stale) return false;
+type StaleLockRemovalAttempt = { removed: true } | { removed: false; failure?: FileLockStaleRemovalFailure };
+
+async function removeStaleLockForAcquire(
+	lockPath: string,
+	snapshot: LockStaleSnapshot,
+): Promise<StaleLockRemovalAttempt> {
+	if (!snapshot.stale) return { removed: false };
 	try {
-		return (await removeFileLockDirForGc(lockPath, snapshot.owner, snapshot.identity)) === "removed";
-	} catch {
-		// Exact removal refusal is not authority to fail or mutate by another path.
-		// Keep contending: a concurrent reclaimer may already be completing the same
-		// dead generation, while a persistent refusal remains fail-closed until the
-		// normal retry budget reports the still-held lock.
-		return false;
+		const outcome = await removeFileLockDirForGc(lockPath, snapshot.owner, snapshot.identity);
+		if (outcome === "removed") return { removed: true };
+		// `owner_changed`/`missing` mean a successor or a concurrent reclaimer already
+		// owns the pathname; that is ordinary contention, not a host removal failure.
+		if (outcome !== "cleanup_failed") return { removed: false };
+		return {
+			removed: false,
+			failure: {
+				outcome,
+				message: (await isNativeExactRemovalUsable())
+					? "the identity-bound lock-removal path refused the dead owner's lock directory"
+					: "the native exact-removal primitive is unavailable on this host and the verified detach fallback was refused",
+			},
+		};
+	} catch (error) {
+		// A transient refusal is not authority to fail or mutate by another path: keep
+		// contending, because a concurrent reclaimer may already be completing the same
+		// dead generation. Record the cause so exhaustion reports *why* a dead owner's
+		// lock could not be retired instead of only "dead but not reaped". Anything
+		// else is an unexpected removal failure and must not hide behind the timeout.
+		if (!isTransientReleaseError(error)) throw error;
+		return {
+			removed: false,
+			failure: {
+				outcome: "error",
+				code: (error as NodeJS.ErrnoException).code,
+				message: (error as Error).message,
+			},
+		};
 	}
 }
 
@@ -1735,6 +1784,7 @@ export async function acquireFileLock(filePath: string, options: FileLockOptions
 	}
 	const ownerToken = crypto.randomUUID();
 	const contentionStartTimes = new Map<string, string | null>();
+	let staleRemovalFailure: FileLockStaleRemovalFailure | undefined;
 	for (let attempt = 0; attempt < opts.retries; attempt++) {
 		if (opts.signal?.aborted) throw opts.signal.reason ?? new Error("File lock acquisition aborted");
 		const localKey = await localLockKey(lockPath);
@@ -1782,7 +1832,9 @@ export async function acquireFileLock(filePath: string, options: FileLockOptions
 			opts.previousOwnerHostIds,
 			contentionStartTimes,
 		);
-		if (await removeStaleLockForAcquire(lockPath, stale)) continue;
+		const staleRemoval = await removeStaleLockForAcquire(lockPath, stale);
+		if (staleRemoval.removed) continue;
+		if (staleRemoval.failure) staleRemovalFailure = staleRemoval.failure;
 		if (!opts.signal) {
 			await Bun.sleep(opts.retryDelayMs);
 			continue;
@@ -1802,6 +1854,9 @@ export async function acquireFileLock(filePath: string, options: FileLockOptions
 		lockPath,
 		opts.retries,
 		await lockHolderDescription(lockPath, orphanTransitionAgeMs, opts.ownerHostId, opts.previousOwnerHostIds ?? []),
+		"acquire_timeout",
+		undefined,
+		staleRemovalFailure,
 	);
 }
 
