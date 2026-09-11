@@ -758,4 +758,187 @@ describe("queued promotion run identity (#4668)", () => {
 			reason: "removed",
 		});
 	});
+
+	it("releases the next deferred SDK follow-up when an earlier one is cancelled (#5460)", async () => {
+		// Exact-head review P1: the deferred cancellation branch spliced
+		// #deferredSdkFollowUps without releasing the successor, so a second
+		// accepted deferred submission stayed outside the Agent queue forever.
+		const gate = Promise.withResolvers<void>();
+		const toolStarted = Promise.withResolvers<void>();
+		const blockingTool: AgentTool<typeof echoSchema, EchoParams> = {
+			name: "echo",
+			label: "Echo",
+			description: "Echo tool",
+			parameters: echoSchema,
+			async execute() {
+				toolStarted.resolve();
+				await gate.promise;
+				return { content: [{ type: "text", text: "done" }] };
+			},
+		};
+		session = buildSession(
+			[
+				{ content: [{ type: "toolCall", name: "echo", arguments: { value: "first" } }] },
+				{ content: ["first answer"] },
+				{ content: ["second answer"] },
+			],
+			blockingTool,
+		);
+		const promptDone = session.prompt("first task");
+		await toolStarted.promise;
+		// A streaming run plus an SDK run token parks both follow-ups in the
+		// DEFERRED store, outside the Agent live queue.
+		const first = await session.submitUserMessage("deferred one", {
+			deliverAs: "followUp",
+			trackSubmission: true,
+			sdkRunCapability: createSdkRunCapability("deferred-one-token"),
+		} as never);
+		const second = await session.submitUserMessage("deferred two", {
+			deliverAs: "followUp",
+			trackSubmission: true,
+			sdkRunCapability: createSdkRunCapability("deferred-two-token"),
+		} as never);
+		expect(session.agent.snapshotFollowUp()).toHaveLength(0);
+
+		expect(first.cancel()).toBe(true);
+		// The live queue was already empty, so the successor must be released into
+		// it immediately — not left waiting for an agent_end that a still-streaming
+		// run has not produced yet.
+		expect(session.agent.snapshotFollowUp()).toHaveLength(1);
+		await expect(first.execution).resolves.toMatchObject({
+			submissionId: first.submissionId,
+			disposition: "removed",
+			reason: "cancelled",
+		});
+
+		gate.resolve();
+		await promptDone;
+		const settled = await Promise.race([
+			second.execution.then(() => "settled" as const),
+			Bun.sleep(5_000).then(() => "timeout" as const),
+		]);
+		expect(settled).toBe("settled");
+		expect((await second.execution).disposition).not.toBe("removed");
+		await expect(second.terminal).resolves.toMatchObject({
+			submissionId: second.submissionId,
+			disposition: "completed",
+		});
+		await session.waitForIdle();
+	});
+
+	it("releases the next deferred SDK follow-up when an earlier one is removed by editing (#5460)", async () => {
+		// Exact-head review P1: identity-based deferred removal spliced
+		// #deferredSdkFollowUps without invoking the deferred-release path, so
+		// removing one displayed row stranded every later accepted submission.
+		const gate = Promise.withResolvers<void>();
+		const toolStarted = Promise.withResolvers<void>();
+		const blockingTool: AgentTool<typeof echoSchema, EchoParams> = {
+			name: "echo",
+			label: "Echo",
+			description: "Echo tool",
+			parameters: echoSchema,
+			async execute() {
+				toolStarted.resolve();
+				await gate.promise;
+				return { content: [{ type: "text", text: "done" }] };
+			},
+		};
+		session = buildSession(
+			[
+				{ content: [{ type: "toolCall", name: "echo", arguments: { value: "first" } }] },
+				{ content: ["first answer"] },
+				{ content: ["second answer"] },
+			],
+			blockingTool,
+		);
+		const promptDone = session.prompt("first task");
+		await toolStarted.promise;
+		const first = await session.submitUserMessage("deferred one", {
+			deliverAs: "followUp",
+			trackSubmission: true,
+			sdkRunCapability: createSdkRunCapability("deferred-one-token"),
+		} as never);
+		const second = await session.submitUserMessage("deferred two", {
+			deliverAs: "followUp",
+			trackSubmission: true,
+			sdkRunCapability: createSdkRunCapability("deferred-two-token"),
+		} as never);
+		expect(session.agent.snapshotFollowUp()).toHaveLength(0);
+
+		const firstRow = session.getQueuedMessageEntries().find(entry => entry.text === "deferred one");
+		expect(firstRow).toBeDefined();
+		expect(session.removeQueuedMessageForEditing(firstRow?.id ?? "")).toBe("deferred one");
+		// The successor must be released immediately: the run is still streaming, so
+		// no agent_end will fire to rescue it before the caller observes the state.
+		expect(session.agent.snapshotFollowUp()).toHaveLength(1);
+		await expect(first.execution).resolves.toMatchObject({
+			submissionId: first.submissionId,
+			disposition: "removed",
+		});
+
+		gate.resolve();
+		await promptDone;
+		const settled = await Promise.race([
+			second.execution.then(() => "settled" as const),
+			Bun.sleep(5_000).then(() => "timeout" as const),
+		]);
+		expect(settled).toBe("settled");
+		expect((await second.execution).disposition).not.toBe("removed");
+		await expect(second.terminal).resolves.toMatchObject({
+			submissionId: second.submissionId,
+			disposition: "completed",
+		});
+		await session.waitForIdle();
+	});
+
+	it("cancels an admitted explicit steer when its preflight signal aborts (#5460)", async () => {
+		// Exact-head review P1: the explicit steer path never installed the
+		// one-shot preflight-abort cancellation used by follow-ups, so an aborted
+		// invocation's steer stayed executable and could not be settled through
+		// that signal.
+		const gate = Promise.withResolvers<void>();
+		const toolStarted = Promise.withResolvers<void>();
+		const blockingTool: AgentTool<typeof echoSchema, EchoParams> = {
+			name: "echo",
+			label: "Echo",
+			description: "Echo tool",
+			parameters: echoSchema,
+			async execute() {
+				toolStarted.resolve();
+				await gate.promise;
+				return { content: [{ type: "text", text: "done" }] };
+			},
+		};
+		session = buildSession(
+			[
+				{ content: [{ type: "toolCall", name: "echo", arguments: { value: "first" } }] },
+				{ content: ["first answer"] },
+			],
+			blockingTool,
+		);
+		const controller = new AbortController();
+		const promptDone = session.prompt("first task");
+		await toolStarted.promise;
+		const submission = await session.submitUserMessage("abortable steer", {
+			deliverAs: "steer",
+			trackSubmission: true,
+			preflightSignal: controller.signal,
+		});
+		// Admission into the live run makes the steer executable; the abort must
+		// cancel exactly that queued message.
+		expect(session.agent.snapshotSteering()).toHaveLength(1);
+		controller.abort();
+		await expect(submission.execution).resolves.toMatchObject({
+			submissionId: submission.submissionId,
+			disposition: "removed",
+		});
+		await expect(submission.terminal).resolves.toMatchObject({
+			submissionId: submission.submissionId,
+			disposition: "removed",
+		});
+		expect(session.agent.snapshotSteering()).toHaveLength(0);
+		gate.resolve();
+		await promptDone;
+		await session.waitForIdle();
+	});
 });

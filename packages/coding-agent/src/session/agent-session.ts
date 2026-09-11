@@ -13466,7 +13466,7 @@ export class AgentSession {
 			sdkRunToken?: string;
 			forceOneAtATime?: boolean;
 		},
-	): Promise<void> {
+	): Promise<QueuedFollowUpOwner> {
 		this.#assertNoHandoffTransition();
 		assertImagePlaceholdersHavePayload(text, images);
 		const displayText = text || (images && images.length > 0 ? "[Image]" : "");
@@ -13480,7 +13480,7 @@ export class AgentSession {
 		// in a queue nobody owns.
 		const admission = this.agent.steer(message, options?.forceOneAtATime ? { forceOneAtATime: true } : undefined);
 		if (!admission.admitted) {
-			await this.#queueFollowUp(text, images, {
+			const queuedFollowUp = await this.#queueFollowUp(text, images, {
 				forceOneAtATime: options?.forceOneAtATime,
 				claimsGenuineUserIntent: options?.claimsGenuineUserIntent,
 				onPromoted: options?.onPromoted,
@@ -13493,7 +13493,7 @@ export class AgentSession {
 				onQueuedAfterAdmission: options?.onQueuedAfterAdmission,
 			});
 			this.#scheduleNonAdmittedQueuedContinuation();
-			return;
+			return queuedFollowUp;
 		}
 		if (options?.forceOneAtATime) this.#sequentialSteerMessages.add(message);
 		this.#steeringMessages.push(this.#createQueuedDisplayEntry(displayText, undefined, message));
@@ -13508,7 +13508,7 @@ export class AgentSession {
 			this.#deepInterviewGenuineUserMessageEpochs.set(message, epoch);
 		}
 		options?.onQueued?.(message);
-		options?.onQueuedAfterAdmission?.(message, () => {
+		const cancelQueuedSteer = (): boolean => {
 			const removed = this.agent.removeQueuedMessages(candidate => candidate === message).steering > 0;
 			if (!removed) return false;
 			this.#steeringMessages = this.#steeringMessages.filter(entry => entry.message !== message);
@@ -13516,7 +13516,23 @@ export class AgentSession {
 			this.#sequentialSteerMessages.delete(message);
 			this.#fireQueuedRemovalHooks([message]);
 			return true;
-		});
+		};
+		options?.onQueuedAfterAdmission?.(message, cancelQueuedSteer);
+		return { cancel: cancelQueuedSteer };
+	}
+
+	/**
+	 * One-shot preflight-abort binding: an invocation cancelled after its queue
+	 * admission must cancel the submission it admitted, so an aborted dispatch
+	 * can never execute later. Both explicit delivery paths (follow-up and
+	 * steer) share this helper so their cancellation semantics cannot diverge
+	 * (exact-head review P1).
+	 */
+	#bindPreflightAbortCancellation(signal: AbortSignal | undefined, owner: QueuedFollowUpOwner): void {
+		if (!signal) return;
+		const cancelQueued = () => owner.cancel();
+		signal.addEventListener("abort", cancelQueued, { once: true });
+		if (signal.aborted) cancelQueued();
 	}
 
 	/**
@@ -13596,7 +13612,6 @@ export class AgentSession {
 					removed = true;
 				} else {
 					removed = this.agent.removeQueuedMessages(candidate => candidate === message).followUp > 0;
-					if (removed) this.#releaseDeferredSdkFollowUps();
 				}
 				if (removed) {
 					this.#followUpMessages = this.#followUpMessages.filter(entry => entry !== displayEntry);
@@ -13604,6 +13619,12 @@ export class AgentSession {
 					this.#sdkRunTokensByQueuedMessage.delete(message);
 					this.#followUpPromotionHooks.get(message)?.({ removed: true });
 					this.#followUpPromotionHooks.delete(message);
+					// Either removal site can unblock the NEXT deferred SDK follow-up:
+					// the cancelled entry may itself have been the deferred head, or it
+					// may have been the live work that deferred head was waiting behind.
+					// Without this release the successor stays accepted with no execution
+					// or terminal settlement (exact-head review P1).
+					this.#releaseDeferredSdkFollowUps();
 				}
 				return removed;
 			},
@@ -14430,16 +14451,14 @@ export class AgentSession {
 					sdkRunToken: internalOptions?.sdkRunToken,
 					onQueuedAfterAdmission: onTrackedQueued,
 				});
-				const cancelQueuedFollowUp = () => queuedFollowUp.cancel();
-				options?.preflightSignal?.addEventListener("abort", cancelQueuedFollowUp, { once: true });
-				if (options?.preflightSignal?.aborted) cancelQueuedFollowUp();
+				this.#bindPreflightAbortCancellation(options?.preflightSignal, queuedFollowUp);
 				options?.onPreflightAccepted?.();
 				return trackedQueuedInput?.submission;
 			}
 			if (deliverAs === "steer") {
 				if (options?.onPreflightAcceptCommit) await options.onPreflightAcceptCommit();
 				assertPreflightStillOpen();
-				await this.#queueSteer(text, images, {
+				const queuedSteer = await this.#queueSteer(text, images, {
 					claimsGenuineUserIntent: true,
 					onPromoted: onQueuedPromoted,
 					external: true,
@@ -14447,6 +14466,11 @@ export class AgentSession {
 					forceOneAtATime: options?.queuePolicy === "sequential",
 					onQueuedAfterAdmission: onTrackedQueued,
 				});
+				// An explicit steer is admitted to the live loop immediately, so an
+				// aborted invocation must cancel the exact submission it admitted:
+				// otherwise the steer stays executable after its caller gave up
+				// (exact-head review P1).
+				this.#bindPreflightAbortCancellation(options?.preflightSignal, queuedSteer);
 				options?.onPreflightAccepted?.();
 				return trackedQueuedInput?.submission;
 			}
@@ -14632,10 +14656,12 @@ export class AgentSession {
 		// removal deleted a DIFFERENT live message while the selected deferred
 		// entry's executable message survived and later ran.
 		let removedMessage = entry?.message;
+		let removedDeferredFollowUp = false;
 		if (removedMessage !== undefined) {
 			const deferredIndex = this.#deferredSdkFollowUps.indexOf(removedMessage);
 			if (deferredIndex !== -1) {
 				this.#deferredSdkFollowUps.splice(deferredIndex, 1);
+				removedDeferredFollowUp = true;
 			} else {
 				this.agent.removeQueuedMessages(candidate => candidate === removedMessage);
 			}
@@ -14644,6 +14670,13 @@ export class AgentSession {
 			const positional =
 				resolvedMode === "steer" ? this.agent.removeSteerAt(index) : this.agent.removeFollowUpAt(index);
 			if (positional !== undefined) removedMessage = positional;
+		}
+		// Removing a deferred SDK follow-up — or the live follow-up it was waiting
+		// behind — must release the NEXT deferred submission, exactly like the
+		// cancellation path does, or it stays accepted with no execution or
+		// terminal settlement (exact-head review P1).
+		if (removedDeferredFollowUp || (removedMessage !== undefined && resolvedMode === "followUp")) {
+			this.#releaseDeferredSdkFollowUps();
 		}
 		// The removed message left its queue WITHOUT consumption: its accepted SDK
 		// submission must terminalize boundedly, not strand accepted forever
