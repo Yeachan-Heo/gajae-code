@@ -275,14 +275,21 @@ export function printTimings(): void {
 /**
  * Begin recording startup timings under a new root span.
  * Idempotent: a second call while already recording is a no-op so that the
- * early starter (cli.ts, process start) and the explicit starter (main.ts)
- * can coexist.
+ * early starter (cli.ts, the first CLI statement) and the explicit starter
+ * (main.ts) can coexist.
+ *
+ * The root is anchored at the process-start origin rather than at the call:
+ * `performance.now()` counts milliseconds since `performance.timeOrigin`
+ * (process start) on Bun, so `start: 0` makes `Total` the true
+ * time-since-process-start. Runtime bootstrap plus static module linking and
+ * evaluation then land in the root's self time instead of being invisible
+ * before the first statement of cli.ts.
  */
 export function startTiming(): void {
 	if (gRecordTimings) return;
 	gRootSpan = {
 		op: "(root)",
-		start: performance.now(),
+		start: 0,
 		parent: undefined,
 		children: [],
 	};

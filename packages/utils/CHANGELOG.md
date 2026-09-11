@@ -4,6 +4,7 @@
 ### Changed
 
 - The startup timing tree drops the unused module-load span machinery (`recordModuleLoadSpan` and the `(modules)` summary renderer) that had no producer since the module-timer hook was removed, and any span still open at print time — such as a dispatch span wrapping the very run that prints — now reports elapsed-at-print instead of a misleading `0.00ms`.
+- `startTiming()` anchors its root span at the process-start origin instead of the call site, so the tree's `Total` covers runtime bootstrap and static module link/eval rather than starting after the first CLI statement.
 
 ### Fixed
 

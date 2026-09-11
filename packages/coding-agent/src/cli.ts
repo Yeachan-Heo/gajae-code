@@ -23,10 +23,11 @@ import {
 import { smokeTestIsolatedShell } from "./exec/isolated-shell";
 import { smokeTestTabWorker } from "./tools/browser/tab-worker-smoke";
 
-// Open the startup-timing window at the first CLI statement. With GJC_TIMING set
-// the printed tree then covers the pre-main costs (fast paths, runtime globals,
-// the launch command's module graph) that main.ts's later startTiming() call
-// cannot observe. Without the env gate nothing records and behavior is unchanged.
+// Start recording startup timings. The root span is anchored at the process
+// start (see startTiming), so the printed tree covers the pre-main costs
+// (runtime bootstrap, static module link/eval, runtime globals, fast paths, the
+// launch command's module graph) that main.ts's later startTiming() call cannot
+// observe. Without the env gate nothing records and behavior is unchanged.
 if (process.env.GJC_TIMING || process.env.PI_TIMING) {
 	startTiming();
 }
