@@ -52,6 +52,7 @@ import {
 	type LifecycleState,
 } from "./lifecycle-ledger";
 import { createMasterCapabilityVerifier, readEndpoint } from "./master-capability";
+import { sdkInternalRuntimeImage } from "./runtime";
 import { type IndexedSession, isSessionAuthorityEligible, SessionIndex, type SessionList } from "./session-index";
 import {
 	type ResolvedScopeV1,
@@ -77,6 +78,8 @@ import { BrokerTransport } from "./transport";
 export interface BrokerSettings {
 	agentDir: string;
 	packageGeneration?: string;
+	/** Published runtime image; tests inject one to model a vanished executable. */
+	runtime?: string;
 	port?: number;
 	heartbeatTtlMs?: number;
 	/** Broker-owned migration policy. Client lifecycle frames cannot select it. */
@@ -96,6 +99,7 @@ export interface BrokerSettings {
 type ResolvedBrokerSettings = {
 	agentDir: string;
 	packageGeneration: string;
+	runtime?: string;
 	port: number;
 	heartbeatTtlMs: number;
 	resolveDirectoryMigration: (_cwd: string) => Promise<DirectoryMigrationPolicy>;
@@ -1310,6 +1314,7 @@ export class Broker {
 		this.settings = {
 			agentDir: settings.agentDir,
 			packageGeneration: settings.packageGeneration ?? resolveBrokerPackageGeneration(),
+			runtime: settings.runtime,
 			port: settings.port ?? 0,
 			heartbeatTtlMs: settings.heartbeatTtlMs ?? BROKER_HEARTBEAT_TTL_MS,
 			resolveDirectoryMigration: settings.resolveDirectoryMigration ?? (async () => "copy-retain"),
@@ -2594,6 +2599,7 @@ export class Broker {
 				version: 1,
 				protocolVersion: 3,
 				packageGeneration: this.settings.packageGeneration,
+				runtime: this.settings.runtime ?? sdkInternalRuntimeImage(),
 				ownerId: this.#owner,
 				pid: process.pid,
 				incarnation,

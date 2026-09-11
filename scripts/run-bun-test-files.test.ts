@@ -9,6 +9,7 @@ import {
 	probeLinuxProcess,
 	processIdentityIsExecuting,
 	runHarness,
+	runTestProcess,
 	selectShard,
 	type TestProcessRunner,
 } from "./run-bun-test-files";
@@ -202,6 +203,36 @@ describe("fresh-process test harness contracts", () => {
 			"tests/nested dir/beta spec.spec.ts",
 			"tests/test_gamma.ts",
 		]);
+	});
+
+	test("captures spawn and child timing for concurrent fresh processes", async () => {
+		const root = await fs.mkdtemp(path.join(import.meta.dir, ".run-bun-test-parallel-timing-"));
+		tempDirs.push(root);
+		await fs.mkdir(path.join(root, "scripts"), { recursive: true });
+		await Bun.write(path.join(root, "scripts", "test-preload.ts"), "export {};\n");
+		await fs.mkdir(path.join(root, "tests"), { recursive: true });
+		await Bun.write(
+			path.join(root, "tests", "first.test.ts"),
+			'import { test } from "bun:test"; test("parallel child one", async () => { await Bun.sleep(50); });\n',
+		);
+		await Bun.write(
+			path.join(root, "tests", "second.test.ts"),
+			'import { test } from "bun:test"; test("parallel child two", async () => { await Bun.sleep(50); });\n',
+		);
+		const sandboxes = await Promise.all(
+			["tests/first.test.ts", "tests/second.test.ts"].map(() =>
+				fs.mkdtemp(path.join(os.tmpdir(), "run-bun-test-parallel-child-")),
+			),
+		);
+		tempDirs.push(...sandboxes);
+		const results = await Promise.all(
+			["tests/first.test.ts", "tests/second.test.ts"].map((file, index) =>
+				runTestProcess(buildTestProcessSpec(file, sandboxes[index]!, 30_000, root), 30_000),
+			),
+		);
+		expect(results.every(result => result.exitCode === 0 && !result.timedOut)).toBe(true);
+		expect(results.every(result => (result.durationMs ?? -1) >= 50)).toBe(true);
+		expect(results.every(result => (result.spawnMs ?? -1) >= 0)).toBe(true);
 	});
 
 	test("a real timed-out child has its process group terminated", async () => {

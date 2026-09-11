@@ -97,6 +97,31 @@ function singleDeepInterviewQuestion() {
 }
 
 describe("AskTool cancellation", () => {
+	it("aborts a headless foreground turn when the remote ask is cancelled", async () => {
+		const tool = new AskTool(
+			createSession({
+				hasUI: false,
+				getAskAnswerSource: () => ({
+					awaitAnswer: async () => undefined,
+					awaitAnswerRequest: async () => undefined,
+				}),
+			}),
+		);
+		const abort = vi.fn();
+		const context = { hasUI: false, abort } as unknown as AgentToolContext;
+
+		await expect(
+			tool.execute(
+				"call-remote-cancel",
+				{ questions: [{ id: "confirm", question: "Proceed?", options: [{ label: "yes" }] }] },
+				undefined,
+				undefined,
+				context,
+			),
+		).rejects.toThrow("Ask was cancelled by the remote client");
+		expect(abort).toHaveBeenCalledTimes(1);
+	});
+
 	it("aborts the turn when the user cancels selection", async () => {
 		const tool = new AskTool(createSession());
 		const abort = vi.fn();

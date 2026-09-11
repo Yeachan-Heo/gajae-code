@@ -270,6 +270,30 @@ describe("recordFatalCrash", () => {
 		expect(performance.now() - startedAt).toBeLessThan(1_000);
 	});
 
+	it("redacts the vendor tokens the Sentry egress guard already refuses", () => {
+		const target = tempCrashLog();
+		// `crash/upstream/envelope.ts` classifies these five as credential-like and
+		// refuses transmission, but that guard covers only the Sentry frame fields.
+		// This log is the other durable sink and reaches egress through
+		// redactCrashSecrets alone. Fixtures are assembled at runtime so no literal
+		// of this shape is committed.
+		const npmToken = ["npm", "a".repeat(36)].join("_");
+		const gitlabToken = ["glpat", "b".repeat(24)].join("-");
+		const stripeKey = ["rk", "test", "c".repeat(24)].join("_");
+		const hfToken = ["hf", "d".repeat(34)].join("_");
+		const err = new Error(`publish failed: ${npmToken} ${gitlabToken} ${stripeKey} ${hfToken}`);
+
+		recordFatalCrash("Uncaught Exception", err, { path: target });
+
+		const contents = fs.readFileSync(target, "utf8");
+		expect(contents).toContain("publish failed");
+		for (const secret of [npmToken, gitlabToken, stripeKey, hfToken]) {
+			expect(contents).not.toContain(secret);
+		}
+		expect(contents).toContain("«redacted-npm-token»");
+		expect(contents).toContain("«redacted-gitlab-token»");
+	});
+
 	it("enforces owner-only permissions on a pre-existing file", () => {
 		if (process.platform === "win32") return;
 		const target = tempCrashLog();

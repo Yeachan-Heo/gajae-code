@@ -309,7 +309,11 @@ export const DEFAULT_BASH_INTERCEPTOR_RULES: BashInterceptorRule[] = [
 		message: "Use the `edit` tool instead of awk -i inplace. It provides diff preview and fuzzy matching.",
 	},
 	{
-		pattern: "^\\s*(echo|printf|cat\\s*<<)\\s+.*[^|]>\\s*\\S",
+		// The redirection must belong to the leading echo/printf/heredoc itself:
+		// `(?!&&)[^;|\n]` keeps the scan inside that one command, `(?<![02-9])`
+		// skips fd redirections like `2>/dev/null`, and `<<\S*` accepts the usual
+		// `<<EOF` / `<<'EOF'` heredoc spelling that has no space after `<<`.
+		pattern: "^\\s*(echo|printf|cat\\s*<<\\S*)\\s+(?:(?!&&)[^;|\\n])*(?<![02-9])>{1,2}\\s*\\S",
 		tool: "write",
 		message: "Use the `write` tool instead of echo/cat redirection. It handles encoding and provides confirmation.",
 	},

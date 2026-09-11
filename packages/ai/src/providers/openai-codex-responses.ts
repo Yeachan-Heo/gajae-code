@@ -51,10 +51,6 @@ import {
 	normalizeSystemPrompts,
 	sanitizeOpenAIResponsesHistoryItemsForReplay,
 } from "../utils";
-import {
-	formatOpenAICodexChatGPTEntitlementError,
-	isOpenAICodexChatGPTEntitlementError,
-} from "../utils/codex-entitlement";
 import { AssistantMessageEventStream } from "../utils/event-stream";
 import { STREAM_FIRST_EVENT_TIMEOUT_PROVIDER_CODE, transportFailureFacts } from "../utils/fallback-transport";
 import { finalizeErrorMessage, type RawHttpRequestDump } from "../utils/http-inspector";
@@ -178,6 +174,7 @@ const CODEX_NON_RETRYABLE_EVENT_MESSAGE =
 	/invalid[_ -]function[_ -]parameters|invalid schema for function|invalid[_ -]tool[_ -]schema|schema must have type ["']?object["']?|request blocked[^\n]*invalid[_ -]prompt|code=invalid[_ -]prompt/i;
 const CODEX_RETRYABLE_EVENT_MESSAGE =
 	/processing your request|retry your request|temporar(?:y|ily)|overloaded|service.?unavailable|internal error|server error/i;
+const CODEX_ACCOUNT_MODEL_UNAVAILABLE_MESSAGE = /\bnot supported when using codex with a chatgpt account\b/i;
 const CODEX_PROVIDER_SESSION_STATE_KEY = "openai-codex-responses";
 const X_CODEX_TURN_STATE_HEADER = "x-codex-turn-state";
 const X_MODELS_ETAG_HEADER = "x-models-etag";
@@ -1246,7 +1243,7 @@ function handleCodexStreamEvent(args: {
 	}
 
 	if (eventType === "error" || eventType === "response.failed") {
-		throw createCodexProviderStreamError(rawEvent, model.id);
+		throw createCodexProviderStreamError(rawEvent);
 	}
 
 	return firstTokenTime;
@@ -2865,14 +2862,13 @@ async function openCodexSseEventStream(
 	updateCodexSessionMetadataFromHeaders(state, response.headers);
 	if (!response.ok) {
 		const info = await parseCodexError(response);
-		const error = new Error(
-			isOpenAICodexChatGPTEntitlementError(info.message, info.code)
-				? formatOpenAICodexChatGPTEntitlementError(body.model)
-				: info.friendlyMessage || info.message,
-		);
+		const error = new Error(info.friendlyMessage || info.message);
 		(error as { headers?: Headers; status?: number }).headers = response.headers;
 		(error as { headers?: Headers; status?: number }).status = response.status;
 		(error as { code?: string }).code = info.code;
+		if (isCodexAccountModelUnavailable(info.message, info.code)) {
+			(error as { credentialModelUnavailable?: true }).credentialModelUnavailable = true;
+		}
 		throw error;
 	}
 	if (!response.body) {
@@ -3219,6 +3215,7 @@ function getCodexEventErrorMessage(rawEvent: Record<string, unknown>): string {
 class CodexProviderStreamError extends Error {
 	readonly retryable: boolean;
 	readonly code?: string;
+	readonly credentialModelUnavailable: boolean;
 	/**
 	 * Provider-supplied message, before display formatting appends `code=`/`status=`
 	 * metadata. Classification must read this, never `message`: the formatted string
@@ -3227,12 +3224,19 @@ class CodexProviderStreamError extends Error {
 	 */
 	readonly providerMessage: string;
 
-	constructor(message: string, retryable: boolean, code: string | undefined, providerMessage: string) {
+	constructor(
+		message: string,
+		retryable: boolean,
+		code: string | undefined,
+		providerMessage: string,
+		credentialModelUnavailable: boolean,
+	) {
 		super(message);
 		this.name = "CodexProviderStreamError";
 		this.retryable = retryable;
 		this.code = code;
 		this.providerMessage = providerMessage;
+		this.credentialModelUnavailable = credentialModelUnavailable;
 	}
 }
 
@@ -3251,12 +3255,11 @@ function isRetryableCodexFailureEvent(rawEvent: Record<string, unknown>): boolea
 	return !!message && CODEX_RETRYABLE_EVENT_MESSAGE.test(message);
 }
 
-function createCodexProviderStreamError(rawEvent: Record<string, unknown>, modelId: string): CodexProviderStreamError {
+function createCodexProviderStreamError(rawEvent: Record<string, unknown>): CodexProviderStreamError {
 	const code = getCodexEventErrorCode(rawEvent);
 	const message = getCodexEventErrorMessage(rawEvent);
-	const formattedMessage = isOpenAICodexChatGPTEntitlementError(message, code)
-		? formatOpenAICodexChatGPTEntitlementError(modelId)
-		: typeof rawEvent.type === "string" && rawEvent.type === "error"
+	const formattedMessage =
+		typeof rawEvent.type === "string" && rawEvent.type === "error"
 			? formatCodexErrorEvent(rawEvent, code, message)
 			: (formatCodexFailure(rawEvent) ?? "Codex response failed");
 	return new CodexProviderStreamError(
@@ -3264,6 +3267,13 @@ function createCodexProviderStreamError(rawEvent: Record<string, unknown>, model
 		isRetryableCodexFailureEvent(rawEvent),
 		code || undefined,
 		message,
+		isCodexAccountModelUnavailable(message, code),
+	);
+}
+
+function isCodexAccountModelUnavailable(message: string | undefined, code: string | undefined): boolean {
+	return (
+		CODEX_ACCOUNT_MODEL_UNAVAILABLE_MESSAGE.test(message ?? "") && code?.toLowerCase() === "invalid_request_error"
 	);
 }
 

@@ -872,6 +872,15 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 		}
 
 		const extensionUi = context?.ui;
+		const throwRemoteCancellation = (remoteSignal: AbortSignal, toolSignal?: AbortSignal): never => {
+			// A headless remote answer source owns the only interactive surface. When it
+			// explicitly closes the ask, abort the enclosing turn as well; otherwise the
+			// tool throws while the foreground prompt keeps running and the next client
+			// prompt is rejected as already active. An abort already initiated by the
+			// caller must not be reported as a second, remote cancellation.
+			if (!extensionUi && !remoteSignal.aborted && !toolSignal?.aborted) context?.abort();
+			throw new ToolAbortError("Ask was cancelled by the remote client");
+		};
 		const ui: UIContext = {
 			select: (prompt, options, dialogOptions) => {
 				const source = this.session.getAskAnswerSource?.();
@@ -908,7 +917,7 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 				)
 					.then((answer): RemoteRaceResult | Promise<RemoteRaceResult> => {
 						if (answer === undefined) {
-							if (!extensionUi) throw new ToolAbortError("Ask was cancelled by the remote client");
+							if (!extensionUi) return throwRemoteCancellation(remoteController.signal, toolSignal);
 							return new Promise<never>(() => {});
 						}
 						const receipt = typeof answer === "string" ? legacyAskReceipt(answer) : answer;
@@ -1041,7 +1050,7 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 				)
 					.then((answer): RemoteRaceResult | Promise<RemoteRaceResult> => {
 						if (answer === undefined) {
-							if (!extensionUi) throw new ToolAbortError("Ask was cancelled by the remote client");
+							if (!extensionUi) return throwRemoteCancellation(remoteController.signal, toolSignal);
 							return new Promise<never>(() => {});
 						}
 						const receipt = typeof answer === "string" ? legacyAskReceipt(answer) : answer;

@@ -25,6 +25,16 @@ export function redactCrashSecrets(text: string): string {
 	redacted = redacted.replace(/\bgh[opsur]_[A-Za-z0-9]{16,}\b/g, "«redacted-github-token»");
 	redacted = redacted.replace(/\bgithub_pat_[A-Za-z0-9_]{20,}\b/g, "«redacted-github-token»");
 	redacted = redacted.replace(/\bxox[baprs]-[A-Za-z0-9-]{8,}\b/g, "«redacted-slack-token»");
+	// The five shapes below are the ones `crash/upstream/envelope.ts` already
+	// classifies as credential-like and refuses to transmit. That refusal only
+	// guards the Sentry frame fields; the persisted crash log and the
+	// `gjc crash report` body — which the user files as a public issue — reach
+	// egress through this function alone, so the same shapes have to be named here.
+	redacted = redacted.replace(/\bnpm_[A-Za-z0-9]{20,}\b/g, "«redacted-npm-token»");
+	redacted = redacted.replace(/\bglpat-[A-Za-z0-9_-]{20,}\b/g, "«redacted-gitlab-token»");
+	// Stripe separates with `_`, so the `sk-` rule above never matched one.
+	redacted = redacted.replace(/\b(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{16,}\b/g, "«redacted-api-key»");
+	redacted = redacted.replace(/\bhf_[A-Za-z0-9]{20,}\b/g, "«redacted-api-key»");
 	// A PEM block carries the key material itself, so it is redacted whole rather
 	// than line by line. It runs before the narrower rules because they would
 	// otherwise chew on the base64 body and leave a truncated key behind.
@@ -70,6 +80,8 @@ export const CRASH_REDACTION_MARKERS: readonly string[] = [
 	"«redacted-api-key»",
 	"«redacted-github-token»",
 	"«redacted-slack-token»",
+	"«redacted-npm-token»",
+	"«redacted-gitlab-token»",
 	"«redacted-aws-key»",
 	"«redacted-private-key»",
 	"«redacted-google-api-key»",

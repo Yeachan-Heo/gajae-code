@@ -1335,7 +1335,7 @@ test("a retention gap at the initial attach keeps delivering instead of rebuildi
 	});
 }, 20_000);
 test("a replay answered from a rolled generation retires the attachment instead of publishing it", async () => {
-	await withAttachedSessionRuntime(async ({ runtime, provider, reconcile, supersede }) => {
+	await withAttachedSessionRuntime(async ({ runtime, provider, reconcile, awaitFrameSettlement, supersede }) => {
 		await withSerializedFakeTransport(async () => {
 			const host = new FakeSessionHost();
 			const starting = runtime.start();
@@ -1344,6 +1344,7 @@ test("a replay answered from a rolled generation retires the attachment instead 
 
 			host.emit("one");
 			await awaitCompletedPosts(provider, 1);
+			await awaitFrameSettlement(GENERATION, 1);
 
 			// The host restarts its stream while this attachment is off the air, so the
 			// resume it issues names a generation the host no longer keeps a log for.

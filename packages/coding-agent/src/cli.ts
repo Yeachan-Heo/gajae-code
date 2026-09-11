@@ -8,6 +8,7 @@ import "@gajae-code/utils/postmortem";
 import { Args, type CliConfig, Command, type CommandEntry, run } from "@gajae-code/utils/cli";
 import { APP_NAME, formatBunRuntimeError, MIN_BUN_VERSION, VERSION } from "@gajae-code/utils/dirs";
 import { runFixtureReport } from "./cli/fixture-report";
+import { COMMUNITY_APP_REPOSITORY, offerMacosCommunityApp } from "./cli/macos-community-app";
 import { ROOT_LAUNCH_FLAGS } from "./cli/root-flags";
 import QuickLane from "./commands/quick-lane";
 import { runBashShellGuardian } from "./exec/bash-shell-guardian";
@@ -470,6 +471,24 @@ export async function runCli(argv: string[]): Promise<void> {
 	}
 	if (argv[0] === "--smoke-test") {
 		await runSmokeTest();
+		return;
+	}
+	if (argv.length === 1 && argv[0] === "--supports-macos-community-app") {
+		process.stdout.write("macos-community-app-offer\n");
+		return;
+	}
+	if (argv.length === 1 && argv[0] === "--internal-macos-community-app-offer") {
+		try {
+			await offerMacosCommunityApp({
+				log: message => {
+					process.stderr.write(`${message}\n`);
+				},
+			});
+		} catch {
+			process.stderr.write(
+				`Optional community app offer failed; GJC remains installed. https://github.com/${COMMUNITY_APP_REPOSITORY}\n`,
+			);
+		}
 		return;
 	}
 	const fixtureArg = rootFixtureArg(argv);
