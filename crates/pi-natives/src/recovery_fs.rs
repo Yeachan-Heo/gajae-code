@@ -634,6 +634,1032 @@ impl RecoveryFsResult {
 	}
 }
 
+#[napi]
+pub struct PortableRecoveryFsRoot {
+	#[cfg(unix)]
+	root: std::sync::Mutex<Option<std::fs::File>>,
+	#[cfg(windows)]
+	root: std::sync::Mutex<Option<WindowsPortableRecoveryRoot>>,
+}
+
+#[cfg(windows)]
+struct WindowsPortableRecoveryRoot {
+	handles: Vec<isize>,
+	path:    std::path::PathBuf,
+}
+
+#[cfg(windows)]
+impl WindowsPortableRecoveryRoot {
+	fn handle(&self) -> isize {
+		*self
+			.handles
+			.last()
+			.expect("retained Windows root has one handle")
+	}
+}
+
+#[cfg(windows)]
+impl Drop for WindowsPortableRecoveryRoot {
+	fn drop(&mut self) {
+		use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+		for handle in self.handles.drain(..).rev() {
+			// SAFETY: every handle is uniquely owned by this retained root.
+			unsafe { CloseHandle(handle as HANDLE) };
+		}
+	}
+}
+
+#[cfg(windows)]
+fn windows_handle_identity(handle: isize) -> Result<RecoveryFsIdentity, &'static str> {
+	use windows_sys::Win32::{
+		Foundation::HANDLE,
+		Storage::FileSystem::{BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle},
+	};
+	let mut information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+	if unsafe { GetFileInformationByHandle(handle as HANDLE, &mut information) } == 0 {
+		return Err("identity_unavailable");
+	}
+	let ino = (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow);
+	let size = (u64::from(information.nFileSizeHigh) << 32) | u64::from(information.nFileSizeLow);
+	let mtime = (u64::from(information.ftLastWriteTime.dwHighDateTime) << 32)
+		| u64::from(information.ftLastWriteTime.dwLowDateTime);
+	let ctime = (u64::from(information.ftCreationTime.dwHighDateTime) << 32)
+		| u64::from(information.ftCreationTime.dwLowDateTime);
+	Ok(RecoveryFsIdentity {
+		dev:      information.dwVolumeSerialNumber.to_string(),
+		ino:      ino.to_string(),
+		nlink:    information.nNumberOfLinks.to_string(),
+		size:     size.to_string(),
+		mtime_ns: mtime.to_string(),
+		ctime_ns: ctime.to_string(),
+		sha256:   None,
+	})
+}
+
+#[cfg(windows)]
+fn windows_file_identity(file: &std::fs::File) -> Result<RecoveryFsIdentity, &'static str> {
+	use std::os::windows::io::AsRawHandle;
+	windows_handle_identity(file.as_raw_handle() as isize)
+}
+
+#[cfg(windows)]
+fn portable_component_for_windows(name: &str) -> Result<(), &'static str> {
+	let path = std::path::Path::new(name);
+	if name.is_empty()
+		|| name == "."
+		|| name == ".."
+		|| path.is_absolute()
+		|| path.components().count() != 1
+	{
+		return Err("invalid_path");
+	}
+	Ok(())
+}
+
+#[cfg(any(unix, windows))]
+const PORTABLE_ROOT_MAX_WRITE_BYTES: usize = 1024 * 1024;
+#[cfg(any(unix, windows))]
+static PORTABLE_ROOT_TEMP_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(unix)]
+fn portable_component(name: &str) -> Result<std::ffi::CString, &'static str> {
+	use std::{os::unix::ffi::OsStrExt, path::Path};
+	let relative = Path::new(name);
+	if name.is_empty()
+		|| name == "."
+		|| name == ".."
+		|| relative.is_absolute()
+		|| relative.components().count() != 1
+	{
+		return Err("invalid_path");
+	}
+	std::ffi::CString::new(relative.as_os_str().as_bytes()).map_err(|_| "invalid_path")
+}
+
+#[cfg(unix)]
+fn portable_regular_result(file: &std::fs::File) -> Result<RecoveryFsResult, &'static str> {
+	use std::os::unix::fs::MetadataExt;
+	let metadata = file.metadata().map_err(|_| "identity_mismatch")?;
+	if !metadata.is_file() || metadata.nlink() != 1 {
+		return Err("identity_mismatch");
+	}
+	Ok(RecoveryFsResult {
+		ok:       true,
+		code:     None,
+		identity: Some(RecoveryFsIdentity {
+			dev:      metadata.dev().to_string(),
+			ino:      metadata.ino().to_string(),
+			nlink:    metadata.nlink().to_string(),
+			size:     metadata.size().to_string(),
+			mtime_ns: (i128::from(metadata.mtime()) * 1_000_000_000
+				+ i128::from(metadata.mtime_nsec()))
+			.to_string(),
+			ctime_ns: (i128::from(metadata.ctime()) * 1_000_000_000
+				+ i128::from(metadata.ctime_nsec()))
+			.to_string(),
+			sha256:   None,
+		}),
+		data:     None,
+	})
+}
+
+#[cfg(unix)]
+fn clear_portable_errno() {
+	#[cfg(any(target_os = "linux", target_os = "android"))]
+	// SAFETY: the platform accessor returns this thread's valid errno pointer.
+	unsafe {
+		*libc::__errno_location() = 0;
+	}
+	#[cfg(any(target_os = "macos", target_os = "ios"))]
+	// SAFETY: the platform accessor returns this thread's valid errno pointer.
+	unsafe {
+		*libc::__error() = 0;
+	}
+}
+
+#[cfg(unix)]
+fn portable_errno() -> i32 {
+	#[cfg(any(target_os = "linux", target_os = "android"))]
+	// SAFETY: the platform accessor returns this thread's valid errno pointer.
+	unsafe {
+		return *libc::__errno_location();
+	}
+	#[cfg(any(target_os = "macos", target_os = "ios"))]
+	// SAFETY: the platform accessor returns this thread's valid errno pointer.
+	unsafe {
+		return *libc::__error();
+	}
+	#[allow(
+		unreachable_code,
+		reason = "every supported Unix platform returns from its errno branch"
+	)]
+	0
+}
+
+#[cfg(unix)]
+fn portable_root_names(
+	root: &std::fs::File,
+	max_entries: u32,
+) -> Result<Vec<String>, &'static str> {
+	use std::os::fd::AsRawFd;
+	if max_entries == 0 || max_entries > 16 * 1024 {
+		return Err("invalid_limit");
+	}
+	// SAFETY: root owns a live directory descriptor; opening `.` creates an
+	// independent directory stream for this enumeration.
+	let duplicate = unsafe {
+		libc::openat(
+			root.as_raw_fd(),
+			c".".as_ptr(),
+			libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+		)
+	};
+	if duplicate < 0 {
+		return Err("io_error");
+	}
+	// SAFETY: duplicate is live and ownership transfers to fdopendir on success.
+	let directory = unsafe { libc::fdopendir(duplicate) };
+	if directory.is_null() {
+		// SAFETY: fdopendir failed, so duplicate remains owned here.
+		unsafe { libc::close(duplicate) };
+		return Err("io_error");
+	}
+	let mut names = Vec::new();
+	loop {
+		clear_portable_errno();
+		// SAFETY: directory remains live until the matching closedir below.
+		let entry = unsafe { libc::readdir(directory) };
+		if entry.is_null() {
+			let errno = portable_errno();
+			// SAFETY: directory is owned here and closed exactly once.
+			unsafe { libc::closedir(directory) };
+			if errno != 0 {
+				return Err("io_error");
+			}
+			names.sort();
+			return Ok(names);
+		}
+		// SAFETY: readdir returned a live dirent with a NUL-terminated name.
+		let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
+		if name == b"." || name == b".." {
+			continue;
+		}
+		if names.len() >= max_entries as usize {
+			// SAFETY: directory is owned here and closed exactly once.
+			unsafe { libc::closedir(directory) };
+			return Err("too_many_entries");
+		}
+		let Ok(name) = std::str::from_utf8(name) else {
+			// SAFETY: directory is owned here and closed exactly once.
+			unsafe { libc::closedir(directory) };
+			return Err("invalid_name");
+		};
+		names.push(name.to_owned());
+	}
+}
+
+#[napi]
+impl PortableRecoveryFsRoot {
+	#[napi]
+	pub fn write_exclusive(&self, relative_name: String, data: Uint8Array) -> RecoveryFsResult {
+		#[cfg(unix)]
+		{
+			use std::{
+				io::Write,
+				os::fd::{AsRawFd, FromRawFd},
+			};
+			if data.len() > PORTABLE_ROOT_MAX_WRITE_BYTES {
+				return RecoveryFsResult::failure("content_too_large");
+			}
+			let Ok(name) = portable_component(&relative_name) else {
+				return RecoveryFsResult::failure("invalid_path");
+			};
+			let Ok(guard) = self.root.lock() else {
+				return RecoveryFsResult::failure("closed");
+			};
+			let Some(root) = guard.as_ref() else {
+				return RecoveryFsResult::failure("closed");
+			};
+			// SAFETY: root and name are live; successful ownership transfers to File.
+			let fd = unsafe {
+				libc::openat(
+					root.as_raw_fd(),
+					name.as_ptr(),
+					libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+					0o600,
+				)
+			};
+			if fd < 0 {
+				return RecoveryFsResult::failure(
+					if std::io::Error::last_os_error().raw_os_error() == Some(libc::EEXIST) {
+						"already_exists"
+					} else {
+						"io_error"
+					},
+				);
+			}
+			// SAFETY: fd is newly owned after successful openat.
+			let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+			let result = (|| {
+				file.write_all(data.as_ref()).map_err(|_| "io_error")?;
+				file.sync_all().map_err(|_| "fsync_failed")?;
+				let result = portable_regular_result(&file)?;
+				root.sync_all().map_err(|_| "fsync_failed")?;
+				Ok(result)
+			})();
+			match result {
+				Ok(result) => result,
+				Err(code) => {
+					drop(file);
+					// SAFETY: root and name remain live; cleanup targets only the entry
+					// created exclusively by this call.
+					unsafe { libc::unlinkat(root.as_raw_fd(), name.as_ptr(), 0) };
+					RecoveryFsResult::failure(code)
+				},
+			}
+		}
+		#[cfg(windows)]
+		{
+			use std::io::Write;
+			if data.len() > PORTABLE_ROOT_MAX_WRITE_BYTES {
+				return RecoveryFsResult::failure("content_too_large");
+			}
+			if portable_component_for_windows(&relative_name).is_err() {
+				return RecoveryFsResult::failure("invalid_path");
+			}
+			let Ok(guard) = self.root.lock() else {
+				return RecoveryFsResult::failure("closed");
+			};
+			let Some(root) = guard.as_ref() else {
+				return RecoveryFsResult::failure("closed");
+			};
+			let path = root.path.join(&relative_name);
+			let mut file = match std::fs::OpenOptions::new()
+				.write(true)
+				.create_new(true)
+				.open(&path)
+			{
+				Ok(file) => file,
+				Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+					return RecoveryFsResult::failure("already_exists");
+				},
+				Err(_) => return RecoveryFsResult::failure("io_error"),
+			};
+			if file.write_all(data.as_ref()).is_err() || file.sync_all().is_err() {
+				drop(file);
+				let _ = std::fs::remove_file(path);
+				return RecoveryFsResult::failure("io_error");
+			}
+			match windows_file_identity(&file) {
+				Ok(identity) if identity.nlink == "1" => RecoveryFsResult {
+					ok:       true,
+					code:     None,
+					identity: Some(identity),
+					data:     None,
+				},
+				_ => {
+					drop(file);
+					if std::fs::remove_file(path).is_err() {
+						return RecoveryFsResult::failure("cleanup_failed");
+					}
+					RecoveryFsResult::failure("identity_mismatch")
+				},
+			}
+		}
+		#[cfg(not(any(unix, windows)))]
+		{
+			let _ = (relative_name, data);
+			RecoveryFsResult::failure("unsupported_platform")
+		}
+	}
+
+	#[napi]
+	pub fn replace(&self, relative_name: String, data: Uint8Array) -> RecoveryFsResult {
+		#[cfg(unix)]
+		{
+			use std::{
+				io::{Read, Write},
+				os::fd::{AsRawFd, FromRawFd},
+				sync::atomic::Ordering,
+			};
+			if data.len() > PORTABLE_ROOT_MAX_WRITE_BYTES {
+				return RecoveryFsResult::failure("content_too_large");
+			}
+			let Ok(name) = portable_component(&relative_name) else {
+				return RecoveryFsResult::failure("invalid_path");
+			};
+			let Ok(guard) = self.root.lock() else {
+				return RecoveryFsResult::failure("closed");
+			};
+			let Some(root) = guard.as_ref() else {
+				return RecoveryFsResult::failure("closed");
+			};
+			let temporary = format!(
+				".portable-root-{}-{}.tmp",
+				std::process::id(),
+				PORTABLE_ROOT_TEMP_ID.fetch_add(1, Ordering::Relaxed),
+			);
+			let Ok(temporary_name) = portable_component(&temporary) else {
+				return RecoveryFsResult::failure("invalid_path");
+			};
+			// SAFETY: root and temporary_name are live; successful ownership transfers
+			// to File.
+			let fd = unsafe {
+				libc::openat(
+					root.as_raw_fd(),
+					temporary_name.as_ptr(),
+					libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+					0o600,
+				)
+			};
+			if fd < 0 {
+				return RecoveryFsResult::failure("io_error");
+			}
+			// SAFETY: fd is newly owned after successful openat.
+			let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+			if file.write_all(data.as_ref()).is_err() || file.sync_all().is_err() {
+				drop(file);
+				// SAFETY: cleanup targets only this call's exclusive temporary entry.
+				unsafe { libc::unlinkat(root.as_raw_fd(), temporary_name.as_ptr(), 0) };
+				return RecoveryFsResult::failure("io_error");
+			}
+			let staged_identity = match portable_regular_result(&file) {
+				Ok(result) => result
+					.identity
+					.expect("portable regular result has identity"),
+				Err(code) => {
+					drop(file);
+					// SAFETY: cleanup targets only this call's exclusive temporary entry.
+					unsafe { libc::unlinkat(root.as_raw_fd(), temporary_name.as_ptr(), 0) };
+					return RecoveryFsResult::failure(code);
+				},
+			};
+			// SAFETY: both names and the retained root descriptor are live; renameat
+			// atomically replaces only within that retained directory.
+			if unsafe {
+				libc::renameat(
+					root.as_raw_fd(),
+					temporary_name.as_ptr(),
+					root.as_raw_fd(),
+					name.as_ptr(),
+				)
+			} != 0
+			{
+				// SAFETY: cleanup targets only this call's exclusive temporary entry.
+				unsafe { libc::unlinkat(root.as_raw_fd(), temporary_name.as_ptr(), 0) };
+				return RecoveryFsResult::failure("io_error");
+			}
+			if root.sync_all().is_err() {
+				return RecoveryFsResult::failure("fsync_failed");
+			}
+			// SAFETY: root and name are live; successful ownership transfers to File.
+			let installed_fd = unsafe {
+				libc::openat(
+					root.as_raw_fd(),
+					name.as_ptr(),
+					libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+				)
+			};
+			if installed_fd < 0 {
+				return RecoveryFsResult::failure("identity_mismatch");
+			}
+			// SAFETY: installed_fd is newly owned after successful openat.
+			let mut installed = unsafe { std::fs::File::from_raw_fd(installed_fd) };
+			let installed_result = match portable_regular_result(&installed) {
+				Ok(result) => result,
+				Err(code) => return RecoveryFsResult::failure(code),
+			};
+			let Some(installed_identity) = installed_result.identity.as_ref() else {
+				return RecoveryFsResult::failure("identity_mismatch");
+			};
+			if installed_identity.dev != staged_identity.dev
+				|| installed_identity.ino != staged_identity.ino
+			{
+				return RecoveryFsResult::failure("identity_mismatch");
+			}
+			let mut installed_data = Vec::with_capacity(data.len());
+			if installed.read_to_end(&mut installed_data).is_err() || installed_data != data.as_ref() {
+				return RecoveryFsResult::failure("changed_file");
+			}
+			drop(file);
+			installed_result
+		}
+		#[cfg(windows)]
+		{
+			use std::{
+				io::{Read, Write},
+				os::windows::{ffi::OsStrExt, fs::OpenOptionsExt},
+				sync::atomic::Ordering,
+			};
+
+			use windows_sys::Win32::Storage::FileSystem::{
+				FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+				MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+			};
+			if data.len() > PORTABLE_ROOT_MAX_WRITE_BYTES {
+				return RecoveryFsResult::failure("content_too_large");
+			}
+			if portable_component_for_windows(&relative_name).is_err() {
+				return RecoveryFsResult::failure("invalid_path");
+			}
+			let Ok(guard) = self.root.lock() else {
+				return RecoveryFsResult::failure("closed");
+			};
+			let Some(root) = guard.as_ref() else {
+				return RecoveryFsResult::failure("closed");
+			};
+			let temporary = format!(
+				".portable-root-{}-{}.tmp",
+				std::process::id(),
+				PORTABLE_ROOT_TEMP_ID.fetch_add(1, Ordering::Relaxed),
+			);
+			let temporary_path = root.path.join(&temporary);
+			let destination_path = root.path.join(&relative_name);
+			let mut file = match std::fs::OpenOptions::new()
+				.read(true)
+				.write(true)
+				.create_new(true)
+				.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+				.open(&temporary_path)
+			{
+				Ok(file) => file,
+				Err(_) => return RecoveryFsResult::failure("io_error"),
+			};
+			if file.write_all(data.as_ref()).is_err() || file.sync_all().is_err() {
+				drop(file);
+				let _ = std::fs::remove_file(temporary_path);
+				return RecoveryFsResult::failure("io_error");
+			}
+			let staged_identity = match windows_file_identity(&file) {
+				Ok(identity) if identity.nlink == "1" => identity,
+				_ => {
+					drop(file);
+					let _ = std::fs::remove_file(temporary_path);
+					return RecoveryFsResult::failure("identity_mismatch");
+				},
+			};
+			let source: Vec<u16> = temporary_path
+				.as_os_str()
+				.encode_wide()
+				.chain(Some(0))
+				.collect();
+			let destination: Vec<u16> = destination_path
+				.as_os_str()
+				.encode_wide()
+				.chain(Some(0))
+				.collect();
+			if unsafe {
+				MoveFileExW(
+					source.as_ptr(),
+					destination.as_ptr(),
+					MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+				)
+			} == 0
+			{
+				let _ = std::fs::remove_file(temporary_path);
+				return RecoveryFsResult::failure("io_error");
+			}
+			let mut installed = match std::fs::OpenOptions::new()
+				.read(true)
+				.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+				.open(destination_path)
+			{
+				Ok(file) => file,
+				Err(_) => return RecoveryFsResult::failure("identity_mismatch"),
+			};
+			let installed_identity = match windows_file_identity(&installed) {
+				Ok(identity) if identity.nlink == "1" => identity,
+				_ => return RecoveryFsResult::failure("identity_mismatch"),
+			};
+			if installed_identity.dev != staged_identity.dev
+				|| installed_identity.ino != staged_identity.ino
+			{
+				return RecoveryFsResult::failure("identity_mismatch");
+			}
+			let mut installed_data = Vec::with_capacity(data.len());
+			if installed.read_to_end(&mut installed_data).is_err() || installed_data != data.as_ref() {
+				return RecoveryFsResult::failure("changed_file");
+			}
+			drop(file);
+			RecoveryFsResult {
+				ok:       true,
+				code:     None,
+				identity: Some(installed_identity),
+				data:     None,
+			}
+		}
+		#[cfg(not(any(unix, windows)))]
+		{
+			let _ = (relative_name, data);
+			RecoveryFsResult::failure("unsupported_platform")
+		}
+	}
+
+	#[napi]
+	pub fn identity(&self) -> RecoveryFsResult {
+		#[cfg(unix)]
+		{
+			use std::os::unix::fs::MetadataExt;
+			let Ok(guard) = self.root.lock() else {
+				return RecoveryFsResult::failure("closed");
+			};
+			let Some(root) = guard.as_ref() else {
+				return RecoveryFsResult::failure("closed");
+			};
+			let Ok(metadata) = root.metadata() else {
+				return RecoveryFsResult::failure("identity_mismatch");
+			};
+			if !metadata.is_dir() {
+				return RecoveryFsResult::failure("identity_mismatch");
+			}
+			RecoveryFsResult {
+				ok:       true,
+				code:     None,
+				identity: Some(RecoveryFsIdentity {
+					dev:      metadata.dev().to_string(),
+					ino:      metadata.ino().to_string(),
+					nlink:    metadata.nlink().to_string(),
+					size:     metadata.size().to_string(),
+					mtime_ns: (i128::from(metadata.mtime()) * 1_000_000_000
+						+ i128::from(metadata.mtime_nsec()))
+					.to_string(),
+					ctime_ns: (i128::from(metadata.ctime()) * 1_000_000_000
+						+ i128::from(metadata.ctime_nsec()))
+					.to_string(),
+					sha256:   None,
+				}),
+				data:     None,
+			}
+		}
+		#[cfg(windows)]
+		{
+			let Ok(guard) = self.root.lock() else {
+				return RecoveryFsResult::failure("closed");
+			};
+			let Some(root) = guard.as_ref() else {
+				return RecoveryFsResult::failure("closed");
+			};
+			match windows_handle_identity(root.handle()) {
+				Ok(identity) => RecoveryFsResult {
+					ok:       true,
+					code:     None,
+					identity: Some(identity),
+					data:     None,
+				},
+				Err(_) => RecoveryFsResult::failure("identity_mismatch"),
+			}
+		}
+		#[cfg(not(any(unix, windows)))]
+		{
+			RecoveryFsResult::failure("unsupported_platform")
+		}
+	}
+
+	#[napi]
+	pub fn list(&self, max_entries: u32) -> napi::Result<Vec<String>> {
+		#[cfg(unix)]
+		{
+			let guard = self
+				.root
+				.lock()
+				.map_err(|_| napi::Error::from_reason("closed"))?;
+			let root = guard
+				.as_ref()
+				.ok_or_else(|| napi::Error::from_reason("closed"))?;
+			portable_root_names(root, max_entries).map_err(napi::Error::from_reason)
+		}
+		#[cfg(windows)]
+		{
+			if max_entries == 0 || max_entries > 16_384 {
+				return Err(napi::Error::from_reason("invalid_limit"));
+			}
+			let guard = self
+				.root
+				.lock()
+				.map_err(|_| napi::Error::from_reason("closed"))?;
+			let root = guard
+				.as_ref()
+				.ok_or_else(|| napi::Error::from_reason("closed"))?;
+			let mut names = Vec::new();
+			for entry in
+				std::fs::read_dir(&root.path).map_err(|_| napi::Error::from_reason("io_error"))?
+			{
+				let entry = entry.map_err(|_| napi::Error::from_reason("io_error"))?;
+				let name = entry
+					.file_name()
+					.into_string()
+					.map_err(|_| napi::Error::from_reason("invalid_name"))?;
+				names.push(name);
+				if names.len() > max_entries as usize {
+					return Err(napi::Error::from_reason("too_many_entries"));
+				}
+			}
+			names.sort();
+			Ok(names)
+		}
+		#[cfg(not(any(unix, windows)))]
+		{
+			let _ = max_entries;
+			Err(napi::Error::from_reason("unsupported_platform"))
+		}
+	}
+
+	#[napi]
+	pub fn read(&self, relative_name: String, max_bytes: u32) -> RecoveryFsResult {
+		#[cfg(unix)]
+		{
+			use std::{
+				ffi::CString,
+				io::Read,
+				os::{
+					fd::{AsRawFd, FromRawFd},
+					unix::{ffi::OsStrExt, fs::MetadataExt},
+				},
+				path::Path,
+			};
+			if max_bytes == 0
+				|| relative_name.is_empty()
+				|| relative_name == "."
+				|| relative_name == ".."
+			{
+				return RecoveryFsResult::failure("invalid_path");
+			}
+			let relative = Path::new(&relative_name);
+			if relative.components().count() != 1 || relative.is_absolute() {
+				return RecoveryFsResult::failure("invalid_path");
+			}
+			let Ok(name) = CString::new(relative.as_os_str().as_bytes()) else {
+				return RecoveryFsResult::failure("invalid_path");
+			};
+			let Ok(guard) = self.root.lock() else {
+				return RecoveryFsResult::failure("closed");
+			};
+			let Some(root) = guard.as_ref() else {
+				return RecoveryFsResult::failure("closed");
+			};
+			// SAFETY: root owns a valid directory fd and name is live and NUL-terminated.
+			let file_fd = unsafe {
+				libc::openat(
+					root.as_raw_fd(),
+					name.as_ptr(),
+					libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+				)
+			};
+			if file_fd < 0 {
+				return RecoveryFsResult::failure(
+					if std::io::Error::last_os_error().raw_os_error() == Some(libc::ENOENT) {
+						"not_found"
+					} else {
+						"untrusted_path"
+					},
+				);
+			}
+			// SAFETY: file_fd is newly owned after successful openat.
+			let mut file = unsafe { std::fs::File::from_raw_fd(file_fd) };
+			let metadata = match file.metadata() {
+				Ok(value) if value.is_file() && value.nlink() == 1 => value,
+				_ => return RecoveryFsResult::failure("identity_mismatch"),
+			};
+			if metadata.size() > u64::from(max_bytes) {
+				return RecoveryFsResult::failure("content_too_large");
+			}
+			let mut data = Vec::with_capacity(metadata.size() as usize + 1);
+			if Read::by_ref(&mut file)
+				.take(u64::from(max_bytes) + 1)
+				.read_to_end(&mut data)
+				.is_err()
+				|| data.len() > max_bytes as usize
+			{
+				return RecoveryFsResult::failure("content_too_large");
+			}
+			let Ok(after) = file.metadata() else {
+				return RecoveryFsResult::failure("changed_file");
+			};
+			if metadata.dev() != after.dev()
+				|| metadata.ino() != after.ino()
+				|| metadata.size() != after.size()
+				|| metadata.mtime() != after.mtime()
+				|| metadata.mtime_nsec() != after.mtime_nsec()
+				|| metadata.ctime() != after.ctime()
+				|| metadata.ctime_nsec() != after.ctime_nsec()
+			{
+				return RecoveryFsResult::failure("changed_file");
+			}
+			// Reopen the named entry after the read. Descriptor stability alone does
+			// not prove that the retained directory still names this inode.
+			// SAFETY: root owns a valid directory fd and name remains live and
+			// NUL-terminated.
+			let named_fd = unsafe {
+				libc::openat(
+					root.as_raw_fd(),
+					name.as_ptr(),
+					libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+				)
+			};
+			if named_fd < 0 {
+				return RecoveryFsResult::failure("changed_file");
+			}
+			// SAFETY: named_fd is newly owned after successful openat.
+			let named = unsafe { std::fs::File::from_raw_fd(named_fd) };
+			let Ok(named_metadata) = named.metadata() else {
+				return RecoveryFsResult::failure("changed_file");
+			};
+			if !named_metadata.is_file()
+				|| named_metadata.nlink() != 1
+				|| metadata.dev() != named_metadata.dev()
+				|| metadata.ino() != named_metadata.ino()
+			{
+				return RecoveryFsResult::failure("changed_file");
+			}
+			RecoveryFsResult {
+				ok:       true,
+				code:     None,
+				identity: Some(RecoveryFsIdentity {
+					dev:      metadata.dev().to_string(),
+					ino:      metadata.ino().to_string(),
+					nlink:    metadata.nlink().to_string(),
+					size:     metadata.size().to_string(),
+					mtime_ns: (i128::from(metadata.mtime()) * 1_000_000_000
+						+ i128::from(metadata.mtime_nsec()))
+					.to_string(),
+					ctime_ns: (i128::from(metadata.ctime()) * 1_000_000_000
+						+ i128::from(metadata.ctime_nsec()))
+					.to_string(),
+					sha256:   None,
+				}),
+				data:     Some(Uint8Array::from(data)),
+			}
+		}
+		#[cfg(windows)]
+		{
+			use std::{
+				io::Read,
+				os::windows::fs::{MetadataExt, OpenOptionsExt},
+				path::Path,
+			};
+
+			use windows_sys::Win32::Storage::FileSystem::{
+				FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT,
+			};
+			if max_bytes == 0 {
+				return RecoveryFsResult::failure("invalid_path");
+			}
+			let Ok(_) = portable_component_for_windows(&relative_name) else {
+				return RecoveryFsResult::failure("invalid_path");
+			};
+			let Ok(guard) = self.root.lock() else {
+				return RecoveryFsResult::failure("closed");
+			};
+			let Some(root) = guard.as_ref() else {
+				return RecoveryFsResult::failure("closed");
+			};
+			let file_path = root.path.join(Path::new(&relative_name));
+			let before = match std::fs::symlink_metadata(&file_path) {
+				Ok(metadata) => metadata,
+				Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+					return RecoveryFsResult::failure("not_found");
+				},
+				Err(_) => return RecoveryFsResult::failure("untrusted_path"),
+			};
+			if !before.is_file()
+				|| before.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+				|| before.file_size() > u64::from(max_bytes)
+			{
+				return RecoveryFsResult::failure("identity_mismatch");
+			}
+			let mut file = match std::fs::OpenOptions::new()
+				.read(true)
+				.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+				.open(&file_path)
+			{
+				Ok(file) => file,
+				Err(_) => return RecoveryFsResult::failure("untrusted_path"),
+			};
+			let opened = match file.metadata() {
+				Ok(metadata)
+					if metadata.is_file()
+						&& metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0 =>
+				{
+					metadata
+				},
+				_ => return RecoveryFsResult::failure("identity_mismatch"),
+			};
+			let Ok(opened_identity) = windows_file_identity(&file) else {
+				return RecoveryFsResult::failure("identity_mismatch");
+			};
+			if opened_identity.nlink != "1" || opened.file_size() > u64::from(max_bytes) {
+				return RecoveryFsResult::failure("identity_mismatch");
+			}
+			let mut data = Vec::with_capacity(opened.file_size() as usize + 1);
+			if Read::by_ref(&mut file)
+				.take(u64::from(max_bytes) + 1)
+				.read_to_end(&mut data)
+				.is_err()
+				|| data.len() > max_bytes as usize
+			{
+				return RecoveryFsResult::failure("content_too_large");
+			}
+			let Ok(after_identity) = windows_file_identity(&file) else {
+				return RecoveryFsResult::failure("changed_file");
+			};
+			let path_after = match std::fs::OpenOptions::new()
+				.read(true)
+				.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+				.open(&file_path)
+			{
+				Ok(file) => file,
+				Err(_) => return RecoveryFsResult::failure("changed_file"),
+			};
+			let Ok(path_identity) = windows_file_identity(&path_after) else {
+				return RecoveryFsResult::failure("changed_file");
+			};
+			if opened_identity.dev != after_identity.dev
+				|| opened_identity.ino != after_identity.ino
+				|| opened_identity.size != after_identity.size
+				|| opened_identity.mtime_ns != after_identity.mtime_ns
+				|| opened_identity.ctime_ns != after_identity.ctime_ns
+				|| opened_identity.dev != path_identity.dev
+				|| opened_identity.ino != path_identity.ino
+			{
+				return RecoveryFsResult::failure("changed_file");
+			}
+			RecoveryFsResult {
+				ok:       true,
+				code:     None,
+				identity: Some(opened_identity),
+				data:     Some(Uint8Array::from(data)),
+			}
+		}
+		#[cfg(not(any(unix, windows)))]
+		{
+			let _ = (relative_name, max_bytes);
+			RecoveryFsResult::failure("unsupported_platform")
+		}
+	}
+
+	#[napi]
+	pub fn close(&self) -> RecoveryFsResult {
+		#[cfg(unix)]
+		{
+			let Ok(mut guard) = self.root.lock() else {
+				return RecoveryFsResult::failure("closed");
+			};
+			if guard.take().is_none() {
+				return RecoveryFsResult::failure("closed");
+			}
+			RecoveryFsResult { ok: true, code: None, identity: None, data: None }
+		}
+		#[cfg(windows)]
+		{
+			let Ok(mut guard) = self.root.lock() else {
+				return RecoveryFsResult::failure("closed");
+			};
+			if guard.take().is_none() {
+				return RecoveryFsResult::failure("closed");
+			}
+			RecoveryFsResult { ok: true, code: None, identity: None, data: None }
+		}
+		#[cfg(not(any(unix, windows)))]
+		{
+			RecoveryFsResult::failure("unsupported_platform")
+		}
+	}
+}
+
+#[napi]
+pub fn open_portable_recovery_fs_root(root_path: String) -> napi::Result<PortableRecoveryFsRoot> {
+	#[cfg(unix)]
+	{
+		use std::{
+			ffi::CString,
+			os::{fd::FromRawFd, unix::ffi::OsStrExt},
+			path::Path,
+		};
+		let root_c = CString::new(Path::new(&root_path).as_os_str().as_bytes())
+			.map_err(|_| napi::Error::from_reason("invalid_path"))?;
+		// SAFETY: root_c is live and NUL-terminated; successful ownership transfers to
+		// File.
+		let fd = unsafe {
+			libc::open(
+				root_c.as_ptr(),
+				libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+			)
+		};
+		if fd < 0 {
+			return Err(napi::Error::from_reason("untrusted_root"));
+		}
+		// SAFETY: fd is newly owned after successful open.
+		let root = unsafe { std::fs::File::from_raw_fd(fd) };
+		Ok(PortableRecoveryFsRoot { root: std::sync::Mutex::new(Some(root)) })
+	}
+	#[cfg(windows)]
+	{
+		use std::{os::windows::ffi::OsStrExt, path::Path};
+
+		use windows_sys::Win32::{
+			Foundation::{CloseHandle, INVALID_HANDLE_VALUE},
+			Storage::FileSystem::{
+				BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_ATTRIBUTE_DIRECTORY,
+				FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+				FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE, GetFileInformationByHandle,
+				OPEN_EXISTING,
+			},
+		};
+		let path = Path::new(&root_path);
+		if !path.is_absolute() || root_path.starts_with(r"\\") {
+			return Err(napi::Error::from_reason("untrusted_root"));
+		}
+		let mut ancestors: Vec<&Path> = path.ancestors().collect();
+		ancestors.reverse();
+		let mut handles = Vec::with_capacity(ancestors.len());
+		for ancestor in ancestors {
+			let wide: Vec<u16> = ancestor.as_os_str().encode_wide().chain(Some(0)).collect();
+			// Omit FILE_SHARE_DELETE on every ancestor so neither the lifecycle root
+			// nor a containing directory can be renamed while this authority is alive.
+			let handle = unsafe {
+				CreateFileW(
+					wide.as_ptr(),
+					FILE_READ_ATTRIBUTES,
+					FILE_SHARE_READ | FILE_SHARE_WRITE,
+					std::ptr::null(),
+					OPEN_EXISTING,
+					FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+					std::ptr::null_mut(),
+				)
+			};
+			if handle == INVALID_HANDLE_VALUE {
+				for retained in handles.drain(..).rev() {
+					unsafe { CloseHandle(retained as _) };
+				}
+				return Err(napi::Error::from_reason("untrusted_root"));
+			}
+			let mut information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+			if unsafe { GetFileInformationByHandle(handle, &mut information) } == 0
+				|| information.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY == 0
+				|| information.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+			{
+				unsafe { CloseHandle(handle) };
+				for retained in handles.drain(..).rev() {
+					unsafe { CloseHandle(retained as _) };
+				}
+				return Err(napi::Error::from_reason("untrusted_root"));
+			}
+			handles.push(handle as isize);
+		}
+		Ok(PortableRecoveryFsRoot {
+			root: std::sync::Mutex::new(Some(WindowsPortableRecoveryRoot {
+				handles,
+				path: path.to_path_buf(),
+			})),
+		})
+	}
+	#[cfg(not(any(unix, windows)))]
+	{
+		let _ = root_path;
+		Err(napi::Error::from_reason("unsupported_platform"))
+	}
+}
+
 /// Bounded, path-free diagnostic evidence for one retained publication.
 #[napi(object)]
 #[derive(Clone)]

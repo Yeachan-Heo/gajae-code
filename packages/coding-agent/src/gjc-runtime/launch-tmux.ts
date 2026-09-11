@@ -17,7 +17,9 @@ import {
 import {
 	MANAGED_OWNER_INCARNATION_ENV,
 	MANAGED_OWNER_RUN_ID_ENV,
+	MANAGED_OWNER_SUPERVISED_ENV,
 	MANAGED_OWNER_SUPERVISOR_ARG,
+	publishManagedOwnerSupervisorAuthoritySync,
 } from "./managed-owner-supervisor";
 import { tmuxRuntimeSessionPath } from "./session-layout";
 import {
@@ -199,6 +201,8 @@ export interface TmuxLaunchPlan {
 	/** Immutable run and endpoint identities bound into the supervised command. */
 	ownerRunId?: string;
 	ownerIncarnation?: string;
+	/** Immutable predecessor evidence captured with the owner-generation baseline. */
+	ownerPredecessor?: ManagedOwnerPredecessorEvidence;
 	/** Generation state captured before owner-isolation planning; required for publication CAS. */
 	ownerGenerationBaseline?: OwnerGenerationBaseline;
 	/** One-shot coordinator signing bootstrap endpoint; key material never enters tmux argv or environment. */
@@ -535,7 +539,11 @@ function buildInnerCommand(context: CommandResolutionContext, rawArgs: string[])
 	const command = resolveCurrentGjcCommand(context);
 	const childArgs = stripRootTmuxFlag(rawArgs);
 	const supervisorEnv: Record<string, string> = context.managedOwnerSupervisor
-		? { GJC_MANAGED_OWNER_COMMAND_JSON: JSON.stringify([...command, ...childArgs]) }
+		? {
+				GJC_MANAGED_OWNER_COMMAND_JSON: JSON.stringify([...command, ...childArgs]),
+				[MANAGED_OWNER_SUPERVISED_ENV]: "1",
+				GJC_TMUX_OWNER_GENERATION_STAGED: "1",
+			}
 		: {};
 	const invocationArgs = context.managedOwnerSupervisor
 		? [...command, MANAGED_OWNER_SUPERVISOR_ARG]
@@ -1206,21 +1214,17 @@ function trustedReplacementAuthority(
 	return resolveManagedOwnerPredecessorSync(stateDir, sessionId, baseline);
 }
 
-function prepareManagedOwnerLifecycle(plan: TmuxLaunchPlan, context: TmuxLaunchContext): void {
-	if (plan.ownerGeneration) return;
-	const sessionId = plan.sessionId ?? plan.sessionName;
-	const stateDir = path.dirname(plan.sessionStateFile ?? path.join(plan.cwd, ".gjc", "runtime"));
-	const baseline = captureOwnerGenerationBaselineSync(stateDir, sessionId);
-	const replacement = trustedReplacementAuthority(stateDir, sessionId, baseline);
-	const generation = crypto.randomUUID();
-	const runId = crypto.randomUUID();
-	const incarnation = crypto.randomUUID();
-	plan.ownerGenerationBaseline = baseline;
-	// Stage immutable identity in the child command. It becomes current only after
-	// immutable creation proof and ownership tagging complete.
-	plan.ownerGeneration = generation;
-	plan.ownerRunId = runId;
-	plan.ownerIncarnation = incarnation;
+function rebuildManagedOwnerChildCommand(
+	plan: TmuxLaunchPlan,
+	context: TmuxLaunchContext,
+	stateDir: string,
+	sessionId: string,
+): void {
+	const generation = plan.ownerGeneration;
+	const runId = plan.ownerRunId;
+	const incarnation = plan.ownerIncarnation;
+	if (!generation || !runId || !incarnation) throw new Error("gjc_tmux_owner_lifecycle_identity_missing");
+	const replacement = plan.ownerPredecessor;
 	const innerCommand = buildInnerCommand(
 		{
 			cwd: plan.cwd,
@@ -1241,6 +1245,7 @@ function prepareManagedOwnerLifecycle(plan: TmuxLaunchPlan, context: TmuxLaunchC
 				[GJC_TMUX_OWNER_GENERATION_ENV]: generation,
 				[GJC_TMUX_OWNER_STATE_DIR_ENV]: stateDir,
 				[GJC_TMUX_OWNER_SERVER_KEY_ENV]: plan.tmuxCommand,
+				[GJC_TMUX_COMMAND_ENV]: plan.tmuxCommand,
 				[MANAGED_OWNER_RUN_ID_ENV]: runId,
 				[MANAGED_OWNER_INCARNATION_ENV]: incarnation,
 				...(replacement
@@ -1272,6 +1277,25 @@ function prepareManagedOwnerLifecycle(plan: TmuxLaunchPlan, context: TmuxLaunchC
 	);
 	plan.innerCommand = innerCommand;
 	plan.newSessionArgs = [...plan.newSessionArgs.slice(0, -1), innerCommand];
+}
+
+function prepareManagedOwnerLifecycle(plan: TmuxLaunchPlan, context: TmuxLaunchContext): void {
+	if (plan.ownerGeneration) return;
+	const sessionId = plan.sessionId ?? plan.sessionName;
+	const stateDir = path.dirname(plan.sessionStateFile ?? path.join(plan.cwd, ".gjc", "runtime"));
+	const baseline = captureOwnerGenerationBaselineSync(stateDir, sessionId);
+	const replacement = trustedReplacementAuthority(stateDir, sessionId, baseline);
+	const generation = crypto.randomUUID();
+	const runId = crypto.randomUUID();
+	const incarnation = crypto.randomUUID();
+	plan.ownerGenerationBaseline = baseline;
+	// Stage immutable identity in the child command. It becomes current only after
+	// immutable creation proof and ownership tagging complete.
+	plan.ownerGeneration = generation;
+	plan.ownerRunId = runId;
+	plan.ownerIncarnation = incarnation;
+	plan.ownerPredecessor = replacement;
+	rebuildManagedOwnerChildCommand(plan, context, stateDir, sessionId);
 }
 
 function defaultSpawnSync(command: string, args: string[], options: TmuxSpawnOptions): TmuxSpawnResult {
@@ -1566,6 +1590,18 @@ export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
 						});
 			}
 			plan.tmuxCommand = plan.authority.command;
+			if (!plan.attachSessionName) {
+				// The lifecycle identity is generated before authority resolution so it can
+				// bind the persisted provider record. Rebuild the child after pinning the
+				// canonical executable so its server-key provenance matches every later
+				// namespaced probe, tag, and cleanup command.
+				rebuildManagedOwnerChildCommand(
+					plan,
+					context,
+					path.dirname(plan.sessionStateFile ?? path.join(plan.cwd, ".gjc", "runtime")),
+					plan.sessionId ?? plan.sessionName,
+				);
+			}
 			if (!plan.attachSessionName) {
 				(context.providerAuthorityPersist ?? persistGjcTmuxProviderAuthoritySync)(plan.authority);
 				(context.providerAuthorityStagedAssert ?? assertGjcTmuxStagedMutationAuthoritySync)(plan.authority);
@@ -1964,6 +2000,35 @@ export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
 	try {
 		const stateDir = path.dirname(plan.sessionStateFile!);
 		resolveManagedOwnerPredecessorSync(stateDir, plan.sessionId!, plan.ownerGenerationBaseline!);
+		if (plan.platform === "linux" && !context.ownerIsolationProbe) {
+			const pane = spawnSync(
+				plan.tmuxCommand,
+				["display-message", "-p", "-t", plan.createdSessionId!, "-F", "#{pane_pid}"],
+				controlOptions,
+			);
+			const supervisorPid = Number(pane.stdout?.trim());
+			const supervisorStartTime = readLinuxProcStartTimeSync(supervisorPid);
+			if (
+				pane.exitCode !== 0 ||
+				!Number.isSafeInteger(supervisorPid) ||
+				supervisorPid <= 0 ||
+				!supervisorStartTime ||
+				!plan.createdServerIdentity
+			)
+				throw new Error("managed_owner_supervisor_authority_unavailable");
+			publishManagedOwnerSupervisorAuthoritySync({
+				schema_version: 1,
+				kind: "managed_owner_supervisor_authority",
+				state_dir: stateDir,
+				session_id: plan.sessionId!,
+				generation: plan.ownerGeneration!,
+				supervisor_pid: supervisorPid,
+				supervisor_start_time: supervisorStartTime,
+				server_pid: plan.createdServerIdentity.pid,
+				server_start_time: plan.createdServerIdentity.startTime,
+				native_session_id: plan.createdSessionId!,
+			});
+		}
 		replaceOwnerGenerationSync(stateDir, plan.sessionId!, plan.ownerGeneration!, plan.ownerGenerationBaseline!);
 		providerAuthorityPublished = true;
 	} catch (error) {

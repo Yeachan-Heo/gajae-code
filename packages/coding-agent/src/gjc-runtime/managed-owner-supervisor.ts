@@ -5,7 +5,17 @@ import * as path from "node:path";
 import { nativeProcessBindings } from "@gajae-code/utils/native-process";
 import { readLinuxProcStartTime } from "./linux-proc";
 import { assertSafePathComponent } from "./session-layout";
-import { lifecyclePaths, type OwnerIntent, observeOwnerTerminal } from "./tmux-owner-isolation";
+import {
+	captureOwnerGenerationBaseline,
+	isValidOwnerIntent,
+	lifecyclePaths,
+	type OwnerIntent,
+	observeOwnerTerminal,
+	readNoFollowJsonSync,
+	type StagedOwnerTerminalJournal,
+	type TerminalSignal,
+	withOwnerGenerationLifecycleLock,
+} from "./tmux-owner-isolation";
 
 export const MANAGED_OWNER_SUPERVISOR_ARG = "--internal-managed-owner-supervisor";
 export const MANAGED_OWNER_CHILD_TOKEN_ENV = "GJC_MANAGED_OWNER_CHILD_TOKEN";
@@ -15,17 +25,18 @@ export const MANAGED_OWNER_GENERATION_ENV = "GJC_TMUX_OWNER_GENERATION";
 export const MANAGED_OWNER_STATE_DIR_ENV = "GJC_TMUX_OWNER_STATE_DIR";
 export const MANAGED_OWNER_RUN_ID_ENV = "GJC_MANAGED_OWNER_RUN_ID";
 export const MANAGED_OWNER_INCARNATION_ENV = "GJC_MANAGED_OWNER_INCARNATION";
+export const MANAGED_OWNER_SUPERVISED_ENV = "GJC_MANAGED_OWNER_SUPERVISED";
 /** Suppresses command-derived durable artifacts for Broker-owned opaque spawn children. */
 export const MANAGED_OWNER_REDACT_COMMAND_ENV = "GJC_MANAGED_OWNER_REDACT_COMMAND";
+const GJC_TMUX_OWNER_SERVER_KEY_ENV = "GJC_TMUX_OWNER_SERVER_KEY";
+const GJC_TMUX_COMMAND_ENV = "GJC_TMUX_COMMAND";
+const GJC_TMUX_OWNER_GENERATION_STAGED_ENV = "GJC_TMUX_OWNER_GENERATION_STAGED";
+const MANAGED_OWNER_TERMINAL_PUBLICATION_UNCERTAIN_EXIT_CODE = 75;
 
 let bootstrapSigtermPending = false;
 const captureBootstrapSigterm = () => {
 	bootstrapSigtermPending = true;
 };
-if (process.argv.includes(MANAGED_OWNER_SUPERVISOR_ARG)) {
-	process.removeAllListeners("SIGTERM");
-	process.on("SIGTERM", captureBootstrapSigterm);
-}
 
 export interface ManagedOwnerBinding {
 	schema_version: 2;
@@ -57,6 +68,111 @@ export interface ManagedOwnerSigabrtReceipt {
 	signal_number: 6;
 	exit_code: number | null;
 	received_at: string;
+}
+
+interface ManagedOwnerSupervisorAuthority {
+	schema_version: 1;
+	kind: "managed_owner_supervisor_authority";
+	session_id: string;
+	generation: string;
+	supervisor_pid: number;
+	supervisor_start_time: string;
+	supervisor_is_parent?: true;
+	server_pid: number;
+	server_start_time: string;
+	native_session_id: string;
+}
+
+/** @internal */
+export function managedOwnerSupervisorIdentityMatches(input: {
+	platform: NodeJS.Platform;
+	record: Pick<ManagedOwnerSupervisorAuthority, "supervisor_pid" | "supervisor_start_time" | "supervisor_is_parent">;
+	processPid: number;
+	processStartTime: string;
+	parentPid: number | null;
+	publishedProcessStartTime: string | null;
+}): boolean {
+	const { record } = input;
+	return record.supervisor_is_parent === true
+		? input.platform === "win32" &&
+				input.parentPid === record.supervisor_pid &&
+				input.publishedProcessStartTime === record.supervisor_start_time
+		: record.supervisor_is_parent === undefined &&
+				record.supervisor_pid === input.processPid &&
+				record.supervisor_start_time === input.processStartTime;
+}
+
+function supervisorAuthorityPath(stateDir: string, sessionId: string, generation: string): string {
+	return path.join(lifecyclePaths(stateDir, sessionId, generation).root, `supervisor-authority-${generation}.json`);
+}
+
+export function publishManagedOwnerSupervisorAuthoritySync(
+	input: ManagedOwnerSupervisorAuthority & { state_dir: string },
+): void {
+	const { state_dir, ...record } = input;
+	const file = supervisorAuthorityPath(state_dir, record.session_id, record.generation);
+	fsSync.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+	fsSync.writeFileSync(file, `${JSON.stringify(record)}\n`, { flag: "wx", mode: 0o600 });
+	const fd = fsSync.openSync(file, "r");
+	try {
+		fsSync.fsyncSync(fd);
+	} finally {
+		fsSync.closeSync(fd);
+	}
+}
+
+async function requireManagedOwnerSupervisorAuthority(
+	stateDir: string,
+	sessionId: string,
+	generation: string,
+	supervisorStartTime: string,
+): Promise<void> {
+	const deadline = Date.now() + 7_000;
+	let authority: unknown = null;
+	while (Date.now() < deadline) {
+		try {
+			authority = readNoFollowJsonSync(supervisorAuthorityPath(stateDir, sessionId, generation));
+			if (authority) break;
+		} catch {}
+		await Bun.sleep(20);
+	}
+	if (!authority || typeof authority !== "object" || Array.isArray(authority))
+		throw new Error("managed_owner_supervisor_authority_unavailable");
+	const record = authority as Partial<ManagedOwnerSupervisorAuthority>;
+	const publishedProcessStartTime =
+		typeof record.supervisor_pid === "number" && record.supervisor_is_parent === true
+			? await managedOwnerProcessProvenance(record.supervisor_pid)
+			: null;
+	const supervisorIdentityMatches =
+		typeof record.supervisor_pid === "number" &&
+		typeof record.supervisor_start_time === "string" &&
+		(record.supervisor_is_parent === undefined || record.supervisor_is_parent === true) &&
+		managedOwnerSupervisorIdentityMatches({
+			platform: process.platform,
+			record: {
+				supervisor_pid: record.supervisor_pid,
+				supervisor_start_time: record.supervisor_start_time,
+				...(record.supervisor_is_parent === true ? { supervisor_is_parent: true } : {}),
+			},
+			processPid: process.pid,
+			processStartTime: supervisorStartTime,
+			parentPid: nativeProcessBindings().Process.fromPid(process.pid)?.ppid ?? null,
+			publishedProcessStartTime,
+		});
+	if (
+		record.schema_version !== 1 ||
+		record.kind !== "managed_owner_supervisor_authority" ||
+		record.session_id !== sessionId ||
+		record.generation !== generation ||
+		!supervisorIdentityMatches ||
+		typeof record.server_pid !== "number" ||
+		typeof record.server_start_time !== "string" ||
+		typeof record.native_session_id !== "string"
+	)
+		throw new Error("managed_owner_supervisor_authority_mismatch");
+	if (!process.env[GJC_TMUX_COMMAND_ENV]?.trim()) throw new Error("managed_owner_supervisor_server_unavailable");
+	const serverStartTime = await managedOwnerProcessProvenance(record.server_pid);
+	if (serverStartTime !== record.server_start_time) throw new Error("managed_owner_supervisor_server_mismatch");
 }
 
 function requiredEnvironment(name: string): string {
@@ -117,6 +233,43 @@ async function writeDurableExclusive(file: string, value: object): Promise<void>
 	if (JSON.stringify(persisted) !== JSON.stringify(value)) throw new Error("managed_owner_durable_reread_failed");
 }
 
+type StagedTerminalJournalResult = "not-staged" | "published" | "recorded" | "failed";
+
+async function recordStagedTerminal(
+	stateDir: string,
+	sessionId: string,
+	generation: string,
+	runId: string,
+	incarnation: string,
+	signal: TerminalSignal,
+	exitCode: number,
+	observedAt: string,
+): Promise<StagedTerminalJournalResult> {
+	if (process.env[GJC_TMUX_OWNER_GENERATION_STAGED_ENV] !== "1") return "not-staged";
+	const journal: StagedOwnerTerminalJournal = {
+		schema_version: 1,
+		kind: "staged_owner_terminal",
+		generation,
+		session_id: sessionId,
+		run_id: runId,
+		incarnation,
+		observed_at: observedAt,
+		signal,
+		exit_code: exitCode,
+		reason: "managed_owner_supervisor_staged_terminal",
+	};
+	try {
+		return await withOwnerGenerationLifecycleLock(stateDir, sessionId, generation, async () => {
+			const baseline = await captureOwnerGenerationBaseline(stateDir, sessionId);
+			if (baseline.state === "current" && baseline.generation === generation) return "published";
+			await writeDurableExclusive(lifecyclePaths(stateDir, sessionId, generation).stagedTerminalFile, journal);
+			return "recorded";
+		});
+	} catch {
+		return "failed";
+	}
+}
+
 function childCommand(): string[] {
 	const command = JSON.parse(requiredEnvironment(MANAGED_OWNER_COMMAND_ENV)) as unknown;
 	if (!Array.isArray(command) || command.length === 0 || command.some(value => typeof value !== "string" || !value))
@@ -128,8 +281,31 @@ export function isManagedOwnerSupervisorArgv(args: readonly string[]): boolean {
 	return args.length === 1 && args[0] === MANAGED_OWNER_SUPERVISOR_ARG;
 }
 
-/** Runs one exact child and publishes authority only for a directly observed Linux signal 6. */
-export async function runManagedOwnerSupervisor(): Promise<void> {
+/** @internal */
+export async function assertManagedOwnerGenerationPublished(
+	stateDir: string,
+	sessionId: string,
+	generation: string,
+	options: { timeoutMs?: number; pollMs?: number } = {},
+): Promise<void> {
+	const timeoutMs = options.timeoutMs ?? 5_000;
+	const pollMs = options.pollMs ?? 20;
+	const deadline = performance.now() + timeoutMs;
+	while (true) {
+		const currentGeneration = await captureOwnerGenerationBaseline(stateDir, sessionId);
+		if (currentGeneration.state === "current" && currentGeneration.generation === generation) return;
+		if (performance.now() >= deadline) throw new Error("managed_owner_supervisor_generation_unpublished");
+		await Bun.sleep(Math.min(pollMs, Math.max(0, deadline - performance.now())));
+	}
+}
+
+if (isManagedOwnerSupervisorArgv(process.argv.slice(2))) {
+	process.removeAllListeners("SIGTERM");
+	process.on("SIGTERM", captureBootstrapSigterm);
+}
+
+/** Runs one exact child and publishes authority for its directly observed terminal state. */
+export async function runManagedOwnerSupervisor(options: { requireAuthority?: boolean } = {}): Promise<void> {
 	const { root, stateDir, generation, sessionId, runId, incarnation } = lifecycleRoot();
 	const command = childCommand();
 	let sigtermPending = bootstrapSigtermPending;
@@ -140,6 +316,10 @@ export async function runManagedOwnerSupervisor(): Promise<void> {
 	process.on("SIGTERM", captureEarlySigterm);
 	const supervisorStartTime = await managedOwnerProcessProvenance(process.pid);
 	if (!supervisorStartTime) throw new Error("managed_owner_supervisor_start_time_unavailable");
+	if (options.requireAuthority) {
+		await requireManagedOwnerSupervisorAuthority(stateDir, sessionId, generation, supervisorStartTime);
+		await assertManagedOwnerGenerationPublished(stateDir, sessionId, generation);
+	}
 	await fs.mkdir(root, { recursive: true, mode: 0o700 });
 	const childToken = crypto.randomUUID();
 	const redactCommand = process.env[MANAGED_OWNER_REDACT_COMMAND_ENV] === "1";
@@ -169,12 +349,88 @@ export async function runManagedOwnerSupervisor(): Promise<void> {
 		stderr: "inherit",
 		env: childEnvironment,
 	});
+	const publishRedactedTerminal = async (exitCode: number): Promise<boolean> => {
+		if (!redactCommand) return false;
+		try {
+			await observeOwnerTerminal({
+				schema_version: 1,
+				op: "observe_terminal",
+				session_id: sessionId,
+				owner_generation: generation,
+				state_dir: stateDir,
+				socket_key: process.env[GJC_TMUX_OWNER_SERVER_KEY_ENV] ?? "",
+				observer: "raw_monitor",
+				observed_at: new Date().toISOString(),
+				signal: normalizeTerminalSignal(child.signalCode),
+				exit_code: exitCode,
+				exit_kind: child.signalCode ? "owner_lost" : exitCode === 0 ? "cleanup" : "exit",
+				reason: exitCode === 0 ? "owner_exit" : "managed_owner_supervisor_unexpected_exit",
+			});
+			return true;
+		} catch {
+			return false;
+		}
+	};
 	const childStartTime = await managedOwnerProcessProvenance(child.pid);
-	if (!childStartTime) throw new Error("managed_owner_child_start_time_unavailable");
-	const childProcess = nativeProcessBindings().Process.fromPid(child.pid);
+	if (!childStartTime) {
+		const exitCode = await child.exited;
+		const stagedJournal = await recordStagedTerminal(
+			stateDir,
+			sessionId,
+			generation,
+			runId,
+			incarnation,
+			normalizeTerminalSignal(child.signalCode),
+			exitCode,
+			new Date().toISOString(),
+		);
+		if (stagedJournal === "failed" || stagedJournal === "recorded") {
+			process.exitCode = MANAGED_OWNER_TERMINAL_PUBLICATION_UNCERTAIN_EXIT_CODE;
+			return;
+		}
+		if (child.signalCode === "SIGABRT" && (await publishRedactedTerminal(exitCode))) {
+			process.exitCode = 134;
+			return;
+		}
+		if (await publishRedactedTerminal(exitCode)) {
+			process.exitCode = exitCode;
+			return;
+		}
+		// Without the child's immutable start identity, its terminal status cannot
+		// be attributed to this owner. Do not mint an unexpected-loss verdict.
+		process.exitCode = MANAGED_OWNER_TERMINAL_PUBLICATION_UNCERTAIN_EXIT_CODE;
+		return;
+	}
+	const nativeReferencePid = child.pid;
+	const nativeReferenceStartTime =
+		process.platform === "linux" ? await readLinuxProcStartTime(nativeReferencePid) : childStartTime;
+	const childProcess =
+		nativeReferenceStartTime === childStartTime ? nativeProcessBindings().Process.fromPid(nativeReferencePid) : null;
 	if (!childProcess) {
 		const exitCode = await child.exited;
+		const stagedJournal = await recordStagedTerminal(
+			stateDir,
+			sessionId,
+			generation,
+			runId,
+			incarnation,
+			normalizeTerminalSignal(child.signalCode),
+			exitCode,
+			new Date().toISOString(),
+		);
+		if (stagedJournal === "failed" || stagedJournal === "recorded") {
+			process.exitCode = MANAGED_OWNER_TERMINAL_PUBLICATION_UNCERTAIN_EXIT_CODE;
+			return;
+		}
 		if (child.signalCode === "SIGABRT") {
+			if (!binding && (await publishRedactedTerminal(exitCode))) {
+				process.exitCode = 134;
+				return;
+			}
+			if (!binding) {
+				process.exitCode = MANAGED_OWNER_TERMINAL_PUBLICATION_UNCERTAIN_EXIT_CODE;
+				return;
+			}
 			if (binding) {
 				const receipt: ManagedOwnerSigabrtReceipt = {
 					schema_version: 2,
@@ -198,7 +454,13 @@ export async function runManagedOwnerSupervisor(): Promise<void> {
 			process.exitCode = 134;
 			return;
 		}
-		process.exitCode = exitCode;
+		if (await publishRedactedTerminal(exitCode)) {
+			process.exitCode = exitCode;
+			return;
+		}
+		// The native process handle is required for exact child ownership. The
+		// start-time evidence alone is insufficient for a non-SIGABRT verdict.
+		process.exitCode = MANAGED_OWNER_TERMINAL_PUBLICATION_UNCERTAIN_EXIT_CODE;
 		return;
 	}
 	if (process.platform === "linux" && childProcess.incarnation !== `linux:${childStartTime}`)
@@ -208,16 +470,40 @@ export async function runManagedOwnerSupervisor(): Promise<void> {
 	let relayedIntent: OwnerIntent | null = null;
 	let relayedAt: string | null = null;
 	const relaySigterm = () => {
+		// Latch the first successful delivery and the intent snapshot that authorized it.
+		// A later intent cannot retroactively authorize an already-delivered signal. When
+		// signalRoot returns false, delivery was not proven and a later signal may retry.
 		if (childExited || sigtermRelayed) return;
 		let candidateIntent: OwnerIntent | null = null;
+		let intentEvidencePresent = false;
+		let expiredIntent = false;
 		try {
-			const candidate = JSON.parse(
-				fsSync.readFileSync(lifecyclePaths(stateDir, sessionId, generation).intentFile, "utf8"),
-			) as Partial<OwnerIntent>;
-			candidateIntent = typeof candidate.dispatch_id === "string" ? (candidate as OwnerIntent) : null;
-		} catch {
+			const intentFile = lifecyclePaths(stateDir, sessionId, generation).intentFile;
+			try {
+				fsSync.lstatSync(intentFile);
+				intentEvidencePresent = true;
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code === "ENOENT") intentEvidencePresent = false;
+				else throw error;
+			}
+			const candidate: unknown = intentEvidencePresent ? readNoFollowJsonSync(intentFile) : null;
+			if (
+				isValidOwnerIntent(candidate) &&
+				candidate.session_id === sessionId &&
+				candidate.generation === generation
+			) {
+				const now = Date.now();
+				const active = Date.parse(candidate.created_at) <= now && Date.parse(candidate.expires_at) > now;
+				if (!active && Date.parse(candidate.expires_at) <= now) expiredIntent = true;
+				else if (active && candidate.server_key === process.env[GJC_TMUX_OWNER_SERVER_KEY_ENV])
+					candidateIntent = candidate;
+			}
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") return;
+			intentEvidencePresent = false;
 			candidateIntent = null;
 		}
+		if (intentEvidencePresent && !candidateIntent && !expiredIntent) return;
 		try {
 			if (!childProcess.signalRoot(15)) return;
 		} catch {
@@ -225,8 +511,8 @@ export async function runManagedOwnerSupervisor(): Promise<void> {
 			return;
 		}
 		sigtermRelayed = true;
-		relayedAt = new Date().toISOString();
 		relayedIntent = candidateIntent;
+		relayedAt = new Date().toISOString();
 	};
 	sigtermPending ||= bootstrapSigtermPending;
 	process.removeListener("SIGTERM", captureBootstrapSigterm);
@@ -237,25 +523,91 @@ export async function runManagedOwnerSupervisor(): Promise<void> {
 	childExited = true;
 	process.removeListener("SIGTERM", relaySigterm);
 	const terminalIntent = relayedIntent as OwnerIntent | null;
-	const terminalObservedAt = relayedAt as string | null;
-	if (sigtermRelayed && terminalObservedAt && terminalIntent) {
-		await observeOwnerTerminal({
-			schema_version: 1,
-			op: "observe_terminal",
-			session_id: sessionId,
-			owner_generation: generation,
-			state_dir: stateDir,
-			socket_key: process.env.GJC_TMUX_OWNER_SERVER_KEY ?? "",
-			observer: "raw_monitor",
-			observed_at: terminalObservedAt,
-			signal: "SIGTERM",
-			exit_code: exitCode,
-			exit_kind: "supervisor_child_exit",
-			reason: "managed_owner_supervisor_exit",
-			operator_dispatch_id: terminalIntent.dispatch_id,
-		});
+	const terminalObservedAt = new Date().toISOString();
+	const stagedJournal = await recordStagedTerminal(
+		stateDir,
+		sessionId,
+		generation,
+		runId,
+		incarnation,
+		normalizeTerminalSignal(child.signalCode),
+		exitCode,
+		terminalObservedAt,
+	);
+	let terminalPublicationFailed = stagedJournal === "failed" || stagedJournal === "recorded";
+	if (child.signalCode !== "SIGABRT" && sigtermRelayed && terminalObservedAt && terminalIntent) {
+		try {
+			await observeOwnerTerminal({
+				schema_version: 1,
+				op: "observe_terminal",
+				session_id: sessionId,
+				owner_generation: generation,
+				state_dir: stateDir,
+				socket_key: process.env.GJC_TMUX_OWNER_SERVER_KEY ?? "",
+				observer: "raw_monitor",
+				observed_at: relayedAt ?? terminalObservedAt,
+				signal: "SIGTERM",
+				exit_code: exitCode,
+				exit_kind: "supervisor_child_exit",
+				reason: "managed_owner_supervisor_exit",
+				operator_dispatch_id: terminalIntent.dispatch_id,
+				operator_intent_id: terminalIntent.intent_id,
+			});
+		} catch {
+			terminalPublicationFailed = true;
+		}
+	} else if (
+		child.signalCode !== "SIGABRT" &&
+		exitCode !== 75 &&
+		(sigtermRelayed || child.signalCode || exitCode !== 0)
+	) {
+		try {
+			await observeOwnerTerminal({
+				schema_version: 1,
+				op: "observe_terminal",
+				session_id: sessionId,
+				owner_generation: generation,
+				state_dir: stateDir,
+				socket_key: process.env.GJC_TMUX_OWNER_SERVER_KEY ?? "",
+				observer: "raw_monitor",
+				observed_at: new Date().toISOString(),
+				signal: normalizeTerminalSignal(child.signalCode),
+				exit_code: exitCode,
+				exit_kind: child.signalCode ?? "supervisor_child_exit",
+				reason: "managed_owner_supervisor_unexpected_exit",
+			});
+		} catch {
+			terminalPublicationFailed = true;
+		}
+	} else if (child.signalCode !== "SIGABRT") {
+		try {
+			await observeOwnerTerminal({
+				schema_version: 1,
+				op: "observe_terminal",
+				session_id: sessionId,
+				owner_generation: generation,
+				state_dir: stateDir,
+				socket_key: process.env[GJC_TMUX_OWNER_SERVER_KEY_ENV] ?? "",
+				observer: "raw_monitor",
+				observed_at: terminalObservedAt,
+				signal: "EXIT",
+				exit_code: exitCode,
+				exit_kind: "cleanup",
+				reason: "owner_exit",
+			});
+		} catch {
+			terminalPublicationFailed = true;
+		}
 	}
 	if (child.signalCode === "SIGABRT") {
+		if (!binding && (await publishRedactedTerminal(exitCode))) {
+			process.exitCode = 134;
+			return;
+		}
+		if (stagedJournal === "failed" || stagedJournal === "recorded") {
+			process.exitCode = MANAGED_OWNER_TERMINAL_PUBLICATION_UNCERTAIN_EXIT_CODE;
+			return;
+		}
 		if (binding) {
 			const receipt: ManagedOwnerSigabrtReceipt = {
 				schema_version: 2,
@@ -279,5 +631,15 @@ export async function runManagedOwnerSupervisor(): Promise<void> {
 		process.exitCode = 134;
 		return;
 	}
+	if (terminalPublicationFailed) {
+		process.exitCode = MANAGED_OWNER_TERMINAL_PUBLICATION_UNCERTAIN_EXIT_CODE;
+		return;
+	}
 	process.exitCode = exitCode;
+}
+
+function normalizeTerminalSignal(signal: NodeJS.Signals | null): TerminalSignal {
+	if (signal === "SIGTERM" || signal === "SIGHUP" || signal === "SIGINT" || signal === "SIGKILL") return signal;
+	if (signal === null) return "EXIT";
+	return "UNKNOWN";
 }

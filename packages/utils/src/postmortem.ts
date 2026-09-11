@@ -410,9 +410,50 @@ function fatalErrorForLog(fatal: FatalDiagnostic): Error {
 // Worker thread: exit only (workers use self.addEventListener for exceptions)
 let inspectorOpened = false;
 
+/**
+ * Returns `stack` without the `Name: message` header V8 places at the top.
+ *
+ * The header spans as many lines as the message does, so dropping a single line left lines
+ * 2..N of a multi-line message inside the "stack" while the caller had already rendered the
+ * message in full — printing the entire body twice. Any stack whose header does not match the
+ * captured name/message (the message may have been replaced by a serialized payload) falls back
+ * to dropping just the first line, which is the shape V8 guarantees.
+ */
+function stackFramesOnly(fatal: FatalDiagnostic): string {
+	if (fatal.stack.length === 0) return "";
+	const header = `${fatal.name}: ${fatal.message}`;
+	if (
+		fatal.stack.startsWith(header) &&
+		(fatal.stack.length === header.length ||
+			fatal.stack[header.length] === "\n" ||
+			fatal.stack[header.length] === "\r")
+	)
+		return fatal.stack.slice(header.length).replace(/^\r?\n/, "");
+	const firstBreak = fatal.stack.indexOf("\n");
+	const firstLine = firstBreak === -1 ? fatal.stack : fatal.stack.slice(0, firstBreak);
+	if (/^\s*at\s+/.test(firstLine)) return fatal.stack;
+	const codedHeaderEnd = firstLine.indexOf("]: ");
+	const codedHeader =
+		firstLine.startsWith(`${fatal.name} [`) && codedHeaderEnd > fatal.name.length + 2
+			? firstLine.slice(0, codedHeaderEnd + 3)
+			: "";
+	if (
+		codedHeader &&
+		fatal.stack.startsWith(`${codedHeader}${fatal.message}`) &&
+		(fatal.stack.length === codedHeader.length + fatal.message.length ||
+			fatal.stack[codedHeader.length + fatal.message.length] === "\n" ||
+			fatal.stack[codedHeader.length + fatal.message.length] === "\r")
+	)
+		return fatal.stack.slice(codedHeader.length + fatal.message.length).replace(/^\r?\n/, "");
+	if (firstBreak === -1) return "";
+	return firstLine === fatal.name || firstLine.startsWith(`${fatal.name}: `) || codedHeader
+		? fatal.stack.slice(firstBreak + 1)
+		: fatal.stack;
+}
+
 function formatFatalError(label: string, fatal: FatalDiagnostic): string {
-	const stackLines = fatal.stack.split("\n").slice(1);
-	const formattedStack = stackLines.length > 0 ? `\n${stackLines.join("\n")}` : "";
+	const frames = stackFramesOnly(fatal);
+	const formattedStack = frames.length > 0 ? `\n${frames}` : "";
 	const formattedPayload = fatal.payload ? `\n${fatal.payload}` : "";
 	return boundCrashRecord(
 		redactCrashSecrets(`\n[${label}] ${fatal.name}: ${fatal.message}${formattedStack}${formattedPayload}\n`),
@@ -591,7 +632,10 @@ function writeCrashRecord(
 	try {
 		const target = options.path ?? getCrashLogPath();
 		const now = options.now ?? new Date();
-		const stack = fatal.stack ? `${redactCrashSecrets(fatal.stack)}\n` : "";
+		// The record already prints `name: message` on its own line below, so only the frames
+		// are appended here; the raw stack would repeat a multi-line message verbatim.
+		const frames = stackFramesOnly(fatal);
+		const stack = frames ? `${redactCrashSecrets(frames)}\n` : "";
 		const payload = fatal.payload ? `${redactCrashSecrets(fatal.payload)}\n` : "";
 		// Identity is computed from the already-captured diagnostic text only; the
 		// throwable is never read again here.

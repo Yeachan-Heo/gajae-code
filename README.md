@@ -401,7 +401,7 @@ gjc setup defaults --check
 
 | Tool or bot | Recommended GJC command | Boundary |
 | ----------- | ----------------------- | -------- |
-| Codex CLI | `gjc --tmux --worktree <name>` or `gjc` | `--worktree` names a GJC-managed sibling worktree; for an existing path, `cd` there first. |
+| Codex CLI | `gjc --tmux --worktree <name>` or `gjc` | `--worktree` names a GJC-managed worktree under the repository-local `.worktrees` bucket; for an existing path, `cd` there first. |
 | Claude Code | `gjc --tmux` or `gjc --tmux --worktree <name>` | GJC does not become a Claude Code extension. |
 | OpenCode | `gjc` or `gjc --tmux` | External-runner workflow only today. |
 | Claw Code | `gjc --tmux --worktree <name>` | GJC does not install into or replace Claw Code. |

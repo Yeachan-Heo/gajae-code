@@ -254,6 +254,18 @@ function testBrokerDiscovery(): BrokerDiscovery {
 	};
 }
 
+function publishedTestBrokerDiscovery(): BrokerDiscovery {
+	return {
+		...testBrokerDiscovery(),
+		ownerId: "test",
+		url: "ws://sdk.example.test",
+		token: "broker-discovery-secret",
+		// High-cardinality durability tests can exceed the production heartbeat
+		// TTL under instrumentation; keep this inert fixture alive for their budget.
+		heartbeatAt: Date.now() + 60_000,
+	};
+}
+
 function createBrokerTestServer(root: string, services: BrokerTestServices) {
 	return createCoordinatorMcpServer({
 		env: {
@@ -575,20 +587,7 @@ async function createSdkControlServer(
 		},
 	});
 	await fs.mkdir(path.join(root, ".gjc", "state", "sdk"), { recursive: true });
-	await writeBrokerDiscovery(agentDir, {
-		version: 1,
-		protocolVersion: 3,
-		packageGeneration: packageJson.version,
-		ownerId: "test",
-		pid: process.pid,
-		incarnation: brokerProcessIncarnation(process.pid) ?? "test-incarnation",
-		host: "127.0.0.1",
-		port: 1,
-		url: "ws://sdk.example.test",
-		token: "broker-discovery-secret",
-		startedAt: Date.now(),
-		heartbeatAt: Date.now(),
-	});
+	await writeBrokerDiscovery(agentDir, publishedTestBrokerDiscovery());
 	if (serverOptions.establishedSidecarAuthority !== false) await seedEstablishedSidecarAuthority();
 	return server;
 }

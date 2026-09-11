@@ -12,6 +12,9 @@
 
 - `redactCrashSecrets` now covers the credential shapes the session-import scrubber already listed: Google API keys, PEM private-key blocks, the `ABIA`/`ACCA` AWS access-key prefixes, and basic-auth credentials embedded in a URL. All four previously survived into the persisted crash log and into outbound crash text, because `sanitizeExternalCrashV1` uses this function as its credential layer and its later URL/hex/path passes do not recognize them. The URL rule bounds its scheme repetition so scanning stays linear; an unbounded one re-tried every prefix of a long alphabetic run and cost roughly ten seconds on a 200 KB crash body.
 
+- A fatal error whose message spans multiple lines no longer prints its body twice. `formatFatalError` and `writeCrashRecord` both dropped a single line from `stack` to skip V8's `Name: message` header, but that header spans as many lines as the message does, so lines 2..N survived as pretend stack frames while the message had already been rendered in full — visible on stderr and in `gjc-crash.log` for any multi-line guard. The header is now stripped by exact `name: message` prefix, falling back to the single-line drop when the captured message no longer matches the stack (a serialized payload can replace it). Real frames are preserved.
+- Crash diagnostics now preserve a lone headerless stack frame and strip coded V8 error headers such as `AssertionError [ERR_ASSERTION]: ...` without duplicating the message.
+
 ## [0.16.4] - 2026-09-05
 
 ## [0.16.3] - 2026-09-04

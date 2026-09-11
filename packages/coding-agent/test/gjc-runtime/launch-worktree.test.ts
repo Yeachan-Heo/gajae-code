@@ -8,8 +8,11 @@ import * as path from "node:path";
 import type { Args } from "@gajae-code/coding-agent/cli/args";
 import { buildDefaultTmuxLaunchPlan } from "@gajae-code/coding-agent/gjc-runtime/launch-tmux";
 import {
+	asLaunchWorktreeGuardError,
 	ensureLaunchWorktree,
+	ensureLaunchWorktreeCancellable,
 	ensureReusableNodeModules,
+	LaunchWorktreeGuardError,
 	parseLaunchWorktreeMode,
 	planLaunchWorktree,
 	prepareLaunchWorktree,
@@ -690,5 +693,260 @@ describe("resolveWorktreeBucketForPath Windows semantics", () => {
 			"C:\\repos\\App.worktrees",
 		);
 		expect(resolveWorktreeBucketForPath(repo, "   ", home, path.win32)).toBe("C:\\repos\\app\\.worktrees");
+	});
+
+	it("preserves replacement-token characters in the repository basename", () => {
+		expect(resolveWorktreeBucketForPath("C:\\repos\\$&`$'", "{repo}.worktrees", home, path.win32)).toBe(
+			"C:\\repos\\$&`$'.worktrees",
+		);
+	});
+});
+
+describe("launch guard classification", () => {
+	// Classification is structural: guards are thrown as LaunchWorktreeGuardError at the refusal
+	// site, so a newly added guard cannot regress to the crash path by being forgotten in a list.
+	it("throws a classified guard, code-prefixed, when the bucket is not git-ignored", async () => {
+		const repo = await createRepo("gjc-guard-not-ignored-");
+		// Drop the bucket ignore so the preflight refuses.
+		await fs.rm(path.join(repo, ".gitignore"), { force: true });
+		let caught: unknown;
+		try {
+			prepareLaunchWorktree(repo, ["--worktree"]);
+		} catch (error) {
+			caught = error;
+		}
+		const guard = asLaunchWorktreeGuardError(caught);
+		expect(guard).toBeInstanceOf(LaunchWorktreeGuardError);
+		expect(guard?.code).toBe("worktree_bucket_not_ignored");
+		expect(guard?.message.startsWith("worktree_bucket_not_ignored")).toBe(true);
+		expect(guard?.message).toContain("Safe remediation:");
+	});
+
+	// Regression: validateBranchName threw raw git stderr with no code prefix, so the guard
+	// existed in name only and fell through to the crash path.
+	it("prefixes the guard code even when git supplies its own branch-name diagnostic", async () => {
+		const repo = await createRepo("gjc-guard-badbranch-");
+		let caught: unknown;
+		try {
+			prepareLaunchWorktree(repo, ["--worktree=bad..name"]);
+		} catch (error) {
+			caught = error;
+		}
+		const guard = asLaunchWorktreeGuardError(caught);
+		expect(guard).toBeInstanceOf(LaunchWorktreeGuardError);
+		expect(guard?.code).toBe("invalid_worktree_branch");
+		expect(guard?.message.startsWith("invalid_worktree_branch:")).toBe(true);
+	});
+
+	it("rejects checkout-history shorthand variants before Git expands them", async () => {
+		const repo = await createRepo("gjc-guard-history-shorthand-");
+		for (const branch of ["@{-1}/suffix", "@{-1}x"]) {
+			let caught: unknown;
+			try {
+				prepareLaunchWorktree(repo, ["--worktree", branch]);
+			} catch (error) {
+				caught = error;
+			}
+			expect(asLaunchWorktreeGuardError(caught)?.code).toBe("invalid_worktree_branch");
+		}
+	});
+
+	it("redacts secrets and bounds captured branch diagnostics", async () => {
+		const repo = await createRepo("gjc-guard-diagnostic-bounds-");
+		const secret = "SuperSecretToken123456";
+		const branch = `Bearer ${secret} ${"x".repeat(20_000)}`;
+		let caught: unknown;
+		try {
+			prepareLaunchWorktree(repo, ["--worktree", branch]);
+		} catch (error) {
+			caught = error;
+		}
+		const guard = asLaunchWorktreeGuardError(caught);
+		expect(guard).toBeInstanceOf(LaunchWorktreeGuardError);
+		expect(guard?.message).not.toContain(secret);
+		expect(guard?.message).toContain("«redacted-auth»");
+		expect(Buffer.byteLength(guard?.message ?? "", "utf8")).toBeLessThanOrEqual(16 * 1024);
+		expect(guard?.message).toContain("[launch diagnostic truncated]");
+	});
+
+	it("neutralizes terminal control bytes in launch guard diagnostics", async () => {
+		const repo = await createRepo("gjc-guard-controls-");
+		let caught: unknown;
+		try {
+			prepareLaunchWorktree(repo, ["--worktree", "bad\u001b]52;c;forged\u0007\rreset\u007f"]);
+		} catch (error) {
+			caught = error;
+		}
+		const message = asLaunchWorktreeGuardError(caught)?.message ?? "";
+		expect(message).not.toMatch(/[\u0000-\u0008\u000B-\u001F\u007F]/u);
+		expect(message).toContain("\\u001b");
+		expect(message).toContain("\\u0007");
+		expect(message).toContain("\\u000d");
+		expect(message).toContain("\\u007f");
+	});
+
+	it("leaves a genuine defect unclassified so it keeps full crash diagnostics", () => {
+		expect(asLaunchWorktreeGuardError(new TypeError("cannot read properties of undefined"))).toBeNull();
+		// A plain Error is never promoted by message shape, even if it looks like a guard.
+		expect(asLaunchWorktreeGuardError(new Error("worktree_bucket_not_ignored"))).toBeNull();
+		expect(asLaunchWorktreeGuardError(new Error("ENOENT: no such file"))).toBeNull();
+		expect(asLaunchWorktreeGuardError("worktree_dirty:/repo")).toBeNull();
+		expect(asLaunchWorktreeGuardError(null)).toBeNull();
+	});
+
+	it("passes an already-classified guard through unchanged", () => {
+		const guard = new LaunchWorktreeGuardError("worktree_dirty", "worktree_dirty:/repo");
+		expect(asLaunchWorktreeGuardError(guard)).toBe(guard);
+	});
+
+	it("classifies path conflicts on the cancellable preparation path", async () => {
+		const repo = await createRepo("gjc-cancellable-guard-");
+		const plan = planLaunchWorktree(repo, { enabled: true, detached: false, name: "occupied" });
+		expect(plan.enabled).toBe(true);
+		if (!plan.enabled) throw new Error("expected an enabled worktree plan");
+		await fs.mkdir(path.dirname(plan.worktreePath), { recursive: true });
+		await Bun.write(plan.worktreePath, "occupied\n");
+
+		let caught: unknown;
+		try {
+			await ensureLaunchWorktreeCancellable(plan);
+		} catch (error) {
+			caught = error;
+		}
+
+		const guard = asLaunchWorktreeGuardError(caught);
+		expect(guard).toBeInstanceOf(LaunchWorktreeGuardError);
+		expect(guard?.code).toBe("worktree_path_conflict");
+	});
+
+	it("retains an exact worktree created as the cancellable deadline expires", async () => {
+		const repo = await createRepo("gjc-cancellable-rollback-");
+		const plan = planLaunchWorktree(repo, { enabled: true, detached: false, name: "deadline" });
+		expect(plan.enabled).toBe(true);
+		if (!plan.enabled) throw new Error("expected an enabled worktree plan");
+		await expect(
+			ensureLaunchWorktreeCancellable(plan, {
+				deadlineAt: 5_000,
+				now: () => (fsSync.existsSync(plan.worktreePath) ? 10_000 : 0),
+			}),
+		).rejects.toBeInstanceOf(Error);
+		expect(fsSync.existsSync(plan.worktreePath)).toBe(true);
+		expect(run("git", ["branch", "--list", plan.branchName ?? ""], repo)).toContain(plan.branchName ?? "");
+	});
+
+	it("retains a raced dirty worktree instead of force-removing user changes", async () => {
+		const repo = await createRepo("gjc-cancellable-dirty-");
+		const plan = planLaunchWorktree(repo, { enabled: true, detached: false, name: "deadline-dirty" });
+		expect(plan.enabled).toBe(true);
+		if (!plan.enabled) throw new Error("expected an enabled worktree plan");
+		let reads = 0;
+
+		await expect(
+			ensureLaunchWorktreeCancellable(plan, {
+				deadlineAt: 50,
+				now: () => {
+					reads += 1;
+					if (reads === 6) fsSync.writeFileSync(path.join(plan.worktreePath, "raced-user-file.txt"), "keep\n");
+					return reads < 6 ? 0 : 100;
+				},
+			}),
+		).rejects.toBeInstanceOf(Error);
+		expect(await Bun.file(path.join(plan.worktreePath, "raced-user-file.txt")).text()).toBe("keep\n");
+		expect(run("git", ["branch", "--list", plan.branchName ?? ""], repo)).toContain(plan.branchName ?? "");
+	});
+
+	it("retains raced ignored content instead of removing it as a clean worktree", async () => {
+		const repo = await createRepo("gjc-cancellable-ignored-");
+		fsSync.appendFileSync(path.join(repo, ".gitignore"), "/ignored-user-file.txt\n");
+		run("git", ["add", ".gitignore"], repo);
+		run("git", ["commit", "-m", "ignore generated user content"], repo);
+		const plan = planLaunchWorktree(repo, { enabled: true, detached: false, name: "deadline-ignored" });
+		expect(plan.enabled).toBe(true);
+		if (!plan.enabled) throw new Error("expected an enabled worktree plan");
+		let reads = 0;
+
+		await expect(
+			ensureLaunchWorktreeCancellable(plan, {
+				deadlineAt: 50,
+				now: () => {
+					reads += 1;
+					if (reads === 6) fsSync.writeFileSync(path.join(plan.worktreePath, "ignored-user-file.txt"), "keep\n");
+					return reads < 6 ? 0 : 100;
+				},
+			}),
+		).rejects.toBeInstanceOf(Error);
+		expect(await Bun.file(path.join(plan.worktreePath, "ignored-user-file.txt")).text()).toBe("keep\n");
+	});
+
+	it("retains a clean committed race instead of deleting its branch", async () => {
+		const repo = await createRepo("gjc-cancellable-commit-");
+		const plan = planLaunchWorktree(repo, { enabled: true, detached: false, name: "deadline-commit" });
+		expect(plan.enabled).toBe(true);
+		if (!plan.enabled) throw new Error("expected an enabled worktree plan");
+		let reads = 0;
+
+		await expect(
+			ensureLaunchWorktreeCancellable(plan, {
+				deadlineAt: 50,
+				now: () => {
+					reads += 1;
+					if (reads === 6) {
+						fsSync.writeFileSync(path.join(plan.worktreePath, "committed-user-file.txt"), "keep\n");
+						run("git", ["add", "committed-user-file.txt"], plan.worktreePath);
+						run("git", ["commit", "-m", "user work"], plan.worktreePath);
+					}
+					return reads < 6 ? 0 : 100;
+				},
+			}),
+		).rejects.toBeInstanceOf(Error);
+		expect(await Bun.file(path.join(plan.worktreePath, "committed-user-file.txt")).text()).toBe("keep\n");
+		expect(run("git", ["rev-parse", plan.branchName ?? ""], repo)).not.toBe(plan.baseRef);
+	});
+
+	it("retains a timed-out clean worktree for a pre-existing branch", async () => {
+		const repo = await createRepo("gjc-cancellable-existing-");
+		const sourceBranch = run("git", ["branch", "--show-current"], repo);
+		run("git", ["checkout", "-b", "deadline-existing"], repo);
+		fsSync.writeFileSync(path.join(repo, "existing.txt"), "existing\n");
+		run("git", ["add", "existing.txt"], repo);
+		run("git", ["commit", "-m", "existing branch"], repo);
+		const existingHead = run("git", ["rev-parse", "HEAD"], repo);
+		run("git", ["checkout", sourceBranch], repo);
+		const plan = planLaunchWorktree(repo, { enabled: true, detached: false, name: "deadline-existing" });
+		expect(plan.enabled).toBe(true);
+		if (!plan.enabled) throw new Error("expected an enabled worktree plan");
+		await expect(
+			ensureLaunchWorktreeCancellable(plan, {
+				deadlineAt: 5_000,
+				now: () => (fsSync.existsSync(plan.worktreePath) ? 10_000 : 0),
+			}),
+		).rejects.toBeInstanceOf(Error);
+		expect(fsSync.existsSync(plan.worktreePath)).toBe(true);
+		expect(run("git", ["rev-parse", "deadline-existing"], repo)).toBe(existingHead);
+	});
+
+	it("retains a detached worktree when a commit races timeout cleanup", async () => {
+		const repo = await createRepo("gjc-cancellable-detached-");
+		const plan = planLaunchWorktree(repo, { enabled: true, detached: true, name: null });
+		expect(plan.enabled).toBe(true);
+		if (!plan.enabled) throw new Error("expected an enabled worktree plan");
+		let reads = 0;
+
+		await expect(
+			ensureLaunchWorktreeCancellable(plan, {
+				deadlineAt: 50,
+				now: () => {
+					reads += 1;
+					if (reads === 6) {
+						fsSync.writeFileSync(path.join(plan.worktreePath, "detached-user-file.txt"), "keep\n");
+						run("git", ["add", "detached-user-file.txt"], plan.worktreePath);
+						run("git", ["commit", "-m", "detached user work"], plan.worktreePath);
+					}
+					return reads < 6 ? 0 : 100;
+				},
+			}),
+		).rejects.toBeInstanceOf(Error);
+		expect(await Bun.file(path.join(plan.worktreePath, "detached-user-file.txt")).text()).toBe("keep\n");
+		expect(run("git", ["rev-parse", "HEAD"], plan.worktreePath)).not.toBe(plan.baseRef);
 	});
 });

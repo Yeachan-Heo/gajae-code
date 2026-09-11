@@ -2,6 +2,7 @@ import { expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import {
+	DependencyPreparationTimeoutError,
 	ensureReusableNodeModules,
 	planLaunchWorktree,
 	WorktreePreparationTimeoutError,
@@ -179,6 +180,56 @@ test("RED B: worktree prep timeout does not spawn a child", async () => {
 	}
 }, 20_000);
 
+test("dependency prep timeout retains the created worktree and concurrent content", async () => {
+	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-prep-budget-retain-"));
+	const agentDir = path.join(root, "agent");
+	const broker = new Broker({ agentDir });
+	try {
+		const repo = await createRepo(root);
+		await fs.appendFile(path.join(repo, ".gitignore"), "/ignored-dependency.txt\n");
+		for (const args of [
+			["add", ".gitignore"],
+			["commit", "-m", "ignore dependency output"],
+		]) {
+			const result = Bun.spawnSync(["git", ...args], { cwd: repo, stdout: "pipe", stderr: "pipe" });
+			if (result.exitCode !== 0) throw new Error(result.stderr.toString());
+		}
+		const planned = planLaunchWorktree(repo, { enabled: true, detached: false, name: "dependency-timeout" });
+		if (!planned.enabled) throw new Error("expected worktree plan");
+		setEnsureReusableNodeModulesForTest(broker, async (_sourceRoot, worktreePath) => {
+			await fs.writeFile(path.join(worktreePath, "README"), "tracked change\n");
+			await fs.writeFile(path.join(worktreePath, "untracked-dependency.txt"), "untracked\n");
+			await fs.writeFile(path.join(worktreePath, "ignored-dependency.txt"), "ignored\n");
+			throw new DependencyPreparationTimeoutError();
+		});
+		await broker.start();
+
+		const response = await broker.handleRequest(
+			"session.create",
+			{
+				cwd: repo,
+				stateRoot: path.join(repo, ".gjc", "state"),
+				target: { worktree: { enabled: true, name: "dependency-timeout" } },
+				worktreePreparationTimeoutMs: 5_000,
+				dependencyPreparationTimeoutMs: 5_000,
+				readinessTimeoutMs: 4_000,
+			},
+			"prep-budget-retain",
+		);
+
+		expect(response).toMatchObject({ ok: false, error: { code: "dependency_preparation_timeout" } });
+		expect(await fs.readFile(path.join(planned.worktreePath, "README"), "utf8")).toBe("tracked change\n");
+		expect(await fs.readFile(path.join(planned.worktreePath, "untracked-dependency.txt"), "utf8")).toBe(
+			"untracked\n",
+		);
+		expect(await fs.readFile(path.join(planned.worktreePath, "ignored-dependency.txt"), "utf8")).toBe("ignored\n");
+	} finally {
+		setEnsureReusableNodeModulesForTest(broker, undefined);
+		await broker.stop();
+		await fs.rm(root, { recursive: true, force: true });
+	}
+}, 20_000);
+
 test("RED C: child readiness timeout is distinct from prep time", async () => {
 	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-prep-budget-c-"));
 	const agentDir = path.join(root, "agent");
@@ -263,8 +314,15 @@ test("worktreePlan plus supplied child 5-tuple is invalid_input", async () => {
 }, 20_000);
 test("dependency install failures redact TOKEN= values from the thrown message", async () => {
 	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-prep-secret-"));
+	const previousPath = process.env.PATH;
 	try {
 		const repo = await createRepo(root);
+		const fakeBin = path.join(root, "bin");
+		await fs.mkdir(fakeBin, { recursive: true });
+		const fakeNpm = path.join(fakeBin, "npm");
+		await fs.writeFile(fakeNpm, "#!/usr/bin/env bash\necho 'TOKEN=secret install failed' >&2\nexit 23\n");
+		await fs.chmod(fakeNpm, 0o755);
+		process.env.PATH = `${fakeBin}:${previousPath ?? ""}`;
 		await fs.writeFile(
 			path.join(repo, "package.json"),
 			JSON.stringify({
@@ -290,6 +348,8 @@ test("dependency install failures redact TOKEN= values from the thrown message",
 		expect(message).toContain("worktree_dependency");
 		expect(message).not.toMatch(/TOKEN=secret/i);
 	} finally {
+		if (previousPath === undefined) delete process.env.PATH;
+		else process.env.PATH = previousPath;
 		await fs.rm(root, { recursive: true, force: true });
 	}
 });
