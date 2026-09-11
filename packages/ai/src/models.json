@@ -64677,6 +64677,52 @@
 			"provider": "openai",
 			"baseUrl": ""
 		},
+		"gpt-image-2.5-flare": {
+			"id": "gpt-image-2.5-flare",
+			"name": "GPT Image 2.5 Flare",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"output": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 128000,
+			"maxTokens": 16384,
+			"api": "openai-responses",
+			"provider": "openai",
+			"baseUrl": ""
+		},
+		"gpt-image-2.5-sunburst": {
+			"id": "gpt-image-2.5-sunburst",
+			"name": "GPT Image 2.5 Sunburst",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"output": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 128000,
+			"maxTokens": 16384,
+			"api": "openai-responses",
+			"provider": "openai",
+			"baseUrl": ""
+		},
 		"gpt-realtime-2.1": {
 			"id": "gpt-realtime-2.1",
 			"name": "GPT-Realtime-2.1",
@@ -65528,6 +65574,52 @@
 		"gpt-image-2": {
 			"id": "gpt-image-2",
 			"name": "GPT Image 2",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"output": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 128000,
+			"maxTokens": 16384,
+			"api": "openai-codex-responses",
+			"provider": "openai-codex",
+			"baseUrl": ""
+		},
+		"gpt-image-2.5-flare": {
+			"id": "gpt-image-2.5-flare",
+			"name": "GPT Image 2.5 Flare",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"output": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 128000,
+			"maxTokens": 16384,
+			"api": "openai-codex-responses",
+			"provider": "openai-codex",
+			"baseUrl": ""
+		},
+		"gpt-image-2.5-sunburst": {
+			"id": "gpt-image-2.5-sunburst",
+			"name": "GPT Image 2.5 Sunburst",
 			"reasoning": false,
 			"input": [
 				"text"
