@@ -45,7 +45,7 @@ export type FileLockAcquireReason = "acquire_timeout" | "orphan_transition";
 export interface FileLockStaleRemovalFailure {
 	/** Guarded-removal outcome the acquire path can record, or `"error"` when the removal attempt threw. */
 	outcome: "cleanup_failed" | "error";
-	/** Transient native/errno code carried by the refusal, when one was present. */
+	/** Native/errno code carried by the refusal, when one was present. */
 	code?: string;
 	/** Human-readable cause surfaced to the operator at exhaustion. */
 	message: string;
@@ -1313,7 +1313,7 @@ async function removeStaleLockForAcquire(
 		// A removal refusal — transient or not — is not authority to fail or mutate by
 		// another path. Keep contending, because a concurrent reclaimer may already be
 		// completing the same dead generation, and record the cause so exhaustion
-		// reports *why* a dead owner's lock could not be retired instead of only
+		// reports *why* a dead owner's lock could not be reaped instead of only
 		// "dead but not reaped".
 		return {
 			removed: false,
