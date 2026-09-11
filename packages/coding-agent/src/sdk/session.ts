@@ -4733,7 +4733,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			mcpDiscoveryEnabled,
 			discoveryMode: effectiveDiscoveryMode,
 			initialSelectedMCPToolNames,
-			preserveUnavailableInitialMCPToolSelection: deferredExactMcpConfig !== undefined,
+			// Both deferral shapes register their tools only in the deferred starter,
+			// so the registry is empty at construction and persisted selections must be
+			// preserved verbatim until the starter publishes the real catalog.
+			preserveUnavailableInitialMCPToolSelection:
+				deferredExactMcpConfig !== undefined || deferredConventionalMcp !== undefined,
 			initialMCPToolSelectionIsExplicit: hasExplicitMCPToolSelection,
 			initialDiscoveredBuiltinToolSelectionIsExplicit: hasExplicitDiscoveredBuiltinToolSelection,
 			initialSelectedDiscoveredBuiltinToolNames,
@@ -5085,9 +5089,14 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 							);
 							const resultTools = result.tools as CustomTool[];
 							if (!cancelled && !session.isDisposed) {
+								// Register the deferred tools before wiring the reactive conventional-tool
+								// sync. The sync's initial publication calls replaceNamedCustomTools, which
+								// only re-activates a swapped tool that was already active; running it
+								// before this registration would therefore drop a persisted conventional
+								// MCP selection and persist the empty set.
+								await session.refreshMCPTools(resultTools);
 								wireOwnedConventionalToolSync();
 								wireOwnedMcpManagerLifecycle();
-								await session.refreshMCPTools(resultTools);
 								if (
 									!session.isDisposed &&
 									(!mcpDiscoveryEnabled || !existingSession.hasPersistedMCPToolSelection)
@@ -5111,7 +5120,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						return { loadedToolCount: cancelled || session.isDisposed ? 0 : loadedToolCount, hasErrors };
 					} catch {
 						const startupError = new Error(DEFERRED_MCP_CONFIG_STARTUP_ERROR);
-						deferredMcpTurnReady?.reject(startupError);
+						// Report the failure through this promise (the caller surfaces the MCP
+						// error), but release the startup turn barrier: rejecting it would leave
+						// it installed forever, so every later prompt would await a rejected
+						// barrier and the interactive session would be unusable.
+						deferredMcpTurnReady?.resolve();
 						await deferredExactMcpConfig?.manager.disconnectAll().catch(() => {});
 						await deferredConventionalMcp?.manager.disconnectAll().catch(() => {});
 						throw startupError;

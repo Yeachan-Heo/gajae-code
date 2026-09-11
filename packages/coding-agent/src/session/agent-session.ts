@@ -948,7 +948,7 @@ export interface AgentSessionConfig {
 	discoveryMode?: "off" | "mcp-only" | "all";
 	/** MCP tool names to activate for the current session when discovery mode is enabled. */
 	initialSelectedMCPToolNames?: string[];
-	/** Keep persisted MCP names until a deferred exact catalog becomes available. */
+	/** Keep persisted MCP names until a deferred (exact or conventional) catalog becomes available. */
 	preserveUnavailableInitialMCPToolSelection?: boolean;
 	/** Built-in discoverable tool names restored for the current all-discovery session. */
 	initialSelectedDiscoveredBuiltinToolNames?: string[];
