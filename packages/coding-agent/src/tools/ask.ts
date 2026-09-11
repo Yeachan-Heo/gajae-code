@@ -892,6 +892,7 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 		q: AskParams["questions"][number],
 		selectedOptions: string[],
 		customInput: string | undefined,
+		toolCallId: string,
 		executionGateId?: string,
 		executionPresentation?: ExecutionApprovalPresentation,
 	): Promise<void> {
@@ -912,6 +913,8 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 			return;
 		}
 		if (!sessionId) throw new ToolAbortError("Deep Interview execution approval requires a session");
+		if (!executionPresentation)
+			throw new ToolAbortError("Execution approval publication could not be authenticated before consent");
 		const approvalStage = ralplanApproval ? "ralplan" : "deep-interview";
 		const lineage = await executionApprovalLineage(this.session.cwd, sessionId, approvalStage);
 		const transcriptEvidence =
@@ -925,6 +928,7 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 			sessionId,
 			questionId: q.id,
 			gateId: executionGateId ?? q.id,
+			toolCallId,
 			target,
 			selectedOptions,
 			transcriptPath: transcriptEvidence.transcriptPath,
@@ -1313,6 +1317,9 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 			const recommended = validRecommendedIndex(q.recommended, rawOptionLabels.length);
 			const questionIndex = params.questions.indexOf(q);
 			const emptyCustomAttempt = options?.emptyCustomAttempt ?? 0;
+			const isExecutionApprovalQuestion =
+				(q.workflowGate?.stage === "deep-interview" && q.workflowGate.kind === "execution") ||
+				(q.workflowGate?.stage === "ralplan" && q.workflowGate.kind === "approval");
 			// Route headless asks through the SDK workflow-gate emitter; a connected
 			// SDK responder supplies the durable answer instead of an interactive UI.
 			if (gateEmitter && canUseWorkflowGate) {
@@ -1327,28 +1334,25 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 					allowEmpty: q.multi === true && params.questions.length > 1,
 					navigationLabel: questionIndex === params.questions.length - 1 ? "Done" : "Next",
 				};
-				let executionGateId: string | undefined =
-					q.workflowGate?.kind === "execution" ||
-					(q.workflowGate?.stage === "ralplan" && q.workflowGate.kind === "approval")
-						? `interactive-${randomUUID()}`
-						: undefined;
+				let executionGateId: string | undefined = isExecutionApprovalQuestion
+					? `interactive-${randomUUID()}`
+					: undefined;
 				let executionPresentation: ExecutionApprovalPresentation | undefined;
-				if (
-					q.workflowGate?.kind === "execution" ||
-					(q.workflowGate?.stage === "ralplan" && q.workflowGate.kind === "approval")
-				) {
+				if (isExecutionApprovalQuestion) {
 					const sessionId = this.session.getSessionId?.();
-					if (sessionId && q.workflowGate.stage !== "ultragoal") {
-						try {
-							executionPresentation = await captureExecutionApprovalPresentation(
-								this.session.cwd,
-								sessionId,
-								q.workflowGate.stage,
-							);
-						} catch {
-							// The approval recorder still performs its authoritative state check;
-							// headless prompts may be emitted before a state publication exists.
-						}
+					if (!sessionId) throw new ToolAbortError("Execution approval requires a session");
+					try {
+						executionPresentation = await captureExecutionApprovalPresentation(
+							this.session.cwd,
+							sessionId,
+							q.workflowGate?.stage === "ralplan" ? "ralplan" : "deep-interview",
+						);
+					} catch (error) {
+						throw new ToolAbortError(
+							error instanceof Error
+								? `Execution approval publication could not be authenticated: ${error.message}`
+								: "Execution approval publication could not be authenticated",
+						);
 					}
 				}
 				const stopGateObservation = gateEmitter.onGateEmitted?.(gate => {
@@ -1383,20 +1387,26 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 			}
 			try {
 				let executionPresentation: ExecutionApprovalPresentation | undefined;
-				if (
-					q.workflowGate?.kind === "execution" ||
-					(q.workflowGate?.stage === "ralplan" && q.workflowGate.kind === "approval")
-				) {
+				if (isExecutionApprovalQuestion) {
+					const sessionId = this.session.getSessionId?.();
+					if (!sessionId) throw new ToolAbortError("Execution approval requires a session");
 					try {
 						executionPresentation = await captureExecutionApprovalPresentation(
 							this.session.cwd,
-							this.session.getSessionId?.() ?? "",
-							q.workflowGate.stage === "ultragoal" ? "deep-interview" : q.workflowGate.stage,
+							sessionId,
+							q.workflowGate?.stage === "ralplan" ? "ralplan" : "deep-interview",
 						);
-					} catch {
-						// See the headless path above: publication is checked when recording.
+					} catch (error) {
+						throw new ToolAbortError(
+							error instanceof Error
+								? `Execution approval publication could not be authenticated: ${error.message}`
+								: "Execution approval publication could not be authenticated",
+						);
 					}
 				}
+				const executionGateId: string | undefined = isExecutionApprovalQuestion
+					? `interactive-${randomUUID()}`
+					: undefined;
 				const deepInterviewPrompt = formatDeepInterviewSelectorPrompt(q.question);
 				const isDeepInterviewQuestion = deepInterviewPrompt !== null || q.deepInterview !== undefined;
 				const baseDisplayQuestion = deepInterviewPrompt ?? q.question;
@@ -1554,6 +1564,8 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 					selectedOptions,
 					customInput,
 					clarificationQuestion,
+					executionGateId,
+					executionPresentation,
 					navigation,
 					cancelled,
 					timedOut,
@@ -1606,6 +1618,7 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 				q,
 				selectedOptions,
 				customInput,
+				_toolCallId,
 				executionGateId,
 				executionPresentation,
 			);
@@ -1724,6 +1737,7 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 				params.questions[index]!,
 				result.selectedOptions,
 				result.customInput,
+				_toolCallId,
 				executionGateIdsByIndex[index],
 				executionPresentationsByIndex[index],
 			);

@@ -2353,12 +2353,15 @@ export async function recordNonCrystalExecutionApproval(options: {
 	selectedOptions: string[];
 	transcriptPath: string;
 	transcriptSha256: string;
-	presentation?: ExecutionApprovalPresentation;
+	toolCallId: string;
+	presentation: ExecutionApprovalPresentation;
 }): Promise<void> {
 	const { cwd, sessionId, approvalStage: stage } = options;
 	if (
 		!isExecutionApprovalId(options.questionId) ||
 		!isExecutionApprovalId(options.gateId) ||
+		!isExecutionApprovalId(options.toolCallId) ||
+		!options.presentation ||
 		options.target !== "ultragoal" ||
 		options.selectedOptions.length !== 1
 	)
@@ -2401,7 +2404,7 @@ export async function recordNonCrystalExecutionApproval(options: {
 							sessionId,
 							options.transcriptPath,
 							options.transcriptSha256,
-							options.questionId,
+							options.toolCallId,
 						),
 						created_at: nowIso(),
 						expires_at: new Date(Date.now() + DEEP_INTERVIEW_EXECUTION_APPROVAL_MAX_AGE_MS).toISOString(),
@@ -2741,12 +2744,18 @@ export async function recordDeepInterviewExecutionApproval(options: {
 	customInput?: string;
 	transcriptPath: string;
 	transcriptSha256: string;
+	toolCallId: string;
 	approvalStage?: "deep-interview" | "ralplan";
-	presentation?: ExecutionApprovalPresentation;
+	presentation: ExecutionApprovalPresentation;
 }): Promise<{ path: string; record: DeepInterviewExecutionApprovalRecord }> {
 	if (options.target !== "ultragoal")
 		throw new StateCommandError(2, "deep-interview execution approval target must be ultragoal");
-	if (!isExecutionApprovalId(options.sessionId) || !isExecutionApprovalId(options.questionId))
+	if (
+		!isExecutionApprovalId(options.sessionId) ||
+		!isExecutionApprovalId(options.questionId) ||
+		!isExecutionApprovalId(options.toolCallId) ||
+		!options.presentation
+	)
 		throw new StateCommandError(2, "deep-interview execution approval descriptor is invalid");
 	if (
 		!Array.isArray(options.selectedOptions) ||
@@ -2882,7 +2891,7 @@ export async function recordDeepInterviewExecutionApproval(options: {
 					options.sessionId,
 					options.transcriptPath,
 					options.transcriptSha256,
-					options.questionId,
+					options.toolCallId,
 				),
 				approval_stage: options.approvalStage ?? "deep-interview",
 				...(ralplanFinal

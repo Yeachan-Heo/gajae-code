@@ -14,7 +14,10 @@ import {
 	runNativeDeepInterviewCommand,
 } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-runtime";
 import { sessionSpecsDir } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
-import { recordDeepInterviewExecutionApproval } from "@gajae-code/coding-agent/gjc-runtime/state-runtime";
+import {
+	captureExecutionApprovalPresentation,
+	recordDeepInterviewExecutionApproval,
+} from "@gajae-code/coding-agent/gjc-runtime/state-runtime";
 import {
 	beginWorkflowTransactionJournal,
 	readWorkflowTransactionJournal,
@@ -2936,10 +2939,12 @@ describe("deep-interview crystallize contract", () => {
 				sessionId,
 				questionId: "crystallize-execution",
 				gateId: "crystallize-execution",
+				toolCallId: "provider-crystallize-execution",
 				target: "ultragoal",
 				selectedOptions: ["Approve execution via ultragoal"],
 				transcriptPath: sessionFile,
 				transcriptSha256: createHash("sha256").update(approvalTranscript).digest("hex"),
+				presentation: await captureExecutionApprovalPresentation(root, sessionId, "deep-interview"),
 			});
 			const approved = await runNativeDeepInterviewCommand(
 				["approve-execution", "--session-id", sessionId, "--json"],
@@ -3120,6 +3125,14 @@ describe("deep-interview crystallize contract", () => {
 	it("rejects a context-free affirmative as a confirmed requirement", () => {
 		const value = singleGoalEvidence("Yes", "Yes");
 		expect(() => crystallizeDeepInterview(value)).toThrow("verbatim user anchor");
+	});
+
+	it("rejects context-free acknowledgements as confirmed requirements", () => {
+		for (const acknowledgement of ["No", "Done", "Confirmed", "Absolutely", "Sounds good", "true", "false"]) {
+			expect(() => crystallizeDeepInterview(singleGoalEvidence(acknowledgement, acknowledgement))).toThrow(
+				"verbatim user anchor",
+			);
+		}
 	});
 
 	it("rejects a root-level forged project transcript through GJC_SESSION_FILE", async () => {

@@ -33,6 +33,7 @@ import { CURRENT_SESSION_VERSION, SessionManager } from "@gajae-code/coding-agen
 import { AskTool } from "@gajae-code/coding-agent/tools/ask";
 import { migrateAndPersistLegacyState } from "../../src/gjc-runtime/state-migrations";
 import {
+	captureExecutionApprovalPresentation,
 	deepInterviewExecutionApprovalRecordPath,
 	reconcileWorkflowSkillState,
 	recordDeepInterviewExecutionApproval,
@@ -261,11 +262,13 @@ async function recordExecutionApproval(
 		sessionId: TEST_SESSION_ID,
 		questionId,
 		gateId: questionId,
+		toolCallId: questionId,
 		target: "ultragoal",
 		selectedOptions: ["Approve execution via ultragoal"],
 		transcriptPath,
 		transcriptSha256: createHash("sha256").update(transcript).digest("hex"),
 		approvalStage,
+		presentation: await captureExecutionApprovalPresentation(cwd, TEST_SESSION_ID, approvalStage),
 	});
 }
 
@@ -355,6 +358,7 @@ async function askAndPersistExecutionApproval(
 	stage: "deep-interview" | "ralplan" = "deep-interview",
 ): Promise<void> {
 	const label = "Approve execution via ultragoal";
+	const toolCallId = `provider-${questionId}`;
 	const args = {
 		questions: [
 			{
@@ -369,7 +373,7 @@ async function askAndPersistExecutionApproval(
 		],
 	};
 	manager.appendMessage(
-		persistedApprovalAssistant([{ type: "toolCall", id: questionId, name: "ask", arguments: args }]),
+		persistedApprovalAssistant([{ type: "toolCall", id: toolCallId, name: "ask", arguments: args }]),
 	);
 	await manager.flush();
 	const tool = new AskTool({
@@ -381,10 +385,10 @@ async function askAndPersistExecutionApproval(
 		getSessionSpawns: () => "*",
 	});
 	const context = { hasUI: true, ui: { select: async () => label }, abort: () => {} } as unknown as AgentToolContext;
-	const result = await tool.execute(questionId, args, undefined, undefined, context);
+	const result = await tool.execute(toolCallId, args, undefined, undefined, context);
 	manager.appendMessage({
 		role: "toolResult",
-		toolCallId: questionId,
+		toolCallId,
 		toolName: "ask",
 		content: result.content,
 		details: result.details,
@@ -416,6 +420,9 @@ describe("gjc state handoff", () => {
 			const pending = (await readJson(recordPath))!;
 			expect(pending.status).toBe("pending");
 			expect(pending.transcript_path).toBe(transcriptPath);
+			expect((pending.transcript_boundary as { approval_tool_call_id?: string }).approval_tool_call_id).toBe(
+				"provider-persisted-ask-v1",
+			);
 			expect(
 				createHash("sha256")
 					.update(await Bun.file(transcriptPath).text())

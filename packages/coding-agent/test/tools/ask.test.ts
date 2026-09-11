@@ -2758,6 +2758,13 @@ describe("AskTool deep-interview recorder persistence", () => {
 	});
 
 	it("preserves a foreign workflow answer without writing its deep-interview metadata", async () => {
+		spyOn(stateRuntime, "captureExecutionApprovalPresentation").mockResolvedValue({
+			state_path: "/tmp/foreign-state.json",
+			state_revision: 1,
+			artifact_path: "/tmp/foreign-artifact.md",
+			artifact_sha256: "b".repeat(64),
+			run_id: null,
+		});
 		const recorder = spyOn(deepInterviewRecorder, "appendOrMergeDeepInterviewRound");
 		const tool = new AskTool(
 			createSession({ getSessionId: () => "session-ask", getDeepInterviewAskStage: () => "post-topology" }),
@@ -2890,6 +2897,13 @@ describe("AskTool deep-interview recorder persistence", () => {
 		expect(recorder).not.toHaveBeenCalled();
 	});
 	it("does not auto-select a ralplan approval gate on ask timeout", async () => {
+		spyOn(stateRuntime, "captureExecutionApprovalPresentation").mockResolvedValue({
+			state_path: "/tmp/timeout-state.json",
+			state_revision: 1,
+			artifact_path: "/tmp/timeout-artifact.md",
+			artifact_sha256: "b".repeat(64),
+			run_id: null,
+		});
 		const tool = new AskTool(
 			createSession({
 				settings: Settings.isolated({ "ask.timeout": 0.001 }),
@@ -2954,6 +2968,13 @@ describe("AskTool deep-interview recorder persistence", () => {
 
 	it("mints execution approval only from an accepted structured user choice", async () => {
 		spyOn(stateRuntime, "executionApprovalLineage").mockResolvedValue("crystal");
+		spyOn(stateRuntime, "captureExecutionApprovalPresentation").mockResolvedValue({
+			state_path: "/tmp/approval-state.json",
+			state_revision: 1,
+			artifact_path: "/tmp/approval-spec.md",
+			artifact_sha256: "b".repeat(64),
+			run_id: null,
+		});
 		spyOn(stateRuntime, "revokeNonCrystalExecutionApproval").mockResolvedValue();
 		spyOn(deepInterviewRuntime, "assertDeepInterviewCrystalCoversLiveTranscript").mockResolvedValue({
 			transcriptPath: "/tmp/session.jsonl",
@@ -2990,6 +3011,8 @@ describe("AskTool deep-interview recorder persistence", () => {
 			questionId: "deep-interview-execution",
 			target: "ultragoal",
 		});
+		const localGateId = record.mock.calls[0]?.[0].gateId;
+		expect(localGateId).not.toBe("deep-interview-execution");
 
 		record.mockClear();
 		const emitter = {
@@ -3014,6 +3037,8 @@ describe("AskTool deep-interview recorder persistence", () => {
 			questionId: "deep-interview-execution",
 			target: "ultragoal",
 		});
+		expect(record.mock.calls[0]?.[0].gateId).not.toBe("deep-interview-execution");
+		expect(record.mock.calls[0]?.[0].gateId).not.toBe(localGateId);
 		record.mockClear();
 		const documentedLabel =
 			"Execute with ultragoal (only when spec is already implementation-ready and really simple)";
@@ -3047,7 +3072,47 @@ describe("AskTool deep-interview recorder persistence", () => {
 		expect(revoke).toHaveBeenCalledWith("/tmp/approval-decline", "approval-decline");
 	});
 
+	it("aborts approval when publication capture fails", async () => {
+		spyOn(stateRuntime, "captureExecutionApprovalPresentation").mockRejectedValue(
+			new Error("publication changed while awaiting consent"),
+		);
+		const record = spyOn(stateRuntime, "recordDeepInterviewExecutionApproval").mockResolvedValue({
+			path: "/tmp/should-not-record.json",
+			record: {
+				transcript_boundary: { byte_length: 1, device: "1", inode: "1", leaf_id: null },
+			} as DeepInterviewExecutionApprovalRecord,
+		});
+		await expect(
+			new AskTool(
+				createSession({ cwd: "/tmp/approval-capture-failure", getSessionId: () => "capture-failure" }),
+			).execute(
+				"capture-failure-call",
+				{
+					questions: [
+						{
+							id: "capture-failure-question",
+							question: "Approve the published specification?",
+							options: [{ label: "Execute with ultragoal" }, { label: "Stop here" }],
+							workflowGate: { stage: "deep-interview", kind: "execution" },
+						},
+					],
+				},
+				undefined,
+				undefined,
+				createContext({ select: async () => "Execute with ultragoal" }),
+			),
+		).rejects.toThrow("publication could not be authenticated");
+		expect(record).not.toHaveBeenCalled();
+	});
+
 	it("does not mint execution approval after a multi-question choice is revised", async () => {
+		spyOn(stateRuntime, "captureExecutionApprovalPresentation").mockResolvedValue({
+			state_path: "/tmp/revised-state.json",
+			state_revision: 1,
+			artifact_path: "/tmp/revised-artifact.md",
+			artifact_sha256: "b".repeat(64),
+			run_id: null,
+		});
 		const record = spyOn(stateRuntime, "recordDeepInterviewExecutionApproval").mockResolvedValue({
 			path: "/tmp/deep-interview-execution-approval.json",
 			record: {
@@ -3413,6 +3478,13 @@ describe("AskTool deep-interview recorder persistence", () => {
 	});
 
 	it("emits deep-interview question gates by default and honors ralplan approval overrides", async () => {
+		spyOn(stateRuntime, "captureExecutionApprovalPresentation").mockResolvedValue({
+			state_path: "/tmp/gate-state.json",
+			state_revision: 1,
+			artifact_path: "/tmp/gate-artifact.md",
+			artifact_sha256: "b".repeat(64),
+			run_id: null,
+		});
 		const defaultGateEmitter = {
 			supportsRemoteGateAnswers: () => true,
 			emitGate: vi.fn(async () => ({ selected: ["Budget"] })),
