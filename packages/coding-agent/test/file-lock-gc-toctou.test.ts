@@ -1949,7 +1949,7 @@ describe("withFileLock stale-removal diagnostics (#5434)", () => {
 			code: "acquire_timeout",
 			removalFailure: { outcome: "cleanup_failed" },
 		});
-		await expect(attempt).rejects.toThrow(/could not be retired on this host/);
+		await expect(attempt).rejects.toThrow(/could not be reaped on this host/);
 	});
 
 	test("surfaces the native refusal code when strict removal is refused", async () => {
@@ -1971,24 +1971,25 @@ describe("withFileLock stale-removal diagnostics (#5434)", () => {
 		await expect(attempt).rejects.toThrow(/Failed to remove file lock tree: sharing_violation/);
 	});
 
-	test("propagates an unexpected removal failure instead of hiding it behind the timeout", async () => {
+	test("reports a non-transient removal failure as the removal cause", async () => {
 		const root = await makeTemp();
 		const file = path.join(root, "index.jsonl");
 		const lockDir = `${file}.lock`;
 		await writeInfo(lockDir, { pid: DEAD_PID, timestamp: Date.now() - 60_000 });
-		FileLockTestHooks.nativeExactRemovalProbe = () => true;
+		FileLockTestHooks.nativeExactRemovalProbe = () => false;
 		FileLockTestHooks.nativeQuarantineBindings = () => ({
-			snapshotDirectoryTree: () => {
-				throw new Error("native snapshot exploded");
-			},
+			snapshotDirectoryTree,
 			exactRemoveDirectoryTree: () => {
-				throw new Error("must not be reached");
+				throw Object.assign(new Error("lock tree removal is broken"), { code: "EIO" });
 			},
 		});
 
-		await expect(withFileLock(file, async () => undefined, { retries: 3, retryDelayMs: 1 })).rejects.toThrow(
-			"native snapshot exploded",
-		);
+		const attempt = withFileLock(file, async () => undefined, { retries: 3, retryDelayMs: 1 });
+		await expect(attempt).rejects.toMatchObject({
+			code: "acquire_timeout",
+			removalFailure: { outcome: "error", code: "EIO" },
+		});
+		await expect(attempt).rejects.toThrow(/lock tree removal is broken/);
 	});
 
 	test("does not pin an earlier refusal onto a live successor generation", async () => {
@@ -2029,6 +2030,51 @@ describe("withFileLock stale-removal diagnostics (#5434)", () => {
 		expect(lockError.code).toBe("acquire_timeout");
 		expect(lockError.holder).toContain("(live)");
 		expect(lockError.removalFailure).toBeUndefined();
-		expect(lockError.message).not.toContain("could not be retired");
+		expect(lockError.message).not.toContain("could not be reaped");
+	});
+
+	test("drops a recorded refusal when a live successor takes over during the final retry sleep", async () => {
+		const root = await makeTemp();
+		const file = path.join(root, "index.jsonl");
+		const lockDir = `${file}.lock`;
+		await writeInfo(lockDir, { pid: DEAD_PID, timestamp: Date.now() - 60_000 });
+		const retries = 3;
+		FileLockTestHooks.nativeExactRemovalProbe = () => false;
+		FileLockTestHooks.nativeQuarantineBindings = () => ({
+			snapshotDirectoryTree,
+			exactRemoveDirectoryTree: () => ({ ok: false, code: "sharing_violation" }),
+		});
+		// Publish a live successor after the loop's final snapshot, so only the
+		// exhaustion-time generation re-read can keep the refusal off the message.
+		const realSleep = Bun.sleep;
+		let sleeps = 0;
+		vi.spyOn(Bun, "sleep").mockImplementation((async (ms?: number) => {
+			sleeps++;
+			if (sleeps === retries) {
+				rmSync(lockDir, { recursive: true, force: true });
+				mkdirSync(lockDir);
+				writeFileSync(
+					path.join(lockDir, "info"),
+					JSON.stringify({
+						pid: process.pid,
+						start_time: processStartTime(process.pid),
+						timestamp: Date.now(),
+					}),
+				);
+			}
+			return await realSleep(ms ?? 0);
+		}) as typeof Bun.sleep);
+
+		let observed: unknown;
+		try {
+			await withFileLock(file, async () => undefined, { retries, retryDelayMs: 1 });
+		} catch (error) {
+			observed = error;
+		}
+		expect(observed).toBeInstanceOf(FileLockAcquireError);
+		const lockError = observed as FileLockAcquireError;
+		expect(lockError.holder).toContain("(live)");
+		expect(lockError.removalFailure).toBeUndefined();
+		expect(lockError.message).not.toContain("could not be reaped");
 	});
 });

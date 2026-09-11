@@ -44,7 +44,7 @@ export type FileLockAcquireReason = "acquire_timeout" | "orphan_transition";
  */
 export interface FileLockStaleRemovalFailure {
 	/** Guarded-removal outcome, or `"error"` when the removal attempt threw. */
-	outcome: FileLockGcRemoval | "error";
+	outcome: Exclude<FileLockGcRemoval, "removed"> | "error";
 	/** Transient native/errno code carried by the refusal, when one was present. */
 	code?: string;
 	/** Human-readable cause surfaced to the operator at exhaustion. */
@@ -65,9 +65,9 @@ export class FileLockAcquireError extends Error {
 	) {
 		const detail = reason === "orphan_transition" && orphanPath ? `orphan_transition at ${orphanPath}` : holder;
 		const removalDetail = removalFailure
-			? ` The stale lock directory could not be retired on this host (${removalFailure.message}${
+			? ` The dead owner's lock directory could not be reaped on this host (${removalFailure.message}${
 					removalFailure.code ? ` [${removalFailure.code}]` : ""
-				}); the removal path refused it, so this is not a live or unreaped owner`
+				})`
 			: "";
 		super(
 			`Failed to acquire lock for ${filePath} after ${attempts} attempts: ${detail}${removalDetail} (${lockPath}); ` +
@@ -1310,12 +1310,11 @@ async function removeStaleLockForAcquire(
 			},
 		};
 	} catch (error) {
-		// A transient refusal is not authority to fail or mutate by another path: keep
-		// contending, because a concurrent reclaimer may already be completing the same
-		// dead generation. Record the cause so exhaustion reports *why* a dead owner's
-		// lock could not be retired instead of only "dead but not reaped". Anything
-		// else is an unexpected removal failure and must not hide behind the timeout.
-		if (!isTransientReleaseError(error)) throw error;
+		// A removal refusal — transient or not — is not authority to fail or mutate by
+		// another path. Keep contending, because a concurrent reclaimer may already be
+		// completing the same dead generation, and record the cause so exhaustion
+		// reports *why* a dead owner's lock could not be retired instead of only
+		// "dead but not reaped".
 		return {
 			removed: false,
 			failure: {
