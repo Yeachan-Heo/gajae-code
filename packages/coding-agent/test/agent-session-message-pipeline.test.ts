@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
-import { Agent, type AgentMessage } from "@gajae-code/agent-core";
+import { Agent, type AgentMessage, isNonDispatchedToolEvent, markNonDispatchedToolEvent } from "@gajae-code/agent-core";
 import type { Message, Model, SimpleStreamOptions } from "@gajae-code/ai";
 import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
@@ -727,6 +727,50 @@ describe("AgentSession message pipeline", () => {
 		await Bun.sleep(0);
 
 		expect(extensionCalls).toEqual(["agent_start", "message_update:one", "message_update:two"]);
+	});
+
+	it("preserves non-dispatched tool provenance through extension event conversion", async () => {
+		const emitted: Array<{ type: string } & Record<string, unknown>> = [];
+		const session = new AgentSession({
+			agent: createAgent(),
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated({ "compaction.enabled": false }),
+			modelRegistry: testModelRegistry as never,
+			extensionRunner: {
+				emit: vi.fn(async (event: { type: string } & Record<string, unknown>) => {
+					emitted.push(event);
+				}),
+				hasHandlers: (eventType: string) =>
+					eventType === "tool_execution_start" || eventType === "tool_execution_end",
+			} as never,
+		});
+		sessions.push(session);
+
+		const sourceStart = {
+			type: "tool_execution_start",
+			toolCallId: "synthetic-call",
+			toolName: "read",
+			args: {},
+		};
+		const sourceEnd = {
+			type: "tool_execution_end",
+			toolCallId: "synthetic-call",
+			toolName: "read",
+			result: { content: "not dispatched" },
+			isError: true,
+		};
+		markNonDispatchedToolEvent(sourceStart);
+		markNonDispatchedToolEvent(sourceEnd);
+		session.agent.emitExternalEvent(sourceStart as never);
+		session.agent.emitExternalEvent(sourceEnd as never);
+		await Bun.sleep(0);
+		await Bun.sleep(0);
+
+		const converted = emitted.filter(
+			event => event.type === "tool_execution_start" || event.type === "tool_execution_end",
+		);
+		expect(converted).toHaveLength(2);
+		expect(converted.every(event => isNonDispatchedToolEvent(event))).toBe(true);
 	});
 
 	it("red-team: subscribers see identical ordering through interleaved message and tool events", async () => {

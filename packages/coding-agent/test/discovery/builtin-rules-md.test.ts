@@ -122,6 +122,19 @@ test("user RULES.md does not follow a symlink outside the selected agent directo
 	expect(rules.find(rule => rule._source.level === "user" && rule.name === "RULES")).toBeUndefined();
 });
 
+test("user RULES.md follows a symlink that remains inside the selected agent directory", async () => {
+	const agentDir = path.join(home, ".gjc", "agent");
+	const target = path.join(agentDir, "managed-RULES.md");
+	writeFile(target, "Managed rule.\n");
+	fs.symlinkSync(target, path.join(agentDir, "RULES.md"), "file");
+
+	const rules = await loadNativeRules({ cwd: project, home, repoRoot: project });
+
+	expect(rules.find(rule => rule._source.level === "user" && rule.name === "RULES")?.content).toContain(
+		"Managed rule.",
+	);
+});
+
 test("absent RULES.md does not produce a rule", async () => {
 	// No RULES.md anywhere — only a sibling .gjc/rules/ to make sure the directory exists.
 	writeFile(path.join(home, ".gjc", "agent", "rules", "other.md"), "# Unrelated rule\n");

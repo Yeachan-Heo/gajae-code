@@ -148,7 +148,7 @@ Stdout and stderr are merged before the model sees them. Non-zero exit codes are
   - `grep|rg|ripgrep|ag|ack` -> `search`
   - `find|fd|locate` with name/type/glob flags -> `find`
   - `sed -i`, `perl -i`, `awk -i inplace` -> `edit`
-  - `echo|printf|cat <<` with redirection -> `write`
+  - `echo|printf|cat <<` with an output redirection of its own -> `write`. The redirection is only attributed to that leading command, so a redirection after `;`, `&&`, `||`, or `|` does not match, and fd redirections such as `2>/dev/null` are not treated as file writes.
 - PTY mode is ignored in non-UI contexts and when `GJC_NO_PTY=1`; the tool silently falls back to non-PTY execution.
 - Non-PTY runs merge `NON_INTERACTIVE_ENV` with `env`; PTY runs also prepend `NON_INTERACTIVE_ENV` before custom env values.
 - When the shell minimizer rewrites output inside `executeBash()`, the visible output is replaced with minimized text and a `[raw output: artifact://<id>]` footer may be appended if `onMinimizedSave` persisted the original text.

@@ -45,6 +45,8 @@ find_tarball() {
 	echo "${matches[0]}"
 }
 
+section "Installer binary upgrade regressions"
+bun test scripts/install-tests/install-sh-binary-upgrade.test.ts
 section "Binary install smoke"
 bun --cwd=packages/natives run build
 bun --cwd=packages/coding-agent run build

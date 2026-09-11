@@ -815,7 +815,12 @@ function managedRetryableFailure(failure: unknown): boolean {
 	// caller is not authorized to make, and the credential-mutating consumers
 	// downstream would block healthy credentials on the way.
 	if (trigger.class === "auth") return trigger.authDisposition !== "forbidden";
-	return trigger.class === "rate_limit" || trigger.class === "quota" || trigger.class === "server";
+	return (
+		trigger.class === "rate_limit" ||
+		trigger.class === "quota" ||
+		trigger.class === "credential" ||
+		trigger.class === "server"
+	);
 }
 
 function promoteTypedEmptyResponseStop(message: AssistantMessage): void {
@@ -2027,6 +2032,7 @@ function losslessDetachedClone<T>(value: T): T {
 						"providerCode",
 						"openaiErrorCode",
 						"anthropicErrorType",
+						"credentialModelUnavailable",
 						"retryAfterMs",
 						"headers",
 					] as const) {
@@ -4877,13 +4883,11 @@ async function streamAssistantResponse(
 									message: { ...partialMessage },
 									scope,
 								});
-								// Preserve ordinary text streaming. Once visible text is
-								// published, this response can no longer be silently resampled;
-								// a later escaped tool call therefore falls through to the
-								// existing terminal per-call rejection instead.
-								if (event.type === "text_start" || event.type === "text_delta" || event.type === "text_end") {
-									provisionalToolTransaction?.commitCallbacksAndUpdates();
-								}
+								// Publish unmanaged content as it arrives, including reasoning and
+								// tool arguments. Publication does not accept or execute tools:
+								// terminal validation and the consumer drain still precede dispatch.
+								// A published escaped call is rejected rather than silently resampled.
+								provisionalToolTransaction?.commitCallbacksAndUpdates();
 							}
 							break;
 

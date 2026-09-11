@@ -102,6 +102,45 @@ describe("AgentSession deep-interview continuation", () => {
 			.filter(content => content.includes("goal is still active and uncleared"));
 	}
 
+	it("schedules one wake for an empty non-admitted steer fallback", async () => {
+		const wake = Promise.withResolvers<void>();
+		const continueQueuedSpy = vi.spyOn(session.agent, "continueQueuedMessages").mockImplementation(async () => {
+			wake.resolve();
+		});
+		session.agent.appendMessage({ ...createAssistantMessage("assistant tail"), timestamp: 1 });
+		let isStreaming = true;
+		Object.defineProperty(session, "isStreaming", { configurable: true, get: () => isStreaming });
+
+		await session.steer("empty fallback");
+		await wake.promise;
+		isStreaming = false;
+
+		expect(continueQueuedSpy).toHaveBeenCalledTimes(1);
+	});
+
+	it("keeps one wake for a later steer when a follow-up queue is already nonempty", async () => {
+		const firstWake = Promise.withResolvers<void>();
+		const secondWake = Promise.withResolvers<void>();
+		let wakeCount = 0;
+		const continueQueuedSpy = vi.spyOn(session.agent, "continueQueuedMessages").mockImplementation(async () => {
+			wakeCount++;
+			if (wakeCount === 1) firstWake.resolve();
+			if (wakeCount === 2) secondWake.resolve();
+		});
+		session.agent.appendMessage({ ...createAssistantMessage("assistant tail"), timestamp: 1 });
+		let isStreaming = true;
+		Object.defineProperty(session, "isStreaming", { configurable: true, get: () => isStreaming });
+
+		await session.steer("first fallback");
+		await firstWake.promise;
+		await session.steer("second fallback");
+		await secondWake.promise;
+		isStreaming = false;
+
+		expect(continueQueuedSpy).toHaveBeenCalledTimes(2);
+		expect(session.getQueuedMessages().followUp).toEqual(["first fallback", "second fallback"]);
+	});
+
 	async function emitLifecycleAndWait(
 		event: AgentEvent,
 		matches: (event: AgentSessionEvent) => boolean,

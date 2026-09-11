@@ -1,13 +1,15 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, test, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import * as url from "node:url";
 import {
+	authenticatedApproval,
 	canonicalDiffSha256,
 	parseBodyRisk,
 	parseGhPrCreate,
 	parsePrVerdict,
 	parseSelfReview,
+	resolvePullRequestEvent,
 	selfReviewSatisfiesPolicy,
 	selfReviewSignature,
 	selfReviewSignedPayload,
@@ -19,6 +21,59 @@ const base = "a".repeat(40);
 const head = "b".repeat(40);
 const digest = "c".repeat(64);
 const approved = `gajae.pr-review-verdict.v1 merge-approved sha256:${digest} reviewer:architect reviewer-id:review-agent evidence:bun test scripts/verify-pr-verdict.test.ts`;
+
+describe("authenticated approval API evidence", () => {
+	const event = { repository: { full_name: "owner/repo" }, pull_request: { number: 5416 } };
+	const review = (state: string, commit = head) => ({ state, commit_id: commit, user: { login: "review-agent" } });
+
+	test.each([
+		{ name: "valid exact-head approval", reviews: [review("APPROVED")], permission: "write", approved: true },
+		{ name: "changes requested after approval", reviews: [review("APPROVED"), review("CHANGES_REQUESTED")], permission: "write", approved: false },
+		{ name: "dismissed approval", reviews: [review("APPROVED"), review("DISMISSED")], permission: "write", approved: false },
+		{ name: "revoked collaborator permission", reviews: [review("APPROVED")], permission: "read", approved: false },
+		{ name: "stale-head approval", reviews: [review("APPROVED", "d".repeat(40))], permission: "write", approved: false },
+	])("$name", async scenario => {
+		const requests: string[] = [];
+		const originalFetch = globalThis.fetch;
+		const replacement: typeof fetch = Object.assign(async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+			const endpoint = String(input);
+			requests.push(endpoint);
+			expect(new Headers(init?.headers).get("Authorization")).toBe("Bearer test-token");
+			if (endpoint === "https://api.github.com/repos/owner/repo/pulls/5416/reviews?per_page=100&page=1") return Response.json(scenario.reviews);
+			if (endpoint === "https://api.github.com/repos/owner/repo/collaborators/review-agent/permission") return Response.json({ permission: scenario.permission });
+			throw new Error(`Unexpected endpoint: ${endpoint}`);
+		}, { preconnect: originalFetch.preconnect });
+		const spy = vi.spyOn(globalThis, "fetch").mockImplementation(replacement);
+		try {
+			const approval = await authenticatedApproval(event, "review-agent", head, "test-token");
+			expect(approval).toEqual(scenario.approved ? { login: "review-agent", headSha: head } : {});
+			expect(validatePrContract(validInput({ authenticatedReviewerLogin: approval.login, authenticatedReviewHeadSha: approval.headSha })).ok).toBe(scenario.approved);
+			expect(requests.length).toBe(scenario.name === "valid exact-head approval" || scenario.name === "revoked collaborator permission" ? 2 : 1);
+		} finally {
+			spy.mockRestore();
+		}
+	});
+
+	test("unavailable and malformed review responses never provide authenticated approval", async () => {
+		for (const failure of ["network", "http", "invalid-json", "object", "null", "malformed-entry"]) {
+			const originalFetch = globalThis.fetch;
+			const replacement: typeof fetch = Object.assign(async () => {
+				if (failure === "network") throw new Error("Reviews network unavailable");
+				if (failure === "http") return new Response("unavailable", { status: 503 });
+				if (failure === "invalid-json") return new Response("{broken");
+				return Response.json(failure === "object" ? {} : failure === "null" ? null : [null]);
+			}, { preconnect: originalFetch.preconnect });
+			const spy = vi.spyOn(globalThis, "fetch").mockImplementation(replacement);
+			try {
+				if (failure === "http") expect(await authenticatedApproval(event, "review-agent", head, "test-token")).toEqual({});
+				else await expect(authenticatedApproval(event, "review-agent", head, "test-token")).rejects.toThrow();
+				expect(spy).toHaveBeenCalledTimes(1);
+			} finally {
+				spy.mockRestore();
+			}
+		}
+	});
+});
 
 function selfReviewComment(overrides: {
 	body?: string;
@@ -67,6 +122,107 @@ function validInput(overrides: Partial<Parameters<typeof validatePrContract>[0]>
 		...overrides,
 	};
 }
+
+describe("review-event mutable PR body refresh", () => {
+	function captured() {
+		return {
+			repository: { full_name: "owner/repo" },
+			pull_request: {
+				number: 5416,
+				body: approved.replace("merge-approved", "needs-human"),
+				user: { login: "author" },
+				base: { ref: "dev", sha: base, repo: { full_name: "owner/repo" } },
+				head: { sha: head },
+			},
+		};
+	}
+
+	test("refreshes only body on the same authority using an authenticated request", async () => {
+		const event = captured();
+		const live = { ...event.pull_request, body: approved };
+		const resolved = await resolvePullRequestEvent(event, "pull_request_review", "test-token", async (endpoint, init) => {
+			expect(endpoint).toBe("https://api.github.com/repos/owner/repo/pulls/5416");
+			expect(new Headers(init.headers).get("Authorization")).toBe("Bearer test-token");
+			return Response.json(live);
+		});
+		expect(resolved).toEqual({ ...event, pull_request: live });
+		expect(resolved.pull_request?.base).toBe(event.pull_request.base);
+		expect(resolved.pull_request?.head).toBe(event.pull_request.head);
+		expect(event.pull_request.body).toContain("needs-human");
+		expect(validatePrContract(validInput({ body: resolved.pull_request?.body ?? "" })).ok).toBe(true);
+		// Refreshing text provides no new approval, risk or fast-gate authority.
+		for (const denied of [
+			{ authenticatedReviewerLogin: undefined },
+			{ authenticatedReviewHeadSha: "d".repeat(40) },
+			{ fastGatePassed: false },
+		]) {
+			expect(validatePrContract(validInput({ body: resolved.pull_request?.body ?? "", ...denied })).ok).toBe(false);
+		}
+	});
+
+	test.each(["merge-blocked", "needs-human", "", null])("current revoked or empty body cannot reuse captured approval: %s", async verdict => {
+		const event = captured();
+		event.pull_request.body = approved;
+		const body = verdict ? approved.replace("merge-approved", verdict) : verdict;
+		const resolved = await resolvePullRequestEvent(event, "pull_request_review", "token", async () => Response.json({ ...event.pull_request, body }));
+		expect(resolved.pull_request?.body).toBe(body);
+		expect(validatePrContract(validInput({ body: resolved.pull_request?.body ?? "" })).ok).toBe(false);
+	});
+
+	test("rejects every live authority drift rather than replacing the captured target", async () => {
+		const event = captured();
+		const live = { ...event.pull_request, body: approved };
+		for (const changed of [
+			{ ...live, number: 5417 },
+			{ ...live, user: { login: "other" } },
+			{ ...live, head: { sha: "d".repeat(40) } },
+			{ ...live, base: { ...live.base, sha: "e".repeat(40) } },
+			{ ...live, base: { ...live.base, ref: "main" } },
+			{ ...live, base: { ...live.base, repo: { full_name: "other/repo" } } },
+		]) {
+			await expect(resolvePullRequestEvent(event, "pull_request_review", "token", async () => Response.json(changed))).rejects.toThrow("authority drift");
+		}
+	});
+
+	test("unavailable or malformed metadata never falls back to captured body", async () => {
+		const event = captured();
+		for (const response of [
+			new Response("denied", { status: 403 }),
+			new Response("{broken"),
+			Response.json(null), Response.json([]), Response.json({}),
+			Response.json({ ...event.pull_request, body: 42 }),
+			Response.json({ ...event.pull_request, body: undefined }),
+		]) {
+			await expect(resolvePullRequestEvent(event, "pull_request_review", "token", async () => response)).rejects.toThrow();
+		}
+		await expect(resolvePullRequestEvent(event, "pull_request_review", "token", async () => { throw new Error("network unavailable"); })).rejects.toThrow("network unavailable");
+		let requests = 0;
+		const request = async () => { requests++; return Response.json(event.pull_request); };
+		await expect(resolvePullRequestEvent(event, "pull_request_review", "", request)).rejects.toThrow("authority is incomplete");
+		await expect(resolvePullRequestEvent({ repository: event.repository }, "pull_request_review", "token", request)).rejects.toThrow("authority is incomplete");
+		expect(requests).toBe(0);
+	});
+
+	test("ordinary PR events retain their captured body without API calls", async () => {
+		const event = captured();
+		for (const name of ["pull_request", "pull_request_target"]) {
+			const resolved = await resolvePullRequestEvent(event, name, "token", async () => { throw new Error("must not fetch"); });
+			expect(resolved).toBe(event);
+		}
+	});
+
+	test("issue-comment resolution retains its authenticated fetch and failure semantics", async () => {
+		const event = { repository: captured().repository, issue: { number: 5416 } };
+		const live = { ...captured().pull_request, body: approved };
+		const resolved = await resolvePullRequestEvent(event, "issue_comment", "token", async (endpoint, init) => {
+			expect(endpoint).toBe("https://api.github.com/repos/owner/repo/pulls/5416");
+			expect(new Headers(init.headers).get("Authorization")).toBe("Bearer token");
+			return Response.json(live);
+		});
+		expect(resolved.pull_request).toEqual(live);
+		expect(await resolvePullRequestEvent(event, "issue_comment", "token", async () => new Response("denied", { status: 403 }))).toBe(event);
+	});
+});
 
 describe("parsePrVerdict", () => {
 	test("accepts exactly one strict verdict line", () => {
@@ -450,6 +606,121 @@ test("preflight preserves missing body-file diagnostics", async () => {
 	} finally {
 		await fs.rm(temp, { recursive: true, force: true });
 	}
+});
+
+describe("push preflight", () => {
+	test("pre-push hook validates every pushed branch head through the contract validator", async () => {
+		const hook = await Bun.file(new URL("../.githooks/pre-push", import.meta.url)).text();
+		// The pushed commit -- not local HEAD -- is what becomes the PR head.
+		expect(hook).toContain('--push-preflight "$branch" "$local_sha"');
+		expect(hook).toContain("GJC_SKIP_PR_PREFLIGHT");
+		// Deletions carry the zero sha and have no head to validate.
+		expect(hook).toContain('[[ "$local_sha" == "$zero" ]] && continue');
+	});
+
+	test("a branch with no open PR has no contract to invalidate", async () => {
+		const script = url.fileURLToPath(new URL("./verify-pr-verdict.ts", import.meta.url));
+		const repoRoot = url.fileURLToPath(new URL("..", import.meta.url));
+		const head = Bun.spawnSync(["git", "rev-parse", "HEAD"], { cwd: repoRoot });
+		const headSha = head.stdout.toString().trim();
+		const child = Bun.spawn([process.execPath, script, "--push-preflight", "gjc-preflight-branch-that-does-not-exist", headSha, "--repo", repoRoot, "--trusted-root", repoRoot], { stdout: "ignore", stderr: "ignore" });
+		expect(await child.exited).toBe(0);
+	});
+
+	test("derives the PR branch from the remote destination, not the local source ref", async () => {
+		const hook = await Bun.file(new URL("../.githooks/pre-push", import.meta.url)).text();
+		// `git push origin HEAD:refs/heads/feature` gives local_ref=HEAD, and a renamed
+		// refspec gives two different names; filtering on the local ref skips both.
+		expect(hook).toContain('[[ "$remote_ref" == refs/heads/* ]] || continue');
+		expect(hook).toContain('branch="${remote_ref#refs/heads/}"');
+		expect(hook).not.toContain('[[ "$local_ref" == refs/heads/* ]]');
+		// The pushed object, not the resolved remote branch tip, is the commit validated.
+		expect(hook).toContain('--push-preflight "$branch" "$local_sha"');
+		// The receiving remote is forwarded so the PR is looked up in the right repository.
+		expect(hook).toContain('--push-remote "$remote"');
+	});
+
+	test("binds PR lookup and base resolution to the receiving repository", async () => {
+		const source = await Bun.file(new URL("./verify-pr-verdict.ts", import.meta.url)).text();
+		const pushPreflight = source.slice(source.indexOf("async function validatePushPreflight"));
+		// An implicit gh context resolves a fork checkout to the fork, where the upstream PR
+		// does not exist -- the empty result would then wave the push through.
+		expect(pushPreflight).toContain('"--repo", baseRepo');
+		expect(pushPreflight).not.toContain('git(["fetch", "--no-tags", "origin", "dev"]');
+		expect(pushPreflight).not.toContain('rev-parse", "origin/dev"');
+		// The base is the PR's own base ref in the contract repository, never an assumed dev.
+		expect(pushPreflight).toContain("pr.baseRefName], cwd)");
+		// A same-named branch in another fork must not be mistaken for this PR.
+		expect(pushPreflight).toContain("headRepositoryOwner?.login?.toLowerCase() === headOwner.toLowerCase()");
+		// Ambiguity fails closed rather than guessing which contract governs the push.
+		expect(pushPreflight).toContain("cannot determine which contract governs this push");
+		// gh pr list's JSON mapping drops headRefOid and review commit oids on older gh
+		// releases (e.g. 2.4.x), which would fail closed on every push, so the head oid
+		// and the review commits must be resolved through the stable `gh api` surface.
+		expect(pushPreflight).toContain('"--jq", ".head.sha"');
+		expect(pushPreflight).toContain("/pulls/${pr.number}/reviews");
+		expect(pushPreflight).not.toContain("reviews,headRefOid");
+	});
+
+	test("resolves the GitHub repository from every supported remote URL form", async () => {
+		const source = await Bun.file(new URL("./verify-pr-verdict.ts", import.meta.url)).text();
+		const pattern = /const match = (\/.+\/u)\.exec\(text\);/u.exec(source.slice(source.indexOf("async function pushRemoteRepository")));
+		expect(pattern).not.toBeNull();
+		const remoteUrl = new RegExp(pattern![1]!.slice(1, -2), "u");
+		const resolve = (url: string): string | null => {
+			const match = remoteUrl.exec(url);
+			return match ? `${match[1]}/${match[2]}` : null;
+		};
+		expect(resolve("git@github.com:Yeachan-Heo/gajae-code.git")).toBe("Yeachan-Heo/gajae-code");
+		expect(resolve("https://github.com/Yeachan-Heo/gajae-code.git")).toBe("Yeachan-Heo/gajae-code");
+		expect(resolve("https://github.com/probepark/gajae-code")).toBe("probepark/gajae-code");
+		expect(resolve("ssh://git@github.com/Yeachan-Heo/gajae-code.git")).toBe("Yeachan-Heo/gajae-code");
+	});
+
+	test("a fork push resolves the contract to the upstream parent repository", async () => {
+		const source = await Bun.file(new URL("./verify-pr-verdict.ts", import.meta.url)).text();
+		const resolver = source.slice(source.indexOf("async function contractRepository"));
+		// A fork's PR lives upstream, so the parent owns the contract; the head stays
+		// qualified by the fork owner that actually receives the push.
+		expect(resolver).toContain('"isFork,parent"');
+		expect(resolver).toContain("return { repo: `${parentOwner}/${parentName}`, forkOwner: pushRepo.split(\"/\")[0]! };");
+		expect(resolver).toContain("if (!info.isFork || !parentOwner || !parentName) return { repo: pushRepo, forkOwner: null };");
+	});
+
+	test("mirrors the Dev CI bootstrap job, which has no requireMergeApproved escape hatch", async () => {
+		const source = await Bun.file(new URL("./verify-pr-verdict.ts", import.meta.url)).text();
+		const pushPreflight = source.slice(source.indexOf("async function validatePushPreflight"));
+		// The bootstrap job blocks needs-human/merge-blocked unconditionally, so a preflight
+		// that passed them locally would disagree with the very check it predicts.
+		expect(pushPreflight).toContain("requireMergeApproved: true");
+		expect(pushPreflight).not.toContain("requireMergeApproved: false");
+		// Mirroring the flag alone would fail a legitimately reviewed merge-approved PR, so
+		// the exact-head approval must be resolved from the same review data.
+		expect(pushPreflight).toContain("authenticatedReviewerLogin: approval.login");
+		expect(pushPreflight).toContain('review.state !== "COMMENTED"');
+		expect(pushPreflight).toContain("review.commit?.oid === headSha");
+	});
+
+	test("a blocking verdict fails the push exactly as the bootstrap job does", () => {
+		const body = approved.replace("merge-approved", "needs-human");
+		const blocked = validatePrContract(validInput({ body, requireMergeApproved: true }));
+		expect(blocked.ok).toBe(false);
+		expect(blocked.diagnostics.join("\n")).toContain("intentionally blocks merge");
+	});
+
+	test("an exact-head approved merge-approved PR still passes the push gate", () => {
+		const reviewed = validatePrContract(validInput({ requireMergeApproved: true }));
+		expect(reviewed.ok).toBe(true);
+	});
+
+	test("a non-commit push target fails closed", async () => {
+		const script = url.fileURLToPath(new URL("./verify-pr-verdict.ts", import.meta.url));
+		const repoRoot = url.fileURLToPath(new URL("..", import.meta.url));
+		const child = Bun.spawn([process.execPath, script, "--push-preflight", "some-branch", "not-a-sha", "--repo", repoRoot, "--trusted-root", repoRoot], { stdout: "pipe", stderr: "pipe" });
+		const [stderr, exitCode] = await Promise.all([new Response(child.stderr).text(), child.exited]);
+		expect(exitCode).toBe(1);
+		expect(stderr).toContain("is not a lowercase 40-hex commit");
+	});
 });
 
 test("workflow is trusted-default-branch-controlled, read-only, exact-head, and invokes only base code", async () => {

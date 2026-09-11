@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import { runUpdateCommand } from "../src/cli/update-cli";
+import { initTheme } from "../src/modes/theme/theme";
 
 const release = {
 	tag: "v999.0.0",
@@ -74,6 +75,9 @@ describe("update telemetry lifecycle", () => {
 				resolveUpdateTarget: async () => target,
 				getLatestRelease: async () => release,
 				recordTelemetryEvent: (event, details) => events.push(`${event}:${details.result ?? ""}`),
+				exit: code => {
+					throw new Error(`Unexpected update exit: ${code}`);
+				},
 			},
 		);
 		expect(events).toEqual([
@@ -84,6 +88,7 @@ describe("update telemetry lifecycle", () => {
 	});
 
 	it("records install success after the verified update path completes", async () => {
+		await initTheme();
 		const events: string[] = [];
 		await runUpdateCommand(
 			{ force: false, check: false, channel: "nightly" },
@@ -94,6 +99,9 @@ describe("update telemetry lifecycle", () => {
 				runPostUpdateRecovery: async () => undefined,
 				refreshInstalledDefaultSkills: async () => undefined,
 				recordTelemetryEvent: (event, details) => events.push(`${event}:${details.result ?? ""}`),
+				exit: code => {
+					throw new Error(`Unexpected update exit: ${code}`);
+				},
 			},
 		);
 		expect(events).toEqual([

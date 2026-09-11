@@ -22,7 +22,7 @@
 | Field | Type | Required | Description |
 | --- | --- | --- | --- |
 | `path` | `string` | Yes | Filesystem path, internal URL, or web URL. May end with a trailing selector such as `:50-100` or `:raw`. |
-| `truncation` | `head` \| `last` \| `both` | No | Which end of over-budget output to retain. Bare local files and archive members use `read.truncation` (factory default: `last`); URLs, converted documents, directories, ranges, internal URLs, and other non-bare routes default to `head`. Explicit values are honored where the route supports truncation. SQLite row/schema/query/raw reads ignore this parameter. |
+| `truncation` | `head` \| `last` \| `both` | No | Which end of over-budget output to retain. Bare local text and archive members use `read.truncation` (factory default: `last`); structural summaries, URLs, converted documents, directories, ranges, internal URLs, and other non-bare routes default to `head`. Structural summaries honor explicit directions without switching to raw source. SQLite row/schema/query/raw reads ignore this parameter. |
 
 
 ### Selector grammar
@@ -102,6 +102,8 @@ URL selectors are parsed separately in `packages/coding-agent/src/tools/fetch.ts
   - Guards: file size `<= 2 MiB` (`MAX_SUMMARY_BYTES`), line count `<= 20_000` (`MAX_SUMMARY_LINES`).
   - Summary output keeps selected declarations and replaces elided spans with `...`. When at least one span is elided, the text content ends with a footer like `[NN lines across MM elided regions; read <path>:raw or a line range like <path>:1-9999 for verbatim content]` so the agent has a concrete recovery selector instead of a bare marker.
   - When an elided block sits between matching brace lines, `#renderSummary()` may merge them into one anchored line rather than emitting separate opener/closer lines.
+  - Structural summaries default to `head`, independently of `read.truncation`. Explicit `head`, `last`, and `both` select complete summary units from the beginning, end, or both ends under `read.summaryMaxBytes` (default 20 KiB). Units are never split or duplicated; retained units stay in source order with their original line/hash anchors. Summaries that fit remain identical for all directions.
+  - The summary body budget counts UTF-8 bytes, separators, and budget-omission markers. Recovery footers are outside that body budget. Omitted source ranges are marked at their actual positions, and the cap footer identifies the requested direction and provides full-source recovery selectors. An oversized unit stops selection from that edge rather than splitting its anchors. If even the omission marker cannot fit, the body is empty and its source-range notice accompanies the recovery footers.
 - Explicit selector or summarization miss: streamed text read.
   - Bare local text uses the receipt budgets (`read.receiptBudgetLines` / `read.receiptBudgetBytes`), whose factory defaults are 50 lines and 10 KiB, and keeps the tail by default (`read.truncation` controls the configured direction). `read.defaultLimit` defaults to 300, but it is a collection/selection limit, not the bare receipt window.
   - Bare archive members use the shared 3000-line / 50 KiB cap and keep the tail by default.
