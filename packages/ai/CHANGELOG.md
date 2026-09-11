@@ -4,7 +4,11 @@
 
 ### Added
 
-- Devin CLI is now a first-class provider (`devin`, api `devin-acp`). Devin publishes no model-inference endpoint, so GJC speaks its documented programmatic surface instead: it spawns `devin acp` and drives the Agent Client Protocol over stdio. Devin owns model selection (discovered from the account's ACP session `model` config option), tool execution, conversation history, and usage; GJC renders Devin's tool calls read-only and always ends the turn with a normal stop so they are never re-executed, forwards cancellation as ACP `session/cancel`, and answers Devin's permission requests from `GJC_DEVIN_PERMISSION_MODE` (`allow` grants `allow_once`, never `allow_always`; `deny` rejects; invalid values fail closed). Maintenance and utility calls that need a text model — compaction, handoff, branch summaries, session titles — are refused instead of being spent on a Devin agent turn; `StreamOptions.maintenanceCall` marks them. See `docs/devin-provider.md`.
+- Devin CLI is now a first-class provider (`devin`, api `devin-acp`). Devin publishes no model-inference endpoint, so GJC speaks its documented programmatic surface instead: it spawns `devin acp` and drives the Agent Client Protocol over stdio. Devin owns model selection (discovered from the account's ACP session `model` config option), tool execution, conversation history, and usage; GJC renders Devin's tool calls read-only and always ends the turn with a normal stop so they are never re-executed, forwards cancellation as ACP `session/cancel`, and answers Devin's permission requests from `GJC_DEVIN_PERMISSION_MODE` (`allow` grants `allow_once` and cancels when none is offered, never granting a persistent approval; `deny` rejects; invalid values fail closed). Maintenance and utility calls that need a text model — compaction, handoff, branch summaries, session titles — are refused instead of being spent on a Devin agent turn; `StreamOptions.maintenanceCall` marks them. See `docs/devin-provider.md`.
+
+### Changed
+
+- `@gajae-code/ai/utils/block-symbols` now exports the provider-neutral provider-resolved tool-call marker: `kProviderResolvedToolCall`, `ProviderResolvedCarrier`, `isProviderResolvedToolCall`, and `copyProviderResolvedToolCall` replace `kCursorExecResolved`, `CursorExecResolvedCarrier`, `isCursorExecResolved`, and `copyCursorExecResolved`. Cursor exec-owned calls and Devin's ACP tool calls both use it, and it is registered with `Symbol.for` so duplicate module instances cannot disagree about it.
 
 ### Fixed
 

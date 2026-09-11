@@ -8,7 +8,7 @@
  * instead of a wire field so the marker exists only in-process and can never
  * round-trip through a transcript or a provider payload.
  */
-export const kProviderResolvedToolCall = Symbol("provider.block.providerResolvedToolCall");
+export const kProviderResolvedToolCall: unique symbol = Symbol.for("@gajae-code/ai.provider-resolved-tool-call.v1");
 
 export type ProviderResolvedCarrier = object & { [kProviderResolvedToolCall]?: true };
 

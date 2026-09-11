@@ -8,7 +8,7 @@
 
 ### Fixed
 
-- Lossless and managed assistant-message snapshots now carry the in-process provider-resolved tool-call marker across the boundary. The marker is a symbol, so a deep snapshot silently dropped it and the agent loop would then dispatch a provider-executed tool call to a local tool of the same display name. This affected Cursor's exec-owned calls and the new Devin ACP provider alike.
+- Lossless, managed, abort-path, and safety-stop assistant-message rebuilds now carry the in-process provider-resolved tool-call marker across the boundary. The marker is a symbol, so a deep snapshot silently dropped it, and the loop would then dispatch a provider-executed tool call to a local tool of the same display name — or, on an aborted turn, fabricate a failed tool result for it. This affected Cursor's exec-owned calls and the new Devin ACP provider alike. The marker is registered with `Symbol.for` and restoration is fail-closed on ambiguous identity.
 
 - Publish reasoning summaries, thinking, and tool-call updates during ordinary unmanaged streaming instead of holding them until text, response completion, or interruption. Tool execution still waits for terminal validation; already-published legacy guarded calls receive explicit rejection instead of silent resampling. Managed fallback attempts remain atomic.
 

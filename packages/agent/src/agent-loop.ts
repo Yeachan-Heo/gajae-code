@@ -879,6 +879,7 @@ function sanitizeProviderSafetyStopProvenance(
 			return repaired;
 		}
 		restoreTransientUnicodeEscapeEvidence(rebuilt.content, message);
+		restoreProviderResolvedMarkers(rebuilt.content, message);
 		return rebuilt;
 	}
 	const rebuilt = managedAssistantShell(message, model);
@@ -2204,8 +2205,28 @@ function restoreProviderResolvedMarkers(destination: AssistantMessage["content"]
 				managedProperty(candidate, "id") === destinationBlock.id &&
 				managedProperty(candidate, "name") === destinationBlock.name,
 		);
-		if (matches.length === 1) copyProviderResolvedToolCall(destinationBlock, matches[0] as object);
+		// Ambiguity suppresses every candidate rather than dispatching a call the
+		// provider may already have executed: this predicate is a safety gate.
+		for (const match of matches) copyProviderResolvedToolCall(destinationBlock, match as object);
 	}
+}
+
+/**
+ * Detach content the way `structuredClone` does, but keep the in-process
+ * provider-resolved marker. The abort path clamps partial content and then
+ * filters provider-resolved calls out of the synthesized aborted results, so a
+ * plain structured clone would fabricate a failed tool result for a call the
+ * provider already ran.
+ */
+function cloneContentPreservingProviderResolved(content: AssistantMessage["content"]): AssistantMessage["content"] {
+	const cloned = structuredClone(content) as AssistantMessage["content"];
+	for (let index = 0; index < content.length; index += 1) {
+		const source = content[index];
+		const target = cloned[index];
+		if (source?.type !== "toolCall" || target?.type !== "toolCall") continue;
+		copyProviderResolvedToolCall(target, source);
+	}
+	return cloned;
 }
 
 function managedUnicodeEscapeEvidence(value: unknown): UnicodeEscapeEvidence | undefined {
@@ -2862,10 +2883,6 @@ class ManagedAttemptTransaction {
 				snapshotBlock = normalized;
 				snapshot.content[index] = snapshotBlock;
 			}
-			// A lossless snapshot must stay lossless for the in-process marker that
-			// tells the loop a provider already executed this call. Dropping it here
-			// would make the loop dispatch the provider's own tool call locally.
-			copyProviderResolvedToolCall(snapshotBlock, sourceBlock);
 			if (metadata) {
 				const detachedMetadata = escapedToolCallMetadata(snapshotBlock);
 				const evidencePresenceChanged = Boolean(metadata.evidence) !== Boolean(detachedMetadata.evidence);
@@ -3204,6 +3221,7 @@ class ManagedAttemptTransaction {
 				managedProperty(snapshot, "content") as AssistantMessage["content"],
 				value,
 			);
+			restoreProviderResolvedMarkers(managedProperty(snapshot, "content") as AssistantMessage["content"], value);
 		}
 		return snapshot;
 	}
@@ -4970,7 +4988,7 @@ function emitAbortedAssistantMessage(
 	const now = Date.now();
 	const abortedMessage: AssistantMessage = {
 		role: "assistant",
-		content: partialMessage ? structuredClone(partialMessage.content) : [],
+		content: partialMessage ? cloneContentPreservingProviderResolved(partialMessage.content) : [],
 		api: config.model.api,
 		provider: config.model.provider,
 		model: config.model.id,

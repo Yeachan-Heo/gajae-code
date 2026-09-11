@@ -133,7 +133,11 @@ export interface DevinAcpConfig {
 	cliArgs?: readonly string[];
 	/** Working directory for the agent process. Defaults to `process.cwd()`. */
 	cwd?: string;
-	/** Overrides the permission policy for this request. */
+	/**
+	 * Overrides the permission policy for this request. Any value other than
+	 * `"allow"` fails closed to `"deny"`, including out-of-type values from
+	 * untyped callers.
+	 */
 	permissionMode?: DevinAcpPermissionMode;
 	/** Explicit permission decisions. When absent, the configured mode decides. */
 	permissionHandler?: DevinAcpPermissionHandler;
@@ -250,7 +254,9 @@ export function devinAcpResolvePermissionMode(
 	configured: DevinAcpPermissionMode | undefined,
 	env: Record<string, string | undefined> = process.env,
 ): DevinAcpPermissionMode {
-	if (configured === "allow" || configured === "deny") return configured;
+	// An explicit value always wins and fails closed: an out-of-type value from an
+	// untyped caller must never fall through to the permissive default.
+	if (configured !== undefined) return configured === "allow" ? "allow" : "deny";
 	const raw = env[DEVIN_ACP_PERMISSION_MODE_ENV]?.trim().toLowerCase();
 	if (raw === undefined || raw.length === 0) return "allow";
 	return raw === "allow" ? "allow" : "deny";
@@ -766,6 +772,10 @@ class DevinAcpBridge implements ProviderSessionState {
 		options: DevinAcpOptions | undefined,
 	): Promise<void> {
 		const { output } = turn;
+		// Every provider opens with a start event carrying its partial assistant
+		// message: the loop uses it to publish streaming updates and to hold the
+		// partial while the turn runs.
+		turn.stream.push({ type: "start", partial: output });
 		try {
 			refuseNonInteractiveTurn(options);
 		} catch (error) {

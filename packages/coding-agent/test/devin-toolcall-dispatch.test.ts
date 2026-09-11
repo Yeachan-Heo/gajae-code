@@ -13,6 +13,8 @@
  */
 
 import { afterEach, describe, expect, test } from "bun:test";
+import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 
 import { Agent, type AgentEvent, type AgentTool } from "@gajae-code/agent-core";
@@ -27,6 +29,11 @@ import { isProviderResolvedToolCall } from "@gajae-code/ai/utils/block-symbols";
 import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
 
 const ACP_FIXTURE = path.resolve(import.meta.dir, "../../ai/test/fixtures/devin-acp-agent.ts");
+const tempDirs: string[] = [];
+
+afterEach(() => {
+	for (const dir of tempDirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
+});
 
 const ZERO_USAGE: AssistantMessage["usage"] = {
 	input: 0,
@@ -146,6 +153,68 @@ describe("devin tool-call dispatch boundary", () => {
 		expect(invocations).toEqual([]);
 		expect(toolEvents).toEqual([]);
 	}
+
+	test("an aborted turn fabricates no tool result for a Devin tool call", async () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-devin-abort-"));
+		tempDirs.push(dir);
+		const receipt = path.join(dir, "toolcall-receipt.json");
+		const invocations: unknown[] = [];
+		const bashTool = {
+			name: "bash",
+			label: "bash",
+			description: "records local execution",
+			parameters: { type: "object", properties: { command: { type: "string" } }, additionalProperties: true },
+			async execute(_id: string, params: unknown) {
+				invocations.push(params);
+				return { content: [{ type: "text" as const, text: "LOCAL_BASH_EXECUTED" }] };
+			},
+		} as unknown as AgentTool;
+
+		const toolEvents: AgentEvent[] = [];
+		let providerStream: AssistantMessageEventStream | undefined;
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model: devinModel(), systemPrompt: ["test"], tools: [bashTool], messages: [] },
+			streamFn: ((model: unknown, context: Context, options: Record<string, unknown>) => {
+				providerStream = streamDevinAcp(model as Model<"devin-acp">, context, {
+					...options,
+					devinAcp: {
+						cliPath: process.execPath,
+						cliArgs: [ACP_FIXTURE, "toolcall-then-wait", receipt],
+					},
+					providerSessionId: "devin-abort-regression",
+				});
+				return providerStream;
+			}) as never,
+		});
+		agent.subscribe(event => {
+			if (event.type === "tool_execution_start" || event.type === "tool_execution_end") toolEvents.push(event);
+		});
+
+		const sawToolCall = (): boolean => {
+			try {
+				return (JSON.parse(fs.readFileSync(receipt, "utf8")) as { toolCallSent?: boolean }).toolCallSent === true;
+			} catch {
+				return false;
+			}
+		};
+		const run = agent.prompt("run the tests");
+		for (let attempt = 0; attempt < 120 && !sawToolCall(); attempt += 1) await Bun.sleep(25);
+		expect(sawToolCall()).toBe(true);
+		agent.abort();
+		await run;
+
+		const aborted = agent.state.messages.findLast(message => message.role === "assistant") as
+			| AssistantMessage
+			| undefined;
+		const phantomResults = agent.state.messages.filter(
+			message => message.role === "toolResult" && message.toolCallId === "call-abort",
+		);
+		expect(aborted?.stopReason).toBe("aborted");
+		expect(invocations).toEqual([]);
+		expect(toolEvents).toEqual([]);
+		expect(phantomResults).toEqual([]);
+	});
 
 	test("marks Devin tool calls as provider-resolved while plain tool calls still dispatch", async () => {
 		const invocations: unknown[] = [];

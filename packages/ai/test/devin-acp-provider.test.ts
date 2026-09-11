@@ -18,6 +18,7 @@ import {
 	DEVIN_ACP_BASE_URL,
 	DEVIN_ACP_CONTEXT_WINDOW,
 	DEVIN_ACP_MAX_TOKENS,
+	DEVIN_ACP_PERMISSION_MODE_ENV,
 	type DevinAcpConfig,
 	devinAcpBridgeIdentity,
 	devinAcpResolvePermissionMode,
@@ -168,6 +169,15 @@ describe("devin turn mapping", () => {
 		expect(events.filter(event => event.type === "done")).toHaveLength(1);
 	});
 
+	test("opens the turn with a start event carrying the partial message", async () => {
+		const { events, message } = await drain(streamDevinAcp(devinModel(), userContext("hi"), fixtureTurn("chat")));
+		expect(events[0]?.type).toBe("start");
+		const start = events[0];
+		expect(start?.type === "start" && start.partial).toBeDefined();
+		expect(start?.type === "start" && start.partial.role).toBe("assistant");
+		expect(message.stopReason).toBe("stop");
+	});
+
 	test("maps ACP stop reasons onto GJC stop reasons", async () => {
 		const refusal = await drain(streamDevinAcp(devinModel(), userContext("hi"), fixtureTurn("refusal")));
 		expect(refusal.message.stopReason).toBe("stop");
@@ -287,6 +297,11 @@ describe("devin permission policy", () => {
 			streamDevinAcp(devinModel(), userContext("clean up"), fixtureTurn("permission-allow-always-only")),
 		);
 		expect(assistantText(message)).toBe('decision:{"outcome":"cancelled"}');
+	});
+
+	test("fails closed to deny when an untyped caller passes an unknown permission mode", () => {
+		expect(devinAcpResolvePermissionMode("everything" as never, {})).toBe("deny");
+		expect(devinAcpResolvePermissionMode("allow", { [DEVIN_ACP_PERMISSION_MODE_ENV]: "deny" })).toBe("allow");
 	});
 
 	test("deny may fall back to reject_always when reject_once is not offered", async () => {

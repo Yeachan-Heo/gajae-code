@@ -220,6 +220,25 @@ class FixtureAgent implements Agent {
 				});
 				return { stopReason: "end_turn" };
 			}
+			case "toolcall-then-wait": {
+				await this.#send(sessionId, {
+					sessionUpdate: "tool_call",
+					toolCallId: "call-abort",
+					title: "Run the test suite",
+					kind: "execute",
+					status: "pending",
+					rawInput: { command: "bun test" },
+				});
+				// Receipt on the agent side so a test can abort only after the client has
+				// been sent the call, without polling client-internal state.
+				if (receiptPath) {
+					fs.writeFileSync(receiptPath, JSON.stringify({ scenario, toolCallSent: true }));
+				}
+				await new Promise<void>(resolve => {
+					this.#releaseCancel = resolve;
+				});
+				return { stopReason: "cancelled" };
+			}
 			case "model": {
 				const modelOption = this.#configOptions.find(option => option.category === "model");
 				const current = modelOption?.type === "select" ? modelOption.currentValue : "none";
