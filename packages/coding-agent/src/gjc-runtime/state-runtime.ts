@@ -1901,6 +1901,7 @@ export interface ExecutionApprovalTranscriptBoundary {
 	device: string;
 	inode: string;
 	leaf_id: string | null;
+	approval_tool_call_id?: string;
 }
 
 function isExecutionApprovalTranscriptBoundary(value: unknown): value is ExecutionApprovalTranscriptBoundary {
@@ -1912,7 +1913,8 @@ function isExecutionApprovalTranscriptBoundary(value: unknown): value is Executi
 		/^\d+$/.test(value.device) &&
 		typeof value.inode === "string" &&
 		/^\d+$/.test(value.inode) &&
-		(value.leaf_id === null || isExecutionApprovalId(value.leaf_id))
+		(value.leaf_id === null || isExecutionApprovalId(value.leaf_id)) &&
+		(value.approval_tool_call_id === undefined || isExecutionApprovalId(value.approval_tool_call_id))
 	);
 }
 
@@ -1976,6 +1978,7 @@ export async function captureExecutionApprovalTranscriptBoundary(
 	sessionId: string,
 	transcriptPath: string,
 	transcriptSha256: string,
+	approvalToolCallId?: string,
 ): Promise<ExecutionApprovalTranscriptBoundary> {
 	const before = await fs.lstat(transcriptPath, { bigint: true });
 	const text = await readBoundedIdentityText(
@@ -1999,6 +2002,7 @@ export async function captureExecutionApprovalTranscriptBoundary(
 		device: after.dev.toString(),
 		inode: after.ino.toString(),
 		leaf_id: leaf,
+		...(approvalToolCallId === undefined ? {} : { approval_tool_call_id: approvalToolCallId }),
 	};
 }
 
@@ -2037,16 +2041,35 @@ export async function assertExecutionApprovalTranscriptBoundary(
 	const suffix = bytes.subarray(boundary.byte_length).toString("utf8");
 	if (suffix && !suffix.endsWith("\n"))
 		throw new StateCommandError(2, "execution approval transcript continuation is incomplete");
+	let approvalAskResultSeen = false;
 	for (const record of approvalTranscriptRecords(suffix)) {
+		const message = record.message;
+		const isUserBearingAskResult =
+			record.type === "message" &&
+			isPlainObject(message) &&
+			message.role === "toolResult" &&
+			message.toolName === "ask";
+		const isRecordedApprovalAskResult =
+			isUserBearingAskResult &&
+			!approvalAskResultSeen &&
+			boundary.approval_tool_call_id !== undefined &&
+			message.toolCallId === boundary.approval_tool_call_id;
 		if (
 			record.type !== "message" ||
 			!isExecutionApprovalId(record.id) ||
 			branch.ids.has(record.id) ||
 			record.parentId !== branch.leaf ||
 			!isPlainObject(record.message) ||
-			!["assistant", "toolResult"].includes(String(record.message.role))
+			!["assistant", "toolResult"].includes(String(record.message.role)) ||
+			(isUserBearingAskResult && !isRecordedApprovalAskResult)
 		)
-			throw new StateCommandError(2, "execution approval transcript continuation changed user evidence or branch");
+			throw new StateCommandError(
+				2,
+				isUserBearingAskResult
+					? "execution approval transcript continuation contains a user-bearing Ask result"
+					: "execution approval transcript continuation changed user evidence or branch",
+			);
+		if (isRecordedApprovalAskResult) approvalAskResultSeen = true;
 		branch.ids.add(record.id);
 		branch.leaf = record.id;
 	}
@@ -2378,6 +2401,7 @@ export async function recordNonCrystalExecutionApproval(options: {
 							sessionId,
 							options.transcriptPath,
 							options.transcriptSha256,
+							options.questionId,
 						),
 						created_at: nowIso(),
 						expires_at: new Date(Date.now() + DEEP_INTERVIEW_EXECUTION_APPROVAL_MAX_AGE_MS).toISOString(),
@@ -2858,6 +2882,7 @@ export async function recordDeepInterviewExecutionApproval(options: {
 					options.sessionId,
 					options.transcriptPath,
 					options.transcriptSha256,
+					options.questionId,
 				),
 				approval_stage: options.approvalStage ?? "deep-interview",
 				...(ralplanFinal
