@@ -151,7 +151,11 @@ mod unix_impl {
 	/// attacker-controlled — this mirrors `path_identity.rs`'s
 	/// `descriptor_walk_path` so temp-file parents (e.g. `os.tmpdir()`)
 	/// resolve the same way here that they do for the rest of the native layer.
-	const fn descriptor_walk_path(path: &Path) -> Cow<'_, Path> {
+	#[allow(
+		clippy::missing_const_for_fn,
+		reason = "macOS alias normalization uses non-const Path operations"
+	)]
+	fn descriptor_walk_path(path: &Path) -> Cow<'_, Path> {
 		#[cfg(target_os = "macos")]
 		{
 			for alias in ["/var", "/tmp", "/etc"] {
@@ -414,11 +418,12 @@ mod unix_impl {
 		Err("atomic_unavailable")
 	}
 
+	#[allow(clippy::unnecessary_cast, reason = "libc stat field widths differ between Unix targets")]
 	const fn symlink_identity(st: &libc::stat) -> Option<(u64, u64)> {
 		if st.st_mode & libc::S_IFMT != libc::S_IFLNK {
 			return None;
 		}
-		Some((st.st_dev, st.st_ino))
+		Some((st.st_dev as u64, st.st_ino as u64))
 	}
 
 	#[allow(clippy::too_many_arguments, reason = "mirrors the public napi signature 1:1")]

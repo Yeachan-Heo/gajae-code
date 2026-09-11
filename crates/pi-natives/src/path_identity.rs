@@ -4267,7 +4267,7 @@ pub(crate) mod platform {
 			Err(error) => return NativePermissionRepairResult::refused(security_code(&error)),
 		}
 		let old_mode = before.st_mode & 0o7777;
-		if before.st_mode != expected_mode {
+		if before.st_mode as u32 != expected_mode {
 			return NativePermissionRepairResult::refused("mode_mismatch");
 		}
 		let new_mode = old_mode & !0o077;
