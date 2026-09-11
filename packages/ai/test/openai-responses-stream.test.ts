@@ -136,6 +136,26 @@ describe("Responses provider: bounded stream-failure classification", () => {
 		}
 	});
 
+	test("treats response.incomplete as a terminal event rather than an interruption", async () => {
+		const result = await streamProviderResult([
+			{ type: "response.created", response: { id: "resp_incomplete" } },
+			{
+				type: "response.incomplete",
+				response: {
+					id: "resp_incomplete",
+					status: "incomplete",
+					incomplete_details: { reason: "max_output_tokens" },
+				},
+			},
+		]);
+
+		// A length-limited stream is a normal terminal (`length`), never the
+		// unexpected-EOF classifier.
+		expect(result.stopReason).toBe("length");
+		expect(result.errorCode).toBeUndefined();
+		expect(result.transportFailure).toBeUndefined();
+	});
+
 	test("reports an unexpected EOF instead of a content-free success", async () => {
 		// The parser reports that no terminal event was observed...
 		expect(await processResponsesStream(makeStream([]), makeOutput(), makeSink(), makeModel())).toBe(false);

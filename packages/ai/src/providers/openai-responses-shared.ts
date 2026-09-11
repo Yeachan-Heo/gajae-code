@@ -964,7 +964,7 @@ export async function processResponsesStream<TApi extends Api>(
 				dropEntry(item.id, event.output_index, item.call_id);
 				stream.push({ type: "toolcall_end", contentIndex, toolCall, partial: output });
 			}
-		} else if (event.type === "response.completed") {
+		} else if (event.type === "response.completed" || event.type === "response.incomplete") {
 			sawTerminalEvent = true;
 			const response = event.response;
 			if (response?.id) {
