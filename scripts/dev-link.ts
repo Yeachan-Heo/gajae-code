@@ -22,10 +22,10 @@
  */
 
 import * as fs from "node:fs";
+import { createHash } from "node:crypto";
 import * as os from "node:os";
 import * as path from "node:path";
-import { formatWorktreeReport, inspectWorktree } from "./worktree-deps";
-import { createHash } from "node:crypto";
+import { findForeignWorkspaceLinks, formatWorktreeReport, inspectWorktree } from "./worktree-deps";
 
 const repoRoot = path.join(import.meta.dir, "..");
 const cliSource = path.join(repoRoot, "packages", "coding-agent", "src", "cli.ts");
