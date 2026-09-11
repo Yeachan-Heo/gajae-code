@@ -10287,13 +10287,13 @@ export class AgentSession {
 		const bridge = this.#clientBridge;
 		const acpEnabled = Boolean(bridge?.capabilities.requestPermission && bridge.requestPermission);
 		const sdkEnabled = this.#sdkPermissionProvider !== undefined;
-		const activeSkill = this.#activeSkillState?.skill ?? "";
-		const activeSkillSession = this.#activeSkillState?.sessionId ?? "";
+		// The wrapped behavior depends only on live session state (cwd, session id,
+		// session agent dir) plus the ACP/SDK permission surfaces below. Active-skill
+		// state is deliberately absent: the Ultragoal ask guard binds to the caller
+		// session id alone, so a skill transition does not change any wrapper.
 		return [
 			"workflow-mutation-v1",
-
-			"ultragoal-ask-v1",
-			`active=${activeSkill}:${activeSkillSession}`,
+			"ultragoal-ask-v2",
 			`acp=${acpEnabled ? "on" : "off"}:sdk=${sdkEnabled ? "on" : "off"}:${this.#acpPermissionWrapperVersion}`,
 		].join("|");
 	}
@@ -10310,10 +10310,7 @@ export class AgentSession {
 					guardToolForUltragoalAsk(
 						innerTool,
 						() => this.sessionManager.getCwd(),
-						() => ({
-							activeSkillState: this.getActiveSkillState(),
-							sessionId: this.sessionManager.getSessionId(),
-						}),
+						() => ({ sessionId: this.sessionManager.getSessionId() }),
 						() => this.getSessionAgentDir(),
 					),
 				),

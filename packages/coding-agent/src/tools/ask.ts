@@ -825,10 +825,7 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 	): Promise<AgentToolResult<AskToolDetails>> {
 		await assertUltragoalAskAllowed(
 			this.session.cwd,
-			{
-				activeSkillState: this.session.getActiveSkillState?.(),
-				sessionId: this.session.getSessionId?.() ?? null,
-			},
+			{ sessionId: this.session.getSessionId?.() ?? null },
 			this.session.getSessionAgentDir?.() ?? this.session.settings.getAgentDir(),
 		);
 		assertDeepInterviewStructuredResponseWithinLimit(params);

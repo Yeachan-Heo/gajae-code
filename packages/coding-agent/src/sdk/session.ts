@@ -4357,10 +4357,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				guardToolForUltragoalAsk(
 					tool,
 					() => sessionManager.getCwd(),
-					() => ({
-						activeSkillState: session?.getActiveSkillState(),
-						sessionId: sessionManager.getSessionId?.() ?? null,
-					}),
+					() => ({ sessionId: sessionManager.getSessionId?.() ?? null }),
 					() => session?.getSessionAgentDir(),
 				),
 			);
