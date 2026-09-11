@@ -51,7 +51,6 @@ export declare class ComputerController {
   keypress(expectedEpoch: number | undefined | null, keys: Array<string>): void
   wait(expectedEpoch: number | undefined | null, ms: number): void
 }
-
 export declare class DoctorJournalAuthority {
   static createExact(root: string, runId: string): DoctorJournalCreateResult
   append(record: string): void
@@ -963,8 +962,10 @@ export declare function exactReplacePath(sourcePath: string, destinationPath: st
 /**
  * Atomically replace an in-place executable (or other running-process
  * payload) only after validating the exact staged source and current
- * destination, retiring the old destination bytes to a caller-preauthorized
- * backup name instead of scrubbing or unlinking them.
+ * destination.
+ *
+ * The old destination bytes are retired to a caller-preauthorized backup
+ * name instead of being scrubbed or unlinked.
  *
  * This exists for D4 self-replacement: [`exact_replace_path`] retires its
  * predecessor through the same descriptor-scrub/exchange-cleanup protocol
@@ -1006,11 +1007,12 @@ export declare function exactRestore(detachedPath: string, originalPath: string,
 
 /**
  * Exchange a staged symlink with the expected destination using the platform
- * atomic name-exchange primitive, retaining the destination's parent as a
- * single opened descriptor for every check and mutation. The retired link is
- * moved into `quarantine_path` with a no-replace rename; it is never deleted
- * and a foreign occupant at any of the three names is always refused rather
- * than overwritten.
+ * atomic name-exchange primitive.
+ *
+ * The destination's parent is retained as a single opened descriptor for
+ * every check and mutation. The retired link is moved into `quarantine_path`
+ * with a no-replace rename; it is never deleted and a foreign occupant at
+ * any of the three names is always refused rather than overwritten.
  */
 export declare function exactSwapManagedLink(stagedPath: string, destinationPath: string, quarantinePath: string, parentDev: string, parentIno: string, oldDev: string, oldIno: string, oldTarget: string, stagedDev: string, stagedIno: string, newTarget: string): DoctorLinkSwapResult
 
@@ -1126,9 +1128,11 @@ export interface FuzzyFindResult {
 }
 
 /**
- * Protocol version for [`exact_swap_managed_link`]'s argument contract. The
- * caller checks this before staging anything so a stale addon (old argument
- * order/count) is refused up front rather than discovered mid-mutation.
+ * Protocol version for [`exact_swap_managed_link`]'s argument contract.
+ *
+ * The caller checks this before staging anything so a stale addon (old
+ * argument order/count) is refused up front rather than discovered
+ * mid-mutation.
  */
 export declare function getDoctorLinkProtocolVersion(): number
 
@@ -1485,7 +1489,10 @@ export interface InboundImageEvent {
  */
 export declare function initNativeCrashDiagnostics(): boolean
 
-/** Validate the exact permission repair preconditions without changing metadata. */
+/**
+ * Validate the exact permission repair preconditions without changing
+ * metadata.
+ */
 export declare function inspectConfigFilePermissionRepair(path: string, identity: NativeExactFileIdentity, expectedMode: number): NativePermissionRepairResult
 
 /**
@@ -2104,8 +2111,10 @@ export interface NativePermissionRepairResult {
  *
  * `status` discriminates the three outcomes described on
  * [`pi_shell::process::ProcessObservation`]:
- * - `"present"` — `incarnation` is the exact kernel-reported identity evidence.
- * - `"absent"` — the OS positively confirmed no process currently has this pid.
+ * - `"present"` — `incarnation` is the exact kernel-reported identity
+ *   evidence.
+ * - `"absent"` — the OS positively confirmed no process currently has this
+ *   pid.
  * - `"unknown"` — `reasonCode` explains why liveness could not be determined
  *   (e.g. an invalid pid, a permission denial, or a platform limitation); this
  *   is never proof of death.
@@ -2362,7 +2371,10 @@ export declare function renameNoReplacePath(sourcePath: string, destinationPath:
  */
 export declare function renameNoReplacePathAsync(sourcePath: string, destinationPath: string): Promise<NativeNoReplaceResult>
 
-/** Remove only group/other permission bits from an exact, user-owned regular file. */
+/**
+ * Remove only group/other permission bits from an exact, user-owned regular
+ * file.
+ */
 export declare function repairConfigFilePermissions(path: string, identity: NativeExactFileIdentity, expectedMode: number): NativePermissionRepairResult
 
 /**

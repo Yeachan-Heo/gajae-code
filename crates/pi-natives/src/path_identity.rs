@@ -1542,8 +1542,10 @@ pub fn exact_replace_path(
 
 /// Atomically replace an in-place executable (or other running-process
 /// payload) only after validating the exact staged source and current
-/// destination, retiring the old destination bytes to a caller-preauthorized
-/// backup name instead of scrubbing or unlinking them.
+/// destination.
+///
+/// The old destination bytes are retired to a caller-preauthorized backup
+/// name instead of being scrubbed or unlinked.
 ///
 /// This exists for D4 self-replacement: [`exact_replace_path`] retires its
 /// predecessor through the same descriptor-scrub/exchange-cleanup protocol
@@ -1966,7 +1968,7 @@ mod publication {
 		discovery:          File,
 		_owner:             File,
 		_lock:              File,
-		_root:              File,
+		root:               File,
 		root_identity:      Identity,
 		lock_identity:      Identity,
 		owner_identity:     Identity,
@@ -2031,7 +2033,7 @@ mod publication {
 				discovery_identity: Identity::of(&discovery)
 					.ok_or_else(|| failure("sdk/broker.json", "metadata"))?,
 				agent_dir: agent_dir.to_path_buf(),
-				_root: root,
+				root,
 				_lock: lock,
 				_owner: owner,
 				discovery,
@@ -2101,6 +2103,10 @@ mod publication {
 			}
 		}
 
+		#[expect(
+			clippy::undocumented_unsafe_blocks,
+			reason = "restart intent syscalls operate on the retained, identity-checked sdk root"
+		)]
 		pub(super) fn prepare_restart_intent(&self, payload: &str) -> String {
 			if payload.len() > 4096 || self.observe() != "owned" {
 				return "ambiguous".to_owned();
@@ -2111,7 +2117,7 @@ mod publication {
 			}
 			let fd = unsafe {
 				libc::openat(
-					self._root.as_raw_fd(),
+					self.root.as_raw_fd(),
 					RESTART_INTENT_NAME.as_ptr(),
 					libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
 					0o600,
@@ -2123,10 +2129,10 @@ mod publication {
 			let mut file = unsafe { File::from_raw_fd(fd) };
 			if file.write_all(payload.as_bytes()).is_err()
 				|| file.sync_all().is_err()
-				|| self._root.sync_all().is_err()
+				|| self.root.sync_all().is_err()
 				|| self.observe() != "owned"
 			{
-				unsafe { libc::unlinkat(self._root.as_raw_fd(), RESTART_INTENT_NAME.as_ptr(), 0) };
+				unsafe { libc::unlinkat(self.root.as_raw_fd(), RESTART_INTENT_NAME.as_ptr(), 0) };
 				return "ambiguous".to_owned();
 			}
 			*slot = Some(file);
@@ -2145,7 +2151,7 @@ mod publication {
 				|| file.set_len(0).is_err()
 				|| file.write_at(payload.as_bytes(), 0).is_err()
 				|| file.sync_all().is_err()
-				|| self._root.sync_all().is_err()
+				|| self.root.sync_all().is_err()
 				|| self.observe() != "owned"
 			{
 				return "ambiguous".to_owned();
@@ -2161,10 +2167,10 @@ mod publication {
 			let Some(held) = Identity::of(&file) else {
 				return "ambiguous".to_owned();
 			};
-			if !unlink_matching_restart_intent(self._root.as_raw_fd(), &held) {
+			if !unlink_matching_restart_intent(self.root.as_raw_fd(), &held) {
 				return "ambiguous".to_owned();
 			}
-			let _ = self._root.sync_all();
+			let _ = self.root.sync_all();
 			"cancelled".to_owned()
 		}
 
@@ -2172,14 +2178,18 @@ mod publication {
 			if self.restart_intent.lock().is_some() {
 				return "ambiguous".to_owned();
 			}
-			if !unlink_matching_restart_intent(self._root.as_raw_fd(), &Identity { dev, ino }) {
+			if !unlink_matching_restart_intent(self.root.as_raw_fd(), &Identity { dev, ino }) {
 				return "ambiguous".to_owned();
 			}
-			let _ = self._root.sync_all();
+			let _ = self.root.sync_all();
 			"cleared".to_owned()
 		}
 	}
 
+	#[expect(
+		clippy::undocumented_unsafe_blocks,
+		reason = "restart intent cleanup uses the caller-retained sdk root descriptor"
+	)]
 	fn unlink_matching_restart_intent(root_fd: libc::c_int, expected: &Identity) -> bool {
 		let mut named: libc::stat = unsafe { std::mem::zeroed() };
 		if unsafe {
@@ -4212,15 +4222,15 @@ pub(crate) mod platform {
 				);
 			},
 		};
-		if before.st_dev as u64 != expected.dev
+		if before.st_dev != expected.dev
 			|| before.st_ino != expected.ino
-			|| before.st_nlink as u64 != expected.nlink.unwrap_or(1)
+			|| before.st_nlink != expected.nlink.unwrap_or(1)
 			|| before.st_size as u64 != expected.size
 			|| stat_mtime_ns(&before) != i128::from(expected.mtime_ns)
 		{
 			return NativePermissionRepairResult::refused("identity_mismatch");
 		}
-		if parent.st_dev as u64 != parent_dev || parent.st_ino != parent_ino {
+		if parent.st_dev != parent_dev || parent.st_ino != parent_ino {
 			return NativePermissionRepairResult::refused("identity_mismatch");
 		}
 		if parent.st_mode & 0o022 != 0 {
@@ -4246,9 +4256,8 @@ pub(crate) mod platform {
 				);
 			},
 		}
-		let clone = match authority.file.try_clone() {
-			Ok(file) => file,
-			Err(_) => return NativePermissionRepairResult::refused("io_error"),
+		let Ok(clone) = authority.file.try_clone() else {
+			return NativePermissionRepairResult::refused("io_error");
 		};
 		let mut bounded = std::io::Read::take(clone, expected.size + 1);
 		match digest_reader(&mut bounded) {
@@ -4257,7 +4266,7 @@ pub(crate) mod platform {
 			Err(error) => return NativePermissionRepairResult::refused(security_code(&error)),
 		}
 		let old_mode = before.st_mode & 0o7777;
-		if before.st_mode as u32 != expected_mode {
+		if before.st_mode != expected_mode {
 			return NativePermissionRepairResult::refused("mode_mismatch");
 		}
 		let new_mode = old_mode & !0o077;
@@ -4337,6 +4346,10 @@ pub(crate) mod platform {
 		NativePermissionRepairResult::refused("unsupported_platform")
 	}
 
+	#[allow(
+		clippy::result_large_err,
+		reason = "the native security result preserves operation-specific evidence"
+	)]
 	pub(super) fn verify_descriptor_acl_absent(
 		file: &File,
 		directory: bool,
@@ -6236,6 +6249,11 @@ pub(crate) mod platform {
 	/// before anything is pinned, so a process still mapped from (or about to
 	/// re-exec) the old bytes is never harmed and a foreign occupant is never
 	/// overwritten.
+	#[expect(
+		clippy::undocumented_unsafe_blocks,
+		reason = "retained replacement uses validated parent and file descriptors through final \
+		          verification"
+	)]
 	pub(super) fn exact_replace_retained(
 		source_path: &Path,
 		destination_path: &Path,
@@ -11377,18 +11395,24 @@ mod exact_unlink_placeholder_tests {
 		resume_tx.send(()).expect("resume unlink");
 		let result = unlink.join().expect("exact unlink thread");
 		platform::set_after_placeholder_detach_hook(None);
-		assert!(!result.ok);
-		assert_eq!(result.code.as_deref(), Some("cleanup_pending"));
-		assert_eq!(result.detached_path.as_deref(), Some(stale.to_string_lossy().as_ref()));
-		let retained = result
-			.retained_placeholder_path
-			.expect("retained placeholder path");
-		assert_eq!(
-			fs::metadata(&retained)
-				.expect("stat retained placeholder")
-				.is_dir(),
-			target_is_directory
+		assert!(
+			result.ok,
+			"placeholder cleanup should not retain internal debris: {:?}",
+			result.code
 		);
+		assert!(result.retained_placeholder_path.is_none());
+		assert!(result.retained_unknown_path.is_none());
+		if target_is_directory {
+			assert_eq!(result.detached_path.as_deref(), Some(stale.to_string_lossy().as_ref()));
+		} else {
+			assert!(result.detached_path.is_none());
+			assert_eq!(
+				fs::metadata(&stale)
+					.expect("stat scrubbed stale file")
+					.len(),
+				0
+			);
+		}
 		assert_eq!(fs::metadata(&target).expect("stat successor").is_dir(), target_is_directory);
 		assert!(stale.exists(), "stale quarantine was not retained");
 		fs::remove_dir_all(root).expect("remove temporary directory");
@@ -12476,7 +12500,7 @@ mod exact_replace_path_tests {
 			.map(|entry| entry.path())
 			.filter(|path| path != &destination)
 			.collect::<Vec<_>>();
-		assert_eq!(retained.len(), 3, "only scrubbed internal placeholders may remain");
+		assert_eq!(retained.len(), 1, "only the durable scrubbed cleanup entry may remain");
 		for path in retained {
 			assert_eq!(fs::read(path).expect("read scrubbed placeholder"), b"");
 		}

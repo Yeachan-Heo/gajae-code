@@ -86,6 +86,22 @@ export async function runCli(argv: string[]): Promise<void> {
 			return;
 		}
 	}
+	if (argv.length === 1 && argv[0] === "--supports-macos-community-app") {
+		process.stdout.write("macos-community-app-offer\n");
+		return;
+	}
+	if (argv.length === 1 && argv[0] === "--internal-macos-community-app-offer") {
+		try {
+			const { offerMacosCommunityApp } = await import("./cli/macos-community-app");
+			await offerMacosCommunityApp({ log: message => process.stderr.write(`${message}\n`) });
+		} catch {
+			const { COMMUNITY_APP_REPOSITORY } = await import("./cli/macos-community-app");
+			process.stderr.write(
+				`Optional community app offer failed; GJC remains installed. https://github.com/${COMMUNITY_APP_REPOSITORY}\n`,
+			);
+		}
+		return;
+	}
 	if (argv[0] === "--internal-doctor-worker") {
 		// Non-forgeable route: reachable only with the exact per-spawn token env var
 		// AND a non-TTY stdin (isRoutableDoctorWorkerInvocation), so a user's own

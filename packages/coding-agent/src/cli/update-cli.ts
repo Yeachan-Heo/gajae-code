@@ -1633,7 +1633,13 @@ export async function runUpdateCommand(
 
 	if (target.method === "migrate" && decision.install && !opts.force) {
 		// Check mode is read-only, including when another installer holds the lock.
-		const releaseLock = opts.check ? undefined : await acquireBinaryUpdateLock(target.path);
+		// A first-time migration may intentionally target a path whose parent does
+		// not exist yet; the real install creates it before entering the locked
+		// replacement flow. There is no existing lock to contend with in that
+		// state, so preflight remains read-only and lock-free until installation.
+		const targetParent = path.dirname(path.resolve(target.path));
+		const parent = await fs.promises.lstat(targetParent).catch(() => undefined);
+		const releaseLock = opts.check || !parent?.isDirectory() ? undefined : await acquireBinaryUpdateLock(target.path);
 		let verified = false;
 		try {
 			verified = (await verifyTarget(release, target.path)).ok;

@@ -34,20 +34,23 @@ fn outcome(
 	DoctorLinkSwapResult { status: status.into(), changed, verified, code: code.map(str::to_owned) }
 }
 
-/// Protocol version for [`exact_swap_managed_link`]'s argument contract. The
-/// caller checks this before staging anything so a stale addon (old argument
-/// order/count) is refused up front rather than discovered mid-mutation.
+/// Protocol version for [`exact_swap_managed_link`]'s argument contract.
+///
+/// The caller checks this before staging anything so a stale addon (old
+/// argument order/count) is refused up front rather than discovered
+/// mid-mutation.
 #[napi]
 pub const fn get_doctor_link_protocol_version() -> u32 {
 	2
 }
 
 /// Exchange a staged symlink with the expected destination using the platform
-/// atomic name-exchange primitive, retaining the destination's parent as a
-/// single opened descriptor for every check and mutation. The retired link is
-/// moved into `quarantine_path` with a no-replace rename; it is never deleted
-/// and a foreign occupant at any of the three names is always refused rather
-/// than overwritten.
+/// atomic name-exchange primitive.
+///
+/// The destination's parent is retained as a single opened descriptor for
+/// every check and mutation. The retired link is moved into `quarantine_path`
+/// with a no-replace rename; it is never deleted and a foreign occupant at
+/// any of the three names is always refused rather than overwritten.
 #[napi]
 #[allow(
 	clippy::too_many_arguments,
@@ -148,7 +151,7 @@ mod unix_impl {
 	/// attacker-controlled — this mirrors `path_identity.rs`'s
 	/// `descriptor_walk_path` so temp-file parents (e.g. `os.tmpdir()`)
 	/// resolve the same way here that they do for the rest of the native layer.
-	fn descriptor_walk_path(path: &Path) -> Cow<'_, Path> {
+	const fn descriptor_walk_path(path: &Path) -> Cow<'_, Path> {
 		#[cfg(target_os = "macos")]
 		{
 			for alias in ["/var", "/tmp", "/etc"] {
@@ -415,7 +418,7 @@ mod unix_impl {
 		if st.st_mode & libc::S_IFMT != libc::S_IFLNK {
 			return None;
 		}
-		Some((st.st_dev as u64, st.st_ino))
+		Some((st.st_dev, st.st_ino))
 	}
 
 	#[allow(clippy::too_many_arguments, reason = "mirrors the public napi signature 1:1")]
@@ -536,15 +539,11 @@ mod unix_impl {
 		// the exchange is atomic and kernel-guaranteed, but this call never trusts its
 		// own success return without re-observing the exact resulting identities and
 		// targets.
-		let dest_after = match fstatat_no_follow(dir.as_raw_fd(), &dest_cname) {
-			Ok(st) => st,
-			Err(_) => {
-				return outcome("uncertain", true, false, Some("post_swap_destination_unreadable"));
-			},
+		let Ok(dest_after) = fstatat_no_follow(dir.as_raw_fd(), &dest_cname) else {
+			return outcome("uncertain", true, false, Some("post_swap_destination_unreadable"));
 		};
-		let staged_after = match fstatat_no_follow(dir.as_raw_fd(), &staged_cname) {
-			Ok(st) => st,
-			Err(_) => return outcome("uncertain", true, false, Some("post_swap_staged_unreadable")),
+		let Ok(staged_after) = fstatat_no_follow(dir.as_raw_fd(), &staged_cname) else {
+			return outcome("uncertain", true, false, Some("post_swap_staged_unreadable"));
 		};
 		let dest_ok = symlink_identity(&dest_after) == Some(staged_id)
 			&& readlinkat_string(dir.as_raw_fd(), &dest_cname).as_deref() == Ok(new_target);

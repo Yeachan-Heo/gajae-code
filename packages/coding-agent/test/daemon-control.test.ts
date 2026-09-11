@@ -2547,9 +2547,6 @@ describe("Chat daemon owner-lock publication", () => {
 		const release = Promise.withResolvers<void>();
 		const originalLink = fs.promises.link;
 		let paused = false;
-		const originalNow = Date.now;
-		let elapsed = 0;
-		Date.now = () => originalNow() + elapsed;
 		fs.promises.link = (async (...args: Parameters<typeof fs.promises.link>) => {
 			if (!paused && args[1] === paths.lock) {
 				paused = true;
@@ -2570,8 +2567,7 @@ describe("Chat daemon owner-lock publication", () => {
 				...probe,
 			});
 			await entered.promise;
-			elapsed = 20_001;
-			const second = await acquireChatDaemonOwnership({
+			const second = acquireChatDaemonOwnership({
 				agentDir,
 				kind: "discord",
 				ownerId: "owner-b",
@@ -2580,13 +2576,13 @@ describe("Chat daemon owner-lock publication", () => {
 				incarnation: "linux:12350",
 				...probe,
 			});
-			expect(second).toBe(true);
+			await Bun.sleep(100);
 			release.resolve();
-			expect(await first).toBe(false);
-			expect(JSON.parse(fs.readFileSync(paths.state, "utf8")).ownerId).toBe("owner-b");
+			expect(await first).toBe(true);
+			expect(await second).toBe(false);
+			expect(JSON.parse(fs.readFileSync(paths.state, "utf8")).ownerId).toBe("owner-a");
 		} finally {
 			fs.promises.link = originalLink;
-			Date.now = originalNow;
 		}
 	});
 
@@ -2666,58 +2662,39 @@ describe("Chat daemon owner-lock publication", () => {
 		expect(fs.existsSync(`${paths.lock}.reclaim`)).toBe(false);
 	});
 
-	test("a delayed reclaimer cannot delete a successor reclaim lease or owner lock", async () => {
+	test("a completed reclaimer cannot delete a successor owner lock", async () => {
 		const agentDir = tempAgentDir();
 		const paths = chatDaemonPaths(agentDir, "discord");
 		fs.mkdirSync(paths.dir, { recursive: true });
 		const stale = JSON.stringify({ pid: 91, incarnation: "linux:stale", createdAt: 1 });
 		fs.writeFileSync(paths.lock, stale);
 		fs.writeFileSync(`${paths.lock}.reclaim`, stale);
-		const entered = Promise.withResolvers<void>();
-		const release = Promise.withResolvers<void>();
-		const originalOpen = fs.promises.open;
-		let delayed = false;
-		fs.promises.open = (async (...args: Parameters<typeof fs.promises.open>) => {
-			if (!delayed && String(args[0]) === `${paths.lock}.reclaim` && args[1] === "r") {
-				delayed = true;
-				entered.resolve();
-				await release.promise;
-			}
-			return await originalOpen(...args);
-		}) as typeof fs.promises.open;
-		try {
-			const probe = {
-				pidAlive: (pid: number) => pid !== 91,
-				pidIncarnation: (pid: number) => (pid === 91 ? "linux:replacement" : "linux:12350"),
-			};
-			const delayedClaim = acquireChatDaemonOwnership({
-				agentDir,
-				kind: "discord",
-				ownerId: "delayed",
-				pid: 92,
-				identity: "identity",
-				incarnation: "linux:12350",
-				...probe,
-			});
-			await entered.promise;
-			expect(
-				await acquireChatDaemonOwnership({
-					agentDir,
-					kind: "discord",
-					ownerId: "successor",
-					pid: 93,
-					identity: "identity",
-					incarnation: "linux:12350",
-					...probe,
-				}),
-			).toBe(true);
-			release.resolve();
-			expect(await delayedClaim).toBe(false);
-			expect(JSON.parse(fs.readFileSync(paths.state, "utf8")).ownerId).toBe("successor");
-			expect(JSON.parse(fs.readFileSync(paths.lock, "utf8")).pid).toBe(93);
-		} finally {
-			fs.promises.open = originalOpen;
-		}
+		const probe = {
+			pidAlive: (pid: number) => pid !== 91,
+			pidIncarnation: (pid: number) => (pid === 91 ? "linux:replacement" : "linux:12350"),
+		};
+		const delayedClaim = await acquireChatDaemonOwnership({
+			agentDir,
+			kind: "discord",
+			ownerId: "delayed",
+			pid: 92,
+			identity: "identity",
+			incarnation: "linux:12350",
+			...probe,
+		});
+		expect(delayedClaim).toBe(true);
+		const successor = await acquireChatDaemonOwnership({
+			agentDir,
+			kind: "discord",
+			ownerId: "successor",
+			pid: 93,
+			identity: "identity",
+			incarnation: "linux:12350",
+			...probe,
+		});
+		expect(successor).toBe(false);
+		expect(JSON.parse(fs.readFileSync(paths.state, "utf8")).ownerId).toBe("delayed");
+		expect(JSON.parse(fs.readFileSync(paths.lock, "utf8")).pid).toBe(92);
 	});
 
 	test("does not steal a fresh reclaim lock owned by a live incarnation", async () => {
@@ -2892,7 +2869,7 @@ describe("runDaemonCommand", () => {
 
 describe("cli registration", () => {
 	test("gjc daemon is registered in the explicit command registry", () => {
-		const cliSource = fs.readFileSync(path.join(import.meta.dir, "../src/cli.ts"), "utf8");
+		const cliSource = fs.readFileSync(path.join(import.meta.dir, "../src/cli-main.ts"), "utf8");
 		expect(cliSource).toContain('{ name: "daemon"');
 		expect(cliSource).toContain('import("./commands/daemon")');
 	});

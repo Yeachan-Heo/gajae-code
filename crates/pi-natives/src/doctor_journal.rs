@@ -73,11 +73,8 @@ fn directory_security(file: &File, private: bool, ancestor: bool) -> Result<Meta
 fn file_security(file: &File) -> Result<Metadata, String> {
 	let meta = file.metadata().map_err(io_code)?;
 	// SAFETY: geteuid only observes process credentials.
-	if !meta.is_file()
-		|| meta.nlink() != 1
-		|| meta.mode() & 0o777 != 0o600
-		|| meta.uid() != unsafe { libc::geteuid() }
-	{
+	let euid = unsafe { libc::geteuid() };
+	if !meta.is_file() || meta.nlink() != 1 || meta.mode() & 0o777 != 0o600 || meta.uid() != euid {
 		return Err("unsafe_journal_file".to_owned());
 	}
 	crate::path_identity::verify_descriptor_acl_absent(file, false)?;

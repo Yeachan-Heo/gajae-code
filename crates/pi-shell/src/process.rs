@@ -473,6 +473,13 @@ mod platform {
 		if pid <= 0 {
 			return ProcessObservation::Unknown { reason_code: "invalid_pid".to_owned() };
 		}
+		// A zombie remains addressable to `kill(pid, 0)` until its parent reaps it,
+		// but it has already exited and cannot be an owned live successor. `/proc`
+		// reports that state directly, so classify it as positively absent before
+		// attempting pidfd/start-time identity.
+		if read_process_state(pid) == Some('Z') {
+			return ProcessObservation::Absent;
+		}
 		if let Some(process) = Process::from_pid(pid) {
 			return ProcessObservation::Present { incarnation: process.incarnation() };
 		}

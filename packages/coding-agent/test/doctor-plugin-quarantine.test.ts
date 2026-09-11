@@ -3,6 +3,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { getAgentDir, setAgentDir } from "@gajae-code/utils";
+import { safeRm } from "../../../scripts/safe-cleanup";
 import { resolveDoctorRoot } from "../src/cli/doctor/ids";
 import {
 	applyPluginQuarantine as applyQuarantineWithBaseline,
@@ -47,9 +48,9 @@ afterEach(async () => {
 	setAgentDir(originalAgentDir);
 	if (originalHome === undefined) delete process.env.HOME;
 	else process.env.HOME = originalHome;
-	await fs.rm(tempHome, { recursive: true, force: true });
-	await fs.rm(cwd, { recursive: true, force: true });
-	await fs.rm(journalRoot, { recursive: true, force: true });
+	await safeRm(tempHome, { recursive: true, force: true });
+	await safeRm(cwd, { recursive: true, force: true });
+	await safeRm(journalRoot, { recursive: true, force: true });
 });
 
 type QuarantineFixtureInput = Omit<PluginQuarantineRequest, "rootId"> & { rootId?: string };
