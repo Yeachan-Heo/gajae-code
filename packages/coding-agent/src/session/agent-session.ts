@@ -316,7 +316,7 @@ import {
 import {
 	assertNonEmptyGjcSessionId,
 	modeStatePath as sessionModeStatePath,
-	sessionRuntimeDir,
+	sessionRuntimeStatePath,
 	sessionStateDir,
 } from "../gjc-runtime/session-layout";
 import { sessionStateLockFailureFields, shouldWarnPersistFailure } from "../gjc-runtime/session-state-lock";
@@ -4474,6 +4474,9 @@ export class AgentSession {
 				newCwdIdentity: move.newCwdIdentity,
 				previousSessionFile: move.previousSessionFile ?? null,
 				newSessionFile: move.newSessionFile ?? null,
+				// The rescope family must decide pin-vs-derived from the marker THIS session
+				// owns, never from the ambient pin (#5473).
+				stateFile: this.#runtimeStateMarkerFile({ sessionId: this.sessionId, cwd: move.previousCwd }),
 			});
 		});
 		this.#unregisterMoveAbortListener = this.sessionManager.registerMoveAbortListener(async move => {
@@ -4485,6 +4488,7 @@ export class AgentSession {
 							sessionId: this.sessionId,
 							cwd: move.newCwd,
 							sessionFile: move.newSessionFile ?? null,
+							stateFile: this.#runtimeStateMarkerFile({ sessionId: this.sessionId, cwd: move.newCwd }),
 						},
 						moveId,
 						move.previousCwd,
@@ -4503,6 +4507,7 @@ export class AgentSession {
 					sessionId: this.sessionId,
 					cwd: move.newCwd,
 					sessionFile: move.newSessionFile ?? null,
+					stateFile: this.#runtimeStateMarkerFile({ sessionId: this.sessionId, cwd: move.newCwd }),
 				},
 				move.previousCwd,
 				moveId,
@@ -4526,6 +4531,7 @@ export class AgentSession {
 						cwd: move.newCwd,
 						sessionFile: this.sessionManager.getSessionFile() ?? null,
 						previousSessionFile: move.previousSessionFile ?? null,
+						stateFile: this.#runtimeStateMarkerFile({ sessionId: this.sessionId, cwd: move.newCwd }),
 					},
 					move.previousCwd,
 				);
@@ -4535,6 +4541,7 @@ export class AgentSession {
 						sessionId: this.sessionId,
 						cwd: move.newCwd,
 						sessionFile: this.sessionManager.getSessionFile() ?? null,
+						stateFile: this.#runtimeStateMarkerFile({ sessionId: this.sessionId, cwd: move.newCwd }),
 					},
 					this.#coordinatorRescopeMoveId,
 					move.previousCwd,
@@ -4551,6 +4558,7 @@ export class AgentSession {
 							cwd: move.newCwd,
 							sessionFile: this.sessionManager.getSessionFile() ?? null,
 							previousSessionFile: move.previousSessionFile ?? null,
+							stateFile: this.#runtimeStateMarkerFile({ sessionId: this.sessionId, cwd: move.newCwd }),
 						},
 						move.previousCwd,
 					);
@@ -4560,6 +4568,7 @@ export class AgentSession {
 							sessionId: this.sessionId,
 							cwd: move.newCwd,
 							sessionFile: this.sessionManager.getSessionFile() ?? null,
+							stateFile: this.#runtimeStateMarkerFile({ sessionId: this.sessionId, cwd: move.newCwd }),
 						},
 						this.#coordinatorRescopeMoveId,
 						move.previousCwd,
@@ -4594,6 +4603,10 @@ export class AgentSession {
 			sessionId: this.sessionId,
 			cwd: this.sessionManager.getCwd(),
 			sessionFile: this.sessionManager.getSessionFile() ?? null,
+			stateFile: this.#runtimeStateMarkerFile({
+				sessionId: this.sessionId,
+				cwd: this.sessionManager.getCwd(),
+			}),
 		};
 		if (hasCoordinatorRuntimeStateRescopeJournal(rescopeRecoveryContext)) {
 			this.extendStartupTurnBarrier(recoverCoordinatorRuntimeStateRescope(rescopeRecoveryContext));
@@ -6174,8 +6187,8 @@ export class AgentSession {
 	#runtimeStateMarkerFile(input: { sessionId: string; cwd: string }): string | null {
 		if (!input.sessionId.trim()) return null;
 		const pinned = process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]?.trim();
-		if (this.taskDepth > 0) return path.join(sessionRuntimeDir(input.cwd, input.sessionId), "runtime-state.json");
-		return pinned || path.join(sessionRuntimeDir(input.cwd, input.sessionId), "runtime-state.json");
+		if (this.taskDepth > 0) return sessionRuntimeStatePath(input.cwd, input.sessionId);
+		return pinned || sessionRuntimeStatePath(input.cwd, input.sessionId);
 	}
 
 	#captureCoordinatorRuntimeStatePersistContext(): CoordinatorRuntimeStatePersistContext {
