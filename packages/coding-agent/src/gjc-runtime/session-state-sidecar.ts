@@ -19,7 +19,7 @@ import {
 } from "../coordinator-mcp/durability";
 import { reduceTerminalReceiptState } from "../sdk/receipt-state";
 import { TOOL_CATALOG } from "../tools/tool-catalog.generated";
-import { sessionRoot, sessionRuntimeDir } from "./session-layout";
+import { sessionRoot, sessionRuntimeDir, sessionRuntimeStatePath } from "./session-layout";
 import { SessionStateLockUnavailableError, withSessionStateFileLock } from "./session-state-lock";
 import {
 	isValidOwnerIntent,
@@ -1069,9 +1069,14 @@ class ForeignRuntimeStateError extends Error {
 	readonly currentCwd: string;
 	constructor(previous: Record<string, unknown>, input: RuntimeStateIdentity) {
 		const recorded = typeof previous.cwd === "string" ? previous.cwd : "<unknown>";
+		// The message keeps naming both workspaces — that is what distinguishes a foreign marker
+		// from file corruption — but it echoes the recorded path through the diagnostic sanitizer
+		// so a marker cannot inject terminal control sequences into an operator's log. The exact
+		// value stays available on the typed fields below.
 		super(
 			`Existing runtime state marker belongs to a different workspace; refusing to overwrite. ` +
-				`recorded cwd ${recorded}, current cwd ${input.cwd}. ` +
+				`recorded cwd ${sanitizeDiagnosticText(recorded)}, current cwd ${sanitizeDiagnosticText(input.cwd)}; ` +
+				`${previousPayloadDigestOf(previous)}. ` +
 				`A live or in-flight marker is never adopted; delete it only if no session is running there.`,
 		);
 		this.name = "ForeignRuntimeStateError";
@@ -1150,7 +1155,7 @@ function parsePreviousPayload(raw: string): Record<string, unknown> {
 		if (marker.ready_for_input !== expectedReady)
 			throw new PreviousRuntimeStateReadError(
 				undefined,
-				`ready_for_input must be ${expectedReady} when state is ${marker.state} (received ${marker.ready_for_input})`,
+				`ready_for_input must be ${expectedReady} when state is ${marker.state} (received ${marker.ready_for_input}); ${previousPayloadDigest(raw)}`,
 			);
 	}
 	if (marker.live !== undefined && marker.live !== null) {
@@ -1158,7 +1163,7 @@ function parsePreviousPayload(raw: string): Record<string, unknown> {
 		if (marker.live !== expectedLive)
 			throw new PreviousRuntimeStateReadError(
 				undefined,
-				`live must be ${expectedLive} when state is ${marker.state} (received ${marker.live})`,
+				`live must be ${expectedLive} when state is ${marker.state} (received ${marker.live}); ${previousPayloadDigest(raw)}`,
 			);
 	}
 	return marker;
@@ -1212,12 +1217,46 @@ function previousPayloadDigest(raw: string): string {
 	return `payload sha256 ${createHash("sha256").update(raw).digest("hex")}`;
 }
 
+/**
+ * The digest a refusal can always compute, for paths that hold no raw bytes.
+ *
+ * Canonicalizing the parsed payload makes the digest a deterministic function of the marker's
+ * VALUE as this process read it — key order is normalized, so a re-parse reproduces it. One
+ * legacy shape is normalized before it can reach here (#4351 rewrites a completed marker's
+ * stale `ready_for_input: true` to false), so the digest binds the payload that was actually
+ * refused rather than the file's original bytes; where the raw bytes are still in hand the
+ * caller uses {@link previousPayloadDigest} instead and gets the byte-exact form.
+ */
+function previousPayloadDigestOf(previous: Record<string, unknown>): string {
+	return `payload-content sha256 ${createHash("sha256")
+		.update(canonicalCoordinatorSidecarPayload(previous))
+		.digest("hex")}`;
+}
+
+/**
+ * Bound and de-fang operator-visible text taken from a marker.
+ *
+ * A corrupt or hostile marker must never be able to write terminal control sequences or
+ * reorder an operator's line into a diagnostic, so C0/C1 controls and every Unicode `Cf`
+ * (format) character — bidi overrides and isolates, zero-width and BOM marks, invisible
+ * operators — are replaced before the value is bounded.
+ */
+function sanitizeDiagnosticText(value: string): string {
+	const sanitized = value.replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029\p{Cf}]/gu, "?");
+	return sanitized.length > 240 ? `${sanitized.slice(0, 240)}...` : sanitized;
+}
+
+/** Quote and de-fang a path or identity for a diagnostic. */
+function quotedDiagnosticText(value: string): string {
+	return JSON.stringify(sanitizeDiagnosticText(value));
+}
+
 /** Identify the marker THIS writer owns, so a cross-session refusal explains itself. */
 function thisMarkerHint(input: RuntimeStateIdentity, stateFile: string | null): string {
 	return (
-		`this write targets session ${JSON.stringify(input.sessionId)} at cwd ${JSON.stringify(input.cwd)}` +
-		(input.sessionFile === null ? "" : ` with session file ${JSON.stringify(input.sessionFile)}`) +
-		(stateFile === null ? "" : ` using marker ${JSON.stringify(stateFile)}`)
+		`this write targets session ${quotedDiagnosticText(input.sessionId)} at cwd ${quotedDiagnosticText(input.cwd)}` +
+		(input.sessionFile === null ? "" : ` with session file ${quotedDiagnosticText(input.sessionFile)}`) +
+		(stateFile === null ? "" : ` using marker ${quotedDiagnosticText(stateFile)}`)
 	);
 }
 
@@ -1444,8 +1483,8 @@ function assertPreviousRuntimeStateIdentity(
 	if (previous.session_id !== input.sessionId)
 		throw new PreviousRuntimeStateReadError(
 			undefined,
-			`session_id must be ${JSON.stringify(input.sessionId)} (received ${describePreviousPayloadValue(previous.session_id)}); ` +
-				thisMarkerHint(input, stateFile),
+			`session_id must be ${quotedDiagnosticText(input.sessionId)} (received ${describePreviousPayloadValue(previous.session_id)}); ` +
+				`${thisMarkerHint(input, stateFile)}; ${previousPayloadDigestOf(previous)}`,
 		);
 	// Signed coordinator mode never trusts an unsigned predecessor. The sole exception
 	// is the narrow, coordinator-authenticated bootstrap seed: it has no runtime identity
@@ -1470,9 +1509,9 @@ function assertPreviousRuntimeStateIdentity(
 				undefined,
 				previous.sidecar_key_id === input.sidecarKeyId
 					? `the marker's sidecar signature is ${describePreviousPayloadValue(previous.sidecar_signature)}; ` +
-							thisMarkerHint(input, stateFile)
+							`${thisMarkerHint(input, stateFile)}; ${previousPayloadDigestOf(previous)}`
 					: `the marker is not signed by this session's sidecar key (recorded ${describePreviousPayloadValue(previous.sidecar_key_id)}, required ${input.sidecarKeyId}); ` +
-							thisMarkerHint(input, stateFile),
+							`${thisMarkerHint(input, stateFile)}; ${previousPayloadDigestOf(previous)}`,
 			);
 		const { sidecar_signature: signature, ...unsigned } = previous;
 		if (
@@ -1485,7 +1524,7 @@ function assertPreviousRuntimeStateIdentity(
 		)
 			throw new PreviousRuntimeStateReadError(
 				undefined,
-				`the marker's sidecar signature does not verify; ${thisMarkerHint(input, stateFile)}`,
+				`the marker's sidecar signature does not verify; ${thisMarkerHint(input, stateFile)}; ${previousPayloadDigestOf(previous)}`,
 			);
 	}
 	if (coordinatorSeed) return;
@@ -1539,7 +1578,7 @@ function runtimeStateFileForContext(context: RuntimeStateContext): string | null
 	const explicit = coordinatorPinnedStateFile();
 	if (explicit) return explicit;
 	if (!context.sessionId.trim()) return null;
-	return path.join(sessionRuntimeDir(context.cwd, context.sessionId), "runtime-state.json");
+	return sessionRuntimeStatePath(context.cwd, context.sessionId);
 }
 function branchForContext(context: RuntimeStateContext): string | null {
 	return context.branch ?? (process.env[GJC_COORDINATOR_SESSION_BRANCH_ENV]?.trim() || null);
@@ -2177,6 +2216,7 @@ function previousRescopeIdentity(context: RuntimeStateContext, previousCwd: stri
 		cwd: previousCwd,
 		sessionFile: context.previousSessionFile ?? context.sessionFile ?? null,
 		platform: context.platform,
+		stateFile: context.stateFile,
 	});
 }
 
@@ -2269,21 +2309,41 @@ function rescopeStateFiles(
 	sessionId: string,
 	previousCwd: string,
 	newCwd: string,
+	stateFile?: string | null,
 ): { oldStateFile: string; newStateFile: string; mode: "pinned" | "derived" } {
-	const explicit = process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]?.trim();
-	if (explicit) {
-		const stateFile = canonicalStateFilePath(explicit);
-		return { oldStateFile: stateFile, newStateFile: stateFile, mode: "pinned" };
+	// Ownership, never the ambient pin, decides whether this session's marker travels with
+	// the cwd: a session that owns its own marker keeps it under the per-session runtime
+	// directory even while the process carries the coordinator pin for a different session
+	// (#5473).
+	const pinned = coordinatorPinnedStateFile();
+	if (pinned && usesCoordinatorPin({ stateFile })) {
+		const canonical = canonicalStateFilePath(pinned);
+		return { oldStateFile: canonical, newStateFile: canonical, mode: "pinned" };
 	}
-	return {
-		oldStateFile: canonicalStateFilePath(
-			path.join(sessionRuntimeDir(fsSync.realpathSync(previousCwd), sessionId), "runtime-state.json"),
-		),
-		newStateFile: canonicalStateFilePath(
-			path.join(sessionRuntimeDir(fsSync.realpathSync(newCwd), sessionId), "runtime-state.json"),
-		),
-		mode: "derived",
+	const derived = {
+		oldStateFile: canonicalStateFilePath(sessionRuntimeStatePath(fsSync.realpathSync(previousCwd), sessionId)),
+		newStateFile: canonicalStateFilePath(sessionRuntimeStatePath(fsSync.realpathSync(newCwd), sessionId)),
 	};
+	if (stateFile === undefined) return { ...derived, mode: "derived" };
+	if (stateFile === null)
+		throw new PreviousRuntimeStateReadError(
+			undefined,
+			"this session owns no runtime-state marker; refusing to rescope one",
+		);
+	// The classification is total: a caller-named marker must be the pin (handled above) or
+	// this session's own derived marker. Both sides are canonicalized first, because a caller
+	// may name its marker through a non-canonical spelling of the cwd — a symlinked checkout or
+	// the macOS `/var`, `/tmp` prefixes — and a marker file that does not exist yet has no
+	// realpath to normalize through.
+	if (
+		!sameResolvedPath(canonicalStateFilePath(stateFile), derived.oldStateFile) &&
+		!sameResolvedPath(canonicalStateFilePath(stateFile), derived.newStateFile)
+	)
+		throw new PreviousRuntimeStateReadError(
+			undefined,
+			`the rescope marker ${quotedDiagnosticText(stateFile)} is neither the process pin nor this session's derived marker; refusing to guess its ownership`,
+		);
+	return { ...derived, mode: "derived" };
 }
 
 function journalSignaturePayload(journal: CoordinatorRuntimeStateRescopeJournal): Record<string, unknown> {
@@ -2341,6 +2401,8 @@ export async function prepareCoordinatorRuntimeStateRescope(input: {
 	newCwdIdentity?: { dev: bigint; ino: bigint };
 	previousSessionFile?: string | null;
 	newSessionFile?: string | null;
+	/** The marker this session owns; `undefined` lets the process pin answer for it. */
+	stateFile?: string | null;
 }): Promise<string> {
 	const previousStat = fsSync.lstatSync(input.previousCwd, { bigint: true });
 	const newStat = fsSync.lstatSync(input.newCwd, { bigint: true });
@@ -2350,13 +2412,14 @@ export async function prepareCoordinatorRuntimeStateRescope(input: {
 	assertPinnedDirectoryIdentity(input.newCwd, newCwdIdentity);
 	const previousCwd = fsSync.realpathSync(input.previousCwd);
 	const newCwd = fsSync.realpathSync(input.newCwd);
-	const stateFiles = rescopeStateFiles(input.sessionId, previousCwd, newCwd);
+	const stateFiles = rescopeStateFiles(input.sessionId, previousCwd, newCwd, input.stateFile);
 	const moveId = input.moveId ?? randomUUID();
 	if (!RUNTIME_STATE_RESCOPE_MOVE_ID_PATTERN.test(moveId)) throw new PreviousRuntimeStateReadError();
 	const identity = normalizedIdentity({
 		sessionId: input.sessionId,
 		cwd: newCwd,
 		sessionFile: input.newSessionFile ?? null,
+		stateFile: input.stateFile,
 	});
 	const previousJournalFile = confinedJournalPath(previousCwd, input.sessionId, identity.platform);
 	const newJournalFile = confinedJournalPath(newCwd, input.sessionId, identity.platform);
@@ -2366,6 +2429,7 @@ export async function prepareCoordinatorRuntimeStateRescope(input: {
 			cwd: newCwd,
 			sessionFile: input.newSessionFile ?? null,
 			previousSessionFile: input.previousSessionFile ?? null,
+			stateFile: input.stateFile,
 		},
 		previousCwd,
 	);
@@ -2534,7 +2598,12 @@ export async function recoverCoordinatorRuntimeStateRescope(context: RuntimeStat
 	const journal = parseRuntimeStateRescopeJournal(observed.raw);
 	verifyRuntimeStateRescopeJournal(journal);
 	const current = normalizedIdentity(context);
-	const configuredStateFiles = rescopeStateFiles(journal.session_id, journal.previous_cwd, journal.new_cwd);
+	const configuredStateFiles = rescopeStateFiles(
+		journal.session_id,
+		journal.previous_cwd,
+		journal.new_cwd,
+		context.stateFile,
+	);
 	if (
 		journal.session_id !== context.sessionId ||
 		journal.key_id !== current.sidecarKeyId ||
@@ -2542,7 +2611,14 @@ export async function recoverCoordinatorRuntimeStateRescope(context: RuntimeStat
 		!sameResolvedPath(journal.old_state_file, configuredStateFiles.oldStateFile, current.platform) ||
 		!sameResolvedPath(journal.new_state_file, configuredStateFiles.newStateFile, current.platform)
 	)
-		throw new PreviousRuntimeStateReadError();
+		throw new PreviousRuntimeStateReadError(
+			undefined,
+			`the rescope journal does not match this session's marker configuration: ` +
+				`journal session ${describePreviousPayloadValue(journal.session_id)} mode ${journal.state_file_mode} ` +
+				`(${sanitizeDiagnosticText(journal.old_state_file)} -> ${sanitizeDiagnosticText(journal.new_state_file)}), ` +
+				`this session ${JSON.stringify(context.sessionId)} mode ${configuredStateFiles.mode} ` +
+				`(${sanitizeDiagnosticText(configuredStateFiles.oldStateFile)} -> ${sanitizeDiagnosticText(configuredStateFiles.newStateFile)})`,
+		);
 	if (
 		sameResolvedPath(journal.previous_cwd, current.cwd, current.platform) &&
 		sameOptionalResolvedPath(journal.previous_session_file, current.sessionFile, current.platform)
@@ -2628,14 +2704,26 @@ export async function relocateCoordinatorRuntimeStateForRescope(
 	if (!newStateFile) return true;
 	const identity = normalizedIdentity(context);
 	const oldIdentity = previousRescopeIdentity(context, previousCwd);
-	const explicitStateFile = process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]?.trim();
 	// A pinned state file never moves with the cwd; a cwd-derived one lives under the
-	// per-session runtime directory rooted at the (now former) cwd.
-	const oldStateFile = explicitStateFile
-		? newStateFile
-		: canonicalStateFilePath(
-				path.join(sessionRuntimeDir(canonicalPreviousCwd, identity.sessionId), "runtime-state.json"),
-			);
+	// per-session runtime directory rooted at the (now former) cwd. Ownership — not the
+	// ambient pin — decides which of the two this session has, and the same total
+	// classification `prepare`/`recover` apply is enforced here (#5473).
+	let oldStateFile: string;
+	if (usesCoordinatorPin(context)) {
+		oldStateFile = newStateFile;
+	} else {
+		oldStateFile = canonicalStateFilePath(sessionRuntimeStatePath(canonicalPreviousCwd, identity.sessionId));
+		if (context.stateFile !== undefined && context.stateFile !== null) {
+			if (
+				!sameResolvedPath(context.stateFile, oldStateFile, identity.platform) &&
+				!sameResolvedPath(context.stateFile, newStateFile, identity.platform)
+			)
+				throw new PreviousRuntimeStateReadError(
+					undefined,
+					`the rescope marker ${quotedDiagnosticText(context.stateFile)} is neither the process pin nor this session's derived marker; refusing to guess its ownership`,
+				);
+		}
+	}
 	const samePath = sameResolvedPath(oldStateFile, newStateFile, identity.platform);
 	let expectedSourceSha256: string | null | undefined;
 	const journalObservation = readRegularFileForRelocation(
