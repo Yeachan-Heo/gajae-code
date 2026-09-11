@@ -2925,12 +2925,12 @@ describe("runDaemonCommand", () => {
 				partialStatuses: [
 					{
 						...healthy,
-						ownerId: "漢字😀".repeat(10_000),
+						ownerId: "\u0000".repeat(10_000),
 						detail: "detail".repeat(10_000),
 						runtime: {
 							...healthy.runtime,
 							execPath: "path".repeat(10_000),
-							warning: "warning".repeat(10_000),
+							warning: "漢字😀".repeat(10_000),
 						},
 					},
 				],
@@ -2938,6 +2938,7 @@ describe("runDaemonCommand", () => {
 			{ command: ["daemon", "status"], json: true },
 		);
 		expect(Buffer.byteLength(oversized.stdout)).toBeLessThanOrEqual(8192);
+		expect(oversized.stdout).not.toContain("\\u0000");
 	});
 
 	test("restart prints a human result line", async () => {
