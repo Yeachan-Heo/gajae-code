@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Performance
+
+- Drain completion-only stream events instead of retaining them, close idle-iterator sources once on early exit, and avoid repeated suffix scans in escape-dense JSON.
+
 ### Fixed
 
 - OpenCode Go's exact `muse-spark-1.3-contributor` model now uses the existing Responses transport with minimal-through-xhigh reasoning, text/image input, and Go pricing. The Go discovery mapper applies the provisional reviewed models.dev Contributor limits over endpoint-reported limits; these are not a published Meta 1.3 specification. The subsequent model-manager merge repairs pre-upgrade ID-only cache placeholders even when fresh, while preserving other already-mapped dynamic limits.
