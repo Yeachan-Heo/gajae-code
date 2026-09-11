@@ -8,7 +8,11 @@ import { acquireFileLock, type FileLockOptions, withFileLock } from "../../confi
 import { loadInstallationHostId, loadLegacyInstallationHostId } from "../../config/machine-identity";
 import { SdkClient } from "../client/client";
 import { type BrokerDiscovery, brokerProcessIncarnation, readBrokerDiscovery } from "./discovery";
-import { resolveSdkInternalSpawnCommand, type SdkInternalSpawnCommand } from "./runtime";
+import {
+	isSdkInternalRuntimeImagePresent,
+	resolveSdkInternalSpawnCommand,
+	type SdkInternalSpawnCommand,
+} from "./runtime";
 import { BrokerStartupError, clearBrokerStartupFailureMarker, readBrokerStartupFailureMarker } from "./startup-failure";
 
 function resolveExpectedBrokerGeneration(): string {
@@ -19,6 +23,23 @@ function resolveExpectedBrokerGeneration(): string {
 export function isBrokerGenerationCompatible(discovery: BrokerDiscovery | null): boolean {
 	if (!discovery) return false;
 	return discovery.packageGeneration === resolveExpectedBrokerGeneration();
+}
+
+/**
+ * A live incumbent stops being reusable once the runtime image it launches
+ * internal processes with is provably gone. A broker outlives its own executable
+ * (a package manager replacing the interpreter it was started from, an install
+ * directory swapped underneath it): it keeps heartbeating and answering
+ * requests, but every `session.create` it accepts is refused at spawn time.
+ * Retiring it here repairs the endpoint before a caller reaches session
+ * creation. Absent runtime evidence -- a record predating the field, or a
+ * publisher that could not classify its own runtime at all -- and evidence this
+ * caller merely cannot inspect both keep the incumbent reusable.
+ */
+export async function isBrokerReusable(discovery: BrokerDiscovery | null): Promise<boolean> {
+	if (!isBrokerGenerationCompatible(discovery)) return false;
+	const runtime = discovery?.runtime;
+	return runtime === undefined || (await isSdkInternalRuntimeImagePresent(runtime));
 }
 export interface EnsureBrokerSettings {
 	agentDir: string;
@@ -387,7 +408,7 @@ export async function closeBrokerClientBeforeDeadline(
 	await Promise.race([close, Bun.sleep(remainingMs)]);
 }
 
-async function retireStaleBrokerGeneration(
+async function retireUnusableBroker(
 	stale: BrokerDiscovery,
 	settings: EnsureBrokerSettings,
 	outerDeadline = Number.POSITIVE_INFINITY,
@@ -429,10 +450,10 @@ export async function reconcileBrokerGenerationForStartup(
 ): Promise<BrokerDiscovery | undefined> {
 	const current = await readBrokerDiscoveryBeforeDeadline(settings.agentDir, settings.heartbeatTtlMs, deadline);
 	if (!current) return undefined;
-	if (isBrokerGenerationCompatible(current)) return current;
-	await retireStaleBrokerGeneration(current, settings, deadline);
+	if (await isBrokerReusable(current)) return current;
+	await retireUnusableBroker(current, settings, deadline);
 	const replacement = await readBrokerDiscoveryBeforeDeadline(settings.agentDir, settings.heartbeatTtlMs, deadline);
-	return replacement && isBrokerGenerationCompatible(replacement) ? replacement : undefined;
+	return replacement && (await isBrokerReusable(replacement)) ? replacement : undefined;
 }
 function createFixtureLeaseFromChild(child: ChildProcess, terminate: () => Promise<void>): ExactFixtureBrokerLease {
 	let termination: Promise<void> | undefined;
@@ -489,19 +510,20 @@ async function ensureBrokerOnce(settings: EnsureBrokerSettings, initiator: Ensur
 	if (priorOwner) {
 		// A retained cleanup failure fences every discovery record. Only a ready
 		// record bound to this exact child incarnation may be reused.
-		if (priorOwner.canReuse(existing)) return { kind: "prior-local-owner", discovery: existing!, owner: priorOwner };
+		if (priorOwner.canReuse(existing) && (await isBrokerReusable(existing)))
+			return { kind: "prior-local-owner", discovery: existing!, owner: priorOwner };
 		await priorOwner.stop();
 		const discoveredAfterCleanup = await readBrokerDiscoveryBeforeDeadline(
 			settings.agentDir,
 			settings.heartbeatTtlMs,
 			initialDiscoveryDeadline,
 		);
-		if (discoveredAfterCleanup && isBrokerGenerationCompatible(discoveredAfterCleanup))
+		if (discoveredAfterCleanup && (await isBrokerReusable(discoveredAfterCleanup)))
 			return { kind: "external-discovery", discovery: discoveredAfterCleanup };
-		// Stale-generation retirement is serialized under the spawn lock below.
+		// Unusable-incumbent retirement is serialized under the spawn lock below.
 	} else if (existing) {
-		if (isBrokerGenerationCompatible(existing)) return { kind: "external-discovery", discovery: existing };
-		// Stale-generation retirement is serialized under the spawn lock below.
+		if (await isBrokerReusable(existing)) return { kind: "external-discovery", discovery: existing };
+		// Unusable-incumbent retirement is serialized under the spawn lock below.
 	}
 
 	// Only one process may spawn for this agent dir at a time; everyone else
@@ -546,7 +568,7 @@ async function ensureBrokerOnce(settings: EnsureBrokerSettings, initiator: Ensur
 					deadline,
 				);
 				if (discovered) {
-					if (!isBrokerGenerationCompatible(discovered)) {
+					if (!(await isBrokerReusable(discovered))) {
 						await sleep(50);
 						continue;
 					}
@@ -577,7 +599,7 @@ async function ensureBrokerOnce(settings: EnsureBrokerSettings, initiator: Ensur
 						settings.heartbeatTtlMs,
 						deadline,
 					);
-					if (winner && isBrokerGenerationCompatible(winner)) {
+					if (winner && (await isBrokerReusable(winner))) {
 						await owner.stop();
 						return { kind: "external-discovery", discovery: winner };
 					}
@@ -622,7 +644,7 @@ async function ensureBrokerOnce(settings: EnsureBrokerSettings, initiator: Ensur
 						settings.heartbeatTtlMs,
 						recoveryDeadline,
 					);
-					if (incumbent && isBrokerGenerationCompatible(incumbent)) {
+					if (incumbent && (await isBrokerReusable(incumbent))) {
 						await owner.stop();
 						return { kind: "external-discovery", discovery: incumbent };
 					}

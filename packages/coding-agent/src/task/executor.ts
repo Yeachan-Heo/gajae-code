@@ -921,7 +921,13 @@ function formatExecutionError(error: unknown): string {
 		const causes = error.errors.map(cause => (cause instanceof Error ? cause.message : String(cause))).join("; ");
 		return causes ? `${error.message}: ${causes}` : error.message;
 	}
-	return error instanceof Error ? error.stack || error.message : String(error);
+	if (!(error instanceof Error)) return String(error);
+	const message = error.message;
+	const stack = error.stack;
+	if (!stack) return message;
+	const stackHeadline = stack.split(/\r?\n/u, 1)[0] ?? "";
+	if (!message || stackHeadline.includes(message)) return stack;
+	return `${error.name || "Error"}: ${message}\n${stack}`;
 }
 
 function transportFactsFromError(error: unknown): TransportFailureFacts | undefined {
