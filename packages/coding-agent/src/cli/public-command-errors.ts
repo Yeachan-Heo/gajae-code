@@ -1,3 +1,4 @@
+import { sanitizeDisplayLine } from "@gajae-code/utils";
 import type { DaemonStatus } from "../daemon/control-types";
 import {
 	type EvidenceClassification,
@@ -161,6 +162,9 @@ function boundedUtf8(value: string, maxBytes: number): string {
 	while (end > 0 && Buffer.byteLength(value.slice(0, end), "utf8") > maxBytes) end--;
 	return value.slice(0, end);
 }
+function boundedDaemonText(value: string): string {
+	return boundedUtf8(sanitizeDisplayLine(value).replaceAll(/[\u2028\u2029]/gu, " "), DAEMON_STATUS_TEXT_BYTES);
+}
 
 function boundedDaemonStatuses(statuses: readonly DaemonStatus[] | undefined): DaemonStatus[] {
 	if (!Array.isArray(statuses)) return [];
@@ -169,17 +173,15 @@ function boundedDaemonStatuses(statuses: readonly DaemonStatus[] | undefined): D
 		configured: status.configured === true,
 		health: DAEMON_HEALTHS.includes(status.health) ? status.health : "error",
 		...(Number.isSafeInteger(status.pid) && status.pid > 0 ? { pid: status.pid } : {}),
-		...(typeof status.ownerId === "string" ? { ownerId: boundedUtf8(status.ownerId, DAEMON_STATUS_TEXT_BYTES) } : {}),
+		...(typeof status.ownerId === "string" ? { ownerId: boundedDaemonText(status.ownerId) } : {}),
 		...(Number.isSafeInteger(status.rootCount) && status.rootCount >= 0 ? { rootCount: status.rootCount } : {}),
 		runtime: {
 			mode: status.runtime.mode === "compiled" ? "compiled" : "source",
-			execPath: boundedUtf8(status.runtime.execPath, DAEMON_STATUS_TEXT_BYTES),
+			execPath: boundedDaemonText(status.runtime.execPath),
 			reloadPicksUpSourceEdits: status.runtime.reloadPicksUpSourceEdits === true,
-			...(typeof status.runtime.warning === "string"
-				? { warning: boundedUtf8(status.runtime.warning, DAEMON_STATUS_TEXT_BYTES) }
-				: {}),
+			...(typeof status.runtime.warning === "string" ? { warning: boundedDaemonText(status.runtime.warning) } : {}),
 		},
-		...(typeof status.detail === "string" ? { detail: boundedUtf8(status.detail, DAEMON_STATUS_TEXT_BYTES) } : {}),
+		...(typeof status.detail === "string" ? { detail: boundedDaemonText(status.detail) } : {}),
 	}));
 }
 export function normalizePublicCommandFailure(error: unknown): PublicCommandFailure {
@@ -352,6 +354,12 @@ function trimSteps(envelope: PublicCommandErrorEnvelope, json: boolean): void {
 			envelope.omittedOptional.push({ path: "error.nextSteps", reason: "output_budget" });
 	}
 }
+function omitPartialStatusesForBudget(envelope: PublicCommandErrorEnvelope, json: boolean): void {
+	if (envelope.error.partialStatuses === undefined || fits(envelope, json)) return;
+	delete envelope.error.partialStatuses;
+	if (!envelope.omittedOptional.some(item => item.path === "error.partialStatuses"))
+		envelope.omittedOptional.push({ path: "error.partialStatuses", reason: "output_budget" });
+}
 
 function reserveDiagnostics(
 	envelope: PublicCommandErrorEnvelope,
@@ -454,6 +462,7 @@ export async function renderPublicCommandFailure(
 			};
 		}
 		trimSteps(envelope, json);
+		omitPartialStatusesForBudget(envelope, json);
 		while (!fits(envelope, json) && envelope.error.references.length) envelope.error.references.pop();
 		if (envelope.evidence.status === "unavailable") {
 			const included = new Set(envelope.error.references);
@@ -478,6 +487,7 @@ export async function renderPublicCommandFailure(
 		while (!fits(envelope, json) && envelope.error.references.length) envelope.error.references.pop();
 	}
 	includeDiagnostics(envelope, diagnostics, json);
+	omitPartialStatusesForBudget(envelope, json);
 	const output = serialize(envelope, json);
 	return { stdout: json ? output : "", stderr: json ? "" : output, exitCode, envelope };
 }
