@@ -850,6 +850,7 @@ function initLoaderContext(require_) {
 		nativeDir,
 		versionedDir,
 		isCompiledBinary,
+		isWorkspaceLoad,
 		stageFromNodeModules,
 		selectedVariant,
 		addonFilenames,

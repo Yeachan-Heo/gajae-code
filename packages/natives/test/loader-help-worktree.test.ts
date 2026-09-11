@@ -6,8 +6,10 @@
  * (`bun run setup:worktree`) rather than only the package-local build. Compiled
  * binaries are unaffected: their diagnostics stay download/extract oriented.
  *
- * The context is injected so the assertion does not depend on whether a real
- * addon happens to be loadable on the host.
+ * The workspace case deliberately runs the REAL loader context (no injected
+ * `context`) so a regression that drops `isWorkspaceLoad` between
+ * `initLoaderContext` and `buildHelpMessage` fails here instead of hiding
+ * behind an injected flag.
  */
 import { describe, expect, it } from "bun:test";
 import { loadNative } from "../native/loader-state.js";
@@ -22,17 +24,8 @@ function loadFailureMessage(options: Parameters<typeof loadNative>[0]): string {
 }
 
 describe("issue 5484: native loader failure guidance", () => {
-	it("names the worktree-safe setup command when a workspace checkout has no addon", () => {
+	it("names the worktree-safe setup command through the real workspace loader context", () => {
 		const message = loadFailureMessage({
-			context: {
-				isCompiledBinary: false,
-				isWorkspaceLoad: true,
-				platformTag: "linux-x64",
-				addonLabel: "linux-x64",
-				addonFilenames: ["pi_natives.linux-x64.node"],
-				versionedDir: "/cache/gjc/9.9.9",
-				candidates: ["/repo/packages/natives/native/pi_natives.linux-x64.node"],
-			},
 			extractEmbeddedAddons: () => [],
 			stageNodeModulesAddon: () => [],
 			requireCandidate: () => {
@@ -40,7 +33,7 @@ describe("issue 5484: native loader failure guidance", () => {
 			},
 		});
 
-		expect(message).toContain("Failed to load pi_natives native addon for linux-x64");
+		expect(message).toContain("Failed to load pi_natives native addon for");
 		expect(message).toContain("bun run setup:worktree");
 	});
 
