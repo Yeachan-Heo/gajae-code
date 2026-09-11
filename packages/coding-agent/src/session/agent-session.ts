@@ -4511,7 +4511,6 @@ export class AgentSession {
 		// fence refuses every later persist) and rebinds the postmortem finalizer, which
 		// otherwise keeps writing terminal state to the launch root's cwd/session file.
 		this.#unregisterAfterMoveListener = this.sessionManager.registerAfterMoveListener(async move => {
-			let completed = false;
 			try {
 				// A move can promote an explicit --session-dir destination to managed
 				// storage without changing the session id. Its local root changes from
@@ -4537,13 +4536,43 @@ export class AgentSession {
 					this.#coordinatorRescopeMoveId,
 					move.previousCwd,
 				);
-				completed = true;
+			} catch (error) {
+				// Publication has already committed, so the move-abort listener cannot
+				// recover this state. Retry coordinator relocation independently of the
+				// failed local-root gate so later persists cannot remain behind a barrier
+				// that no longer has a rollback path.
+				try {
+					const relocated = await relocateCoordinatorRuntimeStateForRescope(
+						{
+							sessionId: this.sessionId,
+							cwd: move.newCwd,
+							sessionFile: this.sessionManager.getSessionFile() ?? null,
+							previousSessionFile: move.previousSessionFile ?? null,
+						},
+						move.previousCwd,
+					);
+					if (!relocated) throw new Error("Coordinator runtime state rescope recovery was refused.");
+					await clearCoordinatorRuntimeStateRescope(
+						{
+							sessionId: this.sessionId,
+							cwd: move.newCwd,
+							sessionFile: this.sessionManager.getSessionFile() ?? null,
+						},
+						this.#coordinatorRescopeMoveId,
+						move.previousCwd,
+					);
+				} catch (recoveryError) {
+					logger.error("Failed to recover coordinator runtime state after committed session move", {
+						cwd: move.newCwd,
+						error: String(error),
+						recoveryError: String(recoveryError),
+					});
+				}
+				throw error;
 			} finally {
 				this.#registerRuntimeStateFinalizer();
-				if (completed) {
-					this.#coordinatorRescopeMoveId = undefined;
-					this.#endCoordinatorRescopeBarrier();
-				}
+				this.#coordinatorRescopeMoveId = undefined;
+				this.#endCoordinatorRescopeBarrier();
 			}
 		});
 		// Power assertions are taken per turn (see #beginInFlight); nothing acquired here.

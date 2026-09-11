@@ -5,6 +5,7 @@ import * as path from "node:path";
 import { getBundledModel } from "@gajae-code/ai";
 import { AsyncJobManager } from "@gajae-code/coding-agent/async";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
+import * as internalUrls from "@gajae-code/coding-agent/internal-urls";
 import { resolveLocalRoot, resolveLocalUrlToPath } from "@gajae-code/coding-agent/internal-urls";
 import { createAgentSession } from "@gajae-code/coding-agent/sdk";
 import { SKILL_PROMPT_MESSAGE_TYPE } from "@gajae-code/coding-agent/session/messages";
@@ -146,6 +147,44 @@ describe("move_session tool (agent-invokable session rescope)", () => {
 			expect(await Bun.file(resolved).text()).toBe("writable after move\n");
 		} finally {
 			unregister();
+			await session.dispose();
+		}
+	}, 20_000);
+
+	it("settles coordinator persistence when post-move local initialization fails", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const cwdA = path.join(tempDir, "root");
+		const cwdB = path.join(cwdA, "repo-b");
+		fs.mkdirSync(cwdB, { recursive: true });
+		const sessionManager = SessionManager.create(cwdA, SessionManager.managedDestination(cwdA, tempDir));
+		const { session } = await makeSession(cwdA, sessionManager, { toolNames: ["move_session"] });
+		const readiness = spyOn(internalUrls, "initializeLocalRoot").mockRejectedValueOnce(
+			new Error("injected post-move local initialization failure"),
+		);
+		try {
+			const sessionId = session.sessionId;
+			await persistCoordinatorRuntimeStateFromEvent(
+				{ type: "agent_start" },
+				{ sessionId, cwd: cwdA, sessionFile: sessionManager.getSessionFile() ?? null },
+			);
+			const launcherFile = path.join(sessionRuntimeDir(cwdA, sessionId), "runtime-state.json");
+			const targetFile = path.join(sessionRuntimeDir(cwdB, sessionId), "runtime-state.json");
+
+			await sessionManager.moveTo(cwdB);
+			await Promise.race([
+				persistCoordinatorRuntimeStateFromEvent(
+					{ type: "turn_start" },
+					{ sessionId, cwd: cwdB, sessionFile: sessionManager.getSessionFile() ?? null },
+				),
+				Bun.sleep(5_000).then(() => {
+					throw new Error("coordinator persistence remained blocked after post-move failure");
+				}),
+			]);
+			expect(fs.existsSync(launcherFile)).toBe(false);
+			expect((JSON.parse(fs.readFileSync(targetFile, "utf8")) as Record<string, unknown>).event).toBe("turn_start");
+		} finally {
+			readiness.mockRestore();
 			await session.dispose();
 		}
 	}, 20_000);
