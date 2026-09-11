@@ -52,6 +52,20 @@ export interface PrValidationInput {
 	requireMergeApproved?: boolean;
 	/** Trusted GitHub issue-comment data backing a maintainer self-review. */
 	selfReviewComment?: AuthenticatedSelfReviewComment | null;
+	/**
+	 * Why the trusted self-review comment could not be READ by the caller that tried to
+	 * fetch it. Set only when the record is missing from the input because the fetch
+	 * failed; a record that is absent from the PR itself is not an unread record.
+	 */
+	selfReviewUnavailable?: string | null;
+	/** True when the caller actually read the PR's comment list for this exact head. */
+	selfReviewFetched?: boolean;
+	/**
+	 * True when the caller could not read the independent-review evidence a risk-classified
+	 * record names. The caller reports that unread evidence itself, so the record's policy
+	 * line must not additionally present the same failure as an unsatisfied policy.
+	 */
+	independentReviewerUnavailable?: boolean;
 	/** Risk declaration from the PR body (must match the self-review comment; issue #4703). */
 	bodyRisk?: string | null;
 	/** Trusted GitHub evidence about the independent reviewer named by extra:independent:<login>. */
@@ -62,6 +76,30 @@ export interface IndependentReviewerEvidence {
 	permission: string;
 	approvedHead: boolean;
 	approvedLogin?: string;
+}
+
+/** A review normalized from either API shape so one rule can decide the effective one. */
+interface EffectiveReview {
+	login?: string;
+	state?: string;
+	oid?: string;
+}
+
+/**
+ * The effective review for one identity on the exact head: the latest non-COMMENTED review,
+ * so a later CHANGES_REQUESTED supersedes an earlier APPROVED. Single-sourced because three
+ * callers (the event approval, the independent-reviewer evidence, and the push preflight)
+ * must never disagree about which review counts — the divergence that produced issue #5483
+ * and later the withdrawn-approval gap the QA lane found.
+ */
+function effectiveExactHeadReview(reviews: EffectiveReview[], login: string, headSha: string): EffectiveReview | undefined {
+	return reviews
+		.filter(review =>
+			review.login?.toLowerCase() === login.toLowerCase()
+			&& review.state !== "COMMENTED"
+			&& review.oid === headSha,
+		)
+		.at(-1);
 }
 
 export interface AuthenticatedSelfReviewComment {
@@ -257,9 +295,11 @@ export function validatePrContract(input: PrValidationInput): PrValidationResult
 			if (parsed.verdict.reviewerId.toLowerCase() !== input.authorLogin.toLowerCase()) {
 				diagnostics.push(`merge-self-approved reviewer-id ${parsed.verdict.reviewerId} must name the PR author ${input.authorLogin}; this verdict is exclusively the owner's self-authorization.`);
 			}
-			if (!selfReview.ok) {
-				diagnostics.push("merge-self-approved requires a valid gajae.pr-self-review.v1 risk record for the exact head (owner identity, low-risk classification, fresh base/head/digest).");
-			} else if (selfReview.risk !== "low-risk" || selfReview.verdict !== "merge-self-approved") {
+			if (!selfReview.ok && !input.selfReviewUnavailable) {
+				diagnostics.push(input.selfReviewFetched && !input.selfReviewComment
+					? `No gajae.pr-self-review.v1 risk record comment from ${input.authorLogin || "the PR author"} was found on this PR; the merge-self-approved solo path requires one bound to the exact head.`
+					: "merge-self-approved requires a valid gajae.pr-self-review.v1 risk record for the exact head (owner identity, low-risk classification, fresh base/head/digest).");
+			} else if (selfReview.ok && (selfReview.risk !== "low-risk" || selfReview.verdict !== "merge-self-approved")) {
 				diagnostics.push(`merge-self-approved requires the risk record to classify this change low-risk with verdict:merge-self-approved; record says risk:${selfReview.risk} verdict:${selfReview.verdict}. Higher risk classes must use independent review (merge-approved).`);
 			}
 		}
@@ -284,10 +324,18 @@ export function validatePrContract(input: PrValidationInput): PrValidationResult
  * distinct maintainer named by extra:independent:<login>).
  * The PR body can never supply this record: evaluateSelfReviewComment reads only the
  * trusted comment data fetched from the GitHub API under workflow permissions.
+ *
+ * A record that could not be READ is reported as unread (issue #5483): the caller that
+ * attempted the fetch supplies `selfReviewUnavailable`, and that message replaces every
+ * claim about the record's content instead of implying it was judged invalid.
  */
 function evaluateSelfReviewComment(input: PrValidationInput): { ok: boolean; reviewerId?: string; risk?: SelfReviewRisk; verdict?: "merge-approved" | "merge-self-approved" | "merge-blocked"; diagnostics: string[] } {
 	const comment = input.selfReviewComment;
-	if (!comment) return { ok: false, diagnostics: [] };
+	if (!comment) {
+		return { ok: false, diagnostics: input.selfReviewUnavailable
+			? [`The gajae.pr-self-review.v1 risk record for this PR could not be read: ${input.selfReviewUnavailable}. It was never evaluated, so it has NOT been judged invalid.`]
+			: [] };
+	}
 	const diagnostics: string[] = [];
 	const parsedComment = parseSelfReview(comment.body);
 	if (!parsedComment.selfReview) return { ok: false, diagnostics: parsedComment.diagnostics };
@@ -319,7 +367,7 @@ function evaluateSelfReviewComment(input: PrValidationInput): { ok: boolean; rev
 	if (input.bodyRisk !== undefined && input.bodyRisk !== null && input.bodyRisk !== review.risk) {
 		diagnostics.push(`Self-review risk ${review.risk} does not match the PR body risk classification ${input.bodyRisk}; the classifications must agree.`);
 	}
-	if (!selfReviewSatisfiesPolicy(review, input.independentReviewer ?? null)) {
+	if (!selfReviewSatisfiesPolicy(review, input.independentReviewer ?? null) && !input.independentReviewerUnavailable) {
 		const required = "an authenticated exact-head approval from a distinct independent reviewer (extra:independent:<login>)";
 		diagnostics.push(`Self-review risk ${review.risk} requires ${required} (extra:${review.extra.kind === "independent" ? `independent:${review.extra.login}` : review.extra.kind}); the risk-classified gate is not satisfied.`);
 	}
@@ -370,14 +418,16 @@ interface IssueComment {
  * All pages are scanned before selecting the newest candidate so an old stale record
  * can never shadow a newer one; comments from other identities are ignored entirely so
  * an outsider's malformed or stale record cannot poison an independently reviewed PR.
- * Any API failure fails closed (issue #4703).
+ * Any API failure fails closed (issue #4703). `read` is false only when the caller's
+ * authority was insufficient to read the list at all, so a caller never reports an
+ * unread list as a PR with no record (issue #5483 review).
  */
-async function fetchSelfReviewComment(event: PullRequestEvent, authorLogin: string): Promise<AuthenticatedSelfReviewComment | null> {
+async function fetchSelfReviewComment(event: PullRequestEvent, authorLogin: string): Promise<{ comment: AuthenticatedSelfReviewComment | null; read: boolean }> {
 	const repository = event.repository?.full_name;
 	const number = event.pull_request?.number;
 	const token = Bun.env.GITHUB_TOKEN;
-	if (!repository || !number || !token || !authorLogin) return null;
-	let newest: IssueComment | null = null;
+	if (!repository || !number || !token || !authorLogin) return { comment: null, read: false };
+	let newest: AuthenticatedSelfReviewComment | null = null;
 	for (let page = 1; ; page++) {
 		const response = await fetch(`https://api.github.com/repos/${repository}/issues/${number}/comments?per_page=100&page=${page}`, {
 			headers: {
@@ -389,18 +439,105 @@ async function fetchSelfReviewComment(event: PullRequestEvent, authorLogin: stri
 		if (!response.ok) throw new Error(`Issue comments API failed: ${response.status}; failing closed instead of skipping the self-review gate.`);
 		const comments = await response.json() as IssueComment[];
 		for (const comment of comments) {
-			if (comment.user?.login?.toLowerCase() !== authorLogin.toLowerCase()) continue;
-			if ((comment.body ?? "").split(/\r?\n/u).some(line => line.trim().startsWith(SELF_REVIEW_PREFIX))) newest = comment;
+			const record = authorSelfReviewRecord(comment, authorLogin);
+			if (record) newest = record;
 		}
 		if (comments.length < 100) break;
 	}
-	return newest ? issueCommentToSelfReview(newest) : null;
+	return { comment: newest, read: true };
 }
 
 function issueCommentToSelfReview(comment: IssueComment): AuthenticatedSelfReviewComment | null {
+	if (!comment || typeof comment !== "object") return null;
 	const login = comment.user?.login;
 	if (!login || typeof comment.body !== "string") return null;
 	return { login, authorAssociation: comment.author_association ?? "NONE", body: comment.body };
+}
+
+/**
+ * Map an issue comment onto the trusted self-review record it carries, or null when the
+ * comment is not the author's own gajae.pr-self-review.v1 record. The server event path and
+ * the local push preflight share this one predicate, so the two gates can never disagree
+ * about which comment counts — the divergence that caused issue #5483. A comment from
+ * another identity is ignored entirely, so an outsider's malformed or stale record cannot
+ * poison an independently reviewed PR.
+ */
+function authorSelfReviewRecord(comment: IssueComment, authorLogin: string): AuthenticatedSelfReviewComment | null {
+	const record = issueCommentToSelfReview(comment);
+	if (!record) return null;
+	if (record.login.toLowerCase() !== authorLogin.toLowerCase()) return null;
+	if (!record.body.split(/\r?\n/u).some(line => line.trim().startsWith(SELF_REVIEW_PREFIX))) return null;
+	return record;
+}
+
+/**
+ * Parse the line-delimited JSON that `gh api --jq` emits (one compact result per line).
+ * Bun.JSONL.parse returns the values parsed before a corrupt record and silently drops a
+ * truncated trailing record, so the chunk parser is used instead: an incomplete or
+ * malformed read must fail closed rather than look like a shorter, valid list.
+ */
+function parseGhJsonl<T>(output: string): { ok: true; values: T[] } | { ok: false; error: string } {
+	if (!output.trim()) return { ok: true, values: [] };
+	const parsed = Bun.JSONL.parseChunk(output, 0, output.length);
+	if (parsed.error) return { ok: false, error: `the JSONL response could not be parsed (${parsed.error})` };
+	if (!parsed.done) return { ok: false, error: "the JSONL response ended mid-record" };
+	return { ok: true, values: parsed.values as T[] };
+}
+
+/**
+ * Resolve the newest author-authored gajae.pr-self-review.v1 record comment through the
+ * locally authenticated `gh api` surface. The push gate runs on a developer machine, so it
+ * cannot rely on a workflow GITHUB_TOKEN; `--paginate` walks every page in the same
+ * oldest-first order as the server's fetchSelfReviewComment, and the newest candidate wins
+ * so an older stale record can never shadow a newer one. A null comment with no error means
+ * the record genuinely is not on the PR; an error means the comment list could not be READ
+ * (non-zero gh exit, or a truncated/malformed response), which the caller reports as a
+ * retrieval failure instead of blaming an unevaluated record (issue #5483).
+ */
+async function fetchPushPreflightSelfReview(repo: string, number: number, authorLogin: string, cwd: string): Promise<{ comment: AuthenticatedSelfReviewComment | null; error: string | null }> {
+	// The jq filter keeps the raw API comment shape so the shared issueCommentToSelfReview
+	// mapper stays the single definition of a trusted record.
+	const listed = await gh(["api", "--paginate", `repos/${repo}/issues/${number}/comments`, "--jq", ".[] | {user: {login: .user.login}, author_association: .author_association, body: .body}"], cwd);
+	if (listed.exitCode !== 0) return { comment: null, error: listed.stderr || `gh exited ${listed.exitCode}` };
+	const parsed = parseGhJsonl<IssueComment>(listed.stdout);
+	if (!parsed.ok) return { comment: null, error: parsed.error };
+	let newest: AuthenticatedSelfReviewComment | null = null;
+	for (const comment of parsed.values) {
+		const record = authorSelfReviewRecord(comment, authorLogin);
+		if (record) newest = record;
+	}
+	return { comment: newest, error: null };
+}
+
+/** A review as `gh api --jq '.[] | {author: {login: .user.login}, state, commit: {oid: .commit_id}}'` emits it. */
+interface LiveReview {
+	author: { login: string } | null;
+	state: string;
+	commit: { oid: string } | null;
+}
+
+/**
+ * Resolve the trusted evidence a risk-classified self-review record's
+ * `extra:independent:<login>` names: an authenticated exact-head APPROVED review from that
+ * login plus its repository permission, mirroring the server's
+ * fetchIndependentReviewerEvidence so a legitimate risk-classified push is not rejected
+ * locally for evidence the server would have supplied (issue #5483 review). Reviews are
+ * paginated so an approval beyond the first page cannot be missed, and a read failure is
+ * returned as an error so the caller can report it as unread instead of unauthorized.
+ */
+async function fetchPushPreflightIndependentReviewer(repo: string, number: number, login: string, headSha: string, cwd: string): Promise<{ evidence: IndependentReviewerEvidence | null; error: string | null }> {
+	const listed = await gh(["api", "--paginate", `repos/${repo}/pulls/${number}/reviews`, "--jq", ".[] | {author: {login: .user.login}, state, commit: {oid: .commit_id}}"], cwd);
+	if (listed.exitCode !== 0) return { evidence: null, error: listed.stderr || `gh exited ${listed.exitCode}` };
+	const parsed = parseGhJsonl<LiveReview>(listed.stdout);
+	if (!parsed.ok) return { evidence: null, error: parsed.error };
+	const approvedHead = effectiveExactHeadReview(
+		parsed.values.map(review => ({ login: review.author?.login, state: review.state, oid: review.commit?.oid })),
+		login,
+		headSha,
+	)?.state === "APPROVED";
+	const permission = await gh(["api", `repos/${repo}/collaborators/${encodeURIComponent(login)}/permission`, "--jq", ".permission"], cwd);
+	if (permission.exitCode !== 0) return { evidence: null, error: permission.stderr || `gh exited ${permission.exitCode}` };
+	return { evidence: { permission: permission.stdout.trim(), approvedHead, approvedLogin: login }, error: null };
 }
 
 export async function authenticatedApproval(event: PullRequestEvent, reviewerId: string, headSha: string, token = Bun.env.GITHUB_TOKEN): Promise<{ login?: string; headSha?: string }> {
@@ -421,12 +558,11 @@ export async function authenticatedApproval(event: PullRequestEvent, reviewerId:
 		reviews.push(...pageReviews);
 		if (pageReviews.length < 100) break;
 	}
-	const reviewerReviews = reviews.filter(review =>
-		review.user?.login?.toLowerCase() === reviewerId.toLowerCase()
-		&& review.state !== "COMMENTED"
-		&& review.commit_id === headSha,
+	const approval = effectiveExactHeadReview(
+		reviews.map(review => ({ login: review.user?.login, state: review.state, oid: review.commit_id })),
+		reviewerId,
+		headSha,
 	);
-	const approval = reviewerReviews.at(-1);
 	if (approval?.state !== "APPROVED") return {};
 	const permissionResponse = await fetch(`https://api.github.com/repos/${repository}/collaborators/${encodeURIComponent(reviewerId)}/permission`, {
 		headers: {
@@ -438,16 +574,17 @@ export async function authenticatedApproval(event: PullRequestEvent, reviewerId:
 	if (!permissionResponse.ok) return {};
 	const collaborator = await permissionResponse.json() as CollaboratorPermission;
 	if (!new Set(["admin", "maintain", "write"]).has(collaborator.permission ?? "")) return {};
-	return approval ? { login: approval.user!.login, headSha: approval.commit_id } : {};
+	return { login: approval.login, headSha: approval.oid };
 }
 
 /**
  * Resolve trusted GitHub evidence for the independent reviewer named by a self-review
- * extra:independent:<login> token: collaborator permission plus an authenticated APPROVED
- * review on the exact PR head (issue #4703 hardening — the token shape alone never
- * satisfies the risk gate).
+ * extra:independent:<login> token: collaborator permission plus the EFFECTIVE review on the
+ * exact PR head — the latest non-COMMENTED review from that login, so a later
+ * CHANGES_REQUESTED supersedes an earlier APPROVED exactly as it does for a merge-approved
+ * verdict (issue #4703 hardening, extended after the push preflight mirrored this lookup).
  */
-async function fetchIndependentReviewerEvidence(event: PullRequestEvent, login: string, headSha: string): Promise<IndependentReviewerEvidence> {
+export async function fetchIndependentReviewerEvidence(event: PullRequestEvent, login: string, headSha: string): Promise<IndependentReviewerEvidence> {
 	const repository = event.repository?.full_name;
 	const number = event.pull_request?.number;
 	const token = Bun.env.GITHUB_TOKEN;
@@ -465,11 +602,11 @@ async function fetchIndependentReviewerEvidence(event: PullRequestEvent, login: 
 		reviews.push(...pageReviews);
 		if (pageReviews.length < 100) break;
 	}
-	const approved = reviews.some(review =>
-		review.user?.login?.toLowerCase() === login.toLowerCase()
-		&& review.state === "APPROVED"
-		&& review.commit_id === headSha,
-	);
+	const approved = effectiveExactHeadReview(
+		reviews.map(review => ({ login: review.user?.login, state: review.state, oid: review.commit_id })),
+		login,
+		headSha,
+	)?.state === "APPROVED";
 	const permissionResponse = await fetch(`https://api.github.com/repos/${repository}/collaborators/${encodeURIComponent(login)}/permission`, { headers });
 	if (!permissionResponse.ok) throw new Error(`Independent reviewer permission lookup failed: ${permissionResponse.status}; failing closed.`);
 	const collaborator = await permissionResponse.json() as CollaboratorPermission;
@@ -638,13 +775,14 @@ async function validateEvent(eventPath: string, cwd: string, trustedRoot: string
 	// The self-review record is fetched whenever the verdict names the author (the
 	// merge-self-approved solo path) or the body verdict is merge-approved with a
 	// self-review record expected to carry the risk classification.
-	const selfReviewComment = parsed.verdict && parsed.verdict.reviewerId.toLowerCase() === authorLogin.toLowerCase()
+	const selfReviewNamedByAuthor = Boolean(parsed.verdict && parsed.verdict.reviewerId.toLowerCase() === authorLogin.toLowerCase());
+	const fetchedSelfReview = selfReviewNamedByAuthor
 		? await fetchSelfReviewComment(event, authorLogin)
-		: null;
+		: { comment: null, read: false };
 	const bodyRiskParsed = parseBodyRisk(body);
 	const bodyRisk = bodyRiskParsed.risk;
-	const independentLogin = selfReviewComment ? independentReviewerLogin(selfReviewComment.body) : null;
-	const independentReviewer = independentLogin && selfReviewComment?.login.toLowerCase() === authorLogin.toLowerCase()
+	const independentLogin = fetchedSelfReview.comment ? independentReviewerLogin(fetchedSelfReview.comment.body) : null;
+	const independentReviewer = independentLogin && fetchedSelfReview.comment?.login.toLowerCase() === authorLogin.toLowerCase()
 		? await fetchIndependentReviewerEvidence(event, independentLogin, headSha)
 		: null;
 	const result = validatePrContract({
@@ -659,7 +797,8 @@ async function validateEvent(eventPath: string, cwd: string, trustedRoot: string
 		authenticatedReviewerLogin: approval.login,
 		authenticatedReviewHeadSha: approval.headSha,
 		requireMergeApproved: true,
-		selfReviewComment,
+		selfReviewComment: fetchedSelfReview.comment,
+		selfReviewFetched: fetchedSelfReview.read,
 		bodyRisk,
 		independentReviewer,
 	});
@@ -871,12 +1010,39 @@ async function validatePushPreflight(branch: string, headSha: string, remote: st
 	if (diff.exitCode !== 0) return { ok: false, diagnostics: [`Could not compute the exact ${baseSha}...${headSha} diff: ${diff.stderr}`] };
 	const body = pr.body ?? "";
 	const bodyRiskParsed = parseBodyRisk(body);
+	const authorLogin = pr.user?.login ?? "";
+	// The self-review record is the merge-self-approved authority and lives in a PR
+	// comment, never in the body, so the local gate must fetch exactly the record the
+	// server reads before it can judge the owner's solo path (issue #5483).
+	const parsedVerdict = parsePrVerdict(body).verdict;
+	// The record is fetched only where it can matter: the owner's solo path always needs it,
+	// and a regression/high-risk body needs its risk classification and independent-review
+	// evidence. A low-risk blocking verdict has nothing to judge, so a stale or unreadable
+	// record comment must not reject a push the local contract otherwise allows.
+	const selfReviewNamedByAuthor = Boolean(parsedVerdict && authorLogin && parsedVerdict.reviewerId.toLowerCase() === authorLogin.toLowerCase());
+	const selfReviewNeeded = selfReviewNamedByAuthor
+		&& (parsedVerdict?.verdict === "merge-self-approved" || (bodyRiskParsed.risk !== null && bodyRiskParsed.risk !== "low-risk"));
+	const selfReview = selfReviewNeeded
+		? await fetchPushPreflightSelfReview(baseRepo, pr.number, authorLogin, cwd)
+		: { comment: null, error: null };
+	// A risk-classified record names the maintainer whose exact-head approval the policy
+	// verifies, so the local gate must resolve that evidence too; otherwise a legitimate
+	// risk-classified push is rejected for evidence the server would have supplied.
+	const independentLogin = selfReview.comment ? independentReviewerLogin(selfReview.comment.body) : null;
+	const independent = independentLogin
+		? await fetchPushPreflightIndependentReviewer(baseRepo, pr.number, independentLogin, headSha, cwd)
+		: { evidence: null, error: null };
 	const result = validatePrContract({
 		body,
 		baseRef: pr.base.ref,
 		baseSha,
 		headSha,
-		authorLogin: pr.user?.login ?? "",
+		authorLogin,
+		selfReviewComment: selfReview.comment,
+		selfReviewUnavailable: selfReview.error,
+		selfReviewFetched: selfReviewNeeded && selfReview.error === null,
+		independentReviewer: independent.evidence,
+		independentReviewerUnavailable: independent.error !== null,
 		computedDiffSha256: canonicalDiffSha256(diff.stdout),
 		baseIsAncestor: ancestry.exitCode === 0,
 		fastGatePassed: await runPushedTreeFastGate(cwd, trustedRoot, headSha),
@@ -884,8 +1050,16 @@ async function validatePushPreflight(branch: string, headSha: string, remote: st
 		requireMergeApproved: false,
 	});
 	const diagnostics = [...bodyRiskParsed.diagnostics, ...result.diagnostics];
+	if (independentLogin && independent.error) {
+		diagnostics.push(`Could not read the independent-review evidence for ${independentLogin} on ${baseRepo}#${pr.number}: ${independent.error}. The evidence was never read, so the reviewer has NOT been judged unauthorized.`);
+	}
 	if (diagnostics.length > 0) {
 		diagnostics.push(`Local push contract failed for ${baseRepo}#${pr.number}; the exact ${baseSha}...${headSha} digest is ${canonicalDiffSha256(diff.stdout)}. Merge authorization remains a separate server check.`);
+		if (selfReview.error) {
+			// A local retrieval failure does not predict the server check, which reads the
+			// comments with its own token, so say so instead of implying the record is bad.
+			diagnostics.push(`Re-run the push once \`gh api\` can read the ${SELF_REVIEW_PREFIX} record for ${baseRepo}#${pr.number}, or push with GJC_SKIP_PR_PREFLIGHT=1 (or --no-verify) while the change is still awaiting review.`);
+		}
 	}
 	return { ok: diagnostics.length === 0, verdict: result.verdict, diagnostics };
 }

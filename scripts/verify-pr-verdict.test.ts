@@ -5,6 +5,7 @@ import * as url from "node:url";
 import {
 	authenticatedApproval,
 	canonicalDiffSha256,
+	fetchIndependentReviewerEvidence,
 	parseBodyRisk,
 	parseGhPrCreate,
 	parsePrVerdict,
@@ -876,6 +877,315 @@ process.exit(result.exitCode);
 		const [stderr, exitCode] = await Promise.all([new Response(child.stderr).text(), child.exited]);
 		expect(exitCode).toBe(1);
 		expect(stderr).toContain("is not a lowercase 40-hex commit");
+	});
+});
+
+/**
+ * Build a signed gajae.pr-self-review.v1 record bound to the given exact base/head/digest.
+ */
+function selfReviewRecord(context: { baseSha: string; headSha: string; digest: string; reviewerId?: string; verdict?: "merge-approved" | "merge-self-approved" | "merge-blocked"; risk?: "low-risk" | "regression-risk" | "high-risk"; extra?: string }): string {
+	const reviewerId = context.reviewerId ?? "owner";
+	const verdict = context.verdict ?? "merge-self-approved";
+	const risk = context.risk ?? "low-risk";
+	const extraToken = context.extra ?? "none";
+	const extra = extraToken === "none" ? { kind: "none" as const } : { kind: "independent" as const, login: extraToken.slice("independent:".length) };
+	const evidence = "hermetic push preflight fixture";
+	const signature = selfReviewSignature(selfReviewSignedPayload({
+		verdict,
+		baseSha: context.baseSha,
+		headSha: context.headSha,
+		diffSha256: context.digest,
+		reviewerId,
+		risk,
+		extra,
+		evidence,
+	}));
+	const record = `gajae.pr-self-review.v1 verdict:${verdict} base:${context.baseSha} head:${context.headSha} sha256:${context.digest} reviewer-id:${reviewerId} risk:${risk} extra:${extraToken} evidence:${evidence}`;
+	return `${record}\nself-review-signature: sha256:${signature}\nSigned-off-by: gaebal-gajae (clawdbot) 🦞`;
+}
+
+interface PushPreflightFixture {
+	exitCode: number;
+	stdout: string;
+	stderr: string;
+	ghCalls: string[];
+}
+
+interface PushPreflightContext {
+	baseSha: string;
+	headSha: string;
+	digest: string;
+}
+
+/**
+ * Hermetic end-to-end push preflight for the maintainer self-review record (issue #5483):
+ * a real git repository, the real CLI, and a PATH-shimmed `gh` whose only job is to serve
+ * the GitHub API responses. Everything the gate itself does — the base fetch, the ancestry
+ * check, the canonical diff digest, the pushed-tree fast gate, and the comment read — runs
+ * for real. The shim is flag-aware: it refuses a comment read that forgot `--paginate` or
+ * lost its `--jq` projection, so the mirroring contract cannot silently regress.
+ */
+async function runSelfReviewPushPreflight(options: {
+	body?: (context: PushPreflightContext) => string;
+	comments?: (context: PushPreflightContext) => unknown[];
+	commentsUnavailable?: boolean;
+	/** Emit the comments as JSONL that is cut off mid-record while gh still exits 0. */
+	commentsTruncated?: boolean;
+	reviews?: (context: PushPreflightContext) => unknown[];
+	reviewsUnavailable?: boolean;
+	permission?: string;
+	permissionUnavailable?: boolean;
+} = {}): Promise<PushPreflightFixture> {
+	const script = url.fileURLToPath(new URL("./verify-pr-verdict.ts", import.meta.url));
+	const repoRoot = url.fileURLToPath(new URL("..", import.meta.url));
+	const temp = await fs.mkdtemp(path.join(Bun.env.TMPDIR ?? "/tmp", "gjc-self-review-preflight-"));
+	try {
+		const work = path.join(temp, "work");
+		const bin = path.join(temp, "bin");
+		await fs.mkdir(work, { recursive: true });
+		await fs.mkdir(bin, { recursive: true });
+		const git = (args: string[]): string => {
+			const child = Bun.spawnSync(["git", ...args], { cwd: work, env: { ...process.env, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null" }, stdout: "pipe", stderr: "pipe" });
+			if (child.exitCode !== 0) throw new Error(`git ${args.join(" ")} failed: ${child.stderr.toString()}`);
+			return child.stdout.toString();
+		};
+		git(["init", "-q"]);
+		git(["symbolic-ref", "HEAD", "refs/heads/dev"]);
+		git(["config", "user.email", "preflight@example.com"]);
+		git(["config", "user.name", "Preflight Fixture"]);
+		await Bun.write(path.join(work, "packages", "coding-agent", "src", "example.ts"), "export const value = 1;\n");
+		git(["add", "-A"]);
+		git(["commit", "-q", "-m", "base"]);
+		const baseSha = git(["rev-parse", "HEAD"]).trim();
+		git(["remote", "add", "origin", "git@github.com:owner/repo.git"]);
+		// The gate fetches https://github.com/owner/repo.git itself; rewriting that URL to
+		// the fixture keeps the real fetch path while staying off the network.
+		git(["config", `url.${work}.insteadOf`, "https://github.com/owner/repo.git"]);
+		git(["checkout", "-q", "-b", "feature"]);
+		await Bun.write(path.join(work, "packages", "coding-agent", "src", "example.ts"), "export const value = 2;\n");
+		git(["add", "-A"]);
+		git(["commit", "-q", "-m", "feature"]);
+		const headSha = git(["rev-parse", "HEAD"]).trim();
+		const diff = Bun.spawnSync(["git", "diff", "--binary", "--full-index", "--no-ext-diff", `${baseSha}...${headSha}`], { cwd: work, stdout: "pipe", stderr: "pipe" }).stdout;
+		const context: PushPreflightContext = { baseSha, headSha, digest: canonicalDiffSha256(diff) };
+		const body = options.body?.(context) ?? `gajae.pr-review-verdict.v1 merge-self-approved sha256:${context.digest} reviewer:human reviewer-id:owner evidence:hermetic push preflight fixture\n\n## Risk classification\n\n- [x] \`low-risk\`\n`;
+		const comments = options.comments?.(context) ?? [{ user: { login: "owner" }, author_association: "OWNER", body: selfReviewRecord(context) }];
+		const reviews = options.reviews?.(context) ?? [];
+		const pullsPath = path.join(temp, "pulls.json");
+		const commentsPath = path.join(temp, "comments.jsonl");
+		const reviewsPath = path.join(temp, "reviews.jsonl");
+		const permissionPath = path.join(temp, "permission.txt");
+		const callsPath = path.join(temp, "gh-calls.log");
+		await Bun.write(pullsPath, JSON.stringify([{ number: 123, body, base: { ref: "dev" }, user: { login: "owner" }, head: { ref: "feature", repo: { owner: { login: "owner" } } } }]));
+		const commentsJsonl = comments.map(comment => JSON.stringify(comment)).join("\n");
+		await Bun.write(commentsPath, options.commentsTruncated ? `${commentsJsonl}\n{"user":{"login":"owner"` : commentsJsonl);
+		await Bun.write(reviewsPath, reviews.map(review => JSON.stringify(review)).join("\n"));
+		await Bun.write(permissionPath, `${options.permission ?? "write"}\n`);
+		await Bun.write(callsPath, "");
+		const ghPath = path.join(bin, "gh");
+		await Bun.write(ghPath, `#!/usr/bin/env bash\nset -euo pipefail\nargs="$*"\nprintf '%s\\n' "$args" >> "$GH_CALLS"\nif [[ "$args" == "repo view owner/repo --json isFork,parent" ]]; then\n  printf '{"isFork":false}\\n'\nelif [[ "$args" == *"/pulls?state=open"* ]]; then\n  cat "$GH_PULLS"\nelif [[ "$args" == *"/pulls/123/reviews"* ]]; then\n  [[ "$args" == *"--paginate"* ]] || { echo "gh reviews read is missing --paginate" >&2; exit 1; }\n  [[ "$args" == *"commit_id"* ]] || { echo "gh reviews read lost its --jq projection" >&2; exit 1; }\n  if [[ -n "\${GH_REVIEWS_UNAVAILABLE:-}" ]]; then\n    echo "HTTP 503: reviews unavailable" >&2\n    exit 1\n  fi\n  cat "$GH_REVIEWS"\nelif [[ "$args" == *"/collaborators/"* ]]; then\n  [[ "$args" == *"--jq .permission"* ]] || { echo "gh permission read lost its --jq projection" >&2; exit 1; }\n  if [[ -n "\${GH_PERMISSION_UNAVAILABLE:-}" ]]; then\n    echo "HTTP 404: Not Found" >&2\n    exit 1\n  fi\n  cat "$GH_PERMISSION"\nelif [[ "$args" == *"/issues/123/comments"* ]]; then\n  [[ "$args" == *"--paginate"* ]] || { echo "gh comments read is missing --paginate" >&2; exit 1; }\n  [[ "$args" == *"author_association"* ]] || { echo "gh comments read lost its --jq projection" >&2; exit 1; }\n  if [[ -n "\${GH_COMMENTS_UNAVAILABLE:-}" ]]; then\n    echo "HTTP 503: service unavailable" >&2\n    exit 1\n  fi\n  cat "$GH_COMMENTS"\nelse\n  echo "unexpected gh invocation: $args" >&2\n  exit 1\nfi\n`);
+		await fs.chmod(ghPath, 0o755);
+		const child = Bun.spawn([process.execPath, script, "--push-preflight", "feature", headSha, "--push-url", "https://github.com/owner/repo.git", "--repo", work, "--trusted-root", repoRoot], {
+			cwd: work,
+			env: {
+				...process.env,
+				PATH: `${bin}${path.delimiter}${process.env.PATH ?? ""}`,
+				GH_CALLS: callsPath,
+				GH_PULLS: pullsPath,
+				GH_COMMENTS: commentsPath,
+				GH_REVIEWS: reviewsPath,
+				GH_PERMISSION: permissionPath,
+				...options.commentsUnavailable ? { GH_COMMENTS_UNAVAILABLE: "1" } : {},
+				...options.reviewsUnavailable ? { GH_REVIEWS_UNAVAILABLE: "1" } : {},
+				...options.permissionUnavailable ? { GH_PERMISSION_UNAVAILABLE: "1" } : {},
+			},
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const [stdout, stderr, exitCode] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
+		const ghCalls = (await Bun.file(callsPath).text()).split("\n").filter(Boolean);
+		return { exitCode, stdout, stderr, ghCalls };
+	} finally {
+		await fs.rm(temp, { recursive: true, force: true });
+	}
+}
+
+describe("push preflight self-review record (issue #5483)", () => {
+	test("a valid merge-self-approved record lets the push preflight pass", async () => {
+		const result = await runSelfReviewPushPreflight();
+		expect(result.stderr).not.toContain("::error::");
+		expect(result.exitCode).toBe(0);
+		expect(result.stdout).toContain("PR contract valid: merge-self-approved");
+		// The record lives on the PR, so the gate must actually read the comment API.
+		expect(result.ghCalls.some(call => call.includes("/issues/123/comments") && call.includes("--paginate"))).toBe(true);
+	});
+
+	test("an unreadable self-review record is reported as unread, not as invalid", async () => {
+		const result = await runSelfReviewPushPreflight({ commentsUnavailable: true });
+		expect(result.exitCode).toBe(1);
+		expect(result.stderr).toContain("It was never evaluated, so it has NOT been judged invalid");
+		expect(result.stderr).toContain("service unavailable");
+		expect(result.stderr).not.toContain("requires a valid gajae.pr-self-review.v1 risk record");
+	});
+
+	test("a truncated comment list is an unread record, not a shorter valid one", async () => {
+		const result = await runSelfReviewPushPreflight({ commentsTruncated: true });
+		expect(result.exitCode).toBe(1);
+		expect(result.stderr).toContain("It was never evaluated, so it has NOT been judged invalid");
+	});
+
+	test("a PR with no author record fails closed and names the absence", async () => {
+		const result = await runSelfReviewPushPreflight({ comments: () => [] });
+		expect(result.exitCode).toBe(1);
+		expect(result.stderr).toContain("was found on this PR; the merge-self-approved solo path requires one bound to the exact head");
+		expect(result.stderr).not.toContain("could not be read");
+	});
+
+	test("the newest author-authored record wins over an older stale one", async () => {
+		const result = await runSelfReviewPushPreflight({
+			comments: context => [
+				// An older record bound to a different head must never shadow the current one.
+				{ user: { login: "owner" }, author_association: "OWNER", body: selfReviewRecord({ ...context, headSha: "d".repeat(40) }) },
+				{ user: { login: "owner" }, author_association: "OWNER", body: selfReviewRecord(context) },
+			],
+		});
+		expect(result.stderr).not.toContain("::error::");
+		expect(result.exitCode).toBe(0);
+	});
+
+	test("a stale record still fails with the precise sub-diagnostic", async () => {
+		const result = await runSelfReviewPushPreflight({
+			comments: context => [{ user: { login: "owner" }, author_association: "OWNER", body: selfReviewRecord({ ...context, headSha: "d".repeat(40) }) }],
+		});
+		expect(result.exitCode).toBe(1);
+		expect(result.stderr).toContain("is stale; exact PR head is");
+	});
+
+	test("another identity's record never authorizes the author's push", async () => {
+		const result = await runSelfReviewPushPreflight({
+			comments: context => [{ user: { login: "intruder" }, author_association: "NONE", body: selfReviewRecord(context) }],
+		});
+		expect(result.exitCode).toBe(1);
+		expect(result.stderr).toContain("was found on this PR; the merge-self-approved solo path requires one bound to the exact head");
+	});
+});
+
+describe("push preflight independent-review evidence (issue #5483 review)", () => {
+	const riskClassifiedBody = (context: PushPreflightContext): string =>
+		`gajae.pr-review-verdict.v1 needs-human sha256:${context.digest} reviewer:human reviewer-id:owner evidence:hermetic push preflight fixture\n\n## Risk classification\n\n- [x] \`regression-risk\`\n`;
+	const riskClassifiedComments = (context: PushPreflightContext) => [{
+		user: { login: "owner" },
+		author_association: "OWNER",
+		body: selfReviewRecord({ ...context, risk: "regression-risk", extra: "independent:review-bot" }),
+	}];
+	const reviewerApproval = (context: PushPreflightContext, state = "APPROVED") => [
+		{ author: { login: "review-bot" }, state, commit: { oid: context.headSha } },
+	];
+
+	test("a risk-classified record is authorized by the named reviewer's exact-head approval and permission", async () => {
+		const result = await runSelfReviewPushPreflight({
+			body: riskClassifiedBody,
+			comments: riskClassifiedComments,
+			reviews: context => reviewerApproval(context),
+			permission: "write",
+		});
+		expect(result.stderr).not.toContain("::error::");
+		expect(result.exitCode).toBe(0);
+		// The evidence must come from the real API surface the server uses.
+		expect(result.ghCalls.some(call => call.includes("/pulls/123/reviews") && call.includes("--paginate"))).toBe(true);
+		expect(result.ghCalls.some(call => call.includes("/collaborators/review-bot/permission"))).toBe(true);
+	});
+
+	test("a named reviewer without repository authority does not authorize the record", async () => {
+		const result = await runSelfReviewPushPreflight({
+			body: riskClassifiedBody,
+			comments: riskClassifiedComments,
+			reviews: context => reviewerApproval(context),
+			permission: "read",
+		});
+		expect(result.exitCode).toBe(1);
+		expect(result.stderr).toContain("is not satisfied");
+	});
+
+	test("a named reviewer without an exact-head approval does not authorize the record", async () => {
+		const result = await runSelfReviewPushPreflight({
+			body: riskClassifiedBody,
+			comments: riskClassifiedComments,
+			reviews: context => reviewerApproval(context, "CHANGES_REQUESTED"),
+			permission: "write",
+		});
+		expect(result.exitCode).toBe(1);
+		expect(result.stderr).toContain("is not satisfied");
+	});
+
+	test("a later CHANGES_REQUESTED on the same head supersedes the reviewer's approval", async () => {
+		const result = await runSelfReviewPushPreflight({
+			body: riskClassifiedBody,
+			comments: riskClassifiedComments,
+			reviews: context => [
+				...reviewerApproval(context),
+				{ author: { login: "review-bot" }, state: "CHANGES_REQUESTED", commit: { oid: context.headSha } },
+			],
+			permission: "write",
+		});
+		expect(result.exitCode).toBe(1);
+		expect(result.stderr).toContain("is not satisfied");
+	});
+
+	test("unreadable independent-review evidence is reported as unread, not as unauthorized", async () => {
+		const result = await runSelfReviewPushPreflight({
+			body: riskClassifiedBody,
+			comments: riskClassifiedComments,
+			reviewsUnavailable: true,
+		});
+		expect(result.exitCode).toBe(1);
+		expect(result.stderr).toContain("Could not read the independent-review evidence for review-bot");
+		expect(result.stderr).toContain("has NOT been judged unauthorized");
+		// One failed read must not be framed as an unsatisfied policy as well.
+		expect(result.stderr).not.toContain("is not satisfied");
+	});
+
+	test("a low-risk blocking verdict never reads the record it does not need", async () => {
+		const result = await runSelfReviewPushPreflight({
+			body: context => `gajae.pr-review-verdict.v1 needs-human sha256:${context.digest} reviewer:human reviewer-id:owner evidence:hermetic push preflight fixture\n\n## Risk classification\n\n- [x] \`low-risk\`\n`,
+			// A read failure would reject the push if the gate asked for the record at all.
+			commentsUnavailable: true,
+		});
+		expect(result.stderr).not.toContain("::error::");
+		expect(result.exitCode).toBe(0);
+		expect(result.ghCalls.some(call => call.includes("/issues/123/comments"))).toBe(false);
+	});
+});
+
+describe("server independent-reviewer evidence (issue #5483 review)", () => {
+	const event = { repository: { full_name: "owner/repo" }, pull_request: { number: 5416 } };
+	const review = (login: string, state: string, commit = head) => ({ state, commit_id: commit, user: { login } });
+
+	test.each([
+		{ name: "approval only", reviews: [review("review-bot", "APPROVED")], approved: true },
+		{ name: "approval withdrawn by a later changes-requested", reviews: [review("review-bot", "APPROVED"), review("review-bot", "CHANGES_REQUESTED")], approved: false },
+		{ name: "approval restored after changes-requested", reviews: [review("review-bot", "CHANGES_REQUESTED"), review("review-bot", "APPROVED")], approved: true },
+		{ name: "commented review never counts", reviews: [review("review-bot", "COMMENTED")], approved: false },
+		{ name: "approval on another head", reviews: [review("review-bot", "APPROVED", "d".repeat(40))], approved: false },
+		{ name: "another identity's approval", reviews: [review("someone-else", "APPROVED")], approved: false },
+	]) ("$name", async scenario => {
+		const originalFetch = globalThis.fetch;
+		const previousToken = Bun.env.GITHUB_TOKEN;
+		Bun.env.GITHUB_TOKEN = "test-token";
+		const replacement: typeof fetch = Object.assign(async (input: Parameters<typeof fetch>[0]) => {
+			const endpoint = String(input);
+			if (endpoint.startsWith("https://api.github.com/repos/owner/repo/pulls/5416/reviews")) return Response.json(scenario.reviews);
+			if (endpoint === "https://api.github.com/repos/owner/repo/collaborators/review-bot/permission") return Response.json({ permission: "write" });
+			throw new Error(`Unexpected endpoint: ${endpoint}`);
+		}, { preconnect: originalFetch.preconnect });
+		const spy = vi.spyOn(globalThis, "fetch").mockImplementation(replacement);
+		try {
+			const evidence = await fetchIndependentReviewerEvidence(event, "review-bot", head);
+			expect(evidence).toEqual({ permission: "write", approvedHead: scenario.approved, approvedLogin: "review-bot" });
+		} finally {
+			spy.mockRestore();
+			if (previousToken === undefined) delete Bun.env.GITHUB_TOKEN; else Bun.env.GITHUB_TOKEN = previousToken;
+		}
 	});
 });
 
