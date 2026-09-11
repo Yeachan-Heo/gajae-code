@@ -266,7 +266,7 @@ posix("generated ID collision fails once before pending publication", async () =
 	});
 });
 
-posix("actual publisher exit leaves bounded crash remnants and its lock is never stolen", async () => {
+posix("a crashed publisher's abandoned lock is reclaimed while a live publisher's lock is never stolen", async () => {
 	for (const phase of ["file-sync", "directory-sync", "cleanup"] as const) {
 		await fixture(async (root, store) => {
 			const prior = await publish(root);
@@ -286,14 +286,35 @@ posix("actual publisher exit leaves bounded crash remnants and its lock is never
 			const before = (await fs.readdir(store)).sort();
 			expect(before).toContain("lock");
 			expect(before.length).toBeLessThanOrEqual(3);
-			expect(await publish(root)).toMatchObject({ status: "unavailable", reason: "store_busy", continuation: null });
-			expect((await fs.readdir(store)).sort()).toEqual(before);
+			// The recorded owner is gone, so its lock is reclaimed instead of wedging
+			// the store for every later failure that needs evidence retained.
+			const recovered = await publish(root);
+			expect(recovered).toMatchObject({ status: "retained", continuation: { kind: "local-store" } });
+			const after = await fs.readdir(store);
+			expect(after).not.toContain("lock");
+			expect(after.length).toBeLessThanOrEqual(before.length + 1);
 			expect((await fs.readFile(path.join(store, "00.json"))).equals(original)).toBe(true);
 			expect(
 				(await readCommandEvidence({ agentDir: root, family: "sdk", id: prior.id, sha256: prior.sha256 })).status,
 			).toBe("available");
 		});
 	}
+});
+
+posix("a lock whose recorded owner is still alive is never stolen, even after the grace window", async () => {
+	await fixture(async (root, store) => {
+		await fs.mkdir(store, { mode: 0o700 });
+		const record = `${JSON.stringify({
+			schema: "gjc.command-error-lock",
+			version: 1,
+			pid: process.pid,
+			createdAt: new Date(Date.now() - 60_000).toISOString(),
+		})}\n`;
+		await fs.writeFile(path.join(store, "lock"), record, { mode: 0o600 });
+		expect(await publish(root)).toMatchObject({ status: "unavailable", reason: "store_busy", continuation: null });
+		expect(await fs.readFile(path.join(store, "lock"), "utf8")).toBe(record);
+		expect(await fs.readdir(store)).toEqual(["lock"]);
+	});
 });
 
 posix(

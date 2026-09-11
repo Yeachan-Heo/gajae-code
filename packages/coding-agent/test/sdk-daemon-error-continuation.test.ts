@@ -184,7 +184,7 @@ posix("oversized locator fails before publication with no fabricated continuatio
 });
 
 posix(
-	"exact 24-hour expiry, non-sliding reads, rollback and busy-lock expiry use canonical unmodified bytes",
+	"exact 24-hour expiry, non-sliding reads, rollback and a live lock owner use canonical unmodified bytes",
 	async () => {
 		await fixture(async (root, slot) => {
 			const created = Date.now();
@@ -223,7 +223,18 @@ posix(
 					continuation: null,
 				});
 				const lock = path.join(path.dirname(slot), "lock");
-				await fs.writeFile(lock, "", { mode: 0o600, flag: "wx" });
+				// Liveness, not elapsed time, proves abandonment: a lock whose recorded owner
+				// is still alive is never reclaimed however far the clock has moved.
+				await fs.writeFile(
+					lock,
+					`${JSON.stringify({
+						schema: "gjc.command-error-lock",
+						version: 1,
+						pid: process.pid,
+						createdAt: new Date(created).toISOString(),
+					})}\n`,
+					{ mode: 0o600, flag: "wx" },
+				);
 				const lockStat = await fs.stat(lock);
 				now = created + 86_400_000;
 				expect(await readCommandEvidence(request)).toMatchObject({
