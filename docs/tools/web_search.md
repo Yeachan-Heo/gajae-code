@@ -147,6 +147,12 @@ Streaming: none. `WebSearchTool.execute()` does not forward its `_signal` argume
     - `max_tokens` and `temperature` pass through as `generationConfig.maxOutputTokens` / `generationConfig.temperature`.
     - `limit` and `num_search_results` are collapsed together before dispatch.
     - Output may include `answer`, `sources`, `citations`, `searchQueries`, `usage`, `model`.
+  - **OpenAI-compatible** — `packages/coding-agent/src/web/search/providers/openai-compatible.ts`
+    - Reuses the active model's resolved credentials, headers, base URL, and wire model ID.
+    - Requests `stream: true` from `/responses` with the `web_search` tool, including when the model normally uses Chat Completions. Only HTTP `404`/`405` falls back to `/chat/completions` with `web_search_options` and streaming enabled.
+    - Accepts JSON responses and consumes SSE responses incrementally. Responses results use the completed response snapshot, or completed output-item events when that snapshot omits its output; Chat results accumulate text and citation annotations. Failed, incomplete, malformed, or prematurely ended streams are rejected rather than returned as partial search results.
+    - Only `url_citation` annotations count as grounding. Inline links are recovered only when `web_search_call` or positive `tool_usage.web_search.num_requests` proves that a search ran; ordinary model answers with ungrounded URLs fail closed (`424`).
+    - Caller cancellation and the LLM search timeout cover response-body consumption as well as the HTTP request.
   - **OpenAI code** — `packages/coding-agent/src/web/search/providers/openai-code.ts`
     - Availability: non-expired OAuth credential for `openai-code` in `agent.db`.
     - Querying: SSE POST to `https://chatgpt.com/backend-api/openai-code/responses` with `tool_choice: { type: "web_search" }` and `search_context_size: "high"` by default.
