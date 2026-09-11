@@ -228,17 +228,52 @@ function normalizeMime(contentType: string): string {
 	return contentType.split(";")[0].trim().toLowerCase();
 }
 
+// Bound both parsing work and decoded filename size to a single modest header.
+function getDispositionFilename(header: string): string | undefined {
+	if (header.length > 8192 || /[\x00-\x1f\x7f]/.test(header.replaceAll("\t", ""))) return undefined;
+	const separator = header.indexOf(";");
+	if (separator < 0) return undefined;
+	const parameter = /;[ \t]*([!#$%&'*+.^_`|~\w-]+)[ \t]*=[ \t]*(?:"((?:[^"\\]|\\.)*)"|([!#$%&'*+.^_`|~\w-]+))[ \t]*/y;
+	let offset = separator;
+	let plain: string | undefined;
+	let extended: string | undefined;
+	const seen = new Set<string>();
+	while (offset < header.length) {
+		parameter.lastIndex = offset;
+		const match = parameter.exec(header);
+		if (!match) return undefined;
+		offset = parameter.lastIndex;
+		const name = match[1].toLowerCase();
+		if (name !== "filename" && name !== "filename*") continue;
+		// Duplicate filename parameters are ambiguous, not an ordering override.
+		if (seen.has(name)) return undefined;
+		seen.add(name);
+		const value = match[2] === undefined ? match[3] : match[2].replace(/\\(.)/g, "$1");
+		if (name === "filename") {
+			if (value) plain = value;
+			continue;
+		}
+		// RFC 8187 ext-value: only UTF-8 is supported; quoted ext-values are invalid.
+		const encoded =
+			match[2] === undefined ? /^UTF-8'[A-Za-z0-9-]*'((?:[!#$&+.^_`|~\w-]|%[\da-fA-F]{2})*)$/i.exec(value) : null;
+		if (!encoded) continue;
+		try {
+			const decoded = decodeURIComponent(encoded[1]);
+			if (decoded && !/[\x00-\x1f\x7f]/.test(decoded)) extended = decoded;
+		} catch {
+			// Invalid UTF-8 or percent encoding must not escape classification.
+		}
+	}
+	return extended ?? plain;
+}
+
 /**
  * Get extension from URL or Content-Disposition
  */
 function getExtensionHint(url: string, contentDisposition?: string): string {
-	// Try Content-Disposition filename first
 	if (contentDisposition) {
-		const match = contentDisposition.match(/filename[*]?=["']?([^"';\n]+)/i);
-		if (match) {
-			const ext = path.extname(match[1]).toLowerCase();
-			if (ext) return ext;
-		}
+		const filename = getDispositionFilename(contentDisposition);
+		if (filename !== undefined) return path.extname(filename).toLowerCase();
 	}
 
 	// Fall back to URL path
@@ -251,21 +286,25 @@ function getExtensionHint(url: string, contentDisposition?: string): string {
 	return "";
 }
 
+function isGenericMimeType(mime: string): boolean {
+	return (
+		mime.length === 0 || mime === "application/octet-stream" || mime === "binary/octet-stream" || mime === "unknown"
+	);
+}
+
 /**
  * Check if content type is convertible via markit.
  */
 function isConvertible(mime: string, extensionHint: string): boolean {
-	if (CONVERTIBLE_MIMES.has(mime)) return true;
-	if (mime === "application/octet-stream" && CONVERTIBLE_EXTENSIONS.has(extensionHint)) return true;
-	if (CONVERTIBLE_EXTENSIONS.has(extensionHint)) return true;
-	return false;
+	return (
+		CONVERTIBLE_MIMES.has(mime) ||
+		(CONVERTIBLE_EXTENSIONS.has(extensionHint) && (extensionHint !== ".pdf" || isGenericMimeType(mime)))
+	);
 }
 
 function resolveImageMimeType(mime: string, extensionHint: string): string | null {
 	if (mime.startsWith("image/")) return mime;
-	const shouldUseExtensionHint =
-		mime.length === 0 || mime === "application/octet-stream" || mime === "binary/octet-stream" || mime === "unknown";
-	if (!shouldUseExtensionHint) return null;
+	if (!isGenericMimeType(mime)) return null;
 	return IMAGE_MIME_BY_EXTENSION.get(extensionHint) ?? null;
 }
 
@@ -741,15 +780,51 @@ async function renderUrl(
 	const { finalUrl, content: rawContent } = response;
 	const mime = normalizeMime(response.contentType);
 	const extHint = getExtensionHint(finalUrl);
+	let isPdf = mime === "application/pdf" || (extHint === ".pdf" && isGenericMimeType(mime));
 
-	const imageMimeType = resolveImageMimeType(mime, extHint);
+	// Raw PDF inspection is explicit; never substitute PDF bytes for failed text extraction.
+	if (raw && isPdf) {
+		const output = finalizeOutput(rawContent);
+		return {
+			url,
+			finalUrl,
+			contentType: mime,
+			method: "raw",
+			content: output.content,
+			fetchedAt,
+			truncated: output.truncated,
+			notes,
+		};
+	}
+
+	// Classify generic downloads from the bounded binary response before dispatch.
+	// Both image rendering and document conversion reuse these bytes.
+	const dispositionBinary = !raw && isGenericMimeType(mime) ? await fetchBinary(finalUrl, timeout, signal) : undefined;
+	if (dispositionBinary && !dispositionBinary.ok) {
+		notes.push(dispositionBinary.error ? `Binary fetch failed: ${dispositionBinary.error}` : "Binary fetch failed");
+		return {
+			url,
+			finalUrl,
+			contentType: mime,
+			method: "failed",
+			content: "",
+			fetchedAt,
+			truncated: false,
+			notes,
+		};
+	}
+	const effectiveExt = dispositionBinary?.ok
+		? getExtensionHint(finalUrl, dispositionBinary.contentDisposition)
+		: extHint;
+	isPdf = mime === "application/pdf" || (effectiveExt === ".pdf" && isGenericMimeType(mime));
+	const imageMimeType = isPdf ? undefined : resolveImageMimeType(mime, effectiveExt);
 	let skipConvertibleBinaryRetry = false;
 	if (imageMimeType) {
 		if (!isInlineImageMimeTypeSupported(imageMimeType)) {
 			notes.push(
 				`Image MIME type ${imageMimeType} is unsupported for inline model serialization; returning text metadata only`,
 			);
-			const shouldTryConvertibleFallback = isConvertible(mime, extHint);
+			const shouldTryConvertibleFallback = isConvertible(mime, effectiveExt);
 			if (shouldTryConvertibleFallback) {
 				notes.push("Attempting binary conversion fallback for unsupported image MIME type");
 			} else {
@@ -757,7 +832,7 @@ async function renderUrl(
 			}
 			skipConvertibleBinaryRetry = !shouldTryConvertibleFallback;
 		} else {
-			const binary = await fetchBinary(finalUrl, timeout, signal);
+			const binary = dispositionBinary ?? (await fetchBinary(finalUrl, timeout, signal));
 			if (binary.ok) {
 				notes.push("Fetched image binary");
 				const conversionExtension = getExtensionHint(finalUrl, binary.contentDisposition) || extHint;
@@ -868,10 +943,10 @@ async function renderUrl(
 	}
 
 	// Step 3: Handle convertible binary files (PDF, DOCX, etc.)
-	if (!skipConvertibleBinaryRetry && isConvertible(mime, extHint)) {
-		const binary = await fetchBinary(finalUrl, timeout, signal);
+	if (!skipConvertibleBinaryRetry && (isPdf || isConvertible(mime, effectiveExt))) {
+		const binary = dispositionBinary ?? (await fetchBinary(finalUrl, timeout, signal));
 		if (binary.ok) {
-			const ext = getExtensionHint(finalUrl, binary.contentDisposition) || extHint;
+			const ext = isPdf ? ".pdf" : getExtensionHint(finalUrl, binary.contentDisposition);
 			const converted = await convertWithMarkit(binary.buffer, ext, timeout, signal);
 			if (converted.ok) {
 				// Any non-empty markit conversion is preferable to a raw-bytes
@@ -901,6 +976,18 @@ async function renderUrl(
 			notes.push(`Binary fetch failed: ${binary.error}`);
 		} else {
 			notes.push("Binary fetch failed");
+		}
+		if (isPdf) {
+			return {
+				url,
+				finalUrl,
+				contentType: mime,
+				method: "failed",
+				content: "",
+				fetchedAt,
+				truncated: false,
+				notes,
+			};
 		}
 	}
 
@@ -1066,7 +1153,7 @@ async function renderUrl(
 				if (binary.ok) {
 					const ext = getExtensionHint(docUrl, binary.contentDisposition);
 					const converted = await convertWithMarkit(binary.buffer, ext, timeout, signal);
-					if (converted.ok && converted.content.trim().length > htmlResult.content.length) {
+					if (converted.ok && converted.content.trim().length > (ext === ".pdf" ? 0 : htmlResult.content.length)) {
 						notes.push(`Extracted and converted document: ${docUrl}`);
 						const output = finalizeOutput(converted.content);
 						return {
@@ -1082,6 +1169,8 @@ async function renderUrl(
 					}
 					if (!converted.ok && converted.error) {
 						notes.push(`markit conversion failed: ${converted.error}`);
+					} else if (converted.ok && !converted.content.trim()) {
+						notes.push("markit conversion produced no usable output");
 					}
 				} else if (binary.error) {
 					notes.push(`Binary fetch failed: ${binary.error}`);
