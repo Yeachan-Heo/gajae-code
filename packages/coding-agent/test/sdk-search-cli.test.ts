@@ -56,6 +56,26 @@ test("search renders populated and empty envelopes with a preamble and no endpoi
 	}
 });
 
+test("search text strips terminal controls and Unicode line separators", () => {
+	const result = envelope("/repo", "populated", [
+		{
+			id: "session-\u001b[31m\u2028one",
+			locator: { cwd: "/repo/\u0007cwd", worktreeRoot: "/repo", stateRoot: "/state" },
+			live: true,
+			probe: "reachable",
+		},
+	]);
+	const output = renderSdkSearchTable({
+		...result,
+		observedAt: "2026-08-23T12:00:00.000Z\u2029later",
+		cursor: "cursor\u001b[0m\u2028next",
+	});
+	expect(output).not.toContain("\u001b");
+	expect(output).not.toContain("\u2028");
+	expect(output).not.toContain("\u2029");
+	expect(output).not.toContain("\u0007");
+});
+
 test("search returns exactly the scoped envelope and probes only populated filtered rows", async () => {
 	const root = await temp();
 	const git = Bun.spawn(["git", "init", "-q", root]);

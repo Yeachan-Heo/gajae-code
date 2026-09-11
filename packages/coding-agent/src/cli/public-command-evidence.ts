@@ -384,7 +384,7 @@ function continuation(
 	)
 		fail("locator_too_large");
 	const argv = [options.family, "--error-ref", record.id, "--error-sha256", sha256, "--error-page", String(page)];
-	if (options.scopeAgentDir !== undefined) argv.push("--error-agent-dir", options.scopeAgentDir);
+	if (options.scopeAgentDir !== undefined) argv.push(`--error-agent-dir=${options.scopeAgentDir}`);
 	if (options.json) argv.push("--json");
 	return { kind: "local-store", id: record.id, sha256, expiresAt: record.expiresAt, page, executable: "gjc", argv };
 }

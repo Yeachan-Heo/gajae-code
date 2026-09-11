@@ -168,7 +168,7 @@ const result=await renderPublicCommandFailure(new PublicCommandFailure({kind:"wa
 					executable: "gjc",
 				});
 				expect(next.argv.slice(0, 2)).toEqual(["sdk", "--error-ref"]);
-				expect(next.argv).toContain(scope);
+				expect(next.argv).toContain(`--error-agent-dir=${scope}`);
 				const result = await actualCli(next.argv, scope);
 				expect(result.code).toBe(0);
 				expect(result.stderr).toBe("");
@@ -242,6 +242,8 @@ await runCli(${JSON.stringify(["sdk", ...argv])});`);
 			["broker-internal"],
 			["broker-internal", "--agent-dir"],
 			["broker-internal", "--agent-dir", ""],
+			["broker-internal", "--agent-dir", "--help"],
+			["broker-internal", "--agent-dir", "\u001b[31m/tmp/agent"],
 			["broker-internal", "--agent-dir=/safe-fixture"],
 			["broker-internal", "--agent-dir", "/safe-fixture", "--help"],
 			["session-host-internal", "--help"],

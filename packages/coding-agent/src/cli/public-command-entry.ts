@@ -266,11 +266,24 @@ export interface PublicCommandDispatchContext extends CommandEntryContext {
 	setup?: (report: (diagnostic: { code: "macos_nofile_limit_low"; successStderr: string }) => void) => Promise<void>;
 }
 
+export function isSafeSdkInternalAgentDir(value: string): boolean {
+	return (
+		value.length > 0 &&
+		value.length <= 4096 &&
+		!value.startsWith("-") &&
+		!/[\x00-\x1f\x7f-\x9f\u2028\u2029]/u.test(value)
+	);
+}
+
 /** Mirrors commands/sdk.ts parseSdkInternalArgv without eagerly loading its runtime. */
 export function isSdkInternalArgv(argv: readonly string[]): boolean {
 	return (
 		(argv[0] === "session-host-internal" && argv.length === 1) ||
-		(argv[0] === "broker-internal" && argv.length === 3 && argv[1] === "--agent-dir" && Boolean(argv[2]))
+		(argv[0] === "broker-internal" &&
+			argv.length === 3 &&
+			argv[1] === "--agent-dir" &&
+			typeof argv[2] === "string" &&
+			isSafeSdkInternalAgentDir(argv[2]))
 	);
 }
 

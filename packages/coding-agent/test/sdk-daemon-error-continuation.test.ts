@@ -60,7 +60,7 @@ posix("immutable 1024-byte fragments reconstruct exact safe values and pin scope
 			}
 			expect(chunks[chunks.length - 1]!.length).toBe(1024);
 			expect(result.page.next).toMatchObject({ sha256: retained.sha256, page: page + 1, executable: "gjc" });
-			expect(result.page.next!.argv.slice(-3)).toEqual(["--error-agent-dir", root, "--json"]);
+			expect(result.page.next!.argv.slice(-2)).toEqual([`--error-agent-dir=${root}`, "--json"]);
 			page++;
 		}
 		const reconstructed = Buffer.concat(chunks);
