@@ -3177,6 +3177,7 @@ describe("deep-interview crystallize contract", () => {
 			"Sounds good!!!",
 			"Yes!!!!!!!!!",
 			"Done…!?!!…",
+			"Absolutely!? !!   ",
 		]) {
 			expect(() => crystallizeDeepInterview(singleGoalEvidence(acknowledgement, acknowledgement))).toThrow(
 				"verbatim user anchor",
