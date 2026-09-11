@@ -142,8 +142,11 @@ convert Devin usage into GJC token accounting; use Devin's `/usage` or
 
 - Provider id `devin`, API `devin-acp`, implemented in
   `packages/ai/src/providers/devin-acp.ts`.
-- One `devin acp` child process per GJC session, reused across turns and killed
-  at session teardown (`providerSessionState`).
+- One `devin acp` child process per GJC session and working directory, reused
+  across turns and killed at session teardown (`providerSessionState`). The
+  working directory is part of that cache identity, so `/move` starts a fresh
+  ACP session in the new directory (Devin's own conversation history restarts,
+  as it would for a new session) and closes the child it replaced.
 - Authentication, model catalog, tool execution, and usage stay inside Devin;
   GJC never reads or stores Devin credentials.
 

@@ -27,7 +27,9 @@ import {
 } from "@agentclientprotocol/sdk";
 
 const scenario = process.argv[2] ?? "chat";
-const receiptPath = process.argv[3];
+// The provider appends the `acp` verb after the args, so argv[3] is a receipt path
+// only when the caller actually supplied one.
+const receiptPath = process.argv[3] === "acp" ? undefined : process.argv[3];
 
 function baseModelOptions(): SessionConfigOption[] {
 	return [
@@ -71,11 +73,14 @@ class FixtureAgent implements Agent {
 		};
 	}
 
-	newSession(_params: NewSessionRequest): NewSessionResponse {
+	newSession(_params: NewSessionRequest): NewSessionResponse | Promise<NewSessionResponse> {
 		if (scenario === "auth") {
 			throw RequestError.authRequired(undefined, "fixture requires login");
 		}
-		return { sessionId: `fixture-${scenario}`, configOptions: this.#configOptions };
+		const response = { sessionId: `fixture-${scenario}`, configOptions: this.#configOptions };
+		// A handshake slow enough for the caller to cancel before `session/new` lands.
+		if (scenario === "slow-session") return Bun.sleep(600).then(() => response);
+		return response;
 	}
 
 	authenticate() {
@@ -109,7 +114,38 @@ class FixtureAgent implements Agent {
 
 	async prompt(params: PromptRequest): Promise<PromptResponse> {
 		const sessionId = params.sessionId;
+		// `slow-chunks`/`slow-session` use the receipt to prove whether a prompt was
+		// forwarded at all; the `cancel` scenario owns the receipt elsewhere.
+		if (
+			receiptPath &&
+			(scenario === "slow-chunks" || scenario === "slow-session" || scenario === "chunk-then-silence")
+		) {
+			fs.writeFileSync(receiptPath, JSON.stringify({ scenario, promptReceived: true, pid: process.pid }));
+		}
 		switch (scenario) {
+			case "slow-chunks": {
+				// 8 updates, 120ms apart (~1s of activity): a gap-based idle budget never
+				// expires while a whole-turn deadline would.
+				for (let index = 0; index < 8; index++) {
+					await Bun.sleep(120);
+					await this.#send(sessionId, {
+						sessionUpdate: "agent_message_chunk",
+						content: { type: "text", text: `${index}` },
+					});
+				}
+				return { stopReason: "end_turn" };
+			}
+			case "slow-session":
+				return { stopReason: "end_turn" };
+			case "chunk-then-silence": {
+				// One update, then silence: the re-armed idle budget must still expire.
+				await this.#send(sessionId, {
+					sessionUpdate: "agent_message_chunk",
+					content: { type: "text", text: "alive" },
+				});
+				await Bun.sleep(10_000);
+				return { stopReason: "cancelled" };
+			}
 			case "chat": {
 				await this.#send(sessionId, {
 					sessionUpdate: "agent_thought_chunk",

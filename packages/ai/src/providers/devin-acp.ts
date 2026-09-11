@@ -86,6 +86,10 @@ const ACP_AUTH_REQUIRED_CODE = -32000;
 /** Cap on one tool-call `arguments` payload copied into a transcript message. */
 const ACP_TOOL_ARGUMENT_MAX_BYTES = 16 * 1024;
 const DEVIN_ACP_STDERR_TAIL_BYTES = 4 * 1024;
+/** Bound on waiting for a live ACP session before a cancellation settles anyway. */
+const DEVIN_ACP_CANCEL_DELIVERY_GRACE_MS = 250;
+/** Bound on waiting for a cancelled agent to acknowledge before a child is reaped. */
+const DEVIN_ACP_CANCEL_ACK_GRACE_MS = 500;
 
 // ---------------------------------------------------------------------------
 // Public provider surface
@@ -296,6 +300,18 @@ interface ActiveTurn {
 	thinkingIndex: number | null;
 	toolCallIndexes: Map<string, number>;
 	settled: boolean;
+	/**
+	 * Resolved by `cancelTurn` so a cancellation that races the ACP handshake stops
+	 * the turn instead of waiting for a session that may never be created.
+	 */
+	cancellation: Promise<void>;
+	requestCancellation: () => void;
+	/**
+	 * Re-arms this turn's idle budget; set only while this turn's ACP prompt is in
+	 * flight. It lives on the turn, not the bridge, so a stale turn can never
+	 * re-arm — or cancel — the turn that replaced it.
+	 */
+	rearmIdle: (() => void) | undefined;
 }
 
 function closeTextBlock(turn: ActiveTurn): void {
@@ -501,8 +517,9 @@ class DevinAcpBridge implements ProviderSessionState {
 	readonly #proc: Bun.Subprocess<"pipe", "pipe", "pipe">;
 	readonly #connection: ClientSideConnection;
 	readonly #cwd: string;
-	readonly #permissionMode: DevinAcpPermissionMode;
-	readonly #permissionHandler: DevinAcpPermissionHandler | undefined;
+	/** Re-applied per turn: the bridge is cached, the policy is not. */
+	#permissionMode: DevinAcpPermissionMode;
+	#permissionHandler: DevinAcpPermissionHandler | undefined;
 	#init: Promise<InitializeResponse> | undefined;
 	#session: Promise<DevinAcpSessionHandle> | undefined;
 	#promptCapabilities: PromptCapabilities | undefined;
@@ -579,6 +596,9 @@ class DevinAcpBridge implements ProviderSessionState {
 			sessionUpdate: notification => {
 				const turn = this.#turn;
 				if (!turn || turn.settled) return;
+				// The idle budget is the gap between agent updates, not a whole-turn wall
+				// clock: a long but active Devin turn must never be killed by it.
+				turn.rearmIdle?.();
 				applySessionUpdate(turn, notification.update);
 			},
 		};
@@ -755,6 +775,11 @@ class DevinAcpBridge implements ProviderSessionState {
 			if (this.#turn === turn) this.#turn = null;
 			return;
 		}
+		// The bridge is cached per conversation, so the permission policy is applied
+		// per turn: a later turn that tightens the mode, or supplies its own handler,
+		// must not inherit whichever turn happened to create the child.
+		this.#permissionMode = devinAcpResolvePermissionMode(options?.devinAcp?.permissionMode);
+		this.#permissionHandler = options?.devinAcp?.permissionHandler;
 		const startedAt = Date.now();
 		const idleTimeoutMs = options?.streamIdleTimeoutMs ?? getStreamIdleTimeoutMs();
 		const firstEventTimeoutMs = options?.streamFirstEventTimeoutMs ?? getStreamFirstEventTimeoutMs(idleTimeoutMs);
@@ -779,8 +804,15 @@ class DevinAcpBridge implements ProviderSessionState {
 				return;
 			}
 			arm(firstEventTimeoutMs, "first-agent-update");
-			const session = await this.#ensureSession();
+			// Race the handshake against cancellation: a `devin acp` child that never
+			// answers `initialize`/`session/new` must not hang the turn (or leak the
+			// child) after the caller already cancelled it.
+			const handshake = this.#ensureSession();
+			void handshake.catch(() => undefined);
+			const session = await Promise.race([handshake, turn.cancellation.then(() => null)]);
+			if (session === null || turn.settled) return;
 			await this.#selectModel(model.id);
+			if (turn.settled) return;
 			const blocks = devinAcpPromptBlocks(context, this.supportsImages);
 			if (blocks.length === 0) {
 				throw new Error(
@@ -788,7 +820,23 @@ class DevinAcpBridge implements ProviderSessionState {
 				);
 			}
 			arm(idleTimeoutMs, "agent-update");
-			const response = await this.#connection.prompt({ sessionId: session.id, prompt: blocks });
+			turn.rearmIdle = () => arm(idleTimeoutMs, "agent-update");
+			const promptCall = this.#connection.prompt({ sessionId: session.id, prompt: blocks });
+			// A child that never answers `session/prompt` must not park `#runTurn` forever,
+			// or a disposable bridge could never be reaped.
+			void promptCall.catch(() => undefined);
+			const response = await Promise.race([
+				promptCall,
+				turn.cancellation.then(async () => {
+					// Grace for the cancelled agent to answer `session/cancel` before a
+					// disposable child is reaped; a hung agent still unwinds after this bound.
+					await Bun.sleep(DEVIN_ACP_CANCEL_ACK_GRACE_MS);
+					return null;
+				}),
+			]);
+			// A cancel that raced the prompt settles the stream first; never rewrite the
+			// terminal state of a turn that has already been published.
+			if (response === null || turn.settled) return;
 			closeTextBlock(turn);
 			closeThinkingBlock(turn);
 			if (options?.signal?.aborted) {
@@ -806,11 +854,15 @@ class DevinAcpBridge implements ProviderSessionState {
 			closeTextBlock(turn);
 			closeThinkingBlock(turn);
 			const mapped = (await this.#settledExitFailure()) ?? error;
-			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
-			output.errorMessage = errorMessage(mapped);
-			settleTurn(turn, output.stopReason === "aborted" ? "aborted" : "error");
+			// A turn already published by a racing cancel keeps its terminal state.
+			if (!turn.settled) {
+				output.stopReason = options?.signal?.aborted ? "aborted" : "error";
+				output.errorMessage = errorMessage(mapped);
+				settleTurn(turn, output.stopReason === "aborted" ? "aborted" : "error");
+			}
 		} finally {
 			if (watchdog !== undefined) clearTimeout(watchdog);
+			turn.rearmIdle = undefined;
 			options?.signal?.removeEventListener("abort", onAbort);
 			if (this.#turn === turn) this.#turn = null;
 		}
@@ -826,10 +878,13 @@ class DevinAcpBridge implements ProviderSessionState {
 		return this.#exitFailure();
 	}
 
-	/** Cancel the in-flight turn: ACP `session/cancel` first, then settle the stream. */
+	/** Cancel the in-flight turn: notify the agent best-effort, then settle the stream. */
 	async cancelTurn(reason?: Error): Promise<void> {
 		const turn = this.#turn;
-		const session = await this.#session?.catch(() => undefined);
+		const session = await Promise.race([
+			this.#session?.catch(() => undefined) ?? Promise.resolve(undefined),
+			Bun.sleep(DEVIN_ACP_CANCEL_DELIVERY_GRACE_MS).then(() => undefined),
+		]);
 		if (session) {
 			try {
 				await this.#connection.cancel({ sessionId: session.id });
@@ -837,6 +892,9 @@ class DevinAcpBridge implements ProviderSessionState {
 				// The agent may already have finished; the turn settles below regardless.
 			}
 		}
+		// Only now wake a parked handshake or prompt: the cancellation must be delivered
+		// before `#runTurn` unwinds and a disposable child is reaped.
+		turn?.requestCancellation();
 		if (turn && !turn.settled) {
 			turn.output.stopReason = reason ? "error" : "aborted";
 			if (reason) turn.output.errorMessage = errorMessage(reason);
@@ -883,7 +941,33 @@ function createTurn(model: Model<"devin-acp">): ActiveTurn {
 		stopReason: "stop",
 		timestamp: Date.now(),
 	};
-	return { stream, output, textIndex: null, thinkingIndex: null, toolCallIndexes: new Map(), settled: false };
+	const cancellation = Promise.withResolvers<void>();
+	return {
+		stream,
+		output,
+		textIndex: null,
+		thinkingIndex: null,
+		toolCallIndexes: new Map(),
+		settled: false,
+		cancellation: cancellation.promise,
+		requestCancellation: cancellation.resolve,
+		rearmIdle: undefined,
+	};
+}
+
+/**
+ * Stable identity for the cached ACP child.
+ *
+ * `cwd` is part of the identity on purpose: `/move` changes `process.cwd()`, and a
+ * cached child keeps the directory it was spawned in, so a cwd change must miss the
+ * cache and respawn instead of running Devin's tools in the abandoned tree.
+ */
+export function devinAcpBridgeIdentity(
+	conversationId: string | undefined,
+	cwd: string,
+	argv: readonly string[],
+): string {
+	return `devin-acp:${conversationId ?? "ephemeral"}:${cwd}\u0000${argv.join("\u0000")}`;
 }
 
 /**
@@ -910,10 +994,19 @@ function resolveBridge(config: { streamOptions: DevinAcpOptions | undefined; con
 		});
 	const stateMap = config.streamOptions?.providerSessionState;
 	if (!stateMap) return { bridge: spawn(), owned: true };
-	const key = `devin-acp:${config.conversationId ?? "ephemeral"}:${argv.join("\u0000")}`;
+	const key = devinAcpBridgeIdentity(config.conversationId, cwd, argv);
 	const existing = stateMap.get(key);
 	if (existing instanceof DevinAcpBridge && !existing.exitError) return { bridge: existing, owned: false };
 	if (existing) existing.close();
+	// One conversation maps to one live child. A cwd (or argv) change supersedes the
+	// previous bridge, and leaving it in the map would keep a child bound to the
+	// abandoned directory running until session teardown.
+	const prefix = `devin-acp:${config.conversationId ?? "ephemeral"}:`;
+	for (const [candidateKey, candidate] of stateMap) {
+		if (candidateKey === key || !candidateKey.startsWith(prefix)) continue;
+		stateMap.delete(candidateKey);
+		if (candidate instanceof DevinAcpBridge) candidate.close();
+	}
 	const created = spawn();
 	stateMap.set(key, created);
 	return { bridge: created, owned: false };
@@ -929,7 +1022,14 @@ export const streamDevinAcp: (
 		const { bridge, owned } = resolveBridge({ streamOptions: options, conversationId });
 		const turn = createTurn(model);
 		const settled = bridge.beginTurn(turn, model, context, options);
-		if (owned) void settled.finally(() => bridge.close());
+		if (owned) {
+			// A disposable child is reaped as soon as the turn unwinds, which the
+			// cancellation races above guarantee even for an agent that never answers.
+			void settled.then(
+				() => bridge.close(),
+				() => bridge.close(),
+			);
+		}
 		return turn.stream;
 	} catch (error) {
 		// Launch failures must surface as a stream error, never as a thrown

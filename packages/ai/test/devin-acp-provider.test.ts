@@ -19,6 +19,8 @@ import {
 	DEVIN_ACP_CONTEXT_WINDOW,
 	DEVIN_ACP_MAX_TOKENS,
 	type DevinAcpConfig,
+	devinAcpBridgeIdentity,
+	devinAcpResolvePermissionMode,
 	fetchDevinAcpModels,
 	streamDevinAcp,
 } from "../src/providers/devin-acp";
@@ -107,6 +109,20 @@ async function waitForFile(file: string, timeoutMs = 5_000): Promise<string> {
 		await Bun.sleep(25);
 	}
 	throw new Error(`receipt ${file} was never written`);
+}
+
+/** Fails when the child is still alive at the deadline; a reaped child raises ESRCH. */
+async function expectProcessExit(pid: number, timeoutMs = 5_000): Promise<void> {
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() < deadline) {
+		try {
+			process.kill(pid, 0);
+		} catch {
+			return;
+		}
+		await Bun.sleep(25);
+	}
+	throw new Error(`child ${pid} was never reaped after its turn settled`);
 }
 
 describe("devin provider registration", () => {
@@ -316,6 +332,19 @@ describe("devin permission policy", () => {
 		);
 		expect(assistantText(message)).toBe('decision:{"outcome":"cancelled"}');
 	});
+
+	test("resolves the documented policy from the environment and fails closed", () => {
+		expect(devinAcpResolvePermissionMode(undefined, {})).toBe("allow");
+		expect(devinAcpResolvePermissionMode(undefined, { GJC_DEVIN_PERMISSION_MODE: "" })).toBe("allow");
+		expect(devinAcpResolvePermissionMode(undefined, { GJC_DEVIN_PERMISSION_MODE: "  " })).toBe("allow");
+		expect(devinAcpResolvePermissionMode(undefined, { GJC_DEVIN_PERMISSION_MODE: "agent-free" })).toBe("deny");
+		// Case and surrounding whitespace are normalized; anything unrecognized is denied.
+		expect(devinAcpResolvePermissionMode(undefined, { GJC_DEVIN_PERMISSION_MODE: " ALLOW " })).toBe("allow");
+		expect(devinAcpResolvePermissionMode(undefined, { GJC_DEVIN_PERMISSION_MODE: "allow_always" })).toBe("deny");
+		// An explicit typed mode always wins over the environment.
+		expect(devinAcpResolvePermissionMode("deny", { GJC_DEVIN_PERMISSION_MODE: "allow" })).toBe("deny");
+		expect(devinAcpResolvePermissionMode("allow", { GJC_DEVIN_PERMISSION_MODE: "deny" })).toBe("allow");
+	});
 });
 
 describe("devin session lifecycle", () => {
@@ -356,6 +385,93 @@ describe("devin session lifecycle", () => {
 		}
 	});
 
+	test("keeps an active turn alive on a gap-based idle budget", async () => {
+		// 8 updates 120ms apart (~1s of activity) with a 400ms idle budget: only a
+		// gap-based budget lets the turn finish, a whole-turn deadline would not.
+		const { message } = await drain(
+			streamDevinAcp(devinModel(), userContext("long turn"), {
+				...fixtureTurn("slow-chunks"),
+				streamIdleTimeoutMs: 400,
+			}),
+		);
+		expect(message.stopReason).toBe("stop");
+		expect(assistantText(message)).toBe("01234567");
+	});
+
+	test("still expires the idle budget when the agent goes silent after activity", async () => {
+		// Activity re-arms the budget; it must not disable it.
+		const { message } = await drain(
+			streamDevinAcp(devinModel(), userContext("go quiet"), {
+				...fixtureTurn("chunk-then-silence"),
+				streamIdleTimeoutMs: 300,
+			}),
+		);
+		expect(assistantText(message)).toBe("alive");
+		expect(message.stopReason).toBe("error");
+		expect(message.errorMessage).toContain("timed out");
+	});
+
+	test("reaps a disposable child when a parked prompt settles the turn", async () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-devin-owned-child-"));
+		tempDirs.push(dir);
+		const receipt = path.join(dir, "prompt-receipt.json");
+		// No `providerSessionState`: this bridge is disposable, so only the turn's own
+		// settlement can reap the child.
+		const { message } = await drain(
+			streamDevinAcp(devinModel(), userContext("go quiet"), {
+				...fixtureTurn("chunk-then-silence", {}, receipt),
+				streamIdleTimeoutMs: 300,
+			}),
+		);
+		expect(message.stopReason).toBe("error");
+		const receiptBody = JSON.parse(await waitForFile(receipt)) as { pid?: number };
+		expect(typeof receiptBody.pid).toBe("number");
+		await expectProcessExit(receiptBody.pid as number);
+	});
+
+	test("settles a cancel that races the ACP handshake without forwarding the prompt", async () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-devin-slow-session-"));
+		tempDirs.push(dir);
+		const receipt = path.join(dir, "prompt-receipt.json");
+		const controller = new AbortController();
+		const streamResult = streamDevinAcp(devinModel(), userContext("cancel me"), {
+			...fixtureTurn("slow-session", {}, receipt),
+			signal: controller.signal,
+		});
+		setTimeout(() => controller.abort(), 50);
+		const message = await streamResult.result();
+		expect(message.stopReason).toBe("aborted");
+		// Outlive the fixture's 600ms `session/new`: a prompt that had been forwarded
+		// would have written its receipt by now.
+		await Bun.sleep(900);
+		expect(fs.existsSync(receipt)).toBe(false);
+	});
+
+	test("applies each turn's permission policy on a cached conversation", async () => {
+		const state = new Map<string, ProviderSessionState>();
+		try {
+			const first = await drain(
+				streamDevinAcp(devinModel(), userContext("clean up"), {
+					...fixtureTurn("permission"),
+					providerSessionId: "policy-conversation",
+					providerSessionState: state,
+				}),
+			);
+			expect(assistantText(first.message)).toBe('decision:{"outcome":"selected","optionId":"allow-once"}');
+			const second = await drain(
+				streamDevinAcp(devinModel(), userContext("clean up"), {
+					...fixtureTurn("permission", { permissionMode: "deny" }),
+					providerSessionId: "policy-conversation",
+					providerSessionState: state,
+				}),
+			);
+			// A cached child must not pin the policy of the turn that created it.
+			expect(assistantText(second.message)).toBe('decision:{"outcome":"selected","optionId":"reject-once"}');
+		} finally {
+			closeAll(state);
+		}
+	});
+
 	test("forwards caller cancellation as an ACP session/cancel", async () => {
 		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-devin-cancel-"));
 		tempDirs.push(dir);
@@ -377,6 +493,44 @@ describe("devin session lifecycle", () => {
 		expect(message.stopReason).toBe("aborted");
 		const receiptBody = JSON.parse(await waitForFile(receipt)) as { cancelReceived?: boolean };
 		expect(receiptBody.cancelReceived).toBe(true);
+	});
+	test("keys the cached ACP child on the working directory", () => {
+		const argv = ["devin", "acp"];
+		expect(devinAcpBridgeIdentity("chat", "/work/a", argv)).toBe(devinAcpBridgeIdentity("chat", "/work/a", argv));
+		expect(devinAcpBridgeIdentity("chat", "/work/a", argv)).not.toBe(devinAcpBridgeIdentity("chat", "/work/b", argv));
+		expect(devinAcpBridgeIdentity("chat", "/work/a", argv)).not.toBe(
+			devinAcpBridgeIdentity("other", "/work/a", argv),
+		);
+	});
+
+	test("replaces the cached child when the working directory changes", async () => {
+		const dirA = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-devin-cwd-a-"));
+		const dirB = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-devin-cwd-b-"));
+		tempDirs.push(dirA, dirB);
+		const state = new Map<string, ProviderSessionState>();
+		try {
+			await drain(
+				streamDevinAcp(devinModel(), userContext("one"), {
+					...fixtureTurn("session", { cwd: dirA }),
+					providerSessionId: "cwd-conversation",
+					providerSessionState: state,
+				}),
+			);
+			expect(state.size).toBe(1);
+			await drain(
+				streamDevinAcp(devinModel(), userContext("two"), {
+					...fixtureTurn("session", { cwd: dirB }),
+					providerSessionId: "cwd-conversation",
+					providerSessionState: state,
+				}),
+			);
+			// The new directory must miss the cache, and the superseded child must not
+			// stay behind holding the abandoned directory.
+			expect(state.size).toBe(1);
+			expect([...state.keys()][0]).toContain(dirB);
+		} finally {
+			closeAll(state);
+		}
 	});
 });
 
