@@ -146,6 +146,8 @@ operation reference used for later reconciliation.
 - `--text` and the JSON input sources (`--json-input`,
   `--json-input-file` — which must be a `0600` regular file —
   `--json-input-stdin`) are mutually exclusive for the prompt body.
+- File input is read through one descriptor, rejects symlink/replacement races,
+  and is capped at 4 MiB before JSON parsing.
 
 ### status
 

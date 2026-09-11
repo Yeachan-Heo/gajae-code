@@ -303,7 +303,7 @@ function serialize(envelope: PublicCommandErrorEnvelope, json: boolean): string 
 	// JSON quoting escapes terminal controls and preserves complete values. Display
 	// strings are not shell commands: executable suggestions remain argv arrays.
 	return `COMMAND ${JSON.stringify(envelope.command)}\nERROR ${JSON.stringify(envelope.error)}\n${envelope.diagnostics ? `DIAGNOSTICS ${JSON.stringify(envelope.diagnostics)}\n` : ""}COMPLETE ${envelope.complete}\nEVIDENCE ${JSON.stringify(envelope.evidence)}\nOMITTED_OPTIONAL ${JSON.stringify(envelope.omittedOptional)}\nCONTINUATION ${JSON.stringify(envelope.continuation)}\n`.replace(
-		/[\x7f-\x9f]/g,
+		/[\x7f-\x9f\u2028\u2029]/g,
 		character => `\\u${character.charCodeAt(0).toString(16).padStart(4, "0")}`,
 	);
 }

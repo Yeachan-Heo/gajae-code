@@ -169,6 +169,20 @@ test("safe reference allowlist preserves complete values and only complete concr
 	expect(unsafe.nextSteps.every(step => step.argv?.[2] !== "status")).toBe(true);
 });
 
+test("text failures escape Unicode line and paragraph separators", async () => {
+	const result = await renderPublicCommandFailure(
+		failure({
+			kind: "uncertain_after_send",
+			references: [{ kind: "operationRef", value: "before\u2028middle\u2029after" }],
+		}),
+		{ command },
+	);
+	expect(result.stderr).not.toContain("\u2028");
+	expect(result.stderr).not.toContain("\u2029");
+	expect(result.stderr).toContain("\\u2028");
+	expect(result.stderr).toContain("\\u2029");
+});
+
 posix("ordinary complete errors never initialize a store", async () => {
 	await fixture(async root => {
 		const result = await renderPublicCommandFailure(failure({ kind: "timeout" }), {

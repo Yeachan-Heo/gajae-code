@@ -12,6 +12,7 @@ import type {
 	DaemonKind,
 	DaemonOperationOptions,
 	DaemonOperationResult,
+	DaemonStatus,
 } from "../daemon/control-types";
 import {
 	DAEMON_ACTION_TOKENS,
@@ -142,24 +143,22 @@ export async function runDaemonCommand(cmd: DaemonCommandArgs, deps: DaemonComma
 	}
 
 	if (cmd.action === "list" || cmd.action === "status") {
-		const statuses = await Promise.all(
-			controllers.map(async controller => {
-				try {
-					return await controller.status();
-				} catch {
-					throw new PublicCommandFailure({
-						kind: "unavailable",
-						proof: "pre-effect",
-						daemonKind: controller.kind,
-					});
-				}
-			}),
-		);
-		if (cmd.json) {
-			process.stdout.write(`${JSON.stringify(statuses, null, 2)}\n`);
-		} else {
-			process.stdout.write(`${statuses.map(s => formatDaemonStatus(s, { verbose: cmd.verbose })).join("\n")}\n`);
+		const statusResults = await Promise.allSettled(controllers.map(controller => controller.status()));
+		const statuses: DaemonStatus[] = [];
+		const failedTargets: PublicDaemonTargetOutcome[] = [];
+		for (const [index, result] of statusResults.entries()) {
+			if (result.status === "fulfilled") statuses.push(result.value);
+			else failedTargets.push({ kind: controllers[index]!.kind, outcome: "unknown" });
 		}
+		if (statuses.length > 0) {
+			if (cmd.json) {
+				process.stdout.write(`${JSON.stringify(statuses, null, 2)}\n`);
+			} else {
+				process.stdout.write(`${statuses.map(s => formatDaemonStatus(s, { verbose: cmd.verbose })).join("\n")}\n`);
+			}
+		}
+		if (failedTargets.length > 0)
+			throw new PublicCommandFailure({ kind: "daemon_mixed", proof: "pre-effect", targets: failedTargets });
 		return;
 	}
 

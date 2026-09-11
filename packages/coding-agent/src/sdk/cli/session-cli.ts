@@ -114,6 +114,7 @@ const transcriptDecoder = new TextDecoder("utf-8", { fatal: true });
 const SEARCH_PROBE_TIMEOUT_MS = 2_000;
 const SEARCH_PROBE_MAX_ROWS = 100;
 const SEARCH_TEXT_WIDTH = 80;
+export const SDK_JSON_INPUT_FILE_MAX_BYTES = 4 * 1024 * 1024;
 
 const TERMINAL_TURN_KINDS = new Set(["turn_end", "agent_end"]);
 const START_TURN_KINDS = new Set(["turn_start", "agent_start"]);
@@ -283,6 +284,68 @@ function parseInput(raw: string | undefined, source: string): JsonRecord {
 	}
 }
 
+function matchesSecureInputIdentity(before: fsSync.BigIntStats, after: fsSync.BigIntStats): boolean {
+	return (
+		before.isFile() &&
+		after.isFile() &&
+		before.dev === after.dev &&
+		before.ino === after.ino &&
+		before.nlink === after.nlink &&
+		before.mode === after.mode &&
+		before.size === after.size &&
+		before.mtimeNs === after.mtimeNs &&
+		before.ctimeNs === after.ctimeNs
+	);
+}
+
+/** Reads a 0600 JSON input through one descriptor, never through a replaceable pathname. */
+export async function readSecureJsonInputFile(filePath: string): Promise<string> {
+	let descriptor: fs.FileHandle | undefined;
+	try {
+		const noFollow = process.platform === "win32" ? 0 : fsSync.constants.O_NOFOLLOW;
+		descriptor = await fs.open(filePath, fsSync.constants.O_RDONLY | noFollow);
+		const before = await descriptor.stat({ bigint: true });
+		if (!before.isFile() || (before.mode & 0o077n) !== 0n)
+			throw new SdkSessionCliError(
+				"input_file_permissions",
+				"--json-input-file must be a regular file with 0600 permissions.",
+				2,
+			);
+		if (before.size > BigInt(SDK_JSON_INPUT_FILE_MAX_BYTES))
+			throw new SdkSessionCliError(
+				"usage",
+				`--json-input-file must be at most ${SDK_JSON_INPUT_FILE_MAX_BYTES} bytes.`,
+				2,
+			);
+
+		const pathIdentity = await fs.lstat(filePath, { bigint: true });
+		if (!matchesSecureInputIdentity(before, pathIdentity))
+			throw new SdkSessionCliError("input_file_unavailable", "Unable to read --json-input-file.", 2);
+
+		const size = Number(before.size);
+		const bytes = Buffer.alloc(size);
+		let offset = 0;
+		while (offset < size) {
+			const read = await descriptor.read(bytes, offset, size - offset, offset);
+			if (read.bytesRead === 0) break;
+			offset += read.bytesRead;
+		}
+		if (offset !== size)
+			throw new SdkSessionCliError("input_file_unavailable", "Unable to read --json-input-file.", 2);
+
+		const after = await descriptor.stat({ bigint: true });
+		const finalPathIdentity = await fs.lstat(filePath, { bigint: true });
+		if (!matchesSecureInputIdentity(before, after) || !matchesSecureInputIdentity(before, finalPathIdentity))
+			throw new SdkSessionCliError("input_file_unavailable", "Unable to read --json-input-file.", 2);
+		return bytes.toString("utf8");
+	} catch (error) {
+		if (error instanceof SdkSessionCliError) throw error;
+		throw new SdkSessionCliError("input_file_unavailable", "Unable to read --json-input-file.", 2);
+	} finally {
+		if (descriptor !== undefined) await descriptor.close().catch(() => {});
+	}
+}
+
 function containsSecretField(value: unknown): boolean {
 	if (Array.isArray(value)) return value.some(containsSecretField);
 	if (!isRecord(value)) return false;
@@ -308,14 +371,7 @@ async function inputFromArgs(args: SdkSessionCliArgs): Promise<JsonRecord> {
 	}
 	if (args.jsonInputFile !== undefined) {
 		try {
-			const stat = await fs.stat(args.jsonInputFile);
-			if (!stat.isFile() || (stat.mode & 0o077) !== 0)
-				throw new SdkSessionCliError(
-					"input_file_permissions",
-					"--json-input-file must be a regular file with 0600 permissions.",
-					2,
-				);
-			return parseInput(await Bun.file(args.jsonInputFile).text(), "--json-input-file");
+			return parseInput(await readSecureJsonInputFile(args.jsonInputFile), "--json-input-file");
 		} catch (error) {
 			if (error instanceof SdkSessionCliError) throw error;
 			throw new SdkSessionCliError("input_file_unavailable", "Unable to read --json-input-file.", 2);

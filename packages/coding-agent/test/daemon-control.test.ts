@@ -2838,6 +2838,45 @@ describe("runDaemonCommand", () => {
 		expect(parsed[0].ownerId).toBe("o1");
 	});
 
+	test("status preserves healthy rows when another target fails", async () => {
+		const healthy: DaemonStatus = {
+			kind: "telegram",
+			configured: true,
+			health: "running",
+			runtime: { mode: "source", execPath: "/usr/bin/node", reloadPicksUpSourceEdits: true },
+		};
+		const controllers: BuiltInDaemonController[] = [
+			{
+				kind: "telegram",
+				status: async () => healthy,
+				stop: async () => ({}) as DaemonOperationResult,
+				reload: async () => ({}) as DaemonOperationResult,
+			},
+			{
+				kind: "discord",
+				status: async () => {
+					throw new Error("private status detail");
+				},
+				stop: async () => ({}) as DaemonOperationResult,
+				reload: async () => ({}) as DaemonOperationResult,
+			},
+		];
+		let failure: unknown;
+		const out = await captureStdout(async () => {
+			try {
+				await runDaemonCommand(
+					{ action: "status", kinds: [], all: true, json: true, force: false },
+					{ controllers },
+				);
+			} catch (error) {
+				failure = error;
+			}
+		});
+		expect(JSON.parse(out)).toEqual([healthy]);
+		expect(failure).toBeInstanceOf(PublicCommandFailure);
+		expect((failure as PublicCommandFailure).input.targets).toEqual([{ kind: "discord", outcome: "unknown" }]);
+	});
+
 	test("restart prints a human result line", async () => {
 		const status: DaemonStatus = {
 			kind: "telegram",
