@@ -151,6 +151,26 @@ function safeReferences(references: readonly EvidenceReference[] | undefined): E
 		.filter(ref => ref && referenceKinds.has(ref.kind) && typeof ref.value === "string")
 		.map(ref => ({ kind: ref.kind, value: ref.value }));
 }
+function boundedDaemonStatuses(statuses: readonly DaemonStatus[] | undefined): DaemonStatus[] {
+	if (!Array.isArray(statuses)) return [];
+	return statuses.slice(0, 3).map(status => ({
+		kind: status.kind,
+		configured: status.configured === true,
+		health: status.health,
+		...(Number.isSafeInteger(status.pid) && status.pid > 0 ? { pid: status.pid } : {}),
+		...(typeof status.ownerId === "string" && status.ownerId.length <= 1024 ? { ownerId: status.ownerId } : {}),
+		...(Number.isSafeInteger(status.rootCount) && status.rootCount >= 0 ? { rootCount: status.rootCount } : {}),
+		runtime: {
+			mode: status.runtime.mode,
+			execPath: status.runtime.execPath.slice(0, 1024),
+			reloadPicksUpSourceEdits: status.runtime.reloadPicksUpSourceEdits === true,
+			...(typeof status.runtime.warning === "string" && status.runtime.warning.length <= 1024
+				? { warning: status.runtime.warning }
+				: {}),
+		},
+		...(typeof status.detail === "string" && status.detail.length <= 1024 ? { detail: status.detail } : {}),
+	}));
+}
 export function normalizePublicCommandFailure(error: unknown): PublicCommandFailure {
 	if (error instanceof PublicCommandFailure && error.input && Object.hasOwn(messages, error.input.kind)) return error;
 	return new PublicCommandFailure({ kind: "operation_failed" });
@@ -295,7 +315,7 @@ export function classifyPublicCommandFailure(
 		outcomeCertainty,
 		references,
 		nextSteps,
-		...(input.partialStatuses === undefined ? {} : { partialStatuses: [...input.partialStatuses].slice(0, 3) }),
+		...(input.partialStatuses === undefined ? {} : { partialStatuses: boundedDaemonStatuses(input.partialStatuses) }),
 		exitCode: usage ? 2 : 1,
 	};
 }
