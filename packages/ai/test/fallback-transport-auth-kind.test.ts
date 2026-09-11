@@ -108,6 +108,18 @@ describe("fallback transport — auth disposition", () => {
 		expect(isForbiddenAuthFailure(facts(429))).toBe(false);
 	});
 
+	it("classifies provider-confirmed account model rejection separately from auth failures", () => {
+		const trigger = classifyFallbackTrigger({
+			kind: "transport",
+			status: 400,
+			providerCode: "invalid_request_error",
+			openaiErrorCode: "invalid_request_error",
+			credentialModelUnavailable: true,
+		});
+		expect(trigger.class).toBe("credential");
+		expect(trigger.authDisposition).toBeUndefined();
+	});
+
 	it("reports no forbidden failure for input carrying no transport facts", () => {
 		expect(isForbiddenAuthFailure(new Error("plain"))).toBe(false);
 		expect(isForbiddenAuthFailure(undefined)).toBe(false);

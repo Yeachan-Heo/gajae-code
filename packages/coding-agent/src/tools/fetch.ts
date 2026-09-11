@@ -764,7 +764,9 @@ async function renderUrl(
 				let convertedText: string | null = null;
 				const converted = await convertWithMarkit(binary.buffer, conversionExtension, timeout, signal);
 				if (converted.ok) {
-					if (converted.content.trim().length > 50) {
+					// See the non-empty conversion note near the document path
+					// below (#5433): short conversions still beat raw fallback.
+					if (converted.content.trim().length > 0) {
 						notes.push("Converted with markit");
 						convertedText = converted.content;
 					} else {
@@ -872,7 +874,10 @@ async function renderUrl(
 			const ext = getExtensionHint(finalUrl, binary.contentDisposition) || extHint;
 			const converted = await convertWithMarkit(binary.buffer, ext, timeout, signal);
 			if (converted.ok) {
-				if (converted.content.trim().length > 50) {
+				// Any non-empty markit conversion is preferable to a raw-bytes
+				// fallback (#5433): short documents like the W3C dummy.pdf
+				// ("Dummy PDF file", 14 chars) are legitimately converted text.
+				if (converted.content.trim().length > 0) {
 					notes.push("Converted with markit");
 					const output = finalizeOutput(converted.content);
 					return {

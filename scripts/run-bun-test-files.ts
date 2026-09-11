@@ -30,6 +30,10 @@ export interface TestProcessResult {
 	exitCode: number;
 	signal?: NodeJS.Signals;
 	timedOut: boolean;
+	/** Time spent from child spawn until the child and its process group settled. */
+	durationMs?: number;
+	/** Time spent in the spawn call itself. */
+	spawnMs?: number;
 }
 
 export type TestProcessRunner = (spec: TestProcessSpec, timeoutMs: number) => Promise<TestProcessResult>;
@@ -288,6 +292,8 @@ async function terminateProcess(child: Bun.Subprocess, leader: LinuxProcessIdent
 }
 
 export const runTestProcess: TestProcessRunner = async (spec, timeoutMs) => {
+	const startedAt = performance.now();
+	const spawnStartedAt = startedAt;
 	const child = Bun.spawn(spec.argv, {
 		cwd: spec.cwd,
 		env: spec.env,
@@ -296,6 +302,7 @@ export const runTestProcess: TestProcessRunner = async (spec, timeoutMs) => {
 		stderr: "inherit",
 		detached: process.platform !== "win32",
 	});
+	const spawnMs = performance.now() - spawnStartedAt;
 	// Signal handlers cannot run between these synchronous statements. Capture
 	// Linux start identity before publishing the child as active, so every visible
 	// entry is identity-bound and a reused pid/process-group is never signalled.
@@ -320,7 +327,13 @@ export const runTestProcess: TestProcessRunner = async (spec, timeoutMs) => {
 		if (process.platform !== "win32" && (await processGroupHasExecutingMembers(child.pid))) {
 			await terminateProcess(child, leader);
 		}
-		return { exitCode, signal: child.signalCode ?? undefined, timedOut };
+		return {
+			exitCode,
+			signal: child.signalCode ?? undefined,
+			timedOut,
+			durationMs: performance.now() - startedAt,
+			spawnMs,
+		};
 	} finally {
 		clearTimeout(timer);
 		activeChildren.delete(child);
@@ -355,8 +368,9 @@ export async function runHarness(
 	const files = selectShard(allFiles, options.shard);
 	if (allFiles.length === 0) throw new Error(`No test files found under ${options.root}.`);
 	if (files.length === 0) throw new Error(`Shard contains no test files under ${options.root}.`);
+	const workerCount = Math.min(options.concurrency, files.length);
 	process.stdout.write(
-		`fresh-process test harness: root=${options.root} files=${files.length}/${allFiles.length}${options.shard ? ` shard=${options.shard.index}/${options.shard.total}` : ""}\n`,
+		`fresh-process test harness: root=${options.root} files=${files.length}/${allFiles.length}${options.shard ? ` shard=${options.shard.index}/${options.shard.total}` : ""} concurrency=${workerCount} ci-shards=${process.env.CI_CODING_AGENT_TEST_SHARDS ?? "unset"}\n`,
 	);
 	const outcomes = new Array<TestProcessResult | undefined>(files.length);
 	let claimed = 0;
@@ -378,7 +392,8 @@ export async function runHarness(
 				fs.mkdir(spec.env.GJC_HOME!, { recursive: true }),
 			]);
 			process.stdout.write(`\n[${index + 1}/${files.length}] START ${file}\n`);
-			let result: TestProcessResult;
+			const startedAt = performance.now();
+			let result: TestProcessResult = { exitCode: 1, timedOut: false };
 			try {
 				result = await runner(spec, options.fileTimeoutMs);
 			} catch (error) {
@@ -386,12 +401,18 @@ export async function runHarness(
 				result = { exitCode: 1, timedOut: false };
 			} finally {
 				await fs.rm(sandbox, { recursive: true, force: true });
-				process.stdout.write(`[${index + 1}/${files.length}] END ${file}\n`);
+				const wallMs = Math.round(performance.now() - startedAt);
+				if (result.durationMs === undefined) result.durationMs = wallMs;
+				const childMs = Math.round(result.durationMs);
+				const spawnMs = result.spawnMs === undefined ? "unknown" : Math.round(result.spawnMs);
+				process.stdout.write(
+					`[${index + 1}/${files.length}] END ${file} wall=${wallMs}ms child=${childMs}ms spawn=${spawnMs}ms\n`,
+				);
 			}
 			outcomes[index] = result;
 		}
 	};
-	await Promise.all(Array.from({ length: Math.min(options.concurrency, files.length) }, executeFiles));
+	await Promise.all(Array.from({ length: workerCount }, executeFiles));
 	const failures = files.flatMap((file, index) => {
 		const result = outcomes[index];
 		return result && (result.exitCode !== 0 || result.timedOut || result.signal) ? [{ file, result }] : [];
@@ -403,7 +424,7 @@ export async function runHarness(
 	process.stderr.write(`fresh-process test harness failed: ${failures.length}/${files.length} files\n`);
 	for (const { file, result } of failures) {
 		process.stderr.write(
-			` - ${file}: exit=${result.exitCode}${result.signal ? ` signal=${result.signal}` : ""}${result.timedOut ? " timeout" : ""}\n`,
+			` - ${file}: exit=${result.exitCode}${result.signal ? ` signal=${result.signal}` : ""}${result.timedOut ? " timeout" : ""} child=${result.durationMs === undefined ? "unknown" : `${Math.round(result.durationMs)}ms`} spawn=${result.spawnMs === undefined ? "unknown" : `${Math.round(result.spawnMs)}ms`}\n`,
 		);
 	}
 	return 1;

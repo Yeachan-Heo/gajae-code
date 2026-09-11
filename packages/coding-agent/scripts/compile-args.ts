@@ -18,7 +18,14 @@ const compiledDefineFlags = ['process.env.PI_COMPILED="true"'];
 const releaseDefineFlags = [...compiledDefineFlags, 'process.env.GJC_BUILD_CHANNEL="release"'];
 const devDefineFlags = [...compiledDefineFlags, 'process.env.GJC_BUILD_CHANNEL="dev"'];
 
-export const compiledExternalPackages = ["mupdf"];
+// NOTE: mupdf must NOT be marked --external here. Compiled binaries cannot
+// resolve bare "mupdf" imports (and its Emscripten loader cannot find the
+// wasm asset inside the bunfs), which broke markit PDF conversion in every
+// standalone release (#5433). mupdf is bundled instead: its wasm is embedded
+// via `with { type: "file" }` and routed to the loader through the hook in
+// packages/coding-agent/src/utils/mupdf-wasm.ts, and the bundled
+// `require("mupdf")` inside markit-ai is replaced by the patch in
+// patches/markit-ai@0.5.3.patch.
 
 export const releaseEntrypoints = [
 	"./packages/coding-agent/src/cli.ts",
@@ -61,8 +68,6 @@ export function buildReleaseCompileArgs(target: string, outfile: string): string
 		outfile,
 		target,
 		defines: releaseDefineFlags,
-
-		externals: compiledExternalPackages,
 	});
 }
 
@@ -72,7 +77,6 @@ export function buildDevCompileArgs(outfile = "dist/gjc"): string[] {
 		entrypoints: devEntrypoints,
 		outfile,
 		defines: devDefineFlags,
-		externals: compiledExternalPackages,
 	});
 }
 

@@ -5,7 +5,7 @@ import type { AgentToolContext } from "@gajae-code/agent-core";
 import { validateToolArguments } from "@gajae-code/ai/utils/validation";
 import { sessionDirName } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
 import { Settings } from "../../src/config/settings";
-import type { BashInterceptorRule } from "../../src/config/settings-schema";
+import { type BashInterceptorRule, DEFAULT_BASH_INTERCEPTOR_RULES } from "../../src/config/settings-schema";
 import { disposeAllShellSessions, getShellSessionCount } from "../../src/exec/bash-executor";
 import type { ToolSession } from "../../src/tools";
 import {
@@ -15,6 +15,7 @@ import {
 	masterCommandEnvOverrides,
 	parseDirectSdkSpawnArgs,
 } from "../../src/tools/bash";
+import { checkBashInterception } from "../../src/tools/bash-interceptor";
 import * as shellSnapshot from "../../src/utils/shell-snapshot";
 import { stubBashExecutorSettings } from "../helpers/tool-session-settings";
 
@@ -112,6 +113,43 @@ describe("BashTool interception", () => {
 				toolNames: ["read"],
 			} as AgentToolContext),
 		).rejects.toThrow("Use read instead");
+	});
+});
+
+describe("default echo/printf/heredoc redirection rule", () => {
+	const blocks = (command: string) =>
+		checkBashInterception(command, ["read", "search", "find", "edit", "write"], DEFAULT_BASH_INTERCEPTOR_RULES).block;
+
+	it("blocks redirections that write a file from the leading command", () => {
+		expect(blocks("echo hello > file.txt")).toBe(true);
+		expect(blocks("echo hello>file.txt")).toBe(true);
+		expect(blocks("printf '%s\\n' x >> log.txt")).toBe(true);
+		expect(blocks("echo x 1> out.txt")).toBe(true);
+		expect(blocks("echo x &> out.txt")).toBe(true);
+		expect(blocks("echo x > f 2>/dev/null")).toBe(true);
+		expect(blocks("echo x 2>&1 > out.txt")).toBe(true);
+	});
+
+	it("blocks heredoc redirection spelled without a space after <<", () => {
+		expect(blocks("cat <<EOF > out.txt")).toBe(true);
+		expect(blocks("cat <<'EOF' > out.txt")).toBe(true);
+		expect(blocks("cat <<-EOF >out.txt")).toBe(true);
+		expect(blocks("cat << EOF > out.txt")).toBe(true);
+	});
+
+	it("does not attribute a later command's redirection to the leading echo", () => {
+		expect(blocks("echo x; date -u 2>/dev/null")).toBe(false);
+		expect(blocks("printf 'x\\n'; true 2>/dev/null")).toBe(false);
+		expect(blocks("echo start && bun test 2>/dev/null")).toBe(false);
+		expect(blocks("echo a || cmd 2>/dev/null")).toBe(false);
+		expect(blocks("echo x | grep y > f")).toBe(false);
+	});
+
+	it("does not treat fd redirection or plain echo as a file write", () => {
+		expect(blocks("echo x 2>/dev/null")).toBe(false);
+		expect(blocks("echo x | tee f")).toBe(false);
+		expect(blocks("echo hi")).toBe(false);
+		expect(blocks("date -u 2>/dev/null; echo x")).toBe(false);
 	});
 });
 

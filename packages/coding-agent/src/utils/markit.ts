@@ -1,6 +1,7 @@
 import { untilAborted } from "@gajae-code/utils";
 import type { Markit, StreamInfo } from "markit-ai";
 import { ToolAbortError } from "../tools/tool-errors";
+import { ensureMupdfWasmResolution } from "./mupdf-wasm";
 
 export interface MarkitConversionResult {
 	content: string;
@@ -18,6 +19,11 @@ let markit: () => Markit | Promise<Markit> = async () => {
 	return promise;
 };
 
+// #5433: mupdf's wasm asset is not reachable at the Emscripten loader's
+// default bunfs path in compiled binaries. Seed the embedded-asset hook
+// before any markit conversion (and therefore before any mupdf import).
+ensureMupdfWasmResolution();
+
 function normalizeExtension(extension: string): string {
 	const trimmed = extension.trim().toLowerCase();
 	if (!trimmed) return ".bin";
@@ -29,6 +35,22 @@ function normalizeError(error: unknown): string {
 		return error.message.trim();
 	}
 	return "Conversion failed";
+}
+
+/**
+ * markit-ai's PDF converter swallows the real mupdf import failure behind a
+ * generic "Install it" message (#5433). Re-run the import here so release
+ * diagnostics carry the actual module/asset/initialization error.
+ */
+async function describeConversionError(error: unknown): Promise<string> {
+	const base = normalizeError(error);
+	if (!base.includes("PDF support requires 'mupdf'")) return base;
+	try {
+		await import("mupdf");
+	} catch (cause) {
+		return `${base} (mupdf import failed: ${normalizeError(cause)})`;
+	}
+	return base;
 }
 
 async function runMarkitConversion<T>(task: (markit: Markit) => Promise<T>, signal?: AbortSignal): Promise<T> {
@@ -62,7 +84,7 @@ export async function convertFileWithMarkit(filePath: string, signal?: AbortSign
 		if (error instanceof ToolAbortError) {
 			throw error;
 		}
-		return { content: "", ok: false, error: normalizeError(error) };
+		return { content: "", ok: false, error: await describeConversionError(error) };
 	}
 }
 
@@ -84,6 +106,6 @@ export async function convertBufferWithMarkit(
 		if (error instanceof ToolAbortError) {
 			throw error;
 		}
-		return { content: "", ok: false, error: normalizeError(error) };
+		return { content: "", ok: false, error: await describeConversionError(error) };
 	}
 }

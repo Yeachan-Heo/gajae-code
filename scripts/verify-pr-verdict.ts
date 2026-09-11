@@ -337,7 +337,7 @@ interface PullRequestEvent {
 		number?: number;
 		body?: string | null;
 		user?: { login?: string };
-		base?: { ref?: string; sha?: string };
+		base?: { ref?: string; sha?: string; repo?: { full_name?: string } };
 		head?: { sha?: string };
 	};
 	/** issue_comment events carry the PR under issue.number instead of pull_request. */
@@ -401,10 +401,9 @@ function issueCommentToSelfReview(comment: IssueComment): AuthenticatedSelfRevie
 	return { login, authorAssociation: comment.author_association ?? "NONE", body: comment.body };
 }
 
-async function authenticatedApproval(event: PullRequestEvent, reviewerId: string, headSha: string): Promise<{ login?: string; headSha?: string }> {
+export async function authenticatedApproval(event: PullRequestEvent, reviewerId: string, headSha: string, token = Bun.env.GITHUB_TOKEN): Promise<{ login?: string; headSha?: string }> {
 	const repository = event.repository?.full_name;
 	const number = event.pull_request?.number;
-	const token = Bun.env.GITHUB_TOKEN;
 	if (!repository || !number || !token) return {};
 	const reviews: PullRequestReview[] = [];
 	for (let page = 1; ; page++) {
@@ -503,41 +502,54 @@ async function runFastGate(cwd: string, trustedRoot: string): Promise<boolean> {
 }
 
 /**
- * issue_comment events carry no pull_request object; the PR is identified by the
- * comment's issue number when that issue is a pull request. Resolve the authoritative
- * PR data (body, author, immutable base, exact head) from the GitHub API using the
- * trusted workflow token so comment-triggered validations use the same immutable
- * event semantics as pull_request events. Non-PR comments resolve to no PR and fail.
+ * Comment events resolve their PR through the authenticated API as before.
+ * Review events refresh only mutable body text: every captured authority binding
+ * must still match. A rerun must never validate a different source or target.
  */
-async function resolvePullRequestEvent(event: PullRequestEvent): Promise<PullRequestEvent> {
-	if (event.pull_request) return event;
+export async function resolvePullRequestEvent(
+	event: PullRequestEvent,
+	eventName = Bun.env.GITHUB_EVENT_NAME,
+	token = Bun.env.GITHUB_TOKEN,
+	request: (url: string, init: RequestInit) => Promise<Response> = fetch,
+): Promise<PullRequestEvent> {
+	const refreshBody = eventName === "pull_request_review";
+	if (event.pull_request && !refreshBody) return event;
+	const captured = event.pull_request;
 	const repository = event.repository?.full_name;
-	const number = event.issue?.number;
-	const token = Bun.env.GITHUB_TOKEN;
+	const number = refreshBody ? captured?.number : event.issue?.number;
+	if (refreshBody && (
+		!repository || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/u.test(repository) ||
+		!Number.isSafeInteger(number) || !number || number < 1 || !token ||
+		!captured?.user?.login || !captured.base?.ref ||
+		captured.base.repo?.full_name !== repository ||
+		!SHA40.test(captured.base.sha ?? "") || !SHA40.test(captured.head?.sha ?? "")
+	)) throw new Error("Review event PR authority is incomplete; failing closed.");
 	if (!repository || !number || !token) return event;
-	const response = await fetch(`https://api.github.com/repos/${repository}/pulls/${number}`, {
+	const response = await request(`https://api.github.com/repos/${repository}/pulls/${number}`, {
 		headers: {
 			Accept: "application/vnd.github+json",
 			Authorization: `Bearer ${token}`,
 			"X-GitHub-Api-Version": "2022-11-28",
 		},
 	});
-	if (!response.ok) return event;
-	const pr = await response.json() as {
-		body?: string | null;
-		user?: { login?: string };
-		base?: { ref?: string; sha?: string };
-		head?: { sha?: string };
-	};
+	if (!response.ok) {
+		if (refreshBody) throw new Error(`Review event PR refresh failed: ${response.status}; failing closed.`);
+		return event;
+	}
+	const pr = await response.json() as NonNullable<PullRequestEvent["pull_request"]>;
+	if (refreshBody) {
+		if (!pr || typeof pr !== "object" || Array.isArray(pr) ||
+			(pr.body !== null && typeof pr.body !== "string") ||
+			pr.number !== number || pr.base?.repo?.full_name !== repository ||
+			pr.user?.login !== captured!.user!.login ||
+			pr.base?.ref !== captured!.base!.ref || pr.base?.sha !== captured!.base!.sha ||
+			pr.head?.sha !== captured!.head!.sha
+		) throw new Error("Review event PR authority drift or malformed live metadata; failing closed.");
+		return { ...event, pull_request: { ...captured, body: pr.body } };
+	}
 	return {
 		...event,
-		pull_request: {
-			number,
-			body: pr.body,
-			user: pr.user,
-			base: pr.base,
-			head: pr.head,
-		},
+		pull_request: { number, body: pr.body, user: pr.user, base: pr.base, head: pr.head },
 	};
 }
 
@@ -691,6 +703,175 @@ async function validatePreflight(command: string, cwd: string, trustedRoot: stri
 	return validatePrContract({ body, baseRef, baseSha, headSha, authorLogin: author, computedDiffSha256: diff.exitCode === 0 ? canonicalDiffSha256(diff.stdout) : "", baseIsAncestor: ancestry.exitCode === 0, fastGatePassed: await runFastGate(cwd, trustedRoot), requireMergeApproved: false });
 }
 
+async function gh(args: string[], cwd: string): Promise<{ exitCode: number; stdout: string; stderr: string }> {
+	const child = Bun.spawn(["gh", ...args], { cwd, stdout: "pipe", stderr: "pipe" });
+	const [stdout, stderr, exitCode] = await Promise.all([
+		new Response(child.stdout).text(),
+		new Response(child.stderr).text(),
+		child.exited,
+	]);
+	return { exitCode, stdout, stderr: stderr.trim() };
+}
+
+interface LivePullRequest {
+	number: number;
+	body: string | null;
+	baseRefName: string;
+	author: { login: string } | null;
+	headRepositoryOwner: { login: string } | null;
+}
+
+interface LiveReview {
+	author: { login: string } | null;
+	state: string;
+	commit: { oid: string } | null;
+}
+
+/**
+ * Resolve the GitHub `owner/repo` actually receiving the push. A fork checkout's `origin`
+ * is the fork while the open PR lives upstream, so the implicit `gh` context would query
+ * the wrong repository (or none) and wave the push through.
+ */
+async function pushRemoteRepository(remote: string, cwd: string): Promise<string | null> {
+	const url = await git(["remote", "get-url", remote], cwd);
+	if (url.exitCode !== 0) return null;
+	const text = new TextDecoder().decode(url.stdout).trim();
+	const match = /(?:[:/])([^/:]+)\/([^/]+?)(?:\.git)?$/u.exec(text);
+	return match ? `${match[1]}/${match[2]}` : null;
+}
+
+/**
+ * The repository whose PRs govern a push to `pushRepo`. Pushing a fork branch opens the
+ * PR upstream, so a fork resolves to its parent; a non-fork is its own authority.
+ */
+async function contractRepository(pushRepo: string, cwd: string): Promise<{ repo: string; forkOwner: string | null }> {
+	const viewed = await gh(["repo", "view", pushRepo, "--json", "isFork,parent"], cwd);
+	if (viewed.exitCode !== 0) return { repo: pushRepo, forkOwner: null };
+	try {
+		const info = JSON.parse(viewed.stdout) as { isFork?: boolean; parent?: { owner?: { login?: string }; name?: string } | null };
+		const parentOwner = info.parent?.owner?.login;
+		const parentName = info.parent?.name;
+		if (!info.isFork || !parentOwner || !parentName) return { repo: pushRepo, forkOwner: null };
+		return { repo: `${parentOwner}/${parentName}`, forkOwner: pushRepo.split("/")[0]! };
+	} catch {
+		return { repo: pushRepo, forkOwner: null };
+	}
+}
+
+/**
+ * Reproduce the Dev CI "PR contract bootstrap" judgement for the exact commit being
+ * pushed. That job runs with NO requireMergeApproved escape hatch, so this gate must
+ * mirror it exactly (requireMergeApproved: true): a stale verdict digest, an unrebased
+ * base, a missing risk classification, AND a blocking verdict (needs-human,
+ * merge-blocked) all fail here, because all of them turn the required check red.
+ *
+ * A preflight that disagrees with CI is worthless, so the authenticated exact-head
+ * approval is resolved from the same GitHub review data the server reads; otherwise a
+ * legitimately reviewed merge-approved PR would fail locally while passing in CI.
+ *
+ * A branch with no open PR has no contract to invalidate and passes.
+ */
+async function validatePushPreflight(branch: string, headSha: string, remote: string, cwd: string, trustedRoot: string): Promise<PrValidationResult> {
+	if (!SHA40.test(headSha)) return { ok: false, diagnostics: [`Pushed commit ${headSha} is not a lowercase 40-hex commit.`] };
+	const pushRepo = await pushRemoteRepository(remote, cwd);
+	if (!pushRepo) return { ok: false, diagnostics: [`Could not resolve the GitHub repository behind push remote ${remote}; refusing to validate against an unknown repository.`] };
+	// A fork push opens its PR upstream, so the contract lives in the parent repository.
+	const { repo: baseRepo, forkOwner } = await contractRepository(pushRepo, cwd);
+	// The head is qualified by the owner actually receiving the push, so a same-named
+	// branch in another fork can never be mistaken for this PR.
+	const headOwner = forkOwner ?? pushRepo.split("/")[0]!;
+	const listed = await gh(["pr", "list", "--repo", baseRepo, "--head", branch, "--state", "open", "--json", "number,body,baseRefName,author,headRepositoryOwner"], cwd);
+	if (listed.exitCode !== 0) {
+		return { ok: false, diagnostics: [`Could not resolve the open PR for ${branch} in ${baseRepo}: ${listed.stderr || `gh exited ${listed.exitCode}`}. Authenticate with gh auth login, or set GJC_SKIP_PR_PREFLIGHT=1 to push without the contract check.`] };
+	}
+	let pulls: LivePullRequest[];
+	try {
+		pulls = JSON.parse(listed.stdout) as LivePullRequest[];
+	} catch (error) {
+		return { ok: false, diagnostics: [`Could not parse the gh pr list response for ${branch}: ${error instanceof Error ? error.message : String(error)}`] };
+	}
+	const candidates = pulls.filter(candidate => candidate.headRepositoryOwner?.login?.toLowerCase() === headOwner.toLowerCase());
+	if (candidates.length > 1) {
+		return { ok: false, diagnostics: [`Branch ${branch} matches ${candidates.length} open PRs in ${baseRepo} from ${headOwner} (#${candidates.map(candidate => candidate.number).join(", #")}); cannot determine which contract governs this push.`] };
+	}
+	const pr = candidates[0];
+	if (!pr) return { ok: true, diagnostics: [] };
+	// gh pr list's JSON mapping omits headRefOid and review commit oids on older gh
+	// releases (e.g. 2.4.x), which would fail closed on every push, so the head and
+	// the review commits are resolved through the stable `gh api` surface instead.
+	const currentHead = await gh(["api", `repos/${baseRepo}/pulls/${pr.number}`, "--jq", ".head.sha"], cwd);
+	if (currentHead.exitCode !== 0) {
+		return { ok: false, diagnostics: [`Could not resolve the current head of ${baseRepo}#${pr.number}: ${currentHead.stderr || `gh exited ${currentHead.exitCode}`}.`] };
+	}
+	const prHeadSha = currentHead.stdout.trim();
+	if (!SHA40.test(prHeadSha)) return { ok: false, diagnostics: [`Current head of ${baseRepo}#${pr.number} (${prHeadSha}) is not a lowercase 40-hex commit.`] };
+	// The base is the repository the PR was queried in -- for a fork push that is the
+	// upstream, never the contributor's local origin/dev. The ref is the PR's own base
+	// branch rather than an assumed "dev".
+	const baseRemoteUrl = `https://github.com/${baseRepo}.git`;
+	const refreshBase = await git(["fetch", "--no-tags", baseRemoteUrl, pr.baseRefName], cwd);
+	if (refreshBase.exitCode !== 0) {
+		return { ok: false, diagnostics: [`Could not fetch the PR base ${baseRepo}#${pr.baseRefName} before the push preflight: ${refreshBase.stderr}`] };
+	}
+	const base = await git(["rev-parse", "FETCH_HEAD"], cwd);
+	const baseSha = new TextDecoder().decode(base.stdout).trim();
+	if (!SHA40.test(baseSha)) return { ok: false, diagnostics: [`Could not resolve ${baseRepo}#${pr.baseRefName} to a commit: ${base.stderr}`] };
+	const ancestry = await git(["merge-base", "--is-ancestor", baseSha, headSha], cwd);
+	const diff = await git(["diff", "--binary", "--full-index", "--no-ext-diff", `${baseSha}...${headSha}`], cwd);
+	if (diff.exitCode !== 0) return { ok: false, diagnostics: [`Could not compute the exact ${baseSha}...${headSha} diff: ${diff.stderr}`] };
+	const body = pr.body ?? "";
+	const bodyRiskParsed = parseBodyRisk(body);
+	// Latest non-COMMENTED review per identity on the exact head, matching the server's
+	// "effective review" semantics: a later CHANGES_REQUESTED supersedes an earlier APPROVED.
+	const parsedVerdict = parsePrVerdict(body).verdict;
+	// Review commit oids come from `gh api` because `gh pr list` omits them on older gh.
+	let reviews: LiveReview[] = [];
+	if (parsedVerdict?.verdict === "merge-approved") {
+		const liveReviews = await gh(["api", `repos/${baseRepo}/pulls/${pr.number}/reviews`, "--jq", "[.[] | {author: {login: .user.login}, state, commit: {oid: .commit_id}}]"], cwd);
+		if (liveReviews.exitCode !== 0) {
+			return { ok: false, diagnostics: [`Could not fetch the reviews of ${baseRepo}#${pr.number} to verify the exact-head approval: ${liveReviews.stderr || `gh exited ${liveReviews.exitCode}`}.`] };
+		}
+		try {
+			reviews = JSON.parse(liveReviews.stdout) as LiveReview[];
+		} catch (error) {
+			return { ok: false, diagnostics: [`Could not parse the review list of ${baseRepo}#${pr.number}: ${error instanceof Error ? error.message : String(error)}`] };
+		}
+	}
+	const approval = ((): { login?: string; headSha?: string } => {
+		if (parsedVerdict?.verdict !== "merge-approved") return {};
+		const effective = reviews
+			.filter(review =>
+				review.author?.login?.toLowerCase() === parsedVerdict.reviewerId.toLowerCase()
+				&& review.state !== "COMMENTED"
+				&& review.commit?.oid === headSha,
+			)
+			.at(-1);
+		return effective?.state === "APPROVED" ? { login: effective.author?.login, headSha: effective.commit?.oid } : {};
+	})();
+	const result = validatePrContract({
+		body,
+		baseRef: pr.baseRefName,
+		baseSha,
+		headSha,
+		// The push is what MAKES headSha the PR head, so prHeadSha is the pre-push
+		// value and is expected to differ; it is reported, never used as the contract head.
+		authorLogin: pr.author?.login ?? "",
+		computedDiffSha256: canonicalDiffSha256(diff.stdout),
+		baseIsAncestor: ancestry.exitCode === 0,
+		fastGatePassed: await runFastGate(cwd, trustedRoot),
+		bodyRisk: bodyRiskParsed.risk,
+		authenticatedReviewerLogin: approval.login,
+		authenticatedReviewHeadSha: approval.headSha,
+		requireMergeApproved: true,
+	});
+	const diagnostics = [...bodyRiskParsed.diagnostics, ...result.diagnostics];
+	if (diagnostics.length > 0) {
+		diagnostics.push(`This is exactly what the Dev CI "PR contract bootstrap" job will report for ${baseRepo}#${pr.number} once ${headSha} lands (currently ${prHeadSha}); the exact ${baseSha}...${headSha} digest is ${canonicalDiffSha256(diff.stdout)}.`);
+		diagnostics.push("Fix the PR body, or push anyway with GJC_SKIP_PR_PREFLIGHT=1 (or --no-verify) while the change is still awaiting review.");
+	}
+	return { ok: diagnostics.length === 0, verdict: result.verdict, diagnostics };
+}
+
 export async function main(argv: string[]): Promise<number> {
 	const repoIndex = argv.indexOf("--repo");
 	const trustedRootIndex = argv.indexOf("--trusted-root");
@@ -700,6 +881,9 @@ export async function main(argv: string[]): Promise<number> {
 	const invocationCwd = path.resolve(process.cwd(), invocationCwdIndex >= 0 && argv[invocationCwdIndex + 1] ? argv[invocationCwdIndex + 1]! : cwd);
 	const eventIndex = argv.indexOf("--event");
 	const preflightIndex = argv.indexOf("--preflight-command");
+	const pushIndex = argv.indexOf("--push-preflight");
+	const pushRemoteIndex = argv.indexOf("--push-remote");
+	const pushRemote = pushRemoteIndex >= 0 && argv[pushRemoteIndex + 1] ? argv[pushRemoteIndex + 1]! : "origin";
 	const signIndex = argv.indexOf("--self-review-sign");
 	if (signIndex >= 0) {
 		const args = argv.slice(signIndex + 1);
@@ -723,9 +907,11 @@ export async function main(argv: string[]): Promise<number> {
 	}
 	const result = eventIndex >= 0 && argv[eventIndex + 1]
 		? await validateEvent(path.resolve(process.cwd(), argv[eventIndex + 1]!), cwd, trustedRoot)
-		: preflightIndex >= 0 && argv[preflightIndex + 1]
-			? await validatePreflight(argv[preflightIndex + 1]!, cwd, trustedRoot, invocationCwd)
-			: { ok: false, diagnostics: ["Usage: bun scripts/verify-pr-verdict.ts --event <github-event.json> | --preflight-command <command> | --self-review-sign <verdict> <base> <head> <digest> <reviewer-id> <risk> <extra> <evidence>"] };
+		: pushIndex >= 0 && argv[pushIndex + 1] && argv[pushIndex + 2]
+			? await validatePushPreflight(argv[pushIndex + 1]!, argv[pushIndex + 2]!, pushRemote, cwd, trustedRoot)
+			: preflightIndex >= 0 && argv[preflightIndex + 1]
+				? await validatePreflight(argv[preflightIndex + 1]!, cwd, trustedRoot, invocationCwd)
+				: { ok: false, diagnostics: ["Usage: bun scripts/verify-pr-verdict.ts --event <github-event.json> | --preflight-command <command> | --push-preflight <branch> <head-sha> [--push-remote <remote>] | --self-review-sign <verdict> <base> <head> <digest> <reviewer-id> <risk> <extra> <evidence>"] };
 	for (const diagnostic of result.diagnostics) console.error(`::error::${diagnostic}`);
 	if (result.ok && result.verdict) console.log(`PR contract valid: ${result.verdict.verdict} ${result.verdict.diffSha256}`);
 	return result.ok ? 0 : 1;

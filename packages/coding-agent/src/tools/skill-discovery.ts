@@ -3,6 +3,7 @@ import { prompt, untilAborted } from "@gajae-code/utils";
 import * as z from "zod/v4";
 import {
 	describeDisabledSkillScopes,
+	describeNoSkillMatch,
 	discoverRuntimeSkills,
 	type RuntimeSkillDiscoveryCandidate,
 } from "../extensibility/runtime-skill-discovery";
@@ -14,7 +15,9 @@ const skillDiscoverySchema = z
 		query: z
 			.string()
 			.optional()
-			.describe("words to match against skill name, description, source, or use conditions"),
+			.describe(
+				"words to match against skill name, description, source, or use conditions; every term must appear (conjunctive substring), or one term must equal the exact skill name",
+			),
 		source: z.enum(["all", "project", "user"]).default("all").optional().describe("skill source scope to search"),
 		limit: z.number().min(1).max(50).default(20).optional().describe("maximum results"),
 	})
@@ -26,10 +29,12 @@ export interface SkillDiscoveryToolDetails {
 	candidates: RuntimeSkillDiscoveryCandidate[];
 	count: number;
 	/**
-	 * Present only when zero candidates were returned AND discovery config gates
-	 * (`skills.enabled` / `skills.trustProjectSkills` / `skills.trustUserSkills`)
-	 * prevented some or all of the requested scope from being searched. Without
-	 * this, a disabled config is indistinguishable from "no skills exist".
+	 * Present only when zero candidates were returned. Either discovery config
+	 * gates (`skills.enabled` / `skills.trustProjectSkills` /
+	 * `skills.trustUserSkills`) prevented some or all of the requested scope
+	 * from being searched, or a non-empty query conjunctively filtered out every
+	 * scanned skill. Without this, both cases are indistinguishable from
+	 * "no skills exist".
 	 */
 	notice?: string;
 	/**
@@ -95,7 +100,9 @@ export class SkillDiscoveryTool implements AgentTool<typeof skillDiscoverySchema
 			};
 			if (result.diagnostics.messages.length > 0) details.diagnostics = result.diagnostics.messages;
 			if (result.candidates.length === 0) {
-				const notice = describeDisabledSkillScopes(source, this.#getRuntimeSkillPolicy());
+				const notice =
+					describeDisabledSkillScopes(source, this.#getRuntimeSkillPolicy()) ??
+					describeNoSkillMatch(input.query, result.scanned);
 				if (notice) details.notice = notice;
 			}
 			return {
