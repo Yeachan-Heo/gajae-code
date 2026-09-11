@@ -82,7 +82,7 @@ const strategy: CredentialRankingStrategy = {
 	windowDefaults: { primaryMs: 3_600_000, secondaryMs: 86_400_000 },
 };
 
-const scenarios = ["first", "after-tool", "already-exhausted", "unknown-before"] as const;
+const scenarios = ["first", "after-tool", "already-exhausted", "unknown-before", "all-blocked"] as const;
 const cases = [
 	...(["quota", "rate_limit", "credential"] as const).flatMap(trigger =>
 		scenarios.map(scenario => ({ scenario, trigger })),
@@ -138,6 +138,20 @@ describe("credential marking before re-resolution", () => {
 						accountId,
 					})),
 				);
+				if (scenario === "all-blocked") {
+					const preblockedSession = "preblocked-session";
+					await storage.getApiKey(provider, preblockedSession, {
+						credentialSelector: { kind: "account", value: "b" },
+					});
+					const blockedRowId = storage.getSessionCredentialRowId(provider, preblockedSession);
+					if (blockedRowId === undefined) throw new Error("Missing secondary OAuth row");
+					expect(
+						await storage.markUsageLimitReached(provider, preblockedSession, {
+							rowId: blockedRowId,
+							retryAfterMs: 120_000,
+						}),
+					).toBe(true);
+				}
 				storage.setRuntimePreferredCredentialSelector(provider, { kind: "account", value: "a" });
 				if (scenario === "no-oauth") {
 					await storage.set(provider, { type: "api_key", key: "synthetic-api-key" });
@@ -208,6 +222,14 @@ describe("credential marking before re-resolution", () => {
 						expect(storage.hasSessionCredentialSelector(provider, session.credentialSessionId)).toBe(true);
 						expect(storage.getSessionCredentialRowId(provider, session.credentialSessionId)).toBe(rowAtFailure);
 					}
+					return;
+				}
+				if (scenario === "all-blocked") {
+					expect(marks).toHaveBeenCalledTimes(1);
+					expect(rowAtFailure).toBeDefined();
+					expect(keys).toEqual(["TOKEN-a"]);
+					expect(storage.getSessionCredentialRowId(provider, session.credentialSessionId)).toBe(rowAtFailure);
+					expect(agent.state.messages.at(-1)?.role).toBe("assistant");
 					return;
 				}
 				expect(marks).toHaveBeenCalledTimes(1);

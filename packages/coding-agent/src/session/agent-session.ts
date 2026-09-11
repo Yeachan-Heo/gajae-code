@@ -21639,10 +21639,11 @@ export class AgentSession {
 				owner: this.#modelRegistry.getAuthStorageOwner(),
 				...(before === undefined ? {} : { rowId: before }),
 			});
+			if (!remaining) return "exhausted";
 			await this.#modelRegistry.getApiKey(this.model, credentialSessionId);
 			const after = authStorage.getSessionCredentialRowId(provider, credentialSessionId);
 			if (before !== undefined && after !== undefined && before !== after) return "rotated";
-			return remaining ? "unchanged" : "exhausted";
+			return "unchanged";
 		}
 		const activeApiKey = await this.#modelRegistry.getApiKey(this.model, credentialSessionId);
 
