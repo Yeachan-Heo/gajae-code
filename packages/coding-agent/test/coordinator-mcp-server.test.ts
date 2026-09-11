@@ -3448,6 +3448,17 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		const afterRepeatedMigration = await readSessionTransaction(paths, "visible-session");
 		expect(afterRepeatedMigration?.revision).toBeGreaterThanOrEqual(migratedRevision ?? 0);
 		expect(afterRepeatedMigration?.canonical.session.broker).toEqual(migratedTransaction?.canonical.session.broker);
+		const staleProjection = (await Bun.file(recordPath).json()) as Record<string, unknown>;
+		staleProjection.endpoint_incarnation = legacyDigest;
+		delete staleProjection.endpoint_file_id;
+		await Bun.write(recordPath, `${JSON.stringify(staleProjection)}\n`);
+		await expect(
+			server.callTool("gjc_coordinator_read_coordination_status", { session_id: "visible-session" }),
+		).resolves.toMatchObject({ ok: true });
+		expect(await Bun.file(recordPath).json()).toMatchObject({
+			endpoint_incarnation: migratedDigest,
+			endpoint_file_id: endpointFileId,
+		});
 
 		const mismatchRoot = await tempRoot();
 		const mismatchControls: SdkControl[] = [];

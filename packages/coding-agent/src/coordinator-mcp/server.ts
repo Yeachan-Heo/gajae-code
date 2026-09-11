@@ -5768,6 +5768,12 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 	async function migrateLegacySessionEndpointAuthority(
 		session: CanonicalSessionSnapshotV1,
 	): Promise<CanonicalSessionSnapshotV1> {
+		const publishProjection = async (canonical: CanonicalSessionSnapshotV1): Promise<void> => {
+			const projected = sessionFromCreationSnapshot(canonical);
+			const current = asRecord(await readJsonFile(sessionFile(canonical.session_id)));
+			if (!current || canonicalJson(current) !== canonicalJson(projected))
+				await writeJsonFile(sessionFile(canonical.session_id), projected);
+		};
 		if (!session.broker.workspace) throw new Error("coordinator_workspace_required");
 		const persistedWorkspace = await canonicalBrokerWorkspace(session.broker.workspace);
 		const authority = await exactBrokerSessionAuthority(session.session_id, persistedWorkspace);
@@ -5787,8 +5793,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				authority.endpointIncarnation,
 				authority.endpointFileId,
 			);
-			if (reconciled.changed)
-				await writeJsonFile(sessionFile(session.session_id), sessionFromCreationSnapshot(reconciled.session));
+			await publishProjection(reconciled.session);
 			return reconciled.session;
 		}
 		if (authority.endpointFileId === undefined) {
@@ -5805,8 +5810,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			authority.endpointIncarnation,
 			authority.endpointFileId,
 		);
-		if (rewritten.changed)
-			await writeJsonFile(sessionFile(session.session_id), sessionFromCreationSnapshot(rewritten.session));
+		await publishProjection(rewritten.session);
 		return rewritten.session;
 	}
 
