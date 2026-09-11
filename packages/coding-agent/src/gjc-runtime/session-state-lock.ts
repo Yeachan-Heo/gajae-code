@@ -969,10 +969,17 @@ function sameWindowsFileObject(left: fsSync.BigIntStats, right: fsSync.BigIntSta
 	return left.isFile() && right.isFile() && left.dev === right.dev && left.ino === right.ino;
 }
 
-function ownerSnapshotFrom(stat: fsSync.BigIntStats, bytes: Buffer): LockOwnerSnapshot {
+function ownerSnapshotFrom(
+	stat: fsSync.BigIntStats,
+	bytes: Buffer,
+	identityStat: fsSync.BigIntStats = stat,
+): LockOwnerSnapshot {
 	return {
-		dev: stat.dev,
-		ino: stat.ino,
+		// Windows may refresh descriptor dev/ino metadata after an in-place
+		// truncate/write even though the pathname still names the same file
+		// object. Preserve the pre-mutation identity when one brackets the read.
+		dev: identityStat.dev,
+		ino: identityStat.ino,
 		nlink: stat.nlink,
 		size: stat.size,
 		mtimeNs: stat.mtimeNs,
@@ -1054,7 +1061,7 @@ async function captureWindowsLockOwner(lockFile: string, flags: number): Promise
 		const bytes = await handle.readFile();
 		const settled = await handle.stat({ bigint: true });
 		if (!sameRegularFileIdentity(opened, settled) || settled.size !== BigInt(bytes.byteLength)) return null;
-		return ownerSnapshotFrom(settled, bytes);
+		return ownerSnapshotFrom(settled, bytes, before);
 	} finally {
 		await handle.close().catch(() => undefined);
 	}
