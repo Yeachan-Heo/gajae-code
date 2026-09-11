@@ -52,6 +52,7 @@ const OPENAI_RESPONSES_PROGRESS_EVENT_TYPES = new Set([
 	"response.custom_tool_call_input.done",
 	"response.output_item.done",
 	"response.completed",
+	"response.incomplete",
 	"response.failed",
 	"error",
 ]);

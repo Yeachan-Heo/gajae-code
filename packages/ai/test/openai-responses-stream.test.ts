@@ -1,7 +1,10 @@
 import { describe, expect, test } from "bun:test";
 import { classifyFallbackTrigger, transportFailureFacts } from "@gajae-code/ai";
 import { streamOpenAIResponses } from "@gajae-code/ai/providers/openai-responses";
-import { processResponsesStream } from "@gajae-code/ai/providers/openai-responses-shared";
+import {
+	isOpenAIResponsesProgressEvent,
+	processResponsesStream,
+} from "@gajae-code/ai/providers/openai-responses-shared";
 import type { AssistantMessage, Model } from "@gajae-code/ai/types";
 import type { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
 import type { ResponseStreamEvent } from "openai/resources/responses/responses";
@@ -137,6 +140,10 @@ describe("Responses provider: bounded stream-failure classification", () => {
 	});
 
 	test("treats response.incomplete as a terminal event rather than an interruption", async () => {
+		// The terminal frame must also count as progress, or a long silent tail before
+		// it lets the idle watchdog abort and overwrite the derived `length`.
+		expect(isOpenAIResponsesProgressEvent({ type: "response.incomplete" })).toBe(true);
+
 		const result = await streamProviderResult([
 			{ type: "response.created", response: { id: "resp_incomplete" } },
 			{
