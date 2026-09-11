@@ -356,6 +356,9 @@ function assertSourceExists(): void {
 }
 
 function worktreeCheck(): never {
+	// A checkout whose workspace links point into another worktree resolves, but
+	// against the wrong sources; report it like `--check` instead of a false green.
+	assertWorkspaceLinksLocal();
 	const report = inspectWorktree(repoRoot);
 	const write = report.ok ? console.log : console.error;
 	write(formatWorktreeReport(report));

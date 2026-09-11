@@ -57,6 +57,7 @@ describe("workspace dependency inspection", () => {
 				if (specifier !== "@gajae-code/utils") throw new Error(`Cannot find package '${specifier}'`);
 				return "/nonexistent/worktree/node_modules/@gajae-code/utils/src/index.ts";
 			},
+			packageTargetExists: () => true,
 		});
 		expect(snapshot.status).toBe("unresolved-workspace-packages");
 		expect(snapshot.unresolvedPackages).toEqual(["@gajae-code/ai", "@gajae-code/tui"]);
@@ -68,10 +69,25 @@ describe("workspace dependency inspection", () => {
 			nodeModulesExists: () => true,
 			listWorkspacePackages: () => ["@gajae-code/utils"],
 			resolvePackage: specifier => `/resolved/${specifier}`,
+			packageTargetExists: () => true,
 		});
 		expect(snapshot.status).toBe("ready");
 		expect(snapshot.workspacePackages).toEqual(["@gajae-code/utils"]);
 		expect(snapshot.unresolvedPackages).toEqual([]);
+	});
+
+	test("treats a resolved-but-missing target as unresolved (dangling workspace symlink)", () => {
+		const snapshot = inspectWorkspaceDependencies({
+			repoRoot: "/nonexistent/worktree",
+			nodeModulesExists: () => true,
+			listWorkspacePackages: () => ["@gajae-code/utils", "@gajae-code/ai"],
+			// Bun's resolver returns a dangling symlink path without throwing, so the
+			// resolver alone cannot distinguish it from a healthy install.
+			resolvePackage: specifier => `/nonexistent/worktree/node_modules/${specifier}/src/index.ts`,
+			packageTargetExists: resolvedPath => resolvedPath.includes("@gajae-code/ai"),
+		});
+		expect(snapshot.status).toBe("unresolved-workspace-packages");
+		expect(snapshot.unresolvedPackages).toEqual(["@gajae-code/utils"]);
 	});
 
 	test("failure message names the worktree-safe command and warns off install:dev", () => {

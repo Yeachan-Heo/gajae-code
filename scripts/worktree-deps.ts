@@ -16,7 +16,7 @@ import * as path from "node:path";
 
 /** Worktree-safe setup command documented in AGENTS.md / README. */
 export const WORKTREE_SETUP_COMMAND = "bun run setup:worktree";
-/** The exact steps `setup:worktree` expands to (kept in sync by scripts/install-dev.test.ts). */
+/** The exact steps `setup:worktree` expands to; `scripts/install-dev.test.ts` pins package.json to this value. */
 export const WORKTREE_SETUP_STEPS = "bun install && bun run build:native";
 /** Entry point whose import exercises the real native-addon loader. */
 export const NATIVE_ENTRY_PATH = path.join("packages", "natives", "native", "index.js");
@@ -37,6 +37,8 @@ export interface WorkspaceDependencyProbe {
 	repoRoot: string;
 	nodeModulesExists?: (nodeModulesDir: string) => boolean;
 	resolvePackage?: (specifier: string, fromDir: string) => string;
+	/** Whether a resolved package entry point is a real, importable path. */
+	packageTargetExists?: (resolvedPath: string) => boolean;
 	listWorkspacePackages?: (repoRoot: string) => string[];
 }
 
@@ -72,6 +74,15 @@ function defaultNodeModulesExists(nodeModulesDir: string): boolean {
 
 function defaultResolvePackage(specifier: string, fromDir: string): string {
 	return Bun.resolveSync(specifier, fromDir);
+}
+
+/**
+ * Bun's resolver returns a path for a package root that is a dangling symlink
+ * without throwing, even though a real `import` then fails with ENOENT. A
+ * partial/stale install must land in `unresolvedPackages`, not report ready.
+ */
+function defaultPackageTargetExists(resolvedPath: string): boolean {
+	return fs.existsSync(resolvedPath);
 }
 
 /**
@@ -119,12 +130,13 @@ export function inspectWorkspaceDependencies(probe: WorkspaceDependencyProbe): W
 	const nodeModulesDir = path.join(repoRoot, "node_modules");
 	const nodeModulesPresent = (probe.nodeModulesExists ?? defaultNodeModulesExists)(nodeModulesDir);
 	const resolvePackage = probe.resolvePackage ?? defaultResolvePackage;
+	const packageTargetExists = probe.packageTargetExists ?? defaultPackageTargetExists;
 	const workspacePackages = nodeModulesPresent ? (probe.listWorkspacePackages ?? listWorkspacePackageNames)(repoRoot) : [];
 	const unresolvedPackages: string[] = [];
 	if (nodeModulesPresent) {
 		for (const specifier of workspacePackages) {
 			try {
-				resolvePackage(specifier, repoRoot);
+				if (!packageTargetExists(resolvePackage(specifier, repoRoot))) unresolvedPackages.push(specifier);
 			} catch {
 				unresolvedPackages.push(specifier);
 			}
