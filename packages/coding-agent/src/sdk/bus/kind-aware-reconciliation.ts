@@ -7,6 +7,7 @@ import { createHash, randomUUID } from "node:crypto";
 
 import {
 	failedPromptOutcome,
+	failureEvidence,
 	type PromptFailureEvidence,
 	rephaseFailedOutcome,
 	sanitizePromptFailure,
@@ -107,12 +108,6 @@ const failedOutcomeForError = (
 				: {}),
 		evidence,
 	});
-
-/** Start/activity evidence for phase derivation from a reconciliation record. */
-const failureEvidence = (record: { startedAt?: number }, hasActivity?: boolean): PromptFailureEvidence => ({
-	...(record.startedAt !== undefined ? { startedAt: record.startedAt } : {}),
-	...(hasActivity === true ? { hasActivity: true } : {}),
-});
 
 const isDeadlineOutcome = (outcome: SdkPromptTerminalOutcome | undefined): boolean =>
 	outcome?.kind === "failed" && outcome.provenance === "deadline";

@@ -61,6 +61,7 @@ import { PromptDeadlineManager, type PromptTerminalTransitionEvidence } from "..
 import {
 	assistantFailureCode,
 	failedPromptOutcome,
+	failureEvidence,
 	formatPromptFailureForLocalLog,
 	PROMPT_FAILURE_MESSAGE_SUBMISSION,
 	type PromptFailureEvidence,
@@ -615,7 +616,7 @@ function canonicalFailedOutcome(
 	const deadline = provenance === "deadline" || failure?.code === "prompt_deadline_exceeded";
 	const known = typeof failure?.code === "string" ? failure.code : undefined;
 	const explicit = providerCode ?? (typeof failure?.providerCode === "string" ? failure.providerCode : undefined);
-	const built = failedPromptOutcome({
+	return failedPromptOutcome({
 		code: deadline ? "prompt_deadline_exceeded" : "prompt_failed",
 		provenance: deadline ? "deadline" : "agent_failed",
 		...(explicit !== undefined
@@ -625,14 +626,7 @@ function canonicalFailedOutcome(
 				: {}),
 		evidence,
 	});
-	return built;
 }
-
-/** Start/activity evidence for phase derivation from a reconciliation record. */
-const failureEvidence = (record: { startedAt?: number }, hasActivity?: boolean): PromptFailureEvidence => ({
-	...(record.startedAt !== undefined ? { startedAt: record.startedAt } : {}),
-	...(hasActivity === true ? { hasActivity: true } : {}),
-});
 
 function canonicalTerminalOutcome(
 	outcome: unknown,
