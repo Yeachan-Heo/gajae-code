@@ -242,6 +242,8 @@ await runCli(${JSON.stringify(["sdk", ...argv])});`);
 			["broker-internal"],
 			["broker-internal", "--agent-dir"],
 			["broker-internal", "--agent-dir", ""],
+			["broker-internal", "--agent-dir", "relative-agent"],
+			["broker-internal", "--agent-dir", "."],
 			["broker-internal", "--agent-dir", "--help"],
 			["broker-internal", "--agent-dir", "\u001b[31m/tmp/agent"],
 			["broker-internal", "--agent-dir=/safe-fixture"],
