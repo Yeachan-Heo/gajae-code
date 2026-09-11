@@ -185,13 +185,17 @@ export async function runDaemonCommand(cmd: DaemonCommandArgs, deps: DaemonComma
 			targets.push({ kind: controller.kind, outcome: "unknown" });
 			for (const pending of controllers.slice(index + 1))
 				targets.push({ kind: pending.kind, outcome: "not-applied" });
-			throw new PublicCommandFailure({ kind: "daemon_mixed", targets });
+			// Completed targets keep their full results: the envelope warns against
+			// replaying applied mutations, so it must carry the resulting state the
+			// caller has to reconcile against.
+			throw new PublicCommandFailure({ kind: "daemon_mixed", targets, partialResults: results });
 		}
 		results.push(result);
 		targets.push({ kind: controller.kind, outcome: daemonOperationOutcome(result) });
 	}
 	const failed = results.some(result => !result.ok);
-	if (failed && !deps.setExitCode) throw new PublicCommandFailure({ kind: "daemon_mixed", targets });
+	if (failed && !deps.setExitCode)
+		throw new PublicCommandFailure({ kind: "daemon_mixed", targets, partialResults: results });
 	if (cmd.json) {
 		process.stdout.write(`${JSON.stringify(results, null, 2)}\n`);
 	} else {

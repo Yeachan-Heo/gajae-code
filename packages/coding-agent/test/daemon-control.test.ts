@@ -3033,6 +3033,120 @@ describe("runDaemonCommand", () => {
 		expect(calls).toEqual(interrupted ? ["telegram", "discord"] : ["telegram", "discord", "slack"]);
 	});
 
+	test("mixed failures retain completed operation results for reconciliation", async () => {
+		const telegramStatus: DaemonStatus = {
+			kind: "telegram",
+			configured: true,
+			health: "running",
+			pid: 41,
+			rootCount: 1,
+			runtime: { mode: "source", execPath: "/usr/bin/node", reloadPicksUpSourceEdits: true },
+		};
+		const completed: DaemonOperationResult = {
+			kind: "telegram",
+			action: "reload",
+			ok: true,
+			before: telegramStatus,
+			after: { ...telegramStatus, pid: 42 },
+			warnings: ["reload warning"],
+			message: "reloaded telegram daemon",
+		};
+		const controllers: BuiltInDaemonController[] = [
+			fakeController(telegramStatus, completed),
+			{
+				kind: "discord",
+				status: async () => ({
+					...telegramStatus,
+					kind: "discord",
+				}),
+				stop: async () => {
+					throw new Error("private stop detail");
+				},
+				reload: async () => {
+					throw new Error("private controller detail");
+				},
+			},
+		];
+		let failure: unknown;
+		const out = await captureStdout(async () => {
+			try {
+				await runDaemonCommand(
+					{ action: "restart", kinds: [], all: true, json: true, force: true },
+					{ controllers },
+				);
+				throw new Error("Expected failure");
+			} catch (error) {
+				failure = error;
+			}
+		});
+		expect(out).toBe("");
+		expect(failure).toBeInstanceOf(PublicCommandFailure);
+		expect((failure as PublicCommandFailure).input).toMatchObject({
+			kind: "daemon_mixed",
+			targets: [
+				{ kind: "telegram", outcome: "applied" },
+				{ kind: "discord", outcome: "unknown" },
+			],
+			partialResults: [completed],
+		});
+		const expectedProjection = [
+			{
+				kind: "telegram" as const,
+				action: "reload" as const,
+				ok: true,
+				before: telegramStatus,
+				after: { ...telegramStatus, pid: 42 },
+			},
+		];
+		for (const json of [true, false]) {
+			const rendered = await renderPublicCommandFailure(failure, { command: ["daemon", "restart"], json });
+			const output = json ? rendered.stdout : rendered.stderr;
+			expect(json ? rendered.stderr : rendered.stdout).toBe("");
+			// The completed target keeps the resulting state a caller must reconcile against;
+			// the thrown controller contributes nothing and no controller free text is echoed.
+			expect(rendered.envelope.error.partialResults).toEqual(expectedProjection);
+			expect(output).toContain('"partialResults":[');
+			expect(output).not.toContain("private controller detail");
+			if (json) expect(JSON.parse(rendered.stdout)).toEqual(rendered.envelope);
+		}
+	});
+
+	test("completed-but-failed targets keep their results in the aggregated failure", async () => {
+		const refused: DaemonOperationResult = {
+			kind: "telegram",
+			action: "reload",
+			ok: false,
+			warnings: [],
+			message: "refused telegram reload",
+			recovery: ownershipMismatchRecovery(),
+		};
+		let failure: unknown;
+		const out = await captureStdout(async () => {
+			try {
+				await runDaemonCommand(
+					{ action: "restart", kinds: ["telegram"], all: false, json: true, force: false },
+					{ controllers: [fakeController({} as DaemonStatus, refused)] },
+				);
+				throw new Error("Expected failure");
+			} catch (error) {
+				failure = error;
+			}
+		});
+		expect(out).toBe("");
+		const rendered = await renderPublicCommandFailure(failure, { command: ["daemon", "restart"], json: true });
+		expect(rendered.envelope.error.partialResults).toEqual([
+			{
+				kind: "telegram" as const,
+				action: "reload" as const,
+				ok: false,
+				recovery: { reason: "ownership_mismatch" },
+			},
+		]);
+		// The envelope still refuses controller free text, so the refusal text and the
+		// remediation prose stay out of it while the typed category is retained.
+		expect(rendered.stdout).not.toContain("refused telegram reload");
+	});
+
 	test.each(["stale", "error"] as const)("unhealthy %s status remains successful", async health => {
 		const status: DaemonStatus = {
 			kind: "telegram",
