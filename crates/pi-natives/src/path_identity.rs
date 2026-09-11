@@ -4174,6 +4174,7 @@ pub(crate) mod platform {
 		}
 	}
 	#[cfg(any(target_os = "linux", target_os = "macos"))]
+	#[allow(clippy::unnecessary_cast, reason = "libc stat field widths differ between Unix targets")]
 	pub(super) fn repair_config_file_permissions(
 		path: &Path,
 		expected: &ExactFileIdentity,
@@ -4222,15 +4223,15 @@ pub(crate) mod platform {
 				);
 			},
 		};
-		if before.st_dev != expected.dev
-			|| before.st_ino != expected.ino
-			|| before.st_nlink != expected.nlink.unwrap_or(1)
+		if before.st_dev as u64 != expected.dev
+			|| before.st_ino as u64 != expected.ino
+			|| before.st_nlink as u64 != expected.nlink.unwrap_or(1)
 			|| before.st_size as u64 != expected.size
 			|| stat_mtime_ns(&before) != i128::from(expected.mtime_ns)
 		{
 			return NativePermissionRepairResult::refused("identity_mismatch");
 		}
-		if parent.st_dev != parent_dev || parent.st_ino != parent_ino {
+		if parent.st_dev as u64 != parent_dev || parent.st_ino as u64 != parent_ino {
 			return NativePermissionRepairResult::refused("identity_mismatch");
 		}
 		if parent.st_mode & 0o022 != 0 {
