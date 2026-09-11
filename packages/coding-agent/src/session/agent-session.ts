@@ -2754,6 +2754,11 @@ export class AgentSession {
 		}
 	}
 
+	#settleTrackedOwnRunPromotionFailures(): void {
+		for (const state of [...this.#trackedQueuedInputsAwaitingOwnRun])
+			this.#settleTrackedQueuedInputRemoved(state, "removed");
+	}
+
 	#settleTrackedQueuedInputRemoved(state: TrackedQueuedInput, reason: QueuedInputRemovalReason): void {
 		if (!state.executionSettled) {
 			state.executionSettled = true;
@@ -7898,8 +7903,10 @@ export class AgentSession {
 												error: error.message,
 											});
 										}
-										if (!predecessorAccepted)
+										if (!predecessorAccepted) {
+											this.#settleTrackedOwnRunPromotionFailures();
 											this.#restoreDeferredAgentEndAfterContinuationFailure(predecessorAgentEnd);
+										}
 										throw error;
 									}
 								} catch (error) {
@@ -13484,8 +13491,6 @@ export class AgentSession {
 		if (images && images.length > 0) content.push(...images);
 		const message = { role: "user" as const, content, attribution: "user" as const, timestamp: Date.now() };
 		options?.onQueued?.(message);
-		// Display entry carries the message identity so positional editing can never
-		// misaddress a deferred SDK follow-up held outside the Agent live queue.
 		const displayEntry = this.#createQueuedDisplayEntry(displayText, undefined, message);
 		this.#followUpMessages.push(displayEntry);
 		this.#externalFollowUps.add(message);
@@ -13495,24 +13500,6 @@ export class AgentSession {
 			this.#deepInterviewGenuineUserMessageEpochs.set(message, epoch);
 		}
 		if (options?.sdkRunToken) this.#sdkRunTokensByQueuedMessage.set(message, options.sdkRunToken);
-		if (options?.sdkRunToken && (this.agent.state.isStreaming || this.agent.hasQueuedMessages())) {
-			this.#deferredSdkFollowUps.push(message);
-		} else {
-			this.agent.followUp(message, options?.forceOneAtATime ? { forceOneAtATime: true } : undefined);
-		}
-		// When this is the first queued message and the session is in a resumable
-		// assistant-ended state, schedule an immediate continue so it is delivered
-		// without waiting for the next user turn. A later accepted follow-up must
-		// not start unrelated queued work ahead of it, because that work has a
-		// different cancellation and terminal owner.
-		if (queueWasEmpty) {
-			this.#scheduleQueuedFollowUpContinuation(() =>
-				this.agent.snapshotFollowUp().some(candidate => candidate === message),
-			);
-			if (options?.scheduleNonAdmittedWake !== false) this.#scheduleNonAdmittedQueuedContinuation();
-		}
-		return {
-
 		const owner: QueuedFollowUpOwner = {
 			cancel: () => {
 				const deferredIndex = this.#deferredSdkFollowUps.indexOf(message);
@@ -13547,51 +13534,8 @@ export class AgentSession {
 			if (options?.scheduleNonAdmittedWake !== false) this.#scheduleNonAdmittedQueuedContinuation();
 		}
 		return owner;
-			cancel: () => {
-				const deferredIndex = this.#deferredSdkFollowUps.indexOf(message);
-				let removed = false;
-				if (deferredIndex !== -1) {
-					this.#deferredSdkFollowUps.splice(deferredIndex, 1);
-					removed = true;
-				} else {
-					removed = this.agent.removeQueuedMessages(candidate => candidate === message).followUp > 0;
-					// This message was already released from the deferred queue; its
-					// scheduled continuation was cancelled before it started. No further
-					// agent_end may arrive to release the next deferred follow-up, so
-					// advance the queue here to keep the next accepted SDK request moving.
-					if (removed) this.#releaseDeferredSdkFollowUps();
-				}
-				if (removed) {
-					this.#followUpMessages = this.#followUpMessages.filter(entry => entry !== displayEntry);
-					this.#deepInterviewGenuineUserMessageEpochs.delete(message);
-					this.#sdkRunTokensByQueuedMessage.delete(message);
-					// A canceled follow-up never reaches the normal promotion boundary,
-					// so terminalize its SDK owner through the same removal disposition.
-					this.#followUpPromotionHooks.get(message)?.({ removed: true });
-					this.#followUpPromotionHooks.delete(message);
-				}
-				return removed;
-			},
-		};
-		options?.onQueuedAfterAdmission?.(message, owner.cancel);
-		if (options?.sdkRunToken && (this.agent.state.isStreaming || this.agent.hasQueuedMessages())) {
-			this.#deferredSdkFollowUps.push(message);
-		} else {
-			this.agent.followUp(message, options?.forceOneAtATime ? { forceOneAtATime: true } : undefined);
-		}
-		// When this is the first queued message and the session is in a resumable
-		// assistant-ended state, schedule an immediate continue so it is delivered
-		// without waiting for the next user turn. A later accepted follow-up must
-		// not start unrelated queued work ahead of it, because that work has a
-		// different cancellation and terminal owner.
-		if (queueWasEmpty) {
-			this.#scheduleQueuedFollowUpContinuation(() =>
-				this.agent.snapshotFollowUp().some(candidate => candidate === message),
-			);
-			this.#scheduleNonAdmittedQueuedContinuation();
-		}
-		return owner;
 	}
+
 	#releaseDeferredSdkFollowUps(): void {
 		// A deferred SDK follow-up must become the sole first message at the next
 		// acceptance so its run token is bound to the agent_start. Releasing it
