@@ -369,7 +369,15 @@ await runCli(${JSON.stringify(["sdk", ...argv])});`);
 				["spawn", "--cwd", ".", "--prompt", "task", "--json"],
 				["spawn", "--cwd", ".", "--prompt", "task", "--json"],
 			],
-			["sdk", ["session", "inspect", "s", "--json"], ["session", "inspect", "s"]],
+			// sdk session declares --json and forwards it to its JSON-aware runner, so the
+			// family must observe its own boundary flag instead of silently dropping it.
+			// The first shape is exactly what the bundled gjc-sdk-author template emits.
+			[
+				"sdk",
+				["session", "raw", "query", "session-1", "--query", "session.metadata", "--json"],
+				["session", "raw", "query", "session-1", "--query", "session.metadata", "--json"],
+			],
+			["sdk", ["session", "inspect", "s", "--json"], ["session", "inspect", "s", "--json"]],
 			["sdk", ["guides", "trust", "--json"], ["guides", "trust"]],
 			["sdk", ["serve", "--stdio", "--json"], ["serve", "--stdio"]],
 			["daemon", ["status", "--json", "--", "telegram"], ["status", "--json", "--", "telegram"]],

@@ -1174,6 +1174,7 @@ export default class Sdk extends Command {
 					agentDir: stringFlag("agent-dir"),
 					repo: stringFlag("repo"),
 					scope: stringFlag("scope"),
+					json: flags.json === true,
 				});
 				return;
 			}
