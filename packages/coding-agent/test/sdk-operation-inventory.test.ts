@@ -41,7 +41,7 @@ afterEach(async () => {
 describe("SDK operation inventory", () => {
 	it("has complete typed operation and adapter coverage", () => {
 		expect(OPERATIONS.filter(operation => operation.kind === "control")).toHaveLength(53);
-		expect(OPERATIONS.filter(operation => operation.kind === "global")).toHaveLength(9);
+		expect(OPERATIONS.filter(operation => operation.kind === "global")).toHaveLength(10);
 		expect(OPERATIONS.filter(operation => operation.kind === "query")).toHaveLength(30);
 		expect(OPERATIONS.filter(operation => operation.kind === "reverse")).toHaveLength(6);
 		for (const operation of OPERATIONS) {
@@ -71,6 +71,18 @@ describe("SDK operation inventory", () => {
 			},
 		});
 		expect(findOperation("global", "session.spawn")).toMatchObject({ id: "G09", sdkId: "session.spawn" });
+		expect(findOperation("global", "session.lookup")).toMatchObject({
+			id: "G10",
+			sdkId: "session.lookup",
+			adapterDispositions: {
+				telegram: "prohibited",
+				discord: "prohibited",
+				slack: "prohibited",
+				mcp: "prohibited",
+				acp: "prohibited",
+				daemonCli: "generic_safe",
+			},
+		});
 		for (const id of ["C39", "C40"])
 			expect(OPERATIONS.find(operation => operation.id === id)?.adapterDispositions).toEqual({
 				telegram: "prohibited",

@@ -1116,6 +1116,24 @@
 		]
 	},
 	{
+		"sourceId": "registry:G10",
+		"sourceFile": "packages/coding-agent/src/sdk/protocol/operation-registry.ts",
+		"sourceKind": "registry",
+		"decision": "include",
+		"sdkId": "session.lookup",
+		"adapterMappings": {
+			"telegram": "prohibited",
+			"discord": "prohibited",
+			"slack": "prohibited",
+			"mcp": "prohibited",
+			"acp": "prohibited",
+			"daemonCli": "generic_safe"
+		},
+		"testIds": [
+			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
+		]
+	},
+	{
 		"sourceId": "registry:Q01",
 		"sourceFile": "packages/coding-agent/src/sdk/protocol/operation-registry.ts",
 		"sourceKind": "registry",

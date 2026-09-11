@@ -16,6 +16,7 @@ The SDK exposes a generic action/reply protocol without requiring integrations t
 External and managed integrations attach through SDK-core surfaces only:
 
 - lifecycle mutations use `SessionLifecycleService` and the Broker lifecycle ledger;
+- read-only uncertain-create reconciliation uses the public `session.lookup` lifecycle operation with the original request key and target;
 - live session controls use opaque `SessionAttachment` capabilities issued by `SessionRouter`;
 - endpoint URL/token discovery, raw WebSocket relays, and `gjc sdk serve` are not public attachment mechanisms;
 - lifecycle-equivalent per-session controls are prohibited on Telegram, Discord, Slack, ACP, MCP, and daemon CLI adapters.

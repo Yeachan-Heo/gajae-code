@@ -137,6 +137,7 @@ const globals = [
 	["session.delete", "Delete a saved session."],
 	["session.reconcile_uncertain", "Retire an indexed terminalUncertain create effect after dead-host proof."],
 	["session.spawn", "Spawn a task-seeded background child session (local interactive master only)."],
+	["session.lookup", "Read a prior session.create outcome without replaying it."],
 ] as const;
 
 const queries = [
@@ -341,9 +342,11 @@ export const OPERATIONS: readonly Operation[] = [
 			errorCodes:
 				id === "G02"
 					? ["endpoint_credential_forbidden"]
-					: ["G03", "G04", "G05"].includes(id)
-						? ["invalid_request", "unknown_model_profile", "model_profile_registry_error"]
-						: ["invalid_request"],
+					: id === "G10"
+						? ["invalid_input", "not_found", "idempotency_conflict", "lifecycle_pending", "terminal_uncertain"]
+						: ["G03", "G04", "G05"].includes(id)
+							? ["invalid_request", "unknown_model_profile", "model_profile_registry_error"]
+							: ["invalid_request"],
 			adapterDispositions:
 				id === "G02"
 					? dispositions({
@@ -354,18 +357,27 @@ export const OPERATIONS: readonly Operation[] = [
 							acp: "machine_only",
 							daemonCli: "machine_only",
 						})
-					: id === "G09"
+					: id === "G10"
 						? dispositions({
 								telegram: "prohibited",
 								discord: "prohibited",
 								slack: "prohibited",
 								mcp: "prohibited",
 								acp: "prohibited",
-								daemonCli: "prohibited",
+								daemonCli: "generic_safe",
 							})
-						: ["G03", "G04", "G05", "G06", "G07", "G08"].includes(id)
-							? dispositions({ telegram: "prohibited", discord: "prohibited", slack: "prohibited" })
-							: dispositions(),
+						: id === "G09"
+							? dispositions({
+									telegram: "prohibited",
+									discord: "prohibited",
+									slack: "prohibited",
+									mcp: "prohibited",
+									acp: "prohibited",
+									daemonCli: "prohibited",
+								})
+							: ["G03", "G04", "G05", "G06", "G07", "G08"].includes(id)
+								? dispositions({ telegram: "prohibited", discord: "prohibited", slack: "prohibited" })
+								: dispositions(),
 			testIds: ["packages/coding-agent/test/sdk-operation-inventory.test.ts"],
 		};
 	}),

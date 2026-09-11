@@ -86,6 +86,7 @@ export interface SdkSessionCliArgs {
 	strict?: boolean;
 	untilIdle?: boolean;
 	allEvents?: boolean;
+	page?: boolean;
 	repo?: string;
 	scope?: string;
 	limit?: number;
@@ -95,7 +96,7 @@ export interface SdkSessionCliArgs {
 }
 
 type JsonRecord = Record<string, unknown>;
-type LifecycleMutationOperation = Exclude<SessionLifecycleOperation, "session.list">;
+type LifecycleMutationOperation = Exclude<SessionLifecycleOperation, "session.lookup" | "session.list">;
 type TailExitReason = "idle" | "close";
 export interface RetainedTranscriptTailReader {
 	readonly size: number;
@@ -364,6 +365,36 @@ async function paginatedSessionList(
 		const result = { ...aggregate, sessions };
 		const firstResponse = pages[0]?.response;
 		return firstResponse && Object.hasOwn(firstResponse, "result") ? { ...firstResponse, result } : result;
+	} catch (error) {
+		if (error instanceof SessionListTraversalError) throw new SdkClientError("protocol_error", error.message);
+		throw error;
+	}
+}
+
+async function singleSessionListPage(
+	router: SessionRouter,
+	input: JsonRecord = {},
+	requestKey = `${SDK_SESSION_CLI_LIFECYCLE_ACTOR.namespace}:session.list:${randomBytes(12).toString("hex")}`,
+): Promise<unknown> {
+	try {
+		const cursor = typeof input.cursor === "string" ? input.cursor : "initial";
+		const response = object(await router.listBrokerSessions(input, `${requestKey}:${cursor}`));
+		if (response?.ok === false) {
+			const failure = object(response.error);
+			throw new SdkClientError(
+				typeof failure?.code === "string" ? failure.code : "broker_error",
+				typeof failure?.message === "string" ? failure.message : "session.list failed",
+			);
+		}
+		const page = sessionListPageFromResponse(response);
+		const continuationCursor = page?.continuationCursor;
+		if (
+			!page ||
+			(continuationCursor !== undefined &&
+				(typeof continuationCursor !== "string" || continuationCursor.length === 0))
+		)
+			throw new SessionListTraversalError("malformed_page");
+		return response;
 	} catch (error) {
 		if (error instanceof SessionListTraversalError) throw new SdkClientError("protocol_error", error.message);
 		throw error;
@@ -1753,9 +1784,38 @@ async function runRawGlobal(
 	input: JsonRecord,
 	args: SdkSessionCliArgs,
 ): Promise<unknown> {
+	if (args.page && operation !== "session.list")
+		throw new SdkSessionCliError("usage", "--page is only available for raw global session.list.", 2);
 	if (operation === "session.list") {
 		await ensureBroker({ agentDir });
-		return await withRouter(agentDir, async router => await paginatedSessionList(router, input));
+		const pageInput = { ...input };
+		if (args.cursor !== undefined) {
+			if (pageInput.cursor !== undefined && pageInput.cursor !== args.cursor)
+				throw new SdkSessionCliError("usage", "--cursor must match the cursor in --json-input.", 2);
+			pageInput.cursor = args.cursor;
+		}
+		if (args.limit !== undefined) {
+			if (pageInput.limit !== undefined && pageInput.limit !== args.limit)
+				throw new SdkSessionCliError("usage", "--limit must match the limit in --json-input.", 2);
+			pageInput.limit = args.limit;
+		}
+		return await withRouter(
+			agentDir,
+			async router =>
+				await (args.page ? singleSessionListPage(router, pageInput) : paginatedSessionList(router, pageInput)),
+		);
+	}
+	if (operation === "session.lookup") {
+		if (!args.idempotencyKey)
+			throw new SdkSessionCliError("invalid_input", "--idempotency-key is required for session lookup.", 2);
+		const lifecycle = createBrokerSessionLifecycleService(agentDir);
+		return await lifecycle.lookup({
+			actor: SDK_SESSION_CLI_LIFECYCLE_ACTOR,
+			capability: "session.lookup",
+			operation: "session.create",
+			requestKey: args.idempotencyKey,
+			target: input,
+		});
 	}
 	if (!isLifecycleOperation(operation))
 		throw new SdkSessionCliError("unknown_operation", `Unknown global operation: ${operation}`, 1);
@@ -1884,7 +1944,9 @@ export async function runSdkSessionCli(
 		const secretError = validateAdapterSecretFields(operation, input);
 		if (secretError) throw new SdkSessionCliError(secretError.code, secretError.message, 2);
 		if (kind === "global") {
-			writeOutput(stripSecretFields(await runRawGlobal(agentDir, operation, input, args)));
+			const result = await runRawGlobal(agentDir, operation, input, args);
+			writeOutput(stripSecretFields(result));
+			if (isRecord(result) && result.ok === false) setExitCode(1);
 			return;
 		}
 		const sessionId = requireValue(args.sessionId, "<sessionId>");

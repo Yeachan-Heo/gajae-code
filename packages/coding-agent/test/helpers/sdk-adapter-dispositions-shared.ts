@@ -176,6 +176,10 @@ export function expectGlobalSemanticResult(operation: Operation, result: unknown
 		expect(result).toMatchObject({ ok: false, error: { code: expect.stringMatching(/^invalid_(input|request)$/) } });
 		return;
 	}
+	if (operation.sdkId === "session.lookup") {
+		expect(result).toMatchObject({ ok: false, operation: "session.lookup", status: "not_found" });
+		return;
+	}
 	const code = expectedGlobalErrors[operation.sdkId];
 	if (code) expect(result).toMatchObject({ ok: false, error: { code } });
 	else expect(result).toMatchObject({ ok: true });

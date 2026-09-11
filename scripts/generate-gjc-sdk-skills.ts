@@ -28,7 +28,7 @@ export const ALLOWED_CONTROLS = [
 	"session.rename",
 ] as const;
 
-export const ALLOWED_GLOBALS = ["session.create", "session.fork", "session.resume", "session.close"] as const;
+export const ALLOWED_GLOBALS = ["session.create", "session.fork", "session.resume", "session.close", "session.lookup"] as const;
 
 // The three skill prompts are authored as static Markdown sources under
 // scripts/gjc-sdk-skills/prompts/ and are imported verbatim. They are the

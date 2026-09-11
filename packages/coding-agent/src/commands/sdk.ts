@@ -872,7 +872,7 @@ class SdkSessionHelp extends Command {
 			description:
 				"session list scope: repo (default), cwd, worktree, or all; search scope: repo (default), pwd, or global",
 		}),
-		limit: Flags.integer({ description: "Search page size from 1 to 100" }),
+		limit: Flags.integer({ description: "Search or raw session.list page size from 1 to 100" }),
 		json: Flags.boolean({ description: "Render search as the SdkSearchResultV1 JSON envelope" }),
 		text: Flags.string({ description: "Prompt text for send (alternative to --json-input)" }),
 		"op-ref": Flags.string({ description: "Operation reference for send (defaults to a generated ULID)" }),
@@ -883,6 +883,7 @@ class SdkSessionHelp extends Command {
 		strict: Flags.boolean({ description: "tail --strict: fail closed on retention gaps" }),
 		"until-idle": Flags.boolean({ description: "tail --until-idle: exit after an observed terminal turn state" }),
 		"all-events": Flags.boolean({ description: "tail --all-events: include every event-ring kind" }),
+		page: Flags.boolean({ description: "raw global session.list: return exactly one broker page" }),
 	};
 	async run(): Promise<void> {}
 }
@@ -983,6 +984,8 @@ class SdkSessionCommand extends Command {
 			strict: Boolean(flagRec.strict),
 			untilIdle: Boolean(flagRec["until-idle"]),
 			allEvents: Boolean(flagRec["all-events"]),
+			page: Boolean(flagRec.page),
+			limit: flagRec.limit as number | undefined,
 			agentDir: flagRec["agent-dir"] as string | undefined,
 			repo: flagRec.repo as string | undefined,
 			scope: flagRec.scope as string | undefined,
