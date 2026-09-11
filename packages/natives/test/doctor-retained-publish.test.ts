@@ -4,7 +4,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 
-import { exactReplaceRetained } from "../native/index.js";
+import { exactReplaceRetained, type NativeExactFileIdentity } from "../native/index.js";
 
 /**
  * Coverage for `exactReplaceRetained` (D4 self-replacement primitive).
@@ -41,7 +41,7 @@ afterEach(async () => {
 	);
 });
 
-async function identityOf(pathname: string, contents: string): Promise<Record<string, unknown>> {
+async function identityOf(pathname: string, contents: string): Promise<NativeExactFileIdentity> {
 	const stat = await fs.stat(pathname, { bigint: true });
 	const parent = await fs.stat(path.dirname(pathname), { bigint: true });
 	return {
@@ -54,6 +54,11 @@ async function identityOf(pathname: string, contents: string): Promise<Record<st
 		mtimeNs: stat.mtimeNs,
 		sha256: sha256(contents),
 	};
+}
+
+function expectCodeIn(result: { code?: string }, codes: readonly string[]): void {
+	if (typeof result.code !== "string") throw new Error("native result did not include a failure code");
+	expect(codes).toContain(result.code);
 }
 
 describe("exactReplaceRetained", () => {
@@ -138,7 +143,7 @@ describe("exactReplaceRetained", () => {
 		const result = exactReplaceRetained(source, destination, "app.bin.backup", poisonedSource, expectedDestination);
 
 		expect(result.ok).toBe(false);
-		expect(["parent_mismatch", "identity_mismatch"]).toContain(result.code);
+		expectCodeIn(result, ["parent_mismatch", "identity_mismatch"]);
 		expect(await fs.readFile(destination, "utf8")).toBe("old-payload");
 		expect(await fs.readFile(source, "utf8")).toBe("new-payload");
 	});
@@ -180,7 +185,7 @@ describe("exactReplaceRetained", () => {
 		const result = exactReplaceRetained(source, destination, "app.bin.backup", expectedSource, expectedDestination);
 
 		expect(result.ok).toBe(false);
-		expect(["hard_link_unsupported", "invalid_request", "identity_mismatch"]).toContain(result.code);
+		expectCodeIn(result, ["hard_link_unsupported", "invalid_request", "identity_mismatch"]);
 		expect(await fs.readFile(source, "utf8")).toBe("new-payload");
 		expect(await fs.readFile(sourceAlias, "utf8")).toBe("new-payload");
 		expect(await fs.readFile(destination, "utf8")).toBe("old-payload");
@@ -200,7 +205,7 @@ describe("exactReplaceRetained", () => {
 		const result = exactReplaceRetained(source, destination, "app.bin.backup", expectedSource, expectedDestination);
 
 		expect(result.ok).toBe(false);
-		expect(["hard_link_unsupported", "invalid_request", "identity_mismatch"]).toContain(result.code);
+		expectCodeIn(result, ["hard_link_unsupported", "invalid_request", "identity_mismatch"]);
 		expect(await fs.readFile(source, "utf8")).toBe("new-payload");
 		expect(await fs.readFile(destination, "utf8")).toBe("old-payload");
 		expect(await fs.readFile(destinationAlias, "utf8")).toBe("old-payload");
@@ -231,7 +236,7 @@ describe("exactReplaceRetained", () => {
 		const result = exactReplaceRetained(source, destination, "app.bin.backup", expectedSource, expectedDestination);
 
 		expect(result.ok).toBe(false);
-		expect(["reparse_point", "identity_mismatch"]).toContain(result.code);
+		expectCodeIn(result, ["reparse_point", "identity_mismatch"]);
 		expect(await fs.readFile(outside, "utf8")).toBe("outside-payload");
 		expect(await fs.readFile(destination, "utf8")).toBe("old-payload");
 	});
@@ -261,7 +266,7 @@ describe("exactReplaceRetained", () => {
 		const result = exactReplaceRetained(source, destination, "app.bin.backup", expectedSource, expectedDestination);
 
 		expect(result.ok).toBe(false);
-		expect(["reparse_point", "identity_mismatch"]).toContain(result.code);
+		expectCodeIn(result, ["reparse_point", "identity_mismatch"]);
 		expect(await fs.readFile(outside, "utf8")).toBe("outside-old-payload");
 		expect(await fs.readFile(source, "utf8")).toBe("new-payload");
 	});
