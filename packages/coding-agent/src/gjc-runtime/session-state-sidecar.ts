@@ -1091,6 +1091,11 @@ function parsePreviousPayload(raw: string): Record<string, unknown> {
 	if (!validPreviousRuntimeStateShape(payload)) throw new PreviousRuntimeStateReadError();
 	// Structural validation above bounds every interpolated value to a known state
 	// or boolean; never include arbitrary marker contents in a terminal diagnostic.
+	if (payload.state === "completed" && payload.ready_for_input === true) {
+		// Before #4351, completed markers could retain the readiness bit. Normalize
+		// only that legacy shape; all other lifecycle contradictions remain errors.
+		payload.ready_for_input = false;
+	}
 	if (payload.ready_for_input !== undefined) {
 		const expectedReady = payload.state === "ready_for_input";
 		if (payload.ready_for_input !== expectedReady)
