@@ -38,6 +38,7 @@
 		"generate-models": "bun scripts/generate-models.ts"
 	},
 	"dependencies": {
+		"@agentclientprotocol/sdk": "catalog:",
 		"@anthropic-ai/sdk": "catalog:",
 		"@bufbuild/protobuf": "catalog:",
 		"@gajae-code/natives": "catalog:",

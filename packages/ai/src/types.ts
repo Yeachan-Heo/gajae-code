@@ -34,6 +34,7 @@ import type {
 	WriteArgs,
 	WriteResult,
 } from "./providers/cursor/gen/agent_pb";
+import type { DevinAcpConfig, DevinAcpOptions } from "./providers/devin-acp";
 import type { GoogleOptions } from "./providers/google";
 import type { GoogleGeminiCliOptions } from "./providers/google-gemini-cli";
 import type { GoogleVertexOptions } from "./providers/google-vertex";
@@ -60,6 +61,7 @@ export type KnownApi =
 	| "google-vertex"
 	| "ollama-chat"
 	| "cursor-agent"
+	| "devin-acp"
 	| "kiro-codewhisperer-stream";
 export type Api = KnownApi | (string & {});
 export interface ApiOptionsMap {
@@ -74,6 +76,7 @@ export interface ApiOptionsMap {
 	"google-vertex": GoogleVertexOptions;
 	"ollama-chat": OllamaChatOptions;
 	"cursor-agent": CursorOptions;
+	"devin-acp": DevinAcpOptions;
 	"kiro-codewhisperer-stream": KiroCodeWhispererOptions;
 }
 // Compile-time exhaustiveness check - this will fail if ApiOptionsMap doesn't have all KnownApi keys
@@ -153,6 +156,7 @@ export const KNOWN_PROVIDERS = [
 	"fugu",
 	"gitlab-duo",
 	"cursor",
+	"devin",
 	"jetbrains-junie",
 	"deepseek",
 	"deepinfra",
@@ -456,6 +460,13 @@ export interface StreamOptions {
 	 */
 	providerSessionState?: Map<string, ProviderSessionState>;
 	/**
+	 * Set by GJC for internal maintenance/one-shot work (context compaction,
+	 * handoff and branch summaries, utility generations) rather than an
+	 * interactive user turn. Agent-level providers use it to refuse requests they
+	 * cannot serve instead of forwarding them to a billed upstream agent.
+	 */
+	maintenanceCall?: boolean;
+	/**
 	 * Optional callback for inspecting or replacing provider payloads before sending.
 	 * Return undefined to keep the payload unchanged.
 	 * The `scope` parameter carries the per-attempt identity for execution attribution.
@@ -520,6 +531,12 @@ export interface StreamOptions {
 	authCredentialType?: "api_key" | "oauth";
 	/** Cursor exec/MCP tool handlers (cursor-agent only). */
 	execHandlers?: CursorExecHandlers;
+	/**
+	 * Devin CLI ACP provider configuration (devin-acp only). When absent, the
+	 * provider spawns `devin acp` from PATH (or `GJC_DEVIN_CLI_PATH`) in the
+	 * current working directory and applies the default permission policy.
+	 */
+	devinAcp?: DevinAcpConfig;
 	/** Per-attempt identity for execution attribution. Threaded into onPayload/onResponse calls. */
 	attemptScope?: AttemptScopeRef;
 }

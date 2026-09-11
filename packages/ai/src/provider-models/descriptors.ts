@@ -53,6 +53,7 @@ import {
 } from "./openai-compat";
 import {
 	cursorModelManagerOptions,
+	devinModelManagerOptions,
 	glmZcodeModelManagerOptions,
 	jetbrainsJunieModelManagerOptions,
 	kiroModelManagerOptions,
@@ -364,6 +365,12 @@ export const PROVIDER_DESCRIPTORS: readonly ProviderDescriptor[] = [
 		catalog("GLM ZCode (unofficial)", ["GLM_ZCODE_API_KEY"], { oauthProvider: "glm-zcode" }),
 	),
 	descriptor("jetbrains-junie", "claude-sonnet-4-6", config => jetbrainsJunieModelManagerOptions(config)),
+	// `adaptive` is Devin's documented recommended default (docs.devin.ai/cli/adaptive).
+	// Enterprise organizations may disable it; the account's real model list comes from
+	// the ACP session's model config option.
+	descriptor("devin", "adaptive", () => devinModelManagerOptions(), {
+		allowUnauthenticated: true,
+	}),
 	descriptor("github-copilot", "gpt-4o", config => githubCopilotModelManagerOptions(config)),
 	descriptor("google", "gemini-2.5-pro", config => googleModelManagerOptions(config)),
 	catalogDescriptor(

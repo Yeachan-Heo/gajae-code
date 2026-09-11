@@ -34,6 +34,7 @@
         "pi-ai": "./src/cli.ts",
       },
       "dependencies": {
+        "@agentclientprotocol/sdk": "catalog:",
         "@anthropic-ai/sdk": "catalog:",
         "@bufbuild/protobuf": "catalog:",
         "@gajae-code/natives": "catalog:",

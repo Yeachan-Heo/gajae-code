@@ -39,6 +39,7 @@ import {
 	readAwsStaticEnvironmentCredentials,
 } from "./providers/aws-credential-config";
 import type { CursorOptions } from "./providers/cursor";
+import type { DevinAcpOptions } from "./providers/devin-acp";
 import type { GoogleOptions } from "./providers/google";
 import type { GoogleGeminiCliOptions } from "./providers/google-gemini-cli";
 import type { GoogleVertexOptions } from "./providers/google-vertex";
@@ -54,6 +55,7 @@ import {
 	streamAzureOpenAIResponses,
 	streamBedrock,
 	streamCursor,
+	streamDevinAcp,
 	streamGoogle,
 	streamGoogleGeminiCli,
 	streamGoogleVertex,
@@ -398,6 +400,9 @@ export function stream<TApi extends Api>(
 			(options || {}) as KiroCodeWhispererOptions,
 			onStreamCreated,
 		);
+	} else if (model.api === "devin-acp") {
+		// Devin authenticates through its own CLI, so there is no GJC API key to resolve.
+		return streamDevinAcp(model as Model<"devin-acp">, context, (options || {}) as DevinAcpOptions, onStreamCreated);
 	}
 
 	const apiKey = options?.apiKey || (model.provider === "opencodex" ? "local" : getEnvApiKey(model.provider));
@@ -952,6 +957,7 @@ function mapOptionsForApi<TApi extends Api>(
 		cacheRetention: options?.cacheRetention ?? model.cacheRetention,
 		headers: options?.headers,
 		initiatorOverride: options?.initiatorOverride,
+		maintenanceCall: options?.maintenanceCall,
 		maxRetryDelayMs: options?.maxRetryDelayMs,
 		requestMaxRetries: options?.fallbackManaged ? 0 : options?.requestMaxRetries,
 		streamMaxRetries: options?.fallbackManaged ? 0 : options?.streamMaxRetries,
@@ -959,6 +965,7 @@ function mapOptionsForApi<TApi extends Api>(
 		sessionId: options?.sessionId,
 		providerSessionId: options?.providerSessionId,
 		providerSessionState: options?.providerSessionState,
+		devinAcp: options?.devinAcp,
 		onPayload: options?.onPayload,
 		onResponse: options?.onResponse,
 		onStreamCreated: options?.onStreamCreated,
@@ -1266,6 +1273,11 @@ function mapOptionsForApi<TApi extends Api>(
 				onToolResult,
 			});
 		}
+
+		case "devin-acp":
+			return castApi<"devin-acp">({
+				...base,
+			});
 
 		case "kiro-codewhisperer-stream":
 			return castApi<"kiro-codewhisperer-stream">({

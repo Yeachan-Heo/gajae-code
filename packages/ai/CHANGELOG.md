@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Devin CLI is now a first-class provider (`devin`, api `devin-acp`). Devin publishes no model-inference endpoint, so GJC speaks its documented programmatic surface instead: it spawns `devin acp` and drives the Agent Client Protocol over stdio. Devin owns model selection (discovered from the account's ACP session `model` config option), tool execution, conversation history, and usage; GJC renders Devin's tool calls read-only and always ends the turn with a normal stop so they are never re-executed, forwards cancellation as ACP `session/cancel`, and answers Devin's permission requests from `GJC_DEVIN_PERMISSION_MODE` (`allow` grants `allow_once`, never `allow_always`; `deny` rejects; invalid values fail closed). Maintenance and utility calls that need a text model — compaction, handoff, branch summaries, session titles — are refused instead of being spent on a Devin agent turn; `StreamOptions.maintenanceCall` marks them. See `docs/devin-provider.md`.
+
 ### Fixed
 
 - The image generation role can select OpenAI's current GPT Image models. `gpt-image-2.5-sunburst` (editing precision) and `gpt-image-2.5-flare` (fast everyday generation) now ship in the bundled catalog under both `openai` and `openai-codex` with the same image-only, zero-cost, 128k-context/16k-max-token shape as `gpt-image-2`, so a provider-qualified `modelRoles.image: openai-codex/gpt-image-2.5-sunburst` selector resolves instead of failing with `No image model configured` (#5478).
