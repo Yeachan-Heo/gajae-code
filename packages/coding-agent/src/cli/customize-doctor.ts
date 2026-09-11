@@ -968,7 +968,7 @@ async function collectExtensions(cwd: string, activeSettings: SettingsInstance):
 			"Trusted filesystem extension module discovered for session-start loading. Doctor does not execute the module, so its runtime input handlers, tools, commands, and flags remain opaque until a session loads it.",
 		notExecutedRemediation: [
 			"Review the trusted extension source before session startup",
-			"Disable it with the disabledExtensions setting, or set disableExtensionDiscovery in the SDK",
+			"Disable one module with gjc config set disabledExtensions '[\"extension-module:<name>\"]', or set disableExtensionDiscovery in the SDK",
 		],
 	});
 }

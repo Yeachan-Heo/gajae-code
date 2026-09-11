@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { clearCache } from "@gajae-code/coding-agent/capability/fs";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
+import { type LoadExtensionsResult, loadExtensions } from "@gajae-code/coding-agent/extensibility/extensions";
 import { createAgentSession } from "@gajae-code/coding-agent/sdk";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { resetAgentDirFromEnvironment } from "@gajae-code/utils";
@@ -81,6 +82,7 @@ describe("issue #5497: session startup loads filesystem extension modules", () =
 		disableExtensionDiscovery?: boolean;
 		additionalExtensionPaths?: string[];
 		settingsOverrides?: Parameters<typeof Settings.isolated>[0];
+		preloadedExtensions?: LoadExtensionsResult;
 	}) =>
 		await createAgentSession({
 			cwd: tempDir,
@@ -89,6 +91,7 @@ describe("issue #5497: session startup loads filesystem extension modules", () =
 			settings: Settings.isolated(options.settingsOverrides ?? {}),
 			disableExtensionDiscovery: options.disableExtensionDiscovery,
 			additionalExtensionPaths: options.additionalExtensionPaths,
+			preloadedExtensions: options.preloadedExtensions,
 			skills: [],
 			contextFiles: [],
 			promptTemplates: [],
@@ -232,6 +235,115 @@ describe("issue #5497: session startup loads filesystem extension modules", () =
 		try {
 			const loaded = extensionsResult.extensions.filter(extension => extension.resolvedPath === entry);
 			expect(loaded).toHaveLength(1);
+		} finally {
+			await session.dispose();
+		}
+	}, 30_000);
+
+	it("skips discovery when a complete preloaded result is supplied", async () => {
+		const discoveredEntry = installProbe();
+		const explicitDir = path.join(tempDir, "preloaded", PROBE_NAME);
+		fs.mkdirSync(explicitDir, { recursive: true });
+		const preloadedEntry = path.join(explicitDir, "index.ts");
+		fs.writeFileSync(preloadedEntry, PROBE_MODULE);
+		const preloaded: LoadExtensionsResult = await loadExtensions([preloadedEntry], tempDir);
+
+		const { session, extensionsResult } = await createSession({ preloadedExtensions: preloaded });
+		try {
+			const loadedPaths = extensionsResult.extensions.map(extension => extension.resolvedPath);
+			expect(loadedPaths).toContain(preloadedEntry);
+			expect(loadedPaths).not.toContain(discoveredEntry);
+		} finally {
+			await session.dispose();
+		}
+	}, 30_000);
+
+	it("records an unreadable configured path without dropping discovered modules", async () => {
+		const entry = installProbe();
+		const { session, extensionsResult } = await createSession({ additionalExtensionPaths: ["\u0000nul-path"] });
+
+		try {
+			expect(extensionsResult.extensions.map(extension => extension.resolvedPath)).toContain(entry);
+			expect(extensionsResult.errors.some(error => error.path.includes("nul-path"))).toBe(true);
+		} finally {
+			await session.dispose();
+		}
+	}, 30_000);
+
+	it("degrades to explicit paths when a configured entry is structurally invalid", async () => {
+		// A non-string entry throws out of path resolution, which aborts discovery;
+		// the session must still be created with the explicit path loaded and the
+		// failure observable in `errors`.
+		const explicitDir = path.join(tempDir, "explicit", PROBE_NAME);
+		fs.mkdirSync(explicitDir, { recursive: true });
+		const entry = path.join(explicitDir, "index.ts");
+		fs.writeFileSync(entry, PROBE_MODULE);
+
+		const { session, extensionsResult } = await createSession({
+			additionalExtensionPaths: [42 as unknown as string, entry],
+		});
+		try {
+			expect(extensionsResult.extensions.map(extension => extension.resolvedPath)).toContain(entry);
+			expect(extensionsResult.errors.some(error => error.error.includes("Failed to resolve extension path"))).toBe(
+				true,
+			);
+			await expect(session.extensionRunner?.emitInput("ooo status", undefined, "interactive")).resolves.toEqual({
+				handled: true,
+				text: HANDLED_TEXT,
+			});
+		} finally {
+			await session.dispose();
+		}
+	}, 30_000);
+
+	it("keeps the session usable when a discovered module throws a hostile value", async () => {
+		// A thrown value whose `toString` also throws must be reported per module:
+		// stringifying the failure is itself a failure source, and it must not abort
+		// the modules that load fine beside it.
+		const hostileDir = path.join(sessionAgentDir, "extensions", "aaa-hostile");
+		fs.mkdirSync(hostileDir, { recursive: true });
+		const hostileEntry = path.join(hostileDir, "index.ts");
+		fs.writeFileSync(
+			hostileEntry,
+			'throw { toString() { throw { toString() { throw new Error("nested hostile"); } }; } };\n',
+		);
+		const entry = installProbe();
+
+		const { session, extensionsResult } = await createSession({});
+		try {
+			const hostileError = extensionsResult.errors.find(error => error.path === hostileEntry);
+			expect(hostileError?.error).toContain("<unprintable error>");
+			expect(extensionsResult.extensions.map(extension => extension.resolvedPath)).toContain(entry);
+			await expect(session.extensionRunner?.emitInput("ooo status", undefined, "interactive")).resolves.toEqual({
+				handled: true,
+				text: HANDLED_TEXT,
+			});
+		} finally {
+			await session.dispose();
+		}
+	}, 30_000);
+
+	it("records a pathological configured directory without dropping discovered modules", async () => {
+		// A configured directory whose `index.ts` is a symlink loop (ELOOP) is recorded
+		// at its own path while the modules every other source contributes still load
+		// and the session stays usable.
+		const loopDir = path.join(tempDir, "loop");
+		fs.mkdirSync(loopDir, { recursive: true });
+		fs.symlinkSync(path.join(loopDir, "index.ts"), path.join(loopDir, "index.ts"));
+		const entry = installProbe();
+
+		const { session, extensionsResult } = await createSession({
+			settingsOverrides: { extensions: [loopDir] },
+		});
+		try {
+			// The pathological configured directory is recorded, and the canonical
+			// discovered module still loads: one bad directory must not drop the rest.
+			expect(extensionsResult.extensions.map(extension => extension.resolvedPath)).toContain(entry);
+			expect(extensionsResult.errors.some(error => error.path === loopDir)).toBe(true);
+			await expect(session.extensionRunner?.emitInput("ooo status", undefined, "interactive")).resolves.toEqual({
+				handled: true,
+				text: HANDLED_TEXT,
+			});
 		} finally {
 			await session.dispose();
 		}

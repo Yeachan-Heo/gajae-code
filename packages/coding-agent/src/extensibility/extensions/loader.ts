@@ -7,7 +7,7 @@ import * as path from "node:path";
 import type { ThinkingLevel } from "@gajae-code/agent-core";
 import type { ImageContent, Model, TextContent, Tool, UsageReport } from "@gajae-code/ai/core";
 import type { KeyId } from "@gajae-code/tui";
-import { hasFsCode, isEacces, isEnoent, logger } from "@gajae-code/utils";
+import { hasFsCode, isEacces, isEnoent, logger, safeErrorDescription } from "@gajae-code/utils";
 import * as Zod from "zod/v4";
 import { type ExtensionModule, extensionModuleCapability } from "../../capability/extension-module";
 import type { Settings } from "../../config/settings";
@@ -512,9 +512,9 @@ async function loadExtension(
 	eventBus: EventBus,
 	runtime: IExtensionRuntime,
 ): Promise<{ extension: Extension | null; error: string | null }> {
-	const resolvedPath = resolvePath(extensionPath, cwd);
 	let activation: ExtensionActivationScope | undefined;
 	try {
+		const resolvedPath = resolvePath(extensionPath, cwd);
 		const module = (await loadLegacyPiModule(resolvedPath)) as LoadedExtensionModule;
 		const factory = getExtensionFactory(module);
 
@@ -541,8 +541,7 @@ async function loadExtension(
 		return { extension, error: null };
 	} catch (err) {
 		activation?.rollback();
-		const message = err instanceof Error ? err.message : String(err);
-		return { extension: null, error: `Failed to load extension: ${message}` };
+		return { extension: null, error: `Failed to load extension: ${safeErrorDescription(err)}` };
 	}
 }
 
@@ -589,7 +588,7 @@ export async function loadExtensions(paths: string[], cwd: string, eventBus?: Ev
 		const { extension, error } = await loadExtension(extPath, cwd, resolvedEventBus, runtime);
 
 		if (error) {
-			errors.push({ path: extPath, error });
+			errors.push({ path: safeErrorDescription(extPath), error });
 			continue;
 		}
 
@@ -623,7 +622,7 @@ async function readExtensionManifest(packageJsonPath: string): Promise<Extension
 		if (isEnoent(error) || isEacces(error) || hasFsCode(error, "EPERM")) {
 			return null;
 		}
-		logger.warn("Failed to read extension manifest", { path: packageJsonPath, error: String(error) });
+		logger.warn("Failed to read extension manifest", { path: packageJsonPath, error: safeErrorDescription(error) });
 		return null;
 	}
 }
@@ -706,7 +705,7 @@ async function discoverExtensionsInDir(dir: string): Promise<string[]> {
 		entries = await fs.readdir(dir, { withFileTypes: true });
 	} catch (err) {
 		if (isEnoent(err)) return [];
-		logger.warn("Failed to discover extensions in directory", { path: dir, error: String(err) });
+		logger.warn("Failed to discover extensions in directory", { path: dir, error: safeErrorDescription(err) });
 		return [];
 	}
 	entries.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
@@ -764,6 +763,11 @@ export async function discoverAndLoadExtensions(
 	const allPaths: string[] = [];
 	const seen = new Set<string>();
 	const disabled = new Set(disabledExtensionIds);
+	// Environmental failures on a configured entry degrade to recorded errors instead
+	// of aborting the whole load, so one unreadable, unresolvable, or pathological
+	// entry — including a directory whose entries cannot be resolved — cannot drop
+	// every other extension the session would have loaded.
+	const discoveryErrors: Array<{ path: string; error: string }> = [];
 
 	const isDisabledName = (name: string): boolean => disabled.has(`extension-module:${name}`);
 
@@ -793,28 +797,61 @@ export async function discoverAndLoadExtensions(
 	}
 
 	// 2. Discover extension entry points from installed plugins
-	addPaths(await getAllPluginExtensionPaths(cwd));
+	try {
+		addPaths(await getAllPluginExtensionPaths(cwd));
+	} catch (error) {
+		discoveryErrors.push({
+			path: "<plugin-registry>",
+			error: `Failed to read plugin extension paths: ${safeErrorDescription(error)}`,
+		});
+		logger.warn("Failed to read plugin extension paths", { error: safeErrorDescription(error) });
+	}
 
 	// 3. Explicitly configured paths
 	for (const configuredPath of configuredPaths) {
-		const resolved = resolvePath(configuredPath, cwd);
+		let resolved: string;
+		try {
+			resolved = resolvePath(configuredPath, cwd);
+		} catch (error) {
+			discoveryErrors.push({
+				path: safeErrorDescription(configuredPath),
+				error: `Failed to resolve extension path: ${safeErrorDescription(error)}`,
+			});
+			continue;
+		}
 		let stat: fs1.Stats | null = null;
 		try {
 			stat = await fs.stat(resolved);
 		} catch (err) {
-			if (!isEnoent(err)) throw err;
+			if (!isEnoent(err)) {
+				discoveryErrors.push({
+					path: resolved,
+					error: `Failed to inspect extension path: ${safeErrorDescription(err)}`,
+				});
+				continue;
+			}
 		}
 
 		if (stat?.isDirectory()) {
-			const entries = await resolveExtensionEntries(resolved);
-			if (entries) {
-				addPaths(entries);
-				continue;
-			}
+			try {
+				const entries = await resolveExtensionEntries(resolved);
+				if (entries) {
+					addPaths(entries);
+					continue;
+				}
 
-			const discovered = await discoverExtensionsInDir(resolved);
-			if (discovered.length > 0) {
-				addPaths(discovered);
+				const discovered = await discoverExtensionsInDir(resolved);
+				if (discovered.length > 0) {
+					addPaths(discovered);
+				}
+			} catch (error) {
+				// Directory entry resolution rethrows non-ENOENT/EACCES/EPERM faults
+				// (ELOOP, ENAMETOOLONG, EIO). Record the offending directory and keep the
+				// modules every other source contributes instead of aborting the pass.
+				discoveryErrors.push({
+					path: resolved,
+					error: `Failed to inspect extension entries: ${safeErrorDescription(error)}`,
+				});
 			}
 			continue;
 		}
@@ -822,5 +859,6 @@ export async function discoverAndLoadExtensions(
 		addPath(resolved);
 	}
 
-	return loadExtensions(allPaths, cwd, eventBus);
+	const result = await loadExtensions(allPaths, cwd, eventBus);
+	return discoveryErrors.length === 0 ? result : { ...result, errors: [...discoveryErrors, ...result.errors] };
 }

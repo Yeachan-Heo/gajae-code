@@ -39,6 +39,7 @@ import {
 	postmortem,
 	prompt,
 	Snowflake,
+	safeErrorDescription,
 	setProjectDir,
 } from "@gajae-code/utils";
 import {
@@ -509,7 +510,9 @@ export interface CreateAgentSessionOptions {
 	/** Disable extension discovery (explicit paths still load). */
 	disableExtensionDiscovery?: boolean;
 	/**
-	 * Pre-loaded extensions (skips file discovery).
+	 * Pre-loaded extensions (skips file discovery). A COMPLETE result is required:
+	 * the session reuses its live `runtime`, so a partial result dereferences a
+	 * missing runtime instead of degrading.
 	 * @internal Used by CLI when extensions are loaded early to parse custom flags.
 	 */
 	preloadedExtensions?: LoadExtensionsResult;
@@ -1272,28 +1275,6 @@ class McpManagerCleanupDiagnosticError extends Error {
 		this.name = "McpManagerCleanupDiagnosticError";
 		this.primaryError = primaryError;
 		this.cleanupDiagnostic = { code: "MCP_MANAGER_CLEANUP_FAILED", cause: cleanupError };
-	}
-}
-
-function safeErrorDescription(value: unknown): string {
-	let isError = false;
-	try {
-		isError = value instanceof Error;
-	} catch {
-		// Hostile proxies can throw from getPrototypeOf during instanceof.
-	}
-	if (isError) {
-		try {
-			const message = (value as { message?: unknown }).message;
-			if (typeof message === "string") return message;
-		} catch {
-			// Hostile error getters must not replace the primary failure.
-		}
-	}
-	try {
-		return String(value);
-	} catch {
-		return "<unprintable error>";
 	}
 }
 
@@ -3623,7 +3604,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		// suppresses discovery entirely.
 		const explicitExtensionPaths = options.additionalExtensionPaths ?? [];
 		// Discovery must never block session creation: a filesystem or plugin-registry
-		// failure degrades to the explicit paths and then to no extensions at all.
+		// failure degrades to the explicit paths and then to no extensions at all, and
+		// the failure stays observable in `extensionsResult.errors`.
 		const loadStartupExtensions = async (): Promise<LoadExtensionsResult> => {
 			try {
 				return options.disableExtensionDiscovery
@@ -3636,15 +3618,24 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 							{ agentDir, profileAuthority, settings },
 						);
 			} catch (error) {
-				logger.warn("Failed to discover extension modules", { error: safeErrorForLog(error) });
+				logger.warn(
+					options.disableExtensionDiscovery
+						? "Failed to load extension modules"
+						: "Failed to discover extension modules",
+					{ error: safeErrorForLog(error) },
+				);
+				const failure = { path: "<extension-discovery>", error: safeErrorDescription(error) };
 				if (options.disableExtensionDiscovery) {
-					return { extensions: [], errors: [], runtime: new ExtensionRuntime() };
+					return { extensions: [], errors: [failure], runtime: new ExtensionRuntime() };
 				}
 				try {
-					return await loadExtensions(explicitExtensionPaths, cwd, eventBus);
+					const fallback = await loadExtensions(explicitExtensionPaths, cwd, eventBus);
+					return { ...fallback, errors: [failure, ...fallback.errors] };
 				} catch (fallbackError) {
+					// Last resort: `loadExtensions` does not throw for a bad module, so this
+					// rung guards its contract rather than a known input.
 					logger.warn("Failed to load explicit extension paths", { error: safeErrorForLog(fallbackError) });
-					return { extensions: [], errors: [], runtime: new ExtensionRuntime() };
+					return { extensions: [], errors: [failure], runtime: new ExtensionRuntime() };
 				}
 			}
 		};
