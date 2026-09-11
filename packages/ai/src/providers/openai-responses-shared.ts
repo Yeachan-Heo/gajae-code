@@ -973,7 +973,17 @@ export async function processResponsesStream<TApi extends Api>(
 			}
 			populateResponsesUsageFromResponse(output, response?.usage);
 			calculateCost(model, output.usage);
-			output.stopReason = mapOpenAIResponsesStopReason(response?.status);
+			// A `response.incomplete` frame is terminal because the response was cut
+			// short, so the event type itself proves truncation. Deriving `length`
+			// from the event rather than trusting `response.status` stops a relay that
+			// drops or rewrites the status from turning a truncated turn into a plain
+			// `stop`/`toolUse` that would dispatch a tool call carrying repaired
+			// partial arguments with no `incompleteArguments` flag.
+			const terminalStatus = response?.status;
+			output.stopReason =
+				event.type === "response.incomplete" && terminalStatus !== "failed" && terminalStatus !== "cancelled"
+					? "length"
+					: mapOpenAIResponsesStopReason(terminalStatus);
 			if (response?.status === "failed" || response?.status === "cancelled") {
 				const error = response?.error ?? (response as any)?.status_details?.error;
 				const details = response?.incomplete_details;
