@@ -472,6 +472,37 @@ const pendingDetachedLockCleanups = new WeakMap<
 	{ path: string; rootDev: string; rootIno: string; snapshot: NativeDirectoryTreeSnapshot }
 >();
 
+/**
+ * Complete a detached lock quarantine without the native exact-removal primitive.
+ * The tree was already retired through a handle-bound no-replace detach, so the
+ * parked root identity is re-verified immediately before the filesystem removes
+ * it; an identity mismatch leaves the quarantine untouched for a later attempt.
+ * Returns true when the quarantine is gone (or was already absent).
+ */
+async function removeDetachedLockQuarantineOnDisk(
+	detachedPath: string,
+	rootDev: string,
+	rootIno: string,
+): Promise<boolean> {
+	let current: BigIntStats;
+	try {
+		current = await fs.lstat(detachedPath, { bigint: true });
+	} catch (error) {
+		if (isEnoent(error)) return true;
+		throw error;
+	}
+	if (
+		!current.isDirectory() ||
+		current.isSymbolicLink() ||
+		current.dev.toString() !== rootDev ||
+		current.ino.toString() !== rootIno
+	) {
+		return false;
+	}
+	await fs.rm(detachedPath, { recursive: true, force: true });
+	return true;
+}
+
 async function finishDetachedLockCleanup(owner: FileLockOwnerToken): Promise<boolean> {
 	const pending = pendingDetachedLockCleanups.get(owner);
 	if (!pending) return false;
@@ -485,7 +516,10 @@ async function finishDetachedLockCleanup(owner: FileLockOwnerToken): Promise<boo
 		) {
 			throw new Error("Detached file lock cleanup identity changed; refusing removal");
 		}
-		if (process.platform === "win32") {
+		// The native replay only exists where the native exact-removal primitive is
+		// usable. A host whose minifilter rejects that primitive would otherwise never
+		// finish the quarantine its own fallback created, so finish on disk instead.
+		if (process.platform === "win32" && (await isNativeExactRemovalUsable())) {
 			const removal = nativeFileLockBindings().exactRemoveDirectoryTree(pending.path, pending.snapshot);
 			if (removal.code === "cleanup_pending") return false;
 			if (!removal.ok && removal.code !== "not_found")
@@ -949,8 +983,18 @@ async function removeVerifiedLockDirWithoutNative(
 		});
 		return (await finishDetachedLockCleanup(owner)) ? "removed" : "cleanup_failed";
 	}
-	const completed = nativeFileLockBindings().exactRemoveDirectoryTree(removal.detachedPath, expected);
-	return completed.ok || completed.code === "not_found" ? "removed" : "cleanup_failed";
+	// The native exact-removal primitive is unavailable by definition on this path.
+	// Replaying it here would recreate the very failure the fallback exists to avoid,
+	// so complete the parked tree with an identity-checked filesystem removal instead.
+	if (
+		removal.retainedSuccessorPath !== undefined ||
+		removal.retainedPlaceholderPath !== undefined ||
+		removal.retainedUnknownPath !== undefined
+	)
+		return "cleanup_failed";
+	return (await removeDetachedLockQuarantineOnDisk(removal.detachedPath, expected.rootDev, expected.rootIno))
+		? "removed"
+		: "cleanup_failed";
 }
 
 async function removeVerifiedOwnedLockDirWithoutNative(

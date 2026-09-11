@@ -4,6 +4,7 @@
 
 ### Fixed
 
+- `exact_remove_directory_tree` accepts a detach-only mode that renames the validated directory to its no-replace `.removing` quarantine and returns it as a handle-bound detach instead of deleting it, so a host whose filter rejects the exact-removal primitive can still retire a lock tree. The Windows detach-only branch derives its identity from the retained handle, so a directory's non-zero mtime and size match the object being retired instead of failing the detach closed (#5434).
 - Recheck full computer-use supervisor state between keys, and report keyboard-event creation failures while retaining pressed keys for cleanup before cursor restoration.
 
 ## [0.16.6] - 2026-09-07

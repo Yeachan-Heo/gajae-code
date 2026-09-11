@@ -958,6 +958,40 @@ describe("file lock cleanup failure handling (#2478)", () => {
 		expect(await fs.exists(lockDir)).toBe(false);
 	});
 
+	test("finishes a filter-hosted release with identity-checked disk cleanup", async () => {
+		const base = await makeTemp();
+		const lockedFile = path.join(base, "state.json");
+		const lockDir = `${lockedFile}.lock`;
+		const detached = `${lockDir}.removing`;
+		const realPlatform = Object.getOwnPropertyDescriptor(process, "platform");
+		let nativeReplayCalls = 0;
+		// A filter-hosted Windows host: the probe rejects the native exact-removal
+		// primitive, while the handle-bound detach-only quarantine still succeeds.
+		FileLockTestHooks.nativeExactRemovalProbe = () => false;
+		FileLockTestHooks.nativeQuarantineBindings = () => ({
+			snapshotDirectoryTree,
+			exactRemoveDirectoryTree: (target, _snapshot, _parent, detachOnly) => {
+				if (detachOnly) {
+					renameSync(target, `${target}.removing`);
+					return { ok: true, detachedPath: `${target}.removing` };
+				}
+				nativeReplayCalls++;
+				return { ok: false, code: "sharing_violation" };
+			},
+		});
+		Object.defineProperty(process, "platform", { configurable: true, value: "win32" });
+		try {
+			await expect(withFileLock(lockedFile, async () => undefined)).resolves.toBeUndefined();
+		} finally {
+			if (realPlatform) Object.defineProperty(process, "platform", realPlatform);
+		}
+		// The fallback must neither replay the rejected primitive nor leave the parked
+		// quarantine behind while reporting success.
+		expect(nativeReplayCalls).toBe(0);
+		expect(await fs.exists(lockDir)).toBe(false);
+		expect(await fs.exists(detached)).toBe(false);
+	});
+
 	test("keeps a successor after fallback validation races with replacement", async () => {
 		const base = await makeTemp();
 		const lockedFile = path.join(base, "state.json");
