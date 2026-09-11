@@ -1,5 +1,5 @@
 import { sanitizeDisplayLine } from "@gajae-code/utils";
-import type { DaemonStatus } from "../daemon/control-types";
+import type { DaemonOperationResult, DaemonRecovery, DaemonStatus } from "../daemon/control-types";
 import {
 	type EvidenceClassification,
 	type EvidenceContinuation,
@@ -38,6 +38,12 @@ export interface PublicCommandFailureInput {
 	restartJustified?: boolean;
 	targets?: readonly PublicDaemonTargetOutcome[];
 	partialStatuses?: readonly DaemonStatus[];
+	/**
+	 * Operation results already completed before a later target failed. Without them
+	 * a `daemon_mixed` failure tells the caller not to repeat applied mutations but
+	 * withholds the resulting state it would have to reconcile against.
+	 */
+	partialResults?: readonly DaemonOperationResult[];
 	diagnostics?: readonly PublicCommandDiagnosticCode[];
 }
 export class PublicCommandFailure extends Error {
@@ -60,7 +66,22 @@ export interface ClassifiedPublicCommandFailure extends EvidenceClassification {
 	references: EvidenceReference[];
 	nextSteps: PublicRecoveryStep[];
 	partialStatuses?: DaemonStatus[];
+	partialResults?: PublicDaemonOperationResult[];
 	exitCode: 1 | 2;
+}
+/** Bounded projection of a completed daemon operation result for failure envelopes. */
+export interface PublicDaemonOperationResult {
+	kind: "telegram" | "discord" | "slack";
+	action: DaemonOperationResult["action"];
+	ok: boolean;
+	before?: DaemonStatus;
+	after?: DaemonStatus;
+	/**
+	 * Typed allowlisted recovery category only. The failure envelope never echoes
+	 * controller-supplied free text, so the message, warnings, and remediation
+	 * strings of a completed operation stay out of it.
+	 */
+	recovery?: { reason: DaemonRecovery["reason"] };
 }
 export const EVIDENCE_UNAVAILABLE_WARNING =
 	"Necessary reconciliation evidence could not be retained; no lossless continuation is available. Do not blindly retry the original operation.";
@@ -182,6 +203,21 @@ function boundedDaemonStatuses(statuses: readonly DaemonStatus[] | undefined): D
 			...(typeof status.runtime.warning === "string" ? { warning: boundedDaemonText(status.runtime.warning) } : {}),
 		},
 		...(typeof status.detail === "string" ? { detail: boundedDaemonText(status.detail) } : {}),
+	}));
+}
+
+const DAEMON_RESULT_ACTIONS = ["status", "stop", "restart", "reload"] as const;
+
+/** Bounded projection: only allowlisted identity, typed outcome, and structured state survive. */
+function boundedDaemonResults(results: readonly DaemonOperationResult[] | undefined): PublicDaemonOperationResult[] {
+	if (!Array.isArray(results)) return [];
+	return results.slice(0, 3).map(result => ({
+		kind: DAEMON_KINDS.includes(result.kind) ? result.kind : "telegram",
+		action: DAEMON_RESULT_ACTIONS.includes(result.action) ? result.action : "restart",
+		ok: result.ok === true,
+		...(result.before === undefined ? {} : { before: boundedDaemonStatuses([result.before])[0]! }),
+		...(result.after === undefined ? {} : { after: boundedDaemonStatuses([result.after])[0]! }),
+		...(result.recovery === undefined ? {} : { recovery: { reason: result.recovery.reason } }),
 	}));
 }
 export function normalizePublicCommandFailure(error: unknown): PublicCommandFailure {
@@ -329,6 +365,7 @@ export function classifyPublicCommandFailure(
 		references,
 		nextSteps,
 		...(input.partialStatuses === undefined ? {} : { partialStatuses: boundedDaemonStatuses(input.partialStatuses) }),
+		...(input.partialResults === undefined ? {} : { partialResults: boundedDaemonResults(input.partialResults) }),
 		exitCode: usage ? 2 : 1,
 	};
 }
@@ -355,10 +392,19 @@ function trimSteps(envelope: PublicCommandErrorEnvelope, json: boolean): void {
 	}
 }
 function omitPartialStatusesForBudget(envelope: PublicCommandErrorEnvelope, json: boolean): void {
-	if (envelope.error.partialStatuses === undefined || fits(envelope, json)) return;
-	delete envelope.error.partialStatuses;
-	if (!envelope.omittedOptional.some(item => item.path === "error.partialStatuses"))
-		envelope.omittedOptional.push({ path: "error.partialStatuses", reason: "output_budget" });
+	// Completed operation results are the reconciliation payload; the status view is
+	// redundant beside them, so the status view is dropped first under budget pressure.
+	for (const path of ["error.partialStatuses", "error.partialResults"] as const) {
+		const present =
+			path === "error.partialStatuses"
+				? envelope.error.partialStatuses !== undefined
+				: envelope.error.partialResults !== undefined;
+		if (!present || fits(envelope, json)) continue;
+		if (path === "error.partialStatuses") delete envelope.error.partialStatuses;
+		else delete envelope.error.partialResults;
+		if (!envelope.omittedOptional.some(item => item.path === path))
+			envelope.omittedOptional.push({ path, reason: "output_budget" });
+	}
 }
 
 function reserveDiagnostics(
