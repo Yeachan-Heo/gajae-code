@@ -336,6 +336,16 @@ export interface BrokerDiscovery {
 	version: typeof SDK_STATE_VERSION;
 	protocolVersion: 3;
 	packageGeneration: string;
+	/**
+	 * The runtime image this broker launches internal SDK processes with. Present
+	 * whenever the publisher could classify its own runtime, including when that
+	 * image was already gone at publication time -- absence is the reader's
+	 * verdict to reach, not a reason to publish nothing. Absent only for records
+	 * written before this field existed and for a publisher whose runtime
+	 * evidence could not be classified at all; readers then reuse the broker as
+	 * before rather than retiring it on unknown evidence.
+	 */
+	runtime?: string;
 	ownerId: string;
 	pid: number;
 	incarnation: string;
@@ -465,6 +475,7 @@ export async function readBrokerDiscovery(
 			d.pid <= 0 ||
 			typeof d.incarnation !== "string" ||
 			d.incarnation.length === 0 ||
+			(d.runtime !== undefined && (typeof d.runtime !== "string" || d.runtime.length === 0)) ||
 			!Number.isFinite(d.heartbeatAt)
 		)
 			return null;

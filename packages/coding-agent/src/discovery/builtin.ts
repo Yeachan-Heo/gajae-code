@@ -289,7 +289,7 @@ async function loadSystemPrompt(ctx: LoadContext): Promise<LoadResult<SystemProm
 
 	const userAgentDir = resolveUserAgentDir(ctx);
 	const userPath = path.join(userAgentDir, "SYSTEM.md");
-	const userContent = await readContainedFile(userAgentDir, userPath, ctx);
+	const userContent = await readContainedFile(userAgentDir, userPath, ctx.userAgentIdentity);
 	if (userContent) {
 		items.push({
 			path: userPath,
@@ -468,7 +468,7 @@ async function loadStickyRulesFile(
 	if (!canonicalPath) return null;
 	const content =
 		level === "user"
-			? await readContainedFile(path.dirname(filePath), filePath, ctx)
+			? await readContainedFile(path.dirname(filePath), filePath, ctx.userAgentIdentity)
 			: await readBuiltinFile(ctx, canonicalPath, scope);
 	if (!content) return null;
 	const source = createSourceMeta(PROVIDER_ID, canonicalPath, level);
@@ -1032,7 +1032,7 @@ async function loadContextFiles(ctx: LoadContext): Promise<LoadResult<ContextFil
 
 	const userAgentDir = resolveUserAgentDir(ctx);
 	const userPath = path.join(userAgentDir, "AGENTS.md");
-	const userContent = await readContainedFile(userAgentDir, userPath, ctx);
+	const userContent = await readContainedFile(userAgentDir, userPath, ctx.userAgentIdentity);
 	if (userContent) {
 		items.push({
 			path: userPath,

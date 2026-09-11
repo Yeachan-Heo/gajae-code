@@ -542,18 +542,24 @@ async function scanRootLinkIdentityIsCurrent(root: string, expected: ScanRootLin
 	}
 }
 
-async function captureDirectoryIdentity(root: string): Promise<DirectoryIdentity | null> {
-	const observed = await fs.promises.lstat(root, { bigint: true });
-	if (observed.isSymbolicLink() || !observed.isDirectory()) return null;
+async function captureDirectoryIdentity(root: string, allowSymlink = false): Promise<DirectoryIdentity | null> {
+	const observed = allowSymlink
+		? await fs.promises.stat(root, { bigint: true })
+		: await fs.promises.lstat(root, { bigint: true });
+	if ((!allowSymlink && observed.isSymbolicLink()) || !observed.isDirectory()) return null;
 	const realPath = await fs.promises.realpath(root);
 	const resolved = await fs.promises.stat(realPath, { bigint: true });
 	if (!resolved.isDirectory() || observed.dev !== resolved.dev || observed.ino !== resolved.ino) return null;
-	return { dev: observed.dev, ino: observed.ino, realPath };
+	return { dev: resolved.dev, ino: resolved.ino, realPath };
 }
 
-async function directoryIdentityIsCurrent(root: string, expected: DirectoryIdentity): Promise<boolean> {
+async function directoryIdentityIsCurrent(
+	root: string,
+	expected: DirectoryIdentity,
+	allowSymlink = false,
+): Promise<boolean> {
 	try {
-		const current = await captureDirectoryIdentity(root);
+		const current = await captureDirectoryIdentity(root, allowSymlink);
 		return (
 			current !== null &&
 			current.dev === expected.dev &&
@@ -846,24 +852,65 @@ export async function scanSkillsFromDir(
 	return { items, warnings };
 }
 
-/** Read a regular single-link file that remains contained by its configured root. */
-export async function readContainedFile(root: string, filePath: string, ctx?: LoadContext): Promise<string | null> {
-	// Explicit-home loads already authorized this root (including its absence).
-	// Never replace that authority with the directory present at provider-read time.
-	const rootIdentity = ctx?.userAgentIdentity !== undefined ? ctx.userAgentIdentity : await capturePathIdentity(root);
-	if (!rootIdentity) return null;
-	await SkillDiscoveryTestHooks.afterContainedRootValidated?.(root);
-	return readFile(filePath, {
-		isolatedHome: true,
-		home: ctx?.home ?? root,
-		homeIdentity: ctx?.homeIdentity,
-		userAgentDir: root,
-		userAgentIdentity: rootIdentity,
-		scope: "native",
-		containmentRoot: root,
-		containmentRootIdentity: rootIdentity,
-		bypassCache: true,
-	});
+/** Read a regular file that remains contained by its configured root. */
+export async function readContainedFile(
+	root: string,
+	filePath: string,
+	expectedRootIdentity?: FileIdentity | null,
+): Promise<string | null> {
+	if (expectedRootIdentity === null) return null;
+	let rootIdentity: DirectoryIdentity;
+	try {
+		const capturedRoot = await captureDirectoryIdentity(root, true);
+		if (!capturedRoot) return null;
+		rootIdentity = capturedRoot;
+		if (
+			expectedRootIdentity !== undefined &&
+			(rootIdentity.dev !== BigInt(expectedRootIdentity.dev) ||
+				rootIdentity.ino !== BigInt(expectedRootIdentity.ino))
+		)
+			return null;
+		await SkillDiscoveryTestHooks.afterContainedRootValidated?.(root);
+		if (!(await directoryIdentityIsCurrent(root, rootIdentity, true))) return null;
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+		throw error;
+	}
+	const relative = path.relative(root, filePath);
+	if (relative.startsWith("..") || path.isAbsolute(relative)) return null;
+	const flags = fs.constants.O_RDONLY | (process.platform === "win32" ? 0 : (fs.constants.O_NONBLOCK ?? 0));
+	let handle: FileHandle;
+	try {
+		handle = await fs.promises.open(filePath, flags);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+		return null;
+	}
+	try {
+		const [opened, currentPath, currentTarget, currentRoot] = await Promise.all([
+			handle.stat({ bigint: true }),
+			fs.promises.realpath(filePath),
+			fs.promises.stat(filePath, { bigint: true }),
+			directoryIdentityIsCurrent(root, rootIdentity, true),
+		]);
+		const currentRelative = path.relative(rootIdentity.realPath, currentPath);
+		if (
+			!opened.isFile() ||
+			opened.nlink !== 1n ||
+			!currentTarget.isFile() ||
+			opened.dev !== currentTarget.dev ||
+			opened.ino !== currentTarget.ino ||
+			!currentRoot ||
+			currentRelative.startsWith("..") ||
+			path.isAbsolute(currentRelative)
+		) {
+			return null;
+		}
+		const content = await handle.readFile({ encoding: "utf8" });
+		return (await directoryIdentityIsCurrent(root, rootIdentity, true)) ? content : null;
+	} finally {
+		await handle.close();
+	}
 }
 
 /**

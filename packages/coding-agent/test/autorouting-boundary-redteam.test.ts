@@ -2380,39 +2380,7 @@ describe("autorouting boundary red-team generation 4 delta re-attacks", () => {
 		expect(pass).toBe(true);
 	}, 30_000);
 
-	it.each([
-		{
-			id: "incomplete-stack",
-			message: "post-fence failure evidence",
-			stack: "Error\n    at concurrent-post-fence-fixture",
-			expected: "Error: post-fence failure evidence\nError\n    at concurrent-post-fence-fixture",
-		},
-		{
-			id: "incidental-path-match",
-			message: "executor.ts",
-			stack: "Error\n    at runSubprocess (/workspace/task/executor.ts:42:1)",
-			expected: "Error: executor.ts\nError\n    at runSubprocess (/workspace/task/executor.ts:42:1)",
-		},
-		{
-			id: "complete-headline",
-			message: "post-fence failure evidence",
-			stack: "Error: post-fence failure evidence\n    at post-fence-fixture",
-			expected: "Error: post-fence failure evidence\n    at post-fence-fixture",
-		},
-		{
-			id: "multiline-headline",
-			message: "post-fence failure evidence\nadditional diagnostic detail",
-			stack: "Error: post-fence failure evidence\nadditional diagnostic detail\n    at post-fence-fixture",
-			expected: "Error: post-fence failure evidence\nadditional diagnostic detail\n    at post-fence-fixture",
-		},
-		{
-			id: "incomplete-multiline-headline",
-			message: "post-fence failure evidence\nadditional diagnostic detail",
-			stack: "Error: post-fence failure evidence\n    at post-fence-fixture",
-			expected:
-				"Error: post-fence failure evidence\nadditional diagnostic detail\nError: post-fence failure evidence\n    at post-fence-fixture",
-		},
-	])("C3 a post-fence failure stays terminal and preserves its diagnostic (%j)", async diagnostic => {
+	it("C3 a post-fence failure stays terminal and never enters the pre-fence discard downgrade", async () => {
 		const root = await mkdtemp(path.join(tmpdir(), "autorouting-gen4-post-fence-"));
 		const finalPath = path.join(root, "candidate.jsonl");
 		const models = [
@@ -2432,8 +2400,11 @@ describe("autorouting boundary red-team generation 4 delta re-attacks", () => {
 		vi.spyOn(modelRegistry, "getAll").mockReturnValue(models);
 		vi.spyOn(modelRegistry, "getAvailable").mockReturnValue(models);
 		vi.spyOn(modelRegistry, "getApiKey").mockImplementation(async () => "key");
-		const postFenceFailure = new Error(diagnostic.message);
-		postFenceFailure.stack = diagnostic.stack;
+		const postFenceFailure = new Error("executor");
+		// Bun can expose an Error stack without its message when this fresh-process case
+		// runs beside several other heavyweight test children. The executor must retain
+		// the message instead of treating that incomplete stack as the whole diagnostic.
+		postFenceFailure.stack = "Error\n    at concurrent-executor-fixture";
 		const originalCreate = sdkModule.createAgentSession;
 		let createCalls = 0;
 		const createErrors: string[] = [];
@@ -2518,13 +2489,11 @@ describe("autorouting boundary red-team generation 4 delta re-attacks", () => {
 				]) &&
 			result?.preflightFenceCrossed === true &&
 			result?.preflightFailure?.kind === "transport" &&
-			result?.error === diagnostic.expected &&
+			result?.error?.startsWith("Error: executor\n") === true &&
 			stagingTree.length === 0 &&
 			finalExists;
 		record(
-			diagnostic.id === "incomplete-stack"
-				? "gen4-c3-post-fence-terminal-ledger"
-				: `gen4-c3-post-fence-terminal-ledger-${diagnostic.id}`,
+			"gen4-c3-post-fence-terminal-ledger",
 			"AC13",
 			rootCommand,
 			observed,

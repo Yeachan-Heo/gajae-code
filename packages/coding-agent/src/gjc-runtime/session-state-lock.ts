@@ -128,7 +128,14 @@ function transitionGenerationFromStat(stat: fsSync.BigIntStats): TransitionDirec
 	};
 }
 
-interface PendingTransitionRelease {
+interface PendingOwnerRepair {
+	/** Descriptor retained when a rewrite fault defeats immediate repair. */
+	repairHandle?: fs.FileHandle;
+	repairBytes?: string;
+	repairSnapshot?: LockOwnerSnapshot;
+}
+
+interface PendingTransitionRelease extends PendingOwnerRepair {
 	phase: "setup" | "release";
 	token: string;
 	generation?: TransitionDirectoryGeneration;
@@ -138,12 +145,14 @@ interface PendingTransitionRelease {
 	 * authority when setup generation capture itself faults or the pathname is
 	 * replaced before recovery gets to run. */
 	generationHandle?: fs.FileHandle;
-	/** Descriptor retained when a rewrite fault defeats immediate repair. */
-	repairHandle?: fs.FileHandle;
-	repairBytes?: string;
-	repairSnapshot?: LockOwnerSnapshot;
 	held?: LockOwnerSnapshot;
 	releasedOwner?: SessionStateLockOwner;
+	recoverable: boolean;
+	recovery?: Promise<boolean>;
+}
+
+interface PendingPrimaryOwnerRelease extends PendingOwnerRepair {
+	held: LockOwnerSnapshot;
 	recoverable: boolean;
 	recovery?: Promise<boolean>;
 }
@@ -153,6 +162,7 @@ interface LocalTransitionQueue {
 }
 
 const pendingTransitionReleases = new Map<string, PendingTransitionRelease>();
+const pendingPrimaryOwnerReleases = new Map<string, PendingPrimaryOwnerRelease>();
 const localTransitionQueues = new Map<string, LocalTransitionQueue>();
 
 async function joinLocalTransitionQueue(
@@ -203,7 +213,18 @@ function clearPendingTransitionRelease(key: string, pending?: PendingTransitionR
 	}
 }
 
-async function repairPendingOwnerRecord(pending: PendingTransitionRelease): Promise<boolean> {
+function clearPendingPrimaryOwnerRelease(key: string, pending?: PendingPrimaryOwnerRelease): void {
+	const current = pendingPrimaryOwnerReleases.get(key);
+	if (pending !== undefined && current !== pending) return;
+	pendingPrimaryOwnerReleases.delete(key);
+	const repairHandle = (pending ?? current)?.repairHandle;
+	if (repairHandle) {
+		(pending ?? current)!.repairHandle = undefined;
+		void repairHandle.close().catch(() => undefined);
+	}
+}
+
+async function repairPendingOwnerRecord(pending: PendingOwnerRepair): Promise<boolean> {
 	const handle = pending.repairHandle;
 	if (!handle || pending.repairBytes === undefined) return true;
 	try {
@@ -2039,6 +2060,82 @@ async function recoverPendingTransitionRelease(
 }
 
 /**
+ * Complete a primary owner release that failed after the caller's operation had settled.
+ *
+ * This authority is deliberately separate from the transition claim record: the transition
+ * wrapper may have released its own claim successfully even though `releaseOwnerLock`
+ * failed, leaving the primary owner live. Recovery always takes a NEW transition claim and
+ * re-proves the exact held owner snapshot before rewriting it. A changed or missing path
+ * invalidates the remembered authority without touching whatever replaced it.
+ */
+async function recoverPendingPrimaryOwnerRelease(
+	lockFile: string,
+	recoveryKey: string,
+	quarantineName: string,
+	budget: LockRetryBudget,
+): Promise<boolean> {
+	const pending = pendingPrimaryOwnerReleases.get(recoveryKey);
+	if (!pending?.recoverable) return false;
+	if (pending.recovery) {
+		if (budget.nonBlocking) throw SESSION_STATE_LOCK_BUSY;
+		return await pending.recovery;
+	}
+	const recovery = (async (): Promise<boolean> => {
+		let released = false;
+		try {
+			await withLockPathTransition(
+				lockFile,
+				async () => {
+					if (pendingPrimaryOwnerReleases.get(recoveryKey) !== pending) return false;
+					if (!(await repairPendingOwnerRecord(pending))) return false;
+					if (pending.repairSnapshot && sameLockOwnerObject(pending.repairSnapshot, pending.held))
+						pending.held = pending.repairSnapshot;
+					pending.repairSnapshot = undefined;
+
+					const current = await captureRegularLockOwner(lockFile);
+					if (!current || !sameLockOwnerSnapshot(current, pending.held)) {
+						clearPendingPrimaryOwnerRelease(recoveryKey, pending);
+						return false;
+					}
+					try {
+						await releaseOwnerLock(lockFile, pending.held);
+					} catch (error) {
+						const rewriteFailure = error as OwnerRewriteFailure;
+						if (rewriteFailure.repairSnapshot && sameLockOwnerObject(rewriteFailure.repairSnapshot, pending.held))
+							pending.held = rewriteFailure.repairSnapshot;
+						if (rewriteFailure.repairHandle) {
+							const previous = pending.repairHandle;
+							pending.repairHandle = rewriteFailure.repairHandle;
+							pending.repairBytes = rewriteFailure.repairBytes ?? pending.held.bytes;
+							if (previous && previous !== rewriteFailure.repairHandle)
+								void previous.close().catch(() => undefined);
+						}
+						pending.recoverable = true;
+						return false;
+					}
+					clearPendingPrimaryOwnerRelease(recoveryKey, pending);
+					released = true;
+					return true;
+				},
+				quarantineName,
+				budget,
+			);
+		} catch {
+			// The remembered owner remains recoverable. A later admission gets a fresh
+			// transition claim and retries the exact same release without replaying work.
+			return false;
+		}
+		return released;
+	})();
+	pending.recovery = recovery;
+	try {
+		return await recovery;
+	} finally {
+		if (pending.recovery === recovery) pending.recovery = undefined;
+	}
+}
+
+/**
  * Run one pathname transition under an atomic `mkdir`/`rmdir` claim.
  *
  * Same-process contenders join the current claim owner's lifetime before consuming their
@@ -2591,9 +2688,11 @@ async function runWithSessionStateFileLock<T>(
 ): Promise<T> {
 	const lockFile = `${stateFile}.lock`;
 	let owner: SessionStateLockOwner;
+	let primaryRecoveryKey: string;
 	try {
 		owner = await newLockOwner();
 		await ensureSessionStateParent(path.dirname(stateFile));
+		primaryRecoveryKey = await transitionRecoveryKey(`${lockFile}${LOCK_TRANSITION_RESOURCE_SUFFIX}`);
 	} catch (error) {
 		const cause = error instanceof SessionStateLockUnavailableError ? (error.cause ?? error) : error;
 		throw lockUnavailable(lockFile, "lock_initialization_failed", budget, cause);
@@ -2604,13 +2703,24 @@ async function runWithSessionStateFileLock<T>(
 		let held: LockOwnerSnapshot | undefined;
 		let callbackFailure = false;
 		let callbackError: unknown;
+		let acquiredInsideTransition: LockOwnerSnapshot | undefined;
 		try {
+			// A prior call may settle and fail release while this contender is waiting.
+			// Retry its remembered release under a fresh claim before each admission.
+			await recoverPendingPrimaryOwnerRelease(lockFile, primaryRecoveryKey, cycleQuarantine, budget);
 			// Contention (`EEXIST`, or `EISDIR`/`EPERM` for a legacy directory owner)
 			// propagates out of the claim to the evaluation below; the claim is released
 			// first, so the reclaim that follows can take it.
 			held = await withLockPathTransition(
 				lockFile,
-				() => acquireOwnerLock(lockFile, owner, cycleQuarantine),
+				async () => {
+					const acquired = await acquireOwnerLock(lockFile, owner, cycleQuarantine);
+					// A stale pending release can only survive when the old pathname was
+					// removed or replaced; this successful acquisition supersedes it.
+					clearPendingPrimaryOwnerRelease(primaryRecoveryKey);
+					acquiredInsideTransition = acquired;
+					return acquired;
+				},
 				cycleQuarantine,
 				budget,
 			);
@@ -2624,9 +2734,42 @@ async function runWithSessionStateFileLock<T>(
 			// Released against the identity captured when it was written, so a record that
 			// is no longer ours is left for its owner rather than unlinked by name.
 			let releaseFailure: { error: unknown } | undefined;
+			const pending: PendingPrimaryOwnerRelease = {
+				held: record,
+				recoverable: false,
+			};
+			clearPendingPrimaryOwnerRelease(primaryRecoveryKey);
+			pendingPrimaryOwnerReleases.set(primaryRecoveryKey, pending);
 			try {
-				await withLockPathTransition(lockFile, async () => releaseOwnerLock(lockFile, record), cycleQuarantine);
+				await withLockPathTransition(
+					lockFile,
+					async () => {
+						try {
+							await releaseOwnerLock(lockFile, record);
+							clearPendingPrimaryOwnerRelease(primaryRecoveryKey, pending);
+						} catch (error) {
+							const rewriteFailure = error as OwnerRewriteFailure;
+							if (
+								rewriteFailure.repairSnapshot &&
+								sameLockOwnerObject(rewriteFailure.repairSnapshot, pending.held)
+							)
+								pending.held = rewriteFailure.repairSnapshot;
+							if (rewriteFailure.repairHandle) {
+								const previous = pending.repairHandle;
+								pending.repairHandle = rewriteFailure.repairHandle;
+								pending.repairBytes = rewriteFailure.repairBytes ?? pending.held.bytes;
+								if (previous && previous !== rewriteFailure.repairHandle)
+									void previous.close().catch(() => undefined);
+							}
+							throw error;
+						}
+					},
+					cycleQuarantine,
+				);
 			} catch (error) {
+				// The operation and release wrapper have settled, even when claiming
+				// the release transition failed before its callback could run.
+				pending.recoverable = true;
 				releaseFailure = { error };
 			}
 			if (!outcome.ok) {
@@ -2642,6 +2785,17 @@ async function runWithSessionStateFileLock<T>(
 			if (releaseFailure) throw releaseFailure.error;
 			return outcome.value;
 		} catch (error) {
+			if (!held && acquiredInsideTransition) {
+				// The callback acquired the primary owner, but the wrapper rejected
+				// before handing that value back (for example, claim cleanup exhausted).
+				// The callback has settled now, so retain its exact snapshot for the next
+				// admission to release under a fresh transition.
+				clearPendingPrimaryOwnerRelease(primaryRecoveryKey);
+				pendingPrimaryOwnerReleases.set(primaryRecoveryKey, {
+					held: acquiredInsideTransition,
+					recoverable: true,
+				});
+			}
 			if (callbackFailure && error === callbackError) throw error;
 			// A fault after the lock was taken belongs to the operation, not to acquisition.
 			if (held) throw lockDiagnostic(error, lockFile, "lock_release_failed");

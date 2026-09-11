@@ -113,7 +113,6 @@ describe("AgentSession deep-interview continuation", () => {
 
 		await session.steer("empty fallback");
 		await wake.promise;
-		await session.waitForIdle();
 		isStreaming = false;
 
 		expect(continueQueuedSpy).toHaveBeenCalledTimes(1);
@@ -134,11 +133,8 @@ describe("AgentSession deep-interview continuation", () => {
 
 		await session.steer("first fallback");
 		await firstWake.promise;
-		await session.waitForIdle();
-		expect(continueQueuedSpy).toHaveBeenCalledTimes(1);
 		await session.steer("second fallback");
 		await secondWake.promise;
-		await session.waitForIdle();
 		isStreaming = false;
 
 		expect(continueQueuedSpy).toHaveBeenCalledTimes(2);

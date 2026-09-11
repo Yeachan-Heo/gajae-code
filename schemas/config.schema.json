@@ -2181,7 +2181,7 @@
 							"message": "Use the `edit` tool instead of awk -i inplace. It provides diff preview and fuzzy matching."
 						},
 						{
-							"pattern": "^\\s*(echo|printf|cat\\s*<<)\\s+.*[^|]>\\s*\\S",
+							"pattern": "^\\s*(echo|printf|cat\\s*<<\\S*)\\s+(?:(?!&&)[^;|\\n])*(?<![02-9])>{1,2}\\s*\\S",
 							"tool": "write",
 							"message": "Use the `write` tool instead of echo/cat redirection. It handles encoding and provides confirmation."
 						}
