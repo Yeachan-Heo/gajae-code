@@ -54,7 +54,6 @@ import {
 	recordNonCrystalExecutionApproval,
 	revokeDeepInterviewExecutionApproval,
 	revokeNonCrystalExecutionApproval,
-	runNativeStateCommand,
 } from "../gjc-runtime/state-runtime";
 import {
 	type AskGateQuestion,
@@ -936,21 +935,9 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 			approvalStage,
 			presentation: executionPresentation,
 		});
-		if (ralplanApproval) {
-			const result = await runNativeStateCommand(
-				[
-					"approve-execution",
-					"--mode",
-					lineage === "crystal" ? "deep-interview" : approvalStage,
-					"--session-id",
-					sessionId,
-					"--json",
-				],
-				this.session.cwd,
-			);
-			if (result.status !== 0)
-				throw new ToolAbortError(result.stderr?.trim() || "Ralplan execution approval could not be persisted");
-		}
+		// Ralplan approval is consumed by the subsequent handoff, after the agent
+		// persists this Ask tool result. Consuming here would validate the boundary
+		// before the matching provider toolResult exists in the transcript.
 	}
 
 	async execute(

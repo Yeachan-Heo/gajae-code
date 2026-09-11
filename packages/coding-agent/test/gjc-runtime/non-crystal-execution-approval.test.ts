@@ -111,7 +111,13 @@ async function publish(cwd: string, sessionId: string, stage: ExecutionApprovalS
 	return JSON.parse(await fs.readFile(modeStatePath(cwd, sessionId, stage), "utf8"));
 }
 
-async function ask(cwd: string, manager: SessionManager, stage: ExecutionApprovalStage, id = "approve-report") {
+async function ask(
+	cwd: string,
+	manager: SessionManager,
+	stage: ExecutionApprovalStage,
+	id = "approve-report",
+	consumeRalplan = true,
+) {
 	const label = "Approve execution via ultragoal";
 	const toolCallId = `provider-${id}`;
 	const workflowGate =
@@ -151,13 +157,36 @@ async function ask(cwd: string, manager: SessionManager, stage: ExecutionApprova
 	});
 	manager.appendMessage(assistant([{ type: "text", text: "Approval recorded. Preparing the handoff." }]));
 	await manager.flush();
+	if (stage === "ralplan" && consumeRalplan) {
+		const approval = await runNativeStateCommand(
+			["approve-execution", "--mode", "ralplan", "--session-id", manager.getSessionId(), "--json"],
+			cwd,
+		);
+		if (approval.status !== 0) throw new Error(approval.stderr || "Ralplan approval consume failed");
+	}
 }
 
 function consume(cwd: string, sessionId: string) {
 	return runNativeDeepInterviewCommand(["approve-execution", "--session-id", sessionId, "--json"], cwd);
 }
 
-function handoff(cwd: string, sessionId: string, stage: ExecutionApprovalStage) {
+async function handoff(cwd: string, sessionId: string, stage: ExecutionApprovalStage) {
+	if (stage === "ralplan") {
+		const recordPath = nonCrystalExecutionApprovalRecordPath(cwd, sessionId, stage);
+		let consumed = false;
+		try {
+			consumed = (JSON.parse(await fs.readFile(recordPath, "utf8")) as { status?: string }).status === "consumed";
+		} catch {
+			// Let the native command return its fail-closed missing-record error.
+		}
+		if (!consumed) {
+			const approval = await runNativeStateCommand(
+				["approve-execution", "--mode", "ralplan", "--session-id", sessionId, "--json"],
+				cwd,
+			);
+			if (approval.status !== 0) return approval;
+		}
+	}
 	return runNativeStateCommand(
 		["handoff", "--mode", stage, "--to", "ultragoal", "--session-id", sessionId, "--json"],
 		cwd,
@@ -205,8 +234,8 @@ describe("non-Crystal user-gated execution approval", () => {
 			await withSession(async (cwd, manager, sessionId) => {
 				await publish(cwd, sessionId, stage);
 				expect((await handoff(cwd, sessionId, stage)).status).toBe(2);
-				await ask(cwd, manager, stage);
-				expect((await approval(cwd, sessionId, stage)).status).toBe(stage === "ralplan" ? "consumed" : "pending");
+				await ask(cwd, manager, stage, "approve-report", false);
+				expect((await approval(cwd, sessionId, stage)).status).toBe("pending");
 				expect(await Bun.file(modeStatePath(cwd, sessionId, "ultragoal")).exists()).toBe(false);
 				if (stage === "deep-interview") {
 					const result = await consume(cwd, sessionId);
@@ -222,7 +251,7 @@ describe("non-Crystal user-gated execution approval", () => {
 		it(`${stage}: a new persisted user message invalidates consent`, async () => {
 			await withSession(async (cwd, manager, sessionId) => {
 				await publish(cwd, sessionId, stage);
-				await ask(cwd, manager, stage);
+				await ask(cwd, manager, stage, "approve-report", false);
 				manager.appendMessage({ role: "user", content: "Change the report requirements.", timestamp: Date.now() });
 				await manager.flush();
 				const result =
@@ -235,7 +264,7 @@ describe("non-Crystal user-gated execution approval", () => {
 		it(`${stage}: changed or missing published artifacts cannot mint approval`, async () => {
 			await withSession(async (cwd, manager, sessionId) => {
 				await publish(cwd, sessionId, stage);
-				await ask(cwd, manager, stage);
+				await ask(cwd, manager, stage, "approve-report", false);
 				const record = await approval(cwd, sessionId, stage);
 				await fs.writeFile(record.artifact_path, "# substituted artifact\n");
 				const result =
@@ -249,7 +278,7 @@ describe("non-Crystal user-gated execution approval", () => {
 		it(`${stage}: altered approval record and stale publication fail closed`, async () => {
 			await withSession(async (cwd, manager, sessionId) => {
 				await publish(cwd, sessionId, stage);
-				await ask(cwd, manager, stage);
+				await ask(cwd, manager, stage, "approve-report", false);
 				const recordPath = nonCrystalExecutionApprovalRecordPath(cwd, sessionId, stage);
 				const original = await fs.readFile(recordPath, "utf8");
 				await fs.writeFile(recordPath, JSON.stringify({ ...JSON.parse(original), gate_id: "forged" }));
@@ -282,13 +311,14 @@ describe("non-Crystal user-gated execution approval", () => {
 				const previous = await approval(cwd, sessionId, stage);
 				const record = async (gateId: string) => {
 					const transcriptPath = manager.getSessionFile()!;
+					const toolCallId = `provider-${gateId}`;
 					await recordNonCrystalExecutionApproval({
 						cwd,
 						sessionId,
 						approvalStage: stage,
 						questionId: previous.question_id,
 						gateId,
-						toolCallId: `provider-${previous.question_id}`,
+						toolCallId,
 						target: "ultragoal",
 						selectedOptions: ["Approve execution via ultragoal"],
 						transcriptPath,
@@ -297,6 +327,18 @@ describe("non-Crystal user-gated execution approval", () => {
 							.digest("hex"),
 						presentation: await captureExecutionApprovalPresentation(cwd, sessionId, stage),
 					});
+					manager.appendMessage({
+						role: "toolResult",
+						toolCallId,
+						toolName: "ask",
+						content: [{ type: "text", text: "Approve execution via ultragoal" }],
+						details: {
+							questions: [{ id: previous.question_id, selectedOptions: ["Approve execution via ultragoal"] }],
+						},
+						isError: false,
+						timestamp: Date.now(),
+					});
+					await manager.flush();
 				};
 				await expect(record("fresh-gate-same-publication")).rejects.toThrow("replay");
 				await publish(cwd, sessionId, stage, 2);
@@ -401,6 +443,9 @@ describe("non-Crystal user-gated execution approval", () => {
 			await manager.flush();
 			await publishCrystal(cwd, sessionId);
 			const transcriptPath = manager.getSessionFile()!;
+			const renewalToolCallId = "provider-renewed-crystal";
+			manager.appendMessage(assistant([{ type: "toolCall", id: renewalToolCallId, name: "ask", arguments: {} }]));
+			await manager.flush();
 			const descriptor = {
 				cwd,
 				sessionId,
@@ -411,13 +456,25 @@ describe("non-Crystal user-gated execution approval", () => {
 				transcriptSha256: createHash("sha256")
 					.update(await fs.readFile(transcriptPath))
 					.digest("hex"),
-				toolCallId: `provider-${previous.question_id}`,
+				toolCallId: renewalToolCallId,
 				presentation: await captureExecutionApprovalPresentation(cwd, sessionId, "deep-interview"),
 			};
 			await expect(
 				recordDeepInterviewExecutionApproval({ ...descriptor, gateId: previous.gate_id }),
 			).rejects.toThrow("already consumed");
 			const renewed = await recordDeepInterviewExecutionApproval({ ...descriptor, gateId: "fresh-crystal-gate" });
+			manager.appendMessage({
+				role: "toolResult",
+				toolCallId: renewalToolCallId,
+				toolName: "ask",
+				content: [{ type: "text", text: "Approve execution via ultragoal" }],
+				details: {
+					questions: [{ id: previous.question_id, selectedOptions: ["Approve execution via ultragoal"] }],
+				},
+				isError: false,
+				timestamp: Date.now(),
+			});
+			await manager.flush();
 			expect(renewed.record.question_id).toBe(previous.question_id);
 			expect(renewed.record.crystal_spec_version).toBe(previous.crystal_spec_version + 1);
 			expect(renewed.record.spec_sha256).not.toBe(previous.spec_sha256);
@@ -436,10 +493,10 @@ describe("non-Crystal user-gated execution approval", () => {
 			expect(planning.status, planning.stderr).toBe(0);
 			await publish(cwd, sessionId, "ralplan");
 			expect(await executionApprovalLineage(cwd, sessionId, "ralplan")).toBe("crystal");
-			await ask(cwd, manager, "ralplan", "approve-linked-crystal");
+			await ask(cwd, manager, "ralplan", "approve-linked-crystal", false);
 			const crystalApprovalPath = deepInterviewExecutionApprovalRecordPath(cwd, sessionId);
 			const crystalApproval = await fs.readFile(crystalApprovalPath, "utf8");
-			expect(JSON.parse(crystalApproval).status).toBe("consumed");
+			expect(JSON.parse(crystalApproval).status).toBe("pending");
 			const indexPath = path.join(sessionStateDir(cwd, sessionId), "deep-interview-handoff-ralplan-audit.json");
 			const oldIndex = await fs.readFile(indexPath, "utf8");
 			const oldAudit = await fs.readFile(auditPath(cwd, sessionId), "utf8");

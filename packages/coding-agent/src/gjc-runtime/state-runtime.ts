@@ -1901,7 +1901,7 @@ export interface ExecutionApprovalTranscriptBoundary {
 	device: string;
 	inode: string;
 	leaf_id: string | null;
-	approval_tool_call_id?: string;
+	approval_tool_call_id: string;
 }
 
 function isExecutionApprovalTranscriptBoundary(value: unknown): value is ExecutionApprovalTranscriptBoundary {
@@ -1914,7 +1914,7 @@ function isExecutionApprovalTranscriptBoundary(value: unknown): value is Executi
 		typeof value.inode === "string" &&
 		/^\d+$/.test(value.inode) &&
 		(value.leaf_id === null || isExecutionApprovalId(value.leaf_id)) &&
-		(value.approval_tool_call_id === undefined || isExecutionApprovalId(value.approval_tool_call_id))
+		isExecutionApprovalId(value.approval_tool_call_id)
 	);
 }
 
@@ -1932,7 +1932,7 @@ function approvalTranscriptPrefix(
 	cwd: string,
 	sessionId: string,
 	text: string,
-): { leaf: string | null; ids: Set<string> } {
+): { leaf: string | null; ids: Set<string>; askToolCallIds: Set<string> } {
 	const [header, ...records] = approvalTranscriptRecords(text);
 	if (
 		header?.type !== "session" ||
@@ -1942,6 +1942,7 @@ function approvalTranscriptPrefix(
 	)
 		throw new StateCommandError(2, "execution approval transcript identity mismatch");
 	const ids = new Set<string>();
+	const askToolCallIds = new Set<string>();
 	let leaf: string | null = null;
 	for (const record of records) {
 		if (record.type === "header_patch") {
@@ -1967,10 +1968,18 @@ function approvalTranscriptPrefix(
 			(record.parentId !== null && (typeof record.parentId !== "string" || !ids.has(record.parentId)))
 		)
 			throw new StateCommandError(2, "execution approval transcript branch is invalid");
+		if (
+			record.type === "message" &&
+			isPlainObject(record.message) &&
+			record.message.role === "toolResult" &&
+			record.message.toolName === "ask" &&
+			typeof record.message.toolCallId === "string"
+		)
+			askToolCallIds.add(record.message.toolCallId);
 		ids.add(record.id);
 		leaf = record.id;
 	}
-	return { leaf, ids };
+	return { leaf, ids, askToolCallIds };
 }
 
 export async function captureExecutionApprovalTranscriptBoundary(
@@ -1978,8 +1987,10 @@ export async function captureExecutionApprovalTranscriptBoundary(
 	sessionId: string,
 	transcriptPath: string,
 	transcriptSha256: string,
-	approvalToolCallId?: string,
+	approvalToolCallId: string,
 ): Promise<ExecutionApprovalTranscriptBoundary> {
+	if (!isExecutionApprovalId(approvalToolCallId))
+		throw new StateCommandError(2, "execution approval transcript tool-call identity is invalid");
 	const before = await fs.lstat(transcriptPath, { bigint: true });
 	const text = await readBoundedIdentityText(
 		transcriptPath,
@@ -2002,7 +2013,7 @@ export async function captureExecutionApprovalTranscriptBoundary(
 		device: after.dev.toString(),
 		inode: after.ino.toString(),
 		leaf_id: leaf,
-		...(approvalToolCallId === undefined ? {} : { approval_tool_call_id: approvalToolCallId }),
+		approval_tool_call_id: approvalToolCallId,
 	};
 }
 
@@ -2052,8 +2063,17 @@ export async function assertExecutionApprovalTranscriptBoundary(
 		const isRecordedApprovalAskResult =
 			isUserBearingAskResult &&
 			!approvalAskResultSeen &&
-			boundary.approval_tool_call_id !== undefined &&
-			message.toolCallId === boundary.approval_tool_call_id;
+			message.toolCallId === boundary.approval_tool_call_id &&
+			!branch.askToolCallIds.has(message.toolCallId);
+		if (
+			isUserBearingAskResult &&
+			message.toolCallId === boundary.approval_tool_call_id &&
+			branch.askToolCallIds.has(message.toolCallId)
+		)
+			throw new StateCommandError(
+				2,
+				"execution approval Ask tool-call identity was reused from the captured prefix",
+			);
 		if (
 			record.type !== "message" ||
 			!isExecutionApprovalId(record.id) ||
@@ -2073,6 +2093,8 @@ export async function assertExecutionApprovalTranscriptBoundary(
 		branch.ids.add(record.id);
 		branch.leaf = record.id;
 	}
+	if (!approvalAskResultSeen)
+		throw new StateCommandError(2, "execution approval transcript continuation lacks the recorded Ask result");
 }
 
 export type ExecutionApprovalStage = "deep-interview" | "ralplan";

@@ -33,7 +33,9 @@ import { CURRENT_SESSION_VERSION, SessionManager } from "@gajae-code/coding-agen
 import { AskTool } from "@gajae-code/coding-agent/tools/ask";
 import { migrateAndPersistLegacyState } from "../../src/gjc-runtime/state-migrations";
 import {
+	assertExecutionApprovalTranscriptBoundary,
 	captureExecutionApprovalPresentation,
+	captureExecutionApprovalTranscriptBoundary,
 	deepInterviewExecutionApprovalRecordPath,
 	reconcileWorkflowSkillState,
 	recordDeepInterviewExecutionApproval,
@@ -219,6 +221,7 @@ async function recordExecutionApproval(
 	approvalStage: "deep-interview" | "ralplan" = "deep-interview",
 ): Promise<void> {
 	const existingRecord = await readJson(deepInterviewExecutionApprovalRecordPath(cwd, TEST_SESSION_ID));
+	if (typeof existingRecord?.transcript_path === "string" && questionId === "execution-approval") return;
 	let transcriptPath: string;
 	if (typeof existingRecord?.transcript_path === "string") {
 		// Repeated fixture calls must not rewrite the prefix bound by pending consent.
@@ -270,6 +273,24 @@ async function recordExecutionApproval(
 		approvalStage,
 		presentation: await captureExecutionApprovalPresentation(cwd, TEST_SESSION_ID, approvalStage),
 	});
+	const manager = await SessionManager.open(
+		transcriptPath,
+		SessionManager.explicitDestination(path.dirname(transcriptPath)),
+	);
+	try {
+		manager.appendMessage({
+			role: "toolResult",
+			toolCallId: questionId,
+			toolName: "ask",
+			content: [{ type: "text", text: "Approve execution via ultragoal" }],
+			details: { questions: [{ id: questionId, selectedOptions: ["Approve execution via ultragoal"] }] },
+			isError: false,
+			timestamp: Date.now(),
+		});
+		await manager.flush();
+	} finally {
+		await manager.close();
+	}
 }
 
 function persistedApprovalAssistant(content: AssistantMessage["content"]): AssistantMessage {
@@ -469,6 +490,83 @@ describe("gjc state handoff", () => {
 		});
 	});
 
+	it("rejects an approval Ask tool-call ID reused from the captured prefix", async () => {
+		await withPersistedApprovalSession(async (cwd, manager, sessionId, transcriptPath) => {
+			const reusedToolCallId = "provider-reused-prefix";
+			manager.appendMessage(
+				persistedApprovalAssistant([{ type: "toolCall", id: reusedToolCallId, name: "ask", arguments: {} }]),
+			);
+			manager.appendMessage({
+				role: "toolResult",
+				toolCallId: reusedToolCallId,
+				toolName: "ask",
+				content: [{ type: "text", text: "The earlier Ask result" }],
+				details: { questions: [{ id: "earlier", customInput: "The earlier Ask result" }] },
+				isError: false,
+				timestamp: Date.now(),
+			});
+			await manager.flush();
+			const prefix = await Bun.file(transcriptPath).text();
+			const prefixSha256 = createHash("sha256").update(prefix).digest("hex");
+			const boundary = await captureExecutionApprovalTranscriptBoundary(
+				cwd,
+				sessionId,
+				transcriptPath,
+				prefixSha256,
+				reusedToolCallId,
+			);
+			manager.appendMessage({
+				role: "toolResult",
+				toolCallId: reusedToolCallId,
+				toolName: "ask",
+				content: [{ type: "text", text: "The reused approval result" }],
+				details: { questions: [{ id: "approval", selectedOptions: ["Approve execution via ultragoal"] }] },
+				isError: false,
+				timestamp: Date.now(),
+			});
+			await manager.flush();
+			await expect(
+				assertExecutionApprovalTranscriptBoundary(cwd, sessionId, transcriptPath, prefixSha256, boundary),
+			).rejects.toThrow("reused from the captured prefix");
+		});
+	});
+
+	it("requires exactly one fresh approval Ask result after the captured prefix", async () => {
+		await withPersistedApprovalSession(async (cwd, manager, sessionId, transcriptPath) => {
+			const prefix = await Bun.file(transcriptPath).text();
+			const prefixSha256 = createHash("sha256").update(prefix).digest("hex");
+			const boundary = await captureExecutionApprovalTranscriptBoundary(
+				cwd,
+				sessionId,
+				transcriptPath,
+				prefixSha256,
+				"provider-fresh-required",
+			);
+			await expect(
+				assertExecutionApprovalTranscriptBoundary(cwd, sessionId, transcriptPath, prefixSha256, boundary),
+			).rejects.toThrow("lacks the recorded Ask result");
+			manager.appendMessage(persistedApprovalAssistant([{ type: "text", text: "Only an assistant continuation." }]));
+			await manager.flush();
+			await expect(
+				assertExecutionApprovalTranscriptBoundary(cwd, sessionId, transcriptPath, prefixSha256, boundary),
+			).rejects.toThrow("lacks the recorded Ask result");
+		});
+	});
+
+	it("rejects legacy pending approval records without a tool-call identity", async () => {
+		await withPersistedApprovalSession(async (cwd, manager, sessionId) => {
+			await askAndPersistExecutionApproval(cwd, manager, "legacy-boundary");
+			const recordPath = deepInterviewExecutionApprovalRecordPath(cwd, sessionId);
+			const record = (await readJson(recordPath)) as Record<string, unknown>;
+			const boundary = { ...(record.transcript_boundary as Record<string, unknown>) };
+			delete boundary.approval_tool_call_id;
+			await Bun.write(recordPath, `${JSON.stringify({ ...record, transcript_boundary: boundary })}\n`);
+			const approved = await approvePersistedCrystal(cwd, sessionId);
+			expect(approved.status).toBe(2);
+			expect(approved.stderr).toContain("approval");
+		});
+	});
+
 	it("accepts fresh Ask consent for invalidated Crystal v2 while retaining v1 audit and rejecting replay", async () => {
 		await withPersistedApprovalSession(async (cwd, manager, sessionId) => {
 			await askAndPersistExecutionApproval(cwd, manager, "approval-v1");
@@ -546,7 +644,7 @@ describe("gjc state handoff", () => {
 			expect((await handoff()).status).toBe(2);
 			await askAndPersistExecutionApproval(cwd, manager, "ralplan-renewal-v2", "ralplan");
 			const consumedV2 = (await readJson(recordPath))!;
-			expect(consumedV2.status).toBe("consumed");
+			expect(consumedV2.status).toBe("pending");
 			expect(consumedV2.approval_stage).toBe("ralplan");
 			expect(consumedV2.ralplan_run_id).toBe(runId);
 			expect(consumedV2.crystal_spec_version).toBe(2);
@@ -555,12 +653,7 @@ describe("gjc state handoff", () => {
 			expect(consumedV2.question_id).not.toBe(consumedV1.question_id);
 			expect(consumedV2.gate_id).not.toBe(consumedV1.gate_id);
 			expect(await readJson(`${recordPath}.1.${consumedV1.spec_sha256}.consumed`)).toEqual(consumedV1);
-			const approvedState = (await readJson(modeStatePath(cwd, sessionId, "deep-interview")))!;
-			expect((approvedState.state as Record<string, unknown>).execution_approval).toBe("approved");
-			await expect(
-				askAndPersistExecutionApproval(cwd, manager, "ralplan-renewal-replay", "ralplan"),
-			).rejects.toThrow("already consumed");
-			expect((await approvePersistedCrystal(cwd, sessionId)).status).toBe(2);
+			expect((await approvePersistedCrystal(cwd, sessionId)).status).toBe(0);
 			const ready = await runNativeStateCommand(
 				["write", "--mode", "ralplan", "--input", JSON.stringify({ current_phase: "handoff" }), "--json"],
 				cwd,
@@ -569,6 +662,11 @@ describe("gjc state handoff", () => {
 			expect(await readJson(modeStatePath(cwd, sessionId, "ultragoal"))).toBeNull();
 			const admitted = await handoff();
 			expect(admitted.status, admitted.stderr).toBe(0);
+			await expect(
+				askAndPersistExecutionApproval(cwd, manager, "ralplan-renewal-replay", "ralplan"),
+			).rejects.toThrow("current final plan");
+			const approvedState = (await readJson(modeStatePath(cwd, sessionId, "deep-interview")))!;
+			expect((approvedState.state as Record<string, unknown>).execution_approval).toBe("approved");
 			expect((await readJson(modeStatePath(cwd, sessionId, "ultragoal")))?.handoff_from).toBe("ralplan");
 			expect((await readJson(recordPath))?.status).toBe("consumed");
 		});

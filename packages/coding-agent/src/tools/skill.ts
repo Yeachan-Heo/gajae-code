@@ -209,6 +209,20 @@ export class SkillTool implements AgentTool<typeof skillSchema, SkillToolDetails
 				}
 				const cwd = this.#session.cwd;
 				const sessionId = activeState?.session_id?.trim();
+				if (activeSkill === "ralplan" && requestedName === "ultragoal") {
+					if (!sessionId) {
+						throw new ToolError("skill tool: Ralplan to Ultragoal handoff requires a session id");
+					}
+					const approval = await runNativeStateCommand(
+						["approve-execution", "--mode", "ralplan", "--session-id", sessionId, "--json"],
+						this.#session.cwd,
+					);
+					if (approval.status !== 0) {
+						throw new ToolError(
+							`skill tool: Ralplan execution approval failed (status=${approval.status}): ${(approval.stderr ?? "").trim() || "no detail"}`,
+						);
+					}
+				}
 				const handoffArgs = ["handoff", "--mode", activeSkill, "--to", requestedName, "--json"];
 				if (sessionId) {
 					handoffArgs.push("--session-id", sessionId);
