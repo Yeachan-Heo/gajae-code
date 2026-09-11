@@ -3052,11 +3052,14 @@ export class AgentSession {
 	 */
 	#registerRuntimeStateFinalizer(): void {
 		this.#unregisterRuntimeStateFinalizer?.();
-		const currentContext = () => ({
-			sessionId: this.sessionId,
-			cwd: this.sessionManager.getCwd(),
-			sessionFile: this.sessionManager.getSessionFile(),
-		});
+		const currentContext = () => {
+			const identity = { sessionId: this.sessionId, cwd: this.sessionManager.getCwd() };
+			return {
+				...identity,
+				sessionFile: this.sessionManager.getSessionFile(),
+				stateFile: this.#runtimeStateMarkerFile(identity),
+			};
+		};
 		this.#unregisterRuntimeStateFinalizer = registerCoordinatorRuntimeStateFinalizer(
 			currentContext(),
 			currentContext,
@@ -6158,19 +6161,30 @@ export class AgentSession {
 		);
 	}
 
+	/**
+	 * The runtime-state marker THIS session owns, or `null` when it has none.
+	 *
+	 * The process-wide `GJC_COORDINATOR_SESSION_STATE_FILE` pin describes exactly one session:
+	 * the one the launcher minted it for. A nested in-process session — the role-agent/subagent
+	 * fan-out — is a different session, so it must never read or write the parent's marker. The
+	 * sidecar's identity fence refuses every such write (the reported 102x rejection while a
+	 * fan-out was live), and a write that did land would rewrite the parent's lifecycle under
+	 * the child's identity. A nested session therefore owns its own session-derived marker.
+	 */
+	#runtimeStateMarkerFile(input: { sessionId: string; cwd: string }): string | null {
+		if (!input.sessionId.trim()) return null;
+		const pinned = process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]?.trim();
+		if (this.taskDepth > 0) return path.join(sessionRuntimeDir(input.cwd, input.sessionId), "runtime-state.json");
+		return pinned || path.join(sessionRuntimeDir(input.cwd, input.sessionId), "runtime-state.json");
+	}
+
 	#captureCoordinatorRuntimeStatePersistContext(): CoordinatorRuntimeStatePersistContext {
 		const context = {
 			sessionId: this.sessionId,
 			cwd: this.sessionManager.getCwd(),
 			sessionFile: this.sessionManager.getSessionFile(),
 		};
-		const explicitStateFile = process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]?.trim();
-		const stateFile =
-			explicitStateFile ||
-			(context.sessionId.trim()
-				? path.join(sessionRuntimeDir(context.cwd, context.sessionId), "runtime-state.json")
-				: null);
-		return { ...context, stateFile };
+		return { ...context, stateFile: this.#runtimeStateMarkerFile(context) };
 	}
 
 	/**

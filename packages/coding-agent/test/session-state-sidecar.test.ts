@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, setSystemTime, spyOn } from "bun:test";
-import { generateKeyPairSync, verify } from "node:crypto";
+import { createHash, generateKeyPairSync, verify } from "node:crypto";
 import type { PathLike, StatOptions } from "node:fs";
 import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
@@ -76,6 +76,16 @@ function assistantEnd(text: string, stopReason: "stop" | "error" = "stop") {
 			},
 		],
 	};
+}
+
+/** Await a runtime-state write and return the refusal it must produce. */
+async function expectRefusal(promise: Promise<unknown>): Promise<Error> {
+	try {
+		await promise;
+	} catch (error) {
+		return error as Error;
+	}
+	throw new Error("expected the runtime-state write to be refused, but it succeeded");
 }
 
 function expectCompactJson(raw: string): RuntimePayload {
@@ -433,7 +443,7 @@ describe("coordinator runtime state sidecar", () => {
 				{ type: "agent_start" },
 				{ sessionId: "fallback", cwd: root, sessionFile: null },
 			),
-		).rejects.toThrow("invalid or unreadable");
+		).rejects.toThrow("this launch requires Coordinator sidecar signing but its signing key material is missing");
 		expect(await Bun.file(stateFile).exists()).toBe(false);
 
 		// The signer is captured and removed before runtime initialization. Supplying
@@ -445,7 +455,7 @@ describe("coordinator runtime state sidecar", () => {
 				{ type: "turn_start" },
 				{ sessionId: "fallback", cwd: root, sessionFile: null },
 			),
-		).rejects.toThrow("invalid or unreadable");
+		).rejects.toThrow("this launch requires Coordinator sidecar signing but its signing key material is missing");
 		expect(await Bun.file(stateFile).exists()).toBe(false);
 	});
 
@@ -667,7 +677,7 @@ describe("coordinator runtime state sidecar", () => {
 				{ type: "agent_end", messages: [] },
 				{ sessionId: "fallback", cwd: root, sessionFile: null },
 			),
-		).rejects.toThrow("Existing runtime state marker is invalid or unreadable; refusing to overwrite.");
+		).rejects.toThrow("Existing runtime state marker violates the lifecycle contract: the marker is not valid JSON");
 		expect(await Bun.file(stateFile).text()).toBe(evidence);
 
 		await expect(
@@ -676,7 +686,7 @@ describe("coordinator runtime state sidecar", () => {
 				cwd: root,
 				sessionFile: null,
 			}),
-		).rejects.toThrow("Existing runtime state marker is invalid or unreadable; refusing to overwrite.");
+		).rejects.toThrow("Existing runtime state marker violates the lifecycle contract: the marker is not valid JSON");
 		expect(await Bun.file(stateFile).text()).toBe(evidence);
 	});
 
@@ -684,7 +694,7 @@ describe("coordinator runtime state sidecar", () => {
 		"state",
 		"ready_for_input",
 		"live",
-	])("does not echo structurally invalid marker field %s into diagnostics", async field => {
+	])("names structurally invalid marker field %s without echoing its text", async field => {
 		const root = await tempRoot();
 		const stateFile = path.join(root, "invalid-field.json");
 		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
@@ -704,11 +714,123 @@ describe("coordinator runtime state sidecar", () => {
 			sessionFile: null,
 		}).catch((error: unknown) => error);
 		expect(failure).toBeInstanceOf(Error);
-		expect(failure).toMatchObject({
-			name: "PreviousRuntimeStateReadError",
-			message: "Existing runtime state marker is invalid or unreadable; refusing to overwrite.",
-		});
+		expect((failure as Error).name).toBe("PreviousRuntimeStateReadError");
+		const message = (failure as Error).message;
+		// The failing field is named and the offending bytes are pinned by digest...
+		expect(message).toContain(`Existing runtime state marker violates the lifecycle contract: ${field} `);
+		expect(message).toMatch(/payload sha256 [a-f0-9]{64}/);
+		// ...while the marker's own text never reaches an operator-visible diagnostic.
+		expect(message).not.toContain("untrusted-marker-text");
+		expect(message).not.toContain("\x1b");
 		expect(await Bun.file(stateFile).text()).toBe(evidence);
+	});
+
+	it("binds a shape refusal to the exact marker bytes by digest", async () => {
+		const root = await tempRoot();
+		const stateFile = path.join(root, "digest-state.json");
+		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
+		process.env[GJC_COORDINATOR_SESSION_ID_ENV] = "digest-session";
+		const evidence = JSON.stringify({
+			schema_version: 1,
+			session_id: "digest-session",
+			state: "prepared",
+			ready_for_input: "no thanks",
+			live: null,
+		});
+		await Bun.write(stateFile, evidence);
+
+		const failure = await expectRefusal(
+			persistCoordinatorRuntimeStateFromEvent(
+				{ type: "turn_start" },
+				{ sessionId: "fallback", cwd: root, sessionFile: null },
+			),
+		);
+
+		expect(failure.message).toContain("ready_for_input must be a boolean when present (received a string (9 chars))");
+		expect(failure.message).toContain(`payload sha256 ${createHash("sha256").update(evidence).digest("hex")}`);
+	});
+
+	it("reads back the coordinator-only prepared lifecycle the shared projection writes", async () => {
+		const root = await tempRoot();
+		const stateFile = path.join(root, "shared-projection.json");
+		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
+		process.env[GJC_COORDINATOR_SESSION_ID_ENV] = "prepared-session";
+		// Exactly what the coordinator's projection writer emits for a prepared session
+		// (server.ts writeSessionStateUnlocked): readiness withheld, no runtime identity
+		// fields, and no sidecar signature. The runtime sidecar owns the same file, so it
+		// has to read every lifecycle value the coordinator may leave behind (#5473).
+		await Bun.write(
+			stateFile,
+			`${JSON.stringify({
+				schema_version: 1,
+				session_id: "prepared-session",
+				state: "prepared",
+				ready_for_input: false,
+				current_turn_id: null,
+				last_turn_id: null,
+				updated_at: "2026-09-10T08:09:09.000Z",
+				source: "coordinator",
+				live: null,
+				reason: null,
+			})}\n`,
+		);
+
+		await persistCoordinatorRuntimeStateFromEvent(
+			{ type: "turn_start" },
+			{ sessionId: "fallback", cwd: root, sessionFile: null },
+		);
+
+		expect(await readPayload(stateFile)).toMatchObject({ session_id: "prepared-session", state: "running" });
+	});
+
+	it("keeps a nested session that owns its marker off the pinned parent marker", async () => {
+		const root = await tempRoot();
+		const pinnedFile = path.join(root, "projections", "session-states", "parent-session.json");
+		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = pinnedFile;
+		// The coordinator-launched runtime carries no GJC_COORDINATOR_SESSION_ID, so a
+		// nested session is identified by the session id it actually runs under.
+		delete process.env[GJC_COORDINATOR_SESSION_ID_ENV];
+		await persistCoordinatorRuntimeStateFromEvent(
+			{ type: "turn_start" },
+			{ sessionId: "parent-session", cwd: root, sessionFile: null },
+		);
+		const parentMarker = await Bun.file(pinnedFile).text();
+
+		// An in-process role-agent/subagent run shares this process's environment but is a
+		// different session, so it owns a session-derived marker instead of the parent's.
+		const childFile = path.join(sessionRuntimeDir(root, "child-scope"), "runtime-state.json");
+		await persistCoordinatorRuntimeStateFromEvent(
+			{ type: "turn_start" },
+			{ sessionId: "child-scope", cwd: root, sessionFile: null, stateFile: childFile },
+		);
+
+		expect(await readPayload(childFile)).toMatchObject({ session_id: "child-scope", state: "running" });
+		expect(await Bun.file(pinnedFile).text()).toBe(parentMarker);
+	});
+
+	it("names the owning session when a foreign session reaches for a pinned marker", async () => {
+		const root = await tempRoot();
+		const pinnedFile = path.join(root, "projections", "session-states", "parent-session.json");
+		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = pinnedFile;
+		delete process.env[GJC_COORDINATOR_SESSION_ID_ENV];
+		await persistCoordinatorRuntimeStateFromEvent(
+			{ type: "turn_start" },
+			{ sessionId: "parent-session", cwd: root, sessionFile: null },
+		);
+		const parentMarker = await Bun.file(pinnedFile).text();
+
+		const failure = await expectRefusal(
+			persistCoordinatorRuntimeStateFromEvent(
+				{ type: "turn_start" },
+				{ sessionId: "child-scope", cwd: root, sessionFile: null },
+			),
+		);
+
+		// The 102x live rejection (#5473) was opaque; it must now say which session the
+		// marker belongs to and which marker this write was aimed at.
+		expect(failure.message).toContain('session_id must be "child-scope" (received "parent-session")');
+		expect(failure.message).toContain(`using marker ${JSON.stringify(pinnedFile)}`);
+		expect(await Bun.file(pinnedFile).text()).toBe(parentMarker);
 	});
 
 	it("reports a live transition timeout without misclassifying or changing runtime state", async () => {
@@ -759,7 +881,9 @@ describe("coordinator runtime state sidecar", () => {
 				{ type: "turn_start" },
 				{ sessionId: "fallback", cwd: root, sessionFile: null },
 			),
-		).rejects.toThrow("Existing runtime state marker is invalid or unreadable; refusing to overwrite.");
+		).rejects.toThrow(
+			"Existing runtime state marker violates the lifecycle contract: the marker path is not a regular file",
+		);
 		expect((await fs.stat(stateFile)).isDirectory()).toBe(true);
 
 		await expect(
@@ -768,7 +892,9 @@ describe("coordinator runtime state sidecar", () => {
 				cwd: root,
 				sessionFile: null,
 			}),
-		).rejects.toThrow("Existing runtime state marker is invalid or unreadable; refusing to overwrite.");
+		).rejects.toThrow(
+			"Existing runtime state marker violates the lifecycle contract: the marker path is not a regular file",
+		);
 		expect((await fs.stat(stateFile)).isDirectory()).toBe(true);
 	});
 
@@ -791,7 +917,9 @@ describe("coordinator runtime state sidecar", () => {
 					{ type: "turn_start" },
 					{ sessionId: "fallback", cwd: root, sessionFile: null },
 				),
-			).rejects.toThrow("Existing runtime state marker is invalid or unreadable; refusing to overwrite.");
+			).rejects.toThrow(
+				"Existing runtime state marker violates the lifecycle contract: the marker could not be read (EACCES)",
+			);
 		} finally {
 			stat.mockRestore();
 		}
@@ -809,7 +937,9 @@ describe("coordinator runtime state sidecar", () => {
 					cwd: root,
 					sessionFile: null,
 				}),
-			).rejects.toThrow("Existing runtime state marker is invalid or unreadable; refusing to overwrite.");
+			).rejects.toThrow(
+				"Existing runtime state marker violates the lifecycle contract: the marker could not be read (EACCES)",
+			);
 		} finally {
 			readFileSync.mockRestore();
 		}
@@ -1877,7 +2007,9 @@ describe("coordinator runtime state sidecar", () => {
 					cwd: root,
 					sessionFile: null,
 				}),
-			).rejects.toThrow("invalid or unreadable");
+			).rejects.toThrow(
+				'Existing runtime state marker violates the lifecycle contract: session_id must be "current-session" (received "stale-session")',
+			);
 		} finally {
 			process.exitCode = previousExitCode;
 		}
