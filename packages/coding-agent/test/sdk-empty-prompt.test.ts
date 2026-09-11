@@ -1,7 +1,10 @@
 import { expect, test } from "bun:test";
+import * as fs from "node:fs/promises";
+import { tmpdir } from "node:os";
+import * as path from "node:path";
 import { PublicCommandFailure, renderPublicCommandFailure } from "../src/cli/public-command-errors";
 import { acpPromptPayload } from "../src/modes/acp/acp-agent";
-import { runSdkSessionCli } from "../src/sdk/cli/session-cli";
+import { readSecureJsonInputFile, runSdkSessionCli, SDK_JSON_INPUT_FILE_MAX_BYTES } from "../src/sdk/cli/session-cli";
 import { dispatchControl } from "../src/sdk/host/control/dispatch";
 import { validateRequiredPromptText } from "../src/sdk/protocol/adapter-validation";
 import { OPERATIONS } from "../src/sdk/protocol/operation-registry";
@@ -57,6 +60,27 @@ test("SDK session send rejects empty text before broker startup and operation al
 			value: expect.any(String),
 		});
 		expect(rendered.exitCode).toBe(2);
+	}
+});
+
+test("secure JSON input files are bounded and descriptor-bound", async () => {
+	const root = await fs.mkdtemp(path.join(tmpdir(), "gjc-json-input-"));
+	try {
+		const input = path.join(root, "input.json");
+		await fs.writeFile(input, '{"text":"safe"}', { mode: 0o600 });
+		expect(await readSecureJsonInputFile(input)).toBe('{"text":"safe"}');
+
+		if (process.platform !== "win32") {
+			const link = path.join(root, "input-link.json");
+			await fs.symlink(input, link);
+			await expect(readSecureJsonInputFile(link)).rejects.toMatchObject({ code: "input_file_unavailable" });
+		}
+
+		const oversized = path.join(root, "oversized.json");
+		await fs.writeFile(oversized, Buffer.alloc(SDK_JSON_INPUT_FILE_MAX_BYTES + 1), { mode: 0o600 });
+		await expect(readSecureJsonInputFile(oversized)).rejects.toMatchObject({ code: "usage" });
+	} finally {
+		await fs.rm(root, { recursive: true, force: true });
 	}
 });
 
