@@ -912,13 +912,16 @@ describe("file lock cleanup failure handling (#2478)", () => {
 	});
 
 	test.skipIf(process.platform === "win32")(
-		"retains an unowned removal transition and reports bounded contention before publication",
+		"aborts immediately for an old truncated removal transition and preserves the orphan",
 		async () => {
 			const lockedFile = path.join(await makeTemp(), "state.json");
 			const lockDir = `${lockedFile}.lock`;
 			const detachedPath = `${lockDir}.removing`;
+			const infoPath = path.join(detachedPath, "info");
 			await fs.mkdir(detachedPath);
-			await Bun.write(path.join(detachedPath, "info"), "");
+			await Bun.write(infoPath, "");
+			const old = new Date(Date.now() - 120_000);
+			await fs.utimes(infoPath, old, old);
 			const retainedIdentity = await fs.stat(detachedPath, { bigint: true });
 			let publications = 0;
 			let entered = false;
@@ -930,26 +933,67 @@ describe("file lock cleanup failure handling (#2478)", () => {
 				renameDirectoryNoReplacePathAsync,
 			});
 
-			await expect(
-				withFileLock(
-					lockedFile,
-					async () => {
-						entered = true;
-					},
-					{ retries: 2, retryDelayMs: 1 },
-				),
-			).rejects.toMatchObject({
+			const failure = await withFileLock(
+				lockedFile,
+				async () => {
+					entered = true;
+				},
+				{ retries: 12_000, retryDelayMs: 5 },
+			).catch(error => error);
+			expect(failure).toBeInstanceOf(FileLockAcquireError);
+			expect(failure).toMatchObject({
 				code: "acquire_timeout",
-				holder: expect.stringContaining("blocked by retained removal transition"),
+				reason: "orphan_transition",
+				orphanPath: detachedPath,
+				attempts: 1,
 			});
+			if (!(failure instanceof FileLockAcquireError)) throw new Error("Expected a file lock acquisition failure");
+			expect(failure.message).toContain(`orphan_transition at ${detachedPath}`);
 			expect(entered).toBe(false);
 			expect(publications).toBe(0);
 			expect(await fs.exists(lockDir)).toBe(false);
 			const retained = await fs.stat(detachedPath, { bigint: true });
 			expect(retained.dev).toBe(retainedIdentity.dev);
 			expect(retained.ino).toBe(retainedIdentity.ino);
-			expect(await Bun.file(path.join(detachedPath, "info")).text()).toBe("");
+			expect(await Bun.file(infoPath).text()).toBe("");
 			expect(await fs.readdir(path.dirname(lockDir))).toEqual([path.basename(detachedPath)]);
+		},
+	);
+
+	test.skipIf(process.platform === "win32")("waits for a live removal transition owner", async () => {
+		const lockedFile = path.join(await makeTemp(), "live-transition.json");
+		const detachedPath = `${lockedFile}.lock.removing`;
+		await writeInfo(detachedPath, { pid: process.pid, timestamp: Date.now(), owner_token: "live-transition" });
+
+		const failure = await withFileLock(lockedFile, async () => undefined, { retries: 2, retryDelayMs: 1 }).catch(
+			error => error,
+		);
+		expect(failure).toMatchObject({
+			code: "acquire_timeout",
+			reason: "acquire_timeout",
+			attempts: 2,
+			holder: expect.stringContaining("blocked by retained removal transition"),
+		});
+		expect(await fs.exists(detachedPath)).toBe(true);
+	});
+
+	test.skipIf(process.platform === "win32")(
+		"classifies a dead removal transition owner as abandoned without deleting it",
+		async () => {
+			const lockedFile = path.join(await makeTemp(), "dead-transition.json");
+			const detachedPath = `${lockedFile}.lock.removing`;
+			await writeInfo(detachedPath, { pid: DEAD_PID, timestamp: Date.now(), owner_token: "dead-transition" });
+
+			const failure = await withFileLock(lockedFile, async () => undefined, { retries: 2, retryDelayMs: 1 }).catch(
+				error => error,
+			);
+			expect(failure).toMatchObject({
+				code: "acquire_timeout",
+				reason: "acquire_timeout",
+				attempts: 2,
+				holder: expect.stringContaining("blocked by abandoned removal transition"),
+			});
+			expect(await fs.exists(detachedPath)).toBe(true);
 		},
 	);
 

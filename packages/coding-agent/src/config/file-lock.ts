@@ -32,6 +32,8 @@ export interface FileLockOptions {
 	previousOwnerHostIds?: readonly string[];
 }
 
+export type FileLockAcquireReason = "acquire_timeout" | "orphan_transition";
+
 export class FileLockAcquireError extends Error {
 	readonly code = "acquire_timeout";
 
@@ -40,9 +42,12 @@ export class FileLockAcquireError extends Error {
 		readonly lockPath: string,
 		readonly attempts: number,
 		readonly holder: string,
+		readonly reason: FileLockAcquireReason = "acquire_timeout",
+		readonly orphanPath?: string,
 	) {
+		const detail = reason === "orphan_transition" && orphanPath ? `orphan_transition at ${orphanPath}` : holder;
 		super(
-			`Failed to acquire lock for ${filePath} after ${attempts} attempts: ${holder} (${lockPath}); ` +
+			`Failed to acquire lock for ${filePath} after ${attempts} attempts: ${detail} (${lockPath}); ` +
 				`a live owner is never displaced — if this is an SDK broker (gjc sdk session list), it must finish or be stopped before retrying; ` +
 				`the lock is a directory, remove it only by deleting the directory (${lockPath}) once no live owner remains`,
 		);
@@ -486,14 +491,39 @@ function fileLockRemovalTransitionPath(lockPath: string): string {
 	return `${lockPath}.removing`;
 }
 
-async function fileLockRemovalTransitionExists(lockPath: string): Promise<boolean> {
+type FileLockRemovalTransitionState = "active" | "abandoned" | "orphan_transition";
+type FileLockOrphanTransition = { kind: "orphan_transition"; path: string };
+type FileLockAcquisitionResult = LockInfo | FileLockOrphanTransition | null;
+
+async function classifyFileLockRemovalTransition(
+	lockPath: string,
+	orphanAgeMs: number,
+	ownerHostId?: string,
+	previousOwnerHostIds: readonly string[] = [],
+): Promise<FileLockRemovalTransitionState | null> {
+	const transitionPath = fileLockRemovalTransitionPath(lockPath);
 	try {
-		await fs.lstat(fileLockRemovalTransitionPath(lockPath));
-		return true;
+		const transition = await fs.lstat(transitionPath);
+		if (!transition.isDirectory() || transition.isSymbolicLink()) return "active";
 	} catch (error) {
-		if (isEnoent(error)) return false;
+		if (isEnoent(error)) return null;
 		throw error;
 	}
+
+	const observation = await readLockInfoObservation(transitionPath);
+	if (!observation) return "active";
+	const info = parseLockInfoBytes(observation.bytes);
+	if (info) {
+		const stale = await staleLockSnapshot(transitionPath, 0, ownerHostId, previousOwnerHostIds);
+		return stale.stale ? "abandoned" : "active";
+	}
+
+	const infoAgeMs = Date.now() - Number(observation.state.file.mtimeNs / 1_000_000n);
+	return Number.isFinite(infoAgeMs) && infoAgeMs >= orphanAgeMs ? "orphan_transition" : "active";
+}
+
+function isFileLockOrphanTransition(value: FileLockAcquisitionResult): value is FileLockOrphanTransition {
+	return value !== null && "kind" in value && value.kind === "orphan_transition";
 }
 
 function sameFileLockTreeAfterPublication(
@@ -1097,10 +1127,12 @@ export async function genericFileLockDirStaleVerdict(
 
 async function tryAcquireLock(
 	lockPath: string,
-	ownerHostId?: string,
+	ownerHostId: string | undefined,
+	orphanTransitionAgeMs: number,
+	previousOwnerHostIds: readonly string[],
 	ownerToken = crypto.randomUUID(),
 	onAcquired?: () => void,
-): Promise<LockInfo | null> {
+): Promise<FileLockAcquisitionResult> {
 	await ensureLockParent(path.dirname(lockPath));
 	const afterParentMkdir = FileLockTestHooks.afterParentMkdir;
 	if (afterParentMkdir) await afterParentMkdir(lockPath);
@@ -1129,7 +1161,15 @@ async function tryAcquireLock(
 			// POSIX exact tree removal owns this deterministic sibling from detach
 			// until cleanup. The outer acquisition loop supplies the existing bounded
 			// contention wait while the predecessor retains that namespace.
-			if (await fileLockRemovalTransitionExists(destinationPath)) return null;
+			const transitionState = await classifyFileLockRemovalTransition(
+				destinationPath,
+				orphanTransitionAgeMs,
+				ownerHostId,
+				previousOwnerHostIds,
+			);
+			if (transitionState === "orphan_transition")
+				return { kind: "orphan_transition", path: fileLockRemovalTransitionPath(destinationPath) };
+			if (transitionState !== null) return null;
 			const staged = snapshotDirectoryTree(canonicalPendingPath);
 			if (!staged.ok || !staged.snapshot) {
 				const failure = new Error(
@@ -1173,27 +1213,37 @@ async function tryAcquireLock(
 		// predecessor atomically detaches its lock before this no-replace publish.
 		// Roll this exact staged tree back to its UUID path before reporting
 		// contention; never delete or rename the predecessor's `.removing` tree.
-		if (stagedSnapshot && (await fileLockRemovalTransitionExists(destinationPath))) {
-			const publishedSnapshot = snapshotDirectoryTree(destinationPath);
-			if (
-				!publishedSnapshot.ok ||
-				!publishedSnapshot.snapshot ||
-				!sameFileLockTreeAfterPublication(stagedSnapshot, publishedSnapshot.snapshot)
-			) {
-				const failure = new Error(
-					`Failed to verify published file lock before transition rollback: ${publishedSnapshot.code ?? "identity_mismatch"}.`,
-				) as NodeJS.ErrnoException;
-				if (publishedSnapshot.code) failure.code = publishedSnapshot.code;
-				throw failure;
-			}
-			await rollbackPublishedFileLock(
-				canonicalParent,
+		if (stagedSnapshot) {
+			const transitionState = await classifyFileLockRemovalTransition(
 				destinationPath,
-				canonicalPendingPath,
-				publishedSnapshot.snapshot,
+				orphanTransitionAgeMs,
+				ownerHostId,
+				previousOwnerHostIds,
 			);
-			removePending = true;
-			return null;
+			if (transitionState !== null) {
+				const publishedSnapshot = snapshotDirectoryTree(destinationPath);
+				if (
+					!publishedSnapshot.ok ||
+					!publishedSnapshot.snapshot ||
+					!sameFileLockTreeAfterPublication(stagedSnapshot, publishedSnapshot.snapshot)
+				) {
+					const failure = new Error(
+						`Failed to verify published file lock before transition rollback: ${publishedSnapshot.code ?? "identity_mismatch"}.`,
+					) as NodeJS.ErrnoException;
+					if (publishedSnapshot.code) failure.code = publishedSnapshot.code;
+					throw failure;
+				}
+				await rollbackPublishedFileLock(
+					canonicalParent,
+					destinationPath,
+					canonicalPendingPath,
+					publishedSnapshot.snapshot,
+				);
+				removePending = true;
+				return transitionState === "orphan_transition"
+					? { kind: "orphan_transition", path: fileLockRemovalTransitionPath(destinationPath) }
+					: null;
+			}
 		}
 		// Published and transition-free above, so an onAcquired failure must
 		// propagate instead of retrying an acquisition that already owns the lock.
@@ -1410,10 +1460,26 @@ async function releaseLock(lockPath: string, owner: FileLockOwnerToken, knownKey
  * Bounded, actionable description of who holds `lockPath` at exhaustion time.
  * Never a stealing authority: purely diagnostic, read once after the last retry.
  */
-async function lockHolderDescription(lockPath: string): Promise<string> {
+async function lockHolderDescription(
+	lockPath: string,
+	orphanTransitionAgeMs: number,
+	ownerHostId?: string,
+	previousOwnerHostIds: readonly string[] = [],
+): Promise<string> {
 	try {
-		if (process.platform !== "win32" && (await fileLockRemovalTransitionExists(lockPath))) {
-			return "blocked by retained removal transition; retry the owning process cleanup or inspect the exact orphan manually; unproven transition ownership is never removed";
+		if (process.platform !== "win32") {
+			const transitionState = await classifyFileLockRemovalTransition(
+				lockPath,
+				orphanTransitionAgeMs,
+				ownerHostId,
+				previousOwnerHostIds,
+			);
+			if (transitionState === "orphan_transition")
+				return `orphan_transition at ${fileLockRemovalTransitionPath(lockPath)}`;
+			if (transitionState === "abandoned")
+				return `blocked by abandoned removal transition at ${fileLockRemovalTransitionPath(lockPath)}; inspect and remove the directory manually once no publisher remains`;
+			if (transitionState === "active")
+				return "blocked by retained removal transition; retry the owning process cleanup or inspect the exact orphan manually; unproven transition ownership is never removed";
 		}
 		let info = await readLockInfo(lockPath);
 		let bytes: string | null = null;
@@ -1470,6 +1536,8 @@ export async function acquireFileLock(filePath: string, options: FileLockOptions
 	if (options.previousOwnerHostIds?.some(hostId => !hostId))
 		throw new Error("previousOwnerHostIds must contain only non-empty identities");
 	const opts = { ...DEFAULT_OPTIONS, ...options };
+	const orphanTransitionAgeMs = Math.max(0, opts.retries * opts.retryDelayMs);
+
 	if (opts.signal?.aborted) throw opts.signal.reason ?? new Error("File lock acquisition aborted");
 	const lockPath = getLockPath(filePath);
 	await ensureLockParent(path.dirname(lockPath));
@@ -1488,10 +1556,26 @@ export async function acquireFileLock(filePath: string, options: FileLockOptions
 			await retryPendingLocalRelease(lockPath, localKey);
 			continue;
 		}
-		const owner = await tryAcquireLock(lockPath, opts.ownerHostId, ownerToken, opts.onAcquired);
-		if (owner) {
-			localLockStates.set(localKey, { owner, status: "held" });
-			return () => releaseLock(lockPath, owner, localKey);
+		const result = await tryAcquireLock(
+			lockPath,
+			opts.ownerHostId,
+			orphanTransitionAgeMs,
+			opts.previousOwnerHostIds ?? [],
+			ownerToken,
+			opts.onAcquired,
+		);
+		if (isFileLockOrphanTransition(result))
+			throw new FileLockAcquireError(
+				filePath,
+				lockPath,
+				attempt + 1,
+				`orphan transition retained at ${result.path}`,
+				"orphan_transition",
+				result.path,
+			);
+		if (result) {
+			localLockStates.set(localKey, { owner: result, status: "held" });
+			return () => releaseLock(lockPath, result, localKey);
 		}
 		const pendingKey = await pendingLocalReleaseKey(lockPath, localKey);
 		const localState = localLockStates.get(pendingKey ?? localKey);
@@ -1526,7 +1610,12 @@ export async function acquireFileLock(filePath: string, options: FileLockOptions
 			opts.signal.removeEventListener("abort", onAbort);
 		}
 	}
-	throw new FileLockAcquireError(filePath, lockPath, opts.retries, await lockHolderDescription(lockPath));
+	throw new FileLockAcquireError(
+		filePath,
+		lockPath,
+		opts.retries,
+		await lockHolderDescription(lockPath, orphanTransitionAgeMs, opts.ownerHostId, opts.previousOwnerHostIds ?? []),
+	);
 }
 
 /**
