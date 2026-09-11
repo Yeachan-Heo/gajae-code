@@ -53,6 +53,7 @@ import type {
 	StreamOptions,
 	ToolCall,
 } from "../types";
+import { kProviderResolvedToolCall, type ProviderResolvedCarrier } from "../utils/block-symbols";
 import { AssistantMessageEventStream } from "../utils/event-stream";
 import { getStreamFirstEventTimeoutMs, getStreamIdleTimeoutMs } from "../utils/idle-iterator";
 
@@ -93,8 +94,8 @@ const DEVIN_ACP_STDERR_TAIL_BYTES = 4 * 1024;
 /**
  * How GJC answers Devin's `session/request_permission` prompts.
  *
- * - `"allow"` (default) selects the least-permissive grant the agent offered
- *   (`allow_once` before `allow_always`). Devin then runs that one action.
+ * - `"allow"` (default) selects `allow_once`. A request that offers no
+ *   `allow_once` is cancelled: GJC never grants a persistent approval on its own.
  * - `"deny"` selects `reject_once` before `reject_always`.
  *
  * Neither mode escalates persistently on its own, and an unrecognized
@@ -220,13 +221,19 @@ export function devinAcpSelectOptions(
 	return entries;
 }
 
-/** Select the least-permissive option matching the configured policy. */
+/**
+ * Select the option matching the configured policy.
+ *
+ * `allow` grants a single action and never a persistent one: when the agent
+ * offers no `allow_once`, the request is cancelled rather than escalated to
+ * `allow_always`. `deny` may fall back to `reject_always`, because a persistent
+ * refusal only reduces what the agent may do.
+ */
 export function devinAcpSelectPermissionOption(
 	options: ReadonlyArray<PermissionOption>,
 	mode: DevinAcpPermissionMode,
 ): { optionId: string } | null {
-	const preferred =
-		mode === "allow" ? (["allow_once", "allow_always"] as const) : (["reject_once", "reject_always"] as const);
+	const preferred = mode === "allow" ? (["allow_once"] as const) : (["reject_once", "reject_always"] as const);
 	for (const kind of preferred) {
 		const found = options.find(option => option.kind === kind);
 		if (found) return { optionId: found.optionId };
@@ -377,7 +384,7 @@ function upsertToolCall(turn: ActiveTurn, toolCall: AcpToolCall | ToolCallUpdate
 		return;
 	}
 	if (existingOnly) return;
-	const block: ToolCall = {
+	const block: ToolCall & ProviderResolvedCarrier = {
 		type: "toolCall",
 		id: toolCall.toolCallId,
 		name: devinAcpDisplayToolName(kind, "name" in toolCall ? toolCall.name : undefined),
@@ -386,6 +393,9 @@ function upsertToolCall(turn: ActiveTurn, toolCall: AcpToolCall | ToolCallUpdate
 			_acp: acpAnnotation(toolCall.toolCallId, kind, status),
 		},
 		...(title.length > 0 ? { intent: title } : {}),
+		// The agent already ran this call. The marker is what stops the GJC agent
+		// loop from dispatching it to a local tool of the same display name.
+		[kProviderResolvedToolCall]: true,
 	};
 	const created = turn.output.content.length;
 	turn.output.content.push(block);

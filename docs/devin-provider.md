@@ -107,7 +107,7 @@ permission policy gates. GJC answers from an explicit policy:
 
 | `GJC_DEVIN_PERMISSION_MODE` | Behavior |
 | --- | --- |
-| unset / `allow` (default) | Grant the least-privileged option Devin offered — `allow_once` before `allow_always`. One action per prompt: GJC never escalates to a persistent grant on its own. |
+| unset / `allow` (default) | Grants `allow_once`. A request that offers no `allow_once` is **cancelled**: GJC never grants a persistent approval on its own. |
 | `deny` | Reject with `reject_once` (or `reject_always` when that is the only refusal offered). |
 | any other value | Fails closed to `deny`. |
 

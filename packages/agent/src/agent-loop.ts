@@ -34,7 +34,7 @@ import {
 	neutralizeReservedControlTokens,
 	stripUnusableReasoningItems,
 } from "@gajae-code/ai/utils";
-import { isCursorExecResolved } from "@gajae-code/ai/utils/block-symbols";
+import { copyProviderResolvedToolCall, isProviderResolvedToolCall } from "@gajae-code/ai/utils/block-symbols";
 import {
 	attachUnicodeEscapeEvidence,
 	type UnicodeEscapeEvidence,
@@ -2107,6 +2107,7 @@ function managedAssistantShell(
 	}
 	const content = rawArray === undefined ? [] : rawArray.flatMap(managedContentBlock);
 	restoreTransientUnicodeEscapeEvidence(content, value);
+	restoreProviderResolvedMarkers(content, value);
 	const usage = managedAssistantUsage(managedAttemptSnapshot(managedProperty(source, "usage")));
 	const api = managedProperty(source, "api");
 	const provider = managedProperty(source, "provider");
@@ -2179,6 +2180,32 @@ function managedAssistantShell(
 function managedContentBlock(block: unknown): AssistantMessage["content"] {
 	const normalized = managedAssistantContent(block);
 	return normalized ? [normalized] : [];
+}
+
+/**
+ * Carry the in-process provider-resolved marker across a managed snapshot.
+ *
+ * A managed shell deep-snapshots content, and symbol keys do not survive that.
+ * Losing the marker would let the loop dispatch a tool call the provider already
+ * executed, so it is re-attached by tool-call identity (`id` plus `name`), the
+ * same way transient unicode-escape evidence is restored.
+ */
+function restoreProviderResolvedMarkers(destination: AssistantMessage["content"], source: unknown): void {
+	const sourceContent = managedProperty(source, "content");
+	if (!Array.isArray(sourceContent)) return;
+	const marked = sourceContent.filter(
+		(block): block is object => typeof block === "object" && block !== null && isProviderResolvedToolCall(block),
+	);
+	if (marked.length === 0) return;
+	for (const destinationBlock of destination) {
+		if (destinationBlock.type !== "toolCall") continue;
+		const matches = marked.filter(
+			candidate =>
+				managedProperty(candidate, "id") === destinationBlock.id &&
+				managedProperty(candidate, "name") === destinationBlock.name,
+		);
+		if (matches.length === 1) copyProviderResolvedToolCall(destinationBlock, matches[0] as object);
+	}
 }
 
 function managedUnicodeEscapeEvidence(value: unknown): UnicodeEscapeEvidence | undefined {
@@ -2835,6 +2862,10 @@ class ManagedAttemptTransaction {
 				snapshotBlock = normalized;
 				snapshot.content[index] = snapshotBlock;
 			}
+			// A lossless snapshot must stay lossless for the in-process marker that
+			// tells the loop a provider already executed this call. Dropping it here
+			// would make the loop dispatch the provider's own tool call locally.
+			copyProviderResolvedToolCall(snapshotBlock, sourceBlock);
 			if (metadata) {
 				const detachedMetadata = escapedToolCallMetadata(snapshotBlock);
 				const evidencePresenceChanged = Boolean(metadata.evidence) !== Boolean(detachedMetadata.evidence);
@@ -4205,7 +4236,7 @@ async function runLoopBody(
 				// This maintains the tool_use/tool_result pairing that the API requires
 				type ToolCallContent = Extract<AssistantMessage["content"][number], { type: "toolCall" }>;
 				const toolCalls = message.content.filter(
-					(c): c is ToolCallContent => c.type === "toolCall" && !isCursorExecResolved(c),
+					(c): c is ToolCallContent => c.type === "toolCall" && !isProviderResolvedToolCall(c),
 				);
 				const toolResults: ToolResultMessage[] = [];
 				for (const toolCall of toolCalls) {
@@ -4238,7 +4269,7 @@ async function runLoopBody(
 			// Check for tool calls
 			type ToolCallContent = Extract<AssistantMessage["content"][number], { type: "toolCall" }>;
 			const toolCalls = message.content.filter(
-				(c): c is ToolCallContent => c.type === "toolCall" && !isCursorExecResolved(c),
+				(c): c is ToolCallContent => c.type === "toolCall" && !isProviderResolvedToolCall(c),
 			);
 			hasMoreToolCalls = toolCalls.length > 0;
 
@@ -5035,7 +5066,7 @@ async function executeToolCalls(
 	} = config;
 	type ToolCallContent = Extract<AssistantMessage["content"][number], { type: "toolCall" }>;
 	const toolCalls = assistantMessage.content.filter(
-		(c): c is ToolCallContent => c.type === "toolCall" && !isCursorExecResolved(c),
+		(c): c is ToolCallContent => c.type === "toolCall" && !isProviderResolvedToolCall(c),
 	);
 	const emittedToolResults: ToolResultMessage[] = [];
 	const toolCallInfos = toolCalls.map(call => ({ id: call.id, name: call.name }));

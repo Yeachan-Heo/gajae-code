@@ -266,6 +266,24 @@ describe("devin permission policy", () => {
 		expect(assistantText(message)).toBe('decision:{"outcome":"cancelled"}');
 	});
 
+	test("cancels rather than escalating to allow_always when allow_once is not offered", async () => {
+		const { message } = await drain(
+			streamDevinAcp(devinModel(), userContext("clean up"), fixtureTurn("permission-allow-always-only")),
+		);
+		expect(assistantText(message)).toBe('decision:{"outcome":"cancelled"}');
+	});
+
+	test("deny may fall back to reject_always when reject_once is not offered", async () => {
+		const { message } = await drain(
+			streamDevinAcp(
+				devinModel(),
+				userContext("clean up"),
+				fixtureTurn("permission-allow-always-only", { permissionMode: "deny" }),
+			),
+		);
+		expect(assistantText(message)).toBe('decision:{"outcome":"selected","optionId":"reject-always"}');
+	});
+
 	test("honours an explicit permission handler", async () => {
 		const { message } = await drain(
 			streamDevinAcp(

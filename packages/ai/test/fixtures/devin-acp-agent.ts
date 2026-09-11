@@ -144,11 +144,18 @@ class FixtureAgent implements Agent {
 				return { stopReason: "end_turn" };
 			}
 			case "permission":
-			case "permission-reject-only": {
+			case "permission-reject-only":
+			case "permission-allow-always-only": {
 				const allowOnce = { optionId: "allow-once", name: "Allow once", kind: "allow_once" as const };
 				const allowAlways = { optionId: "allow-always", name: "Always allow", kind: "allow_always" as const };
 				const rejectOnce = { optionId: "reject-once", name: "Reject", kind: "reject_once" as const };
-				const options = scenario === "permission-reject-only" ? [rejectOnce] : [allowOnce, allowAlways, rejectOnce];
+				const rejectAlways = { optionId: "reject-always", name: "Always reject", kind: "reject_always" as const };
+				const options =
+					scenario === "permission-reject-only"
+						? [rejectOnce]
+						: scenario === "permission-allow-always-only"
+							? [allowAlways, rejectAlways]
+							: [allowOnce, allowAlways, rejectOnce];
 				const response = await this.#connection.requestPermission({
 					sessionId,
 					toolCall: { toolCallId: "call-perm", title: "Delete build output", kind: "delete" },
