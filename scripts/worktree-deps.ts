@@ -21,7 +21,17 @@ export const WORKTREE_SETUP_STEPS = "bun install && bun run build:native";
 /** Entry point whose import exercises the real native-addon loader. */
 export const NATIVE_ENTRY_PATH = path.join("packages", "natives", "native", "index.js");
 
-export type WorkspaceDependencyStatus = "ready" | "missing-node-modules" | "unresolved-workspace-packages";
+export type WorkspaceDependencyStatus =
+	| "ready"
+	| "missing-node-modules"
+	| "unresolved-workspace-packages"
+	| "foreign-workspace-links";
+
+/** A `node_modules/@gajae-code/*` symlink whose real target is outside this checkout. */
+export interface ForeignWorkspaceLink {
+	link: string;
+	target: string;
+}
 
 export interface WorkspaceDependencySnapshot {
 	repoRoot: string;
@@ -30,6 +40,8 @@ export interface WorkspaceDependencySnapshot {
 	/** Workspace packages that declare a root entry point and must resolve for tests. */
 	workspacePackages: string[];
 	unresolvedPackages: string[];
+	/** Resolvable package links that point into another checkout (stale cross-worktree install). */
+	foreignWorkspaceLinks: ForeignWorkspaceLink[];
 	status: WorkspaceDependencyStatus;
 }
 
@@ -40,6 +52,7 @@ export interface WorkspaceDependencyProbe {
 	/** Whether a resolved package entry point is a real, importable path. */
 	packageTargetExists?: (resolvedPath: string) => boolean;
 	listWorkspacePackages?: (repoRoot: string) => string[];
+	findForeignWorkspaceLinks?: (repoRoot: string) => ForeignWorkspaceLink[];
 }
 
 export interface NativeAddonProbeResult {
@@ -83,6 +96,49 @@ function defaultResolvePackage(specifier: string, fromDir: string): string {
  */
 function defaultPackageTargetExists(resolvedPath: string): boolean {
 	return fs.existsSync(resolvedPath);
+}
+
+/**
+ * Workspace links that resolve into another checkout. They import fine, but
+ * the tests then exercise the other worktree's sources, so the checkout must
+ * not be reported ready. Broken symlinks are left to the resolution probe.
+ */
+export function findForeignWorkspaceLinks(repoRoot: string): ForeignWorkspaceLink[] {
+	const scopeDir = path.join(repoRoot, "node_modules", "@gajae-code");
+	let entries: string[];
+	try {
+		entries = fs.readdirSync(scopeDir);
+	} catch {
+		return [];
+	}
+	let repoRootReal: string;
+	try {
+		repoRootReal = fs.realpathSync(repoRoot);
+	} catch {
+		repoRootReal = repoRoot;
+	}
+	const foreign: ForeignWorkspaceLink[] = [];
+	for (const entry of entries.sort()) {
+		const link = path.join(scopeDir, entry);
+		let isSymlink: boolean;
+		try {
+			isSymlink = fs.lstatSync(link).isSymbolicLink();
+		} catch {
+			continue;
+		}
+		if (!isSymlink) continue;
+		let target: string;
+		try {
+			target = fs.realpathSync(link);
+		} catch {
+			// Dangling links are the resolution probe's job, not the locality check's.
+			continue;
+		}
+		if (target !== repoRootReal && !target.startsWith(repoRootReal + path.sep)) {
+			foreign.push({ link, target });
+		}
+	}
+	return foreign;
 }
 
 /**
@@ -142,33 +198,56 @@ export function inspectWorkspaceDependencies(probe: WorkspaceDependencyProbe): W
 			}
 		}
 	}
+	const foreignWorkspaceLinks = nodeModulesPresent
+		? (probe.findForeignWorkspaceLinks ?? findForeignWorkspaceLinks)(repoRoot)
+		: [];
 	const status: WorkspaceDependencyStatus = !nodeModulesPresent
 		? "missing-node-modules"
 		: unresolvedPackages.length > 0
 			? "unresolved-workspace-packages"
-			: "ready";
-	return { repoRoot, nodeModulesDir, nodeModulesPresent, workspacePackages, unresolvedPackages, status };
+			: foreignWorkspaceLinks.length > 0
+				? "foreign-workspace-links"
+				: "ready";
+	return {
+		repoRoot,
+		nodeModulesDir,
+		nodeModulesPresent,
+		workspacePackages,
+		unresolvedPackages,
+		foreignWorkspaceLinks,
+		status,
+	};
 }
 
 /** The fail-fast message the test preload throws when the checkout cannot run tests. */
 export function formatWorkspaceDependencyFailure(snapshot: WorkspaceDependencySnapshot): string {
-	const reason =
-		snapshot.status === "missing-node-modules"
-			? `node_modules/ is absent at ${snapshot.nodeModulesDir}.`
-			: `node_modules/ exists but these workspace packages do not resolve: ${snapshot.unresolvedPackages.join(", ")}.`;
-	return [
-		"",
-		"✗ Workspace dependencies are not installed in this checkout.",
-		"",
-		`  ${reason}`,
-		"",
-		"  Tests cannot resolve @gajae-code/* workspace packages, so every run fails with a",
-		'  bare "Cannot find module" error before the suite starts. This is expected in a',
-		"  fresh `git worktree add` checkout.",
-		"",
-		...WORKTREE_SETUP_HELP,
-		"",
-	].join("\n");
+	const lines: string[] = ["", "✗ Workspace dependencies are not usable in this checkout.", ""];
+	if (snapshot.status === "missing-node-modules") {
+		lines.push(
+			`  node_modules/ is absent at ${snapshot.nodeModulesDir}.`,
+			"",
+			"  Tests cannot resolve @gajae-code/* workspace packages, so every run fails with a",
+			'  bare "Cannot find module" error before the suite starts. This is expected in a',
+			"  fresh `git worktree add` checkout.",
+		);
+	} else if (snapshot.status === "foreign-workspace-links") {
+		lines.push(
+			"  node_modules/@gajae-code/* links point outside this checkout:",
+			...snapshot.foreignWorkspaceLinks.map(({ link, target }) => `    ${link} -> ${target}`),
+			"",
+			"  Those packages resolve, but against another checkout's sources, so a green suite",
+			"  would not be evidence for this checkout. Treat it as a stale cross-worktree install.",
+		);
+	} else {
+		lines.push(
+			`  node_modules/ exists but these workspace packages do not resolve: ${snapshot.unresolvedPackages.join(", ")}.`,
+			"",
+			"  Tests cannot import them, so every run fails with a bare module-resolution error",
+			"  before the suite starts.",
+		);
+	}
+	lines.push("", ...WORKTREE_SETUP_HELP, "");
+	return lines.join("\n");
 }
 
 /**
@@ -205,14 +284,18 @@ function indentBlock(text: string, maxLines: number): string {
 /** Human-readable `dev:doctor --worktree` report. */
 export function formatWorktreeReport(report: WorktreeReport): string {
 	const { snapshot, native } = report;
-	const lines = [
-		`Worktree readiness: ${snapshot.repoRoot}`,
-		`  node_modules:       ${snapshot.nodeModulesPresent ? "present" : "ABSENT"} (${snapshot.nodeModulesDir})`,
+	const workspaceLine =
 		snapshot.status === "ready"
 			? `  workspace packages: ${snapshot.workspacePackages.length}/${snapshot.workspacePackages.length} resolve`
 			: snapshot.status === "missing-node-modules"
 				? "  workspace packages: unknown (node_modules absent)"
-				: `  workspace packages: unresolved: ${snapshot.unresolvedPackages.join(", ")}`,
+				: snapshot.status === "foreign-workspace-links"
+					? `  workspace packages: ${snapshot.foreignWorkspaceLinks.length} link(s) point outside this checkout`
+					: `  workspace packages: unresolved: ${snapshot.unresolvedPackages.join(", ")}`;
+	const lines = [
+		`Worktree readiness: ${snapshot.repoRoot}`,
+		`  node_modules:       ${snapshot.nodeModulesPresent ? "present" : "ABSENT"} (${snapshot.nodeModulesDir})`,
+		workspaceLine,
 		`  native addon:       ${native.ok ? "loads" : "UNAVAILABLE"} (${native.entryPath})`,
 	];
 	if (!native.ok && native.output) lines.push(indentBlock(native.output, 20));

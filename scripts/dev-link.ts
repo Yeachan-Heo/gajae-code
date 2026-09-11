@@ -24,7 +24,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { formatWorktreeReport, inspectWorktree } from "./worktree-deps";
+import { findForeignWorkspaceLinks, formatWorktreeReport, inspectWorktree } from "./worktree-deps";
 
 const repoRoot = path.join(import.meta.dir, "..");
 const cliSource = path.join(repoRoot, "packages", "coding-agent", "src", "cli.ts");
@@ -319,30 +319,14 @@ function assertResolvedGjcMatchesTarget(winner: GjcHit | undefined, expectedReal
 }
 
 function assertWorkspaceLinksLocal(): void {
-	const repoRootReal = realpath(repoRoot) ?? repoRoot;
-	const scopeDir = path.join(repoRoot, "node_modules", "@gajae-code");
-	let entries: string[];
-	try {
-		entries = fs.readdirSync(scopeDir);
-	} catch {
-		return;
-	}
-	const stale: Array<{ link: string; real: string }> = [];
-	for (const entry of entries) {
-		const link = path.join(scopeDir, entry);
-		try {
-			if (!fs.lstatSync(link).isSymbolicLink()) continue;
-		} catch {
-			continue;
-		}
-		const real = realpath(link);
-		if (real && !real.startsWith(repoRootReal + path.sep)) stale.push({ link, real });
-	}
+	// Shared with the test preload's dependency probe so the doctor and an actual
+	// `bun test` run agree on what counts as a usable install.
+	const stale = findForeignWorkspaceLinks(repoRoot);
 	if (stale.length === 0) return;
 	console.error("✗ Workspace symlinks point outside this checkout (stale cross-worktree install):");
-	for (const { link, real } of stale) {
+	for (const { link, target } of stale) {
 		console.error(`    ${link}`);
-		console.error(`      -> ${real}`);
+		console.error(`      -> ${target}`);
 	}
 	console.error("  Fix: rm -rf node_modules/@gajae-code && bun install");
 	process.exit(1);

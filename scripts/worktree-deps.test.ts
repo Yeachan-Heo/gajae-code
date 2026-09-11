@@ -5,6 +5,7 @@ import * as path from "node:path";
 import {
 	WORKTREE_SETUP_COMMAND,
 	WORKTREE_SETUP_STEPS,
+	findForeignWorkspaceLinks,
 	formatWorkspaceDependencyFailure,
 	formatWorktreeReport,
 	inspectWorkspaceDependencies,
@@ -28,6 +29,14 @@ async function tempRoot(prefix: string): Promise<string> {
 async function writeWorkspacePackage(root: string, dir: string, manifest: Record<string, unknown>): Promise<void> {
 	await fs.mkdir(path.join(root, "packages", dir), { recursive: true });
 	await Bun.write(path.join(root, "packages", dir, "package.json"), JSON.stringify(manifest));
+}
+
+/** A real, resolvable workspace package: manifest plus the entry file it exports. */
+async function writeResolvableWorkspacePackage(root: string, dir: string, manifest: Record<string, unknown>): Promise<string> {
+	await writeWorkspacePackage(root, dir, manifest);
+	const entry = path.join(root, "packages", dir, "src", "index.ts");
+	await Bun.write(entry, "export {};\n");
+	return entry;
 }
 
 describe("workspace dependency inspection", () => {
@@ -90,6 +99,25 @@ describe("workspace dependency inspection", () => {
 		expect(snapshot.unresolvedPackages).toEqual(["@gajae-code/utils"]);
 	});
 
+	test("flags workspace links that resolve into another checkout", () => {
+		const snapshot = inspectWorkspaceDependencies({
+			repoRoot: "/nonexistent/worktree",
+			nodeModulesExists: () => true,
+			listWorkspacePackages: () => ["@gajae-code/utils"],
+			resolvePackage: () => "/elsewhere/packages/utils/src/index.ts",
+			packageTargetExists: () => true,
+			findForeignWorkspaceLinks: () => [
+				{ link: "/nonexistent/worktree/node_modules/@gajae-code/utils", target: "/elsewhere/packages/utils" },
+			],
+		});
+		expect(snapshot.status).toBe("foreign-workspace-links");
+		expect(snapshot.unresolvedPackages).toEqual([]);
+		const message = formatWorkspaceDependencyFailure(snapshot);
+		expect(message).toContain("/nonexistent/worktree/node_modules/@gajae-code/utils -> /elsewhere/packages/utils");
+		expect(message).toContain("another checkout's sources");
+		expect(message).toContain(WORKTREE_SETUP_COMMAND);
+	});
+
 	test("failure message names the worktree-safe command and warns off install:dev", () => {
 		const message = formatWorkspaceDependencyFailure(
 			inspectWorkspaceDependencies({
@@ -121,8 +149,56 @@ describe("workspace dependency inspection", () => {
 	});
 });
 
-describe("workspace package discovery", () => {
-	test("includes workspace packages with a root entry point and skips manifest-only artifacts", async () => {
+describe("real-filesystem defaults", () => {
+	test("pins the default target-exists check with a dangling workspace symlink on disk", async () => {
+		const root = await tempRoot("gjc-worktree-dangling-");
+		await writeWorkspacePackage(root, "utils", { name: "@gajae-code/utils", exports: { ".": "./src/index.ts" } });
+		const scopeDir = path.join(root, "node_modules", "@gajae-code");
+		await fs.mkdir(scopeDir, { recursive: true });
+		await fs.symlink(path.join(root, "packages", "utils-missing"), path.join(scopeDir, "utils"));
+
+		const snapshot = inspectWorkspaceDependencies({ repoRoot: root });
+		expect(snapshot.status).toBe("unresolved-workspace-packages");
+		expect(snapshot.unresolvedPackages).toEqual(["@gajae-code/utils"]);
+	});
+
+	test("detects a real workspace link that resolves into another checkout", async () => {
+		const root = await tempRoot("gjc-worktree-foreign-");
+		const other = await tempRoot("gjc-worktree-other-");
+		await writeResolvableWorkspacePackage(other, "utils", {
+			name: "@gajae-code/utils",
+			exports: { ".": "./src/index.ts" },
+		});
+		await writeResolvableWorkspacePackage(root, "utils", {
+			name: "@gajae-code/utils",
+			exports: { ".": "./src/index.ts" },
+		});
+		const scopeDir = path.join(root, "node_modules", "@gajae-code");
+		await fs.mkdir(scopeDir, { recursive: true });
+		await fs.symlink(path.join(other, "packages", "utils"), path.join(scopeDir, "utils"));
+
+		const links = findForeignWorkspaceLinks(root);
+		expect(links).toHaveLength(1);
+		expect(links[0]?.target).toBe(await fs.realpath(path.join(other, "packages", "utils")));
+		expect(inspectWorkspaceDependencies({ repoRoot: root }).status).toBe("foreign-workspace-links");
+	});
+
+	test("does not flag workspace links that stay inside the checkout", async () => {
+		const root = await tempRoot("gjc-worktree-local-");
+		await writeResolvableWorkspacePackage(root, "utils", {
+			name: "@gajae-code/utils",
+			exports: { ".": "./src/index.ts" },
+		});
+		const scopeDir = path.join(root, "node_modules", "@gajae-code");
+		await fs.mkdir(scopeDir, { recursive: true });
+		await fs.symlink(path.join(root, "packages", "utils"), path.join(scopeDir, "utils"));
+
+		expect(findForeignWorkspaceLinks(root)).toEqual([]);
+		expect(inspectWorkspaceDependencies({ repoRoot: root }).status).toBe("ready");
+	});
+});
+
+describe("workspace package discovery", () => {	test("includes workspace packages with a root entry point and skips manifest-only artifacts", async () => {
 		const root = await tempRoot("gjc-worktree-packages-");
 		await writeWorkspacePackage(root, "utils", {
 			name: "@gajae-code/utils",
@@ -183,6 +259,7 @@ describe("worktree readiness report", () => {
 				nodeModulesPresent: true,
 				workspacePackages: ["@gajae-code/utils"],
 				unresolvedPackages: [],
+				foreignWorkspaceLinks: [],
 				status: "ready",
 			},
 			native: { ok: true, entryPath: "/nonexistent/worktree/packages/natives/native/index.js", output: "" },
@@ -239,7 +316,7 @@ describe("test preload worktree guard", () => {
 		const output = `${result.stdout.toString()}${result.stderr.toString()}`;
 
 		expect(result.exitCode).not.toBe(0);
-		expect(output).toContain("Workspace dependencies are not installed in this checkout");
+		expect(output).toContain("Workspace dependencies are not usable in this checkout");
 		expect(output).toContain(WORKTREE_SETUP_COMMAND);
 		expect(output).toContain(WORKTREE_SETUP_STEPS);
 		expect(output).toContain("node_modules/ is absent");
