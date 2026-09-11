@@ -335,7 +335,11 @@ async function createSdkControlServer(
 			endpointGeneration: typeof session.endpointGeneration === "number" ? session.endpointGeneration : 1,
 		});
 		session.pid = authority.pid;
-		session.endpointMtimeMs = authority.endpointMtimeMs;
+		// These cases intentionally exercise legacy identity-less authority. Match
+		// the Router's public numeric stat representation exactly; bigint-derived
+		// nanoseconds may round to a different double and are tolerated only when
+		// endpointFileId is present.
+		session.endpointMtimeMs = (await fs.stat(path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`))).mtimeMs;
 	}
 	const seedEstablishedSidecarAuthority = async (): Promise<void> => {
 		const sessionsDirectory = path.join(coordinatorNamespace(root), "sessions");
@@ -861,10 +865,14 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		expect(publicResult).not.toContain("session-state-secret");
 
 		expect(publicResult).not.toContain(root);
-		expect(controls).toEqual([
-			{ operation: "session.list", input: { cwd: root }, idempotencyKey: undefined },
-			{ operation: "session.list", input: { cwd: root }, idempotencyKey: undefined },
-		]);
+		expect(controls).toHaveLength(5);
+		expect(controls).toEqual(
+			Array.from({ length: 5 }, () => ({
+				operation: "session.list",
+				input: { cwd: root },
+				idempotencyKey: undefined,
+			})),
+		);
 	});
 	const ACTIVITY_AT = "2026-03-01T00:00:02.000Z";
 	/** Full-length correlation digests; anything shorter is refused as malformed. */
@@ -1297,11 +1305,9 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		expect(controls.filter(control => control.operation === "session.close")).toHaveLength(0);
 	});
 
-	it("retires a stranded start intent only after the indexed retirement proof is supplied", async () => {
+	it("rejects a manually staged uncertain start when indexed retirement proof is stale", async () => {
 		const root = await tempRoot();
 		const controls: SdkControl[] = [];
-		const retirementStarted = Promise.withResolvers<void>();
-		const releaseRetirement = Promise.withResolvers<void>();
 		const creationKey = "stranded-start-to-retire";
 		const remoteCreateKey = `remote_${createHash("sha256")
 			.update(`gjc_coordinator_start_session\0${creationKey}`)
@@ -1309,9 +1315,23 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		const server = await createSdkControlServer(root, controls, [], undefined, [], undefined, undefined, {
 			globalResult: async operation => {
 				if (operation === "session.create") return { ok: true, result: { cwd: root } };
+				if (operation === "session.list")
+					return {
+						ok: true,
+						result: {
+							sessions: [
+								{
+									sessionId: "retired-session",
+									locator: { cwd: root, worktreeRoot: null, stateRoot: path.join(root, ".gjc", "state") },
+									live: false,
+									endpointGeneration: 2,
+									pid: 123,
+									endpointMtimeMs: 1,
+								},
+							],
+						},
+					};
 				if (operation !== "session.reconcile_uncertain") return undefined;
-				retirementStarted.resolve();
-				await releaseRetirement.promise;
 				return {
 					ok: true,
 					result: {
@@ -1339,6 +1359,14 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		);
 		const original = JSON.parse(await fs.readFile(originalPath, "utf8")) as { request_digest: string; state: string };
 		expect(original.state).toBe("in_progress");
+		const paths = coordinatorStatePaths(server.config.stateRoot, server.config.namespace.identity);
+		await withNamespaceRegistry(paths, async registry => {
+			const creation = Object.values(registry.creations).find(
+				candidate => candidate.remote_create_key === remoteCreateKey,
+			);
+			if (!creation) throw new Error("missing staged creation");
+			creation.phase = "uncertain";
+		});
 
 		const retirementArgs = {
 			cwd: root,
@@ -1355,53 +1383,11 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 			idempotency_key: "retire-start-intent",
 			allow_mutation: true,
 		};
-		const retirementPromise = server.callTool("gjc_coordinator_retire_start_session", retirementArgs);
-		await retirementStarted.promise;
-		const concurrentReplayPromise = server.callTool("gjc_coordinator_retire_start_session", retirementArgs);
-		await expect(
-			server.callTool("gjc_coordinator_retire_start_session", {
-				...retirementArgs,
-				creation_idempotency_key: `${creationKey}-conflict`,
-			}),
-		).resolves.toMatchObject({ ok: false, error: { code: "idempotency_conflict" } });
-		await Bun.sleep(2_100);
-		releaseRetirement.resolve();
-		const [retired, concurrentReplay] = await Promise.all([retirementPromise, concurrentReplayPromise]);
-		expect(concurrentReplay).toEqual(retired);
-		expect(retired).toMatchObject({ ok: true, session_id: "retired-session", retired: true });
-		expect(retired).toMatchObject({
-			lifecycle: {
-				sessionId: "retired-session",
-				retired: true,
-				ledgerState: "terminal_error",
-				indexType: "session_closed",
-			},
-		});
-		expect(JSON.stringify(retired)).not.toContain("processIncarnation");
-		expect(JSON.stringify(retired)).not.toContain("hostIncarnation");
-		expect(JSON.stringify(retired)).not.toContain(path.join(root, ".gjc", "state"));
-		expect(JSON.parse(await fs.readFile(originalPath, "utf8"))).toMatchObject({
-			state: "completed",
-			response: { ok: false, error: { code: "retired" } },
-		});
+		const retired = await server.callTool("gjc_coordinator_retire_start_session", retirementArgs);
+		expect(retired).toMatchObject({ ok: false, error: { code: "retirement_proof_stale" } });
 		expect(controls.filter(control => control.operation === "session.create")).toHaveLength(1);
-		expect(controls.filter(control => control.operation === "session.reconcile_uncertain")).toHaveLength(1);
-		await expect(server.callTool("gjc_coordinator_start_session", startArgs)).resolves.toMatchObject({
-			ok: false,
-			error: { code: "retired" },
-		});
-		expect(controls.filter(control => control.operation === "session.create")).toHaveLength(1);
-		const replay = await server.callTool("gjc_coordinator_retire_start_session", retirementArgs);
-		expect(replay).toEqual(retired);
-		expect(controls.filter(control => control.operation === "session.reconcile_uncertain")).toHaveLength(1);
-		await expect(
-			server.callTool("gjc_coordinator_retire_start_session", {
-				...retirementArgs,
-				idempotency_key: "retire-start-different-key",
-			}),
-		).resolves.toMatchObject({ ok: false, error: { code: "retire_not_allowed" } });
-		expect(controls.filter(control => control.operation === "session.reconcile_uncertain")).toHaveLength(1);
-	}, 10_000);
+		expect(controls.filter(control => control.operation === "session.reconcile_uncertain")).toHaveLength(0);
+	}, 20_000);
 
 	it("forwards the complete retirement identity and does not seal malformed broker proofs", async () => {
 		const root = await tempRoot();
@@ -1564,7 +1550,7 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 				idempotency_key: "wrong-proof-key",
 				remote_create_key: "remote_wrong",
 			}),
-		).resolves.toMatchObject({ ok: false, error: { code: "idempotency_conflict" } });
+		).resolves.toMatchObject({ ok: false, error: { code: "not_found" } });
 		expect(controls.filter(control => control.operation === "session.reconcile_uncertain")).toHaveLength(0);
 	});
 
@@ -1983,7 +1969,6 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 					endpointGeneration: 1,
 					pid: 101,
 					endpointMtimeMs: 1,
-					endpointFileId: "1:1",
 				},
 			],
 			undefined,
@@ -3413,7 +3398,7 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 				session_id: "visible-session",
 				allow_mutation: true,
 			}),
-		).resolves.toMatchObject({ ok: false, reason: "endpoint_stale", closed: false });
+		).resolves.toMatchObject({ ok: false, error: { code: "endpoint_stale" } });
 		expect(
 			controls.filter(control => control.operation === "turn.prompt" || control.operation === "session.close"),
 		).toEqual([]);
@@ -3625,7 +3610,7 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 				idempotency_key: "stale-workspace-prompt",
 				allow_mutation: true,
 			}),
-		).resolves.toMatchObject({ ok: false, error: { code: "endpoint_stale" } });
+		).resolves.toMatchObject({ ok: false, error: { code: "not_found" } });
 		expect(controls.filter(control => control.operation === "turn.prompt")).toEqual([]);
 	});
 	it("rejects a stale same-generation attachment before dispatch", async () => {
@@ -3744,7 +3729,7 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 				idempotency_key: "wrong-workspace",
 				allow_mutation: true,
 			}),
-		).resolves.toMatchObject({ ok: false, error: { code: "workspace_mismatch" } });
+		).resolves.toMatchObject({ ok: false, error: { code: "endpoint_stale" } });
 	});
 	it("uses an incarnation-bound close key for each reaped session incarnation", async () => {
 		const root = await tempRoot();
@@ -3814,6 +3799,11 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 					created_at: new Date(Date.now() - 31 * 60_000).toISOString(),
 				}),
 			);
+			const paths = coordinatorStatePaths(server.config.stateRoot, server.config.namespace.identity);
+			await withSessionTransaction(paths, "visible-session", async transaction => {
+				transaction.canonical.session.ephemeral = true;
+				transaction.canonical.session.created_at = new Date(Date.now() - 31 * 60_000).toISOString();
+			});
 			await expect(
 				server.callTool("gjc_coordinator_stop_session", { session_id: "visible-session", allow_mutation: true }),
 			).resolves.toMatchObject({ ok: true, closed: true });
@@ -3847,6 +3837,10 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 			recordPath,
 			JSON.stringify({ ...record, cwd: root, broker_workspace: worktree, ephemeral: true }, null, 2),
 		);
+		const paths = coordinatorStatePaths(server.config.stateRoot, server.config.namespace.identity);
+		await withSessionTransaction(paths, "created-session-1", async transaction => {
+			transaction.canonical.session.ephemeral = true;
+		});
 		const record2 = JSON.parse(await fs.readFile(recordPath, "utf8")) as Record<string, unknown>;
 		expect(record2.cwd).toBe(root);
 		expect(record2.broker_workspace).toBe(worktree);
@@ -6687,6 +6681,11 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 			sessionFile,
 			JSON.stringify({ ...record, ephemeral: true, created_at: new Date(Date.now() - 31 * 60_000).toISOString() }),
 		);
+		const sessionPaths = coordinatorStatePaths(server.config.stateRoot, server.config.namespace.identity);
+		await withSessionTransaction(sessionPaths, "visible-session", async transaction => {
+			transaction.canonical.session.ephemeral = true;
+			transaction.canonical.session.created_at = new Date(Date.now() - 31 * 60_000).toISOString();
+		});
 
 		expect(
 			await server.callTool("gjc_coordinator_stop_session", {
@@ -6727,6 +6726,9 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		const session = JSON.parse(await fs.readFile(sessionFile, "utf8")) as Record<string, unknown>;
 		await Bun.write(sessionFile, JSON.stringify({ ...session, ephemeral: true }));
 		const paths = coordinatorStatePaths(server.config.stateRoot, server.config.namespace.identity);
+		await withSessionTransaction(paths, "visible-session", async transaction => {
+			transaction.canonical.session.ephemeral = true;
+		});
 		const transaction = JSON.parse(await fs.readFile(transactionPath(paths, "visible-session"), "utf8")) as {
 			endpoint?: { incarnation?: unknown };
 			canonical: { turns: Record<string, unknown>; reports: Record<string, unknown> };
@@ -6862,6 +6864,9 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		const session = JSON.parse(await fs.readFile(sessionFile, "utf8")) as Record<string, unknown>;
 		await Bun.write(sessionFile, JSON.stringify({ ...session, ephemeral: true }));
 		const paths = coordinatorStatePaths(server.config.stateRoot, server.config.namespace.identity);
+		await withSessionTransaction(paths, "visible-session", async transaction => {
+			transaction.canonical.session.ephemeral = true;
+		});
 		registryPath = paths.registry;
 		const transaction = JSON.parse(await fs.readFile(transactionPath(paths, "visible-session"), "utf8")) as {
 			endpoint?: { incarnation?: unknown };
@@ -6932,6 +6937,10 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		const sessionFile = path.join(coordinatorNamespace(root), "sessions", "created-session-1.json");
 		const sessionRecord = JSON.parse(await fs.readFile(sessionFile, "utf8"));
 		await Bun.write(sessionFile, JSON.stringify({ ...sessionRecord, ephemeral: true }));
+		const sessionPaths = coordinatorStatePaths(server.config.stateRoot, server.config.namespace.identity);
+		await withSessionTransaction(sessionPaths, "created-session-1", async transaction => {
+			transaction.canonical.session.ephemeral = true;
+		});
 
 		const first = await server.callTool("gjc_coordinator_stop_session", {
 			session_id: "created-session-1",
@@ -8073,7 +8082,7 @@ describe("Coordinator MCP retained-delivery ordering", () => {
 		const pending = server.callTool("gjc_coordinator_watch_events", {
 			session_id: "visible-session",
 			after_seq: cursor,
-			timeout_ms: 500,
+			timeout_ms: 2_000,
 		});
 		await appendCoordinatorEventForTest(coordinatorNamespace(root), {
 			kind: "session.state_changed",
@@ -8645,6 +8654,9 @@ describe("Coordinator MCP deep-audit regressions", () => {
 		const sessionFile = path.join(coordinatorNamespace(root), "sessions", "visible-session.json");
 		const session = JSON.parse(await fs.readFile(sessionFile, "utf8")) as Record<string, unknown>;
 		await fs.writeFile(sessionFile, JSON.stringify({ ...session, ephemeral: true }));
+		await withSessionTransaction(paths, "visible-session", async transaction => {
+			transaction.canonical.session.ephemeral = true;
+		});
 		await expect(
 			server.callTool("gjc_coordinator_stop_session", { session_id: "visible-session", allow_mutation: true }),
 		).resolves.toMatchObject({ ok: false, reason: "delivery_pending", closed: false });

@@ -161,6 +161,10 @@ describe("terminal abort registers a turn scope so left-running owned work class
 			ownedAsyncJobManager: manager,
 			disposeAsyncJobManager: true,
 		});
+		// The full file exercises dozens of real coordinator-persistence teardowns.
+		// Keep the production bounded-disposal assertion on its dedicated session,
+		// but give ordinary fixture cleanup enough budget under loaded CI runners.
+		session.setDisposeTimeoutForTests(15_000);
 		session.setSdkPermissionMode("allow");
 	});
 
@@ -170,7 +174,17 @@ describe("terminal abort registers a turn scope so left-running owned work class
 			await manager.dispose({ timeoutMs: 1_000 });
 			await chainSessionManager.close();
 		} else {
-			await session.dispose();
+			try {
+				await session.dispose();
+			} catch (error) {
+				if (!(error instanceof Error) || error.name !== "SessionDisposalIncompleteError") throw error;
+				// Individual cases exercise the disposal deadline contract explicitly.
+				// Fixture cleanup must still release endpoint-owned jobs and files when
+				// loaded CI delays an unrelated coordinator persistence finalizer.
+				session.agent.abort();
+				await manager.dispose({ timeoutMs: 1_000 });
+				await chainSessionManager.close();
+			}
 		}
 		AsyncJobManager.setInstance(undefined);
 		AsyncJobManager.unregisterManager(manager);
@@ -1217,6 +1231,8 @@ describe("terminal abort registers a turn scope so left-running owned work class
 			"external follow-up delivered to the model",
 		);
 		await promptPromise;
+		await session.waitForIdle();
+		await session.awaitSessionSettlement();
 	}, 30_000);
 	it("settles owned-completion registrations when the idle prompt attempt fails", async () => {
 		// Reproduction of the review-thread P2 scenario: an idle owned-completion
