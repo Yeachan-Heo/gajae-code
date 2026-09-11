@@ -3366,9 +3366,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		}
 		// MCP routing is scope-held; no process-global manager registration.
 
-		// General extension discovery is quarantined from the public SDK surface.
-		// Recognized hook conventions are the bounded exception: their descriptors
+		// Recognized hook conventions are a bounded additional source: their descriptors
 		// normalize before import and then adapt into the authoritative ExtensionRunner.
+		// General extension-module discovery runs further below, before that runner is built.
 		const inlineExtensions: ExtensionFactory[] = [...(options.extensions ?? [])];
 		const discoveredHookExtensions: Array<{ factory: ExtensionFactory; name: string }> = [];
 		if (customTools.length > 0) {
@@ -3619,19 +3619,36 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		// installed plugin bundles, the `extensions` setting, and explicitly
 		// supplied `additionalExtensionPaths`. `disableExtensionDiscovery` keeps its
 		// documented opt-out semantics: explicit paths still load, matching
-		// `cli/list-models.ts`. `preloadedExtensions` (CLI early load so extension
-		// flags exist before argument parsing) suppresses discovery entirely.
-		const extensionsResult: LoadExtensionsResult =
-			options.preloadedExtensions ??
-			(options.disableExtensionDiscovery
-				? await loadExtensions(options.additionalExtensionPaths ?? [], cwd, eventBus)
-				: await discoverAndLoadExtensions(
-						[...(options.additionalExtensionPaths ?? []), ...settings.get("extensions")],
-						cwd,
-						eventBus,
-						settings.get("disabledExtensions"),
-						{ agentDir, profileAuthority, settings },
-					));
+		// `cli/list-models.ts`. A caller-supplied `preloadedExtensions` result
+		// suppresses discovery entirely.
+		const explicitExtensionPaths = options.additionalExtensionPaths ?? [];
+		// Discovery must never block session creation: a filesystem or plugin-registry
+		// failure degrades to the explicit paths and then to no extensions at all.
+		const loadStartupExtensions = async (): Promise<LoadExtensionsResult> => {
+			try {
+				return options.disableExtensionDiscovery
+					? await loadExtensions(explicitExtensionPaths, cwd, eventBus)
+					: await discoverAndLoadExtensions(
+							[...explicitExtensionPaths, ...settings.get("extensions")],
+							cwd,
+							eventBus,
+							settings.get("disabledExtensions"),
+							{ agentDir, profileAuthority, settings },
+						);
+			} catch (error) {
+				logger.warn("Failed to discover extension modules", { error: safeErrorForLog(error) });
+				if (options.disableExtensionDiscovery) {
+					return { extensions: [], errors: [], runtime: new ExtensionRuntime() };
+				}
+				try {
+					return await loadExtensions(explicitExtensionPaths, cwd, eventBus);
+				} catch (fallbackError) {
+					logger.warn("Failed to load explicit extension paths", { error: safeErrorForLog(fallbackError) });
+					return { extensions: [], errors: [], runtime: new ExtensionRuntime() };
+				}
+			}
+		};
+		const extensionsResult: LoadExtensionsResult = options.preloadedExtensions ?? (await loadStartupExtensions());
 		if (options.preloadedExtensions === undefined) {
 			for (const { path: extPath, error } of extensionsResult.errors) {
 				logger.warn("Failed to load extension", { path: extPath, error });

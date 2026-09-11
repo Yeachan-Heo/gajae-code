@@ -739,7 +739,11 @@ async function discoverExtensionsInDir(dir: string): Promise<string[]> {
  * `getAgentDir()`.
  */
 export interface DiscoverExtensionsOptions {
-	/** Agent directory backing user-scope discovery. Default: `getAgentDir()`. */
+	/**
+	 * Agent directory backing user-scope discovery. Default: `getAgentDir()`.
+	 * Only the native capability provider is scoped this way; installed
+	 * plugin-bundle extension paths stay home-scoped by design.
+	 */
 	agentDir?: string;
 	/** Resolver-owned classification for `agentDir`. */
 	profileAuthority?: "default" | "custom";
@@ -764,6 +768,7 @@ export async function discoverAndLoadExtensions(
 	const isDisabledName = (name: string): boolean => disabled.has(`extension-module:${name}`);
 
 	const addPath = (extPath: string): void => {
+		if (isDisabledName(getExtensionNameFromPath(extPath))) return;
 		const resolved = path.resolve(extPath);
 		if (!seen.has(resolved)) {
 			seen.add(resolved);
@@ -772,10 +777,7 @@ export async function discoverAndLoadExtensions(
 	};
 
 	const addPaths = (paths: string[]) => {
-		for (const extPath of paths) {
-			if (isDisabledName(getExtensionNameFromPath(extPath))) continue;
-			addPath(extPath);
-		}
+		for (const extPath of paths) addPath(extPath);
 	};
 
 	// 1. Discover extension modules via capability API (native .gjc/.pi only)
@@ -787,7 +789,6 @@ export async function discoverAndLoadExtensions(
 	});
 	for (const ext of discovered.items) {
 		if (ext._source.provider !== "native") continue;
-		if (isDisabledName(ext.name)) continue;
 		addPath(ext.path);
 	}
 
@@ -797,7 +798,6 @@ export async function discoverAndLoadExtensions(
 	// 3. Explicitly configured paths
 	for (const configuredPath of configuredPaths) {
 		const resolved = resolvePath(configuredPath, cwd);
-
 		let stat: fs1.Stats | null = null;
 		try {
 			stat = await fs.stat(resolved);

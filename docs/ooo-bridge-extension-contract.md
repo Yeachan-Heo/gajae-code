@@ -58,7 +58,9 @@ Before command dispatch, the exact-prefix helper increments the Ouroboros bridge
 
 ### Runtime status
 
-Session startup loads filesystem extension modules. Unless `options.disableExtensionDiscovery` is set, `createAgentSession` calls `discoverAndLoadExtensions` with the explicit `options.additionalExtensionPaths`, the `extensions` setting, and the canonical native locations below, applying the `disabledExtensions` setting (`packages/coding-agent/src/sdk/session.ts`). `options.preloadedExtensions` still short-circuits discovery for callers that load extensions before argument parsing, and `disableExtensionDiscovery` keeps its documented opt-out semantics: explicit paths still load. A module that fails to import is reported through the shared logger and startup continues, so one broken module cannot block the session.
+Session startup loads filesystem extension modules. Unless `options.disableExtensionDiscovery` is set, `createAgentSession` calls `discoverAndLoadExtensions` with the explicit `options.additionalExtensionPaths`, the `extensions` setting, and the canonical native locations below, applying the `disabledExtensions` setting to every form (`disableExtensionDiscovery` keeps its documented opt-out semantics: explicit paths still load). `options.preloadedExtensions` short-circuits discovery for a caller that already loaded extensions. A discovered module that fails to import is reported through the shared logger and skipped while the remaining modules still load, and a discovery failure itself warns and degrades to the explicitly configured paths instead of failing session creation.
+
+Disabling one module is `disabledExtensions: ["extension-module:<name>"]`; the retired `--no-extensions` / `--extension` CLI flags are not a control surface here (ACP-only launch flags).
 
 A bridge installed under the locations below is therefore discovered and activated, and its `input` handler runs. `gjc customize doctor` is read-only and never executes a module, so it reports the module as `[stored-only]` and says why its dynamic registrations remain opaque:
 
