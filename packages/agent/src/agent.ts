@@ -542,7 +542,10 @@ export class Agent {
 	#onResponse?: SimpleStreamOptions["onResponse"];
 	#onSseEvent?: SimpleStreamOptions["onSseEvent"];
 	#onAssistantMessageEvent?: (message: AssistantMessage, event: AssistantMessageEvent) => void;
-	#onProvisionalAssistantMessageEvent?: (message: AssistantMessage, event: AssistantMessageEvent) => void;
+	#onProvisionalAssistantMessageEvent?: (
+		message: AssistantMessage,
+		event: AssistantMessageEvent,
+	) => boolean | undefined;
 	#onToolChoiceIncapability?: AgentLoopConfig["onToolChoiceIncapability"];
 	#onHarmonyLeak?: (event: HarmonyAuditEvent) => void | Promise<void>;
 	#onBeforeYield?: () => Promise<void> | void;
@@ -928,7 +931,7 @@ export class Agent {
 	}
 
 	setProvisionalAssistantMessageEventInterceptor(
-		fn: ((message: AssistantMessage, event: AssistantMessageEvent) => void) | undefined,
+		fn: ((message: AssistantMessage, event: AssistantMessageEvent) => boolean | undefined) | undefined,
 	): void {
 		this.#onProvisionalAssistantMessageEvent = fn;
 	}
@@ -2048,9 +2051,9 @@ export class Agent {
 				this.#onAssistantMessageEvent?.(message, event);
 			},
 			onProvisionalAssistantMessageEvent: (message, event) => {
-				if (this.#activeRunId !== runId) return;
+				if (this.#activeRunId !== runId) return false;
 				this.#state.streamMessage = message;
-				this.#onProvisionalAssistantMessageEvent?.(message, event);
+				return this.#onProvisionalAssistantMessageEvent?.(message, event);
 			},
 			hasProvisionalAssistantMessageEventConsumer: this.#onProvisionalAssistantMessageEvent !== undefined,
 			onToolChoiceIncapability: this.#onToolChoiceIncapability

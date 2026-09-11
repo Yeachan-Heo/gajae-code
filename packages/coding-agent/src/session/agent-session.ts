@@ -4406,6 +4406,11 @@ export class AgentSession {
 		this.agent.setProvisionalAssistantMessageEventInterceptor((message, assistantMessageEvent) => {
 			const contentIndex = assistantMessageEvent.contentIndex ?? 0;
 			const block = message.content[contentIndex];
+			if (
+				block?.type === "toolCall" &&
+				(block.escapedNonAsciiArguments === true || block.escapedUnicodeArgumentEvidence !== undefined)
+			)
+				return false;
 			if (block?.type === "toolCall" && block.id) this.#provisionalStreamingToolCallIds.add(block.id);
 			if (
 				assistantMessageEvent.type !== "toolcall_start" &&
