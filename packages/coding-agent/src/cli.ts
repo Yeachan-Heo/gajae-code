@@ -3,16 +3,22 @@
 /** Lightweight CLI bootstrap. Heavy command registration is loaded only after
  * security admission; `gjc doctor` stays reachable when normal startup breaks. */
 import { APP_NAME, formatBunRuntimeError, MIN_BUN_VERSION } from "@gajae-code/utils/dirs";
+import { startTiming } from "@gajae-code/utils/logger";
 import {
 	BASH_SHELL_RUNTIME_ARG,
 	BASH_SHELL_SUPERVISOR_ARG,
 	BASH_SHELL_WORKER_ARG,
 } from "./exec/bash-shell-worker-protocol";
 
-
 const MANAGED_OWNER_SUPERVISOR_ARG = "--internal-managed-owner-supervisor";
 const MANAGED_OWNER_CHILD_TOKEN_ENV = "GJC_MANAGED_OWNER_CHILD_TOKEN";
 const TMUX_OWNER_ISOLATION_ARG = "--internal-tmux-owner-isolation";
+
+// Anchor startup timing before the heavy CLI module graph is loaded so the
+// printed tree includes runtime/bootstrap costs as well as dispatch work.
+if (process.env.GJC_TIMING || process.env.PI_TIMING) {
+	startTiming();
+}
 
 if (Bun.semver.order(Bun.version, MIN_BUN_VERSION) < 0) {
 	process.stderr.write(

@@ -7,6 +7,7 @@
 import "@gajae-code/utils/postmortem";
 import { Args, type CliConfig, Command, type CommandEntry, run } from "@gajae-code/utils/cli";
 import { APP_NAME, formatBunRuntimeError, MIN_BUN_VERSION, VERSION } from "@gajae-code/utils/dirs";
+import { time } from "@gajae-code/utils/logger";
 import { runFixtureReport } from "./cli/fixture-report";
 import { ROOT_LAUNCH_FLAGS } from "./cli/root-flags";
 import QuickLane from "./commands/quick-lane";
@@ -509,8 +510,8 @@ export async function runCliAfterAdmission(argv: string[]): Promise<void> {
 	}
 	const bootstrap = interactiveBootstrapText(runArgv);
 	if (bootstrap) process.stdout.write(bootstrap);
-	await installRuntimeGlobals();
-	return run({ bin: APP_NAME, version: VERSION, argv: runArgv, commands, help: showHelp });
+	await time("cli:installRuntimeGlobals", installRuntimeGlobals);
+	return time("cli:dispatch", () => run({ bin: APP_NAME, version: VERSION, argv: runArgv, commands, help: showHelp }));
 }
 
 export const runCli = runCliAfterAdmission;
