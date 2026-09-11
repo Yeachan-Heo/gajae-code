@@ -209,16 +209,14 @@ export async function runSdkServe(
 				? await dependencies.startStdio(options)
 				: await dependencies.startSocket({ ...options, socketPath: parsed.mode.socketPath });
 	} catch (error) {
-		// No transport handle has transferred ownership. Cleanup must not replace
-		// the original failure or expose broker credentials through a raw error.
+		// No transport handle has transferred ownership. Cleanup diagnostics are
+		// attached to the original failure instance, never substituted for it, and
+		// broker credentials never reach a raw error.
 		const failure = servePreflightFailure(error);
 		try {
 			await broker?.close();
 		} catch {
-			throw new PublicCommandFailure({
-				...failure.input,
-				diagnostics: [...(failure.input.diagnostics ?? []), "broker_cleanup_failed"],
-			});
+			failure.input.diagnostics = [...(failure.input.diagnostics ?? []), "broker_cleanup_failed"];
 		}
 		throw failure;
 	}
