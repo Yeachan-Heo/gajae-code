@@ -130,6 +130,8 @@ export interface StateWriterOptions {
 	 * `withWorkflowStateLock`). Skip re-acquisition to avoid self-deadlock.
 	 */
 	lockHeld?: boolean;
+	/** Caller already holds the session-wide active-entry store lock. */
+	activeStateScopeLockHeld?: boolean;
 }
 
 export class StateWriteConflictError extends Error {
@@ -1016,17 +1018,128 @@ export async function writeActiveEntry(
 	options?: StateWriterOptions,
 ): Promise<GuardedWriteResult> {
 	const filePath = activeEntryPath(path.resolve(cwd), sessionScope, skill);
-	const result = await writeGuardedResolvedJsonAtomic(
-		filePath,
-		{ ...entry, skill },
-		{
-			...options,
-			policy: "cache",
-			advanceSourceRevision: true,
-		},
-	);
+	const write = () =>
+		writeGuardedResolvedJsonAtomic(
+			filePath,
+			{ ...entry, skill },
+			{
+				...options,
+				policy: "cache",
+				advanceSourceRevision: true,
+			},
+		);
+	const result = options?.activeStateScopeLockHeld
+		? await write()
+		: await withActiveStateScopeLock(cwd, sessionScope, write);
 	invalidateActiveStateCacheForScope(cwd, sessionScope);
 	return result;
+}
+
+export async function withActiveStateScopeLock<T>(
+	cwd: string,
+	sessionScope: string | ActiveSessionScope | undefined,
+	fn: () => Promise<T>,
+): Promise<T> {
+	const lockTarget = `${layoutActiveSnapshotPath(path.resolve(cwd), requireSessionId(sessionScope, "active state lock"))}.entries`;
+	return lockResolvedWorkflowTarget(lockTarget, fn);
+}
+
+/** Update an active entry only while it still exactly matches the observed predecessor. */
+export async function updateActiveEntryIfExact(
+	cwd: string,
+	sessionScope: string | ActiveSessionScope | undefined,
+	skill: string,
+	expected: SkillActiveEntry,
+	replacement: SkillActiveEntry,
+): Promise<GuardedWriteResult> {
+	const filePath = activeEntryPath(path.resolve(cwd), sessionScope, skill);
+	return withActiveStateScopeLock(cwd, sessionScope, () =>
+		lockResolvedWorkflowTarget(filePath, async () => {
+			const current = await readJsonIfPresent(filePath);
+			if (!Bun.deepEquals(current, expected)) {
+				return { path: filePath, written: false, reason: "stale-skip", revision: persistedStateRevision(current) };
+			}
+			const result = await writeGuardedResolvedJsonAtomic(filePath, replacement, {
+				cwd,
+				policy: "cache",
+				sourceRevision: persistedSourceRevision(current) + 1,
+				lockHeld: true,
+			});
+			invalidateActiveStateCacheForScope(cwd, sessionScope);
+			return result;
+		}),
+	);
+}
+
+/** Merge active subskills against the authoritative raw entry under the active-store transaction. */
+export async function mergeActiveEntrySubskills(
+	cwd: string,
+	sessionScope: string | ActiveSessionScope,
+	skill: string,
+	expected: SkillActiveEntry,
+	activeSubskills: SkillActiveEntry["active_subskills"],
+	updatedAt: string,
+): Promise<{ predecessor: SkillActiveEntry | undefined; result: GuardedWriteResult }> {
+	const filePath = activeEntryPath(path.resolve(cwd), sessionScope, skill);
+	return withActiveStateScopeLock(cwd, sessionScope, () =>
+		lockResolvedWorkflowTarget(filePath, async () => {
+			const current = await readJsonIfPresent(filePath);
+			const predecessor =
+				current && typeof current === "object" && !Array.isArray(current)
+					? (current as SkillActiveEntry)
+					: undefined;
+			if (!predecessor || !Bun.deepEquals(predecessor, expected)) {
+				return {
+					predecessor,
+					result: {
+						path: filePath,
+						written: false,
+						reason: "stale-skip",
+						revision: persistedStateRevision(current),
+					},
+				};
+			}
+			const replacement: SkillActiveEntry = {
+				...predecessor,
+				skill,
+				active_subskills: activeSubskills,
+				updated_at: updatedAt,
+			};
+			const result = await writeGuardedResolvedJsonAtomic(filePath, replacement, {
+				cwd,
+				policy: "cache",
+				sourceRevision: persistedSourceRevision(current) + 1,
+				lockHeld: true,
+			});
+			invalidateActiveStateCacheForScope(cwd, sessionScope);
+			return { predecessor, result };
+		}),
+	);
+}
+
+/** Replace an exact caller-owned active entry with its predecessor under one lock. */
+export async function restoreActiveEntryIfOwned(
+	cwd: string,
+	sessionScope: string | ActiveSessionScope,
+	receipt: GuardedStateWriteReceipt,
+	predecessor: SkillActiveEntry,
+): Promise<boolean> {
+	return withActiveStateScopeLock(cwd, sessionScope, () =>
+		lockResolvedWorkflowTarget(receipt.path, async () => {
+			const current = await readJsonIfPresent(receipt.path);
+			if (!matchesGuardedStateWriteReceipt(current, receipt)) return false;
+			const restored = await writeGuardedResolvedJsonAtomic(receipt.path, predecessor, {
+				cwd,
+				policy: "cache",
+				sourceRevision: persistedSourceRevision(current) + 1,
+				advanceSourceRevision: true,
+				lockHeld: true,
+			});
+			if (!restored.written) return false;
+			invalidateActiveStateCacheForScope(cwd, sessionScope);
+			return true;
+		}),
+	);
 }
 
 export async function removeActiveEntry(
@@ -1036,25 +1149,29 @@ export async function removeActiveEntry(
 	options?: StateWriterOptions,
 ): Promise<DeleteResult> {
 	const filePath = activeEntryPath(path.resolve(cwd), sessionScope, skill);
-	return lockResolvedWorkflowTarget(
-		filePath,
-		async () => {
-			const current = await readJsonIfPresent(filePath);
-			const incomingSourceRevision = options?.sourceRevision;
-			if (
-				current !== undefined &&
-				incomingSourceRevision !== undefined &&
-				incomingSourceRevision < persistedSourceRevision(current)
-			) {
-				return { path: filePath, deleted: false };
-			}
-			const deleted = await atomicRemove(filePath);
-			if (deleted) await maybeAudit(filePath, options);
-			if (deleted) invalidateActiveStateCacheForScope(cwd, sessionScope);
-			return { path: filePath, deleted };
-		},
-		options?.lock,
-	);
+	const remove = () =>
+		lockResolvedWorkflowTarget(
+			filePath,
+			async () => {
+				const current = await readJsonIfPresent(filePath);
+				const incomingSourceRevision = options?.sourceRevision;
+				if (
+					current !== undefined &&
+					incomingSourceRevision !== undefined &&
+					incomingSourceRevision < persistedSourceRevision(current)
+				) {
+					return { path: filePath, deleted: false };
+				}
+				const deleted = await atomicRemove(filePath);
+				if (deleted) await maybeAudit(filePath, options);
+				if (deleted) invalidateActiveStateCacheForScope(cwd, sessionScope);
+				return { path: filePath, deleted };
+			},
+			options?.lock,
+		);
+	return options?.activeStateScopeLockHeld
+		? await remove()
+		: await withActiveStateScopeLock(cwd, sessionScope, remove);
 }
 
 export async function readActiveEntries(

@@ -1170,12 +1170,13 @@ export class TUI extends Container {
 	#pendingDependentGenericBytes: Array<{ bytes: Uint8Array; rect: CellRect; blockedBy: string[] }> = [];
 	#terminalGeneration = 0;
 	/**
-	 * Raster lifecycle epoch. `stop()` increments it before lease cleanup so a
-	 * queue body captured under a prior running epoch can never write to the
-	 * terminal after restoration; `start()` does not reset it, so work enqueued
-	 * in the new lifecycle carries the new epoch.
+	 * Raster lifecycle epoch. Lifecycle-invalidating transitions increment it
+	 * before lease cleanup so a queue body captured under a prior running epoch
+	 * can never write to the terminal after restoration; `start()` does not reset
+	 * it, so work enqueued in the new lifecycle carries the new epoch.
 	 */
 	#rasterLifecycle = 0;
+	#inFlightMultipartAbort?: () => void;
 
 	#unsubscribeTabWidthChange?: () => void;
 	static #renderCounters: TuiRenderCounterSnapshot = {
@@ -1315,6 +1316,11 @@ export class TUI extends Container {
 			this.#widthSettleTimer = undefined;
 		}
 		this.#invalidatePreparations();
+		// Invalidate every raster-queue body captured before disposal. Disposal does
+		// not stop the terminal itself, so the ingress epoch is the only fence that
+		// prevents a held body or queued render from writing after teardown.
+		this.#closeInFlightMultipartPrefix();
+		this.#rasterLifecycle++;
 		this.#preparationLifecycle = undefined;
 		this.#settleRenderCommitWaiters(false);
 		this.#unsubscribeTabWidthChange?.();
@@ -2065,44 +2071,60 @@ export class TUI extends Container {
 				}
 				if (!shouldWrite) return { queueId: id, operation: op.type, status: "stale-token" };
 			}
+			let multipartAbortBarrier: (() => void) | undefined;
 			if (op.type === "raster-multipart-batch" && op.prefix !== undefined && op.afterPrefix !== undefined) {
 				const prefixWritten = this.#guardTerminalOperation(() =>
 					this.terminal.write(new TextDecoder().decode(op.prefix)),
 				);
 				if (!prefixWritten) return failed();
 				const abortBarrier = () => {
+					if (this.#inFlightMultipartAbort === abortBarrier) this.#inFlightMultipartAbort = undefined;
 					// Abort/cursor-restoration bytes are terminal writes: never emit
 					// them once the running epoch ended (e.g. a user predicate that
 					// itself stops the terminal before throwing or returning false).
-					if (!isCurrentLifecycle()) return;
+					if (!isCurrentLifecycle() || !this.terminalAvailable) return;
 					const abortSuffix = op.abortSuffix === undefined ? "" : new TextDecoder().decode(op.abortSuffix);
 					const cursorVisibility = op.restoreCursorVisibility ? this.#cursorVisibilitySequence() : "";
 					if (abortSuffix || cursorVisibility)
 						this.#guardTerminalOperation(() => this.terminal.write(abortSuffix + cursorVisibility));
 				};
-				const flushed = await (this.terminal as Terminal & { flush?: () => Promise<boolean> }).flush?.();
+				multipartAbortBarrier = abortBarrier;
+				this.#inFlightMultipartAbort = abortBarrier;
+				let flushed: boolean | undefined;
+				try {
+					flushed = await (this.terminal as Terminal & { flush?: () => Promise<boolean> }).flush?.();
+				} catch {
+					abortBarrier();
+					return failed();
+				}
 				// Async boundary: the terminal may have stopped while we awaited.
-				if (!isCurrentLifecycle()) return failed();
+				if (!isCurrentLifecycle()) {
+					abortBarrier();
+					return failed();
+				}
 				if (flushed === false) {
-					if (isCurrentLifecycle()) abortBarrier();
+					abortBarrier();
 					return failed();
 				}
 				let afterPrefixSucceeded: boolean;
 				try {
 					afterPrefixSucceeded = await op.afterPrefix();
 				} catch {
-					if (isCurrentLifecycle()) abortBarrier();
+					abortBarrier();
 					return failed();
 				}
 				if (afterPrefixSucceeded !== true) {
-					if (isCurrentLifecycle()) abortBarrier();
+					abortBarrier();
 					return failed();
 				}
 				// Async boundary: afterPrefix awaited external work; re-check epoch.
-				if (!isCurrentLifecycle()) return failed();
+				if (!isCurrentLifecycle()) {
+					abortBarrier();
+					return failed();
+				}
 				const currentLease = this.#rasterLeases.get(request.token?.ownerId ?? "");
 				if (!currentLease || currentLease.revoked || currentLease.token !== request.token) {
-					if (isCurrentLifecycle()) abortBarrier();
+					abortBarrier();
 					return { queueId: id, operation: op.type, status: currentLease?.revoked ? "revoked" : "stale-token" };
 				}
 				if (op.shouldWrite !== undefined) {
@@ -2110,17 +2132,20 @@ export class TUI extends Container {
 					try {
 						shouldWrite = op.shouldWrite();
 					} catch {
-						if (isCurrentLifecycle()) abortBarrier();
+						abortBarrier();
 						return failed();
 					}
 					if (!shouldWrite) {
-						if (isCurrentLifecycle()) abortBarrier();
+						abortBarrier();
 						return { queueId: id, operation: op.type, status: "stale-token" };
 					}
 				}
 			}
 			// Final pre-write gate: an async body may have resumed after stop().
-			if (!isCurrentLifecycle()) return failed();
+			if (!isCurrentLifecycle()) {
+				multipartAbortBarrier?.();
+				return failed();
+			}
 			const bytes =
 				op.type === "raster-multipart-batch"
 					? op.records.map((b: Uint8Array) => new TextDecoder().decode(b)).join("")
@@ -2133,6 +2158,11 @@ export class TUI extends Container {
 			const ok = dependent
 				? this.#writeProtectedRenderIngress(finalBytes)
 				: this.#guardTerminalOperation(() => this.terminal.write(finalBytes));
+			if (ok && this.#inFlightMultipartAbort === multipartAbortBarrier) {
+				this.#inFlightMultipartAbort = undefined;
+			} else if (!ok && multipartAbortBarrier) {
+				multipartAbortBarrier();
+			}
 			if (!ok && dependent) {
 				const rect = (op as { rect: CellRect }).rect;
 				const blockedBy = [...this.#rasterCleanup.entries()]
@@ -2270,6 +2300,12 @@ export class TUI extends Container {
 			},
 		);
 		return next;
+	}
+
+	#closeInFlightMultipartPrefix(): void {
+		const abort = this.#inFlightMultipartAbort;
+		this.#inFlightMultipartAbort = undefined;
+		abort?.();
 	}
 	#validRect(r: CellRect): boolean {
 		return (
@@ -2542,10 +2578,15 @@ export class TUI extends Container {
 	}
 	#markTerminalUnavailable(settleRenderWaiters = true): void {
 		this.#invalidatePreparations();
+		// A terminal-loss transition invalidates bodies parked behind the raster
+		// ingress just like stop(). Restarted output must never resume that stale
+		// epoch after availability returns.
+		this.#terminalUnavailable = true;
+		this.#closeInFlightMultipartPrefix();
+		this.#rasterLifecycle++;
 		this.#terminalGeneration++;
 		for (const record of this.#rasterCleanup.values()) record.terminalGeneration = this.#terminalGeneration;
 		this.#revokeRasterLeases("terminal-loss");
-		this.#terminalUnavailable = true;
 		this.#stopped = true;
 		this.#renderRequested = false;
 		if (settleRenderWaiters) this.#settleRenderCommitWaiters(false);
@@ -2782,6 +2823,7 @@ export class TUI extends Container {
 		// Invalidate every raster-queue body captured under the running epoch
 		// before any teardown: nothing queued before stop may write after
 		// restoration. Synchronous stop cleanup below writes directly.
+		this.#closeInFlightMultipartPrefix();
 		this.#rasterLifecycle++;
 		this.#flushRasterLeasesBeforeStop("terminal-loss");
 		const placementCleanup = this.#kittyPlacementDeletePlan(this.#kittyPlacementSpans, [], [], true).output;
@@ -3190,10 +3232,15 @@ export class TUI extends Container {
 			}
 			this.#renderRequested = true;
 			process.nextTick(() => {
-				if (this.#stopped || !this.#renderRequested) {
+				if (this.#stopped) {
 					this.#settleRenderCommitWaiters(false, generation);
 					return;
 				}
+				// Another next-tick callback may already have coalesced this forced
+				// generation into the active frame. Its queued terminal write owns the
+				// commit result; do not fail every waiter merely because renderRequested
+				// was cleared when that frame was prepared.
+				if (!this.#renderRequested) return;
 				this.#renderPreparedFrame();
 			});
 			return;

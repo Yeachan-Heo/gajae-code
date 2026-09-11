@@ -345,6 +345,91 @@ describe("TUI raster lease public boundary", () => {
 		expect(ack.status).toBe("failed");
 		expect(terminal.getWriteLog()).toEqual(["SAVE+PLACE", "RESTORE"]);
 	});
+	it("closes the multipart barrier when the final write is rejected", async () => {
+		const { tui, terminal } = await setup();
+		const lease = await tui.acquireRasterLease(request("barrier-final-write"));
+		if (lease.status !== "acquired") throw new Error("lease not acquired");
+		terminal.clearWriteLog();
+		const ack = await tui.submitTerminalOutput({
+			operation: {
+				type: "raster-multipart-batch",
+				prefix: bytes("SAVE+PLACE"),
+				afterPrefix: async () => {
+					failNextWrites(terminal);
+					return true;
+				},
+				records: [bytes("IMAGE")],
+				abortSuffix: bytes("RESTORE"),
+			},
+			token: lease.token,
+		});
+		expect(ack.status).toBe("failed");
+		expect(terminal.getWriteLog()).toEqual(["SAVE+PLACE"]);
+		tui.stop();
+		expect(terminal.getWriteLog().join("")).not.toContain("RESTORE");
+	});
+	it("closes multipart ownership when terminal loss occurs during prefix flush", async () => {
+		const { tui, terminal } = await setup();
+		const lease = await tui.acquireRasterLease(request("terminal-loss-flush"));
+		if (lease.status !== "acquired") throw new Error("lease not acquired");
+		const flushStarted = Promise.withResolvers<void>();
+		const releaseFlush = Promise.withResolvers<void>();
+		terminal.flush = async () => {
+			flushStarted.resolve();
+			await releaseFlush.promise;
+		};
+		let available = true;
+		Object.defineProperty(terminal, "available", { configurable: true, get: () => available });
+		terminal.clearWriteLog();
+		const pending = tui.submitTerminalOutput({
+			token: lease.token,
+			operation: {
+				type: "raster-multipart-batch",
+				prefix: bytes("FLUSH_PREFIX"),
+				afterPrefix: async () => true,
+				records: [bytes("FLUSH_BODY")],
+				abortSuffix: bytes("FLUSH_ABORT"),
+			},
+		});
+		await flushStarted.promise;
+		available = false;
+		tui.requestRender(true, "terminal-loss-during-flush");
+		releaseFlush.resolve();
+
+		expect((await pending).status).toBe("failed");
+		expect(terminal.getWriteLog().join("")).toBe("FLUSH_PREFIX");
+	});
+	it("closes multipart ownership when terminal loss occurs during afterPrefix", async () => {
+		const { tui, terminal } = await setup();
+		const lease = await tui.acquireRasterLease(request("terminal-loss-after-prefix"));
+		if (lease.status !== "acquired") throw new Error("lease not acquired");
+		const callbackStarted = Promise.withResolvers<void>();
+		const releaseCallback = Promise.withResolvers<void>();
+		let available = true;
+		Object.defineProperty(terminal, "available", { configurable: true, get: () => available });
+		terminal.clearWriteLog();
+		const pending = tui.submitTerminalOutput({
+			token: lease.token,
+			operation: {
+				type: "raster-multipart-batch",
+				prefix: bytes("CALLBACK_PREFIX"),
+				afterPrefix: async () => {
+					callbackStarted.resolve();
+					await releaseCallback.promise;
+					return true;
+				},
+				records: [bytes("CALLBACK_BODY")],
+				abortSuffix: bytes("CALLBACK_ABORT"),
+			},
+		});
+		await callbackStarted.promise;
+		available = false;
+		tui.requestRender(true, "terminal-loss-during-after-prefix");
+		releaseCallback.resolve();
+
+		expect((await pending).status).toBe("failed");
+		expect(terminal.getWriteLog().join("")).toBe("CALLBACK_PREFIX");
+	});
 	it("does not write records when the prefix callback returns false or throws", async () => {
 		const { tui, terminal } = await setup();
 		const lease = await tui.acquireRasterLease(request("prefix-failure"));
@@ -838,8 +923,8 @@ describe("TUI raster lease public boundary", () => {
 		// The retained payload is delivered by the first start() after stop.
 		expect(terminal.getWriteLog().join("")).toContain("PET_ERASE");
 
-		// (b) Started body paused at an await when stop occurs: no suffix/abort/GIF
-		// bytes and no cursor restoration may follow stop.
+		// (b) Started body paused at an await when stop occurs: stop synchronously
+		// closes the prefix barrier, and no body bytes may follow afterward.
 		const lease = await tui.acquireRasterLease(request("paused"));
 		if (lease.status !== "acquired") throw new Error("lease not acquired");
 		terminal.clearWriteLog();
@@ -865,16 +950,18 @@ describe("TUI raster lease public boundary", () => {
 		await Bun.sleep(5);
 		expect(terminal.getWriteLog().join("")).toContain("PREFIX");
 		tui.stop();
+		const multipartAtStop = terminal.getWriteLog().join("");
+		expect(multipartAtStop).toContain("ABORT_BYTES");
 		releaseAfterPrefix();
 		const ack = await submit;
 		expect(ack.status).toBe("failed");
 		const after = terminal.getWriteLog().join("");
+		expect(after).toBe(multipartAtStop);
 		expect(after).not.toContain("SUFFIX");
-		expect(after).not.toContain("ABORT_BYTES");
 		expect(after).not.toContain("GIF");
 
-		// (c) A shouldWrite predicate that stops the terminal mid-operation must
-		// not emit abort or cursor-restoration bytes either.
+		// (c) A shouldWrite predicate that stops the terminal before prefix output
+		// emits neither abort nor body bytes.
 		tui.start();
 		const lease2 = await tui.acquireRasterLease(request("predicate-stop"));
 		if (lease2.status !== "acquired") throw new Error("lease not acquired");
@@ -896,6 +983,7 @@ describe("TUI raster lease public boundary", () => {
 		});
 		expect(ack2.status).toBe("failed");
 		expect(terminal.getWriteLog().join("")).not.toContain("ABORT2");
+		expect(terminal.getWriteLog().join("")).not.toContain("R2");
 
 		// (d) New-lifecycle work after restart writes normally.
 		tui.start();

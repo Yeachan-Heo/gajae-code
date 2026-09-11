@@ -1957,6 +1957,20 @@ export class SelectorController {
 							this.#refreshThemeUi();
 							return true;
 						},
+						onThinkingLevelCommit: async level => {
+							try {
+								await this.ctx.session.setThinkingLevelForControl(level as ThinkingLevel, true);
+								this.ctx.statusLine.invalidate();
+								this.ctx.updateEditorBorderColor();
+								this.ctx.updateEditorTopBorder();
+								void this.ctx.notifyConfigChanged?.();
+								this.ctx.ui.requestRender();
+								return true;
+							} catch (error) {
+								this.ctx.showError(error instanceof Error ? error.message : String(error));
+								return false;
+							}
+						},
 						onPetPreview: mode => {
 							this.ctx.previewPetMode(mode as PetMode);
 						},

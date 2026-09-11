@@ -247,6 +247,23 @@ type McpNotificationEntry = {
 	uri: string;
 };
 
+function settleOwnedAsyncResultEntry(entry: AsyncResultEntry): void {
+	const registration = entry.ownedCompletion?.registration;
+	if (!registration) return;
+	// The registration's endpoint is immutable; do not consult the process-global
+	// manager, which may belong to a concurrent session with the same job id.
+	const manager = AsyncJobManager.forEndpoint(registration.endpointId);
+	const job = manager?.getJob(registration.jobId);
+	if (
+		job?.generation === registration.jobGeneration &&
+		job.status !== "completed" &&
+		job.status !== "cancelled" &&
+		job.status !== "failed"
+	)
+		return;
+	unregisterOwnedRegistration(registration);
+}
+
 /** Capture the cursor edit grant before the model-facing edit entry is removed. */
 export function captureCursorEditTool<T>(
 	toolRegistry: ReadonlyMap<string, unknown>,
@@ -4734,9 +4751,19 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		const sessionAsyncJobManager = asyncJobManager;
 		if (sessionAsyncJobManager) {
 			session.yieldQueue.register<AsyncResultEntry>("async-result", {
+				onDrop: entry => {
+					sessionAsyncJobManager.releaseDeliveryClaim(entry.generation);
+					settleOwnedAsyncResultEntry(entry);
+				},
+				// YieldQueue calls this only after streaming/idle injection succeeds;
+				// admission retries therefore retain the claim with the queued entry.
+				onDelivered: entry => sessionAsyncJobManager.releaseDeliveryClaim(entry.generation),
 				isStale: entry => {
 					const stale = sessionAsyncJobManager.isDeliverySuppressed(entry.jobId, entry.generation);
-					if (stale) sessionAsyncJobManager.releaseDeliveryClaim(entry.generation);
+					if (stale) {
+						sessionAsyncJobManager.releaseDeliveryClaim(entry.generation);
+						settleOwnedAsyncResultEntry(entry);
+					}
 					return stale;
 				},
 				// Build one message per ownership origin so an owned-scope drop of
@@ -4747,15 +4774,12 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						? `${entry.ownedCompletion.lineageIdHash}\u0000${entry.ownedCompletion.promptAttemptEpoch}`
 						: "ordinary",
 				build: entries => {
-					try {
-						return buildAsyncResultBatchMessage(entries);
-					} finally {
-						for (const entry of entries) sessionAsyncJobManager.releaseDeliveryClaim(entry.generation);
-					}
+					return buildAsyncResultBatchMessage(entries);
 				},
 			});
 		}
 		session.yieldQueue.register<McpNotificationEntry>("mcp-notification", {
+			preserveAcrossIdentity: true,
 			build: buildMcpNotificationBatchMessage,
 		});
 

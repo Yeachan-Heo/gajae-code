@@ -17894,14 +17894,21 @@ export class SessionManager {
 			timestamp: new Date().toISOString(),
 			message,
 		};
-		associateSessionMessageEntryId(message, entry.id);
 		// Defense-in-depth (#4443): detect directly adjacent thinking/redacted_thinking
 		// blocks in a persisted assistant transcript message and warn once per session.
 		// This is a read-only observation — storage is NEVER mutated. The diagnostic is
 		// bounded to development/test to avoid production noise, and names only the
 		// envelope shape (block count), never raw thinking text, signatures, or payloads.
 		this.#warnAdjacentPrivateThinking(message);
-		this.#appendEntry(entry);
+		try {
+			this.#appendEntry(entry);
+		} catch (error) {
+			if (error instanceof SessionNearLimitAppendError && error.entryRetained) {
+				associateSessionMessageEntryId(message, entry.id);
+			}
+			throw error;
+		}
+		associateSessionMessageEntryId(message, entry.id);
 		const residentEntry = this.#byId.get(entry.id);
 		if (residentEntry?.type === "message") transferSessionMessageIdentity([message], [residentEntry.message]);
 		return entry.id;
@@ -18292,6 +18299,34 @@ export class SessionManager {
 			}
 		}
 		return Array.from(ruleNames);
+	}
+
+	/** Read repeat-state authority without materializing the full session context. */
+	getTtsrPersistenceState(): { records: TtsrInjectionRecord[]; messageCount: number } {
+		const records = new Map<string, TtsrInjectionRecord>();
+		let messageCount: number | undefined;
+		const visited = new Set<string>();
+		let current = this.#leafId ? this.#resolveEntry(this.#leafId) : undefined;
+		while (current && !visited.has(current.id)) {
+			visited.add(current.id);
+			if (current.type === "ttsr_injection") {
+				if (
+					messageCount === undefined &&
+					typeof current.ttsrMessageCount === "number" &&
+					Number.isFinite(current.ttsrMessageCount)
+				) {
+					messageCount = current.ttsrMessageCount;
+				}
+				for (const record of current.injectedRuleRecords ?? []) {
+					if (!records.has(record.name)) records.set(record.name, { ...record });
+				}
+				for (const name of current.injectedRules) {
+					if (!records.has(name)) records.set(name, { name, lastInjectedAt: 0 });
+				}
+			}
+			current = current.parentId ? this.#resolveEntry(current.parentId) : undefined;
+		}
+		return { records: Array.from(records.values()), messageCount: messageCount ?? 0 };
 	}
 
 	// =========================================================================

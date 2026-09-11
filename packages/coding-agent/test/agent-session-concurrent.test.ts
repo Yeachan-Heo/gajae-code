@@ -19,9 +19,9 @@ import { TtsrManager } from "@gajae-code/coding-agent/export/ttsr";
 import type { ExtensionRunner } from "@gajae-code/coding-agent/extensibility/extensions/runner";
 import { submitInteractiveInput } from "@gajae-code/coding-agent/main";
 import type { SubmittedUserInput } from "@gajae-code/coding-agent/modes/types";
-import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
+import { AgentSession, type AgentSessionEvent } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
-import { convertToLlm } from "@gajae-code/coding-agent/session/messages";
+import { convertToLlm, SILENT_ABORT_MARKER } from "@gajae-code/coding-agent/session/messages";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { Snowflake } from "@gajae-code/utils";
 import * as z from "zod/v4";
@@ -1446,7 +1446,8 @@ describe("AgentSession TTSR resume gate", () => {
 			modelRegistry,
 			ttsrManager,
 		});
-
+		const terminalEvents: AgentSessionEvent[] = [];
+		session.subscribe(event => terminalEvents.push(event));
 		// prompt() must block until the TTSR continuation completes
 		await session.prompt("Write some Rust code");
 
@@ -1454,6 +1455,58 @@ describe("AgentSession TTSR resume gate", () => {
 		expect(continuationCompleted).toBe(true);
 		expect(streamCallCount).toBeGreaterThanOrEqual(2);
 		expect(session.isStreaming).toBe(false);
+		expect(
+			terminalEvents.some(
+				event =>
+					event.type === "message_end" &&
+					event.message.role === "assistant" &&
+					event.ttsrAbort === true &&
+					event.message.errorMessage === SILENT_ABORT_MARKER,
+			),
+		).toBe(true);
+	});
+
+	it("releases an interrupted TTSR continuation when repeat-state persistence fails", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		let streamCallCount = 0;
+		const ttsrManager = new TtsrManager({
+			enabled: true,
+			contextMode: "discard",
+			interruptMode: "always",
+			repeatMode: "once",
+			repeatGap: 10,
+		});
+		ttsrManager.addRule(testRule);
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [] },
+			streamFn: (_model, _context, options) => {
+				streamCallCount++;
+				const stream = new AssistantMessageEventStream();
+				if (streamCallCount === 1) pushAbortableTtsrStream(stream, options?.signal);
+				else pushContinuationStream(stream, () => {});
+				return stream;
+			},
+		});
+		const sessionManager = SessionManager.inMemory(tempDir);
+		const appendTtsrInjection = sessionManager.appendTtsrInjection.bind(sessionManager);
+		vi.spyOn(sessionManager, "appendTtsrInjection").mockImplementation((ruleNames, records, messageCount) => {
+			if (ruleNames.length > 0) throw new Error("injected interrupt persistence failure");
+			return appendTtsrInjection(ruleNames, records, messageCount);
+		});
+		const settings = Settings.isolated();
+		const authStorage = await AuthStorage.create(path.join(tempDir, "testauth-int-failure.db"));
+		authStorages.push(authStorage);
+		const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "models.yml"));
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		session = new AgentSession({ agent, sessionManager, settings, modelRegistry, ttsrManager });
+
+		await session.prompt("Write some Rust code");
+
+		expect(streamCallCount).toBe(1);
+		expect(session.isStreaming).toBe(false);
+		expect(session.isTtsrAbortPending).toBe(false);
+		expect(ttsrManager.getInjectedRuleNames()).toEqual([]);
 	});
 
 	it("prompt() blocks until TTSR deferred continuation completes", async () => {
@@ -1521,7 +1574,6 @@ describe("AgentSession TTSR resume gate", () => {
 			modelRegistry,
 			ttsrManager,
 		});
-
 		// prompt() must block until the deferred TTSR continuation completes
 		await session.prompt("Write some Rust code");
 
@@ -1592,7 +1644,6 @@ describe("AgentSession TTSR resume gate", () => {
 			modelRegistry,
 			ttsrManager,
 		});
-
 		// Start prompt (will trigger TTSR and create resume gate)
 		const promptPromise = session.prompt("Write some Rust code");
 		await waitFor(() => session.agent.state.isStreaming);
@@ -1602,6 +1653,7 @@ describe("AgentSession TTSR resume gate", () => {
 		await promptPromise;
 
 		expect(session.isStreaming).toBe(false);
+		expect(session.isTtsrAbortPending).toBe(false);
 	});
 
 	it("prompt() waits for TTSR continuation with tool calls to finish", async () => {
@@ -1835,6 +1887,233 @@ describe("AgentSession TTSR resume gate", () => {
 		expect(text).toContain('rule="no-unwrap"');
 		expect(text).toContain("Do not use .unwrap()");
 		expect(text.indexOf("<system-reminder")).toBeLessThan(text.indexOf("edit applied"));
+	});
+
+	it("clears a per-tool reminder bucket after pre-dispatch argument validation fails", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		let streamCallCount = 0;
+		const ttsrManager = new TtsrManager({
+			enabled: true,
+			contextMode: "discard",
+			interruptMode: "never",
+			repeatMode: "once",
+			repeatGap: 10,
+		});
+		ttsrManager.addRule(testRule);
+		const mockTool: AgentTool = {
+			name: "mock_edit",
+			label: "Mock Edit",
+			description: "A mock edit tool",
+			parameters: z.object({ snippet: z.string() }),
+			execute: async () => ({ content: [{ type: "text" as const, text: "edit applied" }] }),
+		};
+		const toolCall = (snippet: unknown): ToolCall => ({
+			type: "toolCall",
+			id: "call_reused_after_validation",
+			name: "mock_edit",
+			arguments: { snippet },
+		});
+		const toolMessage = (call: ToolCall): AssistantMessage => ({
+			role: "assistant",
+			content: [call],
+			api: "anthropic-messages",
+			provider: "anthropic",
+			model: "mock",
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "toolUse",
+			timestamp: Date.now(),
+		});
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [mockTool] },
+			streamFn: () => {
+				streamCallCount++;
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(() => {
+					if (streamCallCount === 1 || streamCallCount === 3) {
+						const call = toolCall(streamCallCount === 1 ? 7 : "value.unwrap()");
+						const partial = toolMessage(call);
+						stream.push({ type: "start", partial });
+						stream.push({ type: "toolcall_start", contentIndex: 0, partial });
+						stream.push({ type: "toolcall_delta", contentIndex: 0, delta: "value.unwrap()", partial });
+						stream.push({ type: "toolcall_end", contentIndex: 0, toolCall: call, partial });
+						stream.push({ type: "done", reason: "toolUse", message: partial });
+					} else {
+						const done = makeMsg("done");
+						stream.push({ type: "start", partial: done });
+						stream.push({ type: "done", reason: "stop", message: done });
+					}
+				});
+				return stream;
+			},
+		});
+		const sessionManager = SessionManager.inMemory(tempDir);
+		const settings = Settings.isolated();
+		const authStorage = await AuthStorage.create(path.join(tempDir, "testauth-validation-ttsr.db"));
+		authStorages.push(authStorage);
+		const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "models.yml"));
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		session = new AgentSession({ agent, sessionManager, settings, modelRegistry, ttsrManager });
+
+		await session.prompt("invalid call");
+		await session.prompt("valid retry");
+
+		const results = agent.state.messages.filter(
+			(message): message is Extract<typeof message, { role: "toolResult" }> =>
+				message.role === "toolResult" && message.toolCallId === "call_reused_after_validation",
+		);
+		const finalResult = results.at(-1);
+		const resultText = Array.isArray(finalResult?.content)
+			? finalResult.content
+					.filter((content): content is { type: "text"; text: string } => content.type === "text")
+					.map(content => content.text)
+					.join("\n")
+			: "";
+		expect(results).toHaveLength(2);
+		expect(resultText).toContain('rule="no-unwrap"');
+		expect(resultText).toContain("edit applied");
+	});
+
+	it("restores the repeat gate when per-tool TTSR persistence fails", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		let streamCallCount = 0;
+		const ttsrManager = new TtsrManager({
+			enabled: true,
+			contextMode: "discard",
+			interruptMode: "never",
+			repeatMode: "once",
+			repeatGap: 10,
+		});
+		ttsrManager.addRule(testRule);
+		const toolCall: ToolCall = {
+			type: "toolCall",
+			id: "call_failed_ttsr_persistence",
+			name: "mock_edit",
+			arguments: { snippet: "value.unwrap()" },
+		};
+		const mockTool: AgentTool = {
+			name: "mock_edit",
+			label: "Mock Edit",
+			description: "A mock edit tool",
+			parameters: z.object({ snippet: z.string().optional() }),
+			execute: async () => ({ content: [{ type: "text" as const, text: "edit applied" }] }),
+		};
+		const toolMessage = (): AssistantMessage => ({
+			role: "assistant",
+			content: [toolCall],
+			api: "anthropic-messages",
+			provider: "anthropic",
+			model: "mock",
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "toolUse",
+			timestamp: Date.now(),
+		});
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [mockTool] },
+			streamFn: () => {
+				streamCallCount++;
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(() => {
+					if (streamCallCount === 1) {
+						const partial = toolMessage();
+						stream.push({ type: "start", partial });
+						stream.push({ type: "toolcall_start", contentIndex: 0, partial });
+						stream.push({
+							type: "toolcall_delta",
+							contentIndex: 0,
+							delta: "value.unwrap()",
+							partial,
+						});
+						stream.push({ type: "toolcall_end", contentIndex: 0, toolCall, partial });
+						stream.push({ type: "done", reason: "toolUse", message: partial });
+					} else {
+						const done = makeMsg("done");
+						stream.push({ type: "start", partial: done });
+						stream.push({ type: "done", reason: "stop", message: done });
+					}
+				});
+				return stream;
+			},
+		});
+		const sessionManager = SessionManager.inMemory(tempDir);
+		const append = vi.spyOn(sessionManager, "appendTtsrInjection").mockImplementationOnce(() => {
+			throw new Error("injected TTSR persistence failure");
+		});
+		const settings = Settings.isolated();
+		const authStorage = await AuthStorage.create(path.join(tempDir, "testauth-failed-ttsr.db"));
+		authStorages.push(authStorage);
+		const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "models.yml"));
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		session = new AgentSession({ agent, sessionManager, settings, modelRegistry, ttsrManager });
+
+		await session.prompt("Write some Rust code");
+
+		expect(append).toHaveBeenCalled();
+		expect(ttsrManager.getInjectedRuleNames()).toEqual([]);
+	});
+
+	it("reconciles a failed turn-end repeat checkpoint before the next provider call", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const order: string[] = [];
+		let streamCallCount = 0;
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"] },
+			streamFn: () => {
+				order.push(`provider-${++streamCallCount}`);
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(() => {
+					const done = makeMsg("done");
+					stream.push({ type: "start", partial: done });
+					stream.push({ type: "done", reason: "stop", message: done });
+				});
+				return stream;
+			},
+		});
+		const sessionManager = SessionManager.inMemory(tempDir);
+		const appendTtsrInjection = sessionManager.appendTtsrInjection.bind(sessionManager);
+		let rejectNextTurnCheckpoint = true;
+		vi.spyOn(sessionManager, "appendTtsrInjection").mockImplementation((ruleNames, records, messageCount) => {
+			if (ruleNames.length === 0 && rejectNextTurnCheckpoint) {
+				rejectNextTurnCheckpoint = false;
+				order.push("persist-failed");
+				throw new Error("injected turn-end persistence failure");
+			}
+			order.push("persisted");
+			return appendTtsrInjection(ruleNames, records, messageCount);
+		});
+		const settings = Settings.isolated();
+		const authStorage = await AuthStorage.create(path.join(tempDir, "testauth-turn-end-failure.db"));
+		authStorages.push(authStorage);
+		const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "models.yml"));
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		const ttsrManager = new TtsrManager({ enabled: true });
+		session = new AgentSession({ agent, sessionManager, settings, modelRegistry, ttsrManager });
+
+		await expect(session.prompt("first turn")).rejects.toThrow("injected turn-end persistence failure");
+		expect(ttsrManager.getMessageCount()).toBe(0);
+		expect(() => session.newSession()).toThrow("Reconcile repeat-state persistence before changing session history.");
+		expect(order).toEqual(["provider-1", "persist-failed"]);
+
+		await session.prompt("second turn");
+
+		expect(order.slice(0, 4)).toEqual(["provider-1", "persist-failed", "persisted", "provider-2"]);
+		expect(ttsrManager.getMessageCount()).toBe(2);
 	});
 
 	it("interruptMode never deduplicates the reminder across sibling tool calls in one batch", async () => {

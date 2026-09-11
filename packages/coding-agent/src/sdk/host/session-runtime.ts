@@ -3802,8 +3802,8 @@ function createControlSurface(
 		},
 		setModelProfile: id => (ctx.setModelProfile ? ctx.setModelProfile(id) : unavailable("model.profile.set")()),
 		cycleModel: () => (ctx.cycleModel ? ctx.cycleModel() : unavailable("model.cycle")()),
-		setThinking: level => {
-			api.setThinkingLevel(level as never);
+		setThinking: async level => {
+			await api.setThinkingLevelForControl(level as ThinkingLevel, false);
 			return { changed: true };
 		},
 		cycleThinking: () =>
