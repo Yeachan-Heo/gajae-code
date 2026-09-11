@@ -427,6 +427,99 @@ async function removeOwned(store: Store, name: string, stat: Stats): Promise<voi
 	if (!identity(current, stat)) fail("unsafe_path");
 	await fs.unlink(path.join(store.root, name));
 }
+
+/**
+ * Publisher lock ownership record. Publication is exclusive, so the lock must survive a
+ * publisher that dies mid-publish without wedging the store forever. Reclamation is
+ * therefore bounded and evidence-backed: the lock is released only when its recorded
+ * owner is provably gone (ESRCH), or when an incomplete record proves a crash inside the
+ * create-to-write window and the bounded grace has elapsed.
+ *
+ * A recorded pid that is still alive is never reclaimed, even after the grace window:
+ * a hung publisher is indistinguishable from a live one, and stealing its lock is the
+ * only way two publishers could enter concurrently. The residual failure mode is a
+ * reused pid wedging the store, which fails closed as `store_busy` rather than
+ * corrupting it.
+ */
+const LOCK_SCHEMA = "gjc.command-error-lock";
+const LOCK_RECORD_BYTES = 512;
+const LOCK_GRACE_MS = 5_000;
+const LOCK_ATTEMPTS = 2;
+
+interface EvidenceLockRecord {
+	schema: typeof LOCK_SCHEMA;
+	version: 1;
+	pid: number;
+	createdAt: string;
+}
+
+function lockRecordBytes(): Buffer {
+	const record: EvidenceLockRecord = {
+		schema: LOCK_SCHEMA,
+		version: 1,
+		pid: process.pid,
+		createdAt: new Date().toISOString(),
+	};
+	return Buffer.from(`${JSON.stringify(record)}\n`);
+}
+
+function lockRecordFromBytes(bytes: Buffer): EvidenceLockRecord | undefined {
+	let value: EvidenceLockRecord;
+	try {
+		value = JSON.parse(bytes.toString("utf8")) as EvidenceLockRecord;
+	} catch {
+		return undefined;
+	}
+	if (value?.schema !== LOCK_SCHEMA || value.version !== 1) return undefined;
+	if (!Number.isSafeInteger(value.pid) || value.pid <= 0) return undefined;
+	if (typeof value.createdAt !== "string" || !Number.isFinite(Date.parse(value.createdAt))) return undefined;
+	return value;
+}
+
+/** ESRCH proves the recorded owner is gone; EPERM means it is alive but owned elsewhere. */
+function lockOwnerAlive(pid: number): boolean {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch (error) {
+		return code(error) !== "ESRCH";
+	}
+}
+
+function lockAbandoned(existing: { bytes: Buffer; stat: Stats }, now: number): boolean {
+	const record = lockRecordFromBytes(existing.bytes);
+	if (!record) return now - existing.stat.mtimeMs >= LOCK_GRACE_MS;
+	return !lockOwnerAlive(record.pid);
+}
+
+/**
+ * Exactly one publisher may hold the lock: the exclusive create is the admission
+ * primitive, and a reclaim is an identity-verified unlink of a specifically abandoned
+ * inode followed by another exclusive create. A concurrent reclaimer that loses either
+ * step observes the successor's different inode and reports `store_busy` instead of
+ * deleting a lock it does not own.
+ */
+async function acquirePublicationLock(store: Store): Promise<Handle> {
+	for (let attempt = 1; ; attempt++) {
+		try {
+			return await fs.open(
+				path.join(store.root, "lock"),
+				constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+				0o600,
+			);
+		} catch (error) {
+			if (code(error) !== "EEXIST") throw error;
+			if (attempt >= LOCK_ATTEMPTS) fail("store_busy");
+			const existing = await readFile(store, "lock", LOCK_RECORD_BYTES);
+			if (!existing || !lockAbandoned(existing, Date.now())) fail("store_busy");
+			try {
+				await removeOwned(store, "lock", existing.stat);
+			} catch {
+				fail("store_busy");
+			}
+		}
+	}
+}
 async function checkLayout(store: Store): Promise<void> {
 	const directory = await fs.opendir(store.root);
 	let count = 0;
@@ -474,18 +567,11 @@ export async function publishCommandEvidence(
 		if (Buffer.byteLength(JSON.stringify(locator)) > 4096) fail("locator_too_large");
 		pageFor(record, bytes, sha256, Math.max(1, Math.ceil(bytes.length / 1024) - 1), options);
 		store = await openStore(input.agentDir, true);
-		try {
-			lock = await fs.open(
-				path.join(store.root, "lock"),
-				constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
-				0o600,
-			);
-		} catch (error) {
-			if (code(error) === "EEXIST") fail("store_busy");
-			throw error;
-		}
+		lock = await acquirePublicationLock(store);
+		await lock.writeFile(lockRecordBytes());
+		await lock.sync();
 		lockStat = await lock.stat();
-		fileProof(lockStat, 4096);
+		fileProof(lockStat, LOCK_RECORD_BYTES);
 		await checkLayout(store);
 		const pending = await readFile(store, "pending");
 		if (pending) await removeOwned(store, "pending", pending.stat);
@@ -593,7 +679,7 @@ export async function readCommandEvidence(
 			throw error;
 		}
 		await checkLayout(store);
-		await readFile(store, "lock", 4096);
+		await readFile(store, "lock", LOCK_RECORD_BYTES);
 		await readFile(store, "pending");
 		let match: { record: EvidenceRecord; bytes: Buffer } | undefined;
 		let total = 0;
