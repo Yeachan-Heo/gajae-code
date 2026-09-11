@@ -73,6 +73,34 @@ describe("injectImageGenerationModels", () => {
 				input: ["text"],
 				output: ["text", "image"],
 			}),
+			expect.objectContaining({
+				id: "gpt-image-2.5-sunburst",
+				api: "openai-responses",
+				provider: "openai",
+				input: ["text"],
+				output: ["text", "image"],
+			}),
+			expect.objectContaining({
+				id: "gpt-image-2.5-sunburst",
+				api: "openai-codex-responses",
+				provider: "openai-codex",
+				input: ["text"],
+				output: ["text", "image"],
+			}),
+			expect.objectContaining({
+				id: "gpt-image-2.5-flare",
+				api: "openai-responses",
+				provider: "openai",
+				input: ["text"],
+				output: ["text", "image"],
+			}),
+			expect.objectContaining({
+				id: "gpt-image-2.5-flare",
+				api: "openai-codex-responses",
+				provider: "openai-codex",
+				input: ["text"],
+				output: ["text", "image"],
+			}),
 		]);
 	});
 });

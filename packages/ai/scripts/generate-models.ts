@@ -99,41 +99,47 @@ export function injectCodexAstraModel(models: Model[]): void {
 
 /**
  * Inject dedicated image generation models into providers that support them.
- * gpt-image-2 is registered under openai and openai-codex so the image
- * generation tool can route through a dedicated model instead of the active
- * chat model. These entries are image-only and should be excluded from the
- * chat model browser UI.
+ * gpt-image-2 and the gpt-image-2.5 variants (sunburst for editing precision,
+ * flare for fast everyday generation) are registered under openai and
+ * openai-codex so the image generation tool can route through a dedicated
+ * model instead of the active chat model. These entries are image-only and
+ * should be excluded from the chat model browser UI.
  */
 export function injectImageGenerationModels(models: Model[]): void {
+	const imageModelVariants = [
+		{ id: "gpt-image-2", name: "GPT Image 2" },
+		{ id: "gpt-image-2.5-sunburst", name: "GPT Image 2.5 Sunburst" },
+		{ id: "gpt-image-2.5-flare", name: "GPT Image 2.5 Flare" },
+	];
 	const imageModelBase = {
-		id: "gpt-image-2",
-		name: "GPT Image 2",
 		reasoning: false,
 		input: ["text"],
 		output: ["text", "image"],
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 		contextWindow: 128_000,
 		maxTokens: 16_384,
-	} satisfies Omit<Model, "api" | "provider" | "baseUrl">;
-	const hasOpenAI = models.some(m => m.provider === "openai" && m.id === "gpt-image-2");
-	if (!hasOpenAI) {
-		const openAIImageModel: Model<"openai-responses"> = {
-			...imageModelBase,
-			api: "openai-responses",
-			provider: "openai",
-			baseUrl: "",
-		};
-		models.push(openAIImageModel);
-	}
-	const hasCodex = models.some(m => m.provider === "openai-codex" && m.id === "gpt-image-2");
-	if (!hasCodex) {
-		const codexImageModel: Model<"openai-codex-responses"> = {
-			...imageModelBase,
-			api: "openai-codex-responses",
-			provider: "openai-codex",
-			baseUrl: "",
-		};
-		models.push(codexImageModel);
+	} satisfies Omit<Model, "api" | "provider" | "baseUrl" | "id" | "name">;
+	for (const variant of imageModelVariants) {
+		if (!models.some(m => m.provider === "openai" && m.id === variant.id)) {
+			const openAIImageModel: Model<"openai-responses"> = {
+				...imageModelBase,
+				...variant,
+				api: "openai-responses",
+				provider: "openai",
+				baseUrl: "",
+			};
+			models.push(openAIImageModel);
+		}
+		if (!models.some(m => m.provider === "openai-codex" && m.id === variant.id)) {
+			const codexImageModel: Model<"openai-codex-responses"> = {
+				...imageModelBase,
+				...variant,
+				api: "openai-codex-responses",
+				provider: "openai-codex",
+				baseUrl: "",
+			};
+			models.push(codexImageModel);
+		}
 	}
 }
 
