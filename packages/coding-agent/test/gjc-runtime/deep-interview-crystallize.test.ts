@@ -2946,6 +2946,26 @@ describe("deep-interview crystallize contract", () => {
 				transcriptSha256: createHash("sha256").update(approvalTranscript).digest("hex"),
 				presentation: await captureExecutionApprovalPresentation(root, sessionId, "deep-interview"),
 			});
+			const parentId = (JSON.parse(approvalTranscript.toString("utf8").trim().split("\n").at(-1)!) as { id: string })
+				.id;
+			await fs.appendFile(
+				sessionFile,
+				`${JSON.stringify({
+					type: "message",
+					id: "approval-tool-result",
+					parentId,
+					message: {
+						role: "toolResult",
+						toolCallId: "provider-crystallize-execution",
+						toolName: "ask",
+						content: [{ type: "text", text: "Approve execution via ultragoal" }],
+						details: {
+							questions: [{ id: "crystallize-execution", selectedOptions: ["Approve execution via ultragoal"] }],
+						},
+						isError: false,
+					},
+				})}\n`,
+			);
 			const approved = await runNativeDeepInterviewCommand(
 				["approve-execution", "--session-id", sessionId, "--json"],
 				root,
@@ -3128,7 +3148,19 @@ describe("deep-interview crystallize contract", () => {
 	});
 
 	it("rejects context-free acknowledgements as confirmed requirements", () => {
-		for (const acknowledgement of ["No", "Done", "Confirmed", "Absolutely", "Sounds good", "true", "false"]) {
+		for (const acknowledgement of [
+			"No",
+			"Done",
+			"Confirmed",
+			"Absolutely",
+			"Sounds good",
+			"true",
+			"false",
+			"Yes!!",
+			"Done...",
+			"Absolutely?!",
+			"Sounds good!!!",
+		]) {
 			expect(() => crystallizeDeepInterview(singleGoalEvidence(acknowledgement, acknowledgement))).toThrow(
 				"verbatim user anchor",
 			);
