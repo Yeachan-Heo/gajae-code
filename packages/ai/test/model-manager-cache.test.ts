@@ -1,10 +1,16 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test, vi } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { readModelCache, writeModelCache } from "../src/model-cache";
 import { resolveProviderModels } from "../src/model-manager";
 import { Effort } from "../src/model-thinking";
+import { getBundledModel, getBundledModels } from "../src/models";
+import {
+	opencodeGoModelManagerOptions,
+	UNK_CONTEXT_WINDOW,
+	UNK_MAX_TOKENS,
+} from "../src/provider-models/openai-compat";
 import type { Api, Model } from "../src/types";
 
 const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
@@ -39,7 +45,231 @@ describe("online-if-uncached model refresh", () => {
 	});
 
 	afterEach(() => {
+		vi.restoreAllMocks();
 		rmSync(cacheDir, { recursive: true, force: true });
+	});
+
+	test("preserves Muse 1.3 metadata through ID-only discovery and cache reuse", async () => {
+		const id = "muse-spark-1.3-contributor";
+		const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(Response.json({ data: [{ id }] }));
+		const options = {
+			...opencodeGoModelManagerOptions({ apiKey: "test-key" }),
+			staticModels: getBundledModels("opencode-go"),
+			cacheDbPath,
+		};
+		const online = await resolveProviderModels<Api>(options, "online");
+		const muse = online.models.find(entry => entry.id === id);
+		expect(muse).toMatchObject({
+			api: "openai-responses",
+			reasoning: true,
+			thinking: { mode: "effort", minLevel: Effort.Minimal, maxLevel: Effort.XHigh },
+			contextWindow: 1_048_576,
+			maxTokens: 131_072,
+			cost: { input: 0.1, output: 0.2, cacheRead: 0.002, cacheWrite: 0 },
+			input: ["text", "image"],
+		});
+		expect(muse).toEqual(getBundledModel("opencode-go", id));
+		expect(fetchSpy).toHaveBeenCalledTimes(1);
+		const cached = await resolveProviderModels<Api>(options, "offline");
+		expect(cached.models.find(entry => entry.id === id)).toEqual(muse);
+		expect(fetchSpy).toHaveBeenCalledTimes(1);
+	});
+
+	test("Go discovery applies reviewed Muse limits while preserving endpoint and uncurated model metadata", async () => {
+		const id = "muse-spark-1.3-contributor";
+		const baseUrl = "https://go.example.test/v1";
+		const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+			Response.json({
+				data: [
+					{
+						id,
+						name: "Endpoint Contributor name",
+						context_length: 64_000,
+						max_completion_tokens: 4_000,
+					},
+					{
+						id: "muse-spark-1.3",
+						name: "Endpoint uncurated name",
+						context_length: 64_000,
+						max_tokens: 4_000,
+					},
+				],
+			}),
+		);
+		const options = opencodeGoModelManagerOptions({ apiKey: "test-key", baseUrl });
+		const discovered = await options.fetchDynamicModels?.();
+		expect(fetchSpy).toHaveBeenCalledTimes(1);
+		expect(fetchSpy.mock.calls[0]?.[0]).toBe(`${baseUrl}/models`);
+		expect(discovered).toHaveLength(2);
+		expect(discovered).toContainEqual({
+			...getBundledModel("opencode-go", id),
+			baseUrl,
+		});
+		expect(discovered).toContainEqual({
+			id: "muse-spark-1.3",
+			name: "Endpoint uncurated name",
+			api: "openai-completions",
+			provider: "opencode-go",
+			baseUrl,
+			contextWindow: 64_000,
+			maxTokens: 4_000,
+			reasoning: false,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		});
+	});
+
+	test("refreshes stale Muse 1.3 placeholder cache metadata through ID-only discovery", async () => {
+		const providerId = "opencode-go";
+		const id = "muse-spark-1.3-contributor";
+		const now = 1_700_000_000_000;
+		const stale = {
+			...model(providerId, id),
+			contextWindow: UNK_CONTEXT_WINDOW,
+			maxTokens: UNK_MAX_TOKENS,
+		};
+		writeModelCache(providerId, now - CACHE_TTL_MS - 1, [stale], true, fingerprint([stale]), cacheDbPath);
+		const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(Response.json({ data: [{ id }] }));
+		const options = {
+			...opencodeGoModelManagerOptions({ apiKey: "test-key" }),
+			staticModels: getBundledModels(providerId),
+			cacheDbPath,
+			now: () => now,
+		};
+		const result = await resolveProviderModels<Api>(options, "online-if-uncached");
+		const muse = result.models.find(entry => entry.id === id);
+		expect(muse?.api).toBe("openai-responses");
+		expect(muse).toEqual(getBundledModel(providerId, id));
+		expect(fetchSpy).toHaveBeenCalledTimes(1);
+		expect(readModelCache<Api>(providerId, CACHE_TTL_MS, () => now, cacheDbPath)?.models).toContainEqual(muse);
+	});
+
+	test("upgrades a fresh pre-review Muse cache with matching registry-owned provenance", async () => {
+		const providerId = "opencode-go";
+		const id = "muse-spark-1.3-contributor";
+		const now = 1_700_000_000_000;
+		const provenance = "registry-owned-credential-endpoint";
+		const placeholder = {
+			...model(providerId, id),
+			contextWindow: UNK_CONTEXT_WINDOW,
+			maxTokens: UNK_MAX_TOKENS,
+		};
+		writeModelCache(providerId, now, [placeholder], true, fingerprint([placeholder]), cacheDbPath, [id], provenance);
+		const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(Response.json({ data: [{ id }] }));
+		const result = await resolveProviderModels<Api>(
+			{
+				...opencodeGoModelManagerOptions({ apiKey: "test-key" }),
+				staticModels: getBundledModels(providerId),
+				cacheDbPath,
+				now: () => now,
+				// The CLI registry owns this value and overrides descriptor options.
+				cacheDynamicModelProvenance: provenance,
+			},
+			"online-if-uncached",
+		);
+		expect(fetchSpy).toHaveBeenCalledTimes(0);
+		expect(result.models.find(entry => entry.id === id)).toMatchObject({
+			api: "openai-responses",
+			contextWindow: 1_048_576,
+			maxTokens: 131_072,
+			reasoning: true,
+			thinking: { mode: "effort", minLevel: Effort.Minimal, maxLevel: Effort.XHigh },
+		});
+	});
+
+	test.each([
+		"offline",
+		"online-if-uncached",
+		"online",
+	] as const)("repairs pre-review Muse limits during %s without changing refresh or error fallback", async strategy => {
+		const providerId = "opencode-go";
+		const id = "muse-spark-1.3-contributor";
+		const now = 1_700_000_000_000;
+		const staticModels = [getBundledModel(providerId, id)];
+		const placeholder = {
+			...model(providerId, id),
+			contextWindow: UNK_CONTEXT_WINDOW,
+			maxTokens: UNK_MAX_TOKENS,
+		};
+		const provenance = "same-credential-endpoint";
+		writeModelCache(providerId, now, [placeholder], true, fingerprint(staticModels), cacheDbPath, [id], provenance);
+		const fetchDynamicModels = vi.fn(async () => null);
+		const options = {
+			providerId,
+			staticModels,
+			cacheDbPath,
+			now: () => now,
+			cacheDynamicModelProvenance: provenance,
+			fetchDynamicModels,
+		};
+		const result = await resolveProviderModels<Api>(options, strategy);
+		expect(result.models[0]).toMatchObject(staticModels[0]!);
+		expect(fetchDynamicModels).toHaveBeenCalledTimes(strategy === "online" ? 1 : 0);
+		const reused = await resolveProviderModels<Api>(options, "offline");
+		expect(reused.models[0]).toMatchObject(staticModels[0]!);
+	});
+
+	test.each([
+		{ contextWindow: 64_000, maxTokens: 4_000 },
+		{ contextWindow: 2_000_000, maxTokens: 200_000 },
+		{ contextWindow: UNK_CONTEXT_WINDOW, maxTokens: 4_000 },
+		{ contextWindow: 64_000, maxTokens: UNK_MAX_TOKENS },
+		{ contextWindow: UNK_CONTEXT_WINDOW, maxTokens: UNK_MAX_TOKENS, reasoning: true },
+		{
+			contextWindow: UNK_CONTEXT_WINDOW,
+			maxTokens: UNK_MAX_TOKENS,
+			api: "openai-responses" as const,
+		},
+	])("model-manager merge preserves non-placeholder already-mapped Muse limits %j", async overrides => {
+		const providerId = "opencode-go";
+		const id = "muse-spark-1.3-contributor";
+		const discovered = { ...model(providerId, id), ...overrides };
+		const result = await resolveProviderModels<Api>(
+			{
+				providerId,
+				staticModels: [getBundledModel(providerId, id)],
+				cacheDbPath,
+				fetchDynamicModels: async () => [discovered],
+			},
+			"online",
+		);
+		expect(result.models[0]).toMatchObject({
+			api: "openai-responses",
+			reasoning: true,
+			contextWindow: overrides.contextWindow,
+			maxTokens: overrides.maxTokens,
+		});
+	});
+
+	test.each([
+		["opencode-go", "muse-spark-1.2-contributor"],
+		["opencode-go", "muse-spark-1.4-contributor"],
+		["other-provider", "muse-spark-1.3-contributor"],
+	])("does not reinterpret placeholders for %s/%s", async (providerId, id) => {
+		const reference = {
+			...getBundledModel("opencode-go", "muse-spark-1.3-contributor"),
+			provider: providerId,
+			id,
+		};
+		const result = await resolveProviderModels<Api>(
+			{
+				providerId,
+				staticModels: [reference],
+				cacheDbPath,
+				fetchDynamicModels: async () => [
+					{
+						...model(providerId, id),
+						contextWindow: UNK_CONTEXT_WINDOW,
+						maxTokens: UNK_MAX_TOKENS,
+					},
+				],
+			},
+			"online",
+		);
+		expect(result.models[0]).toMatchObject({
+			contextWindow: UNK_CONTEXT_WINDOW,
+			maxTokens: UNK_MAX_TOKENS,
+		});
 	});
 
 	test("reuses a fresh authoritative cache without discovery", async () => {

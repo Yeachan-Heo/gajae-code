@@ -4,6 +4,7 @@ import { insertModelCacheIfAbsent, readModelCache, updateModelCacheIfUnchanged, 
 import { isRetiredModel, isRetiredModelKey } from "./model-retirements";
 import { applyGeneratedModelPolicies, enrichModelThinking } from "./model-thinking";
 import { type GeneratedProvider, getBundledModels } from "./models";
+import { UNK_CONTEXT_WINDOW, UNK_MAX_TOKENS } from "./provider-models/openai-compat";
 import type { Api, Model, Provider } from "./types";
 import { isSafeCatalogModelId } from "./utils/discovery/openai-compatible";
 
@@ -552,6 +553,20 @@ function fingerprintStatic<TApi extends Api>(models: readonly Model<TApi>[]): st
 
 function mergeDynamicModel<TApi extends Api>(existingModel: Model<TApi>, dynamicModel: Model<TApi>): Model<TApi> {
 	const supportsImage = existingModel.input.includes("image") || dynamicModel.input.includes("image");
+	// Before this exact Go model was curated, ID-only discovery cached the
+	// non-reasoning Completions defaults. A fresh authoritative cache can skip
+	// discovery after an upgrade, so recover its limits from reviewed static
+	// Responses metadata here. Do not reinterpret individual numeric limits or
+	// apply this correction to reviewed discovery rows or other model IDs.
+	const hasPreReviewMuseLimits =
+		existingModel.provider === "opencode-go" &&
+		existingModel.id === "muse-spark-1.3-contributor" &&
+		existingModel.api === "openai-responses" &&
+		existingModel.reasoning &&
+		dynamicModel.api === "openai-completions" &&
+		!dynamicModel.reasoning &&
+		dynamicModel.contextWindow === UNK_CONTEXT_WINDOW &&
+		dynamicModel.maxTokens === UNK_MAX_TOKENS;
 	// The static catalog is authoritative for transport: `api` (and its
 	// api-specific `baseUrl`). Dynamic discovery enumerates ids via a single
 	// hardcoded api (e.g. fetchOpenAICompatibleModels always tags
@@ -579,8 +594,12 @@ function mergeDynamicModel<TApi extends Api>(existingModel: Model<TApi>, dynamic
 			cacheRead: preferDiscoveryCost(dynamicModel.cost.cacheRead, existingModel.cost.cacheRead),
 			cacheWrite: preferDiscoveryCost(dynamicModel.cost.cacheWrite, existingModel.cost.cacheWrite),
 		},
-		contextWindow: preferDiscoveryLimit(dynamicModel.contextWindow, existingModel.contextWindow),
-		maxTokens: preferDiscoveryLimit(dynamicModel.maxTokens, existingModel.maxTokens),
+		contextWindow: hasPreReviewMuseLimits
+			? existingModel.contextWindow
+			: preferDiscoveryLimit(dynamicModel.contextWindow, existingModel.contextWindow),
+		maxTokens: hasPreReviewMuseLimits
+			? existingModel.maxTokens
+			: preferDiscoveryLimit(dynamicModel.maxTokens, existingModel.maxTokens),
 		headers: dynamicModel.headers ? { ...existingModel.headers, ...dynamicModel.headers } : existingModel.headers,
 		compat: dynamicModel.compat ?? existingModel.compat,
 		contextPromotionTarget: dynamicModel.contextPromotionTarget ?? existingModel.contextPromotionTarget,

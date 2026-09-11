@@ -3685,6 +3685,36 @@ describe("coordinator runtime state sidecar", () => {
 		expect(typeof payload.ended_at).toBe("string");
 		expect(Number.isFinite(Date.parse(payload.ended_at as string))).toBe(true);
 	});
+	it("issue-5471: normalizes a pre-4351 completed readiness bit and self-heals on write", async () => {
+		const root = await tempRoot();
+		const stateFile = path.join(root, "issue-5471-legacy-completed.json");
+		const sessionId = "issue-5471-legacy-completed";
+		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
+		process.env[GJC_COORDINATOR_SESSION_ID_ENV] = sessionId;
+		await Bun.write(
+			stateFile,
+			`${JSON.stringify({
+				schema_version: 1,
+				session_id: sessionId,
+				state: "completed",
+				ready_for_input: true,
+				cwd: root,
+				workdir: root,
+				session_file: null,
+				current_turn_id: "turn-final",
+				last_turn_id: "turn-prev",
+				live: false,
+				updated_at: "2026-08-11T00:00:00.000Z",
+				reason: null,
+			})}\n`,
+		);
+
+		await expect(
+			persistCoordinatorRuntimeStateFromEvent({ type: "turn_start" }, { sessionId, cwd: root, sessionFile: null }),
+		).resolves.toBeUndefined();
+
+		await expect(readPayload(stateFile)).resolves.toMatchObject({ state: "running", ready_for_input: false });
+	});
 
 	it("issue-4351: errored session reports ready_for_input false", async () => {
 		const root = await tempRoot();
@@ -3722,7 +3752,7 @@ describe("coordinator runtime state sidecar", () => {
 	});
 
 	it.each([
-		["completed", true, false, "ready_for_input must be false when state is completed (received true)"],
+		["errored", true, false, "ready_for_input must be false when state is errored (received true)"],
 		["ready_for_input", false, false, "ready_for_input must be true when state is ready_for_input (received false)"],
 		["running", false, false, "live must be true when state is running (received false)"],
 		["completed", false, true, "live must be false when state is completed (received true)"],

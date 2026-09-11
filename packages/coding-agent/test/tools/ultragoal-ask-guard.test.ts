@@ -196,6 +196,74 @@ describe("ultragoal ask guard", () => {
 		expect(execute).not.toHaveBeenCalled();
 	});
 
+	it("isolates wrapped Ask from another session's skill metadata and environment", async () => {
+		const cwd = await tempDir();
+		process.env.GJC_SESSION_ID = TEST_SESSION_ID;
+		await createUltragoalPlan({ cwd, brief: "Implement session A's story" });
+		const ledgerFile = Bun.file(getUltragoalPaths(cwd, TEST_SESSION_ID).ledgerPath);
+		const ledgerBefore = await ledgerFile.text();
+		const sessionId = "ordinary-ask-session-b";
+		const states = [
+			undefined,
+			{ skill: "autoresearch", session_id: TEST_SESSION_ID },
+			{ skill: "ultragoal", session_id: TEST_SESSION_ID },
+			{ skill: "deep-interview", session_id: TEST_SESSION_ID },
+			{ skill: "ralplan", session_id: TEST_SESSION_ID },
+		];
+		for (const activeSkillState of states) {
+			const execute = vi.fn(async () => {});
+			const guarded = guardToolForUltragoalAsk(
+				stubAskTool(execute),
+				() => cwd,
+				() => ({ sessionId: ` ${sessionId} `, activeSkillState }),
+			);
+			const result = await guarded.execute("call", {}, undefined, undefined, undefined as never);
+			expect(result.content).toEqual([{ type: "text", text: "asked" }]);
+			expect(execute).toHaveBeenCalledTimes(1);
+			expect(await ledgerFile.text()).toBe(ledgerBefore);
+		}
+	});
+
+	it("allows ordinary unwrapped Ask in session B without changing session A's ledger", async () => {
+		const cwd = await tempDir();
+		process.env.GJC_SESSION_ID = TEST_SESSION_ID;
+		await createUltragoalPlan({ cwd, brief: "Implement session A's story" });
+		const ledgerFile = Bun.file(getUltragoalPaths(cwd, TEST_SESSION_ID).ledgerPath);
+		const ledgerBefore = await ledgerFile.text();
+		const select = vi.fn(async () => "Continue");
+		const tool = new AskTool(createSession(cwd, { getSessionId: () => "ordinary-ask-session-b" }));
+		await tool.execute(
+			"call",
+			{ questions: [{ id: "q", question: "Continue intake?", options: [{ label: "Continue" }] }] },
+			undefined,
+			undefined,
+			createContext(select),
+		);
+		expect(select).toHaveBeenCalledTimes(1);
+		expect(await ledgerFile.text()).toBe(ledgerBefore);
+	});
+
+	it("preserves environment and skill fallback for absent or blank caller IDs", async () => {
+		const cwd = await tempDir();
+		process.env.GJC_SESSION_ID = TEST_SESSION_ID;
+		await createUltragoalPlan({ cwd, brief: "Implement the existing session's story" });
+		for (const sessionId of [undefined, "", "   "]) {
+			for (const skill of [undefined, "deep-interview"]) {
+				process.env.GJC_SESSION_ID = skill ? "unrelated-environment-session" : TEST_SESSION_ID;
+				const execute = vi.fn(async () => {});
+				const guarded = guardToolForUltragoalAsk(
+					stubAskTool(execute),
+					() => cwd,
+					() => ({ sessionId, activeSkillState: skill ? { skill, session_id: TEST_SESSION_ID } : undefined }),
+				);
+				await expect(guarded.execute("call", {}, undefined, undefined, undefined as never)).rejects.toThrow(
+					ToolError,
+				);
+				expect(execute).not.toHaveBeenCalled();
+			}
+		}
+	});
+
 	it("preserves `this` for a prototype-method ask tool when ultragoal is inactive (regression)", async () => {
 		const cwd = await tempDir();
 		const tool = new StubExtensionWrappedAskTool();
