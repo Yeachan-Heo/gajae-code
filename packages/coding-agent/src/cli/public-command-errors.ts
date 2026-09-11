@@ -100,6 +100,11 @@ export const PUBLIC_COMMAND_DIAGNOSTICS = {
 		"The macOS open-file limit is below the recommended minimum; increase it before starting additional concurrent work.",
 	router_cleanup_failed: "SDK session Router cleanup failed.",
 	broker_cleanup_failed: "SDK broker client cleanup failed.",
+	usage_transport_exclusive: "Specify exactly one of --stdio or --socket <path>.",
+	usage_duplicate_option: "Each option on this command may occur at most once.",
+	usage_unknown_argument: "An unrecognized argument was supplied; re-read the command help for its accepted grammar.",
+	usage_missing_value: "An option that requires a value was supplied without one.",
+	usage_invalid_option_value: "An option value is invalid; re-read the command help for its accepted values.",
 } as const;
 export type PublicCommandDiagnosticCode = keyof typeof PUBLIC_COMMAND_DIAGNOSTICS;
 export interface PublicCommandDiagnostic {

@@ -1,5 +1,9 @@
 import { getAgentDir } from "@gajae-code/utils";
-import { normalizePublicCommandFailure, PublicCommandFailure } from "../../cli/public-command-errors";
+import {
+	normalizePublicCommandFailure,
+	type PublicCommandDiagnosticCode,
+	PublicCommandFailure,
+} from "../../cli/public-command-errors";
 import { readSdkBrokerDiscovery, SdkClient, SdkClientError } from "../client";
 import { SessionListTraversalError, sessionListPageFromResponse, traverseSessionList } from "../session-list";
 import type { ServeHandle } from "./index";
@@ -13,13 +17,18 @@ interface ServeArguments {
 	pendingCeiling?: string;
 }
 
-function usageError(_message: string): never {
-	throw new PublicCommandFailure({ kind: "usage", proof: "pre-effect" });
+/**
+ * Usage failures keep a static, allowlisted reason instead of the parser's raw text:
+ * the concrete diagnostic is what makes an unknown flag or a missing operand
+ * actionable, and it never echoes caller argv back into output or the evidence store.
+ */
+function usageError(diagnostic: PublicCommandDiagnosticCode): never {
+	throw new PublicCommandFailure({ kind: "usage", proof: "pre-effect", diagnostics: [diagnostic] });
 }
 
-function readFlagValue(argv: string[], index: number, flag: string): string {
+function readFlagValue(argv: string[], index: number): string {
 	const value = argv[index + 1];
-	if (value === undefined || value.startsWith("-")) usageError(`${flag} requires a value`);
+	if (value === undefined || value.startsWith("-")) usageError("usage_missing_value");
 	return value;
 }
 
@@ -31,29 +40,29 @@ function parseServeArguments(argv: string[]): ServeArguments {
 	for (let index = 0; index < argv.length; index++) {
 		switch (argv[index]) {
 			case "--stdio":
-				if (stdio) usageError("--stdio may only be specified once");
+				if (stdio) usageError("usage_duplicate_option");
 				stdio = true;
 				break;
 			case "--socket":
-				if (socketPath !== undefined) usageError("--socket may only be specified once");
-				socketPath = readFlagValue(argv, index, "--socket");
+				if (socketPath !== undefined) usageError("usage_duplicate_option");
+				socketPath = readFlagValue(argv, index);
 				index++;
 				break;
 			case "--session":
-				if (sessionId !== undefined) usageError("--session may only be specified once");
-				sessionId = readFlagValue(argv, index, "--session");
+				if (sessionId !== undefined) usageError("usage_duplicate_option");
+				sessionId = readFlagValue(argv, index);
 				index++;
 				break;
 			case "--pending-ceiling":
-				if (pendingCeiling !== undefined) usageError("--pending-ceiling may only be specified once");
-				pendingCeiling = readFlagValue(argv, index, "--pending-ceiling");
+				if (pendingCeiling !== undefined) usageError("usage_duplicate_option");
+				pendingCeiling = readFlagValue(argv, index);
 				index++;
 				break;
 			default:
-				usageError(`unknown argument: ${argv[index]}`);
+				usageError("usage_unknown_argument");
 		}
 	}
-	if (stdio === (socketPath !== undefined)) usageError("specify exactly one of --stdio or --socket <path>");
+	if (stdio === (socketPath !== undefined)) usageError("usage_transport_exclusive");
 	return { mode: stdio ? { kind: "stdio" } : { kind: "socket", socketPath: socketPath! }, sessionId, pendingCeiling };
 }
 
@@ -61,10 +70,9 @@ function parseServeArguments(argv: string[]): ServeArguments {
 export function resolveServePendingCeiling(flagValue: string | undefined, envValue: string | undefined): number {
 	const value = flagValue ?? envValue;
 	if (value === undefined) return DEFAULT_PENDING_CEILING_BYTES;
-	if (!/^\d+$/.test(value)) usageError("--pending-ceiling must be a positive integer");
+	if (!/^\d+$/.test(value)) usageError("usage_invalid_option_value");
 	const ceiling = Number(value);
-	if (!Number.isSafeInteger(ceiling) || ceiling < MIN_PENDING_CEILING_BYTES)
-		usageError(`--pending-ceiling must be an integer of at least ${MIN_PENDING_CEILING_BYTES}`);
+	if (!Number.isSafeInteger(ceiling) || ceiling < MIN_PENDING_CEILING_BYTES) usageError("usage_invalid_option_value");
 	return ceiling;
 }
 
@@ -202,7 +210,9 @@ export async function runSdkServe(
 		const endpoint = brokerResult(await broker.global("session.get_endpoint", { sessionId }));
 		const url = typeof endpoint.url === "string" && endpoint.url ? endpoint.url : undefined;
 		const token = typeof endpoint.token === "string" ? endpoint.token : "";
-		if (!url) throw new PublicCommandFailure({ kind: "unavailable", proof: "pre-effect" });
+		// An endpoint without its minted credential cannot authenticate any relayed
+		// client, so starting the listener would advertise a serve that always fails.
+		if (!url || !token) throw new PublicCommandFailure({ kind: "unavailable", proof: "pre-effect" });
 		const options = { url, token, pendingCeilingBytes };
 		transport =
 			parsed.mode.kind === "stdio"

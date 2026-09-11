@@ -6,7 +6,11 @@ import path from "node:path";
 import { PassThrough, Writable } from "node:stream";
 import { CliParseError } from "@gajae-code/utils/cli";
 import type { ServerWebSocket } from "bun";
-import { PublicCommandFailure } from "../src/cli/public-command-errors";
+import {
+	PUBLIC_COMMAND_DIAGNOSTICS,
+	PublicCommandFailure,
+	renderPublicCommandFailure,
+} from "../src/cli/public-command-errors";
 import { renderPublicCommandHelp } from "../src/cli/public-command-help";
 import { parseSdkInternalArgv } from "../src/commands/sdk.js";
 import { SdkClientError } from "../src/sdk/client/client.js";
@@ -746,6 +750,52 @@ describe("SDK serve CLI and discovery", () => {
 		await expect(runSdkServe(["--stdio", "--pending-ceiling", "nope"])).rejects.toMatchObject({
 			input: { kind: "usage" },
 		});
+	});
+
+	test.each([
+		[["--stdio", "--socket", "/tmp/x"], "usage_transport_exclusive"],
+		[["--stdio", "--stdio"], "usage_duplicate_option"],
+		[["--bogus"], "usage_unknown_argument"],
+		[["--socket"], "usage_missing_value"],
+		[["--stdio", "--pending-ceiling", "nope"], "usage_invalid_option_value"],
+	] as const)("usage failure %j stays actionable without echoing argv (%s)", async (argv, diagnostic) => {
+		const failure = await runSdkServe([...argv]).catch((error: unknown) => error);
+		expect(failure).toBeInstanceOf(PublicCommandFailure);
+		expect((failure as PublicCommandFailure).input.diagnostics).toEqual([diagnostic]);
+		const rendered = await renderPublicCommandFailure(failure, { command: ["sdk", "serve"], json: true });
+		expect(rendered.stderr).toBe("");
+		const envelope = JSON.parse(rendered.stdout) as { error: { category: string }; diagnostics: unknown[] };
+		expect(envelope.error.category).toBe("usage");
+		expect(envelope.diagnostics).toEqual([{ code: diagnostic, message: PUBLIC_COMMAND_DIAGNOSTICS[diagnostic] }]);
+		expect(rendered.stdout).not.toContain("--bogus");
+	});
+
+	test("an endpoint without its minted credential fails pre-effect and never starts the transport", async () => {
+		const calls: string[] = [];
+		const dependencies: SdkServeDependencies = {
+			readDiscovery: async () => ({ url: "ws://unused", token: "unused" }),
+			connect: async () => ({
+				global: async operation =>
+					operation === "session.list"
+						? { ok: true, result: { sessions: [{ sessionId: "session-one", live: true }], warnings: [] } }
+						: { ok: true, result: { url: "ws://unused", token: "" } },
+				close: async () => {
+					calls.push("close");
+				},
+			}),
+			startStdio: async () => {
+				calls.push("start");
+				throw new Error("unexpected transport start");
+			},
+			startSocket: async () => {
+				calls.push("start");
+				throw new Error("unexpected transport start");
+			},
+		};
+		await expect(runSdkServe(["--stdio", "--pending-ceiling", "262144"], dependencies)).rejects.toMatchObject({
+			input: { kind: "unavailable", proof: "pre-effect" },
+		});
+		expect(calls).toEqual(["close"]);
 	});
 
 	test("parses stale tombstones and fails endpoint selection closed", async () => {
