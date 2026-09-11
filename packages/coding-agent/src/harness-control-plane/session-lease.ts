@@ -9,7 +9,7 @@
 import { createHash, randomBytes } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { FileLockAcquireError, withFileLock } from "../config/file-lock";
+import { isFileLockAcquireTimeout, withFileLock } from "../config/file-lock";
 
 import { controlSocketPath, sessionPaths } from "./storage";
 
@@ -76,7 +76,7 @@ async function withLeaseMutationLock<T>(root: string, sessionId: string, fn: () 
 			retryDelayMs: 20,
 		});
 	} catch (error) {
-		if (error instanceof FileLockAcquireError && error.code === "acquire_timeout") {
+		if (isFileLockAcquireTimeout(error)) {
 			throw new LeaseError(`lease_lock_timeout:${sessionId}`, "lease_lock_timeout");
 		}
 		throw error;

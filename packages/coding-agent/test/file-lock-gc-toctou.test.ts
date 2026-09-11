@@ -942,7 +942,7 @@ describe("file lock cleanup failure handling (#2478)", () => {
 			).catch(error => error);
 			expect(failure).toBeInstanceOf(FileLockAcquireError);
 			expect(failure).toMatchObject({
-				code: "acquire_timeout",
+				code: "orphan_transition",
 				reason: "orphan_transition",
 				orphanPath: detachedPath,
 				attempts: 1,

@@ -35,7 +35,7 @@ export interface FileLockOptions {
 export type FileLockAcquireReason = "acquire_timeout" | "orphan_transition";
 
 export class FileLockAcquireError extends Error {
-	readonly code = "acquire_timeout";
+	readonly code: FileLockAcquireReason;
 
 	constructor(
 		readonly filePath: string,
@@ -51,8 +51,13 @@ export class FileLockAcquireError extends Error {
 				`a live owner is never displaced — if this is an SDK broker (gjc sdk session list), it must finish or be stopped before retrying; ` +
 				`the lock is a directory, remove it only by deleting the directory (${lockPath}) once no live owner remains`,
 		);
+		this.code = reason;
 		this.name = "FileLockAcquireError";
 	}
+}
+
+export function isFileLockAcquireTimeout(error: unknown): error is FileLockAcquireError {
+	return error instanceof FileLockAcquireError && error.code === "acquire_timeout";
 }
 
 const DEFAULT_OPTIONS: Required<
