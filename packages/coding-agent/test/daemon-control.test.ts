@@ -346,7 +346,7 @@ describe("daemon operator contract", () => {
 			kind: "telegram",
 			configured: true,
 			health: "running",
-			ownerId: "owner\u001b[31m\u2028id",
+			ownerId: "owner\u001b[31m\u2028\u202eid",
 			detail: "detail\nnext",
 			roots: ["/safe\u0007root"],
 			rootCount: 1,
@@ -369,6 +369,7 @@ describe("daemon operator contract", () => {
 			expect(rendered).not.toContain("\u001b");
 			expect(rendered).not.toContain("\u2028");
 			expect(rendered).not.toContain("\u2029");
+			expect(rendered).not.toContain("\u202e");
 		}
 		expect(renderedStatus).toContain("detail next");
 	});

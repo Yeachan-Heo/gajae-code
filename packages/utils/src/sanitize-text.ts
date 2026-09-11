@@ -17,6 +17,7 @@ const ESC_CHAR = "\x1b";
 // Well-formed strings only need control/ANSI detection: C0 (excl. \t \n),
 // CR, DEL, and C1. ESC (0x1B) is in \x0B-\x1F.
 const CONTROL_RE = /[\x00-\x08\x0B-\x1F\x7F-\x9F]/g;
+const DISPLAY_FORMAT_RE = /[\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069]/gu;
 
 const REPLACEMENT_CHAR = "\ufffd";
 
@@ -34,10 +35,11 @@ export function sanitizeText(text: string): string {
  * {@link sanitizeText} deliberately preserves `\n`, and width-based truncation
  * treats it as zero-width, so a value carrying line breaks can still inject
  * extra rows and evade a single-line width budget. Flatten every CR/LF run to a
- * single space before the usual control/ANSI strip.
+ * single space before the usual control/ANSI strip, then remove directional
+ * format controls that can visually reorder an otherwise safe row.
  */
 export function sanitizeDisplayLine(text: string): string {
-	return sanitizeText(text.replace(/[\r\n]+/gu, " "));
+	return sanitizeText(text.replace(/[\r\n]+/gu, " ")).replace(DISPLAY_FORMAT_RE, "");
 }
 
 function sanitizeWellFormedText(text: string): string {
