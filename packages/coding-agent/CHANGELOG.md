@@ -6,6 +6,7 @@
 
 - Successful macOS installs and updates can offer the optional experimental, third-party community Gajae Code App (#5140), defaulting to No. The shared installer requires canonical release checksums and a verified bundle/signature, skips installed apps and automation, and supports `GJC_NO_COMMUNITY_APP=1`; app failures leave GJC installed.
 ### Fixed
+- The `opencode-go/muse-spark-1.3-contributor` catalog row added in #5485 is now declared in the autorouting tier-map skip list, so `check:autorouting-map` and its CI gate pass again instead of failing on the unlabeled new key.
 - Image generation now sends the selected image-role model instead of silently substituting a provider default for Antigravity, Gemini, OpenRouter, and Alibaba.
 - The Ultragoal Ask guard now binds state lookup and nudge consumption to an explicit nonblank caller session, regardless of active skill or stale skill/environment session metadata, preventing another session's durable goal from blocking that caller or consuming its nudge budget (#5465).
 - Completed coordinator runtime markers with the legacy `ready_for_input: true` shape now resume and self-heal on the next lifecycle write, while other contradictory readiness and liveness markers remain hard errors (#5471).
