@@ -438,7 +438,7 @@ test("SDK-only finalizeOutcome keeps legacy recordError positional compatibility
 	});
 	expect(compatReconciliation.lookup("prompt", { clientRef: "finalize-compat-ref" })).toMatchObject({
 		status: "failed",
-		error: { code: "legacy_error", message: "legacy message" },
+		error: { code: "legacy_error", message: "Prompt submission failed." },
 	});
 	// The isCurrent callback shape still fences a stale finalize to a no-op.
 	const second = createInvocationReconciliation();
@@ -4049,7 +4049,16 @@ describe("post-acceptance invocation terminalization", () => {
 			});
 			expect(terminal).toMatchObject({
 				status: "failed",
-				error: { code, message: "Prompt submission failed." },
+				error: { code, message: "Provider failure after execution started." },
+				outcome: {
+					kind: "failed",
+					code: "prompt_failed",
+					message: "Provider failure after execution started.",
+					provenance: "agent_failed",
+					phase: "post_start",
+					category: "provider_rejected",
+					providerCode: code,
+				},
 				terminalAt: expect.any(Number),
 			});
 			const stable = await harness.query("turn.result", { kind: "prompt", ...failedIds });
@@ -4669,7 +4678,16 @@ describe("post-acceptance invocation terminalization", () => {
 			// the failure reason survives as the safe-token code.
 			expect(await settledStatus(harness, "turn.prompt_status", { commandId, turnId })).toMatchObject({
 				status: "failed",
-				error: { code: "upstream_stream_interrupted", message: "Prompt submission failed." },
+				error: { code: "upstream_stream_interrupted", message: "Provider failure after execution started." },
+				outcome: {
+					kind: "failed",
+					code: "prompt_failed",
+					message: "Provider failure after execution started.",
+					provenance: "agent_failed",
+					phase: "post_start",
+					category: "provider_transport",
+					providerCode: "upstream_stream_interrupted",
+				},
 			});
 			await harness.stop();
 		} finally {
@@ -5042,7 +5060,15 @@ describe("post-acceptance invocation terminalization", () => {
 			});
 			expect(result).toMatchObject({
 				status: "failed",
-				error: { code: "prompt_failed", message: "Prompt submission failed." },
+				error: { code: "prompt_failed", message: "Agent run failed after execution started." },
+				outcome: {
+					kind: "failed",
+					code: "prompt_failed",
+					message: "Agent run failed after execution started.",
+					provenance: "agent_failed",
+					phase: "post_start",
+					category: "agent_runtime",
+				},
 			});
 			const successor = await harness.control("turn.prompt", { text: "successor" });
 			expect(successor).toMatchObject({ ok: true, result: { accepted: true } });
@@ -5243,7 +5269,15 @@ describe("post-acceptance invocation terminalization", () => {
 					}),
 				).toMatchObject({
 					status: "failed",
-					error: { code: "prompt_failed", message: "Prompt submission failed." },
+					error: { code: "prompt_failed", message: "Agent run failed after execution started." },
+					outcome: {
+						kind: "failed",
+						code: "prompt_failed",
+						message: "Agent run failed after execution started.",
+						provenance: "agent_failed",
+						phase: "post_start",
+						category: "agent_runtime",
+					},
 				});
 				await harness.stop();
 			} finally {

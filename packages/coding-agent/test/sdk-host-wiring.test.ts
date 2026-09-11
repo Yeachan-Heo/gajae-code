@@ -2192,7 +2192,13 @@ test("SDK host buffers synchronous pre-ack accepted failure until after acknowle
 			type: "agent_failed",
 			sessionId,
 			...correlation,
-			error: { code: "unavailable", message: "Prompt submission failed." },
+			error: { code: "unavailable", message: "Agent run failed after execution started." },
+			outcome: expect.objectContaining({
+				kind: "failed",
+				phase: "post_start",
+				category: "unknown",
+				providerCode: "unavailable",
+			}),
 		}),
 	]);
 	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
@@ -8159,7 +8165,18 @@ test("long-running prompt settles terminally after the delivery buffer expires",
 	}
 	expect(settled).toMatchObject({
 		ok: true,
-		result: { status: "failed", error: { code: "agent_error", message: "Prompt submission failed." } },
+		result: {
+			status: "failed",
+			error: { code: "agent_error", message: "Agent run failed after execution started." },
+			outcome: {
+				kind: "failed",
+				code: "prompt_failed",
+				message: "Agent run failed after execution started.",
+				provenance: "agent_failed",
+				phase: "post_start",
+				category: "agent_runtime",
+			},
+		},
 	});
 	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
 });
