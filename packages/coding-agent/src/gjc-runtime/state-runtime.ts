@@ -1932,7 +1932,12 @@ function approvalTranscriptPrefix(
 	cwd: string,
 	sessionId: string,
 	text: string,
-): { leaf: string | null; ids: Set<string>; askToolCallIds: Set<string> } {
+): {
+	leaf: string | null;
+	ids: Set<string>;
+	askToolCallCounts: Map<string, number>;
+	leafAskToolCallIds: Set<string>;
+} {
 	const [header, ...records] = approvalTranscriptRecords(text);
 	if (
 		header?.type !== "session" ||
@@ -1942,7 +1947,8 @@ function approvalTranscriptPrefix(
 	)
 		throw new StateCommandError(2, "execution approval transcript identity mismatch");
 	const ids = new Set<string>();
-	const askToolCallIds = new Set<string>();
+	const askToolCallCounts = new Map<string, number>();
+	let leafAskToolCallIds = new Set<string>();
 	let leaf: string | null = null;
 	for (const record of records) {
 		if (record.type === "header_patch") {
@@ -1968,18 +1974,37 @@ function approvalTranscriptPrefix(
 			(record.parentId !== null && (typeof record.parentId !== "string" || !ids.has(record.parentId)))
 		)
 			throw new StateCommandError(2, "execution approval transcript branch is invalid");
+		const recordAskToolCallIds = new Set<string>();
 		if (
 			record.type === "message" &&
 			isPlainObject(record.message) &&
 			record.message.role === "toolResult" &&
 			record.message.toolName === "ask" &&
 			typeof record.message.toolCallId === "string"
-		)
-			askToolCallIds.add(record.message.toolCallId);
+		) {
+			askToolCallCounts.set(record.message.toolCallId, (askToolCallCounts.get(record.message.toolCallId) ?? 0) + 1);
+		}
+		if (record.type === "message" && isPlainObject(record.message) && record.message.role === "assistant") {
+			const content = record.message.content;
+			if (Array.isArray(content)) {
+				for (const block of content) {
+					if (
+						isPlainObject(block) &&
+						block.type === "toolCall" &&
+						block.name === "ask" &&
+						typeof block.id === "string"
+					) {
+						recordAskToolCallIds.add(block.id);
+						askToolCallCounts.set(block.id, (askToolCallCounts.get(block.id) ?? 0) + 1);
+					}
+				}
+			}
+		}
+		leafAskToolCallIds = recordAskToolCallIds;
 		ids.add(record.id);
 		leaf = record.id;
 	}
-	return { leaf, ids, askToolCallIds };
+	return { leaf, ids, askToolCallCounts, leafAskToolCallIds };
 }
 
 export async function captureExecutionApprovalTranscriptBoundary(
@@ -2007,12 +2032,14 @@ export async function captureExecutionApprovalTranscriptBoundary(
 		createHash("sha256").update(text).digest("hex") !== transcriptSha256
 	)
 		throw new StateCommandError(2, "execution approval transcript changed before recording consent");
-	const { leaf } = approvalTranscriptPrefix(cwd, sessionId, text);
+	const prefix = approvalTranscriptPrefix(cwd, sessionId, text);
+	if (prefix.askToolCallCounts.get(approvalToolCallId) !== 1 || !prefix.leafAskToolCallIds.has(approvalToolCallId))
+		throw new StateCommandError(2, "execution approval transcript boundary lacks the current Ask call");
 	return {
 		byte_length: Buffer.byteLength(text),
 		device: after.dev.toString(),
 		inode: after.ino.toString(),
-		leaf_id: leaf,
+		leaf_id: prefix.leaf,
 		approval_tool_call_id: approvalToolCallId,
 	};
 }
@@ -2049,12 +2076,25 @@ export async function assertExecutionApprovalTranscriptBoundary(
 	const branch = approvalTranscriptPrefix(cwd, sessionId, prefix.toString("utf8"));
 	if (branch.leaf !== boundary.leaf_id)
 		throw new StateCommandError(2, "execution approval transcript branch identity changed");
+	if (
+		branch.askToolCallCounts.get(boundary.approval_tool_call_id) !== 1 ||
+		!branch.leafAskToolCallIds.has(boundary.approval_tool_call_id)
+	)
+		throw new StateCommandError(2, "execution approval Ask tool-call identity was reused from the captured prefix");
 	const suffix = bytes.subarray(boundary.byte_length).toString("utf8");
 	if (suffix && !suffix.endsWith("\n"))
 		throw new StateCommandError(2, "execution approval transcript continuation is incomplete");
 	let approvalAskResultSeen = false;
 	for (const record of approvalTranscriptRecords(suffix)) {
 		const message = record.message;
+		const isUserBearingAskCall =
+			record.type === "message" &&
+			isPlainObject(message) &&
+			message.role === "assistant" &&
+			Array.isArray(message.content) &&
+			message.content.some(block => isPlainObject(block) && block.type === "toolCall" && block.name === "ask");
+		if (isUserBearingAskCall)
+			throw new StateCommandError(2, "execution approval transcript continuation contains a new Ask call");
 		const isUserBearingAskResult =
 			record.type === "message" &&
 			isPlainObject(message) &&
@@ -2064,11 +2104,11 @@ export async function assertExecutionApprovalTranscriptBoundary(
 			isUserBearingAskResult &&
 			!approvalAskResultSeen &&
 			message.toolCallId === boundary.approval_tool_call_id &&
-			!branch.askToolCallIds.has(message.toolCallId);
+			branch.leafAskToolCallIds.has(boundary.approval_tool_call_id);
 		if (
 			isUserBearingAskResult &&
 			message.toolCallId === boundary.approval_tool_call_id &&
-			branch.askToolCallIds.has(message.toolCallId)
+			!branch.leafAskToolCallIds.has(boundary.approval_tool_call_id)
 		)
 			throw new StateCommandError(
 				2,
@@ -3759,6 +3799,12 @@ async function hasSanctionedRalplanFinalAdmission(
 		admission.degradationReason === null &&
 		(await verifiedRalplanFinalEvidence(cwd, sessionId, state)) !== undefined
 	);
+}
+
+/** Whether a verified automatic Ultragoal admission already authorizes handoff. */
+export async function hasSanctionedRalplanFinalAdmissionForHandoff(cwd: string, sessionId: string): Promise<boolean> {
+	const read = await readExistingStateForMutation(modeStateFile(cwd, "ralplan", sessionId));
+	return read.kind === "valid" && (await hasSanctionedRalplanFinalAdmission(cwd, sessionId, read.value));
 }
 
 async function assertRalplanApprovalRecordCurrent(

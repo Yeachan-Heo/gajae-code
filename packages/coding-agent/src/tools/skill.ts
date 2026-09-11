@@ -27,7 +27,11 @@ import * as z from "zod/v4";
 import { resolveSubskillActivationForSkillInvocation } from "../extensibility/gjc-plugins";
 import { findRuntimeSkillByName } from "../extensibility/runtime-skill-discovery";
 import { buildSkillPromptMessage } from "../extensibility/skills";
-import { runNativeStateCommand } from "../gjc-runtime/state-runtime";
+import {
+	executionApprovalLineage,
+	hasSanctionedRalplanFinalAdmissionForHandoff,
+	runNativeStateCommand,
+} from "../gjc-runtime/state-runtime";
 import { getSkillManifest } from "../gjc-runtime/workflow-manifest";
 import skillDescription from "../prompts/tools/skill.md" with { type: "text" };
 import { SKILL_PROMPT_MESSAGE_TYPE } from "../session/messages";
@@ -213,14 +217,18 @@ export class SkillTool implements AgentTool<typeof skillSchema, SkillToolDetails
 					if (!sessionId) {
 						throw new ToolError("skill tool: Ralplan to Ultragoal handoff requires a session id");
 					}
-					const approval = await runNativeStateCommand(
-						["approve-execution", "--mode", "ralplan", "--session-id", sessionId, "--json"],
-						this.#session.cwd,
-					);
-					if (approval.status !== 0) {
-						throw new ToolError(
-							`skill tool: Ralplan execution approval failed (status=${approval.status}): ${(approval.stderr ?? "").trim() || "no detail"}`,
+					if (!(await hasSanctionedRalplanFinalAdmissionForHandoff(this.#session.cwd, sessionId))) {
+						const lineage = await executionApprovalLineage(this.#session.cwd, sessionId, "ralplan");
+						const approvalMode = lineage === "crystal" ? "deep-interview" : "ralplan";
+						const approval = await runNativeStateCommand(
+							["approve-execution", "--mode", approvalMode, "--session-id", sessionId, "--json"],
+							this.#session.cwd,
 						);
+						if (approval.status !== 0) {
+							throw new ToolError(
+								`skill tool: Ralplan execution approval failed (status=${approval.status}): ${(approval.stderr ?? "").trim() || "no detail"}`,
+							);
+						}
 					}
 				}
 				const handoffArgs = ["handoff", "--mode", activeSkill, "--to", requestedName, "--json"];
