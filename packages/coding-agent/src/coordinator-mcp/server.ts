@@ -4582,6 +4582,13 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 								};
 								authority.outcome = { state: "deferred_link", first_seen_at: authority.first_seen_at };
 								authority.updated_at = observedAt;
+								// The runtime already published this gate, but no coordinator turn owns
+								// it yet, so the question stays unmaterialized. Reporting nothing here
+								// made a blocked agent indistinguishable from an idle one: `list_questions`
+								// answered a healthy empty snapshot for the whole deferral window while
+								// the ask behind the gate was waiting for an answer no operator could see
+								// (#5475). The deferral itself is unchanged — only the silence is.
+								diagnostic("pending_registration", null, gate.gate_id);
 								continue;
 							}
 							authority.outcome =

@@ -109,6 +109,12 @@ export interface AskToolDetails {
 export const OTHER_OPTION = "Other (type your own)";
 export const ASK_CLARIFICATION_OPTION = "Ask about these choices";
 export const RECOMMENDED_SUFFIX = " (Recommended)";
+/**
+ * Environment override bounding how long a headless ask waits for an answer
+ * source to take the question, in milliseconds. Unset, empty, or non-positive
+ * disables the bound.
+ */
+export const GJC_ASK_ACK_TIMEOUT_MS_ENV = "GJC_ASK_ACK_TIMEOUT_MS";
 const REMOTE_NAVIGATION_FORWARD = "\u0000ask-navigation-forward";
 const HEADLESS_CHECKBOX_CHECKED = "[x]";
 const HEADLESS_CHECKBOX_UNCHECKED = "[ ]";
@@ -156,6 +162,24 @@ async function awaitDeepInterviewRecorderPersistence(persistence: Promise<void>,
 function getDoneOptionLabel(): string {
 	const success = theme?.status?.success;
 	return success ? `${success} Done selecting` : "Done selecting";
+}
+
+/**
+ * How long a headless ask may wait for an answer source to take the question.
+ *
+ * A headless ask has no local selector, so it is answered only by a remote
+ * answer source or by a workflow gate waiting for a remote responder. Neither
+ * channel acknowledges that the question was actually taken up, so without a
+ * bound the ask waits forever while the operator sees only silence (#5475).
+ * `GJC_ASK_ACK_TIMEOUT_MS` arms the bound. It stays disabled by default: an
+ * attended remote responder may legitimately answer arbitrarily late, and
+ * silently cutting such a wait short would corrupt a real answer into an abort.
+ */
+export function resolveAskAckTimeoutMs(env: Record<string, string | undefined> = process.env): number | null {
+	const raw = env[GJC_ASK_ACK_TIMEOUT_MS_ENV];
+	if (raw === undefined) return null;
+	const parsed = Number(raw);
+	return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : null;
 }
 
 export function validRecommendedIndex(recommended: number | undefined, optionCount: number): number | undefined {
@@ -868,6 +892,40 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 			throw new ToolAbortError("Ask tool requires interactive mode");
 		}
 
+		// Only a headless ask needs an acknowledgement bound: an interactive UI
+		// answers locally, and its own `ask.timeout` already applies there.
+		const askAckTimeoutMs = hasInteractiveUi ? null : resolveAskAckTimeoutMs();
+		const askAckExpired = Symbol("ask-ack-expired");
+		/**
+		 * Bound one headless answer wait. On expiry the ask must fail with a
+		 * distinguishable origin ("no answer source acknowledged the question")
+		 * instead of degrading into the empty answer the model would otherwise
+		 * read as "the user declined", and the enclosing turn is aborted so the
+		 * stall cannot outlive the tool call.
+		 */
+		const awaitAskAck = async <T>(work: () => Promise<T>): Promise<T> => {
+			if (askAckTimeoutMs === null) return await work();
+			const expired = Promise.withResolvers<typeof askAckExpired>();
+			const timer = setTimeout(() => expired.resolve(askAckExpired), askAckTimeoutMs);
+			try {
+				const settled = await Promise.race([work(), expired.promise]);
+				if (settled !== askAckExpired) return settled;
+				logger.warn("ask_answer_source_ack_timeout", {
+					sessionId: this.session.getSessionId?.() ?? null,
+					answerSource: canUseWorkflowGate ? "workflow_gate" : "remote",
+					ackTimeoutMs: askAckTimeoutMs,
+				});
+				await settleActiveRemote({ kind: "resolve_without_commit", reason: "aborted" });
+				activeRemoteRequest = undefined;
+				context?.abort();
+				throw new ToolAbortError(
+					`Ask was aborted: no answer source acknowledged the question within ${askAckTimeoutMs / 1000}s`,
+				);
+			} finally {
+				clearTimeout(timer);
+			}
+		};
+
 		const extensionUi = context?.ui;
 		const throwRemoteCancellation = (remoteSignal: AbortSignal, toolSignal?: AbortSignal): never => {
 			// A headless remote answer source owns the only interactive surface. When it
@@ -995,20 +1053,22 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 				// The losing selector may reject when aborted after the race already settled;
 				// swallow that so it is not an unhandled rejection (the race result is unaffected).
 				void local.catch(() => undefined);
-				return Promise.race([local, remote])
-					.then(async result => {
-						if (result.winner === "remote") {
-							localController.abort();
-							if (result.settlement) await result.receipt.settle(result.settlement);
-							else activeRemoteReceipt = result.receipt;
-						} else {
-							void remote.then(remoteResult =>
-								remoteResult.receipt.settle({ kind: "resolve_without_commit", reason: "aborted" }),
-							);
-						}
-						return result.value;
-					})
-					.finally(() => toolSignal?.removeEventListener("abort", abortRace));
+				return awaitAskAck(() =>
+					Promise.race([local, remote])
+						.then(async result => {
+							if (result.winner === "remote") {
+								localController.abort();
+								if (result.settlement) await result.receipt.settle(result.settlement);
+								else activeRemoteReceipt = result.receipt;
+							} else {
+								void remote.then(remoteResult =>
+									remoteResult.receipt.settle({ kind: "resolve_without_commit", reason: "aborted" }),
+								);
+							}
+							return result.value;
+						})
+						.finally(() => toolSignal?.removeEventListener("abort", abortRace)),
+				);
 			},
 			editor: (title, prefill, dialogOptions, editorOptions) => {
 				const source = this.session.getAskAnswerSource?.();
@@ -1084,19 +1144,21 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 							})
 					: new Promise<never>(() => {});
 				void local.catch(() => undefined);
-				return Promise.race([local, remote])
-					.then(result => {
-						if (result.winner === "remote") {
-							activeRemoteReceipt = result.receipt;
-							localController.abort();
-						} else {
-							void remote.then(remoteResult =>
-								remoteResult.receipt.settle({ kind: "resolve_without_commit", reason: "aborted" }),
-							);
-						}
-						return result.value;
-					})
-					.finally(() => toolSignal?.removeEventListener("abort", abortRace));
+				return awaitAskAck(() =>
+					Promise.race([local, remote])
+						.then(result => {
+							if (result.winner === "remote") {
+								activeRemoteReceipt = result.receipt;
+								localController.abort();
+							} else {
+								void remote.then(remoteResult =>
+									remoteResult.receipt.settle({ kind: "resolve_without_commit", reason: "aborted" }),
+								);
+							}
+							return result.value;
+						})
+						.finally(() => toolSignal?.removeEventListener("abort", abortRace)),
+				);
 			},
 		};
 
@@ -1143,7 +1205,7 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 					allowEmpty: q.multi === true && params.questions.length > 1,
 					navigationLabel: questionIndex === params.questions.length - 1 ? "Done" : "Next",
 				};
-				const answer = await gateEmitter.emitGate(questionToGate(gateQuestion));
+				const answer = await awaitAskAck(() => gateEmitter.emitGate(questionToGate(gateQuestion)));
 				const decoded = gateAnswerToResult(gateQuestion, answer);
 				return {
 					optionLabels: rawOptionLabels,

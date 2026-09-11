@@ -13,7 +13,13 @@ import type {
 	AskSettlement,
 	ToolSession,
 } from "@gajae-code/coding-agent/tools";
-import { AskTool, askSchema, askToolRenderer } from "@gajae-code/coding-agent/tools/ask";
+import {
+	AskTool,
+	askSchema,
+	askToolRenderer,
+	GJC_ASK_ACK_TIMEOUT_MS_ENV,
+	resolveAskAckTimeoutMs,
+} from "@gajae-code/coding-agent/tools/ask";
 import { ToolAbortError } from "@gajae-code/coding-agent/tools/tool-errors";
 import { logger } from "@gajae-code/utils";
 
@@ -3037,6 +3043,100 @@ describe("AskTool deep-interview recorder persistence", () => {
 
 		expect(result.content[0]).toMatchObject({ type: "text", text: "User selected: Budget" });
 		expect(warn).toHaveBeenCalledWith(expect.stringContaining("deep-interview round recording failed"));
+	});
+
+	it("bounds a headless ask whose answer source never takes the question", async () => {
+		process.env[GJC_ASK_ACK_TIMEOUT_MS_ENV] = "50";
+		try {
+			const warn = spyOn(logger, "warn").mockImplementation(() => {});
+			const abort = vi.fn();
+			const neverAnswers = () => new Promise<never>(() => {});
+			const abortError = { value: undefined as Error | undefined };
+
+			const outcome = await Promise.race([
+				new AskTool(
+					createSession({
+						hasUI: false,
+						getAskAnswerSource: () => ({ awaitAnswer: neverAnswers, awaitAnswerRequest: neverAnswers }),
+					}),
+				)
+					.execute(
+						"call-headless-ack-timeout",
+						{
+							questions: [
+								{ id: "join_gate", question: "Join the plan?", options: [{ label: "Yes" }, { label: "No" }] },
+							],
+						},
+						undefined,
+						undefined,
+						{ hasUI: false, abort } as unknown as AgentToolContext,
+					)
+					.then(
+						() => "settled",
+						error => {
+							abortError.value = error instanceof Error ? error : new Error(String(error));
+							return "rejected";
+						},
+					),
+				Bun.sleep(5_000).then(() => "hung"),
+			]);
+
+			expect(outcome).toBe("rejected");
+			expect(abortError.value?.message).toContain("no answer source acknowledged the question within 0.05s");
+			expect(abort).toHaveBeenCalledTimes(1);
+			expect(warn).toHaveBeenCalledWith(
+				"ask_answer_source_ack_timeout",
+				expect.objectContaining({ answerSource: "remote", ackTimeoutMs: 50 }),
+			);
+		} finally {
+			delete process.env[GJC_ASK_ACK_TIMEOUT_MS_ENV];
+		}
+	});
+
+	it("leaves a headless ask unbounded when no acknowledgement window is configured", async () => {
+		delete process.env[GJC_ASK_ACK_TIMEOUT_MS_ENV];
+		const warn = spyOn(logger, "warn").mockImplementation(() => {});
+		const abort = vi.fn();
+		const neverAnswers = () => new Promise<never>(() => {});
+		const pending = new AskTool(
+			createSession({
+				hasUI: false,
+				getAskAnswerSource: () => ({ awaitAnswer: neverAnswers, awaitAnswerRequest: neverAnswers }),
+			}),
+		).execute(
+			"call-headless-unbounded",
+			{
+				questions: [{ id: "join_gate", question: "Join the plan?", options: [{ label: "Yes" }, { label: "No" }] }],
+			},
+			undefined,
+			undefined,
+			{ hasUI: false, abort } as unknown as AgentToolContext,
+		);
+		void pending.catch(() => undefined);
+
+		// An attended remote responder may legitimately answer arbitrarily late, so the
+		// default must stay unbounded rather than cut a real answer short.
+		expect(
+			await Promise.race([
+				pending.then(
+					() => "settled",
+					() => "rejected",
+				),
+				Bun.sleep(25).then(() => "pending"),
+			]),
+		).toBe("pending");
+		expect(abort).not.toHaveBeenCalled();
+		expect(warn).not.toHaveBeenCalledWith("ask_answer_source_ack_timeout", expect.anything());
+	});
+
+	it("resolves the acknowledgement window only from a positive integer environment value", () => {
+		expect(resolveAskAckTimeoutMs({})).toBeNull();
+		expect(resolveAskAckTimeoutMs({ [GJC_ASK_ACK_TIMEOUT_MS_ENV]: "" })).toBeNull();
+		expect(resolveAskAckTimeoutMs({ [GJC_ASK_ACK_TIMEOUT_MS_ENV]: "0" })).toBeNull();
+		expect(resolveAskAckTimeoutMs({ [GJC_ASK_ACK_TIMEOUT_MS_ENV]: "-1" })).toBeNull();
+		expect(resolveAskAckTimeoutMs({ [GJC_ASK_ACK_TIMEOUT_MS_ENV]: "soon" })).toBeNull();
+		expect(resolveAskAckTimeoutMs({ [GJC_ASK_ACK_TIMEOUT_MS_ENV]: "1.5" })).toBeNull();
+		expect(resolveAskAckTimeoutMs({ [GJC_ASK_ACK_TIMEOUT_MS_ENV]: "250" })).toBe(250);
 	});
 
 	it("passes optional metadata for single, multi-question, and SDK workflow gate asks", async () => {
