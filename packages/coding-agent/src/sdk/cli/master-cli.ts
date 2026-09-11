@@ -9,7 +9,8 @@
  */
 import { randomUUID } from "node:crypto";
 import * as path from "node:path";
-import { getAgentDir } from "@gajae-code/utils";
+import { replaceTabs, truncateToWidth } from "@gajae-code/tui";
+import { getAgentDir, sanitizeDisplayLine } from "@gajae-code/utils";
 import { PublicCommandFailure } from "../../cli/public-command-errors";
 import { type IndexedSession, isSessionAuthorityEligible, SessionIndex } from "../broker/session-index";
 import { SdkClientError } from "../client";
@@ -143,6 +144,10 @@ function opaque(value: unknown): string | undefined {
 	return typeof value === "string" && value.length > 0 && value.length <= 512 ? value : undefined;
 }
 
+function safeSpawnText(value: string): string {
+	return truncateToWidth(replaceTabs(sanitizeDisplayLine(value).replaceAll(/[\u2028\u2029]/gu, " ")), 512);
+}
+
 /** Projects an arbitrary Broker response onto the allowlisted render shape. */
 export function safeSpawnRender(
 	response: unknown,
@@ -191,12 +196,12 @@ export function safeSpawnRender(
 }
 
 export function renderSpawnTable(rendered: SdkSpawnRendered): string {
-	const lines = [`Result: ${rendered.code}`];
-	if (rendered.claimId) lines.push(`Claim: ${rendered.claimId}`);
-	if (rendered.sessionId) lines.push(`Child session: ${rendered.sessionId}`);
-	if (rendered.substrateKind) lines.push(`Substrate: ${rendered.substrateKind}`);
-	if (rendered.seed?.phase) lines.push(`Seed phase: ${rendered.seed.phase}`);
-	if (rendered.seed?.status) lines.push(`Seed status: ${rendered.seed.status}`);
+	const lines = [`Result: ${safeSpawnText(rendered.code)}`];
+	if (rendered.claimId) lines.push(`Claim: ${safeSpawnText(rendered.claimId)}`);
+	if (rendered.sessionId) lines.push(`Child session: ${safeSpawnText(rendered.sessionId)}`);
+	if (rendered.substrateKind) lines.push(`Substrate: ${safeSpawnText(rendered.substrateKind)}`);
+	if (rendered.seed?.phase) lines.push(`Seed phase: ${safeSpawnText(rendered.seed.phase)}`);
+	if (rendered.seed?.status) lines.push(`Seed status: ${safeSpawnText(rendered.seed.status)}`);
 
 	return lines.join("\n");
 }

@@ -262,6 +262,24 @@ describe("gjc sdk spawn CLI", () => {
 		}
 	});
 
+	it("sanitizes untrusted human-readable spawn fields", () => {
+		const { rendered } = safeSpawnRender({
+			ok: true,
+			result: {
+				code: "ok\u001b[31m",
+				claimId: "claim\u2028id",
+				sessionId: "session\u0007id",
+				substrateKind: "headless",
+				seed: { phase: "accepted\u2029phase", status: "ready" },
+			},
+		});
+		const text = renderSpawnTable(rendered);
+		expect(text).not.toContain("\u001b");
+		expect(text).not.toContain("\u2028");
+		expect(text).not.toContain("\u2029");
+		expect(text).not.toContain("\u0007");
+	});
+
 	it("exposes typed errors for scripting", () => {
 		const error = new SdkMasterCliError("master_context_required", "no master", 1);
 		expect(error.code).toBe("master_context_required");

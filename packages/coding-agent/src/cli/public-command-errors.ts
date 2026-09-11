@@ -1,3 +1,4 @@
+import type { DaemonStatus } from "../daemon/control-types";
 import {
 	type EvidenceClassification,
 	type EvidenceContinuation,
@@ -35,6 +36,7 @@ export interface PublicCommandFailureInput {
 	daemonKind?: "telegram" | "discord" | "slack";
 	restartJustified?: boolean;
 	targets?: readonly PublicDaemonTargetOutcome[];
+	partialStatuses?: readonly DaemonStatus[];
 	diagnostics?: readonly PublicCommandDiagnosticCode[];
 }
 export class PublicCommandFailure extends Error {
@@ -56,6 +58,7 @@ export interface ClassifiedPublicCommandFailure extends EvidenceClassification {
 	message: string;
 	references: EvidenceReference[];
 	nextSteps: PublicRecoveryStep[];
+	partialStatuses?: DaemonStatus[];
 	exitCode: 1 | 2;
 }
 export const EVIDENCE_UNAVAILABLE_WARNING =
@@ -292,6 +295,7 @@ export function classifyPublicCommandFailure(
 		outcomeCertainty,
 		references,
 		nextSteps,
+		...(input.partialStatuses === undefined ? {} : { partialStatuses: [...input.partialStatuses].slice(0, 3) }),
 		exitCode: usage ? 2 : 1,
 	};
 }
@@ -356,8 +360,8 @@ export async function renderPublicCommandFailure(
 	if (options.scopeAgentDir !== undefined) {
 		for (const recovery of safeError.nextSteps) {
 			if (recovery.argv?.[0] !== "sdk" || recovery.argv.at(-1) === "--help") continue;
-			if (options.scopeAgentDir.length <= 1024 && !/[\x00-\x1f\x7f-\x9f]/.test(options.scopeAgentDir))
-				recovery.argv.push("--agent-dir", options.scopeAgentDir);
+			if (options.scopeAgentDir.length <= 1024 && !/[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(options.scopeAgentDir))
+				recovery.argv.push(`--agent-dir=${options.scopeAgentDir}`);
 			else {
 				delete recovery.executable;
 				delete recovery.argv;

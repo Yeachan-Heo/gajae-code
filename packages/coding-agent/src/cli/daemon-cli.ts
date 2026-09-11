@@ -150,15 +150,21 @@ export async function runDaemonCommand(cmd: DaemonCommandArgs, deps: DaemonComma
 			if (result.status === "fulfilled") statuses.push(result.value);
 			else failedTargets.push({ kind: controllers[index]!.kind, outcome: "unknown" });
 		}
-		if (statuses.length > 0) {
-			if (cmd.json) {
-				process.stdout.write(`${JSON.stringify(statuses, null, 2)}\n`);
-			} else {
+		if (failedTargets.length > 0) {
+			if (!cmd.json && statuses.length > 0)
 				process.stdout.write(`${statuses.map(s => formatDaemonStatus(s, { verbose: cmd.verbose })).join("\n")}\n`);
-			}
+			throw new PublicCommandFailure({
+				kind: "daemon_mixed",
+				proof: "pre-effect",
+				targets: failedTargets,
+				partialStatuses: statuses,
+			});
 		}
-		if (failedTargets.length > 0)
-			throw new PublicCommandFailure({ kind: "daemon_mixed", proof: "pre-effect", targets: failedTargets });
+		if (statuses.length > 0) {
+			if (cmd.json) process.stdout.write(`${JSON.stringify(statuses, null, 2)}\n`);
+			else
+				process.stdout.write(`${statuses.map(s => formatDaemonStatus(s, { verbose: cmd.verbose })).join("\n")}\n`);
+		}
 		return;
 	}
 

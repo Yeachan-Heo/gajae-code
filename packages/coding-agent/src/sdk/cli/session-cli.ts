@@ -3,7 +3,7 @@ import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { replaceTabs, truncateToWidth } from "@gajae-code/tui";
-import { getAgentDir, logger } from "@gajae-code/utils";
+import { getAgentDir, logger, sanitizeDisplayLine } from "@gajae-code/utils";
 import { PublicCommandFailure, type PublicEffectProof, type PublicFailureKind } from "../../cli/public-command-errors";
 import type { EvidenceReference } from "../../cli/public-command-evidence";
 import { repo as resolveGitRepository } from "../../utils/git";
@@ -298,14 +298,28 @@ function matchesSecureInputIdentity(before: fsSync.BigIntStats, after: fsSync.Bi
 	);
 }
 
+async function secureInputPath(filePath: string): Promise<string> {
+	const resolved = path.resolve(filePath);
+	const canonical = await fs.realpath(resolved);
+	if (canonical !== resolved)
+		throw new SdkSessionCliError("input_file_unavailable", "Unable to read --json-input-file.", 2);
+	return resolved;
+}
+
 /** Reads a 0600 JSON input through one descriptor, never through a replaceable pathname. */
 export async function readSecureJsonInputFile(filePath: string): Promise<string> {
 	let descriptor: fs.FileHandle | undefined;
 	try {
+		const resolvedPath = await secureInputPath(filePath);
 		const noFollow = process.platform === "win32" ? 0 : fsSync.constants.O_NOFOLLOW;
-		descriptor = await fs.open(filePath, fsSync.constants.O_RDONLY | noFollow);
+		descriptor = await fs.open(resolvedPath, fsSync.constants.O_RDONLY | noFollow);
 		const before = await descriptor.stat({ bigint: true });
-		if (!before.isFile() || (before.mode & 0o077n) !== 0n)
+		const uid = process.getuid?.();
+		if (
+			!before.isFile() ||
+			(before.mode & 0o7777n) !== 0o600n ||
+			(process.platform !== "win32" && uid !== undefined && before.uid !== BigInt(uid))
+		)
 			throw new SdkSessionCliError(
 				"input_file_permissions",
 				"--json-input-file must be a regular file with 0600 permissions.",
@@ -318,7 +332,7 @@ export async function readSecureJsonInputFile(filePath: string): Promise<string>
 				2,
 			);
 
-		const pathIdentity = await fs.lstat(filePath, { bigint: true });
+		const pathIdentity = await fs.lstat(resolvedPath, { bigint: true });
 		if (!matchesSecureInputIdentity(before, pathIdentity))
 			throw new SdkSessionCliError("input_file_unavailable", "Unable to read --json-input-file.", 2);
 
@@ -334,7 +348,8 @@ export async function readSecureJsonInputFile(filePath: string): Promise<string>
 			throw new SdkSessionCliError("input_file_unavailable", "Unable to read --json-input-file.", 2);
 
 		const after = await descriptor.stat({ bigint: true });
-		const finalPathIdentity = await fs.lstat(filePath, { bigint: true });
+		await secureInputPath(resolvedPath);
+		const finalPathIdentity = await fs.lstat(resolvedPath, { bigint: true });
 		if (!matchesSecureInputIdentity(before, after) || !matchesSecureInputIdentity(before, finalPathIdentity))
 			throw new SdkSessionCliError("input_file_unavailable", "Unable to read --json-input-file.", 2);
 		return bytes.toString("utf8");
@@ -635,9 +650,10 @@ async function probeSearchRows(agentDir: string, result: SdkSearchResultV1): Pro
 	} catch {
 		return {
 			...result,
+			warnings: [...result.warnings, "probe_unavailable"],
 			rows: mergeProbedSearchRows(
 				result.rows,
-				rows.map(row => ({ ...row, probe: row.live ? "unreachable" : "stale" })),
+				rows.map(row => (row.live ? { ...row } : { ...row, probe: "stale" as const })),
 			),
 		};
 	}
@@ -684,7 +700,10 @@ function searchScopeLabel(result: SdkSearchResultV1): string {
 }
 
 function safeSearchText(value: string): string {
-	return truncateToWidth(replaceTabs(value).replaceAll(/[\r\n]/g, " "), SEARCH_TEXT_WIDTH);
+	return truncateToWidth(
+		replaceTabs(sanitizeDisplayLine(value).replaceAll(/[\u2028\u2029]/gu, " ")),
+		SEARCH_TEXT_WIDTH,
+	);
 }
 
 /** Renders a credential-free scope/status preamble and bounded search table. */
@@ -692,15 +711,15 @@ export function renderSdkSearchTable(result: SdkSearchResultV1): string {
 	const lines = [
 		`Scope requested: ${result.scope.requested}`,
 		`Scope resolved: ${safeSearchText(searchScopeLabel(result))}`,
-		`Status: ${result.status}`,
-		`Observed at: ${result.observedAt}`,
+		`Status: ${safeSearchText(result.status)}`,
+		`Observed at: ${safeSearchText(result.observedAt)}`,
 		...(result.cursor === undefined ? [] : [`Continuation cursor: ${safeSearchText(result.cursor)}`]),
 	];
 	if (result.rows.length === 0) return lines.join("\n");
 	lines.push("ID  PROBE        LIVE  CWD");
 	for (const row of result.rows)
 		lines.push(
-			`${safeSearchText(row.id).padEnd(20)}  ${(row.probe ?? "-").padEnd(11)}  ${String(row.live).padEnd(4)}  ${safeSearchText(row.locator.cwd)}`,
+			`${safeSearchText(row.id).padEnd(20)}  ${safeSearchText(row.probe ?? "-").padEnd(11)}  ${String(row.live).padEnd(4)}  ${safeSearchText(row.locator.cwd)}`,
 		);
 	return lines.join("\n");
 }

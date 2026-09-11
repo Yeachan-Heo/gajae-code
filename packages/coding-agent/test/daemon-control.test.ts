@@ -4,7 +4,11 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { parseDaemonArgs, runDaemonCommand, UnknownDaemonKindError } from "../src/cli/daemon-cli";
-import { classifyPublicCommandFailure, PublicCommandFailure } from "../src/cli/public-command-errors";
+import {
+	classifyPublicCommandFailure,
+	PublicCommandFailure,
+	renderPublicCommandFailure,
+} from "../src/cli/public-command-errors";
 import { Settings } from "../src/config/settings";
 import { createBuiltInDaemonControllers, selectDaemonControllers } from "../src/daemon/builtin";
 import type { BuiltInDaemonController, DaemonOperationResult, DaemonStatus } from "../src/daemon/control-types";
@@ -335,6 +339,38 @@ describe("daemon operator contract", () => {
 			runtime: { mode: "source", execPath: "/usr/bin/node", reloadPicksUpSourceEdits: true },
 		};
 		expect(formatDaemonStatus(status)).toBe("telegram: not configured");
+	});
+
+	test("formatDaemonStatus and formatDaemonResult strip terminal controls", () => {
+		const status: DaemonStatus = {
+			kind: "telegram",
+			configured: true,
+			health: "running",
+			ownerId: "owner\u001b[31m\u2028id",
+			detail: "detail\nnext",
+			roots: ["/safe\u0007root"],
+			rootCount: 1,
+			runtime: {
+				mode: "source",
+				execPath: "/usr/bin/node\u001b[0m",
+				reloadPicksUpSourceEdits: true,
+				warning: "warning\u2029text",
+			},
+		};
+		const renderedStatus = formatDaemonStatus(status, { verbose: true });
+		const renderedResult = formatDaemonResult({
+			kind: "telegram",
+			action: "reload",
+			ok: true,
+			warnings: ["warning\u001b[31m"],
+			message: "message\u2028text",
+		});
+		for (const rendered of [renderedStatus, renderedResult]) {
+			expect(rendered).not.toContain("\u001b");
+			expect(rendered).not.toContain("\u2028");
+			expect(rendered).not.toContain("\u2029");
+		}
+		expect(renderedStatus).toContain("detail next");
 	});
 
 	test("formatDaemonResult renders the ownership-mismatch recovery steps", () => {
@@ -2872,9 +2908,17 @@ describe("runDaemonCommand", () => {
 				failure = error;
 			}
 		});
-		expect(JSON.parse(out)).toEqual([healthy]);
+		expect(out).toBe("");
 		expect(failure).toBeInstanceOf(PublicCommandFailure);
-		expect((failure as PublicCommandFailure).input.targets).toEqual([{ kind: "discord", outcome: "unknown" }]);
+		expect((failure as PublicCommandFailure).input).toMatchObject({
+			kind: "daemon_mixed",
+			targets: [{ kind: "discord", outcome: "unknown" }],
+			partialStatuses: [healthy],
+		});
+		const rendered = await renderPublicCommandFailure(failure, { command: ["daemon", "status"], json: true });
+		expect(rendered.stderr).toBe("");
+		expect(JSON.parse(rendered.stdout)).toEqual(rendered.envelope);
+		expect(rendered.envelope.error.partialStatuses).toEqual([healthy]);
 	});
 
 	test("restart prints a human result line", async () => {

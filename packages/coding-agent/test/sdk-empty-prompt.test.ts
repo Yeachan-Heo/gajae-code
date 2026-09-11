@@ -74,6 +74,23 @@ test("secure JSON input files are bounded and descriptor-bound", async () => {
 			const link = path.join(root, "input-link.json");
 			await fs.symlink(input, link);
 			await expect(readSecureJsonInputFile(link)).rejects.toMatchObject({ code: "input_file_unavailable" });
+
+			await fs.chmod(input, 0o400);
+			await expect(readSecureJsonInputFile(input)).rejects.toMatchObject({ code: "input_file_permissions" });
+			await fs.chmod(input, 0o600);
+
+			const outside = await fs.mkdtemp(path.join(tmpdir(), "gjc-json-input-outside-"));
+			try {
+				const outsideFile = path.join(outside, "input.json");
+				await fs.writeFile(outsideFile, '{"text":"outside"}', { mode: 0o600 });
+				const ancestor = path.join(root, "linked-dir");
+				await fs.symlink(outside, ancestor);
+				await expect(readSecureJsonInputFile(path.join(ancestor, "input.json"))).rejects.toMatchObject({
+					code: "input_file_unavailable",
+				});
+			} finally {
+				await fs.rm(outside, { recursive: true, force: true });
+			}
 		}
 
 		const oversized = path.join(root, "oversized.json");

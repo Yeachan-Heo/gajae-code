@@ -5,7 +5,7 @@ import * as path from "node:path";
 import { logger } from "@gajae-code/utils";
 import { CliParseError, Command } from "@gajae-code/utils/cli";
 import type { Args as ParsedArgs } from "../cli/args";
-import { scanPublicCommand } from "../cli/public-command-entry";
+import { isSafeSdkInternalAgentDir, scanPublicCommand } from "../cli/public-command-entry";
 import { PublicCommandFailure } from "../cli/public-command-errors";
 import { parseModelString } from "../config/model-resolver";
 import { Settings } from "../config/settings";
@@ -841,7 +841,13 @@ export type SdkInternalArgv = { action: "broker-internal"; agentDir: string } | 
 /** Parses the exact private argv contracts used by SDK child-process spawns. */
 export function parseSdkInternalArgv(argv: readonly string[]): SdkInternalArgv {
 	if (argv[0] === "session-host-internal" && argv.length === 1) return { action: "session-host-internal" };
-	if (argv[0] === "broker-internal" && argv.length === 3 && argv[1] === "--agent-dir" && argv[2])
+	if (
+		argv[0] === "broker-internal" &&
+		argv.length === 3 &&
+		argv[1] === "--agent-dir" &&
+		typeof argv[2] === "string" &&
+		isSafeSdkInternalAgentDir(argv[2])
+	)
 		return { action: "broker-internal", agentDir: argv[2] };
 	throw new CliParseError("Invalid internal SDK invocation.");
 }
