@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Maintenance LLM calls (compaction, handoff, branch summaries) forward a `maintenanceCall: true` marker to the provider. Agent-level providers such as Devin over ACP use it to refuse work they cannot serve instead of forwarding a summarization prompt to a billed upstream agent.
+
 ### Fixed
 
 - Publish reasoning summaries, thinking, and tool-call updates during ordinary unmanaged streaming instead of holding them until text, response completion, or interruption. Tool execution still waits for terminal validation; already-published legacy guarded calls receive explicit rejection instead of silent resampling. Managed fallback attempts remain atomic.
