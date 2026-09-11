@@ -2933,6 +2933,21 @@ describe("deep-interview crystallize contract", () => {
 				root,
 			);
 			expect(first.status).toBe(0);
+			const transcriptBeforeApproval = await fs.readFile(sessionFile, "utf8");
+			const transcriptParentId = (JSON.parse(transcriptBeforeApproval.trim().split("\n").at(-1)!) as { id: string })
+				.id;
+			await fs.appendFile(
+				sessionFile,
+				`${JSON.stringify({
+					type: "message",
+					id: "approval-tool-call",
+					parentId: transcriptParentId,
+					message: {
+						role: "assistant",
+						content: [{ type: "toolCall", id: "provider-crystallize-execution", name: "ask", arguments: {} }],
+					},
+				})}\n`,
+			);
 			const approvalTranscript = await fs.readFile(sessionFile);
 			await recordDeepInterviewExecutionApproval({
 				cwd: root,
@@ -3160,6 +3175,8 @@ describe("deep-interview crystallize contract", () => {
 			"Done...",
 			"Absolutely?!",
 			"Sounds good!!!",
+			"Yes!!!!!!!!!",
+			"Done…!?!!…",
 		]) {
 			expect(() => crystallizeDeepInterview(singleGoalEvidence(acknowledgement, acknowledgement))).toThrow(
 				"verbatim user anchor",

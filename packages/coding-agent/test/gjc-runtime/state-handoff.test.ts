@@ -259,6 +259,20 @@ async function recordExecutionApproval(
 			await manager.close();
 		}
 	}
+	if (typeof existingRecord?.transcript_path === "string") {
+		const manager = await SessionManager.open(
+			transcriptPath,
+			SessionManager.explicitDestination(path.dirname(transcriptPath)),
+		);
+		try {
+			manager.appendMessage(
+				persistedApprovalAssistant([{ type: "toolCall", id: questionId, name: "ask", arguments: {} }]),
+			);
+			await manager.flush();
+		} finally {
+			await manager.close();
+		}
+	}
 	const transcript = await Bun.file(transcriptPath).text();
 	await recordDeepInterviewExecutionApproval({
 		cwd,
@@ -493,6 +507,7 @@ describe("gjc state handoff", () => {
 	it("rejects an approval Ask tool-call ID reused from the captured prefix", async () => {
 		await withPersistedApprovalSession(async (cwd, manager, sessionId, transcriptPath) => {
 			const reusedToolCallId = "provider-reused-prefix";
+			const currentToolCallId = "provider-current-approval";
 			manager.appendMessage(
 				persistedApprovalAssistant([{ type: "toolCall", id: reusedToolCallId, name: "ask", arguments: {} }]),
 			);
@@ -505,6 +520,9 @@ describe("gjc state handoff", () => {
 				isError: false,
 				timestamp: Date.now(),
 			});
+			manager.appendMessage(
+				persistedApprovalAssistant([{ type: "toolCall", id: currentToolCallId, name: "ask", arguments: {} }]),
+			);
 			await manager.flush();
 			const prefix = await Bun.file(transcriptPath).text();
 			const prefixSha256 = createHash("sha256").update(prefix).digest("hex");
@@ -513,7 +531,7 @@ describe("gjc state handoff", () => {
 				sessionId,
 				transcriptPath,
 				prefixSha256,
-				reusedToolCallId,
+				currentToolCallId,
 			);
 			manager.appendMessage({
 				role: "toolResult",
@@ -527,12 +545,54 @@ describe("gjc state handoff", () => {
 			await manager.flush();
 			await expect(
 				assertExecutionApprovalTranscriptBoundary(cwd, sessionId, transcriptPath, prefixSha256, boundary),
-			).rejects.toThrow("reused from the captured prefix");
+			).rejects.toThrow("user-bearing Ask result");
+		});
+	});
+
+	it("rejects an approval Ask ID reused from a dangling assistant tool call", async () => {
+		await withPersistedApprovalSession(async (cwd, manager, sessionId, transcriptPath) => {
+			const danglingToolCallId = "provider-dangling-ask";
+			const currentToolCallId = "provider-current-approval";
+			manager.appendMessage(
+				persistedApprovalAssistant([{ type: "toolCall", id: danglingToolCallId, name: "ask", arguments: {} }]),
+			);
+			manager.appendMessage(
+				persistedApprovalAssistant([{ type: "toolCall", id: currentToolCallId, name: "ask", arguments: {} }]),
+			);
+			await manager.flush();
+			const prefix = await Bun.file(transcriptPath).text();
+			const prefixSha256 = createHash("sha256").update(prefix).digest("hex");
+			const boundary = await captureExecutionApprovalTranscriptBoundary(
+				cwd,
+				sessionId,
+				transcriptPath,
+				prefixSha256,
+				currentToolCallId,
+			);
+			manager.appendMessage({
+				role: "toolResult",
+				toolCallId: danglingToolCallId,
+				toolName: "ask",
+				content: [{ type: "text", text: "Reused dangling approval" }],
+				details: { questions: [{ id: "approval", selectedOptions: ["Approve execution via ultragoal"] }] },
+				isError: false,
+				timestamp: Date.now(),
+			});
+			await manager.flush();
+			await expect(
+				assertExecutionApprovalTranscriptBoundary(cwd, sessionId, transcriptPath, prefixSha256, boundary),
+			).rejects.toThrow("user-bearing Ask result");
 		});
 	});
 
 	it("requires exactly one fresh approval Ask result after the captured prefix", async () => {
 		await withPersistedApprovalSession(async (cwd, manager, sessionId, transcriptPath) => {
+			manager.appendMessage(
+				persistedApprovalAssistant([
+					{ type: "toolCall", id: "provider-fresh-required", name: "ask", arguments: {} },
+				]),
+			);
+			await manager.flush();
 			const prefix = await Bun.file(transcriptPath).text();
 			const prefixSha256 = createHash("sha256").update(prefix).digest("hex");
 			const boundary = await captureExecutionApprovalTranscriptBoundary(
@@ -711,7 +771,8 @@ describe("gjc state handoff", () => {
 			);
 			expect((await approvePersistedCrystal(cwd, sessionId)).status).toBe(2);
 			const handoff = await handoffPersistedCrystal(cwd, sessionId);
-			expect(handoff.status, handoff.stderr).toBe(0);
+			expect(handoff.status).toBe(2);
+			expect(handoff.stderr).toContain("new Ask call");
 			expect((await readJson(recordPath))?.crystal_spec_version).toBe(3);
 			expect((await readJson(recordPath))?.status).toBe("consumed");
 		});

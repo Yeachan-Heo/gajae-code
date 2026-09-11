@@ -65,12 +65,16 @@ function runtimeSkillSettings(): Settings {
 	});
 }
 
-function mockRalplanApprovalConsume(): string[][] {
+function mockRalplanApprovalConsume(
+	options: { lineage?: "ordinary" | "crystal"; automatic?: boolean } = {},
+): string[][] {
 	const calls: string[][] = [];
 	const real = stateRuntime.runNativeStateCommand;
+	spyOn(stateRuntime, "executionApprovalLineage").mockResolvedValue(options.lineage ?? "ordinary");
+	spyOn(stateRuntime, "hasSanctionedRalplanFinalAdmissionForHandoff").mockResolvedValue(options.automatic ?? false);
 	spyOn(stateRuntime, "runNativeStateCommand").mockImplementation(async (args, cwd) => {
 		calls.push([...args]);
-		if (args[0] === "approve-execution" && args[2] === "ralplan") {
+		if (args[0] === "approve-execution" && (args[2] === "ralplan" || args[2] === "deep-interview")) {
 			return { status: 0, stdout: "{}\n", stderr: "" };
 		}
 		if (args[0] === "handoff" && args[2] === "ralplan" && args[4] === "ultragoal") {
@@ -664,6 +668,35 @@ describe("SkillTool", () => {
 		await expect(SkillTool.createIf(session)!.execute("call-1", { name: "ultragoal" })).rejects.toThrow(
 			/Ralplan execution approval failed/,
 		);
+	});
+
+	it("consumes linked Crystal approval through deep-interview lineage", async () => {
+		const stateCalls = mockRalplanApprovalConsume({ lineage: "crystal" });
+		const cwd = await makeTempCwd();
+		await writeCallerModeState(cwd, "ralplan", "handoff", "s1");
+		const ralplan = await makeSkill("ralplan", "---\nname: ralplan\n---\nPlan");
+		const ultragoal = await makeSkill("ultragoal", "---\nname: ultragoal\n---\nGo");
+		const session = createSession(cwd, [ralplan, ultragoal], [], {
+			getActiveSkillState: () => ({ skill: "ralplan", session_id: "s1" }),
+			getActiveSkillPhase: () => "handoff",
+		});
+		await SkillTool.createIf(session)!.execute("call-1", { name: "ultragoal" });
+		expect(stateCalls[0]).toEqual(["approve-execution", "--mode", "deep-interview", "--session-id", "s1", "--json"]);
+	});
+
+	it("skips explicit consume for verified automatic Ultragoal admission", async () => {
+		const stateCalls = mockRalplanApprovalConsume({ automatic: true });
+		const cwd = await makeTempCwd();
+		await writeCallerModeState(cwd, "ralplan", "handoff", "s1");
+		const ralplan = await makeSkill("ralplan", "---\nname: ralplan\n---\nPlan");
+		const ultragoal = await makeSkill("ultragoal", "---\nname: ultragoal\n---\nGo");
+		const session = createSession(cwd, [ralplan, ultragoal], [], {
+			getActiveSkillState: () => ({ skill: "ralplan", session_id: "s1" }),
+			getActiveSkillPhase: () => "handoff",
+		});
+		await SkillTool.createIf(session)!.execute("call-1", { name: "ultragoal" });
+		expect(stateCalls[0]?.[0]).toBe("handoff");
+		expect(stateCalls.some(args => args[0] === "approve-execution")).toBe(false);
 	});
 
 	it("keeps explicit default model selection stable across workflow handoffs", async () => {
