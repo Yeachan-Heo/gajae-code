@@ -1090,14 +1090,7 @@ export async function removeFileLockDirForGc(
 	const current = onDiskBytes === null ? null : parseLockInfoBytes(onDiskBytes);
 	if (!current || onDiskBytes === null) return "missing";
 	if (!expectedIdentity) return "owner_changed";
-	if (
-		current.pid !== expected.pid ||
-		(expected.process_incarnation !== undefined && current.process_incarnation !== expected.process_incarnation) ||
-		(expected.start_time !== undefined && current.start_time !== expected.start_time) ||
-		current.owner_host_id !== expected.owner_host_id ||
-		(expected.owner_token !== undefined && current.owner_token !== expected.owner_token) ||
-		current.timestamp !== expected.timestamp
-	) {
+	if (!sameFileLockOwnerToken(current, expected)) {
 		return "owner_changed";
 	}
 	if (!(await isNativeExactRemovalUsable()))
@@ -1274,6 +1267,27 @@ async function staleLockSnapshot(
 }
 
 type StaleLockRemovalAttempt = { removed: true } | { removed: false; failure?: FileLockStaleRemovalFailure };
+
+type RecordedStaleRemovalFailure = { owner: FileLockOwnerToken; failure: FileLockStaleRemovalFailure };
+
+/**
+ * A recorded refusal describes exactly one dead owner generation. Re-read the pathname at
+ * exhaustion and report it only while that same generation still owns the directory, so a
+ * refusal recorded for a dead generation is never pinned onto a live successor that took
+ * the pathname over before the budget ran out.
+ */
+async function staleRemovalFailureForCurrentGeneration(
+	lockPath: string,
+	recorded: RecordedStaleRemovalFailure | undefined,
+): Promise<FileLockStaleRemovalFailure | undefined> {
+	if (!recorded) return undefined;
+	try {
+		const current = await readLockInfo(lockPath);
+		return current && sameFileLockOwnerToken(current, recorded.owner) ? recorded.failure : undefined;
+	} catch {
+		return undefined;
+	}
+}
 
 async function removeStaleLockForAcquire(
 	lockPath: string,
@@ -1495,6 +1509,21 @@ function isTransientReleaseError(error: unknown): boolean {
 
 function throwTransientNativeResult(code: string): never {
 	throw Object.assign(new Error(`Native lock operation is transiently unavailable: ${code}.`), { code });
+}
+
+/**
+ * The owner-generation fields a guarded removal and a diagnostic both have to agree on
+ * before either may act on, or speak about, that generation.
+ */
+function sameFileLockOwnerToken(current: LockInfo, expected: FileLockOwnerToken): boolean {
+	return (
+		current.pid === expected.pid &&
+		(expected.process_incarnation === undefined || current.process_incarnation === expected.process_incarnation) &&
+		(expected.start_time === undefined || current.start_time === expected.start_time) &&
+		current.owner_host_id === expected.owner_host_id &&
+		(expected.owner_token === undefined || current.owner_token === expected.owner_token) &&
+		current.timestamp === expected.timestamp
+	);
 }
 
 type NativeFileLockBindings = {
@@ -1784,7 +1813,7 @@ export async function acquireFileLock(filePath: string, options: FileLockOptions
 	}
 	const ownerToken = crypto.randomUUID();
 	const contentionStartTimes = new Map<string, string | null>();
-	let staleRemovalFailure: FileLockStaleRemovalFailure | undefined;
+	let staleRemovalFailure: RecordedStaleRemovalFailure | undefined;
 	for (let attempt = 0; attempt < opts.retries; attempt++) {
 		if (opts.signal?.aborted) throw opts.signal.reason ?? new Error("File lock acquisition aborted");
 		const localKey = await localLockKey(lockPath);
@@ -1833,8 +1862,12 @@ export async function acquireFileLock(filePath: string, options: FileLockOptions
 			contentionStartTimes,
 		);
 		const staleRemoval = await removeStaleLockForAcquire(lockPath, stale);
-		if (staleRemoval.removed) continue;
-		if (staleRemoval.failure) staleRemovalFailure = staleRemoval.failure;
+		if (staleRemoval.removed) {
+			staleRemovalFailure = undefined;
+			continue;
+		}
+		staleRemovalFailure =
+			stale.stale && staleRemoval.failure ? { owner: stale.owner, failure: staleRemoval.failure } : undefined;
 		if (!opts.signal) {
 			await Bun.sleep(opts.retryDelayMs);
 			continue;
@@ -1856,7 +1889,7 @@ export async function acquireFileLock(filePath: string, options: FileLockOptions
 		await lockHolderDescription(lockPath, orphanTransitionAgeMs, opts.ownerHostId, opts.previousOwnerHostIds ?? []),
 		"acquire_timeout",
 		undefined,
-		staleRemovalFailure,
+		await staleRemovalFailureForCurrentGeneration(lockPath, staleRemovalFailure),
 	);
 }
 

@@ -1990,4 +1990,45 @@ describe("withFileLock stale-removal diagnostics (#5434)", () => {
 			"native snapshot exploded",
 		);
 	});
+
+	test("does not pin an earlier refusal onto a live successor generation", async () => {
+		const root = await makeTemp();
+		const file = path.join(root, "index.jsonl");
+		const lockDir = `${file}.lock`;
+		await writeInfo(lockDir, { pid: DEAD_PID, timestamp: Date.now() - 60_000 });
+		let replaced = false;
+		FileLockTestHooks.nativeExactRemovalProbe = () => false;
+		FileLockTestHooks.nativeQuarantineBindings = () => ({
+			snapshotDirectoryTree,
+			exactRemoveDirectoryTree: () => {
+				if (!replaced) {
+					replaced = true;
+					rmSync(lockDir, { recursive: true, force: true });
+					mkdirSync(lockDir);
+					writeFileSync(
+						path.join(lockDir, "info"),
+						JSON.stringify({
+							pid: process.pid,
+							start_time: processStartTime(process.pid),
+							timestamp: Date.now(),
+						}),
+					);
+				}
+				return { ok: false, code: "sharing_violation" };
+			},
+		});
+
+		let observed: unknown;
+		try {
+			await withFileLock(file, async () => undefined, { retries: 4, retryDelayMs: 1 });
+		} catch (error) {
+			observed = error;
+		}
+		expect(observed).toBeInstanceOf(FileLockAcquireError);
+		const lockError = observed as FileLockAcquireError;
+		expect(lockError.code).toBe("acquire_timeout");
+		expect(lockError.holder).toContain("(live)");
+		expect(lockError.removalFailure).toBeUndefined();
+		expect(lockError.message).not.toContain("could not be retired");
+	});
 });
