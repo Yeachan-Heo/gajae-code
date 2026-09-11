@@ -1486,6 +1486,7 @@ pub fn exact_remove_directory_tree(
 	path: String,
 	snapshot: NativeDirectoryTreeSnapshot,
 	parent_identity: Option<NativeDirectoryParentIdentity>,
+	detach_only: Option<bool>,
 ) -> NativeExactUnlinkResult {
 	if path.contains('\0') {
 		return NativeExactUnlinkResult::failure("io_error");
@@ -1501,7 +1502,12 @@ pub fn exact_remove_directory_tree(
 		},
 		None => None,
 	};
-	platform::exact_remove_directory_tree(Path::new(&path), &snapshot, parent_identity)
+	platform::exact_remove_directory_tree_with_mode(
+		Path::new(&path),
+		&snapshot,
+		parent_identity,
+		detach_only.unwrap_or(false),
+	)
 }
 
 #[cfg(unix)]
@@ -6209,10 +6215,11 @@ pub(crate) mod platform {
 		Ok(())
 	}
 
-	pub(super) fn exact_remove_directory_tree(
+	pub(super) fn exact_remove_directory_tree_with_mode(
 		path: &Path,
 		expected: &NativeDirectoryTreeSnapshot,
 		expected_parent: Option<(u64, u64)>,
+		detach_only: bool,
 	) -> NativeExactUnlinkResult {
 		let planned_path = path.to_string_lossy().into_owned();
 		let final_path = format!("{planned_path}.removing");
@@ -6375,6 +6382,14 @@ pub(crate) mod platform {
 				},
 			}
 		};
+		if detach_only {
+			// SAFETY: this branch owns both retained descriptors exactly once.
+			unsafe {
+				libc::close(fd);
+				libc::close(parent);
+			}
+			return NativeExactUnlinkResult::detached(detached_retained_path);
+		}
 		if let Err(code) = fsync_root_parent(parent) {
 			// SAFETY: this branch owns the live descriptors and closes each exactly once.
 			unsafe {
@@ -9005,10 +9020,11 @@ mod platform {
 		}
 	}
 
-	pub(super) fn exact_remove_directory_tree(
+	pub(super) fn exact_remove_directory_tree_with_mode(
 		path: &Path,
 		expected: &NativeDirectoryTreeSnapshot,
 		expected_parent: Option<(u64, u64)>,
+		detach_only: bool,
 	) -> NativeExactUnlinkResult {
 		let planned_path = path.to_string_lossy().into_owned();
 		let final_path = format!("{planned_path}.removing");
@@ -9085,6 +9101,38 @@ mod platform {
 				return NativeExactUnlinkResult::detached_failure("parent_mismatch", retained_path);
 			}
 		}
+		if detach_only {
+			let Ok(quarantine_name) = String::from_utf16(&final_name) else {
+				return NativeExactUnlinkResult::failure("io_error");
+			};
+			// `detach_directory` re-verifies the renamed object through
+			// `handle_identity_matches`, so the identity has to come from this
+			// retained handle. Placeholder constants never match a directory's
+			// non-zero mtime (and zeroing the size would too), which would turn
+			// every filter-hosted detach into a spurious identity mismatch.
+			let identity = ExactFileIdentity {
+				dev:             root_entry.dev.parse().unwrap_or_default(),
+				ino:             root_entry.ino.parse().unwrap_or_default(),
+				nlink:           None,
+				parent_dev:      expected_parent.map(|value| value.0),
+				parent_ino:      expected_parent.map(|value| value.1),
+				size:            root_entry.size.parse().unwrap_or_default(),
+				mtime_ns:        root_entry.mtime_ns.parse().unwrap_or_default(),
+				directory:       true,
+				detach_only:     true,
+				quarantine_name: Some(quarantine_name.clone()),
+				sha256:          None,
+				allow_hard_link: false,
+			};
+			return detach_directory(
+				root.target,
+				parent,
+				path.file_name().expect("validated directory name"),
+				&quarantine_name,
+				final_path,
+				&identity,
+			);
+		}
 		match remove_tree_handle(root.target, "", &expected.entries) {
 			Ok(()) if !already_final => match rename_handle(root.target, parent, &final_name, false) {
 				Ok(()) => match tree_entry(root.target, String::new(), "directory") {
@@ -9147,10 +9195,11 @@ mod platform {
 	pub(super) fn snapshot_directory_tree(_: &Path) -> NativeDirectoryTreeResult {
 		NativeDirectoryTreeResult::failure("tree_authority_unavailable")
 	}
-	pub(super) fn exact_remove_directory_tree(
+	pub(super) fn exact_remove_directory_tree_with_mode(
 		_: &Path,
 		_: &NativeDirectoryTreeSnapshot,
 		_: Option<(u64, u64)>,
+		_: bool,
 	) -> NativeExactUnlinkResult {
 		NativeExactUnlinkResult::failure("tree_authority_unavailable")
 	}
@@ -10211,7 +10260,7 @@ mod exact_unlink_placeholder_tests {
 			.expect("snapshot target");
 		let detached = std::path::PathBuf::from(format!("{}.removing", target.to_string_lossy()));
 
-		let first = platform::exact_remove_directory_tree(&target, &snapshot, None);
+		let first = platform::exact_remove_directory_tree_with_mode(&target, &snapshot, None, false);
 		assert_tree_replay_result(&first, &detached);
 		let first_snapshot = platform::snapshot_directory_tree(&detached)
 			.snapshot
@@ -10221,7 +10270,7 @@ mod exact_unlink_placeholder_tests {
 			"first retained tree contains no authorized payload",
 		);
 
-		let second = platform::exact_remove_directory_tree(&target, &snapshot, None);
+		let second = platform::exact_remove_directory_tree_with_mode(&target, &snapshot, None, false);
 		assert_tree_replay_result(&second, &detached);
 		let second_snapshot = platform::snapshot_directory_tree(&detached)
 			.snapshot
@@ -10262,7 +10311,8 @@ mod exact_unlink_placeholder_tests {
 			let detached = std::path::PathBuf::from(format!("{}.removing", target.to_string_lossy()));
 
 			platform::inject_root_parent_fsync_failure(fail_on_call);
-			let interrupted = platform::exact_remove_directory_tree(&target, &snapshot, None);
+			let interrupted =
+				platform::exact_remove_directory_tree_with_mode(&target, &snapshot, None, false);
 			assert!(!interrupted.ok);
 			assert_eq!(interrupted.code.as_deref(), Some("io_error"));
 			assert_eq!(
@@ -10272,7 +10322,8 @@ mod exact_unlink_placeholder_tests {
 			assert_eq!(interrupted.payload_durable, None);
 
 			platform::inject_root_parent_fsync_failure(0);
-			let replayed = platform::exact_remove_directory_tree(&target, &snapshot, None);
+			let replayed =
+				platform::exact_remove_directory_tree_with_mode(&target, &snapshot, None, false);
 			assert_tree_replay_result(&replayed, &detached);
 			let replayed_snapshot = platform::snapshot_directory_tree(&detached)
 				.snapshot
@@ -10280,6 +10331,41 @@ mod exact_unlink_placeholder_tests {
 			assert!(tree_is_descriptor_scrubbed(&replayed_snapshot, &snapshot));
 			fs::remove_dir_all(root).expect("remove temporary directory");
 		}
+	}
+
+	#[test]
+	fn detach_only_parks_the_verified_tree_without_scrubbing_the_payload() {
+		let root = std::env::temp_dir().join(format!(
+			"gjc-tree-detach-only-{}-{}",
+			std::process::id(),
+			SystemTime::now()
+				.duration_since(UNIX_EPOCH)
+				.expect("system time")
+				.as_nanos(),
+		));
+		fs::create_dir(&root).expect("create temporary directory");
+		let target = root.join("target");
+		fs::create_dir(&target).expect("create target");
+		fs::write(target.join("payload.bin"), b"authorized payload").expect("write payload");
+		let snapshot = platform::snapshot_directory_tree(&target)
+			.snapshot
+			.expect("snapshot target");
+		let detached = std::path::PathBuf::from(format!("{}.removing", target.to_string_lossy()));
+
+		let retired = platform::exact_remove_directory_tree_with_mode(&target, &snapshot, None, true);
+
+		assert!(retired.ok);
+		assert_eq!(retired.code.as_deref(), None);
+		assert_eq!(retired.detached_path.as_deref(), Some(detached.to_string_lossy().as_ref()));
+		// Detach-only parks the verified tree at the quarantine name; the payload is
+		// removed by the replay, never by the detach itself.
+		assert_eq!(retired.payload_durable, None);
+		assert!(!target.exists());
+		assert_eq!(
+			fs::read(detached.join("payload.bin")).expect("read retained payload"),
+			b"authorized payload"
+		);
+		fs::remove_dir_all(root).expect("remove temporary directory");
 	}
 
 	#[test]
@@ -10307,7 +10393,7 @@ mod exact_unlink_placeholder_tests {
 		platform::set_before_tree_root_rename_hook(Some((entered_tx, resume_rx)));
 		let target_for_remove = target.clone();
 		let removal = thread::spawn(move || {
-			platform::exact_remove_directory_tree(&target_for_remove, &snapshot, None)
+			platform::exact_remove_directory_tree_with_mode(&target_for_remove, &snapshot, None, false)
 		});
 		entered_rx.recv().expect("wait for root validation");
 		let retained_stale = root.join("retained-stale-root");
@@ -10360,7 +10446,7 @@ mod exact_unlink_placeholder_tests {
 		platform::set_before_tree_root_rename_hook(Some((entered_tx, resume_rx)));
 		let target_for_remove = target.clone();
 		let removal = thread::spawn(move || {
-			platform::exact_remove_directory_tree(&target_for_remove, &snapshot, None)
+			platform::exact_remove_directory_tree_with_mode(&target_for_remove, &snapshot, None, false)
 		});
 		entered_rx.recv().expect("wait for root validation");
 		let retained_stale = root.join("retained-stale-root");
@@ -10408,7 +10494,7 @@ mod exact_unlink_placeholder_tests {
 		platform::set_after_tree_scrub_hook(Some((entered_tx, resume_rx)));
 		let target_for_remove = target.clone();
 		let removal = thread::spawn(move || {
-			platform::exact_remove_directory_tree(&target_for_remove, &snapshot, None)
+			platform::exact_remove_directory_tree_with_mode(&target_for_remove, &snapshot, None, false)
 		});
 		entered_rx
 			.recv()
@@ -10473,7 +10559,8 @@ mod exact_unlink_placeholder_tests {
 			.expect("snapshot unlinked tree");
 		let alias = root.join("raced-alias.bin");
 		fs::hard_link(raced.join("payload.bin"), &alias).expect("link raced alias");
-		let result = platform::exact_remove_directory_tree(&raced, &raced_snapshot, None);
+		let result =
+			platform::exact_remove_directory_tree_with_mode(&raced, &raced_snapshot, None, false);
 		assert!(!result.ok);
 		assert_eq!(result.code.as_deref(), Some("hard_link_unsupported"));
 		assert_eq!(result.payload_durable, None);
@@ -10514,7 +10601,7 @@ mod exact_unlink_placeholder_tests {
 		platform::set_after_tree_file_link_check_hook(Some((entered_tx, resume_rx)));
 		let target_for_remove = target.clone();
 		let removal = thread::spawn(move || {
-			platform::exact_remove_directory_tree(&target_for_remove, &snapshot, None)
+			platform::exact_remove_directory_tree_with_mode(&target_for_remove, &snapshot, None, false)
 		});
 		entered_rx
 			.recv()
@@ -10561,7 +10648,7 @@ mod exact_unlink_placeholder_tests {
 		platform::set_after_tree_file_link_check_hook(Some((entered_tx, resume_rx)));
 		let target_for_remove = target.clone();
 		let removal = thread::spawn(move || {
-			platform::exact_remove_directory_tree(&target_for_remove, &snapshot, None)
+			platform::exact_remove_directory_tree_with_mode(&target_for_remove, &snapshot, None, false)
 		});
 		entered_rx
 			.recv()
@@ -10610,7 +10697,7 @@ mod exact_unlink_placeholder_tests {
 		platform::set_before_tree_child_rename_hook(Some((entered_tx, resume_rx)));
 		let target_for_remove = target.clone();
 		let removal = thread::spawn(move || {
-			platform::exact_remove_directory_tree(&target_for_remove, &snapshot, None)
+			platform::exact_remove_directory_tree_with_mode(&target_for_remove, &snapshot, None, false)
 		});
 		entered_rx.recv().expect("wait for child rename boundary");
 		let retained_stale = detached.join("retained-stale");
@@ -10669,7 +10756,7 @@ mod exact_unlink_placeholder_tests {
 		platform::set_after_tree_validation_hook(Some((entered_tx, resume_rx)));
 		let target_for_remove = target.clone();
 		let aborted = thread::spawn(move || {
-			platform::exact_remove_directory_tree(&target_for_remove, &snapshot, None)
+			platform::exact_remove_directory_tree_with_mode(&target_for_remove, &snapshot, None, false)
 		});
 		entered_rx.recv().expect("wait for aborted hook");
 		assert!(aborted.join().is_err(), "disconnected hook did not abort");
@@ -10684,7 +10771,7 @@ mod exact_unlink_placeholder_tests {
 		platform::set_after_tree_validation_hook(Some((entered_tx, resume_rx)));
 		let next_for_remove = next.clone();
 		let removal = thread::spawn(move || {
-			platform::exact_remove_directory_tree(&next_for_remove, &snapshot, None)
+			platform::exact_remove_directory_tree_with_mode(&next_for_remove, &snapshot, None, false)
 		});
 		entered_rx.recv().expect("wait for next hook");
 		resume_tx.send(()).expect("resume next hook");

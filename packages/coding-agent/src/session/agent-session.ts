@@ -948,7 +948,7 @@ export interface AgentSessionConfig {
 	discoveryMode?: "off" | "mcp-only" | "all";
 	/** MCP tool names to activate for the current session when discovery mode is enabled. */
 	initialSelectedMCPToolNames?: string[];
-	/** Keep persisted MCP names until a deferred exact catalog becomes available. */
+	/** Keep persisted MCP names until a deferred (exact or conventional) catalog becomes available. */
 	preserveUnavailableInitialMCPToolSelection?: boolean;
 	/** Built-in discoverable tool names restored for the current all-discovery session. */
 	initialSelectedDiscoveredBuiltinToolNames?: string[];
@@ -3052,11 +3052,14 @@ export class AgentSession {
 	 */
 	#registerRuntimeStateFinalizer(): void {
 		this.#unregisterRuntimeStateFinalizer?.();
-		const currentContext = () => ({
-			sessionId: this.sessionId,
-			cwd: this.sessionManager.getCwd(),
-			sessionFile: this.sessionManager.getSessionFile(),
-		});
+		const currentContext = () => {
+			const identity = { sessionId: this.sessionId, cwd: this.sessionManager.getCwd() };
+			return {
+				...identity,
+				sessionFile: this.sessionManager.getSessionFile(),
+				stateFile: this.#runtimeStateMarkerFile(identity),
+			};
+		};
 		this.#unregisterRuntimeStateFinalizer = registerCoordinatorRuntimeStateFinalizer(
 			currentContext(),
 			currentContext,
@@ -4511,8 +4514,12 @@ export class AgentSession {
 		// fence refuses every later persist) and rebinds the postmortem finalizer, which
 		// otherwise keeps writing terminal state to the launch root's cwd/session file.
 		this.#unregisterAfterMoveListener = this.sessionManager.registerAfterMoveListener(async move => {
-			let completed = false;
 			try {
+				// A move can promote an explicit --session-dir destination to managed
+				// storage without changing the session id. Its local root changes from
+				// artifacts/local to scratch, so complete migration before releasing
+				// the rescope barrier or allowing the next prompt's sync resolver.
+				await initializeLocalRoot(this.#localProtocolOptions());
 				const relocated = await relocateCoordinatorRuntimeStateForRescope(
 					{
 						sessionId: this.sessionId,
@@ -4532,13 +4539,43 @@ export class AgentSession {
 					this.#coordinatorRescopeMoveId,
 					move.previousCwd,
 				);
-				completed = true;
+			} catch (error) {
+				// Publication has already committed, so the move-abort listener cannot
+				// recover this state. Retry coordinator relocation independently of the
+				// failed local-root gate so later persists cannot remain behind a barrier
+				// that no longer has a rollback path.
+				try {
+					const relocated = await relocateCoordinatorRuntimeStateForRescope(
+						{
+							sessionId: this.sessionId,
+							cwd: move.newCwd,
+							sessionFile: this.sessionManager.getSessionFile() ?? null,
+							previousSessionFile: move.previousSessionFile ?? null,
+						},
+						move.previousCwd,
+					);
+					if (!relocated) throw new Error("Coordinator runtime state rescope recovery was refused.");
+					await clearCoordinatorRuntimeStateRescope(
+						{
+							sessionId: this.sessionId,
+							cwd: move.newCwd,
+							sessionFile: this.sessionManager.getSessionFile() ?? null,
+						},
+						this.#coordinatorRescopeMoveId,
+						move.previousCwd,
+					);
+				} catch (recoveryError) {
+					logger.error("Failed to recover coordinator runtime state after committed session move", {
+						cwd: move.newCwd,
+						error: String(error),
+						recoveryError: String(recoveryError),
+					});
+				}
+				throw error;
 			} finally {
 				this.#registerRuntimeStateFinalizer();
-				if (completed) {
-					this.#coordinatorRescopeMoveId = undefined;
-					this.#endCoordinatorRescopeBarrier();
-				}
+				this.#coordinatorRescopeMoveId = undefined;
+				this.#endCoordinatorRescopeBarrier();
 			}
 		});
 		// Power assertions are taken per turn (see #beginInFlight); nothing acquired here.
@@ -6124,19 +6161,30 @@ export class AgentSession {
 		);
 	}
 
+	/**
+	 * The runtime-state marker THIS session owns, or `null` when it has none.
+	 *
+	 * The process-wide `GJC_COORDINATOR_SESSION_STATE_FILE` pin describes exactly one session:
+	 * the one the launcher minted it for. A nested in-process session — the role-agent/subagent
+	 * fan-out — is a different session, so it must never read or write the parent's marker. The
+	 * sidecar's identity fence refuses every such write (the reported 102x rejection while a
+	 * fan-out was live), and a write that did land would rewrite the parent's lifecycle under
+	 * the child's identity. A nested session therefore owns its own session-derived marker.
+	 */
+	#runtimeStateMarkerFile(input: { sessionId: string; cwd: string }): string | null {
+		if (!input.sessionId.trim()) return null;
+		const pinned = process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]?.trim();
+		if (this.taskDepth > 0) return path.join(sessionRuntimeDir(input.cwd, input.sessionId), "runtime-state.json");
+		return pinned || path.join(sessionRuntimeDir(input.cwd, input.sessionId), "runtime-state.json");
+	}
+
 	#captureCoordinatorRuntimeStatePersistContext(): CoordinatorRuntimeStatePersistContext {
 		const context = {
 			sessionId: this.sessionId,
 			cwd: this.sessionManager.getCwd(),
 			sessionFile: this.sessionManager.getSessionFile(),
 		};
-		const explicitStateFile = process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]?.trim();
-		const stateFile =
-			explicitStateFile ||
-			(context.sessionId.trim()
-				? path.join(sessionRuntimeDir(context.cwd, context.sessionId), "runtime-state.json")
-				: null);
-		return { ...context, stateFile };
+		return { ...context, stateFile: this.#runtimeStateMarkerFile(context) };
 	}
 
 	/**
@@ -10287,13 +10335,13 @@ export class AgentSession {
 		const bridge = this.#clientBridge;
 		const acpEnabled = Boolean(bridge?.capabilities.requestPermission && bridge.requestPermission);
 		const sdkEnabled = this.#sdkPermissionProvider !== undefined;
-		const activeSkill = this.#activeSkillState?.skill ?? "";
-		const activeSkillSession = this.#activeSkillState?.sessionId ?? "";
+		// The wrapped behavior depends only on live session state (cwd, session id,
+		// session agent dir) plus the ACP/SDK permission surfaces below. Active-skill
+		// state is deliberately absent: the Ultragoal ask guard binds to the caller
+		// session id alone, so a skill transition does not change any wrapper.
 		return [
 			"workflow-mutation-v1",
-
-			"ultragoal-ask-v1",
-			`active=${activeSkill}:${activeSkillSession}`,
+			"ultragoal-ask-v2",
 			`acp=${acpEnabled ? "on" : "off"}:sdk=${sdkEnabled ? "on" : "off"}:${this.#acpPermissionWrapperVersion}`,
 		].join("|");
 	}
@@ -10310,10 +10358,7 @@ export class AgentSession {
 					guardToolForUltragoalAsk(
 						innerTool,
 						() => this.sessionManager.getCwd(),
-						() => ({
-							activeSkillState: this.getActiveSkillState(),
-							sessionId: this.sessionManager.getSessionId(),
-						}),
+						() => ({ sessionId: this.sessionManager.getSessionId() }),
 						() => this.getSessionAgentDir(),
 					),
 				),

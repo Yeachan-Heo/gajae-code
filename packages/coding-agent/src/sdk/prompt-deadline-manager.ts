@@ -7,6 +7,7 @@ import {
 	promptDeadlineAt,
 	recordAttributableProgress,
 } from "./prompt-deadline-lease";
+import { failedPromptOutcome } from "./prompt-failure";
 import type { SdkPromptTerminalOutcome } from "./prompt-status";
 import type { TurnResultContent } from "./turn-result";
 
@@ -17,10 +18,8 @@ const UNCERTAINTY_RETRY_DELAY_MS = 1_000;
 
 type DeadlineReconciliation = InvocationReconciliation | KindAwareReconciliation;
 
-export type PromptDeadlineOutcome = {
-	kind: "failed";
+export type PromptDeadlineOutcome = Extract<SdkPromptTerminalOutcome, { kind: "failed" }> & {
 	code: "prompt_deadline_exceeded";
-	message: string;
 	provenance: "deadline";
 };
 
@@ -161,12 +160,11 @@ export class PromptDeadlineManager {
 			return;
 		}
 		const generation = lease.generation;
-		const outcome: PromptDeadlineOutcome = {
-			kind: "failed",
+		const outcome: PromptDeadlineOutcome = failedPromptOutcome({
 			code: "prompt_deadline_exceeded",
-			message: "Prompt deadline exceeded.",
 			provenance: "deadline",
-		};
+			evidence: {},
+		}) as PromptDeadlineOutcome;
 		try {
 			await this.#reconciliation.claimPendingOutcome("prompt", correlation, outcome);
 		} catch {

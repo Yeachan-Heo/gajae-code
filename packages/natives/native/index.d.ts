@@ -896,7 +896,7 @@ export declare function encodeSixel(bytes: Uint8Array, targetWidthPx: number, ta
  * detached descriptor remains authoritative throughout payload scrubbing and
  * replay.
  */
-export declare function exactRemoveDirectoryTree(path: string, snapshot: NativeDirectoryTreeSnapshot, parentIdentity?: NativeDirectoryParentIdentity | undefined | null): NativeExactUnlinkResult
+export declare function exactRemoveDirectoryTree(path: string, snapshot: NativeDirectoryTreeSnapshot, parentIdentity?: NativeDirectoryParentIdentity | undefined | null, detachOnly?: boolean | undefined | null): NativeExactUnlinkResult
 
 /**
  * Atomically replace a staged regular file only after validating the exact

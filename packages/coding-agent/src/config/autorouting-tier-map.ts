@@ -373,6 +373,9 @@ export const TIER_MAP_SKIP_LIST = {
 	"opencode-go/muse-spark-1.2-contributor": {
 		rationale: "post-rebase catalog addition from dev; not yet curated",
 	},
+	"opencode-go/muse-spark-1.3-contributor": {
+		rationale: "catalog addition from PR #5485; not yet curated",
+	},
 	"opencode-go/qwen3.8-flash": { rationale: "post-rebase catalog addition from dev; not yet curated" },
 	"opencode-go/qwen3.8-max": { rationale: "post-rebase catalog addition from dev; not yet curated" },
 	"opencode-zen/grok-4.6": { rationale: "post-rebase catalog addition from dev; not yet curated" },

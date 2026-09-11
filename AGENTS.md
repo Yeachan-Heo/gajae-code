@@ -42,11 +42,22 @@ bun run stats               # gjc stats from source
 One-time / environment setup:
 
 ```sh
-bun run install:dev         # bun install + native build + workspace links + dev:link + setup defaults
+bun run install:dev         # PRIMARY CHECKOUT ONLY: bun install + native build + workspace links + dev:link + setup defaults
+bun run setup:worktree      # git worktree only: bun install + native build, no global-state changes
 bun run dev:link            # symlink `gjc` on PATH to the source CLI (scripts/dev-link.ts)
 bun run dev:doctor          # verify PATH resolution of `gjc` points at this workspace
+bun run dev:doctor -- --worktree   # verify this checkout can resolve workspace deps and load the native addon
 bun run install:defaults    # (re)install bundled default definitions
 ```
+
+A second checkout created with `git worktree add` starts with no `node_modules/` and no
+built native addon, so every `bun test` fails with a bare module-resolution error until
+dependencies are installed. Run `bun run setup:worktree` there (equivalent to
+`bun install && bun run build:native`). Do **not** run `bun run install:dev` in a
+worktree: it repoints the global `gjc` on `PATH`, rewrites `core.hooksPath`, and
+overwrites user-level defaults for your primary checkout. `bun run dev:doctor -- --worktree`
+reports whether the current checkout can resolve workspace packages and load the native
+addon, and names the fix when it cannot.
 
 Removing build output (never touches sources, `node_modules/`, `.gjc/` state, or `artifacts/` test working space):
 
@@ -163,7 +174,7 @@ Avoid placeholder tests, tautologies, broad `not.toThrow()` assertions, duplicat
 
 - Always commit incrementally; atomic commits are preferred. One logical change per commit — never batch unrelated work.
 - For targeted branch / PR-like work, always open a PR targeting `dev`.
-- The exact-head PR contract is validated locally before it can go red in CI: `git config core.hooksPath .githooks` (done by `bun run install:dev`, or `bun run dev:hooks`) enables a `pre-push` hook that runs `scripts/verify-pr-verdict.ts --push-preflight <branch> <pushed-sha>` against the live PR body. Stale verdict digests, unrebased bases, malformed verdicts, and missing risk classifications fail at push time. Blocking verdicts (`needs-human`, `merge-blocked`) are allowed locally — only the server merge gate rejects them. Bypass with `GJC_SKIP_PR_PREFLIGHT=1` or `--no-verify`.
+- Enable the local exact-head PR preflight with `bun run dev:hooks` (also included in `install:dev`). The Git hook passes the destination branch, pushed object SHA, and actual push URL to `scripts/verify-pr-verdict.ts --push-preflight <branch> <pushed-sha> --push-url <destination-url>`. It rejects stale digests, unrebased bases, malformed verdicts, missing risk classifications, unresolved repository/fork authority, and a `merge-self-approved` verdict that its own signed risk-record comment does not back at the exact head. Valid blocking verdicts (`needs-human`, `merge-blocked`) are allowed locally; only the server merge gate authorizes merge. Bypass with `GJC_SKIP_PR_PREFLIGHT=1` or `--no-verify`. The opt-in `gh pr create` preflight (`--preflight-command`) is evaluated before the PR exists, so it can never see a self-review record and rejects a `merge-self-approved` body; create the PR, post the record, then validate at push time.
 - Commit messages use the lore format: conventional-commit subject, a short why-focused body, then structured trailers. Include only the trailers that apply.
 
   ```

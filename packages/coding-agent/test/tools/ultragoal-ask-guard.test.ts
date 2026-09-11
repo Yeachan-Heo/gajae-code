@@ -187,13 +187,111 @@ describe("ultragoal ask guard", () => {
 		process.env.GJC_SESSION_ID = TEST_SESSION_ID;
 		await createUltragoalPlan({ cwd, brief: "Implement the story" });
 		const execute = vi.fn(async () => {});
-		const guarded = guardToolForUltragoalAsk(stubAskTool(execute), () => cwd);
+		const guarded = guardToolForUltragoalAsk(
+			stubAskTool(execute),
+			() => cwd,
+			() => ({ sessionId: TEST_SESSION_ID }),
+		);
 
 		await expect(guarded.execute("call", {}, undefined, undefined, undefined as never)).rejects.toThrow(ToolError);
 		await expect(guarded.execute("call", {}, undefined, undefined, undefined as never)).rejects.toThrow(
 			/try-harder nudge/,
 		);
 		expect(execute).not.toHaveBeenCalled();
+	});
+
+	it("isolates wrapped Ask from another session's durable run and stale environment", async () => {
+		const cwd = await tempDir();
+		process.env.GJC_SESSION_ID = TEST_SESSION_ID;
+		await createUltragoalPlan({ cwd, brief: "Implement session A's story" });
+		// A foreign session's active-skill snapshot on disk is still not this Ask's scope.
+		await writeActiveDeepInterviewState(cwd, TEST_SESSION_ID);
+		const ledgerFile = Bun.file(getUltragoalPaths(cwd, TEST_SESSION_ID).ledgerPath);
+		const ledgerBefore = await ledgerFile.text();
+		const execute = vi.fn(async () => {});
+		const guarded = guardToolForUltragoalAsk(
+			stubAskTool(execute),
+			() => cwd,
+			() => ({ sessionId: " ordinary-ask-session-b " }),
+		);
+		const result = await guarded.execute("call", {}, undefined, undefined, undefined as never);
+		expect(result.content).toEqual([{ type: "text", text: "asked" }]);
+		expect(execute).toHaveBeenCalledTimes(1);
+		expect(await ledgerFile.text()).toBe(ledgerBefore);
+	});
+
+	it("permits an anonymous Ask instead of GJC_SESSION_ID's durable run", async () => {
+		const cwd = await tempDir();
+		process.env.GJC_SESSION_ID = TEST_SESSION_ID;
+		await createUltragoalPlan({ cwd, brief: "Implement session A's story" });
+		const ledgerFile = Bun.file(getUltragoalPaths(cwd, TEST_SESSION_ID).ledgerPath);
+		const ledgerBefore = await ledgerFile.text();
+		for (const sessionId of [undefined, "", "   "]) {
+			const execute = vi.fn(async () => {});
+			const guarded = guardToolForUltragoalAsk(
+				stubAskTool(execute),
+				() => cwd,
+				() => ({ sessionId }),
+			);
+			const result = await guarded.execute("call", {}, undefined, undefined, undefined as never);
+			expect(result.content).toEqual([{ type: "text", text: "asked" }]);
+			expect(execute).toHaveBeenCalledTimes(1);
+		}
+		expect(await ledgerFile.text()).toBe(ledgerBefore);
+	});
+
+	it("permits an anonymous Ask instead of an auto-detected session's durable run", async () => {
+		const cwd = await tempDir();
+		process.env.GJC_SESSION_ID = TEST_SESSION_ID;
+		await createUltragoalPlan({ cwd, brief: "Implement session A's story" });
+		await writeActivityMarker(cwd, TEST_SESSION_ID, new Date().toISOString());
+		delete process.env.GJC_SESSION_ID;
+		const execute = vi.fn(async () => {});
+		const guarded = guardToolForUltragoalAsk(
+			stubAskTool(execute),
+			() => cwd,
+			() => ({}),
+		);
+		const result = await guarded.execute("call", {}, undefined, undefined, undefined as never);
+		expect(result.content).toEqual([{ type: "text", text: "asked" }]);
+		expect(execute).toHaveBeenCalledTimes(1);
+	});
+
+	it("allows ordinary unwrapped Ask in session B without changing session A's ledger", async () => {
+		const cwd = await tempDir();
+		process.env.GJC_SESSION_ID = TEST_SESSION_ID;
+		await createUltragoalPlan({ cwd, brief: "Implement session A's story" });
+		const ledgerFile = Bun.file(getUltragoalPaths(cwd, TEST_SESSION_ID).ledgerPath);
+		const ledgerBefore = await ledgerFile.text();
+		const select = vi.fn(async () => "Continue");
+		const tool = new AskTool(createSession(cwd, { getSessionId: () => "ordinary-ask-session-b" }));
+		await tool.execute(
+			"call",
+			{ questions: [{ id: "q", question: "Continue intake?", options: [{ label: "Continue" }] }] },
+			undefined,
+			undefined,
+			createContext(select),
+		);
+		expect(select).toHaveBeenCalledTimes(1);
+		expect(await ledgerFile.text()).toBe(ledgerBefore);
+	});
+
+	it("binds the wrapped ask to the caller even when a different session owns the ambient run", async () => {
+		const cwd = await tempDir();
+		process.env.GJC_SESSION_ID = TEST_SESSION_ID;
+		await createUltragoalPlan({ cwd, brief: "Implement the existing session's story" });
+		await writeActivityMarker(cwd, TEST_SESSION_ID, new Date().toISOString());
+		const ownerSessionId = " caller-owns-the-run ";
+		process.env.GJC_SESSION_ID = "unrelated-environment-session";
+		const execute = vi.fn(async () => {});
+		const guarded = guardToolForUltragoalAsk(
+			stubAskTool(execute),
+			() => cwd,
+			() => ({ sessionId: ownerSessionId }),
+		);
+		const result = await guarded.execute("call", {}, undefined, undefined, undefined as never);
+		expect(result.content).toEqual([{ type: "text", text: "asked" }]);
+		expect(execute).toHaveBeenCalledTimes(1);
 	});
 
 	it("preserves `this` for a prototype-method ask tool when ultragoal is inactive (regression)", async () => {
@@ -223,7 +321,7 @@ describe("ultragoal ask guard", () => {
 		process.env.GJC_SESSION_ID = TEST_SESSION_ID;
 		await createUltragoalPlan({ cwd, brief: "Implement the story" });
 		const select = vi.fn(async () => "Yes");
-		const tool = new AskTool(createSession(cwd));
+		const tool = new AskTool(createSession(cwd, { getSessionId: () => TEST_SESSION_ID }));
 
 		await expect(
 			tool.execute(

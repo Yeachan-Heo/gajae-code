@@ -102,6 +102,53 @@ function streamProviderResult(events: unknown[]): Promise<AssistantMessage> {
 	).result();
 }
 
+describe("Responses provider: bounded stream-failure classification", () => {
+	test("classifies a non-overload HTTP 200 failed envelope without creating retry facts", async () => {
+		for (const shape of FAILURE_SHAPES) {
+			const error = await failedResponseError(shape, "server_error", OVERLOAD_MESSAGE);
+
+			expect((error as Error).message).toBe(`server_error: ${OVERLOAD_MESSAGE}`);
+			expect((error as { code?: string }).code).toBe("upstream_stream_interrupted");
+			// The diagnostic classifier is not a transport fact, so it can never
+			// authorize a replay.
+			expect(transportFailureFacts(error)).toBeUndefined();
+			expect(classifyFallbackTrigger(error)).toEqual({ class: "other" });
+		}
+	});
+
+	test("classifies a top-level stream error event without creating retry facts", async () => {
+		const error = await streamError([
+			{ type: "error", code: "server_error", message: "stream interrupted before terminal event" },
+		]);
+
+		expect((error as { code?: string }).code).toBe("upstream_stream_interrupted");
+		expect(transportFailureFacts(error)).toBeUndefined();
+		expect(classifyFallbackTrigger(error)).toEqual({ class: "other" });
+	});
+
+	test("carries the bounded classifier onto the failed assistant message", async () => {
+		for (const shape of FAILURE_SHAPES) {
+			const result = await streamProviderResult([failureEvent(shape, "server_error", OVERLOAD_MESSAGE)]);
+
+			expect(result.stopReason).toBe("error");
+			expect(result.errorCode).toBe("upstream_stream_interrupted");
+			expect(result.transportFailure).toBeUndefined();
+		}
+	});
+
+	test("reports an unexpected EOF instead of a content-free success", async () => {
+		// The parser reports that no terminal event was observed...
+		expect(await processResponsesStream(makeStream([]), makeOutput(), makeSink(), makeModel())).toBe(false);
+
+		// ...and the provider turns that into a bounded failure, not a `done` turn.
+		const result = await streamProviderResult([]);
+		expect(result.stopReason).toBe("error");
+		expect(result.errorCode).toBe("upstream_stream_interrupted");
+		expect(result.transportFailure).toBeUndefined();
+		expect(result.content).toHaveLength(0);
+	});
+});
+
 describe("Responses provider: generic terminal error codes", () => {
 	test("preserves the exact capacity-overload code as typed transport facts", async () => {
 		for (const shape of FAILURE_SHAPES) {

@@ -741,6 +741,7 @@ export async function runInteractiveMode(
 	resumeAction?: "continue-tail" | "open-idle",
 	startDeferredMcpConfig?: CreateAgentSessionResult["startDeferredMcpConfig"],
 	startDeferredModelProfiles?: DeferredModelProfileStartup,
+	options?: { stopAfterFirstPaint?: boolean },
 ): Promise<void> {
 	const mode = createInteractiveMode
 		? createInteractiveMode({
@@ -762,7 +763,7 @@ export async function runInteractiveMode(
 				eventBus,
 			);
 
-	await initializeInteractiveModeWithStartupUpdate(mode, startupUpdate);
+	await logger.time("interactive:init", () => initializeInteractiveModeWithStartupUpdate(mode, startupUpdate));
 	try {
 		await persistCoordinatorRuntimeInputReady();
 	} catch (error) {
@@ -775,7 +776,10 @@ export async function runInteractiveMode(
 			normalInteractive: true,
 			automation:
 				/^(?:1|true|yes|on)$/i.test(process.env.CI ?? "") ||
-				/^(?:1|true|yes|on)$/i.test(process.env.GJC_AUTOMATION ?? ""),
+				/^(?:1|true|yes|on)$/i.test(process.env.GJC_AUTOMATION ?? "") ||
+				// The timing probe must never block on a fresh-profile onboarding
+				// selector waiting for input that will never come.
+				options?.stopAfterFirstPaint === true,
 			initialMessage,
 			initialMessages,
 			initialImages,
@@ -788,7 +792,14 @@ export async function runInteractiveMode(
 			if (shouldOfferOnboarding(onboardingState)) await mode.showFrictionlessOnboarding();
 		}
 	}
-	mode.renderInitialMessages(undefined, { preserveExistingChat: true });
+	logger.time("interactive:firstPaint", () => mode.renderInitialMessages(undefined, { preserveExistingChat: true }));
+	if (options?.stopAfterFirstPaint) {
+		// GJC_TIMING=x probe: the cold-start measurement ends here, so tear the UI
+		// down with the same shutdown/stop order the interactive exit path uses.
+		await mode.shutdown();
+		mode.stop();
+		return;
+	}
 
 	for (const notify of notifs) {
 		if (!notify) {
@@ -1862,7 +1873,13 @@ export async function runRootCommand(
 	setPrimaryControlSurface(sessionOptions, "cli");
 	sessionOptions.settings = settingsInstance;
 	sessionOptions.masterModeContext = masterModeContext;
-	if (isInteractive && sessionOptions.mcpConfigPath) {
+	// Interactive launches paint before MCP connects: the deferred starter runs
+	// after first paint and a startup turn barrier keeps the first prompt from
+	// racing tool registration. A no-op whenever no MCP servers apply — exact
+	// `--mcp-config`, conventional autoload, or plugin bundles (plugins never
+	// defer; their connect evidence is published during session creation).
+	// ACP/print/SDK sessions connect eagerly and are not carved out here.
+	if (isInteractive) {
 		sessionOptions.deferMcpConfigStartup = true;
 	}
 	// ACP is not carved out: `gjc acp` is broker-backed and never builds a local
@@ -2075,10 +2092,12 @@ export async function runRootCommand(
 		}
 
 		if (isInteractive) {
-			let exitForTiming = false;
+			const timingEnv = $pickenv("GJC_TIMING", "PI_TIMING");
+			const exitForTiming = timingEnv === "x";
+			let changelogMarkdown: string | undefined;
 			try {
 				startupUpdate.startBeforeInteractiveInitialization();
-				const changelogMarkdown = await logger.time(
+				changelogMarkdown = await logger.time(
 					"main:getChangelogForDisplay",
 					deps.getChangelogForDisplay ?? getChangelogForDisplay,
 					parsedArgs,
@@ -2095,9 +2114,8 @@ export async function runRootCommand(
 					process.stdout.write(`${chalk.dim(`Model scope: ${modelList} ${chalk.gray("(Alt+N to cycle)")}`)}\n`);
 				}
 
-				if ($pickenv("GJC_TIMING", "PI_TIMING")) {
+				if (timingEnv && !exitForTiming) {
 					logger.printTimings();
-					exitForTiming = $pickenv("GJC_TIMING", "PI_TIMING") === "x";
 				}
 
 				if (!exitForTiming) {
@@ -2134,6 +2152,39 @@ export async function runRootCommand(
 			}
 
 			if (exitForTiming) {
+				// GJC_TIMING=x measures through the first transcript paint, so the
+				// cold-start number includes interactive init and time-to-first-render.
+				// The probe's deliverable is the timing report: a mode boot or teardown
+				// failure is logged, but session disposal still precedes the exit (the
+				// contract under startup-update-contract) and the report still prints.
+				// This block sits outside the try/catch so the mock-throwing exit in
+				// tests cannot unwind into a second disposal.
+				try {
+					await runInteractiveMode(
+						session,
+						VERSION,
+						changelogMarkdown,
+						notifs,
+						startupUpdate,
+						parsedArgs.messages,
+						setToolUIContext,
+						lspServers,
+						mcpManager,
+						eventBus,
+						initialMessage,
+						initialImages,
+						deps.createInteractiveMode,
+						bareResumeAction,
+						startDeferredMcpConfig,
+						startDeferredModelProfiles,
+						{ stopAfterFirstPaint: true },
+					);
+				} catch (error) {
+					logger.warn("Timing probe interactive boot failed", { error: String(error) });
+				}
+				// Report before teardown so Total ends at first paint, not at the end
+				// of session persistence and resource cleanup.
+				logger.printTimings();
 				await session.dispose();
 				process.exit(0);
 			}

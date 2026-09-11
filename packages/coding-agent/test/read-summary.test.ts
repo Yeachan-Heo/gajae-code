@@ -101,6 +101,37 @@ describe("read summary", () => {
 		expect(result.details?.summary?.elidedSpans).toBe(20);
 	});
 
+	it("retains actual parser summary endpoints and monotonic source anchors when capped", async () => {
+		const fixture = path.join(tmpDir, "directional-many.ts");
+		await fs.writeFile(
+			fixture,
+			Array.from(
+				{ length: 100 },
+				(_, index) =>
+					`export function fn${index}(): number {\n\tconst one = ${index};\n\tconst two = 2;\n\treturn one + two;\n}`,
+			).join("\n\n"),
+		);
+		const tool = new ReadTool(createSession(tmpDir, Settings.isolated({ "read.summaryMaxBytes": 1 })));
+		for (const truncation of ["head", "last", "both"] as const) {
+			const result = await tool.execute("read-summary-directional-cap", { path: fixture, truncation });
+			const text = textOutput(result);
+			const declarations = [...text.matchAll(/^(\d+)[a-z]{2}-(\d+)[a-z]{2}\|export function fn(\d+)\(/gm)];
+			expect(declarations.length).toBeGreaterThan(0);
+			const indexes = declarations.map(match => Number(match[3]));
+			expect(indexes).toEqual([...new Set(indexes)].sort((a, b) => a - b));
+			for (const match of declarations) {
+				expect(Number(match[1])).toBe(Number(match[3]) * 6 + 1);
+				expect(Number(match[2])).toBe(Number(match[3]) * 6 + 5);
+			}
+			if (truncation !== "last") expect(indexes[0]).toBe(0);
+			if (truncation !== "head") expect(indexes.at(-1)).toBe(99);
+			if (truncation === "head") expect(indexes).not.toContain(99);
+			if (truncation === "last") expect(indexes).not.toContain(0);
+			expect(text.match(/Summary truncated at 1 KiB/g)).toHaveLength(1);
+			expect(text).not.toContain("const one =");
+		}
+	});
+
 	it("returns verbatim anchored ranges when a selector is explicit", async () => {
 		const fixture = path.join(tmpDir, "fixture.ts");
 		await fs.writeFile(fixture, "export function alpha(): string {\n\tconst clean = 'alpha';\n\treturn clean;\n}\n");
@@ -269,11 +300,13 @@ describe("read summary", () => {
 		await fs.writeFile(fixture, "export const x = 1;\n");
 
 		const tool = new ReadTool(createSession(tmpDir));
-		const result = await tool.execute("read-summary-no-footer", { path: fixture });
-		const text = textOutput(result);
-
-		expect(text).not.toContain("elided regions");
-		expect(text).not.toContain(":raw");
-		expect(result.details?.summary).toBeUndefined();
+		for (const truncation of ["head", "last", "both"] as const) {
+			const result = await tool.execute("read-summary-no-footer", { path: fixture, truncation });
+			const text = textOutput(result);
+			expect(text).toContain("export const x = 1;");
+			expect(text).not.toContain("elided regions");
+			expect(text).not.toContain(":raw");
+			expect(result.details?.summary).toBeUndefined();
+		}
 	});
 });

@@ -740,4 +740,22 @@ describe("/import-session command surface", () => {
 		const acp = ACP_BUILTIN_SLASH_COMMANDS.find(command => command.name === "import-session");
 		expect(acp).toBeUndefined();
 	});
+	it("redacts the vendor tokens the egress guard classifies as credential-like", () => {
+		// `crash/upstream/envelope.ts` refuses to transmit these four shapes.
+		// Assembled at runtime so no literal of this shape is committed.
+		const cases = {
+			npm: ["npm", "a".repeat(36)].join("_"),
+			gitlab: ["glpat", "b".repeat(24)].join("-"),
+			stripe: ["rk", "test", "c".repeat(24)].join("_"),
+			huggingface: ["hf", "d".repeat(34)].join("_"),
+		};
+		for (const value of Object.values(cases)) {
+			const result = redactImportedText(`observed ${value} in the log`);
+			expect(result.value).not.toContain(value);
+			expect(result.value).toContain("observed");
+		}
+		// Prefix lookalikes that are too short to be tokens stay intact.
+		const benign = redactImportedText("npm install express and the hf_ prefix");
+		expect(benign.redacted).toBe(0);
+	});
 });

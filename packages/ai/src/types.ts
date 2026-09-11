@@ -786,6 +786,14 @@ export interface AssistantMessage {
 	usage: Usage;
 	stopReason: StopReason;
 	errorMessage?: string;
+	/**
+	 * Bounded, redaction-safe failure classifier for a terminal provider/runtime
+	 * failure (a safe token matching `[A-Za-z0-9._-]{1,64}`), e.g.
+	 * `upstream_stream_interrupted`. Set by the provider/agent that owns the
+	 * classifier; never raw provider text and never a retry-admission fact (retry
+	 * policy keys on `transportFailure`, not on this diagnostic).
+	 */
+	errorCode?: string;
 	errorKind?: AssistantErrorKind;
 	/**
 	 * Structured, shape-only diagnostic for a terminal local staging-buffer

@@ -220,8 +220,8 @@ async function openIsolatedFile(abs: string, options?: ReadFileOptions): Promise
 	const authorized = await statAuthorizedPath(abs, options);
 	if (options?.isolatedHome && authorized === null) return null;
 	try {
-		const noFollow = options?.isolatedHome ? (fs.constants.O_NOFOLLOW ?? 0) : 0;
-		handle = await fs.promises.open(abs, fs.constants.O_RDONLY | noFollow);
+		const isolatedFlags = options?.isolatedHome ? (fs.constants.O_NOFOLLOW ?? 0) | (fs.constants.O_NONBLOCK ?? 0) : 0;
+		handle = await fs.promises.open(abs, fs.constants.O_RDONLY | isolatedFlags);
 		if (!(await validateOpenedPath(handle, abs, options, authorized, "file"))) {
 			await handle.close();
 			return null;

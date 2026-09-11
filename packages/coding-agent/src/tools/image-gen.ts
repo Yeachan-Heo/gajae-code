@@ -31,7 +31,6 @@ import imageGenDescription from "../prompts/tools/image-gen.md" with { type: "te
 import { isPrivateOrSpecialAddress, validatePublicHttpUrl } from "../web/insane/url-guard";
 import { resolveReadPath } from "./path-utils";
 
-const DEFAULT_MODEL = "gemini-3-pro-image-preview";
 const IMAGE_TIMEOUT = 3 * 60 * 1000; // 3 minutes
 const MAX_IMAGE_SIZE = 35 * 1024 * 1024;
 const MAX_IMAGE_REDIRECTS = 5;
@@ -81,6 +80,14 @@ export function redactImageProviderText(value: unknown, activeApiKey?: string): 
 		// listing `ghp`/`gho`/`github_pat` there never matched one. Short tokens
 		// then fell through the 40-character catch-all below entirely.
 		.replace(/\b(?:gh[opsur]_[A-Za-z0-9_]{12,}|github_pat_[A-Za-z0-9_]{12,})\b/g, REDACTED_PROVIDER_SECRET)
+		// The shapes `crash/upstream/envelope.ts` classifies as credential-like.
+		// A GitLab PAT and a Hugging Face token are both shorter than the 40-character
+		// catch-all below, and Stripe separates with `_` so the `sk|rk|pk`-hyphen rule
+		// above never matched one.
+		.replace(
+			/\b(?:npm_[A-Za-z0-9]{20,}|glpat-[A-Za-z0-9_-]{20,}|(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{16,}|hf_[A-Za-z0-9]{20,})\b/g,
+			REDACTED_PROVIDER_SECRET,
+		)
 		// AWS access-key ids are 20 characters, so the catch-all never reached them.
 		.replace(/\b(?:AKIA|ASIA|ABIA|ACCA)[0-9A-Z]{16}\b/g, REDACTED_PROVIDER_SECRET)
 		// A Google API key is exactly 39 characters — one short of the catch-all.
@@ -835,16 +842,6 @@ function extractOpenRouterImageUrls(message: OpenRouterMessage | undefined): str
 	return urls;
 }
 
-/** Provider → default image model mapping for fallbacks */
-export const IMAGE_PROVIDER_DEFAULTS: Record<string, string> = {
-	openai: "gpt-image-2",
-	alibaba: "wan2.7-image",
-	"openai-codex": "gpt-image-2",
-	antigravity: "gemini-3-pro-image",
-	gemini: "gemini-3-pro-image-preview",
-	openrouter: "google/gemini-3-pro-image-preview",
-};
-
 /**
  * Resolve the image-generation model from the `modelRoles.image` settings entry.
  * Returns the resolved Model (with provider identity) or undefined when no
@@ -865,12 +862,6 @@ export function resolveImageRoleModel(
 		credentialSessionId: options?.credentialSessionId,
 	});
 	return resolved.model;
-}
-
-/** Resolve the effective image model for a configured provider */
-export function resolveImageModel(provider: string, modelOverride: string | null): string {
-	if (modelOverride) return modelOverride;
-	return IMAGE_PROVIDER_DEFAULTS[provider] ?? DEFAULT_MODEL;
 }
 
 interface ParsedAntigravityCredentials {
@@ -961,10 +952,11 @@ async function findImageApiKey(
 	settings: ModelRoleSettings,
 	sessionId?: string,
 	credentialSessionId?: string,
-): Promise<ImageApiKey | null> {
+): Promise<(ImageApiKey & { model: Model }) | null> {
 	const imageModel = resolveImageRoleModel(settings, modelRegistry, { sessionId, credentialSessionId });
 	if (!imageModel) return null;
-	return resolveCredentialsForImageModel(imageModel, modelRegistry, sessionId);
+	const credentials = await resolveCredentialsForImageModel(imageModel, modelRegistry, sessionId);
+	return credentials ? { ...credentials, model: imageModel } : null;
 }
 
 /**
@@ -1512,16 +1504,7 @@ export const imageGenTool: CustomTool<typeof imageGenSchema, ImageGenToolDetails
 			}
 
 			const provider = apiKey.provider;
-			const imageModel = apiKey.model;
-			const model = imageModel
-				? imageModel.id
-				: provider === "antigravity"
-					? resolveImageModel("antigravity", null)
-					: provider === "alibaba"
-						? resolveImageModel("alibaba", null)
-						: provider === "openrouter"
-							? resolveImageModel("openrouter", null)
-							: resolveImageModel("gemini", null);
+			const model = apiKey.model.id;
 			const resolvedModel = provider === "openrouter" ? resolveOpenRouterModel(model) : model;
 			const cwd = ctx.sessionManager.getCwd();
 
@@ -1535,10 +1518,6 @@ export const imageGenTool: CustomTool<typeof imageGenSchema, ImageGenToolDetails
 			const requestSignal = ptree.combineSignals(signal, IMAGE_TIMEOUT);
 
 			if (provider === "openai" || provider === "openai-codex") {
-				if (!apiKey.model) {
-					throw new Error("Missing active GPT model for OpenAI image generation");
-				}
-
 				const parsed = await generateOpenAIHostedImage(
 					apiKey.apiKey,
 					apiKey.model,

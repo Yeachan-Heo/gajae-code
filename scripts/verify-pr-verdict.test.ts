@@ -5,6 +5,7 @@ import * as url from "node:url";
 import {
 	authenticatedApproval,
 	canonicalDiffSha256,
+	fetchIndependentReviewerEvidence,
 	parseBodyRisk,
 	parseGhPrCreate,
 	parsePrVerdict,
@@ -609,109 +610,265 @@ test("preflight preserves missing body-file diagnostics", async () => {
 });
 
 describe("push preflight", () => {
-	test("pre-push hook validates every pushed branch head through the contract validator", async () => {
-		const hook = await Bun.file(new URL("../.githooks/pre-push", import.meta.url)).text();
-		// The pushed commit -- not local HEAD -- is what becomes the PR head.
-		expect(hook).toContain('--push-preflight "$branch" "$local_sha"');
-		expect(hook).toContain("GJC_SKIP_PR_PREFLIGHT");
-		// Deletions carry the zero sha and have no head to validate.
-		expect(hook).toContain('[[ "$local_sha" == "$zero" ]] && continue');
+	async function preflight(options: { metadata?: string; apiExit?: number; remote?: string; destination?: string; pushUrls?: string; openPr?: boolean; pages?: "late" | "ambiguous" | "failure" }) {
+		const temp = await fs.mkdtemp(path.join(Bun.env.TMPDIR ?? "/tmp", "push-authority-"));
+		const callsPath = path.join(temp, "calls.jsonl");
+		const executable = `#!${process.execPath}\n`;
+		try {
+			await fs.writeFile(callsPath, "");
+			await fs.writeFile(path.join(temp, "gh"), executable + `
+const args = process.argv.slice(2);
+require("node:fs").appendFileSync(process.env.CALLS, JSON.stringify(["gh", ...args]) + "\\n");
+if (process.env.GH_HOST !== "github.com") { console.error("wrong GH_HOST"); process.exit(96); }
+if (args[0] === "repo") {
+ console.log(process.env.METADATA);
+ process.exit(Number(process.env.API_EXIT));
+}
+if (args[0] === "api" && args[1].includes("/pulls?")) {
+ const pr = {number: 42, body: "", base: {ref: "release"}, user: {login: "author"}, head: {ref: "destination-branch", sha: "d".repeat(40), repo: {owner: {login: "receiver"}}}};
+ const page = Number(new URL("https://github.com/" + args[1]).searchParams.get("page"));
+ if (process.env.PAGES && page === 1) {
+  console.log(JSON.stringify(Array.from({length: 100}, (_, i) => ({...pr, number: i + 100, head: {...pr.head, repo: {owner: {login: "other"}}}})))); process.exit(0);
+ }
+ if (process.env.PAGES === "failure") process.exit(95);
+ console.log(JSON.stringify(process.env.PAGES === "ambiguous" ? [pr, {...pr, number: 43}] : process.env.OPEN_PR === "1" || process.env.PAGES === "late" ? [pr] : [])); process.exit(0);
+}
+process.exit(97);
+`);
+			await fs.writeFile(path.join(temp, "git"), executable + `
+const args = process.argv.slice(2);
+require("node:fs").appendFileSync(process.env.CALLS, JSON.stringify(["git", ...args]) + "\\n");
+if (JSON.stringify(args) === JSON.stringify(["remote", "get-url", "--push", "--all", "origin"])) {
+ console.log(process.env.PUSH_URLS); process.exit(0);
+}
+if (args[0] === "fetch" || args[0] === "merge-base") process.exit(0);
+if (args[0] === "rev-parse") { console.log("a".repeat(40)); process.exit(0); }
+if (args[0] === "diff") { console.error("mock exact diff stop"); process.exit(1); }
+process.exit(98);
+`);
+			await Promise.all(["gh", "git"].map(name => fs.chmod(path.join(temp, name), 0o755)));
+			const script = url.fileURLToPath(new URL("./verify-pr-verdict.ts", import.meta.url));
+			const args = [process.execPath, script, "--push-preflight", "destination-branch", head, "--push-remote", options.remote ?? "origin", "--repo", temp, "--trusted-root", temp];
+			if (options.destination !== undefined) args.push("--push-url", options.destination);
+			const child = Bun.spawn(args, {
+				env: { ...process.env, GH_HOST: "hostile.example", PATH: `${temp}:${process.env.PATH}`, CALLS: callsPath, METADATA: options.metadata ?? '{"isFork":false}', API_EXIT: String(options.apiExit ?? 0), PUSH_URLS: options.pushUrls ?? "git@github.com:receiver/project.git", OPEN_PR: options.openPr ? "1" : "0", PAGES: options.pages ?? "" },
+				stdout: "pipe", stderr: "pipe",
+			});
+			const [stdout, stderr, exitCode] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
+			const calls = (await fs.readFile(callsPath, "utf8")).trim().split("\n").filter(Boolean).map(line => JSON.parse(line) as string[]);
+			return { stdout, stderr, exitCode, calls };
+		} finally {
+			await fs.rm(temp, { recursive: true, force: true });
+		}
+	}
+
+	test("a named remote uses push URLs, never its fetch URL", async () => {
+		const result = await preflight({});
+		expect(result.exitCode).toBe(0);
+		expect(result.calls[0]).toEqual(["git", "remote", "get-url", "--push", "--all", "origin"]);
+		expect(result.calls[1]).toEqual(["gh", "repo", "view", "receiver/project", "--json", "isFork,parent"]);
 	});
 
-	test("a branch with no open PR has no contract to invalidate", async () => {
-		const script = url.fileURLToPath(new URL("./verify-pr-verdict.ts", import.meta.url));
-		const repoRoot = url.fileURLToPath(new URL("..", import.meta.url));
-		const head = Bun.spawnSync(["git", "rev-parse", "HEAD"], { cwd: repoRoot });
-		const headSha = head.stdout.toString().trim();
-		const child = Bun.spawn([process.execPath, script, "--push-preflight", "gjc-preflight-branch-that-does-not-exist", headSha, "--repo", repoRoot, "--trusted-root", repoRoot], { stdout: "ignore", stderr: "ignore" });
-		expect(await child.exited).toBe(0);
+	test("REST discovery pins github.com and keeps the pushed object independent of remote head", async () => {
+		const result = await preflight({ openPr: true });
+		expect(result.exitCode).toBe(1);
+		expect(result.stderr).toContain("mock exact diff stop");
+		expect(result.calls).toContainEqual(["gh", "api", "repos/receiver/project/pulls?state=open&head=receiver%3Adestination-branch&per_page=100&page=1"]);
+		expect(result.calls).toContainEqual(["git", "fetch", "--no-tags", "https://github.com/receiver/project.git", "release"]);
+		expect(result.calls).toContainEqual(["git", "merge-base", "--is-ancestor", base, head]);
+		expect(result.calls).toContainEqual(["git", "diff", "--binary", "--full-index", "--no-ext-diff", `${base}...${head}`]);
 	});
 
-	test("derives the PR branch from the remote destination, not the local source ref", async () => {
-		const hook = await Bun.file(new URL("../.githooks/pre-push", import.meta.url)).text();
-		// `git push origin HEAD:refs/heads/feature` gives local_ref=HEAD, and a renamed
-		// refspec gives two different names; filtering on the local ref skips both.
-		expect(hook).toContain('[[ "$remote_ref" == refs/heads/* ]] || continue');
-		expect(hook).toContain('branch="${remote_ref#refs/heads/}"');
-		expect(hook).not.toContain('[[ "$local_ref" == refs/heads/* ]]');
-		// The pushed object, not the resolved remote branch tip, is the commit validated.
-		expect(hook).toContain('--push-preflight "$branch" "$local_sha"');
-		// The receiving remote is forwarded so the PR is looked up in the right repository.
-		expect(hook).toContain('--push-remote "$remote"');
+	test("the hook destination overrides split pushurl configuration", async () => {
+		const result = await preflight({ destination: "https://github.com/actual/destination.git", pushUrls: "https://github.com/wrong/one.git\nhttps://github.com/wrong/two.git" });
+		expect(result.exitCode).toBe(0);
+		expect(result.calls[0]).toEqual(["gh", "repo", "view", "actual/destination", "--json", "isFork,parent"]);
+		expect(result.calls.some(call => call[0] === "git")).toBe(false);
+		expect(result.calls[1]?.[2]).toContain("repos/actual/destination/pulls?");
 	});
 
-	test("binds PR lookup and base resolution to the receiving repository", async () => {
-		const source = await Bun.file(new URL("./verify-pr-verdict.ts", import.meta.url)).text();
-		const pushPreflight = source.slice(source.indexOf("async function validatePushPreflight"));
-		// An implicit gh context resolves a fork checkout to the fork, where the upstream PR
-		// does not exist -- the empty result would then wave the push through.
-		expect(pushPreflight).toContain('"--repo", baseRepo');
-		expect(pushPreflight).not.toContain('git(["fetch", "--no-tags", "origin", "dev"]');
-		expect(pushPreflight).not.toContain('rev-parse", "origin/dev"');
-		// The base is the PR's own base ref in the contract repository, never an assumed dev.
-		expect(pushPreflight).toContain("pr.baseRefName], cwd)");
-		// A same-named branch in another fork must not be mistaken for this PR.
-		expect(pushPreflight).toContain("headRepositoryOwner?.login?.toLowerCase() === headOwner.toLowerCase()");
-		// Ambiguity fails closed rather than guessing which contract governs the push.
-		expect(pushPreflight).toContain("cannot determine which contract governs this push");
-		// gh pr list's JSON mapping drops headRefOid and review commit oids on older gh
-		// releases (e.g. 2.4.x), which would fail closed on every push, so the head oid
-		// and the review commits must be resolved through the stable `gh api` surface.
-		expect(pushPreflight).toContain('"--jq", ".head.sha"');
-		expect(pushPreflight).toContain("/pulls/${pr.number}/reviews");
-		expect(pushPreflight).not.toContain("reviews,headRefOid");
-	});
+	for (const remote of ["git@github.com:receiver/project.git", "https://github.com/receiver/project", "ssh://git@github.com/receiver/project.git"]) {
+		test(`URL remote resolves directly: ${remote}`, async () => {
+			const result = await preflight({ remote });
+			expect(result.exitCode).toBe(0);
+			expect(result.calls[0]).toEqual(["gh", "repo", "view", "receiver/project", "--json", "isFork,parent"]);
+		});
+	}
 
-	test("resolves the GitHub repository from every supported remote URL form", async () => {
-		const source = await Bun.file(new URL("./verify-pr-verdict.ts", import.meta.url)).text();
-		const pattern = /const match = (\/.+\/u)\.exec\(text\);/u.exec(source.slice(source.indexOf("async function pushRemoteRepository")));
-		expect(pattern).not.toBeNull();
-		const remoteUrl = new RegExp(pattern![1]!.slice(1, -2), "u");
-		const resolve = (url: string): string | null => {
-			const match = remoteUrl.exec(url);
-			return match ? `${match[1]}/${match[2]}` : null;
+	for (const options of [
+		{ apiExit: 1 }, { metadata: "not-json" }, { metadata: "null" }, { metadata: "{}" },
+		{ metadata: '{"isFork":"false"}' }, { metadata: '{"isFork":true}' },
+		{ metadata: '{"isFork":true,"parent":null}' },
+		{ metadata: '{"isFork":true,"parent":{"owner":{"login":"upstream"}}}' },
+		{ metadata: '{"isFork":true,"parent":{"owner":{"login":"bad/owner"},"name":"project"}}' },
+	]) {
+		test(`unresolved repository authority fails closed: ${JSON.stringify(options)}`, async () => {
+			const result = await preflight(options);
+			expect(result.exitCode).toBe(1);
+			expect(result.stderr).toContain("Could not establish the PR contract repository");
+			expect(result.calls.some(call => call[1] === "api")).toBe(false);
+		});
+	}
+
+	for (const [metadata, repository] of [
+		['{"isFork":false}', "receiver/project"],
+		['{"isFork":true,"parent":{"owner":{"login":"upstream"},"name":"project"}}', "upstream/project"],
+	]) {
+		test(`validated authority selects ${repository}`, async () => {
+			const result = await preflight({ metadata });
+			expect(result.exitCode).toBe(0);
+			expect(result.calls.at(-1)).toEqual(["gh", "api", `repos/${repository}/pulls?state=open&head=receiver%3Adestination-branch&per_page=100&page=1`]);
+		});
+	}
+
+	for (const options of [
+		{ destination: "https://evil.example/receiver/project.git" }, { destination: "" },
+		{ pushUrls: "https://github.com/one/project.git\nhttps://github.com/two/project.git" },
+	]) {
+		test(`unresolved destination cannot query a different repository: ${JSON.stringify(options)}`, async () => {
+			const result = await preflight(options);
+			expect(result.exitCode).toBe(1);
+			expect(result.stderr).toContain("unknown repository");
+			expect(result.calls.some(call => call[0] === "gh")).toBe(false);
+		});
+	}
+
+	for (const pages of ["late", "ambiguous", "failure"] as const) {
+		test(`PR discovery exhausts pagination: ${pages}`, async () => {
+			const result = await preflight({ pages });
+			expect(result.exitCode).toBe(1);
+			expect(result.calls).toContainEqual(["gh", "api", "repos/receiver/project/pulls?state=open&head=receiver%3Adestination-branch&per_page=100&page=2"]);
+			expect(result.stderr).toContain(pages === "late" ? "mock exact diff stop" : pages === "ambiguous" ? "cannot determine which contract" : "Could not resolve the open PR");
+		});
+	}
+
+	async function exactTreePreflight(kind: "needs-human" | "merge-blocked" | "merge-approved" | "stale" | "malformed" | "missing-risk" | "multiple-risk" | "bad-pushed-tree" | "export-ignore" | "export-subst" | "source-symlink" | "source-backslash" | "case-collision") {
+		const temp = await fs.mkdtemp(path.join(Bun.env.TMPDIR ?? "/tmp", "push-exact-tree-"));
+		const repo = path.join(temp, "repo");
+		const bin = path.join(temp, "bin");
+		const scratch = path.join(temp, "scratch");
+		const realGit = Bun.which("git")!;
+		const runGit = (...args: string[]) => {
+			const result = Bun.spawnSync([realGit, ...args], { cwd: repo, env: { ...process.env, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null" } });
+			if (result.exitCode !== 0) throw new Error(result.stderr.toString());
+			return result.stdout;
 		};
-		expect(resolve("git@github.com:Yeachan-Heo/gajae-code.git")).toBe("Yeachan-Heo/gajae-code");
-		expect(resolve("https://github.com/Yeachan-Heo/gajae-code.git")).toBe("Yeachan-Heo/gajae-code");
-		expect(resolve("https://github.com/probepark/gajae-code")).toBe("probepark/gajae-code");
-		expect(resolve("ssh://git@github.com/Yeachan-Heo/gajae-code.git")).toBe("Yeachan-Heo/gajae-code");
-	});
+		try {
+			await Promise.all([repo, bin, scratch].map(dir => fs.mkdir(dir)));
+			runGit("init");
+			runGit("config", "user.email", "fixture@example.test");
+			runGit("config", "user.name", "Fixture");
+			const source = path.join(repo, "packages/coding-agent/src/example.ts");
+			await fs.mkdir(path.dirname(source), { recursive: true });
+			const bad = 'import * as fs from "node:fs";\nfs.writeFileSync(".gjc/unsafe.json", "unsafe");\n';
+			await fs.writeFile(source, "export const value = 1;\n");
+			runGit("add", ".");
+			runGit("-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false", "commit", "-m", "base");
+			const baseSha = runGit("rev-parse", "HEAD").toString().trim();
+			const badTree = kind === "bad-pushed-tree" || kind === "export-ignore" || kind === "export-subst" || kind === "source-backslash" || kind === "case-collision";
+			const pushedSource = kind === "export-subst" ? bad.replace("unsafe.json", "$Format:%H$.json") : badTree && kind !== "case-collision" ? bad : "export const value = 2;\n";
+			await fs.writeFile(source, pushedSource);
+			if (kind === "export-ignore" || kind === "export-subst") await fs.writeFile(path.join(repo, ".gitattributes"), `packages/coding-agent/src/example.ts ${kind}\n`);
+			if (kind === "source-symlink") await fs.symlink("example.ts", path.join(path.dirname(source), "linked.ts"));
+			runGit("add", ".");
+			if (kind === "source-backslash") {
+				const unsafePath = path.join(temp, "unsafe-backslash-blob");
+				await fs.writeFile(unsafePath, bad);
+				const unsafeOid = runGit("hash-object", "-w", unsafePath).toString().trim();
+				runGit("update-index", "--add", "--cacheinfo", `100644,${unsafeOid},packages/coding-agent/src/..\\escaped.ts`);
+			}
+			runGit("-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false", "commit", "-m", "pushed");
+			let pushedSha = runGit("rev-parse", "HEAD").toString().trim();
+			if (kind === "case-collision") {
+				// Populate the index directly: both Git paths must exist even when the
+				// host filesystem cannot represent their distinct casing simultaneously.
+				const unsafePath = path.join(temp, "unsafe-blob");
+				await fs.writeFile(unsafePath, bad);
+				const unsafeOid = runGit("hash-object", "-w", unsafePath).toString().trim();
+				const cleanPath = path.join(temp, "clean-blob");
+				await fs.writeFile(cleanPath, "export const value = 2;\n");
+				const cleanOid = runGit("hash-object", "-w", cleanPath).toString().trim();
+				runGit("-c", "core.ignorecase=false", "update-index", "--add", "--cacheinfo", `100644,${unsafeOid},packages/coding-agent/src/Foo.ts`);
+				runGit("-c", "core.ignorecase=false", "update-index", "--add", "--cacheinfo", `100644,${cleanOid},packages/coding-agent/src/foo.ts`);
+				const treeOid = runGit("write-tree").toString().trim();
+				pushedSha = runGit("-c", "commit.gpgsign=false", "commit-tree", treeOid, "-p", baseSha, "-m", "case-distinct pushed tree").toString().trim();
+				const entries = runGit("ls-tree", "-r", pushedSha).toString();
+				expect(entries).toContain(`${unsafeOid}\tpackages/coding-agent/src/Foo.ts`);
+				expect(entries).toContain(`${cleanOid}\tpackages/coding-agent/src/foo.ts`);
+				// Restore only the disposable fixture index; never check out colliding paths.
+				runGit("read-tree", "HEAD");
+			}
+			const diffSha = canonicalDiffSha256(runGit("diff", "--binary", "--full-index", "--no-ext-diff", `${baseSha}...${pushedSha}`));
+			// Checkout a different commit, then dirty it with bytes opposite to the pushed tree.
+			runGit("checkout", "--detach", baseSha);
+			const dirty = badTree ? "export const value = 3;\n" : bad;
+			await fs.writeFile(source, dirty);
+			const verdict = kind === "merge-blocked" || kind === "merge-approved" ? kind : "needs-human";
+			let body = `gajae.pr-review-verdict.v1 ${verdict} sha256:${kind === "stale" ? "0".repeat(64) : diffSha} reviewer:architect reviewer-id:review-agent evidence:fixture review\n`;
+			if (kind === "malformed") body = "gajae.pr-review-verdict.v1 invalid\n";
+			if (kind !== "missing-risk") body += "- [x] `low-risk`\n";
+			if (kind === "multiple-risk") body += "- [x] `high-risk`\n";
+			await fs.writeFile(path.join(temp, "pulls.json"), JSON.stringify([{ number: 42, body, base: { ref: "dev" }, user: { login: "author" }, head: { ref: "dev", sha: baseSha, repo: { owner: { login: "receiver" } } } }]));
+			await fs.writeFile(path.join(bin, "gh"), `#!${process.execPath}\n
+if (process.env.GH_HOST !== "github.com") process.exit(91);
+const args = process.argv.slice(2);
+if (args[0] === "repo") { console.log('{"isFork":false}'); process.exit(0); }
+if (args[0] === "api" && args[1] === "repos/receiver/project/pulls?state=open&head=receiver%3Adev&per_page=100&page=1") {
+ console.log(require("node:fs").readFileSync(process.env.PULLS, "utf8")); process.exit(0);
+}
+throw new Error("Unexpected gh invocation: " + JSON.stringify(args));
+`);
+			await fs.writeFile(path.join(bin, "git"), `#!${process.execPath}\n
+const args = process.argv.slice(2);
+if (args[0] === "fetch") {
+ require("node:fs").writeFileSync(".git/FETCH_HEAD", process.env.BASE_SHA + "\\n"); process.exit(0);
+}
+const result = Bun.spawnSync([process.env.REAL_GIT, ...args], {stdin: "inherit", stdout: "inherit", stderr: "inherit"});
+process.exit(result.exitCode);
+`);
+			await Promise.all(["gh", "git"].map(name => fs.chmod(path.join(bin, name), 0o755)));
+			const trustedRoot = path.resolve(import.meta.dir, "..");
+			const child = Bun.spawn([process.execPath, path.join(trustedRoot, "scripts/verify-pr-verdict.ts"), "--push-preflight", "dev", pushedSha, "--push-url", "https://github.com/receiver/project.git", "--repo", repo, "--trusted-root", trustedRoot], {
+				env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, GH_HOST: "hostile.example", PULLS: path.join(temp, "pulls.json"), BASE_SHA: baseSha, REAL_GIT: realGit, TMPDIR: scratch }, stdout: "pipe", stderr: "pipe",
+			});
+			const [stdout, stderr, exitCode] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
+			expect(await fs.readFile(source, "utf8")).toBe(dirty);
+			expect(runGit("rev-parse", "HEAD").toString().trim()).toBe(baseSha);
+			expect((await fs.readdir(scratch)).filter(name => name.startsWith("gjc-pushed-tree-"))).toEqual([]);
+			return { stdout, stderr, exitCode };
+		} finally {
+			await fs.rm(temp, { recursive: true, force: true });
+		}
+	}
 
-	test("a fork push resolves the contract to the upstream parent repository", async () => {
-		const source = await Bun.file(new URL("./verify-pr-verdict.ts", import.meta.url)).text();
-		const resolver = source.slice(source.indexOf("async function contractRepository"));
-		// A fork's PR lives upstream, so the parent owns the contract; the head stays
-		// qualified by the fork owner that actually receives the push.
-		expect(resolver).toContain('"isFork,parent"');
-		expect(resolver).toContain("return { repo: `${parentOwner}/${parentName}`, forkOwner: pushRepo.split(\"/\")[0]! };");
-		expect(resolver).toContain("if (!info.isFork || !parentOwner || !parentName) return { repo: pushRepo, forkOwner: null };");
-	});
+	for (const kind of ["needs-human", "merge-blocked", "merge-approved"] as const) {
+		test(`CLI permits valid ${kind} without local approval queries and ignores dirty checkout gate failures`, async () => {
+			const result = await exactTreePreflight(kind);
+			expect(result.exitCode).toBe(0);
+			expect(result.stdout).toContain(`PR contract valid: ${kind}`);
+		});
+	}
 
-	test("mirrors the Dev CI bootstrap job, which has no requireMergeApproved escape hatch", async () => {
-		const source = await Bun.file(new URL("./verify-pr-verdict.ts", import.meta.url)).text();
-		const pushPreflight = source.slice(source.indexOf("async function validatePushPreflight"));
-		// The bootstrap job blocks needs-human/merge-blocked unconditionally, so a preflight
-		// that passed them locally would disagree with the very check it predicts.
-		expect(pushPreflight).toContain("requireMergeApproved: true");
-		expect(pushPreflight).not.toContain("requireMergeApproved: false");
-		// Mirroring the flag alone would fail a legitimately reviewed merge-approved PR, so
-		// the exact-head approval must be resolved from the same review data.
-		expect(pushPreflight).toContain("authenticatedReviewerLogin: approval.login");
-		expect(pushPreflight).toContain('review.state !== "COMMENTED"');
-		expect(pushPreflight).toContain("review.commit?.oid === headSha");
-	});
+	for (const [kind, message] of [
+		["stale", "digest"], ["malformed", "Malformed"], ["missing-risk", "found none"],
+		["multiple-risk", "found 2"], ["bad-pushed-tree", "fast gate"], ["source-symlink", "fast gate"], ["source-backslash", "fast gate"], ["case-collision", "fast gate"],
+	] as const) {
+		test(`CLI rejects ${kind} despite clean working-tree bytes when applicable`, async () => {
+			const result = await exactTreePreflight(kind);
+			expect(result.exitCode).toBe(1);
+			expect(result.stderr).toContain(message);
+		});
+	}
 
-	test("a blocking verdict fails the push exactly as the bootstrap job does", () => {
-		const body = approved.replace("merge-approved", "needs-human");
-		const blocked = validatePrContract(validInput({ body, requireMergeApproved: true }));
-		expect(blocked.ok).toBe(false);
-		expect(blocked.diagnostics.join("\n")).toContain("intentionally blocks merge");
-	});
-
-	test("an exact-head approved merge-approved PR still passes the push gate", () => {
-		const reviewed = validatePrContract(validInput({ requireMergeApproved: true }));
-		expect(reviewed.ok).toBe(true);
-	});
+	for (const kind of ["export-ignore", "export-subst"] as const) {
+		test(`pushed attributes cannot omit or transform source bytes: ${kind}`, async () => {
+			const result = await exactTreePreflight(kind);
+			expect(result.exitCode).toBe(1);
+			expect(result.stderr).toContain("Repository fast gate failed");
+			expect(result.stdout + result.stderr).toContain("example.ts");
+			if (kind === "export-subst") expect(result.stdout + result.stderr).toContain("$Format:%H$");
+		});
+	}
 
 	test("a non-commit push target fails closed", async () => {
 		const script = url.fileURLToPath(new URL("./verify-pr-verdict.ts", import.meta.url));
@@ -720,6 +877,315 @@ describe("push preflight", () => {
 		const [stderr, exitCode] = await Promise.all([new Response(child.stderr).text(), child.exited]);
 		expect(exitCode).toBe(1);
 		expect(stderr).toContain("is not a lowercase 40-hex commit");
+	});
+});
+
+/**
+ * Build a signed gajae.pr-self-review.v1 record bound to the given exact base/head/digest.
+ */
+function selfReviewRecord(context: { baseSha: string; headSha: string; digest: string; reviewerId?: string; verdict?: "merge-approved" | "merge-self-approved" | "merge-blocked"; risk?: "low-risk" | "regression-risk" | "high-risk"; extra?: string }): string {
+	const reviewerId = context.reviewerId ?? "owner";
+	const verdict = context.verdict ?? "merge-self-approved";
+	const risk = context.risk ?? "low-risk";
+	const extraToken = context.extra ?? "none";
+	const extra = extraToken === "none" ? { kind: "none" as const } : { kind: "independent" as const, login: extraToken.slice("independent:".length) };
+	const evidence = "hermetic push preflight fixture";
+	const signature = selfReviewSignature(selfReviewSignedPayload({
+		verdict,
+		baseSha: context.baseSha,
+		headSha: context.headSha,
+		diffSha256: context.digest,
+		reviewerId,
+		risk,
+		extra,
+		evidence,
+	}));
+	const record = `gajae.pr-self-review.v1 verdict:${verdict} base:${context.baseSha} head:${context.headSha} sha256:${context.digest} reviewer-id:${reviewerId} risk:${risk} extra:${extraToken} evidence:${evidence}`;
+	return `${record}\nself-review-signature: sha256:${signature}\nSigned-off-by: gaebal-gajae (clawdbot) 🦞`;
+}
+
+interface PushPreflightFixture {
+	exitCode: number;
+	stdout: string;
+	stderr: string;
+	ghCalls: string[];
+}
+
+interface PushPreflightContext {
+	baseSha: string;
+	headSha: string;
+	digest: string;
+}
+
+/**
+ * Hermetic end-to-end push preflight for the maintainer self-review record (issue #5483):
+ * a real git repository, the real CLI, and a PATH-shimmed `gh` whose only job is to serve
+ * the GitHub API responses. Everything the gate itself does — the base fetch, the ancestry
+ * check, the canonical diff digest, the pushed-tree fast gate, and the comment read — runs
+ * for real. The shim is flag-aware: it refuses a comment read that forgot `--paginate` or
+ * lost its `--jq` projection, so the mirroring contract cannot silently regress.
+ */
+async function runSelfReviewPushPreflight(options: {
+	body?: (context: PushPreflightContext) => string;
+	comments?: (context: PushPreflightContext) => unknown[];
+	commentsUnavailable?: boolean;
+	/** Emit the comments as JSONL that is cut off mid-record while gh still exits 0. */
+	commentsTruncated?: boolean;
+	reviews?: (context: PushPreflightContext) => unknown[];
+	reviewsUnavailable?: boolean;
+	permission?: string;
+	permissionUnavailable?: boolean;
+} = {}): Promise<PushPreflightFixture> {
+	const script = url.fileURLToPath(new URL("./verify-pr-verdict.ts", import.meta.url));
+	const repoRoot = url.fileURLToPath(new URL("..", import.meta.url));
+	const temp = await fs.mkdtemp(path.join(Bun.env.TMPDIR ?? "/tmp", "gjc-self-review-preflight-"));
+	try {
+		const work = path.join(temp, "work");
+		const bin = path.join(temp, "bin");
+		await fs.mkdir(work, { recursive: true });
+		await fs.mkdir(bin, { recursive: true });
+		const git = (args: string[]): string => {
+			const child = Bun.spawnSync(["git", ...args], { cwd: work, env: { ...process.env, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null" }, stdout: "pipe", stderr: "pipe" });
+			if (child.exitCode !== 0) throw new Error(`git ${args.join(" ")} failed: ${child.stderr.toString()}`);
+			return child.stdout.toString();
+		};
+		git(["init", "-q"]);
+		git(["symbolic-ref", "HEAD", "refs/heads/dev"]);
+		git(["config", "user.email", "preflight@example.com"]);
+		git(["config", "user.name", "Preflight Fixture"]);
+		await Bun.write(path.join(work, "packages", "coding-agent", "src", "example.ts"), "export const value = 1;\n");
+		git(["add", "-A"]);
+		git(["commit", "-q", "-m", "base"]);
+		const baseSha = git(["rev-parse", "HEAD"]).trim();
+		git(["remote", "add", "origin", "git@github.com:owner/repo.git"]);
+		// The gate fetches https://github.com/owner/repo.git itself; rewriting that URL to
+		// the fixture keeps the real fetch path while staying off the network.
+		git(["config", `url.${work}.insteadOf`, "https://github.com/owner/repo.git"]);
+		git(["checkout", "-q", "-b", "feature"]);
+		await Bun.write(path.join(work, "packages", "coding-agent", "src", "example.ts"), "export const value = 2;\n");
+		git(["add", "-A"]);
+		git(["commit", "-q", "-m", "feature"]);
+		const headSha = git(["rev-parse", "HEAD"]).trim();
+		const diff = Bun.spawnSync(["git", "diff", "--binary", "--full-index", "--no-ext-diff", `${baseSha}...${headSha}`], { cwd: work, stdout: "pipe", stderr: "pipe" }).stdout;
+		const context: PushPreflightContext = { baseSha, headSha, digest: canonicalDiffSha256(diff) };
+		const body = options.body?.(context) ?? `gajae.pr-review-verdict.v1 merge-self-approved sha256:${context.digest} reviewer:human reviewer-id:owner evidence:hermetic push preflight fixture\n\n## Risk classification\n\n- [x] \`low-risk\`\n`;
+		const comments = options.comments?.(context) ?? [{ user: { login: "owner" }, author_association: "OWNER", body: selfReviewRecord(context) }];
+		const reviews = options.reviews?.(context) ?? [];
+		const pullsPath = path.join(temp, "pulls.json");
+		const commentsPath = path.join(temp, "comments.jsonl");
+		const reviewsPath = path.join(temp, "reviews.jsonl");
+		const permissionPath = path.join(temp, "permission.txt");
+		const callsPath = path.join(temp, "gh-calls.log");
+		await Bun.write(pullsPath, JSON.stringify([{ number: 123, body, base: { ref: "dev" }, user: { login: "owner" }, head: { ref: "feature", repo: { owner: { login: "owner" } } } }]));
+		const commentsJsonl = comments.map(comment => JSON.stringify(comment)).join("\n");
+		await Bun.write(commentsPath, options.commentsTruncated ? `${commentsJsonl}\n{"user":{"login":"owner"` : commentsJsonl);
+		await Bun.write(reviewsPath, reviews.map(review => JSON.stringify(review)).join("\n"));
+		await Bun.write(permissionPath, `${options.permission ?? "write"}\n`);
+		await Bun.write(callsPath, "");
+		const ghPath = path.join(bin, "gh");
+		await Bun.write(ghPath, `#!/usr/bin/env bash\nset -euo pipefail\nargs="$*"\nprintf '%s\\n' "$args" >> "$GH_CALLS"\nif [[ "$args" == "repo view owner/repo --json isFork,parent" ]]; then\n  printf '{"isFork":false}\\n'\nelif [[ "$args" == *"/pulls?state=open"* ]]; then\n  cat "$GH_PULLS"\nelif [[ "$args" == *"/pulls/123/reviews"* ]]; then\n  [[ "$args" == *"--paginate"* ]] || { echo "gh reviews read is missing --paginate" >&2; exit 1; }\n  [[ "$args" == *"commit_id"* ]] || { echo "gh reviews read lost its --jq projection" >&2; exit 1; }\n  if [[ -n "\${GH_REVIEWS_UNAVAILABLE:-}" ]]; then\n    echo "HTTP 503: reviews unavailable" >&2\n    exit 1\n  fi\n  cat "$GH_REVIEWS"\nelif [[ "$args" == *"/collaborators/"* ]]; then\n  [[ "$args" == *"--jq .permission"* ]] || { echo "gh permission read lost its --jq projection" >&2; exit 1; }\n  if [[ -n "\${GH_PERMISSION_UNAVAILABLE:-}" ]]; then\n    echo "HTTP 404: Not Found" >&2\n    exit 1\n  fi\n  cat "$GH_PERMISSION"\nelif [[ "$args" == *"/issues/123/comments"* ]]; then\n  [[ "$args" == *"--paginate"* ]] || { echo "gh comments read is missing --paginate" >&2; exit 1; }\n  [[ "$args" == *"author_association"* ]] || { echo "gh comments read lost its --jq projection" >&2; exit 1; }\n  if [[ -n "\${GH_COMMENTS_UNAVAILABLE:-}" ]]; then\n    echo "HTTP 503: service unavailable" >&2\n    exit 1\n  fi\n  cat "$GH_COMMENTS"\nelse\n  echo "unexpected gh invocation: $args" >&2\n  exit 1\nfi\n`);
+		await fs.chmod(ghPath, 0o755);
+		const child = Bun.spawn([process.execPath, script, "--push-preflight", "feature", headSha, "--push-url", "https://github.com/owner/repo.git", "--repo", work, "--trusted-root", repoRoot], {
+			cwd: work,
+			env: {
+				...process.env,
+				PATH: `${bin}${path.delimiter}${process.env.PATH ?? ""}`,
+				GH_CALLS: callsPath,
+				GH_PULLS: pullsPath,
+				GH_COMMENTS: commentsPath,
+				GH_REVIEWS: reviewsPath,
+				GH_PERMISSION: permissionPath,
+				...options.commentsUnavailable ? { GH_COMMENTS_UNAVAILABLE: "1" } : {},
+				...options.reviewsUnavailable ? { GH_REVIEWS_UNAVAILABLE: "1" } : {},
+				...options.permissionUnavailable ? { GH_PERMISSION_UNAVAILABLE: "1" } : {},
+			},
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const [stdout, stderr, exitCode] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
+		const ghCalls = (await Bun.file(callsPath).text()).split("\n").filter(Boolean);
+		return { exitCode, stdout, stderr, ghCalls };
+	} finally {
+		await fs.rm(temp, { recursive: true, force: true });
+	}
+}
+
+describe("push preflight self-review record (issue #5483)", () => {
+	test("a valid merge-self-approved record lets the push preflight pass", async () => {
+		const result = await runSelfReviewPushPreflight();
+		expect(result.stderr).not.toContain("::error::");
+		expect(result.exitCode).toBe(0);
+		expect(result.stdout).toContain("PR contract valid: merge-self-approved");
+		// The record lives on the PR, so the gate must actually read the comment API.
+		expect(result.ghCalls.some(call => call.includes("/issues/123/comments") && call.includes("--paginate"))).toBe(true);
+	});
+
+	test("an unreadable self-review record is reported as unread, not as invalid", async () => {
+		const result = await runSelfReviewPushPreflight({ commentsUnavailable: true });
+		expect(result.exitCode).toBe(1);
+		expect(result.stderr).toContain("It was never evaluated, so it has NOT been judged invalid");
+		expect(result.stderr).toContain("service unavailable");
+		expect(result.stderr).not.toContain("requires a valid gajae.pr-self-review.v1 risk record");
+	});
+
+	test("a truncated comment list is an unread record, not a shorter valid one", async () => {
+		const result = await runSelfReviewPushPreflight({ commentsTruncated: true });
+		expect(result.exitCode).toBe(1);
+		expect(result.stderr).toContain("It was never evaluated, so it has NOT been judged invalid");
+	});
+
+	test("a PR with no author record fails closed and names the absence", async () => {
+		const result = await runSelfReviewPushPreflight({ comments: () => [] });
+		expect(result.exitCode).toBe(1);
+		expect(result.stderr).toContain("was found on this PR; the merge-self-approved solo path requires one bound to the exact head");
+		expect(result.stderr).not.toContain("could not be read");
+	});
+
+	test("the newest author-authored record wins over an older stale one", async () => {
+		const result = await runSelfReviewPushPreflight({
+			comments: context => [
+				// An older record bound to a different head must never shadow the current one.
+				{ user: { login: "owner" }, author_association: "OWNER", body: selfReviewRecord({ ...context, headSha: "d".repeat(40) }) },
+				{ user: { login: "owner" }, author_association: "OWNER", body: selfReviewRecord(context) },
+			],
+		});
+		expect(result.stderr).not.toContain("::error::");
+		expect(result.exitCode).toBe(0);
+	});
+
+	test("a stale record still fails with the precise sub-diagnostic", async () => {
+		const result = await runSelfReviewPushPreflight({
+			comments: context => [{ user: { login: "owner" }, author_association: "OWNER", body: selfReviewRecord({ ...context, headSha: "d".repeat(40) }) }],
+		});
+		expect(result.exitCode).toBe(1);
+		expect(result.stderr).toContain("is stale; exact PR head is");
+	});
+
+	test("another identity's record never authorizes the author's push", async () => {
+		const result = await runSelfReviewPushPreflight({
+			comments: context => [{ user: { login: "intruder" }, author_association: "NONE", body: selfReviewRecord(context) }],
+		});
+		expect(result.exitCode).toBe(1);
+		expect(result.stderr).toContain("was found on this PR; the merge-self-approved solo path requires one bound to the exact head");
+	});
+});
+
+describe("push preflight independent-review evidence (issue #5483 review)", () => {
+	const riskClassifiedBody = (context: PushPreflightContext): string =>
+		`gajae.pr-review-verdict.v1 needs-human sha256:${context.digest} reviewer:human reviewer-id:owner evidence:hermetic push preflight fixture\n\n## Risk classification\n\n- [x] \`regression-risk\`\n`;
+	const riskClassifiedComments = (context: PushPreflightContext) => [{
+		user: { login: "owner" },
+		author_association: "OWNER",
+		body: selfReviewRecord({ ...context, risk: "regression-risk", extra: "independent:review-bot" }),
+	}];
+	const reviewerApproval = (context: PushPreflightContext, state = "APPROVED") => [
+		{ author: { login: "review-bot" }, state, commit: { oid: context.headSha } },
+	];
+
+	test("a risk-classified record is authorized by the named reviewer's exact-head approval and permission", async () => {
+		const result = await runSelfReviewPushPreflight({
+			body: riskClassifiedBody,
+			comments: riskClassifiedComments,
+			reviews: context => reviewerApproval(context),
+			permission: "write",
+		});
+		expect(result.stderr).not.toContain("::error::");
+		expect(result.exitCode).toBe(0);
+		// The evidence must come from the real API surface the server uses.
+		expect(result.ghCalls.some(call => call.includes("/pulls/123/reviews") && call.includes("--paginate"))).toBe(true);
+		expect(result.ghCalls.some(call => call.includes("/collaborators/review-bot/permission"))).toBe(true);
+	});
+
+	test("a named reviewer without repository authority does not authorize the record", async () => {
+		const result = await runSelfReviewPushPreflight({
+			body: riskClassifiedBody,
+			comments: riskClassifiedComments,
+			reviews: context => reviewerApproval(context),
+			permission: "read",
+		});
+		expect(result.exitCode).toBe(1);
+		expect(result.stderr).toContain("is not satisfied");
+	});
+
+	test("a named reviewer without an exact-head approval does not authorize the record", async () => {
+		const result = await runSelfReviewPushPreflight({
+			body: riskClassifiedBody,
+			comments: riskClassifiedComments,
+			reviews: context => reviewerApproval(context, "CHANGES_REQUESTED"),
+			permission: "write",
+		});
+		expect(result.exitCode).toBe(1);
+		expect(result.stderr).toContain("is not satisfied");
+	});
+
+	test("a later CHANGES_REQUESTED on the same head supersedes the reviewer's approval", async () => {
+		const result = await runSelfReviewPushPreflight({
+			body: riskClassifiedBody,
+			comments: riskClassifiedComments,
+			reviews: context => [
+				...reviewerApproval(context),
+				{ author: { login: "review-bot" }, state: "CHANGES_REQUESTED", commit: { oid: context.headSha } },
+			],
+			permission: "write",
+		});
+		expect(result.exitCode).toBe(1);
+		expect(result.stderr).toContain("is not satisfied");
+	});
+
+	test("unreadable independent-review evidence is reported as unread, not as unauthorized", async () => {
+		const result = await runSelfReviewPushPreflight({
+			body: riskClassifiedBody,
+			comments: riskClassifiedComments,
+			reviewsUnavailable: true,
+		});
+		expect(result.exitCode).toBe(1);
+		expect(result.stderr).toContain("Could not read the independent-review evidence for review-bot");
+		expect(result.stderr).toContain("has NOT been judged unauthorized");
+		// One failed read must not be framed as an unsatisfied policy as well.
+		expect(result.stderr).not.toContain("is not satisfied");
+	});
+
+	test("a low-risk blocking verdict never reads the record it does not need", async () => {
+		const result = await runSelfReviewPushPreflight({
+			body: context => `gajae.pr-review-verdict.v1 needs-human sha256:${context.digest} reviewer:human reviewer-id:owner evidence:hermetic push preflight fixture\n\n## Risk classification\n\n- [x] \`low-risk\`\n`,
+			// A read failure would reject the push if the gate asked for the record at all.
+			commentsUnavailable: true,
+		});
+		expect(result.stderr).not.toContain("::error::");
+		expect(result.exitCode).toBe(0);
+		expect(result.ghCalls.some(call => call.includes("/issues/123/comments"))).toBe(false);
+	});
+});
+
+describe("server independent-reviewer evidence (issue #5483 review)", () => {
+	const event = { repository: { full_name: "owner/repo" }, pull_request: { number: 5416 } };
+	const review = (login: string, state: string, commit = head) => ({ state, commit_id: commit, user: { login } });
+
+	test.each([
+		{ name: "approval only", reviews: [review("review-bot", "APPROVED")], approved: true },
+		{ name: "approval withdrawn by a later changes-requested", reviews: [review("review-bot", "APPROVED"), review("review-bot", "CHANGES_REQUESTED")], approved: false },
+		{ name: "approval restored after changes-requested", reviews: [review("review-bot", "CHANGES_REQUESTED"), review("review-bot", "APPROVED")], approved: true },
+		{ name: "commented review never counts", reviews: [review("review-bot", "COMMENTED")], approved: false },
+		{ name: "approval on another head", reviews: [review("review-bot", "APPROVED", "d".repeat(40))], approved: false },
+		{ name: "another identity's approval", reviews: [review("someone-else", "APPROVED")], approved: false },
+	]) ("$name", async scenario => {
+		const originalFetch = globalThis.fetch;
+		const previousToken = Bun.env.GITHUB_TOKEN;
+		Bun.env.GITHUB_TOKEN = "test-token";
+		const replacement: typeof fetch = Object.assign(async (input: Parameters<typeof fetch>[0]) => {
+			const endpoint = String(input);
+			if (endpoint.startsWith("https://api.github.com/repos/owner/repo/pulls/5416/reviews")) return Response.json(scenario.reviews);
+			if (endpoint === "https://api.github.com/repos/owner/repo/collaborators/review-bot/permission") return Response.json({ permission: "write" });
+			throw new Error(`Unexpected endpoint: ${endpoint}`);
+		}, { preconnect: originalFetch.preconnect });
+		const spy = vi.spyOn(globalThis, "fetch").mockImplementation(replacement);
+		try {
+			const evidence = await fetchIndependentReviewerEvidence(event, "review-bot", head);
+			expect(evidence).toEqual({ permission: "write", approvedHead: scenario.approved, approvedLogin: "review-bot" });
+		} finally {
+			spy.mockRestore();
+			if (previousToken === undefined) delete Bun.env.GITHUB_TOKEN; else Bun.env.GITHUB_TOKEN = previousToken;
+		}
 	});
 });
 

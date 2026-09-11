@@ -15,6 +15,7 @@
  *   bun scripts/dev-link.ts            # link `gjc` -> src/cli.ts on PATH
  *   bun scripts/dev-link.ts --binary   # link `gjc` -> dist/gjc compiled binary
  *   bun scripts/dev-link.ts --check    # doctor: fail if `gjc` has drifted
+ *   bun scripts/dev-link.ts --worktree # doctor: node_modules / native addon readiness
  *
  * Env:
  *   GJC_DEV_LINK_DIR   override the target bin dir (default ~/.local/bin)
@@ -23,6 +24,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { findForeignWorkspaceLinks, formatWorktreeReport, inspectWorktree } from "./worktree-deps";
 
 const repoRoot = path.join(import.meta.dir, "..");
 const cliSource = path.join(repoRoot, "packages", "coding-agent", "src", "cli.ts");
@@ -317,30 +319,14 @@ function assertResolvedGjcMatchesTarget(winner: GjcHit | undefined, expectedReal
 }
 
 function assertWorkspaceLinksLocal(): void {
-	const repoRootReal = realpath(repoRoot) ?? repoRoot;
-	const scopeDir = path.join(repoRoot, "node_modules", "@gajae-code");
-	let entries: string[];
-	try {
-		entries = fs.readdirSync(scopeDir);
-	} catch {
-		return;
-	}
-	const stale: Array<{ link: string; real: string }> = [];
-	for (const entry of entries) {
-		const link = path.join(scopeDir, entry);
-		try {
-			if (!fs.lstatSync(link).isSymbolicLink()) continue;
-		} catch {
-			continue;
-		}
-		const real = realpath(link);
-		if (real && !real.startsWith(repoRootReal + path.sep)) stale.push({ link, real });
-	}
+	// Shared with the test preload's dependency probe so the doctor and an actual
+	// `bun test` run agree on what counts as a usable install.
+	const stale = findForeignWorkspaceLinks(repoRoot);
 	if (stale.length === 0) return;
 	console.error("✗ Workspace symlinks point outside this checkout (stale cross-worktree install):");
-	for (const { link, real } of stale) {
+	for (const { link, target } of stale) {
 		console.error(`    ${link}`);
-		console.error(`      -> ${real}`);
+		console.error(`      -> ${target}`);
 	}
 	console.error("  Fix: rm -rf node_modules/@gajae-code && bun install");
 	process.exit(1);
@@ -351,6 +337,16 @@ function assertSourceExists(): void {
 	console.error(`✗ Cannot find CLI source at ${cliSource}`);
 	console.error("  Run this from the gajae-code checkout.");
 	process.exit(1);
+}
+
+function worktreeCheck(): never {
+	// A checkout whose workspace links point into another worktree resolves, but
+	// against the wrong sources; report it like `--check` instead of a false green.
+	assertWorkspaceLinksLocal();
+	const report = inspectWorktree(repoRoot);
+	const write = report.ok ? console.log : console.error;
+	write(formatWorktreeReport(report));
+	process.exit(report.ok ? 0 : 1);
 }
 
 function check(): never {
@@ -443,6 +439,7 @@ function link(binary: boolean): never {
 }
 
 if (import.meta.main) {
-	if (process.argv.includes("--check")) check();
+	if (process.argv.includes("--worktree")) worktreeCheck();
+	else if (process.argv.includes("--check")) check();
 	else link(process.argv.includes("--binary"));
 }

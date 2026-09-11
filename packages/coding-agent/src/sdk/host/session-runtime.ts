@@ -58,7 +58,15 @@ import {
 } from "../model-profile-model";
 import { projectQ10Models } from "../models.js";
 import { PromptDeadlineManager, type PromptTerminalTransitionEvidence } from "../prompt-deadline-manager";
-import { formatPromptFailureForLocalLog, sanitizePromptFailure } from "../prompt-failure";
+import {
+	assistantFailureCode,
+	failedPromptOutcome,
+	formatPromptFailureForLocalLog,
+	PROMPT_FAILURE_MESSAGE_SUBMISSION,
+	type PromptFailureEvidence,
+	rephaseFailedOutcome,
+	sanitizePromptFailure,
+} from "../prompt-failure";
 import type { SdkPromptTerminalOutcome } from "../prompt-status";
 import { validateRequiredPromptText } from "../protocol/adapter-validation";
 import { OPERATIONS } from "../protocol/operation-registry";
@@ -599,24 +607,46 @@ const isPreservedProviderFailure = (code: string | undefined): boolean =>
  * classifier so a failed terminal can never be quarantined on reload.
  */
 function canonicalFailedOutcome(
-	failure?: { code?: unknown; message?: unknown },
+	failure?: { code?: unknown; message?: unknown; providerCode?: unknown },
 	provenance: "agent_failed" | "deadline" = "agent_failed",
+	evidence: PromptFailureEvidence = {},
+	providerCode?: string,
 ): InvocationOutcome {
 	const deadline = provenance === "deadline" || failure?.code === "prompt_deadline_exceeded";
-	return {
-		kind: "failed",
+	const known = typeof failure?.code === "string" ? failure.code : undefined;
+	const explicit = providerCode ?? (typeof failure?.providerCode === "string" ? failure.providerCode : undefined);
+	const built = failedPromptOutcome({
 		code: deadline ? "prompt_deadline_exceeded" : "prompt_failed",
-		message: deadline ? "Prompt deadline exceeded." : EMPTY_PROMPT_FAILURE.message,
 		provenance: deadline ? "deadline" : "agent_failed",
-	};
+		...(explicit !== undefined
+			? { providerCode: explicit }
+			: known !== undefined && known !== "prompt_failed" && known !== "prompt_deadline_exceeded"
+				? { providerCode: known }
+				: {}),
+		evidence,
+	});
+	return built;
 }
+
+/** Start/activity evidence for phase derivation from a reconciliation record. */
+const failureEvidence = (record: { startedAt?: number }, hasActivity?: boolean): PromptFailureEvidence => ({
+	...(record.startedAt !== undefined ? { startedAt: record.startedAt } : {}),
+	...(hasActivity === true ? { hasActivity: true } : {}),
+});
 
 function canonicalTerminalOutcome(
 	outcome: unknown,
-	failure?: { code?: unknown; message?: unknown },
+	failure?: { code?: unknown; message?: unknown; providerCode?: unknown },
+	evidence: PromptFailureEvidence = {},
 ): InvocationOutcome | undefined {
 	if (outcome && typeof outcome === "object") {
-		const candidate = outcome as { kind?: unknown; reason?: unknown; provenance?: unknown; code?: unknown };
+		const candidate = outcome as {
+			kind?: unknown;
+			reason?: unknown;
+			provenance?: unknown;
+			code?: unknown;
+			providerCode?: unknown;
+		};
 		if (candidate.kind === "stopped") {
 			if (candidate.reason === "cancelled" && candidate.provenance === "client_cancel")
 				return { kind: "stopped", reason: "cancelled", provenance: "client_cancel" };
@@ -628,9 +658,11 @@ function canonicalTerminalOutcome(
 			return canonicalFailedOutcome(
 				{ code: candidate.code, message: (outcome as { message?: unknown }).message },
 				candidate.provenance === "deadline" ? "deadline" : "agent_failed",
+				evidence,
+				typeof candidate.providerCode === "string" ? candidate.providerCode : undefined,
 			);
 	}
-	if (failure !== undefined) return canonicalFailedOutcome(failure);
+	if (failure !== undefined) return canonicalFailedOutcome(failure, "agent_failed", evidence);
 	return undefined;
 }
 interface InvocationRecord extends InvocationCorrelation {
@@ -1185,7 +1217,9 @@ export function createInvocationReconciliation(
 				delete (next as unknown as { pendingOutcome?: unknown }).pendingOutcome;
 				delete (next as unknown as { pendingReceiptState?: unknown }).pendingReceiptState;
 				next.content = reduceTurnResultContent(next.content, frame.content);
-				const incomingOutcome = canonicalTerminalOutcome(frame.outcome) ?? canonicalTerminalOutcome(pendingOutcome);
+				const incomingOutcome =
+					canonicalTerminalOutcome(frame.outcome, undefined, failureEvidence(next, frame.hasActivity)) ??
+					canonicalTerminalOutcome(pendingOutcome, undefined, failureEvidence(next, frame.hasActivity));
 				if (
 					incomingOutcome?.kind === "stopped" &&
 					(next.error === undefined || next.error.code === "prompt_deadline_exceeded")
@@ -1194,9 +1228,21 @@ export function createInvocationReconciliation(
 					if (next.error?.code === "prompt_deadline_exceeded") delete next.error;
 					next.status = "terminal_ok";
 				} else if (incomingOutcome?.kind === "failed") {
-					next.outcome = incomingOutcome;
+					// The provider diagnostic recorded before the boundary carries the
+					// bounded classifier; prefer it over a generic frame outcome that lost
+					// the provider code.
+					const recordErrorOutcome =
+						next.error !== undefined && next.error.code !== "prompt_deadline_exceeded"
+							? canonicalFailedOutcome(next.error, "agent_failed", failureEvidence(next))
+							: undefined;
+					const preferRecordError =
+						recordErrorOutcome?.kind === "failed" &&
+						recordErrorOutcome.providerCode !== undefined &&
+						incomingOutcome.providerCode === undefined;
+					next.outcome = preferRecordError ? recordErrorOutcome : incomingOutcome;
 					if (next.error === undefined)
 						next.error = { code: incomingOutcome.code, message: incomingOutcome.message };
+					else next.error = { code: next.error.code, message: incomingOutcome.message };
 					next.status = "failed";
 				} else if (next.error !== undefined) {
 					next.outcome = canonicalFailedOutcome(next.error);
@@ -1211,6 +1257,15 @@ export function createInvocationReconciliation(
 					next.error = EMPTY_PROMPT_FAILURE;
 					next.outcome = canonicalFailedOutcome(EMPTY_PROMPT_FAILURE);
 				} else next.status = "terminal_ok";
+				if (next.outcome !== undefined)
+					next.outcome = rephaseFailedOutcome(
+						next.outcome as SdkPromptTerminalOutcome,
+						failureEvidence(next, frame.hasActivity),
+					);
+				if ((next.outcome as SdkPromptTerminalOutcome | undefined)?.kind === "failed") {
+					const failed = next.outcome as Extract<SdkPromptTerminalOutcome, { kind: "failed" }>;
+					next.error = { code: next.error?.code ?? failed.code, message: failed.message };
+				}
 				next.receiptState = reduceReceiptState(
 					next.receiptState,
 					reportableTurnResultContent(next.content) ? "present" : "missing",
@@ -1272,11 +1327,12 @@ export function createInvocationReconciliation(
 		hydrate,
 		async claimPendingOutcome(kind, correlation, outcome) {
 			const record = records.get(key(kind, correlation));
-			const normalized = canonicalTerminalOutcome(outcome);
+			const normalized = canonicalTerminalOutcome(outcome, undefined, failureEvidence(record ?? {}));
 			if (normalized === undefined) throw new Error("Invalid terminal outcome.");
 			if (!record || record.terminalAt !== undefined || record.kind !== kind) return normalized;
 			const pending = (record as unknown as { pendingOutcome?: unknown }).pendingOutcome;
-			if (pending !== undefined) return canonicalTerminalOutcome(pending) ?? normalized;
+			if (pending !== undefined)
+				return canonicalTerminalOutcome(pending, undefined, failureEvidence(record)) ?? normalized;
 			const next = { ...record, revision: ++mutationRevision } as InvocationRecord & { pendingOutcome?: unknown };
 			next.pendingOutcome = normalized;
 			records.set(key(kind, correlation), next);
@@ -1320,14 +1376,22 @@ export function createInvocationReconciliation(
 			if (!record || record.terminalAt !== undefined || record.kind !== kind) return;
 			const requestedOutcome = canonicalTerminalOutcome(
 				outcome ?? (record as unknown as { pendingOutcome?: unknown }).pendingOutcome,
+				undefined,
+				failureEvidence(record, evidence?.hasActivity),
 			);
 			const priorFailure = record.error;
+			const requestedProviderCode = requestedOutcome?.kind === "failed" ? requestedOutcome.providerCode : undefined;
 			// A provider diagnostic recorded before a deadline finalization is stronger
 			// than the synthetic deadline claim. Preserve it as the terminal failure
 			// intent instead of allowing a later agent_end to look successful.
 			const finalOutcome =
 				priorFailure !== undefined && priorFailure.code !== "prompt_deadline_exceeded"
-					? canonicalFailedOutcome(priorFailure)
+					? canonicalFailedOutcome(
+							priorFailure,
+							"agent_failed",
+							failureEvidence(record, evidence?.hasActivity),
+							requestedProviderCode,
+						)
 					: requestedOutcome?.kind === "stopped"
 						? requestedOutcome
 						: priorFailure !== undefined &&
@@ -1335,12 +1399,22 @@ export function createInvocationReconciliation(
 									(requestedOutcome.kind === "failed" &&
 										(requestedOutcome.code === "prompt_deadline_exceeded" ||
 											priorFailure.code !== "prompt_deadline_exceeded")))
-							? canonicalFailedOutcome(priorFailure)
+							? canonicalFailedOutcome(
+									priorFailure,
+									"agent_failed",
+									failureEvidence(record, evidence?.hasActivity),
+									requestedProviderCode,
+								)
 							: requestedOutcome;
 			const previousRecord = { ...record };
 			const finalizedRecord: InvocationRecord = { ...record, revision: ++mutationRevision, terminalAt: Date.now() };
 			finalizedRecord.content = reduceTurnResultContent(finalizedRecord.content, evidence?.content);
 			let resolvedOutcome = finalOutcome;
+			if (resolvedOutcome !== undefined)
+				resolvedOutcome = rephaseFailedOutcome(
+					resolvedOutcome,
+					failureEvidence(record, evidence?.hasActivity),
+				) as InvocationOutcome;
 			if (resolvedOutcome?.kind === "stopped") {
 				// Stopped is a successful terminal boundary: it must never coexist with
 				// an earlier diagnostic failure.
@@ -1350,11 +1424,11 @@ export function createInvocationReconciliation(
 				finalizedRecord.status = "failed";
 				finalizedRecord.error =
 					recordError !== undefined
-						? { code: recordError.code, message: recordError.message }
+						? { code: recordError.code, message: resolvedOutcome.message }
 						: priorFailure !== undefined &&
 								(resolvedOutcome.code === "prompt_deadline_exceeded" ||
 									priorFailure.code !== "prompt_deadline_exceeded")
-							? priorFailure
+							? { code: priorFailure.code, message: resolvedOutcome.message }
 							: { code: resolvedOutcome.code, message: resolvedOutcome.message };
 			} else if (kind === "prompt") {
 				// Evidence-based empty predicate (exact-head review P1/P2): the same
@@ -1363,9 +1437,14 @@ export function createInvocationReconciliation(
 				// only a genuinely empty, no-activity completion fails closed.
 				const terminalText = evidence?.content?.text.trim() ?? "";
 				if (terminalText === "" && !evidence?.hasActivity && evidence?.outcomeKind !== "stopped") {
-					resolvedOutcome = canonicalFailedOutcome(EMPTY_PROMPT_FAILURE);
+					const emptyOutcome = canonicalFailedOutcome(
+						EMPTY_PROMPT_FAILURE,
+						"agent_failed",
+						failureEvidence(finalizedRecord, evidence?.hasActivity),
+					) as Extract<InvocationOutcome, { kind: "failed" }>;
+					resolvedOutcome = emptyOutcome;
 					finalizedRecord.status = "failed";
-					finalizedRecord.error = EMPTY_PROMPT_FAILURE;
+					finalizedRecord.error = { code: emptyOutcome.code, message: emptyOutcome.message };
 				} else finalizedRecord.status = "terminal_ok";
 			} else finalizedRecord.status = "terminal_ok";
 			finalizedRecord.receiptState = reduceReceiptState(
@@ -2127,7 +2206,9 @@ function rejectionRecoveryIntent(error: unknown): { code: string; message: strin
  * after retry/fallback policy has settled, so this is the safe boundary at which
  * to publish the additive failure diagnostic before terminal reconciliation.
  */
-function providerFailureFromAgentEnd(event: unknown): { code: string; message: string } | undefined {
+function providerFailureFromAgentEnd(
+	event: unknown,
+): { code: string; message: string; providerCode?: string } | undefined {
 	try {
 		if (!event || typeof event !== "object") return undefined;
 		const messages = (event as { messages?: unknown }).messages;
@@ -2143,7 +2224,8 @@ function providerFailureFromAgentEnd(event: unknown): { code: string; message: s
 			errorMessage?: unknown;
 			errorKind?: unknown;
 			errorStatus?: unknown;
-			transportFailure?: { status?: unknown };
+			errorCode?: unknown;
+			transportFailure?: { status?: unknown; providerCode?: unknown };
 		};
 		let stopReason: unknown;
 		try {
@@ -2189,10 +2271,24 @@ function providerFailureFromAgentEnd(event: unknown): { code: string; message: s
 				// A throwing transport metadata accessor is also statusless.
 			}
 		}
+		const providerCode = assistantFailureCode(assistant);
 		if (status === 402 || status === 429)
-			return { code: `provider_http_${status}`, message: "Prompt submission failed." };
-		if (status !== undefined) return { code: "provider_rejected", message: "Prompt submission failed." };
-		return { code: "provider_rejected", message: "Prompt submission failed." };
+			return {
+				code: `provider_http_${status}`,
+				message: PROMPT_FAILURE_MESSAGE_SUBMISSION,
+				...(providerCode !== undefined ? { providerCode } : {}),
+			};
+		if (status !== undefined)
+			return {
+				code: "provider_rejected",
+				message: PROMPT_FAILURE_MESSAGE_SUBMISSION,
+				...(providerCode !== undefined ? { providerCode } : {}),
+			};
+		return {
+			code: "provider_rejected",
+			message: PROMPT_FAILURE_MESSAGE_SUBMISSION,
+			...(providerCode !== undefined ? { providerCode } : {}),
+		};
 	} catch {
 		// Provider metadata is untrusted: an SDK/provider adapter may expose a
 		// throwing getter while the lifecycle boundary still needs to terminalize.

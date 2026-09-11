@@ -5,7 +5,12 @@ import { createHash, randomUUID } from "node:crypto";
  * Preserves Q26 admit/first-terminal/capacity semantics; indexes and caps are per-kind.
  */
 
-import { sanitizePromptFailure } from "../prompt-failure";
+import {
+	failedPromptOutcome,
+	type PromptFailureEvidence,
+	rephaseFailedOutcome,
+	sanitizePromptFailure,
+} from "../prompt-failure";
 import type {
 	PromptReconciliationStatus,
 	SdkPromptFailureCode,
@@ -55,7 +60,10 @@ const STOP_REASONS: readonly SdkPromptStopReason[] = [
 ];
 const FAILURE_CODES: readonly SdkPromptFailureCode[] = ["prompt_failed", "prompt_deadline_exceeded"];
 
-const normalizeTerminalOutcome = (outcome: unknown): SdkPromptTerminalOutcome | undefined => {
+const normalizeTerminalOutcome = (
+	outcome: unknown,
+	evidence: PromptFailureEvidence = {},
+): SdkPromptTerminalOutcome | undefined => {
 	if (outcome === null || typeof outcome !== "object") return undefined;
 	const candidate = outcome as Record<string, unknown>;
 	if (
@@ -73,22 +81,37 @@ const normalizeTerminalOutcome = (outcome: unknown): SdkPromptTerminalOutcome | 
 		FAILURE_CODES.includes(candidate.code as SdkPromptFailureCode) &&
 		typeof candidate.message === "string" &&
 		["agent_failed", "deadline"].includes(candidate.provenance as string)
-	)
-		return {
-			kind: "failed",
+	) {
+		return failedPromptOutcome({
 			code: candidate.code as SdkPromptFailureCode,
-			message:
-				candidate.code === "prompt_deadline_exceeded" ? "Prompt deadline exceeded." : "Prompt submission failed.",
 			provenance: candidate.provenance as "agent_failed" | "deadline",
-		};
+			...(typeof candidate.providerCode === "string" ? { providerCode: candidate.providerCode } : {}),
+			evidence,
+		});
+	}
 	return undefined;
 };
 
-const failedOutcomeForError = (error: { code: string; message: string }): SdkPromptTerminalOutcome => ({
-	kind: "failed",
-	code: "prompt_failed",
-	message: error.message,
-	provenance: "agent_failed",
+const failedOutcomeForError = (
+	error: { code: string; message: string },
+	evidence: PromptFailureEvidence = {},
+	providerCodeOverride?: string,
+): SdkPromptTerminalOutcome =>
+	failedPromptOutcome({
+		code: "prompt_failed",
+		provenance: "agent_failed",
+		...(providerCodeOverride !== undefined
+			? { providerCode: providerCodeOverride }
+			: error.code !== "prompt_failed"
+				? { providerCode: error.code }
+				: {}),
+		evidence,
+	});
+
+/** Start/activity evidence for phase derivation from a reconciliation record. */
+const failureEvidence = (record: { startedAt?: number }, hasActivity?: boolean): PromptFailureEvidence => ({
+	...(record.startedAt !== undefined ? { startedAt: record.startedAt } : {}),
+	...(hasActivity === true ? { hasActivity: true } : {}),
 });
 
 const isDeadlineOutcome = (outcome: SdkPromptTerminalOutcome | undefined): boolean =>
@@ -440,7 +463,10 @@ export function createKindAwareReconciliation(
 						record.receiptState,
 						reportableTurnResultContent(content) ? "present" : undefined,
 					);
-					const incomingOutcome = normalizeTerminalOutcome(frame.outcome);
+					const incomingOutcome = normalizeTerminalOutcome(
+						frame.outcome,
+						failureEvidence(record, frame.hasActivity),
+					);
 					const providerErrorRecord = record.error;
 					const providerError =
 						providerErrorRecord !== undefined && providerErrorRecord.code !== "prompt_deadline_exceeded";
@@ -460,7 +486,7 @@ export function createKindAwareReconciliation(
 								? providerErrorRecord
 								: { code: providerOutcome.code, message: providerOutcome.message };
 						} else if (providerError) {
-							outcome = failedOutcomeForError(providerErrorRecord);
+							outcome = failedOutcomeForError(providerErrorRecord, failureEvidence(record, frame.hasActivity));
 							error = providerErrorRecord;
 						} else if (
 							incomingOutcome?.kind === "stopped" ||
@@ -479,7 +505,7 @@ export function createKindAwareReconciliation(
 								? providerErrorRecord
 								: { code: providerOutcome.code, message: providerOutcome.message };
 						} else if (record.status === "failed" && providerError) {
-							outcome = failedOutcomeForError(providerErrorRecord);
+							outcome = failedOutcomeForError(providerErrorRecord, failureEvidence(record, frame.hasActivity));
 							error = providerErrorRecord;
 						} else if (
 							record.status === "terminal_ok" &&
@@ -523,7 +549,7 @@ export function createKindAwareReconciliation(
 					const failure = sanitizePromptFailure(frame.error);
 					if (record.error?.code === "prompt_deadline_exceeded") {
 						record.error = failure;
-						record.outcome = failedOutcomeForError(failure);
+						record.outcome = failedOutcomeForError(failure, failureEvidence(record, frame.hasActivity));
 						record.status = "failed";
 						return { value: undefined, changed: true };
 					}
@@ -557,7 +583,10 @@ export function createKindAwareReconciliation(
 				return { value: undefined, changed: true };
 			}
 			const pendingOutcome = record.pendingOutcome;
-			const frameOutcome = normalizeTerminalOutcome(frame.type === "agent_end" ? frame.outcome : undefined);
+			const frameOutcome = normalizeTerminalOutcome(
+				frame.type === "agent_end" ? frame.outcome : undefined,
+				failureEvidence(record, frame.hasActivity),
+			);
 			delete record.deadlineRecoveryPending;
 			delete record.deadlineMaxAt;
 			record.terminalAt = now();
@@ -572,7 +601,7 @@ export function createKindAwareReconciliation(
 				if (frameOutcome?.kind === "failed" && frameOutcome.provenance === "agent_failed")
 					terminalOutcome = frameOutcome;
 				else if (providerError && (pendingOutcome.kind !== "failed" || isDeadlineOutcome(pendingOutcome)))
-					terminalOutcome = failedOutcomeForError(providerErrorRecord);
+					terminalOutcome = failedOutcomeForError(providerErrorRecord, failureEvidence(record, frame.hasActivity));
 				else if (isDeadlineOutcome(pendingOutcome) && frameOutcome?.kind === "stopped")
 					terminalOutcome = frameOutcome;
 				record.outcome = terminalOutcome;
@@ -598,7 +627,7 @@ export function createKindAwareReconciliation(
 					? frameOutcome
 					: providerError &&
 							(frameOutcome === undefined || isDeadlineOutcome(frameOutcome) || frameOutcome.kind === "stopped")
-						? failedOutcomeForError(providerErrorRecord)
+						? failedOutcomeForError(providerErrorRecord, failureEvidence(record, frame.hasActivity))
 						: frameOutcome;
 				if (terminalOutcome !== undefined) {
 					record.outcome = terminalOutcome;
@@ -618,10 +647,10 @@ export function createKindAwareReconciliation(
 				) {
 					record.status = "failed";
 					record.error = EMPTY_PROMPT_FAILURE;
-					record.outcome = failedOutcomeForError(EMPTY_PROMPT_FAILURE);
+					record.outcome = failedOutcomeForError(EMPTY_PROMPT_FAILURE, failureEvidence(record, frame.hasActivity));
 				} else if (record.error !== undefined) {
 					record.status = "failed";
-					record.outcome = failedOutcomeForError(record.error);
+					record.outcome = failedOutcomeForError(record.error, failureEvidence(record, frame.hasActivity));
 				} else record.status = "terminal_ok";
 				record.receiptState = reduceReceiptState(
 					record.receiptState,
@@ -645,9 +674,10 @@ export function createKindAwareReconciliation(
 			if (!record || record.terminalAt !== undefined || record.kind !== kind)
 				return { value: normalized, changed: false };
 			if (record.pendingOutcome !== undefined) return { value: record.pendingOutcome, changed: false };
-			record.pendingOutcome = normalized;
+			const decorated = rephaseFailedOutcome(normalized, failureEvidence(record));
+			record.pendingOutcome = decorated;
 			record.pendingReceiptState = receiptState;
-			return { value: normalized, changed: true };
+			return { value: decorated, changed: true };
 		});
 
 	const finalizeOutcome = async (
@@ -673,25 +703,28 @@ export function createKindAwareReconciliation(
 			const record = candidate.get(keyOf(kind, correlation));
 			if (!record || record.terminalAt !== undefined || record.kind !== kind)
 				return { value: undefined, changed: false };
-			const requestedOutcome = normalizeTerminalOutcome(outcome) ?? record.pendingOutcome;
+			const requestedOutcome = normalizeTerminalOutcome(outcome, failureEvidence(record)) ?? record.pendingOutcome;
 			const providerErrorRecord = record.error;
 			const providerError =
 				providerErrorRecord !== undefined && providerErrorRecord.code !== "prompt_deadline_exceeded";
+			const requestedProviderCode = requestedOutcome?.kind === "failed" ? requestedOutcome.providerCode : undefined;
 			const finalOutcome = providerError
-				? failedOutcomeForError(providerErrorRecord)
+				? failedOutcomeForError(providerErrorRecord, failureEvidence(record), requestedProviderCode)
 				: requestedOutcome?.kind === "stopped"
 					? requestedOutcome
 					: providerError &&
 							(requestedOutcome === undefined ||
 								(requestedOutcome.kind === "failed" && isDeadlineOutcome(requestedOutcome)))
-						? failedOutcomeForError(providerErrorRecord)
+						? failedOutcomeForError(providerErrorRecord, failureEvidence(record), requestedProviderCode)
 						: requestedOutcome;
 			record.terminalAt = now();
 			if (finalOutcome?.kind === "failed") {
 				record.status = "failed";
 				if (recordError !== undefined && !(providerError && recordError.code === "prompt_deadline_exceeded"))
-					record.error = recordError;
-				else if (!providerError) record.error = { code: finalOutcome.code, message: finalOutcome.message };
+					record.error = { code: recordError.code, message: finalOutcome.message };
+				else if (providerError && providerErrorRecord !== undefined)
+					record.error = { code: providerErrorRecord.code, message: finalOutcome.message };
+				else record.error = { code: finalOutcome.code, message: finalOutcome.message };
 			} else if (
 				kind === "prompt" &&
 				((finalOutcome === undefined && !sanitizedContent?.text.trim()) ||
@@ -699,7 +732,7 @@ export function createKindAwareReconciliation(
 			) {
 				record.status = "failed";
 				record.error = EMPTY_PROMPT_FAILURE;
-				record.outcome = failedOutcomeForError(EMPTY_PROMPT_FAILURE);
+				record.outcome = failedOutcomeForError(EMPTY_PROMPT_FAILURE, failureEvidence(record));
 			} else if (finalOutcome?.kind === "stopped") {
 				// A stopped terminal is authoritative only when no provider failure
 				// was recorded before finalization.
@@ -837,16 +870,23 @@ export function createKindAwareReconciliation(
 				loaded.map(record => {
 					const safeOutcome = (
 						outcome: SdkPromptTerminalOutcome | undefined,
-					): SdkPromptTerminalOutcome | undefined =>
-						outcome?.kind === "failed"
-							? {
-									...outcome,
-									message:
-										outcome.code === "prompt_deadline_exceeded"
-											? "Prompt deadline exceeded."
-											: "Prompt submission failed.",
-								}
-							: outcome;
+					): SdkPromptTerminalOutcome | undefined => {
+						if (outcome?.kind !== "failed") return outcome;
+						const rephased = rephaseFailedOutcome(
+							outcome,
+							record.startedAt !== undefined ? { startedAt: record.startedAt } : {},
+						);
+						// Legacy durable rows carry a generic message and no phase/category;
+						// rewriting them to the current contract is a durable-state sanitization.
+						if (
+							rephased.kind === "failed" &&
+							(outcome.phase !== rephased.phase ||
+								outcome.category !== rephased.category ||
+								outcome.message !== rephased.message)
+						)
+							sanitizedDurableRecord = true;
+						return rephased;
+					};
 					let hydrated: DurableReconciliationRecord;
 					if (record.kind === "steer") {
 						const safeError = record.error === undefined ? undefined : sanitizePromptFailure(record.error);

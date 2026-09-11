@@ -188,4 +188,5 @@ Normal package/runtime diagnostics include:
 
 - reinstall hint (`bun install @gajae-code/natives`),
 - local rebuild command (`bun --cwd=packages/natives run build`),
+- worktree-safe setup hint when the loader runs from a workspace checkout (`bun run setup:worktree`),
 - optional x64 variant build hint (`TARGET_VARIANT=baseline|modern bun --cwd=packages/natives run build`).
