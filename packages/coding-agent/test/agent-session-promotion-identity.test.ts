@@ -730,4 +730,32 @@ describe("queued promotion run identity (#4668)", () => {
 		gate.resolve();
 		await prompt;
 	});
+
+	it("settles a queued follow-up removed by successor startup failure", async () => {
+		session = buildSession([{ content: ["first answer"] }], {
+			name: "echo",
+			label: "Echo",
+			description: "Echo tool",
+			parameters: echoSchema,
+			async execute(_toolCallId, params) {
+				return { content: [{ type: "text", text: `echoed: ${params.value}` }] };
+			},
+		});
+		await session.prompt("first task");
+		const submission = await session.submitUserMessage("startup failure", {
+			deliverAs: "followUp",
+			trackSubmission: true,
+		});
+		session.agent.setModel(undefined);
+		await expect(submission.execution).resolves.toMatchObject({
+			submissionId: submission.submissionId,
+			disposition: "removed",
+			reason: "removed",
+		});
+		await expect(submission.terminal).resolves.toMatchObject({
+			submissionId: submission.submissionId,
+			disposition: "removed",
+			reason: "removed",
+		});
+	});
 });

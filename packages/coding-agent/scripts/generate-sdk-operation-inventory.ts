@@ -813,10 +813,17 @@ export function scanAgentSessionMethods(sourceText: string): string[] {
 			throw new Error("SDK operation inventory scanner: AgentSession class body is unbalanced.");
 
 		const methods: string[] = [];
+		const seenMethods = new Set<string>();
 		for (let memberStart = bodyStart + 1; memberStart < bodyEnd; ) {
 			const declaration = scanMethodDeclaration(tokens, memberStart, bodyEnd);
 			if (declaration) {
-				if (declaration.name) methods.push(`agent_session:${declaration.name}`);
+				if (declaration.name) {
+					const sourceId = `agent_session:${declaration.name}`;
+					if (!seenMethods.has(sourceId)) {
+						seenMethods.add(sourceId);
+						methods.push(sourceId);
+					}
+				}
 				memberStart = Math.max(memberStart + 1, declaration.end);
 				continue;
 			}
