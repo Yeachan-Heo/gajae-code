@@ -43,8 +43,8 @@ export type FileLockAcquireReason = "acquire_timeout" | "orphan_transition";
  * generation); this records the cause that exhaustion must report.
  */
 export interface FileLockStaleRemovalFailure {
-	/** Guarded-removal outcome, or `"error"` when the removal attempt threw. */
-	outcome: Exclude<FileLockGcRemoval, "removed"> | "error";
+	/** Guarded-removal outcome the acquire path can record, or `"error"` when the removal attempt threw. */
+	outcome: "cleanup_failed" | "error";
 	/** Transient native/errno code carried by the refusal, when one was present. */
 	code?: string;
 	/** Human-readable cause surfaced to the operator at exhaustion. */
