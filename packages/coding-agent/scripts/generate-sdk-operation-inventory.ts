@@ -209,6 +209,12 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 		"internal session-scoped profile lifecycle plumbing behind the reviewed model.set seam, not an independent public SDK operation",
 	"agent_session:getProfileInstalledOverrideKeys":
 		"internal session-scoped profile lifecycle accessor behind the reviewed model.set seam, not an independent public SDK operation",
+	"agent_session:getActiveModelProfileScope":
+		"internal session-scoped profile lifecycle accessor behind the reviewed model.set seam, not an independent public SDK operation",
+	"agent_session:getProfileInstalledOverrideState":
+		"internal session-scoped profile lifecycle accessor behind the reviewed model.set seam, not an independent public SDK operation",
+	"agent_session:restoreProfileInstalledOverrideState":
+		"internal session-scoped profile lifecycle plumbing behind the reviewed model.set seam, not an independent public SDK operation",
 	"agent_session:getSessionDefaultModelSelector": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:recordResumeDefaultModel": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:resolveConfiguredDefaultModel": "internal accessor/plumbing, not a user-facing control seam",

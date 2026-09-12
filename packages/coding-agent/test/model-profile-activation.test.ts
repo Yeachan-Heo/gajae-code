@@ -19,6 +19,7 @@ import {
 import type { ModelProfileDefinition } from "../src/config/model-profiles";
 import { BUILTIN_MODEL_PROFILES, mergeModelProfiles } from "../src/config/model-profiles";
 import { kNoAuth, ModelRegistry } from "../src/config/model-registry";
+import type { ModelSelectorValue } from "../src/config/model-selector-value";
 import { Settings } from "../src/config/settings";
 import { AgentSession, type DefaultFallbackRuntimeState } from "../src/session/agent-session";
 import { AuthStorage } from "../src/session/auth-storage";
@@ -149,6 +150,11 @@ function fakeRegistry(options?: { missingProviders?: string[]; profiles?: ModelP
 function fakeSession(initial = model("provider-a", "initial")) {
 	let activeModelProfile: string | undefined;
 	let activeModelProfileScope: "session" | "durable" | undefined;
+	let profileInstalledOverrideState = {
+		modelRoles: {} as Record<string, ModelSelectorValue | undefined>,
+		agentModelOverrides: {} as Record<string, ModelSelectorValue | undefined>,
+		preProfileModel: initial as Model | undefined,
+	};
 	return {
 		model: initial as Model | undefined,
 		thinkingLevel: ThinkingLevel.Low as ThinkingLevel | undefined,
@@ -207,6 +213,46 @@ function fakeSession(initial = model("provider-a", "initial")) {
 		},
 		getActiveModelProfileScope() {
 			return activeModelProfileScope;
+		},
+		noteProfileInstalledOverrides(
+			modelRoles: readonly string[],
+			agentModelOverrides: readonly string[],
+			preProfileModel: Model | undefined,
+			previousModelRoles?: Readonly<Record<string, ModelSelectorValue>>,
+			previousAgentModelOverrides?: Readonly<Record<string, ModelSelectorValue>>,
+		) {
+			profileInstalledOverrideState = {
+				modelRoles: Object.fromEntries(modelRoles.map(role => [role, previousModelRoles?.[role]])),
+				agentModelOverrides: Object.fromEntries(
+					agentModelOverrides.map(role => [role, previousAgentModelOverrides?.[role]]),
+				),
+				preProfileModel,
+			};
+		},
+		clearProfileInstalledOverrides() {
+			profileInstalledOverrideState = {
+				modelRoles: {},
+				agentModelOverrides: {},
+				preProfileModel: undefined,
+			};
+		},
+		getProfileInstalledOverrideState() {
+			return {
+				modelRoles: { ...profileInstalledOverrideState.modelRoles },
+				agentModelOverrides: { ...profileInstalledOverrideState.agentModelOverrides },
+				preProfileModel: profileInstalledOverrideState.preProfileModel,
+			};
+		},
+		restoreProfileInstalledOverrideState(state: {
+			modelRoles: Readonly<Record<string, ModelSelectorValue | undefined>>;
+			agentModelOverrides: Readonly<Record<string, ModelSelectorValue | undefined>>;
+			preProfileModel: Model | undefined;
+		}) {
+			profileInstalledOverrideState = {
+				modelRoles: { ...state.modelRoles },
+				agentModelOverrides: { ...state.agentModelOverrides },
+				preProfileModel: state.preProfileModel,
+			};
 		},
 	};
 }
@@ -2529,6 +2575,7 @@ describe("preset-equivalent profile activation", () => {
 		// A prior explicit selection made provider-a sticky for the session.
 		sticky.set(session.sessionId, "provider-a/opus-real");
 		session.setActiveModelProfile("preset-profile", "session");
+		session.noteProfileInstalledOverrides(["reviewer"], [], session.model, { reviewer: "provider/durable" });
 
 		const snapshot = await materializeModelProfileForDeletion({
 			session: sessionWithFallback,
@@ -2546,6 +2593,9 @@ describe("preset-equivalent profile activation", () => {
 		expect(restoreDefaultFallbackRuntimeState).toHaveBeenCalledWith(fallbackRuntimeState);
 		expect(session.getActiveModelProfile()).toBe("preset-profile");
 		expect(session.getActiveModelProfileScope()).toBe("session");
+		expect(session.getProfileInstalledOverrideState()).toMatchObject({
+			modelRoles: { reviewer: "provider/durable" },
+		});
 	});
 
 	test("successful activation leaves the new model sticky", async () => {
