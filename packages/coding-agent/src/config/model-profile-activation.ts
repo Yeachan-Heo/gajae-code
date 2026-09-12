@@ -698,7 +698,7 @@ async function preflightModelProfileBindings(options: {
 	if (proxyMode === "always" && proxyProvider === undefined)
 		throw new Error('modelProfile.proxyMode "always" requires modelProfile.proxyProvider');
 	const configuredProviderIds = options.modelRegistry.getConfiguredProviderIds?.();
-	if (proxyProvider !== undefined && configuredProviderIds && !configuredProviderIds.includes(proxyProvider)) {
+	if (proxyProvider !== undefined && (!configuredProviderIds || !configuredProviderIds.includes(proxyProvider))) {
 		throw new Error(
 			`modelProfile.proxyProvider "${proxyProvider}" is not configured. Configure it with \`gjc setup provider\` before activating a preset.`,
 		);
@@ -1432,10 +1432,6 @@ export async function applyPreparedModelProfileActivation(
 			prepared.settings.set("modelProfile.default", prepared.profileName);
 			await prepared.settings.flushOrThrow();
 		}
-		prepared.session.setActiveModelProfile?.(
-			prepared.profileName,
-			options.profileScope ?? (options.persistDefault ? "durable" : "session"),
-		);
 		if (prepared.defaultModel) {
 			prepared.modelRegistry.seedCanonicalVariant?.(prepared.session.sessionId, prepared.defaultModel);
 			resumeDefaultChanged = true;
@@ -1447,6 +1443,10 @@ export async function applyPreparedModelProfileActivation(
 			prepared.previousModel,
 			prepared.baseModelRoles,
 			prepared.baseAgentModelOverrides,
+		);
+		prepared.session.setActiveModelProfile?.(
+			prepared.profileName,
+			options.profileScope ?? (options.persistDefault ? "durable" : "session"),
 		);
 		if (fallbackResolutionSeeded) {
 			prepared.session.seedDefaultFallbackResolution?.(

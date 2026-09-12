@@ -16076,7 +16076,7 @@ export class AgentSession {
 			: undefined;
 	}
 
-	/** Resolver intent only for default assignments owned by an active or runtime-recovered durable profile. */
+	/** Resolver intent only for assignments owned by an active or runtime-recovered profile. */
 	#persistedModelProfileAliasIntent(role: string): { aliasIntent: "preset-equivalent" } | undefined {
 		const runtimeDefaultIdentity = this.#defaultFallbackController?.chain;
 		const profileDefinitions = this.#modelRegistry.getModelProfiles?.() ?? new Map<string, unknown>();
@@ -16085,7 +16085,7 @@ export class AgentSession {
 			? resolveModelProfileName(configuredProfile, profileDefinitions)
 			: undefined;
 		const candidateProfileName =
-			(this.#activeModelProfileScope === "durable" ? this.#activeModelProfile : undefined) ??
+			this.#activeModelProfile ??
 			(role === "default" &&
 			runtimeDefaultIdentity?.origin === "runtime" &&
 			runtimeDefaultIdentity.identity === configuredProfileIdentity
@@ -16187,7 +16187,7 @@ export class AgentSession {
 		previousAgentModelOverrides?: Readonly<Record<string, ModelSelectorValue>>,
 	): void {
 		const bindings = this.#modelRegistry.getConfiguredModelBindings?.();
-		this.#preProfileModel = preProfileModel;
+		if (this.#activeModelProfileScope !== "session") this.#preProfileModel = preProfileModel;
 		const currentModelRoles = new Set(modelRoles);
 		const currentAgentModelOverrides = new Set(agentModelOverrides);
 		for (const role of this.#activeProfileInstalledRoles.keys()) {
