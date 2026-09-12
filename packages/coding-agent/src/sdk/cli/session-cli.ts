@@ -2084,6 +2084,9 @@ function rawKind(action: string, args: SdkSessionCliArgs): SdkSessionCliRawKind 
 export async function runSdkSessionCli(
 	args: SdkSessionCliArgs,
 	writeOutput: (value: unknown) => void = writeJson,
+	setExitCode: (exitCode: 1 | 2) => void = exitCode => {
+		process.exitCode = exitCode;
+	},
 ): Promise<void> {
 	try {
 		const action = args.action;

@@ -531,9 +531,15 @@ export async function runDaemonCli(
 	let output: unknown;
 	let exitCode: number | undefined;
 	try {
-		await runSdkSessionCli(args, value => {
-			output = value;
-		});
+		await runSdkSessionCli(
+			args,
+			value => {
+				output = value;
+			},
+			code => {
+				exitCode = code;
+			},
+		);
 	} catch (error) {
 		expect(error).toBeInstanceOf(PublicCommandFailure);
 		if (!(error instanceof PublicCommandFailure)) throw error;
@@ -614,7 +620,8 @@ export async function assertDaemonCliRow(operation: Operation, secret: boolean):
 			} else {
 				if (action === "global") expectGlobalSemanticResult(operation, result.output);
 				else expectSemanticResult(operation, result.output);
-				expect(result.exitCode).toBeUndefined();
+				if (action === "global" && operation.sdkId === "session.lookup") expect(result.exitCode).toBe(1);
+				else expect(result.exitCode).toBeUndefined();
 			}
 		} else expect(result.output).toMatchObject({ ok: false, error: expect.any(Object) });
 		expectObservation(host, before, operation, expected);

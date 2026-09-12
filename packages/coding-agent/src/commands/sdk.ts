@@ -3,7 +3,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { logger } from "@gajae-code/utils";
-import { CliParseError, Command } from "@gajae-code/utils/cli";
+import { Args, CliParseError, Command, Flags } from "@gajae-code/utils/cli";
 import type { Args as ParsedArgs } from "../cli/args";
 import { isSafeSdkInternalAgentDir, scanPublicCommand } from "../cli/public-command-entry";
 import { PublicCommandFailure } from "../cli/public-command-errors";
@@ -31,7 +31,7 @@ import {
 import { processIncarnation } from "../sdk/broker/process-incarnation";
 import { writeBrokerStartupFailureMarker } from "../sdk/broker/startup-failure";
 import { renderSdkSearchTable, runSdkSearch, runSdkSessionCli } from "../sdk/cli";
-import { renderSpawnTable, runSdkSpawn } from "../sdk/cli/master-cli";
+import { renderSpawnTable, runSdkSpawn, SdkMasterCliError } from "../sdk/cli/master-cli";
 import { runSdkGuidesCli } from "../sdk/guides/cli";
 import { type CreateLifecycleAgentSessionResult, createLifecycleAgentSession } from "../sdk/lifecycle-session";
 import { listManagedSessionCandidates, resolveManagedSessionScope } from "../sdk/session-directory";
@@ -1123,6 +1123,8 @@ export default class Sdk extends Command {
 					strict: Boolean(flags.strict),
 					untilIdle: Boolean(flags["until-idle"]),
 					allEvents: Boolean(flags["all-events"]),
+					page: Boolean(flags.page),
+					limit: flags.limit as number | undefined,
 					agentDir: stringFlag("agent-dir"),
 					repo: stringFlag("repo"),
 					scope: stringFlag("scope"),
