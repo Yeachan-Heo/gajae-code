@@ -1198,13 +1198,28 @@ type InternalCustomMessageOptions = Pick<
 };
 
 function assertTrackedSendUserMessageOptions(options: unknown): asserts options is TrackedSendUserMessageOptions {
-	const candidate =
-		options !== null && typeof options === "object" ? (options as Partial<TrackedSendUserMessageOptions>) : undefined;
-	if (candidate?.trackSubmission !== true || (candidate.deliverAs !== "steer" && candidate.deliverAs !== "followUp")) {
+	const candidate = options !== null && typeof options === "object" ? (options as Record<string, unknown>) : undefined;
+	const queuePolicy = candidate?.queuePolicy;
+	if (
+		candidate?.trackSubmission !== true ||
+		(candidate.deliverAs !== "steer" && candidate.deliverAs !== "followUp") ||
+		(queuePolicy !== undefined && queuePolicy !== "respect-mode" && queuePolicy !== "sequential")
+	) {
 		throw Object.assign(
-			new Error("submitUserMessage requires trackSubmission: true and deliverAs: steer or followUp."),
+			new Error(
+				"submitUserMessage requires trackSubmission: true, deliverAs: steer or followUp, and a valid queuePolicy.",
+			),
 			{ code: "invalid_input" },
 		);
+	}
+}
+
+function assertLegacySendUserMessageOptions(options: unknown): void {
+	const candidate = options !== null && typeof options === "object" ? (options as Record<string, unknown>) : undefined;
+	if (candidate?.trackSubmission !== undefined) {
+		throw Object.assign(new Error("sendUserMessage does not support trackSubmission; use submitUserMessage."), {
+			code: "invalid_input",
+		});
 	}
 }
 
@@ -3063,14 +3078,22 @@ export class AgentSession {
 			]),
 		];
 	}
+	/** Terminalize every tracked submission before the predecessor runtime loses its event bridge. */
+	#settleTrackedQueuedInputsForSessionTransition(): void {
+		for (const state of [...this.#trackedQueuedInputs.values()]) {
+			this.#settleTrackedQueuedInputRemoved(state, "removed");
+		}
+	}
 	/** Drop queued SDK work when the session identity is replaced. The old
 	 * promotion hooks belong to the predecessor runtime; retaining the message
 	 * would let it execute later under the successor without an owner. */
 	#terminalizeQueuedSdkWorkForSessionTransition(messages: readonly AgentMessage[]): void {
-		if (messages.length === 0) return;
-		this.#fireQueuedRemovalHooks(messages);
-		for (const message of messages) this.#sdkRunTokensByQueuedMessage.delete(message);
-		this.#deferredSdkFollowUps = this.#deferredSdkFollowUps.filter(message => !messages.includes(message));
+		if (messages.length > 0) {
+			this.#fireQueuedRemovalHooks(messages);
+			for (const message of messages) this.#sdkRunTokensByQueuedMessage.delete(message);
+			this.#deferredSdkFollowUps = this.#deferredSdkFollowUps.filter(message => !messages.includes(message));
+		}
+		this.#settleTrackedQueuedInputsForSessionTransition();
 	}
 	#resetActiveSdkRunOwnership(): void {
 		this.#activeSdkRunToken = undefined;
@@ -9434,6 +9457,10 @@ export class AgentSession {
 			this.#disposeDeadlineTimer.unref?.();
 			this.#abortAdmissionEpoch++;
 			this.#isDisposed = true;
+			// Dispose disconnects the Agent event bridge before bounded abort cleanup;
+			// settle every accepted SDK handle now so consumed submissions cannot wait
+			// forever for an agent_end that teardown deliberately suppresses.
+			this.#terminalizeQueuedSdkWorkForSessionTransition(this.#queuedMessagesForSessionTransition());
 			// Invalidate every coordinator event admitted before disposal. Handlers may
 			// still unwind, but their captured generation can no longer enqueue a write.
 			this.#coordinatorPersistGeneration += 1;
@@ -14249,6 +14276,7 @@ export class AgentSession {
 		content: string | (TextContent | ImageContent)[],
 		options?: SendUserMessageOptions,
 	): Promise<void> {
+		assertLegacySendUserMessageOptions(options);
 		await this.#sendUserMessage(content, options);
 	}
 
@@ -24218,6 +24246,14 @@ export class AgentSession {
 						}
 					}
 					transitionCleanupCommitted = true;
+					// The successor identity is committed. Settle consumed tracked inputs
+					// before reconnecting the successor or running session-switch hooks,
+					// either of which can outlive the predecessor event bridge.
+					this.#terminalizeQueuedSdkWorkForSessionTransition([
+						...previousAgentSteeringQueue,
+						...previousAgentFollowUpQueue,
+						...previousDeferredSdkFollowUps,
+					]);
 					// Different files may intentionally carry the same copied session id; pathname transition is the commit signal.
 					ownerShutdownTransitionCommitted = true;
 					if (ownerShutdownSettled) {

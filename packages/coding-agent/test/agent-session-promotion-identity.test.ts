@@ -67,6 +67,50 @@ describe("queued promotion run identity (#4668)", () => {
 		return new AgentSession({ agent, sessionManager: SessionManager.inMemory(), settings, modelRegistry });
 	}
 
+	function buildAbortableTrackedTransitionFixture() {
+		const firstGate = Promise.withResolvers<void>();
+		const secondGate = Promise.withResolvers<void>();
+		const firstToolStarted = Promise.withResolvers<void>();
+		const secondToolStarted = Promise.withResolvers<void>();
+		let toolCallCount = 0;
+		const transitionTool: AgentTool<typeof echoSchema, EchoParams> = {
+			name: "echo",
+			label: "Echo",
+			description: "Echo tool",
+			parameters: echoSchema,
+			async execute(_toolCallId, _params, signal) {
+				toolCallCount += 1;
+				if (toolCallCount === 1) {
+					firstToolStarted.resolve();
+					await firstGate.promise;
+				} else {
+					secondToolStarted.resolve();
+					const aborted = Promise.withResolvers<void>();
+					const onAbort = () => aborted.resolve();
+					if (signal?.aborted) aborted.resolve();
+					else signal?.addEventListener("abort", onAbort, { once: true });
+					await Promise.race([secondGate.promise, aborted.promise]);
+					signal?.removeEventListener("abort", onAbort);
+				}
+				return { content: [{ type: "text", text: "done" }] };
+			},
+		};
+		return {
+			session: buildSession(
+				[
+					{ content: [{ type: "toolCall", name: "echo", arguments: { value: "first" } }] },
+					{ content: [{ type: "toolCall", name: "echo", arguments: { value: "second" } }] },
+					{ content: ["done"] },
+				],
+				transitionTool,
+			),
+			firstGate,
+			secondGate,
+			firstToolStarted,
+			secondToolStarted,
+		};
+	}
+
 	it("fires startsOwnRun:false when a follow-up is consumed inside the current run", async () => {
 		// The loop's in-run follow-up poll consumes the queued message WITHOUT a
 		// new agent_start; the promotion must report in-run consumption so the
@@ -1068,6 +1112,60 @@ describe("queued promotion run identity (#4668)", () => {
 		await session.waitForIdle();
 	});
 
+	it("terminalizes a consumed tracked submission before disposal disconnects Agent events", async () => {
+		const fixture = buildAbortableTrackedTransitionFixture();
+		session = fixture.session;
+		const promptDone = session.prompt("first task").catch(() => {});
+		await fixture.firstToolStarted.promise;
+		const submission = await session.submitUserMessage("same-run steer", {
+			deliverAs: "steer",
+			trackSubmission: true,
+		});
+		fixture.firstGate.resolve();
+		await expect(submission.execution).resolves.toMatchObject({
+			submissionId: submission.submissionId,
+			disposition: "joined-current-run",
+		});
+		await fixture.secondToolStarted.promise;
+
+		const dispose = session.dispose();
+		await expect(submission.terminal).resolves.toMatchObject({
+			submissionId: submission.submissionId,
+			disposition: "removed",
+			reason: "removed",
+		});
+		fixture.secondGate.resolve();
+		await dispose;
+		await promptDone;
+	});
+
+	it("terminalizes a consumed tracked submission during session replacement", async () => {
+		const fixture = buildAbortableTrackedTransitionFixture();
+		session = fixture.session;
+		const promptDone = session.prompt("first task").catch(() => {});
+		await fixture.firstToolStarted.promise;
+		const submission = await session.submitUserMessage("same-run steer", {
+			deliverAs: "steer",
+			trackSubmission: true,
+		});
+		fixture.firstGate.resolve();
+		await expect(submission.execution).resolves.toMatchObject({
+			submissionId: submission.submissionId,
+			disposition: "joined-current-run",
+		});
+		await fixture.secondToolStarted.promise;
+
+		const replacement = session.newSession();
+		await expect(submission.terminal).resolves.toMatchObject({
+			submissionId: submission.submissionId,
+			disposition: "removed",
+			reason: "removed",
+		});
+		fixture.secondGate.resolve();
+		await expect(replacement).resolves.toBe(true);
+		await promptDone;
+	});
+
 	it("rejects invalid tracked submission options before dispatch", async () => {
 		session = buildSession([{ content: ["must not dispatch"] }], {
 			name: "echo",
@@ -1083,6 +1181,7 @@ describe("queued promotion run identity (#4668)", () => {
 			{ deliverAs: "followUp" },
 			{ deliverAs: "followUp", trackSubmission: false },
 			{ deliverAs: "unsupported", trackSubmission: true },
+			{ deliverAs: "followUp", trackSubmission: true, queuePolicy: "bogus" },
 		];
 		for (const options of invalidOptions) {
 			await expect(session.submitUserMessage("invalid options", options as never)).rejects.toMatchObject({
@@ -1092,5 +1191,14 @@ describe("queued promotion run identity (#4668)", () => {
 			expect(session.agent.state.messages).toHaveLength(0);
 			expect(session.isStreaming).toBe(false);
 		}
+		await expect(
+			session.sendUserMessage("legacy tracked input", {
+				deliverAs: "followUp",
+				trackSubmission: true,
+			} as never),
+		).rejects.toMatchObject({ code: "invalid_input" });
+		expect(session.agent.hasQueuedMessages()).toBe(false);
+		expect(session.agent.state.messages).toHaveLength(0);
+		expect(session.isStreaming).toBe(false);
 	});
 });
