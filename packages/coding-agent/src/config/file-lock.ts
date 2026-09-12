@@ -646,19 +646,25 @@ async function adoptOrphanedFileLockRemovalTransition(lockPath: string, orphanAg
 		if (isTransientReleaseError(error)) return false;
 		throw error;
 	}
-	if (removal.ok || removal.code === "not_found") return true;
+	if (removal.ok) {
+		return removal.code === undefined && Object.keys(removal).every(key => key === "ok");
+	}
+	if (removal.code === "not_found" && Object.keys(removal).every(key => key === "ok" || key === "code")) return true;
 	// POSIX cannot bind a namespace unlink to the verified descriptor, so the
 	// primitive retains the scrubbed tree under its deterministic name and the
 	// caller finishes the on-disk removal. Finish only the exact tree this call
 	// scrubbed; a retained successor/placeholder/unknown path is refused so a
 	// replacement is never deleted.
 	if (
+		removal.ok === false &&
 		removal.code === "cleanup_pending" &&
+		removal.payloadDurable === true &&
 		removal.detachedPath !== undefined &&
 		path.resolve(removal.detachedPath) === path.resolve(transitionPath) &&
 		removal.retainedSuccessorPath === undefined &&
 		removal.retainedPlaceholderPath === undefined &&
-		removal.retainedUnknownPath === undefined
+		removal.retainedUnknownPath === undefined &&
+		Object.keys(removal).every(key => ["ok", "code", "payloadDurable", "detachedPath"].includes(key))
 	)
 		return await removeDetachedLockQuarantineOnDisk(transitionPath, snapshot.rootDev, snapshot.rootIno);
 	return false;

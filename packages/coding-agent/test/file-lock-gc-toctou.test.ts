@@ -16,6 +16,7 @@ import type { GcContext, GcPidProbe, GcRecord } from "@gajae-code/coding-agent/g
 import * as nativeBindings from "@gajae-code/natives";
 import {
 	exactRemoveDirectoryTree,
+	type NativeExactUnlinkResult,
 	type NativeNoReplaceResult,
 	renameDirectoryNoReplacePathAsync,
 	renameNoReplacePathAsync,
@@ -1097,6 +1098,61 @@ describe("file lock cleanup failure handling (#2478)", () => {
 			expect(await fs.readdir(path.dirname(lockDir))).toEqual([]);
 		},
 	);
+
+	const invalidOrphanAdoptionReceipts: [string, (detachedPath: string) => NativeExactUnlinkResult][] = [
+		["missing durable scrub proof", detachedPath => ({ ok: false, code: "cleanup_pending", detachedPath })],
+		[
+			"false durable scrub proof",
+			detachedPath => ({ ok: false, code: "cleanup_pending", payloadDurable: false, detachedPath }),
+		],
+		[
+			"extra receipt field",
+			detachedPath => ({
+				ok: false,
+				code: "cleanup_pending",
+				payloadDurable: true,
+				detachedPath,
+				retainedSuccessorPath: detachedPath,
+			}),
+		],
+		[
+			"contradictory success",
+			detachedPath => ({ ok: true, code: "cleanup_pending", payloadDurable: true, detachedPath }),
+		],
+	];
+	test.each(
+		invalidOrphanAdoptionReceipts,
+	)("keeps an aged scrubbed transition when adoption returns %s", async (_label, makeReceipt) => {
+		const lockedFile = path.join(await makeTemp(), "state.json");
+		const lockDir = `${lockedFile}.lock`;
+		const detachedPath = `${lockDir}.removing`;
+		const infoPath = path.join(detachedPath, "info");
+		await fs.mkdir(detachedPath);
+		await Bun.write(infoPath, "");
+		const old = new Date(Date.now() - 120_000);
+		await fs.utimes(infoPath, old, old);
+		let exactRemoveCalls = 0;
+		FileLockTestHooks.nativeQuarantineBindings = () => ({
+			snapshotDirectoryTree,
+			exactRemoveDirectoryTree: target => {
+				exactRemoveCalls++;
+				return makeReceipt(target);
+			},
+		});
+
+		const failure = await withFileLock(lockedFile, async () => undefined, {
+			retries: 1,
+			retryDelayMs: 1,
+		}).catch(error => error);
+		expect(failure).toMatchObject({
+			code: "orphan_transition",
+			reason: "orphan_transition",
+			orphanPath: detachedPath,
+			attempts: 1,
+		});
+		expect(exactRemoveCalls).toBe(1);
+		expect(await fs.exists(detachedPath)).toBe(true);
+	});
 
 	test.skipIf(process.platform === "win32")(
 		"keeps the typed orphan diagnostic when a transition payload was never scrubbed",
