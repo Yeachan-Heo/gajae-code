@@ -67,7 +67,7 @@ jobs:
       QUALIFY_HEAD_SHA: ${{ inputs.head_sha }}
       QUALIFY_BASE_REPOSITORY: ${{ inputs.base_repository }}
       QUALIFY_HARNESS_SHA: ${{ github.workflow_sha }}
-      QUALIFY_EVIDENCE: ${{ runner.temp }}/wsl-drvfs-evidence
+      QUALIFY_EVIDENCE: ${{ github.workspace }}/wsl-drvfs-evidence
     steps:
       - name: Validate qualification inputs
         shell: pwsh
