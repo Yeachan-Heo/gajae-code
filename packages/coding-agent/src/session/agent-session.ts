@@ -16124,6 +16124,7 @@ export class AgentSession {
 	 */
 	#resetSessionScopedModelProfileState(options?: {
 		preserveDefaultConfiguredChain?: boolean;
+		preserveDefaultModelRole?: boolean;
 		forceCleanup?: boolean;
 		preserveActiveModelProfile?: { name: string; scope: "session" | "durable" };
 	}): void {
@@ -16142,7 +16143,14 @@ export class AgentSession {
 		if (hadInstalledKeys) {
 			const modelRoles = { ...this.settings.get("modelRoles") };
 			const agentOverrides = { ...this.settings.get("task.agentModelOverrides") };
+			if (options?.preserveDefaultModelRole) {
+				const selectedDefault =
+					this.settings.getGlobal("modelRoles")?.default ??
+					(this.model ? formatModelString(this.model) : undefined);
+				if (selectedDefault !== undefined) modelRoles.default = selectedDefault;
+			}
 			for (const [role, baseline] of this.#activeProfileInstalledRoles) {
+				if (role === "default" && options?.preserveDefaultModelRole) continue;
 				if (baseline === undefined) delete modelRoles[role];
 				else modelRoles[role] = baseline;
 			}
@@ -16179,7 +16187,7 @@ export class AgentSession {
 		previousAgentModelOverrides?: Readonly<Record<string, ModelSelectorValue>>,
 	): void {
 		const bindings = this.#modelRegistry.getConfiguredModelBindings?.();
-		if (this.#preProfileModel === undefined) this.#preProfileModel = preProfileModel;
+		this.#preProfileModel = preProfileModel;
 		const currentModelRoles = new Set(modelRoles);
 		const currentAgentModelOverrides = new Set(agentModelOverrides);
 		for (const role of this.#activeProfileInstalledRoles.keys()) {
@@ -16366,7 +16374,7 @@ export class AgentSession {
 			this.settings.unset("modelProfile.default");
 			this.settings.clearOverride("modelProfile.default");
 		}
-		this.#resetSessionScopedModelProfileState();
+		this.#resetSessionScopedModelProfileState({ preserveDefaultModelRole: true });
 	}
 
 	/**

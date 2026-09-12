@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
-import { Agent } from "@gajae-code/agent-core";
+import { Agent, ThinkingLevel } from "@gajae-code/agent-core";
 import { Effort, getBundledModel, type Model } from "@gajae-code/ai";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
@@ -587,6 +587,28 @@ describe("AgentSession switchSession resumeModelBehavior", () => {
 
 		expect(settings.get("task.agentModelOverrides").executor).toBe("provider/durable-executor");
 		expect(settings.getModelRole("default")).toBe("provider/durable-default");
+		expect(session.getActiveModelProfile()).toBeUndefined();
+	});
+
+	it("keeps an explicit default selection after clearing profile ownership", async () => {
+		const sonnet = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const opus = getBundledModel("anthropic", "claude-opus-4-8")!;
+		const settings = Settings.isolated({ "compaction.enabled": false });
+		session = new AgentSession({
+			agent: new Agent({ initialState: { model: sonnet, systemPrompt: ["Test"], tools: [], messages: [] } }),
+			sessionManager: SessionManager.create(tempDir.path(), tempDir.path()),
+			settings,
+			modelRegistry,
+		});
+
+		settings.override("modelRoles", { default: `${sonnet.provider}/${sonnet.id}` });
+		session.setActiveModelProfile("session-profile", "session");
+		session.noteProfileInstalledOverrides(["default"], [], sonnet, { default: "anthropic/durable-default" });
+
+		await session.setDefaultModelSelection(opus, ThinkingLevel.Low);
+
+		expect(session.model?.id).toBe(opus.id);
+		expect(settings.getModelRole("default")).toBe(`${opus.provider}/${opus.id}:low`);
 		expect(session.getActiveModelProfile()).toBeUndefined();
 	});
 
