@@ -61,7 +61,7 @@ try {
     if ((Get-FileHash -Algorithm SHA256 -LiteralPath $image).Hash.ToLowerInvariant() -cne $expectedImageHash) { throw 'Ubuntu rootfs checksum mismatch' }
     "url=$imageBase/$imageName`nsha256=$expectedImageHash" | Set-Content (Join-Path $EvidencePath 'ubuntu-image.txt')
     $importAttempted = $true
-    Invoke-Native wsl.exe @('--import', $distro, (Join-Path $ownedRoot 'distro'), $image, '--version', '1')
+    Invoke-Native wsl.exe @('--import', $distro, (Join-Path $ownedRoot 'distro'), $image, '--version', '2') | Tee-Object -FilePath (Join-Path $EvidencePath 'wsl-import.txt')
     Invoke-Native wsl.exe @('--list', '--verbose')
 
     # Normalize only the trusted harness copy; target bytes come from git bundle.

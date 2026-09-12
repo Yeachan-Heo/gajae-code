@@ -29,7 +29,7 @@ on:
         required: false
         type: string
       wsl_drvfs:
-        description: Run nonpublishing real WSLv1/NTFS DrvFS lock qualification for head_sha.
+        description: Run nonpublishing real WSLv2/NTFS DrvFS lock qualification for head_sha.
         required: false
         type: boolean
         default: false
@@ -57,7 +57,7 @@ concurrency:
 
 jobs:
   wsl-drvfs-qualification:
-    name: Opt-in real WSLv1/NTFS DrvFS qualification
+    name: Opt-in real WSLv2/NTFS DrvFS qualification
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.wsl_drvfs == true }}
     runs-on: windows-2025
     timeout-minutes: 90
@@ -92,7 +92,7 @@ jobs:
           path: qualification-source
           fetch-depth: 0
           persist-credentials: false
-      - name: Qualify exact source on disposable WSLv1 DrvFS
+      - name: Qualify exact source on disposable WSLv2 DrvFS
         shell: pwsh
         run: |
           & ./qualification-harness/scripts/qualify-wsl-drvfs.ps1 -SourcePath (Join-Path $env:GITHUB_WORKSPACE 'qualification-source') -HeadSha $env:QUALIFY_HEAD_SHA -EvidencePath $env:QUALIFY_EVIDENCE
