@@ -1182,7 +1182,7 @@ describe("queued promotion run identity (#4668)", () => {
 
 	it("preserves a still-queued tracked steer through manual compaction", async () => {
 		const sessionManager = SessionManager.inMemory();
-		const history: AgentMessage[] = [
+		const history: Array<Parameters<SessionManager["appendMessage"]>[0]> = [
 			{ role: "user", content: "old context ".repeat(100), timestamp: 1 },
 			{ role: "user", content: "recent context", timestamp: 2 },
 		];
