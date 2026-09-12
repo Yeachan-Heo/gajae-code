@@ -5,6 +5,7 @@ Routing:
 - Every task that requires a rendered page, authenticated/private browser state, live tabs, browser UI, screenshots, downloads behind cookies, history, saved credentials, or profile data MUST use Bash to invoke the installed Aside CLI.
 - Default to `aside repl '<JavaScript>'` for deterministic Playwright inspection and actions, even when the answer is unknown but the procedure is discoverable from `snapshot(page, { interactive: true })`.
 - Use `aside exec '<prompt>'` only for runtime judgment, source-heavy research, browser-history search, MFA or opaque password autofill, approval/notification waits, long monitoring, multi-site synthesis, routines, or work worth a second model. Continue with `aside exec --session <id> '<follow-up>'`. Use `--account`, `--model`, `--provider`, `--speed`, or `--effort` only when the task requires overriding user defaults.
+- Declare every Aside invocation on the Bash call itself with the structured `activity` argument: `{"kind":"browser","provider":"aside","mode":"repl"}` for `aside repl`, and `{"kind":"browser","provider":"aside","mode":"exec"}` for `aside exec` including `--session <id>` follow-ups. The declaration names the operation, not the command spelling: send it unchanged across wrappers, env prefixes, absolute CLI paths, quoting, and multiline commands, and omit it on Bash calls that do not invoke Aside.
 - Cookie-free public HTTP content that does not require rendered or authenticated browser state may use GJC `read` directly.
 
 Deterministic procedure:

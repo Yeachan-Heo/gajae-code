@@ -44,6 +44,11 @@ describe("createAgentSession browser.backend", () => {
 			const discoverable = session.getDiscoverableTools({ source: "builtin" });
 			expect(discoverable).toEqual(expect.arrayContaining([expect.objectContaining({ name: "browser" })]));
 			expect(session.systemPrompt.join("\n\n")).not.toContain("<browser-backend>");
+			// The activity declaration requirement belongs to the Aside routing
+			// contract only; the default backend never asks Bash to declare one.
+			const nativePrompt = session.systemPrompt.join("\n\n");
+			expect(nativePrompt).not.toContain('"kind":"browser"');
+			expect(nativePrompt).not.toContain('mode":"repl');
 		} finally {
 			await session.dispose();
 		}
@@ -59,6 +64,13 @@ describe("createAgentSession browser.backend", () => {
 			expect(prompt).toContain("<browser-backend>");
 			expect(prompt).toContain("aside repl");
 			expect(prompt).not.toContain("MCP `repl`");
+			// The routing contract requires a structured declaration on every
+			// Aside Bash call, for repl, for exec, and for exec --session follow-ups.
+			expect(prompt).toContain("`activity` argument");
+			expect(prompt).toContain('{"kind":"browser","provider":"aside","mode":"repl"}');
+			expect(prompt).toContain('{"kind":"browser","provider":"aside","mode":"exec"}');
+			expect(prompt).toContain("`--session <id>` follow-ups");
+			expect(prompt).toContain("omit it on Bash calls that do not invoke Aside");
 		} finally {
 			await session.dispose();
 		}

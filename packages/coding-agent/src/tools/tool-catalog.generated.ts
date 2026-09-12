@@ -89,6 +89,33 @@ export const TOOL_CATALOG: Readonly<Record<string, ToolCatalogEntry>> = {
 				"pty": {
 					"type": "boolean",
 					"description": "run in pty mode"
+				},
+				"activity": {
+					"description": "declare browser activity for the aside browser backend: repl or exec",
+					"type": "object",
+					"properties": {
+						"kind": {
+							"type": "string",
+							"const": "browser"
+						},
+						"provider": {
+							"type": "string",
+							"const": "aside"
+						},
+						"mode": {
+							"type": "string",
+							"enum": [
+								"repl",
+								"exec"
+							]
+						}
+					},
+					"required": [
+						"kind",
+						"provider",
+						"mode"
+					],
+					"additionalProperties": false
 				}
 			},
 			"required": [

@@ -1,6 +1,10 @@
 # Changelog
 
 ## [Unreleased]
+### Added
+
+- Bash accepts an optional model-declared activity declaration (`activity: { kind: "browser", provider: "aside", mode: "repl" | "exec" }`) and mirrors the accepted value into `BashToolDetails.activity` on foreground results, background/folded starts, and background job progress/terminal details. The `browser.backend: aside` routing prompt now requires the declaration on every Bash invocation that runs Aside, so embedding consumers can project Aside browser activity from the existing tool-call lifecycle instead of parsing command text. The declaration is schema-validated only: malformed values are dropped (never coerced, never fatal), calls without one are ordinary unchanged Bash, and GJC still neither spawns nor supervises Aside nor inspects the command.
+
 ### Fixed
 
 - A failing `gjc --smoke-test` no longer leaves its isolated-shell worker behind. The readiness bail-out ran a `finally` that only removed marker files, so the probe shell stayed alive and its abandoned run went unobserved; the wider readiness/run deadlines made that window long. Teardown now aborts the probe, retires the worker, and observes the run on every exit path — graceful close alone would have waited out the command’s own sleep.
