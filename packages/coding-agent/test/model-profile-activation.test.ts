@@ -12,6 +12,7 @@ import {
 	materializeActiveModelProfileAssignments,
 	materializeModelProfileForDeletion,
 	prepareModelProfileActivation,
+	resolveModelProfileDefaultChain,
 	restoreMaterializedModelProfileForDeletion,
 } from "../src/config/model-profile-activation";
 
@@ -336,6 +337,33 @@ describe("model profile activation", () => {
 			authStorage.close();
 			tempDir.removeSync();
 		}
+	});
+
+	test("durable default recovery excludes a bundled default absent from the activation catalog", async () => {
+		const profile: ModelProfileDefinition = {
+			name: "excluded-bundled-default",
+			requiredProviders: ["anthropic"],
+			modelMapping: { default: "anthropic/claude-opus-5" },
+			source: "builtin",
+		};
+		const baseRegistry = fakeRegistry({ profiles: [profile] });
+		const getAvailableForProfileActivation = vi.fn(() => [] as Model[]);
+		const registry = {
+			...baseRegistry,
+			getAvailable: baseRegistry.getAll,
+			getAvailableForProfileActivation,
+		} as unknown as ModelRegistry;
+
+		expect(registry.getAvailable().some(candidate => candidate.id === "claude-opus-5")).toBe(true);
+		const recovery = await resolveModelProfileDefaultChain({
+			modelRegistry: registry,
+			settings: Settings.isolated(),
+			profileName: profile.name,
+			credentialSessionId: "resume-session",
+		});
+
+		expect(getAvailableForProfileActivation).toHaveBeenCalledTimes(1);
+		expect(recovery.entries).toEqual([]);
 	});
 
 	test("notifies mounted consumers when fresh discovery evidence changes from non-empty to empty", async () => {
