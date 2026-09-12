@@ -18308,6 +18308,8 @@ export class AgentSession {
 			}
 			const compactionAbortController = new AbortController();
 			this.#compactionAbortController = compactionAbortController;
+			const steeringBeforeCompaction = this.agent.snapshotSteering();
+			const steeringDisplaysBeforeCompaction = [...this.#steeringMessages];
 			// Compaction intentionally preserves still-queued inputs, but it drops the
 			// Agent event bridge before aborting the active run. Settle submissions that
 			// already crossed the queue boundary now; they cannot receive agent_end later.
@@ -18315,6 +18317,19 @@ export class AgentSession {
 			this.#disconnectFromAgent();
 			try {
 				await this.abort({ cause: "compaction", preserveCompaction: true });
+				const steeringAfterAbort = new Set(this.agent.snapshotSteering());
+				const missingSteering = steeringBeforeCompaction.filter(message => !steeringAfterAbort.has(message));
+				if (missingSteering.length > 0) {
+					this.agent.restoreSteering(missingSteering);
+					const missingSteeringSet = new Set(missingSteering);
+					const missingSteeringDisplays: QueuedDisplayEntry[] = [];
+					for (let index = 0; index < steeringBeforeCompaction.length; index++) {
+						if (!missingSteeringSet.has(steeringBeforeCompaction[index]!)) continue;
+						const display = steeringDisplaysBeforeCompaction[index];
+						if (display) missingSteeringDisplays.push(display);
+					}
+					this.#steeringMessages = [...missingSteeringDisplays, ...this.#steeringMessages];
+				}
 			} catch (error) {
 				this.#compactionAbortController = undefined;
 				throw error;
