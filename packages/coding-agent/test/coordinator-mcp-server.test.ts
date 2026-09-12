@@ -1,5 +1,6 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, vi } from "bun:test";
 import { createHash } from "node:crypto";
+import * as nodeFs from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -8235,24 +8236,43 @@ describe("Coordinator MCP retained-delivery ordering", () => {
 		});
 		const initial = await server.callTool("gjc_coordinator_watch_events", { after_seq: 0, timeout_ms: 0 });
 		const cursor = Number(initial.next_after_seq);
-		gateAvailable = true;
-		const pending = server.callTool("gjc_coordinator_watch_events", {
-			session_id: "visible-session",
-			after_seq: cursor,
-			timeout_ms: 500,
+		const watcherReady = Promise.withResolvers<void>();
+		const namespaceDir = coordinatorNamespace(root);
+		const originalWatch = nodeFs.watch;
+		const watchSpy = vi.spyOn(nodeFs, "watch").mockImplementation((...args: unknown[]): nodeFs.FSWatcher => {
+			const watcher: nodeFs.FSWatcher = Reflect.apply(originalWatch, nodeFs, args);
+			if (args[0] === path.join(namespaceDir, "session-states")) watcherReady.resolve();
+			return watcher;
 		});
-		await appendCoordinatorEventForTest(coordinatorNamespace(root), {
-			kind: "session.state_changed",
-			sessionId: "visible-session",
-			summary: "wake",
-		});
-		const result = await pending;
-		expect(result).toMatchObject({
-			ok: true,
-			events: expect.arrayContaining([
-				expect.objectContaining({ kind: "question.opened", question_id: "wake-gate" }),
-			]),
-		});
+		// Keep the protocol's 500ms deadline, but drive this functional wake test
+		// with logical time rather than charging unrelated filesystem setup to it.
+		vi.useFakeTimers();
+		try {
+			const pending = server.callTool("gjc_coordinator_watch_events", {
+				session_id: "visible-session",
+				event_types: ["question.opened"],
+				after_seq: cursor,
+				timeout_ms: 500,
+			});
+			await watcherReady.promise;
+			gateAvailable = true;
+			await appendCoordinatorEventForTest(namespaceDir, {
+				kind: "session.state_changed",
+				sessionId: "visible-session",
+				summary: "wake",
+			});
+			const result = await pending;
+			expect(result).toMatchObject({
+				ok: true,
+				timed_out: false,
+				events: expect.arrayContaining([
+					expect.objectContaining({ kind: "question.opened", question_id: "wake-gate" }),
+				]),
+			});
+		} finally {
+			watchSpy.mockRestore();
+			vi.useRealTimers();
+		}
 	});
 
 	it("imports a pre-WAL active Q12 turn into canonical admission, listing, and answer handling", async () => {
