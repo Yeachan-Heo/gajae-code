@@ -202,6 +202,40 @@ describe("AgentSession switchSession resumeModelBehavior", () => {
 		);
 	});
 
+	it("does not materialize current settings into a legacy saved chain during recovery", async () => {
+		const sonnet = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const codex = getBundledModel("openai-codex", "gpt-5.6-sol")!;
+		authStorage.setRuntimeApiKey("openai-codex", "test-key");
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"modelProfile.default": "codex-medium",
+			"session.resumeModelBehavior": "keepSessionModel",
+		});
+		const sessionFile = await createPersistedTarget(sonnet, settings);
+
+		session = new AgentSession({
+			agent: new Agent({ initialState: { model: sonnet, systemPrompt: ["Test"], tools: [], messages: [] } }),
+			sessionManager: SessionManager.create(tempDir.path(), tempDir.path()),
+			settings,
+			modelRegistry,
+		});
+		settings.override("modelRoles", {
+			default: ["anthropic/removed-model", `${codex.provider}/${codex.id}`],
+		});
+		vi.spyOn(modelRegistry, "getAvailable").mockReturnValue([codex]);
+		vi.spyOn(modelRegistry, "getAll").mockReturnValue([codex]);
+		const setConfiguredChain = vi.spyOn(session, "setConfiguredModelChain");
+
+		expect(await session.switchSession(sessionFile)).toBe(true);
+		expect(session.model?.id).toBe(codex.id);
+		expect(session.getConfiguredModelChainState("default")).toEqual({
+			entries: [`${sonnet.provider}/${sonnet.id}`],
+			origin: "legacy_session",
+			explicitHead: true,
+		});
+		expect(setConfiguredChain).not.toHaveBeenCalled();
+	});
+
 	it("restores predecessor profile cleanup state when successor persistence fails", async () => {
 		const sonnet = getBundledModel("anthropic", "claude-sonnet-4-5")!;
 		const settings = Settings.isolated({ "compaction.enabled": false });

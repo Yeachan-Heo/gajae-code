@@ -23761,8 +23761,8 @@ export class AgentSession {
 							...(this.#persistedModelProfileAliasIntent("default") ?? {}),
 						},
 					);
-					let controller = this.#defaultFallbackChain();
-					this.seedDefaultFallbackResolution(resolution.activeIndex, resolution.skips);
+					let controller = this.#defaultFallbackChain(false);
+					this.#seedDefaultFallbackResolutionForController(controller, resolution.activeIndex, resolution.skips);
 					let resolvedModel = resolution.model;
 					if (!resolvedModel) {
 						const allSelectorsUnknown =
