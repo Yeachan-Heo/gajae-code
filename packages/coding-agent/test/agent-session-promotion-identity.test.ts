@@ -78,6 +78,7 @@ describe("queued promotion run identity (#4668)", () => {
 	function buildAbortableTrackedTransitionFixture(
 		sessionManager = SessionManager.inMemory(),
 		extensionRunner?: unknown,
+		abortFirstTool = false,
 	) {
 		const firstGate = Promise.withResolvers<void>();
 		const secondGate = Promise.withResolvers<void>();
@@ -93,7 +94,16 @@ describe("queued promotion run identity (#4668)", () => {
 				toolCallCount += 1;
 				if (toolCallCount === 1) {
 					firstToolStarted.resolve();
-					await firstGate.promise;
+					if (!abortFirstTool) {
+						await firstGate.promise;
+					} else {
+						const aborted = Promise.withResolvers<void>();
+						const onAbort = () => aborted.resolve();
+						if (signal?.aborted) aborted.resolve();
+						else signal?.addEventListener("abort", onAbort, { once: true });
+						await Promise.race([firstGate.promise, aborted.promise]);
+						signal?.removeEventListener("abort", onAbort);
+					}
 				} else {
 					secondToolStarted.resolve();
 					const aborted = Promise.withResolvers<void>();
@@ -1207,7 +1217,7 @@ describe("queued promotion run identity (#4668)", () => {
 				};
 			}),
 		};
-		const fixture = buildAbortableTrackedTransitionFixture(sessionManager, extensionRunner);
+		const fixture = buildAbortableTrackedTransitionFixture(sessionManager, extensionRunner, true);
 		session = fixture.session;
 		for (const message of history) sessionManager.appendMessage(message);
 		session.settings.override("compaction.keepRecentTokens", 1);
@@ -1227,12 +1237,10 @@ describe("queued promotion run identity (#4668)", () => {
 			summary: "compacted summary",
 		});
 		expect(session.messages.some(message => message.role === "compactionSummary")).toBe(true);
-		expect(session.agent.snapshotSteering()).toHaveLength(1);
-		const resume = session.prompt("resume after compact").catch(() => {});
 		await expect(withTimeout(submission.execution, 5_000, "compaction queued test execution")).resolves.toMatchObject(
 			{
 				submissionId: submission.submissionId,
-				disposition: "joined-current-run",
+				disposition: "promoted-to-run",
 			},
 		);
 		fixture.secondGate.resolve();
@@ -1240,7 +1248,177 @@ describe("queued promotion run identity (#4668)", () => {
 			submissionId: submission.submissionId,
 			disposition: "completed",
 		});
-		await resume;
+		await promptDone;
+	});
+
+	it("restores queued tracked steering when compaction abort fails", async () => {
+		const fixture = buildAbortableTrackedTransitionFixture(undefined, undefined, true);
+		session = fixture.session;
+		const activeSession = session;
+		const promptDone = session.prompt("first task").catch(() => {});
+		await withTimeout(fixture.firstToolStarted.promise, 5_000, "compaction abort-error test first tool");
+		const submission = await session.submitUserMessage("restore after abort error", {
+			deliverAs: "steer",
+			trackSubmission: true,
+		});
+		expect(session.agent.snapshotSteering()).toHaveLength(1);
+		expect(
+			session.getQueuedMessageEntries().filter(entry => entry.text === "restore after abort error"),
+		).toHaveLength(1);
+		vi.spyOn(activeSession, "abort").mockImplementationOnce(async () => {
+			activeSession.agent.clearSteeringQueue();
+			throw new Error("synthetic compaction abort failure");
+		});
+
+		await expect(session.compact()).rejects.toThrow("synthetic compaction abort failure");
+		expect(session.agent.snapshotSteering()).toHaveLength(1);
+		expect(
+			session.getQueuedMessageEntries().filter(entry => entry.text === "restore after abort error"),
+		).toHaveLength(1);
+		expect(submission.cancel()).toBe(true);
+		await expect(submission.terminal).resolves.toMatchObject({
+			submissionId: submission.submissionId,
+			disposition: "removed",
+			reason: "cancelled",
+		});
+		fixture.firstGate.resolve();
+		await withTimeout(fixture.secondToolStarted.promise, 5_000, "compaction abort-error test second tool");
+		fixture.secondGate.resolve();
+		await promptDone;
+	});
+
+	it("releases deferred tracked follow-ups after manual compaction", async () => {
+		const sessionManager = SessionManager.inMemory();
+		const history: Array<Parameters<SessionManager["appendMessage"]>[0]> = [
+			{ role: "user", content: "old context ".repeat(100), timestamp: 1 },
+			{ role: "user", content: "recent context", timestamp: 2 },
+		];
+		for (const message of history) sessionManager.appendMessage(message);
+		const extensionRunner = {
+			hasHandlers: vi.fn((eventType: string) => eventType === "session_before_compact"),
+			hasToolResultMediation: vi.fn().mockReturnValue(false),
+			emitBeforeAgentStart: vi.fn().mockResolvedValue({ messages: [] }),
+			emit: vi.fn().mockImplementation(async (event: unknown) => {
+				const preparation = (event as { preparation?: { firstKeptEntryId: string; tokensBefore: number } })
+					.preparation;
+				if (!preparation) return undefined;
+				return {
+					compaction: {
+						summary: "compacted summary",
+						shortSummary: "compacted",
+						firstKeptEntryId: preparation.firstKeptEntryId,
+						tokensBefore: preparation.tokensBefore,
+						details: {},
+					},
+				};
+			}),
+		};
+		const fixture = buildAbortableTrackedTransitionFixture(sessionManager, extensionRunner, true);
+		session = fixture.session;
+		session.settings.override("compaction.keepRecentTokens", 1);
+		const promptDone = session.prompt("first task").catch(() => {});
+		await withTimeout(fixture.firstToolStarted.promise, 5_000, "deferred compaction test first tool");
+		const submission = await session.submitUserMessage("deferred through compact", {
+			deliverAs: "followUp",
+			trackSubmission: true,
+			sdkRunCapability: createSdkRunCapability("deferred-compaction-token"),
+		} as never);
+		expect(session.agent.snapshotFollowUp()).toHaveLength(0);
+
+		const compaction = session.compact();
+		await expect(withTimeout(compaction, 5_000, "deferred compaction test compact")).resolves.toMatchObject({
+			summary: "compacted summary",
+		});
+		await expect(
+			withTimeout(submission.execution, 5_000, "deferred compaction test execution"),
+		).resolves.toMatchObject({
+			submissionId: submission.submissionId,
+			disposition: "promoted-to-run",
+		});
+		await withTimeout(fixture.secondToolStarted.promise, 5_000, "deferred compaction test second tool");
+		fixture.secondGate.resolve();
+		await expect(withTimeout(submission.terminal, 5_000, "deferred compaction test terminal")).resolves.toMatchObject(
+			{
+				submissionId: submission.submissionId,
+				disposition: "completed",
+			},
+		);
+		await promptDone;
+	});
+
+	it("keeps sequential steering policy across manual compaction", async () => {
+		const sessionManager = SessionManager.inMemory();
+		for (const message of [
+			{ role: "user" as const, content: "old context ".repeat(100), timestamp: 1 },
+			{ role: "user" as const, content: "recent context", timestamp: 2 },
+		])
+			sessionManager.appendMessage(message);
+		const extensionRunner = {
+			hasHandlers: vi.fn((eventType: string) => eventType === "session_before_compact"),
+			hasToolResultMediation: vi.fn().mockReturnValue(false),
+			emitBeforeAgentStart: vi.fn().mockResolvedValue({ messages: [] }),
+			emit: vi.fn().mockImplementation(async (event: unknown) => {
+				const preparation = (event as { preparation?: { firstKeptEntryId: string; tokensBefore: number } })
+					.preparation;
+				if (!preparation) return undefined;
+				return {
+					compaction: {
+						summary: "compacted summary",
+						shortSummary: "compacted",
+						firstKeptEntryId: preparation.firstKeptEntryId,
+						tokensBefore: preparation.tokensBefore,
+						details: {},
+					},
+				};
+			}),
+		};
+		const fixture = buildAbortableTrackedTransitionFixture(sessionManager, extensionRunner, true);
+		session = fixture.session;
+		session.settings.override("compaction.keepRecentTokens", 1);
+		const promptDone = session.prompt("first task").catch(() => {});
+		await withTimeout(fixture.firstToolStarted.promise, 5_000, "sequential compaction test first tool");
+		const first = await session.submitUserMessage("sequential compact one", {
+			deliverAs: "steer",
+			trackSubmission: true,
+			queuePolicy: "sequential",
+		});
+		const second = await session.submitUserMessage("sequential compact two", {
+			deliverAs: "steer",
+			trackSubmission: true,
+			queuePolicy: "sequential",
+		});
+		expect(session.agent.snapshotSteering()).toHaveLength(2);
+
+		await expect(withTimeout(session.compact(), 5_000, "sequential compaction test compact")).resolves.toMatchObject({
+			summary: "compacted summary",
+		});
+		await expect(withTimeout(first.execution, 5_000, "sequential compaction first execution")).resolves.toMatchObject(
+			{
+				submissionId: first.submissionId,
+				disposition: "promoted-to-run",
+			},
+		);
+		expect(await Promise.race([second.execution.then(() => "settled"), Bun.sleep(20).then(() => "pending")])).toBe(
+			"pending",
+		);
+		await withTimeout(fixture.secondToolStarted.promise, 5_000, "sequential compaction test second tool");
+		fixture.secondGate.resolve();
+		await expect(withTimeout(first.terminal, 5_000, "sequential compaction first terminal")).resolves.toMatchObject({
+			submissionId: first.submissionId,
+			disposition: "completed",
+		});
+		await expect(
+			withTimeout(second.execution, 5_000, "sequential compaction second execution"),
+		).resolves.toMatchObject({
+			submissionId: second.submissionId,
+			disposition: "joined-current-run",
+		});
+		await expect(withTimeout(second.terminal, 5_000, "sequential compaction second terminal")).resolves.toMatchObject(
+			{
+				submissionId: second.submissionId,
+				disposition: "completed",
+			},
+		);
 		await promptDone;
 	});
 

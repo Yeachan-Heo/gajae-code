@@ -19,6 +19,7 @@ import { TtsrManager } from "@gajae-code/coding-agent/export/ttsr";
 import type { ExtensionRunner } from "@gajae-code/coding-agent/extensibility/extensions/runner";
 import { submitInteractiveInput } from "@gajae-code/coding-agent/main";
 import type { SubmittedUserInput } from "@gajae-code/coding-agent/modes/types";
+import type { QueuedInputSubmission } from "@gajae-code/coding-agent/sdk";
 import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { convertToLlm } from "@gajae-code/coding-agent/session/messages";
@@ -992,11 +993,15 @@ describe("AgentSession concurrent prompt guard", () => {
 		authStorages.push(authStorage);
 		authStorage.setRuntimeApiKey("anthropic", "test-key");
 		const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "models-switch-hook.yml"));
+		let switchSubmission: QueuedInputSubmission | undefined;
 		const extensionRunner = {
 			hasHandlers: vi.fn(() => false),
 			emit: vi.fn(async (event: { type: string }) => {
 				if (event.type === "session_switch") {
-					await session.sendUserMessage("queued by switch hook", { deliverAs: "steer" });
+					switchSubmission = await session.submitUserMessage("queued by switch hook", {
+						deliverAs: "steer",
+						trackSubmission: true,
+					});
 				}
 			}),
 		} as unknown as ExtensionRunner;
@@ -1023,6 +1028,13 @@ describe("AgentSession concurrent prompt guard", () => {
 
 		expect(session.getQueuedMessages().followUp).toEqual(["queued by switch hook"]);
 		expect(agent.snapshotFollowUp()).toHaveLength(1);
+		expect(switchSubmission).toBeDefined();
+		const submission = switchSubmission!;
+		expect(await Promise.race([submission.terminal.then(() => "settled"), Bun.sleep(20).then(() => "pending")])).toBe(
+			"pending",
+		);
+		session.clearQueue();
+		await expect(submission.terminal).resolves.toMatchObject({ disposition: "removed", reason: "removed" });
 	});
 
 	// Regression: a subscriber that fires the next prompt synchronously from the
