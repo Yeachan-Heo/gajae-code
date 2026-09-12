@@ -442,6 +442,31 @@ describe("model profile activation", () => {
 		).resolves.toEqual({ profileName: profile.name, entries: [] });
 	});
 
+	test("durable default recovery keeps a known unauthenticated bare default unavailable", async () => {
+		const profile: ModelProfileDefinition = {
+			name: "known-unauthenticated-bare-default",
+			requiredProviders: [],
+			modelMapping: { default: "default" },
+			source: "user",
+		};
+		const baseRegistry = fakeRegistry({ profiles: [profile] });
+		const registry = {
+			...baseRegistry,
+			getAvailable: baseRegistry.getAll,
+			getAvailableForProfileActivation: () => [] as Model[],
+			getApiKeyForProvider: async () => undefined,
+		} as unknown as ModelRegistry;
+
+		await expect(
+			resolveModelProfileDefaultChain({
+				modelRegistry: registry,
+				settings: Settings.isolated(),
+				profileName: profile.name,
+				credentialSessionId: "resume-session",
+			}),
+		).resolves.toEqual({ profileName: profile.name, entries: [] });
+	});
+
 	test("durable default recovery ignores an optional mapped provider auth probe failure", async () => {
 		const profile: ModelProfileDefinition = {
 			name: "optional-mapped-provider",
@@ -2598,6 +2623,65 @@ describe("preset-equivalent profile activation", () => {
 		});
 	});
 
+	test("role-only profile deletion clears its identity-bearing default chain", async () => {
+		const profile: ModelProfileDefinition = {
+			name: "role-only-profile",
+			requiredProviders: ["provider-b"],
+			modelMapping: { executor: "provider-b/executor" },
+			source: "user",
+		};
+		const session = fakeSession();
+		const registry = fakeRegistry({ profiles: [profile] });
+		const settings = Settings.isolated();
+		session.setActiveModelProfile(profile.name, "session");
+		session.setConfiguredModelChain("default", ["provider-a/default"], "profile-activation", profile.name);
+
+		await materializeModelProfileForDeletion({
+			session,
+			modelRegistry: registry,
+			settings,
+			profileName: profile.name,
+		});
+
+		expect(session.getConfiguredModelChainState("default")).toMatchObject({
+			entries: [],
+			origin: "profile-deletion-materialized",
+			identity: undefined,
+		});
+	});
+
+	test("session-scoped activation prepares over the active durable profile layer", async () => {
+		const durableProfile: ModelProfileDefinition = {
+			name: "durable-layer",
+			requiredProviders: ["provider-a", "provider-b"],
+			modelMapping: { default: "provider-a/default", executor: "provider-b/executor" },
+			source: "user",
+		};
+		const sessionProfile: ModelProfileDefinition = {
+			name: "session-layer",
+			requiredProviders: ["provider-c"],
+			modelMapping: { default: "provider-c/default", executor: "provider-c/executor" },
+			source: "user",
+		};
+		const session = fakeSession();
+		const registry = fakeRegistry({ profiles: [durableProfile, sessionProfile] });
+		const settings = Settings.isolated();
+
+		await activateModelProfile(
+			{ session, modelRegistry: registry, settings, profileName: durableProfile.name },
+			{ persistDefault: true, profileScope: "durable" },
+		);
+		const prepared = await prepareModelProfileActivation({
+			session,
+			modelRegistry: registry,
+			settings,
+			profileName: sessionProfile.name,
+			profileScope: "session",
+		});
+
+		expect(prepared.baseAgentModelOverrides).toMatchObject({ executor: "provider-b/executor" });
+	});
+
 	test("successful activation leaves the new model sticky", async () => {
 		const tempDir = TempDir.createSync("@gjc-profile-sticky-success-");
 		try {
@@ -2666,6 +2750,38 @@ describe("model-profile-activation: OpenAI-compatible proxy routing", () => {
 		},
 		source: "builtin",
 	};
+
+	test("fallback mode does not probe an unused proxy", async () => {
+		const profile: ModelProfileDefinition = {
+			name: "direct-only-builtin",
+			requiredProviders: ["provider-a"],
+			modelMapping: { default: "provider-a/default" },
+			source: "builtin",
+		};
+		const baseRegistry = fakeRegistry({ profiles: [profile] });
+		const getApiKeyForProvider = vi.fn(async (provider: string) => {
+			if (provider === "litellm") throw new Error("proxy lookup failed");
+			return `key-${provider}`;
+		});
+		const registry = {
+			...baseRegistry,
+			getApiKeyForProvider,
+			getConfiguredProviderIds: () => ["litellm"],
+		} as unknown as ModelRegistry;
+
+		await expect(
+			resolveModelProfileDefaultChain({
+				modelRegistry: registry,
+				settings: Settings.isolated({
+					"modelProfile.proxyMode": "fallback",
+					"modelProfile.proxyProvider": "litellm",
+				}),
+				profileName: profile.name,
+				credentialSessionId: "resume-session",
+			}),
+		).resolves.toEqual({ profileName: profile.name, entries: ["provider-a/default"] });
+		expect(getApiKeyForProvider).not.toHaveBeenCalledWith("litellm", "resume-session");
+	});
 
 	function proxyRegistry(
 		options: { proxyApiKey?: string; missing?: string[]; profiles?: ModelProfileDefinition[] } = {},

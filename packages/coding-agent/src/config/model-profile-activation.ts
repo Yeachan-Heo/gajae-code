@@ -124,6 +124,7 @@ export interface PrepareModelProfileActivationOptions {
 		};
 	settings: Pick<Settings, "get" | "getGlobal" | "getOverride">;
 	profileName: string;
+	profileScope?: ModelProfileScope;
 }
 export interface ApplyModelProfileActivationOptions {
 	persistDefault?: boolean;
@@ -186,6 +187,18 @@ export interface PreparedModelProfileActivation {
 	previousCanonicalVariant: string | undefined;
 	/** Registry used to resolve and restore the session sticky canonical variant. */
 	modelRegistry: PrepareModelProfileActivationOptions["modelRegistry"];
+}
+
+function restoreProfileOverrideLayer(
+	current: Record<string, ModelSelectorValue>,
+	baseline: Readonly<Record<string, ModelSelectorValue | undefined>>,
+): Record<string, ModelSelectorValue> {
+	const restored = { ...current };
+	for (const [role, value] of Object.entries(baseline)) {
+		if (value === undefined) delete restored[role];
+		else restored[role] = value;
+	}
+	return restored;
 }
 export interface MaterializeModelProfileAssignmentOptions {
 	session: Pick<
@@ -686,13 +699,6 @@ async function preflightModelProfileBindings(options: {
 			`modelProfile.proxyProvider "${proxyProvider}" is not configured. Configure it with \`gjc setup provider\` before activating a preset.`,
 		);
 	}
-	const proxyApiKey =
-		proxyProvider === undefined
-			? undefined
-			: await options.modelRegistry.getApiKeyForProvider(proxyProvider, options.credentialSessionId);
-	const proxyAuthenticated = proxyApiKey !== undefined && (proxyApiKey === kNoAuth || isAuthenticated(proxyApiKey));
-	if (proxyMode === "always" && !proxyAuthenticated)
-		throw new ModelProfileCredentialError(profileLabel, [proxyProvider!]);
 	const strictMissing = missingProviders.filter(
 		provider => !proxyRoutableProviders.has(provider) && !alternativeSet.has(provider),
 	);
@@ -700,6 +706,19 @@ async function preflightModelProfileBindings(options: {
 	const routableMissing = missingProviders.filter(
 		provider => proxyRoutableProviders.has(provider) && !alternativeSet.has(provider),
 	);
+	const alternativeNeedsProxy = alternativeGroups.some(
+		group =>
+			!group.some(provider => authenticatedProviders.has(provider)) &&
+			group.every(provider => proxyRoutableProviders.has(provider)),
+	);
+	const proxyRequired = proxyMode === "always" || routableMissing.length > 0 || alternativeNeedsProxy;
+	let proxyAuthenticated = false;
+	if (proxyProvider !== undefined && proxyRequired) {
+		const proxyApiKey = await options.modelRegistry.getApiKeyForProvider(proxyProvider, options.credentialSessionId);
+		proxyAuthenticated = proxyApiKey === kNoAuth || isAuthenticated(proxyApiKey);
+	}
+	if (proxyMode === "always" && !proxyAuthenticated)
+		throw new ModelProfileCredentialError(profileLabel, [proxyProvider!]);
 	if (routableMissing.length > 0 && !proxyAuthenticated)
 		throw new ModelProfileCredentialError(profileLabel, proxyProvider ? [proxyProvider] : routableMissing);
 	for (const group of alternativeGroups) {
@@ -1262,6 +1281,42 @@ export async function prepareModelProfileActivation(
 			);
 		}
 
+		const previousProfileInstalledOverrideState = options.session.getProfileInstalledOverrideState?.();
+		const previousProfileScope = options.session.getActiveModelProfileScope?.();
+		const previousModelRoles = { ...options.settings.get("modelRoles") };
+		const previousAgentModelOverrides = { ...options.settings.get("task.agentModelOverrides") };
+		const baseModelRoles =
+			options.profileScope === "session" && previousProfileScope === "durable"
+				? previousModelRoles
+				: options.profileScope === "session" &&
+						previousProfileScope === "session" &&
+						previousProfileInstalledOverrideState
+					? restoreProfileOverrideLayer(previousModelRoles, previousProfileInstalledOverrideState.modelRoles)
+					: Object.fromEntries(
+							Object.entries(previousModelRoles).filter(
+								([key]) =>
+									!(options.session.getProfileInstalledOverrideKeys?.().modelRoles ?? []).includes(key),
+							),
+						);
+		const baseAgentModelOverrides =
+			options.profileScope === "session" && previousProfileScope === "durable"
+				? previousAgentModelOverrides
+				: options.profileScope === "session" &&
+						previousProfileScope === "session" &&
+						previousProfileInstalledOverrideState
+					? restoreProfileOverrideLayer(
+							previousAgentModelOverrides,
+							previousProfileInstalledOverrideState.agentModelOverrides,
+						)
+					: Object.fromEntries(
+							Object.entries(previousAgentModelOverrides).filter(
+								([key]) =>
+									!(options.session.getProfileInstalledOverrideKeys?.().agentModelOverrides ?? []).includes(
+										key,
+									),
+							),
+						);
+
 		return {
 			profileName,
 			session: options.session as PreparedModelProfileActivation["session"],
@@ -1270,19 +1325,10 @@ export async function prepareModelProfileActivation(
 			previousModel,
 			previousCanonicalVariant,
 			previousThinkingLevel: options.session.thinkingLevel,
-			previousAgentModelOverrides: { ...options.settings.get("task.agentModelOverrides") },
-			previousModelRoles: { ...options.settings.get("modelRoles") },
-			baseAgentModelOverrides: Object.fromEntries(
-				Object.entries(options.settings.get("task.agentModelOverrides") ?? {}).filter(
-					([key]) =>
-						!(options.session.getProfileInstalledOverrideKeys?.().agentModelOverrides ?? []).includes(key),
-				),
-			),
-			baseModelRoles: Object.fromEntries(
-				Object.entries(options.settings.get("modelRoles") ?? {}).filter(
-					([key]) => !(options.session.getProfileInstalledOverrideKeys?.().modelRoles ?? []).includes(key),
-				),
-			),
+			previousAgentModelOverrides,
+			previousModelRoles,
+			baseAgentModelOverrides,
+			baseModelRoles,
 			previousPersistedModelRoles: options.settings.getGlobal("modelRoles"),
 			previousPersistedAgentModelOverrides: options.settings.getGlobal("task.agentModelOverrides"),
 			previousModelRolesOverride: options.settings.getOverride("modelRoles"),
@@ -1304,8 +1350,8 @@ export async function prepareModelProfileActivation(
 			modelRoles,
 			agentModelOverrides,
 			previousActiveModelProfile: options.session.getActiveModelProfile?.(),
-			previousActiveModelProfileScope: options.session.getActiveModelProfileScope?.(),
-			previousProfileInstalledOverrideState: options.session.getProfileInstalledOverrideState?.(),
+			previousActiveModelProfileScope: previousProfileScope,
+			previousProfileInstalledOverrideState,
 			previousSessionDefaultModel: options.session.getSessionDefaultModelSelector?.(),
 			previousDefaultFallbackRuntimeState: options.session.getDefaultFallbackRuntimeState?.(),
 		};
@@ -1394,8 +1440,8 @@ export async function applyPreparedModelProfileActivation(
 			Object.keys(prepared.modelRoles),
 			Object.keys(prepared.agentModelOverrides),
 			prepared.previousModel,
-			prepared.previousModelRolesOverride,
-			prepared.previousAgentModelOverridesOverride,
+			prepared.baseModelRoles,
+			prepared.baseAgentModelOverrides,
 		);
 	} catch (error) {
 		const rollbackErrors: unknown[] = [];
@@ -1593,6 +1639,10 @@ export async function materializeModelProfileForDeletion(
 		...prepared.previousAgentModelOverrides,
 		...concreteAgentModelOverrides,
 	};
+	const deletesOwnedDefaultChain =
+		prepared.defaultChain.length === 0 &&
+		prepared.previousDefaultChainState?.origin === "profile-activation" &&
+		prepared.previousDefaultChainState.identity === prepared.profileName;
 	let defaultChainChanged = false;
 
 	try {
@@ -1603,11 +1653,11 @@ export async function materializeModelProfileForDeletion(
 		prepared.settings.override("modelRoles", nextModelRoles);
 		prepared.settings.override("task.agentModelOverrides", nextAgentModelOverrides);
 		prepared.session.setActiveModelProfile?.(undefined);
-		if (prepared.defaultChain.length > 0) {
+		if (prepared.defaultChain.length > 0 || deletesOwnedDefaultChain) {
 			defaultChainChanged = true;
 			prepared.session.setConfiguredModelChain(
 				"default",
-				concreteDefaultChain,
+				deletesOwnedDefaultChain ? [] : concreteDefaultChain,
 				"profile-deletion-materialized",
 				undefined,
 				true,
@@ -1805,6 +1855,9 @@ export async function activateModelProfile(
 	options: PrepareModelProfileActivationOptions,
 	applyOptions: ApplyModelProfileActivationOptions = {},
 ): Promise<void> {
-	const prepared = await prepareModelProfileActivation(options);
+	const prepared = await prepareModelProfileActivation({
+		...options,
+		profileScope: applyOptions.profileScope ?? (applyOptions.persistDefault ? "durable" : "session"),
+	});
 	await applyPreparedModelProfileActivation(prepared, applyOptions);
 }

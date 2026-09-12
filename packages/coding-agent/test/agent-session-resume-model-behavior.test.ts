@@ -502,6 +502,29 @@ describe("AgentSession switchSession resumeModelBehavior", () => {
 		});
 	});
 
+	it("restores the durable role layer beneath a session-only profile", async () => {
+		const sonnet = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const settings = Settings.isolated({ "compaction.enabled": false });
+		session = new AgentSession({
+			agent: new Agent({ initialState: { model: sonnet, systemPrompt: ["Test"], tools: [], messages: [] } }),
+			sessionManager: SessionManager.create(tempDir.path(), tempDir.path()),
+			settings,
+			modelRegistry,
+		});
+
+		settings.override("task.agentModelOverrides", { executor: "provider/durable-executor" });
+		session.setActiveModelProfile("durable-profile", "durable");
+		session.noteProfileInstalledOverrides([], ["executor"], sonnet, {}, {});
+		settings.override("task.agentModelOverrides", { executor: "provider/session-executor" });
+		session.setActiveModelProfile("session-profile", "session");
+		session.noteProfileInstalledOverrides([], ["executor"], sonnet, {}, { executor: "provider/durable-executor" });
+
+		session.clearSessionOnlyModelProfileState();
+
+		expect(settings.get("task.agentModelOverrides").executor).toBe("provider/durable-executor");
+		expect(session.getActiveModelProfile()).toBeUndefined();
+	});
+
 	it("does not recover a saved selector that still exists in the full catalog", async () => {
 		const sonnet = getBundledModel("anthropic", "claude-sonnet-4-5")!;
 		const settings = Settings.isolated({

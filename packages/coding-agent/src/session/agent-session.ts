@@ -16135,6 +16135,8 @@ export class AgentSession {
 			return;
 		const hadInstalledKeys =
 			this.#activeProfileInstalledRoles.size > 0 || this.#activeProfileInstalledAgentOverrides.size > 0;
+		let restoredModelRoles: Record<string, ModelSelectorValue> | undefined;
+		let restoredAgentOverrides: Record<string, ModelSelectorValue> | undefined;
 		if (hadInstalledKeys) {
 			const modelRoles = { ...this.settings.get("modelRoles") };
 			const agentOverrides = { ...this.settings.get("task.agentModelOverrides") };
@@ -16146,13 +16148,17 @@ export class AgentSession {
 				if (baseline === undefined) delete agentOverrides[role];
 				else agentOverrides[role] = baseline;
 			}
-			this.settings.override("modelRoles", modelRoles);
-			this.settings.override("task.agentModelOverrides", agentOverrides);
+			restoredModelRoles = modelRoles;
+			restoredAgentOverrides = agentOverrides;
 			this.#activeProfileInstalledRoles.clear();
 			this.#activeProfileInstalledAgentOverrides.clear();
 		}
 		if (hadInstalledKeys || this.getActiveModelProfile() !== undefined) {
 			this.#modelRegistry.reapplyConfiguredModelBindings(this.settings);
+		}
+		if (restoredModelRoles && restoredAgentOverrides) {
+			this.settings.override("modelRoles", restoredModelRoles);
+			this.settings.override("task.agentModelOverrides", restoredAgentOverrides);
 		}
 		const defaultChain = getSessionContextForInternalRead(this.sessionManager).configuredModelChains.default;
 		if (!options?.preserveDefaultConfiguredChain && defaultChain && defaultChain.identity !== undefined) {
@@ -16181,7 +16187,6 @@ export class AgentSession {
 			if (!currentAgentModelOverrides.has(role)) this.#activeProfileInstalledAgentOverrides.delete(role);
 		}
 		for (const role of modelRoles) {
-			if (this.#activeProfileInstalledRoles.has(role)) continue;
 			const bindingValue = bindings?.modelRoles?.[role];
 			this.#activeProfileInstalledRoles.set(
 				role,
@@ -16191,7 +16196,6 @@ export class AgentSession {
 			);
 		}
 		for (const role of agentModelOverrides) {
-			if (this.#activeProfileInstalledAgentOverrides.has(role)) continue;
 			const bindingValue = bindings?.agentModelOverrides?.[role];
 			this.#activeProfileInstalledAgentOverrides.set(
 				role,
