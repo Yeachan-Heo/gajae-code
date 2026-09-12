@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
 import { Agent } from "@gajae-code/agent-core";
-import { Effort, getBundledModel } from "@gajae-code/ai";
+import { Effort, getBundledModel, type Model } from "@gajae-code/ai";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
@@ -16,6 +16,7 @@ import { TempDir } from "@gajae-code/utils";
 describe("AgentSession switchSession resumeModelBehavior", () => {
 	let tempDir: TempDir;
 	let session: AgentSession;
+	let targetSession: AgentSession | undefined;
 	let modelRegistry: ModelRegistry;
 	let authStorage: AuthStorage;
 
@@ -28,12 +29,31 @@ describe("AgentSession switchSession resumeModelBehavior", () => {
 
 	afterEach(async () => {
 		vi.restoreAllMocks();
+		if (targetSession) {
+			await targetSession.dispose();
+			targetSession = undefined;
+		}
 		if (session) {
 			await session.dispose();
 		}
 		authStorage.close();
 		tempDir.removeSync();
 	});
+
+	async function createPersistedTarget(model: Model, settings: Settings): Promise<string> {
+		targetSession = new AgentSession({
+			agent: new Agent({ initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] } }),
+			sessionManager: SessionManager.create(tempDir.path(), tempDir.path()),
+			settings,
+			modelRegistry,
+		});
+		await targetSession.setModel(model);
+		targetSession.setConfiguredModelChain("default", [`${model.provider}/${model.id}`], "legacy_session");
+		const sessionFile = targetSession.sessionFile;
+		if (!sessionFile) throw new Error("Expected persisted target session");
+		await targetSession.sessionManager.ensureOnDisk();
+		return sessionFile;
+	}
 
 	it("keeps the session's saved model by default when the global default changes", async () => {
 		const sonnet = getBundledModel("anthropic", "claude-sonnet-4-5")!;
@@ -95,6 +115,58 @@ describe("AgentSession switchSession resumeModelBehavior", () => {
 		expect(session.model?.id).toBe(opus.id);
 		expect(session.getActiveModelProfile()).toBe("codex-medium");
 	});
+	it("recovers a removed saved model through the durable preset without rewriting its legacy chain", async () => {
+		const sonnet = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const codex = getBundledModel("openai-codex", "gpt-5.6-sol")!;
+		authStorage.setRuntimeApiKey("openai-codex", "test-key");
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"modelProfile.default": "codex-medium",
+			"session.resumeModelBehavior": "keepSessionModel",
+		});
+		const sessionFile = await createPersistedTarget(sonnet, settings);
+
+		session = new AgentSession({
+			agent: new Agent({ initialState: { model: sonnet, systemPrompt: ["Test"], tools: [], messages: [] } }),
+			sessionManager: SessionManager.create(tempDir.path(), tempDir.path()),
+			settings,
+			modelRegistry,
+		});
+		vi.spyOn(modelRegistry, "getAvailable").mockReturnValue([codex]);
+		vi.spyOn(modelRegistry, "getAll").mockReturnValue([codex]);
+		const setConfiguredChain = vi.spyOn(session, "setConfiguredModelChain");
+		const notice = vi.spyOn(session, "emitNotice");
+
+		expect(await session.switchSession(sessionFile)).toBe(true);
+		expect(session.model?.id).toBe(codex.id);
+		expect(session.getConfiguredModelChain("default")).toEqual([`${sonnet.provider}/${sonnet.id}`]);
+		expect(setConfiguredChain).not.toHaveBeenCalled();
+		expect(notice).toHaveBeenCalledWith("warning", expect.any(String), "fallback");
+	});
+
+	it("does not recover a saved selector that still exists in the full catalog", async () => {
+		const sonnet = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"modelProfile.default": "codex-medium",
+			"session.resumeModelBehavior": "keepSessionModel",
+		});
+		const sessionFile = await createPersistedTarget(sonnet, settings);
+
+		session = new AgentSession({
+			agent: new Agent({ initialState: { model: sonnet, systemPrompt: ["Test"], tools: [], messages: [] } }),
+			sessionManager: SessionManager.create(tempDir.path(), tempDir.path()),
+			settings,
+			modelRegistry,
+		});
+		vi.spyOn(modelRegistry, "getAvailable").mockReturnValue([]);
+		vi.spyOn(modelRegistry, "getAll").mockReturnValue([sonnet]);
+		const recover = vi.spyOn(modelRegistry, "getModelProfile");
+
+		expect(await session.switchSession(sessionFile)).toBe(false);
+		expect(recover).not.toHaveBeenCalled();
+	});
+
 	it("restore shares one thinking-level rule: no stray thinking_level_change, recompute from defaultThinkingLevel", async () => {
 		const sonnet = getBundledModel("anthropic", "claude-sonnet-4-5")!;
 		const settings = Settings.isolated({ "compaction.enabled": false, defaultThinkingLevel: Effort.Medium });

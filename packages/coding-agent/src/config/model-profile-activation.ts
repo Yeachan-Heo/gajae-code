@@ -608,6 +608,72 @@ export function requiresQualifiedModelProfileRoleResolution(profile: Pick<ModelP
 	return profile.source === "user" || profile.source === "registry";
 }
 
+/** Resolve a durable preset's default chain without mutating session or settings state. */
+export async function resolveModelProfileDefaultChain(options: {
+	modelRegistry: PrepareModelProfileActivationOptions["modelRegistry"];
+	settings: Pick<Settings, "get">;
+	profileName: string;
+	credentialSessionId: string;
+}): Promise<{ profileName: string; entries: string[] }> {
+	const profiles = options.modelRegistry.getModelProfiles();
+	const profileName = validateModelProfileName(options.profileName, profiles, options.modelRegistry.getError?.());
+	const profile = profiles.get(profileName) ?? options.modelRegistry.getModelProfile(profileName)!;
+	const label = formatModelProfileDisplayLabel(profile);
+	const required = aggregateModelProfileRequiredProviders(profile.requiredProviders, profile);
+	const alternatives = profile.alternativeProviderGroups ?? [];
+	const alternativeProviders = new Set(alternatives.flat());
+	const requiredProviders = new Set(required);
+	const authenticated = new Set<string>();
+	const missing: string[] = [];
+	for (const provider of new Set([
+		...required,
+		...alternativeProviders,
+		...deriveModelProfileMappedProviders(profile),
+	])) {
+		const key = await options.modelRegistry.getApiKeyForProvider(provider, options.credentialSessionId);
+		if (key === kNoAuth || isAuthenticated(key)) authenticated.add(provider);
+		else if (requiredProviders.has(provider)) missing.push(provider);
+	}
+	const proxyProvider = profile.source === "user" ? undefined : resolveProxyProviderId(options.settings);
+	const proxyMode = profile.source === "user" ? "fallback" : resolveProxyMode(options.settings);
+	const routable = getProxyRoutableProviders(profile);
+	if (proxyMode === "always" && proxyProvider === undefined)
+		throw new Error('modelProfile.proxyMode "always" requires modelProfile.proxyProvider');
+	if (proxyProvider !== undefined && !options.modelRegistry.getConfiguredProviderIds?.().includes(proxyProvider)) {
+		throw new Error(
+			`modelProfile.proxyProvider "${proxyProvider}" is not configured. Configure it with \`gjc setup provider\` before activating a preset.`,
+		);
+	}
+	const proxyKey = proxyProvider
+		? await options.modelRegistry.getApiKeyForProvider(proxyProvider, options.credentialSessionId)
+		: undefined;
+	const proxyAuthenticated = proxyKey !== undefined && (proxyKey === kNoAuth || isAuthenticated(proxyKey));
+	if (proxyMode === "always" && !proxyAuthenticated) throw new ModelProfileCredentialError(label, [proxyProvider!]);
+	const strictMissing = missing.filter(provider => !routable.has(provider) && !alternativeProviders.has(provider));
+	if (strictMissing.length > 0) throw new ModelProfileCredentialError(label, strictMissing);
+	const routableMissing = missing.filter(provider => routable.has(provider) && !alternativeProviders.has(provider));
+	if (routableMissing.length > 0 && !proxyAuthenticated)
+		throw new ModelProfileCredentialError(label, proxyProvider ? [proxyProvider] : routableMissing);
+	for (const group of alternatives) {
+		if (group.some(provider => authenticated.has(provider))) continue;
+		if (group.every(provider => routable.has(provider)) && proxyAuthenticated) continue;
+		throw new ModelProfileCredentialError(label, group);
+	}
+	const available =
+		options.modelRegistry.getAvailableForProfileActivation?.() ??
+		options.modelRegistry.getAvailable?.() ??
+		options.modelRegistry.getAll();
+	let bindings = resolveProfileBindings(profile);
+	if (alternatives.length > 0) bindings = rewriteBindingsProviders(bindings, authenticated, alternatives);
+	if (proxyProvider !== undefined && proxyAuthenticated && profile.source !== "user") {
+		bindings = rewriteBindingsForProxy(bindings, proxyProvider, proxyMode, available, authenticated, routable);
+	}
+	return {
+		profileName,
+		entries: bindings.defaultSelector ? normalizeModelSelectorValue(bindings.defaultSelector) : [],
+	};
+}
+
 export function rewriteSelectorForProxy(
 	selector: string,
 	proxyProvider: string,
