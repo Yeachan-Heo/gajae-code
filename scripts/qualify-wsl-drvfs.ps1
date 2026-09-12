@@ -26,11 +26,17 @@ $EvidencePath = (Resolve-Path -LiteralPath $EvidencePath).Path
 $distro = 'gjc-drvfs-' + [Guid]::NewGuid().ToString('N')
 $ownedRoot = Join-Path $env:RUNNER_TEMP $distro
 New-Item -ItemType Directory -Path $ownedRoot | Out-Null
-$testRoot = Join-Path $ownedRoot 'fixtures'
-New-Item -ItemType Directory -Path $testRoot | Out-Null
+$fixtureParent = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'Temp'
+$testRoot = Join-Path $fixtureParent ($distro + '-fixtures')
 $importAttempted = $false
 Start-Transcript -Path (Join-Path $EvidencePath 'host-transcript.txt') | Out-Null
 try {
+    Get-Volume | Select-Object DriveLetter, FileSystem, FileSystemLabel, HealthStatus | ConvertTo-Json | Set-Content (Join-Path $EvidencePath 'host-volumes.json')
+    $fixtureDriveRoot = [IO.Path]::GetPathRoot($testRoot)
+    if ($fixtureDriveRoot -cnotmatch '^[A-Za-z]:\\$') { throw 'Fixture temp directory must be on a local Windows drive' }
+    $fixtureVolume = Get-Volume -DriveLetter ($fixtureDriveRoot.Substring(0, 1))
+    if ($fixtureVolume.FileSystem -cne 'NTFS') { throw 'This qualification requires an NTFS-backed DrvFS fixture' }
+    New-Item -ItemType Directory -Path $testRoot | Out-Null
     "distro=$distro`nrunner_image=$env:ImageOS`nrunner_image_version=$env:ImageVersion`nsource=$SourcePath`nwindows_test_root=$testRoot" | Set-Content (Join-Path $EvidencePath 'host.txt')
     Invoke-Native wsl.exe @('--version')
     Invoke-Native wsl.exe @('--status')
