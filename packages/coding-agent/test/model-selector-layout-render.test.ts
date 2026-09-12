@@ -93,7 +93,7 @@ async function replay(renderScope?: "layout"): Promise<Capture[]> {
 		loaded.resolve();
 		await terminal.waitForRender();
 		expect(terminal.getViewport().join("\n")).toContain("Model Alpha");
-		expect(transcript.renders).toBe(openingRenders + (renderScope ? 0 : 1));
+		expect(transcript.renders).toBe(openingRenders + (renderScope === "layout" ? 0 : 1));
 		capture();
 
 		terminal.clearWriteLog();
@@ -101,7 +101,7 @@ async function replay(renderScope?: "layout"): Promise<Capture[]> {
 		catalogChanged();
 		await terminal.waitForRender();
 		expect(terminal.getViewport().join("\n")).toContain("Model Beta");
-		expect(transcript.renders).toBe(openingRenders + (renderScope ? 0 : 2));
+		expect(transcript.renders).toBe(openingRenders + (renderScope === "layout" ? 0 : 2));
 		capture();
 
 		// A full request must win even without a semantic revision update.
@@ -215,7 +215,7 @@ async function replayPresetLanding(renderScope?: "layout"): Promise<Capture[]> {
 			expect(viewport).toContain("Model presets");
 			expect(viewport).toContain("Alpha presets");
 			expect(viewport).toContain("Pinned session status");
-			expect(transcript.renders).toBe(openingRenders + (renderScope ? 0 : frame));
+			expect(transcript.renders).toBe(openingRenders + (renderScope === "layout" ? 0 : frame));
 			captures.push({
 				viewport: terminal.getViewportAnsi(),
 				scrollback: terminal.getScrollBuffer(),
