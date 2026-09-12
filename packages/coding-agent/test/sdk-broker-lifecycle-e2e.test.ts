@@ -782,13 +782,13 @@ test("session host fails closed when its lifecycle effect marker is corrupt", as
 	}
 });
 
-test("session host orphan watchdog resolves only after the broker publication stays unobservable for the full grace window", async () => {
+test("session host orphan watchdog resolves only after its own broker stays unobservable for the full grace window", async () => {
 	let nowMs = 0;
 	const observations: (Record<string, unknown> | null | Error)[] = [
-		{ pid: 1 }, // live broker
+		{ ownerId: "owner", pid: 1, incarnation: "a" }, // own broker: pins identity
 		null, // broker vanishes: absence window opens
 		new Error("EACCES"), // unreadable publication accrues against the same bound
-		{ pid: 2 }, // replacement broker resets the window
+		{ ownerId: "owner", pid: 1, incarnation: "a" }, // the same broker returns: window resets
 		null, // broker vanishes again
 		null,
 		null, // grace elapses here
@@ -809,11 +809,71 @@ test("session host orphan watchdog resolves only after the broker publication st
 		graceMs: 20,
 		pollMs: 10,
 	});
-	// One live read, then two absent polls (window survives the replacement at
-	// read 4 only because it reset), then three consecutive absent polls whose
-	// third crosses the 20ms grace: 7 reads total, never fewer.
+	// One live read, then two accruing polls, then the pinned broker's return at
+	// read 4 resets the window, then three consecutive absent polls whose third
+	// crosses the 20ms grace: 7 reads total, never fewer.
 	expect(reads).toBe(7);
 	expect(nowMs).toBe(60);
+});
+
+test("session host orphan watchdog treats a replacement broker as absence because no replacement adopts an existing host", async () => {
+	let nowMs = 0;
+	// A crashed broker is succeeded by a live replacement that republishes
+	// discovery immediately. Routing for this host died with the original, and
+	// the successor never adopts it, so the successor's publication must not be
+	// read as proof that this host is still reachable.
+	const observations: Record<string, unknown>[] = [
+		{ ownerId: "owner", pid: 1, incarnation: "a" }, // own broker: pins identity
+		{ ownerId: "owner", pid: 2, incarnation: "b" }, // replacement: absence window opens
+		{ ownerId: "owner", pid: 2, incarnation: "b" },
+		{ ownerId: "owner", pid: 2, incarnation: "b" }, // grace elapses here
+	];
+	let reads = 0;
+	await watchSessionHostBrokerLiveness({
+		agentDir: "/unused",
+		now: () => nowMs,
+		sleep: async ms => {
+			nowMs += ms;
+		},
+		readDiscovery: async () => {
+			const observation = observations[reads];
+			reads += 1;
+			return observation ?? null;
+		},
+		graceMs: 20,
+		pollMs: 10,
+	});
+	expect(reads).toBe(4);
+	expect(nowMs).toBe(30);
+});
+
+test("session host orphan watchdog rejects a pid-reusing successor as its own broker", async () => {
+	let nowMs = 0;
+	// Same pid, different start time: `incarnation` is what separates a survivor
+	// from a successor that merely landed on the recycled pid.
+	const observations: Record<string, unknown>[] = [
+		{ ownerId: "owner", pid: 7, incarnation: "a" },
+		{ ownerId: "owner", pid: 7, incarnation: "b" },
+		{ ownerId: "owner", pid: 7, incarnation: "b" },
+		{ ownerId: "owner", pid: 7, incarnation: "b" },
+	];
+	let reads = 0;
+	await watchSessionHostBrokerLiveness({
+		agentDir: "/unused",
+		now: () => nowMs,
+		sleep: async ms => {
+			nowMs += ms;
+		},
+		readDiscovery: async () => {
+			const observation = observations[reads];
+			reads += 1;
+			return observation ?? null;
+		},
+		graceMs: 20,
+		pollMs: 10,
+	});
+	expect(reads).toBe(4);
+	expect(nowMs).toBe(30);
 });
 
 test("startup failure artifacts reject symlink and oversize collisions while accepting byte-identical owner evidence", async () => {
