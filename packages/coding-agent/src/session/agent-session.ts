@@ -316,7 +316,7 @@ import {
 import {
 	assertNonEmptyGjcSessionId,
 	modeStatePath as sessionModeStatePath,
-	sessionRuntimeDir,
+	sessionRuntimeStatePath,
 	sessionStateDir,
 } from "../gjc-runtime/session-layout";
 import { sessionStateLockFailureFields, shouldWarnPersistFailure } from "../gjc-runtime/session-state-lock";
@@ -4474,6 +4474,9 @@ export class AgentSession {
 				newCwdIdentity: move.newCwdIdentity,
 				previousSessionFile: move.previousSessionFile ?? null,
 				newSessionFile: move.newSessionFile ?? null,
+				// The rescope family must decide pin-vs-derived from the marker THIS session
+				// owns, never from the ambient pin (#5473).
+				stateFile: this.#runtimeStateMarkerFile({ sessionId: this.sessionId, cwd: move.previousCwd }),
 			});
 		});
 		this.#unregisterMoveAbortListener = this.sessionManager.registerMoveAbortListener(async move => {
@@ -4485,6 +4488,7 @@ export class AgentSession {
 							sessionId: this.sessionId,
 							cwd: move.newCwd,
 							sessionFile: move.newSessionFile ?? null,
+							stateFile: this.#runtimeStateMarkerFile({ sessionId: this.sessionId, cwd: move.newCwd }),
 						},
 						moveId,
 						move.previousCwd,
@@ -4503,6 +4507,7 @@ export class AgentSession {
 					sessionId: this.sessionId,
 					cwd: move.newCwd,
 					sessionFile: move.newSessionFile ?? null,
+					stateFile: this.#runtimeStateMarkerFile({ sessionId: this.sessionId, cwd: move.newCwd }),
 				},
 				move.previousCwd,
 				moveId,
@@ -4526,6 +4531,7 @@ export class AgentSession {
 						cwd: move.newCwd,
 						sessionFile: this.sessionManager.getSessionFile() ?? null,
 						previousSessionFile: move.previousSessionFile ?? null,
+						stateFile: this.#runtimeStateMarkerFile({ sessionId: this.sessionId, cwd: move.newCwd }),
 					},
 					move.previousCwd,
 				);
@@ -4535,6 +4541,7 @@ export class AgentSession {
 						sessionId: this.sessionId,
 						cwd: move.newCwd,
 						sessionFile: this.sessionManager.getSessionFile() ?? null,
+						stateFile: this.#runtimeStateMarkerFile({ sessionId: this.sessionId, cwd: move.newCwd }),
 					},
 					this.#coordinatorRescopeMoveId,
 					move.previousCwd,
@@ -4551,6 +4558,7 @@ export class AgentSession {
 							cwd: move.newCwd,
 							sessionFile: this.sessionManager.getSessionFile() ?? null,
 							previousSessionFile: move.previousSessionFile ?? null,
+							stateFile: this.#runtimeStateMarkerFile({ sessionId: this.sessionId, cwd: move.newCwd }),
 						},
 						move.previousCwd,
 					);
@@ -4560,6 +4568,7 @@ export class AgentSession {
 							sessionId: this.sessionId,
 							cwd: move.newCwd,
 							sessionFile: this.sessionManager.getSessionFile() ?? null,
+							stateFile: this.#runtimeStateMarkerFile({ sessionId: this.sessionId, cwd: move.newCwd }),
 						},
 						this.#coordinatorRescopeMoveId,
 						move.previousCwd,
@@ -4594,6 +4603,10 @@ export class AgentSession {
 			sessionId: this.sessionId,
 			cwd: this.sessionManager.getCwd(),
 			sessionFile: this.sessionManager.getSessionFile() ?? null,
+			stateFile: this.#runtimeStateMarkerFile({
+				sessionId: this.sessionId,
+				cwd: this.sessionManager.getCwd(),
+			}),
 		};
 		if (hasCoordinatorRuntimeStateRescopeJournal(rescopeRecoveryContext)) {
 			this.extendStartupTurnBarrier(recoverCoordinatorRuntimeStateRescope(rescopeRecoveryContext));
@@ -6174,8 +6187,8 @@ export class AgentSession {
 	#runtimeStateMarkerFile(input: { sessionId: string; cwd: string }): string | null {
 		if (!input.sessionId.trim()) return null;
 		const pinned = process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]?.trim();
-		if (this.taskDepth > 0) return path.join(sessionRuntimeDir(input.cwd, input.sessionId), "runtime-state.json");
-		return pinned || path.join(sessionRuntimeDir(input.cwd, input.sessionId), "runtime-state.json");
+		if (this.taskDepth > 0) return sessionRuntimeStatePath(input.cwd, input.sessionId);
+		return pinned || sessionRuntimeStatePath(input.cwd, input.sessionId);
 	}
 
 	#captureCoordinatorRuntimeStatePersistContext(): CoordinatorRuntimeStatePersistContext {
@@ -19828,6 +19841,10 @@ export class AgentSession {
 	 * provider session state and configured WebSocket transport preference
 	 * instead of falling back to a fresh HTTP/SSE session. Mirrors the
 	 * `providerSessionId ?? sessionId` affinity the agent loop sends per turn.
+	 *
+	 * `maintenanceCall` is what lets an agent-level provider (for example Devin
+	 * over ACP) refuse work it cannot serve instead of forwarding a
+	 * summarization prompt to a billed upstream agent.
 	 */
 	#maintenanceProviderTransport(): {
 		sessionId: string | undefined;
@@ -19835,6 +19852,7 @@ export class AgentSession {
 		providerSessionState: Map<string, ProviderSessionState>;
 		preferWebsockets: boolean | undefined;
 		remoteCompactionFallbackHealth: RemoteCompactionFallbackHealthHooks;
+		maintenanceCall: boolean;
 	} {
 		const providerSessionId = this.agent.providerSessionId ?? this.agent.sessionId;
 		return {
@@ -19843,6 +19861,7 @@ export class AgentSession {
 			providerSessionState: this.#providerSessionState,
 			preferWebsockets: this.agent.preferWebsockets,
 			remoteCompactionFallbackHealth: this.#remoteCompactionFallbackHealth,
+			maintenanceCall: true,
 		};
 	}
 
@@ -21581,7 +21600,7 @@ export class AgentSession {
 	 * Marks the credential that just failed and reports whether the session
 	 * actually moved to a DIFFERENT stored credential.
 	 *
-	 * Three invariants this enforces, in order:
+	 * Credential mutation invariants:
 	 *
 	 * 1. **Pin guard, first and for every trigger class.** A pinned credential
 	 *    (`--api-key` or `--credential`) must never be mutated or rotated away
@@ -21591,11 +21610,10 @@ export class AgentSession {
 	 *    path invalidated pinned credentials outright.
 	 * 2. **A terminal `forbidden` never mutates credential state.** Rotation
 	 *    would hide an authorization defect and cycle through healthy rows.
-	 * 3. **Distinct-row proof in BOTH branches.** `invalidateCredentialMatching`
-	 *    reports "I matched and blocked a row", which is not the same as "the
-	 *    session now uses a different credential" — with a single-row pool it is
-	 *    true while nothing rotated. Both branches therefore re-resolve and
-	 *    require the active key to have actually changed.
+	 * 3. Auth failures retain their existing key-change proof. Quota, rate-limit
+	 *    and OAuth account-model rejections mark before resolving and require two known,
+	 *    different stored row IDs before reporting rotation. This is mark-time
+	 *    identity, not dispatch-bound attribution across shared sessions.
 	 */
 	async #markFailedCredential(trigger: {
 		class: FallbackTriggerClass;
@@ -21627,27 +21645,33 @@ export class AgentSession {
 		}
 
 		const credentialSessionId = this.credentialSessionId;
+		if (trigger.class !== "auth") {
+			if (
+				trigger.class === "credential" &&
+				authStorage.getSessionCredentialType(provider, credentialSessionId) !== "oauth"
+			)
+				return "unchanged";
+			const before = authStorage.getSessionCredentialRowId(provider, credentialSessionId);
+			const remaining = await authStorage.markUsageLimitReached(provider, credentialSessionId, {
+				// Account-model rejection retains default backoff, not response retry-after.
+				...(trigger.class === "credential" ? {} : { retryAfterMs: trigger.retryAfterMs }),
+				owner: this.#modelRegistry.getAuthStorageOwner(),
+				...(before === undefined ? {} : { rowId: before }),
+			});
+			if (!remaining) return "exhausted";
+			await this.#modelRegistry.getApiKey(this.model, credentialSessionId);
+			const after = authStorage.getSessionCredentialRowId(provider, credentialSessionId);
+			if (before !== undefined && after !== undefined && before !== after) return "rotated";
+			return "unchanged";
+		}
 		const activeApiKey = await this.#modelRegistry.getApiKey(this.model, credentialSessionId);
 
-		let remaining: boolean;
-		if (trigger.class === "auth") {
-			if (!isAuthenticated(activeApiKey)) return "unchanged";
-			remaining = await authStorage.invalidateCredentialMatching(provider, activeApiKey, {
-				sessionId: credentialSessionId,
-				owner: this.#modelRegistry.getAuthStorageOwner(),
-			});
-			if (!remaining) return "unchanged";
-		} else if (trigger.class === "credential") {
-			if (authStorage.getSessionCredentialType(provider, credentialSessionId) !== "oauth") return "unchanged";
-			remaining = await authStorage.markUsageLimitReached(provider, credentialSessionId, {
-				owner: this.#modelRegistry.getAuthStorageOwner(),
-			});
-		} else {
-			remaining = await authStorage.markUsageLimitReached(provider, credentialSessionId, {
-				retryAfterMs: trigger.retryAfterMs,
-				owner: this.#modelRegistry.getAuthStorageOwner(),
-			});
-		}
+		if (!isAuthenticated(activeApiKey)) return "unchanged";
+		const remaining = await authStorage.invalidateCredentialMatching(provider, activeApiKey, {
+			sessionId: credentialSessionId,
+			owner: this.#modelRegistry.getAuthStorageOwner(),
+		});
+		if (!remaining) return "unchanged";
 
 		// (3) Distinct-row proof.
 		if ((await this.#modelRegistry.getApiKey(this.model, credentialSessionId)) !== activeApiKey) {

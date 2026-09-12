@@ -1778,7 +1778,7 @@ test("ACP malformed agent_failed waits for agent_end before replacement prompt",
 	}
 });
 
-test("ACP preserves the settlement-grace failure diagnostic", async () => {
+test("ACP derives the settlement-grace failure wording from the safe contract", async () => {
 	const fixture = await createFixture();
 	try {
 		const pending = prompt(fixture, "unsettled prompt resources");

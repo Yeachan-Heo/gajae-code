@@ -11,10 +11,11 @@ import { createNotificationsExtension } from "../src/sdk/bus";
 
 /**
  * A provider failure reaches this extension as an `agent_end` carrying an error
- * assistant message. The SDK/ACP failure envelope uses the fixed safe token
- * "Prompt submission failed." (see `sanitizePromptFailure`), while the assistant
- * message can remain in the local session transcript. The bounded operator log
- * keeps that failure diagnosable without widening the SDK/ACP redaction boundary.
+ * assistant message. The SDK/ACP failure envelope carries only the bounded,
+ * derived phase/category wording (see `promptFailureMessage` and
+ * `sanitizePromptFailure`), never raw provider text, while the assistant message
+ * can remain in the local session transcript. The bounded operator log keeps that
+ * failure diagnosable without widening the SDK/ACP redaction boundary.
  */
 
 const dirs: string[] = [];

@@ -304,6 +304,16 @@ function lifecycleFingerprint(operation: string, input: Record<string, unknown>)
 		.update(JSON.stringify({ operation, input: lifecycleRequestIdentity(input) }))
 		.digest("hex");
 }
+
+function publicLifecycleLookupInput(
+	input: Record<string, unknown>,
+): { operation: "session.create"; target: Record<string, unknown> } | BrokerResponse {
+	if (input.operation !== "session.create")
+		return error("invalid_input", "session.lookup only supports operation session.create");
+	const target = objectRecord(input.target);
+	if (!target) return error("invalid_input", "session.lookup target must be an object");
+	return { operation: "session.create", target };
+}
 function lifecycleResponseState(response: BrokerResponse): LifecycleState {
 	if (response.ok) return "terminal_ok";
 	if (isCleanupPending(response)) return "effect_started";
@@ -3165,6 +3175,28 @@ export class Broker {
 			indexSeq: snapshot.indexSeq,
 		};
 	}
+	async #lookupLifecycle(
+		requestedOperation: string,
+		idempotencyKey: string | undefined,
+		requestedFingerprint: string,
+	): Promise<BrokerResponse> {
+		if (!idempotencyKey) return error("invalid_input", "operation, idempotencyKey, and fingerprint are required");
+		if (requestedOperation === "session.spawn")
+			return error("invalid_input", "session.spawn does not support lifecycle lookup");
+		if (!LIFECYCLE_OPERATIONS.has(requestedOperation)) return error("not_found", "lifecycle operation was not found");
+		const identity = await deriveIdempotencyIdentity(this.settings.agentDir, requestedOperation, idempotencyKey);
+		const entry = this.ledger.get(identity);
+		if (!entry) return error("not_found", "lifecycle operation was not found");
+		if (entry.fingerprint !== requestedFingerprint)
+			return error("idempotency_conflict", "lifecycle request fingerprint differs");
+		if (entry.state === "terminal_uncertain")
+			return error("terminal_uncertain", "lifecycle outcome is still uncertain");
+		if (entry.state !== "terminal_ok" && entry.state !== "terminal_error")
+			return error("lifecycle_pending", "lifecycle outcome is still pending");
+		return isBrokerResponse(entry.response)
+			? entry.response
+			: error("terminal_uncertain", "lifecycle outcome has no recorded response");
+	}
 	handleRequest(operation: string, input: Record<string, unknown>, idempotencyKey?: string): Promise<BrokerResponse> {
 		if (this.#stopping || (this.#publication !== null && this.#publicationState !== "healthy-owned"))
 			return Promise.resolve(error("unavailable", "broker publication is unavailable"));
@@ -3190,6 +3222,15 @@ export class Broker {
 			if (spawnClose) return spawnClose;
 		}
 		if (operation === "session.control") return this.#sessionControl(input, idempotencyKey);
+		if (operation === "session.lookup") {
+			const lookup = publicLifecycleLookupInput(input);
+			if (isBrokerResponse(lookup)) return lookup;
+			return await this.#lookupLifecycle(
+				lookup.operation,
+				idempotencyKey,
+				lifecycleFingerprint(lookup.operation, lookup.target),
+			);
+		}
 		const fingerprint = lifecycleFingerprint(operation, input);
 		const normalization = normalizeBrokerInput(operation, input);
 		if (isBrokerResponse(normalization)) return normalization;
@@ -3252,22 +3293,9 @@ export class Broker {
 		if (operation === "broker.lookup_lifecycle") {
 			const requestedOperation = typeof input.operation === "string" ? input.operation : undefined;
 			const requestedFingerprint = typeof input.fingerprint === "string" ? input.fingerprint : undefined;
-			if (!idempotencyKey || !requestedOperation || !requestedFingerprint)
+			if (!requestedOperation || !requestedFingerprint)
 				return error("invalid_input", "operation, idempotencyKey, and fingerprint are required");
-			if (requestedOperation === "session.spawn")
-				return error("invalid_input", "session.spawn does not support lifecycle lookup");
-			if (!LIFECYCLE_OPERATIONS.has(requestedOperation))
-				return error("not_found", "lifecycle operation was not found");
-			const identity = await deriveIdempotencyIdentity(this.settings.agentDir, requestedOperation, idempotencyKey);
-			const entry = this.ledger.get(identity);
-			if (!entry) return error("not_found", "lifecycle operation was not found");
-			if (entry.fingerprint !== requestedFingerprint)
-				return error("idempotency_conflict", "lifecycle request fingerprint differs");
-			if (entry.state === "terminal_uncertain")
-				return error("terminal_uncertain", "lifecycle outcome is still uncertain");
-			return isBrokerResponse(entry.response)
-				? entry.response
-				: error("terminal_uncertain", "lifecycle outcome has no recorded response");
+			return await this.#lookupLifecycle(requestedOperation, idempotencyKey, requestedFingerprint);
 		}
 
 		if (!idempotencyKey) return error("invalid_input", "idempotencyKey is required for lifecycle operations");

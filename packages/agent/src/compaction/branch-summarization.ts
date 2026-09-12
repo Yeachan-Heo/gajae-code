@@ -93,6 +93,12 @@ export interface GenerateBranchSummaryOptions {
 	sessionId?: string;
 	/** Opaque provider conversation identity; never derived from branch-summary content. */
 	providerSessionId?: string;
+	/**
+	 * Marks this as GJC maintenance work rather than an interactive user turn.
+	 * Agent-level providers (e.g. `devin-acp`) refuse maintenance calls they
+	 * cannot serve instead of forwarding them to a billed upstream agent.
+	 */
+	maintenanceCall?: boolean;
 	/** Shared provider state map so the branch summary call reuses session-scoped transport/session caches. */
 	providerSessionState?: Map<string, ProviderSessionState>;
 	/** Hint that websocket transport should be preferred when supported by the provider implementation. */
@@ -337,6 +343,7 @@ export async function generateBranchSummary(
 			sessionId,
 			providerSessionId,
 			providerSessionState,
+			maintenanceCall: options.maintenanceCall,
 			preferWebsockets,
 		},
 		{ telemetry: options.telemetry, oneshotKind: "branch_summary" },

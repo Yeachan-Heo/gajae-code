@@ -15,6 +15,7 @@ const BROKER_OPERATIONS = new Set([
 	"session.close",
 	"session.delete",
 	"session.reconcile_uncertain",
+	"session.lookup",
 	"broker.shutdown",
 	"session.control",
 	"broker.lookup_lifecycle",

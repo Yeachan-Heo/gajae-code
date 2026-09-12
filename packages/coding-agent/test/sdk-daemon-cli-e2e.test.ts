@@ -1,13 +1,16 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { createHash } from "node:crypto";
 import { closeSync, openSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import path from "node:path";
 import { Broker } from "../src/sdk/broker/broker";
+import { deriveIdempotencyIdentity } from "../src/sdk/broker/identity";
 import { resolveScopeRequest, scopeRequestV1 } from "../src/sdk/broker/session-scope";
 import { scanRetainedTranscriptTail } from "../src/sdk/cli/session-cli";
 import { SessionEventStream } from "../src/sdk/host/events";
 import { type CursorEnvelope, signCursor, verifyCursor } from "../src/sdk/host/query/cursor";
+import { deriveSessionLifecycleIdempotencyKey } from "../src/sdk/lifecycle";
 import { SessionManager } from "../src/session/session-manager";
 
 const cliEntrypoint = path.resolve(import.meta.dir, "../src/cli.ts");
@@ -1587,6 +1590,131 @@ describe("SDK session CLI", () => {
 			result: { sessions: [{ sessionId: "page-one" }, { sessionId: "page-two" }] },
 		});
 		expect(requests).toEqual([{}, { cursor: "page-2" }]);
+	}, 60_000);
+
+	it("raw global session.list page preserves one broker page and its cursor", async () => {
+		const originalHandleRequest = broker.handleRequest.bind(broker);
+		const requests: Array<Record<string, unknown>> = [];
+		broker.handleRequest = async (operation, input, idempotencyKey) => {
+			if (operation === "session.list") {
+				requests.push(input);
+				return input.cursor === undefined
+					? {
+							ok: true,
+							result: { sessions: [stubRow("page-one")], continuationCursor: "page-2" },
+						}
+					: { ok: true, result: { sessions: [stubRow("page-two")] } };
+			}
+			return await originalHandleRequest(operation, input, idempotencyKey);
+		};
+
+		const first = await runCli(root, agentDir, ["raw", "global", "--op", "session.list", "--page", "--limit", "1"]);
+		expect(first.exitCode).toBe(0);
+		expect(JSON.parse(first.stdout)).toMatchObject({
+			ok: true,
+			result: { sessions: [{ sessionId: "page-one" }], continuationCursor: "page-2" },
+		});
+
+		const second = await runCli(root, agentDir, [
+			"raw",
+			"global",
+			"--op",
+			"session.list",
+			"--page",
+			"--limit",
+			"1",
+			"--cursor",
+			"page-2",
+		]);
+		expect(second.exitCode).toBe(0);
+		expect(JSON.parse(second.stdout)).toMatchObject({ ok: true, result: { sessions: [{ sessionId: "page-two" }] } });
+		expect(JSON.parse(second.stdout).result).not.toHaveProperty("continuationCursor");
+		expect(requests).toEqual([{ limit: 1 }, { limit: 1, cursor: "page-2" }]);
+	}, 60_000);
+
+	it("raw global session.lookup recovers a recorded create without replaying it", async () => {
+		const originalHandleRequest = broker.handleRequest.bind(broker);
+		const operations: string[] = [];
+		broker.handleRequest = async (operation, input, idempotencyKey) => {
+			operations.push(operation);
+			return await originalHandleRequest(operation, input, idempotencyKey);
+		};
+		const actor = { id: "gjc-sdk-session-cli", namespace: "sdk:session-cli" } as const;
+		const requestKey = "lost-create-response";
+		const target = { cwd: root };
+		const idempotencyKey = deriveSessionLifecycleIdempotencyKey(actor, requestKey, "session.create");
+		const identity = await deriveIdempotencyIdentity(agentDir, "session.create", idempotencyKey);
+		const fingerprint = createHash("sha256")
+			.update(JSON.stringify({ operation: "session.create", input: target }))
+			.digest("hex");
+		const begun = await broker.ledger.begin(identity, `test-${requestKey}`, {
+			operationKey: `session.create\0${idempotencyKey}`,
+			fingerprint,
+		});
+		expect(begun.kind).toBe("new");
+		await broker.ledger.transition(identity, "terminal_ok", {
+			response: { ok: true, result: { sessionId: "recovered-create", cwd: root } },
+		});
+
+		const recovered = await runCli(root, agentDir, [
+			"raw",
+			"global",
+			"--op",
+			"session.lookup",
+			"--idempotency-key",
+			requestKey,
+			"--json-input",
+			JSON.stringify(target),
+		]);
+		expect(recovered.exitCode).toBe(0);
+		expect(JSON.parse(recovered.stdout)).toEqual({
+			ok: true,
+			operation: "session.lookup",
+			status: "found",
+			request: { operation: "session.create", requestKey },
+			result: { sessionId: "recovered-create", cwd: root },
+		});
+
+		const missing = await runCli(root, agentDir, [
+			"raw",
+			"global",
+			"--op",
+			"session.lookup",
+			"--idempotency-key",
+			"missing-create",
+			"--json-input",
+			JSON.stringify(target),
+		]);
+		expect(missing.exitCode).toBe(1);
+		expect(JSON.parse(missing.stdout)).toEqual({
+			ok: false,
+			operation: "session.lookup",
+			status: "not_found",
+			request: { operation: "session.create", requestKey: "missing-create" },
+			certainty: "uncertain",
+			error: { code: "not_found", message: "lifecycle operation was not found" },
+		});
+
+		const conflict = await runCli(root, agentDir, [
+			"raw",
+			"global",
+			"--op",
+			"session.lookup",
+			"--idempotency-key",
+			requestKey,
+			"--json-input",
+			JSON.stringify({ cwd: path.join(root, "different-target") }),
+		]);
+		expect(conflict.exitCode).toBe(1);
+		expect(JSON.parse(conflict.stdout)).toEqual({
+			ok: false,
+			operation: "session.lookup",
+			status: "conflict",
+			request: { operation: "session.create", requestKey },
+			certainty: "uncertain",
+			error: { code: "idempotency_conflict", message: "lifecycle request fingerprint differs" },
+		});
+		expect(operations).toEqual(["session.lookup", "session.lookup", "session.lookup"]);
 	}, 60_000);
 
 	it("rejects a failed SDK session CLI session.list continuation without returning page one", async () => {

@@ -830,7 +830,89 @@ describe("coordinator runtime state sidecar", () => {
 		// marker belongs to and which marker this write was aimed at.
 		expect(failure.message).toContain('session_id must be "child-scope" (received "parent-session")');
 		expect(failure.message).toContain(`using marker ${JSON.stringify(pinnedFile)}`);
+		// ...and it must pin the payload it refused, so the two writers can be compared.
+		expect(failure.message).toMatch(/payload-content sha256 [a-f0-9]{64}/);
 		expect(await Bun.file(pinnedFile).text()).toBe(parentMarker);
+	});
+
+	it("never lets a foreign marker inject control sequences into the refusal", async () => {
+		const root = await tempRoot();
+		const sessionId = "foreign-diagnostic";
+		const hostile = "D:\\Users\\Operator\\Repo\u001b[2J\u009b\u007f\u202e\u200b\ufeff\u2066\u2028\u2029injected";
+		const stateFile = path.join(root, "runtime-state.json");
+		await Bun.write(
+			stateFile,
+			JSON.stringify({
+				schema_version: 1,
+				session_id: sessionId,
+				state: "running",
+				live: true,
+				cwd: hostile,
+				workdir: hostile,
+				session_file: null,
+			}),
+		);
+		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
+		// normalizedIdentity prefers GJC_COORDINATOR_SESSION_ID whenever the pin is set, so this
+		// case must not inherit an ambient coordinator id from the process running the suite.
+		delete process.env[GJC_COORDINATOR_SESSION_ID_ENV];
+
+		const failure = await expectRefusal(
+			persistCoordinatorRuntimeStateFromEvent({ type: "turn_start" }, { sessionId, cwd: root, sessionFile: null }),
+		);
+
+		expect(failure.name).toBe("ForeignRuntimeStateError");
+		// The operator still learns both workspaces — that is what distinguishes a foreign
+		// marker from file corruption — but the recorded path is de-fanged, not echoed raw.
+		expect(failure.message).toContain("D:\\Users\\Operator\\Repo");
+		for (const unsafe of ["\u001b", "\u009b", "\u007f", "\u202e", "\u200b", "\ufeff", "\u2066", "\u2028", "\u2029"]) {
+			expect(failure.message).not.toContain(unsafe);
+		}
+		expect(failure.message).toMatch(/payload-content sha256 [a-f0-9]{64}/);
+		// The exact recorded value stays available on the typed field.
+		expect((failure as Error & { recordedCwd: string }).recordedCwd).toBe(hostile);
+	});
+
+	it("accepts a non-canonical spelling of the session's own derived marker", async () => {
+		const root = await tempRoot();
+		const real = path.join(root, "real");
+		const alias = path.join(root, "alias");
+		const target = path.join(root, "target");
+		await fs.mkdir(real);
+		await fs.mkdir(target);
+		await fs.symlink(real, alias);
+		// No pin: this session owns its derived marker, and a caller may reach it through a
+		// symlinked spelling of the cwd (macOS `/var` and `/tmp` prefixes behave the same way).
+		delete process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV];
+		const sessionId = "spelling-session";
+		const aliased = path.join(sessionRuntimeDir(alias, sessionId), "runtime-state.json");
+
+		await expect(
+			prepareCoordinatorRuntimeStateRescope({ sessionId, previousCwd: real, newCwd: target, stateFile: aliased }),
+		).resolves.toBeDefined();
+		expect(fsSync.existsSync(path.join(sessionRuntimeDir(real, sessionId), "runtime-state-rescope.json"))).toBe(true);
+	});
+
+	it("de-fangs a caller-named rescope marker this session cannot own", async () => {
+		const root = await tempRoot();
+		delete process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV];
+		const launcher = path.join(root, "launcher");
+		const target = path.join(root, "target");
+		await fs.mkdir(launcher);
+		await fs.mkdir(target);
+		const hostile = `${root}/foreign\u202e\u200bmarker.json`;
+
+		const failure = await expectRefusal(
+			prepareCoordinatorRuntimeStateRescope({
+				sessionId: "foreign-marker-session",
+				previousCwd: launcher,
+				newCwd: target,
+				stateFile: hostile,
+			}),
+		);
+
+		expect(failure.message).toContain("refusing to guess its ownership");
+		for (const unsafe of ["\u202e", "\u200b"]) expect(failure.message).not.toContain(unsafe);
 	});
 
 	it("reports a live transition timeout without misclassifying or changing runtime state", async () => {
@@ -3848,6 +3930,54 @@ describe("coordinator runtime state sidecar", () => {
 		await expect(readPayload(stateFile)).resolves.toMatchObject({ state: "running", ready_for_input: false });
 	});
 
+	it("issue-5471: the legacy readiness tolerance does not weaken the sidecar signing fence", async () => {
+		const root = await tempRoot();
+		const stateFile = path.join(root, "state.json");
+		const fixture = path.join(import.meta.dir, "fixtures", "session-state-sidecar-subprocess.ts");
+		const { privateKey } = generateKeyPairSync("ed25519");
+		const privateDer = privateKey.export({ format: "der", type: "pkcs8" }).toString("base64");
+		const keyId = "455f1a4c455f1a4c455f1a4c455f1a4c455f1a4c455f1a4c455f1a4c455f1a4c";
+		// The exact pre-#4351 shape: unsigned, no sidecar key, readiness bit still set.
+		await Bun.write(
+			stateFile,
+			`${JSON.stringify({
+				schema_version: 1,
+				session_id: "155-FinalA4",
+				state: "completed",
+				ready_for_input: true,
+				cwd: root,
+				workdir: root,
+				session_file: null,
+				current_turn_id: "turn-final",
+				last_turn_id: "turn-prev",
+				live: false,
+				source: "agent_session_event",
+				event: "agent_end",
+				updated_at: "2026-08-01T01:14:30.375Z",
+			})}\n`,
+		);
+		const before = await Bun.file(stateFile).bytes();
+		const child = Bun.spawn([process.execPath, fixture, stateFile], {
+			cwd: root,
+			env: {
+				...process.env,
+				[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]: stateFile,
+				[GJC_COORDINATOR_SESSION_ID_ENV]: "155-FinalA4",
+				[GJC_COORDINATOR_SIDECAR_SIGNATURE_REQUIRED_ENV]: "true",
+				[GJC_COORDINATOR_SIDECAR_KEY_ID_ENV]: keyId,
+				[GJC_COORDINATOR_SIDECAR_SIGNING_KEY_ENV]: privateDer,
+			},
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const stderr = await new Response(child.stderr).text();
+		expect(await child.exited).not.toBe(0);
+		// Normalizing the readiness bit must not become a way past the signing fence, and a
+		// refused marker must survive byte-identical.
+		expect(stderr).toContain("the marker is not signed by this session's sidecar key");
+		expect(await Bun.file(stateFile).bytes()).toEqual(before);
+	});
+
 	it("issue-4351: errored session reports ready_for_input false", async () => {
 		const root = await tempRoot();
 		const stateFile = path.join(root, "issue-4351-errored.json");
@@ -3909,15 +4039,19 @@ describe("coordinator runtime state sidecar", () => {
 		})}\n`;
 		await Bun.write(stateFile, evidence);
 		const context = { sessionId, cwd: root, sessionFile: null };
-		const message = `Existing runtime state marker violates the lifecycle contract: ${detail}; refusing to overwrite.`;
+		const prefix = `Existing runtime state marker violates the lifecycle contract: ${detail}`;
 
-		await expect(
+		const failure = await expectRefusal(
 			persistCoordinatorRuntimeStateFromEvent(assistantEnd("re-assert completion"), context),
-		).rejects.toThrow(message);
-		expect(await Bun.file(stateFile).text()).toBe(evidence);
-		await expect(persistCoordinatorRuntimeStateFromPostmortem(postmortem.Reason.SIGTERM, context)).rejects.toThrow(
-			message,
 		);
+		expect(failure.message).toContain(prefix);
+		expect(failure.message).toMatch(/payload sha256 [a-f0-9]{64}; refusing to overwrite\.$/);
+		expect(await Bun.file(stateFile).text()).toBe(evidence);
+		const postmortemFailure = await expectRefusal(
+			persistCoordinatorRuntimeStateFromPostmortem(postmortem.Reason.SIGTERM, context),
+		);
+		expect(postmortemFailure.message).toContain(prefix);
+		expect(postmortemFailure.message).toMatch(/payload sha256 [a-f0-9]{64}; refusing to overwrite\.$/);
 		expect(await Bun.file(stateFile).text()).toBe(evidence);
 	});
 });

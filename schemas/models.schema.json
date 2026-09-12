@@ -38,7 +38,8 @@
 							"google-vertex",
 							"google-gemini-cli",
 							"ollama-chat",
-							"cursor-agent"
+							"cursor-agent",
+							"devin-acp"
 						]
 					},
 					"headers": {
@@ -362,7 +363,8 @@
 										"google-vertex",
 										"google-gemini-cli",
 										"ollama-chat",
-										"cursor-agent"
+										"cursor-agent",
+										"devin-acp"
 									]
 								},
 								"baseUrl": {

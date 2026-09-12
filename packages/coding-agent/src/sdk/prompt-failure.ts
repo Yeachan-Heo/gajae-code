@@ -19,6 +19,14 @@ export interface PromptFailureEvidence {
 	hasActivity?: boolean;
 }
 
+/** Start/activity evidence for phase derivation from a reconciliation record. */
+export function failureEvidence(record: { startedAt?: number }, hasActivity?: boolean): PromptFailureEvidence {
+	return {
+		...(record.startedAt !== undefined ? { startedAt: record.startedAt } : {}),
+		...(hasActivity === true ? { hasActivity: true } : {}),
+	};
+}
+
 /**
  * Bounded classifier sets. Only these safe tokens may select a category; any
  * other value (including `undefined`) stays `unknown` instead of guessing, so
@@ -32,6 +40,7 @@ const PROVIDER_TRANSPORT_CODES = new Set([
 	"transport_reset",
 	"stream_first_event_timeout",
 	"empty_response",
+	"server_is_overloaded",
 ]);
 const PROVIDER_REJECTED_CODES = new Set(["provider_rejected", "provider_http_402", "provider_http_429"]);
 const AGENT_RUNTIME_CODES = new Set([
@@ -55,16 +64,6 @@ export function promptFailurePhase(evidence: PromptFailureEvidence): SdkPromptFa
 
 export function isSdkPromptFailurePhase(value: unknown): value is SdkPromptFailurePhase {
 	return value === "submission" || value === "post_start";
-}
-
-export function isSdkPromptFailureCategory(value: unknown): value is SdkPromptFailureCategory {
-	return (
-		value === "provider_transport" ||
-		value === "provider_rejected" ||
-		value === "agent_runtime" ||
-		value === "deadline" ||
-		value === "unknown"
-	);
 }
 
 /** Allowlisted origin category for a bounded safe classifier + provenance. */

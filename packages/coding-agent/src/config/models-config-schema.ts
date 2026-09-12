@@ -141,6 +141,7 @@ const ModelDefinitionSchema = z
 				"google-gemini-cli",
 				"ollama-chat",
 				"cursor-agent",
+				"devin-acp",
 			])
 			.optional(),
 		baseUrl: z.string().min(1).optional(),
@@ -234,6 +235,7 @@ const ProviderConfigSchema = z
 				"google-gemini-cli",
 				"ollama-chat",
 				"cursor-agent",
+				"devin-acp",
 			])
 			.optional(),
 		headers: z.record(z.string(), z.string()).optional(),

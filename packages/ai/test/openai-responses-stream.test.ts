@@ -1,7 +1,10 @@
 import { describe, expect, test } from "bun:test";
 import { classifyFallbackTrigger, transportFailureFacts } from "@gajae-code/ai";
 import { streamOpenAIResponses } from "@gajae-code/ai/providers/openai-responses";
-import { processResponsesStream } from "@gajae-code/ai/providers/openai-responses-shared";
+import {
+	isOpenAIResponsesProgressEvent,
+	processResponsesStream,
+} from "@gajae-code/ai/providers/openai-responses-shared";
 import type { AssistantMessage, Model } from "@gajae-code/ai/types";
 import type { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
 import type { ResponseStreamEvent } from "openai/resources/responses/responses";
@@ -134,6 +137,30 @@ describe("Responses provider: bounded stream-failure classification", () => {
 			expect(result.errorCode).toBe("upstream_stream_interrupted");
 			expect(result.transportFailure).toBeUndefined();
 		}
+	});
+
+	test("treats response.incomplete as a terminal event rather than an interruption", async () => {
+		// The terminal frame must also count as progress, or a long silent tail before
+		// it lets the idle watchdog abort and overwrite the derived `length`.
+		expect(isOpenAIResponsesProgressEvent({ type: "response.incomplete" })).toBe(true);
+
+		const result = await streamProviderResult([
+			{ type: "response.created", response: { id: "resp_incomplete" } },
+			{
+				type: "response.incomplete",
+				response: {
+					id: "resp_incomplete",
+					status: "incomplete",
+					incomplete_details: { reason: "max_output_tokens" },
+				},
+			},
+		]);
+
+		// A length-limited stream is a normal terminal (`length`), never the
+		// unexpected-EOF classifier.
+		expect(result.stopReason).toBe("length");
+		expect(result.errorCode).toBeUndefined();
+		expect(result.transportFailure).toBeUndefined();
 	});
 
 	test("reports an unexpected EOF instead of a content-free success", async () => {

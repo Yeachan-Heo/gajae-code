@@ -42,8 +42,19 @@ The SDK prompt deadline is progress-aware: `sdk.promptDeadlineMs` (30 min, `60_0
 - `session.fork`
 - `session.resume`
 - `session.close`
+- `session.lookup`
 
 Use `gjc sdk session raw global --op <operation> --idempotency-key <key> --json-input <object>` for lifecycle operations. The Broker derives the canonical lifecycle identity; do not create a second lifecycle route or ledger.
+
+For a lost `session.create` response, use the read-only lookup with the same request key and create target retained before dispatch:
+
+```sh
+gjc sdk session raw global --op session.lookup \
+  --idempotency-key <create-request-key> \
+  --json-input '{"cwd":"/absolute/path/to/repo"}'
+```
+
+Lookup never replays creation. Treat `not_found` as an unknown outcome, not as proof that the create did not execute; `found`, `pending`, `conflict`, `uncertain`, and `terminal` remain distinct structured statuses.
 
 ## Explicitly excluded
 
