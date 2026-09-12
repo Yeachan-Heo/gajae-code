@@ -1020,7 +1020,7 @@ async function resolveAndClampSelectorValue(
 				{
 					managedFallback: true,
 					aliasIntent: options.aliasIntent,
-					canonicalSessionId: options.sessionId,
+					canonicalSessionId: options.sessionId ?? null,
 					credentialSessionId: options.credentialSessionId,
 				},
 			);

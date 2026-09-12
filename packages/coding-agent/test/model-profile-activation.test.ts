@@ -467,6 +467,35 @@ describe("model profile activation", () => {
 		).resolves.toEqual({ profileName: profile.name, entries: [] });
 	});
 
+	test("durable default recovery does not mutate canonical session stickiness", async () => {
+		const profile: ModelProfileDefinition = {
+			name: "sticky-isolated-default",
+			requiredProviders: [],
+			modelMapping: { default: "default" },
+			source: "user",
+		};
+		const baseRegistry = fakeRegistry({ profiles: [profile] });
+		const clearCanonicalVariant = vi.fn();
+		const registry = {
+			...baseRegistry,
+			getAvailable: () => [] as Model[],
+			getAvailableForProfileActivation: () => [] as Model[],
+			getSessionCanonicalVariant: () => "provider-a/default",
+			clearCanonicalVariant,
+			getApiKeyForProvider: async () => undefined,
+		} as unknown as ModelRegistry;
+
+		await expect(
+			resolveModelProfileDefaultChain({
+				modelRegistry: registry,
+				settings: Settings.isolated(),
+				profileName: profile.name,
+				credentialSessionId: "resume-session",
+			}),
+		).resolves.toEqual({ profileName: profile.name, entries: [] });
+		expect(clearCanonicalVariant).not.toHaveBeenCalled();
+	});
+
 	test("durable default recovery ignores an optional mapped provider auth probe failure", async () => {
 		const profile: ModelProfileDefinition = {
 			name: "optional-mapped-provider",

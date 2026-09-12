@@ -94,6 +94,30 @@ describe("AgentSession switchSession resumeModelBehavior", () => {
 		expect(session.model?.id).toBe(opus.id);
 	});
 
+	it("uses the resolved multi-entry settings chain for useCurrentDefault fallback", async () => {
+		const sonnet = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"session.resumeModelBehavior": "useCurrentDefault",
+		});
+		const sessionFile = await createPersistedTarget(sonnet, settings);
+		targetSession!.setConfiguredModelChain("default", ["unknown-provider/saved-model"], "legacy_session");
+		await targetSession!.sessionManager.flush();
+		const configuredEntries = ["unknown-provider/current-model", `${sonnet.provider}/${sonnet.id}`];
+		settings.override("modelRoles", { default: configuredEntries });
+
+		session = new AgentSession({
+			agent: new Agent({ initialState: { model: sonnet, systemPrompt: ["Test"], tools: [], messages: [] } }),
+			sessionManager: SessionManager.create(tempDir.path(), tempDir.path()),
+			settings,
+			modelRegistry,
+		});
+
+		expect(await session.switchSession(sessionFile)).toBe(true);
+		expect(session.model?.id).toBe(sonnet.id);
+		expect(session.getDefaultFallbackRuntimeState().chain.entries).toEqual(configuredEntries);
+	});
+
 	it("retains a session-only active profile when useCurrentDefault reloads its runtime defaults", async () => {
 		const sonnet = getBundledModel("anthropic", "claude-sonnet-4-5")!;
 		const opus = getBundledModel("anthropic", "claude-opus-4-8")!;

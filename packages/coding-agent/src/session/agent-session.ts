@@ -16210,6 +16210,7 @@ export class AgentSession {
 	clearProfileInstalledOverrides(): void {
 		this.#activeProfileInstalledRoles.clear();
 		this.#activeProfileInstalledAgentOverrides.clear();
+		this.#preProfileModel = undefined;
 	}
 
 	getProfileInstalledOverrideState(): {
@@ -21119,7 +21120,10 @@ export class AgentSession {
 		const existing = this.#defaultFallbackController;
 		if (
 			existing &&
-			(existing.chain.origin === "runtime" || existing.chain.entries.join("\u0000") === chain.entries.join("\u0000"))
+			(existing.chain.origin === "runtime" ||
+				(existing.chain.origin === "settings" &&
+					existing.chain.entries.join("\u0000") === settingsEntries.join("\u0000")) ||
+				existing.chain.entries.join("\u0000") === chain.entries.join("\u0000"))
 		) {
 			return existing;
 		}
@@ -23854,7 +23858,14 @@ export class AgentSession {
 							...(this.#persistedModelProfileAliasIntent("default") ?? {}),
 						},
 					);
-					let controller = this.#defaultFallbackChain(false);
+					let controller =
+						resumeModelBehavior === "useCurrentDefault"
+							? new FallbackChainController(
+									{ role: "default", entries: [...defaultEntries], origin: "settings", explicitHead: true },
+									this.settings.get("fallback.maxAttempts"),
+								)
+							: this.#defaultFallbackChain(false);
+					if (resumeModelBehavior === "useCurrentDefault") this.#defaultFallbackController = controller;
 					this.#seedDefaultFallbackResolutionForController(
 						controller,
 						resolution.activeIndex,
