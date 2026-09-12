@@ -16,6 +16,7 @@
 - The in-process SDK now exposes `session.submitUserMessage()` for tracked queued steers and follow-ups. Each submission has a unique identity plus admission, execution, terminal, cancellation, removal, same-run, successor-run, and sequential FIFO lifecycle receipts without relying on private SDK-host correlation hooks.
 
 ### Fixed
+- Tracked queued SDK submissions now cancel steers rearmed as follow-ups, retain terminal ownership across per-turn attempt-scope rotation, and reject malformed `submitUserMessage` options before dispatch (#5460).
 - Tracked queued submissions settle as removed when successor startup fails before run acceptance, and overloaded AgentSession seams are coalesced in the generated SDK inventory.
 - Coordinator MCP now admits an authenticated workflow gate opened during an in-flight runtime turn while the sidecar is still `running`, preserving stable question bindings and live answer dispatch; terminal states without an accepted runtime receipt remain `terminal_uncertain` (#5513).
 - SDK session CLI raw globals now expose an explicit `--page` mode that preserves one bounded Broker `session.list` page and its opaque continuation cursor without changing semantic all-pages listing. The public `session.lookup` lifecycle global reconciles a previously submitted `session.create` from its retained request key and target without replaying creation, returns credential-free found/pending/not-found/conflict/uncertain/terminal outcomes, and keeps lookup identity and certainty in nonzero CLI results.

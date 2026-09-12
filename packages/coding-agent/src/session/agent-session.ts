@@ -1197,6 +1197,17 @@ type InternalCustomMessageOptions = Pick<
 	sdkRunToken?: string;
 };
 
+function assertTrackedSendUserMessageOptions(options: unknown): asserts options is TrackedSendUserMessageOptions {
+	const candidate =
+		options !== null && typeof options === "object" ? (options as Partial<TrackedSendUserMessageOptions>) : undefined;
+	if (candidate?.trackSubmission !== true || (candidate.deliverAs !== "steer" && candidate.deliverAs !== "followUp")) {
+		throw Object.assign(
+			new Error("submitUserMessage requires trackSubmission: true and deliverAs: steer or followUp."),
+			{ code: "invalid_input" },
+		);
+	}
+}
+
 function promptPreflightCancelledError(): Error {
 	const error = Object.assign(new Error("Prompt preflight was cancelled before execution."), { code: "busy" });
 	error.name = "PromptPreflightCancelledError";
@@ -2090,6 +2101,7 @@ type TrackedQueuedInput = {
 	message?: AgentMessage;
 	cancelQueued?: () => boolean;
 	attemptScope?: AttemptScope;
+	logicalRunId?: AttemptRunHandle["logicalRunId"];
 	executionSettled: boolean;
 	terminalSettled: boolean;
 	cancelRequested: boolean;
@@ -2675,6 +2687,7 @@ export class AgentSession {
 	#queuedDisplaySequence = 0;
 	readonly #trackedQueuedInputs = new Map<string, TrackedQueuedInput>();
 	readonly #trackedQueuedInputsAwaitingOwnRun = new Set<TrackedQueuedInput>();
+	readonly #trackedQueuedInputsByLogicalRunId = new Map<AttemptRunHandle["logicalRunId"], Set<TrackedQueuedInput>>();
 	readonly #trackedQueuedInputsByAttemptScope = new WeakMap<AttemptScope, Set<TrackedQueuedInput>>();
 
 	#createTrackedQueuedInput(delivery: QueuedInputDelivery, queuePolicy: QueuedInputQueuePolicy): TrackedQueuedInput {
@@ -2713,6 +2726,23 @@ export class AgentSession {
 		return { attemptId: scope.attemptId, generation: scope.generation, lineage: scope.lineage };
 	}
 
+	#forgetTrackedQueuedInputOwnership(state: TrackedQueuedInput): void {
+		if (state.logicalRunId !== undefined) {
+			const states = this.#trackedQueuedInputsByLogicalRunId.get(state.logicalRunId);
+			if (states) {
+				states.delete(state);
+				if (states.size === 0) this.#trackedQueuedInputsByLogicalRunId.delete(state.logicalRunId);
+			}
+		}
+		if (state.attemptScope !== undefined) {
+			const states = this.#trackedQueuedInputsByAttemptScope.get(state.attemptScope);
+			if (states) {
+				states.delete(state);
+				if (states.size === 0) this.#trackedQueuedInputsByAttemptScope.delete(state.attemptScope);
+			}
+		}
+	}
+
 	#admitTrackedQueuedInput(state: TrackedQueuedInput, message: AgentMessage, cancelQueued: () => boolean): void {
 		if (state.message !== undefined || state.terminalSettled) return;
 		state.message = message;
@@ -2728,16 +2758,28 @@ export class AgentSession {
 		state: TrackedQueuedInput,
 		disposition: "joined-current-run" | "promoted-to-run",
 		scope: AttemptScope,
+		logicalRunId?: AttemptRunHandle["logicalRunId"],
 	): void {
 		if (state.executionSettled || state.terminalSettled) return;
 		state.executionSettled = true;
 		state.attemptScope = scope;
-		let states = this.#trackedQueuedInputsByAttemptScope.get(scope);
-		if (states === undefined) {
-			states = new Set<TrackedQueuedInput>();
-			this.#trackedQueuedInputsByAttemptScope.set(scope, states);
+		const owningLogicalRunId =
+			logicalRunId ?? this.#logicalRunIdByAttemptScope.get(scope) ?? this.#activeLogicalRunId;
+		state.logicalRunId = owningLogicalRunId;
+		if (owningLogicalRunId !== undefined) {
+			let logicalStates = this.#trackedQueuedInputsByLogicalRunId.get(owningLogicalRunId);
+			if (logicalStates === undefined) {
+				logicalStates = new Set<TrackedQueuedInput>();
+				this.#trackedQueuedInputsByLogicalRunId.set(owningLogicalRunId, logicalStates);
+			}
+			logicalStates.add(state);
 		}
-		states.add(state);
+		let scopeStates = this.#trackedQueuedInputsByAttemptScope.get(scope);
+		if (scopeStates === undefined) {
+			scopeStates = new Set<TrackedQueuedInput>();
+			this.#trackedQueuedInputsByAttemptScope.set(scope, scopeStates);
+		}
+		scopeStates.add(state);
 		state.execution.resolve({
 			submissionId: state.submission.submissionId,
 			delivery: state.delivery,
@@ -2746,11 +2788,11 @@ export class AgentSession {
 		});
 	}
 
-	#settleTrackedOwnRunPromotions(scope: AttemptScope | undefined): void {
-		if (scope === undefined || this.#trackedQueuedInputsAwaitingOwnRun.size === 0) return;
+	#settleTrackedOwnRunPromotions(handle: AttemptRunHandle): void {
+		if (this.#trackedQueuedInputsAwaitingOwnRun.size === 0) return;
 		for (const state of [...this.#trackedQueuedInputsAwaitingOwnRun]) {
 			this.#trackedQueuedInputsAwaitingOwnRun.delete(state);
-			this.#settleTrackedExecution(state, "promoted-to-run", scope);
+			this.#settleTrackedExecution(state, "promoted-to-run", handle.scope, handle.logicalRunId);
 		}
 	}
 
@@ -2778,6 +2820,7 @@ export class AgentSession {
 			reason,
 		});
 		this.#trackedQueuedInputsAwaitingOwnRun.delete(state);
+		this.#forgetTrackedQueuedInputOwnership(state);
 		this.#trackedQueuedInputs.delete(state.submission.submissionId);
 	}
 
@@ -2803,10 +2846,12 @@ export class AgentSession {
 
 	#settleTrackedQueuedInputTerminal(scope: AttemptScope | undefined): void {
 		if (scope === undefined) return;
-		const states = this.#trackedQueuedInputsByAttemptScope.get(scope);
+		const logicalRunId = this.#logicalRunIdByAttemptScope.get(scope);
+		const states =
+			(logicalRunId === undefined ? undefined : this.#trackedQueuedInputsByLogicalRunId.get(logicalRunId)) ??
+			this.#trackedQueuedInputsByAttemptScope.get(scope);
 		if (states === undefined) return;
-		this.#trackedQueuedInputsByAttemptScope.delete(scope);
-		for (const state of states) {
+		for (const state of [...states]) {
 			if (state.terminalSettled) continue;
 			state.terminalSettled = true;
 			state.terminal.resolve({
@@ -2815,6 +2860,7 @@ export class AgentSession {
 				disposition: "completed",
 				attemptScope: this.#scopeRef(scope),
 			});
+			this.#forgetTrackedQueuedInputOwnership(state);
 			this.#trackedQueuedInputs.delete(state.submission.submissionId);
 		}
 	}
@@ -3041,7 +3087,7 @@ export class AgentSession {
 			predecessorScope !== undefined &&
 			this.#skipPostPromptRecoveryWaitByAttemptScope.delete(predecessorScope);
 		this.#acceptRunHandle(handle);
-		this.#settleTrackedOwnRunPromotions(handle.scope);
+		this.#settleTrackedOwnRunPromotions(handle);
 		if (sdkRunToken !== undefined) {
 			this.#activeSdkRunToken = sdkRunToken;
 			this.#sdkRunTokensByAttemptScope.set(handle.scope, sdkRunToken);
@@ -3366,12 +3412,14 @@ export class AgentSession {
 	#attemptAuthority!: AttemptScopeAuthority;
 	#attemptRecordStore!: AttemptRecordStore;
 	#activeLogicalRunId: AttemptRunHandle["logicalRunId"] | undefined;
+	readonly #logicalRunIdByAttemptScope = new WeakMap<AttemptScope, AttemptRunHandle["logicalRunId"]>();
 	#acceptRunHandle(handle: AttemptRunHandle | undefined): void {
 		// Integration doubles can accept a run without minting a handle; keep the
 		// previously recorded run id rather than throwing inside the callback.
 		if (!handle) return;
 		this.#activeLogicalRunId = handle.logicalRunId;
 		this.#activeAttemptScope = handle.scope;
+		this.#logicalRunIdByAttemptScope.set(handle.scope, handle.logicalRunId);
 	}
 
 	#turnIndex = 0;
@@ -6230,6 +6278,10 @@ export class AgentSession {
 	}
 
 	#trackAgentEvent = (event: AgentEvent): Promise<void> => {
+		const eventScope = (event as AgentEvent & { scope?: AttemptScope }).scope;
+		if ((event.type === "agent_start" || event.type === "turn_start") && eventScope !== undefined) {
+			this.#bindAttemptScopeToActiveRun(eventScope);
+		}
 		this.#agentEventAdmission.set(event, {
 			scope: this.#activeAttemptScope,
 			sdkRunToken: this.#activeSdkRunToken,
@@ -9190,6 +9242,15 @@ export class AgentSession {
 			}
 		} finally {
 			finishAttempt();
+		}
+	}
+
+	#bindAttemptScopeToActiveRun(scope: AttemptScope): void {
+		if (this.#activeLogicalRunId !== undefined) {
+			this.#logicalRunIdByAttemptScope.set(scope, this.#activeLogicalRunId);
+		}
+		if (this.#activeSdkRunToken !== undefined) {
+			this.#sdkRunTokensByAttemptScope.set(scope, this.#activeSdkRunToken);
 		}
 	}
 
@@ -13422,10 +13483,13 @@ export class AgentSession {
 		}
 		options?.onQueued?.(message);
 		const cancelQueuedSteer = (): boolean => {
-			const removed = this.agent.removeQueuedMessages(candidate => candidate === message).steering > 0;
+			const removedQueues = this.agent.removeQueuedMessages(candidate => candidate === message);
+			const removed = removedQueues.steering > 0 || removedQueues.followUp > 0;
 			if (!removed) return false;
 			this.#steeringMessages = this.#steeringMessages.filter(entry => entry.message !== message);
+			this.#followUpMessages = this.#followUpMessages.filter(entry => entry.message !== message);
 			this.#externalSteerMessages.delete(message);
+			this.#externalFollowUps.delete(message);
 			this.#sequentialSteerMessages.delete(message);
 			this.#fireQueuedRemovalHooks([message]);
 			return true;
@@ -14198,6 +14262,7 @@ export class AgentSession {
 		content: string | (TextContent | ImageContent)[],
 		options: TrackedSendUserMessageOptions,
 	): Promise<QueuedInputSubmission> {
+		assertTrackedSendUserMessageOptions(options);
 		const submission = await this.#sendUserMessage(content, options);
 		if (submission === undefined) throw new Error("Tracked user message did not produce a submission handle.");
 		return submission;
@@ -15765,7 +15830,7 @@ export class AgentSession {
 							resetRetryReplaySafety: true,
 							sdkRunToken: selectedSdkRunToken,
 							skipInitialSteeringPoll: heldSteering.length > 0,
-							onRunAccepted: () => {
+							onRunAccepted: (handle: AttemptRunHandle) => {
 								runAccepted = true;
 								if (heldSteering.length > 0) {
 									// Re-admit the aborted turn's steers into the replacement run the
@@ -15779,7 +15844,7 @@ export class AgentSession {
 								}
 								if (selected) {
 									this.#fireQueuedPromotionHooks([message], { startsOwnRun: true });
-									this.#settleTrackedOwnRunPromotions(this.#activeAttemptScope);
+									this.#settleTrackedOwnRunPromotions(handle);
 								}
 								if (selected) {
 									this.#steeringMessages = this.#steeringMessages.filter(entry => entry !== selected.display);
