@@ -5728,6 +5728,20 @@ test("production post-registration startup failure proves cleanup and exact repl
 		await broker.start();
 		const input = { cwd: root, readinessTimeoutMs: 10_000 };
 		const response = await broker.handleRequest("session.create", input, "production-startup-failure");
+		await broker.index.refresh();
+		const closed = broker.index.listSessions().sessions[0];
+		expect(closed).toBeDefined();
+		if (!closed) throw new Error("Expected the failed lifecycle host's retained identity");
+		const registration = broker.index.findHostRegistration(
+			closed.sessionId,
+			closed.endpointGeneration,
+			closed.pid,
+			closed.lifecycleRequestId,
+		);
+		expect(registration?.endpointFileId).toEqual(expect.any(String));
+		expect(closed.endpointFileId).toBe(registration?.endpointFileId);
+		if (!registration) throw new Error("Expected the original lifecycle registration");
+		expect(broker.index.hostUnregisteredAfter(registration)).toMatchObject({ indexSeq: expect.any(Number) });
 		expect(response).toMatchObject({
 			ok: false,
 			error: {
