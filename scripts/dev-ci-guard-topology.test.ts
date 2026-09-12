@@ -210,10 +210,26 @@ describe("dev-ci Telegram daemon generation guard topology", () => {
 		}
 	});
 
+	test("keeps real DrvFS qualification manual, default-off, and independently source-bound", async () => {
+		const d = await workflow();
+		expect(d.on.workflow_dispatch.inputs.wsl_drvfs).toMatchObject({ type: "boolean", default: false, required: false });
+		const qualification = requiredJob(d, "wsl-drvfs-qualification");
+		expect(qualification.if).toBe("${{ github.event_name == 'workflow_dispatch' && inputs.wsl_drvfs == true }}");
+		expect(qualification.permissions).toEqual({ contents: "read" });
+		expect(requiredEnvValue(qualification, "QUALIFY_HEAD_SHA")).toBe("${{ inputs.head_sha }}");
+		const harness = namedStep(qualification, "Checkout workflow harness independently");
+		const source = namedStep(qualification, "Checkout exact qualification source");
+		expect(harness.with).toMatchObject({ ref: "${{ github.workflow_sha }}", "persist-credentials": false });
+		expect(source.with).toMatchObject({ ref: "${{ inputs.head_sha }}", repository: "${{ github.repository }}", "persist-credentials": false });
+		const upload = namedStep(qualification, "Upload qualification evidence even on failure");
+		expect(upload.if).toBe("${{ always() }}");
+		expect(upload.with).toMatchObject({ name: "wsl-drvfs-${{ github.run_id }}", "if-no-files-found": "error" });
+	});
+
 	test("keeps affected validation pinned while reserving an explicit virtual-integration dispatch head", async () => {
 		const d = await workflow();
 		const dispatchInputs = Object.keys(d.on.workflow_dispatch.inputs);
-		expect(dispatchInputs).toEqual(["base_ref", "base_sha", "base_repository", "head_sha", "base_sha_override"]);
+		expect(dispatchInputs).toEqual(["base_ref", "base_sha", "base_repository", "head_sha", "base_sha_override", "wsl_drvfs"]);
 		expect(dispatchInputs).not.toContain("head_ref");
 		expect(dispatchInputs).not.toContain("head_repository");
 
