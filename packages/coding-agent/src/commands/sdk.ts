@@ -80,20 +80,52 @@ export async function lifecycleArgs(
 }
 
 /**
- * How long a session host tolerates the complete absence of a live broker
- * publication before treating itself as orphaned. Hosts intentionally survive
- * broker restarts (a replacement broker republishes discovery within seconds),
- * so this must comfortably exceed a restart window while still bounding the
- * lifetime of hosts whose broker is gone for good — otherwise every crashed or
+ * How long a session host tolerates losing the broker it was launched under
+ * before treating itself as orphaned.
+ *
+ * A host is reachable only through its own broker: routing lives in the broker
+ * process and a replacement broker never adopts hosts from an earlier
+ * incarnation, so a host that outlives its broker is stranded no matter how
+ * healthy the agent directory looks afterwards. The grace still has to outlast
+ * a restart-shaped gap, because a broker that is merely slow to republish must
+ * never cost a live host — but it must stay finite, or every crashed or
  * torn-down broker leaks a detached multi-hundred-megabyte host forever.
  */
 export const SESSION_HOST_BROKER_ABSENCE_GRACE_MS = 10 * 60_000;
 const SESSION_HOST_BROKER_POLL_MS = 15_000;
 
 /**
- * Resolves only once no live broker publication has been observable in
- * `agentDir` for the full grace window. A reappearing broker (including a
- * replacement with a different pid) resets the window; an unreadable
+ * Identity of the broker incarnation an observation describes, or `null` when
+ * it carries no usable identity.
+ *
+ * Two observations with different identities are two different brokers, never
+ * the same broker seen twice: `incarnation` is start-time derived, so it
+ * separates a genuine survivor from a successor that merely reused the pid.
+ */
+function brokerPublicationIdentity(observation: unknown): string | null {
+	if (!observation || typeof observation !== "object") return null;
+	const { ownerId, pid, incarnation } = observation as {
+		ownerId?: unknown;
+		pid?: unknown;
+		incarnation?: unknown;
+	};
+	const parts = [
+		typeof ownerId === "string" ? ownerId : "",
+		Number.isSafeInteger(pid) ? String(pid) : "",
+		typeof incarnation === "string" ? incarnation : "",
+	];
+	return parts.some(part => part !== "") ? parts.join(":") : null;
+}
+
+/**
+ * Resolves only once the broker this host was launched under has been
+ * unobservable for the full grace window.
+ *
+ * The first identifiable publication pins that broker. A later publication from
+ * a different incarnation is a replacement, and a replacement cannot route to
+ * this host — observing one is evidence of being stranded, not of being alive —
+ * so it accrues against the bound instead of resetting it. Only the pinned
+ * broker reappearing resets the window. An unreadable or unidentifiable
  * publication is not proof of orphanhood but accrues against the same bound.
  */
 export async function watchSessionHostBrokerLiveness(deps: {
@@ -110,6 +142,7 @@ export async function watchSessionHostBrokerLiveness(deps: {
 	const graceMs = deps.graceMs ?? SESSION_HOST_BROKER_ABSENCE_GRACE_MS;
 	const pollMs = deps.pollMs ?? SESSION_HOST_BROKER_POLL_MS;
 	let absentSince: number | null = null;
+	let ownBroker: string | null = null;
 	for (;;) {
 		let live: unknown = null;
 		try {
@@ -117,7 +150,9 @@ export async function watchSessionHostBrokerLiveness(deps: {
 		} catch {
 			// Transient read failures are ambiguity, not proof of orphanhood.
 		}
-		if (live) {
+		const identity = brokerPublicationIdentity(live);
+		if (identity !== null && (ownBroker === null || identity === ownBroker)) {
+			ownBroker ??= identity;
 			absentSince = null;
 		} else {
 			absentSince ??= now();
