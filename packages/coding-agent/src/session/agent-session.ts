@@ -15707,10 +15707,11 @@ export class AgentSession {
 		// The successor session must not inherit the predecessor's profile marker
 		// or its runtime role overrides; a durable `modelProfile.default` is
 		// reapplied by the startup policy on a fresh launch instead.
+		const configuredDefaultProfileIdentity = this.#getConfiguredModelProfileIdentity();
 		const droppingSessionOnlyProfile =
 			this.getActiveModelProfile() !== undefined &&
 			(this.#activeModelProfileScope !== "durable" ||
-				this.settings.get("modelProfile.default") !== this.getActiveModelProfile());
+				configuredDefaultProfileIdentity !== this.getActiveModelProfile());
 		const preProfileModel = this.#preProfileModel;
 		this.#resetSessionScopedModelProfileState();
 		// A dropped session-only profile must not leak its concrete model into
@@ -15725,13 +15726,6 @@ export class AgentSession {
 			}
 		}
 		this.#clearConstructorToolSelectionAuthority();
-		const configuredDefaultProfile = this.settings.get("modelProfile.default");
-		const configuredDefaultProfileIdentity = configuredDefaultProfile
-			? resolveModelProfileName(
-					configuredDefaultProfile,
-					this.#modelRegistry.getModelProfiles?.() ?? new Map<string, unknown>(),
-				)
-			: undefined;
 		if (this.#activeModelProfile && this.#activeModelProfile !== configuredDefaultProfileIdentity) {
 			this.settings.clearOverride("modelRoles");
 			this.settings.clearOverride("task.agentModelOverrides");
@@ -16036,6 +16030,10 @@ export class AgentSession {
 		return this.#activeModelProfile;
 	}
 
+	getActiveModelProfileScope(): "session" | "durable" | undefined {
+		return this.#activeModelProfileScope;
+	}
+
 	/**
 	 * Re-apply vendor-separated delegation after a profile activation changed the
 	 * role layer. `eagerTasks` is resolved at prompt build time, but under
@@ -16062,6 +16060,20 @@ export class AgentSession {
 		await this.refreshBaseSystemPrompt();
 	}
 
+	#getConfiguredModelProfileIdentity(): string | undefined {
+		const profileName = this.settings.get("modelProfile.default");
+		return profileName
+			? resolveModelProfileName(profileName, this.#modelRegistry.getModelProfiles?.() ?? new Map<string, unknown>())
+			: undefined;
+	}
+
+	#getGlobalModelProfileIdentity(): string | undefined {
+		const profileName = this.settings.getGlobal("modelProfile.default");
+		return profileName
+			? resolveModelProfileName(profileName, this.#modelRegistry.getModelProfiles?.() ?? new Map<string, unknown>())
+			: undefined;
+	}
+
 	/** Resolver intent only for default assignments owned by an active or runtime-recovered durable profile. */
 	#persistedModelProfileAliasIntent(role: string): { aliasIntent: "preset-equivalent" } | undefined {
 		const runtimeDefaultIdentity = this.#defaultFallbackController?.chain;
@@ -16071,7 +16083,7 @@ export class AgentSession {
 			? resolveModelProfileName(configuredProfile, profileDefinitions)
 			: undefined;
 		const candidateProfileName =
-			this.#activeModelProfile ??
+			(this.#activeModelProfileScope === "durable" ? this.#activeModelProfile : undefined) ??
 			(role === "default" &&
 			runtimeDefaultIdentity?.origin === "runtime" &&
 			runtimeDefaultIdentity.identity === configuredProfileIdentity
@@ -16113,11 +16125,11 @@ export class AgentSession {
 		forceCleanup?: boolean;
 		preserveActiveModelProfile?: { name: string; scope: "session" | "durable" };
 	}): void {
-		const persistedProfile = this.settings.get("modelProfile.default");
+		const persistedProfileIdentity = this.#getConfiguredModelProfileIdentity();
 		if (
 			!options?.forceCleanup &&
-			persistedProfile !== undefined &&
-			persistedProfile === this.getActiveModelProfile() &&
+			persistedProfileIdentity !== undefined &&
+			persistedProfileIdentity === this.getActiveModelProfile() &&
 			this.#activeModelProfileScope === "durable"
 		)
 			return;
@@ -16160,6 +16172,14 @@ export class AgentSession {
 	): void {
 		const bindings = this.#modelRegistry.getConfiguredModelBindings?.();
 		if (this.#preProfileModel === undefined) this.#preProfileModel = preProfileModel;
+		const currentModelRoles = new Set(modelRoles);
+		const currentAgentModelOverrides = new Set(agentModelOverrides);
+		for (const role of this.#activeProfileInstalledRoles.keys()) {
+			if (!currentModelRoles.has(role)) this.#activeProfileInstalledRoles.delete(role);
+		}
+		for (const role of this.#activeProfileInstalledAgentOverrides.keys()) {
+			if (!currentAgentModelOverrides.has(role)) this.#activeProfileInstalledAgentOverrides.delete(role);
+		}
 		for (const role of modelRoles) {
 			if (this.#activeProfileInstalledRoles.has(role)) continue;
 			const bindingValue = bindings?.modelRoles?.[role];
@@ -16186,6 +16206,28 @@ export class AgentSession {
 	clearProfileInstalledOverrides(): void {
 		this.#activeProfileInstalledRoles.clear();
 		this.#activeProfileInstalledAgentOverrides.clear();
+	}
+
+	getProfileInstalledOverrideState(): {
+		modelRoles: Record<string, ModelSelectorValue | undefined>;
+		agentModelOverrides: Record<string, ModelSelectorValue | undefined>;
+		preProfileModel: Model | undefined;
+	} {
+		return {
+			modelRoles: Object.fromEntries(this.#activeProfileInstalledRoles),
+			agentModelOverrides: Object.fromEntries(this.#activeProfileInstalledAgentOverrides),
+			preProfileModel: this.#preProfileModel,
+		};
+	}
+
+	restoreProfileInstalledOverrideState(state: {
+		modelRoles: Readonly<Record<string, ModelSelectorValue | undefined>>;
+		agentModelOverrides: Readonly<Record<string, ModelSelectorValue | undefined>>;
+		preProfileModel: Model | undefined;
+	}): void {
+		this.#activeProfileInstalledRoles = new Map(Object.entries(state.modelRoles));
+		this.#activeProfileInstalledAgentOverrides = new Map(Object.entries(state.agentModelOverrides));
+		this.#preProfileModel = state.preProfileModel;
 	}
 
 	/** Current profile-installed override keys, for deriving the activation base. */
@@ -16225,8 +16267,11 @@ export class AgentSession {
 	/** Persist effective roles only when the active profile is a durable default. */
 	materializeActiveDefaultModelProfileAssignment(model: Model): boolean {
 		// A merged read could let a project-scoped value authorize durable global writes.
-		const persistedProfile = this.settings.getGlobal("modelProfile.default");
-		if (persistedProfile === undefined || persistedProfile !== this.getActiveModelProfile()) return false;
+		if (
+			this.#activeModelProfileScope !== "durable" ||
+			this.#getGlobalModelProfileIdentity() !== this.getActiveModelProfile()
+		)
+			return false;
 		return materializeActiveModelProfileAssignment({
 			session: this,
 			settings: this.settings,
@@ -16299,14 +16344,14 @@ export class AgentSession {
 		// dropped together with the runtime role overrides the profile activation
 		// installed, so the concrete default takes effect for every role without
 		// writing the profile's role mappings globally.
-		if (this.model && this.settings.get("modelProfile.default") !== undefined) {
+		if (this.model && this.#getConfiguredModelProfileIdentity() !== undefined) {
 			if (this.materializeActiveDefaultModelProfileAssignment(this.model)) return;
 		}
 		// A persisted default that no longer matches the dropped session-only
 		// marker is superseded: the concrete selection is now the durable
 		// default, so the next launch must not reapply the stale profile.
-		const persistedProfile = this.settings.get("modelProfile.default");
-		if (persistedProfile !== undefined && persistedProfile !== this.getActiveModelProfile()) {
+		const persistedProfileIdentity = this.#getConfiguredModelProfileIdentity();
+		if (persistedProfileIdentity !== undefined && persistedProfileIdentity !== this.getActiveModelProfile()) {
 			this.settings.unset("modelProfile.default");
 			this.settings.clearOverride("modelProfile.default");
 		}
@@ -16321,8 +16366,8 @@ export class AgentSession {
 	 * marker is superseded by the concrete selection and removed.
 	 */
 	clearSessionOnlyModelProfileState(): void {
-		const persistedProfile = this.settings.get("modelProfile.default");
-		if (persistedProfile !== undefined && persistedProfile !== this.getActiveModelProfile()) {
+		const persistedProfileIdentity = this.#getConfiguredModelProfileIdentity();
+		if (persistedProfileIdentity !== undefined && persistedProfileIdentity !== this.getActiveModelProfile()) {
 			this.settings.unset("modelProfile.default");
 			this.settings.clearOverride("modelProfile.default");
 		}
@@ -16415,9 +16460,10 @@ export class AgentSession {
 		controller: FallbackChainController,
 		activeIndex: number,
 		skips: Array<{ selector: string; reason: string }>,
+		emitEvent = true,
 	): void {
 		controller.seedResolution(activeIndex, skips);
-		this.#emitResolutionFallbackSwitch(controller);
+		if (emitEvent) this.#emitResolutionFallbackSwitch(controller);
 	}
 
 	getDefaultFallbackRuntimeState(): DefaultFallbackRuntimeState {
@@ -23696,6 +23742,7 @@ export class AgentSession {
 			let unavailableDefaultChainMessage: string | undefined;
 			let recoveredDefaultChainMessage: string | undefined;
 			let recoveredDefaultChain = false;
+			let fallbackResolutionController: FallbackChainController | undefined;
 			let transitionCleanupCommitted = false;
 
 			try {
@@ -23804,7 +23851,13 @@ export class AgentSession {
 						},
 					);
 					let controller = this.#defaultFallbackChain(false);
-					this.#seedDefaultFallbackResolutionForController(controller, resolution.activeIndex, resolution.skips);
+					this.#seedDefaultFallbackResolutionForController(
+						controller,
+						resolution.activeIndex,
+						resolution.skips,
+						false,
+					);
+					if (controller.activeIndex > 0) fallbackResolutionController = controller;
 					let resolvedModel = resolution.model;
 					if (!resolvedModel) {
 						const allSelectorsUnknown =
@@ -23865,7 +23918,9 @@ export class AgentSession {
 										controller,
 										recovered.activeIndex,
 										recovered.skips,
+										false,
 									);
+									if (controller.activeIndex > 0) fallbackResolutionController = controller;
 									resolvedModel = recovered.model;
 									recoveredDefaultChain = true;
 									recoveredDefaultChainMessage =
@@ -23942,6 +23997,7 @@ export class AgentSession {
 				// Establish the successor's durable session identity only after every
 				// restored state facet is live. Identity-bound extension hooks run below.
 				await this.sessionManager.ensureOnDisk();
+				if (fallbackResolutionController) this.#emitResolutionFallbackSwitch(fallbackResolutionController);
 				if (!switchingToDifferentSession) await this.#initializeLocalRootForLoadedSession();
 
 				if (switchingToDifferentSession) {

@@ -474,12 +474,19 @@ async function applyStartupModelProfilesWithPolicy(
 	const applyProfile = async (
 		profileName: string,
 		persistDefault: boolean,
-		options: { thinkingLevelOverride?: CreateAgentSessionOptions["thinkingLevel"] } = {},
+		options: {
+			profileScope?: "session" | "durable";
+			thinkingLevelOverride?: CreateAgentSessionOptions["thinkingLevel"];
+		} = {},
 	): Promise<boolean> => {
 		try {
 			await activateModelProfile(
 				{ session: args.session, modelRegistry: args.modelRegistry, settings: args.settings, profileName },
-				{ persistDefault, thinkingLevelOverride: options.thinkingLevelOverride },
+				{
+					persistDefault,
+					profileScope: options.profileScope ?? (persistDefault ? "durable" : "session"),
+					thinkingLevelOverride: options.thinkingLevelOverride,
+				},
 			);
 			return true;
 		} catch (error) {
@@ -504,6 +511,7 @@ async function applyStartupModelProfilesWithPolicy(
 		if (defaultProfile) {
 			applied =
 				(await applyProfile(defaultProfile, false, {
+					profileScope: "durable",
 					thinkingLevelOverride: args.settings.has("defaultThinkingLevel")
 						? args.settings.get("defaultThinkingLevel")
 						: undefined,

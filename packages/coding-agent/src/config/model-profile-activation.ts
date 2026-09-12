@@ -3,7 +3,7 @@ import type { Api, Model } from "@gajae-code/ai/core";
 import { logger } from "@gajae-code/utils";
 import type { AgentSession, DefaultFallbackRuntimeState } from "../session/agent-session";
 import { clampExplicitThinkingLevelForModel, formatClampedModelSelector } from "../thinking";
-import { resolveModelProfileName, validateModelProfileName } from "./model-profile-contract";
+import { validateModelProfileName } from "./model-profile-contract";
 import {
 	aggregateModelProfileRequiredProviders,
 	deriveModelProfileMappedProviders,
@@ -34,14 +34,22 @@ import {
 import { type ModelSelectorValue, normalizeModelSelectorValue } from "./model-selector-value";
 import type { Settings } from "./settings";
 
+type ModelProfileScope = "session" | "durable";
+type ProfileInstalledOverrideState = {
+	modelRoles: Record<string, ModelSelectorValue | undefined>;
+	agentModelOverrides: Record<string, ModelSelectorValue | undefined>;
+	preProfileModel: Model<Api> | undefined;
+};
+
 type ModelProfileActivationSession = Pick<
 	AgentSession,
 	"model" | "thinkingLevel" | "sessionId" | "getConfiguredModelChain" | "setConfiguredModelChain"
 > & {
 	credentialSessionId?: string;
 	setModelTemporary?: AgentSession["setModelTemporary"];
-	setActiveModelProfile?: (name: string | undefined, scope?: "session" | "durable") => void;
+	setActiveModelProfile?: (name: string | undefined, scope?: ModelProfileScope) => void;
 	getActiveModelProfile?: () => string | undefined;
+	getActiveModelProfileScope?: () => ModelProfileScope | undefined;
 	/** Record which runtime override keys this activation installed (session-scoped). */
 	noteProfileInstalledOverrides?: (
 		modelRoles: readonly string[],
@@ -52,6 +60,8 @@ type ModelProfileActivationSession = Pick<
 	) => void;
 	/** Drop the recorded profile-installed override keys (e.g. after materialization). */
 	clearProfileInstalledOverrides?: () => void;
+	getProfileInstalledOverrideState?: () => ProfileInstalledOverrideState;
+	restoreProfileInstalledOverrideState?: (state: ProfileInstalledOverrideState) => void;
 	/** Current profile-installed override keys, for deriving the activation base. */
 	getProfileInstalledOverrideKeys?: () => { modelRoles: readonly string[]; agentModelOverrides: readonly string[] };
 	/** Re-apply vendor-separated delegation (task tool + prompt) after the role layer changed. */
@@ -117,7 +127,7 @@ export interface PrepareModelProfileActivationOptions {
 }
 export interface ApplyModelProfileActivationOptions {
 	persistDefault?: boolean;
-	profileScope?: "session" | "durable";
+	profileScope?: ModelProfileScope;
 	thinkingLevelOverride?: ThinkingLevel;
 }
 export interface PreparedModelProfileActivation {
@@ -155,6 +165,8 @@ export interface PreparedModelProfileActivation {
 	modelRoles: Record<string, ModelSelectorValue>;
 	agentModelOverrides: Record<string, ModelSelectorValue>;
 	previousActiveModelProfile: string | undefined;
+	previousActiveModelProfileScope: ModelProfileScope | undefined;
+	previousProfileInstalledOverrideState: ProfileInstalledOverrideState | undefined;
 	/**
 	 * The session resume default ("provider/id") captured BEFORE activation —
 	 * the model resume would restore prior to this profile. Snapshotted
@@ -191,6 +203,9 @@ export interface MaterializeModelProfileAssignmentOptions {
 		| "restoreDefaultFallbackRuntimeState"
 		| "modelRegistry"
 		| "clearProfileInstalledOverrides"
+		| "getActiveModelProfileScope"
+		| "getProfileInstalledOverrideState"
+		| "restoreProfileInstalledOverrideState"
 	>;
 	settings: Pick<Settings, "clearOverride" | "get" | "getGlobal" | "getOverride" | "override" | "set" | "unset">;
 	role: GjcModelAssignmentTargetId;
@@ -213,6 +228,9 @@ export interface MaterializeModelProfileAssignmentsOptions {
 		| "restoreDefaultFallbackRuntimeState"
 		| "modelRegistry"
 		| "clearProfileInstalledOverrides"
+		| "getActiveModelProfileScope"
+		| "getProfileInstalledOverrideState"
+		| "restoreProfileInstalledOverrideState"
 	>;
 	settings: Pick<Settings, "clearOverride" | "get" | "getGlobal" | "getOverride" | "override" | "set" | "unset">;
 	assignments: ReadonlyMap<GjcModelAssignmentTargetId, string> | Partial<Record<GjcModelAssignmentTargetId, string>>;
@@ -300,6 +318,8 @@ function commitMaterializedProfileAssignments(
 	const previousAgentModelOverridesOverride = options.settings.getOverride("task.agentModelOverrides");
 	const previousDefaultProfileOverride = options.settings.getOverride("modelProfile.default");
 	const previousActiveProfile = options.session.getActiveModelProfile?.();
+	const previousActiveProfileScope = options.session.getActiveModelProfileScope?.();
+	const previousProfileInstalledOverrideState = options.session.getProfileInstalledOverrideState?.();
 	const previousChain = options.session.getConfiguredModelChainState?.("default");
 	const previousFallbackRuntimeState = options.session.getDefaultFallbackRuntimeState?.();
 	const previousCanonicalVariant = options.session.modelRegistry?.getSessionCanonicalVariant?.(
@@ -385,7 +405,10 @@ function commitMaterializedProfileAssignments(
 				? options.settings.clearOverride("modelProfile.default")
 				: options.settings.override("modelProfile.default", previousDefaultProfileOverride),
 		);
-		restore(() => options.session.setActiveModelProfile?.(previousActiveProfile));
+		if (previousProfileInstalledOverrideState) {
+			restore(() => options.session.restoreProfileInstalledOverrideState?.(previousProfileInstalledOverrideState));
+		}
+		restore(() => options.session.setActiveModelProfile?.(previousActiveProfile, previousActiveProfileScope));
 		if (rollbackErrors.length > 0) {
 			throw new AggregateError(
 				[error, ...rollbackErrors],
@@ -657,7 +680,8 @@ async function preflightModelProfileBindings(options: {
 	const proxyRoutableProviders = getProxyRoutableProviders(profile);
 	if (proxyMode === "always" && proxyProvider === undefined)
 		throw new Error('modelProfile.proxyMode "always" requires modelProfile.proxyProvider');
-	if (proxyProvider !== undefined && !options.modelRegistry.getConfiguredProviderIds?.().includes(proxyProvider)) {
+	const configuredProviderIds = options.modelRegistry.getConfiguredProviderIds?.();
+	if (proxyProvider !== undefined && configuredProviderIds && !configuredProviderIds.includes(proxyProvider)) {
 		throw new Error(
 			`modelProfile.proxyProvider "${proxyProvider}" is not configured. Configure it with \`gjc setup provider\` before activating a preset.`,
 		);
@@ -733,6 +757,7 @@ export async function resolveModelProfileDefaultChain(options: {
 				sessionId: undefined,
 				credentialSessionId: options.credentialSessionId,
 				aliasIntent: "preset-equivalent",
+				allowUnavailableSelectors: true,
 			},
 			label,
 			"default",
@@ -941,6 +966,7 @@ async function resolveAndClampSelectorValue(
 		credentialSessionId: string;
 		aliasIntent: "preset-equivalent";
 		requireQualifiedResolution?: boolean;
+		allowUnavailableSelectors?: boolean;
 	},
 	profileLabel: string,
 	role: string,
@@ -993,7 +1019,7 @@ async function resolveAndClampSelectorValue(
 				const bareSelector = selectorSuffix.thinkingLevel ? selectorSuffix.selector : selector;
 				const aliasKnown =
 					options.modelRegistry.lookupAliasExists?.(bareSelector.toLowerCase()) ?? providers.length > 0;
-				if (selectors.length === 1) {
+				if (selectors.length === 1 && !options.allowUnavailableSelectors) {
 					if (!aliasKnown) {
 						throw new Error(
 							`Model profile "${profileLabel}" ${role} selector "${bareSelector}" does not match any catalog model`,
@@ -1022,7 +1048,12 @@ async function resolveAndClampSelectorValue(
 		resolvedAny = true;
 		clamped.push(formatMaterializedSelector(selector, resolved.model));
 	}
-	if (!resolvedAny && everySelectorIsKnownBare && unresolvedKnownBareProviders.size > 0) {
+	if (
+		!resolvedAny &&
+		everySelectorIsKnownBare &&
+		unresolvedKnownBareProviders.size > 0 &&
+		!options.allowUnavailableSelectors
+	) {
 		throw new ModelProfileCredentialError(profileLabel, [...unresolvedKnownBareProviders].sort(), role);
 	}
 	if (options.requireQualifiedResolution && !resolvedAny && unresolvedQualifiedSelectors.length > 0) {
@@ -1273,6 +1304,8 @@ export async function prepareModelProfileActivation(
 			modelRoles,
 			agentModelOverrides,
 			previousActiveModelProfile: options.session.getActiveModelProfile?.(),
+			previousActiveModelProfileScope: options.session.getActiveModelProfileScope?.(),
+			previousProfileInstalledOverrideState: options.session.getProfileInstalledOverrideState?.(),
 			previousSessionDefaultModel: options.session.getSessionDefaultModelSelector?.(),
 			previousDefaultFallbackRuntimeState: options.session.getDefaultFallbackRuntimeState?.(),
 		};
@@ -1348,14 +1381,9 @@ export async function applyPreparedModelProfileActivation(
 			prepared.settings.set("modelProfile.default", prepared.profileName);
 			await prepared.settings.flushOrThrow();
 		}
-		const persistedProfile = prepared.settings.get("modelProfile.default");
-		const persistedProfileIdentity = persistedProfile
-			? resolveModelProfileName(persistedProfile, prepared.modelRegistry.getModelProfiles())
-			: undefined;
 		prepared.session.setActiveModelProfile?.(
 			prepared.profileName,
-			options.profileScope ??
-				(options.persistDefault || persistedProfileIdentity === prepared.profileName ? "durable" : "session"),
+			options.profileScope ?? (options.persistDefault ? "durable" : "session"),
 		);
 		if (prepared.defaultModel) {
 			prepared.modelRegistry.seedCanonicalVariant?.(prepared.session.sessionId, prepared.defaultModel);
@@ -1454,7 +1482,17 @@ export async function applyPreparedModelProfileActivation(
 				prepared.session.restoreDefaultFallbackRuntimeState?.(prepared.previousDefaultFallbackRuntimeState!),
 			);
 		}
-		restore(() => prepared.session.setActiveModelProfile?.(prepared.previousActiveModelProfile));
+		if (prepared.previousProfileInstalledOverrideState) {
+			restore(() =>
+				prepared.session.restoreProfileInstalledOverrideState?.(prepared.previousProfileInstalledOverrideState!),
+			);
+		}
+		restore(() =>
+			prepared.session.setActiveModelProfile?.(
+				prepared.previousActiveModelProfile,
+				prepared.previousActiveModelProfileScope,
+			),
+		);
 		restore(() =>
 			restoreCanonicalVariant(prepared.modelRegistry, prepared.session.sessionId, prepared.previousCanonicalVariant),
 		);
@@ -1500,6 +1538,8 @@ export interface MaterializeModelProfileForDeletionResult {
 	previousDefaultProfile: string | undefined;
 	previousPersistedDefaultProfile: string | undefined;
 	previousActiveModelProfile: string | undefined;
+	previousActiveModelProfileScope: ModelProfileScope | undefined;
+	previousProfileInstalledOverrideState: ProfileInstalledOverrideState | undefined;
 	previousDefaultChainState: ConfiguredModelChainState | undefined;
 	previousDefaultFallbackRuntimeState: DefaultFallbackRuntimeState | undefined;
 	/**
@@ -1630,7 +1670,17 @@ export async function materializeModelProfileForDeletion(
 				? prepared.settings.clearOverride("modelProfile.default")
 				: prepared.settings.override("modelProfile.default", prepared.previousDefaultProfileOverride),
 		);
-		restore(() => prepared.session.setActiveModelProfile?.(prepared.previousActiveModelProfile));
+		if (prepared.previousProfileInstalledOverrideState) {
+			restore(() =>
+				prepared.session.restoreProfileInstalledOverrideState?.(prepared.previousProfileInstalledOverrideState!),
+			);
+		}
+		restore(() =>
+			prepared.session.setActiveModelProfile?.(
+				prepared.previousActiveModelProfile,
+				prepared.previousActiveModelProfileScope,
+			),
+		);
 		try {
 			await prepared.settings.flushOrThrow();
 		} catch (rollbackError) {
@@ -1658,6 +1708,8 @@ export async function materializeModelProfileForDeletion(
 		previousDefaultProfile,
 		previousPersistedDefaultProfile,
 		previousActiveModelProfile: prepared.previousActiveModelProfile,
+		previousActiveModelProfileScope: prepared.previousActiveModelProfileScope,
+		previousProfileInstalledOverrideState: prepared.previousProfileInstalledOverrideState,
 		previousDefaultChainState: prepared.previousDefaultChainState,
 		previousDefaultFallbackRuntimeState: prepared.previousDefaultFallbackRuntimeState,
 		restoreSessionCanonicalVariant: () =>
@@ -1669,7 +1721,10 @@ export async function restoreMaterializedModelProfileForDeletion(options: {
 	settings: Pick<Settings, "clearOverride" | "flushOrThrow" | "override" | "set" | "unset">;
 	session: Pick<
 		ModelProfileActivationSession,
-		"setActiveModelProfile" | "setConfiguredModelChain" | "restoreDefaultFallbackRuntimeState"
+		| "setActiveModelProfile"
+		| "setConfiguredModelChain"
+		| "restoreDefaultFallbackRuntimeState"
+		| "restoreProfileInstalledOverrideState"
 	>;
 	snapshot: MaterializeModelProfileForDeletionResult;
 }): Promise<void> {
@@ -1723,7 +1778,19 @@ export async function restoreMaterializedModelProfileForDeletion(options: {
 			? options.settings.clearOverride("modelProfile.default")
 			: options.settings.override("modelProfile.default", options.snapshot.previousDefaultProfileOverride),
 	);
-	restore(() => options.session.setActiveModelProfile?.(options.snapshot.previousActiveModelProfile));
+	if (options.snapshot.previousProfileInstalledOverrideState) {
+		restore(() =>
+			options.session.restoreProfileInstalledOverrideState?.(
+				options.snapshot.previousProfileInstalledOverrideState!,
+			),
+		);
+	}
+	restore(() =>
+		options.session.setActiveModelProfile?.(
+			options.snapshot.previousActiveModelProfile,
+			options.snapshot.previousActiveModelProfileScope,
+		),
+	);
 	try {
 		await options.settings.flushOrThrow();
 	} catch (error) {

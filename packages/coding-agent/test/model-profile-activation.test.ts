@@ -148,6 +148,7 @@ function fakeRegistry(options?: { missingProviders?: string[]; profiles?: ModelP
 
 function fakeSession(initial = model("provider-a", "initial")) {
 	let activeModelProfile: string | undefined;
+	let activeModelProfileScope: "session" | "durable" | undefined;
 	return {
 		model: initial as Model | undefined,
 		thinkingLevel: ThinkingLevel.Low as ThinkingLevel | undefined,
@@ -197,11 +198,15 @@ function fakeSession(initial = model("provider-a", "initial")) {
 		getSessionDefaultModelSelector() {
 			return this.resumeDefaultSelectors.at(-1);
 		},
-		setActiveModelProfile(name: string | undefined) {
+		setActiveModelProfile(name: string | undefined, scope: "session" | "durable" = "durable") {
 			activeModelProfile = name;
+			activeModelProfileScope = name === undefined ? undefined : scope;
 		},
 		getActiveModelProfile() {
 			return activeModelProfile;
+		},
+		getActiveModelProfileScope() {
+			return activeModelProfileScope;
 		},
 	};
 }
@@ -364,6 +369,31 @@ describe("model profile activation", () => {
 
 		expect(getAvailableForProfileActivation).toHaveBeenCalledTimes(1);
 		expect(recovery.entries).toEqual([]);
+	});
+
+	test("durable default recovery keeps an excluded bare bundled default unavailable", async () => {
+		const profile: ModelProfileDefinition = {
+			name: "excluded-bare-bundled-default",
+			requiredProviders: ["anthropic"],
+			modelMapping: { default: "claude-opus-5" },
+			source: "builtin",
+		};
+		const baseRegistry = fakeRegistry({ profiles: [profile] });
+		const getAvailableForProfileActivation = vi.fn(() => [] as Model[]);
+		const registry = {
+			...baseRegistry,
+			getAvailable: baseRegistry.getAll,
+			getAvailableForProfileActivation,
+		} as unknown as ModelRegistry;
+
+		await expect(
+			resolveModelProfileDefaultChain({
+				modelRegistry: registry,
+				settings: Settings.isolated(),
+				profileName: profile.name,
+				credentialSessionId: "resume-session",
+			}),
+		).resolves.toEqual({ profileName: profile.name, entries: [] });
 	});
 
 	test("durable default recovery ignores an optional mapped provider auth probe failure", async () => {
@@ -2403,6 +2433,25 @@ describe("preset-equivalent profile activation", () => {
 		expect(session.getSessionDefaultModelSelector()).toBe("provider-a/opus-real");
 	});
 
+	test("activation rollback restores the prior session-only profile scope", async () => {
+		const session = fakeSession();
+		session.setActiveModelProfile("prior-profile", "session");
+		const settings = Settings.isolated();
+		const prepared = await prepareModelProfileActivation({
+			session,
+			modelRegistry: fakeRegistry(),
+			settings,
+			profileName: "profile-a",
+		});
+		vi.spyOn(settings, "flushOrThrow").mockRejectedValueOnce(new Error("flush failed"));
+
+		await expect(applyPreparedModelProfileActivation(prepared, { persistDefault: true })).rejects.toThrow(
+			"flush failed",
+		);
+		expect(session.getActiveModelProfile()).toBe("prior-profile");
+		expect(session.getActiveModelProfileScope()).toBe("session");
+	});
+
 	// A transient live-model switch (no canonical identity, unrelated to the
 	// prior selection) must not clobber the exactly-sticky provider on rollback.
 	test("transient live model cannot clobber the prior sticky on rollback", async () => {
@@ -2479,6 +2528,7 @@ describe("preset-equivalent profile activation", () => {
 		const settings = Settings.isolated();
 		// A prior explicit selection made provider-a sticky for the session.
 		sticky.set(session.sessionId, "provider-a/opus-real");
+		session.setActiveModelProfile("preset-profile", "session");
 
 		const snapshot = await materializeModelProfileForDeletion({
 			session: sessionWithFallback,
@@ -2494,6 +2544,8 @@ describe("preset-equivalent profile activation", () => {
 		// The snapshot's internal closure restored the exact pre-clear sticky.
 		expect(sticky.get(session.sessionId)).toBe("provider-a/opus-real");
 		expect(restoreDefaultFallbackRuntimeState).toHaveBeenCalledWith(fallbackRuntimeState);
+		expect(session.getActiveModelProfile()).toBe("preset-profile");
+		expect(session.getActiveModelProfileScope()).toBe("session");
 	});
 
 	test("successful activation leaves the new model sticky", async () => {

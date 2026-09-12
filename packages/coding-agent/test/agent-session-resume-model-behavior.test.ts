@@ -452,6 +452,56 @@ describe("AgentSession switchSession resumeModelBehavior", () => {
 		expect(settings.get("modelRoles").reviewer).toBe("provider/durable");
 	});
 
+	it("replaces stale profile ownership keys when a successor profile omits a role", async () => {
+		const sonnet = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const settings = Settings.isolated({ "compaction.enabled": false });
+		session = new AgentSession({
+			agent: new Agent({ initialState: { model: sonnet, systemPrompt: ["Test"], tools: [], messages: [] } }),
+			sessionManager: SessionManager.create(tempDir.path(), tempDir.path()),
+			settings,
+			modelRegistry,
+		});
+
+		session.noteProfileInstalledOverrides(["reviewer"], ["executor"], sonnet);
+		session.noteProfileInstalledOverrides(["planner"], [], sonnet);
+
+		expect(session.getProfileInstalledOverrideKeys()).toEqual({
+			modelRoles: ["planner"],
+			agentModelOverrides: [],
+		});
+	});
+
+	it("treats a legacy durable profile alias as the canonical successor identity", async () => {
+		const sonnet = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"modelProfile.default": "codex-standard",
+			"session.resumeModelBehavior": "keepSessionModel",
+		});
+		const sessionFile = await createPersistedTarget(sonnet, settings);
+		targetSession!.setConfiguredModelChain(
+			"default",
+			[`${sonnet.provider}/${sonnet.id}`],
+			"profile-activation",
+			"codex-medium",
+		);
+		await targetSession!.sessionManager.flush();
+
+		session = new AgentSession({
+			agent: new Agent({ initialState: { model: sonnet, systemPrompt: ["Test"], tools: [], messages: [] } }),
+			sessionManager: SessionManager.create(tempDir.path(), tempDir.path()),
+			settings,
+			modelRegistry,
+		});
+
+		expect(await session.switchSession(sessionFile)).toBe(true);
+		expect(session.getActiveModelProfile()).toBe("codex-medium");
+		expect(session.getConfiguredModelChainState("default")).toMatchObject({
+			origin: "profile-activation",
+			identity: "codex-medium",
+		});
+	});
+
 	it("does not recover a saved selector that still exists in the full catalog", async () => {
 		const sonnet = getBundledModel("anthropic", "claude-sonnet-4-5")!;
 		const settings = Settings.isolated({
