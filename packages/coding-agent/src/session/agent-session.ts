@@ -1197,21 +1197,21 @@ type InternalCustomMessageOptions = Pick<
 	sdkRunToken?: string;
 };
 
+function assertQueuedInputQueuePolicy(queuePolicy: unknown): asserts queuePolicy is QueuedInputQueuePolicy | undefined {
+	if (queuePolicy !== undefined && queuePolicy !== "respect-mode" && queuePolicy !== "sequential") {
+		throw Object.assign(new Error("queuePolicy must be respect-mode or sequential."), { code: "invalid_input" });
+	}
+}
+
 function assertTrackedSendUserMessageOptions(options: unknown): asserts options is TrackedSendUserMessageOptions {
 	const candidate = options !== null && typeof options === "object" ? (options as Record<string, unknown>) : undefined;
-	const queuePolicy = candidate?.queuePolicy;
-	if (
-		candidate?.trackSubmission !== true ||
-		(candidate.deliverAs !== "steer" && candidate.deliverAs !== "followUp") ||
-		(queuePolicy !== undefined && queuePolicy !== "respect-mode" && queuePolicy !== "sequential")
-	) {
+	if (candidate?.trackSubmission !== true || (candidate.deliverAs !== "steer" && candidate.deliverAs !== "followUp")) {
 		throw Object.assign(
-			new Error(
-				"submitUserMessage requires trackSubmission: true, deliverAs: steer or followUp, and a valid queuePolicy.",
-			),
+			new Error("submitUserMessage requires trackSubmission: true and deliverAs: steer or followUp."),
 			{ code: "invalid_input" },
 		);
 	}
+	assertQueuedInputQueuePolicy(candidate?.queuePolicy);
 }
 
 function assertLegacySendUserMessageOptions(options: unknown): void {
@@ -14300,6 +14300,7 @@ export class AgentSession {
 		content: string | (TextContent | ImageContent)[],
 		options?: SendUserMessageDispatchOptions,
 	): Promise<undefined | QueuedInputSubmission> {
+		assertQueuedInputQueuePolicy(options?.queuePolicy);
 		const sdkRunToken = readSdkRunCapability(options?.sdkRunCapability);
 		const internalOptions = options ? { ...options, ...(sdkRunToken ? { sdkRunToken } : {}) } : undefined;
 		this.#assertRecoveryHydrationPromoted();
@@ -16255,6 +16256,17 @@ export class AgentSession {
 			const previousSessionFile = this.sessionFile;
 			const previousWorkflowGateSessionId = this.sessionId;
 			const previousSessionIdentity = this.sessionManager.getSessionId();
+			const predecessorQueuedSdkWork = this.#queuedMessagesForSessionTransition();
+			const settleForkPredecessorWork = (): void => {
+				this.#terminalizeQueuedSdkWorkForSessionTransition(predecessorQueuedSdkWork);
+				this.#deferredSdkFollowUps = [];
+				this.#pendingNextTurnMessages = [];
+				this.#scheduledHiddenNextTurnGeneration = undefined;
+				this.agent.clearAllQueues();
+				this.#steeringMessages = [];
+				this.#followUpMessages = [];
+				this.#resetActiveSdkRunOwnership();
+			};
 
 			// Emit session_before_switch event with reason "fork" (can be cancelled)
 			if (this.#extensionRunner?.hasHandlers("session_before_switch")) {
@@ -16323,6 +16335,7 @@ export class AgentSession {
 				}
 				this.sessionManager = forkedManager;
 				this.#rekeyJobManagerForSessionIdentity(previousSessionIdentity, previousSessionFile);
+				settleForkPredecessorWork();
 				try {
 					await previousManager.close();
 				} catch (error) {
@@ -16344,6 +16357,7 @@ export class AgentSession {
 					// Fork commits a successor endpoint identity; re-register the
 					// manager under it (review thread P1).
 					this.#rekeyJobManagerForSessionIdentity(previousSessionIdentity, previousSessionFile);
+					settleForkPredecessorWork();
 					await this.#runToolSessionTransitionCleanups();
 				} catch (error) {
 					throw await discardPreparedNewSessionAfterFailure(this.sessionManager, prepared, error);
