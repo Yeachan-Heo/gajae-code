@@ -1422,6 +1422,31 @@ describe("queued promotion run identity (#4668)", () => {
 		await promptDone;
 	});
 
+	it("rejects tracked preflight that crosses a session transition", async () => {
+		const fixture = buildAbortableTrackedTransitionFixture(undefined, undefined, true);
+		session = fixture.session;
+		const promptDone = session.prompt("first task").catch(() => {});
+		await withTimeout(fixture.firstToolStarted.promise, 5_000, "transition admission test first tool");
+		const preflightEntered = Promise.withResolvers<void>();
+		const releasePreflight = Promise.withResolvers<void>();
+		const submission = session.submitUserMessage("must not cross transition", {
+			deliverAs: "followUp",
+			trackSubmission: true,
+			onPreflightAcceptCommit: async () => {
+				preflightEntered.resolve();
+				await releasePreflight.promise;
+			},
+		} as never);
+		await preflightEntered.promise;
+		const compaction = session.compact().catch(() => undefined);
+		releasePreflight.resolve();
+		await expect(submission).rejects.toMatchObject({ code: "busy" });
+		await compaction;
+		fixture.firstGate.resolve();
+		fixture.secondGate.resolve();
+		await promptDone;
+	});
+
 	it("terminalizes a consumed tracked submission during session replacement", async () => {
 		const fixture = buildAbortableTrackedTransitionFixture();
 		session = fixture.session;
