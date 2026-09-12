@@ -79,16 +79,6 @@ function assistantEnd(text: string, stopReason: "stop" | "error" = "stop") {
 	};
 }
 
-/** Await a runtime-state write and return the refusal it must produce. */
-async function expectRefusal(promise: Promise<unknown>): Promise<Error> {
-	try {
-		await promise;
-	} catch (error) {
-		return error as Error;
-	}
-	throw new Error("expected the runtime-state write to be refused, but it succeeded");
-}
-
 async function committedFailureFixture() {
 	const root = await tempRoot();
 	const stateFile = path.join(root, "state.json");

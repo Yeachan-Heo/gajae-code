@@ -1198,6 +1198,8 @@ test("deadline release retains acceptance and receipt evidence and refuses stale
 		code: "prompt_deadline_exceeded",
 		message: "Prompt deadline exceeded.",
 		provenance: "deadline",
+		phase: "post_start",
+		category: "deadline",
 	} as const;
 	await reconciliation.noteAccepted("prompt", correlation);
 	await reconciliation.noteTransition("prompt", correlation, { type: "agent_start" });

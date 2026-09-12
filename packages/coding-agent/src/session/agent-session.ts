@@ -13502,7 +13502,6 @@ export class AgentSession {
 			this.#scheduleQueuedFollowUpContinuation(() =>
 				this.agent.snapshotFollowUp().some(candidate => candidate === message),
 			);
-
 		}
 		// Own the unwind wakeup here, including refused steers behind existing work.
 		// Scheduling again in #queueSteer would wake the first enqueue twice.

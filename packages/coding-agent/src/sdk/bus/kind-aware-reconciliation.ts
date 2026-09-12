@@ -159,13 +159,19 @@ export interface KindAwareReconciliation {
 		outcome: SdkPromptTerminalOutcome,
 		receiptState?: Extract<ReceiptState, "present" | "missing">,
 	): Promise<SdkPromptTerminalOutcome>;
+	/** Release only a superseded deadline claim/terminal while its expiry owner is current. */
+	releaseDeadlineOutcome(
+		kind: ReconciliationKind,
+		correlation: PromptCorrelation,
+		isCurrent: () => boolean,
+	): Promise<void>;
 	finalizeOutcome(
 		kind: ReconciliationKind,
 		correlation: PromptCorrelation,
 		outcome?: SdkPromptTerminalOutcome,
 		recordError?: { code: string; message: string },
 		content?: unknown,
-	): Promise<void>;
+	): Promise<"committed" | "superseded" | "retained" | "missing">;
 	finalizeOutcome(
 		kind: ReconciliationKind,
 		correlation: PromptCorrelation,
@@ -173,7 +179,8 @@ export interface KindAwareReconciliation {
 		isCurrent?: () => boolean,
 		recordError?: { code: string; message: string },
 		content?: unknown,
-	): Promise<void>;
+		onCommitted?: () => void,
+	): Promise<"committed" | "superseded" | "retained" | "missing">;
 	/** Replace an exhausted deadline failure with an active, non-definite record. */
 	markUncertain(
 		kind: ReconciliationKind,
@@ -275,6 +282,9 @@ export function createKindAwareReconciliation(
 
 	const queueMutation = async <T>(
 		mutate: (candidate: Map<string, DurableReconciliationRecord>) => { value: T; changed: boolean },
+		isCurrent?: () => boolean,
+		onCommitted?: () => void,
+		onSuperseded?: () => void,
 	): Promise<T> => {
 		const run = async () => {
 			const candidate = new Map([...records].map(([key, record]) => [key, { ...record }]));
@@ -286,8 +296,20 @@ export function createKindAwareReconciliation(
 					...current.filter(record => !ownedKinds.has(record.kind)),
 					...[...candidate.values()].filter(record => ownedKinds.has(record.kind)).map(record => ({ ...record })),
 				]);
+			// Persistence can yield to fresh progress. Never expose its stale
+			// terminal candidate to Q26 while compensating the durable write.
+			if (isCurrent && !isCurrent()) {
+				onSuperseded?.();
+				if (store)
+					await store.transact(current => [
+						...current.filter(record => !ownedKinds.has(record.kind)),
+						...[...records.values()].filter(record => ownedKinds.has(record.kind)).map(record => ({ ...record })),
+					]);
+				return result.value;
+			}
 			records = candidate;
 			clientRefIndex = candidateIndex;
+			onCommitted?.();
 			return result.value;
 		};
 		const pending = mutationChain.then(run, run);
@@ -692,8 +714,8 @@ export function createKindAwareReconciliation(
 				: typeof arg5 === "object" && arg5 !== null && "code" in arg5
 					? (arg5 as { code: string; message: string })
 					: undefined;
-					? arg6
-					: arg5;
+		const content =
+			typeof arg4 === "function" ? arg6 : typeof arg5 === "object" && arg5 !== null && "code" in arg5 ? arg6 : arg5;
 		const sanitizedContent = sanitizeTurnResultContent(content);
 		let committed = false;
 		let superseded = false;
@@ -701,70 +723,72 @@ export function createKindAwareReconciliation(
 			candidate => {
 				if (isCurrent !== undefined && !isCurrent()) {
 					superseded = true;
-				return { value: undefined, changed: false };
+					return { value: undefined, changed: false };
 				}
-			const record = candidate.get(keyOf(kind, correlation));
+				const record = candidate.get(keyOf(kind, correlation));
 				if (!record || record.kind !== kind) return { value: undefined, changed: false };
 				if (record.terminalAt !== undefined) {
 					// A queued provider diagnostic may already own this terminal. Merge
 					// deferred receipt evidence without replacing its classifier.
 					const content = reduceTurnResultContent(record.content, sanitizedContent);
 					const receipt = reduceReceiptState(
-				record.receiptState,
+						record.receiptState,
 						reportableTurnResultContent(content) ? "present" : undefined,
-			);
+					);
 					if (content === record.content && receipt === record.receiptState)
-				return { value: undefined, changed: false };
+						return { value: undefined, changed: false };
 					record.content = content;
 					record.receiptState = receipt;
-			return { value: undefined, changed: true };
+					return { value: undefined, changed: true };
 				}
-			const requestedOutcome = normalizeTerminalOutcome(outcome, failureEvidence(record)) ?? record.pendingOutcome;
-			const providerErrorRecord = record.error;
-			const providerError =
-				providerErrorRecord !== undefined && providerErrorRecord.code !== "prompt_deadline_exceeded";
-			const requestedProviderCode = requestedOutcome?.kind === "failed" ? requestedOutcome.providerCode : undefined;
-			const finalOutcome = providerError
-				? failedOutcomeForError(providerErrorRecord, failureEvidence(record), requestedProviderCode)
-				: requestedOutcome?.kind === "stopped"
-					? requestedOutcome
-					: providerError &&
-							(requestedOutcome === undefined ||
-								(requestedOutcome.kind === "failed" && isDeadlineOutcome(requestedOutcome)))
-						? failedOutcomeForError(providerErrorRecord, failureEvidence(record), requestedProviderCode)
-						: requestedOutcome;
-			record.terminalAt = now();
-			if (finalOutcome?.kind === "failed") {
-				record.status = "failed";
-				if (recordError !== undefined && !(providerError && recordError.code === "prompt_deadline_exceeded"))
-					record.error = { code: recordError.code, message: finalOutcome.message };
-				else if (providerError && providerErrorRecord !== undefined)
-					record.error = { code: providerErrorRecord.code, message: finalOutcome.message };
-				else record.error = { code: finalOutcome.code, message: finalOutcome.message };
-			} else if (
-				kind === "prompt" &&
-				((finalOutcome === undefined && !sanitizedContent?.text.trim()) ||
-					(finalOutcome?.kind !== "stopped" && content !== undefined && !sanitizedContent?.text.trim()))
-			) {
-				record.status = "failed";
-				record.error = EMPTY_PROMPT_FAILURE;
-				record.outcome = failedOutcomeForError(EMPTY_PROMPT_FAILURE, failureEvidence(record));
-			} else if (finalOutcome?.kind === "stopped") {
-				// A stopped terminal is authoritative only when no provider failure
-				// was recorded before finalization.
-				record.status = "terminal_ok";
-				delete record.error;
-			} else record.status = "terminal_ok";
-			record.content = reduceTurnResultContent(record.content, sanitizedContent);
-			if (record.status !== "failed" || record.outcome === undefined) record.outcome = finalOutcome;
-			record.receiptState = reduceReceiptState(
-				record.receiptState,
-				reportableTurnResultContent(record.content) ? "present" : (record.pendingReceiptState ?? "unknown"),
-			);
-			delete record.pendingOutcome;
-			delete record.pendingReceiptState;
-			cleanupRecords(candidate);
-			return { value: undefined, changed: true };
+				const requestedOutcome =
+					normalizeTerminalOutcome(outcome, failureEvidence(record)) ?? record.pendingOutcome;
+				const providerErrorRecord = record.error;
+				const providerError =
+					providerErrorRecord !== undefined && providerErrorRecord.code !== "prompt_deadline_exceeded";
+				const requestedProviderCode =
+					requestedOutcome?.kind === "failed" ? requestedOutcome.providerCode : undefined;
+				const finalOutcome = providerError
+					? failedOutcomeForError(providerErrorRecord, failureEvidence(record), requestedProviderCode)
+					: requestedOutcome?.kind === "stopped"
+						? requestedOutcome
+						: providerError &&
+								(requestedOutcome === undefined ||
+									(requestedOutcome.kind === "failed" && isDeadlineOutcome(requestedOutcome)))
+							? failedOutcomeForError(providerErrorRecord, failureEvidence(record), requestedProviderCode)
+							: requestedOutcome;
+				record.terminalAt = now();
+				if (finalOutcome?.kind === "failed") {
+					record.status = "failed";
+					if (recordError !== undefined && !(providerError && recordError.code === "prompt_deadline_exceeded"))
+						record.error = { code: recordError.code, message: finalOutcome.message };
+					else if (providerError && providerErrorRecord !== undefined)
+						record.error = { code: providerErrorRecord.code, message: finalOutcome.message };
+					else record.error = { code: finalOutcome.code, message: finalOutcome.message };
+				} else if (
+					kind === "prompt" &&
+					((finalOutcome === undefined && !sanitizedContent?.text.trim()) ||
+						(finalOutcome?.kind !== "stopped" && content !== undefined && !sanitizedContent?.text.trim()))
+				) {
+					record.status = "failed";
+					record.error = EMPTY_PROMPT_FAILURE;
+					record.outcome = failedOutcomeForError(EMPTY_PROMPT_FAILURE, failureEvidence(record));
+				} else if (finalOutcome?.kind === "stopped") {
+					// A stopped terminal is authoritative only when no provider failure
+					// was recorded before finalization.
+					record.status = "terminal_ok";
+					delete record.error;
+				} else record.status = "terminal_ok";
+				record.content = reduceTurnResultContent(record.content, sanitizedContent);
+				if (record.status !== "failed" || record.outcome === undefined) record.outcome = finalOutcome;
+				record.receiptState = reduceReceiptState(
+					record.receiptState,
+					reportableTurnResultContent(record.content) ? "present" : (record.pendingReceiptState ?? "unknown"),
+				);
+				delete record.pendingOutcome;
+				delete record.pendingReceiptState;
+				cleanupRecords(candidate);
+				return { value: undefined, changed: true };
 			},
 			isCurrent,
 			() => {
@@ -774,7 +798,7 @@ export function createKindAwareReconciliation(
 			() => {
 				superseded = true;
 			},
-			);
+		);
 		if (committed) return "committed";
 		if (superseded) return "superseded";
 		const retained = records.get(keyOf(kind, correlation));
@@ -803,6 +827,35 @@ export function createKindAwareReconciliation(
 				delete record.error;
 			record.deadlineRecoveryPending = true;
 			if (deadlineMaxAt !== undefined) record.deadlineMaxAt = deadlineMaxAt;
+			return { value: undefined, changed: true };
+		});
+	};
+
+	const releaseDeadlineOutcome = async (
+		kind: ReconciliationKind,
+		correlation: PromptCorrelation,
+		isCurrent: () => boolean,
+	) => {
+		await queueMutation(candidate => {
+			if (!isCurrent()) return { value: undefined, changed: false };
+			const record = candidate.get(keyOf(kind, correlation));
+			if (!record || record.kind !== kind) return { value: undefined, changed: false };
+			if (record.terminalAt !== undefined && !isDeadlineOutcome(record.outcome))
+				return { value: undefined, changed: false };
+			if (!isDeadlineOutcome(record.pendingOutcome) && !isDeadlineOutcome(record.outcome))
+				return { value: undefined, changed: false };
+			// Retain acceptance, receipt/content evidence and authenticated failures.
+			// A natural or cancellation terminal is never rolled back by this owner.
+			if (record.pendingReceiptState === "present")
+				record.receiptState = reduceReceiptState(record.receiptState, "present");
+			delete record.pendingOutcome;
+			delete record.pendingReceiptState;
+			if (isDeadlineOutcome(record.outcome)) {
+				delete record.outcome;
+				delete record.terminalAt;
+				record.status = record.startedAt === undefined ? "accepted" : "in_flight";
+			}
+			if (record.error?.code === "prompt_deadline_exceeded") delete record.error;
 			return { value: undefined, changed: true };
 		});
 	};
@@ -992,6 +1045,7 @@ export function createKindAwareReconciliation(
 		noteAccepted,
 		noteTransition,
 		claimPendingOutcome,
+		releaseDeadlineOutcome,
 		finalizeOutcome,
 		markUncertain,
 		peekPendingOutcome,
