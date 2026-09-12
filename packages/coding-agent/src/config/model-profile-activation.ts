@@ -668,10 +668,56 @@ export async function resolveModelProfileDefaultChain(options: {
 	if (proxyProvider !== undefined && proxyAuthenticated && profile.source !== "user") {
 		bindings = rewriteBindingsForProxy(bindings, proxyProvider, proxyMode, available, authenticated, routable);
 	}
-	return {
-		profileName,
-		entries: bindings.defaultSelector ? normalizeModelSelectorValue(bindings.defaultSelector) : [],
-	};
+	if (!bindings.defaultSelector) return { profileName, entries: [] };
+
+	const defaultChain = normalizeModelSelectorValue(
+		await resolveAndClampSelectorValue(
+			bindings.defaultSelector,
+			available,
+			{
+				settings: options.settings as Settings,
+				modelRegistry: options.modelRegistry as ModelRegistry,
+				sessionId: undefined,
+				credentialSessionId: options.credentialSessionId,
+				aliasIntent: "preset-equivalent",
+			},
+			label,
+			"default",
+		),
+	);
+	const entries: string[] = [];
+	for (const selector of defaultChain) {
+		const resolution = await resolveModelChainWithAuth(
+			[selector],
+			{
+				getAvailable: () => available,
+				getApiKey: (model, sessionId) =>
+					options.modelRegistry.getApiKeyForProvider(model.provider, sessionId, model.baseUrl),
+				resolveCanonicalModel: options.modelRegistry.resolveCanonicalModel?.bind(options.modelRegistry),
+				getCanonicalVariants: options.modelRegistry.getCanonicalVariants?.bind(options.modelRegistry),
+				getCanonicalId: options.modelRegistry.getCanonicalId?.bind(options.modelRegistry),
+				resolveModelByLookupAlias: options.modelRegistry.resolveModelByLookupAlias?.bind(options.modelRegistry),
+				lookupAliasExists: options.modelRegistry.lookupAliasExists?.bind(options.modelRegistry),
+				clearCanonicalVariant: options.modelRegistry.clearCanonicalVariant?.bind(options.modelRegistry),
+			} as ModelRegistry,
+			options.settings as Settings,
+			options.credentialSessionId,
+			{
+				managedFallback: true,
+				aliasIntent: "preset-equivalent",
+				canonicalSessionId: null,
+				credentialSessionId: options.credentialSessionId,
+			},
+		);
+		if (!resolution.model) continue;
+		const concreteSelector = `${resolution.model.provider}/${resolution.model.id}`;
+		entries.push(
+			resolution.explicitThinkingLevel && resolution.thinkingLevel
+				? formatModelSelectorValue(concreteSelector, resolution.thinkingLevel)
+				: concreteSelector,
+		);
+	}
+	return { profileName, entries };
 }
 
 export function rewriteSelectorForProxy(
@@ -821,7 +867,7 @@ async function resolveAndClampSelectorValue(
 	options: {
 		settings: Settings;
 		modelRegistry: ModelRegistry;
-		sessionId: string;
+		sessionId?: string;
 		credentialSessionId: string;
 		aliasIntent: "preset-equivalent";
 		requireQualifiedResolution?: boolean;
