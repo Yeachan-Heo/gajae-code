@@ -19,12 +19,14 @@ import {
 } from "../src/setup/model-onboarding-guidance";
 import {
 	addApiCompatibleProvider,
+	type DiscoveryCatalogRefresher,
 	findProviderPreset,
 	formatProviderPresetList,
 	formatProviderSetupResult,
 	parseModelList,
 	parseProviderCompatibility,
 	redactSecret,
+	reloadAndRefreshDiscoveryCatalog,
 	validateModelApi,
 } from "../src/setup/provider-onboarding";
 import { formatUnknownBuiltinSlashCommandDiagnostic } from "../src/slash-commands/builtin-registry";
@@ -62,6 +64,25 @@ describe("provider onboarding recovery guidance", () => {
 		]) {
 			expect(guidance).toContain(command);
 		}
+	});
+
+	it("keeps the credential session through the targeted discovery refresh", async () => {
+		const calls: Array<readonly [string, string, string | undefined]> = [];
+		const registry: DiscoveryCatalogRefresher = {
+			refresh: async (mode, credentialSessionId): Promise<void> => {
+				calls.push(["refresh", mode, credentialSessionId]);
+			},
+			refreshProvider: async (providerId, strategy = "online", credentialSessionId): Promise<void> => {
+				calls.push([providerId, strategy, credentialSessionId]);
+			},
+			getProviderDiscoveryState: (): { status: string } => ({ status: "ok" }),
+		};
+
+		expect(await reloadAndRefreshDiscoveryCatalog(registry, "gateway", "credential-session")).toBeNull();
+		expect(calls).toEqual([
+			["refresh", "offline", "credential-session"],
+			["gateway", "online", "credential-session"],
+		]);
 	});
 });
 
