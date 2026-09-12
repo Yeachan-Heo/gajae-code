@@ -1,0 +1,8 @@
+### Added
+
+- The in-process SDK now exposes `session.submitUserMessage()` for tracked queued steers and follow-ups. Each submission has a unique identity plus admission, execution, terminal, cancellation, removal, same-run, successor-run, and sequential FIFO lifecycle receipts without relying on private SDK-host correlation hooks.
+
+### Fixed
+
+- Tracked queued SDK submissions now cancel steers rearmed as follow-ups, retain terminal ownership across per-turn attempt-scope rotation, and reject malformed `submitUserMessage` options before dispatch (#5460).
+- Tracked queued submissions settle as removed when successor startup fails before run acceptance, and overloaded AgentSession seams are coalesced in the generated SDK inventory.
