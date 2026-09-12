@@ -3,7 +3,7 @@ import type { Api, Model } from "@gajae-code/ai/core";
 import { logger } from "@gajae-code/utils";
 import type { AgentSession, DefaultFallbackRuntimeState } from "../session/agent-session";
 import { clampExplicitThinkingLevelForModel, formatClampedModelSelector } from "../thinking";
-import { validateModelProfileName } from "./model-profile-contract";
+import { resolveModelProfileName, validateModelProfileName } from "./model-profile-contract";
 import {
 	aggregateModelProfileRequiredProviders,
 	deriveModelProfileMappedProviders,
@@ -40,13 +40,15 @@ type ModelProfileActivationSession = Pick<
 > & {
 	credentialSessionId?: string;
 	setModelTemporary?: AgentSession["setModelTemporary"];
-	setActiveModelProfile?: (name: string | undefined) => void;
+	setActiveModelProfile?: (name: string | undefined, scope?: "session" | "durable") => void;
 	getActiveModelProfile?: () => string | undefined;
 	/** Record which runtime override keys this activation installed (session-scoped). */
 	noteProfileInstalledOverrides?: (
 		modelRoles: readonly string[],
 		agentModelOverrides: readonly string[],
 		preProfileModel: Model<Api> | undefined,
+		previousModelRoles?: Readonly<Record<string, ModelSelectorValue>>,
+		previousAgentModelOverrides?: Readonly<Record<string, ModelSelectorValue>>,
 	) => void;
 	/** Drop the recorded profile-installed override keys (e.g. after materialization). */
 	clearProfileInstalledOverrides?: () => void;
@@ -115,6 +117,7 @@ export interface PrepareModelProfileActivationOptions {
 }
 export interface ApplyModelProfileActivationOptions {
 	persistDefault?: boolean;
+	profileScope?: "session" | "durable";
 	thinkingLevelOverride?: ThinkingLevel;
 }
 export interface PreparedModelProfileActivation {
@@ -613,11 +616,6 @@ interface ModelProfilePreflightContext {
 	profileName: string;
 	profile: ModelProfileDefinition;
 	profileLabel: string;
-	authenticatedProviders: Set<string>;
-	proxyProvider: string | undefined;
-	proxyMode: ModelProfileProxyMode;
-	proxyAuthenticated: boolean;
-	proxyRoutableProviders: ReadonlySet<string>;
 	availableModels: Model<Api>[];
 	bindings: ResolvedProfileBinding;
 }
@@ -709,11 +707,6 @@ async function preflightModelProfileBindings(options: {
 		profileName,
 		profile,
 		profileLabel,
-		authenticatedProviders,
-		proxyProvider,
-		proxyMode,
-		proxyAuthenticated,
-		proxyRoutableProviders,
 		availableModels,
 		bindings,
 	};
@@ -722,7 +715,7 @@ async function preflightModelProfileBindings(options: {
 /** Resolve a durable preset's default chain without mutating session or settings state. */
 export async function resolveModelProfileDefaultChain(options: {
 	modelRegistry: PrepareModelProfileActivationOptions["modelRegistry"];
-	settings: Pick<Settings, "get">;
+	settings: Settings;
 	profileName: string;
 	credentialSessionId: string;
 }): Promise<{ profileName: string; entries: string[] }> {
@@ -735,7 +728,7 @@ export async function resolveModelProfileDefaultChain(options: {
 			bindings.defaultSelector,
 			available,
 			{
-				settings: options.settings as Settings,
+				settings: options.settings,
 				modelRegistry: options.modelRegistry as ModelRegistry,
 				sessionId: undefined,
 				credentialSessionId: options.credentialSessionId,
@@ -760,7 +753,7 @@ export async function resolveModelProfileDefaultChain(options: {
 				lookupAliasExists: options.modelRegistry.lookupAliasExists?.bind(options.modelRegistry),
 				clearCanonicalVariant: options.modelRegistry.clearCanonicalVariant?.bind(options.modelRegistry),
 			} as ModelRegistry,
-			options.settings as Settings,
+			options.settings,
 			options.credentialSessionId,
 			{
 				managedFallback: true,
@@ -776,6 +769,23 @@ export async function resolveModelProfileDefaultChain(options: {
 				? formatModelSelectorValue(concreteSelector, resolution.thinkingLevel)
 				: concreteSelector,
 		);
+	}
+	if (entries.length === 0) {
+		const catalog = options.modelRegistry.getAll();
+		const unresolvedSelectors = defaultChain.filter(
+			selector =>
+				!resolveModelRoleValue(selector, catalog, {
+					settings: options.settings,
+					modelRegistry: options.modelRegistry as ModelRegistry,
+					credentialSessionId: options.credentialSessionId,
+					aliasIntent: "preset-equivalent",
+				}).model,
+		);
+		if (unresolvedSelectors.length > 0) {
+			throw new Error(
+				`Model profile "${label}" default selectors do not match any catalog model: ${unresolvedSelectors.join(", ")}`,
+			);
+		}
 	}
 	return { profileName, entries };
 }
@@ -1338,7 +1348,15 @@ export async function applyPreparedModelProfileActivation(
 			prepared.settings.set("modelProfile.default", prepared.profileName);
 			await prepared.settings.flushOrThrow();
 		}
-		prepared.session.setActiveModelProfile?.(prepared.profileName);
+		const persistedProfile = prepared.settings.get("modelProfile.default");
+		const persistedProfileIdentity = persistedProfile
+			? resolveModelProfileName(persistedProfile, prepared.modelRegistry.getModelProfiles())
+			: undefined;
+		prepared.session.setActiveModelProfile?.(
+			prepared.profileName,
+			options.profileScope ??
+				(options.persistDefault || persistedProfileIdentity === prepared.profileName ? "durable" : "session"),
+		);
 		if (prepared.defaultModel) {
 			prepared.modelRegistry.seedCanonicalVariant?.(prepared.session.sessionId, prepared.defaultModel);
 			resumeDefaultChanged = true;
@@ -1348,6 +1366,8 @@ export async function applyPreparedModelProfileActivation(
 			Object.keys(prepared.modelRoles),
 			Object.keys(prepared.agentModelOverrides),
 			prepared.previousModel,
+			prepared.previousModelRolesOverride,
+			prepared.previousAgentModelOverridesOverride,
 		);
 	} catch (error) {
 		const rollbackErrors: unknown[] = [];

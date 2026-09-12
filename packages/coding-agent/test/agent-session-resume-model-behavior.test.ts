@@ -236,6 +236,46 @@ describe("AgentSession switchSession resumeModelBehavior", () => {
 		expect(setConfiguredChain).not.toHaveBeenCalled();
 	});
 
+	it("publishes a listener-visible event for a normal saved-chain fallback", async () => {
+		const sonnet = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const codex = getBundledModel("openai-codex", "gpt-5.6-sol")!;
+		authStorage.setRuntimeApiKey("openai-codex", "test-key");
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"session.resumeModelBehavior": "keepSessionModel",
+		});
+		const sessionFile = await createPersistedTarget(sonnet, settings);
+		const unknownSelector = "missing-provider/missing-model";
+		targetSession!.setConfiguredModelChain("default", [unknownSelector, `${codex.provider}/${codex.id}`], "test");
+		await targetSession!.sessionManager.flush();
+
+		session = new AgentSession({
+			agent: new Agent({ initialState: { model: sonnet, systemPrompt: ["Test"], tools: [], messages: [] } }),
+			sessionManager: SessionManager.create(tempDir.path(), tempDir.path()),
+			settings,
+			modelRegistry,
+		});
+		vi.spyOn(modelRegistry, "getAvailable").mockReturnValue([codex]);
+		vi.spyOn(modelRegistry, "getAll").mockReturnValue([codex]);
+		const fallbackEvents: Array<Record<string, unknown>> = [];
+		session.subscribe(event => {
+			if (event.type === "model_fallback_switched") fallbackEvents.push(event);
+		});
+
+		expect(await session.switchSession(sessionFile)).toBe(true);
+		expect(fallbackEvents).toHaveLength(1);
+		expect(fallbackEvents[0]).toMatchObject({
+			from: unknownSelector,
+			to: `${codex.provider}/${codex.id}`,
+			reason: "resolution",
+			role: "default",
+			scope: "session",
+			activeIndex: 1,
+			chainLength: 2,
+			attemptsUsed: 0,
+		});
+	});
+
 	it("does not mask strict durable-profile provider failures during recovery", async () => {
 		const sonnet = getBundledModel("anthropic", "claude-sonnet-4-5")!;
 		const codex = getBundledModel("openai-codex", "gpt-5.6-sol")!;
@@ -291,6 +331,37 @@ describe("AgentSession switchSession resumeModelBehavior", () => {
 		await expect(session.switchSession(sessionFile)).rejects.toThrow("proxy provider lookup failed");
 	});
 
+	it("does not mask an unresolved durable profile default as saved-chain exhaustion", async () => {
+		const sonnet = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const codex = getBundledModel("openai-codex", "gpt-5.6-sol")!;
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"modelProfile.default": "broken-profile",
+			"session.resumeModelBehavior": "keepSessionModel",
+		});
+		const sessionFile = await createPersistedTarget(sonnet, settings);
+		session = new AgentSession({
+			agent: new Agent({ initialState: { model: sonnet, systemPrompt: ["Test"], tools: [], messages: [] } }),
+			sessionManager: SessionManager.create(tempDir.path(), tempDir.path()),
+			settings,
+			modelRegistry,
+		});
+		const profiles = new Map(modelRegistry.getModelProfiles());
+		profiles.set("broken-profile", {
+			name: "broken-profile",
+			requiredProviders: [],
+			modelMapping: { default: "missing-provider/missing-model" },
+			source: "user",
+		});
+		vi.spyOn(modelRegistry, "getModelProfiles").mockReturnValue(profiles);
+		vi.spyOn(modelRegistry, "getAvailable").mockReturnValue([codex]);
+		vi.spyOn(modelRegistry, "getAll").mockReturnValue([codex]);
+
+		await expect(session.switchSession(sessionFile)).rejects.toThrow(
+			'Model profile "broken-profile" default selectors do not match any catalog model',
+		);
+	});
+
 	it("restores predecessor profile cleanup state when successor persistence fails", async () => {
 		const sonnet = getBundledModel("anthropic", "claude-sonnet-4-5")!;
 		const settings = Settings.isolated({ "compaction.enabled": false });
@@ -305,6 +376,34 @@ describe("AgentSession switchSession resumeModelBehavior", () => {
 		settings.override("task.agentModelOverrides", { executor: `${sonnet.provider}/${sonnet.id}` });
 		session.setActiveModelProfile("session-only-profile");
 		session.noteProfileInstalledOverrides(["reviewer"], ["executor"], sonnet);
+		session.setDefaultFallbackRuntimeModel(`${sonnet.provider}/${sonnet.id}:low`);
+		const fallbackState = session.getDefaultFallbackRuntimeState();
+		session.restoreDefaultFallbackRuntimeState({
+			chain: {
+				...fallbackState.chain,
+				entries: [`${sonnet.provider}/${sonnet.id}:low`, `${sonnet.provider}/${sonnet.id}:high`],
+				identity: "predecessor-profile",
+			},
+			controller: {
+				...fallbackState.controller,
+				activeIndex: 1,
+				attemptsUsed: 2,
+				totalAttemptsUsed: 3,
+				attemptStarted: true,
+				restoredEntryIndices: [0],
+				tried: [
+					{
+						selector: `${sonnet.provider}/${sonnet.id}:low`,
+						triggerClass: "unknown",
+						reason: "previous failure",
+					},
+				],
+				skips: [{ selector: `${sonnet.provider}/${sonnet.id}:low`, reason: "previous skip" }],
+				exhaustedForTurn: false,
+			},
+			exhaustedLastTurn: true,
+		});
+		const previousFallbackState = session.getDefaultFallbackRuntimeState();
 		vi.spyOn(session.sessionManager, "ensureOnDisk").mockRejectedValueOnce(new Error("disk commit failed"));
 
 		await expect(session.switchSession(sessionFile)).rejects.toThrow("disk commit failed");
@@ -315,6 +414,42 @@ describe("AgentSession switchSession resumeModelBehavior", () => {
 		});
 		expect(settings.get("modelRoles")).toMatchObject({ reviewer: `${sonnet.provider}/${sonnet.id}` });
 		expect(settings.get("task.agentModelOverrides")).toMatchObject({ executor: `${sonnet.provider}/${sonnet.id}` });
+		expect(session.getDefaultFallbackRuntimeState()).toEqual(previousFallbackState);
+	});
+
+	it("cleans a session-only profile when the successor restores the same durable profile", async () => {
+		const sonnet = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"modelProfile.default": "codex-medium",
+			"session.resumeModelBehavior": "keepSessionModel",
+		});
+		const sessionFile = await createPersistedTarget(sonnet, settings);
+		targetSession!.setConfiguredModelChain(
+			"default",
+			[`${sonnet.provider}/${sonnet.id}`],
+			"profile-activation",
+			"codex-medium",
+		);
+		await targetSession!.sessionManager.flush();
+
+		session = new AgentSession({
+			agent: new Agent({ initialState: { model: sonnet, systemPrompt: ["Test"], tools: [], messages: [] } }),
+			sessionManager: SessionManager.create(tempDir.path(), tempDir.path()),
+			settings,
+			modelRegistry,
+		});
+		settings.override("modelRoles", { reviewer: "provider/session" });
+		session.setActiveModelProfile("codex-medium", "session");
+		session.noteProfileInstalledOverrides(["reviewer"], [], sonnet, { reviewer: "provider/durable" });
+
+		expect(await session.switchSession(sessionFile)).toBe(true);
+		expect(session.getActiveModelProfile()).toBe("codex-medium");
+		expect(session.getConfiguredModelChainState("default")).toMatchObject({
+			origin: "profile-activation",
+			identity: "codex-medium",
+		});
+		expect(settings.get("modelRoles").reviewer).toBe("provider/durable");
 	});
 
 	it("does not recover a saved selector that still exists in the full catalog", async () => {

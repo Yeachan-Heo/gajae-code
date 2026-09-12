@@ -2444,6 +2444,7 @@ export class AgentSession {
 	#scopedModels: ScopedModelSelection[];
 	#thinkingLevel: ThinkingLevel | undefined;
 	#activeModelProfile: string | undefined;
+	#activeModelProfileScope: "session" | "durable" | undefined;
 	#activeProfileInstalledRoles = new Map<string, ModelSelectorValue | undefined>();
 	#activeProfileInstalledAgentOverrides = new Map<string, ModelSelectorValue | undefined>();
 	#preProfileModel: Model | undefined;
@@ -15708,7 +15709,8 @@ export class AgentSession {
 		// reapplied by the startup policy on a fresh launch instead.
 		const droppingSessionOnlyProfile =
 			this.getActiveModelProfile() !== undefined &&
-			this.settings.get("modelProfile.default") !== this.getActiveModelProfile();
+			(this.#activeModelProfileScope !== "durable" ||
+				this.settings.get("modelProfile.default") !== this.getActiveModelProfile());
 		const preProfileModel = this.#preProfileModel;
 		this.#resetSessionScopedModelProfileState();
 		// A dropped session-only profile must not leak its concrete model into
@@ -15733,7 +15735,7 @@ export class AgentSession {
 		if (this.#activeModelProfile && this.#activeModelProfile !== configuredDefaultProfileIdentity) {
 			this.settings.clearOverride("modelRoles");
 			this.settings.clearOverride("task.agentModelOverrides");
-			this.#activeModelProfile = undefined;
+			this.setActiveModelProfile(undefined);
 		}
 		const inheritedThinkingLevel = resolveThinkingLevelForModel(this.model, this.#getInheritedThinkingLevel());
 		this.#thinkingLevelMutationRevision++;
@@ -16025,8 +16027,9 @@ export class AgentSession {
 		await this.#syncEditToolModeAfterModelChange(previousEditMode);
 	}
 
-	setActiveModelProfile(name: string | undefined): void {
+	setActiveModelProfile(name: string | undefined, scope: "session" | "durable" = "durable"): void {
 		this.#activeModelProfile = name;
+		this.#activeModelProfileScope = name === undefined ? undefined : scope;
 	}
 
 	getActiveModelProfile(): string | undefined {
@@ -16062,13 +16065,21 @@ export class AgentSession {
 	/** Resolver intent only for default assignments owned by an active or runtime-recovered durable profile. */
 	#persistedModelProfileAliasIntent(role: string): { aliasIntent: "preset-equivalent" } | undefined {
 		const runtimeDefaultIdentity = this.#defaultFallbackController?.chain;
-		const profileName =
+		const profileDefinitions = this.#modelRegistry.getModelProfiles?.() ?? new Map<string, unknown>();
+		const configuredProfile = this.settings.get("modelProfile.default");
+		const configuredProfileIdentity = configuredProfile
+			? resolveModelProfileName(configuredProfile, profileDefinitions)
+			: undefined;
+		const candidateProfileName =
 			this.#activeModelProfile ??
 			(role === "default" &&
 			runtimeDefaultIdentity?.origin === "runtime" &&
-			runtimeDefaultIdentity.identity === this.settings.get("modelProfile.default")
+			runtimeDefaultIdentity.identity === configuredProfileIdentity
 				? runtimeDefaultIdentity.identity
 				: undefined);
+		const profileName = candidateProfileName
+			? resolveModelProfileName(candidateProfileName, profileDefinitions)
+			: undefined;
 		if (!profileName) return undefined;
 		const profile = this.#modelRegistry.getModelProfile?.(profileName);
 		if (!profile) return undefined;
@@ -16097,9 +16108,19 @@ export class AgentSession {
 	 * configured `modelBindings` (also installed into these two override slots
 	 * once at startup) are not profile-owned and must survive the transition.
 	 */
-	#resetSessionScopedModelProfileState(options?: { preserveDefaultConfiguredChain?: boolean }): void {
+	#resetSessionScopedModelProfileState(options?: {
+		preserveDefaultConfiguredChain?: boolean;
+		forceCleanup?: boolean;
+		preserveActiveModelProfile?: { name: string; scope: "session" | "durable" };
+	}): void {
 		const persistedProfile = this.settings.get("modelProfile.default");
-		if (persistedProfile !== undefined && persistedProfile === this.getActiveModelProfile()) return;
+		if (
+			!options?.forceCleanup &&
+			persistedProfile !== undefined &&
+			persistedProfile === this.getActiveModelProfile() &&
+			this.#activeModelProfileScope === "durable"
+		)
+			return;
 		const hadInstalledKeys =
 			this.#activeProfileInstalledRoles.size > 0 || this.#activeProfileInstalledAgentOverrides.size > 0;
 		if (hadInstalledKeys) {
@@ -16125,7 +16146,7 @@ export class AgentSession {
 		if (!options?.preserveDefaultConfiguredChain && defaultChain && defaultChain.identity !== undefined) {
 			this.setConfiguredModelChain("default", [], "user-selection");
 		}
-		this.setActiveModelProfile(undefined);
+		this.setActiveModelProfile(options?.preserveActiveModelProfile?.name, options?.preserveActiveModelProfile?.scope);
 		this.#preProfileModel = undefined;
 	}
 
@@ -16134,6 +16155,8 @@ export class AgentSession {
 		modelRoles: readonly string[],
 		agentModelOverrides: readonly string[],
 		preProfileModel: Model | undefined,
+		previousModelRoles?: Readonly<Record<string, ModelSelectorValue>>,
+		previousAgentModelOverrides?: Readonly<Record<string, ModelSelectorValue>>,
 	): void {
 		const bindings = this.#modelRegistry.getConfiguredModelBindings?.();
 		if (this.#preProfileModel === undefined) this.#preProfileModel = preProfileModel;
@@ -16142,7 +16165,9 @@ export class AgentSession {
 			const bindingValue = bindings?.modelRoles?.[role];
 			this.#activeProfileInstalledRoles.set(
 				role,
-				bindingValue ?? this.settings.getGlobal("modelRoles")?.[role as never],
+				previousModelRoles && Object.hasOwn(previousModelRoles, role)
+					? previousModelRoles[role]
+					: (bindingValue ?? this.settings.getGlobal("modelRoles")?.[role as never]),
 			);
 		}
 		for (const role of agentModelOverrides) {
@@ -16150,7 +16175,9 @@ export class AgentSession {
 			const bindingValue = bindings?.agentModelOverrides?.[role];
 			this.#activeProfileInstalledAgentOverrides.set(
 				role,
-				bindingValue ?? this.settings.getGlobal("task.agentModelOverrides")?.[role as never],
+				previousAgentModelOverrides && Object.hasOwn(previousAgentModelOverrides, role)
+					? previousAgentModelOverrides[role]
+					: (bindingValue ?? this.settings.getGlobal("task.agentModelOverrides")?.[role as never]),
 			);
 		}
 	}
@@ -16174,12 +16201,15 @@ export class AgentSession {
 	 * Session-scoped only: does not persist `modelProfile.default`.
 	 */
 	async activateModelProfileForControl(profileName: string): Promise<boolean> {
-		await activateModelProfile({
-			session: this,
-			modelRegistry: this.#modelRegistry,
-			settings: this.settings,
-			profileName,
-		});
+		await activateModelProfile(
+			{
+				session: this,
+				modelRegistry: this.#modelRegistry,
+				settings: this.settings,
+				profileName,
+			},
+			{ profileScope: "session" },
+		);
 		return this.getActiveModelProfile() === profileName;
 	}
 
@@ -16238,6 +16268,7 @@ export class AgentSession {
 				},
 				{
 					persistDefault: options?.persistDefault ?? false,
+					profileScope: options?.persistDefault ? "durable" : "session",
 					thinkingLevelOverride: options?.thinkingLevelOverride,
 				},
 			);
@@ -23633,6 +23664,8 @@ export class AgentSession {
 			const previousModel = this.model;
 			const previousThinkingLevel = this.#thinkingLevel;
 			const previousActiveModelProfile = this.#activeModelProfile;
+			const previousActiveModelProfileScope = this.#activeModelProfileScope;
+			const previousDefaultFallbackRuntimeState = this.getDefaultFallbackRuntimeState();
 			// Different-file cleanup drops session-only profile state before the
 			// successor is committed. Preserve exactly that mutable predecessor
 			// state so an on-disk commit failure can restore it.
@@ -23736,7 +23769,7 @@ export class AgentSession {
 				const liveProfileIdentity = previousActiveModelProfile
 					? resolveModelProfileName(previousActiveModelProfile, profileDefinitions)
 					: undefined;
-				this.#activeModelProfile =
+				const nextActiveModelProfile =
 					resumeModelBehavior === "useCurrentDefault"
 						? liveProfileIdentity && profileDefinitions.has(liveProfileIdentity)
 							? liveProfileIdentity
@@ -23748,6 +23781,15 @@ export class AgentSession {
 								profileDefinitions.has(persistedProfileIdentity)
 							? persistedProfileIdentity
 							: undefined;
+				const nextActiveModelProfileScope =
+					nextActiveModelProfile === undefined
+						? undefined
+						: resumeModelBehavior === "useCurrentDefault" && liveProfileIdentity === nextActiveModelProfile
+							? (previousActiveModelProfileScope ?? "session")
+							: configuredProfileIdentity === nextActiveModelProfile
+								? "durable"
+								: "session";
+				this.setActiveModelProfile(nextActiveModelProfile, nextActiveModelProfileScope);
 				this.#defaultFallbackController = undefined;
 				if (defaultEntries.length > 0) {
 					const resolution = await resolveModelChainWithAuth(
@@ -23879,8 +23921,24 @@ export class AgentSession {
 				// Switching to another session file must not carry the predecessor's
 				// profile marker or role overrides into the successor; the successor's
 				// own configured model is restored above.
-				if (switchingToDifferentSession)
-					this.#resetSessionScopedModelProfileState({ preserveDefaultConfiguredChain: recoveredDefaultChain });
+				if (switchingToDifferentSession) {
+					const predecessorProfileWasSessionScoped =
+						previousActiveModelProfile !== undefined && previousActiveModelProfileScope !== "durable";
+					const preserveSuccessorProfile =
+						nextActiveModelProfile !== undefined && nextActiveModelProfileScope === "durable";
+					this.#resetSessionScopedModelProfileState({
+						preserveDefaultConfiguredChain: recoveredDefaultChain || preserveSuccessorProfile,
+						forceCleanup: predecessorProfileWasSessionScoped,
+						...(preserveSuccessorProfile
+							? {
+									preserveActiveModelProfile: {
+										name: nextActiveModelProfile,
+										scope: "durable" as const,
+									},
+								}
+							: {}),
+					});
+				}
 				// Establish the successor's durable session identity only after every
 				// restored state facet is live. Identity-bound extension hooks run below.
 				await this.sessionManager.ensureOnDisk();
@@ -23996,9 +24054,9 @@ export class AgentSession {
 					);
 				}
 				await this.sessionManager.restoreRollbackState(previousSessionState);
-				this.#defaultFallbackController = undefined;
+				this.restoreDefaultFallbackRuntimeState(previousDefaultFallbackRuntimeState);
 				this.#syncAgentSessionId(previousSessionState.sessionId);
-				this.#activeModelProfile = previousActiveModelProfile;
+				this.setActiveModelProfile(previousActiveModelProfile, previousActiveModelProfileScope);
 				this.#activeProfileInstalledRoles = previousProfileInstalledRoles;
 				this.#activeProfileInstalledAgentOverrides = previousProfileInstalledAgentOverrides;
 				this.#preProfileModel = previousPreProfileModel;
