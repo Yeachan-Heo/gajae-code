@@ -10,6 +10,7 @@ import {
 	formatModelProfileDisplayLabel,
 	type ModelProfileDefinition,
 	PROXY_ROUTABLE_PROVIDER_IDS,
+	type ResolvedProfileBinding,
 	resolveProfileBindings,
 } from "./model-profiles";
 
@@ -618,7 +619,7 @@ interface ModelProfilePreflightContext {
 	proxyAuthenticated: boolean;
 	proxyRoutableProviders: ReadonlySet<string>;
 	availableModels: Model<Api>[];
-	bindings: ReturnType<typeof resolveProfileBindings>;
+	bindings: ResolvedProfileBinding;
 }
 
 /** Shared, non-mutating profile credential preflight and binding rewrite. */
