@@ -2468,6 +2468,12 @@ type SessionAdmissionEntry = {
 	continuationCapability?: symbol;
 };
 
+type SuccessorSessionAdmission = {
+	generation: number;
+	sessionId: string | undefined;
+	capability: symbol;
+};
+
 type SessionAdmissionLease = {
 	release(): void;
 };
@@ -2584,6 +2590,7 @@ export class AgentSession {
 	#sessionAdmissionClosing = false;
 	#sessionAdmissionClosed = false;
 	#sessionAdmissionContext = new AsyncLocalStorage<SessionAdmissionEntry>();
+	#successorSessionAdmissionContext = new AsyncLocalStorage<SuccessorSessionAdmission>();
 	#selectionFenceGenerationContext = new AsyncLocalStorage<number>();
 	#selectionFenceTail: Promise<void> = Promise.resolve();
 	#pendingSelectionFences = 0;
@@ -2783,6 +2790,10 @@ export class AgentSession {
 			delivery: state.delivery,
 			queuePolicy: state.queuePolicy,
 		});
+	}
+	#settleTrackedAdmissionCallbackFailure(state: TrackedQueuedInput, owner: QueuedFollowUpOwner): void {
+		if (owner.cancel()) return;
+		this.#settleTrackedQueuedInputRemoved(state, "removed");
 	}
 
 	#settleTrackedExecution(
@@ -3036,20 +3047,7 @@ export class AgentSession {
 		// follow-up queued after them, preserving submission order. Marking
 		// each as sequential first, then restoring ahead of the existing queue,
 		// keeps the existing follow-ups' identity and per-message marks intact.
-		let batch: AgentMessage[] = [];
-		const flushBatch = () => {
-			if (batch.length > 1) this.agent.markFollowUpBatch(batch);
-			batch = [];
-		};
-		for (const message of rearmed) {
-			if (this.#sequentialSteerMessages.has(message)) {
-				flushBatch();
-				this.agent.markFollowUpSequential(message);
-			} else if (this.agent.getSteeringMode() === "all") {
-				batch.push(message);
-			}
-		}
-		flushBatch();
+		this.#markSteeringAsFollowUpPolicy(rearmed);
 		this.agent.restoreFollowUp(rearmed);
 		this.#followUpMessages = [...rearmedDisplays, ...this.#followUpMessages];
 		for (const message of rearmed) {
@@ -3067,6 +3065,22 @@ export class AgentSession {
 		// abort paths schedule their own continuation and this one is a no-op
 		// once the queue is drained.
 		this.#scheduleQueuedDelivery();
+	}
+	#markSteeringAsFollowUpPolicy(messages: readonly AgentMessage[]): void {
+		let batch: AgentMessage[] = [];
+		const flushBatch = () => {
+			if (batch.length > 1) this.agent.markFollowUpBatch(batch);
+			batch = [];
+		};
+		for (const message of messages) {
+			if (this.#sequentialSteerMessages.has(message)) {
+				flushBatch();
+				this.agent.markFollowUpSequential(message);
+			} else if (this.agent.getSteeringMode() === "all") {
+				batch.push(message);
+			}
+		}
+		flushBatch();
 	}
 	#fireQueuedPromotionHooks(messages: readonly AgentMessage[], promotion?: { startsOwnRun?: boolean }): void {
 		for (const message of messages) {
@@ -3842,7 +3856,6 @@ export class AgentSession {
 	 * orchestrator does not hold it), so there is no self-deadlock.
 	 */
 	#sessionTransitionKind: string | undefined;
-	#allowSessionTransitionSubmissions = false;
 	#coordinatorPersistGeneration = 0;
 	#coordinatorRescopeBarrier: Promise<void> | undefined;
 	#releaseCoordinatorRescopeBarrier: (() => void) | undefined;
@@ -3917,7 +3930,15 @@ export class AgentSession {
 
 	#endSessionTransition(): void {
 		this.#sessionTransitionKind = undefined;
-		this.#allowSessionTransitionSubmissions = false;
+	}
+
+	#runCommittedSuccessorHook<T>(body: () => Promise<T>): Promise<T> {
+		const admission: SuccessorSessionAdmission = {
+			generation: this.#coordinatorPersistGeneration,
+			sessionId: this.sessionId,
+			capability: Symbol("committed-successor-session-hook"),
+		};
+		return this.#successorSessionAdmissionContext.run(admission, body);
 	}
 
 	#activateNextSessionAdmission(): void {
@@ -13657,6 +13678,7 @@ export class AgentSession {
 			this.#externalFollowUps.delete(message);
 			this.#sequentialSteerMessages.delete(message);
 			this.#fireQueuedRemovalHooks([message]);
+			this.#releaseDeferredSdkFollowUps();
 			return true;
 		};
 		options?.onQueuedAfterAdmission?.(message, cancelQueuedSteer);
@@ -14390,6 +14412,7 @@ export class AgentSession {
 			this.#followUpMessages = this.#followUpMessages.filter(e => !(e.tag && removedTags.has(e.tag)));
 			displayFollowUp = beforeF - this.#followUpMessages.length;
 		}
+		if (agentRemoved.total > 0) this.#releaseDeferredSdkFollowUps();
 		return {
 			agentSteering: agentRemoved.steering,
 			agentFollowUp: agentRemoved.followUp,
@@ -14442,6 +14465,7 @@ export class AgentSession {
 		assertQueuedInputQueuePolicy(options?.queuePolicy);
 		const sdkRunToken = readSdkRunCapability(options?.sdkRunCapability);
 		const submissionTransitionGeneration = this.#coordinatorPersistGeneration;
+		const successorAdmission = this.#successorSessionAdmissionContext.getStore();
 		const internalOptions = options ? { ...options, ...(sdkRunToken ? { sdkRunToken } : {}) } : undefined;
 		this.#assertRecoveryHydrationPromoted();
 		const owner = this.#sessionAdmissionContext.getStore();
@@ -14568,9 +14592,14 @@ export class AgentSession {
 			const assertPreflightStillOpen = () => {
 				this.#assertSessionAdmissionOpen();
 				if (
-					!this.#allowSessionTransitionSubmissions &&
 					(this.#sessionTransitionKind !== undefined ||
-						this.#coordinatorPersistGeneration !== submissionTransitionGeneration)
+						this.#coordinatorPersistGeneration !== submissionTransitionGeneration) &&
+					!(
+						successorAdmission !== undefined &&
+						this.#successorSessionAdmissionContext.getStore()?.capability === successorAdmission.capability &&
+						successorAdmission.generation === this.#coordinatorPersistGeneration &&
+						successorAdmission.sessionId === this.sessionId
+					)
 				) {
 					throw Object.assign(
 						new AgentBusyError(
@@ -14611,7 +14640,12 @@ export class AgentSession {
 					onQueuedAfterAdmission: onTrackedQueued,
 				});
 				this.#bindPreflightAbortCancellation(options?.preflightSignal, queuedFollowUp);
-				options?.onPreflightAccepted?.();
+				try {
+					options?.onPreflightAccepted?.();
+				} catch (error) {
+					if (trackedQueuedInput) this.#settleTrackedAdmissionCallbackFailure(trackedQueuedInput, queuedFollowUp);
+					throw error;
+				}
 				return trackedQueuedInput?.submission;
 			}
 			if (deliverAs === "steer") {
@@ -14630,7 +14664,12 @@ export class AgentSession {
 				// otherwise the steer stays executable after its caller gave up
 				// (exact-head review P1).
 				this.#bindPreflightAbortCancellation(options?.preflightSignal, queuedSteer);
-				options?.onPreflightAccepted?.();
+				try {
+					options?.onPreflightAccepted?.();
+				} catch (error) {
+					if (trackedQueuedInput) this.#settleTrackedAdmissionCallbackFailure(trackedQueuedInput, queuedSteer);
+					throw error;
+				}
 				return trackedQueuedInput?.submission;
 			}
 
@@ -14815,12 +14854,10 @@ export class AgentSession {
 		// removal deleted a DIFFERENT live message while the selected deferred
 		// entry's executable message survived and later ran.
 		let removedMessage = entry?.message;
-		let removedDeferredFollowUp = false;
 		if (removedMessage !== undefined) {
 			const deferredIndex = this.#deferredSdkFollowUps.indexOf(removedMessage);
 			if (deferredIndex !== -1) {
 				this.#deferredSdkFollowUps.splice(deferredIndex, 1);
-				removedDeferredFollowUp = true;
 			} else {
 				this.agent.removeQueuedMessages(candidate => candidate === removedMessage);
 			}
@@ -14834,9 +14871,7 @@ export class AgentSession {
 		// behind — must release the NEXT deferred submission, exactly like the
 		// cancellation path does, or it stays accepted with no execution or
 		// terminal settlement (exact-head review P1).
-		if (removedDeferredFollowUp || (removedMessage !== undefined && resolvedMode === "followUp")) {
-			this.#releaseDeferredSdkFollowUps();
-		}
+		if (removedMessage !== undefined) this.#releaseDeferredSdkFollowUps();
 		// The removed message left its queue WITHOUT consumption: its accepted SDK
 		// submission must terminalize boundedly, not strand accepted forever
 		// (#4668 review P1).
@@ -15966,16 +16001,16 @@ export class AgentSession {
 					const steeringDisplaysDuringWindow = additionsSince(this.#steeringMessages, steeringDisplaySnapshot);
 					const followUpDisplaysDuringWindow = additionsSince(this.#followUpMessages, followUpDisplaySnapshot);
 					const selectedMessage = selected?.message;
-					const heldFollowUp = selected
-						? [...queueSnapshot.steering, ...queueSnapshot.followUp].filter(
-								message => message !== selectedMessage,
-							)
+					const reclassifiedSteering = selected
+						? queueSnapshot.steering.filter(message => message !== selectedMessage)
 						: [];
+					const heldFollowUp = selected ? [...reclassifiedSteering, ...queueSnapshot.followUp] : [];
 					let heldQueueRestored = false;
 					const restoreHeldQueue = () => {
 						if (!selected || heldQueueRestored) return;
 						heldQueueRestored = true;
 						const current = this.agent.snapshotQueues();
+						this.#markSteeringAsFollowUpPolicy(reclassifiedSteering);
 						this.agent.restoreQueues({
 							steering: current.steering,
 							followUp: [...heldFollowUp, ...current.followUp],
@@ -16367,11 +16402,13 @@ export class AgentSession {
 		this.#reconnectToAgent();
 		this.#resetIrcRosterDeliveryState();
 		if (this.#extensionRunner) {
-			await this.#extensionRunner.emit({
-				type: "session_switch",
-				reason: "new",
-				previousSessionFile,
-			});
+			await this.#runCommittedSuccessorHook(() =>
+				this.#extensionRunner!.emit({
+					type: "session_switch",
+					reason: "new",
+					previousSessionFile,
+				}),
+			);
 		} else {
 		}
 	}
@@ -16554,11 +16591,13 @@ export class AgentSession {
 
 			// Emit session_switch event with reason "fork" to hooks
 			if (this.#extensionRunner) {
-				await this.#extensionRunner.emit({
-					type: "session_switch",
-					reason: "fork",
-					previousSessionFile,
-				});
+				await this.#runCommittedSuccessorHook(() =>
+					this.#extensionRunner!.emit({
+						type: "session_switch",
+						reason: "fork",
+						previousSessionFile,
+					}),
+				);
 			}
 
 			return true;
@@ -18994,11 +19033,13 @@ export class AgentSession {
 				// errors are isolated by ExtensionRunner and must not roll back the
 				// already-committed switch.
 				if (this.#extensionRunner) {
-					await this.#extensionRunner.emit({
-						type: "session_switch",
-						reason: "new",
-						previousSessionFile,
-					});
+					await this.#runCommittedSuccessorHook(() =>
+						this.#extensionRunner!.emit({
+							type: "session_switch",
+							reason: "new",
+							previousSessionFile,
+						}),
+					);
 				}
 
 				return { document: handoffText, savedPath };
@@ -24547,17 +24588,14 @@ export class AgentSession {
 				// messages, model state, MCP selections, the agent subscription, and
 				// session-scoped tool cleanup are complete.
 				if (this.#extensionRunner) {
-					this.#allowSessionTransitionSubmissions = true;
-					try {
-						await this.#extensionRunner.emit({
+					await this.#runCommittedSuccessorHook(() =>
+						this.#extensionRunner!.emit({
 							type: "session_switch",
 							reason: "resume",
 							previousSessionFile,
 							...(options?.transition ? { transition: options.transition } : {}),
-						});
-					} finally {
-						this.#allowSessionTransitionSubmissions = false;
-					}
+						}),
+					);
 				}
 				this.#terminalizeQueuedSdkWorkForSessionTransition(
 					[...previousAgentSteeringQueue, ...previousAgentFollowUpQueue, ...previousDeferredSdkFollowUps],
@@ -24776,10 +24814,12 @@ export class AgentSession {
 			// session_branch is the post-commit identity signal. Publish it only after
 			// the successor's messages and MCP selections are restored.
 			if (this.#extensionRunner) {
-				await this.#extensionRunner.emit({
-					type: "session_branch",
-					previousSessionFile,
-				});
+				await this.#runCommittedSuccessorHook(() =>
+					this.#extensionRunner!.emit({
+						type: "session_branch",
+						previousSessionFile,
+					}),
+				);
 			}
 
 			return { selectedText, cancelled: false };

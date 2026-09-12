@@ -444,6 +444,44 @@ describe("AgentSession.cancelAndSubmit", () => {
 		expect(entriesAtNewTurn).toEqual([expect.objectContaining({ text: remaining.text, mode: "followUp" })]);
 	});
 
+	it("preserves sequential policy when cancel-submit reclassifies steers", async () => {
+		const { agent, session: s, requestUserTexts } = buildGatedStreamingSession();
+		s.setFollowUpMode("all");
+		const activePrompt = s.prompt("active stream");
+		await waitForStreaming(s);
+		const first = await s.submitUserMessage("sequential-one", {
+			deliverAs: "steer",
+			trackSubmission: true,
+			queuePolicy: "sequential",
+		});
+		const second = await s.submitUserMessage("sequential-two", {
+			deliverAs: "steer",
+			trackSubmission: true,
+			queuePolicy: "sequential",
+		});
+		const third = await s.submitUserMessage("sequential-three", {
+			deliverAs: "steer",
+			trackSubmission: true,
+			queuePolicy: "sequential",
+		});
+		const [selected] = s.getQueuedMessageEntries();
+		if (!selected) throw new Error("Expected a selected sequential steer");
+
+		expect(await s.cancelAndSubmit("replacement", { queuedEntryId: selected.id })).toEqual({ kind: "submitted" });
+		expect(agent.snapshotFollowUp().map(messageText)).toEqual(["sequential-two", "sequential-three"]);
+		await activePrompt;
+		await s.waitForIdle();
+		const contexts = requestUserTexts();
+		const secondRequest = contexts.findIndex(texts => texts.includes("sequential-two"));
+		const thirdRequest = contexts.findIndex(texts => texts.includes("sequential-three"));
+		expect(secondRequest).toBeGreaterThanOrEqual(0);
+		expect(thirdRequest).toBeGreaterThan(secondRequest);
+		expect(contexts[secondRequest]).not.toContain("sequential-three");
+		await expect(first.terminal).resolves.toMatchObject({ disposition: "completed" });
+		await expect(second.terminal).resolves.toMatchObject({ disposition: "completed" });
+		await expect(third.terminal).resolves.toMatchObject({ disposition: "completed" });
+	});
+
 	it("committed queue-head preserves the original image-bearing queued message", async () => {
 		const { agent, session: s } = buildSession();
 		await s.steer("rich queued content", [{ type: "image", data: "image-data", mimeType: "image/png" }]);
