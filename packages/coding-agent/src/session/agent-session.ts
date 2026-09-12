@@ -2350,6 +2350,7 @@ export interface DefaultFallbackRuntimeState {
 	chain: ConfiguredFallbackChain;
 	controller: FallbackChainRuntimeState;
 	exhaustedLastTurn: boolean;
+	preserveLoadedLegacyDefaultChain?: boolean;
 }
 
 /**
@@ -16488,6 +16489,7 @@ export class AgentSession {
 			chain: { ...controller.chain, entries: [...controller.chain.entries] },
 			controller: controller.snapshotRuntimeState(),
 			exhaustedLastTurn: this.#defaultFallbackExhaustedLastTurn,
+			preserveLoadedLegacyDefaultChain: this.#preserveLoadedLegacyDefaultChain,
 		};
 	}
 
@@ -16499,6 +16501,7 @@ export class AgentSession {
 		controller.restoreRuntimeState(state.controller);
 		this.#defaultFallbackController = controller;
 		this.#defaultFallbackExhaustedLastTurn = state.exhaustedLastTurn;
+		this.#preserveLoadedLegacyDefaultChain = state.preserveLoadedLegacyDefaultChain ?? false;
 	}
 
 	/**
@@ -23755,6 +23758,8 @@ export class AgentSession {
 			const previousActiveSdkRunToken = this.#activeSdkRunToken;
 			const previousActiveAttemptScope = this.#activeAttemptScope;
 			const previousActiveLogicalRunId = this.#activeLogicalRunId;
+			const previousPendingFallbackSwitches = [...this.#pendingFallbackSwitches];
+			this.#pendingFallbackSwitches = [];
 
 			this.#steeringMessages = [];
 			this.#followUpMessages = [];
@@ -24181,6 +24186,7 @@ export class AgentSession {
 				else this.settings.override("task.agentModelOverrides", previousAgentModelOverridesOverride);
 				this.#restoreWorkflowGateEmitter(suspendedWorkflowGateEmitter);
 				this.#rekeyHindsightMemoryForCurrentSessionId();
+				this.#pendingFallbackSwitches = previousPendingFallbackSwitches;
 				let restoreMcpError: unknown;
 				try {
 					await this.#restoreMCPSelectionsForSessionContext(previousSessionContext);
