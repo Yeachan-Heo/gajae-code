@@ -16141,7 +16141,7 @@ export class AgentSession {
 			const modelRoles = { ...this.settings.get("modelRoles") };
 			const agentOverrides = { ...this.settings.get("task.agentModelOverrides") };
 			for (const [role, baseline] of this.#activeProfileInstalledRoles) {
-				if (role === "default" || baseline === undefined) delete modelRoles[role];
+				if (baseline === undefined) delete modelRoles[role];
 				else modelRoles[role] = baseline;
 			}
 			for (const [role, baseline] of this.#activeProfileInstalledAgentOverrides) {
@@ -23942,7 +23942,7 @@ export class AgentSession {
 									this.credentialSessionId,
 									{
 										managedFallback: true,
-										canonicalSessionId: this.sessionId,
+										canonicalSessionId: null,
 										credentialSessionId: this.credentialSessionId,
 										aliasIntent: "preset-equivalent",
 									},

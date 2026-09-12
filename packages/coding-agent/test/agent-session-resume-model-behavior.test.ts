@@ -565,16 +565,27 @@ describe("AgentSession switchSession resumeModelBehavior", () => {
 			modelRegistry,
 		});
 
+		settings.override("modelRoles", { default: "provider/durable-default" });
 		settings.override("task.agentModelOverrides", { executor: "provider/durable-executor" });
 		session.setActiveModelProfile("durable-profile", "durable");
-		session.noteProfileInstalledOverrides([], ["executor"], sonnet, {}, {});
+		session.noteProfileInstalledOverrides(["default"], ["executor"], sonnet, {
+			default: "provider/global-default",
+		});
+		settings.override("modelRoles", { default: "provider/session-default" });
 		settings.override("task.agentModelOverrides", { executor: "provider/session-executor" });
 		session.setActiveModelProfile("session-profile", "session");
-		session.noteProfileInstalledOverrides([], ["executor"], sonnet, {}, { executor: "provider/durable-executor" });
+		session.noteProfileInstalledOverrides(
+			["default"],
+			["executor"],
+			sonnet,
+			{ default: "provider/durable-default" },
+			{ executor: "provider/durable-executor" },
+		);
 
 		session.clearSessionOnlyModelProfileState();
 
 		expect(settings.get("task.agentModelOverrides").executor).toBe("provider/durable-executor");
+		expect(settings.getModelRole("default")).toBe("provider/durable-default");
 		expect(session.getActiveModelProfile()).toBeUndefined();
 	});
 
