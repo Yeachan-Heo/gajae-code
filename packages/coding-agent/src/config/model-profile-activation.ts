@@ -608,41 +608,54 @@ export function requiresQualifiedModelProfileRoleResolution(profile: Pick<ModelP
 	return profile.source === "user" || profile.source === "registry";
 }
 
-/** Resolve a durable preset's default chain without mutating session or settings state. */
-export async function resolveModelProfileDefaultChain(options: {
+interface ModelProfilePreflightContext {
+	profileName: string;
+	profile: ModelProfileDefinition;
+	profileLabel: string;
+	authenticatedProviders: Set<string>;
+	proxyProvider: string | undefined;
+	proxyMode: ModelProfileProxyMode;
+	proxyAuthenticated: boolean;
+	proxyRoutableProviders: ReadonlySet<string>;
+	availableModels: Model<Api>[];
+	bindings: ReturnType<typeof resolveProfileBindings>;
+}
+
+/** Shared, non-mutating profile credential preflight and binding rewrite. */
+async function preflightModelProfileBindings(options: {
 	modelRegistry: PrepareModelProfileActivationOptions["modelRegistry"];
 	settings: Pick<Settings, "get">;
 	profileName: string;
 	credentialSessionId: string;
-}): Promise<{ profileName: string; entries: string[] }> {
+}): Promise<ModelProfilePreflightContext> {
 	const profiles = options.modelRegistry.getModelProfiles();
 	const profileName = validateModelProfileName(options.profileName, profiles, options.modelRegistry.getError?.());
 	const profile = profiles.get(profileName) ?? options.modelRegistry.getModelProfile(profileName)!;
-	const label = formatModelProfileDisplayLabel(profile);
-	const required = aggregateModelProfileRequiredProviders(profile.requiredProviders, profile);
-	const alternatives = profile.alternativeProviderGroups ?? [];
-	const alternativeProviders = new Set(alternatives.flat());
-	const requiredProviders = new Set(required);
-	const authenticated = new Set<string>();
-	const missing: string[] = [];
+	const profileLabel = formatModelProfileDisplayLabel(profile);
+	const requiredProviders = aggregateModelProfileRequiredProviders(profile.requiredProviders, profile);
+	const alternativeGroups = profile.alternativeProviderGroups ?? [];
+	const alternativeSet = new Set(alternativeGroups.flat());
+	const requiredProviderSet = new Set(requiredProviders);
+	const authenticatedProviders = new Set<string>();
+	const missingProviders: string[] = [];
 	for (const provider of new Set([
-		...required,
-		...alternativeProviders,
+		...requiredProviders,
+		...alternativeSet,
 		...deriveModelProfileMappedProviders(profile),
 	])) {
-		let key: string | undefined;
+		let apiKey: string | undefined;
 		try {
-			key = await options.modelRegistry.getApiKeyForProvider(provider, options.credentialSessionId);
+			apiKey = await options.modelRegistry.getApiKeyForProvider(provider, options.credentialSessionId);
 		} catch (error) {
-			if (requiredProviders.has(provider) && !alternativeProviders.has(provider)) throw error;
+			if (requiredProviderSet.has(provider) && !alternativeSet.has(provider)) throw error;
 			continue;
 		}
-		if (key === kNoAuth || isAuthenticated(key)) authenticated.add(provider);
-		else if (requiredProviders.has(provider)) missing.push(provider);
+		if (apiKey === kNoAuth || isAuthenticated(apiKey)) authenticatedProviders.add(provider);
+		else if (requiredProviderSet.has(provider)) missingProviders.push(provider);
 	}
 	const proxyProvider = profile.source === "user" ? undefined : resolveProxyProviderId(options.settings);
 	const proxyMode = profile.source === "user" ? "fallback" : resolveProxyMode(options.settings);
-	const routable = getProxyRoutableProviders(profile);
+	const proxyRoutableProviders = getProxyRoutableProviders(profile);
 	if (proxyMode === "always" && proxyProvider === undefined)
 		throw new Error('modelProfile.proxyMode "always" requires modelProfile.proxyProvider');
 	if (proxyProvider !== undefined && !options.modelRegistry.getConfiguredProviderIds?.().includes(proxyProvider)) {
@@ -650,30 +663,70 @@ export async function resolveModelProfileDefaultChain(options: {
 			`modelProfile.proxyProvider "${proxyProvider}" is not configured. Configure it with \`gjc setup provider\` before activating a preset.`,
 		);
 	}
-	const proxyKey = proxyProvider
-		? await options.modelRegistry.getApiKeyForProvider(proxyProvider, options.credentialSessionId)
-		: undefined;
-	const proxyAuthenticated = proxyKey !== undefined && (proxyKey === kNoAuth || isAuthenticated(proxyKey));
-	if (proxyMode === "always" && !proxyAuthenticated) throw new ModelProfileCredentialError(label, [proxyProvider!]);
-	const strictMissing = missing.filter(provider => !routable.has(provider) && !alternativeProviders.has(provider));
-	if (strictMissing.length > 0) throw new ModelProfileCredentialError(label, strictMissing);
-	const routableMissing = missing.filter(provider => routable.has(provider) && !alternativeProviders.has(provider));
+	const proxyApiKey =
+		proxyProvider === undefined
+			? undefined
+			: await options.modelRegistry.getApiKeyForProvider(proxyProvider, options.credentialSessionId);
+	const proxyAuthenticated = proxyApiKey !== undefined && (proxyApiKey === kNoAuth || isAuthenticated(proxyApiKey));
+	if (proxyMode === "always" && !proxyAuthenticated)
+		throw new ModelProfileCredentialError(profileLabel, [proxyProvider!]);
+	const strictMissing = missingProviders.filter(
+		provider => !proxyRoutableProviders.has(provider) && !alternativeSet.has(provider),
+	);
+	if (strictMissing.length > 0) throw new ModelProfileCredentialError(profileLabel, strictMissing);
+	const routableMissing = missingProviders.filter(
+		provider => proxyRoutableProviders.has(provider) && !alternativeSet.has(provider),
+	);
 	if (routableMissing.length > 0 && !proxyAuthenticated)
-		throw new ModelProfileCredentialError(label, proxyProvider ? [proxyProvider] : routableMissing);
-	for (const group of alternatives) {
-		if (group.some(provider => authenticated.has(provider))) continue;
-		if (group.every(provider => routable.has(provider)) && proxyAuthenticated) continue;
-		throw new ModelProfileCredentialError(label, group);
+		throw new ModelProfileCredentialError(profileLabel, proxyProvider ? [proxyProvider] : routableMissing);
+	for (const group of alternativeGroups) {
+		if (group.some(provider => authenticatedProviders.has(provider))) continue;
+		if (group.every(provider => proxyRoutableProviders.has(provider)) && proxyAuthenticated) continue;
+		throw new ModelProfileCredentialError(
+			profileLabel,
+			proxyProvider && group.every(provider => proxyRoutableProviders.has(provider)) ? [proxyProvider] : [...group],
+		);
 	}
-	const available =
+	const availableModels =
 		options.modelRegistry.getAvailableForProfileActivation?.() ??
 		options.modelRegistry.getAvailable?.() ??
 		options.modelRegistry.getAll();
 	let bindings = resolveProfileBindings(profile);
-	if (alternatives.length > 0) bindings = rewriteBindingsProviders(bindings, authenticated, alternatives);
+	if (alternativeGroups.length > 0)
+		bindings = rewriteBindingsProviders(bindings, authenticatedProviders, alternativeGroups);
 	if (proxyProvider !== undefined && proxyAuthenticated && profile.source !== "user") {
-		bindings = rewriteBindingsForProxy(bindings, proxyProvider, proxyMode, available, authenticated, routable);
+		bindings = rewriteBindingsForProxy(
+			bindings,
+			proxyProvider,
+			proxyMode,
+			availableModels,
+			authenticatedProviders,
+			proxyRoutableProviders,
+		);
 	}
+	return {
+		profileName,
+		profile,
+		profileLabel,
+		authenticatedProviders,
+		proxyProvider,
+		proxyMode,
+		proxyAuthenticated,
+		proxyRoutableProviders,
+		availableModels,
+		bindings,
+	};
+}
+
+/** Resolve a durable preset's default chain without mutating session or settings state. */
+export async function resolveModelProfileDefaultChain(options: {
+	modelRegistry: PrepareModelProfileActivationOptions["modelRegistry"];
+	settings: Pick<Settings, "get">;
+	profileName: string;
+	credentialSessionId: string;
+}): Promise<{ profileName: string; entries: string[] }> {
+	const context = await preflightModelProfileBindings(options);
+	const { profileName, profileLabel: label, availableModels: available, bindings } = context;
 	if (!bindings.defaultSelector) return { profileName, entries: [] };
 
 	const defaultChain = normalizeModelSelectorValue(
@@ -1048,11 +1101,7 @@ function restoreCanonicalVariant(
 export async function prepareModelProfileActivation(
 	options: PrepareModelProfileActivationOptions,
 ): Promise<PreparedModelProfileActivation> {
-	const profiles = options.modelRegistry.getModelProfiles();
-	const profileName = validateModelProfileName(options.profileName, profiles, options.modelRegistry.getError?.());
-	const profile = profiles.get(profileName) ?? options.modelRegistry.getModelProfile(profileName)!;
-	const profileLabel = formatModelProfileDisplayLabel(profile);
-
+	const requestedProfileName = options.profileName;
 	const previousModel = options.session.model;
 	// Snapshot the exact pre-clear sticky selector (verbatim, not re-derived from
 	// the live model) so a failed prepare/apply/materialize rollback restores the
@@ -1066,121 +1115,14 @@ export async function prepareModelProfileActivation(
 	options.modelRegistry.clearCanonicalVariant?.(options.session.sessionId);
 
 	try {
-		const requiredProviders = aggregateModelProfileRequiredProviders(profile.requiredProviders, profile);
-		const alternativeGroups = profile.alternativeProviderGroups ?? [];
-		const alternativeSet = new Set(alternativeGroups.flat());
-		const requiredProviderSet = new Set(requiredProviders);
-		const authenticationProbeProviders = new Set<string>([
-			...requiredProviders,
-			...alternativeSet,
-			...deriveModelProfileMappedProviders(profile),
-		]);
-
-		const missingProviders: string[] = [];
-		const authenticatedProviders: string[] = [];
-		for (const provider of authenticationProbeProviders) {
-			let apiKey: string | undefined;
-			try {
-				apiKey = await options.modelRegistry.getApiKeyForProvider(provider, credentialSessionId);
-			} catch (error) {
-				if (requiredProviderSet.has(provider) && !alternativeSet.has(provider)) throw error;
-				continue;
-			}
-			if (apiKey !== kNoAuth && !isAuthenticated(apiKey)) {
-				if (requiredProviderSet.has(provider)) missingProviders.push(provider);
-			} else {
-				authenticatedProviders.push(provider);
-			}
-		}
-
-		// Required providers are the only activation prerequisites. Mapped fallback
-		// providers are resolution-time candidates and intentionally do not gate here.
-		// A proxy-routable strict provider is satisfied through the configured
-		// OpenAI-compatible proxy when that proxy is itself authenticated; otherwise
-		// we fail closed pointing at the proxy (or the provider when none is set).
-		const proxyProvider = profile.source !== "user" ? resolveProxyProviderId(options.settings) : undefined;
-		const proxyMode = profile.source !== "user" ? resolveProxyMode(options.settings) : "fallback";
-		const proxyRoutableProviders =
-			profile.source === "user"
-				? new Set<string>()
-				: profile.source === "registry"
-					? new Set([
-							...PROXY_ROUTABLE_PROVIDER_IDS,
-							...profile.requiredProviders,
-							...deriveModelProfileMappedProviders(profile),
-						])
-					: PROXY_ROUTABLE_PROVIDER_IDS;
-		if (proxyMode === "always" && proxyProvider === undefined) {
-			throw new Error('modelProfile.proxyMode "always" requires modelProfile.proxyProvider');
-		}
-		if (proxyProvider !== undefined) {
-			const configuredProxyProviders = options.modelRegistry.getConfiguredProviderIds?.();
-			if (!configuredProxyProviders?.includes(proxyProvider)) {
-				throw new Error(
-					`modelProfile.proxyProvider "${proxyProvider}" is not configured. Configure it with \`gjc setup provider\` before activating a preset.`,
-				);
-			}
-		}
-		const proxyApiKey =
-			proxyProvider === undefined
-				? undefined
-				: await options.modelRegistry.getApiKeyForProvider(proxyProvider, credentialSessionId);
-		const proxyAuthenticated =
-			proxyProvider !== undefined &&
-			proxyApiKey !== undefined &&
-			(proxyApiKey === kNoAuth || isAuthenticated(proxyApiKey));
-		if (proxyMode === "always" && !proxyAuthenticated) {
-			throw new ModelProfileCredentialError(profileLabel, [proxyProvider!]);
-		}
-
-		const strictMissing = missingProviders.filter(
-			provider => !proxyRoutableProviders.has(provider) && !alternativeSet.has(provider),
-		);
-		if (strictMissing.length > 0) {
-			throw new ModelProfileCredentialError(profileLabel, strictMissing);
-		}
-		const strictRoutableMissing = missingProviders.filter(
-			provider => proxyRoutableProviders.has(provider) && !alternativeSet.has(provider),
-		);
-		if (strictRoutableMissing.length > 0 && (proxyProvider === undefined || !proxyAuthenticated)) {
-			throw new ModelProfileCredentialError(
-				profileLabel,
-				proxyProvider === undefined ? strictRoutableMissing : [proxyProvider],
-			);
-		}
-		for (const group of alternativeGroups) {
-			const groupAuthenticated = group.some(provider => authenticatedProviders.includes(provider));
-			if (groupAuthenticated) continue;
-			const allRoutable = group.every(provider => proxyRoutableProviders.has(provider));
-			if (allRoutable && proxyAuthenticated) continue;
-			throw new ModelProfileCredentialError(
-				profileLabel,
-				allRoutable && proxyProvider !== undefined ? [proxyProvider] : [...group],
-			);
-		}
-
-		const availableModels =
-			options.modelRegistry.getAvailableForProfileActivation?.() ??
-			options.modelRegistry.getAvailable?.() ??
-			options.modelRegistry.getAll();
+		const context = await preflightModelProfileBindings({
+			modelRegistry: options.modelRegistry,
+			settings: options.settings,
+			profileName: requestedProfileName,
+			credentialSessionId,
+		});
+		const { profileName, profile, profileLabel, availableModels, bindings } = context;
 		const roleCatalogModels = options.modelRegistry.getAll();
-		let bindings = resolveProfileBindings(profile);
-		if (alternativeGroups.length > 0) {
-			bindings = rewriteBindingsProviders(bindings, new Set(authenticatedProviders), alternativeGroups);
-		}
-		// Built-in preset selectors are routed through a configured authenticated
-		// proxy according to the selected mode. This session-scoped rewrite is never
-		// persisted to models.yml.
-		if (proxyProvider !== undefined && proxyAuthenticated && profile.source !== "user") {
-			bindings = rewriteBindingsForProxy(
-				bindings,
-				proxyProvider,
-				proxyMode,
-				availableModels,
-				new Set(authenticatedProviders),
-				proxyRoutableProviders,
-			);
-		}
 		const defaultSelectors = bindings.defaultSelector ? normalizeModelSelectorValue(bindings.defaultSelector) : [];
 		const defaultChain =
 			defaultSelectors.length > 0
