@@ -4119,6 +4119,79 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 			runtime_turn_id: undefined,
 			state: "queued",
 		});
+		await patchSessionState(server, root, "visible-session", {
+			source: "coordinator",
+			live: false,
+		});
+		releaseAdmission.resolve();
+		await expect(answer).resolves.toMatchObject({ ok: false, error: { code: "terminal_uncertain" } });
+		expect(controls.filter(control => control.operation === "workflow.gate_answer")).toHaveLength(0);
+	});
+
+	it("does not dispatch a waiting answer after the fresh Q12 gate disappears", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		let runtimeTurnId = "unbound";
+		let gateVisible = true;
+		const admissionStarted = Promise.withResolvers<void>();
+		const releaseAdmission = Promise.withResolvers<void>();
+		const server = await createSdkControlServer(
+			root,
+			controls,
+			[],
+			query =>
+				query === "Q12"
+					? {
+							ok: true,
+							page: {
+								items: gateVisible ? [sharedAskGate("missing-fresh-gate", runtimeTurnId)] : [],
+								complete: true,
+								revision: gateVisible ? "present" : "missing",
+							},
+						}
+					: { ok: true, page: { items: [], complete: true, revision: "context" } },
+			undefined,
+			undefined,
+			undefined,
+			{
+				afterAnswerRemoteStarted: async () => {
+					admissionStarted.resolve();
+					await releaseAdmission.promise;
+				},
+				controlResult: control =>
+					control.operation === "workflow.gate_answer" ? { ok: true, result: { status: "accepted" } } : undefined,
+			},
+		);
+		await registerSdkSession(server, root);
+		const sent = await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "visible-session",
+			prompt: "missing fresh gate",
+			idempotency_key: "missing-fresh-gate-prompt",
+			allow_mutation: true,
+		});
+		runtimeTurnId = String((sent.turn as Record<string, Record<string, unknown>>).delivery.runtime_turn_id);
+		await patchSessionState(server, root, "visible-session", {
+			state: "needs_user_input",
+			ready_for_input: false,
+			current_turn_id: sent.turn_id,
+			last_turn_id: sent.turn_id,
+			source: "agent_session_event",
+			live: true,
+		});
+		const listed = await server.callTool("gjc_coordinator_list_questions", { session_id: "visible-session" });
+		const question = (listed.questions as Array<Record<string, unknown>>)[0]!;
+		if (typeof question.answer_binding !== "string") throw new Error("missing fresh gate binding");
+		const answer = server.callTool("gjc_coordinator_submit_question_answer", {
+			session_id: "visible-session",
+			turn_id: sent.turn_id,
+			question_id: "missing-fresh-gate",
+			answer_binding: question.answer_binding,
+			answer: { selected: ["opt_0"] },
+			idempotency_key: "missing-fresh-gate-answer",
+			allow_mutation: true,
+		});
+		await admissionStarted.promise;
+		gateVisible = false;
 		releaseAdmission.resolve();
 		await expect(answer).resolves.toMatchObject({ ok: false, error: { code: "terminal_uncertain" } });
 		expect(controls.filter(control => control.operation === "workflow.gate_answer")).toHaveLength(0);

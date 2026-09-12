@@ -261,7 +261,7 @@ describe("AuthStorage OAuth refresh race", () => {
 	});
 
 	test("still disables when the failure is real (no concurrent rotation)", async () => {
-		if (!authStorage) throw new Error("test setup failed");
+		if (!authStorage || !store) throw new Error("test setup failed");
 
 		// Single-process scenario: refresh genuinely fails and no peer updated the
 		// row. The credential should still be soft-deleted.
@@ -274,9 +274,10 @@ describe("AuthStorage OAuth refresh race", () => {
 			},
 		]);
 
-		vi.spyOn(oauthUtils, "getOAuthApiKey").mockImplementation(async () => {
-			throw new Error('invalid_grant {"error":"invalid_grant"}');
-		});
+		const refreshSpy = vi
+			.spyOn(oauthUtils, "refreshOAuthToken")
+			.mockRejectedValue(new Error('invalid_grant {"error":"invalid_grant"}'));
+		const fetchSpy = vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("Unexpected OAuth network request"));
 
 		await withEnv(SUPPRESS_ANTHROPIC_ENV, async () => {
 			const apiKey = await authStorage!.getApiKey("anthropic", "session-real-failure");
@@ -284,6 +285,10 @@ describe("AuthStorage OAuth refresh race", () => {
 			expect(apiKey).toBeUndefined();
 			expect(events).toHaveLength(1);
 			expect(events[0]?.disabledCause).toContain("invalid_grant");
+			expect(refreshSpy).toHaveBeenCalledTimes(1);
+			expect(refreshSpy).toHaveBeenCalledWith("anthropic", expect.objectContaining({ refresh: "stale-refresh" }));
+			expect(fetchSpy).not.toHaveBeenCalled();
+			expect(store!.listAuthCredentials("anthropic")).toHaveLength(0);
 		});
 	});
 

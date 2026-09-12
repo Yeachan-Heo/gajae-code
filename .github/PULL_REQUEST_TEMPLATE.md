@@ -31,6 +31,6 @@ gajae.pr-review-verdict.v1 <merge-approved|merge-self-approved|merge-blocked|nee
 - [ ] Target branch is `dev`
 - [ ] `bun check` passes
 - [ ] Tested locally
-- [ ] CHANGELOG updated (if user-facing)
+- [ ] Changelog fragment added under `packages/<pkg>/changelog.d/` (if user-facing)
 - [ ] Verdict above matches the exact PR head, not an earlier commit
 - [ ] Risk classification above matches the actual review path taken
