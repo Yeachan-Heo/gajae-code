@@ -1447,6 +1447,21 @@ describe("queued promotion run identity (#4668)", () => {
 		await promptDone;
 	});
 
+	it("removes tracked queue state when post-admission callback fails", async () => {
+		session = buildAbortableTrackedTransitionFixture().session;
+		await expect(
+			session.submitUserMessage("callback failure", {
+				deliverAs: "followUp",
+				trackSubmission: true,
+				onPreflightAccepted: () => {
+					throw new Error("synthetic post-admission failure");
+				},
+			} as never),
+		).rejects.toThrow("synthetic post-admission failure");
+		expect(session.agent.snapshotQueues()).toEqual({ steering: [], followUp: [] });
+		expect(session.getQueuedMessageEntries()).toEqual([]);
+	});
+
 	it("terminalizes a consumed tracked submission during session replacement", async () => {
 		const fixture = buildAbortableTrackedTransitionFixture();
 		session = fixture.session;

@@ -1037,6 +1037,50 @@ describe("AgentSession concurrent prompt guard", () => {
 		await expect(submission.terminal).resolves.toMatchObject({ disposition: "removed", reason: "removed" });
 	});
 
+	it("admits tracked work from a committed new-session hook", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const currentSessionManager = SessionManager.create(tempDir, tempDir);
+		const settings = Settings.isolated();
+		const authStorage = await AuthStorage.create(path.join(tempDir, "testauth-new-hook.db"));
+		authStorages.push(authStorage);
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "models-new-hook.yml"));
+		let newSessionSubmission: QueuedInputSubmission | undefined;
+		const extensionRunner = {
+			hasHandlers: vi.fn(() => false),
+			emit: vi.fn(async (event: { type: string; reason?: string }) => {
+				if (event.type === "session_switch" && event.reason === "new") {
+					newSessionSubmission = await session.submitUserMessage("queued by new hook", {
+						deliverAs: "followUp",
+						trackSubmission: true,
+					});
+				}
+			}),
+		} as unknown as ExtensionRunner;
+
+		session = new AgentSession({
+			agent: new Agent({
+				getApiKey: () => "test-key",
+				initialState: { model, systemPrompt: ["Test"], tools: [] },
+				appendOnlyContext: createAppendOnlyContextManager(model.provider),
+			}),
+			sessionManager: currentSessionManager,
+			settings,
+			modelRegistry,
+			extensionRunner,
+		});
+
+		expect(await session.newSession()).toBe(true);
+		expect(newSessionSubmission).toBeDefined();
+		expect(session.getQueuedMessages().followUp).toEqual(["queued by new hook"]);
+		const submission = newSessionSubmission!;
+		expect(await Promise.race([submission.terminal.then(() => "settled"), Bun.sleep(20).then(() => "pending")])).toBe(
+			"pending",
+		);
+		session.clearQueue();
+		await expect(submission.terminal).resolves.toMatchObject({ disposition: "removed", reason: "removed" });
+	});
+
 	// Regression: a subscriber that fires the next prompt synchronously from the
 	// agent_end listener (the shape every wire transport ends up in — rpc-mode
 	// stdout subscriber, ACP bridge, Cursor exec) must not collide with the
