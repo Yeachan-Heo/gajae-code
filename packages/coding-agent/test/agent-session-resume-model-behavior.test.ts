@@ -202,6 +202,32 @@ describe("AgentSession switchSession resumeModelBehavior", () => {
 		);
 	});
 
+	it("restores predecessor profile cleanup state when successor persistence fails", async () => {
+		const sonnet = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const settings = Settings.isolated({ "compaction.enabled": false });
+		const sessionFile = await createPersistedTarget(sonnet, settings);
+		session = new AgentSession({
+			agent: new Agent({ initialState: { model: sonnet, systemPrompt: ["Test"], tools: [], messages: [] } }),
+			sessionManager: SessionManager.create(tempDir.path(), tempDir.path()),
+			settings,
+			modelRegistry,
+		});
+		settings.override("modelRoles", { reviewer: `${sonnet.provider}/${sonnet.id}` });
+		settings.override("task.agentModelOverrides", { executor: `${sonnet.provider}/${sonnet.id}` });
+		session.setActiveModelProfile("session-only-profile");
+		session.noteProfileInstalledOverrides(["reviewer"], ["executor"], sonnet);
+		vi.spyOn(session.sessionManager, "ensureOnDisk").mockRejectedValueOnce(new Error("disk commit failed"));
+
+		await expect(session.switchSession(sessionFile)).rejects.toThrow("disk commit failed");
+		expect(session.getActiveModelProfile()).toBe("session-only-profile");
+		expect(session.getProfileInstalledOverrideKeys()).toEqual({
+			modelRoles: ["reviewer"],
+			agentModelOverrides: ["executor"],
+		});
+		expect(settings.get("modelRoles")).toMatchObject({ reviewer: `${sonnet.provider}/${sonnet.id}` });
+		expect(settings.get("task.agentModelOverrides")).toMatchObject({ executor: `${sonnet.provider}/${sonnet.id}` });
+	});
+
 	it("does not recover a saved selector that still exists in the full catalog", async () => {
 		const sonnet = getBundledModel("anthropic", "claude-sonnet-4-5")!;
 		const settings = Settings.isolated({

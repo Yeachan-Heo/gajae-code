@@ -16376,7 +16376,15 @@ export class AgentSession {
 	 * The configured chain's role, origin, and identity are retained by the controller.
 	 */
 	seedDefaultFallbackResolution(activeIndex: number, skips: Array<{ selector: string; reason: string }>): void {
-		const controller = this.#defaultFallbackChain();
+		this.#seedDefaultFallbackResolutionForController(this.#defaultFallbackChain(), activeIndex, skips);
+	}
+
+	/** Seed an already-selected runtime controller without legacy-chain materialization. */
+	#seedDefaultFallbackResolutionForController(
+		controller: FallbackChainController,
+		activeIndex: number,
+		skips: Array<{ selector: string; reason: string }>,
+	): void {
 		controller.seedResolution(activeIndex, skips);
 		this.#emitResolutionFallbackSwitch(controller);
 	}
@@ -23625,6 +23633,14 @@ export class AgentSession {
 			const previousModel = this.model;
 			const previousThinkingLevel = this.#thinkingLevel;
 			const previousActiveModelProfile = this.#activeModelProfile;
+			// Different-file cleanup drops session-only profile state before the
+			// successor is committed. Preserve exactly that mutable predecessor
+			// state so an on-disk commit failure can restore it.
+			const previousProfileInstalledRoles = new Map(this.#activeProfileInstalledRoles);
+			const previousProfileInstalledAgentOverrides = new Map(this.#activeProfileInstalledAgentOverrides);
+			const previousPreProfileModel = this.#preProfileModel;
+			const previousModelRolesOverride = this.settings.getOverride("modelRoles");
+			const previousAgentModelOverridesOverride = this.settings.getOverride("task.agentModelOverrides");
 			const previousServiceTier = this.agent.serviceTier;
 			const previousSelectedMCPToolNames = new Set(this.#selectedMCPToolNames);
 			const previousTools = [...this.agent.state.tools];
@@ -23745,8 +23761,8 @@ export class AgentSession {
 							...(this.#persistedModelProfileAliasIntent("default") ?? {}),
 						},
 					);
-					let controller = this.#defaultFallbackChain(false);
-					controller.seedResolution(resolution.activeIndex, resolution.skips);
+					let controller = this.#defaultFallbackChain();
+					this.seedDefaultFallbackResolution(resolution.activeIndex, resolution.skips);
 					let resolvedModel = resolution.model;
 					if (!resolvedModel) {
 						const allSelectorsUnknown =
@@ -23800,7 +23816,11 @@ export class AgentSession {
 											this.settings.get("fallback.maxAttempts"),
 										);
 										controller = this.#defaultFallbackChain(false);
-										controller.seedResolution(recovered.activeIndex, recovered.skips);
+										this.#seedDefaultFallbackResolutionForController(
+											controller,
+											recovered.activeIndex,
+											recovered.skips,
+										);
 										resolvedModel = recovered.model;
 										recoveredDefaultChain = true;
 										recoveredDefaultChainMessage =
@@ -23979,6 +23999,14 @@ export class AgentSession {
 				this.#defaultFallbackController = undefined;
 				this.#syncAgentSessionId(previousSessionState.sessionId);
 				this.#activeModelProfile = previousActiveModelProfile;
+				this.#activeProfileInstalledRoles = previousProfileInstalledRoles;
+				this.#activeProfileInstalledAgentOverrides = previousProfileInstalledAgentOverrides;
+				this.#preProfileModel = previousPreProfileModel;
+				if (previousModelRolesOverride === undefined) this.settings.clearOverride("modelRoles");
+				else this.settings.override("modelRoles", previousModelRolesOverride);
+				if (previousAgentModelOverridesOverride === undefined)
+					this.settings.clearOverride("task.agentModelOverrides");
+				else this.settings.override("task.agentModelOverrides", previousAgentModelOverridesOverride);
 				this.#restoreWorkflowGateEmitter(suspendedWorkflowGateEmitter);
 				this.#rekeyHindsightMemoryForCurrentSessionId();
 				let restoreMcpError: unknown;
