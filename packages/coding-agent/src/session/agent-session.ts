@@ -15715,7 +15715,20 @@ export class AgentSession {
 			(this.#activeModelProfileScope !== "durable" ||
 				configuredDefaultProfileIdentity !== this.getActiveModelProfile());
 		const preProfileModel = this.#preProfileModel;
-		this.#resetSessionScopedModelProfileState();
+		this.#resetSessionScopedModelProfileState(
+			droppingSessionOnlyProfile && configuredDefaultProfileIdentity
+				? {
+						preserveActiveModelProfile: {
+							name: configuredDefaultProfileIdentity,
+							scope: "durable",
+						},
+					}
+				: undefined,
+		);
+		this.#defaultFallbackController = undefined;
+		this.#preserveLoadedLegacyDefaultChain = false;
+		this.#defaultFallbackExhaustedLastTurn = false;
+		this.#pendingFallbackSwitches = [];
 		// A dropped session-only profile must not leak its concrete model into
 		// the successor: restore the configured global default model before it is
 		// recorded as the new session's model.
@@ -21129,11 +21142,18 @@ export class AgentSession {
 		);
 		const existing = this.#defaultFallbackController;
 		const settingsControllerActive = existing?.chain.origin === "settings";
+		if (settingsControllerActive) {
+			if (existing.chain.entries.join("\u0000") === settingsEntries.join("\u0000")) return existing;
+			this.#defaultFallbackController = new FallbackChainController(
+				{ role: "default", entries: [...settingsEntries], origin: "settings", explicitHead: true },
+				this.settings.get("fallback.maxAttempts"),
+			);
+			return this.#defaultFallbackController;
+		}
 		const materializeSettingsChain =
 			configuredChain?.origin === "legacy_session" &&
 			configuredChain.entries.length === 1 &&
 			settingsEntries.length > 1 &&
-			!settingsControllerActive &&
 			!this.#preserveLoadedLegacyDefaultChain;
 		const useSettingsChain = materializeSettingsChain && materializeLegacyChain;
 		if (useSettingsChain) {
@@ -23767,6 +23787,10 @@ export class AgentSession {
 			const previousActiveAttemptScope = this.#activeAttemptScope;
 			const previousActiveLogicalRunId = this.#activeLogicalRunId;
 			const previousPendingFallbackSwitches = [...this.#pendingFallbackSwitches];
+			const previousCanonicalSessionId = this.sessionId;
+			const previousCanonicalVariant = this.#modelRegistry.getSessionCanonicalVariant?.(previousCanonicalSessionId);
+			let successorCanonicalSessionId: string | undefined;
+			let successorCanonicalVariant: string | undefined;
 			this.#pendingFallbackSwitches = [];
 
 			this.#steeringMessages = [];
@@ -23787,6 +23811,8 @@ export class AgentSession {
 				await this.sessionManager.setSessionFile(sessionPath, {
 					deferEphemeralArtifactRetirement: switchingToDifferentSession,
 				});
+				successorCanonicalSessionId = this.sessionId;
+				successorCanonicalVariant = this.#modelRegistry.getSessionCanonicalVariant?.(successorCanonicalSessionId);
 				// setSessionFile rotated the endpoint identity to the successor;
 				// re-register the manager under it so post-transition lineage
 				// bindings resolve and owned aborts classify in the successor
@@ -23899,6 +23925,7 @@ export class AgentSession {
 				this.#defaultFallbackController = undefined;
 				this.#preserveLoadedLegacyDefaultChain =
 					resumeModelBehavior !== "useCurrentDefault" && configuredDefaultChain?.origin === "legacy_session";
+				this.#defaultFallbackExhaustedLastTurn = false;
 				if (defaultEntries.length > 0) {
 					const resolution = await resolveModelChainWithAuth(
 						defaultEntries,
@@ -24182,6 +24209,38 @@ export class AgentSession {
 				await this.sessionManager.restoreRollbackState(previousSessionState);
 				this.restoreDefaultFallbackRuntimeState(previousDefaultFallbackRuntimeState);
 				this.#preserveLoadedLegacyDefaultChain = previousPreserveLoadedLegacyDefaultChain;
+				let restoreCanonicalError: unknown;
+				try {
+					if (
+						successorCanonicalSessionId !== undefined &&
+						successorCanonicalSessionId !== previousCanonicalSessionId
+					) {
+						if (successorCanonicalVariant === undefined)
+							this.#modelRegistry.clearCanonicalVariant?.(successorCanonicalSessionId);
+						else if (
+							!this.#modelRegistry.restoreSessionCanonicalVariant?.(
+								successorCanonicalSessionId,
+								successorCanonicalVariant,
+							)
+						)
+							throw new Error(
+								`Session switch rollback could not restore canonical affinity for successor session "${successorCanonicalSessionId}".`,
+							);
+					}
+					if (previousCanonicalVariant === undefined)
+						this.#modelRegistry.clearCanonicalVariant?.(previousCanonicalSessionId);
+					else if (
+						!this.#modelRegistry.restoreSessionCanonicalVariant?.(
+							previousCanonicalSessionId,
+							previousCanonicalVariant,
+						)
+					)
+						throw new Error(
+							`Session switch rollback could not restore canonical affinity for predecessor session "${previousCanonicalSessionId}".`,
+						);
+				} catch (canonicalError) {
+					restoreCanonicalError = canonicalError;
+				}
 				this.#syncAgentSessionId(previousSessionState.sessionId);
 				this.setActiveModelProfile(previousActiveModelProfile, previousActiveModelProfileScope);
 				this.#activeProfileInstalledRoles = previousProfileInstalledRoles;
@@ -24245,6 +24304,12 @@ export class AgentSession {
 				this.#reconnectToAgent();
 				if (restoreMcpError) {
 					throw restoreMcpError;
+				}
+				if (restoreCanonicalError) {
+					throw new AggregateError(
+						[error, restoreCanonicalError],
+						"Session switch failed and canonical affinity rollback was incomplete.",
+					);
 				}
 				if (unavailableDefaultChainMessage) {
 					this.emitNotice(
