@@ -22,12 +22,13 @@ Primary implementation:
 
 ## How to open it
 
-Any of the following opens the same selector:
+The following open the tree selector:
 
 - `/tree`
 - configured keybinding action `tree`
-- double-escape on empty editor when `doubleEscapeAction = "tree"` (default)
-- `/branch` when `doubleEscapeAction = "tree"` (routes to tree selector instead of user-only branch picker)
+- double-escape on an empty editor when `doubleEscapeAction = "tree"` (default)
+
+With `doubleEscapeAction = "branch"`, double Escape opens the user-message branch picker instead; the `app.session.fork` action opens that picker directly.
 
 ## Tree UI model
 
@@ -197,14 +198,14 @@ Label edits in tree UI call `appendLabelChange(targetId, label)`.
 
 ## `/tree` vs adjacent operations
 
-| Operation | Scope                                            | Result                                                                                                                                                   |
-| --------- | ------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `/tree`   | Current session file                             | Moves leaf to selected point (same file)                                                                                                                 |
-| `/branch` | Usually current session file -> new session file | By default branches from selected **user** message into a new session file; if `doubleEscapeAction = "tree"`, `/branch` opens tree navigation UI instead |
-| `/fork`   | Whole current session                            | Duplicates session into a new persisted session file                                                                                                     |
-| `/resume` | Session list                                     | Switches to another session file                                                                                                                         |
+| Operation | Scope                                          | Result                                                                                                                                                     |
+| --------- | ---------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `/tree`   | Current session file                           | Moves leaf to selected point (same file)                                                                                                                   |
+| `app.session.fork` action or branch-configured double Escape | Current branching lifecycle | Opens the existing user-message branch picker; behavior is unchanged                                                                                       |
+| `/fork`   | Selected user prompt; new persistent session file | Opens the same picker, copies history before the selected prompt into an independent session, switches to it, and prefills the prompt without submitting |
+| `/resume` | Session list                                   | Switches to another session file                                                                                                                           |
 
-Key distinction: `/tree` is a navigation/repositioning tool inside one session file. `/branch`, `/fork`, and `/resume` all change session-file context.
+Key distinction: `/tree` is a navigation/repositioning tool inside one session file. Interactive `/fork` adds the persistent slash-command path without changing the existing `app.session.fork` action, branch-configured double Escape, or `/resume`.
 
 ## Operator workflows
 

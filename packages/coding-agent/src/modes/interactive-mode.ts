@@ -2291,7 +2291,6 @@ export class InteractiveMode implements InteractiveModeContext {
 	}
 
 	handleForkCommand(): Promise<void> {
-		this.#btwController.dispose();
 		return this.#commandController.handleForkCommand();
 	}
 

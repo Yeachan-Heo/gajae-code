@@ -22,7 +22,7 @@ This document describes operator-visible behavior for session export/share/fork/
 | `/share`                                | Interactive slash command | No                                    | No                                                                                 | Temp HTML + share URL/gist                                                       |
 | `/star`                                | Interactive/headless slash command | Yes (append-only header metadata)      | No; marks only the active session                                               | None                                                                             |
 | `/unstar`                              | Interactive/headless slash command | Yes (append-only header metadata)      | No; clears the active session's star                                            | None                                                                             |
-| `/fork`                                 | Interactive slash command | Yes (active session identity changes) | Creates new session file and switches current session to it (persistent mode only) | Copies artifact directory to new session namespace when present                  |
+| `/fork`                                 | Interactive slash command | Original unchanged; active session switches | Opens the user-prompt selector; selection creates and switches to a persistent session containing history before that prompt | Selected prompt text is restored to the editor |
 | `--fork <id                             | path>`                    | CLI startup                           | Yes after session creation                                                         | Creates a new session fork from the selected source into current cwd/session dir | None |
 | `/import-session <transcript-file> [--provider codex\|claude]` | Interactive or trusted local startup command | No active-session mutation | Creates one independently resumable native session file | Bounded quarantine digest proof and provenance |
 | `/resume`                               | Interactive slash command | Yes (active in-memory state replaced) | Switches to selected existing session file                                         | None                                                                             |
@@ -153,40 +153,37 @@ Cancellation/abort semantics in share:
 
 ## Fork
 
-Interactive `/fork` creates a new session from the current one and switches the active session identity.
+Interactive `/fork` starts an independent continuation from a selected user prompt. It reuses the existing user-message selector and session-branch lifecycle rather than duplicating the whole active transcript.
 
 ### Preconditions and immediate guards
 
-- If agent is streaming, `/fork` is rejected with warning.
-- UI status/loading indicators are cleared before operation.
+- `/fork` is refused while a response, compaction, foreground Bash/Python execution, or prompt submission is active.
+- `/fork` requires a persistent active session. A `--no-session` runtime is refused because the result must be independently resumable.
 
-### Session-level flow
+### Interactive flow
 
-`AgentSession.fork()`:
+1. `/fork` opens the same user-prompt selector used by the ordinary user-message branch flow.
+2. Cancelling the selector closes it without changing the active session, transcript, or editor.
+3. Selecting a user prompt runs `AgentSession.branch()` at that prompt boundary. Its `session_before_branch` hook may cancel the operation; a successful switch emits `session_branch`.
+4. A new persistent session is created with the history before the selected prompt, and the TUI switches to it.
+5. The selected prompt text is restored to the editor for editing. It is not submitted automatically.
+
+The original session file and transcript remain unchanged. The new session keeps the same cwd and works against the same files, and the command itself does not modify those files; `/fork` does not create or switch a Git branch or worktree. `/tree`, the `app.session.fork` action, and branch-configured double Escape retain their existing behavior.
+
+### Low-level full-session `AgentSession.fork()`
+
+The low-level `AgentSession.fork()` API remains a whole-session duplicate operation and is not the interactive `/fork` prompt-selection flow:
 
 1. Emits `session_before_switch` with `reason: "fork"` (cancellable).
 2. Flushes pending writes.
 3. Calls `SessionManager.fork()`.
-4. Copies artifacts directory from old session namespace to new namespace (best-effort; non-ENOENT copy failures are logged, not fatal).
+4. Copies the artifacts directory from the old session namespace to the new namespace (best-effort; non-ENOENT copy failures are logged, not fatal).
 5. Updates `agent.sessionId`.
 6. Emits `session_switch` with `reason: "fork"`.
 
-`SessionManager.fork()` behavior:
+`SessionManager.fork()` requires persistent mode and an existing session file. It creates a new session id and JSONL path, rewrites the header with a new id and timestamp plus the unchanged cwd and previous session id as `parentSession`, and retains all non-header entries.
 
-- Requires persistent mode and existing session file.
-- Creates new session id and new JSONL file path.
-- Rewrites header with:
-  - new `id`
-  - new timestamp
-  - `cwd` unchanged
-  - `parentSession` set to previous session id
-- Keeps all non-header entries unchanged in the new file.
-
-### Non-persistent behavior
-
-- In-memory session manager returns `undefined` from `fork()`.
-- `AgentSession.fork()` returns `false`.
-- UI reports `Fork failed (session not persisted or cancelled)`.
+In-memory `SessionManager.fork()` returns `undefined`, so low-level `AgentSession.fork()` returns `false`.
 
 ### CLI `--fork <id|path>`
 
@@ -299,7 +296,7 @@ These callbacks are observational; they do not cancel switch/fork.
 
 ### Other cancellation surfaces relevant to this doc
 
-- `/fork` is blocked while streaming (user must wait/abort current response first).
+- `/fork` is blocked while a response, compaction, foreground Bash/Python execution, or prompt submission is active.
 - `/resume` selector can be cancelled by user closing selector.
 - Cross-project `--resume <id>` can be cancelled by declining fork prompt.
 - `/share` has UI abort path (`Share cancelled`) for gist flow; it does not wire process-kill semantics for `gh gist create` in this code path.

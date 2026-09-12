@@ -84,6 +84,7 @@ export function buildHelpMarkdown(keybindings: Pick<KeybindingsManager, "getAcce
 		"| Resume another session | `/resume` |",
 		"| Show session details | `/session info` |",
 		"| Delete current session transcript/artifacts | `/session delete` |",
+		"| Fork from an earlier prompt into a new session | `/fork` |",
 		`| Select a model | \`/model\` or ${selectModelKey} |`,
 		`| Queue a message for the next turn | ${queueMessageKey} |`,
 		`| Select or edit a queued message | ${dequeueMessageKey} |`,
@@ -1109,31 +1110,11 @@ export class CommandController {
 	}
 
 	async handleForkCommand(): Promise<void> {
-		if (this.ctx.session.isStreaming) {
-			this.ctx.showWarning("Wait for the current response to finish or abort it before forking.");
+		if (!this.ctx.sessionManager.getSessionFile()) {
+			this.ctx.showError("Fork requires a persisted session");
 			return;
 		}
-
-		const success = await this.ctx.session.fork();
-		if (this.ctx.isStopped?.()) return;
-		if (!success) {
-			this.ctx.showError("Fork failed (session not persisted or cancelled)");
-			return;
-		}
-		clearInteractiveActivityLoaders(this.ctx);
-		stopInteractiveActivityIndicator(this.ctx, { foregroundSettled: true });
-		this.ctx.resetIrcSidebarSession();
-
-		this.ctx.statusLine.invalidate();
-		this.ctx.updateEditorTopBorder();
-
-		const sessionFile = this.ctx.session.sessionFile;
-		const shortPath = sessionFile ? sessionFile.split("/").pop() : "new session";
-		this.ctx.chatContainer.addChild(new Spacer(1));
-		this.ctx.chatContainer.addChild(
-			new Text(`${theme.fg("accent", `${theme.status.success} Session forked to ${shortPath}`)}`, 1, 1),
-		);
-		this.ctx.ui.requestRender();
+		this.ctx.showUserMessageSelector();
 	}
 
 	async handleMoveCommand(targetPath: string): Promise<void> {
