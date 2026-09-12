@@ -28,6 +28,11 @@ on:
         description: Optional exact terminal-green dev SHA; validation rejects a mismatch.
         required: false
         type: string
+      wsl_drvfs:
+        description: Run nonpublishing real WSLv1/DrvFS lock qualification for head_sha.
+        required: false
+        type: boolean
+        default: false
 
 # Least privilege by default: no dev-ci job needs a write-scoped GITHUB_TOKEN.
 # Every job only checks out, installs, tests, and exchanges artifacts through the
@@ -51,6 +56,55 @@ concurrency:
     && !(github.event_name == 'pull_request' && github.event.action == 'edited' && (github.event.changes.body != null || github.event.changes.title != null) && github.event.changes.base == null) }}
 
 jobs:
+  wsl-drvfs-qualification:
+    name: Opt-in real WSLv1/DrvFS qualification
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.wsl_drvfs == true }}
+    runs-on: windows-2025
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    env:
+      QUALIFY_HEAD_SHA: ${{ inputs.head_sha }}
+      QUALIFY_BASE_REPOSITORY: ${{ inputs.base_repository }}
+      QUALIFY_HARNESS_SHA: ${{ github.workflow_sha }}
+      QUALIFY_EVIDENCE: ${{ runner.temp }}/wsl-drvfs-evidence
+    steps:
+      - name: Validate qualification inputs
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path $env:QUALIFY_EVIDENCE | Out-Null
+          "head_sha=$env:QUALIFY_HEAD_SHA`nharness_sha=$env:QUALIFY_HARNESS_SHA`nrepository=$env:GITHUB_REPOSITORY" | Set-Content "$env:QUALIFY_EVIDENCE/dispatch.txt"
+          if ($env:QUALIFY_HEAD_SHA -cnotmatch '^[0-9a-f]{40}$') { throw 'Qualification requires exact lowercase 40-hex head_sha' }
+          if ($env:QUALIFY_BASE_REPOSITORY -cne $env:GITHUB_REPOSITORY) { throw 'Qualification requires this repository' }
+      - name: Checkout workflow harness independently
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ github.workflow_sha }}
+          path: qualification-harness
+          persist-credentials: false
+      - name: Checkout exact qualification source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ inputs.head_sha }}
+          path: qualification-source
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Qualify exact source on disposable WSLv1 DrvFS
+        shell: pwsh
+        run: |
+          & ./qualification-harness/scripts/qualify-wsl-drvfs.ps1 -SourcePath (Join-Path $env:GITHUB_WORKSPACE 'qualification-source') -HeadSha $env:QUALIFY_HEAD_SHA -EvidencePath $env:QUALIFY_EVIDENCE
+      - name: Upload qualification evidence even on failure
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: wsl-drvfs-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.QUALIFY_EVIDENCE }}
+          if-no-files-found: error
+          retention-days: 14
+
   pr-contract-bootstrap:
     name: PR contract bootstrap
     if: ${{ github.event_name == 'pull_request' }}
