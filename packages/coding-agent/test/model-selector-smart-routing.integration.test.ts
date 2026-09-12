@@ -67,7 +67,12 @@ function createContext(
 ) {
 	const settings = options.settings ?? Settings.isolated();
 	let notifyCatalogChanged = () => {};
-	const ui = { setFocus: vi.fn(), requestRender: vi.fn(), terminal: { rows: 40, columns: 120 } };
+	const ui = {
+		setFocus: vi.fn(),
+		requestRender: vi.fn(),
+		requestLayoutRender: vi.fn(),
+		terminal: { rows: 40, columns: 120 },
+	};
 	const editorContainer = { clear: vi.fn(), detachChild: vi.fn(), addChild: vi.fn() };
 	const registry = {
 		getAll: () => catalog,
