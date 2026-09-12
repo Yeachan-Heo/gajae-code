@@ -1099,7 +1099,7 @@ describe("file lock cleanup failure handling (#2478)", () => {
 		},
 	);
 
-	const invalidOrphanAdoptionReceipts: [string, (detachedPath: string) => NativeExactUnlinkResult][] = [
+	const invalidOrphanAdoptionReceipts: [string, (detachedPath: string) => unknown][] = [
 		["missing durable scrub proof", detachedPath => ({ ok: false, code: "cleanup_pending", detachedPath })],
 		[
 			"false durable scrub proof",
@@ -1119,6 +1119,8 @@ describe("file lock cleanup failure handling (#2478)", () => {
 			"contradictory success",
 			detachedPath => ({ ok: true, code: "cleanup_pending", payloadDurable: true, detachedPath }),
 		],
+		["contradictory not-found", _detachedPath => ({ ok: true, code: "not_found" })],
+		["non-boolean success", _detachedPath => ({ ok: 1 })],
 	];
 	test.each(
 		invalidOrphanAdoptionReceipts,
@@ -1136,7 +1138,7 @@ describe("file lock cleanup failure handling (#2478)", () => {
 			snapshotDirectoryTree,
 			exactRemoveDirectoryTree: target => {
 				exactRemoveCalls++;
-				return makeReceipt(target);
+				return makeReceipt(target) as NativeExactUnlinkResult;
 			},
 		});
 

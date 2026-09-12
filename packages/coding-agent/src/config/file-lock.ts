@@ -646,10 +646,15 @@ async function adoptOrphanedFileLockRemovalTransition(lockPath: string, orphanAg
 		if (isTransientReleaseError(error)) return false;
 		throw error;
 	}
-	if (removal.ok) {
+	if (removal.ok === true) {
 		return removal.code === undefined && Object.keys(removal).every(key => key === "ok");
 	}
-	if (removal.code === "not_found" && Object.keys(removal).every(key => key === "ok" || key === "code")) return true;
+	if (
+		removal.ok === false &&
+		removal.code === "not_found" &&
+		Object.keys(removal).every(key => key === "ok" || key === "code")
+	)
+		return true;
 	// POSIX cannot bind a namespace unlink to the verified descriptor, so the
 	// primitive retains the scrubbed tree under its deterministic name and the
 	// caller finishes the on-disk removal. Finish only the exact tree this call
