@@ -3291,8 +3291,10 @@ describe("managed retry ownership", () => {
 			},
 		});
 		const ends: string[] = [];
+		const failures: Array<{ scope?: { attemptId: string; generation: number; lineage: string } }> = [];
 		agent.subscribe(event => {
 			if (event.type === "agent_end") ends.push(event.type);
+			if (event.type === "agent_failed") failures.push(event);
 		});
 		await agent.prompt("run", {
 			fallbackManaged: true,
@@ -3305,6 +3307,8 @@ describe("managed retry ownership", () => {
 		});
 		await agent.waitForIdle();
 		expect(ends).toHaveLength(1);
+		expect(failures).toHaveLength(1);
+		expect(failures[0]?.scope).toEqual(expect.objectContaining({ lineage: "main" }));
 	});
 });
 

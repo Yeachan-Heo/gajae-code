@@ -2397,7 +2397,11 @@ export class Agent {
 						// The documented contract emits the sanitized diagnostic
 						// before the error terminal on this path too (exact-head
 						// review P2).
-						this.#emit({ type: "agent_failed", error: sanitizeAgentFailure(err) });
+						this.#emit({
+							type: "agent_failed",
+							error: sanitizeAgentFailure(err),
+							scope: ownership.handle.scope,
+						});
 						this.requestRunTerminal(managedLogicalRunOwner ?? runId, { stopReason: "error" });
 						if (this.#managedLogicalRunOwner === managedLogicalRunOwner) this.#managedLogicalRunOwner = undefined;
 					}
