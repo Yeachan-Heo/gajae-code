@@ -54,7 +54,7 @@ The file holds one or more `### <Section>` blocks (`### Added`, `### Changed`, `
 
 This pattern exists because of what it replaces. Contributors used to append their entry under `## [Unreleased]` in `packages/<pkg>/CHANGELOG.md`, which put every pull request on the same lines of the same file. Git cannot auto-merge two insertions at the same position, so each merge dirtied every other open PR — and the exact-head approval contract re-binds approval to the head (`scripts/verify-pr-verdict.ts` requires `review.commit?.oid === headSha`), so clearing that dirt with a rebase threw the approval away and cost a fresh reviewer round-trip. Issue #5491 measured a six-line change paying three rebases and two approval rounds, with `CHANGELOG.md` the only conflicted path every time. Distinct fragment file names cannot conflict, so the shared insertion point stops existing.
 
-`scripts/release.ts` folds every pending fragment into its package's `## [Unreleased]` section and deletes the consumed files as part of the release commit. `bun run check:changelog-fragments` validates fragments locally, and Dev CI rejects a pull request that edits a guarded `## [Unreleased]` section directly or deletes a fragment.
+`scripts/release.ts` folds every pending fragment into its package's `## [Unreleased]` section and deletes the consumed files as part of the release commit. Run `bun scripts/changelog-fragments.ts check` to validate fragments locally, and Dev CI rejects a pull request that edits a guarded `## [Unreleased]` section directly or deletes a fragment.
 
 ## Rebasing onto `dev`
 
