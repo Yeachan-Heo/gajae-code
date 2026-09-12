@@ -16097,7 +16097,7 @@ export class AgentSession {
 	 * configured `modelBindings` (also installed into these two override slots
 	 * once at startup) are not profile-owned and must survive the transition.
 	 */
-	#resetSessionScopedModelProfileState(): void {
+	#resetSessionScopedModelProfileState(options?: { preserveDefaultConfiguredChain?: boolean }): void {
 		const persistedProfile = this.settings.get("modelProfile.default");
 		if (persistedProfile !== undefined && persistedProfile === this.getActiveModelProfile()) return;
 		const hadInstalledKeys =
@@ -16122,7 +16122,7 @@ export class AgentSession {
 			this.#modelRegistry.reapplyConfiguredModelBindings(this.settings);
 		}
 		const defaultChain = getSessionContextForInternalRead(this.sessionManager).configuredModelChains.default;
-		if (defaultChain && defaultChain.identity !== undefined) {
+		if (!options?.preserveDefaultConfiguredChain && defaultChain && defaultChain.identity !== undefined) {
 			this.setConfiguredModelChain("default", [], "user-selection");
 		}
 		this.setActiveModelProfile(undefined);
@@ -23646,6 +23646,7 @@ export class AgentSession {
 				: undefined;
 			let unavailableDefaultChainMessage: string | undefined;
 			let recoveredDefaultChainMessage: string | undefined;
+			let recoveredDefaultChain = false;
 			let transitionCleanupCommitted = false;
 
 			try {
@@ -23796,6 +23797,7 @@ export class AgentSession {
 										controller = this.#defaultFallbackChain(false);
 										controller.seedResolution(recovered.activeIndex, recovered.skips);
 										resolvedModel = recovered.model;
+										recoveredDefaultChain = true;
 										recoveredDefaultChainMessage =
 											"Saved session model is no longer registered; restored the durable default preset instead.";
 									}
@@ -23852,7 +23854,8 @@ export class AgentSession {
 				// Switching to another session file must not carry the predecessor's
 				// profile marker or role overrides into the successor; the successor's
 				// own configured model is restored above.
-				if (switchingToDifferentSession) this.#resetSessionScopedModelProfileState();
+				if (switchingToDifferentSession)
+					this.#resetSessionScopedModelProfileState({ preserveDefaultConfiguredChain: recoveredDefaultChain });
 				// Establish the successor's durable session identity only after every
 				// restored state facet is live. Identity-bound extension hooks run below.
 				await this.sessionManager.ensureOnDisk();

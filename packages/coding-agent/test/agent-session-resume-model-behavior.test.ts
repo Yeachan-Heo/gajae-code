@@ -115,7 +115,7 @@ describe("AgentSession switchSession resumeModelBehavior", () => {
 		expect(session.model?.id).toBe(opus.id);
 		expect(session.getActiveModelProfile()).toBe("codex-medium");
 	});
-	it("recovers a removed saved model through the durable preset without rewriting its legacy chain", async () => {
+	it("preserves an unknown identity-bearing saved chain and recovered runtime fallback across different-file cleanup", async () => {
 		const sonnet = getBundledModel("anthropic", "claude-sonnet-4-5")!;
 		const codex = getBundledModel("openai-codex", "gpt-5.6-sol")!;
 		authStorage.setRuntimeApiKey("openai-codex", "test-key");
@@ -125,6 +125,13 @@ describe("AgentSession switchSession resumeModelBehavior", () => {
 			"session.resumeModelBehavior": "keepSessionModel",
 		});
 		const sessionFile = await createPersistedTarget(sonnet, settings);
+		targetSession!.setConfiguredModelChain(
+			"default",
+			[`${sonnet.provider}/${sonnet.id}`],
+			"profile-activation",
+			"removed-profile",
+		);
+		await targetSession!.sessionManager.flush();
 
 		session = new AgentSession({
 			agent: new Agent({ initialState: { model: sonnet, systemPrompt: ["Test"], tools: [], messages: [] } }),
@@ -132,6 +139,9 @@ describe("AgentSession switchSession resumeModelBehavior", () => {
 			settings,
 			modelRegistry,
 		});
+		settings.override("modelRoles", { reviewer: `${sonnet.provider}/${sonnet.id}` });
+		session.setActiveModelProfile("session-only-profile");
+		session.noteProfileInstalledOverrides(["reviewer"], [], sonnet);
 		vi.spyOn(modelRegistry, "getAvailable").mockReturnValue([codex]);
 		vi.spyOn(modelRegistry, "getAll").mockReturnValue([codex]);
 		const setConfiguredChain = vi.spyOn(session, "setConfiguredModelChain");
@@ -139,9 +149,24 @@ describe("AgentSession switchSession resumeModelBehavior", () => {
 
 		expect(await session.switchSession(sessionFile)).toBe(true);
 		expect(session.model?.id).toBe(codex.id);
-		expect(session.getConfiguredModelChain("default")).toEqual([`${sonnet.provider}/${sonnet.id}`]);
+		expect(session.getConfiguredModelChainState("default")).toEqual({
+			entries: [`${sonnet.provider}/${sonnet.id}`],
+			origin: "profile-activation",
+			identity: "removed-profile",
+			explicitHead: true,
+		});
+		expect(session.getDefaultFallbackRuntimeState().chain).toMatchObject({
+			entries: [`${codex.provider}/${codex.id}:low`],
+			origin: "runtime",
+			identity: "codex-medium",
+		});
+		expect(settings.get("modelRoles").reviewer).toBeUndefined();
 		expect(setConfiguredChain).not.toHaveBeenCalled();
-		expect(notice).toHaveBeenCalledWith("warning", expect.any(String), "fallback");
+		expect(notice).toHaveBeenCalledWith(
+			"warning",
+			"Saved session model is no longer registered; restored the durable default preset instead.",
+			"fallback",
+		);
 	});
 
 	it("does not recover a saved selector that still exists in the full catalog", async () => {
