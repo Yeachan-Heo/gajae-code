@@ -4439,6 +4439,8 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				eventId: string;
 			}> = [];
 			let q12Admitted = true;
+			let liveInFlightAskAdmitted = false;
+			let liveInFlightCandidate = false;
 			await withAdmittedSessionTransaction(
 				questionPaths,
 				sessionId,
@@ -4446,6 +4448,29 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					const liveState = await readSessionState(namespaceDir, sessionId);
 					const waitingToken = admissionToken;
 					const waitingTurn = waitingToken ? transaction.canonical.turns[waitingToken.coordinator_turn_id] : null;
+					const liveTurn = admission.active_turn_id
+						? transaction.canonical.turns[admission.active_turn_id]
+						: undefined;
+					// A headless ask opens a durable Q12 gate before the runtime has a
+					// distinct needs_user_input lifecycle marker. Admit that narrow,
+					// observable in-flight state only when the sidecar, active turn, and
+					// accepted runtime receipt all identify the same turn. This is waiting
+					// evidence, not a terminal observation; all terminal paths remain
+					// subject to the existing receipt and terminal-fence checks.
+					liveInFlightCandidate = Boolean(
+						liveState?.schema_version === 1 &&
+							liveState.session_id === sessionId &&
+							liveState?.source === "agent_session_event" &&
+							liveState.live === true &&
+							liveState.state === "running" &&
+							liveState.current_turn_id !== null &&
+							Number.isFinite(Date.parse(liveState.updated_at)) &&
+							hasExactRuntimeWriterIdentity(liveState, transaction.canonical.session.broker) &&
+							liveState.current_turn_id === admission.active_turn_id &&
+							liveTurn &&
+							ACTIVE_TURN_STATUSES.has(liveTurn.status as TurnStatus) &&
+							hasAcceptedRuntimeReceipt(liveTurn),
+					);
 					if (
 						waitingToken &&
 						(!liveState ||
@@ -4467,8 +4492,17 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					}
 					if (
 						liveState?.source === "agent_session_event" &&
+						(liveState.state === "completed" || liveState.state === "errored") &&
+						!admission.terminal
+					) {
+						q12Admitted = false;
+						return;
+					}
+					if (
+						liveState?.source === "agent_session_event" &&
 						liveState.live === true &&
-						(liveState.state !== "needs_user_input" || liveState.current_turn_id !== admission.active_turn_id)
+						(liveState.state !== "needs_user_input" || liveState.current_turn_id !== admission.active_turn_id) &&
+						!liveInFlightCandidate
 					) {
 						q12Admitted = false;
 						return;
@@ -4604,6 +4638,12 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 							continue;
 						}
 						const turn = owners[0]!;
+						if (liveInFlightCandidate && turn.turn_id !== admission.active_turn_id) {
+							authority.outcome = { state: "ownership_conflict", reason: "ownership_conflict" };
+							authority.updated_at = observedAt;
+							diagnostic("ownership_conflict", turn.turn_id, gate.gate_id);
+							continue;
+						}
 						const provenance = runtimeProvenanceToken(sessionId, transaction, turn, gate);
 						if (!turn.runtime_provenance || canonicalJson(turn.runtime_provenance) !== canonicalJson(provenance))
 							turn.runtime_provenance = provenance;
@@ -4699,6 +4739,8 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 								},
 							};
 						}
+						if (liveInFlightCandidate && turn.turn_id === admission.active_turn_id)
+							liveInFlightAskAdmitted = true;
 					}
 					if (complete)
 						for (const [authorityId, authority] of Object.entries(transaction.canonical.gate_authorities))
@@ -4720,7 +4762,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				},
 				options,
 			);
-			if (!q12Admitted)
+			if (!q12Admitted || (liveInFlightCandidate && !liveInFlightAskAdmitted))
 				return {
 					ok: true,
 					schema_version: 1,
@@ -9795,10 +9837,9 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 
 						const admission = await reconcileSessionRuntime(sessionId, { observeQuestions: true });
 						const admissionToken = admission.waiting_token;
-						const liveAdmissionRequired =
-							admission.session_state?.source === "agent_session_event" &&
-							admission.session_state.live === true &&
-							admission.session_state.state === "needs_user_input";
+						const agentRuntimeAdmissionRequired =
+							admission.session_state?.source === "agent_session_event" && admission.session_state.live === true;
+						const liveAdmissionRequired = admission.session_state?.state === "needs_user_input";
 						if (liveAdmissionRequired && !admissionToken)
 							return {
 								ok: false,
@@ -9815,6 +9856,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 							};
 						let translated: unknown;
 						let session: Record<string, unknown> | null = null;
+						let liveInFlightAnswerAdmitted = false;
 						const claimed = await withAdmittedSessionTransaction(questionPaths, sessionId, async transaction => {
 							const liveState = await readSessionState(namespaceDir, sessionId);
 							const question = transaction.canonical.questions[questionId];
@@ -9895,10 +9937,30 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 								authority?.observation.kind === "valid"
 									? authority.observation.first_provenance.runtime_turn_id
 									: null;
+							const liveInFlightAskOwned = Boolean(
+								liveState?.schema_version === 1 &&
+									liveState.session_id === sessionId &&
+									liveState?.source === "agent_session_event" &&
+									liveState.live === true &&
+									liveState.state === "running" &&
+									liveState.current_turn_id === turnId &&
+									Number.isFinite(Date.parse(liveState.updated_at)) &&
+									hasExactRuntimeWriterIdentity(liveState, transaction.canonical.session.broker) &&
+									canonicalTurn &&
+									ACTIVE_TURN_STATUSES.has(canonicalTurn.status as TurnStatus) &&
+									hasAcceptedRuntimeReceipt(canonicalTurn) &&
+									authority?.outcome?.state === "pending" &&
+									authority.outcome.turn_id === turnId &&
+									authority.observation.kind === "valid" &&
+									runtimeTurnId === canonicalTurn.delivery.runtime_turn_id,
+							);
 							const liveWaitingOwned =
-								liveState?.source !== "agent_session_event" ||
-								liveState.live !== true ||
-								(liveState.state === "needs_user_input" && liveState.current_turn_id === turnId);
+								liveState?.source !== "agent_session_event"
+									? true
+									: liveState.live === true &&
+										((liveState.state === "needs_user_input" && liveState.current_turn_id === turnId) ||
+											liveInFlightAskOwned);
+							liveInFlightAnswerAdmitted = liveInFlightAskOwned;
 							const provenanceMatches =
 								admissionToken === null ||
 								(Boolean(canonicalTurn?.runtime_provenance) &&
@@ -9910,7 +9972,8 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 								!liveWaitingOwned ||
 								(liveState?.source === "agent_session_event" &&
 									liveState.live === true &&
-									canonicalTurn?.status !== "waiting_for_answer") ||
+									canonicalTurn?.status !== "waiting_for_answer" &&
+									!liveInFlightAskOwned) ||
 								!authority ||
 								authority.observation.kind !== "valid" ||
 								!canonicalTurn ||
@@ -10022,17 +10085,103 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 						const latestAdmission = await reconcileSessionRuntime(sessionId, { observeQuestions: true });
 						const latestState = latestAdmission.session_state;
 						const latestToken = latestAdmission.waiting_token;
-						const latestLiveRequired =
-							latestState?.source === "agent_session_event" &&
-							latestState.live === true &&
-							latestState.state === "needs_user_input";
-						if (
-							latestAdmission.terminal ||
-							(latestLiveRequired && (!latestToken || latestToken.coordinator_turn_id !== turnId)) ||
+						const latestQuestions = await reconcileQuestions(sessionId);
+						const latestSession = asRecord(await readJsonFile(sessionFile(sessionId)));
+						const latestSnapshot = latestSession ? await readCompleteQ12Snapshot(latestSession) : null;
+						let latestFreshGate: (WorkflowGateQueryRecord & WorkflowGate) | undefined;
+						if (latestSnapshot?.complete === true) {
+							latestFreshGate = (latestSnapshot.items as unknown[]).find(row => {
+								if (!row || typeof row !== "object") return false;
+								const record = row as Record<string, unknown>;
+								return record.tag === "pending" && record.gate_id === gateId;
+							}) as (WorkflowGateQueryRecord & WorkflowGate) | undefined;
+						}
+						const latestQ12Proof =
+							latestQuestions.reconciliation.complete &&
+							latestSnapshot?.complete === true &&
+							latestFreshGate !== undefined &&
+							(await withSessionTransaction(questionPaths, sessionId, async transaction => {
+								const canonicalQuestion = transaction.canonical.questions[questionId];
+								const canonicalTurn = transaction.canonical.turns[turnId];
+								const authority = canonicalQuestion
+									? transaction.canonical.gate_authorities[canonicalQuestion.authority_id]
+									: undefined;
+								if (!canonicalQuestion || !canonicalTurn || !authority || !latestFreshGate) return false;
+								const freshProvenance = runtimeProvenanceToken(
+									sessionId,
+									transaction,
+									canonicalTurn,
+									latestFreshGate,
+								);
+								return Boolean(
+									canonicalQuestion.session_id === sessionId &&
+										canonicalQuestion.turn_id === turnId &&
+										(canonicalQuestion.status === "pending" || canonicalQuestion.status === "resolving") &&
+										ACTIVE_TURN_STATUSES.has(canonicalTurn.status as TurnStatus) &&
+										hasAcceptedRuntimeReceipt(canonicalTurn) &&
+										latestFreshGate.gate_id === authority.authority.gate_id &&
+										latestFreshGate.runtime_turn_id === canonicalTurn.delivery.runtime_turn_id &&
+										authority.outcome.state === "pending" &&
+										authority.outcome.turn_id === turnId &&
+										authority.outcome.question_id === questionId &&
+										authority.observation.kind === "valid" &&
+										canonicalTurn.runtime_provenance &&
+										canonicalJson(authority.observation.first_provenance) ===
+											canonicalJson(freshProvenance) &&
+										canonicalJson(canonicalTurn.runtime_provenance) === canonicalJson(freshProvenance) &&
+										!canonicalTurn.terminal_fence,
+								);
+							}));
+						const latestLiveInFlightAsk =
+							!latestAdmission.terminal &&
+							latestAdmission.active_turn_id === turnId &&
+							latestQ12Proof &&
+							(await withSessionTransaction(questionPaths, sessionId, async transaction => {
+								const runtimeState = await readSessionState(namespaceDir, sessionId);
+								const canonicalQuestion = transaction.canonical.questions[questionId];
+								const canonicalTurn = transaction.canonical.turns[turnId];
+								const authority = canonicalQuestion
+									? transaction.canonical.gate_authorities[canonicalQuestion.authority_id]
+									: undefined;
+								const authorityRuntimeTurnId =
+									authority?.observation.kind === "valid"
+										? authority.observation.first_provenance.runtime_turn_id
+										: null;
+								return Boolean(
+									runtimeState?.schema_version === 1 &&
+										runtimeState.session_id === sessionId &&
+										runtimeState.source === "agent_session_event" &&
+										runtimeState.live === true &&
+										runtimeState.state === "running" &&
+										runtimeState.current_turn_id === turnId &&
+										Number.isFinite(Date.parse(runtimeState.updated_at)) &&
+										hasExactRuntimeWriterIdentity(runtimeState, transaction.canonical.session.broker) &&
+										canonicalTurn &&
+										ACTIVE_TURN_STATUSES.has(canonicalTurn.status as TurnStatus) &&
+										hasAcceptedRuntimeReceipt(canonicalTurn) &&
+										canonicalQuestion &&
+										(canonicalQuestion.status === "pending" || canonicalQuestion.status === "resolving") &&
+										authority?.outcome.state === "pending" &&
+										authority.outcome.turn_id === turnId &&
+										authority.observation.kind === "valid" &&
+										canonicalTurn.delivery.runtime_turn_id === authorityRuntimeTurnId &&
+										canonicalTurn.runtime_provenance &&
+										canonicalJson(canonicalTurn.runtime_provenance) ===
+											canonicalJson(authority.observation.first_provenance) &&
+										!canonicalTurn.terminal_fence,
+								);
+							}));
+						const latestAgentRuntimeAdmitted =
+							!agentRuntimeAdmissionRequired ||
 							(latestState?.source === "agent_session_event" &&
 								latestState.live === true &&
-								(latestState.state !== "needs_user_input" || latestState.current_turn_id !== turnId))
-						) {
+								latestState.current_turn_id === turnId &&
+								((liveInFlightAnswerAdmitted && latestState.state === "running" && latestLiveInFlightAsk) ||
+									(!liveInFlightAnswerAdmitted &&
+										latestState.state === "needs_user_input" &&
+										latestToken?.coordinator_turn_id === turnId &&
+										latestQ12Proof)));
+						if (latestAdmission.terminal || !latestQ12Proof || !latestAgentRuntimeAdmitted) {
 							// No remote call has occurred. Undo the durable dispatch claim so this
 							// outer request remains retryable rather than stranding the question in
 							// remote_started/resolving.

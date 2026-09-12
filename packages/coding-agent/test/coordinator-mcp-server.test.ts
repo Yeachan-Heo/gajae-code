@@ -3913,6 +3913,345 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		).toMatchObject({ ok: false, error: { code: "idempotency_conflict" } });
 	});
 
+	it("admits a live ask while the agent-session sidecar is still running", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const queries: string[] = [];
+		let runtimeTurnId = "unbound";
+		const server = await createSdkControlServer(
+			root,
+			controls,
+			queries,
+			query =>
+				query === "Q12"
+					? {
+							ok: true,
+							page: {
+								items: [sharedAskGate("live-ask", runtimeTurnId)],
+								complete: true,
+								revision: "live-ask",
+							},
+						}
+					: { ok: true, page: { items: [], complete: true, revision: "context" } },
+			undefined,
+			undefined,
+			undefined,
+			{
+				controlResult: control =>
+					control.operation === "workflow.gate_answer"
+						? { ok: true, result: { status: "accepted", resolved_at: "2026-09-12T13:00:00.000Z" } }
+						: undefined,
+			},
+		);
+		await registerSdkSession(server, root);
+		const sent = await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "visible-session",
+			prompt: "open a live ask",
+			idempotency_key: "live-ask-prompt",
+			allow_mutation: true,
+		});
+		runtimeTurnId = String((sent.turn as Record<string, Record<string, unknown>>).delivery.runtime_turn_id);
+		await patchSessionState(server, root, "visible-session", {
+			state: "running",
+			ready_for_input: false,
+			current_turn_id: sent.turn_id,
+			last_turn_id: sent.turn_id,
+			source: "agent_session_event",
+			live: true,
+		});
+
+		const listed = await server.callTool("gjc_coordinator_list_questions", { session_id: "visible-session" });
+		const question = (listed.questions as Array<Record<string, unknown>>)[0]!;
+		expect(queries).toContain("Q12");
+		expect(listed).toMatchObject({
+			ok: true,
+			questions: [expect.objectContaining({ question_id: "live-ask", status: "pending" })],
+			reconciliation: { attempted: true, complete: true, reason: null },
+		});
+		if (typeof question.answer_binding !== "string") throw new Error("missing live ask answer binding");
+		expect(question.answer_binding).toMatch(/^[A-Za-z0-9_-]{43}$/);
+		const repeated = await server.callTool("gjc_coordinator_list_questions", { session_id: "visible-session" });
+		const repeatedQuestion = (repeated.questions as Array<Record<string, unknown>>)[0]!;
+		if (typeof repeatedQuestion.answer_binding !== "string") throw new Error("missing repeated live ask binding");
+		expect(repeatedQuestion.question_id).toBe("live-ask");
+		expect(repeatedQuestion.answer_binding).toBe(question.answer_binding);
+		const answer = await server.callTool("gjc_coordinator_submit_question_answer", {
+			session_id: "visible-session",
+			turn_id: sent.turn_id,
+			question_id: "live-ask",
+			answer_binding: question.answer_binding,
+			answer: { selected: ["opt_0"] },
+			idempotency_key: "live-ask-answer",
+			allow_mutation: true,
+		});
+		expect(answer).toMatchObject({
+			ok: true,
+			operation: "workflow.gate_answer",
+			status: "accepted",
+			replayed: false,
+		});
+		expect(controls.filter(control => control.operation === "workflow.gate_answer")).toEqual([
+			expect.objectContaining({
+				input: { id: "live-ask", response: { selected: ["Continue"] }, expectedSessionId: "visible-session" },
+			}),
+		]);
+		await expect(
+			server.callTool("gjc_coordinator_list_questions", { session_id: "visible-session", status: "answered" }),
+		).resolves.toMatchObject({
+			questions: [expect.objectContaining({ question_id: "live-ask", status: "answered" })],
+		});
+	});
+
+	it("does not admit a forged live running sidecar without exact writer identity", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		let runtimeTurnId = "unbound";
+		const server = await createSdkControlServer(root, controls, [], query =>
+			query === "Q12"
+				? {
+						ok: true,
+						page: {
+							items: [sharedAskGate("forged-live-ask", runtimeTurnId)],
+							complete: true,
+							revision: "forged-live-ask",
+						},
+					}
+				: { ok: true, page: { items: [], complete: true, revision: "context" } },
+		);
+		await registerSdkSession(server, root);
+		const sent = await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "visible-session",
+			prompt: "forged live ask",
+			idempotency_key: "forged-live-ask-prompt",
+			allow_mutation: true,
+		});
+		runtimeTurnId = String((sent.turn as Record<string, Record<string, unknown>>).delivery.runtime_turn_id);
+		const stateFile = coordinatorSessionStatePath(root, "visible-session");
+		const state = JSON.parse(await fs.readFile(stateFile, "utf8")) as Record<string, unknown>;
+		delete state.sidecar_key_id;
+		delete state.sidecar_signature;
+		await fs.writeFile(
+			stateFile,
+			JSON.stringify({
+				...state,
+				state: "running",
+				ready_for_input: false,
+				current_turn_id: sent.turn_id,
+				last_turn_id: sent.turn_id,
+				source: "agent_session_event",
+				live: true,
+			}),
+		);
+
+		await expect(
+			server.callTool("gjc_coordinator_list_questions", { session_id: "visible-session" }),
+		).resolves.toMatchObject({
+			questions: [],
+			reconciliation: { attempted: false, complete: false, reason: "terminal_uncertain" },
+		});
+	});
+
+	it("rechecks the accepted runtime receipt before dispatching a live answer", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		let runtimeTurnId = "unbound";
+		const admissionStarted = Promise.withResolvers<void>();
+		const releaseAdmission = Promise.withResolvers<void>();
+		const server = await createSdkControlServer(
+			root,
+			controls,
+			[],
+			query =>
+				query === "Q12"
+					? {
+							ok: true,
+							page: {
+								items: [sharedAskGate("receipt-drift-ask", runtimeTurnId)],
+								complete: true,
+								revision: "receipt-drift",
+							},
+						}
+					: { ok: true, page: { items: [], complete: true, revision: "context" } },
+			undefined,
+			undefined,
+			undefined,
+			{
+				afterAnswerRemoteStarted: async () => {
+					admissionStarted.resolve();
+					await releaseAdmission.promise;
+				},
+				controlResult: control =>
+					control.operation === "workflow.gate_answer" ? { ok: true, result: { status: "accepted" } } : undefined,
+			},
+		);
+		await registerSdkSession(server, root);
+		const sent = await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "visible-session",
+			prompt: "receipt drift",
+			idempotency_key: "receipt-drift-prompt",
+			allow_mutation: true,
+		});
+		runtimeTurnId = String((sent.turn as Record<string, Record<string, unknown>>).delivery.runtime_turn_id);
+		await patchSessionState(server, root, "visible-session", {
+			state: "running",
+			ready_for_input: false,
+			current_turn_id: sent.turn_id,
+			last_turn_id: sent.turn_id,
+			source: "agent_session_event",
+			live: true,
+		});
+		const listed = await server.callTool("gjc_coordinator_list_questions", { session_id: "visible-session" });
+		const question = (listed.questions as Array<Record<string, unknown>>)[0]!;
+		if (typeof question.answer_binding !== "string") throw new Error("missing receipt drift binding");
+		const answer = server.callTool("gjc_coordinator_submit_question_answer", {
+			session_id: "visible-session",
+			turn_id: sent.turn_id,
+			question_id: "receipt-drift-ask",
+			answer_binding: question.answer_binding,
+			answer: { selected: ["opt_0"] },
+			idempotency_key: "receipt-drift-answer",
+			allow_mutation: true,
+		});
+		await admissionStarted.promise;
+		await patchTurnDelivery(server, "visible-session", String(sent.turn_id), {
+			prompt_acknowledged: false,
+			runtime_command_id: undefined,
+			runtime_turn_id: undefined,
+			state: "queued",
+		});
+		await patchSessionState(server, root, "visible-session", {
+			source: "coordinator",
+			live: false,
+		});
+		releaseAdmission.resolve();
+		await expect(answer).resolves.toMatchObject({ ok: false, error: { code: "terminal_uncertain" } });
+		expect(controls.filter(control => control.operation === "workflow.gate_answer")).toHaveLength(0);
+	});
+
+	it("does not dispatch a waiting answer after the fresh Q12 gate disappears", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		let runtimeTurnId = "unbound";
+		let gateVisible = true;
+		const admissionStarted = Promise.withResolvers<void>();
+		const releaseAdmission = Promise.withResolvers<void>();
+		const server = await createSdkControlServer(
+			root,
+			controls,
+			[],
+			query =>
+				query === "Q12"
+					? {
+							ok: true,
+							page: {
+								items: gateVisible ? [sharedAskGate("missing-fresh-gate", runtimeTurnId)] : [],
+								complete: true,
+								revision: gateVisible ? "present" : "missing",
+							},
+						}
+					: { ok: true, page: { items: [], complete: true, revision: "context" } },
+			undefined,
+			undefined,
+			undefined,
+			{
+				afterAnswerRemoteStarted: async () => {
+					admissionStarted.resolve();
+					await releaseAdmission.promise;
+				},
+				controlResult: control =>
+					control.operation === "workflow.gate_answer" ? { ok: true, result: { status: "accepted" } } : undefined,
+			},
+		);
+		await registerSdkSession(server, root);
+		const sent = await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "visible-session",
+			prompt: "missing fresh gate",
+			idempotency_key: "missing-fresh-gate-prompt",
+			allow_mutation: true,
+		});
+		runtimeTurnId = String((sent.turn as Record<string, Record<string, unknown>>).delivery.runtime_turn_id);
+		await patchSessionState(server, root, "visible-session", {
+			state: "needs_user_input",
+			ready_for_input: false,
+			current_turn_id: sent.turn_id,
+			last_turn_id: sent.turn_id,
+			source: "agent_session_event",
+			live: true,
+		});
+		const listed = await server.callTool("gjc_coordinator_list_questions", { session_id: "visible-session" });
+		const question = (listed.questions as Array<Record<string, unknown>>)[0]!;
+		if (typeof question.answer_binding !== "string") throw new Error("missing fresh gate binding");
+		const answer = server.callTool("gjc_coordinator_submit_question_answer", {
+			session_id: "visible-session",
+			turn_id: sent.turn_id,
+			question_id: "missing-fresh-gate",
+			answer_binding: question.answer_binding,
+			answer: { selected: ["opt_0"] },
+			idempotency_key: "missing-fresh-gate-answer",
+			allow_mutation: true,
+		});
+		await admissionStarted.promise;
+		gateVisible = false;
+		releaseAdmission.resolve();
+		await expect(answer).resolves.toMatchObject({ ok: false, error: { code: "terminal_uncertain" } });
+		expect(controls.filter(control => control.operation === "workflow.gate_answer")).toHaveLength(0);
+	});
+
+	it("keeps an uncertain terminal boundary fail-closed despite a pending gate row", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		let runtimeTurnId = "unbound";
+		const server = await createSdkControlServer(root, controls, [], query =>
+			query === "Q12"
+				? {
+						ok: true,
+						page: {
+							items: [sharedAskGate("uncertain-terminal-ask", runtimeTurnId)],
+							complete: true,
+							revision: "uncertain-terminal",
+						},
+					}
+				: { ok: true, page: { items: [], complete: true, revision: "context" } },
+		);
+		await registerSdkSession(server, root);
+		const sent = await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "visible-session",
+			prompt: "terminal boundary race",
+			idempotency_key: "uncertain-terminal-prompt",
+			allow_mutation: true,
+		});
+		runtimeTurnId = String((sent.turn as Record<string, Record<string, unknown>>).delivery.runtime_turn_id);
+		await patchTurnDelivery(server, "visible-session", String(sent.turn_id), {
+			prompt_acknowledged: false,
+			runtime_command_id: undefined,
+			runtime_turn_id: undefined,
+			state: "queued",
+		});
+		await patchSessionState(server, root, "visible-session", {
+			state: "completed",
+			ready_for_input: false,
+			current_turn_id: sent.turn_id,
+			last_turn_id: sent.turn_id,
+			source: "agent_session_event",
+			live: false,
+			final_response: {
+				text: "terminal raced broker acknowledgement",
+				format: "markdown",
+				source: "runtime",
+				artifact_path: null,
+				truncated: false,
+			},
+		});
+
+		await expect(
+			server.callTool("gjc_coordinator_list_questions", { session_id: "visible-session" }),
+		).resolves.toMatchObject({
+			ok: true,
+			questions: [],
+			reconciliation: { attempted: false, complete: false, reason: "terminal_uncertain" },
+		});
+	});
+
 	it("bounds every Q12 snapshot page by the remaining snapshot budget", async () => {
 		const root = await tempRoot();
 		const controls: SdkControl[] = [];

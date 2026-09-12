@@ -39,6 +39,7 @@ import {
 	postmortem,
 	prompt,
 	Snowflake,
+	safeErrorDescription,
 	setProjectDir,
 } from "@gajae-code/utils";
 import {
@@ -92,6 +93,7 @@ import type { CustomTool, CustomToolContext, CustomToolSessionEvent } from "../e
 import { CustomToolAdapter } from "../extensibility/custom-tools/wrapper";
 import {
 	createCustomToolSettings,
+	discoverAndLoadExtensions,
 	type ExtensionContext,
 	type ExtensionEvent,
 	type ExtensionFactory,
@@ -103,6 +105,7 @@ import {
 	type FunctionHookResult,
 	type LoadExtensionsResult,
 	loadExtensionFromFactory,
+	loadExtensions,
 	type ToolDefinition,
 	wrapRegisteredTools,
 } from "../extensibility/extensions";
@@ -507,7 +510,9 @@ export interface CreateAgentSessionOptions {
 	/** Disable extension discovery (explicit paths still load). */
 	disableExtensionDiscovery?: boolean;
 	/**
-	 * Pre-loaded extensions (skips file discovery).
+	 * Pre-loaded extensions (skips file discovery). A COMPLETE result is required:
+	 * the session reuses its live `runtime`, so a partial result dereferences a
+	 * missing runtime instead of degrading.
 	 * @internal Used by CLI when extensions are loaded early to parse custom flags.
 	 */
 	preloadedExtensions?: LoadExtensionsResult;
@@ -1270,28 +1275,6 @@ class McpManagerCleanupDiagnosticError extends Error {
 		this.name = "McpManagerCleanupDiagnosticError";
 		this.primaryError = primaryError;
 		this.cleanupDiagnostic = { code: "MCP_MANAGER_CLEANUP_FAILED", cause: cleanupError };
-	}
-}
-
-function safeErrorDescription(value: unknown): string {
-	let isError = false;
-	try {
-		isError = value instanceof Error;
-	} catch {
-		// Hostile proxies can throw from getPrototypeOf during instanceof.
-	}
-	if (isError) {
-		try {
-			const message = (value as { message?: unknown }).message;
-			if (typeof message === "string") return message;
-		} catch {
-			// Hostile error getters must not replace the primary failure.
-		}
-	}
-	try {
-		return String(value);
-	} catch {
-		return "<unprintable error>";
 	}
 }
 
@@ -3364,9 +3347,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		}
 		// MCP routing is scope-held; no process-global manager registration.
 
-		// General extension discovery is quarantined from the public SDK surface.
-		// Recognized hook conventions are the bounded exception: their descriptors
+		// Recognized hook conventions are a bounded additional source: their descriptors
 		// normalize before import and then adapt into the authoritative ExtensionRunner.
+		// General extension-module discovery runs further below, before that runner is built.
 		const inlineExtensions: ExtensionFactory[] = [...(options.extensions ?? [])];
 		const discoveredHookExtensions: Array<{ factory: ExtensionFactory; name: string }> = [];
 		if (customTools.length > 0) {
@@ -3612,15 +3595,56 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			});
 		}
 
-		// Extension/module discovery is quarantined; retain only the private
-		// runtime needed for bundled product extensions, explicitly supplied SDK
-		// extension factories, and custom tools. Filesystem extension paths remain
-		// ignored here even when options.additionalExtensionPaths is supplied.
-		const extensionsResult: LoadExtensionsResult = options.preloadedExtensions ?? {
-			extensions: [],
-			errors: [],
-			runtime: new ExtensionRuntime(),
+		// Extension modules are discovered at session startup from the canonical
+		// native locations (`<agentDir>/extensions`, `<cwd>/.gjc/extensions`),
+		// installed plugin bundles, the `extensions` setting, and explicitly
+		// supplied `additionalExtensionPaths`. `disableExtensionDiscovery` keeps its
+		// documented opt-out semantics: explicit paths still load, matching
+		// `cli/list-models.ts`. A caller-supplied `preloadedExtensions` result
+		// suppresses discovery entirely.
+		const explicitExtensionPaths = options.additionalExtensionPaths ?? [];
+		// Discovery must never block session creation: a filesystem or plugin-registry
+		// failure degrades to the explicit paths and then to no extensions at all, and
+		// the failure stays observable in `extensionsResult.errors`.
+		const loadStartupExtensions = async (): Promise<LoadExtensionsResult> => {
+			try {
+				return options.disableExtensionDiscovery
+					? await loadExtensions(explicitExtensionPaths, cwd, eventBus)
+					: await discoverAndLoadExtensions(
+							[...explicitExtensionPaths, ...settings.get("extensions")],
+							cwd,
+							eventBus,
+							settings.get("disabledExtensions"),
+							{ agentDir, profileAuthority, settings },
+						);
+			} catch (error) {
+				logger.warn(
+					options.disableExtensionDiscovery
+						? "Failed to load extension modules"
+						: "Failed to discover extension modules",
+					{ error: safeErrorForLog(error) },
+				);
+				const failure = { path: "<extension-discovery>", error: safeErrorDescription(error) };
+				if (options.disableExtensionDiscovery) {
+					return { extensions: [], errors: [failure], runtime: new ExtensionRuntime() };
+				}
+				try {
+					const fallback = await loadExtensions(explicitExtensionPaths, cwd, eventBus);
+					return { ...fallback, errors: [failure, ...fallback.errors] };
+				} catch (fallbackError) {
+					// Last resort: `loadExtensions` does not throw for a bad module, so this
+					// rung guards its contract rather than a known input.
+					logger.warn("Failed to load explicit extension paths", { error: safeErrorForLog(fallbackError) });
+					return { extensions: [], errors: [failure], runtime: new ExtensionRuntime() };
+				}
+			}
 		};
+		const extensionsResult: LoadExtensionsResult = options.preloadedExtensions ?? (await loadStartupExtensions());
+		if (options.preloadedExtensions === undefined) {
+			for (const { path: extPath, error } of extensionsResult.errors) {
+				logger.warn("Failed to load extension", { path: extPath, error });
+			}
+		}
 
 		if (!extensionsResult.extensions.some(extension => extension.path === BUNDLED_GROK_BUILD_EXTENSION_ID)) {
 			const bundledGrokExtension = await loadExtensionFromFactory(

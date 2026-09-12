@@ -16,6 +16,8 @@ import type { GcContext, GcPidProbe, GcRecord } from "@gajae-code/coding-agent/g
 import * as nativeBindings from "@gajae-code/natives";
 import {
 	exactRemoveDirectoryTree,
+	type NativeExactUnlinkResult,
+	type NativeNoReplaceResult,
 	renameDirectoryNoReplacePathAsync,
 	renameNoReplacePathAsync,
 	snapshotDirectoryTree,
@@ -139,6 +141,18 @@ function deadLockRecord(lockDir: string): GcRecord {
 		removable: true,
 		action: "none",
 		reason: "file_lock_owner_pid_dead",
+	};
+}
+
+function successfulPublication(primitive: NativeNoReplaceResult["primitive"]): NativeNoReplaceResult {
+	return {
+		ok: true,
+		mutationState: "committed",
+		durabilityState: "not_attempted",
+		reason: "none",
+		primitive,
+		phase: "complete",
+		diagnostic: { schemaVersion: 1, collectionState: "unavailable" },
 	};
 }
 
@@ -968,6 +982,16 @@ describe("file lock cleanup failure handling (#2478)", () => {
 		// A filter-hosted Windows host: the probe rejects the native exact-removal
 		// primitive, while the handle-bound detach-only quarantine still succeeds.
 		FileLockTestHooks.nativeExactRemovalProbe = () => false;
+		FileLockTestHooks.nativePublicationBindings = () => ({
+			renameNoReplacePathAsync: async (source, destination) => {
+				await fs.rename(source, destination);
+				return successfulPublication("windows_rename_noreplace");
+			},
+			renameDirectoryNoReplacePathAsync: async (source, destination) => {
+				await fs.rename(source, destination);
+				return successfulPublication("mkdirat_renameat_noreplace");
+			},
+		});
 		FileLockTestHooks.nativeQuarantineBindings = () => ({
 			snapshotDirectoryTree,
 			exactRemoveDirectoryTree: (target, _snapshot, _parent, detachOnly) => {
@@ -1047,7 +1071,7 @@ describe("file lock cleanup failure handling (#2478)", () => {
 	});
 
 	test.skipIf(process.platform === "win32")(
-		"aborts immediately for an old truncated removal transition and preserves the orphan",
+		"adopts and finishes an aged scrubbed removal transition instead of wedging",
 		async () => {
 			const lockedFile = path.join(await makeTemp(), "state.json");
 			const lockDir = `${lockedFile}.lock`;
@@ -1057,23 +1081,102 @@ describe("file lock cleanup failure handling (#2478)", () => {
 			await Bun.write(infoPath, "");
 			const old = new Date(Date.now() - 120_000);
 			await fs.utimes(infoPath, old, old);
-			const retainedIdentity = await fs.stat(detachedPath, { bigint: true });
-			let publications = 0;
 			let entered = false;
-			FileLockTestHooks.nativePublicationBindings = () => ({
-				renameNoReplacePathAsync: async (source, destination) => {
-					publications++;
-					return await renameNoReplacePathAsync(source, destination);
+
+			await withFileLock(
+				lockedFile,
+				async () => {
+					entered = true;
+					expect(await fs.exists(lockDir)).toBe(true);
 				},
-				renameDirectoryNoReplacePathAsync,
-			});
+				{ retries: 12_000, retryDelayMs: 5 },
+			);
+
+			expect(entered).toBe(true);
+			expect(await fs.exists(lockDir)).toBe(false);
+			expect(await fs.exists(detachedPath)).toBe(false);
+			expect(await fs.readdir(path.dirname(lockDir))).toEqual([]);
+		},
+	);
+
+	const invalidOrphanAdoptionReceipts: [string, (detachedPath: string) => unknown][] = [
+		["missing durable scrub proof", detachedPath => ({ ok: false, code: "cleanup_pending", detachedPath })],
+		[
+			"false durable scrub proof",
+			detachedPath => ({ ok: false, code: "cleanup_pending", payloadDurable: false, detachedPath }),
+		],
+		[
+			"extra receipt field",
+			detachedPath => ({
+				ok: false,
+				code: "cleanup_pending",
+				payloadDurable: true,
+				detachedPath,
+				retainedSuccessorPath: detachedPath,
+			}),
+		],
+		[
+			"contradictory success",
+			detachedPath => ({ ok: true, code: "cleanup_pending", payloadDurable: true, detachedPath }),
+		],
+		["contradictory not-found", _detachedPath => ({ ok: true, code: "not_found" })],
+		["non-boolean success", _detachedPath => ({ ok: 1 })],
+	];
+	test.each(
+		invalidOrphanAdoptionReceipts,
+	)("keeps an aged scrubbed transition when adoption returns %s", async (_label, makeReceipt) => {
+		const lockedFile = path.join(await makeTemp(), "state.json");
+		const lockDir = `${lockedFile}.lock`;
+		const detachedPath = `${lockDir}.removing`;
+		const infoPath = path.join(detachedPath, "info");
+		await fs.mkdir(detachedPath);
+		await Bun.write(infoPath, "");
+		const old = new Date(Date.now() - 120_000);
+		await fs.utimes(infoPath, old, old);
+		let exactRemoveCalls = 0;
+		FileLockTestHooks.nativeQuarantineBindings = () => ({
+			snapshotDirectoryTree,
+			exactRemoveDirectoryTree: target => {
+				exactRemoveCalls++;
+				return makeReceipt(target) as NativeExactUnlinkResult;
+			},
+		});
+
+		const failure = await withFileLock(lockedFile, async () => undefined, {
+			retries: 1,
+			retryDelayMs: 1,
+		}).catch(error => error);
+		expect(failure).toMatchObject({
+			code: "orphan_transition",
+			reason: "orphan_transition",
+			orphanPath: detachedPath,
+			attempts: 1,
+		});
+		expect(exactRemoveCalls).toBe(1);
+		expect(await fs.exists(detachedPath)).toBe(true);
+	});
+
+	test.skipIf(process.platform === "win32")(
+		"keeps the typed orphan diagnostic when a transition payload was never scrubbed",
+		async () => {
+			const lockedFile = path.join(await makeTemp(), "state.json");
+			const lockDir = `${lockedFile}.lock`;
+			const detachedPath = `${lockDir}.removing`;
+			const infoPath = path.join(detachedPath, "info");
+			await fs.mkdir(detachedPath);
+			await Bun.write(infoPath, "");
+			await Bun.write(path.join(detachedPath, "unretired-payload"), "not scrubbed");
+			const old = new Date(Date.now() - 120_000);
+			await fs.utimes(infoPath, old, old);
+			await fs.utimes(path.join(detachedPath, "unretired-payload"), old, old);
+			let entered = false;
 
 			const failure = await withFileLock(
 				lockedFile,
 				async () => {
 					entered = true;
 				},
-				{ retries: 12_000, retryDelayMs: 5 },
+				{ retries: 2, retryDelayMs: 1 },
 			).catch(error => error);
 			expect(failure).toBeInstanceOf(FileLockAcquireError);
 			expect(failure).toMatchObject({
@@ -1082,16 +1185,37 @@ describe("file lock cleanup failure handling (#2478)", () => {
 				orphanPath: detachedPath,
 				attempts: 1,
 			});
-			if (!(failure instanceof FileLockAcquireError)) throw new Error("Expected a file lock acquisition failure");
-			expect(failure.message).toContain(`orphan_transition at ${detachedPath}`);
 			expect(entered).toBe(false);
-			expect(publications).toBe(0);
-			expect(await fs.exists(lockDir)).toBe(false);
-			const retained = await fs.stat(detachedPath, { bigint: true });
-			expect(retained.dev).toBe(retainedIdentity.dev);
-			expect(retained.ino).toBe(retainedIdentity.ino);
-			expect(await Bun.file(infoPath).text()).toBe("");
-			expect(await fs.readdir(path.dirname(lockDir))).toEqual([path.basename(detachedPath)]);
+			expect(await fs.exists(detachedPath)).toBe(true);
+			expect(await Bun.file(path.join(detachedPath, "unretired-payload")).text()).toBe("not scrubbed");
+		},
+	);
+
+	test.skipIf(process.platform === "win32")(
+		"keeps waiting for a young empty removal transition instead of adopting it",
+		async () => {
+			// A freshly scanned transition whose `info` is momentarily empty stays
+			// classified active; only an aged one is ever adopted.
+			const lockedFile = path.join(await makeTemp(), "young-transition.json");
+			const detachedPath = `${lockedFile}.lock.removing`;
+			await fs.mkdir(detachedPath);
+			await Bun.write(path.join(detachedPath, "info"), "");
+			// Keep the acquisition budget (retries * retryDelayMs) far larger than the
+			// transition's age without sleeping through it in the test.
+			const realSleep = Bun.sleep;
+			vi.spyOn(Bun, "sleep").mockImplementation((async (_ms?: number) => await realSleep(0)) as typeof Bun.sleep);
+
+			const failure = await withFileLock(lockedFile, async () => undefined, {
+				retries: 2,
+				retryDelayMs: 60_000,
+			}).catch(error => error);
+			expect(failure).toMatchObject({
+				code: "acquire_timeout",
+				reason: "acquire_timeout",
+				attempts: 2,
+				holder: expect.stringContaining("blocked by retained removal transition"),
+			});
+			expect(await fs.exists(detachedPath)).toBe(true);
 		},
 	);
 

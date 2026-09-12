@@ -1311,8 +1311,9 @@ async function buildSessionOptions(
 		options.rules = [];
 	}
 
-	// General extension modules stay preloaded/explicit, while the SDK performs
-	// bounded native/Claude/Codex hook discovery through the canonical adapter.
+	// Session startup discovers extension modules from the canonical locations, so
+	// these stay at their defaults. `--extension` / `--no-extensions` are retired
+	// ACP-only launch flags and deliberately do not feed the local startup path.
 	options.disableExtensionDiscovery = false;
 	options.additionalExtensionPaths = [];
 

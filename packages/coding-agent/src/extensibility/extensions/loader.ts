@@ -7,9 +7,10 @@ import * as path from "node:path";
 import type { ThinkingLevel } from "@gajae-code/agent-core";
 import type { ImageContent, Model, TextContent, Tool, UsageReport } from "@gajae-code/ai/core";
 import type { KeyId } from "@gajae-code/tui";
-import { hasFsCode, isEacces, isEnoent, logger } from "@gajae-code/utils";
+import { hasFsCode, isEacces, isEnoent, logger, safeErrorDescription } from "@gajae-code/utils";
 import * as Zod from "zod/v4";
 import { type ExtensionModule, extensionModuleCapability } from "../../capability/extension-module";
+import type { Settings } from "../../config/settings";
 import { loadCapability } from "../../discovery";
 import { getExtensionNameFromPath } from "../../discovery/helpers";
 import type { ExecOptions } from "../../exec/exec";
@@ -511,9 +512,9 @@ async function loadExtension(
 	eventBus: EventBus,
 	runtime: IExtensionRuntime,
 ): Promise<{ extension: Extension | null; error: string | null }> {
-	const resolvedPath = resolvePath(extensionPath, cwd);
 	let activation: ExtensionActivationScope | undefined;
 	try {
+		const resolvedPath = resolvePath(extensionPath, cwd);
 		const module = (await loadLegacyPiModule(resolvedPath)) as LoadedExtensionModule;
 		const factory = getExtensionFactory(module);
 
@@ -540,8 +541,7 @@ async function loadExtension(
 		return { extension, error: null };
 	} catch (err) {
 		activation?.rollback();
-		const message = err instanceof Error ? err.message : String(err);
-		return { extension: null, error: `Failed to load extension: ${message}` };
+		return { extension: null, error: `Failed to load extension: ${safeErrorDescription(err)}` };
 	}
 }
 
@@ -588,7 +588,7 @@ export async function loadExtensions(paths: string[], cwd: string, eventBus?: Ev
 		const { extension, error } = await loadExtension(extPath, cwd, resolvedEventBus, runtime);
 
 		if (error) {
-			errors.push({ path: extPath, error });
+			errors.push({ path: safeErrorDescription(extPath), error });
 			continue;
 		}
 
@@ -622,7 +622,7 @@ async function readExtensionManifest(packageJsonPath: string): Promise<Extension
 		if (isEnoent(error) || isEacces(error) || hasFsCode(error, "EPERM")) {
 			return null;
 		}
-		logger.warn("Failed to read extension manifest", { path: packageJsonPath, error: String(error) });
+		logger.warn("Failed to read extension manifest", { path: packageJsonPath, error: safeErrorDescription(error) });
 		return null;
 	}
 }
@@ -705,7 +705,7 @@ async function discoverExtensionsInDir(dir: string): Promise<string[]> {
 		entries = await fs.readdir(dir, { withFileTypes: true });
 	} catch (err) {
 		if (isEnoent(err)) return [];
-		logger.warn("Failed to discover extensions in directory", { path: dir, error: String(err) });
+		logger.warn("Failed to discover extensions in directory", { path: dir, error: safeErrorDescription(err) });
 		return [];
 	}
 	entries.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
@@ -730,6 +730,27 @@ async function discoverExtensionsInDir(dir: string): Promise<string[]> {
 }
 
 /**
+ * Session-scoped discovery inputs.
+ *
+ * A session's selected agent directory is not necessarily the process-global
+ * one (`createAgentSession({ agentDir })`), so user-scope extension modules and
+ * provider policy must resolve against the caller's profile rather than
+ * `getAgentDir()`.
+ */
+export interface DiscoverExtensionsOptions {
+	/**
+	 * Agent directory backing user-scope discovery. Default: `getAgentDir()`.
+	 * Only the native capability provider is scoped this way; installed
+	 * plugin-bundle extension paths stay home-scoped by design.
+	 */
+	agentDir?: string;
+	/** Resolver-owned classification for `agentDir`. */
+	profileAuthority?: "default" | "custom";
+	/** Session settings whose provider policy applies to this load. */
+	settings?: Settings;
+}
+
+/**
  * Discover and load extensions from standard locations.
  */
 export async function discoverAndLoadExtensions(
@@ -737,14 +758,21 @@ export async function discoverAndLoadExtensions(
 	cwd: string,
 	eventBus?: EventBus,
 	disabledExtensionIds: string[] = [],
+	options: DiscoverExtensionsOptions = {},
 ): Promise<LoadExtensionsResult> {
 	const allPaths: string[] = [];
 	const seen = new Set<string>();
 	const disabled = new Set(disabledExtensionIds);
+	// Environmental failures on a configured entry degrade to recorded errors instead
+	// of aborting the whole load, so one unreadable, unresolvable, or pathological
+	// entry — including a directory whose entries cannot be resolved — cannot drop
+	// every other extension the session would have loaded.
+	const discoveryErrors: Array<{ path: string; error: string }> = [];
 
 	const isDisabledName = (name: string): boolean => disabled.has(`extension-module:${name}`);
 
 	const addPath = (extPath: string): void => {
+		if (isDisabledName(getExtensionNameFromPath(extPath))) return;
 		const resolved = path.resolve(extPath);
 		if (!seen.has(resolved)) {
 			seen.add(resolved);
@@ -753,44 +781,77 @@ export async function discoverAndLoadExtensions(
 	};
 
 	const addPaths = (paths: string[]) => {
-		for (const extPath of paths) {
-			if (isDisabledName(getExtensionNameFromPath(extPath))) continue;
-			addPath(extPath);
-		}
+		for (const extPath of paths) addPath(extPath);
 	};
 
 	// 1. Discover extension modules via capability API (native .gjc/.pi only)
-	const discovered = await loadCapability<ExtensionModule>(extensionModuleCapability.id, { cwd });
+	const discovered = await loadCapability<ExtensionModule>(extensionModuleCapability.id, {
+		cwd,
+		...(options.agentDir === undefined ? {} : { agentDir: options.agentDir }),
+		...(options.profileAuthority === undefined ? {} : { profileAuthority: options.profileAuthority }),
+		...(options.settings === undefined ? {} : { settings: options.settings }),
+	});
 	for (const ext of discovered.items) {
 		if (ext._source.provider !== "native") continue;
-		if (isDisabledName(ext.name)) continue;
 		addPath(ext.path);
 	}
 
 	// 2. Discover extension entry points from installed plugins
-	addPaths(await getAllPluginExtensionPaths(cwd));
+	try {
+		addPaths(await getAllPluginExtensionPaths(cwd));
+	} catch (error) {
+		discoveryErrors.push({
+			path: "<plugin-registry>",
+			error: `Failed to read plugin extension paths: ${safeErrorDescription(error)}`,
+		});
+		logger.warn("Failed to read plugin extension paths", { error: safeErrorDescription(error) });
+	}
 
 	// 3. Explicitly configured paths
 	for (const configuredPath of configuredPaths) {
-		const resolved = resolvePath(configuredPath, cwd);
-
+		let resolved: string;
+		try {
+			resolved = resolvePath(configuredPath, cwd);
+		} catch (error) {
+			discoveryErrors.push({
+				path: safeErrorDescription(configuredPath),
+				error: `Failed to resolve extension path: ${safeErrorDescription(error)}`,
+			});
+			continue;
+		}
 		let stat: fs1.Stats | null = null;
 		try {
 			stat = await fs.stat(resolved);
 		} catch (err) {
-			if (!isEnoent(err)) throw err;
+			if (!isEnoent(err)) {
+				discoveryErrors.push({
+					path: resolved,
+					error: `Failed to inspect extension path: ${safeErrorDescription(err)}`,
+				});
+				continue;
+			}
 		}
 
 		if (stat?.isDirectory()) {
-			const entries = await resolveExtensionEntries(resolved);
-			if (entries) {
-				addPaths(entries);
-				continue;
-			}
+			try {
+				const entries = await resolveExtensionEntries(resolved);
+				if (entries) {
+					addPaths(entries);
+					continue;
+				}
 
-			const discovered = await discoverExtensionsInDir(resolved);
-			if (discovered.length > 0) {
-				addPaths(discovered);
+				const discovered = await discoverExtensionsInDir(resolved);
+				if (discovered.length > 0) {
+					addPaths(discovered);
+				}
+			} catch (error) {
+				// Directory entry resolution rethrows non-ENOENT/EACCES/EPERM faults
+				// (ELOOP, ENAMETOOLONG, EIO). Record the offending directory and keep the
+				// modules every other source contributes instead of aborting the pass.
+				discoveryErrors.push({
+					path: resolved,
+					error: `Failed to inspect extension entries: ${safeErrorDescription(error)}`,
+				});
 			}
 			continue;
 		}
@@ -798,5 +859,6 @@ export async function discoverAndLoadExtensions(
 		addPath(resolved);
 	}
 
-	return loadExtensions(allPaths, cwd, eventBus);
+	const result = await loadExtensions(allPaths, cwd, eventBus);
+	return discoveryErrors.length === 0 ? result : { ...result, errors: [...discoveryErrors, ...result.errors] };
 }
