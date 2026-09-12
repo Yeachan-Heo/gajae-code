@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
 import { getBundledModel, type Model } from "@gajae-code/ai";
+import type { ModelProfileDefinition } from "@gajae-code/coding-agent/config/model-profiles";
 import type { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { ModelSelectorComponent } from "@gajae-code/coding-agent/modes/components/model-selector";
@@ -129,6 +130,169 @@ async function replay(renderScope?: "layout"): Promise<Capture[]> {
 		terminal.reset();
 	}
 }
+
+async function replayPresetLanding(renderScope?: "layout"): Promise<Capture[]> {
+	const terminal = new VirtualTerminal(100, 40);
+	const tui = new TUI(terminal, false, { widthSettleMs: 0 });
+	const transcript = new CountingTranscript();
+	transcript.addChild(
+		new Text(Array.from({ length: 2_000 }, (_, i) => `履歴 ${i}: 漢字 transcript`).join("\n"), 0, 0),
+	);
+	const statusLine = new Text("Pinned session status", 0, 0);
+	const composer = new Container();
+	tui.addChild(transcript);
+	tui.addChild(statusLine);
+	tui.addChild(composer);
+	tui.setViewportAnchorComponent(transcript);
+	tui.setBottomPinnedComponent(statusLine);
+	tui.setViewportOutputSource({ identity: "session:preset-layout", revision: 0n });
+	const loaded = Promise.withResolvers<void>();
+	let auth = Promise.withResolvers<string | undefined>();
+	let catalogChanged: () => void = () => {};
+	let authChanged: () => void = () => {};
+	const model = getBundledModel("openai", "gpt-4o");
+	const profile: ModelProfileDefinition = {
+		name: "custom-alpha",
+		displayName: "Profile Alpha",
+		providerGroup: "Alpha presets",
+		requiredProviders: ["openai"],
+		modelMapping: { default: "openai/gpt-4o" },
+		source: "user",
+	};
+	const profiles = new Map([[profile.name, profile]]);
+	const registry = {
+		refreshStatic: () => loaded.promise,
+		getError: () => undefined,
+		getAvailable: () => [model],
+		getAll: () => [model],
+		getModelProfiles: () => profiles,
+		getModelProfile: (name: string) => profiles.get(name),
+		getAvailableModelProfileNames: () => [...profiles.keys()],
+		getCanonicalModels: () => [],
+		getCanonicalModelSelections: () => [],
+		resolveCanonicalModel: () => undefined,
+		getDiscoverableProviders: () => [],
+		hasConfiguredProviderAuth: () => false,
+		getApiKeyForProvider: () => auth.promise,
+		onCatalogChanged: (callback: () => void) => {
+			catalogChanged = callback;
+			return () => {
+				catalogChanged = () => {};
+			};
+		},
+		authStorage: {
+			onGenerationChanged: (callback: () => void) => {
+				authChanged = callback;
+				return () => {
+					authChanged = () => {};
+				};
+			},
+		},
+	} as unknown as ModelRegistry;
+	const captures: Capture[] = [];
+	try {
+		tui.start();
+		await terminal.waitForRender();
+		// Omit temporaryOnly and all other view overrides: production opens presets.
+		const selector = new ModelSelectorComponent(
+			tui,
+			model,
+			Settings.isolated(),
+			registry,
+			[],
+			() => {},
+			() => {},
+			{ renderScope },
+		);
+		composer.addChild(selector);
+		tui.setFocus(selector);
+		tui.requestRender();
+		await terminal.waitForRender();
+		const openingRenders = transcript.renders;
+		const openingHeight = selector.render(100).length;
+		const capture = (frame: number) => {
+			const viewport = terminal.getViewport().join("\n");
+			expect(viewport).toContain("Model presets");
+			expect(viewport).toContain("Alpha presets");
+			expect(viewport).toContain("Pinned session status");
+			expect(transcript.renders).toBe(openingRenders + (renderScope ? 0 : frame));
+			captures.push({
+				viewport: terminal.getViewportAnsi(),
+				scrollback: terminal.getScrollBuffer(),
+				writes: terminal.getWriteLog(),
+			});
+		};
+		terminal.clearWriteLog();
+		profiles.set("custom-beta", {
+			...profile,
+			name: "custom-beta",
+			displayName: "Profile Beta",
+			providerGroup: "Beta presets",
+		});
+		loaded.resolve();
+		await terminal.waitForRender();
+		expect(selector.render(100).length).toBeGreaterThan(openingHeight);
+		expect(terminal.getViewport().join("\n")).toContain("Beta presets");
+		capture(1);
+
+		terminal.clearWriteLog();
+		auth.resolve("test-key");
+		await terminal.waitForRender();
+		expect(terminal.getViewport().find(line => line.includes("Alpha presets"))).toContain("✓");
+		capture(2);
+
+		terminal.clearWriteLog();
+		auth = Promise.withResolvers<string | undefined>();
+		authChanged();
+		auth.resolve(undefined);
+		await terminal.waitForRender();
+		expect(terminal.getViewport().find(line => line.includes("Alpha presets"))).toContain("✗");
+		capture(3);
+
+		terminal.clearWriteLog();
+		profiles.delete("custom-beta");
+		catalogChanged();
+		await terminal.waitForRender();
+		expect(selector.render(100).length).toBe(openingHeight);
+		expect(terminal.getViewport().join("\n")).not.toContain("Beta presets");
+		capture(4);
+		return captures;
+	} finally {
+		loaded.resolve();
+		auth.resolve(undefined);
+		tui.stop();
+		tui.dispose();
+		terminal.reset();
+	}
+}
+
+test("default preset landing reuses history across catalog and auth refreshes with identical pinned terminal output", async () => {
+	const previousTheme = theme;
+	const testTheme = await getThemeByName("red-claw");
+	if (!testTheme) throw new Error("Missing test theme");
+	setThemeInstance(testTheme);
+	try {
+		const full = await replayPresetLanding();
+		const layout = await replayPresetLanding("layout");
+		expect(layout).toEqual(full);
+		if (Bun.env.GJC_MODEL_SELECTOR_RENDER_REPORT) {
+			await Bun.write(
+				`${Bun.env.GJC_MODEL_SELECTOR_RENDER_REPORT}.presets.json`,
+				JSON.stringify(
+					{
+						scenarios: ["static-catalog-growth", "auth-available", "auth-revoked", "catalog-shrink"],
+						full,
+						layout,
+					},
+					null,
+					2,
+				),
+			);
+		}
+	} finally {
+		setThemeInstance(previousTheme);
+	}
+});
 
 test("composer model refreshes reuse the transcript with identical terminal output and conservative invalidation", async () => {
 	const previousTheme = theme;
