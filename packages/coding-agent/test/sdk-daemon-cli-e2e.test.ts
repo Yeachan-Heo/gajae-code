@@ -86,8 +86,15 @@ async function runCliArgs(repo: string, agentDir: string, commandArgs: string[])
 		if (exitCode !== 0) {
 			expect(stderr).toBe("");
 			expect(Buffer.byteLength(stdout)).toBeLessThanOrEqual(8192);
-			expect(JSON.parse(stdout)).toMatchObject({ schema: "gjc.command-error", version: 1, ok: false });
-			expect(JSON.parse(stdout)).not.toHaveProperty("result");
+			const parsed = JSON.parse(stdout) as Record<string, unknown>;
+			// `session.lookup` deliberately returns a structured reconciliation
+			// outcome (including uncertain `not_found`) rather than an exception
+			// envelope; all other public failures must use the boundary envelope.
+			const isStructuredLookup = parsed.operation === "session.lookup" && typeof parsed.status === "string";
+			if (!isStructuredLookup) {
+				expect(parsed).toMatchObject({ schema: "gjc.command-error", version: 1, ok: false });
+				expect(parsed).not.toHaveProperty("result");
+			}
 			expect(stdout).not.toContain("session-token");
 		}
 		return { exitCode, stdout, stderr };

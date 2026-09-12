@@ -36,7 +36,7 @@ import {
 import { processIncarnation } from "../sdk/broker/process-incarnation";
 import { writeBrokerStartupFailureMarker } from "../sdk/broker/startup-failure";
 import { renderSdkSearchTable, runSdkSearch, runSdkSessionCli } from "../sdk/cli";
-import { renderSpawnTable, runSdkSpawn } from "../sdk/cli/master-cli";
+import { renderSpawnTable, runSdkSpawn, SdkMasterCliError } from "../sdk/cli/master-cli";
 import { runSdkGuidesCli } from "../sdk/guides/cli";
 import { type CreateLifecycleAgentSessionResult, createLifecycleAgentSession } from "../sdk/lifecycle-session";
 import { listManagedSessionCandidates, resolveManagedSessionScope } from "../sdk/session-directory";
@@ -1171,6 +1171,8 @@ export default class Sdk extends Command {
 					strict: Boolean(flags.strict),
 					untilIdle: Boolean(flags["until-idle"]),
 					allEvents: Boolean(flags["all-events"]),
+					page: Boolean(flags.page),
+					limit: flags.limit as number | undefined,
 					agentDir: stringFlag("agent-dir"),
 					repo: stringFlag("repo"),
 					scope: stringFlag("scope"),

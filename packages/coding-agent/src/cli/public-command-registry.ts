@@ -407,8 +407,16 @@ export const PUBLIC_COMMANDS: readonly PublicCommandDescriptor[] = [
 				required: true,
 			}),
 			"idempotency-key": idempotency,
+			page: booleanFlag("Return exactly one broker session.list page instead of draining continuation pages."),
+			limit: {
+				kind: "integer",
+				description: "Raw session.list page size, 1 through 100.",
+				validation: "search-limit",
+			},
+			cursor: stringFlag("Raw session.list continuation cursor."),
 		},
-		syntax: "--op <operation> [--json-input <object>] [--idempotency-key <key>]",
+		syntax:
+			"--op <operation> [--json-input <object>] [--idempotency-key <key>] [--page] [--limit <N>] [--cursor <cursor>]",
 		risk: "Lifecycle globals can create, close, delete or retire sessions; inspect uncertain results before replay.",
 		recovery: mutationRecovery,
 		constraints: [
