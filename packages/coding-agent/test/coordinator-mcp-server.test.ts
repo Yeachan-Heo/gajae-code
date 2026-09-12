@@ -8908,7 +8908,7 @@ describe("Coordinator MCP deep-audit regressions", () => {
 				["darwin", false],
 				["win32", false],
 			] as const) {
-				Object.defineProperty(process, "platform", { ...originalPlatform, value: platform });
+				Object.defineProperty(process, "platform", originalPlatform);
 				const server = await createSdkControlServer(
 					await tempRoot(),
 					[],
@@ -8921,6 +8921,10 @@ describe("Coordinator MCP deep-audit regressions", () => {
 						platform,
 					},
 				);
+				// Namespace setup uses the real host addon; only artifact capability
+				// discovery and refusal below simulate another platform.
+				expect(await server.callTool("gjc_coordinator_list_artifacts")).toMatchObject({ ok: true });
+				Object.defineProperty(process, "platform", { ...originalPlatform, value: platform });
 				const discovery = await server.handleJsonRpc({ jsonrpc: "2.0", id: platform, method: "tools/list" });
 				const artifact = (discovery.result as { tools: Array<Record<string, unknown>> }).tools.find(
 					tool => tool.name === "gjc_coordinator_read_artifact",

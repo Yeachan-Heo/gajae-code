@@ -1677,7 +1677,21 @@ export class SessionIndex {
 			});
 		});
 	}
-	async unregisterIfCurrent(expected: IndexedSession): Promise<boolean> {
+	async unregisterIfCurrent(
+		expected: Pick<
+			SessionIndexEvent,
+			| "sessionId"
+			| "locator"
+			| "endpointGeneration"
+			| "pid"
+			| "indexSeq"
+			| "endpointMtimeMs"
+			| "endpointFileId"
+			| "lifecycleRequestId"
+			| "processIncarnation"
+			| "hostIncarnation"
+		>,
+	): Promise<boolean> {
 		const indexPath = path.resolve(logFor(this.#agentDir));
 		return await SessionIndex.#enqueue(indexPath, async () => {
 			await fs.mkdir(dirFor(this.#agentDir), { recursive: true, mode: 0o700 });
@@ -1706,6 +1720,7 @@ export class SessionIndex {
 						session.endpointGeneration === expected.endpointGeneration &&
 						session.pid === expected.pid &&
 						session.endpointMtimeMs === expected.endpointMtimeMs &&
+						session.endpointFileId === expected.endpointFileId &&
 						session.lifecycleRequestId === expected.lifecycleRequestId &&
 						session.processIncarnation === expected.processIncarnation &&
 						(session.hostIncarnation ?? session.processIncarnation) ===
@@ -1752,6 +1767,7 @@ export class SessionIndex {
 						: { processIncarnation: expected.processIncarnation }),
 					...(expected.hostIncarnation === undefined ? {} : { hostIncarnation: expected.hostIncarnation }),
 					...(expected.endpointMtimeMs === undefined ? {} : { endpointMtimeMs: expected.endpointMtimeMs }),
+					...(expected.endpointFileId === undefined ? {} : { endpointFileId: expected.endpointFileId }),
 					...(expected.lifecycleRequestId === undefined
 						? {}
 						: { lifecycleRequestId: expected.lifecycleRequestId }),
@@ -2084,6 +2100,7 @@ export class SessionIndex {
 			| "processIncarnation"
 			| "hostIncarnation"
 			| "endpointMtimeMs"
+			| "endpointFileId"
 			| "lifecycleRequestId"
 		>,
 	): { type: "host_unregistered" | "session_closed" | "session_deleted"; indexSeq: number } | undefined {
@@ -2105,6 +2122,7 @@ export class SessionIndex {
 					event.type === "session_closed" ||
 					event.type === "session_deleted") &&
 				(event.hostIncarnation ?? event.processIncarnation) === expectedIncarnation &&
+				event.endpointFileId === expected.endpointFileId &&
 				(supersededAt === undefined || event.indexSeq < supersededAt) &&
 				!followsApplicableTombstone(
 					this.#events,
@@ -2153,6 +2171,7 @@ export class SessionIndex {
 			| "processIncarnation"
 			| "hostIncarnation"
 			| "endpointMtimeMs"
+			| "endpointFileId"
 			| "lifecycleRequestId"
 		>,
 	): number | undefined {
@@ -2170,6 +2189,7 @@ export class SessionIndex {
 		return this.#events.findLast(
 			event =>
 				event.type === "session_closed" &&
+				event.endpointFileId === expected.endpointFileId &&
 				(supersededAt === undefined || event.indexSeq < supersededAt) &&
 				!followsApplicableTombstone(
 					this.#events,
@@ -2318,6 +2338,7 @@ export class SessionIndex {
 			| "lifecycleRequestId"
 			| "hostIncarnation"
 			| "processIncarnation"
+			| "endpointFileId"
 		>,
 	): { indexSeq: number; lifecycleRequestId?: string } | undefined {
 		const lifecycleRequestId = registration.lifecycleRequestId;
@@ -2329,6 +2350,7 @@ export class SessionIndex {
 				item.sessionId === registration.sessionId &&
 				item.endpointGeneration === registration.endpointGeneration &&
 				item.pid === registration.pid &&
+				item.endpointFileId === registration.endpointFileId &&
 				resolveEquivalentPath(item.locator.cwd) === resolveEquivalentPath(registration.locator.cwd) &&
 				path.resolve(item.locator.stateRoot) === path.resolve(registration.locator.stateRoot) &&
 				(lifecycleRequestId === undefined || item.lifecycleRequestId === lifecycleRequestId) &&
