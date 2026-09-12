@@ -526,7 +526,7 @@
     "telegram:packages/coding-agent/src/sdk/bus/daemon-paths.ts:HEARTBEAT_TTL_MS": "62255b5467995d21d3f929c863278ca3e815102001c51ca6d66840e1522ff990",
     "telegram:packages/coding-agent/src/sdk/bus/daemon-paths.ts:daemonPaths": "1bd6ae51096fedb95d47149b977f8a40e7f814a774ecfce21e027aac268b0379",
     "telegram:packages/coding-agent/src/sdk/bus/index.ts:buildIdentity": "246ad10dd6341037a20379a8544736039584d36482f6b2d44e3054f5e7f87724",
-    "telegram:packages/coding-agent/src/sdk/bus/index.ts:createNotificationsExtension": "95e0083499902fb39035dce981dc87d1f236ab2b428578fbffbcc9365461eb63",
+    "telegram:packages/coding-agent/src/sdk/bus/index.ts:createNotificationsExtension": "cb93253d36ad2f3d8f30be3e6ce7ec542e3b6ee9d4bd13c52d9d8494dfa7ad13",
     "telegram:packages/coding-agent/src/sdk/bus/notification-service.ts:DaemonTransitionLock": "0fb018a6384bff312aab0345012936f7e0609e4691c841919426ad3d75841dcb",
     "telegram:packages/coding-agent/src/sdk/bus/notification-service.ts:NATIVE_PATH_IDENTITY_CONTRACT_VERSION": "ec669ef396909ce429e08ce4fa9a78b5f0106d8cedf967e634c6ae6974830b8a",
     "telegram:packages/coding-agent/src/sdk/bus/notification-service.ts:acquireDaemonTransitionLock": "0115500fcb5c5797008d607bd69694579c5b372420310f265d33a4759364decc",
@@ -649,7 +649,7 @@
     "telegram:packages/coding-agent/src/sdk/host/host.ts:TOOL_ACTIVITY_CAPABILITY": "547f80bd6b3bd1c615fc3d885e507aba4418e6c4c54c47d36938b8b2e5d2abd7"
   },
   "nativeAuthoritySha256": {
-    "crates/pi-natives/src/path_identity.rs": "e3444477ea9571d0da96dd1d6ac8cc07d7ed28354e829d87b54a0a7b281c9df9",
+    "crates/pi-natives/src/path_identity.rs": "fecf0e3cb7ebc4d8ad25a2763bc7e61241b56684eacb3c2d74b1bd19794728b3",
     "crates/pi-natives/src/ps.rs": "7696078e123b9beecc7252371c71eab2cec590413be6e6ddf4692ff6fe8c41e1",
     "crates/pi-shell/src/process.rs": "89aa0bc8a17e0ab6ac4165d8e5b56054158166ad9ed7449238c979ca706fa92d",
     "crates/pi-shell/src/shell.rs": "502819bf16cfe7ab92ff55adead41fe203ad2ddfac2e604609777694aa03e7a5",
