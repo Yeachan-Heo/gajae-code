@@ -116,6 +116,35 @@ describe("AgentSession switchSession resumeModelBehavior", () => {
 		expect(await session.switchSession(sessionFile)).toBe(true);
 		expect(session.model?.id).toBe(sonnet.id);
 		expect(session.getDefaultFallbackRuntimeState().chain.entries).toEqual(configuredEntries);
+		expect(session.getConfiguredModelChainState("default")).toMatchObject({
+			entries: ["unknown-provider/saved-model"],
+			origin: "legacy_session",
+		});
+	});
+
+	it("cleans a predecessor session profile before resolving useCurrentDefault", async () => {
+		const sonnet = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const opus = getBundledModel("anthropic", "claude-opus-4-8")!;
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"session.resumeModelBehavior": "useCurrentDefault",
+		});
+		const sessionFile = await createPersistedTarget(sonnet, settings);
+		settings.setModelRole("default", `${opus.provider}/${opus.id}`);
+
+		session = new AgentSession({
+			agent: new Agent({ initialState: { model: sonnet, systemPrompt: ["Test"], tools: [], messages: [] } }),
+			sessionManager: SessionManager.create(tempDir.path(), tempDir.path()),
+			settings,
+			modelRegistry,
+		});
+		settings.override("modelRoles", { default: "unknown-provider/predecessor-model" });
+		session.setActiveModelProfile("session-only-profile", "session");
+		session.noteProfileInstalledOverrides(["default"], [], sonnet, { default: `${opus.provider}/${opus.id}` });
+		expect(settings.getModelRole("default")).toBe("unknown-provider/predecessor-model");
+
+		expect(await session.switchSession(sessionFile)).toBe(true);
+		expect(session.model?.id).toBe(opus.id);
 	});
 
 	it("retains a session-only active profile when useCurrentDefault reloads its runtime defaults", async () => {

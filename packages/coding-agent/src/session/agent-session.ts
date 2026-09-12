@@ -16257,7 +16257,11 @@ export class AgentSession {
 			},
 			{ profileScope: "session" },
 		);
-		return this.getActiveModelProfile() === profileName;
+		const canonicalProfileName = resolveModelProfileName(
+			profileName,
+			this.#modelRegistry.getModelProfiles?.() ?? new Map<string, unknown>(),
+		);
+		return this.getActiveModelProfile() === canonicalProfileName;
 	}
 
 	/**
@@ -16456,8 +16460,12 @@ export class AgentSession {
 	 * Seed default fallback state after guarded auth-aware model resolution skips chain entries.
 	 * The configured chain's role, origin, and identity are retained by the controller.
 	 */
-	seedDefaultFallbackResolution(activeIndex: number, skips: Array<{ selector: string; reason: string }>): void {
-		this.#seedDefaultFallbackResolutionForController(this.#defaultFallbackChain(), activeIndex, skips);
+	seedDefaultFallbackResolution(
+		activeIndex: number,
+		skips: Array<{ selector: string; reason: string }>,
+		emitEvent = true,
+	): void {
+		this.#seedDefaultFallbackResolutionForController(this.#defaultFallbackChain(), activeIndex, skips, emitEvent);
 	}
 
 	/** Seed an already-selected runtime controller without legacy-chain materialization. */
@@ -21105,10 +21113,13 @@ export class AgentSession {
 		const settingsEntries = normalizeModelSelectorValue(
 			this.settings.getModelRole("default") ?? (this.model ? formatModelString(this.model) : undefined),
 		);
+		const existing = this.#defaultFallbackController;
+		const settingsControllerActive = existing?.chain.origin === "settings";
 		const materializeSettingsChain =
 			configuredChain?.origin === "legacy_session" &&
 			configuredChain.entries.length === 1 &&
-			settingsEntries.length > 1;
+			settingsEntries.length > 1 &&
+			!settingsControllerActive;
 		if (materializeSettingsChain && materializeLegacyChain) {
 			this.setConfiguredModelChain("default", settingsEntries, "modelRoles");
 		}
@@ -21117,7 +21128,6 @@ export class AgentSession {
 			: configuredChain
 				? { ...configuredChain, entries: [...configuredChain.entries] }
 				: { role: "default", entries: settingsEntries, origin: "session", explicitHead: true };
-		const existing = this.#defaultFallbackController;
 		if (
 			existing &&
 			(existing.chain.origin === "runtime" ||
@@ -23751,6 +23761,7 @@ export class AgentSession {
 			let recoveredDefaultChainMessage: string | undefined;
 			let recoveredDefaultChain = false;
 			let fallbackResolutionController: FallbackChainController | undefined;
+			let profileCleanupAppliedBeforeResolution = false;
 			let transitionCleanupCommitted = false;
 
 			try {
@@ -23807,12 +23818,6 @@ export class AgentSession {
 
 				const resumeModelBehavior = this.settings.get("session.resumeModelBehavior");
 				const configuredDefaultChain = sessionContext.configuredModelChains.default;
-				const settingsDefaultEntries = normalizeModelSelectorValue(this.settings.getModelRole("default"));
-				const defaultEntries =
-					resumeModelBehavior === "useCurrentDefault"
-						? settingsDefaultEntries
-						: (configuredDefaultChain?.entries ??
-							(sessionContext.models.default ? [sessionContext.models.default] : []));
 				const profileDefinitions = this.#modelRegistry.getModelProfiles?.() ?? new Map<string, unknown>();
 				const configuredProfileName = this.settings.get("modelProfile.default");
 				const configuredProfileIdentity = configuredProfileName
@@ -23844,7 +23849,32 @@ export class AgentSession {
 							: configuredProfileIdentity === nextActiveModelProfile
 								? "durable"
 								: "session";
+				if (switchingToDifferentSession && resumeModelBehavior === "useCurrentDefault") {
+					const predecessorProfileWasSessionScoped =
+						previousActiveModelProfile !== undefined && previousActiveModelProfileScope !== "durable";
+					const preserveSuccessorProfile =
+						nextActiveModelProfile !== undefined && nextActiveModelProfileScope === "durable";
+					this.#resetSessionScopedModelProfileState({
+						preserveDefaultConfiguredChain: true,
+						forceCleanup: predecessorProfileWasSessionScoped,
+						...(preserveSuccessorProfile
+							? {
+									preserveActiveModelProfile: {
+										name: nextActiveModelProfile,
+										scope: "durable" as const,
+									},
+								}
+							: {}),
+					});
+					profileCleanupAppliedBeforeResolution = true;
+				}
 				this.setActiveModelProfile(nextActiveModelProfile, nextActiveModelProfileScope);
+				const settingsDefaultEntries = normalizeModelSelectorValue(this.settings.getModelRole("default"));
+				const defaultEntries =
+					resumeModelBehavior === "useCurrentDefault"
+						? settingsDefaultEntries
+						: (configuredDefaultChain?.entries ??
+							(sessionContext.models.default ? [sessionContext.models.default] : []));
 				this.#defaultFallbackController = undefined;
 				if (defaultEntries.length > 0) {
 					const resolution = await resolveModelChainWithAuth(
@@ -23991,7 +24021,7 @@ export class AgentSession {
 				// Switching to another session file must not carry the predecessor's
 				// profile marker or role overrides into the successor; the successor's
 				// own configured model is restored above.
-				if (switchingToDifferentSession) {
+				if (switchingToDifferentSession && !profileCleanupAppliedBeforeResolution) {
 					const predecessorProfileWasSessionScoped =
 						previousActiveModelProfile !== undefined && previousActiveModelProfileScope !== "durable";
 					const preserveSuccessorProfile =
@@ -24012,7 +24042,6 @@ export class AgentSession {
 				// Establish the successor's durable session identity only after every
 				// restored state facet is live. Identity-bound extension hooks run below.
 				await this.sessionManager.ensureOnDisk();
-				if (fallbackResolutionController) this.#emitResolutionFallbackSwitch(fallbackResolutionController);
 				if (!switchingToDifferentSession) await this.#initializeLocalRootForLoadedSession();
 
 				if (switchingToDifferentSession) {
@@ -24067,6 +24096,7 @@ export class AgentSession {
 						await this.#runToolSessionTransitionCleanups();
 					}
 				}
+				if (fallbackResolutionController) this.#emitResolutionFallbackSwitch(fallbackResolutionController);
 				this.#reconnectToAgent();
 				// Fence predecessor continuations before session_switch starts SDK runtime
 				// teardown. The previous runtime waits for those continuations to settle;

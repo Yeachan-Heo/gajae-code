@@ -3,7 +3,7 @@ import type { Api, Model } from "@gajae-code/ai/core";
 import { logger } from "@gajae-code/utils";
 import type { AgentSession, DefaultFallbackRuntimeState } from "../session/agent-session";
 import { clampExplicitThinkingLevelForModel, formatClampedModelSelector } from "../thinking";
-import { validateModelProfileName } from "./model-profile-contract";
+import { resolveModelProfileName, validateModelProfileName } from "./model-profile-contract";
 import {
 	aggregateModelProfileRequiredProviders,
 	deriveModelProfileMappedProviders,
@@ -68,7 +68,11 @@ type ModelProfileActivationSession = Pick<
 	syncEagerDelegation?: () => Promise<void>;
 	getSessionDefaultModelSelector?: () => string | undefined;
 	recordResumeDefaultModel?: (selector: string | undefined) => void;
-	seedDefaultFallbackResolution?: (activeIndex: number, skips: Array<{ selector: string; reason: string }>) => void;
+	seedDefaultFallbackResolution?: (
+		activeIndex: number,
+		skips: Array<{ selector: string; reason: string }>,
+		emitEvent?: boolean,
+	) => void;
 	getDefaultFallbackRuntimeState?: () => DefaultFallbackRuntimeState;
 	restoreDefaultFallbackRuntimeState?: (state: DefaultFallbackRuntimeState) => void;
 	restoreModelSelectionForRollback?: AgentSession["restoreModelSelectionForRollback"];
@@ -1371,6 +1375,7 @@ export async function applyPreparedModelProfileActivation(
 	let persistentMutationStarted = false;
 	let defaultChainChanged = false;
 	let resumeDefaultChanged = false;
+	let fallbackResolutionSeeded = false;
 
 	try {
 		const ownedDefaultChain =
@@ -1391,7 +1396,9 @@ export async function applyPreparedModelProfileActivation(
 				prepared.session.seedDefaultFallbackResolution?.(
 					prepared.defaultActiveIndex,
 					prepared.defaultResolutionSkips,
+					false,
 				);
+				fallbackResolutionSeeded = true;
 			}
 		}
 		if (prepared.defaultModel) {
@@ -1443,6 +1450,13 @@ export async function applyPreparedModelProfileActivation(
 			prepared.baseModelRoles,
 			prepared.baseAgentModelOverrides,
 		);
+		if (fallbackResolutionSeeded) {
+			prepared.session.seedDefaultFallbackResolution?.(
+				prepared.defaultActiveIndex!,
+				prepared.defaultResolutionSkips,
+				true,
+			);
+		}
 	} catch (error) {
 		const rollbackErrors: unknown[] = [];
 		const restore = (action: () => void): void => {
@@ -1642,7 +1656,11 @@ export async function materializeModelProfileForDeletion(
 	const deletesOwnedDefaultChain =
 		prepared.defaultChain.length === 0 &&
 		prepared.previousDefaultChainState?.origin === "profile-activation" &&
-		prepared.previousDefaultChainState.identity === prepared.profileName;
+		prepared.previousDefaultChainState.identity !== undefined &&
+		resolveModelProfileName(
+			prepared.previousDefaultChainState.identity,
+			prepared.modelRegistry.getModelProfiles(),
+		) === prepared.profileName;
 	let defaultChainChanged = false;
 
 	try {

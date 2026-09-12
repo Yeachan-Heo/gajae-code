@@ -186,7 +186,12 @@ function fakeSession(initial = model("provider-a", "initial")) {
 			this.configuredModelChains.set(role, [...entries]);
 			this.configuredModelChainStates.set(role, { entries: [...entries], origin, identity, explicitHead });
 		},
-		seedDefaultFallbackResolution(activeIndex: number, skips: Array<{ selector: string; reason: string }>) {
+		seedDefaultFallbackResolution(
+			activeIndex: number,
+			skips: Array<{ selector: string; reason: string }>,
+			emitEvent = true,
+		) {
+			if (!emitEvent) return;
 			this.seedDefaultFallbackResolutionCalls.push({ activeIndex, skips });
 		},
 		async setModelTemporary(next: Model, thinkingLevel?: ThinkingLevel) {
@@ -2552,7 +2557,30 @@ describe("preset-equivalent profile activation", () => {
 		expect(session.getActiveModelProfileScope()).toBe("session");
 	});
 
-	// A transient live-model switch (no canonical identity, unrelated to the
+	test("activation flush failure does not publish a fallback event", async () => {
+		const profile: ModelProfileDefinition = {
+			name: "event-rollback-profile",
+			requiredProviders: ["provider-a", "provider-c"],
+			modelMapping: { default: ["provider-a/missing", "provider-c/default"] },
+			source: "user",
+		};
+		const session = fakeSession();
+		const settings = Settings.isolated();
+		const prepared = await prepareModelProfileActivation({
+			session,
+			modelRegistry: fakeRegistry({ profiles: [profile] }),
+			settings,
+			profileName: profile.name,
+		});
+		vi.spyOn(settings, "flushOrThrow").mockRejectedValueOnce(new Error("flush failed"));
+
+		await expect(applyPreparedModelProfileActivation(prepared, { persistDefault: true })).rejects.toThrow(
+			"flush failed",
+		);
+		expect(session.seedDefaultFallbackResolutionCalls).toEqual([]);
+	});
+
+	// A transient live model switch (no canonical identity, unrelated to the
 	// prior selection) must not clobber the exactly-sticky provider on rollback.
 	test("transient live model cannot clobber the prior sticky on rollback", async () => {
 		const profile: ModelProfileDefinition = {
@@ -2654,7 +2682,7 @@ describe("preset-equivalent profile activation", () => {
 
 	test("role-only profile deletion clears its identity-bearing default chain", async () => {
 		const profile: ModelProfileDefinition = {
-			name: "role-only-profile",
+			name: "codex-medium",
 			requiredProviders: ["provider-b"],
 			modelMapping: { executor: "provider-b/executor" },
 			source: "user",
@@ -2663,7 +2691,7 @@ describe("preset-equivalent profile activation", () => {
 		const registry = fakeRegistry({ profiles: [profile] });
 		const settings = Settings.isolated();
 		session.setActiveModelProfile(profile.name, "session");
-		session.setConfiguredModelChain("default", ["provider-a/default"], "profile-activation", profile.name);
+		session.setConfiguredModelChain("default", ["provider-a/default"], "profile-activation", "codex-standard");
 
 		await materializeModelProfileForDeletion({
 			session,
