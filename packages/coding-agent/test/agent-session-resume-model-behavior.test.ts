@@ -145,6 +145,7 @@ describe("AgentSession switchSession resumeModelBehavior", () => {
 
 		expect(await session.switchSession(sessionFile)).toBe(true);
 		expect(session.model?.id).toBe(opus.id);
+		expect(session.getActiveModelProfile()).toBeUndefined();
 	});
 
 	it("retains a session-only active profile when useCurrentDefault reloads its runtime defaults", async () => {

@@ -23832,9 +23832,11 @@ export class AgentSession {
 				const persistedProfileIdentity = configuredDefaultChain?.identity
 					? resolveModelProfileName(configuredDefaultChain.identity, profileDefinitions)
 					: undefined;
-				const liveProfileIdentity = previousActiveModelProfile
-					? resolveModelProfileName(previousActiveModelProfile, profileDefinitions)
-					: undefined;
+				const liveProfileIdentity =
+					previousActiveModelProfile &&
+					!(switchingToDifferentSession && previousActiveModelProfileScope !== "durable")
+						? resolveModelProfileName(previousActiveModelProfile, profileDefinitions)
+						: undefined;
 				const nextActiveModelProfile =
 					resumeModelBehavior === "useCurrentDefault"
 						? liveProfileIdentity && profileDefinitions.has(liveProfileIdentity)
