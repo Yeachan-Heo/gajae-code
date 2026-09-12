@@ -317,6 +317,40 @@ describe("AgentSession switchSession resumeModelBehavior", () => {
 		expect(settings.get("task.agentModelOverrides")).toMatchObject({ executor: `${sonnet.provider}/${sonnet.id}` });
 	});
 
+	it("preserves an already recovered runtime chain when the next switch fails", async () => {
+		const sonnet = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const codex = getBundledModel("openai-codex", "gpt-5.6-sol")!;
+		authStorage.setRuntimeApiKey("openai-codex", "test-key");
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"modelProfile.default": "codex-medium",
+			"session.resumeModelBehavior": "keepSessionModel",
+		});
+		const recoveredFile = await createPersistedTarget(sonnet, settings);
+		await targetSession!.dispose();
+		targetSession = undefined;
+		const rejectedFile = await createPersistedTarget(codex, settings);
+		session = new AgentSession({
+			agent: new Agent({ initialState: { model: sonnet, systemPrompt: ["Test"], tools: [], messages: [] } }),
+			sessionManager: SessionManager.create(tempDir.path(), tempDir.path()),
+			settings,
+			modelRegistry,
+		});
+		vi.spyOn(modelRegistry, "getAvailable").mockReturnValue([codex]);
+		vi.spyOn(modelRegistry, "getAll").mockReturnValue([codex]);
+		expect(await session.switchSession(recoveredFile)).toBe(true);
+		const recoveredRuntimeState = session.getDefaultFallbackRuntimeState();
+		const savedChain = session.getConfiguredModelChainState("default");
+		expect(recoveredRuntimeState.chain).toMatchObject({ origin: "runtime", identity: "codex-medium" });
+		vi.spyOn(session.sessionManager, "ensureOnDisk").mockRejectedValueOnce(new Error("disk commit failed"));
+
+		await expect(session.switchSession(rejectedFile)).rejects.toThrow("disk commit failed");
+		expect(session.sessionFile).toBe(recoveredFile);
+		expect(session.model?.id).toBe(codex.id);
+		expect(session.getConfiguredModelChainState("default")).toEqual(savedChain);
+		expect(session.getDefaultFallbackRuntimeState()).toEqual(recoveredRuntimeState);
+	});
+
 	it("does not recover a saved selector that still exists in the full catalog", async () => {
 		const sonnet = getBundledModel("anthropic", "claude-sonnet-4-5")!;
 		const settings = Settings.isolated({

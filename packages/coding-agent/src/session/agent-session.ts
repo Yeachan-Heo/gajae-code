@@ -23632,6 +23632,7 @@ export class AgentSession {
 			const previousScheduledHiddenNextTurnGeneration = this.#scheduledHiddenNextTurnGeneration;
 			const previousModel = this.model;
 			const previousThinkingLevel = this.#thinkingLevel;
+			const previousDefaultFallbackRuntimeState = this.getDefaultFallbackRuntimeState();
 			const previousActiveModelProfile = this.#activeModelProfile;
 			// Different-file cleanup drops session-only profile state before the
 			// successor is committed. Preserve exactly that mutable predecessor
@@ -23996,7 +23997,7 @@ export class AgentSession {
 					);
 				}
 				await this.sessionManager.restoreRollbackState(previousSessionState);
-				this.#defaultFallbackController = undefined;
+				this.restoreDefaultFallbackRuntimeState(previousDefaultFallbackRuntimeState);
 				this.#syncAgentSessionId(previousSessionState.sessionId);
 				this.#activeModelProfile = previousActiveModelProfile;
 				this.#activeProfileInstalledRoles = previousProfileInstalledRoles;
