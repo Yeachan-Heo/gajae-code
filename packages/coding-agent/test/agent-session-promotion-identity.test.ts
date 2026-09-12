@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it, setDefaultTimeout } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, setDefaultTimeout, vi } from "bun:test";
 import * as path from "node:path";
 import type { AgentMessage, AgentTool } from "@gajae-code/agent-core";
 import { Agent } from "@gajae-code/agent-core";
@@ -10,7 +10,7 @@ import type { QueuedInputSubmission } from "@gajae-code/coding-agent/sdk";
 import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
-import { TempDir } from "@gajae-code/utils";
+import { TempDir, withTimeout } from "@gajae-code/utils";
 import { z } from "zod";
 import { createSdkRunCapability } from "../src/sdk/host/sdk-run-capability";
 
@@ -55,6 +55,7 @@ describe("queued promotion run identity (#4668)", () => {
 		tool: AgentTool<typeof echoSchema, EchoParams>,
 		settings = Settings.isolated({ "compaction.enabled": false }),
 		sessionManager = SessionManager.inMemory(),
+		extensionRunner?: unknown,
 	): AgentSession {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
 		if (!model) throw new Error("Expected bundled Anthropic test model to exist");
@@ -65,10 +66,19 @@ describe("queued promotion run identity (#4668)", () => {
 			streamFn: mock.stream,
 		});
 		settings.setModelRole("default", `${model.provider}/${model.id}`);
-		return new AgentSession({ agent, sessionManager, settings, modelRegistry });
+		return new AgentSession({
+			agent,
+			sessionManager,
+			settings,
+			...(extensionRunner ? { extensionRunner: extensionRunner as never } : {}),
+			modelRegistry,
+		});
 	}
 
-	function buildAbortableTrackedTransitionFixture(sessionManager = SessionManager.inMemory()) {
+	function buildAbortableTrackedTransitionFixture(
+		sessionManager = SessionManager.inMemory(),
+		extensionRunner?: unknown,
+	) {
 		const firstGate = Promise.withResolvers<void>();
 		const secondGate = Promise.withResolvers<void>();
 		const firstToolStarted = Promise.withResolvers<void>();
@@ -106,6 +116,7 @@ describe("queued promotion run identity (#4668)", () => {
 				transitionTool,
 				undefined,
 				sessionManager,
+				extensionRunner,
 			),
 			firstGate,
 			secondGate,
@@ -1166,6 +1177,70 @@ describe("queued promotion run identity (#4668)", () => {
 		});
 		fixture.secondGate.resolve();
 		await compaction;
+		await promptDone;
+	});
+
+	it("preserves a still-queued tracked steer through manual compaction", async () => {
+		const sessionManager = SessionManager.inMemory();
+		const history: AgentMessage[] = [
+			{ role: "user", content: "old context ".repeat(100), timestamp: 1 },
+			{ role: "user", content: "recent context", timestamp: 2 },
+		];
+		const extensionRunner = {
+			hasHandlers: vi.fn((eventType: string) => eventType === "session_before_compact"),
+			hasToolResultMediation: vi.fn().mockReturnValue(false),
+			emitBeforeAgentStart: vi.fn().mockImplementation(async () => {
+				return { messages: [] };
+			}),
+			emit: vi.fn().mockImplementation(async (event: unknown) => {
+				const preparation = (event as { preparation?: { firstKeptEntryId: string; tokensBefore: number } })
+					.preparation;
+				if (!preparation) return undefined;
+				return {
+					compaction: {
+						summary: "compacted summary",
+						shortSummary: "compacted",
+						firstKeptEntryId: preparation.firstKeptEntryId,
+						tokensBefore: preparation.tokensBefore,
+						details: {},
+					},
+				};
+			}),
+		};
+		const fixture = buildAbortableTrackedTransitionFixture(sessionManager, extensionRunner);
+		session = fixture.session;
+		for (const message of history) sessionManager.appendMessage(message);
+		session.settings.override("compaction.keepRecentTokens", 1);
+
+		const promptDone = session.prompt("first task").catch(() => {});
+		await withTimeout(fixture.firstToolStarted.promise, 5_000, "compaction queued test first tool");
+		const submission = await session.submitUserMessage("queued through compact", {
+			deliverAs: "steer",
+			trackSubmission: true,
+		});
+		expect(session.agent.snapshotSteering()).toHaveLength(1);
+
+		const compaction = session.compact();
+		await Bun.sleep(1);
+		fixture.firstGate.resolve();
+		await expect(withTimeout(compaction, 5_000, "compaction queued test compact")).resolves.toMatchObject({
+			summary: "compacted summary",
+		});
+		expect(session.messages.some(message => message.role === "compactionSummary")).toBe(true);
+		expect(session.agent.snapshotSteering()).toHaveLength(1);
+		const resume = session.prompt("resume after compact").catch(() => {});
+		await expect(withTimeout(submission.execution, 5_000, "compaction queued test execution")).resolves.toMatchObject(
+			{
+				submissionId: submission.submissionId,
+				disposition: "joined-current-run",
+			},
+		);
+		fixture.secondGate.resolve();
+		await expect(withTimeout(submission.terminal, 5_000, "compaction queued test terminal")).resolves.toMatchObject({
+			submissionId: submission.submissionId,
+			disposition: "completed",
+		});
+		await resume;
 		await promptDone;
 	});
 
