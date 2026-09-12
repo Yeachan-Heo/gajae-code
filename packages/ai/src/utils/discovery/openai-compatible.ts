@@ -242,8 +242,8 @@ export async function fetchOpenAICompatibleModels<TApi extends Api>(
 			method: "GET",
 			headers: requestHeaders,
 			signal: options.signal
-				? AbortSignal.any([options.signal, AbortSignal.timeout(5_000)])
-				: AbortSignal.timeout(5_000),
+				? AbortSignal.any([options.signal, AbortSignal.timeout(MODELS_LIST_REQUEST_TIMEOUT_MS)])
+				: AbortSignal.timeout(MODELS_LIST_REQUEST_TIMEOUT_MS),
 		});
 	} catch {
 		return null;
