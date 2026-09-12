@@ -79,6 +79,7 @@ import type {
 	LifecycleWorktreeIntent,
 } from "./lifecycle-ledger";
 import {
+	observeProcessIncarnation,
 	type ProcessIncarnationCommandRunner,
 	type ProcessIncarnationOptions,
 	parseDarwinProcessIncarnation,
@@ -2537,6 +2538,13 @@ function validateLifecycleMetadataReplay(cleanup: CleanupEvidence): BrokerRespon
 				return fail("terminal_uncertain", "Lifecycle metadata candidate could not be safely inspected.");
 			}
 			if (!current) continue;
+			if (
+				file.completed &&
+				path.resolve(candidate) === path.resolve(file.plannedPath) &&
+				current.identity.size === 0n &&
+				current.identity.nlink === 1n
+			)
+				continue;
 			if (!sameLifecycleCleanupIdentity(current.identity, file.identity))
 				return fail("terminal_uncertain", "Lifecycle metadata candidate lacks exact replay authority.");
 			// A completed file's recorded retained quarantine is receipt-bound durable
@@ -2876,14 +2884,11 @@ async function reconcileLifecycleCleanup(
 				// A completed file's recorded retained quarantine is durable evidence,
 				// not a survivor — accept it only at its receipt-bound path and identity.
 				if (
-					file.detachedPath &&
-					path.resolve(candidate) === path.resolve(file.detachedPath) &&
-					stat.isFile() &&
-					!stat.isSymbolicLink() &&
-					stat.nlink === 1 &&
-					stat.size === 0
-				)
-					continue;
+					(file.detachedPath && path.resolve(candidate) === path.resolve(file.detachedPath)) ||
+					path.resolve(candidate) === path.resolve(file.plannedPath)
+				) {
+					if (stat.isFile() && !stat.isSymbolicLink() && stat.nlink === 1 && stat.size === 0) continue;
+				}
 				return fail(
 					"terminal_uncertain",
 					"Lifecycle cleanup receipt marks a target complete while an authorized candidate remains.",
@@ -3411,6 +3416,22 @@ async function removeOwnedLifecycleArtifacts(
 			{ dev: BigInt(endpointParent.dev), ino: BigInt(endpointParent.ino) },
 		);
 		if (!lifecycleProofWithinDeadline(proofBudget)) return false;
+		if (endpointRemoval.ok) {
+			// POSIX exact-unlink scrubs the detached exchange payload and may retain
+			// its zero-byte quarantine name as durable internal evidence even when
+			// the canonical removal itself succeeded. Carry that known placeholder
+			// into the enclosing close reconciliation so it is not mistaken for a
+			// live endpoint payload.
+			for (const candidate of [plannedEndpointPath, retryEndpointPath, finalEndpointPath]) {
+				try {
+					const metadata = fsSync.lstatSync(candidate);
+					if (metadata.isFile() && metadata.nlink === 1 && metadata.size === 0)
+						onDurablePlaceholder?.(path.resolve(candidate));
+				} catch {
+					// A missing quarantine alias carries no retained authority.
+				}
+			}
+		}
 		if (!endpointRemoval.ok) {
 			if (endpointRemoval.retainedUnknownPath) {
 				onRetainedUnknown?.();
@@ -3734,13 +3755,20 @@ async function signalVerifiedSession(
 	signal: NodeJS.Signals,
 	expected?: EffectMarker,
 ): Promise<boolean> {
-	if (!(await hasDurableProcessIdentity(record, id, expected))) return false;
+	// An exited process may remain a zombie until its parent reaps it. Its
+	// incarnation is intentionally unavailable at that point, but native
+	// observation positively classifies the pid as absent. Treat that as a
+	// successful no-op so close can continue with endpoint/index cleanup rather
+	// than escalating to an unverifiable signal and reporting terminal uncertainty.
+	if (!(await hasDurableProcessIdentity(record, id, expected)))
+		return observeProcessIncarnation(record.pid).status === "absent";
 	try {
-		if (!(await hasDurableProcessIdentity(record, id, expected))) return false;
+		if (!(await hasDurableProcessIdentity(record, id, expected)))
+			return observeProcessIncarnation(record.pid).status === "absent";
 		process.kill(record.pid, signal);
 		return true;
 	} catch {
-		return false;
+		return observeProcessIncarnation(record.pid).status === "absent";
 	}
 }
 
@@ -3912,6 +3940,12 @@ async function hasOwnedEndpointPayload(
 ): Promise<boolean> {
 	const directory = path.join(root, "sdk");
 	const endpointName = `${id}.json`;
+	const knownScrubbedPlaceholders = new Set([
+		`.gjc-delete-endpoint-${effectMarker}-${endpointName}`,
+		`.gjc-delete-endpoint-retry-${effectMarker}-${endpointName}`,
+		`.gjc-delete-endpoint-final-${effectMarker}-${endpointName}`,
+		`.gjc-delete-endpoint-detached-${effectMarker}-${endpointName}`,
+	]);
 	let names: string[];
 	try {
 		names = await fs.readdir(directory);
@@ -3927,7 +3961,9 @@ async function hasOwnedEndpointPayload(
 			if (
 				!metadata.isFile() ||
 				metadata.size > 0 ||
-				(metadata.size === 0 && !durablePlaceholders.has(path.resolve(candidate)))
+				(metadata.size === 0 &&
+					!durablePlaceholders.has(path.resolve(candidate)) &&
+					!knownScrubbedPlaceholders.has(name))
 			)
 				return true;
 		} catch (error) {

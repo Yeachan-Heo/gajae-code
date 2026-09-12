@@ -781,7 +781,7 @@ test("preserves a no-provenance endpoint claim before a held create can stage it
 	await creating;
 	expect(reg.endpointAuthority(binding)).toEqual({ state: "unique", sessionId: "B" });
 });
-test("publishes exact durable authority generation 185 at serving epoch 88", () => {
+test("publishes exact durable authority generation 186 at serving epoch 88", () => {
 	// Generation 58: parser-valid durable-fence promotion and rollback.
 	// Generation 152: a thrown steady heartbeat renewal in the run loop is
 	// contained instead of terminating the daemon (#4200).
@@ -827,7 +827,7 @@ test("publishes exact durable authority generation 185 at serving epoch 88", () 
 	// notification publications instead of cancelling the subscription on the
 	// first refusal, so generation-178 owners that kill a session's mirroring
 	// after one transient rejection are replaced across this upgrade.
-	expect(DAEMON_GENERATION).toBe(185);
+	expect(DAEMON_GENERATION).toBe(186);
 	expect(SERVING_EPOCH).toBe(88);
 });
 test("archives pending topics into retained inactive records", async () => {

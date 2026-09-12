@@ -26,6 +26,7 @@ import {
 	parseToolActivityToggleCommand,
 } from "./config-commands";
 import { agentDirDigest, daemonPaths, HEARTBEAT_TTL_MS } from "./daemon-paths";
+import { type DoctorDaemonOccupancy, doctorDaemonOccupancySettled } from "./doctor-daemon-restart";
 import {
 	acquireDaemonTransitionLock,
 	type DaemonTransitionLock,
@@ -4405,8 +4406,16 @@ class TelegramEffectSupervisor {
 		return this.#stopping;
 	}
 
+	get admitting(): boolean {
+		return this.#admitting;
+	}
+
 	closeAdmission(): void {
 		this.#admitting = false;
+	}
+
+	openAdmission(): void {
+		if (!this.#stopping) this.#admitting = true;
 	}
 
 	beginShutdown(): void {
@@ -4703,6 +4712,45 @@ export class TelegramNotificationDaemon {
 		}
 		this.runtime.requestStop();
 		this.running = false;
+	}
+
+	/** Doctor reservation hook: stop admitting new provider work without killing the owner. Synchronous fence; returns a real acknowledgement. */
+	prepareDoctorRestart(): boolean {
+		this.effects.closeAdmission();
+		return !this.effects.admitting;
+	}
+
+	/**
+	 * Real occupancy read from the live runtime structures the daemon actually
+	 * uses, not synthetic zeros. `inflight` is turns currently executing;
+	 * `inbound` is inbound work accepted but not yet resolved (pending /btw
+	 * turns, topic-adoption session_create dispatches in flight, and inbound
+	 * reaction acks not yet terminal); `outbound` is the real rate-limit pool
+	 * backlog plus terminal /btw deliveries still in flight; `cleanup` counts
+	 * only genuinely outstanding cleanup — non-completed cleanup receipts plus
+	 * live archive/compensation fences — never a completed receipt or an
+	 * unrelated rejected-topic notice timer.
+	 */
+	doctorOccupancy(): DoctorDaemonOccupancy {
+		const outstandingCleanupReceipts = [...this.#cleanupReceipts.values()].filter(
+			receipt => receipt.state !== "completed",
+		).length;
+		return {
+			attached: this.sessions.size,
+			inflight: this.busy.size,
+			inbound:
+				this.#pendingBtwTurns.size + this.#adoptionStartingTopics.size + this.dispatchState.inboundReactions.size,
+			outbound: this.pool.pending + this.#btwTerminalDeliveries.size,
+			cleanup: outstandingCleanupReceipts + this.archiveFlights.size + this.compensationFenceRetries.size,
+		};
+	}
+
+	doctorRestartReady(): boolean {
+		return doctorDaemonOccupancySettled(this.doctorOccupancy());
+	}
+
+	cancelDoctorRestart(): void {
+		if (!this.stopRequested) this.effects.openAdmission();
 	}
 
 	#lifecycleActor(): SessionLifecycleActor {
@@ -8884,7 +8932,7 @@ export class TelegramNotificationDaemon {
 		);
 	}
 	private submitPool(item: Parameters<RateLimitPool<TelegramQueuePayload>["submit"]>[0]): boolean {
-		if (this.stopRequested || this.effects.stopping) return false;
+		if (this.stopRequested || this.effects.stopping || !this.effects.admitting) return false;
 		this.pool.submit(item);
 		return true;
 	}
@@ -11949,6 +11997,16 @@ export class TelegramNotificationDaemon {
 		if (this.validationMode() || !this.#topicRegistryMutationAllowed()) return;
 		if ((await this.handleForumTopicCreatedUpdate(update)) !== "not-topic") return;
 		if ((await this.handleForumTopicEdited(update)) !== "not-topic") return;
+		// Doctor admission fence: forum-topic bookkeeping above is structural
+		// registry housekeeping for topics that already exist, not new user-facing
+		// work, so it stays live. Everything below this line admits genuinely NEW
+		// inbound work — adoption/session_create, /session_* lifecycle commands,
+		// /btw turns, model-picker taps, and inline session control dispatch — and
+		// MUST be refused while the owner has closed admission for a doctor
+		// restart. Already-active turns and the outbound queue are untouched here:
+		// they drain through their own existing paths (RateLimitPool.drain,
+		// in-flight session turns), never invalidated by this refusal.
+		if (!this.effects.admitting) return;
 		// A raw path is accepted only after the explicit direct-entry choice. The exact
 		// `/session_create path <dir>` form remains available in any pending topic.
 		// Both must precede the general lifecycle handler, which would otherwise create

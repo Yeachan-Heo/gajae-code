@@ -5,13 +5,16 @@
  * binaries. Package-manager installs are migrated to a user binary path
  * rather than overwritten. Source checkouts and dev-links are never replaced.
  */
+
+import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { pipeline } from "node:stream/promises";
+import { exactReplaceRetained, exactUnlink } from "@gajae-code/natives";
 import { $which, APP_NAME, isCompiledBinary, isEnoent, redactCrashSecrets, VERSION } from "@gajae-code/utils";
 import { $ } from "bun";
 import chalk from "chalk";
+import { acquireFileLock } from "../config/file-lock";
 import { Settings } from "../config/settings";
 import { isUpdateChannel, UPDATE_CHANNELS, type UpdateChannel } from "../config/update-channel";
 import { installDefaultGjcDefinitions } from "../defaults/gjc-defaults";
@@ -29,6 +32,21 @@ import {
 	verifyDownloadedBinaryChecksum,
 	versionFromTag,
 } from "./github-release";
+import {
+	type ActivationRecordV1,
+	buildActivationRecord,
+	createActivationRecordFile,
+	type DirectoryIdentity,
+	type FileIdentity,
+	readActivationRecord,
+	reconcileActivationRecord,
+	sameDirectoryIdentity,
+	sameFileIdentity,
+	snapshotDirectory,
+	snapshotRegularFile,
+	toNativeIdentity,
+	updateActivationRecordFile,
+} from "./install-activation";
 import { COMMUNITY_APP_REPOSITORY, offerMacosCommunityApp } from "./macos-community-app";
 import { runNotifyCommand } from "./notify-cli";
 
@@ -83,6 +101,10 @@ export interface BinaryReplacementOptions {
 	tempPath: string;
 	backupPath: string;
 	expectedVersion: string;
+	originalTarget: FileIdentity | undefined;
+	originalParent: DirectoryIdentity;
+	candidate?: { readonly channel: string; readonly ref: string; readonly sha256: string };
+	verifyStagedVersion?: (stagingPath: string, expectedVersion: string) => Promise<void>;
 	verifyInstalledVersion: (expectedVersion: string) => Promise<InstalledVersionVerification>;
 }
 
@@ -300,6 +322,10 @@ export function isProtectedSourcePathForTest(filePath: string): boolean {
 	return isProtectedSourcePath(filePath);
 }
 
+export function isProtectedSourcePathForInstall(filePath: string): boolean {
+	return isProtectedSourcePath(filePath);
+}
+
 export function defaultUserBinaryPathForTest(
 	platform: NodeJS.Platform = process.platform,
 	env: NodeJS.ProcessEnv = process.env,
@@ -388,7 +414,10 @@ export function compareVersionsForTest(a: string, b: string): number {
 /**
  * Get the appropriate binary name for this platform.
  */
-function getBinaryName(platform: NodeJS.Platform = process.platform, arch: string = process.arch): string {
+export function getBinaryNameForPlatform(
+	platform: NodeJS.Platform = process.platform,
+	arch: string = process.arch,
+): string {
 	let os: string;
 	switch (platform) {
 		case "linux":
@@ -424,6 +453,7 @@ function getBinaryName(platform: NodeJS.Platform = process.platform, arch: strin
 	}
 	return `${APP_NAME}-${os}-${archName}`;
 }
+const getBinaryName = getBinaryNameForPlatform;
 
 /**
  * Resolve the running GJC image. Compiled binaries update themselves via
@@ -742,176 +772,169 @@ export function formatVerificationFailureForTest(
 	return formatVerificationFailure(result, expectedVersion);
 }
 
-async function unlinkIfExists(filePath: string): Promise<void> {
-	try {
-		await fs.promises.unlink(filePath);
-	} catch (err) {
-		if (!isEnoent(err)) throw err;
-	}
-}
-
-function formatBackupCleanupWarning(backupPath: string, err: unknown): string {
-	return `Installed update, but could not remove backup file ${backupPath}: ${err}. You can delete it manually after closing shells or antivirus processes that may still hold it.`;
-}
-
-async function cleanupVerifiedBackup(backupPath: string): Promise<string | undefined> {
-	try {
-		await unlinkIfExists(backupPath);
-		return undefined;
-	} catch (err) {
-		return formatBackupCleanupWarning(backupPath, err);
-	}
-}
-
 export async function recoverWindowsUpdateJournal(journalPath: string): Promise<void> {
-	let raw: string;
 	try {
-		raw = await fs.promises.readFile(journalPath, "utf8");
-	} catch (err) {
-		if (isEnoent(err)) return;
-		throw err;
+		await fs.promises.lstat(journalPath);
+	} catch (error) {
+		if (isEnoent(error)) return;
+		throw error;
 	}
-	let target = "";
-	let backup = "";
-	let next = "";
-	try {
-		const parsed: unknown = JSON.parse(raw);
-		if (parsed && typeof parsed === "object") {
-			const record = parsed as { target?: unknown; backup?: unknown; next?: unknown };
-			if (typeof record.target === "string") target = record.target;
-			if (typeof record.backup === "string") backup = record.backup;
-			if (typeof record.next === "string") next = record.next;
-		}
-	} catch {
-		await unlinkIfExists(journalPath);
-		return;
-	}
-	const exists = async (p: string): Promise<boolean> => {
-		try {
-			await fs.promises.lstat(p);
-			return true;
-		} catch (err) {
-			if (isEnoent(err)) return false;
-			throw err;
-		}
-	};
-	if (target && next && (await exists(next))) {
-		if (!(await exists(target))) {
-			await fs.promises.rename(next, target);
-			await unlinkIfExists(journalPath);
-			return;
-		}
-		try {
-			const recoverBackup = `${target}.bak.recover.${process.pid}.${Date.now().toString(16)}`;
-			await fs.promises.rename(target, recoverBackup);
-			try {
-				await fs.promises.rename(next, target);
-			} catch (promoteErr) {
-				try {
-					await fs.promises.rename(recoverBackup, target);
-				} catch {
-					throw promoteErr;
-				}
-				throw promoteErr;
-			}
-			await unlinkIfExists(recoverBackup);
-			await unlinkIfExists(journalPath);
-			return;
-		} catch {
-			return;
-		}
-	}
-	if (target && backup && !(await exists(target))) {
-		try {
-			await fs.promises.rename(backup, target);
-		} catch (restoreErr) {
-			if (!isEnoent(restoreErr)) throw restoreErr;
-		}
-	}
-	await unlinkIfExists(journalPath);
+	throw new Error("legacy_update_journal_requires_manual_review");
 }
 
 /**
  * Atomically replace the installed binary and roll back if version verification fails.
  */
 export async function replaceBinaryForUpdate(options: BinaryReplacementOptions): Promise<InstalledVersionVerification> {
-	let backupReady = false;
-	let published = false;
-	let stagedNext = false;
-	const journalPath = `${options.targetPath}.update-journal`;
+	const targetPath = path.resolve(options.targetPath);
+	const parentPath = path.dirname(targetPath);
+	if (
+		path.dirname(path.resolve(options.tempPath)) !== parentPath ||
+		path.dirname(path.resolve(options.backupPath)) !== parentPath
+	)
+		throw new Error("installation_staging_parent_mismatch");
+	await recoverWindowsUpdateJournal(`${targetPath}.update-journal`);
+	const parent = await snapshotDirectory(parentPath);
+	const current = await snapshotRegularFile(targetPath);
+	if (
+		!sameDirectoryIdentity(options.originalParent, parent) ||
+		(options.originalTarget
+			? !current || !sameFileIdentity(options.originalTarget, current.identity)
+			: current !== undefined)
+	)
+		throw new Error("installation_original_target_changed");
+	const existing = await readActivationRecord(targetPath);
+	if (existing.status === "malformed" || existing.status === "foreign") throw new Error("activation_record_untrusted");
+	const resumePinned =
+		existing.status === "valid" &&
+		existing.record.phase !== "verified" &&
+		existing.record.phase !== "rolled_back" &&
+		options.candidate !== undefined;
+	const staged = resumePinned ? undefined : await snapshotRegularFile(options.tempPath);
+	if (!resumePinned) {
+		if (
+			!staged ||
+			staged.identity.parentDev !== options.originalParent.dev ||
+			staged.identity.parentIno !== options.originalParent.ino
+		)
+			throw new Error("installation_staging_unavailable");
+		if (options.candidate && options.candidate.sha256.toLowerCase() !== staged.identity.sha256)
+			throw new Error("candidate_digest_mismatch");
+		await (options.verifyStagedVersion ?? (async (file, version) => smokeTestPinnedCandidate({ version }, file)))(
+			options.tempPath,
+			options.expectedVersion,
+		);
+		const stagedAfter = await snapshotRegularFile(options.tempPath);
+		if (!stagedAfter || !sameFileIdentity(staged.identity, stagedAfter.identity))
+			throw new Error("installation_candidate_changed");
+	}
+	let record: ActivationRecordV1;
+	let recordIdentity: FileIdentity;
+	if (existing.status === "valid" && existing.record.phase !== "verified" && existing.record.phase !== "rolled_back") {
+		if (
+			existing.record.candidate.digest !== (options.candidate?.sha256.toLowerCase() ?? staged?.identity.sha256) ||
+			existing.record.candidate.version !== options.expectedVersion ||
+			(options.candidate &&
+				(existing.record.candidate.ref !== options.candidate.ref ||
+					existing.record.candidate.channel !== options.candidate.channel))
+		)
+			throw new Error("activation_transaction_requires_reconciliation");
+		record = existing.record;
+		recordIdentity = existing.identity;
+	} else {
+		if (!staged) throw new Error("installation_staging_unavailable");
+		record = {
+			...buildActivationRecord({
+				targetPath,
+				targetIdentity: options.originalTarget,
+				originalTargetAbsent: options.originalTarget === undefined,
+				parentIdentity: options.originalParent,
+				baselineDigest: options.originalTarget?.sha256,
+				baselineVersion: VERSION,
+				stagingPath: path.resolve(options.tempPath),
+				stagingIdentity: staged.identity,
+				candidate: {
+					digest: staged.identity.sha256,
+					version: options.expectedVersion,
+					ref: options.candidate?.ref ?? `v${options.expectedVersion}`,
+					channel: options.candidate?.channel,
+					os: process.platform,
+					arch: process.arch,
+				},
+			}),
+			backupName: path.basename(options.backupPath),
+		};
+		recordIdentity =
+			existing.status === "valid"
+				? await updateActivationRecordFile(record, existing.identity)
+				: await createActivationRecordFile(record);
+	}
+	const promoted = await reconcileActivationRecord(targetPath, {
+		allowPromotion: true,
+		expectedRecordIdentity: recordIdentity,
+	});
+	if (promoted.status === "pending_activation") throw new Error("installation_pending_activation");
+	if (
+		(promoted.status !== "reconciled" &&
+			promoted.status !== "applied_unverified" &&
+			promoted.status !== "verified") ||
+		!promoted.record ||
+		!promoted.recordIdentity
+	)
+		throw new Error(promoted.reason ?? "installation_publication_unverified");
+	record = promoted.record;
+	recordIdentity = promoted.recordIdentity;
 	try {
-		if (process.platform === "win32") {
-			await recoverWindowsUpdateJournal(journalPath);
-		}
+		const verification = await options.verifyInstalledVersion(options.expectedVersion);
+		if (!verification.ok) throw new Error(formatVerificationFailure(verification, options.expectedVersion));
+		const after = await snapshotRegularFile(targetPath);
+		if (!after || !record.targetIdentity || !sameFileIdentity(record.targetIdentity, after.identity))
+			throw new Error("installation_postcheck_identity_changed");
+		await updateActivationRecordFile({ ...record, phase: "verified" }, recordIdentity);
+		return verification;
+	} catch (primary) {
 		try {
-			const dest = await fs.promises.lstat(options.targetPath);
-			if (dest.isSymbolicLink()) {
-				throw new Error(
-					`Refusing to replace symlink ${options.targetPath} with a regular binary. Set GJC_INSTALL_DIR to a real directory.`,
+			const after = await snapshotRegularFile(targetPath);
+			if (!after || !record.targetIdentity || !sameFileIdentity(record.targetIdentity, after.identity))
+				throw new Error("rollback_conflict_target_changed");
+			recordIdentity = await updateActivationRecordFile({ ...record, phase: "uncertain" }, recordIdentity);
+			const failedName = `.gjc-update-failed-${record.transactionId}`;
+			if (record.baseline.exists) {
+				const backupPath = path.join(parentPath, record.backupName);
+				const backup = await snapshotRegularFile(backupPath);
+				if (!backup || !record.backupIdentity || !sameFileIdentity(record.backupIdentity, backup.identity))
+					throw new Error("rollback_backup_changed");
+				const restored = exactReplaceRetained(
+					backupPath,
+					targetPath,
+					failedName,
+					toNativeIdentity(record.backupIdentity),
+					toNativeIdentity(record.targetIdentity),
+				);
+				const observed = await snapshotRegularFile(targetPath);
+				if (!restored.ok || !observed || !sameFileIdentity(record.backupIdentity, observed.identity))
+					throw new Error("rollback_unverified");
+				await updateActivationRecordFile(
+					{ ...record, targetIdentity: observed.identity, phase: "rolled_back" },
+					recordIdentity,
+				);
+			} else {
+				const removed = exactUnlink(targetPath, {
+					...toNativeIdentity(record.targetIdentity, failedName),
+					detachOnly: true,
+				});
+				const absent = await snapshotRegularFile(targetPath);
+				if ((!removed.ok && removed.code !== "cleanup_pending") || absent !== undefined)
+					throw new Error("rollback_unverified");
+				await updateActivationRecordFile(
+					{ ...record, targetIdentity: undefined, phase: "rolled_back" },
+					recordIdentity,
 				);
 			}
-		} catch (err) {
-			if (!isEnoent(err)) throw err;
+		} catch (rollback) {
+			throw new AggregateError([primary, rollback], "installation_rollback_unverified");
 		}
-		await unlinkIfExists(options.backupPath);
-		if (process.platform === "win32") {
-			const nextPath = `${options.targetPath}.next`;
-			await fs.promises.writeFile(
-				journalPath,
-				JSON.stringify({
-					target: options.targetPath,
-					backup: options.backupPath,
-					temp: options.tempPath,
-					next: nextPath,
-				}),
-				"utf8",
-			);
-			try {
-				await fs.promises.rename(options.targetPath, options.backupPath);
-				backupReady = true;
-			} catch (err) {
-				if (isEnoent(err)) {
-					backupReady = false;
-				} else {
-					await fs.promises.copyFile(options.tempPath, nextPath);
-					stagedNext = true;
-					throw new Error(
-						`Running Windows image ${options.targetPath} could not be replaced in-process (${err}). Staged ${nextPath}. Close running gjc.exe and re-run gjc update.`,
-					);
-				}
-			}
-		} else {
-			try {
-				await fs.promises.copyFile(options.targetPath, options.backupPath);
-				backupReady = true;
-			} catch (err) {
-				if (!isEnoent(err)) throw err;
-			}
-		}
-		await fs.promises.rename(options.tempPath, options.targetPath);
-		published = true;
-
-		const verification = await options.verifyInstalledVersion(options.expectedVersion);
-		if (!verification.ok) {
-			throw new Error(
-				`${formatVerificationFailure(verification, options.expectedVersion)}; restored previous ${APP_NAME} binary`,
-			);
-		}
-
-		backupReady = false;
-		if (process.platform === "win32") await unlinkIfExists(journalPath);
-		const cleanupWarning = await cleanupVerifiedBackup(options.backupPath);
-		return cleanupWarning ? { ...verification, cleanupWarning } : verification;
-	} catch (err) {
-		if (backupReady) {
-			await unlinkIfExists(options.targetPath);
-			await fs.promises.rename(options.backupPath, options.targetPath);
-		} else if (published) {
-			await unlinkIfExists(options.targetPath);
-		}
-		await unlinkIfExists(options.tempPath);
-		if (process.platform === "win32" && !stagedNext) await unlinkIfExists(journalPath);
-		throw err;
+		throw primary;
 	}
 }
 
@@ -1005,7 +1028,7 @@ async function downloadBinaryTo(
 	expectedVersion?: string,
 ): Promise<void> {
 	const response = await fetch(url, { redirect: "follow" });
-	if (!response.ok || !response.body) {
+	if (!response.ok || !response.body)
 		throw new Error(
 			formatBinaryDownloadFailureMessage(
 				binaryName,
@@ -1015,31 +1038,85 @@ async function downloadBinaryTo(
 				registryNote,
 			),
 		);
+	const limit = 512 * 1024 * 1024;
+	const declared = response.headers.get("content-length");
+	if (declared && /^\d+$/.test(declared) && Number(declared) > limit) {
+		await response.body.cancel();
+		throw new Error("candidate_size_limit");
 	}
+	const handle = await fs.promises.open(
+		tempPath,
+		fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW,
+		0o600,
+	);
+	const reader = response.body.getReader();
 	try {
-		const fileStream = fs.createWriteStream(tempPath, { mode: 0o755 });
-		await pipeline(response.body, fileStream);
-		const stat = await fs.promises.stat(tempPath);
-		if (stat.size <= 0) {
-			throw new Error(`Downloaded file was empty: ${url}`);
+		let size = 0;
+		for (;;) {
+			const next = await reader.read();
+			if (next.done) break;
+			size += next.value.byteLength;
+			if (size > limit) {
+				await reader.cancel();
+				throw new Error("candidate_size_limit");
+			}
+			await handle.writeFile(next.value);
 		}
-	} catch (err) {
-		await unlinkIfExists(tempPath);
-		throw err;
-	}
-	if (expectedVersion) {
-		const tag = expectedVersion.startsWith("v") ? expectedVersion : `v${expectedVersion}`;
-		try {
+		if (size === 0) throw new Error("candidate_empty");
+		await handle.sync();
+		const beforeVerification = await handle.stat({ bigint: true });
+		if (expectedVersion)
 			await verifyDownloadedBinaryChecksum({
-				tag,
+				tag: expectedVersion.startsWith("v") ? expectedVersion : `v${expectedVersion}`,
 				assetName: binaryName,
 				filePath: tempPath,
 			});
-		} catch (err) {
-			await unlinkIfExists(tempPath);
-			throw err;
-		}
+		const current = await fs.promises.lstat(tempPath, { bigint: true });
+		if (
+			!current.isFile() ||
+			current.isSymbolicLink() ||
+			current.dev !== beforeVerification.dev ||
+			current.ino !== beforeVerification.ino ||
+			current.size !== beforeVerification.size ||
+			current.mtimeNs !== beforeVerification.mtimeNs
+		)
+			throw new Error("candidate_changed_during_verification");
+		await handle.chmod(0o755);
+		await handle.sync();
+	} finally {
+		reader.releaseLock();
+		await handle.close();
 	}
+}
+
+/** Production adapter used by doctor restore: official release origin, checksum manifest, and runtime smoke. */
+export async function fetchAndVerifyOfficialPinnedCandidate(
+	candidate: { ref: string; version: string; os: NodeJS.Platform; arch: string; sha256: string },
+	stagingPath: string,
+): Promise<void> {
+	if (candidate.os !== process.platform || candidate.arch !== process.arch)
+		throw new Error("candidate_platform_or_arch_mismatch");
+	const expectedTag = candidate.ref.startsWith("v") ? candidate.ref : `v${candidate.ref}`;
+	const expectedVersion = versionFromTag(expectedTag);
+	if (expectedVersion !== candidate.version) throw new Error("candidate_ref_version_mismatch");
+	await downloadBinaryTo(
+		buildReleaseBinaryUrl(candidate.version, candidate.os, candidate.arch),
+		stagingPath,
+		getBinaryNameForPlatform(candidate.os, candidate.arch),
+		undefined,
+		candidate.version,
+	);
+	const staged = await snapshotRegularFile(stagingPath);
+	if (!staged) throw new Error("candidate_missing");
+	const digest = staged.identity.sha256;
+	if (digest.toLowerCase() !== candidate.sha256.toLowerCase()) {
+		throw new Error("candidate_digest_mismatch");
+	}
+}
+
+export async function smokeTestPinnedCandidate(candidate: { version: string }, stagingPath: string): Promise<void> {
+	const verification = await verifyInstalledRuntime(candidate.version, stagingPath);
+	if (!verification.ok) throw new Error(formatVerificationFailure(verification, candidate.version));
 }
 
 /** Injectable steps of the binary update flow (seams for testing ordering). */
@@ -1048,8 +1125,6 @@ export interface BinaryUpdateFlow {
 	fsync(filePath: string): Promise<void>;
 	replace(options: BinaryReplacementOptions): Promise<InstalledVersionVerification>;
 	verifyInstalledVersion(expectedVersion: string): Promise<InstalledVersionVerification>;
-	/** Best-effort cleanup of the temp file when the flow aborts before replace. */
-	removeTemp?(filePath: string): Promise<void>;
 	/** Called once fsync has succeeded, right before replacement begins. */
 	beforeReplace?(): void;
 }
@@ -1060,8 +1135,8 @@ export interface BinaryUpdateFlow {
  * before it is published (renamed into place) or exec'd for verification.
  *
  * If fsync fails the temp bytes are not durable, so we abort before
- * replacement/verification and clean up the temp file rather than installing a
- * possibly-truncated binary.
+ * replacement/verification and retain the staging artifact rather than risk
+ * deleting a substituted pathname or installing a possibly-truncated binary.
  */
 export async function runBinaryUpdateFlow(
 	targetPath: string,
@@ -1069,18 +1144,16 @@ export async function runBinaryUpdateFlow(
 	expectedVersion: string,
 	flow: BinaryUpdateFlow,
 ): Promise<InstalledVersionVerification> {
-	const stamp = `${process.pid}.${Date.now().toString(16)}`;
+	const stamp = randomUUID();
 	const tempPath = `${targetPath}.new.${stamp}`;
 	const backupPath = `${targetPath}.bak.${stamp}`;
 	const releaseLock = await acquireBinaryUpdateLock(targetPath);
 	try {
+		const originalTarget = await snapshotRegularFile(targetPath);
+		const originalParent = await snapshotDirectory(path.dirname(targetPath));
+		if (!originalParent) throw new Error("installation_parent_unavailable");
 		await flow.download(url, tempPath);
-		try {
-			await flow.fsync(tempPath);
-		} catch (err) {
-			if (flow.removeTemp) await flow.removeTemp(tempPath);
-			throw err;
-		}
+		await flow.fsync(tempPath);
 
 		flow.beforeReplace?.();
 		return await flow.replace({
@@ -1088,6 +1161,8 @@ export async function runBinaryUpdateFlow(
 			tempPath,
 			backupPath,
 			expectedVersion,
+			originalTarget: originalTarget?.identity,
+			originalParent,
 			verifyInstalledVersion: flow.verifyInstalledVersion,
 		});
 	} finally {
@@ -1095,46 +1170,14 @@ export async function runBinaryUpdateFlow(
 	}
 }
 
-async function acquireBinaryUpdateLock(targetPath: string): Promise<() => Promise<void>> {
-	const lockFile = path.join(path.dirname(targetPath), ".gjc-install.lock");
-	const nonce = `${process.pid}.${Date.now().toString(16)}.${Math.random().toString(16).slice(2)}`;
-	const claim = `${process.pid} ${nonce}\n`;
-	const publish = async (): Promise<void> => {
-		const handle = await fs.promises.open(lockFile, "wx");
-		try {
-			await handle.write(claim);
-		} finally {
-			await handle.close();
-		}
-	};
-	const ownsClaim = async (): Promise<boolean> => {
-		try {
-			return (await fs.promises.readFile(lockFile, "utf8")) === claim;
-		} catch {
-			return false;
-		}
-	};
-	const release = async (): Promise<void> => {
-		try {
-			if (!(await ownsClaim())) return;
-			await unlinkIfExists(lockFile);
-		} catch {
-			// Best-effort lock release after a verified or failed update.
-		}
-	};
-	try {
-		await publish();
-		return release;
-	} catch (err) {
-		const code = (err as NodeJS.ErrnoException).code;
-		if (code === "ENOENT") return async () => {};
-		if (code === "EEXIST") {
-			throw new Error(
-				`Another ${APP_NAME} update is already running for ${targetPath}. Remove ${lockFile} only after confirming no installer or update is running.`,
-			);
-		}
-		throw err;
-	}
+export async function acquireBinaryUpdateLock(targetPath: string): Promise<() => Promise<void>> {
+	const parent = await fs.promises.lstat(path.dirname(path.resolve(targetPath))).catch(() => undefined);
+	if (!parent?.isDirectory()) throw new Error("installation_directory_unavailable");
+	return await acquireFileLock(path.join(path.dirname(path.resolve(targetPath)), ".gjc-install"), {
+		signal: AbortSignal.timeout(10_000),
+		retries: 200,
+		retryDelayMs: 50,
+	});
 }
 
 /**
@@ -1234,7 +1277,6 @@ async function updateViaBinaryAt(
 		fsync: fsyncFile,
 		replace: replaceBinaryForUpdate,
 		verifyInstalledVersion: version => verifyInstalledRuntime(version, targetPath),
-		removeTemp: unlinkIfExists,
 		beforeReplace: () => console.log(chalk.dim("Installing update...")),
 	});
 
@@ -1591,7 +1633,13 @@ export async function runUpdateCommand(
 
 	if (target.method === "migrate" && decision.install && !opts.force) {
 		// Check mode is read-only, including when another installer holds the lock.
-		const releaseLock = opts.check ? undefined : await acquireBinaryUpdateLock(target.path);
+		// A first-time migration may intentionally target a path whose parent does
+		// not exist yet; the real install creates it before entering the locked
+		// replacement flow. There is no existing lock to contend with in that
+		// state, so preflight remains read-only and lock-free until installation.
+		const targetParent = path.dirname(path.resolve(target.path));
+		const parent = await fs.promises.lstat(targetParent).catch(() => undefined);
+		const releaseLock = opts.check || !parent?.isDirectory() ? undefined : await acquireBinaryUpdateLock(target.path);
 		let verified = false;
 		try {
 			verified = (await verifyTarget(release, target.path)).ok;

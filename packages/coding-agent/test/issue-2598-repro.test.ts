@@ -239,7 +239,7 @@ describe("issue #2598 — tab worker source and compiled smoke contract", () => 
 	});
 
 	it("wires the CLI smoke after its owner-native checks", async () => {
-		const source = await Bun.file(path.join(packageDir, "src/cli.ts")).text();
+		const source = await Bun.file(path.join(packageDir, "src/cli-main.ts")).text();
 		const nativeCheck = source.indexOf(
 			'throw new Error("smoke-test: native fuzzy exports missing from embedded addon")',
 		);

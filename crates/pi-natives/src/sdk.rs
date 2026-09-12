@@ -1083,6 +1083,10 @@ fn ensure_not_current_arbitrated_presentation(
 }
 
 #[cfg(test)]
+#[allow(
+	clippy::items_after_test_module,
+	reason = "the helper parsers are kept below the wire-contract tests they support"
+)]
 mod tests {
 	use super::{
 		ActionIdentity, PresentationLease, ensure_not_current_arbitrated_presentation, parse_needed,
@@ -1211,9 +1215,8 @@ mod tests {
 			.expect("initial arbitrated registration succeeds");
 
 		let superseding = r#"{"id":"superseding","kind":"ask","sessionId":"session","question":"question","controls":[]}"#;
-		let error = match server.register_arbitrated_ask(superseding.to_owned(), true) {
-			Ok(_) => panic!("a distinct arbitrated registration cannot supersede an active lease"),
-			Err(error) => error,
+		let Err(error) = server.register_arbitrated_ask(superseding.to_owned(), true) else {
+			panic!("a distinct arbitrated registration cannot supersede an active lease");
 		};
 		assert!(error.reason.contains("registerArbitratedAsk"));
 		assert_eq!(

@@ -459,6 +459,33 @@ export interface GjcReviewedUpdateToken {
 	reviewedAt: string;
 }
 
+export interface LocalRestorePlanV1 {
+	schemaVersion: 1;
+	kind: "gjc-plugin.restore-artifact";
+	identity: GjcBundleIdentity;
+	baselineFingerprint: string;
+	decisionContextFingerprint: string;
+	artifact: {
+		status: "present" | "absent" | "unreadable";
+		digest?: string;
+	};
+	writes: false;
+	fetch: false;
+	locks: false;
+}
+
+export interface ReviewedRestoreTokenV1 {
+	schemaVersion: 1;
+	kind: "gjc-plugin.restore-artifact";
+	purpose: "restore-artifact";
+	identity: GjcBundleIdentity;
+	candidateFingerprint: string;
+	baselineFingerprint: string;
+	decisionContextFingerprint: string;
+	artifactFingerprint: string;
+	reviewedAt: string;
+}
+
 export type GjcLifecycleErrorCode =
 	| "already_installed_use_upgrade"
 	| "not_installed"

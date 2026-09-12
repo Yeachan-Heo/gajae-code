@@ -104,9 +104,23 @@ describe("AgentSession escaped non-ASCII metadata fidelity", () => {
 			settings: Settings.isolated({ "compaction.enabled": false }),
 			modelRegistry,
 		});
+		const assistantMessageEnds: string[] = [];
+		session.subscribe(event => {
+			if (event.type !== "message_end" || event.message.role !== "assistant") return;
+			assistantMessageEnds.push(
+				event.message.content
+					.filter(
+						(block): block is Extract<AssistantMessage["content"][number], { type: "toolCall" }> =>
+							block.type === "toolCall",
+					)
+					.map(block => block.id)
+					.join(","),
+			);
+		});
 
 		await session.prompt("ask me");
 		await manager.flush();
+		expect(assistantMessageEnds).toEqual(["tc-accepted", ""]);
 
 		const persisted = manager
 			.buildSessionContext()

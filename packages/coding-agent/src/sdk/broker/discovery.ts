@@ -2,17 +2,13 @@ import { randomBytes } from "node:crypto";
 import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import path from "node:path";
-
-import type { NativeRetainedBrokerPublication } from "@gajae-code/natives";
-
-type NativeBrokerDiscoveryBindings = Pick<typeof import("@gajae-code/natives"), "retainBrokerPublication">;
-let nativeBrokerDiscoveryBindings: NativeBrokerDiscoveryBindings | undefined;
-
-function nativeBrokerDiscovery(): NativeBrokerDiscoveryBindings {
-	if (!nativeBrokerDiscoveryBindings)
-		nativeBrokerDiscoveryBindings = require("@gajae-code/natives") as NativeBrokerDiscoveryBindings;
-	return nativeBrokerDiscoveryBindings;
-}
+import type {
+	NativeBrokerRestartIntent,
+	NativeBrokerRestartIntentIdentity,
+	NativeRetainedBrokerPublication,
+} from "@gajae-code/natives";
+import { retainBrokerPublication as retainBrokerPublicationFn } from "@gajae-code/natives";
+import { BROKER_ARTIFACT_PATHS, canonicalServiceRootDigest } from "../service-artifact-paths";
 
 import { processIncarnation } from "./process-incarnation";
 import { assertSupportedStateVersion, SDK_STATE_VERSION } from "./state-version";
@@ -23,6 +19,14 @@ export interface RetainedBrokerDiscovery {
 	observeAsync(): Promise<BrokerPublicationObservation>;
 	heartbeat(heartbeatAt: number): Promise<boolean>;
 	close(): void;
+	/** Owner-side `prepared`: exclusively creates the durable restart-intent slot. */
+	prepareRestartIntent(intent: NativeBrokerRestartIntent): Promise<boolean>;
+	/** Owner-side `prepared` -> `committed`: rewrites the exact slot prepare created. */
+	commitRestartIntent(intent: NativeBrokerRestartIntent): Promise<boolean>;
+	/** Owner-side cancel of this process's own prepared/committed slot. */
+	cancelRestartIntent(): Promise<boolean>;
+	/** Successor-side clear of a predecessor's slot this process never prepared. */
+	clearForeignRestartIntent(identity: NativeBrokerRestartIntentIdentity): Promise<boolean>;
 }
 
 /**
@@ -216,12 +220,8 @@ function describeWithheldPublicationAuthority(agentDir: string): string | undefi
 }
 
 function requireRetainedBrokerPublication(agentDir: string): NativeRetainedBrokerPublication {
-	const retainBrokerPublication = nativeBrokerDiscovery().retainBrokerPublication;
-	if (typeof retainBrokerPublication !== "function") {
-		throw new Error("Loaded native bindings do not expose retained broker publication authority.");
-	}
 	try {
-		return retainBrokerPublication(agentDir);
+		return retainBrokerPublicationFn(agentDir);
 	} catch (error) {
 		// Fail closed exactly as before; only name the condition on the way out.
 		const obstruction = nativeRetainedObstruction(error);
@@ -299,6 +299,26 @@ class NativeRetainedBrokerDiscovery implements RetainedBrokerDiscovery {
 		this.#closed = true;
 		this.#publication.close();
 	}
+	async prepareRestartIntent(intent: NativeBrokerRestartIntent): Promise<boolean> {
+		if (this.#closed || !isValidRestartToken(intent.requestId) || !isValidRestartToken(intent.lease)) return false;
+		return (await this.#publication.prepareRestartIntentAsync(intent)).kind === "written";
+	}
+	async commitRestartIntent(intent: NativeBrokerRestartIntent): Promise<boolean> {
+		if (this.#closed || !isValidRestartToken(intent.requestId) || !isValidRestartToken(intent.lease)) return false;
+		return (await this.#publication.commitRestartIntentAsync(intent)).kind === "written";
+	}
+	async cancelRestartIntent(): Promise<boolean> {
+		if (this.#closed) return false;
+		return (await this.#publication.cancelRestartIntentAsync()).kind === "cancelled";
+	}
+	async clearForeignRestartIntent(identity: NativeBrokerRestartIntentIdentity): Promise<boolean> {
+		if (this.#closed) return false;
+		return (await this.#publication.clearRestartIntentAsync(identity)).kind === "cleared";
+	}
+}
+
+function isValidRestartToken(value: string): boolean {
+	return /^[A-Za-z0-9_-]{1,256}$/.test(value);
 }
 
 class LegacyWindowsBrokerDiscovery implements RetainedBrokerDiscovery {
@@ -321,6 +341,18 @@ class LegacyWindowsBrokerDiscovery implements RetainedBrokerDiscovery {
 		await writeBrokerDiscovery(this.#agentDir, next);
 		this.#discovery = next;
 		return true;
+	}
+	async prepareRestartIntent(_intent: NativeBrokerRestartIntent): Promise<boolean> {
+		return false;
+	}
+	async commitRestartIntent(_intent: NativeBrokerRestartIntent): Promise<boolean> {
+		return false;
+	}
+	async cancelRestartIntent(): Promise<boolean> {
+		return false;
+	}
+	async clearForeignRestartIntent(_identity: NativeBrokerRestartIntentIdentity): Promise<boolean> {
+		return false;
 	}
 	close(): void {
 		this.#closed = true;
@@ -355,10 +387,18 @@ export interface BrokerDiscovery {
 	token: string;
 	startedAt: number;
 	heartbeatAt: number;
+	restartRequestId?: string;
+	rootDigest?: string;
+}
+export interface BrokerRestartIntent {
+	requestId: string;
+	lease: string;
+	expiresAt: number;
+	phase?: "prepared" | "committed" | "cancelled";
 }
 export type RedactedBrokerDiscovery = Omit<BrokerDiscovery, "token"> & { token: "[redacted]" };
 export type BrokerDiscoveryWrite = Omit<BrokerDiscovery, "incarnation"> & { incarnation?: string };
-export const brokerDiscoveryPath = (agentDir: string) => path.join(agentDir, "sdk", "broker.json");
+export const brokerDiscoveryPath = (agentDir: string) => path.join(agentDir, BROKER_ARTIFACT_PATHS.discovery);
 export const newBrokerToken = () => randomBytes(32).toString("hex");
 export const brokerProcessIncarnation = processIncarnation;
 export function isPidAlive(pid: number): boolean {
@@ -399,7 +439,6 @@ async function syncDirectory(directory: string): Promise<void> {
 export async function writeBrokerDiscovery(agentDir: string, discovery: BrokerDiscoveryWrite): Promise<void> {
 	const incarnation = discovery.incarnation ?? brokerProcessIncarnation(discovery.pid);
 	if (!incarnation) throw new Error(`Broker process incarnation is unavailable for pid ${discovery.pid}.`);
-	const record: BrokerDiscovery = { ...discovery, incarnation };
 	if (!isFixedWidthHeartbeat(discovery.heartbeatAt)) {
 		throw new Error("Broker heartbeatAt must be a fixed-width 13-digit millisecond timestamp.");
 	}
@@ -407,6 +446,11 @@ export async function writeBrokerDiscovery(agentDir: string, discovery: BrokerDi
 	const dir = path.dirname(file);
 	await fs.mkdir(dir, { recursive: true, mode: 0o700 });
 	await fs.chmod(dir, 0o700);
+	const record: BrokerDiscovery = {
+		...discovery,
+		incarnation,
+		rootDigest: await canonicalServiceRootDigest(agentDir),
+	};
 	const temp = `${file}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`;
 	try {
 		await fs.writeFile(temp, `${JSON.stringify(record)}\n`, { mode: 0o600 });
@@ -427,8 +471,12 @@ export async function publishBrokerDiscovery(
 ): Promise<RetainedBrokerDiscovery> {
 	const incarnation = discovery.incarnation ?? brokerProcessIncarnation(discovery.pid);
 	if (!incarnation) throw new Error(`Broker process incarnation is unavailable for pid ${discovery.pid}.`);
-	const published: BrokerDiscovery = { ...discovery, incarnation };
-	await writeBrokerDiscovery(agentDir, published);
+	await writeBrokerDiscovery(agentDir, { ...discovery, incarnation });
+	const published: BrokerDiscovery = {
+		...discovery,
+		incarnation,
+		rootDigest: await canonicalServiceRootDigest(agentDir),
+	};
 	if (platform === "win32") return new LegacyWindowsBrokerDiscovery(agentDir, published);
 	try {
 		return new NativeRetainedBrokerDiscovery(requireRetainedBrokerPublication(agentDir));
@@ -479,6 +527,7 @@ export async function readBrokerDiscovery(
 			!Number.isFinite(d.heartbeatAt)
 		)
 			return null;
+		if (d.restartRequestId !== undefined && !/^[A-Za-z0-9_-]{1,256}$/.test(d.restartRequestId)) return null;
 		if (!isPidAlive(d.pid)) return null;
 		const incarnation = brokerProcessIncarnation(d.pid);
 		if (!incarnation || incarnation !== d.incarnation || Date.now() - d.heartbeatAt > ttlMs) return null;
@@ -486,6 +535,99 @@ export async function readBrokerDiscovery(
 	} catch (e) {
 		if ((e as NodeJS.ErrnoException).code === "ENOENT" || e instanceof SyntaxError) return null;
 		throw e;
+	}
+}
+
+/**
+ * The restart-intent slot lives directly beneath `sdk/`, independent of
+ * `sdk/broker.lock/` -- so it durably survives a stale-lock reclaim that
+ * renames the incumbent's lock directory aside (`Broker#reclaimStaleLock`).
+ */
+export const brokerRestartIntentPath = (agentDir: string) => path.join(agentDir, BROKER_ARTIFACT_PATHS.restartIntent);
+
+export interface BrokerRestartIntentWithIdentity extends BrokerRestartIntent {
+	/** Existing platform file identity, for a successor's exact-identity clear. */
+	identity: NativeBrokerRestartIntentIdentity;
+}
+
+export async function readBrokerRestartIntent(agentDir: string): Promise<BrokerRestartIntentWithIdentity | null> {
+	const file = brokerRestartIntentPath(agentDir);
+	let handle: fs.FileHandle | undefined;
+	try {
+		handle = await fs.open(
+			file,
+			fsSync.constants.O_RDONLY | fsSync.constants.O_NOFOLLOW | fsSync.constants.O_NONBLOCK,
+		);
+		const before = await handle.stat({ bigint: true });
+		const parent = await fs.lstat(path.dirname(file), { bigint: true });
+		if (
+			!before.isFile() ||
+			before.nlink !== 1n ||
+			before.size > 4096n ||
+			!parent.isDirectory() ||
+			parent.isSymbolicLink()
+		)
+			throw new Error("Malformed broker restart intent.");
+		const buffer = new Uint8Array(4097);
+		let length = 0;
+		while (length < buffer.length) {
+			const read = await handle.read(buffer, length, buffer.length - length, length);
+			if (read.bytesRead === 0) break;
+			length += read.bytesRead;
+		}
+		if (length > 4096) throw new Error("Malformed broker restart intent.");
+		const after = await handle.stat({ bigint: true });
+		const lexical = await fs.lstat(file, { bigint: true });
+		const parentAfter = await fs.lstat(path.dirname(file), { bigint: true });
+		if (
+			after.dev !== before.dev ||
+			after.ino !== before.ino ||
+			after.size !== before.size ||
+			after.mtimeNs !== before.mtimeNs ||
+			after.ctimeNs !== before.ctimeNs ||
+			after.nlink !== 1n ||
+			lexical.isSymbolicLink() ||
+			lexical.dev !== after.dev ||
+			lexical.ino !== after.ino ||
+			lexical.mtimeNs !== after.mtimeNs ||
+			lexical.ctimeNs !== after.ctimeNs ||
+			parentAfter.isSymbolicLink() ||
+			parent.dev !== parentAfter.dev ||
+			parent.ino !== parentAfter.ino
+		)
+			throw new Error("Broker restart intent changed during observation.");
+		let value: unknown;
+		try {
+			value = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(buffer.subarray(0, length)));
+		} catch {
+			throw new Error("Malformed broker restart intent.");
+		}
+		if (!value || typeof value !== "object" || Array.isArray(value))
+			throw new Error("Malformed broker restart intent.");
+		const intent = value as Partial<BrokerRestartIntent>;
+		if (
+			typeof intent.requestId !== "string" ||
+			!/^[A-Za-z0-9_-]{1,256}$/.test(intent.requestId) ||
+			typeof intent.lease !== "string" ||
+			!/^[A-Za-z0-9_-]{1,256}$/.test(intent.lease) ||
+			typeof intent.expiresAt !== "number" ||
+			!Number.isSafeInteger(intent.expiresAt) ||
+			intent.expiresAt <= 0 ||
+			(intent.phase !== "prepared" && intent.phase !== "committed" && intent.phase !== "cancelled")
+		)
+			throw new Error("Malformed broker restart intent.");
+		return {
+			requestId: intent.requestId,
+			lease: intent.lease,
+			expiresAt: intent.expiresAt,
+			phase: intent.phase,
+			identity: { dev: after.dev, ino: after.ino },
+		};
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT" && !handle) return null;
+		throw error;
+	} finally {
+		await handle?.close();
 	}
 }
 export function redactBrokerDiscovery(discovery: BrokerDiscovery): RedactedBrokerDiscovery {

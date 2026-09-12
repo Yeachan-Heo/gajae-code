@@ -7,7 +7,12 @@ import packageJson from "../../../package.json" with { type: "json" };
 import { acquireFileLock, type FileLockOptions, withFileLock } from "../../config/file-lock";
 import { loadInstallationHostId, loadLegacyInstallationHostId } from "../../config/machine-identity";
 import { SdkClient } from "../client/client";
-import { type BrokerDiscovery, brokerProcessIncarnation, readBrokerDiscovery } from "./discovery";
+import {
+	type BrokerDiscovery,
+	brokerProcessIncarnation,
+	readBrokerDiscovery,
+	readBrokerRestartIntent,
+} from "./discovery";
 import {
 	isSdkInternalRuntimeImagePresent,
 	resolveSdkInternalSpawnCommand,
@@ -43,6 +48,8 @@ export async function isBrokerReusable(discovery: BrokerDiscovery | null): Promi
 }
 export interface EnsureBrokerSettings {
 	agentDir: string;
+	/** Only an authorized doctor successor may consume a restart-intent publication. */
+	restartRequestId?: string;
 	heartbeatTtlMs?: number;
 	/**
 	 * Environment for the spawned detached broker. Defaults to `process.env`; tests
@@ -506,6 +513,9 @@ async function ensureBrokerOnce(settings: EnsureBrokerSettings, initiator: Ensur
 		settings.heartbeatTtlMs,
 		initialDiscoveryDeadline,
 	);
+	const restartIntent = await readBrokerRestartIntent(settings.agentDir);
+	if (restartIntent && restartIntent.expiresAt > Date.now() && restartIntent.requestId !== settings.restartRequestId)
+		throw new Error("broker_restart_in_progress");
 	if (initiator === "fixture-lease" && (priorOwner || existing)) throw fixtureLeaseUnavailable();
 	if (priorOwner) {
 		// A retained cleanup failure fences every discovery record. Only a ready
@@ -534,6 +544,9 @@ async function ensureBrokerOnce(settings: EnsureBrokerSettings, initiator: Ensur
 	try {
 		const deadline =
 			Date.now() + (initiator === "fixture-lease" ? FIXTURE_DISCOVERY_TIMEOUT_MS : DISCOVERY_TIMEOUT_MS);
+		const lockedIntent = await readBrokerRestartIntent(settings.agentDir);
+		if (lockedIntent && lockedIntent.expiresAt > Date.now() && lockedIntent.requestId !== settings.restartRequestId)
+			throw new Error("broker_restart_in_progress");
 		// The lock winner may still find a discovery published by an earlier winner
 		// that finished between our first read and the lock acquisition.
 		const discoveredUnderLock = await reconcileBrokerGenerationForStartup(settings, deadline);

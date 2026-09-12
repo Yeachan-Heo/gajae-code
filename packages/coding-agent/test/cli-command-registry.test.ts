@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { commands, routeRootArgv } from "../src/cli";
+import { commands, routeRootArgv } from "../src/cli-main";
 
 describe("CLI command registry", () => {
 	it("registers the model preset registry control command", async () => {

@@ -14,6 +14,7 @@ function nativeChatDaemon(): NativeChatDaemonBindings {
 	return nativeChatDaemonBindings;
 }
 
+import { isEnoent } from "@gajae-code/utils/fs-error";
 import type { Settings } from "../../config/settings";
 import type {
 	BuiltInDaemonController,
@@ -25,7 +26,10 @@ import type {
 } from "../../daemon/control-types";
 import { resolveGjcRuntimeSpawnInfo } from "../../daemon/runtime";
 import { isProcessIncarnation, processIncarnation } from "../broker/process-incarnation";
+import { CHAT_DAEMON_DIRECTORY, CHAT_DAEMON_FILES, canonicalServiceRootDigest } from "../service-artifact-paths";
 import { getNotificationConfig, isDiscordComplete, isProviderEffectivelyEnabled, isSlackComplete } from "./config";
+import { withDaemonStartupExclusion } from "./daemon-startup-exclusion";
+import { type DoctorDaemonControlRequest, isDoctorDaemonControlRequest } from "./doctor-daemon-restart";
 
 export type ChatDaemonKind = "discord" | "slack";
 export type ChatDaemonAction = "stop" | "reload";
@@ -137,8 +141,8 @@ export type ChatDaemonAction = "stop" | "reload";
  * crashes, recovery, and attachment retirement cannot replay ambiguous work.
  */
 export const CHAT_DAEMON_GENERATIONS: Readonly<Record<ChatDaemonKind, number>> = {
-	discord: 75,
-	slack: 82,
+	discord: 76,
+	slack: 83,
 };
 
 export function chatDaemonGeneration(kind: ChatDaemonKind): number {
@@ -157,6 +161,14 @@ export interface ChatDaemonState {
 	transportHealthy: boolean;
 	generation: number;
 	stoppedAt?: number;
+	/**
+	 * Digest of the canonical (symlink-resolved) agent root this record was
+	 * published for. Legacy records omit it and remain non-authorizing for the
+	 * D9 cross-bind check: a state record without a matching rootDigest can
+	 * never be treated as this root's live owner for that check, even though it
+	 * is still valid for every other pre-existing owner check in this module.
+	 */
+	rootDigest?: string;
 }
 
 /**
@@ -326,13 +338,23 @@ const DEFAULT_KILL_TIMEOUT_MS = 3_000;
 /** Covers Discord READY plus its first 5-second heartbeat; tests inject a smaller timeout. */
 const DEFAULT_SPAWN_READY_TIMEOUT_MS = 8_000;
 
-interface ChatDaemonOwnerLock {
+/**
+ * `version`/`ownerId`/`rootDigest` are the D9 cross-bind receipt delta: a
+ * legacy lock predating this generation omits them. Legacy records remain
+ * valid, signalable owner locks for every existing check in this module —
+ * they are simply non-authorizing for a D9 cross-bind check that requires a
+ * matching `ownerId`/`rootDigest` against the sibling state record.
+ */
+export interface ChatDaemonOwnerLock {
+	version?: 1;
 	pid: number;
 	incarnation: string;
 	createdAt: number;
+	ownerId?: string;
+	rootDigest?: string;
 }
 
-interface ChatDaemonOwnerLockLease {
+export interface ChatDaemonOwnerLockLease {
 	content: string;
 	dev: bigint;
 	ino: bigint;
@@ -344,6 +366,19 @@ interface ChatDaemonOwnerLockLease {
 	sha256: string;
 }
 
+/** Result of a bounded, no-follow owner-lock lease capture. Only `"absent"` (ENOENT) means the lock currently does not exist; every other failure is `"unreadable"` and must never be treated as absence. */
+export type ChatDaemonOwnerLockLeaseResult =
+	| { status: "present"; lease: ChatDaemonOwnerLockLease }
+	| { status: "absent" }
+	| { status: "unreadable" };
+
+const CHAT_DAEMON_OWNER_LOCK_LEASE_MAX_BYTES = 64 * 1024;
+
+/** Matches the canonical no-follow, non-blocking lock-info open flags used by config/file-lock.ts. */
+const CHAT_DAEMON_OWNER_LOCK_OPEN_FLAGS =
+	fs.constants.O_RDONLY |
+	(process.platform === "win32" ? 0 : (fs.constants.O_NOFOLLOW ?? 0) | (fs.constants.O_NONBLOCK ?? 0));
+
 interface ChatDaemonOwnershipProbe {
 	pidAlive(pid: number): boolean;
 	pidIncarnation(pid: number): string | undefined;
@@ -353,13 +388,54 @@ export function chatDaemonPaths(
 	agentDir: string,
 	kind: ChatDaemonKind,
 ): { dir: string; lock: string; state: string; control: string } {
-	const dir = path.join(agentDir, "sdk", "daemons", kind);
+	const dir = path.join(agentDir, CHAT_DAEMON_DIRECTORY, kind);
 	return {
 		dir,
-		lock: path.join(dir, "owner.lock"),
-		state: path.join(dir, "state.json"),
-		control: path.join(dir, "control.json"),
+		lock: path.join(dir, CHAT_DAEMON_FILES.ownerLock),
+		state: path.join(dir, CHAT_DAEMON_FILES.state),
+		control: path.join(dir, CHAT_DAEMON_FILES.control),
 	};
+}
+
+export function chatDoctorControlRequestPath(agentDir: string, kind: ChatDaemonKind): string {
+	return path.join(chatDaemonPaths(agentDir, kind).dir, "doctor-restart.control.json");
+}
+
+export async function readChatDoctorControlRequest(
+	agentDir: string,
+	kind: ChatDaemonKind,
+): Promise<DoctorDaemonControlRequest | undefined> {
+	try {
+		const parsed = JSON.parse(
+			await fs.promises.readFile(chatDoctorControlRequestPath(agentDir, kind), "utf8"),
+		) as unknown;
+		return isDoctorDaemonControlRequest(parsed) && parsed.owner === kind ? parsed : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+export async function writeChatDoctorControlRequest(
+	agentDir: string,
+	kind: ChatDaemonKind,
+	request: DoctorDaemonControlRequest,
+): Promise<void> {
+	if (request.owner !== kind) throw new Error(`${kind} doctor request owner mismatch`);
+	const file = chatDoctorControlRequestPath(agentDir, kind);
+	await fs.promises.mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
+	const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
+	await fs.promises.writeFile(tmp, `${JSON.stringify(request)}\n`, { mode: 0o600 });
+	await fs.promises.rename(tmp, file);
+}
+
+export async function clearChatDoctorControlRequest(
+	agentDir: string,
+	kind: ChatDaemonKind,
+	requestId?: string,
+): Promise<void> {
+	const file = chatDoctorControlRequestPath(agentDir, kind);
+	if (requestId && (await readChatDoctorControlRequest(agentDir, kind))?.requestId !== requestId) return;
+	await fs.promises.unlink(file).catch(() => undefined);
 }
 
 /**
@@ -951,7 +1027,7 @@ export async function ensureSlackDaemon(
 	return await ensureChatDaemon("slack", settings, deps);
 }
 
-export async function acquireChatDaemonOwnership(input: {
+export interface AcquireChatDaemonOwnershipInput {
 	agentDir: string;
 	kind: ChatDaemonKind;
 	ownerId: string;
@@ -960,7 +1036,16 @@ export async function acquireChatDaemonOwnership(input: {
 	incarnation?: string;
 	pidAlive?: (pid: number) => boolean;
 	pidIncarnation?: (pid: number) => string | undefined;
-}): Promise<boolean> {
+}
+
+/**
+ * Actual publication body. Runs ONLY inside {@link withDaemonStartupExclusion}
+ * (see {@link acquireChatDaemonOwnership}); never call this directly, and
+ * never call it from inside another already-held startup-exclusion guard for
+ * the same `(agentDir, kind)` — that would be a self-deadlocking reacquisition
+ * of a non-reentrant lock.
+ */
+async function acquireChatDaemonOwnershipLocked(input: AcquireChatDaemonOwnershipInput): Promise<boolean> {
 	const paths = chatDaemonPaths(input.agentDir, input.kind);
 	const pid = input.pid ?? process.pid;
 	const probe: ChatDaemonOwnershipProbe = {
@@ -983,7 +1068,17 @@ export async function acquireChatDaemonOwnership(input: {
 		)
 			return false;
 	}
-	const owner = { pid, incarnation, createdAt: Date.now() };
+	// Existing root: withDaemonStartupExclusion has already acquired its guard
+	// under this same agentDir, so the directory chain up to it exists.
+	const rootDigest = await canonicalServiceRootDigest(input.agentDir);
+	const owner: ChatDaemonOwnerLock = {
+		version: 1,
+		pid,
+		incarnation,
+		createdAt: Date.now(),
+		ownerId: input.ownerId,
+		rootDigest,
+	};
 	let lock = await createChatDaemonOwnerLock(paths.lock, owner);
 	if (!lock) {
 		if (!(await reclaimChatDaemonOwnerLock(paths.lock, paths.state, probe))) return false;
@@ -1003,9 +1098,24 @@ export async function acquireChatDaemonOwnership(input: {
 			heartbeatAt: Date.now(),
 			transportHealthy: false,
 			generation: chatDaemonGeneration(input.kind),
+			rootDigest,
 		} satisfies ChatDaemonState);
 		return true;
 	});
+}
+
+/**
+ * Publishes this process as the `(agentDir, kind)` chat daemon owner
+ * (owner.lock + state.json). Runs behind the shared cross-process startup
+ * exclusion so it can never race a doctor startup/maintenance repair that
+ * holds the same guard (e.g. detaching a stale owner-lock quarantine) — the
+ * guard is acquired here and released before returning; the actual
+ * lock-creation/state-publication logic lives in the unlocked
+ * {@link acquireChatDaemonOwnershipLocked} so the guard is never held across
+ * a nested reacquisition of itself.
+ */
+export async function acquireChatDaemonOwnership(input: AcquireChatDaemonOwnershipInput): Promise<boolean> {
+	return await withDaemonStartupExclusion(input.agentDir, input.kind, () => acquireChatDaemonOwnershipLocked(input));
 }
 
 async function createChatDaemonOwnerLock(
@@ -1029,44 +1139,79 @@ async function createChatDaemonOwnerLock(
 			throw error;
 		}
 		await fs.promises.unlink(temporary);
-		return await captureChatDaemonOwnerLockLease(lock);
+		return await captureChatDaemonOwnerLockLeaseOrUndefined(lock);
 	} finally {
 		await fs.promises.unlink(temporary).catch(() => undefined);
 	}
 }
 
-async function captureChatDaemonOwnerLockLease(lock: string): Promise<ChatDaemonOwnerLockLease | undefined> {
+/**
+ * Bounded, no-follow, non-blocking owner-lock lease capture. Opens with the
+ * same `O_NOFOLLOW|O_NONBLOCK` posture as the canonical lock-info reader in
+ * config/file-lock.ts, reads at most {@link CHAT_DAEMON_OWNER_LOCK_LEASE_MAX_BYTES}
+ * bytes through the open descriptor (never an unbounded `readFile`), and
+ * revalidates identity/parent-directory metadata before and after the read so a
+ * TOCTOU replacement during the read is detected rather than silently trusted.
+ *
+ * Only `ENOENT` on the initial open means the lock is currently absent.
+ * SYMLINK, FIFO/special-file, oversize, and any other I/O failure are all
+ * `"unreadable"` — distinct from absence, and callers must not treat them as
+ * "no lock exists".
+ */
+export async function captureChatDaemonOwnerLockLease(lock: string): Promise<ChatDaemonOwnerLockLeaseResult> {
+	let handle: fs.promises.FileHandle | undefined;
 	try {
-		const handle = await fs.promises.open(lock, "r");
 		try {
-			const before = await handle.stat({ bigint: true });
-			const parentBefore = await fs.promises.lstat(path.dirname(lock), { bigint: true });
-			if (!before.isFile()) return undefined;
-			const content = await handle.readFile({ encoding: "utf8" });
-			const after = await handle.stat({ bigint: true });
-			const pathname = await fs.promises.lstat(lock, { bigint: true });
-			const parentAfter = await fs.promises.lstat(path.dirname(lock), { bigint: true });
-			if (
-				!after.isFile() ||
-				!pathname.isFile() ||
-				pathname.isSymbolicLink() ||
-				before.nlink !== 1n ||
-				pathname.nlink !== 1n ||
-				!parentBefore.isDirectory() ||
-				parentBefore.isSymbolicLink() ||
-				parentBefore.dev !== parentAfter.dev ||
-				parentBefore.ino !== parentAfter.ino ||
-				before.dev !== after.dev ||
-				before.ino !== after.ino ||
-				before.size !== after.size ||
-				before.mtimeNs !== after.mtimeNs ||
-				before.dev !== pathname.dev ||
-				before.ino !== pathname.ino ||
-				before.size !== pathname.size ||
-				before.mtimeNs !== pathname.mtimeNs
-			)
-				return undefined;
-			return {
+			handle = await fs.promises.open(lock, CHAT_DAEMON_OWNER_LOCK_OPEN_FLAGS);
+		} catch (error) {
+			if (isEnoent(error)) return { status: "absent" };
+			return { status: "unreadable" };
+		}
+		const before = await handle.stat({ bigint: true });
+		const parentBefore = await fs.promises.lstat(path.dirname(lock), { bigint: true });
+		if (!before.isFile() || before.size > BigInt(CHAT_DAEMON_OWNER_LOCK_LEASE_MAX_BYTES))
+			return { status: "unreadable" };
+		const buffer = Buffer.alloc(CHAT_DAEMON_OWNER_LOCK_LEASE_MAX_BYTES);
+		let length = 0;
+		while (length < buffer.length) {
+			const read = await handle.read(buffer, length, buffer.length - length, length);
+			if (read.bytesRead === 0) break;
+			length += read.bytesRead;
+		}
+		const content = buffer.subarray(0, length).toString("utf8");
+		const after = await handle.stat({ bigint: true });
+		let pathname: fs.BigIntStats;
+		let parentAfter: fs.BigIntStats;
+		try {
+			pathname = await fs.promises.lstat(lock, { bigint: true });
+			parentAfter = await fs.promises.lstat(path.dirname(lock), { bigint: true });
+		} catch {
+			return { status: "unreadable" };
+		}
+		if (
+			!after.isFile() ||
+			!pathname.isFile() ||
+			pathname.isSymbolicLink() ||
+			before.nlink !== 1n ||
+			pathname.nlink !== 1n ||
+			!parentBefore.isDirectory() ||
+			parentBefore.isSymbolicLink() ||
+			parentBefore.dev !== parentAfter.dev ||
+			parentBefore.ino !== parentAfter.ino ||
+			before.dev !== after.dev ||
+			before.ino !== after.ino ||
+			before.size !== after.size ||
+			before.mtimeNs !== after.mtimeNs ||
+			before.dev !== pathname.dev ||
+			before.ino !== pathname.ino ||
+			before.size !== pathname.size ||
+			before.mtimeNs !== pathname.mtimeNs ||
+			after.size > BigInt(CHAT_DAEMON_OWNER_LOCK_LEASE_MAX_BYTES)
+		)
+			return { status: "unreadable" };
+		return {
+			status: "present",
+			lease: {
 				content,
 				dev: before.dev,
 				ino: before.ino,
@@ -1076,17 +1221,23 @@ async function captureChatDaemonOwnerLockLease(lock: string): Promise<ChatDaemon
 				parentDev: parentBefore.dev,
 				parentIno: parentBefore.ino,
 				sha256: crypto.createHash("sha256").update(content).digest("hex"),
-			};
-		} finally {
-			await handle.close();
-		}
+			},
+		};
 	} catch {
-		return undefined;
+		return { status: "unreadable" };
+	} finally {
+		await handle?.close();
 	}
 }
 
+/** Convenience wrapper for existing call sites that only need the lease or `undefined` (absent or unreadable alike). */
+async function captureChatDaemonOwnerLockLeaseOrUndefined(lock: string): Promise<ChatDaemonOwnerLockLease | undefined> {
+	const result = await captureChatDaemonOwnerLockLease(lock);
+	return result.status === "present" ? result.lease : undefined;
+}
+
 async function ownsChatDaemonOwnerLock(lock: string, lease: ChatDaemonOwnerLockLease): Promise<boolean> {
-	const current = await captureChatDaemonOwnerLockLease(lock);
+	const current = await captureChatDaemonOwnerLockLeaseOrUndefined(lock);
 	return (
 		current?.dev === lease.dev &&
 		current.ino === lease.ino &&
@@ -1162,7 +1313,7 @@ async function staleChatDaemonLockLease(
 	lock: string,
 	probe: ChatDaemonOwnershipProbe,
 ): Promise<ChatDaemonOwnerLockLease | undefined> {
-	const lease = await captureChatDaemonOwnerLockLease(lock);
+	const lease = await captureChatDaemonOwnerLockLeaseOrUndefined(lock);
 	if (!lease) return undefined;
 	let owner: unknown;
 	try {
@@ -1197,22 +1348,39 @@ async function canReclaimChatDaemonOwnerLock(
 	return await staleChatDaemonLockLease(lock, probe);
 }
 
-function isChatDaemonOwnerLock(value: unknown): value is ChatDaemonOwnerLock {
-	return (
-		typeof value === "object" &&
-		value !== null &&
-		typeof (value as ChatDaemonOwnerLock).pid === "number" &&
-		Number.isSafeInteger((value as ChatDaemonOwnerLock).pid) &&
-		(value as ChatDaemonOwnerLock).pid > 0 &&
-		typeof (value as ChatDaemonOwnerLock).incarnation === "string" &&
-		typeof (value as ChatDaemonOwnerLock).createdAt === "number"
-	);
+/**
+ * Strict: `pid`/`incarnation`/`createdAt` are always required. `version`,
+ * `ownerId`, and `rootDigest` are individually optional (legacy locks omit
+ * them), but any one that IS present must be well-formed — a malformed
+ * optional field is never silently ignored.
+ */
+export function isChatDaemonOwnerLock(value: unknown): value is ChatDaemonOwnerLock {
+	if (typeof value !== "object" || value === null) return false;
+	const candidate = value as Record<string, unknown>;
+	if (
+		typeof candidate.pid !== "number" ||
+		!Number.isSafeInteger(candidate.pid) ||
+		candidate.pid <= 0 ||
+		typeof candidate.incarnation !== "string" ||
+		candidate.incarnation.length === 0 ||
+		typeof candidate.createdAt !== "number" ||
+		!Number.isFinite(candidate.createdAt)
+	)
+		return false;
+	if (candidate.version !== undefined && candidate.version !== 1) return false;
+	if (
+		candidate.ownerId !== undefined &&
+		(typeof candidate.ownerId !== "string" || candidate.ownerId.length === 0 || candidate.ownerId.length > 256)
+	)
+		return false;
+	if (candidate.rootDigest !== undefined && !/^[0-9a-f]{64}$/.test(candidate.rootDigest as string)) return false;
+	return true;
 }
 
 function isAlreadyExists(error: unknown): error is NodeJS.ErrnoException {
 	return typeof error === "object" && error !== null && (error as NodeJS.ErrnoException).code === "EEXIST";
 }
-export async function renewChatDaemonHeartbeat(input: {
+export interface RenewChatDaemonHeartbeatInput {
 	agentDir: string;
 	kind: ChatDaemonKind;
 	ownerId: string;
@@ -1221,7 +1389,10 @@ export async function renewChatDaemonHeartbeat(input: {
 	transportHealthy: boolean;
 	pidAlive?: (pid: number) => boolean;
 	pidIncarnation?: (pid: number) => string | undefined;
-}): Promise<boolean> {
+}
+
+/** Actual body; runs ONLY inside {@link withDaemonStartupExclusion} (see {@link renewChatDaemonHeartbeat}). */
+async function renewChatDaemonHeartbeatLocked(input: RenewChatDaemonHeartbeatInput): Promise<boolean> {
 	const paths = chatDaemonPaths(input.agentDir, input.kind);
 	const pidAlive = input.pidAlive ?? defaultPidAlive;
 	const pidIncarnation = input.pidIncarnation ?? defaultPidIncarnation;
@@ -1244,7 +1415,19 @@ export async function renewChatDaemonHeartbeat(input: {
 		return true;
 	});
 }
-export async function releaseChatDaemonOwnership(input: {
+
+/**
+ * Renews the exact-owner heartbeat for `(agentDir, kind)`. Runs behind the
+ * shared cross-process startup exclusion so a heartbeat can never publish in
+ * the middle of a doctor startup/maintenance repair holding the same guard;
+ * the actual re-check-and-write logic lives in the unlocked
+ * {@link renewChatDaemonHeartbeatLocked}.
+ */
+export async function renewChatDaemonHeartbeat(input: RenewChatDaemonHeartbeatInput): Promise<boolean> {
+	return await withDaemonStartupExclusion(input.agentDir, input.kind, () => renewChatDaemonHeartbeatLocked(input));
+}
+
+export interface ReleaseChatDaemonOwnershipInput {
 	agentDir: string;
 	kind: ChatDaemonKind;
 	ownerId: string;
@@ -1252,7 +1435,10 @@ export async function releaseChatDaemonOwnership(input: {
 	incarnation: string;
 	pidAlive?: (pid: number) => boolean;
 	pidIncarnation?: (pid: number) => string | undefined;
-}): Promise<void> {
+}
+
+/** Actual body; runs ONLY inside {@link withDaemonStartupExclusion} (see {@link releaseChatDaemonOwnership}). */
+async function releaseChatDaemonOwnershipLocked(input: ReleaseChatDaemonOwnershipInput): Promise<void> {
 	const paths = chatDaemonPaths(input.agentDir, input.kind);
 	const pidAlive = input.pidAlive ?? defaultPidAlive;
 	const pidIncarnation = input.pidIncarnation ?? defaultPidIncarnation;
@@ -1271,7 +1457,7 @@ export async function releaseChatDaemonOwnership(input: {
 		)
 			return;
 		await writeJson(paths.state, { ...state, stoppedAt: Date.now(), transportHealthy: false });
-		const lock = await captureChatDaemonOwnerLockLease(paths.lock);
+		const lock = await captureChatDaemonOwnerLockLeaseOrUndefined(paths.lock);
 		let owner: unknown;
 		try {
 			owner = lock && JSON.parse(lock.content);
@@ -1279,4 +1465,14 @@ export async function releaseChatDaemonOwnership(input: {
 		if (lock && isChatDaemonOwnerLock(owner) && owner.pid === state.pid && owner.incarnation === state.incarnation)
 			unlinkExactChatDaemonOwnerLock(paths.lock, lock);
 	});
+}
+
+/**
+ * Releases this process's `(agentDir, kind)` chat daemon ownership. Runs
+ * behind the shared cross-process startup exclusion for the same reason as
+ * {@link acquireChatDaemonOwnership}; the actual re-check-and-unpublish logic
+ * lives in the unlocked {@link releaseChatDaemonOwnershipLocked}.
+ */
+export async function releaseChatDaemonOwnership(input: ReleaseChatDaemonOwnershipInput): Promise<void> {
+	await withDaemonStartupExclusion(input.agentDir, input.kind, () => releaseChatDaemonOwnershipLocked(input));
 }

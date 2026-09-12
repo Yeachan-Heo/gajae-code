@@ -5,6 +5,7 @@ import * as path from "node:path";
 
 const repoRoot = path.resolve(import.meta.dir, "..", "..", "..");
 const cliEntry = path.join(repoRoot, "packages", "coding-agent", "src", "cli.ts");
+const cliMainPath = path.join(repoRoot, "packages", "coding-agent", "src", "cli-main.ts");
 
 async function readStream(stream: ReadableStream<Uint8Array>): Promise<string> {
 	const reader = stream.getReader();
@@ -40,7 +41,7 @@ function itWithTempRoot(name: string, prefix: string, run: (root: string) => Pro
 
 describe("CLI help load order", () => {
 	it("keeps model preset command out of the eager CLI module graph", async () => {
-		const source = await fs.readFile(cliEntry, "utf8");
+		const source = await fs.readFile(cliMainPath, "utf8");
 		expect(source).not.toContain('import ModelPresets from "./commands/model-presets"');
 		expect(source).toContain('{ name: "model-presets", load: () => import("./commands/model-presets")');
 	});
@@ -363,8 +364,8 @@ const argsPath = path.join(repoRoot, "packages", "coding-agent", "src", "cli", "
 const fastHelpPath = path.join(repoRoot, "packages", "coding-agent", "src", "cli", "fast-help.ts");
 
 describe("CLI help single source of truth", () => {
-	it("cli.ts sources help from fast-help.ts, not args.ts", async () => {
-		const cliSource = await Bun.file(cliEntry).text();
+	it("cli-main.ts sources help from fast-help.ts, not args.ts", async () => {
+		const cliSource = await Bun.file(cliMainPath).text();
 
 		// Root help is rendered via the live fast-help module; the dead
 		// args.ts help exports must not be on the import path.
@@ -375,7 +376,7 @@ describe("CLI help single source of truth", () => {
 	it("fast-help.ts is the live help SSOT and renders the retained sections", async () => {
 		const fastHelpSource = await Bun.file(fastHelpPath).text();
 
-		// fast-help.ts owns the live help export that cli.ts calls.
+		// fast-help.ts owns the live help export that cli-main.ts calls.
 		expect(fastHelpSource).toContain("export function getExtraHelpText");
 
 		// Every section fast-help.ts emits must be present so the live --help

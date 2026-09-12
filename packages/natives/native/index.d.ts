@@ -51,6 +51,11 @@ export declare class ComputerController {
   keypress(expectedEpoch: number | undefined | null, keys: Array<string>): void
   wait(expectedEpoch: number | undefined | null, ms: number): void
 }
+export declare class DoctorJournalAuthority {
+  static createExact(root: string, runId: string): DoctorJournalCreateResult
+  append(record: string): void
+  close(): void
+}
 
 /**
  * Long-lived macOS appearance observer.
@@ -124,6 +129,29 @@ export declare class NativeRetainedBrokerPublication {
    * unbounded write is exactly the wedge this must not reproduce.
    */
   close(): NativeBrokerPublicationOperation
+  /**
+   * Owner-side prepare: exclusively creates the retained restart-intent slot
+   * and keeps its descriptor open, so a later commit/cancel from this same
+   * process never reopens by name.
+   */
+  prepareRestartIntentAsync(intent: NativeBrokerRestartIntent): Promise<NativeBrokerPublicationOperation>
+  /**
+   * Owner-side commit: rewrites the SAME retained descriptor from prepare, so
+   * the transition can never race a different file occupying the name.
+   */
+  commitRestartIntentAsync(intent: NativeBrokerRestartIntent): Promise<NativeBrokerPublicationOperation>
+  /**
+   * Owner-side cancel: exact-identity unlink of this process's own retained
+   * slot. A lease expiry (no live owner to call this) leaves the file for the
+   * successor's verified `clear_restart_intent_async` instead.
+   */
+  cancelRestartIntentAsync(): Promise<NativeBrokerPublicationOperation>
+  /**
+   * Successor-side clear: exact-identity unlink of a predecessor's restart
+   * slot this process never prepared itself. Only removes the name when its
+   * current on-disk identity still matches the caller-proven dev/ino.
+   */
+  clearRestartIntentAsync(identity: NativeBrokerRestartIntentIdentity): Promise<NativeBrokerPublicationOperation>
 }
 
 /** In-process notification server handle exposed to TypeScript. */
@@ -327,6 +355,16 @@ export declare class Process {
   static fromPid(pid: number): Process | null
   /** Open stable process references whose executable path matches exactly. */
   static fromPath(path: string): Array<Process>
+  /**
+   * Read-only observation of whether `pid` currently names a verifiable
+   * process incarnation.
+   *
+   * Unlike [`Self::from_pid`] returning `null` (which conflates a confirmed-
+   * dead pid with one that simply could not be queried), this keeps positive
+   * OS-reported absence separate from every inconclusive outcome. It never
+   * signals, kills, reaps, waits on, or spawns any process.
+   */
+  static observe(pid: number): NativeProcessObservation
   /** Operating-system process identifier for this process reference. */
   get pid(): number
   /** Kernel-derived identity evidence for this exact process incarnation. */
@@ -868,6 +906,19 @@ export declare function detectMacOSAppearance(): MacOSAppearance | null
  */
 export declare function diffLines(oldStr: string, newStr: string): Array<LineDiffPart>
 
+export interface DoctorJournalCreateResult {
+  authority?: DoctorJournalAuthority
+  sideEffectStarted: boolean
+  reasonCode?: string
+}
+
+export interface DoctorLinkSwapResult {
+  status: string
+  changed: boolean
+  verified: boolean
+  code?: string
+}
+
 /** Ellipsis strategy for [`truncate_to_width`]. */
 export declare enum Ellipsis {
   /** Use a single Unicode ellipsis character ("…"). */
@@ -909,11 +960,61 @@ export declare function exactRemoveDirectoryTree(path: string, snapshot: NativeD
 export declare function exactReplacePath(sourcePath: string, destinationPath: string, expectedSource: NativeExactFileIdentity, expectedDestination: NativeExactFileIdentity): NativeExactUnlinkResult
 
 /**
+ * Atomically replace an in-place executable (or other running-process
+ * payload) only after validating the exact staged source and current
+ * destination.
+ *
+ * The old destination bytes are retired to a caller-preauthorized backup
+ * name instead of being scrubbed or unlinked.
+ *
+ * This exists for D4 self-replacement: [`exact_replace_path`] retires its
+ * predecessor through the same descriptor-scrub/exchange-cleanup protocol
+ * [`exact_unlink`] uses, which either truncates the old bytes in place
+ * (POSIX, when the exchange succeeds) or deletes them outright (Windows).
+ * Both are safe for a config file with no open executing mapping, but unsafe
+ * for a binary a running process may still be mapped from or about to
+ * re-exec: scrubbing or deleting those bytes out from under a live mapping
+ * can crash the very process performing the update. `exact_replace_retained`
+ * therefore never truncates or deletes the predecessor at all -- it commits
+ * the atomic exchange (POSIX) or native rename swap (Windows) and then
+ * renames the old destination to `backup_name` in the same parent, leaving
+ * its bytes byte-for-byte intact and readable at that retained path.
+ *
+ * `backup_name` must be a bounded (<=255 bytes), single-path-component,
+ * separator-free, non-`.`/`..` name; it is used verbatim, with no
+ * auto-suffixing, and an already-occupied backup name is refused rather than
+ * overwritten -- the caller is responsible for choosing a name that will not
+ * collide with a foreign object, and a collision leaves the retired
+ * predecessor's replacement decision to a later caller rather than losing
+ * data. Both identities must describe regular files in the same retained
+ * parent, never directories or detach-only requests, and both are
+ * CAS-checked (parent identity + dev/ino/size/mtime/hash + regular/
+ * single-link ownership; hard-linked or symlinked source/destination are
+ * rejected) before anything is mutated. On Windows a pre-mutation
+ * `STATUS_SHARING_VIOLATION` on the destination open is reported as a
+ * distinct `sharing_violation` code with `windows_error_code` set -- exactly
+ * as [`exact_replace_path`] already reports it -- and is always surfaced
+ * before any rename, so it is never mistaken for a post-effect failure.
+ */
+export declare function exactReplaceRetained(sourcePath: string, destinationPath: string, backupName: string, expectedSource: NativeExactFileIdentity, expectedDestination: NativeExactFileIdentity): NativeExactUnlinkResult
+
+/**
  * Restore only the detached object that still has the supplied exact
  * identity. The detached and original paths must retain the same validated
  * parent, and restoration never replaces an existing original path.
  */
 export declare function exactRestore(detachedPath: string, originalPath: string, identity: NativeExactFileIdentity): NativeExactUnlinkResult
+
+/**
+ * Exchange a staged symlink with the expected destination using the platform
+ * atomic name-exchange primitive.
+ *
+ * The destination's parent is retained as a single opened descriptor for
+ * every check and mutation. The retired link is moved into `quarantine_path`
+ * with a no-replace rename; it is never deleted and a foreign occupant at
+ * any of the three names is always refused rather than overwritten.
+ */
+export declare function exactSwapManagedLink(stagedPath: string, destinationPath: string, quarantinePath: string, parentDev: string, parentIno: string, oldDev: string, oldIno: string, oldTarget: string, stagedDev: string, stagedIno: string, newTarget: string): DoctorLinkSwapResult
 
 /**
  * Delete only the regular file that still has the supplied platform identity.
@@ -1025,6 +1126,15 @@ export interface FuzzyFindResult {
   /** Total number of matches found (may exceed `matches.len()`). */
   totalMatches: number
 }
+
+/**
+ * Protocol version for [`exact_swap_managed_link`]'s argument contract.
+ *
+ * The caller checks this before staging anything so a stale addon (old
+ * argument order/count) is refused up front rather than discovered
+ * mid-mutation.
+ */
+export declare function getDoctorLinkProtocolVersion(): number
 
 /** Get list of supported languages. */
 export declare function getSupportedLanguages(): Array<string>
@@ -1378,6 +1488,12 @@ export interface InboundImageEvent {
  * panics crossing N-API boundaries.
  */
 export declare function initNativeCrashDiagnostics(): boolean
+
+/**
+ * Validate the exact permission repair preconditions without changing
+ * metadata.
+ */
+export declare function inspectConfigFilePermissionRepair(path: string, identity: NativeExactFileIdentity, expectedMode: number): NativePermissionRepairResult
 
 /**
  * Invalidate the filesystem scan cache.
@@ -1742,6 +1858,22 @@ export interface NativeBrokerPublicationOperation {
   kind: string
 }
 
+export interface NativeBrokerRestartIntent {
+  requestId: string
+  lease: string
+  expiresAt: number
+}
+
+/**
+ * Existing file-identity cross-bind (never a secret) that authorizes a
+ * successor to remove a predecessor's restart-intent slot it never itself
+ * prepared.
+ */
+export interface NativeBrokerRestartIntentIdentity {
+  dev: bigint
+  ino: bigint
+}
+
 export declare function nativeBuildInfo(): BuildInfo
 
 /** Result of resolving an existing directory to its stable platform identity. */
@@ -1964,6 +2096,50 @@ export type NativeOwnerOnlySecurityResult =
 			protocol?: never;
 			aclEvidence?: never;
 	  }
+
+/** Result of removing group/other permission bits from one exact config file. */
+export interface NativePermissionRepairResult {
+  status: string
+  changed: boolean
+  verified: boolean
+  code?: string
+}
+
+/**
+ * Read-only, non-mutating observation of whether a pid currently names a
+ * verifiable process incarnation.
+ *
+ * `status` discriminates the three outcomes described on
+ * [`pi_shell::process::ProcessObservation`]:
+ * - `"present"` — `incarnation` is the exact kernel-reported identity
+ *   evidence.
+ * - `"absent"` — the OS positively confirmed no process currently has this
+ *   pid.
+ * - `"unknown"` — `reasonCode` explains why liveness could not be determined
+ *   (e.g. an invalid pid, a permission denial, or a platform limitation); this
+ *   is never proof of death.
+ */
+export interface NativeProcessObservation {
+  status: 'present' | 'absent' | 'unknown'
+  incarnation?: string
+  reasonCode?: string
+}
+
+/** Bounded, path-free evidence for one publish operation. */
+export interface NativePublishDiagnostic {
+  schemaVersion: number
+  collectionState: string
+  osCode?: number
+  syncFailures?: Array<NativePublishSyncFailure>
+}
+
+/** Bounded, path-free evidence for one publish operation. */
+export interface NativePublishSyncFailure {
+  phase: string
+  parentRole: string
+  osCode: number
+  kind: string
+}
 
 /** Bound endpoint info returned from [`NotificationServer::start`]. */
 export interface NotificationEndpoint {
@@ -2194,6 +2370,12 @@ export declare function renameNoReplacePath(sourcePath: string, destinationPath:
  * one unresolved receipt rather than a frozen process.
  */
 export declare function renameNoReplacePathAsync(sourcePath: string, destinationPath: string): Promise<NativeNoReplaceResult>
+
+/**
+ * Remove only group/other permission bits from an exact, user-owned regular
+ * file.
+ */
+export declare function repairConfigFilePermissions(path: string, identity: NativeExactFileIdentity, expectedMode: number): NativePermissionRepairResult
 
 /**
  * Repair an owner-only ACL on a retained expected path.
@@ -2494,19 +2676,3 @@ export interface WorkProfile {
  * Returns UTF-16 lines with active SGR codes carried across line boundaries.
  */
 export declare function wrapTextWithAnsi(text: string, width: number, tabWidth: number): Array<string>
-
-/** Bounded, path-free evidence for a parent-directory durability failure. */
-export interface NativePublishSyncFailure {
-  phase: string
-  parentRole: string
-  osCode: number
-  kind: string
-}
-
-/** Bounded, path-free evidence for one atomic publication. */
-export interface NativePublishDiagnostic {
-  schemaVersion: number
-  collectionState: string
-  osCode?: number
-  syncFailures?: Array<NativePublishSyncFailure>
-}

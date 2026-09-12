@@ -82,6 +82,23 @@ async function readJson(file: string): Promise<Record<string, unknown>> {
 	return JSON.parse(await Bun.file(file).text()) as Record<string, unknown>;
 }
 
+async function waitForPath(
+	pathname: string,
+	predicate: (stat: fsSync.BigIntStats) => boolean,
+	label: string,
+): Promise<void> {
+	const deadline = Date.now() + 5_000;
+	while (Date.now() < deadline) {
+		try {
+			if (predicate(fsSync.lstatSync(pathname, { bigint: true }))) return;
+		} catch {
+			// The owner may not have published the path yet.
+		}
+		await Bun.sleep(25);
+	}
+	throw new Error(`Timed out waiting for ${label}`);
+}
+
 async function seededRunningSession(name: string): Promise<{ root: string; stateFile: string }> {
 	const root = await tempRoot();
 	const stateFile = path.join(root, `${name}.json`);
@@ -2694,15 +2711,15 @@ describe("coordinator session state lock", () => {
 		// only window where the outer lock is observable on disk.
 		const release = Promise.withResolvers<void>();
 		const holder = withSessionStateFileLock(stateFile, () => release.promise);
-		await Bun.sleep(20);
+		await waitForPath(`${stateFile}.lock`, stat => stat.isFile(), "state-file owner lock");
 		const persist = persistCoordinatorRuntimeStateFromEvent(
 			{ type: "tool_execution_start", toolCallId: "call-1" },
 			{ sessionId: SESSION_ID, cwd: root, sessionFile: null },
 			{ label: "bash", observedAt: "2026-03-01T00:00:01.000Z" },
 		);
-		await Bun.sleep(40);
 
 		const mutationLock = path.join(root, "locks", "mutation.lock.lock");
+		await waitForPath(mutationLock, stat => stat.isDirectory(), "namespace mutation lock");
 		expect(fsSync.statSync(mutationLock).isDirectory()).toBe(true);
 		expect(fsSync.existsSync(path.join(mutationLock, "info"))).toBe(true);
 		expect(fsSync.statSync(`${stateFile}.lock`).isFile()).toBe(true);

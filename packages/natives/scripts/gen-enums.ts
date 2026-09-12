@@ -262,7 +262,7 @@ function applyPathIdentityTypes(dts: string): string {
 		)
 		.replace(/export interface NativeCanonicalDirectoryIdentity \{[\s\S]*?\n\}/, identity)
 		.replace(
-			/export (?:interface|type) NativeOwnerOnlySecurityResult[\s\S]*?(?=\n\n\/\*\* Bound endpoint info)/,
+			/export interface NativeOwnerOnlySecurityResult \{[\s\S]*?\n\}|export type NativeOwnerOnlySecurityResult =[\s\S]*?(?=\n\n(?:export\b|\/\*\*)|$)/,
 			security,
 		);
 }

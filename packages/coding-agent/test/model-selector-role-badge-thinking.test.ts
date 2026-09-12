@@ -536,7 +536,7 @@ describe("ModelSelector canonical model selection", () => {
 		await Bun.sleep(0);
 		installTestTheme();
 
-		expect(refreshProvider).toHaveBeenCalledWith("ollama-cloud", "online-if-uncached");
+		expect(refreshProvider).toHaveBeenCalledWith("ollama-cloud", "online-if-uncached", undefined);
 		const rendered = normalizeRenderedText(selector.render(220).join("\n"));
 		expect(rendered).toContain("deepseek-v4-pro");
 		expect(rendered).not.toContain("Provider has not been refreshed yet");

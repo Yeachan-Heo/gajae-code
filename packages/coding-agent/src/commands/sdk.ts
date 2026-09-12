@@ -1113,6 +1113,15 @@ export default class Sdk extends Command {
 					const startupDelayMs = Number(process.env.GJC_SDK_TEST_BROKER_STARTUP_DELAY_MS ?? 0);
 					if (Number.isSafeInteger(startupDelayMs) && startupDelayMs > 0 && startupDelayMs <= 10_000)
 						await Bun.sleep(startupDelayMs);
+					// The real broker-internal entry point is the only place that reads this
+					// launcher-supplied environment variable; it is validated here and handed
+					// to Broker as a typed setting, never read a second time inside broker.ts
+					// from process.env directly.
+					const restartRequestEnv = process.env.GJC_BROKER_RESTART_REQUEST;
+					const restartRequestId =
+						typeof restartRequestEnv === "string" && /^[A-Za-z0-9_-]{1,256}$/.test(restartRequestEnv)
+							? restartRequestEnv
+							: undefined;
 					const candidate = new Broker({
 						agentDir,
 						masterOrphanGraceMs: (await Settings.loadForScope({ cwd: process.cwd(), agentDir })).get(
@@ -1127,6 +1136,7 @@ export default class Sdk extends Command {
 								await settings.close();
 							}
 						},
+						...(restartRequestId === undefined ? {} : { restartRequestId }),
 					});
 					broker = candidate;
 					await candidate.start();

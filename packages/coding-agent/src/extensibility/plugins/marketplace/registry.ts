@@ -17,6 +17,8 @@ import * as path from "node:path";
 
 import { getConfigRootDir, getPluginsDir, isEnoent, logger, tryParseJson } from "@gajae-code/utils";
 
+import { withFileLock } from "../../../config/file-lock";
+
 import type {
 	InstalledPluginEntry,
 	InstalledPluginsRegistry,
@@ -129,6 +131,157 @@ export async function readInstalledPluginsRegistry(filePath: string): Promise<In
 
 export async function writeInstalledPluginsRegistry(filePath: string, reg: InstalledPluginsRegistry): Promise<void> {
 	await atomicWriteJson(filePath, reg);
+}
+
+/**
+ * Refuse a registry file that is not an ordinary, singly-linked regular file:
+ * a symlink could redirect the write elsewhere, and a hard link (nlink > 1)
+ * means the mutation would silently also change another path. Absence is not
+ * a refusal — that is the normal "nothing installed yet" state.
+ */
+async function assertOrdinaryRegistryFile(filePath: string): Promise<void> {
+	let stat: import("node:fs").Stats;
+	try {
+		stat = await fs.lstat(filePath);
+	} catch (err) {
+		if (isEnoent(err)) return;
+		throw err;
+	}
+	if (stat.isSymbolicLink() || !stat.isFile() || stat.nlink > 1) {
+		throw Object.assign(new Error(`Installed plugins registry at ${filePath} is not a safe ordinary file`), {
+			code: "unsafe_registry_link",
+		});
+	}
+}
+
+/**
+ * Strict read for mutation/CAS callers: a missing file is legitimately empty,
+ * but malformed JSON or an unexpected shape must never be silently treated as
+ * an empty registry — that would let a mutating writer overwrite (and lose)
+ * an unreadable but non-empty registry. Use {@link readInstalledPluginsRegistry}
+ * for lenient, display-only reads.
+ */
+async function readInstalledPluginsRegistryStrict(filePath: string): Promise<InstalledPluginsRegistry> {
+	await assertOrdinaryRegistryFile(filePath);
+	let text: string;
+	try {
+		text = await fs.readFile(filePath, "utf8");
+	} catch (err) {
+		if (isEnoent(err)) return emptyInstalledPluginsRegistry();
+		throw err;
+	}
+	const data = tryParseJson<InstalledPluginsRegistry>(text);
+	if (
+		!data ||
+		typeof data !== "object" ||
+		typeof data.version !== "number" ||
+		!data.plugins ||
+		typeof data.plugins !== "object" ||
+		Array.isArray(data.plugins)
+	) {
+		throw Object.assign(new Error(`Installed plugins registry is malformed at ${filePath}`), {
+			code: "malformed_registry",
+		});
+	}
+	return { ...data, version: 2 };
+}
+
+/** dev/ino/mtime/size identity of a file plus its parent directory, for exact CAS. */
+async function fileParentIdentity(filePath: string): Promise<Record<string, string> | null> {
+	try {
+		const stat = await fs.lstat(filePath, { bigint: true });
+		const parent = await fs.lstat(path.dirname(filePath), { bigint: true });
+		return {
+			dev: stat.dev.toString(),
+			ino: stat.ino.toString(),
+			mtimeNs: stat.mtimeNs.toString(),
+			size: stat.size.toString(),
+			parentDev: parent.dev.toString(),
+			parentIno: parent.ino.toString(),
+		};
+	} catch {
+		return null;
+	}
+}
+
+function entryBaseline(identity: Record<string, string> | null, entry: InstalledPluginEntry): string {
+	return JSON.stringify({ identity, entry });
+}
+
+export type InstalledPluginEnablementState =
+	| { status: "ok"; enabled: boolean; baseline: string }
+	| { status: "not_installed" }
+	| { status: "malformed" }
+	| { status: "unsafe_link" };
+
+/**
+ * Pure read-only snapshot of one (id, scope) entry's durable enablement plus
+ * an exact file+parent CAS baseline. Never touches the cached artifact at
+ * `installPath` — presence/absence of that artifact is a D6 concern, not D7's.
+ * A symlinked or hard-linked registry file is refused distinctly from an
+ * absent ("not_installed"-eligible) or malformed one.
+ */
+export async function getInstalledPluginEnablementState(
+	filePath: string,
+	id: string,
+	scope: "user" | "project",
+): Promise<InstalledPluginEnablementState> {
+	let reg: InstalledPluginsRegistry;
+	try {
+		reg = await readInstalledPluginsRegistryStrict(filePath);
+	} catch (error) {
+		if (error instanceof Error && (error as { code?: string }).code === "unsafe_registry_link")
+			return { status: "unsafe_link" };
+		return { status: "malformed" };
+	}
+	const entry = reg.plugins[id]?.find(e => e.scope === scope);
+	if (!entry) return { status: "not_installed" };
+	const identity = await fileParentIdentity(filePath);
+	return { status: "ok", enabled: entry.enabled !== false, baseline: entryBaseline(identity, entry) };
+}
+
+/**
+ * Update durable marketplace enablement without touching cached artifacts.
+ * Serialized under the canonical native-identity-bound file lock ordinary
+ * marketplace writers use (bounded retries, no blind directory removal).
+ * `expectedBaseline` is required: a caller with no prior read has no CAS
+ * authority and must call {@link getInstalledPluginEnablementState} first.
+ */
+export async function setInstalledPluginEnabled(
+	filePath: string,
+	id: string,
+	scope: "user" | "project",
+	enabled: boolean,
+	expectedBaseline: string,
+): Promise<"updated" | "not_needed"> {
+	return await withFileLock(filePath, async () => {
+		let reg: InstalledPluginsRegistry;
+		try {
+			reg = await readInstalledPluginsRegistryStrict(filePath);
+		} catch (error) {
+			if (error instanceof Error && (error as { code?: string }).code === "unsafe_registry_link") throw error;
+			throw Object.assign(new Error(`Installed plugins registry is malformed at ${filePath}`), {
+				code: "malformed_registry",
+				cause: error,
+			});
+		}
+		const entries = reg.plugins[id];
+		const index = entries?.findIndex(entry => entry.scope === scope) ?? -1;
+		if (!entries || index < 0)
+			throw Object.assign(new Error(`Plugin "${id}" is not installed in ${scope} scope`), { code: "not_installed" });
+		const current = entries[index] as InstalledPluginEntry;
+		const identity = await fileParentIdentity(filePath);
+		const baseline = entryBaseline(identity, current);
+		if (baseline !== expectedBaseline)
+			throw Object.assign(new Error("The installed plugin entry changed since it was reviewed"), {
+				code: "stale_baseline",
+			});
+		if ((current.enabled ?? true) === enabled) return "not_needed";
+		const nextEntries = [...entries];
+		nextEntries[index] = { ...current, enabled };
+		await writeInstalledPluginsRegistry(filePath, { ...reg, plugins: { ...reg.plugins, [id]: nextEntries } });
+		return "updated";
+	});
 }
 
 // ── Marketplace CRUD ─────────────────────────────────────────────────
