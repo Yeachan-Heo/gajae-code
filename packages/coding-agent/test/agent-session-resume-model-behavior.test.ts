@@ -236,6 +236,61 @@ describe("AgentSession switchSession resumeModelBehavior", () => {
 		expect(setConfiguredChain).not.toHaveBeenCalled();
 	});
 
+	it("does not mask strict durable-profile provider failures during recovery", async () => {
+		const sonnet = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const codex = getBundledModel("openai-codex", "gpt-5.6-sol")!;
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"modelProfile.default": "codex-medium",
+			"session.resumeModelBehavior": "keepSessionModel",
+		});
+		const sessionFile = await createPersistedTarget(sonnet, settings);
+
+		session = new AgentSession({
+			agent: new Agent({ initialState: { model: sonnet, systemPrompt: ["Test"], tools: [], messages: [] } }),
+			sessionManager: SessionManager.create(tempDir.path(), tempDir.path()),
+			settings,
+			modelRegistry,
+		});
+		vi.spyOn(modelRegistry, "getAvailable").mockReturnValue([codex]);
+		vi.spyOn(modelRegistry, "getAll").mockReturnValue([codex]);
+		vi.spyOn(modelRegistry, "getApiKeyForProvider").mockImplementation(async provider => {
+			if (provider === "openai-codex") throw new Error("required provider lookup failed");
+			return "test-key";
+		});
+
+		await expect(session.switchSession(sessionFile)).rejects.toThrow("required provider lookup failed");
+	});
+
+	it("does not mask strict proxy failures during recovery", async () => {
+		const sonnet = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const codex = getBundledModel("openai-codex", "gpt-5.6-sol")!;
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"modelProfile.default": "codex-medium",
+			"modelProfile.proxyMode": "always",
+			"modelProfile.proxyProvider": "proxy",
+			"session.resumeModelBehavior": "keepSessionModel",
+		});
+		const sessionFile = await createPersistedTarget(sonnet, settings);
+
+		session = new AgentSession({
+			agent: new Agent({ initialState: { model: sonnet, systemPrompt: ["Test"], tools: [], messages: [] } }),
+			sessionManager: SessionManager.create(tempDir.path(), tempDir.path()),
+			settings,
+			modelRegistry,
+		});
+		vi.spyOn(modelRegistry, "getAvailable").mockReturnValue([codex]);
+		vi.spyOn(modelRegistry, "getAll").mockReturnValue([codex]);
+		vi.spyOn(modelRegistry, "getConfiguredProviderIds").mockReturnValue(["proxy"]);
+		vi.spyOn(modelRegistry, "getApiKeyForProvider").mockImplementation(async provider => {
+			if (provider === "proxy") throw new Error("proxy provider lookup failed");
+			return "test-key";
+		});
+
+		await expect(session.switchSession(sessionFile)).rejects.toThrow("proxy provider lookup failed");
+	});
+
 	it("restores predecessor profile cleanup state when successor persistence fails", async () => {
 		const sonnet = getBundledModel("anthropic", "claude-sonnet-4-5")!;
 		const settings = Settings.isolated({ "compaction.enabled": false });
