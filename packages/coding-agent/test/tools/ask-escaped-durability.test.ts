@@ -10,6 +10,7 @@ import { readWorkflowStateJson } from "@gajae-code/coding-agent/gjc-runtime/stat
 import type { ToolSession } from "@gajae-code/coding-agent/tools";
 import { AskTool } from "@gajae-code/coding-agent/tools/ask";
 import { TempDir } from "@gajae-code/utils";
+import { terminalOnlyStream } from "../helpers/terminal-only-stream";
 
 function identityConverter(messages: AgentMessage[]): Message[] {
 	return messages.filter(
@@ -131,7 +132,7 @@ describe("AskTool escaped deep-interview durability (#4926)", () => {
 			const toolResults: Array<{ isError?: boolean; text: string }> = [];
 			const userMessage = { role: "user" as const, content: "Ask the durability question", timestamp: 1 };
 
-			const stream = agentLoop([userMessage], context, config, undefined, mock.stream);
+			const stream = agentLoop([userMessage], context, config, undefined, terminalOnlyStream(mock.stream));
 			for await (const event of stream) {
 				if (event.type === "tool_execution_end") {
 					const first = event.result.content?.[0];
