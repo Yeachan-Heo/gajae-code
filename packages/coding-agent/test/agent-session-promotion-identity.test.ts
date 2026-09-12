@@ -941,4 +941,156 @@ describe("queued promotion run identity (#4668)", () => {
 		await promptDone;
 		await session.waitForIdle();
 	});
+
+	it("cancels a steer after abort re-arms it as a follow-up", async () => {
+		const gate = Promise.withResolvers<void>();
+		const toolStarted = Promise.withResolvers<void>();
+		const blockingTool: AgentTool<typeof echoSchema, EchoParams> = {
+			name: "echo",
+			label: "Echo",
+			description: "Echo tool",
+			parameters: echoSchema,
+			async execute() {
+				toolStarted.resolve();
+				await gate.promise;
+				return { content: [{ type: "text", text: "done" }] };
+			},
+		};
+		session = buildSession(
+			[
+				{ content: [{ type: "toolCall", name: "echo", arguments: { value: "first" } }] },
+				{ content: ["rearmed steer must not execute"] },
+			],
+			blockingTool,
+		);
+		const promptDone = session.prompt("first task");
+		await toolStarted.promise;
+		const submission = await session.submitUserMessage("rearmable steer", {
+			deliverAs: "steer",
+			trackSubmission: true,
+		});
+		expect(session.agent.snapshotSteering()).toHaveLength(1);
+
+		const cancellation = Promise.withResolvers<boolean>();
+		const unsubscribe = session.subscribe(event => {
+			if (event.type !== "agent_end" || event.disownedSteering?.length !== 1) return;
+			cancellation.resolve(submission.cancel());
+		});
+		const abort = session.abort({ cause: "user_interrupt" });
+		gate.resolve();
+
+		expect(await Promise.race([cancellation.promise, Bun.sleep(5_000).then(() => false)])).toBe(true);
+		unsubscribe();
+		await expect(submission.execution).resolves.toMatchObject({
+			submissionId: submission.submissionId,
+			disposition: "removed",
+			reason: "cancelled",
+		});
+		await expect(submission.terminal).resolves.toMatchObject({
+			submissionId: submission.submissionId,
+			disposition: "removed",
+			reason: "cancelled",
+		});
+		await abort;
+		await promptDone;
+		await session.waitForIdle();
+	});
+
+	it("settles tracked steering when one logical run rotates attempt scopes", async () => {
+		const firstGate = Promise.withResolvers<void>();
+		const secondGate = Promise.withResolvers<void>();
+		const firstToolStarted = Promise.withResolvers<void>();
+		const secondToolStarted = Promise.withResolvers<void>();
+		let toolCallCount = 0;
+		const blockingTool: AgentTool<typeof echoSchema, EchoParams> = {
+			name: "echo",
+			label: "Echo",
+			description: "Echo tool",
+			parameters: echoSchema,
+			async execute() {
+				toolCallCount += 1;
+				if (toolCallCount === 1) {
+					firstToolStarted.resolve();
+					await firstGate.promise;
+				} else if (toolCallCount === 2) {
+					secondToolStarted.resolve();
+					await secondGate.promise;
+				}
+				return { content: [{ type: "text", text: "done" }] };
+			},
+		};
+		session = buildSession(
+			[
+				{ content: [{ type: "toolCall", name: "echo", arguments: { value: "first" } }] },
+				{ content: [{ type: "toolCall", name: "echo", arguments: { value: "second" } }] },
+				{ content: ["steering answer"] },
+			],
+			blockingTool,
+		);
+		const observedScopes: string[] = [];
+		const unsubscribe = session.subscribe(event => {
+			if (
+				(event.type === "agent_start" ||
+					event.type === "turn_start" ||
+					event.type === "turn_end" ||
+					event.type === "agent_end") &&
+				event.scope
+			)
+				observedScopes.push(`${event.type}:${event.scope.generation}`);
+		});
+		const promptDone = session.prompt("first task");
+		await firstToolStarted.promise;
+		firstGate.resolve();
+		await secondToolStarted.promise;
+		const submission = await session.submitUserMessage("same-run steer", {
+			deliverAs: "steer",
+			trackSubmission: true,
+		});
+		secondGate.resolve();
+
+		const execution = await submission.execution;
+		if (execution.disposition === "removed") throw new Error("Expected same-run execution");
+		expect(execution.disposition).toBe("joined-current-run");
+		const terminalStatus = await Promise.race([
+			submission.terminal.then(() => "settled" as const),
+			Bun.sleep(5_000).then(() => "timeout" as const),
+		]);
+		expect(terminalStatus).toBe("settled");
+		const terminal = await submission.terminal;
+		expect(terminal).toMatchObject({
+			submissionId: submission.submissionId,
+			disposition: "completed",
+		});
+		if (terminal.disposition !== "completed") throw new Error("Expected completed terminal receipt");
+		expect(observedScopes).toContain("turn_start:2");
+		unsubscribe();
+		await promptDone;
+		await session.waitForIdle();
+	});
+
+	it("rejects invalid tracked submission options before dispatch", async () => {
+		session = buildSession([{ content: ["must not dispatch"] }], {
+			name: "echo",
+			label: "Echo",
+			description: "Echo tool",
+			parameters: echoSchema,
+			async execute(_toolCallId, params) {
+				return { content: [{ type: "text", text: `echoed: ${params.value}` }] };
+			},
+		});
+		const invalidOptions: unknown[] = [
+			undefined,
+			{ deliverAs: "followUp" },
+			{ deliverAs: "followUp", trackSubmission: false },
+			{ deliverAs: "unsupported", trackSubmission: true },
+		];
+		for (const options of invalidOptions) {
+			await expect(session.submitUserMessage("invalid options", options as never)).rejects.toMatchObject({
+				code: "invalid_input",
+			});
+			expect(session.agent.hasQueuedMessages()).toBe(false);
+			expect(session.agent.state.messages).toHaveLength(0);
+			expect(session.isStreaming).toBe(false);
+		}
+	});
 });
