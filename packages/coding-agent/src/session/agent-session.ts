@@ -2927,6 +2927,7 @@ export class AgentSession {
 	#retryPromise: Promise<void> | undefined = undefined;
 	#retryResolve: (() => void) | undefined = undefined;
 	#defaultFallbackController: FallbackChainController | undefined;
+	#preserveLoadedLegacyDefaultChain = false;
 	#fallbackTransitionGeneration = 0;
 	/** Managed escaped-non-ASCII retries issued for the current logical run. Bounded so a deterministic escaper cannot loop forever through un-charged fallback retries. */
 	#escapedNonAsciiManagedRetries = 0;
@@ -16439,6 +16440,7 @@ export class AgentSession {
 		});
 		if (role === "default") {
 			this.#defaultFallbackController = undefined;
+			this.#preserveLoadedLegacyDefaultChain = false;
 			this.#defaultFallbackExhaustedLastTurn = false;
 		}
 	}
@@ -16453,6 +16455,7 @@ export class AgentSession {
 			{ role: "default", entries: [selector], origin: "runtime", explicitHead: true },
 			this.settings.get("fallback.maxAttempts"),
 		);
+		this.#preserveLoadedLegacyDefaultChain = false;
 		this.#defaultFallbackExhaustedLastTurn = false;
 	}
 
@@ -21119,11 +21122,13 @@ export class AgentSession {
 			configuredChain?.origin === "legacy_session" &&
 			configuredChain.entries.length === 1 &&
 			settingsEntries.length > 1 &&
-			!settingsControllerActive;
-		if (materializeSettingsChain && materializeLegacyChain) {
+			!settingsControllerActive &&
+			!this.#preserveLoadedLegacyDefaultChain;
+		const useSettingsChain = materializeSettingsChain && materializeLegacyChain;
+		if (useSettingsChain) {
 			this.setConfiguredModelChain("default", settingsEntries, "modelRoles");
 		}
-		const chain: ConfiguredFallbackChain = materializeSettingsChain
+		const chain: ConfiguredFallbackChain = useSettingsChain
 			? { role: "default", entries: settingsEntries, origin: "modelRoles", explicitHead: true }
 			: configuredChain
 				? { ...configuredChain, entries: [...configuredChain.entries] }
@@ -23729,6 +23734,7 @@ export class AgentSession {
 			const previousThinkingLevel = this.#thinkingLevel;
 			const previousActiveModelProfile = this.#activeModelProfile;
 			const previousActiveModelProfileScope = this.#activeModelProfileScope;
+			const previousPreserveLoadedLegacyDefaultChain = this.#preserveLoadedLegacyDefaultChain;
 			const previousDefaultFallbackRuntimeState = this.getDefaultFallbackRuntimeState();
 			// Different-file cleanup drops session-only profile state before the
 			// successor is committed. Preserve exactly that mutable predecessor
@@ -23876,6 +23882,8 @@ export class AgentSession {
 						: (configuredDefaultChain?.entries ??
 							(sessionContext.models.default ? [sessionContext.models.default] : []));
 				this.#defaultFallbackController = undefined;
+				this.#preserveLoadedLegacyDefaultChain =
+					resumeModelBehavior !== "useCurrentDefault" && configuredDefaultChain?.origin === "legacy_session";
 				if (defaultEntries.length > 0) {
 					const resolution = await resolveModelChainWithAuth(
 						defaultEntries,
@@ -23948,6 +23956,8 @@ export class AgentSession {
 									},
 								);
 								if (recovered.model) {
+									fallbackResolutionController = undefined;
+									this.#preserveLoadedLegacyDefaultChain = false;
 									this.#defaultFallbackController = new FallbackChainController(
 										{
 											role: "default",
@@ -24096,7 +24106,6 @@ export class AgentSession {
 						await this.#runToolSessionTransitionCleanups();
 					}
 				}
-				if (fallbackResolutionController) this.#emitResolutionFallbackSwitch(fallbackResolutionController);
 				this.#reconnectToAgent();
 				// Fence predecessor continuations before session_switch starts SDK runtime
 				// teardown. The previous runtime waits for those continuations to settle;
@@ -24121,6 +24130,7 @@ export class AgentSession {
 					...previousDeferredSdkFollowUps,
 				]);
 				this.#deferredSdkFollowUps = [];
+				if (fallbackResolutionController) this.#emitResolutionFallbackSwitch(fallbackResolutionController);
 				if (recoveredDefaultChainMessage) this.emitNotice("warning", recoveredDefaultChainMessage, "fallback");
 				return true;
 			} catch (error) {
@@ -24156,6 +24166,7 @@ export class AgentSession {
 				}
 				await this.sessionManager.restoreRollbackState(previousSessionState);
 				this.restoreDefaultFallbackRuntimeState(previousDefaultFallbackRuntimeState);
+				this.#preserveLoadedLegacyDefaultChain = previousPreserveLoadedLegacyDefaultChain;
 				this.#syncAgentSessionId(previousSessionState.sessionId);
 				this.setActiveModelProfile(previousActiveModelProfile, previousActiveModelProfileScope);
 				this.#activeProfileInstalledRoles = previousProfileInstalledRoles;
