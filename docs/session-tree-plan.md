@@ -18,8 +18,8 @@ Key files:
 - `src/session/session-manager.ts` — tree data model, traversal, leaf movement, branch/session extraction
 - `src/session/agent-session.ts` — `/tree` navigation flow, summarization, hook/event emission
 - `src/modes/components/tree-selector.ts` — interactive tree UI behavior and filtering
-- `src/modes/controllers/selector-controller.ts` — selector orchestration for `/tree` and `/branch`
-- `src/modes/controllers/input-controller.ts` — command routing (`/tree`, `/branch`, double-escape behavior)
+- `src/modes/controllers/selector-controller.ts` — selector orchestration for `/tree`, the existing user-message branch picker, and interactive `/fork`
+- `src/modes/controllers/input-controller.ts` — command/action routing (`/tree`, `/fork`, `app.session.fork`, and double-escape behavior)
 - `src/session/messages.ts` — conversion of `branch_summary`, `compaction`, and `custom_message` entries into LLM context messages
 
 ## Tree data model in `SessionManager`
@@ -82,14 +82,14 @@ Flow:
 
 Important: summary entries are attached at the **new navigation position**, not on the abandoned branch tail.
 
-## `/branch` behavior (new session file)
+## User-message branch lifecycle (new session file)
 
-`/branch` and `/tree` are intentionally different:
+The existing user-message branch picker and `/tree` are intentionally different:
 
 - `/tree` navigates within the current session file.
-- `/branch` creates a new session branch file (or in-memory replacement for non-persistent mode).
+- The branch picker creates a new session branch file (or an in-memory replacement for non-persistent mode).
 
-User-facing `/branch` flow (`SelectorController.showUserMessageSelector` → `AgentSession.branch`):
+Branch flow (`SelectorController.showUserMessageSelector` → `AgentSession.branch`):
 
 - Branch source must be a **user message**.
 - Selected user text is extracted for editor prefill.
@@ -103,6 +103,20 @@ User-facing `/branch` flow (`SelectorController.showUserMessageSelector` → `Ag
 - Rebuilds fresh label entries from resolved `labelsById` for entries that remain in path.
 - Persistent mode: writes new JSONL file and switches manager to it; returns new file path.
 - In-memory mode: replaces in-memory entries; returns `undefined`.
+
+## Interactive `/fork` behavior (prompt boundary, new persistent session file)
+
+Interactive `/fork` deliberately uses the existing user-message selector and `AgentSession.branch()` lifecycle:
+
+- Cancelling the selector leaves the current session and editor untouched.
+- Admission and final selection refuse the operation while a response, compaction, foreground Bash/Python execution, or prompt submission is active.
+- Selecting a user message invokes `AgentSession.branch()`: `session_before_branch` may cancel before the switch, and success emits `session_branch`.
+- A successful selection creates an independent persistent session containing the root-to-parent history before that prompt.
+- The TUI switches to the new session and restores the selected prompt text to the editor without submitting it.
+- The source transcript remains unchanged. Both sessions keep the same cwd and share the same working files; creating the fork does not modify those files or create a Git branch or worktree.
+- In-memory (`--no-session`) use is refused because interactive `/fork` must produce an independently resumable session.
+
+This does not change the `app.session.fork` action or branch-configured double Escape, which retain the existing user-message branch picker behavior. It also does not change `/tree`, which continues to move the leaf inside the current session file. The low-level whole-session `AgentSession.fork()` and startup `--fork` path remain separate operations.
 
 ## Context reconstruction and summary/custom integration
 
@@ -137,10 +151,12 @@ Tree selector behavior (`tree-selector.ts`):
 - Supports free-text search over rendered semantic content.
 - `Shift+L` opens inline label editing and writes via `appendLabelChange`.
 
-Command routing:
+Command and action routing:
 
-- `/tree` always opens tree selector.
-- `/branch` opens user-message selector unless `doubleEscapeAction=tree`, in which case it also uses tree selector UX.
+- `/tree` always opens the tree selector.
+- `app.session.fork` opens the user-message branch picker.
+- Double Escape opens the tree selector or user-message branch picker according to `doubleEscapeAction`.
+- `/fork` always opens the user-message selector and requires a persistent session.
 
 ## Extension and hook touchpoints for tree operations
 
@@ -168,8 +184,8 @@ Events around tree navigation:
 
 Adjacent but related lifecycle hooks:
 
-- `session_before_branch` / `session_branch` for `/branch` flow
-- `session_before_compact`, `session.compacting`, `session_compact` for compaction entries that later affect tree-context reconstruction
+- `session_before_branch` / `session_branch` wrap `AgentSession.branch()`, including the interactive `/fork` selection path.
+- `session_before_compact`, `session.compacting`, `session_compact` for compaction entries that later affect tree-context reconstruction.
 
 ## Real constraints and edge conditions
 
