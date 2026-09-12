@@ -115,6 +115,39 @@ describe("AgentSession switchSession resumeModelBehavior", () => {
 		expect(session.model?.id).toBe(opus.id);
 		expect(session.getActiveModelProfile()).toBe("codex-medium");
 	});
+	it("does not recover the durable preset when useCurrentDefault cannot resolve the live default", async () => {
+		const sonnet = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const codex = getBundledModel("openai-codex", "gpt-5.6-sol")!;
+		authStorage.setRuntimeApiKey("openai-codex", "test-key");
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"modelProfile.default": "codex-medium",
+			"session.resumeModelBehavior": "useCurrentDefault",
+		});
+		const sessionFile = await createPersistedTarget(sonnet, settings);
+		session = new AgentSession({
+			agent: new Agent({ initialState: { model: sonnet, systemPrompt: ["Test"], tools: [], messages: [] } }),
+			sessionManager: SessionManager.create(tempDir.path(), tempDir.path()),
+			settings,
+			modelRegistry,
+		});
+		settings.setModelRole("default", "unknown-provider/unknown-model");
+		vi.spyOn(modelRegistry, "getAvailable").mockReturnValue([codex]);
+		vi.spyOn(modelRegistry, "getAll").mockReturnValue([codex]);
+		const notice = vi.spyOn(session, "emitNotice");
+
+		expect(await session.switchSession(sessionFile)).toBe(false);
+		expect(session.getDefaultFallbackRuntimeState().chain).not.toMatchObject({
+			origin: "runtime",
+			identity: "codex-medium",
+		});
+		expect(notice).not.toHaveBeenCalledWith(
+			"warning",
+			"Saved session model is no longer registered; restored the durable default preset instead.",
+			"fallback",
+		);
+	});
+
 	it("preserves an unknown identity-bearing saved chain and recovered runtime fallback across different-file cleanup", async () => {
 		const sonnet = getBundledModel("anthropic", "claude-sonnet-4-5")!;
 		const codex = getBundledModel("openai-codex", "gpt-5.6-sol")!;

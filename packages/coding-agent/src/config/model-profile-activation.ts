@@ -630,7 +630,13 @@ export async function resolveModelProfileDefaultChain(options: {
 		...alternativeProviders,
 		...deriveModelProfileMappedProviders(profile),
 	])) {
-		const key = await options.modelRegistry.getApiKeyForProvider(provider, options.credentialSessionId);
+		let key: string | undefined;
+		try {
+			key = await options.modelRegistry.getApiKeyForProvider(provider, options.credentialSessionId);
+		} catch (error) {
+			if (requiredProviders.has(provider) && !alternativeProviders.has(provider)) throw error;
+			continue;
+		}
 		if (key === kNoAuth || isAuthenticated(key)) authenticated.add(provider);
 		else if (requiredProviders.has(provider)) missing.push(provider);
 	}
