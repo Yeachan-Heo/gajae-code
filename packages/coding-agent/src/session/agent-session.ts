@@ -3084,6 +3084,14 @@ export class AgentSession {
 			this.#settleTrackedQueuedInputRemoved(state, "removed");
 		}
 	}
+	/** Settle consumed tracked work before a maintenance path disconnects Agent events. */
+	#settleTrackedQueuedInputsBeforeAgentDisconnect(): void {
+		for (const state of [...this.#trackedQueuedInputs.values()]) {
+			if (state.executionSettled || this.#trackedQueuedInputsAwaitingOwnRun.has(state)) {
+				this.#settleTrackedQueuedInputRemoved(state, "removed");
+			}
+		}
+	}
 	/** Drop queued SDK work when the session identity is replaced. The old
 	 * promotion hooks belong to the predecessor runtime; retaining the message
 	 * would let it execute later under the successor without an owner. */
@@ -18300,6 +18308,10 @@ export class AgentSession {
 			}
 			const compactionAbortController = new AbortController();
 			this.#compactionAbortController = compactionAbortController;
+			// Compaction intentionally preserves still-queued inputs, but it drops the
+			// Agent event bridge before aborting the active run. Settle submissions that
+			// already crossed the queue boundary now; they cannot receive agent_end later.
+			this.#settleTrackedQueuedInputsBeforeAgentDisconnect();
 			this.#disconnectFromAgent();
 			try {
 				await this.abort({ cause: "compaction", preserveCompaction: true });

@@ -1142,6 +1142,33 @@ describe("queued promotion run identity (#4668)", () => {
 		await promptDone;
 	});
 
+	it("terminalizes a consumed tracked submission before manual compaction disconnects Agent events", async () => {
+		const fixture = buildAbortableTrackedTransitionFixture();
+		session = fixture.session;
+		const promptDone = session.prompt("first task").catch(() => {});
+		await fixture.firstToolStarted.promise;
+		const submission = await session.submitUserMessage("same-run steer", {
+			deliverAs: "steer",
+			trackSubmission: true,
+		});
+		fixture.firstGate.resolve();
+		await expect(submission.execution).resolves.toMatchObject({
+			submissionId: submission.submissionId,
+			disposition: "joined-current-run",
+		});
+		await fixture.secondToolStarted.promise;
+
+		const compaction = session.compact().catch(() => {});
+		await expect(submission.terminal).resolves.toMatchObject({
+			submissionId: submission.submissionId,
+			disposition: "removed",
+			reason: "removed",
+		});
+		fixture.secondGate.resolve();
+		await compaction;
+		await promptDone;
+	});
+
 	it("terminalizes a consumed tracked submission during session replacement", async () => {
 		const fixture = buildAbortableTrackedTransitionFixture();
 		session = fixture.session;
