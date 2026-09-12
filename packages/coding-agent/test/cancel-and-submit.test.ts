@@ -10,6 +10,7 @@ import { type AbortOutcome, AgentSession } from "@gajae-code/coding-agent/sessio
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { logger, TempDir } from "@gajae-code/utils";
+import { createSdkRunCapability } from "../src/sdk/host/sdk-run-capability";
 
 type Scenario = "mid-streaming" | "active tool" | "auto-retry" | "pre-existing steering+follow-up entries";
 type RollbackOutcome = Extract<AbortOutcome, { kind: "timeout" | "error" }>;
@@ -227,6 +228,35 @@ describe("AgentSession.cancelAndSubmit", () => {
 		expect(agent.state.messages.map(messageText)).toContain("send now");
 		expect(agent.state.messages.map(messageText)).toContain("sent");
 		expect(s.isStreaming).toBe(false);
+	});
+
+	it("selects a deferred SDK follow-up by display identity", async () => {
+		const { agent, session: s, requestUserTexts } = buildGatedStreamingSession();
+		const activePrompt = s.prompt("active stream");
+		await waitForStreaming(s);
+		const submission = await s.submitUserMessage("deferred selection", {
+			deliverAs: "followUp",
+			trackSubmission: true,
+			sdkRunCapability: createSdkRunCapability("cancel-deferred-selection"),
+		} as never);
+		expect(agent.snapshotFollowUp()).toHaveLength(0);
+		const queuedEntry = s.getQueuedMessageEntries().find(entry => entry.text === "deferred selection");
+		expect(queuedEntry).toBeDefined();
+
+		await expect(s.cancelAndSubmit("replacement", { queuedEntryId: queuedEntry?.id })).resolves.toEqual({
+			kind: "submitted",
+		});
+		await expect(submission.execution).resolves.toMatchObject({
+			submissionId: submission.submissionId,
+			disposition: "promoted-to-run",
+		});
+		await activePrompt;
+		await expect(submission.terminal).resolves.toMatchObject({
+			submissionId: submission.submissionId,
+			disposition: "completed",
+		});
+		expect(requestUserTexts().flat()).toContain("deferred selection");
+		expect(requestUserTexts().flat()).not.toContain("replacement");
 	});
 
 	it("keeps live-run steers as steers of the replacement turn, applied after its response", async () => {
