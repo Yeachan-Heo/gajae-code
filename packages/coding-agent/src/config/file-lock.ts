@@ -690,6 +690,24 @@ function sameFileLockTreeAfterPublication(
 	);
 }
 
+async function matchesCommittedFileLockPublication(
+	pendingPath: string,
+	lockPath: string,
+	staged: NativeDirectoryTreeSnapshot,
+): Promise<boolean> {
+	try {
+		// A replacement, including a dangling symlink, is not a consumed staging name.
+		await fs.lstat(pendingPath);
+		return false;
+	} catch (error) {
+		if (!isEnoent(error)) throw error;
+	}
+	const published = snapshotDirectoryTree(lockPath);
+	return (
+		published.ok && published.snapshot !== undefined && sameFileLockTreeAfterPublication(staged, published.snapshot)
+	);
+}
+
 async function rollbackPublishedFileLock(
 	canonicalParent: string,
 	lockPath: string,
@@ -892,13 +910,57 @@ function isValidNativeNoReplaceResult(value: unknown): value is NativeNoReplaceR
 		return false;
 	if (value.ok)
 		return (
+			value.code === undefined &&
+			value.diagnostic.collectionState === "unavailable" &&
+			value.diagnostic.osCode === undefined &&
+			value.diagnostic.syncFailures === undefined &&
+			Object.keys(value.diagnostic).length === 2 &&
+			value.primitive !== "unsupported" &&
+			value.primitive !== "unknown" &&
 			value.mutationState === "committed" &&
 			value.reason === "none" &&
 			value.phase === "complete" &&
-			(value.durabilityState === "not_attempted" || value.durabilityState === "proven")
+			value.durabilityState === "not_attempted"
 		);
 	if (value.mutationState === "not_committed") return value.durabilityState === "not_attempted";
+	if (value.mutationState === "committed") {
+		// This is a committed namespace change, not authority to retry publication.
+		// DrvFS can hide the renamed directory until the native source handle closes.
+		return (
+			value.code === "destination_identity_changed" &&
+			value.durabilityState === "not_provable" &&
+			value.reason === "identity_violation" &&
+			value.primitive === "mkdirat_renameat_noreplace" &&
+			value.phase === "terminal_identity" &&
+			value.diagnostic.collectionState === "unavailable" &&
+			Object.keys(value.diagnostic).length === 2
+		);
+	}
 	return value.mutationState === "unknown" && value.durabilityState === "not_provable";
+}
+
+function isSuccessfulNativePublication(value: unknown, operation: "primary" | "directory"): boolean {
+	if (!isValidNativeNoReplaceResult(value) || !value.ok) return false;
+	if (operation === "directory") return value.primitive === "mkdirat_renameat_noreplace";
+	switch (process.platform) {
+		case "linux":
+			return value.primitive === "renameat2_noreplace";
+		case "darwin":
+			return value.primitive === "renameatx_np_excl";
+		case "win32":
+			return value.primitive === "windows_rename_noreplace";
+		default:
+			return false;
+	}
+}
+
+function isCommittedDirectoryVerificationFailure(value: unknown): value is NativeNoReplaceResult {
+	return (
+		process.platform === "linux" &&
+		isValidNativeNoReplaceResult(value) &&
+		!value.ok &&
+		value.mutationState === "committed"
+	);
 }
 
 /**
@@ -1196,6 +1258,45 @@ export async function removeFileLockDirForGc(
 	let removed: NativeExactUnlinkResult;
 	try {
 		removed = nativeFileLockBindings().exactRemoveDirectoryTree(nativeCapturePath, captured.snapshot);
+		const retainedPath = fileLockRemovalTransitionPath(nativeCapturePath);
+		if (
+			process.platform === "linux" &&
+			!nativeCapturePath.endsWith(".removing") &&
+			removed.ok === false &&
+			removed.code === "identity_mismatch" &&
+			removed.retainedSuccessorPath === retainedPath &&
+			Object.keys(removed).every(key => ["ok", "code", "retainedSuccessorPath"].includes(key))
+		) {
+			// DrvFS may hide the detached name while native code retains the source
+			// handle. The receipt alone never authorizes deleting a reported successor:
+			// require the complete original tree, then replay exact removal once at
+			// the deterministic retained name, where no further rename is necessary.
+			const retained = nativeFileLockBindings().snapshotDirectoryTree(retainedPath);
+			if (
+				retained.ok &&
+				retained.snapshot &&
+				sameFileLockTreeAfterPublication(captured.snapshot, retained.snapshot)
+			) {
+				const replay = nativeFileLockBindings().exactRemoveDirectoryTree(retainedPath, retained.snapshot);
+				if (
+					replay.ok !== false ||
+					replay.code !== "cleanup_pending" ||
+					replay.payloadDurable !== true ||
+					replay.detachedPath !== retainedPath ||
+					Object.keys(replay).some(key => !["ok", "code", "payloadDurable", "detachedPath"].includes(key))
+				) {
+					// A replay failure can carry detachedPath without authorizing payload
+					// cleanup. Never forward such a receipt to the generic detach handler.
+					logger.debug("Detached file lock replay did not prove durable cleanup", {
+						originalCode: removed.code,
+						replayCode: replay.code,
+					});
+					return "cleanup_failed";
+				}
+				removed = replay;
+				logger.debug("Replayed identity-matched detached file lock removal", { code: removed.code });
+			}
+		}
 	} catch (error) {
 		// Keep the #2478 transient retry contract: sharing denials surface with
 		// their transient code so callers retry, everything else is a refusal.
@@ -1508,10 +1609,30 @@ async function tryAcquireLock(
 			renameDirectoryNoReplacePathAsync,
 		};
 		const published = await publication.renameNoReplacePathAsync(canonicalPendingPath, destinationPath);
-		let publishedSuccessfully = published.ok;
+		let publishedSuccessfully = isSuccessfulNativePublication(published, "primary");
+		if (published.ok && !publishedSuccessfully)
+			throw new Error("Failed to publish file lock: invalid primary success receipt.");
 		if (!published.ok && isPreMutationUnsupportedRenameResult(published)) {
 			const fallback = await publication.renameDirectoryNoReplacePathAsync(canonicalPendingPath, destinationPath);
-			if (fallback.ok) {
+			const fallbackSuccessfully = isSuccessfulNativePublication(fallback, "directory");
+			if (fallback.ok && !fallbackSuccessfully)
+				throw new Error("Failed to publish file lock: invalid directory success receipt.");
+			let verifiedCommittedPublication = false;
+			if (isCommittedDirectoryVerificationFailure(fallback)) {
+				// The staged name has been consumed. Relinquish pathname cleanup even
+				// if completion is refused: a replacement there is not our staged tree.
+				removePending = false;
+				verifiedCommittedPublication =
+					stagedSnapshot !== undefined &&
+					(await matchesCommittedFileLockPublication(canonicalPendingPath, destinationPath, stagedSnapshot));
+				if (verifiedCommittedPublication) {
+					logger.debug("Verified committed file lock publication after native identity refusal", {
+						code: fallback.code,
+						primitive: fallback.primitive,
+					});
+				}
+			}
+			if (fallbackSuccessfully || verifiedCommittedPublication) {
 				publishedSuccessfully = true;
 			} else if (fallback.reason === "destination_exists") {
 				return null;

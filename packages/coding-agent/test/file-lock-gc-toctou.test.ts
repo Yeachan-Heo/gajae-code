@@ -16,6 +16,7 @@ import type { GcContext, GcPidProbe, GcRecord } from "@gajae-code/coding-agent/g
 import * as nativeBindings from "@gajae-code/natives";
 import {
 	exactRemoveDirectoryTree,
+	type NativeNoReplaceResult,
 	renameDirectoryNoReplacePathAsync,
 	renameNoReplacePathAsync,
 	snapshotDirectoryTree,
@@ -139,6 +140,18 @@ function deadLockRecord(lockDir: string): GcRecord {
 		removable: true,
 		action: "none",
 		reason: "file_lock_owner_pid_dead",
+	};
+}
+
+function successfulPublication(primitive: NativeNoReplaceResult["primitive"]): NativeNoReplaceResult {
+	return {
+		ok: true,
+		mutationState: "committed",
+		durabilityState: "not_attempted",
+		reason: "none",
+		primitive,
+		phase: "complete",
+		diagnostic: { schemaVersion: 1, collectionState: "unavailable" },
 	};
 }
 
@@ -968,6 +981,16 @@ describe("file lock cleanup failure handling (#2478)", () => {
 		// A filter-hosted Windows host: the probe rejects the native exact-removal
 		// primitive, while the handle-bound detach-only quarantine still succeeds.
 		FileLockTestHooks.nativeExactRemovalProbe = () => false;
+		FileLockTestHooks.nativePublicationBindings = () => ({
+			renameNoReplacePathAsync: async (source, destination) => {
+				await fs.rename(source, destination);
+				return successfulPublication("windows_rename_noreplace");
+			},
+			renameDirectoryNoReplacePathAsync: async (source, destination) => {
+				await fs.rename(source, destination);
+				return successfulPublication("mkdirat_renameat_noreplace");
+			},
+		});
 		FileLockTestHooks.nativeQuarantineBindings = () => ({
 			snapshotDirectoryTree,
 			exactRemoveDirectoryTree: (target, _snapshot, _parent, detachOnly) => {
