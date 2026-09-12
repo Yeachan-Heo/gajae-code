@@ -3,6 +3,7 @@ import { createHash, generateKeyPairSync, sign } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { classifyPublicCommandFailure, PublicCommandFailure } from "../src/cli/public-command-errors";
 import { FileLockTestHooks } from "../src/config/file-lock";
 import { installGuideCache, readGuideCache } from "../src/sdk/guides/cache";
 import {
@@ -89,17 +90,16 @@ function fakeFetch(
 
 async function runGuidesCli(
 	args: Parameters<typeof runSdkGuidesCli>[0],
-): Promise<{ output: unknown[]; exitCode: number | undefined }> {
+): Promise<{ output: unknown[]; exitCode: number | undefined; failure?: PublicCommandFailure }> {
 	const output: unknown[] = [];
-	let exitCode: number | undefined;
-	await runSdkGuidesCli(
-		args,
-		value => output.push(value),
-		code => {
-			exitCode = code;
-		},
-	);
-	return { output, exitCode };
+	try {
+		await runSdkGuidesCli(args, value => output.push(value));
+		return { output, exitCode: undefined };
+	} catch (error) {
+		expect(error).toBeInstanceOf(PublicCommandFailure);
+		const failure = error as PublicCommandFailure;
+		return { output, exitCode: classifyPublicCommandFailure(failure, ["sdk", "guides"]).exitCode, failure };
+	}
 }
 
 const NOW = Date.UTC(2026, 3, 1);
@@ -650,12 +650,8 @@ describe("guide fetch boundary and CLI-facing selection outcomes", () => {
 			fetchImpl,
 		});
 		expect(refresh.exitCode).toBe(1);
-		expect(refresh.output).toHaveLength(1);
-		const payload = refresh.output[0] as { ok: boolean; error?: { code: string; message: string } };
-		expect(payload.ok).toBe(false);
-		expect(payload.error?.code).toBe("online_refresh_failed");
-		expect(payload.error?.message).toContain("cache");
-		expect(payload.error?.message).toContain("network_error");
+		expect(refresh.output).toEqual([]);
+		expect(refresh.failure?.input.kind).toBe("operation_failed");
 
 		// The failed refresh leaves the prior valid cache intact and usable.
 		const read = await readGuideCache({ agentDir, now: NOW });
@@ -702,10 +698,8 @@ describe("guide fetch boundary and CLI-facing selection outcomes", () => {
 			fetchImpl,
 		});
 		expect(cli.exitCode).toBe(1);
-		const payload = cli.output[0] as { ok: boolean; error?: { code: string; message: string } };
-		expect(payload.ok).toBe(false);
-		expect(payload.error?.code).toBe("online_refresh_failed");
-		expect(payload.error?.message).toContain("oversize");
+		expect(cli.output).toEqual([]);
+		expect(cli.failure?.input.kind).toBe("operation_failed");
 	});
 
 	it("refuses a non-allowlisted refresh URL as a usage error before any fetch", async () => {
@@ -717,9 +711,24 @@ describe("guide fetch boundary and CLI-facing selection outcomes", () => {
 			fetchImpl: fakeFetch(new Map()),
 		});
 		expect(cli.exitCode).toBe(2);
-		expect(cli.output).toHaveLength(1);
-		const payload = cli.output[0] as { ok: boolean; error?: { code: string } };
-		expect(payload.ok).toBe(false);
-		expect(payload.error?.code).toBe("usage");
+		expect(cli.output).toEqual([]);
+		expect(cli.failure?.input.kind).toBe("usage");
+	});
+	it("never echoes credential-bearing rejected URLs or unknown refresh errors", async () => {
+		const agentDir = await tempAgentDir();
+		for (const url of [
+			"https://user:secret@guides.gajae-code.com/manifest.json",
+			"https://guides.gajae-code.com/manifest.json",
+		]) {
+			const result = await runGuidesCli({
+				action: "refresh",
+				agentDir,
+				url,
+				fetchImpl: fakeFetch(new Map(), { error: new Error("secret") }),
+			});
+			expect(result.output).toEqual([]);
+			expect(result.failure).toBeInstanceOf(PublicCommandFailure);
+			expect(JSON.stringify(result.failure)).not.toContain("secret");
+		}
 	});
 });

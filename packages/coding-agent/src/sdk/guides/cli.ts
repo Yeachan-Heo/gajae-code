@@ -1,4 +1,5 @@
 import { getAgentDir } from "@gajae-code/utils";
+import { normalizePublicCommandFailure, PublicCommandFailure } from "../../cli/public-command-errors";
 import { readGuideCache } from "./cache";
 import { BUNDLED_GUIDE_MANIFESTS, GuideCatalog, guideFetchPolicy, isGuideFetchUrlAllowed } from "./catalog";
 import { GUIDE_CLIENT_VERSION, GUIDE_PINNED_KEYS } from "./verify";
@@ -39,50 +40,20 @@ export interface SdkGuidesCliArgs {
 
 const GUIDE_CLI_ACTIONS: readonly string[] = ["refresh", "list", "show", "status", "trust"];
 
-class SdkGuidesCliError extends Error {
-	constructor(
-		readonly code: string,
-		message: string,
-		readonly exitCode: 1 | 2,
-	) {
-		super(message);
-	}
+function usageFailure(): PublicCommandFailure {
+	return new PublicCommandFailure({ kind: "usage", proof: "pre-effect" });
+}
+
+function operationalFailure(): PublicCommandFailure {
+	return new PublicCommandFailure({ kind: "operation_failed", proof: "unknown" });
 }
 
 function writeJson(value: unknown): void {
 	process.stdout.write(`${JSON.stringify(value)}\n`);
 }
 
-function usageFailure(message: string): SdkGuidesCliError {
-	return new SdkGuidesCliError("usage", message, 2);
-}
-
-function operationalFailure(code: string, message: string): SdkGuidesCliError {
-	return new SdkGuidesCliError(code, message, 1);
-}
-
-/**
- * Usage-shaped errors (bad verb, missing argument, URL outside the allowlist)
- * exit 2; every verification/operational failure exits 1. Fail-closed codes
- * from the verification pipeline map to exit 1 so scripts observe a hard
- * failure on tamper, unknown key, rollback, expiry, or corrupt cache.
- */
-function toCliError(error: unknown): SdkGuidesCliError {
-	if (error instanceof SdkGuidesCliError) return error;
-	const code = error instanceof Error && "code" in error ? String((error as { code: unknown }).code) : undefined;
-	const message = error instanceof Error ? error.message : String(error);
-	switch (code) {
-		case "usage":
-		case "invalid_input":
-		case "fetch_forbidden":
-			return new SdkGuidesCliError(code ?? "operation_failed", message, 2);
-		default:
-			return operationalFailure(code ?? "operation_failed", message);
-	}
-}
-
-function requireValue(value: string | undefined, flag: string): string {
-	if (value === undefined || value.length === 0) throw usageFailure(`${flag} is required.`);
+function requireValue(value: string | undefined): string {
+	if (value === undefined || value.length === 0) throw usageFailure();
 	return value;
 }
 
@@ -105,8 +76,8 @@ function manifestSummary(manifest: {
 }
 
 async function runRefresh(agentDir: string, args: SdkGuidesCliArgs): Promise<unknown> {
-	const url = requireValue(args.url, "--url");
-	if (!isGuideFetchUrlAllowed(url)) throw usageFailure(`--url ${url} is outside the HTTPS allowlist.`);
+	const url = requireValue(args.url);
+	if (!isGuideFetchUrlAllowed(url)) throw usageFailure();
 	const catalog = new GuideCatalog({
 		agentDir,
 		onlineUrl: url,
@@ -114,15 +85,9 @@ async function runRefresh(agentDir: string, args: SdkGuidesCliArgs): Promise<unk
 		fetchImpl: args.fetchImpl,
 	});
 	const result = await catalog.refresh();
-	if (!result.ok) throw operationalFailure(result.error.code, result.error.message);
+	if (!result.ok) throw operationalFailure();
 	const selection = result.value;
-	if (selection.source !== "online") {
-		const reasons = selection.warnings.length > 0 ? ` ${selection.warnings.join("; ")}` : "";
-		throw operationalFailure(
-			"online_refresh_failed",
-			`Online refresh did not select an online source (selected ${selection.source} instead)${reasons}.`,
-		);
-	}
+	if (selection.source !== "online") throw operationalFailure();
 	return {
 		source: selection.source,
 		manifest: manifestSummary(selection.manifest),
@@ -134,7 +99,7 @@ async function runRefresh(agentDir: string, args: SdkGuidesCliArgs): Promise<unk
 async function runList(agentDir: string): Promise<unknown> {
 	const catalog = new GuideCatalog({ agentDir });
 	const result = await catalog.load();
-	if (!result.ok) throw operationalFailure(result.error.code, result.error.message);
+	if (!result.ok) throw operationalFailure();
 	const selection = result.value;
 	return {
 		source: selection.source,
@@ -145,10 +110,10 @@ async function runList(agentDir: string): Promise<unknown> {
 }
 
 async function runShow(agentDir: string, args: SdkGuidesCliArgs): Promise<unknown> {
-	const guideId = requireValue(args.guideId, "<guideId>");
+	const guideId = requireValue(args.guideId);
 	const catalog = new GuideCatalog({ agentDir });
 	const result = await catalog.advisory(guideId);
-	if (!result.ok) throw operationalFailure(result.error.code, result.error.message);
+	if (!result.ok) throw operationalFailure();
 	return {
 		source: result.value.source,
 		guideId: result.value.guideId,
@@ -194,21 +159,16 @@ function runTrust(): unknown {
 
 /**
  * Runs the `gjc sdk guides` command family. Exported for command routing from
- * `src/commands/sdk.ts` and for direct service use; the injected `write` /
- * `setExitCode` hooks keep the surface testable without touching stdout or
- * the process exit code.
+ * `src/commands/sdk.ts` and for direct service use. Only successful results are
+ * written here; typed failures belong to the outer public family writer.
  */
 export async function runSdkGuidesCli(
 	args: SdkGuidesCliArgs,
 	writeOutput: (value: unknown) => void = writeJson,
-	setExitCode: (exitCode: 1 | 2) => void = exitCode => {
-		process.exitCode = exitCode;
-	},
 ): Promise<void> {
 	try {
 		const action = args.action;
-		if (action === undefined || !GUIDE_CLI_ACTIONS.includes(action))
-			throw usageFailure(`Expected one of: ${GUIDE_CLI_ACTIONS.join(", ")}.`);
+		if (action === undefined || !GUIDE_CLI_ACTIONS.includes(action)) throw usageFailure();
 		const agentDir = args.agentDir ?? getAgentDir();
 		switch (action) {
 			case "refresh":
@@ -228,8 +188,6 @@ export async function runSdkGuidesCli(
 				return;
 		}
 	} catch (error) {
-		const cliError = toCliError(error);
-		writeOutput({ ok: false, error: { code: cliError.code, message: cliError.message } });
-		setExitCode(cliError.exitCode);
+		throw normalizePublicCommandFailure(error);
 	}
 }

@@ -10,6 +10,7 @@ import { APP_NAME, formatBunRuntimeError, MIN_BUN_VERSION, VERSION } from "@gaja
 import { startTiming, time } from "@gajae-code/utils/logger";
 import { runFixtureReport } from "./cli/fixture-report";
 import { COMMUNITY_APP_REPOSITORY, offerMacosCommunityApp } from "./cli/macos-community-app";
+import { dispatchPublicCommand } from "./cli/public-command-entry";
 import { ROOT_LAUNCH_FLAGS } from "./cli/root-flags";
 import QuickLane from "./commands/quick-lane";
 import { runBashShellGuardian } from "./exec/bash-shell-guardian";
@@ -70,8 +71,30 @@ export const commands: CommandEntry[] = [
 	{ name: "config", load: () => import("./commands/config").then(m => m.default) },
 	{ name: "stats", load: () => import("./commands/stats").then(m => m.default) },
 	{ name: "notify", load: () => import("./commands/notify").then(m => m.default) },
-	{ name: "sdk", load: () => import("./commands/sdk").then(m => m.default) },
-	{ name: "daemon", load: () => import("./commands/daemon").then(m => m.default) },
+	{
+		name: "sdk",
+		load: () => import("./commands/sdk").then(m => m.default),
+		dispatch: (argv, context) =>
+			dispatchPublicCommand(argv, {
+				...context,
+				command: "sdk",
+				load: commands.find(entry => entry.name === "sdk")!.load,
+				setup: report =>
+					installRuntimeGlobals(text => report({ code: "macos_nofile_limit_low", successStderr: text })),
+			}),
+	},
+	{
+		name: "daemon",
+		load: () => import("./commands/daemon").then(m => m.default),
+		dispatch: (argv, context) =>
+			dispatchPublicCommand(argv, {
+				...context,
+				command: "daemon",
+				load: commands.find(entry => entry.name === "daemon")!.load,
+				setup: report =>
+					installRuntimeGlobals(text => report({ code: "macos_nofile_limit_low", successStderr: text })),
+			}),
+	},
 	{ name: "web-search", aliases: ["q"], load: () => import("./commands/web-search").then(m => m.default) },
 	{ name: "local-provider", load: () => import("./commands/local-provider").then(m => m.default) },
 	{ name: "model-presets", load: () => import("./commands/model-presets").then(m => m.default) },
@@ -103,7 +126,7 @@ async function showHelp(config: CliConfig): Promise<void> {
 	}
 }
 
-async function installRuntimeGlobals(): Promise<void> {
+async function installRuntimeGlobals(writeNoFileWarning?: (text: string) => void): Promise<void> {
 	const { installH2Fetch } = await import("@gajae-code/ai/utils/h2-fetch");
 	// Activate HTTP/2 for all `fetch()` calls (provider streams, OAuth, model
 	// discovery, web tools). Bun's HTTP/2 client is gated on a startup flag we
@@ -113,7 +136,7 @@ async function installRuntimeGlobals(): Promise<void> {
 	installH2Fetch();
 
 	const { warnIfMacOSNoFileLimitTooLow } = await import("./cli/nofile-limit");
-	warnIfMacOSNoFileLimitTooLow();
+	warnIfMacOSNoFileLimitTooLow({ writeStderr: writeNoFileWarning });
 
 	// Secondary in-process scrub of the macOS malloc-stack-logging vars. The real
 	// boundary is the darwin re-exec guard at the top of runCli(): Bun snapshots the
@@ -478,6 +501,11 @@ export async function runCli(argv: string[]): Promise<void> {
 	if (isChatDaemonInternalFastPath(argv)) {
 		await runChatDaemonInternalFastPath(argv);
 		return;
+	}
+	// Public families own their inert scanner and operation-only initialization.
+	// Admission and private worker paths above retain precedence.
+	if (argv[0] === "sdk" || argv[0] === "daemon") {
+		return run({ bin: APP_NAME, version: VERSION, argv, commands, help: showHelp });
 	}
 	if (argv[0] === "--smoke-test") {
 		await runSmokeTest();

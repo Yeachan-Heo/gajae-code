@@ -24,12 +24,52 @@ External and managed integrations attach through SDK-core surfaces only:
 For terminal-side session operation, use the broker-bound [SDK session CLI](./sdk-session-cli.md):
 `gjc sdk session list|inspect|send|status|tail` plus the explicit `raw`
 `control|query|global` hatch. The CLI resolves the exact attachment through SDK
-core and emits credential-free JSON.
+core and emits credential-free JSON on success. Add `--json` explicitly for
+machine failures; default ordinary failures are text on stderr, not JSON stdout.
+
+### Public CLI discovery and recovery
+
+Use `gjc sdk --help` or deepest local help such as
+`gjc sdk session raw query --help --json` and `gjc daemon reload --help`.
+Help covers only public paths and immediate children, never worker-only actions
+or flags. `--help-section overview|usage|children|arguments|options|examples|recovery`
+and `--help-page <N>` select bounded static pages; follow `next.argv` with its
+`--help-revision <sha256>` and mode intact. `-h` is accepted, `--help=json` is not.
+Selectors require actual help, valid positive decimal pages and no duplicates.
+Help is inert and never initializes runtime services or storage.
+
+Ordinary errors use `gjc.command-error` version 1: with `--json`, one stdout
+JSON envelope and empty stderr; otherwise stderr text. Help, errors and explicit
+error-evidence pages are bounded to 8192 UTF-8 bytes including newline. Existing
+successful result shapes and serve frames after relay ownership are unchanged.
+Do not treat a timeout as proof that work was not applied; preserve returned
+references and reconcile rather than blindly replaying a mutation.
+
+Oversized essential sanitized error evidence may be retained for exactly 24
+hours in `<effective-agent-dir>/cli-error-evidence-v1`: 64 committed records,
+1 MiB each, 16 MiB committed aggregate, with one additional pending file up to
+1 MiB and a lock up to 4096 bytes. Follow a verified continuation using
+`gjc sdk` or `gjc daemon` with `--error-ref <id> --error-sha256 <digest>`, optional
+`--error-page <N> --error-agent-dir <dir>`, and `--json` for machine output.
+Retrieval is root-only, exclusive with help/operations, and never searches other
+roots or replays the original operation. Reconstruct contiguous base64 fragments
+and verify length/digest before decoding; fragments are not executable commands.
+Publication failure reports incomplete/unavailable evidence and no continuation,
+not fabricated recovery. Availability is conditional on successful publication
+and the retention lifetime, not a promise to overcome disk failure or deletion.
+
+Recovery hints perform no extra probes or automatic recovery. Daemon targets are
+`telegram`, `discord`, `slack`, not the SDK broker: never suggest
+`gjc daemon restart sdk`. `reload` aliases `restart`; stop/restart interrupt work
+and `--force` permits hard-kill escalation. Session retirement requires actual
+proof and confirmed intent, not merely an uncertain result. See the
+[full help, error and evidence contract](./sdk-session-cli.md#command-local-help).
 
 ## Migration from removed external transports
 
-The retired `--mode rpc`, `rpc-ui`, `bridge`, and `gjc sdk serve` transports
-have no replacement wire client. Process-isolated controllers use Coordinator
+The retired `--mode rpc`, `rpc-ui` and `bridge` transports have no replacement
+wire client. The existing `gjc sdk serve` relay remains discoverable CLI tooling,
+not an external SDK attachment API. Process-isolated controllers use Coordinator
 MCP, `gjc sdk session`, or a configured managed adapter. In-process applications
 use the [embedding SDK](./sdk-embedding.md).
 
