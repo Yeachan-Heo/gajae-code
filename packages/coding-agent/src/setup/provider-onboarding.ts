@@ -699,8 +699,12 @@ export async function probeOpenAIModelsList(input: ProviderDiscoveryProbeInput):
 }
 
 export interface DiscoveryCatalogRefresher {
-	refresh(mode: "offline" | "online" | "online-if-uncached"): Promise<void>;
-	refreshProvider(providerId: string, strategy?: "offline" | "online" | "online-if-uncached"): Promise<void>;
+	refresh(mode: "offline" | "online" | "online-if-uncached", credentialSessionId?: string): Promise<void>;
+	refreshProvider(
+		providerId: string,
+		strategy?: "offline" | "online" | "online-if-uncached",
+		credentialSessionId?: string,
+	): Promise<void>;
 	getProviderDiscoveryState(providerId: string): { status: string; error?: string } | undefined;
 }
 
@@ -717,10 +721,11 @@ export interface DiscoveryCatalogRefresher {
 export async function reloadAndRefreshDiscoveryCatalog(
 	registry: DiscoveryCatalogRefresher,
 	providerId: string,
+	credentialSessionId?: string,
 ): Promise<string | null> {
-	await registry.refresh("offline");
+	await registry.refresh("offline", credentialSessionId);
 	try {
-		await registry.refreshProvider(providerId, "online");
+		await registry.refreshProvider(providerId, "online", credentialSessionId);
 	} catch {
 		// Fall through to the status read: discovery failures surface as
 		// state, not rejections.

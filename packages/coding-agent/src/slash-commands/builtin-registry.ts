@@ -1779,10 +1779,7 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 							runtime.ctx.session.credentialSessionId,
 						);
 					} else {
-						await runtime.ctx.session.modelRegistry.refresh(
-							"offline",
-							runtime.ctx.session.credentialSessionId,
-						);
+						await runtime.ctx.session.modelRegistry.refresh("offline", runtime.ctx.session.credentialSessionId);
 					}
 					runtime.ctx.showStatus(
 						recoveryHint
