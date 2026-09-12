@@ -23784,51 +23784,51 @@ export class AgentSession {
 							savedSelectorsMissingFromCatalog &&
 							durableProfile
 						) {
-							try {
-								const recovery = await resolveModelProfileDefaultChain({
-									modelRegistry: this.#modelRegistry,
-									settings: this.settings,
-									profileName: durableProfile,
-									credentialSessionId: this.credentialSessionId,
-								});
-								if (recovery.entries.length > 0) {
-									const recovered = await resolveModelChainWithAuth(
-										recovery.entries,
-										this.#modelRegistry,
-										this.settings,
-										this.credentialSessionId,
+							// The profile preflight is deliberately strict. Optional mapped-provider
+							// probes are absorbed inside resolveModelProfileDefaultChain, while
+							// required-provider, proxy, and profile-configuration failures must
+							// remain actionable instead of being rewritten as saved-chain exhaustion.
+							const recovery = await resolveModelProfileDefaultChain({
+								modelRegistry: this.#modelRegistry,
+								settings: this.settings,
+								profileName: durableProfile,
+								credentialSessionId: this.credentialSessionId,
+							});
+							if (recovery.entries.length > 0) {
+								const recovered = await resolveModelChainWithAuth(
+									recovery.entries,
+									this.#modelRegistry,
+									this.settings,
+									this.credentialSessionId,
+									{
+										managedFallback: true,
+										canonicalSessionId: this.sessionId,
+										credentialSessionId: this.credentialSessionId,
+										aliasIntent: "preset-equivalent",
+									},
+								);
+								if (recovered.model) {
+									this.#defaultFallbackController = new FallbackChainController(
 										{
-											managedFallback: true,
-											canonicalSessionId: this.sessionId,
-											credentialSessionId: this.credentialSessionId,
-											aliasIntent: "preset-equivalent",
+											role: "default",
+											entries: recovery.entries,
+											origin: "runtime",
+											identity: recovery.profileName,
+											explicitHead: true,
 										},
+										this.settings.get("fallback.maxAttempts"),
 									);
-									if (recovered.model) {
-										this.#defaultFallbackController = new FallbackChainController(
-											{
-												role: "default",
-												entries: recovery.entries,
-												origin: "runtime",
-												identity: recovery.profileName,
-												explicitHead: true,
-											},
-											this.settings.get("fallback.maxAttempts"),
-										);
-										controller = this.#defaultFallbackChain(false);
-										this.#seedDefaultFallbackResolutionForController(
-											controller,
-											recovered.activeIndex,
-											recovered.skips,
-										);
-										resolvedModel = recovered.model;
-										recoveredDefaultChain = true;
-										recoveredDefaultChainMessage =
-											"Saved session model is no longer registered; restored the durable default preset instead.";
-									}
+									controller = this.#defaultFallbackChain(false);
+									this.#seedDefaultFallbackResolutionForController(
+										controller,
+										recovered.activeIndex,
+										recovered.skips,
+									);
+									resolvedModel = recovered.model;
+									recoveredDefaultChain = true;
+									recoveredDefaultChainMessage =
+										"Saved session model is no longer registered; restored the durable default preset instead.";
 								}
-							} catch {
-								// A durable default is only a recovery candidate; preserve the saved-chain failure.
 							}
 						}
 						if (!resolvedModel) {
