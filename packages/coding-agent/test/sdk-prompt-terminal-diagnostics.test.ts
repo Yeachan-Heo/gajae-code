@@ -246,11 +246,16 @@ isolatedSdkHostTest(
 			streamMaxRetries: 0,
 		});
 		let handlers!: Map<string, (event: unknown, context: unknown) => unknown>;
-		handlers = await start(sessionContext, async () => {
-			await agent.prompt("work the provider failure");
-		});
-		const unsubscribe = agent.subscribe(event => {
-			void handlers.get(event.type)?.(event, sessionContext);
+		handlers = await start(sessionContext, async (_content, options) => {
+			const runContext = sdkRunContext(sessionContext, options);
+			const unsubscribe = agent.subscribe(event => {
+				void handlers.get(event.type)?.({ ...event, sdkRunToken: runContext.sdkRunToken }, runContext);
+			});
+			try {
+				await agent.prompt("work the provider failure");
+			} finally {
+				unsubscribe();
+			}
 		});
 		const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
 		await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
@@ -292,10 +297,8 @@ isolatedSdkHostTest(
 			// Raw provider text never crosses the SDK boundary.
 			expect(JSON.stringify(failure)).not.toContain(reason);
 		} finally {
-			unsubscribe();
+			await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
 		}
-
-		await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
 	},
 	75_000,
 );

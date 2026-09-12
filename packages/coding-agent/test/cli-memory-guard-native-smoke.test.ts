@@ -36,7 +36,7 @@ describe("memory-guard native smoke fast path", () => {
 		const cliSource = await Bun.file(path.join(import.meta.dir, "../src/cli.ts")).text();
 		expect(cliSource.indexOf("if (isMemoryGuardNativeSmokeFastPath(argv))")).toBeGreaterThan(-1);
 		expect(cliSource.indexOf("if (isMemoryGuardNativeSmokeFastPath(argv))")).toBeLessThan(
-			cliSource.indexOf("await installRuntimeGlobals();"),
+			cliSource.indexOf('await time("cli:installRuntimeGlobals", installRuntimeGlobals);'),
 		);
 
 		const ciSource = await Bun.file(path.join(import.meta.dir, "../../..", ".github/workflows/ci.yml")).text();

@@ -27,7 +27,7 @@ function registerTestProvider(api: ExtensionAPI, providerName: string): void {
 }
 
 describe("Grok Build with explicit third-party extensions", () => {
-	it("loads bundled and inline extensions while keeping filesystem paths quarantined", async () => {
+	it("loads bundled, inline, and explicitly supplied filesystem extensions", async () => {
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-grok-third-party-"));
 		const extensionPath = path.join(root, "third-party.ts");
 		await Bun.write(
@@ -55,7 +55,7 @@ describe("Grok Build with explicit third-party extensions", () => {
 			try {
 				expect(session.modelRegistry.find("grok-build", "grok-composer-2.5-fast")).toBeTruthy();
 				expect(session.modelRegistry.find("inline-test", "model")).toBeTruthy();
-				expect(session.modelRegistry.find("filesystem-test", "model")).toBeUndefined();
+				expect(session.modelRegistry.find("filesystem-test", "model")).toBeTruthy();
 			} finally {
 				await session.dispose();
 			}

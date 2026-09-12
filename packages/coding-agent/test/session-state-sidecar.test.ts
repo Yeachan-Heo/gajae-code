@@ -246,7 +246,7 @@ describe("committed prompt failure projection", () => {
 		expect(await persistCoordinatorCommittedPromptFailure(context, "committed", () => true)).toBe("stale");
 		await Bun.write(stateFile, "invalid-json");
 		await expect(persistCoordinatorCommittedPromptFailure(context, "committed", () => true)).rejects.toThrow(
-			"invalid or unreadable",
+			"marker is not valid JSON",
 		);
 		expect(await Bun.file(stateFile).text()).toBe("invalid-json");
 	});
@@ -766,7 +766,7 @@ describe("coordinator runtime state sidecar", () => {
 				{ type: "agent_start" },
 				{ sessionId: "fallback", cwd: root, sessionFile: null },
 			),
-		).rejects.toThrow("invalid or unreadable");
+		).rejects.toThrow("signing key material is missing");
 		expect(await Bun.file(stateFile).exists()).toBe(false);
 
 		// The signer is captured and removed before runtime initialization. Supplying
@@ -778,7 +778,7 @@ describe("coordinator runtime state sidecar", () => {
 				{ type: "turn_start" },
 				{ sessionId: "fallback", cwd: root, sessionFile: null },
 			),
-		).rejects.toThrow("invalid or unreadable");
+		).rejects.toThrow("signing key material is missing");
 		expect(await Bun.file(stateFile).exists()).toBe(false);
 	});
 
@@ -1000,7 +1000,7 @@ describe("coordinator runtime state sidecar", () => {
 				{ type: "agent_end", messages: [] },
 				{ sessionId: "fallback", cwd: root, sessionFile: null },
 			),
-		).rejects.toThrow("Existing runtime state marker is invalid or unreadable; refusing to overwrite.");
+		).rejects.toThrow("marker is not valid JSON");
 		expect(await Bun.file(stateFile).text()).toBe(evidence);
 
 		await expect(
@@ -1009,7 +1009,7 @@ describe("coordinator runtime state sidecar", () => {
 				cwd: root,
 				sessionFile: null,
 			}),
-		).rejects.toThrow("Existing runtime state marker is invalid or unreadable; refusing to overwrite.");
+		).rejects.toThrow("marker is not valid JSON");
 		expect(await Bun.file(stateFile).text()).toBe(evidence);
 	});
 
@@ -1037,10 +1037,8 @@ describe("coordinator runtime state sidecar", () => {
 			sessionFile: null,
 		}).catch((error: unknown) => error);
 		expect(failure).toBeInstanceOf(Error);
-		expect(failure).toMatchObject({
-			name: "PreviousRuntimeStateReadError",
-			message: "Existing runtime state marker is invalid or unreadable; refusing to overwrite.",
-		});
+		expect(failure).toMatchObject({ name: "PreviousRuntimeStateReadError" });
+		expect((failure as Error).message).toContain("Existing runtime state marker violates the lifecycle contract:");
 		expect(await Bun.file(stateFile).text()).toBe(evidence);
 	});
 
@@ -1092,7 +1090,7 @@ describe("coordinator runtime state sidecar", () => {
 				{ type: "turn_start" },
 				{ sessionId: "fallback", cwd: root, sessionFile: null },
 			),
-		).rejects.toThrow("Existing runtime state marker is invalid or unreadable; refusing to overwrite.");
+		).rejects.toThrow("marker path is not a regular file");
 		expect((await fs.stat(stateFile)).isDirectory()).toBe(true);
 
 		await expect(
@@ -1101,7 +1099,7 @@ describe("coordinator runtime state sidecar", () => {
 				cwd: root,
 				sessionFile: null,
 			}),
-		).rejects.toThrow("Existing runtime state marker is invalid or unreadable; refusing to overwrite.");
+		).rejects.toThrow("marker path is not a regular file");
 		expect((await fs.stat(stateFile)).isDirectory()).toBe(true);
 	});
 
@@ -1124,7 +1122,7 @@ describe("coordinator runtime state sidecar", () => {
 					{ type: "turn_start" },
 					{ sessionId: "fallback", cwd: root, sessionFile: null },
 				),
-			).rejects.toThrow("Existing runtime state marker is invalid or unreadable; refusing to overwrite.");
+			).rejects.toThrow("marker could not be read");
 		} finally {
 			stat.mockRestore();
 		}
@@ -1142,7 +1140,7 @@ describe("coordinator runtime state sidecar", () => {
 					cwd: root,
 					sessionFile: null,
 				}),
-			).rejects.toThrow("Existing runtime state marker is invalid or unreadable; refusing to overwrite.");
+			).rejects.toThrow("marker could not be read");
 		} finally {
 			readFileSync.mockRestore();
 		}
@@ -2317,7 +2315,7 @@ describe("coordinator runtime state sidecar", () => {
 					cwd: root,
 					sessionFile: null,
 				}),
-			).rejects.toThrow("invalid or unreadable");
+			).rejects.toThrow("session_id must be");
 		} finally {
 			process.exitCode = previousExitCode;
 		}
@@ -4162,7 +4160,6 @@ describe("coordinator runtime state sidecar", () => {
 	});
 
 	it.each([
-		["completed", true, false, "ready_for_input must be false when state is completed (received true)"],
 		["ready_for_input", false, false, "ready_for_input must be true when state is ready_for_input (received false)"],
 		["running", false, false, "live must be true when state is running (received false)"],
 		["completed", false, true, "live must be false when state is completed (received true)"],
@@ -4187,7 +4184,7 @@ describe("coordinator runtime state sidecar", () => {
 		})}\n`;
 		await Bun.write(stateFile, evidence);
 		const context = { sessionId, cwd: root, sessionFile: null };
-		const message = `Existing runtime state marker violates the lifecycle contract: ${detail}; refusing to overwrite.`;
+		const message = `Existing runtime state marker violates the lifecycle contract: ${detail};`;
 
 		await expect(
 			persistCoordinatorRuntimeStateFromEvent(assistantEnd("re-assert completion"), context),

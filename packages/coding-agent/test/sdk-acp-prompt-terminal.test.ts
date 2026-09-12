@@ -2894,7 +2894,16 @@ for (const scenario of [
 			recover!(new SdkClientError("uncertain_after_send", "uncertain transport"));
 			await expect(bounded(pending, "failed status recovery")).rejects.toMatchObject({
 				code: authoritative ? classifier : "terminal_uncertain",
-				...(authoritative ? { message: "Execution failed." } : {}),
+				...(authoritative
+					? {
+							message:
+								scenario === "error_detail"
+									? "Execution failed."
+									: scenario === "prompt_deadline_exceeded"
+										? "Prompt deadline exceeded."
+										: "Prompt submission failed.",
+						}
+					: {}),
 			});
 			expect(fixture.turnResultInputs).toEqual([
 				{ kind: "prompt", commandId: "prompt-terminal-command", turnId: "prompt-terminal-turn" },
