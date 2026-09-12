@@ -3078,12 +3078,6 @@ export class AgentSession {
 			]),
 		];
 	}
-	/** Terminalize every tracked submission before the predecessor runtime loses its event bridge. */
-	#settleTrackedQueuedInputsForSessionTransition(): void {
-		for (const state of [...this.#trackedQueuedInputs.values()]) {
-			this.#settleTrackedQueuedInputRemoved(state, "removed");
-		}
-	}
 	/** Settle consumed tracked work before a maintenance path disconnects Agent events. */
 	#settleTrackedQueuedInputsBeforeAgentDisconnect(): void {
 		for (const state of [...this.#trackedQueuedInputs.values()]) {
@@ -3092,16 +3086,58 @@ export class AgentSession {
 			}
 		}
 	}
+	#reconcileCompactionSteeringDisplay(snapshot: readonly QueuedDisplayEntry[]): void {
+		const queued = this.agent.snapshotSteering();
+		const currentByMessage = new Map<AgentMessage, QueuedDisplayEntry>();
+		for (const entry of this.#steeringMessages) {
+			if (entry.message !== undefined && !currentByMessage.has(entry.message)) {
+				currentByMessage.set(entry.message, entry);
+			}
+		}
+		const snapshotByMessage = new Map<AgentMessage, QueuedDisplayEntry>();
+		for (const entry of snapshot) {
+			if (entry.message !== undefined && !snapshotByMessage.has(entry.message)) {
+				snapshotByMessage.set(entry.message, entry);
+			}
+		}
+		const selected = new Set<QueuedDisplayEntry>();
+		const next: QueuedDisplayEntry[] = [];
+		for (const message of queued) {
+			const entry = currentByMessage.get(message) ?? snapshotByMessage.get(message);
+			if (!entry || selected.has(entry)) continue;
+			selected.add(entry);
+			next.push(entry);
+		}
+		const queuedTags = new Set(
+			queued.flatMap(message => {
+				if (message.role !== "custom") return [];
+				const tag = readPendingDisplayTag(message.details);
+				return tag === undefined ? [] : [tag];
+			}),
+		);
+		for (const entry of this.#steeringMessages) {
+			if (entry.message !== undefined || selected.has(entry)) continue;
+			if (entry.tag !== undefined && queuedTags.has(entry.tag)) {
+				selected.add(entry);
+				next.push(entry);
+			}
+		}
+		next.sort((left, right) => left.sequence - right.sequence);
+		this.#steeringMessages = next;
+	}
 	/** Drop queued SDK work when the session identity is replaced. The old
 	 * promotion hooks belong to the predecessor runtime; retaining the message
 	 * would let it execute later under the successor without an owner. */
-	#terminalizeQueuedSdkWorkForSessionTransition(messages: readonly AgentMessage[]): void {
+	#terminalizeQueuedSdkWorkForSessionTransition(
+		messages: readonly AgentMessage[],
+		predecessorStates: readonly TrackedQueuedInput[] = [...this.#trackedQueuedInputs.values()],
+	): void {
 		if (messages.length > 0) {
 			this.#fireQueuedRemovalHooks(messages);
 			for (const message of messages) this.#sdkRunTokensByQueuedMessage.delete(message);
 			this.#deferredSdkFollowUps = this.#deferredSdkFollowUps.filter(message => !messages.includes(message));
 		}
-		this.#settleTrackedQueuedInputsForSessionTransition();
+		for (const state of predecessorStates) this.#settleTrackedQueuedInputRemoved(state, "removed");
 	}
 	#resetActiveSdkRunOwnership(): void {
 		this.#activeSdkRunToken = undefined;
@@ -3165,6 +3201,7 @@ export class AgentSession {
 	// Compaction state
 	#compactionAbortController: AbortController | undefined = undefined;
 	#compactionCompletion: Promise<void> | undefined;
+	#compactionQueuedDeliveryArmed = false;
 	#autoCompactionCompletions = new Set<Promise<AutoCompactionTerminalStatus>>();
 	#autoCompactionAbortController: AbortController | undefined = undefined;
 
@@ -7421,6 +7458,10 @@ export class AgentSession {
 			!(event.stopReason === "maintenance" && isContinuingMidRunMaintenanceOutcome(event.maintenanceOutcome))
 		) {
 			this.#releaseDeferredSdkFollowUps();
+			if (this.#compactionQueuedDeliveryArmed) {
+				if (this.agent.hasQueuedMessages()) this.#scheduleQueuedDelivery();
+				else this.#compactionQueuedDeliveryArmed = false;
+			}
 		}
 
 		// Check auto-retry and auto-compaction after agent completes
@@ -9312,6 +9353,7 @@ export class AgentSession {
 	 */
 	#disconnectFromAgent(): void {
 		this.#abortActiveMidRunBarriers();
+		this.#compactionQueuedDeliveryArmed = false;
 		if (this.#unsubscribeAgent) {
 			this.#unsubscribeAgent();
 			this.#unsubscribeAgent = undefined;
@@ -13656,20 +13698,21 @@ export class AgentSession {
 		return owner;
 	}
 
-	#releaseDeferredSdkFollowUps(): void {
+	#releaseDeferredSdkFollowUps(): boolean {
 		// A deferred SDK follow-up must become the sole first message at the next
 		// acceptance so its run token is bound to the agent_start. Releasing it
 		// behind still-queued work reproduces the token-less mid-run consumption
 		// hazard, so wait for the queue to drain; the next agent_end retries.
-		if (this.agent.hasQueuedMessages()) return;
+		if (this.agent.hasQueuedMessages()) return false;
 		const message = this.#deferredSdkFollowUps.shift();
-		if (!message) return;
+		if (!message) return false;
 		this.agent.followUp(message, { forceOneAtATime: true });
 		this.#scheduleAgentContinue({
 			shouldContinue: () => this.#canStartDeferredSdkFollowUp() && this.agent.hasQueuedMessages(),
 			rescheduleOnBusy: true,
 			continueQueuedOnly: true,
 		});
+		return true;
 	}
 	#canStartDeferredSdkFollowUp(): boolean {
 		if (this.agent.state.isStreaming) return false;
@@ -18316,22 +18359,26 @@ export class AgentSession {
 			this.#settleTrackedQueuedInputsBeforeAgentDisconnect();
 			this.#disconnectFromAgent();
 			try {
-				await this.abort({ cause: "compaction", preserveCompaction: true });
-				const steeringAfterAbort = new Set(this.agent.snapshotSteering());
-				const missingSteering = steeringBeforeCompaction.filter(message => !steeringAfterAbort.has(message));
-				if (missingSteering.length > 0) {
-					this.agent.restoreSteering(missingSteering);
-					const missingSteeringSet = new Set(missingSteering);
-					const missingSteeringDisplays: QueuedDisplayEntry[] = [];
-					for (let index = 0; index < steeringBeforeCompaction.length; index++) {
-						if (!missingSteeringSet.has(steeringBeforeCompaction[index]!)) continue;
-						const display = steeringDisplaysBeforeCompaction[index];
-						if (display) missingSteeringDisplays.push(display);
-					}
-					this.#steeringMessages = [...missingSteeringDisplays, ...this.#steeringMessages];
+				try {
+					await this.abort({ cause: "compaction", preserveCompaction: true });
+				} finally {
+					const steeringAfterAbort = new Set(this.agent.snapshotSteering());
+					const missingSteering = steeringBeforeCompaction.filter(message => !steeringAfterAbort.has(message));
+					if (missingSteering.length > 0) this.agent.restoreSteering(missingSteering);
+					this.#reconcileCompactionSteeringDisplay(steeringDisplaysBeforeCompaction);
+					// The disconnected bridge cannot run finishAttempt for the aborted
+					// predecessor. Do not let its SDK token or attempt identity bleed into
+					// the first ordinary successor prompt.
+					this.#resetActiveSdkRunOwnership();
 				}
 			} catch (error) {
 				this.#compactionAbortController = undefined;
+				if (!this.#isDisposed && !this.#sessionAdmissionClosing) {
+					this.#reconnectToAgent();
+					const releasedDeferred = this.#releaseDeferredSdkFollowUps();
+					this.#compactionQueuedDeliveryArmed = this.agent.hasQueuedMessages();
+					if (!releasedDeferred && this.#compactionQueuedDeliveryArmed) this.#scheduleQueuedDelivery();
+				}
 				throw error;
 			}
 			await this.#waitForAutoCompactionCompletions();
@@ -18479,7 +18526,12 @@ export class AgentSession {
 				if (this.#compactionAbortController === compactionAbortController) {
 					this.#compactionAbortController = undefined;
 				}
-				if (!this.#isDisposed && !this.#sessionAdmissionClosing) this.#reconnectToAgent();
+				if (!this.#isDisposed && !this.#sessionAdmissionClosing) {
+					this.#reconnectToAgent();
+					const releasedDeferred = this.#releaseDeferredSdkFollowUps();
+					this.#compactionQueuedDeliveryArmed = this.agent.hasQueuedMessages();
+					if (!releasedDeferred && this.#compactionQueuedDeliveryArmed) this.#scheduleQueuedDelivery();
+				}
 			}
 		} finally {
 			completion.resolve();
@@ -24081,6 +24133,7 @@ export class AgentSession {
 			const previousAgentSteeringQueue = this.agent.snapshotSteering();
 			const previousAgentFollowUpQueue = this.agent.snapshotFollowUp();
 			const previousDeferredSdkFollowUps = [...this.#deferredSdkFollowUps];
+			const previousTrackedQueuedInputs = [...this.#trackedQueuedInputs.values()];
 			const previousActiveSdkRunToken = this.#activeSdkRunToken;
 			const previousActiveAttemptScope = this.#activeAttemptScope;
 			const previousActiveLogicalRunId = this.#activeLogicalRunId;
@@ -24290,11 +24343,10 @@ export class AgentSession {
 					// The successor identity is committed. Settle consumed tracked inputs
 					// before reconnecting the successor or running session-switch hooks,
 					// either of which can outlive the predecessor event bridge.
-					this.#terminalizeQueuedSdkWorkForSessionTransition([
-						...previousAgentSteeringQueue,
-						...previousAgentFollowUpQueue,
-						...previousDeferredSdkFollowUps,
-					]);
+					this.#terminalizeQueuedSdkWorkForSessionTransition(
+						[...previousAgentSteeringQueue, ...previousAgentFollowUpQueue, ...previousDeferredSdkFollowUps],
+						previousTrackedQueuedInputs,
+					);
 					// Different files may intentionally carry the same copied session id; pathname transition is the commit signal.
 					ownerShutdownTransitionCommitted = true;
 					if (ownerShutdownSettled) {
@@ -24324,12 +24376,14 @@ export class AgentSession {
 						...(options?.transition ? { transition: options.transition } : {}),
 					});
 				}
-				this.#terminalizeQueuedSdkWorkForSessionTransition([
-					...previousAgentSteeringQueue,
-					...previousAgentFollowUpQueue,
-					...previousDeferredSdkFollowUps,
-				]);
-				this.#deferredSdkFollowUps = [];
+				this.#terminalizeQueuedSdkWorkForSessionTransition(
+					[...previousAgentSteeringQueue, ...previousAgentFollowUpQueue, ...previousDeferredSdkFollowUps],
+					previousTrackedQueuedInputs,
+				);
+				const predecessorDeferred = new Set(previousDeferredSdkFollowUps);
+				this.#deferredSdkFollowUps = this.#deferredSdkFollowUps.filter(
+					message => !predecessorDeferred.has(message),
+				);
 				return true;
 			} catch (error) {
 				if (transitionCleanupCommitted) throw error;
