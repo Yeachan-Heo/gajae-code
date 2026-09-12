@@ -654,6 +654,7 @@ async function adoptOrphanedFileLockRemovalTransition(lockPath: string, orphanAg
 	// replacement is never deleted.
 	if (
 		removal.code === "cleanup_pending" &&
+		removal.payloadDurable === true &&
 		removal.detachedPath !== undefined &&
 		path.resolve(removal.detachedPath) === path.resolve(transitionPath) &&
 		removal.retainedSuccessorPath === undefined &&
