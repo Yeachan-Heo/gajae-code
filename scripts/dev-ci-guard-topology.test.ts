@@ -9,6 +9,7 @@ import { parse } from "yaml";
 // aggregate.
 interface WorkflowStep {
 	name?: string;
+	if?: string;
 	uses?: string;
 	run?: string;
 	env?: Record<string, string>;
@@ -19,6 +20,7 @@ interface WorkflowJob {
 	name: string;
 	needs?: string[];
 	if?: string;
+	permissions?: Record<string, "read" | "write" | "none">;
 	env?: Record<string, string>;
 	concurrency?: { group: string; "cancel-in-progress"?: string | boolean; queue?: string };
 	steps: WorkflowStep[];
