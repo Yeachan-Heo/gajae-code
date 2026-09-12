@@ -54,6 +54,7 @@ describe("queued promotion run identity (#4668)", () => {
 		responses: MockHandler[],
 		tool: AgentTool<typeof echoSchema, EchoParams>,
 		settings = Settings.isolated({ "compaction.enabled": false }),
+		sessionManager = SessionManager.inMemory(),
 	): AgentSession {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
 		if (!model) throw new Error("Expected bundled Anthropic test model to exist");
@@ -64,10 +65,10 @@ describe("queued promotion run identity (#4668)", () => {
 			streamFn: mock.stream,
 		});
 		settings.setModelRole("default", `${model.provider}/${model.id}`);
-		return new AgentSession({ agent, sessionManager: SessionManager.inMemory(), settings, modelRegistry });
+		return new AgentSession({ agent, sessionManager, settings, modelRegistry });
 	}
 
-	function buildAbortableTrackedTransitionFixture() {
+	function buildAbortableTrackedTransitionFixture(sessionManager = SessionManager.inMemory()) {
 		const firstGate = Promise.withResolvers<void>();
 		const secondGate = Promise.withResolvers<void>();
 		const firstToolStarted = Promise.withResolvers<void>();
@@ -103,6 +104,8 @@ describe("queued promotion run identity (#4668)", () => {
 					{ content: ["done"] },
 				],
 				transitionTool,
+				undefined,
+				sessionManager,
 			),
 			firstGate,
 			secondGate,
@@ -1166,6 +1169,48 @@ describe("queued promotion run identity (#4668)", () => {
 		await promptDone;
 	});
 
+	it("drops queued and consumed tracked submissions at the committed fork boundary", async () => {
+		const fixture = buildAbortableTrackedTransitionFixture(SessionManager.create(tempDir.path(), tempDir.path()));
+		session = fixture.session;
+		const previousSessionId = session.sessionId;
+		const promptDone = session.prompt("first task").catch(() => {});
+		await fixture.firstToolStarted.promise;
+		const consumed = await session.submitUserMessage("same-run steer", {
+			deliverAs: "steer",
+			trackSubmission: true,
+		});
+		fixture.firstGate.resolve();
+		await expect(consumed.execution).resolves.toMatchObject({
+			submissionId: consumed.submissionId,
+			disposition: "joined-current-run",
+		});
+		await fixture.secondToolStarted.promise;
+		const queued = await session.submitUserMessage("deferred follow-up", {
+			deliverAs: "followUp",
+			trackSubmission: true,
+			sdkRunCapability: createSdkRunCapability("fork-deferred-follow-up"),
+		} as never);
+		expect(session.agent.snapshotFollowUp()).toHaveLength(0);
+
+		const fork = session.fork();
+		await expect(consumed.terminal).resolves.toMatchObject({
+			submissionId: consumed.submissionId,
+			disposition: "removed",
+			reason: "removed",
+		});
+		await expect(queued.terminal).resolves.toMatchObject({
+			submissionId: queued.submissionId,
+			disposition: "removed",
+			reason: "removed",
+		});
+		expect(session.agent.hasQueuedMessages()).toBe(false);
+		expect(session.getQueuedMessageEntries()).toHaveLength(0);
+		fixture.secondGate.resolve();
+		await expect(fork).resolves.toBe(true);
+		expect(session.sessionId).not.toBe(previousSessionId);
+		await promptDone;
+	});
+
 	it("rejects invalid tracked submission options before dispatch", async () => {
 		session = buildSession([{ content: ["must not dispatch"] }], {
 			name: "echo",
@@ -1191,6 +1236,15 @@ describe("queued promotion run identity (#4668)", () => {
 			expect(session.agent.state.messages).toHaveLength(0);
 			expect(session.isStreaming).toBe(false);
 		}
+		await expect(
+			session.sendUserMessage("legacy invalid queue policy", {
+				deliverAs: "followUp",
+				queuePolicy: "bogus",
+			} as never),
+		).rejects.toMatchObject({ code: "invalid_input" });
+		expect(session.agent.hasQueuedMessages()).toBe(false);
+		expect(session.agent.state.messages).toHaveLength(0);
+		expect(session.isStreaming).toBe(false);
 		await expect(
 			session.sendUserMessage("legacy tracked input", {
 				deliverAs: "followUp",
