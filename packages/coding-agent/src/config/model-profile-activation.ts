@@ -1292,7 +1292,8 @@ export async function prepareModelProfileActivation(
 		const baseModelRoles =
 			options.profileScope === "session" && previousProfileScope === "durable"
 				? previousModelRoles
-				: previousProfileScope === "session" && previousProfileInstalledOverrideState
+				: previousProfileInstalledOverrideState &&
+						(previousProfileScope === "session" || options.profileScope === "durable")
 					? restoreProfileOverrideLayer(previousModelRoles, previousProfileInstalledOverrideState.modelRoles)
 					: Object.fromEntries(
 							Object.entries(previousModelRoles).filter(
@@ -1303,7 +1304,8 @@ export async function prepareModelProfileActivation(
 		const baseAgentModelOverrides =
 			options.profileScope === "session" && previousProfileScope === "durable"
 				? previousAgentModelOverrides
-				: previousProfileScope === "session" && previousProfileInstalledOverrideState
+				: previousProfileInstalledOverrideState &&
+						(previousProfileScope === "session" || options.profileScope === "durable")
 					? restoreProfileOverrideLayer(
 							previousAgentModelOverrides,
 							previousProfileInstalledOverrideState.agentModelOverrides,

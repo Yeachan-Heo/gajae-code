@@ -608,7 +608,7 @@ describe("AgentSession switchSession resumeModelBehavior", () => {
 		await session.setDefaultModelSelection(opus, ThinkingLevel.Low);
 
 		expect(session.model?.id).toBe(opus.id);
-		expect(settings.getModelRole("default")).toBe(`${opus.provider}/${opus.id}:low`);
+		expect(settings.getModelRole("default")).toBe(`${opus.provider}/${opus.id}`);
 		expect(session.getActiveModelProfile()).toBeUndefined();
 	});
 

@@ -16145,8 +16145,8 @@ export class AgentSession {
 			const agentOverrides = { ...this.settings.get("task.agentModelOverrides") };
 			if (options?.preserveDefaultModelRole) {
 				const selectedDefault =
-					this.settings.getGlobal("modelRoles")?.default ??
-					(this.model ? formatModelString(this.model) : undefined);
+					(this.model ? formatModelString(this.model) : undefined) ??
+					this.settings.getGlobal("modelRoles")?.default;
 				if (selectedDefault !== undefined) modelRoles.default = selectedDefault;
 			}
 			for (const [role, baseline] of this.#activeProfileInstalledRoles) {
