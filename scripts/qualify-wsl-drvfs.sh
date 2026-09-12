@@ -34,9 +34,20 @@ drvfs_root="$private_mount/$relative_root"
 [[ -d $drvfs_root ]]
 findmnt -T "$drvfs_root" -o TARGET,SOURCE,FSTYPE,OPTIONS > "$evidence/mount-after.txt"
 mount_type=$(findmnt -T "$drvfs_root" -n -o FSTYPE)
-mount_options=$(findmnt -T "$drvfs_root" -n -o OPTIONS)
 [[ $mount_type == drvfs || $mount_type == 9p ]]
-[[ ,$mount_options, == *,metadata,* || $mount_options == *';metadata'* ]]
+# A mount-options label does not prove private mode retention. Verify the
+# required behavior through independent stat processes on the actual mount.
+mode_probe=$(mktemp -d "$drvfs_root/.gjc-mode-XXXXXX")
+chmod 700 "$mode_probe"
+printf 'mode probe\n' > "$mode_probe/file"
+chmod 600 "$mode_probe/file"
+stat -c '%n mode=%a uid=%u gid=%g inode=%i' "$mode_probe" "$mode_probe/file" > "$evidence/metadata-mode.txt"
+[[ $(stat -c '%a' "$mode_probe") == 700 && $(stat -c '%a' "$mode_probe/file") == 600 ]] || {
+    printf 'DrvFS did not retain required private directory/file modes\n' >&2
+    exit 1
+}
+rm -- "$mode_probe/file"
+rmdir -- "$mode_probe"
 printf 'GJC_TEST_DRVFS_ROOT=%s\n' "$drvfs_root" > "$evidence/test-root.txt"
 
 export DEBIAN_FRONTEND=noninteractive
