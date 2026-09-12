@@ -366,6 +366,57 @@ describe("model profile activation", () => {
 		expect(recovery.entries).toEqual([]);
 	});
 
+	test("durable default recovery ignores an optional mapped provider auth probe failure", async () => {
+		const profile: ModelProfileDefinition = {
+			name: "optional-mapped-provider",
+			requiredProviders: ["provider-a"],
+			modelMapping: { default: "provider-a/default", executor: "provider-b/executor" },
+			source: "user",
+		};
+		const baseRegistry = fakeRegistry({ profiles: [profile] });
+		const registry = {
+			...baseRegistry,
+			getApiKeyForProvider: async (provider: string) => {
+				if (provider === "provider-b") throw new Error("optional provider lookup failed");
+				return "key-provider-a";
+			},
+		} as unknown as ModelRegistry;
+
+		await expect(
+			resolveModelProfileDefaultChain({
+				modelRegistry: registry,
+				settings: Settings.isolated(),
+				profileName: profile.name,
+				credentialSessionId: "resume-session",
+			}),
+		).resolves.toEqual({ profileName: profile.name, entries: ["provider-a/default"] });
+	});
+
+	test("durable default recovery rejects a required provider auth probe failure", async () => {
+		const profile: ModelProfileDefinition = {
+			name: "required-provider",
+			requiredProviders: ["provider-a"],
+			modelMapping: { default: "provider-a/default" },
+			source: "user",
+		};
+		const baseRegistry = fakeRegistry({ profiles: [profile] });
+		const registry = {
+			...baseRegistry,
+			getApiKeyForProvider: async () => {
+				throw new Error("required provider lookup failed");
+			},
+		} as unknown as ModelRegistry;
+
+		await expect(
+			resolveModelProfileDefaultChain({
+				modelRegistry: registry,
+				settings: Settings.isolated(),
+				profileName: profile.name,
+				credentialSessionId: "resume-session",
+			}),
+		).rejects.toThrow("required provider lookup failed");
+	});
+
 	test("notifies mounted consumers when fresh discovery evidence changes from non-empty to empty", async () => {
 		const tempDir = TempDir.createSync("@gjc-profile-live-catalog-notify-");
 		const authStorage = await AuthStorage.create(`${tempDir.path()}/auth.db`);

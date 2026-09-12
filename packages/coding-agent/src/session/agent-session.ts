@@ -23762,7 +23762,12 @@ export class AgentSession {
 								}).model,
 						);
 						const durableProfile = this.settings.get("modelProfile.default");
-						if (allSelectorsUnknown && savedSelectorsMissingFromCatalog && durableProfile) {
+						if (
+							resumeModelBehavior !== "useCurrentDefault" &&
+							allSelectorsUnknown &&
+							savedSelectorsMissingFromCatalog &&
+							durableProfile
+						) {
 							try {
 								const recovery = await resolveModelProfileDefaultChain({
 									modelRegistry: this.#modelRegistry,
