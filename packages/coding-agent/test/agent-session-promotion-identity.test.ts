@@ -1002,6 +1002,78 @@ describe("queued promotion run identity (#4668)", () => {
 		});
 	});
 
+	it("preserves FIFO when ordinary follow-up follows deferred SDK work", async () => {
+		const sessionManager = SessionManager.inMemory();
+		sessionManager.appendMessage({ role: "user", content: "old context ".repeat(100), timestamp: 1 });
+		sessionManager.appendMessage({ role: "user", content: "recent context", timestamp: 2 });
+		let ordinary: QueuedInputSubmission | undefined;
+		const extensionRunner = {
+			hasHandlers: vi.fn(
+				(eventType: string) => eventType === "session_before_compact" || eventType === "session_compact",
+			),
+			hasToolResultMediation: vi.fn().mockReturnValue(false),
+			emitBeforeAgentStart: vi.fn().mockResolvedValue({ messages: [] }),
+			emit: vi.fn().mockImplementation(async (event: unknown) => {
+				const typedEvent = event as {
+					type?: string;
+					preparation?: { firstKeptEntryId: string; tokensBefore: number };
+				};
+				if (typedEvent.type === "session_compact") {
+					ordinary = await session!.submitUserMessage("ordinary after deferred SDK", {
+						deliverAs: "followUp",
+						trackSubmission: true,
+					});
+					return undefined;
+				}
+				if (!typedEvent.preparation) return undefined;
+				return {
+					compaction: {
+						summary: "mixed FIFO summary",
+						shortSummary: "mixed FIFO",
+						firstKeptEntryId: typedEvent.preparation.firstKeptEntryId,
+						tokensBefore: typedEvent.preparation.tokensBefore,
+						details: {},
+					},
+				};
+			}),
+		};
+		const fixture = buildAbortableTrackedTransitionFixture(sessionManager, extensionRunner, true);
+		session = fixture.session;
+		session.settings.override("compaction.keepRecentTokens", 1);
+		const promptDone = session.prompt("first task").catch(() => {});
+		await fixture.firstToolStarted.promise;
+		const deferred = await session.submitUserMessage("deferred SDK", {
+			deliverAs: "followUp",
+			trackSubmission: true,
+			sdkRunCapability: createSdkRunCapability("mixed-deferred-fifo"),
+		} as never);
+		expect(session.agent.snapshotFollowUp()).toHaveLength(0);
+
+		await expect(session.compact()).resolves.toMatchObject({ summary: "mixed FIFO summary" });
+		expect(ordinary).toBeDefined();
+		const ordinarySubmission = ordinary!;
+		const executionOrder: string[] = [];
+		void deferred.execution.then(() => executionOrder.push("deferred"));
+		void ordinarySubmission.execution.then(() => executionOrder.push("ordinary"));
+		await withTimeout(fixture.secondToolStarted.promise, 5_000, "mixed FIFO deferred successor start");
+		expect(
+			await Promise.race([ordinarySubmission.execution.then(() => "settled"), Bun.sleep(20).then(() => "pending")]),
+		).toBe("pending");
+		fixture.secondGate.resolve();
+		await expect(withTimeout(deferred.terminal, 5_000, "mixed FIFO deferred terminal")).resolves.toMatchObject({
+			submissionId: deferred.submissionId,
+			disposition: "completed",
+		});
+		await expect(
+			withTimeout(ordinarySubmission.terminal, 5_000, "mixed FIFO ordinary terminal"),
+		).resolves.toMatchObject({
+			submissionId: ordinarySubmission.submissionId,
+			disposition: "completed",
+		});
+		expect(executionOrder).toEqual(["deferred", "ordinary"]);
+		await promptDone;
+	});
+
 	it("admits tracked work from the committed session_compact hook", async () => {
 		const sessionManager = SessionManager.inMemory();
 		const firstKeptEntryId = sessionManager.appendMessage({
