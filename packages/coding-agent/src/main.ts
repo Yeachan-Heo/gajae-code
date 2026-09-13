@@ -478,6 +478,8 @@ async function applyStartupModelProfilesWithPolicy(
 		options: {
 			profileScope?: "session" | "durable";
 			thinkingLevelOverride?: CreateAgentSessionOptions["thinkingLevel"];
+			preserveConfiguredDefaultChain?: boolean;
+			preserveCurrentModel?: boolean;
 		} = {},
 	): Promise<boolean> => {
 		try {
@@ -487,6 +489,8 @@ async function applyStartupModelProfilesWithPolicy(
 					persistDefault,
 					profileScope: options.profileScope ?? (persistDefault ? "durable" : "session"),
 					thinkingLevelOverride: options.thinkingLevelOverride,
+					preserveConfiguredDefaultChain: options.preserveConfiguredDefaultChain,
+					preserveCurrentModel: options.preserveCurrentModel,
 				},
 			);
 			return true;
@@ -514,13 +518,15 @@ async function applyStartupModelProfilesWithPolicy(
 		(args.preferCachedDefaultProfile === true && defaultProfile !== undefined);
 	const applyConfiguredProfiles = async (): Promise<boolean> => {
 		let applied = true;
-		if (defaultProfile && !preserveResumedSessionModel) {
+		if (defaultProfile) {
 			applied =
 				(await applyProfile(defaultProfile, false, {
 					profileScope: "durable",
 					thinkingLevelOverride: args.settings.has("defaultThinkingLevel")
 						? args.settings.get("defaultThinkingLevel")
 						: undefined,
+					preserveConfiguredDefaultChain: preserveResumedSessionModel,
+					preserveCurrentModel: preserveResumedSessionModel,
 				})) && applied;
 		}
 		if (args.parsedArgs.mpreset) {

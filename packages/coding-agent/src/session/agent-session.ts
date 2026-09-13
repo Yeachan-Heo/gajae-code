@@ -15555,7 +15555,9 @@ export class AgentSession {
 		const needsRebind =
 			profileName !== undefined &&
 			((activeProfileIdentity !== undefined &&
-				(this.#activeModelProfileScope !== "durable" || profileName !== activeProfileIdentity)) ||
+				(this.#activeModelProfileScope !== "durable" ||
+					profileName !== activeProfileIdentity ||
+					configuredProfileIdentity !== undefined)) ||
 				(activeProfileIdentity === undefined && recoveredProfileIdentity !== undefined));
 		if (!needsRebind || !profileName) return undefined;
 
@@ -15609,6 +15611,7 @@ export class AgentSession {
 			}
 		}
 
+		const preparedNewSessionProfile = await this.#prepareNewSessionProfileTransition();
 		const manager = this.#ownedAsyncJobManager ?? AsyncJobManager.instance();
 		const ownerId = this.#agentId;
 		const lease = manager && ownerId ? manager.beginOwnerSubagentShutdown(ownerId) : undefined;
@@ -15634,7 +15637,6 @@ export class AgentSession {
 			this.#closeAllProviderSessions("new session");
 			this.#rebindProviderSessionState(new Map());
 			this.#terminalizeQueuedSdkWorkForSessionTransition(this.#queuedMessagesForSessionTransition());
-			const preparedNewSessionProfile = await this.#prepareNewSessionProfileTransition();
 			this.#resetActiveSdkRunOwnership();
 			this.agent.reset();
 			if (!options?.drop) await this.sessionManager.flush();
@@ -15720,7 +15722,6 @@ export class AgentSession {
 			if (!(await manager.cancelAndSettleOwnerJobs(ownerId))) {
 				throw new Error("Owned async jobs did not settle before session replacement.");
 			}
-			const preparedNewSessionProfile = await this.#prepareNewSessionProfileTransition();
 			const prepared = await this.sessionManager.prepareNewSession(options);
 			try {
 				// Last fallible gate while public getters still show the predecessor (#3138).
@@ -15799,6 +15800,9 @@ export class AgentSession {
 			((activeProfileIdentity !== undefined &&
 				(this.#activeModelProfileScope !== "durable" || profileToRebind !== activeProfileIdentity)) ||
 				(activeProfileIdentity === undefined && recoveredRuntimeProfileIdentity !== undefined));
+		const refreshConfiguredProfile =
+			replacingConfiguredProfile ||
+			(profileToRebind !== undefined && preparedNewSessionProfile?.profileName === profileToRebind);
 		const preProfileModel = this.#preProfileModel;
 		this.#resetSessionScopedModelProfileState(
 			(droppingSessionOnlyProfile || replacingConfiguredProfile) && profileToRebind
@@ -15815,7 +15819,7 @@ export class AgentSession {
 		let runtimeProfileDefaultModel: Model | undefined;
 		let runtimeProfileDefaultActiveIndex: number | undefined;
 		let runtimeProfileDefaultSkips: Array<{ selector: string; reason: string }> = [];
-		if (replacingConfiguredProfile && profileToRebind) {
+		if (refreshConfiguredProfile && profileToRebind) {
 			const profileTransition =
 				preparedNewSessionProfile?.profileName === profileToRebind ? preparedNewSessionProfile : undefined;
 			if (profileTransition) {
@@ -15824,20 +15828,11 @@ export class AgentSession {
 					profileTransition,
 					false,
 				);
+				runtimeProfileDefaultModel = profileTransition.defaultModel;
+				runtimeProfileDefaultActiveIndex = profileTransition.defaultActiveIndex;
+				runtimeProfileDefaultSkips = profileTransition.defaultResolutionSkips;
 			} else {
 				this.#resetSessionScopedModelProfileState({ forceCleanup: true });
-			}
-			if (runtimeProfileDefaultChain?.length) {
-				const resolution = await resolveModelChainWithAuth(
-					runtimeProfileDefaultChain,
-					this.#modelRegistry,
-					this.settings,
-					this.credentialSessionId,
-					{ managedFallback: true, canonicalSessionId: null, aliasIntent: "preset-equivalent" },
-				);
-				runtimeProfileDefaultModel = resolution.model;
-				runtimeProfileDefaultActiveIndex = resolution.activeIndex;
-				runtimeProfileDefaultSkips = resolution.skips;
 			}
 		}
 		this.#defaultFallbackController = undefined;
@@ -15860,7 +15855,7 @@ export class AgentSession {
 				controller,
 				runtimeProfileDefaultActiveIndex ?? 0,
 				runtimeProfileDefaultSkips,
-				false,
+				true,
 			);
 		}
 		// A dropped session-only profile must not leak its concrete model into

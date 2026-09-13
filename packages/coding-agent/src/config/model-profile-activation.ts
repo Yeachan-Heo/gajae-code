@@ -284,6 +284,8 @@ function materializeConfiguredDefaultChain(
 	session: Pick<ModelProfileActivationSession, "model" | "thinkingLevel" | "getConfiguredModelChain">,
 ): ModelSelectorValue | undefined {
 	if (!session.model) return undefined;
+	// Non-default assignment materialization deliberately persists the concrete
+	// active default; profile deletion materializes its complete chain separately.
 	return formatModelSelectorValue(`${session.model.provider}/${session.model.id}`, session.thinkingLevel);
 }
 
