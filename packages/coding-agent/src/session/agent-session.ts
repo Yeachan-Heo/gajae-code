@@ -16126,6 +16126,7 @@ export class AgentSession {
 			this.#promptPreflightCancellationGeneration++;
 			this.#promptPreflightAbortController.abort();
 			this.#promptPreflightAbortController = new AbortController();
+			this.#dropQueuedTtsrFollowUps();
 		}
 		const aborted = this.#runCancellationDomains.abort(handle);
 		if (!aborted.ok) {
