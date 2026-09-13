@@ -291,6 +291,8 @@ jobs:
               name: main-native-${{ github.run_id }}
               path: packages/natives/native
          - name: Run ACP conformance
+           env:
+              GJC_RELEASE_TRACE_DIR: ${{ runner.temp }}/acp-conformance/traces
            run: |
               # Real (non-symlinked) seeded scratch workspace, matching the promoted baseline:
               # the ACP client enforces its session cwd root against the resolved path.
@@ -298,7 +300,7 @@ jobs:
               scratch="$(cd "$scratch" && pwd -P)"
               printf 'acpx conformance workspace\n' > "$scratch/README.md"
               bun run conformance:run -- \
-                 --agent-command "bun packages/coding-agent/scripts/acp-conformance-agent.ts" \
+                 --agent-command "bun packages/coding-agent/scripts/acp-conformance-trace-agent.ts" \
                  --format json \
                  --report "$RUNNER_TEMP/acp-conformance/report.json" \
                  --cwd "$scratch"
@@ -307,7 +309,7 @@ jobs:
            uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
            with:
               name: acp-conformance-report-${{ github.run_id }}
-              path: ${{ runner.temp }}/acp-conformance/report.json
+              path: ${{ runner.temp }}/acp-conformance/
               if-no-files-found: warn
               retention-days: 7
               overwrite: true
