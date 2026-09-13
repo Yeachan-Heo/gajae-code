@@ -556,7 +556,17 @@ Project executor override body.
 		const ralplan = await Bun.file(
 			path.join(repoRoot, "packages", "coding-agent", "src", "defaults", "gjc", "skills", "ralplan", "SKILL.md"),
 		).text();
-		expect(ralplan).toContain("counts as opting into execution for that skill");
+		expect(ralplan).toContain("it does not replace structured approval for the current final artifact");
+		expect(ralplan).toContain("Never invent a direct approval record or infer execution consent from the skill name");
+		expect(ralplan).toContain("even if the user already named an execution skill");
+		expect(ralplan).toContain("A revised final artifact requires a fresh structured approval");
+		expect(ralplan).toContain(
+			'"plan this, then use `/skill:ultragoal`" still requires the tagged final approval `ask`',
+		);
+		expect(ralplan).toContain(
+			"Free text, refinement, cancellation, timeout, and **Stop here** do not authorize execution",
+		);
+		expect(ralplan).not.toContain("skip the re-ask");
 		expect(ralplan).toContain("gjc.ralplan.autoHandoff");
 		expect(ralplan).toContain("`off` (default), `ultragoal`, or `autoresearch`");
 		expect(ralplan).not.toContain("team_unavailable");
@@ -631,6 +641,33 @@ Project executor override body.
 		]) {
 			expect(content).not.toContain(forbidden);
 		}
+	});
+
+	it("documents full initial Crystal coverage and an explicit Phase 5 execution approval gate", () => {
+		const content =
+			getDefaultGjcDefinitions().find(
+				definition => definition.kind === "skill" && definition.name === "deep-interview",
+			)?.content ?? "";
+		expect(content).toContain("`snapshot.start` MUST be 0");
+		expect(content).toContain("exactly 200 is valid");
+		expect(content).toContain("canonical stored prior Crystal preserving the prefix");
+		expect(content).toContain("continue the ordinary interview flow");
+		const phase5 = content.split("## Phase 5: Execution Bridge")[1]?.split("### Phase 5b:")[0] ?? "";
+		const example = phase5.match(/```json\n([\s\S]*?)\n```/);
+		expect(example).not.toBeNull();
+		const input = JSON.parse(example![1]!);
+		expect(input.questions).toHaveLength(1);
+		expect(input.questions[0].workflowGate).toEqual({ stage: "deep-interview", kind: "execution" });
+		expect(input.questions[0].multi).toBe(false);
+		expect(input.questions[0].options).toContainEqual({
+			label: "Execute with ultragoal (only when spec is already implementation-ready and really simple)",
+		});
+		expect(phase5).toContain("separate `gjc deep-interview approve-execution --json` action");
+		expect(phase5).toContain("require that action to succeed before invoking `/skill:ultragoal`");
+		expect(phase5).toContain("does not itself authorize or automatically start implementation");
+		expect(phase5).toContain(
+			"Research/refinement choices, custom responses, cancellation, timeout, and untagged asks do not grant execution approval",
+		);
 	});
 
 	it("renders deep-interview arguments once through the loader-owned User field", async () => {
@@ -861,68 +898,83 @@ Project executor override body.
 	it("prints skill inspection guidance for setup defaults without changing JSON output", async () => {
 		const externalRoot = await makeTempRoot();
 		const home = await makeTempRoot();
-		const env = {
-			...process.env,
+		// A fresh HOME alone does not override inherited profile or managed-owner authority.
+		const env: NodeJS.ProcessEnv = {
+			...Object.fromEntries(
+				Object.entries(process.env).filter(([key]) => !key.startsWith("GJC_") && !key.startsWith("PI_")),
+			),
 			HOME: home,
+			GJC_CONFIG_DIR: ".gjc",
+			GJC_CODING_AGENT_DIR: path.join(home, ".gjc", "agent"),
 			PI_NO_TITLE: "1",
 			NO_COLOR: "1",
 			FORCE_COLOR: undefined,
 		};
 
-		const installProc = Bun.spawn(
-			[process.execPath, path.join(repoRoot, "packages", "coding-agent", "src", "cli.ts"), "setup", "defaults"],
-			{
-				cwd: externalRoot,
-				stdout: "pipe",
-				stderr: "pipe",
-				env,
-			},
-		);
-		const installStdout = await new Response(installProc.stdout).text();
-		const installStderr = await new Response(installProc.stderr).text();
-		expect(await installProc.exited).toBe(0);
+		// Hosted cold source startup hit the former 8s kill deadline with no stderr.
+		// Allow 30s per process; the 100s test budget covers all three plus cleanup.
+		const processTimeoutMs = 30_000;
+		const runSetupDefaults = async (args: string[] = []) => {
+			const startedAt = performance.now();
+			let timedOut = false;
+			const proc = Bun.spawn(
+				[
+					process.execPath,
+					path.join(repoRoot, "packages", "coding-agent", "src", "cli.ts"),
+					"setup",
+					"defaults",
+					...args,
+				],
+				{
+					cwd: externalRoot,
+					stdout: "pipe",
+					stderr: "pipe",
+					env,
+				},
+			);
+			const timer = setTimeout(() => {
+				if (proc.exitCode !== null) return;
+				timedOut = true;
+				proc.kill("SIGKILL");
+			}, processTimeoutMs);
+			try {
+				const [stdout, stderr, exitCode] = await Promise.all([
+					new Response(proc.stdout).text(),
+					new Response(proc.stderr).text(),
+					proc.exited,
+				]);
+				const diagnostic = [
+					`setup defaults ${args.join(" ")}: ${timedOut ? "timed out" : "exited"}`,
+					`elapsed=${Math.round(performance.now() - startedAt)}ms budget=${processTimeoutMs}ms`,
+					`exitCode=${exitCode} signal=${proc.signalCode ?? "none"}`,
+					`stdout: ${stdout}`,
+					`stderr: ${stderr}`,
+				].join("\n");
+				expect(timedOut, diagnostic).toBe(false);
+				expect(exitCode, diagnostic).toBe(0);
+				return { stdout, stderr };
+			} finally {
+				clearTimeout(timer);
+				if (proc.exitCode === null) proc.kill("SIGKILL");
+				await proc.exited;
+			}
+		};
+
+		const { stdout: installStdout, stderr: installStderr } = await runSetupDefaults();
 		expect(installStderr).toBe("");
 		expect(installStdout).toContain("gjc skills list");
 		expect(installStdout).toContain("gjc skills read ralplan");
 
-		const skippedProc = Bun.spawn(
-			[process.execPath, path.join(repoRoot, "packages", "coding-agent", "src", "cli.ts"), "setup", "defaults"],
-			{
-				cwd: externalRoot,
-				stdout: "pipe",
-				stderr: "pipe",
-				env,
-			},
-		);
-		const skippedStdout = await new Response(skippedProc.stdout).text();
-		const skippedStderr = await new Response(skippedProc.stderr).text();
-		expect(await skippedProc.exited).toBe(0);
+		const { stdout: skippedStdout, stderr: skippedStderr } = await runSetupDefaults();
 		expect(skippedStderr).toBe("");
 		expect(skippedStdout).toContain("gjc skills list");
 		expect(skippedStdout).toContain("gjc setup defaults --force");
 
-		const jsonProc = Bun.spawn(
-			[
-				process.execPath,
-				path.join(repoRoot, "packages", "coding-agent", "src", "cli.ts"),
-				"setup",
-				"defaults",
-				"--json",
-			],
-			{
-				cwd: externalRoot,
-				stdout: "pipe",
-				stderr: "pipe",
-				env,
-			},
-		);
-		const jsonStdout = await new Response(jsonProc.stdout).text();
-		const jsonStderr = await new Response(jsonProc.stderr).text();
-		expect(await jsonProc.exited).toBe(0);
+		const { stdout: jsonStdout, stderr: jsonStderr } = await runSetupDefaults(["--json"]);
 		expect(jsonStderr).toBe("");
 		expect(jsonStdout).not.toContain("gjc skills list");
 		expect(JSON.parse(jsonStdout) as { skipped: number }).toMatchObject({ skipped: 10 });
-	});
+	}, 100_000);
 });
 
 describe("bundled skills CLI", () => {

@@ -1,8 +1,13 @@
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "bun:test";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, spyOn } from "bun:test";
+import type { PathLike, StatOptions } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import * as url from "node:url";
-import { runNativeDeepInterviewCommand } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-runtime";
+import { crystalSnapshotDigest } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-crystallize";
+import {
+	assertDeepInterviewCrystalCoversLiveTranscript,
+	runNativeDeepInterviewCommand,
+} from "@gajae-code/coding-agent/gjc-runtime/deep-interview-runtime";
 import {
 	createDeepInterviewIntentManifest,
 	MAX_INITIAL_CONTEXT_LENGTH,
@@ -19,18 +24,70 @@ import {
 import { getConfigRootDir, setAgentDir } from "@gajae-code/utils";
 import { YAML } from "bun";
 import { resetSettingsForTest } from "../../src/config/settings";
+import { WORKFLOW_STATE_VERSION } from "../../src/skill-state/workflow-state-contract";
 
 const tempRoots: string[] = [];
 const codingAgentRoot = path.resolve(path.dirname(url.fileURLToPath(import.meta.url)), "../..");
 
 const TEST_SESSION_ID = "test-session";
 const originalSessionId = process.env.GJC_SESSION_ID;
+const originalSessionFile = process.env.GJC_SESSION_FILE;
 const originalAgentDir = process.env.GJC_CODING_AGENT_DIR;
 const fallbackAgentDir = path.join(getConfigRootDir(), "agent");
 async function tempDir(): Promise<string> {
 	const dir = await fs.mkdtemp(path.join(process.cwd(), ".tmp-deep-interview-runtime-"));
 	tempRoots.push(dir);
 	return dir;
+}
+
+async function crystallizeBoundedTranscript(root: string, count: number, start = 0) {
+	const sessionPath = path.join(root, ".gjc", "sessions", `${TEST_SESSION_ID}.jsonl`);
+	const messages = Array.from({ length: count }, (_, index) => ({
+		index,
+		role: index === 0 || index === 199 || index === 200 ? ("user" as const) : ("assistant" as const),
+		content:
+			index === 0
+				? "Build a report."
+				: index === 199
+					? "Encrypt backups."
+					: index === 200
+						? "Export reports."
+						: "Understood.",
+	}));
+	await fs.mkdir(path.dirname(sessionPath), { recursive: true });
+	await fs.writeFile(
+		sessionPath,
+		[
+			JSON.stringify({ type: "session", version: 1, id: TEST_SESSION_ID, cwd: root }),
+			...messages.map(({ role, content }) => JSON.stringify({ type: "message", message: { role, content } })),
+			"",
+		].join("\n"),
+	);
+	process.env.GJC_SESSION_FILE = sessionPath;
+	const source = { revision: count, start, end: count - 1, messages: messages.slice(start) };
+	return runNativeDeepInterviewCommand(
+		[
+			"--crystallize",
+			"--slug",
+			"bounded-transcript",
+			"--input",
+			JSON.stringify({
+				current_revision: count,
+				snapshot: { ...source, digest: crystalSnapshotDigest(source) },
+				items: source.messages
+					.filter(message => message.role === "user")
+					.map(message => ({
+						id: `requirement:${message.index}`,
+						kind: "acceptance_criterion",
+						classification: "confirmed",
+						statement: message.content,
+						anchor: { message_index: message.index, quote: message.content },
+					})),
+			}),
+			"--json",
+		],
+		root,
+	);
 }
 
 beforeAll(() => {
@@ -44,6 +101,8 @@ beforeEach(async () => {
 
 afterEach(async () => {
 	resetSettingsForTest();
+	if (originalSessionFile !== undefined) process.env.GJC_SESSION_FILE = originalSessionFile;
+	else delete process.env.GJC_SESSION_FILE;
 	if (originalAgentDir) {
 		setAgentDir(originalAgentDir);
 	} else {
@@ -59,6 +118,53 @@ afterAll(() => {
 });
 
 describe("native gjc deep-interview runtime", () => {
+	it("accepts an initial Crystal covering exactly 200 authenticated messages", async () => {
+		const root = await tempDir();
+		const result = await crystallizeBoundedTranscript(root, 200);
+		expect(result.status, result.stderr).toBe(0);
+		const payload = JSON.parse(result.stdout ?? "{}");
+		expect(payload.crystal.lifecycle).toBe("ready");
+		expect(payload.crystal.source.start).toBe(0);
+		expect(payload.crystal.source.end).toBe(199);
+		const spec = await fs.readFile(payload.spec_path, "utf8");
+		expect(spec).toContain("Build a report.");
+		expect(spec).toContain("Encrypt backups.");
+	});
+
+	it("rejects an initial 201-message tail snapshot without promoting artifacts and permits ordinary interviewing", async () => {
+		const root = await tempDir();
+		const result = await crystallizeBoundedTranscript(root, 201, 1);
+		expect(result.status).toBe(2);
+		expect(result.stderr).toContain("full authenticated transcript from index 0 (maximum 200 messages)");
+		expect(result.stderr).toContain("ordinary interview flow");
+		expect(await Bun.file(modeStatePath(root, TEST_SESSION_ID, "deep-interview")).exists()).toBe(false);
+		await expect(fs.readdir(sessionSpecsDir(root, TEST_SESSION_ID))).rejects.toMatchObject({ code: "ENOENT" });
+		const interview = await runNativeDeepInterviewCommand(["--json", "Build a report."], root);
+		expect(interview.status, interview.stderr).toBe(0);
+	});
+
+	it("preserves rolled-out requirements through a canonical prior-backed 200-message delta", async () => {
+		const root = await tempDir();
+		const initial = await crystallizeBoundedTranscript(root, 200);
+		expect(initial.status, initial.stderr).toBe(0);
+		const result = await crystallizeBoundedTranscript(root, 400, 200);
+		expect(result.status, result.stderr).toBe(0);
+		const payload = JSON.parse(result.stdout ?? "{}");
+		expect(payload.crystal.lifecycle).toBe("ready");
+		expect(payload.crystal.spec_version).toBe(2);
+		expect(payload.crystal.source.start).toBe(200);
+		expect(payload.crystal.source.end).toBe(399);
+		const spec = await fs.readFile(payload.spec_path, "utf8");
+		expect(spec).toContain("Build a report.");
+		expect(spec).toContain("Encrypt backups.");
+		expect(spec).toContain("Export reports.");
+	});
+	it("rejects unsupported crystallize arguments before reading input", async () => {
+		const root = await tempDir();
+		const result = await runNativeDeepInterviewCommand(["--crystallize", "--write", "--json"], root);
+		expect(result.status).toBe(2);
+		expect(result.stderr).toContain("unsupported crystallize argument: --write");
+	});
 	it("advertises the deep-interview spec persistence and handoff surface in command help", async () => {
 		const source = await fs.readFile(path.join(codingAgentRoot, "src/commands/deep-interview.ts"), "utf-8");
 		// The lightweight CLI help renderer advertises exactly the static flags/examples declared by the command.
@@ -99,6 +205,34 @@ describe("native gjc deep-interview runtime", () => {
 		const validState = JSON.parse(await fs.readFile(validStatePath, "utf-8"));
 		expect(validState.transcript).toEqual([{ question: "q", answer: "a" }]);
 		expect(validState.spec_slug).toBe("valid-state");
+	});
+
+	it("rejects future deep-interview state through every native writer", async () => {
+		for (const action of ["seed", "spec", "crystallize"] as const) {
+			const root = await tempDir();
+			const statePath = modeStatePath(root, TEST_SESSION_ID, "deep-interview");
+			await fs.mkdir(path.dirname(statePath), { recursive: true });
+			await fs.writeFile(
+				statePath,
+				`${JSON.stringify({ skill: "deep-interview", version: WORKFLOW_STATE_VERSION + 1, active: true, current_phase: "interviewing", future_field: "preserve" })}\n`,
+			);
+			const before = await fs.readFile(statePath, "utf8");
+			const result =
+				action === "seed"
+					? await runNativeDeepInterviewCommand(["future state"], root)
+					: action === "spec"
+						? await runNativeDeepInterviewCommand(
+								["--write", "--stage", "final", "--slug", "future", "--spec", "# Future", "--json"],
+								root,
+							)
+						: await runNativeDeepInterviewCommand(
+								["--crystallize", "--input", "{}", "--slug", "future", "--json"],
+								root,
+							);
+			expect(result.status, action).toBe(2);
+			expect(result.stderr, action).toContain("unsupported future deep-interview state version");
+			expect(await fs.readFile(statePath, "utf8"), action).toBe(before);
+		}
 	});
 
 	it("enforces locked-intent review before creating a spec while preserving legacy handoff", async () => {
@@ -331,6 +465,191 @@ describe("native gjc deep-interview runtime", () => {
 		expect(state.spec_path).toBe(payload.path);
 		expect(state.spec_slug).toBe("persist-me");
 		await expect(fs.access(sessionPlansDir(root, TEST_SESSION_ID))).rejects.toThrow();
+	});
+
+	it("compacts the Crystal index before a direct write crosses its read cap", async () => {
+		const root = await tempDir();
+		const specsDir = sessionSpecsDir(root, TEST_SESSION_ID);
+		await fs.mkdir(specsDir, { recursive: true });
+		const row = `${JSON.stringify({
+			slug: "old",
+			stage: "final",
+			path: path.join(specsDir, "deep-interview-old.md"),
+			created_at: "2026-01-01T00:00:00.000Z",
+			sha256: "a".repeat(64),
+		})}\n`;
+		const targetSize = 1_000_000 - 10;
+		const repeated = row.repeat(Math.floor(targetSize / Buffer.byteLength(row)));
+		const padding = " ".repeat(targetSize - Buffer.byteLength(repeated));
+		const indexPath = path.join(specsDir, "deep-interview-index.jsonl");
+		await fs.writeFile(indexPath, `${repeated}${padding}`);
+
+		const result = await runNativeDeepInterviewCommand(
+			["--write", "--stage", "final", "--slug", "current", "--spec", "# Current", "--json"],
+			root,
+		);
+		expect(result.status, result.stderr).toBe(0);
+		expect((await fs.stat(indexPath)).size).toBeLessThanOrEqual(1_000_000);
+		expect(await fs.readFile(indexPath, "utf8")).toContain('"slug":"current"');
+	});
+
+	it("projects synthetic user messages as developer-authored transcript entries", async () => {
+		const root = await tempDir();
+		const sessionPath = path.join(root, ".gjc", "sessions", `${TEST_SESSION_ID}.jsonl`);
+		await fs.mkdir(path.dirname(sessionPath), { recursive: true });
+		const messages: Array<{ index: number; role: "developer" | "user" | "assistant"; content: string }> = [
+			{ index: 0, role: "developer", content: "Synthetic context" },
+			{ index: 1, role: "user", content: "Preserve replay safety." },
+			{ index: 2, role: "assistant", content: "Understood." },
+		];
+		const snapshot = {
+			revision: messages.length,
+			start: 0,
+			end: messages.length - 1,
+			messages,
+			digest: crystalSnapshotDigest({
+				revision: messages.length,
+				start: 0,
+				end: messages.length - 1,
+				messages,
+			}),
+		};
+		await fs.writeFile(
+			sessionPath,
+			[
+				JSON.stringify({ type: "session", version: 1, id: TEST_SESSION_ID, cwd: root }),
+				JSON.stringify({
+					type: "message",
+					message: { role: "user", synthetic: true, content: "Synthetic context" },
+				}),
+				JSON.stringify({ type: "message", message: { role: "user", content: "Preserve replay safety." } }),
+				JSON.stringify({ type: "message", message: { role: "assistant", content: "Understood." } }),
+				"",
+			].join("\n"),
+			"utf8",
+		);
+		process.env.GJC_SESSION_FILE = sessionPath;
+
+		const result = await runNativeDeepInterviewCommand(
+			[
+				"--crystallize",
+				"--slug",
+				"synthetic-role",
+				"--input",
+				JSON.stringify({
+					session_id: TEST_SESSION_ID,
+					current_revision: messages.length,
+					snapshot,
+					items: [
+						{
+							id: "requirement:replay-safety",
+							kind: "acceptance_criterion",
+							classification: "confirmed",
+							statement: "Preserve replay safety.",
+							anchor: { message_index: 1, quote: "Preserve replay safety." },
+						},
+					],
+				}),
+				"--json",
+			],
+			root,
+		);
+		expect(result.status, result.stderr).toBe(0);
+		const payload = JSON.parse(result.stdout ?? "{}") as {
+			crystal?: { source?: { messages?: Array<{ role: string; content: string }> } };
+		};
+		expect(payload.crystal?.source?.messages).toEqual(messages);
+	});
+
+	it("requires transcript-tail coverage for Deep approval but permits post-plan Ralplan evidence", async () => {
+		const root = await tempDir();
+		const sessionPath = path.join(root, ".gjc", "sessions", `${TEST_SESSION_ID}.jsonl`);
+		const messages = [{ index: 0, role: "user" as const, content: "Build a report." }];
+		const snapshot = {
+			revision: 1,
+			start: 0,
+			end: 0,
+			messages,
+			digest: crystalSnapshotDigest({ revision: 1, start: 0, end: 0, messages }),
+		};
+		await fs.mkdir(path.dirname(sessionPath), { recursive: true });
+		await fs.writeFile(
+			sessionPath,
+			`${JSON.stringify({ type: "session", version: 1, id: TEST_SESSION_ID, cwd: root })}\n${JSON.stringify({ type: "message", message: { role: "user", content: "Build a report." } })}\n`,
+		);
+		process.env.GJC_SESSION_FILE = sessionPath;
+		const crystallized = await runNativeDeepInterviewCommand(
+			[
+				"--crystallize",
+				"--slug",
+				"approval-tail",
+				"--input",
+				JSON.stringify({
+					session_id: TEST_SESSION_ID,
+					current_revision: 1,
+					snapshot,
+					items: [
+						{
+							id: "requirement:report",
+							kind: "acceptance_criterion",
+							classification: "confirmed",
+							statement: "Build a report.",
+							anchor: { message_index: 0, quote: "Build a report." },
+						},
+					],
+				}),
+				"--json",
+			],
+			root,
+		);
+		expect(crystallized.status, crystallized.stderr).toBe(0);
+		const deepEvidence = await assertDeepInterviewCrystalCoversLiveTranscript(root, TEST_SESSION_ID, true);
+		await fs.appendFile(
+			sessionPath,
+			`${JSON.stringify({ type: "message", message: { role: "user", content: "Also encrypt backups." } })}\n`,
+		);
+		await expect(assertDeepInterviewCrystalCoversLiveTranscript(root, TEST_SESSION_ID, true)).rejects.toThrow(
+			"re-crystallization",
+		);
+		const ralplanEvidence = await assertDeepInterviewCrystalCoversLiveTranscript(root, TEST_SESSION_ID, false);
+		expect(ralplanEvidence.transcriptPath).toBe(sessionPath);
+		expect(ralplanEvidence.transcriptSha256).not.toBe(deepEvidence.transcriptSha256);
+	});
+
+	it("rejects a transcript path replaced after the bounded descriptor read", async () => {
+		const root = await tempDir();
+		const sessionPath = path.join(root, ".gjc", "sessions", `${TEST_SESSION_ID}.jsonl`);
+		const transcript = `${JSON.stringify({ type: "session", version: 1, id: TEST_SESSION_ID, cwd: root })}\n${JSON.stringify({ type: "message", message: { role: "user", content: "Preserve replay safety." } })}\n`;
+		await fs.mkdir(path.dirname(sessionPath), { recursive: true });
+		await fs.writeFile(sessionPath, transcript, "utf8");
+		process.env.GJC_SESSION_FILE = sessionPath;
+
+		const originalLstat = fs.lstat;
+		let canonicalLstatCalls = 0;
+		const lstatImplementation = (async (file: PathLike, options?: StatOptions) => {
+			const target = typeof file === "string" ? path.resolve(file) : String(file);
+			if (target === sessionPath) {
+				canonicalLstatCalls += 1;
+				if (canonicalLstatCalls === 3) {
+					await fs.rename(sessionPath, `${sessionPath}.detached`);
+					await fs.writeFile(sessionPath, transcript, "utf8");
+				}
+			}
+			return await originalLstat(file, options as never);
+		}) as typeof fs.lstat;
+		const lstatSpy = spyOn(fs, "lstat").mockImplementation(lstatImplementation);
+		try {
+			const result = await runNativeDeepInterviewCommand(
+				["--crystallize", "--slug", "detached", "--input", JSON.stringify({ current_revision: 1 })],
+				root,
+			);
+			expect(result.status).toBe(2);
+			expect(result.stderr).toMatch(
+				/live session transcript changed during recovery read|crystallize snapshot is malformed/,
+			);
+		} finally {
+			lstatSpy.mockRestore();
+		}
 	});
 
 	it("accepts a long inline --spec that exceeds the OS path-length limit", async () => {

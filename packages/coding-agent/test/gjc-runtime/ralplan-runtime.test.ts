@@ -1,5 +1,6 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it, spyOn } from "bun:test";
-import { existsSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { existsSync, type Mode, type PathLike } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import {
@@ -1077,8 +1078,8 @@ describe("native gjc ralplan runtime — duplicate --write guard", () => {
 
 		// The command-level dedup (findExistingStageArtifact) and the ledger append
 		// are not under one lock, so racing identical writes can both observe an
-		// empty index and both append. The shared appendJsonlIdempotent primitive
-		// serializes the append, so exactly one row survives regardless of the race.
+		// empty index and both append. The ledger writer serializes the append, so
+		// exactly one row survives regardless of the race.
 		const results = await Promise.all(Array.from({ length: 6 }, () => runNativeRalplanCommand([...args], root)));
 		for (const result of results) {
 			expect(result.status).toBe(0);
@@ -1096,13 +1097,14 @@ describe("native gjc ralplan runtime — duplicate --write guard", () => {
 		const runId = "sequential-snapshot";
 		const indexPath = path.join(ralplanRunDir(root, runId), "index.jsonl");
 		const artifactPath = path.join(ralplanRunDir(root, runId), "stage-01-planner.md");
-		const originalReadFile = fs.readFile;
+		const originalLstat = fs.lstat;
 		let prePersistLedgerReads = 0;
-		const readSpy = spyOn(fs, "readFile").mockImplementation(async (...args: any[]) => {
-			const target = typeof args[0] === "string" ? args[0] : String(args[0]);
+		const lstatImplementation = (async (file: PathLike, options?: unknown) => {
+			const target = typeof file === "string" ? file : String(file);
 			if (path.resolve(target) === indexPath && !existsSync(artifactPath)) prePersistLedgerReads += 1;
-			return await (originalReadFile as (...readArgs: any[]) => Promise<any>)(...args);
-		});
+			return await originalLstat(file, options as never);
+		}) as typeof fs.lstat;
+		const readSpy = spyOn(fs, "lstat").mockImplementation(lstatImplementation);
 		try {
 			// One invocation only: the documented sequence is intentionally not a
 			// cross-process admission claim, lock, or CAS test.
@@ -1112,6 +1114,60 @@ describe("native gjc ralplan runtime — duplicate --write guard", () => {
 			readSpy.mockRestore();
 		}
 		expect(prePersistLedgerReads).toBe(1);
+	});
+	it("compacts oversized ralplan ledgers while retaining the current final receipt", async () => {
+		const root = await tempDir();
+		const runId = "bounded-ledger";
+		const runDirPath = runDir(root, runId);
+		await fs.mkdir(runDirPath, { recursive: true });
+		const finalPath = path.join(runDirPath, "stage-01-final.md");
+		const finalContent = "# final\n";
+		await fs.writeFile(finalPath, finalContent);
+		const finalAdmission = {
+			configuredTarget: "ultragoal",
+			effectiveTarget: "ultragoal",
+			degradationReason: null,
+			source: "project-config",
+		};
+		const rows = [
+			{
+				stage: "final",
+				stage_n: 1,
+				path: finalPath,
+				created_at: "2026-01-01T00:00:00.000Z",
+				sha256: createHash("sha256").update(finalContent).digest("hex"),
+				auto_handoff: finalAdmission,
+			},
+			...Array.from({ length: 12_000 }, (_, index) => ({
+				stage: "architect",
+				stage_n: index + 1,
+				path: path.join(runDirPath, `stage-${String(index + 1).padStart(5, "0")}-architect.md`),
+				created_at: "2026-01-01T00:00:00.000Z",
+				sha256: `${String(index).padStart(64, "0")}`,
+			})),
+		];
+		const indexPath = path.join(runDirPath, "index.jsonl");
+		await fs.writeFile(indexPath, `${rows.map(row => JSON.stringify(row)).join("\n")}\n`, "utf-8");
+		expect((await fs.stat(indexPath)).size).toBeGreaterThan(1024 * 1024);
+
+		const result = await writeRalplanArtifact(root, runId, "final", 1, "# final");
+		expect(result.status, result.stderr).toBe(0);
+		const compacted = await fs.readFile(indexPath, "utf-8");
+		expect(Buffer.byteLength(compacted, "utf8")).toBeLessThanOrEqual(1024 * 1024);
+		const persistedRows = compacted
+			.trim()
+			.split("\n")
+			.map(line => JSON.parse(line) as Record<string, unknown>);
+		expect(persistedRows).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({
+					stage: "final",
+					stage_n: 1,
+					path: finalPath,
+					auto_handoff: finalAdmission,
+				}),
+			]),
+		);
 	});
 });
 
@@ -1638,7 +1694,15 @@ describe("native gjc ralplan runtime — persisted role-agent state", () => {
 });
 
 describe("native gjc ralplan runtime — post-clear re-activation (#644)", () => {
-	const readState = async (root: string): Promise<{ active?: unknown; current_phase?: unknown; run_id?: unknown }> => {
+	const readState = async (
+		root: string,
+	): Promise<{
+		active?: unknown;
+		current_phase?: unknown;
+		run_id?: unknown;
+		handoff_from?: unknown;
+		handoff_at?: unknown;
+	}> => {
 		const raw = await fs.readFile(ralplanStatePath(root), "utf-8");
 		return JSON.parse(raw);
 	};
@@ -1651,7 +1715,17 @@ describe("native gjc ralplan runtime — post-clear re-activation (#644)", () =>
 		expect(seeded.active).toBe(true);
 
 		// Simulate `gjc state ralplan clear`: active -> false, phase -> complete.
-		await fs.writeFile(statePath, JSON.stringify({ ...seeded, active: false, current_phase: "complete" }), "utf-8");
+		await fs.writeFile(
+			statePath,
+			JSON.stringify({
+				...seeded,
+				active: false,
+				current_phase: "complete",
+				handoff_from: "deep-interview",
+				handoff_at: "2026-01-01T00:00:00.000Z",
+			}),
+			"utf-8",
+		);
 
 		// A subsequent --write with a NEW run_id starts a fresh run and must re-arm the skill.
 		const result = await runNativeRalplanCommand(
@@ -1664,6 +1738,8 @@ describe("native gjc ralplan runtime — post-clear re-activation (#644)", () =>
 		expect(after.run_id).toBe("new-run-after-clear");
 		expect(after.active).toBe(true);
 		expect(after.current_phase).toBe("planner");
+		expect(after.handoff_from).toBeUndefined();
+		expect(after.handoff_at).toBeUndefined();
 	});
 
 	it("re-asserts active:true on a same-run continuation write at the current phase", async () => {
@@ -1857,6 +1933,43 @@ describe("ralplan automatic handoff admission (#3398)", () => {
 			value: "ultragoal→ultragoal",
 		});
 	});
+	it.each([
+		"missing admission",
+		"pending publication",
+		"missing state",
+	])("repairs the authenticated final admission projection after a crash-gap dedupe: %s", async gap => {
+		const root = await tempDir();
+		const runId = "final-admission-crash-gap";
+		await fs.mkdir(path.join(root, ".gjc"), { recursive: true });
+		await fs.writeFile(
+			path.join(root, ".gjc", "config.yml"),
+			YAML.stringify({ gjc: { ralplan: { autoHandoff: "ultragoal" } } }, null, 2),
+			"utf-8",
+		);
+		const first = JSON.parse((await writeRalplanArtifact(root, runId, "final", 1, "# final")).stdout ?? "{}");
+		const expectedAdmission = first.auto_handoff;
+		const statePath = ralplanStatePath(root);
+		const state = JSON.parse(await fs.readFile(statePath, "utf-8")) as Record<string, unknown>;
+		delete state.auto_handoff;
+		if (gap === "pending publication") {
+			state.final_publication_pending = {
+				run_id: runId,
+				publication_id: "interrupted-final-publication",
+				final_sha256: first.sha256,
+				started_at: new Date().toISOString(),
+			};
+		}
+		if (gap === "missing state") await fs.rm(statePath);
+		else await fs.writeFile(statePath, `${JSON.stringify(state)}\n`, "utf-8");
+
+		const retry = JSON.parse((await writeRalplanArtifact(root, runId, "final", 1, "# final")).stdout ?? "{}");
+		expect(retry).toMatchObject({ deduplicated: true, auto_handoff: expectedAdmission });
+		const restoredState = JSON.parse(await fs.readFile(statePath, "utf-8")) as Record<string, unknown>;
+		expect(restoredState.auto_handoff).toEqual(expectedAdmission);
+		expect(restoredState.receipt).toMatchObject({ command: "gjc ralplan final-admission" });
+		expect(restoredState).toMatchObject({ run_id: runId, active: true, current_phase: "final" });
+		expect(restoredState.final_publication_pending).toBeUndefined();
+	});
 	it("overlays a later durable PLANNING-STUCK marker on final dedupe", async () => {
 		const root = await tempDir();
 		const runId = "final-then-stuck";
@@ -1880,6 +1993,12 @@ describe("ralplan automatic handoff admission (#3398)", () => {
 				degradationReason: "planning_stuck",
 			},
 		});
+		const persisted = JSON.parse(await fs.readFile(ralplanStatePath(root), "utf8")) as Record<string, unknown>;
+		expect(persisted.auto_handoff).toMatchObject({
+			effectiveTarget: "off",
+			degradationReason: "planning_stuck",
+		});
+		expect(persisted.receipt).toMatchObject({ command: "gjc ralplan final-admission" });
 	});
 	it("uses the final ledger admission after state loss and config changes", async () => {
 		const root = await tempDir();
@@ -1894,6 +2013,8 @@ describe("ralplan automatic handoff admission (#3398)", () => {
 
 		await fs.rm(ralplanStatePath(root));
 		expect((await writeRalplanArtifact(root, "another-run", "planner", 1, "# other")).status).toBe(0);
+		const currentState = await fs.readFile(ralplanStatePath(root), "utf-8");
+		expect(JSON.parse(currentState)).toMatchObject({ run_id: "another-run", active: true, current_phase: "planner" });
 		await fs.writeFile(
 			path.join(root, ".gjc", "config.yml"),
 			YAML.stringify({ gjc: { ralplan: { autoHandoff: "off" } } }, null, 2),
@@ -1904,6 +2025,44 @@ describe("ralplan automatic handoff admission (#3398)", () => {
 			deduplicated: true,
 			auto_handoff: { configuredTarget: "ultragoal", effectiveTarget: "ultragoal" },
 		});
+		expect(await fs.readFile(ralplanStatePath(root), "utf-8")).toBe(currentState);
+	});
+	it("returns a cleared run's final receipt without reactivating its projection", async () => {
+		const root = await tempDir();
+		const runId = "cleared-final-retry";
+		const first = await writeRalplanArtifact(root, runId, "final", 1, "# final");
+		expect(first.status).toBe(0);
+		expect((await runNativeStateCommand(["clear", "--mode", "ralplan"], root)).status).toBe(0);
+		const clearedState = await fs.readFile(ralplanStatePath(root), "utf-8");
+		expect(JSON.parse(clearedState)).toMatchObject({ run_id: runId, active: false, current_phase: "complete" });
+
+		const retry = await writeRalplanArtifact(root, runId, "final", 1, "# final");
+		expect(retry.status).toBe(0);
+		expect(JSON.parse(retry.stdout ?? "{}")).toMatchObject({
+			deduplicated: true,
+			auto_handoff: JSON.parse(first.stdout ?? "{}").auto_handoff,
+		});
+		expect(await fs.readFile(ralplanStatePath(root), "utf-8")).toBe(clearedState);
+	});
+	it("rejects a new final publication for a cleared run without changing state or artifacts", async () => {
+		const root = await tempDir();
+		const runId = "cleared-final-new";
+		expect((await writeRalplanArtifact(root, runId, "final", 1, "# final")).status).toBe(0);
+		expect((await runNativeStateCommand(["clear", "--mode", "ralplan"], root)).status).toBe(0);
+		const clearedState = await fs.readFile(ralplanStatePath(root), "utf-8");
+		expect(JSON.parse(clearedState)).toMatchObject({ run_id: runId, active: false, current_phase: "complete" });
+		const indexPath = ralplanPlanPath(root, runId, "index.jsonl");
+		const indexBefore = await fs.readFile(indexPath, "utf-8");
+		const pendingPath = ralplanPlanPath(root, runId, "pending-approval.md");
+		const pendingBefore = await fs.readFile(pendingPath, "utf-8");
+
+		const result = await writeRalplanArtifact(root, runId, "final", 2, "# replacement final");
+		expect(result.status).toBe(2);
+		expect(result.stderr).toContain("locked phase");
+		expect(await fs.readFile(ralplanStatePath(root), "utf-8")).toBe(clearedState);
+		expect(await fs.readFile(indexPath, "utf-8")).toBe(indexBefore);
+		expect(await fs.readFile(pendingPath, "utf-8")).toBe(pendingBefore);
+		expect(existsSync(ralplanPlanPath(root, runId, "stage-02-final.md"))).toBe(false);
 	});
 
 	it("makes persisted PLANNING-STUCK dominate automatic handoff", async () => {
@@ -1942,14 +2101,15 @@ describe("ralplan automatic handoff admission (#3398)", () => {
 		);
 		expect((await writeRalplanArtifact(root, runId, "planner", 1, "# plan")).status).toBe(0);
 
-		const originalReadFile = fs.readFile;
+		const originalOpen = fs.open;
 		let indexReads = 0;
 		const injectedError = Object.assign(new Error("EIO: injected unreadable ledger"), { code: "EIO" });
-		const readSpy = spyOn(fs, "readFile").mockImplementation(async (...args: any[]) => {
-			const target = typeof args[0] === "string" ? args[0] : String(args[0]);
+		const openImplementation = (async (file: PathLike, flags: string | number, mode?: Mode) => {
+			const target = typeof file === "string" ? file : String(file);
 			if (path.resolve(target) === indexPath && ++indexReads === 2) throw injectedError;
-			return await (originalReadFile as (...readArgs: any[]) => Promise<any>)(...args);
-		});
+			return await originalOpen(file, flags, mode);
+		}) as typeof fs.open;
+		const readSpy = spyOn(fs, "open").mockImplementation(openImplementation);
 		try {
 			const final = JSON.parse(
 				(await writeRalplanArtifact(root, runId, "final", 2, "# best effort")).stdout ?? "{}",
