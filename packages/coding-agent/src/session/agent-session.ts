@@ -15152,11 +15152,13 @@ export class AgentSession {
 			| undefined;
 
 		if (this.#extensionRunner && savedCompactionEntry) {
-			await this.#extensionRunner.emit({
-				type: "session_compact",
-				compactionEntry: savedCompactionEntry,
-				fromExtension: fromExtension ?? false,
-			});
+			await this.#runCommittedSuccessorHook(() =>
+				this.#extensionRunner!.emit({
+					type: "session_compact",
+					compactionEntry: savedCompactionEntry,
+					fromExtension: fromExtension ?? false,
+				}),
+			);
 		}
 
 		return savedCompactionEntry;
@@ -24907,13 +24909,15 @@ export class AgentSession {
 			// the emit and the context rebuild when no handlers are registered (mirrors
 			// the session_before_tree guard above).
 			if (this.#extensionRunner?.hasHandlers("session_tree")) {
-				await this.#extensionRunner.emit({
-					type: "session_tree",
-					newLeafId: this.sessionManager.getLeafId(),
-					oldLeafId,
-					summaryEntry,
-					fromExtension: summaryText ? fromExtension : undefined,
-				});
+				await this.#runCommittedSuccessorHook(() =>
+					this.#extensionRunner!.emit({
+						type: "session_tree",
+						newLeafId: this.sessionManager.getLeafId(),
+						oldLeafId,
+						summaryEntry,
+						fromExtension: summaryText ? fromExtension : undefined,
+					}),
+				);
 				const refreshedContext = this.buildDisplaySessionContext();
 				return { editorText, cancelled: false, summaryEntry, sessionContext: refreshedContext };
 			}

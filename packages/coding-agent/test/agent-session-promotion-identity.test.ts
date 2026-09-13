@@ -999,6 +999,114 @@ describe("queued promotion run identity (#4668)", () => {
 		});
 	});
 
+	it("admits tracked work from the committed session_compact hook", async () => {
+		const sessionManager = SessionManager.inMemory();
+		const firstKeptEntryId = sessionManager.appendMessage({
+			role: "user",
+			content: "old context ".repeat(100),
+			timestamp: 1,
+		});
+		sessionManager.appendMessage({ role: "user", content: "recent context", timestamp: 2 });
+		const tool: AgentTool<typeof echoSchema, EchoParams> = {
+			name: "echo",
+			label: "Echo",
+			description: "Echo tool",
+			parameters: echoSchema,
+			async execute(_toolCallId, params) {
+				return { content: [{ type: "text", text: params.value }] };
+			},
+		};
+		let submission: QueuedInputSubmission | undefined;
+		const extensionRunner = {
+			hasHandlers: vi.fn(
+				(eventType: string) => eventType === "session_before_compact" || eventType === "session_compact",
+			),
+			hasToolResultMediation: vi.fn().mockReturnValue(false),
+			emitBeforeAgentStart: vi.fn().mockResolvedValue({ messages: [] }),
+			emit: vi.fn().mockImplementation(async (event: unknown) => {
+				const typedEvent = event as {
+					type?: string;
+					preparation?: { firstKeptEntryId: string; tokensBefore: number };
+				};
+				if (typedEvent.type === "session_compact") {
+					submission = await session!.submitUserMessage("queued by compact hook", {
+						deliverAs: "followUp",
+						trackSubmission: true,
+					});
+					return undefined;
+				}
+				if (!typedEvent.preparation) return undefined;
+				return {
+					compaction: {
+						summary: "compacted summary",
+						shortSummary: "compacted",
+						firstKeptEntryId: typedEvent.preparation.firstKeptEntryId,
+						tokensBefore: typedEvent.preparation.tokensBefore,
+						details: {},
+					},
+				};
+			}),
+		};
+		session = buildSession(
+			[{ content: ["unused response"] }],
+			tool,
+			Settings.isolated({ "compaction.enabled": false }),
+			sessionManager,
+			extensionRunner,
+		);
+		session.settings.override("compaction.keepRecentTokens", 1);
+
+		await expect(session.compact()).resolves.toMatchObject({ summary: "compacted summary" });
+		expect(submission).toBeDefined();
+		const accepted = submission!;
+		expect(accepted.submissionId).toMatch(/^queued-/);
+		if (session.getQueuedMessageEntries().length > 0) session.clearQueue();
+		await expect(accepted.terminal).resolves.toMatchObject({
+			submissionId: accepted.submissionId,
+			disposition: expect.any(String),
+		});
+		void firstKeptEntryId;
+	});
+
+	it("admits tracked work from the committed session_tree hook", async () => {
+		const sessionManager = SessionManager.inMemory();
+		const firstUserId = sessionManager.appendMessage({ role: "user", content: "first", timestamp: 1 });
+		sessionManager.appendMessage({ role: "user", content: "second", timestamp: 2 });
+		const tool: AgentTool<typeof echoSchema, EchoParams> = {
+			name: "echo",
+			label: "Echo",
+			description: "Echo tool",
+			parameters: echoSchema,
+			async execute(_toolCallId, params) {
+				return { content: [{ type: "text", text: params.value }] };
+			},
+		};
+		let submission: QueuedInputSubmission | undefined;
+		const extensionRunner = {
+			hasHandlers: vi.fn((eventType: string) => eventType === "session_tree"),
+			emit: vi.fn().mockImplementation(async (event: { type?: string }) => {
+				if (event.type === "session_tree") {
+					submission = await session!.submitUserMessage("queued by tree hook", {
+						deliverAs: "followUp",
+						trackSubmission: true,
+					});
+				}
+			}),
+		};
+		session = buildSession([{ content: ["unused response"] }], tool, undefined, sessionManager, extensionRunner);
+
+		await expect(session.navigateTree(firstUserId, { summarize: false })).resolves.toMatchObject({
+			cancelled: false,
+		});
+		expect(submission).toBeDefined();
+		const accepted = submission!;
+		if (session.getQueuedMessageEntries().length > 0) session.clearQueue();
+		await expect(accepted.terminal).resolves.toMatchObject({
+			submissionId: accepted.submissionId,
+			disposition: expect.any(String),
+		});
+	});
+
 	it("cancels an admitted explicit steer when its preflight signal aborts (#5460)", async () => {
 		// Exact-head review P1: the explicit steer path never installed the
 		// one-shot preflight-abort cancellation used by follow-ups, so an aborted
