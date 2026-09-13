@@ -2568,6 +2568,9 @@ describe.serial("AgentSession resilient retry", () => {
 		});
 		const prompt = session.prompt("dispose while idle-stall retry is waiting");
 		await retryStarted.promise;
+		// Diagnostic branch only: keep the existing one-second deadline, but
+		// obtain the owned disposal step instead of an uninformative false result.
+		session.setDisposeTimeoutForTests(1_000);
 
 		const disposed = await Promise.race([session.dispose().then(() => true), Bun.sleep(1_000).then(() => false)]);
 		expect(disposed).toBe(true);
