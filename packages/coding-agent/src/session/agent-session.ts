@@ -5264,7 +5264,19 @@ export class AgentSession {
 				// #promptWithMessage (resetRetryReplaySafety), which allocates the
 				// fresh attempt epoch at turn start. The idle injector, which calls
 				// agent.prompt directly, allocates right before admission.
-				this.agent.followUp(message);
+				const displayText =
+					message.role === "custom"
+						? this.#getCustomMessageTextContent(message)
+						: message.role === "user"
+							? this.#getUserMessageText(message)
+							: "";
+				void this.#queueFollowUpAfterReservation(message, displayText, {
+					createDisplayEntry: false,
+					trackExternalFollowUp: false,
+				}).catch(error => {
+					this.#settleDeliveredOwnedRegistrations([message]);
+					logger.warn("Owned streaming follow-up was rejected", { error: String(error) });
+				});
 			},
 			injectIdle: async (messages, signal) => {
 				// Mandated boundary comment (corrected turn semantics): same origin
@@ -8750,7 +8762,7 @@ export class AgentSession {
 		if (!injection) {
 			return;
 		}
-		this.agent.followUp({
+		const message: CustomMessage = {
 			role: "custom",
 			customType: "ttsr-injection",
 			content: injection.content,
@@ -8758,27 +8770,37 @@ export class AgentSession {
 			details: { rules: injection.rules.map(rule => rule.name) },
 			attribution: "agent",
 			timestamp: Date.now(),
-		});
+		};
 		this.#ensureTtsrResumePromise();
-		// Mark as injected after this custom message is delivered and persisted (handled in message_end).
-		// followUp() only enqueues; resume on the next tick once streaming settles.
-		this.#scheduleAgentContinue({
-			delayMs: 1,
-			generation: this.#promptGeneration,
-			onSkip: () => {
+		void this.#queueFollowUpAfterReservation(message, this.#getCustomMessageTextContent(message), {
+			createDisplayEntry: false,
+			trackExternalFollowUp: false,
+		})
+			.then(() => {
+				// Mark as injected after this custom message is delivered and persisted (handled in message_end).
+				// followUp() only enqueues; resume on the next tick once streaming settles.
+				this.#scheduleAgentContinue({
+					delayMs: 1,
+					generation: this.#promptGeneration,
+					onSkip: () => {
+						this.#resolveTtsrResume();
+					},
+					shouldContinue: () => {
+						if (this.agent.state.isStreaming || !this.agent.hasQueuedMessages()) {
+							this.#resolveTtsrResume();
+							return false;
+						}
+						return true;
+					},
+					onError: () => {
+						this.#resolveTtsrResume();
+					},
+				});
+			})
+			.catch(error => {
 				this.#resolveTtsrResume();
-			},
-			shouldContinue: () => {
-				if (this.agent.state.isStreaming || !this.agent.hasQueuedMessages()) {
-					this.#resolveTtsrResume();
-					return false;
-				}
-				return true;
-			},
-			onError: () => {
-				this.#resolveTtsrResume();
-			},
-		});
+				logger.warn("TTSR follow-up injection was rejected", { error: String(error) });
+			});
 	}
 
 	/** Build TTSR match context for tool call argument deltas. */
