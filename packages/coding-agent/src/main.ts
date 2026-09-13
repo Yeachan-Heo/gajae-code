@@ -510,6 +510,7 @@ async function applyStartupModelProfilesWithPolicy(
 	const defaultProfile = args.settings.get("modelProfile.default");
 	const preserveResumedSessionModel =
 		args.isResumedSession === true &&
+		args.session.model !== undefined &&
 		args.settings.get("session.resumeModelBehavior") === "keepSessionModel" &&
 		args.parsedArgs.model === undefined &&
 		args.parsedArgs.mpreset === undefined;

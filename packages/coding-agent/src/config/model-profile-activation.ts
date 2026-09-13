@@ -1387,6 +1387,7 @@ export async function applyPreparedModelProfileActivation(
 	let resumeDefaultChanged = false;
 	let fallbackResolutionSeeded = false;
 	const profileScope = options.profileScope ?? prepared.profileScope;
+	const preserveCurrentModel = options.preserveCurrentModel === true && prepared.session.model !== undefined;
 
 	try {
 		const activationDefaultChain =
@@ -1413,7 +1414,7 @@ export async function applyPreparedModelProfileActivation(
 				fallbackResolutionSeeded = true;
 			}
 		}
-		if (prepared.defaultModel && !options.preserveCurrentModel) {
+		if (prepared.defaultModel && !preserveCurrentModel) {
 			modelMutationStarted = true;
 			await prepared.session.setModelTemporary(
 				prepared.defaultModel,
@@ -1446,12 +1447,12 @@ export async function applyPreparedModelProfileActivation(
 			prepared.settings.set("modelProfile.default", prepared.profileName);
 			await prepared.settings.flushOrThrow();
 		}
-		if (prepared.defaultModel && !options.preserveCurrentModel) {
+		if (prepared.defaultModel && !preserveCurrentModel) {
 			prepared.modelRegistry.seedCanonicalVariant?.(prepared.session.sessionId, prepared.defaultModel);
 			resumeDefaultChanged = true;
 			prepared.session.recordResumeDefaultModel?.(`${prepared.defaultModel.provider}/${prepared.defaultModel.id}`);
 		} else if (
-			options.preserveCurrentModel &&
+			preserveCurrentModel &&
 			options.preserveCanonicalAffinity !== false &&
 			prepared.previousCanonicalVariant !== undefined
 		) {
@@ -1462,7 +1463,7 @@ export async function applyPreparedModelProfileActivation(
 			if (restored !== true) {
 				throw new Error("Runtime model-profile rebind could not restore canonical model affinity.");
 			}
-		} else if (options.preserveCurrentModel) {
+		} else if (preserveCurrentModel) {
 			prepared.modelRegistry.clearCanonicalVariant?.(prepared.session.sessionId);
 		}
 		prepared.session.noteProfileInstalledOverrides?.(
