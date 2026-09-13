@@ -13915,15 +13915,10 @@ export class AgentSession {
 			this.#deepInterviewGenuineUserMessageEpochs.set(message, epoch);
 		}
 		if (options?.sdkRunToken) this.#sdkRunTokensByQueuedMessage.set(message, options.sdkRunToken);
-		// If an older SDK follow-up is deferred while the Agent is idle, release
+		// If older deferred work is waiting while the Agent is idle, release
 		// that head before parking this newer message. Otherwise the newer message
 		// would enter the live queue first and invert SDK FIFO ownership.
-		if (
-			options?.sdkRunToken &&
-			!this.agent.state.isStreaming &&
-			!this.agent.hasQueuedMessages() &&
-			this.#deferredSdkFollowUps.length > 0
-		) {
+		if (!this.agent.state.isStreaming && !this.agent.hasQueuedMessages() && this.#deferredSdkFollowUps.length > 0) {
 			this.#releaseDeferredSdkFollowUps();
 		}
 		const owner: QueuedFollowUpOwner = {
@@ -13950,12 +13945,12 @@ export class AgentSession {
 			},
 		};
 		options?.onQueuedAfterAdmission?.(message, owner.cancel);
-		// Existing deferred SDK work is part of the same FIFO even when the Agent
+		// Existing deferred work is part of the same FIFO even when the Agent
 		// queue is currently empty. Enqueuing a newer successor directly into the
 		// Agent in that state would let it run before the older deferred request.
 		if (
-			options?.sdkRunToken &&
-			(this.agent.state.isStreaming || this.agent.hasQueuedMessages() || this.#deferredSdkFollowUps.length > 0)
+			this.#deferredSdkFollowUps.length > 0 ||
+			(options?.sdkRunToken && (this.agent.state.isStreaming || this.agent.hasQueuedMessages()))
 		) {
 			this.#deferredSdkFollowUps.push(message);
 		} else {
