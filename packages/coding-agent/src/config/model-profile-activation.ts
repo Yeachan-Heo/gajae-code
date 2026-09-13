@@ -1447,6 +1447,14 @@ export async function applyPreparedModelProfileActivation(
 			prepared.modelRegistry.seedCanonicalVariant?.(prepared.session.sessionId, prepared.defaultModel);
 			resumeDefaultChanged = true;
 			prepared.session.recordResumeDefaultModel?.(`${prepared.defaultModel.provider}/${prepared.defaultModel.id}`);
+		} else if (options.preserveCurrentModel && prepared.previousCanonicalVariant !== undefined) {
+			const restored = prepared.modelRegistry.restoreSessionCanonicalVariant?.(
+				prepared.session.sessionId,
+				prepared.previousCanonicalVariant,
+			);
+			if (restored !== true) {
+				throw new Error("Runtime model-profile rebind could not restore canonical model affinity.");
+			}
 		}
 		prepared.session.noteProfileInstalledOverrides?.(
 			Object.keys(prepared.modelRoles),

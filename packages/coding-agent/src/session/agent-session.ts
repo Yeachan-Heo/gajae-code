@@ -24165,8 +24165,18 @@ export class AgentSession {
 							...(this.#persistedModelProfileAliasIntent("default") ?? {}),
 						},
 					);
-					let controller =
-						resumeModelBehavior === "useCurrentDefault"
+					let controller = runtimeProfileDefaultChain?.length
+						? new FallbackChainController(
+								{
+									role: "default",
+									entries: [...runtimeProfileDefaultChain],
+									origin: "runtime",
+									identity: nextActiveModelProfile,
+									explicitHead: true,
+								},
+								this.settings.get("fallback.maxAttempts"),
+							)
+						: resumeModelBehavior === "useCurrentDefault"
 							? new FallbackChainController(
 									{ role: "default", entries: [...defaultEntries], origin: "settings", explicitHead: true },
 									this.settings.get("fallback.maxAttempts"),
