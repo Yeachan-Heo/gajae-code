@@ -1021,6 +1021,8 @@ describe("queued promotion run identity (#4668)", () => {
 		};
 		let submission: QueuedInputSubmission | undefined;
 		let ordinaryPromptRejected = false;
+		let customPromptRejected = false;
+		let customSendRejected = false;
 		const extensionRunner = {
 			hasHandlers: vi.fn(
 				(eventType: string) => eventType === "session_before_compact" || eventType === "session_compact",
@@ -1037,6 +1039,26 @@ describe("queued promotion run identity (#4668)", () => {
 						await session!.prompt("ordinary prompt from compact hook");
 					} catch (error) {
 						ordinaryPromptRejected = (error as { code?: string }).code === "busy";
+					}
+					try {
+						await session!.promptCustomMessage(
+							{ customType: "compact-hook-custom", content: "custom prompt from compact hook", display: true },
+							{ streamingBehavior: "followUp" },
+						);
+					} catch (error) {
+						customPromptRejected = (error as { code?: string }).code === "busy";
+					}
+					try {
+						await session!.sendCustomMessage(
+							{
+								customType: "compact-hook-send-custom",
+								content: "custom send from compact hook",
+								display: true,
+							},
+							{ deliverAs: "followUp" },
+						);
+					} catch (error) {
+						customSendRejected = (error as { code?: string }).code === "busy";
 					}
 					submission = await session!.submitUserMessage("queued by compact hook", {
 						deliverAs: "followUp",
@@ -1068,6 +1090,8 @@ describe("queued promotion run identity (#4668)", () => {
 		await expect(session.compact()).resolves.toMatchObject({ summary: "compacted summary" });
 		expect(submission).toBeDefined();
 		expect(ordinaryPromptRejected).toBe(true);
+		expect(customPromptRejected).toBe(true);
+		expect(customSendRejected).toBe(true);
 		const accepted = submission!;
 		expect(accepted.submissionId).toMatch(/^queued-/);
 		if (session.getQueuedMessageEntries().length > 0) session.clearQueue();
