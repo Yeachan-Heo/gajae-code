@@ -12708,7 +12708,7 @@ export class AgentSession {
 				throw new AgentBusyError();
 			}
 			if (options.streamingBehavior === "followUp") {
-				await this.#queueFollowUp(expandedText, options?.images, {
+				await this.#queueFollowUpTextAfterReservation(expandedText, options?.images, {
 					forceOneAtATime: options.followUpQueuePolicy === "sequential",
 					claimsGenuineUserIntent,
 				});
@@ -12743,7 +12743,7 @@ export class AgentSession {
 				) {
 					admission.release();
 					if (options.streamingBehavior === "followUp") {
-						await this.#queueFollowUp(expandedText, options?.images, {
+						await this.#queueFollowUpTextAfterReservation(expandedText, options?.images, {
 							forceOneAtATime: options.followUpQueuePolicy === "sequential",
 							claimsGenuineUserIntent,
 						});
@@ -13750,13 +13750,7 @@ export class AgentSession {
 		if (expandedText.trim().length === 0 && !hasUsableImage)
 			throw Object.assign(new Error("Prompt must not be empty."), { code: "invalid_input" });
 		assertImagePlaceholdersHavePayload(expandedText, images);
-		const message = {
-			role: "user" as const,
-			content: [{ type: "text" as const, text: expandedText }, ...(images ?? [])],
-			attribution: "user" as const,
-			timestamp: Date.now(),
-		};
-		await this.#queueFollowUpAfterReservation(message, expandedText || (images && images.length > 0 ? "[Image]" : ""), {
+		await this.#queueFollowUpTextAfterReservation(expandedText, images, {
 			forceOneAtATime: options?.followUpQueuePolicy === "sequential",
 			claimsGenuineUserIntent: true,
 			allowCancelAndSubmit: true,
@@ -13915,6 +13909,26 @@ export class AgentSession {
 		if (images && images.length > 0) content.push(...images);
 		const message = { role: "user" as const, content, attribution: "user" as const, timestamp: Date.now() };
 		return this.#queueFollowUpMessage(message, text || (images && images.length > 0 ? "[Image]" : ""), options);
+	}
+
+	async #queueFollowUpTextAfterReservation(
+		text: string,
+		images?: ImageContent[],
+		options?: QueueFollowUpOptions,
+	): Promise<QueuedFollowUpOwner> {
+		this.#assertExternalSessionIngress({
+			allowTrackedSuccessor: options?.allowDuringSessionTransition,
+			allowCancelAndSubmit: options?.allowCancelAndSubmit,
+		});
+		assertImagePlaceholdersHavePayload(text, images);
+		const content: (TextContent | ImageContent)[] = [{ type: "text", text }];
+		if (images && images.length > 0) content.push(...images);
+		const message = { role: "user" as const, content, attribution: "user" as const, timestamp: Date.now() };
+		return this.#queueFollowUpAfterReservation(
+			message,
+			text || (images && images.length > 0 ? "[Image]" : ""),
+			options,
+		);
 	}
 
 	#queueFollowUpMessage(

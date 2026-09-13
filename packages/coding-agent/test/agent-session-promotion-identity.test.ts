@@ -1153,6 +1153,53 @@ describe("queued promotion run identity (#4668)", () => {
 		).toEqual(["sdk follow-up", "ordinary follow-up"]);
 	});
 
+	it("holds prompt follow-up admission behind a tracked acceptance reservation", async () => {
+		const fixture = buildAbortableTrackedTransitionFixture(SessionManager.inMemory(), undefined, true);
+		session = fixture.session;
+		const promptFollowUpConsumed = Promise.withResolvers<void>();
+		const unsubscribe = session.agent.subscribe(event => {
+			if (event.type !== "message_start" || event.message.role !== "user") return;
+			const content =
+				typeof event.message.content === "string"
+					? event.message.content
+					: event.message.content.map(part => (part.type === "text" ? part.text : "")).join("");
+			if (content === "prompt follow-up") promptFollowUpConsumed.resolve();
+		});
+		const firstPrompt = session.prompt("first task").catch(() => {});
+		await fixture.firstToolStarted.promise;
+		const commitEntered = Promise.withResolvers<void>();
+		const commitRelease = Promise.withResolvers<void>();
+		const trackedPromise = session.submitUserMessage("sdk follow-up", {
+			deliverAs: "followUp",
+			trackSubmission: true,
+			sdkRunCapability: createSdkRunCapability("prompt-reservation-ordering"),
+			onPreflightAcceptCommit: async () => {
+				commitEntered.resolve();
+				await commitRelease.promise;
+			},
+		} as never);
+		await commitEntered.promise;
+		const promptFollowUp = session.prompt("prompt follow-up", { streamingBehavior: "followUp" });
+		await Bun.sleep(20);
+		expect(session.agent.snapshotFollowUp()).toHaveLength(0);
+		commitRelease.resolve();
+		await withTimeout(trackedPromise, 5_000, "prompt reservation tracked admission");
+		await withTimeout(promptFollowUp, 5_000, "prompt reservation prompt admission");
+		await session.abort({ cause: "user_interrupt" });
+		await firstPrompt;
+		await withTimeout(fixture.secondToolStarted.promise, 5_000, "prompt reservation tracked successor start");
+		expect(
+			await Promise.race([
+				promptFollowUpConsumed.promise.then(() => "started"),
+				Bun.sleep(20).then(() => "pending"),
+			]),
+		).toBe("pending");
+		fixture.secondGate.resolve();
+		await withTimeout(promptFollowUpConsumed.promise, 5_000, "prompt reservation prompt successor start");
+		unsubscribe();
+		await session.waitForIdle();
+	});
+
 	it("admits tracked work from the committed session_compact hook", async () => {
 		const sessionManager = SessionManager.inMemory();
 		const firstKeptEntryId = sessionManager.appendMessage({
