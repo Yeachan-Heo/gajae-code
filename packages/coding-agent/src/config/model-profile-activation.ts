@@ -39,6 +39,12 @@ type ProfileInstalledOverrideState = {
 	modelRoles: Record<string, ModelSelectorValue | undefined>;
 	agentModelOverrides: Record<string, ModelSelectorValue | undefined>;
 	preProfileModel: Model<Api> | undefined;
+	roleLayers?: Array<{
+		profileName: string | undefined;
+		scope: ModelProfileScope;
+		modelRoles: Record<string, ModelSelectorValue | undefined>;
+		agentModelOverrides: Record<string, ModelSelectorValue | undefined>;
+	}>;
 	defaultChainState?: ConfiguredModelChainState;
 	defaultChainBaselines?: Array<ConfiguredModelChainState | undefined>;
 };
@@ -61,6 +67,7 @@ type ModelProfileActivationSession = Pick<
 		previousAgentModelOverrides?: Readonly<Record<string, ModelSelectorValue>>,
 		previousDefaultChainState?: ConfiguredModelChainState,
 		profileScope?: ModelProfileScope,
+		profileName?: string,
 	) => void;
 	/** Drop the recorded profile-installed override keys (e.g. after materialization). */
 	clearProfileInstalledOverrides?: () => void;
@@ -146,6 +153,7 @@ export interface ApplyModelProfileActivationOptions {
 	preserveCurrentModel?: boolean;
 	preserveCanonicalAffinity?: boolean;
 	skipCanonicalAffinityMutation?: boolean;
+	skipEagerDelegationSync?: boolean;
 }
 export interface PreparedModelProfileActivation {
 	profileName: string;
@@ -1315,35 +1323,80 @@ export async function prepareModelProfileActivation(
 		const previousProfileScope = options.session.getActiveModelProfileScope?.();
 		const previousModelRoles = { ...options.settings.get("modelRoles") };
 		const previousAgentModelOverrides = { ...options.settings.get("task.agentModelOverrides") };
-		const baseModelRoles =
-			profileScope === "session" && previousProfileScope === "durable"
-				? previousModelRoles
-				: previousProfileInstalledOverrideState &&
-						(previousProfileScope === "session" || profileScope === "durable")
+		const rolesAfterSessionLayers =
+			previousProfileInstalledOverrideState &&
+			previousProfileScope === "session" &&
+			previousProfileInstalledOverrideState.roleLayers
+				? previousProfileInstalledOverrideState.roleLayers.reduceRight(
+						(roles, layer) =>
+							layer.scope === "session" ? restoreProfileOverrideLayer(roles, layer.modelRoles) : roles,
+						previousModelRoles,
+					)
+				: previousProfileInstalledOverrideState && previousProfileScope === "session"
 					? restoreProfileOverrideLayer(previousModelRoles, previousProfileInstalledOverrideState.modelRoles)
-					: Object.fromEntries(
-							Object.entries(previousModelRoles).filter(
-								([key]) =>
-									!(options.session.getProfileInstalledOverrideKeys?.().modelRoles ?? []).includes(key),
-							),
-						);
-		const baseAgentModelOverrides =
-			profileScope === "session" && previousProfileScope === "durable"
-				? previousAgentModelOverrides
-				: previousProfileInstalledOverrideState &&
-						(previousProfileScope === "session" || profileScope === "durable")
+					: undefined;
+		const agentOverridesAfterSessionLayers =
+			previousProfileInstalledOverrideState &&
+			previousProfileScope === "session" &&
+			previousProfileInstalledOverrideState.roleLayers
+				? previousProfileInstalledOverrideState.roleLayers.reduceRight(
+						(overrides, layer) =>
+							layer.scope === "session"
+								? restoreProfileOverrideLayer(overrides, layer.agentModelOverrides)
+								: overrides,
+						previousAgentModelOverrides,
+					)
+				: previousProfileInstalledOverrideState && previousProfileScope === "session"
 					? restoreProfileOverrideLayer(
 							previousAgentModelOverrides,
 							previousProfileInstalledOverrideState.agentModelOverrides,
 						)
-					: Object.fromEntries(
-							Object.entries(previousAgentModelOverrides).filter(
-								([key]) =>
-									!(options.session.getProfileInstalledOverrideKeys?.().agentModelOverrides ?? []).includes(
-										key,
-									),
-							),
-						);
+					: undefined;
+		const lowerDurableRoleLayer =
+			profileScope === "durable" && previousProfileScope === "session"
+				? [...(previousProfileInstalledOverrideState?.roleLayers ?? [])]
+						.reverse()
+						.find(layer => layer.scope === "durable")
+				: undefined;
+		const baseModelRoles =
+			profileScope === "durable" && lowerDurableRoleLayer
+				? restoreProfileOverrideLayer(
+						rolesAfterSessionLayers ?? previousModelRoles,
+						lowerDurableRoleLayer.modelRoles,
+					)
+				: profileScope === "session" && previousProfileScope === "durable"
+					? previousModelRoles
+					: previousProfileInstalledOverrideState &&
+							(previousProfileScope === "session" || profileScope === "durable")
+						? restoreProfileOverrideLayer(previousModelRoles, previousProfileInstalledOverrideState.modelRoles)
+						: Object.fromEntries(
+								Object.entries(previousModelRoles).filter(
+									([key]) =>
+										!(options.session.getProfileInstalledOverrideKeys?.().modelRoles ?? []).includes(key),
+								),
+							);
+		const baseAgentModelOverrides =
+			profileScope === "durable" && lowerDurableRoleLayer
+				? restoreProfileOverrideLayer(
+						agentOverridesAfterSessionLayers ?? previousAgentModelOverrides,
+						lowerDurableRoleLayer.agentModelOverrides,
+					)
+				: profileScope === "session" && previousProfileScope === "durable"
+					? previousAgentModelOverrides
+					: previousProfileInstalledOverrideState &&
+							(previousProfileScope === "session" || profileScope === "durable")
+						? restoreProfileOverrideLayer(
+								previousAgentModelOverrides,
+								previousProfileInstalledOverrideState.agentModelOverrides,
+							)
+						: Object.fromEntries(
+								Object.entries(previousAgentModelOverrides).filter(
+									([key]) =>
+										!(options.session.getProfileInstalledOverrideKeys?.().agentModelOverrides ?? []).includes(
+											key,
+										),
+								),
+							);
 
 		return {
 			profileName,
@@ -1492,6 +1545,7 @@ export async function applyPreparedModelProfileActivation(
 			prepared.baseAgentModelOverrides,
 			prepared.previousDefaultChainState,
 			profileScope,
+			prepared.profileName,
 		);
 		prepared.session.setActiveModelProfile?.(prepared.profileName, profileScope);
 		if (fallbackResolutionSeeded) {
@@ -1619,13 +1673,15 @@ export async function applyPreparedModelProfileActivation(
 	// so delegation must be re-applied to the live session rather than only to
 	// sessions started after activation. Activation itself already succeeded; a
 	// failed refresh must not roll it back.
-	try {
-		await prepared.session.syncEagerDelegation?.();
-	} catch (error) {
-		logger.warn("Failed to sync eager delegation after model profile activation", {
-			profile: prepared.profileName,
-			error: error instanceof Error ? error.message : String(error),
-		});
+	if (!options.skipEagerDelegationSync) {
+		try {
+			await prepared.session.syncEagerDelegation?.();
+		} catch (error) {
+			logger.warn("Failed to sync eager delegation after model profile activation", {
+				profile: prepared.profileName,
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
 	}
 }
 

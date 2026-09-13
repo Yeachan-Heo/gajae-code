@@ -2414,6 +2414,12 @@ type CoordinatorRuntimeStatePersistContext = {
 	sessionFile: string | undefined;
 	stateFile: string | null;
 };
+type ProfileInstalledRoleLayer = {
+	profileName: string | undefined;
+	scope: "session" | "durable";
+	modelRoles: Record<string, ModelSelectorValue | undefined>;
+	agentModelOverrides: Record<string, ModelSelectorValue | undefined>;
+};
 export class AgentSession {
 	#provisionalStreamingToolCallIds = new Set<string>();
 	readonly agent: Agent;
@@ -2452,6 +2458,7 @@ export class AgentSession {
 	#activeModelProfileScope: "session" | "durable" | undefined;
 	#activeProfileInstalledRoles = new Map<string, ModelSelectorValue | undefined>();
 	#activeProfileInstalledAgentOverrides = new Map<string, ModelSelectorValue | undefined>();
+	#profileInstalledRoleLayers: ProfileInstalledRoleLayer[] = [];
 	#activeProfileInstalledDefaultChainState:
 		| {
 				entries: readonly string[];
@@ -15580,6 +15587,7 @@ export class AgentSession {
 			preserveConfiguredDefaultChain: true,
 			preserveCurrentModel: true,
 			skipCanonicalAffinityMutation: true,
+			skipEagerDelegationSync: true,
 		});
 	}
 
@@ -15945,6 +15953,16 @@ export class AgentSession {
 					nextSelectedDiscoveredBuiltinToolNames: [],
 				});
 			} else {
+			}
+		}
+		if (profileAlreadyApplied) {
+			try {
+				await this.syncEagerDelegation();
+			} catch (error) {
+				logger.warn("Failed to sync eager delegation after new-session profile activation", {
+					profile: this.#activeModelProfile,
+					error: error instanceof Error ? error.message : String(error),
+				});
 			}
 		}
 		this.#todoReminderCount = 0;
@@ -16328,6 +16346,7 @@ export class AgentSession {
 		const hadInstalledKeys =
 			this.#activeProfileInstalledRoles.size > 0 ||
 			this.#activeProfileInstalledAgentOverrides.size > 0 ||
+			this.#profileInstalledRoleLayers.length > 0 ||
 			this.#activeProfileInstalledDefaultChainState !== undefined;
 		let restoredModelRoles: Record<string, ModelSelectorValue> | undefined;
 		let restoredAgentOverrides: Record<string, ModelSelectorValue> | undefined;
@@ -16353,19 +16372,65 @@ export class AgentSession {
 						: undefined) ?? this.settings.getGlobal("modelRoles")?.default;
 				if (selectedDefault !== undefined) modelRoles.default = selectedDefault;
 			}
-			for (const [role, baseline] of this.#activeProfileInstalledRoles) {
-				if (role === "default" && options?.preserveDefaultModelRole) continue;
-				if (baseline === undefined) delete modelRoles[role];
-				else modelRoles[role] = baseline;
+			const roleLayers: ProfileInstalledRoleLayer[] =
+				this.#profileInstalledRoleLayers.length > 0
+					? this.#profileInstalledRoleLayers
+					: [
+							{
+									profileName: this.#activeModelProfile,
+									scope: this.#activeModelProfileScope ?? "session",
+									modelRoles: Object.fromEntries(this.#activeProfileInstalledRoles),
+									agentModelOverrides: Object.fromEntries(this.#activeProfileInstalledAgentOverrides),
+								},
+						]
+			let retainedLayerIndex = -1;
+			if (options?.preserveActiveModelProfile) {
+				for (let index = roleLayers.length - 1; index >= 0; index--) {
+					const layer = roleLayers[index];
+					if (
+						layer.scope === "durable" &&
+						layer.profileName === options.preserveActiveModelProfile.name
+					) {
+						retainedLayerIndex = index;
+						break;
+					}
+				}
+			} else {
+				for (let index = roleLayers.length - 1; index >= 0; index--) {
+					const layer = roleLayers[index];
+					if (layer.scope === "durable") {
+						const hasSessionLayersAbove = roleLayers
+							.slice(index + 1)
+							.some(candidate => candidate.scope === "session");
+						if (!hasSessionLayersAbove) break;
+						retainedLayerIndex = index;
+						break;
+					}
+				}
 			}
-			for (const [role, baseline] of this.#activeProfileInstalledAgentOverrides) {
-				if (baseline === undefined) delete agentOverrides[role];
-				else agentOverrides[role] = baseline;
+			for (let index = roleLayers.length - 1; index > retainedLayerIndex; index--) {
+				const layer = roleLayers[index];
+				for (const [role, baseline] of Object.entries(layer.modelRoles)) {
+					if (role === "default" && options?.preserveDefaultModelRole) continue;
+					if (baseline === undefined) delete modelRoles[role];
+					else modelRoles[role] = baseline;
+				}
+				for (const [role, baseline] of Object.entries(layer.agentModelOverrides)) {
+					if (baseline === undefined) delete agentOverrides[role];
+					else agentOverrides[role] = baseline;
+				}
 			}
 			restoredModelRoles = modelRoles;
 			restoredAgentOverrides = agentOverrides;
-			this.#activeProfileInstalledRoles.clear();
-			this.#activeProfileInstalledAgentOverrides.clear();
+			const retainedLayers = retainedLayerIndex >= 0 ? roleLayers.slice(0, retainedLayerIndex + 1) : [];
+			this.#profileInstalledRoleLayers = retainedLayers;
+			const retainedLayer = retainedLayers.at(-1);
+			this.#activeProfileInstalledRoles = retainedLayer
+				? new Map(Object.entries(retainedLayer.modelRoles))
+				: new Map();
+			this.#activeProfileInstalledAgentOverrides = retainedLayer
+				? new Map(Object.entries(retainedLayer.agentModelOverrides))
+				: new Map();
 		}
 		if (hadInstalledKeys || this.getActiveModelProfile() !== undefined) {
 			if (restoredModelRoles) this.settings.clearOverride("modelRoles");
@@ -16414,6 +16479,7 @@ export class AgentSession {
 			explicitHead: boolean;
 		},
 		profileScope?: "session" | "durable",
+		profileName?: string,
 	): void {
 		if (this.#activeModelProfileScope !== "session") this.#preProfileModel = preProfileModel;
 		if (profileScope === "session") {
@@ -16431,40 +16497,42 @@ export class AgentSession {
 			this.#activeProfileInstalledDefaultChainState = undefined;
 			this.#profileDefaultChainBaselineStack = [];
 		}
-		const currentModelRoles = new Set(modelRoles);
-		const currentAgentModelOverrides = new Set(agentModelOverrides);
-		for (const role of this.#activeProfileInstalledRoles.keys()) {
-			if (!currentModelRoles.has(role)) this.#activeProfileInstalledRoles.delete(role);
-		}
-		for (const role of this.#activeProfileInstalledAgentOverrides.keys()) {
-			if (!currentAgentModelOverrides.has(role)) this.#activeProfileInstalledAgentOverrides.delete(role);
-		}
+		const roleLayer: ProfileInstalledRoleLayer = {
+			profileName: profileName ?? this.#activeModelProfile,
+			scope: profileScope ?? this.#activeModelProfileScope ?? "session",
+			modelRoles: {},
+			agentModelOverrides: {},
+		};
 		for (const role of modelRoles) {
-			this.#activeProfileInstalledRoles.set(
-				role,
+			roleLayer.modelRoles[role] =
 				previousModelRoles !== undefined
 					? Object.hasOwn(previousModelRoles, role)
 						? previousModelRoles[role]
 						: undefined
-					: this.settings.getGlobal("modelRoles")?.[role as never],
-			);
+					: this.settings.getGlobal("modelRoles")?.[role as never];
 		}
 		for (const role of agentModelOverrides) {
-			this.#activeProfileInstalledAgentOverrides.set(
-				role,
+			roleLayer.agentModelOverrides[role] =
 				previousAgentModelOverrides !== undefined
 					? Object.hasOwn(previousAgentModelOverrides, role)
 						? previousAgentModelOverrides[role]
 						: undefined
-					: this.settings.getGlobal("task.agentModelOverrides")?.[role as never],
-			);
+					: this.settings.getGlobal("task.agentModelOverrides")?.[role as never];
 		}
+		if (roleLayer.scope === "durable") {
+			this.#profileInstalledRoleLayers = [roleLayer];
+		} else {
+			this.#profileInstalledRoleLayers = [...this.#profileInstalledRoleLayers, roleLayer];
+		}
+		this.#activeProfileInstalledRoles = new Map(Object.entries(roleLayer.modelRoles));
+		this.#activeProfileInstalledAgentOverrides = new Map(Object.entries(roleLayer.agentModelOverrides));
 	}
 
 	/** Drop the recorded profile-installed override keys after materialization. */
 	clearProfileInstalledOverrides(): void {
 		this.#activeProfileInstalledRoles.clear();
 		this.#activeProfileInstalledAgentOverrides.clear();
+		this.#profileInstalledRoleLayers = [];
 		this.#preProfileModel = undefined;
 		this.#activeProfileInstalledDefaultChainState = undefined;
 		this.#profileDefaultChainBaselineStack = [];
@@ -16474,6 +16542,7 @@ export class AgentSession {
 		modelRoles: Record<string, ModelSelectorValue | undefined>;
 		agentModelOverrides: Record<string, ModelSelectorValue | undefined>;
 		preProfileModel: Model | undefined;
+		roleLayers?: ProfileInstalledRoleLayer[];
 		defaultChainState?: {
 			entries: readonly string[];
 			origin: string;
@@ -16494,6 +16563,12 @@ export class AgentSession {
 			modelRoles: Object.fromEntries(this.#activeProfileInstalledRoles),
 			agentModelOverrides: Object.fromEntries(this.#activeProfileInstalledAgentOverrides),
 			preProfileModel: this.#preProfileModel,
+			roleLayers: this.#profileInstalledRoleLayers.map(layer => ({
+				profileName: layer.profileName,
+				scope: layer.scope,
+				modelRoles: { ...layer.modelRoles },
+				agentModelOverrides: { ...layer.agentModelOverrides },
+			})),
 			defaultChainState: this.#activeProfileInstalledDefaultChainState
 				? {
 						...this.#activeProfileInstalledDefaultChainState,
@@ -16510,6 +16585,7 @@ export class AgentSession {
 		modelRoles: Readonly<Record<string, ModelSelectorValue | undefined>>;
 		agentModelOverrides: Readonly<Record<string, ModelSelectorValue | undefined>>;
 		preProfileModel: Model | undefined;
+		roleLayers?: readonly ProfileInstalledRoleLayer[];
 		defaultChainState?: {
 			entries: readonly string[];
 			origin: string;
@@ -16529,6 +16605,12 @@ export class AgentSession {
 		this.#activeProfileInstalledRoles = new Map(Object.entries(state.modelRoles));
 		this.#activeProfileInstalledAgentOverrides = new Map(Object.entries(state.agentModelOverrides));
 		this.#preProfileModel = state.preProfileModel;
+		this.#profileInstalledRoleLayers = (state.roleLayers ?? []).map(layer => ({
+			profileName: layer.profileName,
+			scope: layer.scope,
+			modelRoles: { ...layer.modelRoles },
+			agentModelOverrides: { ...layer.agentModelOverrides },
+		}));
 		this.#activeProfileInstalledDefaultChainState = state.defaultChainState
 			? { ...state.defaultChainState, entries: [...state.defaultChainState.entries] }
 			: undefined;
@@ -24081,6 +24163,12 @@ export class AgentSession {
 			// state so an on-disk commit failure can restore it.
 			const previousProfileInstalledRoles = new Map(this.#activeProfileInstalledRoles);
 			const previousProfileInstalledAgentOverrides = new Map(this.#activeProfileInstalledAgentOverrides);
+			const previousProfileInstalledRoleLayers = this.#profileInstalledRoleLayers.map(layer => ({
+				profileName: layer.profileName,
+				scope: layer.scope,
+				modelRoles: { ...layer.modelRoles },
+				agentModelOverrides: { ...layer.agentModelOverrides },
+			}));
 			const previousProfileInstalledDefaultChainState = this.#activeProfileInstalledDefaultChainState
 				? {
 						...this.#activeProfileInstalledDefaultChainState,
@@ -24219,8 +24307,9 @@ export class AgentSession {
 				const nextActiveModelProfileScope =
 					nextActiveModelProfile === undefined
 						? undefined
-						: resumeModelBehavior === "useCurrentDefault" && liveProfileIdentity === nextActiveModelProfile
-							? (previousActiveModelProfileScope ?? "session")
+						: liveProfileIdentity === nextActiveModelProfile && !switchingToDifferentSession
+							? (previousActiveModelProfileScope ??
+								(configuredProfileIdentity === nextActiveModelProfile ? "durable" : "session"))
 							: configuredProfileIdentity === nextActiveModelProfile
 								? "durable"
 								: "session";
@@ -24615,6 +24704,7 @@ export class AgentSession {
 				this.setActiveModelProfile(previousActiveModelProfile, previousActiveModelProfileScope);
 				this.#activeProfileInstalledRoles = previousProfileInstalledRoles;
 				this.#activeProfileInstalledAgentOverrides = previousProfileInstalledAgentOverrides;
+				this.#profileInstalledRoleLayers = previousProfileInstalledRoleLayers;
 				this.#activeProfileInstalledDefaultChainState = previousProfileInstalledDefaultChainState;
 				this.#profileDefaultChainBaselineStack = previousProfileDefaultChainBaselineStack;
 				this.#preProfileModel = previousPreProfileModel;
@@ -24662,6 +24752,8 @@ export class AgentSession {
 				this.agent.restoreFollowUp(previousAgentFollowUpQueue);
 				if (previousModel) {
 					this.#setAgentModelWithReasoningContext(previousModel);
+				} else {
+					this.#setAgentModelWithReasoningContext(undefined);
 				}
 				this.#thinkingLevelMutationRevision++;
 				this.#thinkingLevelLiveMutationRevision++;

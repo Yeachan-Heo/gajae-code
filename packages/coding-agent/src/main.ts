@@ -466,6 +466,7 @@ type StartupModelProfileArgs = {
 	preferCachedModels?: boolean;
 	preferCachedDefaultProfile?: boolean;
 	isResumedSession?: boolean;
+	resumedSessionHasModel?: boolean;
 };
 
 async function applyStartupModelProfilesWithPolicy(
@@ -510,7 +511,7 @@ async function applyStartupModelProfilesWithPolicy(
 	const defaultProfile = args.settings.get("modelProfile.default");
 	const preserveResumedSessionModel =
 		args.isResumedSession === true &&
-		args.session.model !== undefined &&
+		args.resumedSessionHasModel === true &&
 		args.settings.get("session.resumeModelBehavior") === "keepSessionModel" &&
 		args.parsedArgs.model === undefined &&
 		args.parsedArgs.mpreset === undefined;
@@ -1803,6 +1804,8 @@ export async function runRootCommand(
 	const resumedSessionAtOpen =
 		(sessionManager?.hasHistoryEntries() ?? false) &&
 		(parsedArgs.continue === true || parsedArgs.resume !== undefined);
+	const resumedSessionHasModel =
+		resumedSessionAtOpen && sessionManager?.buildSessionContext().models.default !== undefined;
 
 	// Restore the resumed session's working directory so the HUD branch, the
 	// project path, and the agent's tools all match where the session was
@@ -2059,6 +2062,7 @@ export async function runRootCommand(
 				initialMessages: parsedArgs.messages,
 				resumeAction: bareResumeAction,
 				isResumedSession: resumedSessionAtOpen,
+				resumedSessionHasModel,
 			};
 			if (isInteractive && parsedArgs.mpreset) {
 				const ready = Promise.withResolvers<void>();
