@@ -1455,6 +1455,8 @@ export async function applyPreparedModelProfileActivation(
 			if (restored !== true) {
 				throw new Error("Runtime model-profile rebind could not restore canonical model affinity.");
 			}
+		} else if (options.preserveCurrentModel) {
+			prepared.modelRegistry.clearCanonicalVariant?.(prepared.session.sessionId);
 		}
 		prepared.session.noteProfileInstalledOverrides?.(
 			Object.keys(prepared.modelRoles),

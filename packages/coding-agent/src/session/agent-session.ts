@@ -15750,6 +15750,7 @@ export class AgentSession {
 		this.#resetSessionScopedModelProfileState(
 			(droppingSessionOnlyProfile || replacingConfiguredProfile) && profileToRebind
 				? {
+						restoreInstalledDefaultChain: !replacingConfiguredProfile,
 						preserveActiveModelProfile: {
 							name: profileToRebind,
 							scope: "durable",
@@ -24316,7 +24317,8 @@ export class AgentSession {
 					const preserveSuccessorProfile =
 						nextActiveModelProfile !== undefined && nextActiveModelProfileScope === "durable";
 					this.#resetSessionScopedModelProfileState({
-						preserveDefaultConfiguredChain: recoveredDefaultChain || preserveSuccessorProfile,
+						preserveDefaultConfiguredChain:
+							switchingToDifferentSession || recoveredDefaultChain || preserveSuccessorProfile,
 						forceCleanup: predecessorProfileWasSessionScoped,
 						...(preserveSuccessorProfile
 							? {
