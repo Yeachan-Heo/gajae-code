@@ -3614,6 +3614,17 @@ export async function acquireManagedLock(
 					let releaseFd = fd;
 					let replacementFd: number | undefined;
 					try {
+						// A named successor means ownership was already lost. Do not let
+						// Linux descriptor recovery mask that condition as a security error.
+						let named: fs.BigIntStats;
+						try {
+							named = fs.lstatSync(lockPath, { bigint: true });
+						} catch (error) {
+							if ((error as NodeJS.ErrnoException).code === "ENOENT") throw new Error("migration_busy");
+							throw error;
+						}
+						if (!named.isFile() || named.isSymbolicLink() || !sameFileIdentity(lockIdentity, named))
+							throw new Error("migration_busy");
 						// Check the descriptor before native security verification: native failures
 						// do not preserve Node's EBADF code for a closed retained descriptor.
 						ManagedLockTestHooks.beforeReleaseDescriptorVerification?.({ path: lockPath, fd });
