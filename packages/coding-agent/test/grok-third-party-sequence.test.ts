@@ -27,12 +27,16 @@ function registerTestProvider(api: ExtensionAPI, providerName: string): void {
 }
 
 describe("Grok Build with explicit third-party extensions", () => {
-	it("loads bundled and inline extensions while keeping filesystem paths quarantined", async () => {
+	it("loads bundled, inline, and explicit extensions without automatic discovery", async () => {
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-grok-third-party-"));
 		const extensionPath = path.join(root, "third-party.ts");
 		await Bun.write(
 			extensionPath,
 			`export default function thirdParty(api) { api.registerProvider("filesystem-test", { name: "Filesystem", baseUrl: "https://example.invalid/v1", apiKey: "$THIRD_PARTY_TEST_KEY", api: "openai-responses", models: [{ id: "model", name: "Model", reasoning: false, input: ["text"], cost: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0 }, contextWindow: 1000, maxTokens: 100 }] }); }`,
+		);
+		await Bun.write(
+			path.join(root, ".gjc", "extensions", "automatic", "index.ts"),
+			(await Bun.file(extensionPath).text()).replaceAll("filesystem-test", "automatic-test"),
 		);
 		try {
 			const { session } = await createAgentSession({
@@ -55,7 +59,12 @@ describe("Grok Build with explicit third-party extensions", () => {
 			try {
 				expect(session.modelRegistry.find("grok-build", "grok-composer-2.5-fast")).toBeTruthy();
 				expect(session.modelRegistry.find("inline-test", "model")).toBeTruthy();
-				expect(session.modelRegistry.find("filesystem-test", "model")).toBeUndefined();
+				expect(session.modelRegistry.find("filesystem-test", "model")).toMatchObject({
+					provider: "filesystem-test",
+					id: "model",
+					baseUrl: "https://example.invalid/v1",
+				});
+				expect(session.modelRegistry.find("automatic-test", "model")).toBeUndefined();
 			} finally {
 				await session.dispose();
 			}
