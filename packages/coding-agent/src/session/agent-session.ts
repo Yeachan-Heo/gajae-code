@@ -15552,11 +15552,14 @@ export class AgentSession {
 		const configuredProfileIdentity = this.#getConfiguredModelProfileIdentity();
 		const profileDefinitions = this.#modelRegistry.getModelProfiles?.() ?? new Map<string, unknown>();
 		const fallbackRuntimeState = this.getDefaultFallbackRuntimeState();
+		const recoveredProfileCandidate = fallbackRuntimeState.chain.identity
+			? resolveModelProfileName(fallbackRuntimeState.chain.identity, profileDefinitions)
+			: undefined;
 		const recoveredProfileIdentity =
 			fallbackRuntimeState.chain.origin === "runtime" &&
-			fallbackRuntimeState.chain.identity !== undefined &&
-			profileDefinitions.has(fallbackRuntimeState.chain.identity)
-				? fallbackRuntimeState.chain.identity
+			recoveredProfileCandidate !== undefined &&
+			profileDefinitions.has(recoveredProfileCandidate)
+				? recoveredProfileCandidate
 				: undefined;
 		const profileName = configuredProfileIdentity ?? recoveredProfileIdentity;
 		const activeProfileIdentity = this.getActiveModelProfile();
@@ -15832,11 +15835,14 @@ export class AgentSession {
 		const configuredDefaultProfileIdentity = this.#getConfiguredModelProfileIdentity();
 		const profileDefinitions = this.#modelRegistry.getModelProfiles?.() ?? new Map<string, unknown>();
 		const previousFallbackRuntimeState = this.getDefaultFallbackRuntimeState();
+		const recoveredProfileCandidate = previousFallbackRuntimeState.chain.identity
+			? resolveModelProfileName(previousFallbackRuntimeState.chain.identity, profileDefinitions)
+			: undefined;
 		const recoveredRuntimeProfileIdentity =
 			previousFallbackRuntimeState.chain.origin === "runtime" &&
-			previousFallbackRuntimeState.chain.identity !== undefined &&
-			profileDefinitions.has(previousFallbackRuntimeState.chain.identity)
-				? previousFallbackRuntimeState.chain.identity
+			recoveredProfileCandidate !== undefined &&
+			profileDefinitions.has(recoveredProfileCandidate)
+				? recoveredProfileCandidate
 				: undefined;
 		const profileToRebind = configuredDefaultProfileIdentity ?? recoveredRuntimeProfileIdentity;
 		const activeProfileIdentity = this.getActiveModelProfile();

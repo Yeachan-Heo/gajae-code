@@ -556,6 +556,13 @@ async function applyStartupModelProfilesWithPolicy(
 		}
 		await applyConfiguredProfiles();
 	}
+	if (preserveResumedSessionModel) {
+		const fallbackState = args.session.getDefaultFallbackRuntimeState();
+		args.session.restoreDefaultFallbackRuntimeState({
+			...fallbackState,
+			preserveLoadedLegacyDefaultChain: true,
+		});
+	}
 
 	// Explicit CLI --model/--thinking must win over any activated or skipped profile.
 	if (explicitModel) {
