@@ -3,6 +3,10 @@
 번호 계약: 박스는 1·2·3 세 개뿐이고 승인 게이트는 번호가 없다.
 gen_workflow.py 의 method 텍스트와 같은 계약이다.
 
+입력 이미지는 gen_workflow.py 가 PaperBanana 로 만든 것이다.
+PaperBanana 원본: https://github.com/dwzhu-pku/PaperBanana
+
+
 (이력: PaperBanana 1차 출력은 게이트를 번호 없이 그려놓고 마지막 박스를
 "Stage 4" 로 적어 번호가 어긋났다. gen_workflow.py 를 고쳐 상류에서
 막았고, 이 프롬프트는 같은 계약을 재확인한다.)

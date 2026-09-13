@@ -3,6 +3,10 @@
 OpenAI Image 2.5 의 이미지 편집 엔드포인트를 쓴다.
 원본 레이아웃·색·구조를 유지하고 라벨만 한국어로 바꾸는 게 목표다.
 
+입력 이미지는 gen_workflow.py 가 PaperBanana 로 만든 것이다.
+PaperBanana 원본: https://github.com/dwzhu-pku/PaperBanana
+
+
 번호 계약: 박스는 1·2·3 세 개뿐이고 승인 게이트는 번호가 없다.
 gen_workflow.py 의 method 텍스트와 같은 계약이다.
 """
