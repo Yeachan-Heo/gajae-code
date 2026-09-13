@@ -959,6 +959,46 @@ describe("queued promotion run identity (#4668)", () => {
 		await session.waitForIdle();
 	});
 
+	it("delivers a released deferred follow-up from a tool-result tail", async () => {
+		const tool: AgentTool<typeof echoSchema, EchoParams> = {
+			name: "echo",
+			label: "Echo",
+			description: "Echo tool",
+			parameters: echoSchema,
+			async execute(_toolCallId, params) {
+				return { content: [{ type: "text", text: params.value }] };
+			},
+		};
+		session = buildSession([{ content: ["tool-tail continuation"] }], tool);
+		session.agent.replaceMessages([
+			{
+				role: "toolResult",
+				toolCallId: "tail-call",
+				toolName: "echo",
+				content: [{ type: "text", text: "tail result" }],
+				isError: false,
+				timestamp: 1,
+			},
+		] satisfies AgentMessage[]);
+		await session.followUp("blocking follow-up");
+		const submission = await session.submitUserMessage("released from tool tail", {
+			deliverAs: "followUp",
+			trackSubmission: true,
+			sdkRunCapability: createSdkRunCapability("tool-tail-release-token"),
+		} as never);
+		const blockingEntry = session.getQueuedMessageEntries().find(entry => entry.text === "blocking follow-up");
+		if (!blockingEntry) throw new Error("Expected the blocking follow-up");
+		expect(session.removeQueuedMessageForEditing(blockingEntry.id)).toBe("blocking follow-up");
+		await expect(withTimeout(submission.execution, 5_000, "tool-tail deferred execution")).resolves.toMatchObject({
+			submissionId: submission.submissionId,
+			disposition: "promoted-to-run",
+		});
+		await expect(withTimeout(submission.terminal, 5_000, "tool-tail deferred terminal")).resolves.toMatchObject({
+			submissionId: submission.submissionId,
+			disposition: "completed",
+		});
+	});
+
 	it("cancels an admitted explicit steer when its preflight signal aborts (#5460)", async () => {
 		// Exact-head review P1: the explicit steer path never installed the
 		// one-shot preflight-abort cancellation used by follow-ups, so an aborted
@@ -1439,6 +1479,7 @@ describe("queued promotion run identity (#4668)", () => {
 		} as never);
 		await preflightEntered.promise;
 		const compaction = session.compact().catch(() => undefined);
+		await expect(session.prompt("ordinary prompt during compaction")).rejects.toMatchObject({ code: "busy" });
 		releasePreflight.resolve();
 		await expect(submission).rejects.toMatchObject({ code: "busy" });
 		await compaction;
