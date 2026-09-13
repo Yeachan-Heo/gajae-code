@@ -17316,6 +17316,85 @@ export class SessionManager {
 		}
 	}
 
+	async setSessionStarredForPicker(session: SessionInfo, starred: boolean): Promise<void> {
+		if (this.#sessionFile && canonicalizeTrustedPath(session.path) === canonicalizeTrustedPath(this.#sessionFile)) {
+			await this.setSessionStarred(starred);
+			return;
+		}
+		await SessionManager.setSessionStarredForPicker(
+			session,
+			starred,
+			this.destination.kind === "explicit" ? this.destination.directory : undefined,
+		);
+	}
+
+	/** Update only a picker candidate's metadata, without opening a runtime or publishing a resume breadcrumb. */
+	static async setSessionStarredForPicker(
+		session: SessionInfo,
+		starred: boolean,
+		explicitSessionDir?: string,
+	): Promise<void> {
+		if (isStagedSessionPath(session.path)) throw new Error("Staged session paths are not resumable");
+		const directory = await fs.promises.realpath(path.dirname(session.path));
+		const sessionPath = path.join(directory, path.basename(session.path));
+		if (explicitSessionDir) {
+			const root = await fs.promises.realpath(explicitSessionDir);
+			if (!pathIsWithin(root, sessionPath)) throw new Error("Session is outside the configured session directory.");
+		} else if (
+			!isProjectSessionTranscriptPath(path.join(canonicalizeTrustedPath(session.cwd), ".gjc"), sessionPath)
+		) {
+			const sessionsRoot = path.dirname(directory);
+			const resolved = resolveManagedScope({ cwd: session.cwd, agentDir: path.dirname(sessionsRoot), sessionsRoot });
+			if (resolved.kind === "error") throw new Error(`Could not resolve managed session scope: ${resolved.message}`);
+			const listing = listManagedCandidates(resolved.scope);
+			if (
+				listing.kind !== "complete" ||
+				!listing.owned.some(candidate => path.resolve(candidate.path) === sessionPath)
+			)
+				throw new Error("Session is not an authorized managed candidate.");
+		}
+		const authority = new ManagedSessionDescendantStore(managedDirectoryRoot(directory), directory);
+		try {
+			const relativePath = path.basename(session.path);
+			const descriptor = authority.descriptorExpected(relativePath);
+			if (!descriptor) throw new Error("Selected session no longer exists.");
+			if (descriptor.size > EAGER_RESUME_TRANSCRIPT_MAX_BYTES)
+				throw new Error("Session is too large to star from the picker. Use /star or /unstar in the session.");
+			const snapshot = authority.readExpected(relativePath);
+			if (!snapshot) throw new Error("Selected session no longer exists.");
+			const content = snapshot.bytes.toString("utf8");
+			const newline = content.indexOf("\n");
+			const rawHeader: unknown = JSON.parse(newline === -1 ? content : content.slice(0, newline));
+			if (!isRecord(rawHeader) || rawHeader.type !== "session" || rawHeader.id !== session.id)
+				throw new Error("Selected session identity changed. Reopen the session picker.");
+			const entries = parseSessionEntries(content);
+			const header = entries[0];
+			if (header?.type !== "session" || header.cwd !== session.cwd)
+				throw new Error("Selected session workspace changed. Reopen the session picker.");
+			if ((header.version ?? 1) < 4)
+				throw new Error("Session format requires an upgrade. Resume it before changing its star.");
+			if ((header.starredPatchVersion === 1 && header.starred === true) === starred) return;
+
+			const patch = `${JSON.stringify({ type: "header_patch", patch: { starred } })}\n`;
+			const appendOnly = rawHeader.starredPatchVersion === 1 && Number(rawHeader.version) >= 4;
+			let bytes: Uint8Array;
+			if (appendOnly) {
+				bytes = Buffer.from(`${content.endsWith("\n") ? "" : "\n"}${patch}`);
+			} else {
+				rawHeader.starredPatchVersion = 1;
+				delete rawHeader.starred;
+				const body = newline === -1 ? "" : content.slice(newline + 1);
+				bytes = Buffer.from(
+					`${JSON.stringify(rawHeader)}\n${body}${body && !body.endsWith("\n") ? "\n" : ""}${patch}`,
+				);
+			}
+			if (appendOnly) authority.appendExpectedIdentitySync(relativePath, bytes, snapshot.identity);
+			else authority.replaceExpectedIdentitySync(relativePath, bytes, snapshot.identity);
+		} finally {
+			authority.close();
+		}
+	}
+
 	async #ensureStarPatchCapability(header: SessionHeader): Promise<void> {
 		if (header.starredPatchVersion === 1) return;
 		const previousStarred = header.starred;

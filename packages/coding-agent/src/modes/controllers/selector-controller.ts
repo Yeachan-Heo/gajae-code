@@ -3274,6 +3274,9 @@ export class SelectorController {
 						});
 					}
 				},
+				undefined,
+				undefined,
+				(session, starred) => this.ctx.sessionManager.setSessionStarredForPicker(session, starred),
 			);
 			selector.setOnRequestRender(() => this.ctx.ui.requestRender());
 			return { component: selector, focus: selector };
