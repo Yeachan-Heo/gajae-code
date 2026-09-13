@@ -2101,6 +2101,19 @@ function extractPermissionLocations(
 type QueuedDisplayEntry = { text: string; tag?: string; sequence: number; message?: AgentMessage };
 type IrcRosterClaim = { token: symbol; signature: string; epoch: number; message: CustomMessage };
 type QueuedFollowUpOwner = { cancel(): boolean };
+type QueueFollowUpOptions = {
+	forceOneAtATime?: boolean;
+	claimsGenuineUserIntent?: boolean;
+	onPromoted?: (promotion: { startsOwnRun?: boolean; removed?: boolean }) => void;
+	sdkRunToken?: string;
+	onQueued?: (message: AgentMessage) => void;
+	scheduleNonAdmittedWake?: boolean;
+	onQueuedAfterAdmission?: (message: AgentMessage, cancelQueued: () => boolean) => void;
+	allowDuringSessionTransition?: boolean;
+	allowCancelAndSubmit?: boolean;
+	createDisplayEntry?: boolean;
+	trackExternalFollowUp?: boolean;
+};
 type DeferredValue<T> = {
 	promise: Promise<T>;
 	resolve: (value: T | PromiseLike<T>) => void;
@@ -13737,7 +13750,13 @@ export class AgentSession {
 		if (expandedText.trim().length === 0 && !hasUsableImage)
 			throw Object.assign(new Error("Prompt must not be empty."), { code: "invalid_input" });
 		assertImagePlaceholdersHavePayload(expandedText, images);
-		await this.#queueFollowUp(expandedText, images, {
+		const message = {
+			role: "user" as const,
+			content: [{ type: "text" as const, text: expandedText }, ...(images ?? [])],
+			attribution: "user" as const,
+			timestamp: Date.now(),
+		};
+		await this.#queueFollowUpAfterReservation(message, expandedText || (images && images.length > 0 ? "[Image]" : ""), {
 			forceOneAtATime: options?.followUpQueuePolicy === "sequential",
 			claimsGenuineUserIntent: true,
 			allowCancelAndSubmit: true,
@@ -13778,7 +13797,7 @@ export class AgentSession {
 		// in a queue nobody owns.
 		const admission = this.agent.steer(message, options?.forceOneAtATime ? { forceOneAtATime: true } : undefined);
 		if (!admission.admitted) {
-			const queuedFollowUp = await this.#queueFollowUp(text, images, {
+			const queuedFollowUp = await this.#queueFollowUpAfterReservation(message, displayText, {
 				forceOneAtATime: options?.forceOneAtATime,
 				claimsGenuineUserIntent: options?.claimsGenuineUserIntent,
 				onPromoted: options?.onPromoted,
@@ -13885,32 +13904,30 @@ export class AgentSession {
 	async #queueFollowUp(
 		text: string,
 		images?: ImageContent[],
-		options?: {
-			forceOneAtATime?: boolean;
-			claimsGenuineUserIntent?: boolean;
-			onPromoted?: (promotion: { startsOwnRun?: boolean; removed?: boolean }) => void;
-			sdkRunToken?: string;
-			onQueued?: (message: AgentMessage) => void;
-			scheduleNonAdmittedWake?: boolean;
-			onQueuedAfterAdmission?: (message: AgentMessage, cancelQueued: () => boolean) => void;
-			allowDuringSessionTransition?: boolean;
-			allowCancelAndSubmit?: boolean;
-		},
+		options?: QueueFollowUpOptions,
 	): Promise<QueuedFollowUpOwner> {
 		this.#assertExternalSessionIngress({
 			allowTrackedSuccessor: options?.allowDuringSessionTransition,
 			allowCancelAndSubmit: options?.allowCancelAndSubmit,
 		});
 		assertImagePlaceholdersHavePayload(text, images);
-		const displayText = text || (images && images.length > 0 ? "[Image]" : "");
-		const queueWasEmpty = !this.agent.hasQueuedMessages();
 		const content: (TextContent | ImageContent)[] = [{ type: "text", text }];
 		if (images && images.length > 0) content.push(...images);
 		const message = { role: "user" as const, content, attribution: "user" as const, timestamp: Date.now() };
+		return this.#queueFollowUpMessage(message, text || (images && images.length > 0 ? "[Image]" : ""), options);
+	}
+
+	#queueFollowUpMessage(
+		message: AgentMessage,
+		displayText: string,
+		options?: QueueFollowUpOptions,
+	): QueuedFollowUpOwner {
+		const queueWasEmpty = !this.agent.hasQueuedMessages();
 		options?.onQueued?.(message);
-		const displayEntry = this.#createQueuedDisplayEntry(displayText, undefined, message);
-		this.#followUpMessages.push(displayEntry);
-		this.#externalFollowUps.add(message);
+		const displayEntry =
+			options?.createDisplayEntry === false ? undefined : this.#createQueuedDisplayEntry(displayText, undefined, message);
+		if (displayEntry) this.#followUpMessages.push(displayEntry);
+		if (options?.trackExternalFollowUp !== false) this.#externalFollowUps.add(message);
 		if (options?.onPromoted) this.#followUpPromotionHooks.set(message, options.onPromoted);
 		if (options?.claimsGenuineUserIntent) {
 			const epoch = this.#claimDeepInterviewUserIntent();
@@ -13935,7 +13952,9 @@ export class AgentSession {
 					removed = this.agent.removeQueuedMessages(candidate => candidate === message).followUp > 0;
 				}
 				if (removed) {
-					this.#followUpMessages = this.#followUpMessages.filter(entry => entry !== displayEntry);
+					this.#followUpMessages = displayEntry
+						? this.#followUpMessages.filter(entry => entry !== displayEntry)
+						: this.#followUpMessages.filter(entry => entry.message !== message);
 					this.#fireQueuedRemovalHooks([message]);
 					// Either removal site can unblock the NEXT deferred SDK follow-up:
 					// the cancelled entry may itself have been the deferred head, or it
@@ -13969,6 +13988,39 @@ export class AgentSession {
 			if (options?.scheduleNonAdmittedWake !== false) this.#scheduleNonAdmittedQueuedContinuation();
 		}
 		return owner;
+	}
+
+	async #queueFollowUpAfterReservation(
+		message: AgentMessage,
+		displayText: string,
+		options?: QueueFollowUpOptions,
+	): Promise<QueuedFollowUpOwner> {
+		const transitionGeneration = this.#coordinatorPersistGeneration;
+		const reservationEpoch = ++this.#followUpReservationEpoch;
+		this.#activeFollowUpReservationEpochs.add(reservationEpoch);
+		const releaseReservation = () => {
+			this.#activeFollowUpReservationEpochs.delete(reservationEpoch);
+			const waiters = [...this.#followUpReservationDrainWaiters];
+			this.#followUpReservationDrainWaiters.clear();
+			for (const waiter of waiters) waiter();
+		};
+		try {
+			if ([...this.#activeFollowUpReservationEpochs].some(epoch => epoch < reservationEpoch)) {
+				await this.#waitForEarlierFollowUpReservations(
+					reservationEpoch,
+					undefined,
+					undefined,
+					transitionGeneration,
+				);
+			}
+			this.#assertExternalSessionIngress({
+				allowTrackedSuccessor: options?.allowDuringSessionTransition,
+				allowCancelAndSubmit: options?.allowCancelAndSubmit,
+			});
+			return this.#queueFollowUpMessage(message, displayText, options);
+		} finally {
+			releaseReservation();
+		}
 	}
 
 	#releaseDeferredSdkFollowUps(): boolean {
@@ -14415,7 +14467,11 @@ export class AgentSession {
 					this.#settleDeliveredOwnedRegistrations([appMessage]);
 					return;
 				}
-				this.agent.followUp(appMessage, sequential);
+				await this.#queueFollowUpAfterReservation(appMessage, this.#getCustomMessageTextContent(appMessage), {
+					forceOneAtATime: sequential !== undefined,
+					createDisplayEntry: false,
+					trackExternalFollowUp: false,
+				});
 				if (this.#abortUnwind && !sequential) this.#abortUnwindSteerFallbacks.push(appMessage);
 				// The chip now describes follow-up work: keep its mode and identity
 				// aligned with where the executable message actually landed.
@@ -14441,10 +14497,11 @@ export class AgentSession {
 				return;
 			}
 
-			this.agent.followUp(
-				appMessage,
-				options?.followUpQueuePolicy === "sequential" ? { forceOneAtATime: true } : undefined,
-			);
+			await this.#queueFollowUpAfterReservation(appMessage, this.#getCustomMessageTextContent(appMessage), {
+				forceOneAtATime: options?.followUpQueuePolicy === "sequential",
+				createDisplayEntry: false,
+				trackExternalFollowUp: false,
+			});
 			this.#bindCustomDisplayEntry(appMessage, "followUp");
 			// The session can report streaming while no agent loop owns the queue
 			// (post-prompt unwind): without a scheduled delivery a cron/monitor
