@@ -1244,6 +1244,7 @@ describe("terminal abort registers a turn scope so left-running owned work class
 		session.discardTerminalAbortSteeringSnapshot(staleToken ?? 0);
 		await session.abortPromptAndWait(handle, { graceMs: TEST_ABORT_GRACE_MS, terminal: { scope: "turn" } });
 		await secondPrompt;
+		await session.waitForIdle();
 	}, 30_000);
 
 	it("terminal abort preserves a queued external follow-up through the purge and rearms it", async () => {
