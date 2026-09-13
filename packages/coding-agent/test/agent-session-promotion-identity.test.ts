@@ -1074,6 +1074,85 @@ describe("queued promotion run identity (#4668)", () => {
 		await promptDone;
 	});
 
+	it("preserves deferred FIFO for custom follow-ups", async () => {
+		const sessionManager = SessionManager.inMemory();
+		const fixture = buildAbortableTrackedTransitionFixture(sessionManager, undefined, true);
+		session = fixture.session;
+		const customStarted = Promise.withResolvers<void>();
+		const unsubscribe = session.agent.subscribe(event => {
+			if (
+				event.type === "message_start" &&
+				event.message.role === "custom" &&
+				event.message.customType === "custom-fifo"
+			) {
+				customStarted.resolve();
+			}
+		});
+		const promptDone = session.prompt("first task").catch(() => {});
+		await fixture.firstToolStarted.promise;
+		const deferred = await session.submitUserMessage("deferred SDK", {
+			deliverAs: "followUp",
+			trackSubmission: true,
+			sdkRunCapability: createSdkRunCapability("custom-fifo-deferred"),
+		} as never);
+		await session.sendCustomMessage(
+			{ customType: "custom-fifo", content: "ordinary custom follow-up", display: true },
+			{ deliverAs: "followUp" },
+		);
+		await session.abort({ cause: "user_interrupt" });
+		await promptDone;
+		await withTimeout(fixture.secondToolStarted.promise, 5_000, "custom FIFO deferred successor start");
+		expect(
+			await Promise.race([customStarted.promise.then(() => "started"), Bun.sleep(20).then(() => "pending")]),
+		).toBe("pending");
+		fixture.secondGate.resolve();
+		await withTimeout(deferred.terminal, 5_000, "custom FIFO deferred terminal");
+		await withTimeout(customStarted.promise, 5_000, "custom FIFO ordinary follow-up start");
+		unsubscribe();
+		await session.waitForIdle();
+	});
+
+	it("holds public follow-up admission behind a tracked acceptance reservation", async () => {
+		const tool: AgentTool<typeof echoSchema, EchoParams> = {
+			name: "echo",
+			label: "Echo",
+			description: "Echo tool",
+			parameters: echoSchema,
+			execute: async () => ({ content: [{ type: "text", text: "done" }] }),
+		};
+		session = buildSession([{ content: ["sdk done"] }, { content: ["ordinary done"] }], tool);
+		const commitEntered = Promise.withResolvers<void>();
+		const commitRelease = Promise.withResolvers<void>();
+		const trackedPromise = session.submitUserMessage("sdk follow-up", {
+			deliverAs: "followUp",
+			trackSubmission: true,
+			sdkRunCapability: createSdkRunCapability("reservation-ordering"),
+			onPreflightAcceptCommit: async () => {
+				commitEntered.resolve();
+				await commitRelease.promise;
+			},
+		} as never);
+		await commitEntered.promise;
+		const ordinaryPromise = session.followUp("ordinary follow-up");
+		await Bun.sleep(20);
+		expect(session.agent.snapshotFollowUp()).toHaveLength(0);
+		commitRelease.resolve();
+		const tracked = await withTimeout(trackedPromise, 5_000, "reservation tracked admission");
+		await withTimeout(ordinaryPromise, 5_000, "reservation ordinary admission");
+		expect(tracked.submissionId).toMatch(/^queued-/u);
+		expect(
+			session.agent
+				.snapshotFollowUp()
+				.map(message =>
+					message.role === "user"
+						? typeof message.content === "string"
+							? message.content
+							: message.content.map(part => (part.type === "text" ? part.text : "")).join("")
+						: "",
+				),
+		).toEqual(["sdk follow-up", "ordinary follow-up"]);
+	});
+
 	it("admits tracked work from the committed session_compact hook", async () => {
 		const sessionManager = SessionManager.inMemory();
 		const firstKeptEntryId = sessionManager.appendMessage({
