@@ -860,6 +860,9 @@ describe("queued promotion run identity (#4668)", () => {
 			deliverAs: "followUp",
 			trackSubmission: true,
 			sdkRunCapability: createSdkRunCapability("deferred-one-token"),
+			onQueuedPromoted: () => {
+				throw new Error("synthetic removal callback failure");
+			},
 		} as never);
 		const second = await session.submitUserMessage("deferred two", {
 			deliverAs: "followUp",
@@ -1017,6 +1020,7 @@ describe("queued promotion run identity (#4668)", () => {
 			},
 		};
 		let submission: QueuedInputSubmission | undefined;
+		let ordinaryPromptRejected = false;
 		const extensionRunner = {
 			hasHandlers: vi.fn(
 				(eventType: string) => eventType === "session_before_compact" || eventType === "session_compact",
@@ -1029,6 +1033,11 @@ describe("queued promotion run identity (#4668)", () => {
 					preparation?: { firstKeptEntryId: string; tokensBefore: number };
 				};
 				if (typedEvent.type === "session_compact") {
+					try {
+						await session!.prompt("ordinary prompt from compact hook");
+					} catch (error) {
+						ordinaryPromptRejected = (error as { code?: string }).code === "busy";
+					}
 					submission = await session!.submitUserMessage("queued by compact hook", {
 						deliverAs: "followUp",
 						trackSubmission: true,
@@ -1058,6 +1067,7 @@ describe("queued promotion run identity (#4668)", () => {
 
 		await expect(session.compact()).resolves.toMatchObject({ summary: "compacted summary" });
 		expect(submission).toBeDefined();
+		expect(ordinaryPromptRejected).toBe(true);
 		const accepted = submission!;
 		expect(accepted.submissionId).toMatch(/^queued-/);
 		if (session.getQueuedMessageEntries().length > 0) session.clearQueue();
@@ -1082,10 +1092,16 @@ describe("queued promotion run identity (#4668)", () => {
 			},
 		};
 		let submission: QueuedInputSubmission | undefined;
+		let ordinaryPromptRejected = false;
 		const extensionRunner = {
 			hasHandlers: vi.fn((eventType: string) => eventType === "session_tree"),
 			emit: vi.fn().mockImplementation(async (event: { type?: string }) => {
 				if (event.type === "session_tree") {
+					try {
+						await session!.prompt("ordinary prompt from tree hook");
+					} catch (error) {
+						ordinaryPromptRejected = (error as { code?: string }).code === "busy";
+					}
 					submission = await session!.submitUserMessage("queued by tree hook", {
 						deliverAs: "followUp",
 						trackSubmission: true,
@@ -1099,6 +1115,7 @@ describe("queued promotion run identity (#4668)", () => {
 			cancelled: false,
 		});
 		expect(submission).toBeDefined();
+		expect(ordinaryPromptRejected).toBe(true);
 		const accepted = submission!;
 		if (session.getQueuedMessageEntries().length > 0) session.clearQueue();
 		await expect(accepted.terminal).resolves.toMatchObject({
@@ -1609,6 +1626,34 @@ describe("queued promotion run identity (#4668)", () => {
 		).rejects.toThrow("synthetic post-admission failure");
 		expect(session.agent.snapshotQueues()).toEqual({ steering: [], followUp: [] });
 		expect(session.getQueuedMessageEntries()).toEqual([]);
+	});
+
+	it("isolates a throwing promotion callback after tracked settlement", async () => {
+		session = buildSession([{ content: ["initial answer"] }, { content: ["follow-up answer"] }], {
+			name: "echo",
+			label: "Echo",
+			description: "Echo tool",
+			parameters: echoSchema,
+			async execute(_toolCallId, params) {
+				return { content: [{ type: "text", text: params.value }] };
+			},
+		});
+		await session.prompt("initial prompt");
+		const submission = await session.submitUserMessage("throwing promotion callback", {
+			deliverAs: "followUp",
+			trackSubmission: true,
+			onQueuedPromoted: () => {
+				throw new Error("synthetic promotion callback failure");
+			},
+		});
+		await expect(submission.execution).resolves.toMatchObject({
+			submissionId: submission.submissionId,
+			disposition: "promoted-to-run",
+		});
+		await expect(submission.terminal).resolves.toMatchObject({
+			submissionId: submission.submissionId,
+			disposition: "completed",
+		});
 	});
 
 	it("terminalizes a consumed tracked submission during session replacement", async () => {
