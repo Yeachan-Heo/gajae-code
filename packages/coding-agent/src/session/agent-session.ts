@@ -15819,18 +15819,36 @@ export class AgentSession {
 		let runtimeProfileDefaultModel: Model | undefined;
 		let runtimeProfileDefaultActiveIndex: number | undefined;
 		let runtimeProfileDefaultSkips: Array<{ selector: string; reason: string }> = [];
+		let runtimeProfileDefaultController: FallbackChainController | undefined;
 		if (refreshConfiguredProfile && profileToRebind) {
 			const profileTransition =
 				preparedNewSessionProfile?.profileName === profileToRebind ? preparedNewSessionProfile : undefined;
 			if (profileTransition) {
-				runtimeProfileDefaultChain = await this.#applyRuntimeModelProfile(
-					profileToRebind,
-					profileTransition,
-					false,
-				);
-				runtimeProfileDefaultModel = profileTransition.defaultModel;
-				runtimeProfileDefaultActiveIndex = profileTransition.defaultActiveIndex;
-				runtimeProfileDefaultSkips = profileTransition.defaultResolutionSkips;
+				try {
+					runtimeProfileDefaultChain = await this.#applyRuntimeModelProfile(
+						profileToRebind,
+						profileTransition,
+						false,
+					);
+					runtimeProfileDefaultModel = profileTransition.defaultModel;
+					runtimeProfileDefaultActiveIndex = profileTransition.defaultActiveIndex;
+					runtimeProfileDefaultSkips = profileTransition.defaultResolutionSkips;
+				} catch (error) {
+					logger.error("New-session model profile installation failed after preflight", {
+						profile: profileToRebind,
+						error: error instanceof Error ? error.message : String(error),
+					});
+					this.emitNotice(
+						"error",
+						`Unable to apply model profile "${profileToRebind}" in the new session.`,
+						"model-profile",
+					);
+					this.#resetSessionScopedModelProfileState({
+						preserveDefaultConfiguredChain: true,
+						forceCleanup: true,
+					});
+					runtimeProfileDefaultChain = undefined;
+				}
 			} else {
 				this.#resetSessionScopedModelProfileState({ forceCleanup: true });
 			}
@@ -15850,18 +15868,19 @@ export class AgentSession {
 				},
 				this.settings.get("fallback.maxAttempts"),
 			);
+			runtimeProfileDefaultController = controller;
 			this.#defaultFallbackController = controller;
 			this.#seedDefaultFallbackResolutionForController(
 				controller,
 				runtimeProfileDefaultActiveIndex ?? 0,
 				runtimeProfileDefaultSkips,
-				true,
+				false,
 			);
 		}
 		// A dropped session-only profile must not leak its concrete model into
 		// the successor: restore the configured global default model before it is
 		// recorded as the new session's model.
-		if (droppingSessionOnlyProfile || replacingConfiguredProfile) {
+		if (droppingSessionOnlyProfile || replacingConfiguredProfile || refreshConfiguredProfile) {
 			// A session-only profile has no durable default, so its pre-activation
 			// model is the only correct restore target.
 			let restoredDefault: Model | undefined;
@@ -15917,6 +15936,7 @@ export class AgentSession {
 			});
 		} else {
 		}
+		if (runtimeProfileDefaultController) this.#emitResolutionFallbackSwitch(runtimeProfileDefaultController);
 	}
 
 	/**
@@ -16324,6 +16344,8 @@ export class AgentSession {
 			this.#activeProfileInstalledAgentOverrides.clear();
 		}
 		if (hadInstalledKeys || this.getActiveModelProfile() !== undefined) {
+			if (restoredModelRoles) this.settings.clearOverride("modelRoles");
+			if (restoredAgentOverrides) this.settings.clearOverride("task.agentModelOverrides");
 			this.#modelRegistry.reapplyConfiguredModelBindings(this.settings);
 		}
 		if (restoredModelRoles && restoredAgentOverrides) {
@@ -16369,7 +16391,6 @@ export class AgentSession {
 		},
 		profileScope?: "session" | "durable",
 	): void {
-		const bindings = this.#modelRegistry.getConfiguredModelBindings?.();
 		if (this.#activeModelProfileScope !== "session") this.#preProfileModel = preProfileModel;
 		if (profileScope === "session") {
 			const baseline = previousDefaultChainState
@@ -16395,21 +16416,23 @@ export class AgentSession {
 			if (!currentAgentModelOverrides.has(role)) this.#activeProfileInstalledAgentOverrides.delete(role);
 		}
 		for (const role of modelRoles) {
-			const bindingValue = bindings?.modelRoles?.[role];
 			this.#activeProfileInstalledRoles.set(
 				role,
-				previousModelRoles && Object.hasOwn(previousModelRoles, role)
-					? previousModelRoles[role]
-					: (bindingValue ?? this.settings.getGlobal("modelRoles")?.[role as never]),
+				previousModelRoles !== undefined
+					? Object.hasOwn(previousModelRoles, role)
+						? previousModelRoles[role]
+						: undefined
+					: this.settings.getGlobal("modelRoles")?.[role as never],
 			);
 		}
 		for (const role of agentModelOverrides) {
-			const bindingValue = bindings?.agentModelOverrides?.[role];
 			this.#activeProfileInstalledAgentOverrides.set(
 				role,
-				previousAgentModelOverrides && Object.hasOwn(previousAgentModelOverrides, role)
-					? previousAgentModelOverrides[role]
-					: (bindingValue ?? this.settings.getGlobal("task.agentModelOverrides")?.[role as never]),
+				previousAgentModelOverrides !== undefined
+					? Object.hasOwn(previousAgentModelOverrides, role)
+						? previousAgentModelOverrides[role]
+						: undefined
+					: this.settings.getGlobal("task.agentModelOverrides")?.[role as never],
 			);
 		}
 	}
@@ -24164,7 +24187,11 @@ export class AgentSession {
 								persistedProfileIdentity &&
 								profileDefinitions.has(persistedProfileIdentity)
 							? persistedProfileIdentity
-							: undefined;
+							: previousActiveModelProfile !== undefined &&
+									configuredProfileIdentity &&
+									profileDefinitions.has(configuredProfileIdentity)
+								? configuredProfileIdentity
+								: undefined;
 				const nextActiveModelProfileScope =
 					nextActiveModelProfile === undefined
 						? undefined
@@ -24384,7 +24411,8 @@ export class AgentSession {
 					this.#resetSessionScopedModelProfileState({
 						preserveDefaultConfiguredChain:
 							switchingToDifferentSession || recoveredDefaultChain || preserveSuccessorProfile,
-						forceCleanup: predecessorProfileWasSessionScoped,
+						forceCleanup:
+							predecessorProfileWasSessionScoped || previousActiveModelProfile !== nextActiveModelProfile,
 						...(preserveSuccessorProfile
 							? {
 									preserveActiveModelProfile: {

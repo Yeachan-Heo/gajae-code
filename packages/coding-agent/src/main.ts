@@ -1800,6 +1800,9 @@ export async function runRootCommand(
 			return;
 		}
 	}
+	const resumedSessionAtOpen =
+		(sessionManager?.hasHistoryEntries() ?? false) &&
+		(parsedArgs.continue === true || parsedArgs.resume !== undefined);
 
 	// Restore the resumed session's working directory so the HUD branch, the
 	// project path, and the agent's tools all match where the session was
@@ -2055,9 +2058,7 @@ export async function runRootCommand(
 				initialMessage,
 				initialMessages: parsedArgs.messages,
 				resumeAction: bareResumeAction,
-				isResumedSession:
-					(sessionManager?.hasHistoryEntries() ?? false) &&
-					(parsedArgs.continue === true || parsedArgs.resume !== undefined),
+				isResumedSession: resumedSessionAtOpen,
 			};
 			if (isInteractive && parsedArgs.mpreset) {
 				const ready = Promise.withResolvers<void>();

@@ -685,8 +685,10 @@ async function preflightModelProfileBindings(options: {
 	const alternativeGroups = profile.alternativeProviderGroups ?? [];
 	const alternativeSet = new Set(alternativeGroups.flat());
 	const requiredProviderSet = new Set(requiredProviders);
+	const mappedProviderSet = new Set(deriveModelProfileMappedProviders(profile));
 	const authenticatedProviders = new Set<string>();
 	const missingProviders: string[] = [];
+	const missingMappedProviders = new Set<string>();
 	for (const provider of new Set([
 		...requiredProviders,
 		...alternativeSet,
@@ -697,10 +699,12 @@ async function preflightModelProfileBindings(options: {
 			apiKey = await options.modelRegistry.getApiKeyForProvider(provider, options.credentialSessionId);
 		} catch (error) {
 			if (requiredProviderSet.has(provider) && !alternativeSet.has(provider)) throw error;
+			if (mappedProviderSet.has(provider)) missingMappedProviders.add(provider);
 			continue;
 		}
 		if (apiKey === kNoAuth || isAuthenticated(apiKey)) authenticatedProviders.add(provider);
 		else if (requiredProviderSet.has(provider)) missingProviders.push(provider);
+		else if (mappedProviderSet.has(provider)) missingMappedProviders.add(provider);
 	}
 	const proxyProvider = profile.source === "user" ? undefined : resolveProxyProviderId(options.settings);
 	const proxyMode = profile.source === "user" ? "fallback" : resolveProxyMode(options.settings);
@@ -725,7 +729,9 @@ async function preflightModelProfileBindings(options: {
 			!group.some(provider => authenticatedProviders.has(provider)) &&
 			group.every(provider => proxyRoutableProviders.has(provider)),
 	);
-	const proxyRequired = proxyMode === "always" || routableMissing.length > 0 || alternativeNeedsProxy;
+	const mappedNeedsProxy = [...missingMappedProviders].some(provider => proxyRoutableProviders.has(provider));
+	const proxyRequired =
+		proxyMode === "always" || routableMissing.length > 0 || alternativeNeedsProxy || mappedNeedsProxy;
 	let proxyAuthenticated = false;
 	if (proxyProvider !== undefined && proxyRequired) {
 		const proxyApiKey = await options.modelRegistry.getApiKeyForProvider(proxyProvider, options.credentialSessionId);
@@ -1386,7 +1392,7 @@ export async function applyPreparedModelProfileActivation(
 	let defaultChainChanged = false;
 	let resumeDefaultChanged = false;
 	let fallbackResolutionSeeded = false;
-	const profileScope = options.profileScope ?? prepared.profileScope;
+	const profileScope = options.profileScope ?? (options.persistDefault ? "durable" : prepared.profileScope);
 	const preserveCurrentModel = options.preserveCurrentModel === true && prepared.session.model !== undefined;
 
 	try {
