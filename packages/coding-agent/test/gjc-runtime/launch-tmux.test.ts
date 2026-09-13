@@ -40,7 +40,9 @@ import {
 	createGjcTmuxSession,
 	removeGjcTmuxSession,
 } from "@gajae-code/coding-agent/gjc-runtime/tmux-sessions";
+import { renameDirectoryNoReplacePathAsync, renameNoReplacePathAsync } from "@gajae-code/natives";
 import { postmortem } from "@gajae-code/utils";
+import { FileLockTestHooks } from "../../src/config/file-lock";
 import { SessionStateLockTestHooks } from "../../src/gjc-runtime/session-state-lock";
 
 function args(overrides: Partial<Args> = {}): Args {
@@ -3891,12 +3893,20 @@ describe("tmux owner isolation launch gate", () => {
 		const ownerRoot = path.join(root, "owner-lifecycle");
 		const previousPlatform = Object.getOwnPropertyDescriptor(process, "platform");
 		const previousOwnerHostId = SessionStateLockTestHooks.ownerHostId;
+		const previousPublicationBindings = FileLockTestHooks.nativePublicationBindings;
 		try {
 			// This test changes process.platform only to exercise the portable Darwin
 			// owner-verdict branch. Keep the unrelated state-lock host identity stable;
 			// otherwise Linux CI tries to resolve a Darwin installation identity and
 			// fails before the behavior under test can persist its fail-closed verdict.
 			SessionStateLockTestHooks.ownerHostId = () => "darwin-owner-finalization-test-host";
+			FileLockTestHooks.nativePublicationBindings = () => ({
+				renameNoReplacePathAsync: async (source, destination) => {
+					const result = await renameNoReplacePathAsync(source, destination);
+					return result.ok ? { ...result, primitive: "renameatx_np_excl" } : result;
+				},
+				renameDirectoryNoReplacePathAsync,
+			});
 			Object.defineProperty(process, "platform", { configurable: true, value: "darwin" });
 			await persistCoordinatorRuntimeStateFromPostmortem(postmortem.Reason.EXIT, {
 				sessionId: "portable-owner",
@@ -3914,6 +3924,7 @@ describe("tmux owner isolation launch gate", () => {
 			expect(payload.reason).toBe("owner_verdict_unavailable");
 		} finally {
 			SessionStateLockTestHooks.ownerHostId = previousOwnerHostId;
+			FileLockTestHooks.nativePublicationBindings = previousPublicationBindings;
 			if (previousPlatform) Object.defineProperty(process, "platform", previousPlatform);
 			fs.rmSync(root, { recursive: true, force: true });
 		}
