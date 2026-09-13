@@ -3925,6 +3925,15 @@ export class AgentSession {
 		return this.#successorSessionAdmissionContext.run(admission, body);
 	}
 
+	#hasCommittedSuccessorAdmission(): boolean {
+		const admission = this.#successorSessionAdmissionContext.getStore();
+		return (
+			admission !== undefined &&
+			admission.generation === this.#coordinatorPersistGeneration &&
+			admission.sessionId === this.sessionId
+		);
+	}
+
 	#activateNextSessionAdmission(): void {
 		if (this.#activeSessionAdmission) return;
 		let next: SessionAdmissionEntry | undefined;
@@ -4083,6 +4092,12 @@ export class AgentSession {
 				code: "busy",
 			});
 		}
+		if (kind === "prompt" && this.#sessionTransitionKind !== undefined && !this.#hasCommittedSuccessorAdmission()) {
+			throw Object.assign(
+				new AgentBusyError(`Cannot start a turn while ${this.#sessionTransitionKind} is in progress.`),
+				{ code: "busy" },
+			);
+		}
 
 		const entry: SessionAdmissionEntry = {
 			kind,
@@ -4125,6 +4140,16 @@ export class AgentSession {
 				throw Object.assign(new AgentBusyError("Cannot start a turn while a handoff is in progress."), {
 					code: "busy",
 				});
+			}
+			if (
+				kind === "prompt" &&
+				this.#sessionTransitionKind !== undefined &&
+				!this.#hasCommittedSuccessorAdmission()
+			) {
+				throw Object.assign(
+					new AgentBusyError(`Cannot start a turn while ${this.#sessionTransitionKind} is in progress.`),
+					{ code: "busy" },
+				);
 			}
 
 			const release = () => {
@@ -6893,16 +6918,19 @@ export class AgentSession {
 		if (userDisplayDequeueAlreadyHandled) this.#displayDequeueAlreadyHandled = undefined;
 		if (event.type === "message_start" && event.message.role === "user" && !userDisplayDequeueAlreadyHandled) {
 			const messageText = userMessageText;
-			if (messageText) {
-				// Check steering queue first (match by .text on tagged records)
-				const steeringIndex = this.#steeringMessages.findIndex(e => e.text === messageText);
-				if (steeringIndex !== -1) {
-					this.#steeringMessages.splice(steeringIndex, 1);
-				} else {
-					// Check follow-up queue
-					const followUpIndex = this.#followUpMessages.findIndex(e => e.text === messageText);
-					if (followUpIndex !== -1) {
-						this.#followUpMessages.splice(followUpIndex, 1);
+			const boundIndex = this.#steeringMessages.findIndex(entry => entry.message === event.message);
+			if (boundIndex !== -1) {
+				this.#steeringMessages.splice(boundIndex, 1);
+			} else {
+				const followUpBoundIndex = this.#followUpMessages.findIndex(entry => entry.message === event.message);
+				if (followUpBoundIndex !== -1) this.#followUpMessages.splice(followUpBoundIndex, 1);
+				else if (messageText) {
+					// Legacy display rows without a bound executable message retain text fallback.
+					const steeringIndex = this.#steeringMessages.findIndex(entry => entry.text === messageText);
+					if (steeringIndex !== -1) this.#steeringMessages.splice(steeringIndex, 1);
+					else {
+						const followUpIndex = this.#followUpMessages.findIndex(entry => entry.text === messageText);
+						if (followUpIndex !== -1) this.#followUpMessages.splice(followUpIndex, 1);
 					}
 				}
 			}
@@ -13731,23 +13759,12 @@ export class AgentSession {
 		if (!message) return false;
 		this.agent.followUp(message, { forceOneAtATime: true });
 		this.#scheduleAgentContinue({
-			shouldContinue: () => this.#canStartDeferredSdkFollowUp() && this.agent.hasQueuedMessages(),
+			shouldContinue: () => this.#canDeliverQueuedMessages() && this.agent.hasQueuedMessages(),
 			rescheduleOnBusy: true,
 			continueQueuedOnly: true,
 		});
 		return true;
 	}
-	#canStartDeferredSdkFollowUp(): boolean {
-		if (this.agent.state.isStreaming) return false;
-		if (this.isCompacting) return false;
-		if (this.isBashRunning) return false;
-		if (this.isEvalRunning) return false;
-		if (this.isRetrying) return false;
-		const messages = this.agent.state.messages;
-		const last = messages[messages.length - 1];
-		return last?.role === "assistant" || last?.role === "bashExecution" || last?.role === "pythonExecution";
-	}
-
 	/**
 	 * Gate for idle-path follow-up auto-continue. See `#queueFollowUp` for rationale.
 	 */
@@ -15917,7 +15934,9 @@ export class AgentSession {
 					const reclassifiedSteering = selected
 						? queueSnapshot.steering.filter(message => message !== selectedMessage)
 						: [];
-					const heldFollowUp = selected ? [...reclassifiedSteering, ...queueSnapshot.followUp] : [];
+					const heldFollowUp = selected
+						? [...reclassifiedSteering, ...queueSnapshot.followUp.filter(message => message !== selectedMessage)]
+						: [];
 					let heldQueueRestored = false;
 					const restoreHeldQueue = () => {
 						if (!selected || heldQueueRestored) return;

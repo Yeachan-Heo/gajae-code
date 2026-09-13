@@ -405,6 +405,24 @@ describe("AgentSession.cancelAndSubmit", () => {
 		expect(s.getQueuedMessageEntries().map(entry => entry.id)).not.toContain(head.id);
 	});
 
+	it("selects a tracked live follow-up exactly once", async () => {
+		const { agent, session: s } = buildSession();
+		const submission = await s.submitUserMessage("live follow-up", {
+			deliverAs: "followUp",
+			trackSubmission: true,
+		});
+		const entry = s.getQueuedMessageEntries().find(candidate => candidate.text === "live follow-up");
+		if (!entry) throw new Error("Expected a live follow-up entry");
+		const promptSpy = vi.spyOn(agent, "prompt");
+
+		expect(await s.cancelAndSubmit(entry.text, { queuedEntryId: entry.id })).toEqual({ kind: "submitted" });
+		const submittedMessages = promptSpy.mock.calls.flatMap(([messages]) => messages as unknown as AgentMessage[]);
+		expect(submittedMessages.filter(message => messageText(message) === "live follow-up")).toHaveLength(1);
+		await expect(submission.execution).resolves.toMatchObject({ disposition: "promoted-to-run" });
+		await expect(submission.terminal).resolves.toMatchObject({ disposition: "completed" });
+		expect(s.getQueuedMessageEntries()).toEqual([]);
+	});
+
 	it("committed external steer fires its ownership hook exactly once", async () => {
 		const { session: s } = buildSession();
 		let promoted = 0;
@@ -442,6 +460,21 @@ describe("AgentSession.cancelAndSubmit", () => {
 		// The unselected steer of the aborted turn is re-queued as a follow-up of
 		// the new turn; exactly one duplicate-text display remains.
 		expect(entriesAtNewTurn).toEqual([expect.objectContaining({ text: remaining.text, mode: "followUp" })]);
+	});
+
+	it("dequeues the bound duplicate across steering and follow-up queues", async () => {
+		const { session: s } = buildGatedStreamingSession();
+		const activePrompt = s.prompt("active stream");
+		await waitForStreaming(s);
+		await s.steer("same display text");
+		await s.followUp("same display text");
+		const selected = s.getQueuedMessageEntries().find(entry => entry.mode === "followUp");
+		if (!selected) throw new Error("Expected a follow-up display entry");
+
+		expect(await s.cancelAndSubmit(selected.text, { queuedEntryId: selected.id })).toEqual({ kind: "submitted" });
+		await activePrompt;
+		await s.waitForIdle();
+		expect(s.getQueuedMessageEntries()).toEqual([]);
 	});
 
 	it("preserves sequential policy when cancel-submit reclassifies steers", async () => {
