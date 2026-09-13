@@ -1766,19 +1766,28 @@ export async function materializeModelProfileForDeletion(
 	for (const [role, selector] of Object.entries(prepared.agentModelOverrides)) {
 		concreteAgentModelOverrides[role] = await concretizeForDeletion(selector);
 	}
-	const nextModelRoles = {
-		...prepared.previousModelRoles,
-		...(concreteDefaultChain.length > 0
-			? {
-					default: concreteDefaultChain.length === 1 ? concreteDefaultChain[0] : [...concreteDefaultChain],
-				}
-			: {}),
-		...concreteModelRoles,
-	};
-	const nextAgentModelOverrides = {
-		...prepared.previousAgentModelOverrides,
-		...concreteAgentModelOverrides,
-	};
+	const retainsDifferentDurableProfile =
+		prepared.previousActiveModelProfileScope === "session" &&
+		previousPersistedDefaultProfile !== undefined &&
+		resolveModelProfileName(previousPersistedDefaultProfile, prepared.modelRegistry.getModelProfiles()) !==
+			prepared.profileName;
+	const nextModelRoles = retainsDifferentDurableProfile
+		? { ...(prepared.previousPersistedModelRoles ?? {}) }
+		: {
+				...prepared.previousModelRoles,
+				...(concreteDefaultChain.length > 0
+					? {
+							default: concreteDefaultChain.length === 1 ? concreteDefaultChain[0] : [...concreteDefaultChain],
+						}
+					: {}),
+				...concreteModelRoles,
+			};
+	const nextAgentModelOverrides = retainsDifferentDurableProfile
+		? { ...(prepared.previousPersistedAgentModelOverrides ?? {}) }
+		: {
+				...prepared.previousAgentModelOverrides,
+				...concreteAgentModelOverrides,
+			};
 	const previousDefaultChainIdentity = prepared.previousDefaultChainState?.identity;
 	const deletesOwnedDefaultChain =
 		prepared.defaultChain.length === 0 &&
@@ -1787,11 +1796,7 @@ export async function materializeModelProfileForDeletion(
 		(resolveModelProfileName(previousDefaultChainIdentity, prepared.modelRegistry.getModelProfiles()) ===
 			prepared.profileName ||
 			previousDefaultChainIdentity === options.profileName);
-	const clearsPersistedDefaultProfile = !(
-		prepared.previousActiveModelProfileScope === "session" &&
-		prepared.previousActiveModelProfile !== undefined &&
-		previousPersistedDefaultProfile !== prepared.profileName
-	);
+	const clearsPersistedDefaultProfile = !retainsDifferentDurableProfile;
 	let defaultChainChanged = false;
 
 	try {
