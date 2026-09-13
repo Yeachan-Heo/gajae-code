@@ -7940,6 +7940,31 @@ export class AgentSession {
 		this.#ttsrResumePromise = undefined;
 	}
 
+	#dropQueuedTtsrFollowUps(): void {
+		const deferredTtsr = new Set(
+			this.#deferredSdkFollowUps.filter(
+				message => message.role === "custom" && message.customType === "ttsr-injection",
+			),
+		);
+		const queuedTtsr = [
+			...this.agent
+				.snapshotFollowUp()
+				.filter(message => message.role === "custom" && message.customType === "ttsr-injection"),
+			...deferredTtsr,
+		];
+		if (queuedTtsr.length === 0) return;
+		this.agent.removeQueuedMessages(
+			message => message.role === "custom" && message.customType === "ttsr-injection",
+			"followUp",
+		);
+		this.#deferredSdkFollowUps = this.#deferredSdkFollowUps.filter(message => !deferredTtsr.has(message));
+		for (const message of deferredTtsr) this.#deferredFollowUpForceOneAtATime.delete(message);
+		this.#followUpMessages = this.#followUpMessages.filter(
+			entry => entry.message === undefined || !queuedTtsr.includes(entry.message),
+		);
+		this.#resolveTtsrResume();
+	}
+
 	#ensurePostPromptTasksPromise(): void {
 		if (this.#postPromptTasksPromise) return;
 		const { promise, resolve } = Promise.withResolvers<void>();
@@ -15717,6 +15742,7 @@ export class AgentSession {
 		this.#promptPreflightCancellationGeneration++;
 		this.#promptPreflightAbortController.abort();
 		this.#promptPreflightAbortController = new AbortController();
+		this.#dropQueuedTtsrFollowUps();
 		this.#scheduledHiddenNextTurnGeneration = undefined;
 		if (options?.preserveCompaction) this.#autoCompactionAbortController?.abort();
 		else this.abortCompaction();
@@ -15792,6 +15818,7 @@ export class AgentSession {
 			this.#promptPreflightCancellationGeneration++;
 			this.#promptPreflightAbortController.abort();
 			this.#promptPreflightAbortController = new AbortController();
+			this.#dropQueuedTtsrFollowUps();
 			this.#drainTerminalOwnedYieldEntries();
 			if (options?.preserveCompaction !== true) this.abortCompaction();
 			const overlappingPostPromptDrain = this.#cancelPostPromptTasks();
@@ -15939,6 +15966,7 @@ export class AgentSession {
 		this.#promptPreflightCancellationGeneration++;
 		this.#promptPreflightAbortController.abort();
 		this.#promptPreflightAbortController = new AbortController();
+		this.#dropQueuedTtsrFollowUps();
 	}
 	/**
 	 * Capture the steering admission snapshot at abort ADMISSION: the host
