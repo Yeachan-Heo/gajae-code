@@ -16443,6 +16443,19 @@ export class AgentSession {
 			if (restoredAgentOverrides) this.settings.clearOverride("task.agentModelOverrides");
 			this.#modelRegistry.reapplyConfiguredModelBindings(this.settings);
 		}
+		const configuredBindings = this.#modelRegistry.getConfiguredModelBindings?.();
+		if (restoredModelRoles && configuredBindings?.modelRoles) {
+			const configuredRoles = this.settings.get("modelRoles");
+			for (const role of Object.keys(configuredBindings.modelRoles)) {
+				if (Object.hasOwn(configuredRoles, role)) restoredModelRoles[role] = configuredRoles[role];
+			}
+		}
+		if (restoredAgentOverrides && configuredBindings?.agentModelOverrides) {
+			const configuredOverrides = this.settings.get("task.agentModelOverrides");
+			for (const role of Object.keys(configuredBindings.agentModelOverrides)) {
+				if (Object.hasOwn(configuredOverrides, role)) restoredAgentOverrides[role] = configuredOverrides[role];
+			}
+		}
 		if (restoredModelRoles && restoredAgentOverrides) {
 			this.settings.override("modelRoles", restoredModelRoles);
 			this.settings.override("task.agentModelOverrides", restoredAgentOverrides);
@@ -16659,7 +16672,7 @@ export class AgentSession {
 		profileName: string,
 		prepared?: PreparedModelProfileActivation,
 		preserveCanonicalAffinity = true,
-	): Promise<readonly string[]> {
+	): Promise<PreparedModelProfileActivation> {
 		const activation =
 			prepared ??
 			(await prepareModelProfileActivation({
@@ -16675,7 +16688,7 @@ export class AgentSession {
 			preserveCurrentModel: true,
 			preserveCanonicalAffinity,
 		});
-		return activation.defaultChain;
+		return activation;
 	}
 
 	/**
@@ -24344,6 +24357,7 @@ export class AgentSession {
 					profileCleanupAppliedBeforeResolution = true;
 				}
 				let runtimeProfileDefaultChain: readonly string[] | undefined;
+				let runtimeProfileDefaultThinkingLevel: ThinkingLevel | undefined;
 				if (
 					resumeModelBehavior === "keepSessionModel" &&
 					nextActiveModelProfile !== undefined &&
@@ -24364,7 +24378,9 @@ export class AgentSession {
 					nextActiveModelProfileScope === "durable" &&
 					configuredProfileIdentity === nextActiveModelProfile
 				) {
-					runtimeProfileDefaultChain = await this.#applyRuntimeModelProfile(nextActiveModelProfile);
+					const profileActivation = await this.#applyRuntimeModelProfile(nextActiveModelProfile);
+					runtimeProfileDefaultChain = profileActivation.defaultChain;
+					runtimeProfileDefaultThinkingLevel = profileActivation.defaultThinkingLevel;
 				}
 				this.setActiveModelProfile(nextActiveModelProfile, nextActiveModelProfileScope);
 				const settingsDefaultEntries = normalizeModelSelectorValue(this.settings.getModelRole("default"));
@@ -24513,7 +24529,7 @@ export class AgentSession {
 				const configuredServiceTier = this.settings.get("serviceTier");
 				const persistedThinkingLevel = hasThinkingEntry
 					? (sessionContext.thinkingLevel as ThinkingLevel | undefined)
-					: defaultThinkingLevel;
+					: (runtimeProfileDefaultThinkingLevel ?? defaultThinkingLevel);
 				const nextThinkingLevel = resolveThinkingLevelForModel(
 					this.model,
 					persistedThinkingLevel === ThinkingLevel.Inherit
