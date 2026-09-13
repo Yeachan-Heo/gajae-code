@@ -24159,10 +24159,6 @@ export class AgentSession {
 				await this.#settleOwnAsyncJobsBeforeArtifactRetirement();
 				this.#assertJobManagerEndpointAdmission(prepared.sessionId, prepared.sessionFile);
 				this.sessionManager.commitPreparedNewSession(prepared);
-				// Branch commits a successor endpoint identity; re-register the
-				// manager under it (review thread P1).
-				this.#rekeyJobManagerForSessionIdentity(previousSessionIdentity, previousSessionFile);
-				await this.#runToolSessionTransitionCleanups();
 			} catch (error) {
 				throw await discardPreparedNewSessionAfterFailure(this.sessionManager, prepared, error);
 			}
@@ -24190,8 +24186,6 @@ export class AgentSession {
 			// Reload messages from entries (works for both file and in-memory mode)
 			const sessionContext = this.buildDisplaySessionContext();
 
-			await this.#restoreMCPSelectionsForSessionContext(sessionContext);
-
 			if (!skipConversationRestore) {
 				this.agent.replaceMessages(sessionContext.messages, {
 					historyRewrite: { reason: "session-branch", preserveSeededPrefix: true },
@@ -24201,6 +24195,12 @@ export class AgentSession {
 			}
 
 			this.#resetIrcRosterDeliveryState();
+			// Once committed, establish the successor's identity and prompt boundary
+			// before fallible post-commit integrations. A cleanup or MCP failure must
+			// not leave the next turn running with the parent's messages/session id.
+			this.#rekeyJobManagerForSessionIdentity(previousSessionIdentity, previousSessionFile);
+			await this.#runToolSessionTransitionCleanups();
+			await this.#restoreMCPSelectionsForSessionContext(sessionContext);
 			// session_branch is the post-commit identity signal. Publish it only after
 			// the successor's messages and MCP selections are restored.
 			if (this.#extensionRunner) {

@@ -201,11 +201,11 @@ Label edits in tree UI call `appendLabelChange(targetId, label)`.
 | Operation | Scope                                          | Result                                                                                                                                                     |
 | --------- | ---------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `/tree`   | Current session file                           | Moves leaf to selected point (same file)                                                                                                                   |
-| `app.session.fork` action or branch-configured double Escape | Current branching lifecycle | Opens the existing user-message branch picker; behavior is unchanged                                                                                       |
+| `app.session.fork` action or branch-configured double Escape | Selected user prompt; new persistent session file | Opens the same picker as `/fork`, with the same persistence and active-work guards |
 | `/fork`   | Selected user prompt; new persistent session file | Opens the same picker, copies history before the selected prompt into an independent session, switches to it, and prefills the prompt without submitting |
 | `/resume` | Session list                                   | Switches to another session file                                                                                                                           |
 
-Key distinction: `/tree` is a navigation/repositioning tool inside one session file. Interactive `/fork` adds the persistent slash-command path without changing the existing `app.session.fork` action, branch-configured double Escape, or `/resume`.
+Key distinction: `/tree` is a navigation/repositioning tool inside one session file. `/fork`, `app.session.fork`, and branch-configured double Escape share a persistent prompt-fork lifecycle. Opening an admitted picker closes any active `/btw` side chat, including when the picker is subsequently cancelled. `/resume` remains unchanged.
 
 ## Operator workflows
 

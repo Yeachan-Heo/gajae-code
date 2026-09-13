@@ -1110,10 +1110,6 @@ export class CommandController {
 	}
 
 	async handleForkCommand(): Promise<void> {
-		if (!this.ctx.sessionManager.getSessionFile()) {
-			this.ctx.showError("Fork requires a persisted session");
-			return;
-		}
 		this.ctx.showUserMessageSelector();
 	}
 
