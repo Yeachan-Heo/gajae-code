@@ -2456,6 +2456,7 @@ type SuccessorSessionAdmission = {
 	generation: number;
 	sessionId: string | undefined;
 	capability: symbol;
+	active: boolean;
 };
 
 type SessionAdmissionLease = {
@@ -2587,6 +2588,7 @@ export class AgentSession {
 	/** Epochs of follow-up reservations still between reservation and durable enqueue. */
 	#activeFollowUpReservationEpochs = new Set<number>();
 	#followUpReservationDrainWaiters = new Set<() => void>();
+	#followUpReservationTransitionWaiters = new Set<() => void>();
 	#selectionFenceGeneration = 0;
 	#defaultModelSelectionMutationRevision = 0;
 	#thinkingLevelMutationRevision = 0;
@@ -2897,20 +2899,30 @@ export class AgentSession {
 	 * those accepted submissions boundedly instead of leaving them accepted
 	 * forever (#4668 review P1). */
 	#fireQueuedRemovalHooks(messages: readonly AgentMessage[]): void {
+		let callbackError: unknown;
 		for (const message of messages) {
 			const steerHook = this.#steerPromotionHooks.get(message);
 			if (steerHook) {
 				this.#steerPromotionHooks.delete(message);
-				steerHook({ startsOwnRun: false, removed: true });
+				try {
+					steerHook({ startsOwnRun: false, removed: true });
+				} catch (error) {
+					callbackError ??= error;
+				}
 			}
 			const followUpHook = this.#followUpPromotionHooks.get(message);
 			if (followUpHook) {
 				this.#followUpPromotionHooks.delete(message);
-				followUpHook({ startsOwnRun: true, removed: true });
+				try {
+					followUpHook({ startsOwnRun: true, removed: true });
+				} catch (error) {
+					callbackError ??= error;
+				}
 			}
 			this.#sdkRunTokensByQueuedMessage.delete(message);
 			this.#deepInterviewGenuineUserMessageEpochs.delete(message);
 		}
+		if (callbackError !== undefined) logger.warn("Queued removal callback failed", { error: callbackError });
 	}
 
 	/**
@@ -3067,21 +3079,31 @@ export class AgentSession {
 		flushBatch();
 	}
 	#fireQueuedPromotionHooks(messages: readonly AgentMessage[], promotion?: { startsOwnRun?: boolean }): void {
+		let callbackError: unknown;
 		for (const message of messages) {
 			const steerHook = this.#steerPromotionHooks.get(message);
 			if (steerHook) {
 				this.#steerPromotionHooks.delete(message);
 				// A steer is consumed INSIDE the currently running turn: no new
 				// agent_start follows for it (#4668 review).
-				steerHook({ startsOwnRun: promotion?.startsOwnRun ?? false });
+				try {
+					steerHook({ startsOwnRun: promotion?.startsOwnRun ?? false });
+				} catch (error) {
+					callbackError ??= error;
+				}
 			}
 			const followUpHook = this.#followUpPromotionHooks.get(message);
 			if (followUpHook) {
 				this.#followUpPromotionHooks.delete(message);
 				// A follow-up is promoted to its own run, whose agent_start follows.
-				followUpHook({ startsOwnRun: promotion?.startsOwnRun ?? true });
+				try {
+					followUpHook({ startsOwnRun: promotion?.startsOwnRun ?? true });
+				} catch (error) {
+					callbackError ??= error;
+				}
 			}
 		}
+		if (callbackError !== undefined) logger.warn("Queued promotion callback failed", { error: callbackError });
 	}
 	#queuedMessagesForSessionTransition(): AgentMessage[] {
 		return [
@@ -3910,6 +3932,13 @@ export class AgentSession {
 		}
 		this.#sessionTransitionKind = kind;
 		this.#coordinatorPersistGeneration += 1;
+		this.#wakeFollowUpReservationTransitionWaiters();
+	}
+
+	#wakeFollowUpReservationTransitionWaiters(): void {
+		const waiters = [...this.#followUpReservationTransitionWaiters];
+		this.#followUpReservationTransitionWaiters.clear();
+		for (const waiter of waiters) waiter();
 	}
 
 	#endSessionTransition(): void {
@@ -3921,17 +3950,27 @@ export class AgentSession {
 			generation: this.#coordinatorPersistGeneration,
 			sessionId: this.sessionId,
 			capability: Symbol("committed-successor-session-hook"),
+			active: true,
 		};
-		return this.#successorSessionAdmissionContext.run(admission, body);
+		return this.#successorSessionAdmissionContext.run(admission, async () => {
+			try {
+				return await body();
+			} finally {
+				admission.active = false;
+			}
+		});
 	}
 
 	#hasCommittedSuccessorAdmission(): boolean {
 		const admission = this.#successorSessionAdmissionContext.getStore();
 		return (
-			admission !== undefined &&
+			admission?.active === true &&
 			admission.generation === this.#coordinatorPersistGeneration &&
 			admission.sessionId === this.sessionId
 		);
+	}
+	#hasCommittedSuccessorTrackedAdmission(options?: SendUserMessageDispatchOptions): boolean {
+		return options?.trackSubmission === true && this.#hasCommittedSuccessorAdmission();
 	}
 
 	#activateNextSessionAdmission(): void {
@@ -4092,7 +4131,7 @@ export class AgentSession {
 				code: "busy",
 			});
 		}
-		if (kind === "prompt" && this.#sessionTransitionKind !== undefined && !this.#hasCommittedSuccessorAdmission()) {
+		if (kind === "prompt" && this.#sessionTransitionKind !== undefined) {
 			throw Object.assign(
 				new AgentBusyError(`Cannot start a turn while ${this.#sessionTransitionKind} is in progress.`),
 				{ code: "busy" },
@@ -4141,11 +4180,7 @@ export class AgentSession {
 					code: "busy",
 				});
 			}
-			if (
-				kind === "prompt" &&
-				this.#sessionTransitionKind !== undefined &&
-				!this.#hasCommittedSuccessorAdmission()
-			) {
+			if (kind === "prompt" && this.#sessionTransitionKind !== undefined) {
 				throw Object.assign(
 					new AgentBusyError(`Cannot start a turn while ${this.#sessionTransitionKind} is in progress.`),
 					{ code: "busy" },
@@ -4473,12 +4508,41 @@ export class AgentSession {
 		ownEpoch: number,
 		requesterSignal?: AbortSignal,
 		admissionSignal?: AbortSignal,
+		transitionGeneration = this.#coordinatorPersistGeneration,
 	): Promise<void> {
 		while ([...this.#activeFollowUpReservationEpochs].some(epoch => epoch < ownEpoch)) {
 			if (requesterSignal?.aborted || admissionSignal?.aborted) throw promptPreflightCancelledError();
+			if (this.#coordinatorPersistGeneration !== transitionGeneration) {
+				throw Object.assign(
+					new AgentBusyError("Cannot submit queued input while a session state transition is in progress."),
+					{
+						code: "busy",
+					},
+				);
+			}
 			const drained = Promise.withResolvers<void>();
 			this.#followUpReservationDrainWaiters.add(drained.resolve);
-			await drained.promise;
+			const abort = Promise.withResolvers<void>();
+			const transition = Promise.withResolvers<void>();
+			const onAbort = () => abort.resolve();
+			requesterSignal?.addEventListener("abort", onAbort, { once: true });
+			admissionSignal?.addEventListener("abort", onAbort, { once: true });
+			this.#followUpReservationTransitionWaiters.add(transition.resolve);
+			try {
+				await Promise.race([drained.promise, abort.promise, transition.promise]);
+				if (requesterSignal?.aborted || admissionSignal?.aborted) throw promptPreflightCancelledError();
+				if (this.#coordinatorPersistGeneration !== transitionGeneration) {
+					throw Object.assign(
+						new AgentBusyError("Cannot submit queued input while a session state transition is in progress."),
+						{ code: "busy" },
+					);
+				}
+			} finally {
+				this.#followUpReservationDrainWaiters.delete(drained.resolve);
+				this.#followUpReservationTransitionWaiters.delete(transition.resolve);
+				requesterSignal?.removeEventListener("abort", onAbort);
+				admissionSignal?.removeEventListener("abort", onAbort);
+			}
 		}
 	}
 
@@ -9564,6 +9628,7 @@ export class AgentSession {
 			// Invalidate every coordinator event admitted before disposal. Handlers may
 			// still unwind, but their captured generation can no longer enqueue a write.
 			this.#coordinatorPersistGeneration += 1;
+			this.#wakeFollowUpReservationTransitionWaiters();
 			this.#disposeAbortController.abort();
 			// Disposal owns a bounded Agent abort below. Waiting for the active prompt's
 			// admission here would put that unbounded prompt ahead of the abort budget.
@@ -13720,10 +13785,7 @@ export class AgentSession {
 				}
 				if (removed) {
 					this.#followUpMessages = this.#followUpMessages.filter(entry => entry !== displayEntry);
-					this.#deepInterviewGenuineUserMessageEpochs.delete(message);
-					this.#sdkRunTokensByQueuedMessage.delete(message);
-					this.#followUpPromotionHooks.get(message)?.({ removed: true });
-					this.#followUpPromotionHooks.delete(message);
+					this.#fireQueuedRemovalHooks([message]);
 					// Either removal site can unblock the NEXT deferred SDK follow-up:
 					// the cancelled entry may itself have been the deferred head, or it
 					// may have been the live work that deferred head was waiting behind.
@@ -14395,7 +14457,6 @@ export class AgentSession {
 		assertQueuedInputQueuePolicy(options?.queuePolicy);
 		const sdkRunToken = readSdkRunCapability(options?.sdkRunCapability);
 		const submissionTransitionGeneration = this.#coordinatorPersistGeneration;
-		const successorAdmission = this.#successorSessionAdmissionContext.getStore();
 		const internalOptions = options ? { ...options, ...(sdkRunToken ? { sdkRunToken } : {}) } : undefined;
 		this.#assertRecoveryHydrationPromoted();
 		const owner = this.#sessionAdmissionContext.getStore();
@@ -14524,12 +14585,7 @@ export class AgentSession {
 				if (
 					(this.#sessionTransitionKind !== undefined ||
 						this.#coordinatorPersistGeneration !== submissionTransitionGeneration) &&
-					!(
-						successorAdmission !== undefined &&
-						this.#successorSessionAdmissionContext.getStore()?.capability === successorAdmission.capability &&
-						successorAdmission.generation === this.#coordinatorPersistGeneration &&
-						successorAdmission.sessionId === this.sessionId
-					)
+					!this.#hasCommittedSuccessorTrackedAdmission(options)
 				) {
 					throw Object.assign(
 						new AgentBusyError(
@@ -14556,8 +14612,10 @@ export class AgentSession {
 						followUpReservationEpoch,
 						options?.preflightSignal,
 						admissionSignal,
+						submissionTransitionGeneration,
 					);
 				}
+				assertPreflightStillOpen();
 				if (options?.onPreflightAcceptCommit) await options.onPreflightAcceptCommit();
 				assertPreflightStillOpen();
 				const queuedFollowUp = await this.#queueFollowUp(text, images, {
