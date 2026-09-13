@@ -26,6 +26,7 @@ import { convertToLlm } from "@gajae-code/coding-agent/session/messages";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { Snowflake } from "@gajae-code/utils";
 import * as z from "zod/v4";
+import { createSdkRunCapability } from "../src/sdk/host/sdk-run-capability";
 import { createAssistantMessage } from "./helpers/agent-session-setup";
 
 // Mock stream that mimics AssistantMessageEventStream
@@ -1658,6 +1659,94 @@ describe("AgentSession TTSR resume gate", () => {
 		await promptPromise;
 
 		expect(session.isStreaming).toBe(false);
+	});
+
+	it("purges deferred TTSR follow-ups during SDK terminal abort", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		let streamCallCount = 0;
+		let staleTtsrStarted = false;
+		const ttsrManager = new TtsrManager({
+			enabled: true,
+			contextMode: "discard",
+			interruptMode: "never",
+			repeatMode: "once",
+			repeatGap: 10,
+		});
+		ttsrManager.addRule(testRule);
+
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [] },
+			streamFn: (_model, context, options) => {
+				streamCallCount += 1;
+				const stream = new AssistantMessageEventStream();
+				if (streamCallCount === 1) {
+					queueMicrotask(() => {
+						stream.push({ type: "start", partial: makeMsg("") });
+						stream.push({
+							type: "text_delta",
+							contentIndex: 0,
+							delta: "result.unwrap(",
+							partial: makeMsg("result.unwrap("),
+						});
+						stream.push({
+							type: "done",
+							reason: "stop",
+							message: makeMsg("result.unwrap()"),
+						});
+					});
+				} else if (streamCallCount === 2) {
+					queueMicrotask(() => {
+						stream.push({ type: "start", partial: makeMsg("") });
+						options?.signal?.addEventListener(
+							"abort",
+							() => {
+								stream.push({
+									type: "error",
+									reason: "aborted",
+									error: makeMsg("aborted", "aborted"),
+								});
+							},
+							{ once: true },
+						);
+					});
+				} else {
+					staleTtsrStarted = context.messages.some(message => JSON.stringify(message).includes(testRule.content));
+					queueMicrotask(() => {
+						stream.push({ type: "start", partial: makeMsg("") });
+						stream.push({ type: "done", reason: "stop", message: makeMsg("stale TTSR") });
+					});
+				}
+				return stream;
+			},
+		});
+		const sessionManager = SessionManager.inMemory(tempDir);
+		const settings = Settings.isolated();
+		const authStorage = await AuthStorage.create(path.join(tempDir, "testauth-terminal-ttsr.db"));
+		authStorages.push(authStorage);
+		const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "models.yml"));
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		session = new AgentSession({ agent, sessionManager, settings, modelRegistry, ttsrManager });
+
+		const promptPromise = session.prompt("first turn").catch(() => {});
+		await waitFor(() => streamCallCount >= 1, 5_000);
+		await session.submitUserMessage("older SDK follow-up", {
+			deliverAs: "followUp",
+			trackSubmission: true,
+			sdkRunCapability: createSdkRunCapability("terminal-ttsr-deferred"),
+		} as never);
+		await waitFor(() => streamCallCount >= 2, 5_000);
+		await Bun.sleep(10);
+		const handle = session.agent.activeResourceRunId;
+		const abortPromise = session.abortPromptAndWait(handle ?? "run", {
+			graceMs: 1_000,
+			terminal: { scope: "turn" },
+		});
+		if (!handle) session.agent.abort();
+		await abortPromise;
+		await promptPromise;
+		await Bun.sleep(100);
+		expect(staleTtsrStarted).toBe(false);
 	});
 
 	it("prompt() waits for TTSR continuation with tool calls to finish", async () => {
