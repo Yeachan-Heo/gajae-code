@@ -15860,7 +15860,9 @@ export class AgentSession {
 		const preProfileModel = this.#preProfileModel;
 		if (!profileAlreadyApplied) {
 			this.#resetSessionScopedModelProfileState(
-				(droppingSessionOnlyProfile || replacingConfiguredProfile) && profileToRebind
+				{
+					preserveDefaultConfiguredChain: true,
+					...((droppingSessionOnlyProfile || replacingConfiguredProfile) && profileToRebind
 					? {
 							restoreInstalledDefaultChain: !replacingConfiguredProfile,
 							preserveActiveModelProfile: {
@@ -15868,11 +15870,13 @@ export class AgentSession {
 								scope: "durable",
 							},
 						}
-					: undefined,
+					: {}),
+				},
 			);
 		}
 		let runtimeProfileDefaultChain: readonly string[] | undefined;
 		let runtimeProfileDefaultModel: Model | undefined;
+		let runtimeProfileDefaultThinkingLevel: ThinkingLevel | undefined;
 		let runtimeProfileDefaultActiveIndex: number | undefined;
 		let runtimeProfileDefaultSkips: Array<{ selector: string; reason: string }> = [];
 		let runtimeProfileDefaultController: FallbackChainController | undefined;
@@ -15883,6 +15887,7 @@ export class AgentSession {
 				if (profileAlreadyApplied) {
 					runtimeProfileDefaultChain = profileTransition.defaultChain;
 					runtimeProfileDefaultModel = profileTransition.defaultModel;
+					runtimeProfileDefaultThinkingLevel = profileTransition.defaultThinkingLevel;
 					runtimeProfileDefaultActiveIndex = profileTransition.defaultActiveIndex;
 					runtimeProfileDefaultSkips = profileTransition.defaultResolutionSkips;
 				}
@@ -15890,7 +15895,11 @@ export class AgentSession {
 				this.#resetSessionScopedModelProfileState({ forceCleanup: true });
 			}
 		}
-		if (profileAlreadyApplied) this.#modelRegistry.clearCanonicalVariant?.(this.sessionId);
+		if (profileAlreadyApplied) {
+			this.#modelRegistry.clearCanonicalVariant?.(this.sessionId);
+			if (runtimeProfileDefaultModel)
+				this.#modelRegistry.seedCanonicalVariant?.(this.sessionId, runtimeProfileDefaultModel);
+		}
 		this.#defaultFallbackController = undefined;
 		this.#preserveLoadedLegacyDefaultChain = false;
 		this.#defaultFallbackExhaustedLastTurn = false;
@@ -15934,7 +15943,8 @@ export class AgentSession {
 			this.settings.clearOverride("task.agentModelOverrides");
 			this.setActiveModelProfile(undefined);
 		}
-		const inheritedThinkingLevel = resolveThinkingLevelForModel(this.model, this.#getInheritedThinkingLevel());
+		const inheritedThinkingLevel =
+			runtimeProfileDefaultThinkingLevel ?? resolveThinkingLevelForModel(this.model, this.#getInheritedThinkingLevel());
 		this.#thinkingLevelMutationRevision++;
 		this.#thinkingLevelLiveMutationRevision++;
 		this.#pendingThinkingLevelControlSuccess = undefined;
@@ -24362,7 +24372,8 @@ export class AgentSession {
 					resumeModelBehavior === "keepSessionModel" &&
 					nextActiveModelProfile !== undefined &&
 					nextActiveModelProfileScope === "durable" &&
-					previousActiveModelProfile !== nextActiveModelProfile
+					(previousActiveModelProfile !== nextActiveModelProfile ||
+						previousActiveModelProfileScope !== nextActiveModelProfileScope)
 				) {
 					try {
 						await this.#applyRuntimeModelProfile(nextActiveModelProfile);
@@ -24464,6 +24475,7 @@ export class AgentSession {
 								credentialSessionId: this.credentialSessionId,
 							});
 							if (recovery.entries.length > 0) {
+								await this.#applyRuntimeModelProfile(recovery.profileName);
 								const recovered = await resolveModelChainWithAuth(
 									recovery.entries,
 									this.#modelRegistry,
@@ -24512,6 +24524,8 @@ export class AgentSession {
 					if (!this.model || !modelsAreEqual(this.model, resolvedModel)) {
 						this.#setModelAuthoritatively(resolvedModel, "restore");
 					}
+					if (runtimeProfileDefaultChain?.length)
+						this.#modelRegistry.seedCanonicalVariant?.(this.sessionId, resolvedModel);
 					await this.#syncEditToolModeAfterModelChange(previousEditMode);
 					// No thinking-level write here: the recompute below is the single
 					// chain-resolution restore rule. Writing the resolved suffix level

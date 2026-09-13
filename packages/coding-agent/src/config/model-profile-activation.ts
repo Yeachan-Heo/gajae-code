@@ -1359,44 +1359,70 @@ export async function prepareModelProfileActivation(
 						.find(layer => layer.scope === "durable")
 				: undefined;
 		const baseModelRoles =
-			profileScope === "durable" && lowerDurableRoleLayer
-				? restoreProfileOverrideLayer(
-						rolesAfterSessionLayers ?? previousModelRoles,
-						lowerDurableRoleLayer.modelRoles,
-					)
-				: profileScope === "session" && previousProfileScope === "durable"
-					? previousModelRoles
-					: previousProfileInstalledOverrideState &&
-							(previousProfileScope === "session" || profileScope === "durable")
-						? restoreProfileOverrideLayer(previousModelRoles, previousProfileInstalledOverrideState.modelRoles)
-						: Object.fromEntries(
-								Object.entries(previousModelRoles).filter(
-									([key]) =>
-										!(options.session.getProfileInstalledOverrideKeys?.().modelRoles ?? []).includes(key),
-								),
-							);
+			profileScope === "durable" && previousProfileScope === "session"
+				? lowerDurableRoleLayer
+					? restoreProfileOverrideLayer(
+							rolesAfterSessionLayers ?? previousModelRoles,
+							lowerDurableRoleLayer.modelRoles,
+						)
+					: (rolesAfterSessionLayers ??
+						(previousProfileInstalledOverrideState
+							? restoreProfileOverrideLayer(previousModelRoles, previousProfileInstalledOverrideState.modelRoles)
+							: previousModelRoles))
+				: profileScope === "session" && previousProfileScope === "session"
+					? (rolesAfterSessionLayers ??
+						(previousProfileInstalledOverrideState
+							? restoreProfileOverrideLayer(previousModelRoles, previousProfileInstalledOverrideState.modelRoles)
+							: previousModelRoles))
+					: profileScope === "session" && previousProfileScope === "durable"
+						? previousModelRoles
+						: previousProfileInstalledOverrideState &&
+								(previousProfileScope === "session" || profileScope === "durable")
+							? restoreProfileOverrideLayer(previousModelRoles, previousProfileInstalledOverrideState.modelRoles)
+							: Object.fromEntries(
+									Object.entries(previousModelRoles).filter(
+										([key]) =>
+											!(options.session.getProfileInstalledOverrideKeys?.().modelRoles ?? []).includes(key),
+									),
+								);
 		const baseAgentModelOverrides =
-			profileScope === "durable" && lowerDurableRoleLayer
-				? restoreProfileOverrideLayer(
-						agentOverridesAfterSessionLayers ?? previousAgentModelOverrides,
-						lowerDurableRoleLayer.agentModelOverrides,
-					)
-				: profileScope === "session" && previousProfileScope === "durable"
-					? previousAgentModelOverrides
-					: previousProfileInstalledOverrideState &&
-							(previousProfileScope === "session" || profileScope === "durable")
-						? restoreProfileOverrideLayer(
-								previousAgentModelOverrides,
-								previousProfileInstalledOverrideState.agentModelOverrides,
-							)
-						: Object.fromEntries(
-								Object.entries(previousAgentModelOverrides).filter(
-									([key]) =>
-										!(options.session.getProfileInstalledOverrideKeys?.().agentModelOverrides ?? []).includes(
-											key,
-										),
-								),
-							);
+			profileScope === "durable" && previousProfileScope === "session"
+				? lowerDurableRoleLayer
+					? restoreProfileOverrideLayer(
+							agentOverridesAfterSessionLayers ?? previousAgentModelOverrides,
+							lowerDurableRoleLayer.agentModelOverrides,
+						)
+					: (agentOverridesAfterSessionLayers ??
+						(previousProfileInstalledOverrideState
+							? restoreProfileOverrideLayer(
+									previousAgentModelOverrides,
+									previousProfileInstalledOverrideState.agentModelOverrides,
+								)
+							: previousAgentModelOverrides))
+				: profileScope === "session" && previousProfileScope === "session"
+					? (agentOverridesAfterSessionLayers ??
+						(previousProfileInstalledOverrideState
+							? restoreProfileOverrideLayer(
+									previousAgentModelOverrides,
+									previousProfileInstalledOverrideState.agentModelOverrides,
+								)
+							: previousAgentModelOverrides))
+					: profileScope === "session" && previousProfileScope === "durable"
+						? previousAgentModelOverrides
+						: previousProfileInstalledOverrideState &&
+								(previousProfileScope === "session" || profileScope === "durable")
+							? restoreProfileOverrideLayer(
+									previousAgentModelOverrides,
+									previousProfileInstalledOverrideState.agentModelOverrides,
+								)
+							: Object.fromEntries(
+									Object.entries(previousAgentModelOverrides).filter(
+										([key]) =>
+											!(
+												options.session.getProfileInstalledOverrideKeys?.().agentModelOverrides ?? []
+											).includes(key),
+									),
+								);
 
 		return {
 			profileName,
