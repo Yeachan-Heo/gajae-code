@@ -16,3 +16,4 @@
 - Successor admission is limited to tracked queued submissions, ordinary prompts remain fenced during transitions, follow-up reservations wake and reject on transition/disposal, and throwing queue lifecycle callbacks cannot strand later cleanup or deferred work.
 - History rewrites now disconnect and settle predecessor runs before fork, branch, or tree navigation commits, while automatic compaction holds the same transition lease and rearms deferred continuations only after the lease is released.
 - Public, prompt, and custom follow-ups now honor the same admission reservation fence as tracked submissions, so preflight windows cannot be overtaken by ordinary queued work.
+- Rearmed steering and TTSR follow-ups now share that cross-store fence and abort generation, preventing older deferred work from being overtaken or stale injections from running after cancellation.

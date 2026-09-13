@@ -3059,8 +3059,20 @@ export class AgentSession {
 		// each as sequential first, then restoring ahead of the existing queue,
 		// keeps the existing follow-ups' identity and per-message marks intact.
 		this.#markSteeringAsFollowUpPolicy(rearmed);
-		this.agent.restoreFollowUp(rearmed);
-		this.#followUpMessages = [...rearmedDisplays, ...this.#followUpMessages];
+		const deferredAlreadyPresent = this.#deferredSdkFollowUps.length > 0;
+		if (deferredAlreadyPresent) {
+			// Deferred follow-ups are an older cross-store FIFO head. Keep rearmed
+			// steering in that store so it cannot block the head in Agent's queue or
+			// be prepended ahead of it when this terminal reclassifies the queue.
+			for (const message of rearmed) {
+				if (this.#sequentialSteerMessages.has(message)) this.#deferredFollowUpForceOneAtATime.add(message);
+			}
+			this.#deferredSdkFollowUps.push(...rearmed);
+			this.#followUpMessages = [...this.#followUpMessages, ...rearmedDisplays];
+		} else {
+			this.agent.restoreFollowUp(rearmed);
+			this.#followUpMessages = [...rearmedDisplays, ...this.#followUpMessages];
+		}
 		for (const message of rearmed) {
 			// External SDK steers keep their promotion hook: it now fires at the
 			// follow-up promotion boundary with startsOwnRun: true.
@@ -8762,6 +8774,8 @@ export class AgentSession {
 		if (!injection) {
 			return;
 		}
+		const ttsrAbortEpoch = this.#abortEpoch;
+		const ttsrAbortSignal = this.#promptPreflightAbortController.signal;
 		const message: CustomMessage = {
 			role: "custom",
 			customType: "ttsr-injection",
@@ -8772,11 +8786,20 @@ export class AgentSession {
 			timestamp: Date.now(),
 		};
 		this.#ensureTtsrResumePromise();
-		void this.#queueFollowUpAfterReservation(message, this.#getCustomMessageTextContent(message), {
-			createDisplayEntry: false,
-			trackExternalFollowUp: false,
-		})
+		void this.#queueFollowUpAfterReservation(
+			message,
+			this.#getCustomMessageTextContent(message),
+			{
+				createDisplayEntry: false,
+				trackExternalFollowUp: false,
+			},
+			ttsrAbortSignal,
+		)
 			.then(() => {
+				if (this.#abortEpoch !== ttsrAbortEpoch || ttsrAbortSignal.aborted) {
+					this.#resolveTtsrResume();
+					return;
+				}
 				// Mark as injected after this custom message is delivered and persisted (handled in message_end).
 				// followUp() only enqueues; resume on the next tick once streaming settles.
 				this.#scheduleAgentContinue({
@@ -14030,7 +14053,9 @@ export class AgentSession {
 		message: AgentMessage,
 		displayText: string,
 		options?: QueueFollowUpOptions,
+		reservationSignal?: AbortSignal,
 	): Promise<QueuedFollowUpOwner> {
+		if (reservationSignal?.aborted) throw promptPreflightCancelledError();
 		const transitionGeneration = this.#coordinatorPersistGeneration;
 		const reservationEpoch = ++this.#followUpReservationEpoch;
 		this.#activeFollowUpReservationEpochs.add(reservationEpoch);
@@ -14044,11 +14069,12 @@ export class AgentSession {
 			if ([...this.#activeFollowUpReservationEpochs].some(epoch => epoch < reservationEpoch)) {
 				await this.#waitForEarlierFollowUpReservations(
 					reservationEpoch,
-					undefined,
+					reservationSignal,
 					undefined,
 					transitionGeneration,
 				);
 			}
+			if (reservationSignal?.aborted) throw promptPreflightCancelledError();
 			this.#assertExternalSessionIngress({
 				allowTrackedSuccessor: options?.allowDuringSessionTransition,
 				allowCancelAndSubmit: options?.allowCancelAndSubmit,

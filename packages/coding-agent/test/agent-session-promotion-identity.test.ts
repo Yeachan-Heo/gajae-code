@@ -1112,6 +1112,39 @@ describe("queued promotion run identity (#4668)", () => {
 		await session.waitForIdle();
 	});
 
+	it("keeps rearmed steering behind an older deferred SDK follow-up", async () => {
+		const fixture = buildAbortableTrackedTransitionFixture(SessionManager.inMemory(), undefined, true);
+		session = fixture.session;
+		const rearmedStarted = Promise.withResolvers<void>();
+		const unsubscribe = session.agent.subscribe(event => {
+			if (event.type !== "message_start" || event.message.role !== "user") return;
+			const content =
+				typeof event.message.content === "string"
+					? event.message.content
+					: event.message.content.map(part => (part.type === "text" ? part.text : "")).join("");
+			if (content === "rearmed steer") rearmedStarted.resolve();
+		});
+		const promptDone = session.prompt("first task").catch(() => {});
+		await fixture.firstToolStarted.promise;
+		const deferred = await session.submitUserMessage("deferred SDK", {
+			deliverAs: "followUp",
+			trackSubmission: true,
+			sdkRunCapability: createSdkRunCapability("rearmed-deferred-fifo"),
+		} as never);
+		await session.steer("rearmed steer");
+		await session.abort({ cause: "user_interrupt" });
+		await promptDone;
+		await withTimeout(fixture.secondToolStarted.promise, 5_000, "rearmed deferred successor start");
+		expect(
+			await Promise.race([rearmedStarted.promise.then(() => "started"), Bun.sleep(20).then(() => "pending")]),
+		).toBe("pending");
+		fixture.secondGate.resolve();
+		await withTimeout(deferred.terminal, 5_000, "rearmed deferred terminal");
+		await withTimeout(rearmedStarted.promise, 5_000, "rearmed steer successor start");
+		unsubscribe();
+		await session.waitForIdle();
+	});
+
 	it("holds public follow-up admission behind a tracked acceptance reservation", async () => {
 		const tool: AgentTool<typeof echoSchema, EchoParams> = {
 			name: "echo",
