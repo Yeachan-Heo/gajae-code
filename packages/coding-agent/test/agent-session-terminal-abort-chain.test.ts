@@ -1223,6 +1223,7 @@ describe("terminal abort registers a turn scope so left-running owned work class
 		await waitFor(() => !session.agent.hasQueuedSteering(), "steer consumed by its own run");
 		await waitFor(() => promoted === 1, "steer ownership hook fired");
 		expect(promoted).toBe(1);
+		await session.waitForIdle();
 	}, 30_000);
 
 	it("rejects a steering snapshot token captured for an earlier turn", async () => {
