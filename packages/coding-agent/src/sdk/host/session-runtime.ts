@@ -47,6 +47,7 @@ import {
 	type MasterRoleAttestationV2,
 	resolveSessionLocator,
 	SessionIndex,
+	type SessionIndexEvent,
 	type SessionLocatorV2,
 } from "../broker/session-index";
 import {
@@ -5873,6 +5874,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					pid: process.pid,
 					processIncarnation: effectiveIncarnation,
 				});
+				let registration: SessionIndexEvent | undefined;
 				await runtime.registerWithBroker({
 					register: async input => {
 						if (publishedEndpointUrl === undefined)
@@ -5899,7 +5901,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 							processIncarnation: effectiveIncarnation,
 							direct,
 						});
-						await index.append({
+						registration = await index.append({
 							type: "host_registered",
 							...input,
 							locator,
@@ -5911,13 +5913,17 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 						});
 					},
 					unregister: async input => {
-						await index.append({
-							type: "host_unregistered",
-							...input,
-							locator,
-							pid: process.pid,
-							...(options.lifecycleRequestId ? { lifecycleRequestId: options.lifecycleRequestId } : {}),
-						});
+						const expected = registration;
+						if (
+							!expected ||
+							expected.sessionId !== input.sessionId ||
+							expected.endpointGeneration !== input.endpointGeneration ||
+							path.resolve(expected.locator.stateRoot) !== path.resolve(input.stateRoot)
+						)
+							return;
+						// Use the successful publication's proof, never a teardown-time file read.
+						await index.unregisterIfCurrent(expected);
+						if (registration === expected) registration = undefined;
 					},
 				});
 				brokerRegistered = true;

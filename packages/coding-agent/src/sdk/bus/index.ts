@@ -90,7 +90,7 @@ import { acpFinalTextFromMessage } from "../acp/final-text";
 import { ensureBroker } from "../broker/ensure";
 import { publishSessionHostRuntimeEvidence, type SessionHostRuntimePublication } from "../broker/lifecycle";
 import { processIncarnation } from "../broker/process-incarnation";
-import { resolveSessionLocator, SessionIndex } from "../broker/session-index";
+import { resolveSessionLocator, SessionIndex, type SessionIndexEvent } from "../broker/session-index";
 import {
 	CAP_GATED_FRAME_KINDS,
 	createSdkSurfaceFactory,
@@ -8003,6 +8003,7 @@ export function createNotificationsExtension(
 						processIncarnation: hostProcessIncarnation,
 					});
 					throwIfLifecycleStopped();
+					let registration: SessionIndexEvent | undefined;
 					await host.registerWithBroker({
 						// The endpoint is written before registration. Its exact mtime
 						// binds this index generation to that discovery record.
@@ -8016,7 +8017,7 @@ export function createNotificationsExtension(
 								processIncarnation: hostProcessIncarnation,
 								direct,
 							});
-							await index.append({
+							registration = await index.append({
 								type: "host_registered",
 								...input,
 								locator,
@@ -8033,13 +8034,16 @@ export function createNotificationsExtension(
 							});
 						},
 						unregister: async input => {
-							await index.append({
-								type: "host_unregistered",
-								...input,
-								locator,
-								pid: process.pid,
-								...(lifecycleRequestId ? { lifecycleRequestId } : {}),
-							});
+							const expected = registration;
+							if (
+								!expected ||
+								expected.sessionId !== input.sessionId ||
+								expected.endpointGeneration !== input.endpointGeneration ||
+								path.resolve(expected.locator.stateRoot) !== path.resolve(input.stateRoot)
+							)
+								return;
+							await index.unregisterIfCurrent(expected);
+							if (registration === expected) registration = undefined;
 						},
 					});
 					throwIfLifecycleStopped();

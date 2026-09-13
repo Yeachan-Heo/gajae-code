@@ -4105,11 +4105,15 @@ test("reconcile_uncertain retires one dead create identity and refuses live host
 			endpointGeneration: 4,
 			pid: child.pid!,
 			endpointMtimeMs: 1,
+			endpointFileId: "1:100",
 			lifecycleRequestId: "reconcile-effect",
 			processIncarnation: processIdentity,
 			hostIncarnation: processIdentity,
 			terminalUncertain: true,
 		});
+		const uncertain = broker.index.listSessionIdentities().find(session => session.sessionId === sessionId)!;
+		const uncertainIncarnation = endpointIncarnation(uncertain, sessionId);
+		expect(uncertainIncarnation).toBeDefined();
 		const createIdentity = "reconcile-create-identity";
 		await broker.ledger.begin(createIdentity, "reconcile-create-request");
 		await broker.ledger.transition(createIdentity, "terminal_uncertain", {
@@ -4219,6 +4223,13 @@ test("reconcile_uncertain retires one dead create identity and refuses live host
 		expect(broker.index.listSessions().sessions).toEqual([
 			expect.objectContaining({ sessionId, terminal: true, terminalUncertain: false, live: false }),
 		]);
+		const terminal = broker.index.listSessionIdentities().find(session => session.sessionId === sessionId)!;
+		expect(endpointIncarnation(terminal, sessionId)).toBe(uncertainIncarnation);
+		expect(broker.index.findSessionClosedEvidence({ ...terminal, endpointFileId: "1:101" })).toBeUndefined();
+		await broker.index.snapshot();
+		const reopened = await new SessionIndex(agentDir).open();
+		const retained = reopened.listSessionIdentities().find(session => session.sessionId === sessionId)!;
+		expect(endpointIncarnation(retained, sessionId)).toBe(uncertainIncarnation);
 	} finally {
 		if (child.exitCode === null) child.kill("SIGKILL");
 		await child.exited;
@@ -5717,6 +5728,20 @@ test("production post-registration startup failure proves cleanup and exact repl
 		await broker.start();
 		const input = { cwd: root, readinessTimeoutMs: 10_000 };
 		const response = await broker.handleRequest("session.create", input, "production-startup-failure");
+		await broker.index.refresh();
+		const closed = broker.index.listSessions().sessions[0];
+		expect(closed).toBeDefined();
+		if (!closed) throw new Error("Expected the failed lifecycle host's retained identity");
+		const registration = broker.index.findHostRegistration(
+			closed.sessionId,
+			closed.endpointGeneration,
+			closed.pid,
+			closed.lifecycleRequestId,
+		);
+		expect(registration?.endpointFileId).toEqual(expect.any(String));
+		expect(closed.endpointFileId).toBe(registration?.endpointFileId);
+		if (!registration) throw new Error("Expected the original lifecycle registration");
+		expect(broker.index.hostUnregisteredAfter(registration)).toMatchObject({ indexSeq: expect.any(Number) });
 		expect(response).toMatchObject({
 			ok: false,
 			error: {
@@ -5946,7 +5971,17 @@ test("broker close acknowledges before terminating the lifecycle child and prese
 			};
 			return listed.result?.sessions?.some(session => session.sessionId === sessionId) ? true : undefined;
 		}, "session indexed before close");
-		const closed = await broker.handleRequest("session.close", { sessionId }, "close-1");
+		await broker.index.refresh();
+		const registered = broker.index.listSessionIdentities().find(session => session.sessionId === sessionId)!;
+		const registeredIncarnation = endpointIncarnation(registered, sessionId);
+		expect(registered.endpointFileId).toBeDefined();
+		expect(registeredIncarnation).toBeDefined();
+		const closeInput = {
+			sessionId,
+			endpointGeneration: registered.endpointGeneration,
+			endpointIncarnation: registeredIncarnation,
+		};
+		const closed = await broker.handleRequest("session.close", closeInput, "close-1");
 		expect(closed).toMatchObject({ ok: true, result: { sessionId } });
 		expect(await child.exited).toBe(0);
 		expect(await broker.handleRequest("session.get_endpoint", { sessionId })).toMatchObject({
@@ -5960,14 +5995,68 @@ test("broker close acknowledges before terminating the lifecycle child and prese
 			ok: true,
 			result: { sessions: [expect.objectContaining({ sessionId, terminal: true, live: false })] },
 		});
-		expect(
-			(await fs.readFile(path.join(agentDir, "sdk", "sessions", "index.jsonl"), "utf8"))
-				.split("\n")
-				.filter(Boolean)
-				.map(line => JSON.parse(line) as { type?: string; sessionId?: string })
-				.at(-1),
-		).toMatchObject({ type: "host_unregistered", sessionId });
-		expect(await broker.handleRequest("session.close", { sessionId }, "close-1")).toEqual(closed);
+		const events = (await fs.readFile(path.join(agentDir, "sdk", "sessions", "index.jsonl"), "utf8"))
+			.split("\n")
+			.filter(Boolean)
+			.map(line => JSON.parse(line) as SessionIndexEvent);
+		const unregistered = events.findLast(
+			event => event.type === "host_unregistered" && event.sessionId === sessionId,
+		)!;
+		expect(unregistered).toMatchObject({
+			type: "host_unregistered",
+			sessionId,
+			endpointFileId: registered.endpointFileId,
+			endpointMtimeMs: registered.endpointMtimeMs,
+			lifecycleRequestId: registered.lifecycleRequestId,
+		});
+		expect(unregistered.hostIncarnation).toBe(registered.hostIncarnation);
+		expect(unregistered.processIncarnation).toBe(registered.processIncarnation);
+		expect(endpointIncarnation(unregistered, sessionId)).toBe(registeredIncarnation);
+		await broker.index.refresh();
+		const terminal = broker.index.listSessionIdentities().find(session => session.sessionId === sessionId)!;
+		expect(endpointIncarnation(terminal, sessionId)).toBe(registeredIncarnation);
+		await broker.index.snapshot();
+		const reopened = await new SessionIndex(agentDir).open();
+		const retained = reopened.listSessionIdentities().find(session => session.sessionId === sessionId)!;
+		expect(retained).toMatchObject({ terminal: true, live: false });
+		expect(endpointIncarnation(retained, sessionId)).toBe(registeredIncarnation);
+		expect(await broker.handleRequest("session.close", closeInput, "close-1")).toEqual(closed);
+	} finally {
+		await broker.stop();
+		await fs.rm(root, { recursive: true, force: true });
+	}
+}, 20_000);
+
+test("delayed lifecycle host cleanup does not unregister a file-only same-generation successor", async () => {
+	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-sdk-close-successor-"));
+	const agentDir = path.join(root, "agent");
+	const sessionId = "close-successor";
+	const broker = new Broker({ agentDir });
+	try {
+		await broker.start();
+		const { child } = await liveLifecycleSession(root, agentDir, sessionId);
+		const registered = await waitFor(async () => {
+			await broker.index.refresh();
+			return broker.index.listSessionIdentities().find(session => session.sessionId === sessionId);
+		}, "host registration before successor publication");
+		expect(registered.endpointFileId).toBeDefined();
+		// Stop background sweeps so only the old host's real teardown writer can
+		// publish retirement while its saved registration loses authority.
+		await broker.stop();
+		const successor = await broker.index.append({
+			...registered,
+			type: "host_registered",
+			endpointFileId: `${registered.endpointFileId}-successor`,
+		});
+		child.kill("SIGTERM");
+		expect(await child.exited).toBe(0);
+		const reopened = await new SessionIndex(agentDir).open();
+		expect(reopened.indexSeq).toBe(successor.indexSeq);
+		const current = reopened.listSessionIdentities().find(session => session.sessionId === sessionId)!;
+		expect(current).toMatchObject({ terminal: false, endpointFileId: successor.endpointFileId });
+		expect(endpointIncarnation(current, sessionId)).toBe(endpointIncarnation(successor, sessionId));
+		expect(reopened.hostUnregisteredAfter(registered)).toBeUndefined();
+		expect(reopened.hostUnregisteredAfter(successor)).toBeUndefined();
 	} finally {
 		await broker.stop();
 		await fs.rm(root, { recursive: true, force: true });

@@ -2404,6 +2404,7 @@ async function executeUncertainRetirement(
 					...(record.processIncarnation === undefined ? {} : { processIncarnation: record.processIncarnation }),
 					...(record.hostIncarnation === undefined ? {} : { hostIncarnation: record.hostIncarnation }),
 					...(record.endpointMtimeMs === undefined ? {} : { endpointMtimeMs: record.endpointMtimeMs }),
+					...(record.endpointFileId === undefined ? {} : { endpointFileId: record.endpointFileId }),
 					...(record.lifecycleRequestId === undefined ? {} : { lifecycleRequestId: record.lifecycleRequestId }),
 				});
 				const verifiedIndexSeq = broker.index.findSessionClosedEvidence(record);
@@ -3499,6 +3500,14 @@ async function recordTerminalUncertain(
 			...(registered.processIncarnation === undefined ? {} : { processIncarnation: registered.processIncarnation }),
 			...(registered.hostIncarnation === undefined ? {} : { hostIncarnation: registered.hostIncarnation }),
 			...(registered.endpointMtimeMs === undefined ? {} : { endpointMtimeMs: registered.endpointMtimeMs }),
+			...(registered.endpointFileId !== undefined &&
+			registered.pid === pid &&
+			path.resolve(registered.locator.stateRoot) === path.resolve(root) &&
+			expected !== undefined &&
+			registered.lifecycleRequestId === expected.effectMarker &&
+			(registered.hostIncarnation ?? registered.processIncarnation) === expected.incarnation
+				? { endpointFileId: registered.endpointFileId }
+				: {}),
 			...(registered.lifecycleRequestId === undefined
 				? expected?.effectMarker === undefined
 					? {}
