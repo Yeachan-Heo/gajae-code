@@ -3093,6 +3093,16 @@ export class AgentSession {
 			}
 		}
 		flushBatch();
+		this.#markTrackedFollowUpSequential(messages);
+	}
+	#markTrackedFollowUpSequential(messages: readonly AgentMessage[]): void {
+		if (messages.length === 0 || this.#trackedQueuedInputs.size === 0) return;
+		const trackedMessages = new Set(messages);
+		for (const state of this.#trackedQueuedInputs.values()) {
+			if (state.queuePolicy === "sequential" && state.message !== undefined && trackedMessages.has(state.message)) {
+				this.agent.markFollowUpSequential(state.message);
+			}
+		}
 	}
 	#fireQueuedPromotionHooks(messages: readonly AgentMessage[], promotion?: { startsOwnRun?: boolean }): void {
 		let callbackError: unknown;
@@ -3127,13 +3137,23 @@ export class AgentSession {
 				...this.agent.snapshotSteering(),
 				...this.agent.snapshotFollowUp(),
 				...this.#deferredSdkFollowUps,
+				...this.#pendingNextTurnMessages.map(entry => entry.message),
 			]),
 		];
 	}
 	/** Settle consumed tracked work before a maintenance path disconnects Agent events. */
 	#settleTrackedQueuedInputsBeforeAgentDisconnect(): void {
+		const queued = new Set([
+			...this.agent.snapshotSteering(),
+			...this.agent.snapshotFollowUp(),
+			...this.#deferredSdkFollowUps,
+		]);
 		for (const state of [...this.#trackedQueuedInputs.values()]) {
-			if (state.executionSettled || this.#trackedQueuedInputsAwaitingOwnRun.has(state)) {
+			if (
+				state.executionSettled ||
+				this.#trackedQueuedInputsAwaitingOwnRun.has(state) ||
+				(state.message !== undefined && !queued.has(state.message))
+			) {
 				this.#settleTrackedQueuedInputRemoved(state, "removed");
 			}
 		}
@@ -3185,6 +3205,7 @@ export class AgentSession {
 	): void {
 		if (messages.length > 0) {
 			this.#fireQueuedRemovalHooks(messages);
+			this.#settleDeliveredOwnedRegistrations(messages);
 			for (const message of messages) this.#sdkRunTokensByQueuedMessage.delete(message);
 			this.#deferredSdkFollowUps = this.#deferredSdkFollowUps.filter(message => !messages.includes(message));
 		}
@@ -3854,6 +3875,36 @@ export class AgentSession {
 	}
 
 	/**
+	 * Reject public work that would enter a session while its identity or
+	 * delivery owner is being changed. The only exception is a tracked
+	 * submitUserMessage issued by the committed successor hook; that capability
+	 * is checked by the caller and is intentionally narrower than the general
+	 * successor-hook context.
+	 */
+	#assertExternalSessionIngress(options?: {
+		allowTrackedSuccessor?: boolean;
+		allowCancelAndSubmit?: boolean;
+	}): void {
+		this.#assertSessionAdmissionOpen();
+		if (this.#cancelAndSubmitInProgress && options?.allowCancelAndSubmit !== true) {
+			throw Object.assign(new AgentBusyError("Cannot submit work while cancel-and-submit is in progress."), {
+				code: "busy",
+			});
+		}
+		if (
+			(this.#sessionTransitionKind !== undefined || this.#handoffTransitionActive) &&
+			!(options?.allowTrackedSuccessor && this.#hasCommittedSuccessorAdmission())
+		) {
+			throw Object.assign(
+				new AgentBusyError(
+					`Cannot submit work while ${this.#sessionTransitionKind ?? "a handoff"} is in progress.`,
+				),
+				{ code: "busy" },
+			);
+		}
+	}
+
+	/**
 	 * Reject a turn start while a handoff transition owns the session. Handoff never
 	 * routes its own generation/injection through these turn-start chokepoints, and
 	 * auto-maintenance runs before the fence, so this fences only external entrants
@@ -3870,14 +3921,17 @@ export class AgentSession {
 
 	/**
 	 * Single, synchronously-acquired mutex for session-identity transitions
-	 * (handoff, compact, new/switch/branch/clear, fork, tree navigation). Acquired
+	 * (handoff, manual/automatic compact, new/switch/branch/clear, fork, tree navigation). Acquired
 	 * BEFORE any await at each transition's entry and released in its finally, so
 	 * exclusion is symmetric regardless of which transition starts first — an
 	 * operation that began earlier and yielded still owns the lease when a peer
-	 * tries to start. Auto-handoff acquires it via handoff() (the maintenance
-	 * orchestrator does not hold it), so there is no self-deadlock.
+	 * tries to start. Auto-handoff acquires it via handoff() while automatic
+	 * context-full maintenance acquires it in its own flow, so neither path
+	 * exposes an unowned history rewrite.
 	 */
 	#sessionTransitionKind: string | undefined;
+	#queuedDeliveryPendingWhileTransition = false;
+	#deferredAutoContinueDuringTransition: (() => void) | undefined;
 	#coordinatorPersistGeneration = 0;
 	#coordinatorRescopeBarrier: Promise<void> | undefined;
 	#releaseCoordinatorRescopeBarrier: (() => void) | undefined;
@@ -3940,15 +3994,30 @@ export class AgentSession {
 	}
 
 	#beginSessionTransition(kind: string): void {
+		if (this.#cancelAndSubmitInProgress) {
+			throw Object.assign(new AgentBusyError(`Cannot start ${kind} during cancel-and-submit.`), { code: "busy" });
+		}
 		if (this.#sessionTransitionKind !== undefined) {
 			throw Object.assign(
-				new Error(`Cannot start ${kind} while a ${this.#sessionTransitionKind} transition is in progress.`),
+				new AgentBusyError(`Cannot start ${kind} while a ${this.#sessionTransitionKind} transition is in progress.`),
 				{ code: "busy" },
 			);
 		}
 		this.#sessionTransitionKind = kind;
 		this.#coordinatorPersistGeneration += 1;
 		this.#wakeFollowUpReservationTransitionWaiters();
+	}
+
+	async #settleActivePromptForHistoryTransition(): Promise<void> {
+		if (this.#livePromptsInFlight() > 0 || this.agent.state.isStreaming) {
+			await this.abort({ cause: "session_switch" });
+		}
+		const activeAdmission = this.#activeSessionAdmission;
+		if (activeAdmission?.kind === "prompt") {
+			if (this.#livePromptsInFlight() === 0 && !this.agent.state.isStreaming)
+				this.cancelPendingPreflightForTerminalAbort();
+			await activeAdmission.settled.promise;
+		}
 	}
 
 	#wakeFollowUpReservationTransitionWaiters(): void {
@@ -3959,6 +4028,15 @@ export class AgentSession {
 
 	#endSessionTransition(): void {
 		this.#sessionTransitionKind = undefined;
+		const deferredAutoContinue = this.#deferredAutoContinueDuringTransition;
+		this.#deferredAutoContinueDuringTransition = undefined;
+		if (!this.#isDisposed && !this.#sessionAdmissionClosing) deferredAutoContinue?.();
+		if (this.#queuedDeliveryPendingWhileTransition) {
+			this.#queuedDeliveryPendingWhileTransition = false;
+			if (!this.#isDisposed && !this.#sessionAdmissionClosing && !this.#cancelAndSubmitInProgress) {
+				this.#scheduleQueuedDelivery();
+			}
+		}
 	}
 
 	#runCommittedSuccessorHook<T>(body: () => Promise<T>): Promise<T> {
@@ -4544,6 +4622,11 @@ export class AgentSession {
 			requesterSignal?.addEventListener("abort", onAbort, { once: true });
 			admissionSignal?.addEventListener("abort", onAbort, { once: true });
 			this.#followUpReservationTransitionWaiters.add(transition.resolve);
+			// The transition/abort signal can change between the checks above and
+			// registering these waiters. Re-check after registration so a wake that
+			// happened in that gap cannot leave this reservation parked forever.
+			if (requesterSignal?.aborted || admissionSignal?.aborted) abort.resolve();
+			if (this.#coordinatorPersistGeneration !== transitionGeneration) transition.resolve();
 			try {
 				await Promise.race([drained.promise, abort.promise, transition.promise]);
 				if (requesterSignal?.aborted || admissionSignal?.aborted) throw promptPreflightCancelledError();
@@ -5157,7 +5240,8 @@ export class AgentSession {
 		this.#setGuardedAgentTools(this.agent.state.tools);
 		this.#bindWorkflowGateEmitter();
 		this.yieldQueue = new YieldQueue({
-			isStreaming: () => this.isStreaming || this.#handoffTransitionActive,
+			isStreaming: () =>
+				this.isStreaming || this.#sessionTransitionKind !== undefined || this.#handoffTransitionActive,
 			injectStreaming: message => {
 				// Mandated boundary comment (corrected turn semantics): turn-scope
 				// abort blocks only deliveries whose origin is a continuation of the
@@ -6140,6 +6224,7 @@ export class AgentSession {
 	 *  Does NOT push to the agent's steering/followUp queue — that happens
 	 *  separately inside `sendCustomMessage`. */
 	enqueueCustomMessageDisplay(text: string, mode: "steer" | "followUp"): string {
+		this.#assertExternalSessionIngress();
 		const tag = `gjc-cmd-${Date.now()}-${++this.#customDisplayTagCounter}`;
 		const displayText = text.trim();
 		if (!displayText) return tag;
@@ -7036,10 +7121,14 @@ export class AgentSession {
 				if (followUpBoundIndex !== -1) this.#followUpMessages.splice(followUpBoundIndex, 1);
 				else if (messageText) {
 					// Legacy display rows without a bound executable message retain text fallback.
-					const steeringIndex = this.#steeringMessages.findIndex(entry => entry.text === messageText);
+					const steeringIndex = this.#steeringMessages.findIndex(
+						entry => entry.message === undefined && entry.text === messageText,
+					);
 					if (steeringIndex !== -1) this.#steeringMessages.splice(steeringIndex, 1);
 					else {
-						const followUpIndex = this.#followUpMessages.findIndex(entry => entry.text === messageText);
+						const followUpIndex = this.#followUpMessages.findIndex(
+							entry => entry.message === undefined && entry.text === messageText,
+						);
 						if (followUpIndex !== -1) this.#followUpMessages.splice(followUpIndex, 1);
 					}
 				}
@@ -8043,6 +8132,10 @@ export class AgentSession {
 										skip("queue_drained");
 										return false;
 									}
+									if (this.#sessionTransitionKind !== undefined || this.#handoffTransitionActive) {
+									skip("handoff_in_progress");
+										return false;
+									}
 									if (options?.shouldContinue && !options.shouldContinue()) {
 										skip("queue_drained");
 										return false;
@@ -8304,6 +8397,18 @@ export class AgentSession {
 		deferredPredecessorAgentEnd?: AgentSessionEvent,
 		sdkRunToken?: string,
 	): void {
+		if (this.#sessionTransitionKind !== undefined || this.#handoffTransitionActive) {
+			this.#deferredAutoContinueDuringTransition = () =>
+				this.#scheduleAutoContinuePrompt(
+					generation,
+					requireUnfinishedWork,
+					resourceRunId,
+					deferredSelectionFenceGeneration,
+					deferredPredecessorAgentEnd,
+					sdkRunToken,
+				);
+			return;
+		}
 		const scheduledGeneration = generation;
 		const scheduledSdkRunToken =
 			sdkRunToken ??
@@ -8322,6 +8427,10 @@ export class AgentSession {
 					"auto_continue_prompt",
 					this.#isDisposed ? "session_disposed" : "generation_changed",
 				);
+				return false;
+			}
+			if (this.#sessionTransitionKind !== undefined || this.#handoffTransitionActive) {
+				this.#logCompactionContinuationSkipped("auto_continue_prompt", "session_transition");
 				return false;
 			}
 			// A same-turn auto-continue of a terminally aborted turn is denied
@@ -11525,7 +11634,7 @@ export class AgentSession {
 
 	/** Main startup calls this exactly once, after a strict open returned `kind: "opened"`. */
 	async continuePersistedHistory(): Promise<void> {
-		this.#assertNoHandoffTransition();
+		this.#assertExternalSessionIngress();
 		this.#assertRecoveryHydrationPromoted();
 		this.#removeEphemeralCustomMessages();
 
@@ -11568,7 +11677,7 @@ export class AgentSession {
 			// Re-check after the awaited preparation: a handoff can engage during the
 			// volatile-context/hindsight awaits above and this would otherwise start a
 			// turn against the session being handed off.
-			this.#assertNoHandoffTransition();
+			this.#assertExternalSessionIngress();
 			await this.agent.continue({
 				...this.#managedFallbackPromptOptions(),
 				onRunAccepted: (handle: AttemptRunHandle) => {
@@ -12562,6 +12671,7 @@ export class AgentSession {
 			? { ...options, ...(sdkRunToken ? { sdkRunToken } : {}) }
 			: undefined;
 		this.#assertRecoveryHydrationPromoted();
+		this.#assertExternalSessionIngress();
 		const owner = this.#sessionAdmissionContext.getStore();
 		if (owner && !owner.released) throw this.#sessionAdmissionBusyError();
 		const expandPromptTemplates = options?.expandPromptTemplates ?? true;
@@ -12683,8 +12793,10 @@ export class AgentSession {
 			if (workflowIntentDiff) {
 				this.sessionManager.appendCustomEntry(WORKFLOW_INTENT_DIFF_CUSTOM_TYPE, workflowIntentDiff);
 			}
+			this.#assertExternalSessionIngress();
 			if (options?.onPreflightAcceptCommit) await options.onPreflightAcceptCommit();
 			else options?.onPreflightAccepted?.();
+			this.#assertExternalSessionIngress();
 			return;
 		}
 
@@ -12716,8 +12828,10 @@ export class AgentSession {
 					if (workflowIntentDiff) {
 						this.sessionManager.appendCustomEntry(WORKFLOW_INTENT_DIFF_CUSTOM_TYPE, workflowIntentDiff);
 					}
+					this.#assertExternalSessionIngress();
 					if (options?.onPreflightAcceptCommit) await options.onPreflightAcceptCommit();
 					else options?.onPreflightAccepted?.();
+					this.#assertExternalSessionIngress();
 					return;
 				}
 				this.#throwIfPromptPreflightCancelled(admissionGeneration, admissionSignal);
@@ -12905,6 +13019,7 @@ export class AgentSession {
 		const internalOptions: InternalCustomMessageOptions | undefined = options
 			? { ...options, ...(sdkRunToken ? { sdkRunToken } : {}) }
 			: undefined;
+		this.#assertExternalSessionIngress();
 		if (options?.preflightSignal?.aborted) throw promptPreflightCancelledError();
 		const textContent =
 			typeof message.content === "string"
@@ -12964,9 +13079,11 @@ export class AgentSession {
 						await activationSeed?.rollback();
 						throw promptPreflightCancelledError();
 					}
+					this.#assertExternalSessionIngress();
 					if (options?.onPreflightAcceptCommit) await options.onPreflightAcceptCommit();
 					else options?.onPreflightAccepted?.();
 					durableAcceptanceCompleted = true;
+					this.#assertExternalSessionIngress();
 					if (options?.preflightSignal?.aborted) {
 						await activationSeed?.rollback();
 						throw promptPreflightCancelledError();
@@ -13403,10 +13520,12 @@ export class AgentSession {
 			await this.#promptAgentWithIdleRetry(preSubmit, agentPromptOptions, predecessorAgentEndHold, {
 				signal: preflightSignal,
 				resourceRunId: this.#runResourceLeaseContext.getStore()?.resourceRunId,
-				onPreflightAccepted: () => {
+				onPreflightAccepted: async () => {
+					this.#assertExternalSessionIngress({ allowCancelAndSubmit: true });
 					this.#throwIfPromptPreflightCancelled(generation, preflightSignal);
-					if (options?.onPreflightAcceptCommit) return options.onPreflightAcceptCommit();
-					options?.onPreflightAccepted?.();
+					if (options?.onPreflightAcceptCommit) await options.onPreflightAcceptCommit();
+					else options?.onPreflightAccepted?.();
+					this.#assertExternalSessionIngress({ allowCancelAndSubmit: true });
 				},
 			});
 			const activeTerminalScope = this.#activeAttemptScope;
@@ -13666,6 +13785,7 @@ export class AgentSession {
 		if (typeof text !== "string" || (text.trim().length === 0 && !hasUsableImage))
 			throw Object.assign(new Error("Prompt must not be empty."), { code: "invalid_input" });
 		this.#assertRecoveryHydrationPromoted();
+		this.#assertExternalSessionIngress({ allowCancelAndSubmit: true });
 		if (text.startsWith("/")) {
 			this.#throwIfExtensionCommand(text);
 		}
@@ -13674,7 +13794,10 @@ export class AgentSession {
 		if (expandedText.trim().length === 0 && !hasUsableImage)
 			throw Object.assign(new Error("Prompt must not be empty."), { code: "invalid_input" });
 		assertImagePlaceholdersHavePayload(expandedText, images);
-		await this.#queueSteer(expandedText, images, { claimsGenuineUserIntent: true });
+		await this.#queueSteer(expandedText, images, {
+			claimsGenuineUserIntent: true,
+			allowCancelAndSubmit: true,
+		});
 	}
 
 	/**
@@ -13690,6 +13813,7 @@ export class AgentSession {
 		if (typeof text !== "string" || (text.trim().length === 0 && !hasUsableImage))
 			throw Object.assign(new Error("Prompt must not be empty."), { code: "invalid_input" });
 		this.#assertRecoveryHydrationPromoted();
+		this.#assertExternalSessionIngress({ allowCancelAndSubmit: true });
 		if (text.startsWith("/")) {
 			this.#throwIfExtensionCommand(text);
 		}
@@ -13701,6 +13825,7 @@ export class AgentSession {
 		await this.#queueFollowUp(expandedText, images, {
 			forceOneAtATime: options?.followUpQueuePolicy === "sequential",
 			claimsGenuineUserIntent: true,
+			allowCancelAndSubmit: true,
 		});
 	}
 
@@ -13718,9 +13843,14 @@ export class AgentSession {
 			external?: boolean;
 			sdkRunToken?: string;
 			forceOneAtATime?: boolean;
+			allowDuringSessionTransition?: boolean;
+			allowCancelAndSubmit?: boolean;
 		},
 	): Promise<QueuedFollowUpOwner> {
-		this.#assertNoHandoffTransition();
+		this.#assertExternalSessionIngress({
+			allowTrackedSuccessor: options?.allowDuringSessionTransition,
+			allowCancelAndSubmit: options?.allowCancelAndSubmit,
+		});
 		assertImagePlaceholdersHavePayload(text, images);
 		const displayText = text || (images && images.length > 0 ? "[Image]" : "");
 		const content: (TextContent | ImageContent)[] = [{ type: "text", text }];
@@ -13744,6 +13874,8 @@ export class AgentSession {
 					options?.onQueued?.(message);
 				},
 				onQueuedAfterAdmission: options?.onQueuedAfterAdmission,
+					allowDuringSessionTransition: options?.allowDuringSessionTransition,
+				allowCancelAndSubmit: options?.allowCancelAndSubmit,
 			});
 			this.#scheduleNonAdmittedQueuedContinuation();
 			return queuedFollowUp;
@@ -13818,7 +13950,12 @@ export class AgentSession {
 	 * run that would have polled the queue is gone, so nothing else owns it.
 	 */
 	#scheduleQueuedDelivery(delayMs?: number): void {
-		if (this.#cancelAndSubmitInProgress || !this.#canDeliverQueuedMessages()) return;
+		if (this.#cancelAndSubmitInProgress) return;
+		if (this.#sessionTransitionKind !== undefined || this.#handoffTransitionActive) {
+			this.#queuedDeliveryPendingWhileTransition = true;
+			return;
+		}
+		if (!this.#canDeliverQueuedMessages()) return;
 		this.#scheduleAgentContinue({
 			...(delayMs === undefined ? {} : { delayMs }),
 			shouldContinue: () => this.#canDeliverQueuedMessages() && this.agent.hasQueuedMessages(),
@@ -13841,9 +13978,14 @@ export class AgentSession {
 			onQueued?: (message: AgentMessage) => void;
 			scheduleNonAdmittedWake?: boolean;
 			onQueuedAfterAdmission?: (message: AgentMessage, cancelQueued: () => boolean) => void;
+			allowDuringSessionTransition?: boolean;
+			allowCancelAndSubmit?: boolean;
 		},
 	): Promise<QueuedFollowUpOwner> {
-		this.#assertNoHandoffTransition();
+		this.#assertExternalSessionIngress({
+			allowTrackedSuccessor: options?.allowDuringSessionTransition,
+			allowCancelAndSubmit: options?.allowCancelAndSubmit,
+		});
 		assertImagePlaceholdersHavePayload(text, images);
 		const displayText = text || (images && images.length > 0 ? "[Image]" : "");
 		const queueWasEmpty = !this.agent.hasQueuedMessages();
@@ -13860,6 +14002,17 @@ export class AgentSession {
 			this.#deepInterviewGenuineUserMessageEpochs.set(message, epoch);
 		}
 		if (options?.sdkRunToken) this.#sdkRunTokensByQueuedMessage.set(message, options.sdkRunToken);
+		// If an older SDK follow-up is deferred while the Agent is idle, release
+		// that head before parking this newer message. Otherwise the newer message
+		// would enter the live queue first and invert SDK FIFO ownership.
+		if (
+			options?.sdkRunToken &&
+			!this.agent.state.isStreaming &&
+			!this.agent.hasQueuedMessages() &&
+			this.#deferredSdkFollowUps.length > 0
+		) {
+			this.#releaseDeferredSdkFollowUps();
+		}
 		const owner: QueuedFollowUpOwner = {
 			cancel: () => {
 				const deferredIndex = this.#deferredSdkFollowUps.indexOf(message);
@@ -13884,7 +14037,13 @@ export class AgentSession {
 			},
 		};
 		options?.onQueuedAfterAdmission?.(message, owner.cancel);
-		if (options?.sdkRunToken && (this.agent.state.isStreaming || this.agent.hasQueuedMessages())) {
+		// Existing deferred SDK work is part of the same FIFO even when the Agent
+		// queue is currently empty. Enqueuing a newer successor directly into the
+		// Agent in that state would let it run before the older deferred request.
+		if (
+			options?.sdkRunToken &&
+			(this.agent.state.isStreaming || this.agent.hasQueuedMessages() || this.#deferredSdkFollowUps.length > 0)
+		) {
 			this.#deferredSdkFollowUps.push(message);
 		} else {
 			this.agent.followUp(message, options?.forceOneAtATime ? { forceOneAtATime: true } : undefined);
@@ -13907,6 +14066,10 @@ export class AgentSession {
 		const message = this.#deferredSdkFollowUps.shift();
 		if (!message) return false;
 		this.agent.followUp(message, { forceOneAtATime: true });
+		if (this.#sessionTransitionKind !== undefined || this.#handoffTransitionActive) {
+			this.#queuedDeliveryPendingWhileTransition = true;
+			return true;
+		}
 		this.#scheduleAgentContinue({
 			shouldContinue: () => this.#canDeliverQueuedMessages() && this.agent.hasQueuedMessages(),
 			rescheduleOnBusy: true,
@@ -13919,6 +14082,7 @@ export class AgentSession {
 	 */
 	#canAutoContinueForFollowUp(): boolean {
 		if (this.#abortUnwind) return false;
+		if (this.#sessionTransitionKind !== undefined || this.#handoffTransitionActive) return false;
 		if (this.isStreaming) return false;
 		if (this.isCompacting) return false;
 		if (this.isBashRunning) return false;
@@ -13954,6 +14118,7 @@ export class AgentSession {
 	 */
 	#canDeliverQueuedMessages(): boolean {
 		if (this.#abortUnwind) return false;
+		if (this.#sessionTransitionKind !== undefined || this.#handoffTransitionActive) return false;
 		if (this.agent.state.isStreaming) return false;
 		if (this.isRetrying) return false;
 		if (this.isCompacting) return false;
@@ -13971,6 +14136,7 @@ export class AgentSession {
 	 */
 	#canAutoContinueForSteer(): boolean {
 		if (this.#abortUnwind) return false;
+		if (this.#sessionTransitionKind !== undefined || this.#handoffTransitionActive) return false;
 		if (this.agent.state.isStreaming) return false;
 		if (this.isRetrying) return false;
 		const messages = this.agent.state.messages;
@@ -13986,11 +14152,13 @@ export class AgentSession {
 	}
 
 	queueDeferredMessage(message: CustomMessage): void {
-		this.#queueHiddenNextTurnMessage(message, true, "turn");
+		this.#assertExternalSessionIngress({ allowCancelAndSubmit: true });
+		this.#queueHiddenNextTurnMessage(message, true, "turn", true);
 	}
 
 	queueDeferredMessageForTests(message: CustomMessage, triggerTurn = true): void {
-		this.#queueHiddenNextTurnMessage(message, triggerTurn, "turn");
+		this.#assertExternalSessionIngress({ allowCancelAndSubmit: true });
+		this.#queueHiddenNextTurnMessage(message, triggerTurn, "turn", true);
 	}
 
 	/** Read-only test seam for the hidden next-turn context queue. */
@@ -14007,11 +14175,12 @@ export class AgentSession {
 		message: CustomMessage,
 		triggerTurn: boolean,
 		origin: "turn" | "external" = "external",
+		allowCancelAndSubmit = false,
 	): void {
 		// A hidden next-turn message queued during a handoff transition would be
 		// dropped when the successor clears predecessor queues; reject it as busy so
 		// the caller can retry against the settled session.
-		this.#assertNoHandoffTransition();
+		this.#assertExternalSessionIngress({ allowCancelAndSubmit });
 		this.#pendingNextTurnMessages.push({ message, origin });
 		if (!triggerTurn) return;
 		const generation = this.#promptGeneration;
@@ -14175,7 +14344,7 @@ export class AgentSession {
 	 *  monitor's registration, so removing it after an intermediate notification
 	 *  would let a later scope:"owned" abort miss the monitor and make subsequent
 	 *  notifications lose their envelope (review thread P1). */
-	#settleDeliveredOwnedRegistrations(messages: AgentMessage[]): void {
+	#settleDeliveredOwnedRegistrations(messages: readonly AgentMessage[]): void {
 		// Use the SESSION-OWNED manager first: the process-global instance is
 		// the last-created session, so checking this session's delivery against
 		// another session's manager (which lacks the same local job id) would
@@ -14284,6 +14453,7 @@ export class AgentSession {
 		},
 	): Promise<void> {
 		this.#assertRecoveryHydrationPromoted();
+		this.#assertExternalSessionIngress();
 		const appMessage: CustomMessage<T> = {
 			role: "custom",
 			customType: message.customType,
@@ -14546,9 +14716,10 @@ export class AgentSession {
 		const submissionTransitionGeneration = this.#coordinatorPersistGeneration;
 		const internalOptions = options ? { ...options, ...(sdkRunToken ? { sdkRunToken } : {}) } : undefined;
 		this.#assertRecoveryHydrationPromoted();
+		const trackedSuccessorAdmission = this.#hasCommittedSuccessorTrackedAdmission(options);
+		this.#assertExternalSessionIngress({ allowTrackedSuccessor: trackedSuccessorAdmission });
 		const owner = this.#sessionAdmissionContext.getStore();
-		if (owner && !owner.released) throw this.#sessionAdmissionBusyError();
-		this.#assertSessionAdmissionOpen();
+		if (owner && !owner.released && !trackedSuccessorAdmission) throw this.#sessionAdmissionBusyError();
 		if (options?.preflightSignal?.aborted) throw promptPreflightCancelledError();
 		if (typeof content !== "string" && !Array.isArray(content)) {
 			throw Object.assign(new Error("sendUserMessage requires string or content-array content."), {
@@ -14590,14 +14761,8 @@ export class AgentSession {
 			throw Object.assign(new Error("trackSubmission requires deliverAs: steer or followUp."), {
 				code: "invalid_input",
 			});
-		const trackedQueuedInput =
-			options?.trackSubmission === true && options.deliverAs !== undefined
-				? this.#createTrackedQueuedInput(options.deliverAs, options.queuePolicy ?? "respect-mode")
-				: undefined;
-		const onTrackedQueued = trackedQueuedInput
-			? (message: AgentMessage, cancelQueued: () => boolean) =>
-					this.#admitTrackedQueuedInput(trackedQueuedInput, message, cancelQueued)
-			: undefined;
+		let trackedQueuedInput: TrackedQueuedInput | undefined;
+		let onTrackedQueued: ((message: AgentMessage, cancelQueued: () => boolean) => void) | undefined;
 		const onQueuedPromoted = (promotion: { startsOwnRun?: boolean; removed?: boolean }): void => {
 			if (trackedQueuedInput) this.#handleTrackedQueuedInputPromotion(trackedQueuedInput, promotion);
 			options?.onQueuedPromoted?.(promotion);
@@ -14668,7 +14833,7 @@ export class AgentSession {
 				await awaitPromptInvocationPreflight(this.#selectionFenceTail, admissionSignal);
 			}
 			const assertPreflightStillOpen = () => {
-				this.#assertSessionAdmissionOpen();
+				this.#assertExternalSessionIngress({ allowTrackedSuccessor: trackedSuccessorAdmission });
 				if (
 					(this.#sessionTransitionKind !== undefined ||
 						this.#coordinatorPersistGeneration !== submissionTransitionGeneration) &&
@@ -14705,6 +14870,14 @@ export class AgentSession {
 				assertPreflightStillOpen();
 				if (options?.onPreflightAcceptCommit) await options.onPreflightAcceptCommit();
 				assertPreflightStillOpen();
+				if (options?.trackSubmission === true) {
+					trackedQueuedInput = this.#createTrackedQueuedInput(
+						deliverAs,
+						options.queuePolicy ?? "respect-mode",
+					);
+					onTrackedQueued = (message: AgentMessage, cancelQueued: () => boolean) =>
+						this.#admitTrackedQueuedInput(trackedQueuedInput!, message, cancelQueued);
+				}
 				const queuedFollowUp = await this.#queueFollowUp(text, images, {
 					claimsGenuineUserIntent: true,
 					forceOneAtATime: Boolean(
@@ -14713,12 +14886,16 @@ export class AgentSession {
 					onPromoted: onQueuedPromoted,
 					sdkRunToken: internalOptions?.sdkRunToken,
 					onQueuedAfterAdmission: onTrackedQueued,
+					allowDuringSessionTransition: this.#hasCommittedSuccessorTrackedAdmission(options),
 				});
 				this.#bindPreflightAbortCancellation(options?.preflightSignal, queuedFollowUp);
 				try {
+					assertPreflightStillOpen();
 					options?.onPreflightAccepted?.();
+					assertPreflightStillOpen();
 				} catch (error) {
 					if (trackedQueuedInput) this.#settleTrackedAdmissionCallbackFailure(trackedQueuedInput, queuedFollowUp);
+					else queuedFollowUp.cancel();
 					throw error;
 				}
 				return trackedQueuedInput?.submission;
@@ -14726,6 +14903,14 @@ export class AgentSession {
 			if (deliverAs === "steer") {
 				if (options?.onPreflightAcceptCommit) await options.onPreflightAcceptCommit();
 				assertPreflightStillOpen();
+				if (options?.trackSubmission === true) {
+					trackedQueuedInput = this.#createTrackedQueuedInput(
+						deliverAs,
+						options.queuePolicy ?? "respect-mode",
+					);
+					onTrackedQueued = (message: AgentMessage, cancelQueued: () => boolean) =>
+						this.#admitTrackedQueuedInput(trackedQueuedInput!, message, cancelQueued);
+				}
 				const queuedSteer = await this.#queueSteer(text, images, {
 					claimsGenuineUserIntent: true,
 					onPromoted: onQueuedPromoted,
@@ -14733,6 +14918,7 @@ export class AgentSession {
 					sdkRunToken: internalOptions?.sdkRunToken,
 					forceOneAtATime: options?.queuePolicy === "sequential",
 					onQueuedAfterAdmission: onTrackedQueued,
+					allowDuringSessionTransition: this.#hasCommittedSuccessorTrackedAdmission(options),
 				});
 				// An explicit steer is admitted to the live loop immediately, so an
 				// aborted invocation must cancel the exact submission it admitted:
@@ -14740,9 +14926,12 @@ export class AgentSession {
 				// (exact-head review P1).
 				this.#bindPreflightAbortCancellation(options?.preflightSignal, queuedSteer);
 				try {
+					assertPreflightStillOpen();
 					options?.onPreflightAccepted?.();
+					assertPreflightStillOpen();
 				} catch (error) {
 					if (trackedQueuedInput) this.#settleTrackedAdmissionCallbackFailure(trackedQueuedInput, queuedSteer);
+					else queuedSteer.cancel();
 					throw error;
 				}
 				return trackedQueuedInput?.submission;
@@ -14810,7 +14999,7 @@ export class AgentSession {
 			// No handle escaped in that case, so discard the unreachable state rather
 			// than retaining an unresolved submission forever.
 			if (trackedQueuedInput?.message === undefined) {
-				this.#trackedQueuedInputs.delete(trackedQueuedInput?.submission.submissionId ?? "");
+				if (trackedQueuedInput) this.#settleTrackedQueuedInputRemoved(trackedQueuedInput, "removed");
 			}
 			releaseFollowUpReservation();
 		}
@@ -14937,10 +15126,25 @@ export class AgentSession {
 				this.agent.removeQueuedMessages(candidate => candidate === removedMessage);
 			}
 		} else if (index >= 0) {
-			// Legacy entries without an identity link keep positional removal.
-			const positional =
-				resolvedMode === "steer" ? this.agent.removeSteerAt(index) : this.agent.removeFollowUpAt(index);
-			if (positional !== undefined) removedMessage = positional;
+			// Legacy entries without an identity link use a content/tag lookup. The
+			// visible index is not an Agent-queue index because hidden messages may
+			// occupy executable slots ahead of the row.
+			const executable = resolvedMode === "steer" ? this.agent.snapshotSteering() : this.agent.snapshotFollowUp();
+			const legacyIndex = executable.findIndex(candidate => {
+				if (entry?.tag !== undefined && candidate.role === "custom") {
+					return readPendingDisplayTag(candidate.details) === entry.tag;
+				}
+				if (entry?.text === undefined) return false;
+				if (candidate.role === "user") return this.#getUserMessageText(candidate) === entry.text;
+				if (candidate.role === "custom") return this.#getCustomMessageTextContent(candidate) === entry.text;
+				return false;
+			});
+			if (legacyIndex !== -1) {
+				removedMessage =
+					resolvedMode === "steer"
+						? this.agent.removeSteerAt(legacyIndex)
+						: this.agent.removeFollowUpAt(legacyIndex);
+			}
 		}
 		// Removing a deferred SDK follow-up — or the live follow-up it was waiting
 		// behind — must release the NEXT deferred submission, exactly like the
@@ -16090,6 +16294,7 @@ export class AgentSession {
 						heldQueueRestored = true;
 						const current = this.agent.snapshotQueues();
 						this.#markSteeringAsFollowUpPolicy(reclassifiedSteering);
+						this.#markTrackedFollowUpSequential(heldFollowUp);
 						this.agent.restoreQueues({
 							steering: current.steering,
 							followUp: [...heldFollowUp, ...current.followUp],
@@ -16552,6 +16757,9 @@ export class AgentSession {
 		// it with handoff and the other transitions via the shared lease.
 		this.#beginSessionTransition("fork");
 		try {
+			this.#settleTrackedQueuedInputsBeforeAgentDisconnect();
+			this.#disconnectFromAgent();
+			await this.#settleActivePromptForHistoryTransition();
 			const previousSessionFile = this.sessionFile;
 			const previousWorkflowGateSessionId = this.sessionId;
 			const previousSessionIdentity = this.sessionManager.getSessionId();
@@ -16681,6 +16889,7 @@ export class AgentSession {
 
 			return true;
 		} finally {
+			this.#reconnectToAgent();
 			this.#endSessionTransition();
 		}
 	}
@@ -18589,6 +18798,14 @@ export class AgentSession {
 	 */
 	async compact(customInstructions?: string, options?: CompactOptions): Promise<CompactionResult> {
 		this.#assertSessionAdmissionOpen();
+		// Automatic context maintenance owns the transition lease while its
+		// post-append hooks run. A manual request must join behind that owner so
+		// it can cancel/wait for the automatic work rather than racing its lease.
+		if (this.#sessionTransitionKind === "auto-compaction") {
+			this.abortCompaction();
+			await this.#waitForAutoCompactionCompletions();
+			await this.#cancelPostPromptTasks();
+		}
 		// Serialize with every other session-identity transition via the shared lease
 		// (bidirectional mutual exclusion with handoff/new/switch/branch/clear/fork/
 		// navigateTree). Released in the outer finally below.
@@ -19062,6 +19279,7 @@ export class AgentSession {
 					...rollbackAgentSteeringQueue,
 					...rollbackAgentFollowUpQueue,
 					...rollbackDeferredSdkFollowUps,
+					...rollbackPendingNextTurnMessages.map(entry => entry.message),
 				]);
 				this.#resetActiveSdkRunOwnership();
 				this.agent.reset();
@@ -20821,6 +21039,15 @@ export class AgentSession {
 		let action: "context-full" | "handoff" =
 			compactionSettings.strategy === "handoff" && reason !== "overflow" ? "handoff" : "context-full";
 		const continueAfterMaintenance = options?.continueAfterMaintenance !== false;
+		let ownsAutoCompactionTransition = false;
+		const acquireAutoCompactionTransition = (): boolean => {
+			if (ownsAutoCompactionTransition) return true;
+			if (this.#sessionTransitionKind !== undefined || this.#cancelAndSubmitInProgress) return false;
+			this.#beginSessionTransition("auto-compaction");
+			ownsAutoCompactionTransition = true;
+			return true;
+		};
+		if (action === "context-full" && !acquireAutoCompactionTransition()) return { kind: "skipped" };
 		// Register the controller before the observable start event so an abort from
 		// a local subscriber, extension, dispose, or caller signal owns this run.
 		this.#autoCompactionAbortController?.abort();
@@ -20873,6 +21100,7 @@ export class AgentSession {
 						reason,
 					});
 					action = "context-full";
+					if (!acquireAutoCompactionTransition()) return { kind: "skipped" };
 				}
 				if (autoCompactionSignal.aborted) return await emitAborted();
 
@@ -21320,6 +21548,7 @@ export class AgentSession {
 			if (this.#autoCompactionAbortController === autoCompactionAbortController) {
 				this.#autoCompactionAbortController = undefined;
 			}
+			if (ownsAutoCompactionTransition) this.#endSessionTransition();
 		}
 	}
 
@@ -24642,7 +24871,12 @@ export class AgentSession {
 					// before reconnecting the successor or running session-switch hooks,
 					// either of which can outlive the predecessor event bridge.
 					this.#terminalizeQueuedSdkWorkForSessionTransition(
-						[...previousAgentSteeringQueue, ...previousAgentFollowUpQueue, ...previousDeferredSdkFollowUps],
+						[
+							...previousAgentSteeringQueue,
+							...previousAgentFollowUpQueue,
+							...previousDeferredSdkFollowUps,
+							...previousPendingNextTurnMessages.map(entry => entry.message),
+						],
 						previousTrackedQueuedInputs,
 					);
 					// Different files may intentionally carry the same copied session id; pathname transition is the commit signal.
@@ -24677,7 +24911,12 @@ export class AgentSession {
 					);
 				}
 				this.#terminalizeQueuedSdkWorkForSessionTransition(
-					[...previousAgentSteeringQueue, ...previousAgentFollowUpQueue, ...previousDeferredSdkFollowUps],
+					[
+						...previousAgentSteeringQueue,
+						...previousAgentFollowUpQueue,
+						...previousDeferredSdkFollowUps,
+						...previousPendingNextTurnMessages.map(entry => entry.message),
+					],
 					previousTrackedQueuedInputs,
 				);
 				const predecessorDeferred = new Set(previousDeferredSdkFollowUps);
@@ -24809,19 +25048,22 @@ export class AgentSession {
 	}> {
 		this.#beginSessionTransition("branch");
 		try {
-			const previousSessionFile = this.sessionFile;
-			const previousWorkflowGateSessionId = this.sessionId;
-			const previousSessionIdentity = this.sessionManager.getSessionId();
 			const selectedEntry = this.sessionManager.getEntryForFidelity(entryId);
-
 			if (selectedEntry?.type !== "message" || selectedEntry.message.role !== "user") {
 				throw new Error("Invalid entry ID for branching");
 			}
+			this.#settleTrackedQueuedInputsBeforeAgentDisconnect();
+			this.#disconnectFromAgent();
+			await this.#settleActivePromptForHistoryTransition();
+			const previousSessionFile = this.sessionFile;
+			const previousWorkflowGateSessionId = this.sessionId;
+			const previousSessionIdentity = this.sessionManager.getSessionId();
 
 			const selectedText = this.#extractUserMessageText(selectedEntry.message.content);
 			const previousAgentSteeringQueue = this.agent.snapshotSteering();
 			const previousAgentFollowUpQueue = this.agent.snapshotFollowUp();
 			const previousDeferredSdkFollowUps = [...this.#deferredSdkFollowUps];
+			const previousPendingNextTurnMessages = [...this.#pendingNextTurnMessages];
 
 			let skipConversationRestore = false;
 
@@ -24861,6 +25103,7 @@ export class AgentSession {
 				...previousAgentSteeringQueue,
 				...previousAgentFollowUpQueue,
 				...previousDeferredSdkFollowUps,
+				...previousPendingNextTurnMessages.map(entry => entry.message),
 			]);
 			this.#deferredSdkFollowUps = [];
 			this.#resetActiveSdkRunOwnership();
@@ -24903,6 +25146,7 @@ export class AgentSession {
 
 			return { selectedText, cancelled: false };
 		} finally {
+			this.#reconnectToAgent();
 			this.#endSessionTransition();
 		}
 	}
@@ -24937,21 +25181,17 @@ export class AgentSession {
 		this.#beginSessionTransition("navigate-tree");
 		try {
 			const oldLeafId = this.sessionManager.getLeafId();
-
-			// No-op if already at target
-			if (targetId === oldLeafId) {
-				return { cancelled: false };
-			}
-
-			// Model required for summarization
+			if (targetId === oldLeafId) return { cancelled: false };
 			if (options.summarize && !this.model) {
 				throw new Error("No model available for summarization");
 			}
-
 			const targetEntry = this.sessionManager.getEntryForFidelity(targetId);
 			if (!targetEntry) {
 				throw new Error(`Entry ${targetId} not found`);
 			}
+			this.#settleTrackedQueuedInputsBeforeAgentDisconnect();
+			this.#disconnectFromAgent();
+			await this.#settleActivePromptForHistoryTransition();
 
 			// Collect entries to summarize (from old leaf to common ancestor).
 			const { entries: collectedEntriesToSummarize, commonAncestorId } = collectEntriesForBranchSummary(
@@ -25079,6 +25319,9 @@ export class AgentSession {
 			const queuedSdkWork = this.#queuedMessagesForSessionTransition();
 			this.#terminalizeQueuedSdkWorkForSessionTransition(queuedSdkWork);
 			this.#deferredSdkFollowUps = [];
+			this.#pendingNextTurnMessages = [];
+			this.#scheduledHiddenNextTurnGeneration = undefined;
+			this.#resetActiveSdkRunOwnership();
 			this.agent.clearAllQueues();
 			this.#steeringMessages = [];
 			this.#followUpMessages = [];
@@ -25114,6 +25357,7 @@ export class AgentSession {
 			}
 			return { editorText, cancelled: false, summaryEntry, sessionContext: displayContext };
 		} finally {
+			this.#reconnectToAgent();
 			this.#endSessionTransition();
 		}
 	}
