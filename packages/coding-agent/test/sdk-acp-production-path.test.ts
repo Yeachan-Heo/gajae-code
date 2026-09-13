@@ -870,7 +870,13 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 		prompt: [{ type: "text", text: "/skill:deep-interview clarify ACP choices" }],
 	});
 	await waitFor(() => skillInputs.length === 1 && promptSocket !== undefined, "ACP skill invocation");
-	expect(skillInputs).toEqual([{ name: "deep-interview", args: "clarify ACP choices" }]);
+	expect(skillInputs).toEqual([
+		{
+			name: "deep-interview",
+			args: "clarify ACP choices",
+			clientRef: expect.stringMatching(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/),
+		},
+	]);
 	expect(promptInputs).toHaveLength(0);
 	promptSocket!.send(
 		JSON.stringify({
@@ -946,7 +952,9 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 	expect(promptInputs[0]).toEqual({
 		text: "[Resource: README]\nURI: file:///workspace/README.md",
 		images: [{ data: "image-bytes", mimeType: "image/png" }],
+		clientRef: expect.stringMatching(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/),
 	});
+	expect(promptInputs[0].clientRef).not.toBe(skillInputs[0].clientRef);
 	await expect(
 		agent.prompt({ sessionId: created.sessionId, prompt: [{ type: "text", text: "second" }] }),
 	).rejects.toThrow("ACP session already has an active prompt.");
