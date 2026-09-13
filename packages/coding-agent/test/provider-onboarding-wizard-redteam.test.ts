@@ -5,6 +5,7 @@ import * as path from "node:path";
 import { AuthStorage, SqliteAuthCredentialStore } from "@gajae-code/ai";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { CustomProviderWizardComponent } from "@gajae-code/coding-agent/modes/components/custom-provider-wizard";
+import { ModelSelectorComponent } from "@gajae-code/coding-agent/modes/components/model-selector";
 import {
 	type ProviderOnboardingAction,
 	ProviderOnboardingSelectorComponent,
@@ -253,10 +254,9 @@ describe("provider onboarding wizard red-team", () => {
 			expect(registry.find("visible-provider", "visible-model")).toBeDefined();
 
 			const selectorLoaded = Promise.withResolvers<void>();
-			let selectorRenderRequests = 0;
-			ctx.ui.requestRender = () => {
-				selectorRenderRequests++;
-				if (selectorRenderRequests === 2) selectorLoaded.resolve();
+			ctx.ui.requestLayoutRender = () => {
+				// Ignore the constructor's loading request before the selector is mounted.
+				if (ctx.ui.focused instanceof ModelSelectorComponent) selectorLoaded.resolve();
 			};
 			controller.showModelSelector({ temporaryOnly: true });
 			await selectorLoaded.promise;
@@ -312,6 +312,7 @@ function createControllerContext(
 		ui: {
 			focused: undefined as unknown,
 			requestRender: () => undefined,
+			requestLayoutRender: () => undefined,
 			setFocus(component: unknown) {
 				this.focused = component;
 			},

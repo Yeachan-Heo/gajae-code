@@ -391,6 +391,7 @@ export class ModelSelectorComponent extends Container {
 	#onCancelCallback = (() => {}) as CancelCallback;
 	#errorMessage?: unknown;
 	#tui: TUI;
+	#renderScope: "full" | "layout";
 	#scopedModels: ReadonlyArray<ScopedModelItem>;
 	#temporaryOnly: boolean;
 	#currentModel?: Model;
@@ -452,6 +453,8 @@ export class ModelSelectorComponent extends Container {
 		onSelect: RoleSelectCallback,
 		onCancel: () => void,
 		options?: {
+			/** Use layout only when mounted outside the viewport-anchor transcript subtree. */
+			renderScope?: "full" | "layout";
 			temporaryOnly?: boolean;
 			initialSearchInput?: string;
 			sessionId?: string;
@@ -473,6 +476,7 @@ export class ModelSelectorComponent extends Container {
 		super();
 
 		this.#tui = tui;
+		this.#renderScope = options?.renderScope ?? "full";
 		this.#settings = settings;
 		this.#modelRegistry = modelRegistry;
 		this.#scopedModels = scopedModels;
@@ -556,7 +560,7 @@ export class ModelSelectorComponent extends Container {
 					this.#clampPresetCursor();
 					void this.#refreshProviderAuth();
 					this.#renderPresetLanding();
-					this.#tui.requestRender();
+					this.#requestRender();
 					return;
 				}
 				if (this.#viewMode === "smart-routing" && this.#smartRoutingPanel) return;
@@ -567,7 +571,7 @@ export class ModelSelectorComponent extends Container {
 					void this.#initializeCatalogView();
 					return;
 				}
-				if (this.#refreshCatalogView()) this.#tui.requestRender();
+				if (this.#refreshCatalogView()) this.#requestRender();
 			});
 		}
 
@@ -588,7 +592,7 @@ export class ModelSelectorComponent extends Container {
 			const panel = this.#smartRoutingPanel;
 			if (!panel) return;
 			panel.updateProviderOrderHint(this.#providerOrderHintFor(panel.getProviderOrder()));
-			this.#tui.requestRender();
+			this.#requestRender();
 		});
 		this.#unsubscribeAuthGeneration =
 			this.#modelRegistry.authStorage?.onGenerationChanged?.(() => {
@@ -606,11 +610,16 @@ export class ModelSelectorComponent extends Container {
 			} else {
 				this.#listContainer.addChild(new Text(theme.fg("muted", "Loading model presets..."), 0, 0));
 			}
-			this.#tui.requestRender();
+			this.#requestRender();
 			void this.#initializePresetLanding();
 		} else {
 			void this.#initializeCatalogView();
 		}
+	}
+
+	#requestRender(): void {
+		if (this.#renderScope === "layout") this.#tui.requestLayoutRender("model-selector");
+		else this.#tui.requestRender();
 	}
 
 	override dispose(): void {
@@ -1084,7 +1093,7 @@ export class ModelSelectorComponent extends Container {
 			this.#commitMaterializedCatalog(catalog);
 			this.#updateTabBar();
 			this.#applyTabFilter();
-			this.#tui.requestRender();
+			this.#requestRender();
 		} catch (presentationError) {
 			const finalError =
 				refreshError !== undefined
@@ -1117,7 +1126,7 @@ export class ModelSelectorComponent extends Container {
 			void this.#refreshSelectedProvider().catch(error => {
 				this.#errorMessage = error instanceof Error ? error.message : String(error);
 				this.#updateList();
-				this.#tui.requestRender();
+				this.#requestRender();
 			});
 		};
 		this.#tabBar = tabBar;
@@ -1645,7 +1654,7 @@ export class ModelSelectorComponent extends Container {
 			) {
 				this.#providerAuthPending = false;
 				this.#renderPresetLanding();
-				this.#tui.requestRender();
+				this.#requestRender();
 			}
 		}
 	}
@@ -1739,7 +1748,7 @@ export class ModelSelectorComponent extends Container {
 		}
 		void this.#refreshProviderAuth();
 		this.#renderPresetLanding();
-		this.#tui.requestRender();
+		this.#requestRender();
 	}
 
 	#switchToModelMode(seed?: string, options?: { imageRoleFilter?: boolean }): void {
@@ -1766,7 +1775,7 @@ export class ModelSelectorComponent extends Container {
 		this.#headerContainer.clear();
 		this.#listContainer.clear();
 		this.#listContainer.addChild(new Text(theme.fg("muted", "Loading models..."), 0, 0));
-		this.#tui.requestRender();
+		this.#requestRender();
 
 		const load = this.#loadModels().then(() => {
 			this.#catalogLoaded = true;
@@ -1786,7 +1795,7 @@ export class ModelSelectorComponent extends Container {
 				this.#buildProviderTabs();
 				this.#updateTabBar();
 				this.#updateList();
-				this.#tui.requestRender();
+				this.#requestRender();
 			}
 		} finally {
 			if (this.#catalogLoadPromise === load) this.#catalogLoadPromise = undefined;
@@ -1798,7 +1807,7 @@ export class ModelSelectorComponent extends Container {
 		this.#updateTabBar();
 		// Apply the latest query: input remains responsive while the catalog loads.
 		this.#filterModels(this.#searchInput.getValue());
-		this.#tui.requestRender();
+		this.#requestRender();
 	}
 
 	/**
@@ -1945,7 +1954,7 @@ export class ModelSelectorComponent extends Container {
 		this.#tabBar = null;
 		this.#listContainer.clear();
 		this.#listContainer.addChild(this.#smartRoutingPanel);
-		this.#tui.requestRender();
+		this.#requestRender();
 	}
 
 	#switchToPresetMode(): void {
@@ -1954,7 +1963,7 @@ export class ModelSelectorComponent extends Container {
 		this.#presetCursor = Math.min(this.#presetCursor, Math.max(0, this.#getPresetRows().length - 1));
 		void this.#refreshProviderAuth();
 		this.#renderPresetLanding();
-		this.#tui.requestRender();
+		this.#requestRender();
 	}
 
 	refreshSmartRoutingState(): void {
@@ -1971,7 +1980,7 @@ export class ModelSelectorComponent extends Container {
 			stale: this.#smartRoutingIsStale(),
 			preview,
 		});
-		this.#tui.requestRender();
+		this.#requestRender();
 	}
 
 	#renderPresetLanding(): void {
@@ -2717,7 +2726,7 @@ export class ModelSelectorComponent extends Container {
 			this.#clampPresetCursor();
 		}
 		void this.#refreshProviderAuth();
-		this.#tui.requestRender();
+		this.#requestRender();
 	}
 
 	#beginActionMenuOrSelect(item: ModelItem | CanonicalModelItem): void {
@@ -2930,7 +2939,7 @@ export class ModelSelectorComponent extends Container {
 	async #handleTrackedAssignment(selection: Extract<ModelSelectorSelection, { kind: "assignment" }>): Promise<void> {
 		if (this.#assignmentState !== "idle") return;
 		this.#assignmentState = "assigning";
-		this.#tui.requestRender();
+		this.#requestRender();
 		try {
 			await Promise.resolve(this.#onSelectCallback(selection));
 		} catch {
@@ -2940,7 +2949,7 @@ export class ModelSelectorComponent extends Container {
 			const shouldClose = this.#closeAfterAssignment;
 			this.#closeAfterAssignment = false;
 			if (shouldClose) this.#onCancelCallback();
-			else this.#tui.requestRender();
+			else this.#requestRender();
 		}
 	}
 
