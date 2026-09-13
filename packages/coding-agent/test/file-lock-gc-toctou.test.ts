@@ -1157,6 +1157,48 @@ describe("file lock cleanup failure handling (#2478)", () => {
 	});
 
 	test.skipIf(process.platform === "win32")(
+		"keeps an aged scrubbed transition when native cleanup lacks durable payload proof",
+		async () => {
+			const lockedFile = path.join(await makeTemp(), "state.json");
+			const lockDir = `${lockedFile}.lock`;
+			const detachedPath = `${lockDir}.removing`;
+			const infoPath = path.join(detachedPath, "info");
+			await fs.mkdir(detachedPath);
+			await Bun.write(infoPath, "");
+			const old = new Date(Date.now() - 120_000);
+			await fs.utimes(infoPath, old, old);
+			FileLockTestHooks.nativeQuarantineBindings = () => ({
+				snapshotDirectoryTree,
+				exactRemoveDirectoryTree: () => ({
+					ok: false,
+					code: "cleanup_pending",
+					payloadDurable: false,
+					detachedPath,
+				}),
+			});
+
+			let entered = false;
+			const failure = await withFileLock(
+				lockedFile,
+				async () => {
+					entered = true;
+				},
+				{ retries: 1, retryDelayMs: 1 },
+			).catch(error => error);
+			expect(failure).toBeInstanceOf(FileLockAcquireError);
+			expect(failure).toMatchObject({
+				code: "orphan_transition",
+				reason: "orphan_transition",
+				orphanPath: detachedPath,
+				attempts: 1,
+			});
+			expect(entered).toBe(false);
+			expect(await fs.exists(detachedPath)).toBe(true);
+			expect(await fs.readFile(infoPath, "utf8")).toBe("");
+		},
+	);
+
+	test.skipIf(process.platform === "win32")(
 		"keeps the typed orphan diagnostic when a transition payload was never scrubbed",
 		async () => {
 			const lockedFile = path.join(await makeTemp(), "state.json");
