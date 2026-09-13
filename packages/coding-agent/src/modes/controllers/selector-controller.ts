@@ -3055,36 +3055,95 @@ export class SelectorController {
 		});
 	}
 
-	showUserMessageSelector(): void {
-		const userMessages = this.ctx.session.getUserMessagesForBranching();
+	#forkBusyReason(): string | undefined {
+		if (this.ctx.session.isStreaming) {
+			return "Wait for the current response to finish or abort it before forking.";
+		}
+		if (this.ctx.session.isCompacting) {
+			return "Wait for compaction to finish or abort it before forking.";
+		}
+		if (this.ctx.hasPendingSubmission()) {
+			return "Wait for the pending message to be submitted or cancel it before forking.";
+		}
+		if (this.ctx.bashComponent || this.ctx.pythonComponent) {
+			return "Wait for the foreground command to finish or cancel it before forking.";
+		}
+		return undefined;
+	}
 
+	showUserMessageSelector(): void {
+		const openedSessionId = this.ctx.sessionManager.getSessionId();
+		const openedSessionFile = this.ctx.sessionManager.getSessionFile();
+		const busyReason = this.#forkBusyReason();
+		if (busyReason) {
+			this.ctx.showWarning(busyReason);
+			return;
+		}
+
+		const userMessages = this.ctx.session.getUserMessagesForBranching();
 		if (userMessages.length === 0) {
 			this.ctx.showStatus("No messages to branch from");
 			return;
 		}
 
+		this.ctx.goalModeController.cancelContinuation();
+
 		this.showSelector(done => {
+			let selectionInFlight = false;
+			const closeWithoutBranch = (message: string, error = false): void => {
+				done();
+				if (error) {
+					this.ctx.showError(message);
+				} else {
+					this.ctx.showStatus(message);
+				}
+				this.ctx.goalModeController.scheduleContinuation();
+				this.ctx.ui.requestRender();
+			};
 			const selector = new UserMessageSelectorComponent(
 				userMessages.map(m => ({ id: m.entryId, text: m.text })),
 				async entryId => {
-					const result = await this.ctx.session.branch(entryId);
-					if (result.cancelled) {
-						// Hook cancelled the branch
-						done();
-						this.ctx.ui.requestRender();
+					if (selectionInFlight) return;
+					selectionInFlight = true;
+
+					if (
+						this.ctx.sessionManager.getSessionId() !== openedSessionId ||
+						this.ctx.sessionManager.getSessionFile() !== openedSessionFile
+					) {
+						closeWithoutBranch("Fork cancelled because the active session changed", true);
 						return;
 					}
-					this.ctx.resetIrcSidebarSession();
+					const busyReason = this.#forkBusyReason();
+					if (busyReason) {
+						closeWithoutBranch(busyReason);
+						return;
+					}
 
-					this.ctx.rebuildInitialMessages("replace-identity");
-					this.ctx.editor.setText(result.selectedText);
-					done();
-					this.ctx.showStatus("Branched to new session");
+					try {
+						const result = await this.ctx.session.branch(entryId);
+						if (this.ctx.isStopped?.()) return;
+						if (result.cancelled) {
+							closeWithoutBranch("Fork cancelled");
+							return;
+						}
+
+						this.ctx.resetIrcSidebarSession();
+						this.ctx.rebuildInitialMessages("replace-identity");
+						if (this.ctx.hasActiveBtw()) this.ctx.handleBtwEscape();
+						this.ctx.editor.setText(result.selectedText);
+						done();
+						this.ctx.showStatus("Forked to a new session; edit the selected prompt to continue");
+					} catch (error) {
+						if (this.ctx.isStopped?.()) return;
+						closeWithoutBranch(`Fork failed: ${error instanceof Error ? error.message : String(error)}`, true);
+					}
 				},
 				() => {
 					done();
+					this.ctx.goalModeController.scheduleContinuation();
 					this.ctx.ui.requestRender();
 				},
+				() => this.ctx.ui.terminal.rows,
 			);
 			return { component: selector, focus: selector.getMessageList() };
 		});

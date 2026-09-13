@@ -490,7 +490,7 @@ export interface InteractiveModeContext {
 	>;
 	goalModeController: Pick<
 		import("./controllers/goal-mode-controller").GoalModeController,
-		"enabled" | "paused" | "handleCommand"
+		"enabled" | "paused" | "handleCommand" | "cancelContinuation" | "scheduleContinuation"
 	>;
 	setHookWidget(key: string, content: ExtensionWidgetContent, options?: ExtensionWidgetOptions): void;
 	setHookStatus(key: string, text: string | undefined): void;
