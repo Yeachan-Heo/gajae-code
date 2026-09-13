@@ -157,18 +157,20 @@ Interactive `/fork` starts an independent continuation from a selected user prom
 
 ### Preconditions and immediate guards
 
-- `/fork` is refused while a response, compaction, foreground Bash/Python execution, or prompt submission is active.
-- `/fork` requires a persistent active session. A `--no-session` runtime is refused because the result must be independently resumable.
+- All prompt-fork entry points (`/fork`, `app.session.fork`, and branch-configured double Escape) refuse active responses, compaction, foreground Bash/Python execution, or pending prompt submission.
+- They require a persistent active session. A `--no-session` runtime is refused because the result must be independently resumable.
 
 ### Interactive flow
 
-1. `/fork` opens the same user-prompt selector used by the ordinary user-message branch flow.
-2. Cancelling the selector closes it without changing the active session, transcript, or editor.
+1. `/fork` opens the same user-prompt selector used by the ordinary user-message branch flow. Once admitted, opening the picker closes any active `/btw` side chat.
+2. Cancelling the selector leaves the active session and transcript unchanged; the closed side chat is not reopened.
 3. Selecting a user prompt runs `AgentSession.branch()` at that prompt boundary. Its `session_before_branch` hook may cancel the operation; a successful switch emits `session_branch`.
 4. A new persistent session is created with the history before the selected prompt, and the TUI switches to it.
-5. The selected prompt text is restored to the editor for editing. It is not submitted automatically.
+5. The selected prompt text is restored to the editor for editing. It is not submitted automatically. Session-specific TODOs, title/status, and other identity-bound UI state are synchronized to the child.
 
-The original session file and transcript remain unchanged. The new session keeps the same cwd and works against the same files, and the command itself does not modify those files; `/fork` does not create or switch a Git branch or worktree. `/tree`, the `app.session.fork` action, and branch-configured double Escape retain their existing behavior.
+If branching fails before the successor is committed, the original session remains active. If a later restoration step fails after commit, the UI is reconciled to the already-active child and reports that the fork was created but restoration failed; it does not pretend the original session is still active.
+
+The original session file and transcript remain unchanged. The new session keeps the same cwd and works against the same files, and the command itself does not modify those files; `/fork` does not create or switch a Git branch or worktree. `/tree` remains same-session navigation.
 
 ### Low-level full-session `AgentSession.fork()`
 

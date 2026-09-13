@@ -108,15 +108,16 @@ Branch flow (`SelectorController.showUserMessageSelector` → `AgentSession.bran
 
 Interactive `/fork` deliberately uses the existing user-message selector and `AgentSession.branch()` lifecycle:
 
-- Cancelling the selector leaves the current session and editor untouched.
+- Opening an admitted picker closes any active `/btw` side chat. Cancelling the selector leaves the current session and transcript unchanged without reopening that side chat.
 - Admission and final selection refuse the operation while a response, compaction, foreground Bash/Python execution, or prompt submission is active.
 - Selecting a user message invokes `AgentSession.branch()`: `session_before_branch` may cancel before the switch, and success emits `session_branch`.
 - A successful selection creates an independent persistent session containing the root-to-parent history before that prompt.
-- The TUI switches to the new session and restores the selected prompt text to the editor without submitting it.
+- The TUI synchronizes session-scoped TODOs and identity chrome to the new session, then restores the selected prompt text to the editor without submitting it.
+- A failure after the child has already been committed reconciles the UI to that child and reports incomplete restoration rather than presenting a pre-switch cancellation.
 - The source transcript remains unchanged. Both sessions keep the same cwd and share the same working files; creating the fork does not modify those files or create a Git branch or worktree.
-- In-memory (`--no-session`) use is refused because interactive `/fork` must produce an independently resumable session.
+- In-memory (`--no-session`) use is refused by the shared selector handler for `/fork`, `app.session.fork`, and branch-configured double Escape.
 
-This does not change the `app.session.fork` action or branch-configured double Escape, which retain the existing user-message branch picker behavior. It also does not change `/tree`, which continues to move the leaf inside the current session file. The low-level whole-session `AgentSession.fork()` and startup `--fork` path remain separate operations.
+These entry points share the same user-message picker and persistence contract. `/tree` continues to move the leaf inside the current session file. The low-level whole-session `AgentSession.fork()` and startup `--fork` path remain separate operations.
 
 ## Context reconstruction and summary/custom integration
 

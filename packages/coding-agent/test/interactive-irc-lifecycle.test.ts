@@ -14,6 +14,7 @@ import {
 import { getThemeByName, setThemeInstance, theme } from "@gajae-code/coding-agent/modes/theme/theme";
 import type { InteractiveModeContext } from "@gajae-code/coding-agent/modes/types";
 import { UiHelpers } from "@gajae-code/coding-agent/modes/utils/ui-helpers";
+import * as titleGenerator from "@gajae-code/coding-agent/utils/title-generator";
 import { Container, Text } from "@gajae-code/tui";
 
 async function dispatchAndSelectFork(ctx: InteractiveModeContext): Promise<void> {
@@ -28,7 +29,7 @@ async function dispatchAndSelectFork(ctx: InteractiveModeContext): Promise<void>
 	throw new Error("Timed out waiting for fork selection");
 }
 
-function createForkContext(branch: () => Promise<boolean>) {
+function createForkContext(branch: () => Promise<boolean>, committedFailure = false) {
 	const chatContainer = new Container();
 	const editor = new Text("", 0, 0);
 	const editorContainer = new Container();
@@ -36,25 +37,38 @@ function createForkContext(branch: () => Promise<boolean>) {
 	const ledger = new IrcObservationLedger();
 	let sidebarRequestedVisible = true;
 	const panelVisible = true;
+	let sessionFile = "/tmp/sessions/parent.jsonl";
+	vi.spyOn(titleGenerator, "setSessionTerminalTitle").mockImplementation(() => {});
 
 	const ctx = {
 		session: {
 			isStreaming: false,
 			getUserMessagesForBranching: () => [{ entryId: "selected-prompt", text: "selected prompt" }],
-			branch: async () => ({ selectedText: "selected prompt", cancelled: !(await branch()) }),
-			sessionFile: "/tmp/sessions/fork.jsonl",
+			branch: async () => {
+				if (committedFailure) sessionFile = "/tmp/sessions/child.jsonl";
+				const accepted = await branch();
+				if (accepted) sessionFile = "/tmp/sessions/child.jsonl";
+				return { selectedText: "selected prompt", cancelled: !accepted };
+			},
+			get sessionFile() {
+				return sessionFile;
+			},
 		},
 		sessionManager: {
-			getSessionFile: () => "/tmp/sessions/fork.jsonl",
-			getSessionId: () => "fork-session",
+			getSessionFile: () => sessionFile,
+			getSessionId: () => sessionFile,
+			getCwd: () => "/tmp",
 		},
 		editor,
 		editorContainer,
 		isInitialized: true,
 		loadingAnimation: undefined,
 		statusContainer: { clear: vi.fn() },
-		statusLine: { invalidate: vi.fn() },
+		statusLine: { invalidate: vi.fn(), setSessionStartTime: vi.fn() },
 		updateEditorTopBorder: vi.fn(),
+		updateEditorBorderColor: vi.fn(),
+		resetObserverRegistry: vi.fn(),
+		reloadTodos: vi.fn(async () => {}),
 		chatContainer,
 		pendingTools: new Map<string, never>(),
 		pendingBashComponents: [],
@@ -111,7 +125,10 @@ function createForkContext(branch: () => Promise<boolean>) {
 	};
 }
 
-afterEach(() => vi.useRealTimers());
+afterEach(() => {
+	vi.useRealTimers();
+	vi.restoreAllMocks();
+});
 
 beforeAll(async () => {
 	const theme = await getThemeByName("red-claw");
@@ -253,6 +270,32 @@ describe("IRC lifecycle resets", () => {
 		expect(failed.ledger.getSidebarRecords()).toHaveLength(1);
 		expect(failed.chatContainer.children).toHaveLength(2);
 		expect(failed.isSidebarRequestedVisible()).toBe(true);
+	});
+
+	it("retires parent IRC ownership when a fork rejects after committing a child", async () => {
+		const fixture = createForkContext(async () => {
+			throw new Error("post-commit setup failed");
+		}, true);
+		const message = {
+			role: "custom" as const,
+			customType: "irc:incoming" as const,
+			content: "parent-only message",
+			display: true,
+			attribution: "agent" as const,
+			timestamp: 0,
+			details: { observationId: "parent-only", from: "peer", to: "you", message: "parent-only message" },
+		};
+		await fixture.controller.handleEvent({ type: "irc_message", message });
+		await dispatchAndSelectFork(fixture.ctx);
+		expect(fixture.ledger.getSidebarRecords()).toEqual([]);
+		expect(fixture.isSidebarRequestedVisible()).toBe(false);
+		expect(fixture.helpers.getRenderedIrcInlineComponents()).toEqual(new Map());
+		expect(fixture.ctx.rebuildInitialMessages).toHaveBeenCalledWith("replace-identity");
+		expect(fixture.ctx.showError).toHaveBeenCalledWith(
+			"Fork created, but session setup failed: post-commit setup failed",
+		);
+		await fixture.controller.handleEvent({ type: "irc_message", message });
+		expect(fixture.ledger.getSidebarRecords()).toEqual([]);
 	});
 
 	it("expires only ephemeral inline owners while retaining the sidebar observation and dedup identity", async () => {

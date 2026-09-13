@@ -2247,10 +2247,24 @@ export class InteractiveMode implements InteractiveModeContext {
 	}
 
 	#prepareSessionSwitch(cleanupPreviousSessionUi?: () => void): void {
-		this.#btwController.dispose();
-		if (cleanupPreviousSessionUi) cleanupPreviousSessionUi();
-		else this.#extensionUiController.clearExtensionTerminalInputListeners();
-		this.#planModeController.clearReview();
+		const errors: unknown[] = [];
+		try {
+			this.#btwController.dispose();
+		} catch (error) {
+			errors.push(error);
+		}
+		try {
+			if (cleanupPreviousSessionUi) cleanupPreviousSessionUi();
+			else this.#extensionUiController.clearExtensionTerminalInputListeners();
+		} catch (error) {
+			errors.push(error);
+		}
+		try {
+			this.#planModeController.clearReview();
+		} catch (error) {
+			errors.push(error);
+		}
+		if (errors.length > 0) throw new AggregateError(errors, "Previous session UI cleanup failed");
 	}
 
 	async handleClearCommand(): Promise<boolean> {
@@ -2545,7 +2559,8 @@ export class InteractiveMode implements InteractiveModeContext {
 	}
 
 	showUserMessageSelector(): void {
-		this.#selectorController.showUserMessageSelector();
+		const cleanupPreviousSessionUi = this.#extensionUiController.captureSessionUiCleanup();
+		this.#selectorController.showUserMessageSelector(() => this.#prepareSessionSwitch(cleanupPreviousSessionUi));
 	}
 
 	showTreeSelector(): void {

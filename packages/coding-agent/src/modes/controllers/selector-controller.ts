@@ -3071,9 +3071,13 @@ export class SelectorController {
 		return undefined;
 	}
 
-	showUserMessageSelector(): void {
+	showUserMessageSelector(onCommitted?: () => void): void {
 		const openedSessionId = this.ctx.sessionManager.getSessionId();
 		const openedSessionFile = this.ctx.sessionManager.getSessionFile();
+		if (!openedSessionFile) {
+			this.ctx.showError("Fork requires a persisted session");
+			return;
+		}
 		const busyReason = this.#forkBusyReason();
 		if (busyReason) {
 			this.ctx.showWarning(busyReason);
@@ -3087,6 +3091,9 @@ export class SelectorController {
 		}
 
 		this.ctx.goalModeController.cancelContinuation();
+		// Close the side-chat composer before the picker takes ownership, including
+		// paths that cancel, fail, or stop while branch() is pending.
+		if (this.ctx.hasActiveBtw()) this.ctx.handleBtwEscape();
 
 		this.showSelector(done => {
 			let selectionInFlight = false;
@@ -3119,6 +3126,8 @@ export class SelectorController {
 						return;
 					}
 
+					let selectedText = userMessages.find(message => message.entryId === entryId)!.text;
+					let branchFailure: unknown;
 					try {
 						const result = await this.ctx.session.branch(entryId);
 						if (this.ctx.isStopped?.()) return;
@@ -3126,17 +3135,51 @@ export class SelectorController {
 							closeWithoutBranch("Fork cancelled");
 							return;
 						}
-
-						this.ctx.resetIrcSidebarSession();
-						this.ctx.rebuildInitialMessages("replace-identity");
-						if (this.ctx.hasActiveBtw()) this.ctx.handleBtwEscape();
-						this.ctx.editor.setText(result.selectedText);
-						done();
-						this.ctx.showStatus("Forked to a new session; edit the selected prompt to continue");
+						selectedText = result.selectedText;
 					} catch (error) {
 						if (this.ctx.isStopped?.()) return;
-						closeWithoutBranch(`Fork failed: ${error instanceof Error ? error.message : String(error)}`, true);
+						const committed =
+							this.ctx.sessionManager.getSessionId() !== openedSessionId ||
+							this.ctx.sessionManager.getSessionFile() !== openedSessionFile;
+						if (!committed) {
+							closeWithoutBranch(`Fork failed: ${error instanceof Error ? error.message : String(error)}`, true);
+							return;
+						}
+						// The successor is already durable. Never describe this as a
+						// cancelled transition or roll it back to the parent's UI.
+						branchFailure = error;
 					}
+
+					try {
+						onCommitted?.();
+					} catch (error) {
+						branchFailure ??= error;
+					}
+					try {
+						this.ctx.resetIrcSidebarSession();
+						this.ctx.resetObserverRegistry();
+						this.#refreshSessionTerminalTitle();
+						this.ctx.statusLine.invalidate();
+						this.ctx.statusLine.setSessionStartTime(Date.now());
+						this.ctx.updateEditorTopBorder();
+						this.ctx.updateEditorBorderColor();
+						this.ctx.rebuildInitialMessages("replace-identity");
+						await this.ctx.reloadTodos();
+					} catch (error) {
+						branchFailure ??= error;
+					}
+					if (this.ctx.isStopped?.()) return;
+					this.ctx.editor.setText(selectedText);
+					done();
+					if (branchFailure !== undefined) {
+						this.ctx.showError(
+							`Fork created, but session setup failed: ${branchFailure instanceof Error ? branchFailure.message : String(branchFailure)}`,
+						);
+					} else {
+						this.ctx.showStatus("Forked to a new session; edit the selected prompt to continue");
+					}
+					// Do not schedule goal continuation over the selected prompt draft.
+					this.ctx.ui.requestRender();
 				},
 				() => {
 					done();
