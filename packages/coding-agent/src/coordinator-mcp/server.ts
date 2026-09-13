@@ -543,7 +543,10 @@ function textResult(
 	};
 }
 
-function toolSchema(name: CoordinatorToolName): {
+function toolSchema(
+	name: CoordinatorToolName,
+	platform: NodeJS.Platform,
+): {
 	name: CoordinatorToolName;
 	description: string;
 	inputSchema: Record<string, unknown>;
@@ -804,7 +807,9 @@ function toolSchema(name: CoordinatorToolName): {
 	if (name === "gjc_coordinator_read_artifact") {
 		return {
 			name,
-			description: coordinatorArtifactCapability().available
+			// Controllers detect capability from tools/list (docs/hermes-mcp-bridge.md), so the
+			// advertisement must use the same resolved platform as the handler refusal.
+			description: coordinatorArtifactCapability(platform).available
 				? "Read one bounded artifact from configured safe roots."
 				: "Unavailable on this platform: artifact reads require Linux identity-bound handle authorization.",
 			inputSchema: { type: "object", properties: { path: pathField }, required: ["path"] },
@@ -8066,8 +8071,14 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			}
 			if (name === "gjc_coordinator_list_questions") return await listQuestions(args);
 			if (name === "gjc_coordinator_list_artifacts") return { ok: true, roots: config.allowedRoots };
-			if (name === "gjc_coordinator_read_artifact")
+			if (name === "gjc_coordinator_read_artifact") {
+				// Advertised capability (tools/list) and refusal must agree on the resolved
+				// platform. This can only add a refusal: safeOpenCoordinatorArtifact keeps
+				// the host-real capability and /proc/self/fd identity checks.
+				if (!coordinatorArtifactCapability(platform).available)
+					return publicError(new Error("artifact_unavailable"));
 				return await readCoordinatorArtifact(config, { path: args.path });
+			}
 			if (name === "gjc_coordinator_read_coordination_status") {
 				const scopedSessionId = args.session_id == null ? null : safeExternalId("session", args.session_id);
 				if (scopedSessionId) await ensureQuestionTransaction(scopedSessionId);
@@ -10696,7 +10707,11 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			return { jsonrpc: "2.0", id, result: {} };
 		}
 		if (request.method === "tools/list") {
-			return { jsonrpc: "2.0", id, result: { tools: COORDINATOR_MCP_TOOL_NAMES.map(toolSchema) } };
+			return {
+				jsonrpc: "2.0",
+				id,
+				result: { tools: COORDINATOR_MCP_TOOL_NAMES.map(name => toolSchema(name, platform)) },
+			};
 		}
 		if (request.method === "prompts/list") {
 			return { jsonrpc: "2.0", id, result: { prompts: [] } };
@@ -10750,7 +10765,11 @@ export async function handleCoordinatorMcpRequest(
 		};
 	}
 	if (request.method === "tools/list") {
-		return { jsonrpc: "2.0", id: request.id ?? null, result: { tools: COORDINATOR_MCP_TOOL_NAMES.map(toolSchema) } };
+		return {
+			jsonrpc: "2.0",
+			id: request.id ?? null,
+			result: { tools: COORDINATOR_MCP_TOOL_NAMES.map(name => toolSchema(name, process.platform)) },
+		};
 	}
 	if (request.method === "prompts/list") {
 		return { jsonrpc: "2.0", id: request.id ?? null, result: { prompts: [] } };
