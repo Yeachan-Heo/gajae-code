@@ -1,4 +1,21 @@
-"""치트시트에 넣을 GJC 워크플로 다이어그램을 PaperBanana 로 생성한다."""
+"""치트시트에 넣을 GJC 워크플로 다이어그램을 PaperBanana 로 생성한다.
+
+PaperBanana 원본: https://github.com/dwzhu-pku/PaperBanana
+논문용 도해를 planner / visualizer / critic / stylist 에이전트로
+반복 생성하는 도구다. 이 스크립트는 그걸 그대로 호출할 뿐이다.
+
+사전 준비 (로컬 도구라 저장소에 포함되지 않는다):
+
+  1. 위 저장소를 받아 configs/model_config.yaml 에 API 키를 넣는다.
+     사용 모델: main=gemini-3.1-pro-preview,
+     image=gemini-3.1-flash-image-preview (nano banana)
+  2. generate_diagram() 래퍼(lib.paperbanana)가 있는 파이프라인
+     디렉토리를 PAPERBANANA_PIPELINE 에 지정한다.
+
+이 스크립트 없이도 치트시트는 재생성된다. assets/ 에 생성본이
+커밋돼 있어서 content.py 는 그걸 읽기만 한다. 다이어그램 자체를
+다시 그릴 때만 필요하다.
+"""
 import logging
 import os
 import sys
@@ -24,7 +41,10 @@ METHOD = """
 # Gajae-Code: plan-gated agent workflow
 
 A coding agent pipeline where every mutation is gated behind an approved plan.
-The flow moves strictly left to right through four stages.
+The flow moves strictly left to right through three numbered stages with an
+unnumbered approval gate between stage 2 and stage 3. The gate is a decision
+point, not a stage — do not give it a number, and do not skip a number because
+of it.
 
 ## Stage 1 — deep-interview (requirements)
 A vague user request enters here. This stage only asks questions and writes a
@@ -36,12 +56,13 @@ Consumes the specification and produces an implementation plan, then runs an
 adversarial critique pass against that plan. Still read-only.
 Output: a reconciled plan receipt.
 
-## Stage 3 — APPROVAL GATE
+## APPROVAL GATE (unnumbered)
 A distinct diamond-shaped decision gate drawn between stage 2 and stage 3.
-Nothing downstream may write files until this gate passes. Label it
-"approval gate: no mutation before this point". This is the visual centerpiece.
+It carries no stage number. Nothing downstream may write files until this gate
+passes. Label it "approval gate: no mutation before this point". This is the
+visual centerpiece.
 
-## Stage 4 — ultragoal (execution + evidence)
+## Stage 3 — ultragoal (execution + evidence)
 Only after the gate: tracks goals through execution, revision, verification,
 and evidence collection. This is the only stage allowed to mutate the repo.
 
