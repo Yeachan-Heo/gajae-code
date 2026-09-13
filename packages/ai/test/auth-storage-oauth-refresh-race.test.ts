@@ -261,7 +261,7 @@ describe("AuthStorage OAuth refresh race", () => {
 	});
 
 	test("still disables when the failure is real (no concurrent rotation)", async () => {
-		if (!authStorage) throw new Error("test setup failed");
+		if (!authStorage || !store) throw new Error("test setup failed");
 
 		// Single-process scenario: refresh genuinely fails and no peer updated the
 		// row. The credential should still be soft-deleted.
@@ -274,9 +274,10 @@ describe("AuthStorage OAuth refresh race", () => {
 			},
 		]);
 
-		vi.spyOn(oauthUtils, "getOAuthApiKey").mockImplementation(async () => {
-			throw new Error('invalid_grant {"error":"invalid_grant"}');
-		});
+		const refreshSpy = vi
+			.spyOn(oauthUtils, "refreshOAuthToken")
+			.mockRejectedValue(new Error('invalid_grant {"error":"invalid_grant"}'));
+		const fetchSpy = vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("Unexpected OAuth network request"));
 
 		await withEnv(SUPPRESS_ANTHROPIC_ENV, async () => {
 			const apiKey = await authStorage!.getApiKey("anthropic", "session-real-failure");
@@ -284,6 +285,10 @@ describe("AuthStorage OAuth refresh race", () => {
 			expect(apiKey).toBeUndefined();
 			expect(events).toHaveLength(1);
 			expect(events[0]?.disabledCause).toContain("invalid_grant");
+			expect(refreshSpy).toHaveBeenCalledTimes(1);
+			expect(refreshSpy).toHaveBeenCalledWith("anthropic", expect.objectContaining({ refresh: "stale-refresh" }));
+			expect(fetchSpy).not.toHaveBeenCalled();
+			expect(store!.listAuthCredentials("anthropic")).toHaveLength(0);
 		});
 	});
 
@@ -437,6 +442,90 @@ describe("AuthStorage OAuth refresh race", () => {
 		await expect(second).resolves.toBe("access-rotated");
 		expect(refreshCalls).toBe(1);
 	});
+	for (const pinned of [false, true]) {
+		test(`caller cancellation preserves shared OAuth refresh and credential state (${pinned ? "pinned" : "auto"})`, async () => {
+			if (!authStorage || !store) throw new Error("test setup failed");
+			const storage = authStorage;
+			const credentialStore = store;
+			const provider = "unit-oauth-cancel";
+			const sessionId = "cancelled-refresh-session";
+			const refreshStarted = Promise.withResolvers<void>();
+			const allowRefresh = Promise.withResolvers<void>();
+			const controller = new AbortController();
+			let refreshCalls = 0;
+			oauthUtils.registerOAuthProvider({
+				id: provider,
+				name: "Unit OAuth Cancellation",
+				sourceId: "auth-storage-oauth-refresh-race-test",
+				async login() {
+					throw new Error("Unexpected login");
+				},
+				async refreshToken(credentials) {
+					refreshCalls += 1;
+					refreshStarted.resolve();
+					await allowRefresh.promise;
+					return {
+						...credentials,
+						access: "access-refreshed",
+						refresh: "refresh-refreshed",
+						expires: Date.now() + 60 * 60_000,
+					};
+				},
+				getApiKey(credentials) {
+					return credentials.access;
+				},
+			});
+			await storage.set(provider, {
+				type: "oauth",
+				access: "access-before",
+				refresh: "refresh-before",
+				expires: Date.now() - 60_000,
+			});
+			const rowsBefore = credentialStore.listAuthCredentials(provider);
+			const rowId = rowsBefore[0]!.id;
+			const selector = { kind: "id" as const, value: String(rowId) };
+			if (pinned) storage.setSessionCredentialSelector(sessionId, provider, selector);
+			const unavailable = vi.spyOn(storage, "markSessionCredentialUnavailable");
+			const caller = storage.getApiKey(provider, sessionId, { signal: controller.signal });
+			// Observe rejection immediately, including when an assertion fails before cancellation.
+			const outcome = caller.then(
+				value => ({ value, error: undefined }),
+				(error: unknown) => ({ value: undefined, error }),
+			);
+			let peer: Promise<string | undefined> | undefined;
+			try {
+				await refreshStarted.promise;
+				controller.abort();
+				const cancelled = await outcome;
+				// Inspect state before releasing the refresh: a later success can mask all-blocked fallback.
+				expect(storage.getEarliestUnblockAt(provider)).toBeUndefined();
+				expect(unavailable).not.toHaveBeenCalled();
+				expect(storage.resolveEffectiveCredentialSelector(provider, sessionId)).toEqual(
+					pinned ? selector : undefined,
+				);
+				expect(credentialStore.listAuthCredentials(provider)).toEqual(rowsBefore);
+				expect(events).toEqual([]);
+				expect(cancelled.error).toBeInstanceOf(Error);
+				expect((cancelled.error as Error).message).toBe("credential refresh aborted");
+				expect(cancelled.value).toBeUndefined();
+				peer = storage.getApiKey(provider, "uncancelled-refresh-peer");
+				allowRefresh.resolve();
+				expect(await peer).toBe("access-refreshed");
+				expect(await storage.getApiKey(provider, sessionId)).toBe("access-refreshed");
+				expect(refreshCalls).toBe(1);
+				expect(storage.getEarliestUnblockAt(provider)).toBeUndefined();
+				expect(storage.getSessionCredentialRowId(provider, sessionId)).toBe(rowId);
+				expect(events).toEqual([]);
+			} finally {
+				controller.abort();
+				allowRefresh.resolve();
+				// Drain the underlying shared refresh even if the cancelled caller has already settled.
+				peer ??= storage.getApiKey(provider, "cleanup-refresh-peer");
+				await Promise.allSettled([outcome, peer]);
+			}
+		});
+	}
+
 	test("invalidating a session-sticky OAuth credential rotates the retry to another active credential", async () => {
 		if (!authStorage) throw new Error("test setup failed");
 

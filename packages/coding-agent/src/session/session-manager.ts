@@ -21886,6 +21886,12 @@ export class SessionManager {
 
 	/**
 	 * List all sessions across all project directories.
+	 *
+	 * Scope re-derivation is an enrichment pass, not an admission gate: a seeded
+	 * transcript stays listed even when its recorded workspace no longer resolves
+	 * (deleted, renamed, unmounted, or recorded by another platform's checkout).
+	 * Dropping those would hide readable sessions from `--resume` with no recovery
+	 * path, which is exactly when a global lookup matters most.
 	 */
 	static async listAll(
 		storage: SessionStorage = new FileSessionStorage(),
@@ -21899,7 +21905,9 @@ export class SessionManager {
 				.filter(entry => entry.isDirectory())
 				.flatMap(entry => storage.listFilesSync(path.join(sessionsRoot, entry.name), "*.jsonl"));
 			const seedSessions = await collectSessionsFromFiles(seedFiles, storage);
-			const logicalFiles = new Set<string>();
+			const logicalFiles = new Set<string>(
+				seedSessions.map(session => session.path).filter(sessionPath => !isStagedSessionPath(sessionPath)),
+			);
 			for (const cwd of new Set(seedSessions.map(session => session.cwd).filter(Boolean))) {
 				const scope = resolveManagedScope({
 					cwd,

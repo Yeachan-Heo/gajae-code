@@ -20,9 +20,17 @@
  *
  * Contract
  * --------
- * Every `## [<version>]` heading present in a `packages/<pkg>/CHANGELOG.md` at the
- * merge base must still be present at the head. Adding headings is fine.
- * Editing entry text is fine. Removing a released section is not.
+ * Two pull-request contracts run from this entry point, which Dev CI already
+ * invokes on every pull request:
+ *
+ * 1. Every `## [<version>]` heading present in a `packages/<pkg>/CHANGELOG.md` at the
+ *    merge base must still be present at the head. Adding headings is fine.
+ *    Editing entry text is fine. Removing a released section is not.
+ *
+ * 2. The shared `## [Unreleased]` section is fragment-owned (issue #5491). A pull
+ *    request must not edit it directly, must not delete a pending fragment, and must
+ *    file its notes under `packages/<pkg>/changelog.d/`. The fragment contract itself,
+ *    including the release-time fold, lives in `scripts/changelog-fragments.ts`.
  *
  * `## [Unreleased]` is exempt in one direction only: it may disappear, because
  * a release commit legitimately consumes it. It may not take released sections
@@ -30,6 +38,7 @@
  */
 
 import { $ } from "bun";
+import { collectPullRequestFragmentViolations } from "./changelog-fragments";
 
 /** `## [1.2.3] - 2026-01-01` or `## [Unreleased]`. */
 const RELEASE_HEADING = /^##\s+\[([^\]]+)\]/;
@@ -146,12 +155,20 @@ export function formatViolation(violation: ChangelogHistoryViolation): string {
 export async function main(argv: string[]): Promise<number> {
 	const base = await resolveBase(readFlag(argv, "base"));
 	const head = readFlag(argv, "head") ?? "HEAD";
-	const violations = await collectViolations(base, head);
-	if (violations.length === 0) {
-		console.log(`changelog-history-guard: no released sections removed (${base.slice(0, 12)}..${head})`);
+	const [violations, fragmentViolations] = await Promise.all([
+		collectViolations(base, head),
+		collectPullRequestFragmentViolations(base, head, process.env.GITHUB_BASE_REF ?? "origin/dev"),
+	]);
+	if (violations.length === 0 && fragmentViolations.length === 0) {
+		console.log(
+			`changelog-history-guard: no released sections removed and no direct [Unreleased] edits (${base.slice(0, 12)}..${head})`,
+		);
 		return 0;
 	}
 	for (const violation of violations) console.error(`::error file=${violation.file}::${formatViolation(violation)}`);
+	for (const violation of fragmentViolations) {
+		console.error(`::error file=${violation.file}::${violation.message}`);
+	}
 	return 1;
 }
 

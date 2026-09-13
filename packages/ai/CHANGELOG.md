@@ -12,6 +12,8 @@
 
 ### Fixed
 
+- Cancelling an OAuth credential lookup during a shared token refresh no longer backs off the healthy credential or marks its session selector unavailable. Cancellation rejects only that caller; peers can still complete the shared refresh, and genuine refresh failures retain their existing handling.
+
 - Usage-limit marking now captures a stable stored row at mark time, including when no explicit row ID is supplied, and re-finds that same row after awaiting usage. Concurrent pointer reassignment or row reordering cannot redirect the mark; a vanished target marks nothing. The same stable-target operation supports OAuth account-specific model-rejection backoff without changing entitlement policy or adding dispatch-bound credential attribution (#5422).
 - The image generation role can select OpenAI's current GPT Image models. `gpt-image-2.5-sunburst` (editing precision) and `gpt-image-2.5-flare` (fast everyday generation) now ship in the bundled catalog under both `openai` and `openai-codex` with the same image-only, zero-cost, 128k-context/16k-max-token shape as `gpt-image-2`, so a provider-qualified `modelRoles.image: openai-codex/gpt-image-2.5-sunburst` selector resolves instead of failing with `No image model configured` (#5478).
 - OpenCode Go's exact `muse-spark-1.3-contributor` model now uses the existing Responses transport with minimal-through-xhigh reasoning, text/image input, and Go pricing. The Go discovery mapper applies the provisional reviewed models.dev Contributor limits over endpoint-reported limits; these are not a published Meta 1.3 specification. The subsequent model-manager merge repairs pre-upgrade ID-only cache placeholders even when fresh, while preserving other already-mapped dynamic limits.

@@ -197,5 +197,5 @@ Avoid placeholder tests, tautologies, broad `not.toThrow()` assertions, duplicat
   Supersedes: f7e8d9c0
   ```
 
-- Package changelogs live at `packages/*/CHANGELOG.md`; add entries under `## [Unreleased]`, never edit released sections.
+- Release notes are per-change fragments: add `packages/<pkg>/changelog.d/<slug>.md` with `### <Section>` blocks whose entries are `- ` bullets. Never edit `## [Unreleased]` in `packages/*/CHANGELOG.md` directly — a single shared insertion point made every PR conflict on the same lines and forced a rebase that invalidated its exact-head approval (issue #5491); distinct fragment file names cannot conflict. `scripts/release.ts` folds pending fragments into the package changelog and consumes them at release time. Released sections stay append-only.
 - Release flow: `bun run release` (scripts/release.ts) after changelogs and verification are complete.
