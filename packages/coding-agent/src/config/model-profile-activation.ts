@@ -1671,14 +1671,14 @@ export async function materializeModelProfileForDeletion(
 		...prepared.previousAgentModelOverrides,
 		...concreteAgentModelOverrides,
 	};
+	const previousDefaultChainIdentity = prepared.previousDefaultChainState?.identity;
 	const deletesOwnedDefaultChain =
 		prepared.defaultChain.length === 0 &&
 		prepared.previousDefaultChainState?.origin === "profile-activation" &&
-		prepared.previousDefaultChainState.identity !== undefined &&
-		resolveModelProfileName(
-			prepared.previousDefaultChainState.identity,
-			prepared.modelRegistry.getModelProfiles(),
-		) === prepared.profileName;
+		previousDefaultChainIdentity !== undefined &&
+		(resolveModelProfileName(previousDefaultChainIdentity, prepared.modelRegistry.getModelProfiles()) ===
+			prepared.profileName ||
+			previousDefaultChainIdentity === options.profileName);
 	const clearsPersistedDefaultProfile = !(
 		prepared.previousActiveModelProfileScope === "session" &&
 		prepared.previousActiveModelProfile !== undefined &&

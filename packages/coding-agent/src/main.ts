@@ -460,11 +460,12 @@ type StartupModelProfileArgs = {
 	session: AgentSession;
 	settings: Settings;
 	modelRegistry: ModelRegistry;
-	parsedArgs: Pick<Args, "default" | "model" | "mpreset" | "thinking">;
+	parsedArgs: Pick<Args, "continue" | "default" | "model" | "mpreset" | "resume" | "thinking">;
 	startupModel?: CreateAgentSessionOptions["model"];
 	startupThinkingLevel?: CreateAgentSessionOptions["thinkingLevel"];
 	preferCachedModels?: boolean;
 	preferCachedDefaultProfile?: boolean;
+	isResumedSession?: boolean;
 };
 
 async function applyStartupModelProfilesWithPolicy(
@@ -503,12 +504,17 @@ async function applyStartupModelProfilesWithPolicy(
 	// deferred `--model <pattern>` path resolved inside createAgentSession.
 	const explicitModel = args.parsedArgs.model ? (args.startupModel ?? args.session.model) : undefined;
 	const defaultProfile = args.settings.get("modelProfile.default");
+	const preserveResumedSessionModel =
+		args.isResumedSession === true &&
+		args.settings.get("session.resumeModelBehavior") === "keepSessionModel" &&
+		args.parsedArgs.model === undefined &&
+		args.parsedArgs.mpreset === undefined;
 	const preferCachedProfiles =
 		(args.preferCachedModels === true && args.parsedArgs.mpreset !== undefined) ||
 		(args.preferCachedDefaultProfile === true && defaultProfile !== undefined);
 	const applyConfiguredProfiles = async (): Promise<boolean> => {
 		let applied = true;
-		if (defaultProfile) {
+		if (defaultProfile && !preserveResumedSessionModel) {
 			applied =
 				(await applyProfile(defaultProfile, false, {
 					profileScope: "durable",
@@ -2042,6 +2048,9 @@ export async function runRootCommand(
 				initialMessage,
 				initialMessages: parsedArgs.messages,
 				resumeAction: bareResumeAction,
+				isResumedSession:
+					(sessionManager?.hasHistoryEntries() ?? false) &&
+					(parsedArgs.continue === true || parsedArgs.resume !== undefined),
 			};
 			if (isInteractive && parsedArgs.mpreset) {
 				const ready = Promise.withResolvers<void>();
