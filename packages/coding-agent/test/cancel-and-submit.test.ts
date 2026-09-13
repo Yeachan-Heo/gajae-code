@@ -10,6 +10,7 @@ import { type AbortOutcome, AgentSession } from "@gajae-code/coding-agent/sessio
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { logger, TempDir } from "@gajae-code/utils";
+import { createSdkRunCapability } from "../src/sdk/host/sdk-run-capability";
 
 type Scenario = "mid-streaming" | "active tool" | "auto-retry" | "pre-existing steering+follow-up entries";
 type RollbackOutcome = Extract<AbortOutcome, { kind: "timeout" | "error" }>;
@@ -229,6 +230,35 @@ describe("AgentSession.cancelAndSubmit", () => {
 		expect(s.isStreaming).toBe(false);
 	});
 
+	it("selects a deferred SDK follow-up by display identity", async () => {
+		const { agent, session: s, requestUserTexts } = buildGatedStreamingSession();
+		const activePrompt = s.prompt("active stream");
+		await waitForStreaming(s);
+		const submission = await s.submitUserMessage("deferred selection", {
+			deliverAs: "followUp",
+			trackSubmission: true,
+			sdkRunCapability: createSdkRunCapability("cancel-deferred-selection"),
+		} as never);
+		expect(agent.snapshotFollowUp()).toHaveLength(0);
+		const queuedEntry = s.getQueuedMessageEntries().find(entry => entry.text === "deferred selection");
+		expect(queuedEntry).toBeDefined();
+
+		await expect(s.cancelAndSubmit("replacement", { queuedEntryId: queuedEntry?.id })).resolves.toEqual({
+			kind: "submitted",
+		});
+		await expect(submission.execution).resolves.toMatchObject({
+			submissionId: submission.submissionId,
+			disposition: "promoted-to-run",
+		});
+		await activePrompt;
+		await expect(submission.terminal).resolves.toMatchObject({
+			submissionId: submission.submissionId,
+			disposition: "completed",
+		});
+		expect(requestUserTexts().flat()).toContain("deferred selection");
+		expect(requestUserTexts().flat()).not.toContain("replacement");
+	});
+
 	it("keeps live-run steers as steers of the replacement turn, applied after its response", async () => {
 		// R6: the aborted turn's admitted steers must stay STEERING of the
 		// replacement run (re-admitted after the replacement is answered), not be
@@ -375,6 +405,24 @@ describe("AgentSession.cancelAndSubmit", () => {
 		expect(s.getQueuedMessageEntries().map(entry => entry.id)).not.toContain(head.id);
 	});
 
+	it("selects a tracked live follow-up exactly once", async () => {
+		const { agent, session: s } = buildSession();
+		const submission = await s.submitUserMessage("live follow-up", {
+			deliverAs: "followUp",
+			trackSubmission: true,
+		});
+		const entry = s.getQueuedMessageEntries().find(candidate => candidate.text === "live follow-up");
+		if (!entry) throw new Error("Expected a live follow-up entry");
+		const promptSpy = vi.spyOn(agent, "prompt");
+
+		expect(await s.cancelAndSubmit(entry.text, { queuedEntryId: entry.id })).toEqual({ kind: "submitted" });
+		const submittedMessages = promptSpy.mock.calls.flatMap(([messages]) => messages as unknown as AgentMessage[]);
+		expect(submittedMessages.filter(message => messageText(message) === "live follow-up")).toHaveLength(1);
+		await expect(submission.execution).resolves.toMatchObject({ disposition: "promoted-to-run" });
+		await expect(submission.terminal).resolves.toMatchObject({ disposition: "completed" });
+		expect(s.getQueuedMessageEntries()).toEqual([]);
+	});
+
 	it("committed external steer fires its ownership hook exactly once", async () => {
 		const { session: s } = buildSession();
 		let promoted = 0;
@@ -412,6 +460,59 @@ describe("AgentSession.cancelAndSubmit", () => {
 		// The unselected steer of the aborted turn is re-queued as a follow-up of
 		// the new turn; exactly one duplicate-text display remains.
 		expect(entriesAtNewTurn).toEqual([expect.objectContaining({ text: remaining.text, mode: "followUp" })]);
+	});
+
+	it("dequeues the bound duplicate across steering and follow-up queues", async () => {
+		const { session: s } = buildGatedStreamingSession();
+		const activePrompt = s.prompt("active stream");
+		await waitForStreaming(s);
+		await s.steer("same display text");
+		await s.followUp("same display text");
+		const selected = s.getQueuedMessageEntries().find(entry => entry.mode === "followUp");
+		if (!selected) throw new Error("Expected a follow-up display entry");
+
+		expect(await s.cancelAndSubmit(selected.text, { queuedEntryId: selected.id })).toEqual({ kind: "submitted" });
+		await activePrompt;
+		await s.waitForIdle();
+		expect(s.getQueuedMessageEntries()).toEqual([]);
+	});
+
+	it("preserves sequential policy when cancel-submit reclassifies steers", async () => {
+		const { agent, session: s, requestUserTexts } = buildGatedStreamingSession();
+		s.setFollowUpMode("all");
+		const activePrompt = s.prompt("active stream");
+		await waitForStreaming(s);
+		const first = await s.submitUserMessage("sequential-one", {
+			deliverAs: "steer",
+			trackSubmission: true,
+			queuePolicy: "sequential",
+		});
+		const second = await s.submitUserMessage("sequential-two", {
+			deliverAs: "steer",
+			trackSubmission: true,
+			queuePolicy: "sequential",
+		});
+		const third = await s.submitUserMessage("sequential-three", {
+			deliverAs: "steer",
+			trackSubmission: true,
+			queuePolicy: "sequential",
+		});
+		const [selected] = s.getQueuedMessageEntries();
+		if (!selected) throw new Error("Expected a selected sequential steer");
+
+		expect(await s.cancelAndSubmit("replacement", { queuedEntryId: selected.id })).toEqual({ kind: "submitted" });
+		expect(agent.snapshotFollowUp().map(messageText)).toEqual(["sequential-two", "sequential-three"]);
+		await activePrompt;
+		await s.waitForIdle();
+		const contexts = requestUserTexts();
+		const secondRequest = contexts.findIndex(texts => texts.includes("sequential-two"));
+		const thirdRequest = contexts.findIndex(texts => texts.includes("sequential-three"));
+		expect(secondRequest).toBeGreaterThanOrEqual(0);
+		expect(thirdRequest).toBeGreaterThan(secondRequest);
+		expect(contexts[secondRequest]).not.toContain("sequential-three");
+		await expect(first.terminal).resolves.toMatchObject({ disposition: "completed" });
+		await expect(second.terminal).resolves.toMatchObject({ disposition: "completed" });
+		await expect(third.terminal).resolves.toMatchObject({ disposition: "completed" });
 	});
 
 	it("committed queue-head preserves the original image-bearing queued message", async () => {
