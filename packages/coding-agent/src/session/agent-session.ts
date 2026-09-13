@@ -215,6 +215,7 @@ import {
 	activateModelProfile,
 	applyPreparedModelProfileActivation,
 	materializeActiveModelProfileAssignment,
+	ModelProfileCredentialError,
 	prepareModelProfileActivation,
 	resolveModelProfileDefaultChain,
 } from "../config/model-profile-activation";
@@ -15567,19 +15568,36 @@ export class AgentSession {
 			settings: this.settings,
 			profileName,
 			profileScope: "durable",
+			invalidateCanonicalVariant: false,
+			canonicalSessionId: null,
 		});
-		if (prepared.previousCanonicalVariant !== undefined) {
-			if (
-				this.#modelRegistry.restoreSessionCanonicalVariant?.(this.sessionId, prepared.previousCanonicalVariant) !==
-				true
-			) {
-				this.#modelRegistry.clearCanonicalVariant?.(this.sessionId);
-				throw new Error("New-session profile preflight could not restore canonical model affinity.");
-			}
-		} else {
-			this.#modelRegistry.clearCanonicalVariant?.(this.sessionId);
-		}
 		return prepared;
+	}
+
+	async #installPreparedNewSessionProfile(prepared: PreparedModelProfileActivation): Promise<void> {
+		await applyPreparedModelProfileActivation(prepared, {
+			profileScope: "durable",
+			preserveConfiguredDefaultChain: true,
+			preserveCurrentModel: true,
+			skipCanonicalAffinityMutation: true,
+		});
+	}
+
+	#restorePrecommitNewSessionProfile(prepared: PreparedModelProfileActivation): void {
+		if (prepared.previousModelRolesOverride === undefined) prepared.settings.clearOverride("modelRoles");
+		else prepared.settings.override("modelRoles", prepared.previousModelRolesOverride);
+		if (prepared.previousAgentModelOverridesOverride === undefined)
+			prepared.settings.clearOverride("task.agentModelOverrides");
+		else prepared.settings.override("task.agentModelOverrides", prepared.previousAgentModelOverridesOverride);
+		if (prepared.previousDefaultFallbackRuntimeState)
+			prepared.session.restoreDefaultFallbackRuntimeState?.(prepared.previousDefaultFallbackRuntimeState);
+		if (prepared.previousProfileInstalledOverrideState)
+			prepared.session.restoreProfileInstalledOverrideState?.(prepared.previousProfileInstalledOverrideState);
+		else prepared.session.clearProfileInstalledOverrides?.();
+		prepared.session.setActiveModelProfile?.(
+			prepared.previousActiveModelProfile,
+			prepared.previousActiveModelProfileScope,
+		);
 	}
 
 	async #runNewSessionTransition(options?: NewSessionOptions): Promise<boolean> {
@@ -15643,17 +15661,26 @@ export class AgentSession {
 			const noLeasePreviousSessionIdentity = this.sessionManager.getSessionId();
 			const noLeasePreviousSessionFile = this.sessionManager.getSessionFile();
 			const prepared = await this.sessionManager.prepareNewSession(options);
+			let profileAppliedBeforeCommit = false;
+			let successorCommitted = false;
 			try {
 				// Last fallible gate while public getters still show the predecessor (#3138).
 				await initializeLocalRoot(this.#localProtocolOptions(prepared));
 				this.#assertJobManagerEndpointAdmission(prepared.sessionId, prepared.sessionFile);
+				if (preparedNewSessionProfile) {
+					await this.#installPreparedNewSessionProfile(preparedNewSessionProfile);
+					profileAppliedBeforeCommit = true;
+				}
 				this.sessionManager.commitPreparedNewSession(prepared);
+				successorCommitted = true;
 				// Endpoint identity committed to the successor: re-register the
 				// manager so post-transition lineage bindings resolve and owned
 				// aborts classify in the successor session (review thread P1).
 				this.#rekeyJobManagerForSessionIdentity(noLeasePreviousSessionIdentity, noLeasePreviousSessionFile);
 				await this.#runToolSessionTransitionCleanups();
 			} catch (error) {
+				if (profileAppliedBeforeCommit && !successorCommitted)
+					this.#restorePrecommitNewSessionProfile(preparedNewSessionProfile!);
 				throw await discardPreparedNewSessionAfterFailure(this.sessionManager, prepared, error);
 			}
 			this.setTodoPhases([]);
@@ -15669,6 +15696,7 @@ export class AgentSession {
 				nextDiscoverySessionToolNames,
 				previousSessionFile,
 				preparedNewSessionProfile,
+				profileAppliedBeforeCommit,
 			);
 			if (options?.drop && previousSessionFile) {
 				try {
@@ -15723,17 +15751,26 @@ export class AgentSession {
 				throw new Error("Owned async jobs did not settle before session replacement.");
 			}
 			const prepared = await this.sessionManager.prepareNewSession(options);
+			let profileAppliedBeforeCommit = false;
+			let successorCommitted = false;
 			try {
 				// Last fallible gate while public getters still show the predecessor (#3138).
 				await initializeLocalRoot(this.#localProtocolOptions(prepared));
 				this.#assertJobManagerEndpointAdmission(prepared.sessionId, prepared.sessionFile);
+				if (preparedNewSessionProfile) {
+					await this.#installPreparedNewSessionProfile(preparedNewSessionProfile);
+					profileAppliedBeforeCommit = true;
+				}
 				this.sessionManager.commitPreparedNewSession(prepared);
+				successorCommitted = true;
 				// Endpoint identity committed to the successor: re-register the
 				// manager so post-transition lineage bindings resolve and owned
 				// aborts classify in the successor session (review thread P1).
 				this.#rekeyJobManagerForSessionIdentity(previousSessionIdentity, previousSessionIdentityFile);
 				await this.#runToolSessionTransitionCleanups();
 			} catch (error) {
+				if (profileAppliedBeforeCommit && !successorCommitted)
+					this.#restorePrecommitNewSessionProfile(preparedNewSessionProfile!);
 				throw await discardPreparedNewSessionAfterFailure(this.sessionManager, prepared, error);
 			}
 			this.#disconnectFromAgent();
@@ -15755,6 +15792,7 @@ export class AgentSession {
 				nextDiscoverySessionToolNames,
 				previousSessionFile,
 				preparedNewSessionProfile,
+				profileAppliedBeforeCommit,
 			);
 			if (options?.drop && previousSessionFile) {
 				try {
@@ -15778,6 +15816,7 @@ export class AgentSession {
 		nextDiscoverySessionToolNames: string[] | undefined,
 		previousSessionFile: string | undefined,
 		preparedNewSessionProfile?: PreparedModelProfileActivation,
+		profileAlreadyApplied = false,
 	): Promise<void> {
 		// The successor session must not inherit the predecessor's profile marker
 		// or its runtime role overrides; a durable `modelProfile.default` is
@@ -15801,20 +15840,23 @@ export class AgentSession {
 				(this.#activeModelProfileScope !== "durable" || profileToRebind !== activeProfileIdentity)) ||
 				(activeProfileIdentity === undefined && recoveredRuntimeProfileIdentity !== undefined));
 		const refreshConfiguredProfile =
-			replacingConfiguredProfile ||
+		profileAlreadyApplied ||
+		replacingConfiguredProfile ||
 			(profileToRebind !== undefined && preparedNewSessionProfile?.profileName === profileToRebind);
 		const preProfileModel = this.#preProfileModel;
-		this.#resetSessionScopedModelProfileState(
-			(droppingSessionOnlyProfile || replacingConfiguredProfile) && profileToRebind
-				? {
-						restoreInstalledDefaultChain: !replacingConfiguredProfile,
-						preserveActiveModelProfile: {
-							name: profileToRebind,
-							scope: "durable",
-						},
-					}
-				: undefined,
-		);
+		if (!profileAlreadyApplied) {
+			this.#resetSessionScopedModelProfileState(
+				(droppingSessionOnlyProfile || replacingConfiguredProfile) && profileToRebind
+					? {
+							restoreInstalledDefaultChain: !replacingConfiguredProfile,
+							preserveActiveModelProfile: {
+								name: profileToRebind,
+								scope: "durable",
+							},
+						}
+					: undefined,
+			);
+		}
 		let runtimeProfileDefaultChain: readonly string[] | undefined;
 		let runtimeProfileDefaultModel: Model | undefined;
 		let runtimeProfileDefaultActiveIndex: number | undefined;
@@ -15824,35 +15866,17 @@ export class AgentSession {
 			const profileTransition =
 				preparedNewSessionProfile?.profileName === profileToRebind ? preparedNewSessionProfile : undefined;
 			if (profileTransition) {
-				try {
-					runtimeProfileDefaultChain = await this.#applyRuntimeModelProfile(
-						profileToRebind,
-						profileTransition,
-						false,
-					);
+				if (profileAlreadyApplied) {
+					runtimeProfileDefaultChain = profileTransition.defaultChain;
 					runtimeProfileDefaultModel = profileTransition.defaultModel;
 					runtimeProfileDefaultActiveIndex = profileTransition.defaultActiveIndex;
 					runtimeProfileDefaultSkips = profileTransition.defaultResolutionSkips;
-				} catch (error) {
-					logger.error("New-session model profile installation failed after preflight", {
-						profile: profileToRebind,
-						error: error instanceof Error ? error.message : String(error),
-					});
-					this.emitNotice(
-						"error",
-						`Unable to apply model profile "${profileToRebind}" in the new session.`,
-						"model-profile",
-					);
-					this.#resetSessionScopedModelProfileState({
-						preserveDefaultConfiguredChain: true,
-						forceCleanup: true,
-					});
-					runtimeProfileDefaultChain = undefined;
 				}
 			} else {
 				this.#resetSessionScopedModelProfileState({ forceCleanup: true });
 			}
 		}
+		if (profileAlreadyApplied) this.#modelRegistry.clearCanonicalVariant?.(this.sessionId);
 		this.#defaultFallbackController = undefined;
 		this.#preserveLoadedLegacyDefaultChain = false;
 		this.#defaultFallbackExhaustedLastTurn = false;
@@ -24201,9 +24225,10 @@ export class AgentSession {
 								? "durable"
 								: "session";
 				const profileOwnershipMustReset =
-					resumeModelBehavior === "useCurrentDefault" &&
-					(previousActiveModelProfile !== nextActiveModelProfile ||
-						(switchingToDifferentSession && previousActiveModelProfileScope === "session"));
+					(resumeModelBehavior === "useCurrentDefault" &&
+						(previousActiveModelProfile !== nextActiveModelProfile ||
+							(switchingToDifferentSession && previousActiveModelProfileScope === "session"))) ||
+					(switchingToDifferentSession && previousActiveModelProfile !== nextActiveModelProfile);
 				if (profileOwnershipMustReset) {
 					const predecessorProfileWasSessionScoped =
 						previousActiveModelProfile !== undefined && previousActiveModelProfileScope !== "durable";
@@ -24224,6 +24249,19 @@ export class AgentSession {
 					profileCleanupAppliedBeforeResolution = true;
 				}
 				let runtimeProfileDefaultChain: readonly string[] | undefined;
+				if (
+					resumeModelBehavior === "keepSessionModel" &&
+					nextActiveModelProfile !== undefined &&
+					nextActiveModelProfileScope === "durable" &&
+					previousActiveModelProfile !== nextActiveModelProfile
+				) {
+					try {
+						await this.#applyRuntimeModelProfile(nextActiveModelProfile);
+					} catch (error) {
+						if (!(error instanceof ModelProfileCredentialError)) throw error;
+						this.emitNotice("warning", error.message, "model-profile");
+					}
+				}
 				if (
 					resumeModelBehavior === "useCurrentDefault" &&
 					(liveProfileIdentity !== undefined || previousActiveModelProfileScope === "session") &&

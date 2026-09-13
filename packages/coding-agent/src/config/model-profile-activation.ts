@@ -133,6 +133,10 @@ export interface PrepareModelProfileActivationOptions {
 	settings: Pick<Settings, "get" | "getGlobal" | "getOverride">;
 	profileName: string;
 	profileScope?: ModelProfileScope;
+	/** Avoid mutating the current session's sticky affinity during a transition preflight. */
+	invalidateCanonicalVariant?: boolean;
+	/** Null disables session-scoped canonical affinity while resolving selectors. */
+	canonicalSessionId?: string | null;
 }
 export interface ApplyModelProfileActivationOptions {
 	persistDefault?: boolean;
@@ -141,6 +145,7 @@ export interface ApplyModelProfileActivationOptions {
 	preserveConfiguredDefaultChain?: boolean;
 	preserveCurrentModel?: boolean;
 	preserveCanonicalAffinity?: boolean;
+	skipCanonicalAffinityMutation?: boolean;
 }
 export interface PreparedModelProfileActivation {
 	profileName: string;
@@ -1185,6 +1190,8 @@ export async function prepareModelProfileActivation(
 	const requestedProfileName = options.profileName;
 	const profileScope = options.profileScope ?? "session";
 	const previousModel = options.session.model;
+	const canonicalSessionId =
+		options.canonicalSessionId === null ? undefined : (options.canonicalSessionId ?? options.session.sessionId);
 	// Snapshot the exact pre-clear sticky selector (verbatim, not re-derived from
 	// the live model) so a failed prepare/apply/materialize rollback restores the
 	// genuinely-sticky provider even when the live model is a transient switch.
@@ -1194,7 +1201,9 @@ export async function prepareModelProfileActivation(
 	// Explicit profile activation/reselection invalidates the session's sticky
 	// canonical variant BEFORE the new profile's aliases resolve, so the old
 	// provider's sticky variant cannot win the new profile's resolution.
-	options.modelRegistry.clearCanonicalVariant?.(options.session.sessionId);
+	if (options.invalidateCanonicalVariant !== false) {
+		options.modelRegistry.clearCanonicalVariant?.(options.session.sessionId);
+	}
 
 	try {
 		const context = await preflightModelProfileBindings({
@@ -1215,7 +1224,7 @@ export async function prepareModelProfileActivation(
 							{
 								settings: options.settings as Settings,
 								modelRegistry: options.modelRegistry as ModelRegistry,
-								sessionId: options.session.sessionId,
+								sessionId: canonicalSessionId,
 								credentialSessionId,
 								aliasIntent: "preset-equivalent",
 							},
@@ -1242,7 +1251,7 @@ export async function prepareModelProfileActivation(
 			{
 				managedFallback: true,
 				aliasIntent: "preset-equivalent",
-				canonicalSessionId: options.session.sessionId,
+				canonicalSessionId: canonicalSessionId ?? null,
 				credentialSessionId,
 			},
 		);
@@ -1271,7 +1280,7 @@ export async function prepareModelProfileActivation(
 				{
 					settings: options.settings as Settings,
 					modelRegistry: options.modelRegistry as ModelRegistry,
-					sessionId: options.session.sessionId,
+					sessionId: canonicalSessionId,
 					credentialSessionId,
 					aliasIntent: "preset-equivalent",
 					requireQualifiedResolution: requiresQualifiedModelProfileRoleResolution(profile),
@@ -1292,7 +1301,7 @@ export async function prepareModelProfileActivation(
 				{
 					settings: options.settings as Settings,
 					modelRegistry: options.modelRegistry as ModelRegistry,
-					sessionId: options.session.sessionId,
+					sessionId: canonicalSessionId,
 					credentialSessionId,
 					aliasIntent: "preset-equivalent",
 					requireQualifiedResolution: requiresQualifiedModelProfileRoleResolution(profile),
@@ -1376,7 +1385,8 @@ export async function prepareModelProfileActivation(
 			previousDefaultFallbackRuntimeState: options.session.getDefaultFallbackRuntimeState?.(),
 		};
 	} catch (error) {
-		restoreCanonicalVariant(options.modelRegistry, options.session.sessionId, previousCanonicalVariant);
+		if (options.invalidateCanonicalVariant !== false)
+			restoreCanonicalVariant(options.modelRegistry, options.session.sessionId, previousCanonicalVariant);
 		throw error;
 	}
 }
@@ -1393,7 +1403,7 @@ export async function applyPreparedModelProfileActivation(
 	let resumeDefaultChanged = false;
 	let fallbackResolutionSeeded = false;
 	const profileScope = options.profileScope ?? (options.persistDefault ? "durable" : prepared.profileScope);
-	const preserveCurrentModel = options.preserveCurrentModel === true && prepared.session.model !== undefined;
+	const preserveCurrentModel = options.preserveCurrentModel === true;
 
 	try {
 		const activationDefaultChain =
@@ -1457,6 +1467,8 @@ export async function applyPreparedModelProfileActivation(
 			prepared.modelRegistry.seedCanonicalVariant?.(prepared.session.sessionId, prepared.defaultModel);
 			resumeDefaultChanged = true;
 			prepared.session.recordResumeDefaultModel?.(`${prepared.defaultModel.provider}/${prepared.defaultModel.id}`);
+		} else if (options.skipCanonicalAffinityMutation) {
+			// A precommit install must leave the predecessor's sticky affinity intact.
 		} else if (
 			preserveCurrentModel &&
 			options.preserveCanonicalAffinity !== false &&
