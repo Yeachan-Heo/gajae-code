@@ -154,7 +154,12 @@ import {
 	MODEL_ONBOARDING_PROVIDER_PRESET_COMMAND,
 	MODEL_ONBOARDING_SETUP_COMMAND,
 } from "../../setup/model-onboarding-guidance";
-import { addApiCompatibleProvider, formatProviderSetupResult } from "../../setup/provider-onboarding";
+import {
+	addApiCompatibleProvider,
+	formatProviderSetupResult,
+	probeOpenAIModelsList,
+	reloadAndRefreshDiscoveryCatalog,
+} from "../../setup/provider-onboarding";
 import {
 	isConfigurableSearchProviderId,
 	isSearchProviderPreference,
@@ -1819,15 +1824,48 @@ export class SelectorController {
 		this.showSelector(done => {
 			let wizard: CustomProviderWizardComponent;
 			const submit = async (input: CustomProviderWizardSubmit): Promise<void> => {
+				// Component-owned generation: revision or cancel after submit
+				// start invalidates this attempt. Both completion branches
+				// check it so a stale refresh cannot report success or
+				// rerender over inputs the user has since revised.
+				const generation = wizard.currentSubmitGeneration();
+				const isCurrentSubmission = (): boolean => wizard.isSubmitCurrent(generation);
 				try {
-					const result = await addApiCompatibleProvider(input);
-					await this.ctx.session.modelRegistry.refresh("offline", this.ctx.session.credentialSessionId);
+					const result = await addApiCompatibleProvider({
+						...input,
+						authStorage: this.ctx.session.modelRegistry.authStorage,
+					});
+					let recoveryHint: string | null = null;
+					if (result.discoveryEnabled && !result.preset) {
+						// A discovery-only add has no static models and no cache yet,
+						// so an offline reload alone leaves an empty catalog. Refresh
+						// only the new provider online; a hint is surfaced instead
+						// of unconditional success when it stays unavailable.
+						recoveryHint = await reloadAndRefreshDiscoveryCatalog(
+							this.ctx.session.modelRegistry,
+							result.providerId,
+							this.ctx.session.credentialSessionId,
+						);
+					} else {
+						await this.ctx.session.modelRegistry.refresh("offline", this.ctx.session.credentialSessionId);
+					}
 					await this.ctx.notifyConfigChanged?.();
-					this.ctx.showStatus(formatProviderSetupResult(result));
+					// A late settle after Esc-cancel or a mid-submit revision
+					// must not drive completion UI: done() restores the
+					// composer and could close a selector the user opened
+					// after dismissal, and a stale refresh must not report
+					// success over revised inputs.
+					if (!isCurrentSubmission()) return;
+					this.ctx.showStatus(
+						recoveryHint
+							? `${formatProviderSetupResult(result)}\n${recoveryHint}`
+							: formatProviderSetupResult(result),
+					);
 					wizard.complete();
 					done();
 					this.ctx.ui.requestRender();
 				} catch (err) {
+					if (!isCurrentSubmission()) return;
 					const message = err instanceof Error ? err.message : String(err);
 					wizard.setSubmitError(`Provider setup failed: ${message}`);
 				}
@@ -1841,6 +1879,9 @@ export class SelectorController {
 					this.ctx.ui.requestRender();
 				},
 				() => this.ctx.ui.requestRender(),
+				{
+					discoverModels: async request => probeOpenAIModelsList(request),
+				},
 			);
 			return { component: wizard, focus: wizard };
 		});

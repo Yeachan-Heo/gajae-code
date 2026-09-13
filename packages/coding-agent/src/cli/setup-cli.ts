@@ -69,6 +69,7 @@ export interface SetupCommandArgs {
 		baseUrl?: string;
 		apiKeyEnv?: string;
 		model?: string[];
+		discover?: boolean;
 		modelsPath?: string;
 		smoke?: boolean;
 		install?: boolean;
@@ -166,6 +167,7 @@ function hasProviderSetupFlags(flags: SetupCommandArgs["flags"]): boolean {
 		flags.baseUrl !== undefined ||
 		flags.apiKeyEnv !== undefined ||
 		flags.model !== undefined ||
+		flags.discover !== undefined ||
 		flags.modelsPath !== undefined
 	);
 }
@@ -264,6 +266,8 @@ export function parseSetupArgs(args: string[]): SetupCommandArgs | undefined {
 			flags.apiKeyEnv = args[++i];
 		} else if (arg === "--model" || arg === "--models") {
 			flags.model = [...(flags.model ?? []), args[++i] ?? ""];
+		} else if (arg === "--discover") {
+			flags.discover = true;
 		} else if (arg === "--models-path") {
 			flags.modelsPath = args[++i];
 		} else if (arg === "--remove") {
@@ -425,6 +429,7 @@ async function handleProviderSetup(flags: {
 	apiKeyEnv?: string;
 	model?: string[];
 	modelsPath?: string;
+	discover?: boolean;
 }): Promise<void> {
 	try {
 		const missing: string[] = [];
@@ -433,7 +438,7 @@ async function handleProviderSetup(flags: {
 			if (!flags.provider) missing.push("--provider");
 			if (!flags.baseUrl) missing.push("--base-url");
 			if (!flags.apiKeyEnv) missing.push("--api-key-env");
-			if (!flags.model || flags.model.length === 0) missing.push("--model");
+			if ((!flags.model || flags.model.length === 0) && !flags.discover) missing.push("--model or --discover");
 		}
 		if (missing.length > 0) {
 			throw new Error(
@@ -449,6 +454,7 @@ async function handleProviderSetup(flags: {
 			models: flags.model,
 			modelsPath: flags.modelsPath,
 			force: flags.force,
+			discover: flags.discover,
 		});
 		if (flags.json) {
 			process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
@@ -932,6 +938,7 @@ ${chalk.bold("Provider example:")}
   ${APP_NAME} setup provider --preset litellm --base-url https://litellm.example.com/v1
   ${APP_NAME} setup provider --preset openai-compatible-proxy --base-url https://gateway.example.com/v1
   MY_PROVIDER_KEY=sk-... ${APP_NAME} setup provider --compat openai --provider my-oai --base-url https://api.example.com/v1 --api-key-env MY_PROVIDER_KEY --model gpt-example
+  MY_PROVIDER_KEY=sk-... ${APP_NAME} setup provider --compat openai --provider my-oai --base-url https://api.example.com/v1 --api-key-env MY_PROVIDER_KEY --discover [--model gpt-example]
 
 ${chalk.bold("Hermes example:")}
   ${APP_NAME} setup hermes --root /path/to/repo
@@ -953,6 +960,7 @@ ${chalk.bold("Options:")}
   --base-url        Provider API base URL (required for proxy presets: litellm, openai-compatible-proxy)
   --api-key-env     Read provider API key from this environment variable
   --model, --models Model id to add (repeat or comma-separate)
+  --discover        Discover models from the provider OpenAI /v1/models endpoint (OpenAI-compatible custom providers; makes --model optional, merges with the live catalog)
   --models-path     Override models config path
   --smoke           Run Hermes MCP setup smoke checks
   --install         Install generated Hermes setup files

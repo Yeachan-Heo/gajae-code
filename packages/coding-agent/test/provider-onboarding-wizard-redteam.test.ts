@@ -60,6 +60,9 @@ function driveWizard(
 		options?.credential ?? (options?.credentialSource === "literal" ? "sk-redteam-secret" : "CUSTOM_PROVIDER_KEY"),
 	);
 	component.handleInput("\n");
+	// Discover step: default to manual model entry.
+	component.handleInput("\x1b[B");
+	component.handleInput("\n");
 	typeText(component, options?.models ?? "custom-model");
 	component.handleInput("\n");
 }

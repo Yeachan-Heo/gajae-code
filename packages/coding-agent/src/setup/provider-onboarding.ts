@@ -1,11 +1,19 @@
 import { randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { getAgentDbPath, getAgentDir } from "@gajae-code/utils";
+import { type AuthStorage, resolveOAuthStorageProvider } from "@gajae-code/ai/core";
+import {
+	isSafeCatalogModelId,
+	MODELS_LIST_REQUEST_TIMEOUT_MS,
+	readBoundedModelsJson,
+} from "@gajae-code/ai/utils/discovery/openai-compatible";
+import { getAgentDbPath, getAgentDir, logger } from "@gajae-code/utils";
+import { $rotatingCredentialEnv } from "@gajae-code/utils/env";
 import { YAML } from "bun";
+import { withFileLock } from "../config/file-lock";
 import { type ModelsConfig, ModelsConfigSchema, type ProviderDiscovery } from "../config/models-config-schema";
 import { compareRankedProviders, famousProviderIndex } from "../config/provider-ranking";
-import { AuthStorage } from "../session/auth-storage";
+import { AuthStorage as AuthStorageImpl } from "../session/auth-storage";
 import providerPresets from "./provider-presets.json";
 
 export type ProviderCompatibility = "openai" | "anthropic";
@@ -21,6 +29,37 @@ export interface ProviderSetupInput {
 	models?: string[];
 	modelsPath?: string;
 	force?: boolean;
+	/**
+	 * Opt into live OpenAI `/v1/models` discovery for an OpenAI-compatible
+	 * custom provider. Manual `--model` ids may be omitted when set; the
+	 * runtime auto-discovers the catalog on refresh and merges it without
+	 * duplicates.
+	 *
+	 * When no manual models are given, setup probes the endpoint before
+	 * writing config so an unreachable endpoint, rejected credential, or
+	 * empty catalog fails the setup loudly instead of writing a provider
+	 * that can never serve a model. There is deliberately no skip flag: the
+	 * pre-write probe is the enforcement point, and the wizard's
+	 * interactive probe is a preview only (inputs may have changed since).
+	 */
+	discover?: boolean;
+	/** Probe override for tests; defaults to the live endpoint probe. */
+	probeDiscovery?: (input: ProviderDiscoveryProbeInput) => Promise<ProviderDiscoveryProbeResult>;
+	/**
+	 * Cancel discovery and persistence until the atomic config rename is
+	 * invoked. Later cancellation does not undo a committed provider.
+	 * Combined with the shared deadline inside the probe; callers that omit
+	 * it get deadline-only probe behavior.
+	 */
+	discoverySignal?: AbortSignal;
+	/**
+	 * Live credential authority for literal-key persistence. Interactive
+	 * callers pass the active session registry's AuthStorage so the
+	 * subsequent targeted online refresh authenticates from the same
+	 * authority that stored the key. When omitted, onboarding falls back
+	 * to a short-lived store at the agent DB path (headless/CLI behavior).
+	 */
+	authStorage?: Pick<AuthStorage, "set" | "remove" | "exportSnapshot">;
 }
 
 export interface ProviderSetupResult {
@@ -32,6 +71,10 @@ export interface ProviderSetupResult {
 	modelsPath: string;
 	redactedApiKey: string;
 	credentialSource: "literal" | "env";
+	/** True when the provider persists a `discovery:` block (live catalog). */
+	discoveryEnabled: boolean;
+	/** The persisted discovery type, when any (e.g. `openai-models-list`). */
+	discoveryType?: string;
 	preset?: string;
 	presetName?: string;
 }
@@ -140,6 +183,7 @@ function resolvePresetInput(input: ProviderSetupInput): {
 	api: ProviderSetupApi;
 	compat?: ProviderCompatConfig;
 	discovery?: ProviderDiscovery;
+	requestedDiscovery: boolean;
 } {
 	const preset = input.preset ? findProviderPreset(input.preset) : undefined;
 	if (input.preset && !preset) {
@@ -181,6 +225,14 @@ function resolvePresetInput(input: ProviderSetupInput): {
 	if (!compatibility) {
 		throw new Error("Provider compatibility is required unless --preset is used.");
 	}
+	if (input.discover && preset) {
+		throw new Error(
+			`Provider preset '${preset.id}' manages its own model catalog; omit --discover or use --compat openai for a custom provider.`,
+		);
+	}
+	if (input.discover && compatibility !== "openai") {
+		throw new Error("Model discovery (--discover) requires an OpenAI-compatible provider; use --compat openai.");
+	}
 	return {
 		compatibility,
 		preset,
@@ -193,6 +245,7 @@ function resolvePresetInput(input: ProviderSetupInput): {
 		api: preset?.api ?? apiForCompatibility(compatibility),
 		compat: preset?.compat,
 		discovery: preset?.discovery,
+		requestedDiscovery: input.discover === true,
 	};
 }
 
@@ -261,8 +314,13 @@ function validateSetupInput(input: ProviderSetupInput): {
 	if (!apiKey) throw new Error("API key is required.");
 
 	const models = parseModelList(resolved.models);
-	if (models.length === 0 && !resolved.discovery)
-		throw new Error("At least one model id or model discovery is required.");
+	// An explicit `--discover` on an OpenAI-compatible custom provider persists
+	// `discovery: { type: openai-models-list }`, which the runtime also
+	// auto-enables — so manual models become optional rather than required.
+	const discovery: ProviderDiscovery | undefined =
+		resolved.discovery ?? (resolved.requestedDiscovery ? { type: "openai-models-list" } : undefined);
+	if (models.length === 0 && !discovery)
+		throw new Error("At least one model id or model discovery is required. Use --model <id> or --discover.");
 	validateModelApi(resolved.modelApi, models, resolved.preset?.id ?? resolved.providerId);
 
 	return {
@@ -275,7 +333,7 @@ function validateSetupInput(input: ProviderSetupInput): {
 		api: resolved.api,
 		modelApi: resolved.modelApi,
 		compat: resolved.compat,
-		discovery: resolved.discovery,
+		discovery,
 		preset: resolved.preset,
 	};
 }
@@ -295,7 +353,7 @@ async function readModelsConfig(modelsPath: string): Promise<ModelsConfig> {
 	return checked.data;
 }
 
-async function writeModelsConfig(modelsPath: string, config: ModelsConfig): Promise<void> {
+async function writeModelsConfig(modelsPath: string, config: ModelsConfig, signal?: AbortSignal): Promise<void> {
 	const checked = ModelsConfigSchema.safeParse(config);
 	if (!checked.success) {
 		const first = checked.error.issues[0];
@@ -313,6 +371,8 @@ async function writeModelsConfig(modelsPath: string, config: ModelsConfig): Prom
 		} finally {
 			await tempHandle.close();
 		}
+		// Rename is the commit boundary. Cancellation after it cannot undo the saved provider.
+		if (signal?.aborted) throw new Error("Provider setup was cancelled; setup did not write any config.");
 		await fs.rename(tempPath, modelsPath);
 		try {
 			const directoryHandle = await fs.open(directory, "r");
@@ -336,6 +396,41 @@ export async function addApiCompatibleProvider(input: ProviderSetupInput): Promi
 	if (existing.providers?.[validated.providerId] && !input.force) {
 		throw new Error(`Provider '${validated.providerId}' already exists. Use --force to replace it.`);
 	}
+	// P2: a discovery-only add with no manual models must prove the endpoint
+	// serves a catalog before config is written — otherwise an unreachable
+	// endpoint or rejected credential would be recorded as configured while
+	// the provider can never serve a model. Manual-model adds skip the probe
+	// (the static list degrades gracefully). The check runs after the
+	// duplicate check above so a duplicate is rejected locally before any
+	// credential crosses the network.
+	// Only explicitly requested custom `--discover` setups are probe-gated.
+	// Preset-managed discovery (goat, litellm, openai-compatible-proxy, ...)
+	// keeps its documented contract — presets write env-var references and
+	// never validate live credentials — so preset adds skip the probe and
+	// resolve their catalog lazily at runtime as before.
+	if (validated.discovery?.type === "openai-models-list" && validated.models.length === 0 && !validated.preset) {
+		const probe = input.probeDiscovery ?? probeOpenAIModelsList;
+		const credentialSource = validated.credentialSource;
+		const probed = await probe({
+			baseUrl: validated.baseUrl,
+			apiKeyEnv: credentialSource === "env" ? validated.apiKey : undefined,
+			apiKey: credentialSource === "literal" ? validated.apiKey : undefined,
+			signal: input.discoverySignal,
+		});
+		// The caller (wizard revision/cancel) may have aborted while the probe
+		// was resolving: recheck before any credential or config write so a
+		// stale revision cannot be persisted after dismissal.
+		if (input.discoverySignal?.aborted) {
+			throw new Error(
+				`Model discovery for '${validated.providerId}' was cancelled; setup did not write any config.`,
+			);
+		}
+		if (probed.models.length === 0) {
+			throw new Error(
+				`Model discovery for '${validated.providerId}' returned no models; add --model <id> or fix the endpoint catalog.`,
+			);
+		}
+	}
 	const provider: ProviderConfig = {
 		baseUrl: validated.baseUrl,
 		api: validated.api,
@@ -353,22 +448,106 @@ export async function addApiCompatibleProvider(input: ProviderSetupInput): Promi
 	if (validated.discovery) provider.discovery = validated.discovery;
 	if (validated.credentialSource === "env") {
 		provider.apiKeyEnv = validated.apiKey;
-	} else {
-		const authStorage = await AuthStorage.create(getAgentDbPath());
+	}
+	// Serialize config merging under the file lock. Credential storage is a
+	// separate authority, not an atomic transaction with models.yml: restore
+	// successful credential writes on precommit failure and report failed recovery.
+	type CredentialStore = Pick<AuthStorage, "set" | "remove" | "exportSnapshot">;
+	type ApiKeyEntry = { type: "api_key"; key: string };
+	const cancelledError = (): Error =>
+		new Error(`Model discovery for '${validated.providerId}' was cancelled; setup did not write any config.`);
+	// Snapshot the complete prior credential entries so a `--force`
+	// replacement cancelled mid-write restores them exactly instead of
+	// deleting them while the old models.yml provider remains. A
+	// resolved-key snapshot is insufficient: the provider may hold multiple
+	// entries, OAuth credentials, or env-resolved keys that were never
+	// stored. Non-api_key entries cannot be restored from a snapshot
+	// (refresh material is sentinelized), so refuse those replacements
+	// upfront rather than destroying them on abort.
+	const snapshotRestorableKeys = (store: CredentialStore): { restorable: ApiKeyEntry[]; unrestorable: number } => {
+		const storageProvider = resolveOAuthStorageProvider(validated.providerId);
+		const priorEntries = store.exportSnapshot().credentials.filter(entry => entry.provider === storageProvider);
+		const restorable = priorEntries
+			.filter((entry): entry is typeof entry & { credential: ApiKeyEntry } => entry.credential.type === "api_key")
+			.map(entry => entry.credential);
+		return { restorable, unrestorable: priorEntries.length - restorable.length };
+	};
+	const rollbackCredential = async (store: CredentialStore, restorable: ApiKeyEntry[]): Promise<void> => {
+		if (restorable.length > 0) {
+			await store.set(validated.providerId, restorable);
+		} else {
+			await store.remove(validated.providerId);
+		}
+	};
+	const withCredentialStore = async (fn: (store: CredentialStore) => Promise<void>): Promise<void> => {
+		if (input.authStorage) {
+			await fn(input.authStorage);
+			return;
+		}
+		const authStorage = await AuthStorageImpl.create(getAgentDbPath());
 		try {
-			await authStorage.set(validated.providerId, { type: "api_key", key: validated.apiKey });
+			await fn(authStorage);
 		} finally {
 			authStorage.close();
 		}
-	}
-	const next: ModelsConfig = {
-		...existing,
-		providers: {
-			...(existing.providers ?? {}),
-			[validated.providerId]: provider,
-		},
 	};
-	await writeModelsConfig(modelsPath, next);
+	await withFileLock(modelsPath, async () => {
+		if (input.discoverySignal?.aborted) {
+			throw cancelledError();
+		}
+		const current = await readModelsConfig(modelsPath);
+		if (input.discoverySignal?.aborted) throw cancelledError();
+		if (current.providers?.[validated.providerId] && !input.force) {
+			throw new Error(`Provider '${validated.providerId}' already exists. Use --force to replace it.`);
+		}
+		let restorable: ApiKeyEntry[] = [];
+		let unrestorable = 0;
+		let wroteKey = false;
+		try {
+			if (validated.credentialSource !== "env") {
+				await withCredentialStore(async store => {
+					const snapshot = snapshotRestorableKeys(store);
+					restorable = snapshot.restorable;
+					unrestorable = snapshot.unrestorable;
+					if (snapshot.unrestorable > 0 && input.discoverySignal) {
+						throw new Error(
+							`Provider '${validated.providerId}' holds non-API-key credentials that cannot be restored if setup is cancelled; remove them first or omit --force.`,
+						);
+					}
+					await store.set(validated.providerId, { type: "api_key", key: validated.apiKey });
+					wroteKey = true;
+				});
+			}
+			if (input.discoverySignal?.aborted) throw cancelledError();
+			await writeModelsConfig(
+				modelsPath,
+				{
+					...current,
+					providers: {
+						...(current.providers ?? {}),
+						[validated.providerId]: provider,
+					},
+				},
+				input.discoverySignal,
+			);
+		} catch (error) {
+			if (wroteKey) {
+				try {
+					if (unrestorable > 0) throw new Error("Prior credentials cannot be restored from a snapshot.");
+					await withCredentialStore(store => rollbackCredential(store, restorable));
+				} catch {
+					// Store errors can contain credentials; never log or interpolate them.
+					// Log independently of the wizard, which may already be dismissed.
+					const recovery =
+						restorable.length > 0 || unrestorable > 0 ? "restore prior credentials" : "remove new credentials";
+					const message = `Provider '${validated.providerId}' setup failed before config commit and could not ${recovery}; credential recovery is required.`;
+					logger.error(message);
+					throw new Error(message, { cause: error });
+				}
+			}
+			throw error;
+		}
+	});
 	return {
 		providerId: validated.providerId,
 		compatibility: validated.compatibility,
@@ -378,6 +557,8 @@ export async function addApiCompatibleProvider(input: ProviderSetupInput): Promi
 		modelsPath,
 		redactedApiKey: redactSecret(validated.apiKey),
 		credentialSource: validated.credentialSource,
+		discoveryEnabled: validated.discovery !== undefined,
+		discoveryType: validated.discovery?.type,
 		preset: validated.preset?.id,
 		presetName: validated.preset?.name,
 	};
@@ -394,11 +575,182 @@ function isLocalHttpHost(hostname: string): boolean {
 	);
 }
 
+export interface ProviderDiscoveryProbeInput {
+	baseUrl: string;
+	apiKeyEnv?: string;
+	apiKey?: string;
+	timeoutMs?: number;
+	signal?: AbortSignal;
+}
+
+export interface ProviderDiscoveryProbeResult {
+	models: string[];
+	endpoint: string;
+}
+
+function redactProbeUrl(value: URL): string {
+	return `${value.origin}${value.pathname}`;
+}
+
+function normalizeProbeBaseUrl(rawBaseUrl: string): URL {
+	const parsed = new URL(rawBaseUrl.trim());
+	const trimmedPath = parsed.pathname.replace(/\/+$/g, "");
+	parsed.pathname = trimmedPath.endsWith("/v1") ? trimmedPath || "/v1" : `${trimmedPath}/v1`;
+	parsed.hash = "";
+	return parsed;
+}
+
+/**
+ * Probe an OpenAI-compatible `/v1/models` endpoint and return the sorted
+ * model ids. Used by the Add-custom-provider wizard so gateway catalogs
+ * (LiteLLM and friends) do not need manual transcription.
+ *
+ * Credential handling: an `apiKeyEnv` name resolves through the trusted
+ * credential env only (never `cwd/.env`); a literal `apiKey` is used as-is.
+ * Errors name the redacted endpoint only — the key material never appears
+ * in messages, and callers must not log the request headers.
+ */
+export async function probeOpenAIModelsList(input: ProviderDiscoveryProbeInput): Promise<ProviderDiscoveryProbeResult> {
+	let baseUrl: URL;
+	try {
+		baseUrl = normalizeProbeBaseUrl(input.baseUrl);
+	} catch {
+		throw new Error("Model discovery needs a valid absolute base URL before probing.");
+	}
+	if (baseUrl.protocol !== "https:" && baseUrl.protocol !== "http:") {
+		throw new Error("Model discovery needs an http or https base URL.");
+	}
+	// P1: never transmit the bearer before the URL passes the same
+	// HTTPS-unless-loopback validation that setup itself enforces — a remote
+	// http:// URL must be rejected before any secret crosses the network.
+	if (baseUrl.protocol === "http:" && !isLocalHttpHost(baseUrl.hostname)) {
+		throw new Error("Model discovery needs https unless the endpoint targets localhost or a loopback address.");
+	}
+	const modelsUrl = new URL(baseUrl);
+	modelsUrl.pathname = `${modelsUrl.pathname.replace(/\/+$/g, "")}/models`;
+	const endpoint = redactProbeUrl(modelsUrl);
+	if (input.signal?.aborted) {
+		throw new Error(`Model discovery for ${endpoint} was cancelled before probing.`);
+	}
+	// Rotating reader (same as the model registry): an agent-.env credential
+	// rotated or removed after startup must be honored live, not served from
+	// the import-time snapshot.
+	const apiKey = input.apiKeyEnv ? $rotatingCredentialEnv(input.apiKeyEnv)?.trim() : input.apiKey?.trim();
+	if (!apiKey) {
+		throw new Error(
+			input.apiKeyEnv
+				? `Discovery needs ${input.apiKeyEnv} set in the trusted environment before ${endpoint} can be probed.`
+				: `Discovery needs an API key before ${endpoint} can be probed.`,
+		);
+	}
+	const headers: Record<string, string> = {};
+	let response: Response;
+	try {
+		response = await fetch(modelsUrl, {
+			headers: { ...headers, Authorization: `Bearer ${apiKey}` },
+			// Combine the caller signal with the shared deadline: a caller
+			// signal alone must never leave the request without a timeout.
+			signal: AbortSignal.any([
+				...(input.signal ? [input.signal] : []),
+				AbortSignal.timeout(input.timeoutMs ?? MODELS_LIST_REQUEST_TIMEOUT_MS),
+			]),
+		});
+	} catch (error) {
+		// Transport layers may echo request details (including the bearer)
+		// in failure text: scrub resolved credential material before the
+		// reason reaches any error surface.
+		const reason = error instanceof Error ? error.message : String(error);
+		const scrubbed = apiKey ? reason.split(apiKey).join("[redacted]") : reason;
+		throw new Error(`Model discovery failed for ${endpoint}: ${scrubbed}`);
+	}
+	if (!response.ok) {
+		if (response.status === 401 || response.status === 403) {
+			throw new Error(
+				`Model discovery rejected by ${endpoint} (HTTP ${response.status}): the credential was rejected; check the API key.`,
+			);
+		}
+		throw new Error(`Model discovery failed for ${endpoint}: HTTP ${response.status}.`);
+	}
+	// Shared bounded reader (1MB cap): an unbounded response.json() would let
+	// a malicious endpoint exhaust process memory before ID filtering runs.
+	let payload: unknown;
+	try {
+		payload = await readBoundedModelsJson(response);
+	} catch (error) {
+		const reason = error instanceof Error ? error.message : String(error);
+		if (reason.includes("exceeds the size limit")) {
+			throw new Error(`Model discovery failed for ${endpoint}: the response exceeds the size limit.`);
+		}
+		throw new Error(`Model discovery failed for ${endpoint}: the response was not valid JSON.`);
+	}
+	if (typeof payload !== "object" || payload === null || !Array.isArray((payload as { data?: unknown }).data)) {
+		throw new Error(`Model discovery failed for ${endpoint}: the response was not an OpenAI models list.`);
+	}
+	const ids = new Set<string>();
+	for (const item of (payload as { data: unknown[] }).data) {
+		// P1: the wire catalog is attacker-controlled — drop IDs that fail the
+		// shared catalog safety check (control chars, OSC/ANSI, oversize)
+		// before they can reach the setup-screen renderer.
+		const rawId = typeof item === "object" && item !== null ? (item as { id?: unknown }).id : undefined;
+		if (!isSafeCatalogModelId(rawId)) continue;
+		ids.add(rawId.trim());
+	}
+	return { models: [...ids].sort((a, b) => a.localeCompare(b)), endpoint };
+}
+
+export interface DiscoveryCatalogRefresher {
+	refresh(mode: "offline" | "online" | "online-if-uncached", credentialSessionId?: string): Promise<void>;
+	refreshProvider(
+		providerId: string,
+		strategy?: "offline" | "online" | "online-if-uncached",
+		credentialSessionId?: string,
+	): Promise<void>;
+	getProviderDiscoveryState(providerId: string): { status: string; error?: string } | undefined;
+}
+
+/**
+ * Reload static config offline, then refresh only the newly added discovery
+ * provider online so freshly requested live catalogs are selectable
+ * immediately (including alongside manual models). Preset-managed
+ * discovery is excluded by callers: presets resolve lazily at runtime.
+ * Returns a recovery hint instead of reporting unconditional success when
+ * the live catalog stays unavailable: the config is saved and valid, but
+ * the user needs to know the catalog did not populate and how to recover
+ * (wait for the next refresh, or re-add with explicit `--model` ids).
+ */
+export async function reloadAndRefreshDiscoveryCatalog(
+	registry: DiscoveryCatalogRefresher,
+	providerId: string,
+	credentialSessionId?: string,
+): Promise<string | null> {
+	await registry.refresh("offline", credentialSessionId);
+	try {
+		await registry.refreshProvider(providerId, "online", credentialSessionId);
+	} catch {
+		// Fall through to the status read: discovery failures surface as
+		// state, not rejections.
+	}
+	const state = registry.getProviderDiscoveryState(providerId);
+	if (state && (state.status === "ok" || state.status === "cached")) return null;
+	const detail = state?.error ? ` (${state.error})` : "";
+	return (
+		`Live catalog unavailable${detail}; the provider is saved and will populate on the next online refresh. ` +
+		`To pin models now, re-add with --force --model <id> (the provider already exists).`
+	);
+}
+
 export function formatProviderSetupResult(result: ProviderSetupResult): string {
 	return [
 		`Provider '${result.providerId}' configured as ${result.compatibility}-compatible.`,
 		...(result.presetName ? [`Preset: ${result.presetName}`] : []),
-		`Models: ${result.modelIds.length > 0 ? result.modelIds.join(", ") : "discovered automatically"}`,
+		`Models: ${result.modelIds.length > 0 ? result.modelIds.join(", ") : result.discoveryEnabled ? "discovered automatically" : "(none)"}`,
+		...(result.discoveryEnabled
+			? [
+					result.discoveryType === "openai-models-list"
+						? "Discovery: live OpenAI /v1/models catalog"
+						: `Discovery: live ${result.discoveryType ?? "provider"} catalog`,
+				]
+			: []),
 		`Base URL: ${result.baseUrl}`,
 		`API key: ${result.credentialSource === "env" ? `${result.redactedApiKey} (environment variable)` : result.redactedApiKey}`,
 		`Config: ${result.modelsPath}`,
