@@ -115,6 +115,26 @@ describe("startup dynamic model refresh", () => {
 		expect(refreshed).toBe(true);
 		expect(fixture.refreshCalls).toEqual([["glm-zcode", "online-if-uncached"]]);
 	});
+	test("refreshes a runtime-descriptor provider the discovery manager does not list", async () => {
+		const fixture = setup({ providers: ["dynamic-provider"] });
+
+		const refreshed = await refreshMissingQualifiedModelProviders("devin/swe-2-max", fixture.modelRegistry as never);
+
+		expect(refreshed).toBe(true);
+		expect(fixture.refreshCalls).toEqual([["devin", "online-if-uncached"]]);
+	});
+
+	test("canonicalizes descriptor provider casing and still ignores unknown providers", async () => {
+		const fixture = setup({ providers: [] });
+
+		const refreshed = await refreshMissingQualifiedModelProviders(
+			["DEVIN/adaptive", "not-a-descriptor/model"],
+			fixture.modelRegistry as never,
+		);
+
+		expect(refreshed).toBe(true);
+		expect(fixture.refreshCalls).toEqual([["devin", "online-if-uncached"]]);
+	});
 
 	test("preserves explicit provider qualifiers and suppresses credential, profile, and resume refreshes", () => {
 		const settings = Settings.isolated({ modelRoles: { default: "dynamic-provider/default-model" } });

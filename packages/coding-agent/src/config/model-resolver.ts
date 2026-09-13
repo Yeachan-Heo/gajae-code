@@ -9,6 +9,7 @@ import {
 	type KnownProvider,
 	type Model,
 	modelsAreEqual,
+	PROVIDER_DESCRIPTORS,
 } from "@gajae-code/ai/core";
 
 import { logger } from "@gajae-code/utils";
@@ -92,9 +93,13 @@ export async function refreshMissingQualifiedModelProviders(
 	for (const selector of normalizeModelSelectorValue(selectors)) {
 		const parsedSelector = parseModelString(selector);
 		if (!parsedSelector) continue;
-		const provider = modelRegistry
-			.getDiscoverableProviders()
-			.find(candidate => candidate.toLowerCase() === parsedSelector.provider.toLowerCase());
+		const provider =
+			modelRegistry
+				.getDiscoverableProviders()
+				.find(candidate => candidate.toLowerCase() === parsedSelector.provider.toLowerCase()) ??
+			PROVIDER_DESCRIPTORS.find(
+				descriptor => descriptor.providerId.toLowerCase() === parsedSelector.provider.toLowerCase(),
+			)?.providerId;
 		if (!provider || refreshedProviders.has(provider)) continue;
 		const availableModels = modelRegistry.getAvailable();
 		const rawModelId = selector.slice(selector.indexOf("/") + 1);
