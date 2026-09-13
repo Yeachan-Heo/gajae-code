@@ -2686,8 +2686,10 @@ export class AgentSession {
 		AgentMessage,
 		(promotion: { startsOwnRun?: boolean; removed?: boolean }) => void
 	>();
-	/** SDK-owned follow-ups held outside Agent's live queue until the active run ends. */
+	/** Deferred follow-ups held outside Agent's live queue until the active run ends. */
 	#deferredSdkFollowUps: AgentMessage[] = [];
+	/** Per-message delivery policy for deferred follow-ups; WeakSet metadata survives array snapshots. */
+	#deferredFollowUpForceOneAtATime = new WeakSet<AgentMessage>();
 	// Client/SDK steering (turn.prompt diverted to steer while streaming, or an
 	// explicit turn.steer) is an independent root-turn request ONLY when it is
 	// admitted AFTER the terminal abort snapshot: a terminal abort admitted
@@ -14014,6 +14016,7 @@ export class AgentSession {
 				let removed = false;
 				if (deferredIndex !== -1) {
 					this.#deferredSdkFollowUps.splice(deferredIndex, 1);
+					this.#deferredFollowUpForceOneAtATime.delete(message);
 					removed = true;
 				} else {
 					removed = this.agent.removeQueuedMessages(candidate => candidate === message).followUp > 0;
@@ -14039,6 +14042,9 @@ export class AgentSession {
 			this.#deferredSdkFollowUps.length > 0 ||
 			(options?.sdkRunToken && (this.agent.state.isStreaming || this.agent.hasQueuedMessages()))
 		) {
+			if (options?.forceOneAtATime || options?.sdkRunToken) {
+				this.#deferredFollowUpForceOneAtATime.add(message);
+			}
 			this.#deferredSdkFollowUps.push(message);
 		} else {
 			this.agent.followUp(message, options?.forceOneAtATime ? { forceOneAtATime: true } : undefined);
@@ -14060,7 +14066,8 @@ export class AgentSession {
 		if (this.agent.hasQueuedMessages()) return false;
 		const message = this.#deferredSdkFollowUps.shift();
 		if (!message) return false;
-		this.agent.followUp(message, { forceOneAtATime: true });
+		const forceOneAtATime = this.#deferredFollowUpForceOneAtATime.delete(message);
+		this.agent.followUp(message, forceOneAtATime ? { forceOneAtATime: true } : undefined);
 		if (this.#sessionTransitionKind !== undefined || this.#handoffTransitionActive) {
 			this.#queuedDeliveryPendingWhileTransition = true;
 			return true;
@@ -15117,6 +15124,7 @@ export class AgentSession {
 			const deferredIndex = this.#deferredSdkFollowUps.indexOf(removedMessage);
 			if (deferredIndex !== -1) {
 				this.#deferredSdkFollowUps.splice(deferredIndex, 1);
+				this.#deferredFollowUpForceOneAtATime.delete(removedMessage);
 			} else {
 				this.agent.removeQueuedMessages(candidate => candidate === removedMessage);
 			}
