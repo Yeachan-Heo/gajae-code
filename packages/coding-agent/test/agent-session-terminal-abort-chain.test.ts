@@ -1224,6 +1224,7 @@ describe("terminal abort registers a turn scope so left-running owned work class
 		await waitFor(() => promoted === 1, "steer ownership hook fired");
 		expect(promoted).toBe(1);
 		await session.waitForIdle();
+		await session.awaitCoordinatorRuntimeStatePersistenceForTests();
 	}, 30_000);
 
 	it("rejects a steering snapshot token captured for an earlier turn", async () => {
@@ -1245,6 +1246,7 @@ describe("terminal abort registers a turn scope so left-running owned work class
 		await session.abortPromptAndWait(handle, { graceMs: TEST_ABORT_GRACE_MS, terminal: { scope: "turn" } });
 		await secondPrompt;
 		await session.waitForIdle();
+		await session.awaitCoordinatorRuntimeStatePersistenceForTests();
 	}, 30_000);
 
 	it("terminal abort preserves a queued external follow-up through the purge and rearms it", async () => {
