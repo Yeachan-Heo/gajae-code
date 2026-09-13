@@ -24238,6 +24238,7 @@ export class AgentSession {
 			let unavailableDefaultChainMessage: string | undefined;
 			let recoveredDefaultChainMessage: string | undefined;
 			let recoveredDefaultChain = false;
+			let recoveredDefaultThinkingLevel: ThinkingLevel | undefined;
 			let fallbackResolutionController: FallbackChainController | undefined;
 			let profileCleanupAppliedBeforeResolution = false;
 			let transitionCleanupCommitted = false;
@@ -24339,6 +24340,9 @@ export class AgentSession {
 						: liveProfileIdentity === nextActiveModelProfile && !switchingToDifferentSession
 							? (previousActiveModelProfileScope ??
 								(configuredProfileIdentity === nextActiveModelProfile ? "durable" : "session"))
+							: configuredDefaultChain?.origin === "profile-activation" &&
+								persistedProfileIdentity === nextActiveModelProfile
+								? "durable"
 							: configuredProfileIdentity === nextActiveModelProfile
 								? "durable"
 								: "session";
@@ -24346,7 +24350,9 @@ export class AgentSession {
 					(resumeModelBehavior === "useCurrentDefault" &&
 						(previousActiveModelProfile !== nextActiveModelProfile ||
 							(switchingToDifferentSession && previousActiveModelProfileScope === "session"))) ||
-					(switchingToDifferentSession && previousActiveModelProfile !== nextActiveModelProfile);
+					(switchingToDifferentSession &&
+						(previousActiveModelProfile !== nextActiveModelProfile ||
+							previousActiveModelProfileScope !== nextActiveModelProfileScope));
 				if (profileOwnershipMustReset) {
 					const predecessorProfileWasSessionScoped =
 						previousActiveModelProfile !== undefined && previousActiveModelProfileScope !== "durable";
@@ -24367,6 +24373,7 @@ export class AgentSession {
 					profileCleanupAppliedBeforeResolution = true;
 				}
 				let runtimeProfileDefaultChain: readonly string[] | undefined;
+				let runtimeProfileDefaultModel: Model | undefined;
 				let runtimeProfileDefaultThinkingLevel: ThinkingLevel | undefined;
 				if (
 					resumeModelBehavior === "keepSessionModel" &&
@@ -24376,7 +24383,10 @@ export class AgentSession {
 						previousActiveModelProfileScope !== nextActiveModelProfileScope)
 				) {
 					try {
-						await this.#applyRuntimeModelProfile(nextActiveModelProfile);
+						const profileActivation = await this.#applyRuntimeModelProfile(nextActiveModelProfile);
+						runtimeProfileDefaultChain = profileActivation.defaultChain;
+						runtimeProfileDefaultModel = profileActivation.defaultModel;
+						runtimeProfileDefaultThinkingLevel = profileActivation.defaultThinkingLevel;
 					} catch (error) {
 						if (!(error instanceof ModelProfileCredentialError)) throw error;
 						this.emitNotice("warning", error.message, "model-profile");
@@ -24391,17 +24401,21 @@ export class AgentSession {
 				) {
 					const profileActivation = await this.#applyRuntimeModelProfile(nextActiveModelProfile);
 					runtimeProfileDefaultChain = profileActivation.defaultChain;
+					runtimeProfileDefaultModel = profileActivation.defaultModel;
 					runtimeProfileDefaultThinkingLevel = profileActivation.defaultThinkingLevel;
 				}
 				this.setActiveModelProfile(nextActiveModelProfile, nextActiveModelProfileScope);
 				const settingsDefaultEntries = normalizeModelSelectorValue(this.settings.getModelRole("default"));
+				const savedDefaultEntries =
+					configuredDefaultChain?.entries ?? (sessionContext.models.default ? [sessionContext.models.default] : []);
 				const defaultEntries =
 					resumeModelBehavior === "useCurrentDefault"
 						? runtimeProfileDefaultChain?.length
 							? runtimeProfileDefaultChain
 							: settingsDefaultEntries
-						: (configuredDefaultChain?.entries ??
-							(sessionContext.models.default ? [sessionContext.models.default] : []));
+					: savedDefaultEntries.length > 0
+						? savedDefaultEntries
+						: runtimeProfileDefaultChain ?? [];
 				this.#defaultFallbackController = undefined;
 				this.#preserveLoadedLegacyDefaultChain =
 					resumeModelBehavior !== "useCurrentDefault" && configuredDefaultChain?.origin === "legacy_session";
@@ -24418,11 +24432,14 @@ export class AgentSession {
 							...(this.#persistedModelProfileAliasIntent("default") ?? {}),
 						},
 					);
-					let controller = runtimeProfileDefaultChain?.length
+					const useRuntimeProfileDefault =
+						runtimeProfileDefaultChain?.length &&
+						(resumeModelBehavior === "useCurrentDefault" || savedDefaultEntries.length === 0);
+					let controller = useRuntimeProfileDefault
 						? new FallbackChainController(
 								{
 									role: "default",
-									entries: [...runtimeProfileDefaultChain],
+									entries: [...(runtimeProfileDefaultChain ?? [])],
 									origin: "runtime",
 									identity: nextActiveModelProfile,
 									explicitHead: true,
@@ -24435,7 +24452,8 @@ export class AgentSession {
 									this.settings.get("fallback.maxAttempts"),
 								)
 							: this.#defaultFallbackChain(false);
-					if (resumeModelBehavior === "useCurrentDefault") this.#defaultFallbackController = controller;
+					if (resumeModelBehavior === "useCurrentDefault" || useRuntimeProfileDefault)
+						this.#defaultFallbackController = controller;
 					this.#seedDefaultFallbackResolutionForController(
 						controller,
 						resolution.activeIndex,
@@ -24510,6 +24528,7 @@ export class AgentSession {
 									);
 									if (controller.activeIndex > 0) fallbackResolutionController = controller;
 									resolvedModel = recovered.model;
+									recoveredDefaultThinkingLevel = recovered.thinkingLevel;
 									recoveredDefaultChain = true;
 									recoveredDefaultChainMessage =
 										"Saved session model is no longer registered; restored the durable default preset instead.";
@@ -24524,13 +24543,20 @@ export class AgentSession {
 					if (!this.model || !modelsAreEqual(this.model, resolvedModel)) {
 						this.#setModelAuthoritatively(resolvedModel, "restore");
 					}
-					if (runtimeProfileDefaultChain?.length)
+					if (runtimeProfileDefaultChain?.length || recoveredDefaultChain)
 						this.#modelRegistry.seedCanonicalVariant?.(this.sessionId, resolvedModel);
 					await this.#syncEditToolModeAfterModelChange(previousEditMode);
 					// No thinking-level write here: the recompute below is the single
 					// chain-resolution restore rule. Writing the resolved suffix level
 					// would append a stray thinking_level_change entry that flips
 					// hasThinkingEntry and changes what the recompute restores.
+				} else if (resumeModelBehavior === "keepSessionModel" && switchingToDifferentSession) {
+					const restoredDefault = runtimeProfileDefaultModel ?? this.resolveConfiguredDefaultModel();
+					if (restoredDefault && (!this.model || !modelsAreEqual(this.model, restoredDefault))) {
+						this.#setModelAuthoritatively(restoredDefault, "restore");
+					} else if (!restoredDefault && this.model) {
+						this.#setAgentModelWithReasoningContext(undefined);
+					}
 				}
 
 				const hasThinkingEntry = this.sessionManager
@@ -24569,8 +24595,14 @@ export class AgentSession {
 				if (switchingToDifferentSession && !profileCleanupAppliedBeforeResolution) {
 					const predecessorProfileWasSessionScoped =
 						previousActiveModelProfile !== undefined && previousActiveModelProfileScope !== "durable";
+					const successorProfileName = recoveredDefaultChain
+						? this.getActiveModelProfile()
+						: nextActiveModelProfile;
+					const successorProfileScope = recoveredDefaultChain
+						? this.#activeModelProfileScope
+						: nextActiveModelProfileScope;
 					const preserveSuccessorProfile =
-						nextActiveModelProfile !== undefined && nextActiveModelProfileScope === "durable";
+						successorProfileName !== undefined && successorProfileScope === "durable";
 					this.#resetSessionScopedModelProfileState({
 						preserveDefaultConfiguredChain:
 							switchingToDifferentSession || recoveredDefaultChain || preserveSuccessorProfile,
@@ -24579,7 +24611,7 @@ export class AgentSession {
 						...(preserveSuccessorProfile
 							? {
 									preserveActiveModelProfile: {
-										name: nextActiveModelProfile,
+									name: successorProfileName!,
 										scope: "durable" as const,
 									},
 								}
@@ -24767,6 +24799,8 @@ export class AgentSession {
 					this.#baseSystemPrompt = previousBaseSystemPrompt;
 					this.agent.setSystemPrompt(previousSystemPrompt);
 				}
+				this.#selectedMCPToolNames = new Set(previousSelectedMCPToolNames);
+				this.#setGuardedAgentTools(previousTools);
 				this.#baseSystemPrompt = previousBaseSystemPrompt;
 				this.agent.setSystemPrompt(previousSystemPrompt);
 				this.agent.replaceMessages(previousAgentMessages, {

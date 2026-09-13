@@ -1815,14 +1815,23 @@ export async function runRootCommand(
 	const savedResumeSelector = resumedSessionContext?.configuredModelChains.default?.entries?.length
 		? resumedSessionContext.configuredModelChains.default.entries
 		: resumedSessionContext?.models.default;
-	const resumedSessionHasModel =
+	const savedResumeResolution =
 		resumedSessionAtOpen &&
-		settingsInstance.get("session.resumeModelBehavior") !== "useCurrentDefault" &&
 		savedResumeSelector !== undefined &&
 		resolveModelRoleValue(savedResumeSelector, modelRegistry.getAvailable(), {
 			settings: settingsInstance,
 			modelRegistry,
-		}).model !== undefined;
+		}).model;
+	const savedResumeModel = savedResumeResolution || undefined;
+	const preferredResumeProvider = preferredCredentialSelector
+		? (preferredCredentialSelector.provider ??
+			authStorage.resolveRuntimePreferredCredentialSelectorProvider(preferredCredentialSelector.selector))
+		: undefined;
+	const resumedSessionHasModel =
+		resumedSessionAtOpen &&
+		settingsInstance.get("session.resumeModelBehavior") !== "useCurrentDefault" &&
+		savedResumeModel !== undefined &&
+		(preferredResumeProvider === undefined || savedResumeModel.provider === preferredResumeProvider);
 
 	// Restore the resumed session's working directory so the HUD branch, the
 	// project path, and the agent's tools all match where the session was

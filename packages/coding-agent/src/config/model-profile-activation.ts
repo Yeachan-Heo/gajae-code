@@ -1808,7 +1808,23 @@ export async function materializeModelProfileForDeletion(
 		}
 		prepared.settings.override("modelRoles", nextModelRoles);
 		prepared.settings.override("task.agentModelOverrides", nextAgentModelOverrides);
-		prepared.session.setActiveModelProfile?.(undefined);
+		if (!retainsDifferentDurableProfile) prepared.session.setActiveModelProfile?.(undefined);
+		else {
+			const retainedProfileName = resolveModelProfileName(
+				previousPersistedDefaultProfile!,
+				prepared.modelRegistry.getModelProfiles(),
+			);
+			const retainedProfile = await prepareModelProfileActivation({
+				...options,
+				profileName: retainedProfileName,
+				profileScope: "durable",
+			});
+			await applyPreparedModelProfileActivation(retainedProfile, {
+				profileScope: "durable",
+				preserveConfiguredDefaultChain: true,
+				preserveCurrentModel: true,
+			});
+		}
 		if (prepared.defaultChain.length > 0 || deletesOwnedDefaultChain) {
 			defaultChainChanged = true;
 			prepared.session.setConfiguredModelChain(
@@ -1820,7 +1836,7 @@ export async function materializeModelProfileForDeletion(
 			);
 		}
 		await prepared.settings.flushOrThrow();
-		prepared.session.clearProfileInstalledOverrides?.();
+		if (!retainsDifferentDurableProfile) prepared.session.clearProfileInstalledOverrides?.();
 	} catch (error) {
 		const previousChain = prepared.previousDefaultChainState;
 		const rollbackErrors: unknown[] = [];
