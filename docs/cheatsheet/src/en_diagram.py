@@ -1,8 +1,11 @@
-"""영문 워크플로 다이어그램의 단계 번호 오류를 바로잡는다.
+"""영문 워크플로 다이어그램을 그린다.
 
-원본(PaperBanana)은 승인 게이트를 번호 없는 다이아몬드로 그려놓고
-마지막 박스를 "Stage 4" 로 적었다. 3단계 박스가 없으니 번호가 어긋난다.
-한글판과 동일한 경로(OpenAI Image 2.5 편집)로 다시 그려 짝을 맞춘다.
+번호 계약: 박스는 1·2·3 세 개뿐이고 승인 게이트는 번호가 없다.
+gen_workflow.py 의 method 텍스트와 같은 계약이다.
+
+(이력: PaperBanana 1차 출력은 게이트를 번호 없이 그려놓고 마지막 박스를
+"Stage 4" 로 적어 번호가 어긋났다. gen_workflow.py 를 고쳐 상류에서
+막았고, 이 프롬프트는 같은 계약을 재확인한다.)
 """
 import base64
 import os
@@ -43,9 +46,9 @@ Labels, left to right:
   four cells: "executor (writes code)", "architect (read-only review)",
               "planner (sequencing)", "critic (plan critique)"
 
-IMPORTANT: the last box must read "Stage 3", not "Stage 4". The original is
-wrong because the approval gate is an unnumbered diamond, so there is no
-Stage 3 box and the numbering skips. Fix it.
+IMPORTANT: there are exactly three numbered boxes (1, 2, 3). The approval gate
+is a decision diamond and carries no stage number, so the numbering must not
+skip: the last box reads "Stage 3", never "Stage 4".
 """
 
 

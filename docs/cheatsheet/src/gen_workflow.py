@@ -24,7 +24,10 @@ METHOD = """
 # Gajae-Code: plan-gated agent workflow
 
 A coding agent pipeline where every mutation is gated behind an approved plan.
-The flow moves strictly left to right through four stages.
+The flow moves strictly left to right through three numbered stages with an
+unnumbered approval gate between stage 2 and stage 3. The gate is a decision
+point, not a stage — do not give it a number, and do not skip a number because
+of it.
 
 ## Stage 1 — deep-interview (requirements)
 A vague user request enters here. This stage only asks questions and writes a
@@ -36,12 +39,13 @@ Consumes the specification and produces an implementation plan, then runs an
 adversarial critique pass against that plan. Still read-only.
 Output: a reconciled plan receipt.
 
-## Stage 3 — APPROVAL GATE
+## APPROVAL GATE (unnumbered)
 A distinct diamond-shaped decision gate drawn between stage 2 and stage 3.
-Nothing downstream may write files until this gate passes. Label it
-"approval gate: no mutation before this point". This is the visual centerpiece.
+It carries no stage number. Nothing downstream may write files until this gate
+passes. Label it "approval gate: no mutation before this point". This is the
+visual centerpiece.
 
-## Stage 4 — ultragoal (execution + evidence)
+## Stage 3 — ultragoal (execution + evidence)
 Only after the gate: tracks goals through execution, revision, verification,
 and evidence collection. This is the only stage allowed to mutate the repo.
 
