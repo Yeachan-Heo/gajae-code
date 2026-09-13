@@ -460,11 +460,13 @@ type StartupModelProfileArgs = {
 	session: AgentSession;
 	settings: Settings;
 	modelRegistry: ModelRegistry;
-	parsedArgs: Pick<Args, "default" | "model" | "mpreset" | "thinking">;
+	parsedArgs: Pick<Args, "continue" | "default" | "model" | "mpreset" | "resume" | "thinking">;
 	startupModel?: CreateAgentSessionOptions["model"];
 	startupThinkingLevel?: CreateAgentSessionOptions["thinkingLevel"];
 	preferCachedModels?: boolean;
 	preferCachedDefaultProfile?: boolean;
+	isResumedSession?: boolean;
+	resumedSessionHasModel?: boolean;
 };
 
 async function applyStartupModelProfilesWithPolicy(
@@ -474,12 +476,23 @@ async function applyStartupModelProfilesWithPolicy(
 	const applyProfile = async (
 		profileName: string,
 		persistDefault: boolean,
-		options: { thinkingLevelOverride?: CreateAgentSessionOptions["thinkingLevel"] } = {},
+		options: {
+			profileScope?: "session" | "durable";
+			thinkingLevelOverride?: CreateAgentSessionOptions["thinkingLevel"];
+			preserveConfiguredDefaultChain?: boolean;
+			preserveCurrentModel?: boolean;
+		} = {},
 	): Promise<boolean> => {
 		try {
 			await activateModelProfile(
 				{ session: args.session, modelRegistry: args.modelRegistry, settings: args.settings, profileName },
-				{ persistDefault, thinkingLevelOverride: options.thinkingLevelOverride },
+				{
+					persistDefault,
+					profileScope: options.profileScope ?? (persistDefault ? "durable" : "session"),
+					thinkingLevelOverride: options.thinkingLevelOverride,
+					preserveConfiguredDefaultChain: options.preserveConfiguredDefaultChain,
+					preserveCurrentModel: options.preserveCurrentModel,
+				},
 			);
 			return true;
 		} catch (error) {
@@ -496,6 +509,12 @@ async function applyStartupModelProfilesWithPolicy(
 	// deferred `--model <pattern>` path resolved inside createAgentSession.
 	const explicitModel = args.parsedArgs.model ? (args.startupModel ?? args.session.model) : undefined;
 	const defaultProfile = args.settings.get("modelProfile.default");
+	const preserveResumedSessionModel =
+		args.isResumedSession === true &&
+		args.resumedSessionHasModel === true &&
+		args.settings.get("session.resumeModelBehavior") === "keepSessionModel" &&
+		args.parsedArgs.model === undefined &&
+		args.parsedArgs.mpreset === undefined;
 	const preferCachedProfiles =
 		(args.preferCachedModels === true && args.parsedArgs.mpreset !== undefined) ||
 		(args.preferCachedDefaultProfile === true && defaultProfile !== undefined);
@@ -504,9 +523,12 @@ async function applyStartupModelProfilesWithPolicy(
 		if (defaultProfile) {
 			applied =
 				(await applyProfile(defaultProfile, false, {
+					profileScope: "durable",
 					thinkingLevelOverride: args.settings.has("defaultThinkingLevel")
 						? args.settings.get("defaultThinkingLevel")
 						: undefined,
+					preserveConfiguredDefaultChain: preserveResumedSessionModel,
+					preserveCurrentModel: preserveResumedSessionModel,
 				})) && applied;
 		}
 		if (args.parsedArgs.mpreset) {
@@ -533,6 +555,13 @@ async function applyStartupModelProfilesWithPolicy(
 			await args.modelRegistry.refresh("online-if-uncached", args.session.credentialSessionId);
 		}
 		await applyConfiguredProfiles();
+	}
+	if (preserveResumedSessionModel) {
+		const fallbackState = args.session.getDefaultFallbackRuntimeState();
+		args.session.restoreDefaultFallbackRuntimeState({
+			...fallbackState,
+			preserveLoadedLegacyDefaultChain: true,
+		});
 	}
 
 	// Explicit CLI --model/--thinking must win over any activated or skipped profile.
@@ -1779,6 +1808,30 @@ export async function runRootCommand(
 			return;
 		}
 	}
+	const resumedSessionAtOpen =
+		(sessionManager?.hasHistoryEntries() ?? false) &&
+		(parsedArgs.continue === true || parsedArgs.resume !== undefined);
+	const resumedSessionContext = resumedSessionAtOpen ? sessionManager?.buildSessionContext() : undefined;
+	const savedResumeSelector = resumedSessionContext?.configuredModelChains.default?.entries?.length
+		? resumedSessionContext.configuredModelChains.default.entries
+		: resumedSessionContext?.models.default;
+	const savedResumeResolution =
+		resumedSessionAtOpen &&
+		savedResumeSelector !== undefined &&
+		resolveModelRoleValue(savedResumeSelector, modelRegistry.getAvailable(), {
+			settings: settingsInstance,
+			modelRegistry,
+		}).model;
+	const savedResumeModel = savedResumeResolution || undefined;
+	const preferredResumeProvider = preferredCredentialSelector
+		? (preferredCredentialSelector.provider ??
+			authStorage.resolveRuntimePreferredCredentialSelectorProvider(preferredCredentialSelector.selector))
+		: undefined;
+	const resumedSessionHasModel =
+		resumedSessionAtOpen &&
+		settingsInstance.get("session.resumeModelBehavior") !== "useCurrentDefault" &&
+		savedResumeModel !== undefined &&
+		(preferredResumeProvider === undefined || savedResumeModel.provider === preferredResumeProvider);
 
 	// Restore the resumed session's working directory so the HUD branch, the
 	// project path, and the agent's tools all match where the session was
@@ -2034,6 +2087,8 @@ export async function runRootCommand(
 				initialMessage,
 				initialMessages: parsedArgs.messages,
 				resumeAction: bareResumeAction,
+				isResumedSession: resumedSessionAtOpen,
+				resumedSessionHasModel,
 			};
 			if (isInteractive && parsedArgs.mpreset) {
 				const ready = Promise.withResolvers<void>();

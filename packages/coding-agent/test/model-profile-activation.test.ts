@@ -12,12 +12,14 @@ import {
 	materializeActiveModelProfileAssignments,
 	materializeModelProfileForDeletion,
 	prepareModelProfileActivation,
+	resolveModelProfileDefaultChain,
 	restoreMaterializedModelProfileForDeletion,
 } from "../src/config/model-profile-activation";
 
 import type { ModelProfileDefinition } from "../src/config/model-profiles";
 import { BUILTIN_MODEL_PROFILES, mergeModelProfiles } from "../src/config/model-profiles";
 import { kNoAuth, ModelRegistry } from "../src/config/model-registry";
+import type { ModelSelectorValue } from "../src/config/model-selector-value";
 import { Settings } from "../src/config/settings";
 import { AgentSession, type DefaultFallbackRuntimeState } from "../src/session/agent-session";
 import { AuthStorage } from "../src/session/auth-storage";
@@ -147,6 +149,12 @@ function fakeRegistry(options?: { missingProviders?: string[]; profiles?: ModelP
 
 function fakeSession(initial = model("provider-a", "initial")) {
 	let activeModelProfile: string | undefined;
+	let activeModelProfileScope: "session" | "durable" | undefined;
+	let profileInstalledOverrideState = {
+		modelRoles: {} as Record<string, ModelSelectorValue | undefined>,
+		agentModelOverrides: {} as Record<string, ModelSelectorValue | undefined>,
+		preProfileModel: initial as Model | undefined,
+	};
 	return {
 		model: initial as Model | undefined,
 		thinkingLevel: ThinkingLevel.Low as ThinkingLevel | undefined,
@@ -178,7 +186,12 @@ function fakeSession(initial = model("provider-a", "initial")) {
 			this.configuredModelChains.set(role, [...entries]);
 			this.configuredModelChainStates.set(role, { entries: [...entries], origin, identity, explicitHead });
 		},
-		seedDefaultFallbackResolution(activeIndex: number, skips: Array<{ selector: string; reason: string }>) {
+		seedDefaultFallbackResolution(
+			activeIndex: number,
+			skips: Array<{ selector: string; reason: string }>,
+			emitEvent = true,
+		) {
+			if (!emitEvent) return;
 			this.seedDefaultFallbackResolutionCalls.push({ activeIndex, skips });
 		},
 		async setModelTemporary(next: Model, thinkingLevel?: ThinkingLevel) {
@@ -196,11 +209,55 @@ function fakeSession(initial = model("provider-a", "initial")) {
 		getSessionDefaultModelSelector() {
 			return this.resumeDefaultSelectors.at(-1);
 		},
-		setActiveModelProfile(name: string | undefined) {
+		setActiveModelProfile(name: string | undefined, scope: "session" | "durable" = "durable") {
 			activeModelProfile = name;
+			activeModelProfileScope = name === undefined ? undefined : scope;
 		},
 		getActiveModelProfile() {
 			return activeModelProfile;
+		},
+		getActiveModelProfileScope() {
+			return activeModelProfileScope;
+		},
+		noteProfileInstalledOverrides(
+			modelRoles: readonly string[],
+			agentModelOverrides: readonly string[],
+			preProfileModel: Model | undefined,
+			previousModelRoles?: Readonly<Record<string, ModelSelectorValue>>,
+			previousAgentModelOverrides?: Readonly<Record<string, ModelSelectorValue>>,
+		) {
+			profileInstalledOverrideState = {
+				modelRoles: Object.fromEntries(modelRoles.map(role => [role, previousModelRoles?.[role]])),
+				agentModelOverrides: Object.fromEntries(
+					agentModelOverrides.map(role => [role, previousAgentModelOverrides?.[role]]),
+				),
+				preProfileModel,
+			};
+		},
+		clearProfileInstalledOverrides() {
+			profileInstalledOverrideState = {
+				modelRoles: {},
+				agentModelOverrides: {},
+				preProfileModel: undefined,
+			};
+		},
+		getProfileInstalledOverrideState() {
+			return {
+				modelRoles: { ...profileInstalledOverrideState.modelRoles },
+				agentModelOverrides: { ...profileInstalledOverrideState.agentModelOverrides },
+				preProfileModel: profileInstalledOverrideState.preProfileModel,
+			};
+		},
+		restoreProfileInstalledOverrideState(state: {
+			modelRoles: Readonly<Record<string, ModelSelectorValue | undefined>>;
+			agentModelOverrides: Readonly<Record<string, ModelSelectorValue | undefined>>;
+			preProfileModel: Model | undefined;
+		}) {
+			profileInstalledOverrideState = {
+				modelRoles: { ...state.modelRoles },
+				agentModelOverrides: { ...state.agentModelOverrides },
+				preProfileModel: state.preProfileModel,
+			};
 		},
 	};
 }
@@ -336,6 +393,163 @@ describe("model profile activation", () => {
 			authStorage.close();
 			tempDir.removeSync();
 		}
+	});
+
+	test("durable default recovery excludes a bundled default absent from the activation catalog", async () => {
+		const profile: ModelProfileDefinition = {
+			name: "excluded-bundled-default",
+			requiredProviders: ["anthropic"],
+			modelMapping: { default: "anthropic/claude-opus-5" },
+			source: "builtin",
+		};
+		const baseRegistry = fakeRegistry({ profiles: [profile] });
+		const getAvailableForProfileActivation = vi.fn(() => [] as Model[]);
+		const registry = {
+			...baseRegistry,
+			getAvailable: baseRegistry.getAll,
+			getAvailableForProfileActivation,
+		} as unknown as ModelRegistry;
+
+		expect(registry.getAvailable().some(candidate => candidate.id === "claude-opus-5")).toBe(true);
+		const recovery = await resolveModelProfileDefaultChain({
+			modelRegistry: registry,
+			settings: Settings.isolated(),
+			profileName: profile.name,
+			credentialSessionId: "resume-session",
+		});
+
+		expect(getAvailableForProfileActivation).toHaveBeenCalledTimes(1);
+		expect(recovery.entries).toEqual([]);
+	});
+
+	test("durable default recovery keeps an excluded bare bundled default unavailable", async () => {
+		const profile: ModelProfileDefinition = {
+			name: "excluded-bare-bundled-default",
+			requiredProviders: ["anthropic"],
+			modelMapping: { default: "claude-opus-5" },
+			source: "builtin",
+		};
+		const baseRegistry = fakeRegistry({ profiles: [profile] });
+		const getAvailableForProfileActivation = vi.fn(() => [] as Model[]);
+		const registry = {
+			...baseRegistry,
+			getAvailable: baseRegistry.getAll,
+			getAvailableForProfileActivation,
+		} as unknown as ModelRegistry;
+
+		await expect(
+			resolveModelProfileDefaultChain({
+				modelRegistry: registry,
+				settings: Settings.isolated(),
+				profileName: profile.name,
+				credentialSessionId: "resume-session",
+			}),
+		).resolves.toEqual({ profileName: profile.name, entries: [] });
+	});
+
+	test("durable default recovery keeps a known unauthenticated bare default unavailable", async () => {
+		const profile: ModelProfileDefinition = {
+			name: "known-unauthenticated-bare-default",
+			requiredProviders: [],
+			modelMapping: { default: "default" },
+			source: "user",
+		};
+		const baseRegistry = fakeRegistry({ profiles: [profile] });
+		const registry = {
+			...baseRegistry,
+			getAvailable: baseRegistry.getAll,
+			getAvailableForProfileActivation: () => [] as Model[],
+			getApiKeyForProvider: async () => undefined,
+		} as unknown as ModelRegistry;
+
+		await expect(
+			resolveModelProfileDefaultChain({
+				modelRegistry: registry,
+				settings: Settings.isolated(),
+				profileName: profile.name,
+				credentialSessionId: "resume-session",
+			}),
+		).resolves.toEqual({ profileName: profile.name, entries: [] });
+	});
+
+	test("durable default recovery does not mutate canonical session stickiness", async () => {
+		const profile: ModelProfileDefinition = {
+			name: "sticky-isolated-default",
+			requiredProviders: [],
+			modelMapping: { default: "default" },
+			source: "user",
+		};
+		const baseRegistry = fakeRegistry({ profiles: [profile] });
+		const clearCanonicalVariant = vi.fn();
+		const registry = {
+			...baseRegistry,
+			getAvailable: () => [] as Model[],
+			getAvailableForProfileActivation: () => [] as Model[],
+			getSessionCanonicalVariant: () => "provider-a/default",
+			clearCanonicalVariant,
+			getApiKeyForProvider: async () => undefined,
+		} as unknown as ModelRegistry;
+
+		await expect(
+			resolveModelProfileDefaultChain({
+				modelRegistry: registry,
+				settings: Settings.isolated(),
+				profileName: profile.name,
+				credentialSessionId: "resume-session",
+			}),
+		).resolves.toEqual({ profileName: profile.name, entries: [] });
+		expect(clearCanonicalVariant).not.toHaveBeenCalled();
+	});
+
+	test("durable default recovery ignores an optional mapped provider auth probe failure", async () => {
+		const profile: ModelProfileDefinition = {
+			name: "optional-mapped-provider",
+			requiredProviders: ["provider-a"],
+			modelMapping: { default: "provider-a/default", executor: "provider-b/executor" },
+			source: "user",
+		};
+		const baseRegistry = fakeRegistry({ profiles: [profile] });
+		const registry = {
+			...baseRegistry,
+			getApiKeyForProvider: async (provider: string) => {
+				if (provider === "provider-b") throw new Error("optional provider lookup failed");
+				return "key-provider-a";
+			},
+		} as unknown as ModelRegistry;
+
+		await expect(
+			resolveModelProfileDefaultChain({
+				modelRegistry: registry,
+				settings: Settings.isolated(),
+				profileName: profile.name,
+				credentialSessionId: "resume-session",
+			}),
+		).resolves.toEqual({ profileName: profile.name, entries: ["provider-a/default"] });
+	});
+
+	test("durable default recovery rejects a required provider auth probe failure", async () => {
+		const profile: ModelProfileDefinition = {
+			name: "required-provider",
+			requiredProviders: ["provider-a"],
+			modelMapping: { default: "provider-a/default" },
+			source: "user",
+		};
+		const baseRegistry = fakeRegistry({ profiles: [profile] });
+		const registry = {
+			...baseRegistry,
+			getApiKeyForProvider: async () => {
+				throw new Error("required provider lookup failed");
+			},
+		} as unknown as ModelRegistry;
+
+		await expect(
+			resolveModelProfileDefaultChain({
+				modelRegistry: registry,
+				settings: Settings.isolated(),
+				profileName: profile.name,
+				credentialSessionId: "resume-session",
+			}),
+		).rejects.toThrow("required provider lookup failed");
 	});
 
 	test("notifies mounted consumers when fresh discovery evidence changes from non-empty to empty", async () => {
@@ -2324,7 +2538,49 @@ describe("preset-equivalent profile activation", () => {
 		expect(session.getSessionDefaultModelSelector()).toBe("provider-a/opus-real");
 	});
 
-	// A transient live-model switch (no canonical identity, unrelated to the
+	test("activation rollback restores the prior session-only profile scope", async () => {
+		const session = fakeSession();
+		session.setActiveModelProfile("prior-profile", "session");
+		const settings = Settings.isolated();
+		const prepared = await prepareModelProfileActivation({
+			session,
+			modelRegistry: fakeRegistry(),
+			settings,
+			profileName: "profile-a",
+		});
+		vi.spyOn(settings, "flushOrThrow").mockRejectedValueOnce(new Error("flush failed"));
+
+		await expect(applyPreparedModelProfileActivation(prepared, { persistDefault: true })).rejects.toThrow(
+			"flush failed",
+		);
+		expect(session.getActiveModelProfile()).toBe("prior-profile");
+		expect(session.getActiveModelProfileScope()).toBe("session");
+	});
+
+	test("activation flush failure does not publish a fallback event", async () => {
+		const profile: ModelProfileDefinition = {
+			name: "event-rollback-profile",
+			requiredProviders: ["provider-a", "provider-c"],
+			modelMapping: { default: ["provider-a/missing", "provider-c/default"] },
+			source: "user",
+		};
+		const session = fakeSession();
+		const settings = Settings.isolated();
+		const prepared = await prepareModelProfileActivation({
+			session,
+			modelRegistry: fakeRegistry({ profiles: [profile] }),
+			settings,
+			profileName: profile.name,
+		});
+		vi.spyOn(settings, "flushOrThrow").mockRejectedValueOnce(new Error("flush failed"));
+
+		await expect(applyPreparedModelProfileActivation(prepared, { persistDefault: true })).rejects.toThrow(
+			"flush failed",
+		);
+		expect(session.seedDefaultFallbackResolutionCalls).toEqual([]);
+	});
+
+	// A transient live model switch (no canonical identity, unrelated to the
 	// prior selection) must not clobber the exactly-sticky provider on rollback.
 	test("transient live model cannot clobber the prior sticky on rollback", async () => {
 		const profile: ModelProfileDefinition = {
@@ -2400,6 +2656,8 @@ describe("preset-equivalent profile activation", () => {
 		const settings = Settings.isolated();
 		// A prior explicit selection made provider-a sticky for the session.
 		sticky.set(session.sessionId, "provider-a/opus-real");
+		session.setActiveModelProfile("preset-profile", "session");
+		session.noteProfileInstalledOverrides(["reviewer"], [], session.model, { reviewer: "provider/durable" });
 
 		const snapshot = await materializeModelProfileForDeletion({
 			session: sessionWithFallback,
@@ -2415,6 +2673,70 @@ describe("preset-equivalent profile activation", () => {
 		// The snapshot's internal closure restored the exact pre-clear sticky.
 		expect(sticky.get(session.sessionId)).toBe("provider-a/opus-real");
 		expect(restoreDefaultFallbackRuntimeState).toHaveBeenCalledWith(fallbackRuntimeState);
+		expect(session.getActiveModelProfile()).toBe("preset-profile");
+		expect(session.getActiveModelProfileScope()).toBe("session");
+		expect(session.getProfileInstalledOverrideState()).toMatchObject({
+			modelRoles: { reviewer: "provider/durable" },
+		});
+	});
+
+	test("role-only profile deletion clears its identity-bearing default chain", async () => {
+		const profile: ModelProfileDefinition = {
+			name: "codex-medium",
+			requiredProviders: ["provider-b"],
+			modelMapping: { executor: "provider-b/executor" },
+			source: "user",
+		};
+		const session = fakeSession();
+		const registry = fakeRegistry({ profiles: [profile] });
+		const settings = Settings.isolated();
+		session.setActiveModelProfile(profile.name, "session");
+		session.setConfiguredModelChain("default", ["provider-a/default"], "profile-activation", "codex-standard");
+
+		await materializeModelProfileForDeletion({
+			session,
+			modelRegistry: registry,
+			settings,
+			profileName: profile.name,
+		});
+
+		expect(session.getConfiguredModelChainState("default")).toMatchObject({
+			entries: [],
+			origin: "profile-deletion-materialized",
+			identity: undefined,
+		});
+	});
+
+	test("session-scoped activation prepares over the active durable profile layer", async () => {
+		const durableProfile: ModelProfileDefinition = {
+			name: "durable-layer",
+			requiredProviders: ["provider-a", "provider-b"],
+			modelMapping: { default: "provider-a/default", executor: "provider-b/executor" },
+			source: "user",
+		};
+		const sessionProfile: ModelProfileDefinition = {
+			name: "session-layer",
+			requiredProviders: ["provider-c"],
+			modelMapping: { default: "provider-c/default", executor: "provider-c/executor" },
+			source: "user",
+		};
+		const session = fakeSession();
+		const registry = fakeRegistry({ profiles: [durableProfile, sessionProfile] });
+		const settings = Settings.isolated();
+
+		await activateModelProfile(
+			{ session, modelRegistry: registry, settings, profileName: durableProfile.name },
+			{ persistDefault: true, profileScope: "durable" },
+		);
+		const prepared = await prepareModelProfileActivation({
+			session,
+			modelRegistry: registry,
+			settings,
+			profileName: sessionProfile.name,
+			profileScope: "session",
+		});
+
+		expect(prepared.baseAgentModelOverrides).toMatchObject({ executor: "provider-b/executor" });
 	});
 
 	test("successful activation leaves the new model sticky", async () => {
@@ -2485,6 +2807,38 @@ describe("model-profile-activation: OpenAI-compatible proxy routing", () => {
 		},
 		source: "builtin",
 	};
+
+	test("fallback mode does not probe an unused proxy", async () => {
+		const profile: ModelProfileDefinition = {
+			name: "direct-only-builtin",
+			requiredProviders: ["provider-a"],
+			modelMapping: { default: "provider-a/default" },
+			source: "builtin",
+		};
+		const baseRegistry = fakeRegistry({ profiles: [profile] });
+		const getApiKeyForProvider = vi.fn(async (provider: string) => {
+			if (provider === "litellm") throw new Error("proxy lookup failed");
+			return `key-${provider}`;
+		});
+		const registry = {
+			...baseRegistry,
+			getApiKeyForProvider,
+			getConfiguredProviderIds: () => ["litellm"],
+		} as unknown as ModelRegistry;
+
+		await expect(
+			resolveModelProfileDefaultChain({
+				modelRegistry: registry,
+				settings: Settings.isolated({
+					"modelProfile.proxyMode": "fallback",
+					"modelProfile.proxyProvider": "litellm",
+				}),
+				profileName: profile.name,
+				credentialSessionId: "resume-session",
+			}),
+		).resolves.toEqual({ profileName: profile.name, entries: ["provider-a/default"] });
+		expect(getApiKeyForProvider).not.toHaveBeenCalledWith("litellm", "resume-session");
+	});
 
 	function proxyRegistry(
 		options: { proxyApiKey?: string; missing?: string[]; profiles?: ModelProfileDefinition[] } = {},
