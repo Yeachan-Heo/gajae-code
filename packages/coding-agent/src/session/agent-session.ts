@@ -210,6 +210,7 @@ import {
 import { reset as resetCapabilities } from "../capability";
 import type { Rule } from "../capability/rule";
 import type { CasReceipt } from "../config/atomic-yaml-patch";
+import type { PreparedModelProfileActivation } from "../config/model-profile-activation";
 import {
 	activateModelProfile,
 	applyPreparedModelProfileActivation,
@@ -15538,6 +15539,47 @@ export class AgentSession {
 		return transition;
 	}
 
+	/** Validate a profile rebind before the new-session identity is committed. */
+	async #prepareNewSessionProfileTransition(): Promise<PreparedModelProfileActivation | undefined> {
+		const configuredProfileIdentity = this.#getConfiguredModelProfileIdentity();
+		const profileDefinitions = this.#modelRegistry.getModelProfiles?.() ?? new Map<string, unknown>();
+		const fallbackRuntimeState = this.getDefaultFallbackRuntimeState();
+		const recoveredProfileIdentity =
+			fallbackRuntimeState.chain.origin === "runtime" &&
+			fallbackRuntimeState.chain.identity !== undefined &&
+			profileDefinitions.has(fallbackRuntimeState.chain.identity)
+				? fallbackRuntimeState.chain.identity
+				: undefined;
+		const profileName = configuredProfileIdentity ?? recoveredProfileIdentity;
+		const activeProfileIdentity = this.getActiveModelProfile();
+		const needsRebind =
+			profileName !== undefined &&
+			((activeProfileIdentity !== undefined &&
+				(this.#activeModelProfileScope !== "durable" || profileName !== activeProfileIdentity)) ||
+				(activeProfileIdentity === undefined && recoveredProfileIdentity !== undefined));
+		if (!needsRebind || !profileName) return undefined;
+
+		const prepared = await prepareModelProfileActivation({
+			session: this,
+			modelRegistry: this.#modelRegistry,
+			settings: this.settings,
+			profileName,
+			profileScope: "durable",
+		});
+		if (prepared.previousCanonicalVariant !== undefined) {
+			if (
+				this.#modelRegistry.restoreSessionCanonicalVariant?.(this.sessionId, prepared.previousCanonicalVariant) !==
+				true
+			) {
+				this.#modelRegistry.clearCanonicalVariant?.(this.sessionId);
+				throw new Error("New-session profile preflight could not restore canonical model affinity.");
+			}
+		} else {
+			this.#modelRegistry.clearCanonicalVariant?.(this.sessionId);
+		}
+		return prepared;
+	}
+
 	async #runNewSessionTransition(options?: NewSessionOptions): Promise<boolean> {
 		const previousSessionFile = this.sessionFile;
 		const previousWorkflowGateSessionId = this.sessionId;
@@ -15592,6 +15634,7 @@ export class AgentSession {
 			this.#closeAllProviderSessions("new session");
 			this.#rebindProviderSessionState(new Map());
 			this.#terminalizeQueuedSdkWorkForSessionTransition(this.#queuedMessagesForSessionTransition());
+			const preparedNewSessionProfile = await this.#prepareNewSessionProfileTransition();
 			this.#resetActiveSdkRunOwnership();
 			this.agent.reset();
 			if (!options?.drop) await this.sessionManager.flush();
@@ -15620,7 +15663,11 @@ export class AgentSession {
 			this.#followUpMessages = [];
 			this.#pendingNextTurnMessages = [];
 			this.#scheduledHiddenNextTurnGeneration = undefined;
-			await this.#initializeNewSessionState(nextDiscoverySessionToolNames, previousSessionFile);
+			await this.#initializeNewSessionState(
+				nextDiscoverySessionToolNames,
+				previousSessionFile,
+				preparedNewSessionProfile,
+			);
 			if (options?.drop && previousSessionFile) {
 				try {
 					await this.sessionManager.dropSession(previousSessionFile);
@@ -15673,6 +15720,7 @@ export class AgentSession {
 			if (!(await manager.cancelAndSettleOwnerJobs(ownerId))) {
 				throw new Error("Owned async jobs did not settle before session replacement.");
 			}
+			const preparedNewSessionProfile = await this.#prepareNewSessionProfileTransition();
 			const prepared = await this.sessionManager.prepareNewSession(options);
 			try {
 				// Last fallible gate while public getters still show the predecessor (#3138).
@@ -15702,7 +15750,11 @@ export class AgentSession {
 			this.#followUpMessages = [];
 			this.#pendingNextTurnMessages = [];
 			this.#scheduledHiddenNextTurnGeneration = undefined;
-			await this.#initializeNewSessionState(nextDiscoverySessionToolNames, previousSessionFile);
+			await this.#initializeNewSessionState(
+				nextDiscoverySessionToolNames,
+				previousSessionFile,
+				preparedNewSessionProfile,
+			);
 			if (options?.drop && previousSessionFile) {
 				try {
 					await this.sessionManager.dropSession(previousSessionFile);
@@ -15724,6 +15776,7 @@ export class AgentSession {
 	async #initializeNewSessionState(
 		nextDiscoverySessionToolNames: string[] | undefined,
 		previousSessionFile: string | undefined,
+		preparedNewSessionProfile?: PreparedModelProfileActivation,
 	): Promise<void> {
 		// The successor session must not inherit the predecessor's profile marker
 		// or its runtime role overrides; a durable `modelProfile.default` is
@@ -15763,8 +15816,18 @@ export class AgentSession {
 		let runtimeProfileDefaultActiveIndex: number | undefined;
 		let runtimeProfileDefaultSkips: Array<{ selector: string; reason: string }> = [];
 		if (replacingConfiguredProfile && profileToRebind) {
-			runtimeProfileDefaultChain = await this.#applyRuntimeModelProfile(profileToRebind);
-			if (runtimeProfileDefaultChain.length > 0) {
+			const profileTransition =
+				preparedNewSessionProfile?.profileName === profileToRebind ? preparedNewSessionProfile : undefined;
+			if (profileTransition) {
+				runtimeProfileDefaultChain = await this.#applyRuntimeModelProfile(
+					profileToRebind,
+					profileTransition,
+					false,
+				);
+			} else {
+				this.#resetSessionScopedModelProfileState({ forceCleanup: true });
+			}
+			if (runtimeProfileDefaultChain?.length) {
 				const resolution = await resolveModelChainWithAuth(
 					runtimeProfileDefaultChain,
 					this.#modelRegistry,
@@ -16462,20 +16525,27 @@ export class AgentSession {
 	}
 
 	/** Rebind a configured durable profile without persisting a session chain or model choice. */
-	async #applyRuntimeModelProfile(profileName: string): Promise<readonly string[]> {
-		const prepared = await prepareModelProfileActivation({
-			session: this,
-			modelRegistry: this.#modelRegistry,
-			settings: this.settings,
-			profileName,
-			profileScope: "durable",
-		});
-		await applyPreparedModelProfileActivation(prepared, {
+	async #applyRuntimeModelProfile(
+		profileName: string,
+		prepared?: PreparedModelProfileActivation,
+		preserveCanonicalAffinity = true,
+	): Promise<readonly string[]> {
+		const activation =
+			prepared ??
+			(await prepareModelProfileActivation({
+				session: this,
+				modelRegistry: this.#modelRegistry,
+				settings: this.settings,
+				profileName,
+				profileScope: "durable",
+			}));
+		await applyPreparedModelProfileActivation(activation, {
 			profileScope: "durable",
 			preserveConfiguredDefaultChain: true,
 			preserveCurrentModel: true,
+			preserveCanonicalAffinity,
 		});
-		return prepared.defaultChain;
+		return activation.defaultChain;
 	}
 
 	/**

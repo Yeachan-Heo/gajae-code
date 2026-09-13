@@ -140,6 +140,7 @@ export interface ApplyModelProfileActivationOptions {
 	thinkingLevelOverride?: ThinkingLevel;
 	preserveConfiguredDefaultChain?: boolean;
 	preserveCurrentModel?: boolean;
+	preserveCanonicalAffinity?: boolean;
 }
 export interface PreparedModelProfileActivation {
 	profileName: string;
@@ -1447,7 +1448,11 @@ export async function applyPreparedModelProfileActivation(
 			prepared.modelRegistry.seedCanonicalVariant?.(prepared.session.sessionId, prepared.defaultModel);
 			resumeDefaultChanged = true;
 			prepared.session.recordResumeDefaultModel?.(`${prepared.defaultModel.provider}/${prepared.defaultModel.id}`);
-		} else if (options.preserveCurrentModel && prepared.previousCanonicalVariant !== undefined) {
+		} else if (
+			options.preserveCurrentModel &&
+			options.preserveCanonicalAffinity !== false &&
+			prepared.previousCanonicalVariant !== undefined
+		) {
 			const restored = prepared.modelRegistry.restoreSessionCanonicalVariant?.(
 				prepared.session.sessionId,
 				prepared.previousCanonicalVariant,
