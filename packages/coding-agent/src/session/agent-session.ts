@@ -2458,6 +2458,15 @@ export class AgentSession {
 				explicitHead: boolean;
 		  }
 		| undefined;
+	#profileDefaultChainBaselineStack: Array<
+		| {
+				entries: readonly string[];
+				origin: string;
+				identity?: string;
+				explicitHead: boolean;
+		  }
+		| undefined
+	> = [];
 	#preProfileModel: Model | undefined;
 	#sessionAdmissionQueue: SessionAdmissionEntry[] = [];
 	#activeSessionAdmission: SessionAdmissionEntry | undefined;
@@ -15720,19 +15729,29 @@ export class AgentSession {
 		// or its runtime role overrides; a durable `modelProfile.default` is
 		// reapplied by the startup policy on a fresh launch instead.
 		const configuredDefaultProfileIdentity = this.#getConfiguredModelProfileIdentity();
+		const profileDefinitions = this.#modelRegistry.getModelProfiles?.() ?? new Map<string, unknown>();
+		const previousFallbackRuntimeState = this.getDefaultFallbackRuntimeState();
+		const recoveredRuntimeProfileIdentity =
+			previousFallbackRuntimeState.chain.origin === "runtime" &&
+			previousFallbackRuntimeState.chain.identity !== undefined &&
+			profileDefinitions.has(previousFallbackRuntimeState.chain.identity)
+				? previousFallbackRuntimeState.chain.identity
+				: undefined;
+		const profileToRebind = configuredDefaultProfileIdentity ?? recoveredRuntimeProfileIdentity;
 		const activeProfileIdentity = this.getActiveModelProfile();
 		const droppingSessionOnlyProfile =
 			activeProfileIdentity !== undefined && this.#activeModelProfileScope === "session";
 		const replacingConfiguredProfile =
-			configuredDefaultProfileIdentity !== undefined &&
-			activeProfileIdentity !== undefined &&
-			(this.#activeModelProfileScope !== "durable" || configuredDefaultProfileIdentity !== activeProfileIdentity);
+			profileToRebind !== undefined &&
+			((activeProfileIdentity !== undefined &&
+				(this.#activeModelProfileScope !== "durable" || profileToRebind !== activeProfileIdentity)) ||
+				(activeProfileIdentity === undefined && recoveredRuntimeProfileIdentity !== undefined));
 		const preProfileModel = this.#preProfileModel;
 		this.#resetSessionScopedModelProfileState(
-			(droppingSessionOnlyProfile || replacingConfiguredProfile) && configuredDefaultProfileIdentity
+			(droppingSessionOnlyProfile || replacingConfiguredProfile) && profileToRebind
 				? {
 						preserveActiveModelProfile: {
-							name: configuredDefaultProfileIdentity,
+							name: profileToRebind,
 							scope: "durable",
 						},
 					}
@@ -15742,8 +15761,8 @@ export class AgentSession {
 		let runtimeProfileDefaultModel: Model | undefined;
 		let runtimeProfileDefaultActiveIndex: number | undefined;
 		let runtimeProfileDefaultSkips: Array<{ selector: string; reason: string }> = [];
-		if (replacingConfiguredProfile && configuredDefaultProfileIdentity) {
-			runtimeProfileDefaultChain = await this.#applyRuntimeModelProfile(configuredDefaultProfileIdentity);
+		if (replacingConfiguredProfile && profileToRebind) {
+			runtimeProfileDefaultChain = await this.#applyRuntimeModelProfile(profileToRebind);
 			if (runtimeProfileDefaultChain.length > 0) {
 				const resolution = await resolveModelChainWithAuth(
 					runtimeProfileDefaultChain,
@@ -15767,7 +15786,7 @@ export class AgentSession {
 					role: "default",
 					entries: [...runtimeProfileDefaultChain],
 					origin: "runtime",
-					identity: configuredDefaultProfileIdentity,
+					identity: profileToRebind,
 					explicitHead: true,
 				},
 				this.settings.get("fallback.maxAttempts"),
@@ -15794,7 +15813,7 @@ export class AgentSession {
 			}
 		}
 		this.#clearConstructorToolSelectionAuthority();
-		if (this.#activeModelProfile && this.#activeModelProfile !== configuredDefaultProfileIdentity) {
+		if (this.#activeModelProfile && this.#activeModelProfile !== profileToRebind) {
 			this.settings.clearOverride("modelRoles");
 			this.settings.clearOverride("task.agentModelOverrides");
 			this.setActiveModelProfile(undefined);
@@ -16191,6 +16210,7 @@ export class AgentSession {
 	#resetSessionScopedModelProfileState(options?: {
 		preserveDefaultConfiguredChain?: boolean;
 		preserveDefaultModelRole?: boolean;
+		restoreInstalledDefaultChain?: boolean;
 		forceCleanup?: boolean;
 		preserveActiveModelProfile?: { name: string; scope: "session" | "durable" };
 	}): void {
@@ -16253,8 +16273,11 @@ export class AgentSession {
 		}
 		const defaultChain = getSessionContextForInternalRead(this.sessionManager).configuredModelChains.default;
 		if (!options?.preserveDefaultConfiguredChain) {
-			const installedDefaultChain = this.#activeProfileInstalledDefaultChainState;
-			if (installedDefaultChain) {
+			const installedDefaultChain =
+				this.#profileDefaultChainBaselineStack.length > 0
+					? this.#profileDefaultChainBaselineStack[0]
+					: this.#activeProfileInstalledDefaultChainState;
+			if (options?.restoreInstalledDefaultChain !== false && installedDefaultChain) {
 				this.setConfiguredModelChain(
 					"default",
 					installedDefaultChain.entries,
@@ -16269,6 +16292,7 @@ export class AgentSession {
 		this.setActiveModelProfile(options?.preserveActiveModelProfile?.name, options?.preserveActiveModelProfile?.scope);
 		this.#preProfileModel = undefined;
 		this.#activeProfileInstalledDefaultChainState = undefined;
+		this.#profileDefaultChainBaselineStack = [];
 	}
 
 	/** Record runtime override keys installed by a profile activation. */
@@ -16288,8 +16312,8 @@ export class AgentSession {
 	): void {
 		const bindings = this.#modelRegistry.getConfiguredModelBindings?.();
 		if (this.#activeModelProfileScope !== "session") this.#preProfileModel = preProfileModel;
-		this.#activeProfileInstalledDefaultChainState =
-			profileScope === "session" && previousDefaultChainState
+		if (profileScope === "session") {
+			const baseline = previousDefaultChainState
 				? {
 						entries: [...previousDefaultChainState.entries],
 						origin: previousDefaultChainState.origin,
@@ -16297,6 +16321,12 @@ export class AgentSession {
 						explicitHead: previousDefaultChainState.explicitHead,
 					}
 				: undefined;
+			if (this.#activeModelProfileScope !== "session") this.#profileDefaultChainBaselineStack = [baseline];
+			this.#activeProfileInstalledDefaultChainState = baseline;
+		} else {
+			this.#activeProfileInstalledDefaultChainState = undefined;
+			this.#profileDefaultChainBaselineStack = [];
+		}
 		const currentModelRoles = new Set(modelRoles);
 		const currentAgentModelOverrides = new Set(agentModelOverrides);
 		for (const role of this.#activeProfileInstalledRoles.keys()) {
@@ -16331,6 +16361,7 @@ export class AgentSession {
 		this.#activeProfileInstalledAgentOverrides.clear();
 		this.#preProfileModel = undefined;
 		this.#activeProfileInstalledDefaultChainState = undefined;
+		this.#profileDefaultChainBaselineStack = [];
 	}
 
 	getProfileInstalledOverrideState(): {
@@ -16343,6 +16374,15 @@ export class AgentSession {
 			identity?: string;
 			explicitHead: boolean;
 		};
+		defaultChainBaselines?: Array<
+			| {
+					entries: readonly string[];
+					origin: string;
+					identity?: string;
+					explicitHead: boolean;
+			  }
+			| undefined
+		>;
 	} {
 		return {
 			modelRoles: Object.fromEntries(this.#activeProfileInstalledRoles),
@@ -16354,6 +16394,9 @@ export class AgentSession {
 						entries: [...this.#activeProfileInstalledDefaultChainState.entries],
 					}
 				: undefined,
+			defaultChainBaselines: this.#profileDefaultChainBaselineStack.map(state =>
+				state ? { ...state, entries: [...state.entries] } : undefined,
+			),
 		};
 	}
 
@@ -16367,6 +16410,15 @@ export class AgentSession {
 			identity?: string;
 			explicitHead: boolean;
 		};
+		defaultChainBaselines?: Array<
+			| {
+					entries: readonly string[];
+					origin: string;
+					identity?: string;
+					explicitHead: boolean;
+			  }
+			| undefined
+		>;
 	}): void {
 		this.#activeProfileInstalledRoles = new Map(Object.entries(state.modelRoles));
 		this.#activeProfileInstalledAgentOverrides = new Map(Object.entries(state.agentModelOverrides));
@@ -16374,6 +16426,9 @@ export class AgentSession {
 		this.#activeProfileInstalledDefaultChainState = state.defaultChainState
 			? { ...state.defaultChainState, entries: [...state.defaultChainState.entries] }
 			: undefined;
+		this.#profileDefaultChainBaselineStack = (state.defaultChainBaselines ?? []).map(profileState =>
+			profileState ? { ...profileState, entries: [...profileState.entries] } : undefined,
+		);
 	}
 
 	/** Current profile-installed override keys, for deriving the activation base. */
@@ -16522,7 +16577,11 @@ export class AgentSession {
 			this.settings.unset("modelProfile.default");
 			this.settings.clearOverride("modelProfile.default");
 		}
-		this.#resetSessionScopedModelProfileState({ preserveDefaultModelRole: true, forceCleanup: true });
+		this.#resetSessionScopedModelProfileState({
+			preserveDefaultModelRole: true,
+			restoreInstalledDefaultChain: false,
+			forceCleanup: true,
+		});
 	}
 
 	/**
@@ -23915,6 +23974,9 @@ export class AgentSession {
 						entries: [...this.#activeProfileInstalledDefaultChainState.entries],
 					}
 				: undefined;
+			const previousProfileDefaultChainBaselineStack = this.#profileDefaultChainBaselineStack.map(state =>
+				state ? { ...state, entries: [...state.entries] } : undefined,
+			);
 			const previousPreProfileModel = this.#preProfileModel;
 			const previousModelRolesOverride = this.settings.getOverride("modelRoles");
 			const previousAgentModelOverridesOverride = this.settings.getOverride("task.agentModelOverrides");
@@ -24027,7 +24089,7 @@ export class AgentSession {
 								configuredProfileIdentity === undefined ||
 								configuredProfileIdentity === liveProfileIdentity)
 							? liveProfileIdentity
-							: liveProfileIdentity !== undefined &&
+							: (liveProfileIdentity !== undefined || previousActiveModelProfileScope === "session") &&
 									configuredProfileIdentity &&
 									profileDefinitions.has(configuredProfileIdentity)
 								? configuredProfileIdentity
@@ -24071,10 +24133,10 @@ export class AgentSession {
 				let runtimeProfileDefaultChain: readonly string[] | undefined;
 				if (
 					resumeModelBehavior === "useCurrentDefault" &&
-					liveProfileIdentity !== undefined &&
+					(liveProfileIdentity !== undefined || previousActiveModelProfileScope === "session") &&
 					nextActiveModelProfile !== undefined &&
 					nextActiveModelProfileScope === "durable" &&
-					nextActiveModelProfile !== liveProfileIdentity
+					configuredProfileIdentity === nextActiveModelProfile
 				) {
 					runtimeProfileDefaultChain = await this.#applyRuntimeModelProfile(nextActiveModelProfile);
 				}
@@ -24411,6 +24473,7 @@ export class AgentSession {
 				this.#activeProfileInstalledRoles = previousProfileInstalledRoles;
 				this.#activeProfileInstalledAgentOverrides = previousProfileInstalledAgentOverrides;
 				this.#activeProfileInstalledDefaultChainState = previousProfileInstalledDefaultChainState;
+				this.#profileDefaultChainBaselineStack = previousProfileDefaultChainBaselineStack;
 				this.#preProfileModel = previousPreProfileModel;
 				if (previousModelRolesOverride === undefined) this.settings.clearOverride("modelRoles");
 				else this.settings.override("modelRoles", previousModelRolesOverride);

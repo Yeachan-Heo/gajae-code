@@ -40,6 +40,7 @@ type ProfileInstalledOverrideState = {
 	agentModelOverrides: Record<string, ModelSelectorValue | undefined>;
 	preProfileModel: Model<Api> | undefined;
 	defaultChainState?: ConfiguredModelChainState;
+	defaultChainBaselines?: Array<ConfiguredModelChainState | undefined>;
 };
 
 type ModelProfileActivationSession = Pick<
