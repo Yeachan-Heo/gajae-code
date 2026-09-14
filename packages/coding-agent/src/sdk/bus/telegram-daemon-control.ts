@@ -36,6 +36,7 @@ import {
 	isCurrentCompatibleOwner,
 	isFreshLiveOwner,
 	isSignalableMatchingOwner,
+	isTelegramDaemonStopCause,
 	readAttestedLegacyDaemonOwner,
 	readDaemonState,
 	readOwnerFreshnessSnapshot,
@@ -236,6 +237,8 @@ export class TelegramDaemonController implements BuiltInDaemonController {
 						})
 					? "running"
 					: "stale";
+		const stopCause = isTelegramDaemonStopCause(state?.stopCause) ? state.stopCause : undefined;
+		const detail = health === "stopped" && state ? `stop cause: ${stopCause ?? "unknown"}` : undefined;
 		return {
 			kind: this.kind,
 			configured: true,
@@ -244,6 +247,7 @@ export class TelegramDaemonController implements BuiltInDaemonController {
 			ownerId: state?.ownerId,
 			startedAt: state?.startedAt,
 			heartbeatAt: snapshot.effectiveHeartbeatAt,
+			...(detail === undefined ? {} : { detail }),
 			runtime,
 		};
 	}

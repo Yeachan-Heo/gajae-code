@@ -254,16 +254,23 @@ function ownerProcessIsAlive(ownerId: string, deps: RunDaemonInternalDeps): bool
 
 /** Creates owner-fenced daemon control hooks for the CLI lifecycle boundary. */
 export function createDaemonControlHooks(settings: Settings) {
+	const readOwnedRequest = async (owner: string) => {
+		const req = await readTelegramControlRequest(settings);
+		return req && (!req.ownerId || req.ownerId === owner) ? req : undefined;
+	};
 	return {
 		shouldStop: async (owner: string) => {
-			const req = await readTelegramControlRequest(settings);
-			return Boolean(req && (!req.ownerId || req.ownerId === owner));
+			return (await readOwnedRequest(owner)) !== undefined;
+		},
+		requestedAction: async (owner: string): Promise<"reload" | "stop" | undefined> => {
+			const action = (await readOwnedRequest(owner))?.action;
+			return action === "reload" || action === "stop" ? action : undefined;
 		},
 		clear: async (owner: string) => {
-			const req = await readTelegramControlRequest(settings);
+			const req = await readOwnedRequest(owner);
 			// Only clear a request that targets this daemon owner, so an exiting
 			// daemon never erases a newer request meant for a different owner.
-			if (req && (!req.ownerId || req.ownerId === owner)) await clearTelegramControlRequest(settings, req.requestId);
+			if (req) await clearTelegramControlRequest(settings, req.requestId);
 		},
 	};
 }
