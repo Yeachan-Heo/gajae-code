@@ -407,3 +407,48 @@ describe("CLI help single source of truth", () => {
 		expect(argsSource).not.toContain("chalk");
 	});
 });
+
+describe("public family inert bootstrap", () => {
+	itWithTempRoot(
+		"nested help and malformed JSON-mode requests bypass invalid runtime settings",
+		"gjc-public-help-",
+		async root => {
+			const agentDir = path.join(root, "agent");
+			await fs.mkdir(agentDir, { recursive: true });
+			await fs.writeFile(path.join(agentDir, "settings.json"), "{ invalid settings secret }");
+			for (const argv of [
+				["sdk", "session", "raw", "query", "--help", "--json"],
+				["daemon", "reload", "--help", "--json"],
+				["sdk", "spawn", "--prompt", "--json"],
+			]) {
+				const proc = Bun.spawn([process.execPath, cliEntry, ...argv], {
+					cwd: repoRoot,
+					stdout: "pipe",
+					stderr: "pipe",
+					env: {
+						...process.env,
+						HOME: root,
+						XDG_CONFIG_HOME: path.join(root, "config"),
+						XDG_DATA_HOME: path.join(root, "data"),
+						GJC_CODING_AGENT_DIR: agentDir,
+						PI_CODING_AGENT_DIR: agentDir,
+						NO_COLOR: "1",
+					},
+				});
+				const [stdout, stderr, exitCode] = await Promise.all([
+					readStream(proc.stdout),
+					readStream(proc.stderr),
+					proc.exited,
+				]);
+				expect(stderr).toBe("");
+				expect(Buffer.byteLength(stdout)).toBeLessThanOrEqual(8192);
+				const result = JSON.parse(stdout);
+				expect(result.schema).toBe(argv[1] === "spawn" ? "gjc.command-error" : "gjc.command-help");
+				expect(exitCode).toBe(argv[1] === "spawn" ? 2 : 0);
+				expect(stdout).not.toContain("invalid settings secret");
+			}
+			expect(await fs.readdir(agentDir)).toEqual(["settings.json"]);
+		},
+		30_000,
+	);
+});

@@ -177,20 +177,21 @@ export async function startSocketServe(
 		void task;
 	});
 	server.on("error", error => void close(error).catch(() => undefined));
-	await new Promise<void>((resolve, reject) => {
-		server?.once("error", reject);
-		server?.listen(options.socketPath, () => resolve());
-	});
-	const bound = await fs.lstat(options.socketPath);
-	if (!bound.isSocket()) {
-		await close();
-		throw socketFailure("socket_bind_failed");
-	}
-	ownedIdentity = { dev: bound.dev, ino: bound.ino };
 	try {
+		await new Promise<void>((resolve, reject) => {
+			server?.once("error", reject);
+			server?.listen(options.socketPath, () => resolve());
+		});
+		const bound = await fs.lstat(options.socketPath);
+		if (!bound.isSocket()) throw socketFailure("socket_bind_failed");
+		ownedIdentity = { dev: bound.dev, ino: bound.ino };
 		await fs.chmod(options.socketPath, 0o600);
 	} catch (error) {
-		await close();
+		try {
+			await close();
+		} catch (cleanupError) {
+			throw new AggregateError([error, cleanupError], "socket_serve_startup_cleanup_failed", { cause: error });
+		}
 		throw error;
 	}
 	return { close, done: done.promise };

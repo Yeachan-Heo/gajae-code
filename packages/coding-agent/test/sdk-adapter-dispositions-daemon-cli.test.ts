@@ -10,7 +10,8 @@
  *
  * Coverage is byte-identical to the original monolithic file's daemonCli loop.
  */
-import { expect, test } from "bun:test";
+import { expect, spyOn, test } from "bun:test";
+import * as brokerEnsure from "../src/sdk/broker/ensure";
 import {
 	adapterPrefix,
 	assertDaemonCliRow,
@@ -34,20 +35,37 @@ for (const operation of OPERATIONS) {
 }
 
 test("raw global session.spawn rejects capability-shaped input before dispatch", async () => {
-	const result = await runDaemonCli({
-		action: "raw",
-		rawAction: "global",
-		operation: "session.spawn",
-		jsonInput: JSON.stringify({
-			cwd: process.cwd(),
-			task: "adapter disposition probe",
-			masterCapability: "capability-shaped-probe",
-			model: "openai/gpt-4o-mini",
-			profile: "default",
-		}),
-	});
-	expect(result).toMatchObject({
-		exitCode: 1,
-		output: { ok: false, error: { code: "adapter_operation_prohibited" } },
-	});
+	const ensure = spyOn(brokerEnsure, "ensureBroker").mockRejectedValue(new Error("Unexpected broker contact"));
+	try {
+		const result = await runDaemonCli({
+			action: "raw",
+			rawAction: "global",
+			operation: "session.spawn",
+			jsonInput: JSON.stringify({
+				cwd: process.cwd(),
+				task: "adapter disposition probe",
+				masterCapability: "capability-shaped-probe",
+				model: "openai/gpt-4o-mini",
+				profile: "default",
+			}),
+		});
+		expect(result).toMatchObject({
+			exitCode: 1,
+			output: {
+				schema: "gjc.command-error",
+				ok: false,
+				error: {
+					code: "authorization_denied",
+					outcomeCertainty: "not-applied",
+					retryability: "no",
+					references: [],
+				},
+			},
+		});
+		expect(ensure).not.toHaveBeenCalled();
+		expect(JSON.stringify(result.output)).not.toContain("capability-shaped-probe");
+		expect(JSON.stringify(result.output)).not.toContain("masterCapability");
+	} finally {
+		ensure.mockRestore();
+	}
 });

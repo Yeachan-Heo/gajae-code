@@ -3,8 +3,10 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { logger } from "@gajae-code/utils";
-import { Args, CliParseError, Command, Flags, renderCommandHelp } from "@gajae-code/utils/cli";
+import { Args, CliParseError, Command, Flags } from "@gajae-code/utils/cli";
 import type { Args as ParsedArgs } from "../cli/args";
+import { isSafeSdkInternalAgentDir, scanPublicCommand } from "../cli/public-command-entry";
+import { PublicCommandFailure } from "../cli/public-command-errors";
 import { parseModelString } from "../config/model-resolver";
 import { Settings } from "../config/settings";
 import { applyStartupModelProfiles, createSessionManager } from "../main";
@@ -839,7 +841,13 @@ export type SdkInternalArgv = { action: "broker-internal"; agentDir: string } | 
 /** Parses the exact private argv contracts used by SDK child-process spawns. */
 export function parseSdkInternalArgv(argv: readonly string[]): SdkInternalArgv {
 	if (argv[0] === "session-host-internal" && argv.length === 1) return { action: "session-host-internal" };
-	if (argv[0] === "broker-internal" && argv.length === 3 && argv[1] === "--agent-dir" && argv[2])
+	if (
+		argv[0] === "broker-internal" &&
+		argv.length === 3 &&
+		argv[1] === "--agent-dir" &&
+		typeof argv[2] === "string" &&
+		isSafeSdkInternalAgentDir(argv[2])
+	)
 		return { action: "broker-internal", agentDir: argv[2] };
 	throw new CliParseError("Invalid internal SDK invocation.");
 }
@@ -1058,68 +1066,88 @@ class SdkGuidesCommand extends Command {
 		});
 	}
 }
-
 export default class Sdk extends Command {
-	static description =
-		"gjc sdk serve --stdio | --socket <path> [--session <id>]; gjc sdk search [--scope repo|pwd|global] [--json] [--limit N] [--cursor ...]; gjc sdk spawn --cwd <dir> --prompt <task> (master only); gjc sdk session list|inspect|send|status|tail; gjc sdk guides refresh|list|show|status|trust";
+	static description = "SDK command runtime; public grammar and help are registry-owned.";
 	static hidden = false;
 	static delegateHelp = true;
-	static args = {
-		action: Args.string({ required: false, options: ["serve", "search", "spawn", "session", "guides"] }),
-	};
-	static flags = SdkServeHelp.flags;
 	async run(): Promise<void> {
-		const action = this.argv[0];
-		if (this.argv.includes("--help") || this.argv.includes("-h")) {
-			const helpAction =
-				action === "serve"
-					? "sdk serve"
-					: action === "search"
-						? "sdk search"
-						: action === "spawn"
-							? "sdk spawn"
-							: action === "session"
-								? "sdk session"
-								: action === "guides"
-									? "sdk guides"
-									: "sdk";
-			const helpCommand =
-				action === "serve"
-					? SdkServeHelp
-					: action === "search"
-						? SdkSearchCommand
-						: action === "spawn"
-							? SdkSpawnCommand
-							: action === "session"
-								? SdkSessionCommand
-								: action === "guides"
-									? SdkGuidesCommand
-									: Sdk;
-			renderCommandHelp("gjc", helpAction, helpCommand);
-			return;
+		if (this.argv[0] !== "broker-internal" && this.argv[0] !== "session-host-internal") {
+			const scan = scanPublicCommand("sdk", this.argv);
+			if (scan.kind !== "operation") throw new PublicCommandFailure({ kind: "usage", proof: "pre-effect" });
+			const { args, flags } = scan;
+			const action = scan.descriptor.command[1];
+			const stringFlag = (name: string): string | undefined => flags[name] as string | undefined;
+			const timeoutMs = flags["timeout-ms"] === undefined ? undefined : Number(flags["timeout-ms"]);
+			if (action === "spawn") {
+				const spawn = await runSdkSpawn({
+					cwd: stringFlag("cwd"),
+					prompt: stringFlag("prompt"),
+					model: stringFlag("model"),
+					profile: stringFlag("profile"),
+					agentDir: stringFlag("agent-dir"),
+					idempotencyKey: stringFlag("idempotency-key"),
+				});
+				process.stdout.write(`${flags.json ? JSON.stringify(spawn.rendered) : renderSpawnTable(spawn.rendered)}\n`);
+				return;
+			}
+			if (action === "search") {
+				const search = await runSdkSearch({
+					agentDir: stringFlag("agent-dir"),
+					repo: stringFlag("repo"),
+					scope: stringFlag("scope"),
+					limit: flags.limit as number | undefined,
+					cursor: stringFlag("cursor"),
+				});
+				process.stdout.write(
+					`${flags.json ? JSON.stringify(search.result) : renderSdkSearchTable(search.result)}\n`,
+				);
+				return;
+			}
+			if (action === "session") {
+				await runSdkSessionCli({
+					action: scan.descriptor.command[2],
+					rawAction: scan.descriptor.command[3],
+					sessionId: args.sessionId as string | undefined,
+					opRef: (args.opRef as string | undefined) ?? stringFlag("op-ref"),
+					operation: stringFlag("op"),
+					query: stringFlag("query"),
+					text: stringFlag("text"),
+					jsonInput: stringFlag("json-input"),
+					jsonInputFile: stringFlag("json-input-file"),
+					jsonInputStdin: Boolean(flags["json-input-stdin"]),
+					confirm: Boolean(flags.confirm),
+					idempotencyKey: stringFlag("idempotency-key"),
+					cursor: stringFlag("cursor"),
+					wait: Boolean(flags.wait),
+					timeoutMs,
+					strict: Boolean(flags.strict),
+					untilIdle: Boolean(flags["until-idle"]),
+					allEvents: Boolean(flags["all-events"]),
+					page: Boolean(flags.page),
+					limit: flags.limit as number | undefined,
+					agentDir: stringFlag("agent-dir"),
+					repo: stringFlag("repo"),
+					scope: stringFlag("scope"),
+					json: flags.json === true,
+				});
+				return;
+			}
+			if (action === "guides") {
+				await runSdkGuidesCli({
+					action: scan.descriptor.command[2],
+					guideId: args.guideId as string | undefined,
+					url: stringFlag("url"),
+					agentDir: stringFlag("agent-dir"),
+					timeoutMs,
+				});
+				return;
+			}
+			if (action === "serve") {
+				await runSdkServe(scan.operationArgv.slice(1));
+				return;
+			}
+			throw new PublicCommandFailure({ kind: "usage", proof: "pre-effect" });
 		}
-		if (action === "search") {
-			await new SdkSearchCommand(this.argv.slice(1), this.config).run();
-			return;
-		}
-		if (action === "spawn") {
-			await new SdkSpawnCommand(this.argv.slice(1), this.config).run();
-			return;
-		}
-		if (action === "session") {
-			await new SdkSessionCommand(this.argv.slice(1), this.config).run();
-			return;
-		}
-		if (action === "guides") {
-			await new SdkGuidesCommand(this.argv.slice(1), this.config).run();
-			return;
-		}
-		if (action === "serve") {
-			await runSdkServe(this.argv.slice(1));
-			return;
-		}
-		if (action !== "broker-internal" && action !== "session-host-internal")
-			throw new CliParseError("Expected action to be serve, search, spawn, session, or guides.");
 		const internal = parseSdkInternalArgv(this.argv);
 		if (internal.action === "session-host-internal") {
 			await runSessionHost();

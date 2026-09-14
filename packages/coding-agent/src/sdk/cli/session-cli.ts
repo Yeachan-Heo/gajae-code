@@ -3,23 +3,20 @@ import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { replaceTabs, truncateToWidth } from "@gajae-code/tui";
-import { getAgentDir } from "@gajae-code/utils";
+import { getAgentDir, logger, sanitizeDisplayLine } from "@gajae-code/utils";
+import { PublicCommandFailure, type PublicEffectProof, type PublicFailureKind } from "../../cli/public-command-errors";
+import type { EvidenceReference } from "../../cli/public-command-evidence";
 import { repo as resolveGitRepository } from "../../utils/git";
 import { ensureBroker } from "../broker/ensure";
 import { resolveSessionLocator } from "../broker/session-index";
-import {
-	resolveScopeRequest,
-	type ScopeNameV1,
-	type ScopeRequestV1,
-	type SdkSearchResultV1,
-	type SdkSearchRowV1,
-} from "../broker/session-scope";
+import type { ScopeNameV1, ScopeRequestV1, SdkSearchResultV1, SdkSearchRowV1 } from "../broker/session-scope";
 import { lifecycleRequestTimeoutMs } from "../broker/startup-budget";
 import { readSdkBrokerDiscovery, SdkClient, SdkClientError } from "../client";
 import { createBrokerSessionLifecycleService } from "../lifecycle/broker-client";
 import type {
 	SessionLifecycleMutationRequest,
 	SessionLifecycleOperation,
+	SessionLifecycleResult,
 	SessionLifecycleSavedSession,
 	SessionLifecycleSavedSessionIdentity,
 	SessionLifecycleService,
@@ -117,6 +114,7 @@ const transcriptDecoder = new TextDecoder("utf-8", { fatal: true });
 const SEARCH_PROBE_TIMEOUT_MS = 2_000;
 const SEARCH_PROBE_MAX_ROWS = 100;
 const SEARCH_TEXT_WIDTH = 80;
+export const SDK_JSON_INPUT_FILE_MAX_BYTES = 4 * 1024 * 1024;
 
 const TERMINAL_TURN_KINDS = new Set(["turn_end", "agent_end"]);
 const START_TURN_KINDS = new Set(["turn_start", "agent_start"]);
@@ -142,6 +140,106 @@ class SdkSessionCliError extends Error {
 	) {
 		super(message);
 	}
+}
+
+/** Translate only SDK-owned codes and explicitly allowlisted reconciliation fields. */
+export function sdkPublicFailure(code: string, details?: unknown, proof?: PublicEffectProof): PublicCommandFailure {
+	const kinds: Record<string, PublicFailureKind> = {
+		usage: "usage",
+		invalid_input: "usage",
+		invalid_json: "invalid_json",
+		broker_unavailable: "broker_unavailable",
+		session_unavailable: "endpoint_stale",
+		endpoint_stale: "endpoint_stale",
+		broker_restarting: "broker_restarting",
+		unavailable: "unavailable",
+		timeout: "timeout",
+		tail_timeout: "timeout",
+		wait_timeout: "wait_timeout",
+		uncertain_after_send: "uncertain_after_send",
+		authorization_denied: "authorization_denied",
+		unauthorized: "authorization_denied",
+		forbidden: "authorization_denied",
+		master_context_required: "authorization_denied",
+		adapter_operation_prohibited: "authorization_denied",
+		endpoint_credential_forbidden: "authorization_denied",
+	};
+	const references: EvidenceReference[] = [];
+	const source = object(details);
+	for (const [field, kind] of [
+		["sessionId", "sessionId"],
+		["operationRef", "operationRef"],
+		["clientRef", "operationRef"],
+		["idempotencyKey", "idempotencyKey"],
+		["claimId", "claimId"],
+		["commandId", "commandId"],
+		["turnId", "turnId"],
+	] as const) {
+		if (typeof source?.[field] === "string") references.push({ kind, value: source[field] as string });
+	}
+	return new PublicCommandFailure({
+		kind: Object.hasOwn(kinds, code) ? kinds[code]! : "operation_failed",
+		proof: code === "wait_timeout" ? "accepted" : proof,
+		references,
+	});
+}
+
+function normalizeSessionFailure(error: unknown, args: SdkSessionCliArgs): PublicCommandFailure {
+	if (error instanceof PublicCommandFailure)
+		return new PublicCommandFailure({
+			...error.input,
+			references: [
+				...(error.input.references ?? []),
+				...(sdkPublicFailure("operation_failed", {
+					sessionId: args.sessionId,
+					operationRef: args.opRef,
+					idempotencyKey: args.idempotencyKey,
+				}).input.references ?? []),
+			],
+		});
+	const context = { sessionId: args.sessionId, operationRef: args.opRef, idempotencyKey: args.idempotencyKey };
+	if (error instanceof SdkSessionCliError)
+		return sdkPublicFailure(
+			error.exitCode === 2 && error.code !== "invalid_json" ? "usage" : error.code,
+			{ ...context, ...object(error.details) },
+			error.exitCode === 2 ? "pre-effect" : undefined,
+		);
+	if (error instanceof SdkClientError)
+		return sdkPublicFailure(
+			error.code,
+			{ ...context, ...object(error.details) },
+			object(error.details)?.requestSent === false
+				? "pre-send"
+				: object(error.details)?.requestSent === true
+					? "sent"
+					: undefined,
+		);
+	if (error instanceof SessionRouterError)
+		return sdkPublicFailure(
+			error.phase === "pre_send" ? "endpoint_stale" : "uncertain_after_send",
+			context,
+			error.phase === "pre_send" ? "pre-send" : "sent",
+		);
+	return sdkPublicFailure("operation_failed", context);
+}
+
+/** Lifecycle terminality/retryability is not, by itself, proof of an effect outcome. */
+export function lifecyclePublicFailure(outcome: Extract<SessionLifecycleResult, { ok: false }>): PublicCommandFailure {
+	const failure = sdkPublicFailure(outcome.error.code);
+	// The service emits retryable protocol_error only when requestSent is explicitly false.
+	const proof: PublicEffectProof =
+		outcome.certainty === "retryable" && outcome.error.code === "protocol_error" ? "pre-send" : "unknown";
+	return new PublicCommandFailure({
+		...failure.input,
+		// Generic lifecycle codes cannot override the authoritative, conservative proof.
+		kind:
+			failure.input.kind === "usage" || failure.input.kind === "invalid_json"
+				? "operation_failed"
+				: failure.input.kind === "wait_timeout"
+					? "timeout"
+					: failure.input.kind,
+		proof,
+	});
 }
 
 class RetainedTranscriptTailError extends Error {
@@ -186,6 +284,128 @@ function parseInput(raw: string | undefined, source: string): JsonRecord {
 	}
 }
 
+function matchesSecurePathIdentity(before: fsSync.BigIntStats, after: fsSync.BigIntStats): boolean {
+	return (
+		before.dev === after.dev &&
+		before.ino === after.ino &&
+		before.nlink === after.nlink &&
+		before.mode === after.mode &&
+		before.size === after.size &&
+		before.mtimeNs === after.mtimeNs &&
+		before.ctimeNs === after.ctimeNs
+	);
+}
+
+function matchesSecureInputIdentity(before: fsSync.BigIntStats, after: fsSync.BigIntStats): boolean {
+	return before.isFile() && after.isFile() && matchesSecurePathIdentity(before, after);
+}
+
+type SecureInputPathSnapshot = {
+	resolvedPath: string;
+	ancestors: readonly { path: string; stat: fsSync.BigIntStats }[];
+};
+
+async function secureInputPath(filePath: string): Promise<SecureInputPathSnapshot> {
+	const resolved = path.resolve(filePath);
+	const canonical = await fs.realpath(resolved);
+	if (canonical !== resolved)
+		throw new SdkSessionCliError("input_file_unavailable", "Unable to read --json-input-file.", 2);
+	const ancestorPaths: string[] = [];
+	for (let current = path.dirname(resolved); ; ) {
+		ancestorPaths.unshift(current);
+		const parent = path.dirname(current);
+		if (parent === current) break;
+		current = parent;
+	}
+	const ancestors = [] as { path: string; stat: fsSync.BigIntStats }[];
+	for (const ancestor of ancestorPaths) {
+		const stat = await fs.lstat(ancestor, { bigint: true });
+		if (!stat.isDirectory())
+			throw new SdkSessionCliError("input_file_unavailable", "Unable to read --json-input-file.", 2);
+		ancestors.push({ path: ancestor, stat });
+	}
+	return { resolvedPath: resolved, ancestors };
+}
+
+function sameSecureInputAncestors(
+	before: readonly { path: string; stat: fsSync.BigIntStats }[],
+	after: readonly { path: string; stat: fsSync.BigIntStats }[],
+): boolean {
+	return (
+		before.length === after.length &&
+		before.every(
+			(entry, index) =>
+				after[index]?.path === entry.path &&
+				after[index] !== undefined &&
+				matchesSecurePathIdentity(entry.stat, after[index]!.stat),
+		)
+	);
+}
+
+/** Reads a 0600 JSON input through one descriptor, never through a replaceable pathname. */
+export async function readSecureJsonInputFile(filePath: string): Promise<string> {
+	let descriptor: fs.FileHandle | undefined;
+	try {
+		const beforePath = await secureInputPath(filePath);
+		const resolvedPath = beforePath.resolvedPath;
+		const noFollow = process.platform === "win32" ? 0 : fsSync.constants.O_NOFOLLOW;
+		descriptor = await fs.open(resolvedPath, fsSync.constants.O_RDONLY | noFollow);
+		const before = await descriptor.stat({ bigint: true });
+		const uid = process.getuid?.();
+		if (
+			!before.isFile() ||
+			(before.mode & 0o7777n) !== 0o600n ||
+			(process.platform !== "win32" && uid !== undefined && before.uid !== BigInt(uid))
+		)
+			throw new SdkSessionCliError(
+				"input_file_permissions",
+				"--json-input-file must be a regular file with 0600 permissions.",
+				2,
+			);
+		if (before.size > BigInt(SDK_JSON_INPUT_FILE_MAX_BYTES))
+			throw new SdkSessionCliError(
+				"usage",
+				`--json-input-file must be at most ${SDK_JSON_INPUT_FILE_MAX_BYTES} bytes.`,
+				2,
+			);
+
+		const pathIdentity = await fs.lstat(resolvedPath, { bigint: true });
+		const openedPath = await secureInputPath(resolvedPath);
+		if (
+			!matchesSecureInputIdentity(before, pathIdentity) ||
+			!sameSecureInputAncestors(beforePath.ancestors, openedPath.ancestors)
+		)
+			throw new SdkSessionCliError("input_file_unavailable", "Unable to read --json-input-file.", 2);
+
+		const size = Number(before.size);
+		const bytes = Buffer.alloc(size);
+		let offset = 0;
+		while (offset < size) {
+			const read = await descriptor.read(bytes, offset, size - offset, offset);
+			if (read.bytesRead === 0) break;
+			offset += read.bytesRead;
+		}
+		if (offset !== size)
+			throw new SdkSessionCliError("input_file_unavailable", "Unable to read --json-input-file.", 2);
+
+		const after = await descriptor.stat({ bigint: true });
+		const finalPath = await secureInputPath(resolvedPath);
+		const finalPathIdentity = await fs.lstat(resolvedPath, { bigint: true });
+		if (
+			!matchesSecureInputIdentity(before, after) ||
+			!matchesSecureInputIdentity(before, finalPathIdentity) ||
+			!sameSecureInputAncestors(beforePath.ancestors, finalPath.ancestors)
+		)
+			throw new SdkSessionCliError("input_file_unavailable", "Unable to read --json-input-file.", 2);
+		return bytes.toString("utf8");
+	} catch (error) {
+		if (error instanceof SdkSessionCliError) throw error;
+		throw new SdkSessionCliError("input_file_unavailable", "Unable to read --json-input-file.", 2);
+	} finally {
+		if (descriptor !== undefined) await descriptor.close().catch(() => {});
+	}
+}
+
 function containsSecretField(value: unknown): boolean {
 	if (Array.isArray(value)) return value.some(containsSecretField);
 	if (!isRecord(value)) return false;
@@ -211,14 +431,7 @@ async function inputFromArgs(args: SdkSessionCliArgs): Promise<JsonRecord> {
 	}
 	if (args.jsonInputFile !== undefined) {
 		try {
-			const stat = await fs.stat(args.jsonInputFile);
-			if (!stat.isFile() || (stat.mode & 0o077) !== 0)
-				throw new SdkSessionCliError(
-					"input_file_permissions",
-					"--json-input-file must be a regular file with 0600 permissions.",
-					2,
-				);
-			return parseInput(await Bun.file(args.jsonInputFile).text(), "--json-input-file");
+			return parseInput(await readSecureJsonInputFile(args.jsonInputFile), "--json-input-file");
 		} catch (error) {
 			if (error instanceof SdkSessionCliError) throw error;
 			throw new SdkSessionCliError("input_file_unavailable", "Unable to read --json-input-file.", 2);
@@ -274,9 +487,8 @@ async function bounded<T>(promise: Promise<T>, timeoutMs: number, message: strin
 	}
 }
 
-function reportRouterCleanupFailure(error: unknown): void {
-	const message = error instanceof Error ? error.message : String(error);
-	process.stderr.write(`SDK session Router cleanup failed: ${message}\n`);
+function reportRouterCleanupFailure(): void {
+	logger.warn("SDK session Router cleanup failed");
 }
 
 async function withRouter<T>(
@@ -302,8 +514,14 @@ async function withRouter<T>(
 	}
 	try {
 		await bounded(router.stop(), ROUTER_STOP_TIMEOUT_MS, "SDK session Router shutdown timed out.");
-	} catch (error) {
-		reportRouterCleanupFailure(error);
+	} catch {
+		if (actionFailed) {
+			const failure = normalizeSessionFailure(actionError, {});
+			actionError = new PublicCommandFailure({
+				...failure.input,
+				diagnostics: [...(failure.input.diagnostics ?? []), "router_cleanup_failed"],
+			});
+		} else reportRouterCleanupFailure();
 	}
 	if (actionFailed) throw actionError;
 	return result;
@@ -324,12 +542,17 @@ function throwResponseFailure(response: unknown): void {
 	const record = object(response);
 	if (record?.ok !== false) return;
 	const failure = object(record.error);
-	throw new SdkSessionCliError(
-		typeof failure?.code === "string" ? failure.code : "unavailable",
-		typeof failure?.message === "string" ? failure.message : "SDK request failed.",
-		1,
+	const failureInput = sdkPublicFailure(
+		typeof failure?.code === "string" ? failure.code : "operation_failed",
 		failure,
 	);
+	throw new PublicCommandFailure({
+		...failureInput.input,
+		references: [
+			...(failureInput.input.references ?? []),
+			...(sdkPublicFailure("operation_failed", record.result).input.references ?? []),
+		],
+	});
 }
 
 async function paginatedSessionList(
@@ -472,9 +695,10 @@ async function probeSearchRows(agentDir: string, result: SdkSearchResultV1): Pro
 	} catch {
 		return {
 			...result,
+			warnings: [...result.warnings, "probe_unavailable"],
 			rows: mergeProbedSearchRows(
 				result.rows,
-				rows.map(row => ({ ...row, probe: row.live ? "unreachable" : "stale" })),
+				rows.map(row => (row.live ? { ...row } : { ...row, probe: "stale" as const })),
 			),
 		};
 	}
@@ -485,54 +709,31 @@ export async function runSdkSearch(
 	args: Pick<SdkSessionCliArgs, "agentDir" | "repo" | "scope" | "limit" | "cursor">,
 	createService: (agentDir: string) => SessionLifecycleService = createBrokerSessionLifecycleService,
 	probe: (agentDir: string, result: SdkSearchResultV1) => Promise<SdkSearchResultV1> = probeSearchRows,
-): Promise<{ result: SdkSearchResultV1; exitCode: 0 | 1 }> {
-	const agentDir = path.resolve(args.agentDir ?? getAgentDir());
-	const locator = await resolveSessionLocator(args.repo ?? process.cwd(), agentDir);
-	const scope: ScopeNameV1 =
-		args.scope === undefined || args.scope === "repo" || args.scope === "pwd" || args.scope === "global"
-			? ((args.scope ?? "repo") as ScopeNameV1)
-			: (() => {
-					throw new SdkSessionCliError(
-						"usage",
-						`Invalid search scope "${args.scope}". Expected repo, pwd, or global.`,
-						2,
-					);
-				})();
-	const request = searchScopeRequest(scope, locator);
-	const resolved = await resolveScopeRequest(request);
-	const outcome = await createService(agentDir).scopedList(request, args.limit, args.cursor);
-	if (outcome.ok) {
-		if ("rows" in outcome.result) {
-			if (outcome.result.status === "not-in-git-worktree") return { result: outcome.result, exitCode: 0 };
-			if (outcome.result.status === "unavailable") return { result: outcome.result, exitCode: 1 };
-			return { result: await probe(agentDir, outcome.result), exitCode: 0 };
+): Promise<{ result: SdkSearchResultV1; exitCode: 0 }> {
+	try {
+		const agentDir = path.resolve(args.agentDir ?? getAgentDir());
+		const locator = await resolveSessionLocator(args.repo ?? process.cwd(), agentDir);
+		const scope: ScopeNameV1 =
+			args.scope === undefined || args.scope === "repo" || args.scope === "pwd" || args.scope === "global"
+				? ((args.scope ?? "repo") as ScopeNameV1)
+				: (() => {
+						throw sdkPublicFailure("usage", undefined, "pre-effect");
+					})();
+		const request = searchScopeRequest(scope, locator);
+		const outcome = await createService(agentDir).scopedList(request, args.limit, args.cursor);
+		if (outcome.ok) {
+			if ("rows" in outcome.result) {
+				if (outcome.result.status === "not-in-git-worktree") return { result: outcome.result, exitCode: 0 };
+				if (outcome.result.status === "unavailable")
+					throw sdkPublicFailure(outcome.result.error?.code ?? "unavailable");
+				return { result: await probe(agentDir, outcome.result), exitCode: 0 };
+			}
+			throw sdkPublicFailure("operation_failed");
 		}
-		return {
-			result: {
-				version: 1,
-				scope: resolved,
-				status: "unavailable",
-				observedAt: new Date().toISOString(),
-				rows: [],
-				warnings: [],
-				error: { code: "malformed_response", message: "broker search returned an unscoped result" },
-			},
-			exitCode: 1,
-		};
+		throw lifecyclePublicFailure(outcome);
+	} catch (error) {
+		throw normalizeSessionFailure(error, args);
 	}
-	if (!outcome.ok && outcome.result?.status === "unavailable") return { result: outcome.result, exitCode: 1 };
-	return {
-		result: {
-			version: 1,
-			scope: resolved,
-			status: "unavailable",
-			observedAt: new Date().toISOString(),
-			rows: [],
-			warnings: [],
-			error: { code: outcome.error.code, message: outcome.error.message },
-		},
-		exitCode: 1,
-	};
 }
 
 function searchScopeLabel(result: SdkSearchResultV1): string {
@@ -544,7 +745,10 @@ function searchScopeLabel(result: SdkSearchResultV1): string {
 }
 
 function safeSearchText(value: string): string {
-	return truncateToWidth(replaceTabs(value).replaceAll(/[\r\n]/g, " "), SEARCH_TEXT_WIDTH);
+	return truncateToWidth(
+		replaceTabs(sanitizeDisplayLine(value).replaceAll(/[\u2028\u2029]/gu, " ")),
+		SEARCH_TEXT_WIDTH,
+	);
 }
 
 /** Renders a credential-free scope/status preamble and bounded search table. */
@@ -552,15 +756,15 @@ export function renderSdkSearchTable(result: SdkSearchResultV1): string {
 	const lines = [
 		`Scope requested: ${result.scope.requested}`,
 		`Scope resolved: ${safeSearchText(searchScopeLabel(result))}`,
-		`Status: ${result.status}`,
-		`Observed at: ${result.observedAt}`,
+		`Status: ${safeSearchText(result.status)}`,
+		`Observed at: ${safeSearchText(result.observedAt)}`,
 		...(result.cursor === undefined ? [] : [`Continuation cursor: ${safeSearchText(result.cursor)}`]),
 	];
 	if (result.rows.length === 0) return lines.join("\n");
 	lines.push("ID  PROBE        LIVE  CWD");
 	for (const row of result.rows)
 		lines.push(
-			`${safeSearchText(row.id).padEnd(20)}  ${(row.probe ?? "-").padEnd(11)}  ${String(row.live).padEnd(4)}  ${safeSearchText(row.locator.cwd)}`,
+			`${safeSearchText(row.id).padEnd(20)}  ${safeSearchText(row.probe ?? "-").padEnd(11)}  ${String(row.live).padEnd(4)}  ${safeSearchText(row.locator.cwd)}`,
 		);
 	return lines.join("\n");
 }
@@ -828,22 +1032,35 @@ async function requestBrokerOperatorAbort(
 		timeoutMs,
 		reconnectAttempts: 0,
 	});
+	let actionFailed = false;
+	let actionError: unknown;
+	let result!: JsonRecord;
 	try {
 		const response = await client.global("session.control", request, {
 			idempotencyKey,
 			timeoutMs,
 		});
-		const result = object(response);
-		if (!result) throw new SdkClientError("protocol_error", "SDK broker returned a malformed control response.");
-		throwResponseFailure(result);
-		return result;
-	} finally {
-		await client.close().catch(error => {
-			process.stderr.write(
-				`SDK broker control cleanup failed: ${error instanceof Error ? error.message : String(error)}\n`,
-			);
-		});
+		const record = object(response);
+		if (!record) throw new SdkClientError("protocol_error", "SDK broker returned a malformed control response.");
+		throwResponseFailure(record);
+		result = record;
+	} catch (error) {
+		actionFailed = true;
+		actionError = error;
 	}
+	try {
+		await client.close();
+	} catch {
+		if (actionFailed) {
+			const failure = normalizeSessionFailure(actionError, args);
+			actionError = new PublicCommandFailure({
+				...failure.input,
+				diagnostics: [...(failure.input.diagnostics ?? []), "broker_cleanup_failed"],
+			});
+		} else logger.warn("SDK broker client cleanup failed");
+	}
+	if (actionFailed) throw actionError;
+	return result;
 }
 
 async function requestQuery(
@@ -923,6 +1140,8 @@ export async function waitForTerminalStatus(
  * reports when a request that was already on the wire is abandoned.
  */
 function isWaitWindowFailure(error: unknown): boolean {
+	if (error instanceof PublicCommandFailure)
+		return error.input.kind === "timeout" || error.input.kind === "uncertain_after_send";
 	if (error instanceof SdkClientError) return error.code === "timeout" || error.code === "uncertain_after_send";
 	return error instanceof SdkSessionCliError && error.code === "timeout";
 }
@@ -942,30 +1161,49 @@ async function runSend(agentDir: string, sessionId: string, args: SdkSessionCliA
 	if (inputRef === undefined) promptInput.clientRef = clientRef;
 	const invalid = validateAdapterControl("turn.prompt", promptInput);
 	if (invalid) throw new SdkSessionCliError(invalid.code, invalid.message, 2);
-	await ensureBroker({ agentDir });
+	let accepted = false;
+	try {
+		await ensureBroker({ agentDir });
 
-	return await withRouter(agentDir, async router => {
-		const response = await requestControl(router, sessionId, "turn.prompt", promptInput, args);
-		const result: JsonRecord = {
-			version: SESSION_ROWS_VERSION,
-			operationRef: clientRef,
-			status: "accepted",
-			receipt: resultObject(response) ?? response,
-		};
-		if (args.wait === true) {
-			const outcome = await waitForTerminalStatus(router, sessionId, clientRef, args.timeoutMs ?? 30_000);
-			if (!outcome.terminal)
-				throw new SdkSessionCliError(
-					"wait_timeout",
-					`Prompt ${clientRef} did not reach a terminal state within the wait window.`,
-					1,
-					{ operationRef: clientRef, status: outcome.status },
-				);
-			result.status = outcome.status;
-			result.statusDetail = outcome.detail;
-		}
-		return { ok: true, result };
-	});
+		return await withRouter(agentDir, async router => {
+			const response = await requestControl(router, sessionId, "turn.prompt", promptInput, args);
+			accepted = true;
+			const result: JsonRecord = {
+				version: SESSION_ROWS_VERSION,
+				operationRef: clientRef,
+				status: "accepted",
+				receipt: resultObject(response) ?? response,
+			};
+			if (args.wait === true) {
+				const outcome = await waitForTerminalStatus(router, sessionId, clientRef, args.timeoutMs ?? 30_000);
+				if (!outcome.terminal)
+					throw new SdkSessionCliError(
+						"wait_timeout",
+						`Prompt ${clientRef} did not reach a terminal state within the wait window.`,
+						1,
+						{ operationRef: clientRef, status: outcome.status },
+					);
+				result.status = outcome.status;
+				result.statusDetail = outcome.detail;
+			}
+			return { ok: true, result };
+		});
+	} catch (error) {
+		const failure = normalizeSessionFailure(error, { ...args, sessionId, opRef: clientRef });
+		throw new PublicCommandFailure({
+			...failure.input,
+			...(accepted
+				? {
+						proof: "accepted" as const,
+						kind:
+							failure.input.kind === "uncertain_after_send" || failure.input.kind === "timeout"
+								? ("wait_timeout" as const)
+								: failure.input.kind,
+					}
+				: {}),
+			references: failure.input.references,
+		});
+	}
 }
 
 async function runStatus(
@@ -1382,8 +1620,7 @@ async function offlineTailReplay(
 		capability: "session.list",
 		target: { cwd: repo, resolveSessionId: sessionId },
 	});
-	if (!outcome.ok)
-		throw new SdkSessionCliError(outcome.error.code, outcome.error.message, 1, { certainty: outcome.certainty });
+	if (!outcome.ok) throw lifecyclePublicFailure(outcome);
 	if ("rows" in outcome.result)
 		throw new SdkSessionCliError(
 			"malformed_response",
@@ -1824,7 +2061,14 @@ async function runRawGlobal(
 	const lifecycle = createBrokerSessionLifecycleService(agentDir);
 	const timeoutMs = lifecycleRequestTimeoutMs(operation, input);
 	const response = await lifecycle.execute(lifecycleMutationRequest(operation, input, args.idempotencyKey, timeoutMs));
-	throwResponseFailure(response);
+	try {
+		if (!response.ok) throw lifecyclePublicFailure(response);
+	} catch (error) {
+		throw normalizeSessionFailure(error, {
+			...args,
+			sessionId: typeof input.sessionId === "string" ? input.sessionId : args.sessionId,
+		});
+	}
 	return response;
 }
 
@@ -1872,7 +2116,6 @@ export async function runSdkSessionCli(
 		if (action === "search") {
 			const search = await runSdkSearch(args);
 			writeOutput(args.json === true ? search.result : renderSdkSearchTable(search.result));
-			if (search.exitCode !== 0) setExitCode(search.exitCode);
 			return;
 		}
 		if (action === "inspect") {
@@ -1927,19 +2170,11 @@ export async function runSdkSessionCli(
 		if (!kind) throw new SdkSessionCliError("usage", "raw requires one of: control, query, global.", 2);
 		const operation = kind === "query" ? requireValue(args.query, "--query") : requireValue(args.operation, "--op");
 		if (isRawSpawnOperation(kind, operation))
-			throw new SdkSessionCliError(
-				"adapter_operation_prohibited",
-				"session.spawn is unavailable through the SDK session CLI.",
-				1,
-			);
+			throw sdkPublicFailure("adapter_operation_prohibited", undefined, "pre-effect");
 		const dispositionError = cliOperationError(kind, operation);
-		if (dispositionError) throw new SdkSessionCliError(dispositionError.code, dispositionError.message, 1);
+		if (dispositionError) throw sdkPublicFailure(dispositionError.code, undefined, "pre-effect");
 		if (isEndpointOperation(operation))
-			throw new SdkSessionCliError(
-				"endpoint_credential_forbidden",
-				"session.get_endpoint is not available through the SDK session CLI.",
-				1,
-			);
+			throw sdkPublicFailure("endpoint_credential_forbidden", undefined, "pre-effect");
 		const input = await inputFromArgs(args);
 		const secretError = validateAdapterSecretFields(operation, input);
 		if (secretError) throw new SdkSessionCliError(secretError.code, secretError.message, 2);
@@ -1958,26 +2193,6 @@ export async function runSdkSessionCli(
 			),
 		);
 	} catch (error) {
-		const cliError =
-			error instanceof SdkSessionCliError
-				? error
-				: error instanceof SessionRouterError
-					? new SdkSessionCliError(error.phase, error.message, 1)
-					: error instanceof SdkClientError
-						? new SdkSessionCliError(error.code, error.message, 1, error.details)
-						: new SdkSessionCliError(
-								"operation_failed",
-								error instanceof Error ? error.message : "SDK operation failed.",
-								1,
-							);
-		writeOutput({
-			ok: false,
-			error: {
-				code: cliError.code,
-				message: cliError.message,
-				...(cliError.details === undefined ? {} : { details: stripSecretFields(cliError.details) }),
-			},
-		});
-		setExitCode(cliError.exitCode);
+		throw normalizeSessionFailure(error, args);
 	}
 }

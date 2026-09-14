@@ -247,8 +247,13 @@ function parseCliJson(stdout: string): Record<string, unknown> {
 	return parsed as Record<string, unknown>;
 }
 
+// Preserve the trusted CLI's bounded public envelope, including exact reconciliation references.
+class CliFailure extends Error {
+	constructor(readonly envelope: Record<string, unknown>, readonly exitCode: number) { super("broker_request_failed"); }
+}
+
 async function runGjcSession(repo: string, arguments_: readonly string[]): Promise<Record<string, unknown>> {
-	const child = Bun.spawn(["gjc", "sdk", "session", ...arguments_], {
+	const child = Bun.spawn(["gjc", "sdk", "session", ...arguments_, "--json"], {
 		cwd: repo,
 		stdin: "ignore",
 		stdout: "pipe",
@@ -259,8 +264,13 @@ async function runGjcSession(repo: string, arguments_: readonly string[]): Promi
 		new Response(child.stdout).text(),
 		new Response(child.stderr).text(),
 	]);
-	if (exitCode !== 0) throw new Error("broker_request_failed");
-	return parseCliJson(stdout);
+	const response = parseCliJson(stdout);
+	if (exitCode !== 0 || response.ok === false) {
+		if (Buffer.byteLength(stdout) > 8192 || response.schema !== "gjc.command-error" || response.version !== 1 || response.ok !== false)
+			throw new Error("invalid_cli_response");
+		throw new CliFailure(response, exitCode === 2 ? 2 : 1);
+	}
+	return response;
 }
 
 async function inspect(repo: string, sessionId: string): Promise<Record<string, unknown>> {
@@ -270,8 +280,8 @@ async function inspect(repo: string, sessionId: string): Promise<Record<string, 
 			const response = await runGjcSession(repo, ["raw", "query", sessionId, "--query", query]);
 			if (response.ok === false) throw new Error("query_unavailable");
 			snapshot[query] = { status: "confirmed", source: query, value: redact(response) };
-		} catch {
-			snapshot[query] = { status: "unavailable", source: query };
+		} catch (error) {
+			snapshot[query] = { status: "unavailable", source: query, ...(error instanceof CliFailure ? { failure: error.envelope } : {}) };
 		}
 	}
 	return snapshot;
@@ -287,18 +297,12 @@ async function requireApproval(sessionId: string, operation: string, input: Reco
 	} finally { reader.close(); }
 }
 
-async function raw(repo: string, args: string[]): Promise<unknown> {
-	const process = Bun.spawn(["gjc", "sdk", "session", "raw", ...args, "--repo", repo], { stdout: "pipe", stderr: "pipe" });
-	const output = await new Response(process.stdout).text();
-	if ((await process.exited) !== 0) throw new Error("broker_dispatch_failed");
-	return JSON.parse(output) as unknown;
-}
 
 async function main(): Promise<void> {
 	const args = parseArgs(process.argv.slice(2));
 	if (args.mode === "inspect") {
 		const result = await inspect(args.repo, args.sessionId);
-		process.stdout.write(JSON.stringify(redact({ sessionId: args.sessionId, result }), null, 2) + "\\n");
+		process.stdout.write(JSON.stringify({ sessionId: args.sessionId, result }, null, 2) + "\\n");
 		return;
 	}
 	if (!args.operation || !ALLOWED_CONTROLS.has(args.operation)) throw new Error("operation_not_allowed");
@@ -318,7 +322,12 @@ async function main(): Promise<void> {
 	process.stdout.write(JSON.stringify(redact({ sessionId: args.sessionId, result }), null, 2) + "\\n");
 }
 
-main().catch(() => { process.stderr.write("GJC SDK request failed safely.\\n"); process.exitCode = 1; });
+main().catch(error => {
+	if (error instanceof CliFailure) {
+		process.stdout.write(JSON.stringify(error.envelope) + "\\n");
+		process.exitCode = error.exitCode;
+	} else { process.stderr.write("GJC SDK request failed safely.\\n"); process.exitCode = 1; }
+});
 `;
 }
 
@@ -391,10 +400,17 @@ def redact(value: Any) -> Any:
     return value
 
 
+class CliFailure(Exception):
+    def __init__(self, envelope: dict[str, Any], exit_code: int) -> None:
+        super().__init__("broker_request_failed")
+        self.envelope = envelope
+        self.exit_code = exit_code
+
+
 def run_gjc_session(repo: str, arguments: list[str]) -> dict[str, Any]:
     try:
         completed = subprocess.run(
-            ["gjc", "sdk", "session", *arguments],
+            ["gjc", "sdk", "session", *arguments, "--json"],
             cwd=repo,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
@@ -405,14 +421,16 @@ def run_gjc_session(repo: str, arguments: list[str]) -> dict[str, Any]:
         )
     except (OSError, subprocess.SubprocessError):
         raise ValueError("broker_request_failed") from None
-    if completed.returncode != 0:
-        raise ValueError("broker_request_failed")
     try:
         response: Any = json.loads(completed.stdout)
     except json.JSONDecodeError:
         raise ValueError("invalid_cli_response") from None
     if not isinstance(response, dict):
         raise ValueError("invalid_cli_response")
+    if completed.returncode != 0 or response.get("ok") is False:
+        if len(completed.stdout.encode("utf-8")) > 8192 or response.get("schema") != "gjc.command-error" or response.get("version") != 1 or response.get("ok") is not False:
+            raise ValueError("invalid_cli_response")
+        raise CliFailure(response, 2 if completed.returncode == 2 else 1)
     return response
 
 
@@ -424,6 +442,8 @@ def inspect(repo: str, session_id: str) -> dict[str, Any]:
             if response.get("ok") is False:
                 raise ValueError("query_unavailable")
             snapshot[query] = {"status": "confirmed", "source": query, "value": redact(response)}
+        except CliFailure as error:
+            snapshot[query] = {"status": "unavailable", "source": query, "failure": error.envelope}
         except Exception:
             snapshot[query] = {"status": "unavailable", "source": query}
     return snapshot
@@ -452,7 +472,7 @@ def main() -> None:
         raise ValueError("secret_input_forbidden")
     if args.mode == "inspect":
         result = inspect(args.repo, args.session_id)
-        print(json.dumps(redact({"sessionId": args.session_id, "result": result}), indent=2))
+        print(json.dumps({"sessionId": args.session_id, "result": result}, indent=2))
         return
     operation = args.operation
     if operation is None or operation not in ALLOWED_CONTROLS:
@@ -480,6 +500,9 @@ def main() -> None:
 
 try:
     main()
+except CliFailure as error:
+    print(json.dumps(error.envelope, ensure_ascii=False, separators=(",", ":")))
+    raise SystemExit(error.exit_code)
 except Exception:
     print("GJC SDK request failed safely.", file=sys.stderr)
     raise SystemExit(1)
