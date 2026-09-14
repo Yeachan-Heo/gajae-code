@@ -1622,8 +1622,11 @@ describe("ModelRegistry", () => {
 				undefined,
 				childA,
 			);
-			expect(fallback.model).toBe(alphaModel);
-			expect(fallback.authFallbackUsed).toBe(true);
+			expect(fallback.model).toBeUndefined();
+			expect(fallback.authFallbackUsed).toBe(false);
+			expect(fallback.parentFallbackSelector).toBeUndefined();
+			expect(fallback.requestedModel).toBe(betaModel);
+			expect(fallback.skips).toEqual([{ selector: "beta/anthropic/claude-sonnet-4.5", reason: "unauthenticated" }]);
 		});
 	});
 

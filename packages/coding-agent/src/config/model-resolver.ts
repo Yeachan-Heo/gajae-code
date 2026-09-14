@@ -87,19 +87,26 @@ export function resolveStartupModelRefreshSelectors(
 
 export async function refreshMissingQualifiedModelProviders(
 	selectors: ModelSelectorValue | undefined,
-	modelRegistry: Pick<ModelRegistry, "getAvailable" | "getDiscoverableProviders" | "refreshProvider">,
+	modelRegistry: Pick<
+		ModelRegistry,
+		"getAvailable" | "getDiscoverableProviders" | "getRefreshableProviders" | "refreshProvider"
+	>,
 ): Promise<boolean> {
 	const refreshedProviders = new Set<string>();
 	for (const selector of normalizeModelSelectorValue(selectors)) {
 		const parsedSelector = parseModelString(selector);
 		if (!parsedSelector) continue;
+		const hasRefreshableProviders = typeof modelRegistry.getRefreshableProviders === "function";
+		const listedProviders = hasRefreshableProviders
+			? modelRegistry.getRefreshableProviders()
+			: modelRegistry.getDiscoverableProviders();
 		const provider =
-			modelRegistry
-				.getDiscoverableProviders()
-				.find(candidate => candidate.toLowerCase() === parsedSelector.provider.toLowerCase()) ??
-			PROVIDER_DESCRIPTORS.find(
-				descriptor => descriptor.providerId.toLowerCase() === parsedSelector.provider.toLowerCase(),
-			)?.providerId;
+			listedProviders.find(candidate => candidate.toLowerCase() === parsedSelector.provider.toLowerCase()) ??
+			(!hasRefreshableProviders
+				? PROVIDER_DESCRIPTORS.find(
+						descriptor => descriptor.providerId.toLowerCase() === parsedSelector.provider.toLowerCase(),
+					)?.providerId
+				: undefined);
 		if (!provider || refreshedProviders.has(provider)) continue;
 		const availableModels = modelRegistry.getAvailable();
 		const rawModelId = selector.slice(selector.indexOf("/") + 1);
@@ -1148,10 +1155,25 @@ export async function resolveModelChainWithAuth(
 	}
 	return { explicitThinkingLevel: false, activeIndex: modelPatterns.length, skips };
 }
+export function isExplicitProviderModelSelector(pattern: string): boolean {
+	const normalized = pattern.trim();
+	if (!normalized || isSessionInheritedAgentPattern(normalized)) return false;
+	const suffix = splitSelectorThinkingSuffix(normalized);
+	const selector = suffix.thinkingLevel ? suffix.selector : normalized;
+	if (getModelRoleAlias(selector)) return false;
+	if (/[*?[]/.test(selector)) return false;
+	const parsed = parseModelString(selector);
+	return parsed !== undefined && parsed.provider.length > 0 && parsed.id.length > 0;
+}
+
+export function isExplicitProviderModelOverride(modelPatterns: readonly string[]): boolean {
+	return modelPatterns.length > 0 && modelPatterns.every(isExplicitProviderModelSelector);
+}
 
 /**
  * Resolve a list of override patterns to the first matching model, with an
- * auth-aware fallback to the parent session's active model.
+ * auth-aware fallback to the parent session's active model for unqualified
+ * aliases and role patterns.
  *
  * If the resolved subagent model has no working credentials (provider has no
  * usable auth), and the parent's active model resolves with working auth,
@@ -1159,6 +1181,14 @@ export async function resolveModelChainWithAuth(
  * silently routing to a provider the user can't actually call (e.g.
  * `modelRoles.task` pointing at an unqualified id whose only available
  * provider variant has no configured credentials — see #985).
+ *
+ * Explicit `provider/model` selectors (including user-specified chains of
+ * them) fail closed instead: a missing catalog entry or authentication
+ * failure must not substitute the parent session's model or another
+ * provider. Intentional chain tails still apply in order. Mixed chains that
+ * include any unqualified/role entry keep parent fallback for the whole
+ * chain, including explicit heads. Glob selectors (`*`, `?`, `[`) are not
+ * exact pins.
  *
  * Keyless-by-design providers (llama.cpp, ollama, lm-studio) advertise the
  * `kNoAuth` sentinel from `getApiKey` to signal that they do not require
@@ -1168,7 +1198,9 @@ export async function resolveModelChainWithAuth(
  *
  * If neither the subagent nor the parent has working auth, returns the
  * primary resolution unchanged so the existing error path still surfaces
- * a meaningful failure downstream.
+ * a meaningful failure downstream. Explicit-only chains return no model
+ * so callers can surface an actionable error. Canonical parent seeding is
+ * independent of that fail-closed substitution guard.
  */
 export async function resolveModelOverrideWithAuthFallback(
 	modelPatterns: string[],
@@ -1196,6 +1228,7 @@ export async function resolveModelOverrideWithAuthFallback(
 	const skips: Array<{ selector: string; reason: string }> = [];
 	let activeIndex = 0;
 	const canonicalScope = canonicalSessionId ?? authSessionId;
+	const explicitExactOnly = isExplicitProviderModelOverride(modelPatterns);
 	if (canonicalScope && parentActiveModelPattern) {
 		const parentActiveModel = resolveModelOverride(
 			[parentActiveModelPattern],
@@ -1261,6 +1294,9 @@ export async function resolveModelOverrideWithAuthFallback(
 		}
 		skips.push({ selector: pattern, reason: "unauthenticated" });
 		activeIndex += 1;
+	}
+	if (explicitExactOnly) {
+		return { explicitThinkingLevel: false, requestedModel, authFallbackUsed: false, activeIndex, skips };
 	}
 	const fallback = parentActiveModelPattern
 		? resolveModelOverride([parentActiveModelPattern], modelRegistry, settings, authSessionId, options?.aliasIntent)
