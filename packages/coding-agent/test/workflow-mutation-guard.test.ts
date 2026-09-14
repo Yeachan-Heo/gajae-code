@@ -1153,4 +1153,49 @@ describe("bash scanner command substitutions", () => {
 			expect(decision.reason).toBe("unknown-target");
 		}
 	});
+
+	it("fails closed when substitution parser frames exceed their nesting bound", async () => {
+		const cwd = await makeTempRoot();
+		await writeActiveSkill(cwd, "deep-interview", "interviewing");
+		const nested = `${"$(".repeat(128)}rm -rf src/product.ts${")".repeat(128)}`;
+		const decision = await decideBash(cwd, `printf "%s" "${nested}"`);
+		expect(decision.blocked).toBe(true);
+		expect(decision.reason).toBe("unknown-target");
+	});
+
+	it("ignores substitutions in literal data heredocs and shell comments", async () => {
+		const cwd = await makeTempRoot();
+		await writeActiveSkill(cwd, "deep-interview", "interviewing");
+
+		for (const command of [
+			"cat <<'EOF' > /tmp/spec.md\n$(rm -rf src/product.ts)\nEOF",
+			"cat <<'EOF' > /tmp/spec.md\n`rm -rf src/product.ts`\nEOF",
+			"# $(rm -rf src/product.ts) and an 'unterminated quote\ncat <<'EOF' > /tmp/spec.md\nsafe\nEOF",
+			"printf '%s' safe # `rm -rf src/product.ts` and an 'unterminated quote\ncat <<'EOF' > /tmp/spec.md\nsafe\nEOF",
+			"printf '%s' safe # $(rm -rf src/product.ts)\ncat <<'EOF' > /tmp/spec.md\nsafe\nEOF",
+		]) {
+			const decision = await decideBash(cwd, command);
+			expect(decision.blocked, command).toBe(false);
+		}
+	});
+
+	it("keeps live substitutions and executable or expanding heredocs blocked", async () => {
+		const cwd = await makeTempRoot();
+		await writeActiveSkill(cwd, "deep-interview", "interviewing");
+
+		for (const command of [
+			'printf "%s" "$(rm -rf src/product.ts)"',
+			'printf "%s" "$(printf "#"; rm -rf src/product.ts)"',
+			'printf "%s" "$(printf ")"; rm -rf src/product.ts)"',
+			'printf "%s" "# $(rm -rf src/product.ts)"',
+			"printf '%s' foo\\# $(rm -rf src/product.ts)",
+			"printf '%s' foo# $(rm -rf src/product.ts)",
+			"bash <<'EOF'\nrm src/product.ts\nEOF",
+			"cat <<'EOF' | bash\nrm src/product.ts\nEOF",
+			"cat <<EOF > /tmp/spec.md\n$(rm src/product.ts)\nEOF",
+		]) {
+			const decision = await decideBash(cwd, command);
+			expect(decision.blocked, command).toBe(true);
+		}
+	});
 });
