@@ -89,7 +89,11 @@ CAPTION = (
 )
 
 if __name__ == "__main__":
-    out = str(_ASSETS / "pb_workflow.png")
+    # 하류(ko/en 생성기)가 읽는 건 크롭본이다. 여기서 끝까지 만들어
+    # 경로가 끊기지 않게 한다. 예전엔 crop.py 를 손으로 돌려야 했고,
+    # 그걸 빠뜨리면 낡은 크롭이 그대로 쓰였다.
+    raw = str(_ASSETS / "pb_workflow.png")
+    out = raw
     data = generate_diagram(
         method=METHOD,
         caption=CAPTION,
@@ -100,4 +104,10 @@ if __name__ == "__main__":
         output_path=out,
     )
     print("RESULT_BYTES:", len(data) if data else None)
-    print("RESULT_PATH:", out)
+    print("RESULT_PATH:", raw)
+
+    from crop import crop
+    import provenance
+    cropped = crop(raw, str(_ASSETS / "pb_workflow_crop.png"))
+    provenance.record(str(_ASSETS), cropped, raw)
+    print("DOWNSTREAM_INPUT:", cropped)

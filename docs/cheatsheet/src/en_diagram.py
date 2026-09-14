@@ -61,6 +61,14 @@ def main():
     if not key:
         raise SystemExit("OPENAI_API_KEY 없음")
 
+    # 입력이 상류 재생성 이후로 낡지 않았는지 먼저 본다.
+    import provenance
+    ok, why = provenance.check(str(_ASSETS), "pb_workflow_crop.png")
+    if not ok:
+        raise SystemExit(
+            f"입력이 신뢰할 수 없다: pb_workflow_crop.png — {why}\n"
+            f"gen_workflow.py 를 먼저 돌려 크롭본을 갱신하세요.")
+
     with open(SRC, "rb") as f:
         files = {"image": ("diagram.png", f.read(), "image/png")}
     data = {"model": MODEL, "prompt": PROMPT, "size": "1536x1024"}
@@ -81,6 +89,11 @@ def main():
     else:
         open(DST, "wb").write(requests.get(payload["url"], timeout=180).content)
     print("saved:", DST, os.path.getsize(DST), "bytes")
+
+    from crop import crop
+    cropped = crop(DST, str(_ASSETS / "pb_workflow_en_crop.png"))
+    provenance.record(str(_ASSETS), cropped, SRC, DST)
+    print("SHEET_INPUT:", cropped)
 
 
 if __name__ == "__main__":
