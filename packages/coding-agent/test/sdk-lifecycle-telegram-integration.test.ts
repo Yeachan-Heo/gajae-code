@@ -228,6 +228,9 @@ test("four live SDK hosts recover broker index heartbeats without recreating ses
 		failEnsures = false;
 		for (const timer of timerRecords) if (timer.active) timer.callback();
 		for (let attempt = 0; attempt < 100 && ensureInFlight > 0; attempt++) await Bun.sleep(1);
+		// Ensure completion is not a checkpoint barrier; exercise the real
+		// replacement broker checkpoint before observing durable heartbeats.
+		await broker.heartbeatSessions();
 		await broker.index.refresh();
 		const recovered = broker.index
 			.listSessions()
