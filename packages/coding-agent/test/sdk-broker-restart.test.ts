@@ -81,4 +81,23 @@ describe("SDK broker restart", () => {
 			await broker.stop();
 		}
 	});
+
+	it("reconciles enrolled managed roots before discovery publication", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-restart-managed-"));
+		await fs.mkdir(path.join(dir, "sdk"), { recursive: true, mode: 0o700 });
+		await fs.writeFile(
+			path.join(dir, "sdk", "managed-task-enrollments.json"),
+			`${JSON.stringify({ version: 1, controlRoots: [dir] }, null, 2)}\n`,
+			{ encoding: "utf8", mode: 0o600 },
+		);
+		const broker = new Broker({ agentDir: dir, packageGeneration: "test" });
+		try {
+			const discovery = await broker.start();
+			expect(broker.ownsDiscovery).toBe(true);
+			expect(discovery.url).toContain("ws://127.0.0.1");
+			expect(discovery.token).toBeDefined();
+		} finally {
+			await broker.stop();
+		}
+	});
 });
