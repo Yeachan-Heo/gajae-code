@@ -8900,45 +8900,36 @@ describe("Coordinator MCP deep-audit regressions", () => {
 	});
 
 	it("advertises Linux-only artifact capability consistently across platform discovery", async () => {
-		const originalPlatform = Object.getOwnPropertyDescriptor(process, "platform");
-		if (!originalPlatform?.configurable) throw new Error("process_platform_not_configurable");
-		try {
-			for (const [platform, available] of [
-				["linux", true],
-				["darwin", false],
-				["win32", false],
-			] as const) {
-				Object.defineProperty(process, "platform", { ...originalPlatform, value: platform });
-				const server = await createSdkControlServer(
-					await tempRoot(),
-					[],
-					[],
-					undefined,
-					undefined,
-					undefined,
-					undefined,
-					{
-						platform,
-					},
-				);
-				const discovery = await server.handleJsonRpc({ jsonrpc: "2.0", id: platform, method: "tools/list" });
-				const artifact = (discovery.result as { tools: Array<Record<string, unknown>> }).tools.find(
-					tool => tool.name === "gjc_coordinator_read_artifact",
-				);
-				expect(artifact?.description).toContain(
-					available ? "Read one bounded artifact" : "Unavailable on this platform",
-				);
-				if (!available) {
-					await expect(
-						server.callTool("gjc_coordinator_read_artifact", { path: "/unsupported" }),
-					).resolves.toEqual({
-						ok: false,
-						error: { code: "artifact_unavailable", message: "Coordinator artifact could not be read." },
-					});
-				}
+		for (const [platform, available] of [
+			["linux", true],
+			["darwin", false],
+			["win32", false],
+		] as const) {
+			const server = await createSdkControlServer(
+				await tempRoot(),
+				[],
+				[],
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				{
+					platform,
+				},
+			);
+			const discovery = await server.handleJsonRpc({ jsonrpc: "2.0", id: platform, method: "tools/list" });
+			const artifact = (discovery.result as { tools: Array<Record<string, unknown>> }).tools.find(
+				tool => tool.name === "gjc_coordinator_read_artifact",
+			);
+			expect(artifact?.description).toContain(
+				available ? "Read one bounded artifact" : "Unavailable on this platform",
+			);
+			if (!available) {
+				await expect(server.callTool("gjc_coordinator_read_artifact", { path: "/unsupported" })).resolves.toEqual({
+					ok: false,
+					error: { code: "artifact_unavailable", message: "Coordinator artifact could not be read." },
+				});
 			}
-		} finally {
-			Object.defineProperty(process, "platform", originalPlatform);
 		}
 	});
 
