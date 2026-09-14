@@ -428,26 +428,114 @@ function cleanShellWord(value: string): string {
 }
 
 /**
- * Blank out single-quoted spans so shell metacharacters inside a literal
- * argument value (e.g. `--value 'uses `x`; a > b'`) are not misread as
- * redirections or separators. Single quotes suppress every expansion in POSIX
- * shells, so their contents are always inert data. Double-quoted spans are left
- * intact because they still expand `$(...)` and backticks.
+ * Blank out quoted spans so shell metacharacters inside a literal argument
+ * value (e.g. `--evidence "p99 500ms -> 120ms"`) are not misread as
+ * redirections or separators.
+ *
+ * Both quote styles are masked because in POSIX shells neither one can contain
+ * a redirection or a command separator: `>`, `|`, `;`, and `&` are always
+ * literal data inside quotes. Masking only single quotes made every `>` in
+ * double-quoted PROSE look like a real redirect, so ordinary evidence text
+ * (`"throughput > baseline"`, `"500ms -> 120ms"`) was scanned as a file write
+ * and blocked.
+ *
+ * Double quotes differ from single quotes in one way that matters here: they
+ * still expand `$(...)` and backticks, and that substitution IS live code. So
+ * the literal text of a double-quoted span is masked while any substitution
+ * inside it is preserved verbatim for the scanners that follow.
+ *
+ * One span is never prose: a quoted word that is the OPERAND of a redirection
+ * or of `of=` (`> "/dev/null"`, `>" src.ts"`, `of=" /dev/null"`) names a file.
+ * Masking it would erase the very path the sink and bypass checks must read, so
+ * operand spans are preserved verbatim.
  */
-function maskSingleQuotedSpans(command: string): string {
+/**
+ * Does the double quote at `quoteIndex` open a redirection / `of=` operand
+ * rather than a prose argument? Only whitespace may sit between the operator
+ * and the quote, so `> "x"`, `>"x"`, `2>>"x"`, `>|"x"`, and `of="x"` all
+ * qualify, while `--evidence "a > b"` does not.
+ */
+function opensRedirectionOperand(command: string, quoteIndex: number): boolean {
+	let cursor = quoteIndex - 1;
+	while (cursor >= 0 && (command[cursor] === " " || command[cursor] === "\t")) cursor -= 1;
+	if (cursor < 0) return false;
+	const previous = command[cursor];
+	if (previous === ">" || previous === "<" || previous === "|" || previous === "&") {
+		// `|`/`&` qualify only as part of a redirection operator (`>|`, `>&`).
+		if (previous === "|" || previous === "&") {
+			const before = command[cursor - 1];
+			return before === ">" || before === "<";
+		}
+		return true;
+	}
+	// `of="..."` (dd) names an output file the same way a redirection does.
+	return previous === "=" && /(?:^|[\s;&|])of=$/i.test(command.slice(0, cursor + 1));
+}
+
+function maskQuotedSpans(command: string): string {
 	let masked = "";
 	let inSingle = false;
-	for (const character of command) {
-		if (character === "'") {
+	let inDouble = false;
+	// True when the span being scanned is a redirection / `of=` operand.
+	let quotedOperand = false;
+	// Depth of `$(...)` / backtick substitution nesting inside a double-quoted
+	// span. While non-zero the characters are live code and must not be masked.
+	let substitutionDepth = 0;
+	for (let index = 0; index < command.length; index += 1) {
+		const character = command[index] as string;
+		// A backslash escape inside a double-quoted span (or outside quotes)
+		// consumes the next character; neither byte can open or close a span.
+		if (character === "\\" && !inSingle) {
+			const next = command[index + 1];
+			const live = inDouble && substitutionDepth === 0 ? " " : character;
+			masked += next === undefined ? live : live + (inDouble && substitutionDepth === 0 ? " " : next);
+			index += next === undefined ? 0 : 1;
+			continue;
+		}
+		if (character === "'" && !inDouble) {
 			inSingle = !inSingle;
 			masked += character;
 			continue;
 		}
-		masked += inSingle && character !== "\n" ? " " : character;
+		if (character === '"' && !inSingle) {
+			if (inDouble) {
+				inDouble = false;
+				quotedOperand = false;
+				substitutionDepth = 0;
+			} else {
+				inDouble = true;
+				quotedOperand = opensRedirectionOperand(command, index);
+			}
+			masked += character;
+			continue;
+		}
+		if (inDouble && quotedOperand) {
+			masked += character;
+			continue;
+		}
+		// Track live substitutions so `"$(rm -rf x)"` stays scannable.
+		if (inDouble && character === "$" && command[index + 1] === "(") {
+			substitutionDepth += 1;
+			masked += "$(";
+			index += 1;
+			continue;
+		}
+		if (inDouble && character === "`") {
+			substitutionDepth = substitutionDepth === 0 ? 1 : 0;
+			masked += character;
+			continue;
+		}
+		if (inDouble && substitutionDepth > 0 && character === ")") {
+			substitutionDepth -= 1;
+			masked += character;
+			continue;
+		}
+		const inert = (inSingle || (inDouble && substitutionDepth === 0)) && character !== "\n";
+		masked += inert ? " " : character;
 	}
 	// An unbalanced quote means the parse is unreliable; keep the original text
 	// so the scanner stays fail-closed rather than blind.
-	return inSingle ? command : masked;
+	return inSingle || inDouble ? command : masked;
 }
 
 function isDeviceSinkPath(value: string): boolean {
@@ -1173,7 +1261,7 @@ function extractBashTargets(args: unknown, depth = 0): ExtractedTargets {
 	}
 	// Nested scripts were read from the raw text above; every scanner below works
 	// on the masked view so quoted argument data cannot look like a redirection.
-	const scanned = maskSingleQuotedSpans(heredoc.masked);
+	const scanned = maskQuotedSpans(heredoc.masked);
 	if (
 		BASH_OPAQUE_INTERPRETER_WRITE_RE.test(heredoc.masked) ||
 		BASH_HEREDOC_OPAQUE_INTERPRETER_WRITE_RE.test(heredoc.masked)
