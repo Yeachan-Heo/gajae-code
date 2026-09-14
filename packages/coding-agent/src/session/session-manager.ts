@@ -2418,6 +2418,8 @@ export interface SessionInfo {
 	firstMessage: string;
 	allMessagesText: string;
 }
+
+const pickerDiskIdentities = new WeakMap<SessionInfo, SessionStorageStat>();
 // =============================================================================
 // Strict ACP authorization inventory (fail-closed, never partial authority)
 // =============================================================================
@@ -3617,6 +3619,38 @@ function sameResumeStat(left: SessionStorageStat, right: SessionStorageStat): bo
 		left.mtimeNs === right.mtimeNs &&
 		left.ctimeNs === right.ctimeNs
 	);
+}
+
+function pickerDiskIdentityMatchesStorageStat(expected: SessionStorageStat, observed: SessionStorageStat): boolean {
+	return (
+		expected.isFile &&
+		observed.isFile &&
+		expected.dev === observed.dev &&
+		expected.ino === observed.ino &&
+		expected.nlink === observed.nlink &&
+		expected.size === observed.size &&
+		expected.mtimeNs === observed.mtimeNs &&
+		expected.ctimeNs === observed.ctimeNs
+	);
+}
+
+function pickerDiskIdentityMatchesManagedSnapshot(
+	expected: SessionStorageStat,
+	observed: Pick<SessionStorageStat, "dev" | "ino" | "nlink" | "size" | "mtimeNs" | "ctimeNs">,
+): boolean {
+	return (
+		expected.isFile &&
+		expected.dev === observed.dev &&
+		expected.ino === observed.ino &&
+		expected.nlink === observed.nlink &&
+		expected.size === observed.size &&
+		expected.mtimeNs === observed.mtimeNs &&
+		expected.ctimeNs === observed.ctimeNs
+	);
+}
+
+function pickerDiskIdentityMatchesDescriptor(expected: SessionStorageStat, observed: DescriptorSnapshot): boolean {
+	return pickerDiskIdentityMatchesManagedSnapshot(expected, observed);
 }
 
 function resumeIdentityMatchesDescriptor(identity: ResumeSessionIdentity, descriptor: DescriptorSnapshot): boolean {
@@ -6948,7 +6982,7 @@ async function collectSessionFromFile(
 		firstMessage ||= extractFirstUserMessageFromPrefix(content) ?? "";
 		const messageCount = Math.max(parsedMessageCount, countMessageMarkers(content));
 		const stats = storage.statSync(file);
-		return {
+		const session: SessionInfo = {
 			path: file,
 			id: header.id,
 			cwd: header.cwd ?? "",
@@ -6963,6 +6997,8 @@ async function collectSessionFromFile(
 			firstMessage: firstMessage || "(no messages)",
 			allMessagesText: allMessages.length > 0 ? allMessages.join(" ") : firstMessage,
 		};
+		pickerDiskIdentities.set(session, stats);
+		return session;
 	} catch {
 		return undefined;
 	}
@@ -7081,6 +7117,7 @@ export const SessionManagerTestHooks: {
 	afterForkTranscriptPublished?: () => void | Promise<void>;
 	beforeEphemeralArtifactManagerInstall?: (dir: string) => void | Promise<void>;
 	beforePersistPatchFence?: (attempt: number) => void;
+	beforeLivePickerStarFence?: () => void;
 	beforeStrictMissingCheck?: (filePath: string, storage: SessionStorage) => void;
 	beforeManagedResumeAcceptance?: (filePath: string, storage: SessionStorage) => void;
 	beforeManagedResumeReturn?: (filePath: string, storage: SessionStorage) => void;
@@ -17318,7 +17355,7 @@ export class SessionManager {
 
 	async setSessionStarredForPicker(session: SessionInfo, starred: boolean): Promise<void> {
 		if (this.#sessionFile && canonicalizeTrustedPath(session.path) === canonicalizeTrustedPath(this.#sessionFile)) {
-			await this.setSessionStarred(starred);
+			await this.#setLivePickerStar(session, starred);
 			return;
 		}
 		await SessionManager.setSessionStarredForPicker(
@@ -17326,6 +17363,108 @@ export class SessionManager {
 			starred,
 			this.destination.kind === "explicit" ? this.destination.directory : undefined,
 		);
+	}
+
+	#assertPickerSessionIsCurrent(session: SessionInfo): void {
+		if (
+			!this.#sessionFile ||
+			canonicalizeTrustedPath(session.path) !== canonicalizeTrustedPath(this.#sessionFile) ||
+			session.id !== this.#sessionId
+		)
+			throw new Error("Selected session identity changed. Reopen the session picker.");
+		if (session.cwd !== this.cwd) throw new Error("Selected session workspace changed. Reopen the session picker.");
+		const expectedDiskIdentity = pickerDiskIdentities.get(session);
+		if (expectedDiskIdentity) {
+			let observed: SessionStorageStat;
+			try {
+				observed = this.#storage.statSync(this.#sessionFile);
+			} catch {
+				throw new Error("Selected session identity changed. Reopen the session picker.");
+			}
+			if (!pickerDiskIdentityMatchesStorageStat(expectedDiskIdentity, observed))
+				throw new Error("Selected session identity changed. Reopen the session picker.");
+		}
+	}
+
+	async #setLivePickerStar(session: SessionInfo, starred: boolean): Promise<void> {
+		this.#assertRecoveryHydrationWritable();
+		this.#assertPickerSessionIsCurrent(session);
+		const operation = this.#persistChain.then(() => {
+			if (this.#persistError) throw this.#persistError;
+			SessionManagerTestHooks.beforeLivePickerStarFence?.();
+			this.#withSessionPersistenceFenceSync(() => {
+				this.#assertRecoveryHydrationWritable();
+				this.#assertPickerSessionIsCurrent(session);
+				const sessionFile = this.#sessionFile!;
+				const directory = path.dirname(sessionFile);
+				const relativePath = path.basename(sessionFile);
+				const authority = new ManagedSessionDescendantStore(managedDirectoryRoot(directory), directory);
+				try {
+					const descriptor = authority.descriptorExpected(relativePath);
+					if (!descriptor) throw new Error("Selected session no longer exists.");
+					if (descriptor.size > EAGER_RESUME_TRANSCRIPT_MAX_BYTES)
+						throw new Error("Session is too large to star from the picker. Use /star or /unstar in the session.");
+					const snapshot = authority.readExpected(relativePath);
+					if (!snapshot) throw new Error("Selected session no longer exists.");
+					const expectedDiskIdentity = pickerDiskIdentities.get(session);
+					if (
+						expectedDiskIdentity &&
+						!pickerDiskIdentityMatchesManagedSnapshot(expectedDiskIdentity, snapshot.identity)
+					)
+						throw new Error("Selected session identity changed. Reopen the session picker.");
+					const content = snapshot.bytes.toString("utf8");
+					const newline = content.indexOf("\n");
+					const rawHeader: unknown = JSON.parse(newline === -1 ? content : content.slice(0, newline));
+					if (!isRecord(rawHeader) || rawHeader.type !== "session" || rawHeader.id !== session.id)
+						throw new Error("Selected session identity changed. Reopen the session picker.");
+					const entries = parseSessionEntries(content);
+					const diskHeader = entries[0];
+					if (diskHeader?.type !== "session" || diskHeader.cwd !== session.cwd)
+						throw new Error("Selected session workspace changed. Reopen the session picker.");
+					if ((diskHeader.version ?? 1) < 4)
+						throw new Error("Session format requires an upgrade. Resume it before changing its star.");
+					if ((diskHeader.starredPatchVersion === 1 && diskHeader.starred === true) === starred) return;
+
+					const patch = `${JSON.stringify({ type: "header_patch", patch: { starred } })}\n`;
+					const appendOnly = rawHeader.starredPatchVersion === 1 && Number(rawHeader.version) >= 4;
+					let bytes: Uint8Array;
+					if (appendOnly) bytes = Buffer.from(`${content.endsWith("\n") ? "" : "\n"}${patch}`);
+					else {
+						rawHeader.starredPatchVersion = 1;
+						delete rawHeader.starred;
+						const body = newline === -1 ? "" : content.slice(newline + 1);
+						bytes = Buffer.from(
+							`${JSON.stringify(rawHeader)}\n${body}${body && !body.endsWith("\n") ? "\n" : ""}${patch}`,
+						);
+					}
+
+					this.#closePersistWriterInternalSync();
+					if (appendOnly) authority.appendExpectedIdentitySync(relativePath, bytes, snapshot.identity);
+					else authority.replaceExpectedIdentitySync(relativePath, bytes, snapshot.identity);
+					const committedDescriptor = authority.descriptorExpected(relativePath);
+					if (!committedDescriptor) throw new Error("Selected session no longer exists after star mutation.");
+					const committedIdentity = this.#storage.statSync(sessionFile);
+					if (!pickerDiskIdentityMatchesDescriptor(committedIdentity, committedDescriptor))
+						throw new Error("Selected session identity changed after star mutation.");
+					pickerDiskIdentities.set(session, committedIdentity);
+					const liveHeader = this.#fileEntries.find(entry => entry.type === "session") as
+						| SessionHeader
+						| undefined;
+					if (!liveHeader) throw new Error("Selected session identity changed. Reopen the session picker.");
+					liveHeader.starredPatchVersion = 1;
+					applyHeaderPatch(liveHeader, { starred });
+					this.#headerExportRevision++;
+					if (this.destination.kind === "managed") {
+						this.#adoptManagedPersistIdentity(sessionFile);
+						this.#publishCommitMarkerFromCurrentTranscriptSync();
+					}
+				} finally {
+					authority.close();
+				}
+			});
+		});
+		this.#persistChain = operation.catch(() => {});
+		await operation;
 	}
 
 	/** Update only a picker candidate's metadata, without opening a runtime or publishing a resume breadcrumb. */
@@ -17390,6 +17529,9 @@ export class SessionManager {
 			}
 			if (appendOnly) authority.appendExpectedIdentitySync(relativePath, bytes, snapshot.identity);
 			else authority.replaceExpectedIdentitySync(relativePath, bytes, snapshot.identity);
+			const committedDescriptor = authority.descriptorExpected(relativePath);
+			if (!committedDescriptor) throw new Error("Selected session no longer exists after star mutation.");
+			pickerDiskIdentities.set(session, descriptorSnapshotAsStorageStat(committedDescriptor));
 		} finally {
 			authority.close();
 		}
