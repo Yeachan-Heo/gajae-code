@@ -10,6 +10,7 @@
 
 ### Added
 
+- Added opt-in native managed task DAGs through authenticated Broker `task.dag` operations, with private durable domain state, resource reservations, native launch and seed fencing, recovery, shared-runner verification, and byte-bound predecessor invalidation. This coordinates enrolled managed tasks only, not arbitrary external processes.
 - Devin CLI models are selectable through the ordinary provider/model path. When `devin acp` is installed and authenticated, `devin` models are discovered from the account (`gjc models`, `/model`), resolve without a GJC credential (authentication stays in the CLI), and can be pointed at a non-PATH executable with `GJC_DEVIN_CLI_PATH`. See `docs/devin-provider.md` for the agent-level boundary, permissions, and billing.
 
 - Successful macOS installs and updates can offer the optional experimental, third-party community Gajae Code App (#5140), defaulting to No. The shared installer requires canonical release checksums and a verified bundle/signature, skips installed apps and automation, and supports `GJC_NO_COMMUNITY_APP=1`; app failures leave GJC installed.

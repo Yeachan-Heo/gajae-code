@@ -37,6 +37,17 @@ export interface ValidationRun {
 	exitStatus: number;
 	pass: boolean;
 }
+export class ValidationObservationUncertainError extends Error {
+	readonly exactCommand: string;
+	readonly cwd: string;
+	constructor(exactCommand: string, cwd: string, cause?: unknown) {
+		super("validation observation is uncertain");
+		this.name = "ValidationObservationUncertainError";
+		this.exactCommand = exactCommand;
+		this.cwd = cwd;
+		if (cause !== undefined) this.cause = cause;
+	}
+}
 
 export interface FinalizeChecks {
 	runValidation(spec: ValidationCommandSpec): Promise<ValidationRun>;
@@ -105,7 +116,16 @@ export async function runFinalize(opts: FinalizeOptions): Promise<FinalizeResult
 
 	// 1. Validation receipts.
 	for (const spec of opts.validationCommands ?? []) {
-		const run = await opts.checks.runValidation(spec);
+		let run: ValidationRun;
+		try {
+			run = await opts.checks.runValidation(spec);
+		} catch (caught) {
+			if (caught instanceof ValidationObservationUncertainError) {
+				blockers.push(`validation-unknown:${spec.name}`);
+				break;
+			}
+			throw caught;
+		}
 		const evidence: ValidationEvidence = {
 			command: spec.name,
 			exactCommand: run.exactCommand,
@@ -133,16 +153,20 @@ export async function runFinalize(opts: FinalizeOptions): Promise<FinalizeResult
 	if (opts.requireTests && (opts.validationCommands?.length ?? 0) === 0) {
 		blockers.push("validation-required-but-none-run");
 	}
+	const validationUnknown = blockers.some(blocker => blocker.startsWith("validation-unknown:"));
 
-	// 2. Commit on branch.
-	if (opts.requireCommit) {
-		if (!commit) blockers.push("missing-commit");
-		else if (!(await opts.checks.commitOnBranch(commit, opts.branch))) blockers.push("commit-not-on-branch");
+	let artifact: { prUrl: string | null; issueArtifact: string | null } = { prUrl: null, issueArtifact: null };
+	if (!validationUnknown) {
+		// 2. Commit on branch.
+		if (opts.requireCommit) {
+			if (!commit) blockers.push("missing-commit");
+			else if (!(await opts.checks.commitOnBranch(commit, opts.branch))) blockers.push("commit-not-on-branch");
+		}
+
+		// 3. PR / issue artifact.
+		artifact = await opts.checks.prOrIssue();
+		if (opts.requirePr && !artifact.prUrl && !artifact.issueArtifact) blockers.push("missing-pr-or-issue");
 	}
-
-	// 3. PR / issue artifact.
-	const artifact = await opts.checks.prOrIssue();
-	if (opts.requirePr && !artifact.prUrl && !artifact.issueArtifact) blockers.push("missing-pr-or-issue");
 
 	// B4: cross-validate the persisted validation receipts (validity + commit freshness) before completion.
 	if (blockers.length === 0) {
@@ -308,11 +332,46 @@ function git(workspace: string, args: string[]): string | null {
 	}
 }
 
-/** Real checks: git for commit/branch, gh for PR, Bun.spawn for validation commands. */
+/** Real checks: git for commit/branch, gh for PR, async Bun.spawn for validation commands. */
+async function discardSpawnStream(stream: ReadableStream<Uint8Array> | null | undefined): Promise<void> {
+	if (!stream) return;
+	const reader = stream.getReader();
+	try {
+		for (;;) {
+			const { done } = await reader.read();
+			if (done) return;
+		}
+	} finally {
+		reader.releaseLock();
+	}
+}
+
 export function defaultFinalizeChecks(workspace: string): FinalizeChecks {
 	return {
 		async runValidation(spec) {
-			const proc = Bun.spawnSync(["bash", "-lc", spec.command], { cwd: workspace, stdout: "pipe", stderr: "pipe" });
+			let proc: Bun.Subprocess<"ignore", "pipe", "pipe">;
+			try {
+				proc = Bun.spawn(["bash", "-lc", spec.command], {
+					cwd: workspace,
+					stdout: "pipe",
+					stderr: "pipe",
+					stdin: "ignore",
+				});
+			} catch {
+				return { exactCommand: spec.command, cwd: workspace, exitStatus: 1, pass: false };
+			}
+			const stdout = discardSpawnStream(proc.stdout);
+			const stderr = discardSpawnStream(proc.stderr);
+			const exited = proc.exited;
+			try {
+				await Promise.all([stdout, stderr, exited]);
+			} catch (cause) {
+				try {
+					proc.kill();
+				} catch {}
+				await Promise.allSettled([stdout, stderr, exited]);
+				throw new ValidationObservationUncertainError(spec.command, workspace, cause);
+			}
 			const exitStatus = proc.exitCode ?? 1;
 			return { exactCommand: spec.command, cwd: workspace, exitStatus, pass: exitStatus === 0 };
 		},
