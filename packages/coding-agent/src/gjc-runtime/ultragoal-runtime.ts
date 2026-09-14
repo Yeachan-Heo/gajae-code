@@ -4852,6 +4852,15 @@ function commandName(args: readonly string[]): string {
 	return "status";
 }
 
+/**
+ * A help request is `--help`/`-h` anywhere in the argv, or a leading `help`
+ * verb. Exported so the CLI command class routes help back through the
+ * verb-aware renderer instead of a generic command-level fallback.
+ */
+export function isUltragoalHelpInvocation(args: readonly string[]): boolean {
+	return args.some(isHelpArg) || args[0] === "help";
+}
+
 function renderUltragoalHelp(args: readonly string[]): string | null {
 	if (!args.some(isHelpArg) && args[0] !== "help") return null;
 	const subject =
@@ -5745,7 +5754,7 @@ export async function runNativeUltragoalCommand(
 ): Promise<UltragoalCommandResult> {
 	const command = commandName(args);
 	const result = await dispatchUltragoalCommand(args, cwd, options.agentDir);
-	const isHelp = args.some(isHelpArg) || args[0] === "help";
+	const isHelp = isUltragoalHelpInvocation(args);
 	if (!isHelp && result.status === 0 && RECONCILE_COMMANDS.has(command)) {
 		await reconcileUltragoalState(cwd, options.agentDir);
 	}
