@@ -1506,7 +1506,12 @@ test("official daemon status surfaces a persisted bounded stop cause", async () 
 	}
 });
 
-test("failed provisional retirement leaves a foreign ownership lock unchanged", async () => {
+test.each([
+	["owner", { ownerId: "owner-b" }],
+	["acquisition", { acquisitionId: "acquisition-b" }],
+	["pid", { pid: process.pid + 1 }],
+	["incarnation", { incarnation: "linux:4242" }],
+] as const)("provisional retirement rejects a foreign %s and accepts the matching lock", async (_field, foreignIdentity) => {
 	const agentDir = tempAgentDir();
 	const incarnation = "linux:4241";
 	try {
@@ -1526,16 +1531,18 @@ test("failed provisional retirement leaves a foreign ownership lock unchanged", 
 		};
 		await writeDaemonOwner(agentDir, state);
 		const paths = daemonPaths(agentDir);
+		const originalState = await Bun.file(paths.state).text();
 		const foreignLock = `${JSON.stringify({
 			pid: state.pid,
 			incarnation,
-			ownerId: "owner-b",
-			acquisitionId: "owner-b",
+			ownerId: state.ownerId,
+			acquisitionId: state.acquisitionId,
 			startedAt: state.startedAt,
+			...foreignIdentity,
 		})}\n`;
 		await Bun.write(paths.lock, foreignLock);
 
-		const retired = await retireProvisionalDaemonOwnership({
+		const retirement = {
 			settings: settings(agentDir),
 			ownerId: state.ownerId,
 			acquisitionId: state.acquisitionId,
@@ -1543,15 +1550,23 @@ test("failed provisional retirement leaves a foreign ownership lock unchanged", 
 			pidAlive: () => false,
 			pidIncarnation: () => incarnation,
 			now: () => 2,
-		});
+		};
+		const retired = await retireProvisionalDaemonOwnership(retirement);
 
 		expect(retired).toBe(false);
 		expect(await Bun.file(paths.lock).text()).toBe(foreignLock);
-		expect(await readDaemonState(settings(agentDir))).toMatchObject({
-			ownerId: state.ownerId,
-			ownershipPhase: "provisional",
+		expect(await Bun.file(paths.state).text()).toBe(originalState);
+
+		// Retirement acquires its own transition lock. This positive control
+		// proves the same setup reaches retirement rather than an early refusal.
+		await writeDaemonOwner(agentDir, state);
+		expect(await retireProvisionalDaemonOwnership(retirement)).toBe(true);
+		expect(await readDaemonState(retirement.settings)).toMatchObject({
+			ownershipPhase: "retired",
+			stoppedAt: 2,
+			stopCause: "startup_failed",
 		});
-		expect((await readDaemonState(settings(agentDir)))?.stoppedAt).toBeUndefined();
+		expect(fs.existsSync(paths.lock)).toBe(false);
 	} finally {
 		fs.rmSync(agentDir, { recursive: true, force: true });
 	}
