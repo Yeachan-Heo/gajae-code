@@ -54,8 +54,9 @@ const ARCHIVE_OR_SQLITE_BASE_RE = /^(.+?\.(?:tar\.gz|sqlite3|sqlite|db3|zip|tgz|
 const INTERNAL_SCHEME_RE = /^[a-z][a-z0-9+.-]*:\/\//i;
 const VIM_FILE_SWITCH_RE = /^\s*:(?:e|e!|edit|edit!)(?:\s+([^<\r\n]+))?(?:<CR>|\r|\n|$)/i;
 const BASH_MUTATION_COMMAND_RE =
-	/(?:^|[;&|\n])\s*(?:\w+=[^\s]+\s+)*(?:sudo\s+)?(?:[^\s;&|]*\/)?(?:tee|touch|rm|mkdir|cp|mv|install|truncate)\b([^;&|\n]*)|(?:^|[^<>])(?:>>?|\d>>?)\s*([^\s;&|]+)/gi;
-const BASH_IN_PLACE_MUTATION_COMMAND_RE = /(?:^|[;&|\n])\s*(?:\w+=[^\s]+\s+)*(?:sudo\s+)?(?:sed|perl)\b([^;&|\n]*)/gi;
+	/(?:^|[;&|(\n])\s*(?:\w+=[^\s]+\s+)*(?:sudo\s+)?(?:[^\s;&|()]*\/)?(?:tee|touch|rm|mkdir|cp|mv|install|truncate)\b([^;&|()\n]*)|(?:^|[^<>])(?:>>?|\d>>?)\s*([^\s;&|]+)/gi;
+const BASH_IN_PLACE_MUTATION_COMMAND_RE =
+	/(?:^|[;&|(\n])\s*(?:\w+=[^\s]+\s+)*(?:sudo\s+)?(?:sed|perl)\b([^;&|()\n]*)/gi;
 const BASH_OPAQUE_INTERPRETER_WRITE_RE =
 	/(?:^|[;&|\n])\s*(?:\w+=[^\s]+\s+)*(?:sudo\s+)?(?:python3?|node|ruby)\b[^;&|\n]*(?:-c|-e)\b[^;&|\n]*(?:open\s*\(|writeFile(?:Sync)?\s*\(|\.write\s*\()/i;
 const BASH_HEREDOC_OPAQUE_INTERPRETER_WRITE_RE =
@@ -447,7 +448,9 @@ function cleanShellWord(value: string): string {
  * One span is never prose: a quoted word that is the OPERAND of a redirection
  * or of `of=` (`> "/dev/null"`, `>" src.ts"`, `of=" /dev/null"`) names a file.
  * Masking it would erase the very path the sink and bypass checks must read, so
- * operand spans are preserved verbatim.
+ * operand spans are preserved verbatim. The returned dequoted view performs
+ * shell quote removal for executable-word/argument extraction while replacing
+ * quoted separators with inert placeholders.
  */
 /**
  * Does the double quote at `quoteIndex` open a redirection / `of=` operand
@@ -472,70 +475,264 @@ function opensRedirectionOperand(command: string, quoteIndex: number): boolean {
 	return previous === "=" && /(?:^|[\s;&|])of=$/i.test(command.slice(0, cursor + 1));
 }
 
-function maskQuotedSpans(command: string): string {
+interface MaskedQuotedSpans {
+	masked: string;
+	/**
+	 * Quote removal preserves executable word characters while neutralizing
+	 * quoted separators/metacharacters. This lets mutation extraction recognize
+	 * `r"m"` and `rm "src/product.ts"` without re-exposing prose as syntax.
+	 */
+	dequoted: string;
+	/** True when live syntax cannot be balanced by this lightweight parser. */
+	unmodeled: boolean;
+}
+
+type QuotedSpanFrame = {
+	kind: "root" | "paren" | "backtick";
+	quote: "none" | "single" | "double";
+	parenDepth: number;
+	quotedOperand: boolean;
+	/** An unquoted `#` comment consumes the rest of this live frame line. */
+	comment: boolean;
+	/** Last live byte in this frame, used for comment-boundary recognition. */
+	previous: string;
+	/** True while the frame is at a command-list boundary before its first word. */
+	expectCommand: boolean;
+};
+
+function maskQuotedSpans(command: string): MaskedQuotedSpans {
 	let masked = "";
-	let inSingle = false;
-	let inDouble = false;
-	// True when the span being scanned is a redirection / `of=` operand.
-	let quotedOperand = false;
-	// Depth of `$(...)` / backtick substitution nesting inside a double-quoted
-	// span. While non-zero the characters are live code and must not be masked.
-	let substitutionDepth = 0;
+	let dequoted = "";
+	let unmodeledSyntax = false;
+	const frames: QuotedSpanFrame[] = [
+		{
+			kind: "root",
+			quote: "none",
+			parenDepth: 0,
+			quotedOperand: false,
+			comment: false,
+			previous: "",
+			expectCommand: true,
+		},
+	];
+	const dequoteData = (character: string): string => (/[\w./-]/.test(character) ? character : "_");
+	const appendLive = (frame: QuotedSpanFrame, character: string): void => {
+		masked += character;
+		dequoted += character;
+		frame.previous = character;
+		if (character === "\n" || ";|&".includes(character)) frame.expectCommand = true;
+		else if (character === "(" && frame.kind === "paren") frame.expectCommand = true;
+		else if (!/\s/.test(character)) frame.expectCommand = false;
+	};
+	const appendQuoted = (character: string, operand: boolean): void => {
+		if (operand) masked += character;
+		else masked += character === "\n" ? "\n" : " ";
+		dequoted += dequoteData(character);
+	};
+
 	for (let index = 0; index < command.length; index += 1) {
+		const frame = frames.at(-1) as QuotedSpanFrame;
 		const character = command[index] as string;
-		// A backslash escape inside a double-quoted span (or outside quotes)
-		// consumes the next character; neither byte can open or close a span.
-		if (character === "\\" && !inSingle) {
-			const next = command[index + 1];
-			const live = inDouble && substitutionDepth === 0 ? " " : character;
-			masked += next === undefined ? live : live + (inDouble && substitutionDepth === 0 ? " " : next);
-			index += next === undefined ? 0 : 1;
-			continue;
-		}
-		if (character === "'" && !inDouble) {
-			inSingle = !inSingle;
-			masked += character;
-			continue;
-		}
-		if (character === '"' && !inSingle) {
-			if (inDouble) {
-				inDouble = false;
-				quotedOperand = false;
-				substitutionDepth = 0;
+		const next = command[index + 1];
+
+		// A comment inside a live substitution must not let a literal `)` close
+		// that substitution. Preserve the newline as syntax, but mask all bytes
+		// before it as inert comment data.
+		if (frame.comment) {
+			if (character === "\n") {
+				frame.comment = false;
+				appendLive(frame, character);
 			} else {
-				inDouble = true;
-				quotedOperand = opensRedirectionOperand(command, index);
+				appendQuoted(character, false);
 			}
-			masked += character;
 			continue;
 		}
-		if (inDouble && quotedOperand) {
-			masked += character;
-			continue;
-		}
-		// Track live substitutions so `"$(rm -rf x)"` stays scannable.
-		if (inDouble && character === "$" && command[index + 1] === "(") {
-			substitutionDepth += 1;
-			masked += "$(";
+
+		// Backslash escapes are quote syntax, not command boundaries. In the
+		// dequoted view the escaped byte survives only as data; in the masked
+		// view preserve the historical bytes so redirection extraction remains
+		// conservative.
+		if (character === "\\" && frame.quote !== "single") {
+			if (next === undefined) {
+				appendQuoted(character, frame.quote !== "none" && frame.quotedOperand);
+				continue;
+			}
+			if (next === "\n") {
+				index += 1;
+				continue;
+			}
+			if (frame.quote === "none" || frame.quotedOperand) masked += character + next;
+			else masked += "  ";
+			dequoted += dequoteData(next);
+			frame.previous = "_";
+			if (frame.quote === "none") frame.expectCommand = false;
 			index += 1;
 			continue;
 		}
-		if (inDouble && character === "`") {
-			substitutionDepth = substitutionDepth === 0 ? 1 : 0;
-			masked += character;
+
+		if (frame.quote === "single") {
+			if (character === "'") {
+				masked += character;
+				frame.quote = "none";
+				frame.quotedOperand = false;
+				frame.previous = character;
+			} else {
+				appendQuoted(character, frame.quotedOperand);
+			}
 			continue;
 		}
-		if (inDouble && substitutionDepth > 0 && character === ")") {
-			substitutionDepth -= 1;
-			masked += character;
+
+		if (frame.quote === "double") {
+			if (character === '"') {
+				masked += character;
+				frame.quote = "none";
+				frame.quotedOperand = false;
+				frame.previous = character;
+				continue;
+			}
+			// A substitution is live even when it appears inside a double-quoted
+			// argument. Push a separate parser frame so quotes/parentheses inside
+			// the substitution cannot close the surrounding `"` prematurely.
+			if (character === "$" && next === "(") {
+				masked += "$(";
+				dequoted += "$(";
+				frame.previous = "(";
+				frame.expectCommand = false;
+				frames.push({
+					kind: "paren",
+					quote: "none",
+					parenDepth: 0,
+					quotedOperand: false,
+					comment: false,
+					previous: "",
+					expectCommand: true,
+				});
+				index += 1;
+				continue;
+			}
+			if (character === "`") {
+				masked += character;
+				dequoted += character;
+				frame.previous = character;
+				frame.expectCommand = false;
+				frames.push({
+					kind: "backtick",
+					quote: "none",
+					parenDepth: 0,
+					quotedOperand: false,
+					comment: false,
+					previous: "",
+					expectCommand: true,
+				});
+				continue;
+			}
+			appendQuoted(character, frame.quotedOperand);
 			continue;
 		}
-		const inert = (inSingle || (inDouble && substitutionDepth === 0)) && character !== "\n";
-		masked += inert ? " " : character;
+
+		// A command-substitution frame closes only at its own unquoted `)`.
+		// Parentheses nested inside `$((…))`/`$( (… ) …)` are tracked separately.
+		if (frame.kind === "paren" && character === ")") {
+			if (frame.parenDepth > 0) {
+				frame.parenDepth -= 1;
+				appendLive(frame, character);
+			} else {
+				appendLive(frame, character);
+				frames.pop();
+				const parent = frames.at(-1);
+				if (parent) {
+					// A substitution close belongs to the current shell word.
+					parent.previous = "_";
+					parent.expectCommand = false;
+				}
+			}
+			continue;
+		}
+		if (frame.kind === "backtick" && character === "`") {
+			appendLive(frame, character);
+			frames.pop();
+			const parent = frames.at(-1);
+			if (parent) {
+				parent.previous = character;
+				parent.expectCommand = false;
+			}
+			continue;
+		}
+
+		if (frame.quote === "none" && character === "#" && (frame.previous === "" || /[\s;|&()]/.test(frame.previous))) {
+			frame.comment = true;
+			appendQuoted(character, false);
+			continue;
+		}
+		if (
+			frame.kind !== "root" &&
+			frame.quote === "none" &&
+			frame.expectCommand &&
+			/^(?:case|if|for|while|until|select|function|time|!|\{)(?:[\s;|&()]|$)/.test(command.slice(index, index + 9))
+		) {
+			// Compound commands have command positions the mutation regexes do
+			// not model; `case` also uses `)` as a pattern terminator. Balanced
+			// parentheses alone cannot authorize these live substitution bodies.
+			unmodeledSyntax = true;
+		}
+		if (character === "'") {
+			masked += character;
+			frame.quote = "single";
+			frame.quotedOperand = false;
+			frame.previous = character;
+			frame.expectCommand = false;
+			continue;
+		}
+		if (character === '"') {
+			masked += character;
+			frame.quote = "double";
+			frame.quotedOperand = opensRedirectionOperand(command, index);
+			frame.previous = character;
+			frame.expectCommand = false;
+			continue;
+		}
+		if (character === "$" && next === "(") {
+			masked += "$(";
+			dequoted += "$(";
+			frame.previous = "(";
+			frame.expectCommand = false;
+			frames.push({
+				kind: "paren",
+				quote: "none",
+				parenDepth: 0,
+				quotedOperand: false,
+				comment: false,
+				previous: "",
+				expectCommand: true,
+			});
+			index += 1;
+			continue;
+		}
+		if (character === "`") {
+			appendLive(frame, character);
+			frames.push({
+				kind: "backtick",
+				quote: "none",
+				parenDepth: 0,
+				quotedOperand: false,
+				comment: false,
+				previous: "",
+				expectCommand: true,
+			});
+			continue;
+		}
+		if (frame.kind === "paren" && character === "(") frame.parenDepth += 1;
+		appendLive(frame, character);
 	}
-	// An unbalanced quote means the parse is unreliable; keep the original text
-	// so the scanner stays fail-closed rather than blind.
-	return inSingle || inDouble ? command : masked;
+
+	// An unbalanced quote/substitution means the parse is unreliable; keep the
+	// original text so both passes remain fail-closed rather than going blind.
+	const root = frames[0];
+	const unbalanced = frames.length !== 1 || root?.quote !== "none";
+	if (unbalanced || unmodeledSyntax) {
+		return { masked: command, dequoted: command, unmodeled: true };
+	}
+	return { masked, dequoted, unmodeled: false };
 }
 
 function isDeviceSinkPath(value: string): boolean {
@@ -1259,9 +1456,18 @@ function extractBashTargets(args: unknown, depth = 0): ExtractedTargets {
 		targets.explicitMutation = true;
 		targets.unknown = true;
 	}
-	// Nested scripts were read from the raw text above; every scanner below works
-	// on the masked view so quoted argument data cannot look like a redirection.
+	// Nested scripts were read from the raw text above. Redirection extraction
+	// uses the quote-preserving syntax view; command extraction uses its
+	// dequoted executable-word view so quoted operands and split command words
+	// remain visible without turning prose into syntax.
 	const scanned = maskQuotedSpans(heredoc.masked);
+	if (scanned.unmodeled) {
+		// A live substitution construct we cannot balance (for example a
+		// `case` pattern whose `)` is not the substitution close) must never
+		// silently hide a mutation from the scanner.
+		targets.explicitMutation = true;
+		targets.unknown = true;
+	}
 	if (
 		BASH_OPAQUE_INTERPRETER_WRITE_RE.test(heredoc.masked) ||
 		BASH_HEREDOC_OPAQUE_INTERPRETER_WRITE_RE.test(heredoc.masked)
@@ -1270,17 +1476,17 @@ function extractBashTargets(args: unknown, depth = 0): ExtractedTargets {
 		targets.unknown = true;
 	}
 	// `exec 1<>file` rebinds a descriptor, so a later `>/dev/null` may not reach the device at all.
-	if (BASH_EXEC_REDIRECT_RE.test(scanned)) {
+	if (BASH_EXEC_REDIRECT_RE.test(scanned.masked)) {
 		targets.explicitMutation = true;
 		targets.unknown = true;
 	}
-	for (const match of scanned.matchAll(BASH_EXTENDED_WRITE_RE)) {
+	for (const match of scanned.masked.matchAll(BASH_EXTENDED_WRITE_RE)) {
 		targets.explicitMutation = true;
 		const cleaned = cleanShellWord(match[1] ?? "");
 		if (!cleaned) targets.unknown = true;
 		else if (!isDeviceSinkPath(cleaned)) addPath(targets, cleaned);
 	}
-	for (const match of scanned.matchAll(BASH_DD_OUTPUT_RE)) {
+	for (const match of scanned.masked.matchAll(BASH_DD_OUTPUT_RE)) {
 		targets.explicitMutation = true;
 		const parts = shellWords(match[1] ?? "").map(cleanShellWord);
 		// Every `of=` counts: GNU dd honors the last one, so `of=/dev/null of=real.ts` writes real.ts.
@@ -1292,7 +1498,7 @@ function extractBashTargets(args: unknown, depth = 0): ExtractedTargets {
 			else if (!isDeviceSinkPath(outputPath)) addPath(targets, outputPath);
 		}
 	}
-	for (const match of scanned.matchAll(BASH_IN_PLACE_MUTATION_COMMAND_RE)) {
+	for (const match of scanned.dequoted.matchAll(BASH_IN_PLACE_MUTATION_COMMAND_RE)) {
 		const parts = shellWords(match[1] ?? "").map(cleanShellWord);
 		const hasInPlaceFlag = parts.some(part => /^-.*i/.test(part));
 		if (!hasInPlaceFlag) continue;
@@ -1301,26 +1507,32 @@ function extractBashTargets(args: unknown, depth = 0): ExtractedTargets {
 		if (target) addPath(targets, target);
 		else targets.unknown = true;
 	}
-	for (const match of scanned.matchAll(BASH_MUTATION_COMMAND_RE)) {
-		targets.explicitMutation = true;
+	for (const match of scanned.masked.matchAll(BASH_MUTATION_COMMAND_RE)) {
 		const redirected = match[2]?.trim();
-		if (redirected) {
-			const cleaned = cleanShellWord(redirected);
-			// A capture that dequotes to nothing (e.g. `>" src.ts"`) is a truncated parse, not a safe no-op.
-			if (!cleaned) targets.unknown = true;
-			else if (!isDeviceSinkPath(cleaned)) addPath(targets, cleaned);
-			continue;
-		}
+		if (!redirected) continue;
+		targets.explicitMutation = true;
+		const cleaned = cleanShellWord(redirected);
+		// A capture that dequotes to nothing (e.g. `>" src.ts"`) is a truncated parse, not a safe no-op.
+		if (!cleaned) targets.unknown = true;
+		else if (!isDeviceSinkPath(cleaned)) addPath(targets, cleaned);
+	}
+	for (const match of scanned.dequoted.matchAll(BASH_MUTATION_COMMAND_RE)) {
+		// Redirections are extracted from the quote-preserving syntax view above.
+		// The dequoted view exists so quote-split command words (`r"m"`) and
+		// quoted operands (`rm "src/product.ts"`) still reach this command branch.
+		if (match[2]) continue;
+		targets.explicitMutation = true;
 		const parts = shellWords(match[1] ?? "");
 		const commandName = match[0]
 			?.match(
-				/(?:^|[;&|\n])\s*(?:\w+=[^\s]+\s+)*(?:sudo\s+)?(?:[^\s;&|]*\/)?(tee|touch|rm|mkdir|cp|mv|install|truncate)\b/i,
+				/(?:^|[;&|(\n])\s*(?:\w+=[^\s]+\s+)*(?:sudo\s+)?(?:[^\s;&|()]*\/)?(tee|touch|rm|mkdir|cp|mv|install|truncate)\b/i,
 			)?.[1]
 			?.toLowerCase();
 		const targetParts =
 			commandName === "cp" || commandName === "mv" || commandName === "install" || commandName === "truncate"
 				? parts.slice(-1)
 				: parts;
+		let extractedTarget = false;
 		for (const part of targetParts) {
 			const cleaned = cleanShellWord(part);
 			if (!cleaned || cleaned.startsWith("-")) continue;
@@ -1328,7 +1540,12 @@ function extractBashTargets(args: unknown, depth = 0): ExtractedTargets {
 			// not argument paths; their targets are captured by the redirect scanners.
 			if (/^\d*[<>]/.test(cleaned)) continue;
 			addPath(targets, cleaned);
+			extractedTarget = true;
 		}
+		// A recognized mutator with no attributable operand is not a safe no-op:
+		// quote masking, unsupported expansions, and option-only invocations all
+		// fail closed rather than allowing a targetless mutation through planning.
+		if (!extractedTarget) targets.unknown = true;
 	}
 	return targets;
 }

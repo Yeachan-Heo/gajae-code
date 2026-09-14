@@ -342,7 +342,7 @@ describe("workflow mutation guard", () => {
 				tool: tool("bash"),
 				args: { command },
 			});
-			expect(decision.blocked).toBe(false);
+			expect(decision.blocked, command).toBe(false);
 		}
 	});
 
@@ -1298,6 +1298,92 @@ describe("bash scanner quoting model", () => {
 		]) {
 			expect((await decideBash(cwd, command)).blocked).toBe(true);
 		}
+	});
+
+	it("blocks quoted and quote-split mutators in planning and autoresearch phases", async () => {
+		const commands = [
+			'rm "src/product.ts"',
+			'r"m" -rf src/product.ts',
+			"r'm' -rf 'src/product.ts'",
+			'r\\\nm "src/product.ts"',
+			"echo \"$(printf 'x)'; rm src/product.ts)\"",
+			'echo "$(printf "x)"; rm src/product.ts)"',
+			'echo "$(printf "$(printf \'x)\')"; rm src/product.ts)"',
+			'echo "$(printf x\\); rm src/product.ts)"',
+			'echo "$(printf \\ #; rm src/product.ts)"',
+			'echo "$(printf x # )\nrm src/product.ts)"',
+			'echo "$(case x in x) true;; esac; rm src/product.ts)"',
+		];
+
+		for (const [skill, phase] of [
+			["deep-interview", "interviewing"],
+			["ralplan", "planner"],
+			["autoresearch", "research"],
+		] as const) {
+			const cwd = await makeTempRoot();
+			await writeActiveSkill(cwd, skill, phase);
+			for (const command of commands) {
+				const decision = await decideBash(cwd, command);
+				expect(decision.blocked, command).toBe(true);
+				expect(decision.targets, command).toContain("src/product.ts");
+			}
+		}
+	});
+
+	it("fails closed on a recognized targetless mutator during autoresearch", async () => {
+		const cwd = await makeTempRoot();
+		await writeActiveSkill(cwd, "autoresearch", "research");
+
+		const decision = await decideBash(cwd, "rm -rf");
+		expect(decision.blocked).toBe(true);
+		expect(decision.reason).toBe("unknown-target");
+		expect(decision.targets).toEqual([]);
+	});
+
+	it("fails closed on unmodeled compound commands in live substitutions", async () => {
+		for (const [skill, phase] of [
+			["deep-interview", "interviewing"],
+			["ralplan", "planner"],
+			["autoresearch", "research"],
+		] as const) {
+			const cwd = await makeTempRoot();
+			await writeActiveSkill(cwd, skill, phase);
+			for (const command of [
+				'echo "$({ rm -f src/product.ts; })"',
+				'echo "$(if true; then rm src/product.ts; fi)"',
+				'echo "$(for x in one; do rm src/product.ts; done)"',
+				'echo "$(while false; do rm src/product.ts; done)"',
+				'echo "$(until true; do rm src/product.ts; done)"',
+				'echo "$(! rm src/product.ts)"',
+				'echo "$(time rm src/product.ts)"',
+				'echo "`{ rm -f src/product.ts; }`"',
+				'touch autoresearch.sh; echo "$({ rm -f src/product.ts; })"',
+			]) {
+				const decision = await decideBash(cwd, command);
+				expect(decision.blocked, command).toBe(true);
+				expect(decision.reason, command).toBe("unknown-target");
+			}
+		}
+	});
+
+	it("allows quoted non-mutator arguments while retaining quoted redirection targets", async () => {
+		const cwd = await makeTempRoot();
+		await writeActiveSkill(cwd, "autoresearch", "research");
+
+		for (const command of [
+			'git commit -m "rm src/product.ts"',
+			'echo "a > b; rm src/product.ts"',
+			'printf x > "/dev/null"',
+			"echo \"$(printf 'x)')\"",
+			'echo "$(printf x # ) rm src/product.ts\n)"',
+		]) {
+			const decision = await decideBash(cwd, command);
+			expect(decision.blocked).toBe(false);
+		}
+
+		const redirected = await decideBash(cwd, 'printf x > "src/product.ts"');
+		expect(redirected.blocked).toBe(true);
+		expect(redirected.targets).toContain("src/product.ts");
 	});
 
 	it("treats an escaped quote as keeping the span open, matching the shell", async () => {
