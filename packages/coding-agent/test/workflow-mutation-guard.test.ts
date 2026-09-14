@@ -1098,3 +1098,77 @@ describe("workflow mutation guard", () => {
 		expect(Buffer.compare(modeBefore, modeAfter)).toBe(0);
 	});
 });
+
+describe("bash scanner quoting model", () => {
+	function decideBash(cwd: string, command: string) {
+		return getWorkflowMutationDecision({ cwd, sessionId: "session-a", tool: tool("bash"), args: { command } });
+	}
+
+	it("treats shell metacharacters inside double-quoted prose as literal data", async () => {
+		const cwd = await makeTempRoot();
+		await writeActiveSkill(cwd, "autoresearch", "research");
+
+		// Every one of these is a sanctioned CLI call whose quoted VALUE merely
+		// mentions `>`/`->` or a destructive word. None of them writes a file.
+		for (const command of [
+			`gjc autoresearch verdict --status-json '{"v":1}' --evidence "p99 500ms -> 120ms" --evaluator run-3 --json`,
+			'gjc autoresearch verdict --evidence "throughput > baseline" --evaluator run-3 --json',
+			'gjc autoresearch critic --caveat "n=3 -> low power" --evaluator critic-1 --json',
+			'gjc autoresearch verdict --evidence "we did not rm the cache; mv was avoided" --evaluator r',
+			'git commit -m "fix thing\nrm was considered\n"',
+		]) {
+			const decision = await decideBash(cwd, command);
+			expect(decision.blocked).toBe(false);
+			expect(decision.targets).toEqual([]);
+		}
+	});
+
+	it("still blocks real writes around and after quoted prose", async () => {
+		const cwd = await makeTempRoot();
+		await writeActiveSkill(cwd, "autoresearch", "research");
+
+		for (const command of [
+			'echo "harmless -> prose" > src/product.ts',
+			'echo "a > b" > src/product.ts && echo "c -> d"',
+			'echo "metric -> value" | tee src/product.ts',
+			'echo "he said \\"hi\\"" > src/product.ts',
+			"echo pwned > src/product.ts",
+			"rm -rf src/product.ts",
+		]) {
+			expect((await decideBash(cwd, command)).blocked).toBe(true);
+		}
+	});
+
+	it("stays fail-closed on an unbalanced quote", async () => {
+		const cwd = await makeTempRoot();
+		await writeActiveSkill(cwd, "autoresearch", "research");
+		for (const command of ['echo "unterminated > src/product.ts', "echo 'unterminated > src/product.ts"]) {
+			expect((await decideBash(cwd, command)).blocked).toBe(true);
+		}
+	});
+
+	it("blocks quote-boundary bypass attempts", async () => {
+		const cwd = await makeTempRoot();
+		await writeActiveSkill(cwd, "autoresearch", "research");
+
+		for (const command of [
+			'gjc autoresearch verdict --evidence "safe" > src/product.ts',
+			'gjc autoresearch verdict --evidence "a > b"; rm src/product.ts',
+			'gjc autoresearch verdict --evidence "p99 -> ok" && rm -rf src/product.ts',
+			`sh -c "echo 'a -> b' > src/product.ts"`,
+			'dd if=/dev/zero of="src/product.ts" count=1',
+			'printf x > "src/product.ts"',
+			'printf x >> "src/product.ts"',
+		]) {
+			expect((await decideBash(cwd, command)).blocked).toBe(true);
+		}
+	});
+
+	it("treats an escaped quote as keeping the span open, matching the shell", async () => {
+		const cwd = await makeTempRoot();
+		await writeActiveSkill(cwd, "autoresearch", "research");
+		// A real shell prints `x " > src/product.ts` and creates no file: the
+		// escaped quote does not close the span, so the `>` never redirects.
+		expect((await decideBash(cwd, 'echo "x \\" > src/product.ts"')).blocked).toBe(false);
+	});
+});
