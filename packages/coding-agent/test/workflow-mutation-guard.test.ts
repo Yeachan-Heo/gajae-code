@@ -1275,6 +1275,70 @@ describe("bash scanner quoting model", () => {
 		}
 	});
 
+	it("blocks mutators reached through a root-level compound command", async () => {
+		const cwd = await makeTempRoot();
+		await writeActiveSkill(cwd, "autoresearch", "research");
+
+		// The mutation regex keys on a `;`/`|`/`&`/newline before the command word.
+		// A root compound puts the mutator after a KEYWORD instead, so these used to
+		// extract no target and no unknown flag, and the planning guard allowed them.
+		for (const command of [
+			"{ rm src/product.ts; }",
+			"if true; then rm src/product.ts; fi",
+			"for f in a; do rm src/product.ts; done",
+			"while true; do printf x > src/product.ts; done",
+			"case x in a) rm src/product.ts;; esac",
+		]) {
+			expect((await decideBash(cwd, command)).blocked, command).toBe(true);
+		}
+	});
+
+	it("blocks mutators reached through an executable wrapper", async () => {
+		const cwd = await makeTempRoot();
+		await writeActiveSkill(cwd, "autoresearch", "research");
+
+		for (const command of [
+			"command rm src/product.ts",
+			"builtin rm src/product.ts",
+			"env rm src/product.ts",
+			"env FOO=bar rm src/product.ts",
+			"exec rm src/product.ts",
+			"nohup rm src/product.ts",
+			"nice -n 5 rm src/product.ts",
+			"command tee src/product.ts",
+		]) {
+			expect((await decideBash(cwd, command)).blocked, command).toBe(true);
+		}
+	});
+
+	it("normalizes ANSI-C and locale-quoted executable names", async () => {
+		const cwd = await makeTempRoot();
+		await writeActiveSkill(cwd, "autoresearch", "research");
+
+		// Bash drops the `$` during quote removal, so these really execute `rm`.
+		for (const command of ["$'rm' src/product.ts", '$"rm" src/product.ts', "$'r''m' src/product.ts"]) {
+			expect((await decideBash(cwd, command)).blocked, command).toBe(true);
+		}
+	});
+
+	it("classifies single-quoted redirection operands like double-quoted ones", async () => {
+		const cwd = await makeTempRoot();
+		await writeActiveSkill(cwd, "autoresearch", "research");
+
+		// `/dev/null` is a sanctioned sink in either quoting style.
+		for (const command of ["printf x > '/dev/null'", "printf x >> '/dev/null'", "dd if=a of='/dev/null'"]) {
+			expect((await decideBash(cwd, command)).blocked, command).toBe(false);
+		}
+		// A single-quoted product path is still a real write.
+		for (const command of [
+			"printf x > 'src/product.ts'",
+			"printf x >> 'src/product.ts'",
+			"dd if=a of='src/product.ts'",
+		]) {
+			expect((await decideBash(cwd, command)).blocked, command).toBe(true);
+		}
+	});
+
 	it("stays fail-closed on an unbalanced quote", async () => {
 		const cwd = await makeTempRoot();
 		await writeActiveSkill(cwd, "autoresearch", "research");

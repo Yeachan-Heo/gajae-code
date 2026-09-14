@@ -53,15 +53,43 @@ const BASH_EXEC_REDIRECT_RE = /(?:^|[;&|\n])\s*(?:sudo\s+)?exec\b[^;&|\n]*[<>]/i
 const ARCHIVE_OR_SQLITE_BASE_RE = /^(.+?\.(?:tar\.gz|sqlite3|sqlite|db3|zip|tgz|tar|db))(?:$|:)/i;
 const INTERNAL_SCHEME_RE = /^[a-z][a-z0-9+.-]*:\/\//i;
 const VIM_FILE_SWITCH_RE = /^\s*:(?:e|e!|edit|edit!)(?:\s+([^<\r\n]+))?(?:<CR>|\r|\n|$)/i;
-const BASH_MUTATION_COMMAND_RE =
-	/(?:^|[;&|(\n])\s*(?:\w+=[^\s]+\s+)*(?:sudo\s+)?(?:[^\s;&|()]*\/)?(?:tee|touch|rm|mkdir|cp|mv|install|truncate)\b([^;&|()\n]*)|(?:^|[^<>])(?:>>?|\d>>?)\s*([^\s;&|]+)/gi;
-const BASH_IN_PLACE_MUTATION_COMMAND_RE =
-	/(?:^|[;&|(\n])\s*(?:\w+=[^\s]+\s+)*(?:sudo\s+)?(?:sed|perl)\b([^;&|()\n]*)/gi;
+/**
+ * Executable wrappers that run their operand as a command (`command rm x`,
+ * `env rm x`, `exec rm x`). Bash resolves through them, so the mutator that
+ * follows is a real write. Left unmodeled they produced no target and no
+ * unknown flag, letting a mutation cross the planning boundary. `env` may
+ * carry `NAME=value` assignments before the wrapped command.
+ */
+const BASH_COMMAND_WRAPPER_SOURCE =
+	"(?:(?:command|builtin|exec|nohup|nice|ionice|stdbuf|setsid|time|env)\\s+(?:-[^\\s]+\\s+(?:\\d+\\s+)?|\\w+=[^\\s]*\\s+)*)*";
+/**
+ * Shell keywords that open a NEW command position without a `;`/`|`/`&`
+ * separator in front of the command word (`then rm x`, `do rm x`, `else rm x`).
+ * Normalizing them to separators lets the existing mutation regexes see the
+ * command position instead of treating `then rm` as one opaque word.
+ */
+const BASH_COMMAND_POSITION_KEYWORD_RE = /(?:^|[;&|(\n{}])\s*(?:then|else|elif|do|in|\{|!)(?=\s)/gi;
+const BASH_MUTATION_COMMAND_RE = new RegExp(
+	`(?:^|[;&|(\\n])\\s*(?:\\w+=[^\\s]+\\s+)*(?:sudo\\s+)?${BASH_COMMAND_WRAPPER_SOURCE}(?:[^\\s;&|()]*\\/)?(?:tee|touch|rm|mkdir|cp|mv|install|truncate)\\b([^;&|()\\n]*)|(?:^|[^<>])(?:>>?|\\d>>?)\\s*([^\\s;&|]+)`,
+	"gi",
+);
+/** Command-word extractor; must accept the same prefixes as `BASH_MUTATION_COMMAND_RE`. */
+const BASH_MUTATION_COMMAND_NAME_RE = new RegExp(
+	`(?:^|[;&|(\\n])\\s*(?:\\w+=[^\\s]+\\s+)*(?:sudo\\s+)?${BASH_COMMAND_WRAPPER_SOURCE}(?:[^\\s;&|()]*\\/)?(tee|touch|rm|mkdir|cp|mv|install|truncate)\\b`,
+	"i",
+);
+const BASH_IN_PLACE_MUTATION_COMMAND_RE = new RegExp(
+	`(?:^|[;&|(\\n])\\s*(?:\\w+=[^\\s]+\\s+)*(?:sudo\\s+)?${BASH_COMMAND_WRAPPER_SOURCE}(?:[^\\s;&|()]*\\/)?(?:sed|perl)\\b([^;&|()\\n]*)`,
+	"gi",
+);
 const BASH_OPAQUE_INTERPRETER_WRITE_RE =
 	/(?:^|[;&|\n])\s*(?:\w+=[^\s]+\s+)*(?:sudo\s+)?(?:python3?|node|ruby)\b[^;&|\n]*(?:-c|-e)\b[^;&|\n]*(?:open\s*\(|writeFile(?:Sync)?\s*\(|\.write\s*\()/i;
 const BASH_HEREDOC_OPAQUE_INTERPRETER_WRITE_RE =
 	/(?:^|[;&|\n])\s*(?:\w+=[^\s]+\s+)*(?:sudo\s+)?(?:python3?|node|ruby)\b[^;&|\n]*(?:<<[-]?\s*['"]?\w+['"]?)[\s\S]*(?:open\s*\(|writeFile(?:Sync)?\s*\(|\.write\s*\()/i;
-const BASH_DD_OUTPUT_RE = /(?:^|[;&|\n])\s*(?:\w+=[^\s]+\s+)*(?:sudo\s+)?(?:[^\s;&|]*\/)?dd\b([^;&|\n]*)/gi;
+const BASH_DD_OUTPUT_RE = new RegExp(
+	`(?:^|[;&|\\n])\\s*(?:\\w+=[^\\s]+\\s+)*(?:sudo\\s+)?${BASH_COMMAND_WRAPPER_SOURCE}(?:[^\\s;&|]*\\/)?dd\\b([^;&|\\n]*)`,
+	"gi",
+);
 /** Literal `sh|bash|zsh -c '<script>'` payloads whose nested script must also be scanned. */
 const BASH_NESTED_SHELL_RE =
 	/(?:^|[;&|\n])\s*(?:\w+=[^\s]+\s+)*(?:sudo\s+)?(?:[^\s;&|]*\/)?(?:ba|z|da)?sh\s+(?:-[A-Za-z]+\s+)*-[A-Za-z]*c\s+(?:(')([^']*)'|(")([^"]*)")/g;
@@ -664,21 +692,31 @@ function maskQuotedSpans(command: string): MaskedQuotedSpans {
 			appendQuoted(character, false);
 			continue;
 		}
-		if (
-			frame.kind !== "root" &&
-			frame.quote === "none" &&
-			frame.expectCommand &&
-			/^(?:case|if|for|while|until|select|function|time|!|\{)(?:[\s;|&()]|$)/.test(command.slice(index, index + 9))
-		) {
-			// Compound commands have command positions the mutation regexes do
-			// not model; `case` also uses `)` as a pattern terminator. Balanced
-			// parentheses alone cannot authorize these live substitution bodies.
-			unmodeledSyntax = true;
+		if (frame.quote === "none" && frame.expectCommand) {
+			const ahead = command.slice(index, index + 9);
+			if (
+				frame.kind !== "root" &&
+				/^(?:case|if|for|while|until|select|function|time|!|\{)(?:[\s;|&()]|$)/.test(ahead)
+			) {
+				// Compound commands have command positions the mutation regexes do
+				// not model; `case` also uses `)` as a pattern terminator. Balanced
+				// parentheses alone cannot authorize these live substitution bodies.
+				unmodeledSyntax = true;
+			} else if (frame.kind === "root" && /^(?:case|select|function)(?:[\s;|&()]|$)/.test(ahead)) {
+				// At the root the other compounds are recovered by command-position
+				// keyword normalization below, but `case` overloads `)` as a pattern
+				// terminator and `select`/`function` introduce command positions the
+				// regexes cannot attribute. Fail closed instead of scanning blind.
+				unmodeledSyntax = true;
+			}
 		}
 		if (character === "'") {
 			masked += character;
 			frame.quote = "single";
-			frame.quotedOperand = false;
+			// A single-quoted redirection/`of=` operand names a file exactly like a
+			// double-quoted one (`> '/dev/null'`, `of='/dev/null'`). Masking it would
+			// erase the path the sink and bypass checks must read.
+			frame.quotedOperand = opensRedirectionOperand(command, index);
 			frame.previous = character;
 			frame.expectCommand = false;
 			continue;
@@ -708,6 +746,21 @@ function maskQuotedSpans(command: string): MaskedQuotedSpans {
 			index += 1;
 			continue;
 		}
+		// ANSI-C (`$'…'`) and locale-translated (`$"…"`) quoting: bash strips the
+		// `$` during quote removal, so `$'rm' src/product.ts` really executes `rm`.
+		// The dequoted view must drop the `$` too, otherwise the executable word
+		// keeps a leading `$` and misses the mutation regexes entirely. The masked
+		// (syntax) view keeps the byte so redirection offsets stay conservative.
+		if (character === "$" && (next === "'" || next === '"')) {
+			masked += character;
+			frame.quote = next === "'" ? "single" : "double";
+			masked += next;
+			frame.quotedOperand = opensRedirectionOperand(command, index);
+			frame.previous = next;
+			frame.expectCommand = false;
+			index += 1;
+			continue;
+		}
 		if (character === "`") {
 			appendLive(frame, character);
 			frames.push({
@@ -732,7 +785,16 @@ function maskQuotedSpans(command: string): MaskedQuotedSpans {
 	if (unbalanced || unmodeledSyntax) {
 		return { masked: command, dequoted: command, unmodeled: true };
 	}
-	return { masked, dequoted, unmodeled: false };
+	// `then rm x` / `do rm x` / `{ rm x` put a mutator in a command position that
+	// is not preceded by a `;`/`|`/`&` separator, so the mutation regexes would
+	// read `then rm` as a single opaque word. Replacing the keyword with a `;`
+	// keeps byte length (match offsets stay aligned) while exposing the position.
+	const exposeCommandPositions = (value: string): string =>
+		value.replace(BASH_COMMAND_POSITION_KEYWORD_RE, segment => {
+			const keyword = segment.trimEnd();
+			return `${keyword.slice(0, keyword.length - 1)};`.padEnd(segment.length, " ");
+		});
+	return { masked: exposeCommandPositions(masked), dequoted: exposeCommandPositions(dequoted), unmodeled: false };
 }
 
 function isDeviceSinkPath(value: string): boolean {
@@ -1523,11 +1585,7 @@ function extractBashTargets(args: unknown, depth = 0): ExtractedTargets {
 		if (match[2]) continue;
 		targets.explicitMutation = true;
 		const parts = shellWords(match[1] ?? "");
-		const commandName = match[0]
-			?.match(
-				/(?:^|[;&|(\n])\s*(?:\w+=[^\s]+\s+)*(?:sudo\s+)?(?:[^\s;&|()]*\/)?(tee|touch|rm|mkdir|cp|mv|install|truncate)\b/i,
-			)?.[1]
-			?.toLowerCase();
+		const commandName = match[0]?.match(BASH_MUTATION_COMMAND_NAME_RE)?.[1]?.toLowerCase();
 		const targetParts =
 			commandName === "cp" || commandName === "mv" || commandName === "install" || commandName === "truncate"
 				? parts.slice(-1)
