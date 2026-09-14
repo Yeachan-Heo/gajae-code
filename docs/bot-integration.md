@@ -115,7 +115,7 @@ Mutating tools:
 - `gjc_coordinator_register_codex_handoff` — registers the Codex app-server resume bridge with a unix/loopback endpoint and an independently authorized token-file reference only; raw token material and paths outside the configured token root are rejected.
 - `gjc_coordinator_ack_codex_handoff` — acknowledges a Codex resume wake by durable `wake_key`; wake prompts never include GJC final responses.
 
-`gjc_coordinator_stop_session` closes a coordinator delegate-created (ephemeral) session through canonical SDK broker lifecycle control, then removes its coordinator metadata only after the broker reports success. It refuses sessions with an active turn. User-registered sessions require both `force: true` and the `GJC_COORDINATOR_MCP_FORCE_STOP` capability; the same SDK lifecycle path reaps abandoned ephemeral delegate sessions after the configured idle TTL.
+`gjc_coordinator_stop_session` closes a coordinator-created (ephemeral) session through canonical SDK broker lifecycle control, then removes its coordinator metadata only after the broker reports success. Newly created `gjc_coordinator_start_session` sessions and fresh sessions created by `gjc_delegate_*` are ephemeral; existing recovered snapshots, reused sessions, and user-registered sessions retain their persisted ownership. The stop path refuses sessions with an active turn. User-registered sessions require both `force: true` and the `GJC_COORDINATOR_MCP_FORCE_STOP` capability; the same SDK lifecycle path reaps abandoned ephemeral sessions after the configured idle TTL.
 
 `gjc_coordinator_retire_start_session` is the recovery terminal for a
 `gjc_coordinator_start_session` receipt stranded in `in_progress` after an

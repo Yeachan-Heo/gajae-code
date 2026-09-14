@@ -188,7 +188,7 @@ Mutating tools:
 
 - `gjc_coordinator_start_session`
 - `gjc_coordinator_activate_session`
-- `gjc_coordinator_stop_session` — closes and reaps coordinator delegate-created ephemeral sessions. A user-registered non-ephemeral session is refused unless the caller sets `force: true` and the bridge has the `GJC_COORDINATOR_MCP_FORCE_STOP` capability.
+- `gjc_coordinator_stop_session` — closes and reaps coordinator-created ephemeral sessions, including newly created `gjc_coordinator_start_session` sessions and fresh `gjc_delegate_*` sessions. Existing recovered snapshots retain their persisted ownership. A user-registered non-ephemeral session is refused unless the caller sets `force: true` and the bridge has the `GJC_COORDINATOR_MCP_FORCE_STOP` capability.
 - `gjc_coordinator_register_session`
 - `gjc_coordinator_send_prompt`
 - `gjc_coordinator_submit_question_answer`

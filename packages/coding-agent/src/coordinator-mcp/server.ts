@@ -685,7 +685,7 @@ function toolSchema(name: CoordinatorToolName): {
 		return {
 			name,
 			description:
-				"Close and reap a coordinator delegate-created (ephemeral) SDK session through broker lifecycle control. Non-ephemeral user-registered sessions require both force and the force-stop capability.",
+				"Close and reap a coordinator-created (ephemeral) SDK session through broker lifecycle control. Non-ephemeral user-registered sessions require both force and the force-stop capability.",
 			inputSchema: {
 				type: "object",
 				properties: {
@@ -9120,6 +9120,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 								session = normalizeSession({
 									session_id: sessionId,
 									cwd: sessionCwd,
+									ephemeral: true,
 									...(mpresetResolution.mpreset ? { mpreset: mpresetResolution.mpreset } : {}),
 									...(modelResolution.model ? { model: modelResolution.model } : {}),
 									broker_workspace: binding.workspace,

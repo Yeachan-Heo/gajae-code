@@ -3,12 +3,13 @@ import { logger } from "@gajae-code/utils";
 /**
  * Idle reaper for coordinator-managed GJC worker sessions.
  *
- * Every `gjc_delegate_*` call that omits `session_id` starts a fresh tmux worker
- * session. Nothing in the coordinator ever tore those down, so completed/crashed
- * sessions accumulated (RAM + worktrees) until something killed them by hand.
+ * New coordinator-owned sessions created by `gjc_coordinator_start_session` or by a
+ * `gjc_delegate_*` call that omits `session_id` are ephemeral. Nothing in the
+ * coordinator ever tore those down, so completed/crashed sessions accumulated
+ * (RAM + worktrees) until something killed them by hand.
  *
  * This is the automatic backstop (defense-in-depth): a periodic sweep force-closes
- * sessions that are (a) ephemeral — coordinator delegate-created, never a user's
+ * sessions that are (a) ephemeral — coordinator-created, never a user's
  * registered resident session, (b) not mid-turn, and (c) idle past a TTL.
  *
  * The controller is pure + fully injectable (clock / list / reap side-effects) so
@@ -25,7 +26,7 @@ export const MIN_SESSION_SWEEP_INTERVAL_MS = 30_000;
 /** Minimal projection of a coordinator session the reaper needs to decide. */
 export interface ReapableSession {
 	sessionId: string;
-	/** True only for coordinator delegate-created sessions. User-registered resident sessions are false and never reaped. */
+	/** True for newly coordinator-created sessions. User-registered resident sessions are false and never reaped. */
 	ephemeral: boolean;
 	/** Epoch ms of last observed activity (turn update / session-state write / session creation). */
 	lastActivityMs: number;
