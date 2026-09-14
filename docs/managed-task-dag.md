@@ -1,6 +1,6 @@
-# Managed task DAG — M1 domain contract
+# Managed task DAG — domain and verification contract
 
-Policy-only milestone. This document describes the private durable domain snapshot and graph/resource reservation APIs. It is not a release, daemon, or verification-acceptance contract. No public PASS boolean, receipt source label, or caller-supplied verification id authorizes readiness.
+This document describes the private durable domain, graph/resource reservations, authenticated Broker admission, recovery, and trusted verification APIs. It is not a production qualification or release announcement. No public PASS boolean, receipt source label, or caller-supplied verification id authorizes readiness.
 
 ## Boundary
 
@@ -9,7 +9,6 @@ Policy-only milestone. This document describes the private durable domain snapsh
 - Distinct control roots and agent-directory identities do not exclude one another.
 - Linux, private, and offline is the first publication boundary. Cross-host and DrvFS semantics are out of scope.
 - Native spawn journals, lock recovery, default workflow/role surfaces, and Workroom product code are unchanged by this slice.
-- Verification acceptance is not installed. Attempt `accepted` remains null. Fabricated acceptance is refused and unpublished.
 
 ## Domain address and enrollment
 
