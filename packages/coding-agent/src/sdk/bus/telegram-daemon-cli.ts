@@ -490,21 +490,27 @@ export async function runDaemonInternal(argv: string[], deps: RunDaemonInternalD
 			}
 			// The daemon's startup settings object is intentionally lightweight and
 			// does not watch the config file. Re-resolve it only after the complete
-			// owner proof above, so a positively observed disable or identity change
-			// can stop this owner while malformed/transient reads remain ambiguous.
-			const refreshedSettings = await resolveDaemonSettings(resolvedAgentDir, deps);
-			const refreshedCfg = getNotificationConfig(refreshedSettings);
-			if (!isProviderEffectivelyEnabled(refreshedCfg, "telegram") || !isTelegramComplete(refreshedCfg)) {
+			// owner proof above. Unknown configuration cannot authorize continued
+			// command ingress with startup credentials.
+			try {
+				const refreshedSettings = await resolveDaemonSettings(resolvedAgentDir, deps);
+				if (!watchdogActive || stopRequested) return;
+				const refreshedCfg = getNotificationConfig(refreshedSettings);
+				if (
+					!isProviderEffectivelyEnabled(refreshedCfg, "telegram") ||
+					!isTelegramComplete(refreshedCfg) ||
+					tokenFingerprint(refreshedCfg.botToken) !== initialTokenFingerprint ||
+					refreshedCfg.chatId !== initialChatId
+				) {
+					stopRequested = true;
+					daemon.requestStop("stop");
+					return;
+				}
+			} catch {
+				if (!watchdogActive || stopRequested) return;
 				stopRequested = true;
 				daemon.requestStop("stop");
-				return;
-			}
-			if (
-				tokenFingerprint(refreshedCfg.botToken) !== initialTokenFingerprint ||
-				refreshedCfg.chatId !== initialChatId
-			) {
-				stopRequested = true;
-				daemon.requestStop("stop");
+				logger.warn("telegram-daemon: configuration verification failed; stopping command ingress");
 				return;
 			}
 			if (lastHeartbeatAt === undefined || heartbeatAt !== lastHeartbeatAt) {
@@ -518,8 +524,8 @@ export async function runDaemonInternal(argv: string[], deps: RunDaemonInternalD
 				daemon.requestStop("stop");
 			}
 		} catch {
-			// Missing, malformed, or temporarily unreadable state is ambiguous.
-			// Stop only on positive supersession or observed non-progress.
+			// Ambiguous ownership state does not authorize owner replacement.
+			// Configuration verification has its own fail-closed boundary above.
 		} finally {
 			watchdogTickInFlight = false;
 		}
