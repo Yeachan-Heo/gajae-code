@@ -1,0 +1,3 @@
+### Fixed
+
+- The bash mutation scanner no longer reads shell metacharacters inside double-quoted values as real redirections. Only single-quoted spans were masked, so ordinary prose in a quoted flag value (`--evidence "p99 500ms -> 120ms"`, `"throughput > baseline"`) parsed as a file write and the workflow boundary blocked the sanctioned `gjc autoresearch` CLI it explicitly permits. Both quote styles are masked now, because neither can contain a redirection or command separator in POSIX shells; a quoted redirection operand (`> "/dev/null"`, `of=" x"`) stays visible so sink and bypass checks keep reading the real path.
