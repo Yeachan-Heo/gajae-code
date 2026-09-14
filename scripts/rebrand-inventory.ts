@@ -40,7 +40,7 @@ const rootLegacyScriptKeys = new Set(["test:py"]);
 
 const ignoredDirs = new Set([".git", "node_modules", ".gjc", "dist", "build", "coverage", ".turbo"]);
 const ignoredFiles = new Set(["bun.lock", "Cargo.lock"]);
-const ignoredExtensions = new Set([".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".node", ".wasm"]);
+const ignoredExtensions = new Set([".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".node", ".wasm", ".pdf"]);
 
 const forbiddenLegacyTokens = ["@oh-my" + "-pi", "oh-my" + "-pi", "om" + "p"] as const;
 const legacyTokenPatterns = forbiddenLegacyTokens.map(token => ({
@@ -208,7 +208,12 @@ function scanLegacyHits(): LegacyHit[] {
 		const rel = relative(file);
 		let content: string;
 		try {
-			content = fs.readFileSync(file, "utf8");
+			const bytes = fs.readFileSync(file);
+			// Binary assets are not brand surfaces, and decoding them as text produces
+			// mojibake in which a compressed byte run can spell a legacy token. Skip
+			// them by content rather than relying on the extension list alone.
+			if (isBinary(bytes)) continue;
+			content = bytes.toString("utf8");
 		} catch {
 			continue;
 		}
@@ -223,6 +228,10 @@ function scanLegacyHits(): LegacyHit[] {
 		}
 	}
 	return hits;
+}
+
+function isBinary(bytes: Buffer): boolean {
+	return bytes.includes(0);
 }
 
 function collectRootMetadataViolations(): MetadataViolation[] {
