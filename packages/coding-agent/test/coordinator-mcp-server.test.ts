@@ -3665,15 +3665,15 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 				idempotency_key: "managed-worktree-reap",
 				allow_mutation: true,
 			}),
-		).resolves.toMatchObject({ ok: true, session: { session_id: "created-session-1" } });
+		).resolves.toMatchObject({
+			ok: true,
+			session: { session_id: "created-session-1", ephemeral: true },
+		});
 		const recordPath = path.join(coordinatorNamespace(root), "sessions", "created-session-1.json");
 		const record = JSON.parse(await fs.readFile(recordPath, "utf8")) as Record<string, unknown>;
 		// Persist the requested coordinator cwd separately from the broker-returned
 		// managed-worktree workspace, matching the delegate creation binding.
-		await Bun.write(
-			recordPath,
-			JSON.stringify({ ...record, cwd: root, broker_workspace: worktree, ephemeral: true }, null, 2),
-		);
+		await Bun.write(recordPath, JSON.stringify({ ...record, cwd: root, broker_workspace: worktree }, null, 2));
 		const record2 = JSON.parse(await fs.readFile(recordPath, "utf8")) as Record<string, unknown>;
 		expect(record2.cwd).toBe(root);
 		expect(record2.broker_workspace).toBe(worktree);
