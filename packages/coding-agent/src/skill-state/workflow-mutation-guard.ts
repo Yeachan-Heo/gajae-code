@@ -1463,8 +1463,15 @@ export async function getWorkflowMutationDecision(
 	// `.gjc/**` is runtime-owned and only the sanctioned CLI writes it). A branch
 	// name is not authorization: an `autoresearch/*` branch isolates keep/discard
 	// bookkeeping, it does not turn product edits into research.
+	//
+	// The allowance requires at least one named target: `every` is vacuously true
+	// for an empty list, so an opaque mutation that resolves to NO target (e.g.
+	// `python3 -c "open('src/product.ts','w').write('x')"`) would otherwise skip
+	// the fail-closed check below and be waved through on a research mission.
 	if (
 		planning.skill === "autoresearch" &&
+		targets.paths.length > 0 &&
+		!targets.unknown &&
 		targets.paths.every(p => isAutoresearchAuthorizedResearchPath(input.cwd, p))
 	) {
 		return { blocked: false, targets: targets.paths };
