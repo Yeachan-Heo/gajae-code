@@ -1098,3 +1098,59 @@ describe("workflow mutation guard", () => {
 		expect(Buffer.compare(modeBefore, modeAfter)).toBe(0);
 	});
 });
+
+describe("bash scanner command substitutions", () => {
+	function decideBash(cwd: string, command: string) {
+		return getWorkflowMutationDecision({ cwd, sessionId: "session-a", tool: tool("bash"), args: { command } });
+	}
+
+	it("scans command substitutions as the live code they are", async () => {
+		const cwd = await makeTempRoot();
+		await writeActiveSkill(cwd, "autoresearch", "research");
+
+		// A substitution executes even inside a double-quoted span, so its body is
+		// a nested command list and must be scanned like an `sh -c` payload.
+		for (const command of [
+			'echo "$(rm -rf src/product.ts)"',
+			'echo "`rm -rf src/product.ts`"',
+			"echo $(printf x > src/product.ts)",
+			'echo "$(echo "$(rm -rf src/product.ts)")"',
+		]) {
+			expect((await decideBash(cwd, command)).blocked, command).toBe(true);
+		}
+
+		// Single quotes suppress substitution entirely, so this one is inert text.
+		expect((await decideBash(cwd, `gjc autoresearch verdict --evidence '$(echo inert)' --evaluator r`)).blocked).toBe(
+			false,
+		);
+	});
+
+	it("tracks quotes the way the shell does while locating substitutions", async () => {
+		const cwd = await makeTempRoot();
+		await writeActiveSkill(cwd, "autoresearch", "research");
+
+		for (const command of [
+			// An apostrophe inside a double-quoted word is data, not a single-quote
+			// opener; the substitution after it is still live.
+			`echo "it's $(rm -rf src/product.ts)"`,
+			// A `)` inside a quoted argument does not close the body; the trailing
+			// command is still part of the substitution.
+			`echo "$(printf ')'; rm -rf src/product.ts)"`,
+			`echo "$(printf ")"; rm -rf src/product.ts)"`,
+			// Backtick body with an escaped backtick inside.
+			'echo "`printf \\`; rm -rf src/product.ts`"',
+		]) {
+			expect((await decideBash(cwd, command)).blocked, command).toBe(true);
+		}
+	});
+
+	it("fails closed on an unbalanced substitution", async () => {
+		const cwd = await makeTempRoot();
+		await writeActiveSkill(cwd, "deep-interview", "interviewing");
+		for (const command of ['echo "$(rm -rf src/product.ts"', 'echo "`rm -rf src/product.ts"']) {
+			const decision = await decideBash(cwd, command);
+			expect(decision.blocked, command).toBe(true);
+			expect(decision.reason).toBe("unknown-target");
+		}
+	});
+});

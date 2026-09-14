@@ -905,6 +905,111 @@ function maskHeredocBodiesPass(
 	};
 }
 
+/**
+ * A command-substitution body and whether its delimiters were balanced. An
+ * unbalanced body is an unreliable parse and the caller fails closed on it.
+ */
+interface SubstitutionBody {
+	body: string;
+	balanced: boolean;
+}
+
+/**
+ * Scan a `$(` body starting just after the opening paren. Quotes inside the
+ * body are honoured: a `)` inside `'...'` or `"..."` is data, not the closer,
+ * and a nested `$(` raises the depth. Returns the body and the index just past
+ * its closing paren, or `end === command.length` with `balanced: false`.
+ */
+function scanDollarParenBody(command: string, start: number): SubstitutionBody & { end: number } {
+	let depth = 1;
+	let inSingle = false;
+	let inDouble = false;
+	for (let cursor = start; cursor < command.length; cursor += 1) {
+		const character = command[cursor];
+		if (character === "\\" && !inSingle) {
+			cursor += 1;
+			continue;
+		}
+		if (character === "'" && !inDouble) {
+			inSingle = !inSingle;
+			continue;
+		}
+		if (character === '"' && !inSingle) {
+			inDouble = !inDouble;
+			continue;
+		}
+		if (inSingle) continue;
+		if (character === "$" && command[cursor + 1] === "(") {
+			depth += 1;
+			cursor += 1;
+			continue;
+		}
+		if (character === "(") depth += 1;
+		else if (character === ")") {
+			depth -= 1;
+			if (depth === 0) return { body: command.slice(start, cursor), balanced: true, end: cursor + 1 };
+		}
+	}
+	return { body: command.slice(start), balanced: false, end: command.length };
+}
+
+/**
+ * Collect the bodies of `$(...)` and backtick command substitutions. Their
+ * contents are a live command list wherever they appear -- including inside a
+ * double-quoted span -- so the caller rescans each one as its own script.
+ *
+ * Quote state is tracked the way the shell does it: an apostrophe inside a
+ * double-quoted word is data, not a single-quote opener, so `"it's $(rm x)"`
+ * still yields the substitution; a `)` inside a quoted argument does not close
+ * the body, so `$(printf ')'; rm x)` yields the whole body. Single-quoted spans
+ * are skipped because they suppress substitution entirely. A body whose
+ * delimiters never balance is reported as such so the caller fails closed.
+ */
+function extractSubstitutionBodies(command: string): SubstitutionBody[] {
+	const bodies: SubstitutionBody[] = [];
+	let inSingle = false;
+	let inDouble = false;
+	for (let index = 0; index < command.length; index += 1) {
+		const character = command[index];
+		if (character === "\\" && !inSingle) {
+			index += 1;
+			continue;
+		}
+		if (character === "'" && !inDouble) {
+			inSingle = !inSingle;
+			continue;
+		}
+		if (character === '"' && !inSingle) {
+			inDouble = !inDouble;
+			continue;
+		}
+		if (inSingle) continue;
+		if (character === "$" && command[index + 1] === "(") {
+			const scanned = scanDollarParenBody(command, index + 2);
+			bodies.push({ body: scanned.body, balanced: scanned.balanced });
+			index = scanned.end - 1;
+			continue;
+		}
+		if (character === "`") {
+			let cursor = index + 1;
+			let closed = false;
+			for (; cursor < command.length; cursor += 1) {
+				if (command[cursor] === "\\") {
+					cursor += 1;
+					continue;
+				}
+				if (command[cursor] === "`") {
+					closed = true;
+					break;
+				}
+			}
+			bodies.push({ body: command.slice(index + 1, cursor), balanced: closed });
+			index = cursor;
+		}
+	}
+	return bodies;
+}
+
 function extractBashTargets(args: unknown, depth = 0): ExtractedTargets {
 	const record = getRecord(args);
 	const command = safeString(record?.command);
@@ -923,6 +1028,21 @@ function extractBashTargets(args: unknown, depth = 0): ExtractedTargets {
 			break;
 		}
 		const nested = extractBashTargets({ command: match[2] ?? match[4] ?? "" }, depth + 1);
+		for (const nestedPath of nested.paths) addPath(targets, nestedPath);
+		if (nested.unknown) targets.unknown = true;
+		if (nested.explicitMutation) targets.explicitMutation = true;
+	}
+	// `$(...)` / backticks are a nested command list, exactly like `sh -c`: the
+	// statement anchors below (`^`, `;`, `&`, `|`, newline) never see inside one,
+	// so `echo "$(rm -rf src/x.ts)"` would otherwise scan clean. Recurse with the
+	// same bounded depth used for nested shells.
+	for (const substitution of extractSubstitutionBodies(command)) {
+		if (depth >= 2 || !substitution.balanced) {
+			targets.explicitMutation = true;
+			targets.unknown = true;
+			break;
+		}
+		const nested = extractBashTargets({ command: substitution.body }, depth + 1);
 		for (const nestedPath of nested.paths) addPath(targets, nestedPath);
 		if (nested.unknown) targets.unknown = true;
 		if (nested.explicitMutation) targets.explicitMutation = true;
