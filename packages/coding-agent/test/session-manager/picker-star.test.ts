@@ -9,6 +9,7 @@ import {
 	parseSessionEntries,
 	type SessionInfo,
 	SessionManager,
+	SessionManagerTestHooks,
 } from "../../src/session/session-manager";
 import { makeAssistantMessage } from "./helpers";
 
@@ -140,11 +141,187 @@ describe("picker star persistence", () => {
 			const [candidate] = await manager.listForResumePickerReadOnly();
 			await manager.setSessionStarredForPicker(candidate!, true);
 			expect(manager.isSessionStarred()).toBe(true);
+			candidate!.starred = true;
+			await manager.setSessionStarredForPicker(candidate!, false);
+			expect(manager.isSessionStarred()).toBe(false);
+			candidate!.starred = false;
+			await manager.setSessionStarredForPicker(candidate!, true);
+			expect(manager.isSessionStarred()).toBe(true);
 			await manager.setSessionName("renamed", "user");
 			manager.appendMessage({ role: "user", content: "still active", timestamp: 2 });
 			await manager.flush();
 			expect(await starred(manager.getSessionFile()!)).toBe(true);
 		} finally {
+			await manager.close();
+		}
+	});
+
+	it("keeps an explicit live writer coherent across repeated same-row toggles", async () => {
+		const { file } = await fixture();
+		const manager = SessionManager.create(cwd, SessionManager.explicitDestination(directory));
+		try {
+			await manager.setSessionFile(file);
+			const [candidate] = await manager.listForResumePickerReadOnly();
+			await manager.setSessionStarredForPicker(candidate!, true);
+			candidate!.starred = true;
+			await manager.setSessionStarredForPicker(candidate!, false);
+
+			expect(manager.isSessionStarred()).toBe(false);
+			expect(await starred(file)).toBe(false);
+			manager.appendMessage({ role: "user", content: "after picker toggle", timestamp: 2 });
+			await manager.flush();
+			expect(await starred(file)).toBe(false);
+		} finally {
+			await manager.close();
+		}
+	});
+
+	it("upgrades star capability through the fenced live explicit-writer path", async () => {
+		const { content, file } = await fixture({ capable: false });
+		const manager = SessionManager.create(cwd, SessionManager.explicitDestination(directory));
+		try {
+			await manager.setSessionFile(file);
+			const [candidate] = await manager.listForResumePickerReadOnly();
+			await manager.setSessionStarredForPicker(candidate!, true);
+
+			expect(manager.isSessionStarred()).toBe(true);
+			const saved = await Bun.file(file).text();
+			expect(saved.slice(saved.indexOf("\n") + 1)).toBe(
+				`${content.slice(content.indexOf("\n") + 1)}{"type":"header_patch","patch":{"starred":true}}\n`,
+			);
+			expect(JSON.parse(saved.split("\n")[0]!)).toMatchObject({
+				id: "candidate",
+				starredPatchVersion: 1,
+			});
+		} finally {
+			await manager.close();
+		}
+	});
+
+	it.each([
+		true,
+		false,
+	])("rejects a final expected-identity race without mutating explicit live state (capable=%s)", async capable => {
+		const { file } = await fixture({ capable });
+		const manager = SessionManager.create(cwd, SessionManager.explicitDestination(directory));
+		try {
+			await manager.setSessionFile(file);
+			const [candidate] = await manager.listForResumePickerReadOnly();
+			const original = ManagedSessionDescendantStore.prototype.readExpected;
+			const competingPatch = '{"type":"header_patch","patch":{"title":"concurrent writer"}}\n';
+			let competingContent = "";
+			let injected = false;
+			vi.spyOn(ManagedSessionDescendantStore.prototype, "readExpected").mockImplementation(function (
+				this: ManagedSessionDescendantStore,
+				relativePath,
+			) {
+				const snapshot = original.call(this, relativePath);
+				if (snapshot && !injected) {
+					injected = true;
+					competingContent = `${snapshot.bytes.toString("utf8")}${competingPatch}`;
+					if (capable)
+						this.appendExpectedIdentitySync(relativePath, Buffer.from(competingPatch), snapshot.identity);
+					else this.replaceExpectedIdentitySync(relativePath, Buffer.from(competingContent), snapshot.identity);
+				}
+				return snapshot;
+			});
+
+			await expect(manager.setSessionStarredForPicker(candidate!, true)).rejects.toThrow("identity_mismatch");
+
+			expect(injected).toBe(true);
+			expect(manager.isSessionStarred()).toBe(false);
+			expect(await Bun.file(file).text()).toBe(competingContent);
+		} finally {
+			await manager.close();
+		}
+	});
+
+	it("rejects stale live rows without changing the active session", async () => {
+		const manager = SessionManager.create(cwd);
+		try {
+			manager.appendMessage({ role: "user", content: "active work", timestamp: 1 });
+			manager.appendMessage(makeAssistantMessage());
+			await manager.flush();
+			const [candidate] = await manager.listForResumePickerReadOnly();
+			const before = await Bun.file(candidate!.path).text();
+
+			await expect(manager.setSessionStarredForPicker({ ...candidate!, id: "stale" }, true)).rejects.toThrow(
+				"identity changed",
+			);
+			await expect(manager.setSessionStarredForPicker({ ...candidate!, cwd: root }, true)).rejects.toThrow(
+				"workspace changed",
+			);
+
+			expect(manager.isSessionStarred()).toBe(false);
+			expect(await Bun.file(candidate!.path).text()).toBe(before);
+		} finally {
+			await manager.close();
+		}
+	});
+
+	it("rejects a replacement at the active path even when its header identity matches", async () => {
+		const manager = SessionManager.create(cwd);
+		try {
+			manager.appendMessage({ role: "user", content: "active work", timestamp: 1 });
+			manager.appendMessage(makeAssistantMessage());
+			await manager.flush();
+			const [candidate] = await manager.listForResumePickerReadOnly();
+			const replacement = (await Bun.file(candidate!.path).text()).replace("active work", "other work ");
+			const replacementPath = path.join(path.dirname(candidate!.path), "replacement.jsonl");
+			await Bun.write(replacementPath, replacement);
+			await fs.chmod(replacementPath, 0o600);
+			await fs.rename(replacementPath, candidate!.path);
+
+			await expect(manager.setSessionStarredForPicker(candidate!, true)).rejects.toThrow("identity changed");
+
+			expect(manager.isSessionStarred()).toBe(false);
+			expect(await Bun.file(candidate!.path).text()).toBe(replacement);
+			expect(await starred(candidate!.path)).toBe(false);
+		} finally {
+			await manager.close();
+		}
+	});
+
+	it("does not recreate a deleted live candidate", async () => {
+		const manager = SessionManager.create(cwd);
+		try {
+			manager.appendMessage({ role: "user", content: "active work", timestamp: 1 });
+			manager.appendMessage(makeAssistantMessage());
+			await manager.flush();
+			const [candidate] = await manager.listForResumePickerReadOnly();
+			await fs.unlink(candidate!.path);
+
+			await expect(manager.setSessionStarredForPicker(candidate!, true)).rejects.toThrow("identity changed");
+
+			expect(manager.isSessionStarred()).toBe(false);
+			expect(await Bun.file(candidate!.path).exists()).toBe(false);
+		} finally {
+			await manager.close();
+		}
+	});
+
+	it("fences a live picker toggle against a session lifecycle transition", async () => {
+		const manager = SessionManager.create(cwd);
+		try {
+			manager.appendMessage({ role: "user", content: "active work", timestamp: 1 });
+			manager.appendMessage(makeAssistantMessage());
+			await manager.flush();
+			const [candidate] = await manager.listForResumePickerReadOnly();
+			const before = await Bun.file(candidate!.path).text();
+			const prepared = await manager.prepareNewSession();
+			SessionManagerTestHooks.beforeLivePickerStarFence = () => {
+				SessionManagerTestHooks.beforeLivePickerStarFence = undefined;
+				manager.commitPreparedNewSession(prepared);
+			};
+
+			await expect(manager.setSessionStarredForPicker(candidate!, true)).rejects.toThrow("identity changed");
+
+			expect(manager.isSessionStarred()).toBe(false);
+			expect(await Bun.file(candidate!.path).text()).toBe(before);
+			expect(manager.getSessionId()).not.toBe(candidate!.id);
+			expect(await Bun.file(manager.getSessionFile()!).exists()).toBe(false);
+		} finally {
+			SessionManagerTestHooks.beforeLivePickerStarFence = undefined;
 			await manager.close();
 		}
 	});

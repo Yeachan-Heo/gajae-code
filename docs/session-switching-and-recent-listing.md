@@ -154,7 +154,7 @@ Caveat: UI text says `Press Tab to view all`, but this component currently has n
 
 `/star` and `/unstar` update only the active session. The read-only `/sessions` dashboard displays the same star marker but never mutates session metadata. Starring is a discovery aid, not a retention or deletion guard.
 
-Picker star changes preserve the candidate's path and do not publish a resume breadcrumb or consume its draft. Existing pre-star headers can gain the star capability in place through an exact-identity replacement; concurrent changes cause an error rather than overwriting the newer transcript. Formats older than v4 must be resumed/upgraded first, and files above the existing eager-read limit must use `/star` or `/unstar` inside the session.
+Picker star changes preserve the candidate's path and do not publish a resume breadcrumb or consume its draft. The active-session row is checked against its session ID, workspace, and listed file identity inside the live manager's persistence fence; stale rows fail without changing the active session. Existing pre-star headers can gain the star capability in place through an exact-identity replacement; concurrent changes cause an error rather than overwriting the newer transcript. Formats older than v4 must be resumed/upgraded first, and files above the existing eager-read limit must use `/star` or `/unstar` inside the session.
 
 ## Runtime switch execution (`AgentSession.switchSession`)
 
