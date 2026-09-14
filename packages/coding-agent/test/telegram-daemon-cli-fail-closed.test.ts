@@ -11,7 +11,7 @@ import {
 	SERVING_EPOCH,
 	type TelegramDaemonOptions,
 } from "../src/sdk/bus/telegram-daemon";
-import { runDaemonInternal } from "../src/sdk/bus/telegram-daemon-cli";
+import { createLightweightDaemonSettings, runDaemonInternal } from "../src/sdk/bus/telegram-daemon-cli";
 
 const BOT_TOKEN = "1234567890:ABCDEFghijkLmnOpQrsTuvWxYz012345678";
 
@@ -208,6 +208,77 @@ describe("issue #4403 — CLI fail-closed + daemon watchdog reconciliation", () 
 			await Bun.sleep(100);
 			expect(reapCalled).toBe(true);
 		} finally {
+			fs.rmSync(agentDir, { recursive: true, force: true });
+		}
+	});
+
+	test("watchdog observes an external Telegram disable and preserves standalone ingress fencing", async () => {
+		const agentDir = tempAgentDir();
+		const ownerId = `${process.pid}-test-disable`;
+		const incarnation = "linux:4242";
+		const rawConfig: Record<string, unknown> = {
+			notifications: {
+				enabled: true,
+				telegram: { enabled: true, botToken: BOT_TOKEN, chatId: "42" },
+			},
+		};
+		writeReadyState(agentDir, process.pid, incarnation, ownerId);
+		let watchdogCallback: (() => void) | undefined;
+		let stopCalled = false;
+		let standaloneIngress = false;
+		const { promise: daemonRun, resolve: resolveRun } = Promise.withResolvers<void>();
+		const watchdogReady = Promise.withResolvers<void>();
+		let settingsLoads = 0;
+		let runner: Promise<void> | undefined;
+		try {
+			runner = runDaemonInternal(["--owner-id", ownerId, "--agent-dir", agentDir], {
+				processPid: process.pid,
+				pidAlive: () => true,
+				pidIncarnation: () => incarnation,
+				loadInstallationHostId: async () => "host-id",
+				SettingsImpl: {
+					init: async () => {
+						settingsLoads += 1;
+						return createLightweightDaemonSettings({ agentDir, rawConfig });
+					},
+				},
+				DaemonImpl: class {
+					constructor(opts: TelegramDaemonOptions) {
+						standaloneIngress = opts.keepAliveWithoutAttachments === true;
+					}
+					requestStop(): void {
+						stopCalled = true;
+						resolveRun();
+					}
+					async run(): Promise<void> {
+						await daemonRun;
+					}
+				} as never,
+				setInterval: (cb: () => void) => {
+					watchdogCallback = cb;
+					watchdogReady.resolve();
+					return 1 as unknown as Timer;
+				},
+				clearInterval: () => {},
+				readDaemonState: async (_settings: Settings) => {
+					const raw = fs.readFileSync(daemonPaths(agentDir).state, "utf8");
+					return JSON.parse(raw) as DaemonState;
+				},
+			});
+			await watchdogReady.promise;
+			expect(standaloneIngress).toBe(true);
+			rawConfig.notifications = {
+				enabled: true,
+				telegram: { enabled: false, botToken: BOT_TOKEN, chatId: "42" },
+			};
+			watchdogCallback?.();
+			for (let attempt = 0; attempt < 100 && !stopCalled; attempt++) await Bun.sleep(5);
+			expect(stopCalled).toBe(true);
+			expect(settingsLoads).toBeGreaterThan(1);
+			await runner;
+		} finally {
+			resolveRun();
+			await runner?.catch(() => undefined);
 			fs.rmSync(agentDir, { recursive: true, force: true });
 		}
 	});

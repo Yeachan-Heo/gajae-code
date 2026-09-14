@@ -11,6 +11,7 @@ import {
 	isTelegramComplete,
 	type NotificationSettingsReader,
 	parseNotificationSettingsSnapshot,
+	tokenFingerprint,
 } from "./config";
 import { daemonPaths, HEARTBEAT_TTL_MS } from "./daemon-paths";
 import { type NotificationDebrisSweepReport, sweepNotificationDebris } from "./notification-service";
@@ -294,6 +295,8 @@ export async function runDaemonInternal(argv: string[], deps: RunDaemonInternalD
 	const settings = await resolveDaemonSettings(resolvedAgentDir, deps);
 	const cfg = getNotificationConfig(settings);
 	if (!isProviderEffectivelyEnabled(cfg, "telegram") || !isTelegramComplete(cfg)) return;
+	const initialTokenFingerprint = tokenFingerprint(cfg.botToken);
+	const initialChatId = cfg.chatId;
 	// Startup hygiene: reclaim inert quarantine/staging debris left by crashed
 	// writers so the notifications dir cannot grow unboundedly and slow every
 	// later endpoint scan. Never awaited by startup; a rejection is logged and
@@ -402,6 +405,7 @@ export async function runDaemonInternal(argv: string[], deps: RunDaemonInternalD
 		toolActivity: cfg.toolActivity,
 		topics: cfg.topics,
 		btw: cfg.btw,
+		keepAliveWithoutAttachments: true,
 		pid: deps.processPid ?? process.pid,
 		control: createDaemonControlHooks(settings as Settings),
 		topicRegistryAuthority,
@@ -483,6 +487,25 @@ export async function runDaemonInternal(argv: string[], deps: RunDaemonInternalD
 				// A bare ownerId equality is not sufficient authority to terminate a
 				// running daemon — a stale or reused PID could match, killing a
 				// foreign process. The stall watchdog below handles non-progress.
+			}
+			// The daemon's startup settings object is intentionally lightweight and
+			// does not watch the config file. Re-resolve it only after the complete
+			// owner proof above, so a positively observed disable or identity change
+			// can stop this owner while malformed/transient reads remain ambiguous.
+			const refreshedSettings = await resolveDaemonSettings(resolvedAgentDir, deps);
+			const refreshedCfg = getNotificationConfig(refreshedSettings);
+			if (!isProviderEffectivelyEnabled(refreshedCfg, "telegram") || !isTelegramComplete(refreshedCfg)) {
+				stopRequested = true;
+				daemon.requestStop("stop");
+				return;
+			}
+			if (
+				tokenFingerprint(refreshedCfg.botToken) !== initialTokenFingerprint ||
+				refreshedCfg.chatId !== initialChatId
+			) {
+				stopRequested = true;
+				daemon.requestStop("stop");
+				return;
 			}
 			if (lastHeartbeatAt === undefined || heartbeatAt !== lastHeartbeatAt) {
 				lastHeartbeatAt = heartbeatAt;
