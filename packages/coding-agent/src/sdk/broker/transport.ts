@@ -25,6 +25,7 @@ const BROKER_OPERATIONS = new Set([
 	"broker.lookup_lifecycle",
 	"model.resolve",
 	"session.spawn",
+	"task.dag",
 ]);
 type RequestInput = Record<string, unknown>;
 type BrokerRequest = {

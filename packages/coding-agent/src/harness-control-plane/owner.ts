@@ -18,7 +18,14 @@ import type { AgentWireOwnerObservation } from "../modes/shared/agent-wire/event
 import { observeAgentWireFrame } from "../modes/shared/agent-wire/event-observation";
 import { classifyRecovery } from "./classifier";
 import { ControlServer, type EndpointHandler, type EndpointRequest } from "./control-endpoint";
-import { defaultFinalizeChecks, type FinalizeChecks, runFinalize, type ValidationCommandSpec } from "./finalize";
+import {
+	defaultFinalizeChecks,
+	type FinalizeChecks,
+	runFinalize,
+	type ValidationCommandSpec,
+	ValidationObservationUncertainError,
+	type ValidationRun,
+} from "./finalize";
 import { type OperateResult, operate } from "./operate";
 import { preserveDirtyWorktree } from "./preserve";
 import { RECEIPT_SPOOL_DIR_ENV, withReceiptSpoolDir } from "./receipt-spool";
@@ -532,7 +539,24 @@ export class RuntimeOwner {
 		};
 		const validation: { name: string; valid: boolean; exitStatus: number }[] = [];
 		for (const spec of this.#validationCommands ?? []) {
-			const run = await checks.runValidation(spec);
+			let run: ValidationRun;
+			try {
+				run = await checks.runValidation(spec);
+			} catch (caught) {
+				if (caught instanceof ValidationObservationUncertainError) {
+					state.lifecycle = "blocked";
+					state.blockers = [`validation-unknown:${spec.name}`];
+					state.updatedAt = new Date(this.#opts.clock ? this.#opts.clock() : Date.now()).toISOString();
+					await writeSessionState(this.#opts.root, state);
+					await this.#emit("critical", "validation_uncertain", {
+						name: spec.name,
+						exactCommand: caught.exactCommand,
+						cwd: caught.cwd,
+					});
+					return this.#response(state, { uncertain: true, name: spec.name, validation }, false);
+				}
+				throw caught;
+			}
 			const evidence: ValidationEvidence = {
 				command: spec.name,
 				exactCommand: run.exactCommand,
