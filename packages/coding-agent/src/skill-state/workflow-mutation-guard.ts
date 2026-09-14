@@ -993,6 +993,47 @@ function maskHeredocBodiesPass(
 	};
 }
 
+/**
+ * Collect the bodies of `$(...)` and backtick command substitutions. Their
+ * contents are a live command list wherever they appear — including inside a
+ * double-quoted span — so the caller rescans each one as its own script.
+ * Single-quoted spans are skipped: they suppress substitution entirely.
+ */
+function extractSubstitutionBodies(command: string): string[] {
+	const bodies: string[] = [];
+	let inSingle = false;
+	for (let index = 0; index < command.length; index += 1) {
+		const character = command[index];
+		if (character === "\\") {
+			index += 1;
+			continue;
+		}
+		if (character === "'") {
+			inSingle = !inSingle;
+			continue;
+		}
+		if (inSingle) continue;
+		if (character === "$" && command[index + 1] === "(") {
+			let depth = 1;
+			const start = index + 2;
+			let cursor = start;
+			for (; cursor < command.length && depth > 0; cursor += 1) {
+				if (command[cursor] === "(") depth += 1;
+				else if (command[cursor] === ")") depth -= 1;
+			}
+			bodies.push(command.slice(start, depth === 0 ? cursor - 1 : command.length));
+			index = cursor - 1;
+			continue;
+		}
+		if (character === "`") {
+			const end = command.indexOf("`", index + 1);
+			bodies.push(command.slice(index + 1, end === -1 ? command.length : end));
+			index = end === -1 ? command.length : end;
+		}
+	}
+	return bodies;
+}
+
 function extractBashTargets(args: unknown, depth = 0): ExtractedTargets {
 	const record = getRecord(args);
 	const command = safeString(record?.command);
@@ -1011,6 +1052,21 @@ function extractBashTargets(args: unknown, depth = 0): ExtractedTargets {
 			break;
 		}
 		const nested = extractBashTargets({ command: match[2] ?? match[4] ?? "" }, depth + 1);
+		for (const nestedPath of nested.paths) addPath(targets, nestedPath);
+		if (nested.unknown) targets.unknown = true;
+		if (nested.explicitMutation) targets.explicitMutation = true;
+	}
+	// `$(...)` / backticks are a nested command list, exactly like `sh -c`: the
+	// statement anchors below (`^`, `;`, `&`, `|`, newline) never see inside one,
+	// so `echo "$(rm -rf src/x.ts)"` would otherwise scan clean. Recurse with the
+	// same bounded depth used for nested shells.
+	for (const substitution of extractSubstitutionBodies(command)) {
+		if (depth >= 2) {
+			targets.explicitMutation = true;
+			targets.unknown = true;
+			break;
+		}
+		const nested = extractBashTargets({ command: substitution }, depth + 1);
 		for (const nestedPath of nested.paths) addPath(targets, nestedPath);
 		if (nested.unknown) targets.unknown = true;
 		if (nested.explicitMutation) targets.explicitMutation = true;

@@ -1139,6 +1139,27 @@ describe("bash scanner quoting model", () => {
 		}
 	});
 
+	it("scans command substitutions as the live code they are", async () => {
+		const cwd = await makeTempRoot();
+		await writeActiveSkill(cwd, "autoresearch", "research");
+
+		// A substitution executes even inside a double-quoted span, so its body is
+		// a nested command list and must be scanned like an `sh -c` payload.
+		for (const command of [
+			'echo "$(rm -rf src/product.ts)"',
+			'echo "`rm -rf src/product.ts`"',
+			"echo $(printf x > src/product.ts)",
+			'echo "$(echo "$(rm -rf src/product.ts)")"',
+		]) {
+			expect((await decideBash(cwd, command)).blocked, command).toBe(true);
+		}
+
+		// Single quotes suppress substitution entirely, so this one is inert text.
+		expect((await decideBash(cwd, `gjc autoresearch verdict --evidence '$(echo inert)' --evaluator r`)).blocked).toBe(
+			false,
+		);
+	});
+
 	it("stays fail-closed on an unbalanced quote", async () => {
 		const cwd = await makeTempRoot();
 		await writeActiveSkill(cwd, "autoresearch", "research");
