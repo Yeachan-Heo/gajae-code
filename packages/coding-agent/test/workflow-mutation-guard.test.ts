@@ -1185,6 +1185,35 @@ describe("bash scanner quoting model", () => {
 		}
 	});
 
+	it("fails closed on an opaque interpreter write that names no target", async () => {
+		const cwd = await makeTempRoot();
+		await writeActiveSkill(cwd, "autoresearch", "research");
+
+		// These resolve to NO extracted target, so an allowance keyed on
+		// `paths.every(...)` alone is vacuously true and waves them through even
+		// though they really do overwrite product code.
+		for (const command of [
+			`python3 -c "open('src/product.ts','w').write('x')"`,
+			`node -e "require('fs').writeFileSync('src/product.ts','x')"`,
+		]) {
+			expect((await decideBash(cwd, command)).blocked, command).toBe(true);
+		}
+	});
+
+	it("keeps the sanctioned research surface writable", async () => {
+		const cwd = await makeTempRoot();
+		await writeActiveSkill(cwd, "autoresearch", "research");
+
+		for (const command of [
+			"echo '#!/bin/sh' > autoresearch.sh",
+			"chmod +x autoresearch.sh",
+			"bash autoresearch.sh",
+			"gjc autoresearch read --json",
+		]) {
+			expect((await decideBash(cwd, command)).blocked, command).toBe(false);
+		}
+	});
+
 	it("treats an escaped quote as keeping the span open, matching the shell", async () => {
 		const cwd = await makeTempRoot();
 		await writeActiveSkill(cwd, "autoresearch", "research");
