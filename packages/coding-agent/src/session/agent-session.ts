@@ -215,7 +215,7 @@ import type { CasReceipt } from "../config/atomic-yaml-patch";
 import {
 	activateModelProfile,
 	materializeActiveModelProfileAssignment,
-	resolveModelProfileDefaultChain,
+	resolveMissingSessionModelRecovery,
 } from "../config/model-profile-activation";
 import {
 	ModelProfileRegistryError,
@@ -230,7 +230,6 @@ import {
 	kNoAuth,
 	MODEL_ROLE_IDS,
 	type ModelRegistry,
-	registrySelectorResolvesToModel,
 } from "../config/model-registry";
 import {
 	extractExplicitThinkingSelector,
@@ -239,7 +238,6 @@ import {
 	managedCursorFallbackUnavailableReason,
 	parseModelString,
 	type ResolvedModelRoleValue,
-	resolveConfiguredModelPatterns,
 	resolveModelChainWithAuth,
 	resolveModelRoleValue,
 	type ScopedModelSelection,
@@ -16852,11 +16850,26 @@ export class AgentSession {
 	 * must not mutate the persisted configured intent.
 	 */
 	setDefaultFallbackRuntimeModel(selector: string): void {
+		this.installRecoveredDefaultFallbackChain([selector], undefined, 0, []);
+	}
+
+	/** Install a runtime-only durable fallback without changing saved session intent. */
+	installRecoveredDefaultFallbackChain(
+		entries: readonly string[],
+		identity: string | undefined,
+		activeIndex: number,
+		skips: Array<{ selector: string; reason: string }>,
+	): void {
 		this.#defaultFallbackController = new FallbackChainController(
-			{ role: "default", entries: [selector], origin: "runtime", explicitHead: true },
+			{ role: "default", entries: [...entries], origin: "runtime", identity, explicitHead: true },
 			this.settings.get("fallback.maxAttempts"),
 		);
 		this.#defaultFallbackExhaustedLastTurn = false;
+		this.#seedDefaultFallbackResolutionForController(this.#defaultFallbackController, activeIndex, skips);
+	}
+
+	hasRecoveredDefaultFallbackChain(): boolean {
+		return this.#defaultFallbackController?.chain.origin === "runtime";
 	}
 
 	/**
@@ -24352,56 +24365,18 @@ export class AgentSession {
 					this.seedDefaultFallbackResolution(resolution.activeIndex, resolution.skips);
 					let resolvedModel = resolution.model;
 					if (!resolvedModel) {
-						const allSelectorsUnknown =
-							resolution.skips.length === defaultEntries.length &&
-							resolution.skips.every(skip => skip.reason === "unknown_model");
-						const fullCatalog = this.#modelRegistry.getAll();
-						const savedSelectorsMissingFromCatalog = resolveConfiguredModelPatterns(
-							defaultEntries,
-							this.settings,
-						).every(selector => {
-							if (
-								resolveModelRoleValue(selector, fullCatalog, {
-									settings: this.settings,
+						if (resumeModelBehavior !== "useCurrentDefault") {
+							try {
+								const recovery = await resolveMissingSessionModelRecovery({
 									modelRegistry: this.#modelRegistry,
+									settings: this.settings,
+									defaultEntries,
+									skips: resolution.skips,
+									savedDefault: sessionContext.models.default,
 									credentialSessionId: this.credentialSessionId,
 									...(this.#persistedModelProfileAliasIntent("default") ?? {}),
-								}).model
-							)
-								return false;
-							// Alias resolution intentionally filters unavailable candidates. The
-							// recovery boundary instead asks whether this saved selector exists in
-							// the complete catalog, so disabled or unauthenticated providers never
-							// masquerade as deregistered models.
-							return !registrySelectorResolvesToModel(selector, fullCatalog);
-						});
-						const savedConcreteDefault = sessionContext.models.default
-							? parseModelString(sessionContext.models.default)
-							: undefined;
-						const savedConcreteDefaultMissingFromCatalog =
-							savedConcreteDefault === undefined ||
-							!this.#modelRegistry
-								.getAll()
-								.some(
-									model =>
-										model.provider === savedConcreteDefault.provider && model.id === savedConcreteDefault.id,
-								);
-						const durableProfile = this.settings.get("modelProfile.default");
-						if (
-							resumeModelBehavior !== "useCurrentDefault" &&
-							allSelectorsUnknown &&
-							savedSelectorsMissingFromCatalog &&
-							savedConcreteDefaultMissingFromCatalog &&
-							durableProfile
-						) {
-							try {
-								const recovery = await resolveModelProfileDefaultChain({
-									modelRegistry: this.#modelRegistry,
-									settings: this.settings,
-									profileName: durableProfile,
-									credentialSessionId: this.credentialSessionId,
 								});
-								if (recovery.model) {
+								if (recovery?.model) {
 									this.#defaultFallbackController = new FallbackChainController(
 										{
 											role: "default",
