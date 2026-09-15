@@ -9,7 +9,6 @@ import {
 	type KnownProvider,
 	type Model,
 	modelsAreEqual,
-	PROVIDER_DESCRIPTORS,
 } from "@gajae-code/ai/core";
 
 import { logger } from "@gajae-code/utils";
@@ -87,26 +86,15 @@ export function resolveStartupModelRefreshSelectors(
 
 export async function refreshMissingQualifiedModelProviders(
 	selectors: ModelSelectorValue | undefined,
-	modelRegistry: Pick<
-		ModelRegistry,
-		"getAvailable" | "getDiscoverableProviders" | "getRefreshableProviders" | "refreshProvider"
-	>,
+	modelRegistry: Pick<ModelRegistry, "getAvailable" | "getRefreshableProviders" | "refreshProvider">,
 ): Promise<boolean> {
 	const refreshedProviders = new Set<string>();
 	for (const selector of normalizeModelSelectorValue(selectors)) {
 		const parsedSelector = parseModelString(selector);
 		if (!parsedSelector) continue;
-		const hasRefreshableProviders = typeof modelRegistry.getRefreshableProviders === "function";
-		const listedProviders = hasRefreshableProviders
-			? modelRegistry.getRefreshableProviders()
-			: modelRegistry.getDiscoverableProviders();
-		const provider =
-			listedProviders.find(candidate => candidate.toLowerCase() === parsedSelector.provider.toLowerCase()) ??
-			(!hasRefreshableProviders
-				? PROVIDER_DESCRIPTORS.find(
-						descriptor => descriptor.providerId.toLowerCase() === parsedSelector.provider.toLowerCase(),
-					)?.providerId
-				: undefined);
+		const provider = modelRegistry
+			.getRefreshableProviders()
+			.find(candidate => candidate.toLowerCase() === parsedSelector.provider.toLowerCase());
 		if (!provider || refreshedProviders.has(provider)) continue;
 		const availableModels = modelRegistry.getAvailable();
 		const rawModelId = selector.slice(selector.indexOf("/") + 1);
