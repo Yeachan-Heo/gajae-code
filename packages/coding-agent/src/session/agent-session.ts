@@ -228,8 +228,8 @@ import {
 	isAuthenticated,
 	kNoAuth,
 	MODEL_ROLE_IDS,
-	registrySelectorResolvesToModel,
 	type ModelRegistry,
+	registrySelectorResolvesToModel,
 } from "../config/model-registry";
 import {
 	extractExplicitThinkingSelector,
@@ -23891,6 +23891,7 @@ export class AgentSession {
 					targetActiveModelProfile !== undefined &&
 					targetActiveModelProfile === configuredProfileIdentity &&
 					liveProfileIdentity === targetActiveModelProfile;
+				const targetProfileRuntimeInstalled = !switchingToDifferentSession || retainsDurableProfileLayer;
 				if (switchingToDifferentSession && !retainsDurableProfileLayer)
 					this.#resetSessionScopedModelProfileState({
 						preserveDefaultConfiguredChain: true,
@@ -24012,6 +24013,12 @@ export class AgentSession {
 					// would append a stray thinking_level_change entry that flips
 					// hasThinkingEntry and changes what the recompute restores.
 				}
+
+				// The saved chain may need its profile identity for alias resolution, but
+				// a cross-file transition must not advertise that profile after its
+				// runtime role layer was removed. Otherwise delegation prompt state and
+				// actual role routing diverge.
+				if (!targetProfileRuntimeInstalled) this.#activeModelProfile = undefined;
 
 				const hasThinkingEntry = this.sessionManager
 					.getBranch()
