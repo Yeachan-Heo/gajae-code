@@ -24217,7 +24217,6 @@ export class AgentSession {
 				: undefined;
 			let unavailableDefaultChainMessage: string | undefined;
 			let recoveredDefaultChainMessage: string | undefined;
-			let recoveredDefaultChain = false;
 			let transitionCleanupCommitted = false;
 			let exactRetirement: PreparedExactMcpRetirement | undefined;
 
@@ -24292,7 +24291,7 @@ export class AgentSession {
 				const liveProfileIdentity = previousActiveModelProfile
 					? resolveModelProfileName(previousActiveModelProfile, profileDefinitions)
 					: undefined;
-				this.#activeModelProfile =
+				const targetActiveModelProfile =
 					resumeModelBehavior === "useCurrentDefault"
 						? liveProfileIdentity && profileDefinitions.has(liveProfileIdentity)
 							? liveProfileIdentity
@@ -24304,6 +24303,12 @@ export class AgentSession {
 								profileDefinitions.has(persistedProfileIdentity)
 							? persistedProfileIdentity
 							: undefined;
+				// The loaded successor must not inherit predecessor profile overrides.
+				// Clear that layer before accepting the successor's durable identity;
+				// otherwise a target matching modelProfile.default makes reset a no-op.
+				if (switchingToDifferentSession)
+					this.#resetSessionScopedModelProfileState({ preserveDefaultConfiguredChain: true });
+				this.#activeModelProfile = targetActiveModelProfile;
 				this.#defaultFallbackController = undefined;
 				if (defaultEntries.length > 0) {
 					const resolution = await resolveModelChainWithAuth(
@@ -24333,11 +24338,23 @@ export class AgentSession {
 									...(this.#persistedModelProfileAliasIntent("default") ?? {}),
 								}).model,
 						);
+						const savedConcreteDefault = sessionContext.models.default
+							? parseModelString(sessionContext.models.default)
+							: undefined;
+						const savedConcreteDefaultMissingFromCatalog =
+							savedConcreteDefault === undefined ||
+							!this.#modelRegistry
+								.getAll()
+								.some(
+									model =>
+										model.provider === savedConcreteDefault.provider && model.id === savedConcreteDefault.id,
+								);
 						const durableProfile = this.settings.get("modelProfile.default");
 						if (
 							resumeModelBehavior !== "useCurrentDefault" &&
 							allSelectorsUnknown &&
 							savedSelectorsMissingFromCatalog &&
+							savedConcreteDefaultMissingFromCatalog &&
 							durableProfile
 						) {
 							try {
@@ -24347,41 +24364,26 @@ export class AgentSession {
 									profileName: durableProfile,
 									credentialSessionId: this.credentialSessionId,
 								});
-								if (recovery.entries.length > 0) {
-									const recovered = await resolveModelChainWithAuth(
-										recovery.entries,
-										this.#modelRegistry,
-										this.settings,
-										this.credentialSessionId,
+								if (recovery.model) {
+									this.#defaultFallbackController = new FallbackChainController(
 										{
-											managedFallback: true,
-											canonicalSessionId: this.sessionId,
-											credentialSessionId: this.credentialSessionId,
-											aliasIntent: "preset-equivalent",
+											role: "default",
+											entries: recovery.entries,
+											origin: "runtime",
+											identity: recovery.profileName,
+											explicitHead: true,
 										},
+										this.settings.get("fallback.maxAttempts"),
 									);
-									if (recovered.model) {
-										this.#defaultFallbackController = new FallbackChainController(
-											{
-												role: "default",
-												entries: recovery.entries,
-												origin: "runtime",
-												identity: recovery.profileName,
-												explicitHead: true,
-											},
-											this.settings.get("fallback.maxAttempts"),
-										);
-										controller = this.#defaultFallbackChain(false);
-										this.#seedDefaultFallbackResolutionForController(
-											controller,
-											recovered.activeIndex,
-											recovered.skips,
-										);
-										resolvedModel = recovered.model;
-										recoveredDefaultChain = true;
-										recoveredDefaultChainMessage =
-											"Saved session model is no longer registered; restored the durable default preset instead.";
-									}
+									controller = this.#defaultFallbackChain(false);
+									this.#seedDefaultFallbackResolutionForController(
+										controller,
+										recovery.activeIndex,
+										recovery.skips,
+									);
+									resolvedModel = recovery.model;
+									recoveredDefaultChainMessage =
+										"Saved session model is no longer registered; restored the durable default preset instead.";
 								}
 							} catch {
 								// A durable default is only a recovery candidate; preserve the saved-chain failure.
@@ -24432,17 +24434,15 @@ export class AgentSession {
 					: configuredServiceTier === "none"
 						? undefined
 						: configuredServiceTier;
-				// Switching to another session file must not carry the predecessor's
-				// profile marker or role overrides into the successor; the successor's
-				// own configured model is restored above.
-				if (switchingToDifferentSession)
-					this.#resetSessionScopedModelProfileState({ preserveDefaultConfiguredChain: recoveredDefaultChain });
 				// Establish the successor's durable session identity only after every
 				// restored state facet is live. Identity-bound extension hooks run below.
 				await this.sessionManager.ensureOnDisk();
 				if (!switchingToDifferentSession) await this.#initializeLocalRootForLoadedSession();
 
 				if (switchingToDifferentSession) {
+					// Profile cleanup changed the active role layer; refresh eager task
+					// delegation and its base prompt before reconnecting the successor.
+					await this.syncEagerDelegation();
 					// The local:// migration gate for this successor already ran above,
 					// before the identity was published (#2797 / #2925).
 					this.#resetHindsightConversationTrackingIfHindsight();
@@ -24606,9 +24606,8 @@ export class AgentSession {
 				this.agent.clearAllQueues();
 				this.agent.restoreSteering(previousAgentSteeringQueue);
 				this.agent.restoreFollowUp(previousAgentFollowUpQueue);
-				if (previousModel) {
-					this.#setAgentModelWithReasoningContext(previousModel);
-				}
+				this.#setAgentModelWithReasoningContext(previousModel);
+				this.#syncAppendOnlyContext(previousModel);
 				this.#thinkingLevelMutationRevision++;
 				this.#thinkingLevelLiveMutationRevision++;
 				this.#pendingThinkingLevelControlSuccess = undefined;
