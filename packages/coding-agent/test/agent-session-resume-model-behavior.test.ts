@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
 import { Agent } from "@gajae-code/agent-core";
 import { Effort, getBundledModel, type Model } from "@gajae-code/ai";
+import type { ModelProfileDefinition } from "@gajae-code/coding-agent/config/model-profiles";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
@@ -203,6 +204,62 @@ describe("AgentSession switchSession resumeModelBehavior", () => {
 		const warningOrder = notice.mock.invocationCallOrder.at(-1);
 		if (commitOrder === undefined || warningOrder === undefined) throw new Error("Expected commit and warning calls");
 		expect(commitOrder).toBeLessThan(warningOrder);
+	});
+
+	it.each([
+		"user",
+		"registry",
+	] as const)("rolls back without durable fallback when the %s durable profile has an unresolved qualified executor", async source => {
+		const sonnet = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const codex = getBundledModel("openai-codex", "gpt-5.6-sol")!;
+		authStorage.setRuntimeApiKey("openai-codex", "test-key");
+		const profile: ModelProfileDefinition = {
+			name: `${source}-resume-unresolved-executor`,
+			requiredProviders: ["openai-codex"],
+			modelMapping: {
+				default: `${codex.provider}/${codex.id}`,
+				executor: "openai-codex/missing-executor",
+			},
+			source,
+		};
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"modelProfile.default": profile.name,
+			"session.resumeModelBehavior": "keepSessionModel",
+		});
+		const sessionFile = await createPersistedTarget(sonnet, settings);
+		targetSession!.setConfiguredModelChain(
+			"default",
+			[`${sonnet.provider}/${sonnet.id}`],
+			"profile-activation",
+			"removed-profile",
+		);
+		await targetSession!.sessionManager.ensureOnDisk();
+		session = new AgentSession({
+			agent: new Agent({ initialState: { model: sonnet, systemPrompt: ["Test"], tools: [], messages: [] } }),
+			sessionManager: SessionManager.create(tempDir.path(), tempDir.path()),
+			settings,
+			modelRegistry,
+		});
+		vi.spyOn(modelRegistry, "getAvailable").mockReturnValue([codex]);
+		vi.spyOn(modelRegistry, "getAll").mockReturnValue([codex]);
+		vi.spyOn(modelRegistry, "getModelProfiles").mockReturnValue(new Map([[profile.name, profile]]));
+		vi.spyOn(modelRegistry, "getModelProfile").mockImplementation(name =>
+			name === profile.name ? profile : undefined,
+		);
+		const notice = vi.spyOn(session, "emitNotice");
+
+		expect(await session.switchSession(sessionFile)).toBe(false);
+		expect(session.model?.id).toBe(sonnet.id);
+		expect(session.getDefaultFallbackRuntimeState().chain).not.toMatchObject({
+			origin: "runtime",
+			identity: profile.name,
+		});
+		expect(notice).not.toHaveBeenCalledWith(
+			"warning",
+			"Saved session model is no longer registered; restored the durable default preset instead.",
+			"fallback",
+		);
 	});
 
 	it("fails without rewriting the saved chain when the durable default is unavailable", async () => {
