@@ -226,32 +226,32 @@ type SessionRecord = {
 	promptObservedToolExecution?: boolean;
 	/** Whether the current prompt attempt published assistant text/thought output; reset per attempt, vetoes a first-turn retry that would re-emit it. */
 	promptObservedAssistantOutput?: boolean;
-	/** Owner token held across the first-turn retry backoff; a non-owner prompt is rejected as a conflict (review P1). */
-	pendingFirstPromptRetry?: FirstPromptRetryReservation;
-};
-
-/**
- * Identity token proving a caller owns an in-progress first-turn retry. While it is held on the
- * session record, `#submitPrompt` rejects any prompt that is not this owner, so a concurrent
- * request cannot slip into the gap between `#settlePrompt` clearing `activePrompt` on the failed
- * first attempt and the retry resubmitting after its backoff (review P1, issue #5574).
- */
-type FirstPromptRetryReservation = {
-	readonly firstPromptRetry: true;
 	/**
-	 * Set once `#submitPrompt` dispatched a turn for this prompt. Distinguishes a prompt that
-	 * genuinely owned the session's first turn from a preflight rejection, so only the former
-	 * settles `firstPromptDone` (review P2).
+	 * Owner token of an in-flight first-turn retry. Set once the failed first turn is accepted
+	 * for retry and held across the backoff and resubmission, so the gap where `activePrompt`
+	 * is unset cannot admit a concurrent prompt that would claim the session or mutate first-turn
+	 * retry state (review P1). Released on retry success, final failure, or cancellation.
 	 */
-	admitted?: boolean;
+	firstPromptRetryOwner?: symbol;
+	/**
+	 * The retry owner whose turn `#submitPrompt` actually dispatched to the host. Distinguishes a
+	 * prompt that genuinely owned the session's first turn from a preflight rejection, so only the
+	 * former settles `firstPromptDone` (review P2). A bare symbol owner cannot carry this flag, so
+	 * admission is tracked here on the record.
+	 */
+	firstPromptRetryAdmitted?: symbol;
 	/**
 	 * Terminal settlement recorded by a teardown that won the backoff gap. The failed attempt
 	 * already cleared `activePrompt`, so `#teardownSession` has no waiter to settle for this
 	 * caller and nothing else carries the outcome across the sleep. Without it the retry wakes
 	 * to a deleted record and resubmits into `not_found`, where a client-driven close/delete
-	 * owes the ACP `cancelled` stop reason (review P1).
+	 * owes the ACP `cancelled` stop reason (review P1). Tagged with the owner it belongs to,
+	 * since a bare symbol owner cannot carry the settlement itself.
 	 */
-	settlement?: { kind: "cancelled" } | { kind: "rejected"; error: AcpSdkAdapterError };
+	firstPromptRetrySettlement?: {
+		readonly owner: symbol;
+		readonly outcome: { kind: "cancelled" } | { kind: "rejected"; error: AcpSdkAdapterError };
+	};
 };
 
 /**
@@ -1749,12 +1749,12 @@ export class AcpAgent implements Agent {
 		if (!record) return await this.#submitPrompt(params, true);
 		// Identity of THIS caller's first-turn retry. Held on the record across the backoff so a
 		// concurrent prompt racing the gap is rejected as a conflict rather than admitted (review P1).
-		const retryReservation: FirstPromptRetryReservation = { firstPromptRetry: true };
+		const retryOwner = Symbol("acp-first-prompt-retry");
 		try {
 			let echoUserMessage = true;
 			for (let attempt = 0; ; attempt++) {
 				try {
-					return await this.#submitPrompt(params, echoUserMessage, retryReservation);
+					return await this.#submitPrompt(params, echoUserMessage, retryOwner);
 				} catch (error) {
 					if (!this.#shouldRetryFirstPrompt(record, error, attempt)) throw error;
 					// The user's message was already echoed on the first attempt; re-echoing
@@ -1763,7 +1763,7 @@ export class AcpAgent implements Agent {
 					// Reserve the session BEFORE the backoff sleep. `#settlePrompt` already cleared
 					// `activePrompt` when it rejected this attempt, so without the reservation the
 					// backoff gap admits a competing prompt that steals the first turn (review P1).
-					record.pendingFirstPromptRetry = retryReservation;
+					record.firstPromptRetryOwner = retryOwner;
 					logger.warn("ACP first-turn prompt failed; retrying after readiness backoff", {
 						sessionId: params.sessionId,
 						attempt: attempt + 1,
@@ -1774,7 +1774,10 @@ export class AcpAgent implements Agent {
 					// down without a waiter to settle, leaving its outcome on this reservation.
 					// Honor it here: resubmitting would only reach `#submitPrompt`'s not_found,
 					// which is not what a client-driven teardown owes the caller (review P1).
-					const settlement = retryReservation.settlement;
+					const settlement =
+						record.firstPromptRetrySettlement?.owner === retryOwner
+							? record.firstPromptRetrySettlement.outcome
+							: undefined;
 					if (settlement) {
 						if (settlement.kind === "cancelled") return { stopReason: "cancelled" };
 						throw settlement.error;
@@ -1794,14 +1797,17 @@ export class AcpAgent implements Agent {
 		} finally {
 			// Release the reservation on retry completion (success), cancellation, or final
 			// failure. Guarded so a later prompt that took ownership is never cleared by this caller.
-			if (record.pendingFirstPromptRetry === retryReservation) record.pendingFirstPromptRetry = undefined;
+			if (record.firstPromptRetryOwner === retryOwner) record.firstPromptRetryOwner = undefined;
 			// Only a turn that was actually admitted (dispatched to the host) settles the
 			// session's first prompt. A preflight rejection — validation, auth/preflight, a
 			// stale-state conflict, an oversize frame, or an ensureProviders() failure — never
 			// owned a turn, so it must not consume the one-shot first-turn retry budget: a later
 			// valid first prompt that hits the startup readiness race must still be retryable
 			// (review P2).
-			if (retryReservation.admitted) record.firstPromptDone = true;
+			if (record.firstPromptRetryAdmitted === retryOwner) {
+				record.firstPromptRetryAdmitted = undefined;
+				record.firstPromptDone = true;
+			}
 		}
 	}
 
@@ -1858,17 +1864,13 @@ export class AcpAgent implements Agent {
 		});
 	}
 
-	async #submitPrompt(
-		params: PromptRequest,
-		echoUserMessage: boolean,
-		retryReservation?: FirstPromptRetryReservation,
-	): Promise<PromptResponse> {
+	async #submitPrompt(params: PromptRequest, echoUserMessage: boolean, retryOwner?: symbol): Promise<PromptResponse> {
 		const record = this.#sessions.get(params.sessionId);
 		if (!record) throw new AcpSdkAdapterError("not_found", `Unknown session, not found: ${params.sessionId}`);
 		// A first-turn retry holds the session across its backoff gap. Any prompt that is not the
 		// retry owner is rejected here, before any state mutation or dispatch, so it cannot steal
 		// the first turn while the authorized retry is still pending (review P1, issue #5574).
-		if (record.pendingFirstPromptRetry && record.pendingFirstPromptRetry !== retryReservation)
+		if (record.firstPromptRetryOwner !== undefined && record.firstPromptRetryOwner !== retryOwner)
 			throw new AcpSdkAdapterError("conflict", "ACP session is retrying its first prompt.");
 		if (record.activePrompt) throw new AcpSdkAdapterError("conflict", "ACP session already has an active prompt.");
 		if (record.authFailure) throw new AcpSdkAdapterError("authentication_failed", record.authFailure);
@@ -2026,7 +2028,7 @@ export class AcpAgent implements Agent {
 		// The turn is now dispatched to the host: this prompt owned the session's first turn,
 		// so it — not a preflight rejection that threw before this point — is what settles
 		// `firstPromptDone` in `prompt()` (review P2).
-		if (retryReservation) retryReservation.admitted = true;
+		if (retryOwner !== undefined) record.firstPromptRetryAdmitted = retryOwner;
 		if (waiter.settled || record.activePrompt !== waiter) {
 			return await response;
 		}
@@ -2303,7 +2305,7 @@ export class AcpAgent implements Agent {
 			// retry is reserved across its backoff gap. That reservation owner has not yet observed
 			// the cancel; clearing it here would let the retry resubmit a turn the client cancelled
 			// (review P1). Leave the flag for the retry's post-backoff check to settle as cancelled.
-			if (!waiter && !record.pendingFirstPromptRetry) record.cancelRequested = false;
+			if (!waiter && !record.firstPromptRetryOwner) record.cancelRequested = false;
 			// Only the LAST in-flight attempt resolves the shared promise false;
 			// an earlier attempt may still acknowledge (review thread P2). After
 			// every attempt of this wave failed, RE-ARM the aggregate: a later
@@ -2905,15 +2907,18 @@ export class AcpAgent implements Agent {
 				// split, and release the reservation: otherwise the retry wakes to a deleted
 				// record and resubmits, surfacing `not_found` where the client's close/delete owes
 				// `cancelled` (review P1).
-				const reservation = record.pendingFirstPromptRetry;
-				if (reservation) {
-					reservation.settlement ??= voluntary
-						? { kind: "cancelled" }
-						: {
-								kind: "rejected",
-								error: new AcpSdkAdapterError("connection_closed", `ACP session was ${reason}.`),
-							};
-					record.pendingFirstPromptRetry = undefined;
+				const retryOwner = record.firstPromptRetryOwner;
+				if (retryOwner !== undefined) {
+					record.firstPromptRetrySettlement = {
+						owner: retryOwner,
+						outcome: voluntary
+							? { kind: "cancelled" }
+							: {
+									kind: "rejected",
+									error: new AcpSdkAdapterError("connection_closed", `ACP session was ${reason}.`),
+								},
+					};
+					record.firstPromptRetryOwner = undefined;
 				}
 			}
 
