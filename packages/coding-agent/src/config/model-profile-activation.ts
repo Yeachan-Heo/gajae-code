@@ -10,6 +10,7 @@ import {
 	formatModelProfileDisplayLabel,
 	type ModelProfileDefinition,
 	PROXY_ROUTABLE_PROVIDER_IDS,
+	type ResolvedProfileBinding,
 	resolveProfileBindings,
 } from "./model-profiles";
 
@@ -1012,7 +1013,7 @@ async function resolveAndClampSelectorValue(
 /** Resolve every non-default binding under the profile activation contract without installing it. */
 async function preflightModelProfileRoleBindings(options: {
 	profile: ModelProfileDefinition;
-	bindings: ReturnType<typeof resolveProfileBindings>;
+	bindings: ResolvedProfileBinding;
 	roleCatalogModels: Model<Api>[];
 	settings: Settings;
 	modelRegistry: ModelRegistry;
