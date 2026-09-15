@@ -1971,6 +1971,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		let startupActiveModelProfile =
 			acceptedInheritedProfileName ??
 			(!hasExplicitModel && acceptedPersistedProfileName ? acceptedPersistedProfileName : undefined);
+		let savedDefaultWasUnresolved = false;
 		let recoveredSessionDefault:
 			| {
 					entries: string[];
@@ -2004,6 +2005,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				if (model && preferredCredentialProvider && model.provider !== preferredCredentialProvider) {
 					model = undefined;
 				}
+				savedDefaultWasUnresolved = !model;
 				if (!model && resumeModelBehavior !== "useCurrentDefault") {
 					const recovery = await resolveMissingSessionModelRecovery({
 						modelRegistry,
@@ -3741,7 +3743,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		// A startup extension can register the saved model after the initial
 		// recovery lookup. Reconsider the saved chain against that completed
 		// catalog before retaining a durable runtime fallback.
-		if (recoveredSessionDefault && defaultModelEntries.length > 0) {
+		if (savedDefaultWasUnresolved && defaultModelEntries.length > 0) {
 			const restoredAfterExtensions = await resolveModelChainWithAuth(
 				defaultModelEntries,
 				modelRegistry,
@@ -3758,7 +3760,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				(!preferredCredentialProvider || restoredAfterExtensions.model.provider === preferredCredentialProvider)
 			) {
 				model = restoredAfterExtensions.model;
-				if (restoredThinkingLevel === undefined) {
+				if (options.thinkingLevel !== undefined) {
+					thinkingLevel = resolveThinkingLevelForModel(model, options.thinkingLevel);
+				} else if (restoredThinkingLevel === undefined) {
 					thinkingLevel = restoredAfterExtensions.explicitThinkingLevel
 						? restoredAfterExtensions.thinkingLevel
 						: undefined;
