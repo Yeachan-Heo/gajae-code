@@ -59,7 +59,7 @@ import { loadCapability, reset as resetCapabilities } from "../capability";
 import { type Rule, ruleCapability, setActiveRules } from "../capability/rule";
 import type { SourceMeta } from "../capability/types";
 import { AUTOROUTING_INACTIVE_WARNING } from "../config/autorouting-contract";
-import { resolveMissingSessionModelRecovery } from "../config/model-profile-activation";
+import { ModelProfileCredentialError, resolveMissingSessionModelRecovery } from "../config/model-profile-activation";
 import { resolveModelProfileName } from "../config/model-profile-contract";
 import { resolveProfileBindings } from "../config/model-profiles";
 import { kNoAuth, ModelRegistry } from "../config/model-registry";
@@ -2007,21 +2007,25 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				}
 				savedDefaultWasUnresolved = !model;
 				if (!model && resumeModelBehavior !== "useCurrentDefault") {
-					const recovery = await resolveMissingSessionModelRecovery({
-						modelRegistry,
-						settings,
-						defaultEntries: defaultModelEntries,
-						skips: restoredDefaultResolution.skips,
-						savedDefault: existingSession.models.default,
-						credentialSessionId,
-						...(persistedProfileOwnsDefault ? { aliasIntent: "preset-equivalent" as const } : {}),
-					});
-					if (recovery?.model) {
-						model = recovery.model;
-						recoveredSessionDefault = recovery;
-						startupActiveModelProfile = undefined;
-						modelFallbackMessage =
-							"Saved session model is no longer registered; restored the durable default preset instead.";
+					try {
+						const recovery = await resolveMissingSessionModelRecovery({
+							modelRegistry,
+							settings,
+							defaultEntries: defaultModelEntries,
+							skips: restoredDefaultResolution.skips,
+							savedDefault: existingSession.models.default,
+							credentialSessionId,
+							...(persistedProfileOwnsDefault ? { aliasIntent: "preset-equivalent" as const } : {}),
+						});
+						if (recovery?.model) {
+							model = recovery.model;
+							recoveredSessionDefault = recovery;
+							startupActiveModelProfile = undefined;
+							modelFallbackMessage =
+								"Saved session model is no longer registered; restored the durable default preset instead.";
+						}
+					} catch (error) {
+						if (!(error instanceof ModelProfileCredentialError)) throw error;
 					}
 				}
 				if (!model) modelFallbackMessage = `Could not restore model ${defaultModelEntries.join(" -> ")}`;
