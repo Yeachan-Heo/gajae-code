@@ -118,7 +118,7 @@ describe("AgentSession switchSession resumeModelBehavior", () => {
 		expect(session.model?.id).toBe(opus.id);
 		expect(session.getActiveModelProfile()).toBe("codex-medium");
 	});
-	it("clears predecessor session-only profile roles before resolving a cross-file current default", async () => {
+	it("clears predecessor session-only profile roles and uninstalled durable markers before a cross-file current default", async () => {
 		const sonnet = getBundledModel("anthropic", "claude-sonnet-4-5")!;
 		const opus = getBundledModel("anthropic", "claude-opus-4-8")!;
 		const settings = Settings.isolated({
@@ -141,8 +141,39 @@ describe("AgentSession switchSession resumeModelBehavior", () => {
 
 		expect(await session.switchSession(sessionFile)).toBe(true);
 		expect(session.model?.id).toBe(sonnet.id);
-		expect(session.getActiveModelProfile()).toBe("opus-codex");
+		expect(session.getActiveModelProfile()).toBeUndefined();
 		expect(settings.getOverride("modelRoles")).toEqual({ default: `${sonnet.provider}/${sonnet.id}` });
+		expect(settings.getOverride("task.agentModelOverrides")).toEqual({});
+	});
+
+	it("clears a saved profile marker when its runtime layer is removed during cross-file resume", async () => {
+		const sonnet = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const opus = getBundledModel("anthropic", "claude-opus-4-8")!;
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"session.resumeModelBehavior": "keepSessionModel",
+		});
+		const sessionFile = await createPersistedTarget(sonnet, settings);
+		targetSession!.setConfiguredModelChain(
+			"default",
+			[`${sonnet.provider}/${sonnet.id}`],
+			"profile-activation",
+			"codex-medium",
+		);
+		await targetSession!.sessionManager.ensureOnDisk();
+		session = new AgentSession({
+			agent: new Agent({ initialState: { model: sonnet, systemPrompt: ["Test"], tools: [], messages: [] } }),
+			sessionManager: SessionManager.create(tempDir.path(), tempDir.path()),
+			settings,
+			modelRegistry,
+		});
+		settings.override("modelRoles", { default: `${opus.provider}/${opus.id}` });
+		settings.override("task.agentModelOverrides", { executor: `${opus.provider}/${opus.id}` });
+		session.setActiveModelProfile("codex-medium");
+		session.noteProfileInstalledOverrides(["default"], ["executor"], sonnet);
+
+		expect(await session.switchSession(sessionFile)).toBe(true);
+		expect(session.getActiveModelProfile()).toBeUndefined();
 		expect(settings.getOverride("task.agentModelOverrides")).toEqual({});
 	});
 
@@ -349,11 +380,7 @@ describe("AgentSession switchSession resumeModelBehavior", () => {
 			"Saved session model is no longer registered; restored the durable default preset instead.",
 			"fallback",
 		);
-		expect(notice).toHaveBeenCalledWith(
-			"error",
-			expect.stringContaining("missing-executor"),
-			"fallback",
-		);
+		expect(notice).toHaveBeenCalledWith("error", expect.stringContaining("missing-executor"), "fallback");
 	});
 
 	it("fails without rewriting the saved chain when the durable default is unavailable", async () => {
@@ -440,12 +467,7 @@ describe("AgentSession switchSession resumeModelBehavior", () => {
 			"session.resumeModelBehavior": "keepSessionModel",
 		});
 		const sessionFile = await createPersistedTarget(removedModel, settings);
-		targetSession!.setConfiguredModelChain(
-			"default",
-			["registered-alias"],
-			"profile-activation",
-			profile.name,
-		);
+		targetSession!.setConfiguredModelChain("default", ["registered-alias"], "profile-activation", profile.name);
 		await targetSession!.sessionManager.ensureOnDisk();
 		session = new AgentSession({
 			agent: new Agent({ initialState: { model: removedModel, systemPrompt: ["Test"], tools: [], messages: [] } }),
