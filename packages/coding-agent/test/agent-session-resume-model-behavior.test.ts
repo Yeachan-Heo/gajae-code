@@ -146,6 +146,34 @@ describe("AgentSession switchSession resumeModelBehavior", () => {
 		expect(settings.getOverride("task.agentModelOverrides")).toEqual({});
 	});
 
+	it("retains a matching durable profile's runtime role layer across a cross-file resume", async () => {
+		const sonnet = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const opus = getBundledModel("anthropic", "claude-opus-4-8")!;
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"modelProfile.default": "opus-codex",
+			"session.resumeModelBehavior": "useCurrentDefault",
+		});
+		const sessionFile = await createPersistedTarget(sonnet, settings);
+		session = new AgentSession({
+			agent: new Agent({ initialState: { model: sonnet, systemPrompt: ["Test"], tools: [], messages: [] } }),
+			sessionManager: SessionManager.create(tempDir.path(), tempDir.path()),
+			settings,
+			modelRegistry,
+		});
+		const modelRoles = { default: `${sonnet.provider}/${sonnet.id}`, planner: `${opus.provider}/${opus.id}` };
+		const agentModelOverrides = { executor: `${opus.provider}/${opus.id}` };
+		settings.override("modelRoles", modelRoles);
+		settings.override("task.agentModelOverrides", agentModelOverrides);
+		session.setActiveModelProfile("opus-codex");
+		session.noteProfileInstalledOverrides(["default", "planner"], ["executor"], sonnet);
+
+		expect(await session.switchSession(sessionFile)).toBe(true);
+		expect(session.getActiveModelProfile()).toBe("opus-codex");
+		expect(settings.getOverride("modelRoles")).toEqual(modelRoles);
+		expect(settings.getOverride("task.agentModelOverrides")).toEqual(agentModelOverrides);
+	});
+
 	it("restores predecessor profile state when target current-default resolution fails", async () => {
 		const sonnet = getBundledModel("anthropic", "claude-sonnet-4-5")!;
 		const opus = getBundledModel("anthropic", "claude-opus-4-8")!;
@@ -319,6 +347,11 @@ describe("AgentSession switchSession resumeModelBehavior", () => {
 		expect(notice).not.toHaveBeenCalledWith(
 			"warning",
 			"Saved session model is no longer registered; restored the durable default preset instead.",
+			"fallback",
+		);
+		expect(notice).toHaveBeenCalledWith(
+			"error",
+			expect.stringContaining("missing-executor"),
 			"fallback",
 		);
 	});
