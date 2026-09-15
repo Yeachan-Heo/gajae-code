@@ -467,7 +467,7 @@ describe("AgentSession switchSession resumeModelBehavior", () => {
 			"session.resumeModelBehavior": "keepSessionModel",
 		});
 		const sessionFile = await createPersistedTarget(removedModel, settings);
-		targetSession!.setConfiguredModelChain("default", ["registered-alias"], "profile-activation", profile.name);
+		targetSession!.setConfiguredModelChain("default", ["Registered-Alias"], "profile-activation", profile.name);
 		await targetSession!.sessionManager.ensureOnDisk();
 		session = new AgentSession({
 			agent: new Agent({ initialState: { model: removedModel, systemPrompt: ["Test"], tools: [], messages: [] } }),
