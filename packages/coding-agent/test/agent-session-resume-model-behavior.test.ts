@@ -419,6 +419,58 @@ describe("AgentSession switchSession resumeModelBehavior", () => {
 		expect(recover).not.toHaveBeenCalled();
 	});
 
+	it("does not recover a bare saved alias that remains registered but unavailable", async () => {
+		const registeredAlias = {
+			...getBundledModel("anthropic", "claude-sonnet-4-5")!,
+			provider: "disabled-provider",
+			id: "catalog/registered-alias",
+		};
+		const removedModel = getBundledModel("anthropic", "claude-opus-4-8")!;
+		const codex = getBundledModel("openai-codex", "gpt-5.6-sol")!;
+		authStorage.setRuntimeApiKey("openai-codex", "test-key");
+		const profile: ModelProfileDefinition = {
+			name: "bare-alias-durable-default",
+			requiredProviders: ["openai-codex"],
+			modelMapping: { default: `${codex.provider}/${codex.id}` },
+			source: "user",
+		};
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"modelProfile.default": profile.name,
+			"session.resumeModelBehavior": "keepSessionModel",
+		});
+		const sessionFile = await createPersistedTarget(removedModel, settings);
+		targetSession!.setConfiguredModelChain(
+			"default",
+			["registered-alias"],
+			"profile-activation",
+			profile.name,
+		);
+		await targetSession!.sessionManager.ensureOnDisk();
+		session = new AgentSession({
+			agent: new Agent({ initialState: { model: removedModel, systemPrompt: ["Test"], tools: [], messages: [] } }),
+			sessionManager: SessionManager.create(tempDir.path(), tempDir.path()),
+			settings,
+			modelRegistry,
+		});
+		vi.spyOn(modelRegistry, "getAvailable").mockReturnValue([codex]);
+		vi.spyOn(modelRegistry, "getAll").mockReturnValue([registeredAlias, codex]);
+		vi.spyOn(modelRegistry, "getModelProfiles").mockReturnValue(new Map([[profile.name, profile]]));
+		vi.spyOn(modelRegistry, "getModelProfile").mockImplementation(name =>
+			name === profile.name ? profile : undefined,
+		);
+		vi.spyOn(modelRegistry, "lookupAliasExists").mockReturnValue(true);
+		vi.spyOn(modelRegistry, "resolveModelByLookupAlias").mockReturnValue(undefined);
+		const notice = vi.spyOn(session, "emitNotice");
+
+		expect(await session.switchSession(sessionFile)).toBe(false);
+		expect(notice).not.toHaveBeenCalledWith(
+			"warning",
+			"Saved session model is no longer registered; restored the durable default preset instead.",
+			"fallback",
+		);
+	});
+
 	it("restore shares one thinking-level rule: no stray thinking_level_change, recompute from defaultThinkingLevel", async () => {
 		const sonnet = getBundledModel("anthropic", "claude-sonnet-4-5")!;
 		const settings = Settings.isolated({ "compaction.enabled": false, defaultThinkingLevel: Effort.Medium });

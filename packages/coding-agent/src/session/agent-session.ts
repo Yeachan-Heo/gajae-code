@@ -229,6 +229,7 @@ import {
 	isAuthenticated,
 	kNoAuth,
 	MODEL_ROLE_IDS,
+	registrySelectorResolvesToModel,
 	type ModelRegistry,
 } from "../config/model-registry";
 import {
@@ -238,6 +239,7 @@ import {
 	managedCursorFallbackUnavailableReason,
 	parseModelString,
 	type ResolvedModelRoleValue,
+	resolveConfiguredModelPatterns,
 	resolveModelChainWithAuth,
 	resolveModelRoleValue,
 	type ScopedModelSelection,
@@ -24352,15 +24354,26 @@ export class AgentSession {
 						const allSelectorsUnknown =
 							resolution.skips.length === defaultEntries.length &&
 							resolution.skips.every(skip => skip.reason === "unknown_model");
-						const savedSelectorsMissingFromCatalog = defaultEntries.every(
-							selector =>
-								!resolveModelRoleValue(selector, this.#modelRegistry.getAll(), {
+						const fullCatalog = this.#modelRegistry.getAll();
+						const savedSelectorsMissingFromCatalog = resolveConfiguredModelPatterns(
+							defaultEntries,
+							this.settings,
+						).every(selector => {
+							if (
+								resolveModelRoleValue(selector, fullCatalog, {
 									settings: this.settings,
 									modelRegistry: this.#modelRegistry,
 									credentialSessionId: this.credentialSessionId,
 									...(this.#persistedModelProfileAliasIntent("default") ?? {}),
-								}).model,
-						);
+								}).model
+							)
+								return false;
+							// Alias resolution intentionally filters unavailable candidates. The
+							// recovery boundary instead asks whether this saved selector exists in
+							// the complete catalog, so disabled or unauthenticated providers never
+							// masquerade as deregistered models.
+							return !registrySelectorResolvesToModel(selector, fullCatalog);
+						});
 						const savedConcreteDefault = sessionContext.models.default
 							? parseModelString(sessionContext.models.default)
 							: undefined;
