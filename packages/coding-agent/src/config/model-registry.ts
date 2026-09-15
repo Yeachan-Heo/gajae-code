@@ -740,7 +740,7 @@ function registryModelMetadataWithoutApiSpecificFields(model: Model<Api>): Parti
 	return metadata;
 }
 
-function registrySelectorResolvesToModel(selector: string, models: readonly Model<Api>[]): boolean {
+export function registrySelectorResolvesToModel(selector: string, models: readonly Model<Api>[]): boolean {
 	if (models.some(model => model.id === selector || `${model.provider}/${model.id}` === selector)) return true;
 	const suffix = splitSelectorThinkingSuffix(selector);
 	const baseSelector = suffix.thinkingLevel === undefined ? selector : suffix.selector;
