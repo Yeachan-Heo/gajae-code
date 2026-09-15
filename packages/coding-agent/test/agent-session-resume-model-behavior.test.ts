@@ -305,6 +305,11 @@ describe("AgentSession switchSession resumeModelBehavior", () => {
 			"session.resumeModelBehavior": "keepSessionModel",
 		});
 		const sessionFile = await createPersistedTarget(sonnet, settings);
+		// The saved configured selector is stale, but the concrete last-used
+		// model remains registered. Recovery must not replace it with the durable
+		// profile merely because the selector alias disappeared.
+		targetSession!.setConfiguredModelChain("default", ["removed/alias"], "legacy_session");
+		await targetSession!.sessionManager.ensureOnDisk();
 
 		session = new AgentSession({
 			agent: new Agent({ initialState: { model: sonnet, systemPrompt: ["Test"], tools: [], messages: [] } }),

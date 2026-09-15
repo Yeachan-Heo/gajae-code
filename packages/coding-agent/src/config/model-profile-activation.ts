@@ -615,7 +615,15 @@ export async function resolveModelProfileDefaultChain(options: {
 	settings: Pick<Settings, "get">;
 	profileName: string;
 	credentialSessionId: string;
-}): Promise<{ profileName: string; entries: string[] }> {
+}): Promise<{
+	profileName: string;
+	entries: string[];
+	model?: Model<Api>;
+	thinkingLevel?: ThinkingLevel;
+	explicitThinkingLevel: boolean;
+	activeIndex: number;
+	skips: Array<{ selector: string; reason: string }>;
+}> {
 	const profiles = options.modelRegistry.getModelProfiles();
 	const profileName = validateModelProfileName(options.profileName, profiles, options.modelRegistry.getError?.());
 	const profile = profiles.get(profileName) ?? options.modelRegistry.getModelProfile(profileName)!;
@@ -716,7 +724,8 @@ export async function resolveModelProfileDefaultChain(options: {
 		credentialSessionId: options.credentialSessionId,
 		profileLabel,
 	});
-	if (!bindings.defaultSelector) return { profileName, entries: [] };
+	if (!bindings.defaultSelector)
+		return { profileName, entries: [], explicitThinkingLevel: false, activeIndex: 0, skips: [] };
 	const defaultChain = normalizeModelSelectorValue(
 		await resolveAndClampSelectorValue(
 			bindings.defaultSelector,
@@ -732,39 +741,29 @@ export async function resolveModelProfileDefaultChain(options: {
 			"default",
 		),
 	);
-	const entries: string[] = [];
-	for (const selector of defaultChain) {
-		const resolution = await resolveModelChainWithAuth(
-			[selector],
-			{
-				getAvailable: () => availableModels,
-				getApiKey: (model, sessionId) =>
-					options.modelRegistry.getApiKeyForProvider(model.provider, sessionId, model.baseUrl),
-				resolveCanonicalModel: options.modelRegistry.resolveCanonicalModel?.bind(options.modelRegistry),
-				getCanonicalVariants: options.modelRegistry.getCanonicalVariants?.bind(options.modelRegistry),
-				getCanonicalId: options.modelRegistry.getCanonicalId?.bind(options.modelRegistry),
-				resolveModelByLookupAlias: options.modelRegistry.resolveModelByLookupAlias?.bind(options.modelRegistry),
-				lookupAliasExists: options.modelRegistry.lookupAliasExists?.bind(options.modelRegistry),
-				clearCanonicalVariant: options.modelRegistry.clearCanonicalVariant?.bind(options.modelRegistry),
-			} as ModelRegistry,
-			options.settings as Settings,
-			options.credentialSessionId,
-			{
-				managedFallback: true,
-				aliasIntent: "preset-equivalent",
-				canonicalSessionId: null,
-				credentialSessionId: options.credentialSessionId,
-			},
-		);
-		if (!resolution.model) continue;
-		const concreteSelector = `${resolution.model.provider}/${resolution.model.id}`;
-		entries.push(
-			resolution.explicitThinkingLevel && resolution.thinkingLevel
-				? formatModelSelectorValue(concreteSelector, resolution.thinkingLevel)
-				: concreteSelector,
-		);
-	}
-	return { profileName, entries };
+	const resolution = await resolveModelChainWithAuth(
+		defaultChain,
+		{
+			getAvailable: () => availableModels,
+			getApiKey: (model, sessionId) =>
+				options.modelRegistry.getApiKeyForProvider(model.provider, sessionId, model.baseUrl),
+			resolveCanonicalModel: options.modelRegistry.resolveCanonicalModel?.bind(options.modelRegistry),
+			getCanonicalVariants: options.modelRegistry.getCanonicalVariants?.bind(options.modelRegistry),
+			getCanonicalId: options.modelRegistry.getCanonicalId?.bind(options.modelRegistry),
+			resolveModelByLookupAlias: options.modelRegistry.resolveModelByLookupAlias?.bind(options.modelRegistry),
+			lookupAliasExists: options.modelRegistry.lookupAliasExists?.bind(options.modelRegistry),
+			clearCanonicalVariant: options.modelRegistry.clearCanonicalVariant?.bind(options.modelRegistry),
+		} as ModelRegistry,
+		options.settings as Settings,
+		options.credentialSessionId,
+		{
+			managedFallback: true,
+			aliasIntent: "preset-equivalent",
+			canonicalSessionId: null,
+			credentialSessionId: options.credentialSessionId,
+		},
+	);
+	return { profileName, entries: defaultChain, ...resolution };
 }
 
 export function rewriteSelectorForProxy(
