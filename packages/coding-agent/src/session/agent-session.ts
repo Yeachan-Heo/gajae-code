@@ -212,7 +212,11 @@ import {
 import { reset as resetCapabilities } from "../capability";
 import type { Rule } from "../capability/rule";
 import type { CasReceipt } from "../config/atomic-yaml-patch";
-import { activateModelProfile, materializeActiveModelProfileAssignment } from "../config/model-profile-activation";
+import {
+	activateModelProfile,
+	materializeActiveModelProfileAssignment,
+	resolveModelProfileDefaultChain,
+} from "../config/model-profile-activation";
 import {
 	ModelProfileRegistryError,
 	resolveModelProfileName,
@@ -16540,10 +16544,18 @@ export class AgentSession {
 		await this.refreshBaseSystemPrompt();
 	}
 
-	/** Resolver intent only for assignments owned by the active profile. */
+	/** Resolver intent only for default assignments owned by an active or runtime-recovered durable profile. */
 	#persistedModelProfileAliasIntent(role: string): { aliasIntent: "preset-equivalent" } | undefined {
-		if (!this.#activeModelProfile) return undefined;
-		const profile = this.#modelRegistry.getModelProfile?.(this.#activeModelProfile);
+		const runtimeDefaultIdentity = this.#defaultFallbackController?.chain;
+		const profileName =
+			this.#activeModelProfile ??
+			(role === "default" &&
+			runtimeDefaultIdentity?.origin === "runtime" &&
+			runtimeDefaultIdentity.identity === this.settings.get("modelProfile.default")
+				? runtimeDefaultIdentity.identity
+				: undefined);
+		if (!profileName) return undefined;
+		const profile = this.#modelRegistry.getModelProfile?.(profileName);
 		if (!profile) return undefined;
 		const bindings = resolveProfileBindings(profile);
 		const owned =
@@ -16570,7 +16582,7 @@ export class AgentSession {
 	 * configured `modelBindings` (also installed into these two override slots
 	 * once at startup) are not profile-owned and must survive the transition.
 	 */
-	#resetSessionScopedModelProfileState(): void {
+	#resetSessionScopedModelProfileState(options?: { preserveDefaultConfiguredChain?: boolean }): void {
 		const persistedProfile = this.settings.get("modelProfile.default");
 		if (persistedProfile !== undefined && persistedProfile === this.getActiveModelProfile()) return;
 		const hadInstalledKeys =
@@ -16595,7 +16607,7 @@ export class AgentSession {
 			this.#modelRegistry.reapplyConfiguredModelBindings(this.settings);
 		}
 		const defaultChain = getSessionContextForInternalRead(this.sessionManager).configuredModelChains.default;
-		if (defaultChain && defaultChain.identity !== undefined) {
+		if (!options?.preserveDefaultConfiguredChain && defaultChain && defaultChain.identity !== undefined) {
 			this.setConfiguredModelChain("default", [], "user-selection");
 		}
 		this.setActiveModelProfile(undefined);
@@ -16849,7 +16861,15 @@ export class AgentSession {
 	 * The configured chain's role, origin, and identity are retained by the controller.
 	 */
 	seedDefaultFallbackResolution(activeIndex: number, skips: Array<{ selector: string; reason: string }>): void {
-		const controller = this.#defaultFallbackChain();
+		this.#seedDefaultFallbackResolutionForController(this.#defaultFallbackChain(), activeIndex, skips);
+	}
+
+	/** Seed an already-selected runtime controller without legacy-chain materialization. */
+	#seedDefaultFallbackResolutionForController(
+		controller: FallbackChainController,
+		activeIndex: number,
+		skips: Array<{ selector: string; reason: string }>,
+	): void {
 		controller.seedResolution(activeIndex, skips);
 		this.#emitResolutionFallbackSwitch(controller);
 	}
@@ -24196,6 +24216,8 @@ export class AgentSession {
 				? this.#suspendWorkflowGateEmitter(previousSessionState.sessionId)
 				: undefined;
 			let unavailableDefaultChainMessage: string | undefined;
+			let recoveredDefaultChainMessage: string | undefined;
+			let recoveredDefaultChain = false;
 			let transitionCleanupCommitted = false;
 			let exactRetirement: PreparedExactMcpRetirement | undefined;
 
@@ -24295,14 +24317,83 @@ export class AgentSession {
 							...(this.#persistedModelProfileAliasIntent("default") ?? {}),
 						},
 					);
-					const controller = this.#defaultFallbackChain();
+					let controller = this.#defaultFallbackChain();
 					this.seedDefaultFallbackResolution(resolution.activeIndex, resolution.skips);
-					if (!resolution.model) {
-						unavailableDefaultChainMessage = this.#fallbackExhaustionError(controller);
-						throw new Error(unavailableDefaultChainMessage);
+					let resolvedModel = resolution.model;
+					if (!resolvedModel) {
+						const allSelectorsUnknown =
+							resolution.skips.length === defaultEntries.length &&
+							resolution.skips.every(skip => skip.reason === "unknown_model");
+						const savedSelectorsMissingFromCatalog = defaultEntries.every(
+							selector =>
+								!resolveModelRoleValue(selector, this.#modelRegistry.getAll(), {
+									settings: this.settings,
+									modelRegistry: this.#modelRegistry,
+									credentialSessionId: this.credentialSessionId,
+									...(this.#persistedModelProfileAliasIntent("default") ?? {}),
+								}).model,
+						);
+						const durableProfile = this.settings.get("modelProfile.default");
+						if (
+							resumeModelBehavior !== "useCurrentDefault" &&
+							allSelectorsUnknown &&
+							savedSelectorsMissingFromCatalog &&
+							durableProfile
+						) {
+							try {
+								const recovery = await resolveModelProfileDefaultChain({
+									modelRegistry: this.#modelRegistry,
+									settings: this.settings,
+									profileName: durableProfile,
+									credentialSessionId: this.credentialSessionId,
+								});
+								if (recovery.entries.length > 0) {
+									const recovered = await resolveModelChainWithAuth(
+										recovery.entries,
+										this.#modelRegistry,
+										this.settings,
+										this.credentialSessionId,
+										{
+											managedFallback: true,
+											canonicalSessionId: this.sessionId,
+											credentialSessionId: this.credentialSessionId,
+											aliasIntent: "preset-equivalent",
+										},
+									);
+									if (recovered.model) {
+										this.#defaultFallbackController = new FallbackChainController(
+											{
+												role: "default",
+												entries: recovery.entries,
+												origin: "runtime",
+												identity: recovery.profileName,
+												explicitHead: true,
+											},
+											this.settings.get("fallback.maxAttempts"),
+										);
+										controller = this.#defaultFallbackChain(false);
+										this.#seedDefaultFallbackResolutionForController(
+											controller,
+											recovered.activeIndex,
+											recovered.skips,
+										);
+										resolvedModel = recovered.model;
+										recoveredDefaultChain = true;
+										recoveredDefaultChainMessage =
+											"Saved session model is no longer registered; restored the durable default preset instead.";
+									}
+								}
+							} catch {
+								// A durable default is only a recovery candidate; preserve the saved-chain failure.
+							}
+						}
+						if (!resolvedModel) {
+							unavailableDefaultChainMessage = this.#fallbackExhaustionError(controller);
+							throw new Error(unavailableDefaultChainMessage);
+						}
 					}
-					if (!this.model || !modelsAreEqual(this.model, resolution.model)) {
-						this.#setModelAuthoritatively(resolution.model, "restore");
+					if (!this.model || !modelsAreEqual(this.model, resolvedModel)) {
+						this.#setModelAuthoritatively(resolvedModel, "restore");
 					}
 					await this.#syncEditToolModeAfterModelChange(previousEditMode);
 					// No thinking-level write here: the recompute below is the single
@@ -24344,7 +24435,8 @@ export class AgentSession {
 				// Switching to another session file must not carry the predecessor's
 				// profile marker or role overrides into the successor; the successor's
 				// own configured model is restored above.
-				if (switchingToDifferentSession) this.#resetSessionScopedModelProfileState();
+				if (switchingToDifferentSession)
+					this.#resetSessionScopedModelProfileState({ preserveDefaultConfiguredChain: recoveredDefaultChain });
 				// Establish the successor's durable session identity only after every
 				// restored state facet is live. Identity-bound extension hooks run below.
 				await this.sessionManager.ensureOnDisk();
@@ -24430,6 +24522,7 @@ export class AgentSession {
 					...previousDeferredSdkFollowUps,
 				]);
 				this.#deferredSdkFollowUps = [];
+				if (recoveredDefaultChainMessage) this.emitNotice("warning", recoveredDefaultChainMessage, "fallback");
 				return true;
 			} catch (error) {
 				if (transitionCleanupCommitted) throw error;
