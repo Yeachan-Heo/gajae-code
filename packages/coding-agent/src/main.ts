@@ -512,7 +512,7 @@ async function applyStartupModelProfilesWithPolicy(
 		(args.preferCachedDefaultProfile === true && defaultProfile !== undefined);
 	const applyConfiguredProfiles = async (): Promise<boolean> => {
 		let applied = true;
-		if (defaultProfile) {
+		if (defaultProfile && !args.session.hasRecoveredDefaultFallbackChain()) {
 			applied =
 				(await applyProfile(defaultProfile, false, {
 					thinkingLevelOverride: args.settings.has("defaultThinkingLevel")
