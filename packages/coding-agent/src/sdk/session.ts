@@ -3728,6 +3728,31 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			extensionsResult.runtime.pendingProviderRegistrations = [];
 		}
 
+		// A startup extension can register the saved model after the initial
+		// recovery lookup. Reconsider the saved chain against that completed
+		// catalog before retaining a durable runtime fallback.
+		if (recoveredSessionDefault && defaultModelEntries.length > 0) {
+			const restoredAfterExtensions = await resolveModelChainWithAuth(
+				defaultModelEntries,
+				modelRegistry,
+				settings,
+				credentialSessionId,
+				{
+					managedFallback: defaultModelEntries.length > 1,
+					canonicalSessionId: providerSessionId,
+					...(persistedProfileOwnsDefault ? { aliasIntent: "preset-equivalent" as const } : {}),
+				},
+			);
+			if (restoredAfterExtensions.model) {
+				model = restoredAfterExtensions.model;
+				recoveredSessionDefault = undefined;
+				startupActiveModelProfile =
+					acceptedInheritedProfileName ??
+					(!hasExplicitModel && acceptedPersistedProfileName ? acceptedPersistedProfileName : undefined);
+				modelFallbackMessage = undefined;
+			}
+		}
+
 		let startupCredentialModelRejected = false;
 		if (startupModelReference && (startupCredentialSelector || startupCredentialProviderMismatch)) {
 			const validated =
