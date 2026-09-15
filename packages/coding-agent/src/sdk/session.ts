@@ -3768,7 +3768,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				model = restoredAfterExtensions.model;
 				if (options.thinkingLevel !== undefined) {
 					thinkingLevel = resolveThinkingLevelForModel(model, options.thinkingLevel);
-				} else if (restoredThinkingLevel === undefined) {
+				} else if (restoredThinkingLevel !== undefined && restoredThinkingLevel !== ThinkingLevel.Inherit) {
+					thinkingLevel = resolveThinkingLevelForModel(model, restoredThinkingLevel);
+				} else {
 					thinkingLevel = restoredAfterExtensions.explicitThinkingLevel
 						? restoredAfterExtensions.thinkingLevel
 						: undefined;
