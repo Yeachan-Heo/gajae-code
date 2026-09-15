@@ -741,12 +741,25 @@ function registryModelMetadataWithoutApiSpecificFields(model: Model<Api>): Parti
 }
 
 export function registrySelectorResolvesToModel(selector: string, models: readonly Model<Api>[]): boolean {
-	if (models.some(model => model.id === selector || `${model.provider}/${model.id}` === selector)) return true;
-	const suffix = splitSelectorThinkingSuffix(selector);
-	const baseSelector = suffix.thinkingLevel === undefined ? selector : suffix.selector;
+	const normalizedSelector = selector.trim().toLowerCase();
+	if (
+		models.some(
+			model =>
+				model.id.toLowerCase() === normalizedSelector ||
+				`${model.provider}/${model.id}`.toLowerCase() === normalizedSelector,
+		)
+	)
+		return true;
+	const suffix = splitSelectorThinkingSuffix(normalizedSelector);
+	const baseSelector = suffix.thinkingLevel === undefined ? normalizedSelector : suffix.selector;
 	const parsed = parseModelString(baseSelector);
-	if (parsed) return models.some(model => model.provider === parsed.provider && model.id === parsed.id);
-	return models.some(model => model.id === baseSelector || model.id.endsWith(`/${baseSelector}`));
+	if (parsed)
+		return models.some(
+			model => model.provider.toLowerCase() === parsed.provider && model.id.toLowerCase() === parsed.id,
+		);
+	return models.some(
+		model => model.id.toLowerCase() === baseSelector || model.id.toLowerCase().endsWith(`/${baseSelector}`),
+	);
 }
 
 function filterMaterializedRegistryProfiles(
