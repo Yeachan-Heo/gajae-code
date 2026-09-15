@@ -928,6 +928,58 @@ test("ACP does not retry a first-turn prompt_failed once the turn executed a too
 	}
 });
 
+test("ACP does not retry a first-turn prompt_failed once the turn published assistant output (review P1)", async () => {
+	const fixture = await createFixture();
+	try {
+		const pending = prompt(fixture, "first turn streams assistant text then fails");
+		await bounded(fixture.promptDelivered, "first prompt delivery");
+		// The turn started AND streamed an assistant text chunk — published to ACP consumers as
+		// an agent_message_chunk — before failing. Re-submitting is a new, independent turn.prompt,
+		// so its output would be delivered on top of this chunk, duplicating the assistant stream.
+		// It is surfaced with its code, not retried.
+		fixture.sendTerminal({
+			type: "event",
+			sessionId: "prompt-terminal-session",
+			commandId: "prompt-terminal-command",
+			turnId: "prompt-terminal-turn",
+			payload: {
+				event: {
+					type: "message_update",
+					message: { role: "assistant", content: [{ type: "text", text: "partial answer before failure" }] },
+					assistantMessageEvent: { type: "text_delta", delta: "partial answer before failure", contentIndex: 0 },
+				},
+			},
+		});
+		// Wait until the chunk is actually delivered to consumers: the retry veto keys on output
+		// having been published, so the failure terminal must arrive after that publication.
+		await waitFor(
+			() =>
+				fixture.updates.some(
+					update =>
+						update.update.sessionUpdate === "agent_message_chunk" &&
+						(update.update as { content: { text: string } }).content.text === "partial answer before failure",
+				),
+			"assistant chunk publication",
+		);
+		fixture.sendFailed("prompt_failed");
+		await expect(bounded(pending, "assistant-output failure settlement")).rejects.toMatchObject({
+			code: "prompt_failed",
+		});
+		// No retry: the prompt was delivered exactly once.
+		expect(fixture.promptDeliveryCount()).toBe(1);
+		// The failed attempt's chunk was delivered to consumers exactly once, never duplicated.
+		expect(
+			fixture.updates.filter(
+				update =>
+					update.update.sessionUpdate === "agent_message_chunk" &&
+					(update.update as { content: { text: string } }).content.text === "partial answer before failure",
+			),
+		).toHaveLength(1);
+	} finally {
+		fixture.dispose();
+	}
+});
+
 test("ACP does not retry a first-turn readiness race after reattaching a session with a prior prompt (issue #5574)", async () => {
 	const fixture = await createFixture({ failBrokerSessionClose: true });
 	try {

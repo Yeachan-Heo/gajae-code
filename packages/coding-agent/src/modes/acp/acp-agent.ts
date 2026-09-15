@@ -224,6 +224,8 @@ type SessionRecord = {
 	promptObservedActivity?: boolean;
 	/** Whether the current prompt attempt executed a tool; reset per attempt, vetoes a first-turn retry that would re-run it. */
 	promptObservedToolExecution?: boolean;
+	/** Whether the current prompt attempt published assistant text/thought output; reset per attempt, vetoes a first-turn retry that would re-emit it. */
+	promptObservedAssistantOutput?: boolean;
 	/** Owner token held across the first-turn retry backoff; a non-owner prompt is rejected as a conflict (review P1). */
 	pendingFirstPromptRetry?: FirstPromptRetryReservation;
 };
@@ -1808,6 +1810,9 @@ export class AcpAgent implements Agent {
 	 *   fingerprint, which a turn rejected before it ever started never has;
 	 * - but NEVER once the turn executed a tool (`promptObservedToolExecution`), so a
 	 *   progressed, side-effecting turn is never re-run as a second turn;
+	 * - but NEVER once the turn published assistant text/thought output
+	 *   (`promptObservedAssistantOutput`), so a re-submit cannot expose duplicated output
+	 *   from both attempts to the live ACP update stream;
 	 * - never once the client has asked to cancel.
 	 */
 	#shouldRetryFirstPrompt(record: SessionRecord, error: unknown, attempt: number): boolean {
@@ -1819,6 +1824,10 @@ export class AcpAgent implements Agent {
 		// turn.prompt, so repeating a tool-executing turn would run the user's instruction and
 		// its side effects a second time (review P1).
 		if (record.promptObservedToolExecution) return false;
+		// Never re-run a turn that already published assistant text/thought output: a re-submit
+		// is a new, independent turn.prompt whose output would be delivered to ACP consumers on
+		// top of the failed attempt's chunks, duplicating or corrupting the assistant stream.
+		if (record.promptObservedAssistantOutput) return false;
 		return error instanceof AcpSdkAdapterError && error.code === "prompt_failed";
 	}
 
@@ -1914,6 +1923,7 @@ export class AcpAgent implements Agent {
 		// observed doing work, never a prior attempt's activity.
 		record.promptObservedActivity = false;
 		record.promptObservedToolExecution = false;
+		record.promptObservedAssistantOutput = false;
 		const { promise: response, resolve, reject } = Promise.withResolvers<PromptResponse>();
 		const waiter: PromptWaiter = {
 			acknowledged: false,
@@ -3374,6 +3384,16 @@ export class AcpAgent implements Agent {
 				notification.update.content.type === "text"
 			)
 				promptOwner.emittedAssistantText += notification.update.content.text;
+			// A live assistant text/thought chunk for this prompt owner has now been exposed to
+			// ACP consumers. Record it so the first-turn readiness retry is vetoed: a re-submit
+			// would deliver a second attempt's output on top of these chunks (issue #5574).
+			if (
+				promptOwner &&
+				event.type !== "agent_failed" &&
+				(notification.update.sessionUpdate === "agent_message_chunk" ||
+					notification.update.sessionUpdate === "agent_thought_chunk")
+			)
+				record.promptObservedAssistantOutput = true;
 			// The prompt rejection carries the sanitized failure diagnostic. Publishing
 			// a second session update after settlement would be stale as soon as the client
 			// starts a replacement turn, and an in-flight transport write cannot be revoked.
