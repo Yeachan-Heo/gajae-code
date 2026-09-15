@@ -24225,6 +24225,7 @@ export class AgentSession {
 				: undefined;
 			let unavailableDefaultChainMessage: string | undefined;
 			let recoveredDefaultChainMessage: string | undefined;
+			let durableDefaultRecoveryError: string | undefined;
 			let transitionCleanupCommitted = false;
 			let exactRetirement: PreparedExactMcpRetirement | undefined;
 
@@ -24309,11 +24310,17 @@ export class AgentSession {
 								profileDefinitions.has(persistedProfileIdentity)
 							? persistedProfileIdentity
 							: undefined;
-				// A cross-file successor may retain only its configured durable profile
-				// identity. Remove predecessor session-only overrides before resolving
-				// useCurrentDefault, so neither its active marker nor delegation roles
-				// influence the successor's default chain.
-				if (switchingToDifferentSession)
+				// Keep a durable profile's existing runtime layer when the successor
+				// resolves to that same profile. A cross-file transition has no separate
+				// profile activation to reinstall its role and delegation bindings. Any
+				// session-only or different predecessor profile must still be removed
+				// before resolving the successor's default chain.
+				const retainsDurableProfileLayer =
+					switchingToDifferentSession &&
+					targetActiveModelProfile !== undefined &&
+					targetActiveModelProfile === configuredProfileIdentity &&
+					liveProfileIdentity === targetActiveModelProfile;
+				if (switchingToDifferentSession && !retainsDurableProfileLayer)
 					this.#resetSessionScopedModelProfileState({
 						preserveDefaultConfiguredChain: true,
 						force: true,
@@ -24401,12 +24408,16 @@ export class AgentSession {
 									recoveredDefaultChainMessage =
 										"Saved session model is no longer registered; restored the durable default preset instead.";
 								}
-							} catch {
-								// A durable default is only a recovery candidate; preserve the saved-chain failure.
+							} catch (error) {
+								// The saved chain remains authoritative on recovery failure, but the
+								// durable preset's diagnostic is actionable and must not disappear.
+								durableDefaultRecoveryError = error instanceof Error ? error.message : String(error);
 							}
 						}
 						if (!resolvedModel) {
 							unavailableDefaultChainMessage = this.#fallbackExhaustionError(controller);
+							if (durableDefaultRecoveryError)
+								unavailableDefaultChainMessage += `; durable default preset recovery failed: ${durableDefaultRecoveryError}`;
 							throw new Error(unavailableDefaultChainMessage);
 						}
 					}
