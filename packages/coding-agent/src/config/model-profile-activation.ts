@@ -656,7 +656,9 @@ export async function resolveMissingSessionModelRecovery(options: {
 	const savedConcreteDefaultMissingFromCatalog =
 		savedConcreteDefault === undefined ||
 		!fullCatalog.some(
-			model => model.provider === savedConcreteDefault.provider && model.id === savedConcreteDefault.id,
+			model =>
+				model.provider.toLowerCase() === savedConcreteDefault.provider.toLowerCase() &&
+				model.id.toLowerCase() === savedConcreteDefault.id.toLowerCase(),
 		);
 	const durableProfile = options.settings.get("modelProfile.default");
 	if (!savedSelectorsMissingFromCatalog || !savedConcreteDefaultMissingFromCatalog || !durableProfile)
