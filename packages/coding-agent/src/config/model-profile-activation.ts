@@ -1890,3 +1890,27 @@ export async function activateModelProfile(
 	const prepared = await prepareModelProfileActivation(options);
 	await applyPreparedModelProfileActivation(prepared, applyOptions);
 }
+
+/** Install only a profile's runtime role layer, preserving session model and configured-chain intent. */
+export async function applyModelProfileRuntimeBindings(options: PrepareModelProfileActivationOptions): Promise<void> {
+	const prepared = await prepareModelProfileActivation(options);
+	try {
+		prepared.settings.override("modelRoles", {
+			...prepared.baseModelRoles,
+			...prepared.modelRoles,
+		});
+		prepared.settings.override("task.agentModelOverrides", {
+			...prepared.baseAgentModelOverrides,
+			...prepared.agentModelOverrides,
+		});
+		prepared.session.setActiveModelProfile?.(prepared.profileName);
+		prepared.session.noteProfileInstalledOverrides?.(
+			Object.keys(prepared.modelRoles),
+			Object.keys(prepared.agentModelOverrides),
+			prepared.previousModel,
+		);
+		await prepared.session.syncEagerDelegation?.();
+	} finally {
+		restoreCanonicalVariant(prepared.modelRegistry, prepared.session.sessionId, prepared.previousCanonicalVariant);
+	}
+}
