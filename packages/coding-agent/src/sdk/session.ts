@@ -3753,10 +3753,23 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					...(persistedProfileOwnsDefault ? { aliasIntent: "preset-equivalent" as const } : {}),
 				},
 			);
-			if (restoredAfterExtensions.model) {
+			if (
+				restoredAfterExtensions.model &&
+				(!preferredCredentialProvider || restoredAfterExtensions.model.provider === preferredCredentialProvider)
+			) {
 				model = restoredAfterExtensions.model;
-				if (restoredThinkingLevel === undefined && restoredAfterExtensions.explicitThinkingLevel) {
-					thinkingLevel = resolveThinkingLevelForModel(model, restoredAfterExtensions.thinkingLevel);
+				if (restoredThinkingLevel === undefined) {
+					thinkingLevel = restoredAfterExtensions.explicitThinkingLevel
+						? restoredAfterExtensions.thinkingLevel
+						: undefined;
+					if (thinkingLevel === undefined && !hasExplicitModel && defaultRoleSpec.explicitThinkingLevel)
+						thinkingLevel = defaultRoleSpec.thinkingLevel;
+					if (thinkingLevel === undefined && hasExplicitDefaultThinkingLevel)
+						thinkingLevel = settings.get("defaultThinkingLevel");
+					if (thinkingLevel === undefined && model.thinking?.defaultLevel !== undefined)
+						thinkingLevel = model.thinking.defaultLevel;
+					if (thinkingLevel === undefined) thinkingLevel = settings.get("defaultThinkingLevel");
+					thinkingLevel = resolveThinkingLevelForModel(model, thinkingLevel);
 				}
 				recoveredSessionDefault = undefined;
 				startupActiveModelProfile =

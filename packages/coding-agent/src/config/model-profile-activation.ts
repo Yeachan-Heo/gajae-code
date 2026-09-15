@@ -1909,7 +1909,14 @@ export async function applyModelProfileRuntimeBindings(options: PrepareModelProf
 			Object.keys(prepared.agentModelOverrides),
 			prepared.previousModel,
 		);
-		await prepared.session.syncEagerDelegation?.();
+		try {
+			await prepared.session.syncEagerDelegation?.();
+		} catch (error) {
+			logger.warn("Failed to sync eager delegation after recovered profile runtime bindings", {
+				profile: prepared.profileName,
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
 	} finally {
 		restoreCanonicalVariant(prepared.modelRegistry, prepared.session.sessionId, prepared.previousCanonicalVariant);
 	}
