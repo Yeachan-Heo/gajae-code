@@ -1976,6 +1976,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					entries: string[];
 					profileName: string;
 					activeIndex: number;
+					thinkingLevel?: ThinkingLevel;
+					explicitThinkingLevel: boolean;
 					skips: Array<{ selector: string; reason: string }>;
 			  }
 			| undefined;
@@ -2053,6 +2055,14 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			hasExistingSession && hasThinkingEntry ? parseThinkingLevel(existingSession.thinkingLevel) : undefined;
 		if (thinkingLevel === undefined && restoredThinkingLevel !== ThinkingLevel.Inherit) {
 			thinkingLevel = restoredThinkingLevel;
+		}
+
+		if (
+			thinkingLevel === undefined &&
+			restoredThinkingLevel === undefined &&
+			recoveredSessionDefault?.explicitThinkingLevel
+		) {
+			thinkingLevel = recoveredSessionDefault.thinkingLevel;
 		}
 
 		if (thinkingLevel === undefined && !hasExplicitModel && defaultRoleSpec.explicitThinkingLevel) {
@@ -3745,6 +3755,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			);
 			if (restoredAfterExtensions.model) {
 				model = restoredAfterExtensions.model;
+				if (restoredThinkingLevel === undefined && restoredAfterExtensions.explicitThinkingLevel) {
+					thinkingLevel = resolveThinkingLevelForModel(model, restoredAfterExtensions.thinkingLevel);
+				}
 				recoveredSessionDefault = undefined;
 				startupActiveModelProfile =
 					acceptedInheritedProfileName ??
