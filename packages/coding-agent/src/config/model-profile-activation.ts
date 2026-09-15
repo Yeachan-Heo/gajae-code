@@ -705,6 +705,16 @@ export async function resolveModelProfileDefaultChain(options: {
 			proxyRoutableProviders,
 		);
 	}
+	await preflightModelProfileRoleBindings({
+		profile,
+		bindings,
+		roleCatalogModels: options.modelRegistry.getAll(),
+		settings: options.settings as Settings,
+		modelRegistry: options.modelRegistry as ModelRegistry,
+		sessionId: "",
+		credentialSessionId: options.credentialSessionId,
+		profileLabel,
+	});
 	if (!bindings.defaultSelector) return { profileName, entries: [] };
 	const defaultChain = normalizeModelSelectorValue(
 		await resolveAndClampSelectorValue(
@@ -999,6 +1009,49 @@ async function resolveAndClampSelectorValue(
 	return clamped.length === 1 && typeof selectorValue === "string" ? clamped[0] : clamped;
 }
 
+/** Resolve every non-default binding under the profile activation contract without installing it. */
+async function preflightModelProfileRoleBindings(options: {
+	profile: ModelProfileDefinition;
+	bindings: ReturnType<typeof resolveProfileBindings>;
+	roleCatalogModels: Model<Api>[];
+	settings: Settings;
+	modelRegistry: ModelRegistry;
+	sessionId: string;
+	credentialSessionId: string;
+	profileLabel: string;
+}): Promise<{
+	modelRoles: Record<string, ModelSelectorValue>;
+	agentModelOverrides: Record<string, ModelSelectorValue>;
+}> {
+	const resolveBindings = async (bindings: Record<string, ModelSelectorValue>) => {
+		const resolved: Record<string, ModelSelectorValue> = {};
+		for (const [role, selectorValue] of Object.entries(bindings) as [
+			GjcModelAssignmentTargetId,
+			ModelSelectorValue,
+		][]) {
+			resolved[role] = await resolveAndClampSelectorValue(
+				selectorValue,
+				options.roleCatalogModels,
+				{
+					settings: options.settings,
+					modelRegistry: options.modelRegistry,
+					sessionId: options.sessionId,
+					credentialSessionId: options.credentialSessionId,
+					aliasIntent: "preset-equivalent",
+					requireQualifiedResolution: requiresQualifiedModelProfileRoleResolution(options.profile),
+				},
+				options.profileLabel,
+				role,
+			);
+		}
+		return resolved;
+	};
+	return {
+		modelRoles: await resolveBindings(options.bindings.modelRoles),
+		agentModelOverrides: await resolveBindings(options.bindings.agentModelOverrides),
+	};
+}
+
 async function concretizeProfileSelectorValue(
 	selectorValue: ModelSelectorValue,
 	prepared: PreparedModelProfileActivation,
@@ -1266,47 +1319,16 @@ export async function prepareModelProfileActivation(
 			throw new Error(`Model profile "${profileLabel}" default selectors did not resolve to an authenticated model`);
 		}
 
-		const modelRoles: Record<string, ModelSelectorValue> = {};
-		for (const [role, selectorValue] of Object.entries(bindings.modelRoles) as [
-			GjcModelAssignmentTargetId,
-			ModelSelectorValue,
-		][]) {
-			modelRoles[role] = await resolveAndClampSelectorValue(
-				selectorValue,
-				roleCatalogModels,
-				{
-					settings: options.settings as Settings,
-					modelRegistry: options.modelRegistry as ModelRegistry,
-					sessionId: options.session.sessionId,
-					credentialSessionId,
-					aliasIntent: "preset-equivalent",
-					requireQualifiedResolution: requiresQualifiedModelProfileRoleResolution(profile),
-				},
-				profileLabel,
-				role,
-			);
-		}
-
-		const agentModelOverrides: Record<string, ModelSelectorValue> = {};
-		for (const [role, selectorValue] of Object.entries(bindings.agentModelOverrides) as [
-			GjcModelAssignmentTargetId,
-			ModelSelectorValue,
-		][]) {
-			agentModelOverrides[role] = await resolveAndClampSelectorValue(
-				selectorValue,
-				roleCatalogModels,
-				{
-					settings: options.settings as Settings,
-					modelRegistry: options.modelRegistry as ModelRegistry,
-					sessionId: options.session.sessionId,
-					credentialSessionId,
-					aliasIntent: "preset-equivalent",
-					requireQualifiedResolution: requiresQualifiedModelProfileRoleResolution(profile),
-				},
-				profileLabel,
-				role,
-			);
-		}
+		const { modelRoles, agentModelOverrides } = await preflightModelProfileRoleBindings({
+			profile,
+			bindings,
+			roleCatalogModels,
+			settings: options.settings as Settings,
+			modelRegistry: options.modelRegistry as ModelRegistry,
+			sessionId: options.session.sessionId,
+			credentialSessionId,
+			profileLabel,
+		});
 
 		return {
 			profileName,

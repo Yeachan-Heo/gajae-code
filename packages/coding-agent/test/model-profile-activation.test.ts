@@ -366,6 +366,27 @@ describe("model profile activation", () => {
 		expect(recovery.entries).toEqual([]);
 	});
 
+	test.each([
+		"user",
+		"registry",
+	] as const)("durable %s profile recovery rejects an unresolved qualified executor when its default resolves", async source => {
+		const profile: ModelProfileDefinition = {
+			name: `${source}-unresolved-executor`,
+			requiredProviders: ["provider-a"],
+			modelMapping: { default: "provider-a/default", executor: "provider-b/missing-executor" },
+			source,
+		};
+
+		await expect(
+			resolveModelProfileDefaultChain({
+				modelRegistry: fakeRegistry({ profiles: [profile] }) as unknown as ModelRegistry,
+				settings: Settings.isolated(),
+				profileName: profile.name,
+				credentialSessionId: "resume-session",
+			}),
+		).rejects.toThrow(/executor selectors do not match any catalog model/);
+	});
+
 	test("durable default recovery ignores an optional mapped provider auth probe failure", async () => {
 		const profile: ModelProfileDefinition = {
 			name: "optional-mapped-provider",
