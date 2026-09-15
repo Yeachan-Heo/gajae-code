@@ -24210,6 +24210,7 @@ export class AgentSession {
 			const previousPendingNextTurnMessages = [...this.#pendingNextTurnMessages];
 			const previousScheduledHiddenNextTurnGeneration = this.#scheduledHiddenNextTurnGeneration;
 			const previousModel = this.model;
+			const previousDefaultFallbackRuntimeState = this.getDefaultFallbackRuntimeState();
 			const previousThinkingLevel = this.#thinkingLevel;
 			const previousActiveModelProfile = this.#activeModelProfile;
 			const previousModelRolesOverride = structuredClone(this.settings.getOverride("modelRoles"));
@@ -24589,7 +24590,7 @@ export class AgentSession {
 				} catch (restoreError) {
 					sessionRestoreError = restoreError;
 				}
-				this.#defaultFallbackController = undefined;
+				this.restoreDefaultFallbackRuntimeState(previousDefaultFallbackRuntimeState);
 				this.#syncAgentSessionId(previousSessionState.sessionId);
 				if (previousModelRolesOverride === undefined) this.settings.clearOverride("modelRoles");
 				else this.settings.override("modelRoles", previousModelRolesOverride);
