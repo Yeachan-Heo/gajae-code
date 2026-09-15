@@ -22,11 +22,13 @@ import {
 	isAuthenticated,
 	kNoAuth,
 	type ModelRegistry,
+	registrySelectorResolvesToModel,
 } from "./model-registry";
 import {
 	formatModelSelectorValue,
 	formatModelString,
 	parseModelString,
+	resolveConfiguredModelPatterns,
 	resolveModelChainWithAuth,
 	resolveModelRoleValue,
 	splitSelectorThinkingSuffix,
@@ -607,6 +609,64 @@ export function getProxyRoutableProviders(profile: ModelProfileDefinition): Read
  */
 export function requiresQualifiedModelProfileRoleResolution(profile: Pick<ModelProfileDefinition, "source">): boolean {
 	return profile.source === "user" || profile.source === "registry";
+}
+
+/** Resolve a removed saved-session default through the durable profile without mutating persistent state. */
+export async function resolveMissingSessionModelRecovery(options: {
+	modelRegistry: PrepareModelProfileActivationOptions["modelRegistry"];
+	settings: Pick<Settings, "get" | "getModelRole">;
+	defaultEntries: readonly string[];
+	skips: Array<{ selector: string; reason: string }>;
+	savedDefault: string | undefined;
+	credentialSessionId: string;
+	aliasIntent?: "preset-equivalent";
+}): Promise<
+	| {
+			profileName: string;
+			entries: string[];
+			model?: Model<Api>;
+			thinkingLevel?: ThinkingLevel;
+			explicitThinkingLevel: boolean;
+			activeIndex: number;
+			skips: Array<{ selector: string; reason: string }>;
+	  }
+	| undefined
+> {
+	const allSelectorsUnknown =
+		options.skips.length === options.defaultEntries.length &&
+		options.skips.every(skip => skip.reason === "unknown_model");
+	if (!allSelectorsUnknown) return undefined;
+	const fullCatalog = options.modelRegistry.getAll();
+	const savedSelectorsMissingFromCatalog = resolveConfiguredModelPatterns(
+		options.defaultEntries,
+		options.settings,
+	).every(selector => {
+		if (
+			resolveModelRoleValue(selector, fullCatalog, {
+				settings: options.settings,
+				modelRegistry: options.modelRegistry,
+				credentialSessionId: options.credentialSessionId,
+				...(options.aliasIntent ? { aliasIntent: options.aliasIntent } : {}),
+			}).model
+		)
+			return false;
+		return !registrySelectorResolvesToModel(selector, fullCatalog);
+	});
+	const savedConcreteDefault = options.savedDefault ? parseModelString(options.savedDefault) : undefined;
+	const savedConcreteDefaultMissingFromCatalog =
+		savedConcreteDefault === undefined ||
+		!fullCatalog.some(
+			model => model.provider === savedConcreteDefault.provider && model.id === savedConcreteDefault.id,
+		);
+	const durableProfile = options.settings.get("modelProfile.default");
+	if (!savedSelectorsMissingFromCatalog || !savedConcreteDefaultMissingFromCatalog || !durableProfile)
+		return undefined;
+	return resolveModelProfileDefaultChain({
+		modelRegistry: options.modelRegistry,
+		settings: options.settings,
+		profileName: durableProfile,
+		credentialSessionId: options.credentialSessionId,
+	});
 }
 
 /** Resolve a durable profile's effective default chain without mutating session or settings state. */
