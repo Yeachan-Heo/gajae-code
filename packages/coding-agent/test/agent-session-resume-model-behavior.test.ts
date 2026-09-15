@@ -118,6 +118,67 @@ describe("AgentSession switchSession resumeModelBehavior", () => {
 		expect(session.model?.id).toBe(opus.id);
 		expect(session.getActiveModelProfile()).toBe("codex-medium");
 	});
+	it("clears predecessor session-only profile roles before resolving a cross-file current default", async () => {
+		const sonnet = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const opus = getBundledModel("anthropic", "claude-opus-4-8")!;
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"modelProfile.default": "opus-codex",
+			"session.resumeModelBehavior": "useCurrentDefault",
+		});
+		const sessionFile = await createPersistedTarget(sonnet, settings);
+		session = new AgentSession({
+			agent: new Agent({ initialState: { model: sonnet, systemPrompt: ["Test"], tools: [], messages: [] } }),
+			sessionManager: SessionManager.create(tempDir.path(), tempDir.path()),
+			settings,
+			modelRegistry,
+		});
+
+		settings.override("modelRoles", { default: `${opus.provider}/${opus.id}` });
+		settings.override("task.agentModelOverrides", { executor: `${opus.provider}/${opus.id}` });
+		session.setActiveModelProfile("codex-medium");
+		session.noteProfileInstalledOverrides(["default"], ["executor"], sonnet);
+
+		expect(await session.switchSession(sessionFile)).toBe(true);
+		expect(session.model?.id).toBe(sonnet.id);
+		expect(session.getActiveModelProfile()).toBe("opus-codex");
+		expect(settings.getOverride("modelRoles")).toEqual({ default: `${sonnet.provider}/${sonnet.id}` });
+		expect(settings.getOverride("task.agentModelOverrides")).toEqual({});
+	});
+
+	it("restores predecessor profile state when target current-default resolution fails", async () => {
+		const sonnet = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const opus = getBundledModel("anthropic", "claude-opus-4-8")!;
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"session.resumeModelBehavior": "useCurrentDefault",
+		});
+		const sessionFile = await createPersistedTarget(sonnet, settings);
+		session = new AgentSession({
+			agent: new Agent({ initialState: { model: sonnet, systemPrompt: ["Test"], tools: [], messages: [] } }),
+			sessionManager: SessionManager.create(tempDir.path(), tempDir.path()),
+			settings,
+			modelRegistry,
+		});
+		const modelRolesOverride = { default: `${opus.provider}/${opus.id}` };
+		const agentOverridesOverride = { executor: `${opus.provider}/${opus.id}` };
+		settings.override("modelRoles", modelRolesOverride);
+		settings.override("task.agentModelOverrides", agentOverridesOverride);
+		session.setActiveModelProfile("codex-medium");
+		session.noteProfileInstalledOverrides(["default"], ["executor"], sonnet);
+		vi.spyOn(modelRegistry, "getAvailable").mockReturnValue([]);
+		vi.spyOn(modelRegistry, "getAll").mockReturnValue([]);
+
+		expect(await session.switchSession(sessionFile)).toBe(false);
+		expect(session.getActiveModelProfile()).toBe("codex-medium");
+		expect(settings.getOverride("modelRoles")).toEqual(modelRolesOverride);
+		expect(settings.getOverride("task.agentModelOverrides")).toEqual(agentOverridesOverride);
+		expect(session.getProfileInstalledOverrideKeys()).toEqual({
+			modelRoles: ["default"],
+			agentModelOverrides: ["executor"],
+		});
+	});
+
 	it("does not recover the durable preset when useCurrentDefault cannot resolve the live default", async () => {
 		const sonnet = getBundledModel("anthropic", "claude-sonnet-4-5")!;
 		const codex = getBundledModel("openai-codex", "gpt-5.6-sol")!;

@@ -16582,9 +16582,10 @@ export class AgentSession {
 	 * configured `modelBindings` (also installed into these two override slots
 	 * once at startup) are not profile-owned and must survive the transition.
 	 */
-	#resetSessionScopedModelProfileState(options?: { preserveDefaultConfiguredChain?: boolean }): void {
+	#resetSessionScopedModelProfileState(options?: { preserveDefaultConfiguredChain?: boolean; force?: boolean }): void {
 		const persistedProfile = this.settings.get("modelProfile.default");
-		if (persistedProfile !== undefined && persistedProfile === this.getActiveModelProfile()) return;
+		if (!options?.force && persistedProfile !== undefined && persistedProfile === this.getActiveModelProfile())
+			return;
 		const hadInstalledKeys =
 			this.#activeProfileInstalledRoles.size > 0 || this.#activeProfileInstalledAgentOverrides.size > 0;
 		if (hadInstalledKeys) {
@@ -24196,6 +24197,13 @@ export class AgentSession {
 			const previousModel = this.model;
 			const previousThinkingLevel = this.#thinkingLevel;
 			const previousActiveModelProfile = this.#activeModelProfile;
+			const previousModelRolesOverride = structuredClone(this.settings.getOverride("modelRoles"));
+			const previousAgentModelOverridesOverride = structuredClone(
+				this.settings.getOverride("task.agentModelOverrides"),
+			);
+			const previousActiveProfileInstalledRoles = new Map(this.#activeProfileInstalledRoles);
+			const previousActiveProfileInstalledAgentOverrides = new Map(this.#activeProfileInstalledAgentOverrides);
+			const previousPreProfileModel = this.#preProfileModel;
 			const previousServiceTier = this.agent.serviceTier;
 			const previousSelectedMCPToolNames = new Set(this.#selectedMCPToolNames);
 			const previousTools = [...this.agent.state.tools];
@@ -24274,12 +24282,6 @@ export class AgentSession {
 
 				const resumeModelBehavior = this.settings.get("session.resumeModelBehavior");
 				const configuredDefaultChain = sessionContext.configuredModelChains.default;
-				const settingsDefaultEntries = normalizeModelSelectorValue(this.settings.getModelRole("default"));
-				const defaultEntries =
-					resumeModelBehavior === "useCurrentDefault"
-						? settingsDefaultEntries
-						: (configuredDefaultChain?.entries ??
-							(sessionContext.models.default ? [sessionContext.models.default] : []));
 				const profileDefinitions = this.#modelRegistry.getModelProfiles?.() ?? new Map<string, unknown>();
 				const configuredProfileName = this.settings.get("modelProfile.default");
 				const configuredProfileIdentity = configuredProfileName
@@ -24293,21 +24295,35 @@ export class AgentSession {
 					: undefined;
 				const targetActiveModelProfile =
 					resumeModelBehavior === "useCurrentDefault"
-						? liveProfileIdentity && profileDefinitions.has(liveProfileIdentity)
-							? liveProfileIdentity
-							: configuredProfileIdentity && profileDefinitions.has(configuredProfileIdentity)
+						? switchingToDifferentSession
+							? configuredProfileIdentity && profileDefinitions.has(configuredProfileIdentity)
 								? configuredProfileIdentity
 								: undefined
+							: liveProfileIdentity && profileDefinitions.has(liveProfileIdentity)
+								? liveProfileIdentity
+								: configuredProfileIdentity && profileDefinitions.has(configuredProfileIdentity)
+									? configuredProfileIdentity
+									: undefined
 						: configuredDefaultChain?.origin === "profile-activation" &&
 								persistedProfileIdentity &&
 								profileDefinitions.has(persistedProfileIdentity)
 							? persistedProfileIdentity
 							: undefined;
-				// The loaded successor must not inherit predecessor profile overrides.
-				// Clear that layer before accepting the successor's durable identity;
-				// otherwise a target matching modelProfile.default makes reset a no-op.
+				// A cross-file successor may retain only its configured durable profile
+				// identity. Remove predecessor session-only overrides before resolving
+				// useCurrentDefault, so neither its active marker nor delegation roles
+				// influence the successor's default chain.
 				if (switchingToDifferentSession)
-					this.#resetSessionScopedModelProfileState({ preserveDefaultConfiguredChain: true });
+					this.#resetSessionScopedModelProfileState({
+						preserveDefaultConfiguredChain: true,
+						force: true,
+					});
+				const settingsDefaultEntries = normalizeModelSelectorValue(this.settings.getModelRole("default"));
+				const defaultEntries =
+					resumeModelBehavior === "useCurrentDefault"
+						? settingsDefaultEntries
+						: (configuredDefaultChain?.entries ??
+							(sessionContext.models.default ? [sessionContext.models.default] : []));
 				this.#activeModelProfile = targetActiveModelProfile;
 				this.#defaultFallbackController = undefined;
 				if (defaultEntries.length > 0) {
@@ -24569,6 +24585,14 @@ export class AgentSession {
 				}
 				this.#defaultFallbackController = undefined;
 				this.#syncAgentSessionId(previousSessionState.sessionId);
+				if (previousModelRolesOverride === undefined) this.settings.clearOverride("modelRoles");
+				else this.settings.override("modelRoles", previousModelRolesOverride);
+				if (previousAgentModelOverridesOverride === undefined)
+					this.settings.clearOverride("task.agentModelOverrides");
+				else this.settings.override("task.agentModelOverrides", previousAgentModelOverridesOverride);
+				this.#activeProfileInstalledRoles = new Map(previousActiveProfileInstalledRoles);
+				this.#activeProfileInstalledAgentOverrides = new Map(previousActiveProfileInstalledAgentOverrides);
+				this.#preProfileModel = previousPreProfileModel;
 				this.#activeModelProfile = previousActiveModelProfile;
 				this.#restoreWorkflowGateEmitter(suspendedWorkflowGateEmitter);
 				this.#rekeyHindsightMemoryForCurrentSessionId();
