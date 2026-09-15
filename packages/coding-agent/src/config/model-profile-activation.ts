@@ -608,6 +608,154 @@ export function requiresQualifiedModelProfileRoleResolution(profile: Pick<ModelP
 	return profile.source === "user" || profile.source === "registry";
 }
 
+/** Resolve a durable profile's effective default chain without mutating session or settings state. */
+export async function resolveModelProfileDefaultChain(options: {
+	modelRegistry: PrepareModelProfileActivationOptions["modelRegistry"];
+	settings: Pick<Settings, "get">;
+	profileName: string;
+	credentialSessionId: string;
+}): Promise<{ profileName: string; entries: string[] }> {
+	const profiles = options.modelRegistry.getModelProfiles();
+	const profileName = validateModelProfileName(options.profileName, profiles, options.modelRegistry.getError?.());
+	const profile = profiles.get(profileName) ?? options.modelRegistry.getModelProfile(profileName)!;
+	const profileLabel = formatModelProfileDisplayLabel(profile);
+	const requiredProviders = aggregateModelProfileRequiredProviders(profile.requiredProviders, profile);
+	const alternativeGroups = profile.alternativeProviderGroups ?? [];
+	const alternativeSet = new Set(alternativeGroups.flat());
+	const requiredProviderSet = new Set(requiredProviders);
+	const authenticatedProviders = new Set<string>();
+	const missingProviders: string[] = [];
+	for (const provider of new Set([
+		...requiredProviders,
+		...alternativeSet,
+		...deriveModelProfileMappedProviders(profile),
+	])) {
+		let apiKey: string | undefined;
+		try {
+			apiKey = await options.modelRegistry.getApiKeyForProvider(provider, options.credentialSessionId);
+		} catch (error) {
+			if (requiredProviderSet.has(provider) && !alternativeSet.has(provider)) throw error;
+			continue;
+		}
+		if (apiKey === kNoAuth || isAuthenticated(apiKey)) authenticatedProviders.add(provider);
+		else if (requiredProviderSet.has(provider)) missingProviders.push(provider);
+	}
+	const proxyProvider = profile.source !== "user" ? resolveProxyProviderId(options.settings) : undefined;
+	const proxyMode = profile.source !== "user" ? resolveProxyMode(options.settings) : "fallback";
+	const proxyRoutableProviders =
+		profile.source === "user"
+			? new Set<string>()
+			: profile.source === "registry"
+				? new Set([
+						...PROXY_ROUTABLE_PROVIDER_IDS,
+						...profile.requiredProviders,
+						...deriveModelProfileMappedProviders(profile),
+					])
+				: PROXY_ROUTABLE_PROVIDER_IDS;
+	if (proxyMode === "always" && proxyProvider === undefined)
+		throw new Error('modelProfile.proxyMode "always" requires modelProfile.proxyProvider');
+	if (proxyProvider !== undefined && !options.modelRegistry.getConfiguredProviderIds?.().includes(proxyProvider)) {
+		throw new Error(
+			`modelProfile.proxyProvider "${proxyProvider}" is not configured. Configure it with \`gjc setup provider\` before activating a preset.`,
+		);
+	}
+	const proxyApiKey =
+		proxyProvider === undefined
+			? undefined
+			: await options.modelRegistry.getApiKeyForProvider(proxyProvider, options.credentialSessionId);
+	const proxyAuthenticated = proxyApiKey !== undefined && (proxyApiKey === kNoAuth || isAuthenticated(proxyApiKey));
+	if (proxyMode === "always" && !proxyAuthenticated)
+		throw new ModelProfileCredentialError(profileLabel, [proxyProvider!]);
+	const strictMissing = missingProviders.filter(
+		provider => !proxyRoutableProviders.has(provider) && !alternativeSet.has(provider),
+	);
+	if (strictMissing.length > 0) throw new ModelProfileCredentialError(profileLabel, strictMissing);
+	const strictRoutableMissing = missingProviders.filter(
+		provider => proxyRoutableProviders.has(provider) && !alternativeSet.has(provider),
+	);
+	if (strictRoutableMissing.length > 0 && !proxyAuthenticated) {
+		throw new ModelProfileCredentialError(
+			profileLabel,
+			proxyProvider === undefined ? strictRoutableMissing : [proxyProvider],
+		);
+	}
+	for (const group of alternativeGroups) {
+		if (group.some(provider => authenticatedProviders.has(provider))) continue;
+		const allRoutable = group.every(provider => proxyRoutableProviders.has(provider));
+		if (allRoutable && proxyAuthenticated) continue;
+		throw new ModelProfileCredentialError(
+			profileLabel,
+			allRoutable && proxyProvider !== undefined ? [proxyProvider] : [...group],
+		);
+	}
+	const availableModels =
+		options.modelRegistry.getAvailableForProfileActivation?.() ??
+		options.modelRegistry.getAvailable?.() ??
+		options.modelRegistry.getAll();
+	let bindings = resolveProfileBindings(profile);
+	if (alternativeGroups.length > 0)
+		bindings = rewriteBindingsProviders(bindings, authenticatedProviders, alternativeGroups);
+	if (proxyProvider !== undefined && proxyAuthenticated && profile.source !== "user") {
+		bindings = rewriteBindingsForProxy(
+			bindings,
+			proxyProvider,
+			proxyMode,
+			availableModels,
+			authenticatedProviders,
+			proxyRoutableProviders,
+		);
+	}
+	if (!bindings.defaultSelector) return { profileName, entries: [] };
+	const defaultChain = normalizeModelSelectorValue(
+		await resolveAndClampSelectorValue(
+			bindings.defaultSelector,
+			availableModels,
+			{
+				settings: options.settings as Settings,
+				modelRegistry: options.modelRegistry as ModelRegistry,
+				sessionId: "",
+				credentialSessionId: options.credentialSessionId,
+				aliasIntent: "preset-equivalent",
+			},
+			profileLabel,
+			"default",
+		),
+	);
+	const entries: string[] = [];
+	for (const selector of defaultChain) {
+		const resolution = await resolveModelChainWithAuth(
+			[selector],
+			{
+				getAvailable: () => availableModels,
+				getApiKey: (model, sessionId) =>
+					options.modelRegistry.getApiKeyForProvider(model.provider, sessionId, model.baseUrl),
+				resolveCanonicalModel: options.modelRegistry.resolveCanonicalModel?.bind(options.modelRegistry),
+				getCanonicalVariants: options.modelRegistry.getCanonicalVariants?.bind(options.modelRegistry),
+				getCanonicalId: options.modelRegistry.getCanonicalId?.bind(options.modelRegistry),
+				resolveModelByLookupAlias: options.modelRegistry.resolveModelByLookupAlias?.bind(options.modelRegistry),
+				lookupAliasExists: options.modelRegistry.lookupAliasExists?.bind(options.modelRegistry),
+				clearCanonicalVariant: options.modelRegistry.clearCanonicalVariant?.bind(options.modelRegistry),
+			} as ModelRegistry,
+			options.settings as Settings,
+			options.credentialSessionId,
+			{
+				managedFallback: true,
+				aliasIntent: "preset-equivalent",
+				canonicalSessionId: null,
+				credentialSessionId: options.credentialSessionId,
+			},
+		);
+		if (!resolution.model) continue;
+		const concreteSelector = `${resolution.model.provider}/${resolution.model.id}`;
+		entries.push(
+			resolution.explicitThinkingLevel && resolution.thinkingLevel
+				? formatModelSelectorValue(concreteSelector, resolution.thinkingLevel)
+				: concreteSelector,
+		);
+	}
+	return { profileName, entries };
+}
+
 export function rewriteSelectorForProxy(
 	selector: string,
 	proxyProvider: string,
