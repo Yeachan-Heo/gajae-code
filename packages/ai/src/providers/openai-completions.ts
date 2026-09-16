@@ -620,6 +620,12 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 		// been consumed since. Both are only meaningful once `repetitionTrip` is set.
 		let repetitionTrippedAt: number | undefined;
 		let repetitionDrainedChunks = 0;
+		// Set immediately before the guard's own abort and nowhere else. The catch
+		// block must be able to tell OUR abort from a provider stall or a transport
+		// failure that merely happened to land inside the drain window: `repetitionTrip`
+		// alone is true for all three, and using it there discarded the real
+		// timeout/transport facts and flipped the retry classification (#5627 review r4).
+		let repetitionSelfAbort = false;
 		const finalizeRepetitionGuardStop = (): void => {
 			if (!repetitionTrip) return;
 			// `error`, not `aborted`: this is a provider-side failure we detected
@@ -982,6 +988,7 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 				const maxChunks = toolCallPending ? REPETITION_DRAIN_PENDING_TOOL_MAX_CHUNKS : REPETITION_DRAIN_MAX_CHUNKS;
 				const maxMs = toolCallPending ? REPETITION_DRAIN_PENDING_TOOL_MAX_MS : REPETITION_DRAIN_MAX_MS;
 				if (repetitionDrainedChunks >= maxChunks || Date.now() - repetitionTrippedAt >= maxMs) {
+					repetitionSelfAbort = true;
 					requestAbortController.abort();
 				}
 			};
@@ -1384,8 +1391,10 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 			for (const block of output.content) delete (block as any).index;
 			// Our own abort landed here. Classify it before the generic transport
 			// path turns it into a retryable provider error. A caller abort still
-			// wins: the user's cancel is the more meaningful intent.
-			if (repetitionTrip && !abortTracker.wasCallerAbort()) {
+			// wins: the user's cancel is the more meaningful intent. Keyed on the
+			// self-abort flag, not on `repetitionTrip`: a stall or transport error
+			// during the drain window must keep its own facts.
+			if (repetitionSelfAbort && !abortTracker.wasCallerAbort()) {
 				finalizeRepetitionGuardStop();
 				return;
 			}

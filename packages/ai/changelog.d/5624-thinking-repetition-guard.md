@@ -20,6 +20,12 @@
   false }`), because visible output is a deliverable and intentional repetition
   there — log dumps, fixtures, tables, generated code — must survive byte for
   byte.
+- Keep a provider stall or transport error that lands *after* a repetition trip
+  classified as what it actually is. The guard drains the stream briefly after
+  tripping, and a fault arriving inside that window was being reported as a
+  decode loop — discarding the real error message, `errorStatus` and
+  `transportFailure`, and marking a retryable provider fault as terminal. The
+  guard's own abort is now tracked explicitly, so only it claims the trip.
 - Strip leaked chat-template tool fences (`<|tool_call_end|>` and friends) from
   rendered thinking, including fences split across streaming chunk boundaries.
   The visible text channel is deliberately untouched, so a fence token the

@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import { streamOpenAICompletions } from "../src/providers/openai-completions";
 import type { AssistantMessage, Context, Model, TextContent, ThinkingContent, ToolCall } from "../src/types";
+import { REPETITION_GUARD_ERROR_CODE } from "../src/utils/stream-repetition-guard";
 
 const originalFetch = global.fetch;
 
@@ -49,12 +50,27 @@ interface DeliveryState {
 }
 
 /**
+ * What the upstream does once every event has been delivered. `close` is the
+ * healthy end of stream; the other two are the faults that can land *inside* the
+ * post-trip drain window and must keep their own classification (#5627).
+ */
+type StreamEnding = "close" | "stall" | "error";
+
+/** Status carried by the `error` ending, so transport facts are observable. */
+const UPSTREAM_ERROR_STATUS = 503;
+const UPSTREAM_ERROR_MESSAGE = "upstream connection reset";
+
+/**
  * Serves the events one at a time through a real `ReadableStream` so the
  * consumer's backpressure — and its abort — are observable. A pre-buffered
  * `Response` would hand over every event before the guard could ever cut the
  * stream short, which is exactly the property under test.
  */
-function streamingFetch(events: ReadonlyArray<SseChunk | "[DONE]">, state: DeliveryState): typeof fetch {
+function streamingFetch(
+	events: ReadonlyArray<SseChunk | "[DONE]">,
+	state: DeliveryState,
+	ending: StreamEnding = "close",
+): typeof fetch {
 	const fn = async (_input: unknown, init?: { signal?: AbortSignal }): Promise<Response> => {
 		const signal = init?.signal;
 		const encoder = new TextEncoder();
@@ -72,6 +88,17 @@ function streamingFetch(events: ReadonlyArray<SseChunk | "[DONE]">, state: Deliv
 			pull(controller) {
 				if (signal?.aborted) return;
 				if (index >= events.length) {
+					if (ending === "error") {
+						controller.error(Object.assign(new Error(UPSTREAM_ERROR_MESSAGE), { status: UPSTREAM_ERROR_STATUS }));
+						return;
+					}
+					if (ending === "stall") {
+						// Never settles: the body goes quiet without closing, which is
+						// what a hung provider looks like to the idle watchdog. The
+						// drain window cannot close itself here — it is evaluated once
+						// per consumed chunk, and no chunk is coming.
+						return new Promise<void>(() => {});
+					}
 					controller.close();
 					return;
 				}
@@ -151,6 +178,62 @@ describe("chat-completions: streamed repetition guard (#5624)", () => {
 		expect(result.transportFailure).toBeUndefined();
 		// The guard cut the upstream stream instead of draining all 100 events.
 		expect(state.delivered).toBeLessThan(100);
+	});
+
+	// The drain window keeps the stream open after a trip, so a provider fault can
+	// land inside it. Keying the catch on `repetitionTrip` classified those faults
+	// as decode loops, dropping the real message/status and flipping the session's
+	// retry decision to terminal. The guard's own abort is now tracked separately.
+	//
+	// Timings: the 20 repeats below deliver in ~5ms, so a 400ms idle timeout is
+	// ~80x clear of delivery and ~5x inside the 2000ms drain window. The drain
+	// cannot pre-empt the stall regardless — it is evaluated once per consumed
+	// chunk, and during a stall no chunk arrives.
+	const STALL_IDLE_TIMEOUT_MS = 400;
+
+	/** 20 > THRESHOLD, so the guard trips at 12 and 8 chunks drain before the fault. */
+	function repeatsBeforeFault(): Array<SseChunk | "[DONE]"> {
+		const events: Array<SseChunk | "[DONE]"> = [];
+		for (let i = 0; i < 20; i++) events.push(chunk({ reasoning_content: `${SENTENCE}\n` }));
+		return events;
+	}
+
+	it("keeps the stall classification when the provider hangs after a trip", async () => {
+		const state: DeliveryState = { delivered: 0 };
+		global.fetch = streamingFetch(repeatsBeforeFault(), state, "stall");
+
+		const result = await streamOpenAICompletions(model(), context(), {
+			apiKey: "test",
+			streamIdleTimeoutMs: STALL_IDLE_TIMEOUT_MS,
+			streamFirstEventTimeoutMs: 5_000,
+		}).result();
+
+		// Non-vacuity: the guard really did trip, so the catch genuinely had a
+		// `repetitionTrip` set and still refused to claim the failure.
+		expect(countOccurrences(thinkingText(result), SENTENCE)).toBe(THRESHOLD);
+		expect(result.stopReason).toBe("error");
+		expect(result.errorCode).not.toBe(REPETITION_GUARD_ERROR_CODE);
+		expect(result.errorCode).toBeUndefined();
+		expect(result.errorMessage).toContain("stalled while waiting for the next event");
+	});
+
+	it("keeps the transport facts when the stream errors after a trip", async () => {
+		const state: DeliveryState = { delivered: 0 };
+		global.fetch = streamingFetch(repeatsBeforeFault(), state, "error");
+
+		const result = await streamOpenAICompletions(model(), context(), {
+			apiKey: "test",
+			streamIdleTimeoutMs: 60_000,
+		}).result();
+
+		expect(countOccurrences(thinkingText(result), SENTENCE)).toBe(THRESHOLD);
+		expect(result.stopReason).toBe("error");
+		expect(result.errorCode).not.toBe(REPETITION_GUARD_ERROR_CODE);
+		expect(result.errorCode).toBeUndefined();
+		// The facts the guard classification used to discard.
+		expect(result.transportFailure).toBeDefined();
+		expect(result.errorStatus).toBe(UPSTREAM_ERROR_STATUS);
+		expect(result.errorMessage).toContain(UPSTREAM_ERROR_MESSAGE);
 	});
 
 	// A repetition stop must not squat on the wire that means "the user cancelled":
