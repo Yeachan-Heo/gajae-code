@@ -24,6 +24,49 @@ const UNCERTAINTY_RETRY_DELAY_MS = 1_000;
  */
 export const DEADLINE_FLUSH_TIMEOUT_MS = 10_000;
 
+/**
+ * Run a best-effort durability flush under a hard real-time bound that ALWAYS
+ * settles, and never let its result reach the caller.
+ *
+ * Shared by both expiry paths — this manager and the notification bus's own
+ * terminalization (#5583) — so there is one bound, one abort, and one warning,
+ * with no drift between them. A rejection is swallowed; a `run` that never
+ * settles is abandoned after `timeoutMs` with its signal aborted so any git
+ * subprocess dies. The signal alone is not sufficient: `git.withRepoLock`
+ * awaits its predecessor before honouring it, so a hung predecessor in the
+ * per-repo write chain is cut only by this outer race.
+ */
+export async function runBoundedDeadlineFlush(
+	run: (signal: AbortSignal) => unknown,
+	timeoutMs: number = DEADLINE_FLUSH_TIMEOUT_MS,
+): Promise<void> {
+	const controller = new AbortController();
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	// An async wrapper so a `run` that throws synchronously becomes a rejection.
+	const flushed = (async () => {
+		await run(controller.signal);
+	})();
+	// The abandoned promise may still reject long after we stop awaiting it.
+	flushed.catch(() => {});
+	try {
+		const bound = new Promise<"timeout">(resolve => {
+			timer = setTimeout(() => resolve("timeout"), timeoutMs);
+			// Never let a pending bound keep the process alive.
+			(timer as unknown as { unref?: () => void }).unref?.();
+		});
+		if ((await Promise.race([flushed.then(() => "flushed" as const), bound])) === "timeout") {
+			controller.abort(new Error(`prompt deadline flush exceeded ${timeoutMs}ms`));
+			logger.warn(
+				`sdk: prompt deadline flush exceeded its ${timeoutMs}ms bound; abandoning it and continuing teardown`,
+			);
+		}
+	} catch {
+		// A failing flush never changes the deadline outcome.
+	} finally {
+		if (timer !== undefined) clearTimeout(timer);
+	}
+}
+
 type DeadlineReconciliation = InvocationReconciliation | KindAwareReconciliation;
 
 export type PromptDeadlineOutcome = Extract<SdkPromptTerminalOutcome, { kind: "failed" }> & {
@@ -92,38 +135,11 @@ export class PromptDeadlineManager {
 		this.#deadlineFlushTimeoutMs = options.deadlineFlushTimeoutMs ?? DEADLINE_FLUSH_TIMEOUT_MS;
 	}
 
-	/**
-	 * Run the durability hook under a hard real-time bound that ALWAYS settles.
-	 * A rejection is swallowed as before; a hook that never settles is abandoned
-	 * after the bound, with its signal aborted so any git subprocess dies, so the
-	 * caller can retire ownership immediately.
-	 */
+	/** Run the durability hook under the shared bound; see `runBoundedDeadlineFlush`. */
 	async #runDeadlineFlush(correlation: InvocationCorrelation): Promise<void> {
 		const hook = this.#onDeadlineExceeded;
 		if (hook === undefined) return;
-		const controller = new AbortController();
-		let timer: ReturnType<typeof setTimeout> | undefined;
-		// An async wrapper so a hook that throws synchronously becomes a rejection.
-		const flushed = (async () => hook(correlation, controller.signal))();
-		// The abandoned promise may still reject long after we stop awaiting it.
-		flushed.catch(() => {});
-		try {
-			const bound = new Promise<"timeout">(resolve => {
-				timer = setTimeout(() => resolve("timeout"), this.#deadlineFlushTimeoutMs);
-				// Never let a pending bound keep the process alive.
-				(timer as unknown as { unref?: () => void }).unref?.();
-			});
-			if ((await Promise.race([flushed.then(() => "flushed" as const), bound])) === "timeout") {
-				controller.abort(new Error(`prompt deadline flush exceeded ${this.#deadlineFlushTimeoutMs}ms`));
-				logger.warn(
-					`sdk: prompt deadline flush exceeded its ${this.#deadlineFlushTimeoutMs}ms bound; abandoning it and continuing teardown`,
-				);
-			}
-		} catch {
-			// A failing hook never changes the deadline outcome.
-		} finally {
-			if (timer !== undefined) clearTimeout(timer);
-		}
+		await runBoundedDeadlineFlush(signal => hook(correlation, signal), this.#deadlineFlushTimeoutMs);
 	}
 
 	#clearTimer(key: string): void {
