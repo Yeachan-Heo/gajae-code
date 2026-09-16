@@ -1038,6 +1038,70 @@ test("ACP does not retry a mid-task prompt_failed after the turn emitted partial
 	}
 });
 
+test("ACP does not retry a mid-task prompt_failed whose terminal carried finalText (review P1)", async () => {
+	const fixture = await createFixture();
+	try {
+		// First turn completes normally, moving the session past its first prompt.
+		const first = prompt(fixture, "first turn ok");
+		await bounded(fixture.promptDelivered, "first prompt delivery");
+		fixture.sendStopped("end_turn");
+		expect(await bounded(first, "first turn settlement")).toEqual({ stopReason: "end_turn" });
+
+		// The mid-task turn starts and streams NOTHING, then fails with its partial answer riding
+		// the terminal as `finalText`. That text publishes asynchronously, after the settlement the
+		// retry gate runs on — so unless it is recorded at terminal capture the turn looks silent
+		// and gets re-submitted, leaving the client this answer AND the retry's reply.
+		const second = prompt(fixture, "mid-task turn answers only on the terminal");
+		await waitFor(() => fixture.promptDeliveryCount() === 2, "second prompt delivery");
+		fixture.sendTerminal({
+			type: "agent_start",
+			sessionId: "prompt-terminal-session",
+			commandId: "prompt-terminal-command-2",
+			turnId: "prompt-terminal-turn-2",
+		});
+		fixture.sendTerminal({
+			type: "agent_failed",
+			sessionId: "prompt-terminal-session",
+			commandId: "prompt-terminal-command-2",
+			turnId: "prompt-terminal-turn-2",
+			outcome: {
+				kind: "failed",
+				code: "prompt_failed",
+				message: "failure with final text",
+				provenance: "agent_failed",
+			},
+			finalText: "partial answer before failure",
+		});
+		await expect(bounded(second, "terminal finalText failure settlement")).rejects.toMatchObject({
+			code: "prompt_failed",
+		});
+		// No re-submit: the third delivery never happens.
+		expect(fixture.promptDeliveryCount()).toBe(2);
+		// The terminal's text still reaches the client — exactly once, with no retry output after it.
+		await waitFor(
+			() =>
+				fixture.updates.some(
+					update =>
+						update.update.sessionUpdate === "agent_message_chunk" &&
+						update.update.content.type === "text" &&
+						update.update.content.text === "partial answer before failure",
+				),
+			"terminal final text publication",
+		);
+		expect(
+			fixture.updates.filter(
+				update =>
+					update.update.sessionUpdate === "agent_message_chunk" &&
+					update.update.content.type === "text" &&
+					update.update.content.text === "partial answer before failure",
+			),
+		).toHaveLength(1);
+		expect(fixture.promptDeliveryCount()).toBe(2);
+	} finally {
+		fixture.dispose();
+	}
+});
+
 test("ACP rejects a concurrent prompt while the mid-task retry owns the session (review P1)", async () => {
 	const fixture = await createFixture();
 	try {

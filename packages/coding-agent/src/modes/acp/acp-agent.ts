@@ -1897,10 +1897,13 @@ export class AcpAgent implements Agent {
 	 *   user's instruction and its non-idempotent side effects a second time. The first-turn
 	 *   retry vetoes that for the same reason; recovery is worth nothing if it double-applies
 	 *   effects the failed turn already committed (review P1).
-	 * - and NEVER once the turn published assistant or thought content
-	 *   (`promptObservedAssistantContent`). Those chunks are already rendered in the client's
-	 *   transcript and cannot be revoked, so the retry's own output would append to a partial
-	 *   reply rather than replace it, leaving the user a duplicated, garbled turn (review P1).
+	 * - and NEVER once the turn produced assistant or thought content
+	 *   (`promptObservedAssistantContent`), whether streamed as chunks or carried on the terminal
+	 *   as `finalText`. That content is — or is about to be — rendered in the client's transcript
+	 *   and cannot be revoked, so the retry's own output would append to a partial reply rather
+	 *   than replace it, leaving the user a duplicated, garbled turn (review P1). Terminal
+	 *   `finalText` counts even though it publishes asynchronously after settlement: it is
+	 *   recorded at terminal capture, before this gate runs.
 	 * - never once the client has asked to cancel;
 	 * - at most one re-submit (`ACP_MID_TASK_PROMPT_MAX_RETRIES`).
 	 */
@@ -3411,6 +3414,15 @@ export class AcpAgent implements Agent {
 				return;
 			}
 			activePrompt.terminal = { outcome, correlation };
+			// A terminal can carry `finalText`, which `#scheduleTerminalUpdates` publishes
+			// asynchronously — after the settlement below has already rejected the waiter and the
+			// retry gate has run. Record it as observed content NOW, or a failed turn whose only
+			// output rode the terminal looks silent, gets re-submitted, and the client ends up with
+			// that original partial answer followed by the retry's reply (review P1).
+			if (typeof event.finalText === "string" && event.finalText.length > 0) {
+				activePrompt.observedAssistantContent = true;
+				record.promptObservedAssistantContent = true;
+			}
 			// Failure diagnostics are useful but advisory. Settle before any mapped
 			// session update can await a backpressured client transport; otherwise an
 			// already-decided failure can still lose to the inactivity watchdog.
