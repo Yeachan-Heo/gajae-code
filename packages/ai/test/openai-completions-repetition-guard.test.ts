@@ -191,6 +191,39 @@ describe("chat-completions: streamed repetition guard (#5624)", () => {
 		expect(result.stopReason).toBe("aborted");
 	});
 
+	it("keeps tool-call frames that arrive after the guard has already tripped", async () => {
+		const state: DeliveryState = { delivered: 0 };
+		const events: Array<SseChunk | "[DONE]"> = [];
+		// Enough repeats to trip the guard *before* the model gets round to its
+		// tool call — the ordering the original abort-on-trip dropped (#5627).
+		for (let i = 0; i < 14; i++) events.push(chunk({ reasoning_content: `${SENTENCE}\n` }));
+		events.push(
+			chunk({
+				tool_calls: [
+					{ index: 0, id: "call_1", type: "function", function: { name: "read", arguments: '{"path":' } },
+				],
+			}),
+			chunk({ tool_calls: [{ index: 0, function: { arguments: '"late.ts"}' } }] }),
+		);
+		for (let i = 0; i < 100; i++) events.push(chunk({ reasoning_content: `${SENTENCE}\n` }));
+		events.push(chunk({}, "stop"), "[DONE]");
+		global.fetch = streamingFetch(events, state);
+
+		const result = await streamOpenAICompletions(model(), context(), { apiKey: "test" }).result();
+
+		const toolCalls = result.content.filter((block): block is ToolCall => block.type === "toolCall");
+		expect(toolCalls).toHaveLength(1);
+		expect(toolCalls[0].name).toBe("read");
+		expect(toolCalls[0].arguments).toEqual({ path: "late.ts" });
+		// Draining for the tool call must not re-open the emit path: the repeats
+		// that kept streaming during the drain are still not rendered.
+		expect(countOccurrences(thinkingText(result), SENTENCE)).toBeLessThanOrEqual(THRESHOLD);
+		expect(result.stopReason).toBe("aborted");
+		expect(result.errorCode).toBe("repetition_guard_tripped");
+		// The drain window is bounded — the stream was still cut short.
+		expect(state.delivered).toBeLessThan(events.length);
+	});
+
 	it("strips leaked tool fences from rendered thinking", async () => {
 		const state: DeliveryState = { delivered: 0 };
 		global.fetch = streamingFetch(

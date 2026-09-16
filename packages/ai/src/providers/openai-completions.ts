@@ -532,6 +532,20 @@ const OPENAI_COMPLETIONS_EMPTY_RESPONSE_MESSAGE = "Provider returned an empty re
 const OPENAI_COMPLETIONS_NETWORK_ERROR_RETRY_MAX_RETRIES = 3;
 const OPENAI_COMPLETIONS_NETWORK_ERROR_RETRY_BASE_DELAY_MS = 2000;
 
+// A tripped repetition guard stops *emitting* immediately, so the user-visible
+// symptom is already fixed at the trip. Aborting the stream right then would
+// also drop `tool_calls` frames a provider emits *after* the repeats, losing a
+// valid invocation (#5627). The stream is drained for a bounded window instead;
+// the only thing the abort still buys is not burning provider budget, and that
+// can wait this long.
+const REPETITION_DRAIN_MAX_CHUNKS = 64;
+const REPETITION_DRAIN_MAX_MS = 2_000;
+// A tool call whose accumulated arguments are not yet complete JSON is worth
+// waiting longer for — but not forever, or a call whose arguments never
+// complete would hold the stream open for the rest of the turn's budget.
+const REPETITION_DRAIN_PENDING_TOOL_MAX_CHUNKS = 256;
+const REPETITION_DRAIN_PENDING_TOOL_MAX_MS = 8_000;
+
 function hasReplayUnsafeOpenAICompletionsDelta(chunk: ChatCompletionChunk): boolean {
 	const choice = Array.isArray(chunk.choices) ? chunk.choices[0] : undefined;
 	const delta = choice?.delta;
@@ -589,6 +603,10 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 		// Declared outside the try so the catch block — which is where the abort
 		// below lands — can tell a runaway-repetition stop from a transport error.
 		let repetitionTrip: (StreamRepetitionTrip & { channel: "text" | "thinking" }) | undefined;
+		// Drain-window bookkeeping: when the trip happened, and how many chunks have
+		// been consumed since. Both are only meaningful once `repetitionTrip` is set.
+		let repetitionTrippedAt: number | undefined;
+		let repetitionDrainedChunks = 0;
 		const finalizeRepetitionGuardStop = (): void => {
 			if (!repetitionTrip) return;
 			// `aborted` rather than a new StopReason: the turn really was cut short
@@ -900,12 +918,35 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 			const thinkingRepetitionGuard = new StreamRepetitionGuard();
 			const noteRepetitionTrip = (guard: StreamRepetitionGuard, channel: "text" | "thinking") => {
 				// `takeTrip()` latches once per guard; this latches once per request,
-				// so the abort below fires exactly once no matter which channel loops.
+				// so the drain window below opens exactly once no matter which
+				// channel loops.
 				if (repetitionTrip) return;
 				const trip = guard.takeTrip();
 				if (!trip) return;
 				repetitionTrip = { ...trip, channel };
-				requestAbortController.abort();
+				// Deliberately no abort here — see the REPETITION_DRAIN_* constants.
+				// The main loop closes the window once late tool-call frames have had
+				// their chance to land.
+				repetitionTrippedAt = Date.now();
+				repetitionDrainedChunks = 0;
+			};
+			/**
+			 * Closes the post-trip drain window. Called once per consumed chunk after
+			 * that chunk is fully processed, so the frames it carried are finalized
+			 * before the stream is cut.
+			 */
+			const maybeAbortAfterRepetitionDrain = (): void => {
+				if (repetitionTrippedAt === undefined || requestSignal.aborted) return;
+				// Reuses the `stopReason === "length"` truncation check below: an open
+				// tool call whose `partialArgs` will not parse is still mid-flight.
+				const toolCallPending =
+					currentBlock?.type === "toolCall" &&
+					!isCompleteJson((currentBlock as { partialArgs?: string }).partialArgs);
+				const maxChunks = toolCallPending ? REPETITION_DRAIN_PENDING_TOOL_MAX_CHUNKS : REPETITION_DRAIN_MAX_CHUNKS;
+				const maxMs = toolCallPending ? REPETITION_DRAIN_PENDING_TOOL_MAX_MS : REPETITION_DRAIN_MAX_MS;
+				if (repetitionDrainedChunks >= maxChunks || Date.now() - repetitionTrippedAt >= maxMs) {
+					requestAbortController.abort();
+				}
 			};
 
 			// Reasoning-channel only — a fence token in visible prose must survive
@@ -1054,6 +1095,9 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 			};
 
 			for await (const chunk of iterateWithNetworkErrorRetry()) {
+				// Counted before the early `continue`s below so chunks carrying no
+				// delta still spend the drain budget rather than extending it.
+				if (repetitionTrippedAt !== undefined) repetitionDrainedChunks += 1;
 				if (!chunk || typeof chunk !== "object") continue;
 
 				// OpenAI documents ChatCompletionChunk.id as the unique chat completion identifier,
@@ -1198,6 +1242,11 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 						}
 					}
 				}
+
+				// This chunk is fully processed — anything it carried (including
+				// `tool_calls` frames) has landed. Only now may the drain window
+				// close and cut the stream.
+				maybeAbortAfterRepetitionDrain();
 			}
 
 			if (parseMiniMaxThinkTags && taggedTextBuffer.length > 0) {
