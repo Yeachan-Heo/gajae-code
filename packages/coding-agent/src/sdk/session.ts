@@ -3814,7 +3814,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 							? recovery.thinkingLevel
 							: defaultRoleSpec.explicitThinkingLevel
 								? defaultRoleSpec.thinkingLevel
-								: (model.thinking?.defaultLevel ?? settings.get("defaultThinkingLevel"));
+								: hasExplicitDefaultThinkingLevel
+									? settings.get("defaultThinkingLevel")
+									: (model.thinking?.defaultLevel ?? settings.get("defaultThinkingLevel"));
 						thinkingLevel = resolveThinkingLevelForModel(model, recoveredLevel);
 					}
 					recoveredSessionDefault = recovery;
