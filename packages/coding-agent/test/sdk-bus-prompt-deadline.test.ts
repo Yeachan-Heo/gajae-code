@@ -5,7 +5,11 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { markNonDispatchedToolEvent, type RunSettlementProof } from "@gajae-code/agent-core";
 import { logger } from "@gajae-code/utils";
-import type { Settings } from "../src/config/settings";
+import {
+	DEFAULT_SDK_PROMPT_DEADLINE_MS,
+	DEFAULT_SDK_PROMPT_MAX_RUNTIME_MS,
+	type Settings,
+} from "../src/config/settings";
 import type { ExtensionActions, ExtensionAPI } from "../src/extensibility/extensions/types";
 import { createNotificationsExtension } from "../src/sdk/bus";
 import { TOOL_CALL_BOUNDARY_GRACE_MS } from "../src/sdk/prompt-tool-boundary";
@@ -58,6 +62,11 @@ function deadlineSettings(cwd: string, leaseMs: number, maxRuntimeMs: number): S
 		},
 		getAgentDir: () => cwd,
 	} as unknown as Settings;
+}
+
+/** Settings whose deadline reads all miss, so the bus must use the schema defaults. */
+function settingsWithoutDeadlineValues(cwd: string): Settings {
+	return { get: () => undefined, getAgentDir: () => cwd } as unknown as Settings;
 }
 
 async function git(root: string, args: string[]): Promise<string> {
@@ -1429,6 +1438,34 @@ test("a cancelled bus prompt never autosaves", async () => {
 		expect(session.deadlineTerminals()).toHaveLength(0);
 		expect((await git(session.cwd, ["rev-list", "--count", "HEAD"])).trim()).toBe("1");
 		expect(await git(session.cwd, ["status", "--porcelain", "--", "agent-work.ts"])).toBe("?? agent-work.ts\n");
+	} finally {
+		await shutdown(session);
+	}
+}, 30_000);
+
+test("the bus arms its deadline at the schema default when the setting read misses", async () => {
+	// #5584 fixed only the schema default and left the bus holding a hardcoded
+	// 1_800_000 fallback. `sdk-prompt-deadline-setting.test.ts` pins the schema
+	// default and the manager-armed lease; this pins the BUS-armed one, so a
+	// future divergent hardcode here fails the suite instead of shipping.
+	const session = await acceptPrompt(
+		"default-lease",
+		DEFAULT_SDK_PROMPT_DEADLINE_MS,
+		DEFAULT_SDK_PROMPT_MAX_RUNTIME_MS,
+		{
+			settings: settingsWithoutDeadlineValues,
+			captureSchedule: true,
+			// Nothing else in the accept path schedules anywhere near an hour out.
+			scheduleFilter: delayMs => delayMs > 1_000_000,
+		},
+	);
+	try {
+		const armed = session.scheduledDelays[0] ?? 0;
+		// Armed from the lease minus however long the durable accept write took.
+		expect(armed).toBeLessThanOrEqual(DEFAULT_SDK_PROMPT_DEADLINE_MS);
+		expect(armed).toBeGreaterThan(DEFAULT_SDK_PROMPT_DEADLINE_MS - 60_000);
+		// The regression this exists to catch: the old 30-minute hardcode.
+		expect(armed).toBeGreaterThan(1_800_000);
 	} finally {
 		await shutdown(session);
 	}
