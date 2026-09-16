@@ -119,6 +119,7 @@ import {
 	syntheticModelInputError,
 	syntheticNamespaceCollision,
 } from "../model-profile-model";
+import { flushWorktreeOnPromptDeadline } from "../prompt-deadline-flush";
 import {
 	createPromptDeadlineLease,
 	isAttributableProgressEventType,
@@ -126,6 +127,7 @@ import {
 	promptDeadlineAt,
 	recordAttributableProgress,
 } from "../prompt-deadline-lease";
+import { runBoundedDeadlineFlush } from "../prompt-deadline-manager";
 import {
 	assistantFailureCode,
 	failedPromptOutcome,
@@ -5493,6 +5495,25 @@ export function createNotificationsExtension(
 					return;
 				}
 				submission.deadlineAttempt = undefined;
+				// Durability before bus ownership teardown (#5583). The bus owns an
+				// independent deadline timer and terminalization path, so the host
+				// wiring in `session-runtime` never sees this expiry — without this
+				// call an active notification-bus session loses its dirty edits on a
+				// deadline, which is the exact work-loss this change exists to stop.
+				//
+				// Deadline path only: reaching here inside `if (deadlineAttempt)` proves
+				// the attempt was registered, and `winner` is the authoritative claimed
+				// outcome, so a cancel, an `agent_failed`, or a normal `agent_end` never
+				// autosaves. Bounded by the shared race and fully swallowed: the
+				// terminal recorded and published below is identical whether the flush
+				// succeeds, fails, or is abandoned.
+				if (
+					winner.kind === "failed" &&
+					winner.code === "prompt_deadline_exceeded" &&
+					settings?.get("sdk.flushWorktreeOnDeadline") !== false
+				) {
+					await runBoundedDeadlineFlush(signal => flushWorktreeOnPromptDeadline(ctx.cwd, signal));
+				}
 			}
 			if (submission.deadlineTimer) clearTimeout(submission.deadlineTimer);
 			if (!recordPromptTerminal(correlation)) return;
