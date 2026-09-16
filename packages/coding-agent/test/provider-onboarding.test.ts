@@ -3,7 +3,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { clampThinkingLevelForModel, Effort, getSupportedEfforts } from "@gajae-code/ai";
-import { getAgentDbPath, getAgentDir, setAgentDir } from "@gajae-code/utils";
+import { getAgentDbPath, getAgentDir, logger, setAgentDir } from "@gajae-code/utils";
 import { YAML } from "bun";
 import { parseSetupArgs } from "../src/cli/setup-cli";
 import { prepareModelProfileActivation } from "../src/config/model-profile-activation";
@@ -11,15 +11,25 @@ import { ModelRegistry } from "../src/config/model-registry";
 import { Settings } from "../src/config/settings";
 import { AuthStorage, SqliteAuthCredentialStore } from "../src/session/auth-storage";
 import {
+	formatModelOnboardingGuidance,
+	formatModelOnboardingInlineHint,
+	formatNoCredentialOnboardingError,
+	formatNoModelOnboardingError,
+	formatNoModelsAvailableFallback,
+} from "../src/setup/model-onboarding-guidance";
+import {
 	addApiCompatibleProvider,
+	type DiscoveryCatalogRefresher,
 	findProviderPreset,
 	formatProviderPresetList,
 	formatProviderSetupResult,
 	parseModelList,
 	parseProviderCompatibility,
 	redactSecret,
+	reloadAndRefreshDiscoveryCatalog,
 	validateModelApi,
 } from "../src/setup/provider-onboarding";
+import { formatUnknownBuiltinSlashCommandDiagnostic } from "../src/slash-commands/builtin-registry";
 
 let tempRoot: string | undefined;
 const originalAgentDir = getAgentDir();
@@ -38,6 +48,42 @@ afterEach(async () => {
 		await fs.rm(tempRoot, { recursive: true, force: true });
 		tempRoot = undefined;
 	}
+});
+
+describe("provider onboarding recovery guidance", () => {
+	it("offers manual models or discovery on every custom-provider recovery surface", () => {
+		const command =
+			"/provider add --compat <openai|anthropic> --provider <id> --base-url <url> --api-key-env <ENV> (--model <model> | --discover)";
+		for (const guidance of [
+			formatModelOnboardingGuidance(),
+			formatModelOnboardingInlineHint(),
+			formatNoModelOnboardingError(),
+			formatNoCredentialOnboardingError("custom-provider"),
+			formatNoModelsAvailableFallback(),
+			formatUnknownBuiltinSlashCommandDiagnostic("provicer"),
+		]) {
+			expect(guidance).toContain(command);
+		}
+	});
+
+	it("keeps the credential session through the targeted discovery refresh", async () => {
+		const calls: Array<readonly [string, string, string | undefined]> = [];
+		const registry: DiscoveryCatalogRefresher = {
+			refresh: async (mode, credentialSessionId): Promise<void> => {
+				calls.push(["refresh", mode, credentialSessionId]);
+			},
+			refreshProvider: async (providerId, strategy = "online", credentialSessionId): Promise<void> => {
+				calls.push([providerId, strategy, credentialSessionId]);
+			},
+			getProviderDiscoveryState: (): { status: string } => ({ status: "ok" }),
+		};
+
+		expect(await reloadAndRefreshDiscoveryCatalog(registry, "gateway", "credential-session")).toBeNull();
+		expect(calls).toEqual([
+			["refresh", "offline", "credential-session"],
+			["gateway", "online", "credential-session"],
+		]);
+	});
 });
 
 describe("provider onboarding setup core", () => {
@@ -221,7 +267,13 @@ describe("provider onboarding setup core", () => {
 
 	it("adds Command Code GOAT with automatic discovery and Claude prefix routing", async () => {
 		const modelsPath = await tempModelsPath();
-		const result = await addApiCompatibleProvider({ preset: "goat", modelsPath });
+		const result = await addApiCompatibleProvider({
+			preset: "goat",
+			modelsPath,
+			probeDiscovery: async () => {
+				throw new Error("preset adds must not probe live endpoints");
+			},
+		});
 		const parsed = YAML.parse(await Bun.file(modelsPath).text()) as {
 			providers?: Record<
 				string,
@@ -559,6 +611,9 @@ describe("provider onboarding setup core", () => {
 			baseUrl: "http://127.0.0.1:4000",
 			apiKeyEnv: "LITELLM_API_KEY",
 			modelsPath,
+			probeDiscovery: async () => {
+				throw new Error("preset adds must not probe live endpoints");
+			},
 		});
 
 		expect(result.providerId).toBe("litellm");
@@ -579,6 +634,9 @@ describe("provider onboarding setup core", () => {
 			baseUrl: "https://gateway.example.com/v1",
 			apiKeyEnv: "GATEWAY_KEY",
 			modelsPath,
+			probeDiscovery: async () => {
+				throw new Error("preset adds must not probe live endpoints");
+			},
 		});
 
 		expect(result.providerId).toBe("openai-compatible-proxy");
@@ -610,6 +668,9 @@ describe("provider onboarding setup core", () => {
 			baseUrl: "http://127.0.0.1:4000",
 			apiKeyEnv: "MY_PROXY_KEY",
 			modelsPath,
+			probeDiscovery: async () => {
+				throw new Error("preset adds must not probe live endpoints");
+			},
 		});
 
 		expect(result.credentialSource).toBe("env");
@@ -722,4 +783,241 @@ describe("provider onboarding setup core", () => {
 			exitSpy.mockRestore();
 		}
 	});
+});
+
+describe("provider onboarding precommit cancellation", () => {
+	it("rechecks cancellation after the locked config read before writing credentials or config", async () => {
+		const modelsPath = await tempModelsPath();
+		await Bun.write(modelsPath, "providers: {}\n");
+		const controller = new AbortController();
+		const parse = YAML.parse;
+		let reads = 0;
+		const parseSpy = vi.spyOn(YAML, "parse").mockImplementation((...args: Parameters<typeof YAML.parse>) => {
+			const result = parse(...args);
+			if (++reads === 2) controller.abort();
+			return result;
+		});
+		const createSpy = vi.spyOn(AuthStorage, "create");
+		try {
+			await expect(
+				addApiCompatibleProvider({
+					compatibility: "openai",
+					providerId: "cancelled-read",
+					baseUrl: "https://example.com/v1",
+					apiKey: "sk-new-secret",
+					models: ["model"],
+					modelsPath,
+					discoverySignal: controller.signal,
+				}),
+			).rejects.toThrow("was cancelled");
+			expect(reads).toBe(2);
+			expect(createSpy).not.toHaveBeenCalled();
+			expect(await Bun.file(modelsPath).text()).toBe("providers: {}\n");
+		} finally {
+			parseSpy.mockRestore();
+			createSpy.mockRestore();
+		}
+	});
+
+	for (const credentialSource of ["env", "literal"] as const) {
+		it(`cancels ${credentialSource} setup after temp fsync without committing and restores credentials`, async () => {
+			const modelsPath = await tempModelsPath();
+			const original = "providers: {}\n";
+			await Bun.write(modelsPath, original);
+			const controller = new AbortController();
+			const authStorage = await AuthStorage.create(getAgentDbPath());
+			await authStorage.set("cancelled-sync", [
+				{ type: "api_key", key: "sk-old-one" },
+				{ type: "api_key", key: "sk-old-two" },
+			]);
+			const open = fs.open;
+			const openSpy = vi.spyOn(fs, "open").mockImplementation(async (...args: Parameters<typeof fs.open>) => {
+				const handle = await open(...args);
+				if (String(args[0]).endsWith(".tmp")) {
+					const sync = handle.sync.bind(handle);
+					vi.spyOn(handle, "sync").mockImplementation(async () => {
+						await sync();
+						controller.abort();
+					});
+				}
+				return handle;
+			});
+			const renameSpy = vi.spyOn(fs, "rename");
+			try {
+				await expect(
+					addApiCompatibleProvider({
+						compatibility: "openai",
+						providerId: "cancelled-sync",
+						baseUrl: "https://example.com/v1",
+						...(credentialSource === "env" ? { apiKeyEnv: "EXAMPLE_KEY" } : { apiKey: "sk-new-secret" }),
+						models: ["model"],
+						modelsPath,
+						authStorage,
+						discoverySignal: controller.signal,
+					}),
+				).rejects.toThrow("was cancelled");
+				expect(renameSpy).not.toHaveBeenCalled();
+				expect(await Bun.file(modelsPath).text()).toBe(original);
+				expect(
+					authStorage
+						.exportSnapshot()
+						.credentials.filter(entry => entry.provider === "cancelled-sync")
+						.map(entry => entry.credential),
+				).toEqual([
+					{ type: "api_key", key: "sk-old-one" },
+					{ type: "api_key", key: "sk-old-two" },
+				]);
+				expect((await fs.readdir(path.dirname(modelsPath))).filter(name => name.endsWith(".tmp"))).toEqual([]);
+			} finally {
+				openSpy.mockRestore();
+				renameSpy.mockRestore();
+				authStorage.close();
+			}
+		});
+	}
+
+	it("does not roll back credentials or report cancellation after config rename commits", async () => {
+		const modelsPath = await tempModelsPath();
+		const controller = new AbortController();
+		const authStorage = await AuthStorage.create(getAgentDbPath());
+		const rename = fs.rename;
+		const renameSpy = vi.spyOn(fs, "rename").mockImplementation(async (...args: Parameters<typeof fs.rename>) => {
+			await rename(...args);
+			controller.abort();
+		});
+		try {
+			const result = await addApiCompatibleProvider({
+				compatibility: "openai",
+				providerId: "committed",
+				baseUrl: "https://example.com/v1",
+				apiKey: "sk-committed",
+				models: ["model"],
+				modelsPath,
+				authStorage,
+				discoverySignal: controller.signal,
+			});
+			expect(controller.signal.aborted).toBe(true);
+			expect(result.providerId).toBe("committed");
+			expect(
+				(YAML.parse(await Bun.file(modelsPath).text()) as { providers: Record<string, unknown> }).providers
+					.committed,
+			).toBeDefined();
+			expect(await authStorage.peekApiKey("committed")).toBe("sk-committed");
+		} finally {
+			renameSpy.mockRestore();
+			authStorage.close();
+		}
+	});
+
+	it("reports unrestorable snapshot recovery without deleting credentials on config failure", async () => {
+		const modelsPath = await tempModelsPath();
+		const authStorage = await AuthStorage.create(getAgentDbPath());
+		const snapshotSpy = vi.spyOn(authStorage, "exportSnapshot").mockReturnValue({
+			generation: 1,
+			generatedAt: 1,
+			credentials: [
+				{
+					id: 7,
+					provider: "unrestorable",
+					identityKey: null,
+					credential: { type: "oauth", access: "sk-oauth-secret", refresh: "__remote__", expires: 1 },
+				},
+			],
+		});
+		const setSpy = vi.spyOn(authStorage, "set");
+		const removeSpy = vi.spyOn(authStorage, "remove");
+		const originalCause = new Error("rename failed sk-new-secret");
+		const renameSpy = vi.spyOn(fs, "rename").mockRejectedValue(originalCause);
+		const logSpy = vi.spyOn(logger, "error").mockImplementation(() => undefined);
+		try {
+			const failure = await addApiCompatibleProvider({
+				compatibility: "openai",
+				providerId: "unrestorable",
+				baseUrl: "https://example.com/v1",
+				apiKey: "sk-new-secret",
+				models: ["model"],
+				modelsPath,
+				authStorage,
+				force: true,
+			}).then(
+				() => undefined,
+				(error: unknown) => error,
+			);
+			expect(failure).toBeInstanceOf(Error);
+			expect((failure as Error).cause).toBe(originalCause);
+			expect((failure as Error).message).toContain("could not restore prior credentials");
+			expect(setSpy).toHaveBeenCalledTimes(1);
+			expect(removeSpy).not.toHaveBeenCalled();
+			expect(await authStorage.peekApiKey("unrestorable")).toBe("sk-new-secret");
+			expect(await Bun.file(modelsPath).exists()).toBe(false);
+			expect(logSpy).toHaveBeenCalledWith((failure as Error).message);
+			expect(JSON.stringify(logSpy.mock.calls)).not.toContain("sk-new-secret");
+			expect(JSON.stringify(logSpy.mock.calls)).not.toContain("sk-oauth-secret");
+		} finally {
+			snapshotSpy.mockRestore();
+			setSpy.mockRestore();
+			removeSpy.mockRestore();
+			renameSpy.mockRestore();
+			logSpy.mockRestore();
+			authStorage.close();
+		}
+	});
+	for (const recovery of ["restore", "remove", "open"] as const) {
+		it(`surfaces and safely logs failed credential ${recovery} recovery after cancellation`, async () => {
+			const modelsPath = await tempModelsPath();
+			const controller = new AbortController();
+			const authStorage = await AuthStorage.create(getAgentDbPath());
+			if (recovery === "restore")
+				await authStorage.set("failed-recovery", { type: "api_key", key: "sk-old-secret" });
+			const set = authStorage.set.bind(authStorage);
+			const setSpy = vi
+				.spyOn(authStorage, "set")
+				.mockImplementation(async (...args: Parameters<AuthStorage["set"]>) => {
+					if (controller.signal.aborted) throw new Error("broker echoed sk-old-secret sk-new-secret");
+					await set(...args);
+					controller.abort();
+				});
+			const removeSpy = vi.spyOn(authStorage, "remove").mockRejectedValue(new Error("broker echoed sk-new-secret"));
+			const createSpy = vi.spyOn(AuthStorage, "create").mockImplementation(async () => {
+				if (controller.signal.aborted) throw new Error("open echoed sk-new-secret");
+				return authStorage;
+			});
+			const closeSpy = vi.spyOn(authStorage, "close").mockImplementation(() => undefined);
+			const logSpy = vi.spyOn(logger, "error").mockImplementation(() => undefined);
+			try {
+				const failure = await addApiCompatibleProvider({
+					compatibility: "openai",
+					providerId: "failed-recovery",
+					baseUrl: "https://example.com/v1",
+					apiKey: "sk-new-secret",
+					models: ["model"],
+					modelsPath,
+					force: true,
+					authStorage: recovery === "open" ? undefined : authStorage,
+					discoverySignal: controller.signal,
+				}).then(
+					() => undefined,
+					(error: unknown) => error,
+				);
+				expect(failure).toBeInstanceOf(Error);
+				const error = failure as Error;
+				expect(error.message).toContain("credential recovery is required");
+				expect(error.cause).toBeInstanceOf(Error);
+				expect((error.cause as Error).message).toContain("was cancelled");
+				expect(logSpy).toHaveBeenCalledWith(error.message);
+				const diagnostics = JSON.stringify(logSpy.mock.calls) + error.message + String(error.cause);
+				expect(diagnostics).not.toContain("sk-old-secret");
+				expect(diagnostics).not.toContain("sk-new-secret");
+				expect(await Bun.file(modelsPath).exists()).toBe(false);
+				expect(await authStorage.peekApiKey("failed-recovery")).toBe("sk-new-secret");
+			} finally {
+				setSpy.mockRestore();
+				removeSpy.mockRestore();
+				createSpy.mockRestore();
+				closeSpy.mockRestore();
+				logSpy.mockRestore();
+				authStorage.close();
+			}
+		});
+	}
 });
