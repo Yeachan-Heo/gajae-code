@@ -11,6 +11,7 @@ import { AsyncJobManager } from "../../async";
 import {
 	getProxyRoutableProviders,
 	inspectProxyProviderId,
+	isModelProfileProxyConfigured,
 	requiresQualifiedModelProfileRoleResolution,
 	resolveProxyMode,
 	rewriteSelectorForProxy,
@@ -1645,18 +1646,18 @@ function createQuerySurface(
 		};
 		try {
 			const proxyMode = profile.source === "user" ? "fallback" : resolveProxyMode(profileSettings);
-			if (profile.source !== "user") {
-				const configuredProviders = ctx.modelRegistry.getConfiguredProviderIds?.() ?? [];
-				if (proxyProvider !== undefined && !configuredProviders.includes(proxyProvider))
+			if (proxyProvider !== undefined) {
+				const configuredProviders = ctx.modelRegistry.getConfiguredProviderIds?.();
+				const credentialless =
+					proxyProvider === "opencodex" &&
+					!configuredProviders?.includes(proxyProvider) &&
+					(await ctx.modelRegistry.getApiKeyForProvider(proxyProvider, getProfileCredentialSessionId())) ===
+						kNoAuth;
+				if (!isModelProfileProxyConfigured(proxyProvider, configuredProviders, credentialless))
 					return { available: false };
 			}
 			if (profile.source !== "user" && proxyMode === "always") {
-				if (
-					proxyProvider === undefined ||
-					!proxyAuthenticated ||
-					!(ctx.modelRegistry.getConfiguredProviderIds?.() ?? []).includes(proxyProvider)
-				)
-					return { available: false };
+				if (proxyProvider === undefined || !proxyAuthenticated) return { available: false };
 			}
 			const bindings = resolveProfileBindings(profile);
 			const assignments: Array<{ value: ModelSelectorValue; isDefault: boolean }> = [];

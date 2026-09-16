@@ -534,6 +534,14 @@ function rewriteBindingsProviders(
 		),
 	};
 }
+export function isModelProfileProxyConfigured(
+	provider: string,
+	configuredProviders: readonly string[] | undefined,
+	credentialless: boolean,
+): boolean {
+	return configuredProviders?.includes(provider) === true || (provider === "opencodex" && credentialless);
+}
+
 /**
  * Resolve the explicitly configured OpenAI-compatible proxy provider id for a
  * preset. Returns undefined when unset or empty. Passwords/labels are never
@@ -1005,8 +1013,7 @@ export async function prepareModelProfileActivation(
 				: await options.modelRegistry.getApiKeyForProvider(proxyProvider, credentialSessionId);
 		if (proxyProvider !== undefined) {
 			const configuredProxyProviders = options.modelRegistry.getConfiguredProviderIds?.();
-			const discoveredLocalProxy = proxyProvider === "opencodex" && proxyApiKey === kNoAuth;
-			if (!configuredProxyProviders?.includes(proxyProvider) && !discoveredLocalProxy) {
+			if (!isModelProfileProxyConfigured(proxyProvider, configuredProxyProviders, proxyApiKey === kNoAuth)) {
 				throw new Error(
 					`modelProfile.proxyProvider "${proxyProvider}" is not configured. Configure it with \`gjc setup provider\` before activating a preset.`,
 				);

@@ -26,6 +26,7 @@ import type { BillingPath } from "../../config/billing-path";
 import {
 	getProxyRoutableProviders,
 	inspectProxyProviderId,
+	isModelProfileProxyConfigured,
 	requiresQualifiedModelProfileRoleResolution,
 	resolveProxyMode,
 	rewriteSelectorForProxy,
@@ -426,6 +427,7 @@ export class ModelSelectorComponent extends Container {
 	#presetScopeMenuOpen: boolean = false;
 	#presetScopeIndex: number = 0;
 	#providerAuthById = new Map<string, boolean>();
+	#credentiallessProviders = new Set<string>();
 	#bareProfileAuthByName = new Map<string, boolean>();
 	// Rebuilt with the provider and bare-selector snapshots on every catalog or credential refresh.
 	#profileAuthByName = new Map<string, boolean>();
@@ -1441,17 +1443,16 @@ export class ModelSelectorComponent extends Container {
 				const proxyProvider = tryResolveProxyProviderId(this.#settings);
 				if (
 					proxyProvider !== undefined &&
-					!(this.#modelRegistry.getConfiguredProviderIds?.() ?? []).includes(proxyProvider)
+					!isModelProfileProxyConfigured(
+						proxyProvider,
+						this.#modelRegistry.getConfiguredProviderIds?.(),
+						this.#credentiallessProviders.has(proxyProvider),
+					)
 				)
 					return false;
 				try {
 					if (resolveProxyMode(this.#settings) === "always") {
-						const configuredProviders = this.#modelRegistry.getConfiguredProviderIds?.() ?? [];
-						if (
-							proxyProvider === undefined ||
-							this.#isProviderAuthenticated(proxyProvider) !== true ||
-							!configuredProviders.includes(proxyProvider)
-						)
+						if (proxyProvider === undefined || this.#isProviderAuthenticated(proxyProvider) !== true)
 							return false;
 					}
 				} catch {
@@ -1530,6 +1531,7 @@ export class ModelSelectorComponent extends Container {
 	async #refreshProviderAuth(): Promise<void> {
 		const refreshGeneration = ++this.#providerAuthRefreshGeneration;
 		this.#providerAuthById = new Map();
+		this.#credentiallessProviders = new Set();
 		this.#bareProfileAuthByName = new Map();
 		this.#profileAuthByName = new Map();
 		const availableModels = this.#getProfileAvailableModels();
@@ -1586,9 +1588,9 @@ export class ModelSelectorComponent extends Container {
 				[...providers].map(async provider => {
 					try {
 						const apiKey = await this.#modelRegistry.getApiKeyForProvider(provider, this.#authSessionId);
-						return [provider, apiKey === kNoAuth || isAuthenticated(apiKey)] as const;
+						return [provider, apiKey === kNoAuth || isAuthenticated(apiKey), apiKey === kNoAuth] as const;
 					} catch {
-						return [provider, false] as const;
+						return [provider, false, false] as const;
 					}
 				}),
 			);
@@ -1598,7 +1600,10 @@ export class ModelSelectorComponent extends Container {
 				refreshGeneration !== this.#providerAuthRefreshGeneration
 			)
 				return;
-			this.#providerAuthById = new Map(entries);
+			this.#providerAuthById = new Map(entries.map(([provider, authenticated]) => [provider, authenticated]));
+			this.#credentiallessProviders = new Set(
+				entries.filter(([, , keyless]) => keyless).map(([provider]) => provider),
+			);
 			const profileAuthEntries = await Promise.all(
 				[...this.#getPresetGroups().values()].flat().map(async profile => {
 					const bindings = resolveProfileBindings(profile);

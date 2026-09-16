@@ -2,6 +2,7 @@ import { beforeAll, describe, expect, test, vi } from "bun:test";
 import { ThinkingLevel } from "@gajae-code/agent-core";
 import type { Model } from "@gajae-code/ai";
 import type { ModelProfileDefinition } from "@gajae-code/coding-agent/config/model-profiles";
+import { kNoAuth } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import {
 	ModelSelectorComponent,
@@ -320,6 +321,46 @@ describe("model selector profiles", () => {
 		expect(resolveAlias.mock.calls[0]?.[1]?.credentialSessionId).toBe("profile-session");
 		expect(getApiKeyForProvider).toHaveBeenCalledWith("provider-a", "profile-session");
 	});
+
+	for (const proxyMode of ["fallback", "always"] as const) {
+		for (const [provider, apiKey, available] of [
+			["opencodex", kNoAuth, true],
+			["opencodex", undefined, false],
+			["opencodex", "unconfigured-key", false],
+			["custom-proxy", kNoAuth, false],
+		] as const) {
+			test(`discovered proxy preset availability: ${proxyMode}, ${provider}, ${apiKey}`, async () => {
+				installTestTheme();
+				const discoveredProfile: ModelProfileDefinition = {
+					name: "discovered-ocx",
+					providerGroup: "DISCOVERED OCX",
+					requiredProviders: ["anthropic"],
+					modelMapping: { default: "anthropic/claude-opus-5" },
+					source: "registry",
+				};
+				const proxyModel = { ...model(provider, "opencodex/claude-opus-5"), wireModelId: "claude-opus-5" };
+				const registry = createRegistry() as unknown as TestModelRegistry;
+				registry.getModelProfiles = () => new Map([[discoveredProfile.name, discoveredProfile]]);
+				registry.getModelProfile = (name: string) =>
+					name === discoveredProfile.name ? discoveredProfile : undefined;
+				registry.getConfiguredProviderIds = () => [];
+				registry.getAvailable = () => [proxyModel];
+				registry.getAll = registry.getAvailable;
+				registry.getApiKeyForProvider = async (id: string) => (id === provider ? apiKey : undefined);
+				const selector = createSelector(() => {}, {
+					registry,
+					settings: Settings.isolated({
+						"modelProfile.proxyProvider": provider,
+						"modelProfile.proxyMode": proxyMode,
+					}),
+				});
+				await Bun.sleep(10);
+				const rendered = normalizeRenderedText(selector.render(220).join("\n"));
+				expect(rendered).toContain(`${available ? "✓" : "✗"} DISCOVERED OCX`);
+				selector.dispose();
+			});
+		}
+	}
 
 	test("renders a registry preset unavailable when its configured proxy lacks the model", async () => {
 		installTestTheme();
