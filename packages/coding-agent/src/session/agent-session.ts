@@ -2942,6 +2942,7 @@ export class AgentSession {
 	#retryPromise: Promise<void> | undefined = undefined;
 	#retryResolve: (() => void) | undefined = undefined;
 	#defaultFallbackController: FallbackChainController | undefined;
+	#startupRecoveryBindingsRequired = false;
 	#fallbackTransitionGeneration = 0;
 	/** Managed escaped-non-ASCII retries issued for the current logical run. Bounded so a deterministic escaper cannot loop forever through un-charged fallback retries. */
 	#escapedNonAsciiManagedRetries = 0;
@@ -16470,8 +16471,12 @@ export class AgentSession {
 		this.#seedDefaultFallbackResolutionForController(this.#defaultFallbackController, activeIndex, skips);
 	}
 
+	markStartupRecoveryBindingsRequired(): void {
+		this.#startupRecoveryBindingsRequired = true;
+	}
+
 	hasRecoveredDefaultFallbackChain(): boolean {
-		return this.#defaultFallbackController?.chain.origin === "runtime";
+		return this.#startupRecoveryBindingsRequired || this.#defaultFallbackController?.chain.origin === "runtime";
 	}
 
 	/**
