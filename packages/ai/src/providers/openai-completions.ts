@@ -1577,7 +1577,7 @@ function buildParams(
 		delete params.tool_choice;
 	}
 
-	if (supportsReasoningParams && getMiniMaxThinkingMode(model) === "toggle") {
+	if (supportsReasoningParams && getMiniMaxThinkingMode(model, resolvedBaseUrl) === "toggle") {
 		// MiniMax-M3 accepts an on/off switch, not reasoning_effort. Omitting
 		// the switch preserves the OpenAI-compatible endpoint's default (on).
 		if (options?.disableReasoning) params.thinking = { type: "disabled" };

@@ -91,6 +91,72 @@ describe("MiniMax native thinking capabilities", () => {
 			expect(payload.output_config).toBeUndefined();
 			expect(payload.max_tokens ?? payload.max_completion_tokens).toBe(1024);
 		});
+
+		it(`${provider}: validates the normalized endpoint rather than the provider identity`, () => {
+			const model = getBundledModel(provider, "MiniMax-M3");
+			const endpoint = new URL(model.baseUrl);
+			const nativePath = endpoint.pathname;
+			for (const baseUrl of [
+				`${model.baseUrl}/`,
+				`https://${endpoint.hostname.toUpperCase()}:443${nativePath}/`,
+				...(model.api === "anthropic-messages" ? [`${model.baseUrl}/v1/`] : []),
+			]) {
+				expect(getMiniMaxThinkingMode({ ...model, baseUrl })).toBe("toggle");
+			}
+			for (const baseUrl of [
+				`https://proxy.invalid${nativePath}`,
+				`https://${endpoint.hostname}.proxy.invalid${nativePath}`,
+				`https://sub.${endpoint.hostname}${nativePath}`,
+				`http://${endpoint.hostname}${nativePath}`,
+				`https://${endpoint.hostname}:8443${nativePath}`,
+				`https://user:password@${endpoint.hostname}${nativePath}`,
+				`https://${endpoint.hostname}/custom-proxy`,
+				`${model.baseUrl}?upstream=proxy`,
+				`${model.baseUrl}#proxy`,
+				"not-a-url",
+				"",
+			]) {
+				for (const id of ["MiniMax-M3", "MiniMax-M3[1m]", "MiniMax-M2.7"]) {
+					expect(getMiniMaxThinkingMode({ ...model, id, baseUrl })).toBeUndefined();
+					expect(getMiniMaxThinkingMode({ ...model, id }, baseUrl)).toBeUndefined();
+				}
+				if (model.api === "openai-completions") {
+					expect(modelSupportsReasoningControl({ ...model, baseUrl })).toBe(false);
+					expect(modelSupportsReasoningControl(model, baseUrl)).toBe(false);
+				}
+			}
+		});
+
+		it(`${provider}: does not emit native thinking switches to a proxy retaining the built-in provider ID`, async () => {
+			for (const enabled of [true, false]) {
+				const model = { ...getBundledModel(provider, "MiniMax-M3"), baseUrl: "https://proxy.invalid/v1" };
+				let payload: Record<string, unknown> | undefined;
+				const options = {
+					apiKey: "test-key",
+					signal: AbortSignal.abort(),
+					thinkingEnabled: enabled,
+					reasoning: enabled ? Effort.High : undefined,
+					disableReasoning: !enabled,
+					onPayload: (value: unknown) => {
+						payload = value as Record<string, unknown>;
+						throw new Error("Proxy payload captured");
+					},
+				};
+				const stream =
+					model.api === "anthropic-messages"
+						? streamAnthropic(model as Model<"anthropic-messages">, context, options)
+						: streamOpenAICompletions(model as Model<"openai-completions">, context, options);
+				await stream.result();
+				expect(payload).toBeDefined();
+				if (model.api === "anthropic-messages" && enabled) {
+					// Preserve the pre-existing generic Anthropic budget behavior, not MiniMax adaptive.
+					expect(payload?.thinking).toMatchObject({ type: "enabled", budget_tokens: 1024 });
+				} else {
+					expect(payload?.thinking).toBeUndefined();
+				}
+				expect(payload?.reasoning_effort).toBeUndefined();
+			}
+		});
 	}
 
 	it("does not grant MiniMax controls to custom proxies or unknown models", () => {

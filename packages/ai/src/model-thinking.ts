@@ -234,12 +234,35 @@ export function refreshModelThinking<TApi extends Api>(model: ApiModel<TApi>): A
  * https://platform.minimax.io/docs/api-reference/text-openai-api#thinking-control
  * https://platform.minimax.io/docs/api-reference/text-anthropic-api#thinking-control
  */
-export function getMiniMaxThinkingMode(model: ApiModel<Api>): "toggle" | "always-on" | undefined {
+export function getMiniMaxThinkingMode(
+	model: ApiModel<Api>,
+	resolvedBaseUrl?: string,
+): "toggle" | "always-on" | undefined {
 	const isDirectRoute =
 		(model.api === "anthropic-messages" && (model.provider === "minimax" || model.provider === "minimax-cn")) ||
 		(model.api === "openai-completions" &&
 			(model.provider === "minimax-code" || model.provider === "minimax-code-cn"));
 	if (!isDirectRoute) return undefined;
+	// Provider identity survives baseUrl overrides. Only the normalized native
+	// endpoint, not a provider label or a matching hostname suffix, proves this contract.
+	try {
+		const endpoint = new URL(resolvedBaseUrl ?? model.baseUrl);
+		const host = model.provider.endsWith("-cn") ? "api.minimaxi.com" : "api.minimax.io";
+		const path = endpoint.pathname.replace(/\/+$/, "");
+		const validPath =
+			model.api === "anthropic-messages" ? path === "/anthropic" || path === "/anthropic/v1" : path === "/v1";
+		if (
+			endpoint.origin !== `https://${host}` ||
+			!validPath ||
+			endpoint.username ||
+			endpoint.password ||
+			endpoint.search ||
+			endpoint.hash
+		)
+			return undefined;
+	} catch {
+		return undefined;
+	}
 	if (model.id === "MiniMax-M3" || model.id === "MiniMax-M3[1m]") return "toggle";
 	if (/^MiniMax-M2(?:[.\-[]|$)/.test(model.id)) return "always-on";
 	return undefined;
@@ -258,7 +281,7 @@ export function modelSupportsReasoningControl<TApi extends Api>(
 	if (!model.reasoning) return false;
 	// MiniMax's native thinking switch is not OpenAI reasoning_effort. M2.x
 	// always thinks; M3 supports adaptive/disabled, but no effort or budget.
-	const miniMaxMode = getMiniMaxThinkingMode(model);
+	const miniMaxMode = getMiniMaxThinkingMode(model, resolvedBaseUrl);
 	if (miniMaxMode) return miniMaxMode === "toggle";
 	if (model.api === "openai-completions") {
 		const completionsModel = model as ApiModel<"openai-completions">;

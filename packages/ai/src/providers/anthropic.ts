@@ -3611,7 +3611,7 @@ function buildParams(
 		);
 	}
 
-	const miniMaxMode = getMiniMaxThinkingMode(model);
+	const miniMaxMode = getMiniMaxThinkingMode(model, baseUrl);
 	if (model.reasoning && miniMaxMode === "toggle") {
 		// MiniMax's Messages endpoint defaults to off and only supports a
 		// switch. Claude budget_tokens/output_config.effort do not apply.
