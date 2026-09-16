@@ -79,6 +79,7 @@ import { callWithCopilotModelRetry } from "../utils/retry";
 import { resolveRetryBudget } from "../utils/retry-budget";
 import { adaptSchemaForStrict, flattenToolRootCombinators, NO_STRICT, toolWireSchema } from "../utils/schema";
 import { wrapFetchForSseDebug } from "../utils/sse-debug";
+import { StreamRepetitionGuard, type StreamRepetitionTrip } from "../utils/stream-repetition-guard";
 import { type HealedToolCall, modelMayLeakKimiToolCalls, ToolCallHealer } from "../utils/tool-call-healing";
 import { isForcedToolChoice, mapToOpenAICompletionsToolChoice } from "../utils/tool-choice";
 import {
@@ -86,6 +87,7 @@ import {
 	markToolChoiceIncapability,
 	resolveToolChoice,
 } from "../utils/tool-choice-capability";
+import { ToolFenceStripper } from "../utils/tool-fence-strip";
 import { COMPOSER_EDIT_DISCIPLINE_PROMPT, isComposerHarnessModel } from "./composer-discipline";
 import { mergeDashScopeTokenPlanHeaders } from "./dashscope-token-plan-headers";
 import {
@@ -584,6 +586,27 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 		const abortTracker = createAbortSourceTracker(options?.signal);
 		const { requestAbortController, requestSignal } = abortTracker;
 
+		// Declared outside the try so the catch block — which is where the abort
+		// below lands — can tell a runaway-repetition stop from a transport error.
+		let repetitionTrip: (StreamRepetitionTrip & { channel: "text" | "thinking" }) | undefined;
+		const finalizeRepetitionGuardStop = (): void => {
+			if (!repetitionTrip) return;
+			// `aborted` rather than a new StopReason: the turn really was cut short
+			// locally, and `errorCode` is the bounded classifier for *why* (#5624).
+			// The observed repeat count belongs in the free-form message only.
+			output.stopReason = "aborted";
+			output.errorCode = "repetition_guard_tripped";
+			output.errorMessage =
+				`Stopped the turn: the model repeated the same ${repetitionTrip.channel} output ` +
+				`${repetitionTrip.repeats} times (${JSON.stringify(repetitionTrip.sample)}).`;
+			output.duration = Date.now() - startTime;
+			if (firstTokenTime) output.ttft = firstTokenTime - startTime;
+			// No `transportFailure`: this is a local decision, not a retryable
+			// transport fault, and retry policy keys on that field.
+			stream.push({ type: "error", reason: "aborted", error: output });
+			stream.end();
+		};
+
 		try {
 			const apiKey = options?.apiKey || getEnvApiKey(model.provider) || "";
 			const idleTimeoutMs = options?.streamIdleTimeoutMs ?? getOpenAIStreamIdleTimeoutMs(model.provider, model.id);
@@ -870,15 +893,45 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 
 			let taggedTextBuffer = "";
 			let insideTaggedThinking = false;
+			// One guard per channel: interleaving visible text and reasoning through
+			// a single instance would splice unrelated tokens into the same window.
+			// Tool-call frames are never fed through either guard.
+			const textRepetitionGuard = new StreamRepetitionGuard();
+			const thinkingRepetitionGuard = new StreamRepetitionGuard();
+			const noteRepetitionTrip = (guard: StreamRepetitionGuard, channel: "text" | "thinking") => {
+				// `takeTrip()` latches once per guard; this latches once per request,
+				// so the abort below fires exactly once no matter which channel loops.
+				if (repetitionTrip) return;
+				const trip = guard.takeTrip();
+				if (!trip) return;
+				repetitionTrip = { ...trip, channel };
+				requestAbortController.abort();
+			};
+
+			// Reasoning-channel only — a fence token in visible prose must survive
+			// as text (CHANGELOG.md:1094), and the Kimi healer must not see this
+			// channel at all or its holdback buffer corrupts.
+			const thinkingFenceStripper = new ToolFenceStripper();
+			let lastThinkingSignature: string | undefined;
+
 			const appendTextDelta = (text: string) => {
 				if (!text) return;
 				if (!firstTokenTime) firstTokenTime = Date.now();
-				appendText(output, stream, text);
+				const emit = textRepetitionGuard.feed(text);
+				noteRepetitionTrip(textRepetitionGuard, "text");
+				if (emit) appendText(output, stream, emit);
+			};
+			const emitThinkingText = (thinking: string, signature?: string) => {
+				if (!thinking) return;
+				const emit = thinkingRepetitionGuard.feed(thinking);
+				noteRepetitionTrip(thinkingRepetitionGuard, "thinking");
+				if (emit) appendThinking(output, stream, emit, signature);
 			};
 			const appendThinkingDelta = (thinking: string, signature?: string) => {
 				if (!thinking) return;
 				if (!firstTokenTime) firstTokenTime = Date.now();
-				appendThinking(output, stream, thinking, signature);
+				lastThinkingSignature = signature;
+				emitThinkingText(thinkingFenceStripper.feed(thinking), signature);
 			};
 
 			const flushTaggedTextBuffer = () => {
@@ -1160,6 +1213,10 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 				flushDeepseekStripBuffer(true);
 			}
 
+			// A partial fence held back at the last chunk never completed, so it was
+			// ordinary thinking text after all.
+			emitThinkingText(thinkingFenceStripper.flush(), lastThinkingSignature);
+
 			if (kimiHealer) {
 				const trailing = kimiHealer.flushPending();
 				if (trailing.length > 0) appendTextDelta(trailing);
@@ -1186,6 +1243,14 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 			}
 
 			finishCurrentBlock(currentBlock);
+
+			// A repetition abort usually surfaces as a throw from the stream
+			// iterator, but a host that had already buffered the rest of the
+			// response finishes the loop normally instead. Same outcome either way.
+			if (repetitionTrip) {
+				finalizeRepetitionGuardStop();
+				return;
+			}
 
 			const firstEventTimeoutError = abortTracker.getLocalAbortReason();
 			if (firstEventTimeoutError) {
@@ -1221,6 +1286,13 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 			stream.end();
 		} catch (error) {
 			for (const block of output.content) delete (block as any).index;
+			// Our own abort landed here. Classify it before the generic transport
+			// path turns it into a retryable provider error. A caller abort still
+			// wins: the user's cancel is the more meaningful intent.
+			if (repetitionTrip && !abortTracker.wasCallerAbort()) {
+				finalizeRepetitionGuardStop();
+				return;
+			}
 			const localAbortReason = abortTracker.getLocalAbortReason();
 			const normalizedError =
 				!streamConnected && model.provider === "alibaba-token-plan" && error instanceof APIConnectionTimeoutError
