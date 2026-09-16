@@ -49,6 +49,7 @@ export class PromptDeadlineManager {
 	readonly #getMaxMs: () => number;
 	readonly #now: () => number;
 	readonly #onExpired?: (correlation: InvocationCorrelation, outcome?: PromptDeadlineOutcome) => void;
+	readonly #onDeadlineExceeded?: (correlation: InvocationCorrelation) => void | Promise<void>;
 
 	constructor(options: {
 		reconciliation: DeadlineReconciliation;
@@ -56,12 +57,22 @@ export class PromptDeadlineManager {
 		getMaxMs: () => number;
 		now?: () => number;
 		onExpired?: (correlation: InvocationCorrelation, outcome?: PromptDeadlineOutcome) => void;
+		/**
+		 * Best-effort durability hook for the single path that genuinely retires a
+		 * prompt as `prompt_deadline_exceeded` (#5583). Awaited before ownership is
+		 * retired so it can persist work the teardown would otherwise strand; a
+		 * rejection is swallowed and never changes the deadline outcome. Not called
+		 * when a real terminal transition or a real failure won the race, nor when
+		 * renewed progress supersedes this expiry instance.
+		 */
+		onDeadlineExceeded?: (correlation: InvocationCorrelation) => void | Promise<void>;
 	}) {
 		this.#reconciliation = options.reconciliation;
 		this.#getLeaseMs = options.getLeaseMs;
 		this.#getMaxMs = options.getMaxMs;
 		this.#now = options.now ?? Date.now;
 		this.#onExpired = options.onExpired;
+		this.#onDeadlineExceeded = options.onDeadlineExceeded;
 	}
 
 	#clearTimer(key: string): void {
@@ -192,6 +203,14 @@ export class PromptDeadlineManager {
 		// so this expiry pass must not retire the now-live invocation's pending
 		// ownership even though the finalize write landed.
 		if (this.#backOffIfSuperseded(key, lease, generation)) return;
+		// Durability before teardown (#5583). This is the only path that retires a
+		// prompt as prompt_deadline_exceeded, and it runs after every supersession
+		// check, so a renewed lease never reaches it. Fully guarded: a throwing or
+		// slow hook must not touch the terminal transition or lease bookkeeping
+		// below, which the outcome above has already made durable.
+		try {
+			await this.#onDeadlineExceeded?.(correlation);
+		} catch {}
 		// Retire pending ownership ONLY after durable terminal confirmation with
 		// no superseding progress (#4668 review P1): retiring earlier strands an
 		// accepted/in-flight invocation without an owner, retry, or deadline
