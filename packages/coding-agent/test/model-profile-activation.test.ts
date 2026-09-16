@@ -8,6 +8,7 @@ import {
 	applyPreparedModelProfileActivation,
 	formatModelProfileCredentialError,
 	ModelProfileCredentialError,
+	ModelProfileUnknownProviderError,
 	materializeActiveModelProfileAssignment,
 	materializeActiveModelProfileAssignments,
 	materializeModelProfileForDeletion,
@@ -1855,6 +1856,67 @@ describe("model profile activation", () => {
 			}),
 		).rejects.toThrow('Unknown model profile "missing". Available profiles: alpha, beta');
 	});
+	test("required provider this build does not know is a build mismatch, not a credential gap", async () => {
+		const session = fakeSession();
+		const settings = Settings.isolated({
+			"task.agentModelOverrides": { executor: "provider-a/original" },
+			"modelProfile.default": "old-profile",
+		});
+		const profile: ModelProfileDefinition = {
+			name: "from-newer-build",
+			requiredProviders: ["openai-codex", "future-provider-x"],
+			modelMapping: { default: "future-provider-x/default" },
+			source: "user",
+		};
+		const registry = {
+			...fakeRegistry({ profiles: [profile] }),
+			getConfiguredProviderIds: () => [],
+		} as unknown as ModelRegistry;
+
+		const error = (await prepareModelProfileActivation({
+			session,
+			modelRegistry: registry,
+			settings,
+			profileName: profile.name,
+		}).catch((caught: unknown) => caught)) as ModelProfileUnknownProviderError;
+
+		expect(error).toBeInstanceOf(ModelProfileUnknownProviderError);
+		expect(error).toBeInstanceOf(ModelProfileCredentialError);
+		expect(error.code).toBe("unknown_provider");
+		// Only the undeclared, unshipped provider is named; openai-codex ships in
+		// every build and stays a credential concern.
+		expect(error.providers).toEqual(["future-provider-x"]);
+		expect(error.message).toBe(
+			'Model profile "from-newer-build" requires provider(s) this build does not know: future-provider-x. The profile likely targets a newer or custom build; declare the provider(s) in models.yml or use a build that ships them.',
+		);
+		expect(error.message).not.toContain("Run /login");
+		expect(session.setModelTemporaryCalls).toEqual([]);
+		expect(settings.get("modelProfile.default")).toBe("old-profile");
+	});
+
+	test("required provider declared in models.yml keeps the credential diagnosis", async () => {
+		const profile: ModelProfileDefinition = {
+			name: "declared-provider",
+			requiredProviders: ["future-provider-x"],
+			modelMapping: { default: "future-provider-x/default" },
+			source: "user",
+		};
+		const registry = {
+			...fakeRegistry({ missingProviders: ["future-provider-x"], profiles: [profile] }),
+			getConfiguredProviderIds: () => ["future-provider-x"],
+		} as unknown as ModelRegistry;
+
+		await expect(
+			activateModelProfile({
+				session: fakeSession(),
+				modelRegistry: registry,
+				settings: Settings.isolated(),
+				profileName: profile.name,
+			}),
+		).rejects.toThrow(
+			'Model profile "declared-provider" requires credentials for: future-provider-x. Run /login and configure the missing provider(s), then retry.',
+		);
+	});
 
 	test("apply rolls back runtime changes when persistence throws", async () => {
 		const session = fakeSession();
@@ -2759,7 +2821,10 @@ describe("model-profile-activation: OpenAI-compatible proxy routing", () => {
 		const registry = {
 			...base,
 			getAll: () => [...base.getAll(), proxyModel("acme-private/alpha")],
-			getConfiguredProviderIds: () => ["litellm"],
+			// acme-private models a user-declared custom provider, so it must be
+			// part of the configured ids or activation diagnoses it as a provider
+			// this build does not know instead of a missing credential.
+			getConfiguredProviderIds: () => ["litellm", "acme-private"],
 			getApiKeyForProvider: async (provider: string) =>
 				provider === "litellm" ? "key-litellm" : base.getApiKeyForProvider(provider),
 		};

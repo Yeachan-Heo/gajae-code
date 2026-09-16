@@ -252,7 +252,9 @@ describe("model profile activation red-team", () => {
 					model("litellm", "provider-b/executor"),
 				],
 			}),
-			getConfiguredProviderIds: () => ["litellm"],
+			// provider-a/b model user-declared custom providers here; declaring
+			// them keeps the unknown-provider gate out of this proxy-routing test.
+			getConfiguredProviderIds: () => ["litellm", "provider-a", "provider-b"],
 			getApiKeyForProvider: async (provider: string) => `key-${provider}`,
 		};
 

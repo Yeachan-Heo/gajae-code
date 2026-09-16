@@ -1,5 +1,5 @@
 import { ThinkingLevel } from "@gajae-code/agent-core";
-import type { Api, Model } from "@gajae-code/ai/core";
+import { type Api, isKnownProvider, type Model } from "@gajae-code/ai/core";
 import { logger } from "@gajae-code/utils";
 import type { AgentSession, DefaultFallbackRuntimeState } from "../session/agent-session";
 import { clampExplicitThinkingLevelForModel, formatClampedModelSelector } from "../thinking";
@@ -449,7 +449,7 @@ export function materializeActiveModelProfileAssignments(options: MaterializeMod
 }
 
 export class ModelProfileCredentialError extends Error {
-	readonly code = "authentication_failed";
+	readonly code: string = "authentication_failed";
 	readonly profileLabel: string;
 	readonly providers: readonly string[];
 	readonly role: string | undefined;
@@ -465,6 +465,28 @@ export class ModelProfileCredentialError extends Error {
 
 export function formatModelProfileCredentialError(profileLabel: string, providers: readonly string[]): string {
 	return `Model profile "${profileLabel}" requires credentials for: ${providers.join(", ")}. Run /login and configure the missing provider(s), then retry.`;
+}
+export function formatModelProfileUnknownProviderError(profileLabel: string, providers: readonly string[]): string {
+	return `Model profile "${profileLabel}" requires provider(s) this build does not know: ${providers.join(", ")}. The profile likely targets a newer or custom build; declare the provider(s) in models.yml or use a build that ships them.`;
+}
+
+/**
+ * A required profile provider that this build cannot know: it is neither a
+ * built-in provider id nor declared in models.yml. That is a build/config
+ * mismatch (for example a profile authored on a newer or custom build), not a
+ * credential gap, so the diagnosis must not send the user to /login.
+ *
+ * Extends {@link ModelProfileCredentialError} so existing startup recovery
+ * (interactive toast-and-continue) keeps working with the sharper message.
+ */
+export class ModelProfileUnknownProviderError extends ModelProfileCredentialError {
+	readonly code = "unknown_provider";
+
+	constructor(profileLabel: string, providers: readonly string[], role?: string) {
+		super(profileLabel, providers, role);
+		this.name = "ModelProfileUnknownProviderError";
+		this.message = formatModelProfileUnknownProviderError(profileLabel, providers);
+	}
 }
 
 /**
@@ -957,6 +979,25 @@ export async function prepareModelProfileActivation(
 			...alternativeSet,
 			...deriveModelProfileMappedProviders(profile),
 		]);
+		// A required provider this build cannot know is a build/config mismatch,
+		// not a credential gap: diagnose it before any auth probing so the user
+		// is never sent to /login for a provider this binary cannot serve (for
+		// example a models.yml profile authored on a newer or custom build). A
+		// registry without configured-provider visibility keeps the legacy
+		// credential diagnosis.
+		const configuredProviderIds = options.modelRegistry.getConfiguredProviderIds?.();
+		if (configuredProviderIds !== undefined) {
+			const unknownRequiredProviders = [
+				...new Set(
+					requiredProviders.filter(
+						provider => !isKnownProvider(provider) && !configuredProviderIds.includes(provider),
+					),
+				),
+			].sort();
+			if (unknownRequiredProviders.length > 0) {
+				throw new ModelProfileUnknownProviderError(profileLabel, unknownRequiredProviders);
+			}
+		}
 
 		const missingProviders: string[] = [];
 		const authenticatedProviders: string[] = [];
