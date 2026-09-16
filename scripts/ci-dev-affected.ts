@@ -948,6 +948,9 @@ export function planTasks(
 	if (paths.some(isSdkPackageSmokePath)) {
 		add(tasks, "sdk-package-smoke", "SDK package smoke", ["bun", "packages/coding-agent/scripts/build-sdk-package-smoke.ts"]);
 	}
+	if (paths.some(isSchemaContractPath)) {
+		addSchemaSyncTask(tasks);
+	}
 
 	if (rustChanged) {
 		add(tasks, "rust-check", "Rust check", ["bun", "run", "check:rs"]);
@@ -1048,6 +1051,9 @@ export function planTargetedTasks(
 			if (isUnscopedWrapperPath(changedPath)) {
 				add(tasks, "wrapper-version", "Unscoped wrapper CLI version smoke", ["bun", "packages/gajae-code/bin/gjc.js", "--version"]);
 			}
+		}
+		if (isSchemaContractPath(changedPath)) {
+			addSchemaSyncTask(tasks);
 		}
 		if (isSdkPackageSmokePath(changedPath)) {
 			add(tasks, "sdk-package-smoke", "SDK package smoke", ["bun", "packages/coding-agent/scripts/build-sdk-package-smoke.ts"]);
@@ -1363,6 +1369,18 @@ export function isFullWorkspacePath(changedPath: string): boolean {
 		"tsconfig.base.json",
 		"tsconfig.tools.json",
 	].includes(changedPath);
+}
+
+// `schemas/*.json` is generated from the settings schema by
+// `scripts/generate-json-schemas.ts`. Either side can drift from the other, and
+// the `--check` gate that catches it lives only inside `ci:check:full`, which an
+// affected-path run does not select for a change confined to these two files.
+export function isSchemaContractPath(changedPath: string): boolean {
+	return changedPath.startsWith("schemas/") || changedPath === "packages/coding-agent/src/config/settings-schema.ts";
+}
+
+function addSchemaSyncTask(tasks: Map<string, Task>): void {
+	add(tasks, "check-schemas", "Generated JSON schema sync check", ["bun", "run", "check:schemas"]);
 }
 
 function isRootPackageReleaseHarnessOnly(paths: readonly string[]): boolean {
