@@ -8424,15 +8424,17 @@ describe("Coordinator MCP retained-delivery ordering", () => {
 			if (args[0] === path.join(namespaceDir, "session-states")) watcherReady.resolve();
 			return watcher;
 		});
-		// Keep the protocol's 500ms deadline, but drive this functional wake test
-		// with logical time rather than charging unrelated filesystem setup to it.
-		vi.useFakeTimers();
+		// Real timers: the long poll's own fallback deadline must stay armed so a wake
+		// regression fails here instead of hanging until an outer suite timeout. Watcher
+		// installation and the filesystem append run while the poll is in flight, so the
+		// budget carries headroom for that setup rather than the protocol's tight 500ms.
+		const wakeBudgetMs = 10_000;
 		try {
 			const pending = server.callTool("gjc_coordinator_watch_events", {
 				session_id: "visible-session",
 				event_types: ["question.opened"],
 				after_seq: cursor,
-				timeout_ms: 500,
+				timeout_ms: wakeBudgetMs,
 			});
 			await watcherReady.promise;
 			gateAvailable = true;
@@ -8451,7 +8453,6 @@ describe("Coordinator MCP retained-delivery ordering", () => {
 			});
 		} finally {
 			watchSpy.mockRestore();
-			vi.useRealTimers();
 		}
 	});
 
