@@ -18,6 +18,21 @@ afterEach(async () => {
 	await Promise.all(tempRoots.splice(0).map(dir => fsp.rm(dir, { recursive: true, force: true })));
 });
 
+/**
+ * Wait for an observable condition instead of guessing how long the manager
+ * needs. A fixed sleep has to cover a real flush's five git subprocesses, which
+ * is fine locally and flaky on a loaded CI runner; polling scales with the box.
+ * The generous bound is deliberate — it exists to turn a genuine hang into a
+ * legible timeout, not to police timing, which the assertions still do.
+ */
+async function waitFor(predicate: () => boolean, label: string, timeoutMs = 10_000): Promise<void> {
+	const deadline = Date.now() + timeoutMs;
+	while (!predicate()) {
+		if (Date.now() > deadline) throw new Error(`Timed out waiting for ${label}`);
+		await Bun.sleep(5);
+	}
+}
+
 async function run(cwd: string, args: string[]): Promise<string> {
 	const proc = Bun.spawn(["git", ...args], { cwd, stdout: "pipe", stderr: "pipe" });
 	const [code, stdout, stderr] = await Promise.all([
@@ -139,7 +154,7 @@ describe("PromptDeadlineManager deadline flush wiring (#5583)", () => {
 		});
 		const correlation = { commandId: "flush-cmd", turnId: "flush-turn" };
 		manager.onAccepted(correlation);
-		await Bun.sleep(150);
+		await waitFor(() => order.length === 2, "the flush and the retirement");
 
 		expect(finalized).toContain("prompt_deadline_exceeded");
 		// The flush runs before teardown, so the WIP commit exists by the time the
@@ -167,7 +182,7 @@ describe("PromptDeadlineManager deadline flush wiring (#5583)", () => {
 		});
 		const correlation = { commandId: "flush-fail-cmd", turnId: "flush-fail-turn" };
 		manager.onAccepted(correlation);
-		await Bun.sleep(150);
+		await waitFor(() => expired === 1, "the retirement after the failing flush");
 
 		expect(finalized).toContain("prompt_deadline_exceeded");
 		expect(expired).toBe(1);
@@ -196,7 +211,9 @@ describe("PromptDeadlineManager deadline flush wiring (#5583)", () => {
 		});
 		const correlation = { commandId: "flush-hang-cmd", turnId: "flush-hang-turn" };
 		manager.onAccepted(correlation);
-		await Bun.sleep(150);
+		// The poll bound is far above the 20ms flush bound on purpose: if the flush
+		// bound regressed, this times out with a legible message instead of hanging.
+		await waitFor(() => expired === 1, "teardown past the abandoned flush");
 
 		// Reaching these assertions at all is the point: teardown completed.
 		expect(finalized).toContain("prompt_deadline_exceeded");
@@ -248,7 +265,10 @@ describe("PromptDeadlineManager deadline flush wiring (#5583)", () => {
 		});
 		const correlation = { commandId: "flush-slow-cmd", turnId: "flush-slow-turn" };
 		manager.onAccepted(correlation);
-		await Bun.sleep(300);
+		// A real flush spawns five git subprocesses; a fixed sleep sized on a fast
+		// box is what made this flake on CI. The deep-equal below still pins order,
+		// so a truncated flush fails as ["retire"] rather than passing early.
+		await waitFor(() => order.length === 2, "the flush and the retirement");
 
 		// The bound must not truncate work that finishes within it.
 		expect(order).toEqual(["flush", "retire"]);
