@@ -111,8 +111,9 @@ export class PromptDeadlineManager {
 		onExpired?: (correlation: InvocationCorrelation) => void;
 		/**
 		 * Best-effort durability hook for the single path that genuinely retires a
-		 * prompt as `prompt_deadline_exceeded` (#5583). Awaited before ownership is
-		 * retired so it can persist work the teardown would otherwise strand; a
+		 * prompt as `prompt_deadline_exceeded` (#5583). Awaited after the durable
+		 * pending claim but BEFORE the durable terminal, so a crash in that window
+		 * leaves the record pending and recovery retries the prompt; a
 		 * rejection is swallowed and never changes the deadline outcome. Not called
 		 * when a real terminal transition or a real failure won the race, nor when
 		 * renewed progress supersedes this expiry instance. The hook receives an
@@ -253,6 +254,28 @@ export class PromptDeadlineManager {
 		// claim must cancel this expiry instance instead of surfacing an exceeded
 		// outcome for a prompt that is demonstrably alive.
 		if (this.#backOffIfSuperseded(key, lease, generation)) return;
+		// Durability BEFORE the durable terminal (#5583, #5623 review round 4). The
+		// claim above is already the durable pending marker, so a process death
+		// anywhere in this window leaves the record PENDING and restart recovery
+		// retries the prompt — work that was never autosaved is never reported as
+		// finished. Running the flush after `finalizeOutcome` instead made the
+		// autosave the one step a crash could silently skip, which is the whole
+		// durability guarantee of this change. The cost is that the durable terminal
+		// is delayed by at most the flush's bound.
+		//
+		// The wait is BOUNDED, not just guarded (#5623 review round 2): a hook that
+		// never settles — a blocking git lock, a credential prompt — would leave the
+		// finalize, `#onExpired` and `clear` below unreachable, stranding the prompt
+		// with neither a terminal nor an owner. A try/catch cannot rescue a promise
+		// that never settles, so the flush is raced against a real timer and
+		// abandoned if it outruns it.
+		await this.#runDeadlineFlush(correlation);
+		// Fence again AFTER the flush (#5623 review round 2): the flush is an await
+		// like any other here, and up to ten seconds long, so progress can land and
+		// renew the lease while it runs. A renewed prompt must not be terminalized as
+		// deadline-exceeded by this stale pass; `#backOffIfSuperseded` reschedules on
+		// the way out, so it keeps a live deadline.
+		if (this.#backOffIfSuperseded(key, lease, generation)) return;
 		try {
 			await this.#reconciliation.finalizeOutcome("prompt", correlation, outcome, () => {
 				const current = this.#leases.get(key);
@@ -269,25 +292,6 @@ export class PromptDeadlineManager {
 		// observed during the finalize await renews the lease past its deadline,
 		// so this expiry pass must not retire the now-live invocation's pending
 		// ownership even though the finalize write landed.
-		if (this.#backOffIfSuperseded(key, lease, generation)) return;
-		// Durability before teardown (#5583). This is the only path that retires a
-		// prompt as prompt_deadline_exceeded, and it runs after every supersession
-		// check, so a renewed lease never reaches it. The wait is BOUNDED, not just
-		// guarded (#5623 review round 2): a hook that never settles — a blocking
-		// git lock, a credential prompt, a hanging pre-commit hook — would leave
-		// `#onExpired` and `clear` below unreachable, stranding lifecycle ownership
-		// and the lease after the outcome was already finalized. A try/catch cannot
-		// rescue a promise that never settles, so the flush is raced against a real
-		// timer and abandoned if it outruns it.
-		await this.#runDeadlineFlush(correlation);
-		// Fence again AFTER the flush (#5623 review round 2): the flush is an await
-		// like any other here, and up to ten seconds long, so progress can land and
-		// renew the lease while it runs. The durable prompt_deadline_exceeded
-		// outcome was already finalized above and is not in question; what this
-		// guards is in-memory ownership — retiring `#onExpired` and clearing the
-		// lease of a prompt that has since been renewed or re-accepted would strand
-		// a live invocation with no owner and no deadline. `#backOffIfSuperseded`
-		// reschedules on the way out, so the renewed prompt keeps a live deadline.
 		if (this.#backOffIfSuperseded(key, lease, generation)) return;
 		// Retire pending ownership ONLY after durable terminal confirmation with
 		// no superseding progress (#4668 review P1): retiring earlier strands an
