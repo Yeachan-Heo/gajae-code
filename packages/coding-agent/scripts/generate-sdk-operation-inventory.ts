@@ -287,6 +287,8 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 		"internal fallback resolution bookkeeping, not a user-facing SDK control seam",
 	"agent_session:syncEagerDelegation":
 		"internal profile-derived eager delegation synchronization, not a user-facing SDK control seam",
+	"agent_session:submitUserMessage":
+		"public in-process embedder lifecycle API; direct handle surface, not an SDK transport operation",
 };
 /** Maps reviewed source seams to registry SDK operation IDs. */
 const SEAM_TO_SDK: Readonly<Record<string, string>> = {
@@ -811,10 +813,17 @@ export function scanAgentSessionMethods(sourceText: string): string[] {
 			throw new Error("SDK operation inventory scanner: AgentSession class body is unbalanced.");
 
 		const methods: string[] = [];
+		const seenMethods = new Set<string>();
 		for (let memberStart = bodyStart + 1; memberStart < bodyEnd; ) {
 			const declaration = scanMethodDeclaration(tokens, memberStart, bodyEnd);
 			if (declaration) {
-				if (declaration.name) methods.push(`agent_session:${declaration.name}`);
+				if (declaration.name) {
+					const sourceId = `agent_session:${declaration.name}`;
+					if (!seenMethods.has(sourceId)) {
+						seenMethods.add(sourceId);
+						methods.push(sourceId);
+					}
+				}
 				memberStart = Math.max(memberStart + 1, declaration.end);
 				continue;
 			}
