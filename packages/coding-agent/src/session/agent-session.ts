@@ -16559,9 +16559,16 @@ export class AgentSession {
 		const profile = this.#modelRegistry.getModelProfile?.(profileName);
 		if (!profile) return undefined;
 		const bindings = resolveProfileBindings(profile);
+		const configuredDefault = role === "default" ? this.getConfiguredModelChain("default")?.[0] : undefined;
+		const profileDefault = Array.isArray(bindings.defaultSelector)
+			? bindings.defaultSelector[0]
+			: bindings.defaultSelector;
+		const ownsConfiguredDefault =
+			profileDefault !== undefined &&
+			configuredDefault?.trim().toLowerCase() === profileDefault.trim().toLowerCase();
 		const owned =
 			role === "default"
-				? bindings.defaultSelector !== undefined
+				? runtimeDefaultIdentity?.origin === "runtime" || ownsConfiguredDefault
 				: Object.hasOwn(bindings.modelRoles, role) || Object.hasOwn(bindings.agentModelOverrides, role);
 		return owned ? { aliasIntent: "preset-equivalent" } : undefined;
 	}
