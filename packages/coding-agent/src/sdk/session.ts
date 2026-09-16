@@ -4150,6 +4150,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				toolDiscoveryActive: effectiveDiscoveryMode === "all" || mcpDiscoveryEnabled,
 				eagerTasks: resolveEagerTasks(),
 				secretsEnabled,
+				taskIsolationEnabled: settings.get("task.isolation.mode") !== "none",
 				workspaceTree: workspaceTreePromise,
 				subagent: options.parentTaskPrefix !== undefined,
 			});

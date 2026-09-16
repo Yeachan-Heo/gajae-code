@@ -11,7 +11,12 @@
  */
 
 /** Agent session event types that constitute attributable agent/skill/tool progress. */
-const ATTRIBUTABLE_PROGRESS_EVENT_TYPES = new Set(["tool_execution_start", "tool_execution_end"]);
+const ATTRIBUTABLE_PROGRESS_EVENT_TYPES = new Set([
+	"tool_execution_start",
+	/** Periodic output from a running tool; renews the deadline for long-running tools (e.g. Gradle compiles). */
+	"tool_execution_update",
+	"tool_execution_end",
+]);
 
 export interface PromptDeadlineLease {
 	/** When the prompt was accepted; anchors the hard maximum runtime. */
@@ -57,9 +62,12 @@ export function recordAttributableProgress(lease: PromptDeadlineLease, now: numb
 
 /**
  * Whether an agent session event at the prompt/agent runtime boundary is
- * attributable progress for the accepted prompt. Only tool execution
- * boundaries qualify: skills do their work through tools, so skill progress is
- * covered; streaming text/thinking deltas, retries, and bookkeeping are not.
+ * attributable progress for the accepted prompt. Tool execution boundaries and
+ * streaming updates qualify: skills do their work through tools, so skill
+ * progress is covered; `tool_execution_update` keeps long-running tools (e.g.
+ * a multi-minute Gradle compile that streams stdout) from tripping the
+ * inactivity deadline mid-run. Streaming text/thinking deltas, retries, and
+ * bookkeeping are not attributable.
  */
 export function isAttributableProgressEventType(type: string): boolean {
 	return ATTRIBUTABLE_PROGRESS_EVENT_TYPES.has(type);

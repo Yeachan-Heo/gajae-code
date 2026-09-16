@@ -361,18 +361,48 @@ test("attributable tool progress renews the accepted prompt deadline on the bus 
 	}
 }, 30_000);
 
-test("non-attributable bus events never renew the accepted prompt deadline", async () => {
-	// AC-1 + AC-3: streaming chatter and tool updates are not progress, so the
-	// zero-activity expiry at acceptedAt + leaseMs is preserved.
-	const session = await acceptPrompt("chatter", LEASE_MS, 60_000);
+test("tool_execution_update renews the accepted prompt deadline on the bus route", async () => {
+	// #5575: periodic output from a long-running tool is attributable progress, so
+	// a `tool_execution_update` at ~60% of the lease renews the terminal deadline
+	// past the original acceptance-anchored fixed point.
+	const session = await acceptPrompt("update-renew", LEASE_MS, 60_000);
 	try {
 		await Bun.sleep(600);
 		session.handlers.get("tool_execution_update")?.(
-			{ type: "tool_execution_update", toolCallId: "chatter-tool", output: "tick" },
+			{ type: "tool_execution_update", toolCallId: "update-renew-tool", output: "tick" },
 			session.sessionContext,
 		);
+
+		// Past the ORIGINAL fixed deadline, with margin for timer jitter.
+		await waitFor(() => Date.now() - session.acceptedAt > LEASE_MS + 250, "original fixed deadline to pass");
+		expect(session.deadlineTerminals()).toHaveLength(0);
+
+		// The renewed deadline still terminalizes exactly once: renewal bounds, it
+		// does not disable.
+		await waitFor(() => session.deadlineTerminals().length > 0, "renewed deadline terminal");
+		expect(Date.now() - session.acceptedAt).toBeGreaterThan(LEASE_MS + 300);
+		await Bun.sleep(200);
+		expect(session.deadlineTerminals()).toHaveLength(1);
+		expect((session.deadlineTerminals()[0]?.error as { message?: string }).message).toBe("Prompt deadline exceeded.");
+	} finally {
+		await shutdown(session);
+	}
+}, 30_000);
+
+test("non-attributable bus events never renew the accepted prompt deadline", async () => {
+	// AC-1 + AC-3: streaming text chatter is not progress, so the zero-activity
+	// expiry at acceptedAt + leaseMs is preserved. Tool boundaries — including
+	// `tool_execution_update` — ARE attributable now, so they are covered by the
+	// renewal cases, not here.
+	const session = await acceptPrompt("chatter", LEASE_MS, 60_000);
+	try {
+		await Bun.sleep(600);
 		session.handlers.get("message_update")?.(
 			{ type: "message_update", messageId: "chatter-message", delta: "still thinking" },
+			session.sessionContext,
+		);
+		session.handlers.get("message_end")?.(
+			{ type: "message_end", messageId: "chatter-message", message: { role: "assistant", content: [] } },
 			session.sessionContext,
 		);
 

@@ -1266,7 +1266,9 @@ export async function clone(url: string, targetDir: string, options: CloneOption
 	const args = ["clone", "--depth", "1"];
 	if (options.ref) args.push("--branch", options.ref, "--single-branch");
 	else args.push("--single-branch");
-	args.push(url, absoluteTarget);
+	// `--` ends option parsing, so a URL that begins with `-` can never be read as
+	// a git option (`--upload-pack=...` and friends).
+	args.push("--", url, absoluteTarget);
 
 	try {
 		await runEffect(path.dirname(absoluteTarget), args, { signal: options.signal });

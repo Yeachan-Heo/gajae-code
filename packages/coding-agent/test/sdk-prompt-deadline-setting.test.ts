@@ -9,8 +9,8 @@ function schemaReportFor(value: unknown) {
 }
 
 describe("sdk.promptDeadlineMs", () => {
-	it("defaults to 1,800,000 milliseconds", () => {
-		expect(Settings.isolated().get(SETTING_PATH)).toBe(1_800_000);
+	it("defaults to 3,600,000 milliseconds", () => {
+		expect(Settings.isolated().get(SETTING_PATH)).toBe(3_600_000);
 	});
 
 	it("accepts its inclusive safe-integer bounds", () => {

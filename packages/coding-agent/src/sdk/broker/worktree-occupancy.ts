@@ -67,6 +67,20 @@ export function observeProcess(
  * `uncertain` counts as occupied: refusing a launch is recoverable by picking
  * another worktree name, whereas two live sessions sharing a checkout corrupts
  * work already done.
+ *
+ * A row carrying BOTH `terminalUncertain` and `forcedStaleRelease` is the one
+ * exception. That pair is written only by the forced stop of a stale-endpoint
+ * session: teardown was requested explicitly, so parking its worktree until an
+ * OS probe happens to prove exit would leave the checkout locked indefinitely
+ * (#5581) exactly when the probe returns `uncertain`. Such a row is released
+ * regardless of the process observation.
+ *
+ * `terminalUncertain` on its own is not enough. The fail-closed tail of a
+ * signal-escalated teardown sets it after SIGKILL without ever proving the child
+ * gone, so that process may still be running in the checkout; releasing on the
+ * flag alone would let a second session into the same worktree. Those rows stay
+ * under the strict "only definitive exit releases" rule like every other
+ * ordinary retained row.
  */
 export function worktreeOccupant(
 	sessions: readonly IndexedSession[],
@@ -79,7 +93,13 @@ export function worktreeOccupant(
 	const target = resolveEquivalentPath(worktreePath);
 	for (const session of sessions) {
 		const sessionWorktreeRoot = session.locator.worktreeRoot;
-		if (session.terminal || typeof sessionWorktreeRoot !== "string" || sessionWorktreeRoot.length === 0) continue;
+		if (
+			session.terminal ||
+			(session.terminalUncertain === true && session.forcedStaleRelease === true) ||
+			typeof sessionWorktreeRoot !== "string" ||
+			sessionWorktreeRoot.length === 0
+		)
+			continue;
 		if (resolveEquivalentPath(sessionWorktreeRoot) !== target) continue;
 		// `live` is heartbeat-derived and can be stale. Only positive process-exit
 		// evidence releases a matching retained session's worktree.

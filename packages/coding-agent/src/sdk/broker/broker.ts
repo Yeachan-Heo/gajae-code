@@ -3,7 +3,7 @@ import type { BigIntStats } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import path from "node:path";
-import type { NativeDirectoryTreeSnapshot } from "@gajae-code/natives";
+import type { NativeBrokerRestartIntent, NativeDirectoryTreeSnapshot } from "@gajae-code/natives";
 import { logger, resolveEquivalentPath } from "@gajae-code/utils";
 import packageJson from "../../../package.json" with { type: "json" };
 import type { ModelProfileErrorDetails } from "../../config/model-profile-contract";
@@ -14,6 +14,7 @@ import {
 	BROKER_RUNTIME_CLOSE_CAPABILITY_FIELD,
 } from "../host/control/runtime-gate";
 import { createDefaultSdkHostModelResolver, type SdkHostModelResolver } from "../host/model-pin";
+import { canonicalServiceRootDigest } from "../service-artifact-paths";
 import {
 	type DirectoryMigrationPolicy,
 	listManagedSessionCandidates,
@@ -32,6 +33,7 @@ import {
 	type RedactedBrokerDiscovery,
 	type RetainedBrokerDiscovery,
 	readBrokerDiscovery,
+	readBrokerRestartIntent,
 	redactBrokerDiscovery,
 } from "./discovery";
 import { endpointIncarnation, matchesIndexedEndpointFile, readEndpointFile } from "./endpoint-authority";
@@ -94,6 +96,14 @@ export interface BrokerSettings {
 	masterOrphanGraceMs?: number;
 	/** Host model resolver override for lifecycle tests and embedders. */
 	resolveModelPin?: SdkHostModelResolver;
+	/**
+	 * Exact restart request this process instance is the authorized successor
+	 * for. Set only by the real `broker-internal` entry point from its own
+	 * `GJC_BROKER_RESTART_REQUEST` environment read — never inferred here from
+	 * `process.env` directly, so the value this broker publishes is exactly the
+	 * value its launcher decided, with no cast/assumed tag in between.
+	 */
+	restartRequestId?: string;
 }
 
 type ResolvedBrokerSettings = {
@@ -107,6 +117,7 @@ type ResolvedBrokerSettings = {
 	spawnSubstrateProvider?: SpawnSubstrateProvider;
 	spawnPromptLayer?: SpawnPromptLayer;
 	masterOrphanGraceMs: number;
+	restartRequestId?: string;
 };
 export function resolveBrokerPackageGeneration(): string {
 	const v = (packageJson as { version?: unknown }).version;
@@ -1106,6 +1117,32 @@ export interface StartupAdmissionTiming {
 	sleep(ms: number, signal?: AbortSignal): Promise<void>;
 }
 
+export interface BrokerRestartOwnerIdentity {
+	ownerId: string;
+	generation: string;
+	pid: number;
+	incarnation: string;
+}
+export interface BrokerRestartPrepareOptions extends BrokerRestartOwnerIdentity {
+	requestId: string;
+	deadlineAt: number;
+	drain?: boolean;
+}
+export interface BrokerRestartPrepareResult {
+	lease: string;
+	occupancyEpoch: number;
+	expiresAt: number;
+	requestId: string;
+	owner: BrokerRestartOwnerIdentity;
+}
+export interface BrokerRestartCommitOptions extends BrokerRestartPrepareOptions {
+	lease: string;
+	occupancyEpoch: number;
+}
+export type BrokerRestartResult =
+	| { ok: true; result: BrokerRestartPrepareResult | { committed: true } | { cancelled: true } }
+	| { ok: false; error: { code: string; message: string } };
+
 export type StartupAdmissionResult<T> =
 	| { status: "completed"; admittedAt: number; value: T }
 	| { status: "admission_timeout"; reason: "admission_timeout" }
@@ -1278,6 +1315,15 @@ export class Broker {
 	#rejectCompletion!: (error: unknown) => void;
 	#resolveModelPin: SdkHostModelResolver;
 	#ownsResolveModelPin: boolean;
+	#restart:
+		| {
+				options: BrokerRestartPrepareOptions;
+				lease: string;
+				occupancyEpoch: number;
+				expiresAt: number;
+				timer: NodeJS.Timeout;
+		  }
+		| undefined;
 	constructor(settings: BrokerSettings) {
 		this.settings = {
 			agentDir: settings.agentDir,
@@ -1290,6 +1336,7 @@ export class Broker {
 			spawnSubstrateProvider: settings.spawnSubstrateProvider,
 			spawnPromptLayer: settings.spawnPromptLayer,
 			masterOrphanGraceMs: settings.masterOrphanGraceMs ?? MASTER_ORPHAN_GRACE_DEFAULT_MS,
+			...(settings.restartRequestId === undefined ? {} : { restartRequestId: settings.restartRequestId }),
 		};
 		this.index = new SessionIndex(settings.agentDir);
 		this.ledger = new LifecycleLedger(settings.agentDir);
@@ -2392,9 +2439,23 @@ export class Broker {
 	async #createLock(): Promise<void> {
 		await fs.mkdir(this.#lock, { mode: 0o700 });
 		try {
+			const incarnation = brokerProcessIncarnation(process.pid);
+			// A minimal, non-secret receipt delta for D9 stale-artifact detach
+			// (sequenced follow-up): the OS incarnation and a digest of the exact
+			// resolved root this lock authorizes, so a later positive-death check can
+			// cross-bind this owner record against the discovery record it authored
+			// without re-deriving anything from file content or adding new identity.
+			const rootDigest = await canonicalServiceRootDigest(this.settings.agentDir);
 			await fs.writeFile(
 				this.#lockRecordPath(),
-				JSON.stringify({ version: 1, ownerId: this.#owner, pid: process.pid, acquiredAt: Date.now() }),
+				JSON.stringify({
+					version: 1,
+					ownerId: this.#owner,
+					pid: process.pid,
+					acquiredAt: Date.now(),
+					...(incarnation ? { incarnation } : {}),
+					rootDigest,
+				}),
 				{ flag: "wx", mode: 0o600 },
 			);
 		} catch (e) {
@@ -2577,6 +2638,9 @@ export class Broker {
 				token,
 				startedAt: now,
 				heartbeatAt: now,
+				...(this.settings.restartRequestId === undefined
+					? {}
+					: { restartRequestId: this.settings.restartRequestId }),
 			};
 			// Readiness must not be externally visible until the initial session
 			// checkpoint settles. The bootstrap watchdog owns this pre-publication
@@ -2594,6 +2658,23 @@ export class Broker {
 				void this.#watchPublication();
 				void this.#reapSpawnOrphans();
 			}, cadenceMs);
+			// This process is now the independently verified successor: its own
+			// discovery just published under its own retained authority. Release the
+			// predecessor's reservation only now, keyed to the exact request this
+			// process was launched for -- never on a startup that carries no restart
+			// request, and never before this publish proved this is the real owner.
+			if (this.settings.restartRequestId !== undefined && this.#publication) {
+				try {
+					const intent = await readBrokerRestartIntent(this.settings.agentDir);
+					if (intent && intent.phase === "committed" && intent.requestId === this.settings.restartRequestId)
+						await this.#publication.clearForeignRestartIntent(intent.identity);
+				} catch {
+					// Best-effort reservation release. The admission gate in ensure.ts keys
+					// off requestId equality, which already matches this exact successor,
+					// so a retained committed intent here blocks nothing further; a failed
+					// clear must never fail this broker's own successful startup.
+				}
+			}
 			return this.discovery;
 		} catch (error) {
 			await this.#transport?.stop();
@@ -2610,6 +2691,130 @@ export class Broker {
 	}
 	get completion(): Promise<void> {
 		return this.#completion;
+	}
+	#restartIdentity(): BrokerRestartOwnerIdentity | undefined {
+		const d = this.discovery;
+		if (!d?.incarnation) return undefined;
+		return { ownerId: d.ownerId, generation: d.packageGeneration, pid: d.pid, incarnation: d.incarnation };
+	}
+	#restartBusy(): boolean {
+		for (const session of this.index.listSessions().sessions) {
+			if (session.live && !session.terminal) return true;
+		}
+		return this.#admitted.size > 1;
+	}
+	async prepareRestart(options: BrokerRestartPrepareOptions): Promise<BrokerRestartResult> {
+		const identity = this.#restartIdentity();
+		if (
+			!identity ||
+			options.ownerId !== identity.ownerId ||
+			options.generation !== identity.generation ||
+			options.pid !== identity.pid ||
+			options.incarnation !== identity.incarnation ||
+			!options.requestId ||
+			!Number.isSafeInteger(options.deadlineAt) ||
+			options.deadlineAt <= Date.now()
+		)
+			return { ok: false, error: { code: "restart_identity_mismatch", message: "broker owner identity mismatch" } };
+		if (this.#restart) {
+			if (this.#restart.options.requestId !== options.requestId)
+				return {
+					ok: false,
+					error: { code: "restart_request_mismatch", message: "restart request is already prepared" },
+				};
+			return {
+				ok: true,
+				result: {
+					lease: this.#restart.lease,
+					occupancyEpoch: this.#restart.occupancyEpoch,
+					expiresAt: this.#restart.expiresAt,
+					requestId: this.#restart.options.requestId,
+					owner: identity,
+				},
+			};
+		}
+		this.#startupAdmissions.close();
+		const occupancyEpoch = this.index.listSessions().indexSeq;
+		const lease = randomBytes(24).toString("base64url");
+		const expiresAt = Math.min(options.deadlineAt, Date.now() + 30_000);
+		const timer = setTimeout(() => void this.cancelRestart(options.requestId), Math.max(1, expiresAt - Date.now()));
+		this.#restart = { options, lease, occupancyEpoch, expiresAt, timer };
+		const abortPrepare = async (code: string, message: string): Promise<BrokerRestartResult> => {
+			clearTimeout(timer);
+			this.#restart = undefined;
+			this.#startupAdmissions.reopen();
+			return { ok: false, error: { code, message } };
+		};
+		try {
+			await this.index.refresh();
+		} catch {
+			return abortPrepare("restart_prepare_failed", "broker occupancy could not be refreshed");
+		}
+		const deadline = Math.min(options.deadlineAt, Date.now() + 30_000);
+		while (options.drain && this.#restartBusy() && Date.now() < deadline) await Bun.sleep(25);
+		if (this.#restartBusy()) return abortPrepare("restart_busy", "broker has active or admitted work");
+		const intent: NativeBrokerRestartIntent = { requestId: options.requestId, lease, expiresAt };
+		const publication = this.#publication;
+		if (!publication || !(await publication.prepareRestartIntent(intent)))
+			return abortPrepare("restart_prepare_failed", "restart intent could not be durably prepared");
+		return { ok: true, result: { lease, occupancyEpoch, expiresAt, requestId: options.requestId, owner: identity } };
+	}
+	async commitRestart(options: BrokerRestartCommitOptions): Promise<BrokerRestartResult> {
+		const current = this.#restart;
+		const identity = this.#restartIdentity();
+		if (
+			!current ||
+			!identity ||
+			current.lease !== options.lease ||
+			current.occupancyEpoch !== options.occupancyEpoch ||
+			current.options.requestId !== options.requestId ||
+			options.ownerId !== identity.ownerId ||
+			options.generation !== identity.generation ||
+			options.pid !== identity.pid ||
+			options.incarnation !== identity.incarnation ||
+			Date.now() >= current.expiresAt ||
+			this.#restartBusy()
+		)
+			return { ok: false, error: { code: "restart_commit_refused", message: "restart commit proof is invalid" } };
+		const publication = this.#publication;
+		const intent: NativeBrokerRestartIntent = {
+			requestId: options.requestId,
+			lease: current.lease,
+			expiresAt: current.expiresAt,
+		};
+		if (!publication || !(await publication.commitRestartIntent(intent)))
+			return {
+				ok: false,
+				error: { code: "restart_commit_refused", message: "restart intent could not be durably committed" },
+			};
+		clearTimeout(current.timer);
+		// The retained restart-intent slot (independent of `sdk/broker.lock/`)
+		// deliberately survives this owned-root exit: it is the durable proof a
+		// successor's ordinary startup consults, and clearing it here -- before
+		// this process has actually exited -- would let a racing ordinary
+		// `ensureBroker` treat the still-live old owner as idle and spawn early.
+		setTimeout(() => {
+			void this.#complete("owned-root").finally(() => {
+				if (this.#restart === current) this.#restart = undefined;
+			});
+		}, 0);
+		return { ok: true, result: { committed: true } };
+	}
+	async cancelRestart(requestId: string): Promise<BrokerRestartResult> {
+		const current = this.#restart;
+		if (!current) return { ok: true, result: { cancelled: true } };
+		if (current.options.requestId !== requestId)
+			return { ok: false, error: { code: "restart_request_mismatch", message: "restart request does not match" } };
+		const publication = this.#publication;
+		// Best-effort: the owner's own descriptor-bound cancel removes the intent
+		// it prepared. A publication that is no longer reachable (already fenced,
+		// already stopping) leaves the slot for lease-expiry discovery by the
+		// caller instead of retrying indefinitely inside this admission path.
+		if (publication) await publication.cancelRestartIntent().catch(() => undefined);
+		clearTimeout(current.timer);
+		this.#restart = undefined;
+		this.#startupAdmissions.reopen();
+		return { ok: true, result: { cancelled: true } };
 	}
 	status(): RedactedBrokerDiscovery | null {
 		return this.discovery ? redactBrokerDiscovery(this.discovery) : null;
@@ -3198,8 +3403,22 @@ export class Broker {
 			: error("terminal_uncertain", "lifecycle outcome has no recorded response");
 	}
 	handleRequest(operation: string, input: Record<string, unknown>, idempotencyKey?: string): Promise<BrokerResponse> {
+		if (operation === "broker.status") return Promise.resolve({ ok: true, result: this.status() });
+		if (operation === "broker.prepare_restart")
+			return this.prepareRestart(input as unknown as BrokerRestartPrepareOptions).then(
+				result => result as BrokerResponse,
+			);
+		if (operation === "broker.commit_restart")
+			return this.commitRestart(input as unknown as BrokerRestartCommitOptions).then(
+				result => result as BrokerResponse,
+			);
+		if (operation === "broker.cancel_restart") {
+			const requestId = typeof input.requestId === "string" ? input.requestId : "";
+			return this.cancelRestart(requestId).then(result => result as BrokerResponse);
+		}
 		if (this.#stopping || (this.#publication !== null && this.#publicationState !== "healthy-owned"))
 			return Promise.resolve(error("unavailable", "broker publication is unavailable"));
+		if (this.#restart) return Promise.resolve(error("broker_restarting", "broker restart is prepared"));
 		let release!: () => void;
 		const admission = new Promise<void>(resolve => (release = resolve));
 		this.#admitted.add(admission);

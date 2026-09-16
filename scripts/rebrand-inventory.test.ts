@@ -1,118 +1,103 @@
 import { expect, test } from "bun:test";
-import * as fs from "node:fs/promises";
+import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
+import { fileURLToPath } from "node:url";
 
-const script = path.join(import.meta.dir, "rebrand-inventory.ts");
-const legacyToken = `OM${"p"}`;
+const script = fileURLToPath(new URL("./rebrand-inventory.ts", import.meta.url));
+const legacyToken = "om" + "p";
 
-async function scan(root: string) {
-	const child = Bun.spawn(["bun", script, "--json"], { cwd: root, stdout: "pipe", stderr: "pipe" });
-	const [stdout, , exitCode] = await Promise.all([
-		new Response(child.stdout).text(),
-		new Response(child.stderr).text(),
-		child.exited,
-	]);
-	expect(exitCode).toBe(0);
-	return JSON.parse(stdout) as {
-		inventory: { legacyHits: { allowlisted: number; unexpected: { path: string; token: string }[] } };
-		violations: { unexpectedLegacyHitCount: number };
+function fixture(): string {
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-rebrand-inventory-"));
+	const write = (name: string, content: string): void => {
+		const file = path.join(root, name);
+		fs.mkdirSync(path.dirname(file), { recursive: true });
+		fs.writeFileSync(file, content);
 	};
-}
-
-async function fixture(files: Record<string, string | Uint8Array>) {
-	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "rebrand-inventory-"));
-	await fs.writeFile(
-		path.join(root, "package.json"),
-		JSON.stringify({ name: "gajae-code", description: "d", homepage: "h", repository: "r", bugs: "b" }),
+	write("package.json", JSON.stringify({ name: "gajae-code" }));
+	write(
+		"packages/coding-agent/package.json",
+		JSON.stringify({ name: "@gajae-code/coding-agent", bin: { gjc: "cli.js", "gjc-stats": "stats.js" } }),
 	);
-	for (const [rel, body] of Object.entries(files)) {
-		const abs = path.join(root, rel);
-		await fs.mkdir(path.dirname(abs), { recursive: true });
-		await fs.writeFile(abs, body);
-	}
+	for (const name of ["autoresearch", "deep-interview", "ralplan", "ultragoal"])
+		write(`packages/coding-agent/src/defaults/gjc/skills/${name}/SKILL.md`, name);
+	for (const name of ["architect", "critic", "executor", "planner"])
+		write(`packages/coding-agent/src/prompts/agents/${name}.md`, name);
+	fs.mkdirSync(path.join(root, "docs", "cheatsheet", "src"), { recursive: true });
 	return root;
 }
 
-// A compressed byte run inside a binary asset can decode into text that spells a
-// legacy token. Two committed cheatsheet PDFs did exactly that and turned the dev
-// gate red while no brand surface actually regressed.
-test("a legacy token spelled by binary bytes is not reported as a brand hit", async () => {
-	// The token sits on a word boundary exactly as it did in the committed PDFs,
-	// so this fixture is a true red control for the unguarded scanner.
-	const binary = new Uint8Array([0x25, 0x50, 0x44, 0x46, 0x00, 0xd8, ...Buffer.from(` ${legacyToken} `), 0x00, 0xff]);
-	const root = await fixture({ "docs/cheatsheet/sheet.pdf": binary, "docs/assets/blob.bin": binary });
+function inventory(root: string) {
+	const result = Bun.spawnSync([process.execPath, script, "--strict", "--json"], { cwd: root });
+	expect(result.stderr.toString()).toBe("");
+	return { exitCode: result.exitCode, report: JSON.parse(result.stdout.toString()) };
+}
+
+test("PDF binary payloads are not scanned as source text", () => {
+	const root = fixture();
 	try {
-		const report = await scan(root);
+		for (const extension of ["pdf", "PDF"])
+			fs.writeFileSync(
+				path.join(root, "docs", "cheatsheet", `binary.${extension}`),
+				Buffer.from(`%PDF-1.4\nstream\n\0${legacyToken}\0\nendstream\n%%EOF`),
+			);
+		const { exitCode, report } = inventory(root);
+		expect(exitCode).toBe(0);
 		expect(report.violations.unexpectedLegacyHitCount).toBe(0);
 		expect(report.inventory.legacyHits.unexpected).toEqual([]);
 	} finally {
-		await fs.rm(root, { recursive: true, force: true });
+		fs.rmSync(root, { recursive: true, force: true });
 	}
 });
 
-// Review finding A2/1: NUL bytes are not the only binary marker. An asset with an
-// unknown extension and no NUL in its sniff window was still token-scanned, so the
-// false positive the PR set out to remove stayed reachable.
-test("a legacy token spelled by NUL-free binary bytes is not reported as a brand hit", async () => {
-	// A real woff2 header followed by invalid UTF-8 continuation bytes: no NUL anywhere,
-	// and an extension the walker does not recognize.
-	const nulFree = new Uint8Array([
-		0x77,
-		0x4f,
-		0x46,
-		0x32,
-		0xc3,
-		0x28,
-		...Buffer.from(` ${legacyToken} `),
-		0xa0,
-		0xa1,
-		0xff,
-		0xfe,
-	]);
-	expect(nulFree.includes(0)).toBe(false);
-	const root = await fixture({ "docs/assets/glyphs.woff2": nulFree, "docs/assets/opaque.qqq": nulFree });
+// Review finding A2/1: the extension list above cannot close this hole, because
+// walk() still admits arbitrary unknown extensions. A NUL-free binary asset was
+// therefore decoded and token-scanned, leaving the false positive reachable.
+test.each(["woff2", "qqq"])("NUL-free binary payloads are not scanned as source text (.%s)", extension => {
+	const root = fixture();
 	try {
-		const report = await scan(root);
+		// Real woff2 signature, then invalid UTF-8 continuation bytes. No NUL anywhere.
+		const payload = Buffer.concat([
+			Buffer.from([0x77, 0x4f, 0x46, 0x32, 0xc3, 0x28]),
+			Buffer.from(` ${legacyToken} `),
+			Buffer.from([0xa0, 0xa1, 0xff, 0xfe]),
+		]);
+		expect(payload.includes(0)).toBe(false);
+		fs.writeFileSync(path.join(root, "docs", "cheatsheet", `asset.${extension}`), payload);
+		const { exitCode, report } = inventory(root);
+		expect(exitCode).toBe(0);
 		expect(report.violations.unexpectedLegacyHitCount).toBe(0);
 		expect(report.inventory.legacyHits.unexpected).toEqual([]);
 	} finally {
-		await fs.rm(root, { recursive: true, force: true });
+		fs.rmSync(root, { recursive: true, force: true });
 	}
 });
 
-// Guard the other direction: a text file longer than the sniff window must stay a
-// brand surface even though its window ends mid-character.
-test("a long UTF-8 text doc whose sniff window splits a character is still reported", async () => {
-	const filler = "\uAC00".repeat(4000); // 12000 bytes of 3-byte characters
-	const root = await fixture({ "docs/long.md": `${filler}\nThe ${legacyToken} runtime is gone.\n` });
+// Guard the other direction: the binary sniff window must not misread a long text
+// file whose window boundary splits a multibyte character.
+test("long UTF-8 text whose sniff window splits a character still fails strict inventory", () => {
+	const root = fixture();
 	try {
-		const report = await scan(root);
+		const filler = "\uAC00".repeat(4000); // 12000 bytes of 3-byte characters
+		fs.writeFileSync(path.join(root, "README.md"), `${filler}\nLegacy CLI: ${legacyToken}\n`);
+		const { exitCode, report } = inventory(root);
+		expect(exitCode).toBe(1);
 		expect(report.violations.unexpectedLegacyHitCount).toBe(1);
-		expect(report.inventory.legacyHits.unexpected[0]?.path).toBe("docs/long.md");
+		expect(report.inventory.legacyHits.unexpected).toEqual([{ line: 2, path: "README.md", token: legacyToken }]);
 	} finally {
-		await fs.rm(root, { recursive: true, force: true });
+		fs.rmSync(root, { recursive: true, force: true });
 	}
 });
 
-// Positive control: skipping binaries must not weaken detection in real text.
-test("a legacy token written in a text doc is still reported", async () => {
-	const root = await fixture({ "docs/notes.md": `The ${legacyToken} runtime is gone.\n` });
+test.each(["README.md", "docs/cheatsheet/src/content.py"])("legacy text in %s still fails strict inventory", file => {
+	const root = fixture();
 	try {
-		const report = await scan(root);
+		fs.writeFileSync(path.join(root, file), `Legacy CLI: ${legacyToken}\n`);
+		const { exitCode, report } = inventory(root);
+		expect(exitCode).toBe(1);
 		expect(report.violations.unexpectedLegacyHitCount).toBe(1);
-		expect(report.inventory.legacyHits.unexpected[0]?.path).toBe("docs/notes.md");
+		expect(report.inventory.legacyHits.unexpected).toEqual([{ line: 1, path: file, token: legacyToken }]);
 	} finally {
-		await fs.rm(root, { recursive: true, force: true });
-	}
-});
-
-test("an allowlisted text surface keeps its exemption", async () => {
-	const root = await fixture({ "docs/environment-variables.md": `Retained ${legacyToken} variable.\n` });
-	try {
-		const report = await scan(root);
-		expect(report.violations.unexpectedLegacyHitCount).toBe(0);
-		expect(report.inventory.legacyHits.allowlisted).toBe(1);
-	} finally {
-		await fs.rm(root, { recursive: true, force: true });
+		fs.rmSync(root, { recursive: true, force: true });
 	}
 });

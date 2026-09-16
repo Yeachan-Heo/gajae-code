@@ -2162,7 +2162,15 @@ export async function inspectFileLockStagingDir(
 	const namePid = fileLockStagingOwnerPid(path.basename(stagingPath));
 	if (namePid === null) return kept;
 	const canonical = await canonicalLockPathPreservingFinal(stagingPath);
-	const root = await fs.lstat(canonical, { bigint: true });
+	// A winning acquirer publishes (renames) its staging directory concurrently, so the
+	// candidate can disappear between the caller's readdir and this observation.
+	let root: BigIntStats;
+	try {
+		root = await fs.lstat(canonical, { bigint: true });
+	} catch (error) {
+		if (!isEnoent(error)) throw error;
+		return { ...kept, reason: "enoent_already_gone" };
+	}
 	if (!root.isDirectory() || root.isSymbolicLink()) return kept;
 	const captured = nativeFileLockBindings().snapshotDirectoryTree(canonical);
 	if (
@@ -2222,14 +2230,24 @@ export async function inspectFileLockStagingDir(
 		!removal.retainedPlaceholderPath &&
 		!removal.retainedUnknownPath
 	) {
-		const detached = await fs.lstat(removal.detachedPath, { bigint: true });
+		let detached: BigIntStats | null;
+		try {
+			detached = await fs.lstat(removal.detachedPath, { bigint: true });
+		} catch (error) {
+			if (!isEnoent(error)) throw error;
+			detached = null;
+		}
 		if (
-			detached.isDirectory() &&
+			detached?.isDirectory() &&
 			!detached.isSymbolicLink() &&
 			detached.dev.toString() === captured.snapshot.rootDev &&
 			detached.ino.toString() === captured.snapshot.rootIno
 		) {
-			await fs.rmdir(removal.detachedPath);
+			try {
+				await fs.rmdir(removal.detachedPath);
+			} catch (error) {
+				if (!isEnoent(error)) throw error;
+			}
 			return { ...result, removed: true, reason: "removed" };
 		}
 	}

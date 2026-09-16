@@ -34,7 +34,7 @@ For `workflow.gate_answer`, use the durable workflow gate ID and pass `expectedS
 
 ## Long-running prompts
 
-The SDK prompt deadline is progress-aware: `sdk.promptDeadlineMs` (30 min, `60_000–86_400_000`) is an inactivity lease renewed only by attributable `tool_execution_start` / `tool_execution_end` for the exact accepted `commandId`/`turnId`, bounded by `sdk.promptMaxRuntimeMs` (6 h default, `60_000–86_400_000`, caps at 24 h). Persist `session_id` / `turn_id` from `turn.prompt` acceptance and reconcile with `turn.result` (Q26) rather than replaying blindly. Distinguish the bounded `await_turn` poll `timeout_ms` from the SDK terminal deadline; heartbeats, streaming text/thinking deltas, retries, and other-turn activity do not renew the lease.
+The SDK prompt deadline is progress-aware: `sdk.promptDeadlineMs` (30 min, `60_000–86_400_000`) is an inactivity lease renewed only by attributable `tool_execution_start` / `tool_execution_update` / `tool_execution_end` for the exact accepted `commandId`/`turnId`, bounded by `sdk.promptMaxRuntimeMs` (6 h default, `60_000–86_400_000`, caps at 24 h). A running tool's partial-result `tool_execution_update` counts, so a long-running tool that streams output keeps the lease alive mid-run. Persist `session_id` / `turn_id` from `turn.prompt` acceptance and reconcile with `turn.result` (Q26) rather than replaying blindly. Distinguish the bounded `await_turn` poll `timeout_ms` from the SDK terminal deadline; heartbeats, streaming text/thinking deltas, retries, and other-turn activity do not renew the lease.
 
 ## Allowed lifecycle operations
 

@@ -205,11 +205,19 @@ describe("dev-ci Telegram daemon generation guard topology", () => {
 		for (const changedPath of [
 			"packages/coding-agent/src/capability/fs.ts",
 			"packages/coding-agent/test/pr-4834-home-isolation.test.ts",
+			// Doctor's journal-backed repair refusal is a win32-only contract (the Rust
+			// journal authority is #[cfg(unix)]), so every doctor implementation change
+			// must both run and require this job rather than only the Ubuntu shards.
+			"packages/coding-agent/src/cli/doctor",
+			"packages/coding-agent/test/doctor-windows-repair-gate.test.ts",
 		]) {
 			expect(eligibility).toContain(changedPath);
 			expect(producerRequired).toContain(changedPath);
 			expect(affectedRequired).toContain(changedPath);
 		}
+		expect(namedStep(requiredJob(d, "windows-dev-doctor"), "Verify Windows workspace shim and doctor").run).toContain(
+			"bun test ./packages/coding-agent/test/doctor-windows-repair-gate.test.ts",
+		);
 	});
 
 	test("keeps real DrvFS qualification manual, default-off, and independently source-bound", async () => {

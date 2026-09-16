@@ -52,7 +52,13 @@ import { DiscordLiveProvider } from "./discord-live-provider";
 import type { DiscordDiagnosticProvider } from "./discord-provider";
 import { SlackLiveProvider } from "./slack-live-provider";
 import type { SlackDiagnosticProvider } from "./slack-provider";
-import { type OwnerFreshnessSnapshot, readOwnerFreshnessSnapshot, type TelegramDaemonFs } from "./telegram-daemon";
+import {
+	isTelegramDaemonStopCause,
+	type OwnerFreshnessSnapshot,
+	readOwnerFreshnessSnapshot,
+	type TelegramDaemonFs,
+	type TelegramDaemonStopCause,
+} from "./telegram-daemon";
 import { DAEMON_GENERATION } from "./telegram-daemon-contract";
 
 const DEFAULT_API_BASE = "https://api.telegram.org";
@@ -547,6 +553,7 @@ interface NormalizedDaemonState {
 	startedAt: number | undefined;
 	heartbeatAt: number | undefined;
 	stoppedAt: number | undefined;
+	stopCause: TelegramDaemonStopCause | undefined;
 	roots: string[] | undefined;
 	generation: number | undefined;
 	generationStatus: "missing" | "valid" | "invalid";
@@ -594,6 +601,7 @@ function parseDaemonState(raw: string): NormalizedDaemonState | undefined {
 		startedAt: finiteNonNegativeNumber(rec.startedAt),
 		heartbeatAt: finiteNonNegativeNumber(rec.heartbeatAt),
 		stoppedAt: finiteNonNegativeNumber(rec.stoppedAt),
+		stopCause: isTelegramDaemonStopCause(rec.stopCause) ? rec.stopCause : undefined,
 		roots: stringArray(rec.roots),
 		generation,
 		generationStatus,
@@ -677,6 +685,8 @@ export interface DaemonHealth {
 	stopped: boolean;
 	heartbeatAt: number | undefined;
 	heartbeatAgeMs: number | undefined;
+	/** Bounded persisted stop cause; absent means this record predates diagnostics or is unknown. */
+	stopCause?: TelegramDaemonStopCause;
 
 	/**
 	 * Session endpoints the live owner reported an OPEN socket to in its latest
@@ -928,6 +938,7 @@ export async function checkNotificationHealth(opts: HealthOptions): Promise<Noti
 		stopped: state?.stoppedAt !== undefined,
 		heartbeatAt,
 		heartbeatAgeMs: heartbeatAt === undefined ? undefined : displayHeartbeatAgeMs(now, heartbeatAt),
+		...(state?.stopCause === undefined ? {} : { stopCause: state.stopCause }),
 		attachedEndpoints: snapshot.attachedEndpoints,
 		generation: state?.generation,
 		currentGeneration: DAEMON_GENERATION,
@@ -948,19 +959,26 @@ export async function checkNotificationHealth(opts: HealthOptions): Promise<Noti
 			} catch {
 				lockPresent = false;
 			}
+			const stopCause = daemon.stopCause ?? "unknown";
 			if (lockPresent) {
 				checks.push({
 					name: "daemon",
 					level: "warn",
-					detail: `daemon owner pid ${daemon.pid} is not alive; run recovery to clear the stale lock`,
+					detail: `daemon owner pid ${daemon.pid} is not alive; run recovery to clear the stale lock (stop cause: ${stopCause})`,
 				});
 			} else {
 				checks.push({
 					name: "daemon",
 					level: "warn",
-					detail: `daemon owner pid ${daemon.pid} is not alive; no lock present (daemon exited cleanly)`,
+					detail: `daemon owner pid ${daemon.pid} is not alive; no lock present (stop cause: ${stopCause})`,
 				});
 			}
+		} else if (daemon.stopped) {
+			checks.push({
+				name: "daemon",
+				level: "warn",
+				detail: `daemon is stopped (stop cause: ${daemon.stopCause ?? "unknown"})`,
+			});
 		} else if (!daemon.heartbeatFresh) {
 			checks.push({ name: "daemon", level: "warn", detail: `daemon pid ${daemon.pid} heartbeat is stale` });
 		} else if (telegramConfigured && !daemon.identityMatches) {

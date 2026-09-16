@@ -510,6 +510,221 @@ export function planLaunchWorktree(
 	return { enabled: true, repoRoot, worktreePath, detached: mode.detached, baseRef, branchName };
 }
 
+/**
+ * Config subdirectory a launcher (e.g. paseo, #5570) may seed into the worktree target
+ * before handing the path to gjc. `git worktree add` refuses any non-empty target, so
+ * this artifact is evacuated and restored around the add rather than treated as a conflict.
+ */
+const PRE_WORKTREE_GJC_DIR = ".gjc";
+
+/**
+ * Assert that `target` resolves to a location contained within `parent`.
+ *
+ * Both paths are resolved through {@link fs.realpathSync} so a symlink anywhere along the
+ * chain cannot smuggle a write outside the worktree bucket. Throws `worktree_path_conflict`
+ * when the resolved target escapes the resolved parent.
+ */
+function assertRealpathContained(target: string, parent: string): void {
+	const realParent = fs.realpathSync(parent);
+	const realTarget = fs.realpathSync(target);
+	if (realTarget === realParent || realTarget.startsWith(realParent + path.sep)) return;
+	throw new Error(`worktree_path_conflict:${target}`);
+}
+
+/**
+ * Whether an existing worktree target can be materialized in place. An empty directory,
+ * or one holding nothing but a pre-seeded {@link PRE_WORKTREE_GJC_DIR}, is safe to replace;
+ * anything else is a genuine `worktree_path_conflict`. A missing path is trivially usable.
+ *
+ * A symlinked target is never replaceable: evacuation and overlay writes would follow the
+ * link out of the worktree bucket, so it is reported as a conflict instead.
+ */
+export function isReplaceableWorktreeTarget(worktreePath: string): boolean {
+	let stat: fs.Stats;
+	try {
+		stat = fs.lstatSync(worktreePath);
+	} catch (error) {
+		if (fileSystemErrorCode(error) === "ENOENT") return true;
+		throw error;
+	}
+	if (stat.isSymbolicLink() || !stat.isDirectory()) return false;
+	const entries = fs.readdirSync(worktreePath);
+	return entries.every(entry => entry === PRE_WORKTREE_GJC_DIR);
+}
+
+/**
+ * Restore a stashed pre-seeded `.gjc/` into `worktreePath`.
+ *
+ * `git worktree add` materializes any tracked `.gjc/**` content (e.g. `.gjc/qa/**`) into the
+ * fresh worktree before this runs, so a bare rename would collide with EEXIST. When the target
+ * already exists, the stashed launcher config is overlaid onto it — stash entries win on name
+ * collision, tracked-only entries survive — and the stash is removed. When it does not exist
+ * (the untracked case, or a rolled-back add that never checked out), the stash is renamed in.
+ */
+export function restorePreWorktreeGjc(gjcStash: string, worktreePath: string): void {
+	fs.mkdirSync(worktreePath, { recursive: true });
+	const target = path.join(worktreePath, PRE_WORKTREE_GJC_DIR);
+	let targetStat: fs.Stats | null;
+	try {
+		targetStat = fs.lstatSync(target);
+	} catch (error) {
+		if (fileSystemErrorCode(error) === "ENOENT") targetStat = null;
+		else throw error;
+	}
+	if (targetStat) {
+		// `git worktree add` may have checked out a tracked `.gjc` symlink pointing outside the
+		// worktree; a recursive cpSync into it would redirect the overlay off-tree. Reject it and
+		// require the resolved destination to stay inside the worktree.
+		if (targetStat.isSymbolicLink()) throw new Error(`worktree_path_conflict:${target}`);
+		assertRealpathContained(target, worktreePath);
+		fs.cpSync(gjcStash, target, { recursive: true, force: true });
+		fs.rmSync(gjcStash, { recursive: true, force: true });
+		return;
+	}
+	fs.renameSync(gjcStash, target);
+}
+
+/**
+ * Handle returned by {@link evacuatePreWorktreeTarget}: a hook that restores the pre-seeded
+ * `.gjc/` into the freshly created worktree, plus the sibling stash path it was moved to
+ * (`null` when there was nothing to preserve). The stash path lets a failed restore report
+ * where the pre-seeded config can be recovered by hand.
+ */
+export interface EvacuationHandle {
+	restore: () => void;
+	stashPath: string | null;
+}
+
+/**
+ * Clear a {@link isReplaceableWorktreeTarget replaceable} target so `git worktree add` can
+ * create it, moving any pre-seeded `.gjc/` to a sibling stash. Returns a hook that restores
+ * `.gjc/` into the freshly created worktree; a no-op when there was nothing to preserve.
+ */
+export function evacuatePreWorktreeTarget(worktreePath: string): EvacuationHandle {
+	if (!fs.existsSync(worktreePath)) return { restore: () => {}, stashPath: null };
+	const gjcSource = path.join(worktreePath, PRE_WORKTREE_GJC_DIR);
+	let gjcStat: fs.Stats | null;
+	try {
+		gjcStat = fs.lstatSync(gjcSource);
+	} catch (error) {
+		if (fileSystemErrorCode(error) === "ENOENT") gjcStat = null;
+		else throw error;
+	}
+	if (!gjcStat) {
+		fs.rmdirSync(worktreePath);
+		return { restore: () => {}, stashPath: null };
+	}
+	// A symlinked `.gjc` would let the rename below (and the later overlay) escape the worktree
+	// bucket. Refuse it as a path conflict rather than following the link off-tree.
+	if (gjcStat.isSymbolicLink()) throw new Error(`worktree_path_conflict:${gjcSource}`);
+	assertRealpathContained(gjcSource, worktreePath);
+	const gjcStash = path.join(path.dirname(worktreePath), `.gjc-pre-wt-${path.basename(worktreePath)}`);
+	// A lingering stash means a prior evacuation was interrupted before its restore ran, or the
+	// path holds unrelated user data. Either way it is not ours to destroy: fail closed so the
+	// operator can inspect and remove it, rather than overwriting it before the worktree add.
+	if (fs.existsSync(gjcStash)) {
+		throw new Error(`stash path already occupied: ${gjcStash} — remove it manually before retrying`);
+	}
+	fs.renameSync(gjcSource, gjcStash);
+	fs.rmdirSync(worktreePath);
+	return { restore: () => restorePreWorktreeGjc(gjcStash, worktreePath), stashPath: gjcStash };
+}
+
+/** Best-effort restore that never masks the failure that triggered it. */
+function tryRestore(restore: () => void): void {
+	try {
+		restore();
+	} catch {
+		// The original worktree-add failure is the actionable one; leave restore best-effort.
+	}
+}
+
+/** Best-effort removal of a worktree GJC just created, used when a later step must roll it back. */
+function rollbackCreatedWorktree(plan: GjcLaunchWorktreePlan): void {
+	try {
+		runGit(plan.repoRoot, ["worktree", "remove", "--force", plan.worktreePath]);
+	} catch {
+		try {
+			runGit(plan.repoRoot, ["worktree", "prune"]);
+		} catch {
+			// Best-effort rollback; the restore failure below is the actionable error.
+		}
+	}
+}
+
+/**
+ * Finalize the pre-seeded `.gjc/` overlay after a successful `git worktree add`, transactionally.
+ *
+ * `git worktree add` has already registered and materialized the worktree by the time this runs,
+ * so a restore/overlay failure cannot simply propagate: the half-prepared worktree would be
+ * reused verbatim on the next launch (never restored, stash stranded). On failure this rolls the
+ * newly created worktree back so a retry starts clean, preserves the stash for manual recovery,
+ * and throws — success is never reported when restoration did not complete.
+ */
+export function commitPreWorktreeRestore(handle: EvacuationHandle, plan: GjcLaunchWorktreePlan): void {
+	try {
+		handle.restore();
+	} catch (error) {
+		rollbackCreatedWorktree(plan);
+		const detail = error instanceof Error ? error.message : String(error);
+		const recovery = handle.stashPath
+			? `The stashed launcher .gjc was preserved at ${handle.stashPath} for manual recovery.`
+			: "No launcher .gjc stash was created.";
+		throw new Error(
+			[
+				`worktree_gjc_restore_failed:${plan.worktreePath}`,
+				`GJC created the worktree but could not restore the pre-seeded .gjc overlay: ${detail}`,
+				recovery,
+				"The newly created worktree was rolled back; resolve the obstruction and relaunch.",
+			].join("\n"),
+		);
+	}
+}
+
+/**
+ * Acquire a per-target filesystem lock so the replaceability check, evacuation, `git worktree
+ * add`, and restore run as one critical section. Without it a second launcher racing on the same
+ * target could add files between the scan and the evacuation, or move `.gjc` first and strand the
+ * partially modified target. The lock is an atomic `O_EXCL` lockfile beside the target (inside the
+ * git-ignored bucket); a concurrent holder fails fast with `worktree_target_locked`.
+ */
+export function acquireTargetLock(worktreePath: string): () => void {
+	const lockPath = path.join(path.dirname(worktreePath), `.gjc-lock-${path.basename(worktreePath)}`);
+	try {
+		fs.closeSync(fs.openSync(lockPath, "wx"));
+	} catch (error) {
+		if (fileSystemErrorCode(error) === "EEXIST") {
+			throw new Error(
+				`worktree_target_locked:${worktreePath} — another launch is preparing this worktree (lock: ${lockPath})`,
+			);
+		}
+		throw error;
+	}
+	let released = false;
+	return () => {
+		if (released) return;
+		released = true;
+		try {
+			fs.rmSync(lockPath, { force: true });
+		} catch {
+			// Best-effort release; a stranded lockfile is surfaced as worktree_target_locked next time.
+		}
+	};
+}
+
+function buildWorktreeAddArgs(plan: GjcLaunchWorktreePlan, branchAlreadyExisted: boolean): string[] {
+	const args = ["worktree", "add"];
+	if (plan.detached) args.push("--detach", plan.worktreePath, plan.baseRef);
+	else if (branchAlreadyExisted) args.push(plan.worktreePath, plan.branchName ?? "");
+	else args.push("-b", plan.branchName ?? "", plan.worktreePath, plan.baseRef);
+	return args;
+}
+
+function classifyWorktreeAddFailure(plan: GjcLaunchWorktreePlan, args: string[], stderr: string): Error {
+	if (plan.branchName && BRANCH_IN_USE_PATTERN.test(stderr)) return new Error(`branch_in_use:${plan.branchName}`);
+	return new Error(stderr || `worktree_add_failed:${args.join(" ")}`);
+}
+
 export function ensureLaunchWorktree(
 	plan: GjcLaunchWorktreePlan | { enabled: false },
 	options?: LaunchWorktreeAbortOptions,
@@ -573,32 +788,43 @@ function ensureLaunchWorktreeSync(
 		};
 	}
 
-	if (fs.existsSync(plan.worktreePath)) throw new Error(`worktree_path_conflict:${plan.worktreePath}`);
+	if (!isReplaceableWorktreeTarget(plan.worktreePath)) throw new Error(`worktree_path_conflict:${plan.worktreePath}`);
 	if (plan.branchName && hasBranchInUse(allWorktrees, plan.branchName, plan.worktreePath)) {
 		throw new Error(`branch_in_use:${plan.branchName}`);
 	}
 
 	ensureBucketDirUsable(path.dirname(plan.worktreePath));
-	const branchAlreadyExisted = plan.branchName ? branchExists(plan.repoRoot, plan.branchName) : false;
-	const args = ["worktree", "add"];
-	if (plan.detached) args.push("--detach", plan.worktreePath, plan.baseRef);
-	else if (branchAlreadyExisted) args.push(plan.worktreePath, plan.branchName ?? "");
-	else args.push("-b", plan.branchName ?? "", plan.worktreePath, plan.baseRef);
+	const releaseLock = acquireTargetLock(plan.worktreePath);
+	try {
+		// Re-check under the lock: a concurrent launcher may have populated the target between the
+		// scan above and now. From here the check, evacuation, add, and restore are serialized.
+		if (!isReplaceableWorktreeTarget(plan.worktreePath)) {
+			throw new Error(`worktree_path_conflict:${plan.worktreePath}`);
+		}
+		const branchAlreadyExisted = plan.branchName ? branchExists(plan.repoRoot, plan.branchName) : false;
+		const args = buildWorktreeAddArgs(plan, branchAlreadyExisted);
+		const evacuation = evacuatePreWorktreeTarget(plan.worktreePath);
+		try {
+			const result = Bun.spawnSync(["git", ...args], { cwd: plan.repoRoot, stdout: "pipe", stderr: "pipe" });
+			if (result.exitCode !== 0) {
+				throw classifyWorktreeAddFailure(plan, args, sanitizeWorktreeDiagnostic(result.stderr.toString().trim()));
+			}
+		} catch (error) {
+			tryRestore(evacuation.restore);
+			throw error;
+		}
+		commitPreWorktreeRestore(evacuation, plan);
 
-	const result = Bun.spawnSync(["git", ...args], { cwd: plan.repoRoot, stdout: "pipe", stderr: "pipe" });
-	if (result.exitCode !== 0) {
-		const stderr = sanitizeWorktreeDiagnostic(result.stderr.toString().trim());
-		if (plan.branchName && BRANCH_IN_USE_PATTERN.test(stderr)) throw new Error(`branch_in_use:${plan.branchName}`);
-		throw new Error(stderr || `worktree_add_failed:${args.join(" ")}`);
+		return {
+			...plan,
+			worktreePath: path.resolve(plan.worktreePath),
+			created: true,
+			reused: false,
+			createdBranch: Boolean(plan.branchName && !branchAlreadyExisted),
+		};
+	} finally {
+		releaseLock();
 	}
-
-	return {
-		...plan,
-		worktreePath: path.resolve(plan.worktreePath),
-		created: true,
-		reused: false,
-		createdBranch: Boolean(plan.branchName && !branchAlreadyExisted),
-	};
 }
 
 export async function ensureLaunchWorktreeCancellable(
@@ -658,33 +884,44 @@ export async function ensureLaunchWorktreeCancellable(
 		};
 	}
 
-	if (fs.existsSync(plan.worktreePath)) throw new Error(`worktree_path_conflict:${plan.worktreePath}`);
+	if (!isReplaceableWorktreeTarget(plan.worktreePath)) throw new Error(`worktree_path_conflict:${plan.worktreePath}`);
 	if (plan.branchName && hasBranchInUse(allWorktrees, plan.branchName, plan.worktreePath)) {
 		throw new Error(`branch_in_use:${plan.branchName}`);
 	}
 
 	ensureBucketDirUsable(path.dirname(plan.worktreePath));
 	throwIfAborted(options, timeout);
-	const branchAlreadyExisted = plan.branchName ? branchExists(plan.repoRoot, plan.branchName) : false;
-	const args = ["worktree", "add"];
-	if (plan.detached) args.push("--detach", plan.worktreePath, plan.baseRef);
-	else if (branchAlreadyExisted) args.push(plan.worktreePath, plan.branchName ?? "");
-	else args.push("-b", plan.branchName ?? "", plan.worktreePath, plan.baseRef);
+	const releaseLock = acquireTargetLock(plan.worktreePath);
+	try {
+		// Re-check under the lock: a concurrent launcher may have populated the target between the
+		// scan above and now. From here the check, evacuation, add, and restore are serialized.
+		if (!isReplaceableWorktreeTarget(plan.worktreePath)) {
+			throw new Error(`worktree_path_conflict:${plan.worktreePath}`);
+		}
+		const branchAlreadyExisted = plan.branchName ? branchExists(plan.repoRoot, plan.branchName) : false;
+		const args = buildWorktreeAddArgs(plan, branchAlreadyExisted);
+		const evacuation = evacuatePreWorktreeTarget(plan.worktreePath);
+		try {
+			const result = await spawnProcessGroup(["git", ...args], plan.repoRoot, options, timeout);
+			if (result.exitCode !== 0) {
+				throw classifyWorktreeAddFailure(plan, args, sanitizeWorktreeDiagnostic(result.stderr.trim()));
+			}
+		} catch (error) {
+			tryRestore(evacuation.restore);
+			throw error;
+		}
+		commitPreWorktreeRestore(evacuation, plan);
 
-	const result = await spawnProcessGroup(["git", ...args], plan.repoRoot, options, timeout);
-	if (result.exitCode !== 0) {
-		const stderr = sanitizeWorktreeDiagnostic(result.stderr.trim());
-		if (plan.branchName && BRANCH_IN_USE_PATTERN.test(stderr)) throw new Error(`branch_in_use:${plan.branchName}`);
-		throw new Error(stderr || `worktree_add_failed:${args.join(" ")}`);
+		return {
+			...plan,
+			worktreePath: path.resolve(plan.worktreePath),
+			created: true,
+			reused: false,
+			createdBranch: Boolean(plan.branchName && !branchAlreadyExisted),
+		};
+	} finally {
+		releaseLock();
 	}
-
-	return {
-		...plan,
-		worktreePath: path.resolve(plan.worktreePath),
-		created: true,
-		reused: false,
-		createdBranch: Boolean(plan.branchName && !branchAlreadyExisted),
-	};
 }
 
 interface WorkspacePackageManifest {

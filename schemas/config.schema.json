@@ -137,7 +137,7 @@
 				"promptDeadlineMs": {
 					"type": "integer",
 					"description": "SDK-owned prompt deadline; ACP has no separate timeout.",
-					"default": 1800000,
+					"default": 3600000,
 					"minimum": 60000,
 					"maximum": 86400000
 				},

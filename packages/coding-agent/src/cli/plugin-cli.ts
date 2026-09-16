@@ -1281,7 +1281,12 @@ async function handleSetEnabled(
 		}
 
 		try {
-			await manager.setEnabled(name, enabled);
+			const scope = flags.scope ?? "user";
+			const state = await manager.getEnablementState(name, scope);
+			if (state.status !== "ok") {
+				throw new Error(state.status === "malformed" ? "plugin config is malformed" : "not installed");
+			}
+			await manager.setEnabled(name, enabled, scope, state.baseline);
 			if (flags.json) {
 				console.log(JSON.stringify({ [jsonKey]: name }));
 			} else {

@@ -115,9 +115,17 @@ export class PromptActivity {
 			this.#awaitingModel = true;
 			return;
 		}
-		// Streamed content/thinking/tool-call deltas, and the tool call the model asked for,
-		// are only ever produced by an answering model.
-		if (eventType === "message_update" || eventType === "tool_execution_start") {
+		// `message_update` is a streaming chunk: the model is still producing this response,
+		// so the gap that follows it is another inference gap, not a dead producer. Clearing
+		// `#awaitingModel` here would drop the turn to the narrow idle bound mid-stream, and a
+		// slow next chunk would be killed at that bound (issue #5571). The stream only truly
+		// ends at `message_end` (role=assistant) below, so `message_update` is intentionally
+		// left as an active model signal and does not clear inference state.
+		//
+		// The tool call the model asked for, by contrast, marks the model's turn as answered:
+		// inference has produced its result, and any following gap is governed by the tool
+		// bound while that tool runs.
+		if (eventType === "tool_execution_start") {
 			this.#awaitingModel = false;
 			return;
 		}

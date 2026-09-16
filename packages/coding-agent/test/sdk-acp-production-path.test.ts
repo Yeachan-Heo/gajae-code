@@ -819,7 +819,7 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 		expect.objectContaining({
 			cwd,
 			modelPreset: "codex-medium",
-			readinessTimeoutMs: 30_500,
+			readinessTimeoutMs: 22_000,
 			mcpServers: [
 				{
 					name: "Air",

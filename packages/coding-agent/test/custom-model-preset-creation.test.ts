@@ -853,7 +853,7 @@ describe("custom model preset creation", () => {
 		let selector: ModelSelectorComponent | undefined;
 		let confirmTitle: string | undefined;
 		const ctx = {
-			ui: { setFocus: () => {}, requestRender: () => {} },
+			ui: { setFocus: () => {}, requestRender: () => {}, requestLayoutRender: () => {} },
 			editorContainer: {
 				clear: () => {},
 				detachChild: () => {},

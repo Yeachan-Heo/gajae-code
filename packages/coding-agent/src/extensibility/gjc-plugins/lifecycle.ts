@@ -1,3 +1,4 @@
+import * as crypto from "node:crypto";
 import * as nodeFs from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
@@ -44,6 +45,9 @@ import type {
 	GjcUninstallPreview,
 	GjcUpdateApplyResult,
 	GjcUpdatePreview,
+	LocalRestorePlanV1,
+	NormalizedGjcPluginBundle,
+	ReviewedRestoreTokenV1,
 } from "./types";
 import { GJC_PLUGIN_MANIFEST_FILENAME, GjcPluginLoadError } from "./types";
 
@@ -824,6 +828,161 @@ export async function applyGjcBundleUpdate(
 	});
 }
 
+async function restoreArtifactObservation(entry: GjcPluginRegistryEntry): Promise<LocalRestorePlanV1["artifact"]> {
+	const hash = crypto.createHash("sha256");
+	try {
+		for (const file of [...entry.copiedFiles].sort((a, b) => a.relativePath.localeCompare(b.relativePath))) {
+			const target = path.join(entry.pluginRoot, file.relativePath);
+			const stat = await fs.lstat(target);
+			if (!stat.isFile() || stat.isSymbolicLink()) return { status: "unreadable" };
+			const bytes = await fs.readFile(target);
+			if (crypto.createHash("sha256").update(bytes).digest("hex") !== file.sha256) return { status: "unreadable" };
+			hash.update(file.relativePath);
+			hash.update("\0");
+			hash.update(file.sha256);
+			hash.update("\0");
+		}
+		return { status: "present", digest: hash.digest("hex") };
+	} catch (error) {
+		hash.digest();
+		return { status: isEnoent(error) ? "absent" : "unreadable" };
+	}
+}
+
+function bundleArtifactFingerprint(bundle: NormalizedGjcPluginBundle): string {
+	const hash = crypto.createHash("sha256");
+	for (const file of [...bundle.files].sort((a, b) => a.relativePath.localeCompare(b.relativePath))) {
+		hash.update(file.relativePath);
+		hash.update("\0");
+		hash.update(file.sha256);
+		hash.update("\0");
+	}
+	return hash.digest("hex");
+}
+
+export async function previewGjcBundleRestore(
+	ctx: GjcLifecycleContext,
+	identity: GjcBundleIdentity,
+): Promise<GjcLifecycleResult<LocalRestorePlanV1>> {
+	const registry = await readRegistry(identity.scope, ctx.cwd, { migrate: false });
+	const entry = registry.plugins.find(plugin => plugin.name === identity.name);
+	if (!entry) return { ok: false, error: notInstalled(identity) };
+	const effective = await readEffective(ctx.cwd);
+	return {
+		ok: true,
+		value: {
+			schemaVersion: 1,
+			kind: "gjc-plugin.restore-artifact",
+			identity,
+			baselineFingerprint: baselineFingerprint(entry),
+			decisionContextFingerprint: decisionContextFingerprint(identity, effective),
+			artifact: await restoreArtifactObservation(entry),
+			writes: false,
+			fetch: false,
+			locks: false,
+		},
+	};
+}
+
+export async function authorizeGjcBundleRestore(
+	ctx: GjcLifecycleContext,
+	plan: LocalRestorePlanV1,
+	authorizations: readonly string[],
+): Promise<GjcLifecycleResult<ReviewedRestoreTokenV1>> {
+	if (plan.kind !== "gjc-plugin.restore-artifact" || plan.schemaVersion !== 1)
+		return { ok: false, error: fail("invalid_target", "Restore plan is invalid") };
+	if (!authorizations.includes("plugin-change") || !authorizations.includes("install-replace"))
+		return { ok: false, error: fail("invalid_target", "Restore authorization is missing") };
+	const registry = await readRegistry(plan.identity.scope, ctx.cwd, { migrate: false });
+	const entry = registry.plugins.find(plugin => plugin.name === plan.identity.name);
+	if (!entry) return { ok: false, error: notInstalled(plan.identity) };
+	if (baselineFingerprint(entry) !== plan.baselineFingerprint)
+		return { ok: false, error: fail("stale_baseline", "The installed bundle changed since it was reviewed") };
+	const effective = await readEffective(ctx.cwd);
+	if (decisionContextFingerprint(plan.identity, effective) !== plan.decisionContextFingerprint)
+		return {
+			ok: false,
+			error: fail("stale_decision_context", "Installed bundles changed since restore was reviewed"),
+		};
+	return await withSourceAvailability(plan.identity, async () =>
+		resolveGjcBundleCandidate(storedSourceLocator(entry.source), async ({ bundle }) => {
+			if (bundle.name !== plan.identity.name)
+				return { ok: false, error: fail("identity_mismatch", "Stored source identity changed") };
+			const fingerprint = candidateFingerprint(plan.identity.scope, bundle);
+			return {
+				ok: true,
+				value: {
+					schemaVersion: 1,
+					kind: "gjc-plugin.restore-artifact",
+					purpose: "restore-artifact",
+					identity: plan.identity,
+					candidateFingerprint: fingerprint,
+					baselineFingerprint: plan.baselineFingerprint,
+					decisionContextFingerprint: plan.decisionContextFingerprint,
+					artifactFingerprint: bundleArtifactFingerprint(bundle),
+					reviewedAt: new Date().toISOString(),
+				},
+			};
+		}),
+	);
+}
+
+export async function applyGjcBundleRestore(
+	ctx: GjcLifecycleContext,
+	token: ReviewedRestoreTokenV1,
+): Promise<GjcLifecycleResult<GjcUpdateApplyResult>> {
+	if (
+		token.kind !== "gjc-plugin.restore-artifact" ||
+		token.purpose !== "restore-artifact" ||
+		token.schemaVersion !== 1
+	)
+		return { ok: false, error: fail("invalid_target", "Restore token is invalid") };
+	const identity = token.identity;
+	const registry = await readRegistry(identity.scope, ctx.cwd, { migrate: false });
+	const stored = registry.plugins.find(plugin => plugin.name === identity.name);
+	if (!stored) return { ok: false, error: notInstalled(identity) };
+	return await withSourceAvailability(identity, async () => {
+		const result = await runGjcBundleTransaction(storedSourceLocator(stored.source), {
+			scope: identity.scope,
+			cwd: ctx.cwd,
+			decide: async ({ existing, effective, bundle, candidate }) => {
+				if (!existing) return { kind: "abort", error: notInstalled(identity) };
+				if (candidateFingerprint(identity.scope, bundle) !== token.candidateFingerprint)
+					return { kind: "abort", error: fail("stale_candidate", "The restore candidate changed since review") };
+				if (baselineFingerprint(existing) !== token.baselineFingerprint)
+					return { kind: "abort", error: fail("stale_baseline", "The installed bundle changed since review") };
+				if (decisionContextFingerprint(identity, effective) !== token.decisionContextFingerprint)
+					return {
+						kind: "abort",
+						error: fail("stale_decision_context", "Installed bundles changed since restore was reviewed"),
+					};
+				const observed = await restoreArtifactObservation(existing);
+				if (observed.status === "present" && observed.digest === bundleArtifactFingerprint(bundle))
+					return { kind: "noop", entry: existing };
+				const reconciled = reconcileEnablement(existing.disabledSurfaceIds, surfaceIdsOf(bundle.surfaces));
+				const next: GjcPluginRegistryEntry = {
+					...candidate,
+					enabled: existing.enabled,
+					installedAt: existing.installedAt,
+					disabledSurfaceIds: reconciled.disabledSurfaceIds,
+				};
+				if (reconciled.quarantine.length) next.quarantine = reconciled.quarantine;
+				else delete next.quarantine;
+				return { kind: "commit", entry: next };
+			},
+		});
+		if (result.status === "aborted") return { ok: false, error: result.error };
+		return {
+			ok: true,
+			value: {
+				status: result.status === "noop" ? "unchanged" : "updated",
+				summary: toBundleSummary(result.entry),
+				remnantCount: result.remnants.length,
+			},
+		};
+	});
+}
+
 async function mutateEntry(
 	ctx: GjcLifecycleContext,
 	identity: GjcBundleIdentity,
@@ -840,6 +999,36 @@ async function mutateEntry(
 		await writeRegistryUnlocked({ version: 1, scope: identity.scope, plugins: next }, ctx.cwd);
 		return { ok: true, value: { summary: toBundleSummary(outcome.value), mutated: true } };
 	});
+}
+
+/**
+ * Doctor-only quarantine primitive. The expected baseline is compared while
+ * holding the ordinary registry writer lock, so concurrent enable/disable or
+ * update cannot be clobbered.
+ */
+export async function setGjcBundleQuarantineExpectedBaseline(
+	ctx: GjcLifecycleContext,
+	identity: GjcBundleIdentity,
+	enabled: boolean,
+	expectedBaseline: string,
+): Promise<GjcLifecycleResult<GjcToggleResult>> {
+	return await mutateEntry(ctx, identity, entry => {
+		if (baselineFingerprint(entry) !== expectedBaseline) {
+			return { ok: false, error: fail("stale_baseline", "The installed bundle changed since it was reviewed") };
+		}
+		if (entry.enabled === enabled) return { ok: true, value: null };
+		return { ok: true, value: { ...entry, enabled, updatedAt: new Date().toISOString() } };
+	});
+}
+
+export async function getGjcBundleEnablementState(
+	ctx: GjcLifecycleContext,
+	identity: GjcBundleIdentity,
+): Promise<GjcLifecycleResult<{ enabled: boolean; baseline: string }>> {
+	const registry = await readRegistry(identity.scope, ctx.cwd, { migrate: false });
+	const entry = registry.plugins.find(p => p.name === identity.name);
+	if (!entry) return { ok: false, error: notInstalled(identity) };
+	return { ok: true, value: { enabled: entry.enabled, baseline: baselineFingerprint(entry) } };
 }
 
 /**

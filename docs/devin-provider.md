@@ -90,9 +90,14 @@ are rejected the same way.
 This rarely matters in practice: because GJC forwards only your newest message,
 Devin manages the conversation context itself, so GJC-side compaction is not
 needed to keep a Devin session going. GJC's own transcript can still reach its
-auto-compaction threshold on a long session, in which case compaction reports the
-error above — switch to a non-Devin model (`/model`) for that operation, or keep
-a non-Devin model as your main model when you rely on GJC-side compaction.
+auto-compaction threshold on a long session; when every model the maintenance
+action could reach is an agent-level provider, GJC skips it quietly instead of
+reporting a guaranteed refusal on every crossing. Manual maintenance
+(`/compact`, `/handoff`, branch summaries) still reports the refusal — switch
+to a non-Devin model (`/model`) for that operation. Auto-compaction can also
+run when a non-Devin model stays reachable (e.g. the default role resolves to a
+text model while the session itself is on Devin) or a `session_before_compact`
+extension hook supplies the summary.
 
 ### Images
 
@@ -136,7 +141,7 @@ convert Devin usage into GJC token accounting; use Devin's `/usage` or
 | `Devin account does not offer model "<id>"` | The model is not in your account's allowlist. Pick a discovered model. |
 | `Devin ACP process exited with code …` | The CLI crashed; the stderr tail is included in the message. |
 | Turn stalls then errors | The agent stopped sending updates within the stream idle timeout. Check `devin doctor`/`devin --version`. |
-| Error naming maintenance calls | GJC refused a compaction/handoff/branch-summary request on a Devin model. Switch to a non-Devin model for that operation. |
+| Error naming maintenance calls | GJC refused a manual compaction/handoff/branch-summary request on a Devin model (auto-maintenance skips quietly). Switch to a non-Devin model for that operation. |
 
 ## Implementation notes
 

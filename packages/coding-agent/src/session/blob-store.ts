@@ -1286,14 +1286,14 @@ export class EphemeralBlobStore extends BlobStore {
 		return new EphemeralBlobStore(dir, { adoptVerifiedDir: true, disposalParentDescriptor: parentDescriptor });
 	}
 
-	#cachePut(hash: string, data: Buffer): void {
+	#cachePut(hash: string, data: Buffer, ownership?: typeof TAKE_BLOB_BUFFER_OWNERSHIP): void {
 		const existing = this.#bufferCache.get(hash);
 		if (existing) {
 			this.#bufferCache.delete(hash);
 			this.#bufferCacheBytes -= existing.byteLength;
 		}
 		if (data.byteLength > EphemeralBlobStore.#BUFFER_CACHE_MAX_BYTES) return;
-		this.#bufferCache.set(hash, data);
+		this.#bufferCache.set(hash, ownership === TAKE_BLOB_BUFFER_OWNERSHIP ? data : Buffer.from(data));
 		this.#bufferCacheBytes += data.byteLength;
 		for (const [oldHash, oldData] of this.#bufferCache) {
 			if (this.#bufferCacheBytes <= EphemeralBlobStore.#BUFFER_CACHE_MAX_BYTES) break;
@@ -1309,18 +1309,18 @@ export class EphemeralBlobStore extends BlobStore {
 
 	putSync(data: Buffer, ownership?: typeof TAKE_BLOB_BUFFER_OWNERSHIP): BlobPutResult {
 		const result = this.#adoptedVerifiedDir ? putResidentCacheBlobSync(this.dir, data) : super.putSync(data);
-		this.#cachePut(result.hash, ownership === TAKE_BLOB_BUFFER_OWNERSHIP ? data : Buffer.from(data));
+		this.#cachePut(result.hash, data, ownership);
 		return result;
 	}
 
 	putImmutableSync(data: Buffer): CheckedBlobPutResult {
 		if (this.#adoptedVerifiedDir) {
 			const result = putResidentCacheBlobSync(this.dir, data);
-			this.#cachePut(result.hash, Buffer.from(data));
+			this.#cachePut(result.hash, data);
 			return makeBlobPutResult(result.hash, result.path, data.byteLength);
 		}
 		const result = super.putImmutableSync(data);
-		this.#cachePut(result.hash, Buffer.from(data));
+		this.#cachePut(result.hash, data);
 		return result;
 	}
 
@@ -1347,7 +1347,7 @@ export class EphemeralBlobStore extends BlobStore {
 		const data = this.#adoptedVerifiedDir
 			? readVerifiedResidentCacheBlobSync(hash, path.join(this.dir, hash))
 			: super.getSync(hash);
-		if (data) this.#cachePut(hash, Buffer.from(data));
+		if (data) this.#cachePut(hash, data);
 		return data;
 	}
 
@@ -1363,7 +1363,7 @@ export class EphemeralBlobStore extends BlobStore {
 	getCheckedSync(hash: string): Buffer | null {
 		if (this.#adoptedVerifiedDir) return this.getSync(hash);
 		const data = super.getCheckedSync(hash);
-		if (data) this.#cachePut(hash, Buffer.from(data));
+		if (data) this.#cachePut(hash, data);
 		return data;
 	}
 
@@ -1478,9 +1478,9 @@ export class MemoryBlobStore extends BlobStore {
 		return this.putSync(data);
 	}
 
-	putSync(data: Buffer): BlobPutResult {
+	putSync(data: Buffer, ownership?: typeof TAKE_BLOB_BUFFER_OWNERSHIP): BlobPutResult {
 		const hash = sha256Hex(data);
-		this.#store(hash, Buffer.from(data));
+		this.#store(hash, ownership === TAKE_BLOB_BUFFER_OWNERSHIP ? data : Buffer.from(data));
 		return makeBlobPutResult(hash, `memory:${hash}`);
 	}
 

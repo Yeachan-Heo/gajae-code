@@ -1,0 +1,3 @@
+### Fixed
+
+- `gjc autoresearch <verb> --help` and `gjc ultragoal <verb> --help` reach the native help again. Both commands opt into `delegateHelp`, which exists so a command can route `cmd subcommand --help` itself, but each one then re-intercepted the help flags and printed the generic command summary — discarding the verb. The native help already documents every verb's flags, so `verdict --help` never showed `--status-json`, `--evidence`, `--evaluator`, or `--caveat`, and `ultragoal review --help` never showed its FLAGS block. Help still renders before the workflow-settings migration and without resolving a session.
