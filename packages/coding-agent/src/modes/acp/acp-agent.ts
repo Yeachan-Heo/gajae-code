@@ -3467,7 +3467,9 @@ export class AcpAgent implements Agent {
 			// the first-turn retry gate — which the settlement below releases — would see
 			// "started, no output", resubmit, and let BOTH this terminal's final text and the
 			// retry's answer reach ACP consumers. Record the output before settling (review P1).
-			if (typeof event.finalText === "string" && event.finalText) record.promptObservedAssistantOutput = true;
+			// Whitespace-only final text carries no assistant content, matching the trimmed
+			// presence contract in prompt-reconciliation.ts:237.
+			if (typeof event.finalText === "string" && event.finalText.trim()) record.promptObservedAssistantOutput = true;
 			// Failure diagnostics are useful but advisory. Settle before any mapped
 			// session update can await a backpressured client transport; otherwise an
 			// already-decided failure can still lose to the inactivity watchdog.
