@@ -101,7 +101,7 @@ describe("acpRequestFailure carries the prompt terminal's classification (issue 
 		const leak = "Request failed: 400 tokens exceeded for user@example.com";
 		const failure = acpRequestFailure(promptFailure({ providerCode: leak })) as RequestError;
 
-		expect((failure.data as Record<string, unknown>)).not.toHaveProperty("providerCode");
+		expect(failure.data as Record<string, unknown>).not.toHaveProperty("providerCode");
 		expect(JSON.stringify(failure)).not.toContain("tokens exceeded");
 		// `RequestError` prefixes its own class wording; the redacted body is unchanged.
 		expect(failure.message).toBe("Internal error: Prompt submission failed.");
@@ -111,7 +111,10 @@ describe("acpRequestFailure carries the prompt terminal's classification (issue 
 	it("keeps -32603 for the prompt-failure class", () => {
 		// Pinned ACP core-v1 conformance expects -32603/-32000 here; the classification
 		// travels in `data`, never in a renumbered code.
-		for (const error of [promptFailure({}), promptFailure({ code: "prompt_deadline_exceeded", provenance: "deadline" })])
+		for (const error of [
+			promptFailure({}),
+			promptFailure({ code: "prompt_deadline_exceeded", provenance: "deadline" }),
+		])
 			expect((acpRequestFailure(error) as RequestError).code).toBe(-32603);
 	});
 
