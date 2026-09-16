@@ -24386,7 +24386,7 @@ export class AgentSession {
 					this.seedDefaultFallbackResolution(resolution.activeIndex, resolution.skips);
 					let resolvedModel = resolution.model;
 					if (!resolvedModel) {
-						if (resumeModelBehavior !== "useCurrentDefault") {
+						if (resumeModelBehavior === "keepSessionModel") {
 							try {
 								const recovery = await resolveMissingSessionModelRecovery({
 									modelRegistry: this.#modelRegistry,
@@ -24398,23 +24398,6 @@ export class AgentSession {
 									...(this.#persistedModelProfileAliasIntent("default") ?? {}),
 								});
 								if (recovery?.model) {
-									this.#defaultFallbackController = new FallbackChainController(
-										{
-											role: "default",
-											entries: recovery.entries,
-											origin: "runtime",
-											identity: recovery.profileName,
-											explicitHead: true,
-										},
-										this.settings.get("fallback.maxAttempts"),
-									);
-									controller = this.#defaultFallbackChain(false);
-									this.#seedDefaultFallbackResolutionForController(
-										controller,
-										recovery.activeIndex,
-										recovery.skips,
-									);
-									resolvedModel = recovery.model;
 									if (switchingToDifferentSession) {
 										await applyModelProfileRuntimeBindings({
 											session: this,
@@ -24425,9 +24408,19 @@ export class AgentSession {
 										targetActiveModelProfile = recovery.profileName;
 										targetProfileRuntimeInstalled = true;
 									}
+									this.installRecoveredDefaultFallbackChain(
+										recovery.entries,
+										recovery.profileName,
+										recovery.activeIndex,
+										recovery.skips,
+									);
+									controller = this.#defaultFallbackChain(false);
+									resolvedModel = recovery.model;
 									recoveredThinkingLevel = recovery.explicitThinkingLevel ? recovery.thinkingLevel : undefined;
 									recoveredDefaultChainMessage =
 										"Saved session model is no longer registered; restored the durable default preset instead.";
+								} else if (recovery) {
+									durableDefaultRecoveryError = "durable default preset resolution failed";
 								}
 							} catch (error) {
 								// The saved chain remains authoritative on recovery failure, but the
