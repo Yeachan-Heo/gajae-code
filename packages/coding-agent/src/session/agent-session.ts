@@ -198,6 +198,7 @@ import {
 	logger,
 	prompt,
 	Snowflake,
+	safeErrorDescription,
 } from "@gajae-code/utils";
 import { createAppendOnlyContextManager, resolveAppendOnlyMode } from "../append-only-mode";
 import {
@@ -214,6 +215,7 @@ import type { Rule } from "../capability/rule";
 import type { CasReceipt } from "../config/atomic-yaml-patch";
 import {
 	activateModelProfile,
+	applyModelProfileRuntimeBindings,
 	materializeActiveModelProfileAssignment,
 	resolveMissingSessionModelRecovery,
 } from "../config/model-profile-activation";
@@ -24323,7 +24325,7 @@ export class AgentSession {
 				const liveProfileIdentity = previousActiveModelProfile
 					? resolveModelProfileName(previousActiveModelProfile, profileDefinitions)
 					: undefined;
-				const targetActiveModelProfile =
+				let targetActiveModelProfile =
 					resumeModelBehavior === "useCurrentDefault"
 						? switchingToDifferentSession
 							? configuredProfileIdentity && profileDefinitions.has(configuredProfileIdentity)
@@ -24349,7 +24351,7 @@ export class AgentSession {
 					targetActiveModelProfile !== undefined &&
 					targetActiveModelProfile === configuredProfileIdentity &&
 					liveProfileIdentity === targetActiveModelProfile;
-				const targetProfileRuntimeInstalled = !switchingToDifferentSession || retainsDurableProfileLayer;
+				let targetProfileRuntimeInstalled = !switchingToDifferentSession || retainsDurableProfileLayer;
 				if (switchingToDifferentSession && !retainsDurableProfileLayer)
 					this.#resetSessionScopedModelProfileState({
 						preserveDefaultConfiguredChain: true,
@@ -24408,6 +24410,16 @@ export class AgentSession {
 										recovery.skips,
 									);
 									resolvedModel = recovery.model;
+									if (switchingToDifferentSession) {
+										await applyModelProfileRuntimeBindings({
+											session: this,
+											modelRegistry: this.#modelRegistry,
+											settings: this.settings,
+											profileName: recovery.profileName,
+										});
+										targetActiveModelProfile = recovery.profileName;
+										targetProfileRuntimeInstalled = true;
+									}
 									recoveredThinkingLevel = recovery.explicitThinkingLevel ? recovery.thinkingLevel : undefined;
 									recoveredDefaultChainMessage =
 										"Saved session model is no longer registered; restored the durable default preset instead.";
@@ -24415,7 +24427,10 @@ export class AgentSession {
 							} catch (error) {
 								// The saved chain remains authoritative on recovery failure, but the
 								// durable preset's diagnostic is actionable and must not disappear.
-								durableDefaultRecoveryError = error instanceof Error ? error.message : String(error);
+								logger.warn("Failed to recover saved session model through durable default", {
+									error: safeErrorDescription(error),
+								});
+								durableDefaultRecoveryError = "durable default preset resolution failed";
 							}
 						}
 						if (!resolvedModel) {
