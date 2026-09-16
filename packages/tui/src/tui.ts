@@ -820,6 +820,7 @@ type TuiRenderCounterSnapshot = {
 	differentialGuardVisibleWidthCalls: number;
 	widthReflowScanRows: number;
 	widthReflowVisibleWidthCalls: number;
+	kittyPlacementScanRows: number;
 };
 type RenderCommitWaiter = {
 	resolve: (committed: boolean) => void;
@@ -1185,6 +1186,7 @@ export class TUI extends Container {
 		differentialGuardVisibleWidthCalls: 0,
 		widthReflowScanRows: 0,
 		widthReflowVisibleWidthCalls: 0,
+		kittyPlacementScanRows: 0,
 	};
 
 	static resetRenderCountersForTest(): void {
@@ -1194,6 +1196,7 @@ export class TUI extends Container {
 			differentialGuardVisibleWidthCalls: 0,
 			widthReflowScanRows: 0,
 			widthReflowVisibleWidthCalls: 0,
+			kittyPlacementScanRows: 0,
 		};
 	}
 
@@ -4131,7 +4134,12 @@ export class TUI extends Container {
 		lines: string[],
 		owners: ReadonlyMap<string, KittyPlacementOwner>,
 	): KittyPlacementSpan[] {
+		// encodeKittyPlacement is only reachable from renderImage's kitty branch, so a
+		// line rendered under any other protocol cannot carry a placement and the scan
+		// can only return empty. See the commit message for the consumers this covers.
+		if (TERMINAL.imageProtocol !== ImageProtocol.Kitty) return [];
 		const placements: KittyPlacementSpan[] = [];
+		TUI.#renderCounters.kittyPlacementScanRows += lines.length;
 		for (let row = 0; row < lines.length; row++) {
 			for (const placement of extractKittyPlacementReferences(lines[row])) {
 				placements.push({
@@ -4739,8 +4747,9 @@ export class TUI extends Container {
 			if (usedWindowNormalize) renderMetrics.recordLineCount("offscreenScan", diffStart);
 		}
 		const nextKittyPlacementSpans = this.#kittyPlacementSpansForLines(newLines, placementOwners);
-		const previousLogicalFrame = this.#latestRenderedLines.slice();
-		const previousRawFrame = this.#latestRaw.slice();
+		// Reassigned, never mutated in place -- a reference is the snapshot.
+		const previousLogicalFrame = this.#latestRenderedLines;
+		const previousRawFrame = this.#latestRaw;
 		const previousRenderedLength = previousLogicalFrame.length;
 		this.#latestRenderedLines = newLines;
 		this.#latestRenderedTranscriptLineCount = nextTranscriptLineCount;
