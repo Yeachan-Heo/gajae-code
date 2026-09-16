@@ -6,6 +6,8 @@
 
 - Defer resize reflow-decision scans to their consuming branch, skipping them on unchanged-width frames and viewport-only repaints; coalesced resize appends avoid that decision scan while retained-prefix validation may still measure rows, preserving rendering and settled scrollback repair.
 
+## [0.16.7] - 2026-09-13
+
 ## [0.16.6] - 2026-09-07
 
 ## [0.16.5] - 2026-09-07

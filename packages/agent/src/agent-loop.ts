@@ -2672,6 +2672,7 @@ class ManagedAttemptTransaction {
 	#lastStagedShape: { stagedEventCount: number; stagedBytes: number; contentBlockCount: number } | undefined;
 	#discarded = false;
 	#committed = false;
+	#rejected = false;
 	#degradedFieldDiagnostics = new Set<string>();
 
 	constructor(
@@ -2858,6 +2859,14 @@ class ManagedAttemptTransaction {
 
 	get committed(): boolean {
 		return this.#committed;
+	}
+
+	reject(): void {
+		this.#rejected = true;
+	}
+
+	get rejected(): boolean {
+		return this.#rejected;
 	}
 
 	acceptedAssistantSnapshot(message: AssistantMessage): AssistantMessage {
@@ -4097,7 +4106,7 @@ async function runLoopBody(
 				message.stopReason !== "error" &&
 				message.stopReason !== "aborted" &&
 				escapedNonAsciiResampleAttempt < MAX_ESCAPED_NONASCII_RESAMPLES &&
-				!escapedToolTransaction?.committed &&
+				(!escapedToolTransaction?.committed || escapedToolTransaction.rejected) &&
 				hasEscapedNonAsciiToolCall(message)
 			) {
 				escapedNonAsciiResampleAttempt++;
@@ -4868,17 +4877,20 @@ async function streamAssistantResponse(
 					const event = next.value;
 
 					switch (event.type) {
-						case "start":
+						case "start": {
 							partialMessage = config.fallbackManaged
 								? managedAssistantShell(event.partial, config.model, managedDegradedFieldDiagnostics)
 								: event.partial;
 							context.messages.push(partialMessage);
 							addedPartial = true;
+							let acceptedStart = true;
 							if (provisionalToolTransaction) {
-								config.onProvisionalAssistantMessageEvent?.(partialMessage, event);
+								acceptedStart = config.onProvisionalAssistantMessageEvent?.(partialMessage, event) !== false;
+								if (!acceptedStart) provisionalToolTransaction.reject();
 							}
-							stream.push({ type: "message_start", message: { ...partialMessage }, scope });
+							if (acceptedStart) stream.push({ type: "message_start", message: { ...partialMessage }, scope });
 							break;
+						}
 
 						case "toolChoiceIncapability":
 							config.onToolChoiceIncapability?.(event);
@@ -4911,13 +4923,17 @@ async function streamAssistantResponse(
 									? managedAssistantEventSnapshot(event, partialMessage, managedDegradedFieldDiagnostics)
 									: event;
 								context.messages[context.messages.length - 1] = partialMessage;
+								let acceptedUpdate = true;
 								if (provisionalToolTransaction) {
-									config.onProvisionalAssistantMessageEvent?.(partialMessage, partialEvent);
-									provisionalToolTransaction.stageAssistantMessageEvent(partialMessage, partialEvent);
+									acceptedUpdate =
+										config.onProvisionalAssistantMessageEvent?.(partialMessage, partialEvent) !== false;
+									if (!acceptedUpdate) provisionalToolTransaction.reject();
+									if (acceptedUpdate)
+										provisionalToolTransaction.stageAssistantMessageEvent(partialMessage, partialEvent);
 								} else {
 									config.onAssistantMessageEvent?.(partialMessage, partialEvent);
 								}
-								if (signal?.aborted) continue;
+								if (!acceptedUpdate || signal?.aborted) continue;
 								stream.push({
 									type: "message_update",
 									assistantMessageEvent: partialEvent,

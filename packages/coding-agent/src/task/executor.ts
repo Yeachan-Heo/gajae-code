@@ -34,7 +34,11 @@ import { logger, prompt, untilAborted } from "@gajae-code/utils";
 import { AsyncJobManager } from "../async";
 import { AUTOROUTING_SELECTOR_MAX_LENGTH, type AutoroutingReasonCode } from "../config/autorouting-contract";
 import { ModelRegistry } from "../config/model-registry";
-import { formatModelString, resolveModelOverrideWithAuthFallback } from "../config/model-resolver";
+import {
+	formatModelString,
+	isExplicitProviderModelOverride,
+	resolveModelOverrideWithAuthFallback,
+} from "../config/model-resolver";
 import type { PromptTemplate } from "../config/prompt-templates";
 import { Settings } from "../config/settings";
 import { SETTINGS_SCHEMA, type SettingPath } from "../config/settings-schema";
@@ -1774,6 +1778,24 @@ export async function runSubprocessOnce(options: ExecutorOptions): Promise<Singl
 					canonicalChildScope,
 				),
 			);
+			if (!model && isExplicitProviderModelOverride(modelPatterns)) {
+				const skipReasons = [...new Set(skips.map(skip => skip.reason))];
+				if ((options.preflightProbe || options.preflightDurable) && skipReasons.includes("unauthenticated")) {
+					preflightOperation = "auth_resolve";
+					throw Object.assign(new Error("autorouting credential unavailable"), {
+						transient: false,
+						credentialMissing: true,
+					});
+				}
+				const reason = skipReasons.includes("unauthenticated")
+					? "authentication failed"
+					: skipReasons.includes("unknown_model")
+						? "is missing from the catalog"
+						: "could not be resolved";
+				throw new Error(
+					`Requested model ${modelPatterns.join(", ")} ${reason}. Explicit provider/model selectors fail closed and do not fall back to the parent session model.`,
+				);
+			}
 			if (
 				(options.preflightProbe || options.preflightDurable) &&
 				model &&

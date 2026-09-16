@@ -4,6 +4,7 @@ import * as fs from "node:fs/promises";
 import path from "node:path";
 import * as native from "@gajae-code/natives";
 import { FileLockTestHooks } from "../src/config/file-lock";
+import { endpointIncarnation } from "../src/sdk/broker/endpoint-authority";
 import {
 	canonicalSessionCwd,
 	SessionIndex,
@@ -41,6 +42,13 @@ function deferred<T = void>() {
  * "cleanup_pending" result is read as a release failure by the Windows branch.
  */
 function pinWindowsLockRemoval(): void {
+	FileLockTestHooks.nativePublicationBindings = () => ({
+		renameNoReplacePathAsync: async (source, destination) => {
+			const result = await native.renameNoReplacePathAsync(source, destination);
+			return result.ok ? { ...result, primitive: "windows_rename_noreplace" } : result;
+		},
+		renameDirectoryNoReplacePathAsync: native.renameDirectoryNoReplacePathAsync,
+	});
 	FileLockTestHooks.nativeQuarantineBindings = () => ({
 		snapshotDirectoryTree: native.snapshotDirectoryTree,
 		exactRemoveDirectoryTree: target => {
@@ -394,6 +402,7 @@ describe("SDK session index", () => {
 			process.kill = originalKill;
 			fromPid.mockRestore();
 			FileLockTestHooks.nativeQuarantineBindings = undefined;
+			FileLockTestHooks.nativePublicationBindings = undefined;
 			await fs.rm(dir, { recursive: true, force: true });
 		}
 	});
@@ -600,6 +609,7 @@ describe("SDK session index", () => {
 			}
 		} finally {
 			FileLockTestHooks.nativeQuarantineBindings = undefined;
+			FileLockTestHooks.nativePublicationBindings = undefined;
 			if (platform) Object.defineProperty(process, "platform", platform);
 		}
 	});
@@ -625,6 +635,7 @@ describe("SDK session index", () => {
 		} finally {
 			spy.mockRestore();
 			FileLockTestHooks.nativeQuarantineBindings = undefined;
+			FileLockTestHooks.nativePublicationBindings = undefined;
 			if (platform) Object.defineProperty(process, "platform", platform);
 		}
 	});
@@ -1341,6 +1352,94 @@ describe("SDK session index", () => {
 				terminal: true,
 			}),
 		]);
+	});
+	it("fences file-only replacements and retains the exact close identity through compaction and reopen", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-file-close-"));
+		try {
+			const index = await new SessionIndex(dir).open();
+			const predecessor = await index.append({
+				...event("session"),
+				endpointMtimeMs: 1234.5,
+				endpointFileId: "1:100",
+				lifecycleRequestId: "same-request",
+				ts: 1234,
+			});
+			const successor = await index.append({
+				...event("session"),
+				endpointMtimeMs: predecessor.endpointMtimeMs,
+				endpointFileId: "1:101",
+				lifecycleRequestId: predecessor.lifecycleRequestId,
+				ts: predecessor.ts,
+			});
+			const successorIncarnation = endpointIncarnation(successor, successor.sessionId);
+			expect(successorIncarnation).toBeDefined();
+			expect(successorIncarnation).not.toBe(endpointIncarnation(predecessor, predecessor.sessionId));
+			const before = index.indexSeq;
+			expect(await index.unregisterIfCurrent(predecessor)).toBe(false);
+			expect(await index.unregisterIfCurrent({ ...successor, endpointFileId: undefined })).toBe(false);
+			expect(index.indexSeq).toBe(before);
+			expect(index.listSessions().sessions[0]).toMatchObject({ terminal: false, endpointFileId: "1:101" });
+			expect(await index.unregisterIfCurrent(successor)).toBe(true);
+			const terminal = index.listSessions().sessions[0]!;
+			expect(terminal).toMatchObject({ terminal: true, live: false, endpointFileId: "1:101" });
+			expect(endpointIncarnation(terminal, terminal.sessionId)).toBe(successorIncarnation);
+			expect(index.hostUnregisteredAfter(predecessor)).toBeUndefined();
+			expect(index.hostUnregisteredAfter(successor)).toMatchObject({ indexSeq: terminal.indexSeq });
+			expect(index.findSessionTerminalEvidence(predecessor)).toBeUndefined();
+			expect(index.findSessionTerminalEvidence(successor)).toEqual({
+				type: "host_unregistered",
+				indexSeq: terminal.indexSeq,
+			});
+			const rows = (await fs.readFile(path.join(dir, "sdk", "sessions", "index.jsonl"), "utf8"))
+				.trim()
+				.split("\n")
+				.map(line => JSON.parse(line) as SessionIndexEvent);
+			expect(rows.at(-1)).toMatchObject({
+				type: "host_unregistered",
+				endpointFileId: successor.endpointFileId,
+				endpointMtimeMs: successor.endpointMtimeMs,
+				lifecycleRequestId: successor.lifecycleRequestId,
+			});
+			expect(rows.at(-1)?.hostIncarnation).toBe(successor.hostIncarnation);
+			expect(rows.at(-1)?.processIncarnation).toBe(successor.processIncarnation);
+			await index.snapshot();
+			await fs.writeFile(path.join(dir, "sdk", "sessions", "index.jsonl"), "");
+			const reopened = await new SessionIndex(dir).open();
+			const retained = reopened.listSessions().sessions[0]!;
+			expect(retained).toMatchObject({ terminal: true, live: false, endpointFileId: "1:101" });
+			expect(endpointIncarnation(retained, retained.sessionId)).toBe(successorIncarnation);
+			const closedSeq = reopened.indexSeq;
+			expect(await reopened.unregisterIfCurrent(successor)).toBe(false);
+			expect(reopened.indexSeq).toBe(closedSeq);
+		} finally {
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	});
+	it("does not certify terminal evidence with a contradictory or stripped endpoint file identity", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-terminal-file-"));
+		try {
+			const index = await new SessionIndex(dir).open();
+			for (const type of ["host_unregistered", "session_closed", "session_deleted"] as const) {
+				for (const endpointFileId of [undefined, "1:101"]) {
+					const registration = await index.append({
+						...event(`${type}-${endpointFileId ?? "missing"}`),
+						endpointMtimeMs: 1234.5,
+						endpointFileId: "1:100",
+					});
+					await index.append({
+						...event(registration.sessionId),
+						type,
+						endpointMtimeMs: registration.endpointMtimeMs,
+						endpointFileId,
+					});
+					if (type === "host_unregistered") expect(index.hostUnregisteredAfter(registration)).toBeUndefined();
+					expect(index.findSessionTerminalEvidence(registration)).toBeUndefined();
+					if (type === "session_closed") expect(index.findSessionClosedEvidence(registration)).toBeUndefined();
+				}
+			}
+		} finally {
+			await fs.rm(dir, { recursive: true, force: true });
+		}
 	});
 	it("does not unregister a concurrent terminal-uncertain record", async () => {
 		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-uncertain-"));

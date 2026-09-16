@@ -89,6 +89,7 @@ describe("telegram daemon owner postmortem", () => {
 
 		const state = await readDaemonState(settings(agentDir));
 		expect(state?.stoppedAt).toBe(9_999);
+		expect(state?.stopCause).toBe("postmortem");
 		// Freshness turns on stoppedAt, so this is the field that ends the lie.
 		expect(state?.ownershipPhase).toBe("ready");
 	});
@@ -155,7 +156,9 @@ describe("telegram daemon owner postmortem", () => {
 		seedReadyOwner(agentDir, { stoppedAt: 4_242 });
 
 		expect(await mark(agentDir)).toBe(false);
-		expect((await readDaemonState(settings(agentDir)))?.stoppedAt).toBe(4_242);
+		const state = await readDaemonState(settings(agentDir));
+		expect(state?.stoppedAt).toBe(4_242);
+		expect(state?.stopCause).toBeUndefined();
 	});
 
 	test("absent state is not resurrected as a stopped owner", async () => {

@@ -299,15 +299,10 @@ async function readActivity(stateFile: string): Promise<Record<string, unknown> 
 	throw new Error("coordinator activity snapshot was never readable");
 }
 
-/** Wait until the sidecar stops writing, so the LAST published snapshot can be asserted. */
-async function settledActivity(stateFile: string): Promise<Record<string, unknown> | undefined> {
-	let previous = JSON.stringify(await readActivity(stateFile));
-	for (let quiet = 0; quiet < 20; quiet++) {
-		await Bun.sleep(10);
-		const current = JSON.stringify(await readActivity(stateFile));
-		if (current !== previous) quiet = 0;
-		previous = current;
-	}
+/** Join event handling and sidecar persistence before asserting the LAST published snapshot. */
+async function settledActivity(session: AgentSession, stateFile: string): Promise<Record<string, unknown> | undefined> {
+	await session.awaitSessionSettlement();
+	await session.awaitCoordinatorRuntimeStatePersistenceForTests();
 	return await readActivity(stateFile);
 }
 
@@ -654,7 +649,7 @@ describe("AgentSession coordinator activity labels", () => {
 		release.resolve();
 		await syntheticPaired.promise;
 		await run;
-		const settled = await settledActivity(stateFile);
+		const settled = await settledActivity(session, stateFile);
 		sampling = false;
 		await sampler;
 
@@ -833,7 +828,7 @@ describe("AgentSession coordinator activity labels", () => {
 		pendingCalls = [toolCall("call-transform-rejected", "read")];
 		await session.agent.prompt("emit a call the argument transform rejects");
 
-		const settled = JSON.stringify(await settledActivity(stateFile));
+		const settled = JSON.stringify(await settledActivity(session, stateFile));
 		sampling = false;
 		await sampler;
 

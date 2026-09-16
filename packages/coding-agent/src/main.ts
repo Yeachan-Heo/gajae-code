@@ -474,7 +474,10 @@ async function applyStartupModelProfilesWithPolicy(
 	const applyProfile = async (
 		profileName: string,
 		persistDefault: boolean,
-		options: { thinkingLevelOverride?: CreateAgentSessionOptions["thinkingLevel"] } = {},
+		options: {
+			thinkingLevelOverride?: CreateAgentSessionOptions["thinkingLevel"];
+			tolerateCredentialError?: boolean;
+		} = {},
 	): Promise<boolean> => {
 		try {
 			await activateModelProfile(
@@ -483,13 +486,21 @@ async function applyStartupModelProfilesWithPolicy(
 			);
 			return true;
 		} catch (error) {
-			if (onCredentialError && error instanceof ModelProfileCredentialError) {
-				onCredentialError(error);
+			if (error instanceof ModelProfileCredentialError && (onCredentialError || options.tolerateCredentialError)) {
+				if (onCredentialError) onCredentialError(error);
+				else process.stderr.write(`${chalk.yellow(`Warning: ${error.message}`)}\n`);
 				return false;
 			}
 			throw error;
 		}
 	};
+
+	// An explicit startup selector (--mpreset or --model) fully replaces the
+	// persisted default profile for this session, so a failing default must not
+	// abort a non-interactive run: it is reported as a warning and the explicit
+	// selection proceeds. Without an explicit selector the historic fatal
+	// contract is unchanged.
+	const tolerateDefaultProfileFailure = args.parsedArgs.mpreset !== undefined || args.parsedArgs.model !== undefined;
 
 	// Capture the explicitly-selected startup model BEFORE profile activation can
 	// override it. startupModel covers the eager path; session.model covers the
@@ -507,6 +518,7 @@ async function applyStartupModelProfilesWithPolicy(
 					thinkingLevelOverride: args.settings.has("defaultThinkingLevel")
 						? args.settings.get("defaultThinkingLevel")
 						: undefined,
+					tolerateCredentialError: tolerateDefaultProfileFailure,
 				})) && applied;
 		}
 		if (args.parsedArgs.mpreset) {

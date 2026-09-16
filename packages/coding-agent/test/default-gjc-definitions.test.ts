@@ -543,12 +543,16 @@ Project executor override body.
 		expect(routing).toContain("Delegate large implementation slices to `executor`");
 		expect(routing).toContain('explicit user request to use a worktree (for example, "use worktree")');
 		expect(routing).toContain("delegate implementation through `task` with `isolated: true`");
+		// Isolation-off branch: plain git worktree, never a refusal.
+		expect(routing).toContain("create or select a dedicated git worktree with `git worktree add`");
+		expect(routing).toContain("NEVER refuse worktree work over that missing parameter");
 		expect(routing).toContain("read the full skill text and follow it exactly");
 		expect(routing).toContain("Before explicit execution approval or a valid non-off ralplan final runtime receipt");
 		expect(routing).toContain(
 			"reconciliation must persist its final receipt before choosing approval or an admitted handoff",
 		);
-		expect(routing.split("\n").filter(line => line.startsWith("-"))).toHaveLength(14);
+		// 15 = 13 unconditional lines + both worktree-routing branches.
+		expect(routing.split("\n").filter(line => line.startsWith("-"))).toHaveLength(15);
 		expect(decomposition).toMatch(/skip it for one-step or obvious two-step fixes/i);
 	});
 

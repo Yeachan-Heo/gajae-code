@@ -27,10 +27,10 @@ describe("prompt-deadline-lease", () => {
 		expect(lease.lastProgressAt).toBe(5_000);
 	});
 
-	test("only tool execution boundaries are attributable", () => {
+	test("tool execution boundaries and streaming updates are attributable", () => {
 		expect(isAttributableProgressEventType("tool_execution_start")).toBe(true);
+		expect(isAttributableProgressEventType("tool_execution_update")).toBe(true);
 		expect(isAttributableProgressEventType("tool_execution_end")).toBe(true);
-		expect(isAttributableProgressEventType("tool_execution_update")).toBe(false);
 		expect(isAttributableProgressEventType("message_update")).toBe(false);
 		expect(isAttributableProgressEventType("agent_start")).toBe(false);
 		expect(isAttributableProgressEventType("heartbeat")).toBe(false);
@@ -55,9 +55,14 @@ describe("PromptDeadlineManager", () => {
 		manager.onAttributableEvent(correlation, "tool_execution_start", now);
 		expect(manager.deadlineAt(correlation)).toBe(2_800_000);
 
+		// Streaming update from a long-running tool renews the lease
+		now = 1_500_000;
+		manager.onAttributableEvent(correlation, "tool_execution_update", now);
+		expect(manager.deadlineAt(correlation)).toBe(3_300_000);
+
 		// Streaming chatter must not renew
 		manager.onAttributableEvent(correlation, "message_update", now + 500);
-		expect(manager.deadlineAt(correlation)).toBe(2_800_000);
+		expect(manager.deadlineAt(correlation)).toBe(3_300_000);
 
 		// Unrelated correlation must not renew
 		const other = { commandId: "c2", turnId: "t2" };

@@ -1,0 +1,460 @@
+import { afterEach, describe, expect, it, spyOn } from "bun:test";
+import * as fs from "node:fs";
+import * as path from "node:path";
+import { Agent, type AgentTool } from "@gajae-code/agent-core";
+import type { AssistantMessage, ToolResultMessage } from "@gajae-code/ai";
+import { createMockModel, registerMockApi } from "@gajae-code/ai/providers/mock";
+import { Settings } from "@gajae-code/coding-agent/config/settings";
+import { AgentSession, StreamingEditFileCache } from "@gajae-code/coding-agent/session/agent-session";
+import { EphemeralBlobStore, MemoryBlobStore } from "@gajae-code/coding-agent/session/blob-store";
+import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
+import { logger, TempDir } from "@gajae-code/utils";
+import * as z from "zod/v4";
+
+registerMockApi();
+const sessions: AgentSession[] = [];
+afterEach(async () => {
+	for (const session of sessions.splice(0)) await session.dispose();
+});
+
+function createSession(cwd: string, reply = "ok", tools: AgentTool[] = []) {
+	const model = createMockModel({ handler: () => ({ content: [reply] }) });
+	const agent = new Agent({
+		getApiKey: () => "test-key",
+		initialState: { model, systemPrompt: ["test"], messages: [], tools },
+		streamFn: model.stream,
+	});
+	const session = new AgentSession({
+		agent,
+		sessionManager: SessionManager.inMemory(cwd),
+		settings: Settings.isolated({ "compaction.enabled": false, "edit.streamingAbort": true }),
+		modelRegistry: { getApiKey: async () => "test-key", getAvailable: () => [model] } as never,
+		toolRegistry: new Map(tools.map(tool => [tool.name, tool])),
+	});
+	sessions.push(session);
+	return session;
+}
+
+function startEdit(session: AgentSession, filePath: string, id: string): void {
+	const message: AssistantMessage = {
+		role: "assistant",
+		content: [{ type: "toolCall", id, name: "edit", arguments: { path: filePath, diff: "" } }],
+		api: "anthropic-messages",
+		provider: "anthropic",
+		model: "mock",
+		stopReason: "toolUse",
+		timestamp: Date.now(),
+		usage: {
+			input: 0,
+			output: 0,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 0,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		},
+	};
+	session.agent.emitExternalEvent({
+		type: "message_update",
+		message,
+		assistantMessageEvent: { type: "toolcall_start", contentIndex: 0, partial: message },
+	});
+}
+
+async function settleEvents(): Promise<void> {
+	for (let index = 0; index < 30; index++) await Promise.resolve();
+}
+
+describe("session runtime cache hot paths", () => {
+	it.each([
+		"malformed URL",
+		"local root failure",
+	])("admits failed edits and revokes pre-cache reads after %s", async mode => {
+		using dir = TempDir.createSync("precache-invalidation-failure-");
+		const filePath = path.resolve(dir.path(), "file.txt");
+		await Bun.write(filePath, "old");
+		const session = createSession(dir.path());
+		const pending = Promise.withResolvers<string>();
+		const started = Promise.withResolvers<void>();
+		const replacementStarted = Promise.withResolvers<void>();
+		const originalRead = fs.promises.readFile;
+		let reads = 0;
+		const readSpy = spyOn(fs.promises, "readFile").mockImplementation(((...args: Parameters<typeof originalRead>) => {
+			if (String(args[0]) !== filePath) return originalRead(...args);
+			reads++;
+			if (reads > 1) {
+				replacementStarted.resolve();
+				return Promise.resolve("fresh");
+			}
+			started.resolve();
+			return pending.promise;
+		}) as typeof originalRead);
+		const publishSpy = spyOn(StreamingEditFileCache.prototype, "set");
+		const clearSpy = spyOn(StreamingEditFileCache.prototype, "clear");
+		const debugSpy = spyOn(logger, "debug");
+		const rootSpy = spyOn(session.sessionManager, "getArtifactsDir");
+		const received: ToolResultMessage[] = [];
+		const completed: string[] = [];
+		const unsubscribe = session.subscribe(event => {
+			if (event.type === "message_end" && event.message.role === "toolResult") received.push(event.message);
+			if (event.type === "tool_execution_end") completed.push(event.toolCallId);
+		});
+		try {
+			startEdit(session, filePath, "pending");
+			await started.promise;
+			if (mode === "local root failure") {
+				rootSpy.mockImplementation(() => {
+					throw new Error("local root unavailable");
+				});
+			}
+			const failedPath = mode === "malformed URL" ? "local://bad" + "%ZZ" : "local://file.txt";
+			const message: ToolResultMessage = {
+				role: "toolResult",
+				toolCallId: "failed-edit",
+				toolName: "edit",
+				content: [{ type: "text", text: "edit failed" }],
+				details: { path: failedPath },
+				isError: true,
+				timestamp: Date.now(),
+			};
+			session.agent.emitExternalEvent({
+				type: "tool_execution_end",
+				toolCallId: message.toolCallId,
+				toolName: "edit",
+				result: { content: message.content, details: message.details },
+				isError: true,
+			});
+			session.agent.emitExternalEvent({ type: "message_end", message });
+			// Revocation must precede the asynchronous admission/spill boundary.
+			expect(clearSpy).toHaveBeenCalledTimes(1);
+			pending.resolve("stale");
+			await session.awaitPendingContextTransformations();
+			await settleEvents();
+			expect(debugSpy.mock.calls).toContainEqual([
+				"Failed to resolve streaming-edit cache invalidation path",
+				{ path: failedPath, error: expect.any(String) },
+			]);
+			if (mode === "local root failure") expect(rootSpy).toHaveBeenCalled();
+			expect(received).toEqual([message]);
+			expect(completed).toEqual([message.toolCallId]);
+			expect(session.sessionManager.buildSessionContext().messages).toContainEqual(message);
+			expect(publishSpy.mock.calls.filter(([key]) => key === filePath)).toHaveLength(0);
+			startEdit(session, filePath, "replacement");
+			await replacementStarted.promise;
+			await settleEvents();
+			expect(reads).toBe(2);
+			expect(publishSpy.mock.calls.filter(([key]) => key === filePath)).toEqual([[filePath, "fresh"]]);
+		} finally {
+			pending.resolve("stale");
+			unsubscribe();
+			rootSpy.mockRestore();
+			debugSpy.mockRestore();
+			clearSpy.mockRestore();
+			publishSpy.mockRestore();
+			readSpy.mockRestore();
+			await session.dispose();
+			sessions.splice(sessions.indexOf(session), 1);
+		}
+	});
+	it.each([
+		["mixed multibyte", "界🙂".repeat(4000)],
+		["surrogate boundary", `ab${"🙂".repeat(2000)}`],
+	])("bounds oversized %s IRC replies with the existing suffix and intact code points", async (_label, source) => {
+		using dir = TempDir.createSync("irc-byte-bound-");
+		const session = createSession(dir.path(), source);
+		const { replyText: reply } = await session.respondAsBackground({ from: "0-Main", message: "ping" });
+		if (reply === null) throw new Error("Expected an IRC reply");
+		const suffix = "\n[…truncated]";
+		const budget = 4096 - Buffer.byteLength(suffix);
+		let prefix = "";
+		for (const glyph of source) {
+			if (Buffer.byteLength(prefix + glyph) > budget) break;
+			prefix += glyph;
+		}
+		expect(reply).toBe(prefix + suffix);
+		expect(Buffer.byteLength(reply)).toBeLessThanOrEqual(4096);
+		expect(reply).not.toContain("�");
+		expect(reply.isWellFormed()).toBe(true);
+	});
+
+	it("does not publish a delayed pre-cache read after edit invalidation or retire its replacement", async () => {
+		using dir = TempDir.createSync("precache-token-");
+		const filePath = path.resolve(dir.path(), "file.txt");
+		await Bun.write(filePath, "old");
+		const session = createSession(dir.path());
+		const first = Promise.withResolvers<string>();
+		const second = Promise.withResolvers<string>();
+		const firstStarted = Promise.withResolvers<void>();
+		const secondStarted = Promise.withResolvers<void>();
+		const originalRead = fs.promises.readFile;
+		let reads = 0;
+		const readSpy = spyOn(fs.promises, "readFile").mockImplementation(((...args: Parameters<typeof originalRead>) => {
+			if (String(args[0]) !== filePath) return originalRead(...args);
+			reads++;
+			if (reads === 1) {
+				firstStarted.resolve();
+				return first.promise;
+			}
+			secondStarted.resolve();
+			return second.promise;
+		}) as typeof originalRead);
+		const publishSpy = spyOn(StreamingEditFileCache.prototype, "set");
+		try {
+			startEdit(session, filePath, "first");
+			await firstStarted.promise;
+			session.agent.emitExternalEvent({
+				type: "message_end",
+				message: {
+					role: "toolResult",
+					toolCallId: "first",
+					toolName: "edit",
+					content: [{ type: "text", text: "ok" }],
+					details: { path: filePath },
+					isError: false,
+					timestamp: Date.now(),
+				},
+			});
+			await settleEvents();
+			startEdit(session, filePath, "second");
+			await secondStarted.promise;
+			first.resolve("old");
+			await settleEvents();
+			expect(publishSpy.mock.calls.filter(([key]) => key === filePath)).toHaveLength(0);
+			startEdit(session, filePath, "third");
+			await settleEvents();
+			expect(reads).toBe(2);
+			second.resolve("new");
+			await settleEvents();
+			expect(publishSpy.mock.calls.filter(([key]) => key === filePath)).toEqual([[filePath, "new"]]);
+		} finally {
+			first.resolve("old");
+			second.resolve("new");
+			readSpy.mockRestore();
+			publishSpy.mockRestore();
+		}
+	});
+
+	it.each(["edit", "turn reset", "rejection"])("bounds and re-admits pre-cache generations after %s", async mode => {
+		using dir = TempDir.createSync("precache-generation-bound-");
+		const filePath = path.resolve(dir.path(), "file.txt");
+		await Bun.write(filePath, "old");
+		const session = createSession(dir.path());
+		const reads: PromiseWithResolvers<string>[] = [];
+		const firstStarted = Promise.withResolvers<void>();
+		const secondStarted = Promise.withResolvers<void>();
+		const replacementStarted = Promise.withResolvers<void>();
+		const nextTurnStarted = Promise.withResolvers<void>();
+		const originalRead = fs.promises.readFile;
+		const readSpy = spyOn(fs.promises, "readFile").mockImplementation(((...args: Parameters<typeof originalRead>) => {
+			if (String(args[0]) !== filePath) return originalRead(...args);
+			const pending = Promise.withResolvers<string>();
+			reads.push(pending);
+			if (reads.length === 1) firstStarted.resolve();
+			if (reads.length === 2) secondStarted.resolve();
+			if (reads.length === 3) replacementStarted.resolve();
+			if (reads.length === 4) nextTurnStarted.resolve();
+			return pending.promise;
+		}) as typeof originalRead);
+		const publishSpy = spyOn(StreamingEditFileCache.prototype, "set");
+		try {
+			const invalidate = () =>
+				session.agent.emitExternalEvent({
+					type: "message_end",
+					message: {
+						role: "toolResult",
+						toolCallId: "edit",
+						toolName: "edit",
+						content: [{ type: "text", text: "ok" }],
+						details: { path: filePath },
+						isError: false,
+						timestamp: Date.now(),
+					},
+				});
+			startEdit(session, filePath, "first");
+			await firstStarted.promise;
+			invalidate();
+			await settleEvents();
+			startEdit(session, filePath, "second");
+			await secondStarted.promise;
+			if (mode === "turn reset") session.agent.emitExternalEvent({ type: "turn_start" });
+			else invalidate();
+			await settleEvents();
+			startEdit(session, filePath, "third");
+			await settleEvents();
+			expect(reads).toHaveLength(2);
+			if (mode === "rejection") reads[0]!.reject(new Error("stale read failed"));
+			else reads[0]!.resolve("stale first");
+			await settleEvents();
+			expect(publishSpy.mock.calls.filter(([key]) => key === filePath)).toHaveLength(0);
+			startEdit(session, filePath, "replacement");
+			await replacementStarted.promise;
+			expect(reads).toHaveLength(3);
+			reads[2]!.resolve("fresh replacement");
+			await settleEvents();
+			expect(publishSpy.mock.calls.filter(([key]) => key === filePath)).toEqual([[filePath, "fresh replacement"]]);
+			if (mode === "rejection") reads[1]!.reject(new Error("second stale read failed"));
+			else reads[1]!.resolve("stale second");
+			await settleEvents();
+			expect(publishSpy.mock.calls.filter(([key]) => key === filePath)).toEqual([[filePath, "fresh replacement"]]);
+			// Reset also evicts the published text; settled stale generations must not block another read.
+			session.agent.emitExternalEvent({ type: "turn_start" });
+			await settleEvents();
+			startEdit(session, filePath, "after-reset");
+			await nextTurnStarted.promise;
+			expect(reads).toHaveLength(4);
+			reads[3]!.resolve("next turn");
+			await settleEvents();
+			expect(publishSpy.mock.calls.filter(([key]) => key === filePath)).toEqual([
+				[filePath, "fresh replacement"],
+				[filePath, "next turn"],
+			]);
+		} finally {
+			for (const pending of reads) pending.resolve("stale");
+			readSpy.mockRestore();
+			publishSpy.mockRestore();
+			await session.dispose();
+			sessions.splice(sessions.indexOf(session), 1);
+		}
+	});
+
+	it.each(["reject", "throw"])("re-admits pre-cache reads after a current read fails via %s", async failure => {
+		using dir = TempDir.createSync("precache-failure-");
+		const filePath = path.resolve(dir.path(), "file.txt");
+		await Bun.write(filePath, "old");
+		const session = createSession(dir.path());
+		const failed = Promise.withResolvers<string>();
+		const firstStarted = Promise.withResolvers<void>();
+		const replacementStarted = Promise.withResolvers<void>();
+		const replacement = Promise.withResolvers<string>();
+		const originalRead = fs.promises.readFile;
+		let reads = 0;
+		const readSpy = spyOn(fs.promises, "readFile").mockImplementation(((...args: Parameters<typeof originalRead>) => {
+			if (String(args[0]) !== filePath) return originalRead(...args);
+			reads++;
+			if (reads === 1) {
+				firstStarted.resolve();
+				if (failure === "throw") throw new Error("synchronous read failure");
+				return failed.promise;
+			}
+			replacementStarted.resolve();
+			return replacement.promise;
+		}) as typeof originalRead);
+		const publishSpy = spyOn(StreamingEditFileCache.prototype, "set");
+		try {
+			startEdit(session, filePath, "failed");
+			await firstStarted.promise;
+			if (failure === "reject") failed.reject(new Error("asynchronous read failure"));
+			await settleEvents();
+			expect(publishSpy.mock.calls.filter(([key]) => key === filePath)).toHaveLength(0);
+			startEdit(session, filePath, "retry");
+			await replacementStarted.promise;
+			expect(reads).toBe(2);
+			replacement.resolve("recovered");
+			await settleEvents();
+			expect(publishSpy.mock.calls.filter(([key]) => key === filePath)).toEqual([[filePath, "recovered"]]);
+		} finally {
+			failed.resolve("unused");
+			replacement.resolve("recovered");
+			readSpy.mockRestore();
+			publishSpy.mockRestore();
+		}
+	});
+
+	it("keeps only the current permission wrapper across bridge and provider replacements", () => {
+		using dir = TempDir.createSync("wrapper-generations-");
+		const tool: AgentTool = {
+			name: "bash",
+			label: "bash",
+			description: "test",
+			parameters: z.object({}),
+			execute: async () => ({ content: [{ type: "text", text: "ok" }] }),
+		};
+		const mapSpy = spyOn(WeakMap.prototype, "set");
+		try {
+			const session = createSession(dir.path(), "ok", [tool]);
+			for (let index = 0; index < 40; index++) {
+				session.setClientBridge({
+					capabilities: { requestPermission: true },
+					requestPermission: async () => ({ outcome: "cancelled" }),
+				});
+				session.setSdkPermissionProvider(async () => ({ outcome: "cancelled" }));
+				const wrapped = session.getToolForExecution("bash");
+				expect(session.getToolForExecution("bash")).toBe(wrapped);
+			}
+			const maps = mapSpy.mock.calls.filter(([key, value]) => key === tool && value instanceof Map);
+			expect(maps).toHaveLength(1);
+			const versions = maps[0]![1] as Map<string, AgentTool>;
+			expect(versions.size).toBe(1);
+			expect(versions.values().next().value).toBe(session.getToolForExecution("bash"));
+		} finally {
+			mapSpy.mockRestore();
+		}
+	});
+
+	it("reuses warm context without recursive sentinel traversal", () => {
+		const manager = SessionManager.inMemory();
+		manager.appendMessage({ role: "user", content: "hello", timestamp: 1 });
+		const expected = manager.buildSessionContext();
+		const valuesSpy = spyOn(Object, "values");
+		try {
+			expect(manager.buildSessionContext()).toEqual(expected);
+			expect(valuesSpy).not.toHaveBeenCalled();
+			manager.appendMessage({ role: "user", content: "new revision", timestamp: 2 });
+			expect(manager.buildSessionContext().messages).toHaveLength(2);
+			expect(valuesSpy.mock.calls.length).toBeGreaterThan(0);
+		} finally {
+			valuesSpy.mockRestore();
+		}
+	});
+
+	it("copies ordinary memory inputs but transfers owned inputs and isolates returned buffers", () => {
+		const store = new MemoryBlobStore();
+		const ordinary = Buffer.from("ordinary");
+		const owned = Buffer.from("owned");
+		const copySpy = spyOn(Buffer, "from");
+		let ordinaryHash: string;
+		let ownedHash: string;
+		try {
+			ordinaryHash = store.putSync(ordinary).hash;
+			expect(copySpy.mock.calls.some(([value]) => value === ordinary)).toBe(true);
+			copySpy.mockClear();
+			ownedHash = store.putOwnedSync(owned).hash;
+			expect(copySpy.mock.calls.some(([value]) => value === owned)).toBe(false);
+		} finally {
+			copySpy.mockRestore();
+		}
+		ordinary.fill(0);
+		expect(store.getSync(ordinaryHash)?.toString()).toBe("ordinary");
+		store.getSync(ownedHash)!.fill(0);
+		expect(store.getSync(ownedHash)?.toString()).toBe("owned");
+	});
+
+	it("rejects oversized ephemeral buffers before copying and isolates accepted buffers", () => {
+		using dir = TempDir.createSync("ephemeral-copy-bound-");
+		const store = new EphemeralBlobStore(path.join(dir.path(), "cache"));
+		try {
+			for (const size of [8 * 1024 * 1024 - 1, 8 * 1024 * 1024, 8 * 1024 * 1024 + 1]) {
+				const input = Buffer.alloc(size, 65);
+				const copySpy = spyOn(Buffer, "from");
+				let hash: string;
+				try {
+					hash = store.putSync(input).hash;
+					expect(copySpy.mock.calls.filter(([value]) => value === input).length).toBe(
+						size > 8 * 1024 * 1024 ? 0 : 1,
+					);
+				} finally {
+					copySpy.mockRestore();
+				}
+				input.fill(66);
+				const cached = store.getBufferedSync(hash);
+				if (size > 8 * 1024 * 1024) expect(cached).toBeNull();
+				else {
+					expect(cached?.length).toBe(size);
+					expect(cached?.[0]).toBe(65);
+				}
+				expect(store.getSync(hash)?.[0]).toBe(65);
+			}
+		} finally {
+			store.dispose();
+		}
+	});
+});

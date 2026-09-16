@@ -11,7 +11,8 @@ import {
 	SERVING_EPOCH,
 	type TelegramDaemonOptions,
 } from "../src/sdk/bus/telegram-daemon";
-import { runDaemonInternal } from "../src/sdk/bus/telegram-daemon-cli";
+import { createDaemonControlHooks, runDaemonInternal } from "../src/sdk/bus/telegram-daemon-cli";
+import { writeTelegramControlRequest } from "../src/sdk/bus/telegram-daemon-control";
 
 const BOT_TOKEN = "1234567890:ABCDEFghijkLmnOpQrsTuvWxYz012345678";
 
@@ -66,6 +67,28 @@ function writeReadyState(agentDir: string, pid: number, incarnation: string, own
 }
 
 describe("issue #4403 — CLI fail-closed + daemon watchdog reconciliation", () => {
+	test("control action projection remains owner-fenced", async () => {
+		const agentDir = tempAgentDir();
+		try {
+			const s = settings(agentDir);
+			await writeTelegramControlRequest(s, {
+				version: 1,
+				requestId: "reload-request",
+				action: "reload",
+				ownerId: "owner-a",
+				pid: 123,
+				createdAt: 1,
+			});
+			const hooks = createDaemonControlHooks(s);
+			expect(await hooks.shouldStop("owner-a")).toBe(true);
+			expect(await hooks.requestedAction("owner-a")).toBe("reload");
+			expect(await hooks.shouldStop("owner-b")).toBe(false);
+			expect(await hooks.requestedAction("owner-b")).toBeUndefined();
+		} finally {
+			fs.rmSync(agentDir, { recursive: true, force: true });
+		}
+	});
+
 	test("watchdog does NOT self-terminate when incarnation authority is unavailable (fail-closed)", async () => {
 		const agentDir = tempAgentDir();
 		const token = "test-fail-closed";

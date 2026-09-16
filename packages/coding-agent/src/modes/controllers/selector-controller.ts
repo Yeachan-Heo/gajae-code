@@ -2947,6 +2947,8 @@ export class SelectorController {
 				},
 				{
 					...options,
+					// The selector replaces the composer, outside the anchored transcript.
+					renderScope: "layout",
 					sessionId: this.ctx.session.credentialSessionId,
 					currentThinkingLevel: this.ctx.session.thinkingLevel,
 					activeModelProfile:

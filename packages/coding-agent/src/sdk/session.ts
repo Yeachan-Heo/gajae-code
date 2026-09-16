@@ -3603,6 +3603,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		// `cli/list-models.ts`. A caller-supplied `preloadedExtensions` result
 		// suppresses discovery entirely.
 		const explicitExtensionPaths = options.additionalExtensionPaths ?? [];
+		// The `extensions` setting is schema-typed as an array of paths, but a
+		// hand-edited config can hold an invalid shape; discovery must degrade to
+		// no extra paths instead of aborting startup for every session.
+		const extensionsSettingPaths = Array.isArray(settings.get("extensions")) ? settings.get("extensions") : [];
 		// Discovery must never block session creation: a filesystem or plugin-registry
 		// failure degrades to the explicit paths and then to no extensions at all, and
 		// the failure stays observable in `extensionsResult.errors`.
@@ -3611,7 +3615,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				return options.disableExtensionDiscovery
 					? await loadExtensions(explicitExtensionPaths, cwd, eventBus)
 					: await discoverAndLoadExtensions(
-							[...explicitExtensionPaths, ...settings.get("extensions")],
+							[...explicitExtensionPaths, ...extensionsSettingPaths],
 							cwd,
 							eventBus,
 							settings.get("disabledExtensions"),
@@ -4146,6 +4150,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				toolDiscoveryActive: effectiveDiscoveryMode === "all" || mcpDiscoveryEnabled,
 				eagerTasks: resolveEagerTasks(),
 				secretsEnabled,
+				taskIsolationEnabled: settings.get("task.isolation.mode") !== "none",
 				workspaceTree: workspaceTreePromise,
 				subagent: options.parentTaskPrefix !== undefined,
 			});

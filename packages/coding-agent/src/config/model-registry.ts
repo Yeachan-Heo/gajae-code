@@ -777,6 +777,11 @@ function filterMaterializedRegistryProfiles(
 	}
 	return filtered;
 }
+type SpecialProviderDescriptor = {
+	providerId: string;
+	resolveKey: (value: string | undefined) => string | undefined;
+	createOptions: (key: string) => ModelManagerOptions<Api>;
+};
 
 const PROVIDER_BASE_URL_ENV_ALIASES: Record<string, readonly string[]> = {
 	anthropic: ["ANTHROPIC_BASE_URL"],
@@ -3611,16 +3616,8 @@ export class ModelRegistry {
 		return discoveries.flat();
 	}
 
-	async #collectBuiltInModelManagerOptions(
-		excludedProviderIds: ReadonlySet<string> = new Set(),
-		providerFilter?: ReadonlySet<string>,
-		credentialSessionId?: string,
-	): Promise<ModelManagerDiscoveryOptions[]> {
-		const specialProviderDescriptors: Array<{
-			providerId: string;
-			resolveKey: (value: string | undefined) => string | undefined;
-			createOptions: (key: string) => ModelManagerOptions<Api>;
-		}> = [
+	#specialProviderDescriptors(credentialSessionId?: string): SpecialProviderDescriptor[] {
+		return [
 			{
 				providerId: "google-antigravity",
 				resolveKey: extractGoogleOAuthToken,
@@ -3657,6 +3654,14 @@ export class ModelRegistry {
 				},
 			},
 		];
+	}
+
+	async #collectBuiltInModelManagerOptions(
+		excludedProviderIds: ReadonlySet<string> = new Set(),
+		providerFilter?: ReadonlySet<string>,
+		credentialSessionId?: string,
+	): Promise<ModelManagerDiscoveryOptions[]> {
+		const specialProviderDescriptors = this.#specialProviderDescriptors(credentialSessionId);
 		const disabledProviders = getDisabledProviderIdsFromSettings(this.#settings);
 		const standardProviderDescriptors = PROVIDER_DESCRIPTORS.filter(
 			descriptor =>
@@ -5410,6 +5415,27 @@ export class ModelRegistry {
 		return this.#discoveryManager.providers
 			.filter(provider => !disabledProviders.has(provider.provider))
 			.map(provider => provider.provider);
+	}
+
+	/**
+	 * Providers whose catalogs can be filled by bounded official refresh:
+	 * configured discovery, built-in special OAuth dynamics, and standard
+	 * descriptor-backed providers. Unknown ids stay excluded. Disabled
+	 * providers are omitted. UI tabs still use getDiscoverableProviders.
+	 */
+	getRefreshableProviders(): string[] {
+		const disabledProviders = getDisabledProviderIdsFromSettings(this.#settings);
+		const providers: string[] = [];
+		const seen = new Set<string>();
+		const add = (providerId: string) => {
+			if (disabledProviders.has(providerId) || seen.has(providerId)) return;
+			seen.add(providerId);
+			providers.push(providerId);
+		};
+		for (const provider of this.#discoveryManager.providers) add(provider.provider);
+		for (const descriptor of PROVIDER_DESCRIPTORS) add(descriptor.providerId);
+		for (const descriptor of this.#specialProviderDescriptors()) add(descriptor.providerId);
+		return providers;
 	}
 
 	getProviderDiscoveryState(provider: string): ProviderDiscoveryState | undefined {

@@ -119,6 +119,13 @@ const BEHAVIORAL_OWNER_TESTS: Readonly<Record<string, readonly string[]>> = {
 		"packages/coding-agent/test/agent-session-promotion-identity.test.ts",
 		"packages/coding-agent/test/agent-session-terminal-abort-chain.test.ts",
 	],
+	// The managed-scope owner-only self-heal budget/latency contract is verified by
+	// a dedicated suite that exercises the bounded walk, targeted repair, and
+	// deferred tail directly (prepare only runs the walk behind a Linux-only
+	// retained authority), so basename matching would miss it.
+	"packages/coding-agent/src/session/internal/managed-session-scope.ts": [
+		"packages/coding-agent/test/managed-scope-self-heal-budget.test.ts",
+	],
 	"packages/coding-agent/src/sdk/bus/reconciliation-store.ts": [
 		"packages/coding-agent/test/sdk-reconciliation-store.test.ts",
 	],

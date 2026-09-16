@@ -279,15 +279,27 @@ function reportRouterCleanupFailure(error: unknown): void {
 	process.stderr.write(`SDK session Router cleanup failed: ${message}\n`);
 }
 
+/**
+ * Sessions a CLI-opened Router is allowed to attach to. Required, and required
+ * to be exhaustive: attaching is not free and is not invisible, because every
+ * attachment registers this process as a live client on that host and renews
+ * the host's abandonment window. An omitted scope used to mean "the whole
+ * fleet", so a single-session command silently kept every unrelated host alive.
+ *
+ * `BROKER_ONLY` is the empty scope, for work the Broker answers over its own
+ * client (`session.list`) and which therefore needs no session transport at all.
+ */
+const BROKER_ONLY: readonly string[] = [];
+
 async function withRouter<T>(
 	agentDir: string,
+	sessionIds: readonly string[],
 	action: (router: SessionRouter) => Promise<T>,
 	onFrame?: (attachment: SessionAttachment, frame: SessionRouterFrame) => void,
-	sessionIds?: readonly string[],
 ): Promise<T> {
 	const router = new SessionRouter({
 		agentDir,
-		...(sessionIds === undefined ? {} : { sessionIds }),
+		sessionIds,
 		...(onFrame === undefined ? {} : { deps: { onFrame } }),
 	});
 	let result!: T;
@@ -409,7 +421,12 @@ type SessionRows = {
 
 async function sessionRows(agentDir: string, input: JsonRecord = {}): Promise<SessionRows> {
 	await ensureBroker({ agentDir });
-	return await withRouter(agentDir, async router => {
+	// `session.list` is answered by the Broker over its own client, so resolving a
+	// row needs no session transport. `runInspect` and `runTail` resolve exactly
+	// one session through here, and an unscoped lookup attached every live
+	// session in the directory before the scoped operation that follows it ever
+	// ran — renewing the abandonment window of hosts the caller never named.
+	return await withRouter(agentDir, BROKER_ONLY, async router => {
 		const response = await paginatedSessionList(router, input);
 		const result = resultObject(response) ?? {};
 		let sessions: SdkSessionRowV1[];
@@ -464,9 +481,8 @@ async function probeSearchRows(agentDir: string, result: SdkSearchResultV1): Pro
 	try {
 		const probes = await withRouter(
 			agentDir,
-			async router => await Promise.all(rows.map(row => searchProbe(row, router))),
-			undefined,
 			rows.map(row => row.id),
+			async router => await Promise.all(rows.map(row => searchProbe(row, router))),
 		);
 		return { ...result, rows: mergeProbedSearchRows(result.rows, probes) };
 	} catch {
@@ -944,7 +960,7 @@ async function runSend(agentDir: string, sessionId: string, args: SdkSessionCliA
 	if (invalid) throw new SdkSessionCliError(invalid.code, invalid.message, 2);
 	await ensureBroker({ agentDir });
 
-	return await withRouter(agentDir, async router => {
+	return await withRouter(agentDir, [sessionId], async router => {
 		const response = await requestControl(router, sessionId, "turn.prompt", promptInput, args);
 		const result: JsonRecord = {
 			version: SESSION_ROWS_VERSION,
@@ -976,7 +992,7 @@ async function runStatus(
 ): Promise<unknown> {
 	assertClientRef(opRef);
 	await ensureBroker({ agentDir });
-	return await withRouter(agentDir, async router => {
+	return await withRouter(agentDir, [sessionId], async router => {
 		const response = await requestQuery(router, sessionId, "turn.result", { kind: "prompt", clientRef: opRef }, args);
 		const status = resultObject(response) ?? {};
 		const raw = typeof status.status === "string" ? status.status : "unknown";
@@ -1539,6 +1555,7 @@ async function runLiveTail(
 
 	return await withRouter(
 		agentDir,
+		[sessionId],
 		async router => {
 			const attachment = attachmentFor(router, sessionId);
 			const checkpointResponse = await router.request(
@@ -1726,7 +1743,11 @@ async function runRawControl(
 	await ensureBroker({ agentDir });
 	const operatorRequest = operatorAbortBrokerRequest(sessionId, operation, input, args);
 	if (operatorRequest) return await requestBrokerOperatorAbort(agentDir, operatorRequest, args);
-	return await withRouter(agentDir, async router => await requestControl(router, sessionId, operation, input, args));
+	return await withRouter(
+		agentDir,
+		[sessionId],
+		async router => await requestControl(router, sessionId, operation, input, args),
+	);
 }
 
 async function runRawQuery(
@@ -1737,7 +1758,11 @@ async function runRawQuery(
 	args: SdkSessionCliArgs,
 ): Promise<unknown> {
 	await ensureBroker({ agentDir });
-	return await withRouter(agentDir, async router => await requestQuery(router, sessionId, operation, input, args));
+	return await withRouter(
+		agentDir,
+		[sessionId],
+		async router => await requestQuery(router, sessionId, operation, input, args),
+	);
 }
 
 function lifecycleMutationRequest(
@@ -1801,6 +1826,7 @@ async function runRawGlobal(
 		}
 		return await withRouter(
 			agentDir,
+			BROKER_ONLY,
 			async router =>
 				await (args.page ? singleSessionListPage(router, pageInput) : paginatedSessionList(router, pageInput)),
 		);

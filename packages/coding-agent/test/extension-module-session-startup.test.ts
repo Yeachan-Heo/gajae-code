@@ -348,4 +348,21 @@ describe("issue #5497: session startup loads filesystem extension modules", () =
 			await session.dispose();
 		}
 	}, 30_000);
+	it("degrades a schema-invalid extensions setting instead of aborting discovery", async () => {
+		// The `extensions` setting is schema-typed as an array of paths. A
+		// hand-edited config.yml can still hold an invalid shape (an object, for
+		// example); discovery must skip the extra paths rather than fail for the
+		// whole session startup.
+		const entry = installProbe();
+
+		const { session, extensionsResult } = await createSession({
+			settingsOverrides: { extensions: { userLoose: true } as never },
+		});
+		try {
+			expect(extensionsResult.errors.map(error => error.path)).not.toContain("<extension-discovery>");
+			expect(extensionsResult.extensions.map(extension => extension.resolvedPath)).toContain(entry);
+		} finally {
+			await session.dispose();
+		}
+	}, 30_000);
 });

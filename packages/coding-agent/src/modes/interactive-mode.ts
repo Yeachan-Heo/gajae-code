@@ -45,7 +45,12 @@ import {
 	starReminderLaunchGate,
 } from "../reminders/star-reminder";
 import type { NotificationSessionReconcileResult, NotificationSessionStatus } from "../sdk/bus/session-control";
-import type { AgentSession, AgentSessionEvent, AsyncJobSnapshotItem } from "../session/agent-session";
+import {
+	type AgentSession,
+	type AgentSessionEvent,
+	type AsyncJobSnapshotItem,
+	isSessionDisposalIncompleteError,
+} from "../session/agent-session";
 import type { HistoryStorage } from "../session/history-storage";
 import type { SessionContext, SessionManager } from "../session/session-manager";
 import { getRecentSessions, getSessionMessageEntryId } from "../session/session-manager";
@@ -1791,7 +1796,17 @@ export class InteractiveMode implements InteractiveModeContext {
 
 		// Emit shutdown event to hooks
 		this.session.setSdkPlanModeHandler(null);
-		await this.session.dispose();
+		let disposalWarning: string | undefined;
+		try {
+			await this.session.dispose();
+		} catch (error) {
+			if (!isSessionDisposalIncompleteError(error)) throw error;
+			// The caller deadline does not cancel the underlying persistence drain.
+			// Own this expected failure here so /exit still restores the terminal and
+			// enters bounded cleanup, rather than the unhandled-rejection crash path.
+			disposalWarning = sanitizeText(error.message);
+			logger.warn("Interactive shutdown persistence remains incomplete", { error: error.message });
+		}
 
 		if (this.isInitialized) {
 			this.ui.requestRender(true);
@@ -1808,6 +1823,9 @@ export class InteractiveMode implements InteractiveModeContext {
 		await this.petWidget?.disposeAsync();
 		await this.#itermPetTransport?.dispose();
 		this.stop();
+		if (disposalWarning) {
+			process.stderr.write(`\nShutdown incomplete: ${disposalWarning}\nPending state may not be saved.\n`);
+		}
 
 		// Print resumption hint if this is a persisted session
 		const sessionId = this.sessionManager.getSessionId();
@@ -1818,7 +1836,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			);
 		}
 
-		await postmortem.quit(0);
+		await postmortem.quit(disposalWarning ? 1 : 0);
 	}
 
 	async checkShutdownRequested(): Promise<void> {

@@ -15,7 +15,7 @@ export interface TelegramOwnerMarker {
 	startedAt: number;
 }
 
-function validMarker(value: unknown): value is TelegramOwnerMarker {
+export function validMarker(value: unknown): value is TelegramOwnerMarker {
 	if (!value || typeof value !== "object" || Array.isArray(value)) return false;
 	const v = value as Record<string, unknown>;
 	return (

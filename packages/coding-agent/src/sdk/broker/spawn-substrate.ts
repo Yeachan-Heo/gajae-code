@@ -13,7 +13,7 @@ import {
 	type ManagedTmuxLaunchProof,
 	verifyManagedGjcTmuxSession,
 } from "../../gjc-runtime/tmux-sessions";
-import { processIncarnation } from "./process-incarnation";
+import { observeProcessIncarnation, processIncarnation } from "./process-incarnation";
 import type { SpawnSubstrateLaunchSpec, SpawnSubstrateProof, SpawnSubstrateProvider } from "./spawn-authority";
 
 export type SpawnMultiplexerSelection = "none" | "tmux" | "psmux" | "proof_failed";
@@ -249,6 +249,9 @@ function startHeadless(spec: SpawnSubstrateLaunchSpec, env: NodeJS.ProcessEnv): 
 }
 
 function defaultIsProcessGone(pid: number): boolean {
+	const observation = observeProcessIncarnation(pid);
+	if (observation.status === "absent") return true;
+	if (observation.status === "present") return false;
 	try {
 		process.kill(pid, 0);
 		return false;

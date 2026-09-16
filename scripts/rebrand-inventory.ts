@@ -40,7 +40,7 @@ const rootLegacyScriptKeys = new Set(["test:py"]);
 
 const ignoredDirs = new Set([".git", "node_modules", ".gjc", "dist", "build", "coverage", ".turbo"]);
 const ignoredFiles = new Set(["bun.lock", "Cargo.lock"]);
-const ignoredExtensions = new Set([".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".node", ".wasm"]);
+const ignoredExtensions = new Set([".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".node", ".wasm", ".pdf"]);
 
 const forbiddenLegacyTokens = ["@oh-my" + "-pi", "oh-my" + "-pi", "om" + "p"] as const;
 const legacyTokenPatterns = forbiddenLegacyTokens.map(token => ({

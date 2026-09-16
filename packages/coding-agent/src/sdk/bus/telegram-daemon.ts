@@ -26,6 +26,7 @@ import {
 	parseToolActivityToggleCommand,
 } from "./config-commands";
 import { agentDirDigest, daemonPaths, HEARTBEAT_TTL_MS } from "./daemon-paths";
+import { type DoctorDaemonOccupancy, doctorDaemonOccupancySettled } from "./doctor-daemon-restart";
 import {
 	acquireDaemonTransitionLock,
 	type DaemonTransitionLock,
@@ -160,6 +161,33 @@ export type EnsureTelegramDaemonDetailedResult = "spawned" | "reloaded" | "attac
 
 export type TelegramDaemonOwnershipPhase = "provisional" | "ready" | "retired";
 
+/** Closed vocabulary for the durable reason an owner stopped serving. */
+export type TelegramDaemonStopCause =
+	| "stop"
+	| "reload"
+	| "signal"
+	| "idle_timeout"
+	| "ownership_loss"
+	| "startup_failed"
+	| "unexpected_exception"
+	| "postmortem";
+
+export function isTelegramDaemonStopCause(value: unknown): value is TelegramDaemonStopCause {
+	switch (value) {
+		case "stop":
+		case "reload":
+		case "signal":
+		case "idle_timeout":
+		case "ownership_loss":
+		case "startup_failed":
+		case "unexpected_exception":
+		case "postmortem":
+			return true;
+		default:
+			return false;
+	}
+}
+
 export interface DaemonState {
 	pid: number;
 	/** OS process-start provenance; mandatory for PID-authorized ownership actions. */
@@ -189,6 +217,8 @@ export interface DaemonState {
 	/** Lifecycle-serving compatibility epoch; absent pre-epoch records are epoch 1. */
 	servingEpoch?: number;
 	stoppedAt?: number;
+	/** Bounded, secret-free explanation for a stopped owner; absent on legacy/unknown records. */
+	stopCause?: TelegramDaemonStopCause;
 }
 interface ExactFileStat {
 	dev: bigint;
@@ -1640,6 +1670,7 @@ export function hasSafeDaemonStateShape(state: unknown): state is DaemonState {
 			(candidate.generation === undefined ||
 				(Number.isSafeInteger(candidate.generation) && (candidate.generation as number) > 0)) &&
 			(candidate.stoppedAt === undefined || Number.isSafeInteger(candidate.stoppedAt)) &&
+			(candidate.stopCause === undefined || isTelegramDaemonStopCause(candidate.stopCause)) &&
 			(candidate.servingEpoch === undefined ||
 				(Number.isSafeInteger(candidate.servingEpoch) && (candidate.servingEpoch as number) > 0)),
 	);
@@ -2471,6 +2502,7 @@ export async function renewDaemonHeartbeat(input: {
 				...boundState,
 				ownershipPhase: "retired",
 				stoppedAt: (input.now ?? Date.now)(),
+				stopCause: boundState.stopCause ?? "startup_failed",
 			}).catch(() => undefined);
 			if (await transitionLockIsHeldByCaller({ fs: fsImpl, path: paths.steal, lock: transition }))
 				await unlinkOwnershipLockExactly(fsImpl, paths.lock, lock);
@@ -2609,10 +2641,14 @@ export async function retireProvisionalDaemonOwnership(input: {
 		if (!(await transitionLockIsHeldByCaller({ fs: fsImpl, path: paths.steal, lock: transition }))) return false;
 		const lock = await readOwnershipLock(fsImpl, paths.lock);
 		if (!ownershipLockMatchesState(lock, state)) return false;
+		if (!(await transitionLockIsHeldByCaller({ fs: fsImpl, path: paths.steal, lock: transition }))) return false;
+		const stoppedAt = state.stoppedAt ?? (input.now ?? Date.now)();
+		const stopCause = state.stopCause ?? (state.stoppedAt === undefined ? "startup_failed" : undefined);
 		await writeJsonAtomic(fsImpl, paths.state, {
 			...state,
 			ownershipPhase: "retired",
-			stoppedAt: (input.now ?? Date.now)(),
+			stoppedAt,
+			...(stopCause === undefined ? {} : { stopCause }),
 		});
 		if (!(await transitionLockIsHeldByCaller({ fs: fsImpl, path: paths.steal, lock: transition }))) return false;
 		return await unlinkOwnershipLockExactly(fsImpl, paths.lock, lock);
@@ -2859,6 +2895,7 @@ export async function releaseDaemonOwnership(input: {
 	pidIncarnation?: (pid: number) => string | undefined;
 	fs?: TelegramDaemonFs;
 	now?: () => number;
+	stopCause?: TelegramDaemonStopCause;
 }): Promise<void> {
 	const fsImpl = input.fs ?? nodeFs;
 	const paths = daemonPaths(input.settings.getAgentDir());
@@ -2890,7 +2927,15 @@ export async function releaseDaemonOwnership(input: {
 		if (!(await transitionLockIsHeldByCaller({ fs: fsImpl, path: paths.steal, lock: transition }))) return;
 		const lock = await readOwnershipLock(fsImpl, paths.lock);
 		if (!ownershipLockMatchesState(lock, state)) return;
-		await writeJsonAtomic(fsImpl, paths.state, { ...state, stoppedAt: (input.now ?? Date.now)() });
+		const stoppedAt = state.stoppedAt ?? (input.now ?? Date.now)();
+		const stopCause =
+			state.stopCause ??
+			(state.stoppedAt === undefined && isTelegramDaemonStopCause(input.stopCause) ? input.stopCause : undefined);
+		await writeJsonAtomic(fsImpl, paths.state, {
+			...state,
+			stoppedAt,
+			...(stopCause === undefined ? {} : { stopCause }),
+		});
 		try {
 			const { removeTelegramOwnerMarker } = await import("./telegram-daemon-owner-registry");
 			await removeTelegramOwnerMarker(fsImpl, input.settings.getAgentDir(), state.acquisitionId ?? state.ownerId);
@@ -2912,9 +2957,9 @@ export async function releaseDaemonOwnership(input: {
  * `ownershipPhase: "ready"` and a fresh-looking lock behind forever, so later
  * readers attached to an owner that had not existed for hours.
  *
- * This writes `stoppedAt` and nothing else. The lock is left in place for the
- * existing reclaim path to adjudicate, because a process on its way out is the
- * least qualified party to decide who owns what next.
+ * This writes `stoppedAt` and a closed-vocabulary `stopCause`. The lock is left
+ * in place for the existing reclaim path to adjudicate, because a process on
+ * its way out is the least qualified party to decide who owns what next.
  *
  * Fenced on full owner identity: if the state no longer names this exact
  * owner, acquisition, pid and incarnation, a successor already took over and
@@ -2950,7 +2995,12 @@ export async function markDaemonOwnerStopped(input: {
 			return false;
 		const lock = await readOwnershipLock(fsImpl, paths.lock);
 		if (!ownershipLockMatchesState(lock, state)) return false;
-		await writeJsonAtomic(fsImpl, paths.state, { ...state, stoppedAt: (input.now ?? Date.now)() });
+		const stopCause = state.stopCause ?? "postmortem";
+		await writeJsonAtomic(fsImpl, paths.state, {
+			...state,
+			stoppedAt: (input.now ?? Date.now)(),
+			stopCause,
+		});
 		try {
 			const { removeTelegramOwnerMarker } = await import("./telegram-daemon-owner-registry");
 			await removeTelegramOwnerMarker(fsImpl, input.settings.getAgentDir(), state.acquisitionId ?? state.ownerId);
@@ -3992,6 +4042,12 @@ export class TelegramEventDispatchState {
 export interface DaemonControlHooks {
 	/** Returns true when a stop/reload has been requested for this owner. */
 	shouldStop(ownerId: string): Promise<boolean>;
+	/**
+	 * Returns the owner-fenced action behind `shouldStop`, when the control
+	 * plane can provide one. This is a diagnostic projection, not an alternate
+	 * stop authority: callers must still gate it behind `shouldStop`.
+	 */
+	requestedAction?(ownerId: string): Promise<"reload" | "stop" | undefined>;
 	/** Clear a consumed control request (best-effort). */
 	clear?(ownerId: string): Promise<void>;
 }
@@ -4405,8 +4461,16 @@ class TelegramEffectSupervisor {
 		return this.#stopping;
 	}
 
+	get admitting(): boolean {
+		return this.#admitting;
+	}
+
 	closeAdmission(): void {
 		this.#admitting = false;
+	}
+
+	openAdmission(): void {
+		if (!this.#stopping) this.#admitting = true;
 	}
 
 	beginShutdown(): void {
@@ -4496,6 +4560,10 @@ export class TelegramNotificationDaemon {
 	private running = false;
 	/** Once set, a concurrent startup await can never restore a running daemon. */
 	private stopRequested = false;
+	/** First observed stop cause wins, including an explicit stop. */
+	#stopCause: TelegramDaemonStopCause | undefined;
+	/** Signal cause resolution is asynchronous because control requests are file-backed. */
+	#stopCauseResolution: Promise<void> | undefined;
 
 	private readonly fsImpl: TelegramDaemonFs;
 	readonly #deliveryAbort = new AbortController();
@@ -4652,12 +4720,47 @@ export class TelegramNotificationDaemon {
 		}
 	}
 
+	#resolveControlStopCause(fallback: "signal" | "stop"): void {
+		if (this.#stopCause !== undefined || this.#stopCauseResolution !== undefined) return;
+		const requestedAction = this.opts.control?.requestedAction;
+		if (!requestedAction) {
+			this.#stopCause = fallback;
+			return;
+		}
+		// Diagnostics must never hold ownership cleanup behind a stalled file read.
+		const deadline = Promise.withResolvers<void>();
+		const timer = setTimeout(() => {
+			this.#stopCause ??= fallback;
+			deadline.resolve();
+		}, 250);
+		const lookup = Promise.resolve()
+			.then(() => requestedAction.call(this.opts.control, this.opts.ownerId))
+			.then(
+				action => {
+					this.#stopCause ??= action === "reload" || action === "stop" ? action : fallback;
+				},
+				() => {
+					this.#stopCause ??= fallback;
+				},
+			);
+		this.#stopCauseResolution = Promise.race([lookup, deadline.promise]).finally(() => clearTimeout(timer));
+	}
+
 	/**
 	 * Cooperatively stop the daemon: set the stop flag and abort the in-flight
 	 * long poll so the run loop wakes immediately instead of waiting out the
-	 * ~25s getUpdates timeout. Safe to call from a signal handler.
+	 * ~25s getUpdates timeout. Safe to call from a signal handler. The
+	 * no-argument form is the generic finally fallback and never overwrites a
+	 * previously observed specific cause.
 	 */
-	requestStop(_reason?: "reload" | "stop" | "signal"): void {
+	requestStop(reason?: TelegramDaemonStopCause): void {
+		if (reason === "signal") {
+			this.#resolveControlStopCause("signal");
+		} else if (reason !== undefined && this.#stopCauseResolution === undefined) {
+			this.#stopCause ??= reason;
+		} else if (this.#stopCauseResolution === undefined) {
+			this.#stopCause ??= "stop";
+		}
 		this.stopRequested = true;
 		this.effects.closeAdmission();
 		this.#deliveryAbort.abort();
@@ -4703,6 +4806,45 @@ export class TelegramNotificationDaemon {
 		}
 		this.runtime.requestStop();
 		this.running = false;
+	}
+
+	/** Doctor reservation hook: stop admitting new provider work without killing the owner. Synchronous fence; returns a real acknowledgement. */
+	prepareDoctorRestart(): boolean {
+		this.effects.closeAdmission();
+		return !this.effects.admitting;
+	}
+
+	/**
+	 * Real occupancy read from the live runtime structures the daemon actually
+	 * uses, not synthetic zeros. `inflight` is turns currently executing;
+	 * `inbound` is inbound work accepted but not yet resolved (pending /btw
+	 * turns, topic-adoption session_create dispatches in flight, and inbound
+	 * reaction acks not yet terminal); `outbound` is the real rate-limit pool
+	 * backlog plus terminal /btw deliveries still in flight; `cleanup` counts
+	 * only genuinely outstanding cleanup — non-completed cleanup receipts plus
+	 * live archive/compensation fences — never a completed receipt or an
+	 * unrelated rejected-topic notice timer.
+	 */
+	doctorOccupancy(): DoctorDaemonOccupancy {
+		const outstandingCleanupReceipts = [...this.#cleanupReceipts.values()].filter(
+			receipt => receipt.state !== "completed",
+		).length;
+		return {
+			attached: this.sessions.size,
+			inflight: this.busy.size,
+			inbound:
+				this.#pendingBtwTurns.size + this.#adoptionStartingTopics.size + this.dispatchState.inboundReactions.size,
+			outbound: this.pool.pending + this.#btwTerminalDeliveries.size,
+			cleanup: outstandingCleanupReceipts + this.archiveFlights.size + this.compensationFenceRetries.size,
+		};
+	}
+
+	doctorRestartReady(): boolean {
+		return doctorDaemonOccupancySettled(this.doctorOccupancy());
+	}
+
+	cancelDoctorRestart(): void {
+		if (!this.stopRequested) this.effects.openAdmission();
 	}
 
 	#lifecycleActor(): SessionLifecycleActor {
@@ -8884,7 +9026,7 @@ export class TelegramNotificationDaemon {
 		);
 	}
 	private submitPool(item: Parameters<RateLimitPool<TelegramQueuePayload>["submit"]>[0]): boolean {
-		if (this.stopRequested || this.effects.stopping) return false;
+		if (this.stopRequested || this.effects.stopping || !this.effects.admitting) return false;
 		this.pool.submit(item);
 		return true;
 	}
@@ -9832,7 +9974,7 @@ export class TelegramNotificationDaemon {
 					// and the next interval republishes (#4200). Only a proven
 					// ownership loss stops the owner.
 					if ((await this.renewOwnershipHeartbeat()) === "not_owner") {
-						this.runtime.requestStop();
+						this.requestStop("ownership_loss");
 						return;
 					}
 					await this.renewActiveTopicLeases();
@@ -11949,6 +12091,16 @@ export class TelegramNotificationDaemon {
 		if (this.validationMode() || !this.#topicRegistryMutationAllowed()) return;
 		if ((await this.handleForumTopicCreatedUpdate(update)) !== "not-topic") return;
 		if ((await this.handleForumTopicEdited(update)) !== "not-topic") return;
+		// Doctor admission fence: forum-topic bookkeeping above is structural
+		// registry housekeeping for topics that already exist, not new user-facing
+		// work, so it stays live. Everything below this line admits genuinely NEW
+		// inbound work — adoption/session_create, /session_* lifecycle commands,
+		// /btw turns, model-picker taps, and inline session control dispatch — and
+		// MUST be refused while the owner has closed admission for a doctor
+		// restart. Already-active turns and the outbound queue are untouched here:
+		// they drain through their own existing paths (RateLimitPool.drain,
+		// in-flight session turns), never invalidated by this refusal.
+		if (!this.effects.admitting) return;
 		// A raw path is accepted only after the explicit direct-entry choice. The exact
 		// `/session_create path <dir>` form remains available in any pending topic.
 		// Both must precede the general lifecycle handler, which would otherwise create
@@ -12803,7 +12955,10 @@ export class TelegramNotificationDaemon {
 						`notifications: ownership heartbeat renewal threw; continuing: ${sanitizeDiagnostic(String(error))}`,
 					);
 				}
-				if (!ownerHeld) break;
+				if (!ownerHeld) {
+					this.requestStop("ownership_loss");
+					break;
+				}
 				if (await this.controlStopRequested()) break;
 				const idleElapsed = this.runtime.now() - idleSince >= (this.opts.idleTimeoutMs ?? 60_000);
 				if (this.sessions.size > 0) {
@@ -12811,6 +12966,7 @@ export class TelegramNotificationDaemon {
 				} else if (idleElapsed) {
 					// Zero sessions past the idle window: exit so the owner does not run
 					// forever. An active session resets the idle window above.
+					this.requestStop("idle_timeout");
 					break;
 				}
 				// Poll getUpdates whenever the daemon owns the token — even with zero
@@ -12836,8 +12992,12 @@ export class TelegramNotificationDaemon {
 				if (await this.controlStopRequested()) break;
 				await this.runtime.sleep(10);
 			}
+		} catch (error) {
+			this.requestStop("unexpected_exception");
+			throw error;
 		} finally {
-			this.requestStop("stop");
+			this.requestStop();
+			await this.#stopCauseResolution;
 			this.running = false;
 			await this.#attachmentRouter
 				.stop()
@@ -12911,6 +13071,7 @@ export class TelegramNotificationDaemon {
 						pidIncarnation: this.opts.pidIncarnation,
 						fs: this.fsImpl,
 						now: this.opts.now,
+						stopCause: this.#stopCause,
 					});
 				}
 			}
@@ -12922,7 +13083,11 @@ export class TelegramNotificationDaemon {
 		if (this.runtime.stopRequested) return true;
 		if (!this.opts.control) return false;
 		try {
-			return await this.opts.control.shouldStop(this.opts.ownerId);
+			const requested = await this.opts.control.shouldStop(this.opts.ownerId);
+			if (!requested) return false;
+			this.#resolveControlStopCause("stop");
+			this.requestStop();
+			return true;
 		} catch {
 			return false;
 		}

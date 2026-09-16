@@ -739,6 +739,97 @@ test("a turn silent after agent_start is not killed while the model is still ans
 	}
 });
 
+test("a turn silent after message_update is not killed at the narrow bound while streaming is ongoing", async () => {
+	const fixture = await createFixture();
+	try {
+		const { pending } = await startTurn(fixture);
+		let settled = false;
+		void pending.then(
+			() => {
+				settled = true;
+			},
+			() => {
+				settled = true;
+			},
+		);
+
+		// A `message_update` is a streaming chunk, not the end of the response (issue #5571):
+		// the model is still producing output, so the gap after it is an inference gap. The
+		// host went quiet mid-stream — clearing inference state here would have dropped the
+		// turn to the narrow idle bound and killed a slow next chunk at 340s.
+		const { commandId, turnId } = fixture.correlation();
+		const chunks = textChunks(fixture.updates);
+		fixture.send({
+			type: "event",
+			kind: "message_update",
+			sessionId: fixture.sessionId,
+			commandId,
+			turnId,
+			payload: {
+				event_type: "message_update",
+				event: {
+					type: "message_update",
+					message: { role: "assistant", content: [{ type: "text", text: "streaming chunk" }] },
+					assistantMessageEvent: { type: "text_delta", delta: "streaming chunk", contentIndex: 0 },
+				},
+			},
+		});
+		await waitFor(() => textChunks(fixture.updates) > chunks, "streaming chunk ingress");
+
+		fixture.clock.advance(ACP_PROMPT_INACTIVITY_TIMEOUT_MS + 1);
+		await Bun.sleep(0);
+		expect(settled).toBe(false);
+
+		// Still one tick short of the inference bound after the whole gap.
+		fixture.clock.advance(ACP_PROMPT_INFERENCE_TIMEOUT_MS - ACP_PROMPT_INACTIVITY_TIMEOUT_MS - 2);
+		await Bun.sleep(0);
+		expect(settled).toBe(false);
+
+		fixture.sendAssistantText("done streaming");
+		fixture.sendStopped("end_turn");
+		expect(await bounded(pending, "prompt completion")).toEqual({ stopReason: "end_turn" });
+	} finally {
+		fixture.dispose();
+	}
+});
+
+test("cancelling during message_update streaming settles as cancelled and permits a follow-up", async () => {
+	const fixture = await createFixture({ cancelSettlementGraceMs: 25 });
+	try {
+		const { pending } = await startTurn(fixture);
+		const { commandId, turnId } = fixture.correlation();
+		fixture.send({
+			type: "event",
+			kind: "message_update",
+			sessionId: fixture.sessionId,
+			commandId,
+			turnId,
+			payload: {
+				event_type: "message_update",
+				event: {
+					type: "message_update",
+					message: { role: "assistant", content: [{ type: "text", text: "partial" }] },
+					assistantMessageEvent: { type: "text_delta", delta: "partial", contentIndex: 0 },
+				},
+			},
+		});
+		await waitFor(() => textChunks(fixture.updates) > 0, "streaming chunk ingress");
+
+		await bounded(fixture.agent.cancel({ sessionId: fixture.sessionId }), "streaming cancel acknowledgement");
+		// A streamed host can report its normal stopped reason after acknowledging the
+		// abort. The client-visible cause must remain the cancellation.
+		fixture.sendStopped("end_turn");
+		expect(await bounded(pending, "streaming cancellation settlement")).toEqual({ stopReason: "cancelled" });
+
+		const followUp = prompt(fixture, "follow-up after streaming cancel");
+		await waitFor(() => fixture.promptDeliveryCount() === 2, "follow-up prompt delivery");
+		fixture.sendStopped("end_turn");
+		expect(await bounded(followUp, "follow-up completion")).toEqual({ stopReason: "end_turn" });
+	} finally {
+		fixture.dispose();
+	}
+});
+
 test("a turn silent after tool_execution_end is not killed while the model is re-invoked", async () => {
 	const fixture = await createFixture();
 	try {
