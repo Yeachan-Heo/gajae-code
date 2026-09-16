@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Cursor usage-context caching now hashes only normalized wire-visible tool definitions instead of complete class-backed tool instances. Session state containing filesystem `bigint` identities can no longer fail requests during preflight serialization, while tool name, description, and schema changes still invalidate cached conversation state.
+
 ## [0.16.7] - 2026-09-13
 
 ## [0.16.6] - 2026-09-07
