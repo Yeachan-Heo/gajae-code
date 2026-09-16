@@ -1973,6 +1973,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			acceptedInheritedProfileName ??
 			(!hasExplicitModel && acceptedPersistedProfileName ? acceptedPersistedProfileName : undefined);
 		let savedDefaultWasUnresolved = false;
+		let deferredMissingSessionRecovery = false;
 		let recoveredSessionDefault:
 			| {
 					entries: string[];
@@ -2018,7 +2019,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 							credentialSessionId,
 							...(persistedProfileOwnsDefault ? { aliasIntent: "preset-equivalent" as const } : {}),
 						});
-						if (recovery?.model) {
+						if (
+							recovery?.model &&
+							(!preferredCredentialProvider || recovery.model.provider === preferredCredentialProvider)
+						) {
 							model = recovery.model;
 							recoveredSessionDefault = recovery;
 							startupActiveModelProfile = undefined;
@@ -2026,7 +2030,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 								"Saved session model is no longer registered; restored the durable default preset instead.";
 						}
 					} catch (error) {
-						if (!(error instanceof ModelProfileCredentialError)) throw error;
+						if (!(error instanceof ModelProfileCredentialError)) deferredMissingSessionRecovery = true;
 					}
 				}
 				if (!model) modelFallbackMessage = `Could not restore model ${defaultModelEntries.join(" -> ")}`;
@@ -3796,6 +3800,26 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					acceptedInheritedProfileName ??
 					(!hasExplicitModel && acceptedPersistedProfileName ? acceptedPersistedProfileName : undefined);
 				modelFallbackMessage = undefined;
+			} else if (deferredMissingSessionRecovery) {
+				const recovery = await resolveMissingSessionModelRecovery({
+					modelRegistry,
+					settings,
+					defaultEntries: defaultModelEntries,
+					skips: restoredAfterExtensions.skips,
+					savedDefault: existingSession.models.default,
+					credentialSessionId,
+					...(persistedProfileOwnsDefault ? { aliasIntent: "preset-equivalent" as const } : {}),
+				});
+				if (
+					recovery?.model &&
+					(!preferredCredentialProvider || recovery.model.provider === preferredCredentialProvider)
+				) {
+					model = recovery.model;
+					recoveredSessionDefault = recovery;
+					startupActiveModelProfile = undefined;
+					modelFallbackMessage =
+						"Saved session model is no longer registered; restored the durable default preset instead.";
+				}
 			}
 		}
 
