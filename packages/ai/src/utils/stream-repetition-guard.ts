@@ -22,6 +22,13 @@
 export const DEFAULT_REPETITION_THRESHOLD = 12;
 
 /**
+ * `errorCode` stamped on a turn this guard stopped. A bounded classifier, never
+ * raw model text — consumers branch on it to tell a local decode-loop stop from
+ * a client cancellation or a transport fault (#5627).
+ */
+export const REPETITION_GUARD_ERROR_CODE = "repetition_guard_tripped";
+
+/**
  * Shortest n-gram window compared when the repeats carry no newline to split
  * on. Requiring eight tokens keeps ordinary repetition — a run of zeroes in a
  * matrix, a ruler of dashes — from reading as a decode loop.

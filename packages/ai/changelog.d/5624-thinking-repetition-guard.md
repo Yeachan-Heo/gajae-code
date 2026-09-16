@@ -3,10 +3,15 @@
 - Stop a runaway reasoning stream instead of rendering every repeat. When an
   openai-compatible model falls into a decode loop and emits the same line — or
   the same short token run — 12 times in a row on the reasoning channel, the turn
-  is now cut short with `stopReason: "aborted"` and
+  is now cut short with `stopReason: "error"` and
   `errorCode: "repetition_guard_tripped"` rather than dumping dozens of identical
   lines into the terminal. Tool calls in the same message still stream and
   execute normally, including ones the model emits *after* the repeats.
+
+  The stop is classified as a provider error rather than `aborted`, so the auth
+  gateway renders it as HTTP 502 `upstream_error` and telemetry no longer counts
+  it as a user cancellation. A genuine caller abort still wins and still reports
+  `aborted`.
 
   The guard applies to the reasoning channel only. Visible text is opt-in via the
   new `repetitionGuard` option (`{ thinking?: number | false; text?: number |

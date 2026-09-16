@@ -132,7 +132,7 @@ describe("chat-completions: streamed repetition guard (#5624)", () => {
 	// short sentence emitted ~78 times on the reasoning channel.
 	const SENTENCE = "0.0.1 버전으로 배포 완료되었습니다";
 
-	it("bounds a thinking channel stuck repeating one line and marks the turn aborted", async () => {
+	it("bounds a thinking channel stuck repeating one line and marks the turn a provider error", async () => {
 		const state: DeliveryState = { delivered: 0 };
 		const events: Array<SseChunk | "[DONE]"> = [];
 		for (let i = 0; i < 100; i++) events.push(chunk({ reasoning_content: `${SENTENCE}\n` }));
@@ -142,12 +142,37 @@ describe("chat-completions: streamed repetition guard (#5624)", () => {
 		const result = await streamOpenAICompletions(model(), context(), { apiKey: "test" }).result();
 
 		expect(countOccurrences(thinkingText(result), SENTENCE)).toBeLessThanOrEqual(THRESHOLD);
-		expect(result.stopReason).toBe("aborted");
+		expect(result.stopReason).toBe("error");
 		expect(result.errorCode).toBe("repetition_guard_tripped");
 		// The count belongs in the human-readable message, never in the bounded code.
 		expect(result.errorMessage).toContain(String(THRESHOLD));
+		// A local decision, not a retryable transport fault — and retry admission
+		// in the agent loop keys on exactly this field.
+		expect(result.transportFailure).toBeUndefined();
 		// The guard cut the upstream stream instead of draining all 100 events.
 		expect(state.delivered).toBeLessThan(100);
+	});
+
+	// A repetition stop must not squat on the wire that means "the user cancelled":
+	// the auth gateway maps `aborted` to 499 and telemetry counts it as a cancel.
+	it("still reports a genuine caller abort as aborted, not as a guard trip", async () => {
+		const state: DeliveryState = { delivered: 0 };
+		const events: Array<SseChunk | "[DONE]"> = [];
+		for (let i = 0; i < 100; i++) events.push(chunk({ reasoning_content: `Step ${i}: still working\n` }));
+		events.push(chunk({}, "stop"), "[DONE]");
+		global.fetch = streamingFetch(events, state);
+
+		const controller = new AbortController();
+		const pending = streamOpenAICompletions(model(), context(), {
+			apiKey: "test",
+			signal: controller.signal,
+		}).result();
+		await Promise.resolve();
+		controller.abort();
+		const result = await pending;
+
+		expect(result.stopReason).toBe("aborted");
+		expect(result.errorCode).not.toBe("repetition_guard_tripped");
 	});
 
 	it("bounds a thinking channel repeating a short run with no newlines", async () => {
@@ -161,7 +186,7 @@ describe("chat-completions: streamed repetition guard (#5624)", () => {
 		const result = await streamOpenAICompletions(model(), context(), { apiKey: "test" }).result();
 
 		expect(countOccurrences(thinkingText(result), "0.0.1 done")).toBeLessThan(200);
-		expect(result.stopReason).toBe("aborted");
+		expect(result.stopReason).toBe("error");
 		expect(result.errorCode).toBe("repetition_guard_tripped");
 		expect(state.delivered).toBeLessThan(200);
 	});
@@ -188,7 +213,7 @@ describe("chat-completions: streamed repetition guard (#5624)", () => {
 		expect(toolCalls).toHaveLength(1);
 		expect(toolCalls[0].name).toBe("read");
 		expect(toolCalls[0].arguments).toEqual({ path: "a.ts" });
-		expect(result.stopReason).toBe("aborted");
+		expect(result.stopReason).toBe("error");
 	});
 
 	it("keeps tool-call frames that arrive after the guard has already tripped", async () => {
@@ -218,7 +243,7 @@ describe("chat-completions: streamed repetition guard (#5624)", () => {
 		// Draining for the tool call must not re-open the emit path: the repeats
 		// that kept streaming during the drain are still not rendered.
 		expect(countOccurrences(thinkingText(result), SENTENCE)).toBeLessThanOrEqual(THRESHOLD);
-		expect(result.stopReason).toBe("aborted");
+		expect(result.stopReason).toBe("error");
 		expect(result.errorCode).toBe("repetition_guard_tripped");
 		// The drain window is bounded — the stream was still cut short.
 		expect(state.delivered).toBeLessThan(events.length);

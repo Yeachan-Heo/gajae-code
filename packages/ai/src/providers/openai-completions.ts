@@ -81,6 +81,7 @@ import { adaptSchemaForStrict, flattenToolRootCombinators, NO_STRICT, toolWireSc
 import { wrapFetchForSseDebug } from "../utils/sse-debug";
 import {
 	DEFAULT_REPETITION_THRESHOLD,
+	REPETITION_GUARD_ERROR_CODE,
 	StreamRepetitionGuard,
 	type StreamRepetitionTrip,
 } from "../utils/stream-repetition-guard";
@@ -621,11 +622,15 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 		let repetitionDrainedChunks = 0;
 		const finalizeRepetitionGuardStop = (): void => {
 			if (!repetitionTrip) return;
-			// `aborted` rather than a new StopReason: the turn really was cut short
-			// locally, and `errorCode` is the bounded classifier for *why* (#5624).
-			// The observed repeat count belongs in the free-form message only.
-			output.stopReason = "aborted";
-			output.errorCode = "repetition_guard_tripped";
+			// `error`, not `aborted`: this is a provider-side failure we detected
+			// locally, and `aborted` is the wire for *client cancellation* — the
+			// auth gateway maps it to 499/`request_aborted` and telemetry counts it
+			// as a user cancel, so borrowing it misreports the turn (#5627). No new
+			// StopReason variant: the union is switched on exhaustively everywhere.
+			// `errorCode` stays the bounded classifier for *why* (#5624); the
+			// observed repeat count belongs in the free-form message only.
+			output.stopReason = "error";
+			output.errorCode = REPETITION_GUARD_ERROR_CODE;
 			output.errorMessage =
 				`Stopped the turn: the model repeated the same ${repetitionTrip.channel} output ` +
 				`${repetitionTrip.repeats} times (${JSON.stringify(repetitionTrip.sample)}).`;
@@ -633,7 +638,7 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 			if (firstTokenTime) output.ttft = firstTokenTime - startTime;
 			// No `transportFailure`: this is a local decision, not a retryable
 			// transport fault, and retry policy keys on that field.
-			stream.push({ type: "error", reason: "aborted", error: output });
+			stream.push({ type: "error", reason: "error", error: output });
 			stream.end();
 		};
 
