@@ -114,6 +114,12 @@ export function guardedStateWriteReceipt(result: GuardedWriteResult): GuardedSta
 
 export interface StateWriterOptions {
 	cwd?: string;
+	/**
+	 * Linux-only private durable source publication. The supplied directory is
+	 * the exact private subtree containing the target; existing paths are never
+	 * chmodded or repaired.
+	 */
+	privateDurable?: { directory: string };
 	receipt?: StateWriterReceiptContext;
 	audit?: StateWriterAuditContext;
 	sourceRevision?: number;
@@ -147,6 +153,16 @@ export class StateWriteConflictError extends Error {
 
 export interface DeleteIfOwnedOptions extends StateWriterOptions {
 	predicate?: (current: unknown) => boolean | Promise<boolean>;
+}
+
+export class StatePublicationUncertainError extends Error {
+	constructor(
+		public readonly path: string,
+		public readonly cause: unknown,
+	) {
+		super(`state publication requires authoritative reload: ${path}`);
+		this.name = "StatePublicationUncertainError";
+	}
 }
 
 export interface DeleteResult {
@@ -528,13 +544,123 @@ async function atomicWrite(filePath: string, content: string): Promise<string> {
 	return filePath;
 }
 
+async function syncDirectory(directory: string): Promise<void> {
+	const handle = await fs.open(directory, "r");
+	try {
+		await handle.sync();
+	} finally {
+		await handle.close();
+	}
+}
+
+function currentUid(): number {
+	const uid = process.getuid?.();
+	if (uid === undefined) throw new Error("private durable publication requires a POSIX uid");
+	return uid;
+}
+
+async function assertSafePublicationDirectory(directory: string, privateSubtree: boolean): Promise<void> {
+	const stat = await fs.lstat(directory);
+	if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("unsafe publication directory");
+	if ((stat.mode & 0o022) !== 0 || stat.uid !== currentUid())
+		throw new Error("publication parent is not exclusively owned");
+	if (privateSubtree && (stat.mode & 0o777) !== 0o700)
+		throw new Error("private publication directory is not owned mode 0700");
+}
+
+async function preparePrivateDirectory(filePath: string, options: StateWriterOptions): Promise<void> {
+	if (process.platform !== "linux") throw new Error("private durable publication requires Linux");
+	const boundary = resolveGjcTarget(options.privateDurable!.directory, cwdForOptions(options));
+	if (boundary !== path.dirname(filePath)) throw new Error("private publication directory must be the target parent");
+	const root = cwdForOptions(options);
+	if ((await fs.realpath(root)) !== root) throw new Error("private publication requires canonical cwd");
+	let directory = root;
+	for (const segment of path.relative(root, path.dirname(filePath)).split(path.sep)) {
+		const parent = directory;
+		directory = path.join(parent, segment);
+		let created = false;
+		try {
+			await fs.mkdir(directory, { mode: 0o700 });
+			created = true;
+		} catch (error) {
+			if (!isErrno(error, "EEXIST")) throw error;
+		}
+		await assertSafePublicationDirectory(
+			directory,
+			directory === boundary || directory.startsWith(`${boundary}${path.sep}`),
+		);
+		if (created) {
+			// The newly linked entry is durable only after both the child and its
+			// parent have been synced. Do not alter any pre-existing parent mode.
+			await syncDirectory(directory);
+			await syncDirectory(parent);
+		} else if (directory === boundary) {
+			// Finish a prior interrupted private-subtree creation before publishing
+			// the state file into it.
+			await syncDirectory(directory);
+			await syncDirectory(parent);
+		}
+	}
+	try {
+		const stat = await fs.lstat(filePath);
+		if (
+			!stat.isFile() ||
+			stat.isSymbolicLink() ||
+			stat.nlink !== 1 ||
+			(stat.mode & 0o777) !== 0o600 ||
+			stat.uid !== currentUid()
+		)
+			throw new Error("unsafe private publication file");
+	} catch (error) {
+		if (!isErrno(error, "ENOENT")) throw error;
+	}
+}
+
+async function privateAtomicWrite(filePath: string, content: string, options: StateWriterOptions): Promise<void> {
+	await preparePrivateDirectory(filePath, options);
+	const temporary = tempPathFor(filePath);
+	let renameAttempted = false;
+	try {
+		const handle = await fs.open(temporary, "wx", 0o600);
+		try {
+			await handle.writeFile(content, "utf8");
+			await handle.sync();
+		} finally {
+			await handle.close();
+		}
+		renameAttempted = true;
+		await fs.rename(temporary, filePath);
+		await syncDirectory(path.dirname(filePath));
+		await maybeAudit(filePath, options);
+	} catch (error) {
+		// A rename call or anything after it can have committed the replacement
+		// before returning an error. The caller must reload instead of retrying
+		// with a new authority record.
+		if (renameAttempted) throw new StatePublicationUncertainError(filePath, error);
+		await fs.rm(temporary, { force: true }).catch(() => undefined);
+		throw error;
+	}
+}
+
 async function writeGuardedResolvedJsonAtomic(
 	filePath: string,
 	value: unknown,
 	options: GuardedStateWriterOptions,
 ): Promise<GuardedWriteResult> {
+	if (options.privateDurable) {
+		if (options.policy !== "source" || options.expectedRevision === undefined)
+			throw new Error("private durable publication requires source CAS");
+		await preparePrivateDirectory(filePath, options);
+	}
 	const write = async (): Promise<GuardedWriteResult> => {
-		const current = await readJsonIfPresentTolerant(filePath);
+		const strict = options.privateDurable ? await readExistingStateForMutation(filePath) : undefined;
+		if (strict?.kind === "corrupt") throw new Error(strict.error);
+		if (strict?.kind === "absent" && options.expectedRevision !== 0) throw new Error("established state missing");
+		const current = strict
+			? strict.kind === "valid"
+				? strict.value
+				: undefined
+			: await readJsonIfPresentTolerant(filePath);
 		const currentRevision = persistedStateRevision(current);
 
 		if (options.policy === "source") {
@@ -542,8 +668,11 @@ async function writeGuardedResolvedJsonAtomic(
 				throw new StateWriteConflictError(filePath, options.expectedRevision, currentRevision);
 			}
 			const next = stampStateRevision(withWorkflowReceipt(value, buildReceipt(options)), currentRevision + 1);
-			await atomicWrite(filePath, jsonText(next));
-			await maybeAudit(filePath, options);
+			if (options.privateDurable) await privateAtomicWrite(filePath, jsonText(next), options);
+			else {
+				await atomicWrite(filePath, jsonText(next));
+				await maybeAudit(filePath, options);
+			}
 			return { path: filePath, written: true, revision: currentRevision + 1, stamped: next };
 		}
 
@@ -798,6 +927,7 @@ export async function withWorkflowStateLock<T>(
 	options?: StateWriterOptions,
 ): Promise<T> {
 	const filePath = resolveGjcTarget(targetPath, cwdForOptions(options));
+	if (options?.privateDurable) await preparePrivateDirectory(filePath, options);
 	return lockResolvedWorkflowTarget(filePath, fn, options?.lock);
 }
 
