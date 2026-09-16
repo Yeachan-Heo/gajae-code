@@ -280,6 +280,15 @@ export class PromptDeadlineManager {
 		// rescue a promise that never settles, so the flush is raced against a real
 		// timer and abandoned if it outruns it.
 		await this.#runDeadlineFlush(correlation);
+		// Fence again AFTER the flush (#5623 review round 2): the flush is an await
+		// like any other here, and up to ten seconds long, so progress can land and
+		// renew the lease while it runs. The durable prompt_deadline_exceeded
+		// outcome was already finalized above and is not in question; what this
+		// guards is in-memory ownership — retiring `#onExpired` and clearing the
+		// lease of a prompt that has since been renewed or re-accepted would strand
+		// a live invocation with no owner and no deadline. `#backOffIfSuperseded`
+		// reschedules on the way out, so the renewed prompt keeps a live deadline.
+		if (this.#backOffIfSuperseded(key, lease, generation)) return;
 		// Retire pending ownership ONLY after durable terminal confirmation with
 		// no superseding progress (#4668 review P1): retiring earlier strands an
 		// accepted/in-flight invocation without an owner, retry, or deadline
