@@ -11,32 +11,47 @@
  * Strictly best effort AND strictly bounded. Every failure — including an abort —
  * is logged and swallowed: the prompt still fails with `prompt_deadline_exceeded`
  * and teardown still happens, because the deadline outcome must never depend on
- * git. Every git call that accepts a signal gets one, so a blocking lock,
- * credential prompt, or hanging commit hook is killed rather than waited on.
+ * git. Every git call that accepts a signal gets one, so a blocking lock or a
+ * hanging plumbing command is killed rather than waited on.
  *
- * Policy note: this stages the whole dirty worktree (`git add -A`, untracked
- * files included) and runs the repository's normal commit hooks. Narrowing that
- * is deliberately out of scope here — see the #5623 review discussion.
+ * ── Isolated index, plumbing commit, compare-and-swap ref move (#5623 round 4)
  *
- * Index guarantee: an attempt that produces no commit leaves the index exactly
- * as it found it. Staging the whole worktree is a visible mutation, so the index
- * is snapshotted with `git write-tree` first and restored with `git read-tree`
- * when a failing commit hook or an abort lands between the staging and the
- * commit. An index that cannot be snapshotted is never staged at all.
+ * The autosave never opens the user's real `.git/index` for writing and never
+ * runs a repository hook:
+ *
+ *   1. everything is staged into a throwaway index inside the worktree's own git
+ *      dir (`GIT_INDEX_FILE`), seeded from the HEAD captured before staging;
+ *   2. the commit is built with plumbing — `write-tree` then `commit-tree` — so
+ *      `pre-commit`/`commit-msg` cannot execute during teardown;
+ *   3. the ref moves with a compare-and-swap against that captured HEAD, so the
+ *      one mutation that can outlive teardown is conditional: an abandoned flush
+ *      that wakes up late finds HEAD moved and does nothing. `withRepoLock`
+ *      awaits its predecessor BEFORE honouring the signal, so this really does
+ *      happen — the abort alone cannot prevent it;
+ *   4. the real index is adopted only after that swap succeeds, so a successful
+ *      autosave leaves `git status` clean instead of a phantom reverse diff.
+ *
+ * Every failing and aborted path therefore just unlinks the temp index. There is
+ * no rollback left to get wrong, and index-only state the user set — intent-to-add,
+ * skip-worktree/assume-unchanged, sparse-index, index extensions — survives byte
+ * for byte because the file was never written.
+ *
+ * ── Ownership
+ *
+ * Staging the whole dirty worktree (`git add -A`, untracked files included) is
+ * the point: the work being saved is whatever the agent touched, and narrowing
+ * it would strand exactly the files this exists for. What makes that safe is
+ * WHERE it runs. `sdk.flushWorktreeOnDeadline` still defaults to on, but the
+ * implicit default applies only in a LINKED worktree (`gitDir !== commonDir`) —
+ * what agent/paseo sessions run in, and the #5583 field report. In the user's
+ * primary checkout an autosave needs an explicit opt-in.
  */
 
+import * as fsp from "node:fs/promises";
+import * as path from "node:path";
 import { logger } from "@gajae-code/utils";
 import * as git from "../utils/git";
 import { DEADLINE_FLUSH_TIMEOUT_MS } from "./prompt-deadline-manager";
-
-/**
- * Independent bound for the index restore. Deliberately NOT composed with the
- * flush's own signal: on the abort path that signal is already aborted, so a
- * restore issued under it could never run and the rollback would be vacuous on
- * exactly one of the two failure modes it exists for. Short, because it guards a
- * single local `git read-tree` after the deadline has already been decided.
- */
-const INDEX_RESTORE_TIMEOUT_MS = 5_000;
 
 export interface PromptDeadlineFlushResult {
 	/** Branch the WIP commit landed on, or `undefined` on a detached HEAD. */
@@ -47,93 +62,101 @@ export interface PromptDeadlineFlushResult {
 	worktreeRoot: string;
 }
 
+export interface PromptDeadlineFlushOptions {
+	/**
+	 * Whether the caller resolved `sdk.flushWorktreeOnDeadline` to `true` from a
+	 * value the user actually wrote, rather than from the schema default. Only an
+	 * explicit opt-in may autosave outside a linked worktree.
+	 */
+	readonly explicitOptIn?: boolean;
+	readonly signal?: AbortSignal;
+}
+
 function wipCommitMessage(branch: string | undefined): string {
 	return `wip(${branch ?? "detached"}): autosave on prompt deadline\n`;
 }
 
+/** Porcelain v1 XY codes for a path with unresolved merge stages. */
+const UNMERGED_STATUS_CODES = new Set(["DD", "AU", "UD", "UA", "DU", "AA", "UU"]);
+
 /**
- * Roll the index back to `tree` after an autosave attempt that staged but never
- * committed. Best effort like everything else here; returns whether the index is
- * back to what the user had.
+ * Whether the repository is mid-conflict. Staging into an isolated index seeded
+ * from HEAD would happily commit the conflict markers and then adopt a resolved
+ * index over the user's unresolved one, so a conflicted repo is left alone.
  */
-async function restoreIndex(worktreeRoot: string, tree: string): Promise<boolean> {
-	try {
-		// Plain `read-tree` is index-only: the user's file edits stay untouched.
-		await git.readTree(worktreeRoot, tree, { signal: AbortSignal.timeout(INDEX_RESTORE_TIMEOUT_MS) });
-		return true;
-	} catch (error) {
-		logger.warn(
-			`sdk: prompt deadline worktree autosave could not restore the index it staged in ${worktreeRoot}; ` +
-				`recover it with \`git read-tree ${tree}\`: ${String(error)}`,
-		);
-		return false;
-	}
+function hasUnmergedPaths(statusText: string): boolean {
+	return statusText.split("\n").some(line => UNMERGED_STATUS_CODES.has(line.slice(0, 2)));
+}
+
+/**
+ * A session owns its checkout when it runs in a linked worktree: those are
+ * created per agent/task and have their own git dir pointing back at the shared
+ * common dir. A primary checkout is the user's, and `git add -A` there would
+ * commit whatever they happen to have open alongside the agent.
+ */
+function isLinkedWorktree(repository: git.GitRepository): boolean {
+	return path.resolve(repository.gitDir) !== path.resolve(repository.commonDir);
 }
 
 /**
  * Commit any uncommitted work in the worktree owning `cwd`.
  *
- * Returns `undefined` — without running any mutating git command — when `cwd`
- * is not inside a git worktree, when the tree is already clean, or when git
- * fails or is aborted. Only the session's own worktree is touched; nothing is
- * ever pushed.
+ * Returns `undefined` — without moving any ref — when `cwd` is not inside a git
+ * worktree, when the tree is already clean, when the session does not own the
+ * checkout, or when git fails or is aborted. Only the session's own worktree is
+ * touched; nothing is ever pushed.
  *
- * `signal` is composed with an internal `DEADLINE_FLUSH_TIMEOUT_MS` bound, so a
- * caller that passes nothing still cannot hang here.
+ * The abort signal is composed with an internal `DEADLINE_FLUSH_TIMEOUT_MS`
+ * bound, so a caller that passes nothing still cannot hang here.
  */
 export async function flushWorktreeOnPromptDeadline(
 	cwd: string,
-	signal?: AbortSignal,
+	options?: AbortSignal | PromptDeadlineFlushOptions,
 ): Promise<PromptDeadlineFlushResult | undefined> {
+	const { explicitOptIn = false, signal } = options instanceof AbortSignal ? { signal: options } : (options ?? {});
 	const timeout = AbortSignal.timeout(DEADLINE_FLUSH_TIMEOUT_MS);
 	const bound = signal === undefined ? timeout : AbortSignal.any([signal, timeout]);
-	// Whether the user's index is as they left it. Only a failed rollback of a
-	// staged-but-uncommitted attempt can falsify it.
-	let indexRestored = true;
 	try {
-		const worktreeRoot = await git.repo.root(cwd, bound);
-		if (!worktreeRoot) return undefined;
-		const summary = await git.status.summary(worktreeRoot, bound);
-		if (!summary) return undefined;
+		// One resolution for the root, the git dir (where the temp index lives) and
+		// the common dir (the ownership signal). A repository we cannot resolve is
+		// one we cannot place a temp index in, so it is left alone.
+		const repository = await git.repo.resolve(cwd);
+		if (!repository) return undefined;
+		const worktreeRoot = repository.repoRoot;
+		if (!explicitOptIn && !isLinkedWorktree(repository)) {
+			logger.debug(
+				`sdk: prompt deadline worktree autosave skipped; ${worktreeRoot} is a primary checkout the session does ` +
+					`not own. Set sdk.flushWorktreeOnDeadline to true to autosave here anyway.`,
+			);
+			return undefined;
+		}
+		const statusText = await git.status(worktreeRoot, { porcelainV1: true, signal: bound });
+		const summary = git.status.parse(statusText);
 		if (summary.staged + summary.unstaged + summary.untracked === 0) return undefined;
+		if (hasUnmergedPaths(statusText)) {
+			logger.warn(
+				`sdk: prompt deadline worktree autosave skipped; ${worktreeRoot} has an unmerged index and autosaving ` +
+					`would commit conflict markers over it.`,
+			);
+			return undefined;
+		}
 		// `head.resolve` reads .git files directly and takes no signal.
 		const headState = await git.head.resolve(worktreeRoot);
 		const branch = headState?.kind === "ref" ? (headState.branchName ?? undefined) : undefined;
+		// Captured HERE, before the repo lock rather than inside it, because this is
+		// the value the adoption below is conditional on: an autosave may only land
+		// on the HEAD the deadline saw. `withRepoLock` awaits its predecessor before
+		// honouring the signal, so the wait between this line and the swap is
+		// genuinely unbounded, and anything that moved HEAD in between wins.
+		const headSha = await git.head.sha(worktreeRoot, bound);
+		// The ref adoption targets. On a detached HEAD that is HEAD itself;
+		// otherwise the branch ref, so the swap cannot be confused by a checkout.
+		const refName = headState?.kind === "ref" ? headState.ref : "HEAD";
 		// Serialize against other in-process git writers on this repo; the lock is
-		// keyed by primary repo root, so sibling worktrees share one queue. Note
-		// that `withRepoLock` awaits its predecessor BEFORE honouring the signal,
-		// so a hung predecessor is bounded by the caller's race, not by `bound`.
+		// keyed by primary repo root, so sibling worktrees share one queue.
 		const commit = await git.withRepoLock(
 			worktreeRoot,
-			async () => {
-				// Snapshot the index BEFORE mutating it. `git write-tree` refuses on an
-				// unmerged index, and an autosave that cannot be rolled back must not
-				// start: better no autosave than a silently restaged conflict.
-				let snapshot: string;
-				try {
-					snapshot = await git.writeTree(worktreeRoot, { signal: bound });
-				} catch (error) {
-					logger.warn(
-						`sdk: prompt deadline worktree autosave skipped; the index in ${worktreeRoot} could not be ` +
-							`snapshotted so nothing was staged: ${String(error)}`,
-					);
-					return undefined;
-				}
-				// Set before staging, not after: a `git add -A` that fails partway has
-				// still moved the index, so the rollback must cover that too.
-				let stagedWithoutCommit = true;
-				try {
-					await git.stage.files(worktreeRoot, [], bound);
-					await git.commit(worktreeRoot, wipCommitMessage(branch), { signal: bound });
-					// The commit landed, so the index legitimately matches the new HEAD.
-					// Restoring the snapshot now would leave a phantom "revert it all"
-					// staged diff, so a failure of the sha read below must NOT roll back.
-					stagedWithoutCommit = false;
-					return await git.head.short(worktreeRoot, 7, bound);
-				} finally {
-					if (stagedWithoutCommit) indexRestored = await restoreIndex(worktreeRoot, snapshot);
-				}
-			},
+			() => autosave(repository, { headSha, refName, message: wipCommitMessage(branch) }, bound),
 			bound,
 		);
 		if (!commit) return undefined;
@@ -144,11 +167,70 @@ export async function flushWorktreeOnPromptDeadline(
 		return { commit, worktreeRoot, ...(branch === undefined ? {} : { branch }) };
 	} catch (error) {
 		logger.warn(
-			indexRestored
-				? `sdk: prompt deadline worktree autosave failed; uncommitted work was left in place: ${String(error)}`
-				: `sdk: prompt deadline worktree autosave failed and its staged index could not be rolled back ` +
-						`(see the restore warning above): ${String(error)}`,
+			`sdk: prompt deadline worktree autosave failed; uncommitted work was left in place: ${String(error)}`,
 		);
 		return undefined;
+	}
+}
+
+/**
+ * Build and adopt the WIP commit. Runs under the repo write lock; returns the
+ * abbreviated SHA, or `undefined` when the swap was refused because HEAD moved.
+ */
+async function autosave(
+	repository: git.GitRepository,
+	target: { headSha: string | null; message: string; refName: string },
+	bound: AbortSignal,
+): Promise<string | undefined> {
+	const worktreeRoot = repository.repoRoot;
+	const { headSha, message, refName } = target;
+	// Inside the git dir, never the worktree (where it would show up as untracked
+	// and be staged by our own `add -A`) and never /tmp (a different filesystem
+	// breaks git's rename-into-place).
+	const indexFile = path.join(repository.gitDir, `gjc-deadline-index-${crypto.randomUUID()}`);
+	const env = { GIT_INDEX_FILE: indexFile };
+	try {
+		// A missing index file is an empty index, which is already correct for an
+		// unborn HEAD; otherwise seed from the commit the swap is conditional on.
+		if (headSha) await git.readTree(worktreeRoot, headSha, { env, signal: bound });
+		await git.stage.files(worktreeRoot, [], { env, signal: bound });
+		const tree = await git.writeTree(worktreeRoot, { env, signal: bound });
+		// `git status` counts paths git will not necessarily commit (a dirty
+		// submodule at the same SHA, for one). Without this an autosave could land
+		// an empty WIP commit, which `git commit` used to refuse for us.
+		if (headSha && tree === (await git.ref.resolve(worktreeRoot, `${headSha}^{tree}`, bound))) return undefined;
+		const created = await git.commitTree(worktreeRoot, tree, message, {
+			parents: headSha ? [headSha] : [],
+			signal: bound,
+		});
+		try {
+			await git.ref.update(worktreeRoot, refName, created, headSha ?? "", { reason: message, signal: bound });
+		} catch (error) {
+			// The expected-old-value check failed (or the ref is locked): someone
+			// moved HEAD while this flush was queued or abandoned. Their commit wins;
+			// we never retry and never force.
+			logger.warn(
+				`sdk: prompt deadline worktree autosave abandoned; ${refName} in ${worktreeRoot} moved after the ` +
+					`autosave was prepared, so nothing was adopted: ${String(error)}`,
+			);
+			return undefined;
+		}
+		// Only now is it safe to touch the real index: it matches the commit that
+		// is genuinely HEAD, so `git status` reads clean. This is index-only — the
+		// user's files are not rewritten.
+		try {
+			await git.readTree(worktreeRoot, created, { signal: bound });
+		} catch (error) {
+			logger.warn(
+				`sdk: prompt deadline worktree autosave committed ${created} but could not adopt it into the index in ` +
+					`${worktreeRoot}; recover with \`git reset\`: ${String(error)}`,
+			);
+		}
+		return created.slice(0, 7);
+	} finally {
+		// The real index was never written, so unlinking the scratch one is the
+		// whole cleanup. `.lock` is git's in-progress sibling, stranded only if a
+		// plumbing command was killed mid-write.
+		await Promise.all([indexFile, `${indexFile}.lock`].map(file => fsp.rm(file, { force: true }).catch(() => {})));
 	}
 }
