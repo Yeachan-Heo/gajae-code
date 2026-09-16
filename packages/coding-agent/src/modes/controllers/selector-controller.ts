@@ -4,6 +4,7 @@ import {
 	type Api,
 	type AuthCredentialSelector,
 	type CredentialRemovalTarget,
+	getMiniMaxThinkingMode,
 	isSqliteCorruptionError,
 	isSqliteError,
 	type Model,
@@ -155,6 +156,7 @@ import {
 	MODEL_ONBOARDING_SETUP_COMMAND,
 } from "../../setup/model-onboarding-guidance";
 import { addApiCompatibleProvider, formatProviderSetupResult } from "../../setup/provider-onboarding";
+import { getThinkingLevelMetadata } from "../../thinking";
 import {
 	isConfigurableSearchProviderId,
 	isSearchProviderPreference,
@@ -1847,6 +1849,11 @@ export class SelectorController {
 	}
 
 	showEffortSelector(): void {
+		const model = this.ctx.session.model;
+		if (model && getMiniMaxThinkingMode(model) === "always-on") {
+			this.ctx.showStatus("Reasoning is always on for MiniMax M2.x; disabling and effort control are unsupported.");
+			return;
+		}
 		const availableLevels = [
 			ThinkingLevel.Inherit,
 			ThinkingLevel.Off,
@@ -1871,9 +1878,14 @@ export class SelectorController {
 
 					const effectiveLevel = this.ctx.session.thinkingLevel ?? ThinkingLevel.Off;
 					const requestedLabel =
-						level === ThinkingLevel.Inherit ? `${level} (configured default: ${configuredDefault})` : level;
+						level === ThinkingLevel.Inherit
+							? `${level} (configured default: ${configuredDefault})`
+							: getThinkingLevelMetadata(level, model).label;
+					const effectiveLabel = getThinkingLevelMetadata(effectiveLevel, model).label;
 					const clampedSuffix =
-						effectiveLevel === levelToApply ? "" : ` Requested ${levelToApply}; effective ${effectiveLevel}.`;
+						effectiveLevel === levelToApply
+							? ""
+							: ` Requested ${getThinkingLevelMetadata(levelToApply, model).label}; effective ${effectiveLabel}.`;
 
 					this.ctx.statusLine.invalidate();
 					this.ctx.updateEditorBorderColor();
@@ -1882,13 +1894,14 @@ export class SelectorController {
 					this.ctx.ui.requestRender();
 					const scopeLabel = persistDefault ? "Default reasoning effort" : "Reasoning effort";
 					this.ctx.showStatus(
-						`${scopeLabel} set to ${requestedLabel}. Effective effort: ${effectiveLevel}.${clampedSuffix}`,
+						`${scopeLabel} set to ${requestedLabel}. Effective effort: ${effectiveLabel}.${clampedSuffix}`,
 					);
 				},
 				() => {
 					done();
 					this.ctx.ui.requestRender();
 				},
+				model,
 			);
 			return { component: selector, focus: selector };
 		});

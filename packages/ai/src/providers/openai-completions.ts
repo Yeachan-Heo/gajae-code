@@ -18,6 +18,7 @@ import {
 } from "../adapter-internals/provider-safety-stop";
 import {
 	type Effort,
+	getMiniMaxThinkingMode,
 	getSupportedEfforts,
 	isGroqCompoundReasoningUnsupported,
 	modelSupportsReasoningControl,
@@ -364,7 +365,7 @@ type OpenAICompletionsParams = Omit<OpenAI.Chat.Completions.ChatCompletionCreate
 	top_k?: number;
 	min_p?: number;
 	repetition_penalty?: number;
-	thinking?: { type: "enabled" | "disabled" };
+	thinking?: { type: "enabled" | "disabled" | "adaptive" };
 	enable_thinking?: boolean;
 	chat_template_kwargs?: { enable_thinking: boolean };
 	reasoning?: { effort?: string } | { enabled: false };
@@ -1576,7 +1577,12 @@ function buildParams(
 		delete params.tool_choice;
 	}
 
-	if (supportsReasoningParams && compat.thinkingFormat === "zai" && model.reasoning) {
+	if (supportsReasoningParams && getMiniMaxThinkingMode(model) === "toggle") {
+		// MiniMax-M3 accepts an on/off switch, not reasoning_effort. Omitting
+		// the switch preserves the OpenAI-compatible endpoint's default (on).
+		if (options?.disableReasoning) params.thinking = { type: "disabled" };
+		else if (options?.reasoning) params.thinking = { type: "adaptive" };
+	} else if (supportsReasoningParams && compat.thinkingFormat === "zai" && model.reasoning) {
 		// Z.ai uses binary thinking: { type: "enabled" | "disabled" }
 		// Must explicitly disable since z.ai defaults to thinking enabled.
 		const enabled = options?.reasoning && !options?.disableReasoning;

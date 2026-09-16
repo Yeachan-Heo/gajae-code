@@ -27,6 +27,7 @@ function markManagedAttemptValidated<T extends object>(options: T): T {
 import { getCustomApi } from "./api-registry";
 import type { Effort } from "./model-thinking";
 import {
+	getMiniMaxThinkingMode,
 	mapEffortToAnthropicAdaptiveEffort,
 	mapEffortToGoogleThinkingLevel,
 	requireSupportedEffort,
@@ -978,6 +979,16 @@ function mapOptionsForApi<TApi extends Api>(
 
 	switch (model.api) {
 		case "anthropic-messages": {
+			const miniMaxMode = getMiniMaxThinkingMode(model);
+			if (miniMaxMode) {
+				return castApi<"anthropic-messages">({
+					...base,
+					thinkingEnabled:
+						miniMaxMode === "toggle" ? !!options?.reasoning && !options?.disableReasoning : undefined,
+					toolChoice: mapAnthropicToolChoice(options?.toolChoice),
+					serviceTier: options?.serviceTier,
+				});
+			}
 			// Explicitly disable thinking when reasoning is not specified or model doesn't support it
 			const reasoning = options?.reasoning;
 			if (!reasoning || !model.reasoning) {
@@ -1094,7 +1105,12 @@ function mapOptionsForApi<TApi extends Api>(
 			return castApi<"openai-completions">({
 				...base,
 				reasoning: resolveOpenAiReasoningEffort(model, options),
-				disableReasoning: options?.disableReasoning,
+				// Agent-level off is represented by an absent effort. MiniMax's
+				// native OpenAI endpoint defaults to on, so send an explicit switch.
+				disableReasoning:
+					getMiniMaxThinkingMode(model) === "toggle"
+						? !options?.reasoning || options?.disableReasoning
+						: options?.disableReasoning,
 				toolChoice: mapOpenAiToolChoice(options?.toolChoice),
 				serviceTier: options?.serviceTier,
 			});

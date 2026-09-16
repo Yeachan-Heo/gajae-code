@@ -1,5 +1,11 @@
 import { ThinkingLevel } from "@gajae-code/agent-core";
-import { getSupportedEfforts, type Model, modelSupportsServiceTier, modelsAreEqual } from "@gajae-code/ai/core";
+import {
+	getMiniMaxThinkingMode,
+	getSupportedEfforts,
+	type Model,
+	modelSupportsServiceTier,
+	modelsAreEqual,
+} from "@gajae-code/ai/core";
 import {
 	Container,
 	fuzzyFilter,
@@ -1853,7 +1859,7 @@ export class ModelSelectorComponent extends Container {
 		const modelLabel = sanitizeText(`${model.provider}/${model.id}`).replace(/\s+/g, " ").trim();
 		let label = modelLabel;
 		if (thinkingLevel && thinkingLevel !== ThinkingLevel.Inherit) {
-			label += ` (${getThinkingLevelMetadata(thinkingLevel).label})`;
+			label += ` (${getThinkingLevelMetadata(thinkingLevel, model).label})`;
 		}
 		const billing = this.#billingPathForModel(model)?.label;
 		if (billing) label += ` [${billing}]`;
@@ -2214,7 +2220,7 @@ export class ModelSelectorComponent extends Container {
 				const assigned = this.#roles[role];
 				if (roleInfo.tag && assigned && modelsAreEqual(assigned.model, item.model)) {
 					const badge = makeInvertedBadge(roleInfo.tag, roleInfo.color ?? "muted");
-					const thinkingLabel = getThinkingLevelMetadata(assigned.thinkingLevel).label;
+					const thinkingLabel = getThinkingLevelMetadata(assigned.thinkingLevel, item.model).label;
 
 					// Subagent roles (task.agentModelOverrides) run under task.serviceTier,
 					// so their ⚡ uses the effective subagent tier. A non-subagent
@@ -2326,6 +2332,11 @@ export class ModelSelectorComponent extends Container {
 	#renderActionMenu(item: ModelItem | CanonicalModelItem): void {
 		this.#listContainer.addChild(new Spacer(1));
 		this.#listContainer.addChild(new Text(theme.fg("muted", `  Action for: ${item.model.id}`), 0, 0));
+		if (getMiniMaxThinkingMode(item.model) === "always-on") {
+			this.#listContainer.addChild(
+				new Text(theme.fg("muted", "  Reasoning: always on; effort control is unsupported"), 0, 0),
+			);
+		}
 		this.#listContainer.addChild(new Spacer(1));
 		const actionCount = this.#getActionCount(item.model);
 		for (let i = 0; i < actionCount; i++) {
@@ -2390,7 +2401,7 @@ export class ModelSelectorComponent extends Container {
 		// Show the highlighted reasoning level — never the model id (that mislabel
 		// made "Reasoning for Default: gpt-5.6-luna" look like a level).
 		const selectedLevel = choice.levels[this.#selectedThinkingIndex];
-		const selectedLevelLabel = selectedLevel ? getThinkingLevelMetadata(selectedLevel).label : "—";
+		const selectedLevelLabel = selectedLevel ? getThinkingLevelMetadata(selectedLevel, choice.item.model).label : "—";
 		this.#listContainer.addChild(new Spacer(1));
 		this.#listContainer.addChild(
 			new Text(theme.fg("muted", `  Reasoning for ${targetLabel}: ${selectedLevelLabel}`), 0, 0),
@@ -2398,7 +2409,7 @@ export class ModelSelectorComponent extends Container {
 		this.#listContainer.addChild(new Spacer(1));
 		for (let i = 0; i < choice.levels.length; i++) {
 			const level = choice.levels[i];
-			const metadata = getThinkingLevelMetadata(level);
+			const metadata = getThinkingLevelMetadata(level, choice.item.model);
 			const prefix = i === this.#selectedThinkingIndex ? theme.fg("accent", `${theme.nav.cursor} `) : "  ";
 			const label = `${metadata.label} — ${metadata.description}`;
 			this.#listContainer.addChild(

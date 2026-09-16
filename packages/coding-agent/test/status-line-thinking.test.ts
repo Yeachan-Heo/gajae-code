@@ -1,5 +1,6 @@
 import { beforeAll, describe, expect, it } from "bun:test";
 import { ThinkingLevel } from "@gajae-code/agent-core";
+import { getBundledModel } from "@gajae-code/ai/core";
 import type { SegmentContext } from "../src/modes/components/status-line/segments";
 import { renderSegment } from "../src/modes/components/status-line/segments";
 import { EMPTY_JOBS_SNAPSHOT } from "../src/modes/jobs-observer";
@@ -49,4 +50,15 @@ describe("status line thinking indicator", () => {
 		expect(rendered.content).toContain("opus-4.5");
 		expect(rendered.content).toContain(theme.thinking.max);
 	});
+	for (const provider of ["minimax", "minimax-cn", "minimax-code", "minimax-code-cn"] as const) {
+		it(`${provider}: shows actual MiniMax state rather than an effort label`, () => {
+			const ctx = createCtx(ThinkingLevel.High);
+			ctx.session.state.model = getBundledModel(provider, "MiniMax-M3");
+			expect(renderSegment("model", ctx).content).toContain(`${theme.sep.dot}on`);
+			ctx.session.state.thinkingLevel = undefined;
+			expect(renderSegment("model", ctx).content).toContain(`${theme.sep.dot}off`);
+			ctx.session.state.model = getBundledModel(provider, "MiniMax-M2.7");
+			expect(renderSegment("model", ctx).content).toContain("always on");
+		});
+	}
 });

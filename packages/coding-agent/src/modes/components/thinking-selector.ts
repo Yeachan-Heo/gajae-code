@@ -1,7 +1,8 @@
 import { ThinkingLevel, type ThinkingLevel as ThinkingLevelValue } from "@gajae-code/agent-core";
+import type { Model } from "@gajae-code/ai/types";
 import { Container, type SelectItem, SelectList, Text } from "@gajae-code/tui";
 import { getSelectListTheme, theme } from "../../modes/theme/theme";
-import { getThinkingLevelMetadata, type ThinkingLevelValue as ThinkingMetadataValue } from "../../thinking-metadata";
+import { getThinkingLevelMetadata } from "../../thinking";
 import { DynamicBorder } from "./dynamic-border";
 
 const SCOPE_ITEMS = [
@@ -31,21 +32,24 @@ export class ThinkingSelectorComponent extends Container {
 	#selectedLevel: ThinkingLevelValue | undefined;
 	readonly #onSelect: (selection: ThinkingSelectorSelection) => void;
 	readonly #onCancel: () => void;
+	readonly #model: Model | undefined;
 
 	constructor(
 		currentLevel: ThinkingLevelValue | undefined,
 		availableLevels: ThinkingLevelValue[],
 		onSelect: (selection: ThinkingSelectorSelection) => void,
 		onCancel: () => void,
+		model?: Model,
 	) {
 		super();
 
 		this.#onSelect = onSelect;
 		this.#onCancel = onCancel;
+		this.#model = model;
 
 		const currentValue = currentLevel ?? ThinkingLevel.Off;
 		const thinkingLevels: SelectItem[] = availableLevels.map(level => {
-			const metadata = getThinkingLevelMetadata(level as ThinkingMetadataValue);
+			const metadata = getThinkingLevelMetadata(level, model);
 			return level === currentValue
 				? { ...metadata, label: metadata.label + theme.fg("muted", " (current)") }
 				: metadata;
@@ -96,7 +100,7 @@ export class ThinkingSelectorComponent extends Container {
 			this.#renderLevelList();
 		};
 
-		const metadata = getThinkingLevelMetadata(level as ThinkingMetadataValue);
+		const metadata = getThinkingLevelMetadata(level, this.#model);
 		this.detachAll();
 		this.#selectList = scopeList;
 		this.addChild(new DynamicBorder());

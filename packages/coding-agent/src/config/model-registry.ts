@@ -18,6 +18,7 @@ import {
 	getBundledModels,
 	getBundledProviders,
 	getEnvApiKey,
+	getMiniMaxThinkingMode,
 	googleAntigravityModelManagerOptions,
 	googleGeminiCliModelManagerOptions,
 	isCodexGpt56Tier,
@@ -280,6 +281,7 @@ export const GJC_MODEL_ASSIGNMENT_TARGETS: Record<GjcModelAssignmentTargetId, Gj
 
 export function requiresExplicitThinkingChoice(model: Model, role: GjcModelAssignmentTargetId | null): boolean {
 	if (!modelSupportsReasoningControl(model)) return false;
+	if (getMiniMaxThinkingMode(model) === "toggle") return true;
 	if (model.provider === "openai" || model.provider === "openai-codex" || isDirectXaiReasoningEffortModel(model))
 		return true;
 	if (role === null) return false;
