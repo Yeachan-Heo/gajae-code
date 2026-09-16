@@ -50,6 +50,50 @@ test("a legacy token spelled by binary bytes is not reported as a brand hit", as
 	}
 });
 
+// Review finding A2/1: NUL bytes are not the only binary marker. An asset with an
+// unknown extension and no NUL in its sniff window was still token-scanned, so the
+// false positive the PR set out to remove stayed reachable.
+test("a legacy token spelled by NUL-free binary bytes is not reported as a brand hit", async () => {
+	// A real woff2 header followed by invalid UTF-8 continuation bytes: no NUL anywhere,
+	// and an extension the walker does not recognize.
+	const nulFree = new Uint8Array([
+		0x77,
+		0x4f,
+		0x46,
+		0x32,
+		0xc3,
+		0x28,
+		...Buffer.from(` ${legacyToken} `),
+		0xa0,
+		0xa1,
+		0xff,
+		0xfe,
+	]);
+	expect(nulFree.includes(0)).toBe(false);
+	const root = await fixture({ "docs/assets/glyphs.woff2": nulFree, "docs/assets/opaque.qqq": nulFree });
+	try {
+		const report = await scan(root);
+		expect(report.violations.unexpectedLegacyHitCount).toBe(0);
+		expect(report.inventory.legacyHits.unexpected).toEqual([]);
+	} finally {
+		await fs.rm(root, { recursive: true, force: true });
+	}
+});
+
+// Guard the other direction: a text file longer than the sniff window must stay a
+// brand surface even though its window ends mid-character.
+test("a long UTF-8 text doc whose sniff window splits a character is still reported", async () => {
+	const filler = "\uAC00".repeat(4000); // 12000 bytes of 3-byte characters
+	const root = await fixture({ "docs/long.md": `${filler}\nThe ${legacyToken} runtime is gone.\n` });
+	try {
+		const report = await scan(root);
+		expect(report.violations.unexpectedLegacyHitCount).toBe(1);
+		expect(report.inventory.legacyHits.unexpected[0]?.path).toBe("docs/long.md");
+	} finally {
+		await fs.rm(root, { recursive: true, force: true });
+	}
+});
+
 // Positive control: skipping binaries must not weaken detection in real text.
 test("a legacy token written in a text doc is still reported", async () => {
 	const root = await fixture({ "docs/notes.md": `The ${legacyToken} runtime is gone.\n` });
