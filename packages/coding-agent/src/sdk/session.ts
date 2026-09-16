@@ -59,7 +59,7 @@ import { loadCapability, reset as resetCapabilities } from "../capability";
 import { type Rule, ruleCapability, setActiveRules } from "../capability/rule";
 import type { SourceMeta } from "../capability/types";
 import { AUTOROUTING_INACTIVE_WARNING } from "../config/autorouting-contract";
-import { ModelProfileCredentialError, resolveMissingSessionModelRecovery } from "../config/model-profile-activation";
+import { resolveMissingSessionModelRecovery } from "../config/model-profile-activation";
 import { resolveModelProfileName } from "../config/model-profile-contract";
 import { resolveProfileBindings } from "../config/model-profiles";
 import { kNoAuth, ModelRegistry } from "../config/model-registry";
@@ -2031,8 +2031,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 							modelFallbackMessage =
 								"Saved session model is no longer registered; restored the durable default preset instead.";
 						}
-					} catch (error) {
-						if (!(error instanceof ModelProfileCredentialError)) deferredMissingSessionRecovery = true;
+					} catch {
+						deferredMissingSessionRecovery = true;
 					}
 				}
 				if (!model) modelFallbackMessage = `Could not restore model ${defaultModelEntries.join(" -> ")}`;
