@@ -3822,7 +3822,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					} else {
 						const recoveredLevel = recovery.explicitThinkingLevel
 							? recovery.thinkingLevel
-							: (model.thinking?.defaultLevel ?? settings.get("defaultThinkingLevel"));
+							: defaultRoleSpec.explicitThinkingLevel
+								? defaultRoleSpec.thinkingLevel
+								: (model.thinking?.defaultLevel ?? settings.get("defaultThinkingLevel"));
 						thinkingLevel = resolveThinkingLevelForModel(model, recoveredLevel);
 					}
 					recoveredSessionDefault = recovery;
