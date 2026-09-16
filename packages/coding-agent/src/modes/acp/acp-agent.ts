@@ -233,6 +233,8 @@ type SessionRecord = {
 	promptObservedToolExecution?: boolean;
 	/** Owner token held across the first-turn retry backoff; a non-owner prompt is rejected as a conflict (review P1). */
 	pendingFirstPromptRetry?: FirstPromptRetryReservation;
+	/** Owner token held across a mid-task retry; a non-owner prompt is rejected as a conflict (review P1). */
+	pendingMidTaskPromptRetry?: MidTaskPromptRetryReservation;
 };
 
 /**
@@ -249,6 +251,16 @@ type FirstPromptRetryReservation = {
 	 * settles `firstPromptDone` (review P2).
 	 */
 	admitted?: boolean;
+};
+
+/**
+ * Identity token proving a caller owns an in-progress mid-task retry. Held on the session record
+ * from the moment the failed turn settles until the retry finishes, so a competing prompt cannot be
+ * admitted in the gap between `#settlePrompt` clearing `activePrompt` on the failed attempt and the
+ * retry resubmitting (review P1, issue #5615).
+ */
+type MidTaskPromptRetryReservation = {
+	readonly midTaskPromptRetry: true;
 };
 
 /**
@@ -1747,11 +1759,14 @@ export class AcpAgent implements Agent {
 		// Identity of THIS caller's first-turn retry. Held on the record across the backoff so a
 		// concurrent prompt racing the gap is rejected as a conflict rather than admitted (review P1).
 		const retryReservation: FirstPromptRetryReservation = { firstPromptRetry: true };
+		// Identity of THIS caller's mid-task retry, held the same way so a prompt racing the gap
+		// between the failed turn settling and the retry resubmitting is rejected (review P1).
+		const midTaskRetryReservation: MidTaskPromptRetryReservation = { midTaskPromptRetry: true };
 		try {
 			let echoUserMessage = true;
 			for (let attempt = 0; ; attempt++) {
 				try {
-					return await this.#submitPrompt(params, echoUserMessage, retryReservation);
+					return await this.#submitPrompt(params, echoUserMessage, retryReservation, midTaskRetryReservation);
 				} catch (error) {
 					if (this.#shouldRetryFirstPrompt(record, error, attempt)) {
 						// The user's message was already echoed on the first attempt; re-echoing
@@ -1779,18 +1794,32 @@ export class AcpAgent implements Agent {
 						}
 						continue;
 					}
-					// A mid-task turn (not the session's first prompt) that had already executed a
-					// tool and then terminalized empty as `prompt_failed` is re-submitted once, so a
-					// transient provider blip does not abandon the task with an opaque -32603 (issue
-					// #5615). Unlike the first-turn readiness retry there is no backoff — the host is
-					// already up mid-session — and the message was already echoed on the first attempt.
+					// A mid-task turn (not the session's first prompt) that started but ran no tool and
+					// then terminalized empty as `prompt_failed` is re-submitted once, so a transient
+					// provider blip does not abandon the task with an opaque -32603 (issue #5615).
+					// Unlike the first-turn readiness retry there is no backoff — the host is already
+					// up mid-session — and the message was already echoed on the first attempt.
 					if (this.#shouldRetryMidTaskPrompt(record, error, attempt)) {
 						echoUserMessage = false;
+						// Reserve the session before resubmitting. `#settlePrompt` already cleared
+						// `activePrompt` when it rejected this attempt, so without the reservation the
+						// settle-to-dispatch gap admits a competing prompt that steals the retry's
+						// turn (review P1).
+						record.pendingMidTaskPromptRetry = midTaskRetryReservation;
 						logger.warn("ACP mid-task prompt failed; retrying once", {
 							sessionId: params.sessionId,
 							attempt: attempt + 1,
 							maxRetries: ACP_MID_TASK_PROMPT_MAX_RETRIES,
 						});
+						// A session/cancel that reached the record in that same gap must settle the
+						// retry as `cancelled` instead of dispatching a fresh turn the client no longer
+						// wants. The check lives here, before resubmission, because `#submitPrompt`
+						// unconditionally clears `cancelRequested` for the turn it is about to start,
+						// so a later check would miss it (review P1).
+						if (record.cancelRequested) {
+							record.cancelRequested = false;
+							return { stopReason: "cancelled" };
+						}
 						continue;
 					}
 					throw error;
@@ -1800,6 +1829,7 @@ export class AcpAgent implements Agent {
 			// Release the reservation on retry completion (success), cancellation, or final
 			// failure. Guarded so a later prompt that took ownership is never cleared by this caller.
 			if (record.pendingFirstPromptRetry === retryReservation) record.pendingFirstPromptRetry = undefined;
+			if (record.pendingMidTaskPromptRetry === midTaskRetryReservation) record.pendingMidTaskPromptRetry = undefined;
 			// Only a turn that was actually admitted (dispatched to the host) settles the
 			// session's first prompt. A preflight rejection — validation, auth/preflight, a
 			// stale-state conflict, an oversize frame, or an ensureProviders() failure — never
@@ -1848,33 +1878,30 @@ export class AcpAgent implements Agent {
 
 	/**
 	 * The mid-task empty-turn signature (issue #5615): a turn on a session that has already
-	 * completed its first prompt executed real work (a tool ran) and then terminalized as
-	 * `prompt_failed` — the EMPTY_PROMPT_FAILURE path, where a model re-invocation after
-	 * `tool_execution_end` returns empty content with no tool calls. A transient provider blip
-	 * mid-task should not abandon the whole task with an opaque `-32603`, so the turn is
-	 * re-submitted once instead of surfaced.
+	 * completed its first prompt started producing frames and then terminalized as
+	 * `prompt_failed` — the EMPTY_PROMPT_FAILURE path, where a model re-invocation returns empty
+	 * content with no tool calls. A transient provider blip mid-task should not abandon the whole
+	 * task with an opaque `-32603`, so the turn is re-submitted once instead of surfaced.
 	 *
-	 * Every gate is deliberately narrower than the first-turn retry, because a mid-task empty
-	 * completion is more likely to be a genuine (if unhelpful) result than a startup race:
+	 * The gates mirror the first-turn retry, only on the other side of `firstPromptDone`:
 	 * - never the session's first logical prompt (`firstPromptDone`) — that is the first-turn path;
 	 * - only an `agent_failed` `prompt_failed` terminal — never a deadline, a cancel, or a stop;
-	 * - only after the turn actually executed a tool (`promptObservedToolExecution`), the mid-task
-	 *   progress fingerprint from issue #5615 ("after several tool calls"); a turn that merely
-	 *   started — or never started — is surfaced, not recovered here;
+	 * - only after the turn was observed starting (`promptObservedActivity`); a turn that never
+	 *   started is a genuine rejection, surfaced rather than recovered here;
+	 * - but NEVER once the turn executed a tool (`promptObservedToolExecution`). A re-submit is a
+	 *   new, independent `turn.prompt`, so re-running a tool-executing turn would commit the
+	 *   user's instruction and its non-idempotent side effects a second time. The first-turn
+	 *   retry vetoes that for the same reason; recovery is worth nothing if it double-applies
+	 *   effects the failed turn already committed (review P1).
 	 * - never once the client has asked to cancel;
 	 * - at most one re-submit (`ACP_MID_TASK_PROMPT_MAX_RETRIES`).
-	 *
-	 * Unlike the first-turn retry (which refuses a tool-executing turn to avoid repeating side
-	 * effects), this path re-runs a turn that ran a tool: the re-submit is a new, independent
-	 * `turn.prompt`, so the user's instruction and its side effects may execute a second time.
-	 * That is the accepted cost of recovering a mid-task turn that had already begun doing work
-	 * before the provider returned an empty completion (issue #5615).
 	 */
 	#shouldRetryMidTaskPrompt(record: SessionRecord, error: unknown, attempt: number): boolean {
 		if (attempt >= ACP_MID_TASK_PROMPT_MAX_RETRIES) return false;
 		if (!record.firstPromptDone) return false;
 		if (record.cancelRequested) return false;
-		if (!record.promptObservedToolExecution) return false;
+		if (!record.promptObservedActivity) return false;
+		if (record.promptObservedToolExecution) return false;
 		return error instanceof AcpSdkAdapterError && error.code === "prompt_failed";
 	}
 
@@ -1890,6 +1917,7 @@ export class AcpAgent implements Agent {
 		params: PromptRequest,
 		echoUserMessage: boolean,
 		retryReservation?: FirstPromptRetryReservation,
+		midTaskRetryReservation?: MidTaskPromptRetryReservation,
 	): Promise<PromptResponse> {
 		const record = this.#sessions.get(params.sessionId);
 		if (!record) throw new AcpSdkAdapterError("not_found", `Unknown session, not found: ${params.sessionId}`);
@@ -1898,6 +1926,10 @@ export class AcpAgent implements Agent {
 		// the first turn while the authorized retry is still pending (review P1, issue #5574).
 		if (record.pendingFirstPromptRetry && record.pendingFirstPromptRetry !== retryReservation)
 			throw new AcpSdkAdapterError("conflict", "ACP session is retrying its first prompt.");
+		// Same ownership rule for a mid-task retry: only the reservation holder may resubmit while
+		// the failed turn's retry is pending (review P1, issue #5615).
+		if (record.pendingMidTaskPromptRetry && record.pendingMidTaskPromptRetry !== midTaskRetryReservation)
+			throw new AcpSdkAdapterError("conflict", "ACP session is retrying a mid-task prompt.");
 		if (record.activePrompt) throw new AcpSdkAdapterError("conflict", "ACP session already has an active prompt.");
 		if (record.authFailure) throw new AcpSdkAdapterError("authentication_failed", record.authFailure);
 		if (this.#retiredPromptAcknowledgements.has(params.sessionId))
@@ -2326,11 +2358,13 @@ export class AcpAgent implements Agent {
 			}
 			waiter?.cancelAttemptResolve?.(true);
 		} catch (error) {
-			// With no active prompt the cancel intent normally clears — except when a first-turn
-			// retry is reserved across its backoff gap. That reservation owner has not yet observed
-			// the cancel; clearing it here would let the retry resubmit a turn the client cancelled
-			// (review P1). Leave the flag for the retry's post-backoff check to settle as cancelled.
-			if (!waiter && !record.pendingFirstPromptRetry) record.cancelRequested = false;
+			// With no active prompt the cancel intent normally clears — except when a first-turn or
+			// mid-task retry is reserved across its dispatch gap. That reservation owner has not yet
+			// observed the cancel; clearing it here would let the retry resubmit a turn the client
+			// cancelled (review P1). Leave the flag for the retry's pre-dispatch check to settle as
+			// cancelled.
+			if (!waiter && !record.pendingFirstPromptRetry && !record.pendingMidTaskPromptRetry)
+				record.cancelRequested = false;
 			// Only the LAST in-flight attempt resolves the shared promise false;
 			// an earlier attempt may still acknowledge (review thread P2). After
 			// every attempt of this wave failed, RE-ARM the aggregate: a later

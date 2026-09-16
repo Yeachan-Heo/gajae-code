@@ -862,17 +862,20 @@ test("ACP retries a valid first prompt even after an earlier preflight rejection
 	}
 });
 
-test("ACP does not retry a prompt_failed on a later turn even after activity", async () => {
+test("ACP retries a mid-task prompt_failed once when the turn started but ran no tool (issue #5615)", async () => {
 	const fixture = await createFixture();
 	try {
-		// First turn completes normally, consuming the one-shot first-turn retry budget.
+		// First turn completes normally, so the session is past its first prompt: a later failure
+		// takes the mid-task retry path (issue #5615), not the first-turn readiness path.
 		const first = prompt(fixture, "first turn ok");
 		await bounded(fixture.promptDelivered, "first prompt delivery");
 		fixture.sendStopped("end_turn");
 		expect(await bounded(first, "first turn settlement")).toEqual({ stopReason: "end_turn" });
 
-		// A second turn that starts and then fails is surfaced, not retried.
-		const second = prompt(fixture, "second turn fails after starting");
+		// A mid-task turn starts (agent_start) and then terminalizes empty as prompt_failed without
+		// ever executing a tool. Nothing was committed, so re-submitting cannot replay a side
+		// effect — the turn is recovered instead of abandoning the task with an opaque -32603.
+		const second = prompt(fixture, "mid-task turn fails empty before any tool ran");
 		await waitFor(() => fixture.promptDeliveryCount() === 2, "second prompt delivery");
 		fixture.sendTerminal({
 			type: "agent_start",
@@ -881,10 +884,11 @@ test("ACP does not retry a prompt_failed on a later turn even after activity", a
 			turnId: "prompt-terminal-turn-2",
 		});
 		fixture.sendFailed("prompt_failed");
-		await expect(bounded(second, "second turn failure settlement")).rejects.toMatchObject({
-			code: "prompt_failed",
-		});
-		expect(fixture.promptDeliveryCount()).toBe(2);
+		// The turn is re-submitted once, as a distinct third delivery.
+		await waitFor(() => fixture.promptDeliveryCount() === 3, "mid-task retry delivery");
+		// The re-submit lands on a healthy provider and completes normally.
+		fixture.sendStopped("end_turn");
+		expect(await bounded(second, "mid-task retry recovery")).toEqual({ stopReason: "end_turn" });
 	} finally {
 		fixture.dispose();
 	}
@@ -928,7 +932,7 @@ test("ACP does not retry a first-turn prompt_failed once the turn executed a too
 	}
 });
 
-test("ACP retries a mid-task prompt_failed once after the turn executed a tool, then recovers (issue #5615)", async () => {
+test("ACP does not retry a mid-task prompt_failed once the turn executed a tool (review P1)", async () => {
 	const fixture = await createFixture();
 	try {
 		// The first turn completes normally, so the session is past its first prompt: a later
@@ -938,9 +942,10 @@ test("ACP retries a mid-task prompt_failed once after the turn executed a tool, 
 		fixture.sendStopped("end_turn");
 		expect(await bounded(first, "first turn settlement")).toEqual({ stopReason: "end_turn" });
 
-		// A mid-task turn starts, executes a tool (real work), then the model re-invocation
-		// carrying the tool result back returns empty and the turn terminalizes as prompt_failed
-		// — the exact mid-task empty-turn signature from issue #5615.
+		// A mid-task turn starts, executes a tool, and then fails prompt_failed. The tool already
+		// committed its effect, and a re-submit is a new, independent turn.prompt — replaying it
+		// would run the user's instruction and that non-idempotent side effect a second time. The
+		// failure is surfaced with its code instead, exactly as on the first turn.
 		const second = prompt(fixture, "mid-task turn runs a tool then fails empty");
 		await waitFor(() => fixture.promptDeliveryCount() === 2, "second prompt delivery");
 		fixture.sendTerminal({
@@ -968,11 +973,84 @@ test("ACP retries a mid-task prompt_failed once after the turn executed a tool, 
 			},
 		});
 		fixture.sendFailed("prompt_failed");
-		// The turn is re-submitted once, as a distinct third delivery.
+		await expect(bounded(second, "tool-progressed mid-task failure settlement")).rejects.toMatchObject({
+			code: "prompt_failed",
+		});
+		expect(fixture.promptDeliveryCount()).toBe(2);
+	} finally {
+		fixture.dispose();
+	}
+});
+
+test("ACP rejects a concurrent prompt while the mid-task retry owns the session (review P1)", async () => {
+	const fixture = await createFixture();
+	try {
+		const first = prompt(fixture, "first turn ok");
+		await bounded(fixture.promptDelivered, "first prompt delivery");
+		fixture.sendStopped("end_turn");
+		expect(await bounded(first, "first turn settlement")).toEqual({ stopReason: "end_turn" });
+
+		// The mid-task turn starts then fails empty, so the retry path reserves the session before
+		// re-submitting.
+		const second = prompt(fixture, "mid-task turn fails empty before any tool ran");
+		await waitFor(() => fixture.promptDeliveryCount() === 2, "second prompt delivery");
+		fixture.sendTerminal({
+			type: "agent_start",
+			sessionId: "prompt-terminal-session",
+			commandId: "prompt-terminal-command-2",
+			turnId: "prompt-terminal-turn-2",
+		});
+		fixture.sendFailed("prompt_failed");
 		await waitFor(() => fixture.promptDeliveryCount() === 3, "mid-task retry delivery");
-		// The re-submit lands on a healthy provider and completes normally.
+		// A request that is not the retry owner is rejected by the reservation — specifically by it,
+		// not by the generic active-prompt guard — so it can never take the session from the retry.
+		await expect(bounded(prompt(fixture, "competing prompt"), "competing prompt rejection")).rejects.toMatchObject({
+			code: "conflict",
+			message: "ACP session is retrying a mid-task prompt.",
+		});
+		expect(fixture.promptDeliveryCount()).toBe(3);
+		// The authorized retry still completes, and releases the reservation as it settles.
 		fixture.sendStopped("end_turn");
 		expect(await bounded(second, "mid-task retry recovery")).toEqual({ stopReason: "end_turn" });
+		const next = prompt(fixture, "post-retry prompt");
+		await waitFor(() => fixture.promptDeliveryCount() === 4, "post-retry prompt delivery");
+		fixture.sendStopped("end_turn");
+		expect(await bounded(next, "post-retry prompt completion")).toEqual({ stopReason: "end_turn" });
+	} finally {
+		fixture.dispose();
+	}
+});
+
+test("ACP settles a cancel that arrives during the mid-task retry as cancelled (review P1)", async () => {
+	const fixture = await createFixture({ cancelSettlementGraceMs: 25 });
+	try {
+		const first = prompt(fixture, "first turn ok");
+		await bounded(fixture.promptDelivered, "first prompt delivery");
+		fixture.sendStopped("end_turn");
+		expect(await bounded(first, "first turn settlement")).toEqual({ stopReason: "end_turn" });
+
+		const second = prompt(fixture, "mid-task turn fails empty before any tool ran");
+		await waitFor(() => fixture.promptDeliveryCount() === 2, "second prompt delivery");
+		fixture.sendTerminal({
+			type: "agent_start",
+			sessionId: "prompt-terminal-session",
+			commandId: "prompt-terminal-command-2",
+			turnId: "prompt-terminal-turn-2",
+		});
+		fixture.sendFailed("prompt_failed");
+		await waitFor(() => fixture.promptDeliveryCount() === 3, "mid-task retry delivery");
+		// The client cancels while the reserved retry is in flight. The cancel must win: the retry's
+		// reservation may not swallow it, and the prompt settles as cancelled rather than as the
+		// original prompt_failed.
+		await bounded(fixture.agent.cancel({ sessionId: fixture.sessionId }), "mid-task retry cancel");
+		expect(await bounded(second, "cancelled mid-task retry")).toEqual({ stopReason: "cancelled" });
+		expect(fixture.promptDeliveryCount()).toBe(3);
+		// The reservation did not leak: a later prompt is admitted rather than rejected as a
+		// lingering retry conflict.
+		const next = prompt(fixture, "post-cancel prompt");
+		await waitFor(() => fixture.promptDeliveryCount() === 4, "post-cancel prompt delivery");
+		fixture.sendStopped("end_turn");
+		expect(await bounded(next, "post-cancel prompt completion")).toEqual({ stopReason: "end_turn" });
 	} finally {
 		fixture.dispose();
 	}
@@ -1061,9 +1139,9 @@ test("ACP does not retry a first-turn readiness race after reattaching a session
 			"same-id reattachment",
 		);
 
-		// A turn that starts (agent_start) then fails prompt_failed is the readiness-race signature
-		// that WOULD be retried on a true first turn. Because the reattached session is not on its
-		// first prompt, it is surfaced, not retried.
+		// A turn that starts (agent_start) then fails prompt_failed is the readiness-race signature.
+		// Because the reattached session is not on its first prompt, it takes the one-shot mid-task
+		// retry (issue #5615) instead of the first-turn path's larger, backed-off budget.
 		const second = prompt(fixture, "readiness race after reattach");
 		await waitFor(() => fixture.promptDeliveryCount() === 2, "second prompt delivery");
 		fixture.sendTerminal({
@@ -1073,10 +1151,14 @@ test("ACP does not retry a first-turn readiness race after reattaching a session
 			turnId: "prompt-terminal-turn-2",
 		});
 		fixture.sendFailed("prompt_failed");
+		await waitFor(() => fixture.promptDeliveryCount() === 3, "mid-task retry delivery");
+		// The single mid-task re-submit fails too, and is surfaced. A session still classified as
+		// being on its first turn would have retried again; this one does not.
+		fixture.sendFailed("prompt_failed");
 		await expect(bounded(second, "reattached failure settlement")).rejects.toMatchObject({
 			code: "prompt_failed",
 		});
-		expect(fixture.promptDeliveryCount()).toBe(2);
+		expect(fixture.promptDeliveryCount()).toBe(3);
 	} finally {
 		fixture.releaseBlockedAdvisoryQueries();
 		fixture.dispose();
@@ -1098,7 +1180,8 @@ test("ACP does not retry a first-turn readiness race on a loaded session with pr
 		);
 
 		// A replayed user turn proves the loaded session already had a prompt, so a turn that starts
-		// then fails prompt_failed is surfaced, not retried, even though no prompt ran in this process.
+		// then fails prompt_failed takes the one-shot mid-task retry rather than the first-turn
+		// readiness path, even though no prompt ran in this process.
 		const pending = prompt(fixture, "readiness race after load");
 		await waitFor(() => fixture.promptDeliveryCount() === 1, "loaded prompt delivery");
 		fixture.sendTerminal({
@@ -1108,10 +1191,14 @@ test("ACP does not retry a first-turn readiness race on a loaded session with pr
 			turnId: "prompt-terminal-turn",
 		});
 		fixture.sendFailed("prompt_failed");
+		await waitFor(() => fixture.promptDeliveryCount() === 2, "mid-task retry delivery");
+		// The single mid-task re-submit fails too, and is surfaced. A session still classified as
+		// being on its first turn would have retried again; this one does not.
+		fixture.sendFailed("prompt_failed");
 		await expect(bounded(pending, "loaded failure settlement")).rejects.toMatchObject({
 			code: "prompt_failed",
 		});
-		expect(fixture.promptDeliveryCount()).toBe(1);
+		expect(fixture.promptDeliveryCount()).toBe(2);
 	} finally {
 		fixture.releaseBlockedAdvisoryQueries();
 		fixture.dispose();
