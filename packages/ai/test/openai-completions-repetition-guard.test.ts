@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import { streamOpenAICompletions } from "../src/providers/openai-completions";
 import type { AssistantMessage, Context, Model, TextContent, ThinkingContent, ToolCall } from "../src/types";
-import { REPETITION_GUARD_ERROR_CODE } from "../src/utils/stream-repetition-guard";
+import { REPETITION_GUARD_ERROR_CODE, REPETITION_GUARD_STOP_MESSAGE } from "../src/utils/stream-repetition-guard";
 
 const originalFetch = global.fetch;
 
@@ -171,8 +171,9 @@ describe("chat-completions: streamed repetition guard (#5624)", () => {
 		expect(countOccurrences(thinkingText(result), SENTENCE)).toBeLessThanOrEqual(THRESHOLD);
 		expect(result.stopReason).toBe("error");
 		expect(result.errorCode).toBe("repetition_guard_tripped");
-		// The count belongs in the human-readable message, never in the bounded code.
-		expect(result.errorMessage).toContain(String(THRESHOLD));
+		// A fixed literal — the repeat count used to be interpolated here, but this
+		// field is forwarded to API clients by the gateway (#5627 r5).
+		expect(result.errorMessage).toBe(REPETITION_GUARD_STOP_MESSAGE);
 		// A local decision, not a retryable transport fault — and retry admission
 		// in the agent loop keys on exactly this field.
 		expect(result.transportFailure).toBeUndefined();
@@ -468,5 +469,32 @@ describe("chat-completions: streamed repetition guard (#5624)", () => {
 		expect(result.stopReason).toBe("stop");
 		expect(result.errorCode).toBeUndefined();
 		expect(thinkingText(result)).toContain("Step 59: checking file 59.ts");
+	});
+	// The repeated unit is raw model output, and the gateway forwards
+	// `errorMessage` to API clients on the streaming path. The sentinel below is
+	// also built from words `classifyGatewayError` keyword-matches on, so one
+	// case covers both hazards: leaking the sample, and letting it pick the HTTP
+	// status (#5627 review r5).
+	const LEAK_SENTINEL = "quota invalid forbidden zzsentinelzz";
+
+	it("never puts the repeated sample in errorMessage", async () => {
+		const state: DeliveryState = { delivered: 0 };
+		const events: Array<SseChunk | "[DONE]"> = [];
+		for (let i = 0; i < 40; i++) events.push(chunk({ reasoning_content: `${LEAK_SENTINEL}\n` }));
+		events.push(chunk({}, "stop"), "[DONE]");
+		global.fetch = streamingFetch(events, state);
+
+		const result = await streamOpenAICompletions(model(), context(), { apiKey: "test" }).result();
+
+		// Non-vacuity: the guard really tripped on the sentinel.
+		expect(result.errorCode).toBe(REPETITION_GUARD_ERROR_CODE);
+		expect(thinkingText(result)).toContain(LEAK_SENTINEL);
+		// ...and none of it reached the field the gateway publishes.
+		expect(result.errorMessage).toBe(REPETITION_GUARD_STOP_MESSAGE);
+		expect(result.errorMessage).not.toContain(LEAK_SENTINEL);
+		expect(result.errorMessage).not.toContain("zzsentinelzz");
+		expect(result.errorMessage).not.toContain("quota");
+		expect(result.errorMessage).not.toContain("invalid");
+		expect(result.errorMessage).not.toContain("forbidden");
 	});
 });

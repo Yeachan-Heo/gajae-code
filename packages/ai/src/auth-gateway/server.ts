@@ -564,6 +564,14 @@ function redactGatewayError(error: unknown): Error {
 }
 
 function redactGatewayMessage(message: AssistantMessage): AssistantMessage {
+	// A repetition stop is replaced wholesale, before `cleanReason` ever sees it.
+	// `cleanReason` only strips credential-shaped text, so ordinary model prose
+	// survives it verbatim — and this message's free-form half is a sample of raw
+	// model output. Reuses the fixed envelope the non-streaming path already
+	// returns, so both paths publish the same bounded string (#5627 review r5).
+	if (message.errorCode === REPETITION_GUARD_ERROR_CODE) {
+		return { ...message, errorMessage: REPETITION_GUARD_GATEWAY_ERROR.message };
+	}
 	if (message.errorMessage === undefined) return message;
 	return { ...message, errorMessage: cleanReason(message.errorMessage) ?? "Upstream request failed" };
 }
@@ -572,8 +580,12 @@ function redactGatewayMessage(message: AssistantMessage): AssistantMessage {
  * Protect all gateway SSE encoders from upstream error text. Provider wire
  * modules format `error` events themselves, so sanitize at this boundary and
  * also convert iterator failures to bounded errors before their catch blocks.
+ *
+ * Exported for tests: this is the only place the streaming path scrubs error
+ * text, so the assertion that a repetition sample never reaches the wire has to
+ * drive it directly.
  */
-function redactGatewayStream(events: AssistantMessageEventStream): AssistantMessageEventStream {
+export function redactGatewayStream(events: AssistantMessageEventStream): AssistantMessageEventStream {
 	async function* redactedEvents(): AsyncGenerator<AssistantMessageEvent> {
 		try {
 			for await (const event of events) {

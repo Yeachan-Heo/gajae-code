@@ -26,6 +26,14 @@
   decode loop — discarding the real error message, `errorStatus` and
   `transportFailure`, and marking a retryable provider fault as terminal. The
   guard's own abort is now tracked explicitly, so only it claims the trip.
+- Keep the repeated sample out of error payloads. The guard's `errorMessage`
+  interpolated the repeated unit, the channel and the repeat count, and the auth
+  gateway forwards `errorMessage` to API clients on the streaming path — so raw
+  model output was published verbatim, and a repeated `quota` or `forbidden` in
+  the sample could steer the HTTP status the gateway picked. The message is now
+  a fixed literal at the provider, the gateway substitutes the same bounded
+  envelope its non-streaming path already used, and the sample survives only in
+  local `logger.debug` diagnostics.
 - Strip leaked chat-template tool fences (`<|tool_call_end|>` and friends) from
   rendered thinking, including fences split across streaming chunk boundaries.
   The visible text channel is deliberately untouched, so a fence token the

@@ -82,6 +82,7 @@ import { wrapFetchForSseDebug } from "../utils/sse-debug";
 import {
 	DEFAULT_REPETITION_THRESHOLD,
 	REPETITION_GUARD_ERROR_CODE,
+	REPETITION_GUARD_STOP_MESSAGE,
 	StreamRepetitionGuard,
 	type StreamRepetitionTrip,
 } from "../utils/stream-repetition-guard";
@@ -633,13 +634,16 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 			// auth gateway maps it to 499/`request_aborted` and telemetry counts it
 			// as a user cancel, so borrowing it misreports the turn (#5627). No new
 			// StopReason variant: the union is switched on exhaustively everywhere.
-			// `errorCode` stays the bounded classifier for *why* (#5624); the
-			// observed repeat count belongs in the free-form message only.
+			// `errorCode` stays the bounded classifier for *why* (#5624).
 			output.stopReason = "error";
 			output.errorCode = REPETITION_GUARD_ERROR_CODE;
-			output.errorMessage =
-				`Stopped the turn: the model repeated the same ${repetitionTrip.channel} output ` +
-				`${repetitionTrip.repeats} times (${JSON.stringify(repetitionTrip.sample)}).`;
+			// A fixed literal, never the observed sample/channel/count: the auth
+			// gateway forwards `errorMessage` to API clients on the streaming path,
+			// so interpolating here publishes raw model output and feeds it to a
+			// keyword classifier that picks HTTP status from message text. The
+			// diagnostic detail lives in the `logger.debug` at the trip site
+			// instead (#5627 review r5).
+			output.errorMessage = REPETITION_GUARD_STOP_MESSAGE;
 			output.duration = Date.now() - startTime;
 			if (firstTokenTime) output.ttft = firstTokenTime - startTime;
 			// No `transportFailure`: this is a local decision, not a retryable
@@ -967,6 +971,16 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 				const trip = guard.takeTrip();
 				if (!trip) return;
 				repetitionTrip = { ...trip, channel };
+				// The only place the repeated unit is retained. `errorMessage` is a
+				// fixed literal because the gateway forwards it to API clients, so the
+				// sample has to stay in local diagnostics (#5627 review r5).
+				logger.debug("openai-completions: repetition guard tripped", {
+					model: model.id,
+					channel,
+					kind: trip.kind,
+					repeats: trip.repeats,
+					sample: trip.sample,
+				});
 				// Deliberately no abort here — see the REPETITION_DRAIN_* constants.
 				// The main loop closes the window once late tool-call frames have had
 				// their chance to land.

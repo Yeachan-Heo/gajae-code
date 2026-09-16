@@ -29,6 +29,19 @@ export const DEFAULT_REPETITION_THRESHOLD = 12;
 export const REPETITION_GUARD_ERROR_CODE = "repetition_guard_tripped";
 
 /**
+ * Wire-safe `errorMessage` for a turn this guard stopped. A literal with zero
+ * interpolation — not the sample, not the channel, not the repeat count.
+ *
+ * The auth gateway forwards `errorMessage` to API clients on the streaming path
+ * (`redactGatewayMessage` only strips credential-shaped text), so anything
+ * interpolated here is raw model output published verbatim. It also reaches
+ * `classifyGatewayError`, which keyword-matches on message text, so a repeated
+ * `quota` or `forbidden` in a sample could pick the HTTP status. The repeated
+ * unit stays in local `logger.debug` diagnostics only (#5627 review r5).
+ */
+export const REPETITION_GUARD_STOP_MESSAGE = "Stopped the turn: the model produced runaway repeated output.";
+
+/**
  * Shortest n-gram window compared when the repeats carry no newline to split
  * on. Requiring eight tokens keeps ordinary repetition — a run of zeroes in a
  * matrix, a ruler of dashes — from reading as a decode loop.
