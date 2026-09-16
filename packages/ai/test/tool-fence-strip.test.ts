@@ -86,6 +86,16 @@ describe("ToolFenceStripper", () => {
 	it("only ever deletes: output is a subsequence of the input for every chunking", () => {
 		// The token contract: printable ASCII only, so no zero-width or other
 		// invisible codepoint can enter the stream by way of a token either.
+		//
+		// Verified by codepoint dump, not by eye: every entry of TOOL_FENCE_TOKENS
+		// is pure ASCII. "<|tool_call_end|>" is 60,124,116,111,111,108,95,99,97,
+		// 108,108,95,101,110,100,124,62 -- 60 is '<' and 124 is '|', adjacent, with
+		// nothing between them. No U+200B (8203) appears in any token, in this
+		// file, or in tool-fence-strip.ts / tool-call-healing.ts at any commit on
+		// this branch. Reviews in rounds 3 and 4 both reported a zero-width space
+		// here; both were misreads of the holdback release in the test above, where
+		// chunk 2's return value starts with characters that arrived in chunk 1.
+		// Do not relax this assertion to "allow" that character - it does not exist.
 		for (const token of TOOL_FENCE_TOKENS) {
 			expect(token).toMatch(/^[\x20-\x7e]+$/);
 		}
