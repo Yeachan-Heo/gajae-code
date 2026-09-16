@@ -380,7 +380,12 @@ describe("AgentSession switchSession resumeModelBehavior", () => {
 			"Saved session model is no longer registered; restored the durable default preset instead.",
 			"fallback",
 		);
-		expect(notice).toHaveBeenCalledWith("error", expect.stringContaining("missing-executor"), "fallback");
+		expect(notice).toHaveBeenCalledWith(
+			"error",
+			expect.stringContaining("durable default preset resolution failed"),
+			"fallback",
+		);
+		expect(notice).not.toHaveBeenCalledWith("error", expect.stringContaining("missing-executor"), "fallback");
 	});
 
 	it("fails without rewriting the saved chain when the durable default is unavailable", async () => {
