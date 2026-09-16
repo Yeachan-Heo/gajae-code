@@ -59,6 +59,7 @@ import { loadCapability, reset as resetCapabilities } from "../capability";
 import { type Rule, ruleCapability, setActiveRules } from "../capability/rule";
 import type { SourceMeta } from "../capability/types";
 import { AUTOROUTING_INACTIVE_WARNING } from "../config/autorouting-contract";
+import { resolveMissingSessionModelRecovery } from "../config/model-profile-activation";
 import { resolveModelProfileName } from "../config/model-profile-contract";
 import { resolveProfileBindings } from "../config/model-profiles";
 import { kNoAuth, ModelRegistry } from "../config/model-registry";
@@ -1967,9 +1968,22 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		const persistedProfileOwnsDefault = acceptedPersistedProfileName
 			? resolveProfileBindings(persistedProfiles.get(acceptedPersistedProfileName)!).defaultSelector !== undefined
 			: false;
-		const startupActiveModelProfile =
+		let startupActiveModelProfile =
 			acceptedInheritedProfileName ??
 			(!hasExplicitModel && acceptedPersistedProfileName ? acceptedPersistedProfileName : undefined);
+		let savedDefaultWasUnresolved = false;
+		let deferredMissingSessionRecovery = false;
+		let retainedRecoveryBindingsAfterLateRestore = false;
+		let recoveredSessionDefault:
+			| {
+					entries: string[];
+					profileName: string;
+					activeIndex: number;
+					thinkingLevel?: ThinkingLevel;
+					explicitThinkingLevel: boolean;
+					skips: Array<{ selector: string; reason: string }>;
+			  }
+			| undefined;
 		// If session has data, restore its configured default chain rather than the
 		// scalar runtime model, which may be a stale fallback from the prior run.
 		if (!hasExplicitModel && !model && hasExistingSession && defaultModelEntries.length > 0) {
@@ -1992,6 +2006,33 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				// another provider would strand it without any error.
 				if (model && preferredCredentialProvider && model.provider !== preferredCredentialProvider) {
 					model = undefined;
+				}
+				savedDefaultWasUnresolved = !model;
+				if (!model && resumeModelBehavior !== "useCurrentDefault") {
+					try {
+						const recovery = await resolveMissingSessionModelRecovery({
+							modelRegistry,
+							settings,
+							defaultEntries: defaultModelEntries,
+							skips: restoredDefaultResolution.skips,
+							savedDefault: existingSession.models.default,
+							credentialSessionId,
+							...(persistedProfileOwnsDefault ? { aliasIntent: "preset-equivalent" as const } : {}),
+						});
+						deferredMissingSessionRecovery = true;
+						if (
+							recovery?.model &&
+							(!preferredCredentialProvider || recovery.model.provider === preferredCredentialProvider)
+						) {
+							model = recovery.model;
+							recoveredSessionDefault = recovery;
+							startupActiveModelProfile = undefined;
+							modelFallbackMessage =
+								"Saved session model is no longer registered; restored the durable default preset instead.";
+						}
+					} catch {
+						deferredMissingSessionRecovery = true;
+					}
 				}
 				if (!model) modelFallbackMessage = `Could not restore model ${defaultModelEntries.join(" -> ")}`;
 			});
@@ -2026,6 +2067,14 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			hasExistingSession && hasThinkingEntry ? parseThinkingLevel(existingSession.thinkingLevel) : undefined;
 		if (thinkingLevel === undefined && restoredThinkingLevel !== ThinkingLevel.Inherit) {
 			thinkingLevel = restoredThinkingLevel;
+		}
+
+		if (
+			thinkingLevel === undefined &&
+			(restoredThinkingLevel === undefined || restoredThinkingLevel === ThinkingLevel.Inherit) &&
+			recoveredSessionDefault?.explicitThinkingLevel
+		) {
+			thinkingLevel = recoveredSessionDefault.thinkingLevel;
 		}
 
 		if (thinkingLevel === undefined && !hasExplicitModel && defaultRoleSpec.explicitThinkingLevel) {
@@ -3701,6 +3750,86 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			extensionsResult.runtime.pendingProviderRegistrations = [];
 		}
 
+		// A startup extension can register the saved model after the initial
+		// recovery lookup. Reconsider the saved chain against that completed
+		// catalog before retaining a durable runtime fallback.
+		if (savedDefaultWasUnresolved && defaultModelEntries.length > 0) {
+			const restoredAfterExtensions = await resolveModelChainWithAuth(
+				defaultModelEntries,
+				modelRegistry,
+				settings,
+				credentialSessionId,
+				{
+					managedFallback: defaultModelEntries.length > 1,
+					canonicalSessionId: providerSessionId,
+					...(persistedProfileOwnsDefault ? { aliasIntent: "preset-equivalent" as const } : {}),
+				},
+			);
+			if (
+				restoredAfterExtensions.model &&
+				(!preferredCredentialProvider || restoredAfterExtensions.model.provider === preferredCredentialProvider)
+			) {
+				model = restoredAfterExtensions.model;
+				retainedRecoveryBindingsAfterLateRestore = savedDefaultWasUnresolved;
+				if (options.thinkingLevel !== undefined) {
+					thinkingLevel = resolveThinkingLevelForModel(model, options.thinkingLevel);
+				} else if (restoredThinkingLevel !== undefined && restoredThinkingLevel !== ThinkingLevel.Inherit) {
+					thinkingLevel = resolveThinkingLevelForModel(model, restoredThinkingLevel);
+				} else {
+					thinkingLevel = restoredAfterExtensions.explicitThinkingLevel
+						? restoredAfterExtensions.thinkingLevel
+						: undefined;
+					if (thinkingLevel === undefined && !hasExplicitModel && defaultRoleSpec.explicitThinkingLevel)
+						thinkingLevel = defaultRoleSpec.thinkingLevel;
+					if (thinkingLevel === undefined && hasExplicitDefaultThinkingLevel)
+						thinkingLevel = settings.get("defaultThinkingLevel");
+					if (thinkingLevel === undefined && model.thinking?.defaultLevel !== undefined)
+						thinkingLevel = model.thinking.defaultLevel;
+					if (thinkingLevel === undefined) thinkingLevel = settings.get("defaultThinkingLevel");
+					thinkingLevel = resolveThinkingLevelForModel(model, thinkingLevel);
+				}
+				recoveredSessionDefault = undefined;
+				startupActiveModelProfile =
+					acceptedInheritedProfileName ??
+					(!hasExplicitModel && acceptedPersistedProfileName ? acceptedPersistedProfileName : undefined);
+				modelFallbackMessage = undefined;
+			} else if (deferredMissingSessionRecovery) {
+				const recovery = await resolveMissingSessionModelRecovery({
+					modelRegistry,
+					settings,
+					defaultEntries: defaultModelEntries,
+					skips: restoredAfterExtensions.skips,
+					savedDefault: existingSession.models.default,
+					credentialSessionId,
+					...(persistedProfileOwnsDefault ? { aliasIntent: "preset-equivalent" as const } : {}),
+				});
+				if (
+					recovery?.model &&
+					(!preferredCredentialProvider || recovery.model.provider === preferredCredentialProvider)
+				) {
+					model = recovery.model;
+					if (options.thinkingLevel !== undefined) {
+						thinkingLevel = resolveThinkingLevelForModel(model, options.thinkingLevel);
+					} else if (restoredThinkingLevel !== undefined && restoredThinkingLevel !== ThinkingLevel.Inherit) {
+						thinkingLevel = resolveThinkingLevelForModel(model, restoredThinkingLevel);
+					} else {
+						const recoveredLevel = recovery.explicitThinkingLevel
+							? recovery.thinkingLevel
+							: defaultRoleSpec.explicitThinkingLevel
+								? defaultRoleSpec.thinkingLevel
+								: hasExplicitDefaultThinkingLevel
+									? settings.get("defaultThinkingLevel")
+									: (model.thinking?.defaultLevel ?? settings.get("defaultThinkingLevel"));
+						thinkingLevel = resolveThinkingLevelForModel(model, recoveredLevel);
+					}
+					recoveredSessionDefault = recovery;
+					startupActiveModelProfile = undefined;
+					modelFallbackMessage =
+						"Saved session model is no longer registered; restored the durable default preset instead.";
+				}
+			}
+		}
+
 		let startupCredentialModelRejected = false;
 		if (startupModelReference && (startupCredentialSelector || startupCredentialProviderMismatch)) {
 			const validated =
@@ -4788,6 +4917,14 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			providerSessionState: options.providerSessionState,
 		});
 		session.setActiveModelProfile(startupActiveModelProfile);
+		if (retainedRecoveryBindingsAfterLateRestore) session.markStartupRecoveryBindingsRequired();
+		if (recoveredSessionDefault)
+			session.installRecoveredDefaultFallbackChain(
+				recoveredSessionDefault.entries,
+				recoveredSessionDefault.profileName,
+				recoveredSessionDefault.activeIndex,
+				recoveredSessionDefault.skips,
+			);
 		session.configWarnings.push(...contextFileWarnings);
 		// Determined once, here, where settings are already available. Keep the
 		// durable warning for interactive and print consumers; ACP delivery is

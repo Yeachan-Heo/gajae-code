@@ -62,11 +62,13 @@ function fakeSessionResult(): CreateAgentSessionResult {
 		},
 		extensionRunner: undefined,
 		getConfiguredModelChain: () => undefined,
+		hasRecoveredDefaultFallbackChain: () => false,
 		setConfiguredModelChain: () => {},
 		seedDefaultFallbackResolution: () => {},
 		setModelTemporary: async (model: typeof testModel) => {
 			activeModel = model;
 		},
+		subscribe: () => () => {},
 		dispose: async () => {},
 	} as unknown as AgentSession;
 	return {

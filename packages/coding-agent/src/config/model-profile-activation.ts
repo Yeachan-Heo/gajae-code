@@ -10,6 +10,7 @@ import {
 	formatModelProfileDisplayLabel,
 	type ModelProfileDefinition,
 	PROXY_ROUTABLE_PROVIDER_IDS,
+	type ResolvedProfileBinding,
 	resolveProfileBindings,
 } from "./model-profiles";
 
@@ -21,11 +22,13 @@ import {
 	isAuthenticated,
 	kNoAuth,
 	type ModelRegistry,
+	registrySelectorResolvesToModel,
 } from "./model-registry";
 import {
 	formatModelSelectorValue,
 	formatModelString,
 	parseModelString,
+	resolveConfiguredModelPatterns,
 	resolveModelChainWithAuth,
 	resolveModelRoleValue,
 	splitSelectorThinkingSuffix,
@@ -608,6 +611,223 @@ export function requiresQualifiedModelProfileRoleResolution(profile: Pick<ModelP
 	return profile.source === "user" || profile.source === "registry";
 }
 
+/** Resolve a removed saved-session default through the durable profile without mutating persistent state. */
+export async function resolveMissingSessionModelRecovery(options: {
+	modelRegistry: PrepareModelProfileActivationOptions["modelRegistry"];
+	settings: Pick<Settings, "get" | "getModelRole">;
+	defaultEntries: readonly string[];
+	skips: Array<{ selector: string; reason: string }>;
+	savedDefault: string | undefined;
+	credentialSessionId: string;
+	aliasIntent?: "preset-equivalent";
+}): Promise<
+	| {
+			profileName: string;
+			entries: string[];
+			model?: Model<Api>;
+			thinkingLevel?: ThinkingLevel;
+			explicitThinkingLevel: boolean;
+			activeIndex: number;
+			skips: Array<{ selector: string; reason: string }>;
+	  }
+	| undefined
+> {
+	const allSelectorsUnknown =
+		options.skips.length === options.defaultEntries.length &&
+		options.skips.every(skip => skip.reason === "unknown_model");
+	if (!allSelectorsUnknown) return undefined;
+	const fullCatalog = options.modelRegistry.getAll();
+	const savedSelectorsMissingFromCatalog = resolveConfiguredModelPatterns(
+		options.defaultEntries,
+		options.settings,
+	).every(selector => {
+		if (
+			resolveModelRoleValue(selector, fullCatalog, {
+				settings: options.settings,
+				modelRegistry: options.modelRegistry,
+				credentialSessionId: options.credentialSessionId,
+				...(options.aliasIntent ? { aliasIntent: options.aliasIntent } : {}),
+			}).model
+		)
+			return false;
+		return !registrySelectorResolvesToModel(selector, fullCatalog);
+	});
+	const savedConcreteDefault = options.savedDefault ? parseModelString(options.savedDefault) : undefined;
+	const savedConcreteDefaultMissingFromCatalog =
+		savedConcreteDefault === undefined ||
+		!fullCatalog.some(
+			model =>
+				model.provider.toLowerCase() === savedConcreteDefault.provider.toLowerCase() &&
+				model.id.toLowerCase() === savedConcreteDefault.id.toLowerCase(),
+		);
+	const durableProfile = options.settings.get("modelProfile.default");
+	if (!savedSelectorsMissingFromCatalog || !savedConcreteDefaultMissingFromCatalog || !durableProfile)
+		return undefined;
+	return resolveModelProfileDefaultChain({
+		modelRegistry: options.modelRegistry,
+		settings: options.settings,
+		profileName: durableProfile,
+		credentialSessionId: options.credentialSessionId,
+	});
+}
+
+/** Resolve a durable profile's effective default chain without mutating session or settings state. */
+export async function resolveModelProfileDefaultChain(options: {
+	modelRegistry: PrepareModelProfileActivationOptions["modelRegistry"];
+	settings: Pick<Settings, "get">;
+	profileName: string;
+	credentialSessionId: string;
+}): Promise<{
+	profileName: string;
+	entries: string[];
+	model?: Model<Api>;
+	thinkingLevel?: ThinkingLevel;
+	explicitThinkingLevel: boolean;
+	activeIndex: number;
+	skips: Array<{ selector: string; reason: string }>;
+}> {
+	const profiles = options.modelRegistry.getModelProfiles();
+	const profileName = validateModelProfileName(options.profileName, profiles, options.modelRegistry.getError?.());
+	const profile = profiles.get(profileName) ?? options.modelRegistry.getModelProfile(profileName)!;
+	const profileLabel = formatModelProfileDisplayLabel(profile);
+	const requiredProviders = aggregateModelProfileRequiredProviders(profile.requiredProviders, profile);
+	const alternativeGroups = profile.alternativeProviderGroups ?? [];
+	const alternativeSet = new Set(alternativeGroups.flat());
+	const requiredProviderSet = new Set(requiredProviders);
+	const authenticatedProviders = new Set<string>();
+	const missingProviders: string[] = [];
+	for (const provider of new Set([
+		...requiredProviders,
+		...alternativeSet,
+		...deriveModelProfileMappedProviders(profile),
+	])) {
+		let apiKey: string | undefined;
+		try {
+			apiKey = await options.modelRegistry.getApiKeyForProvider(provider, options.credentialSessionId);
+		} catch (error) {
+			if (requiredProviderSet.has(provider) && !alternativeSet.has(provider)) throw error;
+			continue;
+		}
+		if (apiKey === kNoAuth || isAuthenticated(apiKey)) authenticatedProviders.add(provider);
+		else if (requiredProviderSet.has(provider)) missingProviders.push(provider);
+	}
+	const proxyProvider = profile.source !== "user" ? resolveProxyProviderId(options.settings) : undefined;
+	const proxyMode = profile.source !== "user" ? resolveProxyMode(options.settings) : "fallback";
+	const proxyRoutableProviders =
+		profile.source === "user"
+			? new Set<string>()
+			: profile.source === "registry"
+				? new Set([
+						...PROXY_ROUTABLE_PROVIDER_IDS,
+						...profile.requiredProviders,
+						...deriveModelProfileMappedProviders(profile),
+					])
+				: PROXY_ROUTABLE_PROVIDER_IDS;
+	if (proxyMode === "always" && proxyProvider === undefined)
+		throw new Error('modelProfile.proxyMode "always" requires modelProfile.proxyProvider');
+	if (proxyProvider !== undefined && !options.modelRegistry.getConfiguredProviderIds?.().includes(proxyProvider)) {
+		throw new Error(
+			`modelProfile.proxyProvider "${proxyProvider}" is not configured. Configure it with \`gjc setup provider\` before activating a preset.`,
+		);
+	}
+	const proxyApiKey =
+		proxyProvider === undefined
+			? undefined
+			: await options.modelRegistry.getApiKeyForProvider(proxyProvider, options.credentialSessionId);
+	const proxyAuthenticated = proxyApiKey !== undefined && (proxyApiKey === kNoAuth || isAuthenticated(proxyApiKey));
+	if (proxyMode === "always" && !proxyAuthenticated)
+		throw new ModelProfileCredentialError(profileLabel, [proxyProvider!]);
+	const strictMissing = missingProviders.filter(
+		provider => !proxyRoutableProviders.has(provider) && !alternativeSet.has(provider),
+	);
+	if (strictMissing.length > 0) throw new ModelProfileCredentialError(profileLabel, strictMissing);
+	const strictRoutableMissing = missingProviders.filter(
+		provider => proxyRoutableProviders.has(provider) && !alternativeSet.has(provider),
+	);
+	if (strictRoutableMissing.length > 0 && !proxyAuthenticated) {
+		throw new ModelProfileCredentialError(
+			profileLabel,
+			proxyProvider === undefined ? strictRoutableMissing : [proxyProvider],
+		);
+	}
+	for (const group of alternativeGroups) {
+		if (group.some(provider => authenticatedProviders.has(provider))) continue;
+		const allRoutable = group.every(provider => proxyRoutableProviders.has(provider));
+		if (allRoutable && proxyAuthenticated) continue;
+		throw new ModelProfileCredentialError(
+			profileLabel,
+			allRoutable && proxyProvider !== undefined ? [proxyProvider] : [...group],
+		);
+	}
+	const availableModels =
+		options.modelRegistry.getAvailableForProfileActivation?.() ??
+		options.modelRegistry.getAvailable?.() ??
+		options.modelRegistry.getAll();
+	let bindings = resolveProfileBindings(profile);
+	if (alternativeGroups.length > 0)
+		bindings = rewriteBindingsProviders(bindings, authenticatedProviders, alternativeGroups);
+	if (proxyProvider !== undefined && proxyAuthenticated && profile.source !== "user") {
+		bindings = rewriteBindingsForProxy(
+			bindings,
+			proxyProvider,
+			proxyMode,
+			availableModels,
+			authenticatedProviders,
+			proxyRoutableProviders,
+		);
+	}
+	await preflightModelProfileRoleBindings({
+		profile,
+		bindings,
+		roleCatalogModels: options.modelRegistry.getAll(),
+		settings: options.settings as Settings,
+		modelRegistry: options.modelRegistry as ModelRegistry,
+		sessionId: "",
+		credentialSessionId: options.credentialSessionId,
+		profileLabel,
+	});
+	if (!bindings.defaultSelector)
+		return { profileName, entries: [], explicitThinkingLevel: false, activeIndex: 0, skips: [] };
+	const defaultChain = normalizeModelSelectorValue(
+		await resolveAndClampSelectorValue(
+			bindings.defaultSelector,
+			availableModels,
+			{
+				settings: options.settings as Settings,
+				modelRegistry: options.modelRegistry as ModelRegistry,
+				sessionId: "",
+				credentialSessionId: options.credentialSessionId,
+				aliasIntent: "preset-equivalent",
+			},
+			profileLabel,
+			"default",
+		),
+	);
+	const resolution = await resolveModelChainWithAuth(
+		defaultChain,
+		{
+			getAvailable: () => availableModels,
+			getApiKey: (model, sessionId) =>
+				options.modelRegistry.getApiKeyForProvider(model.provider, sessionId, model.baseUrl),
+			resolveCanonicalModel: options.modelRegistry.resolveCanonicalModel?.bind(options.modelRegistry),
+			getCanonicalVariants: options.modelRegistry.getCanonicalVariants?.bind(options.modelRegistry),
+			getCanonicalId: options.modelRegistry.getCanonicalId?.bind(options.modelRegistry),
+			resolveModelByLookupAlias: options.modelRegistry.resolveModelByLookupAlias?.bind(options.modelRegistry),
+			lookupAliasExists: options.modelRegistry.lookupAliasExists?.bind(options.modelRegistry),
+			clearCanonicalVariant: options.modelRegistry.clearCanonicalVariant?.bind(options.modelRegistry),
+		} as ModelRegistry,
+		options.settings as Settings,
+		options.credentialSessionId,
+		{
+			managedFallback: true,
+			aliasIntent: "preset-equivalent",
+			canonicalSessionId: null,
+			credentialSessionId: options.credentialSessionId,
+		},
+	);
+	return { profileName, entries: defaultChain, ...resolution };
+}
+
 export function rewriteSelectorForProxy(
 	selector: string,
 	proxyProvider: string,
@@ -849,6 +1069,49 @@ async function resolveAndClampSelectorValue(
 		);
 	}
 	return clamped.length === 1 && typeof selectorValue === "string" ? clamped[0] : clamped;
+}
+
+/** Resolve every non-default binding under the profile activation contract without installing it. */
+async function preflightModelProfileRoleBindings(options: {
+	profile: ModelProfileDefinition;
+	bindings: ResolvedProfileBinding;
+	roleCatalogModels: Model<Api>[];
+	settings: Settings;
+	modelRegistry: ModelRegistry;
+	sessionId: string;
+	credentialSessionId: string;
+	profileLabel: string;
+}): Promise<{
+	modelRoles: Record<string, ModelSelectorValue>;
+	agentModelOverrides: Record<string, ModelSelectorValue>;
+}> {
+	const resolveBindings = async (bindings: Record<string, ModelSelectorValue>) => {
+		const resolved: Record<string, ModelSelectorValue> = {};
+		for (const [role, selectorValue] of Object.entries(bindings) as [
+			GjcModelAssignmentTargetId,
+			ModelSelectorValue,
+		][]) {
+			resolved[role] = await resolveAndClampSelectorValue(
+				selectorValue,
+				options.roleCatalogModels,
+				{
+					settings: options.settings,
+					modelRegistry: options.modelRegistry,
+					sessionId: options.sessionId,
+					credentialSessionId: options.credentialSessionId,
+					aliasIntent: "preset-equivalent",
+					requireQualifiedResolution: requiresQualifiedModelProfileRoleResolution(options.profile),
+				},
+				options.profileLabel,
+				role,
+			);
+		}
+		return resolved;
+	};
+	return {
+		modelRoles: await resolveBindings(options.bindings.modelRoles),
+		agentModelOverrides: await resolveBindings(options.bindings.agentModelOverrides),
+	};
 }
 
 async function concretizeProfileSelectorValue(
@@ -1118,47 +1381,16 @@ export async function prepareModelProfileActivation(
 			throw new Error(`Model profile "${profileLabel}" default selectors did not resolve to an authenticated model`);
 		}
 
-		const modelRoles: Record<string, ModelSelectorValue> = {};
-		for (const [role, selectorValue] of Object.entries(bindings.modelRoles) as [
-			GjcModelAssignmentTargetId,
-			ModelSelectorValue,
-		][]) {
-			modelRoles[role] = await resolveAndClampSelectorValue(
-				selectorValue,
-				roleCatalogModels,
-				{
-					settings: options.settings as Settings,
-					modelRegistry: options.modelRegistry as ModelRegistry,
-					sessionId: options.session.sessionId,
-					credentialSessionId,
-					aliasIntent: "preset-equivalent",
-					requireQualifiedResolution: requiresQualifiedModelProfileRoleResolution(profile),
-				},
-				profileLabel,
-				role,
-			);
-		}
-
-		const agentModelOverrides: Record<string, ModelSelectorValue> = {};
-		for (const [role, selectorValue] of Object.entries(bindings.agentModelOverrides) as [
-			GjcModelAssignmentTargetId,
-			ModelSelectorValue,
-		][]) {
-			agentModelOverrides[role] = await resolveAndClampSelectorValue(
-				selectorValue,
-				roleCatalogModels,
-				{
-					settings: options.settings as Settings,
-					modelRegistry: options.modelRegistry as ModelRegistry,
-					sessionId: options.session.sessionId,
-					credentialSessionId,
-					aliasIntent: "preset-equivalent",
-					requireQualifiedResolution: requiresQualifiedModelProfileRoleResolution(profile),
-				},
-				profileLabel,
-				role,
-			);
-		}
+		const { modelRoles, agentModelOverrides } = await preflightModelProfileRoleBindings({
+			profile,
+			bindings,
+			roleCatalogModels,
+			settings: options.settings as Settings,
+			modelRegistry: options.modelRegistry as ModelRegistry,
+			sessionId: options.session.sessionId,
+			credentialSessionId,
+			profileLabel,
+		});
 
 		return {
 			profileName,
@@ -1659,4 +1891,35 @@ export async function activateModelProfile(
 ): Promise<void> {
 	const prepared = await prepareModelProfileActivation(options);
 	await applyPreparedModelProfileActivation(prepared, applyOptions);
+}
+
+/** Install only a profile's runtime role layer, preserving session model and configured-chain intent. */
+export async function applyModelProfileRuntimeBindings(options: PrepareModelProfileActivationOptions): Promise<void> {
+	const prepared = await prepareModelProfileActivation(options);
+	try {
+		prepared.settings.override("modelRoles", {
+			...prepared.baseModelRoles,
+			...prepared.modelRoles,
+		});
+		prepared.settings.override("task.agentModelOverrides", {
+			...prepared.baseAgentModelOverrides,
+			...prepared.agentModelOverrides,
+		});
+		prepared.session.setActiveModelProfile?.(prepared.profileName);
+		prepared.session.noteProfileInstalledOverrides?.(
+			Object.keys(prepared.modelRoles),
+			Object.keys(prepared.agentModelOverrides),
+			prepared.previousModel,
+		);
+		try {
+			await prepared.session.syncEagerDelegation?.();
+		} catch (error) {
+			logger.warn("Failed to sync eager delegation after recovered profile runtime bindings", {
+				profile: prepared.profileName,
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
+	} finally {
+		restoreCanonicalVariant(prepared.modelRegistry, prepared.session.sessionId, prepared.previousCanonicalVariant);
+	}
 }

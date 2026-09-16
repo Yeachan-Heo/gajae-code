@@ -29,7 +29,11 @@ import { resolveLaunchDisposition } from "./cli/launch-disposition";
 import { runListModelsCommand } from "./cli/list-models";
 import { selectSession } from "./cli/session-picker";
 import { findConfigFile } from "./config";
-import { activateModelProfile, ModelProfileCredentialError } from "./config/model-profile-activation";
+import {
+	activateModelProfile,
+	applyModelProfileRuntimeBindings,
+	ModelProfileCredentialError,
+} from "./config/model-profile-activation";
 import { ModelRegistry, ModelsConfigFile } from "./config/model-registry";
 import {
 	parseModelString,
@@ -477,13 +481,23 @@ async function applyStartupModelProfilesWithPolicy(
 		options: {
 			thinkingLevelOverride?: CreateAgentSessionOptions["thinkingLevel"];
 			tolerateCredentialError?: boolean;
+			runtimeBindingsOnly?: boolean;
 		} = {},
 	): Promise<boolean> => {
 		try {
-			await activateModelProfile(
-				{ session: args.session, modelRegistry: args.modelRegistry, settings: args.settings, profileName },
-				{ persistDefault, thinkingLevelOverride: options.thinkingLevelOverride },
-			);
+			if (options.runtimeBindingsOnly) {
+				await applyModelProfileRuntimeBindings({
+					session: args.session,
+					modelRegistry: args.modelRegistry,
+					settings: args.settings,
+					profileName,
+				});
+			} else {
+				await activateModelProfile(
+					{ session: args.session, modelRegistry: args.modelRegistry, settings: args.settings, profileName },
+					{ persistDefault, thinkingLevelOverride: options.thinkingLevelOverride },
+				);
+			}
 			return true;
 		} catch (error) {
 			if (error instanceof ModelProfileCredentialError && (onCredentialError || options.tolerateCredentialError)) {
@@ -519,6 +533,7 @@ async function applyStartupModelProfilesWithPolicy(
 						? args.settings.get("defaultThinkingLevel")
 						: undefined,
 					tolerateCredentialError: tolerateDefaultProfileFailure,
+					runtimeBindingsOnly: args.session.hasRecoveredDefaultFallbackChain(),
 				})) && applied;
 		}
 		if (args.parsedArgs.mpreset) {
