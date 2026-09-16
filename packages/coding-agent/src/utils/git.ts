@@ -805,10 +805,18 @@ export const status = Object.assign(
 // ════════════════════════════════════════════════════════════════════════════
 
 export const stage = {
-	/** Stage files. Empty array stages all (`git add -A`). */
-	async files(cwd: string, files: readonly string[] = [], signal?: AbortSignal): Promise<void> {
+	/**
+	 * Stage files. Empty array stages all (`git add -A`). Accepts a bare signal or
+	 * `{ env, signal }`; `env` exists so a caller can stage into an isolated
+	 * `GIT_INDEX_FILE` instead of the repository's real index.
+	 */
+	async files(
+		cwd: string,
+		files: readonly string[] = [],
+		options: AbortSignal | Pick<CommandOptions, "env" | "signal"> = {},
+	): Promise<void> {
 		const args = files.length === 0 ? ["add", "-A"] : ["add", "--", ...files];
-		await runEffect(cwd, args, { signal });
+		await runEffect(cwd, args, options instanceof AbortSignal ? { signal: options } : options);
 	},
 
 	/** Selectively stage hunks from the provided diff or the current working tree diff. */
@@ -900,6 +908,28 @@ export async function readTree(
 /** Write the current index as a tree and return its object id. */
 export async function writeTree(cwd: string, options: Pick<CommandOptions, "env" | "signal"> = {}): Promise<string> {
 	return (await runText(cwd, ["write-tree"], options)).trim();
+}
+
+export interface CommitTreeOptions {
+	readonly env?: Record<string, string | undefined>;
+	readonly parents?: readonly string[];
+	readonly signal?: AbortSignal;
+}
+
+/**
+ * Create a commit object from an existing tree and return its SHA. Plumbing:
+ * unlike `commit` this touches neither the index nor any ref, and runs no
+ * `pre-commit`/`commit-msg` hook.
+ */
+export async function commitTree(
+	cwd: string,
+	tree: string,
+	message: string,
+	options: CommitTreeOptions = {},
+): Promise<string> {
+	const args = ["commit-tree", tree];
+	for (const parent of options.parents ?? []) args.push("-p", parent);
+	return (await runText(cwd, args, { env: options.env, signal: options.signal, stdin: message })).trim();
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -1073,6 +1103,26 @@ export const ref = {
 		const result = await runCommand(cwd, ["rev-parse", refName], { readOnly: true, signal });
 		if (result.exitCode !== 0) return null;
 		return result.stdout.trim() || null;
+	},
+
+	/**
+	 * Move a ref to `newValue`, but only while it still holds `expectedOldValue`
+	 * (the empty string asserts the ref does not exist yet). Git verifies the old
+	 * value and writes the new one under its own ref lock, so this is an atomic
+	 * compare-and-swap: a concurrent writer that moved the ref first makes this
+	 * throw instead of silently clobbering their commit.
+	 */
+	async update(
+		cwd: string,
+		refName: string,
+		newValue: string,
+		expectedOldValue: string,
+		options: { reason?: string; signal?: AbortSignal } = {},
+	): Promise<void> {
+		const args = ["update-ref"];
+		if (options.reason) args.push("-m", options.reason);
+		args.push(refName, newValue, expectedOldValue);
+		await runEffect(cwd, args, { signal: options.signal });
 	},
 
 	/** Tags pointing at a ref. */
