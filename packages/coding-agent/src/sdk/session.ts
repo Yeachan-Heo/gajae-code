@@ -59,7 +59,7 @@ import { loadCapability, reset as resetCapabilities } from "../capability";
 import { type Rule, ruleCapability, setActiveRules } from "../capability/rule";
 import type { SourceMeta } from "../capability/types";
 import { AUTOROUTING_INACTIVE_WARNING } from "../config/autorouting-contract";
-import { resolveMissingSessionModelRecovery } from "../config/model-profile-activation";
+import { ModelProfileCredentialError, resolveMissingSessionModelRecovery } from "../config/model-profile-activation";
 import { resolveModelProfileName } from "../config/model-profile-contract";
 import { resolveProfileBindings } from "../config/model-profiles";
 import { kNoAuth, ModelRegistry } from "../config/model-registry";
@@ -3796,38 +3796,42 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					(!hasExplicitModel && acceptedPersistedProfileName ? acceptedPersistedProfileName : undefined);
 				modelFallbackMessage = undefined;
 			} else if (deferredMissingSessionRecovery) {
-				const recovery = await resolveMissingSessionModelRecovery({
-					modelRegistry,
-					settings,
-					defaultEntries: defaultModelEntries,
-					skips: restoredAfterExtensions.skips,
-					savedDefault: existingSession.models.default,
-					credentialSessionId,
-					...(persistedProfileOwnsDefault ? { aliasIntent: "preset-equivalent" as const } : {}),
-				});
-				if (
-					recovery?.model &&
-					(!preferredCredentialProvider || recovery.model.provider === preferredCredentialProvider)
-				) {
-					model = recovery.model;
-					if (options.thinkingLevel !== undefined) {
-						thinkingLevel = resolveThinkingLevelForModel(model, options.thinkingLevel);
-					} else if (restoredThinkingLevel !== undefined && restoredThinkingLevel !== ThinkingLevel.Inherit) {
-						thinkingLevel = resolveThinkingLevelForModel(model, restoredThinkingLevel);
-					} else {
-						const recoveredLevel = recovery.explicitThinkingLevel
-							? recovery.thinkingLevel
-							: defaultRoleSpec.explicitThinkingLevel
-								? defaultRoleSpec.thinkingLevel
-								: hasExplicitDefaultThinkingLevel
-									? settings.get("defaultThinkingLevel")
-									: (model.thinking?.defaultLevel ?? settings.get("defaultThinkingLevel"));
-						thinkingLevel = resolveThinkingLevelForModel(model, recoveredLevel);
+				try {
+					const recovery = await resolveMissingSessionModelRecovery({
+						modelRegistry,
+						settings,
+						defaultEntries: defaultModelEntries,
+						skips: restoredAfterExtensions.skips,
+						savedDefault: existingSession.models.default,
+						credentialSessionId,
+						...(persistedProfileOwnsDefault ? { aliasIntent: "preset-equivalent" as const } : {}),
+					});
+					if (
+						recovery?.model &&
+						(!preferredCredentialProvider || recovery.model.provider === preferredCredentialProvider)
+					) {
+						model = recovery.model;
+						if (options.thinkingLevel !== undefined) {
+							thinkingLevel = resolveThinkingLevelForModel(model, options.thinkingLevel);
+						} else if (restoredThinkingLevel !== undefined && restoredThinkingLevel !== ThinkingLevel.Inherit) {
+							thinkingLevel = resolveThinkingLevelForModel(model, restoredThinkingLevel);
+						} else {
+							const recoveredLevel = recovery.explicitThinkingLevel
+								? recovery.thinkingLevel
+								: defaultRoleSpec.explicitThinkingLevel
+									? defaultRoleSpec.thinkingLevel
+									: hasExplicitDefaultThinkingLevel
+										? settings.get("defaultThinkingLevel")
+										: (model.thinking?.defaultLevel ?? settings.get("defaultThinkingLevel"));
+							thinkingLevel = resolveThinkingLevelForModel(model, recoveredLevel);
+						}
+						recoveredSessionDefault = recovery;
+						startupActiveModelProfile = undefined;
+						modelFallbackMessage =
+							"Saved session model is no longer registered; restored the durable default preset instead.";
 					}
-					recoveredSessionDefault = recovery;
-					startupActiveModelProfile = undefined;
-					modelFallbackMessage =
-						"Saved session model is no longer registered; restored the durable default preset instead.";
+				} catch (error) {
+					if (!(error instanceof ModelProfileCredentialError)) throw error;
 				}
 			}
 		}
