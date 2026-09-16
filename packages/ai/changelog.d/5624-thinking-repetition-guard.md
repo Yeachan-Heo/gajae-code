@@ -11,7 +11,9 @@
   The stop is classified as a provider error rather than `aborted`, so the auth
   gateway renders it as HTTP 502 `upstream_error` and telemetry no longer counts
   it as a user cancellation. A genuine caller abort still wins and still reports
-  `aborted`.
+  `aborted`. The trip is terminal and is not auto-retried: a decode loop is
+  deterministic for the submitted context, so replaying it would re-trip the
+  guard and re-bill the full context on every attempt.
 
   The guard applies to the reasoning channel only. Visible text is opt-in via the
   new `repetitionGuard` option (`{ thinking?: number | false; text?: number |

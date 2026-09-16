@@ -131,6 +131,7 @@ import {
 	SERVER_OVERLOADED_PROVIDER_CODE,
 	STREAM_FIRST_EVENT_TIMEOUT_PROVIDER_CODE,
 } from "@gajae-code/ai/utils/fallback-transport";
+import { REPETITION_GUARD_ERROR_CODE } from "@gajae-code/ai/utils/stream-repetition-guard";
 import { AttemptRecordStore } from "./attempt-record-store";
 import {
 	BTW_MAX_ANSWER_UTF8_BYTES,
@@ -20911,6 +20912,11 @@ export class AgentSession {
 		if (message.errorMessage?.startsWith("Managed fallback retried the escaped non-ASCII")) return "terminal";
 		if (message.stopReason !== "error") return "none";
 		if (message.errorKind === "provider_safety_stop") return "terminal";
+		// A decode loop is deterministic for the submitted context: replaying the
+		// identical conversation re-trips the guard and re-bills the full context.
+		// Without this the message carries no transport facts and would fall
+		// through to "unknown", which is admitted for bounded retry (#5627).
+		if (message.errorCode === REPETITION_GUARD_ERROR_CODE) return "terminal";
 		if (message.errorKind === "local_snapshot_failure") return "local_snapshot";
 		if (message.errorKind === "local_buffer_overflow") return "local_buffer_overflow";
 		if (this.#isTypedFirstEventTimeout(message)) return "first_event_timeout";

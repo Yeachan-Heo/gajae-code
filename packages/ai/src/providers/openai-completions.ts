@@ -637,7 +637,11 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 			output.duration = Date.now() - startTime;
 			if (firstTokenTime) output.ttft = firstTokenTime - startTime;
 			// No `transportFailure`: this is a local decision, not a retryable
-			// transport fault, and retry policy keys on that field.
+			// transport fault, and the agent loop's retry admission keys on that
+			// field. The session-layer classifier does not — absent transport facts
+			// it defaults to a bounded retry — so it branches on this `errorCode`
+			// and treats the trip as terminal instead (#5627). Retrying is pointless
+			// anyway: a decode loop is deterministic for the submitted context.
 			stream.push({ type: "error", reason: "error", error: output });
 			stream.end();
 		};
