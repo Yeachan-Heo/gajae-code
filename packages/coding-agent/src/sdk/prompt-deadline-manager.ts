@@ -1,3 +1,4 @@
+import { logger } from "@gajae-code/utils";
 import type { KindAwareReconciliation } from "./bus/kind-aware-reconciliation";
 import type { InvocationCorrelation, InvocationReconciliation } from "./host/session-runtime";
 import {
@@ -15,6 +16,13 @@ const MAX_EXPIRY_RETRIES = 5;
 const MAX_UNCERTAINTY_RETRIES = 3;
 const EXPIRY_RETRY_DELAY_MS = 1_000;
 const UNCERTAINTY_RETRY_DELAY_MS = 1_000;
+
+/**
+ * Hard real-time bound on the best-effort durability hook, shared with
+ * `prompt-deadline-flush` so the manager's race and the flush's own abort
+ * signal cannot drift apart.
+ */
+export const DEADLINE_FLUSH_TIMEOUT_MS = 10_000;
 
 type DeadlineReconciliation = InvocationReconciliation | KindAwareReconciliation;
 
@@ -49,7 +57,8 @@ export class PromptDeadlineManager {
 	readonly #getMaxMs: () => number;
 	readonly #now: () => number;
 	readonly #onExpired?: (correlation: InvocationCorrelation) => void;
-	readonly #onDeadlineExceeded?: (correlation: InvocationCorrelation) => void | Promise<void>;
+	readonly #onDeadlineExceeded?: (correlation: InvocationCorrelation, signal: AbortSignal) => void | Promise<void>;
+	readonly #deadlineFlushTimeoutMs: number;
 
 	constructor(options: {
 		reconciliation: DeadlineReconciliation;
@@ -63,9 +72,16 @@ export class PromptDeadlineManager {
 		 * retired so it can persist work the teardown would otherwise strand; a
 		 * rejection is swallowed and never changes the deadline outcome. Not called
 		 * when a real terminal transition or a real failure won the race, nor when
-		 * renewed progress supersedes this expiry instance.
+		 * renewed progress supersedes this expiry instance. The hook receives an
+		 * abort signal that fires when it outruns `deadlineFlushTimeoutMs`.
 		 */
-		onDeadlineExceeded?: (correlation: InvocationCorrelation) => void | Promise<void>;
+		onDeadlineExceeded?: (correlation: InvocationCorrelation, signal: AbortSignal) => void | Promise<void>;
+		/**
+		 * Hard bound on `onDeadlineExceeded`. Measured with a real timer, not
+		 * `now`, because it guards real subprocesses — which is also why it is a
+		 * constructor option: a fake clock cannot shorten it for tests.
+		 */
+		deadlineFlushTimeoutMs?: number;
 	}) {
 		this.#reconciliation = options.reconciliation;
 		this.#getLeaseMs = options.getLeaseMs;
@@ -73,6 +89,41 @@ export class PromptDeadlineManager {
 		this.#now = options.now ?? Date.now;
 		this.#onExpired = options.onExpired;
 		this.#onDeadlineExceeded = options.onDeadlineExceeded;
+		this.#deadlineFlushTimeoutMs = options.deadlineFlushTimeoutMs ?? DEADLINE_FLUSH_TIMEOUT_MS;
+	}
+
+	/**
+	 * Run the durability hook under a hard real-time bound that ALWAYS settles.
+	 * A rejection is swallowed as before; a hook that never settles is abandoned
+	 * after the bound, with its signal aborted so any git subprocess dies, so the
+	 * caller can retire ownership immediately.
+	 */
+	async #runDeadlineFlush(correlation: InvocationCorrelation): Promise<void> {
+		const hook = this.#onDeadlineExceeded;
+		if (hook === undefined) return;
+		const controller = new AbortController();
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		// An async wrapper so a hook that throws synchronously becomes a rejection.
+		const flushed = (async () => hook(correlation, controller.signal))();
+		// The abandoned promise may still reject long after we stop awaiting it.
+		flushed.catch(() => {});
+		try {
+			const bound = new Promise<"timeout">(resolve => {
+				timer = setTimeout(() => resolve("timeout"), this.#deadlineFlushTimeoutMs);
+				// Never let a pending bound keep the process alive.
+				(timer as unknown as { unref?: () => void }).unref?.();
+			});
+			if ((await Promise.race([flushed.then(() => "flushed" as const), bound])) === "timeout") {
+				controller.abort(new Error(`prompt deadline flush exceeded ${this.#deadlineFlushTimeoutMs}ms`));
+				logger.warn(
+					`sdk: prompt deadline flush exceeded its ${this.#deadlineFlushTimeoutMs}ms bound; abandoning it and continuing teardown`,
+				);
+			}
+		} catch {
+			// A failing hook never changes the deadline outcome.
+		} finally {
+			if (timer !== undefined) clearTimeout(timer);
+		}
 	}
 
 	#clearTimer(key: string): void {
@@ -205,12 +256,14 @@ export class PromptDeadlineManager {
 		if (this.#backOffIfSuperseded(key, lease, generation)) return;
 		// Durability before teardown (#5583). This is the only path that retires a
 		// prompt as prompt_deadline_exceeded, and it runs after every supersession
-		// check, so a renewed lease never reaches it. Fully guarded: a throwing or
-		// slow hook must not touch the terminal transition or lease bookkeeping
-		// below, which the outcome above has already made durable.
-		try {
-			await this.#onDeadlineExceeded?.(correlation);
-		} catch {}
+		// check, so a renewed lease never reaches it. The wait is BOUNDED, not just
+		// guarded (#5623 review round 2): a hook that never settles — a blocking
+		// git lock, a credential prompt, a hanging pre-commit hook — would leave
+		// `#onExpired` and `clear` below unreachable, stranding lifecycle ownership
+		// and the lease after the outcome was already finalized. A try/catch cannot
+		// rescue a promise that never settles, so the flush is raced against a real
+		// timer and abandoned if it outruns it.
+		await this.#runDeadlineFlush(correlation);
 		// Retire pending ownership ONLY after durable terminal confirmation with
 		// no superseding progress (#4668 review P1): retiring earlier strands an
 		// accepted/in-flight invocation without an owner, retry, or deadline

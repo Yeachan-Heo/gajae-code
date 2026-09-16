@@ -5217,9 +5217,9 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			// Persist the agent's uncommitted work before the retirement below tears
 			// the session down (#5583). Best effort by contract: failures are logged
 			// inside the flush and the deadline outcome is unaffected.
-			onDeadlineExceeded: async () => {
+			onDeadlineExceeded: async (_correlation, signal) => {
 				if (options.settings?.get("sdk.flushWorktreeOnDeadline" as never) === false) return;
-				await flushWorktreeOnPromptDeadline(ctx.cwd);
+				await flushWorktreeOnPromptDeadline(ctx.cwd, signal);
 			},
 			onExpired: correlation => {
 				const owner = lifecycleOwnerHolder.state;
