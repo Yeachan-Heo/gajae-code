@@ -2020,7 +2020,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 							credentialSessionId,
 							...(persistedProfileOwnsDefault ? { aliasIntent: "preset-equivalent" as const } : {}),
 						});
-						deferredMissingSessionRecovery = !recovery?.model;
+						deferredMissingSessionRecovery = true;
 						if (
 							recovery?.model &&
 							(!preferredCredentialProvider || recovery.model.provider === preferredCredentialProvider)
@@ -2072,7 +2072,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 
 		if (
 			thinkingLevel === undefined &&
-			restoredThinkingLevel === undefined &&
+			(restoredThinkingLevel === undefined || restoredThinkingLevel === ThinkingLevel.Inherit) &&
 			recoveredSessionDefault?.explicitThinkingLevel
 		) {
 			thinkingLevel = recoveredSessionDefault.thinkingLevel;
