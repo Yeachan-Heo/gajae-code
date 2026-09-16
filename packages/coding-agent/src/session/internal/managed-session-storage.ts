@@ -570,6 +570,25 @@ const SCRUBBED_REMNANT_PREFIXES = [
 	".gjc-replace-retry-",
 ] as const;
 
+/**
+ * Replacement staging is named `.<destination-basename>.<uuid>.replacement` and
+ * is published by exchanging it with the destination, so the staging NAME
+ * survives publication while pointing at the retired predecessor. On a POSIX
+ * exchange that leaves the successor inode reachable under two names until the
+ * staging name is unlinked, and a crash between exchange and unlink strands it.
+ *
+ * A stranded staging name that still resolves to the LIVE transcript inode is
+ * not evidence of anything: every managed capture opens no-follow and rejects
+ * `nlink > 1` (`captureManagedFileNoFollowLimit`, `inspectManagedFileNoFollow`),
+ * so the extra name makes the transcript permanently unlistable and unopenable
+ * — `--resume <id>` reports "Session not found." and `--continue` reports
+ * "Could not inspect managed session: read-failed", while the bytes are intact
+ * and resume by explicit path still works. Reaping the surplus NAME (never the
+ * inode) restores both paths without touching transcript content.
+ */
+const REPLACEMENT_STAGING_NAME =
+	/^\.(?<destination>.+)\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.replacement$/;
+
 /** In-flight protocol steps complete in milliseconds; anything older is abandoned. */
 const SCRUBBED_REMNANT_MIN_AGE_MS = 15 * 60 * 1000;
 
@@ -591,6 +610,39 @@ function reportScrubbedProtocolRemnantReap(reaped: number, failures: number): Sc
 }
 
 /**
+ * True when `name` is replacement staging whose inode is ALSO reachable under
+ * its own published destination in the same directory. Publication exchanged
+ * the two names, so the surplus staging name aliases the live successor and
+ * pins its `nlink` above one; reaping the staging name restores the
+ * single-link invariant every managed capture requires.
+ *
+ * Two distinct names resolving to one inode already prove `nlink > 1`, so
+ * identity equality is the whole test — the staging name always carries a
+ * leading dot the destination does not, and can never be its own destination.
+ *
+ * A staging name that does NOT alias its destination is left untouched: it is
+ * either an unpublished attempt or a retired predecessor, and both are
+ * recovery evidence owned by receipt reconciliation.
+ */
+function stagingAliasesPublishedDestination(directory: string, name: string): boolean {
+	const destination = REPLACEMENT_STAGING_NAME.exec(name)?.groups?.destination;
+	if (!destination) return false;
+	try {
+		const staging = fs.lstatSync(path.join(directory, name), { bigint: true });
+		if (!staging.isFile() || staging.isSymbolicLink()) return false;
+		const published = fs.lstatSync(path.join(directory, destination), { bigint: true });
+		return (
+			published.isFile() &&
+			!published.isSymbolicLink() &&
+			published.dev === staging.dev &&
+			published.ino === staging.ino
+		);
+	} catch {
+		return false;
+	}
+}
+
+/**
  * Best-effort removal of scrubbed write-protocol remnants from one managed
  * directory. Only zero-length, single-link, non-symlink regular files whose
  * names carry a terminal remnant prefix and whose timestamps are older than
@@ -599,6 +651,11 @@ function reportScrubbedProtocolRemnantReap(reaped: number, failures: number): Sc
  * or detached receipts retained as evidence) are never touched. A proven
  * concurrent disappearance (ENOENT) is benign; all other I/O failures are
  * returned and logged once without aborting scope preparation.
+ *
+ * Stranded replacement staging that aliases its own published destination is
+ * reaped by the same pass. That entry is neither zero-length nor single-link,
+ * so the terminal-remnant filters above can never reach it, yet leaving it in
+ * place bricks resume for the session it aliases.
  */
 export function reapScrubbedProtocolRemnantsSync(
 	directory: string,
@@ -614,11 +671,13 @@ export function reapScrubbedProtocolRemnantsSync(
 	let reaped = 0;
 	let failures = 0;
 	for (const name of names) {
-		if (!SCRUBBED_REMNANT_PREFIXES.some(prefix => name.startsWith(prefix))) continue;
+		const terminalRemnant = SCRUBBED_REMNANT_PREFIXES.some(prefix => name.startsWith(prefix));
+		if (!terminalRemnant && !stagingAliasesPublishedDestination(directory, name)) continue;
 		const pathname = path.join(directory, name);
 		try {
 			const named = fs.lstatSync(pathname);
-			if (!named.isFile() || named.isSymbolicLink() || named.nlink !== 1 || named.size !== 0) continue;
+			if (!named.isFile() || named.isSymbolicLink()) continue;
+			if (terminalRemnant && (named.nlink !== 1 || named.size !== 0)) continue;
 			if (named.mtimeMs > cutoff) continue;
 			fs.unlinkSync(pathname);
 			reaped += 1;
@@ -635,7 +694,8 @@ const SCRUBBED_REMNANT_REAP_BATCH_SIZE = 256;
 /**
  * Async twin of {@link reapScrubbedProtocolRemnantsSync} with the same safety
  * filters (terminal remnant prefix, zero-length, single-link, non-symlink,
- * older than the age gate), yielding between bounded batches. Long-lived
+ * older than the age gate, plus stranded staging that aliases its own
+ * published destination), yielding between bounded batches. Long-lived
  * processes reap per-session descendant directories through this path so a
  * legacy oversized directory cannot starve timers or sibling subagents while
  * it is being drained (issue #4394).
@@ -655,12 +715,14 @@ export async function reapScrubbedProtocolRemnants(
 	let failures = 0;
 	let scanned = 0;
 	for (const name of names) {
-		if (!SCRUBBED_REMNANT_PREFIXES.some(prefix => name.startsWith(prefix))) continue;
+		const terminalRemnant = SCRUBBED_REMNANT_PREFIXES.some(prefix => name.startsWith(prefix));
+		if (!terminalRemnant && !stagingAliasesPublishedDestination(directory, name)) continue;
 		if (++scanned % SCRUBBED_REMNANT_REAP_BATCH_SIZE === 0) await Bun.sleep(0);
 		const pathname = path.join(directory, name);
 		try {
 			const named = await fsp.lstat(pathname);
-			if (!named.isFile() || named.isSymbolicLink() || named.nlink !== 1 || named.size !== 0) continue;
+			if (!named.isFile() || named.isSymbolicLink()) continue;
+			if (terminalRemnant && (named.nlink !== 1 || named.size !== 0)) continue;
 			if (named.mtimeMs > cutoff) continue;
 			await fsp.unlink(pathname);
 			reaped += 1;
