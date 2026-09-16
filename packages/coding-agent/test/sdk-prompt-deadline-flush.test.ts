@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { existsSync } from "node:fs";
 import * as fsp from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -358,5 +359,150 @@ describe("PromptDeadlineManager deadline flush wiring (#5583)", () => {
 		expect(manager.has(correlation)).toBe(true);
 		expect(manager.deadlineAt(correlation)).toBe(50);
 		manager.clearAll();
+	});
+});
+
+/**
+ * #5623 review round 3: the autosave stages the whole worktree before it
+ * commits, so a failing commit hook or an abort landing in between used to
+ * leave the user's previously-unstaged and untracked edits staged with no
+ * commit to show for it — silently changing whatever they committed next.
+ * An attempt that produces no commit must leave the index exactly as it found it.
+ */
+describe("deadline autosave index rollback (#5623)", () => {
+	/** A repo whose index mixes all three states the rollback has to preserve. */
+	async function initMixedIndexRepo(prefix: string): Promise<string> {
+		const root = await initRepo(prefix);
+		// Staged by the user beforehand.
+		await fsp.writeFile(path.join(root, "user-staged.ts"), "export const staged = 1;\n");
+		await run(root, ["add", "user-staged.ts"]);
+		// Tracked and modified, deliberately NOT staged.
+		await fsp.writeFile(path.join(root, "README.md"), "edited by the user\n");
+		// Untracked.
+		await fsp.writeFile(path.join(root, "agent-work.ts"), "export const work = true;\n");
+		return root;
+	}
+
+	/** The two index facts the rollback must preserve byte-for-byte. */
+	async function indexState(root: string): Promise<{ cached: string[]; status: string[] }> {
+		const lines = (text: string) => text.split("\n").filter(Boolean).sort();
+		return {
+			cached: lines(await run(root, ["diff", "--cached", "--name-only"])),
+			status: lines(await run(root, ["status", "--porcelain=v1"])),
+		};
+	}
+
+	async function writePreCommitHook(root: string, script: string): Promise<void> {
+		const hook = path.join(root, ".git", "hooks", "pre-commit");
+		await fsp.mkdir(path.dirname(hook), { recursive: true });
+		await fsp.writeFile(hook, script, { mode: 0o755 });
+	}
+
+	async function gitStdin(cwd: string, args: string[], stdin: string): Promise<void> {
+		const proc = Bun.spawn(["git", ...args], {
+			cwd,
+			stdin: Buffer.from(stdin),
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const [code, stderr] = await Promise.all([proc.exited, new Response(proc.stderr).text()]);
+		if (code !== 0) throw new Error(`git ${args.join(" ")} failed: ${stderr}`);
+	}
+
+	async function hashBlob(cwd: string, text: string): Promise<string> {
+		const proc = Bun.spawn(["git", "hash-object", "-w", "--stdin"], {
+			cwd,
+			stdin: Buffer.from(text),
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const [, stdout] = await Promise.all([proc.exited, new Response(proc.stdout).text()]);
+		return stdout.trim();
+	}
+
+	test("a failing commit hook leaves the index exactly as the user had it", async () => {
+		const root = await initMixedIndexRepo("gjc-deadline-hook-fail-");
+		await writePreCommitHook(root, "#!/bin/sh\nexit 1\n");
+		const before = await indexState(root);
+		const commitsBefore = (await run(root, ["rev-list", "--count", "HEAD"])).trim();
+
+		expect(await flushWorktreeOnPromptDeadline(root)).toBeUndefined();
+
+		expect((await run(root, ["rev-list", "--count", "HEAD"])).trim()).toBe(commitsBefore);
+		const after = await indexState(root);
+		// `--cached` is the assertion that actually pins the bug: a status-only
+		// check passes while the index is wrong.
+		expect(after.cached).toEqual(before.cached);
+		expect(after.status).toEqual(before.status);
+	});
+
+	test("an abort between staging and the commit rolls the index back", async () => {
+		const root = await initMixedIndexRepo("gjc-deadline-abort-mid-");
+		// The sentinel lives under .git/ so it never shows up in `git status`.
+		// The hook SUCCEEDS after its delay on purpose: that makes the abort the
+		// only way this run can end without a commit, so the assertions below
+		// cannot be satisfied by a hook failure instead.
+		const started = path.join(root, ".git", "hook-started");
+		await writePreCommitHook(root, `#!/bin/sh\ntouch ${JSON.stringify(started)}\nsleep 3\nexit 0\n`);
+		const before = await indexState(root);
+		const commitsBefore = (await run(root, ["rev-list", "--count", "HEAD"])).trim();
+
+		const controller = new AbortController();
+		const flushing = flushWorktreeOnPromptDeadline(root, controller.signal);
+		// Abort only once the hook is demonstrably running, which proves
+		// `git add -A` has already staged everything.
+		await waitFor(() => existsSync(started), "the pre-commit hook to start");
+		controller.abort(new Error("deadline flush bound elapsed"));
+
+		// Aborting kills `git commit` but not the hook it already spawned, and the
+		// hook holds the inherited stdout pipe, so the call settles only once the
+		// hook exits. Teardown does not wait on this — `runBoundedDeadlineFlush`
+		// abandons the promise — but the rollback still has to land when it does.
+		expect(await flushing).toBeUndefined();
+		expect((await run(root, ["rev-list", "--count", "HEAD"])).trim()).toBe(commitsBefore);
+		const after = await indexState(root);
+		// The rollback ran under its own signal: `bound` is already aborted here,
+		// so a restore composed with it could never have run.
+		expect(after.cached).toEqual(before.cached);
+		expect(after.status).toEqual(before.status);
+	}, 30_000);
+
+	test("never stages an index it cannot snapshot", async () => {
+		const root = await initMixedIndexRepo("gjc-deadline-unmerged-");
+		// A real unmerged index: `git write-tree` refuses on stage 1/2/3 entries,
+		// so the autosave has no rollback available and must not start.
+		const [base, ours, theirs] = await Promise.all([
+			hashBlob(root, "base\n"),
+			hashBlob(root, "ours\n"),
+			hashBlob(root, "theirs\n"),
+		]);
+		await gitStdin(
+			root,
+			["update-index", "--index-info"],
+			`100644 ${base} 1\tconflicted.txt\n100644 ${ours} 2\tconflicted.txt\n100644 ${theirs} 3\tconflicted.txt\n`,
+		);
+		const before = await indexState(root);
+		const commitsBefore = (await run(root, ["rev-list", "--count", "HEAD"])).trim();
+
+		expect(await flushWorktreeOnPromptDeadline(root)).toBeUndefined();
+
+		expect((await run(root, ["rev-list", "--count", "HEAD"])).trim()).toBe(commitsBefore);
+		const after = await indexState(root);
+		expect(after.cached).toEqual(before.cached);
+		expect(after.status).toEqual(before.status);
+	});
+
+	test("still commits the whole mixed index on the success path", async () => {
+		const root = await initMixedIndexRepo("gjc-deadline-mixed-success-");
+
+		expect(await flushWorktreeOnPromptDeadline(root)).toBeDefined();
+
+		// A clean tree also proves the snapshot was NOT restored after a commit
+		// that landed: doing so would leave a phantom "revert everything" staged.
+		expect(await run(root, ["status", "--porcelain=v1"])).toBe("");
+		expect((await run(root, ["rev-list", "--count", "HEAD"])).trim()).toBe("2");
+		expect(await run(root, ["show", "HEAD:agent-work.ts"])).toBe("export const work = true;\n");
+		expect(await run(root, ["show", "HEAD:user-staged.ts"])).toBe("export const staged = 1;\n");
+		expect(await run(root, ["show", "HEAD:README.md"])).toBe("edited by the user\n");
 	});
 });
