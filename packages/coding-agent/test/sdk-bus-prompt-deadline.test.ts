@@ -11,6 +11,8 @@ import {
 } from "../src/config/settings";
 import type { ExtensionActions, ExtensionAPI } from "../src/extensibility/extensions/types";
 import { createNotificationsExtension } from "../src/sdk/bus";
+import type { DurableExecutionReconciliationRecord } from "../src/sdk/bus/reconciliation-store";
+import * as gitUtils from "../src/utils/git";
 
 /**
  * The notification/SDK bus host route and the SDK-only host route are mutually
@@ -51,13 +53,22 @@ async function waitFor(predicate: () => boolean, label: string, timeoutMs = 20_0
 	}
 }
 
+/**
+ * The autosave only honours the `sdk.flushWorktreeOnDeadline` schema default in
+ * a linked worktree the session owns. These fixtures run in a plain temp repo —
+ * a primary checkout — so the default double writes the setting explicitly, the
+ * way a user opting in would. `has` is the signal the bus reads to tell an
+ * explicit value apart from a schema default.
+ */
 function deadlineSettings(cwd: string, leaseMs: number, maxRuntimeMs: number): Settings {
 	return {
 		get: (key: string) => {
 			if (key === "sdk.promptDeadlineMs") return leaseMs;
 			if (key === "sdk.promptMaxRuntimeMs") return maxRuntimeMs;
+			if (key === "sdk.flushWorktreeOnDeadline") return true;
 			return undefined;
 		},
+		has: (key: string) => key === "sdk.flushWorktreeOnDeadline",
 		getAgentDir: () => cwd,
 	} as unknown as Settings;
 }
@@ -191,6 +202,7 @@ interface BusSession {
 	terminals: (correlation: { commandId: string; turnId: string }) => Record<string, unknown>[];
 	socket: WebSocket;
 	cwd: string;
+	sessionId: string;
 	acceptFailure: AcceptFailure;
 	/** Deadline callbacks the bus scheduled, captured around acceptance only. */
 	scheduled: (() => void)[];
@@ -342,6 +354,7 @@ async function acceptPrompt(
 	return {
 		socket,
 		cwd,
+		sessionId,
 		acceptFailure,
 		scheduled,
 		scheduledDelays,
@@ -368,6 +381,27 @@ async function acceptPrompt(
 					frame.turnId === target.turnId,
 			),
 	};
+}
+
+/**
+ * The bus's own durable reconciliation document for this session's prompt. This
+ * is the record restart recovery reads, so it is the only thing that can say
+ * whether a crash at a given instant would report the prompt as finished.
+ */
+async function promptRecord(session: BusSession): Promise<DurableExecutionReconciliationRecord | undefined> {
+	const file = path.join(session.cwd, ".gjc", "state", ".sdk-reconciliation", `${session.sessionId}.json`);
+	if (!fs.existsSync(file)) return undefined;
+	const document = JSON.parse(await fsPromises.readFile(file, "utf8")) as {
+		records: DurableExecutionReconciliationRecord[];
+	};
+	return document.records.find(
+		record => record.commandId === session.correlation.commandId && record.turnId === session.correlation.turnId,
+	);
+}
+
+/** The failure code of a durable outcome; `undefined` for any non-failed shape. */
+function failureCode(outcome: DurableExecutionReconciliationRecord["outcome"]): string | undefined {
+	return outcome?.kind === "failed" ? outcome.code : undefined;
 }
 
 async function shutdown(session: BusSession): Promise<void> {
@@ -855,6 +889,80 @@ test("the bus deadline path autosaves the dirty worktree before ownership teardo
 		// The terminal itself is untouched by the autosave.
 		expect(session.deadlineTerminals()).toHaveLength(1);
 		expect((session.deadlineTerminals()[0]?.error as { message?: string }).message).toBe("Prompt deadline exceeded.");
+	} finally {
+		await shutdown(session);
+	}
+}, 30_000);
+
+test("the bus deadline autosave runs before the durable terminal, not after it", async () => {
+	// #5623 review round 4, finding 2. The autosave used to run AFTER
+	// `finalizeOutcome`, which made it the one step a crash could silently skip:
+	// the durable record already said `prompt_deadline_exceeded` — terminal, done —
+	// while the work it claims to have saved was still only in the worktree. It now
+	// runs inside the claim→finalize window, so a death anywhere in it leaves the
+	// record PENDING and restart recovery retries the prompt.
+	//
+	// The autosave is held open at its staging step so the durable document can be
+	// read at exactly that instant.
+	const staged = Promise.withResolvers<void>();
+	const release = Promise.withResolvers<void>();
+	const originalStage = gitUtils.stage.files;
+	const stageSpy = spyOn(gitUtils.stage, "files").mockImplementation(
+		async (...args: Parameters<typeof originalStage>) => {
+			await originalStage(...args);
+			staged.resolve();
+			await release.promise;
+		},
+	);
+	const session = await acceptPrompt("autosave-order", LEASE_MS, 60_000, { prepareCwd: initDirtyGitRepo });
+	try {
+		await staged.promise;
+		// Mid-autosave: the claim is durable, the terminal deliberately is not.
+		const midFlush = await promptRecord(session);
+		expect(midFlush).toBeDefined();
+		expect(midFlush?.status).not.toBe("failed");
+		expect(failureCode(midFlush?.pendingOutcome)).toBe("prompt_deadline_exceeded");
+		expect(midFlush?.outcome).toBeUndefined();
+
+		release.resolve();
+		await waitFor(() => session.deadlineTerminals().length > 0, "deadline terminal");
+
+		// Only now is the terminal durable — and the work it reports is saved.
+		expect(failureCode((await promptRecord(session))?.outcome)).toBe("prompt_deadline_exceeded");
+		expect(await git(session.cwd, ["show", "HEAD:agent-work.ts"])).toBe("export const done = true;\n");
+	} finally {
+		release.resolve();
+		stageSpy.mockRestore();
+		await shutdown(session);
+	}
+}, 30_000);
+
+test("the bus never autosaves a checkout the session does not own by default", async () => {
+	// #5623 review round 4, finding 4. `sdk.flushWorktreeOnDeadline` defaults to
+	// true, but a default-on autosave in the user's primary checkout would `git
+	// add -A` whatever they happen to have open next to the agent. Only an
+	// explicitly written `true` (or a linked worktree) may autosave there.
+	const session = await acceptPrompt("autosave-unowned", LEASE_MS, 60_000, {
+		prepareCwd: initDirtyGitRepo,
+		// No `has`, so every read of the flag comes from the schema default.
+		settings: cwd =>
+			({
+				get: (key: string) => {
+					if (key === "sdk.promptDeadlineMs") return LEASE_MS;
+					if (key === "sdk.promptMaxRuntimeMs") return 60_000;
+					return undefined;
+				},
+				getAgentDir: () => cwd,
+			}) as unknown as Settings,
+	});
+	try {
+		await waitFor(() => session.deadlineTerminals().length > 0, "deadline terminal");
+		await Bun.sleep(200);
+
+		// The deadline still terminalizes; only the autosave is skipped.
+		expect((await git(session.cwd, ["rev-list", "--count", "HEAD"])).trim()).toBe("1");
+		expect(await git(session.cwd, ["status", "--porcelain", "--", "agent-work.ts"])).toBe("?? agent-work.ts\n");
+		expect(session.deadlineTerminals()).toHaveLength(1);
 	} finally {
 		await shutdown(session);
 	}
