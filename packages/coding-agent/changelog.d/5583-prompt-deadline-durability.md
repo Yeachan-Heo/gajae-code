@@ -1,0 +1,4 @@
+### Fixed
+
+- The SDK prompt deadline now arms at the declared `sdk.promptDeadlineMs` default everywhere. Raising the schema default to 60 minutes left the SDK bus and session host each holding their own hardcoded 30-minute fallback, so a settings lookup that missed still retired a legitimate long turn at the old deadline (#5583).
+- A prompt retired by its deadline no longer tears the session down with the agent's work uncommitted. Uncommitted changes in the session's own worktree are autosaved as a `wip(<branch>): autosave on prompt deadline` commit before teardown, so the next run resumes from a commit instead of re-reasoning. The flush is best effort and never changes the deadline outcome: it is skipped on a clean tree, outside a git worktree, and when renewed progress supersedes the expiry, and any git failure is logged and swallowed. Set `sdk.flushWorktreeOnDeadline` to `false` to opt out (#5583).
