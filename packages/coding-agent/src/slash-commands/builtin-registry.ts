@@ -45,6 +45,7 @@ import {
 } from "../setup/provider-onboarding";
 import { parseThinkingLevel } from "../thinking";
 import { getDisplayChangelogEntries } from "../utils/changelog";
+import { buildConversationTitleInput, generateSessionTitle } from "../utils/title-generator";
 import { handleAsideAcp } from "./helpers/aside";
 import { buildAutoroutingStatusReport } from "./helpers/autorouting-status";
 import { buildContextReportText } from "./helpers/context-report";
@@ -138,6 +139,38 @@ function toSlashCommandRuntime(runtime: TuiSlashCommandRuntime): SlashCommandRun
 		},
 		notifyConfigChanged: () => ctx.notifyConfigChanged?.(),
 	};
+}
+
+async function regenerateSessionTitle(runtime: SlashCommandRuntime): Promise<SlashCommandResult> {
+	try {
+		const input = buildConversationTitleInput(runtime.session.messages);
+		if (!input) {
+			return usage("Nothing to summarize yet — pass a title: /rename <title>", runtime);
+		}
+
+		const generated = await generateSessionTitle(
+			input,
+			runtime.session.modelRegistry,
+			runtime.settings,
+			runtime.session.credentialSessionId,
+			runtime.session.model,
+			provider => runtime.session.agent.metadataForProvider(provider),
+		);
+		if (!generated) {
+			return usage("Could not generate a session title — pass one: /rename <title>", runtime);
+		}
+
+		const stored = await runtime.sessionManager.setSessionName(generated, "user");
+		if (!stored) {
+			await runtime.output("Session name not changed (a user-set name takes precedence).");
+			return commandConsumed();
+		}
+		await runtime.notifyTitleChanged?.();
+		await runtime.output(`Session renamed to ${generated}.`);
+		return commandConsumed();
+	} catch (err) {
+		return usage(`Rename failed: ${errorMessage(err)}`, runtime);
+	}
 }
 
 async function updateSessionStar(
@@ -2134,11 +2167,11 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 	},
 	{
 		name: "rename",
-		description: "Rename the current session",
-		inlineHint: "<title>",
+		description: "Rename the current session, or regenerate the title from the conversation",
+		inlineHint: "[title]",
 		allowArgs: true,
 		handle: async (command, runtime) => {
-			if (!command.args) return usage("Usage: /rename <title>", runtime);
+			if (!command.args) return regenerateSessionTitle(runtime);
 			const ok = await runtime.sessionManager.setSessionName(command.args, "user");
 			if (!ok) {
 				await runtime.output("Session name not changed (a user-set name takes precedence).");
@@ -2151,8 +2184,8 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 		handleTui: async (command, runtime) => {
 			const title = command.args.trim();
 			if (!title) {
-				runtime.ctx.showError("Usage: /rename <title>");
 				runtime.ctx.editor.setText("");
+				await runtime.ctx.handleRenameCommand();
 				return;
 			}
 			runtime.ctx.editor.setText("");
