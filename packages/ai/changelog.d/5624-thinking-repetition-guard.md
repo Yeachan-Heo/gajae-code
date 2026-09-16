@@ -34,6 +34,12 @@
   a fixed literal at the provider, the gateway substitutes the same bounded
   envelope its non-streaming path already used, and the sample survives only in
   local `logger.debug` diagnostics.
+- Classify a runaway turn whose final repeat arrives without a trailing newline.
+  The guard closed a line only on `\n` and a token only on whitespace, so a
+  stream that ended mid-unit left the last copy uncounted and the turn reported a
+  healthy completion. The guard is now finalized at end of stream — on the
+  normal-completion path only, so a stream that threw mid-repeat still keeps its
+  own transport facts.
 - Strip leaked chat-template tool fences (`<|tool_call_end|>` and friends) from
   rendered thinking, including fences split across streaming chunk boundaries.
   The visible text channel is deliberately untouched, so a fence token the

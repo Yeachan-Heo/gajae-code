@@ -1334,6 +1334,25 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 			// ordinary thinking text after all.
 			emitThinkingText(thinkingFenceStripper.flush(), lastThinkingSignature);
 
+			// Close each guard's in-progress unit now that no more text is coming:
+			// a final repeat with no trailing newline would otherwise go uncounted
+			// and the runaway turn would read as a healthy completion. Must run
+			// after the fence flush above, whose output feeds the thinking guard.
+			//
+			// Normal-completion path ONLY. Never finalize in the catch block: a
+			// stream that threw mid-repeat must keep its own transport facts rather
+			// than be reclassified as a decode loop (#5627 r4, commit c2aa25d30).
+			// No abort either — the stream has already ended, so aborting would set
+			// `repetitionSelfAbort` for nothing.
+			for (const [guard, channel] of [
+				[textRepetitionGuard, "text"],
+				[thinkingRepetitionGuard, "thinking"],
+			] as const) {
+				if (!guard) continue;
+				guard.finalize();
+				noteRepetitionTrip(guard, channel);
+			}
+
 			if (kimiHealer) {
 				const trailing = kimiHealer.flushPending();
 				if (trailing.length > 0) appendTextDelta(trailing);

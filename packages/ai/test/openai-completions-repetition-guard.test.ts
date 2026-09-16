@@ -497,4 +497,22 @@ describe("chat-completions: streamed repetition guard (#5624)", () => {
 		expect(result.errorMessage).not.toContain("invalid");
 		expect(result.errorMessage).not.toContain("forbidden");
 	});
+
+	// `feed()` closes a line only on `\n` and a token only on whitespace, so a
+	// runaway stream whose last copy arrives unterminated used to finish as a
+	// healthy turn. The guard is finalized at end of stream instead (#5627 r5).
+	it("classifies a runaway turn whose final repeat has no trailing newline", async () => {
+		const state: DeliveryState = { delivered: 0 };
+		const events: Array<SseChunk | "[DONE]"> = [];
+		for (let i = 0; i < THRESHOLD - 1; i++) events.push(chunk({ reasoning_content: `${SENTENCE}\n` }));
+		// The threshold-completing copy never gets its newline.
+		events.push(chunk({ reasoning_content: SENTENCE }), chunk({}, "stop"), "[DONE]");
+		global.fetch = streamingFetch(events, state);
+
+		const result = await streamOpenAICompletions(model(), context(), { apiKey: "test" }).result();
+
+		expect(result.stopReason).toBe("error");
+		expect(result.errorCode).toBe(REPETITION_GUARD_ERROR_CODE);
+		expect(result.errorMessage).toBe(REPETITION_GUARD_STOP_MESSAGE);
+	});
 });

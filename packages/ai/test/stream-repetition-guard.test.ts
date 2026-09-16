@@ -140,4 +140,68 @@ describe("StreamRepetitionGuard", () => {
 			expect(guard.takeTrip()).toBeUndefined();
 		});
 	});
+	// `feed()` closes a line only on `\n` and a token only on whitespace, so the
+	// final copy of a runaway stream that ends mid-unit was never counted and the
+	// turn read as healthy. `finalize()` closes the in-progress unit (#5627 r5).
+	describe("finalize", () => {
+		it("trips on a final line that never got its newline", () => {
+			const guard = new StreamRepetitionGuard();
+			for (let i = 0; i < DEFAULT_REPETITION_THRESHOLD - 1; i++) guard.feed(`${SENTENCE}\n`);
+			// The threshold-completing copy arrives unterminated.
+			guard.feed(SENTENCE);
+
+			expect(guard.tripped).toBe(false);
+			guard.finalize();
+			expect(guard.tripped).toBe(true);
+			expect(guard.trip).toMatchObject({ kind: "line" });
+		});
+
+		it("trips on a final n-gram token with no trailing whitespace", () => {
+			const guard = new StreamRepetitionGuard();
+			// An 8-token unit is the shortest n-gram window the detector compares,
+			// and 8 x 12 = 96 tokens is the first count at which it can fire. Feed
+			// 95 closed tokens, so the 96th is the one still open in the buffer.
+			const unit = "a1 a2 a3 a4 a5 a6 a7 a8 ";
+			// No newlines anywhere, so only the n-gram detector can catch this.
+			for (let i = 0; i < DEFAULT_REPETITION_THRESHOLD - 1; i++) guard.feed(unit);
+			// Last copy arrives without its trailing space: `a8` never closes.
+			guard.feed(unit.trimEnd());
+
+			expect(guard.tripped).toBe(false);
+			guard.finalize();
+			expect(guard.tripped).toBe(true);
+			expect(guard.trip).toMatchObject({ kind: "ngram" });
+		});
+
+		it("is idempotent and still yields exactly one trip", () => {
+			const guard = new StreamRepetitionGuard();
+			for (let i = 0; i < DEFAULT_REPETITION_THRESHOLD - 1; i++) guard.feed(`${SENTENCE}\n`);
+			guard.feed(SENTENCE);
+
+			guard.finalize();
+			guard.finalize();
+			guard.finalize();
+
+			expect(guard.takeTrip()).toMatchObject({ kind: "line" });
+			expect(guard.takeTrip()).toBeUndefined();
+		});
+
+		it("does not trip a healthy stream", () => {
+			const guard = new StreamRepetitionGuard();
+			guard.feed("Step 1: checking a.ts\nStep 2: checking b.ts\nStep 3: done");
+
+			guard.finalize();
+
+			expect(guard.tripped).toBe(false);
+			expect(guard.takeTrip()).toBeUndefined();
+		});
+
+		it("emits nothing", () => {
+			const guard = new StreamRepetitionGuard();
+			guard.feed("trailing text with no newline");
+			// `finalize()` returns void: everything feed() returned is already
+			// rendered by the time it runs.
+			expect(guard.finalize()).toBeUndefined();
+		});
+	});
 });

@@ -99,6 +99,7 @@ export class StreamRepetitionGuard {
 	#token = "";
 	#trip: StreamRepetitionTrip | undefined;
 	#tripTaken = false;
+	#finalized = false;
 
 	constructor(options?: StreamRepetitionGuardOptions) {
 		this.#threshold = Math.max(2, options?.threshold ?? DEFAULT_REPETITION_THRESHOLD);
@@ -149,6 +150,26 @@ export class StreamRepetitionGuard {
 			if (this.#trip) return text.slice(0, i + 1);
 		}
 		return text;
+	}
+
+	/**
+	 * Close the in-progress unit at end of stream and run detection once more.
+	 *
+	 * `feed()` only closes a token on whitespace and a line on `\n`, so a stream
+	 * whose final repeat arrives without a trailing newline left the last copy
+	 * uncounted and the turn read as a healthy completion (#5627 review r5).
+	 *
+	 * Emits nothing — everything `feed()` returned has already been rendered by
+	 * the time this runs. A trip found here therefore classifies the turn while
+	 * the last copy is already on screen; that is intended. Idempotent.
+	 */
+	finalize(): void {
+		if (this.#finalized || this.#trip) return;
+		this.#finalized = true;
+		// Token first: the trailing partial must enter `#tokens` so the n-gram
+		// scan sees it before the line comparison closes the buffer.
+		this.#closeToken();
+		this.#closeLine();
 	}
 
 	#closeLine(): void {
