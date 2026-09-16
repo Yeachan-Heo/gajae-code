@@ -982,6 +982,62 @@ test("ACP does not retry a mid-task prompt_failed once the turn executed a tool 
 	}
 });
 
+test("ACP does not retry a mid-task prompt_failed after the turn emitted partial assistant content (review P1)", async () => {
+	const fixture = await createFixture();
+	try {
+		// First turn completes normally, moving the session past its first prompt.
+		const first = prompt(fixture, "first turn ok");
+		await bounded(fixture.promptDelivered, "first prompt delivery");
+		fixture.sendStopped("end_turn");
+		expect(await bounded(first, "first turn settlement")).toEqual({ stopReason: "end_turn" });
+
+		// The mid-task turn starts and streams a partial assistant reply, which the client renders
+		// into its transcript, before failing prompt_failed. No tool ran, but the published chunks
+		// cannot be revoked: a re-submit would append a second reply to the half-written one and
+		// leave the user a duplicated, garbled turn. The failure is surfaced instead.
+		const second = prompt(fixture, "mid-task turn speaks then fails empty");
+		await waitFor(() => fixture.promptDeliveryCount() === 2, "second prompt delivery");
+		fixture.sendTerminal({
+			type: "agent_start",
+			sessionId: "prompt-terminal-session",
+			commandId: "prompt-terminal-command-2",
+			turnId: "prompt-terminal-turn-2",
+		});
+		fixture.sendTerminal({
+			type: "event",
+			sessionId: "prompt-terminal-session",
+			commandId: "prompt-terminal-command-2",
+			turnId: "prompt-terminal-turn-2",
+			payload: {
+				event_type: "message_end",
+				event: {
+					type: "message_end",
+					message: { role: "assistant", content: [{ type: "text", text: "partial reply" }] },
+				},
+			},
+		});
+		// The partial reply is published to the client before the turn fails — that publication is
+		// exactly what makes the retry unsafe.
+		await waitFor(
+			() =>
+				fixture.updates.some(
+					update =>
+						update.update.sessionUpdate === "agent_message_chunk" &&
+						update.update.content.type === "text" &&
+						update.update.content.text === "partial reply",
+				),
+			"partial assistant chunk publication",
+		);
+		fixture.sendFailed("prompt_failed");
+		await expect(bounded(second, "partial-content failure settlement")).rejects.toMatchObject({
+			code: "prompt_failed",
+		});
+		expect(fixture.promptDeliveryCount()).toBe(2);
+	} finally {
+		fixture.dispose();
+	}
+});
+
 test("ACP rejects a concurrent prompt while the mid-task retry owns the session (review P1)", async () => {
 	const fixture = await createFixture();
 	try {

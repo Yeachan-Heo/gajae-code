@@ -169,6 +169,8 @@ interface PromptWaiter {
 	observedTurnActivity: boolean;
 	/** True once a prompt-owned tool execution frame was observed; vetoes a first-turn retry that would re-run it. */
 	observedToolExecution: boolean;
+	/** True once this prompt published assistant or thought content; vetoes a retry that would duplicate it. */
+	observedAssistantContent: boolean;
 	/** Coordinates a prompt-control rejection racing an acknowledged ACP cancellation. */
 	cancelAttempt?: Promise<boolean>;
 	/** Whether ANY overlapping cancel attempt for this prompt was acknowledged:
@@ -231,6 +233,8 @@ type SessionRecord = {
 	promptObservedActivity?: boolean;
 	/** Whether the current prompt attempt executed a tool; reset per attempt, vetoes a first-turn retry that would re-run it. */
 	promptObservedToolExecution?: boolean;
+	/** Whether the current prompt attempt published assistant or thought content; reset per attempt, vetoes a retry that would duplicate it. */
+	promptObservedAssistantContent?: boolean;
 	/** Owner token held across the first-turn retry backoff; a non-owner prompt is rejected as a conflict (review P1). */
 	pendingFirstPromptRetry?: FirstPromptRetryReservation;
 	/** Owner token held across a mid-task retry; a non-owner prompt is rejected as a conflict (review P1). */
@@ -1893,6 +1897,10 @@ export class AcpAgent implements Agent {
 	 *   user's instruction and its non-idempotent side effects a second time. The first-turn
 	 *   retry vetoes that for the same reason; recovery is worth nothing if it double-applies
 	 *   effects the failed turn already committed (review P1).
+	 * - and NEVER once the turn published assistant or thought content
+	 *   (`promptObservedAssistantContent`). Those chunks are already rendered in the client's
+	 *   transcript and cannot be revoked, so the retry's own output would append to a partial
+	 *   reply rather than replace it, leaving the user a duplicated, garbled turn (review P1).
 	 * - never once the client has asked to cancel;
 	 * - at most one re-submit (`ACP_MID_TASK_PROMPT_MAX_RETRIES`).
 	 */
@@ -1902,6 +1910,7 @@ export class AcpAgent implements Agent {
 		if (record.cancelRequested) return false;
 		if (!record.promptObservedActivity) return false;
 		if (record.promptObservedToolExecution) return false;
+		if (record.promptObservedAssistantContent) return false;
 		return error instanceof AcpSdkAdapterError && error.code === "prompt_failed";
 	}
 
@@ -2002,6 +2011,7 @@ export class AcpAgent implements Agent {
 		// observed doing work, never a prior attempt's activity.
 		record.promptObservedActivity = false;
 		record.promptObservedToolExecution = false;
+		record.promptObservedAssistantContent = false;
 		const { promise: response, resolve, reject } = Promise.withResolvers<PromptResponse>();
 		const waiter: PromptWaiter = {
 			acknowledged: false,
@@ -2020,6 +2030,7 @@ export class AcpAgent implements Agent {
 			activity: new PromptActivity(),
 			observedTurnActivity: false,
 			observedToolExecution: false,
+			observedAssistantContent: false,
 			resolve,
 			reject,
 		};
@@ -2172,6 +2183,7 @@ export class AcpAgent implements Agent {
 					this.#observePromptActivity(waiter, deferredFrame);
 					if (waiter.observedTurnActivity) record.promptObservedActivity = true;
 					if (waiter.observedToolExecution) record.promptObservedToolExecution = true;
+					if (waiter.observedAssistantContent) record.promptObservedAssistantContent = true;
 					observedDeferredActivity = true;
 				}
 			}
@@ -3171,6 +3183,7 @@ export class AcpAgent implements Agent {
 		this.#observePromptActivity(waiter, frame);
 		if (waiter.observedTurnActivity) record.promptObservedActivity = true;
 		if (waiter.observedToolExecution) record.promptObservedToolExecution = true;
+		if (waiter.observedAssistantContent) record.promptObservedAssistantContent = true;
 		this.#armPromptWatchdog(id, record, waiter);
 	}
 
@@ -3464,6 +3477,17 @@ export class AcpAgent implements Agent {
 				notification.update.content.type === "text"
 			)
 				promptOwner.emittedAssistantText += notification.update.content.text;
+			// Any chunk the client already rendered — text, an image, a thought — is transcript a
+			// re-submit cannot take back, so it vetoes the mid-task retry that would duplicate it
+			// (review P1). The `agent_failed` diagnostic rides the same update shape but is the
+			// failure report itself, not model output, and on a terminal is never even published.
+			if (
+				promptOwner &&
+				event.type !== "agent_failed" &&
+				(notification.update.sessionUpdate === "agent_message_chunk" ||
+					notification.update.sessionUpdate === "agent_thought_chunk")
+			)
+				promptOwner.observedAssistantContent = true;
 			// The prompt rejection carries the sanitized failure diagnostic. Publishing
 			// a second session update after settlement would be stale as soon as the client
 			// starts a replacement turn, and an in-flight transport write cannot be revoked.
