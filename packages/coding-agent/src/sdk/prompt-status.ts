@@ -75,6 +75,14 @@ export type SdkPromptFailureCategory =
 	| "agent_runtime"
 	| "deadline"
 	| "unknown";
+/**
+ * Whether the failure class says an identical re-submission could still succeed.
+ * Derived from `SdkPromptFailureCategory` alone (see `promptFailureRetryability`)
+ * so a consumer never has to re-implement the category matrix or parse a message.
+ * `unknown` is preserved rather than collapsed into `terminal`: an uncertain
+ * attribution is not evidence that the turn is unrecoverable.
+ */
+export type SdkPromptFailureRetryability = "transient" | "terminal" | "unknown";
 export type SdkPromptTerminalOutcome =
 	| { kind: "stopped"; reason: SdkPromptStopReason; provenance: "agent" | "client_cancel" }
 	| {

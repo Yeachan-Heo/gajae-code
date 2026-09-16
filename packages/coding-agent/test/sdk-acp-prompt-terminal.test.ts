@@ -1,9 +1,14 @@
 import { expect, setDefaultTimeout, test, vi } from "bun:test";
 import * as path from "node:path";
-import type { AgentSideConnection, PromptRequest, SessionNotification } from "@agentclientprotocol/sdk";
+import {
+	type AgentSideConnection,
+	type PromptRequest,
+	RequestError,
+	type SessionNotification,
+} from "@agentclientprotocol/sdk";
 import { logger, TempDir } from "@gajae-code/utils";
 import packageJson from "../package.json" with { type: "json" };
-import { AcpAgent } from "../src/modes/acp/acp-agent";
+import { AcpAgent, acpRequestFailure } from "../src/modes/acp/acp-agent";
 import { AcpSdkAdapter } from "../src/sdk/acp/adapter";
 import { writeBrokerDiscovery } from "../src/sdk/broker/discovery";
 import {
@@ -642,6 +647,68 @@ test("ACP prompt rejects prompt_failed terminal outcomes with their code", async
 		fixture.dispose();
 	}
 });
+
+/**
+ * Issue #5615: the whole chain, from a forced host terminal frame through settlement
+ * to the JSON-RPC payload an ACP client actually receives. The classification used to
+ * stop at the rejection; these assert it survives the wire boundary, and that a
+ * transient class is distinguishable from a terminal one without reading the message.
+ */
+for (const { label, providerCode, category, retryability } of [
+	{
+		label: "a transient provider/transport failure",
+		providerCode: "upstream_stream_interrupted",
+		category: "provider_transport",
+		retryability: "transient",
+	},
+	{
+		label: "a terminal provider rejection",
+		providerCode: "provider_http_429",
+		category: "provider_rejected",
+		retryability: "terminal",
+	},
+] as const) {
+	test(`ACP publishes ${label} as typed prompt-failure data (issue #5615)`, async () => {
+		const fixture = await createFixture();
+		try {
+			// A later turn, so this is the mid-session path rather than the first-turn
+			// retry class: the earlier turn settles before this one is submitted.
+			const first = prompt(fixture, "first turn");
+			await bounded(fixture.promptDelivered, "first prompt delivery");
+			fixture.sendStopped("end_turn");
+			await bounded(first, "first turn completion");
+
+			const pending = prompt(fixture, "mid-session turn");
+			await waitFor(() => fixture.promptDeliveryCount() === 2, "mid-session prompt delivery");
+			fixture.sendFailed("prompt_failed", undefined, providerCode);
+			const rejection = await bounded(
+				pending.then(
+					() => undefined,
+					(error: unknown) => error,
+				),
+				"mid-session prompt failure",
+			);
+
+			const failure = acpRequestFailure(rejection) as RequestError;
+			expect(failure).toBeInstanceOf(RequestError);
+			// Pinned ACP core-v1 conformance keeps this class on -32603.
+			expect(failure.code).toBe(-32603);
+			expect(failure.data).toMatchObject({
+				code: "prompt_failed",
+				details: "Prompt submission failed.",
+				phase: "submission",
+				category,
+				retryability,
+				providerCode,
+			});
+			// The host frame's own message ("prompt_failed from fixture") is provider text
+			// and must not ride out on the payload.
+			expect(JSON.stringify(failure)).not.toContain("from fixture");
+		} finally {
+			fixture.dispose();
+		}
+	});
+}
 
 test("ACP retries a first-turn prompt_failed after the turn started, then recovers (issue #5574)", async () => {
 	const fixture = await createFixture();

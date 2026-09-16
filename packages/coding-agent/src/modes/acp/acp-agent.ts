@@ -53,7 +53,13 @@ import { canonicalSessionCwd } from "../../sdk/broker/session-index";
 import { readSdkBrokerDiscovery, SdkClient, SdkClientError } from "../../sdk/client";
 import type { AbortScope } from "../../sdk/host/control/operations";
 import { SYNTHETIC_PROVIDER_ID } from "../../sdk/model-profile-namespace";
-import { failedPromptOutcome, isSdkPromptFailurePhase, rephaseFailedOutcome } from "../../sdk/prompt-failure";
+import {
+	failedPromptOutcome,
+	isSafePromptFailureCode,
+	isSdkPromptFailurePhase,
+	promptFailureRetryability,
+	rephaseFailedOutcome,
+} from "../../sdk/prompt-failure";
 import type { SdkPromptTerminalOutcome } from "../../sdk/prompt-status";
 import { PromptActivity, type PromptWatchdogClock, systemPromptWatchdogClock } from "../../sdk/prompt-watchdog";
 import { validateRequiredPromptText } from "../../sdk/protocol/adapter-validation";
@@ -618,12 +624,36 @@ type SdkPromptFailedOutcome = Extract<SdkPromptTerminalOutcome, { kind: "failed"
  * category — so settlement carries that classification instead of discarding it into a bare
  * `AcpSdkAdapterError` (review P1, issue #5574).
  */
-class AcpPromptFailureError extends AcpSdkAdapterError {
+export class AcpPromptFailureError extends AcpSdkAdapterError {
 	readonly failure: SdkPromptFailedOutcome;
 	constructor(failure: SdkPromptFailedOutcome) {
 		super(failure.code, failure.message);
 		this.failure = failure;
 	}
+}
+
+/**
+ * The wire projection of a prompt terminal's classification (issue #5615).
+ *
+ * `super(failure.code, failure.message)` above narrows the error to the generic
+ * `prompt_failed` plus its fixed redacted message, so the classification the
+ * terminal already computed used to die at the JSON-RPC boundary: an ACP client
+ * saw only `-32603 {code, details}` and could not tell a transient provider blip
+ * from a dead session without parsing English. These fields carry it across.
+ *
+ * `providerCode` is re-checked against the safe-token rule rather than trusted:
+ * `terminalOutcome` accepts the host's `providerCode` on a `typeof` check alone,
+ * and this is the first path that puts it on the wire, so an unbounded value is
+ * dropped instead of becoming a leak of provider text (the redaction contract in
+ * `sanitizePromptFailure`). A dropped or absent code is omitted, never nulled.
+ */
+function promptFailureWireData(failure: SdkPromptFailedOutcome): Record<string, string> {
+	return {
+		phase: failure.phase,
+		category: failure.category,
+		retryability: promptFailureRetryability(failure.category),
+		...(isSafePromptFailureCode(failure.providerCode) ? { providerCode: failure.providerCode } : {}),
+	};
 }
 
 /**
@@ -1251,9 +1281,17 @@ export function acpRequestFailure(error: unknown): unknown {
 	const code = typeof error === "object" && error !== null && "code" in error ? error.code : undefined;
 	if (typeof code !== "string") return error;
 	const message = error instanceof Error ? error.message : code;
+	// A prompt terminal additionally publishes its classification (issue #5615). The
+	// spread is empty for every other error, so their payloads are byte-identical to
+	// before. `code`/`details` and the JSON-RPC code itself are untouched either way:
+	// this enriches `data`, it does not restate the redacted message.
+	const data =
+		error instanceof AcpPromptFailureError
+			? { code, details: message, ...promptFailureWireData(error.failure) }
+			: { code, details: message };
 	switch (code) {
 		case "authentication_failed":
-			return RequestError.authRequired({ code, details: message }, message);
+			return RequestError.authRequired(data, message);
 		// `not_found` stays -32603 with its discriminator in `data`: ACP's
 		// `resourceNotFound` (-32002) is a URI-addressed resource error, and an unknown
 		// session id is not a resource URI. Pinned ACP core-v1 conformance also requires
@@ -1261,12 +1299,15 @@ export function acpRequestFailure(error: unknown): unknown {
 		case "invalid_input":
 		case "unsupported":
 		case "unsupported_content":
-			return RequestError.invalidParams({ code, details: message }, message);
+			return RequestError.invalidParams(data, message);
 		default:
 			// The remaining internal codes (conflict, unavailable, busy, …) have no ACP
 			// counterpart and stay -32603. Keep the discriminator in `data` so a client can
-			// branch on retry/reconnect instead of parsing an English message.
-			return RequestError.internalError({ code, details: message }, message);
+			// branch on retry/reconnect instead of parsing an English message. `prompt_failed`
+			// and `prompt_deadline_exceeded` land here and keep -32603 by design: pinned ACP
+			// core-v1 conformance expects -32603/-32000 for this class, so the added
+			// classification travels in `data` rather than in a renumbered code.
+			return RequestError.internalError(data, message);
 	}
 }
 
