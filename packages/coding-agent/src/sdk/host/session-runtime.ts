@@ -5219,7 +5219,13 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			// inside the flush and the deadline outcome is unaffected.
 			onDeadlineExceeded: async (_correlation, signal) => {
 				if (options.settings?.get("sdk.flushWorktreeOnDeadline" as never) === false) return;
-				await flushWorktreeOnPromptDeadline(ctx.cwd, signal);
+				// `has` is true only for a value the user actually wrote, so this
+				// separates an explicit opt-in from the schema default. The flush only
+				// honours the default inside a linked worktree the session owns.
+				const explicitOptIn =
+					options.settings?.has?.("sdk.flushWorktreeOnDeadline" as never) === true &&
+					options.settings?.get("sdk.flushWorktreeOnDeadline" as never) === true;
+				await flushWorktreeOnPromptDeadline(ctx.cwd, { explicitOptIn, signal });
 			},
 			onExpired: correlation => {
 				const owner = lifecycleOwnerHolder.state;
