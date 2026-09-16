@@ -295,7 +295,7 @@ describe("AgentSession switchSession resumeModelBehavior", () => {
 			settings,
 			modelRegistry,
 		});
-		vi.spyOn(modelRegistry, "getAvailable").mockReturnValue([codex]);
+		const getAvailable = vi.spyOn(modelRegistry, "getAvailable").mockReturnValue([codex]);
 		vi.spyOn(modelRegistry, "getAll").mockReturnValue([codex]);
 		const setConfiguredChain = vi.spyOn(session, "setConfiguredModelChain");
 		const ensureOnDisk = vi.spyOn(session.sessionManager, "ensureOnDisk");
@@ -324,6 +324,16 @@ describe("AgentSession switchSession resumeModelBehavior", () => {
 		const warningOrder = notice.mock.invocationCallOrder.at(-1);
 		if (commitOrder === undefined || warningOrder === undefined) throw new Error("Expected commit and warning calls");
 		expect(commitOrder).toBeLessThan(warningOrder);
+
+		const recoveredRuntimeState = session.getDefaultFallbackRuntimeState();
+		await targetSession!.dispose();
+		targetSession = undefined;
+		const opus = getBundledModel("anthropic", "claude-opus-4-8")!;
+		const failedSessionFile = await createPersistedTarget(opus, settings);
+		getAvailable.mockReturnValue([]);
+
+		expect(await session.switchSession(failedSessionFile)).toBe(false);
+		expect(session.getDefaultFallbackRuntimeState()).toEqual(recoveredRuntimeState);
 	});
 
 	it.each([

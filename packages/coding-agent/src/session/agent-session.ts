@@ -243,6 +243,7 @@ import {
 	resolveModelChainWithAuth,
 	resolveModelRoleValue,
 	type ScopedModelSelection,
+	splitSelectorThinkingSuffix,
 } from "../config/model-resolver";
 import { type ModelSelectorValue, normalizeModelSelectorValue } from "../config/model-selector-value";
 import { expandPromptTemplate, type PromptTemplate } from "../config/prompt-templates";
@@ -16565,14 +16566,21 @@ export class AgentSession {
 		const profileDefault = Array.isArray(bindings.defaultSelector)
 			? bindings.defaultSelector[0]
 			: bindings.defaultSelector;
-		const configuredDefaultModel = configuredDefault ? parseModelString(configuredDefault) : undefined;
-		const profileDefaultModel = profileDefault ? parseModelString(profileDefault) : undefined;
+		const configuredDefaultIdentity = configuredDefault
+			? splitSelectorThinkingSuffix(configuredDefault).selector.trim().toLowerCase()
+			: undefined;
+		const profileDefaultIdentity = profileDefault
+			? splitSelectorThinkingSuffix(profileDefault).selector.trim().toLowerCase()
+			: undefined;
+		const configuredDefaultModel = configuredDefaultIdentity
+			? parseModelString(configuredDefaultIdentity)
+			: undefined;
+		const profileDefaultModel = profileDefaultIdentity ? parseModelString(profileDefaultIdentity) : undefined;
 		const ownsConfiguredDefault =
 			configuredDefaultModel && profileDefaultModel
-				? configuredDefaultModel.provider.toLowerCase() === profileDefaultModel.provider.toLowerCase() &&
-					configuredDefaultModel.id.toLowerCase() === profileDefaultModel.id.toLowerCase()
-				: profileDefault !== undefined &&
-					configuredDefault?.trim().toLowerCase() === profileDefault.trim().toLowerCase();
+				? configuredDefaultModel.provider === profileDefaultModel.provider &&
+					configuredDefaultModel.id === profileDefaultModel.id
+				: profileDefaultIdentity !== undefined && configuredDefaultIdentity === profileDefaultIdentity;
 		const owned =
 			role === "default"
 				? runtimeDefaultIdentity?.origin === "runtime" || ownsConfiguredDefault
