@@ -20,7 +20,7 @@ It is specific to this repository and should not be installed as a user-global h
 .gjc/hooks/pre/bash.ts
 ```
 
-The example invokes `hol-guard command test <command> --json` directly and proceeds only when Guard reports both an explicitly benign classification and `minimum_action: allow`. A timeout, CLI failure, malformed result, review requirement, or stricter action blocks the Bash tool call.
+The example invokes `hol-guard command test <command> --json` directly and proceeds only when Guard reports both an explicitly benign classification and `minimum_action: allow`. Because that Guard command evaluates command text rather than caller-supplied Bash environment overrides, the example blocks any `env` override instead of allowing an execution shape Guard did not inspect. A timeout, CLI failure, malformed result, review requirement, unsupported environment override, or stricter action blocks the Bash tool call. Timeout cleanup waits for the Guard child process and escalates to a forceful kill within a bounded grace period before returning.
 
 Install HOL Guard separately and keep `hol-guard` available on `PATH`. This example is additive to the target project's own authentication, permissions, review, and recovery controls.
 
