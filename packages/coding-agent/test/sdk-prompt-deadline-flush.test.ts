@@ -292,4 +292,51 @@ describe("PromptDeadlineManager deadline flush wiring (#5583)", () => {
 		expect(await run(root, ["status", "--porcelain"])).toBe("?? live.ts\n");
 		manager.clearAll();
 	});
+
+	/**
+	 * #5623 review round 2: the flush is an await like any other in `#onDeadline`,
+	 * and up to ten seconds long, so progress can land and renew the lease while it
+	 * runs. Without a fence AFTER it, the stale expiry retires ownership and clears
+	 * the lease of a prompt that is demonstrably live again.
+	 */
+	test("does not retire ownership when progress lands during the flush", async () => {
+		let now = 0;
+		const flushStarted = Promise.withResolvers<void>();
+		const releaseFlush = Promise.withResolvers<void>();
+		const { api, finalized } = reconciliation();
+		let expired = 0;
+		const manager = new PromptDeadlineManager({
+			reconciliation: api as never,
+			getLeaseMs: () => 20,
+			getMaxMs: () => 60_000,
+			now: () => now,
+			deadlineFlushTimeoutMs: 5_000,
+			onDeadlineExceeded: async () => {
+				flushStarted.resolve();
+				await releaseFlush.promise;
+			},
+			onExpired: () => {
+				expired += 1;
+			},
+		});
+		const correlation = { commandId: "flush-renew-cmd", turnId: "flush-renew-turn" };
+		manager.onAccepted(correlation);
+		now = 20;
+
+		// The flush is in flight and the deadline outcome is already finalized.
+		await flushStarted.promise;
+		expect(finalized).toContain("prompt_deadline_exceeded");
+		// Progress renews the same lease object and bumps its generation.
+		now = 30;
+		manager.onProgress(correlation, 30);
+		releaseFlush.resolve();
+		await Bun.sleep(50);
+
+		// The post-flush fence backs this stale expiry off instead of tearing down
+		// a renewed prompt, and reschedules so it keeps a live deadline.
+		expect(expired).toBe(0);
+		expect(manager.has(correlation)).toBe(true);
+		expect(manager.deadlineAt(correlation)).toBe(50);
+		manager.clearAll();
+	});
 });
