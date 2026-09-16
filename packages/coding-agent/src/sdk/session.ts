@@ -1973,6 +1973,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			(!hasExplicitModel && acceptedPersistedProfileName ? acceptedPersistedProfileName : undefined);
 		let savedDefaultWasUnresolved = false;
 		let deferredMissingSessionRecovery = false;
+		let retainedRecoveryBindingsAfterLateRestore = false;
 		let recoveredSessionDefault:
 			| {
 					entries: string[];
@@ -3768,6 +3769,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				(!preferredCredentialProvider || restoredAfterExtensions.model.provider === preferredCredentialProvider)
 			) {
 				model = restoredAfterExtensions.model;
+				retainedRecoveryBindingsAfterLateRestore = recoveredSessionDefault !== undefined;
 				if (options.thinkingLevel !== undefined) {
 					thinkingLevel = resolveThinkingLevelForModel(model, options.thinkingLevel);
 				} else if (restoredThinkingLevel !== undefined && restoredThinkingLevel !== ThinkingLevel.Inherit) {
@@ -4914,6 +4916,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			providerSessionState: options.providerSessionState,
 		});
 		session.setActiveModelProfile(startupActiveModelProfile);
+		if (retainedRecoveryBindingsAfterLateRestore) session.markStartupRecoveryBindingsRequired();
 		if (recoveredSessionDefault)
 			session.installRecoveredDefaultFallbackChain(
 				recoveredSessionDefault.entries,
