@@ -41,7 +41,7 @@ gjc setup hermes \
   --install
 ```
 
-The generated setup is model-agnostic and worktree-isolated. By default it renders `GJC_COORDINATOR_MCP_SESSION_COMMAND` as `gjc --worktree`, which is a typed selector for SDK lifecycle creation—not a shell command the bridge runs. Spawned sessions launch inside a GJC-managed sibling worktree while GJC retains the source repository as project identity. Users who need a stable named branch can set `--worktree-name`:
+The generated setup is model-agnostic and worktree-isolated. By default it renders `GJC_COORDINATOR_MCP_SESSION_COMMAND` as `gjc --worktree`, which is a typed selector for SDK lifecycle creation—not a shell command the bridge runs. Spawned sessions launch inside a GJC-managed repo-local worktree while GJC retains the source repository as project identity. Users who need a stable named branch can set `--worktree-name`:
 
 ```bash
 gjc setup hermes \

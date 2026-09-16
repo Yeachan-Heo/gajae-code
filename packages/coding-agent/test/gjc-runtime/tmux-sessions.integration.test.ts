@@ -4,6 +4,7 @@ import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { publishManagedOwnerSupervisorAuthoritySync } from "@gajae-code/coding-agent/gjc-runtime/managed-owner-supervisor";
 import {
 	buildGjcTmuxExactOptionTarget,
 	buildGjcTmuxProfileCommands,
@@ -149,6 +150,7 @@ try {
 			GJC_COORDINATOR_SESSION_ID: sessionId,
 			GJC_MANAGED_OWNER_RUN_ID: runId,
 			GJC_MANAGED_OWNER_INCARNATION: incarnation,
+			GJC_MANAGED_OWNER_SUPERVISED: "1",
 			GJC_MANAGED_OWNER_COMMAND_JSON: JSON.stringify([process.execPath, childScript]),
 		};
 		isolatedServers.push({ env, stateDir, scopeName });
@@ -170,6 +172,45 @@ try {
 			{ stdout: "pipe", stderr: "pipe", env },
 		);
 		if (created.exitCode !== 0) throw new Error(created.stderr.toString());
+		const identity = Bun.spawnSync(
+			[
+				env.GJC_TMUX_COMMAND!,
+				"display-message",
+				"-p",
+				"-t",
+				sessionName,
+				"-F",
+				"#{pane_pid}\t#{session_id}\t#{pid}",
+			],
+			{ stdout: "pipe", stderr: "pipe", env },
+		);
+		if (identity.exitCode !== 0) throw new Error(identity.stderr.toString());
+		const [rawSupervisorPid, nativeSessionId, rawServerPid] = identity.stdout.toString().trim().split("\t");
+		const supervisorPid = Number(rawSupervisorPid);
+		const serverPid = Number(rawServerPid);
+		const readStartTime = (pid: number) => {
+			const stat = fsSync.readFileSync(`/proc/${pid}/stat`, "utf8");
+			return stat
+				.slice(stat.lastIndexOf(")") + 1)
+				.trim()
+				.split(/\s+/)[19];
+		};
+		const supervisorStartTime = readStartTime(supervisorPid);
+		const serverStartTime = readStartTime(serverPid);
+		if (!nativeSessionId || !supervisorStartTime || !serverStartTime)
+			throw new Error("managed authority unavailable");
+		publishManagedOwnerSupervisorAuthoritySync({
+			schema_version: 1,
+			kind: "managed_owner_supervisor_authority",
+			state_dir: stateDir,
+			session_id: sessionId,
+			generation,
+			supervisor_pid: supervisorPid,
+			supervisor_start_time: supervisorStartTime,
+			server_pid: serverPid,
+			server_start_time: serverStartTime,
+			native_session_id: nativeSessionId,
+		});
 		for (let attempt = 0; attempt < 150 && !fsSync.existsSync(childReadyFile); attempt += 1) await Bun.sleep(20);
 		if (!fsSync.existsSync(childReadyFile)) {
 			const errorFile = path.join(stateDir, "supervisor-error");

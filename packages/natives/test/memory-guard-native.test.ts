@@ -76,4 +76,88 @@ describe("probeWindowsJobMemory", () => {
 			),
 		).toThrow("currentExecutablePath");
 	});
+
+	it("rejects stale same-version bindings without portable recovery-root capability", () => {
+		const bindings = {
+			__piNativesVCurrent: () => undefined,
+			__piNativesPublishOutcomeV1: () => undefined,
+			renameNoReplacePath: () => undefined,
+			probeWindowsJobMemory: () => undefined,
+			currentExecutablePath: () => undefined,
+		};
+		expect(() =>
+			validateLoadedBindings(
+				{ versionSentinelExport: "__piNativesVCurrent", packageVersion: "current" },
+				bindings,
+				"cached-addon.node",
+			),
+		).toThrow("openPortableRecoveryFsRoot");
+	});
+
+	it("rejects stale same-version bindings without retained root enumeration", () => {
+		const bindings = {
+			__piNativesVCurrent: () => undefined,
+			__piNativesPublishOutcomeV1: () => undefined,
+			renameNoReplacePath: () => undefined,
+			probeWindowsJobMemory: () => undefined,
+			currentExecutablePath: () => undefined,
+			openPortableRecoveryFsRoot: () => undefined,
+			PortableRecoveryFsRoot: class {
+				identity(): void {}
+			},
+		};
+		expect(() =>
+			validateLoadedBindings(
+				{ versionSentinelExport: "__piNativesVCurrent", packageVersion: "current" },
+				bindings,
+				"cached-addon.node",
+			),
+		).toThrow("PortableRecoveryFsRoot.list");
+	});
+
+	it("rejects stale same-version bindings without retained root read and close", () => {
+		const bindings = {
+			__piNativesVCurrent: () => undefined,
+			__piNativesPublishOutcomeV1: () => undefined,
+			renameNoReplacePath: () => undefined,
+			probeWindowsJobMemory: () => undefined,
+			currentExecutablePath: () => undefined,
+			openPortableRecoveryFsRoot: () => undefined,
+			PortableRecoveryFsRoot: class {
+				identity(): void {}
+				list(): void {}
+			},
+		};
+		expect(() =>
+			validateLoadedBindings(
+				{ versionSentinelExport: "__piNativesVCurrent", packageVersion: "current" },
+				bindings,
+				"cached-addon.node",
+			),
+		).toThrow("PortableRecoveryFsRoot.read");
+	});
+
+	it("rejects stale same-version bindings without retained root publication", () => {
+		const bindings = {
+			__piNativesVCurrent: () => undefined,
+			__piNativesPublishOutcomeV1: () => undefined,
+			renameNoReplacePath: () => undefined,
+			probeWindowsJobMemory: () => undefined,
+			currentExecutablePath: () => undefined,
+			openPortableRecoveryFsRoot: () => undefined,
+			PortableRecoveryFsRoot: class {
+				identity(): void {}
+				list(): void {}
+				read(): void {}
+				close(): void {}
+			},
+		};
+		expect(() =>
+			validateLoadedBindings(
+				{ versionSentinelExport: "__piNativesVCurrent", packageVersion: "current" },
+				bindings,
+				"cached-addon.node",
+			),
+		).toThrow("PortableRecoveryFsRoot.writeExclusive");
+	});
 });

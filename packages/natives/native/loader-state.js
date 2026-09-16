@@ -757,6 +757,26 @@ export function validateLoadedBindings(ctx, bindings, candidate) {
 	if (typeof bindings.currentExecutablePath !== "function") {
 		throw new Error(`Loaded ${candidate} but it lacks required executable identity capability \`currentExecutablePath\`.`);
 	}
+	if (typeof bindings.openPortableRecoveryFsRoot !== "function") {
+		throw new Error(
+			`Loaded ${candidate} but it lacks required portable recovery-root capability \`openPortableRecoveryFsRoot\`.`,
+		);
+	}
+	if (
+		typeof bindings.PortableRecoveryFsRoot?.prototype?.identity !== "function" ||
+		typeof bindings.PortableRecoveryFsRoot?.prototype?.list !== "function" ||
+		typeof bindings.PortableRecoveryFsRoot?.prototype?.read !== "function" ||
+		typeof bindings.PortableRecoveryFsRoot?.prototype?.close !== "function" ||
+		typeof bindings.PortableRecoveryFsRoot?.prototype?.writeExclusive !== "function" ||
+		typeof bindings.PortableRecoveryFsRoot?.prototype?.replace !== "function"
+	) {
+		throw new Error(
+			`Loaded ${candidate} but it lacks required portable recovery-root capabilities ` +
+				"`PortableRecoveryFsRoot.identity`, `PortableRecoveryFsRoot.list`, " +
+				"`PortableRecoveryFsRoot.read`, `PortableRecoveryFsRoot.close`, " +
+				"`PortableRecoveryFsRoot.writeExclusive`, and `PortableRecoveryFsRoot.replace`.",
+		);
+	}
 }
 
 function buildHelpMessage(ctx) {

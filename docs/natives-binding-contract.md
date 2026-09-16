@@ -117,7 +117,7 @@ Native enums are represented in generated declarations and also appended to `mod
 ## Error behavior and caveats
 
 - Addon load failure or unsupported platform throws during package import from `native/index.js`.
-- The loader does not verify the full export set after `require(...)`; stale or mismatched binaries surface as native load errors or missing members at use sites.
+- After `require(...)`, the loader validates required version and capability sentinels, including `openPortableRecoveryFsRoot` and the retained-root methods used by lifecycle recovery, and fails at load time when they are absent. This validation is intentionally not exhaustive for every addon export, so an unvalidated stale or mismatched member can still surface at its use site.
 - N-API conversion validates basic argument conversion, but TS optional fields do not guarantee semantic validity for untyped callers.
 - Numeric enum declarations do not prevent out-of-range numeric values from untyped callers unless the Rust function rejects them during conversion.
 - Callback exports use napi-rs `ThreadsafeFunction` shape: `(error: Error | null, value) => void`. Native code generally emits successful values; hard failures reject/throw through the owning call.

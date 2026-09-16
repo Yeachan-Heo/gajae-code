@@ -4,7 +4,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 
-import { openRecoveryFsRoot } from "../native/index.js";
+import { openPortableRecoveryFsRoot, openRecoveryFsRoot } from "../native/index.js";
 
 const temporaryDirectories: string[] = [];
 
@@ -18,6 +18,62 @@ afterEach(async () => {
 	await Promise.all(
 		temporaryDirectories.splice(0).map(directory => fs.rm(directory, { recursive: true, force: true })),
 	);
+});
+
+describe.skipIf(process.platform === "win32")("portable retained recovery filesystem root", () => {
+	it("keeps reads bound to the opened directory across a pathname ABA swap", async () => {
+		const root = await temporaryDirectory();
+		const retained = `${root}-retained`;
+		await fs.writeFile(path.join(root, "receipt"), "original\n");
+		await fs.writeFile(path.join(root, "original-only"), "original\n");
+		await fs.symlink("receipt", path.join(root, "receipt-link"));
+		const originalIdentity = await fs.stat(root);
+		const authority = openPortableRecoveryFsRoot(root);
+		await fs.rename(root, retained);
+		await fs.mkdir(root);
+		await fs.writeFile(path.join(root, "receipt"), "forged\n");
+		await fs.writeFile(path.join(root, "forged-only"), "forged\n");
+
+		expect(authority.identity()).toMatchObject({
+			ok: true,
+			identity: { dev: originalIdentity.dev.toString(), ino: originalIdentity.ino.toString() },
+		});
+		expect(authority.list(1024)).toEqual(["original-only", "receipt", "receipt-link"]);
+		expect(authority.read("missing", 1024)).toMatchObject({ ok: false, code: "not_found" });
+		expect(authority.read("receipt-link", 1024)).toMatchObject({ ok: false, code: "untrusted_path" });
+		expect(authority.writeExclusive("marker", Buffer.from("marker\n"))).toMatchObject({ ok: true });
+		expect(authority.writeExclusive("marker", Buffer.from("duplicate\n"))).toMatchObject({
+			ok: false,
+			code: "already_exists",
+		});
+		expect(authority.replace("receipt", Buffer.from("replaced\n"))).toMatchObject({ ok: true });
+		const result = authority.read("receipt", 1024);
+		expect(result.ok).toBe(true);
+		expect(Buffer.from(result.data ?? []).toString()).toBe("replaced\n");
+		expect(await fs.readFile(path.join(root, "receipt"), "utf8")).toBe("forged\n");
+		expect(authority.close().ok).toBe(true);
+
+		await fs.rm(root, { recursive: true, force: true });
+		await fs.rename(retained, root);
+	});
+});
+
+describe.skipIf(process.platform !== "win32")("Windows portable retained recovery filesystem root", () => {
+	it("prevents lifecycle-root replacement while evidence and publication authority is retained", async () => {
+		const container = await temporaryDirectory();
+		const root = path.join(container, "lifecycle");
+		const retained = `${container}-retained`;
+		await fs.mkdir(root);
+		await fs.writeFile(path.join(root, "receipt"), "original\n");
+		const authority = openPortableRecoveryFsRoot(root);
+		await expect(fs.rename(container, retained)).rejects.toBeDefined();
+		expect(authority.list(1024)).toEqual(["receipt"]);
+		expect(Buffer.from(authority.read("receipt", 1024).data ?? []).toString()).toBe("original\n");
+		expect(authority.writeExclusive("marker", Buffer.from("marker\n"))).toMatchObject({ ok: true });
+		expect(authority.replace("receipt", Buffer.from("replaced\n"))).toMatchObject({ ok: true });
+		expect(Buffer.from(authority.read("receipt", 1024).data ?? []).toString()).toBe("replaced\n");
+		expect(authority.close().ok).toBe(true);
+	});
 });
 
 describe.skipIf(process.platform !== "linux")("native recovery filesystem authority", () => {

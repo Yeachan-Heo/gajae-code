@@ -2,7 +2,13 @@
  * Fuzzy matching utilities.
  * Matches if all query characters appear in order (not necessarily consecutive).
  * Lower score = better match.
+ *
+ * Hangul is handled like the path/slash-command autocomplete matcher: both sides are NFC-folded
+ * so decomposed filesystem-derived text still matches, and a bare consonant matches a syllable's
+ * initial (초성 검색). Without this, these selectors silently dropped NFD entries entirely.
  */
+
+import { foldHangulText, hangulFuzzyCharMatches } from "./hangul";
 
 export interface FuzzyMatch {
 	matches: boolean;
@@ -26,7 +32,7 @@ function scoreMatch(queryLower: string, textLower: string): FuzzyMatch {
 	let consecutiveMatches = 0;
 
 	for (let i = 0; i < textLower.length && queryIndex < queryLower.length; i++) {
-		if (textLower[i] === queryLower[queryIndex]) {
+		if (hangulFuzzyCharMatches(queryLower[queryIndex]!, textLower[i]!)) {
 			const isWordBoundary = i === 0 || /[\s\-_./:]/.test(textLower[i - 1]!);
 
 			// Reward consecutive matches
@@ -77,8 +83,10 @@ function buildAlphanumericSwapQueries(queryLower: string): string[] {
 }
 
 export function fuzzyMatch(query: string, text: string): FuzzyMatch {
-	const queryLower = query.toLowerCase();
-	const textLower = text.toLowerCase();
+	// Fold before lowercasing so a decomposed syllable is composed first; initial-jamo lookup
+	// is only defined for precomposed syllables.
+	const queryLower = foldHangulText(query).toLowerCase();
+	const textLower = foldHangulText(text).toLowerCase();
 
 	const direct = scoreMatch(queryLower, textLower);
 	if (direct.matches) {
