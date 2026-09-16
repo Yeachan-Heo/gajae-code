@@ -126,6 +126,13 @@ const ACP_SESSION_READINESS_TIMEOUT_MS = ACP_MCP_LIFECYCLE_TIMEOUT_MS;
 const ACP_FIRST_PROMPT_MAX_RETRIES = 2;
 /** Backoff before each first-prompt retry, scaled by attempt (250ms, then 500ms). */
 const ACP_FIRST_PROMPT_RETRY_BASE_DELAY_MS = 250;
+/**
+ * A mid-task turn (not the session's first prompt) that already did real work and then
+ * terminalized empty as `prompt_failed` gets a single re-submit — more conservative than the
+ * first turn's two retries, because a mid-task empty completion is likelier to be a genuine
+ * result than a startup readiness race (issue #5615).
+ */
+const ACP_MID_TASK_PROMPT_MAX_RETRIES = 1;
 
 type JsonObject = Record<string, unknown>;
 interface PromptWaiter {
@@ -1746,30 +1753,47 @@ export class AcpAgent implements Agent {
 				try {
 					return await this.#submitPrompt(params, echoUserMessage, retryReservation);
 				} catch (error) {
-					if (!this.#shouldRetryFirstPrompt(record, error, attempt)) throw error;
-					// The user's message was already echoed on the first attempt; re-echoing
-					// would duplicate it in the client transcript.
-					echoUserMessage = false;
-					// Reserve the session BEFORE the backoff sleep. `#settlePrompt` already cleared
-					// `activePrompt` when it rejected this attempt, so without the reservation the
-					// backoff gap admits a competing prompt that steals the first turn (review P1).
-					record.pendingFirstPromptRetry = retryReservation;
-					logger.warn("ACP first-turn prompt failed; retrying after readiness backoff", {
-						sessionId: params.sessionId,
-						attempt: attempt + 1,
-						maxRetries: ACP_FIRST_PROMPT_MAX_RETRIES,
-					});
-					await this.#delayFirstPromptRetry(attempt);
-					// A session/cancel that arrived during the backoff gap (activePrompt already
-					// cleared by the failed attempt, retry not yet resubmitted) must settle the
-					// retry as `cancelled` instead of dispatching a fresh turn the client no
-					// longer wants. The check lives here, before resubmission, because
-					// `#submitPrompt` unconditionally clears `cancelRequested` for the new turn
-					// it is about to start, so a later check would miss it (review P1).
-					if (record.cancelRequested) {
-						record.cancelRequested = false;
-						return { stopReason: "cancelled" };
+					if (this.#shouldRetryFirstPrompt(record, error, attempt)) {
+						// The user's message was already echoed on the first attempt; re-echoing
+						// would duplicate it in the client transcript.
+						echoUserMessage = false;
+						// Reserve the session BEFORE the backoff sleep. `#settlePrompt` already cleared
+						// `activePrompt` when it rejected this attempt, so without the reservation the
+						// backoff gap admits a competing prompt that steals the first turn (review P1).
+						record.pendingFirstPromptRetry = retryReservation;
+						logger.warn("ACP first-turn prompt failed; retrying after readiness backoff", {
+							sessionId: params.sessionId,
+							attempt: attempt + 1,
+							maxRetries: ACP_FIRST_PROMPT_MAX_RETRIES,
+						});
+						await this.#delayFirstPromptRetry(attempt);
+						// A session/cancel that arrived during the backoff gap (activePrompt already
+						// cleared by the failed attempt, retry not yet resubmitted) must settle the
+						// retry as `cancelled` instead of dispatching a fresh turn the client no
+						// longer wants. The check lives here, before resubmission, because
+						// `#submitPrompt` unconditionally clears `cancelRequested` for the new turn
+						// it is about to start, so a later check would miss it (review P1).
+						if (record.cancelRequested) {
+							record.cancelRequested = false;
+							return { stopReason: "cancelled" };
+						}
+						continue;
 					}
+					// A mid-task turn (not the session's first prompt) that had already executed a
+					// tool and then terminalized empty as `prompt_failed` is re-submitted once, so a
+					// transient provider blip does not abandon the task with an opaque -32603 (issue
+					// #5615). Unlike the first-turn readiness retry there is no backoff — the host is
+					// already up mid-session — and the message was already echoed on the first attempt.
+					if (this.#shouldRetryMidTaskPrompt(record, error, attempt)) {
+						echoUserMessage = false;
+						logger.warn("ACP mid-task prompt failed; retrying once", {
+							sessionId: params.sessionId,
+							attempt: attempt + 1,
+							maxRetries: ACP_MID_TASK_PROMPT_MAX_RETRIES,
+						});
+						continue;
+					}
+					throw error;
 				}
 			}
 		} finally {
@@ -1819,6 +1843,38 @@ export class AcpAgent implements Agent {
 		// turn.prompt, so repeating a tool-executing turn would run the user's instruction and
 		// its side effects a second time (review P1).
 		if (record.promptObservedToolExecution) return false;
+		return error instanceof AcpSdkAdapterError && error.code === "prompt_failed";
+	}
+
+	/**
+	 * The mid-task empty-turn signature (issue #5615): a turn on a session that has already
+	 * completed its first prompt executed real work (a tool ran) and then terminalized as
+	 * `prompt_failed` — the EMPTY_PROMPT_FAILURE path, where a model re-invocation after
+	 * `tool_execution_end` returns empty content with no tool calls. A transient provider blip
+	 * mid-task should not abandon the whole task with an opaque `-32603`, so the turn is
+	 * re-submitted once instead of surfaced.
+	 *
+	 * Every gate is deliberately narrower than the first-turn retry, because a mid-task empty
+	 * completion is more likely to be a genuine (if unhelpful) result than a startup race:
+	 * - never the session's first logical prompt (`firstPromptDone`) — that is the first-turn path;
+	 * - only an `agent_failed` `prompt_failed` terminal — never a deadline, a cancel, or a stop;
+	 * - only after the turn actually executed a tool (`promptObservedToolExecution`), the mid-task
+	 *   progress fingerprint from issue #5615 ("after several tool calls"); a turn that merely
+	 *   started — or never started — is surfaced, not recovered here;
+	 * - never once the client has asked to cancel;
+	 * - at most one re-submit (`ACP_MID_TASK_PROMPT_MAX_RETRIES`).
+	 *
+	 * Unlike the first-turn retry (which refuses a tool-executing turn to avoid repeating side
+	 * effects), this path re-runs a turn that ran a tool: the re-submit is a new, independent
+	 * `turn.prompt`, so the user's instruction and its side effects may execute a second time.
+	 * That is the accepted cost of recovering a mid-task turn that had already begun doing work
+	 * before the provider returned an empty completion (issue #5615).
+	 */
+	#shouldRetryMidTaskPrompt(record: SessionRecord, error: unknown, attempt: number): boolean {
+		if (attempt >= ACP_MID_TASK_PROMPT_MAX_RETRIES) return false;
+		if (!record.firstPromptDone) return false;
+		if (record.cancelRequested) return false;
+		if (!record.promptObservedToolExecution) return false;
 		return error instanceof AcpSdkAdapterError && error.code === "prompt_failed";
 	}
 
