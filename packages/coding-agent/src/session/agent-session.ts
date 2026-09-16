@@ -16565,9 +16565,14 @@ export class AgentSession {
 		const profileDefault = Array.isArray(bindings.defaultSelector)
 			? bindings.defaultSelector[0]
 			: bindings.defaultSelector;
+		const configuredDefaultModel = configuredDefault ? parseModelString(configuredDefault) : undefined;
+		const profileDefaultModel = profileDefault ? parseModelString(profileDefault) : undefined;
 		const ownsConfiguredDefault =
-			profileDefault !== undefined &&
-			configuredDefault?.trim().toLowerCase() === profileDefault.trim().toLowerCase();
+			configuredDefaultModel && profileDefaultModel
+				? configuredDefaultModel.provider.toLowerCase() === profileDefaultModel.provider.toLowerCase() &&
+					configuredDefaultModel.id.toLowerCase() === profileDefaultModel.id.toLowerCase()
+				: profileDefault !== undefined &&
+					configuredDefault?.trim().toLowerCase() === profileDefault.trim().toLowerCase();
 		const owned =
 			role === "default"
 				? runtimeDefaultIdentity?.origin === "runtime" || ownsConfiguredDefault
@@ -24464,9 +24469,11 @@ export class AgentSession {
 					.some(entry => entry.type === "service_tier_change");
 				const defaultThinkingLevel = this.settings.get("defaultThinkingLevel");
 				const configuredServiceTier = this.settings.get("serviceTier");
-				const persistedThinkingLevel = hasThinkingEntry
-					? (sessionContext.thinkingLevel as ThinkingLevel | undefined)
-					: (recoveredThinkingLevel ?? defaultThinkingLevel);
+				const sessionThinkingLevel = sessionContext.thinkingLevel as ThinkingLevel | undefined;
+				const persistedThinkingLevel =
+					hasThinkingEntry && sessionThinkingLevel !== ThinkingLevel.Inherit
+						? sessionThinkingLevel
+						: (recoveredThinkingLevel ?? defaultThinkingLevel);
 				const nextThinkingLevel = resolveThinkingLevelForModel(
 					this.model,
 					persistedThinkingLevel === ThinkingLevel.Inherit
