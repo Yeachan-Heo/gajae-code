@@ -2019,6 +2019,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 							credentialSessionId,
 							...(persistedProfileOwnsDefault ? { aliasIntent: "preset-equivalent" as const } : {}),
 						});
+						deferredMissingSessionRecovery = !recovery?.model;
 						if (
 							recovery?.model &&
 							(!preferredCredentialProvider || recovery.model.provider === preferredCredentialProvider)
@@ -3769,7 +3770,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				(!preferredCredentialProvider || restoredAfterExtensions.model.provider === preferredCredentialProvider)
 			) {
 				model = restoredAfterExtensions.model;
-				retainedRecoveryBindingsAfterLateRestore = recoveredSessionDefault !== undefined;
+				retainedRecoveryBindingsAfterLateRestore = savedDefaultWasUnresolved;
 				if (options.thinkingLevel !== undefined) {
 					thinkingLevel = resolveThinkingLevelForModel(model, options.thinkingLevel);
 				} else if (restoredThinkingLevel !== undefined && restoredThinkingLevel !== ThinkingLevel.Inherit) {
