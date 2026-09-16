@@ -104,6 +104,19 @@ describe("flushWorktreeOnPromptDeadline", () => {
 		expect(await flushWorktreeOnPromptDeadline(root)).toBeUndefined();
 		expect(await fsp.exists(path.join(root, ".git"))).toBe(false);
 	});
+
+	test("an already-aborted signal stops the flush before it commits anything", async () => {
+		const root = await initRepo("gjc-deadline-flush-aborted-");
+		await fsp.writeFile(path.join(root, "unsaved.ts"), "export const lost = false;\n");
+		const controller = new AbortController();
+		controller.abort(new Error("bound elapsed"));
+
+		expect(await flushWorktreeOnPromptDeadline(root, controller.signal)).toBeUndefined();
+
+		// No commit was created and the work is still in the worktree, untouched.
+		expect((await run(root, ["rev-list", "--count", "HEAD"])).trim()).toBe("1");
+		expect(await run(root, ["status", "--porcelain"])).toBe("?? unsaved.ts\n");
+	});
 });
 
 describe("PromptDeadlineManager deadline flush wiring (#5583)", () => {
@@ -159,6 +172,88 @@ describe("PromptDeadlineManager deadline flush wiring (#5583)", () => {
 		expect(finalized).toContain("prompt_deadline_exceeded");
 		expect(expired).toBe(1);
 		expect(manager.has(correlation)).toBe(false);
+		manager.clearAll();
+	});
+
+	/**
+	 * Review round 2 on #5623: a flush that never settles — blocking git lock,
+	 * credential prompt, hanging pre-commit hook — used to strand `onExpired` and
+	 * `clear` forever, because a try/catch cannot rescue a pending promise. These
+	 * tests pass only if the bound always settles; a regression hangs the suite.
+	 */
+	test("a never-settling flush cannot hold teardown past the bound", async () => {
+		const { api, finalized } = reconciliation();
+		let expired = 0;
+		const manager = new PromptDeadlineManager({
+			reconciliation: api as never,
+			getLeaseMs: () => 20,
+			getMaxMs: () => 60_000,
+			deadlineFlushTimeoutMs: 20,
+			onDeadlineExceeded: () => new Promise<void>(() => {}),
+			onExpired: () => {
+				expired += 1;
+			},
+		});
+		const correlation = { commandId: "flush-hang-cmd", turnId: "flush-hang-turn" };
+		manager.onAccepted(correlation);
+		await Bun.sleep(150);
+
+		// Reaching these assertions at all is the point: teardown completed.
+		expect(finalized).toContain("prompt_deadline_exceeded");
+		expect(expired).toBe(1);
+		expect(manager.has(correlation)).toBe(false);
+		manager.clearAll();
+	});
+
+	test("aborts the hook's signal when the bound elapses", async () => {
+		const aborted = Promise.withResolvers<string>();
+		const { api } = reconciliation();
+		const manager = new PromptDeadlineManager({
+			reconciliation: api as never,
+			getLeaseMs: () => 20,
+			getMaxMs: () => 60_000,
+			deadlineFlushTimeoutMs: 20,
+			onDeadlineExceeded: (_correlation, signal) =>
+				new Promise<void>(() => {
+					signal.addEventListener("abort", () => aborted.resolve(String((signal.reason as Error)?.message)));
+				}),
+		});
+		const correlation = { commandId: "flush-abort-cmd", turnId: "flush-abort-turn" };
+		manager.onAccepted(correlation);
+
+		// The abort is what kills the git subprocess inside a real flush.
+		expect(await aborted.promise).toContain("20ms");
+		manager.clearAll();
+	});
+
+	test("awaits a slow but finite flush to completion instead of truncating it", async () => {
+		const root = await initRepo("gjc-deadline-slow-flush-");
+		await fsp.writeFile(path.join(root, "slow.ts"), "export const slow = true;\n");
+		const { api } = reconciliation();
+		const order: string[] = [];
+		const manager = new PromptDeadlineManager({
+			reconciliation: api as never,
+			getLeaseMs: () => 20,
+			getMaxMs: () => 60_000,
+			// Comfortably longer than the deliberate delay below.
+			deadlineFlushTimeoutMs: 2_000,
+			onDeadlineExceeded: async (_correlation, signal) => {
+				await Bun.sleep(40);
+				await flushWorktreeOnPromptDeadline(root, signal);
+				order.push("flush");
+			},
+			onExpired: () => {
+				order.push("retire");
+			},
+		});
+		const correlation = { commandId: "flush-slow-cmd", turnId: "flush-slow-turn" };
+		manager.onAccepted(correlation);
+		await Bun.sleep(300);
+
+		// The bound must not truncate work that finishes within it.
+		expect(order).toEqual(["flush", "retire"]);
+		expect(await run(root, ["status", "--porcelain"])).toBe("");
+		expect(await run(root, ["show", "HEAD:slow.ts"])).toBe("export const slow = true;\n");
 		manager.clearAll();
 	});
 
