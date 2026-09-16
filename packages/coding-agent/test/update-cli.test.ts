@@ -5,8 +5,14 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { VERSION } from "@gajae-code/utils";
 import { runCli } from "../src/cli";
+import {
+	buildActivationRecord,
+	createActivationRecordFile,
+	snapshotDirectory,
+	snapshotRegularFile,
+} from "../src/cli/install-activation";
 import { offerMacosCommunityApp } from "../src/cli/macos-community-app";
-import type { BinaryUpdateFlow, UpdateCommandDependencies } from "../src/cli/update-cli";
+import type { BinaryReplacementOptions, BinaryUpdateFlow, UpdateCommandDependencies } from "../src/cli/update-cli";
 import {
 	assertSupportedLinuxLibcForTest,
 	buildReleaseBinaryUrlForTest,
@@ -870,7 +876,14 @@ describe("update-cli managed notification recovery", () => {
 	};
 
 	describe("standalone migration preflight", () => {
-		const target = { method: "migrate" as const, path: "/standalone/gjc", previousPath: "/shim/gjc" };
+		// The migration target lives in a real temporary install directory: the
+		// preflight lock is acquired in that directory and must never create it.
+		const standaloneRoot = fsNode.mkdtempSync(path.join(os.tmpdir(), "gjc-standalone-"));
+		const target = {
+			method: "migrate" as const,
+			path: path.join(standaloneRoot, "gjc"),
+			previousPath: path.join(standaloneRoot, "shim-gjc"),
+		};
 
 		it("verifies the release checksum before executing the migration target", async () => {
 			const calls: string[] = [];
@@ -1610,15 +1623,14 @@ describe("update-cli managed notification recovery", () => {
 describe("update-cli install lock", () => {
 	it("locks the same file the POSIX installer uses", async () => {
 		const source = await Bun.file(path.resolve(import.meta.dir, "../src/cli/update-cli.ts")).text();
-		expect(source).toContain(".gjc-install.lock");
+		expect(source).toContain('".gjc-install"');
 		expect(source).not.toContain("No checksum asset on");
 		expect(source).not.toContain(".update-lock");
-		expect(source).toContain(`Remove ${String.fromCharCode(36)}{lockFile} only after confirming`);
 	});
 });
 
 describe("update-cli windows journal recovery", () => {
-	it("promotes .next over the live target and does not strand the prior binary", async () => {
+	it("refuses path-only legacy journals without mutating them", async () => {
 		const dir = await makeTempDir();
 		const targetPath = path.join(dir, "gjc");
 		const backupPath = `${targetPath}.bak`;
@@ -1627,14 +1639,14 @@ describe("update-cli windows journal recovery", () => {
 		await Bun.write(targetPath, "old");
 		await Bun.write(nextPath, "new");
 		await Bun.write(journalPath, JSON.stringify({ target: targetPath, backup: backupPath, next: nextPath }));
-		await recoverWindowsUpdateJournal(journalPath);
-		expect(await Bun.file(targetPath).text()).toBe("new");
-		expect(await Bun.file(nextPath).exists()).toBe(false);
-		expect(await Bun.file(journalPath).exists()).toBe(false);
-		const leftovers = (await fs.readdir(dir)).filter(name => name.includes(".bak.recover."));
-		expect(leftovers).toEqual([]);
+		await expect(recoverWindowsUpdateJournal(journalPath)).rejects.toThrow(
+			"legacy_update_journal_requires_manual_review",
+		);
+		expect(await Bun.file(targetPath).text()).toBe("old");
+		expect(await Bun.file(nextPath).exists()).toBe(true);
+		expect(await Bun.file(journalPath).exists()).toBe(true);
 	});
-	it("promotes .next even when the journal backup path already exists", async () => {
+	it("preserves a legacy journal even when its backup path already exists", async () => {
 		const dir = await makeTempDir();
 		const targetPath = path.join(dir, "gjc");
 		const backupPath = `${targetPath}.bak`;
@@ -1644,17 +1656,62 @@ describe("update-cli windows journal recovery", () => {
 		await Bun.write(nextPath, "new");
 		await Bun.write(backupPath, "stale-backup");
 		await Bun.write(journalPath, JSON.stringify({ target: targetPath, backup: backupPath, next: nextPath }));
-		await recoverWindowsUpdateJournal(journalPath);
-		expect(await Bun.file(targetPath).text()).toBe("new");
+		await expect(recoverWindowsUpdateJournal(journalPath)).rejects.toThrow(
+			"legacy_update_journal_requires_manual_review",
+		);
+		expect(await Bun.file(targetPath).text()).toBe("old");
 		expect(await Bun.file(backupPath).text()).toBe("stale-backup");
-		expect(await Bun.file(nextPath).exists()).toBe(false);
-		expect(await Bun.file(journalPath).exists()).toBe(false);
-		const leftovers = (await fs.readdir(dir)).filter(name => name.includes(".bak.recover."));
-		expect(leftovers).toEqual([]);
+		expect(await Bun.file(nextPath).exists()).toBe(true);
+		expect(await Bun.file(journalPath).exists()).toBe(true);
 	});
 });
 
+async function replaceBinaryFixture(options: Omit<BinaryReplacementOptions, "originalTarget" | "originalParent">) {
+	const originalTarget = await snapshotRegularFile(options.targetPath);
+	const originalParent = await snapshotDirectory(path.dirname(options.targetPath));
+	if (!originalParent) throw new Error("fixture parent missing");
+	return await replaceBinaryForUpdate({
+		...options,
+		originalTarget: originalTarget?.identity,
+		originalParent,
+		// These fixtures exercise filesystem publication; runtime verification is injected separately.
+		verifyStagedVersion: options.verifyStagedVersion ?? (async () => {}),
+	});
+}
+
 describe("update-cli binary replacement", () => {
+	it("consumes the shared verified activation record rather than creating a competing journal", async () => {
+		const dir = await makeTempDir();
+		const targetPath = path.join(dir, "gjc");
+		const tempPath = `${targetPath}.new`;
+		const backupPath = `${targetPath}.bak`;
+		await Bun.write(targetPath, "old binary");
+		await Bun.write(tempPath, "new binary");
+		const old = (await snapshotRegularFile(targetPath))!;
+		const parent = (await snapshotDirectory(dir))!;
+		await createActivationRecordFile({
+			...buildActivationRecord({
+				targetPath,
+				targetIdentity: old.identity,
+				parentIdentity: parent,
+				baselineDigest: old.identity.sha256,
+				candidate: { digest: old.identity.sha256, version: "15.1.7" },
+				stagingPath: path.join(dir, "previous-stage"),
+				stagingIdentity: old.identity,
+			}),
+			phase: "verified",
+		});
+		await replaceBinaryFixture({
+			targetPath,
+			tempPath,
+			backupPath,
+			expectedVersion: "15.1.8",
+			verifyInstalledVersion: async () => ({ ok: true, actual: "15.1.8", path: targetPath }),
+		});
+		expect(await Bun.file(targetPath).text()).toBe("new binary");
+		expect(await Bun.file(`${targetPath}.update-journal`).exists()).toBe(false);
+	});
+
 	it("restores the previous binary when the replacement fails verification", async () => {
 		const dir = await makeTempDir();
 		const targetPath = path.join(dir, "gjc");
@@ -1664,14 +1721,14 @@ describe("update-cli binary replacement", () => {
 		await Bun.write(tempPath, "broken binary");
 
 		await expect(
-			replaceBinaryForUpdate({
+			replaceBinaryFixture({
 				targetPath,
 				tempPath,
 				backupPath,
 				expectedVersion: "15.1.8",
 				verifyInstalledVersion: async () => ({ ok: false, path: targetPath }),
 			}),
-		).rejects.toThrow("restored previous gjc binary");
+		).rejects.toThrow("could not verify updated version");
 
 		expect(await Bun.file(targetPath).text()).toBe("old binary");
 		expect(await Bun.file(tempPath).exists()).toBe(false);
@@ -1684,7 +1741,7 @@ describe("update-cli binary replacement", () => {
 		const backupPath = `${targetPath}.bak`;
 		await Bun.write(tempPath, "new binary");
 
-		const result = await replaceBinaryForUpdate({
+		const result = await replaceBinaryFixture({
 			targetPath,
 			tempPath,
 			backupPath,
@@ -1707,84 +1764,58 @@ describe("update-cli binary replacement", () => {
 		await fs.symlink(realPath, targetPath);
 		await Bun.write(tempPath, "new binary");
 		await expect(
-			replaceBinaryForUpdate({
+			replaceBinaryFixture({
 				targetPath,
 				tempPath,
 				backupPath,
 				expectedVersion: "15.1.8",
 				verifyInstalledVersion: async () => ({ ok: true, actual: "15.1.8", path: targetPath }),
 			}),
-		).rejects.toThrow("Refusing to replace symlink");
+		).rejects.toThrow("target_not_regular");
 		expect(fsNode.lstatSync(targetPath).isSymbolicLink()).toBe(true);
 		expect(await Bun.file(realPath).text()).toBe("managed");
 	});
-	it("does not delete the live binary when backup copy fails", async () => {
+	it("refuses an occupied backup without changing the live binary or foreign file", async () => {
 		const dir = await makeTempDir();
 		const targetPath = path.join(dir, "gjc");
 		const tempPath = `${targetPath}.new`;
 		const backupPath = `${targetPath}.bak`;
 		await Bun.write(targetPath, "old binary");
 		await Bun.write(tempPath, "new binary");
-		const originalCopy = fsNode.promises.copyFile;
-		const copy = vi.spyOn(fsNode.promises, "copyFile").mockImplementation(async (src, dest, flags) => {
-			if (String(src) === targetPath) {
-				const err = new Error("EPERM: copy") as NodeJS.ErrnoException;
-				err.code = "EPERM";
-				throw err;
-			}
-			return originalCopy(src, dest, flags as number | undefined);
-		});
-		try {
-			await expect(
-				replaceBinaryForUpdate({
-					targetPath,
-					tempPath,
-					backupPath,
-					expectedVersion: "15.1.8",
-					verifyInstalledVersion: async () => ({ ok: true, actual: "15.1.8", path: targetPath }),
-				}),
-			).rejects.toThrow("EPERM");
-			expect(await Bun.file(targetPath).text()).toBe("old binary");
-		} finally {
-			copy.mockRestore();
-		}
+		await Bun.write(backupPath, "foreign-backup");
+		await expect(
+			replaceBinaryFixture({
+				targetPath,
+				tempPath,
+				backupPath,
+				expectedVersion: "15.1.8",
+				verifyInstalledVersion: async () => ({ ok: true, actual: "15.1.8", path: targetPath }),
+			}),
+		).rejects.toThrow("quarantine_collision");
+		expect(await Bun.file(targetPath).text()).toBe("old binary");
+		expect(await Bun.file(backupPath).text()).toBe("foreign-backup");
+		expect(await Bun.file(tempPath).text()).toBe("new binary");
 	});
 
-	it("keeps a verified replacement when backup cleanup hits EPERM", async () => {
+	it("keeps a verified replacement with its retained rollback closure", async () => {
 		const dir = await makeTempDir();
 		const targetPath = path.join(dir, "gjc.cmd");
 		const tempPath = `${targetPath}.new`;
 		const backupPath = `${targetPath}.bak`;
 		await Bun.write(targetPath, "old binary");
 		await Bun.write(tempPath, "new binary");
-		const originalUnlink = fsNode.promises.unlink;
-		const unlinkSpy = vi.spyOn(fsNode.promises, "unlink").mockImplementation(async filePath => {
-			if (String(filePath) === backupPath && fsNode.existsSync(backupPath)) {
-				const err = new Error("EPERM: operation not permitted, unlink");
-				(err as NodeJS.ErrnoException).code = "EPERM";
-				throw err;
-			}
-			return await originalUnlink(filePath);
+		const result = await replaceBinaryFixture({
+			targetPath,
+			tempPath,
+			backupPath,
+			expectedVersion: "15.1.8",
+			verifyInstalledVersion: async () => ({ ok: true, actual: "15.1.8", path: targetPath }),
 		});
 
-		try {
-			const result = await replaceBinaryForUpdate({
-				targetPath,
-				tempPath,
-				backupPath,
-				expectedVersion: "15.1.8",
-				verifyInstalledVersion: async () => ({ ok: true, actual: "15.1.8", path: targetPath }),
-			});
-
-			expect(result.ok).toBe(true);
-			expect(result.cleanupWarning).toContain("Installed update, but could not remove backup file");
-			expect(result.cleanupWarning).toContain(backupPath);
-			expect(await Bun.file(targetPath).text()).toBe("new binary");
-			expect(await Bun.file(tempPath).exists()).toBe(false);
-			expect(await Bun.file(backupPath).text()).toBe("old binary");
-		} finally {
-			unlinkSpy.mockRestore();
-		}
+		expect(result.ok).toBe(true);
+		expect(await Bun.file(targetPath).text()).toBe("new binary");
+		expect(await Bun.file(tempPath).exists()).toBe(false);
+		expect(await Bun.file(backupPath).text()).toBe("old binary");
 	});
 
 	it("keeps the replacement only after it reports the expected version", async () => {
@@ -1795,7 +1826,7 @@ describe("update-cli binary replacement", () => {
 		await Bun.write(targetPath, "old binary");
 		await Bun.write(tempPath, "new binary");
 
-		await replaceBinaryForUpdate({
+		await replaceBinaryFixture({
 			targetPath,
 			tempPath,
 			backupPath,
@@ -1805,7 +1836,7 @@ describe("update-cli binary replacement", () => {
 
 		expect(await Bun.file(targetPath).text()).toBe("new binary");
 		expect(await Bun.file(tempPath).exists()).toBe(false);
-		expect(await Bun.file(backupPath).exists()).toBe(false);
+		expect(await Bun.file(backupPath).exists()).toBe(true);
 	});
 });
 
@@ -1859,7 +1890,7 @@ describe("update-cli download durability", () => {
 describe("update-cli binary update flow", () => {
 	it("downloads, fsyncs, then replaces and verifies in that order", async () => {
 		const calls: string[] = [];
-		const targetPath = "/opt/gjc/bin/gjc";
+		const targetPath = path.join(await makeTempDir(), "gjc");
 		const flow: BinaryUpdateFlow = {
 			download: async (url, tempPath) => {
 				calls.push(`download ${url} -> ${tempPath}`);
@@ -1874,9 +1905,6 @@ describe("update-cli binary update flow", () => {
 			verifyInstalledVersion: async expected => {
 				calls.push(`verify ${expected}`);
 				return { ok: true, actual: expected, path: targetPath };
-			},
-			removeTemp: async filePath => {
-				calls.push(`removeTemp ${filePath}`);
 			},
 			beforeReplace: () => {
 				calls.push("beforeReplace");
@@ -1896,7 +1924,7 @@ describe("update-cli binary update flow", () => {
 
 	it("aborts before replacement/verification when fsync fails", async () => {
 		const calls: string[] = [];
-		const targetPath = "/opt/gjc/bin/gjc";
+		const targetPath = path.join(await makeTempDir(), "gjc");
 		const flow: BinaryUpdateFlow = {
 			download: async (_url, tempPath) => {
 				calls.push(`download ${tempPath}`);
@@ -1913,9 +1941,6 @@ describe("update-cli binary update flow", () => {
 				calls.push("verify");
 				return { ok: true };
 			},
-			removeTemp: async filePath => {
-				calls.push(`removeTemp ${filePath}`);
-			},
 		};
 
 		await expect(runBinaryUpdateFlow(targetPath, "https://example.test/gjc", "1.2.3", flow)).rejects.toThrow(
@@ -1924,7 +1949,7 @@ describe("update-cli binary update flow", () => {
 
 		expect(calls[0]).toMatch(new RegExp(`^download ${targetPath}\\.new\\.`));
 		expect(calls[1]).toBe("fsync");
-		expect(calls[2]).toMatch(new RegExp(`^removeTemp ${targetPath}\\.new\\.`));
+		expect(calls).toHaveLength(2);
 		expect(calls).not.toContain("replace");
 		expect(calls).not.toContain("verify");
 	});

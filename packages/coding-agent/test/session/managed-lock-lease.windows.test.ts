@@ -70,7 +70,7 @@ describe("managed migration lock lease ownership", () => {
 		fs.writeFileSync(first.path, original, { mode: 0o600 });
 
 		expect(() => first.assertOwned()).toThrow("migration_busy");
-		await expect(first.release()).rejects.toThrow();
+		await expect(first.release()).rejects.toThrow("migration_busy");
 		expect(fs.readFileSync(first.path)).toEqual(original);
 		await first.release();
 	});

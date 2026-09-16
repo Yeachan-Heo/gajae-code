@@ -34,6 +34,7 @@ import type { BedrockOptions } from "./amazon-bedrock";
 import type { AnthropicOptions } from "./anthropic";
 import type { AzureOpenAIResponsesOptions } from "./azure-openai-responses";
 import type { CursorOptions } from "./cursor";
+import type { DevinAcpOptions } from "./devin-acp";
 import type { GoogleOptions } from "./google";
 import type { GoogleGeminiCliOptions } from "./google-gemini-cli";
 import type { GoogleVertexOptions } from "./google-vertex";
@@ -146,6 +147,14 @@ interface CursorProviderModule {
 	) => AssistantMessageEventStream;
 }
 
+interface DevinAcpProviderModule {
+	streamDevinAcp: (
+		model: Model<"devin-acp">,
+		context: Context,
+		options: DevinAcpOptions,
+	) => AssistantMessageEventStream;
+}
+
 interface BedrockProviderModule {
 	streamBedrock: (
 		model: Model<"bedrock-converse-stream">,
@@ -176,6 +185,7 @@ let openAICompletionsProviderModulePromise: Promise<LazyProviderModule<"openai-c
 let openAIResponsesProviderModulePromise: Promise<LazyProviderModule<"openai-responses">> | undefined;
 let ollamaProviderModulePromise: Promise<LazyProviderModule<"ollama-chat">> | undefined;
 let cursorProviderModulePromise: Promise<LazyProviderModule<"cursor-agent">> | undefined;
+let devinAcpProviderModulePromise: Promise<LazyProviderModule<"devin-acp">> | undefined;
 let bedrockProviderModuleOverride: LazyProviderModule<"bedrock-converse-stream"> | undefined;
 let kiroCodeWhispererProviderModulePromise: Promise<LazyProviderModule<"kiro-codewhisperer-stream">> | undefined;
 let bedrockProviderModulePromise: Promise<LazyProviderModule<"bedrock-converse-stream">> | undefined;
@@ -459,6 +469,14 @@ function loadCursorProviderModule(): Promise<LazyProviderModule<"cursor-agent">>
 	return cursorProviderModulePromise;
 }
 
+function loadDevinAcpProviderModule(): Promise<LazyProviderModule<"devin-acp">> {
+	devinAcpProviderModulePromise ||= Promise.resolve().then(() => {
+		const provider = require("./devin-acp") as DevinAcpProviderModule;
+		return { stream: provider.streamDevinAcp };
+	});
+	return devinAcpProviderModulePromise;
+}
+
 function loadBedrockProviderModule(): Promise<LazyProviderModule<"bedrock-converse-stream">> {
 	if (bedrockProviderModuleOverride) {
 		return Promise.resolve(bedrockProviderModuleOverride);
@@ -492,6 +510,7 @@ export const PROVIDER_RUNTIME_DESCRIPTORS: readonly ProviderRuntimeDescriptor<Ap
 	{ api: "openai-responses", load: loadOpenAIResponsesProviderModule },
 	{ api: "ollama-chat", load: loadOllamaProviderModule },
 	{ api: "cursor-agent", load: loadCursorProviderModule },
+	{ api: "devin-acp", load: loadDevinAcpProviderModule },
 	{ api: "kiro-codewhisperer-stream", load: loadKiroCodeWhispererProviderModule },
 	{ api: "bedrock-converse-stream", load: loadBedrockProviderModule },
 ] as readonly ErasedProviderRuntimeDescriptor[];
@@ -538,6 +557,7 @@ export const streamOpenAIResponses = createLazyStream(
 	PROVIDER_OWNED_STREAM_WATCHDOG,
 );
 export const streamCursor = createLazyStream(loadCursorProviderModule, PROVIDER_OWNED_STREAM_WATCHDOG);
+export const streamDevinAcp = createLazyStream(loadDevinAcpProviderModule, PROVIDER_OWNED_STREAM_WATCHDOG);
 export const streamOllama = createLazyStream(loadOllamaProviderModule);
 
 export const streamBedrock = createLazyStream(loadBedrockProviderModule);

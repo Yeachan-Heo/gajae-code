@@ -124,3 +124,21 @@ export function modelsAreEqual<TApi extends Api>(
 	if (!a || !b) return false;
 	return a.id === b.id && a.provider === b.provider;
 }
+
+/**
+ * APIs backed by agent-level providers — currently Devin over ACP. An
+ * agent-level provider runs its own agent loop and owns the conversation
+ * history, so it refuses GJC maintenance calls (`maintenanceCall` requests such
+ * as compaction summaries, handoff generation, and branch summaries) instead of
+ * spending billed agent quota on work it cannot answer as a text model.
+ */
+export const AGENT_LEVEL_PROVIDER_APIS: ReadonlySet<Api> = new Set<Api>(["devin-acp"]);
+
+/**
+ * Whether a model's provider can serve GJC maintenance calls at all. When this
+ * is false for every model a maintenance action can reach, the call can only
+ * report a guaranteed refusal, so callers should skip rather than surface it.
+ */
+export function modelSupportsMaintenanceCalls(model: Model<Api>): boolean {
+	return !AGENT_LEVEL_PROVIDER_APIS.has(model.api);
+}

@@ -2,7 +2,6 @@
  * Generate shell completion specs for external completion engines.
  */
 import { Args, Command, Flags } from "@gajae-code/utils/cli";
-import { commands, RootHelpCommand } from "../cli";
 import {
 	buildGjcFigSpec,
 	defaultInshellisenseSpecDir,
@@ -10,6 +9,7 @@ import {
 	installGjcInshellisenseSpec,
 	renderFigSpecModule,
 } from "../cli/completion-cli";
+import { commands, RootHelpCommand } from "../cli-main";
 
 const TARGETS = ["inshellisense", "fig"] as const;
 

@@ -1,4 +1,4 @@
-import { Command, renderCommandHelp } from "@gajae-code/utils/cli";
+import { Command } from "@gajae-code/utils/cli";
 import { ensureWorkflowSettingsMigrated } from "../config/settings";
 import {
 	GJC_SESSION_FILE_ENV,
@@ -8,7 +8,7 @@ import {
 	writeCurrentSessionGoalModeState,
 	writePendingGoalModeRequest,
 } from "../gjc-runtime/goal-mode-request";
-import { runNativeUltragoalCommand } from "../gjc-runtime/ultragoal-runtime";
+import { isUltragoalHelpInvocation, runNativeUltragoalCommand } from "../gjc-runtime/ultragoal-runtime";
 
 export default class Ultragoal extends Command {
 	static description = "Run native GJC Ultragoal workflow commands";
@@ -19,9 +19,15 @@ export default class Ultragoal extends Command {
 	async run(): Promise<void> {
 		// A read-only help request must not perform the workflow-settings
 		// migration (which can create/drain agent.db, write config.yml, and
-		// retire legacy settings.json): render help before the trigger.
-		if (this.argv.includes("--help") || this.argv.includes("-h")) {
-			renderCommandHelp("gjc", "ultragoal", Ultragoal);
+		// retire legacy settings.json): render help before the trigger. The
+		// native runtime owns help rendering because it is verb-aware — dropping
+		// to a generic command-level renderer here would discard the verb and
+		// hide every per-verb flag (`review --help`, `checkpoint --help`, ...).
+		if (isUltragoalHelpInvocation(this.argv)) {
+			const help = await runNativeUltragoalCommand(this.argv);
+			if (help.stdout) process.stdout.write(help.stdout);
+			if (help.stderr) process.stderr.write(help.stderr);
+			process.exitCode = help.status;
 			return;
 		}
 		await ensureWorkflowSettingsMigrated(process.cwd());

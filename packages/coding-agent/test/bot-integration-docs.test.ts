@@ -103,7 +103,7 @@ describe("external controller integration docs", () => {
 
 	it("classifies external control surface readiness against code and smoke coverage", async () => {
 		const readiness = await readRepoFile("docs", "external-control-readiness.md");
-		const cli = await readRepoFile("packages", "coding-agent", "src", "cli.ts");
+		const cliMain = await readRepoFile("packages", "coding-agent", "src", "cli-main.ts");
 		const cliArgs = await readRepoFile("packages", "coding-agent", "src", "cli", "args.ts");
 		const acpCommand = await readRepoFile("packages", "coding-agent", "src", "commands", "acp.ts");
 		const mcpCommand = await readRepoFile("packages", "coding-agent", "src", "commands", "mcp-serve.ts");
@@ -129,7 +129,7 @@ describe("external controller integration docs", () => {
 
 		expect(cliArgs).toContain('export type Mode = "text" | "json" | "acp"');
 		expect(cliArgs).toContain("was removed; external control now uses the Gajae-Code SDK");
-		expect(cli).toContain('{ name: "acp", load: () => import("./commands/acp").then(m => m.default) }');
+		expect(cliMain).toContain('{ name: "acp", load: () => import("./commands/acp").then(m => m.default) }');
 		expect(acpCommand).toContain("Run Gajae Code as an ACP (Agent Client Protocol) server over stdio");
 		expect(mcpCommand).toContain('server !== "coordinator" && server !== "hermes"');
 	});

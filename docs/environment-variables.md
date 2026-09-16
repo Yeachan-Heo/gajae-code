@@ -479,7 +479,7 @@ Extra conditional behavior:
 | `GJC_TASK_MAX_OUTPUT_LINES`   | Max captured output lines per subagent (default `5000`)                                            |
 | `GJC_FALLBACK_MAX_STAGED_EVENTS` | Positive-integer cap on events staged by the provisional staging transaction before it is rejected as a local overflow (default `10000`, hard ceiling `2000000`). Surrounding whitespace is ignored by the trusted environment resolver. Applies to both managed fallback and ordinary (non-managed lossless) sessions; in non-managed sessions the cap only decides how much reasoning buffers before the batch flushes and streams through. Invalid or non-positive values fall back to the default; values above the ceiling clamp to it with a warning — the staging guard stays bounded. Resolved from trusted environment sources only (process/agent/user config); a project `.env` cannot change these guardrails. |
 | `GJC_FALLBACK_MAX_STAGED_BYTES` | Positive-integer byte cap on the provisional staging transaction (default `16777216` = 16 MiB, hard ceiling `1073741824` = 1 GiB). Surrounding whitespace is ignored by the trusted environment resolver. Applies to both managed fallback and ordinary (non-managed lossless) sessions; in non-managed sessions the cap only decides how much reasoning buffers before the batch flushes and streams through; raising it raises peak memory of ordinary runs by delaying that flush. A staged streaming frame is counted once as the message and once as the event's partial snapshot of that message, so a reasoning-heavy turn is charged roughly twice its retained volume — size the cap accordingly. Invalid or non-positive values fall back to the default; values above the ceiling clamp to it with a warning — the staging guard stays bounded. Resolved from trusted environment sources only (process/agent/user config); a project `.env` cannot change these guardrails. |
-| `GJC_TIMING`                  | If set (any non-empty value), prints a hierarchical timing-span tree to **stderr** via `logger.printTimings()`. In interactive mode the tree prints once the agent is ready (before the TUI starts); in print mode it prints after the whole prompt batch completes. Print-mode prompts are wrapped in `print:prompt:initial` / `print:prompt:next` spans so each user message shows up as its own row. `GJC_TIMING=x` exits the process with code 0 right after printing in interactive mode (use to measure cold startup only). `GJC_TIMING=full` lists every module-load entry instead of just the top N. |
+| `GJC_TIMING`                  | If set (any non-empty value), prints a hierarchical timing-span tree to **stderr** via `logger.printTimings()`. The window is anchored at process start, so `Total` includes runtime bootstrap and static module link/eval costs as well as the boot phases (`cli:installRuntimeGlobals`, `cli:dispatch`, `interactive:init`, `interactive:firstPaint`) under `cli.ts` and `main.ts`. In interactive mode the tree prints once the agent is ready (before the TUI starts); in print mode it prints after the whole prompt batch completes. Print-mode prompts are wrapped in `print:prompt:initial` / `print:prompt:next` spans so each user message shows up as its own row. `GJC_TIMING=x` exits the process with code 0 in interactive mode after booting the TUI through the first transcript paint (`interactive:init` / `interactive:firstPaint` spans), so the total is a full time-to-first-render cold-start measure. |
 | `GJC_PACKAGE_DIR`             | Overrides package asset base dir resolution (docs/examples/changelog path lookup)                  |
 | `GJC_DISABLE_LSPMUX`             | Canonical lspmux opt-out. A truthy value disables lspmux probing and wrapping; `PI_DISABLE_LSPMUX` is a supported compatibility alias with the same effect. |
 | `PI_DISABLE_LSPMUX`              | Supported compatibility alias for `GJC_DISABLE_LSPMUX`; a truthy value also disables lspmux probing and wrapping. |
@@ -627,7 +627,18 @@ See [External control readiness](./external-control-readiness.md#jetbrains-air-c
 
 ---
 
-## 12) Removed ingress modes
+## 12) Devin CLI provider (ACP)
+
+| Variable | Values | Default | Behavior |
+| --- | --- | --- | --- |
+| `GJC_DEVIN_CLI_PATH` | executable path | `devin` on `PATH` | Executable GJC spawns as `<path> acp`. Use it when the Devin CLI is installed outside `PATH`. |
+| `GJC_DEVIN_PERMISSION_MODE` | `allow`, `deny` | `allow` | How GJC answers Devin's ACP permission requests for Devin's own tool calls. `allow` grants `allow_once`; a request that offers none is answered `cancelled`, because GJC never grants a persistent approval on its own. `deny` selects `reject_once`/`reject_always`. Invalid values fail closed to `deny`. |
+
+Devin authentication lives entirely in the Devin CLI (`devin auth login`, or `WINDSURF_API_KEY` for enterprise builds); GJC stores no Devin credential. See [Devin CLI provider (ACP)](./devin-provider.md) for the integration boundary, model discovery, and billing.
+
+---
+
+## 13) Removed ingress modes
 
 `--mode rpc`, `--mode rpc-ui`, and `--mode bridge` have been removed. The retired bridge-prefixed variables and `GJC_RPC_EMIT_TITLE` are not runtime configuration variables. Use the [SDK machine interface](./sdk.md) for external machine control.
 

@@ -57,9 +57,38 @@ import type { ReceiptState } from "./receipt-state";
 export type PromptReconciliationStatus = "accepted" | "in_flight" | "terminal_ok" | "failed";
 export type SdkPromptStopReason = "end_turn" | "max_tokens" | "max_turn_requests" | "refusal" | "cancelled";
 export type SdkPromptFailureCode = "prompt_failed" | "prompt_deadline_exceeded";
+/**
+ * Stable, safe execution phase of a failed prompt. `submission` means the
+ * failure happened before the run started (a genuine submission rejection);
+ * `post_start` means the run had already started, so it must never be described
+ * as a submission rejection.
+ */
+export type SdkPromptFailurePhase = "submission" | "post_start";
+/**
+ * Allowlisted, bounded origin category for a failed prompt. It is derived only
+ * from safe classifiers (never raw provider text) and preserves `unknown` when
+ * attribution is uncertain instead of guessing.
+ */
+export type SdkPromptFailureCategory =
+	| "provider_transport"
+	| "provider_rejected"
+	| "agent_runtime"
+	| "deadline"
+	| "unknown";
 export type SdkPromptTerminalOutcome =
 	| { kind: "stopped"; reason: SdkPromptStopReason; provenance: "agent" | "client_cancel" }
-	| { kind: "failed"; code: SdkPromptFailureCode; message: string; provenance: "agent_failed" | "deadline" };
+	| {
+			kind: "failed";
+			code: SdkPromptFailureCode;
+			message: string;
+			provenance: "agent_failed" | "deadline";
+			/** Execution phase at failure time; never a submission rejection when post_start. */
+			phase: SdkPromptFailurePhase;
+			/** Bounded failure-origin category; `unknown` when attribution is uncertain. */
+			category: SdkPromptFailureCategory;
+			/** Bounded safe provider/transport classifier when the provider supplied one. */
+			providerCode?: string;
+	  };
 
 /** Exactly one selector per lookup. */
 export type TurnPromptStatusSelector = { clientRef: string } | { commandId: string; turnId: string };

@@ -134,8 +134,11 @@ describe("reconciliation-store", () => {
 			outcome: {
 				kind: "failed",
 				code: "prompt_failed",
-				message: "Agent run failed.",
+				message: "Provider failure after execution started.",
 				provenance: "agent_failed",
+				phase: "post_start",
+				category: "provider_transport",
+				providerCode: "provider_unavailable",
 			},
 			error: { code: "provider_unavailable", message: "Agent run failed." },
 		});

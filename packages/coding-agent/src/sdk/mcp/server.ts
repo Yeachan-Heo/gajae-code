@@ -150,7 +150,7 @@ function mcpOperationError(
 const MCP_LIFECYCLE_ACTOR = { id: "gjc-sdk-mcp", namespace: "sdk:mcp" } as const;
 const ROUTER_START_TIMEOUT_MS = 3_000;
 const ROUTER_STOP_TIMEOUT_MS = 5_000;
-type LifecycleMutationOperation = Exclude<SessionLifecycleOperation, "session.list">;
+type LifecycleMutationOperation = Exclude<SessionLifecycleOperation, "session.lookup" | "session.list">;
 
 function isLifecycleOperation(operation: string): operation is LifecycleMutationOperation {
 	return (

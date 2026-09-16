@@ -28,7 +28,7 @@ import type {
 	Usage,
 } from "../types";
 import { normalizeSystemPrompts } from "../utils";
-import { kCursorExecResolved } from "../utils/block-symbols";
+import { kProviderResolvedToolCall } from "../utils/block-symbols";
 import { AssistantMessageEventStream } from "../utils/event-stream";
 import { transportFailureFacts } from "../utils/fallback-transport";
 import { FirstEventTimeoutError, getStreamFirstEventTimeoutMs, getStreamIdleTimeoutMs } from "../utils/idle-iterator";
@@ -2384,7 +2384,7 @@ type ToolCallState = ToolCall & {
 	index: number;
 	partialJson?: string;
 	kind: "mcp" | "todo_write" | "native" | "cursor-exec";
-	[kCursorExecResolved]?: true;
+	[kProviderResolvedToolCall]?: true;
 };
 
 interface BlockState {
@@ -4320,7 +4320,7 @@ function synthesizeCursorExecToolCall(
 		arguments: cursorJsonSafeValue(args) as Record<string, unknown>,
 		index: output.content.length,
 		kind: "cursor-exec",
-		[kCursorExecResolved]: true,
+		[kProviderResolvedToolCall]: true,
 	};
 	output.content.push(block);
 	const contentIndex = output.content.length - 1;

@@ -125,6 +125,16 @@ export function sessionLogsDir(cwd: string, gjcSessionId: string): string {
 export function sessionRuntimeDir(cwd: string, gjcSessionId: string): string {
 	return path.join(sessionRoot(cwd, gjcSessionId), "runtime");
 }
+/**
+ * The session-derived runtime-state marker owned by `gjcSessionId` — the marker a session
+ * writes when the process carries no coordinator pin for it, and the one a committed cwd move
+ * relocates. The coordinator pin is a separate path resolved from
+ * `GJC_COORDINATOR_SESSION_STATE_FILE`, so only the sidecar may decide which of the two a
+ * session owns; callers use this for the derived half of that decision.
+ */
+export function sessionRuntimeStatePath(cwd: string, gjcSessionId: string): string {
+	return path.join(sessionRuntimeDir(cwd, gjcSessionId), "runtime-state.json");
+}
 export function sessionIpykernelsDir(cwd: string, gjcSessionId: string): string {
 	return path.join(sessionRoot(cwd, gjcSessionId), "ipykernels");
 }

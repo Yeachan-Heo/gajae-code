@@ -73,6 +73,8 @@ curl -fsSL https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/main/scripts
 
 From a checkout: `bun run install:dev`, then `bun run dev` / `bun run dev:link`. The setup command installs dependencies, rebuilds the native addon, links the source CLI, and installs bundled defaults. See the repository `AGENTS.md` for the development workflow.
 
+From a `git worktree add` checkout, run `bun run setup:worktree` instead: it installs dependencies and builds the native addon without touching the global `gjc` link, git hooks, or user defaults of your primary checkout. `bun run dev:doctor -- --worktree` reports whether the checkout can resolve workspace packages and load the native addon. `install:dev` is for the primary checkout only.
+
 ## Windows notes
 
 GJC's shell tool requires a bash-compatible shell on Windows. After a binary install, the PowerShell installer records Git Bash if it finds it. Options:

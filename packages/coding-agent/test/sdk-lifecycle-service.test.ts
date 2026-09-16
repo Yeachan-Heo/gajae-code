@@ -99,6 +99,61 @@ describe("SessionLifecycleService", () => {
 		expect(new Set([first.client.calls[0]?.options.idempotencyKey, actorKey, requestKey, operationKey]).size).toBe(4);
 	});
 
+	it("looks up a create outcome with the public request identity without replaying create", async () => {
+		const { service, client } = serviceWith({ ok: true, result: { sessionId: "recovered", cwd: "/repo" } });
+		const result = await service.lookup({
+			actor,
+			capability: "session.lookup",
+			operation: "session.create",
+			requestKey: "create-request",
+			target,
+		});
+
+		expect(result).toEqual({
+			ok: true,
+			operation: "session.lookup",
+			status: "found",
+			request: { operation: "session.create", requestKey: "create-request" },
+			result: { sessionId: "recovered", cwd: "/repo" },
+		});
+		expect(client.calls).toEqual([
+			{
+				operation: "session.lookup",
+				input: { operation: "session.create", target },
+				options: {
+					idempotencyKey: deriveSessionLifecycleIdempotencyKey(actor, "create-request", "session.create"),
+				},
+			},
+		]);
+	});
+
+	it("distinguishes missing, conflicting, pending, uncertain, and recorded terminal create outcomes", async () => {
+		for (const [code, status, certainty] of [
+			["not_found", "not_found", "uncertain"],
+			["idempotency_conflict", "conflict", "uncertain"],
+			["lifecycle_pending", "pending", "uncertain"],
+			["terminal_uncertain", "uncertain", "uncertain"],
+			["invalid_input", "terminal", "terminal"],
+		] as const) {
+			const { service, client } = serviceWith({ ok: false, error: { code, message: `lookup:${code}` } });
+			const result = await service.lookup({
+				actor,
+				capability: "session.lookup",
+				operation: "session.create",
+				requestKey: `lookup-${code}`,
+				target,
+			});
+			expect(result).toMatchObject({
+				ok: false,
+				operation: "session.lookup",
+				status,
+				certainty,
+				error: { code, message: `lookup:${code}` },
+			});
+			expect(client.calls).toHaveLength(1);
+		}
+	});
+
 	it("maps every lifecycle operation to its Broker operation and input", async () => {
 		const { service, client } = serviceWith();
 		await service.create({ actor, capability: "session.create", requestKey: "create", target: { cwd: "/create" } });

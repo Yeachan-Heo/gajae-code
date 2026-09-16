@@ -61,6 +61,8 @@ describe("SDK package exports", () => {
 	});
 	it("loads the public SDK and bus package subpaths", () => {
 		expect(publicSdk.createAgentSession).toBeFunction();
+		expect(publicSdk.lifecycle.SessionLifecycleService).toBeFunction();
+		expect(publicSdk.lifecycle.SessionLifecycleService.prototype.lookup).toBeFunction();
 		expect(bus.createNotificationsExtension).toBeFunction();
 		expect(publicSdk.UnknownModelProfileError).toBeFunction();
 		expect(publicSdk.ModelProfileRegistryError).toBeFunction();

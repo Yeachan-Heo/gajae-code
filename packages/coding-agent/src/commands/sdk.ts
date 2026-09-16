@@ -80,20 +80,52 @@ export async function lifecycleArgs(
 }
 
 /**
- * How long a session host tolerates the complete absence of a live broker
- * publication before treating itself as orphaned. Hosts intentionally survive
- * broker restarts (a replacement broker republishes discovery within seconds),
- * so this must comfortably exceed a restart window while still bounding the
- * lifetime of hosts whose broker is gone for good — otherwise every crashed or
+ * How long a session host tolerates losing the broker it was launched under
+ * before treating itself as orphaned.
+ *
+ * A host is reachable only through its own broker: routing lives in the broker
+ * process and a replacement broker never adopts hosts from an earlier
+ * incarnation, so a host that outlives its broker is stranded no matter how
+ * healthy the agent directory looks afterwards. The grace still has to outlast
+ * a restart-shaped gap, because a broker that is merely slow to republish must
+ * never cost a live host — but it must stay finite, or every crashed or
  * torn-down broker leaks a detached multi-hundred-megabyte host forever.
  */
 export const SESSION_HOST_BROKER_ABSENCE_GRACE_MS = 10 * 60_000;
 const SESSION_HOST_BROKER_POLL_MS = 15_000;
 
 /**
- * Resolves only once no live broker publication has been observable in
- * `agentDir` for the full grace window. A reappearing broker (including a
- * replacement with a different pid) resets the window; an unreadable
+ * Identity of the broker incarnation an observation describes, or `null` when
+ * it carries no usable identity.
+ *
+ * Two observations with different identities are two different brokers, never
+ * the same broker seen twice: `incarnation` is start-time derived, so it
+ * separates a genuine survivor from a successor that merely reused the pid.
+ */
+function brokerPublicationIdentity(observation: unknown): string | null {
+	if (!observation || typeof observation !== "object") return null;
+	const { ownerId, pid, incarnation } = observation as {
+		ownerId?: unknown;
+		pid?: unknown;
+		incarnation?: unknown;
+	};
+	const parts = [
+		typeof ownerId === "string" ? ownerId : "",
+		Number.isSafeInteger(pid) ? String(pid) : "",
+		typeof incarnation === "string" ? incarnation : "",
+	];
+	return parts.some(part => part !== "") ? parts.join(":") : null;
+}
+
+/**
+ * Resolves only once the broker this host was launched under has been
+ * unobservable for the full grace window.
+ *
+ * The first identifiable publication pins that broker. A later publication from
+ * a different incarnation is a replacement, and a replacement cannot route to
+ * this host — observing one is evidence of being stranded, not of being alive —
+ * so it accrues against the bound instead of resetting it. Only the pinned
+ * broker reappearing resets the window. An unreadable or unidentifiable
  * publication is not proof of orphanhood but accrues against the same bound.
  */
 export async function watchSessionHostBrokerLiveness(deps: {
@@ -110,6 +142,7 @@ export async function watchSessionHostBrokerLiveness(deps: {
 	const graceMs = deps.graceMs ?? SESSION_HOST_BROKER_ABSENCE_GRACE_MS;
 	const pollMs = deps.pollMs ?? SESSION_HOST_BROKER_POLL_MS;
 	let absentSince: number | null = null;
+	let ownBroker: string | null = null;
 	for (;;) {
 		let live: unknown = null;
 		try {
@@ -117,7 +150,9 @@ export async function watchSessionHostBrokerLiveness(deps: {
 		} catch {
 			// Transient read failures are ambiguity, not proof of orphanhood.
 		}
-		if (live) {
+		const identity = brokerPublicationIdentity(live);
+		if (identity !== null && (ownBroker === null || identity === ownBroker)) {
+			ownBroker ??= identity;
 			absentSince = null;
 		} else {
 			absentSince ??= now();
@@ -872,7 +907,7 @@ class SdkSessionHelp extends Command {
 			description:
 				"session list scope: repo (default), cwd, worktree, or all; search scope: repo (default), pwd, or global",
 		}),
-		limit: Flags.integer({ description: "Search page size from 1 to 100" }),
+		limit: Flags.integer({ description: "Search or raw session.list page size from 1 to 100" }),
 		json: Flags.boolean({ description: "Render search as the SdkSearchResultV1 JSON envelope" }),
 		text: Flags.string({ description: "Prompt text for send (alternative to --json-input)" }),
 		"op-ref": Flags.string({ description: "Operation reference for send (defaults to a generated ULID)" }),
@@ -883,6 +918,7 @@ class SdkSessionHelp extends Command {
 		strict: Flags.boolean({ description: "tail --strict: fail closed on retention gaps" }),
 		"until-idle": Flags.boolean({ description: "tail --until-idle: exit after an observed terminal turn state" }),
 		"all-events": Flags.boolean({ description: "tail --all-events: include every event-ring kind" }),
+		page: Flags.boolean({ description: "raw global session.list: return exactly one broker page" }),
 	};
 	async run(): Promise<void> {}
 }
@@ -983,6 +1019,8 @@ class SdkSessionCommand extends Command {
 			strict: Boolean(flagRec.strict),
 			untilIdle: Boolean(flagRec["until-idle"]),
 			allEvents: Boolean(flagRec["all-events"]),
+			page: Boolean(flagRec.page),
+			limit: flagRec.limit as number | undefined,
 			agentDir: flagRec["agent-dir"] as string | undefined,
 			repo: flagRec.repo as string | undefined,
 			scope: flagRec.scope as string | undefined,
@@ -1110,6 +1148,15 @@ export default class Sdk extends Command {
 					const startupDelayMs = Number(process.env.GJC_SDK_TEST_BROKER_STARTUP_DELAY_MS ?? 0);
 					if (Number.isSafeInteger(startupDelayMs) && startupDelayMs > 0 && startupDelayMs <= 10_000)
 						await Bun.sleep(startupDelayMs);
+					// The real broker-internal entry point is the only place that reads this
+					// launcher-supplied environment variable; it is validated here and handed
+					// to Broker as a typed setting, never read a second time inside broker.ts
+					// from process.env directly.
+					const restartRequestEnv = process.env.GJC_BROKER_RESTART_REQUEST;
+					const restartRequestId =
+						typeof restartRequestEnv === "string" && /^[A-Za-z0-9_-]{1,256}$/.test(restartRequestEnv)
+							? restartRequestEnv
+							: undefined;
 					const candidate = new Broker({
 						agentDir,
 						masterOrphanGraceMs: (await Settings.loadForScope({ cwd: process.cwd(), agentDir })).get(
@@ -1124,6 +1171,7 @@ export default class Sdk extends Command {
 								await settings.close();
 							}
 						},
+						...(restartRequestId === undefined ? {} : { restartRequestId }),
 					});
 					broker = candidate;
 					await candidate.start();

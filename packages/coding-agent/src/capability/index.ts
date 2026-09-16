@@ -467,12 +467,12 @@ export async function loadCapabilityForHome<T>(
 	// read another profile's SYSTEM/RULES/AGENTS, skills, commands, hooks,
 	// settings, or executable descriptors.
 	const canonicalHome = await canonicalizeThroughExistingAncestor(resolvedHome);
+	const homeStats = await fs.stat(canonicalHome);
+	const homeIdentity = { dev: homeStats.dev, ino: homeStats.ino };
 	const trustedHome = await canonicalizeThroughExistingAncestor(getTrustedHomeDir());
 	const isolatedHome = canonicalHome !== trustedHome;
 	const lexicalCwd = options.cwd === undefined ? canonicalHome : path.resolve(options.cwd);
 	const cwd = await canonicalizeThroughExistingAncestor(lexicalCwd);
-	const homeStats = await fs.stat(canonicalHome);
-	const homeIdentity = { dev: homeStats.dev, ino: homeStats.ino };
 	// Every explicit-home cwd must resolve inside the supplied physical home.
 	// Allowing an outside cwd would let repository and plugin-registry discovery
 	// walk unrelated ancestors before the isolated boundary can take effect.

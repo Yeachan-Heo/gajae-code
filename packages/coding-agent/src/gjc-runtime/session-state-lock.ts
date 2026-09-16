@@ -38,36 +38,97 @@ const EMPTY_FILE_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca4959
 const LOCK_ACQUIRE_RETRY_MS = 5;
 const LOCK_ACQUIRE_MAX_RETRY_MS = 100;
 const LOCK_ACQUIRE_TIMEOUT_MS = 5_000;
+/**
+ * Ceiling on total waiting, however much progress the lock is making.
+ *
+ * `LOCK_ACQUIRE_TIMEOUT_MS` bounds waiting WITHOUT PROGRESS (see
+ * {@link creditLockHandoffProgress}); this bounds waiting altogether, so a contender behind
+ * an unboundedly busy lock still fails rather than blocking its caller forever. It matches
+ * the namespace-wide `locks/mutation.lock` budget that encloses these same writes, so the
+ * inner and outer locks cannot disagree about how long a write may take.
+ */
+const LOCK_ACQUIRE_MAX_WAIT_MS = 60_000;
 const LOCK_STALE_MS = 30_000;
 const RELEASED_TRANSITION_GRACE_MS = 1_000;
 const SESSION_STATE_LOCK_BUSY = Symbol("session-state-lock-busy");
 
 interface LockRetryBudget {
+	/** When the current no-progress window began; moved forward by an observed handoff. */
 	startedAt: number;
+	/** When this acquisition began waiting; never moved, and bounds total waiting. */
+	firstAttemptAt: number;
 	nextDelayMs: number;
 	attempts: number;
 	nonBlocking: boolean;
+	/** Identity of the holder observed on the previous contended attempt, if any. */
+	observedHolder?: string;
 }
 
 function lockRetryBudget(nonBlocking = false): LockRetryBudget {
-	return { startedAt: performance.now(), nextDelayMs: LOCK_ACQUIRE_RETRY_MS, attempts: 0, nonBlocking };
+	const now = performance.now();
+	return { startedAt: now, firstAttemptAt: now, nextDelayMs: LOCK_ACQUIRE_RETRY_MS, attempts: 0, nonBlocking };
+}
+
+/**
+ * Credit the acquisition budget when the lock is observed to have CHANGED HANDS.
+ *
+ * The acquisition deadline exists to bound waiting on a lock that is stuck, but on its own
+ * it cannot tell "stuck" from "busy": it expires just the same while peers take and release
+ * the lock normally in front of this contender. That is the starvation this protocol
+ * actually suffers from — several gjc processes write one `session-states/<id>.json`, each
+ * inside the 60s namespace transaction lock, so a critical section legitimately outlasting
+ * the 5s deadline costs every waiter its runtime-state update outright.
+ *
+ * A holder identity that differs from the one seen on the previous contended attempt, and
+ * that this contender did not itself produce, is positive proof that a PEER took and gave
+ * up the lock — so the no-progress window restarts from that observation. An UNCHANGED
+ * identity credits nothing, which keeps a genuinely wedged lock — the case the deadline is
+ * for — failing on exactly its original schedule.
+ *
+ * `selfCaused` is what separates a handoff from a livelock. A contender that reclaims an
+ * abandoned record sees a different identity next round purely because of its own removal;
+ * crediting that would let an endlessly recreated dead claim spin until the total-wait
+ * ceiling instead of failing on the acquisition deadline. Those rounds are already bounded
+ * by their own {@link lockRetryExhausted} check, so they credit nothing here.
+ *
+ * {@link LOCK_ACQUIRE_MAX_WAIT_MS} bounds total waiting regardless, so progress can never be
+ * credited indefinitely.
+ */
+function creditLockHandoffProgress(budget: LockRetryBudget, holder: string | undefined, selfCaused: boolean): void {
+	if (holder === undefined) return;
+	const previous = budget.observedHolder;
+	budget.observedHolder = holder;
+	if (selfCaused || previous === undefined || previous === holder) return;
+	budget.startedAt = performance.now();
+	// A handoff means the wait restarts from a fresh, responsive lock rather than from
+	// whatever backoff the previous holder's tenure had grown to.
+	budget.nextDelayMs = LOCK_ACQUIRE_RETRY_MS;
 }
 
 function lockRetryElapsedMs(budget: LockRetryBudget): number {
 	return Math.max(0, performance.now() - budget.startedAt);
 }
 
+/** Milliseconds left before either the no-progress or the total-wait bound is reached. */
+function lockRetryRemainingMs(budget: LockRetryBudget): number {
+	const now = performance.now();
+	return Math.min(
+		LOCK_ACQUIRE_TIMEOUT_MS - Math.max(0, now - budget.startedAt),
+		LOCK_ACQUIRE_MAX_WAIT_MS - Math.max(0, now - budget.firstAttemptAt),
+	);
+}
+
 function lockRetryExhausted(budget: LockRetryBudget): boolean {
-	return lockRetryElapsedMs(budget) >= LOCK_ACQUIRE_TIMEOUT_MS;
+	return lockRetryRemainingMs(budget) <= 0;
 }
 
 async function waitForLockRetry(budget: LockRetryBudget): Promise<boolean> {
 	budget.attempts++;
-	const remainingMs = LOCK_ACQUIRE_TIMEOUT_MS - lockRetryElapsedMs(budget);
+	const remainingMs = lockRetryRemainingMs(budget);
 	if (remainingMs <= 0) return false;
 	await Bun.sleep(Math.min(budget.nextDelayMs, remainingMs));
 	budget.nextDelayMs = Math.min(LOCK_ACQUIRE_MAX_RETRY_MS, budget.nextDelayMs * 2);
-	return lockRetryElapsedMs(budget) < LOCK_ACQUIRE_TIMEOUT_MS;
+	return !lockRetryExhausted(budget);
 }
 
 /**
@@ -178,7 +239,14 @@ async function joinLocalTransitionQueue(
 	SessionStateLockTestHooks.afterLocalTransitionQueued?.(transitionDir);
 	queue.waiters.push(ready.resolve);
 	await ready.promise;
-	if (retryBudget) retryBudget.startedAt += Math.max(0, performance.now() - queuedAt);
+	// A same-process queue wait is this runtime's own serialization, not filesystem
+	// contention: it is credited against BOTH bounds so a descheduled local owner cannot
+	// time out its own successor.
+	if (retryBudget) {
+		const queuedMs = Math.max(0, performance.now() - queuedAt);
+		retryBudget.startedAt += queuedMs;
+		retryBudget.firstAttemptAt += queuedMs;
+	}
 	return queue;
 }
 
@@ -614,6 +682,36 @@ function persistFailureClass(error: unknown): string {
 	return `error:${boundedPersistFailureClassPart(persistFailureConstructorName(error), "Object")}:code=${boundedPersistFailureClassPart(code, "none")}:errno=${boundedPersistFailureClassPart(errno, "none")}`;
 }
 
+/**
+ * The refusal reasons that mean ONLY "someone else held the lock the whole time I waited".
+ *
+ * Each is a contention verdict the acquisition protocol reached without learning anything
+ * about the state file itself, so the same write attempted later can still succeed. Every
+ * other reason is a standing condition — an unsafe path type, an unprovenanced owner, a
+ * failed release, an inspection fault — that a retry would only repeat, so those stay
+ * fail-closed and are reported once.
+ */
+const CONTENTION_RETRYABLE_LOCK_REASONS: ReadonlySet<SessionStateLockUnavailableReason> = new Set([
+	"acquire_timeout",
+	"lock_owner_live_or_unverifiable",
+	"lock_owner_record_fresh",
+	"transition_claim_timeout",
+]);
+
+/**
+ * Whether a failed persist lost only a race and is worth attempting again.
+ *
+ * A coordinator runtime-state update that is dropped on contention is not recoverable by
+ * any later write: the coordinator keeps reporting a stale lifecycle/activity snapshot for
+ * that session until some unrelated event happens to win the lock. Retrying a contention
+ * refusal is therefore repairing a dropped update, not masking a fault — and it is
+ * deliberately limited to the reasons that carry no information about the document.
+ */
+export function isRetryableSessionStateLockContention(error: unknown): boolean {
+	const reason = sessionStateLockFailureFields(error).reason;
+	return reason !== undefined && CONTENTION_RETRYABLE_LOCK_REASONS.has(reason);
+}
+
 export const PERSIST_FAILURE_WARN_WINDOW_MS = 30_000;
 const persistFailureLastWarnedAt = new Map<string, number>();
 
@@ -964,10 +1062,22 @@ function sameRegularFileIdentity(left: fsSync.BigIntStats, right: fsSync.BigIntS
 	);
 }
 
-function ownerSnapshotFrom(stat: fsSync.BigIntStats, bytes: Buffer): LockOwnerSnapshot {
+/** Whether two path/descriptor stats name the same Windows file object. */
+function sameWindowsFileObject(left: fsSync.BigIntStats, right: fsSync.BigIntStats): boolean {
+	return left.isFile() && right.isFile() && left.dev === right.dev && left.ino === right.ino;
+}
+
+function ownerSnapshotFrom(
+	stat: fsSync.BigIntStats,
+	bytes: Buffer,
+	identityStat: fsSync.BigIntStats = stat,
+): LockOwnerSnapshot {
 	return {
-		dev: stat.dev,
-		ino: stat.ino,
+		// Windows may refresh descriptor dev/ino metadata after an in-place
+		// truncate/write even though the pathname still names the same file
+		// object. Preserve the pre-mutation identity when one brackets the read.
+		dev: identityStat.dev,
+		ino: identityStat.ino,
 		nlink: stat.nlink,
 		size: stat.size,
 		mtimeNs: stat.mtimeNs,
@@ -1044,12 +1154,12 @@ async function captureWindowsLockOwner(lockFile: string, flags: number): Promise
 			throw new SessionStateLockUnavailableError(new Error("Lock path became a reparse point under the read."));
 		// The open landed on the object the pre-`lstat` judged, and the pathname still
 		// names it. Either disagreement means the bytes have no attributable identity.
-		if (!sameRegularFileIdentity(before, opened)) return null;
-		if (!relinked || !sameRegularFileIdentity(before, relinked)) return null;
+		if (!sameWindowsFileObject(before, opened)) return null;
+		if (!relinked || !sameWindowsFileObject(before, relinked)) return null;
 		const bytes = await handle.readFile();
 		const settled = await handle.stat({ bigint: true });
 		if (!sameRegularFileIdentity(opened, settled) || settled.size !== BigInt(bytes.byteLength)) return null;
-		return ownerSnapshotFrom(settled, bytes);
+		return ownerSnapshotFrom(settled, bytes, before);
 	} finally {
 		await handle.close().catch(() => undefined);
 	}
@@ -1382,11 +1492,11 @@ async function rewriteHeldOwnerRecord(
 	try {
 		const opened = await handle.stat({ bigint: true });
 		if (!opened.isFile()) throw new SessionStateLockUnavailableError(new Error("Owner record is not regular."));
-		if (before && !sameRegularFileIdentity(before, opened))
+		if (before && !sameWindowsFileObject(before, opened))
 			throw new SessionStateLockUnavailableError(new Error("Owner record changed while opening for rewrite."));
 		if (before) {
 			const relinked = await fs.lstat(file, { bigint: true }).catch(() => null);
-			if (!relinked || !sameRegularFileIdentity(opened, relinked))
+			if (!relinked || !sameWindowsFileObject(opened, relinked))
 				throw new SessionStateLockUnavailableError(new Error("Owner pathname changed while opening for rewrite."));
 		}
 		const currentBytes = await handle.readFile();
@@ -1402,9 +1512,12 @@ async function rewriteHeldOwnerRecord(
 		await SessionStateLockTestHooks.beforeOwnerRecordRewrite?.(file);
 		rewriteHookPassed = true;
 		await writeOwnerBytes(handle, replacementBytes);
-		const rewritten = await handle.stat({ bigint: true });
 		const canonical = await captureRegularLockOwner(file);
-		if (!canonical || canonical.dev !== rewritten.dev || canonical.ino !== rewritten.ino)
+		// On Windows, an in-place truncate/write can expose refreshed descriptor
+		// metadata even though the file object is unchanged. The descriptor opened
+		// before mutation is the stable identity bracket; the path capture still
+		// proves that the pathname resolves to that same object after the rewrite.
+		if (!canonical || canonical.dev !== opened.dev || canonical.ino !== opened.ino)
 			throw new SessionStateLockUnavailableError(new Error("Owner pathname changed after rewrite."));
 		if (canonical.bytes !== replacementBytes.toString("utf8")) {
 			let successor: unknown;
@@ -2216,7 +2329,11 @@ async function runLockPathTransition<T>(
 				throw new SessionStateLockUnavailableError(error);
 			if (await joinLocalTurn()) continue;
 			await SessionStateLockTestHooks.afterTransitionClaimContention?.(transitionDir);
+			// Claims are held only for pathname bookkeeping, so a changed claim identity is
+			// proof that contenders are cycling through rather than that one is wedged.
+			const observedClaim = await observedLockHolderIdentity(transitionDir);
 			const reclaimed = await reclaimStaleTransitionClaim(transitionDir, quarantineName);
+			creditLockHandoffProgress(budget, observedClaim, reclaimed);
 			// One safe reclaim may make progress, but a try-acquire never follows a
 			// succession of contenders. A later maintenance pass can take the freed claim.
 			if (budget.nonBlocking) throw SESSION_STATE_LOCK_BUSY;
@@ -2614,6 +2731,29 @@ async function reclaimStaleDirectoryLock(
 }
 
 /**
+ * Identity of whatever currently occupies a lock or transition-claim pathname, for the
+ * sole purpose of telling a lock that is HANDING OFF from one that is stuck.
+ *
+ * Every owner record carries a fresh `randomUUID` token and every release rewrites the
+ * record, so hashing the exact bytes read distinguishes successive holders without
+ * parsing, trusting, or acting on their contents. Inode identity is folded in so that a
+ * record replaced by a byte-identical one still reads as a different holder.
+ *
+ * This is advisory only: it never authorizes a reclaim, and an unreadable or absent path
+ * yields `undefined`, which credits no progress. Failing to observe a handoff can only
+ * make this contender give up on its original schedule.
+ */
+async function observedLockHolderIdentity(lockPath: string): Promise<string | undefined> {
+	const snapshot = await captureRegularLockOwner(lockPath).catch(() => null);
+	if (snapshot) return `f:${snapshot.dev}:${snapshot.ino}:${snapshot.sha256}`;
+	// A legacy directory lock and a transition claim are directories; their identity is
+	// the directory incarnation itself, since a successor claim is a new inode.
+	const stat = await fs.lstat(lockPath, { bigint: true }).catch(() => null);
+	if (!stat?.isDirectory()) return undefined;
+	return `d:${stat.dev}:${stat.ino}:${stat.ctimeNs}`;
+}
+
+/**
  * Decide what actually occupies the lock path, without following it.
  *
  * @internal exported as the seam these decisions are tested through: a live legacy
@@ -2658,6 +2798,11 @@ export async function reclaimStaleSessionStateLock(lockFile: string, quarantineN
  * Taking the path, cleaning up a failed write, and releasing are all pathname transitions,
  * so each runs under the transition claim — never the caller's operation, which holds the
  * lock file itself and may run for as long as it needs.
+ *
+ * The acquisition deadline measures LACK OF PROGRESS, not total waiting: see
+ * {@link creditLockHandoffProgress}. A contender behind a queue of peers that are each
+ * taking and releasing the lock normally keeps waiting; one behind a lock that never moves
+ * still refuses promptly.
  */
 export async function withSessionStateFileLock<T>(stateFile: string, operation: () => Promise<T>): Promise<T> {
 	return await runWithSessionStateFileLock(stateFile, operation, lockRetryBudget());
@@ -2830,6 +2975,14 @@ async function runWithSessionStateFileLock<T>(
 			if (reclaim === "legacy_directory_unprovenanced") lastReason = "legacy_directory_owner_unprovenanced";
 			else if (reclaim === "owner_live_or_unverifiable") lastReason = "lock_owner_live_or_unverifiable";
 			else if (reclaim === "owner_record_fresh") lastReason = "lock_owner_record_fresh";
+			// A holder that differs from the one seen last round proves the lock is moving,
+			// so this contender is queued behind live peers rather than behind a wedge. A
+			// change this attempt's own reclaim produced is not a peer handoff.
+			creditLockHandoffProgress(
+				budget,
+				await observedLockHolderIdentity(lockFile),
+				reclaim === "owner_removed" || reclaim === "reclaimed",
+			);
 			SessionStateLockTestHooks.afterAcquireContention?.(lockFile, budget.attempts + 1, lockRetryElapsedMs(budget));
 			if (!(await waitForLockRetry(budget))) throw lockUnavailable(lockFile, lastReason, budget);
 		}

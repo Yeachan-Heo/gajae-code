@@ -10,9 +10,11 @@ import {
 	type ChatDaemonKind,
 	chatDaemonGeneration,
 	clearChatDaemonControlRequest,
+	clearChatDoctorControlRequest,
 	hasSafeChatDaemonStateShape,
 	readChatDaemonControlRequest,
 	readChatDaemonState,
+	readChatDoctorControlRequest,
 	releaseChatDaemonOwnership,
 	renewChatDaemonHeartbeat,
 } from "./chat-daemon-control";
@@ -24,6 +26,7 @@ import {
 	notificationConfigFromFile,
 	resolveNotificationProvider,
 } from "./config";
+import { doctorDaemonIdentityMatches, doctorDaemonOccupancySettled } from "./doctor-daemon-restart";
 
 export interface ChatDaemonRuntimeHandle {
 	start(): Promise<void>;
@@ -31,6 +34,26 @@ export interface ChatDaemonRuntimeHandle {
 	transportHealthy?(): boolean;
 	/** Executes operator commands that must run inside the owning daemon. */
 	bindExistingRoot?(request: ChatDaemonCommandBindInput): Promise<ChatDaemonCommandOutcome>;
+	prepareDoctorRestart?(): void;
+	cancelDoctorRestart?(): void;
+	doctorOccupancy?(): {
+		attached: number;
+		inflight: number;
+		inbound: number;
+		outbound: number;
+		cleanup: number;
+	};
+	doctorRestartReady?(): boolean;
+	doctorRestartStatus?(
+		identity: {
+			owner: "discord" | "slack";
+			ownerId: string;
+			generation: number;
+			incarnation: string;
+		},
+		requestId: string,
+		leaseExpiresAt: number,
+	): unknown;
 }
 
 export interface RunChatDaemonInternalDeps {
@@ -237,7 +260,47 @@ export async function runChatDaemonInternal(
 			);
 		};
 		const bindExistingRoot = activeRuntime.bindExistingRoot?.bind(activeRuntime);
+		let doctorPreparedRequestId: string | undefined;
 		while (!stopping) {
+			const doctorRequest = await readChatDoctorControlRequest(agentDir, kind);
+			if (doctorRequest) {
+				const identity = {
+					owner: kind,
+					ownerId,
+					generation: chatDaemonGeneration(kind),
+					incarnation: ownedIncarnation,
+				} as const;
+				// The shared predicate is the single definition of "this request addresses
+				// exactly me"; spelling the four fields out here would let this owner and
+				// the doctor client drift apart silently.
+				if (
+					doctorDaemonIdentityMatches(doctorRequest, identity) &&
+					(doctorRequest.leaseExpiresAt === undefined || doctorRequest.leaseExpiresAt > Date.now())
+				) {
+					if (doctorRequest.action === "prepare") {
+						activeRuntime.prepareDoctorRestart?.();
+						doctorPreparedRequestId = doctorRequest.requestId;
+					} else if (doctorRequest.action === "cancel" && doctorPreparedRequestId === doctorRequest.requestId) {
+						activeRuntime.cancelDoctorRestart?.();
+						await clearChatDoctorControlRequest(agentDir, kind, doctorRequest.requestId);
+						doctorPreparedRequestId = undefined;
+					} else if (doctorRequest.action === "commit" && doctorPreparedRequestId === doctorRequest.requestId) {
+						const occupancy = activeRuntime.doctorOccupancy?.();
+						if (
+							occupancy !== undefined &&
+							doctorDaemonOccupancySettled(occupancy) &&
+							activeRuntime.doctorRestartReady?.()
+						) {
+							// Keep committed intent durable until the restart
+							// coordinator proves old death/cleanup and successor
+							// publication.
+							stopping = true;
+							await stopRuntime();
+							doctorPreparedRequestId = undefined;
+						}
+					}
+				}
+			}
 			const request = await readChatDaemonControlRequest(agentDir, kind);
 			if (request?.ownerId === ownerId && request.incarnation === incarnation) {
 				await clearChatDaemonControlRequest(agentDir, kind, request.requestId);

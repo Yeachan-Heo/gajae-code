@@ -12,6 +12,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { failedPromptOutcome } from "../prompt-failure";
 import type { PromptReconciliationStatus, SdkPromptTerminalOutcome } from "../prompt-status";
 import type { ReceiptState } from "../receipt-state";
 import { reportableTurnResultContent, TURN_RESULT_CONTENT_MAX_BYTES, type TurnResultContent } from "../turn-result";
@@ -559,12 +560,16 @@ export function settleProcessRestart(
 ): DurableReconciliationRecord[] {
 	const isDeadlineOutcome = (outcome: SdkPromptTerminalOutcome | undefined): boolean =>
 		outcome?.kind === "failed" && outcome.provenance === "deadline";
-	const providerFailureOutcome = (error: { code: string; message: string }): SdkPromptTerminalOutcome => ({
-		kind: "failed",
-		code: "prompt_failed",
-		message: error.message,
-		provenance: "agent_failed",
-	});
+	const providerFailureOutcome = (
+		error: { code: string; message: string },
+		record: { startedAt?: number },
+	): SdkPromptTerminalOutcome =>
+		failedPromptOutcome({
+			code: "prompt_failed",
+			provenance: "agent_failed",
+			...(error.code !== "prompt_failed" ? { providerCode: error.code } : {}),
+			evidence: record.startedAt !== undefined ? { startedAt: record.startedAt } : {},
+		});
 	return records.map(record => {
 		if (record.kind === "steer") {
 			if (record.status !== "dispatching") return record;
@@ -592,13 +597,14 @@ export function settleProcessRestart(
 			const outcome: SdkPromptTerminalOutcome =
 				providerError &&
 				(pendingOutcome === undefined || isDeadlineOutcome(pendingOutcome) || pendingOutcome.kind === "stopped")
-					? providerFailureOutcome(providerErrorRecord)
-					: (pendingOutcome ?? {
-							kind: "failed",
+					? providerFailureOutcome(providerErrorRecord, record)
+					: (pendingOutcome ??
+						failedPromptOutcome({
 							code: "prompt_failed",
-							message: "Prompt did not complete before process restart.",
 							provenance: "agent_failed",
-						});
+							providerCode: "process_restart_uncertain",
+							evidence: record.startedAt !== undefined ? { startedAt: record.startedAt } : {},
+						}));
 			const preservedError =
 				providerError && preserveProviderError
 					? providerErrorRecord

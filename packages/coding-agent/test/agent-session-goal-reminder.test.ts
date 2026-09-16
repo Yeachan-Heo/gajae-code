@@ -6,6 +6,7 @@ import { getBundledModel } from "@gajae-code/ai/models";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { sessionRuntimeDir } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
+import { SessionStateLockUnavailableError } from "@gajae-code/coding-agent/gjc-runtime/session-state-lock";
 import * as sidecar from "@gajae-code/coding-agent/gjc-runtime/session-state-sidecar";
 import {
 	GJC_COORDINATOR_SESSION_ID_ENV,
@@ -374,6 +375,145 @@ describe("AgentSession active goal reminders", () => {
 			else process.env[GJC_COORDINATOR_SESSION_ID_ENV] = previousSessionId;
 		}
 	});
+
+	/**
+	 * A runtime-state update that loses the lock is dropped outright: nothing re-derives
+	 * the snapshot later, so the coordinator keeps reporting stale lifecycle/tool activity
+	 * for the session. A pure-contention refusal is therefore retried rather than warned
+	 * about and abandoned.
+	 */
+	it("retries a persist that lost only a lock race, then reports nothing", async () => {
+		const contention = new SessionStateLockUnavailableError({
+			lockPath: path.join(tempDir.path(), "runtime-state.json.lock"),
+			reason: "lock_owner_live_or_unverifiable",
+		});
+		const persisted = Promise.withResolvers<void>();
+		let calls = 0;
+		const persist = vi.spyOn(sidecar, "persistCoordinatorRuntimeStateFromEvent").mockImplementation(async () => {
+			calls++;
+			if (calls < 3) throw contention;
+			persisted.resolve();
+		});
+		const warned: string[] = [];
+		const warnSpy = vi.spyOn(logger, "warn").mockImplementation(message => {
+			if (message === "Failed to persist coordinator runtime state") warned.push(message);
+		});
+		const previousSessionId = process.env[GJC_COORDINATOR_SESSION_ID_ENV];
+		process.env[GJC_COORDINATOR_SESSION_ID_ENV] = session.sessionId;
+		try {
+			session.agent.emitExternalEvent({ type: "turn_start" });
+			await Promise.race([
+				persisted.promise,
+				Bun.sleep(30_000).then(() => {
+					throw new Error("Timed out waiting for the contended persist to be retried");
+				}),
+			]);
+
+			// The update landed on a later attempt instead of being dropped, so there is
+			// nothing to report.
+			expect(calls).toBe(3);
+			expect(warned).toEqual([]);
+		} finally {
+			if (previousSessionId === undefined) delete process.env[GJC_COORDINATOR_SESSION_ID_ENV];
+			else process.env[GJC_COORDINATOR_SESSION_ID_ENV] = previousSessionId;
+			persist.mockRestore();
+			warnSpy.mockRestore();
+		}
+	}, 60_000);
+
+	/**
+	 * A refusal that is not contention describes a standing condition a retry would only
+	 * repeat, so it must be reported on the first attempt rather than delayed.
+	 */
+	it("reports a non-contention persist failure immediately without retrying", async () => {
+		const refusal = new SessionStateLockUnavailableError({
+			lockPath: path.join(tempDir.path(), "runtime-state.json.lock"),
+			reason: "unsafe_lock_path_type",
+		});
+		let calls = 0;
+		const persist = vi.spyOn(sidecar, "persistCoordinatorRuntimeStateFromEvent").mockImplementation(async () => {
+			calls++;
+			throw refusal;
+		});
+		const warningLogged = Promise.withResolvers<void>();
+		const warned: Array<Record<string, unknown>> = [];
+		const warnSpy = vi.spyOn(logger, "warn").mockImplementation((message, metadata) => {
+			if (message === "Failed to persist coordinator runtime state") {
+				warned.push(metadata ?? {});
+				warningLogged.resolve();
+			}
+		});
+		const previousSessionId = process.env[GJC_COORDINATOR_SESSION_ID_ENV];
+		process.env[GJC_COORDINATOR_SESSION_ID_ENV] = session.sessionId;
+		try {
+			session.agent.emitExternalEvent({ type: "turn_start" });
+			await Promise.race([
+				warningLogged.promise,
+				Bun.sleep(1_000).then(() => {
+					throw new Error("Timed out waiting for an immediate non-contention persist failure");
+				}),
+			]);
+
+			expect(calls).toBe(1);
+			expect(warned).toHaveLength(1);
+			expect(warned[0]).toMatchObject({ event: "turn_start", reason: "unsafe_lock_path_type" });
+			expect(warned[0]).not.toHaveProperty("retries");
+		} finally {
+			if (previousSessionId === undefined) delete process.env[GJC_COORDINATOR_SESSION_ID_ENV];
+			else process.env[GJC_COORDINATOR_SESSION_ID_ENV] = previousSessionId;
+			persist.mockRestore();
+			warnSpy.mockRestore();
+		}
+	});
+
+	/**
+	 * Retrying is bounded: a lock that stays contended is still reported, and the report
+	 * records how many attempts were spent on it.
+	 */
+	it("gives up on persistent contention and records the attempts it spent", async () => {
+		const contention = new SessionStateLockUnavailableError({
+			lockPath: path.join(tempDir.path(), "runtime-state.json.lock"),
+			reason: "transition_claim_timeout",
+		});
+		let calls = 0;
+		const persist = vi.spyOn(sidecar, "persistCoordinatorRuntimeStateFromEvent").mockImplementation(async () => {
+			calls++;
+			throw contention;
+		});
+		const warningLogged = Promise.withResolvers<void>();
+		const warned: Array<Record<string, unknown>> = [];
+		const warnSpy = vi.spyOn(logger, "warn").mockImplementation((message, metadata) => {
+			if (message === "Failed to persist coordinator runtime state") {
+				warned.push(metadata ?? {});
+				warningLogged.resolve();
+			}
+		});
+		const previousSessionId = process.env[GJC_COORDINATOR_SESSION_ID_ENV];
+		process.env[GJC_COORDINATOR_SESSION_ID_ENV] = session.sessionId;
+		try {
+			session.agent.emitExternalEvent({ type: "turn_start" });
+			await Promise.race([
+				warningLogged.promise,
+				Bun.sleep(30_000).then(() => {
+					throw new Error("Timed out waiting for bounded persist retries to be exhausted");
+				}),
+			]);
+
+			// One initial attempt plus a bounded number of retries, never an unbounded loop.
+			expect(calls).toBe(4);
+			expect(warned).toHaveLength(1);
+			expect(warned[0]).toMatchObject({
+				event: "turn_start",
+				reason: "transition_claim_timeout",
+				retries: 3,
+			});
+		} finally {
+			if (previousSessionId === undefined) delete process.env[GJC_COORDINATOR_SESSION_ID_ENV];
+			else process.env[GJC_COORDINATOR_SESSION_ID_ENV] = previousSessionId;
+			persist.mockRestore();
+			warnSpy.mockRestore();
+		}
+	}, 60_000);
 
 	it("attributes a delayed persist failure to the document captured before a rescope", async () => {
 		const cwdA = path.join(tempDir.path(), "cwd-a");

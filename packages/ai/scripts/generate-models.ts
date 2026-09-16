@@ -98,42 +98,55 @@ export function injectCodexAstraModel(models: Model[]): void {
 }
 
 /**
- * Inject dedicated image generation models into providers that support them.
- * gpt-image-2 is registered under openai and openai-codex so the image
- * generation tool can route through a dedicated model instead of the active
- * chat model. These entries are image-only and should be excluded from the
- * chat model browser UI.
+ * Dedicated image generation models registered under openai and openai-codex so
+ * the image generation tool can route through a dedicated model instead of the
+ * active chat model. These entries are image-only and should be excluded from
+ * the chat model browser UI.
  */
-export function injectImageGenerationModels(models: Model[]): void {
-	const imageModelBase = {
-		id: "gpt-image-2",
-		name: "GPT Image 2",
+const IMAGE_GENERATION_MODELS = [
+	{ id: "gpt-image-2", name: "GPT Image 2" },
+	{ id: "gpt-image-2.5-sunburst", name: "GPT Image 2.5 Sunburst" },
+	{ id: "gpt-image-2.5-flare", name: "GPT Image 2.5 Flare" },
+] as const;
+
+function imageGenerationModelBase(id: string, name: string): Omit<Model, "api" | "provider" | "baseUrl"> {
+	return {
+		id,
+		name,
 		reasoning: false,
 		input: ["text"],
 		output: ["text", "image"],
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 		contextWindow: 128_000,
 		maxTokens: 16_384,
-	} satisfies Omit<Model, "api" | "provider" | "baseUrl">;
-	const hasOpenAI = models.some(m => m.provider === "openai" && m.id === "gpt-image-2");
-	if (!hasOpenAI) {
-		const openAIImageModel: Model<"openai-responses"> = {
-			...imageModelBase,
-			api: "openai-responses",
-			provider: "openai",
-			baseUrl: "",
-		};
-		models.push(openAIImageModel);
+	};
+}
+
+/**
+ * Inject dedicated image generation models into providers that support them.
+ */
+export function injectImageGenerationModels(models: Model[]): void {
+	for (const { id, name } of IMAGE_GENERATION_MODELS) {
+		if (!models.some(m => m.provider === "openai" && m.id === id)) {
+			const openAIImageModel: Model<"openai-responses"> = {
+				...imageGenerationModelBase(id, name),
+				api: "openai-responses",
+				provider: "openai",
+				baseUrl: "",
+			};
+			models.push(openAIImageModel);
+		}
 	}
-	const hasCodex = models.some(m => m.provider === "openai-codex" && m.id === "gpt-image-2");
-	if (!hasCodex) {
-		const codexImageModel: Model<"openai-codex-responses"> = {
-			...imageModelBase,
-			api: "openai-codex-responses",
-			provider: "openai-codex",
-			baseUrl: "",
-		};
-		models.push(codexImageModel);
+	for (const { id, name } of IMAGE_GENERATION_MODELS) {
+		if (!models.some(m => m.provider === "openai-codex" && m.id === id)) {
+			const codexImageModel: Model<"openai-codex-responses"> = {
+				...imageGenerationModelBase(id, name),
+				api: "openai-codex-responses",
+				provider: "openai-codex",
+				baseUrl: "",
+			};
+			models.push(codexImageModel);
+		}
 	}
 }
 

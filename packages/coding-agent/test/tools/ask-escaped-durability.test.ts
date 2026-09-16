@@ -10,6 +10,7 @@ import { readWorkflowStateJson } from "@gajae-code/coding-agent/gjc-runtime/stat
 import type { ToolSession } from "@gajae-code/coding-agent/tools";
 import { AskTool } from "@gajae-code/coding-agent/tools/ask";
 import { TempDir } from "@gajae-code/utils";
+import { terminalOnlyStream } from "../helpers/terminal-only-stream";
 
 function identityConverter(messages: AgentMessage[]): Message[] {
 	return messages.filter(
@@ -131,7 +132,7 @@ describe("AskTool escaped deep-interview durability (#4926)", () => {
 			const toolResults: Array<{ isError?: boolean; text: string }> = [];
 			const userMessage = { role: "user" as const, content: "Ask the durability question", timestamp: 1 };
 
-			const stream = agentLoop([userMessage], context, config, undefined, mock.stream);
+			const stream = agentLoop([userMessage], context, config, undefined, terminalOnlyStream(mock.stream));
 			for await (const event of stream) {
 				if (event.type === "tool_execution_end") {
 					const first = event.result.content?.[0];
@@ -140,9 +141,12 @@ describe("AskTool escaped deep-interview durability (#4926)", () => {
 			}
 
 			expect(mock.calls).toHaveLength(4);
-			expect(toolResults).toHaveLength(1);
-			expect(toolResults[0].isError).toBe(true);
-			expect(toolResults[0].text).toContain("\\uXXXX");
+			expect(toolResults).toHaveLength(3);
+			expect(
+				toolResults.slice(0, 2).every(result => result.isError === true && result.text.includes("\\uXXXX")),
+			).toBe(true);
+			expect(toolResults[2]).toMatchObject({ isError: true });
+			expect(toolResults[2]?.text).toContain("repeated malformed tool-call recovery");
 
 			const compact = await readDeepInterviewStateCompact(statePath);
 			expect(compact.pending_shells).toHaveLength(1);

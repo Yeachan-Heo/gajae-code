@@ -98,6 +98,8 @@ export interface MockResponse {
 	providerPayload?: AssistantMessage["providerPayload"];
 	/** Optional typed provider failure metadata for retry/fallback tests. */
 	transportFailure?: AssistantMessage["transportFailure"];
+	/** Bounded, redaction-safe failure classifier copied onto the terminal error message. */
+	errorCode?: string;
 	/** If set, the stream emits a terminal error event instead of completing. */
 	throw?: string | Error;
 	/** Delay before any event is emitted. Honors the call's AbortSignal. */
@@ -363,7 +365,7 @@ async function runMock(
 				: response.throw instanceof Error
 					? response.throw.message
 					: String(response.throw);
-		emitTerminalError(stream, model, startedAt, "error", message);
+		emitTerminalError(stream, model, startedAt, "error", message, response.errorCode ?? errorCodeOf(response.throw));
 		return;
 	}
 
@@ -485,6 +487,7 @@ function emitTerminalError(
 	startedAt: number,
 	reason: "aborted" | "error",
 	message: string,
+	errorCode?: string,
 ): void {
 	const failure: AssistantMessage = {
 		role: "assistant",
@@ -495,11 +498,23 @@ function emitTerminalError(
 		usage: emptyUsage(),
 		stopReason: reason as StopReason,
 		errorMessage: message,
+		...(errorCode !== undefined ? { errorCode } : {}),
 		timestamp: startedAt,
 		duration: Date.now() - startedAt,
 	};
 	stream.push({ type: "start", partial: failure });
 	stream.push({ type: "error", reason, error: failure });
+}
+
+/** Bounded safe-token classifier read off a thrown mock error, when present. */
+function errorCodeOf(value: unknown): string | undefined {
+	try {
+		if (!(value instanceof Error)) return undefined;
+		const code = (value as { code?: unknown }).code;
+		return typeof code === "string" && code.length <= 64 && /^[A-Za-z0-9._-]+$/.test(code) ? code : undefined;
+	} catch {
+		return undefined;
+	}
 }
 
 function sleep(ms: number, signal?: AbortSignal): Promise<void> {

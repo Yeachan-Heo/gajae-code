@@ -64,6 +64,22 @@ async function createRepo(prefix: string): Promise<string> {
 	return root;
 }
 
+/**
+ * A repo whose history tracks `.gjc/**` content, so `git worktree add` materializes a `.gjc`
+ * directory in the fresh worktree before restore runs — the collision the P1 fix must survive.
+ * `config.json` is tracked with distinct content to prove the launcher stash overrides it.
+ */
+async function createRepoWithTrackedGjc(prefix: string): Promise<string> {
+	const root = await createRepo(prefix);
+	await fs.mkdir(path.join(root, ".gjc", "qa"), { recursive: true });
+	await Bun.write(path.join(root, ".gjc", "qa", "tracked.json"), '{"tracked":true}\n');
+	await Bun.write(path.join(root, ".gjc", "config.json"), '{"source":"tracked"}\n');
+	// `.gjc` is commonly ignored by a global excludes file; force-add so the fixture tracks it.
+	run("git", ["add", "-f", ".gjc"], root);
+	run("git", ["commit", "-m", "track gjc"], root);
+	return root;
+}
+
 afterEach(async () => {
 	for (const root of cleanupRoots.splice(0)) {
 		const bucket = path.join(root, ".worktrees");
@@ -462,6 +478,103 @@ describe("default launch worktrees", () => {
 		await Bun.write(path.join(planned.worktreePath, "occupied"), "conflict\n");
 
 		expect(() => ensureLaunchWorktree(planned)).toThrow(/worktree_path_conflict/);
+	});
+
+	it("materializes a launcher-seeded .gjc-only target and restores its config", async () => {
+		const repo = await createRepo("gjc-launch-preseeded-worktree-");
+		const planned = planLaunchWorktree(repo, { enabled: true, detached: false, name: "feature/demo" });
+		if (!planned.enabled) throw new Error("expected enabled worktree plan");
+		// Reproduce paseo pre-creating the target with only its gjc config inside.
+		await fs.mkdir(path.join(planned.worktreePath, ".gjc"), { recursive: true });
+		await Bun.write(path.join(planned.worktreePath, ".gjc", "config.json"), '{"session":"demo"}\n');
+
+		const ensured = ensureLaunchWorktree(planned);
+		if (!ensured.enabled) throw new Error("expected enabled worktree");
+
+		expect(ensured.created).toBe(true);
+		expect(await Bun.file(path.join(ensured.worktreePath, ".git")).exists()).toBe(true);
+		expect(run("git", ["branch", "--show-current"], ensured.worktreePath)).toBe("feature/demo");
+		expect(await Bun.file(path.join(ensured.worktreePath, "README.md")).exists()).toBe(true);
+		expect(await Bun.file(path.join(ensured.worktreePath, ".gjc", "config.json")).text()).toBe(
+			'{"session":"demo"}\n',
+		);
+		// The evacuation stash must not linger beside the worktree.
+		expect(fsSync.existsSync(path.join(repo, ".worktrees", `.gjc-pre-wt-${testSlug("feature/demo")}`))).toBe(false);
+	});
+
+	it("still rejects a launcher-seeded target holding user files alongside .gjc", async () => {
+		const repo = await createRepo("gjc-launch-preseeded-conflict-");
+		const planned = planLaunchWorktree(repo, { enabled: true, detached: false, name: "feature/demo" });
+		if (!planned.enabled) throw new Error("expected enabled worktree plan");
+		await fs.mkdir(path.join(planned.worktreePath, ".gjc"), { recursive: true });
+		await Bun.write(path.join(planned.worktreePath, "notes.txt"), "user work\n");
+
+		expect(() => ensureLaunchWorktree(planned)).toThrow(/worktree_path_conflict/);
+		// The genuine conflict must leave the target untouched, not evacuate it.
+		expect(await Bun.file(path.join(planned.worktreePath, "notes.txt")).exists()).toBe(true);
+	});
+
+	it("refuses to evacuate .gjc when the sibling stash path is already occupied", async () => {
+		const repo = await createRepo("gjc-launch-preseeded-stash-collision-");
+		const planned = planLaunchWorktree(repo, { enabled: true, detached: false, name: "feature/demo" });
+		if (!planned.enabled) throw new Error("expected enabled worktree plan");
+		// The launcher pre-seeds the target with only its gjc config: the evacuation case.
+		await fs.mkdir(path.join(planned.worktreePath, ".gjc"), { recursive: true });
+		await Bun.write(path.join(planned.worktreePath, ".gjc", "config.json"), '{"session":"demo"}\n');
+		// A prior interrupted run (or unrelated user data) already occupies the sibling stash path.
+		const stashPath = path.join(repo, ".worktrees", `.gjc-pre-wt-${testSlug("feature/demo")}`);
+		await fs.mkdir(stashPath, { recursive: true });
+		await Bun.write(path.join(stashPath, "collision-marker.txt"), "precious\n");
+
+		expect(() => ensureLaunchWorktree(planned)).toThrow(/stash path already occupied/);
+		// The occupied stash must be preserved untouched, not overwritten by the evacuation.
+		expect(fsSync.existsSync(stashPath)).toBe(true);
+		expect(await Bun.file(path.join(stashPath, "collision-marker.txt")).text()).toBe("precious\n");
+	});
+
+	it("overlays the launcher config onto tracked .gjc content the checkout materializes", async () => {
+		const repo = await createRepoWithTrackedGjc("gjc-launch-tracked-gjc-sync-");
+		const planned = planLaunchWorktree(repo, { enabled: true, detached: false, name: "feature/demo" });
+		if (!planned.enabled) throw new Error("expected enabled worktree plan");
+		// The launcher pre-seeds only its gjc config, overlapping a tracked file name.
+		await fs.mkdir(path.join(planned.worktreePath, ".gjc"), { recursive: true });
+		await Bun.write(path.join(planned.worktreePath, ".gjc", "config.json"), '{"session":"demo"}\n');
+
+		const ensured = ensureLaunchWorktree(planned);
+		if (!ensured.enabled) throw new Error("expected enabled worktree");
+
+		expect(ensured.created).toBe(true);
+		expect(run("git", ["branch", "--show-current"], ensured.worktreePath)).toBe("feature/demo");
+		// Stash wins on the colliding name; tracked-only content survives the overlay.
+		expect(await Bun.file(path.join(ensured.worktreePath, ".gjc", "config.json")).text()).toBe(
+			'{"session":"demo"}\n',
+		);
+		expect(await Bun.file(path.join(ensured.worktreePath, ".gjc", "qa", "tracked.json")).text()).toBe(
+			'{"tracked":true}\n',
+		);
+		// The evacuation stash must not linger beside the worktree.
+		expect(fsSync.existsSync(path.join(repo, ".worktrees", `.gjc-pre-wt-${testSlug("feature/demo")}`))).toBe(false);
+	});
+
+	it("overlays the launcher config onto tracked .gjc content on the cancellable path", async () => {
+		const repo = await createRepoWithTrackedGjc("gjc-launch-tracked-gjc-cancellable-");
+		const planned = planLaunchWorktree(repo, { enabled: true, detached: false, name: "feature/demo" });
+		if (!planned.enabled) throw new Error("expected enabled worktree plan");
+		await fs.mkdir(path.join(planned.worktreePath, ".gjc"), { recursive: true });
+		await Bun.write(path.join(planned.worktreePath, ".gjc", "config.json"), '{"session":"demo"}\n');
+
+		const ensured = await ensureLaunchWorktreeCancellable(planned);
+		if (!ensured.enabled) throw new Error("expected enabled worktree");
+
+		expect(ensured.created).toBe(true);
+		expect(run("git", ["branch", "--show-current"], ensured.worktreePath)).toBe("feature/demo");
+		expect(await Bun.file(path.join(ensured.worktreePath, ".gjc", "config.json")).text()).toBe(
+			'{"session":"demo"}\n',
+		);
+		expect(await Bun.file(path.join(ensured.worktreePath, ".gjc", "qa", "tracked.json")).text()).toBe(
+			'{"tracked":true}\n',
+		);
+		expect(fsSync.existsSync(path.join(repo, ".worktrees", `.gjc-pre-wt-${testSlug("feature/demo")}`))).toBe(false);
 	});
 
 	it("rejects a missing locked worktree instead of running status in its absent path", async () => {

@@ -193,27 +193,35 @@ describe("issue #985: subagent dispatch auth fallback", () => {
 		expect(controller.currentSelector()).toBe("deepseek/deepseek-v4-fallback");
 	});
 
-	test("rebases to the parent when every override selector is unknown", async () => {
+	test("fails closed when every explicit override selector is unknown", async () => {
 		const registry = createMockRegistry({
 			models: [parentModel],
 			authedProviders: new Set(["deepseek"]),
 		});
-		const result = await resolveModelOverrideWithAuthFallback(
-			["unknown/first", "unknown/second"],
-			"deepseek/deepseek-v4-pro",
-			registry,
-		);
+		const patterns = ["unknown/first", "unknown/second"];
+		const result = await resolveModelOverrideWithAuthFallback(patterns, "deepseek/deepseek-v4-pro", registry);
 
 		expect(result.requestedModel).toBeUndefined();
-		expect(result.parentFallbackSelector).toBe("deepseek/deepseek-v4-pro");
+		expect(result.model).toBeUndefined();
+		expect(result.authFallbackUsed).toBe(false);
+		expect(result.parentFallbackSelector).toBeUndefined();
+		expect(result.skips).toEqual([
+			{ selector: "unknown/first", reason: "unknown_model" },
+			{ selector: "unknown/second", reason: "unknown_model" },
+		]);
 		const controller = new FallbackChainController(
-			{ role: "default", entries: [result.parentFallbackSelector!], origin: "subagent", explicitHead: true },
+			{
+				role: "default",
+				entries: patterns,
+				origin: "subagent",
+				explicitHead: true,
+			} satisfies ConfiguredFallbackChain,
 			1,
 		);
+		controller.seedResolution(result.activeIndex ?? 0, result.skips);
+		expect(controller.currentSelector()).toBeUndefined();
 		expect(controller.onAttemptFailure("server", "500")).toBe("exhausted");
-		expect(controller.tried).toEqual([
-			{ selector: "deepseek/deepseek-v4-pro", triggerClass: "server", reason: "500" },
-		]);
+		expect(controller.tried).toEqual([]);
 	});
 
 	test("rebases to a keyless parent fallback", async () => {
@@ -286,16 +294,19 @@ describe("issue #985: subagent dispatch auth fallback", () => {
 		expect(result.model?.provider).toBe("opencode-zen");
 	});
 
-	test("does not fall back when subagent and parent resolve to the same model", async () => {
+	test("does not fall back to parent when an unauthenticated explicit selector matches the parent", async () => {
 		const registry = createMockRegistry({
 			models: [sharedModel],
-			authedProviders: new Set(), // even with no auth, identical model means no benefit
+			authedProviders: new Set(),
 		});
 
 		const result = await resolveModelOverrideWithAuthFallback(["deepseek/shared-id"], "deepseek/shared-id", registry);
 
 		expect(result.authFallbackUsed).toBe(false);
-		expect(result.model?.id).toBe("shared-id");
+		expect(result.model).toBeUndefined();
+		expect(result.parentFallbackSelector).toBeUndefined();
+		expect(result.requestedModel?.id).toBe("shared-id");
+		expect(result.skips).toEqual([{ selector: "deepseek/shared-id", reason: "unauthenticated" }]);
 	});
 
 	test("treats keyless providers (kNoAuth marker) as authenticated", async () => {

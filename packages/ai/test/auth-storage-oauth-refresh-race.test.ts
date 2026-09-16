@@ -261,7 +261,7 @@ describe("AuthStorage OAuth refresh race", () => {
 	});
 
 	test("still disables when the failure is real (no concurrent rotation)", async () => {
-		if (!authStorage) throw new Error("test setup failed");
+		if (!authStorage || !store) throw new Error("test setup failed");
 
 		// Single-process scenario: refresh genuinely fails and no peer updated the
 		// row. The credential should still be soft-deleted.
@@ -274,9 +274,10 @@ describe("AuthStorage OAuth refresh race", () => {
 			},
 		]);
 
-		vi.spyOn(oauthUtils, "getOAuthApiKey").mockImplementation(async () => {
-			throw new Error('invalid_grant {"error":"invalid_grant"}');
-		});
+		const refreshSpy = vi
+			.spyOn(oauthUtils, "refreshOAuthToken")
+			.mockRejectedValue(new Error('invalid_grant {"error":"invalid_grant"}'));
+		const fetchSpy = vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("Unexpected OAuth network request"));
 
 		await withEnv(SUPPRESS_ANTHROPIC_ENV, async () => {
 			const apiKey = await authStorage!.getApiKey("anthropic", "session-real-failure");
@@ -284,6 +285,10 @@ describe("AuthStorage OAuth refresh race", () => {
 			expect(apiKey).toBeUndefined();
 			expect(events).toHaveLength(1);
 			expect(events[0]?.disabledCause).toContain("invalid_grant");
+			expect(refreshSpy).toHaveBeenCalledTimes(1);
+			expect(refreshSpy).toHaveBeenCalledWith("anthropic", expect.objectContaining({ refresh: "stale-refresh" }));
+			expect(fetchSpy).not.toHaveBeenCalled();
+			expect(store!.listAuthCredentials("anthropic")).toHaveLength(0);
 		});
 	});
 
@@ -437,6 +442,234 @@ describe("AuthStorage OAuth refresh race", () => {
 		await expect(second).resolves.toBe("access-rotated");
 		expect(refreshCalls).toBe(1);
 	});
+	for (const pinned of [false, true]) {
+		test(`caller cancellation preserves shared OAuth refresh and credential state (${pinned ? "pinned" : "auto"})`, async () => {
+			if (!authStorage || !store) throw new Error("test setup failed");
+			const storage = authStorage;
+			const credentialStore = store;
+			const provider = "unit-oauth-cancel";
+			const sessionId = "cancelled-refresh-session";
+			const refreshStarted = Promise.withResolvers<void>();
+			const allowRefresh = Promise.withResolvers<void>();
+			const controller = new AbortController();
+			let refreshCalls = 0;
+			oauthUtils.registerOAuthProvider({
+				id: provider,
+				name: "Unit OAuth Cancellation",
+				sourceId: "auth-storage-oauth-refresh-race-test",
+				async login() {
+					throw new Error("Unexpected login");
+				},
+				async refreshToken(credentials) {
+					refreshCalls += 1;
+					refreshStarted.resolve();
+					await allowRefresh.promise;
+					return {
+						...credentials,
+						access: "access-refreshed",
+						refresh: "refresh-refreshed",
+						expires: Date.now() + 60 * 60_000,
+					};
+				},
+				getApiKey(credentials) {
+					return credentials.access;
+				},
+			});
+			await storage.set(provider, {
+				type: "oauth",
+				access: "access-before",
+				refresh: "refresh-before",
+				expires: Date.now() - 60_000,
+			});
+			const rowsBefore = credentialStore.listAuthCredentials(provider);
+			const rowId = rowsBefore[0]!.id;
+			const selector = { kind: "id" as const, value: String(rowId) };
+			if (pinned) storage.setSessionCredentialSelector(sessionId, provider, selector);
+			const unavailable = vi.spyOn(storage, "markSessionCredentialUnavailable");
+			const caller = storage.getApiKey(provider, sessionId, { signal: controller.signal });
+			// Observe rejection immediately, including when an assertion fails before cancellation.
+			const outcome = caller.then(
+				value => ({ value, error: undefined }),
+				(error: unknown) => ({ value: undefined, error }),
+			);
+			let peer: Promise<string | undefined> | undefined;
+			try {
+				await refreshStarted.promise;
+				controller.abort();
+				const cancelled = await outcome;
+				// Inspect state before releasing the refresh: a later success can mask all-blocked fallback.
+				expect(storage.getEarliestUnblockAt(provider)).toBeUndefined();
+				expect(unavailable).not.toHaveBeenCalled();
+				expect(storage.resolveEffectiveCredentialSelector(provider, sessionId)).toEqual(
+					pinned ? selector : undefined,
+				);
+				expect(credentialStore.listAuthCredentials(provider)).toEqual(rowsBefore);
+				expect(events).toEqual([]);
+				expect(cancelled.error).toBeInstanceOf(Error);
+				expect((cancelled.error as Error).message).toBe("credential refresh aborted");
+				expect(cancelled.value).toBeUndefined();
+				peer = storage.getApiKey(provider, "uncancelled-refresh-peer");
+				allowRefresh.resolve();
+				expect(await peer).toBe("access-refreshed");
+				expect(await storage.getApiKey(provider, sessionId)).toBe("access-refreshed");
+				expect(refreshCalls).toBe(1);
+				expect(storage.getEarliestUnblockAt(provider)).toBeUndefined();
+				expect(storage.getSessionCredentialRowId(provider, sessionId)).toBe(rowId);
+				expect(events).toEqual([]);
+			} finally {
+				controller.abort();
+				allowRefresh.resolve();
+				// Drain the underlying shared refresh even if the cancelled caller has already settled.
+				peer ??= storage.getApiKey(provider, "cleanup-refresh-peer");
+				await Promise.allSettled([outcome, peer]);
+			}
+		});
+	}
+
+	test("a cancelled MCP-bound refresh does not poison the failure memo or block the credential", async () => {
+		if (!authStorage || !store) throw new Error("test setup failed");
+
+		// The bound token endpoint hangs on the first (cancelled) attempt so the
+		// caller aborts mid-refresh, then succeeds for the later request. Before the
+		// fix, the aborted attempt was recorded in the replay-guard memo, which
+		// re-threw on the next request and temp-blocked a healthy credential.
+		const gotFirstRequest = Promise.withResolvers<void>();
+		const releaseHang = Promise.withResolvers<void>();
+		let firstRequest = true;
+		const server = Bun.serve({
+			port: 0,
+			fetch: async () => {
+				if (firstRequest) {
+					firstRequest = false;
+					gotFirstRequest.resolve();
+					await releaseHang.promise; // hang until the caller aborts / cleanup
+					return new Response("aborted", { status: 500 });
+				}
+				return Response.json({ access_token: "fresh-access", refresh_token: "fresh-refresh", expires_in: 3600 });
+			},
+		});
+		try {
+			const origin = `http://localhost:${server.port}`;
+			const binding = { resourceOrigin: origin, tokenEndpoint: `${origin}/token` };
+			await authStorage.set("anthropic", [
+				{
+					type: "oauth",
+					access: "expired-access",
+					refresh: "bound-refresh",
+					expires: Date.now() - 60_000,
+					mcpBinding: binding,
+				},
+			]);
+			const credentialId = store.listAuthCredentials("anthropic")[0]!.id;
+
+			vi.spyOn(oauthUtils, "getOAuthApiKey").mockImplementation(async (provider, creds) => {
+				const credential = creds[provider];
+				if (!credential) return null;
+				return { newCredentials: credential, apiKey: credential.access };
+			});
+
+			const controller = new AbortController();
+			const cancelled = authStorage.refreshCredentialById(credentialId, controller.signal).then(
+				() => undefined,
+				(error: unknown) => error,
+			);
+			await gotFirstRequest.promise;
+			controller.abort();
+			const outcome = await cancelled;
+
+			// Cancellation propagates as an error, but must not disable or temp-block
+			// the credential.
+			expect(outcome).toBeInstanceOf(Error);
+			expect(events).toHaveLength(0);
+			expect(authStorage.getEarliestUnblockAt("anthropic")).toBeUndefined();
+
+			// A later normal request must NOT be re-thrown from a poisoned memo: the
+			// endpoint now succeeds, so the credential refreshes cleanly.
+			await withEnv(SUPPRESS_ANTHROPIC_ENV, async () => {
+				expect(await authStorage!.getApiKey("anthropic", "after-cancel")).toBe("fresh-access");
+			});
+			expect(events).toHaveLength(0);
+		} finally {
+			releaseHang.resolve();
+			server.stop(true);
+		}
+	});
+
+	test("an internal probe timeout memoizes the local refresh failure so the next request cannot replay the token", async () => {
+		if (!authStorage || !store) throw new Error("test setup failed");
+
+		// Companion to the caller-cancellation case above. When the abort comes
+		// from an INTERNAL deadline (an `AbortSignal.timeout` used by the health /
+		// usage probes) rather than the caller's ESC, the rotating refresh token
+		// may already have been consumed by the timed-out dial. That failure MUST
+		// be memoized: otherwise the same (credential, token) pair is immediately
+		// eligible for a second refresh, which replays the token upstream and can
+		// trip provider reuse-detection/revocation. This is the probe-timeout path
+		// the replay guard must NOT skip.
+		let dials = 0;
+		const gotFirstRequest = Promise.withResolvers<void>();
+		const releaseHang = Promise.withResolvers<void>();
+		const server = Bun.serve({
+			port: 0,
+			fetch: async () => {
+				dials += 1;
+				if (dials === 1) {
+					gotFirstRequest.resolve();
+					await releaseHang.promise; // hang past the internal timeout
+					return new Response("late", { status: 500 });
+				}
+				// A second dial would mean the memo failed to block the replay.
+				return Response.json({ access_token: "fresh-access", refresh_token: "fresh-refresh", expires_in: 3600 });
+			},
+		});
+		try {
+			const origin = `http://localhost:${server.port}`;
+			const binding = { resourceOrigin: origin, tokenEndpoint: `${origin}/token` };
+			await authStorage.set("anthropic", [
+				{
+					type: "oauth",
+					access: "expired-access",
+					refresh: "bound-refresh",
+					expires: Date.now() - 60_000,
+					mcpBinding: binding,
+				},
+			]);
+			const credentialId = store.listAuthCredentials("anthropic")[0]!.id;
+
+			vi.spyOn(oauthUtils, "getOAuthApiKey").mockImplementation(async (provider, creds) => {
+				const credential = creds[provider];
+				if (!credential) return null;
+				return { newCredentials: credential, apiKey: credential.access };
+			});
+
+			// Internal deadline: an AbortSignal.timeout (reason === "TimeoutError"),
+			// NOT a caller AbortController.abort() (reason === "AbortError").
+			const timeoutSignal = AbortSignal.timeout(50);
+			const timedOut = authStorage.refreshCredentialById(credentialId, timeoutSignal).then(
+				() => undefined,
+				(error: unknown) => error,
+			);
+			await gotFirstRequest.promise;
+			const outcome = await timedOut;
+			expect(outcome).toBeInstanceOf(Error);
+
+			// A subsequent NON-force request with the same token must be
+			// short-circuited by the replay-guard memo instead of dialing the
+			// endpoint a second time.
+			await withEnv(SUPPRESS_ANTHROPIC_ENV, async () => {
+				const apiKey = await authStorage!.getApiKey("anthropic", "after-internal-timeout");
+				expect(apiKey).toBeUndefined();
+			});
+			// Exactly one dial happened: the internal-timeout failure was memoized
+			// and blocked the replay.
+			expect(dials).toBe(1);
+			expect(events).toHaveLength(0);
+		} finally {
+			releaseHang.resolve();
+			server.stop(true);
+		}
+	});
+
 	test("invalidating a session-sticky OAuth credential rotates the retry to another active credential", async () => {
 		if (!authStorage) throw new Error("test setup failed");
 

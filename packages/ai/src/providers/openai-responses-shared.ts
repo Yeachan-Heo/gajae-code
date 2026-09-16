@@ -52,6 +52,7 @@ const OPENAI_RESPONSES_PROGRESS_EVENT_TYPES = new Set([
 	"response.custom_tool_call_input.done",
 	"response.output_item.done",
 	"response.completed",
+	"response.incomplete",
 	"response.failed",
 	"error",
 ]);
@@ -447,7 +448,7 @@ export async function processResponsesStream<TApi extends Api>(
 	stream: AssistantMessageEventStream,
 	model: Model<TApi>,
 	options?: ProcessResponsesStreamOptions,
-): Promise<void> {
+): Promise<boolean> {
 	type StreamItem = ResponseReasoningItem | ResponseOutputMessage | ResponseFunctionToolCall | ResponseCustomToolCall;
 	type StreamBlock = ThinkingContent | TextContent | (ToolCall & { partialJson: string });
 	interface ItemEntry {
@@ -592,6 +593,7 @@ export async function processResponsesStream<TApi extends Api>(
 	};
 	let sawFirstToken = false;
 
+	let sawTerminalEvent = false;
 	for await (const event of openaiStream) {
 		if (event.type === "response.created") {
 			output.responseId = event.response.id;
@@ -963,14 +965,25 @@ export async function processResponsesStream<TApi extends Api>(
 				dropEntry(item.id, event.output_index, item.call_id);
 				stream.push({ type: "toolcall_end", contentIndex, toolCall, partial: output });
 			}
-		} else if (event.type === "response.completed") {
+		} else if (event.type === "response.completed" || event.type === "response.incomplete") {
+			sawTerminalEvent = true;
 			const response = event.response;
 			if (response?.id) {
 				output.responseId = response.id;
 			}
 			populateResponsesUsageFromResponse(output, response?.usage);
 			calculateCost(model, output.usage);
-			output.stopReason = mapOpenAIResponsesStopReason(response?.status);
+			// A `response.incomplete` frame is terminal because the response was cut
+			// short, so the event type itself proves truncation. Deriving `length`
+			// from the event rather than trusting `response.status` stops a relay that
+			// drops or rewrites the status from turning a truncated turn into a plain
+			// `stop`/`toolUse` that would dispatch a tool call carrying repaired
+			// partial arguments with no `incompleteArguments` flag.
+			const terminalStatus = response?.status;
+			output.stopReason =
+				event.type === "response.incomplete" && terminalStatus !== "failed" && terminalStatus !== "cancelled"
+					? "length"
+					: mapOpenAIResponsesStopReason(terminalStatus);
 			if (response?.status === "failed" || response?.status === "cancelled") {
 				const error = response?.error ?? (response as any)?.status_details?.error;
 				const details = response?.incomplete_details;
@@ -998,8 +1011,9 @@ export async function processResponsesStream<TApi extends Api>(
 				output.stopReason = "toolUse";
 			}
 		} else if (event.type === "error") {
-			throw new Error(`Error Code ${event.code}: ${event.message}` || "Unknown error");
+			throw createResponsesStreamFailureError(`Error Code ${event.code}: ${event.message}` || "Unknown error");
 		} else if (event.type === "response.failed") {
+			sawTerminalEvent = true;
 			const error = event.response?.error ?? (event.response as any)?.status_details?.error;
 			const details = event.response?.incomplete_details;
 			const message = error
@@ -1009,6 +1023,45 @@ export async function processResponsesStream<TApi extends Api>(
 					: "Unknown error (no error details in response)";
 			throw createResponsesFailedError(message, error?.code);
 		}
+	}
+	return sawTerminalEvent;
+}
+
+/**
+ * Bounded classifier for a Responses stream that ended in failure before a
+ * successful terminal event: a `response.failed` envelope, a `response.completed`
+ * with `failed` status, a top-level `error` event, or an unexpected EOF (the
+ * stream returning without any terminal event). It is deliberately NOT a
+ * transport-retry fact: `transportFailureFacts` does not admit it, so preserving
+ * this diagnostic can never authorize a replay.
+ */
+export const RESPONSES_STREAM_FAILURE_CODE = "upstream_stream_interrupted";
+
+/** Attach the bounded stream-failure classifier without touching retry facts. */
+function createResponsesStreamFailureError(message: string): Error {
+	return Object.assign(new Error(message), { code: RESPONSES_STREAM_FAILURE_CODE });
+}
+
+/**
+ * Typed error for an SSE stream that ended (EOF) before any terminal event, so
+ * the caller sees a bounded classifier instead of a content-free success.
+ */
+export function unexpectedResponsesStreamEndError(): Error {
+	return createResponsesStreamFailureError("Upstream response stream ended before a terminal response event");
+}
+
+/**
+ * Read the bounded stream-failure classifier back off a thrown provider error.
+ * Only this module's own classifier is returned, so a foreign error's arbitrary
+ * `code` can never be forwarded onto the assistant message.
+ */
+export function responsesStreamFailureCode(error: unknown): string | undefined {
+	try {
+		return (error as { code?: unknown } | undefined)?.code === RESPONSES_STREAM_FAILURE_CODE
+			? RESPONSES_STREAM_FAILURE_CODE
+			: undefined;
+	} catch {
+		return undefined;
 	}
 }
 
@@ -1020,10 +1073,11 @@ export async function processResponsesStream<TApi extends Api>(
  * Exactly OpenAI's capacity-overload code is carried through as transport facts,
  * matched case-sensitively; every other failure stays a plain error, so an
  * untyped, cased, or malformed code can never reach a typed retry admission. The
- * display message is unchanged either way.
+ * display message is unchanged either way. Every non-overload envelope carries
+ * the bounded stream-failure classifier instead of a typed retry fact.
  */
 function createResponsesFailedError(message: string, code: string | undefined): Error {
-	if (code !== SERVER_OVERLOADED_PROVIDER_CODE) return new Error(message);
+	if (code !== SERVER_OVERLOADED_PROVIDER_CODE) return createResponsesStreamFailureError(message);
 	const error = new Error(message) as Error & { openaiErrorCode?: string };
 	error.openaiErrorCode = SERVER_OVERLOADED_PROVIDER_CODE;
 	return error;

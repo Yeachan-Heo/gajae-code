@@ -115,6 +115,7 @@ import {
 	isContextOverflow,
 	isFastModeEffectiveForProvider,
 	isUsageLimitError,
+	modelSupportsMaintenanceCalls,
 	modelSupportsServiceTier,
 	modelsAreEqual,
 	streamSimple,
@@ -316,10 +317,14 @@ import {
 import {
 	assertNonEmptyGjcSessionId,
 	modeStatePath as sessionModeStatePath,
-	sessionRuntimeDir,
+	sessionRuntimeStatePath,
 	sessionStateDir,
 } from "../gjc-runtime/session-layout";
-import { sessionStateLockFailureFields, shouldWarnPersistFailure } from "../gjc-runtime/session-state-lock";
+import {
+	isRetryableSessionStateLockContention,
+	sessionStateLockFailureFields,
+	shouldWarnPersistFailure,
+} from "../gjc-runtime/session-state-lock";
 import {
 	type CoordinatorToolObservation,
 	clearCoordinatorRuntimeStateRescope,
@@ -948,7 +953,7 @@ export interface AgentSessionConfig {
 	discoveryMode?: "off" | "mcp-only" | "all";
 	/** MCP tool names to activate for the current session when discovery mode is enabled. */
 	initialSelectedMCPToolNames?: string[];
-	/** Keep persisted MCP names until a deferred exact catalog becomes available. */
+	/** Keep persisted MCP names until a deferred (exact or conventional) catalog becomes available. */
 	preserveUnavailableInitialMCPToolSelection?: boolean;
 	/** Built-in discoverable tool names restored for the current all-discovery session. */
 	initialSelectedDiscoveredBuiltinToolNames?: string[];
@@ -1674,13 +1679,10 @@ function dedupeIrcReply(text: string): string {
 	}
 	let result = out.join("\n");
 	if (Buffer.byteLength(result, "utf8") > IRC_REPLY_MAX_BYTES) {
-		// Trim by characters until we're under the byte budget — handles multi-byte
-		// glyphs at the boundary without splitting them.
+		// Bound the UTF-8 prefix without repeatedly measuring the shrinking reply.
 		const suffix = "\n[…truncated]";
 		const budget = IRC_REPLY_MAX_BYTES - Buffer.byteLength(suffix, "utf8");
-		while (Buffer.byteLength(result, "utf8") > budget) {
-			result = result.slice(0, -1);
-		}
+		result = truncateHeadBytes(result, budget).text;
 		result += suffix;
 	}
 	return result;
@@ -2032,6 +2034,20 @@ export type BeforeAgentStartContributor = (event: {
 
 const AGENT_END_WORKER_INTEGRATION_TIMEOUT_MS = 5_000;
 const POST_PUBLICATION_ERROR_MAX_BYTES = 512;
+
+/**
+ * Bounded repair for a coordinator runtime-state update that lost its lock outright.
+ *
+ * The lock itself already waits out a busy peer, so reaching this path means a whole
+ * acquisition budget elapsed without the lock ever moving. Retrying covers the remaining
+ * case that budget cannot: a holder whose single critical section legitimately outlives
+ * it. The delay is far longer than the lock's own backoff because the contention being
+ * waited out is a whole foreign write, not a scheduling hiccup, and the retries stay small
+ * so a persistently wedged lock is still reported promptly instead of stalling the
+ * session's persist queue.
+ */
+const COORDINATOR_PERSIST_CONTENTION_RETRIES = 3;
+const COORDINATOR_PERSIST_RETRY_DELAY_MS = 2_000;
 
 export type WorkerIntegrationOutcome =
 	| { status: "completed" }
@@ -3052,11 +3068,14 @@ export class AgentSession {
 	 */
 	#registerRuntimeStateFinalizer(): void {
 		this.#unregisterRuntimeStateFinalizer?.();
-		const currentContext = () => ({
-			sessionId: this.sessionId,
-			cwd: this.sessionManager.getCwd(),
-			sessionFile: this.sessionManager.getSessionFile(),
-		});
+		const currentContext = () => {
+			const identity = { sessionId: this.sessionId, cwd: this.sessionManager.getCwd() };
+			return {
+				...identity,
+				sessionFile: this.sessionManager.getSessionFile(),
+				stateFile: this.#runtimeStateMarkerFile(identity),
+			};
+		};
 		this.#unregisterRuntimeStateFinalizer = registerCoordinatorRuntimeStateFinalizer(
 			currentContext(),
 			currentContext,
@@ -4403,6 +4422,11 @@ export class AgentSession {
 		this.agent.setProvisionalAssistantMessageEventInterceptor((message, assistantMessageEvent) => {
 			const contentIndex = assistantMessageEvent.contentIndex ?? 0;
 			const block = message.content[contentIndex];
+			if (
+				block?.type === "toolCall" &&
+				(block.escapedNonAsciiArguments === true || block.escapedUnicodeArgumentEvidence !== undefined)
+			)
+				return false;
 			if (block?.type === "toolCall" && block.id) this.#provisionalStreamingToolCallIds.add(block.id);
 			if (
 				assistantMessageEvent.type !== "toolcall_start" &&
@@ -4471,6 +4495,9 @@ export class AgentSession {
 				newCwdIdentity: move.newCwdIdentity,
 				previousSessionFile: move.previousSessionFile ?? null,
 				newSessionFile: move.newSessionFile ?? null,
+				// The rescope family must decide pin-vs-derived from the marker THIS session
+				// owns, never from the ambient pin (#5473).
+				stateFile: this.#runtimeStateMarkerFile({ sessionId: this.sessionId, cwd: move.previousCwd }),
 			});
 		});
 		this.#unregisterMoveAbortListener = this.sessionManager.registerMoveAbortListener(async move => {
@@ -4482,6 +4509,7 @@ export class AgentSession {
 							sessionId: this.sessionId,
 							cwd: move.newCwd,
 							sessionFile: move.newSessionFile ?? null,
+							stateFile: this.#runtimeStateMarkerFile({ sessionId: this.sessionId, cwd: move.newCwd }),
 						},
 						moveId,
 						move.previousCwd,
@@ -4500,6 +4528,7 @@ export class AgentSession {
 					sessionId: this.sessionId,
 					cwd: move.newCwd,
 					sessionFile: move.newSessionFile ?? null,
+					stateFile: this.#runtimeStateMarkerFile({ sessionId: this.sessionId, cwd: move.newCwd }),
 				},
 				move.previousCwd,
 				moveId,
@@ -4511,14 +4540,19 @@ export class AgentSession {
 		// fence refuses every later persist) and rebinds the postmortem finalizer, which
 		// otherwise keeps writing terminal state to the launch root's cwd/session file.
 		this.#unregisterAfterMoveListener = this.sessionManager.registerAfterMoveListener(async move => {
-			let completed = false;
 			try {
+				// A move can promote an explicit --session-dir destination to managed
+				// storage without changing the session id. Its local root changes from
+				// artifacts/local to scratch, so complete migration before releasing
+				// the rescope barrier or allowing the next prompt's sync resolver.
+				await initializeLocalRoot(this.#localProtocolOptions());
 				const relocated = await relocateCoordinatorRuntimeStateForRescope(
 					{
 						sessionId: this.sessionId,
 						cwd: move.newCwd,
 						sessionFile: this.sessionManager.getSessionFile() ?? null,
 						previousSessionFile: move.previousSessionFile ?? null,
+						stateFile: this.#runtimeStateMarkerFile({ sessionId: this.sessionId, cwd: move.newCwd }),
 					},
 					move.previousCwd,
 				);
@@ -4528,17 +4562,50 @@ export class AgentSession {
 						sessionId: this.sessionId,
 						cwd: move.newCwd,
 						sessionFile: this.sessionManager.getSessionFile() ?? null,
+						stateFile: this.#runtimeStateMarkerFile({ sessionId: this.sessionId, cwd: move.newCwd }),
 					},
 					this.#coordinatorRescopeMoveId,
 					move.previousCwd,
 				);
-				completed = true;
+			} catch (error) {
+				// Publication has already committed, so the move-abort listener cannot
+				// recover this state. Retry coordinator relocation independently of the
+				// failed local-root gate so later persists cannot remain behind a barrier
+				// that no longer has a rollback path.
+				try {
+					const relocated = await relocateCoordinatorRuntimeStateForRescope(
+						{
+							sessionId: this.sessionId,
+							cwd: move.newCwd,
+							sessionFile: this.sessionManager.getSessionFile() ?? null,
+							previousSessionFile: move.previousSessionFile ?? null,
+							stateFile: this.#runtimeStateMarkerFile({ sessionId: this.sessionId, cwd: move.newCwd }),
+						},
+						move.previousCwd,
+					);
+					if (!relocated) throw new Error("Coordinator runtime state rescope recovery was refused.");
+					await clearCoordinatorRuntimeStateRescope(
+						{
+							sessionId: this.sessionId,
+							cwd: move.newCwd,
+							sessionFile: this.sessionManager.getSessionFile() ?? null,
+							stateFile: this.#runtimeStateMarkerFile({ sessionId: this.sessionId, cwd: move.newCwd }),
+						},
+						this.#coordinatorRescopeMoveId,
+						move.previousCwd,
+					);
+				} catch (recoveryError) {
+					logger.error("Failed to recover coordinator runtime state after committed session move", {
+						cwd: move.newCwd,
+						error: String(error),
+						recoveryError: String(recoveryError),
+					});
+				}
+				throw error;
 			} finally {
 				this.#registerRuntimeStateFinalizer();
-				if (completed) {
-					this.#coordinatorRescopeMoveId = undefined;
-					this.#endCoordinatorRescopeBarrier();
-				}
+				this.#coordinatorRescopeMoveId = undefined;
+				this.#endCoordinatorRescopeBarrier();
 			}
 		});
 		// Power assertions are taken per turn (see #beginInFlight); nothing acquired here.
@@ -4557,6 +4624,10 @@ export class AgentSession {
 			sessionId: this.sessionId,
 			cwd: this.sessionManager.getCwd(),
 			sessionFile: this.sessionManager.getSessionFile() ?? null,
+			stateFile: this.#runtimeStateMarkerFile({
+				sessionId: this.sessionId,
+				cwd: this.sessionManager.getCwd(),
+			}),
 		};
 		if (hasCoordinatorRuntimeStateRescopeJournal(rescopeRecoveryContext)) {
 			this.extendStartupTurnBarrier(recoverCoordinatorRuntimeStateRescope(rescopeRecoveryContext));
@@ -6124,19 +6195,30 @@ export class AgentSession {
 		);
 	}
 
+	/**
+	 * The runtime-state marker THIS session owns, or `null` when it has none.
+	 *
+	 * The process-wide `GJC_COORDINATOR_SESSION_STATE_FILE` pin describes exactly one session:
+	 * the one the launcher minted it for. A nested in-process session — the role-agent/subagent
+	 * fan-out — is a different session, so it must never read or write the parent's marker. The
+	 * sidecar's identity fence refuses every such write (the reported 102x rejection while a
+	 * fan-out was live), and a write that did land would rewrite the parent's lifecycle under
+	 * the child's identity. A nested session therefore owns its own session-derived marker.
+	 */
+	#runtimeStateMarkerFile(input: { sessionId: string; cwd: string }): string | null {
+		if (!input.sessionId.trim()) return null;
+		const pinned = process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]?.trim();
+		if (this.taskDepth > 0) return sessionRuntimeStatePath(input.cwd, input.sessionId);
+		return pinned || sessionRuntimeStatePath(input.cwd, input.sessionId);
+	}
+
 	#captureCoordinatorRuntimeStatePersistContext(): CoordinatorRuntimeStatePersistContext {
 		const context = {
 			sessionId: this.sessionId,
 			cwd: this.sessionManager.getCwd(),
 			sessionFile: this.sessionManager.getSessionFile(),
 		};
-		const explicitStateFile = process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]?.trim();
-		const stateFile =
-			explicitStateFile ||
-			(context.sessionId.trim()
-				? path.join(sessionRuntimeDir(context.cwd, context.sessionId), "runtime-state.json")
-				: null);
-		return { ...context, stateFile };
+		return { ...context, stateFile: this.#runtimeStateMarkerFile(context) };
 	}
 
 	/**
@@ -6183,17 +6265,30 @@ export class AgentSession {
 		observation: CoordinatorToolObservation | undefined,
 		propagateFailure: boolean,
 	): Promise<void> {
-		try {
-			await persistCoordinatorRuntimeStateFromEvent(event, context, observation);
-		} catch (error) {
-			this.#warnPersistFailure(
-				"Failed to persist coordinator runtime state",
-				error,
-				context.stateFile,
-				context.sessionId,
-				{ event: event.type },
-			);
-			if (propagateFailure) throw error;
+		for (let attempt = 0; ; attempt++) {
+			try {
+				await persistCoordinatorRuntimeStateFromEvent(event, context, observation);
+				return;
+			} catch (error) {
+				// Losing the lock drops this update permanently: nothing re-derives the
+				// snapshot afterwards, so the coordinator keeps reporting stale lifecycle
+				// and tool activity for this session until an unrelated event happens to
+				// win. A pure-contention refusal is therefore retried before it is
+				// reported; every other failure is a standing condition, reported at once.
+				if (attempt < COORDINATOR_PERSIST_CONTENTION_RETRIES && isRetryableSessionStateLockContention(error)) {
+					await Bun.sleep(COORDINATOR_PERSIST_RETRY_DELAY_MS);
+					continue;
+				}
+				this.#warnPersistFailure(
+					"Failed to persist coordinator runtime state",
+					error,
+					context.stateFile,
+					context.sessionId,
+					{ event: event.type, ...(attempt > 0 ? { retries: attempt } : {}) },
+				);
+				if (propagateFailure) throw error;
+				return;
+			}
 		}
 	}
 
@@ -6374,6 +6469,18 @@ export class AgentSession {
 		eventLease?: RunResourceProducerLease,
 	): Promise<void> => {
 		const attemptScope = (event as AgentEvent & { scope?: AttemptScope }).scope;
+
+		// These lifecycle boundaries can be delivered without awaiting this listener.
+		// Revoke streaming-edit cache generations before any admission, spill, or
+		// extension work so a completed read cannot publish across the boundary.
+		if (event.type === "turn_start") this.#resetStreamingEditState();
+		if (event.type === "message_end" && event.message.role === "toolResult") {
+			const details = event.message.details;
+			if (event.message.toolName === "edit" && details && typeof details === "object" && "path" in details) {
+				const editPath = (details as { path?: unknown }).path;
+				if (typeof editPath === "string") this.#invalidateFileCacheForPath(editPath);
+			}
+		}
 
 		if (
 			event.type === "tool_execution_start" ||
@@ -6729,7 +6836,6 @@ export class AgentSession {
 		}
 
 		if (event.type === "turn_start") {
-			this.#resetStreamingEditState();
 			// TTSR: Reset buffer on turn start
 			this.#ttsrManager?.resetBuffer();
 		}
@@ -6973,10 +7079,6 @@ export class AgentSession {
 					isError?: boolean;
 					content?: Array<TextContent | ImageContent>;
 				};
-				// Invalidate streaming edit cache when edit tool completes to prevent stale data
-				if (toolName === "edit" && details?.path) {
-					this.#invalidateFileCacheForPath(details.path);
-				}
 				if (toolName === "todo_write" && !isError && Array.isArray(details?.phases)) {
 					this.setTodoPhases(details.phases);
 				}
@@ -8224,6 +8326,9 @@ export class AgentSession {
 		this.#streamingEditPrecheckedToolCallIds.clear();
 		this.#streamingEditParsedToolCallCache.clear();
 		this.#streamingEditFileCache.clear();
+		for (const resolvedPath of this.#streamingEditPrecachePending.keys()) {
+			this.#invalidateStreamingEditPrecachePath(resolvedPath);
+		}
 	}
 
 	#getStreamingEditToolCall(event: AgentEvent): StreamingEditParsedToolCall | undefined {
@@ -8304,24 +8409,48 @@ export class AgentSession {
 		return block?.type === "toolCall" && this.#provisionalStreamingToolCallIds.has(block.id);
 	}
 
-	#streamingEditPrecachePending = new Set<string>();
+	#streamingEditPrecachePending = new Map<string, symbol>();
+	#streamingEditPrecacheStale = new Map<string, Set<symbol>>();
 	async #preCacheFileAsync(resolvedPath: string): Promise<void> {
 		if (this.#streamingEditFileCache.has(resolvedPath)) return;
 		if (this.#streamingEditPrecachePending.has(resolvedPath)) return;
-		this.#streamingEditPrecachePending.add(resolvedPath);
+		// Keep at most one invalidated read alongside the current generation. Once
+		// two reads are already in flight, further invalidations wait for one to
+		// settle instead of accumulating another whole-file read.
+		if ((this.#streamingEditPrecacheStale.get(resolvedPath)?.size ?? 0) >= 2) return;
+		const token = Symbol();
+		this.#streamingEditPrecachePending.set(resolvedPath, token);
 		try {
 			const stat = await fs.promises.stat(resolvedPath);
 			if (stat.size > MAX_EDIT_FILE_BYTES) return;
 
+			if (this.#streamingEditPrecachePending.get(resolvedPath) !== token) return;
 			const rawText = await fs.promises.readFile(resolvedPath, "utf-8");
+			if (this.#streamingEditPrecachePending.get(resolvedPath) !== token) return;
 			if (this.#streamingEditFileCache.has(resolvedPath)) return;
 			const { text } = stripBom(rawText);
 			this.#streamingEditFileCache.set(resolvedPath, normalizeToLF(text));
 		} catch {
 			// Don't cache on read errors (including ENOENT) - let the edit tool handle them
 		} finally {
-			this.#streamingEditPrecachePending.delete(resolvedPath);
+			if (this.#streamingEditPrecachePending.get(resolvedPath) === token) {
+				this.#streamingEditPrecachePending.delete(resolvedPath);
+			}
+			const stale = this.#streamingEditPrecacheStale.get(resolvedPath);
+			if (stale?.delete(token) && stale.size === 0) this.#streamingEditPrecacheStale.delete(resolvedPath);
 		}
+	}
+
+	#invalidateStreamingEditPrecachePath(resolvedPath: string): void {
+		const token = this.#streamingEditPrecachePending.get(resolvedPath);
+		if (token === undefined) return;
+		this.#streamingEditPrecachePending.delete(resolvedPath);
+		let stale = this.#streamingEditPrecacheStale.get(resolvedPath);
+		if (!stale) {
+			stale = new Set();
+			this.#streamingEditPrecacheStale.set(resolvedPath, stale);
+		}
+		stale.add(token);
 	}
 
 	#ensureFileCache(resolvedPath: string): void {
@@ -8341,9 +8470,27 @@ export class AgentSession {
 
 	/** Invalidate cache for a file after an edit completes to prevent stale data */
 	#invalidateFileCacheForPath(filePath: string): void {
-		const resolvedPath = this.#resolveSessionFsPath(filePath);
+		let resolvedPath: string | undefined;
+		try {
+			resolvedPath = this.#resolveSessionFsPath(filePath);
+		} catch (error) {
+			// Tool-result admission must survive malformed paths and unavailable local roots.
+			// Without a resolved key, revoke every generation before any lifecycle await.
+			this.#streamingEditFileCache.clear();
+			this.#streamingEditPrecachePending.delete(filePath);
+			this.#streamingEditPrecacheStale.delete(filePath);
+			for (const pendingPath of this.#streamingEditPrecachePending.keys()) {
+				this.#invalidateStreamingEditPrecachePath(pendingPath);
+			}
+			logger.debug("Failed to resolve streaming-edit cache invalidation path", {
+				path: filePath,
+				error: String(error),
+			});
+			return;
+		}
 		if (resolvedPath === undefined) return;
 		this.#streamingEditFileCache.delete(resolvedPath);
+		this.#invalidateStreamingEditPrecachePath(resolvedPath);
 	}
 
 	/**
@@ -10287,13 +10434,13 @@ export class AgentSession {
 		const bridge = this.#clientBridge;
 		const acpEnabled = Boolean(bridge?.capabilities.requestPermission && bridge.requestPermission);
 		const sdkEnabled = this.#sdkPermissionProvider !== undefined;
-		const activeSkill = this.#activeSkillState?.skill ?? "";
-		const activeSkillSession = this.#activeSkillState?.sessionId ?? "";
+		// The wrapped behavior depends only on live session state (cwd, session id,
+		// session agent dir) plus the ACP/SDK permission surfaces below. Active-skill
+		// state is deliberately absent: the Ultragoal ask guard binds to the caller
+		// session id alone, so a skill transition does not change any wrapper.
 		return [
 			"workflow-mutation-v1",
-
-			"ultragoal-ask-v1",
-			`active=${activeSkill}:${activeSkillSession}`,
+			"ultragoal-ask-v2",
 			`acp=${acpEnabled ? "on" : "off"}:sdk=${sdkEnabled ? "on" : "off"}:${this.#acpPermissionWrapperVersion}`,
 		].join("|");
 	}
@@ -10303,6 +10450,7 @@ export class AgentSession {
 		let wrappersByVersion = this.#guardedToolWrapperCache.get(tool);
 		const cached = wrappersByVersion?.get(cacheKey);
 		if (cached) return cached as T;
+		wrappersByVersion?.clear();
 		const innerTool = tool instanceof ExtensionToolWrapper ? tool.getInnerTool() : tool;
 		const guarded = this.#wrapToolForCwdTransitionFence(
 			this.#wrapToolForWorkflowMutationGuard(
@@ -10310,10 +10458,7 @@ export class AgentSession {
 					guardToolForUltragoalAsk(
 						innerTool,
 						() => this.sessionManager.getCwd(),
-						() => ({
-							activeSkillState: this.getActiveSkillState(),
-							sessionId: this.sessionManager.getSessionId(),
-						}),
+						() => ({ sessionId: this.sessionManager.getSessionId() }),
 						() => this.getSessionAgentDir(),
 					),
 				),
@@ -19783,6 +19928,10 @@ export class AgentSession {
 	 * provider session state and configured WebSocket transport preference
 	 * instead of falling back to a fresh HTTP/SSE session. Mirrors the
 	 * `providerSessionId ?? sessionId` affinity the agent loop sends per turn.
+	 *
+	 * `maintenanceCall` is what lets an agent-level provider (for example Devin
+	 * over ACP) refuse work it cannot serve instead of forwarding a
+	 * summarization prompt to a billed upstream agent.
 	 */
 	#maintenanceProviderTransport(): {
 		sessionId: string | undefined;
@@ -19790,6 +19939,7 @@ export class AgentSession {
 		providerSessionState: Map<string, ProviderSessionState>;
 		preferWebsockets: boolean | undefined;
 		remoteCompactionFallbackHealth: RemoteCompactionFallbackHealthHooks;
+		maintenanceCall: boolean;
 	} {
 		const providerSessionId = this.agent.providerSessionId ?? this.agent.sessionId;
 		return {
@@ -19798,6 +19948,7 @@ export class AgentSession {
 			providerSessionState: this.#providerSessionState,
 			preferWebsockets: this.agent.preferWebsockets,
 			remoteCompactionFallbackHealth: this.#remoteCompactionFallbackHealth,
+			maintenanceCall: true,
 		};
 	}
 
@@ -19942,6 +20093,35 @@ export class AgentSession {
 		// disabled/off settings so a resource-floor breach still compacts before OOM.
 		if (!options?.force && compactionSettings.strategy === "off") return { kind: "skipped" };
 		if (!options?.force && reason !== "idle" && !compactionSettings.enabled) return { kind: "skipped" };
+		// Agent-level providers (e.g. Devin over ACP) own conversation history and
+		// refuse GJC maintenance calls by contract. Context-full maintenance walks
+		// the candidate chain while handoff generation calls the session model
+		// directly, so when every model the selected action can reach is
+		// agent-level the attempt can only report a guaranteed refusal on every
+		// threshold crossing — treat it as a benign skip like maintenance being off.
+		// A session_before_compact hook can still serve context-full maintenance
+		// without a model call, so it keeps the session eligible.
+		const handoffSelected = compactionSettings.strategy === "handoff" && reason !== "overflow";
+		const reachableModels =
+			handoffSelected && this.model
+				? [this.model]
+				: this.#getCompactionModelCandidates(this.#modelRegistry.getAvailable());
+		const hookServesMaintenance =
+			!handoffSelected && this.#extensionRunner?.hasHandlers("session_before_compact") === true;
+		if (
+			reachableModels.length > 0 &&
+			!reachableModels.some(modelSupportsMaintenanceCalls) &&
+			!hookServesMaintenance
+		) {
+			logger.debug(
+				"Auto-compaction skipped: every reachable model is an agent-level provider that refuses maintenance calls",
+				{
+					reason,
+					provider: this.model?.provider,
+				},
+			);
+			return { kind: "skipped" };
+		}
 		const generation = this.#promptGeneration;
 		if (
 			options?.deferHandoffMaintenance !== false &&
@@ -20199,7 +20379,24 @@ export class AgentSession {
 				details = compactionPrep.details;
 				preserveData = compactionPrep.preserveData;
 			} else {
-				const candidates = this.#getCompactionModelCandidates(availableModels);
+				// Agent-level providers refuse maintenance calls by contract, so they
+				// can only add a guaranteed refusal to the failure list — never spend a
+				// call on one while a text-model candidate exists. The pre-flight
+				// reachability check normally catches the all-agent-level case; this
+				// covers a mid-flight model swap landing here.
+				const candidates =
+					this.#getCompactionModelCandidates(availableModels).filter(modelSupportsMaintenanceCalls);
+				if (candidates.length === 0) {
+					await this.#emitSessionEvent({
+						type: "auto_compaction_end",
+						action,
+						result: undefined,
+						aborted: false,
+						willRetry: false,
+						skipped: true,
+					});
+					return { kind: "skipped" };
+				}
 				maintenanceAttemptSignature = this.#buildAutoMaintenanceAttemptSignature(
 					action,
 					preparation,
@@ -21536,7 +21733,7 @@ export class AgentSession {
 	 * Marks the credential that just failed and reports whether the session
 	 * actually moved to a DIFFERENT stored credential.
 	 *
-	 * Three invariants this enforces, in order:
+	 * Credential mutation invariants:
 	 *
 	 * 1. **Pin guard, first and for every trigger class.** A pinned credential
 	 *    (`--api-key` or `--credential`) must never be mutated or rotated away
@@ -21546,11 +21743,10 @@ export class AgentSession {
 	 *    path invalidated pinned credentials outright.
 	 * 2. **A terminal `forbidden` never mutates credential state.** Rotation
 	 *    would hide an authorization defect and cycle through healthy rows.
-	 * 3. **Distinct-row proof in BOTH branches.** `invalidateCredentialMatching`
-	 *    reports "I matched and blocked a row", which is not the same as "the
-	 *    session now uses a different credential" — with a single-row pool it is
-	 *    true while nothing rotated. Both branches therefore re-resolve and
-	 *    require the active key to have actually changed.
+	 * 3. Auth failures retain their existing key-change proof. Quota, rate-limit
+	 *    and OAuth account-model rejections mark before resolving and require two known,
+	 *    different stored row IDs before reporting rotation. This is mark-time
+	 *    identity, not dispatch-bound attribution across shared sessions.
 	 */
 	async #markFailedCredential(trigger: {
 		class: FallbackTriggerClass;
@@ -21582,27 +21778,33 @@ export class AgentSession {
 		}
 
 		const credentialSessionId = this.credentialSessionId;
+		if (trigger.class !== "auth") {
+			if (
+				trigger.class === "credential" &&
+				authStorage.getSessionCredentialType(provider, credentialSessionId) !== "oauth"
+			)
+				return "unchanged";
+			const before = authStorage.getSessionCredentialRowId(provider, credentialSessionId);
+			const remaining = await authStorage.markUsageLimitReached(provider, credentialSessionId, {
+				// Account-model rejection retains default backoff, not response retry-after.
+				...(trigger.class === "credential" ? {} : { retryAfterMs: trigger.retryAfterMs }),
+				owner: this.#modelRegistry.getAuthStorageOwner(),
+				...(before === undefined ? {} : { rowId: before }),
+			});
+			if (!remaining) return "exhausted";
+			await this.#modelRegistry.getApiKey(this.model, credentialSessionId);
+			const after = authStorage.getSessionCredentialRowId(provider, credentialSessionId);
+			if (before !== undefined && after !== undefined && before !== after) return "rotated";
+			return "unchanged";
+		}
 		const activeApiKey = await this.#modelRegistry.getApiKey(this.model, credentialSessionId);
 
-		let remaining: boolean;
-		if (trigger.class === "auth") {
-			if (!isAuthenticated(activeApiKey)) return "unchanged";
-			remaining = await authStorage.invalidateCredentialMatching(provider, activeApiKey, {
-				sessionId: credentialSessionId,
-				owner: this.#modelRegistry.getAuthStorageOwner(),
-			});
-			if (!remaining) return "unchanged";
-		} else if (trigger.class === "credential") {
-			if (authStorage.getSessionCredentialType(provider, credentialSessionId) !== "oauth") return "unchanged";
-			remaining = await authStorage.markUsageLimitReached(provider, credentialSessionId, {
-				owner: this.#modelRegistry.getAuthStorageOwner(),
-			});
-		} else {
-			remaining = await authStorage.markUsageLimitReached(provider, credentialSessionId, {
-				retryAfterMs: trigger.retryAfterMs,
-				owner: this.#modelRegistry.getAuthStorageOwner(),
-			});
-		}
+		if (!isAuthenticated(activeApiKey)) return "unchanged";
+		const remaining = await authStorage.invalidateCredentialMatching(provider, activeApiKey, {
+			sessionId: credentialSessionId,
+			owner: this.#modelRegistry.getAuthStorageOwner(),
+		});
+		if (!remaining) return "unchanged";
 
 		// (3) Distinct-row proof.
 		if ((await this.#modelRegistry.getApiKey(this.model, credentialSessionId)) !== activeApiKey) {

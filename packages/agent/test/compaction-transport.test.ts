@@ -112,6 +112,7 @@ describe("maintenance call transport forwarding (#736)", () => {
 			providerSessionId: "provider-session-1",
 			providerSessionState,
 			preferWebsockets: true,
+			maintenanceCall: true,
 		});
 
 		expect(captured).toHaveLength(1);
@@ -119,6 +120,7 @@ describe("maintenance call transport forwarding (#736)", () => {
 		expect(captured[0]?.providerSessionId).toBe("provider-session-1");
 		expect(captured[0]?.providerSessionState).toBe(providerSessionState);
 		expect(captured[0]?.preferWebsockets).toBe(true);
+		expect(captured[0]?.maintenanceCall).toBe(true);
 	});
 
 	it("generateHandoff forwards sessionId, providerSessionState, and preferWebsockets", async () => {
@@ -132,6 +134,7 @@ describe("maintenance call transport forwarding (#736)", () => {
 			providerSessionId: "provider-session-2",
 			providerSessionState,
 			preferWebsockets: true,
+			maintenanceCall: true,
 		});
 
 		expect(captured).toHaveLength(1);
@@ -139,6 +142,7 @@ describe("maintenance call transport forwarding (#736)", () => {
 		expect(captured[0]?.providerSessionId).toBe("provider-session-2");
 		expect(captured[0]?.providerSessionState).toBe(providerSessionState);
 		expect(captured[0]?.preferWebsockets).toBe(true);
+		expect(captured[0]?.maintenanceCall).toBe(true);
 	});
 
 	it("generateBranchSummary forwards sessionId, providerSessionState, and preferWebsockets", async () => {
@@ -169,6 +173,7 @@ describe("maintenance call transport forwarding (#736)", () => {
 			providerSessionId: "provider-session-3",
 			providerSessionState,
 			preferWebsockets: true,
+			maintenanceCall: true,
 		});
 
 		expect(captured).toHaveLength(1);
@@ -176,6 +181,7 @@ describe("maintenance call transport forwarding (#736)", () => {
 		expect(captured[0]?.providerSessionId).toBe("provider-session-3");
 		expect(captured[0]?.providerSessionState).toBe(providerSessionState);
 		expect(captured[0]?.preferWebsockets).toBe(true);
+		expect(captured[0]?.maintenanceCall).toBe(true);
 	});
 
 	it("compact() forwards transport fields to the history summary (short summary is derived locally, #2335)", async () => {
@@ -187,6 +193,7 @@ describe("maintenance call transport forwarding (#736)", () => {
 			providerSessionId: "provider-session-4",
 			providerSessionState,
 			preferWebsockets: true,
+			maintenanceCall: true,
 		});
 
 		// history summary only: shortSummary is derived from the main summary
@@ -197,6 +204,7 @@ describe("maintenance call transport forwarding (#736)", () => {
 			expect(options.providerSessionId).toBe("provider-session-4");
 			expect(options.providerSessionState).toBe(providerSessionState);
 			expect(options.preferWebsockets).toBe(true);
+			expect(options.maintenanceCall).toBe(true);
 		}
 	});
 });

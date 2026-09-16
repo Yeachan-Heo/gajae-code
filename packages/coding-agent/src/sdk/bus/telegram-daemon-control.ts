@@ -27,6 +27,7 @@ import { resolveGjcRuntimeSpawnInfo } from "../../daemon/runtime";
 import { isProcessIncarnation } from "../broker/process-incarnation";
 
 import { getNotificationConfig, isTelegramComplete, tokenFingerprint } from "./config";
+import { type DoctorDaemonControlRequest, isDoctorDaemonControlRequest } from "./doctor-daemon-restart";
 import {
 	type AttestedLegacyDaemonOwner,
 	confirmTelegramDaemonSpawn,
@@ -36,6 +37,7 @@ import {
 	isCurrentCompatibleOwner,
 	isFreshLiveOwner,
 	isSignalableMatchingOwner,
+	isTelegramDaemonStopCause,
 	readAttestedLegacyDaemonOwner,
 	readDaemonState,
 	readOwnerFreshnessSnapshot,
@@ -63,6 +65,48 @@ export interface TelegramDaemonControlRequest {
 
 export function telegramControlRequestPath(agentDir: string): string {
 	return path.join(daemonPaths(agentDir).dir, "telegram-daemon.control.json");
+}
+
+export function telegramDoctorControlRequestPath(agentDir: string): string {
+	return path.join(daemonPaths(agentDir).dir, "doctor-restart.control.json");
+}
+
+export async function readTelegramDoctorControlRequest(
+	settings: Settings,
+	fsImpl: TelegramDaemonFs = nodeFs,
+): Promise<DoctorDaemonControlRequest | undefined> {
+	try {
+		const parsed = JSON.parse(
+			await fsImpl.readFile(telegramDoctorControlRequestPath(settings.getAgentDir()), "utf8"),
+		) as unknown;
+		return isDoctorDaemonControlRequest(parsed) && parsed.owner === "telegram" ? parsed : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+export async function writeTelegramDoctorControlRequest(
+	settings: Settings,
+	request: DoctorDaemonControlRequest,
+	fsImpl: TelegramDaemonFs = nodeFs,
+): Promise<void> {
+	if (request.owner !== "telegram") throw new Error("telegram doctor request owner mismatch");
+	const dir = daemonPaths(settings.getAgentDir()).dir;
+	await fsImpl.mkdir(dir, { recursive: true, mode: 0o700 });
+	const file = telegramDoctorControlRequestPath(settings.getAgentDir());
+	const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
+	await fsImpl.writeFile(tmp, `${JSON.stringify(request)}\n`, { mode: 0o600 });
+	await fsImpl.rename(tmp, file);
+}
+
+export async function clearTelegramDoctorControlRequest(
+	settings: Settings,
+	requestId?: string,
+	fsImpl: TelegramDaemonFs = nodeFs,
+): Promise<void> {
+	const file = telegramDoctorControlRequestPath(settings.getAgentDir());
+	if (requestId && (await readTelegramDoctorControlRequest(settings, fsImpl))?.requestId !== requestId) return;
+	await fsImpl.unlink(file).catch(() => undefined);
 }
 
 export async function readTelegramControlRequest(
@@ -236,6 +280,8 @@ export class TelegramDaemonController implements BuiltInDaemonController {
 						})
 					? "running"
 					: "stale";
+		const stopCause = isTelegramDaemonStopCause(state?.stopCause) ? state.stopCause : undefined;
+		const detail = health === "stopped" && state ? `stop cause: ${stopCause ?? "unknown"}` : undefined;
 		return {
 			kind: this.kind,
 			configured: true,
@@ -244,6 +290,7 @@ export class TelegramDaemonController implements BuiltInDaemonController {
 			ownerId: state?.ownerId,
 			startedAt: state?.startedAt,
 			heartbeatAt: snapshot.effectiveHeartbeatAt,
+			...(detail === undefined ? {} : { detail }),
 			runtime,
 		};
 	}

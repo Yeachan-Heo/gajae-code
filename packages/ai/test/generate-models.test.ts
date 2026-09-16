@@ -52,6 +52,15 @@ describe("injectCodexAstraModel", () => {
 });
 
 describe("injectImageGenerationModels", () => {
+	const imageModelMetadata: Omit<Model, "id" | "name" | "api" | "provider" | "baseUrl"> = {
+		reasoning: false,
+		input: ["text"],
+		output: ["text", "image"],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 128_000,
+		maxTokens: 16_384,
+	};
+
 	it("adds typed image-output models once for OpenAI and Codex", () => {
 		const models: Model[] = [];
 
@@ -59,20 +68,105 @@ describe("injectImageGenerationModels", () => {
 		injectImageGenerationModels(models);
 
 		expect(models).toEqual([
-			expect.objectContaining({
+			{
+				...imageModelMetadata,
 				id: "gpt-image-2",
+				name: "GPT Image 2",
 				api: "openai-responses",
 				provider: "openai",
-				input: ["text"],
-				output: ["text", "image"],
-			}),
-			expect.objectContaining({
+				baseUrl: "",
+			},
+			{
+				...imageModelMetadata,
+				id: "gpt-image-2.5-sunburst",
+				name: "GPT Image 2.5 Sunburst",
+				api: "openai-responses",
+				provider: "openai",
+				baseUrl: "",
+			},
+			{
+				...imageModelMetadata,
+				id: "gpt-image-2.5-flare",
+				name: "GPT Image 2.5 Flare",
+				api: "openai-responses",
+				provider: "openai",
+				baseUrl: "",
+			},
+			{
+				...imageModelMetadata,
 				id: "gpt-image-2",
+				name: "GPT Image 2",
 				api: "openai-codex-responses",
 				provider: "openai-codex",
-				input: ["text"],
-				output: ["text", "image"],
-			}),
+				baseUrl: "",
+			},
+			{
+				...imageModelMetadata,
+				id: "gpt-image-2.5-sunburst",
+				name: "GPT Image 2.5 Sunburst",
+				api: "openai-codex-responses",
+				provider: "openai-codex",
+				baseUrl: "",
+			},
+			{
+				...imageModelMetadata,
+				id: "gpt-image-2.5-flare",
+				name: "GPT Image 2.5 Flare",
+				api: "openai-codex-responses",
+				provider: "openai-codex",
+				baseUrl: "",
+			},
+		]);
+	});
+
+	it("keeps the GPT Image 2.5 rows mirroring the GPT Image 2 metadata", () => {
+		const models: Model[] = [];
+
+		injectImageGenerationModels(models);
+
+		const metadataOf = (model: Model) => {
+			const { id: _id, name: _name, ...metadata } = model;
+			return metadata;
+		};
+		for (const provider of ["openai", "openai-codex"] as const) {
+			const legacy = models.find(model => model.provider === provider && model.id === "gpt-image-2");
+			if (!legacy) throw new Error(`expected gpt-image-2 under ${provider}`);
+			for (const id of ["gpt-image-2.5-sunburst", "gpt-image-2.5-flare"] as const) {
+				const candidate = models.find(model => model.provider === provider && model.id === id);
+				if (!candidate) throw new Error(`expected ${id} under ${provider}`);
+				expect(metadataOf(candidate)).toEqual(metadataOf(legacy));
+			}
+		}
+	});
+
+	it("preserves catalog entries that already exist", () => {
+		const discovered: Model<"openai-responses"> = {
+			id: "gpt-image-2.5-sunburst",
+			name: "Discovered name",
+			api: "openai-responses",
+			provider: "openai",
+			baseUrl: "https://example.test/v1",
+			reasoning: false,
+			input: ["text"],
+			output: ["text", "image"],
+			cost: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 200_000,
+			maxTokens: 32_000,
+		};
+		const models: Model[] = [discovered];
+
+		injectImageGenerationModels(models);
+
+		expect(models.filter(model => model.provider === "openai" && model.id === "gpt-image-2.5-sunburst")).toEqual([
+			discovered,
+		]);
+		expect(models.map(model => `${model.provider}/${model.id}`)).toEqual([
+			"openai/gpt-image-2.5-sunburst",
+			"openai/gpt-image-2",
+			"openai/gpt-image-2.5-flare",
+			"openai-codex/gpt-image-2",
+			"openai-codex/gpt-image-2.5-sunburst",
+			"openai-codex/gpt-image-2.5-flare",
 		]);
 	});
 });

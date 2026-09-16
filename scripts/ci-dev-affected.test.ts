@@ -1401,6 +1401,12 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 			expect(tasks.map(task => task.key)).toContain(`test:${testFile}`);
 		}
 	});
+	test("managed-session-scope changes schedule the owner-only self-heal budget regression", () => {
+		const keys = targeted(["packages/coding-agent/src/session/internal/managed-session-scope.ts"]).map(
+			task => task.key,
+		);
+		expect(keys).toContain("test:packages/coding-agent/test/managed-scope-self-heal-budget.test.ts");
+	});
 	test("extensibility sources select the bounded Function Hooks/plugin owner shard", () => {
 		const ownerTests = [
 			"packages/coding-agent/test/function-hooks.test.ts",
@@ -1622,6 +1628,13 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 		expect(targeted(["CHANGELOG.md", "packages/coding-agent/README.md"])).toEqual([]);
 	});
 
+	// A fragment is how a user-facing change records its release note (#5491), so it
+	// must stay as cheap as the single changelog line it replaced rather than pulling
+	// package or root work in by its path.
+	test("changelog fragments plan nothing on their own", () => {
+		expect(targeted(["packages/coding-agent/changelog.d/5491-rebase-free-release-notes.md"])).toEqual([]);
+	});
+
 	// docs/ is the source the embedded docs index is generated from, so shipping a
 	// docs edit without regenerating that index is the one drift class a docs-only
 	// change can introduce. Both planners must select that gate, because dev CI runs
@@ -1671,6 +1684,7 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 			["packages/coding-agent/README.md"],
 			["README.md"],
 			[".gjc/skills/example/SKILL.md"],
+			["packages/coding-agent/changelog.d/5491-rebase-free-release-notes.md"],
 			["packages/example/src/index.ts"],
 		]) {
 			for (const tasks of [targeted(changed), planTasks(changed, packages)]) {

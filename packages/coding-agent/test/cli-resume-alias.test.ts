@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test";
-import { normalizeResumeAlias, routeRootArgv } from "../src/cli";
 import { parseArgs } from "../src/cli/args";
+import { normalizeResumeAlias, routeRootArgv } from "../src/cli-main";
 
 describe("resume CLI alias", () => {
 	it("normalizes only the exact raw resume alias", () => {

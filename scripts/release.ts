@@ -10,6 +10,7 @@
  */
 
 import { $, Glob } from "bun";
+import { consumeFragments, foldFragmentsIntoChangelog, readPackageFragments } from "./changelog-fragments";
 
 const changelogGlob = new Glob("packages/*/CHANGELOG.md");
 const packageJsonGlob = new Glob("packages/*/package.json");
@@ -395,8 +396,17 @@ async function updateChangelogsForRelease(version: string): Promise<void> {
 			continue;
 		}
 
-		await Bun.write(changelog, releasedChangelogContent(content, version, date, changelog));
-		console.log(`  Updated ${changelog}`);
+		// Pending fragments are the only place a contributor writes release notes,
+		// so they are folded in before the version cut and consumed by the same
+		// commit. Reading them first means a malformed fragment aborts the release
+		// instead of shipping a version that silently dropped its notes.
+		const fragments = await readPackageFragments(changelog);
+		const folded = foldFragmentsIntoChangelog(content, fragments, changelog);
+		await Bun.write(changelog, releasedChangelogContent(folded, version, date, changelog));
+		await consumeFragments(fragments);
+		console.log(
+			`  Updated ${changelog}${fragments.length > 0 ? ` (folded ${fragments.length} fragment(s))` : ""}`,
+		);
 	}
 }
 

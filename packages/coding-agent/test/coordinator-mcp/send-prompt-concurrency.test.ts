@@ -140,7 +140,7 @@ describe("send_prompt same-session concurrency", () => {
 				allow_mutation: true,
 			});
 			expect(started.ok).toBe(true);
-			expect((started.session as { session_id: string }).session_id).toBe(sessionId);
+			expect(started.session).toMatchObject({ session_id: sessionId, ephemeral: true });
 			await expect(
 				server.callTool("gjc_coordinator_activate_session", {
 					session_id: sessionId,

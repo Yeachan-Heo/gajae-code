@@ -26,7 +26,11 @@ export type SessionLifecycleOperation =
 	| "session.close"
 	| "session.delete"
 	| "session.reconcile_uncertain"
+	| "session.lookup"
 	| "session.list";
+
+export type SessionLifecycleMutationOperation = Exclude<SessionLifecycleOperation, "session.lookup" | "session.list">;
+export type SessionLifecycleLookupOperation = "session.create";
 
 export interface SessionLifecycleActor {
 	readonly id: string;
@@ -160,10 +164,7 @@ export interface SessionListTarget {
 	readonly cursor?: string;
 }
 
-interface SessionLifecycleMutationRequestBase<
-	TOperation extends Exclude<SessionLifecycleOperation, "session.list">,
-	TTarget,
-> {
+interface SessionLifecycleMutationRequestBase<TOperation extends SessionLifecycleMutationOperation, TTarget> {
 	readonly operation: TOperation;
 	readonly actor: SessionLifecycleActor;
 	readonly capability: TOperation;
@@ -189,7 +190,19 @@ export interface SessionListRequest {
 	readonly timeoutMs?: number;
 }
 
-export type SessionLifecycleRequest = SessionLifecycleMutationRequest | SessionListRequest;
+export interface SessionLifecycleLookupRequest {
+	readonly operation: SessionLifecycleLookupOperation;
+	readonly actor: SessionLifecycleActor;
+	readonly capability: "session.lookup";
+	readonly requestKey: string;
+	readonly target: Readonly<Record<string, unknown>>;
+	readonly timeoutMs?: number;
+}
+
+export type SessionLifecycleRequest =
+	| SessionLifecycleMutationRequest
+	| SessionListRequest
+	| SessionLifecycleLookupRequest;
 
 export type SessionLifecycleMutationRequest =
 	| SessionCreateRequest
@@ -265,6 +278,30 @@ export interface SessionListSuccessResult {
 	readonly result: SessionLifecycleListResult | SessionScopedListResult;
 }
 
+export interface SessionLifecycleLookupIdentity {
+	readonly operation: SessionLifecycleLookupOperation;
+	readonly requestKey: string;
+}
+
+export type SessionLifecycleLookupStatus = "found" | "pending" | "not_found" | "conflict" | "uncertain" | "terminal";
+
+export interface SessionLifecycleLookupSuccessResult {
+	readonly ok: true;
+	readonly operation: "session.lookup";
+	readonly status: "found";
+	readonly request: SessionLifecycleLookupIdentity;
+	readonly result: SessionLifecycleSessionResult;
+}
+
+export interface SessionLifecycleLookupFailure {
+	readonly ok: false;
+	readonly operation: "session.lookup";
+	readonly status: Exclude<SessionLifecycleLookupStatus, "found"> | "unavailable";
+	readonly request: SessionLifecycleLookupIdentity;
+	readonly certainty: SessionLifecycleCertainty;
+	readonly error: SessionLifecycleError;
+}
+
 export interface SessionLifecycleError {
 	readonly code: string;
 	readonly message: string;
@@ -321,6 +358,7 @@ export type SessionCloseOutcome = SessionCloseResult | SessionCloseFailure;
 export type SessionDeleteOutcome = SessionDeleteResult | SessionDeleteFailure;
 export type SessionReconcileUncertainOutcome = SessionReconcileUncertainResult | SessionReconcileUncertainFailure;
 export type SessionListOutcome = SessionListSuccessResult | SessionListFailure;
+export type SessionLifecycleLookupOutcome = SessionLifecycleLookupSuccessResult | SessionLifecycleLookupFailure;
 export type SessionLifecycleResult =
 	| SessionCreateOutcome
 	| SessionForkOutcome
@@ -328,13 +366,14 @@ export type SessionLifecycleResult =
 	| SessionCloseOutcome
 	| SessionDeleteOutcome
 	| SessionReconcileUncertainOutcome
-	| SessionListOutcome;
+	| SessionListOutcome
+	| SessionLifecycleLookupOutcome;
 
 /** Shared, side-effect-free validation for lifecycle mutation requests. */
 export type SessionLifecycleMutationValidation =
 	| {
 			readonly ok: true;
-			readonly operation: Exclude<SessionLifecycleOperation, "session.list">;
+			readonly operation: SessionLifecycleMutationOperation;
 			readonly actor: SessionLifecycleActor;
 			readonly requestKey: string;
 			readonly target: Readonly<Record<string, unknown>>;
@@ -387,7 +426,7 @@ export function deriveSessionLifecycleIdempotencyKey(
 	return createHash("sha256").update(canonicalJson(identity), "utf8").digest("hex");
 }
 
-function operationOf(value: unknown): SessionLifecycleOperation {
+function operationOf(value: unknown): SessionLifecycleMutationOperation | "session.list" {
 	if (
 		value === "session.create" ||
 		value === "session.fork" ||
@@ -401,7 +440,7 @@ function operationOf(value: unknown): SessionLifecycleOperation {
 	return "session.list";
 }
 
-function failure<TOperation extends SessionLifecycleOperation>(
+function failure<TOperation extends SessionLifecycleMutationOperation | "session.list">(
 	operation: TOperation,
 	certainty: SessionLifecycleCertainty,
 	code: string,
@@ -780,6 +819,26 @@ function certaintyForThrownError(error: {
 	return "retryable";
 }
 
+function lookupStatusForError(code: string): {
+	status: Exclude<SessionLifecycleLookupStatus, "found"> | "unavailable";
+	certainty: SessionLifecycleCertainty;
+} {
+	if (code === "not_found") return { status: "not_found", certainty: "uncertain" };
+	if (code === "idempotency_conflict") return { status: "conflict", certainty: "uncertain" };
+	if (code === "lifecycle_pending") return { status: "pending", certainty: "uncertain" };
+	if (code === "terminal_uncertain") return { status: "uncertain", certainty: "uncertain" };
+	return { status: "terminal", certainty: certaintyForBrokerCode(code) };
+}
+
+function lookupFailure(
+	request: SessionLifecycleLookupIdentity,
+	status: Exclude<SessionLifecycleLookupStatus, "found"> | "unavailable",
+	certainty: SessionLifecycleCertainty,
+	error: SessionLifecycleError,
+): SessionLifecycleLookupFailure {
+	return { ok: false, operation: "session.lookup", status, request, certainty, error };
+}
+
 function brokerSuccess(value: unknown): unknown | undefined {
 	if (!isRecord(value) || value.ok !== true) return undefined;
 	return value.result;
@@ -790,6 +849,90 @@ export class SessionLifecycleService {
 
 	constructor(client: SessionLifecycleClient) {
 		this.#client = client;
+	}
+
+	async lookup(request: SessionLifecycleLookupRequest): Promise<SessionLifecycleLookupOutcome> {
+		const operation = request.operation;
+		const requestKey = typeof request.requestKey === "string" ? request.requestKey : "";
+		const identity: SessionLifecycleLookupIdentity = { operation, requestKey };
+		if (!validActor(request.actor))
+			return lookupFailure(identity, "terminal", "terminal", {
+				code: "unauthorized",
+				message: "authenticated actor is required",
+			});
+		if (request.capability !== "session.lookup")
+			return lookupFailure(identity, "terminal", "terminal", {
+				code: "capability_denied",
+				message: "capability does not authorize session.lookup",
+			});
+		if (!validRequestKey(request.requestKey))
+			return lookupFailure(identity, "terminal", "terminal", {
+				code: "invalid_request",
+				message: "requestKey is required",
+			});
+		if (!validTarget(request.target))
+			return lookupFailure(identity, "terminal", "terminal", {
+				code: "invalid_request",
+				message: "target must be an object",
+			});
+
+		const validation = validateSessionLifecycleMutationRequest({
+			operation,
+			actor: request.actor,
+			capability: operation,
+			requestKey: request.requestKey,
+			target: request.target,
+		});
+		if (!validation.ok) return lookupFailure(identity, "terminal", validation.certainty, validation.error);
+
+		let response: unknown;
+		try {
+			response = await this.#client.global(
+				"session.lookup",
+				{ operation, target: { ...validation.target } },
+				{
+					idempotencyKey: deriveSessionLifecycleIdempotencyKey(request.actor, request.requestKey, operation),
+					...(request.timeoutMs === undefined ? {} : { timeoutMs: request.timeoutMs }),
+				},
+			);
+		} catch (thrown) {
+			const error = brokerError(thrown) ?? brokerErrorFromThrown(thrown);
+			if (error) {
+				const mapped = lookupStatusForError(error.code);
+				const transport = TRANSPORT_ERROR_CODES.has(error.code);
+				return lookupFailure(
+					identity,
+					transport ? "unavailable" : mapped.status,
+					transport ? certaintyForThrownError(error) : mapped.certainty,
+					{
+						code: error.code,
+						message: error.message,
+					},
+				);
+			}
+			return lookupFailure(identity, "unavailable", "retryable", {
+				code: "unavailable",
+				message: "lifecycle broker request was unavailable",
+			});
+		}
+
+		const error = brokerError(response);
+		if (error) {
+			const mapped = lookupStatusForError(error.code);
+			return lookupFailure(identity, mapped.status, mapped.certainty, error);
+		}
+		if (!isRecord(response) || response.ok !== true)
+			return lookupFailure(identity, "uncertain", "uncertain", {
+				code: "malformed_response",
+				message: "lifecycle broker returned a malformed lookup result",
+			});
+		const result = sessionResult(brokerSuccess(response));
+		if (!result)
+			return lookupFailure(identity, "uncertain", "uncertain", {
+				code: "malformed_response",
+				message: "lifecycle broker returned a malformed session result",
+			});
+		return { ok: true, operation: "session.lookup", status: "found", request: identity, result };
 	}
 
 	async scopedList(scope: ScopeRequestV1, limit?: number, cursor?: string): Promise<SessionListOutcome> {

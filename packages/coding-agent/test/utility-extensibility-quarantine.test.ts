@@ -61,7 +61,7 @@ describe("GJC utility extensibility quarantine", () => {
 		expect(await Bun.file(srcPath("slash-commands", "marketplace-install-parser.ts")).exists()).toBe(false);
 	});
 
-	it("does not default-discover skills, extensions, custom commands, custom tools, plugins, or marketplaces", async () => {
+	it("loads documented filesystem extension modules at session startup while keeping other extensibility surfaces opt-in", async () => {
 		const sdk = await source("sdk", "session.ts");
 		const skillsEnabledGuard = '} else if (settings.get("skills.enabled")) {';
 		const defaultSdk = sdk.slice(0, sdk.indexOf(skillsEnabledGuard));
@@ -69,13 +69,17 @@ describe("GJC utility extensibility quarantine", () => {
 		const main = await source("main.ts");
 		const settingsSchema = await source("config", "settings-schema.ts");
 
+		// Issue #5497: extension modules under the documented native locations
+		// (`<agentDir>/extensions`, `<cwd>/.gjc/extensions`) load at session startup
+		// unless the caller opts out with `disableExtensionDiscovery`.
+		expect(sdk).toContain("discoverAndLoadExtensions(");
+		expect(sdk).toContain("options.disableExtensionDiscovery");
+
 		for (const forbidden of [
 			'logger.time("discoverSkills"',
 			'logger.time("discoverSlashCommands"',
 			'logger.time("discoverCustomCommands"',
 			'logger.time("discoverAndLoadCustomTools"',
-			'logger.time("discoverAndLoadExtensions"',
-			'logger.time("loadExtensions"',
 		]) {
 			expect(forbidden === 'logger.time("discoverSkills"' ? defaultSdk : sdk).not.toContain(forbidden);
 		}

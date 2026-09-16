@@ -107,6 +107,7 @@ export function validateLoadedBindings(
 
 export interface LoaderContext {
 	isCompiledBinary: boolean;
+	isWorkspaceLoad?: boolean;
 	platformTag: string;
 	packageVersion?: string;
 	addonLabel?: string;

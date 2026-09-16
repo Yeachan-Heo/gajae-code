@@ -121,6 +121,90 @@ export function isProcessIncarnation(value: unknown): value is string {
 	);
 }
 
+/**
+ * Read-only, non-mutating observation of whether a pid currently names a
+ * verifiable process incarnation.
+ *
+ * - `status: "present"` carries the exact kernel-reported identity evidence
+ *   (the same value `processIncarnation` returns).
+ * - `status: "absent"` is positive OS-confirmed death proof (POSIX
+ *   `kill(pid, 0)` returning `ESRCH`, or Windows `OpenProcess` failing with
+ *   the exact code the kernel reports for an unresolved client id) — never a
+ *   permission failure or an ambiguous disappearance.
+ * - `status: "unknown"` covers every inconclusive case (invalid pid, missing
+ *   or unavailable native addon, permission denial, platform limitation).
+ *   Callers MUST NOT treat this as death proof.
+ */
+export type ProcessIncarnationObservation =
+	| { status: "present"; incarnation: string }
+	| { status: "absent" }
+	| { status: "unknown"; reasonCode: string };
+
+/** Raw shape returned by the native `Process.observe` binding. */
+export type NativeProcessObserveResult = { status?: unknown; incarnation?: unknown; reasonCode?: unknown };
+
+export interface ObserveProcessIncarnationOptions {
+	/**
+	 * Injectable native observe function, used by tests to exercise error
+	 * classification (malformed shapes, unavailable addon) without a global
+	 * mock. Defaults to the real `Process.observe` binding.
+	 */
+	observe?: (pid: number) => NativeProcessObserveResult;
+}
+
+/**
+ * Read-only process-incarnation observation for `pid`, distinguishing a
+ * proved-live incarnation from positive OS-confirmed absence from every
+ * inconclusive outcome. Never signals, kills, reaps, waits on, or spawns any
+ * process — it only reads existing native process-table state via
+ * `Process.observe`.
+ *
+ * `pid` must be a positive safe integer; any other value (including `0`,
+ * negative, `NaN`, or non-integer) is reported as `unknown` rather than
+ * risking an ambiguous platform-specific interpretation (`0`/negative PIDs
+ * address process groups on POSIX, not a single process).
+ */
+export function observeProcessIncarnation(
+	pid: number,
+	options: ObserveProcessIncarnationOptions = {},
+): ProcessIncarnationObservation {
+	if (!Number.isSafeInteger(pid) || pid <= 0 || pid > 0x7fff_ffff) {
+		return { status: "unknown", reasonCode: "invalid_pid" };
+	}
+	try {
+		const observe =
+			options.observe ?? (nativeProcessBindings().Process as { observe?: (pid: number) => unknown }).observe;
+		if (typeof observe !== "function") {
+			// Older addon build predating Process.observe: liveness cannot be
+			// determined through this path, and that is not death proof.
+			return { status: "unknown", reasonCode: "observe_unavailable" };
+		}
+		const result = observe(pid) as NativeProcessObserveResult;
+		if (result?.status === "present" && isProcessIncarnation(result.incarnation) && result.reasonCode === undefined) {
+			return { status: "present", incarnation: result.incarnation };
+		}
+		if (result?.status === "absent" && result.incarnation === undefined && result.reasonCode === undefined) {
+			return { status: "absent" };
+		}
+		if (
+			result?.status === "unknown" &&
+			result.incarnation === undefined &&
+			typeof result.reasonCode === "string" &&
+			/^[a-z][a-z0-9_]{0,63}$/.test(result.reasonCode)
+		) {
+			return { status: "unknown", reasonCode: result.reasonCode };
+		}
+		// A native result shape that matches none of the above (e.g. "present"
+		// without a canonical incarnation) is a contract mismatch, not evidence of
+		// anything — report unknown rather than guessing.
+		return { status: "unknown", reasonCode: "malformed_observation" };
+	} catch {
+		// The native addon is missing/unloadable on this host. Not proof of
+		// death: the caller has no OS confirmation either way.
+		return { status: "unknown", reasonCode: "native_addon_unavailable" };
+	}
+}
+
 /** A PID is reusable; bind it to the strongest OS-provided process start incarnation available. */
 export function processIncarnation(pid: number, options: ProcessIncarnationOptions = {}): string | undefined {
 	if (!Number.isSafeInteger(pid) || pid <= 0) return undefined;
@@ -128,8 +212,8 @@ export function processIncarnation(pid: number, options: ProcessIncarnationOptio
 	if (platform === process.platform && options.runCommand === undefined) {
 		try {
 			const nativeProcess = nativeProcessBindings().Process.fromPid(pid) as { incarnation?: unknown } | null;
-			// null is the native binding's authoritative absent-process result: the
-			// process is dead or its PID was never opened.  Returning undefined here
+			// A null native reference cannot provide an incarnation: the process
+			// may be absent or inaccessible. Returning undefined here
 			// avoids repeatedly spawning powershell.exe (whose Get-Process uses the same
 			// OpenProcess path and therefore cannot recover a valid incarnation either)
 			// during the broker's ~5 s liveness polling, which on Windows 11 produces a

@@ -10,6 +10,7 @@ import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { TempDir } from "@gajae-code/utils";
 import * as z from "zod/v4";
+import { terminalOnlyStream } from "./helpers/terminal-only-stream";
 
 const QUESTION = "마지막 병목";
 const usage = {
@@ -96,7 +97,7 @@ describe("AgentSession escaped non-ASCII metadata fidelity", () => {
 		const agent = new Agent({
 			initialState: { model: mock.model, systemPrompt: ["test"], tools: [askTool()], messages: [] },
 			convertToLlm: identityConverter,
-			streamFn: mock.stream,
+			streamFn: terminalOnlyStream(mock.stream),
 		});
 		session = new AgentSession({
 			agent,
@@ -104,9 +105,23 @@ describe("AgentSession escaped non-ASCII metadata fidelity", () => {
 			settings: Settings.isolated({ "compaction.enabled": false }),
 			modelRegistry,
 		});
+		const assistantMessageEnds: string[] = [];
+		session.subscribe(event => {
+			if (event.type !== "message_end" || event.message.role !== "assistant") return;
+			assistantMessageEnds.push(
+				event.message.content
+					.filter(
+						(block): block is Extract<AssistantMessage["content"][number], { type: "toolCall" }> =>
+							block.type === "toolCall",
+					)
+					.map(block => block.id)
+					.join(","),
+			);
+		});
 
 		await session.prompt("ask me");
 		await manager.flush();
+		expect(assistantMessageEnds).toEqual(["tc-accepted", ""]);
 
 		const persisted = manager
 			.buildSessionContext()

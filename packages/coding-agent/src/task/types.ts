@@ -370,8 +370,15 @@ const API_KEY_LABEL_VALUE_PATTERN = /(["']?api\s+key["']?\s*:\s*)(?:"[^"]*"|'[^'
 // arbitrary trailing segments.
 const SENSITIVE_SETUP_FAILURE_VALUE_PATTERN =
 	/(["']?(?:[A-Za-z][A-Za-z0-9]{0,63}[_.-]){0,16}?(?:access[_-]?token|refresh[_-]?token|session[_-]?token|id[_-]?token|api[_-]?key|client[_-]?secret|private[_-]?key|signing[_-]?key|secret|password|passwd|pwd|authorization|credential|token)(?:[_.-][A-Za-z0-9]+)*["']?)(\s*[=:]\s*)(?:"[^"]*"|'[^']*'|[^\s&]+)/gi;
+// `AKIA` is only one of four AWS access-key id prefixes, and the npm, GitLab,
+// Stripe and Hugging Face shapes are the ones `crash/upstream/envelope.ts`
+// already classifies as credential-like. Stripe and Hugging Face separate with
+// `_`, so the `sk-` alternatives above never matched them.
 const BARE_PROVIDER_TOKEN_PATTERN =
-	/\b(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}|xox[baprs]-[A-Za-z0-9-]{20,}|sk-(?:proj-)?[A-Za-z0-9_-]{20,}|sk-ant-[A-Za-z0-9_-]{20,}|AIza[A-Za-z0-9_-]{35}|AKIA[A-Z0-9]{16})\b/g;
+	/\b(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}|xox[baprs]-[A-Za-z0-9-]{20,}|sk-(?:proj-)?[A-Za-z0-9_-]{20,}|sk-ant-[A-Za-z0-9_-]{20,}|AIza[A-Za-z0-9_-]{35}|(?:AKIA|ASIA|ABIA|ACCA)[A-Z0-9]{16}|npm_[A-Za-z0-9]{20,}|glpat-[A-Za-z0-9_-]{20,}|(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{16,}|hf_[A-Za-z0-9]{20,})\b/g;
+// A PEM block carries the key material itself and is redacted whole, before the
+// narrower rules can consume its base64 body and leave a truncated key behind.
+const PEM_PRIVATE_KEY_PATTERN = /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----/g;
 const LOCAL_ABSOLUTE_PATH_PATTERN = /(^|[\s("'`=])((?:\/(?!\/)[^\s/:?"'`()[\]{},;<>]+){2,})/g;
 const WINDOWS_ABSOLUTE_PATH_PATTERN =
 	/(^|[\s("'`=])([A-Za-z]:\\(?:[^\\/:?"'`()[\]{},;<>\s]+\\)+[^\\/:?"'`()[\]{},;<>\s]+)/g;
@@ -431,6 +438,7 @@ function capSetupFailureSummary(value: string): string {
 export function createSetupFailureSummary(error: unknown): SetupFailureSummary {
 	const message = normalizeSetupFailureText(error instanceof Error ? error.message : String(error));
 	const summary = message
+		.replace(PEM_PRIVATE_KEY_PATTERN, "[redacted]")
 		.replace(AUTHORIZATION_HEADER_VALUE_PATTERN, "$1[redacted]")
 		.replace(COOKIE_HEADER_VALUE_PATTERN, "$1[redacted]")
 		.replace(URL_CREDENTIAL_PATTERN, "$1[redacted]@")

@@ -142,6 +142,13 @@ export interface SessionIndexEvent {
 	endpointFileId?: string;
 	lifecycleRequestId?: string;
 	terminalUncertain?: boolean;
+	/**
+	 * Distinguishes the terminal-uncertain claim written by a forced stop of a
+	 * stale-endpoint session from the one written by the fail-closed tail of an
+	 * ordinary teardown. Only the forced claim releases the session's worktree;
+	 * see `worktreeOccupant`.
+	 */
+	forcedStaleRelease?: boolean;
 	/** OS process incarnation (C1); absent on legacy v1/v2 events. */
 	hostIncarnation?: string;
 	/** Present on host_heartbeat checkpoints (C2). */
@@ -164,6 +171,8 @@ export interface IndexedSession {
 	indexSeq: number;
 	lifecycleRequestId?: string;
 	terminalUncertain?: boolean;
+	/** True only for a terminal-uncertain claim written by a forced stale-worktree release. */
+	forcedStaleRelease?: boolean;
 	hostIncarnation?: string;
 	identityProvenance: SessionIdentityProvenance;
 	activity?: SessionActivity;
@@ -598,6 +607,7 @@ function projectIdentity(
 		endpointFileId: latest.endpointFileId,
 		lifecycleRequestId: latest.lifecycleRequestId,
 		terminalUncertain,
+		...(latest.forcedStaleRelease === true ? { forcedStaleRelease: true } : {}),
 		indexSeq: latest.indexSeq,
 		hostIncarnation: latest.hostIncarnation,
 		masterRole: latest.masterRole,
@@ -879,21 +889,27 @@ function compactEvents(events: SessionIndexEvent[], policy: ResolvedRetentionPol
 	}
 	if (policy.maxRows >= 1 && kept.length > policy.maxRows) {
 		const keptLatest = new Map<string, SessionIndexEvent>();
+		const rowsBySession = new Map<string, number>();
 		for (const event of kept) {
 			const previous = keptLatest.get(event.sessionId);
 			if (previous === undefined || event.indexSeq > previous.indexSeq) keptLatest.set(event.sessionId, event);
+			rowsBySession.set(event.sessionId, (rowsBySession.get(event.sessionId) ?? 0) + 1);
 		}
 		const anchorSession = kept.find(event => event.indexSeq === maxIndexSeq)?.sessionId;
 		const candidates = [...keptLatest.entries()]
 			.filter(([sessionId]) => sessionId !== anchorSession)
 			.filter(([, latest]) => !(policy.tombstoneRule === "retain" && latest.type === "session_deleted"))
 			.sort((a, b) => a[1].indexSeq - b[1].indexSeq);
-		let result = kept;
+		let remaining = kept.length;
+		const evicted = new Set<string>();
 		for (const [sessionId] of candidates) {
-			if (result.length <= policy.maxRows) break;
-			result = result.filter(event => event.sessionId !== sessionId);
+			if (remaining <= policy.maxRows) break;
+			evicted.add(sessionId);
+			remaining -= rowsBySession.get(sessionId)!;
 		}
-		return result;
+		// Evict whole sessions in the same order without repeatedly copying the
+		// surviving history for every victim while rotation holds the index lock.
+		return kept.filter(event => !evicted.has(event.sessionId));
 	}
 	return kept;
 }
@@ -1233,8 +1249,59 @@ export class SessionIndex {
 		// captured here (refresh() does this via #refreshUnderLock).
 		this.#changeStamp = await readIndexChangeStamp(this.#agentDir);
 	}
+	/**
+	 * Parse/checksum history before contending for the global lock (#5438). Under
+	 * the lock, prove both file identities and the exact prepared bytes still
+	 * match. Growth is safe only after comparing the whole prefix, not merely
+	 * its size/mtime: a same-inode rewrite followed by append must replay.
+	 * There is no optimistic retry loop; replacement or corruption falls back
+	 * to the authoritative locked replay and existing quarantine repair.
+	 */
+	async #replayPreparedAppendUnderLock(scan: SessionIndexScan, prior: SessionIndexChangeStamp): Promise<void> {
+		const stamp = await readIndexChangeStamp(this.#agentDir);
+		if (
+			scan.diagnosis.status !== "healthy" ||
+			stamp.snapshot.exists !== prior.snapshot.exists ||
+			stamp.snapshot.ino !== prior.snapshot.ino ||
+			stamp.log.exists !== prior.log.exists ||
+			stamp.log.ino !== prior.log.ino
+		) {
+			await this.#replayUnderLock();
+			return;
+		}
+		const read = async (file: string): Promise<Buffer | undefined> => {
+			try {
+				return await fs.readFile(file);
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+				throw error;
+			}
+		};
+		const [snapshot, log] = await Promise.all([read(snapshotFor(this.#agentDir)), read(logFor(this.#agentDir))]);
+		const sameSnapshot =
+			snapshot === undefined
+				? scan.snapshotContents === undefined
+				: scan.snapshotContents !== undefined && snapshot.equals(scan.snapshotContents);
+		const samePrefix =
+			log === undefined
+				? scan.logContents === undefined
+				: scan.logContents !== undefined &&
+					log.length >= scan.logContents.length &&
+					log.subarray(0, scan.logContents.length).equals(scan.logContents);
+		if (!sameSnapshot || !samePrefix) {
+			await this.#replayUnderLock();
+			return;
+		}
+		this.#adoptScan(scan);
+		if ((log?.length ?? 0) > this.#logOffset) await this.#tailUnderLock(this.indexSeq, true, true);
+	}
 	async #replayUnderLock(): Promise<void> {
 		const scan = await this.#scan();
+		this.#adoptScan(scan);
+		await this.#writeAuditUnderLock();
+		this.#changeStamp = await readIndexChangeStamp(this.#agentDir);
+	}
+	#adoptScan(scan: SessionIndexScan): void {
 		if (scan.diagnosis.status === "unsupported") throw scan.unsupportedError!;
 		this.#events = [...scan.snapshotEvents, ...scan.validLogEvents];
 		this.#warnings = [];
@@ -1245,8 +1312,6 @@ export class SessionIndex {
 		this.#corruptSuffix = scan.diagnosis.status === "corrupt";
 		if (scan.diagnosis.reason === "invalid snapshot") this.#warnings.push("Invalid session index snapshot");
 		if (this.#corruptSuffix) this.#warnings.push("Corrupt session index entry; replay truncated");
-		await this.#writeAuditUnderLock();
-		this.#changeStamp = await readIndexChangeStamp(this.#agentDir);
 	}
 	/** Seed the audit dedupe set once, then append records for newly-rejected events. */
 	async #writeAuditUnderLock(): Promise<void> {
@@ -1472,7 +1537,7 @@ export class SessionIndex {
 		await this.#replayUnderLock();
 		return { ...scan.diagnosis, repaired: true, quarantinePath };
 	}
-	async #tailUnderLock(snapshotSeq = this.indexSeq, allowResync = true): Promise<void> {
+	async #tailUnderLock(snapshotSeq = this.indexSeq, allowResync = true, strictSequence = false): Promise<void> {
 		let data: Buffer;
 		try {
 			const handle = await fs.open(logFor(this.#agentDir), "r");
@@ -1508,10 +1573,19 @@ export class SessionIndex {
 				corrupt = true;
 				continue;
 			}
-			if (corrupt || event.indexSeq <= snapshotSeq) continue;
+			// Valid JSON need not be an event object. In particular, null must
+			// reach replay/repair rather than throw while reading its fields.
+			if (event === null || typeof event !== "object" || Array.isArray(event)) {
+				corrupt = true;
+				continue;
+			}
+			if (corrupt || (!strictSequence && event.indexSeq <= snapshotSeq)) continue;
 			const { checksum, ...unsigned } = event;
 			if (checksum !== sessionIndexChecksum(unsigned) || event.indexSeq !== this.indexSeq + 1) corrupt = true;
-			else this.#events.push(event);
+			else {
+				this.#events.push(event);
+				if (!hasSessionLocatorV2(event)) this.#warn(legacyLocatorDiagnostic(event));
+			}
 		}
 		if (hasUnterminatedSuffix) corrupt = true;
 		if (corrupt) {
@@ -1563,8 +1637,10 @@ export class SessionIndex {
 				input.pid > 0
 			)
 				ownIncarnation = input.processIncarnation ?? processIncarnation(input.pid);
+			const preparedStamp = await readIndexChangeStamp(this.#agentDir);
+			const preparedScan = await this.#scan();
 			return await withSessionIndexLock("append", this.#agentDir, async () => {
-				await this.#replayUnderLock();
+				await this.#replayPreparedAppendUnderLock(preparedScan, preparedStamp);
 				if (this.#corruptSuffix) {
 					// A corrupt suffix used to hard-fail every append until a human ran
 					// `gjc gc --repair-session-index` — but the writers that corrupt the
@@ -1596,14 +1672,36 @@ export class SessionIndex {
 				if (ownIncarnation !== undefined && unsigned.hostIncarnation === undefined)
 					unsigned.hostIncarnation = ownIncarnation;
 				const event: SessionIndexEvent = { ...unsigned, checksum: sessionIndexChecksum(unsigned) };
-				await appendSync(logFor(this.#agentDir), JSON.stringify(event));
-				await this.#refreshUnderLock();
-				if ((await fs.stat(logFor(this.#agentDir))).size >= ROTATE_BYTES) await this.#rotate();
+				const serialized = JSON.stringify(event);
+				// Publish to memory only after the complete append and fsync succeed.
+				// No need to reread/checksum the row this lock holder just wrote.
+				await appendSync(logFor(this.#agentDir), serialized);
+				// Keep caller-owned input/return objects separate from durable state.
+				this.#events.push(JSON.parse(serialized) as SessionIndexEvent);
+				this.#logOffset += Buffer.byteLength(serialized) + 1;
+				if (!hasSessionLocatorV2(event)) this.#warn(legacyLocatorDiagnostic(event));
+				await this.#writeAuditUnderLock();
+				if (this.#logOffset >= ROTATE_BYTES) await this.#rotate();
+				this.#changeStamp = await readIndexChangeStamp(this.#agentDir);
 				return event;
 			});
 		});
 	}
-	async unregisterIfCurrent(expected: IndexedSession): Promise<boolean> {
+	async unregisterIfCurrent(
+		expected: Pick<
+			SessionIndexEvent,
+			| "sessionId"
+			| "locator"
+			| "endpointGeneration"
+			| "pid"
+			| "indexSeq"
+			| "endpointMtimeMs"
+			| "endpointFileId"
+			| "lifecycleRequestId"
+			| "processIncarnation"
+			| "hostIncarnation"
+		>,
+	): Promise<boolean> {
 		const indexPath = path.resolve(logFor(this.#agentDir));
 		return await SessionIndex.#enqueue(indexPath, async () => {
 			await fs.mkdir(dirFor(this.#agentDir), { recursive: true, mode: 0o700 });
@@ -1632,6 +1730,7 @@ export class SessionIndex {
 						session.endpointGeneration === expected.endpointGeneration &&
 						session.pid === expected.pid &&
 						session.endpointMtimeMs === expected.endpointMtimeMs &&
+						session.endpointFileId === expected.endpointFileId &&
 						session.lifecycleRequestId === expected.lifecycleRequestId &&
 						session.processIncarnation === expected.processIncarnation &&
 						(session.hostIncarnation ?? session.processIncarnation) ===
@@ -1678,6 +1777,7 @@ export class SessionIndex {
 						: { processIncarnation: expected.processIncarnation }),
 					...(expected.hostIncarnation === undefined ? {} : { hostIncarnation: expected.hostIncarnation }),
 					...(expected.endpointMtimeMs === undefined ? {} : { endpointMtimeMs: expected.endpointMtimeMs }),
+					...(expected.endpointFileId === undefined ? {} : { endpointFileId: expected.endpointFileId }),
 					...(expected.lifecycleRequestId === undefined
 						? {}
 						: { lifecycleRequestId: expected.lifecycleRequestId }),
@@ -1747,15 +1847,23 @@ export class SessionIndex {
 		);
 	}
 	async #rotate(): Promise<void> {
-		await this.#snapshotUnderLock();
-		const file = logFor(this.#agentDir);
-		await replaceAtomically(file, "");
+		// Every caller has already replayed/refreshed under this same lock.
+		// Replaying before snapshot and again after rotation needlessly parses
+		// the entire history multiple times in the append critical section.
+		const events = compactEvents(this.#events, this.#policy);
+		await replaceAtomically(
+			snapshotFor(this.#agentDir),
+			JSON.stringify({ version: SESSION_INDEX_SNAPSHOT_VERSION, indexSeq: this.indexSeq, events }),
+		);
+		await replaceAtomically(logFor(this.#agentDir), "");
+		this.#events = events;
 		this.#logOffset = 0;
-		// Sync in-memory state with the compacted snapshot while the lock is
-		// held: without this the instance keeps pre-compaction events and a
-		// fresh change stamp, so later refreshIfChanged() polls would never
-		// observe the compaction (#4689 review).
-		await this.#replayUnderLock();
+		this.#corruptSuffix = false;
+		this.#warnings = [];
+		for (const event of events) {
+			if (!hasSessionLocatorV2(event)) this.#warn(legacyLocatorDiagnostic(event));
+		}
+		this.#changeStamp = await readIndexChangeStamp(this.#agentDir);
 	}
 
 	listSessions(): SessionList {
@@ -2002,6 +2110,7 @@ export class SessionIndex {
 			| "processIncarnation"
 			| "hostIncarnation"
 			| "endpointMtimeMs"
+			| "endpointFileId"
 			| "lifecycleRequestId"
 		>,
 	): { type: "host_unregistered" | "session_closed" | "session_deleted"; indexSeq: number } | undefined {
@@ -2023,6 +2132,7 @@ export class SessionIndex {
 					event.type === "session_closed" ||
 					event.type === "session_deleted") &&
 				(event.hostIncarnation ?? event.processIncarnation) === expectedIncarnation &&
+				event.endpointFileId === expected.endpointFileId &&
 				(supersededAt === undefined || event.indexSeq < supersededAt) &&
 				!followsApplicableTombstone(
 					this.#events,
@@ -2071,6 +2181,7 @@ export class SessionIndex {
 			| "processIncarnation"
 			| "hostIncarnation"
 			| "endpointMtimeMs"
+			| "endpointFileId"
 			| "lifecycleRequestId"
 		>,
 	): number | undefined {
@@ -2088,6 +2199,7 @@ export class SessionIndex {
 		return this.#events.findLast(
 			event =>
 				event.type === "session_closed" &&
+				event.endpointFileId === expected.endpointFileId &&
 				(supersededAt === undefined || event.indexSeq < supersededAt) &&
 				!followsApplicableTombstone(
 					this.#events,
@@ -2236,6 +2348,7 @@ export class SessionIndex {
 			| "lifecycleRequestId"
 			| "hostIncarnation"
 			| "processIncarnation"
+			| "endpointFileId"
 		>,
 	): { indexSeq: number; lifecycleRequestId?: string } | undefined {
 		const lifecycleRequestId = registration.lifecycleRequestId;
@@ -2247,6 +2360,7 @@ export class SessionIndex {
 				item.sessionId === registration.sessionId &&
 				item.endpointGeneration === registration.endpointGeneration &&
 				item.pid === registration.pid &&
+				item.endpointFileId === registration.endpointFileId &&
 				resolveEquivalentPath(item.locator.cwd) === resolveEquivalentPath(registration.locator.cwd) &&
 				path.resolve(item.locator.stateRoot) === path.resolve(registration.locator.stateRoot) &&
 				(lifecycleRequestId === undefined || item.lifecycleRequestId === lifecycleRequestId) &&

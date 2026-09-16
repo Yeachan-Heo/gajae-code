@@ -37,8 +37,8 @@
 - Cancellation and headless cases throw instead of returning a structured success result.
 
 ## Flow
-1. `AskTool.createIf()` only registers the tool when `session.hasUI` is true; headless sessions never get it.
-2. `execute()` requires `context.ui`; if missing it aborts the context and throws `ToolAbortError("Ask tool requires interactive mode")`.
+1. `AskTool.createIf()` registers the tool when the session has a UI, is workflow-gate eligible, or exposes a workflow-gate emitter; a plain headless session without any answer surface never gets it.
+2. `execute()` prefers a local interactive UI (`context.ui`) when one exists. Otherwise it uses a registered ask answer source (e.g. an SDK/ACP client) or, without one, the durable workflow gate (`packages/coding-agent/src/tools/ask.ts`).
 3. It reads `ask.timeout` from settings, converts seconds to milliseconds, and disables timeout entirely while plan mode is enabled (`packages/coding-agent/src/tools/ask.ts`).
 4. If `ask.notify` is not `off`, it sends a terminal notification: `Waiting for input`.
 5. For each question, `askSingleQuestion()` drives either:
@@ -68,7 +68,8 @@
 
 ## Limits & Caps
 - `questions` must contain at least 1 item (`askSchema` in `packages/coding-agent/src/tools/ask.ts`).
-- `ask.timeout` default is `30` seconds; `0` disables timeout (`packages/coding-agent/src/config/settings-schema.ts`).
+- `ask.timeout` default is `0` (disabled); a positive value auto-selects the recommended option after that many seconds (`packages/coding-agent/src/config/settings-schema.ts`).
+- `GJC_ASK_ANSWER_DEADLINE_MS` bounds how long a **headless** ask waits for an answer, in milliseconds. Unset, empty, `0`, negative, non-integer, or greater than `MAX_ASK_ANSWER_DEADLINE_MS` (`2_147_483_647`, the largest delay the runtime timer can represent) disables the bound, which is the default. On expiry the ask logs `ask_answer_deadline_exceeded`, aborts the enclosing turn, and throws `ToolAbortError("Ask was aborted: no answer was received within Ns of the headless ask answer deadline")`. This is an answer deadline, not an acknowledgement bound: no answer source reports that it has taken the question, so a late answer is settled as `resolve_without_commit`/`aborted` rather than attributed to an unresponsive source. It is deliberately separate from `ask.timeout`, which auto-selects an answer for the interactive picker and may legitimately let a remote responder answer later.
 - Prompt guidance says provide 2-5 options, but code does not enforce that (`packages/coding-agent/src/prompts/tools/ask.md`).
 - Timeout only applies to the option picker; once the user chooses `Other`, the editor has no timeout (`packages/coding-agent/src/prompts/tools/ask.md`).
 
@@ -76,6 +77,8 @@
 - Missing interactive UI: throws `ToolAbortError("Ask tool requires interactive mode")`.
 - User cancels picker/editor without timeout: throws `ToolAbortError("Ask tool was cancelled by the user")`.
 - Abort signal during input: converted to `ToolAbortError("Ask input was cancelled")`.
+- Remote answer source closes the ask: throws `ToolAbortError("Ask was cancelled by the remote client")`.
+- `GJC_ASK_ANSWER_DEADLINE_MS` expires with no answer: throws `ToolAbortError("Ask was aborted: no answer was received within Ns of the headless ask answer deadline")`.
 - Empty `questions` at runtime returns a text error payload instead of throwing: `Error: questions must not be empty`.
 
 ## Notes

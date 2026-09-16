@@ -81,6 +81,8 @@ describe("kind-aware reconciliation", () => {
 						code: "prompt_failed",
 						message: "raw provider secret",
 						provenance: "agent_failed",
+						phase: "submission",
+						category: "unknown",
 					},
 					receiptState: "unknown",
 				},
@@ -103,6 +105,15 @@ describe("kind-aware reconciliation", () => {
 			expect(reopened.lookupResult("prompt", { clientRef: "diagnostic-ref" })).toMatchObject({
 				status: "failed",
 				error: { code: "provider_unavailable", message: "Prompt submission failed." },
+			});
+			expect(reopened.lookup("prompt", { clientRef: "diagnostic-ref" })).toMatchObject({
+				status: "failed",
+				outcome: {
+					kind: "failed",
+					phase: "submission",
+					category: "agent_runtime",
+					message: "Prompt submission failed.",
+				},
 			});
 			expect(reopened.lookupSteer("steer-diagnostic-ref")).toMatchObject({
 				status: "rejected",
@@ -267,6 +278,8 @@ describe("kind-aware reconciliation", () => {
 					code: "prompt_failed",
 					message: "Prompt submission failed.",
 					provenance: "agent_failed",
+					phase: "submission",
+					category: "agent_runtime",
 				},
 			},
 			{
@@ -276,6 +289,8 @@ describe("kind-aware reconciliation", () => {
 					code: "prompt_failed",
 					message: "claimed failure",
 					provenance: "agent_failed",
+					phase: "submission",
+					category: "agent_runtime",
 				},
 				frame: { type: "agent_end" },
 				expectedStatus: "failed",
@@ -284,6 +299,8 @@ describe("kind-aware reconciliation", () => {
 					code: "prompt_failed",
 					message: "Prompt submission failed.",
 					provenance: "agent_failed",
+					phase: "submission",
+					category: "agent_runtime",
 				},
 			},
 		] as const;

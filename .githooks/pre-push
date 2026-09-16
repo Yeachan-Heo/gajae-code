@@ -17,6 +17,7 @@ fi
 
 repo_root="$(git rev-parse --show-toplevel)"
 remote="${1:-origin}"
+push_url="${2:-}"
 zero="0000000000000000000000000000000000000000"
 status=0
 
@@ -26,8 +27,7 @@ while read -r _local_ref local_sha remote_ref _remote_sha; do
 	# Only branch destinations carry a PR; tags and notes never do.
 	[[ "$remote_ref" == refs/heads/* ]] || continue
 	branch="${remote_ref#refs/heads/}"
-	[[ "$branch" == "dev" || "$branch" == "main" ]] && continue
-	if ! bun "$repo_root/scripts/verify-pr-verdict.ts" --push-preflight "$branch" "$local_sha" --push-remote "$remote" --repo "$repo_root" --trusted-root "$repo_root"; then
+	if ! bun "$repo_root/scripts/verify-pr-verdict.ts" --push-preflight "$branch" "$local_sha" --push-remote "$remote" --push-url "$push_url" --repo "$repo_root" --trusted-root "$repo_root"; then
 		status=1
 	fi
 done

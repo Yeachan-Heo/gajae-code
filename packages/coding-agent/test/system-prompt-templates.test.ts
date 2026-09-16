@@ -295,15 +295,26 @@ describe("system Handlebars prompt templates", () => {
 		expect(rendered).toContain("recommend `/skill:deep-interview` via `ask`");
 		expect(rendered).toContain("Explicit user intent outranks every routing heuristic");
 	});
-	test("system-prompt routes explicit worktree requests through isolated delegation", async () => {
+	test("system-prompt routes explicit worktree requests through isolated delegation when isolation is on", async () => {
 		const templatePath = path.join(systemPromptsDir, "system-prompt.md");
 		const template = await Bun.file(templatePath).text();
-		const rendered = prompt.render(template, baseRenderContext);
+		const rendered = prompt.render(template, { ...baseRenderContext, taskIsolationEnabled: true });
 
 		expect(rendered).toContain('explicit user request to use a worktree (for example, "use worktree")');
 		expect(rendered).toContain("delegate implementation through `task` with `isolated: true`");
 		expect(rendered).toContain("in-session counterpart of launching `gjc --worktree`");
-		expect(rendered).toContain("report that conflict instead of editing in the parent session");
+		expect(rendered).toContain("create or select a dedicated git worktree with `git worktree add`");
+	});
+
+	test("system-prompt never demands `isolated` when the task schema omits it", async () => {
+		const templatePath = path.join(systemPromptsDir, "system-prompt.md");
+		const template = await Bun.file(templatePath).text();
+		const rendered = prompt.render(template, { ...baseRenderContext, taskIsolationEnabled: false });
+
+		expect(rendered).toContain('explicit user request to use a worktree (for example, "use worktree")');
+		expect(rendered).toContain("create or select a dedicated git worktree with `git worktree add`");
+		expect(rendered).toContain("NEVER refuse worktree work over that missing parameter");
+		expect(rendered).not.toContain("delegate implementation through `task` with `isolated: true`");
 	});
 
 	test("keeps system and project as separate ordered blocks; volatile facts excluded from stable prefix", async () => {
