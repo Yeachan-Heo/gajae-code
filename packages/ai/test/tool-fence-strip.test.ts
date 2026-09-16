@@ -70,4 +70,43 @@ describe("ToolFenceStripper", () => {
 		const stripper = new ToolFenceStripper();
 		expect(stripper.feed("")).toBe("");
 	});
+
+	// States the pass-through property as one assertion rather than splitting it
+	// across two `expect`s. The split reads as an insertion: `<|to` is held back
+	// at the end of chunk 1 and released at the front of chunk 2, so chunk 2's
+	// return value *starts* with characters that arrived in chunk 1 (#5627).
+	it("never inserts characters: a non-token run rejoins to exactly the input", () => {
+		const stripper = new ToolFenceStripper();
+		const joined = stripper.feed("value <|to") + stripper.feed("tal|> is 4") + stripper.flush();
+
+		expect(joined).toBe("value <|total|> is 4");
+		expect(joined).not.toContain("\u200b");
+	});
+
+	it("only ever deletes: output is a subsequence of the input for every chunking", () => {
+		// The token contract: printable ASCII only, so no zero-width or other
+		// invisible codepoint can enter the stream by way of a token either.
+		for (const token of TOOL_FENCE_TOKENS) {
+			expect(token).toMatch(/^[\x20-\x7e]+$/);
+		}
+
+		/** True when every character of `out` appears in `input`, in order. */
+		const isSubsequence = (out: string, input: string): boolean => {
+			let matched = 0;
+			for (const ch of input) {
+				if (matched < out.length && out[matched] === ch) matched++;
+			}
+			return matched === out.length;
+		};
+
+		// One real fence token, one lookalike that never completes.
+		for (const input of ["a<|tool_call_end|>b", "value <|total|> is 4"]) {
+			const stripper = new ToolFenceStripper();
+			let out = "";
+			for (const ch of input) out += stripper.feed(ch);
+			out += stripper.flush();
+
+			expect(isSubsequence(out, input)).toBe(true);
+		}
+	});
 });
