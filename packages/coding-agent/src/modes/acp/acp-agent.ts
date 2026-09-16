@@ -46,7 +46,7 @@ import {
 	AcpSdkAdapterError,
 	acpMcpLaunchFailure,
 } from "../../sdk/acp";
-import { resolveAcpFinalText } from "../../sdk/acp/final-text";
+import { hasAcpFinalTextContent, resolveAcpFinalText } from "../../sdk/acp/final-text";
 import type { SessionLifecycleMcpServer } from "../../sdk/acp/mcp";
 import { ensureBroker } from "../../sdk/broker/ensure";
 import { canonicalSessionCwd } from "../../sdk/broker/session-index";
@@ -3467,9 +3467,11 @@ export class AcpAgent implements Agent {
 			// the first-turn retry gate — which the settlement below releases — would see
 			// "started, no output", resubmit, and let BOTH this terminal's final text and the
 			// retry's answer reach ACP consumers. Record the output before settling (review P1).
-			// Whitespace-only final text carries no assistant content, matching the trimmed
-			// presence contract in prompt-reconciliation.ts:237.
-			if (typeof event.finalText === "string" && event.finalText.trim()) record.promptObservedAssistantOutput = true;
+			// Whitespace-only final text carries no assistant content. `hasAcpFinalTextContent` is the
+			// single presence predicate shared with the terminal publication gate below, so a terminal
+			// this gate treats as "no output" can never publish a chunk alongside the retry's answer.
+			if (typeof event.finalText === "string" && hasAcpFinalTextContent(event.finalText))
+				record.promptObservedAssistantOutput = true;
 			// Failure diagnostics are useful but advisory. Settle before any mapped
 			// session update can await a backpressured client transport; otherwise an
 			// already-decided failure can still lose to the inactivity watchdog.
@@ -3630,7 +3632,7 @@ export class AcpAgent implements Agent {
 		if (promptOwner) this.#flushFailureDiagnostics(id, promptOwner, adapter);
 		let decorationStart = Promise.resolve();
 		const finalText = typeof event.finalText === "string" ? event.finalText : "";
-		if (promptOwner && finalText) {
+		if (promptOwner && hasAcpFinalTextContent(finalText)) {
 			const finalTextTask = (async () => {
 				await Bun.sleep(0);
 				const resolution = resolveAcpFinalText(promptOwner.emittedAssistantText, finalText);

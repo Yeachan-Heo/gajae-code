@@ -1107,10 +1107,18 @@ test("ACP retries a first-turn prompt_failed whose terminal carries only whitesp
 			commandId: "prompt-terminal-command",
 			turnId: "prompt-terminal-turn",
 		});
+		const idleBefore = idlePhaseUpdates(fixture.updates);
 		fixture.sendReadinessFailure("   \n  ");
 		await waitFor(() => fixture.promptDeliveryCount() === 2, "first-turn retry delivery");
+		// The failed terminal publishes its idle phase on `decorationStart` — the very tail a
+		// final-text publication would occupy — so waiting for that idle update orders the assertion
+		// strictly after any whitespace chunk would have been emitted. Without this wait the check
+		// could pass simply because the async tail had not run yet.
+		await waitFor(() => idlePhaseUpdates(fixture.updates) > idleBefore, "failed-terminal idle phase");
+		expect(fixture.updates.filter(update => update.update.sessionUpdate === "agent_message_chunk")).toHaveLength(0);
 		fixture.sendStopped("end_turn");
 		expect(await bounded(pending, "whitespace final-text retry recovery")).toEqual({ stopReason: "end_turn" });
+		expect(fixture.updates.filter(update => update.update.sessionUpdate === "agent_message_chunk")).toHaveLength(0);
 	} finally {
 		fixture.dispose();
 	}
