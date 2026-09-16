@@ -3805,6 +3805,16 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					(!preferredCredentialProvider || recovery.model.provider === preferredCredentialProvider)
 				) {
 					model = recovery.model;
+					if (options.thinkingLevel !== undefined) {
+						thinkingLevel = resolveThinkingLevelForModel(model, options.thinkingLevel);
+					} else if (restoredThinkingLevel !== undefined && restoredThinkingLevel !== ThinkingLevel.Inherit) {
+						thinkingLevel = resolveThinkingLevelForModel(model, restoredThinkingLevel);
+					} else {
+						const recoveredLevel = recovery.explicitThinkingLevel
+							? recovery.thinkingLevel
+							: (model.thinking?.defaultLevel ?? settings.get("defaultThinkingLevel"));
+						thinkingLevel = resolveThinkingLevelForModel(model, recoveredLevel);
+					}
 					recoveredSessionDefault = recovery;
 					startupActiveModelProfile = undefined;
 					modelFallbackMessage =
