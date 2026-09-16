@@ -276,6 +276,58 @@ describe("chat-completions: streamed repetition guard (#5624)", () => {
 		expect(result.stopReason).toBe("stop");
 	});
 
+	// Visible text is the deliverable. A model asked for a log dump, a fixture or
+	// a generated table legitimately repeats itself, and truncating that corrupts
+	// the answer — so the heuristic is confined to the reasoning channel (#5627).
+	const LOG_LINE = "[info] cache warm\n";
+
+	it("streams intentionally repeated visible output through unchanged", async () => {
+		const state: DeliveryState = { delivered: 0 };
+		const events: Array<SseChunk | "[DONE]"> = [];
+		for (let i = 0; i < 60; i++) events.push(chunk({ content: LOG_LINE }));
+		events.push(chunk({}, "stop"), "[DONE]");
+		global.fetch = streamingFetch(events, state);
+
+		const result = await streamOpenAICompletions(model(), context(), { apiKey: "test" }).result();
+
+		expect(visibleText(result)).toBe(LOG_LINE.repeat(60));
+		expect(result.stopReason).toBe("stop");
+		expect(result.errorCode).toBeUndefined();
+	});
+
+	it("guards visible output when the caller opts in", async () => {
+		const state: DeliveryState = { delivered: 0 };
+		const events: Array<SseChunk | "[DONE]"> = [];
+		for (let i = 0; i < 60; i++) events.push(chunk({ content: LOG_LINE }));
+		events.push(chunk({}, "stop"), "[DONE]");
+		global.fetch = streamingFetch(events, state);
+
+		const result = await streamOpenAICompletions(model(), context(), {
+			apiKey: "test",
+			repetitionGuard: { text: THRESHOLD },
+		}).result();
+
+		expect(countOccurrences(visibleText(result), LOG_LINE)).toBeLessThanOrEqual(THRESHOLD);
+		expect(result.errorCode).toBe("repetition_guard_tripped");
+	});
+
+	it("leaves the thinking channel unguarded when the caller opts out", async () => {
+		const state: DeliveryState = { delivered: 0 };
+		const events: Array<SseChunk | "[DONE]"> = [];
+		for (let i = 0; i < 60; i++) events.push(chunk({ reasoning_content: `${SENTENCE}\n` }));
+		events.push(chunk({}, "stop"), "[DONE]");
+		global.fetch = streamingFetch(events, state);
+
+		const result = await streamOpenAICompletions(model(), context(), {
+			apiKey: "test",
+			repetitionGuard: { thinking: false },
+		}).result();
+
+		expect(countOccurrences(thinkingText(result), SENTENCE)).toBe(60);
+		expect(result.stopReason).toBe("stop");
+		expect(result.errorCode).toBeUndefined();
+	});
+
 	it("passes a normal stream through byte for byte", async () => {
 		const state: DeliveryState = { delivered: 0 };
 		const thinkingParts = ["Let me check the version.\n", "It looks like 0.0.1.\n", "Deploying now.\n"];

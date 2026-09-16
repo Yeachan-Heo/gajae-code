@@ -79,7 +79,11 @@ import { callWithCopilotModelRetry } from "../utils/retry";
 import { resolveRetryBudget } from "../utils/retry-budget";
 import { adaptSchemaForStrict, flattenToolRootCombinators, NO_STRICT, toolWireSchema } from "../utils/schema";
 import { wrapFetchForSseDebug } from "../utils/sse-debug";
-import { StreamRepetitionGuard, type StreamRepetitionTrip } from "../utils/stream-repetition-guard";
+import {
+	DEFAULT_REPETITION_THRESHOLD,
+	StreamRepetitionGuard,
+	type StreamRepetitionTrip,
+} from "../utils/stream-repetition-guard";
 import { type HealedToolCall, modelMayLeakKimiToolCalls, ToolCallHealer } from "../utils/tool-call-healing";
 import { isForcedToolChoice, mapToOpenAICompletionsToolChoice } from "../utils/tool-choice";
 import {
@@ -361,6 +365,14 @@ export interface OpenAICompletionsOptions extends StreamOptions {
 	/** Force-disable reasoning where supported, or request the lowest effort on generic effort endpoints. */
 	disableReasoning?: boolean;
 	serviceTier?: ServiceTier;
+	/**
+	 * Runaway-repetition guard thresholds, per stream channel. A number sets the
+	 * consecutive-repeat threshold; `false` disables the channel's guard.
+	 * Defaults: thinking = DEFAULT_REPETITION_THRESHOLD, text = false — visible
+	 * output is a deliverable and intentional repetition there (logs, fixtures,
+	 * tables, generated code) must survive byte for byte (#5627).
+	 */
+	repetitionGuard?: { thinking?: number | false; text?: number | false };
 }
 
 type OpenAICompletionsParams = Omit<OpenAI.Chat.Completions.ChatCompletionCreateParamsStreaming, "reasoning_effort"> & {
@@ -914,8 +926,24 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 			// One guard per channel: interleaving visible text and reasoning through
 			// a single instance would splice unrelated tokens into the same window.
 			// Tool-call frames are never fed through either guard.
-			const textRepetitionGuard = new StreamRepetitionGuard();
-			const thinkingRepetitionGuard = new StreamRepetitionGuard();
+			//
+			// A disabled channel gets no guard at all rather than a lenient one, so
+			// it is structurally impossible for it to set `repetitionTrip`. Visible
+			// text is disabled by default: a decode loop there is not the reported
+			// failure (#5624 was reasoning-channel), and truncating deliverable
+			// output — a log dump, a fixture, a table — corrupts the answer (#5627).
+			const createRepetitionGuard = (
+				setting: number | false | undefined,
+				fallback: number | false,
+			): StreamRepetitionGuard | undefined => {
+				const threshold = setting ?? fallback;
+				return threshold === false ? undefined : new StreamRepetitionGuard({ threshold });
+			};
+			const textRepetitionGuard = createRepetitionGuard(options?.repetitionGuard?.text, false);
+			const thinkingRepetitionGuard = createRepetitionGuard(
+				options?.repetitionGuard?.thinking,
+				DEFAULT_REPETITION_THRESHOLD,
+			);
 			const noteRepetitionTrip = (guard: StreamRepetitionGuard, channel: "text" | "thinking") => {
 				// `takeTrip()` latches once per guard; this latches once per request,
 				// so the drain window below opens exactly once no matter which
@@ -955,17 +983,27 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 			const thinkingFenceStripper = new ToolFenceStripper();
 			let lastThinkingSignature: string | undefined;
 
+			/** Returns the portion safe to emit — the whole chunk when the channel is unguarded. */
+			const feedRepetitionGuard = (
+				guard: StreamRepetitionGuard | undefined,
+				text: string,
+				channel: "text" | "thinking",
+			): string => {
+				if (!guard) return text;
+				const emit = guard.feed(text);
+				noteRepetitionTrip(guard, channel);
+				return emit;
+			};
+
 			const appendTextDelta = (text: string) => {
 				if (!text) return;
 				if (!firstTokenTime) firstTokenTime = Date.now();
-				const emit = textRepetitionGuard.feed(text);
-				noteRepetitionTrip(textRepetitionGuard, "text");
+				const emit = feedRepetitionGuard(textRepetitionGuard, text, "text");
 				if (emit) appendText(output, stream, emit);
 			};
 			const emitThinkingText = (thinking: string, signature?: string) => {
 				if (!thinking) return;
-				const emit = thinkingRepetitionGuard.feed(thinking);
-				noteRepetitionTrip(thinkingRepetitionGuard, "thinking");
+				const emit = feedRepetitionGuard(thinkingRepetitionGuard, thinking, "thinking");
 				if (emit) appendThinking(output, stream, emit, signature);
 			};
 			const appendThinkingDelta = (thinking: string, signature?: string) => {
