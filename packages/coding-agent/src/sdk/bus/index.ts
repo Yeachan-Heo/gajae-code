@@ -50,7 +50,12 @@ type NotificationServer = NativeNotificationServer;
 import { $credentialEnv, logger, postmortem, VERSION } from "@gajae-code/utils";
 
 import { AsyncJobManager } from "../../async";
-import { Settings, validateSettingPatch } from "../../config/settings";
+import {
+	resolveSdkPromptDeadlineMs,
+	resolveSdkPromptMaxRuntimeMs,
+	Settings,
+	validateSettingPatch,
+} from "../../config/settings";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "../../extensibility/extensions";
 import { INTERACTIVE_SELECTOR_RESUME_ORIGIN } from "../../extensibility/shared-events";
 import { toAgentWireEventPayload } from "../../modes/shared/agent-wire/event-envelope";
@@ -5021,10 +5026,6 @@ export function createNotificationsExtension(
 				finalizePrompt(key, correlation);
 			}
 		};
-		const readFiniteSetting = (key: "sdk.promptDeadlineMs" | "sdk.promptMaxRuntimeMs", fallback: number): number => {
-			const value = settings?.get(key);
-			return typeof value === "number" && Number.isFinite(value) ? value : fallback;
-		};
 		/**
 		 * (Re)arm the accepted prompt's terminal deadline from its current lease.
 		 * `terminalizePrompt` stays the single authoritative terminal owner; this
@@ -5207,8 +5208,8 @@ export function createNotificationsExtension(
 				createdAt: Date.now(),
 				deadlineLease: createPromptDeadlineLease({
 					now: Date.now(),
-					leaseMs: readFiniteSetting("sdk.promptDeadlineMs", 1_800_000),
-					maxMs: readFiniteSetting("sdk.promptMaxRuntimeMs", 21_600_000),
+					leaseMs: resolveSdkPromptDeadlineMs(settings?.get("sdk.promptDeadlineMs")),
+					maxMs: resolveSdkPromptMaxRuntimeMs(settings?.get("sdk.promptMaxRuntimeMs")),
 				}),
 				phase: "active",
 				// Bound to the Agent run at `agent_start`; acceptance precedes execution.
