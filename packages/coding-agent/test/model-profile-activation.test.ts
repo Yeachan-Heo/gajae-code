@@ -13,6 +13,7 @@ import {
 	materializeModelProfileForDeletion,
 	prepareModelProfileActivation,
 	restoreMaterializedModelProfileForDeletion,
+	rewriteSelectorForProxy,
 } from "../src/config/model-profile-activation";
 
 import type { ModelProfileDefinition } from "../src/config/model-profiles";
@@ -2473,6 +2474,76 @@ describe("preset-equivalent profile activation", () => {
 });
 
 describe("model-profile-activation: OpenAI-compatible proxy routing", () => {
+	test("preserves an exported model when native discovery also exposes its wire id", () => {
+		const models = [
+			model("opencodex", "anthropic/claude-opus-5"),
+			{ ...model("opencodex", "opencodex/anthropic/claude-opus-5"), wireModelId: "anthropic/claude-opus-5" },
+		];
+		expect(
+			rewriteSelectorForProxy(
+				"anthropic/claude-opus-5",
+				"opencodex",
+				"always",
+				models,
+				new Set(),
+				new Set(["anthropic"]),
+			),
+		).toBe("opencodex/anthropic/claude-opus-5");
+	});
+
+	test("retains public proxy aliases when a distinct wire id is configured", () => {
+		const alias = { ...model("litellm", "xai/grok-4.3"), wireModelId: "deployment-42" };
+		expect(
+			rewriteSelectorForProxy("xai/grok-4.3:high", "litellm", "always", [alias], new Set(), new Set(["xai"])),
+		).toBe("litellm/xai/grok-4.3:high");
+	});
+
+	test("rejects ambiguous wire ids instead of choosing an arbitrary pool route", () => {
+		const aliases = ["one", "two"].map(id => ({ ...model("opencodex", id), wireModelId: "gpt-5.6-terra" }));
+		expect(() =>
+			rewriteSelectorForProxy(
+				"openai-codex/gpt-5.6-terra",
+				"opencodex",
+				"always",
+				aliases,
+				new Set(),
+				new Set(["openai-codex"]),
+			),
+		).toThrow("ambiguous models");
+	});
+
+	test("routes every Opus + Codex role through discovered OpenCodex without a models.yml entry", async () => {
+		const profile = BUILTIN_MODEL_PROFILES.find(candidate => candidate.name === "opus-codex")!;
+		const base = fakeRegistry({ profiles: [profile] });
+		const discovered = base
+			.getAll()
+			.filter(model => model.provider === "anthropic" || model.provider === "openai-codex")
+			.map(model => {
+				const wireModelId = model.provider === "anthropic" ? `anthropic/${model.id}` : model.id;
+				return { ...model, provider: "opencodex", id: `opencodex/${wireModelId}`, wireModelId };
+			});
+		const registry = {
+			...base,
+			getAll: () => [...base.getAll(), ...discovered],
+			getConfiguredProviderIds: () => [],
+			getApiKeyForProvider: async (provider: string) => (provider === "opencodex" ? kNoAuth : `key-${provider}`),
+		};
+		const prepared = await prepareModelProfileActivation({
+			session: fakeSession(),
+			modelRegistry: registry as unknown as ModelRegistry,
+			settings: Settings.isolated({ "modelProfile.proxyProvider": "opencodex", "modelProfile.proxyMode": "always" }),
+			profileName: "opus-codex",
+		});
+		expect(prepared.defaultModel?.provider).toBe("opencodex");
+		expect(prepared.defaultModel?.wireModelId).toBe("anthropic/claude-opus-5");
+		expect(prepared.agentModelOverrides).toEqual({
+			executor: "opencodex/opencodex/gpt-5.6-terra:low",
+			architect: "opencodex/opencodex/gpt-5.6-sol:high",
+			planner: "opencodex/opencodex/anthropic/claude-sonnet-5",
+			critic: "opencodex/opencodex/gpt-5.6-sol:xhigh",
+		});
+	});
+
 	const proxyModel = (id: string, thinking?: Model["thinking"]): Model => model("litellm", id, thinking);
 
 	// xai/grok-4.3 is pinned by builtin grok profiles and is proxy-routable.

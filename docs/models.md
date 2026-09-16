@@ -316,6 +316,14 @@ gjc --mpreset opencodego --default
 
 ### Routing built-in presets through a proxy (`modelProfile.proxyProvider`)
 
+For a local OpenCodex pool, set `modelProfile.proxyProvider` to `opencodex` and
+`modelProfile.proxyMode` to `always`. With a persisted `modelProfile.default`, plain
+`gjc` applies that preset through the pool on startup, even when direct Anthropic
+and Codex credentials exist. GJC discovers the local proxy's public `/v1/models`
+catalog automatically; no management token or static `models.yml` roster is needed.
+Model IDs retain their GJC namespace, while preset matching uses the upstream wire
+ID. A missing proxy model still fails activation instead of silently bypassing the pool.
+
 Built-in preset selectors pin a direct provider endpoint (`xai/grok-4.3`, `xiaomi/mimo-v2.5-pro`, …). To serve those models through your own OpenAI-compatible gateway (LiteLLM, OpenRouter, or a custom proxy) instead of each vendor's endpoint, configure the proxy provider id and routing mode in `config.yml`:
 
 ```yaml

@@ -8215,7 +8215,7 @@ describe("ModelRegistry", () => {
 				if (url === "http://127.0.0.1:10201/healthz") {
 					return new Response(JSON.stringify({ ok: true, version: "opencodex", port: 10201 }), { status: 200 });
 				}
-				if (url === "http://127.0.0.1:10201/api/models") {
+				if (url === "http://127.0.0.1:10201/v1/models") {
 					return new Response(JSON.stringify([{ id: "provider/model", name: "Provider Model" }]), { status: 200 });
 				}
 				throw new Error(`Unexpected URL: ${url}`);
@@ -8251,7 +8251,7 @@ describe("ModelRegistry", () => {
 				if (url === "http://127.0.0.1:10201/healthz") {
 					return new Response(JSON.stringify({ ok: true, version: "opencodex", port: 10201 }), { status: 200 });
 				}
-				if (url === "http://127.0.0.1:10201/api/models") {
+				if (url === "http://127.0.0.1:10201/v1/models") {
 					return new Response(JSON.stringify([{ id: "provider/model", name: "Provider Model" }]), { status: 200 });
 				}
 				throw new Error(`Unexpected URL: ${url}`);
