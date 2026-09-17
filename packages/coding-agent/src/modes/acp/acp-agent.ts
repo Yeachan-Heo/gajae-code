@@ -183,6 +183,8 @@ interface PromptWaiter {
 	lastFrameAt: number;
 	/** Type of that prompt-owned frame, reported when the watchdog expires. */
 	lastFrameType: string;
+	/** True while the prompt is blocked in provider preflight, before the turn is dispatched. */
+	awaitingProviderPreflight: boolean;
 	/** Cancels the armed inactivity watchdog; re-armed by prompt-owned frames. */
 	cancelWatchdog?: () => void;
 	/** What the host is observably doing — a tool running, a model call unanswered — and the bound that follows from it. */
@@ -2096,6 +2098,7 @@ export class AcpAgent implements Agent {
 			deferredActivityFrames: [],
 			lastFrameAt: this.#promptWatchdogClock.now(),
 			lastFrameType: "prompt_dispatch",
+			awaitingProviderPreflight: true,
 			activity: new PromptActivity(),
 			observedTurnActivity: false,
 			observedToolExecution: false,
@@ -2107,9 +2110,24 @@ export class AcpAgent implements Agent {
 		// pending. Retain the original promise for the caller, but mark that delayed rejection
 		// as observed until prompt() can resume and await it.
 		void response.catch(() => undefined);
+		// Silence has to be bounded from the moment the prompt owns the session: a host that
+		// dies before it ever answers is exactly the failure that leaves the client running.
+		// Provider preflight is part of that window — it awaits a lease the host may never win
+		// — so the bound is armed before it, not after (issue #5658). The arm below re-arms
+		// this same waiter once preflight clears, and #armPromptWatchdog cancels the previous
+		// timer first, so only one timer is ever live.
+		this.#armPromptWatchdog(params.sessionId, record, waiter);
+		// The watchdog settles `response`, not this await, so a preflight that never returns
+		// would pin session/prompt open with the caller's promise already rejected. Racing the
+		// settlement lets the re-checks below hand that rejection back to the caller.
+		const settlement = response.then(
+			() => undefined,
+			() => undefined,
+		);
 		try {
-			await record.adapter.ensureProviders();
+			await Promise.race([record.adapter.ensureProviders(), settlement]);
 		} catch (error) {
+			waiter.awaitingProviderPreflight = false;
 			if (waiter.settled || record.activePrompt !== waiter) {
 				this.#retiredPromptAcknowledgements.delete(params.sessionId);
 				return await response;
@@ -2122,11 +2140,13 @@ export class AcpAgent implements Agent {
 			if (record.activePrompt === waiter) {
 				record.activePrompt = undefined;
 				record.busy = record.backgroundBusy;
+				clearPromptWatchdog(waiter);
 				this.#retiredPromptAcknowledgements.delete(params.sessionId);
 				void this.#publishPromptPhaseIdle(params.sessionId, record.adapter);
 			}
 			throw error;
 		}
+		waiter.awaitingProviderPreflight = false;
 		if (waiter.settled || record.activePrompt !== waiter) {
 			this.#retiredPromptAcknowledgements.delete(params.sessionId);
 			return await response;
@@ -2137,8 +2157,9 @@ export class AcpAgent implements Agent {
 			return await response;
 		}
 
-		// Silence has to be bounded from the moment the prompt owns the session: a host that
-		// dies before it ever answers is exactly the failure that leaves the client running.
+		// Re-arm now that preflight is behind us: the bound armed before it already covered
+		// this prompt's ownership window, and this call replaces that timer rather than
+		// racing it, so the dispatched turn gets the full inactivity bound of its own.
 		this.#armPromptWatchdog(params.sessionId, record, waiter);
 		// Echo the user's own message back as `user_message_chunk`. Clients render their
 		// transcript from session/update, so without this a prompt's text and any attached
@@ -3298,12 +3319,19 @@ export class AcpAgent implements Agent {
 	async #expirePromptWatchdog(id: string, record: SessionRecord, waiter: PromptWaiter): Promise<void> {
 		if (record.activePrompt !== waiter || waiter.settled || waiter.terminalReserved) return;
 		const silenceMs = Math.max(0, this.#promptWatchdogClock.now() - waiter.lastFrameAt);
-		const cause = this.#promptTransportGone(id, record) ?? "the SDK session host stopped producing frames";
+		// A prompt still in preflight has never reached the host, so "stopped producing frames"
+		// would point the reader at the wrong phase: nothing was ever dispatched to produce them.
+		const cause =
+			this.#promptTransportGone(id, record) ??
+			(waiter.awaitingProviderPreflight
+				? "the SDK session host never finished provider preflight"
+				: "the SDK session host stopped producing frames");
 		logger.error("acp_prompt_watchdog_expired", {
 			sessionId: id,
 			cause,
 			silenceMs,
 			lastFrameType: waiter.lastFrameType,
+			awaitingProviderPreflight: waiter.awaitingProviderPreflight,
 			inactivityBoundMs: waiter.activity.inactivityBoundMs,
 			toolRunning: waiter.activity.running,
 			awaitingModel: waiter.activity.awaitingModel,
