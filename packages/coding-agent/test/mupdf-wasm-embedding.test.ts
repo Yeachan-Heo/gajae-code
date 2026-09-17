@@ -2,6 +2,7 @@ import { describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { pathToFileURL } from "node:url";
 
 import { convertFileWithMarkit } from "../src/utils/markit";
 import { ensureMupdfWasmResolution } from "../src/utils/mupdf-wasm";
@@ -10,23 +11,51 @@ const MODULE_CONFIG_KEY = "$libmupdf_wasm_Module";
 const fixturePdfPath = path.resolve(import.meta.dirname, "fixtures/dummy-pdf-fixture.pdf");
 
 describe("mupdf wasm embedding (#5433)", () => {
-	it("seeds the emscripten module config with a locateFile hook", () => {
+	it("lets an ordinary source runtime use mupdf's adjacent wasm sidecar", () => {
 		const globalScope = globalThis as typeof globalThis & Record<string, unknown>;
 		const previous = globalScope[MODULE_CONFIG_KEY];
 		delete globalScope[MODULE_CONFIG_KEY];
 		try {
 			ensureMupdfWasmResolution();
-			const seeded = globalScope[MODULE_CONFIG_KEY] as { locateFile?: unknown } | undefined;
-			expect(typeof seeded?.locateFile).toBe("function");
-			// Idempotent: seeding again must not replace an existing config.
-			ensureMupdfWasmResolution();
-			expect(globalScope[MODULE_CONFIG_KEY]).toBe(seeded);
+			expect(globalScope[MODULE_CONFIG_KEY]).toBeUndefined();
 		} finally {
 			if (previous === undefined) {
 				delete globalScope[MODULE_CONFIG_KEY];
 			} else {
 				globalScope[MODULE_CONFIG_KEY] = previous;
 			}
+		}
+	});
+
+	it("loads from an npm-style package layout without resolving the monorepo-only embedded asset", async () => {
+		const repositoryRoot = path.resolve(import.meta.dirname, "../../..");
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-mupdf-package-layout-"));
+		const packageUtils = path.join(tempDir, "node_modules", "@gajae-code", "coding-agent", "src", "utils");
+		const scopeDir = path.join(tempDir, "node_modules", "@gajae-code");
+		try {
+			fs.mkdirSync(packageUtils, { recursive: true });
+			fs.copyFileSync(
+				path.resolve(import.meta.dirname, "../package.json"),
+				path.join(tempDir, "node_modules", "@gajae-code", "coding-agent", "package.json"),
+			);
+			fs.copyFileSync(
+				path.resolve(import.meta.dirname, "../src/utils/mupdf-wasm.ts"),
+				path.join(packageUtils, "mupdf-wasm.ts"),
+			);
+			fs.copyFileSync(
+				path.resolve(import.meta.dirname, "../src/utils/mupdf-wasm-embedded.ts"),
+				path.join(packageUtils, "mupdf-wasm-embedded.ts"),
+			);
+			fs.symlinkSync(
+				fs.realpathSync(path.join(repositoryRoot, "node_modules", "@gajae-code", "utils")),
+				path.join(scopeDir, "utils"),
+				"dir",
+			);
+
+			const loaded = await import(`${pathToFileURL(path.join(packageUtils, "mupdf-wasm.ts")).href}?package-layout`);
+			expect(typeof loaded.ensureMupdfWasmResolution).toBe("function");
+		} finally {
+			fs.rmSync(tempDir, { recursive: true, force: true });
 		}
 	});
 

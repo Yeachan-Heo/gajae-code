@@ -15,12 +15,13 @@
  *
  * This must run before the first `import("mupdf")` anywhere in the process.
  */
-import mupdfWasmPath from "../../../../node_modules/mupdf/dist/mupdf-wasm.wasm" with { type: "file" };
+import { isCompiledBinary } from "@gajae-code/utils/env";
 
 const MODULE_CONFIG_KEY = "$libmupdf_wasm_Module";
+const mupdfWasmPath = isCompiledBinary() ? (await import("./mupdf-wasm-embedded")).default : undefined;
 
 export function ensureMupdfWasmResolution(): void {
 	const globalScope = globalThis as typeof globalThis & Record<string, unknown>;
-	if (globalScope[MODULE_CONFIG_KEY] !== undefined) return;
+	if (globalScope[MODULE_CONFIG_KEY] !== undefined || mupdfWasmPath === undefined) return;
 	globalScope[MODULE_CONFIG_KEY] = { locateFile: () => String(mupdfWasmPath) };
 }
