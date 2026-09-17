@@ -132,7 +132,8 @@ describe("post-start terminal wording names the upstream provider (issue #5664)"
 		// The defect: `details` alone reads as "your task failed". It stays exactly as it is —
 		// pinned ACP core-v1 conformance asserts on it — and the operator wording arrives beside it.
 		expect(data.details).toBe("Provider failure after execution started.");
-		const operator = data.operatorMessage as string;
+		expect(typeof data.operatorMessage).toBe("string");
+		const operator = String(data.operatorMessage);
 		expect(operator).toContain("Upstream provider failure");
 		expect(operator).toContain("server_is_overloaded");
 		// A snapshot nobody can find is not a fix: the ref is stated where the operator reads it.
