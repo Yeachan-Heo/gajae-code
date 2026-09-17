@@ -1006,8 +1006,19 @@ test("a tool still executing when the boundary grace expires is force-terminated
 		);
 
 		await waitFor(() => session.deadlineTerminals().length > 0, "forced deadline terminal", 25_000);
-		// Bounded, not disabled: the cap plus the grace, never longer.
-		expect(Date.now() - session.acceptedAt).toBeGreaterThan(maxRuntimeMs + TOOL_CALL_BOUNDARY_GRACE_MS - 200);
+		// Bounded, not disabled — pinned in BOTH directions.
+		//
+		// The lower bound is a discriminating FRACTION of the grace, not a tight
+		// epsilon around it: `acceptedAt` is stamped after the acknowledgement frame
+		// round-trips, while the deadline is armed from the earlier SERVER-side
+		// durable accept, so this measures `real_elapsed - skew`. Under full-suite
+		// load that skew reaches hundreds of ms, and a tight epsilon then measures
+		// harness scheduling rather than the deadline. Without the boundary wait this
+		// terminal fires at ~maxRuntimeMs (800 ms), so half a grace still fails
+		// loudly on any regression that removes the wait.
+		const elapsed = Date.now() - session.acceptedAt;
+		expect(elapsed).toBeGreaterThan(maxRuntimeMs + TOOL_CALL_BOUNDARY_GRACE_MS / 2);
+		expect(elapsed).toBeLessThan(maxRuntimeMs + 2 * TOOL_CALL_BOUNDARY_GRACE_MS);
 		expect(session.deadlineTerminals()).toHaveLength(1);
 		// Classification is byte-identical to a clean expiry — downstream retry
 		// classifiers branch on these and must not move.
@@ -1232,9 +1243,12 @@ test("repeated tool_execution_updates at an already-due hard cap open exactly on
 		expect(boundaryWaits).toBe(1);
 		expect(forced.records).toHaveLength(1);
 		expect(forced.records[0]?.pendingToolCallIds).toEqual(["compiling-tool"]);
-		// Bounded by the cap plus ONE grace, never a pile of overlapping ones.
+		// Bounded by the cap plus ONE grace, never a pile of overlapping ones. The
+		// lower bound is half a grace for the same reason as the forced case above:
+		// `acceptedAt` lags the server-side accept the deadline is armed from, so a
+		// tight epsilon measures harness skew instead of the deadline.
 		const elapsed = Date.now() - session.acceptedAt;
-		expect(elapsed).toBeGreaterThan(maxRuntimeMs + TOOL_CALL_BOUNDARY_GRACE_MS - 400);
+		expect(elapsed).toBeGreaterThan(maxRuntimeMs + TOOL_CALL_BOUNDARY_GRACE_MS / 2);
 		expect(elapsed).toBeLessThan(maxRuntimeMs + 2 * TOOL_CALL_BOUNDARY_GRACE_MS);
 		await Bun.sleep(300);
 		expect(session.deadlineTerminals()).toHaveLength(1);

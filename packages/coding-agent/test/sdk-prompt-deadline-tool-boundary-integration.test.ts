@@ -108,7 +108,15 @@ describe("prompt deadline tool boundary on a live AgentSession", () => {
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings: Settings.isolated({ "compaction.enabled": false }),
-			modelRegistry: { getApiKey: async () => "test-key" } as never,
+			// `getAvailable` is NOT optional here. `compaction.enabled: false` does
+			// not keep the prompt off the compaction path: the resource-floor
+			// emergency in `#checkEstimatedContextBeforePromptOnce` calls
+			// `#runAutoCompaction(..., { force: true })`, and `force` deliberately
+			// bypasses both the strategy-off and the disabled guards, landing on
+			// `#modelRegistry.getAvailable()`. That floor only trips under memory
+			// pressure, so a stub without it passes alone and throws inside
+			// `prompt()` under a full-suite run — taking every assertion below with it.
+			modelRegistry: { getApiKey: async () => "test-key", getAvailable: () => [mock.model] } as never,
 		});
 		session = live;
 		// `activePromptHandle` goes undefined once the run is terminal, so the
