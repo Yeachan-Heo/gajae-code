@@ -5707,6 +5707,19 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 					const payload = frame.payload as { commandId?: string; turnId?: string } | undefined;
 					return payload?.commandId === correlation.commandId && payload?.turnId === correlation.turnId;
 				});
+			// onExpired publishes the pair only after the durable finalize resolves, so
+			// the terminal status can be observable a few microtasks before the frames
+			// are. Wait for them within a bounded horizon rather than sampling once;
+			// the deep-equality assertions below still pin "exactly one of each".
+			const framesDeadline = Date.now() + 10_000;
+			while (
+				Date.now() < framesDeadline &&
+				!(
+					correlated().some(frame => frame.kind === "agent_failed") &&
+					correlated().some(frame => frame.kind === "agent_end")
+				)
+			)
+				await Bun.sleep(5);
 			expect(correlated().filter(frame => frame.kind === "agent_failed")).toEqual([
 				expect.objectContaining({
 					payload: expect.objectContaining({
