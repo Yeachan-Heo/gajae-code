@@ -377,6 +377,31 @@ function isUnansweredAfterDispatch(error: unknown): boolean {
 	return error instanceof SdkClientError && error.code === "uncertain_after_send";
 }
 
+/**
+ * Base of the repeat counts at which a deduped retention-gap concession
+ * re-states itself: the powers of ten.
+ *
+ * A concession is correct and must keep happening — it is what carries the
+ * cursor over an unrecoverable loss — but endpoint churn on a live session
+ * re-attaches from seq 0, so the host re-states the SAME evicted prefix every
+ * round. Measured over one day of `~/.gjc/logs`: 2,467 byte-identical warns for
+ * `sequences 1-527`, and 34,541 warn records in a 10.5 MB file overwhelmingly of
+ * this one class, burying every other warn class in the window (#5619).
+ *
+ * Warning once per bound and then only at 10, 100, 1_000, ... turns a flood of N
+ * repeats into 1 + O(log N) lines — 4 instead of 2,467 — without ever going
+ * fully silent on a loss that keeps recurring.
+ */
+const RETENTION_GAP_SUMMARY_BASE = 10;
+
+/** True when `repeats` is a power of {@link RETENTION_GAP_SUMMARY_BASE}. */
+function isRetentionGapSummaryRepeat(repeats: number): boolean {
+	if (repeats < RETENTION_GAP_SUMMARY_BASE) return false;
+	let threshold = RETENTION_GAP_SUMMARY_BASE;
+	while (threshold < repeats) threshold *= RETENTION_GAP_SUMMARY_BASE;
+	return threshold === repeats;
+}
+
 const REPLAY_BARRIER_LIMIT = 1_024;
 const REPLAY_PENDING_STALL_MS = 10_000;
 const REPLAY_RETRY_ATTEMPTS = 3;
@@ -625,6 +650,19 @@ export class SessionRouter {
 		string,
 		{ generation: number; frames: Array<{ seq: number; frame: Record<string, unknown> }> }
 	>();
+	/**
+	 * The retention gap each session last conceded, so an identical concession
+	 * warns once instead of once per re-attach (#5619).
+	 *
+	 * This lives on the Router, not on `AttachedSession`, because the event that
+	 * causes the repeat is a NON-RESUMABLE re-attach: it builds a fresh
+	 * attachment at `cursor.seq = 0`, replays from zero, and the host re-states
+	 * the same evicted prefix. State hung off the attachment would be rebuilt by
+	 * the very churn it exists to dedupe. Bounded at one entry per live session
+	 * id — cleared when the session leaves the index, exactly like the two maps
+	 * above — so it is O(live sessions) and needs no eviction policy.
+	 */
+	readonly #concededGaps = new Map<string, { generation: number; fromSeq: number; toSeq: number; repeats: number }>();
 	readonly #reviving = new Set<string>();
 	readonly #notificationReceipts = new Map<string, NotificationCleanupReceipt>();
 	#stopTimer: (() => void) | undefined;
@@ -1362,6 +1400,9 @@ export class SessionRouter {
 			if (!liveIds.has(sessionId)) {
 				this.#undelivered.delete(sessionId);
 				this.#recoveredFrames.delete(sessionId);
+				// The session left the index: a real end of stream, so the next one
+				// under this id deserves a fresh warn rather than the old memo.
+				this.#concededGaps.delete(sessionId);
 			}
 			try {
 				await this.#retireAttachment(attached, liveIds.has(sessionId) ? "replaced" : "removed");
@@ -1646,6 +1687,13 @@ export class SessionRouter {
 			if (!resumable) {
 				this.#undelivered.delete(indexed.sessionId);
 				this.#recoveredFrames.delete(indexed.sessionId);
+				// `#concededGaps` is deliberately NOT cleared here. Those two maps
+				// track frames in flight, which a non-resumable replacement really
+				// does abandon; the gap memo tracks what the operator has already
+				// been told. `!resumable` IS the churn that re-concedes the same
+				// evicted prefix, so clearing it here would drop the memo microseconds
+				// before the warn it exists to suppress (#5619). It is cleared where
+				// the session leaves the index instead.
 			}
 		}
 		const client = await this.#createAttachedClient(indexed, endpoint, runEpoch);
@@ -2220,6 +2268,41 @@ export class SessionRouter {
 		this.#failBarrier(attached, `publication failed at seq ${seq} (${reason})`);
 	}
 
+	/**
+	 * States one retention-gap concession, deduped per (session, generation, gap
+	 * bound). Logging is ALL this gates: the concession's frame recovery and
+	 * cursor carry run on every pass, deduped or not, because skipping either
+	 * would drop frames or strand the cursor below the gap.
+	 *
+	 * A bound the session has already conceded repeats at debug and re-states its
+	 * running total at {@link RETENTION_GAP_SUMMARY_BASE} powers; a different
+	 * bound, or a rolled generation, is a genuinely new loss and earns its own
+	 * warn (#5619).
+	 */
+	#logConcededGap(attached: AttachedSession, fromSeq: number, toSeq: number, recoveredNote: string): void {
+		const message = `chat daemon replay conceded a retention gap (sequences ${fromSeq}-${toSeq} are gone from the host${recoveredNote}); session ${attached.sessionId} generation ${attached.generation} resumes at seq ${toSeq + 1}.`;
+		const previous = this.#concededGaps.get(attached.sessionId);
+		if (
+			!previous ||
+			previous.generation !== attached.generation ||
+			previous.fromSeq !== fromSeq ||
+			previous.toSeq !== toSeq
+		) {
+			this.#concededGaps.set(attached.sessionId, { generation: attached.generation, fromSeq, toSeq, repeats: 0 });
+			logger.warn(message);
+			return;
+		}
+		previous.repeats += 1;
+		logger.debug(message);
+		if (!isRetentionGapSummaryRepeat(previous.repeats)) return;
+		// Deliberately phrased without the substring the first warn carries: the
+		// summary states the volume, and callers filtering for the concession
+		// itself must not sweep it up.
+		logger.warn(
+			`chat daemon replay re-stated the same retention loss ${previous.repeats} more times for session ${attached.sessionId} generation ${attached.generation} (sequences ${fromSeq}-${toSeq}); the stream keeps re-attaching from seq 0. Repeats stay at debug until the count reaches ${previous.repeats * RETENTION_GAP_SUMMARY_BASE}.`,
+		);
+	}
+
 	#rememberRecoveredFrame(attached: AttachedSession, seq: number, frame: Record<string, unknown>): void {
 		let pending = this.#recoveredFrames.get(attached.sessionId);
 		if (!pending || pending.generation !== attached.generation) {
@@ -2503,9 +2586,7 @@ export class SessionRouter {
 				held.splice(0, held.length, ...carried);
 				const recoveredNote =
 					recovered.length > 0 ? `, ${recovered.length} of them recovered from live delivery` : "";
-				logger.warn(
-					`chat daemon replay conceded a retention gap (sequences ${gap.fromSeq}-${gap.toSeq} are gone from the host${recoveredNote}); session ${attached.sessionId} generation ${attached.generation} resumes at seq ${gap.toSeq + 1}.`,
-				);
+				this.#logConcededGap(attached, gap.fromSeq, gap.toSeq, recoveredNote);
 				for (const entry of recovered) this.#rememberRecoveredFrame(attached, entry.seq, entry.frame);
 				if (!(await this.#deliverRecoveredFrames(attached))) return;
 				if (gap.toSeq > attached.cursor.seq) attached.cursor.seq = gap.toSeq;
