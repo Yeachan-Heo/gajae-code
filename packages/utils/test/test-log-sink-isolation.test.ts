@@ -42,7 +42,9 @@ test("a test process does not write watchdog errors into the operator log sink",
 
 	// Drop the inherited pin so the child's own preload has to isolate itself;
 	// inheriting it would make this pass without exercising the guard at all.
-	const env = { ...process.env, HOME: home };
+	// Widened to an index-signature copy because Bun types `process.env` with
+	// known keys only, so `delete` on the spread result does not type-check.
+	const env: Record<string, string | undefined> = { ...process.env, HOME: home };
 	delete env.GJC_LOG_DIR;
 
 	const proc = Bun.spawn([process.execPath, "test", WATCHDOG_TEST, "-t", WATCHDOG_CASE], {
