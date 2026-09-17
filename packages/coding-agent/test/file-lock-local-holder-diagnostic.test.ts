@@ -166,6 +166,30 @@ test("keeps a genuinely foreign holder opaque", async () => {
 	expect(await fs.exists(`${filePath}.lock`)).toBe(true);
 });
 
+test("names the missing provenance of an unqualified holder instead of a host", async () => {
+	const filePath = path.join(await makeTemp(), "unqualified.json");
+	const lockDir = `${filePath}.lock`;
+	// No owner_host_id key at all: an older record predating host qualification. A
+	// host-aware acquirer must still fail closed on it — the pid stays unprobed and the
+	// lock unreclaimed — without inventing a host value for it.
+	const timestamp = await publishHolder(lockDir, { pid: process.pid, start_time: "unknown" });
+	const published = await fs.readFile(path.join(lockDir, "info"), "utf8");
+
+	const holder = await holderAtExhaustion(filePath, { ownerHostId: "this-host" });
+
+	expect(holder).toBe(
+		`held by pid ${process.pid} on an unrecorded host (${FOREIGN_PHRASE}) since ${new Date(timestamp).toISOString()}`,
+	);
+	expect(holder).not.toContain("undefined");
+	expect(holder).not.toContain("on host");
+	// The pid was never probed: a live local pid would otherwise have been labelled.
+	expect(holder).not.toContain("(live)");
+	expect(holder).not.toContain("dead but not reaped");
+	// Fail-closed for real, not only in wording: the record still owns the directory.
+	expect(await fs.exists(lockDir)).toBe(true);
+	expect(await fs.readFile(path.join(lockDir, "info"), "utf8")).toBe(published);
+});
+
 test("keeps a host-qualified holder opaque to an acquirer carrying no host identity", async () => {
 	const filePath = path.join(await makeTemp(), "no-acquirer-host.json");
 	const timestamp = await publishHolder(`${filePath}.lock`, {

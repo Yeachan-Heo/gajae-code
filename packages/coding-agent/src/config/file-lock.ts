@@ -1987,8 +1987,14 @@ async function lockHolderDescription(
 			// the record is reclaimable decides whether its pid is probeable, so a
 			// holder this acquirer *may* reclaim is never described as opaque.
 			if (lockRecordIsForeignHost(info, ownerHostId, previousOwnerHostIds)) {
+				// An unqualified record carries no host provenance at all. A host-aware
+				// acquirer still fails closed on it — its pid is never probed and its
+				// lock is never reclaimed — but the diagnostic must say the provenance
+				// is missing instead of naming a host it does not have.
+				const provenance =
+					info.owner_host_id === undefined ? "on an unrecorded host" : `on host ${info.owner_host_id}`;
 				return (
-					`held by pid ${info.pid} on host ${info.owner_host_id} (liveness unknown from this host)` +
+					`held by pid ${info.pid} ${provenance} (liveness unknown from this host)` +
 					` since ${new Date(info.timestamp).toISOString()}`
 				);
 			}
