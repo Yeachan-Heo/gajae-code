@@ -150,7 +150,23 @@ export function resolveServePendingCeiling(flagValue: string | undefined, envVal
 	return ceiling;
 }
 
-type BrokerSessionRow = { sessionId: string; live: boolean; ambiguous: boolean };
+type BrokerTranscriptIdentity = {
+	dev: string;
+	ino: string;
+	size: number;
+	mtimeMs: number;
+	mtimeNs: string;
+	sha256: string;
+};
+type BrokerSavedSession = { id: string; path: string; identity: BrokerTranscriptIdentity };
+type BrokerSessionLocator = { cwd: string; worktreeRoot: string | null; stateRoot: string };
+type BrokerSessionRow = {
+	sessionId: string;
+	live: boolean;
+	ambiguous: boolean;
+	locator?: BrokerSessionLocator;
+	savedSession?: BrokerSavedSession;
+};
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -167,28 +183,127 @@ function brokerResult(value: unknown): Record<string, unknown> {
 	return isRecord(value) && isRecord(value.result) ? value.result : {};
 }
 
-function brokerSessionRows(sessions: readonly unknown[]): BrokerSessionRow[] {
+function brokerSessionLocator(value: unknown): BrokerSessionLocator | undefined {
+	if (!isRecord(value)) return undefined;
+	const { cwd, worktreeRoot, stateRoot } = value;
+	return typeof cwd === "string" &&
+		cwd.length > 0 &&
+		(worktreeRoot === null || typeof worktreeRoot === "string") &&
+		typeof stateRoot === "string" &&
+		stateRoot.length > 0
+		? { cwd, worktreeRoot, stateRoot }
+		: undefined;
+}
+
+function brokerSavedSession(value: unknown): BrokerSavedSession | undefined {
+	if (!isRecord(value) || typeof value.id !== "string" || !value.id || typeof value.path !== "string" || !value.path)
+		return undefined;
+	if (!isRecord(value.identity)) return undefined;
+	const { dev, ino, size, mtimeMs, mtimeNs, sha256 } = value.identity;
+	if (
+		typeof dev !== "string" ||
+		!/^[0-9]+$/.test(dev) ||
+		typeof ino !== "string" ||
+		!/^[0-9]+$/.test(ino) ||
+		typeof size !== "number" ||
+		!Number.isSafeInteger(size) ||
+		size < 0 ||
+		typeof mtimeMs !== "number" ||
+		!Number.isFinite(mtimeMs) ||
+		mtimeMs < 0 ||
+		typeof mtimeNs !== "string" ||
+		!/^[0-9]+$/.test(mtimeNs) ||
+		typeof sha256 !== "string" ||
+		!/^[a-f0-9]{64}$/.test(sha256)
+	)
+		return undefined;
+	return { id: value.id, path: value.path, identity: { dev, ino, size, mtimeMs, mtimeNs, sha256 } };
+}
+
+function brokerSessionRows(sessions: readonly unknown[], savedSession?: unknown): BrokerSessionRow[] {
+	const pageSavedSession = brokerSavedSession(savedSession);
 	return sessions.flatMap(item => {
 		if (!isRecord(item) || typeof item.sessionId !== "string" || !item.sessionId) return [];
-		return [{ sessionId: item.sessionId, live: item.live === true, ambiguous: item.ambiguous === true }];
+		const locator = brokerSessionLocator(item.locator);
+		const saved = pageSavedSession?.id === item.sessionId ? pageSavedSession : brokerSavedSession(item.savedSession);
+		return [
+			{
+				sessionId: item.sessionId,
+				live: item.live === true,
+				ambiguous: item.ambiguous === true,
+				...(locator === undefined ? {} : { locator }),
+				...(saved === undefined ? {} : { savedSession: saved }),
+			},
+		];
 	});
 }
 
 /** Exhausts strict broker `session.list` pages into one full session snapshot. */
-export async function listBrokerSessions(broker: SdkClient, explicitSessionId?: string): Promise<BrokerSessionRow[]> {
+export async function listBrokerSessions(
+	broker: SdkClient,
+	explicitSessionId?: string,
+	cwd?: string,
+): Promise<BrokerSessionRow[]> {
 	try {
 		const pages = await traverseSessionList(
-			{ ...(explicitSessionId ? { resolveSessionId: explicitSessionId } : {}) },
+			{
+				...(explicitSessionId ? { resolveSessionId: explicitSessionId } : {}),
+				...(cwd === undefined ? {} : { cwd }),
+			},
 			async input => await broker.global("session.list", input),
 			response => {
 				brokerResult(response);
 				return sessionListPageFromResponse(response);
 			},
 		);
-		return pages.flatMap(page => brokerSessionRows(page.sessions));
+		return pages.flatMap(page => brokerSessionRows(page.sessions, isRecord(page.page) ? page.page.savedSession : undefined));
 	} catch (error) {
 		if (error instanceof SessionListTraversalError) throw new SdkClientError("protocol_error", error.message);
 		throw error;
+	}
+}
+
+function endpointStaleError(sessionId: string): Error {
+	return new Error(`endpoint_stale: session ${sessionId} endpoint is not live`);
+}
+
+function isEndpointStaleSelection(error: unknown, sessionId: string): boolean {
+	return error instanceof Error && error.message.startsWith(`endpoint_stale: session ${sessionId} endpoint is not live`);
+}
+
+async function recoverBrokerSession(broker: SdkClient, row: BrokerSessionRow, sessionId: string): Promise<void> {
+	const locator = row.locator;
+	const authority =
+		row.savedSession?.id === sessionId
+			? row.savedSession
+			: locator === undefined
+				? undefined
+				: (await listBrokerSessions(broker, sessionId, locator.cwd)).find(
+						candidate => candidate.sessionId === sessionId,
+					)?.savedSession;
+	if (locator === undefined || authority?.id !== sessionId) throw endpointStaleError(sessionId);
+	await brokerResult(
+		await broker.global("session.resume", {
+			sessionId,
+			cwd: locator.cwd,
+			stateRoot: locator.stateRoot,
+			sessionPath: authority.path,
+			sessionIdentity: authority.identity,
+		}),
+	);
+}
+
+/** Resolves an explicit or automatic serve target, reattaching one stale explicit session at most once. */
+export async function resolveServeSession(broker: SdkClient, explicitSessionId?: string): Promise<string> {
+	const sessions = await listBrokerSessions(broker, explicitSessionId);
+	try {
+		return selectBrokerSession(sessions, explicitSessionId);
+	} catch (error) {
+		if (explicitSessionId === undefined || !isEndpointStaleSelection(error, explicitSessionId)) throw error;
+		const row = sessions.find(session => session.sessionId === explicitSessionId);
+		if (!row) throw error;
+		await recoverBrokerSession(broker, row, explicitSessionId);
+		return selectBrokerSession(await listBrokerSessions(broker, explicitSessionId), explicitSessionId);
 	}
 }
 
@@ -232,7 +347,7 @@ export async function runSdkServe(argv: string[]): Promise<void> {
 	}
 	let primary: Error | undefined;
 	try {
-		const sessionId = selectBrokerSession(await listBrokerSessions(broker, parsed.sessionId), parsed.sessionId);
+		const sessionId = await resolveServeSession(broker, parsed.sessionId);
 		const endpoint = brokerResult(await broker.global("session.get_endpoint", { sessionId }));
 		const url = typeof endpoint.url === "string" && endpoint.url ? endpoint.url : undefined;
 		const token = typeof endpoint.token === "string" && endpoint.token ? endpoint.token : undefined;

@@ -17,6 +17,7 @@ import { type RelayWebSocket, startRelayPair, type TransportError } from "../src
 import {
 	listBrokerSessions,
 	resolveServePendingCeiling,
+	resolveServeSession,
 	runSdkServe,
 	SdkServeError,
 	selectBrokerSession,
@@ -773,6 +774,170 @@ describe("SDK serve CLI and discovery", () => {
 			code: "endpoint_stale",
 			exitCode: 1,
 		});
+	});
+
+	test("reattaches one indexed-but-dead explicit session before serving", async () => {
+		const sessionId = "dead-session";
+		const cwd = "/workspace";
+		const stateRoot = `${cwd}/.gjc/state`;
+		const identity = {
+			dev: "1",
+			ino: "2",
+			size: 3,
+			mtimeMs: 4,
+			mtimeNs: "5",
+			sha256: "a".repeat(64),
+		};
+		const locator = { cwd, worktreeRoot: null, stateRoot };
+		const calls: { operation: string; input: Record<string, unknown> }[] = [];
+		let resumed = false;
+		const broker = {
+			global: async (operation: string, input: Record<string, unknown>) => {
+				calls.push({ operation, input });
+				if (operation === "session.list") {
+					if (input.cwd === cwd)
+						return {
+							ok: true,
+							result: {
+								sessions: [{ sessionId, live: false, ambiguous: false, locator }],
+								savedSession: { id: sessionId, path: `${cwd}/session.jsonl`, identity },
+							},
+						};
+					return {
+						ok: true,
+						result: { sessions: [{ sessionId, live: resumed, ambiguous: false, locator }], warnings: [] },
+					};
+				}
+				if (operation === "session.resume") {
+					resumed = true;
+					return { ok: true, result: { sessionId } };
+				}
+				return { ok: false, error: { code: "unexpected_operation", message: operation } };
+			},
+		} as never;
+
+		expect(await resolveServeSession(broker, sessionId)).toBe(sessionId);
+		expect(calls.map(call => call.operation)).toEqual([
+			"session.list",
+			"session.list",
+			"session.resume",
+			"session.list",
+		]);
+		expect(calls[1]?.input).toEqual({ resolveSessionId: sessionId, cwd });
+		expect(calls[2]?.input).toEqual({
+			sessionId,
+			cwd,
+			stateRoot,
+			sessionPath: `${cwd}/session.jsonl`,
+			sessionIdentity: identity,
+		});
+		expect(calls.filter(call => call.operation === "session.resume")).toHaveLength(1);
+	});
+
+	test("does not retry a recovery when the resumed session remains dead", async () => {
+		const sessionId = "still-dead";
+		const locator = { cwd: "/workspace", worktreeRoot: null, stateRoot: "/workspace/.gjc/state" };
+		const calls: string[] = [];
+		const broker = {
+			global: async (operation: string, input: Record<string, unknown>) => {
+				calls.push(operation);
+				if (operation === "session.list" && input.cwd !== undefined)
+					return {
+						ok: true,
+						result: {
+							sessions: [{ sessionId, live: false, ambiguous: false, locator }],
+							savedSession: {
+								id: sessionId,
+								path: "/workspace/session.jsonl",
+								identity: {
+									dev: "1",
+									ino: "2",
+									size: 3,
+									mtimeMs: 4,
+									mtimeNs: "5",
+									sha256: "b".repeat(64),
+									},
+								},
+							},
+					};
+				if (operation === "session.resume") return { ok: true, result: { sessionId } };
+				if (operation === "session.list")
+					return { ok: true, result: { sessions: [{ sessionId, live: false, ambiguous: false, locator }] } };
+				return { ok: false, error: { code: "unexpected_operation", message: operation } };
+			},
+		} as never;
+
+		await expect(resolveServeSession(broker, sessionId)).rejects.toThrow(
+			`endpoint_stale: session ${sessionId} endpoint is not live`,
+		);
+		expect(calls).toEqual(["session.list", "session.list", "session.resume", "session.list"]);
+		expect(calls.filter(operation => operation === "session.resume")).toHaveLength(1);
+	});
+
+	test("surfaces a recovery failure without retrying or selecting an endpoint", async () => {
+		const sessionId = "resume-fails";
+		const locator = { cwd: "/workspace", worktreeRoot: null, stateRoot: "/workspace/.gjc/state" };
+		const calls: string[] = [];
+		const broker = {
+			global: async (operation: string, input: Record<string, unknown>) => {
+				calls.push(operation);
+				if (operation === "session.list" && input.cwd !== undefined)
+					return {
+						ok: true,
+						result: {
+							sessions: [{ sessionId, live: false, ambiguous: false, locator }],
+							savedSession: {
+								id: sessionId,
+								path: "/workspace/session.jsonl",
+								identity: {
+									dev: "1",
+									ino: "2",
+									size: 3,
+									mtimeMs: 4,
+									mtimeNs: "5",
+									sha256: "c".repeat(64),
+									},
+								},
+							},
+					};
+				if (operation === "session.resume")
+					return { ok: false, error: { code: "resume_failed", message: "resume failed" } };
+				return { ok: true, result: { sessions: [{ sessionId, live: false, ambiguous: false, locator }] } };
+			},
+		} as never;
+
+		await expect(resolveServeSession(broker, sessionId)).rejects.toMatchObject({
+			name: "SdkClientError",
+			code: "resume_failed",
+			message: "resume failed",
+		});
+		expect(calls).toEqual(["session.list", "session.list", "session.resume"]);
+	});
+
+	test("does not recover a live endpoint or change closed selection failures", async () => {
+		const calls: string[] = [];
+		const broker = {
+			global: async (operation: string) => {
+				calls.push(operation);
+				return {
+					ok: true,
+					result: {
+						sessions: [
+							{ sessionId: "live", live: true, ambiguous: false },
+							{ sessionId: "live-2", live: true, ambiguous: false },
+							{ sessionId: "ambiguous", live: false, ambiguous: true },
+						],
+						warnings: [],
+					},
+				};
+			},
+		} as never;
+
+		expect(await resolveServeSession(broker, "live")).toBe("live");
+		await expect(resolveServeSession(broker, "ambiguous")).rejects.toThrow("ambiguous_session");
+		await expect(resolveServeSession(broker, "missing")).rejects.toThrow("not_found");
+		await expect(resolveServeSession(broker)).rejects.toThrow("multiple_live_endpoints");
+		expect(calls.filter(operation => operation === "session.resume")).toHaveLength(0);
 	});
 
 	test("rejects malformed broker session.list pages instead of treating them as empty", async () => {
