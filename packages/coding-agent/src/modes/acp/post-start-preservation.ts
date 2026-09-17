@@ -60,6 +60,12 @@ export interface PostStartPreservation {
 	 * `safeStashRef` admit only a bare hex oid.
 	 */
 	untrackedNotCaptured?: number;
+	/**
+	 * The worktree was observed changing while it was being captured, so the snapshot may be missing
+	 * edits that landed mid-flight. A BOOLEAN, never the paths that changed — same redaction contract
+	 * as {@link PostStartPreservation.untrackedNotCaptured}.
+	 */
+	racedDuringCapture?: boolean;
 }
 
 /**
@@ -99,6 +105,22 @@ export function preservationStatus(value: unknown): PostStartPreservationStatus 
 	return value === "preserved" || value === "clean" ? value : "unknown";
 }
 
+/**
+ * Only an explicit `true` asserts the worktree held still across the capture.
+ *
+ * Positive framing on purpose: a missing or garbage value is then "not verified stable", which is
+ * the conservative side. The inverse spelling would let an absent field silently mean "no race" and
+ * promote an unverified snapshot to complete — the exact direction this must never fail in.
+ */
+function verifiedStable(value: unknown): boolean {
+	return value === true;
+}
+
+/** Read a race flag defensively; only an explicit `true` claims one was observed. */
+export function racedDuringCapture(value: unknown): boolean {
+	return value === true;
+}
+
 /** A worktree nobody could inspect. Conservative by construction. */
 function unverifiedPreservation(): PostStartPreservation {
 	return { status: "unknown", snapshotComplete: false };
@@ -130,6 +152,12 @@ export interface WorktreeCapture {
 	status: PostStartPreservationStatus;
 	stashRef?: string;
 	untrackedNotCaptured: number;
+	/**
+	 * `true` ONLY when a post-capture re-read confirmed the worktree did not change mid-capture.
+	 * Absent, `false`, or garbage all mean "not verified", which downgrades the result rather than
+	 * promoting it — see {@link verifiedStable}.
+	 */
+	stable?: boolean;
 }
 
 /** Injectable capture seam; production uses {@link boundedWorktreeCapture}. */
@@ -171,61 +199,104 @@ function isPlainExit(error: unknown, expected: number): boolean {
  * Non-destructive, exactly as before: `git stash create` builds a commit object without touching
  * the working tree, and `git stash store` only writes a ref. Nothing resets, cleans, or commits.
  */
-export function boundedWorktreeCapture(workspace: string): WorktreeCapture {
-	const deadline = Date.now() + PRESERVE_BUDGET_MS;
-	const overBudget = (): boolean => Date.now() > deadline;
-	const unknown: WorktreeCapture = { status: "unknown", untrackedNotCaptured: 0 };
+/** The two cheap observations the capture is built on. */
+interface WorktreeObservation {
+	trackedDirty: boolean;
+	untracked: number;
+}
 
-	// 1. Tracked changes. `--quiet` produces NO output, so a huge diff cannot blow the buffer:
-	//    exit 0 = no tracked change, exit 1 = dirty, anything else = git did not answer.
-	if (overBudget()) return unknown;
+/**
+ * One bounded pass of the two observations, or `undefined` when git did not answer.
+ *
+ * `diff --quiet` produces NO output, so a huge diff cannot blow the buffer: exit 0 = no tracked
+ * change, exit 1 = dirty, anything else = git did not answer. A worktree emitting more untracked
+ * paths than the output cap is emphatically not clean, so a truncated read is a non-answer too.
+ */
+function observeWorktree(workspace: string): WorktreeObservation | undefined {
 	let trackedDirty: boolean;
 	try {
 		gitRun(workspace, ["diff", "--quiet", "HEAD"]);
 		trackedDirty = false;
 	} catch (error) {
-		if (!isPlainExit(error, 1)) return unknown;
+		if (!isPlainExit(error, 1)) return undefined;
 		trackedDirty = true;
 	}
-
-	// 2. Untracked COUNT only — never contents. A worktree emitting more than the cap is
-	//    emphatically not clean, so a truncated read is `unknown`, never `clean`.
-	if (overBudget()) return unknown;
-	let untrackedNotCaptured: number;
 	try {
-		untrackedNotCaptured = gitRun(workspace, ["ls-files", "--others", "--exclude-standard"])
+		const untracked = gitRun(workspace, ["ls-files", "--others", "--exclude-standard"])
 			.split("\n")
 			.map(line => line.trim())
 			.filter(Boolean).length;
+		return { trackedDirty, untracked };
 	} catch {
-		return unknown;
+		return undefined;
+	}
+}
+
+export function boundedWorktreeCapture(workspace: string): WorktreeCapture {
+	const deadline = Date.now() + PRESERVE_BUDGET_MS;
+	const overBudget = (): boolean => Date.now() > deadline;
+	const unknown: WorktreeCapture = { status: "unknown", untrackedNotCaptured: 0 };
+
+	// 1. Observe the worktree.
+	if (overBudget()) return unknown;
+	const before = observeWorktree(workspace);
+	if (before === undefined) return unknown;
+
+	// 2. Verified empty — but only if it is STILL empty once re-read. Nothing is stashed either way.
+	if (!before.trackedDirty && before.untracked === 0) {
+		if (overBudget()) return unknown;
+		const after = observeWorktree(workspace);
+		// Cannot re-read, or it changed: either way "verified empty" is no longer a claim anyone can
+		// make, and asserting it would strand whatever landed. Downgrade to `unknown`, never `clean`.
+		if (after === undefined || after.trackedDirty || after.untracked !== 0) return unknown;
+		return { status: "clean", untrackedNotCaptured: 0, stable: true };
 	}
 
-	// 3. Verified empty: nothing to stash, so nothing is stashed.
-	if (!trackedDirty && untrackedNotCaptured === 0) return { status: "clean", untrackedNotCaptured: 0 };
-	// Untracked-only: there is no tracked content for a stash object to hold, so there is no ref to
-	// offer. Reported as preserved-without-a-ref, which routes to the keep-the-worktree wording.
-	if (!trackedDirty) return { status: "preserved", untrackedNotCaptured };
+	/**
+	 * Compare a post-capture re-read against `before`. A non-answer is NOT stability — an
+	 * unverifiable re-read must never promote a result to complete. The uncaptured count reported is
+	 * the larger of the two: files that appeared mid-capture are absent from the snapshot too, so
+	 * the bigger number is the one the operator actually needs.
+	 */
+	const settle = (stashRef: string | undefined): WorktreeCapture => {
+		const after = overBudget() ? undefined : observeWorktree(workspace);
+		const stable =
+			after !== undefined && after.trackedDirty === before.trackedDirty && after.untracked === before.untracked;
+		const untrackedNotCaptured = Math.max(before.untracked, after?.untracked ?? before.untracked);
+		return {
+			status: "preserved",
+			...(stashRef === undefined ? {} : { stashRef }),
+			untrackedNotCaptured,
+			stable,
+		};
+	};
+
+	// 3. Untracked-only: no tracked content for a stash object to hold, so there is no ref to offer.
+	//    Reported as preserved-without-a-ref, which routes to the keep-the-worktree wording.
+	if (!before.trackedDirty) return settle(undefined);
 
 	// 4. Snapshot the tracked content. A failure here means no recoverable ref — still `preserved`,
 	//    because the tree IS known dirty, just not recoverable from the stash list.
-	if (overBudget()) return { status: "preserved", untrackedNotCaptured };
+	if (overBudget()) return settle(undefined);
 	let oid: string;
 	try {
 		oid = gitRun(workspace, ["stash", "create", STASH_MESSAGE]).trim();
 	} catch {
-		return { status: "preserved", untrackedNotCaptured };
+		return settle(undefined);
 	}
-	if (oid.length === 0) return { status: "preserved", untrackedNotCaptured };
+	if (oid.length === 0) return settle(undefined);
 
-	if (overBudget()) return { status: "preserved", untrackedNotCaptured };
+	if (overBudget()) return settle(undefined);
 	try {
 		gitRun(workspace, ["stash", "store", "-m", STASH_MESSAGE, oid]);
 	} catch {
 		// The object exists but nothing references it, so it is not durably recoverable.
-		return { status: "preserved", untrackedNotCaptured };
+		return settle(undefined);
 	}
-	return { status: "preserved", stashRef: oid, untrackedNotCaptured };
+	// The ref is kept even when the re-read differs: it genuinely recovers the tracked content it
+	// holds, and discarding a real ref over a race would help nobody. `settle` marks it unstable so
+	// the snapshot is reported incomplete rather than complete.
+	return settle(oid);
 }
 
 /**
@@ -245,7 +316,12 @@ export function preservePostStartWork(
 		const result = capture(workspace);
 		const status = preservationStatus(result.status);
 		if (status === "unknown") return unverifiedPreservation();
-		if (status === "clean") return { status: "clean", snapshotComplete: true };
+		// A `clean` verdict is only worth reporting when the capture actually verified the tree held
+		// still. An unverified "clean" is indistinguishable from "I did not look", so it degrades to
+		// `unknown` rather than reassuring an operator about a tree that may have changed.
+		if (status === "clean")
+			return verifiedStable(result.stable) ? { status: "clean", snapshotComplete: true } : unverifiedPreservation();
+		const stable = verifiedStable(result.stable);
 		const stashRef = safeStashRef(result.stashRef);
 		// `git stash create` snapshots tracked+staged content ONLY — an untracked file is absent from
 		// the stash object's tree, so `git stash apply <ref>` will not bring it back. (Not fixable by
@@ -257,8 +333,10 @@ export function preservePostStartWork(
 		return {
 			status: "preserved",
 			...(stashRef === undefined ? {} : { stashRef }),
-			snapshotComplete: stashRef !== undefined && untrackedNotCaptured === 0,
+			// A snapshot taken across a changing worktree is not complete, however good the ref is.
+			snapshotComplete: stashRef !== undefined && untrackedNotCaptured === 0 && stable,
 			...(untrackedNotCaptured > 0 ? { untrackedNotCaptured } : {}),
+			...(stable ? {} : { racedDuringCapture: true }),
 		};
 	} catch {
 		return unverifiedPreservation();
@@ -323,7 +401,14 @@ export function postStartOperatorMessage(input: {
 			parts.push(
 				`${uncaptured} new file(s) are NOT in that snapshot and exist only in the worktree; ${OPERATOR_KEEP_WORKTREE}.`,
 			);
-		else if (!preservation.snapshotComplete) parts.push(`The snapshot is incomplete; ${OPERATOR_KEEP_WORKTREE}.`);
+		// A boolean, never the paths that changed: this crosses the wire and those paths are
+		// user-controlled.
+		if (racedDuringCapture(preservation.racedDuringCapture))
+			parts.push(
+				`The worktree changed while it was being captured, so that snapshot may be missing later edits; ${OPERATOR_KEEP_WORKTREE}.`,
+			);
+		else if (uncaptured === 0 && !preservation.snapshotComplete)
+			parts.push(`The snapshot is incomplete; ${OPERATOR_KEEP_WORKTREE}.`);
 	}
 	return parts.join(" ");
 }

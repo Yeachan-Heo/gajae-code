@@ -178,6 +178,69 @@ describe("post-start terminal preserves the worktree before reporting failure (i
 		expect(message).not.toContain("snapshot is incomplete");
 	});
 
+	// REGRESSION (round-3 review finding 2): the capture observed dirtiness, counted untracked
+	// files, then stashed — with nothing checking the worktree held still in between. A file that
+	// appeared mid-flight produced `snapshotComplete: true` plus a ref that cannot recover it, so the
+	// operator was shown complete-recovery wording and a later sweep stranded the concurrent edit.
+	it("downgrades a snapshot taken across a changing worktree, keeping the ref it did get", async () => {
+		await writeFile(path.join(ws, "src.ts"), "export const v = 2;\n");
+		// A real capture first, to borrow a genuine stash oid for the raced result.
+		const settled = preservePostStartWork(ws);
+		const realRef = settled.stashRef ?? "<none>";
+		// The file that appeared between the untracked count and the stash. It exists on disk and is
+		// absent from `realRef`'s tree, exactly as in the reported race.
+		await writeFile(path.join(ws, "appeared-mid-capture.ts"), "export const late = true;\n");
+		expect(git(ws, ["ls-tree", "-r", "--name-only", realRef])).not.toContain("appeared-mid-capture.ts");
+
+		const raced = preservePostStartWork(ws, () => ({
+			status: "preserved",
+			stashRef: realRef,
+			untrackedNotCaptured: 1,
+			stable: false,
+		}));
+
+		// The ref survives — it genuinely recovers the tracked content it holds.
+		expect(raced.stashRef).toBe(realRef);
+		// But the snapshot is NOT complete, which is the whole finding.
+		expect(raced.snapshotComplete).toBe(false);
+		expect(raced.racedDuringCapture).toBe(true);
+
+		const message = postStartOperatorMessage({ category: "provider_transport", preservation: raced });
+
+		expect(message).toContain(`git stash apply ${realRef}`);
+		expect(message).toContain("changed while it was being captured");
+		expect(message).toContain("do not discard this worktree");
+		// A boolean and a count cross the wire; the path never does.
+		expect(message).not.toContain("appeared-mid-capture.ts");
+	});
+
+	it("still reports a stable capture as complete, with no race wording", async () => {
+		// The control for the case above: without it, a blanket "always incomplete" regression passes.
+		await writeFile(path.join(ws, "src.ts"), "export const v = 2;\n");
+
+		const preservation = preservePostStartWork(ws);
+
+		expect(preservation.status).toBe("preserved");
+		expect(preservation.snapshotComplete).toBe(true);
+		expect(preservation.racedDuringCapture).toBeUndefined();
+
+		const message = postStartOperatorMessage({ category: "provider_transport", preservation });
+		expect(message).not.toContain("changed while it was being captured");
+		expect(message).not.toContain("do not discard this worktree");
+	});
+
+	it("treats an unverifiable or unstable re-read as unknown rather than clean", () => {
+		// A `clean` verdict nobody re-confirmed is indistinguishable from "I did not look".
+		for (const stable of [undefined, false, "true" as unknown as boolean, null as unknown as boolean])
+			expect(preservePostStartWork(ws, () => ({ status: "clean", untrackedNotCaptured: 0, stable })).status).toBe(
+				"unknown",
+			);
+		// And a capture that DID verify still reports clean.
+		expect(preservePostStartWork(ws, () => ({ status: "clean", untrackedNotCaptured: 0, stable: true })).status).toBe(
+			"clean",
+		);
+	});
+
 	// REGRESSION (round-3 review finding 1): `#settlePrompt` leaves `preservation` undefined for any
 	// failure whose phase is not `post_start`, so a submission-phase transport rejection reached the
 	// wording with nothing captured — and was told its worktree had been checked and found empty.
@@ -204,6 +267,21 @@ describe("post-start terminal preserves the worktree before reporting failure (i
 		});
 
 		expect(message).toContain("No uncommitted work was found to preserve.");
+	});
+
+	it("reports the larger uncaptured count when files appear during the capture", () => {
+		// The operator needs the number that covers what is actually missing from the snapshot.
+		const raced = preservePostStartWork(ws, () => ({
+			status: "preserved",
+			stashRef: "d".repeat(40),
+			untrackedNotCaptured: 3,
+			stable: false,
+		}));
+
+		expect(raced.untrackedNotCaptured).toBe(3);
+		expect(postStartOperatorMessage({ category: "provider_transport", preservation: raced })).toContain(
+			"3 new file(s) are NOT in that snapshot",
+		);
 	});
 
 	it("reads a malformed uncaptured count as zero rather than letting it reach the operator", () => {
