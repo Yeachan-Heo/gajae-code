@@ -399,7 +399,26 @@ interface AttachedRuntimeHarness {
 	awaitFrameSettlement: (generation: number, seq: number, count?: number) => Promise<void>;
 	/** Supersedes the indexed attachment with a newer endpoint generation. */
 	supersede: () => Promise<void>;
+	/**
+	 * Rewrites the endpoint file in place at the same generation, url, token and
+	 * pid, restoring its mtime so the index still vouches for it.
+	 *
+	 * Only the file's ctime moves, which is enough for `sameEndpointIdentity` to
+	 * reject it: the next reconcile treats the attachment as NON-RESUMABLE and
+	 * rebuilds it from `cursor.seq = 0`. That is the production churn behind
+	 * #5619 — the loop that re-asks the host for an evicted prefix it already
+	 * conceded, over and over, at one and the same generation.
+	 */
+	churnEndpoint: () => Promise<void>;
 }
+
+/**
+ * The mtime every attached-runtime endpoint file is pinned to. The index records
+ * this value and the Router refuses a file whose mtime drifts from it by more
+ * than a microsecond, so `churnEndpoint` needs a timestamp it can restore
+ * exactly rather than one carrying the filesystem's own sub-millisecond noise.
+ */
+const PINNED_ENDPOINT_MTIME = new Date(1_700_000_000_000);
 
 /**
  * Runs the real attach path: one live indexed session with a readable, non-stale
@@ -417,10 +436,9 @@ async function withAttachedSessionRuntime(run: (harness: AttachedRuntimeHarness)
 		const stateRoot = path.join(agentDir, ".gjc", "state");
 		const endpointFile = path.join(stateRoot, "sdk", `${SESSION_ID}.json`);
 		await fs.mkdir(path.dirname(endpointFile), { recursive: true });
-		await fs.writeFile(
-			endpointFile,
-			`${JSON.stringify({ version: 1, sessionId: SESSION_ID, url: "ws://localhost:1/", token: "not-persisted", pid: process.pid })}\n`,
-		);
+		const endpointBody = `${JSON.stringify({ version: 1, sessionId: SESSION_ID, url: "ws://localhost:1/", token: "not-persisted", pid: process.pid })}\n`;
+		await fs.writeFile(endpointFile, endpointBody);
+		await fs.utimes(endpointFile, PINNED_ENDPOINT_MTIME, PINNED_ENDPOINT_MTIME);
 		const endpointMtimeMs = (await fs.stat(endpointFile)).mtimeMs;
 		const index = await new SessionIndex(agentDir).open();
 		const hostIncarnation = currentHostIncarnation();
@@ -518,6 +536,12 @@ async function withAttachedSessionRuntime(run: (harness: AttachedRuntimeHarness)
 					endpointMtimeMs,
 				});
 				await index.checkpointLiveHeartbeats(wallClockNow());
+			},
+			churnEndpoint: async () => {
+				await fs.writeFile(endpointFile, endpointBody);
+				await fs.utimes(endpointFile, PINNED_ENDPOINT_MTIME, PINNED_ENDPOINT_MTIME);
+				// The index still vouches for this file; only its identity moved.
+				expect((await fs.stat(endpointFile)).mtimeMs).toBe(endpointMtimeMs);
 			},
 		});
 	} finally {
@@ -1334,6 +1358,83 @@ test("a retention gap at the initial attach keeps delivering instead of rebuildi
 		});
 	});
 }, 20_000);
+test("endpoint churn re-conceding one retention gap warns once and backs its repeats off", async () => {
+	await withAttachedSessionRuntime(async ({ runtime, provider, reconcileReplaySettled, warnings, churnEndpoint }) => {
+		await withSerializedFakeTransport(async () => {
+			// The production shape behind #5619: a ring that already rolled past its
+			// first event, and a session whose endpoint file keeps churning. Each churn
+			// is a non-resumable re-attach, so the daemon replays from seq 0 and the
+			// host re-states the identical loss — measured at thousands a day, every
+			// one of them reading `sequences 1-N`.
+			const host = new FakeSessionHost(2);
+			host.emit("evicted one");
+			host.emit("retained two");
+			host.emit("retained three");
+
+			const starting = runtime.start();
+			host.accept(await awaitSocket(1));
+			await starting;
+			await awaitPosts(provider, 2);
+
+			const conceded = `chat daemon replay conceded a retention gap (sequences 1-1 are gone from the host); session ${SESSION_ID} generation ${GENERATION} resumes at seq 2.`;
+			expect(warnings.filter(line => line.includes("conceded a retention gap"))).toEqual([conceded]);
+
+			// A churned endpoint is no durable index update, so the timer tick's idle
+			// gate skips it. The explicit reconcile is the same forced authority body
+			// the daemon's own dispatch and adoption paths run.
+			const rebuild = async (socketCount: number): Promise<void> => {
+				await churnEndpoint();
+				const settling = reconcileReplaySettled();
+				host.accept(await awaitSocket(socketCount));
+				await settling;
+				await awaitReplayRequests(host, socketCount);
+			};
+
+			const rounds = 50;
+			for (let round = 0; round < rounds; round++) await rebuild(round + 2);
+
+			// Control, and it holds with or without the dedupe: every round really did
+			// rebuild the attachment and re-ask the host from zero. Without it, warning
+			// once would be indistinguishable from never reproducing the repeat at all.
+			expect(host.replayRequests).toEqual(
+				Array.from({ length: rounds + 1 }, () => ({ sinceGeneration: GENERATION, sinceSeq: 0 })),
+			);
+
+			// AC-1: one warn for the whole flood, not one per concession.
+			expect(warnings.filter(line => line.includes("conceded a retention gap"))).toEqual([conceded]);
+
+			// AC-3: the repeats are not silent, they are logarithmic. 50 repeats cross
+			// exactly one power of ten, so the operator learns the volume once.
+			const summaries = warnings.filter(line => line.includes("re-stated the same retention loss"));
+			expect(summaries).toHaveLength(1);
+			expect(summaries[0]).toContain("re-stated the same retention loss 10 more times");
+			// The summary must stay clear of the concession's own wording, or every
+			// caller filtering for a conceded gap sweeps it up as one.
+			expect(summaries[0]!.includes("conceded a retention gap")).toBe(false);
+
+			// AC-2: a different bound is a different loss and earns its own warn, which
+			// is what proves the memo keys on the gap and not merely on the session.
+			host.emit("evicted four");
+			host.emit("evicted five");
+			await rebuild(rounds + 2);
+			const widened = `chat daemon replay conceded a retention gap (sequences 1-3 are gone from the host); session ${SESSION_ID} generation ${GENERATION} resumes at seq 4.`;
+			await awaitWarning(warnings, widened);
+			expect(warnings.filter(line => line.includes("conceded a retention gap"))).toEqual([conceded, widened]);
+
+			// Control, and it holds with or without the dedupe: the memo gates the
+			// logger call and nothing else, so 52 attachments still publish the
+			// retained suffix exactly once each, in order, on a live transport.
+			await awaitPosts(provider, 4);
+			expect(provider.posts.map(post => post.text)).toEqual([
+				"GJC notice\nretained two",
+				"GJC notice\nretained three",
+				"GJC notice\nevicted four",
+				"GJC notice\nevicted five",
+			]);
+			expect(runtime.transportHealthy()).toBe(true);
+		});
+	});
+}, 60_000);
 test("a replay answered from a rolled generation retires the attachment instead of publishing it", async () => {
 	await withAttachedSessionRuntime(async ({ runtime, provider, reconcile, awaitFrameSettlement, supersede }) => {
 		await withSerializedFakeTransport(async () => {
