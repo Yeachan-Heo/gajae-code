@@ -165,6 +165,7 @@ type BrokerSessionRow = {
 	sessionId: string;
 	live: boolean;
 	ambiguous: boolean;
+	terminalUncertain?: boolean;
 	locator?: BrokerSessionLocator;
 	savedSession?: BrokerSavedSession;
 };
@@ -227,11 +228,13 @@ function brokerSessionRows(sessions: readonly unknown[], savedSession?: unknown)
 		if (!isRecord(item) || typeof item.sessionId !== "string" || !item.sessionId) return [];
 		const locator = brokerSessionLocator(item.locator);
 		const saved = pageSavedSession?.id === item.sessionId ? pageSavedSession : brokerSavedSession(item.savedSession);
+		const terminalUncertain = item.terminalUncertain === true || item.terminal_uncertain === true;
 		return [
 			{
 				sessionId: item.sessionId,
 				live: item.live === true,
 				ambiguous: item.ambiguous === true,
+				...(terminalUncertain ? { terminalUncertain: true } : {}),
 				...(locator === undefined ? {} : { locator }),
 				...(saved === undefined ? {} : { savedSession: saved }),
 			},
@@ -305,7 +308,7 @@ export async function resolveServeSession(broker: SdkClient, explicitSessionId?:
 		// self-reap case (#5633). Every other targeting outcome — unindexed,
 		// ambiguous, no explicit id — stays the selector's to report, so this
 		// decision does not depend on the selector's error text.
-		if (row !== undefined && !row.ambiguous && !row.live) {
+		if (row !== undefined && !row.ambiguous && !row.terminalUncertain && !row.live) {
 			await recoverBrokerSession(broker, row, explicitSessionId);
 			return selectBrokerSession(await listBrokerSessions(broker, explicitSessionId), explicitSessionId);
 		}
@@ -319,10 +322,12 @@ export function selectBrokerSession(sessions: BrokerSessionRow[], explicitSessio
 		const row = sessions.find(session => session.sessionId === explicitSessionId);
 		if (!row) throw new SdkServeError("not_found", `session ${explicitSessionId} is not indexed by the broker`, 1);
 		if (row.ambiguous) throw new SdkServeError("ambiguous_session", "session id maps to more than one state root", 1);
+		if (row.terminalUncertain)
+			throw new SdkServeError("terminal_uncertain", `session ${explicitSessionId} ownership is uncertain`, 1);
 		if (!row.live) throw new SdkServeError("endpoint_stale", `session ${explicitSessionId} endpoint is not live`, 1);
 		return row.sessionId;
 	}
-	const live = sessions.filter(session => session.live && !session.ambiguous);
+	const live = sessions.filter(session => session.live && !session.ambiguous && !session.terminalUncertain);
 	if (live.length === 0) throw new SdkServeError("no_live_endpoint", "no live session endpoint", 1);
 	if (live.length > 1)
 		throw new SdkServeError("multiple_live_endpoints", "more than one live session; specify --session <id>", 1);

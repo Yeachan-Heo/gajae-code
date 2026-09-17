@@ -938,14 +938,22 @@ describe("SDK serve CLI and discovery", () => {
 		const previousPiAgentDir = process.env.PI_CODING_AGENT_DIR;
 		setAgentDir(agentDir);
 		const originalProcessOnce = process.once;
+		const invokeOriginalProcessOnce = originalProcessOnce.bind(process) as (
+			event: Parameters<NodeJS.EventEmitter["once"]>[0],
+			listener: Parameters<NodeJS.EventEmitter["once"]>[1],
+		) => typeof process;
 		let stop: (() => void) | undefined;
-		process.once = ((event, listener) => {
+		const interceptedProcessOnce: typeof process.once = (
+			event: Parameters<NodeJS.EventEmitter["once"]>[0],
+			listener: Parameters<NodeJS.EventEmitter["once"]>[1],
+		) => {
 			if (event === "SIGTERM") {
 				stop = listener as () => void;
 				return process;
 			}
-			return originalProcessOnce.call(process, event, listener);
-		}) as typeof process.once;
+			return invokeOriginalProcessOnce(event, listener);
+		};
+		process.once = interceptedProcessOnce;
 		let serving: Promise<void> | undefined;
 		let client: net.Socket | undefined;
 		try {
@@ -1028,6 +1036,39 @@ describe("SDK serve CLI and discovery", () => {
 		);
 		expect(calls).toEqual(["session.list", "session.list", "session.resume", "session.list"]);
 		expect(calls.filter(operation => operation === "session.resume")).toHaveLength(1);
+	});
+
+	test("does not recover an indexed terminal-uncertain explicit session", async () => {
+		const sessionId = "uncertain-session";
+		const locator = { cwd: "/workspace", worktreeRoot: null, stateRoot: "/workspace/.gjc/state" };
+		const identity = {
+			dev: "1",
+			ino: "2",
+			size: 3,
+			mtimeMs: 4,
+			mtimeNs: "5",
+			sha256: "d".repeat(64),
+		};
+		const calls: string[] = [];
+		const broker = {
+			global: async (operation: string) => {
+				calls.push(operation);
+				if (operation === "session.list")
+					return {
+						ok: true,
+						result: {
+							sessions: [{ sessionId, live: false, ambiguous: false, terminal_uncertain: true, locator }],
+							savedSession: { id: sessionId, path: "/workspace/session.jsonl", identity },
+						},
+					};
+				return { ok: false, error: { code: "unexpected_operation", message: operation } };
+			},
+		} as never;
+
+		await expect(resolveServeSession(broker, sessionId)).rejects.toThrow(
+			`terminal_uncertain: session ${sessionId} ownership is uncertain`,
+		);
+		expect(calls).toEqual(["session.list"]);
 	});
 
 	test("surfaces a recovery failure without retrying or selecting an endpoint", async () => {
