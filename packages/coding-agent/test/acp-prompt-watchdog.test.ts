@@ -5,6 +5,7 @@ import { getProviderFirstEventTimeoutFallbackMs } from "@gajae-code/ai/utils/idl
 import { logger, TempDir } from "@gajae-code/utils";
 import packageJson from "../package.json" with { type: "json" };
 import { AcpAgent } from "../src/modes/acp/acp-agent";
+import { AcpSdkAdapter } from "../src/sdk/acp/adapter";
 import { writeBrokerDiscovery } from "../src/sdk/broker/discovery";
 import {
 	ACP_PROMPT_INACTIVITY_TIMEOUT_MS,
@@ -566,6 +567,68 @@ test("a session accepts a new prompt after a watchdog rejection", async () => {
 		fixture.sendStopped("end_turn");
 		expect(await bounded(recovered, "recovered prompt completion")).toEqual({ stopReason: "end_turn" });
 	} finally {
+		fixture.dispose();
+	}
+});
+
+test("a prompt stalled in provider preflight is rejected at the bound instead of hanging", async () => {
+	const fixture = await createFixture();
+	const preflightEntered = Promise.withResolvers<void>();
+	const releasePreflight = Promise.withResolvers<void>();
+	// The session is already established, so this wedges only the per-prompt preflight:
+	// the window between the waiter taking ownership and the turn reaching the host.
+	const ensureProviders = vi.spyOn(AcpSdkAdapter.prototype, "ensureProviders").mockImplementation(async () => {
+		preflightEntered.resolve();
+		await releasePreflight.promise;
+	});
+	const diagnostic = vi.spyOn(logger, "error").mockImplementation(() => {});
+	try {
+		const deliveriesBefore = fixture.promptDeliveryCount();
+		const pending = prompt(fixture, "stalled provider preflight");
+		await bounded(preflightEntered.promise, "provider preflight");
+		// Nothing reached the host, so no frame can ever refresh this prompt.
+		expect(fixture.promptDeliveryCount()).toBe(deliveriesBefore);
+		// The bound is live while the preflight is still wedged; without it the advance
+		// below would settle nothing and this prompt would run forever.
+		expect(fixture.clock.pending).toBe(1);
+
+		fixture.clock.advance(ACP_PROMPT_INACTIVITY_TIMEOUT_MS + 1);
+
+		const error = await bounded(
+			pending.then(
+				() => undefined,
+				(reason: unknown) => reason,
+			),
+			"preflight watchdog rejection",
+		);
+		expect(error).toBeInstanceOf(Error);
+		expect(error).toMatchObject({ code: "prompt_abandoned" });
+		const message = (error as Error).message;
+		expect(message).toContain("ACP prompt was abandoned");
+		expect(message).toContain(`${Math.round(ACP_PROMPT_INACTIVITY_TIMEOUT_MS / 1_000)}s of silence`);
+		// The phase is named: a preflight stall is not a host that went quiet mid-turn.
+		expect(message).toContain("never finished provider preflight");
+		expect(message).toContain('"prompt_dispatch"');
+		expect(
+			diagnostic.mock.calls.some(
+				call =>
+					call[0] === "acp_prompt_watchdog_expired" &&
+					(call[1] as { awaitingProviderPreflight?: boolean })?.awaitingProviderPreflight === true,
+			),
+		).toBe(true);
+		expect(fixture.promptDeliveryCount()).toBe(deliveriesBefore);
+
+		// The rejection releases the session rather than poisoning it.
+		releasePreflight.resolve();
+		ensureProviders.mockRestore();
+		const { pending: recovered } = await startTurn(fixture);
+		expect(fixture.promptDeliveryCount()).toBe(deliveriesBefore + 1);
+		fixture.sendStopped("end_turn");
+		expect(await bounded(recovered, "prompt after preflight stall")).toEqual({ stopReason: "end_turn" });
+	} finally {
+		releasePreflight.resolve();
+		ensureProviders.mockRestore();
+		diagnostic.mockRestore();
 		fixture.dispose();
 	}
 });
