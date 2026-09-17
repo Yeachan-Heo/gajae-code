@@ -235,8 +235,11 @@ export async function runSdkServe(argv: string[]): Promise<void> {
 		const sessionId = selectBrokerSession(await listBrokerSessions(broker, parsed.sessionId), parsed.sessionId);
 		const endpoint = brokerResult(await broker.global("session.get_endpoint", { sessionId }));
 		const url = typeof endpoint.url === "string" && endpoint.url ? endpoint.url : undefined;
-		const token = typeof endpoint.token === "string" ? endpoint.token : "";
-		if (!url) throw new SdkServeError("unavailable", "broker returned an invalid endpoint record", 1);
+		const token = typeof endpoint.token === "string" && endpoint.token ? endpoint.token : undefined;
+		// An empty credential has to die here rather than at the transport: the relay
+		// writes it straight into the upstream URL, where it resurfaces as a generic
+		// connection failure and this stable malformed-endpoint code is lost.
+		if (!url || !token) throw new SdkServeError("unavailable", "broker returned an invalid endpoint record", 1);
 		const options = { url, token, pendingCeilingBytes };
 		const handle =
 			parsed.mode.kind === "stdio"

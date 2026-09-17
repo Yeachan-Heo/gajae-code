@@ -989,4 +989,47 @@ describe("SDK serve CLI and discovery", () => {
 			exitCode: 1,
 		});
 	});
+
+	test("rejects an empty or malformed endpoint credential before starting the relay", async () => {
+		const fake = upstream();
+		// The socket dir is deliberately insecure and nothing listens on port 1, so if
+		// the credential guard ever stopped running first, the next failure would carry
+		// a different code — the regression reads as a code diff rather than a live
+		// relay the test then has to wait out.
+		const insecureDir = await tempDir();
+		await fs.chmod(insecureDir, 0o777);
+		const socketArgv = ["--socket", path.join(insecureDir, "serve.sock")];
+		const cases: { argv: string[]; endpoint: Record<string, unknown> }[] = [
+			{ argv: socketArgv, endpoint: { url: fake.url, token: "" } },
+			{ argv: socketArgv, endpoint: { url: fake.url } },
+			{ argv: socketArgv, endpoint: { url: fake.url, token: 42 } },
+			{ argv: ["--stdio"], endpoint: { url: "ws://127.0.0.1:1", token: "" } },
+		];
+		const observed: unknown[] = [];
+		try {
+			for (const { argv, endpoint } of cases) {
+				const broker = fakeBroker(operation =>
+					operation === "session.list"
+						? {
+								ok: true,
+								result: { sessions: [{ sessionId: "sess-live", live: true, ambiguous: false }], warnings: [] },
+							}
+						: { ok: true, result: endpoint },
+				);
+				try {
+					const failure = await withServeAgentDir(broker.url, async () => await serveRejection(argv));
+					// Only the code is recorded — the credential itself is never echoed.
+					const typed = failure as { code?: unknown; exitCode?: unknown };
+					observed.push({ typed: failure instanceof SdkServeError, code: typed.code, exitCode: typed.exitCode });
+				} finally {
+					broker.stop();
+				}
+			}
+			expect(observed).toEqual(cases.map(() => ({ typed: true, code: "unavailable", exitCode: 1 })));
+			// Neither relay ever reached the endpoint the broker handed back.
+			expect(fake.connections).toHaveLength(0);
+		} finally {
+			fake.stop();
+		}
+	});
 });
