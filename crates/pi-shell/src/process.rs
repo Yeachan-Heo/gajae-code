@@ -836,7 +836,11 @@ mod platform {
 			snapshot_all_pids()?
 				.into_iter()
 				.filter_map(Process::from_pid)
-				.filter(|process| unsafe { libc::getsid(process.pid()) } == sid)
+				.filter(|process| {
+					// SAFETY: getsid only reads the integer PID value and does not
+					// access caller-owned memory.
+					(unsafe { libc::getsid(process.pid()) }) == sid
+				})
 				.collect(),
 		)
 	}
