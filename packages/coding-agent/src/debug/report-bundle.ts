@@ -6,7 +6,7 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { WorkProfile } from "@gajae-code/natives";
-import { APP_NAME, getLogPath, getLogsDir, getReportsDir, isEnoent } from "@gajae-code/utils";
+import { APP_NAME, getEffectiveLogPath, getEffectiveLogsDir, getReportsDir, isEnoent } from "@gajae-code/utils";
 import type { CpuProfile, HeapSnapshot } from "./profiler";
 import { collectSystemInfo, sanitizeEnv } from "./system-info";
 
@@ -102,7 +102,7 @@ export async function createReportBundle(options: ReportBundleOptions): Promise<
 	}
 
 	// Recent logs (last 1000 lines)
-	const logPath = getLogPath();
+	const logPath = getEffectiveLogPath();
 	const logs = await readLastLines(logPath, 1000);
 	if (logs) {
 		data["logs.txt"] = logs;
@@ -228,14 +228,14 @@ async function addSubagentSessions(
 
 /** Get recent log entries for display (tail-limited to avoid OOM on large files). */
 export async function getLogText(): Promise<string> {
-	return readLastLines(getLogPath(), MAX_LOG_LINES);
+	return readLastLines(getEffectiveLogPath(), MAX_LOG_LINES);
 }
 
 const LOG_FILE_PATTERN = new RegExp(`^${APP_NAME}\\.(\\d{4}-\\d{2}-\\d{2})\\.log$`);
 
 export async function createDebugLogSource(): Promise<DebugLogSource> {
-	const logsDir = getLogsDir();
-	const todayPath = getLogPath();
+	const logsDir = getEffectiveLogsDir();
+	const todayPath = getEffectiveLogPath();
 	const todayName = path.basename(todayPath);
 	let olderFiles: string[] = [];
 	try {

@@ -735,9 +735,44 @@ export function getLogsDir(): string {
 	return dirs.rootSubdir("logs", "state");
 }
 
+/** Dated log file name, shared by the canonical and effective log paths so they cannot drift. */
+function datedLogFileName(date: Date): string {
+	return `${APP_NAME}.${date.toISOString().slice(0, 10)}.log`;
+}
+
 /** Get the path to a dated log file (~/.gjc/logs/gjc.YYYY-MM-DD.log). */
 export function getLogPath(date = new Date()): string {
-	return path.join(getLogsDir(), `${APP_NAME}.${date.toISOString().slice(0, 10)}.log`);
+	return path.join(getLogsDir(), datedLogFileName(date));
+}
+
+/**
+ * The logs directory the process actually reads and writes.
+ *
+ * A trusted `GJC_LOG_DIR` redirects the sink — the test preload pins it to a
+ * per-process temp directory so `bun test` stops appending fixture
+ * `level:error` records to the operator's shared log (issue #5618) — and
+ * everything else falls back to {@link getLogsDir}.
+ *
+ * The override is provenance-checked through the same {@link trustedValue} rule
+ * as the config and agent directories: Bun loads `cwd/.env` into `process.env`
+ * before any module runs, so a repository could otherwise redirect where the
+ * operator's production logs are written. A dynamic (`$`/backtick) declaration
+ * is rejected there too, which fails closed onto the canonical path.
+ *
+ * This is deliberately *not* folded into {@link getLogsDir}: that function's
+ * config-root semantics are pinned by tests, and the preload sets `GJC_LOG_DIR`
+ * for every test process, so folding the override in would move it under every
+ * test. Writers and readers must both come through here instead — the split
+ * between the two is what let the transport and the log readers disagree.
+ */
+export function getEffectiveLogsDir(): string {
+	const override = trustedValue("GJC_LOG_DIR", dirs.trustSnapshot)?.trim();
+	return override || getLogsDir();
+}
+
+/** Get the dated log file under {@link getEffectiveLogsDir}. */
+export function getEffectiveLogPath(date = new Date()): string {
+	return path.join(getEffectiveLogsDir(), datedLogFileName(date));
 }
 
 /**

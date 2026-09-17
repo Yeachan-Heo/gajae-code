@@ -1,6 +1,6 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { APP_NAME, extractHttpStatusFromError, getLogsDir } from "@gajae-code/utils";
+import { APP_NAME, extractHttpStatusFromError, getEffectiveLogsDir } from "@gajae-code/utils";
 import { isCopilotTransientModelError } from "./retry.js";
 import { formatErrorMessageWithRetryAfter } from "./retry-after.js";
 
@@ -109,7 +109,7 @@ const MAX_RETAINED_DUMPS = 50;
 
 /** Directory holding the retained HTTP 400 dumps. */
 export function httpRequestDumpDir(): string {
-	return path.join(getLogsDir(), "http-400-requests");
+	return path.join(getEffectiveLogsDir(), "http-400-requests");
 }
 
 /**

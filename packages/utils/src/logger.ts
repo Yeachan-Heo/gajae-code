@@ -12,7 +12,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import * as fs from "node:fs";
 import type * as winston from "winston";
-import { getLogsDir } from "./dirs";
+import { getEffectiveLogsDir } from "./dirs";
 
 /** Ensure a logs directory exists; return the resolved path. */
 function ensureDir(dir: string): string {
@@ -78,20 +78,17 @@ function makeLogFormat(winston: WinstonModule): winston.Logform.Format {
  *
  * Destination precedence:
  *   1. `dir` — an explicit path from {@link setTransports}(`{ file: "<path>" }`).
- *   2. `GJC_LOG_DIR` — read here rather than at module load so a preload that
- *      pins it before the first log write is honored. Blank values are ignored.
- *   3. {@link getLogsDir} — the real config root (`~/.gjc/logs`) in production.
+ *   2. {@link getEffectiveLogsDir} — the provenance-checked `GJC_LOG_DIR`
+ *      override, else the real config root (`~/.gjc/logs`).
  *
- * The env var exists so test processes stop appending to the operator's shared
- * sink (issue #5618): logs resolve from the config root, not the agent dir, so
- * the preload's `GJC_CODING_AGENT_DIR` isolation does not cover them. The
- * override lives here instead of in `getLogsDir()` so that function's path
- * semantics — and the tests pinning them — stay intact.
+ * The resolution is centralized in `dirs.ts` rather than read from the
+ * environment here: the log *readers* (report bundles, the debug log view, the
+ * HTTP dump directory) call the same helper, and a second env read in this file
+ * is what let the transport write somewhere the readers never looked.
  */
 function makeFileTransport(DailyRotateFile: DailyRotateFileCtor, dir?: string): Transport {
-	const envDir = process.env.GJC_LOG_DIR?.trim() || undefined;
 	return new DailyRotateFile({
-		dirname: ensureDir(dir ?? envDir ?? getLogsDir()),
+		dirname: ensureDir(dir ?? getEffectiveLogsDir()),
 		filename: "gjc.%DATE%.log",
 		datePattern: "YYYY-MM-DD",
 		maxSize: "10m",
