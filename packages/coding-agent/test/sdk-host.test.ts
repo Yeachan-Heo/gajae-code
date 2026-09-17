@@ -124,7 +124,9 @@ describe("SessionSdkHost", () => {
 		await host.start();
 		await host.registerWithBroker({
 			register: () => {},
-			heartbeat: input => activity.push(input.activity),
+			heartbeat: input => {
+				activity.push(input.activity);
+			},
 		});
 		await Bun.sleep(0);
 		await host.reportActivity("active", 100);

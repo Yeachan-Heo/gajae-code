@@ -790,7 +790,11 @@ test("observer daemon demand covers hello-before-replay, replay-after, and disco
 		await host.session.extensionRunner?.emit({ type: "agent_start" });
 		expect(sessionHostWorkInFlight()).toBe(true);
 		expect(sessionHostAttachedClients()).toBe(baseDemand + 1);
-		await host.session.extensionRunner?.emit({ type: "agent_end" });
+		await host.session.extensionRunner?.emit({
+			type: "agent_end",
+			stopReason: "completed",
+			messages: [{ role: "assistant", stopReason: "stop" }],
+		} as never);
 		await Bun.sleep(20);
 		expect(sessionHostWorkInFlight()).toBe(false);
 		expect(sessionHostAttachedClients()).toBe(baseDemand);
