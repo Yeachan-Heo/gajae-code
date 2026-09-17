@@ -39,6 +39,7 @@ const LIVE_OPENCODE_GO_MODEL_IDS = [
 	"grok-4.6",
 	"muse-spark-1.2-contributor",
 	"muse-spark-1.3-contributor",
+	"union-alpha",
 ] as const;
 
 const catalog = models["opencode-go"];

@@ -378,11 +378,13 @@ export const TIER_MAP_SKIP_LIST = {
 	},
 	"opencode-go/qwen3.8-flash": { rationale: "post-rebase catalog addition from dev; not yet curated" },
 	"opencode-go/qwen3.8-max": { rationale: "post-rebase catalog addition from dev; not yet curated" },
+	"opencode-go/union-alpha": { rationale: "stealth model; capability tier not yet independently reviewed" },
 	"opencode-zen/grok-4.6": { rationale: "post-rebase catalog addition from dev; not yet curated" },
 	"opencode-zen/hy3-free": { rationale: "post-rebase catalog addition from dev; not yet curated" },
 	"opencode-zen/kimi-k3": { rationale: "post-rebase catalog addition from dev; not yet curated" },
 	"opencode-zen/ling-3.0-tiny-free": { rationale: "post-rebase catalog addition from dev; not yet curated" },
 	"opencode-zen/nemotron-3.5-lightning-free": { rationale: "post-rebase catalog addition from dev; not yet curated" },
+	"opencode-zen/union-alpha": { rationale: "stealth model; capability tier not yet independently reviewed" },
 	"openrouter/anthropic/claude-fable-5:batch": { rationale: "post-rebase catalog addition from dev; not yet curated" },
 	"openrouter/anthropic/claude-haiku-4.5:batch": {
 		rationale: "post-rebase catalog addition from dev; not yet curated",
