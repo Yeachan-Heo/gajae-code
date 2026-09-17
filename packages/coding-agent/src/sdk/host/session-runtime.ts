@@ -26,7 +26,12 @@ import {
 import { isAuthenticated, kNoAuth } from "../../config/model-registry";
 import { resolveModelChainWithAuth, splitSelectorThinkingSuffix } from "../../config/model-resolver";
 import { type ModelSelectorValue, normalizeModelSelectorValue } from "../../config/model-selector-value";
-import { type Settings, validateSettingPatch } from "../../config/settings";
+import {
+	resolveSdkPromptDeadlineMs,
+	resolveSdkPromptMaxRuntimeMs,
+	type Settings,
+	validateSettingPatch,
+} from "../../config/settings";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "../../extensibility/extensions";
 import type { AgentEndEvent } from "../../extensibility/shared-events";
 import { normalizeGoal } from "../../goals/state";
@@ -5323,14 +5328,8 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		await steerReconciliation.hydrateFromStore();
 		const deadlineManager = new PromptDeadlineManager({
 			reconciliation,
-			getLeaseMs: () => {
-				const v = options.settings?.get("sdk.promptDeadlineMs" as never) as number | undefined;
-				return typeof v === "number" && Number.isFinite(v) ? v : 1_800_000;
-			},
-			getMaxMs: () => {
-				const v = options.settings?.get("sdk.promptMaxRuntimeMs" as never) as number | undefined;
-				return typeof v === "number" && Number.isFinite(v) ? v : 21_600_000;
-			},
+			getLeaseMs: () => resolveSdkPromptDeadlineMs(options.settings?.get("sdk.promptDeadlineMs" as never)),
+			getMaxMs: () => resolveSdkPromptMaxRuntimeMs(options.settings?.get("sdk.promptMaxRuntimeMs" as never)),
 			onExpired: (correlation, deadlineOutcome) => {
 				const owner = lifecycleOwnerHolder.state;
 				if (deadlineOutcome === undefined) {
