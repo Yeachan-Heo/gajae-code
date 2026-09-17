@@ -125,9 +125,16 @@ import {
 	assistantFailureCode,
 	failedPromptOutcome,
 	formatPromptFailureForLocalLog,
+	PROMPT_FAILURE_MESSAGE_DEADLINE,
 	sanitizePromptFailure,
 } from "../prompt-failure";
 import { PROMPT_CLIENT_REF_MAX_LENGTH, type SdkPromptTerminalOutcome } from "../prompt-status";
+import {
+	IDLE_TOOL_BOUNDARY_RESULT,
+	TOOL_CALL_BOUNDARY_GRACE_MS,
+	type ToolBoundaryWaitResult,
+	waitForToolCallBoundary,
+} from "../prompt-tool-boundary";
 import { OPERATIONS } from "../protocol/operation-registry";
 import {
 	lifecycleStartupCapabilityForApi,
@@ -273,6 +280,20 @@ type PromptTerminalExtra = {
 	diagnostic?: PromptTerminalDiagnostic;
 	diagnosticAlreadyLogged?: boolean;
 };
+
+/**
+ * Diagnostic reason for a deadline terminal. The pre-#5637 string is preserved
+ * byte-identically whenever the abort landed at a tool boundary (or with no tool
+ * running); only a force-termination with tool calls still executing gets its
+ * own reason, so the "we killed a tool mid-flight" case stops being
+ * indistinguishable from a clean expiry. The failure code, provenance, category
+ * and message are untouched either way — downstream retry classification must
+ * not move.
+ */
+function promptDeadlineDiagnosticReason(boundary: ToolBoundaryWaitResult): string {
+	if (boundary.outcome !== "forced") return PROMPT_FAILURE_MESSAGE_DEADLINE;
+	return `${PROMPT_FAILURE_MESSAGE_DEADLINE} Forced after ${TOOL_CALL_BOUNDARY_GRACE_MS}ms with ${boundary.pendingToolCallIds.length} tool call(s) still executing.`;
+}
 
 function formatPromptTerminalFailureReason(reason: unknown): string {
 	let rawReason: string;
@@ -4824,6 +4845,14 @@ export function createNotificationsExtension(
 			preflightAbort?: () => void | Promise<void>;
 			reconciliationKind: ReconciliationKind;
 			bufferedFrames: Array<PromptLifecycleFrame | Record<string, unknown>>;
+			/**
+			 * Dispatched tool calls currently executing for this correlation. A SET of
+			 * ids, not a counter: a duplicate or unmatched `tool_execution_end` must
+			 * not drive it negative and falsely report the prompt idle (#5637).
+			 */
+			runningToolCallIds: Set<string>;
+			/** Drained when `runningToolCallIds` becomes empty; one entry per waiting expiry attempt. */
+			toolIdleWaiters: Array<() => void>;
 		};
 		const promptSubmissions = new Map<string, PromptSubmission>();
 		/** Connections fenced by a fatal prompt closure; their later frames are refused. */
@@ -5046,33 +5075,77 @@ export function createNotificationsExtension(
 			if (submission.deadlineTimer) clearTimeout(submission.deadlineTimer);
 			submission.deadlineTimer = setTimeout(
 				() => {
-					const current = promptSubmissions.get(key);
-					// Identity fencing: a discarded, evicted or re-accepted submission is
-					// never terminalized by a predecessor's timer.
-					if (!current || current.deadlineLease !== lease) return;
-					// Progress delivered while this timer was pending renews the lease, so
-					// re-arm instead of terminalizing a demonstrably live prompt.
-					if (Date.now() < promptDeadlineAt(lease)) {
-						armPromptDeadline(key, correlation);
-						return;
-					}
-					// Register the expiry attempt BEFORE the awaited durable claim:
-					// progress arriving while the claim is in flight must supersede
-					// this attempt (see the post-claim fence in terminalizePrompt).
-					current.deadlineAttempt = { lease, generation: lease.generation };
-					void terminalizePrompt(
-						correlation,
-						{
-							kind: "failed",
-							code: "prompt_deadline_exceeded",
-							message: "Prompt deadline exceeded.",
-							provenance: "deadline",
-							phase: "submission",
-							category: "deadline",
-						},
-						{ fence: true },
-						{ diagnostic: { reason: "Prompt deadline exceeded." } },
-					);
+					void (async () => {
+						const current = promptSubmissions.get(key);
+						// Identity fencing: a discarded, evicted or re-accepted submission is
+						// never terminalized by a predecessor's timer.
+						if (!current || current.deadlineLease !== lease) return;
+						// Progress delivered while this timer was pending renews the lease, so
+						// re-arm instead of terminalizing a demonstrably live prompt.
+						if (Date.now() < promptDeadlineAt(lease)) {
+							armPromptDeadline(key, correlation);
+							return;
+						}
+						// Let an in-flight dispatched tool call reach its boundary first
+						// (#5637): terminal fencing aborts the run before it waits for
+						// settlement, so a tool aborted mid-write leaves a torn artifact.
+						// The wait sits BEFORE the attempt is registered on purpose — inside
+						// `terminalizePrompt` the very `tool_execution_end` that ends the
+						// wait would bump the lease generation and the post-claim fence
+						// would read this attempt as "superseded", so the deadline would
+						// effectively never fire while tools run. Here the existing
+						// renewal/re-arm logic handles that case unchanged. Nothing has been
+						// aborted yet, so this wait is composed with NO abort signal: an
+						// already-aborted one would make the path unreachable.
+						const boundary: ToolBoundaryWaitResult =
+							current.runningToolCallIds.size === 0
+								? IDLE_TOOL_BOUNDARY_RESULT
+								: await waitForToolCallBoundary({
+										pending: () => [...current.runningToolCallIds],
+										whenIdle: () => whenPromptToolsIdle(current),
+										graceMs: TOOL_CALL_BOUNDARY_GRACE_MS,
+									});
+						// Every pre-await fence is re-validated after the await, in order.
+						const after = promptSubmissions.get(key);
+						if (!after || after.deadlineLease !== lease) return;
+						if (after.terminal || after.phase !== "active") return;
+						if (Date.now() < promptDeadlineAt(lease)) {
+							// The boundary event renewed the lease: the prompt is demonstrably
+							// alive, so re-arm instead of terminalizing it.
+							armPromptDeadline(key, correlation);
+							return;
+						}
+						if (boundary.outcome === "forced") {
+							// Ids only: never tool arguments, output, paths or anything
+							// credential-shaped.
+							logger.warn("sdk_prompt_deadline_forced_mid_tool", {
+								commandId: correlation.commandId,
+								turnId: correlation.turnId,
+								graceMs: TOOL_CALL_BOUNDARY_GRACE_MS,
+								pendingToolCallIds: boundary.pendingToolCallIds,
+							});
+						}
+						// Register the expiry attempt BEFORE the awaited durable claim:
+						// progress arriving while the claim is in flight must supersede
+						// this attempt (see the post-claim fence in terminalizePrompt).
+						// The generation is read AFTER the boundary wait because the
+						// boundary event may have bumped it and this attempt is
+						// deliberately the current one.
+						after.deadlineAttempt = { lease, generation: lease.generation };
+						void terminalizePrompt(
+							correlation,
+							{
+								kind: "failed",
+								code: "prompt_deadline_exceeded",
+								message: "Prompt deadline exceeded.",
+								provenance: "deadline",
+								phase: "submission",
+								category: "deadline",
+							},
+							{ fence: true },
+							{ diagnostic: { reason: promptDeadlineDiagnosticReason(boundary) } },
+						);
+					})();
 				},
 				Math.max(0, promptDeadlineAt(lease) - Date.now()),
 			);
@@ -5083,6 +5156,7 @@ export function createNotificationsExtension(
 			const correlation = runtime.activePromptCorrelation;
 			// Renewal is attributed exactly like the correlated delivery below.
 			renewPromptDeadline(correlation, event);
+			noteToolDispatchBoundary(correlation, event);
 			const submission = promptSubmissions.get(promptSubmissionKey(correlation));
 			if (!submission || submission.abandoned) return;
 			const frame = {
@@ -5169,6 +5243,38 @@ export function createNotificationsExtension(
 			if (submission.deadlineLease.generation === generation) return;
 			armPromptDeadline(key, correlation);
 		};
+		/**
+		 * Track which dispatched tool calls are executing for the accepted prompt,
+		 * so an expired deadline can abort at a tool boundary instead of mid-write
+		 * (#5637). Attribution is deliberately identical to `renewPromptDeadline`'s
+		 * — same funnel, same allowlist, same pairing-only exclusion — because a
+		 * call that cannot prove progress cannot prove it is running either.
+		 * `tool_execution_update` proves neither start nor end, so it never changes
+		 * membership.
+		 */
+		const noteToolDispatchBoundary = (
+			correlation: { commandId: string; turnId: string },
+			event: { type: string; toolCallId?: unknown },
+		) => {
+			if (event.type !== "tool_execution_start" && event.type !== "tool_execution_end") return;
+			if (isNonDispatchedToolEvent(event) || typeof event.toolCallId !== "string") return;
+			const submission = promptSubmissions.get(promptSubmissionKey(correlation));
+			if (!submission) return;
+			if (event.type === "tool_execution_start") {
+				submission.runningToolCallIds.add(event.toolCallId);
+				return;
+			}
+			if (!submission.runningToolCallIds.delete(event.toolCallId)) return;
+			if (submission.runningToolCallIds.size > 0) return;
+			for (const resolve of submission.toolIdleWaiters.splice(0)) resolve();
+		};
+		/** Resolves once no dispatched tool call is executing for this submission. */
+		const whenPromptToolsIdle = (submission: PromptSubmission): Promise<void> => {
+			if (submission.runningToolCallIds.size === 0) return Promise.resolve();
+			const { promise, resolve } = Promise.withResolvers<void>();
+			submission.toolIdleWaiters.push(resolve);
+			return promise;
+		};
 		const flushPromptLifecycle = (key: string, submission: PromptSubmission) => {
 			for (const frame of submission.bufferedFrames.splice(0)) {
 				try {
@@ -5239,6 +5345,8 @@ export function createNotificationsExtension(
 				...(preflightAbort ? { preflightAbort } : {}),
 				reconciliationKind,
 				bufferedFrames: [],
+				runningToolCallIds: new Set<string>(),
+				toolIdleWaiters: [],
 			};
 			const key = promptSubmissionKey(correlation);
 			promptSubmissions.set(key, submission);

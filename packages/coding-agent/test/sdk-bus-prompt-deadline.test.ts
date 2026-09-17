@@ -4,9 +4,11 @@ import * as fsPromises from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { markNonDispatchedToolEvent, type RunSettlementProof } from "@gajae-code/agent-core";
+import { logger } from "@gajae-code/utils";
 import type { Settings } from "../src/config/settings";
 import type { ExtensionActions, ExtensionAPI } from "../src/extensibility/extensions/types";
 import { createNotificationsExtension } from "../src/sdk/bus";
+import { TOOL_CALL_BOUNDARY_GRACE_MS } from "../src/sdk/prompt-tool-boundary";
 
 /**
  * The notification/SDK bus host route and the SDK-only host route are mutually
@@ -438,8 +440,18 @@ test("sustained attributable progress still terminalizes at the maximum runtime"
 	const maxRuntimeMs = 1_800;
 	const session = await acceptPrompt("cap", 700, maxRuntimeMs);
 	const progress = setInterval(() => {
+		// Each call is started AND completed: an unmatched start means the tool is
+		// still executing, which the deadline now waits a bounded grace for (#5637).
+		// Both events are equally attributable, so the renewal under test is
+		// unchanged — this only stops the fixture from claiming a growing pile of
+		// tools is permanently mid-execution.
+		const toolCallId = `cap-tool-${Date.now()}`;
 		session.handlers.get("tool_execution_start")?.(
-			{ type: "tool_execution_start", toolCallId: `cap-tool-${Date.now()}`, toolName: "read", args: {} },
+			{ type: "tool_execution_start", toolCallId, toolName: "read", args: {} },
+			session.sessionContext,
+		);
+		session.handlers.get("tool_execution_end")?.(
+			{ type: "tool_execution_end", toolCallId, toolName: "read", isError: false },
 			session.sessionContext,
 		);
 	}, 250);
@@ -886,6 +898,142 @@ test("a deadline that aborts a genuinely dispatched tool still publishes its ter
 		expect(record?.pendingReceiptState).toBeUndefined();
 		expect((record?.error as { code?: string } | undefined)?.code).toBe("prompt_deadline_exceeded");
 	} finally {
+		await shutdown(session);
+	}
+}, 30_000);
+
+test("the deadline abort lands after the running tool call reaches its boundary", async () => {
+	// #5637 AC-1: terminal fencing aborts the run BEFORE it waits for settlement,
+	// so a tool aborted mid-write leaves a torn artifact behind. Expiry must now
+	// wait for the dispatched call's own `tool_execution_end` first.
+	//
+	// Driven as a MAXIMUM-RUNTIME expiry: the boundary event is attributable
+	// progress, so under an inactivity lease it would renew the prompt and the
+	// abort would (correctly) never happen. The acceptance-anchored hard cap
+	// cannot be renewed past, so the abort still deterministically lands — just
+	// at the boundary instead of through the tool.
+	const maxRuntimeMs = 800;
+	const order: string[] = [];
+	const session = await acceptPrompt("boundary-order", 60_000, maxRuntimeMs, {
+		abortPromptAndWait: async () => {
+			order.push("abort");
+			return { status: "settled", terminalScope: {} };
+		},
+	});
+	try {
+		// A dispatched call that will SUCCEED slowly: a failing tool routes through
+		// the error path and would make the ordering assertion vacuous.
+		session.handlers.get("tool_execution_start")?.(
+			{ type: "tool_execution_start", toolCallId: "boundary-tool", toolName: "read", args: {} },
+			session.sessionContext,
+		);
+
+		// Proving a NEGATIVE inside a window, which a poll cannot express: well past
+		// the hard cap the abort must NOT have fired, because the tool is still
+		// running. Without the boundary wait it would have fired at ~800 ms.
+		await Bun.sleep(2_500);
+		expect(order).toEqual([]);
+		expect(session.deadlineTerminals()).toHaveLength(0);
+
+		// The tool reaches its boundary, comfortably inside the grace.
+		order.push("tool_execution_end");
+		session.handlers.get("tool_execution_end")?.(
+			{ type: "tool_execution_end", toolCallId: "boundary-tool", toolName: "read", isError: false },
+			session.sessionContext,
+		);
+
+		await waitFor(() => order.includes("abort"), "deadline abort after the tool boundary");
+		expect(order).toEqual(["tool_execution_end", "abort"]);
+		// Classification is untouched: still the same terminal deadline failure.
+		await waitFor(() => session.deadlineTerminals().length > 0, "boundary deadline terminal");
+		expect(session.deadlineTerminals()).toHaveLength(1);
+		expect((session.deadlineTerminals()[0]?.error as { code?: string }).code).toBe("prompt_deadline_exceeded");
+		expect((session.deadlineTerminals()[0]?.error as { message?: string }).message).toBe("Prompt deadline exceeded.");
+	} finally {
+		await shutdown(session);
+	}
+}, 30_000);
+
+test("a tool still executing when the boundary grace expires is force-terminated and recorded", async () => {
+	// #5637 AC-2: the wait is bounded. A tool that never reaches its boundary must
+	// still be force-terminated exactly as before — and the fact that the run was
+	// killed WHILE a tool was executing must survive in a structured form rather
+	// than being indistinguishable from a clean expiry.
+	const maxRuntimeMs = 800;
+	const diagnostics: Array<Record<string, unknown>> = [];
+	const forcedWarnings: Array<Record<string, unknown>> = [];
+	const errorSpy = spyOn(logger, "error").mockImplementation(((event: unknown, fields?: unknown) => {
+		if (event === "sdk_prompt_terminal_failed") diagnostics.push((fields ?? {}) as Record<string, unknown>);
+	}) as never);
+	const realWarn = logger.warn.bind(logger);
+	const warnSpy = spyOn(logger, "warn").mockImplementation(((event: unknown, fields?: unknown) => {
+		if (event === "sdk_prompt_deadline_forced_mid_tool") {
+			forcedWarnings.push((fields ?? {}) as Record<string, unknown>);
+			return;
+		}
+		return realWarn(event as never, fields as never);
+	}) as never);
+	const session = await acceptPrompt("boundary-forced", 60_000, maxRuntimeMs);
+	try {
+		session.handlers.get("tool_execution_start")?.(
+			{ type: "tool_execution_start", toolCallId: "stuck-tool", toolName: "bash", args: {} },
+			session.sessionContext,
+		);
+
+		await waitFor(() => session.deadlineTerminals().length > 0, "forced deadline terminal", 25_000);
+		// Bounded, not disabled: the cap plus the grace, never longer.
+		expect(Date.now() - session.acceptedAt).toBeGreaterThan(maxRuntimeMs + TOOL_CALL_BOUNDARY_GRACE_MS - 200);
+		expect(session.deadlineTerminals()).toHaveLength(1);
+		// Classification is byte-identical to a clean expiry — downstream retry
+		// classifiers branch on these and must not move.
+		expect((session.deadlineTerminals()[0]?.error as { code?: string }).code).toBe("prompt_deadline_exceeded");
+		expect((session.deadlineTerminals()[0]?.error as { message?: string }).message).toBe("Prompt deadline exceeded.");
+
+		// The structured record of the forced mid-tool kill: ids only.
+		expect(forcedWarnings).toHaveLength(1);
+		expect(forcedWarnings[0]?.pendingToolCallIds).toEqual(["stuck-tool"]);
+		expect(forcedWarnings[0]?.graceMs).toBe(TOOL_CALL_BOUNDARY_GRACE_MS);
+		expect(forcedWarnings[0]?.commandId).toBe(session.correlation.commandId);
+		expect(forcedWarnings[0]?.turnId).toBe(session.correlation.turnId);
+		// ... and the distinct terminal diagnostic reason.
+		const reason = String(diagnostics.at(-1)?.reason ?? "");
+		expect(reason).toContain("Prompt deadline exceeded.");
+		expect(reason).toContain("still executing");
+	} finally {
+		warnSpy.mockRestore();
+		errorSpy.mockRestore();
+		await shutdown(session);
+	}
+}, 40_000);
+
+test("a tool that ends before expiry leaves the deadline path unchanged", async () => {
+	// Control: with nothing executing at expiry the boundary wait must not exist —
+	// no grace, no extra delay, and the original diagnostic reason verbatim. This
+	// passes both with and without the boundary wait, which is what makes the two
+	// cases above pin the behavioural delta rather than the new code's existence.
+	const maxRuntimeMs = 800;
+	const diagnostics: Array<Record<string, unknown>> = [];
+	const errorSpy = spyOn(logger, "error").mockImplementation(((event: unknown, fields?: unknown) => {
+		if (event === "sdk_prompt_terminal_failed") diagnostics.push((fields ?? {}) as Record<string, unknown>);
+	}) as never);
+	const session = await acceptPrompt("boundary-idle", 60_000, maxRuntimeMs);
+	try {
+		session.handlers.get("tool_execution_start")?.(
+			{ type: "tool_execution_start", toolCallId: "quick-tool", toolName: "read", args: {} },
+			session.sessionContext,
+		);
+		session.handlers.get("tool_execution_end")?.(
+			{ type: "tool_execution_end", toolCallId: "quick-tool", toolName: "read", isError: false },
+			session.sessionContext,
+		);
+
+		await waitFor(() => session.deadlineTerminals().length > 0, "idle-path deadline terminal");
+		expect(Date.now() - session.acceptedAt).toBeLessThan(maxRuntimeMs + 900);
+		expect(session.deadlineTerminals()).toHaveLength(1);
+		expect((session.deadlineTerminals()[0]?.error as { code?: string }).code).toBe("prompt_deadline_exceeded");
+		expect(String(diagnostics.at(-1)?.reason ?? "")).toBe("Prompt deadline exceeded.");
+	} finally {
+		errorSpy.mockRestore();
 		await shutdown(session);
 	}
 }, 30_000);
