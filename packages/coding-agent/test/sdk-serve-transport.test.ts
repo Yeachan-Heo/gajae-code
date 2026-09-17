@@ -4,7 +4,7 @@ import * as net from "node:net";
 import * as os from "node:os";
 import path from "node:path";
 import { PassThrough, Writable } from "node:stream";
-import { getAgentDir, setAgentDir } from "@gajae-code/utils";
+import { getAgentDir, resetAgentDirFromEnvironment, setAgentDir } from "@gajae-code/utils";
 import { CliParseError, renderCommandHelp } from "@gajae-code/utils/cli";
 import type { ServerWebSocket } from "bun";
 import Sdk, { parseSdkInternalArgv } from "../src/commands/sdk.js";
@@ -789,11 +789,15 @@ describe("SDK serve CLI and discovery", () => {
 			sha256: "a".repeat(64),
 		};
 		const locator = { cwd, worktreeRoot: null, stateRoot };
-		const calls: { operation: string; input: Record<string, unknown> }[] = [];
+		const calls: {
+			operation: string;
+			input: Record<string, unknown>;
+			options?: { idempotencyKey?: string };
+		}[] = [];
 		let resumed = false;
 		const broker = {
-			global: async (operation: string, input: Record<string, unknown>) => {
-				calls.push({ operation, input });
+			global: async (operation: string, input: Record<string, unknown>, options?: { idempotencyKey?: string }) => {
+				calls.push({ operation, input, options });
 				if (operation === "session.list") {
 					if (input.cwd === cwd)
 						return {
@@ -831,7 +835,159 @@ describe("SDK serve CLI and discovery", () => {
 			sessionPath: `${cwd}/session.jsonl`,
 			sessionIdentity: identity,
 		});
+		expect(calls[2]?.options?.idempotencyKey).toEqual(expect.any(String));
+		expect(calls[2]?.options?.idempotencyKey?.length).toBeLessThanOrEqual(128);
 		expect(calls.filter(call => call.operation === "session.resume")).toHaveLength(1);
+	});
+
+	test("wires recovery through session.get_endpoint and relay startup", async () => {
+		const agentDir = await tempDir();
+		const socketPath = path.join(agentDir, "serve.sock");
+		const sessionId = "dead-session";
+		const cwd = "/workspace";
+		const stateRoot = `${cwd}/.gjc/state`;
+		const identity = {
+			dev: "1",
+			ino: "2",
+			size: 3,
+			mtimeMs: 4,
+			mtimeNs: "5",
+			sha256: "a".repeat(64),
+		};
+		const locator = { cwd, worktreeRoot: null, stateRoot };
+		const endpoint = upstream();
+		const brokerToken = "broker-token";
+		const brokerRequests: Record<string, unknown>[] = [];
+		let resumed = false;
+		const incarnation = brokerProcessIncarnation(process.pid);
+		if (!incarnation) throw new Error("test broker process incarnation unavailable");
+		const brokerServer = Bun.serve<unknown>({
+			port: 0,
+			fetch(req, server) {
+				if (new URL(req.url).searchParams.get("token") !== brokerToken)
+					return new Response("unauthorized", { status: 401 });
+				if (server.upgrade(req, { data: {} })) return;
+				return new Response("upgrade required", { status: 426 });
+			},
+			websocket: {
+				open(ws) {
+					ws.send(JSON.stringify({ type: "broker_hello", protocolVersion: 3 }));
+				},
+				message(ws, message) {
+					const frame = JSON.parse(String(message)) as Record<string, unknown>;
+					brokerRequests.push(frame);
+					const id = typeof frame.id === "string" ? frame.id : "";
+					const respond = (body: Record<string, unknown>) =>
+						ws.send(JSON.stringify({ type: "broker_response", id, ...body }));
+					if (frame.operation === "session.list") {
+						respond({
+							ok: true,
+							result: {
+								indexSeq: 1,
+								sessions: [{ sessionId, live: resumed, ambiguous: false, locator }],
+								...(resumed ? {} : { savedSession: { id: sessionId, path: `${cwd}/session.jsonl`, identity } }),
+								warnings: [],
+							},
+						});
+						return;
+					}
+					if (frame.operation === "session.resume") {
+						if (typeof frame.idempotencyKey !== "string" || frame.idempotencyKey.length === 0) {
+							respond({
+								ok: false,
+								error: {
+									code: "invalid_input",
+									message: "idempotencyKey is required for lifecycle operations",
+								},
+							});
+							return;
+						}
+						resumed = true;
+						respond({ ok: true, result: { sessionId } });
+						return;
+					}
+					if (frame.operation === "session.get_endpoint") {
+						respond({ ok: true, result: { url: endpoint.url, token } });
+						return;
+					}
+					respond({ ok: false, error: { code: "unexpected_operation", message: String(frame.operation) } });
+				},
+			},
+		});
+		const now = Date.now();
+		await fs.mkdir(path.join(agentDir, "sdk"), { recursive: true });
+		await fs.writeFile(
+			path.join(agentDir, "sdk", "broker.json"),
+			JSON.stringify({
+				version: 1,
+				protocolVersion: 3,
+				packageGeneration: "test",
+				ownerId: "serve-test",
+				pid: process.pid,
+				incarnation,
+				host: "127.0.0.1",
+				port: brokerServer.port,
+				url: `ws://127.0.0.1:${brokerServer.port}`,
+				token: brokerToken,
+				startedAt: now,
+				heartbeatAt: now,
+			}),
+		);
+
+		const previousAgentDir = process.env.GJC_CODING_AGENT_DIR;
+		const previousPiAgentDir = process.env.PI_CODING_AGENT_DIR;
+		setAgentDir(agentDir);
+		const originalProcessOnce = process.once;
+		let stop: (() => void) | undefined;
+		process.once = ((event, listener) => {
+			if (event === "SIGTERM") {
+				stop = listener as () => void;
+				return process;
+			}
+			return originalProcessOnce.call(process, event, listener);
+		}) as typeof process.once;
+		let serving: Promise<void> | undefined;
+		let client: net.Socket | undefined;
+		try {
+			serving = runSdkServe(["--socket", socketPath, "--session", sessionId]);
+			for (let attempt = 0; attempt < 600 && client === undefined; attempt++) {
+				try {
+					client = await socketConnect(socketPath);
+				} catch {
+					await Bun.sleep(5);
+				}
+			}
+			if (!client) throw new Error("Timed out waiting for sdk serve socket");
+			const frame = '{"type":"probe","value":1}';
+			client.write(`gjc-sdk-transport/1 token=${token}\n${frame}\n`);
+			expect(await waitFor(() => endpoint.connections[0]?.messages[0], "relay startup")).toBe(frame);
+			await closeSocket(client);
+			stop = await waitFor(() => stop, "serve shutdown callback");
+			stop();
+			await serving;
+
+			expect(brokerRequests.map(request => request.operation)).toEqual([
+				"session.list",
+				"session.resume",
+				"session.list",
+				"session.get_endpoint",
+			]);
+			const recoveryRequest = brokerRequests.find(request => request.operation === "session.resume");
+			expect(recoveryRequest?.idempotencyKey).toEqual(expect.any(String));
+			expect((recoveryRequest?.idempotencyKey as string).length).toBeLessThanOrEqual(128);
+		} finally {
+			stop?.();
+			if (client) client.destroy();
+			await serving?.catch(() => undefined);
+			process.once = originalProcessOnce;
+			brokerServer.stop(true);
+			endpoint.stop();
+			if (previousAgentDir === undefined) delete process.env.GJC_CODING_AGENT_DIR;
+			else process.env.GJC_CODING_AGENT_DIR = previousAgentDir;
+			if (previousPiAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+			else process.env.PI_CODING_AGENT_DIR = previousPiAgentDir;
+			resetAgentDirFromEnvironment();
+		}
 	});
 
 	test("does not retry a recovery when the resumed session remains dead", async () => {

@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { getAgentDir } from "@gajae-code/utils";
 import { CliParseError } from "@gajae-code/utils/cli";
 import type { BrokerDiscovery } from "../broker/discovery";
@@ -281,13 +282,17 @@ async function recoverBrokerSession(broker: SdkClient, row: BrokerSessionRow, se
 					)?.savedSession;
 	if (locator === undefined || authority?.id !== sessionId) throw endpointStaleError(sessionId);
 	brokerResult(
-		await broker.global("session.resume", {
-			sessionId,
-			cwd: locator.cwd,
-			stateRoot: locator.stateRoot,
-			sessionPath: authority.path,
-			sessionIdentity: authority.identity,
-		}),
+		await broker.global(
+			"session.resume",
+			{
+				sessionId,
+				cwd: locator.cwd,
+				stateRoot: locator.stateRoot,
+				sessionPath: authority.path,
+				sessionIdentity: authority.identity,
+			},
+			{ idempotencyKey: randomUUID() },
+		),
 	);
 }
 
