@@ -37,40 +37,36 @@ async function countMarkerRecords(home: string): Promise<number> {
 	return count;
 }
 
-test(
-	"a test process does not write watchdog errors into the operator log sink",
-	async () => {
-		const home = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-log-sink-guard-"));
+test("a test process does not write watchdog errors into the operator log sink", async () => {
+	const home = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-log-sink-guard-"));
 
-		// Drop the inherited pin so the child's own preload has to isolate itself;
-		// inheriting it would make this pass without exercising the guard at all.
-		const env = { ...process.env, HOME: home };
-		delete env.GJC_LOG_DIR;
+	// Drop the inherited pin so the child's own preload has to isolate itself;
+	// inheriting it would make this pass without exercising the guard at all.
+	const env = { ...process.env, HOME: home };
+	delete env.GJC_LOG_DIR;
 
-		const proc = Bun.spawn([process.execPath, "test", WATCHDOG_TEST, "-t", WATCHDOG_CASE], {
-			cwd: REPO_ROOT,
-			env,
-			stdout: "pipe",
-			stderr: "pipe",
-		});
-		const [stdout, stderr, exitCode] = await Promise.all([
-			new Response(proc.stdout).text(),
-			new Response(proc.stderr).text(),
-			proc.exited,
-		]);
-		expect(exitCode, `nested bun test failed:\n${stdout}\n${stderr}`).toBe(0);
+	const proc = Bun.spawn([process.execPath, "test", WATCHDOG_TEST, "-t", WATCHDOG_CASE], {
+		cwd: REPO_ROOT,
+		env,
+		stdout: "pipe",
+		stderr: "pipe",
+	});
+	const [stdout, stderr, exitCode] = await Promise.all([
+		new Response(proc.stdout).text(),
+		new Response(proc.stderr).text(),
+		proc.exited,
+	]);
+	expect(exitCode, `nested bun test failed:\n${stdout}\n${stderr}`).toBe(0);
 
-		// Poll before asserting zero: winston's transport is async, so an instant
-		// read can pass vacuously on a sink that is about to be written.
-		const deadline = Date.now() + 5000;
-		let count = 0;
-		while (Date.now() < deadline) {
-			count = await countMarkerRecords(home);
-			if (count > 0) break;
-			await new Promise(resolve => setTimeout(resolve, 100));
-		}
+	// Poll before asserting zero: winston's transport is async, so an instant
+	// read can pass vacuously on a sink that is about to be written.
+	const deadline = Date.now() + 5000;
+	let count = 0;
+	while (Date.now() < deadline) {
+		count = await countMarkerRecords(home);
+		if (count > 0) break;
+		await new Promise(resolve => setTimeout(resolve, 100));
+	}
 
-		expect(count).toBe(0);
-	},
-	180_000,
-);
+	expect(count).toBe(0);
+}, 180_000);
