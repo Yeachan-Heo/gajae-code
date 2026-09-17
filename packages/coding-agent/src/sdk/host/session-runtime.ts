@@ -357,6 +357,17 @@ export interface SdkOnlyTerminalAbortSeams {
 			terminal?: { scope: "turn" | "owned"; expectedEpoch?: number; steeringSnapshotToken?: number };
 		},
 	) => Promise<{ status: string; terminalScope?: unknown }>;
+	/**
+	 * Live, SYNCHRONOUS view of the dispatched tool calls the run resource
+	 * ledger holds for an execution handle (#5637). Strictly read-only: it
+	 * never claims, reserves, seals or quarantines ledger state. Declared here
+	 * so both hosts expose ONE seam contract — the bus route consumes it for its
+	 * deadline tool-boundary wait, and this route threads it so a future boundary
+	 * wait or deadline abort reads the ledger rather than silently falling back
+	 * to the event-derived set. Optional so an older host that does not thread it
+	 * degrades to that fallback instead of failing to construct.
+	 */
+	pendingToolExecutions?: (handle: string) => readonly string[];
 	/** Test override for the maximum durable terminal reservation rows. */
 	maxDurableTerminalReservationsForTests?: number;
 }

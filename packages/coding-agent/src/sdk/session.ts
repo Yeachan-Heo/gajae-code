@@ -3589,6 +3589,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 									if (!session) throw new Error("Terminal abort session is not initialized.");
 									return session.abortPromptAndWait(handle, seamOptions);
 								},
+								pendingToolExecutions: handle => {
+									if (!session) throw new Error("Terminal abort session is not initialized.");
+									return session.pendingToolExecutions(handle);
+								},
 							},
 						});
 					}
