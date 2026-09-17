@@ -74,11 +74,16 @@ function getRuntimeHome(): string {
 }
 
 const DEFAULT_LIMIT = 20;
-const MAX_LIMIT = 50;
+/**
+ * Upper bound every caller's `limit` clamps to. Exported so `gjc skills discover`
+ * can default a human to the widest page the library will serve instead of the
+ * model-context-sized `DEFAULT_LIMIT`.
+ */
+export const SKILL_DISCOVERY_MAX_LIMIT = 50;
 const MAX_DIAGNOSTICS = 10;
 function normalizeLimit(limit: number | undefined): number {
 	if (limit === undefined || !Number.isFinite(limit)) return DEFAULT_LIMIT;
-	return Math.max(1, Math.min(MAX_LIMIT, Math.trunc(limit)));
+	return Math.max(1, Math.min(SKILL_DISCOVERY_MAX_LIMIT, Math.trunc(limit)));
 }
 
 interface ProjectScanDir {
@@ -558,8 +563,20 @@ export async function discoverRuntimeSkills(
 		seenNames,
 		diagnostics,
 	);
+	const limit = normalizeLimit(options.limit);
+	if (candidates.length > limit) {
+		// Appended directly instead of through pushDiagnostic: this is the only
+		// message that explains why a skill the caller can see on disk is absent
+		// from the result, and the reported case (several stale
+		// skills.customDirectories entries, one "does not exist" message each)
+		// fills the MAX_DIAGNOSTICS budget before the slice is ever reached. A
+		// dropped truncation notice makes the truncation invisible again.
+		diagnostics.push(
+			`showing ${limit} of ${candidates.length} matching skills; raise the limit (max ${SKILL_DISCOVERY_MAX_LIMIT}) or narrow the query to see the rest`,
+		);
+	}
 	return {
-		candidates: candidates.slice(0, normalizeLimit(options.limit)),
+		candidates: candidates.slice(0, limit),
 		scanned,
 		diagnostics: { messages: diagnostics },
 	};

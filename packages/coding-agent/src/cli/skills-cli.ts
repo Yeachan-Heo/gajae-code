@@ -8,7 +8,11 @@ import {
 	type EmbeddedDefaultGjcSkill,
 	getEmbeddedDefaultGjcSkills,
 } from "../defaults/gjc-defaults";
-import { discoverRuntimeSkills, type RuntimeSkillDiscoveryCandidate } from "../extensibility/runtime-skill-discovery";
+import {
+	discoverRuntimeSkills,
+	type RuntimeSkillDiscoveryCandidate,
+	SKILL_DISCOVERY_MAX_LIMIT,
+} from "../extensibility/runtime-skill-discovery";
 
 export type SkillsAction = "list" | "read" | "discover";
 
@@ -18,6 +22,9 @@ export interface SkillsCommandArgs {
 	flags?: {
 		json?: boolean;
 		source?: "all" | "project" | "user";
+		/** Max discover results; clamped to [1, SKILL_DISCOVERY_MAX_LIMIT] by the library. */
+		limit?: number;
+		query?: string;
 	};
 }
 
@@ -74,13 +81,21 @@ export async function runSkillsCommand(cmd: SkillsCommandArgs): Promise<void> {
 			const result = await discoverRuntimeSkills({
 				cwd: process.cwd(),
 				source,
+				query: cmd.flags?.query,
+				// A human paging the catalog defaults to the widest page the library
+				// serves; the library default stays sized for the agent tool's context.
+				limit: cmd.flags?.limit ?? SKILL_DISCOVERY_MAX_LIMIT,
 				policy: {
 					...settings.getGroup("skills"),
 					disabledExtensions: settings.get("disabledExtensions"),
 				},
 			});
 			if (cmd.flags?.json) {
-				writeJson({ candidates: result.candidates, diagnostics: result.diagnostics.messages });
+				writeJson({
+					candidates: result.candidates,
+					scanned: result.scanned,
+					diagnostics: result.diagnostics.messages,
+				});
 				return;
 			}
 			for (const candidate of result.candidates) {
