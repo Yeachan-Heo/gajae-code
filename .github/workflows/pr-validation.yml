@@ -42,6 +42,9 @@ jobs:
       contents: read
       pull-requests: read
       checks: write
+    outputs:
+      # Fail closed: absent means the validator never reported an authorized merge.
+      merge_authorized: ${{ steps.validate.outputs.merge_authorized }}
     steps:
       - name: Resolve PR head/base from the event or the comment's PR
         id: pr
@@ -111,27 +114,44 @@ jobs:
           unset BUN_OPTIONS
           trusted_root="$PWD/trusted-base"
           repo_root="$PWD/pr-head"
+          # This check reports CONTRACT validity only; the merge-approval verdict is
+          # reported by the separate "Merge approval" job from the output captured here.
+          # Every path writes merge_authorized, and only an explicit authorized line from
+          # the trusted validator can set it to true.
           if [[ ! -f "$trusted_root/scripts/verify-pr-verdict.ts" ]]; then
             echo "::notice::immutable base ${{ steps.pr.outputs.base_sha }} predates the trusted validator; Dev CI PR contract bootstrap remains authoritative"
+            echo "merge_authorized=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           empty_bunfig="$RUNNER_TEMP/gjc-pr-contract-empty-bunfig.toml"
           printf '# trusted empty Bun configuration\n' > "$empty_bunfig"
+          log="$RUNNER_TEMP/gjc-pr-contract.log"
           cd "$trusted_root"
+          status=0
           bun --no-env-file --config="$empty_bunfig" "$trusted_root/scripts/verify-pr-verdict.ts" \
-            --event "$GITHUB_EVENT_PATH" --repo "$repo_root" --trusted-root "$trusted_root"
-      - name: Publish head-bound check result for comment-triggered validation
+            --event "$GITHUB_EVENT_PATH" --repo "$repo_root" --trusted-root "$trusted_root" \
+            --gate contract 2>&1 | tee "$log" || status=$?
+          authorized=false
+          if grep -qxF 'gjc-merge-authorized=true' "$log"; then
+            authorized=true
+          fi
+          echo "merge_authorized=$authorized" >> "$GITHUB_OUTPUT"
+          exit "$status"
+      - name: Publish head-bound check results for comment-triggered validation
         # issue_comment runs are associated with the default-branch SHA, not the PR
         # head. Create/update a CHECK RUN on the resolved exact head with the exact
-        # name of the required context ("Validate exact-head PR contract" in this
-        # "PR contract" workflow), so comment events — including deletion of the
-        # backing self-review record — publish to the SAME required authority the
-        # pull_request_target runs report. A parallel status context could never
-        # revoke a green required check; this can.
+        # name of each required context ("Validate exact-head PR contract" and
+        # "Merge approval" in this "PR contract" workflow), so comment events —
+        # including deletion of the backing self-review record — publish to the SAME
+        # required authorities the pull_request_target runs report. A parallel status
+        # context could never revoke a green required check; this can. BOTH names must
+        # be published: revoking a self-review comment while only republishing the
+        # contract name would leave a stale green "Merge approval" behind it.
         # Branch-protection rollout contract: once this lands, dev branch
-        # protection should require "PR contract / Validate exact-head PR contract"
-        # (strict); until protection is enabled, the Dev CI PR contract bootstrap
-        # job plus the verdict discipline remain the enforced path.
+        # protection should require BOTH "PR contract / Validate exact-head PR contract"
+        # and "PR contract / Merge approval" (strict); requiring only the contract name
+        # would make an unapproved PR mergeable. Until protection is enabled, the Dev CI
+        # PR contract bootstrap jobs plus the verdict discipline remain the enforced path.
         if: ${{ always() && github.event_name == 'issue_comment' && steps.pr.outputs.skip != 'true' }}
         env:
           GITHUB_TOKEN: ${{ github.token }}
@@ -143,15 +163,25 @@ jobs:
           trusted_root="$PWD/trusted-base"
           conclusion="failure"
           summary="PR contract re-evaluated from a comment event"
+          approval_conclusion="failure"
+          approval_summary="merge authorization re-evaluated from a comment event"
           if [[ "${{ steps.validate.outcome }}" == "success" ]]; then
             conclusion="success"
             summary="PR contract valid at exact head (comment-triggered re-validation)"
+            if [[ "${{ steps.validate.outputs.merge_authorized }}" == "true" ]]; then
+              approval_conclusion="success"
+              approval_summary="merge authorized at exact head (comment-triggered re-validation)"
+            else
+              approval_summary="merge not authorized at exact head; the PR contract itself is valid"
+            fi
             # A trusted base that predates the self-review-aware validator cannot
-            # authorize anything; never publish success for that case.
+            # authorize anything; never publish success for that case, under EITHER name.
             if [[ -f "$trusted_root/scripts/verify-pr-verdict.ts" ]] \
               && ! grep -q "gajae.pr-self-review.v1" "$trusted_root/scripts/verify-pr-verdict.ts"; then
               conclusion="failure"
               summary="trusted base ${base_sha:0:10} predates self-review validation; bootstrap remains authoritative"
+              approval_conclusion="failure"
+              approval_summary="$summary"
             fi
           fi
           details_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
@@ -164,3 +194,48 @@ jobs:
             -f 'output[title]="PR contract (comment-triggered exact-head re-validation)"' \
             -f "output[summary]=$summary" \
             -f "details_url=$details_url"
+          # The approval authority must be republished too: revoking a self-review
+          # comment while only refreshing the contract name would leave a stale green
+          # "Merge approval" check behind it.
+          gh api --method POST "repos/${{ github.repository }}/check-runs" \
+            -H "Accept: application/vnd.github+json" \
+            -f name="Merge approval" \
+            -f head_sha="$head_sha" \
+            -f status="completed" \
+            -f conclusion="$approval_conclusion" \
+            -f 'output[title]="Merge approval (comment-triggered exact-head re-validation)"' \
+            -f "output[summary]=$approval_summary" \
+            -f "details_url=$details_url"
+
+  merge-approval:
+    name: Merge approval
+    needs: [validate]
+    # always() is load-bearing. GitHub reports a SKIPPED job as Success for required
+    # checks (https://docs.github.com/en/pull-requests/reference/status-checks), so a
+    # plain `needs:` would skip this job when the contract job fails and publish a GREEN
+    # merge-approval check for a red contract — the precise hole this must not open.
+    # The job therefore always runs and decides from the upstream result plus its output.
+    if: ${{ always() }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    # Reads only the upstream job's result and output: no checkout, no bun, no token.
+    permissions: {}
+    steps:
+      - name: Require an authorized merge verdict for this exact head
+        env:
+          CONTRACT_RESULT: ${{ needs.validate.result }}
+          MERGE_AUTHORIZED: ${{ needs.validate.outputs.merge_authorized }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "contract job result: ${CONTRACT_RESULT:-unknown}; merge authorized: ${MERGE_AUTHORIZED:-false}"
+          # Fail closed on anything that is not an explicit success + explicit true.
+          if [[ "${CONTRACT_RESULT:-}" != "success" ]]; then
+            echo "::error::PR contract validation did not succeed (${CONTRACT_RESULT:-unknown}); no merge authorization can be reported."
+            exit 1
+          fi
+          if [[ "${MERGE_AUTHORIZED:-}" != "true" ]]; then
+            echo "::error::This exact head is not authorized to merge: the verdict is not merge-approved (or merge-self-approved) backed by the review evidence the contract requires. The PR contract itself is valid — only the approval is pending."
+            exit 1
+          fi
+          echo "Merge authorized for this exact head."

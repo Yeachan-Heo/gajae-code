@@ -126,7 +126,10 @@ describe("dev-ci Telegram daemon generation guard topology", () => {
 				if (enabled) scheduled.push(name);
 				needs[name] = { result: enabled ? "success" : "skipped", outputs: enabled ? { relevant: "true", has_native: "true", has_tasks: "true" } : {} };
 			}
-			if (scenario.skip) expect({ scenario: scenario.name, scheduled }).toEqual({ scenario: scenario.name, scheduled: ["pr-contract-bootstrap"] });
+			// The contract lane is both bootstrap jobs: the verdict line lives in the body,
+			// so a metadata edit must re-evaluate the contract AND the merge approval it
+			// reports. Neither is code evidence.
+			if (scenario.skip) expect({ scenario: scenario.name, scheduled }).toEqual({ scenario: scenario.name, scheduled: ["pr-contract-bootstrap", "merge-approval-bootstrap"] });
 			else if (headOnlyDispatch) expect(scheduled).toEqual(["virtual-integration"]);
 			else {
 				expect(scheduled).toContain("affected-plan");

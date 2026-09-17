@@ -6,6 +6,7 @@ import {
 	authenticatedApproval,
 	canonicalDiffSha256,
 	fetchIndependentReviewerEvidence,
+	gateExitCode,
 	parseBodyRisk,
 	parseGhPrCreate,
 	parsePrVerdict,
@@ -167,7 +168,10 @@ describe("review-event mutable PR body refresh", () => {
 		const body = verdict ? approved.replace("merge-approved", verdict) : verdict;
 		const resolved = await resolvePullRequestEvent(event, "pull_request_review", "token", async () => Response.json({ ...event.pull_request, body }));
 		expect(resolved.pull_request?.body).toBe(body);
-		expect(validatePrContract(validInput({ body: resolved.pull_request?.body ?? "" })).ok).toBe(false);
+		// A revoked or empty body can never merge. A blocking verdict is now a withheld
+		// authorization rather than a contract defect, so the invariant is stated on
+		// mergeAuthorized, which covers both halves.
+		expect(validatePrContract(validInput({ body: resolved.pull_request?.body ?? "" })).mergeAuthorized).toBe(false);
 	});
 
 	test("rejects every live authority drift rather than replacing the captured target", async () => {
@@ -272,7 +276,11 @@ describe("validatePrContract", () => {
 	test("local preflight permits blocking verdicts but server merge gate rejects them", () => {
 		const body = approved.replace("merge-approved", "needs-human");
 		expect(validatePrContract(validInput({ body, requireMergeApproved: false })).ok).toBe(true);
-		expect(validatePrContract(validInput({ body, requireMergeApproved: true })).diagnostics[0]).toContain("intentionally blocks merge");
+		// The server still rejects it; the rejection is reported as a withheld merge
+		// authorization instead of a contract defect.
+		const server = validatePrContract(validInput({ body, requireMergeApproved: true }));
+		expect(server.mergeAuthorized).toBe(false);
+		expect(server.authorizationDiagnostics[0]).toContain("intentionally blocks merge");
 	});
 
 	test("server merge approval requires an authenticated exact-head GitHub review", () => {
@@ -284,6 +292,80 @@ describe("validatePrContract", () => {
 		const result = validatePrContract(validInput({ baseSha: "HEAD", headSha: "head", computedDiffSha256: "sha" }));
 		expect(result.diagnostics.join("\n")).toContain("40-hex");
 		expect(result.diagnostics.join("\n")).toContain("lowercase SHA-256");
+	});
+});
+
+/**
+ * The merge-approval gate is reported on its own channel so one red check stops meaning both
+ * "your PR is malformed" and "your PR is waiting for a reviewer". The authorization predicate
+ * itself is unchanged: only which result field carries it moved.
+ */
+describe("merge authorization reported separately from contract validity", () => {
+	const blocked = approved.replace("merge-approved", "needs-human");
+
+	test("needs-human is a valid contract with the merge authorization withheld", () => {
+		const result = validatePrContract(validInput({ body: `## GJC verdict\n\n${blocked}\n` }));
+		expect(result.ok).toBe(true);
+		expect(result.diagnostics).toEqual([]);
+		expect(result.mergeAuthorized).toBe(false);
+		expect(result.authorizationDiagnostics).toHaveLength(1);
+		expect(result.authorizationDiagnostics[0]).toContain("Verdict needs-human intentionally blocks merge.");
+	});
+
+	test("an authenticated exact-head merge-approved authorizes the merge", () => {
+		const result = validatePrContract(validInput());
+		expect(result.ok).toBe(true);
+		expect(result.mergeAuthorized).toBe(true);
+		expect(result.authorizationDiagnostics).toEqual([]);
+	});
+
+	// Forgery and false claims are NOT "waiting for a human": each stays a contract defect
+	// on the contract check, and each still withholds the merge authorization.
+	test.each([
+		["merge-approved claimed with reviewer-id == author", { body: `## GJC verdict\n\n${approved.replace("reviewer-id:review-agent", "reviewer-id:author")}\n`, authenticatedReviewerLogin: "author" }, "cannot be self-approved"],
+		["merge-approved without an authenticated review", { authenticatedReviewerLogin: undefined }, "not backed by an authenticated"],
+		["merge-approved approved on another head", { authenticatedReviewHeadSha: "d".repeat(40) }, "must target exact PR head"],
+		["stale verdict digest", { computedDiffSha256: "d".repeat(64) }, "is stale"],
+		["base not an ancestor of head", { baseIsAncestor: false }, "does not contain immutable event base"],
+		["failed repository fast gate", { fastGatePassed: false }, "Repository fast gate failed"],
+	])("%s stays a contract failure", (_name, overrides, message) => {
+		const result = validatePrContract(validInput(overrides));
+		expect(result.ok).toBe(false);
+		expect(result.diagnostics.join("\n")).toContain(message);
+		expect(result.authorizationDiagnostics).toEqual([]);
+		// Invariant: a malformed contract can never report an authorized merge.
+		expect(result.mergeAuthorized).toBe(false);
+	});
+
+	test("an invalid contract never authorizes a merge, whatever the verdict says", () => {
+		for (const body of [`## GJC verdict\n\n${approved}\n`, `## GJC verdict\n\n${blocked}\n`, "no verdict at all"]) {
+			for (const overrides of [{}, { fastGatePassed: false }, { baseIsAncestor: false }, { computedDiffSha256: "d".repeat(64) }]) {
+				const result = validatePrContract(validInput({ body, ...overrides }));
+				if (!result.ok) expect(result.mergeAuthorized).toBe(false);
+			}
+		}
+	});
+
+	// Back-compat: every existing caller (--push-preflight, --preflight-command, the local
+	// pre-push hook) passes no --gate and must keep the single combined exit code.
+	test.each([
+		["all", { ok: true, mergeAuthorized: false }, 1],
+		["all", { ok: true, mergeAuthorized: true }, 0],
+		["all", { ok: false, mergeAuthorized: false }, 1],
+		["contract", { ok: true, mergeAuthorized: false }, 0],
+		["contract", { ok: false, mergeAuthorized: false }, 1],
+		["approval", { ok: true, mergeAuthorized: false }, 1],
+		["approval", { ok: true, mergeAuthorized: true }, 0],
+		["approval", { ok: false, mergeAuthorized: false }, 1],
+	] as const)("--gate %s exits %p for %p", (gate, result, code) => {
+		expect(gateExitCode(gate, result)).toBe(code);
+	});
+
+	test("the default gate still fails a needs-human PR exactly as before the split", () => {
+		const result = validatePrContract(validInput({ body: `## GJC verdict\n\n${blocked}\n` }));
+		expect(gateExitCode("all", result)).toBe(1);
+		expect(gateExitCode("contract", result)).toBe(0);
+		expect(gateExitCode("approval", result)).toBe(1);
 	});
 });
 
@@ -1350,6 +1432,39 @@ test("dev CI carries immutable inline first-landing bootstrap validation", async
 	expect(workflow).toContain("Self-review is stale: base/head/digest do not match this exact PR");
 	expect(workflow).toContain("not the repository owner");
 	expect(workflow).toContain("does not match the PR body risk classification");
+});
+
+test("the merge-approval gate is a separate, fail-closed check in both workflows", async () => {
+	const prContract = await Bun.file(new URL("../.github/workflows/pr-validation.yml", import.meta.url)).text();
+	const devCi = await Bun.file(new URL("../.github/workflows/dev-ci.yml", import.meta.url)).text();
+	// The contract check keeps its required context name and now reports contract
+	// validity alone; the approval verdict travels as a job output.
+	expect(prContract).toContain("name: Validate exact-head PR contract");
+	expect(prContract).toContain("--gate contract");
+	expect(prContract).toContain("merge_authorized: ${{ steps.validate.outputs.merge_authorized }}");
+	expect(prContract).toContain("name: Merge approval");
+	expect(prContract).toContain('-f name="Merge approval"');
+	expect(devCi).toContain("name: PR contract bootstrap");
+	expect(devCi).toContain("name: Merge approval bootstrap");
+	expect(devCi).toContain("merge_authorized: ${{ steps.contract.outputs['gjc-merge-authorized'] }}");
+	expect(devCi).toContain("gjc-merge-authorized=${mergeAuthorized}");
+	// The pending-approval branch no longer aborts the bootstrap job; every other
+	// failure in that script is still a throw that fails the CONTRACT check.
+	expect(devCi).not.toContain("throw new Error(`Verdict ${verdict} intentionally blocks merge.`)");
+	expect(devCi).toContain("Verdict ${verdict} intentionally blocks merge.");
+	expect(devCi).toContain("throw new Error(`Stale verdict digest");
+	expect(devCi).toContain("merge-approved cannot be self-approved");
+	// Fail closed on a skipped/failed/cancelled upstream job. GitHub reports a SKIPPED
+	// job as Success for required checks, so `needs:` alone would publish a green
+	// approval check for a red contract; always() plus an explicit result test cannot.
+	expect(prContract).toContain("needs: [validate]");
+	expect(devCi).toContain("needs: [pr-contract-bootstrap]");
+	for (const [workflow, guard] of [[prContract, "if: ${{ always() }}"], [devCi, "if: ${{ always() && github.event_name == 'pull_request' }}"]] as const) {
+		expect(workflow).toContain(guard);
+		expect(workflow).toContain('if [[ "${CONTRACT_RESULT:-}" != "success" ]]; then');
+		expect(workflow).toContain('if [[ "${MERGE_AUTHORIZED:-}" != "true" ]]; then');
+		expect(workflow).toContain("https://docs.github.com/en/pull-requests/reference/status-checks");
+	}
 });
 
 test("review events cannot launch or cancel the affected Dev CI pipeline", async () => {
