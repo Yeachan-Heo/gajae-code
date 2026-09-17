@@ -676,6 +676,12 @@ const CURSOR_WRITE_DRAIN_TIMEOUT_MS = 5_000;
 const CURSOR_MAX_PENDING_SHELL_WRITE_BYTES = 1024 * 1024;
 const pendingCursorWrites = new WeakMap<object, Set<Promise<void>>>();
 const cursorWriteErrors = new WeakMap<object, unknown>();
+interface CursorWriteListeners {
+	finishes: Set<(error?: unknown) => void>;
+	onError: (error: unknown) => void;
+	onClose: () => void;
+}
+const cursorWriteListeners = new WeakMap<object, CursorWriteListeners>();
 
 function closeStalledCursorRequest(request: http2.ClientHttp2Stream): void {
 	// A request whose peer stopped reading may never invoke a write callback. Close
@@ -833,25 +839,44 @@ function writeCursorFrame(request: http2.ClientHttp2Stream, frame: Uint8Array): 
 	// late transport error cannot surface as an unhandled rejection in the gap.
 	completion.promise.catch(() => {});
 	pending.add(completion.promise);
+	let listeners = cursorWriteListeners.get(request);
+	if (!listeners) {
+		const finishes = new Set<(error?: unknown) => void>();
+		const onError = (error: unknown) => {
+			for (const finish of [...finishes]) finish(error);
+		};
+		listeners = {
+			finishes,
+			onError,
+			onClose: () => onError(new Error("Cursor request closed before write completed")),
+		};
+		cursorWriteListeners.set(request, listeners);
+	}
+	const shared = listeners;
 	const finish = (error?: unknown) => {
 		if (completed) return;
 		completed = true;
 		pending.delete(completion.promise);
 		if (error != null && !cursorWriteErrors.has(request)) cursorWriteErrors.set(request, error);
-		if (typeof request.removeListener === "function") {
-			request.removeListener("close", onClose);
-			request.removeListener("error", finish);
+		shared.finishes.delete(finish);
+		if (shared.finishes.size === 0) {
+			if (typeof request.removeListener === "function") {
+				request.removeListener("close", shared.onClose);
+				request.removeListener("error", shared.onError);
+			}
+			cursorWriteListeners.delete(request);
+			// Keep the pending set and first error until the final drain observes them.
 		}
 		if (error == null) completion.resolve();
 		else completion.reject(error);
 	};
-	const onClose = () => finish(new Error("Cursor request closed before write completed"));
+	shared.finishes.add(finish);
 	try {
 		// The real HTTP/2 stream always exposes EventEmitter methods. Keep the
 		// test seam tolerant of a minimal writer stub as well.
-		if (typeof request.once === "function") {
-			request.once("close", onClose);
-			request.once("error", finish);
+		if (shared.finishes.size === 1 && typeof request.once === "function") {
+			request.once("close", shared.onClose);
+			request.once("error", shared.onError);
 		}
 		return request.write(frame, finish) !== false;
 	} catch (error) {
