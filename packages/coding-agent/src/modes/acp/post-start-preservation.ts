@@ -153,7 +153,8 @@ export interface WorktreeCapture {
 	stashRef?: string;
 	untrackedNotCaptured: number;
 	/**
-	 * `true` ONLY when a post-capture re-read confirmed the worktree did not change mid-capture.
+	 * `true` ONLY when the capture was fenced against its own snapshot afterwards: the working tree
+	 * still matched the stash object's tree (`git diff --quiet <oid>`) AND no untracked file appeared.
 	 * Absent, `false`, or garbage all mean "not verified", which downgrades the result rather than
 	 * promoting it — see {@link verifiedStable}.
 	 */
@@ -232,6 +233,32 @@ function observeWorktree(workspace: string): WorktreeObservation | undefined {
 	}
 }
 
+/**
+ * Content fence: does the WORKING TREE still hold exactly what the stash object captured?
+ *
+ * `git diff --quiet <oid>` compares the worktree against that object's tree, which is precisely the
+ * "did the tracked content stay equal to what I captured" question — and it is content-aware where
+ * the coarse observation pair is not. Measured on git 2.47.3 and 2.55.0: a tracked file edited after
+ * `stash create` leaves `diff --quiet HEAD` still exiting 1 and the untracked count unchanged (so the
+ * coarse pair says "stable"), while `diff --quiet <oid>` exits 1 and catches it. `--quiet` emits no
+ * output, so however large the divergence it cannot blow the output cap.
+ *
+ * Only a PLAIN exit 0 is stability. A plain exit 1 is git answering "diverged"; a string `code` — a
+ * spawn failure, `ETIMEDOUT`, `ENOBUFS` — is git not answering at all, and an unverifiable fence must
+ * never promote a result to complete.
+ */
+function trackedMatchesSnapshot(workspace: string, stashRef: string | undefined, overBudget: () => boolean): boolean {
+	// No stash object means there is no tree to fence against, so stability cannot be established.
+	if (stashRef === undefined) return false;
+	if (overBudget()) return false;
+	try {
+		gitRun(workspace, ["diff", "--quiet", stashRef]);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
 export function boundedWorktreeCapture(workspace: string): WorktreeCapture {
 	const deadline = Date.now() + PRESERVE_BUDGET_MS;
 	const overBudget = (): boolean => Date.now() > deadline;
@@ -253,21 +280,31 @@ export function boundedWorktreeCapture(workspace: string): WorktreeCapture {
 	}
 
 	/**
-	 * Compare a post-capture re-read against `before`. A non-answer is NOT stability — an
-	 * unverifiable re-read must never promote a result to complete. The uncaptured count reported is
-	 * the larger of the two: files that appeared mid-capture are absent from the snapshot too, so
-	 * the bigger number is the one the operator actually needs.
+	 * Decide stability from two independent post-capture checks, then report.
+	 *
+	 * The tracked half is a CONTENT fence against the snapshot itself ({@link trackedMatchesSnapshot}),
+	 * not a re-comparison of the coarse observations. Comparing `before`/`after` cannot see a tracked
+	 * file edited while `stash create` ran: the file is dirty in both observations and the untracked
+	 * count is unchanged, so the coarse pair called it stable while the stash held only the earlier
+	 * bytes — the operator was then told the snapshot was complete and swept the later edit away.
+	 *
+	 * The untracked half still needs the coarse re-read, because the fence is blind to it: a new
+	 * untracked file leaves the two tracked trees identical. The uncaptured count reported is the
+	 * larger of the two, since files that appeared mid-capture are absent from the snapshot too.
+	 *
+	 * A non-answer on either half is NOT stability.
 	 */
 	const settle = (stashRef: string | undefined): WorktreeCapture => {
+		// Fence first, so it runs as close to the capture as the budget allows.
+		const trackedStable = trackedMatchesSnapshot(workspace, stashRef, overBudget);
 		const after = overBudget() ? undefined : observeWorktree(workspace);
-		const stable =
-			after !== undefined && after.trackedDirty === before.trackedDirty && after.untracked === before.untracked;
+		const untrackedStable = after !== undefined && after.untracked === before.untracked;
 		const untrackedNotCaptured = Math.max(before.untracked, after?.untracked ?? before.untracked);
 		return {
 			status: "preserved",
 			...(stashRef === undefined ? {} : { stashRef }),
 			untrackedNotCaptured,
-			stable,
+			stable: trackedStable && untrackedStable,
 		};
 	};
 

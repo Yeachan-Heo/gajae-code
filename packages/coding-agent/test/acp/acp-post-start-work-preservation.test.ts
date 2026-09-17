@@ -225,8 +225,8 @@ describe("post-start terminal preserves the worktree before reporting failure (i
 	// ref transaction and would fail the stash store, and it must fire once or later ref writes
 	// re-trigger it. The sentinel lives under `.git/` so it is not itself an untracked file and the
 	// observable delta stays exactly one path.
-	it("downgrades a real capture when git itself mutates the worktree mid-stash", async () => {
-		await writeFile(path.join(ws, "src.ts"), "export const v = 2; // tracked edit\n");
+	/** Install a once-only `reference-transaction` hook that runs `body` inside the capture window. */
+	async function installMidCaptureHook(body: string): Promise<void> {
 		const hook = path.join(ws, ".git", "hooks", "reference-transaction");
 		await writeFile(
 			hook,
@@ -234,13 +234,18 @@ describe("post-start terminal preserves the worktree before reporting failure (i
 				"#!/bin/sh",
 				`if [ ! -e "${ws}/.git/gjc-hook-fired" ]; then`,
 				`  : > "${ws}/.git/gjc-hook-fired"`,
-				`  printf 'export const late = true;\\n' > "${ws}/appeared-mid-capture.ts"`,
+				`  ${body}`,
 				"fi",
 				"exit 0",
 				"",
 			].join("\n"),
 		);
 		await chmod(hook, 0o755);
+	}
+
+	it("downgrades a real capture when git itself mutates the worktree mid-stash", async () => {
+		await writeFile(path.join(ws, "src.ts"), "export const v = 2; // tracked edit\n");
+		await installMidCaptureHook(`printf 'export const late = true;\\n' > "${ws}/appeared-mid-capture.ts"`);
 		// Pre-capture the worktree holds no untracked files at all.
 		expect(git(ws, ["ls-files", "--others", "--exclude-standard"]).trim()).toBe("");
 
@@ -276,6 +281,52 @@ describe("post-start terminal preserves the worktree before reporting failure (i
 		expect(message).toContain("do not discard this worktree");
 		// Count only — untracked paths are user-controlled and this crosses the wire.
 		expect(message).not.toContain("appeared-mid-capture.ts");
+	});
+
+	// REGRESSION (round-4 review finding 1): the data-loss path the coarse observation pair CANNOT
+	// see. When an already-dirty TRACKED file is edited while `stash create` runs, `diff --quiet HEAD`
+	// still exits 1 and the untracked count is still 0 — identical coarse observations before and
+	// after — so the old comparison called it stable and reported `snapshotComplete: true`, while the
+	// stash object holds only the EARLIER bytes. An operator trusting that swept the later edit away.
+	// Only a content fence against the snapshot's own tree (`git diff --quiet <oid>`) catches it.
+	it("downgrades a real capture when a tracked file is edited mid-stash", async () => {
+		const original = "export const v = 2; // tracked edit\n";
+		await writeFile(path.join(ws, "src.ts"), original);
+		await installMidCaptureHook(`printf 'export const later = true;\\n' >> "${ws}/src.ts"`);
+
+		// No seam: the production capture path, against real git.
+		const preservation = preservePostStartWork(ws);
+
+		// The hook really did append inside the capture window.
+		expect(await readFile(path.join(ws, "src.ts"), "utf8")).toBe(`${original}export const later = true;\n`);
+		// The coarse observations are IDENTICAL either side of the capture — this is what made the
+		// old check report stability, and why this case needs the fence.
+		expect(git(ws, ["ls-files", "--others", "--exclude-standard"]).trim()).toBe("");
+		expect(() => git(ws, ["diff", "--quiet", "HEAD"])).toThrow();
+
+		// The ref it DID get is kept — it recovers the earlier bytes, which is better than nothing.
+		expect(preservation.status).toBe("preserved");
+		expect(preservation.stashRef).toMatch(/^[0-9a-f]{7,64}$/);
+		// But it must NOT be advertised as a complete snapshot.
+		expect(preservation.racedDuringCapture).toBe(true);
+		expect(preservation.snapshotComplete).toBe(false);
+		// No untracked file appeared, so the count stays absent — the downgrade came from the fence.
+		expect(preservation.untrackedNotCaptured).toBeUndefined();
+
+		// GROUND TRUTH, real git: the stash holds the pre-edit bytes, without the appended line.
+		const stashed = git(ws, ["show", `${preservation.stashRef}:src.ts`]);
+		expect(stashed).toBe(original);
+		expect(stashed).not.toContain("export const later");
+
+		const message = postStartOperatorMessage({
+			category: "provider_transport",
+			providerCode: "server_is_overloaded",
+			preservation,
+		});
+		expect(message).toContain("changed while it was being captured");
+		expect(message).toContain("do not discard this worktree");
+		// Never a path: this crosses the wire.
+		expect(message).not.toContain("src.ts");
 	});
 
 	it("still reports a stable capture as complete, with no race wording", async () => {
