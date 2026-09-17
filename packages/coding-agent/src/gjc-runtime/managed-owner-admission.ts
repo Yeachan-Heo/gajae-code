@@ -128,8 +128,15 @@ function safeChildToken(value: string): boolean {
 	}
 }
 
-async function readExactJsons(root: string, files: readonly string[]): Promise<unknown[] | null> {
-	if (process.platform !== "linux") return null;
+/**
+ * The exact reader needs the Linux-only recovery-fs authority, so an unavailable
+ * read has two very different causes. A blocked operator cannot act on either
+ * unless the outcome says which one it was, so the unavailable arm names it.
+ */
+type ExactJsonRead = { values: unknown[] } | { reader: "unsupported_platform" | "read_failed" };
+
+async function readExactJsons(root: string, files: readonly string[]): Promise<ExactJsonRead> {
+	if (process.platform !== "linux") return { reader: "unsupported_platform" };
 	try {
 		const { openRecoveryFsRoot } = require("@gajae-code/natives") as Pick<
 			typeof import("@gajae-code/natives"),
@@ -140,17 +147,37 @@ async function readExactJsons(root: string, files: readonly string[]): Promise<u
 			const values: unknown[] = [];
 			for (const file of files) {
 				const result = authority.read(file, 64 * 1024);
-				if (!result.ok || !result.data) return null;
+				if (!result.ok || !result.data) return { reader: "read_failed" };
 				const content = Buffer.from(result.data).toString("utf8");
-				if (!content.endsWith("\n") || content.indexOf("\n") !== content.length - 1) return null;
+				if (!content.endsWith("\n") || content.indexOf("\n") !== content.length - 1)
+					return { reader: "read_failed" };
 				values.push(JSON.parse(content));
 			}
-			return values;
+			return { values };
 		} finally {
 			authority.close();
 		}
 	} catch {
-		return null;
+		return { reader: "read_failed" };
+	}
+}
+
+function exactJsonValues(read: ExactJsonRead): unknown[] {
+	return "values" in read ? read.values : [];
+}
+
+function exactReaderDetails(read: ExactJsonRead): Record<string, unknown> {
+	return "values" in read ? {} : { platform: process.platform, evidence_reader: read.reader };
+}
+
+function readerExplanation(details: Record<string, unknown>): string {
+	switch (details.evidence_reader) {
+		case "unsupported_platform":
+			return ` (platform ${process.platform}: exact binding reader unsupported)`;
+		case "read_failed":
+			return ` (platform ${process.platform}: exact binding evidence unreadable)`;
+		default:
+			return "";
 	}
 }
 
@@ -188,6 +215,22 @@ async function durableHandoff(
 }
 
 /**
+ * Fails closed and says so. The durable handoff is the record of authority, but
+ * nothing reads it during an incident, so the same reason also goes to stderr:
+ * otherwise a blocked child exits 75 having printed nothing at all.
+ */
+async function blockAdmission(
+	owner: { root: string; generation: string; sessionId: string },
+	reason: string,
+	details: Record<string, unknown> = {},
+): Promise<{ kind: "blocked" }> {
+	await durableHandoff(owner.root, owner.generation, owner.sessionId, reason, details);
+	process.stderr.write(`child admission blocked: ${reason}${readerExplanation(details)}\n`);
+	process.exitCode = 75;
+	return { kind: "blocked" };
+}
+
+/**
  * This is the pre-CLI barrier. A replacement is identified only by the exact
  * predecessor token supplied by its launch binding; directory enumeration is
  * deliberately never an authority source.
@@ -198,12 +241,9 @@ export async function admitManagedOwnerBeforeCli(): Promise<ManagedOwnerAdmissio
 	const childToken = process.env[MANAGED_OWNER_CHILD_TOKEN_ENV]?.trim();
 	const predecessorToken = process.env[MANAGED_OWNER_PREDECESSOR_TOKEN_ENV]?.trim();
 	if (childToken && !predecessorToken) {
-		if (!safeChildToken(childToken)) {
-			await durableHandoff(owner.root, owner.generation, owner.sessionId, "exact_child_binding_unavailable");
-			process.exitCode = 75;
-			return { kind: "blocked" };
-		}
-		const [binding] = (await readExactJsons(owner.root, [`child-${childToken}.binding.json`])) ?? [];
+		if (!safeChildToken(childToken)) return blockAdmission(owner, "exact_child_binding_unavailable");
+		const read = await readExactJsons(owner.root, [`child-${childToken}.binding.json`]);
+		const [binding] = exactJsonValues(read);
 		if (
 			isBinding(binding, {
 				generation: owner.generation,
@@ -214,33 +254,20 @@ export async function admitManagedOwnerBeforeCli(): Promise<ManagedOwnerAdmissio
 			})
 		)
 			return { kind: "supervised" };
-		await durableHandoff(owner.root, owner.generation, owner.sessionId, "exact_child_binding_unavailable");
-		process.exitCode = 75;
-		return { kind: "blocked" };
+		return blockAdmission(owner, "exact_child_binding_unavailable", exactReaderDetails(read));
 	}
 	const predecessorGeneration = process.env[MANAGED_OWNER_PREDECESSOR_GENERATION_ENV]?.trim();
 	const predecessorRunId = process.env[MANAGED_OWNER_PREDECESSOR_RUN_ID_ENV]?.trim();
 	const predecessorIncarnation = process.env[MANAGED_OWNER_PREDECESSOR_INCARNATION_ENV]?.trim();
-	if (!predecessorGeneration || !predecessorRunId || !predecessorIncarnation) {
-		await durableHandoff(owner.root, owner.generation, owner.sessionId, "replacement_predecessor_identity_missing");
-		process.exitCode = 75;
-		return { kind: "blocked" };
-	}
-	if (!predecessorToken) {
-		await durableHandoff(owner.root, owner.generation, owner.sessionId, "replacement_predecessor_binding_missing");
-		process.exitCode = 75;
-		return { kind: "blocked" };
-	}
-	if (!safeChildToken(predecessorToken)) {
-		await durableHandoff(owner.root, owner.generation, owner.sessionId, "replacement_predecessor_binding_untrusted");
-		process.exitCode = 75;
-		return { kind: "blocked" };
-	}
-	const [binding, receipt] =
-		(await readExactJsons(owner.root, [
-			`child-${predecessorToken}.binding.json`,
-			`sigabrt-${predecessorToken}.receipt.json`,
-		])) ?? [];
+	if (!predecessorGeneration || !predecessorRunId || !predecessorIncarnation)
+		return blockAdmission(owner, "replacement_predecessor_identity_missing");
+	if (!predecessorToken) return blockAdmission(owner, "replacement_predecessor_binding_missing");
+	if (!safeChildToken(predecessorToken)) return blockAdmission(owner, "replacement_predecessor_binding_untrusted");
+	const read = await readExactJsons(owner.root, [
+		`child-${predecessorToken}.binding.json`,
+		`sigabrt-${predecessorToken}.receipt.json`,
+	]);
+	const [binding, receipt] = exactJsonValues(read);
 	if (
 		!isBinding(binding, {
 			generation: predecessorGeneration,
@@ -249,16 +276,10 @@ export async function admitManagedOwnerBeforeCli(): Promise<ManagedOwnerAdmissio
 			incarnation: predecessorIncarnation,
 			token: predecessorToken,
 		})
-	) {
-		await durableHandoff(owner.root, owner.generation, owner.sessionId, "replacement_predecessor_binding_untrusted");
-		process.exitCode = 75;
-		return { kind: "blocked" };
-	}
-	if (!isReceipt(receipt, binding)) {
-		await durableHandoff(owner.root, owner.generation, owner.sessionId, "exact_sigabrt_receipt_untrusted");
-		process.exitCode = 75;
-		return { kind: "blocked" };
-	}
+	)
+		return blockAdmission(owner, "replacement_predecessor_binding_untrusted", exactReaderDetails(read));
+	if (!isReceipt(receipt, binding))
+		return blockAdmission(owner, "exact_sigabrt_receipt_untrusted", exactReaderDetails(read));
 	const admission = {
 		session_id: owner.sessionId,
 		endpoint_incarnation: predecessorIncarnation,
@@ -287,11 +308,7 @@ export async function admitManagedOwnerBeforeCli(): Promise<ManagedOwnerAdmissio
 		},
 		decision,
 	});
-	if (decision.disposition !== "resume") {
-		await durableHandoff(owner.root, owner.generation, owner.sessionId, decision.reason);
-		process.exitCode = 75;
-		return { kind: "blocked" };
-	}
+	if (decision.disposition !== "resume") return blockAdmission(owner, decision.reason);
 	return { kind: "recovery", context: { root: owner.root, binding, receipt, admission, decision } };
 }
 
