@@ -1,5 +1,6 @@
 import { installRuntimeDeletionGuard } from "./safe-cleanup";
 import { decideAgentDirIsolation, readProjectEnvFile, stripAmbientProviderEnvironment } from "./test-agent-dir-isolation";
+import { decideLogDirIsolation } from "./test-log-dir-isolation";
 import { formatWorkspaceDependencyFailure, inspectWorkspaceDependencies } from "./worktree-deps";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -95,17 +96,37 @@ if (isolation.action === "isolate") {
 // intended: they inherit the same isolated sink.
 //
 // A caller that pinned GJC_LOG_DIR explicitly means it (e.g. a fixture asserting
-// on log content), so honor it untouched.
+// on log content), so that is honored untouched — but only when the pin is
+// trusted. A nonblank value is not evidence of intent on its own: Bun overlays
+// `cwd/.env` into `process.env` before any module runs, so a checkout that
+// declares GJC_LOG_DIR would otherwise be honored here and isolation would never
+// happen. The decision (including that distrust rule) lives in
+// ./test-log-dir-isolation.ts so it is unit-testable without importing this
+// preload's side effects.
 //
-// FAIL CLOSED, as with the agent dir: if the temp sink cannot be created, throw.
-// Continuing would silently run the suite against the operator's live log sink,
-// which is the regression this exists to prevent.
-if (!process.env.GJC_LOG_DIR?.trim()) {
+// FAIL CLOSED, as with the agent dir: if the temp sink cannot be created — or if
+// the checkout declares GJC_LOG_DIR dynamically, where no pin this preload sets
+// can survive production's provenance check — throw. Continuing would silently
+// run the suite against the operator's live log sink, which is the regression
+// this exists to prevent.
+const logIsolation = decideLogDirIsolation({
+	env: { GJC_LOG_DIR: process.env.GJC_LOG_DIR },
+	projectEnv: readProjectEnvFile(process.cwd()),
+});
+if (logIsolation.action === "fail") {
+	throw new Error(
+		"Test log-directory isolation failed (dynamic): this checkout's .env declares GJC_LOG_DIR with a `$` or " +
+			"backtick in its value. Bun expands it at load time, so the trust check in packages/utils/src/dirs.ts " +
+			"rejects the key entirely and log writes would fall back to the operator's live log sink no matter what " +
+			"this preload pins. Remove GJC_LOG_DIR from the project .env before running tests.",
+	);
+}
+if (logIsolation.action === "isolate") {
 	try {
 		process.env.GJC_LOG_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-test-logs-"));
 	} catch (error) {
 		throw new Error(
-			`Test log-directory isolation failed; refusing to run tests against the live log sink: ${String(error)}`,
+			`Test log-directory isolation failed (${logIsolation.reason}); refusing to run tests against the live log sink: ${String(error)}`,
 		);
 	}
 }
