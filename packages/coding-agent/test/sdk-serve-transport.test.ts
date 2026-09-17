@@ -110,6 +110,19 @@ function serveFailure(run: () => unknown): { typed: boolean; code: unknown; exit
 	throw new Error("Expected the serve path to fail.");
 }
 
+/** The awaited counterpart of `serveFailure`, for serve paths that reject. */
+async function serveRejectionFailure(
+	run: () => Promise<unknown>,
+): Promise<{ typed: boolean; code: unknown; exitCode: unknown }> {
+	try {
+		await run();
+	} catch (error) {
+		const typed = error as { code?: unknown; exitCode?: unknown };
+		return { typed: error instanceof SdkServeError, code: typed.code, exitCode: typed.exitCode };
+	}
+	throw new Error("Expected the serve path to reject.");
+}
+
 /** A fake SDK broker: a hello on open, then one canned reply per broker request. */
 function fakeBroker(reply: (operation: string) => Record<string, unknown>) {
 	const server = Bun.serve<unknown>({
@@ -1031,9 +1044,11 @@ describe("SDK serve CLI and discovery", () => {
 			},
 		} as never;
 
-		await expect(resolveServeSession(broker, sessionId)).rejects.toThrow(
-			`endpoint_stale: session ${sessionId} endpoint is not live`,
-		);
+		expect(await serveRejectionFailure(() => resolveServeSession(broker, sessionId))).toEqual({
+			typed: true,
+			code: "endpoint_stale",
+			exitCode: 1,
+		});
 		expect(calls).toEqual(["session.list", "session.list", "session.resume", "session.list"]);
 		expect(calls.filter(operation => operation === "session.resume")).toHaveLength(1);
 	});
@@ -1065,9 +1080,11 @@ describe("SDK serve CLI and discovery", () => {
 			},
 		} as never;
 
-		await expect(resolveServeSession(broker, sessionId)).rejects.toThrow(
-			`terminal_uncertain: session ${sessionId} ownership is uncertain`,
-		);
+		expect(await serveRejectionFailure(() => resolveServeSession(broker, sessionId))).toEqual({
+			typed: true,
+			code: "terminal_uncertain",
+			exitCode: 1,
+		});
 		expect(calls).toEqual(["session.list"]);
 	});
 
@@ -1131,9 +1148,15 @@ describe("SDK serve CLI and discovery", () => {
 		} as never;
 
 		expect(await resolveServeSession(broker, "live")).toBe("live");
-		await expect(resolveServeSession(broker, "ambiguous")).rejects.toThrow("ambiguous_session");
-		await expect(resolveServeSession(broker, "missing")).rejects.toThrow("not_found");
-		await expect(resolveServeSession(broker)).rejects.toThrow("multiple_live_endpoints");
+		expect([
+			await serveRejectionFailure(() => resolveServeSession(broker, "ambiguous")),
+			await serveRejectionFailure(() => resolveServeSession(broker, "missing")),
+			await serveRejectionFailure(() => resolveServeSession(broker)),
+		]).toEqual([
+			{ typed: true, code: "ambiguous_session", exitCode: 1 },
+			{ typed: true, code: "not_found", exitCode: 1 },
+			{ typed: true, code: "multiple_live_endpoints", exitCode: 1 },
+		]);
 		expect(calls.filter(operation => operation === "session.resume")).toHaveLength(0);
 	});
 
