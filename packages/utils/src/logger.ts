@@ -89,9 +89,9 @@ function makeLogFormat(winston: WinstonModule): winston.Logform.Format {
  * semantics — and the tests pinning them — stay intact.
  */
 function makeFileTransport(DailyRotateFile: DailyRotateFileCtor, dir?: string): Transport {
-	const envDir = process.env.GJC_LOG_DIR?.trim();
+	const envDir = process.env.GJC_LOG_DIR?.trim() || undefined;
 	return new DailyRotateFile({
-		dirname: ensureDir(dir ?? (envDir ? envDir : getLogsDir())),
+		dirname: ensureDir(dir ?? envDir ?? getLogsDir()),
 		filename: "gjc.%DATE%.log",
 		datePattern: "YYYY-MM-DD",
 		maxSize: "10m",
