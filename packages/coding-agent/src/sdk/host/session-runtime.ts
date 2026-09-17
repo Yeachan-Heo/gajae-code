@@ -5346,18 +5346,38 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				const releaseTerminalRetention = retainTerminalBoundaries([{ correlation }]);
 				try {
 					if (claimTerminalBoundary(correlation)) {
-						runtime.emitEvent({
-							type: "agent_failed",
-							sessionId,
-							...correlation,
-							error: failure,
-						});
-						runtime.emitEvent({
-							type: "agent_end",
-							sessionId,
-							...correlation,
-							outcome: canonicalFailedOutcome(failure, "deadline"),
-						});
+						// Each required frame is emitted INDEPENDENTLY (review P2): a throwing
+						// diagnostic must never suppress the boundary, which is the frame this
+						// path exists to deliver. Both failures are reported, never rethrown --
+						// the cleanup below still has to run.
+						try {
+							runtime.emitEvent({
+								type: "agent_failed",
+								sessionId,
+								...correlation,
+								error: failure,
+							});
+						} catch (error) {
+							logger.warn("sdk: deadline correlated diagnostic publication failed", {
+								commandId: correlation.commandId,
+								turnId: correlation.turnId,
+								error: sanitizePromptFailure(error),
+							});
+						}
+						try {
+							runtime.emitEvent({
+								type: "agent_end",
+								sessionId,
+								...correlation,
+								outcome: canonicalFailedOutcome(failure, "deadline"),
+							});
+						} catch (error) {
+							logger.error("sdk: deadline correlated boundary publication failed", {
+								commandId: correlation.commandId,
+								turnId: correlation.turnId,
+								error: sanitizePromptFailure(error),
+							});
+						}
 					}
 				} finally {
 					releaseTerminalRetention();
