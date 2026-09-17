@@ -25,7 +25,9 @@ import { ACP_PROMPT_INFERENCE_TIMEOUT_MS } from "../../src/sdk/prompt-watchdog";
 
 setDefaultTimeout(20_000);
 
-type TodoStatus = "pending" | "in_progress" | "completed";
+// The internal statuses a `todo_reminder` carries, which is a superset of ACP's three-value plan
+// status: `/todo drop` produces `abandoned`, and the mapper projects that onto the wire.
+type TodoStatus = "pending" | "in_progress" | "completed" | "abandoned";
 type Todo = { content: string; status: TodoStatus };
 
 /** Virtual timer source: the watchdog only fires when the test says it does. */
@@ -358,6 +360,36 @@ describe("an abandoned prompt reports its unfinished plan (issue #5669)", () => 
 
 		expect(data).toMatchObject({ planIncomplete: "false", planPendingCount: "0", planTotalCount: "2" });
 		expect(JSON.parse(String(data.planPending))).toEqual([]);
+	});
+
+	it("counts a plan of nothing but dropped steps as unfinished work", async () => {
+		const data = await abandonWithPlans([
+			[
+				{ content: "rewrite the parser", status: "abandoned" },
+				{ content: "migrate the callers", status: "abandoned" },
+			],
+		]);
+
+		// `/todo drop` marks a step `abandoned`, and ACP's plan status has no such member, so the
+		// wire entry says `completed` for the client's plan UI. Reading that rendering as evidence
+		// reported this turn as finished with zero pending steps — dropped work is not done work.
+		expect(data).toMatchObject({ planIncomplete: "true", planPendingCount: "2", planTotalCount: "2" });
+		expect(JSON.parse(String(data.planPending))).toEqual(["rewrite the parser", "migrate the callers"]);
+	});
+
+	it("separates a dropped step from a genuinely completed one in a mixed plan", async () => {
+		const data = await abandonWithPlans([
+			[
+				{ content: "apply the patch", status: "completed" },
+				{ content: "rewrite the parser", status: "abandoned" },
+				{ content: "run tests", status: "pending" },
+			],
+		]);
+
+		expect(data).toMatchObject({ planIncomplete: "true", planPendingCount: "2", planTotalCount: "3" });
+		// List order, and the completed step stays out of it: the fix must not collapse into
+		// "everything is unfinished".
+		expect(JSON.parse(String(data.planPending))).toEqual(["rewrite the parser", "run tests"]);
 	});
 
 	it("omits the plan fields entirely when no plan was ever observed", async () => {
