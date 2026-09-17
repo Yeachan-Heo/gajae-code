@@ -666,9 +666,13 @@ function promptFailureWireData(failure: SdkPromptFailedOutcome): Record<string, 
 
 /**
  * What an ACP `plan` update said the turn intended to do. Structural rather than the SDK's
- * `PlanEntry` so only the two fields this evidence reads are depended on.
+ * `PlanEntry` so only the fields this evidence reads are depended on.
  */
-type AcpPlanSnapshot = Array<{ content: string; status: "pending" | "in_progress" | "completed" }>;
+type AcpPlanSnapshot = Array<{
+	content: string;
+	status: "pending" | "in_progress" | "completed";
+	_meta?: { gjcTodoStatus?: unknown } | null;
+}>;
 
 /**
  * An abandoned prompt that still carries the plan its turn was working through (issue #5669).
@@ -693,6 +697,20 @@ const ACP_ABANDON_PLAN_MAX_ENTRIES = 10;
 const ACP_ABANDON_PLAN_MAX_CONTENT_CHARS = 200;
 
 /**
+ * Whether a plan entry describes work the turn never finished (issue #5669).
+ *
+ * An entry whose ACP status is `completed` can still be unfinished: ACP's `PlanEntryStatus` has no
+ * `abandoned` member, so a task dropped via `/todo drop` is projected as `completed` for the
+ * client's plan UI while the mapper keeps the internal status in `_meta.gjcTodoStatus`. Completion
+ * evidence has to read that internal truth — reading the wire status alone would report a plan of
+ * nothing but dropped tasks as a finished turn. `_meta` crosses a JSON boundary, so the internal
+ * status is compared as `unknown` rather than asserted into a type.
+ */
+function planEntryUnfinished(entry: AcpPlanSnapshot[number]): boolean {
+	return entry.status !== "completed" || entry._meta?.gjcTodoStatus === "abandoned";
+}
+
+/**
  * The wire projection of an abandoned prompt's plan (issue #5669).
  *
  * Plan text is model-authored, so it is bounded the same way `promptFailureWireData` bounds a
@@ -706,7 +724,7 @@ const ACP_ABANDON_PLAN_MAX_CONTENT_CHARS = 200;
  */
 function promptAbandonWireData(plan: AcpPlanSnapshot | undefined): Record<string, string> {
 	if (!plan) return {};
-	const pending = plan.filter(entry => entry.status !== "completed");
+	const pending = plan.filter(planEntryUnfinished);
 	return {
 		planIncomplete: pending.length > 0 ? "true" : "false",
 		planPendingCount: String(pending.length),
@@ -3405,8 +3423,8 @@ export class AcpAgent implements Agent {
 			awaitingModel: waiter.activity.awaitingModel,
 			...(plan
 				? {
-						planIncomplete: plan.some(entry => entry.status !== "completed"),
-						planPendingCount: plan.filter(entry => entry.status !== "completed").length,
+						planIncomplete: plan.some(planEntryUnfinished),
+						planPendingCount: plan.filter(planEntryUnfinished).length,
 						planTotalCount: plan.length,
 					}
 				: {}),
