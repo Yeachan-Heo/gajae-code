@@ -175,6 +175,42 @@ async function serveRejection(argv: string[]): Promise<unknown> {
 	throw new Error("Expected serve to fail.");
 }
 
+/**
+ * Drives the `gjc sdk serve` command boundary against `brokerUrl` and returns the
+ * single envelope it wrote to stderr, with stdout captured alongside so a leak into
+ * the frame channel is visible.
+ */
+async function serveEnvelope(brokerUrl: string): Promise<{ stdout: string; error: Record<string, unknown> }> {
+	const stdoutChunks: string[] = [];
+	const stderrChunks: string[] = [];
+	const realStdout = process.stdout.write;
+	const realStderr = process.stderr.write;
+	const previousExitCode = process.exitCode;
+	(process.stdout as unknown as { write(value: string): boolean }).write = value => {
+		stdoutChunks.push(String(value));
+		return true;
+	};
+	(process.stderr as unknown as { write(value: string): boolean }).write = value => {
+		stderrChunks.push(String(value));
+		return true;
+	};
+	try {
+		await withServeAgentDir(brokerUrl, async () => {
+			await new Sdk(["serve", "--stdio"], {} as never).run();
+		});
+	} finally {
+		(process.stdout as unknown as { write: typeof realStdout }).write = realStdout;
+		(process.stderr as unknown as { write: typeof realStderr }).write = realStderr;
+		// Restore to a real number: assigning `undefined` is a no-op in Bun, so it
+		// would leave the boundary's exit code 1 on the whole test runner process.
+		process.exitCode = previousExitCode ?? 0;
+	}
+	const lines = stderrChunks.join("").split("\n").filter(Boolean);
+	if (lines.length !== 1) throw new Error(`Expected one stderr envelope, got ${lines.length}.`);
+	const parsed = JSON.parse(lines[0]!) as { error: Record<string, unknown> };
+	return { stdout: stdoutChunks.join(""), error: parsed.error };
+}
+
 const closeFailureMessage = "SDK WebSocket close timed out after 250ms";
 
 /**
@@ -988,6 +1024,27 @@ describe("SDK serve CLI and discovery", () => {
 			message: "SDK broker is not running",
 			exitCode: 1,
 		});
+	});
+
+	test("carries a broker cleanup failure into the serve stderr envelope", async () => {
+		const broker = fakeBroker(() => ({
+			ok: false,
+			error: { code: "endpoint_credential_forbidden", message: "credential refused" },
+		}));
+		try {
+			const failed = await withRejectingBrokerClose(async () => await serveEnvelope(broker.url));
+			// The frame channel stays byte-pure; the teardown diagnostics ride on stderr.
+			expect(failed.stdout).toBe("");
+			expect(failed.error).toMatchObject({ code: "endpoint_credential_forbidden" });
+			expect(failed.error.cleanupError).toEqual({ code: "timeout", message: closeFailureMessage });
+			// Negative control: a clean teardown leaves the envelope as it was before
+			// the field existed, so the key must not become unconditionally present.
+			const clean = await serveEnvelope(broker.url);
+			expect(clean.error).toMatchObject({ code: "endpoint_credential_forbidden" });
+			expect("cleanupError" in clean.error).toBe(false);
+		} finally {
+			broker.stop();
+		}
 	});
 
 	test("rejects an empty or malformed endpoint credential before starting the relay", async () => {

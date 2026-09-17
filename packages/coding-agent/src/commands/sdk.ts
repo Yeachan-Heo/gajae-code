@@ -1129,6 +1129,10 @@ export default class Sdk extends Command {
 							code: error.code,
 							message: error.message,
 							...(error.details === undefined ? {} : { details: error.details }),
+							// A broker teardown that failed alongside the primary failure is
+							// recorded on the error; dropping it here would hide from the
+							// embedder that the session may not have been released cleanly.
+							...(error.cleanupError === undefined ? {} : { cleanupError: error.cleanupError }),
 						},
 					})}\n`,
 				);
