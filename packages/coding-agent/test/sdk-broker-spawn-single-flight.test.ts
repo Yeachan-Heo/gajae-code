@@ -78,16 +78,31 @@ function spawnStaleBrokerWorker(dir: string, ready: string): LockWorker {
 	return Bun.spawn([process.execPath, "-e", source], { stdin: "ignore", stdout: "pipe", stderr: "pipe" });
 }
 
-function spawnExpiringStaleDiscoveryWorker(dir: string, ready: string, lifetimeMs: number): LockWorker {
+function spawnControllableStaleDiscoveryWorker(
+	dir: string,
+	ready: string,
+	retirementRequested: string,
+	retirementRelease: string,
+): LockWorker {
 	const source = `
 		import * as fs from "node:fs/promises";
-		import { brokerProcessIncarnation, writeBrokerDiscovery } from ${JSON.stringify(discoveryModule)};
+		import { brokerDiscoveryPath, brokerProcessIncarnation, writeBrokerDiscovery } from ${JSON.stringify(discoveryModule)};
 		const startedAt = Date.now();
 		const incarnation = brokerProcessIncarnation(process.pid);
 		if (!incarnation) throw new Error("stale worker incarnation unavailable");
-		process.on("SIGTERM", () => {});
+		let retiring = false;
+		process.once("SIGTERM", () => {
+			if (retiring) return;
+			retiring = true;
+			void (async () => {
+				await fs.writeFile(${JSON.stringify(retirementRequested)}, "requested");
+				while (!(await fs.stat(${JSON.stringify(retirementRelease)}).then(() => true).catch(() => false)))
+					await Bun.sleep(10);
+				await fs.rm(brokerDiscoveryPath(${JSON.stringify(dir)}), { force: true });
+			})();
+		});
 		let published = false;
-		while (Date.now() - startedAt < ${lifetimeMs}) {
+		while (!retiring) {
 			await writeBrokerDiscovery(${JSON.stringify(dir)}, {
 				version: 1,
 				protocolVersion: 3,
@@ -106,7 +121,7 @@ function spawnExpiringStaleDiscoveryWorker(dir: string, ready: string, lifetimeM
 				published = true;
 				await fs.writeFile(${JSON.stringify(ready)}, "ready");
 			}
-			await Bun.sleep(100);
+			await Bun.sleep(20);
 		}
 	`;
 	return Bun.spawn([process.execPath, "-e", source], { stdin: "ignore", stdout: "pipe", stderr: "pipe" });
@@ -361,7 +376,12 @@ it("the parent discovery budget covers child-fence contention plus a full startu
 it("the parent budget composes stale retirement, child-fence contention, and startup", async () => {
 	const dir = await temp();
 	const ready = path.join(dir, "expiring-stale.ready");
-	const stale = spawnExpiringStaleDiscoveryWorker(dir, ready, 19_000);
+	const retirementRequested = path.join(dir, "stale-retirement.requested");
+	const retirementRelease = path.join(dir, "stale-retirement.release");
+	const signalDir = path.join(dir, "broker-signals");
+	const startupGate = path.join(dir, "broker-startup.release");
+	await fs.mkdir(signalDir, { recursive: true });
+	const stale = spawnControllableStaleDiscoveryWorker(dir, ready, retirementRequested, retirementRelease);
 	const entered = Promise.withResolvers<void>();
 	const unblock = Promise.withResolvers<void>();
 	const holder = withBrokerStartupLock(dir, async () => {
@@ -378,12 +398,23 @@ it("the parent budget composes stale retirement, child-fence contention, and sta
 				stdin: "ignore",
 				stdout: "pipe",
 				stderr: "pipe",
-				env: { ...process.env, GJC_SDK_TEST_BROKER_STARTUP_DELAY_MS: "10000" },
+				env: {
+					...process.env,
+					GJC_SDK_TEST_BROKER_SIGNAL_DIR: signalDir,
+					GJC_SDK_TEST_BROKER_STARTUP_GATE_FILE: startupGate,
+				},
 			},
 		);
-		await Bun.sleep(14_000);
+		await waitForFile(retirementRequested);
+		await fs.writeFile(retirementRelease, "release");
+		await waitForFile(path.join(signalDir, "retirement-finished"));
+		await waitForFile(path.join(signalDir, "fence-contended"));
 		unblock.resolve();
 		await holder;
+		await waitForFile(path.join(signalDir, "fence-acquired"));
+		await waitForFile(path.join(signalDir, "startup-gate-waiting"));
+		await fs.writeFile(startupGate, "release");
+		await waitForFile(path.join(signalDir, "startup-gate-released"));
 		const [code, error] = await Promise.all([child.exited, new Response(child.stderr).text()]);
 		expect({ code, error }).toEqual({ code: 0, error: "" });
 		const discovery = await brokerDiscovery.readBrokerDiscovery(dir);

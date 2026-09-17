@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import * as nodeFs from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -13,7 +14,11 @@ import { initTheme } from "../modes/theme/theme";
 import { ACP_MCP_REQUEST_TIMEOUT_MS, ACP_MCP_STARTUP_HEADROOM_MS } from "../sdk/acp/mcp";
 import { Broker } from "../sdk/broker/broker";
 import { readBrokerDiscovery } from "../sdk/broker/discovery";
-import { reconcileBrokerGenerationForStartup, withBrokerStartupLock } from "../sdk/broker/ensure";
+import {
+	emitBrokerStartupTestSignal,
+	reconcileBrokerGenerationForStartup,
+	withBrokerStartupLock,
+} from "../sdk/broker/ensure";
 import { completeBrokerProcess } from "../sdk/broker/internal";
 import {
 	type LifecycleTranscriptEvidence,
@@ -93,6 +98,43 @@ export async function lifecycleArgs(
  */
 export const SESSION_HOST_BROKER_ABSENCE_GRACE_MS = 10 * 60_000;
 const SESSION_HOST_BROKER_POLL_MS = 15_000;
+
+async function waitForBrokerStartupTestGate(gateFile: string): Promise<void> {
+	if (await Bun.file(gateFile).exists()) return;
+	const directory = path.dirname(gateFile);
+	const filename = path.basename(gateFile);
+	await new Promise<void>((resolve, reject) => {
+		let settled = false;
+		let watcher: nodeFs.FSWatcher | undefined;
+		const finish = (error?: unknown): void => {
+			if (settled) return;
+			settled = true;
+			watcher?.close();
+			if (error === undefined) resolve();
+			else reject(error);
+		};
+		try {
+			watcher = nodeFs.watch(directory, (_eventType, changed) => {
+				if (String(changed) !== filename) return;
+				void Bun.file(gateFile)
+					.exists()
+					.then(exists => {
+						if (exists) finish();
+					})
+					.catch(finish);
+			});
+		} catch (error) {
+			finish(error);
+			return;
+		}
+		void Bun.file(gateFile)
+			.exists()
+			.then(exists => {
+				if (exists) finish();
+			})
+			.catch(finish);
+	});
+}
 
 /**
  * Identity of the broker incarnation an observation describes, or `null` when
@@ -1128,7 +1170,7 @@ export default class Sdk extends Command {
 		const agentDir = path.resolve(internal.agentDir);
 		let broker: Broker | undefined;
 		try {
-			broker = await withBrokerStartupLock(agentDir, async deadline => {
+			const startupOperation = async (deadline: number): Promise<Broker | undefined> => {
 				const remainingMs = Math.max(1, deadline - Date.now());
 				const testWatchdogMs = Number(process.env.GJC_SDK_TEST_BROKER_STARTUP_WATCHDOG_MS ?? 0);
 				const watchdogMs =
@@ -1144,6 +1186,12 @@ export default class Sdk extends Command {
 					if (process.env.GJC_SDK_TEST_BROKER_STARTUP_STALL === "1") {
 						const stalled = Promise.withResolvers<void>();
 						await stalled.promise;
+					}
+					const startupGateFile = process.env.GJC_SDK_TEST_BROKER_STARTUP_GATE_FILE;
+					if (startupGateFile) {
+						await emitBrokerStartupTestSignal("startup-gate-waiting");
+						await waitForBrokerStartupTestGate(startupGateFile);
+						await emitBrokerStartupTestSignal("startup-gate-released");
 					}
 					const startupDelayMs = Number(process.env.GJC_SDK_TEST_BROKER_STARTUP_DELAY_MS ?? 0);
 					if (Number.isSafeInteger(startupDelayMs) && startupDelayMs > 0 && startupDelayMs <= 10_000)
@@ -1179,6 +1227,10 @@ export default class Sdk extends Command {
 				} finally {
 					clearTimeout(startupWatchdog);
 				}
+			};
+			broker = await withBrokerStartupLock(agentDir, startupOperation, {
+				onAcquired: () => void emitBrokerStartupTestSignal("fence-acquired"),
+				onContended: () => void emitBrokerStartupTestSignal("fence-contended"),
 			});
 		} catch (error) {
 			if (broker) {

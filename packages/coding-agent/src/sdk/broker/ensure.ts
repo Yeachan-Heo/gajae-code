@@ -70,6 +70,27 @@ const SPAWN_LOCK_RETRY_DELAY_MS = 50;
 const SPAWN_LOCK_TARGET_NAME = "broker.spawn";
 const STARTUP_LOCK_TARGET_NAME = "broker.startup";
 
+export interface BrokerStartupLockTestHooks {
+	onAcquired?: () => void;
+	onContended?: () => void;
+}
+
+/**
+ * Test-only phase observation for detached broker startup regressions. The
+ * signal is opt-in through the child environment and never affects broker
+ * ownership or error handling when the test seam is absent.
+ */
+export async function emitBrokerStartupTestSignal(signal: string): Promise<void> {
+	const directory = process.env.GJC_SDK_TEST_BROKER_SIGNAL_DIR;
+	if (!directory || !/^[a-z0-9-]+$/.test(signal)) return;
+	try {
+		await fs.mkdir(directory, { recursive: true, mode: 0o700 });
+		await fs.writeFile(path.join(directory, signal), `${process.pid}\n`);
+	} catch {
+		// Test observability must never change broker startup semantics.
+	}
+}
+
 type SpawnLockOptions = Pick<FileLockOptions, "retries" | "retryDelayMs" | "signal">;
 
 interface BrokerLockHostIdentity {
@@ -151,6 +172,7 @@ async function acquireSpawnLock(agentDir: string, options: SpawnLockOptions = {}
 export async function withBrokerStartupLock<T>(
 	agentDir: string,
 	operation: (deadline: number) => Promise<T>,
+	testHooks: BrokerStartupLockTestHooks = {},
 ): Promise<T> {
 	const hostIdentity = await brokerLockHostIdentity(agentDir);
 	return withFileLock(
@@ -159,6 +181,8 @@ export async function withBrokerStartupLock<T>(
 		{
 			retries: Math.ceil(STARTUP_LOCK_WAIT_MS / SPAWN_LOCK_RETRY_DELAY_MS),
 			retryDelayMs: SPAWN_LOCK_RETRY_DELAY_MS,
+			onAcquired: testHooks.onAcquired,
+			onContended: testHooks.onContended,
 			...hostIdentity,
 		},
 	);
@@ -459,6 +483,7 @@ export async function reconcileBrokerGenerationForStartup(
 	if (!current) return undefined;
 	if (await isBrokerReusable(current)) return current;
 	await retireUnusableBroker(current, settings, deadline);
+	await emitBrokerStartupTestSignal("retirement-finished");
 	const replacement = await readBrokerDiscoveryBeforeDeadline(settings.agentDir, settings.heartbeatTtlMs, deadline);
 	return replacement && (await isBrokerReusable(replacement)) ? replacement : undefined;
 }

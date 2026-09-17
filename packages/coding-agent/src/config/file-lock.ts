@@ -27,6 +27,7 @@ export interface FileLockOptions {
 	retryDelayMs?: number;
 	signal?: AbortSignal;
 	onAcquired?: () => void;
+	onContended?: () => void;
 	/** Stable host identity required to safely reclaim locks on a shared volume. */
 	ownerHostId?: string;
 	/** Previous local host identities accepted only when deciding stale-owner reclamation. */
@@ -84,7 +85,7 @@ export function isFileLockAcquireTimeout(error: unknown): error is FileLockAcqui
 }
 
 const DEFAULT_OPTIONS: Required<
-	Omit<FileLockOptions, "ownerHostId" | "previousOwnerHostIds" | "signal" | "onAcquired">
+	Omit<FileLockOptions, "ownerHostId" | "previousOwnerHostIds" | "signal" | "onAcquired" | "onContended">
 > = {
 	staleMs: 10_000,
 	retries: 50,
@@ -2022,6 +2023,7 @@ export async function acquireFileLock(filePath: string, options: FileLockOptions
 	}
 	const ownerToken = crypto.randomUUID();
 	const contentionStartTimes = new Map<string, string | null>();
+	let contentionObserved = false;
 	let staleRemovalFailure: RecordedStaleRemovalFailure | undefined;
 	for (let attempt = 0; attempt < opts.retries; attempt++) {
 		if (opts.signal?.aborted) throw opts.signal.reason ?? new Error("File lock acquisition aborted");
@@ -2051,6 +2053,10 @@ export async function acquireFileLock(filePath: string, options: FileLockOptions
 		if (result) {
 			localLockStates.set(localKey, { owner: result, status: "held" });
 			return () => releaseLock(lockPath, result, localKey);
+		}
+		if (!contentionObserved) {
+			contentionObserved = true;
+			opts.onContended?.();
 		}
 		const pendingKey = await pendingLocalReleaseKey(lockPath, localKey);
 		const localState = localLockStates.get(pendingKey ?? localKey);
