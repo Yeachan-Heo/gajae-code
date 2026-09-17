@@ -256,7 +256,9 @@ export async function listBrokerSessions(
 				return sessionListPageFromResponse(response);
 			},
 		);
-		return pages.flatMap(page => brokerSessionRows(page.sessions, isRecord(page.page) ? page.page.savedSession : undefined));
+		return pages.flatMap(page =>
+			brokerSessionRows(page.sessions, isRecord(page.page) ? page.page.savedSession : undefined),
+		);
 	} catch (error) {
 		if (error instanceof SessionListTraversalError) throw new SdkClientError("protocol_error", error.message);
 		throw error;
@@ -265,10 +267,6 @@ export async function listBrokerSessions(
 
 function endpointStaleError(sessionId: string): Error {
 	return new Error(`endpoint_stale: session ${sessionId} endpoint is not live`);
-}
-
-function isEndpointStaleSelection(error: unknown, sessionId: string): boolean {
-	return error instanceof Error && error.message.startsWith(`endpoint_stale: session ${sessionId} endpoint is not live`);
 }
 
 async function recoverBrokerSession(broker: SdkClient, row: BrokerSessionRow, sessionId: string): Promise<void> {
@@ -282,7 +280,7 @@ async function recoverBrokerSession(broker: SdkClient, row: BrokerSessionRow, se
 						candidate => candidate.sessionId === sessionId,
 					)?.savedSession;
 	if (locator === undefined || authority?.id !== sessionId) throw endpointStaleError(sessionId);
-	await brokerResult(
+	brokerResult(
 		await broker.global("session.resume", {
 			sessionId,
 			cwd: locator.cwd,
@@ -296,15 +294,18 @@ async function recoverBrokerSession(broker: SdkClient, row: BrokerSessionRow, se
 /** Resolves an explicit or automatic serve target, reattaching one stale explicit session at most once. */
 export async function resolveServeSession(broker: SdkClient, explicitSessionId?: string): Promise<string> {
 	const sessions = await listBrokerSessions(broker, explicitSessionId);
-	try {
-		return selectBrokerSession(sessions, explicitSessionId);
-	} catch (error) {
-		if (explicitSessionId === undefined || !isEndpointStaleSelection(error, explicitSessionId)) throw error;
+	if (explicitSessionId !== undefined) {
 		const row = sessions.find(session => session.sessionId === explicitSessionId);
-		if (!row) throw error;
-		await recoverBrokerSession(broker, row, explicitSessionId);
-		return selectBrokerSession(await listBrokerSessions(broker, explicitSessionId), explicitSessionId);
+		// An indexed, unambiguous row that is not live is the recoverable
+		// self-reap case (#5633). Every other targeting outcome — unindexed,
+		// ambiguous, no explicit id — stays the selector's to report, so this
+		// decision does not depend on the selector's error text.
+		if (row !== undefined && !row.ambiguous && !row.live) {
+			await recoverBrokerSession(broker, row, explicitSessionId);
+			return selectBrokerSession(await listBrokerSessions(broker, explicitSessionId), explicitSessionId);
+		}
 	}
+	return selectBrokerSession(sessions, explicitSessionId);
 }
 
 /** Selects the session to serve through broker `session.list` truth (C10); exported for tests. */
