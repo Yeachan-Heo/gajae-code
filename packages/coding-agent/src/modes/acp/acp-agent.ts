@@ -4007,9 +4007,13 @@ export class AcpAgent implements Agent {
 		// BEFORE reporting the failure, so the edits survive the worktree being swept (issue #5664).
 		// Scoped to the phase rather than the category: any post-start fatal strands work.
 		const preservation = failure.phase === "post_start" ? preservePostStartWork(record.cwd) : undefined;
-		if (preservation)
+		// Only a turn that actually stashed something warrants a warn line; a verified-clean tree is
+		// the uninteresting case and would just add noise to every post-start failure. An `unknown`
+		// worktree IS worth surfacing — it is the case where an operator may still lose work.
+		if (preservation && preservation.status !== "clean")
 			logger.warn("acp_post_start_work_preserved", {
 				sessionId: id,
+				status: preservation.status,
 				category: failure.category,
 				...(isSafePromptFailureCode(failure.providerCode) ? { providerCode: failure.providerCode } : {}),
 				...(preservation.stashRef ? { stashRef: preservation.stashRef } : {}),

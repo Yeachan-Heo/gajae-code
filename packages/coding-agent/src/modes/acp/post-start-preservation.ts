@@ -20,13 +20,33 @@
  * Preservation is deliberately scoped to the PHASE, not the category: a post-start fatal strands
  * work whatever classified it (issue #5615's bare `agent_runtime` `prompt_failed` ended the same
  * way). The upstream-provider wording is the part gated on `provider_transport`.
+ *
+ * The capture is BOUNDED and local to this module rather than delegated to the harness's
+ * `preserveDirtyWorktree`. That helper backs a `vanish` receipt, where completeness is the point,
+ * so it hashes every untracked file's contents and runs git unbounded; this path runs synchronously
+ * inside `#settlePrompt` before the rejection, so a hung git or a pathological worktree would delay
+ * the terminal outcome itself. It also cannot distinguish "clean" from "could not look" — every git
+ * failure inside it degrades to empty evidence — which is precisely the conflation that let an
+ * uninspectable worktree be reported as clean.
  */
-import { preserveDirtyWorktree } from "../../harness-control-plane/preserve";
+import { execFileSync } from "node:child_process";
 import { isSafePromptFailureCode } from "../../sdk/prompt-failure";
 import type { SdkPromptFailureCategory } from "../../sdk/prompt-status";
 
-/** What a post-start terminal managed to preserve. Absent when there was nothing to preserve. */
+/**
+ * Whether the worktree was actually inspected, and what was found.
+ *
+ * `clean` and `unknown` are deliberately distinct. Collapsing them — as returning a bare
+ * `undefined` for both did — tells an operator whose worktree could NOT be inspected the same
+ * thing it tells one whose worktree was verified empty, so they sweep it and lose the edits. A
+ * failure to verify is not evidence of absence.
+ */
+export type PostStartPreservationStatus = "preserved" | "clean" | "unknown";
+
+/** What a post-start terminal managed to preserve. Always reported, never implied by absence. */
 export interface PostStartPreservation {
+	/** `clean` = verified nothing to preserve. `unknown` = could NOT verify or snapshot. */
+	status: PostStartPreservationStatus;
 	/** Present only when a recoverable stash object was actually stored. */
 	stashRef?: string;
 	/** False when the worktree was dirty but some component could not be captured. */
@@ -69,51 +89,179 @@ export function uncapturedUntrackedCount(value: unknown): number {
 	return typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : 0;
 }
 
+/**
+ * Read a status conservatively. A missing or unrecognized value becomes `unknown` rather than
+ * `clean`, for the same reason `safeStashRef` and `uncapturedUntrackedCount` bound their inputs:
+ * this type is reachable with any value, and the failure that must never happen here is telling an
+ * operator their worktree is empty when nobody established that.
+ */
+export function preservationStatus(value: unknown): PostStartPreservationStatus {
+	return value === "preserved" || value === "clean" ? value : "unknown";
+}
+
+/** A worktree nobody could inspect. Conservative by construction. */
+function unverifiedPreservation(): PostStartPreservation {
+	return { status: "unknown", snapshotComplete: false };
+}
+
 /** The action an operator must take when the snapshot does not hold everything. */
 export const OPERATOR_KEEP_WORKTREE = "do not discard this worktree";
+export const OPERATOR_NOTHING_TO_PRESERVE = "No uncommitted work was found to preserve.";
 export const OPERATOR_UPSTREAM_LABEL = "Upstream provider failure";
 export const OPERATOR_UPSTREAM_SUFFIX = ": the model provider ended this turn, not your task.";
 export const OPERATOR_POST_START_PREFIX = "The turn ended after execution had already started.";
 
 /**
- * Snapshot a possibly-dirty worktree without mutating it, and never let that change the terminal
- * outcome the caller would otherwise have produced.
+ * Budgets for the capture. `#settlePrompt` runs this SYNCHRONOUSLY before it rejects the turn, so
+ * an unbounded git invocation blocks the Bun event loop and delays the very terminal this exists to
+ * make safe. `execFileSync` honours both of these for real on this runtime (a `timeout` overrun
+ * throws `ETIMEDOUT` after SIGKILL; a `maxBuffer` overrun throws `ENOBUFS`), so they are enforcement
+ * rather than decoration.
+ */
+const GIT_COMMAND_TIMEOUT_MS = 2_000;
+const GIT_OUTPUT_MAX_BYTES = 1_000_000;
+const PRESERVE_BUDGET_MS = 5_000;
+
+/** This is the ACP settle path, not the harness vanish path; the stash list records which. */
+const STASH_MESSAGE = "gjc-post-start-snapshot";
+
+/** The three facts the ACP path needs. Deliberately NOT the full vanish-receipt evidence set. */
+export interface WorktreeCapture {
+	status: PostStartPreservationStatus;
+	stashRef?: string;
+	untrackedNotCaptured: number;
+}
+
+/** Injectable capture seam; production uses {@link boundedWorktreeCapture}. */
+export type WorktreeCaptureFn = (workspace: string) => WorktreeCapture;
+
+function gitRun(workspace: string, args: string[]): string {
+	return execFileSync("git", args, {
+		cwd: workspace,
+		encoding: "utf8",
+		stdio: ["ignore", "pipe", "ignore"],
+		timeout: GIT_COMMAND_TIMEOUT_MS,
+		maxBuffer: GIT_OUTPUT_MAX_BYTES,
+		killSignal: "SIGKILL",
+	});
+}
+
+/**
+ * True only for a git process that ran to completion and exited with `expected`.
  *
- * `preserveDirtyWorktree` is the shipped helper (harness architect blocker B2): `git diff HEAD` +
- * sha256, an untracked manifest, and a `git stash create` + `git stash store` snapshot. It never
- * resets, cleans, commits, or otherwise touches the working tree. A clean tree makes
- * `git stash create` a no-op that emits no oid, so a failure storm cannot stash-spam the list.
+ * This is the distinction the whole `clean` vs `unknown` split rests on: a plain non-zero exit is
+ * git ANSWERING (`diff --quiet` exits 1 to mean "dirty"), whereas a spawn failure, an `ETIMEDOUT`,
+ * or an `ENOBUFS` sets a string `code` and means git never answered at all. Reading the second as
+ * the first is what would report an uninspectable worktree as clean.
+ */
+function isPlainExit(error: unknown, expected: number): boolean {
+	const candidate = error as { status?: unknown; code?: unknown } | undefined;
+	return candidate?.status === expected && typeof candidate?.code !== "string";
+}
+
+/**
+ * Bounded, read-mostly worktree capture for the ACP settle path.
  *
- * Every failure mode here returns `undefined` rather than throwing: a workspace that is not a git
- * repo, a git binary that is missing or hangs, a clean tree. Preservation is a best-effort
- * addition to a terminal path, never a new way for that path to fail.
+ * It deliberately does NOT reuse `preserveDirtyWorktree`: that helper backs a `vanish` receipt,
+ * where completeness is the point, so it hashes every untracked file's CONTENTS and runs unbounded
+ * git commands. This path needs only three facts — is it dirty, is there a recoverable ref, how
+ * many untracked files are outside that ref — and it needs them fast, so it never reads file
+ * contents and never runs a git command without a timeout and an output cap.
+ *
+ * Non-destructive, exactly as before: `git stash create` builds a commit object without touching
+ * the working tree, and `git stash store` only writes a ref. Nothing resets, cleans, or commits.
+ */
+export function boundedWorktreeCapture(workspace: string): WorktreeCapture {
+	const deadline = Date.now() + PRESERVE_BUDGET_MS;
+	const overBudget = (): boolean => Date.now() > deadline;
+	const unknown: WorktreeCapture = { status: "unknown", untrackedNotCaptured: 0 };
+
+	// 1. Tracked changes. `--quiet` produces NO output, so a huge diff cannot blow the buffer:
+	//    exit 0 = no tracked change, exit 1 = dirty, anything else = git did not answer.
+	if (overBudget()) return unknown;
+	let trackedDirty: boolean;
+	try {
+		gitRun(workspace, ["diff", "--quiet", "HEAD"]);
+		trackedDirty = false;
+	} catch (error) {
+		if (!isPlainExit(error, 1)) return unknown;
+		trackedDirty = true;
+	}
+
+	// 2. Untracked COUNT only — never contents. A worktree emitting more than the cap is
+	//    emphatically not clean, so a truncated read is `unknown`, never `clean`.
+	if (overBudget()) return unknown;
+	let untrackedNotCaptured: number;
+	try {
+		untrackedNotCaptured = gitRun(workspace, ["ls-files", "--others", "--exclude-standard"])
+			.split("\n")
+			.map(line => line.trim())
+			.filter(Boolean).length;
+	} catch {
+		return unknown;
+	}
+
+	// 3. Verified empty: nothing to stash, so nothing is stashed.
+	if (!trackedDirty && untrackedNotCaptured === 0) return { status: "clean", untrackedNotCaptured: 0 };
+	// Untracked-only: there is no tracked content for a stash object to hold, so there is no ref to
+	// offer. Reported as preserved-without-a-ref, which routes to the keep-the-worktree wording.
+	if (!trackedDirty) return { status: "preserved", untrackedNotCaptured };
+
+	// 4. Snapshot the tracked content. A failure here means no recoverable ref — still `preserved`,
+	//    because the tree IS known dirty, just not recoverable from the stash list.
+	if (overBudget()) return { status: "preserved", untrackedNotCaptured };
+	let oid: string;
+	try {
+		oid = gitRun(workspace, ["stash", "create", STASH_MESSAGE]).trim();
+	} catch {
+		return { status: "preserved", untrackedNotCaptured };
+	}
+	if (oid.length === 0) return { status: "preserved", untrackedNotCaptured };
+
+	if (overBudget()) return { status: "preserved", untrackedNotCaptured };
+	try {
+		gitRun(workspace, ["stash", "store", "-m", STASH_MESSAGE, oid]);
+	} catch {
+		// The object exists but nothing references it, so it is not durably recoverable.
+		return { status: "preserved", untrackedNotCaptured };
+	}
+	return { status: "preserved", stashRef: oid, untrackedNotCaptured };
+}
+
+/**
+ * Report what a post-start terminal managed to preserve, without ever letting that reporting change
+ * the terminal outcome the caller would otherwise have produced.
+ *
+ * Every failure mode reports `unknown` rather than throwing: a missing workspace, a workspace that
+ * is not a git repo, a git binary that is missing or hangs, a capture that overran its budget.
+ * "I could not look" is reported as exactly that, never as a verified-clean tree.
  */
 export function preservePostStartWork(
 	workspace: string | undefined,
-	preserve: typeof preserveDirtyWorktree = preserveDirtyWorktree,
-): PostStartPreservation | undefined {
-	if (typeof workspace !== "string" || workspace.length === 0) return undefined;
+	capture: WorktreeCaptureFn = boundedWorktreeCapture,
+): PostStartPreservation {
+	if (typeof workspace !== "string" || workspace.length === 0) return unverifiedPreservation();
 	try {
-		const result = preserve(workspace);
-		// Gate on dirty: a clean tree preserved nothing, so there is nothing to report and no ref
-		// an operator could recover.
-		if (result.gitDelta !== "dirty") return undefined;
+		const result = capture(workspace);
+		const status = preservationStatus(result.status);
+		if (status === "unknown") return unverifiedPreservation();
+		if (status === "clean") return { status: "clean", snapshotComplete: true };
 		const stashRef = safeStashRef(result.stashRef);
 		// `git stash create` snapshots tracked+staged content ONLY — an untracked file is absent from
 		// the stash object's tree, so `git stash apply <ref>` will not bring it back. (Not fixable by
 		// passing `-u`: `git stash create` takes a MESSAGE, not flags, so `-u` becomes the message and
 		// the tree is unchanged — verified on git 2.47.3 and 2.55.0. Real untracked capture needs
 		// `git stash push -u`, which mutates the worktree and would break this path's non-destructive
-		// guarantee.) So a dirty tree carrying untracked files is NOT completely snapshotted, whatever
-		// the shared helper's own `snapshotComplete` says about its manifest being readable.
-		const untrackedNotCaptured = result.untrackedManifest.length;
+		// guarantee.) So a dirty tree carrying untracked files is NOT completely snapshotted.
+		const untrackedNotCaptured = uncapturedUntrackedCount(result.untrackedNotCaptured);
 		return {
+			status: "preserved",
 			...(stashRef === undefined ? {} : { stashRef }),
-			snapshotComplete: result.snapshotComplete === true && stashRef !== undefined && untrackedNotCaptured === 0,
+			snapshotComplete: stashRef !== undefined && untrackedNotCaptured === 0,
 			...(untrackedNotCaptured > 0 ? { untrackedNotCaptured } : {}),
 		};
 	} catch {
-		return undefined;
+		return unverifiedPreservation();
 	}
 }
 
@@ -144,8 +292,14 @@ export function postStartOperatorMessage(input: {
 		parts.push(`${OPERATOR_UPSTREAM_LABEL}${code}${OPERATOR_UPSTREAM_SUFFIX}`);
 	} else parts.push(OPERATOR_POST_START_PREFIX);
 
+	// A submission-phase rejection never ran, so it carries no preservation at all.
+	const status = preservation === undefined ? undefined : preservationStatus(preservation.status);
 	const ref = preservation === undefined ? undefined : safeStashRef(preservation.stashRef);
-	if (preservation === undefined) parts.push("No uncommitted work was found to preserve.");
+	if (preservation === undefined || status === "clean") parts.push(OPERATOR_NOTHING_TO_PRESERVE);
+	else if (status === "unknown")
+		// Never "no work was found": nobody established that. The operator must keep the worktree
+		// precisely BECAUSE the answer is unknown.
+		parts.push(`Uncommitted work could not be verified or preserved; ${OPERATOR_KEEP_WORKTREE}.`);
 	else if (ref === undefined)
 		parts.push(
 			"Uncommitted work was found but no recoverable snapshot ref is available; do not discard this worktree.",
