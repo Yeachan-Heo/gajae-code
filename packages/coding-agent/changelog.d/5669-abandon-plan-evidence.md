@@ -1,0 +1,3 @@
+### Fixed
+
+- An ACP prompt abandoned by the inactivity watchdog now reports whether the turn's plan was still unfinished instead of collapsing into a generic internal error. The rejection keeps its `prompt_abandoned` code and message, and its JSON-RPC `data` additionally carries `planIncomplete`, `planPendingCount`, `planTotalCount`, and a bounded `planPending` list of the steps the turn never completed, so a wrapper can tell "the agent finished" from "the agent stopped with work left" instead of publishing unverified work as complete. An abandon that never observed a plan omits those fields entirely rather than guessing (#5669).
