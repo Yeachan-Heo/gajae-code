@@ -3777,6 +3777,8 @@ async function invocationHarness(
 		persistHold?: { type: string; onEntered: () => void; release: Promise<void> };
 		/** Hold successive matching durable transitions, consumed in arrival order. */
 		persistHolds?: Array<{ type: string; onEntered: () => void; release: Promise<void> }>;
+		/** Throw to inject a publication failure for a matching broadcast frame. */
+		broadcastInterceptor?: (frame: SdkFrame) => void;
 		onLifecycleDrainTimeout?: () => void;
 		onFailureDiagnosticKeyCount?: (count: number) => void;
 		agentFailedWriteFailures?: number;
@@ -3848,6 +3850,9 @@ async function invocationHarness(
 				if (typeof response.id === "string") waiters.get(response.id)?.(response);
 			},
 			broadcastFrame(frame) {
+				// Interception precedes recording: a frame whose publication throws never
+				// reached the wire, so it must not appear in the observed broadcasts.
+				hooks.broadcastInterceptor?.(frame);
 				broadcasts.push(frame);
 			},
 			start: async () => ({ url: "ws://127.0.0.1:1" }),
@@ -5912,6 +5917,99 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 			);
 			await harness.stop();
 		} finally {
+			await Bun.sleep(50);
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	test.each([
+		{ failing: "agent_failed" as const, surviving: "agent_end" as const },
+		{ failing: "agent_end" as const, surviving: "agent_failed" as const },
+	])("a deadline frame that fails to publish never suppresses the other ($failing)", async ({
+		failing,
+		surviving,
+	}) => {
+		// Review P2: the deadline's two frames were emitted as unguarded sequential
+		// calls, so a throwing agent_failed skipped the agent_end while reconciliation
+		// and the lifecycle cleanup still ran -- leaving the ACP request with NO
+		// terminal boundary, the exact failure this path exists to prevent. Each frame
+		// is now published independently, and neither failure may skip the cleanup.
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-deadline-frame-failure-"));
+		const warnings: Array<{ message: string; data: Record<string, unknown> | undefined }> = [];
+		const warn = spyOn(logger, "warn").mockImplementation((message, data) => {
+			warnings.push({ message: String(message), data: data as Record<string, unknown> | undefined });
+		});
+		const errors: Array<{ message: string; data: Record<string, unknown> | undefined }> = [];
+		const error = spyOn(logger, "error").mockImplementation((message, data) => {
+			errors.push({ message: String(message), data: data as Record<string, unknown> | undefined });
+		});
+		try {
+			let failCorrelation: { commandId?: string; turnId?: string } = {};
+			const harness = await invocationHarness(`deadline-frame-failure-${failing}`, cwd, {
+				settings: zeroProgressSettings,
+				sendUserMessage: async (_content, options) => {
+					await options?.onPreflightAcceptCommit?.();
+					await neverSettlingPromise();
+				},
+				broadcastInterceptor: frame => {
+					const payload = frame.payload as { commandId?: string; turnId?: string } | undefined;
+					if (
+						frame.kind === failing &&
+						payload?.commandId === failCorrelation.commandId &&
+						payload?.turnId === failCorrelation.turnId
+					)
+						throw Object.assign(new Error("injected publication failure"), { code: "io_error" });
+				},
+			});
+			const accepted = await harness.control("turn.prompt", { text: "frame failure" });
+			expect(accepted.ok).toBe(true);
+			const correlation = { commandId: accepted.result?.commandId, turnId: accepted.result?.turnId };
+			failCorrelation = correlation;
+			await harness.emit("agent_start");
+			await awaitCorrelatedFrames(harness, correlation, frames => frames.some(frame => frame.kind === surviving));
+			const correlated = correlatedFrames(harness, correlation);
+			// The frame whose publication threw never reached the wire; the other one
+			// still did, carrying the deadline's terminal identity.
+			expect({
+				failing: correlated.filter(frame => frame.kind === failing).length,
+				surviving: correlated.filter(frame => frame.kind === surviving).length,
+			}).toEqual({ failing: 0, surviving: 1 });
+			if (surviving === "agent_end")
+				expect(correlated.find(frame => frame.kind === "agent_end")?.payload).toMatchObject({
+					outcome: { kind: "failed", code: "prompt_deadline_exceeded", provenance: "deadline" },
+				});
+
+			// The failure is reported, with the correlation and without provider text.
+			expect([...warnings, ...errors]).toContainEqual(
+				expect.objectContaining({
+					message: expect.stringContaining("deadline correlated"),
+					data: expect.objectContaining({ commandId: correlation.commandId, turnId: correlation.turnId }),
+				}),
+			);
+
+			// The cleanup after the publication still ran: the durable record is settled,
+			// a late real boundary stays idempotent for the retired correlation, and the
+			// session still terminalizes a fresh turn.
+			expect(await settledStatus(harness, "turn.prompt_status", correlation)).toMatchObject({
+				status: "failed",
+				error: { code: "prompt_deadline_exceeded" },
+			});
+			await harness.emit("agent_end", { messages: [] });
+			expect(correlatedFrames(harness, correlation).filter(frame => frame.kind === "agent_end")).toHaveLength(
+				surviving === "agent_end" ? 1 : 0,
+			);
+			const control = await harness.control("turn.prompt", { text: "after frame failure" });
+			const controlIds = { commandId: control.result?.commandId, turnId: control.result?.turnId };
+			await harness.emit("agent_start");
+			await harness.emit("agent_end", { messages: [{ role: "assistant", content: "done" }] });
+			expect(await settledStatus(harness, "turn.prompt_status", controlIds)).toMatchObject({
+				status: "terminal_ok",
+			});
+			expect(correlatedFrames(harness, controlIds).filter(frame => frame.kind === "agent_end")).toHaveLength(1);
+			await harness.stop();
+		} finally {
+			warn.mockRestore();
+			error.mockRestore();
 			await Bun.sleep(50);
 			await rm(cwd, { recursive: true, force: true });
 		}
