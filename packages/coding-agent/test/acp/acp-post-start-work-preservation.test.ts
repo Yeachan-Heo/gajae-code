@@ -21,7 +21,7 @@
  */
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { execFileSync } from "node:child_process";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { RequestError } from "@agentclientprotocol/sdk";
@@ -211,6 +211,70 @@ describe("post-start terminal preserves the worktree before reporting failure (i
 		expect(message).toContain("changed while it was being captured");
 		expect(message).toContain("do not discard this worktree");
 		// A boolean and a count cross the wire; the path never does.
+		expect(message).not.toContain("appeared-mid-capture.ts");
+	});
+
+	// The same downgrade as above, but driven through the REAL capture: no injected result and no
+	// hand-set `stable` flag, so this is the only case that actually executes the post-capture
+	// re-read inside `boundedWorktreeCapture`.
+	//
+	// The race is produced by git itself. A `reference-transaction` hook fires when `git stash store`
+	// writes `refs/stash` — after the pre-capture observation and before the re-read — which is
+	// exactly the window the reviewer described. Three things the hook must get right: `$GIT_DIR` is
+	// not reliably set for it (so the worktree path is baked in absolute), a nonzero exit ABORTS the
+	// ref transaction and would fail the stash store, and it must fire once or later ref writes
+	// re-trigger it. The sentinel lives under `.git/` so it is not itself an untracked file and the
+	// observable delta stays exactly one path.
+	it("downgrades a real capture when git itself mutates the worktree mid-stash", async () => {
+		await writeFile(path.join(ws, "src.ts"), "export const v = 2; // tracked edit\n");
+		const hook = path.join(ws, ".git", "hooks", "reference-transaction");
+		await writeFile(
+			hook,
+			[
+				"#!/bin/sh",
+				`if [ ! -e "${ws}/.git/gjc-hook-fired" ]; then`,
+				`  : > "${ws}/.git/gjc-hook-fired"`,
+				`  printf 'export const late = true;\\n' > "${ws}/appeared-mid-capture.ts"`,
+				"fi",
+				"exit 0",
+				"",
+			].join("\n"),
+		);
+		await chmod(hook, 0o755);
+		// Pre-capture the worktree holds no untracked files at all.
+		expect(git(ws, ["ls-files", "--others", "--exclude-standard"]).trim()).toBe("");
+
+		// No seam: the production capture path, against real git.
+		const preservation = preservePostStartWork(ws);
+
+		// The hook really did fire inside the capture window.
+		expect(git(ws, ["ls-files", "--others", "--exclude-standard"])).toContain("appeared-mid-capture.ts");
+
+		// The ref it DID get is kept — it genuinely recovers the tracked edit.
+		expect(preservation.status).toBe("preserved");
+		expect(preservation.stashRef).toMatch(/^[0-9a-f]{7,64}$/);
+		// But nothing about this snapshot may be advertised as complete.
+		expect(preservation.racedDuringCapture).toBe(true);
+		expect(preservation.snapshotComplete).toBe(false);
+		// The LARGER count: the file that appeared is missing from the snapshot too.
+		expect(preservation.untrackedNotCaptured).toBe(1);
+
+		// GROUND TRUTH, real git: the stash object holds the tracked edit and not the late file.
+		const stashed = git(ws, ["ls-tree", "-r", "--name-only", preservation.stashRef ?? "<none>"])
+			.split("\n")
+			.map(line => line.trim())
+			.filter(Boolean);
+		expect(stashed).toContain("src.ts");
+		expect(stashed).not.toContain("appeared-mid-capture.ts");
+
+		const message = postStartOperatorMessage({
+			category: "provider_transport",
+			providerCode: "server_is_overloaded",
+			preservation,
+		});
+		expect(message).toContain("changed while it was being captured");
+		expect(message).toContain("do not discard this worktree");
+		// Count only — untracked paths are user-controlled and this crosses the wire.
 		expect(message).not.toContain("appeared-mid-capture.ts");
 	});
 
