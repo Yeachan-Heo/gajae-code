@@ -3122,7 +3122,7 @@ test("broker records the resolved worktree state root and preserves pre-child pr
 		await fs.rm(root, { recursive: true, force: true });
 	}
 }, 20_000);
-test("broker fails closed when the reopened terminal ledger cannot reproduce its response", async () => {
+test("broker preserves a settled response when terminal persistence read-back is unavailable", async () => {
 	const agentDir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-ledger-mismatch-"));
 	const broker = new Broker({ agentDir });
 	const originalReadTerminal = LifecycleLedger.prototype.readTerminal;
@@ -3135,6 +3135,100 @@ test("broker fails closed when the reopened terminal ledger cannot reproduce its
 			"ledger-mismatch",
 		);
 		expect(response).toEqual({
+			ok: false,
+			error: {
+				code: "invalid_input",
+				message: "Unknown lifecycle operation.",
+			},
+		});
+		const rows = (await fs.readFile(path.join(agentDir, "sdk", "lifecycle-ledger.jsonl"), "utf8"))
+			.split("\n")
+			.filter(Boolean)
+			.map(line => JSON.parse(line) as Record<string, unknown>);
+		expect(rows.findLast(row => row.operationKey === "session.unknown\0ledger-mismatch")).toMatchObject({
+			state: "terminal_error",
+			response,
+		});
+	} finally {
+		LifecycleLedger.prototype.readTerminal = originalReadTerminal;
+		await broker.stop();
+		await fs.rm(agentDir, { recursive: true, force: true });
+	}
+});
+
+test("successful create stays settled when terminal read-back is unavailable and the next create proceeds", async () => {
+	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-terminal-readback-create-"));
+	const agentDir = path.join(root, "agent");
+	const broker = new Broker({ agentDir });
+	const originalReadTerminal = LifecycleLedger.prototype.readTerminal;
+	let firstSessionId: string | undefined;
+	let secondSessionId: string | undefined;
+	try {
+		await broker.start();
+		LifecycleLedger.prototype.readTerminal = async () => undefined;
+		const first = await broker.handleRequest(
+			"session.create",
+			{ cwd: root, readinessTimeoutMs: 10_000 },
+			"terminal-readback-first",
+		);
+		expect(first.ok).toBe(true);
+		if (!first.ok || typeof (first.result as { sessionId?: unknown }).sessionId !== "string")
+			throw new Error("Expected the first create to succeed.");
+		firstSessionId = (first.result as { sessionId: string }).sessionId;
+
+		const firstRows = (await fs.readFile(path.join(agentDir, "sdk", "lifecycle-ledger.jsonl"), "utf8"))
+			.split("\n")
+			.filter(Boolean)
+			.map(line => JSON.parse(line) as Record<string, unknown>);
+		expect(firstRows.findLast(row => row.operationKey === "session.create\0terminal-readback-first")).toMatchObject({
+			state: "terminal_ok",
+			response: { ok: true, result: { sessionId: firstSessionId } },
+		});
+
+		LifecycleLedger.prototype.readTerminal = originalReadTerminal;
+		const second = await broker.handleRequest(
+			"session.create",
+			{ cwd: root, readinessTimeoutMs: 10_000 },
+			"terminal-readback-second",
+		);
+		expect(second.ok).toBe(true);
+		if (!second.ok || typeof (second.result as { sessionId?: unknown }).sessionId !== "string")
+			throw new Error("Expected the second create to succeed.");
+		secondSessionId = (second.result as { sessionId: string }).sessionId;
+	} finally {
+		LifecycleLedger.prototype.readTerminal = originalReadTerminal;
+		for (const [sessionId, key] of [
+			[firstSessionId, "terminal-readback-close-first"],
+			[secondSessionId, "terminal-readback-close-second"],
+		] as const) {
+			if (sessionId) await broker.handleRequest("session.close", { sessionId }, key).catch(() => undefined);
+		}
+		await broker.stop();
+		await fs.rm(root, { recursive: true, force: true });
+	}
+}, 20_000);
+
+test("broker marks a terminal outcome uncertain only when readable evidence conflicts", async () => {
+	const agentDir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-terminal-conflict-"));
+	const broker = new Broker({ agentDir });
+	const originalReadTerminal = LifecycleLedger.prototype.readTerminal;
+	try {
+		await broker.start();
+		LifecycleLedger.prototype.readTerminal = async function (identity, requestHash) {
+			const persisted = await originalReadTerminal.call(this, identity, requestHash);
+			return persisted
+				? {
+						...persisted,
+						response: { ok: false, error: { code: "tampered", message: "readable conflict" } },
+					}
+				: undefined;
+		};
+		const response = await broker.handleRequest(
+			"session.unknown",
+			{ sessionId: "terminal-conflict" },
+			"terminal-conflict",
+		);
+		expect(response).toMatchObject({
 			ok: false,
 			error: {
 				code: "terminal_uncertain",

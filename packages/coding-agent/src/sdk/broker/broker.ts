@@ -50,6 +50,7 @@ import {
 import {
 	type LifecycleDurableEffectsReceipt,
 	LifecycleLedger,
+	type LifecycleLedgerEntry,
 	type LifecycleStartupFailureReceipt,
 	type LifecycleState,
 } from "./lifecycle-ledger";
@@ -725,9 +726,38 @@ function canonicalJson(value: unknown): string {
 	if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
 	const record = value as Record<string, unknown>;
 	return `{${Object.keys(record)
+		.filter(key => record[key] !== undefined)
 		.sort()
 		.map(key => `${JSON.stringify(key)}:${canonicalJson(record[key])}`)
 		.join(",")}}`;
+}
+
+type TerminalPersistenceVerification =
+	| { kind: "unverified" }
+	| { kind: "verified" }
+	| { kind: "uncertain"; mismatches: readonly string[] };
+
+function verifyTerminalPersistence(
+	persisted: LifecycleLedgerEntry | undefined,
+	storedResponse: BrokerResponse,
+	durableEffects: LifecycleDurableEffectsReceipt | undefined,
+	startupFailure: LifecycleStartupFailureReceipt | undefined,
+): TerminalPersistenceVerification {
+	// A missing read-back is a verification failure, not evidence that the
+	// operation itself is ambiguous. The terminal transition was already synced
+	// before this read, so preserve its settled outcome and let a later reader
+	// reconcile the durable row.
+	if (persisted === undefined) return { kind: "unverified" };
+	const optionalReceiptJson = (value: unknown): string | undefined =>
+		value === undefined || value === null ? undefined : canonicalJson(value);
+	const mismatches = [
+		["response", canonicalJson(persisted.response), canonicalJson(storedResponse)],
+		["durableEffects", optionalReceiptJson(persisted.durableEffects), optionalReceiptJson(durableEffects)],
+		["startupFailure", optionalReceiptJson(persisted.startupFailure), optionalReceiptJson(startupFailure)],
+	]
+		.filter(([, actual, expected]) => actual !== expected)
+		.map(([field]) => field);
+	return mismatches.length === 0 ? { kind: "verified" } : { kind: "uncertain", mismatches };
 }
 
 function credentialFreeLifecycleResponse(value: unknown): unknown {
@@ -3710,12 +3740,21 @@ export class Broker {
 			});
 			if (isCleanupPending(response)) return response;
 			const persisted = await this.ledger.readTerminal(identity, requestHash);
-			const persistenceVerified =
-				persisted !== undefined &&
-				canonicalJson(persisted.response) === canonicalJson(storedResponse) &&
-				canonicalJson(persisted.durableEffects) === canonicalJson(outcome.durableEffects) &&
-				canonicalJson(persisted.startupFailure) === canonicalJson(outcome.startupFailure);
-			if (!persistenceVerified) {
+			const persistenceVerification = verifyTerminalPersistence(
+				persisted,
+				storedResponse,
+				outcome.durableEffects,
+				outcome.startupFailure,
+			);
+			if (persistenceVerification.kind === "unverified") {
+				logger.warn("sdk broker terminal persistence read-back was unavailable; preserving settled outcome", {
+					identity,
+				});
+			} else if (persistenceVerification.kind === "uncertain") {
+				logger.warn("sdk broker terminal persistence verification found conflicting evidence", {
+					identity,
+					mismatches: persistenceVerification.mismatches,
+				});
 				const uncertain = error(
 					"terminal_uncertain",
 					"Lifecycle terminal evidence could not be verified after persistence; retained artifacts require reconciliation.",
