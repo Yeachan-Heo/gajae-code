@@ -92,7 +92,7 @@ import { publishSessionHostRuntimeEvidence, type SessionHostRuntimePublication }
 import { processIncarnation } from "../broker/process-incarnation";
 import { resolveSessionLocator, SessionIndex, type SessionIndexEvent } from "../broker/session-index";
 import {
-	CAP_GATED_FRAME_KINDS,
+	canDeliverSdkEvent,
 	createSdkSurfaceFactory,
 	masterAttestationForEffectiveHost,
 	reattestMasterSessionIdentity,
@@ -100,7 +100,6 @@ import {
 	type SessionSdkHost,
 	SessionSdkSessionRuntime,
 	shouldHostSdk,
-	TOOL_ACTIVITY_CAPABILITY,
 	verifyMasterCapabilityFrame,
 } from "../host";
 import { type AbortScope, type ControlSurface, dispatchControl, TypedControlError } from "../host/control";
@@ -4755,6 +4754,7 @@ export function createNotificationsExtension(
 		type HostCapabilityCacheEntry = { generation: number; capabilities: ReadonlySet<string> };
 		const hostCapCache = new Map<string, HostCapabilityCacheEntry>();
 		const hostConnectionIncarnations = new Map<string, HostConnectionIncarnation>();
+		const hostAttachedConnections = new Set<string>();
 		let nextHostConnectionGeneration = 0;
 		const liveHostConnection = (connectionId: string): HostConnectionIncarnation | undefined => {
 			if (!connectionId) return undefined;
@@ -4790,6 +4790,7 @@ export function createNotificationsExtension(
 				});
 			}
 			hostCapCache.delete(connectionId);
+			hostAttachedConnections.delete(connectionId);
 		};
 
 		const configOverrides = new Map<string, unknown>();
@@ -4881,17 +4882,17 @@ export function createNotificationsExtension(
 		 * ordinary direct SDK subscribers retain both public surfaces from #4570.
 		 */
 		const broadcastEventFrame = (event: SdkFrame): string[] => {
-			const gated = CAP_GATED_FRAME_KINDS.has(String(event.kind));
 			const json = JSON.stringify(event);
 			const recipients: string[] = [];
-			for (const [connectionId, entry] of hostCapCache) {
-				const capabilities = entry.capabilities;
-				if (liveHostCapabilities(connectionId) !== capabilities) continue;
+			for (const connectionId of hostAttachedConnections) {
+				const incarnation = hostConnectionIncarnations.get(connectionId);
+				if (!incarnation || incarnation.closed) continue;
+				const capabilities = liveHostCapabilities(connectionId);
 				if (fencedConnections.has(connectionId)) continue;
-				if (gated && !capabilities.has(TOOL_ACTIVITY_CAPABILITY)) continue;
+				if (!canDeliverSdkEvent(String(event.kind), capabilities)) continue;
 				try {
 					server.sendTo(connectionId, json);
-					if (capabilities.has(POSITIONED_NOTIFICATION_EFFECTS_CAPABILITY)) recipients.push(connectionId);
+					if (capabilities?.has(POSITIONED_NOTIFICATION_EFFECTS_CAPABILITY)) recipients.push(connectionId);
 				} catch {
 					// Broadcasts are best effort; directed responses surface send failures.
 				}
@@ -4899,17 +4900,17 @@ export function createNotificationsExtension(
 			return recipients;
 		};
 		const broadcastEventFrameWithReceipts = (event: SdkFrame): string[] => {
-			const gated = CAP_GATED_FRAME_KINDS.has(String(event.kind));
 			const json = JSON.stringify(event);
 			const receipts: string[] = [];
-			for (const [connectionId, entry] of hostCapCache) {
-				const capabilities = entry.capabilities;
-				if (liveHostCapabilities(connectionId) !== capabilities) continue;
+			for (const connectionId of hostAttachedConnections) {
+				const incarnation = hostConnectionIncarnations.get(connectionId);
+				if (!incarnation || incarnation.closed) continue;
+				const capabilities = liveHostCapabilities(connectionId);
 				if (fencedConnections.has(connectionId)) continue;
-				if (gated && !capabilities.has(TOOL_ACTIVITY_CAPABILITY)) continue;
+				if (!canDeliverSdkEvent(String(event.kind), capabilities)) continue;
 				try {
 					const receipt = server.sendToWithReceipt(connectionId, json);
-					if (capabilities.has(POSITIONED_NOTIFICATION_EFFECTS_CAPABILITY)) receipts.push(receipt);
+					if (capabilities?.has(POSITIONED_NOTIFICATION_EFFECTS_CAPABILITY)) receipts.push(receipt);
 				} catch {
 					// Rejected positioned sends remain eligible for the atomic raw fallback.
 				}
@@ -7429,14 +7430,10 @@ export function createNotificationsExtension(
 						sendEndpointStale(inbound.connectionId, typedFrame);
 						return;
 					}
-					if (typedFrame.type === "ephemeral_turn" || typedFrame.type === "ephemeral_turn_cancel") return;
 					if (typedFrame.type === "event_replay") {
-						const capabilities = Array.isArray(typedFrame.capabilities) ? typedFrame.capabilities : [];
-						rememberHostCapabilities(
-							inbound.connectionId,
-							capabilities.filter((capability): capability is string => typeof capability === "string"),
-						);
+						if (liveHostConnection(inbound.connectionId)) hostAttachedConnections.add(inbound.connectionId);
 					}
+					if (typedFrame.type === "ephemeral_turn" || typedFrame.type === "ephemeral_turn_cancel") return;
 					inboundSdkFrame?.(inbound.connectionId, typedFrame);
 				} catch (error) {
 					sendMalformed(
@@ -7469,7 +7466,18 @@ export function createNotificationsExtension(
 				);
 			}
 			server.onNegotiatedCapabilities((_err, connectionId, capabilities) => {
-				if (connectionId) rememberHostCapabilities(connectionId, capabilities);
+				// ThreadsafeFunction currently delivers its tuple payload as the second
+				// callback argument at runtime, while older generated declarations expose
+				// the tuple members as separate parameters. Accept both shapes without
+				// allowing an unvalidated payload to become authority.
+				const tuple = Array.isArray(connectionId) ? (connectionId as unknown[]) : undefined;
+				const id = tuple?.[0] ?? connectionId;
+				const negotiated = tuple?.[1] ?? capabilities;
+				if (typeof id === "string" && Array.isArray(negotiated))
+					rememberHostCapabilities(
+						id,
+						negotiated.filter((capability): capability is string => typeof capability === "string"),
+					);
 			});
 			server.onConnectionClose((_err, connectionId) => {
 				if (!connectionId) return;

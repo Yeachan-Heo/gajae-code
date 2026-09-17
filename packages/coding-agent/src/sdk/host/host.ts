@@ -108,6 +108,11 @@ export const SESSION_HOST_OBSERVER_CAPABILITY = "session_host_observer_v1";
 export const CAP_GATED_FRAME_KINDS: ReadonlySet<string> = new Set(["tool_activity", "reasoning_summary"]);
 const EMPTY_CAPABILITIES: ReadonlySet<string> = new Set();
 
+/** Keep live delivery and replay on one capability gate. */
+export function canDeliverSdkEvent(kind: string, capabilities: ReadonlySet<string> | undefined): boolean {
+	return !CAP_GATED_FRAME_KINDS.has(kind) || capabilities?.has(TOOL_ACTIVITY_CAPABILITY) === true;
+}
+
 /** Safe, identifier-free explanations for every refused activation status. */
 const ACTIVATION_MESSAGES: Record<
 	Exclude<SessionActivationOutcome, "activated" | "already"> | "session_mismatch",
@@ -596,9 +601,7 @@ export class SessionSdkHost {
 					const sinceSeq = rawSeq;
 					const replay = this.events.replay(sinceSeq, sinceGeneration);
 					const capabilities = this.#options.connectionCapabilities?.(connectionId) ?? EMPTY_CAPABILITIES;
-					const events = replay.events.filter(
-						event => !CAP_GATED_FRAME_KINDS.has(String(event.kind)) || capabilities.has(TOOL_ACTIVITY_CAPABILITY),
-					);
+					const events = replay.events.filter(event => canDeliverSdkEvent(String(event.kind), capabilities));
 					await this.#send(connectionId, {
 						type: "event_replay_result",
 						id,

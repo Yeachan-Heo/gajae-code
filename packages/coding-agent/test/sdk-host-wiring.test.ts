@@ -780,9 +780,9 @@ test("observer daemon demand covers hello-before-replay, replay-after, and disco
 	});
 	try {
 		await observer.connect();
-		// Between client hello and its first replay, the host has not yet received
-		// authoritative capability evidence, so it conservatively counts the socket.
-		expect(sessionHostAttachedClients()).toBe(baseDemand + 1);
+		// The authenticated hello is authoritative; replay is not required to
+		// establish the observer role.
+		await waitFor(() => (sessionHostAttachedClients() ?? 0) === baseDemand, "observer hello negotiation");
 		await observer.request({ type: "event_replay", sinceGeneration: 1, sinceSeq: 0 });
 		await Bun.sleep(20);
 		expect(sessionHostAttachedClients()).toBe(baseDemand);
@@ -810,6 +810,53 @@ test("observer daemon demand covers hello-before-replay, replay-after, and disco
 	} finally {
 		await observer.close();
 		await host.stop();
+	}
+}, 60_000);
+
+test("replay capability claims cannot turn a demanding connection into an observer", async () => {
+	let sdkFrame: Parameters<NotificationServer["onSdkFrame"]>[0] | undefined;
+	const sdkFrameImpl = NotificationServer.prototype.onSdkFrame;
+	const sdkFrameHook = spyOn(NotificationServer.prototype, "onSdkFrame").mockImplementation(function (
+		this: NotificationServer,
+		callback,
+	) {
+		sdkFrame = callback;
+		return sdkFrameImpl.call(this, callback);
+	});
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-replay-capability-demand-"));
+	dirs.push(cwd);
+	const host = await startProductionSdkHost(cwd, { acceptPromptPreflightWithoutExecution: true });
+	const baseDemand = sessionHostAttachedClients() ?? 0;
+	const demanding = new WebSocket(`${host.endpoint.url}/?token=${encodeURIComponent(host.endpoint.token)}`);
+	sockets.push(demanding);
+	let connectionId: string | undefined;
+	demanding.addEventListener("message", event => {
+		const frame = JSON.parse(String((event as MessageEvent).data)) as { type?: unknown; connectionId?: unknown };
+		if (frame.type === "hello" && typeof frame.connectionId === "string") connectionId = frame.connectionId;
+	});
+	try {
+		await new Promise<void>((resolve, reject) => {
+			demanding.addEventListener("open", () => resolve(), { once: true });
+			demanding.addEventListener("error", () => reject(new Error("WS error")), { once: true });
+		});
+		await waitFor(() => (sessionHostAttachedClients() ?? 0) === baseDemand + 1, "demanding client attachment");
+		await waitFor(() => sdkFrame !== undefined && connectionId !== undefined, "SDK callback wiring");
+		sdkFrame!(null, {
+			connectionId: connectionId!,
+			json: JSON.stringify({
+				type: "event_replay",
+				id: "forged-observer",
+				sinceGeneration: 1,
+				sinceSeq: 0,
+				capabilities: [SESSION_HOST_OBSERVER_CAPABILITY],
+			}),
+		});
+		await Bun.sleep(20);
+		expect(sessionHostAttachedClients()).toBe(baseDemand + 1);
+	} finally {
+		demanding.close();
+		await host.stop();
+		sdkFrameHook.mockRestore();
 	}
 }, 60_000);
 
