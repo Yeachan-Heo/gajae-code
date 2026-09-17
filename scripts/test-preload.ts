@@ -82,6 +82,33 @@ if (isolation.action === "isolate") {
 	process.env.GJC_CODING_AGENT_DIR = agentDir;
 	process.env.PI_CODING_AGENT_DIR = agentDir;
 }
+
+// Isolate the log sink for every test process (issue #5618). The agent-dir
+// isolation above does not cover logging: `getLogsDir()` resolves
+// `rootSubdir("logs", "state")` — the REAL config root — so fixtures that drive
+// production code paths append genuine `level:error` records to the operator's
+// shared `~/.gjc/logs/gjc.<date>.log`. In a measured 24h window 90% of the error
+// records in that sink were ACP prompt-watchdog fixture output, which makes the
+// operator's own log useless for diagnosing real failures.
+//
+// Setting this on `process.env` also reaches spawned child fixtures, which is
+// intended: they inherit the same isolated sink.
+//
+// A caller that pinned GJC_LOG_DIR explicitly means it (e.g. a fixture asserting
+// on log content), so honor it untouched.
+//
+// FAIL CLOSED, as with the agent dir: if the temp sink cannot be created, throw.
+// Continuing would silently run the suite against the operator's live log sink,
+// which is the regression this exists to prevent.
+if (!process.env.GJC_LOG_DIR?.trim()) {
+	try {
+		process.env.GJC_LOG_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-test-logs-"));
+	} catch (error) {
+		throw new Error(
+			`Test log-directory isolation failed; refusing to run tests against the live log sink: ${String(error)}`,
+		);
+	}
+}
 //
 // Recursive-deletion boundary (issue #4794). An operator's real home was
 // destroyed by test cleanup activity; this preload now installs a

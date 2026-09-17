@@ -73,10 +73,25 @@ function makeLogFormat(winston: WinstonModule): winston.Logform.Format {
 	);
 }
 
-/** Build a rotating file transport, materializing the target directory lazily. */
+/**
+ * Build a rotating file transport, materializing the target directory lazily.
+ *
+ * Destination precedence:
+ *   1. `dir` — an explicit path from {@link setTransports}(`{ file: "<path>" }`).
+ *   2. `GJC_LOG_DIR` — read here rather than at module load so a preload that
+ *      pins it before the first log write is honored. Blank values are ignored.
+ *   3. {@link getLogsDir} — the real config root (`~/.gjc/logs`) in production.
+ *
+ * The env var exists so test processes stop appending to the operator's shared
+ * sink (issue #5618): logs resolve from the config root, not the agent dir, so
+ * the preload's `GJC_CODING_AGENT_DIR` isolation does not cover them. The
+ * override lives here instead of in `getLogsDir()` so that function's path
+ * semantics — and the tests pinning them — stay intact.
+ */
 function makeFileTransport(DailyRotateFile: DailyRotateFileCtor, dir?: string): Transport {
+	const envDir = process.env.GJC_LOG_DIR?.trim();
 	return new DailyRotateFile({
-		dirname: ensureDir(dir ?? getLogsDir()),
+		dirname: ensureDir(dir ?? (envDir ? envDir : getLogsDir())),
 		filename: "gjc.%DATE%.log",
 		datePattern: "YYYY-MM-DD",
 		maxSize: "10m",
