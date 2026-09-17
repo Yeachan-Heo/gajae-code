@@ -39,6 +39,11 @@ import { getDisplayChangelogEntries } from "../../utils/changelog";
 import { copyToClipboard } from "../../utils/clipboard";
 import { openPath } from "../../utils/open";
 import {
+	beginSessionTitleGeneration,
+	invalidateSessionTitleGeneration,
+	isSessionTitleGenerationCurrent,
+} from "../../utils/session-title-generation";
+import {
 	buildConversationTitleInput,
 	generateSessionTitle,
 	setSessionTerminalTitle,
@@ -1193,6 +1198,7 @@ export class CommandController {
 	async handleRenameCommand(title?: string): Promise<void> {
 		try {
 			if (!title?.trim()) {
+				const generation = beginSessionTitleGeneration(this.ctx.sessionManager);
 				const input = buildConversationTitleInput(this.ctx.session.messages);
 				if (!input) {
 					this.ctx.showError("Nothing to summarize yet — pass a title: /rename <title>");
@@ -1207,6 +1213,11 @@ export class CommandController {
 					this.ctx.session.model,
 					provider => this.ctx.session.agent.metadataForProvider(provider),
 				);
+				if (
+					!isSessionTitleGenerationCurrent(this.ctx.sessionManager, generation) ||
+					buildConversationTitleInput(this.ctx.session.messages) !== input
+				)
+					return;
 				if (!generated) {
 					this.ctx.showError("Could not generate a session title — pass one: /rename <title>");
 					return;
@@ -1221,6 +1232,7 @@ export class CommandController {
 				return;
 			}
 
+			invalidateSessionTitleGeneration(this.ctx.sessionManager);
 			const stored = await this.ctx.sessionManager.setSessionName(title, "user");
 			if (!stored) {
 				this.ctx.showError("Session name cannot be empty.");

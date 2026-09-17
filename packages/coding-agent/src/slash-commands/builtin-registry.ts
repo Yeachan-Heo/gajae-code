@@ -45,6 +45,11 @@ import {
 } from "../setup/provider-onboarding";
 import { parseThinkingLevel } from "../thinking";
 import { getDisplayChangelogEntries } from "../utils/changelog";
+import {
+	beginSessionTitleGeneration,
+	invalidateSessionTitleGeneration,
+	isSessionTitleGenerationCurrent,
+} from "../utils/session-title-generation";
 import { buildConversationTitleInput, generateSessionTitle } from "../utils/title-generator";
 import { handleAsideAcp } from "./helpers/aside";
 import { buildAutoroutingStatusReport } from "./helpers/autorouting-status";
@@ -143,6 +148,7 @@ function toSlashCommandRuntime(runtime: TuiSlashCommandRuntime): SlashCommandRun
 
 async function regenerateSessionTitle(runtime: SlashCommandRuntime): Promise<SlashCommandResult> {
 	try {
+		const generation = beginSessionTitleGeneration(runtime.sessionManager);
 		const input = buildConversationTitleInput(runtime.session.messages);
 		if (!input) {
 			return usage("Nothing to summarize yet — pass a title: /rename <title>", runtime);
@@ -156,6 +162,11 @@ async function regenerateSessionTitle(runtime: SlashCommandRuntime): Promise<Sla
 			runtime.session.model,
 			provider => runtime.session.agent.metadataForProvider(provider),
 		);
+		if (
+			!isSessionTitleGenerationCurrent(runtime.sessionManager, generation) ||
+			buildConversationTitleInput(runtime.session.messages) !== input
+		)
+			return commandConsumed();
 		if (!generated) {
 			return usage("Could not generate a session title — pass one: /rename <title>", runtime);
 		}
@@ -2172,6 +2183,7 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 		allowArgs: true,
 		handle: async (command, runtime) => {
 			if (!command.args) return regenerateSessionTitle(runtime);
+			invalidateSessionTitleGeneration(runtime.sessionManager);
 			const ok = await runtime.sessionManager.setSessionName(command.args, "user");
 			if (!ok) {
 				await runtime.output("Session name not changed (a user-set name takes precedence).");

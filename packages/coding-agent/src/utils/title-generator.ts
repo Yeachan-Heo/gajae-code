@@ -100,9 +100,11 @@ function getTitleModel(registry: ModelRegistry, settings: Settings, currentModel
 }
 
 /**
- * Generate a title for a session based on the first user message.
+ * Generate a title for a session based on the provided user-message input.
+ * Automatic titles pass the first user message; regeneration passes a bounded
+ * conversation digest.
  *
- * @param firstMessage The first user message
+ * @param firstMessage The first user message or bounded conversation digest
  * @param registry Model registry
  * @param settings Settings used to resolve the smol role
  * @param sessionId Optional session id for sticky API key selection
