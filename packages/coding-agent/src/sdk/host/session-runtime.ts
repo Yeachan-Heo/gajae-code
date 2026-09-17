@@ -4395,16 +4395,57 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 	 * already-retired correlation. Growth is bounded by FIFO eviction instead (a Set
 	 * preserves insertion order). A correlation displaced by 1024 later boundaries is long
 	 * retired, and its durable record stays authoritative for anything a consumer missed.
+	 *
+	 * Eviction must never reach a correlation that can still be published (review P1). A
+	 * handler captures its transitions, awaits durable writes, and claims only immediately
+	 * before its emit; parked on those awaits, 1024 later boundaries would otherwise evict
+	 * its key and let its delayed agent_end publish a SECOND boundary for a correlation the
+	 * deadline already terminalized. Every would-be publisher therefore RETAINS its
+	 * correlations for as long as it can still reach a claim, and a retained key is skipped
+	 * as an eviction victim.
 	 */
 	const MAX_PUBLISHED_TERMINAL_BOUNDARIES = 1024;
 	const publishedTerminalBoundaries = new Set<string>();
+	/** Correlations with at least one publisher still able to reach a claim. */
+	const retainedTerminalBoundaries = new Map<string, number>();
+	/**
+	 * Protect every correlation this publisher may still claim, and return its release.
+	 * Callers MUST release on every exit path -- published, claim lost, or threw -- so a
+	 * failure cannot leak a permanent protection.
+	 */
+	const retainTerminalBoundaries = (
+		invocations: ReadonlyArray<{ correlation: InvocationCorrelation }>,
+	): (() => void) => {
+		const keys = invocations.map(({ correlation }) => lifecycleCorrelationKey(correlation));
+		for (const key of keys) retainedTerminalBoundaries.set(key, (retainedTerminalBoundaries.get(key) ?? 0) + 1);
+		let released = false;
+		return () => {
+			if (released) return;
+			released = true;
+			for (const key of keys) {
+				const retained = retainedTerminalBoundaries.get(key);
+				if (retained === undefined) continue;
+				if (retained > 1) retainedTerminalBoundaries.set(key, retained - 1);
+				else retainedTerminalBoundaries.delete(key);
+			}
+		};
+	};
 	const claimTerminalBoundary = (correlation: InvocationCorrelation): boolean => {
 		const key = lifecycleCorrelationKey(correlation);
 		if (publishedTerminalBoundaries.has(key)) return false;
 		publishedTerminalBoundaries.add(key);
-		if (publishedTerminalBoundaries.size > MAX_PUBLISHED_TERMINAL_BOUNDARIES) {
-			const oldest = publishedTerminalBoundaries.values().next();
-			if (!oldest.done) publishedTerminalBoundaries.delete(oldest.value);
+		while (publishedTerminalBoundaries.size > MAX_PUBLISHED_TERMINAL_BOUNDARIES) {
+			let victim: string | undefined;
+			for (const candidate of publishedTerminalBoundaries) {
+				if (retainedTerminalBoundaries.has(candidate)) continue;
+				victim = candidate;
+				break;
+			}
+			// Every key is still publishable: exceed the bound rather than evict a live
+			// one. Correctness beats the bound, and the excess is bounded by the live
+			// lifecycles the session already bounds.
+			if (victim === undefined) break;
+			publishedTerminalBoundaries.delete(victim);
 		}
 		return true;
 	};
@@ -4760,6 +4801,11 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		// recorded as observed=false, never rethrown into the api handler.
 		let observed = true;
 		const failedTransitions: Array<{ kind: InvocationKind; correlation: InvocationCorrelation }> = [];
+		// Retained BEFORE the first durable await: from here this publisher can still
+		// reach the claim below, so no later boundary may evict its correlations while
+		// it is parked. A start retains too -- its keys are not published yet, so the
+		// protection is inert, and one unconditional release path cannot leak.
+		const releaseTerminalRetention = retainTerminalBoundaries(transitions);
 		try {
 			for (const invocation of transitions) {
 				try {
@@ -4922,6 +4968,10 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			}
 		} catch {
 			observed = false;
+		} finally {
+			// Every exit path -- published, claim lost, or threw -- releases: this
+			// publisher can no longer reach a claim.
+			releaseTerminalRetention();
 		}
 		if (type === "agent_end" && isContinuingMidRunMaintenanceOutcome(maintenanceOutcome)) return;
 		if (type === "agent_end") {
@@ -5290,19 +5340,27 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				// NEITHER frame, but still run the cleanup below, and still let #expire
 				// finish its durable reconciliation. Losing the boundary must not skip
 				// cleanup.
-				if (claimTerminalBoundary(correlation)) {
-					runtime.emitEvent({
-						type: "agent_failed",
-						sessionId,
-						...correlation,
-						error: failure,
-					});
-					runtime.emitEvent({
-						type: "agent_end",
-						sessionId,
-						...correlation,
-						outcome: canonicalFailedOutcome(failure, "deadline"),
-					});
+				//
+				// Retained for the whole publication: this path owns the correlation from
+				// here, so a concurrent boundary must not evict its key mid-flight.
+				const releaseTerminalRetention = retainTerminalBoundaries([{ correlation }]);
+				try {
+					if (claimTerminalBoundary(correlation)) {
+						runtime.emitEvent({
+							type: "agent_failed",
+							sessionId,
+							...correlation,
+							error: failure,
+						});
+						runtime.emitEvent({
+							type: "agent_end",
+							sessionId,
+							...correlation,
+							outcome: canonicalFailedOutcome(failure, "deadline"),
+						});
+					}
+				} finally {
+					releaseTerminalRetention();
 				}
 				if (owner) {
 					removeLifecycleReferences(owner, correlation);
