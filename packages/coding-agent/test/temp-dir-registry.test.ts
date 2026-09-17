@@ -8,10 +8,15 @@ import {
 	reapStaleTempDirs,
 	STALE_TEMP_DIR_REAP_AGE_MS,
 	sweepAfterSettle,
+	TEMP_DIR_OWNER_MARKER,
 } from "./helpers/temp-dir-registry";
 
 const HELPER_MODULE = path.join(import.meta.dir, "helpers", "temp-dir-registry.ts");
 const PREFIX = "pi-temp-dir-registry-test-";
+/** Comfortably past the age gate, so age is never what keeps a root alive. */
+const ANCIENT_MS = STALE_TEMP_DIR_REAP_AGE_MS + 60_000;
+/** Stand-in owner pid for cases that inject their own probe verdict. */
+const DEAD_PID = 999_999;
 
 /** Scratch roots this file owns, removed unconditionally after every case. */
 const scratchRoots: string[] = [];
@@ -21,6 +26,28 @@ function makeScratchRoot(): string {
 	fs.mkdirSync(root, { recursive: true });
 	scratchRoots.push(root);
 	return root;
+}
+
+function writeMarker(dir: string, owner: { pid: number; host: string; startedAt: number }): void {
+	fs.writeFileSync(path.join(dir, TEMP_DIR_OWNER_MARKER), JSON.stringify(owner));
+}
+
+function ageDir(dir: string, ageMs: number): void {
+	const stamp = new Date(Date.now() - ageMs);
+	fs.utimesSync(dir, stamp, stamp);
+}
+
+/** A prefixed root with a well-formed marker, aged by both mtime and `startedAt`. */
+function makeOwnedRoot(root: string, name: string, options: { ageMs: number; pid?: number; host?: string }): string {
+	const dir = path.join(root, `${PREFIX}${name}`);
+	fs.mkdirSync(dir);
+	writeMarker(dir, {
+		pid: options.pid ?? DEAD_PID,
+		host: options.host ?? os.hostname(),
+		startedAt: Date.now() - options.ageMs,
+	});
+	ageDir(dir, options.ageMs);
+	return dir;
 }
 
 afterEach(() => {
@@ -102,19 +129,32 @@ describe("temp dir registry", () => {
 		expect(fs.existsSync(late)).toBe(false);
 	});
 
-	it("reaps a stale root and leaves a fresh one", () => {
+	it("register writes an ownership marker naming this process", () => {
 		const root = makeScratchRoot();
-		const stale = path.join(root, `${PREFIX}stale`);
-		const fresh = path.join(root, `${PREFIX}fresh`);
+		const dir = path.join(root, "claimed");
+		fs.mkdirSync(dir);
+
+		createTempDirRegistry().register(dir);
+
+		const marker = JSON.parse(fs.readFileSync(path.join(dir, TEMP_DIR_OWNER_MARKER), "utf8")) as {
+			pid: number;
+			host: string;
+			startedAt: number;
+		};
+		expect(marker.pid).toBe(process.pid);
+		expect(marker.host).toBe(os.hostname());
+		expect(Number.isFinite(marker.startedAt)).toBe(true);
+	});
+
+	it("reaps a dead-owner root and leaves a fresh one", () => {
+		const root = makeScratchRoot();
+		const stale = makeOwnedRoot(root, "stale", { ageMs: ANCIENT_MS });
+		const fresh = makeOwnedRoot(root, "fresh", { ageMs: 0 });
 		const unrelated = path.join(root, "pi-some-other-suite-stale");
-		for (const dir of [stale, fresh, unrelated]) fs.mkdirSync(dir);
+		fs.mkdirSync(unrelated);
+		writeMarker(unrelated, { pid: DEAD_PID, host: os.hostname(), startedAt: Date.now() - ANCIENT_MS });
 
-		const now = Date.now();
-		const old = new Date(now - STALE_TEMP_DIR_REAP_AGE_MS - 60_000);
-		fs.utimesSync(stale, old, old);
-		fs.utimesSync(unrelated, old, old);
-
-		reapStaleTempDirs(PREFIX, { root, now });
+		reapStaleTempDirs(PREFIX, { root, now: Date.now(), pidProbe: () => "dead" });
 
 		expect(fs.existsSync(stale)).toBe(false);
 		expect(fs.existsSync(fresh)).toBe(true);
@@ -122,14 +162,107 @@ describe("temp dir registry", () => {
 		expect(fs.existsSync(unrelated)).toBe(true);
 	});
 
+	// The reviewer's scenario for #5672: a shard paused at a breakpoint, or one
+	// simply running long, leaves its root untouched past the age gate while
+	// still holding it. Age alone would delete a live run's session state.
+	it("keeps an ancient root whose owner is still alive", () => {
+		const root = makeScratchRoot();
+		const live = makeOwnedRoot(root, "live", { ageMs: ANCIENT_MS });
+
+		reapStaleTempDirs(PREFIX, { root, now: Date.now(), pidProbe: () => "alive" });
+
+		expect(fs.existsSync(live)).toBe(true);
+	});
+
+	it("keeps an ancient root when the probe cannot answer", () => {
+		const root = makeScratchRoot();
+		const opaque = makeOwnedRoot(root, "opaque", { ageMs: ANCIENT_MS });
+
+		// EPERM and any other refusal land here: not evidence of death.
+		reapStaleTempDirs(PREFIX, { root, now: Date.now(), pidProbe: () => "unknown" });
+
+		expect(fs.existsSync(opaque)).toBe(true);
+	});
+
+	it("keeps an ancient root that carries no marker at all", () => {
+		const root = makeScratchRoot();
+		const unmarked = path.join(root, `${PREFIX}unmarked`);
+		fs.mkdirSync(unmarked);
+		ageDir(unmarked, ANCIENT_MS);
+
+		reapStaleTempDirs(PREFIX, { root, now: Date.now(), pidProbe: () => "dead" });
+
+		// Roots predating the marker cannot be proven abandoned, so they stay.
+		expect(fs.existsSync(unmarked)).toBe(true);
+	});
+
+	it("keeps an ancient root whose marker is unparseable", () => {
+		const root = makeScratchRoot();
+		const garbled = path.join(root, `${PREFIX}garbled`);
+		fs.mkdirSync(garbled);
+		fs.writeFileSync(path.join(garbled, TEMP_DIR_OWNER_MARKER), "{not json");
+		ageDir(garbled, ANCIENT_MS);
+
+		reapStaleTempDirs(PREFIX, { root, now: Date.now(), pidProbe: () => "dead" });
+
+		expect(fs.existsSync(garbled)).toBe(true);
+	});
+
+	it("keeps an ancient root owned by another host", () => {
+		const root = makeScratchRoot();
+		const foreign = makeOwnedRoot(root, "foreign", { ageMs: ANCIENT_MS, host: `${os.hostname()}-elsewhere` });
+
+		// A pid number only means something on the host that issued it, so a
+		// local ESRCH says nothing about a foreign owner.
+		reapStaleTempDirs(PREFIX, { root, now: Date.now(), pidProbe: () => "dead" });
+
+		expect(fs.existsSync(foreign)).toBe(true);
+	});
+
+	it("keeps the running process's own root", () => {
+		const root = makeScratchRoot();
+		const mine = makeOwnedRoot(root, "mine", { ageMs: ANCIENT_MS, pid: process.pid });
+
+		reapStaleTempDirs(PREFIX, { root, now: Date.now(), pidProbe: () => "dead" });
+
+		expect(fs.existsSync(mine)).toBe(true);
+	});
+
+	it("keeps a dead-owner root that is still inside the age window", () => {
+		const root = makeScratchRoot();
+		const recent = makeOwnedRoot(root, "recent", { ageMs: 60_000 });
+
+		reapStaleTempDirs(PREFIX, { root, now: Date.now(), pidProbe: () => "dead" });
+
+		expect(fs.existsSync(recent)).toBe(true);
+	});
+
+	// Exercises the real `process.kill(pid, 0)` path rather than the seam, so
+	// the injected probe is not the only thing ever tested.
+	it("reaps via the default probe when the owner pid has genuinely exited", () => {
+		const exited = Bun.spawnSync({ cmd: ["true"] });
+		const exitedPid = exited.pid;
+		expect(typeof exitedPid).toBe("number");
+
+		const root = makeScratchRoot();
+		const abandoned = makeOwnedRoot(root, "abandoned", { ageMs: ANCIENT_MS, pid: exitedPid });
+		const live = makeOwnedRoot(root, "live", { ageMs: ANCIENT_MS, pid: process.pid });
+
+		// No pidProbe: the default probeTempDirOwner runs.
+		reapStaleTempDirs(PREFIX, { root, now: Date.now() });
+
+		expect(fs.existsSync(abandoned)).toBe(false);
+		expect(fs.existsSync(live)).toBe(true);
+	});
+
 	it("refuses an empty prefix instead of reaping the whole root", () => {
 		const root = makeScratchRoot();
 		const victim = path.join(root, "anything");
 		fs.mkdirSync(victim);
-		const old = new Date(Date.now() - STALE_TEMP_DIR_REAP_AGE_MS - 60_000);
-		fs.utimesSync(victim, old, old);
+		writeMarker(victim, { pid: DEAD_PID, host: os.hostname(), startedAt: Date.now() - ANCIENT_MS });
+		ageDir(victim, ANCIENT_MS);
 
-		reapStaleTempDirs("", { root });
+		reapStaleTempDirs("", { root, pidProbe: () => "dead" });
 
 		expect(fs.existsSync(victim)).toBe(true);
 	});
