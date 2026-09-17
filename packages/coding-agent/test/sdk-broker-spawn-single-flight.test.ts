@@ -9,10 +9,14 @@ import type { BrokerDiscovery } from "../src/sdk/broker/discovery";
 import * as brokerDiscovery from "../src/sdk/broker/discovery";
 import {
 	acquireSpawnLockForTest,
+	BROKER_DISCOVERY_BUDGET,
 	brokerOwnerForTest,
 	closeBrokerClientBeforeDeadline,
+	type EnsureBrokerTiming,
 	ensureBroker,
 	readBrokerDiscoveryBeforeDeadlineForTest,
+	reconcileBrokerGenerationForStartup,
+	setEnsureBrokerTimingForTest,
 	withBrokerStartupLock,
 } from "../src/sdk/broker/ensure";
 
@@ -55,6 +59,44 @@ function spawnLockWorker(
 		await release();
 	`;
 	return Bun.spawn([process.execPath, "-e", source], { stdin: "ignore", stdout: "pipe", stderr: "pipe", env });
+}
+
+/**
+ * #5604: the session CLI reports a discovery-budget expiry as a JSON envelope on
+ * stdout, with exit code 1 and a legitimately empty stderr. An assertion that
+ * reads only `{code, error}` therefore throws its own diagnostic away and prints
+ * `{code: 1, error: ""}`. Fold the envelope's reason into the assertion instead.
+ */
+function cliFailureReason(stdout: string): string | undefined {
+	const trimmed = stdout.trim();
+	if (trimmed.length === 0) return undefined;
+	try {
+		const envelope = JSON.parse(trimmed) as { ok?: unknown; error?: { code?: unknown; message?: unknown } };
+		if (envelope.ok !== false) return undefined;
+		return `${envelope.error?.code ?? "unknown"}: ${envelope.error?.message ?? "no message"}`;
+	} catch {
+		return trimmed.slice(0, 500);
+	}
+}
+
+/**
+ * Virtual clock for the discovery budget. It starts at the real wall clock so any
+ * absolute deadline handed to a real-time consumer stays sane, and advances only
+ * when the code under test sleeps -- so a budget leg gets measured, not waited out.
+ */
+function virtualBudgetClock(): { timing: EnsureBrokerTiming; elapsedMs(): number } {
+	const start = Date.now();
+	let current = start;
+	return {
+		timing: {
+			now: () => current,
+			sleep: (ms: number) => {
+				current += Math.max(0, ms);
+				return Promise.resolve();
+			},
+		},
+		elapsedMs: () => current - start,
+	};
 }
 
 function spawnEnsureWorker(dir: string, env: NodeJS.ProcessEnv = process.env): LockWorker {
@@ -415,8 +457,20 @@ it("the parent budget composes stale retirement, child-fence contention, and sta
 		await waitForFile(path.join(signalDir, "startup-gate-waiting"));
 		await fs.writeFile(startupGate, "release");
 		await waitForFile(path.join(signalDir, "startup-gate-released"));
-		const [code, error] = await Promise.all([child.exited, new Response(child.stderr).text()]);
-		expect({ code, error }).toEqual({ code: 0, error: "" });
+		// The session CLI reports a discovery-budget expiry as a JSON envelope on
+		// stdout, with exit code 1 and a legitimately empty stderr, so an assertion
+		// that reads only {code, error} prints `{code: 1, error: ""}` and throws its
+		// own diagnostic away. Fold the envelope's reason in instead (#5604).
+		const [code, error, output] = await Promise.all([
+			child.exited,
+			new Response(child.stderr).text(),
+			new Response(child.stdout).text(),
+		]);
+		expect({ code, error, failure: cliFailureReason(output) }).toEqual({
+			code: 0,
+			error: "",
+			failure: undefined,
+		});
 		const discovery = await brokerDiscovery.readBrokerDiscovery(dir);
 		expect(discovery).toMatchObject({ packageGeneration: packageJson.version });
 		expect(await fs.readdir(path.join(dir, "sdk"))).not.toContain("broker.startup.lock");
@@ -436,6 +490,60 @@ it("the parent budget composes stale retirement, child-fence contention, and sta
 		await fs.rm(dir, { recursive: true, force: true });
 	}
 }, 55_000);
+
+/**
+ * #5604: the composition the wall-clock case above stages -- stale retirement,
+ * then the child fence, then startup and publication -- is arithmetic, and
+ * racing three real clocks is a poor way to assert arithmetic. Drive the same
+ * legs on a virtual clock so each one's cost is measured exactly and a change to
+ * any constant fails here first, in milliseconds, instead of as a flake.
+ */
+it("spends the parent discovery budget one composition leg at a time", async () => {
+	const dir = await temp();
+	const clock = virtualBudgetClock();
+	// An incumbent of the wrong generation that never retires: a pid this process
+	// cannot match by incarnation keeps retirement on its polling path and out of
+	// process.kill entirely, and the unroutable url refuses its shutdown request.
+	const unretirable: BrokerDiscovery = {
+		version: 1,
+		protocolVersion: 3,
+		packageGeneration: "pr5604-incompatible-generation",
+		ownerId: "pr5604-virtual-clock-owner",
+		pid: process.pid,
+		incarnation: "pr5604-virtual-clock-incarnation",
+		host: "127.0.0.1",
+		port: 1,
+		url: "ws://127.0.0.1:1",
+		token: "pr5604-virtual-clock-token",
+		startedAt: clock.timing.now(),
+		heartbeatAt: clock.timing.now(),
+	};
+	const readSpy = spyOn(brokerDiscovery, "readBrokerDiscovery").mockImplementation(() => Promise.resolve(unretirable));
+	setEnsureBrokerTimingForTest(clock.timing);
+	try {
+		const budgetStart = clock.timing.now();
+		const reconciled = await reconcileBrokerGenerationForStartup(
+			{ agentDir: dir },
+			budgetStart + BROKER_DISCOVERY_BUDGET.discoveryMs,
+		);
+		// Leg one gives up on an incumbent that never goes away, and spends exactly
+		// its own leg doing so -- never the caller's whole budget.
+		expect(reconciled).toBeUndefined();
+		expect(clock.elapsedMs()).toBe(BROKER_DISCOVERY_BUDGET.staleRetirementMs);
+		// What survives retirement is still a full child-fence wait plus one
+		// publication attempt; that remainder is what the wall-clock case stages.
+		expect(budgetStart + BROKER_DISCOVERY_BUDGET.discoveryMs - clock.timing.now()).toBe(
+			BROKER_DISCOVERY_BUDGET.startupLockWaitMs + BROKER_DISCOVERY_BUDGET.publicationMs,
+		);
+		// The fence itself grants its holder retirement plus that publication.
+		const fenceDeadline = await withBrokerStartupLock(dir, deadline => Promise.resolve(deadline));
+		expect(fenceDeadline - clock.timing.now()).toBe(BROKER_DISCOVERY_BUDGET.fenceOperationMs);
+	} finally {
+		setEnsureBrokerTimingForTest(undefined);
+		readSpy.mockRestore();
+		await fs.rm(dir, { recursive: true, force: true });
+	}
+}, 15_000);
 
 it("stale broker client teardown cannot extend an expired retirement deadline", async () => {
 	const stalled = Promise.withResolvers<void>();
