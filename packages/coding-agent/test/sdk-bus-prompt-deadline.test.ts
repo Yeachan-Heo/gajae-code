@@ -1194,3 +1194,54 @@ test("a tool_execution_end delivered before its own start never forces a spuriou
 		await shutdown(session);
 	}
 }, 40_000);
+
+test("repeated tool_execution_updates at an already-due hard cap open exactly one boundary wait", async () => {
+	// #5637 review thread P2. `tool_execution_update` is attributable progress by
+	// design (a multi-minute compile must not trip the inactivity lease), and at an
+	// already-due HARD CAP `promptDeadlineAt` is pinned to `acceptedAt + maxMs`, so
+	// every update re-arms a ZERO-delay timer that walks straight past the re-arm
+	// check. Without a per-submission fence each one opened ANOTHER grace wait and
+	// they piled up concurrently through the whole 5 s grace.
+	const maxRuntimeMs = 600;
+	const ledgerTools: LedgerTools = new Set(["compiling-tool"]);
+	const forced = captureForcedWarnings();
+	const session = await acceptPrompt("one-wait", 60_000, maxRuntimeMs, { ledgerTools });
+	// One boundary wait arms exactly one timer at the grace, and the wait is
+	// otherwise unobservable from outside the bus. Scoped to the update storm so
+	// the spy cannot see session teardown's unrelated timers.
+	let boundaryWaits = 0;
+	const timerSpy = spyOn(globalThis, "setTimeout").mockImplementation(((
+		callback: () => void,
+		delayMs?: number,
+		...rest: unknown[]
+	) => {
+		if (delayMs === TOOL_CALL_BOUNDARY_GRACE_MS) boundaryWaits += 1;
+		return realSetTimeout(callback, delayMs, ...rest);
+	}) as never);
+	const storm = setInterval(() => {
+		session.handlers.get("tool_execution_update")?.(
+			{ type: "tool_execution_update", toolCallId: "compiling-tool", output: "tick" },
+			session.sessionContext,
+		);
+	}, 50);
+	try {
+		await waitFor(() => session.deadlineTerminals().length > 0, "single-wait deadline terminal", 25_000);
+		clearInterval(storm);
+		// The storm ran for the cap plus the whole grace, i.e. ~100 updates; each
+		// one of them used to start its own wait.
+		expect(boundaryWaits).toBe(1);
+		expect(forced.records).toHaveLength(1);
+		expect(forced.records[0]?.pendingToolCallIds).toEqual(["compiling-tool"]);
+		// Bounded by the cap plus ONE grace, never a pile of overlapping ones.
+		const elapsed = Date.now() - session.acceptedAt;
+		expect(elapsed).toBeGreaterThan(maxRuntimeMs + TOOL_CALL_BOUNDARY_GRACE_MS - 400);
+		expect(elapsed).toBeLessThan(maxRuntimeMs + 2 * TOOL_CALL_BOUNDARY_GRACE_MS);
+		await Bun.sleep(300);
+		expect(session.deadlineTerminals()).toHaveLength(1);
+	} finally {
+		clearInterval(storm);
+		timerSpy.mockRestore();
+		forced.restore();
+		await shutdown(session);
+	}
+}, 60_000);

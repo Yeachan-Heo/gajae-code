@@ -4846,6 +4846,14 @@ export function createNotificationsExtension(
 				 */
 				selfAbortStarted?: true;
 			};
+			/**
+			 * A due deadline expiry is already awaiting the tool-call boundary for
+			 * this submission. Progress that cannot renew past an already-due hard
+			 * cap re-arms a zero-delay timer on every delivery; without this fence
+			 * each one would open ANOTHER grace wait and they would pile up through
+			 * the whole grace (review thread P2).
+			 */
+			deadlineExpiryInFlight?: boolean;
 			phase: "active" | "outcome_claimed" | "terminalizing" | "publication_closed" | "delivered";
 			outcome?: SdkPromptTerminalOutcome;
 			/** Agent-owned resource run captured at acceptance; cleanup targets only this handle. */
@@ -5103,65 +5111,92 @@ export function createNotificationsExtension(
 							armPromptDeadline(key, correlation);
 							return;
 						}
-						// Let an in-flight dispatched tool call reach its boundary first
-						// (#5637): terminal fencing aborts the run before it waits for
-						// settlement, so a tool aborted mid-write leaves a torn artifact.
-						// The wait sits BEFORE the attempt is registered on purpose — inside
-						// `terminalizePrompt` the very `tool_execution_end` that ends the
-						// wait would bump the lease generation and the post-claim fence
-						// would read this attempt as "superseded", so the deadline would
-						// effectively never fire while tools run. Here the existing
-						// renewal/re-arm logic handles that case unchanged. Nothing has been
-						// aborted yet, so this wait is composed with NO abort signal: an
-						// already-aborted one would make the path unreachable.
-						const boundary: ToolBoundaryWaitResult =
-							pendingToolCallIdsFor(current).length === 0
-								? IDLE_TOOL_BOUNDARY_RESULT
-								: await waitForToolCallBoundary({
-										pending: () => pendingToolCallIdsFor(current),
-										whenIdle: () => whenPromptToolsIdle(current),
-										graceMs: TOOL_CALL_BOUNDARY_GRACE_MS,
-									});
-						// Every pre-await fence is re-validated after the await, in order.
-						const after = promptSubmissions.get(key);
-						if (!after || after.deadlineLease !== lease) return;
-						if (after.terminal || after.phase !== "active") return;
-						if (Date.now() < promptDeadlineAt(lease)) {
-							// The boundary event renewed the lease: the prompt is demonstrably
-							// alive, so re-arm instead of terminalizing it.
-							armPromptDeadline(key, correlation);
-							return;
+						// Nothing to terminalize behind the terminal owner — and nothing to
+						// wait for on its behalf either. `terminalizePrompt` refuses this
+						// state anyway; checking it here keeps a superseded timer from
+						// opening a boundary wait it can never use.
+						if (current.terminal || current.phase !== "active") return;
+						// One boundary wait per submission (review thread P2). At an already
+						// due HARD CAP `promptDeadlineAt` is pinned to `acceptedAt + maxMs`,
+						// so every streamed `tool_execution_update` — attributable progress
+						// by design, so a multi-minute compile does not trip the inactivity
+						// lease — re-arms a ZERO-delay timer that walks straight past the
+						// re-arm check above. `deadlineAttempt` cannot serve as the fence: it
+						// is registered only AFTER the wait, precisely so the boundary event
+						// that ends the wait is not read as superseding it.
+						if (current.deadlineExpiryInFlight) return;
+						current.deadlineExpiryInFlight = true;
+						try {
+							// Let an in-flight dispatched tool call reach its boundary first
+							// (#5637): terminal fencing aborts the run before it waits for
+							// settlement, so a tool aborted mid-write leaves a torn artifact.
+							// The wait sits BEFORE the attempt is registered on purpose — inside
+							// `terminalizePrompt` the very `tool_execution_end` that ends the
+							// wait would bump the lease generation and the post-claim fence
+							// would read this attempt as "superseded", so the deadline would
+							// effectively never fire while tools run. Here the existing
+							// renewal/re-arm logic handles that case unchanged. Nothing has been
+							// aborted yet, so this wait is composed with NO abort signal: an
+							// already-aborted one would make the path unreachable.
+							const boundary: ToolBoundaryWaitResult =
+								pendingToolCallIdsFor(current).length === 0
+									? IDLE_TOOL_BOUNDARY_RESULT
+									: await waitForToolCallBoundary({
+											pending: () => pendingToolCallIdsFor(current),
+											whenIdle: () => whenPromptToolsIdle(current),
+											graceMs: TOOL_CALL_BOUNDARY_GRACE_MS,
+										});
+							// Every pre-await fence is re-validated after the await, in order.
+							const after = promptSubmissions.get(key);
+							if (!after || after.deadlineLease !== lease) return;
+							if (after.terminal || after.phase !== "active") return;
+							if (Date.now() < promptDeadlineAt(lease)) {
+								// The boundary event renewed the lease: the prompt is demonstrably
+								// alive, so re-arm instead of terminalizing it.
+								armPromptDeadline(key, correlation);
+								return;
+							}
+							if (boundary.outcome === "forced") {
+								// Ids only: never tool arguments, output, paths or anything
+								// credential-shaped.
+								logger.warn("sdk_prompt_deadline_forced_mid_tool", {
+									commandId: correlation.commandId,
+									turnId: correlation.turnId,
+									graceMs: TOOL_CALL_BOUNDARY_GRACE_MS,
+									pendingToolCallIds: boundary.pendingToolCallIds,
+								});
+							}
+							// Register the expiry attempt BEFORE the awaited durable claim:
+							// progress arriving while the claim is in flight must supersede
+							// this attempt (see the post-claim fence in terminalizePrompt).
+							// The generation is read AFTER the boundary wait because the
+							// boundary event may have bumped it and this attempt is
+							// deliberately the current one.
+							after.deadlineAttempt = { lease, generation: lease.generation };
+							void terminalizePrompt(
+								correlation,
+								{
+									kind: "failed",
+									code: "prompt_deadline_exceeded",
+									message: "Prompt deadline exceeded.",
+									provenance: "deadline",
+									phase: "submission",
+									category: "deadline",
+								},
+								{ fence: true },
+								{ diagnostic: { reason: promptDeadlineDiagnosticReason(boundary) } },
+							);
+						} finally {
+							// `finally` is safe here, and a bare clear before each `return` is
+							// not: a leaked `true` disables the deadline for the rest of the
+							// submission's life, which is strictly worse than the pile-up it
+							// guards. It can only ever clear the flag THIS attempt set on THIS
+							// object — a competing attempt would have returned at the guard
+							// above without setting it — and an attempt that threw is no longer
+							// waiting, so re-admitting the next one is correct. The wait itself
+							// is bounded by the grace, so this always runs.
+							current.deadlineExpiryInFlight = false;
 						}
-						if (boundary.outcome === "forced") {
-							// Ids only: never tool arguments, output, paths or anything
-							// credential-shaped.
-							logger.warn("sdk_prompt_deadline_forced_mid_tool", {
-								commandId: correlation.commandId,
-								turnId: correlation.turnId,
-								graceMs: TOOL_CALL_BOUNDARY_GRACE_MS,
-								pendingToolCallIds: boundary.pendingToolCallIds,
-							});
-						}
-						// Register the expiry attempt BEFORE the awaited durable claim:
-						// progress arriving while the claim is in flight must supersede
-						// this attempt (see the post-claim fence in terminalizePrompt).
-						// The generation is read AFTER the boundary wait because the
-						// boundary event may have bumped it and this attempt is
-						// deliberately the current one.
-						after.deadlineAttempt = { lease, generation: lease.generation };
-						void terminalizePrompt(
-							correlation,
-							{
-								kind: "failed",
-								code: "prompt_deadline_exceeded",
-								message: "Prompt deadline exceeded.",
-								provenance: "deadline",
-								phase: "submission",
-								category: "deadline",
-							},
-							{ fence: true },
-							{ diagnostic: { reason: promptDeadlineDiagnosticReason(boundary) } },
-						);
 					})();
 				},
 				Math.max(0, promptDeadlineAt(lease) - Date.now()),
