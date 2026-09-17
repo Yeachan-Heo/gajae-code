@@ -1,4 +1,5 @@
 import { afterEach, expect, spyOn, test } from "bun:test";
+import { AsyncLocalStorage } from "node:async_hooks";
 import * as fs from "node:fs";
 import * as fsPromises from "node:fs/promises";
 import * as os from "node:os";
@@ -2954,6 +2955,107 @@ test("SDK host retains the final assistant text for a skill whose invocation set
 		await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
 	}
 });
+test("SDK host retains final text for an ownerless durable skill invocation", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-ownerless-skill-result-text-"));
+	dirs.push(cwd);
+	const sessionId = `sdk-ownerless-skill-result-text-${Date.now()}`;
+	const ownerlessText = "ownerless durable skill result ✓";
+	const sessionContext = context(cwd, sessionId);
+	const baseBindings = sessionContext.sdkBindings as () => string[];
+	sessionContext.sdkBindings = () => [...baseBindings(), "invokeSkill"];
+	sessionContext.invokeSkill = async (
+		name: string,
+		_args: string | undefined,
+		options?: {
+			onSkillPrepared?: (meta: { name: string; path: string }) => void;
+			onPreflightAcceptCommit?: () => void | Promise<void>;
+		},
+	) => {
+		options?.onSkillPrepared?.({ name, path: "/fixture/SKILL.md" });
+		await options?.onPreflightAcceptCommit?.();
+		return ownerlessText;
+	};
+	const handlers = start(sessionContext);
+	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+	await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
+	const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+	const frames: Record<string, unknown>[] = [];
+	const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+	sockets.push(socket);
+	socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+	await new Promise<void>((resolve, reject) => {
+		socket.addEventListener("open", () => resolve(), { once: true });
+		socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
+	});
+	await waitFor(() => frames.some(frame => frame.type === "hello"), "SDK hello");
+	const requesterConnectionId = String(frames.find(frame => frame.type === "hello")?.connectionId);
+	let ownerlessControlRequested = false;
+	const asyncLocalStoragePrototype = AsyncLocalStorage.prototype as unknown as {
+		run: (store: unknown, callback: (...args: unknown[]) => unknown, ...args: unknown[]) => unknown;
+	};
+	const nativeAsyncLocalStorageRun = asyncLocalStoragePrototype.run;
+	asyncLocalStoragePrototype.run = function (store, callback, ...args) {
+		if (
+			ownerlessControlRequested &&
+			store === requesterConnectionId &&
+			String(callback).includes("dispatchControl")
+		) {
+			ownerlessControlRequested = false;
+			return callback(...args);
+		}
+		return Reflect.apply(nativeAsyncLocalStorageRun, this, [store, callback, ...args]);
+	};
+	const requestQuery = async (id: string): Promise<Record<string, unknown> | undefined> => {
+		socket.send(
+			JSON.stringify({
+				type: "query_request",
+				id,
+				query: "turn.result",
+				input: { kind: "skill", clientRef: "ownerless-skill-ref" },
+			}),
+		);
+		await waitFor(() => frames.some(frame => frame.id === id), `${id} response`);
+		return frames.find(frame => frame.id === id);
+	};
+	try {
+		ownerlessControlRequested = true;
+		socket.send(
+			JSON.stringify({
+				type: "control_request",
+				id: "ownerless-skill",
+				operation: "skill.invoke",
+				input: { name: "fixture-skill", args: "ownerless", clientRef: "ownerless-skill-ref" },
+			}),
+		);
+		await waitFor(() => frames.some(frame => frame.id === "ownerless-skill"), "ownerless skill response");
+		expect(ownerlessControlRequested).toBe(false);
+		expect(frames.find(frame => frame.id === "ownerless-skill")).toMatchObject({
+			type: "control_response",
+			ok: true,
+			result: { accepted: true, commandId: expect.any(String), turnId: expect.any(String) },
+		});
+
+		let resultResponse: Record<string, unknown> | undefined;
+		for (let attempt = 0; attempt < 100; attempt++) {
+			resultResponse = await requestQuery(`ownerless-skill-result-${attempt}`);
+			const result = resultResponse?.result as { status?: string } | undefined;
+			if (result?.status === "terminal_ok" || result?.status === "failed") break;
+			await Bun.sleep(10);
+		}
+		const byteLength = new TextEncoder().encode(ownerlessText).byteLength;
+		expect(resultResponse).toMatchObject({
+			ok: true,
+			result: {
+				status: "terminal_ok",
+				receiptState: "present",
+				content: { version: 1, type: "text", text: ownerlessText, byteLength, truncated: false },
+			},
+		});
+	} finally {
+		await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+		asyncLocalStoragePrototype.run = nativeAsyncLocalStorageRun;
+	}
+}, 60_000);
 test("SDK host waits for durable prompt acceptance before completing concurrent cancellation", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-prompt-durable-accept-cancel-"));
 	dirs.push(cwd);
