@@ -99,6 +99,21 @@ const BEHAVIORAL_OWNER_TESTS: Readonly<Record<string, readonly string[]>> = {
 	"packages/coding-agent/src/tools/write.ts": ["packages/coding-agent/test/write-acp-fs.test.ts"],
 	"packages/coding-agent/src/lsp/index.ts": ["packages/coding-agent/test/tools/lsp-batching.test.ts"],
 	"packages/coding-agent/src/config/model-registry.ts": ["packages/coding-agent/test/model-registry-runtime-provider.test.ts"],
+	// Making this module asynchronous (e.g. a top-level `await import(...)`)
+	// propagates async-ness through every importer, and bun 1.4.0 drops it on the
+	// `model-registry` <-> `model-resolver` import cycle: the bundle then carries a
+	// non-async module initializer containing `await`, so every compiled binary dies
+	// at parse time with `SyntaxError: Unexpected identifier 'init_model_registry'`.
+	// Basename matching would never reach that test from this file, which is how
+	// #5674 shipped to dev. Compile-and-run coverage must run on any change here.
+	"packages/coding-agent/src/utils/mupdf-wasm.ts": [
+		"packages/coding-agent/test/mupdf-wasm-embedding.test.ts",
+		"packages/coding-agent/test/ooo-bridge-installed-flow.test.ts",
+	],
+	"packages/coding-agent/src/utils/mupdf-wasm-embedded.ts": [
+		"packages/coding-agent/test/mupdf-wasm-embedding.test.ts",
+		"packages/coding-agent/test/ooo-bridge-installed-flow.test.ts",
+	],
 	"packages/coding-agent/src/modes/components/model-selector.ts": [
 		"packages/coding-agent/test/model-selector-profiles-redteam.test.ts",
 		"packages/coding-agent/test/model-preset-landing-redteam-qa.test.ts",

@@ -14,11 +14,32 @@
  * read the wasm from the bunfs directly — no disk sidecar needed.
  *
  * This must run before the first `import("mupdf")` anywhere in the process.
+ *
+ * The embedded asset lives behind a separate module (#5663) so that an
+ * npm-installed source tree never resolves the monorepo-only
+ * `node_modules/mupdf/...` specifier at import time. That module is pulled in
+ * with a synchronous `require`, NOT a top-level `await import(...)`: a
+ * top-level await here makes this module async, and bun 1.4.0 fails to
+ * propagate that async-ness through the `model-registry` <-> `model-resolver`
+ * import cycle. The resulting bundle emits a non-async `__esm(() => { ...
+ * await init_model_registry(); ... })` wrapper, so every compiled binary died
+ * at parse time with `SyntaxError: Unexpected identifier
+ * 'init_model_registry'` (#5674). Keep this resolution synchronous.
  */
 import { isCompiledBinary } from "@gajae-code/utils/env";
 
 const MODULE_CONFIG_KEY = "$libmupdf_wasm_Module";
-const mupdfWasmPath = isCompiledBinary() ? (await import("./mupdf-wasm-embedded")).default : undefined;
+
+function loadEmbeddedMupdfWasmPath(): string | undefined {
+	if (!isCompiledBinary()) return undefined;
+	// Only reached inside a compiled binary, where the embedded module — and
+	// therefore the bunfs asset it points at — is always bundled in.
+	const embedded = require("./mupdf-wasm-embedded") as { default?: unknown };
+	const embeddedPath = embedded.default;
+	return typeof embeddedPath === "string" ? embeddedPath : undefined;
+}
+
+const mupdfWasmPath = loadEmbeddedMupdfWasmPath();
 
 export function ensureMupdfWasmResolution(): void {
 	const globalScope = globalThis as typeof globalThis & Record<string, unknown>;
