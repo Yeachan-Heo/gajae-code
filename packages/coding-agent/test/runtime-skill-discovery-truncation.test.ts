@@ -40,6 +40,13 @@ async function makeSkill(root: string, name: string, description: string): Promi
  * Discovery isolated to `skills.customDirectories`: both ambient scopes are
  * untrusted, so nothing on the developer's real machine can change the counts,
  * while custom directories stay visible (naming one is explicit consent).
+ *
+ * Untrusting the scopes is not enough on its own: the bundled workflow skills
+ * are scanned under `source: "all"` regardless of trust and of the
+ * include/ignore/disabled filters, so every call below also pins
+ * `source: "user"` — the scope that excludes bundled skills by design and still
+ * covers custom directories. Without that pin, adding one bundled skill shifts
+ * every count and diagnostic string asserted in this file.
  */
 function policy(customDirectories: string[]): SkillsSettings {
 	return { enabled: true, trustProjectSkills: false, trustUserSkills: false, customDirectories };
@@ -75,7 +82,7 @@ describe("discoverRuntimeSkills truncation diagnostics", () => {
 		await makeFiller(fillerDir, 22);
 		await makeSkill(egoDir, "ego-browser", "Drive the ego browser");
 
-		const result = await discoverRuntimeSkills({ cwd, home, policy: policy([egoDir, fillerDir]) });
+		const result = await discoverRuntimeSkills({ cwd, home, source: "user", policy: policy([egoDir, fillerDir]) });
 
 		expect(result.candidates).toHaveLength(DEFAULT_LIMIT);
 		expect(result.candidates.map(candidate => candidate.name)).not.toContain("ego-browser");
@@ -86,6 +93,7 @@ describe("discoverRuntimeSkills truncation diagnostics", () => {
 		const narrowed = await discoverRuntimeSkills({
 			cwd,
 			home,
+			source: "user",
 			query: "ego-browser",
 			policy: policy([egoDir, fillerDir]),
 		});
@@ -103,7 +111,12 @@ describe("discoverRuntimeSkills truncation diagnostics", () => {
 		await makeFiller(fillerDir, 22);
 		const missing = Array.from({ length: 12 }, (_, i) => path.join(cwd, "purged-paseo-skills", String(i)));
 
-		const result = await discoverRuntimeSkills({ cwd, home, policy: policy([...missing, fillerDir]) });
+		const result = await discoverRuntimeSkills({
+			cwd,
+			home,
+			source: "user",
+			policy: policy([...missing, fillerDir]),
+		});
 
 		// The budget really is exhausted: 12 missing dirs, only 10 messages kept.
 		expect(result.diagnostics.messages.filter(message => message.includes("does not exist"))).toHaveLength(
@@ -122,13 +135,14 @@ describe("discoverRuntimeSkills truncation diagnostics", () => {
 		const fillerDir = await makeRoot("exact-filler");
 		await makeFiller(fillerDir, 5);
 
-		const exact = await discoverRuntimeSkills({ cwd, home, limit: 5, policy: policy([fillerDir]) });
+		const exact = await discoverRuntimeSkills({ cwd, home, source: "user", limit: 5, policy: policy([fillerDir]) });
 		expect(exact.candidates).toHaveLength(5);
 		expect(truncationMessages(exact.diagnostics.messages)).toEqual([]);
 
 		const empty = await discoverRuntimeSkills({
 			cwd,
 			home,
+			source: "user",
 			query: "no-skill-mentions-this-term",
 			policy: policy([fillerDir]),
 		});
@@ -144,14 +158,14 @@ describe("discoverRuntimeSkills truncation diagnostics", () => {
 		const fillerDir = await makeRoot("clamp-filler");
 		await makeFiller(fillerDir, 55);
 
-		const high = await discoverRuntimeSkills({ cwd, home, limit: 999, policy: policy([fillerDir]) });
+		const high = await discoverRuntimeSkills({ cwd, home, source: "user", limit: 999, policy: policy([fillerDir]) });
 		expect(high.candidates).toHaveLength(SKILL_DISCOVERY_MAX_LIMIT);
 		expect(truncationMessages(high.diagnostics.messages)).toEqual([
 			"showing 1-50 of 55 matching skills; pass --offset 50 for the next page, or narrow the query",
 		]);
 
 		for (const limit of [0, -5]) {
-			const low = await discoverRuntimeSkills({ cwd, home, limit, policy: policy([fillerDir]) });
+			const low = await discoverRuntimeSkills({ cwd, home, source: "user", limit, policy: policy([fillerDir]) });
 			expect(low.candidates).toHaveLength(1);
 		}
 	});
@@ -165,14 +179,28 @@ describe("discoverRuntimeSkills truncation diagnostics", () => {
 		const fillerDir = await makeRoot("offset-filler");
 		await makeFiller(fillerDir, 12);
 
-		const last = await discoverRuntimeSkills({ cwd, home, limit: 5, offset: 10, policy: policy([fillerDir]) });
+		const last = await discoverRuntimeSkills({
+			cwd,
+			home,
+			source: "user",
+			limit: 5,
+			offset: 10,
+			policy: policy([fillerDir]),
+		});
 		expect(last.candidates.map(candidate => candidate.name)).toEqual([fillerName(10), fillerName(11)]);
 		expect(last.matching).toBe(12);
 		expect(last.offset).toBe(10);
 		expect(last.nextOffset).toBeUndefined();
 		expect(truncationMessages(last.diagnostics.messages)).toEqual(["showing 11-12 of 12 matching skills"]);
 
-		const past = await discoverRuntimeSkills({ cwd, home, limit: 5, offset: 40, policy: policy([fillerDir]) });
+		const past = await discoverRuntimeSkills({
+			cwd,
+			home,
+			source: "user",
+			limit: 5,
+			offset: 40,
+			policy: policy([fillerDir]),
+		});
 		expect(past.candidates).toEqual([]);
 		expect(past.nextOffset).toBeUndefined();
 		expect(past.diagnostics.messages).toContain(
@@ -180,7 +208,14 @@ describe("discoverRuntimeSkills truncation diagnostics", () => {
 		);
 
 		// A negative offset is normalized to the first page, not to an error.
-		const negative = await discoverRuntimeSkills({ cwd, home, limit: 5, offset: -3, policy: policy([fillerDir]) });
+		const negative = await discoverRuntimeSkills({
+			cwd,
+			home,
+			source: "user",
+			limit: 5,
+			offset: -3,
+			policy: policy([fillerDir]),
+		});
 		expect(negative.offset).toBe(0);
 		expect(negative.candidates.map(candidate => candidate.name)).toEqual([
 			fillerName(0),
@@ -203,6 +238,14 @@ describe("discoverRuntimeSkills truncation diagnostics", () => {
 describe("gjc skills discover paging", () => {
 	const FILLER_COUNT = 55;
 	const TARGET_COUNT = 3;
+	/**
+	 * The CLI counterpart of `policy()`: `GJC_CODING_AGENT_DIR` isolates the user
+	 * scope's filesystem, but the bundled workflow skills are scanned under the
+	 * default `--source all` regardless of trust, so the catalog is pinned to the
+	 * user scope — where the fixture's customDirectories live and bundled skills do
+	 * not — to keep `allNames` the whole catalog.
+	 */
+	const USER_SCOPE = ["--source", "user"];
 	const targetName = (index: number) => `zeta-target-${index}`;
 	const allNames = [
 		...Array.from({ length: FILLER_COUNT }, (_, i) => fillerName(i)),
@@ -291,7 +334,8 @@ describe("gjc skills discover paging", () => {
 	// The assertion the previous version of this test was missing: it passed an
 	// explicit limit, so it stayed green with the CLI default reverted.
 	it("defaults an unflagged page to the library maximum, not the agent-sized default", async () => {
-		const { payload } = await discoverJson([]);
+		// Unflagged means no --limit: the scope pin below never sets a page size.
+		const { payload } = await discoverJson([...USER_SCOPE]);
 
 		expect(payload.candidates).toHaveLength(SKILL_DISCOVERY_MAX_LIMIT);
 		expect(names(payload)).toEqual(allNames.slice(0, SKILL_DISCOVERY_MAX_LIMIT));
@@ -300,7 +344,7 @@ describe("gjc skills discover paging", () => {
 	});
 
 	it("forwards --query so the non-matching group is excluded", async () => {
-		const { payload } = await discoverJson(["--query", "zeta-target"]);
+		const { payload } = await discoverJson([...USER_SCOPE, "--query", "zeta-target"]);
 
 		expect(names(payload)).toEqual(Array.from({ length: TARGET_COUNT }, (_, i) => targetName(i)));
 		expect(payload.nextOffset).toBeUndefined();
@@ -310,15 +354,15 @@ describe("gjc skills discover paging", () => {
 	// against. A filtered query is where the two numbers have to diverge, which is
 	// what makes the new field more than a rename of the old one.
 	it("reports matching below scanned once a query filters the catalog", async () => {
-		const { payload } = await discoverJson(["--query", "zeta-target"]);
+		const { payload } = await discoverJson([...USER_SCOPE, "--query", "zeta-target"]);
 
 		expect(payload.scanned).toBe(allNames.length);
 		expect(payload.matching).toBe(TARGET_COUNT);
 	});
 
 	it("pages the whole matching set contiguously and omits nextOffset on the final page", async () => {
-		const first = await discoverJson(["--offset", "0"]);
-		const second = await discoverJson(["--offset", String(SKILL_DISCOVERY_MAX_LIMIT)]);
+		const first = await discoverJson([...USER_SCOPE, "--offset", "0"]);
+		const second = await discoverJson([...USER_SCOPE, "--offset", String(SKILL_DISCOVERY_MAX_LIMIT)]);
 
 		expect(first.payload.offset).toBe(0);
 		expect(first.payload.nextOffset).toBe(SKILL_DISCOVERY_MAX_LIMIT);
@@ -339,27 +383,31 @@ describe("gjc skills discover paging", () => {
 	it("reaches position 51 of the catalog, which no flag combination could return before", async () => {
 		const fiftyFirst = allNames[SKILL_DISCOVERY_MAX_LIMIT];
 
-		const firstPage = await discoverJson([]);
+		const firstPage = await discoverJson([...USER_SCOPE]);
 		expect(names(firstPage.payload)).not.toContain(fiftyFirst);
 
-		const nextPage = await discoverJson(["--offset", String(SKILL_DISCOVERY_MAX_LIMIT)]);
+		const nextPage = await discoverJson([...USER_SCOPE, "--offset", String(SKILL_DISCOVERY_MAX_LIMIT)]);
 		expect(names(nextPage.payload)[0]).toBe(fiftyFirst);
 	});
 
 	it("prints a next-page command that round-trips, and prints none on the last page", async () => {
-		const text = await runDiscover(["--limit", "50", "--query", "alpha-filler"]);
+		const text = await runDiscover([...USER_SCOPE, "--limit", "50", "--query", "alpha-filler"]);
 		expect(text.exitCode).toBe(0);
 
 		const nextPageLine = text.stdout.split("\n").find(line => line.startsWith("Next page: "));
 		// The filters the invocation carried are echoed back, so the printed line
-		// is runnable as printed instead of silently dropping the query.
-		expect(nextPageLine).toBe("Next page: gjc skills discover --offset 50 --limit 50 --query alpha-filler");
+		// is runnable as printed instead of silently dropping the query. A non-"all"
+		// --source is one of those filters, which is why the replay below inherits
+		// the scope pin from the printed command rather than re-adding it.
+		expect(nextPageLine).toBe(
+			"Next page: gjc skills discover --offset 50 --limit 50 --query alpha-filler --source user",
+		);
 
 		const replayArgs = (nextPageLine ?? "").replace("Next page: gjc skills discover ", "").split(" ");
 		const replayed = await discoverJson(replayArgs);
 		expect(names(replayed.payload)).toEqual(allNames.slice(SKILL_DISCOVERY_MAX_LIMIT, FILLER_COUNT));
 
-		const lastPage = await runDiscover(["--offset", String(SKILL_DISCOVERY_MAX_LIMIT)]);
+		const lastPage = await runDiscover([...USER_SCOPE, "--offset", String(SKILL_DISCOVERY_MAX_LIMIT)]);
 		expect(lastPage.exitCode).toBe(0);
 		expect(lastPage.stdout).not.toContain("Next page:");
 	});
