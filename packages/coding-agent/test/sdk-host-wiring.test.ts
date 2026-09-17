@@ -75,7 +75,7 @@ import type { NotificationSessionController } from "../src/sdk/bus/session-contr
 import { SdkClient } from "../src/sdk/client";
 import { SESSION_HOST_OBSERVER_CAPABILITY, SessionSdkHost } from "../src/sdk/host";
 import { createSdkRunCapability } from "../src/sdk/host/sdk-run-capability";
-import type { SessionAttachment } from "../src/sdk/router/session-router";
+import { type SessionAttachment, SessionRouter } from "../src/sdk/router/session-router";
 import { createAgentSession } from "../src/sdk/session";
 import {
 	attachLifecycleStartupCapability,
@@ -806,6 +806,84 @@ test("observer daemon demand covers hello-before-replay, replay-after, and disco
 	} finally {
 		await observer.close();
 		await host.stop();
+	}
+}, 60_000);
+
+test("a default ACP-shaped SessionRouter client remains demanding", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-default-router-demand-"));
+	dirs.push(cwd);
+	const host = await startProductionSdkHost(cwd, { acceptPromptPreflightWithoutExecution: true });
+	const baseDemand = sessionHostAttachedClients() ?? 0;
+	// ACP constructs the default router without notification-daemon observer role.
+	const router = new SessionRouter({ agentDir: path.join(cwd, ".gjc", "agent") });
+	try {
+		await router.start();
+		await waitFor(
+			() => (sessionHostAttachedClients() ?? 0) === baseDemand + 1,
+			"default SessionRouter demand attachment",
+		);
+		await Bun.sleep(100);
+		expect(sessionHostAttachedClients()).toBe(baseDemand + 1);
+	} finally {
+		await router.stop();
+		await host.stop();
+	}
+}, 60_000);
+
+test("late capability and replay callbacks after close cannot erase a live demanding client", async () => {
+	let negotiated: Parameters<NotificationServer["onNegotiatedCapabilities"]>[0] | undefined;
+	let closed: Parameters<NotificationServer["onConnectionClose"]>[0] | undefined;
+	let sdkFrame: Parameters<NotificationServer["onSdkFrame"]>[0] | undefined;
+	const negotiatedImpl = NotificationServer.prototype.onNegotiatedCapabilities;
+	const closedImpl = NotificationServer.prototype.onConnectionClose;
+	const sdkFrameImpl = NotificationServer.prototype.onSdkFrame;
+	const negotiatedHook = spyOn(NotificationServer.prototype, "onNegotiatedCapabilities").mockImplementation(function (
+		this: NotificationServer,
+		callback,
+	) {
+		negotiated = callback;
+		return negotiatedImpl.call(this, callback);
+	});
+	const closedHook = spyOn(NotificationServer.prototype, "onConnectionClose").mockImplementation(function (
+		this: NotificationServer,
+		callback,
+	) {
+		closed = callback;
+		return closedImpl.call(this, callback);
+	});
+	const sdkFrameHook = spyOn(NotificationServer.prototype, "onSdkFrame").mockImplementation(function (
+		this: NotificationServer,
+		callback,
+	) {
+		sdkFrame = callback;
+		return sdkFrameImpl.call(this, callback);
+	});
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-late-capability-close-"));
+	dirs.push(cwd);
+	let host: Awaited<ReturnType<typeof startProductionSdkHost>> | undefined;
+	let demanding: SdkClient | undefined;
+	try {
+		host = await startProductionSdkHost(cwd, { acceptPromptPreflightWithoutExecution: true });
+		const baseDemand = sessionHostAttachedClients() ?? 0;
+		demanding = new SdkClient(host.endpoint.url, host.endpoint.token, { reconnectAttempts: 0 });
+		await demanding.connect();
+		await waitFor(() => (sessionHostAttachedClients() ?? 0) === baseDemand + 1, "demanding client attachment");
+		if (!negotiated || !closed || !sdkFrame) throw new Error("native callback capture failed");
+
+		closed(null, "closed-before-late-callback");
+		negotiated(null, "closed-before-late-callback", [SESSION_HOST_OBSERVER_CAPABILITY]);
+		sdkFrame(null, {
+			connectionId: "closed-before-late-callback",
+			json: JSON.stringify({ type: "event_replay", capabilities: [SESSION_HOST_OBSERVER_CAPABILITY] }),
+		});
+		await Bun.sleep(20);
+		expect(sessionHostAttachedClients()).toBe(baseDemand + 1);
+	} finally {
+		await demanding?.close();
+		await host?.stop();
+		negotiatedHook.mockRestore();
+		closedHook.mockRestore();
+		sdkFrameHook.mockRestore();
 	}
 }, 60_000);
 

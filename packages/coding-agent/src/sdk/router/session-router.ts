@@ -25,6 +25,7 @@ import {
 	readSdkSessionEndpoint,
 	type SdkSessionEndpoint,
 } from "../client/discovery";
+import { SESSION_HOST_OBSERVER_CAPABILITY } from "../host/host";
 import {
 	type ActivatedPreparedSession,
 	type PreparedSessionActivationClient,
@@ -33,7 +34,6 @@ import {
 } from "../session-activation";
 import type { SessionBindingAuthority } from "../session-authority";
 import { ACP_SESSION_RECONNECT, SESSION_REQUEST_TIMEOUT_MS } from "../session-reconnect";
-import { SESSION_HOST_OBSERVER_CAPABILITY } from "../host/host";
 import { rememberReplayRetentionGap } from "./replay-retention-gap-cache";
 
 export type { SessionBindingAuthority, SessionEndpointAuthority } from "../session-authority";
@@ -287,6 +287,8 @@ export interface SessionRouterOptions {
 	agentDir: string;
 	/** Limits attachment to exact ids selected by a Broker-scoped operation. */
 	sessionIds?: readonly string[];
+	/** Marks default SDK clients as notification-only observers; demanding by default. */
+	observer?: boolean;
 	deps?: SessionRouterDeps;
 	/** Runtime-specific identity validation; Router supplies a conservative fallback. */
 	correlateFrame?: SessionRouterFrameCorrelator;
@@ -613,6 +615,7 @@ type AdoptedSession = {
 export class SessionRouter {
 	readonly #agentDir: string;
 	readonly #sessionIds: ReadonlySet<string> | undefined;
+	readonly #observer: boolean;
 	readonly #deps: SessionRouterDeps;
 	readonly #correlateFrame: SessionRouterFrameCorrelator;
 	readonly #index: SessionIndex;
@@ -654,6 +657,7 @@ export class SessionRouter {
 	constructor(options: SessionRouterOptions) {
 		this.#agentDir = options.agentDir;
 		this.#sessionIds = options.sessionIds === undefined ? undefined : new Set(options.sessionIds);
+		this.#observer = options.observer === true;
 		this.#deps = options.deps ?? {};
 		this.#correlateFrame = options.correlateFrame ?? fallbackCorrelation;
 		this.#index = this.#deps.createIndex?.(options.agentDir) ?? new DefaultSessionIndex(options.agentDir);
@@ -1522,7 +1526,7 @@ export class SessionRouter {
 		} else {
 			const defaultClient = new SdkClient(endpoint.url, endpoint.token, {
 				...ACP_SESSION_RECONNECT,
-				capabilities: [SESSION_HOST_OBSERVER_CAPABILITY],
+				...(this.#observer ? { capabilities: [SESSION_HOST_OBSERVER_CAPABILITY] } : {}),
 			});
 			transport = defaultClient;
 			connection = defaultClient.connect().then(() => defaultClient);

@@ -96,9 +96,9 @@ import {
 	createSdkSurfaceFactory,
 	masterAttestationForEffectiveHost,
 	reattestMasterSessionIdentity,
+	SESSION_HOST_OBSERVER_CAPABILITY,
 	type SessionSdkHost,
 	SessionSdkSessionRuntime,
-	SESSION_HOST_OBSERVER_CAPABILITY,
 	shouldHostSdk,
 	TOOL_ACTIVITY_CAPABILITY,
 	verifyMasterCapabilityFrame,
@@ -4751,7 +4751,46 @@ export function createNotificationsExtension(
 			}
 		};
 
-		const hostCapCache = new Map<string, ReadonlySet<string>>();
+		type HostConnectionIncarnation = { generation: number; closed: boolean };
+		type HostCapabilityCacheEntry = { generation: number; capabilities: ReadonlySet<string> };
+		const hostCapCache = new Map<string, HostCapabilityCacheEntry>();
+		const hostConnectionIncarnations = new Map<string, HostConnectionIncarnation>();
+		let nextHostConnectionGeneration = 0;
+		const liveHostConnection = (connectionId: string): HostConnectionIncarnation | undefined => {
+			if (!connectionId) return undefined;
+			const current = hostConnectionIncarnations.get(connectionId);
+			if (current?.closed) return undefined;
+			if (current) return current;
+			const incarnation = { generation: ++nextHostConnectionGeneration, closed: false };
+			hostConnectionIncarnations.set(connectionId, incarnation);
+			return incarnation;
+		};
+		const rememberHostCapabilities = (connectionId: string, capabilities: readonly string[]): void => {
+			const incarnation = liveHostConnection(connectionId);
+			if (!incarnation) return;
+			hostCapCache.set(connectionId, {
+				generation: incarnation.generation,
+				capabilities: new Set(capabilities),
+			});
+		};
+		const liveHostCapabilities = (connectionId: string): ReadonlySet<string> | undefined => {
+			const incarnation = hostConnectionIncarnations.get(connectionId);
+			const entry = hostCapCache.get(connectionId);
+			return incarnation && !incarnation.closed && entry?.generation === incarnation.generation
+				? entry.capabilities
+				: undefined;
+		};
+		const closeHostConnection = (connectionId: string): void => {
+			const current = hostConnectionIncarnations.get(connectionId);
+			if (current) current.closed = true;
+			else {
+				hostConnectionIncarnations.set(connectionId, {
+					generation: ++nextHostConnectionGeneration,
+					closed: true,
+				});
+			}
+			hostCapCache.delete(connectionId);
+		};
 
 		const configOverrides = new Map<string, unknown>();
 		const configRevision = { current: 0 };
@@ -4845,7 +4884,9 @@ export function createNotificationsExtension(
 			const gated = CAP_GATED_FRAME_KINDS.has(String(event.kind));
 			const json = JSON.stringify(event);
 			const recipients: string[] = [];
-			for (const [connectionId, capabilities] of hostCapCache) {
+			for (const [connectionId, entry] of hostCapCache) {
+				const capabilities = entry.capabilities;
+				if (liveHostCapabilities(connectionId) !== capabilities) continue;
 				if (fencedConnections.has(connectionId)) continue;
 				if (gated && !capabilities.has(TOOL_ACTIVITY_CAPABILITY)) continue;
 				try {
@@ -4861,7 +4902,9 @@ export function createNotificationsExtension(
 			const gated = CAP_GATED_FRAME_KINDS.has(String(event.kind));
 			const json = JSON.stringify(event);
 			const receipts: string[] = [];
-			for (const [connectionId, capabilities] of hostCapCache) {
+			for (const [connectionId, entry] of hostCapCache) {
+				const capabilities = entry.capabilities;
+				if (liveHostCapabilities(connectionId) !== capabilities) continue;
 				if (fencedConnections.has(connectionId)) continue;
 				if (gated && !capabilities.has(TOOL_ACTIVITY_CAPABILITY)) continue;
 				try {
@@ -6860,7 +6903,7 @@ export function createNotificationsExtension(
 					expectedEpoch: options.masterAttestationEpoch,
 					replay: consumedMasterNonces,
 				}),
-			connectionCapabilities: connectionId => hostCapCache.get(connectionId),
+			connectionCapabilities: liveHostCapabilities,
 			installProviderDefinitions,
 			onProviderDefinitionsRemoved: removeProviderDefinitions,
 			onRequest: options.onSdkRequest,
@@ -7389,9 +7432,9 @@ export function createNotificationsExtension(
 					if (typedFrame.type === "ephemeral_turn" || typedFrame.type === "ephemeral_turn_cancel") return;
 					if (typedFrame.type === "event_replay") {
 						const capabilities = Array.isArray(typedFrame.capabilities) ? typedFrame.capabilities : [];
-						hostCapCache.set(
+						rememberHostCapabilities(
 							inbound.connectionId,
-							new Set(capabilities.filter((capability): capability is string => typeof capability === "string")),
+							capabilities.filter((capability): capability is string => typeof capability === "string"),
 						);
 					}
 					inboundSdkFrame?.(inbound.connectionId, typedFrame);
@@ -7426,15 +7469,15 @@ export function createNotificationsExtension(
 				);
 			}
 			server.onNegotiatedCapabilities((_err, connectionId, capabilities) => {
-				if (connectionId) hostCapCache.set(connectionId, new Set(capabilities));
+				if (connectionId) rememberHostCapabilities(connectionId, capabilities);
 			});
 			server.onConnectionClose((_err, connectionId) => {
 				if (!connectionId) return;
+				closeHostConnection(connectionId);
 				void controlSurface
 					.cancelPendingPreflightsForConnection(connectionId)
 					.catch(error => logger.warn(`sdk: failed to cancel disconnected preflight: ${String(error)}`));
 				host.handleDisconnect(connectionId);
-				hostCapCache.delete(connectionId);
 				// The socket is gone, so its fence has nothing left to refuse. Dropping the
 				// entry keeps the set bounded by live connections instead of growing forever.
 				fencedConnections.delete(connectionId);
@@ -7700,7 +7743,7 @@ export function createNotificationsExtension(
 			// thread (forwarded by the daemon over the WS, fail-closed at the daemon).
 			server.onInbound(async (err, inbound) => {
 				if (err || !inbound) return;
-				const notificationOrigin = hostCapCache.get(inbound.connectionId)?.has(ASK_SELECTED_ACK_CAPABILITY);
+				const notificationOrigin = liveHostCapabilities(inbound.connectionId)?.has(ASK_SELECTED_ACK_CAPABILITY);
 				const admission = notificationInboundAdmission({
 					inboundFenced: initializedRuntime.inboundFenced,
 					policySuspended: runtime?.policySuspended ?? false,
@@ -7963,9 +8006,10 @@ export function createNotificationsExtension(
 				attachedClients: () => server.clientCount(),
 				observerClients: () => {
 					if (readWorkInFlight()) return 0;
-					return [...hostCapCache.values()].filter(capabilities =>
-						capabilities.has(SESSION_HOST_OBSERVER_CAPABILITY),
+					const observers = [...hostCapCache.keys()].filter(connectionId =>
+						liveHostCapabilities(connectionId)?.has(SESSION_HOST_OBSERVER_CAPABILITY),
 					).length;
+					return Math.min(server.clientCount(), observers);
 				},
 				workInFlight: readWorkInFlight,
 			});

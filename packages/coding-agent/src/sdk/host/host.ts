@@ -213,6 +213,8 @@ export class SessionSdkHost {
 	#unsubscribe?: () => void;
 	#registration?: { writer: BrokerIndexWriter; generation: number };
 	#reportedActivityState?: "active" | "idle";
+	/** Serializes durable activity transitions so a later state cannot be lost. */
+	#activityReportTail: Promise<void> = Promise.resolve();
 	/** The generation whose readiness signal has already been published. */
 	#readyGeneration?: number;
 	/** Serializes activation attempts so a concurrent pair cannot both publish. */
@@ -430,17 +432,22 @@ export class SessionSdkHost {
 
 	/** Persist the host's observable activity for broker/session-list consumers. */
 	async reportActivity(state: "active" | "idle", at = Date.now()): Promise<void> {
-		if (this.#reportedActivityState === state) return;
 		const registration = this.#registration;
 		if (!this.#started || this.#stopping || !registration?.writer.heartbeat) return;
 		if (!Number.isFinite(at)) at = Date.now();
-		await registration.writer.heartbeat({
-			sessionId: this.#options.sessionId,
-			stateRoot: this.#options.stateRoot,
-			endpointGeneration: this.events.generation,
-			activity: { state, at },
-		});
-		this.#reportedActivityState = state;
+		const write = async (): Promise<void> => {
+			if (this.#reportedActivityState === state) return;
+			await registration.writer.heartbeat!({
+				sessionId: this.#options.sessionId,
+				stateRoot: this.#options.stateRoot,
+				endpointGeneration: this.events.generation,
+				activity: { state, at },
+			});
+			this.#reportedActivityState = state;
+		};
+		const report = this.#activityReportTail.then(write, write);
+		this.#activityReportTail = report.catch(() => undefined);
+		await report;
 	}
 
 	async #send(connectionId: string, frame: SdkFrame): Promise<"written" | "dropped"> {
