@@ -16,7 +16,15 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { engines, version } from "../package.json" with { type: "json" };
-import { parseEnvFile } from "./env-file";
+import { canonicalEnvKey, type ProjectEnvSnapshot, projectEnvSnapshot } from "./env-file";
+
+// The provenance snapshot and its key fold live in the leaf `env-file` module so
+// `scripts/test-preload.ts` can share this exact logic without importing this
+// module (whose load-time resolver construction would freeze state before the
+// preload sets its isolation variables). Re-exported here because `env.ts` and
+// `test/env-provenance.windows.test.ts` import `canonicalEnvKey` from this
+// module's public surface.
+export { canonicalEnvKey };
 
 /** App name (e.g. "gjc") */
 export const APP_NAME: string = "gjc";
@@ -171,39 +179,6 @@ function sanitizeConfigDirName(value: string | undefined): string | undefined {
 }
 
 /**
- * Windows environment variable names are case-insensitive, so a project dotenv
- * line `userprofile=...` is what `process.env.USERPROFILE` resolves to. Every
- * provenance lookup here is spelled in upper case, so the snapshot must be
- * keyed the same way or the declaration is invisible to the guard while still
- * being live in the process. POSIX names are case-sensitive and must not fold.
- */
-export function canonicalEnvKey(name: string): string {
-	return process.platform === "win32" ? name.toUpperCase() : name;
-}
-
-function projectEnvSnapshot(cwd = process.cwd()): { values: Record<string, string>; dynamic: Set<string> } {
-	const nodeEnv = process.env.NODE_ENV;
-	const validNodeEnv = nodeEnv && /^[A-Za-z0-9_-]+$/.test(nodeEnv) ? nodeEnv : undefined;
-	const files = [
-		".env",
-		...(validNodeEnv ? [`.env.${validNodeEnv}`] : []),
-		...(validNodeEnv !== "test" ? [".env.local"] : []),
-		...(validNodeEnv ? [`.env.${validNodeEnv}.local`] : []),
-	];
-	const values: Record<string, string> = {};
-	const dynamic = new Set<string>();
-	for (const file of files) {
-		for (const [rawKey, value] of Object.entries(parseEnvFile(path.join(cwd, file)))) {
-			const key = canonicalEnvKey(rawKey);
-			values[key] = value;
-			if (/[$`]/.test(value)) dynamic.add(key);
-			else dynamic.delete(key);
-		}
-	}
-	return { values, dynamic };
-}
-
-/**
  * Resolve an environment value only when it is not supplied by the caller's
  * project dotenv (or when the inherited value is observably distinct).
  *
@@ -220,10 +195,7 @@ function projectEnvSnapshot(cwd = process.cwd()): { values: Record<string, strin
  * happens to carry the identical value loses the override, which is the same
  * trade-off `resolveLiveCredentialEnvValue` already makes.
  */
-function trustedValue(
-	name: string,
-	project: { values: Record<string, string>; dynamic: Set<string> },
-): string | undefined {
+function trustedValue(name: string, project: ProjectEnvSnapshot): string | undefined {
 	const value = process.env[name];
 	if (!value) return undefined;
 	const key = canonicalEnvKey(name);
@@ -232,7 +204,7 @@ function trustedValue(
 	return value;
 }
 
-function resolveConfigDirName(project: { values: Record<string, string>; dynamic: Set<string> }): string {
+function resolveConfigDirName(project: ProjectEnvSnapshot): string {
 	return (
 		sanitizeConfigDirName(trustedValue("GJC_CONFIG_DIR", project)) ??
 		sanitizeConfigDirName(trustedValue("PI_CONFIG_DIR", project)) ??
@@ -369,7 +341,7 @@ function accountHomeFromSystem(): AccountHome | undefined {
  * per call is what makes the contract call-time; the provenance comparison above
  * is what keeps an untrusted mutable home from being honored.
  */
-function resolveTrustedHome(project: { values: Record<string, string>; dynamic: Set<string> }): string {
+function resolveTrustedHome(project: ProjectEnvSnapshot): string {
 	const authoritativeHomeKey = process.platform === "win32" ? "USERPROFILE" : "HOME";
 	const declaredHomeKey = canonicalEnvKey(authoritativeHomeKey);
 	const declaredHome = project.values[declaredHomeKey];
@@ -425,7 +397,7 @@ type XdgCategory = "data" | "state" | "cache";
 class DirResolver {
 	configRoot: string;
 	agentDir: string;
-	readonly #projectEnv: { values: Record<string, string>; dynamic: Set<string> };
+	readonly #projectEnv: ProjectEnvSnapshot;
 	#configDirName: string;
 	readonly #agentDirOverride: boolean;
 	#trustedHome: string;
@@ -491,10 +463,7 @@ class DirResolver {
 	 * change storage lane when a home refresh made its path coincide with the
 	 * new default.
 	 */
-	private refreshCategoryDirs(
-		snapshot: { values: Record<string, string>; dynamic: Set<string> },
-		isDefault: boolean,
-	): void {
+	private refreshCategoryDirs(snapshot: ProjectEnvSnapshot, isDefault: boolean): void {
 		let xdgData: string | undefined;
 		let xdgState: string | undefined;
 		let xdgCache: string | undefined;
@@ -619,7 +588,7 @@ class DirResolver {
 		this.refreshConfigDirOverride();
 		if (!this.#homeAvailable) throw new Error("User state is unavailable: no trustworthy home directory");
 	}
-	get trustSnapshot(): { values: Record<string, string>; dynamic: Set<string> } {
+	get trustSnapshot(): ProjectEnvSnapshot {
 		return this.#projectEnv;
 	}
 }

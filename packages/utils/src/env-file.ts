@@ -6,6 +6,7 @@
  * below both of them.
  */
 import * as fs from "node:fs";
+import * as path from "node:path";
 import { isSafeEnvValue } from "./spawn-env";
 
 const ENV_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
@@ -154,4 +155,66 @@ export function parseEnvFileContent(content: string): Record<string, string> {
 	}
 
 	return result;
+}
+
+/**
+ * What the caller's checkout declares through its dotenv files.
+ *
+ * `values` is the merged declaration set, later layers winning. `dynamic` holds
+ * the keys whose surviving declaration is one Bun expands at load time, which
+ * every provenance guard refuses outright because a value comparison cannot see
+ * what such a declaration became.
+ */
+export interface ProjectEnvSnapshot {
+	values: Record<string, string>;
+	dynamic: Set<string>;
+}
+
+/**
+ * Windows environment variable names are case-insensitive, so a project dotenv
+ * line `userprofile=...` is what `process.env.USERPROFILE` resolves to. Every
+ * provenance lookup is spelled in upper case, so the snapshot must be keyed the
+ * same way or the declaration is invisible to the guard while still being live
+ * in the process. POSIX names are case-sensitive and must not fold.
+ */
+export function canonicalEnvKey(name: string): string {
+	return process.platform === "win32" ? name.toUpperCase() : name;
+}
+
+/**
+ * The layered dotenv declarations Bun overlays into `process.env` for a cwd.
+ *
+ * Lives in this leaf module so every consumer shares ONE notion of provenance.
+ * `dirs.ts` resolves the config, agent and log directories from it, and
+ * `scripts/test-preload.ts` decides test isolation from it — a second, narrower
+ * reader (only `cwd/.env`, its own regex, its own dynamic test) is how a
+ * `GJC_LOG_DIR` declared in `.env.local` / `.env.$NODE_ENV` came to be honored
+ * by the preload and then rejected in production, silently routing test log
+ * records to the operator's canonical sink. This module imports only `node:fs`,
+ * `node:path` and the import-free `./spawn-env`, so importing it has no side
+ * effects and cannot freeze resolver state the way importing `dirs.ts` would.
+ *
+ * `.env.local` is deliberately skipped when `NODE_ENV === "test"`, matching the
+ * convention that a local override file is not part of a test run.
+ */
+export function projectEnvSnapshot(cwd = process.cwd()): ProjectEnvSnapshot {
+	const nodeEnv = process.env.NODE_ENV;
+	const validNodeEnv = nodeEnv && /^[A-Za-z0-9_-]+$/.test(nodeEnv) ? nodeEnv : undefined;
+	const files = [
+		".env",
+		...(validNodeEnv ? [`.env.${validNodeEnv}`] : []),
+		...(validNodeEnv !== "test" ? [".env.local"] : []),
+		...(validNodeEnv ? [`.env.${validNodeEnv}.local`] : []),
+	];
+	const values: Record<string, string> = {};
+	const dynamic = new Set<string>();
+	for (const file of files) {
+		for (const [rawKey, value] of Object.entries(parseEnvFile(path.join(cwd, file)))) {
+			const key = canonicalEnvKey(rawKey);
+			values[key] = value;
+			if (/[$`]/.test(value)) dynamic.add(key);
+			else dynamic.delete(key);
+		}
+	}
+	return { values, dynamic };
 }

@@ -1,5 +1,6 @@
+import { projectEnvSnapshot } from "../packages/utils/src/env-file";
 import { installRuntimeDeletionGuard } from "./safe-cleanup";
-import { decideAgentDirIsolation, readProjectEnvFile, stripAmbientProviderEnvironment } from "./test-agent-dir-isolation";
+import { decideAgentDirIsolation, stripAmbientProviderEnvironment } from "./test-agent-dir-isolation";
 import { decideLogDirIsolation } from "./test-log-dir-isolation";
 import { formatWorkspaceDependencyFailure, inspectWorkspaceDependencies } from "./worktree-deps";
 import * as fs from "node:fs";
@@ -45,6 +46,19 @@ try {
 const e2eEnabled = /^(1|true|yes|on)$/i.test(process.env.E2E?.trim() ?? "");
 if (!e2eEnabled) stripAmbientProviderEnvironment(process.env);
 
+// The checkout's dotenv declarations, resolved ONCE through the same layered
+// snapshot production uses (`.env`, `.env.$NODE_ENV`, `.env.local` — skipped
+// under NODE_ENV=test — and `.env.$NODE_ENV.local`). Both isolation decisions
+// below read it.
+//
+// The agent-dir call site previously had the identical narrowness the log-dir
+// one did (a bespoke `cwd/.env`-only reader), and leaving two different notions
+// of provenance in one preload is the same defect relocated. Widening it can
+// only move cases from `honor` to `isolate`, which is the fail-safe direction,
+// and the repository ships no dotenv files at its root, so no CI or dev-machine
+// behaviour changes.
+const projectEnv = projectEnvSnapshot(process.cwd());
+
 // Isolate the agent directory for every test process. `getAgentDir()` (and
 // therefore `Settings.isolated()` and every daemon-path helper) resolves the
 // REAL `~/.gjc/agent` unless GJC_CODING_AGENT_DIR overrides it, so any test
@@ -69,7 +83,7 @@ const isolation = decideAgentDirIsolation({
 		GJC_CONFIG_DIR: process.env.GJC_CONFIG_DIR,
 		PI_CONFIG_DIR: process.env.PI_CONFIG_DIR,
 	},
-	projectEnv: readProjectEnvFile(process.cwd()),
+	projectEnv: projectEnv.values,
 });
 if (isolation.action === "isolate") {
 	let agentDir: string;
@@ -111,7 +125,7 @@ if (isolation.action === "isolate") {
 // this exists to prevent.
 const logIsolation = decideLogDirIsolation({
 	env: { GJC_LOG_DIR: process.env.GJC_LOG_DIR },
-	projectEnv: readProjectEnvFile(process.cwd()),
+	projectEnv,
 });
 if (logIsolation.action === "fail") {
 	throw new Error(
