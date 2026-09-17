@@ -4,7 +4,11 @@ import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { promisify } from "node:util";
-import { isContinuingMidRunMaintenanceOutcome, ThinkingLevel } from "@gajae-code/agent-core";
+import {
+	isContinuingMidRunMaintenanceOutcome,
+	isNonDispatchedToolEvent,
+	ThinkingLevel,
+} from "@gajae-code/agent-core";
 import type { Api, ImageContent, Model } from "@gajae-code/ai/core";
 import { logger } from "@gajae-code/utils";
 import { AsyncJobManager } from "../../async";
@@ -5056,7 +5060,12 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 	// the active run — the root invocation plus any in-run consumed follow-ups
 	// sharing it — not only the head, or an attached correlation would
 	// false-fire prompt_deadline_exceeded during a long shared run.
-	const renewAttributableProgress = (eventType: string, ctx: ExtensionContext): void => {
+	const renewAttributableProgress = (event: AgentSessionEvent, ctx: ExtensionContext): void => {
+		// Pairing-only tool boundaries synthesized while an abort unwinds never
+		// entered a tool. Treating them as progress lets a deadline renew its own
+		// lease after claiming the terminal outcome, leaving that claim pending
+		// instead of durably finalizing it.
+		if (isNonDispatchedToolEvent(event)) return;
 		// Tool events do not carry an SDK run token. Prefer the lifecycle-active
 		// runtime for the current session so a retained predecessor cannot make a
 		// live replacement look ambiguous and suppress its lease renewal.
@@ -5096,7 +5105,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			if (seen.has(correlationKey)) continue;
 			seen.add(correlationKey);
 			if (invocation.kind === "prompt")
-				current.deadlineManager.onAttributableEvent(invocation.correlation, eventType);
+				current.deadlineManager.onAttributableEvent(invocation.correlation, event.type);
 		}
 	};
 	/**
@@ -5167,14 +5176,14 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		}
 		publishContentFrames(current, event as AgentSessionEvent, invocations);
 	};
-	api.on("tool_execution_start", async (_event, ctx) => {
-		renewAttributableProgress("tool_execution_start", ctx);
+	api.on("tool_execution_start", async (event, ctx) => {
+		renewAttributableProgress(event as AgentSessionEvent, ctx);
 	});
-	api.on("tool_execution_update", async (_event, ctx) => {
-		renewAttributableProgress("tool_execution_update", ctx);
+	api.on("tool_execution_update", async (event, ctx) => {
+		renewAttributableProgress(event as AgentSessionEvent, ctx);
 	});
-	api.on("tool_execution_end", async (_event, ctx) => {
-		renewAttributableProgress("tool_execution_end", ctx);
+	api.on("tool_execution_end", async (event, ctx) => {
+		renewAttributableProgress(event as AgentSessionEvent, ctx);
 	});
 	const errorCode = (error: unknown): string | undefined =>
 		typeof error === "object" &&
@@ -5215,11 +5224,33 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				const v = options.settings?.get("sdk.promptMaxRuntimeMs" as never) as number | undefined;
 				return typeof v === "number" && Number.isFinite(v) ? v : 21_600_000;
 			},
-			onExpired: correlation => {
+			onExpired: (correlation, deadlineOutcome) => {
 				const owner = lifecycleOwnerHolder.state;
-				if (!owner) return;
-				removeLifecycleReferences(owner, correlation);
-				maybeRetireLifecycleOwner(owner);
+				if (deadlineOutcome === undefined) {
+					if (!owner) return;
+					removeLifecycleReferences(owner, correlation);
+					maybeRetireLifecycleOwner(owner);
+					return;
+				}
+				const failure = sanitizePromptFailure(
+					Object.assign(new Error("Prompt deadline exceeded."), { code: deadlineOutcome.code }),
+				);
+				runtime.emitEvent({
+					type: "agent_failed",
+					sessionId,
+					...correlation,
+					error: failure,
+				});
+				runtime.emitEvent({
+					type: "agent_end",
+					sessionId,
+					...correlation,
+					outcome: canonicalFailedOutcome(failure, "deadline"),
+				});
+				if (owner) {
+					removeLifecycleReferences(owner, correlation);
+					maybeRetireLifecycleOwner(owner);
+				}
 			},
 		});
 		const pending: Array<{

@@ -48,14 +48,14 @@ export class PromptDeadlineManager {
 	readonly #getLeaseMs: () => number;
 	readonly #getMaxMs: () => number;
 	readonly #now: () => number;
-	readonly #onExpired?: (correlation: InvocationCorrelation) => void;
+	readonly #onExpired?: (correlation: InvocationCorrelation, outcome?: PromptDeadlineOutcome) => void;
 
 	constructor(options: {
 		reconciliation: DeadlineReconciliation;
 		getLeaseMs: () => number;
 		getMaxMs: () => number;
 		now?: () => number;
-		onExpired?: (correlation: InvocationCorrelation) => void;
+		onExpired?: (correlation: InvocationCorrelation, outcome?: PromptDeadlineOutcome) => void;
 	}) {
 		this.#reconciliation = options.reconciliation;
 		this.#getLeaseMs = options.getLeaseMs;
@@ -197,7 +197,7 @@ export class PromptDeadlineManager {
 		// accepted/in-flight invocation without an owner, retry, or deadline
 		// recovery path.
 		try {
-			this.#onExpired?.(correlation);
+			this.#onExpired?.(correlation, outcome);
 		} catch {}
 		this.#expiryRetries.delete(key);
 		this.clear(correlation);

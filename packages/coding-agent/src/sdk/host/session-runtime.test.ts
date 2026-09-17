@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { markNonDispatchedToolEvent } from "@gajae-code/agent-core";
 import { logger } from "@gajae-code/utils";
 import { AsyncJobManager } from "../../async";
 import type { Settings } from "../../config/settings";
@@ -5649,6 +5650,108 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 				status: "failed",
 				error: { code: "prompt_deadline_exceeded", message: "Prompt deadline exceeded." },
 			});
+			await harness.stop();
+		} finally {
+			await Bun.sleep(50);
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	test("a running prompt deadline publishes one terminal frame pair and keeps normal terminals working", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-deadline-terminal-frame-"));
+		try {
+			const harness = await invocationHarness("deadline-terminal-frame", cwd, {
+				settings: zeroProgressSettings,
+				sendUserMessage: async (_content, options) => {
+					await options?.onPreflightAcceptCommit?.();
+					await neverSettlingPromise();
+				},
+			});
+			const accepted = await harness.control("turn.prompt", { text: "deadline" });
+			expect(accepted.ok).toBe(true);
+			const correlation = {
+				commandId: accepted.result?.commandId,
+				turnId: accepted.result?.turnId,
+			};
+			await harness.emit("agent_start");
+
+			// An abort can synthesize pairing-only tool boundaries for a call that
+			// never ran. Those are cleanup, not fresh progress that may renew the
+			// deadline currently terminating this prompt.
+			const syntheticStart = {
+				type: "tool_execution_start",
+				toolCallId: "deadline-cleanup",
+				toolName: "read",
+				args: {},
+			};
+			const syntheticEnd = {
+				type: "tool_execution_end",
+				toolCallId: "deadline-cleanup",
+				toolName: "read",
+				result: { content: "aborted" },
+				isError: true,
+			};
+			markNonDispatchedToolEvent(syntheticStart);
+			markNonDispatchedToolEvent(syntheticEnd);
+			await harness.emit("tool_execution_start", syntheticStart);
+			await harness.emit("tool_execution_end", syntheticEnd);
+
+			const settled = await settledStatus(harness, "turn.prompt_status", correlation);
+			expect(settled).toMatchObject({
+				status: "failed",
+				error: { code: "prompt_deadline_exceeded" },
+				outcome: { kind: "failed", code: "prompt_deadline_exceeded", provenance: "deadline" },
+			});
+			const correlated = () =>
+				harness.broadcasts.filter(frame => {
+					const payload = frame.payload as { commandId?: string; turnId?: string } | undefined;
+					return payload?.commandId === correlation.commandId && payload.turnId === correlation.turnId;
+				});
+			expect(correlated().filter(frame => frame.kind === "agent_failed")).toEqual([
+				expect.objectContaining({
+					payload: expect.objectContaining({
+						error: expect.objectContaining({ code: "prompt_deadline_exceeded" }),
+					}),
+				}),
+			]);
+			expect(correlated().filter(frame => frame.kind === "agent_end")).toEqual([
+				expect.objectContaining({
+					payload: expect.objectContaining({
+						outcome: expect.objectContaining({
+							kind: "failed",
+							code: "prompt_deadline_exceeded",
+							provenance: "deadline",
+						}),
+					}),
+				}),
+			]);
+
+			// A late real boundary is idempotent for the retired correlation.
+			await harness.emit("agent_end", { messages: [] });
+			expect(correlated().filter(frame => frame.kind === "agent_failed")).toHaveLength(1);
+			expect(correlated().filter(frame => frame.kind === "agent_end")).toHaveLength(1);
+			expect(await harness.query("turn.prompt_status", correlation)).toMatchObject({ result: settled });
+
+			// Control: the ordinary agent-produced terminal path remains live.
+			const control = await harness.control("turn.prompt", { text: "normal terminal" });
+			const controlCorrelation = {
+				commandId: control.result?.commandId,
+				turnId: control.result?.turnId,
+			};
+			await harness.emit("agent_start");
+			await harness.emit("agent_end", { messages: [{ role: "assistant", content: "done" }] });
+			expect(await settledStatus(harness, "turn.prompt_status", controlCorrelation)).toMatchObject({
+				status: "terminal_ok",
+			});
+			const controlTerminals = harness.broadcasts.filter(frame => {
+				const payload = frame.payload as { commandId?: string; turnId?: string } | undefined;
+				return (
+					frame.kind === "agent_end" &&
+					payload?.commandId === controlCorrelation.commandId &&
+					payload.turnId === controlCorrelation.turnId
+				);
+			});
+			expect(controlTerminals).toHaveLength(1);
 			await harness.stop();
 		} finally {
 			await Bun.sleep(50);
