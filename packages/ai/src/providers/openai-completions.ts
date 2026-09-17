@@ -34,6 +34,7 @@ import {
 	type Model,
 	type OpenAICompat,
 	type ProviderSessionState,
+	type RepetitionGuardOptions,
 	resolveServiceTier,
 	type ServiceTier,
 	type StopReason,
@@ -374,7 +375,7 @@ export interface OpenAICompletionsOptions extends StreamOptions {
 	 * output is a deliverable and intentional repetition there (logs, fixtures,
 	 * tables, generated code) must survive byte for byte (#5627).
 	 */
-	repetitionGuard?: { thinking?: number | false; text?: number | false };
+	repetitionGuard?: RepetitionGuardOptions;
 }
 
 type OpenAICompletionsParams = Omit<OpenAI.Chat.Completions.ChatCompletionCreateParamsStreaming, "reasoning_effort"> & {

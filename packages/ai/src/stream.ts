@@ -1113,6 +1113,7 @@ function mapOptionsForApi<TApi extends Api>(
 						: options?.disableReasoning,
 				toolChoice: mapOpenAiToolChoice(options?.toolChoice),
 				serviceTier: options?.serviceTier,
+				repetitionGuard: options?.repetitionGuard,
 			});
 
 		case "openai-responses":

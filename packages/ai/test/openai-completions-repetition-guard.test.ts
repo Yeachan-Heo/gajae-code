@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import { streamOpenAICompletions } from "../src/providers/openai-completions";
+import { streamSimple } from "../src/stream";
 import type { AssistantMessage, Context, Model, TextContent, ThinkingContent, ToolCall } from "../src/types";
 import { REPETITION_GUARD_ERROR_CODE, REPETITION_GUARD_STOP_MESSAGE } from "../src/utils/stream-repetition-guard";
 
@@ -614,4 +615,42 @@ describe("chat-completions: streamed repetition guard (#5624)", () => {
 		expect(result.errorMessage).toBe(REPETITION_GUARD_STOP_MESSAGE);
 	});
 
+	// The cases above reach the option by calling the provider directly. Callers
+	// in this repository go through `streamSimple`/`completeSimple`, whose
+	// options mapping dropped `repetitionGuard` on the floor — so the documented
+	// opt-out was unreachable from the public API and a false-positive thinking
+	// trip could not be switched off (#5627 review r5).
+	function opinionatedRepeats(): SseEvent[] {
+		const events: SseEvent[] = [];
+		for (let i = 0; i < 60; i++) events.push(chunk({ reasoning_content: `${SENTENCE}\n` }));
+		events.push(chunk({}, "stop"), "[DONE]");
+		return events;
+	}
+
+	it("honours a repetitionGuard opt-out forwarded through streamSimple", async () => {
+		const state: DeliveryState = { delivered: 0 };
+		global.fetch = streamingFetch(opinionatedRepeats(), state);
+
+		const result = await streamSimple(model(), context(), {
+			apiKey: "test",
+			repetitionGuard: { thinking: false },
+		}).result();
+
+		expect(countOccurrences(thinkingText(result), SENTENCE)).toBe(60);
+		expect(result.stopReason).toBe("stop");
+		expect(result.errorCode).toBeUndefined();
+	});
+
+	// Positive control: same fixture, same entry point, option omitted. Without
+	// this the opt-out test could pass on a stream that never looped at all.
+	it("still trips through streamSimple when no repetitionGuard option is given", async () => {
+		const state: DeliveryState = { delivered: 0 };
+		global.fetch = streamingFetch(opinionatedRepeats(), state);
+
+		const result = await streamSimple(model(), context(), { apiKey: "test" }).result();
+
+		expect(countOccurrences(thinkingText(result), SENTENCE)).toBeLessThanOrEqual(THRESHOLD);
+		expect(result.stopReason).toBe("error");
+		expect(result.errorCode).toBe(REPETITION_GUARD_ERROR_CODE);
+	});
 });

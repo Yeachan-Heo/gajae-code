@@ -46,6 +46,12 @@
   answering a tripped stream with those frames held the request open with no
   bound at all. The check now runs exactly once per consumed chunk, still after
   that chunk is fully processed so late tool-call frames are never cut mid-flight.
+- Make `repetitionGuard` reachable from the public API. The option existed only
+  on the openai-completions provider type and was dropped by the
+  `streamSimple`/`completeSimple` options mapping, so callers on the normal path
+  could neither disable a channel nor change its threshold. It is now part of
+  `SimpleStreamOptions` (as the shared `RepetitionGuardOptions` type) and is
+  forwarded to the transport; defaults and semantics are unchanged.
 - Strip leaked chat-template tool fences (`<|tool_call_end|>` and friends) from
   rendered thinking, including fences split across streaming chunk boundaries.
   The visible text channel is deliberately untouched, so a fence token the
