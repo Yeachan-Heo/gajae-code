@@ -300,8 +300,12 @@ describe("AgentSession switchSession resumeModelBehavior", () => {
 		const setConfiguredChain = vi.spyOn(session, "setConfiguredModelChain");
 		const ensureOnDisk = vi.spyOn(session.sessionManager, "ensureOnDisk");
 		const notice = vi.spyOn(session, "emitNotice");
+		const syncEagerDelegation = vi
+			.spyOn(session, "syncEagerDelegation")
+			.mockRejectedValue(new Error("delegation refresh failed"));
 
 		expect(await session.switchSession(sessionFile)).toBe(true);
+		expect(syncEagerDelegation).toHaveBeenCalledTimes(1);
 		expect(session.model?.id).toBe(codex.id);
 		expect(session.getConfiguredModelChainState("default")).toEqual({
 			entries: [`${sonnet.provider}/${sonnet.id}`],
@@ -326,6 +330,7 @@ describe("AgentSession switchSession resumeModelBehavior", () => {
 		expect(commitOrder).toBeLessThan(warningOrder);
 
 		const recoveredRuntimeState = session.getDefaultFallbackRuntimeState();
+		syncEagerDelegation.mockResolvedValue(undefined);
 		await targetSession!.dispose();
 		targetSession = undefined;
 		const opus = getBundledModel("anthropic", "claude-opus-4-8")!;
