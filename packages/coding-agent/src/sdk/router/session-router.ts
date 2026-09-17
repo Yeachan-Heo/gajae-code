@@ -33,6 +33,7 @@ import {
 } from "../session-activation";
 import type { SessionBindingAuthority } from "../session-authority";
 import { ACP_SESSION_RECONNECT, SESSION_REQUEST_TIMEOUT_MS } from "../session-reconnect";
+import { rememberReplayRetentionGap } from "./replay-retention-gap-cache";
 
 export type { SessionBindingAuthority, SessionEndpointAuthority } from "../session-authority";
 
@@ -378,12 +379,6 @@ function isUnansweredAfterDispatch(error: unknown): boolean {
 }
 
 const REPLAY_BARRIER_LIMIT = 1_024;
-/**
- * Retention-gap concessions are durable stream facts, but a Router can observe
- * many streams over its lifetime. Keep the warning memo bounded while retaining
- * enough recent coordinates to suppress reconnect/poll duplicates.
- */
-const REPLAY_CONCESSION_CACHE_LIMIT = 1_024;
 const REPLAY_PENDING_STALL_MS = 10_000;
 const REPLAY_RETRY_ATTEMPTS = 3;
 const REPLAY_RETRY_BACKOFF_MS = 100;
@@ -2218,19 +2213,12 @@ export class SessionRouter {
 		recoveredNote: string,
 	): void {
 		const key = JSON.stringify([attached.sessionId, attached.generation, gap.fromSeq, gap.toSeq]);
-		const previous = this.#concededReplayGaps.get(key);
-		if (previous !== undefined) {
-			this.#concededReplayGaps.delete(key);
-			this.#concededReplayGaps.set(key, previous + 1);
+		const repeat = rememberReplayRetentionGap(this.#concededReplayGaps, key);
+		if (repeat !== undefined) {
 			logger.debug(
-				`chat daemon replay retention gap repeated (sequences ${gap.fromSeq}-${gap.toSeq}); suppressed warning ${previous + 1} for session ${attached.sessionId} generation ${attached.generation}.`,
+				`chat daemon replay retention gap repeated (sequences ${gap.fromSeq}-${gap.toSeq}); suppressed warning ${repeat} for session ${attached.sessionId} generation ${attached.generation}.`,
 			);
 			return;
-		}
-		this.#concededReplayGaps.set(key, 0);
-		if (this.#concededReplayGaps.size > REPLAY_CONCESSION_CACHE_LIMIT) {
-			const oldest = this.#concededReplayGaps.keys().next().value;
-			if (oldest !== undefined) this.#concededReplayGaps.delete(oldest);
 		}
 		logger.warn(
 			`chat daemon replay conceded a retention gap (sequences ${gap.fromSeq}-${gap.toSeq} are gone from the host${recoveredNote}); session ${attached.sessionId} generation ${attached.generation} resumes at seq ${gap.toSeq + 1}.`,
