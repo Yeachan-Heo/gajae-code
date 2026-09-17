@@ -34,6 +34,26 @@ interface SseChunk {
 	}>;
 }
 
+/**
+ * A chunk with no `choices` key at all — what a usage-only report or a
+ * keepalive-shaped frame looks like on the wire. Its own type rather than a
+ * cast, so the harness keeps type-checking the events it serves.
+ */
+interface SseChoicelessChunk {
+	id: string;
+	object: "chat.completion.chunk";
+	created: number;
+	model: string;
+	usage?: { prompt_tokens: number; completion_tokens: number; total_tokens: number };
+}
+
+/**
+ * Everything the harness can serve. A bare `string` is emitted verbatim after
+ * `data: `, so `"[DONE]"` ends the stream and e.g. `"123"` produces a payload
+ * that parses to a non-object.
+ */
+type SseEvent = SseChunk | SseChoicelessChunk | Record<string, never> | string;
+
 function chunk(delta: SseChoiceDelta, finish: SseChunk["choices"][0]["finish_reason"] = null): SseChunk {
 	return {
 		id: "chatcmpl-repetition-guard",
@@ -67,7 +87,7 @@ const UPSTREAM_ERROR_MESSAGE = "upstream connection reset";
  * stream short, which is exactly the property under test.
  */
 function streamingFetch(
-	events: ReadonlyArray<SseChunk | "[DONE]">,
+	events: ReadonlyArray<SseEvent>,
 	state: DeliveryState,
 	ending: StreamEnding = "close",
 ): typeof fetch {
@@ -333,6 +353,84 @@ describe("chat-completions: streamed repetition guard (#5624)", () => {
 		expect(state.delivered).toBeLessThan(events.length);
 	});
 
+	// Mirrors the module-private REPETITION_DRAIN_PENDING_TOOL_MAX_CHUNKS — the
+	// widest of the two budgets, so asserting against it holds whichever branch
+	// `maybeAbortAfterRepetitionDrain` takes.
+	const DRAIN_PENDING_TOOL_MAX_CHUNKS = 256;
+
+	/**
+	 * The drain budget used to be spent only by chunks that survived to the
+	 * bottom of the loop body: two early `continue`s — one for a non-object
+	 * payload, one for a `choices`-less payload — skipped the only call to
+	 * `maybeAbortAfterRepetitionDrain()`. A provider that answered a tripped
+	 * stream with usage-only, keepalive-shaped or malformed frames therefore
+	 * held the request open with no bound at all (#5627 review r5).
+	 *
+	 * Both halves live in one test on purpose: the bound and the late tool call
+	 * pull in opposite directions (cut sooner vs. finalize what already
+	 * arrived), so splitting them would let a fix satisfy one and break the
+	 * other while staying green.
+	 */
+	it("bounds the drain on chunks that carry no choices, and still keeps a late tool call", async () => {
+		const state: DeliveryState = { delivered: 0 };
+		const events: SseEvent[] = [];
+		// 14 > THRESHOLD, so the guard is already tripped before the tool call.
+		for (let i = 0; i < 14; i++) events.push(chunk({ reasoning_content: `${SENTENCE}\n` }));
+		events.push(
+			chunk({
+				tool_calls: [
+					{ index: 0, id: "call_1", type: "function", function: { name: "read", arguments: '{"path":' } },
+				],
+			}),
+			chunk({ tool_calls: [{ index: 0, function: { arguments: '"late.ts"}' } }] }),
+		);
+		// Now flood with chunks that reach *only* the two early-exit paths, far
+		// past either budget so "bounded" is a real claim and not an accident.
+		const FLOOD = 400;
+		for (let i = 0; i < FLOOD; i++) {
+			if (i % 3 === 0) {
+				// usage-only / `choices`-less
+				events.push({
+					id: "chatcmpl-repetition-guard",
+					object: "chat.completion.chunk",
+					created: 0,
+					model: "test-model",
+					usage: { prompt_tokens: 1, completion_tokens: i, total_tokens: i + 1 },
+				});
+			} else if (i % 3 === 1) {
+				// not an object at all — `data: 123` parses to a number
+				events.push(String(i));
+			} else {
+				events.push({});
+			}
+		}
+		events.push(chunk({}, "stop"), "[DONE]");
+		global.fetch = streamingFetch(events, state);
+
+		const result = await streamOpenAICompletions(model(), context(), {
+			apiKey: "test",
+			// Generous: the chunk budget, not the clock, must be what ends this.
+			streamIdleTimeoutMs: 60_000,
+		}).result();
+
+		// (1) The late tool call still landed — the check stays *after* each
+		// chunk's processing, so nothing in flight is cut mid-frame.
+		const toolCalls = result.content.filter((block): block is ToolCall => block.type === "toolCall");
+		expect(toolCalls).toHaveLength(1);
+		expect(toolCalls[0].name).toBe("read");
+		expect(toolCalls[0].arguments).toEqual({ path: "late.ts" });
+
+		// (2) ...and the stream was still cut, inside the advertised budget.
+		expect(state.delivered).toBeLessThan(events.length);
+		expect(state.delivered).toBeLessThanOrEqual(DRAIN_PENDING_TOOL_MAX_CHUNKS);
+
+		// Classification is unchanged by the restructure.
+		expect(result.stopReason).toBe("error");
+		expect(result.errorCode).toBe(REPETITION_GUARD_ERROR_CODE);
+		// Draining did not re-open the emit path.
+		expect(countOccurrences(thinkingText(result), SENTENCE)).toBeLessThanOrEqual(THRESHOLD);
+	});
+
 	it("strips leaked tool fences from rendered thinking", async () => {
 		const state: DeliveryState = { delivered: 0 };
 		global.fetch = streamingFetch(
@@ -515,4 +613,5 @@ describe("chat-completions: streamed repetition guard (#5624)", () => {
 		expect(result.errorCode).toBe(REPETITION_GUARD_ERROR_CODE);
 		expect(result.errorMessage).toBe(REPETITION_GUARD_STOP_MESSAGE);
 	});
+
 });

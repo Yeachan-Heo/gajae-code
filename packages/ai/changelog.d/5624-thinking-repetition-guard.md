@@ -40,6 +40,12 @@
   healthy completion. The guard is now finalized at end of stream — on the
   normal-completion path only, so a stream that threw mid-repeat still keeps its
   own transport facts.
+- Bound the post-trip drain on *every* consumed chunk. The drain budget was only
+  spent by chunks that carried a usable `choices[0]`; usage-only, keepalive-shaped,
+  `choices`-less and malformed frames skipped the check entirely, so a provider
+  answering a tripped stream with those frames held the request open with no
+  bound at all. The check now runs exactly once per consumed chunk, still after
+  that chunk is fully processed so late tool-call frames are never cut mid-flight.
 - Strip leaked chat-template tool fences (`<|tool_call_end|>` and friends) from
   rendered thinking, including fences split across streaming chunk boundaries.
   The visible text channel is deliberately untouched, so a fence token the

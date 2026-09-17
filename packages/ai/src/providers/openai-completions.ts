@@ -1163,157 +1163,179 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 			};
 
 			for await (const chunk of iterateWithNetworkErrorRetry()) {
-				// Counted before the early `continue`s below so chunks carrying no
+				// Counted before the guarded blocks below so chunks carrying no
 				// delta still spend the drain budget rather than extending it.
 				if (repetitionTrippedAt !== undefined) repetitionDrainedChunks += 1;
-				if (!chunk || typeof chunk !== "object") continue;
 
-				// OpenAI documents ChatCompletionChunk.id as the unique chat completion identifier,
-				// and each chunk in a streamed completion carries the same id.
-				output.responseId ||= chunk.id;
+				// Positive-form guards instead of early `continue`s: the drain check
+				// at the bottom of the body has to be reached on *every* path, or a
+				// provider that keeps emitting usage-only, keepalive-shaped,
+				// `choices`-less or malformed chunks after a trip never spends the
+				// budget and the request hangs open (#5627 review r5).
+				if (chunk && typeof chunk === "object") {
+					// OpenAI documents ChatCompletionChunk.id as the unique chat completion identifier,
+					// and each chunk in a streamed completion carries the same id.
+					output.responseId ||= chunk.id;
 
-				if (chunk.usage) {
-					applyUsage(chunk.usage);
-				}
-
-				const choice = Array.isArray(chunk.choices) ? chunk.choices[0] : undefined;
-				if (!choice) continue;
-
-				if (!chunk.usage) {
-					const choiceUsage = getChoiceUsage(choice);
-					if (choiceUsage) {
-						applyUsage(choiceUsage);
-					}
-				}
-
-				if (choice.finish_reason) {
-					const finishReasonResult = mapStopReason(choice.finish_reason);
-					if (choice.finish_reason === "content_filter") {
-						markProviderSafetyStop(finishReasonResult.errorMessage);
-					} else if (!providerSafetyStop) {
-						output.stopReason = finishReasonResult.stopReason;
-						if (finishReasonResult.errorMessage) {
-							output.errorMessage = finishReasonResult.errorMessage;
-						}
-					}
-				}
-
-				if (choice.delta) {
-					if (typeof choice.delta.refusal === "string" && choice.delta.refusal.length > 0) {
-						appendTextDelta(choice.delta.refusal);
-						if (!providerSafetyStop) {
-							markProviderSafetyStop("Provider returned a safety refusal");
-						}
-					}
-					const normalizedDeltaText = normalizeStreamingContentText(choice.delta.content);
-					if (normalizedDeltaText.length > 0) {
-						if (!firstTokenTime) firstTokenTime = Date.now();
-						if (parseMiniMaxThinkTags) {
-							taggedTextBuffer += normalizedDeltaText;
-							flushTaggedTextBuffer();
-						} else if (stripDeepseekChatTemplateTokens) {
-							deepseekStripBuffer += normalizedDeltaText;
-							flushDeepseekStripBuffer(false);
-						} else if (kimiHealer) {
-							const hasStructuredToolCalls =
-								Array.isArray(choice.delta.tool_calls) && choice.delta.tool_calls.length > 0;
-							if (hasStructuredToolCalls) {
-								// Same chunk leaks markers AND carries structured tool_calls.
-								// Strip the marker text from visible output, but drop any
-								// synthesized calls so the structured payload stays the
-								// single source of truth (avoids double-dispatch).
-								const clean = kimiHealer.consumeWithoutCalls(normalizedDeltaText);
-								if (clean.length > 0) appendTextDelta(clean);
-							} else {
-								const clean = kimiHealer.feed(normalizedDeltaText);
-								if (clean.length > 0) appendTextDelta(clean);
-								flushHealedToolCalls();
-							}
-						} else {
-							appendTextDelta(normalizedDeltaText);
-						}
+					if (chunk.usage) {
+						applyUsage(chunk.usage);
 					}
 
-					// Some endpoints return reasoning in reasoning_content (llama.cpp),
-					// or reasoning (other openai compatible endpoints)
-					// Use the first non-empty reasoning field to avoid duplication
-					// (e.g., chutes.ai returns both reasoning_content and reasoning with same content)
-					const reasoningFields = ["reasoning_content", "reasoning", "reasoning_text"];
-					let foundReasoningField: string | null = null;
-					for (const field of reasoningFields) {
-						if (
-							(choice.delta as any)[field] !== null &&
-							(choice.delta as any)[field] !== undefined &&
-							(choice.delta as any)[field].length > 0
-						) {
-							if (!foundReasoningField) {
-								foundReasoningField = field;
-								break;
+					const choice = Array.isArray(chunk.choices) ? chunk.choices[0] : undefined;
+					if (choice) {
+						if (!chunk.usage) {
+							const choiceUsage = getChoiceUsage(choice);
+							if (choiceUsage) {
+								applyUsage(choiceUsage);
 							}
 						}
-					}
 
-					if (foundReasoningField) {
-						const delta = (choice.delta as any)[foundReasoningField];
-						appendThinkingDelta(delta, foundReasoningField);
-					}
-
-					if (choice?.delta?.tool_calls && choice.delta.tool_calls.length > 0) {
-						for (const toolCall of choice.delta.tool_calls) {
-							if (currentBlock?.type !== "toolCall" || (toolCall.id && currentBlock.id !== toolCall.id)) {
-								finishCurrentBlock(currentBlock);
-								currentBlock = {
-									type: "toolCall",
-									id: toolCall.id || "",
-									name: toolCall.function?.name || "",
-									arguments: {},
-									partialArgs: "",
-								};
-								output.content.push(currentBlock);
-								stream.push({
-									type: "toolcall_start",
-									contentIndex: blockIndex(currentBlock),
-									partial: output,
-								});
-							}
-
-							if (currentBlock.type === "toolCall") {
-								if (toolCall.id) currentBlock.id = toolCall.id;
-								if (toolCall.function?.name) currentBlock.name = toolCall.function.name;
-								let delta = "";
-								if (toolCall.function?.arguments) {
-									delta = toolCall.function.arguments;
-									currentBlock.partialArgs += toolCall.function.arguments;
-									currentBlock.arguments = parseStreamingJson(currentBlock.partialArgs);
-								}
-								stream.push({
-									type: "toolcall_delta",
-									contentIndex: blockIndex(currentBlock),
-									delta,
-									partial: output,
-								});
-							}
-						}
-					}
-
-					const reasoningDetails = (choice.delta as any).reasoning_details;
-					if (reasoningDetails && Array.isArray(reasoningDetails)) {
-						for (const detail of reasoningDetails) {
-							if (detail.type === "reasoning.encrypted" && detail.id && detail.data) {
-								const matchingToolCall = output.content.find(
-									b => b.type === "toolCall" && b.id === detail.id,
-								) as ToolCall | undefined;
-								if (matchingToolCall) {
-									matchingToolCall.thoughtSignature = JSON.stringify(detail);
+						if (choice.finish_reason) {
+							const finishReasonResult = mapStopReason(choice.finish_reason);
+							if (choice.finish_reason === "content_filter") {
+								markProviderSafetyStop(finishReasonResult.errorMessage);
+							} else if (!providerSafetyStop) {
+								output.stopReason = finishReasonResult.stopReason;
+								if (finishReasonResult.errorMessage) {
+									output.errorMessage = finishReasonResult.errorMessage;
 								}
 							}
 						}
+
+						if (choice.delta) {
+							if (typeof choice.delta.refusal === "string" && choice.delta.refusal.length > 0) {
+								appendTextDelta(choice.delta.refusal);
+								if (!providerSafetyStop) {
+									markProviderSafetyStop("Provider returned a safety refusal");
+								}
+							}
+							const normalizedDeltaText = normalizeStreamingContentText(choice.delta.content);
+							if (normalizedDeltaText.length > 0) {
+								if (!firstTokenTime) firstTokenTime = Date.now();
+								if (parseMiniMaxThinkTags) {
+									taggedTextBuffer += normalizedDeltaText;
+									flushTaggedTextBuffer();
+								} else if (stripDeepseekChatTemplateTokens) {
+									deepseekStripBuffer += normalizedDeltaText;
+									flushDeepseekStripBuffer(false);
+								} else if (kimiHealer) {
+									const hasStructuredToolCalls =
+										Array.isArray(choice.delta.tool_calls) && choice.delta.tool_calls.length > 0;
+									if (hasStructuredToolCalls) {
+										// Same chunk leaks markers AND carries structured tool_calls.
+										// Strip the marker text from visible output, but drop any
+										// synthesized calls so the structured payload stays the
+										// single source of truth (avoids double-dispatch).
+										const clean = kimiHealer.consumeWithoutCalls(normalizedDeltaText);
+										if (clean.length > 0) appendTextDelta(clean);
+									} else {
+										const clean = kimiHealer.feed(normalizedDeltaText);
+										if (clean.length > 0) appendTextDelta(clean);
+										flushHealedToolCalls();
+									}
+								} else {
+									appendTextDelta(normalizedDeltaText);
+								}
+							}
+
+							// Some endpoints return reasoning in reasoning_content (llama.cpp),
+							// or reasoning (other openai compatible endpoints)
+							// Use the first non-empty reasoning field to avoid duplication
+							// (e.g., chutes.ai returns both reasoning_content and reasoning with same content)
+							const reasoningFields = ["reasoning_content", "reasoning", "reasoning_text"];
+							let foundReasoningField: string | null = null;
+							for (const field of reasoningFields) {
+								if (
+									(choice.delta as any)[field] !== null &&
+									(choice.delta as any)[field] !== undefined &&
+									(choice.delta as any)[field].length > 0
+								) {
+									if (!foundReasoningField) {
+										foundReasoningField = field;
+										break;
+									}
+								}
+							}
+
+							if (foundReasoningField) {
+								const delta = (choice.delta as any)[foundReasoningField];
+								appendThinkingDelta(delta, foundReasoningField);
+							}
+
+							if (choice?.delta?.tool_calls && choice.delta.tool_calls.length > 0) {
+								for (const toolCall of choice.delta.tool_calls) {
+									if (currentBlock?.type !== "toolCall" || (toolCall.id && currentBlock.id !== toolCall.id)) {
+										finishCurrentBlock(currentBlock);
+										currentBlock = {
+											type: "toolCall",
+											id: toolCall.id || "",
+											name: toolCall.function?.name || "",
+											arguments: {},
+											partialArgs: "",
+										};
+										output.content.push(currentBlock);
+										stream.push({
+											type: "toolcall_start",
+											contentIndex: blockIndex(currentBlock),
+											partial: output,
+										});
+									}
+
+									if (currentBlock.type === "toolCall") {
+										if (toolCall.id) currentBlock.id = toolCall.id;
+										if (toolCall.function?.name) currentBlock.name = toolCall.function.name;
+										let delta = "";
+										if (toolCall.function?.arguments) {
+											delta = toolCall.function.arguments;
+											currentBlock.partialArgs += toolCall.function.arguments;
+											currentBlock.arguments = parseStreamingJson(currentBlock.partialArgs);
+										}
+										stream.push({
+											type: "toolcall_delta",
+											contentIndex: blockIndex(currentBlock),
+											delta,
+											partial: output,
+										});
+									}
+								}
+							}
+
+							const reasoningDetails = (choice.delta as any).reasoning_details;
+							if (reasoningDetails && Array.isArray(reasoningDetails)) {
+								for (const detail of reasoningDetails) {
+									if (detail.type === "reasoning.encrypted" && detail.id && detail.data) {
+										const matchingToolCall = output.content.find(
+											b => b.type === "toolCall" && b.id === detail.id,
+										) as ToolCall | undefined;
+										if (matchingToolCall) {
+											matchingToolCall.thoughtSignature = JSON.stringify(detail);
+										}
+									}
+								}
+							}
+						}
 					}
 				}
 
-				// This chunk is fully processed — anything it carried (including
-				// `tool_calls` frames) has landed. Only now may the drain window
-				// close and cut the stream.
+				// Single invariant: exactly one evaluation per consumed chunk, on
+				// every path. Two properties ride on this being the last *statement*
+				// of the body rather than a `finally`:
+				//
+				// (a) This chunk is fully processed — anything it carried (including
+				//     `tool_calls` frames) has landed. Only now may the drain window
+				//     close and cut the stream. The check must never run *before*
+				//     the chunk's processing.
+				// (b) A throwing chunk keeps its own transport facts. A `finally`
+				//     would also run when the body throws, and this check sets
+				//     `repetitionSelfAbort` — which the catch below branches on to
+				//     call `finalizeRepetitionGuardStop()`. A malformed payload
+				//     throwing inside the drain window would then be re-labelled as
+				//     the guard's own abort, discarding the real
+				//     errorMessage/errorStatus/transportFailure and flipping retry
+				//     admission — exactly the defect fixed in e577268e.
+				//
+				// Caller-abort priority is unchanged: a genuine caller abort still
+				// wins over the guard's self-abort, and a trip is still not a cancel.
 				maybeAbortAfterRepetitionDrain();
 			}
 
