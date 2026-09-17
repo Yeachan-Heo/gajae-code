@@ -378,6 +378,12 @@ function isUnansweredAfterDispatch(error: unknown): boolean {
 }
 
 const REPLAY_BARRIER_LIMIT = 1_024;
+/**
+ * Retention-gap concessions are durable stream facts, but a Router can observe
+ * many streams over its lifetime. Keep the warning memo bounded while retaining
+ * enough recent coordinates to suppress reconnect/poll duplicates.
+ */
+const REPLAY_CONCESSION_CACHE_LIMIT = 1_024;
 const REPLAY_PENDING_STALL_MS = 10_000;
 const REPLAY_RETRY_ATTEMPTS = 3;
 const REPLAY_RETRY_BACKOFF_MS = 100;
@@ -627,6 +633,8 @@ export class SessionRouter {
 	>();
 	readonly #reviving = new Set<string>();
 	readonly #notificationReceipts = new Map<string, NotificationCleanupReceipt>();
+	/** Recent retention-gap coordinates already reported at warning level. */
+	readonly #concededReplayGaps = new Map<string, number>();
 	#stopTimer: (() => void) | undefined;
 	#reconcileTail: Promise<void> = Promise.resolve();
 	#reconcilePending: { readonly runEpoch: number; force: boolean } | undefined;
@@ -2203,6 +2211,31 @@ export class SessionRouter {
 			`chat daemon replay barrier failed (${reason}); rebuilding session ${attached.sessionId} at generation ${attached.generation} from seq ${attached.cursor.seq}.`,
 		);
 	}
+
+	#logReplayRetentionGap(
+		attached: AttachedSession,
+		gap: Readonly<{ fromSeq: number; toSeq: number }>,
+		recoveredNote: string,
+	): void {
+		const key = JSON.stringify([attached.sessionId, attached.generation, gap.fromSeq, gap.toSeq]);
+		const previous = this.#concededReplayGaps.get(key);
+		if (previous !== undefined) {
+			this.#concededReplayGaps.delete(key);
+			this.#concededReplayGaps.set(key, previous + 1);
+			logger.debug(
+				`chat daemon replay retention gap repeated (sequences ${gap.fromSeq}-${gap.toSeq}); suppressed warning ${previous + 1} for session ${attached.sessionId} generation ${attached.generation}.`,
+			);
+			return;
+		}
+		this.#concededReplayGaps.set(key, 0);
+		if (this.#concededReplayGaps.size > REPLAY_CONCESSION_CACHE_LIMIT) {
+			const oldest = this.#concededReplayGaps.keys().next().value;
+			if (oldest !== undefined) this.#concededReplayGaps.delete(oldest);
+		}
+		logger.warn(
+			`chat daemon replay conceded a retention gap (sequences ${gap.fromSeq}-${gap.toSeq} are gone from the host${recoveredNote}); session ${attached.sessionId} generation ${attached.generation} resumes at seq ${gap.toSeq + 1}.`,
+		);
+	}
 	#failDelivery(attached: AttachedSession, seq: number, error: unknown): void {
 		const previous = this.#undelivered.get(attached.sessionId);
 		const attempts = previous?.generation === attached.generation && previous.seq === seq ? previous.attempts + 1 : 1;
@@ -2503,9 +2536,7 @@ export class SessionRouter {
 				held.splice(0, held.length, ...carried);
 				const recoveredNote =
 					recovered.length > 0 ? `, ${recovered.length} of them recovered from live delivery` : "";
-				logger.warn(
-					`chat daemon replay conceded a retention gap (sequences ${gap.fromSeq}-${gap.toSeq} are gone from the host${recoveredNote}); session ${attached.sessionId} generation ${attached.generation} resumes at seq ${gap.toSeq + 1}.`,
-				);
+				this.#logReplayRetentionGap(attached, gap, recoveredNote);
 				for (const entry of recovered) this.#rememberRecoveredFrame(attached, entry.seq, entry.frame);
 				if (!(await this.#deliverRecoveredFrames(attached))) return;
 				if (gap.toSeq > attached.cursor.seq) attached.cursor.seq = gap.toSeq;

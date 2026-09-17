@@ -1334,6 +1334,49 @@ test("a retention gap at the initial attach keeps delivering instead of rebuildi
 		});
 	});
 }, 20_000);
+
+test("replay retention-gap warnings dedupe a settled stream range and reopen for a new range", async () => {
+	await withAttachedSessionRuntime(async ({ runtime, provider, warnings }) => {
+		await withSerializedFakeTransport(async () => {
+			const host = new FakeSessionHost(2);
+			host.emit("evicted one");
+			host.emit("retained two");
+			host.emit("retained three");
+
+			let starting = runtime.start();
+			host.accept(await awaitSocket(1));
+			await starting;
+			await awaitPosts(provider, 2);
+			const concessionWarnings = () => warnings.filter(line => line.includes("conceded a retention gap"));
+			expect(concessionWarnings()).toHaveLength(1);
+
+			// Restarting the Router replays the same stream from its initial cursor. The
+			// concession is the same durable range, so it must not produce another warning.
+			await runtime.stop();
+			starting = runtime.start();
+			host.accept(await awaitSocket(2));
+			await starting;
+			await awaitReplayRequests(host, 2);
+			await Bun.sleep(50);
+			expect(concessionWarnings()).toHaveLength(1);
+
+			// Advancing the host ring changes the bound, so the next replay remains visible
+			// even though it belongs to the same session generation.
+			host.emit("future four");
+			await runtime.stop();
+			starting = runtime.start();
+			host.accept(await awaitSocket(3));
+			await starting;
+			await awaitReplayRequests(host, 3);
+			await Bun.sleep(50);
+			expect(concessionWarnings()).toEqual([
+				`chat daemon replay conceded a retention gap (sequences 1-1 are gone from the host); session ${SESSION_ID} generation ${GENERATION} resumes at seq 2.`,
+				`chat daemon replay conceded a retention gap (sequences 1-2 are gone from the host); session ${SESSION_ID} generation ${GENERATION} resumes at seq 3.`,
+			]);
+		});
+	});
+}, 20_000);
+
 test("a replay answered from a rolled generation retires the attachment instead of publishing it", async () => {
 	await withAttachedSessionRuntime(async ({ runtime, provider, reconcile, awaitFrameSettlement, supersede }) => {
 		await withSerializedFakeTransport(async () => {
