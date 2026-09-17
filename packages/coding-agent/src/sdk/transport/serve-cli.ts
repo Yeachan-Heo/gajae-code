@@ -16,6 +16,30 @@ function usageError(message: string): never {
 	throw new CliParseError(`gjc sdk serve: ${message}`);
 }
 
+/**
+ * A `gjc sdk serve` operational failure with a stable machine-readable code and a
+ * documented exit code, mirroring `SdkSessionCliError`. Usage errors keep their own
+ * `CliParseError` path; this type covers only failures an embedder must branch on.
+ */
+export class SdkServeError extends Error {
+	constructor(
+		readonly code: string,
+		message: string,
+		readonly exitCode: 1,
+		readonly details?: unknown,
+	) {
+		super(message);
+		this.name = "SdkServeError";
+	}
+}
+
+/** Normalizes a serve-path failure into a typed error so nothing escapes untyped. */
+function toServeError(error: unknown): Error {
+	if (error instanceof SdkServeError || error instanceof CliParseError) return error;
+	if (error instanceof SdkClientError) return new SdkServeError(error.code, error.message, 1, error.details);
+	return new SdkServeError("serve_failed", error instanceof Error ? error.message : "SDK serve failed.", 1);
+}
+
 function readFlagValue(argv: string[], index: number, flag: string): string {
 	const value = argv[index + 1];
 	if (value === undefined || value.startsWith("-")) usageError(`${flag} requires a value`);
@@ -113,14 +137,15 @@ export async function listBrokerSessions(broker: SdkClient, explicitSessionId?: 
 export function selectBrokerSession(sessions: BrokerSessionRow[], explicitSessionId: string | undefined): string {
 	if (explicitSessionId !== undefined) {
 		const row = sessions.find(session => session.sessionId === explicitSessionId);
-		if (!row) throw new Error(`not_found: session ${explicitSessionId} is not indexed by the broker`);
-		if (row.ambiguous) throw new Error("ambiguous_session: session id maps to more than one state root");
-		if (!row.live) throw new Error(`endpoint_stale: session ${explicitSessionId} endpoint is not live`);
+		if (!row) throw new SdkServeError("not_found", `session ${explicitSessionId} is not indexed by the broker`, 1);
+		if (row.ambiguous) throw new SdkServeError("ambiguous_session", "session id maps to more than one state root", 1);
+		if (!row.live) throw new SdkServeError("endpoint_stale", `session ${explicitSessionId} endpoint is not live`, 1);
 		return row.sessionId;
 	}
 	const live = sessions.filter(session => session.live && !session.ambiguous);
-	if (live.length === 0) throw new Error("no_live_endpoint: no live session endpoint");
-	if (live.length > 1) throw new Error("multiple_live_endpoints: more than one live session; specify --session <id>");
+	if (live.length === 0) throw new SdkServeError("no_live_endpoint", "no live session endpoint", 1);
+	if (live.length > 1)
+		throw new SdkServeError("multiple_live_endpoints", "more than one live session; specify --session <id>", 1);
 	return live[0]!.sessionId;
 }
 
@@ -133,25 +158,25 @@ export function selectBrokerSession(sessions: BrokerSessionRow[], explicitSessio
 export async function runSdkServe(argv: string[]): Promise<void> {
 	const parsed = parseServeArguments(argv);
 	if (parsed.mode.kind === "socket" && process.platform === "win32")
-		throw new Error("unsupported_platform: --socket is unavailable on Windows.");
+		throw new SdkServeError("unsupported_platform", "--socket is unavailable on Windows.", 1);
 	const pendingCeilingBytes = resolveServePendingCeiling(
 		parsed.pendingCeiling,
 		process.env.GJC_SDK_SERVE_PENDING_CEILING_BYTES,
 	);
 	const discovery = await readSdkBrokerDiscovery(getAgentDir());
-	if (!discovery) throw new Error("broker_unavailable: SDK broker is not running");
+	if (!discovery) throw new SdkServeError("broker_unavailable", "SDK broker is not running", 1);
 	let broker: SdkClient;
 	try {
 		broker = await SdkClient.connect(discovery.url, discovery.token);
 	} catch {
-		throw new Error("broker_unavailable: SDK broker is not reachable");
+		throw new SdkServeError("broker_unavailable", "SDK broker is not reachable", 1);
 	}
 	try {
 		const sessionId = selectBrokerSession(await listBrokerSessions(broker, parsed.sessionId), parsed.sessionId);
 		const endpoint = brokerResult(await broker.global("session.get_endpoint", { sessionId }));
 		const url = typeof endpoint.url === "string" && endpoint.url ? endpoint.url : undefined;
 		const token = typeof endpoint.token === "string" ? endpoint.token : "";
-		if (!url) throw new Error("unavailable: broker returned an invalid endpoint record");
+		if (!url) throw new SdkServeError("unavailable", "broker returned an invalid endpoint record", 1);
 		const options = { url, token, pendingCeilingBytes };
 		const handle =
 			parsed.mode.kind === "stdio"
@@ -169,7 +194,7 @@ export async function runSdkServe(argv: string[]): Promise<void> {
 			process.removeListener("SIGTERM", stop);
 		}
 	} catch (error) {
-		throw error instanceof SdkClientError ? new Error(`${error.code}: ${error.message}`) : error;
+		throw toServeError(error);
 	} finally {
 		await broker.close();
 	}
