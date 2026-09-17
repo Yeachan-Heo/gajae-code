@@ -9,6 +9,7 @@ import { CliParseError, renderCommandHelp } from "@gajae-code/utils/cli";
 import type { ServerWebSocket } from "bun";
 import Sdk, { parseSdkInternalArgv } from "../src/commands/sdk.js";
 import { brokerProcessIncarnation, writeBrokerDiscovery } from "../src/sdk/broker/discovery.js";
+import { SDK_STATE_VERSION } from "../src/sdk/broker/state-version.js";
 import { SdkClient, SdkClientError } from "../src/sdk/client/client.js";
 import { listSdkSessionEndpoints } from "../src/sdk/client/discovery.js";
 import { classifyEndpoint, selectLiveEndpoint } from "../src/sdk/client/liveness.js";
@@ -956,5 +957,36 @@ describe("SDK serve CLI and discovery", () => {
 			broker.stop();
 			fake.stop();
 		}
+	});
+
+	test("reports an unreadable broker discovery record as a typed failure", async () => {
+		const failure = await withServeAgentDir(undefined, async () => {
+			// A record from a newer SDK state version: the read throws rather than
+			// reporting the broker absent. A JSON syntax error cannot reach this path
+			// — the reader folds that into the absent case.
+			const file = path.join(getAgentDir(), "sdk", "broker.json");
+			await fs.mkdir(path.dirname(file), { recursive: true });
+			await fs.writeFile(file, JSON.stringify({ version: SDK_STATE_VERSION + 1, token: "super-secret-token" }));
+			return await serveRejection(["--stdio"]);
+		});
+		expect(failure).toBeInstanceOf(SdkServeError);
+		expect(failure).toMatchObject({
+			code: "broker_discovery_unreadable",
+			exitCode: 1,
+			details: { code: "discovery_error", path: expect.stringContaining(path.join("sdk", "broker.json")) },
+		});
+		const typed = failure as SdkServeError;
+		expect(`${typed.message} ${JSON.stringify(typed.details)}`).not.toContain("super-secret-token");
+	});
+
+	test("still reports a missing broker discovery record as broker_unavailable", async () => {
+		// Pins the ENOENT case against the typed wrap around the same read.
+		const failure = await withServeAgentDir(undefined, async () => await serveRejection(["--stdio"]));
+		expect(failure).toBeInstanceOf(SdkServeError);
+		expect(failure).toMatchObject({
+			code: "broker_unavailable",
+			message: "SDK broker is not running",
+			exitCode: 1,
+		});
 	});
 });

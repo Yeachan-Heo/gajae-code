@@ -1,6 +1,7 @@
 import { getAgentDir } from "@gajae-code/utils";
 import { CliParseError } from "@gajae-code/utils/cli";
-import { readSdkBrokerDiscovery, SdkClient, SdkClientError } from "../client";
+import type { BrokerDiscovery } from "../broker/discovery";
+import { readSdkBrokerDiscovery, SdkClient, SdkClientError, SdkDiscoveryError } from "../client";
 import { SessionListTraversalError, sessionListPageFromResponse, traverseSessionList } from "../session-list";
 import { DEFAULT_PENDING_CEILING_BYTES, MIN_PENDING_CEILING_BYTES, startSocketServe, startStdioServe } from "./index";
 
@@ -45,6 +46,26 @@ function toServeError(error: unknown): Error {
 	if (error instanceof SdkServeError || error instanceof CliParseError) return error;
 	if (error instanceof SdkClientError) return new SdkServeError(error.code, error.message, 1, error.details);
 	return new SdkServeError("serve_failed", error instanceof Error ? error.message : "SDK serve failed.", 1);
+}
+
+/**
+ * Reads the broker discovery record so an unreadable one — a permission or file-kind
+ * failure, or a record from a newer state version — fails as a typed serve error
+ * instead of escaping the command boundary untyped. A missing record still reads as
+ * `null`, which the caller reports as `broker_unavailable`.
+ */
+async function readServeDiscovery(agentDir: string): Promise<BrokerDiscovery | null> {
+	try {
+		return await readSdkBrokerDiscovery(agentDir);
+	} catch (error) {
+		// The path is a local file inside the agent dir, already named by this
+		// command's other diagnostics; the broker token is never surfaced.
+		const details =
+			error instanceof SdkDiscoveryError
+				? { code: error.code, message: error.message, path: error.path }
+				: { code: "discovery_error", message: error instanceof Error ? error.message : String(error) };
+		throw new SdkServeError("broker_discovery_unreadable", "SDK broker discovery record is unreadable", 1, details);
+	}
 }
 
 /** Reduces a teardown failure to the code and message an embedder can branch on. */
@@ -201,7 +222,7 @@ export async function runSdkServe(argv: string[]): Promise<void> {
 		parsed.pendingCeiling,
 		process.env.GJC_SDK_SERVE_PENDING_CEILING_BYTES,
 	);
-	const discovery = await readSdkBrokerDiscovery(getAgentDir());
+	const discovery = await readServeDiscovery(getAgentDir());
 	if (!discovery) throw new SdkServeError("broker_unavailable", "SDK broker is not running", 1);
 	let broker: SdkClient;
 	try {
