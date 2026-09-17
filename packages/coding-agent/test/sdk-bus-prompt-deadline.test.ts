@@ -1206,6 +1206,58 @@ test("a tool_execution_end delivered before its own start never forces a spuriou
 	}
 }, 40_000);
 
+test("an empty ledger reading ends the wait even when a stale start event is still unmatched", async () => {
+	// #5637 review thread P2. The reverse direction of the ledger-authority case
+	// above, and the reason the pending set is a REPLACE rather than a union: the
+	// same asynchrony that delays a `tool_execution_start` also delays its END.
+	// The reachable ordering is start delivered -> real tool finishes and releases
+	// its lease -> end lost or stuck behind another extension. The ledger is then
+	// empty while `runningToolCallIds` still holds the id, and a union would burn
+	// the whole 5 s grace and record a forced mid-tool kill for a call that had
+	// already returned.
+	const maxRuntimeMs = 800;
+	const diagnostics: Array<Record<string, unknown>> = [];
+	const errorSpy = spyOn(logger, "error").mockImplementation(((event: unknown, fields?: unknown) => {
+		if (event === "sdk_prompt_terminal_failed") diagnostics.push((fields ?? {}) as Record<string, unknown>);
+	}) as never);
+	const ledgerTools: LedgerTools = new Set();
+	const forced = captureForcedWarnings();
+	const session = await acceptPrompt("ledger-released", 60_000, maxRuntimeMs, { ledgerTools });
+	try {
+		// AgentLoop takes the lease and publishes the start, which DOES reach the
+		// bus this time: the event-derived set now holds the id.
+		ledgerTools.add("released-tool");
+		session.handlers.get("tool_execution_start")?.(
+			{ type: "tool_execution_start", toolCallId: "released-tool", toolName: "apply_patch", args: {} },
+			session.sessionContext,
+		);
+
+		// The tool finishes for real and its lease is released. Its
+		// `tool_execution_end` never arrives — lost, or parked indefinitely behind
+		// another extension — so the id is stranded in `runningToolCallIds`.
+		ledgerTools.delete("released-tool");
+
+		await waitFor(() => session.deadlineTerminals().length > 0, "released-ledger deadline terminal", 25_000);
+		expect(session.deadlineTerminals()).toHaveLength(1);
+		// PRIMARY signal, and one that cannot flake: this is the ORDINARY deadline
+		// terminal, not the forced-mid-tool one. The forced path names the grace
+		// and the pending count in its diagnostic reason.
+		const reason = String(diagnostics.at(-1)?.reason ?? "");
+		expect(reason).toBe("Prompt deadline exceeded.");
+		expect(reason).not.toContain("Forced after");
+		expect(forced.records).toEqual([]);
+		expect((session.deadlineTerminals()[0]?.error as { code?: string }).code).toBe("prompt_deadline_exceeded");
+		// SECONDARY bound: the terminal lands at the cap, not at cap + grace. Split
+		// halfway so a loaded runner has ~2.5 s of slack on either side of the
+		// discriminator.
+		expect(Date.now() - session.acceptedAt).toBeLessThan(maxRuntimeMs + TOOL_CALL_BOUNDARY_GRACE_MS / 2);
+	} finally {
+		forced.restore();
+		errorSpy.mockRestore();
+		await shutdown(session);
+	}
+}, 40_000);
+
 test("repeated tool_execution_updates at an already-due hard cap open exactly one boundary wait", async () => {
 	// #5637 review thread P2. `tool_execution_update` is attributable progress by
 	// design (a multi-minute compile must not trip the inactivity lease), and at an
