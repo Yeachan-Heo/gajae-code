@@ -3775,6 +3775,8 @@ async function invocationHarness(
 		persistInterceptor?: (transition: { type: string }) => void;
 		/** Hold one matching durable transition until the test releases it. */
 		persistHold?: { type: string; onEntered: () => void; release: Promise<void> };
+		/** Hold successive matching durable transitions, consumed in arrival order. */
+		persistHolds?: Array<{ type: string; onEntered: () => void; release: Promise<void> }>;
 		onLifecycleDrainTimeout?: () => void;
 		onFailureDiagnosticKeyCount?: (count: number) => void;
 		agentFailedWriteFailures?: number;
@@ -3802,7 +3804,7 @@ async function invocationHarness(
 		? createInterceptorReconciliationStore(
 				hooks.persistInterceptor,
 				hooks.agentFailedWriteFailures,
-				hooks.persistHold,
+				hooks.persistHolds ?? (hooks.persistHold ? [hooks.persistHold] : undefined),
 			)
 		: undefined;
 	createSdkSessionRuntimeExtension(api, {
@@ -3932,10 +3934,10 @@ async function invocationHarness(
 function createInterceptorReconciliationStore(
 	interceptor: (transition: { type: string }) => void,
 	agentFailedWriteFailures = 1,
-	persistHold?: { type: string; onEntered: () => void; release: Promise<void> },
+	persistHolds?: Array<{ type: string; onEntered: () => void; release: Promise<void> }>,
 ): SdkOnlyReconciliationStore {
 	const failureCounts = new Map<string, number>();
-	let holdConsumed = false;
+	let nextHold = 0;
 	const backing = createInterceptorBackingStore();
 	return {
 		path: null,
@@ -3967,10 +3969,11 @@ function createInterceptorReconciliationStore(
 					interceptor({ type: "agent_end" });
 				}
 			}
-			if (persistHold && !holdConsumed && persistHold.type === transitionType) {
-				holdConsumed = true;
-				persistHold.onEntered();
-				await persistHold.release;
+			const hold = persistHolds?.[nextHold];
+			if (hold && hold.type === transitionType) {
+				nextHold += 1;
+				hold.onEntered();
+				await hold.release;
 			}
 			backing.records = records;
 		},
@@ -5907,6 +5910,138 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 			expect(correlatedFrames(harness, controlCorrelation).filter(frame => frame.kind === "agent_end")).toHaveLength(
 				1,
 			);
+			await harness.stop();
+		} finally {
+			await Bun.sleep(50);
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	test("boundary-claim eviction never lets a parked publisher republish a claimed boundary", async () => {
+		// Review P1: the claim registry is FIFO-bounded, while a lifecycle handler
+		// captures its transitions, awaits its durable writes, and only claims
+		// immediately before the emit. Parked on those awaits, its key can be evicted
+		// by later correlations, and its delayed agent_end then publishes a SECOND
+		// correlated boundary for a correlation the deadline already terminalized.
+		//
+		// The interleaving is CONSTRUCTED, not sampled. The deadline's finalize write
+		// is held so the real agent_end lands inside the finalization window and takes
+		// the upgrade path; releasing it lets the deadline publish and claim the pair
+		// while the handler parks on the NEXT invocation's write, before its claim
+		// loop. The pressure then runs in a second session because one session's
+		// durable writes are serialized -- a held write blocks that session entirely.
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-claim-eviction-"));
+		try {
+			const finalizeHold = { entered: Promise.withResolvers<void>(), release: Promise.withResolvers<void>() };
+			const parkHold = { entered: Promise.withResolvers<void>(), release: Promise.withResolvers<void>() };
+			// Read at each lease arming, so only the `expiring` prompt is short-leased.
+			let promptDeadlineMs = 600_000;
+			const settings = {
+				get: (key: string) =>
+					key === "sdk.promptDeadlineMs"
+						? promptDeadlineMs
+						: key === "sdk.promptMaxRuntimeMs"
+							? 600_000
+							: undefined,
+			} as unknown as Settings;
+			const promoted: Array<((promotion: { startsOwnRun: boolean }) => void) | undefined> = [];
+			const harness = await invocationHarness("claim-eviction", cwd, {
+				settings,
+				sendUserMessage: async (_content, options) => {
+					await options?.onPreflightAcceptCommit?.();
+					if ((options as { deliverAs?: string } | undefined)?.deliverAs === "followUp") {
+						promoted.push(
+							(options as { onQueuedPromoted?: (promotion: { startsOwnRun: boolean }) => void } | undefined)
+								?.onQueuedPromoted,
+						);
+						return;
+					}
+					await neverSettlingPromise();
+				},
+				persistInterceptor: () => {},
+				agentFailedWriteFailures: 0,
+				persistHolds: [
+					{
+						type: "agent_end",
+						onEntered: () => finalizeHold.entered.resolve(),
+						release: finalizeHold.release.promise,
+					},
+					{ type: "agent_end", onEntered: () => parkHold.entered.resolve(), release: parkHold.release.promise },
+				],
+				onLifecycleDrainTimeout: () => {},
+			});
+			// A never-settling head turn keeps the session streaming so the two
+			// follow-ups queue and promote into ONE run, giving the terminal handler a
+			// second invocation to park on after the deadline publishes the first.
+			expect((await harness.control("turn.prompt", { text: "head" })).ok).toBe(true);
+			await harness.emit("agent_start");
+			// `leading` is drained FIRST, so the terminal handler's first durable write
+			// is its own -- not the deadline's pending finalization -- and parking on it
+			// leaves `expiring` untouched for the deadline to publish.
+			const leading = await harness.control("turn.follow_up", { text: "leading" });
+			promoted[0]?.({ startsOwnRun: true });
+			promptDeadlineMs = 1_500;
+			const expiring = await harness.control("turn.follow_up", { text: "expiring" });
+			promoted[1]?.({ startsOwnRun: true });
+			promptDeadlineMs = 600_000;
+			const expiringIds = { commandId: expiring.result?.commandId, turnId: expiring.result?.turnId };
+			const leadingIds = { commandId: leading.result?.commandId, turnId: leading.result?.turnId };
+			await harness.emit("agent_start");
+			// Both must be in the drained batch: a lease that fired before the drain
+			// would leave the handler with nothing to park on and prove nothing.
+			expect({
+				expiring: correlatedFrames(harness, expiringIds).filter(frame => frame.kind === "agent_start").length,
+				leading: correlatedFrames(harness, leadingIds).filter(frame => frame.kind === "agent_start").length,
+			}).toEqual({ expiring: 1, leading: 1 });
+
+			await finalizeHold.entered.promise;
+			// The real boundary lands while the deadline's finalization is pending, so
+			// the handler captures BOTH transitions and waits on the finalize commit.
+			const parkedEnd = harness.emit("agent_end", {
+				sdkRunToken: `${leadingIds.commandId}:${leadingIds.turnId}`,
+				messages: [{ role: "assistant", content: "done" }],
+			});
+			finalizeHold.release.resolve();
+			// The deadline now publishes and claims the pair; the handler parks on the
+			// leading invocation's durable write, before its own claim loop.
+			await parkHold.entered.promise;
+			await awaitCorrelatedFrames(harness, expiringIds, frames => frames.some(frame => frame.kind === "agent_end"));
+			const deadlineBoundary = correlatedFrames(harness, expiringIds).find(frame => frame.kind === "agent_end");
+			expect(
+				(deadlineBoundary?.payload as { outcome?: { provenance?: string } } | undefined)?.outcome?.provenance,
+			).toBe("deadline");
+
+			// Eviction pressure: more than MAX_PUBLISHED_TERMINAL_BOUNDARIES (1024)
+			// other correlations claim their own boundary while the publisher is parked.
+			await harness.switchSession("claim-eviction-pressure");
+			const PRESSURE = 1_100;
+			for (let index = 0; index < PRESSURE; index += 1) {
+				const accepted = await harness.control("turn.prompt", { text: `pressure-${index}` });
+				expect(accepted.ok).toBe(true);
+				const token = `${accepted.result?.commandId}:${accepted.result?.turnId}`;
+				await harness.emit("agent_start", { sdkRunToken: token });
+				await harness.emit("agent_end", { sdkRunToken: token, messages: [{ role: "assistant", content: "ok" }] });
+			}
+			const claimedCorrelations = new Set(
+				harness.broadcasts
+					.filter(frame => frame.kind === "agent_end")
+					.map(frame => {
+						const payload = frame.payload as { commandId?: string; turnId?: string } | undefined;
+						return `${payload?.commandId}:${payload?.turnId}`;
+					}),
+			);
+			// A sweep that never passed the bound would evict nothing and prove nothing.
+			expect(claimedCorrelations.size).toBeGreaterThan(1_024);
+
+			parkHold.release.resolve();
+			await parkedEnd;
+			await Bun.sleep(25);
+			// The parked publisher lost its claim to the deadline before the pressure
+			// ran, and must still lose it after: exactly one boundary on the wire.
+			expect({
+				expiring: correlatedFrames(harness, expiringIds).filter(frame => frame.kind === "agent_end").length,
+				leading: correlatedFrames(harness, leadingIds).filter(frame => frame.kind === "agent_end").length,
+			}).toEqual({ expiring: 1, leading: 1 });
 			await harness.stop();
 		} finally {
 			await Bun.sleep(50);
