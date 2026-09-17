@@ -85,7 +85,12 @@ describe("post-start terminal preserves the worktree before reporting failure (i
 
 		expect(preservation).toBeDefined();
 		expect(preservation?.stashRef).toMatch(/^[0-9a-f]{7,64}$/);
-		expect(preservation?.snapshotComplete).toBe(true);
+		// NOT complete: `new-module.ts` is untracked, and `git stash create` snapshots tracked
+		// content only, so the stash object cannot restore it. Reporting `true` here was the false
+		// promise — it also suppressed the only warning that would have told the operator to keep
+		// the worktree.
+		expect(preservation?.snapshotComplete).toBe(false);
+		expect(preservation?.untrackedNotCaptured).toBe(1);
 		// Non-destructive: never resets, never cleans, never commits. The edits are still on disk
 		// exactly as the turn left them.
 		expect(await readFile(path.join(ws, "src.ts"), "utf8")).toBe("export const v = 2; // an hour of work\n");
@@ -100,6 +105,81 @@ describe("post-start terminal preserves the worktree before reporting failure (i
 	it("does not stash-spam a clean tree", () => {
 		expect(preservePostStartWork(ws)).toBeUndefined();
 		expect(git(ws, ["stash", "list"]).trim()).toBe("");
+	});
+
+	// This is the load-bearing test for the whole "fix the promise, not the capture" decision. If
+	// someone later switches the shared helper to `git stash push -u` semantics (which WOULD capture
+	// untracked files, at the cost of mutating the worktree), the ground-truth assertion below fails
+	// loudly instead of the report silently going back to over-claiming.
+	it("proves untracked files are absent from the stash object, and reports that instead of promising them", async () => {
+		await writeFile(path.join(ws, "src.ts"), "export const v = 2;\n");
+		await writeFile(path.join(ws, "new-module.ts"), "export const added = true;\n");
+
+		const preservation = preservePostStartWork(ws);
+		const stashRef = preservation?.stashRef ?? "<none>";
+
+		// GROUND TRUTH: the stash commit's tree holds the tracked edit and nothing else. `git stash
+		// create` takes a MESSAGE, not flags, so there is no non-destructive `-u` that would change
+		// this; real untracked capture needs `git stash push -u`, which mutates the worktree.
+		const stashedPaths = git(ws, ["ls-tree", "-r", "--name-only", stashRef])
+			.split("\n")
+			.map(s => s.trim())
+			.filter(Boolean);
+		expect(stashedPaths).toContain("src.ts");
+		expect(stashedPaths).not.toContain("new-module.ts");
+
+		// The report must match that reality rather than the hopeful version of it.
+		expect(preservation?.snapshotComplete).toBe(false);
+		expect(preservation?.untrackedNotCaptured).toBe(1);
+
+		const message = postStartOperatorMessage({
+			category: "provider_transport",
+			providerCode: "server_is_overloaded",
+			...(preservation === undefined ? {} : { preservation }),
+		});
+
+		// The tracked half of the promise is true, so the recovery hint stays.
+		expect(message).toContain(`git stash apply ${stashRef}`);
+		// The untracked half is named, counted, and actionable.
+		expect(message).toContain("1 new file(s) are NOT in that snapshot");
+		expect(message).toContain("do not discard this worktree");
+		// A count, never a path: this string crosses the wire and untracked paths are user-controlled.
+		expect(message).not.toContain("new-module.ts");
+	});
+
+	it("keeps the plain recovery promise for a tracked-only dirty tree, where it is true", async () => {
+		// The control case: no untracked files, so the stash really does hold everything. This proves
+		// the fix reports the actual gap rather than blanket-marking every snapshot incomplete.
+		await writeFile(path.join(ws, "src.ts"), "export const v = 2;\n");
+
+		const preservation = preservePostStartWork(ws);
+
+		expect(preservation?.snapshotComplete).toBe(true);
+		expect(preservation?.untrackedNotCaptured).toBeUndefined();
+		expect(git(ws, ["ls-tree", "-r", "--name-only", preservation?.stashRef ?? "<none>"])).toContain("src.ts");
+
+		const message = postStartOperatorMessage({
+			category: "provider_transport",
+			providerCode: "server_is_overloaded",
+			...(preservation === undefined ? {} : { preservation }),
+		});
+
+		expect(message).toContain(`git stash apply ${preservation?.stashRef}`);
+		expect(message).not.toContain("NOT in that snapshot");
+		expect(message).not.toContain("do not discard this worktree");
+		expect(message).not.toContain("snapshot is incomplete");
+	});
+
+	it("reads a malformed uncaptured count as zero rather than letting it reach the operator", () => {
+		// `PostStartPreservation` is reachable with any value, so the count is bounded the same way
+		// `safeStashRef` bounds the ref.
+		for (const bad of [-1, 1.5, Number.NaN, "3" as unknown as number, Number.MAX_SAFE_INTEGER + 2])
+			expect(
+				postStartOperatorMessage({
+					category: "provider_transport",
+					preservation: { stashRef: "c".repeat(40), snapshotComplete: true, untrackedNotCaptured: bad },
+				}),
+			).not.toContain("NOT in that snapshot");
 	});
 
 	it("is fail-safe: preservation throwing or the path being unusable never changes the outcome", () => {
