@@ -60,10 +60,14 @@ export function buildConversationTitleInput(messages: readonly AgentMessage[]): 
 		userMessages.length > MAX_TITLE_CONVERSATION_MESSAGES
 			? [userMessages[0]!, ...userMessages.slice(-(MAX_TITLE_CONVERSATION_MESSAGES - 1))]
 			: userMessages;
+	// Reserve separator and ellipsis room so the digest is already within the
+	// generator's MAX_INPUT_CHARS bound; its existing truncation is a no-op here.
+	const maxMessageChars = Math.min(
+		MAX_TITLE_MESSAGE_CHARS,
+		Math.floor((MAX_INPUT_CHARS - (keptMessages.length - 1) - keptMessages.length) / keptMessages.length),
+	);
 	return keptMessages
-		.map(message =>
-			message.length > MAX_TITLE_MESSAGE_CHARS ? `${message.slice(0, MAX_TITLE_MESSAGE_CHARS)}…` : message,
-		)
+		.map(message => (message.length > maxMessageChars ? `${message.slice(0, maxMessageChars)}…` : message))
 		.join("\n");
 }
 
