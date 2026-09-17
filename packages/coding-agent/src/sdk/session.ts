@@ -1516,6 +1516,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	let processCwdClaimed = false;
 	let hasRegistered = false;
 	let asyncJobManager: AsyncJobManager | undefined;
+	let asyncJobManagerOwned = false;
 	let asyncJobManagerAdmitted = false;
 	let priorAsyncJobManager: AsyncJobManager | undefined;
 	let cleanupOwnedMcpManager: (() => Promise<void>) | undefined;
@@ -2296,6 +2297,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						},
 					})
 				: options.inheritedAsyncJobManager;
+		asyncJobManagerOwned = backgroundJobsEnabled === true && !options.parentTaskPrefix;
 
 		let promptMetadataModel: Model | undefined;
 		const getActiveModelString = (): string | undefined => {
@@ -5201,10 +5203,12 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				// a retry under the same endpoint is falsely rejected and an orphan
 				// redirects global-manager consumers away from the live session
 				// (review thread P1).
-				if (asyncJobManagerAdmitted && asyncJobManager) {
-					AsyncJobManager.unregisterManager(asyncJobManager);
-					if (AsyncJobManager.instance() === asyncJobManager) {
-						AsyncJobManager.setInstance(priorAsyncJobManager);
+				if (asyncJobManagerOwned && asyncJobManager) {
+					if (asyncJobManagerAdmitted) {
+						AsyncJobManager.unregisterManager(asyncJobManager);
+						if (AsyncJobManager.instance() === asyncJobManager) {
+							AsyncJobManager.setInstance(priorAsyncJobManager);
+						}
 					}
 					await asyncJobManager.dispose({ timeoutMs: 100 });
 				}

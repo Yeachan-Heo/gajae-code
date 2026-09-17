@@ -576,7 +576,14 @@ export class AsyncJobManager {
 	 *  queried, registered, or cancelled across sessions (review thread P1). */
 	static registerForEndpoint(endpointId: string, manager: AsyncJobManager): boolean {
 		const holder = AsyncJobManager.#byEndpoint.get(endpointId);
-		if (holder !== undefined && holder !== manager) return false;
+		if (manager.#disposed || manager.#registrationClosed) return false;
+		if (holder !== undefined && holder !== manager) {
+			// A manager that has already completed disposal is no
+			// longer a live endpoint owner. Drop its stale admission before
+			// admitting the replacement; live owners still fail closed.
+			if (!holder.#disposed) return false;
+			AsyncJobManager.#byEndpoint.delete(endpointId);
+		}
 		AsyncJobManager.#byEndpoint.set(endpointId, manager);
 		return true;
 	}
@@ -586,7 +593,8 @@ export class AsyncJobManager {
 		return AsyncJobManager.#byEndpoint.get(endpointId);
 	}
 
-	static unregisterForEndpoint(endpointId: string): void {
+	static unregisterForEndpoint(endpointId: string, manager?: AsyncJobManager): void {
+		if (manager !== undefined && AsyncJobManager.#byEndpoint.get(endpointId) !== manager) return;
 		AsyncJobManager.#byEndpoint.delete(endpointId);
 	}
 
@@ -619,9 +627,13 @@ export class AsyncJobManager {
 		manager: AsyncJobManager | undefined,
 	): boolean {
 		if (!manager || predecessorEndpointId === successorEndpointId) return true;
+		if (manager.#disposed || manager.#registrationClosed) return false;
 		if (AsyncJobManager.#byEndpoint.get(predecessorEndpointId) !== manager) return true;
 		const successorOwner = AsyncJobManager.#byEndpoint.get(successorEndpointId);
-		if (successorOwner !== undefined && successorOwner !== manager) return false;
+		if (successorOwner !== undefined && successorOwner !== manager) {
+			if (!successorOwner.#disposed) return false;
+			AsyncJobManager.#byEndpoint.delete(successorEndpointId);
+		}
 		AsyncJobManager.#byEndpoint.delete(predecessorEndpointId);
 		AsyncJobManager.#byEndpoint.set(successorEndpointId, manager);
 		return true;
@@ -651,6 +663,7 @@ export class AsyncJobManager {
 
 	readonly #jobs = new Map<string, AsyncJob>();
 	#retainedDisposalCompletion: Promise<void> = Promise.resolve();
+	#disposePromise: Promise<boolean> | undefined;
 	readonly #deliveries: AsyncJobDelivery[] = [];
 	readonly #inFlightDeliveries: AsyncJobDelivery[] = [];
 	readonly #suppressedDeliveries = new Set<string>();
@@ -2773,6 +2786,13 @@ export class AsyncJobManager {
 	}
 
 	async dispose(options?: { timeoutMs?: number }): Promise<boolean> {
+		if (this.#disposePromise) return this.#disposePromise;
+		const disposal = this.#disposeInternal(options);
+		this.#disposePromise = disposal;
+		return disposal;
+	}
+
+	async #disposeInternal(options?: { timeoutMs?: number }): Promise<boolean> {
 		// Close registration FIRST, then run owner cleanups, and only then mark the
 		// manager disposed. Setting #disposed before the cleanups made
 		// #ensureDeliveryLoop a no-op, so a failure an owner cleanup settled through
@@ -2865,6 +2885,12 @@ export class AsyncJobManager {
 		this.#notifyChange();
 		this.#changeListeners.clear();
 		this.#foldListeners.clear();
+		const releaseEndpointOwnership = (): void => {
+			AsyncJobManager.unregisterManager(this);
+			if (AsyncJobManager.instance() === this) AsyncJobManager.setInstance(undefined);
+		};
+		if (disposalCompleted) releaseEndpointOwnership();
+		else void this.#retainedDisposalCompletion.then(releaseEndpointOwnership);
 		return disposalCompleted;
 	}
 
