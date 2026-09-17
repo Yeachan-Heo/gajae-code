@@ -198,6 +198,7 @@ gjc setup provider --preset glm
 gjc setup provider --preset alibaba-token-plan
 gjc setup provider --preset cline-pass
 gjc setup provider --preset commandcode-goat
+gjc setup provider --preset ionet
 ```
 
 The same presets are available inside the TUI:
@@ -209,9 +210,10 @@ The same presets are available inside the TUI:
 /provider add --preset alibaba-token-plan
 /provider add --preset cline-pass
 /provider add --preset commandcode-goat
+/provider add --preset ionet
 ```
 
-Presets only write `models.yml` entries that reference documented environment variable names (`MINIMAX_CODE_API_KEY`, `MINIMAX_CODE_CN_API_KEY`, `ZAI_API_KEY`, `ALIBABA_TOKEN_PLAN_API_KEY`, `CLINE_API_KEY`, or `CMD_API_KEY`); they do not store or validate real credentials. The GLM preset aliases (`glm`, `zai`, `z-ai`) write an OpenAI-compatible custom provider named `glm-proxy` and do not replace the first-class `zai` provider. The Alibaba Token Plan preset (aliases: `alibaba`, `token-plan`) writes an OpenAI-compatible custom provider named `alibaba-token-plan` with per-model API routing. The ClinePass preset (aliases: `clinepass`, `cline`) does not hardcode models: Cline's inference API has no working `/models` route, so GJC follows Cline's own catalog-generation source and fetches the live `cline-pass` provider catalog from `https://models.dev/api.json`. The Command Code GOAT preset (aliases: `commandcode`, `command-code`, `goat`) fetches its live `/provider/v1/models` catalog, keeps every current or future model—including Claude-named IDs—on the provider's documented OpenAI-compatible `/chat/completions` transport, and requires a fixed harmless inference entitlement probe before login persistence. Create the corresponding API key in the provider dashboard before inference; plan entitlement is enforced by the provider.
+Presets only write `models.yml` entries that reference documented environment variable names (`MINIMAX_CODE_API_KEY`, `MINIMAX_CODE_CN_API_KEY`, `ZAI_API_KEY`, `ALIBABA_TOKEN_PLAN_API_KEY`, `CLINE_API_KEY`, `CMD_API_KEY`, or `IONET_API_KEY`); they do not store or validate real credentials. The GLM preset aliases (`glm`, `zai`, `z-ai`) write an OpenAI-compatible custom provider named `glm-proxy` and do not replace the first-class `zai` provider. The Alibaba Token Plan preset (aliases: `alibaba`, `token-plan`) writes an OpenAI-compatible custom provider named `alibaba-token-plan` with per-model API routing. The ClinePass preset (aliases: `clinepass`, `cline`) does not hardcode models: Cline's inference API has no working `/models` route, so GJC follows Cline's own catalog-generation source and fetches the live `cline-pass` provider catalog from `https://models.dev/api.json`. The Command Code GOAT preset (aliases: `commandcode`, `command-code`, `goat`) fetches its live `/provider/v1/models` catalog, keeps every current or future model—including Claude-named IDs—on the provider's documented OpenAI-compatible `/chat/completions` transport, and requires a fixed harmless inference entitlement probe before login persistence. The IO Intelligence preset (aliases: `io-net`, `io-intelligence`) writes an OpenAI-compatible custom provider named `ionet` for [IO Intelligence](https://io.net) by io.net; model ids are `org/name` pairs discovered live from the endpoint's `/models` route, so no models are hardcoded. Create the corresponding API key in the provider dashboard before inference; plan entitlement is enforced by the provider.
 
 ## Signed remote preset registry
 
