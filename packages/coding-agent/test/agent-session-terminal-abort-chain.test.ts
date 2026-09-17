@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -29,8 +29,12 @@ import { MonitorTool } from "@gajae-code/coding-agent/tools/monitor";
 import { SubagentTool } from "@gajae-code/coding-agent/tools/subagent";
 import { Snowflake } from "@gajae-code/utils";
 import { AsyncJobManager } from "../src/async";
+import { createTempDirRegistry, reapStaleTempDirs, sweepAfterSettle } from "./helpers/temp-dir-registry";
 
 const TEST_ABORT_GRACE_MS = 50;
+/** Prefix this suite owns exclusively; the reaper must never widen past it. */
+const TEMP_DIR_PREFIX = "pi-terminal-abort-chain-";
+const tempDirRegistry = createTempDirRegistry();
 
 /** Scripted assistant turn that issues a single `bash` tool call. */
 function bashCall(command: string, callId: string, background = false): MockResponse {
@@ -106,11 +110,27 @@ describe("terminal abort registers a turn scope so left-running owned work class
 		}
 	};
 
+	// Reclaim roots abandoned by an earlier run whose teardown hook timed out
+	// before this suite grew its own sweep. Age-gated so a shard running
+	// concurrently on this host is never touched.
+	beforeAll(() => {
+		reapStaleTempDirs(TEMP_DIR_PREFIX);
+	});
+
+	// Backstop for the two paths the per-case `finally` cannot cover: an
+	// `afterEach` abandoned for exceeding its budget never reaches its
+	// `finally`, and a writer that outlives teardown can recreate a root the
+	// `finally` already removed. `afterAll` still runs in both cases.
+	afterAll(async () => {
+		await sweepAfterSettle(tempDirRegistry);
+	});
+
 	beforeEach(async () => {
 		manualTeardown = false;
 		extraManagers = new Set();
-		tempDir = path.join(os.tmpdir(), `pi-terminal-abort-chain-${Snowflake.next()}`);
+		tempDir = path.join(os.tmpdir(), `${TEMP_DIR_PREFIX}${Snowflake.next()}`);
 		fs.mkdirSync(tempDir, { recursive: true });
+		tempDirRegistry.register(tempDir);
 
 		resetSettingsForTest();
 		await Settings.init({ inMemory: true, cwd: tempDir });
@@ -220,9 +240,7 @@ describe("terminal abort registers a turn scope so left-running owned work class
 			AsyncJobManager.unregisterManager(manager);
 			authStorage?.close();
 			authStorage = undefined;
-			if (fs.existsSync(tempDir)) {
-				fs.rmSync(tempDir, { recursive: true, force: true });
-			}
+			tempDirRegistry.release(tempDir);
 		}
 	}, 30_000);
 
