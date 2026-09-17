@@ -4,11 +4,7 @@ import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { promisify } from "node:util";
-import {
-	isContinuingMidRunMaintenanceOutcome,
-	isNonDispatchedToolEvent,
-	ThinkingLevel,
-} from "@gajae-code/agent-core";
+import { isContinuingMidRunMaintenanceOutcome, isNonDispatchedToolEvent, ThinkingLevel } from "@gajae-code/agent-core";
 import type { Api, ImageContent, Model } from "@gajae-code/ai/core";
 import { logger } from "@gajae-code/utils";
 import { AsyncJobManager } from "../../async";
@@ -5060,7 +5056,11 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 	// the active run — the root invocation plus any in-run consumed follow-ups
 	// sharing it — not only the head, or an attached correlation would
 	// false-fire prompt_deadline_exceeded during a long shared run.
-	const renewAttributableProgress = (event: AgentSessionEvent, ctx: ExtensionContext): void => {
+	const renewAttributableProgress = (
+		eventType: "tool_execution_start" | "tool_execution_update" | "tool_execution_end",
+		event: AgentSessionEvent,
+		ctx: ExtensionContext,
+	): void => {
 		// Pairing-only tool boundaries synthesized while an abort unwinds never
 		// entered a tool. Treating them as progress lets a deadline renew its own
 		// lease after claiming the terminal outcome, leaving that claim pending
@@ -5105,7 +5105,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			if (seen.has(correlationKey)) continue;
 			seen.add(correlationKey);
 			if (invocation.kind === "prompt")
-				current.deadlineManager.onAttributableEvent(invocation.correlation, event.type);
+				current.deadlineManager.onAttributableEvent(invocation.correlation, eventType);
 		}
 	};
 	/**
@@ -5177,13 +5177,13 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		publishContentFrames(current, event as AgentSessionEvent, invocations);
 	};
 	api.on("tool_execution_start", async (event, ctx) => {
-		renewAttributableProgress(event as AgentSessionEvent, ctx);
+		renewAttributableProgress("tool_execution_start", event as AgentSessionEvent, ctx);
 	});
 	api.on("tool_execution_update", async (event, ctx) => {
-		renewAttributableProgress(event as AgentSessionEvent, ctx);
+		renewAttributableProgress("tool_execution_update", event as AgentSessionEvent, ctx);
 	});
 	api.on("tool_execution_end", async (event, ctx) => {
-		renewAttributableProgress(event as AgentSessionEvent, ctx);
+		renewAttributableProgress("tool_execution_end", event as AgentSessionEvent, ctx);
 	});
 	const errorCode = (error: unknown): string | undefined =>
 		typeof error === "object" &&

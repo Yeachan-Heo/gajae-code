@@ -5705,7 +5705,7 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 			const correlated = () =>
 				harness.broadcasts.filter(frame => {
 					const payload = frame.payload as { commandId?: string; turnId?: string } | undefined;
-					return payload?.commandId === correlation.commandId && payload.turnId === correlation.turnId;
+					return payload?.commandId === correlation.commandId && payload?.turnId === correlation.turnId;
 				});
 			expect(correlated().filter(frame => frame.kind === "agent_failed")).toEqual([
 				expect.objectContaining({
@@ -5748,7 +5748,7 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 				return (
 					frame.kind === "agent_end" &&
 					payload?.commandId === controlCorrelation.commandId &&
-					payload.turnId === controlCorrelation.turnId
+					payload?.turnId === controlCorrelation.turnId
 				);
 			});
 			expect(controlTerminals).toHaveLength(1);
