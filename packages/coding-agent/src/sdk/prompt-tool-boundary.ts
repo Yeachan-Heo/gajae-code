@@ -25,6 +25,18 @@
  */
 export const TOOL_CALL_BOUNDARY_GRACE_MS = 5_000;
 
+/**
+ * Re-check interval for the pending set while the grace runs.
+ *
+ * The authoritative source of "is a tool running?" is the run resource ledger,
+ * a SYNCHRONOUS snapshot with no completion signal of its own, so the wait has
+ * to look again rather than being told. `whenIdle` only wakes the check early
+ * when the event-derived view happens to drain first. Bounded by the grace, so
+ * this costs at most `graceMs / pollMs` array reads on the rare expiry-with-a-
+ * tool-running path and nothing at all on the idle path.
+ */
+export const TOOL_CALL_BOUNDARY_POLL_MS = 25;
+
 export type ToolBoundaryOutcome = "idle" | "settled" | "forced";
 
 export interface ToolBoundaryWaitResult {
@@ -58,9 +70,15 @@ export const IDLE_TOOL_BOUNDARY_RESULT: ToolBoundaryWaitResult = Object.freeze({
  */
 export async function waitForToolCallBoundary(input: {
 	pending: () => readonly string[];
-	/** Resolves when the pending set becomes empty. Expected never to reject. */
+	/**
+	 * Resolves when the event-derived view of the pending set drains. A wake-up
+	 * HINT only: `pending()` is re-read before the wait is allowed to settle,
+	 * because the authoritative source may still hold a call this signal knows
+	 * nothing about. Expected never to reject.
+	 */
 	whenIdle: () => Promise<void>;
 	graceMs?: number;
+	pollMs?: number;
 	now?: () => number;
 }): Promise<ToolBoundaryWaitResult> {
 	const now = input.now ?? Date.now;
@@ -68,30 +86,36 @@ export async function waitForToolCallBoundary(input: {
 	// beyond the caller's own await.
 	if (input.pending().length === 0) return IDLE_TOOL_BOUNDARY_RESULT;
 	const graceMs = Math.max(0, input.graceMs ?? TOOL_CALL_BOUNDARY_GRACE_MS);
+	const pollMs = Math.max(1, input.pollMs ?? TOOL_CALL_BOUNDARY_POLL_MS);
 	const startedAt = now();
-	let timer: ReturnType<typeof setTimeout> | undefined;
+	let graceTimer: ReturnType<typeof setTimeout> | undefined;
+	let pollTimer: ReturnType<typeof setInterval> | undefined;
 	try {
-		const idle = input.whenIdle();
-		// The loser of the race is abandoned rather than cancelled, so a rejection
-		// from it must be swallowed here or it surfaces as an unhandled rejection
-		// and takes the host down. A rejected idle simply leaves the grace timer
-		// as the sole arbiter.
 		const settled = new Promise<"settled">(resolve => {
-			void idle.then(
-				() => resolve("settled"),
-				() => {},
-			);
+			// `pending()` is the single arbiter of settlement; the idle signal and
+			// the poll only decide WHEN it is consulted.
+			const check = () => {
+				if (input.pending().length === 0) resolve("settled");
+			};
+			// The loser of the race is abandoned rather than cancelled, so a rejection
+			// from it must be swallowed here or it surfaces as an unhandled rejection
+			// and takes the host down. A rejected idle simply leaves the poll and the
+			// grace timer as the arbiters.
+			void input.whenIdle().then(check, () => {});
+			pollTimer = setInterval(check, pollMs);
+			pollTimer?.unref?.();
 		});
 		const forced = new Promise<"forced">(resolve => {
-			timer = setTimeout(() => resolve("forced"), graceMs);
+			graceTimer = setTimeout(() => resolve("forced"), graceMs);
 			// Never hold the process open for a tool that will not come back.
-			timer?.unref?.();
+			graceTimer?.unref?.();
 		});
 		const outcome = await Promise.race([settled, forced]);
 		return outcome === "settled"
 			? { outcome: "settled", waitedMs: now() - startedAt, pendingToolCallIds: [] }
 			: { outcome: "forced", waitedMs: now() - startedAt, pendingToolCallIds: [...input.pending()] };
 	} finally {
-		clearTimeout(timer);
+		clearTimeout(graceTimer);
+		clearInterval(pollTimer);
 	}
 }

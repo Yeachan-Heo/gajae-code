@@ -4117,6 +4117,13 @@ export function createNotificationsExtension(
 				handle: string,
 				options: { graceMs: number; terminal?: { scope: "turn" | "owned"; expectedEpoch?: number } },
 			) => Promise<RunSettlementProof>;
+			/**
+			 * Live, SYNCHRONOUS view of the dispatched tool calls the run resource
+			 * ledger holds for an execution handle (#5637). Strictly read-only: it
+			 * never claims, seals or otherwise mutates ledger state. Optional so an
+			 * older host that does not thread it degrades to the event-derived set.
+			 */
+			pendingToolExecutions?: (handle: string) => readonly string[];
 		};
 	} = {},
 ): void {
@@ -4777,6 +4784,8 @@ export function createNotificationsExtension(
 		const configRevision = { current: 0 };
 		const PROMPT_SUBMISSION_CAPACITY = 128;
 		const PROMPT_SUBMISSION_TTL_MS = 5 * 60_000;
+		/** Bound on remembered `tool_execution_end`s that outran their own start. */
+		const UNMATCHED_TOOL_END_CAPACITY = 64;
 		const PROMPT_TERMINAL_TOMBSTONE_CAPACITY = 256;
 		const PROMPT_TERMINAL_TOMBSTONE_TTL_MS = 15 * 60_000;
 		// SDK-owned terminalization grace; injectable in tests, never a user setting.
@@ -4851,6 +4860,14 @@ export function createNotificationsExtension(
 			 * not drive it negative and falsely report the prompt idle (#5637).
 			 */
 			runningToolCallIds: Set<string>;
+			/**
+			 * Ids whose `tool_execution_end` was delivered with no matching start yet.
+			 * The fanout is asynchronous and unordered across listeners, so the end of
+			 * a finished call can land first; without this the late start would add a
+			 * call that is already over and leave it running forever. Bounded, and
+			 * only ever written on that out-of-order path.
+			 */
+			endedToolCallIds: Set<string>;
 			/** Drained when `runningToolCallIds` becomes empty; one entry per waiting expiry attempt. */
 			toolIdleWaiters: Array<() => void>;
 		};
@@ -5098,10 +5115,10 @@ export function createNotificationsExtension(
 						// aborted yet, so this wait is composed with NO abort signal: an
 						// already-aborted one would make the path unreachable.
 						const boundary: ToolBoundaryWaitResult =
-							current.runningToolCallIds.size === 0
+							pendingToolCallIdsFor(current).length === 0
 								? IDLE_TOOL_BOUNDARY_RESULT
 								: await waitForToolCallBoundary({
-										pending: () => [...current.runningToolCallIds],
+										pending: () => pendingToolCallIdsFor(current),
 										whenIdle: () => whenPromptToolsIdle(current),
 										graceMs: TOOL_CALL_BOUNDARY_GRACE_MS,
 									});
@@ -5261,12 +5278,64 @@ export function createNotificationsExtension(
 			const submission = promptSubmissions.get(promptSubmissionKey(correlation));
 			if (!submission) return;
 			if (event.type === "tool_execution_start") {
+				// A start whose own end already arrived describes a call that is over:
+				// re-adding it would strand an id that can never be removed again, and
+				// the deadline would then burn the whole grace and report a forced
+				// mid-tool kill for a tool that is not running (review thread P1,
+				// mirror case). The id is consumed, so the pair closes exactly once.
+				if (submission.endedToolCallIds.delete(event.toolCallId)) return;
 				submission.runningToolCallIds.add(event.toolCallId);
 				return;
 			}
-			if (!submission.runningToolCallIds.delete(event.toolCallId)) return;
+			if (!submission.runningToolCallIds.delete(event.toolCallId)) {
+				// End with no known start: remember it only for this out-of-order case.
+				submission.endedToolCallIds.add(event.toolCallId);
+				// Oldest-first eviction; a Set iterates in insertion order.
+				while (submission.endedToolCallIds.size > UNMATCHED_TOOL_END_CAPACITY) {
+					const oldest = submission.endedToolCallIds.values().next().value;
+					if (oldest === undefined) break;
+					submission.endedToolCallIds.delete(oldest);
+				}
+				return;
+			}
 			if (submission.runningToolCallIds.size > 0) return;
 			for (const resolve of submission.toolIdleWaiters.splice(0)) resolve();
+		};
+		/**
+		 * Authoritative set of tool calls executing for this submission (#5637).
+		 *
+		 * The run resource ledger is the source of truth, not the extension fanout.
+		 * AgentLoop reserves a `kind: "tool"` lease SYNCHRONOUSLY inside its
+		 * dispatch loop, before the tool's `execute` is invoked, and the lease
+		 * settles at the call's real end. `tool_execution_start` instead travels an
+		 * ASYNCHRONOUS path — enqueued on the agent event stream, drained a turn
+		 * later, then handed to listeners whose returned promises are deliberately
+		 * not awaited, behind any user extension registered ahead of this one. So
+		 * `runningToolCallIds` can still be EMPTY while a file-mutating tool is
+		 * already writing, which is exactly the mid-`apply_patch` kill this fix
+		 * exists to prevent.
+		 *
+		 * The late fanout stays for observability and still drives
+		 * `toolIdleWaiters`, but it is no longer the authority: it may only ADD to
+		 * the ledger's answer. Waiting a bounded grace on a call the ledger already
+		 * released is harmless; reporting idle while the ledger says a tool is
+		 * running is the bug. When the seam is unavailable — an older host, no
+		 * execution handle bound yet, or an unknown run — this degrades to the
+		 * event-derived set alone, i.e. exactly today's behaviour and never worse.
+		 */
+		const pendingToolCallIdsFor = (submission: PromptSubmission): string[] => {
+			const ids = new Set(submission.runningToolCallIds);
+			const handle = submission.executionHandle;
+			const readLedger = terminalAbortSeams?.pendingToolExecutions;
+			if (handle && readLedger)
+				try {
+					for (const id of readLedger(handle)) ids.add(id);
+				} catch (error) {
+					// A seam failure must never disable the deadline or extend it
+					// unboundedly; fall back to the event-derived set for this attempt.
+					logger.warn(`sdk: pending tool execution seam failed: ${String(error)}`);
+				}
+			return [...ids];
 		};
 		/** Resolves once no dispatched tool call is executing for this submission. */
 		const whenPromptToolsIdle = (submission: PromptSubmission): Promise<void> => {
@@ -5346,6 +5415,7 @@ export function createNotificationsExtension(
 				reconciliationKind,
 				bufferedFrames: [],
 				runningToolCallIds: new Set<string>(),
+				endedToolCallIds: new Set<string>(),
 				toolIdleWaiters: [],
 			};
 			const key = promptSubmissionKey(correlation);
