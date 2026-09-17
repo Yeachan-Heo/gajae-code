@@ -9,7 +9,7 @@ import { CliParseError, renderCommandHelp } from "@gajae-code/utils/cli";
 import type { ServerWebSocket } from "bun";
 import Sdk, { parseSdkInternalArgv } from "../src/commands/sdk.js";
 import { brokerProcessIncarnation, writeBrokerDiscovery } from "../src/sdk/broker/discovery.js";
-import { SdkClientError } from "../src/sdk/client/client.js";
+import { SdkClient, SdkClientError } from "../src/sdk/client/client.js";
 import { listSdkSessionEndpoints } from "../src/sdk/client/discovery.js";
 import { classifyEndpoint, selectLiveEndpoint } from "../src/sdk/client/liveness.js";
 import { type RelayWebSocket, startRelayPair, type TransportError } from "../src/sdk/transport/relay.js";
@@ -162,6 +162,53 @@ async function withServeAgentDir<T>(url: string | undefined, run: () => Promise<
 	} finally {
 		setAgentDir(previous);
 	}
+}
+
+/** Captures the failure `runSdkServe` rejects with, so assertions read its typed fields. */
+async function serveRejection(argv: string[]): Promise<unknown> {
+	try {
+		await runSdkServe(argv);
+	} catch (error) {
+		return error;
+	}
+	throw new Error("Expected serve to fail.");
+}
+
+const closeFailureMessage = "SDK WebSocket close timed out after 250ms";
+
+/**
+ * Runs `run()` with `SdkClient.connect` handing back a client whose `close()` rejects
+ * once the real teardown finishes — the broker-cleanup failure a `finally` would let
+ * replace whatever the serve path already decided.
+ */
+async function withRejectingBrokerClose<T>(run: () => Promise<T>): Promise<T> {
+	const realConnect = SdkClient.connect;
+	SdkClient.connect = async (url: string, token: string) => {
+		const client = await realConnect.call(SdkClient, url, token);
+		const realClose = client.close.bind(client);
+		client.close = async () => {
+			await realClose();
+			throw new SdkClientError("timeout", closeFailureMessage);
+		};
+		return client;
+	};
+	try {
+		return await run();
+	} finally {
+		SdkClient.connect = realConnect;
+	}
+}
+
+/**
+ * Ends a running serve the way Ctrl-C does — through the SIGINT handler it registers —
+ * without raising a real signal the test runner also listens for.
+ */
+async function stopServeViaSignalHandler(before: readonly unknown[]): Promise<void> {
+	const stop = await waitFor(
+		() => process.listeners("SIGINT").find(listener => !before.includes(listener)),
+		"the serve SIGINT handler",
+	);
+	stop("SIGINT");
 }
 
 class StalledWebSocket implements RelayWebSocket {
@@ -844,5 +891,70 @@ describe("SDK serve CLI and discovery", () => {
 			ok: false,
 			error: { code: "broker_unavailable", message: "SDK broker is not running" },
 		});
+	});
+
+	test("keeps the primary serve failure when broker cleanup also fails", async () => {
+		const broker = fakeBroker(() => ({
+			ok: false,
+			error: { code: "endpoint_credential_forbidden", message: "credential refused", details: { reason: "lease" } },
+		}));
+		try {
+			const failure = await withServeAgentDir(broker.url, async () =>
+				withRejectingBrokerClose(async () => await serveRejection(["--stdio"])),
+			);
+			expect(failure).toBeInstanceOf(SdkServeError);
+			// The code an embedder branches on is the broker's, never the teardown's,
+			// and the broker payload survives the cleanup failure untouched.
+			expect(failure).toMatchObject({
+				code: "endpoint_credential_forbidden",
+				message: "credential refused",
+				exitCode: 1,
+				details: {
+					code: "endpoint_credential_forbidden",
+					message: "credential refused",
+					details: { reason: "lease" },
+				},
+				cleanupError: { code: "timeout", message: closeFailureMessage },
+			});
+		} finally {
+			broker.stop();
+		}
+	});
+
+	test("surfaces a cleanup-only broker failure as a typed serve_cleanup_failed", async () => {
+		const fake = upstream();
+		const broker = fakeBroker(operation =>
+			operation === "session.list"
+				? {
+						ok: true,
+						result: { sessions: [{ sessionId: "sess-live", live: true, ambiguous: false }], warnings: [] },
+					}
+				: { ok: true, result: { url: fake.url, token } },
+		);
+		const socketPath = path.join(await tempDir(), "serve.sock");
+		try {
+			const failure = await withServeAgentDir(broker.url, async () =>
+				withRejectingBrokerClose(async () => {
+					const before = process.listeners("SIGINT");
+					// Resolve rather than reject, so a serve that fails early cannot
+					// surface as an unhandled rejection while we wait for its handler.
+					const served = runSdkServe(["--socket", socketPath]).then(
+						() => undefined,
+						(error: unknown) => error,
+					);
+					await stopServeViaSignalHandler(before);
+					return await served;
+				}),
+			);
+			expect(failure).toBeInstanceOf(SdkServeError);
+			expect(failure).toMatchObject({
+				code: "serve_cleanup_failed",
+				exitCode: 1,
+				details: { code: "timeout", message: closeFailureMessage },
+			});
+		} finally {
+			broker.stop();
+			fake.stop();
+		}
 	});
 });

@@ -22,6 +22,13 @@ function usageError(message: string): never {
  * `CliParseError` path; this type covers only failures an embedder must branch on.
  */
 export class SdkServeError extends Error {
+	/**
+	 * Diagnostics for a broker-teardown failure that happened alongside this primary
+	 * failure. It rides beside `details` rather than inside it because `details`
+	 * carries the broker's own error payload verbatim and embedders already read it.
+	 */
+	cleanupError?: { code: string; message: string };
+
 	constructor(
 		readonly code: string,
 		message: string,
@@ -38,6 +45,37 @@ function toServeError(error: unknown): Error {
 	if (error instanceof SdkServeError || error instanceof CliParseError) return error;
 	if (error instanceof SdkClientError) return new SdkServeError(error.code, error.message, 1, error.details);
 	return new SdkServeError("serve_failed", error instanceof Error ? error.message : "SDK serve failed.", 1);
+}
+
+/** Reduces a teardown failure to the code and message an embedder can branch on. */
+function cleanupDiagnostics(error: Error): { code: string; message: string } {
+	return { code: error instanceof SdkClientError ? error.code : "serve_cleanup_failed", message: error.message };
+}
+
+/** Runs broker teardown to completion, handing back its failure instead of throwing it. */
+async function brokerCloseFailure(broker: SdkClient): Promise<Error | undefined> {
+	try {
+		await broker.close();
+		return undefined;
+	} catch (error) {
+		return error instanceof Error ? error : new Error(String(error));
+	}
+}
+
+/**
+ * Combines the serve body's failure with the broker-teardown failure. The primary
+ * failure always wins — a rejected teardown only ever rides along as diagnostics, it
+ * never replaces the error an embedder branches on — and a teardown that fails on its
+ * own still leaves typed. Exported for tests.
+ */
+export function resolveServeOutcome(primary: Error | undefined, cleanup: Error | undefined): Error | undefined {
+	if (primary) {
+		if (cleanup && primary instanceof SdkServeError) primary.cleanupError = cleanupDiagnostics(cleanup);
+		return primary;
+	}
+	if (!cleanup) return undefined;
+	const diagnostics = cleanupDiagnostics(cleanup);
+	return new SdkServeError("serve_cleanup_failed", `SDK broker cleanup failed: ${cleanup.message}`, 1, diagnostics);
 }
 
 function readFlagValue(argv: string[], index: number, flag: string): string {
@@ -171,6 +209,7 @@ export async function runSdkServe(argv: string[]): Promise<void> {
 	} catch {
 		throw new SdkServeError("broker_unavailable", "SDK broker is not reachable", 1);
 	}
+	let primary: Error | undefined;
 	try {
 		const sessionId = selectBrokerSession(await listBrokerSessions(broker, parsed.sessionId), parsed.sessionId);
 		const endpoint = brokerResult(await broker.global("session.get_endpoint", { sessionId }));
@@ -194,8 +233,10 @@ export async function runSdkServe(argv: string[]): Promise<void> {
 			process.removeListener("SIGTERM", stop);
 		}
 	} catch (error) {
-		throw toServeError(error);
-	} finally {
-		await broker.close();
+		primary = toServeError(error);
 	}
+	// Teardown always runs, but never through a `finally` throw: a rejected
+	// `broker.close()` there would replace the typed failure with its own.
+	const failure = resolveServeOutcome(primary, await brokerCloseFailure(broker));
+	if (failure) throw failure;
 }
