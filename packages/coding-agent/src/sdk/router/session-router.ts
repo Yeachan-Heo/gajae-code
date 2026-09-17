@@ -33,6 +33,7 @@ import {
 } from "../session-activation";
 import type { SessionBindingAuthority } from "../session-authority";
 import { ACP_SESSION_RECONNECT, SESSION_REQUEST_TIMEOUT_MS } from "../session-reconnect";
+import { SESSION_HOST_OBSERVER_CAPABILITY } from "../host/host";
 import { rememberReplayRetentionGap } from "./replay-retention-gap-cache";
 
 export type { SessionBindingAuthority, SessionEndpointAuthority } from "../session-authority";
@@ -1519,7 +1520,10 @@ export class SessionRouter {
 				endpointMtimeMs,
 			});
 		} else {
-			const defaultClient = new SdkClient(endpoint.url, endpoint.token, { ...ACP_SESSION_RECONNECT });
+			const defaultClient = new SdkClient(endpoint.url, endpoint.token, {
+				...ACP_SESSION_RECONNECT,
+				capabilities: [SESSION_HOST_OBSERVER_CAPABILITY],
+			});
 			transport = defaultClient;
 			connection = defaultClient.connect().then(() => defaultClient);
 		}

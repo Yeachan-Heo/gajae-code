@@ -112,6 +112,33 @@ describe("SessionSdkHost", () => {
 		expect(registered).toEqual([1, 2]);
 	});
 
+	test("reports the idle host state and only records activity transitions", async () => {
+		const activity: Array<{ state: "active" | "idle"; at: number }> = [];
+		const host = new SessionSdkHost({
+			sessionId: "activity",
+			stateRoot: "/tmp/activity",
+			token: "t",
+			sendFrame: () => "written",
+			onFrame: () => () => {},
+		});
+		await host.start();
+		await host.registerWithBroker({
+			register: () => {},
+			heartbeat: input => activity.push(input.activity),
+		});
+		await Bun.sleep(0);
+		await host.reportActivity("active", 100);
+		await host.reportActivity("active", 200);
+		await host.reportActivity("idle", 300);
+		await host.stop();
+
+		expect(activity).toEqual([
+			{ state: "idle", at: expect.any(Number) },
+			{ state: "active", at: 100 },
+			{ state: "idle", at: 300 },
+		]);
+	});
+
 	test("retries broker unregister after a fail-once owner release", async () => {
 		let unsubscribeAttempts = 0;
 		let unregisterAttempts = 0;

@@ -98,6 +98,7 @@ import {
 	reattestMasterSessionIdentity,
 	type SessionSdkHost,
 	SessionSdkSessionRuntime,
+	SESSION_HOST_OBSERVER_CAPABILITY,
 	shouldHostSdk,
 	TOOL_ACTIVITY_CAPABILITY,
 	verifyMasterCapabilityFrame,
@@ -7950,15 +7951,23 @@ export function createNotificationsExtension(
 			}
 
 			// The native server owns the only authoritative view of this host's live
-			// SDK client sockets; publish it so a detached session host can bound its
-			// own lifetime without probing the OS (#4010). The handle is this
-			// runtime's alone, so only this runtime's teardown can retract it.
+			// SDK client sockets; publish it with observer-only sockets separated so a
+			// detached session host can bound its own lifetime without probing the OS
+			// (#4010). The handle is this runtime's alone, so only this runtime's teardown
+			// can retract it.
+			const readWorkInFlight = (): boolean =>
+				initializedRuntime.busy ||
+				initializedRuntime.pendingPromptCorrelations.length > 0 ||
+				initializedRuntime.pendingPromptCorrelationsBySdkRunToken.size > 0;
 			initializedRuntime.evidencePublication = publishSessionHostRuntimeEvidence({
 				attachedClients: () => server.clientCount(),
-				workInFlight: () =>
-					initializedRuntime.busy ||
-					initializedRuntime.pendingPromptCorrelations.length > 0 ||
-					initializedRuntime.pendingPromptCorrelationsBySdkRunToken.size > 0,
+				observerClients: () => {
+					if (readWorkInFlight()) return 0;
+					return [...hostCapCache.values()].filter(capabilities =>
+						capabilities.has(SESSION_HOST_OBSERVER_CAPABILITY),
+					).length;
+				},
+				workInFlight: readWorkInFlight,
 			});
 			ephemeralTurns.configureAuthority({
 				sessionId: id,
@@ -8060,6 +8069,32 @@ export function createNotificationsExtension(
 								...(lifecycleRequestId ? { lifecycleRequestId } : {}),
 							});
 						},
+						heartbeat: async input => {
+							const expected = registration;
+							if (
+								!expected ||
+								expected.sessionId !== input.sessionId ||
+								expected.endpointGeneration !== input.endpointGeneration ||
+								path.resolve(expected.locator.stateRoot) !== path.resolve(input.stateRoot)
+							)
+								return;
+							await index.append({
+								type: "host_heartbeat",
+								sessionId: expected.sessionId,
+								locator: expected.locator,
+								endpointGeneration: expected.endpointGeneration,
+								pid: expected.pid,
+								...(expected.processIncarnation === undefined
+									? {}
+									: { processIncarnation: expected.processIncarnation }),
+								...(expected.hostIncarnation === undefined
+									? {}
+									: { hostIncarnation: expected.hostIncarnation }),
+								...(expected.masterRole === undefined ? {} : { masterRole: expected.masterRole }),
+								activity: input.activity,
+								ts: input.activity.at,
+							});
+						},
 						unregister: async input => {
 							const expected = registration;
 							if (
@@ -8075,8 +8110,8 @@ export function createNotificationsExtension(
 					});
 					throwIfLifecycleStopped();
 					initializedRuntime.brokerRegistrationActive = true;
-					// Host liveness is derived from alive(pid) when the index is read; heartbeats
-					// are deliberately not appended to the durable session index.
+					// Host liveness is derived from alive(pid) and the coalesced heartbeats;
+					// activity transitions are appended by the host through this registration.
 				} catch (brokerError) {
 					if (lifecycleRequired) throw brokerError;
 					logger.warn(`sdk broker registration skipped: ${String(brokerError)}`);
@@ -8896,6 +8931,9 @@ export function createNotificationsExtension(
 		const id = sessionId(ctx);
 		const rt = runtimes.get(id);
 		if (!rt) return;
+		void rt.host
+			.reportActivity("active")
+			.catch(error => logger.warn(`notifications: active activity checkpoint failed: ${String(error)}`));
 		// Streaming state is SDK-visible session truth (context.get isStreaming);
 		// it is tracked regardless of whether notifications are active.
 		rt.busy = true;
@@ -8983,6 +9021,9 @@ export function createNotificationsExtension(
 		const id = sessionId(ctx);
 		const rt = runtimes.get(id);
 		if (!rt) return;
+		void rt.host
+			.reportActivity("idle")
+			.catch(error => logger.warn(`notifications: idle activity checkpoint failed: ${String(error)}`));
 		// Clear the streaming flag for SDK consumers even when notifications are off.
 		rt.busy = false;
 		const correlation = rt.activePromptCorrelation;

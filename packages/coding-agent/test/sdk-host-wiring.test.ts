@@ -66,13 +66,14 @@ import {
 import type { InteractiveModeContext } from "../src/modes/types";
 import { AcpSdkAdapter } from "../src/sdk/acp/adapter";
 import { brokerOwnerForTest } from "../src/sdk/broker/ensure";
+import { sessionHostAttachedClients, sessionHostWorkInFlight } from "../src/sdk/broker/lifecycle";
 import { SessionIndex } from "../src/sdk/broker/session-index";
 import { formatPromptSettlementDiagnostic, PresentationArbiter } from "../src/sdk/bus";
 import { getTelegramFileSink } from "../src/sdk/bus/attachment-registry";
 import { reconciliationStorePath } from "../src/sdk/bus/reconciliation-store";
 import type { NotificationSessionController } from "../src/sdk/bus/session-control";
 import { SdkClient } from "../src/sdk/client";
-import { SessionSdkHost } from "../src/sdk/host";
+import { SESSION_HOST_OBSERVER_CAPABILITY, SessionSdkHost } from "../src/sdk/host";
 import { createSdkRunCapability } from "../src/sdk/host/sdk-run-capability";
 import type { SessionAttachment } from "../src/sdk/router/session-router";
 import { createAgentSession } from "../src/sdk/session";
@@ -765,6 +766,46 @@ test("production SDK host starts exactly one instrumented server (no duplicate a
 	} finally {
 		serverStart.mockRestore();
 		await host?.stop();
+	}
+}, 60_000);
+
+test("observer daemon demand covers hello-before-replay, replay-after, and disconnect-before-replay while live work promotes demand", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-observer-demand-"));
+	dirs.push(cwd);
+	const host = await startProductionSdkHost(cwd, { acceptPromptPreflightWithoutExecution: true });
+	const baseDemand = sessionHostAttachedClients() ?? 0;
+	const observer = new SdkClient(host.endpoint.url, host.endpoint.token, {
+		capabilities: [SESSION_HOST_OBSERVER_CAPABILITY],
+		reconnectAttempts: 0,
+	});
+	try {
+		await observer.connect();
+		// Between client hello and its first replay, the host has not yet received
+		// authoritative capability evidence, so it conservatively counts the socket.
+		expect(sessionHostAttachedClients()).toBe(baseDemand + 1);
+		await observer.request({ type: "event_replay", sinceGeneration: 1, sinceSeq: 0 });
+		await Bun.sleep(20);
+		expect(sessionHostAttachedClients()).toBe(baseDemand);
+
+		await host.session.extensionRunner?.emit({ type: "agent_start" });
+		expect(sessionHostWorkInFlight()).toBe(true);
+		expect(sessionHostAttachedClients()).toBe(baseDemand + 1);
+		await host.session.extensionRunner?.emit({ type: "agent_end" });
+		await Bun.sleep(20);
+		expect(sessionHostWorkInFlight()).toBe(false);
+		expect(sessionHostAttachedClients()).toBe(baseDemand);
+
+		const disconnectedBeforeReplay = new SdkClient(host.endpoint.url, host.endpoint.token, {
+			capabilities: [SESSION_HOST_OBSERVER_CAPABILITY],
+			reconnectAttempts: 0,
+		});
+		await disconnectedBeforeReplay.connect();
+		await disconnectedBeforeReplay.close();
+		await Bun.sleep(20);
+		expect(sessionHostAttachedClients()).toBe(baseDemand);
+	} finally {
+		await observer.close();
+		await host.stop();
 	}
 }, 60_000);
 
