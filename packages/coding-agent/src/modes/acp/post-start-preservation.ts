@@ -7,10 +7,13 @@
  * `#shouldRetryFirstPrompt`'s tool/output gates exist to prevent (issue #5574). Nothing here
  * re-opens those gates. Instead it makes the terminal outcome non-destructive and non-misleading:
  *
- *   - the uncommitted work is snapshotted into the git stash list BEFORE the turn reports `error`,
- *     so an operator can recover it after the worktree is swept;
+ *   - the uncommitted TRACKED work is snapshotted into the git stash list BEFORE the turn reports
+ *     `error`, so an operator can recover it after the worktree is swept;
  *   - the snapshot's location is stated in operator-facing wording, because a snapshot nobody can
- *     find is not a fix;
+ *     find is not a fix — and so is what the snapshot does NOT hold, because a recovery hint an
+ *     operator trusts and that then silently drops their new files is worse than no hint at all.
+ *     `git stash create` captures tracked/staged content only, so untracked files are reported as
+ *     uncaptured (by count) rather than implied to be recoverable;
  *   - a `provider_transport` failure is described as an upstream provider problem rather than as a
  *     failure of the operator's task.
  *
@@ -28,6 +31,15 @@ export interface PostStartPreservation {
 	stashRef?: string;
 	/** False when the worktree was dirty but some component could not be captured. */
 	snapshotComplete: boolean;
+	/**
+	 * How many untracked files exist in the worktree but NOT in the stash object.
+	 *
+	 * A COUNT, never the paths: this object is interpolated into a message that crosses the wire,
+	 * and untracked paths are user-controlled strings. A non-negative integer is the whole budget
+	 * the `#4068`/`#4077` redaction contract allows here — the same reasoning that makes
+	 * `safeStashRef` admit only a bare hex oid.
+	 */
+	untrackedNotCaptured?: number;
 }
 
 /**
@@ -47,6 +59,18 @@ export function safeStashRef(value: unknown): string | undefined {
 	return typeof value === "string" && STASH_REF_PATTERN.test(value) ? value : undefined;
 }
 
+/**
+ * Admit an uncaptured-untracked count only as a non-negative safe integer, for the same reason
+ * `safeStashRef` exists: `PostStartPreservation` is reachable with any value and this number is
+ * interpolated into wire-bound text. A non-integer, negative, or absent count reads as zero rather
+ * than reaching the operator as prose.
+ */
+export function uncapturedUntrackedCount(value: unknown): number {
+	return typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : 0;
+}
+
+/** The action an operator must take when the snapshot does not hold everything. */
+export const OPERATOR_KEEP_WORKTREE = "do not discard this worktree";
 export const OPERATOR_UPSTREAM_LABEL = "Upstream provider failure";
 export const OPERATOR_UPSTREAM_SUFFIX = ": the model provider ended this turn, not your task.";
 export const OPERATOR_POST_START_PREFIX = "The turn ended after execution had already started.";
@@ -75,9 +99,18 @@ export function preservePostStartWork(
 		// an operator could recover.
 		if (result.gitDelta !== "dirty") return undefined;
 		const stashRef = safeStashRef(result.stashRef);
+		// `git stash create` snapshots tracked+staged content ONLY — an untracked file is absent from
+		// the stash object's tree, so `git stash apply <ref>` will not bring it back. (Not fixable by
+		// passing `-u`: `git stash create` takes a MESSAGE, not flags, so `-u` becomes the message and
+		// the tree is unchanged — verified on git 2.47.3 and 2.55.0. Real untracked capture needs
+		// `git stash push -u`, which mutates the worktree and would break this path's non-destructive
+		// guarantee.) So a dirty tree carrying untracked files is NOT completely snapshotted, whatever
+		// the shared helper's own `snapshotComplete` says about its manifest being readable.
+		const untrackedNotCaptured = result.untrackedManifest.length;
 		return {
 			...(stashRef === undefined ? {} : { stashRef }),
-			snapshotComplete: result.snapshotComplete === true && stashRef !== undefined,
+			snapshotComplete: result.snapshotComplete === true && stashRef !== undefined && untrackedNotCaptured === 0,
+			...(untrackedNotCaptured > 0 ? { untrackedNotCaptured } : {}),
 		};
 	} catch {
 		return undefined;
@@ -121,7 +154,16 @@ export function postStartOperatorMessage(input: {
 		parts.push(
 			`Uncommitted work was preserved in the git stash list as ${ref} — recover it with \`git stash apply ${ref}\`.`,
 		);
-		if (!preservation.snapshotComplete) parts.push("The snapshot is incomplete; do not discard this worktree.");
+		// Name the gap precisely instead of a bare "incomplete". The stash genuinely recovers the
+		// tracked edits, so that hint stays; what it does NOT contain is the new files, and an
+		// operator who reads only the hint would sweep the worktree and lose them. A count, never a
+		// path — see `PostStartPreservation.untrackedNotCaptured`.
+		const uncaptured = uncapturedUntrackedCount(preservation.untrackedNotCaptured);
+		if (uncaptured > 0)
+			parts.push(
+				`${uncaptured} new file(s) are NOT in that snapshot and exist only in the worktree; ${OPERATOR_KEEP_WORKTREE}.`,
+			);
+		else if (!preservation.snapshotComplete) parts.push(`The snapshot is incomplete; ${OPERATOR_KEEP_WORKTREE}.`);
 	}
 	return parts.join(" ");
 }
