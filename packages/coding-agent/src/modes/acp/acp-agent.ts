@@ -73,6 +73,12 @@ import {
 	mapAgentWireEventPayloadToAcpSessionUpdates,
 } from "./acp-event-mapper";
 import { resolveAcpPermissionMode } from "./permission-mode";
+import {
+	type PostStartPreservation,
+	postStartOperatorMessage,
+	preservePostStartWork,
+	safeStashRef,
+} from "./post-start-preservation";
 import type { AcpStartupOptions } from "./startup-options";
 import { ACP_TERMINAL_AUTH_FLAG } from "./terminal-auth";
 
@@ -634,9 +640,16 @@ type SdkPromptFailedOutcome = Extract<SdkPromptTerminalOutcome, { kind: "failed"
  */
 export class AcpPromptFailureError extends AcpSdkAdapterError {
 	readonly failure: SdkPromptFailedOutcome;
-	constructor(failure: SdkPromptFailedOutcome) {
+	/**
+	 * What a post-start terminal snapshotted before reporting this failure (issue #5664).
+	 * Absent for a submission-phase rejection, which never ran and so stranded nothing, and for a
+	 * post-start turn whose worktree was clean.
+	 */
+	readonly preservation?: PostStartPreservation;
+	constructor(failure: SdkPromptFailedOutcome, preservation?: PostStartPreservation) {
 		super(failure.code, failure.message);
 		this.failure = failure;
+		if (preservation !== undefined) this.preservation = preservation;
 	}
 }
 
@@ -655,12 +668,28 @@ export class AcpPromptFailureError extends AcpSdkAdapterError {
  * dropped instead of becoming a leak of provider text (the redaction contract in
  * `sanitizePromptFailure`). A dropped or absent code is omitted, never nulled.
  */
-function promptFailureWireData(failure: SdkPromptFailedOutcome): Record<string, string> {
+function promptFailureWireData(
+	failure: SdkPromptFailedOutcome,
+	preservation?: PostStartPreservation,
+): Record<string, string> {
+	// `operatorMessage` says, in words, what the classifier tokens above already say in codes, plus
+	// where a post-start terminal put the operator's uncommitted work (issue #5664). It is built
+	// only from those same bounded tokens, so it widens nothing that reaches the wire. The existing
+	// `code`/`details` pair is untouched: pinned ACP core-v1 conformance asserts on it.
+	const operatorMessage = postStartOperatorMessage({
+		category: failure.category,
+		...(failure.providerCode === undefined ? {} : { providerCode: failure.providerCode }),
+		...(preservation === undefined ? {} : { preservation }),
+	});
 	return {
 		phase: failure.phase,
 		category: failure.category,
 		retryability: promptFailureRetryability(failure.category),
 		...(isSafePromptFailureCode(failure.providerCode) ? { providerCode: failure.providerCode } : {}),
+		...(operatorMessage === undefined ? {} : { operatorMessage }),
+		...(safeStashRef(preservation?.stashRef) === undefined
+			? {}
+			: { preservedStashRef: preservation?.stashRef as string }),
 	};
 }
 
@@ -1368,7 +1397,7 @@ export function acpRequestFailure(error: unknown): unknown {
 	// this enriches `data`, it does not restate the redacted message.
 	const data =
 		error instanceof AcpPromptFailureError
-			? { code, details: message, ...promptFailureWireData(error.failure) }
+			? { code, details: message, ...promptFailureWireData(error.failure, error.preservation) }
 			: { code, details: message };
 	// An abandoned prompt additionally publishes the plan it never finished (issue #5669).
 	// Same rule as above: `code`/`details` and the JSON-RPC code are untouched, and an abandon
@@ -3972,7 +4001,21 @@ export class AcpAgent implements Agent {
 			outcome.phase === "post_start"
 				? outcome
 				: (rephaseFailedOutcome(outcome, { hasActivity: waiter.observedTurnActivity }) as SdkPromptFailedOutcome);
-		waiter.reject(new AcpPromptFailureError(failure));
+		// A post-start turn may have spent the last hour editing this worktree, and the rejection
+		// below is terminal by design — the retry gates that forbid re-running a tool-executing turn
+		// stay exactly as they are (issue #5574). Snapshot the uncommitted work into the stash list
+		// BEFORE reporting the failure, so the edits survive the worktree being swept (issue #5664).
+		// Scoped to the phase rather than the category: any post-start fatal strands work.
+		const preservation = failure.phase === "post_start" ? preservePostStartWork(record.cwd) : undefined;
+		if (preservation)
+			logger.warn("acp_post_start_work_preserved", {
+				sessionId: id,
+				category: failure.category,
+				...(isSafePromptFailureCode(failure.providerCode) ? { providerCode: failure.providerCode } : {}),
+				...(preservation.stashRef ? { stashRef: preservation.stashRef } : {}),
+				snapshotComplete: preservation.snapshotComplete,
+			});
+		waiter.reject(new AcpPromptFailureError(failure, preservation));
 	}
 
 	async #emitEndOfTurnUpdates(id: string, adapter: AcpSdkAdapter, publicationGeneration: number): Promise<void> {
