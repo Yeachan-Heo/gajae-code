@@ -856,9 +856,9 @@ describe("SDK serve CLI and discovery", () => {
 									mtimeMs: 4,
 									mtimeNs: "5",
 									sha256: "b".repeat(64),
-									},
 								},
 							},
+						},
 					};
 				if (operation === "session.resume") return { ok: true, result: { sessionId } };
 				if (operation === "session.list")
@@ -896,9 +896,9 @@ describe("SDK serve CLI and discovery", () => {
 									mtimeMs: 4,
 									mtimeNs: "5",
 									sha256: "c".repeat(64),
-									},
 								},
 							},
+						},
 					};
 				if (operation === "session.resume")
 					return { ok: false, error: { code: "resume_failed", message: "resume failed" } };
