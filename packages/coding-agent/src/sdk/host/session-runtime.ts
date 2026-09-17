@@ -4379,6 +4379,37 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 	const activePromptOwnerHolder: { connectionIds?: Set<string>; lifecycleEpoch?: number } = {};
 	let nextLifecycleEpoch = 0;
 	const skillTerminalRecoveryKeys = new Set<string>();
+	/**
+	 * Exactly one correlated terminal BOUNDARY (agent_end) may reach the wire per
+	 * correlation. The provider agent_end handler and the prompt-deadline expiry can both
+	 * reach their emission after the other has already published: the handler captures its
+	 * transitions synchronously and then awaits durable writes, while the deadline callback
+	 * fires only after its own claim/finalize awaits have settled. Neither can be stopped by
+	 * removing lifecycle references, and noteTransition is a no-op once the record is
+	 * terminal, so durable state would record one outcome while clients received two. This
+	 * claim is the shared arbiter, taken synchronously -- no await between the check and the
+	 * set -- by whoever is about to publish the boundary.
+	 *
+	 * The key is never removed at cleanup: dropping it when the correlation retires would
+	 * re-open the window, and would stop a late real boundary from being idempotent for an
+	 * already-retired correlation. Growth is bounded by FIFO eviction instead (a Set
+	 * preserves insertion order). A correlation displaced by 1024 later boundaries is long
+	 * retired, and its durable record stays authoritative for anything a consumer missed.
+	 */
+	const MAX_PUBLISHED_TERMINAL_BOUNDARIES = 1024;
+	const publishedTerminalBoundaries = new Set<string>();
+	const claimTerminalBoundary = (correlation: InvocationCorrelation): boolean => {
+		const key = lifecycleCorrelationKey(correlation);
+		if (publishedTerminalBoundaries.has(key)) return false;
+		publishedTerminalBoundaries.add(key);
+		if (publishedTerminalBoundaries.size > MAX_PUBLISHED_TERMINAL_BOUNDARIES) {
+			const oldest = publishedTerminalBoundaries.values().next();
+			if (!oldest.done) publishedTerminalBoundaries.delete(oldest.value);
+		}
+		return true;
+	};
+	const hasClaimedTerminalBoundary = (correlation: InvocationCorrelation): boolean =>
+		publishedTerminalBoundaries.has(lifecycleCorrelationKey(correlation));
 	const trackLifecycle = (handler: () => Promise<void>, owner: RuntimeState | undefined): Promise<void> => {
 		if (!owner) return Promise.resolve();
 		let task: Promise<void>;
@@ -4810,6 +4841,15 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					failureCause ?? Object.assign(new Error("agent run failed"), { code: "agent_failed" }),
 				);
 				for (const invocation of transitions) {
+					// A correlation whose terminal boundary is already published was
+					// terminalized by the deadline, which emitted its own diagnostic together
+					// with the pair; a second correlated agent_failed would duplicate it. The
+					// check is READ-ONLY: the claim is taken by would-be agent_end publishers
+					// alone, because the real path emits its agent_failed and its agent_end
+					// from two SEPARATE emitLifecycle invocations, so claiming here would make
+					// the publisher block its own boundary. In the ordinary flow this changes
+					// nothing -- agent_failed precedes agent_end and the claim is untaken.
+					if (hasClaimedTerminalBoundary(invocation.correlation)) continue;
 					try {
 						current.runtime.emitEvent({
 							type,
@@ -4857,6 +4897,15 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				// above with the one uncorrelated frame, so it cannot settle a live prompt.
 				const outcome = terminalOutcome ?? terminalStoppedOutcome(stopReason, maintenanceOutcome);
 				for (const invocation of transitions) {
+					// Claim synchronously, immediately before the emit: the durable awaits
+					// above give the deadline expiry room to publish this correlation's
+					// boundary first. On a lost claim skip ONLY this frame -- every durable
+					// write, diagnostic cleanup, batch retirement and waiter resolution below
+					// still runs. `observed` deliberately stays true: it means "the correlated
+					// publication reached the wire", and it did, the deadline put it there.
+					// Flipping it would make a terminal abort's durable row refuse to claim
+					// terminalPublished for a boundary that IS on the wire.
+					if (!claimTerminalBoundary(invocation.correlation)) continue;
 					try {
 						current.runtime.emitEvent({ type, sessionId, ...invocation.correlation, outcome });
 					} catch {
@@ -5235,18 +5284,26 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				const failure = sanitizePromptFailure(
 					Object.assign(new Error("Prompt deadline exceeded."), { code: deadlineOutcome.code }),
 				);
-				runtime.emitEvent({
-					type: "agent_failed",
-					sessionId,
-					...correlation,
-					error: failure,
-				});
-				runtime.emitEvent({
-					type: "agent_end",
-					sessionId,
-					...correlation,
-					outcome: canonicalFailedOutcome(failure, "deadline"),
-				});
+				// The deadline publishes a failed/end PAIR and owns it atomically, so the
+				// boundary claim is taken once, here, covering both frames. Losing it means
+				// a real agent_end already reached the wire for this correlation: emit
+				// NEITHER frame, but still run the cleanup below, and still let #expire
+				// finish its durable reconciliation. Losing the boundary must not skip
+				// cleanup.
+				if (claimTerminalBoundary(correlation)) {
+					runtime.emitEvent({
+						type: "agent_failed",
+						sessionId,
+						...correlation,
+						error: failure,
+					});
+					runtime.emitEvent({
+						type: "agent_end",
+						sessionId,
+						...correlation,
+						outcome: canonicalFailedOutcome(failure, "deadline"),
+					});
+				}
 				if (owner) {
 					removeLifecycleReferences(owner, correlation);
 					maybeRetireLifecycleOwner(owner);
