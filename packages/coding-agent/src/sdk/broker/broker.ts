@@ -750,13 +750,14 @@ function verifyTerminalPersistence(
 	if (persisted === undefined) return { kind: "unverified" };
 	const optionalReceiptJson = (value: unknown): string | undefined =>
 		value === undefined || value === null ? undefined : canonicalJson(value);
-	const mismatches = [
+	// The field name is always present; only the two compared receipt renderings are
+	// optional. Naming that shape keeps the mismatch list a plain string list.
+	const comparisons: readonly (readonly [string, string | undefined, string | undefined])[] = [
 		["response", canonicalJson(persisted.response), canonicalJson(storedResponse)],
 		["durableEffects", optionalReceiptJson(persisted.durableEffects), optionalReceiptJson(durableEffects)],
 		["startupFailure", optionalReceiptJson(persisted.startupFailure), optionalReceiptJson(startupFailure)],
-	]
-		.filter(([, actual, expected]) => actual !== expected)
-		.map(([field]) => field);
+	];
+	const mismatches = comparisons.filter(([, actual, expected]) => actual !== expected).map(([field]) => field);
 	return mismatches.length === 0 ? { kind: "verified" } : { kind: "uncertain", mismatches };
 }
 
