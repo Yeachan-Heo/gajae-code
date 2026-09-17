@@ -1,0 +1,3 @@
+### Fixed
+
+- `gjc sdk serve` no longer surfaces a session-selection failure as an uncaught exception with the failure code buried in a message string. Selection failures (`not_found`, `ambiguous_session`, `endpoint_stale`, `no_live_endpoint`, `multiple_live_endpoints`) and the broker-reach failures on the same path now raise a typed error carrying a stable `code`, a broker `SdkClientError` keeps both its `code` and its `details` instead of being downgraded, and the command boundary writes a `{"ok":false,"error":{"code","message"}}` envelope to stderr — never the stdout frame channel — and exits 1 (#5633).

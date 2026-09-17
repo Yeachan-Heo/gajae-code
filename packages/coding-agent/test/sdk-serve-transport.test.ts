@@ -4,9 +4,11 @@ import * as net from "node:net";
 import * as os from "node:os";
 import path from "node:path";
 import { PassThrough, Writable } from "node:stream";
+import { getAgentDir, setAgentDir } from "@gajae-code/utils";
 import { CliParseError, renderCommandHelp } from "@gajae-code/utils/cli";
 import type { ServerWebSocket } from "bun";
 import Sdk, { parseSdkInternalArgv } from "../src/commands/sdk.js";
+import { brokerProcessIncarnation, writeBrokerDiscovery } from "../src/sdk/broker/discovery.js";
 import { SdkClientError } from "../src/sdk/client/client.js";
 import { listSdkSessionEndpoints } from "../src/sdk/client/discovery.js";
 import { classifyEndpoint, selectLiveEndpoint } from "../src/sdk/client/liveness.js";
@@ -15,6 +17,7 @@ import {
 	listBrokerSessions,
 	resolveServePendingCeiling,
 	runSdkServe,
+	SdkServeError,
 	selectBrokerSession,
 } from "../src/sdk/transport/serve-cli.js";
 import { startSocketServe } from "../src/sdk/transport/socket.js";
@@ -90,6 +93,76 @@ const tempDir = async (): Promise<string> => {
 	temporary.push(dir);
 	return dir;
 };
+
+/**
+ * Reports how a serve failure surfaced without rethrowing it, so a regression shows
+ * up as an assertion diff on the machine-readable code rather than a raw throw.
+ */
+function serveFailure(run: () => unknown): { typed: boolean; code: unknown; exitCode: unknown } {
+	try {
+		run();
+	} catch (error) {
+		const typed = error as { code?: unknown; exitCode?: unknown };
+		return { typed: error instanceof SdkServeError, code: typed.code, exitCode: typed.exitCode };
+	}
+	throw new Error("Expected the serve path to fail.");
+}
+
+/** A fake SDK broker: a hello on open, then one canned reply per broker request. */
+function fakeBroker(reply: (operation: string) => Record<string, unknown>) {
+	const server = Bun.serve<unknown>({
+		port: 0,
+		fetch(req, server) {
+			if (server.upgrade(req, { data: {} })) return;
+			return new Response("upgrade required", { status: 426 });
+		},
+		websocket: {
+			open(ws) {
+				ws.send(JSON.stringify({ type: "broker_hello", connectionId: "fake-broker" }));
+			},
+			message(ws, message) {
+				const frame = JSON.parse(String(message)) as { id?: unknown; operation?: unknown };
+				if (typeof frame.id !== "string") return;
+				const operation = typeof frame.operation === "string" ? frame.operation : "";
+				ws.send(JSON.stringify({ type: "broker_response", id: frame.id, ...reply(operation) }));
+			},
+		},
+	});
+	return { url: `ws://127.0.0.1:${server.port}`, stop: () => server.stop(true) };
+}
+
+/**
+ * Points `getAgentDir()` at a private temp agent dir — never the shared one — and
+ * optionally publishes a discovery record for `url` so serve reaches the broker.
+ */
+async function withServeAgentDir<T>(url: string | undefined, run: () => Promise<T>): Promise<T> {
+	const agentDir = path.join(await tempDir(), "agent");
+	if (url !== undefined) {
+		const incarnation = brokerProcessIncarnation(process.pid);
+		if (!incarnation) throw new Error("Broker process incarnation is unavailable for this test process.");
+		await writeBrokerDiscovery(agentDir, {
+			version: 1,
+			protocolVersion: 3,
+			packageGeneration: "serve-cli-test",
+			ownerId: "serve-cli-test",
+			pid: process.pid,
+			incarnation,
+			host: "127.0.0.1",
+			port: Number(new URL(url).port),
+			url,
+			token,
+			startedAt: Date.now(),
+			heartbeatAt: Date.now(),
+		});
+	}
+	const previous = getAgentDir();
+	setAgentDir(agentDir);
+	try {
+		return await run();
+	} finally {
+		setAgentDir(previous);
+	}
+}
 
 class StalledWebSocket implements RelayWebSocket {
 	static readonly CLOSED = 3;
@@ -611,7 +684,11 @@ describe("SDK serve CLI and discovery", () => {
 		// Auto-selection also observes beyond-page liveness.
 		expect(selectBrokerSession(rows, undefined)).toBe("sess-150");
 		// First-page rows are still governed by the same broker truth.
-		expect(() => selectBrokerSession(rows, "sess-1")).toThrow(/endpoint_stale/);
+		expect(serveFailure(() => selectBrokerSession(rows, "sess-1"))).toEqual({
+			typed: true,
+			code: "endpoint_stale",
+			exitCode: 1,
+		});
 	});
 
 	test("rejects malformed broker session.list pages instead of treating them as empty", async () => {
@@ -667,5 +744,103 @@ describe("SDK serve CLI and discovery", () => {
 			details: { code: "continuation_failed", message: "page two failed" },
 		});
 		expect(calls).toBe(2);
+	});
+
+	test("reports a broker-indexed but reaped session as a typed endpoint_stale failure", () => {
+		// The issue's scenario: a per-turn embedder returns after ~30 minutes of quiet,
+		// the session host has self-reaped, and the broker still indexes the row. The
+		// code must live in a field an embedder can branch on, not inside the message.
+		const reaped = [{ sessionId: "sess-reaped", live: false, ambiguous: false }];
+		expect(serveFailure(() => selectBrokerSession(reaped, "sess-reaped"))).toEqual({
+			typed: true,
+			code: "endpoint_stale",
+			exitCode: 1,
+		});
+	});
+
+	test("maps every session-selection failure to its own stable code", () => {
+		const live = (sessionId: string) => ({ sessionId, live: true, ambiguous: false });
+		const cases: [string, () => string][] = [
+			["not_found", () => selectBrokerSession([], "missing")],
+			["ambiguous_session", () => selectBrokerSession([{ sessionId: "dup", live: true, ambiguous: true }], "dup")],
+			["endpoint_stale", () => selectBrokerSession([{ sessionId: "s", live: false, ambiguous: false }], "s")],
+			[
+				"no_live_endpoint",
+				() => selectBrokerSession([{ sessionId: "s", live: false, ambiguous: false }], undefined),
+			],
+			["multiple_live_endpoints", () => selectBrokerSession([live("a"), live("b")], undefined)],
+		];
+		expect(cases.map(([, run]) => serveFailure(run))).toEqual(
+			cases.map(([code]) => ({ typed: true, code, exitCode: 1 })),
+		);
+	});
+
+	test("propagates a broker SdkClientError through serve with its code and details intact", async () => {
+		const broker = fakeBroker(() => ({
+			ok: false,
+			error: { code: "endpoint_credential_forbidden", message: "credential refused", details: { reason: "lease" } },
+		}));
+		try {
+			const failure = await withServeAgentDir(broker.url, async () => {
+				try {
+					await runSdkServe(["--stdio"]);
+				} catch (error) {
+					return error;
+				}
+				throw new Error("Expected serve to fail.");
+			});
+			expect(failure).toBeInstanceOf(SdkServeError);
+			expect(failure).toMatchObject({
+				code: "endpoint_credential_forbidden",
+				message: "credential refused",
+				exitCode: 1,
+				// `details` is the field the old bare-Error downgrade destroyed.
+				details: {
+					code: "endpoint_credential_forbidden",
+					message: "credential refused",
+					details: { reason: "lease" },
+				},
+			});
+		} finally {
+			broker.stop();
+		}
+	});
+
+	test("renders a serve failure as a structured envelope on stderr without an uncaught exception", async () => {
+		const stdoutChunks: string[] = [];
+		const stderrChunks: string[] = [];
+		const realStdout = process.stdout.write;
+		const realStderr = process.stderr.write;
+		const previousExitCode = process.exitCode;
+		(process.stdout as unknown as { write(value: string): boolean }).write = value => {
+			stdoutChunks.push(String(value));
+			return true;
+		};
+		(process.stderr as unknown as { write(value: string): boolean }).write = value => {
+			stderrChunks.push(String(value));
+			return true;
+		};
+		let observedExitCode: typeof process.exitCode;
+		try {
+			// No discovery record in this private agent dir, so selection fails closed.
+			// `run()` must resolve: a rethrow here is the uncaught exception being fixed.
+			await withServeAgentDir(undefined, async () => {
+				await new Sdk(["serve", "--stdio"], {} as never).run();
+			});
+			observedExitCode = process.exitCode;
+		} finally {
+			(process.stdout as unknown as { write: typeof realStdout }).write = realStdout;
+			(process.stderr as unknown as { write: typeof realStderr }).write = realStderr;
+			process.exitCode = previousExitCode;
+		}
+		expect(observedExitCode).toBe(1);
+		// The frame channel must stay byte-pure: the envelope belongs on stderr alone.
+		expect(stdoutChunks.join("")).toBe("");
+		const lines = stderrChunks.join("").split("\n").filter(Boolean);
+		expect(lines).toHaveLength(1);
+		expect(JSON.parse(lines[0]!)).toEqual({
+			ok: false,
+			error: { code: "broker_unavailable", message: "SDK broker is not running" },
+		});
 	});
 });
