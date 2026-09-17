@@ -349,7 +349,7 @@ a new prompt while the old outcome remains unknown.
 receives `resource_gone`; it must not treat that result as cancellation of another
 prompt.
 
-`sdk.promptDeadlineMs` defaults to `1_800_000`. It accepts only safe integers in
+`sdk.promptDeadlineMs` defaults to `3_600_000`. It accepts only safe integers in
 `[60_000, 86_400_000]`; there is no disable value. The SDK snapshots the setting
 when the prompt is durably accepted as the initial inactivity lease. Fresh
 **attributable** progress for the exact accepted `commandId`/`turnId` — `tool_execution_start` /

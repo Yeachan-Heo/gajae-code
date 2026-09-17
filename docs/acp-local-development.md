@@ -136,7 +136,7 @@ Paseo runs its daemon as a separate long-lived process, so it needs its own
 restart after a config change — but not after a GJC rebuild, since it spawns
 `gjc` per session. `--wait-timeout 3m` stops the CLI from waiting; it does not
 cancel the agent, which may remain `running`. That timeout is separate from
-GJC's `sdk.promptDeadlineMs`, which defaults to 30 minutes and settles as
+GJC's `sdk.promptDeadlineMs`, which defaults to 60 minutes and settles as
 `prompt_deadline_exceeded`.
 
 Errors surface in the daemon log with the JSON-RPC payload intact, which is
