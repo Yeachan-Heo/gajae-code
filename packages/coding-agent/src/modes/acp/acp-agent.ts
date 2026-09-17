@@ -193,6 +193,12 @@ interface PromptWaiter {
 	observedTurnActivity: boolean;
 	/** True once a prompt-owned tool execution frame was observed; vetoes a first-turn retry that would re-run it. */
 	observedToolExecution: boolean;
+	/**
+	 * Newest `plan` update published for this prompt, retained so an abandoned turn can report
+	 * what it had left to do (issue #5669). Absent means no plan was ever observed, which is
+	 * evidence of nothing — distinct from an observed plan whose entries are all `completed`.
+	 */
+	planSnapshot?: AcpPlanSnapshot;
 	/** Coordinates a prompt-control rejection racing an acknowledged ACP cancellation. */
 	cancelAttempt?: Promise<boolean>;
 	/** Whether ANY overlapping cancel attempt for this prompt was acknowledged:
@@ -655,6 +661,61 @@ function promptFailureWireData(failure: SdkPromptFailedOutcome): Record<string, 
 		category: failure.category,
 		retryability: promptFailureRetryability(failure.category),
 		...(isSafePromptFailureCode(failure.providerCode) ? { providerCode: failure.providerCode } : {}),
+	};
+}
+
+/**
+ * What an ACP `plan` update said the turn intended to do. Structural rather than the SDK's
+ * `PlanEntry` so only the two fields this evidence reads are depended on.
+ */
+type AcpPlanSnapshot = Array<{ content: string; status: "pending" | "in_progress" | "completed" }>;
+
+/**
+ * An abandoned prompt that still carries the plan its turn was working through (issue #5669).
+ *
+ * The watchdog settles a prompt whose host stopped producing frames, and that rejection used to
+ * be a bare `AcpSdkAdapterError`: `{code, details}` and nothing else. A wrapper could not tell
+ * "the agent finished" from "the agent stopped with work left", so an abandoned turn's unverified
+ * diff was published as if it were complete. The last observed plan is the evidence that settles
+ * that question, so settlement carries it instead of dropping it at the JSON-RPC boundary.
+ */
+export class AcpPromptAbandonedError extends AcpSdkAdapterError {
+	readonly plan: AcpPlanSnapshot | undefined;
+	constructor(code: string, message: string, plan: AcpPlanSnapshot | undefined) {
+		super(code, message);
+		this.plan = plan;
+	}
+}
+
+/** Most pending plan entries that may reach the wire. */
+const ACP_ABANDON_PLAN_MAX_ENTRIES = 10;
+/** Longest one pending entry's text may be on the wire. */
+const ACP_ABANDON_PLAN_MAX_CONTENT_CHARS = 200;
+
+/**
+ * The wire projection of an abandoned prompt's plan (issue #5669).
+ *
+ * Plan text is model-authored, so it is bounded the same way `promptFailureWireData` bounds a
+ * provider classifier: a capped number of entries, each capped in length, and never restated in
+ * the human message. The counts are what a wrapper actually gates on; the contents are there so
+ * the reader can name the unfinished steps without a log dive.
+ *
+ * An absent plan yields no keys at all. "No plan was ever observed" is not the same claim as
+ * "the plan was complete", and a client must be able to tell them apart, so the fields are
+ * omitted rather than nulled or reported as unknown.
+ */
+function promptAbandonWireData(plan: AcpPlanSnapshot | undefined): Record<string, string> {
+	if (!plan) return {};
+	const pending = plan.filter(entry => entry.status !== "completed");
+	return {
+		planIncomplete: pending.length > 0 ? "true" : "false",
+		planPendingCount: String(pending.length),
+		planTotalCount: String(plan.length),
+		planPending: JSON.stringify(
+			pending
+				.slice(0, ACP_ABANDON_PLAN_MAX_ENTRIES)
+				.map(entry => entry.content.slice(0, ACP_ABANDON_PLAN_MAX_CONTENT_CHARS)),
+		),
 	};
 }
 
@@ -1291,6 +1352,10 @@ export function acpRequestFailure(error: unknown): unknown {
 		error instanceof AcpPromptFailureError
 			? { code, details: message, ...promptFailureWireData(error.failure) }
 			: { code, details: message };
+	// An abandoned prompt additionally publishes the plan it never finished (issue #5669).
+	// Same rule as above: `code`/`details` and the JSON-RPC code are untouched, and an abandon
+	// that observed no plan adds no keys, so its payload stays byte-identical to before.
+	if (error instanceof AcpPromptAbandonedError) Object.assign(data, promptAbandonWireData(error.plan));
 	switch (code) {
 		case "authentication_failed":
 			return RequestError.authRequired(data, message);
@@ -3326,6 +3391,9 @@ export class AcpAgent implements Agent {
 			(waiter.awaitingProviderPreflight
 				? "the SDK session host never finished provider preflight"
 				: "the SDK session host stopped producing frames");
+		// Counts only: the plan's contents are model-authored and belong on the bounded wire
+		// projection, not in the log line (issue #5669).
+		const plan = waiter.planSnapshot;
 		logger.error("acp_prompt_watchdog_expired", {
 			sessionId: id,
 			cause,
@@ -3335,6 +3403,13 @@ export class AcpAgent implements Agent {
 			inactivityBoundMs: waiter.activity.inactivityBoundMs,
 			toolRunning: waiter.activity.running,
 			awaitingModel: waiter.activity.awaitingModel,
+			...(plan
+				? {
+						planIncomplete: plan.some(entry => entry.status !== "completed"),
+						planPendingCount: plan.filter(entry => entry.status !== "completed").length,
+						planTotalCount: plan.length,
+					}
+				: {}),
 			...(waiter.correlation.commandId ? { commandId: waiter.correlation.commandId } : {}),
 			...(waiter.correlation.turnId ? { turnId: waiter.correlation.turnId } : {}),
 		});
@@ -3342,11 +3417,12 @@ export class AcpAgent implements Agent {
 			record,
 			id,
 			waiter,
-			new AcpSdkAdapterError(
+			new AcpPromptAbandonedError(
 				"prompt_abandoned",
 				`ACP prompt was abandoned after ${Math.round(silenceMs / 1_000)}s of silence: ${cause}. Last frame was ` +
 					`"${waiter.lastFrameType}" (${describeCorrelation(waiter.correlation)}). The turn was settled so the ` +
 					`client stops waiting; the session still accepts the next prompt.`,
+				plan,
 			),
 		);
 	}
@@ -3607,6 +3683,12 @@ export class AcpAgent implements Agent {
 				notification.update.content.type === "text"
 			)
 				promptOwner.emittedAssistantText += notification.update.content.text;
+			// The newest plan REPLACES the retained one: a plan update is the whole list, not a
+			// delta, so `todo_auto_clear`'s empty `entries` correctly leaves no pending work behind
+			// (issue #5669). Retained here rather than at frame ingress because this is where the
+			// mapper has already decided what the client is being told the plan is.
+			if (promptOwner && notification.update.sessionUpdate === "plan")
+				promptOwner.planSnapshot = notification.update.entries;
 			// A live assistant text/thought chunk for this prompt owner has now been exposed to
 			// ACP consumers. Record it so the first-turn readiness retry is vetoed: a re-submit
 			// would deliver a second attempt's output on top of these chunks (issue #5574).
