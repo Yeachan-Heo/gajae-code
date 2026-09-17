@@ -1,6 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import { createHash } from "node:crypto";
-import * as nodeFs from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -184,6 +183,12 @@ type SdkControlServerOptions = {
 	eventWebhookDelivery?: NonNullable<
 		NonNullable<Parameters<typeof createCoordinatorMcpServer>[0]>["services"]
 	>["eventWebhookDelivery"];
+	onCoordinatorEventWatchReady?: NonNullable<
+		NonNullable<Parameters<typeof createCoordinatorMcpServer>[0]>["services"]
+	>["onCoordinatorEventWatchReady"];
+	onCoordinatorEventWake?: NonNullable<
+		NonNullable<Parameters<typeof createCoordinatorMcpServer>[0]>["services"]
+	>["onCoordinatorEventWake"];
 	/** Extra env layered into the coordinator server env for webhook opt-in tests. */
 	eventWebhookEnv?: Record<string, string>;
 	/** Injectable host model resolver for coordinator `model` pin tests. */
@@ -437,6 +442,8 @@ async function createSdkControlServer(
 			canonicalizePath: serverOptions.canonicalizePath,
 			codexTransportFactory: serverOptions.codexTransportFactory,
 			eventWebhookDelivery: serverOptions.eventWebhookDelivery,
+			onCoordinatorEventWatchReady: serverOptions.onCoordinatorEventWatchReady,
+			onCoordinatorEventWake: serverOptions.onCoordinatorEventWake,
 			afterPromptReceiptPersisted: serverOptions.afterPromptReceiptPersisted,
 			afterAnswerRemoteStarted: serverOptions.afterAnswerRemoteStarted,
 			afterCanonicalTurnCommit: serverOptions.afterCanonicalTurnCommit,
@@ -8509,18 +8516,34 @@ describe("Coordinator MCP retained-delivery ordering", () => {
 		const controls: SdkControl[] = [];
 		let gateAvailable = false;
 		let runtimeTurnId = "unbound";
-		const server = await createSdkControlServer(root, controls, [], query => {
-			if (query !== "Q12") return { ok: true, page: { items: [], complete: true, revision: "context" } };
-			if (!gateAvailable) return { ok: true, page: { items: [], complete: true, revision: "q12-empty" } };
-			return {
-				ok: true,
-				page: {
-					items: [sharedAskGate("wake-gate", runtimeTurnId)],
-					complete: true,
-					revision: "q12-open",
-				},
-			};
-		});
+		const watchReady = Promise.withResolvers<void>();
+		const wakeObserved = Promise.withResolvers<void>();
+		const realSetTimeout = setTimeout;
+		const realClearTimeout = clearTimeout;
+		const server = await createSdkControlServer(
+			root,
+			controls,
+			[],
+			query => {
+				if (query !== "Q12") return { ok: true, page: { items: [], complete: true, revision: "context" } };
+				if (!gateAvailable) return { ok: true, page: { items: [], complete: true, revision: "q12-empty" } };
+				return {
+					ok: true,
+					page: {
+						items: [sharedAskGate("wake-gate", runtimeTurnId)],
+						complete: true,
+						revision: "q12-open",
+					},
+				};
+			},
+			undefined,
+			undefined,
+			undefined,
+			{
+				onCoordinatorEventWatchReady: () => watchReady.resolve(),
+				onCoordinatorEventWake: () => wakeObserved.resolve(),
+			},
+		);
 		await registerSdkSession(server, root);
 		const sent = await server.callTool("gjc_coordinator_send_prompt", {
 			session_id: "visible-session",
@@ -8547,19 +8570,13 @@ describe("Coordinator MCP retained-delivery ordering", () => {
 		});
 		const initial = await server.callTool("gjc_coordinator_watch_events", { after_seq: 0, timeout_ms: 0 });
 		const cursor = Number(initial.next_after_seq);
-		const watcherReady = Promise.withResolvers<void>();
 		const namespaceDir = coordinatorNamespace(root);
-		const originalWatch = nodeFs.watch;
-		const watchSpy = vi.spyOn(nodeFs, "watch").mockImplementation((...args: unknown[]): nodeFs.FSWatcher => {
-			const watcher: nodeFs.FSWatcher = Reflect.apply(originalWatch, nodeFs, args);
-			if (args[0] === path.join(namespaceDir, "session-states")) watcherReady.resolve();
-			return watcher;
-		});
-		// Real timers: the long poll's own fallback deadline must stay armed so a wake
-		// regression fails here instead of hanging until an outer suite timeout. Watcher
-		// installation and the filesystem append run while the poll is in flight, so the
-		// budget carries headroom for that setup rather than the protocol's tight 500ms.
-		const wakeBudgetMs = 10_000;
+		const wakeBudgetMs = 500;
+		// Keep the protocol's 500ms fallback budget without charging CI scheduling to
+		// setup. Success is gated by the product's watcher-wake signal below; the real
+		// timer only provides an outer failure guard when that signal never arrives.
+		vi.useFakeTimers();
+		let wakeSafetyTimer: ReturnType<typeof realSetTimeout> | undefined;
 		try {
 			const pending = server.callTool("gjc_coordinator_watch_events", {
 				session_id: "visible-session",
@@ -8567,13 +8584,18 @@ describe("Coordinator MCP retained-delivery ordering", () => {
 				after_seq: cursor,
 				timeout_ms: wakeBudgetMs,
 			});
-			await watcherReady.promise;
+			wakeSafetyTimer = realSetTimeout(
+				() => wakeObserved.reject(new Error("Coordinator event wake was not observed.")),
+				2_000,
+			);
+			await watchReady.promise;
 			gateAvailable = true;
 			await appendCoordinatorEventForTest(namespaceDir, {
 				kind: "session.state_changed",
 				sessionId: "visible-session",
 				summary: "wake",
 			});
+			await wakeObserved.promise;
 			const result = await pending;
 			expect(result).toMatchObject({
 				ok: true,
@@ -8583,7 +8605,8 @@ describe("Coordinator MCP retained-delivery ordering", () => {
 				]),
 			});
 		} finally {
-			watchSpy.mockRestore();
+			if (wakeSafetyTimer !== undefined) realClearTimeout(wakeSafetyTimer);
+			vi.useRealTimers();
 		}
 	});
 
