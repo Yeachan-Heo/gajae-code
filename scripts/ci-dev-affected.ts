@@ -113,6 +113,10 @@ const BEHAVIORAL_OWNER_TESTS: Readonly<Record<string, readonly string[]>> = {
 	"packages/coding-agent/src/main.ts": ["packages/coding-agent/test/startup-update-contract.test.ts"],
 	"packages/coding-agent/src/sdk/prompt-deadline-lease.ts": ["packages/coding-agent/test/sdk-prompt-deadline-manager.test.ts"],
 	"packages/coding-agent/src/sdk/prompt-deadline-manager.ts": ["packages/coding-agent/test/sdk-prompt-deadline-manager.test.ts"],
+	// The prompt-deadline docs guard derives its expected figure from this schema's
+	// default, so a change to the default must run it here rather than surfacing as
+	// stale prose after merge (#5637).
+	"packages/coding-agent/src/config/settings-schema.ts": ["scripts/sdk-deadline-docs-parity.test.ts"],
 	"packages/coding-agent/src/session/agent-session.ts": [
 		"packages/coding-agent/test/agent-session-concurrent.test.ts",
 		"packages/coding-agent/test/agent-session-before-agent-start-attribution.test.ts",
