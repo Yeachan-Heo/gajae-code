@@ -831,7 +831,9 @@ describe("SDK serve CLI and discovery", () => {
 		} finally {
 			(process.stdout as unknown as { write: typeof realStdout }).write = realStdout;
 			(process.stderr as unknown as { write: typeof realStderr }).write = realStderr;
-			process.exitCode = previousExitCode;
+			// Restore to a real number: assigning `undefined` is a no-op in Bun, so it
+			// would leave the boundary's exit code 1 on the whole test runner process.
+			process.exitCode = previousExitCode ?? 0;
 		}
 		expect(observedExitCode).toBe(1);
 		// The frame channel must stay byte-pure: the envelope belongs on stderr alone.
