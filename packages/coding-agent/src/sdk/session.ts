@@ -5198,14 +5198,13 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			} else {
 				if (hasRegistered) agentRegistry.unregister(resolvedAgentId);
 				// Admission happens before session construction. Any later startup
-				// failure must remove THIS manager's endpoint mapping and restore
-				// the prior global only when this manager is still global: otherwise
-				// a retry under the same endpoint is falsely rejected and an orphan
-				// redirects global-manager consumers away from the live session
-				// (review thread P1).
+				// failure must eventually release THIS manager's endpoint mapping
+				// through disposal and restore the prior global only when this manager
+				// is still global: otherwise a retry under the same endpoint is falsely
+				// rejected and an orphan redirects global-manager consumers away from
+				// the live session (review thread P1).
 				if (asyncJobManagerOwned && asyncJobManager) {
 					if (asyncJobManagerAdmitted) {
-						AsyncJobManager.unregisterManager(asyncJobManager);
 						if (AsyncJobManager.instance() === asyncJobManager) {
 							AsyncJobManager.setInstance(priorAsyncJobManager);
 						}

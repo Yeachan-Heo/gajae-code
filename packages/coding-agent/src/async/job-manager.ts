@@ -569,19 +569,20 @@ export class AsyncJobManager {
 	 *  instead of the last-created process-global instance (review thread P1).
 	 *  Returns TRUE when the mapping was installed (or already held by this
 	 *  manager); returns FALSE when the endpoint id is already held by a
-	 *  FOREIGN live manager — a second top-level session constructed or
-	 *  resumed under that endpoint must then fail construction instead of
-	 *  silently replacing the first manager, which would make the first
-	 *  session's tools resolve the second manager and let same-id jobs be
-	 *  queried, registered, or cancelled across sessions (review thread P1). */
+	 *  FOREIGN manager whose authority has not fully settled — a second
+	 *  top-level session constructed or resumed under that endpoint must then
+	 *  fail construction instead of silently replacing the first manager, which
+	 *  would make the first session's tools resolve the second manager and let
+	 *  same-id jobs be queried, registered, or cancelled across sessions
+	 *  (review thread P1). */
 	static registerForEndpoint(endpointId: string, manager: AsyncJobManager): boolean {
 		const holder = AsyncJobManager.#byEndpoint.get(endpointId);
 		if (manager.#disposed || manager.#registrationClosed) return false;
 		if (holder !== undefined && holder !== manager) {
-			// A manager that has already completed disposal is no
-			// longer a live endpoint owner. Drop its stale admission before
-			// admitting the replacement; live owners still fail closed.
-			if (!holder.#disposed) return false;
+			// A manager remains the endpoint owner until all authority retained
+			// past its disposal deadline has physically settled. Logical shutdown
+			// alone must not admit a replacement while late callbacks can still run.
+			if (!holder.#disposed || !holder.#disposalSettled) return false;
 			AsyncJobManager.#byEndpoint.delete(endpointId);
 		}
 		AsyncJobManager.#byEndpoint.set(endpointId, manager);
@@ -631,7 +632,7 @@ export class AsyncJobManager {
 		if (AsyncJobManager.#byEndpoint.get(predecessorEndpointId) !== manager) return true;
 		const successorOwner = AsyncJobManager.#byEndpoint.get(successorEndpointId);
 		if (successorOwner !== undefined && successorOwner !== manager) {
-			if (!successorOwner.#disposed) return false;
+			if (!successorOwner.#disposed || !successorOwner.#disposalSettled) return false;
 			AsyncJobManager.#byEndpoint.delete(successorEndpointId);
 		}
 		AsyncJobManager.#byEndpoint.delete(predecessorEndpointId);
@@ -687,6 +688,8 @@ export class AsyncJobManager {
 	readonly #maxDeadLetterOverflowOwners: number;
 	#deliveryLoop: Promise<void> | undefined;
 	#disposed = false;
+	/** Set only after all authority retained past a disposal deadline settles. */
+	#disposalSettled = false;
 	#runningOwnerCleanups = false;
 	readonly #subagentRecords = new Map<string, SubagentRecord>();
 	readonly #terminalEvents = new Map<string, TerminalEvent>();
@@ -2886,6 +2889,7 @@ export class AsyncJobManager {
 		this.#changeListeners.clear();
 		this.#foldListeners.clear();
 		const releaseEndpointOwnership = (): void => {
+			this.#disposalSettled = true;
 			AsyncJobManager.unregisterManager(this);
 			if (AsyncJobManager.instance() === this) AsyncJobManager.setInstance(undefined);
 		};

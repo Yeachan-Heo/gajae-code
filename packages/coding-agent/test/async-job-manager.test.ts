@@ -802,6 +802,81 @@ describe("AsyncJobManager", () => {
 		}
 	});
 
+	test("retains endpoint ownership until timed-out disposal authority settles", async () => {
+		const releaseJob = Promise.withResolvers<string>();
+		const manager = new AsyncJobManager({ onJobComplete: async () => {} });
+		const replacement = new AsyncJobManager({ onJobComplete: async () => {} });
+		const endpointId = "retained-disposal-endpoint";
+		try {
+			expect(AsyncJobManager.registerForEndpoint(endpointId, manager)).toBe(true);
+			manager.register("task", "retained job", () => releaseJob.promise, { id: "retained-disposal-job" });
+
+			expect(await manager.dispose({ timeoutMs: 25 })).toBe(false);
+			// Logical shutdown has completed, but the job's promise still gives the
+			// old manager authority to run late cleanup under this endpoint.
+			expect(AsyncJobManager.forEndpoint(endpointId)).toBe(manager);
+			expect(AsyncJobManager.registerForEndpoint(endpointId, replacement)).toBe(false);
+			expect(AsyncJobManager.forEndpoint(endpointId)).toBe(manager);
+
+			releaseJob.resolve("late completion");
+			await manager.awaitRetainedDisposalCompletion();
+			expect(AsyncJobManager.forEndpoint(endpointId)).toBeUndefined();
+			expect(AsyncJobManager.registerForEndpoint(endpointId, replacement)).toBe(true);
+			expect(AsyncJobManager.forEndpoint(endpointId)).toBe(replacement);
+		} finally {
+			releaseJob.resolve("late completion");
+			await replacement.dispose({ timeoutMs: 100 });
+			AsyncJobManager.unregisterManager(manager);
+			AsyncJobManager.unregisterManager(replacement);
+		}
+	});
+
+	test("releases endpoint ownership immediately after fully drained disposal", async () => {
+		const manager = new AsyncJobManager({ onJobComplete: async () => {} });
+		const replacement = new AsyncJobManager({ onJobComplete: async () => {} });
+		const endpointId = "drained-disposal-endpoint";
+		try {
+			expect(AsyncJobManager.registerForEndpoint(endpointId, manager)).toBe(true);
+			expect(await manager.dispose({ timeoutMs: 100 })).toBe(true);
+			expect(AsyncJobManager.forEndpoint(endpointId)).toBeUndefined();
+			expect(AsyncJobManager.registerForEndpoint(endpointId, replacement)).toBe(true);
+			expect(AsyncJobManager.forEndpoint(endpointId)).toBe(replacement);
+		} finally {
+			await replacement.dispose({ timeoutMs: 100 });
+			AsyncJobManager.unregisterManager(manager);
+			AsyncJobManager.unregisterManager(replacement);
+		}
+	});
+
+	test("rekeyForEndpoint rejects a retained foreign successor owner", async () => {
+		const releaseJob = Promise.withResolvers<string>();
+		const manager = new AsyncJobManager({ onJobComplete: async () => {} });
+		const retained = new AsyncJobManager({ onJobComplete: async () => {} });
+		try {
+			expect(AsyncJobManager.registerForEndpoint("rekey-predecessor", manager)).toBe(true);
+			expect(AsyncJobManager.registerForEndpoint("rekey-successor", retained)).toBe(true);
+			retained.register("task", "retained successor job", () => releaseJob.promise, {
+				id: "retained-successor-job",
+			});
+
+			expect(await retained.dispose({ timeoutMs: 25 })).toBe(false);
+			expect(AsyncJobManager.rekeyForEndpoint("rekey-predecessor", "rekey-successor", manager)).toBe(false);
+			expect(AsyncJobManager.endpointIdOf(manager)).toBe("rekey-predecessor");
+			expect(AsyncJobManager.forEndpoint("rekey-successor")).toBe(retained);
+
+			releaseJob.resolve("late completion");
+			await retained.awaitRetainedDisposalCompletion();
+			expect(AsyncJobManager.rekeyForEndpoint("rekey-predecessor", "rekey-successor", manager)).toBe(true);
+			expect(AsyncJobManager.endpointIdOf(manager)).toBe("rekey-successor");
+		} finally {
+			releaseJob.resolve("late completion");
+			await manager.dispose({ timeoutMs: 100 });
+			await retained.awaitRetainedDisposalCompletion();
+			AsyncJobManager.unregisterManager(manager);
+			AsyncJobManager.unregisterManager(retained);
+		}
+	});
+
 	test("resetForTests clears endpoint registrations with the global instance", () => {
 		const manager = new AsyncJobManager({ onJobComplete: async () => {} });
 		AsyncJobManager.setInstance(manager);
