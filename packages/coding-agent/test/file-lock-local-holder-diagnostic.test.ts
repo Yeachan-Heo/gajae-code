@@ -111,19 +111,26 @@ test("reports a local dead holder as dead but not reaped instead of unknown from
 	const lockDir = `${filePath}.lock`;
 	const owner = await exitedOwner();
 	await publishHolder(lockDir, { ...owner, start_time_format: "utc-v1", owner_host_id: "this-host" });
-	// A local dead owner is normally reclaimed within milliseconds; exhaustion is only
-	// reachable when the host refuses to reap the directory, which is exactly the state
-	// the diagnostic exists to describe. Refuse removal for this lock only.
+	// A local dead owner is stale on liveness alone — the stale threshold never enters the
+	// verdict — so it is normally reclaimed on the first retry. Exhaustion is reachable only
+	// when the host refuses to reap the directory, which is exactly the state the diagnostic
+	// exists to describe. Refuse removal for this lock only.
+	let refusals = 0;
 	FileLockTestHooks.nativeQuarantineBindings = () => ({
 		snapshotDirectoryTree,
-		exactRemoveDirectoryTree: (target, snapshot, parentIdentity, detachOnly) =>
-			path.resolve(target) === path.resolve(lockDir)
-				? { ok: false, code: "cleanup_refused" }
-				: exactRemoveDirectoryTree(target, snapshot, parentIdentity, detachOnly),
+		exactRemoveDirectoryTree: (target, snapshot, parentIdentity, detachOnly) => {
+			if (path.resolve(target) !== path.resolve(lockDir))
+				return exactRemoveDirectoryTree(target, snapshot, parentIdentity, detachOnly);
+			refusals++;
+			return { ok: false, code: "cleanup_refused" };
+		},
 	});
 
 	const holder = await holderAtExhaustion(filePath, { ownerHostId: "this-host" });
 
+	// The reclamation path really did judge this dead local owner stale and try to reap it:
+	// without the refusal the lock would have been acquired instead of exhausting.
+	expect(refusals).toBeGreaterThan(0);
 	expect(holder).toContain(`pid ${owner.pid}`);
 	expect(holder).toContain("dead but not reaped");
 	expect(holder).not.toContain(FOREIGN_PHRASE);
