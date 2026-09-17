@@ -5350,27 +5350,36 @@ export function createNotificationsExtension(
 		 * already writing, which is exactly the mid-`apply_patch` kill this fix
 		 * exists to prevent.
 		 *
-		 * The late fanout stays for observability and still drives
-		 * `toolIdleWaiters`, but it is no longer the authority: it may only ADD to
-		 * the ledger's answer. Waiting a bounded grace on a call the ledger already
-		 * released is harmless; reporting idle while the ledger says a tool is
-		 * running is the bug. When the seam is unavailable — an older host, no
-		 * execution handle bound yet, or an unknown run — this degrades to the
-		 * event-derived set alone, i.e. exactly today's behaviour and never worse.
+		 * So whenever the ledger can be read it is the SOLE authority, and a read
+		 * that comes back empty means empty. The fanout is wrong in both
+		 * directions, not one: ledger-running/event-idle must not report idle (the
+		 * mid-`apply_patch` kill above), and ledger-empty/event-running must not
+		 * report pending — the same asynchrony that delays a start also delays an
+		 * end, so a `tool_execution_end` stuck behind another extension would
+		 * otherwise burn the whole grace and record a forced mid-tool kill for a
+		 * call that had already returned.
+		 *
+		 * The fanout stays for observability and still wakes `toolIdleWaiters`, but
+		 * it is the pending authority only when the ledger cannot be consulted: an
+		 * older host without the seam, no execution handle bound yet, or a read
+		 * that threw. That fallback is exactly the pre-ledger behaviour and never
+		 * worse.
 		 */
 		const pendingToolCallIdsFor = (submission: PromptSubmission): string[] => {
-			const ids = new Set(submission.runningToolCallIds);
 			const handle = submission.executionHandle;
 			const readLedger = terminalAbortSeams?.pendingToolExecutions;
 			if (handle && readLedger)
 				try {
-					for (const id of readLedger(handle)) ids.add(id);
+					// Materialized inside the `try` so only a COMPLETED read wins; a read
+					// that succeeds with no entries still answers "nothing is running",
+					// which is the whole point of preferring it over the stale fanout.
+					return [...readLedger(handle)];
 				} catch (error) {
 					// A seam failure must never disable the deadline or extend it
 					// unboundedly; fall back to the event-derived set for this attempt.
 					logger.warn(`sdk: pending tool execution seam failed: ${String(error)}`);
 				}
-			return [...ids];
+			return [...submission.runningToolCallIds];
 		};
 		/** Resolves once no dispatched tool call is executing for this submission. */
 		const whenPromptToolsIdle = (submission: PromptSubmission): Promise<void> => {
