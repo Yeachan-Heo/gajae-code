@@ -134,15 +134,29 @@ export const OPERATOR_UPSTREAM_SUFFIX = ": the model provider ended this turn, n
 export const OPERATOR_POST_START_PREFIX = "The turn ended after execution had already started.";
 
 /**
- * Budgets for the capture. `#settlePrompt` runs this SYNCHRONOUSLY before it rejects the turn, so
- * an unbounded git invocation blocks the Bun event loop and delays the very terminal this exists to
- * make safe. `execFileSync` honours both of these for real on this runtime (a `timeout` overrun
- * throws `ETIMEDOUT` after SIGKILL; a `maxBuffer` overrun throws `ENOBUFS`), so they are enforcement
- * rather than decoration.
+ * Budgets for the capture. `#settlePrompt` runs this SYNCHRONOUSLY before it rejects the turn, so a
+ * slow git invocation blocks the Bun event loop and delays the very terminal this exists to make
+ * safe. `execFileSync` enforces both for real on this runtime: a `timeout` overrun throws
+ * `ETIMEDOUT` after SIGKILL, a `maxBuffer` overrun throws `ENOBUFS`.
+ *
+ * `PRESERVE_BUDGET_MS` is the WHOLE-capture wall, and the per-command cap alone cannot enforce it:
+ * the dirty path runs up to six git children, so six independent 2s caps admit ~12s. Each spawn is
+ * therefore given `min(GIT_COMMAND_TIMEOUT_MS, deadline - now)` — see {@link boundedGit} — which
+ * bounds the total at the wall plus at most one command's scheduling grace.
  */
 const GIT_COMMAND_TIMEOUT_MS = 2_000;
 const GIT_OUTPUT_MAX_BYTES = 1_000_000;
 const PRESERVE_BUDGET_MS = 5_000;
+/**
+ * Below this much remaining budget, do not spawn at all.
+ *
+ * Not a nicety — it is the only safe handling of the tail. `execFileSync` treats `timeout: 0` as
+ * UNBOUNDED (measured: `timeout: 0` against `sleep 3` completed in 3013ms), so a naive
+ * `Math.min(cap, remaining)` would make the worst case — no budget left — strictly worse than having
+ * no deadline at all. A negative throws `ERR_OUT_OF_RANGE` synchronously out of `execFileSync`, which
+ * would escape as an exception rather than degrade. Skipping the spawn is the only correct tail.
+ */
+const MIN_SPAWN_BUDGET_MS = 50;
 
 /** This is the ACP settle path, not the harness vanish path; the stash list records which. */
 const STASH_MESSAGE = "gjc-post-start-snapshot";
@@ -164,15 +178,39 @@ export interface WorktreeCapture {
 /** Injectable capture seam; production uses {@link boundedWorktreeCapture}. */
 export type WorktreeCaptureFn = (workspace: string) => WorktreeCapture;
 
-function gitRun(workspace: string, args: string[]): string {
-	return execFileSync("git", args, {
-		cwd: workspace,
-		encoding: "utf8",
-		stdio: ["ignore", "pipe", "ignore"],
-		timeout: GIT_COMMAND_TIMEOUT_MS,
-		maxBuffer: GIT_OUTPUT_MAX_BYTES,
-		killSignal: "SIGKILL",
-	});
+/** A git runner already bound to one capture's workspace and deadline. */
+type BoundedGit = (args: string[]) => string;
+
+/**
+ * Raised instead of spawning when the whole-capture deadline leaves no usable room.
+ *
+ * Deliberately an exception: every call site already treats a git failure as "git did not answer"
+ * and degrades accordingly, so budget exhaustion lands in exactly the right branch without any
+ * caller needing a second code path. It carries no `status`, so `isPlainExit` rejects it and it can
+ * never be mistaken for git answering.
+ */
+class CaptureBudgetExhausted extends Error {}
+
+/**
+ * Bind a git runner to one capture, so the remaining budget travels with every child it spawns.
+ *
+ * The deadline is a closure parameter rather than module state on purpose: two concurrent captures
+ * must not share, or reset, each other's wall.
+ */
+function boundedGit(workspace: string, deadline: number): BoundedGit {
+	return (args: string[]): string => {
+		const remaining = deadline - Date.now();
+		// Never pass 0 (unbounded) or a negative (throws ERR_OUT_OF_RANGE) to `execFileSync`.
+		if (remaining < MIN_SPAWN_BUDGET_MS) throw new CaptureBudgetExhausted();
+		return execFileSync("git", args, {
+			cwd: workspace,
+			encoding: "utf8",
+			stdio: ["ignore", "pipe", "ignore"],
+			timeout: Math.min(GIT_COMMAND_TIMEOUT_MS, remaining),
+			maxBuffer: GIT_OUTPUT_MAX_BYTES,
+			killSignal: "SIGKILL",
+		});
+	};
 }
 
 /**
@@ -213,17 +251,19 @@ interface WorktreeObservation {
  * change, exit 1 = dirty, anything else = git did not answer. A worktree emitting more untracked
  * paths than the output cap is emphatically not clean, so a truncated read is a non-answer too.
  */
-function observeWorktree(workspace: string): WorktreeObservation | undefined {
+function observeWorktree(git: BoundedGit): WorktreeObservation | undefined {
 	let trackedDirty: boolean;
 	try {
-		gitRun(workspace, ["diff", "--quiet", "HEAD"]);
+		git(["diff", "--quiet", "HEAD"]);
 		trackedDirty = false;
 	} catch (error) {
+		// Covers budget exhaustion too: `CaptureBudgetExhausted` carries no `status`, so it is not a
+		// plain exit and the observation degrades to "git did not answer" — never to `clean`.
 		if (!isPlainExit(error, 1)) return undefined;
 		trackedDirty = true;
 	}
 	try {
-		const untracked = gitRun(workspace, ["ls-files", "--others", "--exclude-standard"])
+		const untracked = git(["ls-files", "--others", "--exclude-standard"])
 			.split("\n")
 			.map(line => line.trim())
 			.filter(Boolean).length;
@@ -247,32 +287,33 @@ function observeWorktree(workspace: string): WorktreeObservation | undefined {
  * spawn failure, `ETIMEDOUT`, `ENOBUFS` — is git not answering at all, and an unverifiable fence must
  * never promote a result to complete.
  */
-function trackedMatchesSnapshot(workspace: string, stashRef: string | undefined, overBudget: () => boolean): boolean {
+function trackedMatchesSnapshot(git: BoundedGit, stashRef: string | undefined): boolean {
 	// No stash object means there is no tree to fence against, so stability cannot be established.
 	if (stashRef === undefined) return false;
-	if (overBudget()) return false;
 	try {
-		gitRun(workspace, ["diff", "--quiet", stashRef]);
+		git(["diff", "--quiet", stashRef]);
 		return true;
 	} catch {
+		// Includes "no budget left to run the fence", which is not verification either.
 		return false;
 	}
 }
 
 export function boundedWorktreeCapture(workspace: string): WorktreeCapture {
-	const deadline = Date.now() + PRESERVE_BUDGET_MS;
-	const overBudget = (): boolean => Date.now() > deadline;
+	// One deadline for the whole capture, carried by the runner into every child it spawns. Each
+	// spawn is capped at the smaller of the per-command cap and what is left, and a spawn with no
+	// room left is skipped rather than started, so the boundary checks this used to do between
+	// commands are now enforced at every spawn instead of only at a few points.
+	const git = boundedGit(workspace, Date.now() + PRESERVE_BUDGET_MS);
 	const unknown: WorktreeCapture = { status: "unknown", untrackedNotCaptured: 0 };
 
 	// 1. Observe the worktree.
-	if (overBudget()) return unknown;
-	const before = observeWorktree(workspace);
+	const before = observeWorktree(git);
 	if (before === undefined) return unknown;
 
 	// 2. Verified empty — but only if it is STILL empty once re-read. Nothing is stashed either way.
 	if (!before.trackedDirty && before.untracked === 0) {
-		if (overBudget()) return unknown;
-		const after = observeWorktree(workspace);
+		const after = observeWorktree(git);
 		// Cannot re-read, or it changed: either way "verified empty" is no longer a claim anyone can
 		// make, and asserting it would strand whatever landed. Downgrade to `unknown`, never `clean`.
 		if (after === undefined || after.trackedDirty || after.untracked !== 0) return unknown;
@@ -296,8 +337,8 @@ export function boundedWorktreeCapture(workspace: string): WorktreeCapture {
 	 */
 	const settle = (stashRef: string | undefined): WorktreeCapture => {
 		// Fence first, so it runs as close to the capture as the budget allows.
-		const trackedStable = trackedMatchesSnapshot(workspace, stashRef, overBudget);
-		const after = overBudget() ? undefined : observeWorktree(workspace);
+		const trackedStable = trackedMatchesSnapshot(git, stashRef);
+		const after = observeWorktree(git);
 		const untrackedStable = after !== undefined && after.untracked === before.untracked;
 		const untrackedNotCaptured = Math.max(before.untracked, after?.untracked ?? before.untracked);
 		return {
@@ -314,18 +355,17 @@ export function boundedWorktreeCapture(workspace: string): WorktreeCapture {
 
 	// 4. Snapshot the tracked content. A failure here means no recoverable ref — still `preserved`,
 	//    because the tree IS known dirty, just not recoverable from the stash list.
-	if (overBudget()) return settle(undefined);
 	let oid: string;
 	try {
-		oid = gitRun(workspace, ["stash", "create", STASH_MESSAGE]).trim();
+		oid = git(["stash", "create", STASH_MESSAGE]).trim();
 	} catch {
+		// Failed, timed out, or no budget left to start: still `preserved`, just no ref.
 		return settle(undefined);
 	}
 	if (oid.length === 0) return settle(undefined);
 
-	if (overBudget()) return settle(undefined);
 	try {
-		gitRun(workspace, ["stash", "store", "-m", STASH_MESSAGE, oid]);
+		git(["stash", "store", "-m", STASH_MESSAGE, oid]);
 	} catch {
 		// The object exists but nothing references it, so it is not durably recoverable.
 		return settle(undefined);

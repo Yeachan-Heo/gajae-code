@@ -21,7 +21,7 @@
  */
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { execFileSync } from "node:child_process";
-import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { RequestError } from "@agentclientprotocol/sdk";
@@ -328,6 +328,61 @@ describe("post-start terminal preserves the worktree before reporting failure (i
 		// Never a path: this crosses the wire.
 		expect(message).not.toContain("src.ts");
 	});
+
+	// REGRESSION (round-4 review finding 2): PRESERVE_BUDGET_MS was advertised as a whole-capture
+	// wall, but each git child carried its own independent GIT_COMMAND_TIMEOUT_MS and the budget was
+	// only consulted BETWEEN commands. The dirty path runs up to six children, so a uniformly slow
+	// git blocked `#settlePrompt` — and the Bun event loop with it — for far longer than the wall.
+	//
+	// Driven through the real `boundedWorktreeCapture` with a PATH shim that makes EVERY git call
+	// slow. An injected `WorktreeCaptureFn` could not test this: the budget lives in the code being
+	// replaced. The assertion is the classification plus a wall bound with real headroom — the point
+	// is that the capture can no longer run long past its budget, not a tight stopwatch.
+	it("keeps the whole capture inside its budget when every git call is slow", async () => {
+		await writeFile(path.join(ws, "src.ts"), "export const v = 2;\n");
+		// Resolve the REAL git before PATH is touched, so the shim can exec it.
+		const realGit = execFileSync("which", ["git"], { encoding: "utf8" }).trim();
+		const shimDir = path.join(ws, ".gjc-shim");
+		await mkdir(shimDir, { recursive: true });
+		await writeFile(
+			path.join(shimDir, "git"),
+			["#!/bin/sh", 'sleep "${GJC_GIT_DELAY:-0}"', `exec ${realGit} "$@"`, ""].join("\n"),
+		);
+		await chmod(path.join(shimDir, "git"), 0o755);
+
+		const originalPath = process.env.PATH;
+		const originalDelay = process.env.GJC_GIT_DELAY;
+		let elapsed = Number.NaN;
+		let preservation: PostStartPreservation | undefined;
+		try {
+			process.env.PATH = `${shimDir}:${originalPath ?? ""}`;
+			// Slow enough that six serial calls would run far past the 5s wall, but under the
+			// per-command cap so each call would otherwise SUCCEED rather than time out.
+			process.env.GJC_GIT_DELAY = "1.5";
+			const started = Date.now();
+			preservation = preservePostStartWork(ws);
+			elapsed = Date.now() - started;
+		} finally {
+			process.env.PATH = originalPath;
+			if (originalDelay === undefined) delete process.env.GJC_GIT_DELAY;
+			else process.env.GJC_GIT_DELAY = originalDelay;
+		}
+		// The environment is restored for every later test in this file.
+		expect(process.env.PATH).toBe(originalPath);
+		expect(process.env.GJC_GIT_DELAY).toBe(originalDelay);
+
+		// Bounded: the wall plus at most one command's grace. Without the deadline threaded into
+		// each child this same shim runs ~10s+, so the headroom here is large and still decisive.
+		expect(elapsed).toBeLessThan(7_500);
+
+		// Whatever it managed, the classification must stay honest: the tree IS dirty, so it may
+		// never be called clean, and nothing it half-captured may be called complete.
+		expect(["preserved", "unknown"]).toContain(preservation?.status);
+		expect(preservation?.snapshotComplete).toBe(false);
+		const message = postStartOperatorMessage({ category: "agent_runtime", preservation });
+		expect(message).toContain("do not discard this worktree");
+		expect(message).not.toContain("No uncommitted work was found");
+	}, 30_000);
 
 	it("still reports a stable capture as complete, with no race wording", async () => {
 		// The control for the case above: without it, a blanket "always incomplete" regression passes.
