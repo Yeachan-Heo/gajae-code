@@ -97,14 +97,22 @@ describe("post-start terminal preserves the worktree before reporting failure (i
 		expect(await readFile(path.join(ws, "new-module.ts"), "utf8")).toBe("export const added = true;\n");
 		expect(git(ws, ["status", "--porcelain"])).toBe(before);
 		// And the snapshot is genuinely recoverable after the worktree is swept.
-		expect(git(ws, ["stash", "list"])).toContain("harness-vanish-snapshot");
+		expect(git(ws, ["stash", "list"])).toContain("gjc-post-start-snapshot");
 		expect(git(ws, ["rev-parse", "stash@{0}"]).trim()).toBe(preservation?.stashRef ?? "<none>");
 		expect(git(ws, ["show", `${preservation?.stashRef}:src.ts`])).toBe("export const v = 2; // an hour of work\n");
 	});
 
-	it("does not stash-spam a clean tree", () => {
-		expect(preservePostStartWork(ws)).toBeUndefined();
+	it("reports a verified clean tree as clean, and does not stash-spam it", () => {
+		const preservation = preservePostStartWork(ws);
+
+		expect(preservation.status).toBe("clean");
+		expect(preservation.snapshotComplete).toBe(true);
+		expect(preservation.stashRef).toBeUndefined();
 		expect(git(ws, ["stash", "list"]).trim()).toBe("");
+		// The original wording survives for the case it was always true for.
+		expect(postStartOperatorMessage({ category: "agent_runtime", preservation })).toContain(
+			"No uncommitted work was found to preserve.",
+		);
 	});
 
 	// This is the load-bearing test for the whole "fix the promise, not the capture" decision. If
@@ -135,7 +143,7 @@ describe("post-start terminal preserves the worktree before reporting failure (i
 		const message = postStartOperatorMessage({
 			category: "provider_transport",
 			providerCode: "server_is_overloaded",
-			...(preservation === undefined ? {} : { preservation }),
+			preservation,
 		});
 
 		// The tracked half of the promise is true, so the recovery hint stays.
@@ -161,7 +169,7 @@ describe("post-start terminal preserves the worktree before reporting failure (i
 		const message = postStartOperatorMessage({
 			category: "provider_transport",
 			providerCode: "server_is_overloaded",
-			...(preservation === undefined ? {} : { preservation }),
+			preservation,
 		});
 
 		expect(message).toContain(`git stash apply ${preservation?.stashRef}`);
@@ -177,21 +185,103 @@ describe("post-start terminal preserves the worktree before reporting failure (i
 			expect(
 				postStartOperatorMessage({
 					category: "provider_transport",
-					preservation: { stashRef: "c".repeat(40), snapshotComplete: true, untrackedNotCaptured: bad },
+					preservation: {
+						status: "preserved",
+						stashRef: "c".repeat(40),
+						snapshotComplete: true,
+						untrackedNotCaptured: bad,
+					},
 				}),
 			).not.toContain("NOT in that snapshot");
 	});
 
-	it("is fail-safe: preservation throwing or the path being unusable never changes the outcome", () => {
+	// REGRESSION (review finding 1): an uninspectable worktree used to return the same bare
+	// `undefined` as a verified-clean one, so the operator was told "No uncommitted work was found
+	// to preserve." for a tree nobody had managed to look at — and swept it.
+	it("reports an uninspectable worktree as unknown, never as clean", () => {
 		const thrower = (): never => {
 			throw new Error("git is gone");
 		};
+		// Still fail-safe: it reports, it does not throw.
 		expect(() => preservePostStartWork(ws, thrower)).not.toThrow();
-		expect(preservePostStartWork(ws, thrower)).toBeUndefined();
-		// Not a git repo, and no path at all.
-		expect(preservePostStartWork(path.join(tmpdir(), "gjc-5664-absent-dir"))).toBeUndefined();
-		expect(preservePostStartWork(undefined)).toBeUndefined();
-		expect(preservePostStartWork("")).toBeUndefined();
+
+		for (const [label, preservation] of [
+			["capture threw", preservePostStartWork(ws, thrower)],
+			["not a git repo", preservePostStartWork(path.join(tmpdir(), "gjc-5664-absent-dir"))],
+			["no workspace", preservePostStartWork(undefined)],
+			["empty workspace", preservePostStartWork("")],
+		] as const) {
+			expect({ label, status: preservation.status }).toEqual({ label, status: "unknown" });
+			expect({ label, complete: preservation.snapshotComplete }).toEqual({ label, complete: false });
+		}
+
+		const message = postStartOperatorMessage({
+			category: "agent_runtime",
+			preservation: { status: "unknown", snapshotComplete: false },
+		});
+
+		// The exact conflation that was wrong: absence of evidence reported as evidence of absence.
+		expect(message).not.toContain("No uncommitted work was found");
+		expect(message).toContain("could not be verified or preserved");
+		expect(message).toContain("do not discard this worktree");
+	});
+
+	// REGRESSION (review finding 2): the capture runs synchronously inside `#settlePrompt`, before
+	// the rejection. A capture that hangs or overruns its budget must degrade to `unknown` rather
+	// than delaying — or changing — the terminal outcome. Driven through the injected seam so this
+	// asserts the RESULT and never races a wall clock.
+	it("degrades to unknown when the capture exceeds its budget or the git call times out", () => {
+		const timedOut = (): never => {
+			// The shape `execFileSync` throws on a `timeout` overrun: SIGKILLed, string `code`.
+			throw Object.assign(new Error("spawnSync git ETIMEDOUT"), {
+				code: "ETIMEDOUT",
+				signal: "SIGKILL",
+				status: null,
+			});
+		};
+		const bufferBlown = (): never => {
+			throw Object.assign(new Error("spawnSync git ENOBUFS"), { code: "ENOBUFS", status: null });
+		};
+
+		for (const [label, seam] of [
+			["git timed out", timedOut],
+			["output cap blown", bufferBlown],
+			["budget overrun", () => ({ status: "unknown", untrackedNotCaptured: 0 }) as const],
+		] as const) {
+			const preservation = preservePostStartWork(ws, seam);
+			expect({ label, status: preservation.status }).toEqual({ label, status: "unknown" });
+			// A killed git is NOT evidence the tree was empty.
+			expect({ label, complete: preservation.snapshotComplete }).toEqual({ label, complete: false });
+		}
+	});
+
+	it("never reads untracked file contents, and still counts them", async () => {
+		await writeFile(path.join(ws, "src.ts"), "export const v = 2;\n");
+		await writeFile(path.join(ws, "secret-blob.ts"), "x".repeat(200_000));
+
+		const preservation = preservePostStartWork(ws);
+
+		expect(preservation.status).toBe("preserved");
+		expect(preservation.untrackedNotCaptured).toBe(1);
+		expect(preservation.snapshotComplete).toBe(false);
+
+		const message = postStartOperatorMessage({ category: "provider_transport", preservation });
+		// The count travels; the name and the contents never do.
+		expect(message).toContain("1 new file(s) are NOT in that snapshot");
+		expect(message).not.toContain("secret-blob.ts");
+		expect(message).not.toContain("xxxx");
+	});
+
+	it("reads a malformed or missing status as unknown rather than clean", () => {
+		// Mirrors the malformed-count case: this type is reachable with any value, and the
+		// conservative default is the one that cannot cost an operator their work.
+		for (const bad of [undefined, null, "CLEAN", "preserved ", 0, {}, "unknown"])
+			expect(
+				postStartOperatorMessage({
+					category: "agent_runtime",
+					preservation: { status: bad as never, snapshotComplete: true },
+				}),
+			).toContain("could not be verified or preserved");
 	});
 });
 
@@ -222,7 +312,9 @@ describe("post-start terminal wording names the upstream provider (issue #5664)"
 	});
 
 	it("keeps -32603 and the redacted message for the prompt-failure class", () => {
-		const failure = acpRequestFailure(overloadFailure({ stashRef: "a".repeat(40), snapshotComplete: true }));
+		const failure = acpRequestFailure(
+			overloadFailure({ status: "preserved", stashRef: "a".repeat(40), snapshotComplete: true }),
+		);
 
 		expect((failure as RequestError).code).toBe(-32603);
 		expect((failure as Error).message).toBe("Internal error: Provider failure after execution started.");
@@ -238,7 +330,7 @@ describe("post-start terminal wording names the upstream provider (issue #5664)"
 				phase: "post_start",
 				evidence: {},
 			}),
-			{ stashRef: "not-a-hex-oid; rm -rf /", snapshotComplete: true },
+			{ status: "preserved", stashRef: "not-a-hex-oid; rm -rf /", snapshotComplete: true },
 		);
 		const serialized = JSON.stringify(acpRequestFailure(failure));
 
@@ -274,7 +366,7 @@ describe("post-start terminal wording names the upstream provider (issue #5664)"
 		const message = postStartOperatorMessage({
 			category: "provider_transport",
 			providerCode: "server_is_overloaded",
-			preservation: { snapshotComplete: false },
+			preservation: { status: "preserved", snapshotComplete: false },
 		});
 
 		expect(message).toContain("no recoverable snapshot ref is available");
@@ -287,7 +379,7 @@ describe("post-start terminal wording names the upstream provider (issue #5664)"
 		// that failure; the upstream-provider wording is gated on the category, so it does not.
 		const message = postStartOperatorMessage({
 			category: "agent_runtime",
-			preservation: { stashRef: "b".repeat(40), snapshotComplete: true },
+			preservation: { status: "preserved", stashRef: "b".repeat(40), snapshotComplete: true },
 		});
 
 		expect(message).toContain("The turn ended after execution had already started.");
