@@ -178,6 +178,34 @@ describe("post-start terminal preserves the worktree before reporting failure (i
 		expect(message).not.toContain("snapshot is incomplete");
 	});
 
+	// REGRESSION (round-3 review finding 1): `#settlePrompt` leaves `preservation` undefined for any
+	// failure whose phase is not `post_start`, so a submission-phase transport rejection reached the
+	// wording with nothing captured — and was told its worktree had been checked and found empty.
+	// No inspection ever happened. The base emitted no such sentence.
+	it("asserts nothing about the worktree when no capture was attempted", () => {
+		const message = postStartOperatorMessage({
+			category: "provider_transport",
+			providerCode: "server_is_overloaded",
+		});
+
+		expect(message).toContain("Upstream provider failure");
+		expect(message).not.toContain("No uncommitted work was found to preserve.");
+		// Nothing was inspected, so nothing is claimed in either direction.
+		expect(message).not.toContain("do not discard this worktree");
+		expect(message).not.toContain("could not be verified");
+	});
+
+	it("still says nothing was found for a capture that verified the tree is clean", () => {
+		// The control for the case above: without it, deleting the sentence everywhere would pass.
+		const message = postStartOperatorMessage({
+			category: "provider_transport",
+			providerCode: "server_is_overloaded",
+			preservation: { status: "clean", snapshotComplete: true },
+		});
+
+		expect(message).toContain("No uncommitted work was found to preserve.");
+	});
+
 	it("reads a malformed uncaptured count as zero rather than letting it reach the operator", () => {
 		// `PostStartPreservation` is reachable with any value, so the count is bounded the same way
 		// `safeStashRef` bounds the ref.

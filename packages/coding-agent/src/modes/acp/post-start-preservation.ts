@@ -292,10 +292,16 @@ export function postStartOperatorMessage(input: {
 		parts.push(`${OPERATOR_UPSTREAM_LABEL}${code}${OPERATOR_UPSTREAM_SUFFIX}`);
 	} else parts.push(OPERATOR_POST_START_PREFIX);
 
-	// A submission-phase rejection never ran, so it carries no preservation at all.
+	// A rejection that never reached execution carries no preservation at all, because
+	// `#settlePrompt` only captures for a `post_start` phase. Say NOTHING about the worktree in that
+	// case: no inspection happened, so "no uncommitted work was found" would assert a check that was
+	// never run — the same absence-of-evidence-as-evidence-of-absence error as reporting an
+	// uninspectable tree clean. The upstream sentence alone is the whole message.
 	const status = preservation === undefined ? undefined : preservationStatus(preservation.status);
 	const ref = preservation === undefined ? undefined : safeStashRef(preservation.stashRef);
-	if (preservation === undefined || status === "clean") parts.push(OPERATOR_NOTHING_TO_PRESERVE);
+	if (preservation === undefined) {
+		// Deliberately no preservation sentence.
+	} else if (status === "clean") parts.push(OPERATOR_NOTHING_TO_PRESERVE);
 	else if (status === "unknown")
 		// Never "no work was found": nobody established that. The operator must keep the worktree
 		// precisely BECAUSE the answer is unknown.
