@@ -5772,6 +5772,148 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 		}
 	});
 
+	/** Frames broadcast for one correlation, in publication order. */
+	const correlatedFrames = (harness: InvocationHarness, correlation: { commandId?: string; turnId?: string }) =>
+		harness.broadcasts.filter(frame => {
+			const payload = frame.payload as { commandId?: string; turnId?: string } | undefined;
+			return payload?.commandId === correlation.commandId && payload?.turnId === correlation.turnId;
+		});
+
+	/** Waits for a bounded horizon until the correlated frames satisfy `ready`. */
+	const awaitCorrelatedFrames = async (
+		harness: InvocationHarness,
+		correlation: { commandId?: string; turnId?: string },
+		ready: (frames: SdkFrame[]) => boolean,
+	): Promise<void> => {
+		// Terminal frames are published only after the durable finalize resolves, so a
+		// single sample can precede them. Poll for the observable condition within a
+		// bounded horizon; the callers' deep-equality assertions still pin "exactly one".
+		const budgetEndsAt = Date.now() + 10_000;
+		while (Date.now() < budgetEndsAt && !ready(correlatedFrames(harness, correlation))) await Bun.sleep(5);
+	};
+
+	test("the deadline/agent_end overlap publishes exactly one correlated terminal boundary", async () => {
+		// Review P1: the two terminal publishers genuinely overlap. The provider
+		// agent_end handler captures its transitions synchronously and then awaits
+		// durable writes; the deadline callback fires only after its own claim/finalize
+		// awaits. Either can reach the wire first, neither can be stopped by removing
+		// lifecycle references, and noteTransition is a no-op once the record is
+		// terminal — so without a shared claim durable state records one outcome while
+		// clients receive two boundaries. Sweeping the real agent_end across the lease
+		// instant exercises BOTH orderings; whichever publisher loses must stay silent.
+		//
+		// The Bun.sleep below is the RACE DRIVER, not the sampling mechanism: every
+		// observation is a bounded poll on the durable settle plus a quiet window that
+		// proves no second frame follows.
+		const ATTEMPTS = 20;
+		const deadlineWins: number[] = [];
+		const providerWins: number[] = [];
+		for (let attempt = 0; attempt < ATTEMPTS; attempt += 1) {
+			const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-deadline-overlap-"));
+			try {
+				const harness = await invocationHarness(`deadline-overlap-${attempt}`, cwd, {
+					settings: zeroProgressSettings,
+					sendUserMessage: async (_content, options) => {
+						await options?.onPreflightAcceptCommit?.();
+						await neverSettlingPromise();
+					},
+				});
+				const accepted = await harness.control("turn.prompt", { text: "overlap" });
+				expect(accepted.ok).toBe(true);
+				const correlation = { commandId: accepted.result?.commandId, turnId: accepted.result?.turnId };
+				await harness.emit("agent_start");
+				// zeroProgressSettings leases 25ms; straddle that instant.
+				await Bun.sleep(24 + attempt * 0.25);
+				await harness.emit("agent_end", { messages: [{ role: "assistant", content: "done" }] });
+				// Both publishers have run once the durable record is terminal and a
+				// correlated boundary is on the wire; the quiet window then proves that
+				// the loser did not publish a second one behind it.
+				const settled = await settledStatus(harness, "turn.prompt_status", correlation);
+				await awaitCorrelatedFrames(harness, correlation, frames =>
+					frames.some(frame => frame.kind === "agent_end"),
+				);
+				await Bun.sleep(25);
+				const correlated = correlatedFrames(harness, correlation);
+				const boundaries = correlated.filter(frame => frame.kind === "agent_end");
+				const diagnostics = correlated.filter(frame => frame.kind === "agent_failed");
+				expect({ attempt, boundaries: boundaries.length }).toEqual({ attempt, boundaries: 1 });
+				const outcome = (boundaries[0]?.payload as { outcome?: { provenance?: string } } | undefined)?.outcome;
+				if (outcome?.provenance === "deadline") {
+					// The deadline owns the pair atomically: its correlated diagnostic and
+					// its correlated boundary reach the wire together, exactly once, and
+					// the correlation still reconciles to a single durable outcome.
+					deadlineWins.push(attempt);
+					expect({ attempt, diagnostics: diagnostics.length }).toEqual({ attempt, diagnostics: 1 });
+					expect(settled).toMatchObject({ outcome: expect.objectContaining({ kind: expect.any(String) }) });
+				} else {
+					// Control within the sweep: the ordinary provider terminal path still
+					// publishes its one boundary, and no synthetic pair trails it.
+					providerWins.push(attempt);
+					expect({ attempt, diagnostics: diagnostics.length }).toEqual({ attempt, diagnostics: 0 });
+				}
+				await harness.stop();
+			} finally {
+				await Bun.sleep(10);
+				await rm(cwd, { recursive: true, force: true });
+			}
+		}
+		// A sweep that never reached the lease instant would prove nothing.
+		expect(deadlineWins.length).toBeGreaterThan(0);
+		expect(deadlineWins.length + providerWins.length).toBe(ATTEMPTS);
+	});
+
+	test("the deadline publishes its correlated diagnostic before its correlated boundary", async () => {
+		// Ordering is part of the pair's contract: a client that matches the boundary and
+		// stops reading must never have the failure reason arrive behind it.
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-deadline-pair-order-"));
+		try {
+			const harness = await invocationHarness("deadline-pair-order", cwd, {
+				settings: zeroProgressSettings,
+				sendUserMessage: async (_content, options) => {
+					await options?.onPreflightAcceptCommit?.();
+					await neverSettlingPromise();
+				},
+			});
+			const accepted = await harness.control("turn.prompt", { text: "order" });
+			expect(accepted.ok).toBe(true);
+			const correlation = { commandId: accepted.result?.commandId, turnId: accepted.result?.turnId };
+			await harness.emit("agent_start");
+			await awaitCorrelatedFrames(
+				harness,
+				correlation,
+				frames =>
+					frames.some(frame => frame.kind === "agent_failed") && frames.some(frame => frame.kind === "agent_end"),
+			);
+			const kinds = correlatedFrames(harness, correlation)
+				.map(frame => frame.kind)
+				.filter(kind => kind === "agent_failed" || kind === "agent_end");
+			// One assertion over the indices, so an out-of-order pair cannot pass by
+			// satisfying two independent presence checks.
+			expect({
+				failedAt: kinds.indexOf("agent_failed"),
+				endAt: kinds.indexOf("agent_end"),
+				failedCount: kinds.filter(kind => kind === "agent_failed").length,
+				endCount: kinds.filter(kind => kind === "agent_end").length,
+			}).toEqual({ failedAt: 0, endAt: 1, failedCount: 1, endCount: 1 });
+
+			// Control: the ordinary terminal path still publishes exactly one boundary.
+			const control = await harness.control("turn.prompt", { text: "normal terminal" });
+			const controlCorrelation = { commandId: control.result?.commandId, turnId: control.result?.turnId };
+			await harness.emit("agent_start");
+			await harness.emit("agent_end", { messages: [{ role: "assistant", content: "done" }] });
+			expect(await settledStatus(harness, "turn.prompt_status", controlCorrelation)).toMatchObject({
+				status: "terminal_ok",
+			});
+			expect(correlatedFrames(harness, controlCorrelation).filter(frame => frame.kind === "agent_end")).toHaveLength(
+				1,
+			);
+			await harness.stop();
+		} finally {
+			await Bun.sleep(50);
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
 	test("an abort_and_prompt replacement of a zero-execution turn is also bounded", async () => {
 		// The issue observed both the original turn.prompt AND the replacement
 		// turn.abort_and_prompt accepted with permanently zero activity. Both the
