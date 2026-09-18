@@ -27,25 +27,26 @@ thread_local! {
 	static SCOPE_COLOR_CACHE: RefCell<HashMap<Scope, usize>> = RefCell::new(HashMap::with_capacity(256));
 }
 
-// Two LRU entries per calling thread protect interleaved Markdown/tool consumers.
-// Admission bounds entry count and source/output/palette bytes, NOT parser heap.
-// Expiry is lazy, sliding reuse expiry: idle allocations remain until another
-// highlight call or thread exit; this is not a ten-second deallocation deadline.
-// Ineligible inputs still take the unchanged full-color path.
+// Two LRU entries per calling thread protect interleaved Markdown/tool
+// consumers. Admission bounds entry count and source/output/palette bytes, NOT
+// parser heap. Expiry is lazy, sliding reuse expiry: idle allocations remain
+// until another highlight call or thread exit; this is not a ten-second
+// deallocation deadline. Ineligible inputs still take the unchanged full-color
+// path.
 const CHECKPOINT_ENTRIES: usize = 2;
 const CHECKPOINT_INPUT_BYTES: usize = 200_000;
 const CHECKPOINT_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
 const CHECKPOINT_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(10);
 
 struct HighlightCheckpoint {
-	code: String,
-	lang: Option<String>,
-	palette: [String; 11],
-	offset: usize,
-	output: String,
+	code:        String,
+	lang:        Option<String>,
+	palette:     [String; 11],
+	offset:      usize,
+	output:      String,
 	parse_state: ParseState,
 	scope_stack: ScopeStack,
-	created: std::time::Instant,
+	created:     std::time::Instant,
 }
 
 thread_local! {
@@ -395,7 +396,9 @@ pub fn highlight_code(code: String, lang: Option<String>, colors: HighlightColor
 	// return the original code — the same fallback used when highlighting fails.
 	if code.len() > *MAX_HIGHLIGHT_BYTES {
 		HIGHLIGHT_CHECKPOINT.with(|slot| {
-			slot.borrow_mut().retain(|entry| entry.created.elapsed() <= CHECKPOINT_MAX_AGE);
+			slot
+				.borrow_mut()
+				.retain(|entry| entry.created.elapsed() <= CHECKPOINT_MAX_AGE);
 		});
 		return code;
 	}
@@ -433,7 +436,8 @@ pub fn highlight_code(code: String, lang: Option<String>, colors: HighlightColor
 		let mut entries = slot.borrow_mut();
 		entries.retain(|entry| entry.created.elapsed() <= CHECKPOINT_MAX_AGE);
 		let index = entries.iter().rposition(|entry| {
-			eligible && entry.lang == lang
+			eligible
+				&& entry.lang == lang
 				&& entry.palette.iter().zip(palette).all(|(a, b)| a == b)
 				&& code.starts_with(&entry.code)
 		});
@@ -571,17 +575,17 @@ mod incremental_tests {
 
 	fn colors() -> HighlightColors {
 		HighlightColors {
-			comment: "\x1b[31m".into(),
-			keyword: "\x1b[32m".into(),
-			function: "\x1b[33m".into(),
-			variable: "\x1b[34m".into(),
-			string: "\x1b[35m".into(),
-			number: "\x1b[36m".into(),
-			r#type: "\x1b[91m".into(),
-			operator: "\x1b[92m".into(),
+			comment:     "\x1b[31m".into(),
+			keyword:     "\x1b[32m".into(),
+			function:    "\x1b[33m".into(),
+			variable:    "\x1b[34m".into(),
+			string:      "\x1b[35m".into(),
+			number:      "\x1b[36m".into(),
+			r#type:      "\x1b[91m".into(),
+			operator:    "\x1b[92m".into(),
 			punctuation: "\x1b[93m".into(),
-			inserted: Some("\x1b[94m".into()),
-			deleted: Some("\x1b[95m".into()),
+			inserted:    Some("\x1b[94m".into()),
+			deleted:     Some("\x1b[95m".into()),
 		}
 	}
 
@@ -603,7 +607,8 @@ mod incremental_tests {
 			{
 				let input = &code[..end];
 				let warm = highlight_code(input.into(), Some(lang.into()), colors());
-				let checkpoint = HIGHLIGHT_CHECKPOINT.with(|slot| std::mem::take(&mut *slot.borrow_mut()));
+				let checkpoint =
+					HIGHLIGHT_CHECKPOINT.with(|slot| std::mem::take(&mut *slot.borrow_mut()));
 				let cold = highlight_code(input.into(), Some(lang.into()), colors());
 				HIGHLIGHT_CHECKPOINT.with(|slot| *slot.borrow_mut() = checkpoint);
 				assert_eq!(warm, cold, "{lang} byte {end}");
