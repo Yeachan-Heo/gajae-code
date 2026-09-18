@@ -972,15 +972,27 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 				const trip = guard.takeTrip();
 				if (!trip) return;
 				repetitionTrip = { ...trip, channel };
-				// The only place the repeated unit is retained. `errorMessage` is a
-				// fixed literal because the gateway forwards it to API clients, so the
-				// sample has to stay in local diagnostics (#5627 review r5).
+				// The repeated unit is never logged. `logger`'s default transport is a
+				// rotating file under `~/.gjc/logs` and `makeLogFormat` JSON-stringifies
+				// every metadata key verbatim — no redaction — so a sample would persist
+				// raw model output to disk and carry it into log rotation, support
+				// bundles and backups. If the loop swallowed a secret or a private
+				// fragment of the prompt, that is where it would land (#5627 review r6).
+				//
+				// Only bounded metadata the model cannot control the *content* of goes
+				// out: an id, two enums and two counts. `sampleLength` is deliberately a
+				// number, not a hash — a hash of a short secret is a probe oracle and
+				// buys nothing for debugging a decode loop. `trip.sample` itself stays on
+				// the in-memory trip for callers; this is only the logging contract.
+				//
+				// Separately, `errorMessage` stays a fixed literal because the gateway
+				// forwards it to API clients (#5627 review r5). Both hold at once.
 				logger.debug("openai-completions: repetition guard tripped", {
 					model: model.id,
 					channel,
 					kind: trip.kind,
 					repeats: trip.repeats,
-					sample: trip.sample,
+					sampleLength: trip.sample.length,
 				});
 				// Deliberately no abort here — see the REPETITION_DRAIN_* constants.
 				// The main loop closes the window once late tool-call frames have had

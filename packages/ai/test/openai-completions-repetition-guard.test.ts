@@ -1,4 +1,8 @@
 import { afterEach, describe, expect, it } from "bun:test";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import { logger } from "@gajae-code/utils";
 import { streamOpenAICompletions } from "../src/providers/openai-completions";
 import { streamSimple } from "../src/stream";
 import type { AssistantMessage, Context, Model, TextContent, ThinkingContent, ToolCall } from "../src/types";
@@ -652,5 +656,99 @@ describe("chat-completions: streamed repetition guard (#5624)", () => {
 		expect(countOccurrences(thinkingText(result), SENTENCE)).toBeLessThanOrEqual(THRESHOLD);
 		expect(result.stopReason).toBe("error");
 		expect(result.errorCode).toBe(REPETITION_GUARD_ERROR_CODE);
+	});
+});
+
+/**
+ * `errorMessage` was already scrubbed for the gateway (#5627 r5), but the trip
+ * site also called `logger.debug(..., { sample: trip.sample })`. `logger`'s
+ * default transport is a rotating FILE under `~/.gjc/logs`, and `makeLogFormat`
+ * JSON-stringifies every metadata key verbatim with no redaction — so a model
+ * that looped on a secret or a private fragment of the prompt persisted it to
+ * disk, where it travelled into rotation, support bundles and backups
+ * (#5627 review r6).
+ *
+ * This drives the real transport rather than spying on the logger module: the
+ * defect was about what lands in the FILE, so the file is what gets asserted.
+ */
+describe("chat-completions: repetition guard diagnostics never persist model text (#5627 r6)", () => {
+	// Obviously fake, and shaped like something a scanner would flag, so a
+	// regression is unmistakable in a diff.
+	const SECRET = "sk-test-NOTAREALKEY-zzsentinelzz-4242";
+	const LOOPED_LINE = `Retrying with credential ${SECRET}`;
+
+	let logDir: string | undefined;
+
+	afterEach(() => {
+		// The module default (see packages/utils/src/logger.ts) — console off so
+		// the TUI is not corrupted, file on.
+		logger.setTransports({ file: true });
+		if (logDir) {
+			fs.rmSync(logDir, { recursive: true, force: true });
+			logDir = undefined;
+		}
+	});
+
+	/**
+	 * winston's file transport writes asynchronously and the module imports
+	 * winston lazily, so neither the file nor its contents exist on return from
+	 * the awaited stream. Poll instead of sleeping a fixed amount, so a loaded
+	 * CI box takes longer rather than failing.
+	 */
+	async function readLogsUntil(dir: string, marker: string, timeoutMs = 5_000): Promise<string> {
+		const deadline = Date.now() + timeoutMs;
+		let contents = "";
+		while (Date.now() < deadline) {
+			contents = fs
+				.readdirSync(dir)
+				.map(name => {
+					try {
+						return fs.readFileSync(path.join(dir, name), "utf8");
+					} catch {
+						// Mid-rotation rename; the next poll picks it up.
+						return "";
+					}
+				})
+				.join("");
+			if (contents.includes(marker)) return contents;
+			await new Promise(resolve => setTimeout(resolve, 25));
+		}
+		return contents;
+	}
+
+	it("writes the repetition-trip diagnostic without the repeated model text", async () => {
+		// `os.tmpdir()`, not a hardcoded /tmp: on macOS this is $TMPDIR.
+		logDir = fs.mkdtempSync(path.join(os.tmpdir(), "rf5627-logs-"));
+		logger.setTransports({ console: false, file: logDir });
+
+		const state: DeliveryState = { delivered: 0 };
+		const events: Array<SseChunk | "[DONE]"> = [];
+		for (let i = 0; i < 40; i++) events.push(chunk({ reasoning_content: `${LOOPED_LINE}\n` }));
+		events.push(chunk({}, "stop"), "[DONE]");
+		global.fetch = streamingFetch(events, state);
+
+		const result = await streamOpenAICompletions(model(), context(), { apiKey: "test" }).result();
+
+		// Non-vacuity, part 1: the guard really tripped on the sentinel line, and
+		// the sentinel really was in the stream the provider consumed.
+		expect(result.errorCode).toBe(REPETITION_GUARD_ERROR_CODE);
+		expect(thinkingText(result)).toContain(SECRET);
+
+		const contents = await readLogsUntil(logDir, "repetition guard tripped");
+
+		// Non-vacuity, part 2: the diagnostic reached the file transport. Without
+		// this half, a run that logged nothing at all would pass the negative
+		// below — so these two come first.
+		expect(contents).toContain("openai-completions: repetition guard tripped");
+		expect(contents).toContain('"repeats":12');
+
+		// The actual contract: no fragment of the repeated unit is on disk.
+		expect(contents).not.toContain(SECRET);
+		expect(contents).not.toContain("zzsentinelzz");
+		expect(contents).not.toContain(LOOPED_LINE);
+		expect(contents).not.toContain('"sample"');
+
+		// Bounded, derived, model-uncontrollable — the replacement for `sample`.
+		expect(contents).toContain(`"sampleLength":${LOOPED_LINE.length}`);
 	});
 });

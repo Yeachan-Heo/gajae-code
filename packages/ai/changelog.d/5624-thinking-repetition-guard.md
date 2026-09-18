@@ -63,6 +63,13 @@
   MAX_REPETITION_THRESHOLD]`, so tracking capacity is finite by construction.
   Bad input normalizes rather than throwing — a failed request would be worse
   than the guard running at its default.
+- Stop persisting raw repeated model output in the default logs. The trip
+  diagnostic logged the repeated sample, and the default log transport is a
+  rotating file that JSON-stringifies metadata verbatim with no redaction, so a
+  model that looped on a secret or a private fragment of the prompt wrote it to
+  disk and into log rotation, support bundles and backups. The diagnostic now
+  carries bounded, derived metadata only (`sampleLength`, a number). The sample
+  remains on the in-memory trip object for callers.
 - Strip leaked chat-template tool fences (`<|tool_call_end|>` and friends) from
   rendered thinking, including fences split across streaming chunk boundaries.
   The visible text channel is deliberately untouched, so a fence token the

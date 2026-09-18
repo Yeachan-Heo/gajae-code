@@ -48,8 +48,12 @@ export const REPETITION_GUARD_ERROR_CODE = "repetition_guard_tripped";
  * (`redactGatewayMessage` only strips credential-shaped text), so anything
  * interpolated here is raw model output published verbatim. It also reaches
  * `classifyGatewayError`, which keyword-matches on message text, so a repeated
- * `quota` or `forbidden` in a sample could pick the HTTP status. The repeated
- * unit stays in local `logger.debug` diagnostics only (#5627 review r5).
+ * `quota` or `forbidden` in a sample could pick the HTTP status (#5627 r5).
+ *
+ * The repeated unit is not logged either: the provider logs bounded metadata
+ * only, because the default log transport persists metadata verbatim to a
+ * rotating file on disk (#5627 review r6). {@link StreamRepetitionTrip.sample}
+ * stays in memory for callers that want it.
  */
 export const REPETITION_GUARD_STOP_MESSAGE = "Stopped the turn: the model produced runaway repeated output.";
 
