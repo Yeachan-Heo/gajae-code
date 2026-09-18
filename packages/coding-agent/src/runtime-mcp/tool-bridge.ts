@@ -43,6 +43,13 @@ export interface MCPToolOptions {
 	 * owning manager/runtime. Resolved per call so late registration still applies.
 	 */
 	inputHandler?: () => MCPInputRequestHandler | undefined;
+	/**
+	 * Exact MCP session control: false while the owning manager has this server
+	 * suspended. Checked alongside `#sessionControlInvalidated` so a wrapper that
+	 * outlives a resume/reconnect still fails locally instead of reaching the
+	 * transport for a server this session no longer has active.
+	 */
+	isAvailable?: () => boolean;
 }
 
 function connectionForTool(target: MCPToolTarget): MCPServerConnection {
@@ -235,6 +242,7 @@ export function parseMCPToolName(name: string): { serverName: string; toolName: 
  * CustomTool wrapping an MCP tool with an active connection.
  */
 export class MCPTool implements CustomTool<TSchema, MCPToolDetails> {
+	// Exact MCP stale wrappers fail before transport RPC.
 	readonly name: string;
 	readonly label: string;
 	readonly description: string;
@@ -247,6 +255,11 @@ export class MCPTool implements CustomTool<TSchema, MCPToolDetails> {
 	private connection: MCPServerConnection;
 	#noReplay = false;
 	#inputHandlerResolver: (() => MCPInputRequestHandler | undefined) | undefined;
+	#isAvailable: (() => boolean) | undefined;
+	#sessionControlInvalidated = false;
+	invalidateForSessionControl(): void {
+		this.#sessionControlInvalidated = true;
+	}
 
 	#callOptions(signal?: AbortSignal): MCPRequestOptions {
 		const inputHandler = this.#inputHandlerResolver?.();
@@ -272,6 +285,7 @@ export class MCPTool implements CustomTool<TSchema, MCPToolDetails> {
 		this.connection = resolvedConnection;
 		this.#noReplay = options?.noReplay === true;
 		this.#inputHandlerResolver = options?.inputHandler;
+		this.#isAvailable = options?.isAvailable;
 		this.name = createMCPToolName(resolvedConnection.name, tool.name);
 		this.label = `${resolvedConnection.name}/${tool.name}`;
 		this.description = tool.description ?? `MCP tool from ${resolvedConnection.name}`;
@@ -299,6 +313,15 @@ export class MCPTool implements CustomTool<TSchema, MCPToolDetails> {
 		const args = normalizeToolArgs(params);
 		const provider = this.connection._source?.provider;
 		const providerName = this.connection._source?.providerName;
+		if (this.#sessionControlInvalidated || this.#isAvailable?.() === false) {
+			return buildErrorResult(
+				new Error("MCP server is suspended for this session"),
+				this.connection.name,
+				this.tool.name,
+				provider,
+				providerName,
+			);
+		}
 
 		try {
 			const result = await callTool(this.connection, this.tool.name, args, this.#callOptions(signal));
@@ -350,6 +373,11 @@ export class DeferredMCPTool implements CustomTool<TSchema, MCPToolDetails> {
 	readonly #fallbackProviderName: string | undefined;
 	#noReplay = false;
 	#inputHandlerResolver: (() => MCPInputRequestHandler | undefined) | undefined;
+	#isAvailable: (() => boolean) | undefined;
+	#sessionControlInvalidated = false;
+	invalidateForSessionControl(): void {
+		this.#sessionControlInvalidated = true;
+	}
 
 	#callOptions(signal?: AbortSignal): MCPRequestOptions {
 		const inputHandler = this.#inputHandlerResolver?.();
@@ -386,6 +414,7 @@ export class DeferredMCPTool implements CustomTool<TSchema, MCPToolDetails> {
 		this.#fallbackProviderName = source?.providerName;
 		this.#noReplay = options?.noReplay === true;
 		this.#inputHandlerResolver = options?.inputHandler;
+		this.#isAvailable = options?.isAvailable;
 	}
 
 	renderCall(args: unknown, _options: RenderResultOptions, theme: Theme) {
@@ -407,6 +436,15 @@ export class DeferredMCPTool implements CustomTool<TSchema, MCPToolDetails> {
 		const args = normalizeToolArgs(params);
 		const provider = this.#fallbackProvider;
 		const providerName = this.#fallbackProviderName;
+		if (this.#sessionControlInvalidated || this.#isAvailable?.() === false) {
+			return buildErrorResult(
+				new Error("MCP server is suspended for this session"),
+				this.serverName,
+				this.tool.name,
+				provider,
+				providerName,
+			);
+		}
 
 		try {
 			const connection = await untilAborted(signal, () => this.getConnection());
