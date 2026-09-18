@@ -60,7 +60,7 @@ import {
 	promptFailureRetryability,
 	rephaseFailedOutcome,
 } from "../../sdk/prompt-failure";
-import type { SdkPromptTerminalOutcome } from "../../sdk/prompt-status";
+import type { SdkPromptFailureCategory, SdkPromptTerminalOutcome } from "../../sdk/prompt-status";
 import { PromptActivity, type PromptWatchdogClock, systemPromptWatchdogClock } from "../../sdk/prompt-watchdog";
 import { validateRequiredPromptText } from "../../sdk/protocol/adapter-validation";
 import { type SessionAttachment, SessionRouter, type SessionRouterFrame } from "../../sdk/router";
@@ -73,13 +73,6 @@ import {
 	mapAgentWireEventPayloadToAcpSessionUpdates,
 } from "./acp-event-mapper";
 import { resolveAcpPermissionMode } from "./permission-mode";
-import {
-	type PostStartPreservation,
-	postStartOperatorMessage,
-	preserveWithinSettlementWall,
-	safeStashRef,
-	unverifiedPreservation,
-} from "./post-start-preservation";
 import type { AcpStartupOptions } from "./startup-options";
 import { ACP_TERMINAL_AUTH_FLAG } from "./terminal-auth";
 
@@ -641,16 +634,9 @@ type SdkPromptFailedOutcome = Extract<SdkPromptTerminalOutcome, { kind: "failed"
  */
 export class AcpPromptFailureError extends AcpSdkAdapterError {
 	readonly failure: SdkPromptFailedOutcome;
-	/**
-	 * What a post-start terminal snapshotted before reporting this failure (issue #5664).
-	 * Absent for a submission-phase rejection, which never ran and so stranded nothing, and for a
-	 * post-start turn whose worktree was clean.
-	 */
-	readonly preservation?: PostStartPreservation;
-	constructor(failure: SdkPromptFailedOutcome, preservation?: PostStartPreservation) {
+	constructor(failure: SdkPromptFailedOutcome) {
 		super(failure.code, failure.message);
 		this.failure = failure;
-		if (preservation !== undefined) this.preservation = preservation;
 	}
 }
 
@@ -669,18 +655,43 @@ export class AcpPromptFailureError extends AcpSdkAdapterError {
  * dropped instead of becoming a leak of provider text (the redaction contract in
  * `sanitizePromptFailure`). A dropped or absent code is omitted, never nulled.
  */
-function promptFailureWireData(
-	failure: SdkPromptFailedOutcome,
-	preservation?: PostStartPreservation,
-): Record<string, string> {
-	// `operatorMessage` says, in words, what the classifier tokens above already say in codes, plus
-	// where a post-start terminal put the operator's uncommitted work (issue #5664). It is built
-	// only from those same bounded tokens, so it widens nothing that reaches the wire. The existing
-	// `code`/`details` pair is untouched: pinned ACP core-v1 conformance asserts on it.
+export const OPERATOR_UPSTREAM_LABEL = "Upstream provider failure";
+export const OPERATOR_UPSTREAM_SUFFIX = ": the model provider ended this turn, not your task.";
+
+/**
+ * Operator-facing wording for a post-start terminal, assembled ONLY from bounded safe tokens: the
+ * classifier `category` and a `providerCode` that passes `isSafePromptFailureCode`. Raw provider
+ * text never reaches this function and must never reach it.
+ *
+ * This is additive. The wire `code`/`details` pair and every `PROMPT_FAILURE_MESSAGE_*` constant
+ * stay exactly as they are — pinned ACP core-v1 conformance asserts on them — so this wording
+ * travels alongside the redacted message instead of repurposing it.
+ *
+ * It says NOTHING about the worktree, deliberately. Nothing on this path inspects the worktree, so
+ * any sentence about uncommitted work would assert a check that never ran — reporting an
+ * uninspected tree as clean is the absence-of-evidence-as-evidence-of-absence error, and an
+ * operator who believed it would sweep work away. Silence is the only honest option until something
+ * actually looks.
+ *
+ * Returns `undefined` for every other category: `phase` and `category` are already on the wire, so
+ * restating them in prose tells an operator nothing they do not already have.
+ */
+export function postStartOperatorMessage(input: {
+	category: SdkPromptFailureCategory;
+	providerCode?: string;
+}): string | undefined {
+	if (input.category !== "provider_transport") return undefined;
+	const code = isSafePromptFailureCode(input.providerCode) ? ` (${input.providerCode})` : "";
+	return `${OPERATOR_UPSTREAM_LABEL}${code}${OPERATOR_UPSTREAM_SUFFIX}`;
+}
+
+function promptFailureWireData(failure: SdkPromptFailedOutcome): Record<string, string> {
+	// `operatorMessage` says, in words, what the classifier tokens already say in codes: that the
+	// cause was an upstream provider problem rather than a failure of the operator's task. Built
+	// only from those same bounded tokens, so it widens nothing that reaches the wire.
 	const operatorMessage = postStartOperatorMessage({
 		category: failure.category,
 		...(failure.providerCode === undefined ? {} : { providerCode: failure.providerCode }),
-		...(preservation === undefined ? {} : { preservation }),
 	});
 	return {
 		phase: failure.phase,
@@ -688,9 +699,6 @@ function promptFailureWireData(
 		retryability: promptFailureRetryability(failure.category),
 		...(isSafePromptFailureCode(failure.providerCode) ? { providerCode: failure.providerCode } : {}),
 		...(operatorMessage === undefined ? {} : { operatorMessage }),
-		...(safeStashRef(preservation?.stashRef) === undefined
-			? {}
-			: { preservedStashRef: preservation?.stashRef as string }),
 	};
 }
 
@@ -1398,7 +1406,7 @@ export function acpRequestFailure(error: unknown): unknown {
 	// this enriches `data`, it does not restate the redacted message.
 	const data =
 		error instanceof AcpPromptFailureError
-			? { code, details: message, ...promptFailureWireData(error.failure, error.preservation) }
+			? { code, details: message, ...promptFailureWireData(error.failure) }
 			: { code, details: message };
 	// An abandoned prompt additionally publishes the plan it never finished (issue #5669).
 	// Same rule as above: `code`/`details` and the JSON-RPC code are untouched, and an abandon
@@ -4002,73 +4010,7 @@ export class AcpAgent implements Agent {
 			outcome.phase === "post_start"
 				? outcome
 				: (rephaseFailedOutcome(outcome, { hasActivity: waiter.observedTurnActivity }) as SdkPromptFailedOutcome);
-		// A submission-phase rejection never ran, so it stranded nothing and rejects immediately on
-		// the synchronous path, exactly as before.
-		if (failure.phase !== "post_start") {
-			waiter.reject(new AcpPromptFailureError(failure));
-			return;
-		}
-		// A post-start turn may have spent the last hour editing this worktree, and the rejection
-		// below is terminal by design — the retry gates that forbid re-running a tool-executing turn
-		// stay exactly as they are (issue #5574). Snapshot the uncommitted work into the stash list
-		// BEFORE reporting the failure, so the edits survive the worktree being swept (issue #5664).
-		// Scoped to the phase rather than the category: any post-start fatal strands work.
-		//
-		// The capture spawns git children, so it runs on a DETACHED tail rather than inline: this
-		// method is synchronous and one `AcpAgent` serves many session records in one process, so
-		// capturing inline pinned the whole loop — and every other session's frames with it — for up
-		// to the capture's whole wall (review A3). Everything above this point stayed synchronous and
-		// in order, so the single-owner fence that `#settlePrompt` provides is unchanged; only the
-		// capture and the reject that consumes it are deferred.
-		this.#rejectAfterPreservation(id, waiter, failure, record.cwd);
-	}
-
-	/**
-	 * Run the post-start worktree capture off the shared loop, then reject with its result.
-	 *
-	 * The reject MUST happen exactly once on every path — capture resolved, capture rejected, wall
-	 * fired — because a dropped reject hangs the prompt forever, which is strictly worse than the
-	 * blocking it replaces. `settleOnce` enforces that, and the whole tail is wrapped so nothing
-	 * inside can escape as an unhandled rejection.
-	 *
-	 * The wall bounds the deferral itself: `preservePostStartWork` already bounds its own git work,
-	 * but a capture seam that never settles would otherwise strand the turn, so settlement never
-	 * waits longer than the capture's own budget plus a grace.
-	 */
-	#rejectAfterPreservation(
-		id: string,
-		waiter: PromptWaiter,
-		failure: SdkPromptFailedOutcome,
-		cwd: string | undefined,
-	): void {
-		let done = false;
-		const settleOnce = (preservation: PostStartPreservation | undefined): void => {
-			if (done) return;
-			done = true;
-			// Only a turn that actually stashed something warrants a warn line; a verified-clean tree
-			// is the uninteresting case and would just add noise to every post-start failure. An
-			// `unknown` worktree IS worth surfacing — it is the case where an operator may still lose
-			// work.
-			if (preservation && preservation.status !== "clean")
-				logger.warn("acp_post_start_work_preserved", {
-					sessionId: id,
-					status: preservation.status,
-					category: failure.category,
-					...(isSafePromptFailureCode(failure.providerCode) ? { providerCode: failure.providerCode } : {}),
-					...(preservation.stashRef ? { stashRef: preservation.stashRef } : {}),
-					snapshotComplete: preservation.snapshotComplete,
-				});
-			waiter.reject(new AcpPromptFailureError(failure, preservation));
-		};
-		void (async () => {
-			try {
-				// Already wall-bounded and non-rejecting; `settleOnce` is the second belt.
-				settleOnce(await preserveWithinSettlementWall(cwd));
-			} catch (error) {
-				logger.warn("acp_post_start_preservation_failed", { sessionId: id, error: String(error) });
-				settleOnce(unverifiedPreservation());
-			}
-		})();
+		waiter.reject(new AcpPromptFailureError(failure));
 	}
 
 	async #emitEndOfTurnUpdates(id: string, adapter: AcpSdkAdapter, publicationGeneration: number): Promise<void> {
