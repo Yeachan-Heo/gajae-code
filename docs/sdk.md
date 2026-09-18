@@ -22,7 +22,7 @@ External and managed integrations attach through SDK-core surfaces only:
 - lifecycle-equivalent per-session controls are prohibited on Telegram, Discord, Slack, ACP, MCP, and daemon CLI adapters.
 
 For terminal-side session operation, use the broker-bound [SDK session CLI](./sdk-session-cli.md):
-`gjc sdk session list|inspect|send|status|tail` plus the explicit `raw`
+`gjc sdk session list|inspect|send|status|tail|close|retire` plus the explicit `raw`
 `control|query|global` hatch. The CLI resolves the exact attachment through SDK
 core and emits credential-free JSON.
 

@@ -3,8 +3,8 @@
 `gjc sdk session` is the broker-bound command family for operating live GJC SDK
 sessions from the terminal. It replaces the removed `gjc daemon session` route.
 
-The command family has six semantic verbs — `list`, `inspect`,
-`send`, `status`, `tail`, and `retire` — plus the explicit `raw` hatch that dispatches one
+The command family has seven semantic verbs — `list`, `inspect`,
+`send`, `status`, `tail`, `close`, and `retire` — plus the explicit `raw` hatch that dispatches one
 SDK operation as `control`, `query`, or `global`.
 
 The session CLI is advisory tooling over the SDK: every semantic verb resolves
@@ -58,7 +58,7 @@ exact canonical path match. Unreadable or removed row workspaces are excluded
 from Git scopes deterministically and reported in `warnings`.
 
 The raw global `session.list` route remains unfiltered, and `inspect`, `send`,
-`status`, `tail`, `retire`, and raw control/query behavior is unchanged.
+`status`, `tail`, `close`, `retire`, and raw control/query behavior is unchanged.
 
 For a process-isolated caller that needs bounded discovery, request exactly one
 Broker page instead of the semantic all-pages list:
@@ -179,6 +179,32 @@ its retained transcript without an endpoint (offline source), bounded to the
 most recent retained entries. If `--after-transcript-id` names a row older than
 that bounded window, the command fails closed with `retention_gap` instead of
 silently omitting unprocessed rows.
+
+### close
+
+`gjc sdk session close <sessionId>` is the official semantic wrapper for the
+`session.close` broker global. It ends one live session: the broker validates
+indexed authority, asks the host to shut down gracefully, escalates to SIGTERM
+against the durably identified session process when graceful teardown exceeds
+the bounded deadline, and appends terminal `session_closed` evidence. A session
+whose ownership is `terminalUncertain` is refused rather than signalled — that
+is what `retire` is for.
+
+```sh
+gjc sdk session close <sessionId> [--agent-dir <agent-dir>] [--idempotency-key <key>]
+```
+
+Closing never attaches to the session. A Router attachment registers the
+calling process as a live client and renews the host's abandonment window,
+which is the opposite of the intent, so the lifecycle mutation is answered by
+the broker over its own client.
+
+`--idempotency-key` is optional here, unlike the raw `session.close` global. A
+close is one terminal intent per session, so the default request key is derived
+from the session id: a retried invocation replays the same lifecycle request
+and is deduplicated by the broker instead of issuing a second close against a
+host that may already be gone. Pass `--idempotency-key` explicitly to key by
+attempt instead.
 
 ### retire
 
