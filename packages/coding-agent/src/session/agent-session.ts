@@ -21459,6 +21459,10 @@ export class AgentSession {
 		if (classifyContextOverflow(message, transportFailure, this.model?.contextWindow ?? 0)) return undefined;
 		const transport = classifyFallbackTrigger(transportFailure ?? { status: message.errorStatus });
 		if (transport.class !== "other") return transport;
+		// HTTP/2 observations explain a terminal failure; they do not authorize replay.
+		if (transportFailure?.http2RstCode !== undefined || transportFailure?.nativeErrorCode !== undefined) {
+			return undefined;
+		}
 		// Managed fallback receives authoritative transport facts from the request
 		// boundary. Once those facts classify as other, error prose must not upgrade
 		// the failure into an unbounded transient or quota retry.
