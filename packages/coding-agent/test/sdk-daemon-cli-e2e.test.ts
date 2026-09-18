@@ -386,9 +386,11 @@ describe("SDK session CLI", () => {
 						if (frame.query === "transcript.list") {
 							transcriptCursor = frame.cursor;
 							transcriptListCursors.push(String(frame.cursor));
-							// Under a staged exchange, only a FRESH mint may page (never the
-							// exchanged replacement - that would replay the old snapshot).
-							if (signedExchange !== undefined && !freshTokens.has(String(frame.cursor))) {
+							// Under a staged exchange, the exchanged replacement may be paged
+							// exactly once (the CLI drains it to release its pin) and any fresh
+							// mint may be paged; anything else is not a live pin.
+							const isReplacement = signedExchange !== undefined && frame.cursor === signedExchange.replacement;
+							if (signedExchange !== undefined && !isReplacement && !freshTokens.has(String(frame.cursor))) {
 								socket.send(
 									JSON.stringify({
 										type: "query_response",
@@ -728,12 +730,13 @@ describe("SDK session CLI", () => {
 		expect(tail.exitCode, tail.stderr).toBe(0);
 		expect(verifyCursor(String(checkpointInputToken), "tail-e2e-key")).toBeDefined();
 		expect(checkpointInputToken).toBe(source);
-		// The exchanged replacement is pinned to the OLD snapshot at offset 0:
-		// paging it would replay every row the caller already processed (a
-		// gateway polling a live session saw ~300 items per poll and rejected 614
-		// frames per turn). The resume pages a FRESH mint instead.
-		expect(transcriptListCursors).toEqual(["fresh-1"]);
-		expect(transcriptCursor).not.toBe(replacement);
+		// The exchanged replacement is pinned to the OLD snapshot at offset 0. It
+		// is paged exactly once, to RELEASE its pin (transcript.list is the only
+		// release the query surface exposes; an unreleased pin per poll hit the
+		// 128 cap within minutes) - its rows are discarded. The rows the caller
+		// receives come from a FRESH mint.
+		expect(transcriptListCursors).toEqual([replacement, "fresh-1"]);
+		expect(transcriptCursor).toBe("fresh-1");
 		const result = JSON.parse(tail.stdout).result as {
 			items: Array<{ kind: string; id?: string }>;
 			cursor?: unknown;

@@ -90,24 +90,38 @@ export function tailItemKey(item: SdkTailItemV1): string {
 	return `${item.kind}\u0000${JSON.stringify(item.payload)}`;
 }
 
-/** Holds positioned live frames until the checkpoint can stamp their authoritative revision. */
+/**
+ * Holds positioned live frames until the checkpoint can stamp their
+ * authoritative revision, and keeps stamping after it.
+ *
+ * A positioned frame (generation+seq) that carries no revision after the
+ * checkpoint used to abort the whole tail with protocol_error. The host emits
+ * such frames whenever its transcript provider is momentarily unavailable
+ * (`eventRevision` returns undefined), which is ordinary during a turn - and
+ * one such frame turned a live, answering session into one no consumer could
+ * observe: every poll failed, the caller held the turn, and after five minutes
+ * reported it failed while the answer sat in the transcript (2026-09-17/18,
+ * five sessions). The checkpoint's revision is the correct stamp for anything
+ * that arrives after it; a frame is never a reason to lose the tail.
+ */
 export class TailRevisionBuffer {
 	#pending: SdkTailItemV1[] = [];
-	#resolved = false;
+	#revision: number | undefined;
 
 	push(item: SdkTailItemV1): SdkTailItemV1[] {
 		if (item.revision !== undefined || item.generation === undefined || item.seq === undefined) return [item];
-		if (!this.#resolved) {
+		if (this.#revision === undefined) {
 			this.#pending.push(item);
 			return [];
 		}
-		throw new Error("A positioned live tail item arrived without an authoritative revision after checkpoint.");
+		item.revision = this.#revision;
+		return [item];
 	}
 
 	resolve(revision: number): SdkTailItemV1[] {
 		if (!Number.isSafeInteger(revision) || revision < 0)
 			throw new Error("Tail revision must be a non-negative integer.");
-		this.#resolved = true;
+		this.#revision = revision;
 		const pending = this.#pending;
 		this.#pending = [];
 		for (const item of pending) item.revision = revision;

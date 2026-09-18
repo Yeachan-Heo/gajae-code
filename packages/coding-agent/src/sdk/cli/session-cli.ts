@@ -1596,6 +1596,30 @@ async function runLiveTail(
 			// rows that carry tool calls and interim assistant text.
 			let cursor = extraction.cursor;
 			if (args.cursor !== undefined) {
+				// The exchange handed back a live pin on the OLD snapshot. Its rows are
+				// not wanted (see above), but the pin must go: `transcript.list` is the
+				// only release the query surface exposes, and each page that is not the
+				// last grants a continuation pin of its own. Drain to `complete`, discard
+				// every page. Left pinned, a poller leaked one pin per poll and hit
+				// snapshot_capacity_exceeded (128) within minutes.
+				let drain = cursor;
+				while (drain !== undefined) {
+					try {
+						const page = extractTranscriptPage(
+							await router.request(
+								sessionId,
+								{ type: "query_request", query: "transcript.list", input: {}, cursor: drain },
+								attachment.generation,
+								attachment,
+								args.timeoutMs === undefined ? undefined : { timeoutMs: args.timeoutMs },
+							),
+						);
+						drain = page.complete ? undefined : page.cursor;
+					} catch {
+						// Releasing is best-effort; a pin that cannot be drained expires with its TTL.
+						drain = undefined;
+					}
+				}
 				cursor = undefined;
 				try {
 					const fresh = await router.request(
