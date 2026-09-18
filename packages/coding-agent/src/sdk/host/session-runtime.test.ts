@@ -6085,6 +6085,16 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 			const expiringIds = { commandId: expiring.result?.commandId, turnId: expiring.result?.turnId };
 			const leadingIds = { commandId: leading.result?.commandId, turnId: leading.result?.turnId };
 			await harness.emit("agent_start");
+			await awaitCorrelatedFrames(
+				harness,
+				expiringIds,
+				frames => frames.some(frame => frame.kind === "agent_start"),
+			);
+			await awaitCorrelatedFrames(
+				harness,
+				leadingIds,
+				frames => frames.some(frame => frame.kind === "agent_start"),
+			);
 			// Both must be in the drained batch: a lease that fired before the drain
 			// would leave the handler with nothing to park on and prove nothing.
 			expect({

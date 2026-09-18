@@ -5031,7 +5031,11 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 	};
 	api.on("agent_start", (event, ctx) => {
 		const owner = lifecycleStateForEvent(ctx, "agent_start", event.sdkRunToken);
-		return trackLifecycle(
+		// Interactive/skill turns must not wait on durable start persist. Keep
+		// trackLifecycle so drain, persist-then-publish, content-hold release, and
+		// shutdown still run; do not return that promise to the extension runner
+		// (EXTENSION_HANDLER_TIMEOUT_MS would otherwise stall the prompt).
+		void trackLifecycle(
 			async () =>
 				emitLifecycle(
 					"agent_start",
@@ -5047,7 +5051,11 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					event.sdkRunTokens,
 				),
 			owner,
-		);
+		).catch(error => {
+			logger.error("SDK agent_start lifecycle task failed", {
+				error: sanitizePromptFailure(error),
+			});
+		});
 	});
 	api.on("agent_end", (event, ctx) => {
 		const tokenBinding =
