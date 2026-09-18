@@ -1585,7 +1585,12 @@ async function runLiveTail(
 					gap,
 				);
 
-			let cursor = extraction.cursor;
+			// A resumed tail (`--cursor`) does not re-walk the transcript: the caller
+			// holds everything up to that checkpoint, and every transcript row it
+			// would get back is a replay of history it already processed. Resume is
+			// event_replay since the checkpoint, plus whatever is live. Only a fresh
+			// (cursorless) tail backfills the transcript.
+			let cursor = args.cursor === undefined ? extraction.cursor : undefined;
 			while (cursor !== undefined) {
 				const response = await router.request(
 					sessionId,
@@ -1612,6 +1617,25 @@ async function runLiveTail(
 				);
 				if (page.complete || page.cursor === undefined) break;
 				cursor = page.cursor;
+			}
+
+			// The checkpoint's own token was just spent walking the transcript
+			// (`transcript.list` consumes and releases it), so it is no longer a
+			// valid resume point. Mint a fresh, unconsumed checkpoint for the caller
+			// to hand back on the next tail. Best-effort: a caller that cannot get
+			// one falls back to a cursorless tail exactly as before.
+			let resumeCursor: string | undefined;
+			try {
+				const fresh = await router.request(
+					sessionId,
+					{ type: "query_request", query: "session.checkpoint", input: {} },
+					attachment.generation,
+					attachment,
+					args.timeoutMs === undefined ? undefined : { timeoutMs: args.timeoutMs },
+				);
+				resumeCursor = extractCheckpoint(fresh).cursor;
+			} catch {
+				resumeCursor = undefined;
 			}
 
 			const replayResponse = await router.request(
@@ -1704,6 +1728,13 @@ async function runLiveTail(
 					source: "session",
 					session: row,
 					...(checkpoint === undefined ? {} : { checkpoint }),
+					// A signed, UNCONSUMED checkpoint cursor to resume from. Carried as
+					// `cursor`, not `checkpointToken`: output passes through
+					// stripSecretFields, whose /token/i matches the latter by name, so a
+					// caller never saw it and no tail could ever be resumed (every poll
+					// replayed the whole session). It is an opaque per-grant cursor, not a
+					// credential - the same shape `list`/`transcript` already return.
+					...(resumeCursor === undefined ? {} : { cursor: resumeCursor }),
 					...(gap === undefined ? {} : { gap }),
 					items: tailItems(),
 					terminal: liveReason === "idle" || liveReason === "close",
