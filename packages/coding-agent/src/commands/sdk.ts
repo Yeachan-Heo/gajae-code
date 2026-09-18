@@ -3,7 +3,7 @@ import * as nodeFs from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { logger } from "@gajae-code/utils";
+import { logger, postmortem } from "@gajae-code/utils";
 import { Args, CliParseError, Command, Flags, renderCommandHelp } from "@gajae-code/utils/cli";
 import type { Args as ParsedArgs } from "../cli/args";
 import { parseModelString } from "../config/model-resolver";
@@ -1296,15 +1296,14 @@ export default class Sdk extends Command {
 		// A live broker must not keep advertising sessions whose host process is
 		// gone; the sweep is the broker-side half of the host reaping bound.
 		const stopSweep = startBrokerDeadRegistrationSweep(runningBroker);
-		const stop = () => {
+		const unregisterBrokerTeardown = postmortem.register("sdk:broker", async () => {
 			stopSweep();
-			void runningBroker.stop();
-		};
-		process.once("SIGTERM", stop);
-		process.once("SIGINT", stop);
+			await runningBroker.stop();
+		});
 		try {
 			await completeBrokerProcess(runningBroker);
 		} finally {
+			unregisterBrokerTeardown();
 			stopSweep();
 		}
 	}

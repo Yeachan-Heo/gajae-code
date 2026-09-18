@@ -1075,16 +1075,4 @@ if (typeof process !== "undefined") {
 			client.proc.kill();
 		}
 	});
-	process.on("SIGINT", () => {
-		void (async () => {
-			await shutdownAll();
-			process.exit(0);
-		})();
-	});
-	process.on("SIGTERM", () => {
-		void (async () => {
-			await shutdownAll();
-			process.exit(0);
-		})();
-	});
 }

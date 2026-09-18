@@ -1,10 +1,12 @@
 import type { Broker } from "./broker";
 
-/** Wait for broker-local completion, then terminate only the current broker process. */
+/** Wait for broker-local completion and report successful completion to the executable boundary. */
 export async function completeBrokerProcess(
 	broker: Broker,
-	exit: (code: number) => never = code => process.exit(code),
-): Promise<never> {
+	setExitCode: (code: number) => void = code => {
+		process.exitCode = code;
+	},
+): Promise<void> {
 	await broker.completion;
-	return exit(0);
+	setExitCode(0);
 }

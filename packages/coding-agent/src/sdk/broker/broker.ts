@@ -3,7 +3,12 @@ import type { BigIntStats } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import path from "node:path";
-import type { NativeBrokerRestartIntent, NativeDirectoryTreeSnapshot } from "@gajae-code/natives";
+import {
+	exactUnlink,
+	type NativeBrokerRestartIntent,
+	type NativeDirectoryTreeSnapshot,
+	type NativeExactFileIdentity,
+} from "@gajae-code/natives";
 import { logger, resolveEquivalentPath } from "@gajae-code/utils";
 import packageJson from "../../../package.json" with { type: "json" };
 import type { ModelProfileErrorDetails } from "../../config/model-profile-contract";
@@ -996,11 +1001,13 @@ const BROKER_LOCK_RETRY_MS = 10;
 type BrokerLockSnapshot = {
 	ownerId?: string;
 	pid: number;
+	incarnation?: string;
 	identity: string;
 	lockIdentity: string;
+	exactIdentity: NativeExactFileIdentity;
 };
 
-/** Tombstone prefix used by {@link Broker.reclaimStaleLock} when a dead owner's lock is renamed aside. */
+/** Tombstone prefix used by {@link Broker.reclaimStaleLock} when a dead owner's lock is detached aside. */
 export const BROKER_LOCK_TOMBSTONE_PREFIX = ".broker.lock.stale-";
 
 /**
@@ -1041,6 +1048,18 @@ function isBrokerLockArtifactName(name: string): boolean {
 		name.startsWith(BROKER_LOCK_TOMBSTONE_PREFIX) ||
 		BROKER_LOCK_BACKUP_PREFIXES.some(prefix => name.startsWith(prefix))
 	);
+}
+
+/**
+ * An owner is reclaimable only when its process is dead, or its recorded
+ * process incarnation proves that this PID has been recycled. Missing process
+ * identity is ambiguous and therefore remains live.
+ */
+function isLiveBrokerLockOwner(snapshot: BrokerLockSnapshot): boolean {
+	if (snapshot.pid <= 0 || !isPidAlive(snapshot.pid)) return false;
+	if (!snapshot.incarnation) return true;
+	const currentIncarnation = brokerProcessIncarnation(snapshot.pid);
+	return !currentIncarnation || currentIncarnation === snapshot.incarnation;
 }
 
 /**
@@ -1095,7 +1114,7 @@ async function classifyBrokerLockArtifact(
  * Remove reclaimed broker lock tombstones and legacy restart backups older than
  * the grace window.
  *
- * `#reclaimStaleLock` renames a dead owner's lock to a tombstone named by a hash
+ * `#reclaimStaleLock` detaches a dead owner's lock to a tombstone named by a hash
  * of the lock's dev+ino, so a machine accrues one directory per dead owner and
  * nothing ever removed them (54 on the install in #3963). Reaping is
  * best-effort and fail-closed: anything live, unreadable, permission-denied, or
@@ -2626,9 +2645,27 @@ export class Broker {
 	#lockRecordPath(): string {
 		return path.join(this.#lock, BROKER_LOCK_RECORD);
 	}
-	async #lockSnapshot(raw: string, lockIdentity: string): Promise<BrokerLockSnapshot> {
+	async #lockSnapshot(
+		raw: string,
+		lock: BigIntStats,
+		lockParent: BigIntStats,
+		lockIdentity: string,
+	): Promise<BrokerLockSnapshot> {
+		// Bind both the lock object and its containing directory. The native detach
+		// walks the pathname without following reparse points, while the parent
+		// identity prevents a replaced sdk directory from redirecting that walk.
+		const exactIdentity: NativeExactFileIdentity = {
+			dev: lock.dev,
+			ino: lock.ino,
+			nlink: lock.nlink,
+			parentDev: lockParent.dev,
+			parentIno: lockParent.ino,
+			size: lock.size,
+			mtimeNs: lock.mtimeNs,
+			...(lock.isDirectory() ? { directory: true } : { sha256: createHash("sha256").update(raw).digest("hex") }),
+		};
 		try {
-			const lock = JSON.parse(raw) as { ownerId?: unknown; pid?: unknown };
+			const lock = JSON.parse(raw) as { ownerId?: unknown; pid?: unknown; incarnation?: unknown };
 			if (
 				typeof lock.ownerId === "string" &&
 				lock.ownerId.length > 0 &&
@@ -2636,11 +2673,33 @@ export class Broker {
 				Number.isInteger(lock.pid) &&
 				lock.pid > 0
 			)
-				return { ownerId: lock.ownerId, pid: lock.pid, identity: `owner:${lock.ownerId}`, lockIdentity };
+				return {
+					ownerId: lock.ownerId,
+					pid: lock.pid,
+					...(typeof lock.incarnation === "string" && lock.incarnation.length > 0
+						? { incarnation: lock.incarnation }
+						: {}),
+					identity: `owner:${lock.ownerId}`,
+					lockIdentity,
+					exactIdentity,
+				};
 		} catch {}
-		return { pid: 0, identity: `contents:${createHash("sha256").update(raw).digest("hex")}`, lockIdentity };
+		return {
+			pid: 0,
+			identity: `contents:${createHash("sha256").update(raw).digest("hex")}`,
+			lockIdentity,
+			exactIdentity,
+		};
 	}
 	async #readLock(): Promise<BrokerLockSnapshot | null> {
+		let lockParent: BigIntStats;
+		try {
+			lockParent = await fs.stat(path.dirname(this.#lock), { bigint: true });
+		} catch (e) {
+			if ((e as NodeJS.ErrnoException).code === "ENOENT") return null;
+			throw e;
+		}
+		if (!lockParent.isDirectory()) return null;
 		let lock: BigIntStats;
 		try {
 			lock = await fs.lstat(this.#lock, { bigint: true });
@@ -2666,12 +2725,13 @@ export class Broker {
 			if ((e as NodeJS.ErrnoException).code === "ENOENT") return null;
 			throw e;
 		}
-		return this.#lockSnapshot(raw, lockIdentity);
+		return this.#lockSnapshot(raw, lock, lockParent, lockIdentity);
 	}
 	async #createLock(): Promise<void> {
+		const incarnation = brokerProcessIncarnation(process.pid);
+		if (!incarnation) throw new Error("Broker process incarnation is unavailable.");
 		await fs.mkdir(this.#lock, { mode: 0o700 });
 		try {
-			const incarnation = brokerProcessIncarnation(process.pid);
 			// A minimal, non-secret receipt delta for D9 stale-artifact detach
 			// (sequenced follow-up): the OS incarnation and a digest of the exact
 			// resolved root this lock authorizes, so a later positive-death check can
@@ -2685,7 +2745,7 @@ export class Broker {
 					ownerId: this.#owner,
 					pid: process.pid,
 					acquiredAt: Date.now(),
-					...(incarnation ? { incarnation } : {}),
+					incarnation,
 					rootDigest,
 				}),
 				{ flag: "wx", mode: 0o600 },
@@ -2712,7 +2772,7 @@ export class Broker {
 			!current ||
 			current.identity !== snapshot.identity ||
 			current.lockIdentity !== snapshot.lockIdentity ||
-			(current.pid > 0 && isPidAlive(current.pid))
+			isLiveBrokerLockOwner(current)
 		)
 			return;
 
@@ -2726,23 +2786,16 @@ export class Broker {
 				path.dirname(this.#lock),
 				`.broker.lock.stale-${createHash("sha256").update(snapshot.lockIdentity).digest("hex")}-${randomBytes(8).toString("hex")}`,
 			);
-			try {
-				await fs.rename(this.#lock, tombstone);
+			const result = exactUnlink(this.#lock, {
+				...current.exactIdentity,
+				detachOnly: true,
+				quarantineName: path.basename(tombstone),
+			});
+			if (result.detachedPath === tombstone && (result.ok || result.code === "cleanup_pending")) return;
+			if (result.code === "collision" || result.code === "quarantine_collision") continue;
+			if (result.code === "identity_mismatch" || result.code === "parent_mismatch" || result.code === "not_found")
 				return;
-			} catch (e) {
-				const code = (e as NodeJS.ErrnoException).code;
-				if (code === "EEXIST" || code === "ENOTEMPTY") continue;
-				if (["ENOENT", "EISDIR", "ENOTDIR"].includes(code ?? "")) return;
-				if (code === "EPERM") {
-					try {
-						await fs.lstat(tombstone);
-						continue;
-					} catch (statError) {
-						if ((statError as NodeJS.ErrnoException).code !== "ENOENT") throw statError;
-					}
-				}
-				throw e;
-			}
+			throw new Error(`Broker lock reclaim failed (${result.code ?? "unknown"}).`);
 		}
 		throw new Error(`Broker lock quarantine namespace is saturated for ${this.#lock}`);
 	}
@@ -2815,7 +2868,7 @@ export class Broker {
 			}
 			const snapshot = await this.#readLock();
 			if (!snapshot) continue;
-			if (snapshot.pid > 0 && isPidAlive(snapshot.pid)) {
+			if (isLiveBrokerLockOwner(snapshot)) {
 				const starting = await this.#waitForBrokerDiscovery();
 				if (starting) {
 					logger.info(
@@ -2825,7 +2878,7 @@ export class Broker {
 					return starting;
 				}
 				const current = await this.#readLock();
-				if (current && current.identity === snapshot.identity && current.pid > 0 && isPidAlive(current.pid)) {
+				if (current && current.identity === snapshot.identity && isLiveBrokerLockOwner(current)) {
 					logger.warn(
 						`sdk broker: lock contention, refusing to start because ${this.#lock} is held by live pid ${current.pid} that published no discovery record`,
 					);
