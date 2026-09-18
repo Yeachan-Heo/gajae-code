@@ -30,6 +30,7 @@ import {
 	type PostStartPreservation,
 	postStartOperatorMessage,
 	preservePostStartWork,
+	preserveWithinSettlementWall,
 } from "../../src/modes/acp/post-start-preservation";
 import { failedPromptOutcome } from "../../src/sdk/prompt-failure";
 
@@ -81,7 +82,7 @@ describe("post-start terminal preserves the worktree before reporting failure (i
 		await writeFile(path.join(ws, "new-module.ts"), "export const added = true;\n");
 		const before = git(ws, ["status", "--porcelain"]);
 
-		const preservation = preservePostStartWork(ws);
+		const preservation = await preservePostStartWork(ws);
 
 		expect(preservation).toBeDefined();
 		expect(preservation?.stashRef).toMatch(/^[0-9a-f]{7,64}$/);
@@ -102,8 +103,8 @@ describe("post-start terminal preserves the worktree before reporting failure (i
 		expect(git(ws, ["show", `${preservation?.stashRef}:src.ts`])).toBe("export const v = 2; // an hour of work\n");
 	});
 
-	it("reports a verified clean tree as clean, and does not stash-spam it", () => {
-		const preservation = preservePostStartWork(ws);
+	it("reports a verified clean tree as clean, and does not stash-spam it", async () => {
+		const preservation = await preservePostStartWork(ws);
 
 		expect(preservation.status).toBe("clean");
 		expect(preservation.snapshotComplete).toBe(true);
@@ -123,7 +124,7 @@ describe("post-start terminal preserves the worktree before reporting failure (i
 		await writeFile(path.join(ws, "src.ts"), "export const v = 2;\n");
 		await writeFile(path.join(ws, "new-module.ts"), "export const added = true;\n");
 
-		const preservation = preservePostStartWork(ws);
+		const preservation = await preservePostStartWork(ws);
 		const stashRef = preservation?.stashRef ?? "<none>";
 
 		// GROUND TRUTH: the stash commit's tree holds the tracked edit and nothing else. `git stash
@@ -160,7 +161,7 @@ describe("post-start terminal preserves the worktree before reporting failure (i
 		// the fix reports the actual gap rather than blanket-marking every snapshot incomplete.
 		await writeFile(path.join(ws, "src.ts"), "export const v = 2;\n");
 
-		const preservation = preservePostStartWork(ws);
+		const preservation = await preservePostStartWork(ws);
 
 		expect(preservation?.snapshotComplete).toBe(true);
 		expect(preservation?.untrackedNotCaptured).toBeUndefined();
@@ -185,14 +186,14 @@ describe("post-start terminal preserves the worktree before reporting failure (i
 	it("downgrades a snapshot taken across a changing worktree, keeping the ref it did get", async () => {
 		await writeFile(path.join(ws, "src.ts"), "export const v = 2;\n");
 		// A real capture first, to borrow a genuine stash oid for the raced result.
-		const settled = preservePostStartWork(ws);
+		const settled = await preservePostStartWork(ws);
 		const realRef = settled.stashRef ?? "<none>";
 		// The file that appeared between the untracked count and the stash. It exists on disk and is
 		// absent from `realRef`'s tree, exactly as in the reported race.
 		await writeFile(path.join(ws, "appeared-mid-capture.ts"), "export const late = true;\n");
 		expect(git(ws, ["ls-tree", "-r", "--name-only", realRef])).not.toContain("appeared-mid-capture.ts");
 
-		const raced = preservePostStartWork(ws, () => ({
+		const raced = await preservePostStartWork(ws, () => ({
 			status: "preserved",
 			stashRef: realRef,
 			untrackedNotCaptured: 1,
@@ -250,7 +251,7 @@ describe("post-start terminal preserves the worktree before reporting failure (i
 		expect(git(ws, ["ls-files", "--others", "--exclude-standard"]).trim()).toBe("");
 
 		// No seam: the production capture path, against real git.
-		const preservation = preservePostStartWork(ws);
+		const preservation = await preservePostStartWork(ws);
 
 		// The hook really did fire inside the capture window.
 		expect(git(ws, ["ls-files", "--others", "--exclude-standard"])).toContain("appeared-mid-capture.ts");
@@ -295,7 +296,7 @@ describe("post-start terminal preserves the worktree before reporting failure (i
 		await installMidCaptureHook(`printf 'export const later = true;\\n' >> "${ws}/src.ts"`);
 
 		// No seam: the production capture path, against real git.
-		const preservation = preservePostStartWork(ws);
+		const preservation = await preservePostStartWork(ws);
 
 		// The hook really did append inside the capture window.
 		expect(await readFile(path.join(ws, "src.ts"), "utf8")).toBe(`${original}export const later = true;\n`);
@@ -360,7 +361,9 @@ describe("post-start terminal preserves the worktree before reporting failure (i
 			// per-command cap so each call would otherwise SUCCEED rather than time out.
 			process.env.GJC_GIT_DELAY = "1.5";
 			const started = Date.now();
-			preservation = preservePostStartWork(ws);
+			// MUST be awaited INSIDE the try: the `finally` restores PATH, so awaiting outside would
+			// let the shim be removed before the children ever spawn and the test would pass in ~0ms.
+			preservation = await preservePostStartWork(ws);
 			elapsed = Date.now() - started;
 		} finally {
 			process.env.PATH = originalPath;
@@ -384,11 +387,111 @@ describe("post-start terminal preserves the worktree before reporting failure (i
 		expect(message).not.toContain("No uncommitted work was found");
 	}, 30_000);
 
+	// REGRESSION (round-5 review, availability axis A3): the capture used `execFileSync`, and
+	// `#settlePrompt` is synchronous, so up to ~5s of git pinned the shared loop. One `AcpAgent`
+	// serves MANY session records in one process, so that stalled every OTHER session's frames too —
+	// a cross-session availability defect no honest-status test could catch, which is why four
+	// rounds shipped without noticing it.
+	//
+	// Two assertions, deliberately: ordering (the timer callback ran BEFORE the capture resolved)
+	// and liveness (the loop kept ticking throughout). Ordering alone would pass if the loop
+	// unblocked only at the very end; ticks alone would be weaker evidence of interleaving.
+	it("leaves the event loop free while the capture runs", async () => {
+		await writeFile(path.join(ws, "src.ts"), "export const v = 2;\n");
+		const realGit = execFileSync("which", ["git"], { encoding: "utf8" }).trim();
+		const shimDir = path.join(ws, ".gjc-shim");
+		await mkdir(shimDir, { recursive: true });
+		await writeFile(
+			path.join(shimDir, "git"),
+			["#!/bin/sh", 'sleep "${GJC_GIT_DELAY:-0}"', `exec ${realGit} "$@"`, ""].join("\n"),
+		);
+		await chmod(path.join(shimDir, "git"), 0o755);
+
+		const originalPath = process.env.PATH;
+		const originalDelay = process.env.GJC_GIT_DELAY;
+		const order: string[] = [];
+		let ticks = 0;
+		let preservation: PostStartPreservation | undefined;
+		let interval: ReturnType<typeof setInterval> | undefined;
+		try {
+			process.env.PATH = `${shimDir}:${originalPath ?? ""}`;
+			process.env.GJC_GIT_DELAY = "1";
+
+			// Started but NOT awaited: the loop must stay live while it runs.
+			const capturing = preservePostStartWork(ws).then(result => {
+				preservation = result;
+				order.push("capture");
+			});
+			interval = setInterval(() => {
+				ticks++;
+			}, 20);
+			await new Promise<void>(resolve =>
+				setTimeout(() => {
+					order.push("timer");
+					resolve();
+				}, 200),
+			);
+			await capturing;
+		} finally {
+			if (interval) clearInterval(interval);
+			process.env.PATH = originalPath;
+			if (originalDelay === undefined) delete process.env.GJC_GIT_DELAY;
+			else process.env.GJC_GIT_DELAY = originalDelay;
+		}
+		expect(process.env.PATH).toBe(originalPath);
+
+		// (i) Ordering: a blocking capture would have finished before any timer could fire.
+		expect(order).toEqual(["timer", "capture"]);
+		// (ii) Liveness: measured headroom is ~46 ticks/s on this runtime against a >=1s git
+		// delay, so 3 is far below anything a loaded runner could miss — and unreachable if the
+		// loop is pinned.
+		expect(ticks).toBeGreaterThanOrEqual(3);
+
+		// Still an honest result, not a fast lie.
+		expect(preservation).toBeDefined();
+		expect(["preserved", "unknown"]).toContain(preservation?.status ?? "<none>");
+		expect(preservation?.snapshotComplete).toBe(false);
+	}, 30_000);
+
+	// A deferred reject that never fires hangs the prompt forever — strictly worse than the
+	// blocking it replaces. The wall is what makes the deferral safe.
+	it("resolves within the settlement wall even when the capture never settles", async () => {
+		const started = Date.now();
+		// A seam that never settles: only the wall can end this.
+		const preservation = await preserveWithinSettlementWall(ws, () => new Promise<never>(() => {}), 150);
+		const elapsed = Date.now() - started;
+
+		expect(elapsed).toBeLessThan(5_000);
+		// Honest on timeout: unverified, never `clean`.
+		expect(preservation.status).toBe("unknown");
+		expect(preservation.snapshotComplete).toBe(false);
+		expect(postStartOperatorMessage({ category: "agent_runtime", preservation })).toContain(
+			"could not be verified or preserved",
+		);
+	});
+
+	it("never rejects, so a settling caller can always reject exactly once", async () => {
+		// The caller defers its single `waiter.reject` until this resolves. If this could reject or
+		// hang, that reject would be dropped and the prompt would never settle.
+		const thrower = (): never => {
+			throw new Error("git is gone");
+		};
+		for (const [label, seam] of [
+			["throwing seam", thrower],
+			["rejecting seam", () => Promise.reject(new Error("boom")) as unknown as Promise<never>],
+			["never-settling seam", () => new Promise<never>(() => {})],
+		] as const) {
+			const preservation = await preserveWithinSettlementWall(ws, seam, 150);
+			expect({ label, status: preservation.status }).toEqual({ label, status: "unknown" });
+			expect({ label, complete: preservation.snapshotComplete }).toEqual({ label, complete: false });
+		}
+	});
+
 	it("still reports a stable capture as complete, with no race wording", async () => {
 		// The control for the case above: without it, a blanket "always incomplete" regression passes.
 		await writeFile(path.join(ws, "src.ts"), "export const v = 2;\n");
 
-		const preservation = preservePostStartWork(ws);
+		const preservation = await preservePostStartWork(ws);
 
 		expect(preservation.status).toBe("preserved");
 		expect(preservation.snapshotComplete).toBe(true);
@@ -399,16 +502,16 @@ describe("post-start terminal preserves the worktree before reporting failure (i
 		expect(message).not.toContain("do not discard this worktree");
 	});
 
-	it("treats an unverifiable or unstable re-read as unknown rather than clean", () => {
+	it("treats an unverifiable or unstable re-read as unknown rather than clean", async () => {
 		// A `clean` verdict nobody re-confirmed is indistinguishable from "I did not look".
 		for (const stable of [undefined, false, "true" as unknown as boolean, null as unknown as boolean])
-			expect(preservePostStartWork(ws, () => ({ status: "clean", untrackedNotCaptured: 0, stable })).status).toBe(
-				"unknown",
-			);
+			expect(
+				(await preservePostStartWork(ws, () => ({ status: "clean", untrackedNotCaptured: 0, stable }))).status,
+			).toBe("unknown");
 		// And a capture that DID verify still reports clean.
-		expect(preservePostStartWork(ws, () => ({ status: "clean", untrackedNotCaptured: 0, stable: true })).status).toBe(
-			"clean",
-		);
+		expect(
+			(await preservePostStartWork(ws, () => ({ status: "clean", untrackedNotCaptured: 0, stable: true }))).status,
+		).toBe("clean");
 	});
 
 	// REGRESSION (round-3 review finding 1): `#settlePrompt` leaves `preservation` undefined for any
@@ -439,9 +542,9 @@ describe("post-start terminal preserves the worktree before reporting failure (i
 		expect(message).toContain("No uncommitted work was found to preserve.");
 	});
 
-	it("reports the larger uncaptured count when files appear during the capture", () => {
+	it("reports the larger uncaptured count when files appear during the capture", async () => {
 		// The operator needs the number that covers what is actually missing from the snapshot.
-		const raced = preservePostStartWork(ws, () => ({
+		const raced = await preservePostStartWork(ws, () => ({
 			status: "preserved",
 			stashRef: "d".repeat(40),
 			untrackedNotCaptured: 3,
@@ -474,18 +577,19 @@ describe("post-start terminal preserves the worktree before reporting failure (i
 	// REGRESSION (review finding 1): an uninspectable worktree used to return the same bare
 	// `undefined` as a verified-clean one, so the operator was told "No uncommitted work was found
 	// to preserve." for a tree nobody had managed to look at — and swept it.
-	it("reports an uninspectable worktree as unknown, never as clean", () => {
+	it("reports an uninspectable worktree as unknown, never as clean", async () => {
 		const thrower = (): never => {
 			throw new Error("git is gone");
 		};
 		// Still fail-safe: it reports, it does not throw.
-		expect(() => preservePostStartWork(ws, thrower)).not.toThrow();
+		// Async now: a rejected promise would sail past `not.toThrow()`, so assert on the promise.
+		await expect(preservePostStartWork(ws, thrower)).resolves.toBeDefined();
 
 		for (const [label, preservation] of [
-			["capture threw", preservePostStartWork(ws, thrower)],
-			["not a git repo", preservePostStartWork(path.join(tmpdir(), "gjc-5664-absent-dir"))],
-			["no workspace", preservePostStartWork(undefined)],
-			["empty workspace", preservePostStartWork("")],
+			["capture threw", await preservePostStartWork(ws, thrower)],
+			["not a git repo", await preservePostStartWork(path.join(tmpdir(), "gjc-5664-absent-dir"))],
+			["no workspace", await preservePostStartWork(undefined)],
+			["empty workspace", await preservePostStartWork("")],
 		] as const) {
 			expect({ label, status: preservation.status }).toEqual({ label, status: "unknown" });
 			expect({ label, complete: preservation.snapshotComplete }).toEqual({ label, complete: false });
@@ -506,7 +610,7 @@ describe("post-start terminal preserves the worktree before reporting failure (i
 	// the rejection. A capture that hangs or overruns its budget must degrade to `unknown` rather
 	// than delaying — or changing — the terminal outcome. Driven through the injected seam so this
 	// asserts the RESULT and never races a wall clock.
-	it("degrades to unknown when the capture exceeds its budget or the git call times out", () => {
+	it("degrades to unknown when the capture exceeds its budget or the git call times out", async () => {
 		const timedOut = (): never => {
 			// The shape `execFileSync` throws on a `timeout` overrun: SIGKILLed, string `code`.
 			throw Object.assign(new Error("spawnSync git ETIMEDOUT"), {
@@ -524,7 +628,7 @@ describe("post-start terminal preserves the worktree before reporting failure (i
 			["output cap blown", bufferBlown],
 			["budget overrun", () => ({ status: "unknown", untrackedNotCaptured: 0 }) as const],
 		] as const) {
-			const preservation = preservePostStartWork(ws, seam);
+			const preservation = await preservePostStartWork(ws, seam);
 			expect({ label, status: preservation.status }).toEqual({ label, status: "unknown" });
 			// A killed git is NOT evidence the tree was empty.
 			expect({ label, complete: preservation.snapshotComplete }).toEqual({ label, complete: false });
@@ -535,7 +639,7 @@ describe("post-start terminal preserves the worktree before reporting failure (i
 		await writeFile(path.join(ws, "src.ts"), "export const v = 2;\n");
 		await writeFile(path.join(ws, "secret-blob.ts"), "x".repeat(200_000));
 
-		const preservation = preservePostStartWork(ws);
+		const preservation = await preservePostStartWork(ws);
 
 		expect(preservation.status).toBe("preserved");
 		expect(preservation.untrackedNotCaptured).toBe(1);
@@ -564,7 +668,7 @@ describe("post-start terminal preserves the worktree before reporting failure (i
 describe("post-start terminal wording names the upstream provider (issue #5664)", () => {
 	it("tells the operator the provider failed and where the work went", async () => {
 		await writeFile(path.join(ws, "src.ts"), "export const v = 2;\n");
-		const preservation = preservePostStartWork(ws);
+		const preservation = await preservePostStartWork(ws);
 		const data = wireData(overloadFailure(preservation));
 
 		// The classification that was already on the wire is unchanged.
