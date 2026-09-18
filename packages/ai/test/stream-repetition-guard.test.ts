@@ -1,5 +1,9 @@
 import { describe, expect, it } from "bun:test";
-import { DEFAULT_REPETITION_THRESHOLD, StreamRepetitionGuard } from "../src/utils/stream-repetition-guard";
+import {
+	DEFAULT_REPETITION_THRESHOLD,
+	MAX_REPETITION_THRESHOLD,
+	StreamRepetitionGuard,
+} from "../src/utils/stream-repetition-guard";
 
 /** Feed `text` through the guard in fixed-size chunks and collect what it emits. */
 function feedInChunks(guard: StreamRepetitionGuard, text: string, size: number): string {
@@ -84,6 +88,88 @@ describe("StreamRepetitionGuard", () => {
 			const emitted = guard.feed(`${SENTENCE}\n`.repeat(50));
 			expect(guard.tripped).toBe(true);
 			expect(countOccurrences(emitted, SENTENCE)).toBeLessThanOrEqual(3);
+		});
+	});
+
+	// `repetitionGuard` is public on `SimpleStreamOptions`, so the threshold
+	// arrives from outside the package typed only as `number`. The old
+	// `Math.max(2, value)` passed `NaN`, `Infinity` and fractions straight
+	// through into both the comparison and the token-retention sizing
+	// (#5627 review r6).
+	describe("threshold normalization", () => {
+		/** Feed well past any plausible threshold so only detection can be the variable. */
+		function feedRunawayLines(guard: StreamRepetitionGuard, copies = 400): void {
+			feedInChunks(guard, `${SENTENCE}\n`.repeat(copies), 11);
+		}
+
+		// Pins: detection must not be silently disabled. Pre-fix `#threshold` was
+		// `NaN`, `repeats >= NaN` was always false, and the guard never tripped.
+		it("falls back to the default when the threshold is NaN, and still trips", () => {
+			const guard = new StreamRepetitionGuard({ threshold: Number.NaN });
+
+			// Behaviour first, deliberately: this is the assertion that reds on
+			// unfixed code, and it states the defect (detection silently off)
+			// rather than the mechanism.
+			feedRunawayLines(guard);
+			expect(guard.tripped).toBe(true);
+			expect(guard.trip?.repeats).toBe(DEFAULT_REPETITION_THRESHOLD);
+			expect(guard.threshold).toBe(DEFAULT_REPETITION_THRESHOLD);
+		});
+
+		// Pins: the same hole reached through the other two non-finite values.
+		it("falls back to the default for Infinity and -Infinity, and still trips", () => {
+			for (const threshold of [Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY]) {
+				const guard = new StreamRepetitionGuard({ threshold });
+
+				feedRunawayLines(guard);
+				expect(guard.tripped).toBe(true);
+				expect(guard.trip?.repeats).toBe(DEFAULT_REPETITION_THRESHOLD);
+				expect(guard.threshold).toBe(DEFAULT_REPETITION_THRESHOLD);
+			}
+		});
+
+		// Pins the memory bound. `#maxTrackedTokens` is `MAX_NGRAM_TOKENS *
+		// (threshold + 1)` — a pure function of the *normalized* threshold — so
+		// clamping the threshold is exactly what makes retention finite. Asserting
+		// the clamped value therefore pins the capacity bound; the trip below
+		// proves the clamp left a threshold the counter can actually reach, rather
+		// than trading unbounded memory for a dead detector.
+		it("clamps an oversized threshold to the cap and trips at the clamped count", () => {
+			const guard = new StreamRepetitionGuard({ threshold: 1e9 });
+
+			feedRunawayLines(guard, MAX_REPETITION_THRESHOLD * 3);
+			expect(guard.tripped).toBe(true);
+			expect(guard.trip?.repeats).toBe(MAX_REPETITION_THRESHOLD);
+			expect(guard.threshold).toBe(MAX_REPETITION_THRESHOLD);
+			expect(Number.isFinite(guard.threshold)).toBe(true);
+		});
+
+		// Pins: a fraction is floored, so the integer repeat counter reaches it
+		// exactly instead of overshooting to the next integer.
+		it("floors a fractional threshold and still trips", () => {
+			const guard = new StreamRepetitionGuard({ threshold: 5.9 });
+
+			const emitted = feedInChunks(guard, `${SENTENCE}\n`.repeat(50), 11);
+			expect(guard.tripped).toBe(true);
+			expect(guard.trip?.repeats).toBe(5);
+			expect(countOccurrences(emitted, SENTENCE)).toBeLessThanOrEqual(5);
+			expect(guard.threshold).toBe(5);
+		});
+
+		// Pins the floor of the clamp: below 2 there is no such thing as a
+		// "repeat", so the guard would trip on the first unit it ever saw.
+		it("raises a below-minimum threshold to 2", () => {
+			expect(new StreamRepetitionGuard({ threshold: 1 }).threshold).toBe(2);
+			expect(new StreamRepetitionGuard({ threshold: 0 }).threshold).toBe(2);
+			expect(new StreamRepetitionGuard({ threshold: -7 }).threshold).toBe(2);
+		});
+
+		it("leaves an ordinary in-range threshold alone", () => {
+			expect(new StreamRepetitionGuard().threshold).toBe(DEFAULT_REPETITION_THRESHOLD);
+			expect(new StreamRepetitionGuard({ threshold: 3 }).threshold).toBe(3);
+			expect(new StreamRepetitionGuard({ threshold: MAX_REPETITION_THRESHOLD }).threshold).toBe(
+				MAX_REPETITION_THRESHOLD,
+			);
 		});
 	});
 

@@ -22,6 +22,18 @@
 export const DEFAULT_REPETITION_THRESHOLD = 12;
 
 /**
+ * Largest accepted repetition threshold.
+ *
+ * Token retention is `MAX_NGRAM_TOKENS * (threshold + 1)`, so capping the
+ * threshold is what makes the guard's memory bounded: at this cap it retains
+ * at most 64 * 129 = 8256 tokens, against 832 at the default. That is roughly
+ * ten times the default's headroom — generous for a caller who genuinely wants
+ * a laxer guard — while keeping a hostile or buggy option from turning the
+ * detector into an unbounded buffer (#5627 review r6).
+ */
+export const MAX_REPETITION_THRESHOLD = 128;
+
+/**
  * `errorCode` stamped on a turn this guard stopped. A bounded classifier, never
  * raw model text — consumers branch on it to tell a local decode-loop stop from
  * a client cancellation or a transport fault (#5627).
@@ -70,7 +82,12 @@ export interface StreamRepetitionTrip {
 }
 
 export interface StreamRepetitionGuardOptions {
-	/** Consecutive repeats that trip the guard. Defaults to 12. */
+	/**
+	 * Consecutive repeats that trip the guard. Defaults to 12. Normalized by
+	 * {@link normalizeThreshold} — non-finite values fall back to the default,
+	 * fractional values are floored, and the result is clamped into
+	 * `[2, MAX_REPETITION_THRESHOLD]`.
+	 */
 	readonly threshold?: number;
 }
 
@@ -85,6 +102,32 @@ function normalize(unit: string): string {
 
 function sampleOf(unit: string): string {
 	return unit.length <= MAX_SAMPLE_CHARS ? unit : `${unit.slice(0, MAX_SAMPLE_CHARS - 1)}…`;
+}
+
+/**
+ * Coerce a caller-supplied threshold into an integer the guard can actually
+ * reach, and that bounds its state.
+ *
+ * `repetitionGuard` is public on `SimpleStreamOptions`, so this value arrives
+ * from outside the package and is only typed `number` (#5627 review r6). The
+ * previous `Math.max(2, value)` admitted three broken inputs:
+ *
+ *   - `NaN` — `Math.max(2, NaN)` is `NaN`, and every comparison against `NaN`
+ *     is false, so the guard silently never tripped: detection off, no error.
+ *   - `Infinity` / a huge finite value — the threshold is unreachable *and*
+ *     `#maxTrackedTokens` becomes effectively unbounded, so `#tokens` grows
+ *     for the whole stream while detection can never fire.
+ *   - a fraction like `2.5` — an integer repeat counter never equals it, so
+ *     the effective threshold silently becomes the next integer up.
+ *
+ * Normalizes rather than throws. This runs on the streaming hot path, and
+ * turning a bad caller option into a failed request is worse than running the
+ * guard at its documented default.
+ */
+function normalizeThreshold(value: number | undefined): number {
+	if (value === undefined || !Number.isFinite(value)) return DEFAULT_REPETITION_THRESHOLD;
+	// Floor before clamping so the counter can hit the threshold exactly.
+	return Math.min(MAX_REPETITION_THRESHOLD, Math.max(2, Math.floor(value)));
 }
 
 export class StreamRepetitionGuard {
@@ -102,8 +145,19 @@ export class StreamRepetitionGuard {
 	#finalized = false;
 
 	constructor(options?: StreamRepetitionGuardOptions) {
-		this.#threshold = Math.max(2, options?.threshold ?? DEFAULT_REPETITION_THRESHOLD);
+		this.#threshold = normalizeThreshold(options?.threshold);
+		// Derived from the *normalized* threshold, never the raw option, so the
+		// capacity is finite by construction and provably at most
+		// `MAX_NGRAM_TOKENS * (MAX_REPETITION_THRESHOLD + 1)` for every input.
 		this.#maxTrackedTokens = MAX_NGRAM_TOKENS * (this.#threshold + 1);
+	}
+
+	/**
+	 * The threshold actually in force — the caller's option after
+	 * {@link normalizeThreshold}, which may differ from what was passed.
+	 */
+	get threshold(): number {
+		return this.#threshold;
 	}
 
 	get tripped(): boolean {

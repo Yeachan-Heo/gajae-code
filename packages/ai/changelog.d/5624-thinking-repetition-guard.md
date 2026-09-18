@@ -52,6 +52,17 @@
   could neither disable a channel nor change its threshold. It is now part of
   `SimpleStreamOptions` (as the shared `RepetitionGuardOptions` type) and is
   forwarded to the transport; defaults and semantics are unchanged.
+- Validate the repetition threshold before it sizes the guard's state. Now that
+  `repetitionGuard` is public, a caller could pass `NaN` — which made every
+  comparison false and silently disabled detection with no error — or `Infinity`
+  or a huge value, which left detection permanently off *and* made the guard's
+  token retention unbounded on a long stream. A fractional threshold was also
+  never reached exactly by an integer repeat counter. The threshold is now
+  normalized at the constructor: non-finite values fall back to the default,
+  fractions are floored, and the result is clamped into `[2,
+  MAX_REPETITION_THRESHOLD]`, so tracking capacity is finite by construction.
+  Bad input normalizes rather than throwing — a failed request would be worse
+  than the guard running at its default.
 - Strip leaked chat-template tool fences (`<|tool_call_end|>` and friends) from
   rendered thinking, including fences split across streaming chunk boundaries.
   The visible text channel is deliberately untouched, so a fence token the
