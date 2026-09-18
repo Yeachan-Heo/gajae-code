@@ -1022,8 +1022,11 @@ describe("SDK session CLI", () => {
 		const tail = await runCli(root, agentDir, ["tail", "live", "--until-idle", "--timeout-ms", "2000"]);
 
 		assertLiveFramesPrecededReplay();
-		expect(tail.exitCode, `tail stdout=${tail.stdout}\nstderr=${tail.stderr}`).toBe(1);
-		expect(JSON.parse(tail.stdout)).toMatchObject({ ok: false, error: { code: "tail_timeout" } });
+		// The wait window closed without the turn going idle. That is a bounded,
+		// non-terminal observation, not a failure: what was collected is returned
+		// and `terminal: false` says the turn is still running.
+		expect(tail.exitCode, `tail stdout=${tail.stdout}\nstderr=${tail.stderr}`).toBe(0);
+		expect(JSON.parse(tail.stdout)).toMatchObject({ ok: true, result: { terminal: false } });
 	}, 60_000);
 
 	it("does not complete --until-idle when a delayed unsequenced terminal follows a newer sequenced start", async () => {
@@ -1045,8 +1048,11 @@ describe("SDK session CLI", () => {
 		const tail = await runCli(root, agentDir, ["tail", "live", "--until-idle", "--timeout-ms", "2000"]);
 
 		assertLiveFramesPrecededReplay();
-		expect(tail.exitCode, `tail stdout=${tail.stdout}\nstderr=${tail.stderr}`).toBe(1);
-		expect(JSON.parse(tail.stdout)).toMatchObject({ ok: false, error: { code: "tail_timeout" } });
+		// The wait window closed without the turn going idle. That is a bounded,
+		// non-terminal observation, not a failure: what was collected is returned
+		// and `terminal: false` says the turn is still running.
+		expect(tail.exitCode, `tail stdout=${tail.stdout}\nstderr=${tail.stderr}`).toBe(0);
+		expect(JSON.parse(tail.stdout)).toMatchObject({ ok: true, result: { terminal: false } });
 	}, 60_000);
 
 	it("fails closed when conflicting lifecycle kinds claim the same canonical position", async () => {
