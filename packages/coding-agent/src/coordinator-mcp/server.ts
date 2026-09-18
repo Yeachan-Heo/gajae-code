@@ -3855,7 +3855,17 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 	): Promise<Map<string, string>> {
 		const authorized = new Map<string, string>();
 		for (const sessionId of new Set(sessionIds)) {
-			const transaction = await readSessionTransaction(questionPaths, sessionId);
+			// A corrupt or unreadable peer session must never abort authorization for
+			// every other session. Only the explicitly scoped session may propagate,
+			// otherwise one bad WAL record makes namespace-wide reads permanently
+			// unavailable instead of degrading to the sessions that are still sound.
+			let transaction: Awaited<ReturnType<typeof readSessionTransaction>>;
+			try {
+				transaction = await readSessionTransaction(questionPaths, sessionId);
+			} catch (error) {
+				if (scopedSessionId === sessionId) throw error;
+				continue;
+			}
 			if (!transaction) {
 				if (scopedSessionId === sessionId && !allowMissingSessionIds.has(sessionId))
 					throw new Error("resource_gone");
@@ -7572,11 +7582,18 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				await assertPersistedSessionAuthority(transaction.canonical.session);
 				await recoverCanonicalSessionProjection(sessionId);
 			} catch (error) {
+				// Degrade per session instead of aborting the namespace sweep: one
+				// unreadable record must not make every coordination read fail.
 				if (
 					!(error instanceof Error) ||
 					(error.message !== "state_corrupt" && (scopedSessionId !== null || !isSessionAuthorityError(error)))
-				)
-					throw error;
+				) {
+					if (scopedSessionId === sessionId) throw error;
+					logger.warn("Coordinator projection recovery skipped session", {
+						sessionId,
+						error: error instanceof Error ? error.message : String(error),
+					});
+				}
 			}
 		}
 	}
