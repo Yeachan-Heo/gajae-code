@@ -7,8 +7,8 @@ import { FileLockTestHooks } from "../src/config/file-lock";
 import { endpointIncarnation } from "../src/sdk/broker/endpoint-authority";
 import {
 	canonicalSessionCwd,
-	SessionIndex,
 	SESSION_HEARTBEAT_INTERVAL_MS,
+	SessionIndex,
 	type SessionIndexEvent,
 	sessionIndexChecksum,
 	sessionWorktreeRoot,
