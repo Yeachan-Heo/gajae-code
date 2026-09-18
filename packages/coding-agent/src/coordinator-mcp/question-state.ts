@@ -2349,6 +2349,30 @@ export function compactTransaction(transaction: CoordinatorSessionTransactionV1,
 	);
 	const pinnedRequests = new Set<object>(pinnedPrompts);
 	const pinnedTurns = new Set(pinnedPrompts.map(request => request.coordinator_turn_id));
+	// An active acknowledged turn proves its runtime receipt through the prompt
+	// request that carries it. Dropping that request on retention leaves the WAL
+	// failing its own `assertTransaction` receipt invariant on the next read, so
+	// the session — and every namespace-wide scan that touches it — is corrupt
+	// forever. Retention must never outrank an invariant the reader enforces.
+	const activeTurnStatuses = new Set(["delivering", "active", "waiting_for_answer", "completing"]);
+	const receiptBearingPromptIds = new Set(
+		Object.entries(transaction.requests.prompts)
+			.filter(([, request]) => {
+				const turn = request.coordinator_turn_id
+					? transaction.canonical.turns[request.coordinator_turn_id]
+					: undefined;
+				if (!turn || !activeTurnStatuses.has(turn.status)) return false;
+				const delivery = turn.delivery as Record<string, unknown>;
+				if (delivery.prompt_acknowledged !== true) return false;
+				return (
+					["accepted", "linked", "terminal", "completed"].includes(request.phase) &&
+					request.runtime_receipt?.accepted === true &&
+					request.runtime_receipt.command_id === delivery.runtime_command_id &&
+					request.runtime_receipt.turn_id === delivery.runtime_turn_id
+				);
+			})
+			.map(([id]) => id),
+	);
 	for (const [id, event] of Object.entries(transaction.outbox))
 		if (
 			event.emitted &&
@@ -2362,6 +2386,7 @@ export function compactTransaction(transaction: CoordinatorSessionTransactionV1,
 			if (
 				request.phase === "completed" &&
 				!pinnedRequests.has(request) &&
+				!receiptBearingPromptIds.has(id) &&
 				old(request.updated_at) &&
 				JSON.stringify(transaction.canonical).includes(id) === false
 			)
