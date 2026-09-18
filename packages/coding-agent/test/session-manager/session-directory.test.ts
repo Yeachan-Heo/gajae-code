@@ -12,6 +12,7 @@ import {
 	deleteManagedSessionCandidate,
 	listManagedCandidates,
 	MANAGED_SESSION_BINDING_FILE,
+	type ManagedScopeResolution,
 	ManagedSessionScopeTestHooks,
 	openManagedCandidateForWrite,
 	prepareManagedSessionScopeForWrite,
@@ -474,6 +475,97 @@ describe.skipIf(process.platform !== "linux")("managed session scope shared stic
 });
 
 describe("managed session write protocol", () => {
+	it("reports the identity failure that stopped a managed startup instead of a blanket binding_invalid", async () => {
+		const { scope } = await fixture();
+		expect(prepareManagedSessionScopeForWriteSync(scope).kind).toBe("resolved");
+
+		// The managed storage identity guards only run under the Windows
+		// verify-first policy, so a Windows identity failure is invisible to every
+		// other platform's CI. Reproduce that failure and assert the operator is
+		// told which invariant broke instead of a blanket `binding_invalid`.
+		const real = syncFs.lstatSync;
+		const lstat = vi.spyOn(syncFs, "lstatSync");
+		lstat.mockImplementation(((target: string, options?: { bigint?: boolean }) => {
+			if (target === scope.directoryPath) throw new Error("identity_mismatch");
+			return (real as (...args: unknown[]) => unknown)(target, options);
+		}) as typeof syncFs.lstatSync);
+
+		let prepared: ManagedScopeResolution;
+		try {
+			prepared = prepareManagedSessionScopeForWriteSync(scope, "windows-existing-verify-first");
+		} finally {
+			lstat.mockRestore();
+		}
+
+		expect(prepared.kind).toBe("error");
+		if (prepared.kind !== "error") throw new Error("Expected a prepare failure");
+		expect(prepared.cause?.classification).toBe("identity_mismatch");
+		expect(prepared.cause?.diagnostic).toMatch(/^prepare:/);
+		expect(JSON.stringify(prepared.cause)).not.toContain(scope.directoryPath);
+		expect(prepared.message).not.toContain(scope.directoryPath);
+	});
+
+	it("separates an external holder's errno from a corrupted binding without leaking the path", async () => {
+		const { cwd, sessionsRoot, scope } = await fixture();
+		const agentDir = path.dirname(sessionsRoot);
+		SessionManager.managedDestination(cwd, agentDir);
+
+		// An external holder (AV scanner, indexer, cloud-sync agent) denying the
+		// managed scope is operationally distinct from a corrupted binding, and
+		// only the errno separates them.
+		const denied = Object.assign(new Error(`EPERM: operation not permitted, open '${scope.directoryPath}'`), {
+			code: "EPERM",
+			path: scope.directoryPath,
+		});
+		const staging = new RegExp(`${MANAGED_SESSION_BINDING_FILE}\\..*\\.staging$`);
+		const openSync = vi.spyOn(syncFs, "openSync");
+		const real = openSync.getMockImplementation() ?? syncFs.openSync;
+		openSync.mockImplementation(((target: Parameters<typeof syncFs.openSync>[0], ...rest: unknown[]) => {
+			if (typeof target === "string" && staging.test(target)) throw denied;
+			return (real as (...args: unknown[]) => number)(target, ...rest);
+		}) as typeof syncFs.openSync);
+
+		let failure: unknown;
+		try {
+			SessionManager.managedDestination(cwd, agentDir);
+		} catch (error) {
+			failure = error;
+		} finally {
+			openSync.mockRestore();
+		}
+
+		expect(failure).toBeInstanceOf(Error);
+		const startupError = failure as Error;
+		expect(startupError.cause).toEqual({ classification: "EPERM", diagnostic: "prepare:binding_publish" });
+		expect(startupError.message).toBe("Could not prepare managed session scope (EPERM: prepare:binding_publish).");
+		expect(startupError.message).not.toContain(scope.directoryPath);
+		expect(JSON.stringify(startupError.cause)).not.toContain(scope.directoryPath);
+	});
+
+	it("still redacts an unclassified startup failure that embeds its pathname", async () => {
+		const { cwd, sessionsRoot, scope } = await fixture();
+		const agentDir = path.dirname(sessionsRoot);
+		SessionManager.managedDestination(cwd, agentDir);
+		const locks = path.join(scope.directoryPath, ".gjc-managed-session-internal", "locks");
+		await fs.rm(locks, { recursive: true, force: true });
+		await fs.writeFile(locks, "not-a-directory\n", { mode: 0o600 });
+
+		let failure: unknown;
+		try {
+			SessionManager.managedDestination(cwd, agentDir);
+		} catch (error) {
+			failure = error;
+		}
+
+		expect(failure).toBeInstanceOf(Error);
+		const startupError = failure as Error;
+		expect(startupError.cause).toEqual({
+			classification: "binding_invalid",
+			diagnostic: "prepare:locks_directory",
+		});
+		expect(startupError.message).not.toContain(locks);
+	});
+
 	it("accepts partial scrubbed replay trees but rejects moved or rootless entries", () => {
 		const expected = {
 			rootDev: "1",

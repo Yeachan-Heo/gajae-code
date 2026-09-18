@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- A managed session scope that fails to prepare now reports the invariant that actually failed instead of a blanket `binding_invalid`. The identity guards (`identity_mismatch`, `reparse_point`, `not_directory`, `not_file`) and external-holder errnos (`EACCES`, `EPERM`, `EBUSY`, `EROFS`, `ENOSPC`, `EMFILE`, `ENFILE`, `ELOOP`, `ENOTDIR`) reach the operator as their own classification, so a startup blocked by an AV scanner, indexer, or cloud-sync agent is distinguishable from a corrupted binding. These guards only run under the Windows `windows-existing-verify-first` policy, which is why the collapse was invisible to non-Windows CI. Failures that embed a pathname still redact to `binding_invalid`, and the existing `code`/`cause.classification` split is unchanged.
+
 ## [0.17.2] - 2026-09-18
 
 ### Added
