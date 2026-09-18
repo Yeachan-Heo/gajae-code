@@ -2348,7 +2348,10 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			if (mappedError instanceof Error && requestErrorResetCodes.has(mappedError)) {
 				output.transportFailure = transportFailureFacts({
 					...output.transportFailure,
-					http2RstCode: requestErrorResetCodes.get(mappedError),
+					// The native error can precede the request's reset observation.
+					// Fill a missing observation at settlement, after terminal draining;
+					// local teardown may supply it, so this is not remote-cause evidence.
+					http2RstCode: requestErrorResetCodes.get(mappedError) ?? h2Request?.rstCode,
 				});
 			}
 			output.errorMessage = formatErrorMessageWithRetryAfter(mappedError);

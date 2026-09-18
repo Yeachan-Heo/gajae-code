@@ -146,7 +146,7 @@ describe("Cursor raw transport watchdog", () => {
 		expect(result.transportFailure?.status).toBeUndefined();
 		expect(events.filter(isTerminalEvent)).toHaveLength(1);
 	});
-	it("adds a following native error code without replacing the first aborted diagnostic", async () => {
+	it("enriches the first aborted diagnostic after duplicate close/aborted notifications", async () => {
 		const connect = http2.connect;
 		let request: http2.ClientHttp2Stream | undefined;
 		vi.spyOn(http2, "connect").mockImplementation(((authority, options) => {
@@ -165,6 +165,8 @@ describe("Cursor raw transport watchdog", () => {
 				if (!request) throw new Error("missing request");
 				// Deliberate ordering test, not evidence of a remote reset source.
 				Object.defineProperty(request, "rstCode", { value: 2 });
+				request.emit("aborted");
+				request.emit("close");
 				request.emit("aborted");
 				request.emit("error", Object.assign(new Error("native detail"), { code: "ERR_HTTP2_STREAM_ERROR" }));
 				request.emit("error", Object.assign(new Error("later detail"), { code: "ERR_HTTP2_SESSION_ERROR" }));
@@ -206,6 +208,50 @@ describe("Cursor raw transport watchdog", () => {
 		const { events, result } = await collectTerminal(baseUrl, { streamFirstEventTimeoutMs: 10_000 });
 		expect(result.errorMessage).toBe("first native failure");
 		expect(result.transportFailure).toMatchObject({ http2RstCode: 2, nativeErrorCode: "ERR_HTTP2_STREAM_ERROR" });
+		expect(events.filter(isTerminalEvent)).toHaveLength(1);
+	});
+
+	it.each([
+		{ kind: "close", initial: undefined, final: 2, expected: 2 },
+		{ kind: "aborted", initial: undefined, final: 2, expected: 2 },
+		{ kind: "close", initial: 2, final: 0, expected: 2 },
+		{ kind: "close", initial: 0, final: 8, expected: 0 },
+	])("preserves reset observations around a frozen native error: %j", async ({ kind, initial, final, expected }) => {
+		const connect = http2.connect;
+		let request: http2.ClientHttp2Stream | undefined;
+		vi.spyOn(http2, "connect").mockImplementation(((authority, options) => {
+			const client = typeof options === "function" ? connect(authority, options) : connect(authority, options ?? {});
+			const createRequest = client.request.bind(client);
+			vi.spyOn(client, "request").mockImplementation((...args) => {
+				request = createRequest(...args);
+				return request;
+			});
+			return client;
+		}) as typeof http2.connect);
+		const baseUrl = await createCursorServer(peer => {
+			peer.on("error", () => {});
+			peer.respond({ ":status": 200, "content-type": "application/connect+proto" });
+			setTimeout(() => {
+				if (!request) throw new Error("missing request");
+				// Explicit event schedule: first native error, then competing terminal.
+				Object.defineProperty(request, "rstCode", { value: initial, configurable: true });
+				const nativeError = Object.assign(new Error("first native failure"), { code: "ERR_HTTP2_STREAM_ERROR" });
+				Object.freeze(nativeError);
+				request.emit("error", nativeError);
+				// The production terminalize path has already requested local close.
+				// This is a final observation, not proof of a remote reset cause.
+				Object.defineProperty(request, "rstCode", { value: final });
+				request.emit(kind);
+				expect(Object.hasOwn(nativeError, "http2RstCode")).toBe(false);
+				request.emit("error", Object.assign(new Error("late native failure"), { code: "ERR_HTTP2_SESSION_ERROR" }));
+			}, 10);
+		});
+		const { events, result } = await collectTerminal(baseUrl, { streamFirstEventTimeoutMs: 10_000 });
+		expect(result.errorMessage).toBe("first native failure");
+		expect(result.transportFailure).toMatchObject({
+			http2RstCode: expected,
+			nativeErrorCode: "ERR_HTTP2_STREAM_ERROR",
+		});
 		expect(events.filter(isTerminalEvent)).toHaveLength(1);
 	});
 
