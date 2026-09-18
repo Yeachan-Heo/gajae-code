@@ -68,11 +68,24 @@ test("a positioned live item cannot be keyed before its authoritative checkpoint
 	);
 	expect(lateLive).toEqual([expect.objectContaining({ revision: 7, generation: 1, seq: 5 })]);
 	expect(() => tailItemKey(lateLive[0]!)).not.toThrow();
-	// A frame that already carries its own revision keeps it.
+	// A frame that already carries its own revision keeps it, and it becomes
+	// the stamp for what follows: revisions advance during a turn, and a
+	// terminal frame stamped with the old checkpoint would sort before this
+	// start (lifecycle order is revision-first) and never complete --until-idle.
 	const stamped = buffer.push(
-		toTailItemV1({ kind: "message_update", revision: 9, generation: 1, seq: 6, payload: {} }, { kind: "event" }),
+		toTailItemV1({ kind: "turn_start", revision: 9, generation: 1, seq: 6, payload: {} }, { kind: "event" }),
 	);
 	expect(stamped[0]?.revision).toBe(9);
+	const terminalAfter = buffer.push(
+		toTailItemV1({ kind: "turn_end", generation: 1, seq: 7, payload: {} }, { kind: "event" }),
+	);
+	expect(terminalAfter[0]?.revision).toBe(9);
+	// Never regresses: an older explicit revision does not pull the stamp back.
+	buffer.push(toTailItemV1({ kind: "activity", revision: 8, generation: 1, seq: 8, payload: {} }, { kind: "event" }));
+	expect(
+		buffer.push(toTailItemV1({ kind: "activity", generation: 1, seq: 9, payload: {} }, { kind: "event" }))[0]
+			?.revision,
+	).toBe(9);
 });
 
 test("ordinary live events read the authoritative revision at emission time", () => {

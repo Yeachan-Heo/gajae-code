@@ -101,15 +101,24 @@ export function tailItemKey(item: SdkTailItemV1): string {
  * one such frame turned a live, answering session into one no consumer could
  * observe: every poll failed, the caller held the turn, and after five minutes
  * reported it failed while the answer sat in the transcript (2026-09-17/18,
- * five sessions). The checkpoint's revision is the correct stamp for anything
- * that arrives after it; a frame is never a reason to lose the tail.
+ * five sessions). A frame is never a reason to lose the tail.
+ *
+ * The stamp is the LATEST revision observed, not the checkpoint's: revisions
+ * advance during a turn, and lifecycle order is compared revision-first. A
+ * terminal frame stamped with the initial checkpoint revision would sort
+ * before a start that carried a later one, and `--until-idle` would wait on a
+ * turn that had already ended.
  */
 export class TailRevisionBuffer {
 	#pending: SdkTailItemV1[] = [];
 	#revision: number | undefined;
 
 	push(item: SdkTailItemV1): SdkTailItemV1[] {
-		if (item.revision !== undefined || item.generation === undefined || item.seq === undefined) return [item];
+		if (item.revision !== undefined) {
+			if (this.#revision !== undefined && item.revision > this.#revision) this.#revision = item.revision;
+			return [item];
+		}
+		if (item.generation === undefined || item.seq === undefined) return [item];
 		if (this.#revision === undefined) {
 			this.#pending.push(item);
 			return [];

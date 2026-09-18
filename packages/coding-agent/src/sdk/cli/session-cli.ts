@@ -1394,6 +1394,7 @@ async function offlineTailReplay(
 	agentDir: string,
 	sessionId: string,
 	row: SdkSessionRowV1,
+	afterTranscriptId?: string,
 ): Promise<unknown> {
 	const lifecycle = createBrokerSessionLifecycleService(agentDir);
 	const outcome = await lifecycle.list({
@@ -1426,15 +1427,21 @@ async function offlineTailReplay(
 			reason: retained.reason,
 		});
 	}
+	const items = entries.map((entry, index) =>
+		toTailItemV1(entry, { kind: "transcript", revision: index + 1, seq: index }),
+	);
+	// The same contract as a live resume: rows up to and including the id the
+	// caller already has are omitted, so a session that stopped between two
+	// polls does not replay processed history on the next one. Unknown
+	// boundary keeps everything (a duplicate is recoverable; a missing row is not).
+	const boundary = afterTranscriptId === undefined ? -1 : items.findIndex(item => item.id === afterTranscriptId);
 	return {
 		ok: true,
 		result: {
 			version: SESSION_ROWS_VERSION,
 			source: "offline",
 			session: row,
-			items: entries.map((entry, index) =>
-				toTailItemV1(entry, { kind: "transcript", revision: index + 1, seq: index }),
-			),
+			items: boundary >= 0 ? items.slice(boundary + 1) : items,
 			terminal: true,
 		},
 	};
@@ -1808,7 +1815,8 @@ export async function runTail(
 		throw new SdkSessionCliError("session_unavailable", `Session ${sessionId} is not indexed by the broker.`, 1);
 	if (row.deleted)
 		throw new SdkSessionCliError("session_deleted", `Session ${sessionId} was deleted and has no tail.`, 1);
-	if (!row.live || row.terminalUncertain === true) return await offlineTailReplay(repo, agentDir, sessionId, row);
+	if (!row.live || row.terminalUncertain === true)
+		return await offlineTailReplay(repo, agentDir, sessionId, row, args.afterTranscriptId);
 	return await runLiveTail(agentDir, sessionId, row, args);
 }
 
