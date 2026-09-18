@@ -29,7 +29,8 @@
  * failure inside it degrades to empty evidence — which is precisely the conflation that let an
  * uninspectable worktree be reported as clean.
  */
-import { execFileSync } from "node:child_process";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import { isSafePromptFailureCode } from "../../sdk/prompt-failure";
 import type { SdkPromptFailureCategory } from "../../sdk/prompt-status";
 
@@ -122,7 +123,7 @@ export function racedDuringCapture(value: unknown): boolean {
 }
 
 /** A worktree nobody could inspect. Conservative by construction. */
-function unverifiedPreservation(): PostStartPreservation {
+export function unverifiedPreservation(): PostStartPreservation {
 	return { status: "unknown", snapshotComplete: false };
 }
 
@@ -136,8 +137,11 @@ export const OPERATOR_POST_START_PREFIX = "The turn ended after execution had al
 /**
  * Budgets for the capture. `#settlePrompt` runs this SYNCHRONOUSLY before it rejects the turn, so a
  * slow git invocation blocks the Bun event loop and delays the very terminal this exists to make
- * safe. `execFileSync` enforces both for real on this runtime: a `timeout` overrun throws
- * `ETIMEDOUT` after SIGKILL, a `maxBuffer` overrun throws `ENOBUFS`.
+ * safe. The capture therefore runs on ASYNC child processes: `execFileSync` would pin the loop for the
+ * whole wall, and one `AcpAgent` serves many session records in one process, so a blocking capture
+ * stalls every OTHER session's frames too. `execFile` enforces both bounds for real (a `timeout`
+ * overrun SIGKILLs the child; a `maxBuffer` overrun rejects) while leaving the loop free —
+ * measured on this runtime: 0 loop ticks during a 1s sync child, 46 during the same async one.
  *
  * `PRESERVE_BUDGET_MS` is the WHOLE-capture wall, and the per-command cap alone cannot enforce it:
  * the dirty path runs up to six git children, so six independent 2s caps admit ~12s. Each spawn is
@@ -150,13 +154,24 @@ const PRESERVE_BUDGET_MS = 5_000;
 /**
  * Below this much remaining budget, do not spawn at all.
  *
- * Not a nicety — it is the only safe handling of the tail. `execFileSync` treats `timeout: 0` as
- * UNBOUNDED (measured: `timeout: 0` against `sleep 3` completed in 3013ms), so a naive
- * `Math.min(cap, remaining)` would make the worst case — no budget left — strictly worse than having
- * no deadline at all. A negative throws `ERR_OUT_OF_RANGE` synchronously out of `execFileSync`, which
- * would escape as an exception rather than degrade. Skipping the spawn is the only correct tail.
+ * Not a nicety — it is the only safe handling of the tail. `timeout: 0` is UNBOUNDED (measured:
+ * `timeout: 0` against `sleep 3` completed in 3013ms), so a naive `Math.min(cap, remaining)` would
+ * make the worst case — no budget left — strictly worse than having no deadline at all. A negative
+ * throws `ERR_OUT_OF_RANGE`. Skipping the spawn is the only correct tail.
  */
 const MIN_SPAWN_BUDGET_MS = 50;
+
+/**
+ * How long settlement will wait for the detached capture tail before rejecting without it.
+ *
+ * `preservePostStartWork` already bounds its own git work to {@link PRESERVE_BUDGET_MS}, so in
+ * practice the tail always wins this race. The wall exists for the case that bound cannot cover — an
+ * injected capture seam that never settles, or a pathological stall between spawns — because a
+ * deferred reject that never fires would hang the prompt forever, which is strictly worse than the
+ * blocking this deferral replaces. The grace is what separates "the capture used its whole budget"
+ * from "the capture is never coming back".
+ */
+export const SETTLE_PRESERVATION_WALL_MS = PRESERVE_BUDGET_MS + 1_000;
 
 /** This is the ACP settle path, not the harness vanish path; the stash list records which. */
 const STASH_MESSAGE = "gjc-post-start-snapshot";
@@ -176,10 +191,12 @@ export interface WorktreeCapture {
 }
 
 /** Injectable capture seam; production uses {@link boundedWorktreeCapture}. */
-export type WorktreeCaptureFn = (workspace: string) => WorktreeCapture;
+export type WorktreeCaptureFn = (workspace: string) => Promise<WorktreeCapture> | WorktreeCapture;
 
 /** A git runner already bound to one capture's workspace and deadline. */
-type BoundedGit = (args: string[]) => string;
+type BoundedGit = (args: string[]) => Promise<string>;
+
+const execFileAsync = promisify(execFile);
 
 /**
  * Raised instead of spawning when the whole-capture deadline leaves no usable room.
@@ -198,18 +215,18 @@ class CaptureBudgetExhausted extends Error {}
  * must not share, or reset, each other's wall.
  */
 function boundedGit(workspace: string, deadline: number): BoundedGit {
-	return (args: string[]): string => {
+	return async (args: string[]): Promise<string> => {
 		const remaining = deadline - Date.now();
-		// Never pass 0 (unbounded) or a negative (throws ERR_OUT_OF_RANGE) to `execFileSync`.
+		// Never pass 0 (unbounded) or a negative (throws ERR_OUT_OF_RANGE).
 		if (remaining < MIN_SPAWN_BUDGET_MS) throw new CaptureBudgetExhausted();
-		return execFileSync("git", args, {
+		const { stdout } = await execFileAsync("git", args, {
 			cwd: workspace,
 			encoding: "utf8",
-			stdio: ["ignore", "pipe", "ignore"],
 			timeout: Math.min(GIT_COMMAND_TIMEOUT_MS, remaining),
 			maxBuffer: GIT_OUTPUT_MAX_BYTES,
 			killSignal: "SIGKILL",
 		});
+		return stdout;
 	};
 }
 
@@ -217,13 +234,30 @@ function boundedGit(workspace: string, deadline: number): BoundedGit {
  * True only for a git process that ran to completion and exited with `expected`.
  *
  * This is the distinction the whole `clean` vs `unknown` split rests on: a plain non-zero exit is
- * git ANSWERING (`diff --quiet` exits 1 to mean "dirty"), whereas a spawn failure, an `ETIMEDOUT`,
- * or an `ENOBUFS` sets a string `code` and means git never answered at all. Reading the second as
- * the first is what would report an uninspectable worktree as clean.
+ * git ANSWERING (`diff --quiet` exits 1 to mean "dirty"), whereas a spawn failure, a timeout kill,
+ * or an output-cap overrun means git never answered at all. Reading the second as the first is what
+ * would report an uninspectable worktree as clean.
+ *
+ * The ASYNC error shape differs from the sync one and this predicate reads the async shape.
+ * Measured on this runtime:
+ *
+ *   case                     execFileSync                promisify(execFile)
+ *   -----------------------  --------------------------  ---------------------------------------
+ *   diff --quiet, dirty      {status:1, code:undefined}  {code:1, status:undefined, killed:false}
+ *   timeout (SIGKILL)        {code:"ETIMEDOUT"}          {code:null, killed:true, signal:"SIGKILL"}
+ *   missing binary           {code:"ENOENT"}             {code:"ENOENT", errno:-2}
+ *   maxBuffer overrun        {code:"ENOBUFS"}            {code:"ERR_CHILD_PROCESS_STDIO_MAXBUFFER"}
+ *
+ * So the exit code now arrives as a NUMBER in `code` and `status` is undefined — reading `status`
+ * here would make every dirty worktree degrade to `unknown`, silently disabling the whole feature
+ * while the honest-status tests still passed. `killed` is checked explicitly because a SIGKILLed
+ * timeout carries `code: null`, and `typeof null !== "string"`, so a string-only guard would read a
+ * killed child as an answer.
  */
 function isPlainExit(error: unknown, expected: number): boolean {
-	const candidate = error as { status?: unknown; code?: unknown } | undefined;
-	return candidate?.status === expected && typeof candidate?.code !== "string";
+	const candidate = error as { code?: unknown; killed?: unknown } | undefined;
+	if (candidate?.killed === true) return false;
+	return typeof candidate?.code === "number" && candidate.code === expected;
 }
 
 /**
@@ -251,10 +285,10 @@ interface WorktreeObservation {
  * change, exit 1 = dirty, anything else = git did not answer. A worktree emitting more untracked
  * paths than the output cap is emphatically not clean, so a truncated read is a non-answer too.
  */
-function observeWorktree(git: BoundedGit): WorktreeObservation | undefined {
+async function observeWorktree(git: BoundedGit): Promise<WorktreeObservation | undefined> {
 	let trackedDirty: boolean;
 	try {
-		git(["diff", "--quiet", "HEAD"]);
+		await git(["diff", "--quiet", "HEAD"]);
 		trackedDirty = false;
 	} catch (error) {
 		// Covers budget exhaustion too: `CaptureBudgetExhausted` carries no `status`, so it is not a
@@ -263,7 +297,7 @@ function observeWorktree(git: BoundedGit): WorktreeObservation | undefined {
 		trackedDirty = true;
 	}
 	try {
-		const untracked = git(["ls-files", "--others", "--exclude-standard"])
+		const untracked = (await git(["ls-files", "--others", "--exclude-standard"]))
 			.split("\n")
 			.map(line => line.trim())
 			.filter(Boolean).length;
@@ -287,11 +321,11 @@ function observeWorktree(git: BoundedGit): WorktreeObservation | undefined {
  * spawn failure, `ETIMEDOUT`, `ENOBUFS` — is git not answering at all, and an unverifiable fence must
  * never promote a result to complete.
  */
-function trackedMatchesSnapshot(git: BoundedGit, stashRef: string | undefined): boolean {
+async function trackedMatchesSnapshot(git: BoundedGit, stashRef: string | undefined): Promise<boolean> {
 	// No stash object means there is no tree to fence against, so stability cannot be established.
 	if (stashRef === undefined) return false;
 	try {
-		git(["diff", "--quiet", stashRef]);
+		await git(["diff", "--quiet", stashRef]);
 		return true;
 	} catch {
 		// Includes "no budget left to run the fence", which is not verification either.
@@ -299,7 +333,7 @@ function trackedMatchesSnapshot(git: BoundedGit, stashRef: string | undefined): 
 	}
 }
 
-export function boundedWorktreeCapture(workspace: string): WorktreeCapture {
+export async function boundedWorktreeCapture(workspace: string): Promise<WorktreeCapture> {
 	// One deadline for the whole capture, carried by the runner into every child it spawns. Each
 	// spawn is capped at the smaller of the per-command cap and what is left, and a spawn with no
 	// room left is skipped rather than started, so the boundary checks this used to do between
@@ -308,12 +342,12 @@ export function boundedWorktreeCapture(workspace: string): WorktreeCapture {
 	const unknown: WorktreeCapture = { status: "unknown", untrackedNotCaptured: 0 };
 
 	// 1. Observe the worktree.
-	const before = observeWorktree(git);
+	const before = await observeWorktree(git);
 	if (before === undefined) return unknown;
 
 	// 2. Verified empty — but only if it is STILL empty once re-read. Nothing is stashed either way.
 	if (!before.trackedDirty && before.untracked === 0) {
-		const after = observeWorktree(git);
+		const after = await observeWorktree(git);
 		// Cannot re-read, or it changed: either way "verified empty" is no longer a claim anyone can
 		// make, and asserting it would strand whatever landed. Downgrade to `unknown`, never `clean`.
 		if (after === undefined || after.trackedDirty || after.untracked !== 0) return unknown;
@@ -335,10 +369,10 @@ export function boundedWorktreeCapture(workspace: string): WorktreeCapture {
 	 *
 	 * A non-answer on either half is NOT stability.
 	 */
-	const settle = (stashRef: string | undefined): WorktreeCapture => {
+	const settle = async (stashRef: string | undefined): Promise<WorktreeCapture> => {
 		// Fence first, so it runs as close to the capture as the budget allows.
-		const trackedStable = trackedMatchesSnapshot(git, stashRef);
-		const after = observeWorktree(git);
+		const trackedStable = await trackedMatchesSnapshot(git, stashRef);
+		const after = await observeWorktree(git);
 		const untrackedStable = after !== undefined && after.untracked === before.untracked;
 		const untrackedNotCaptured = Math.max(before.untracked, after?.untracked ?? before.untracked);
 		return {
@@ -351,29 +385,29 @@ export function boundedWorktreeCapture(workspace: string): WorktreeCapture {
 
 	// 3. Untracked-only: no tracked content for a stash object to hold, so there is no ref to offer.
 	//    Reported as preserved-without-a-ref, which routes to the keep-the-worktree wording.
-	if (!before.trackedDirty) return settle(undefined);
+	if (!before.trackedDirty) return await settle(undefined);
 
 	// 4. Snapshot the tracked content. A failure here means no recoverable ref — still `preserved`,
 	//    because the tree IS known dirty, just not recoverable from the stash list.
 	let oid: string;
 	try {
-		oid = git(["stash", "create", STASH_MESSAGE]).trim();
+		oid = (await git(["stash", "create", STASH_MESSAGE])).trim();
 	} catch {
 		// Failed, timed out, or no budget left to start: still `preserved`, just no ref.
-		return settle(undefined);
+		return await settle(undefined);
 	}
-	if (oid.length === 0) return settle(undefined);
+	if (oid.length === 0) return await settle(undefined);
 
 	try {
-		git(["stash", "store", "-m", STASH_MESSAGE, oid]);
+		await git(["stash", "store", "-m", STASH_MESSAGE, oid]);
 	} catch {
 		// The object exists but nothing references it, so it is not durably recoverable.
-		return settle(undefined);
+		return await settle(undefined);
 	}
 	// The ref is kept even when the re-read differs: it genuinely recovers the tracked content it
 	// holds, and discarding a real ref over a race would help nobody. `settle` marks it unstable so
 	// the snapshot is reported incomplete rather than complete.
-	return settle(oid);
+	return await settle(oid);
 }
 
 /**
@@ -384,13 +418,13 @@ export function boundedWorktreeCapture(workspace: string): WorktreeCapture {
  * is not a git repo, a git binary that is missing or hangs, a capture that overran its budget.
  * "I could not look" is reported as exactly that, never as a verified-clean tree.
  */
-export function preservePostStartWork(
+export async function preservePostStartWork(
 	workspace: string | undefined,
 	capture: WorktreeCaptureFn = boundedWorktreeCapture,
-): PostStartPreservation {
+): Promise<PostStartPreservation> {
 	if (typeof workspace !== "string" || workspace.length === 0) return unverifiedPreservation();
 	try {
-		const result = capture(workspace);
+		const result = await capture(workspace);
 		const status = preservationStatus(result.status);
 		if (status === "unknown") return unverifiedPreservation();
 		// A `clean` verdict is only worth reporting when the capture actually verified the tree held
@@ -417,6 +451,42 @@ export function preservePostStartWork(
 		};
 	} catch {
 		return unverifiedPreservation();
+	}
+}
+
+/**
+ * `preservePostStartWork` bounded so settlement can never wait on it indefinitely.
+ *
+ * The capture already bounds its own git work to {@link PRESERVE_BUDGET_MS}, so in practice it
+ * always wins this race. The wall covers what that bound cannot: an injected capture seam that
+ * never settles, or a stall between spawns. It matters because the caller defers its rejection
+ * until this resolves, and a deferred reject that never fires hangs the prompt forever — strictly
+ * worse than the blocking the deferral replaces.
+ *
+ * NEVER rejects and never resolves `clean` on a failure: every degraded path reports `unknown`, so
+ * a capture nobody could complete is reported as unverified rather than as an empty worktree.
+ */
+export async function preserveWithinSettlementWall(
+	workspace: string | undefined,
+	capture: WorktreeCaptureFn = boundedWorktreeCapture,
+	wallMs: number = SETTLE_PRESERVATION_WALL_MS,
+): Promise<PostStartPreservation> {
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	try {
+		return await Promise.race([
+			preservePostStartWork(workspace, capture),
+			new Promise<PostStartPreservation>(resolve => {
+				timer = setTimeout(() => resolve(unverifiedPreservation()), wallMs);
+				// A pending wall must never hold the process open.
+				timer.unref?.();
+			}),
+		]);
+	} catch {
+		// `preservePostStartWork` degrades internally rather than throwing, so this is
+		// belt-and-braces — the caller still gets a result it can reject with.
+		return unverifiedPreservation();
+	} finally {
+		if (timer) clearTimeout(timer);
 	}
 }
 

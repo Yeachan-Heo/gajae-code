@@ -76,8 +76,9 @@ import { resolveAcpPermissionMode } from "./permission-mode";
 import {
 	type PostStartPreservation,
 	postStartOperatorMessage,
-	preservePostStartWork,
+	preserveWithinSettlementWall,
 	safeStashRef,
+	unverifiedPreservation,
 } from "./post-start-preservation";
 import type { AcpStartupOptions } from "./startup-options";
 import { ACP_TERMINAL_AUTH_FLAG } from "./terminal-auth";
@@ -4001,25 +4002,73 @@ export class AcpAgent implements Agent {
 			outcome.phase === "post_start"
 				? outcome
 				: (rephaseFailedOutcome(outcome, { hasActivity: waiter.observedTurnActivity }) as SdkPromptFailedOutcome);
+		// A submission-phase rejection never ran, so it stranded nothing and rejects immediately on
+		// the synchronous path, exactly as before.
+		if (failure.phase !== "post_start") {
+			waiter.reject(new AcpPromptFailureError(failure));
+			return;
+		}
 		// A post-start turn may have spent the last hour editing this worktree, and the rejection
 		// below is terminal by design — the retry gates that forbid re-running a tool-executing turn
 		// stay exactly as they are (issue #5574). Snapshot the uncommitted work into the stash list
 		// BEFORE reporting the failure, so the edits survive the worktree being swept (issue #5664).
 		// Scoped to the phase rather than the category: any post-start fatal strands work.
-		const preservation = failure.phase === "post_start" ? preservePostStartWork(record.cwd) : undefined;
-		// Only a turn that actually stashed something warrants a warn line; a verified-clean tree is
-		// the uninteresting case and would just add noise to every post-start failure. An `unknown`
-		// worktree IS worth surfacing — it is the case where an operator may still lose work.
-		if (preservation && preservation.status !== "clean")
-			logger.warn("acp_post_start_work_preserved", {
-				sessionId: id,
-				status: preservation.status,
-				category: failure.category,
-				...(isSafePromptFailureCode(failure.providerCode) ? { providerCode: failure.providerCode } : {}),
-				...(preservation.stashRef ? { stashRef: preservation.stashRef } : {}),
-				snapshotComplete: preservation.snapshotComplete,
-			});
-		waiter.reject(new AcpPromptFailureError(failure, preservation));
+		//
+		// The capture spawns git children, so it runs on a DETACHED tail rather than inline: this
+		// method is synchronous and one `AcpAgent` serves many session records in one process, so
+		// capturing inline pinned the whole loop — and every other session's frames with it — for up
+		// to the capture's whole wall (review A3). Everything above this point stayed synchronous and
+		// in order, so the single-owner fence that `#settlePrompt` provides is unchanged; only the
+		// capture and the reject that consumes it are deferred.
+		this.#rejectAfterPreservation(id, waiter, failure, record.cwd);
+	}
+
+	/**
+	 * Run the post-start worktree capture off the shared loop, then reject with its result.
+	 *
+	 * The reject MUST happen exactly once on every path — capture resolved, capture rejected, wall
+	 * fired — because a dropped reject hangs the prompt forever, which is strictly worse than the
+	 * blocking it replaces. `settleOnce` enforces that, and the whole tail is wrapped so nothing
+	 * inside can escape as an unhandled rejection.
+	 *
+	 * The wall bounds the deferral itself: `preservePostStartWork` already bounds its own git work,
+	 * but a capture seam that never settles would otherwise strand the turn, so settlement never
+	 * waits longer than the capture's own budget plus a grace.
+	 */
+	#rejectAfterPreservation(
+		id: string,
+		waiter: PromptWaiter,
+		failure: SdkPromptFailedOutcome,
+		cwd: string | undefined,
+	): void {
+		let done = false;
+		const settleOnce = (preservation: PostStartPreservation | undefined): void => {
+			if (done) return;
+			done = true;
+			// Only a turn that actually stashed something warrants a warn line; a verified-clean tree
+			// is the uninteresting case and would just add noise to every post-start failure. An
+			// `unknown` worktree IS worth surfacing — it is the case where an operator may still lose
+			// work.
+			if (preservation && preservation.status !== "clean")
+				logger.warn("acp_post_start_work_preserved", {
+					sessionId: id,
+					status: preservation.status,
+					category: failure.category,
+					...(isSafePromptFailureCode(failure.providerCode) ? { providerCode: failure.providerCode } : {}),
+					...(preservation.stashRef ? { stashRef: preservation.stashRef } : {}),
+					snapshotComplete: preservation.snapshotComplete,
+				});
+			waiter.reject(new AcpPromptFailureError(failure, preservation));
+		};
+		void (async () => {
+			try {
+				// Already wall-bounded and non-rejecting; `settleOnce` is the second belt.
+				settleOnce(await preserveWithinSettlementWall(cwd));
+			} catch (error) {
+				logger.warn("acp_post_start_preservation_failed", { sessionId: id, error: String(error) });
+				settleOnce(unverifiedPreservation());
+			}
+		})();
 	}
 
 	async #emitEndOfTurnUpdates(id: string, adapter: AcpSdkAdapter, publicationGeneration: number): Promise<void> {
