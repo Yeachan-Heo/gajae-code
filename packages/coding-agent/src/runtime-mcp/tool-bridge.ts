@@ -260,6 +260,9 @@ export class MCPTool implements CustomTool<TSchema, MCPToolDetails> {
 	invalidateForSessionControl(): void {
 		this.#sessionControlInvalidated = true;
 	}
+	#isAvailableForSessionControl(): boolean {
+		return !this.#sessionControlInvalidated && this.#isAvailable?.() !== false;
+	}
 
 	#callOptions(signal?: AbortSignal): MCPRequestOptions {
 		const inputHandler = this.#inputHandlerResolver?.();
@@ -313,7 +316,7 @@ export class MCPTool implements CustomTool<TSchema, MCPToolDetails> {
 		const args = normalizeToolArgs(params);
 		const provider = this.connection._source?.provider;
 		const providerName = this.connection._source?.providerName;
-		if (this.#sessionControlInvalidated || this.#isAvailable?.() === false) {
+		if (!this.#isAvailableForSessionControl()) {
 			return buildErrorResult(
 				new Error("MCP server is suspended for this session"),
 				this.connection.name,
@@ -331,6 +334,15 @@ export class MCPTool implements CustomTool<TSchema, MCPToolDetails> {
 			if (this.reconnect && isRetriableConnectionError(error)) {
 				const newConn = await reconnectWithAbort(this.reconnect, signal);
 				if (newConn) {
+					if (!this.#isAvailableForSessionControl()) {
+						return buildErrorResult(
+							new Error("MCP server is suspended for this session"),
+							this.connection.name,
+							this.tool.name,
+							provider,
+							providerName,
+						);
+					}
 					if (this.#noReplay)
 						return buildErrorResult(error, this.connection.name, this.tool.name, provider, providerName);
 					// Rebind so subsequent calls on this instance use the fresh connection
@@ -377,6 +389,9 @@ export class DeferredMCPTool implements CustomTool<TSchema, MCPToolDetails> {
 	#sessionControlInvalidated = false;
 	invalidateForSessionControl(): void {
 		this.#sessionControlInvalidated = true;
+	}
+	#isAvailableForSessionControl(): boolean {
+		return !this.#sessionControlInvalidated && this.#isAvailable?.() !== false;
 	}
 
 	#callOptions(signal?: AbortSignal): MCPRequestOptions {
@@ -436,7 +451,7 @@ export class DeferredMCPTool implements CustomTool<TSchema, MCPToolDetails> {
 		const args = normalizeToolArgs(params);
 		const provider = this.#fallbackProvider;
 		const providerName = this.#fallbackProviderName;
-		if (this.#sessionControlInvalidated || this.#isAvailable?.() === false) {
+		if (!this.#isAvailableForSessionControl()) {
 			return buildErrorResult(
 				new Error("MCP server is suspended for this session"),
 				this.serverName,
@@ -463,6 +478,15 @@ export class DeferredMCPTool implements CustomTool<TSchema, MCPToolDetails> {
 				if (this.reconnect && isRetriableConnectionError(callError)) {
 					const newConn = await reconnectWithAbort(this.reconnect, signal);
 					if (newConn) {
+						if (!this.#isAvailableForSessionControl()) {
+							return buildErrorResult(
+								new Error("MCP server is suspended for this session"),
+								this.serverName,
+								this.tool.name,
+								provider,
+								providerName,
+							);
+						}
 						if (this.#noReplay)
 							return buildErrorResult(callError, this.serverName, this.tool.name, provider, providerName);
 						const retryProvider = newConn._source?.provider ?? provider;
@@ -491,6 +515,15 @@ export class DeferredMCPTool implements CustomTool<TSchema, MCPToolDetails> {
 			rethrowIfAborted(connError, signal);
 			if (this.reconnect) {
 				const newConn = await reconnectWithAbort(this.reconnect, signal);
+				if (newConn && !this.#isAvailableForSessionControl()) {
+					return buildErrorResult(
+						new Error("MCP server is suspended for this session"),
+						this.serverName,
+						this.tool.name,
+						provider,
+						providerName,
+					);
+				}
 				if (newConn && !this.#noReplay) {
 					try {
 						const result = await callTool(newConn, this.tool.name, args, this.#callOptions(signal));

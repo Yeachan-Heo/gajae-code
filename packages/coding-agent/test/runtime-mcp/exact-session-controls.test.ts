@@ -6,6 +6,7 @@ import * as mcpClient from "../../src/runtime-mcp/client";
 import { MCPManager } from "../../src/runtime-mcp/manager";
 import { legacyEraObservation } from "../../src/runtime-mcp/protocol";
 import { attachExactMcpControls, getExactMcpControls, revokeExactMcpControls } from "../../src/runtime-mcp/redaction";
+import { DeferredMCPTool, MCPTool } from "../../src/runtime-mcp/tool-bridge";
 import type { MCPServerConnection, MCPToolCallResult, MCPTransport } from "../../src/runtime-mcp/types";
 import type { AgentSession } from "../../src/session/agent-session";
 
@@ -103,6 +104,76 @@ describe("exact-config MCP session controls", () => {
 		const freshResult = await freshTool!.execute("fresh", {}, () => {}, {} as never);
 		expect(freshResult.details?.isError).toBeFalsy();
 		expect(calls).toEqual(["tools/call"]);
+	});
+
+	test("an invalidated MCP tool does not replay after reconnect", async () => {
+		const firstCallStarted = Promise.withResolvers<void>();
+		const failFirstCall = Promise.withResolvers<void>();
+		const reconnectStarted = Promise.withResolvers<void>();
+		const finishReconnect = Promise.withResolvers<void>();
+		const first = connection("exact", []);
+		first.transport.request = (async () => {
+			firstCallStarted.resolve();
+			await failFirstCall.promise;
+			throw new Error("ECONNRESET");
+		}) as MCPTransport["request"];
+		const replacementCalls: string[] = [];
+		const replacement = connection("exact", replacementCalls);
+		const tool = new MCPTool(first, { name: "lookup", inputSchema: { type: "object" } }, async () => {
+			reconnectStarted.resolve();
+			await finishReconnect.promise;
+			return replacement;
+		});
+
+		const execution = tool.execute("race", {}, () => {}, {} as never);
+		await firstCallStarted.promise;
+		failFirstCall.resolve();
+		await reconnectStarted.promise;
+		tool.invalidateForSessionControl();
+		finishReconnect.resolve();
+
+		const result = await execution;
+		expect(result.details?.isError).toBe(true);
+		expect(result.content).toEqual([{ type: "text", text: "MCP error: MCP server is suspended for this session" }]);
+		expect(replacementCalls).toEqual([]);
+	});
+
+	test("an invalidated deferred MCP tool does not replay after reconnect", async () => {
+		const firstCallStarted = Promise.withResolvers<void>();
+		const failFirstCall = Promise.withResolvers<void>();
+		const reconnectStarted = Promise.withResolvers<void>();
+		const finishReconnect = Promise.withResolvers<void>();
+		const first = connection("exact", []);
+		first.transport.request = (async () => {
+			firstCallStarted.resolve();
+			await failFirstCall.promise;
+			throw new Error("ECONNRESET");
+		}) as MCPTransport["request"];
+		const replacementCalls: string[] = [];
+		const replacement = connection("exact", replacementCalls);
+		const tool = new DeferredMCPTool(
+			"exact",
+			{ name: "lookup", inputSchema: { type: "object" } },
+			async () => first,
+			undefined,
+			async () => {
+				reconnectStarted.resolve();
+				await finishReconnect.promise;
+				return replacement;
+			},
+		);
+
+		const execution = tool.execute("race", {}, () => {}, {} as never);
+		await firstCallStarted.promise;
+		failFirstCall.resolve();
+		await reconnectStarted.promise;
+		tool.invalidateForSessionControl();
+		finishReconnect.resolve();
+
+		const result = await execution;
+		expect(result.details?.isError).toBe(true);
+		expect(result.content).toEqual([{ type: "text", text: "MCP error: MCP server is suspended for this session" }]);
+		expect(replacementCalls).toEqual([]);
 	});
 
 	test("an unavailable reconnect preserves the published predecessor", async () => {

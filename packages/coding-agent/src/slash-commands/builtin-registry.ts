@@ -3,8 +3,8 @@ import * as path from "node:path";
 import { ThinkingLevel } from "@gajae-code/agent-core";
 import { type Model, modelsAreEqual } from "@gajae-code/ai/core";
 import { getOAuthProviders } from "@gajae-code/ai/utils/oauth";
-import { PET_SKIN_IDS, PET_SKINS, type PetMode, Spacer, Text } from "@gajae-code/tui";
-import { setProjectDir } from "@gajae-code/utils";
+import { PET_SKIN_IDS, PET_SKINS, type PetMode, replaceTabs, Spacer, Text } from "@gajae-code/tui";
+import { sanitizeDisplayLine, setProjectDir } from "@gajae-code/utils";
 import { jobElapsedMs } from "../async";
 import { activateModelProfile, materializeActiveModelProfileAssignments } from "../config/model-profile-activation";
 import { formatModelProfileDisplayLabel } from "../config/model-profiles";
@@ -239,20 +239,26 @@ function providerSetupUsage(): string {
 	].join("\n");
 }
 
+function exactMcpDisplayName(name: string): string {
+	const sanitized = replaceTabs(sanitizeDisplayLine(name));
+	return sanitized || "<unnamed>";
+}
+
 function renderExactMcpStatus(snapshot: ExactMcpStatusSnapshot): string {
 	if (snapshot.servers.length === 0) {
 		return snapshot.startup === "no-servers-declared"
 			? "MCP servers: the config declares none."
 			: "MCP servers: not started yet.";
 	}
+	const servers = snapshot.servers.map(server => ({ ...server, name: exactMcpDisplayName(server.name) }));
 	// Server names and counts vary in width, so pad to the widest of each column;
 	// an unaligned table is unreadable once more than a couple of servers connect.
-	const nameWidth = Math.max(...snapshot.servers.map(server => server.name.length));
-	const transportWidth = Math.max(...snapshot.servers.map(server => server.transport.length));
-	const stateWidth = Math.max(...snapshot.servers.map(server => server.state.length));
-	const countWidth = Math.max(...snapshot.servers.map(server => String(server.toolCount).length));
+	const nameWidth = Math.max(...servers.map(server => server.name.length));
+	const transportWidth = Math.max(...servers.map(server => server.transport.length));
+	const stateWidth = Math.max(...servers.map(server => server.state.length));
+	const countWidth = Math.max(...servers.map(server => String(server.toolCount).length));
 	const lines = [`MCP servers (${snapshot.startup}):`];
-	for (const server of snapshot.servers) {
+	for (const server of servers) {
 		const count = String(server.toolCount).padStart(countWidth);
 		const unit = server.toolCount === 1 ? "tool" : "tools";
 		lines.push(
@@ -1676,7 +1682,7 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 				subcommand !== "reconnect"
 			) {
 				runtime.ctx.showError(
-					`Unknown subcommand: ${subcommand}. Usage: /mcp [status|list|suspend <name>|resume <name>|reconnect <name>]`,
+					`Unknown subcommand: ${exactMcpDisplayName(subcommand)}. Usage: /mcp [status|list|suspend <name>|resume <name>|reconnect <name>]`,
 				);
 				return commandConsumed();
 			}
@@ -1703,30 +1709,31 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 					);
 					return commandConsumed();
 				}
+				const displayName = exactMcpDisplayName(result.name);
 				switch (result.status) {
 					case "suspended":
-						runtime.ctx.showStatus(`MCP server "${result.name}" suspended for this session.`);
+						runtime.ctx.showStatus(`MCP server "${displayName}" suspended for this session.`);
 						break;
 					case "resumed":
-						runtime.ctx.showStatus(`MCP server "${result.name}" resumed (${result.toolCount} tools).`);
+						runtime.ctx.showStatus(`MCP server "${displayName}" resumed (${result.toolCount} tools).`);
 						break;
 					case "reconnected":
-						runtime.ctx.showStatus(`MCP server "${result.name}" reconnected (${result.toolCount} tools).`);
+						runtime.ctx.showStatus(`MCP server "${displayName}" reconnected (${result.toolCount} tools).`);
 						break;
 					case "already-suspended":
-						runtime.ctx.showWarning(`MCP server "${result.name}" is already suspended.`);
+						runtime.ctx.showWarning(`MCP server "${displayName}" is already suspended.`);
 						break;
 					case "not-suspended":
-						runtime.ctx.showWarning(`MCP server "${result.name}" is not suspended.`);
+						runtime.ctx.showWarning(`MCP server "${displayName}" is not suspended.`);
 						break;
 					case "unknown-server":
-						runtime.ctx.showError(`Unknown MCP server: ${result.name}`);
+						runtime.ctx.showError(`Unknown MCP server: ${displayName}`);
 						break;
 					case "unavailable":
 						runtime.ctx.showError(
 							result.action === "resume"
-								? `MCP server "${result.name}" could not be resumed and remains suspended.`
-								: `MCP server "${result.name}" could not be reconnected.`,
+								? `MCP server "${displayName}" could not be resumed and remains suspended.`
+								: `MCP server "${displayName}" could not be reconnected.`,
 						);
 						break;
 				}
