@@ -1258,22 +1258,36 @@ describe("AgentSession retry fallback", () => {
 	});
 
 	it.each([
+		{ managed: false, degraded: true, errorMessage: "Cursor HTTP/2 request aborted before turnEnded" },
+		{ managed: true, degraded: true, errorMessage: "Cursor HTTP/2 request aborted before turnEnded" },
+		{
+			managed: false,
+			degraded: true,
+			errorMessage: "Error: Provider stream timed out while waiting for the first event",
+		},
+		{
+			managed: true,
+			degraded: true,
+			errorMessage: "Error: Provider stream timed out while waiting for the first event",
+		},
 		{ managed: false, errorMessage: "Cursor HTTP/2 request aborted before turnEnded" },
 		{ managed: true, errorMessage: "Cursor HTTP/2 request aborted before turnEnded" },
 		{ managed: false, errorMessage: "Error: Provider stream timed out while waiting for the first event" },
 		{ managed: true, errorMessage: "Error: Provider stream timed out while waiting for the first event" },
-	])("keeps HTTP/2 diagnostics terminal: %j", async ({ managed, errorMessage }) => {
+	])("keeps HTTP/2 diagnostics terminal: %j", async ({ managed, degraded = false, errorMessage }) => {
 		const bundled = getBundledModel("anthropic", "claude-sonnet-4-5");
 		if (!bundled) throw new Error("Expected bundled test model");
 		const model = bundled;
 		const requestedModels: string[] = [];
 		const facts = { kind: "transport" as const, http2RstCode: 8, nativeErrorCode: "ERR_HTTP2_STREAM_ERROR" };
+		const providerFacts = degraded ? { ...facts, nonCloneable: () => {} } : facts;
+		if (degraded) expect(() => structuredClone(providerFacts)).toThrow();
 		const agent = new Agent({
 			initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
 			streamFn: requestedModel => {
 				requestedModels.push(`${requestedModel.provider}/${requestedModel.id}`);
 				// Exercise real session admission with Cursor’s terminal abort diagnostic.
-				return canonicalFirstEventTimeoutStream(requestedModel, [], facts, errorMessage);
+				return canonicalFirstEventTimeoutStream(requestedModel, [], providerFacts, errorMessage);
 			},
 		});
 		const settings = Settings.isolated({
