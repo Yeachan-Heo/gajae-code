@@ -6106,7 +6106,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 								processIncarnation: effectiveIncarnation,
 								direct,
 							});
-							brokerRegistrationEvent = await index.append({
+							const published = await index.append({
 								type: "host_registered",
 								...input,
 								locator,
@@ -6116,6 +6116,12 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 								...(options.lifecycleRequestId ? { lifecycleRequestId: options.lifecycleRequestId } : {}),
 								...(masterRole ? { masterRole } : {}),
 							});
+							brokerRegistrationEvent = published;
+							if (brokerRecoveryStopped) {
+								// Teardown may have run before append returned its ownership proof.
+								await index.unregisterIfCurrent(published);
+								if (brokerRegistrationEvent === published) brokerRegistrationEvent = undefined;
+							}
 						},
 						unregister: async input => {
 							const expected = brokerRegistrationEvent;

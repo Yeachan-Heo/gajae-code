@@ -1,10 +1,11 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "../src/extensibility/extensions";
 import { Broker } from "../src/sdk/broker/broker";
 import { ensureBroker } from "../src/sdk/broker/ensure";
+import { SessionIndex, type SessionIndexEvent } from "../src/sdk/broker/session-index";
 import { createSdkSessionRuntimeExtension } from "../src/sdk/host/session-runtime";
 import {
 	deriveSessionLifecycleIdempotencyKey,
@@ -254,6 +255,116 @@ test("four live SDK hosts recover broker index heartbeats without recreating ses
 		await fs.rm(root, { recursive: true, force: true });
 	}
 });
+
+for (const replacement of [false, true]) {
+	test(`late registration after shutdown retires only its owner (replacement: ${replacement})`, async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-sdk-late-registration-"));
+		const agentDir = path.join(root, "agent");
+		const sessionId = "stopped-during-registration";
+		const context = sdkContext(sessionId, root);
+		const handlers = new Map<string, (event: unknown, context: ExtensionContext) => Promise<void> | void>();
+		const api = {
+			on(event: string, handler: (event: unknown, context: ExtensionContext) => Promise<void> | void) {
+				handlers.set(event, handler);
+			},
+		} as unknown as ExtensionAPI;
+		const entered = Promise.withResolvers<void>();
+		const releasePublication = Promise.withResolvers<void>();
+		const published = Promise.withResolvers<SessionIndexEvent>();
+		const releaseResult = Promise.withResolvers<void>();
+		const append = SessionIndex.prototype.append;
+		const appendSpy = spyOn(SessionIndex.prototype, "append").mockImplementation(async function (
+			this: SessionIndex,
+			input,
+		) {
+			if (input.type !== "host_registered" || input.sessionId !== sessionId) return await append.call(this, input);
+			entered.resolve();
+			await releasePublication.promise;
+			const event = await append.call(this, input);
+			published.resolve(event);
+			await releaseResult.promise;
+			return event;
+		});
+		let starting: Promise<void> | void = undefined;
+		let transportStops = 0;
+		let broker: Broker | undefined;
+		try {
+			broker = new Broker({ agentDir });
+			await broker.start();
+			createSdkSessionRuntimeExtension(api, {
+				agentDir,
+				createTransport: async ({ sessionId: transportSessionId, stateRoot, token }) => ({
+					sessionId: transportSessionId,
+					stateRoot,
+					token,
+					onFrame: () => undefined,
+					sendFrame: () => undefined,
+					start: async () => {
+						const endpoint = path.join(stateRoot, "sdk", `${transportSessionId}.json`);
+						await fs.mkdir(path.dirname(endpoint), { recursive: true });
+						await fs.writeFile(
+							endpoint,
+							JSON.stringify({
+								sessionId: transportSessionId,
+								pid: process.pid,
+								url: "ws://127.0.0.1:1",
+								token,
+							}),
+						);
+						return { url: "ws://127.0.0.1:1" };
+					},
+					stop: async () => {
+						transportStops++;
+					},
+				}),
+			});
+			const start = handlers.get("session_start");
+			const stop = handlers.get("session_shutdown");
+			if (!start || !stop) throw new Error("SDK lifecycle handlers were not installed.");
+			starting = start({}, context);
+			await entered.promise;
+			await stop({}, context);
+			expect(transportStops).toBe(1);
+			releasePublication.resolve();
+			const late = await published.promise;
+			const index = await new SessionIndex(agentDir).open();
+			if (replacement) {
+				// Keep the generation but replace the endpoint file identity, so
+				// cleanup must compare the captured publication's exact authority.
+				await append.call(index, {
+					type: "host_registered",
+					sessionId,
+					locator: late.locator,
+					pid: late.pid,
+					endpointGeneration: late.endpointGeneration,
+					endpointMtimeMs: late.endpointMtimeMs,
+					endpointFileId: `${late.endpointFileId}-replacement`,
+					processIncarnation: late.processIncarnation,
+					hostIncarnation: late.hostIncarnation,
+				});
+			}
+			releaseResult.resolve();
+			await starting;
+			await index.refresh();
+			const current = index.listSessions().sessions.find(session => session.sessionId === sessionId);
+			if (replacement) {
+				expect(current).toBeDefined();
+				expect(current?.terminal).not.toBe(true);
+				expect(current!.indexSeq).toBeGreaterThan(late.indexSeq);
+			} else {
+				expect(current?.terminal).toBe(true);
+			}
+		} finally {
+			releasePublication.resolve();
+			releaseResult.resolve();
+			await starting;
+			appendSpy.mockRestore();
+			await handlers.get("session_shutdown")?.({}, context);
+			await broker?.stop();
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+}
 
 test("stopping a host while broker ensure is pending cannot register it after disposal", async () => {
 	const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-sdk-broker-stop-fence-"));
