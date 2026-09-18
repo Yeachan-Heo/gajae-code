@@ -605,6 +605,27 @@ function migrateLegacyTransactionV1(transaction: CoordinatorSessionTransactionV1
 	}
 	const authorities = canonical.gate_authorities;
 	const endpointIncarnation = typeof broker?.endpoint_incarnation === "string" ? broker.endpoint_incarnation : null;
+	// Report ids predate COORDINATOR_REPORT_ID_PATTERN. A legacy id is rejected by
+	// the reader forever, and because the reader is the namespace-wide scan, one
+	// historical report bricks every coordination read. Rekey legacy reports onto
+	// the canonical digest form instead of leaving the WAL permanently unreadable.
+	const reports = canonical.reports;
+	if (reports && typeof reports === "object" && !Array.isArray(reports)) {
+		const table = reports as Record<string, Record<string, unknown>>;
+		for (const [reportId, report] of Object.entries(table)) {
+			if (COORDINATOR_REPORT_ID_PATTERN.test(reportId)) continue;
+			if (!report || typeof report !== "object" || Array.isArray(report)) continue;
+			const operationId = typeof report.operation_id === "string" ? report.operation_id : reportId;
+			const migratedId = `report-${digest(`legacy-report\0${record.session_id}\0${operationId}`)}`;
+			if (table[migratedId]) {
+				delete table[reportId];
+				continue;
+			}
+			report.report_id = migratedId;
+			table[migratedId] = report;
+			delete table[reportId];
+		}
+	}
 	if (authorities && typeof authorities === "object" && !Array.isArray(authorities)) {
 		for (const authority of Object.values(authorities as Record<string, unknown>)) {
 			if (!authority || typeof authority !== "object" || Array.isArray(authority)) continue;
