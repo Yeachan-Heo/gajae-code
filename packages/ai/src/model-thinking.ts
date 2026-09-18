@@ -66,6 +66,17 @@ const GPT_5_6_PLUS_EFFORTS: readonly Effort[] = [Effort.Low, Effort.Medium, Effo
 const GPT_5_5_DEFAULT_EFFORT = Effort.XHigh;
 const KIMI_K3_EFFORTS: readonly Effort[] = [Effort.Low, Effort.High, Effort.Max];
 const DEEPSEEK_V4_FLASH_0731_EFFORTS: readonly Effort[] = [Effort.Low, Effort.High, Effort.Max];
+const ALIBABA_GLM_53_EFFORTS: readonly Effort[] = [Effort.Low, Effort.High, Effort.Max];
+const ALIBABA_DEEPSEEK_V4_PINNED_IDS = new Set([
+	"deepseek-v4-flash-0731",
+	"deepseek-v4-pro-0813",
+	"deepseek-v4.1-flash",
+]);
+const ALIBABA_DEEPSEEK_V4_PINNED_NAMES: Record<string, string> = {
+	"deepseek-v4-flash-0731": "DeepSeek V4 Flash 0731",
+	"deepseek-v4-pro-0813": "DeepSeek V4 Pro 0813",
+	"deepseek-v4.1-flash": "DeepSeek V4.1 Flash",
+};
 const GROK_4_5_EFFORTS: readonly Effort[] = [Effort.Low, Effort.Medium, Effort.High];
 const GROK_4_6_EFFORTS: readonly Effort[] = [Effort.Low, Effort.Medium, Effort.High, Effort.XHigh];
 const GROK_4_20_EFFORTS: readonly Effort[] = [Effort.Minimal, Effort.Low, Effort.Medium, Effort.High];
@@ -320,9 +331,13 @@ export function applyGeneratedModelPolicies(models: ApiModel<Api>[]): void {
 		if (source.provider === "xai" && (source.id === "grok-4.5" || source.id === "grok-4.6")) {
 			source.reasoning = true;
 		}
-		if (source.provider === "alibaba-token-plan" && source.id === "deepseek-v4-flash-0731") {
+		if (source.provider === "alibaba-token-plan" && ALIBABA_DEEPSEEK_V4_PINNED_IDS.has(source.id)) {
 			source.reasoning = true;
-			source.name = "DeepSeek V4 Flash 0731";
+			source.name = ALIBABA_DEEPSEEK_V4_PINNED_NAMES[source.id] ?? source.name;
+		}
+		if (source.provider === "alibaba-token-plan" && source.id === "glm-5.3") {
+			source.reasoning = true;
+			source.name = "GLM-5.3";
 		}
 		if (source.id.split("/").at(-1)?.toLowerCase() === "muse-spark-1.2") {
 			source.reasoning = true;
@@ -669,7 +684,7 @@ function applyGeneratedModelPolicy(model: ApiModel<Api>): void {
 			levels: [Effort.Low, Effort.High, Effort.Max],
 		};
 	}
-	if (model.provider === "alibaba-token-plan" && model.id === "deepseek-v4-flash-0731") {
+	if (model.provider === "alibaba-token-plan" && ALIBABA_DEEPSEEK_V4_PINNED_IDS.has(model.id)) {
 		model.contextWindow = 1_000_000;
 		model.maxTokens = 384_000;
 		model.compat = {
@@ -678,6 +693,24 @@ function applyGeneratedModelPolicy(model: ApiModel<Api>): void {
 			supportsReasoningEffort: true,
 			reasoningContentField: "reasoning_content",
 			requiresReasoningContentForToolCalls: true,
+		};
+	}
+	if (model.provider === "alibaba-token-plan" && model.id === "glm-5.3") {
+		model.contextWindow = 1_000_000;
+		model.maxTokens = 131_072;
+		model.compat = {
+			...(model.compat ?? {}),
+			supportsDeveloperRole: false,
+			supportsReasoningEffort: true,
+			reasoningContentField: "reasoning_content",
+			requiresReasoningContentForToolCalls: true,
+		};
+		model.thinking = {
+			mode: "effort",
+			minLevel: Effort.Low,
+			maxLevel: Effort.Max,
+			defaultLevel: Effort.Max,
+			levels: [Effort.Low, Effort.High, Effort.Max],
 		};
 	}
 	if (model.provider === "xai" && (model.id === "grok-4.5" || model.id === "grok-4.6")) {
@@ -898,8 +931,11 @@ function inferSupportedEfforts<TApi extends Api>(parsedModel: ParsedModel, model
 	if (model.provider === "kimi-code" && model.id === "k3") {
 		return KIMI_K3_EFFORTS;
 	}
-	if (model.provider === "alibaba-token-plan" && model.id === "deepseek-v4-flash-0731") {
+	if (model.provider === "alibaba-token-plan" && ALIBABA_DEEPSEEK_V4_PINNED_IDS.has(model.id)) {
 		return DEEPSEEK_V4_FLASH_0731_EFFORTS;
+	}
+	if (model.provider === "alibaba-token-plan" && model.id === "glm-5.3") {
+		return ALIBABA_GLM_53_EFFORTS;
 	}
 	switch (parsedModel.family) {
 		case "openai":

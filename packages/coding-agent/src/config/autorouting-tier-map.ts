@@ -541,6 +541,18 @@ export const TIER_MAP_SKIP_LIST = {
 	"alibaba-token-plan/glm-5.2": { baseline: true, rationale: "pre-feature baseline; not yet curated" },
 	"alibaba-token-plan/qwen3.8-max": { baseline: true, rationale: "post-feature catalog addition; not yet curated" },
 	"alibaba-token-plan/qwen3.8-max-preview": { baseline: true, rationale: "pre-feature baseline; not yet curated" },
+	"alibaba-token-plan/deepseek-v4-pro-0813": {
+		baseline: true,
+		rationale: "post-feature catalog addition; not yet curated",
+	},
+	"alibaba-token-plan/deepseek-v4.1-flash": {
+		baseline: true,
+		rationale: "post-feature catalog addition; not yet curated",
+	},
+	"alibaba-token-plan/glm-5.3": {
+		baseline: true,
+		rationale: "post-feature catalog addition; not yet curated",
+	},
 	"amazon-bedrock/anthropic.claude-3-5-haiku-20241022-v1:0": {
 		baseline: true,
 		rationale: "pre-feature baseline; not yet curated",
