@@ -100,6 +100,19 @@ export type BeginResult =
 	| { kind: "idempotency_conflict" }
 	| { kind: "terminal_uncertain"; entry: LifecycleLedgerEntry }
 	| { kind: "in_progress"; entry: LifecycleLedgerEntry };
+
+/**
+ * Why a terminal read-back produced no entry. `absent` means nothing terminal is
+ * recorded for the request; `rejected` means a row exists but was refused, which is
+ * evidence of a damaged ledger rather than of an unpersisted operation. Collapsing
+ * the two lets a corrupt row read as "not yet written" and unfence the session.
+ */
+export type TerminalReadBackRejection = "bounds" | "shape" | "undecodable" | "row-not-attributable" | "partial-row";
+export type TerminalReadBack =
+	| { kind: "terminal"; entry: LifecycleLedgerEntry }
+	| { kind: "absent" }
+	| { kind: "rejected"; reason: TerminalReadBackRejection };
+
 const terminal = (s: LifecycleState) => s === "terminal_ok" || s === "terminal_error";
 const final = (s: LifecycleState) => terminal(s) || s === "terminal_uncertain";
 export interface LifecycleLedgerLimits {
@@ -376,9 +389,9 @@ export class LifecycleLedger {
 	 * uncertainly persists that conclusion, and refusing to read it back would report a
 	 * synced row as unpersisted and replace its true reason with a generic one.
 	 */
-	async readTerminal(identity: string, requestHash: string): Promise<LifecycleLedgerEntry | undefined> {
+	async readTerminal(identity: string, requestHash: string): Promise<TerminalReadBack> {
 		const source = await this.#readBoundedSourceReadOnly();
-		if (!source) return undefined;
+		if (!source) return { kind: "absent" };
 		let prior: LifecycleLedgerEntry | undefined;
 		let latest: LifecycleLedgerEntry | undefined;
 		let rows = 0;
@@ -391,15 +404,16 @@ export class LifecycleLedger {
 			lineStart = offset + 1;
 			if (line.length === 0) continue;
 			rows += 1;
-			if (rows > this.#limits.maxRows || line.length > this.#limits.maxLineBytes) return undefined;
+			if (rows > this.#limits.maxRows || line.length > this.#limits.maxLineBytes)
+				return { kind: "rejected", reason: "bounds" };
 			let entry: LifecycleLedgerEntry;
 			try {
 				const value = parseLifecycleJson(line);
 				assertSupportedStateVersion(this.#file, value);
-				if (!isLifecycleLedgerEntry(value)) return undefined;
+				if (!isLifecycleLedgerEntry(value)) return { kind: "rejected", reason: "shape" };
 				entry = value;
 			} catch {
-				return undefined;
+				return { kind: "rejected", reason: "undecodable" };
 			}
 			if (entry.identity !== identity) continue;
 			if (
@@ -407,7 +421,7 @@ export class LifecycleLedger {
 				!hasValidTerminalDigests(entry) ||
 				!this.#isValidHistoryContinuation(prior, entry)
 			)
-				return undefined;
+				return { kind: "rejected", reason: "row-not-attributable" };
 			prior = entry;
 			latest = entry;
 		}
@@ -417,9 +431,11 @@ export class LifecycleLedger {
 			// a partially persisted row from this identity without inspecting arbitrary
 			// malformed data as a valid record.
 			const identityMarker = Buffer.from(`"identity":${JSON.stringify(identity)}`);
-			if (tail.includes(identityMarker)) return undefined;
+			if (tail.includes(identityMarker)) return { kind: "rejected", reason: "partial-row" };
 		}
-		return latest && final(latest.state) ? latest : undefined;
+		// No matching row, or one that has not reached a terminal state yet, is genuine
+		// absence: nothing was rejected, there is simply nothing terminal to read back.
+		return latest && final(latest.state) ? { kind: "terminal", entry: latest } : { kind: "absent" };
 	}
 
 	/**

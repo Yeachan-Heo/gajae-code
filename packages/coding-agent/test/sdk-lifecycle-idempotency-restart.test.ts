@@ -145,12 +145,12 @@ describe("SDK lifecycle ledger", () => {
 		const verifier = new LifecycleLedger(dir);
 
 		await expect(verifier.readTerminal("first", "first-request")).resolves.toMatchObject({
-			state: "terminal_ok",
-			response: { sessionId: "first" },
+			kind: "terminal",
+			entry: { state: "terminal_ok", response: { sessionId: "first" } },
 		});
 		await expect(verifier.readTerminal("second", "second-request")).resolves.toMatchObject({
-			state: "terminal_ok",
-			response: { sessionId: "second" },
+			kind: "terminal",
+			entry: { state: "terminal_ok", response: { sessionId: "second" } },
 		});
 		expect(await fs.readFile(ledgerPath, "utf8")).toBe(before);
 		expect(await fs.stat(`${ledgerPath}.corrupt`).catch(() => undefined)).toBeUndefined();
@@ -164,7 +164,12 @@ describe("SDK lifecycle ledger", () => {
 		await ledger.transition("target", "terminal_ok", { response: { sessionId: "target" } });
 		const terminalSource = await fs.readFile(ledgerPath, "utf8");
 		await fs.writeFile(ledgerPath, terminalSource.slice(0, -1));
-		await expect(new LifecycleLedger(dir).readTerminal("target", "request")).resolves.toBeUndefined();
+		// A truncated final row for this identity is a *rejected* read-back, not absence:
+		// something is recorded for the request and the ledger refused it.
+		await expect(new LifecycleLedger(dir).readTerminal("target", "request")).resolves.toEqual({
+			kind: "rejected",
+			reason: "partial-row",
+		});
 
 		const conflictingDir = await fs.mkdtemp(
 			path.join(process.env.TMPDIR ?? "/tmp", "gjc-ledger-read-terminal-conflict-"),
@@ -183,7 +188,11 @@ describe("SDK lifecycle ledger", () => {
 				.map(row => `${JSON.stringify(row)}\n`)
 				.join(""),
 		);
-		await expect(new LifecycleLedger(conflictingDir).readTerminal("target", "request")).resolves.toBeUndefined();
+		// A row whose digest does not attribute it to this request is likewise rejected.
+		await expect(new LifecycleLedger(conflictingDir).readTerminal("target", "request")).resolves.toEqual({
+			kind: "rejected",
+			reason: "row-not-attributable",
+		});
 	});
 });
 
@@ -292,8 +301,17 @@ describe("SDK lifecycle ledger history validation", () => {
 		const ledger = await new LifecycleLedger(dir).open();
 		expect(await ledger.begin("cleanup", "request")).toMatchObject({ kind: "terminal_uncertain" });
 		expect(await ledger.begin("terminal", "request")).toMatchObject({ kind: "terminal_uncertain" });
-		await expect(new LifecycleLedger(dir).readTerminal("cleanup", "request")).resolves.toBeUndefined();
-		await expect(new LifecycleLedger(dir).readTerminal("terminal", "request")).resolves.toBeUndefined();
+		// Quarantined standalone cleanup authority fails history continuation, so both
+		// identities read back as rejected rather than absent. That is the distinction
+		// this change exists to keep: the fence stays raised for a damaged ledger.
+		await expect(new LifecycleLedger(dir).readTerminal("cleanup", "request")).resolves.toEqual({
+			kind: "rejected",
+			reason: "row-not-attributable",
+		});
+		await expect(new LifecycleLedger(dir).readTerminal("terminal", "request")).resolves.toEqual({
+			kind: "rejected",
+			reason: "row-not-attributable",
+		});
 		expect(await fs.readFile(ledgerPath, "utf8")).toBe(source);
 		expect(await fs.readFile(`${ledgerPath}.corrupt`, "utf8")).toContain('"effect_started"');
 	});

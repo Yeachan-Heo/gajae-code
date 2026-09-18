@@ -50,9 +50,9 @@ import {
 import {
 	type LifecycleDurableEffectsReceipt,
 	LifecycleLedger,
-	type LifecycleLedgerEntry,
 	type LifecycleStartupFailureReceipt,
 	type LifecycleState,
+	type TerminalReadBack,
 } from "./lifecycle-ledger";
 import { createMasterCapabilityVerifier, readEndpoint } from "./master-capability";
 import { sdkInternalRuntimeImage } from "./runtime";
@@ -738,16 +738,22 @@ type TerminalPersistenceVerification =
 	| { kind: "uncertain"; mismatches: readonly string[] };
 
 function verifyTerminalPersistence(
-	persisted: LifecycleLedgerEntry | undefined,
+	readBack: TerminalReadBack,
 	storedResponse: BrokerResponse,
 	durableEffects: LifecycleDurableEffectsReceipt | undefined,
 	startupFailure: LifecycleStartupFailureReceipt | undefined,
 ): TerminalPersistenceVerification {
-	// A missing read-back is a verification failure, not evidence that the
+	// An absent read-back is a verification failure, not evidence that the
 	// operation itself is ambiguous. The terminal transition was already synced
 	// before this read, so preserve its settled outcome and let a later reader
 	// reconcile the durable row.
-	if (persisted === undefined) return { kind: "unverified" };
+	if (readBack.kind === "absent") return { kind: "unverified" };
+	// A *rejected* row is the opposite: the ledger holds something for this request
+	// and refused it. That is damaged durable state, which previously fenced the
+	// session and must keep fencing it — treating it as "not yet written" would let
+	// a corrupt row clear the fence it exists to raise.
+	if (readBack.kind === "rejected") return { kind: "uncertain", mismatches: [`readBack:${readBack.reason}`] };
+	const persisted = readBack.entry;
 	const optionalReceiptJson = (value: unknown): string | undefined =>
 		value === undefined || value === null ? undefined : canonicalJson(value);
 	// The field name is always present; only the two compared receipt renderings are

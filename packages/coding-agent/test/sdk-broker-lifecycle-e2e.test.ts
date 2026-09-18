@@ -3128,7 +3128,7 @@ test("broker preserves a settled response when terminal persistence read-back is
 	const originalReadTerminal = LifecycleLedger.prototype.readTerminal;
 	try {
 		await broker.start();
-		LifecycleLedger.prototype.readTerminal = async () => undefined;
+		LifecycleLedger.prototype.readTerminal = async () => ({ kind: "absent" });
 		const response = await broker.handleRequest(
 			"session.unknown",
 			{ sessionId: "ledger-mismatch" },
@@ -3165,7 +3165,7 @@ test("successful create stays settled when terminal read-back is unavailable and
 	let secondSessionId: string | undefined;
 	try {
 		await broker.start();
-		LifecycleLedger.prototype.readTerminal = async () => undefined;
+		LifecycleLedger.prototype.readTerminal = async () => ({ kind: "absent" });
 		const first = await broker.handleRequest(
 			"session.create",
 			{ cwd: root, readinessTimeoutMs: 10_000 },
@@ -3215,13 +3215,19 @@ test("broker marks a terminal outcome uncertain only when readable evidence conf
 	try {
 		await broker.start();
 		LifecycleLedger.prototype.readTerminal = async function (identity, requestHash) {
-			const persisted = await originalReadTerminal.call(this, identity, requestHash);
-			return persisted
+			const readBack = await originalReadTerminal.call(this, identity, requestHash);
+			// Only a *readable* row is tampered with here: the point of this case is that a
+			// decodable row whose contents disagree goes uncertain, which is a different
+			// path from an absent read-back and from a rejected one.
+			return readBack.kind === "terminal"
 				? {
-						...persisted,
-						response: { ok: false, error: { code: "tampered", message: "readable conflict" } },
+						kind: "terminal" as const,
+						entry: {
+							...readBack.entry,
+							response: { ok: false, error: { code: "tampered", message: "readable conflict" } },
+						},
 					}
-				: undefined;
+				: readBack;
 		};
 		const response = await broker.handleRequest(
 			"session.unknown",
