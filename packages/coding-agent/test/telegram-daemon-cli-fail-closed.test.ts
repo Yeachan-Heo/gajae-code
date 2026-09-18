@@ -294,9 +294,11 @@ describe("issue #4403 — CLI fail-closed + daemon watchdog reconciliation", () 
 						await daemonRun;
 					}
 				} as never,
-				setInterval: (cb: () => void) => {
-					watchdogCallback = cb;
-					watchdogReady.resolve();
+				setInterval: (cb: () => void, ms: number) => {
+					if (ms === 5_000) {
+						watchdogCallback = cb;
+						watchdogReady.resolve();
+					}
 					return 1 as unknown as Timer;
 				},
 				clearInterval: () => {},
