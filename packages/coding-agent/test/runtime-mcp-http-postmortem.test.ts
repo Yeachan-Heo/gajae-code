@@ -49,6 +49,43 @@ describe("MCP HTTP postmortem release", () => {
 		expect(liveHttpTransportCount()).toBe(0);
 	});
 
+	test("postmortem and graceful close share one session termination", async () => {
+		const deleteStarted = Promise.withResolvers<void>();
+		const releaseDelete = Promise.withResolvers<void>();
+		let deletes = 0;
+		const server = Bun.serve({
+			hostname: "127.0.0.1",
+			port: 0,
+			async fetch(request) {
+				if (request.method === "DELETE") {
+					deletes += 1;
+					deleteStarted.resolve();
+					await releaseDelete.promise;
+					return new Response(null, { status: 204 });
+				}
+				const body = (await request.json()) as { id: string };
+				return Response.json(
+					{ jsonrpc: "2.0", id: body.id, result: {} },
+					{ headers: { "Mcp-Session-Id": "single-flight-session" } },
+				);
+			},
+		});
+		servers.push(server);
+
+		const transport = new HttpTransport({ type: "http", url: `${server.url}mcp`, timeout: 1_000 });
+		await transport.connect();
+		await transport.request("initialize", {});
+
+		const postmortem = disposeAllResourceOwners();
+		await deleteStarted.promise;
+		const graceful = transport.close();
+		await Bun.sleep(10);
+		expect(deletes).toBe(1);
+		releaseDelete.resolve();
+		await Promise.all([postmortem, graceful]);
+		expect(deletes).toBe(1);
+	});
+
 	test("graceful close unregisters the transport before postmortem", async () => {
 		let deletes = 0;
 		const server = Bun.serve({

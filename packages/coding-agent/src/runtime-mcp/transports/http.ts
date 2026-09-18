@@ -663,12 +663,18 @@ export class HttpTransport implements MCPTransport {
 	 * HTTP/SSE server gets that its session may be dropped.
 	 */
 	async #terminateSession(): Promise<void> {
-		if (this.#era === "modern" || !this.#sessionId) return;
+		if (this.#era === "modern") return;
+		const sessionId = this.#sessionId;
+		if (!sessionId) return;
+		// Claim the server session before awaiting the wire request. Graceful close
+		// and postmortem disposal can overlap during shutdown; only the caller that
+		// detached this id may emit its termination DELETE.
+		this.#sessionId = null;
 		try {
 			const timeout = this.config.timeout ?? 30000;
 			const headers: Record<string, string> = {
 				...this.config.headers,
-				"Mcp-Session-Id": this.#sessionId,
+				"Mcp-Session-Id": sessionId,
 			};
 
 			await this.#fetch({
@@ -679,7 +685,6 @@ export class HttpTransport implements MCPTransport {
 		} catch {
 			// Ignore termination errors
 		}
-		this.#sessionId = null;
 	}
 
 	/**
