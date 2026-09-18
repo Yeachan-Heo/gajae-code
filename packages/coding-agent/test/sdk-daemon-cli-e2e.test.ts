@@ -450,9 +450,17 @@ describe("SDK session CLI", () => {
 
 	type OfflineSession = { id: string; path: string };
 
-	async function createStoppedSavedSession(): Promise<OfflineSession> {
+	async function createStoppedSavedSession(rows = 0): Promise<OfflineSession> {
 		const session = SessionManager.create(root, SessionManager.managedDestination(root, agentDir));
 		await session.ensureOnDisk();
+		for (let index = 0; index < rows; index++) {
+			session.appendMessage({
+				role: index % 2 === 0 ? "user" : "assistant",
+				content: [{ type: "text", text: `row ${index}` }],
+				timestamp: 1_700_000_000_000 + index,
+			} as never);
+		}
+		if (rows > 0) await session.flush();
 		const id = session.getSessionId();
 		const savedPath = session.getSessionFile();
 		if (!savedPath) throw new Error("Expected a retained managed session path.");
@@ -1587,6 +1595,25 @@ describe("SDK session CLI", () => {
 			ok: true,
 			result: { version: 2, source: "offline", session: { sessionId: session.id }, terminal: true },
 		});
+	}, 60_000);
+	it("an offline tail honours --after-transcript-id exactly like a live resume", async () => {
+		// A session that stopped between two polls must not replay processed
+		// history on the next one; the boundary contract is the same offline.
+		const session = await createStoppedSavedSession(3);
+		const all = JSON.parse((await runCli(root, agentDir, ["tail", session.id])).stdout).result.items as Array<{
+			id?: string;
+		}>;
+		expect(all.length).toBeGreaterThan(1);
+		const boundary = all[0]!.id!;
+		const after = await runCli(root, agentDir, ["tail", session.id, "--after-transcript-id", boundary]);
+		expect(after.exitCode, after.stderr).toBe(0);
+		const items = JSON.parse(after.stdout).result.items as Array<{ id?: string }>;
+		expect(items.map(item => item.id)).toEqual(all.slice(1).map(item => item.id));
+		// Unknown boundary keeps everything.
+		const unknown = JSON.parse(
+			(await runCli(root, agentDir, ["tail", session.id, "--after-transcript-id", "nope"])).stdout,
+		).result.items;
+		expect(unknown).toHaveLength(all.length);
 	}, 60_000);
 	it("fails closed when the Broker-selected offline transcript is rewritten in place with restored metadata", async () => {
 		const retainedTimestamp = 1_700_000_000;
