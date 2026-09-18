@@ -55,14 +55,24 @@ test("a positioned live item cannot be keyed before its authoritative checkpoint
 	const releasedLiveItems = buffer.resolve(7);
 	expect(releasedLiveItems).toEqual([expect.objectContaining({ revision: 7, generation: 1, seq: 4 })]);
 	expect(new Set([...releasedLiveItems, replayedCopy].map(tailItemKey))).toHaveLength(1);
-	expect(() =>
-		buffer.push(
-			toTailItemV1(
-				{ kind: "message_update", generation: 1, seq: 5, payload: { text: "new revision" } },
-				{ kind: "event" },
-			),
+	// A positioned frame arriving AFTER the checkpoint without a revision is
+	// stamped with the checkpoint's, not fatal. The host emits such frames
+	// whenever its transcript provider is momentarily unavailable mid-turn; one
+	// of them used to abort the entire tail with protocol_error, which made a
+	// live, answering session unobservable to every consumer (2026-09-17/18).
+	const lateLive = buffer.push(
+		toTailItemV1(
+			{ kind: "message_update", generation: 1, seq: 5, payload: { text: "new revision" } },
+			{ kind: "event" },
 		),
-	).toThrow("after checkpoint");
+	);
+	expect(lateLive).toEqual([expect.objectContaining({ revision: 7, generation: 1, seq: 5 })]);
+	expect(() => tailItemKey(lateLive[0]!)).not.toThrow();
+	// A frame that already carries its own revision keeps it.
+	const stamped = buffer.push(
+		toTailItemV1({ kind: "message_update", revision: 9, generation: 1, seq: 6, payload: {} }, { kind: "event" }),
+	);
+	expect(stamped[0]?.revision).toBe(9);
 });
 
 test("ordinary live events read the authoritative revision at emission time", () => {
